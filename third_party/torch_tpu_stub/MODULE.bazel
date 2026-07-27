@@ -1,1 +1,0 @@
-module(name = "torch_tpu", version = "0.1.1")

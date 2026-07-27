@@ -1,0 +1,20 @@
+# Stand-in for the torch_tpu Bazel module in open-source builds. It provides
+# the targets raiden's BUILD files reference under @torch_tpu// without a
+# torch_tpu source checkout: the torch shims resolve to the locally installed
+# torch (TORCH_SOURCE), the tensor_buffer API is a copy of its header (the
+# extension binds the symbols at import to the installed torch_tpu wheel), and
+# the Python targets are empty because torch_tpu is a runtime import.
+module(name = "torch_tpu", version = "0.1.1")
+
+bazel_dep(name = "rules_cc", version = "0.2.9")
+bazel_dep(name = "rules_python", version = "1.8.5")
+bazel_dep(name = "bazel_skylib", version = "1.7.1")
+bazel_dep(name = "protobuf", version = "32.1", repo_name = "com_google_protobuf")
+bazel_dep(name = "abseil-cpp", version = "20260526.0", repo_name = "com_google_absl")
+bazel_dep(name = "xla")
+
+torch_local_repo = use_repo_rule("//bazel:torch_local_repo.bzl", "torch_local_repo")
+
+torch_local_repo(
+    name = "local_torch",
+)

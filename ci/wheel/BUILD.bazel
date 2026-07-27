@@ -9,7 +9,7 @@
 #     --repo_env=WHEEL_VERSION_EXTRAS=.dev$(date +%Y%m%d%H%M%S)
 #
 # The torch wheel additionally needs the torch_tpu module
-# (--override_module=torch_tpu=../torch_tpu) and a local torch
+# (the stand-in under bazel/torch_tpu_standin by default) and a local torch
 # (--define=TORCH_SOURCE=local). See //ci/build_wheel.sh.
 
 load("@nanobind_bazel//:build_defs.bzl", "nanobind_extension")

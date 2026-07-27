@@ -1,0 +1,10 @@
+# Root package of the torch_tpu stand-in module (see MODULE.bazel). The
+# targets raiden references live in the subpackages: shims/torch (torch
+# headers from the installed torch), csrc/api (the tensor_buffer header) and
+# src/torch_tpu (empty Python targets).
+
+load("@nanobind_bazel//:build_defs.bzl", "nanobind_extension")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+package(default_visibility = ["//visibility:public"])

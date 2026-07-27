@@ -1,0 +1,172 @@
+# Nightly build of the tpu_sync wheels: tpu_sync_jax and tpu_sync_torch.
+#
+# Wheels are versioned <pyproject base>.dev<UTC timestamp> (same scheme as
+# torch_tpu) and built inside the ml-build container by
+# ci/build_wheel_impl.sh. Every run keeps the wheels as GitHub Actions
+# artifacts; scheduled runs (and dispatches that opt in) additionally upload
+# them to the tpu-sync Artifact Registry, where they install with:
+#
+#   pip install --pre tpu_sync_jax \
+#     --extra-index-url https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/simple/
+#
+# Nightlies never go to PyPI; releases do, through .github/workflows/
+# release_wheels.yml.
+#
+# The torch wheel needs no torch_tpu checkout: the build resolves the
+# torch_tpu module from the stand-in under bazel/torch_tpu_standin and
+# ships one extension variant per torch release listed in
+# ci/build_wheel_impl.sh; the extension binds torch_tpu's symbols at import
+# to the installed torch_tpu wheel.
+#
+# Required repository variables:
+#   vars.RAIDEN_REGISTRY_URL      (optional) overrides the Artifact Registry
+#                                 upload URL
+
+name: Nightly Wheels
+
+on:
+  schedule:
+    - cron: "0 8 * * *"  # 08:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      upload_to_registry:
+        description: "Upload wheels to the tpu-sync Artifact Registry?"
+        type: choice
+        default: "no"
+        options:
+          - "yes"
+          - "no"
+      use_remote_cache:
+        description: "Use the remote bazel cache (--config=ci)?"
+        type: choice
+        default: "yes"
+        options:
+          - "yes"
+          - "no"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  RAIDEN_REGISTRY_URL: ${{ vars.RAIDEN_REGISTRY_URL || 'https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/' }}
+
+jobs:
+  version:
+    name: "Stamp nightly version"
+    runs-on: ubuntu-latest
+    outputs:
+      wheel_version_extras: ${{ steps.stamp.outputs.wheel_version_extras }}
+    steps:
+      - id: stamp
+        # One timestamp for the whole run so the jax and torch wheels of a
+        # single nightly share a version.
+        run: echo "wheel_version_extras=.dev$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: "Build ${{ matrix.framework }} wheel"
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        framework: [jax, torch]
+    runs-on: linux-x86-n2-32
+    container:
+      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
+    timeout-minutes: 300
+    steps:
+      - name: Checkout tpu-sync
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+          path: tpu-sync
+      # Git security patch (CVE-2022-24765) blocks root from operating on
+      # runner-owned directories. Tell Git explicitly to trust the workspace
+      # inside this ephemeral container.
+      - name: Fix Git Workspace Ownership
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/tpu-sync"
+      - name: Build wheel
+        working-directory: tpu-sync
+        env:
+          BUILD_MODE: ${{ matrix.framework }}
+          WHEEL_VERSION_EXTRAS: ${{ needs.version.outputs.wheel_version_extras }}
+          EXTRA_BAZEL_FLAGS: ${{ (inputs.use_remote_cache || 'yes') == 'yes' && '--config=ci' || '' }}
+        run: |
+          export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          bash ci/build_wheel_impl.sh
+      - name: Check wheel metadata
+        working-directory: tpu-sync
+        env:
+          WHEEL_VERSION_EXTRAS: ${{ needs.version.outputs.wheel_version_extras }}
+        run: uv run --isolated --with twine twine check dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl
+      # The JAX-stack coupling (jax/jaxlib/libtpu) is enforced through the
+      # wheel's own Requires-Dist pins; extract them so each build records the
+      # stack it must run with.
+      - name: Record JAX stack pins
+        if: matrix.framework == 'jax'
+        working-directory: tpu-sync
+        run: |
+          python3 - <<'PY'
+          import glob, re, zipfile
+          whl = sorted(glob.glob('dist/tpu_sync_jax-*.whl'))[-1]
+          with zipfile.ZipFile(whl) as z:
+              meta = next(n for n in z.namelist() if n.endswith('.dist-info/METADATA'))
+              text = z.read(meta).decode()
+          pins = [l.removeprefix('Requires-Dist: ') for l in text.splitlines()
+                  if re.match(r'Requires-Dist: (jax|jaxlib|libtpu)\b', l)]
+          assert pins, f'no jax/jaxlib/libtpu pins found in {whl} METADATA'
+          open('dist/jax_pins.txt', 'w').write('\n'.join(pins) + '\n')
+          print('\n'.join(pins))
+          PY
+          echo "JAX stack pins:" >> "$GITHUB_STEP_SUMMARY"
+          cat dist/jax_pins.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: nightly-wheel-${{ matrix.framework }}
+          path: |
+            tpu-sync/dist/*${{ needs.version.outputs.wheel_version_extras }}-*.whl
+            tpu-sync/dist/jax_pins.txt
+          if-no-files-found: error
+      - name: Summarize
+        working-directory: tpu-sync
+        env:
+          WHEEL_VERSION_EXTRAS: ${{ needs.version.outputs.wheel_version_extras }}
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  upload:
+    name: "Upload wheels to Artifact Registry"
+    needs: [version, build]
+    # Scheduled nightlies always publish; manual dispatches only on request.
+    if: github.event_name == 'schedule' || inputs.upload_to_registry == 'yes'
+    runs-on: linux-x86-n2-32
+    container:
+      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
+    timeout-minutes: 30
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: nightly-wheel-*
+          merge-multiple: true
+          path: dist
+      # Auth uses the runner's ambient GCP service account via the Artifact
+      # Registry keyring backend. --skip-existing makes re-runs idempotent.
+      - name: Upload to Artifact Registry
+        env:
+          WHEEL_VERSION_EXTRAS: ${{ needs.version.outputs.wheel_version_extras }}
+        run: |
+          uv run --isolated \
+            --with twine \
+            --with keyrings.google-artifactregistry-auth \
+            twine upload --skip-existing \
+            --repository-url "${RAIDEN_REGISTRY_URL}" \
+            dist/tpu_sync_*"${WHEEL_VERSION_EXTRAS}"-*.whl
+          echo "Uploaded to ${RAIDEN_REGISTRY_URL}:" >> "$GITHUB_STEP_SUMMARY"
+          ls dist/tpu_sync_*.whl >> "$GITHUB_STEP_SUMMARY"

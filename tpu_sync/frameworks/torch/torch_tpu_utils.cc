@@ -23,8 +23,8 @@
 #include "ATen/core/TensorBody.h"
 #include "torch/headeronly/core/DeviceType.h"
 
-#include "torch_tpu/eager/materialize.h"
-#include "torch_tpu/eager/tensor_to_buffer.h"
+#include "torch_tpu/csrc/eager/materialize.h"
+#include "torch_tpu/csrc/eager/tensor_to_buffer.h"
 
 namespace tpu_raiden {
 namespace torch {

@@ -250,6 +250,14 @@ NB_MODULE(_tpu_raiden_jax, m) {
       .def("notify_for_read",
            &tpu_raiden::kv_cache::jax::KVCacheManager::NotifyForRead,
            nb::arg("req_id"), nb::arg("uuid"), nb::arg("block_ids"))
+      .def("renew_leases",
+           &tpu_raiden::kv_cache::jax::KVCacheManager::RenewRemoteLeases,
+           nb::arg("remote_endpoint"), nb::arg("uuids"),
+           nb::call_guard<nb::gil_scoped_release>())
+      .def("cancel_leases",
+           &tpu_raiden::kv_cache::jax::KVCacheManager::CancelRemoteLeases,
+           nb::arg("remote_endpoint"), nb::arg("uuids"),
+           nb::call_guard<nb::gil_scoped_release>())
       .def(
           "start_read",
           [](tpu_raiden::kv_cache::jax::KVCacheManager& self,
@@ -658,9 +666,9 @@ NB_MODULE(_tpu_raiden_jax, m) {
              {
                nb::gil_scoped_release release;
                auto res = self->PollSaveStatus();
-               done = std::move(res.done);
-               failed = std::move(res.failed);
-               pending = std::move(res.pending);
+                done = std::move(res.done);
+                failed = std::move(res.failed);
+                pending = std::move(res.pending);
                existing = std::move(res.existing);
                unregistered = std::move(res.unregistered);
              }
@@ -699,9 +707,9 @@ NB_MODULE(_tpu_raiden_jax, m) {
              {
                nb::gil_scoped_release release;
                auto res = self->PollLoadStatus();
-                done = std::move(res.done);
-                failed = std::move(res.failed);
-                pending = std::move(res.pending);
+               done = std::move(res.done);
+               failed = std::move(res.failed);
+               pending = std::move(res.pending);
              }
              std::vector<nb::bytes> py_done, py_failed, py_pending;
              py_done.reserve(done.size());

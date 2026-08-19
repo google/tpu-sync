@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -88,11 +89,8 @@ class HostKVCacheManager : public KVCacheManagerWithTransfer {
     // Copy the transport pointer and release server_init_mu_ before the
     // blocking Push: holding the lock across it serializes concurrent pushes
     // from the same manager (one per destination peer).
-    tpu_raiden::transport::BlockTransport* transport = nullptr;
-    {
-      absl::MutexLock lock(server_init_mu_);
-      transport = server_.get();
-    }
+    std::shared_ptr<tpu_raiden::transport::BlockTransport> transport =
+        GetTransportServer();
     if (!transport) {
       return absl::FailedPreconditionError("Transport server is not running");
     }

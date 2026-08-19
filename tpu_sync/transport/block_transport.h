@@ -16,6 +16,7 @@
 #define THIRD_PARTY_TPU_RAIDEN_TRANSPORT_BLOCK_TRANSPORT_H_
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -63,6 +64,14 @@ class BlockTransport final {
 
   // Destructor closes all sockets and joins all threads.
   ~BlockTransport();
+
+  // Rejects new work, resolves queued async pushes with Cancelled, and
+  // interrupts every active connector/listener socket. Idempotent.
+  void CancelPendingOperations();
+
+  // Waits for connector operations, async callbacks, accepted-socket workers,
+  // and pull-response chains to stop touching the delegate.
+  bool WaitForPendingOperations(std::chrono::milliseconds timeout);
 
   // Return the TCP listening socket port.
   int local_port() const { return raw_transport_.local_port(); }
@@ -144,6 +153,7 @@ class BlockTransport final {
     int stream_idx;
     std::string peer;
     std::function<void()> run;
+    std::function<void()> cancel;
   };
 
   struct PeerQueue {
@@ -214,7 +224,12 @@ class BlockTransport final {
       uint64_t uuid);
 
   struct SendStreamState {
-    int client_fd;
+    ~SendStreamState();
+
+    // BlockTransport owns this duplicate of RawBufferTransport's accepted fd.
+    // Keeping a distinct descriptor alive until every callback drops `state`
+    // prevents both fd-number reuse and late async writes through a stale int.
+    int client_fd = -1;
     uint64_t uuid;
     int remote_id;
     size_t count_or_size;
@@ -244,23 +259,37 @@ class BlockTransport final {
   };
 
   void TriggerNextSendStep(std::shared_ptr<SendStreamState> state);
+  void EraseActiveSend(const std::shared_ptr<SendStreamState>& state);
   void ResolveStepCoordinates(const std::shared_ptr<SendStreamState>& state,
                               size_t* layer, size_t* shard, size_t* block_idx);
   uint32_t GetChunksTotalSize(const std::vector<BlockChunk>& chunks);
   absl::Status HandleCustomRequest(int client_fd,
                                    const lib::ChunkHeader& header);
 
-  using SendMap =
-      absl::flat_hash_map<uint64_t, std::shared_ptr<SendStreamState>>;
+  // A UUID identifies the logical transfer, not an individual socket stream:
+  // one parallel SyncPull intentionally opens several streams with the same
+  // UUID. The state address is collision-free while the map's shared_ptr keeps
+  // that state alive, and lets a completion erase only its own stream.
+  using SendMap = absl::flat_hash_map<const SendStreamState*,
+                                      std::shared_ptr<SendStreamState>>;
   using ProgressMap =
       absl::flat_hash_map<std::pair<uint64_t, int>, LayerProgress>;
+
+  bool BeginOperation();
+  void EndOperation();
 
  private:
   BlockTransportDelegate* const block_delegate_;
   const int parallelism_;
 
   absl::Mutex active_sends_mu_;
+  absl::CondVar active_sends_cv_;
   SendMap active_sends_ ABSL_GUARDED_BY(active_sends_mu_);
+
+  absl::Mutex operations_mu_;
+  absl::CondVar operations_cv_;
+  size_t active_operations_ ABSL_GUARDED_BY(operations_mu_) = 0;
+  bool operations_stopping_ ABSL_GUARDED_BY(operations_mu_) = false;
 
   absl::Mutex progress_mu_;
   ProgressMap layer_progress_ ABSL_GUARDED_BY(progress_mu_);

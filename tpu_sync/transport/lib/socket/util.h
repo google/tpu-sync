@@ -15,8 +15,11 @@
 #ifndef TPU_SYNC_TRANSPORT_LIB_SOCKET_UTIL_H_
 #define TPU_SYNC_TRANSPORT_LIB_SOCKET_UTIL_H_
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "grpcpp/channel.h"
@@ -28,7 +31,9 @@ namespace tpu_raiden::transport::lib {
 absl::StatusOr<int> ConnectToPeer(
     absl::string_view peer, absl::string_view local_ip = "",
     bool require_psp = false,
-    std::shared_ptr<grpc::Channel> channel = nullptr);
+    std::shared_ptr<grpc::Channel> channel = nullptr,
+    const std::atomic<bool>* cancelled = nullptr,
+    std::chrono::milliseconds timeout = std::chrono::seconds(30));
 
 }  // namespace tpu_raiden::transport::lib
 

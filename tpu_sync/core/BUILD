@@ -366,6 +366,7 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
@@ -660,6 +661,31 @@ cc_test(
     deps = [
         ":kv_cache_manager_with_transfer",
         "@com_google_googletest//:gtest_main",
+    ],
+)
+
+# Hardware-free legacy UUID lease/control lifecycle coverage.
+cc_test(
+    name = "kv_cache_manager_with_transfer_lifecycle_test",
+    srcs = ["kv_cache_manager_with_transfer_lifecycle_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    tags = ["no_oss"],
+    deps = [
+        ":kv_cache_manager_with_transfer",
+        "//tpu_sync/kv_cache:kv_cache_manager_base",
+        "//tpu_sync/transport/lib:chunk_serializer",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/synchronization",
+        "@xla//xla:future",
+        "@xla//xla/tsl/platform:test",
+        "@xla//xla/tsl/platform:test_main",
     ],
 )
 

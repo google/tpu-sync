@@ -61,6 +61,9 @@ class MockSubManager : public KVCacheManagerWithTransfer {
   std::string started_ep;
   std::vector<int64_t> started_remote_blocks, started_local_blocks;
   std::vector<StartReadCall> start_read_calls;
+  std::string lease_endpoint;
+  std::vector<uint64_t> lease_uuids;
+  bool lease_cancelled = false;
 
   int d2h_calls = 0;
   int h2d_calls = 0;
@@ -95,6 +98,24 @@ class MockSubManager : public KVCacheManagerWithTransfer {
     return res;
   }
 
+  std::vector<int32_t> RenewRemoteLeases(
+      const std::string& remote_endpoint,
+      const std::vector<uint64_t>& uuids) override {
+    lease_endpoint = remote_endpoint;
+    lease_uuids = uuids;
+    lease_cancelled = false;
+    return std::vector<int32_t>(uuids.size(), 1);
+  }
+
+  std::vector<int32_t> CancelRemoteLeases(
+      const std::string& remote_endpoint,
+      const std::vector<uint64_t>& uuids) override {
+    lease_endpoint = remote_endpoint;
+    lease_uuids = uuids;
+    lease_cancelled = true;
+    return std::vector<int32_t>(uuids.size(), 1);
+  }
+
   absl::StatusOr<raiden::PjRtCopyFuture> D2h(
       const std::vector<int64_t>& src_offsets_major_dim = {},
       const std::vector<int64_t>& dst_offsets_major_dim = {},
@@ -123,9 +144,9 @@ class MockSubManager : public KVCacheManagerWithTransfer {
     return raiden::PjRtCopyFuture();
   }
 
-  // Records the single remote endpoint the wrapper's shard-matching selected for
-  // this sub-manager (the wrapper narrows the full remote_descriptors list down
-  // to one endpoint per sub-manager before calling the string overload).
+  // Records the single remote endpoint the wrapper's shard-matching selected
+  // for this sub-manager (the wrapper narrows the full remote_descriptors list
+  // down to one endpoint per sub-manager before calling the string overload).
   int h2h_write_calls = 0;
   int h2h_read_calls = 0;
   std::string last_h2h_write_peer;
@@ -180,6 +201,29 @@ TEST(KVCacheManagerWrapperTest,
   EXPECT_TRUE(s2.empty());
   EXPECT_EQ(r2, std::vector<std::string>{"req_123"});
   EXPECT_TRUE(f2.empty());
+}
+
+TEST(KVCacheManagerWrapperTest, LeaseOperationsUseExactlyOneControlClient) {
+  auto sub0 = std::make_unique<MockSubManager>();
+  auto sub1 = std::make_unique<MockSubManager>();
+  MockSubManager* ptr0 = sub0.get();
+  MockSubManager* ptr1 = sub1.get();
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
+  subs.push_back(std::move(sub0));
+  subs.push_back(std::move(sub1));
+  KVCacheManager manager(std::move(subs));
+
+  EXPECT_EQ(manager.RenewRemoteLeases("10.0.0.1:45000", {1, 2}),
+            std::vector<int32_t>({1, 1}));
+  EXPECT_EQ(ptr0->lease_endpoint, "10.0.0.1:45000");
+  EXPECT_EQ(ptr0->lease_uuids, std::vector<uint64_t>({1, 2}));
+  EXPECT_TRUE(ptr1->lease_endpoint.empty());
+
+  EXPECT_EQ(manager.CancelRemoteLeases("10.0.0.1:45000", {3}),
+            std::vector<int32_t>({1}));
+  EXPECT_TRUE(ptr0->lease_cancelled);
+  EXPECT_EQ(ptr0->lease_uuids, std::vector<uint64_t>({3}));
+  EXPECT_TRUE(ptr1->lease_endpoint.empty());
 }
 
 TEST(KVCacheManagerWrapperTest,
@@ -265,9 +309,9 @@ TEST(KVCacheManagerWrapperTest,
 }
 
 // H2hWrite is the sub-manager transfer the controller-orchestrated ReadRemote
-// path drives (via WorkerServiceImpl). Each local sub-manager must be matched to
-// the remote (destination peer) endpoint whose advertised shards intersect its
-// own global shards -- not by index or list position.
+// path drives (via WorkerServiceImpl). Each local sub-manager must be matched
+// to the remote (destination peer) endpoint whose advertised shards intersect
+// its own global shards -- not by index or list position.
 TEST(KVCacheManagerWrapperTest,
      H2hWriteMatchesRemoteEndpointsByShardIntersection) {
   auto sub0 = std::make_unique<MockSubManager>();

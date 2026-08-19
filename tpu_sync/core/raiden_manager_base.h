@@ -16,9 +16,12 @@
 #define THIRD_PARTY_TPU_RAIDEN_CORE_RAIDEN_MANAGER_BASE_H_
 
 #include <cstddef>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -145,7 +148,14 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   std::optional<std::string> bind_ip_cfg_ = std::nullopt;
   std::vector<std::string> local_ips_;
 
-  tpu_raiden::transport::BlockTransport* InitTransportServer();
+  std::shared_ptr<tpu_raiden::transport::BlockTransport> InitTransportServer();
+  std::shared_ptr<tpu_raiden::transport::BlockTransport> GetTransportServer()
+      const;
+  // Cancels and drains transport work while the derived manager is still
+  // alive. No server_init_mu_ is held while callbacks are invoked.
+  void CancelTransportOperations();
+  std::shared_ptr<void> TrackManagerCallback();
+  bool WaitForManagerCallbacks(std::chrono::milliseconds timeout);
   virtual std::vector<HostNicAddress> GetHostNics() const;
 
   void DetectAndAssignNumaNode(
@@ -153,8 +163,12 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
           layer_buffers);
 
   mutable absl::Mutex server_init_mu_;
-  std::unique_ptr<tpu_raiden::transport::BlockTransport> server_
+  std::shared_ptr<tpu_raiden::transport::BlockTransport> server_
       ABSL_GUARDED_BY(server_init_mu_);
+
+  std::mutex manager_callbacks_mu_;
+  std::condition_variable manager_callbacks_cv_;
+  size_t active_manager_callbacks_ = 0;
 
   std::vector<LayerInfoBase> layers_;
 

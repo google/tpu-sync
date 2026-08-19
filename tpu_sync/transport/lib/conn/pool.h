@@ -15,12 +15,14 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_TRANSPORT_LIB_CONN_POOL_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_TRANSPORT_LIB_CONN_POOL_H_
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -36,7 +38,7 @@ namespace tpu_raiden::transport::lib {
 class ConnPool {
  public:
   // Constructor.
-  ConnPool() : stop_(false) {}
+  ConnPool() : stop_requested_(false), stop_(false) {}
 
   // Destructor.
   ~ConnPool() { DCHECK(stop_ && pool_.empty()); }
@@ -68,8 +70,12 @@ class ConnPool {
 
  private:
   absl::Mutex mu_;
+  std::atomic<bool> stop_requested_;
   bool stop_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_map<Key, Fds> pool_ ABSL_GUARDED_BY(mu_);
+  // Borrowers own close(). Close() only shutdowns these descriptors while
+  // holding mu_, so a stale descriptor can never be closed after reuse.
+  absl::flat_hash_set<int> borrowed_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace tpu_raiden::transport::lib

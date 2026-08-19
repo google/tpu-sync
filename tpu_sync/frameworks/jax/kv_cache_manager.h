@@ -114,6 +114,11 @@ class NumaAwareKVCacheManager {
   int64_t NotifyForRead(const std::string& req_id, uint64_t uuid,
                         const std::vector<int64_t>& block_ids);
 
+  std::vector<int32_t> RenewRemoteLeases(const std::string& remote_endpoint,
+                                         const std::vector<uint64_t>& uuids);
+  std::vector<int32_t> CancelRemoteLeases(const std::string& remote_endpoint,
+                                          const std::vector<uint64_t>& uuids);
+
   void StartRead(
       const std::string& req_id, uint64_t uuid,
       const std::string& remote_endpoint,
@@ -317,6 +322,16 @@ class KVCacheManager {
   int64_t NotifyForRead(const std::string& req_id, uint64_t uuid,
                         const std::vector<int64_t>& block_ids) {
     return numa_manager_->NotifyForRead(req_id, uuid, block_ids);
+  }
+
+  std::vector<int32_t> RenewRemoteLeases(const std::string& remote_endpoint,
+                                         const std::vector<uint64_t>& uuids) {
+    return numa_manager_->RenewRemoteLeases(remote_endpoint, uuids);
+  }
+
+  std::vector<int32_t> CancelRemoteLeases(const std::string& remote_endpoint,
+                                          const std::vector<uint64_t>& uuids) {
+    return numa_manager_->CancelRemoteLeases(remote_endpoint, uuids);
   }
 
   void StartRead(

@@ -446,6 +446,25 @@ int64_t NumaAwareKVCacheManager::NotifyForRead(
   return res;
 }
 
+std::vector<int32_t> NumaAwareKVCacheManager::RenewRemoteLeases(
+    const std::string& remote_endpoint, const std::vector<uint64_t>& uuids) {
+  if (sub_managers_.empty()) {
+    throw std::runtime_error("KVCacheManager has no transfer sub-managers");
+  }
+  // The endpoint identifies one producer control port. MSL performs any
+  // required per-port fanout; fanning this request across local NUMA managers
+  // would duplicate every renew/cancel operation.
+  return sub_managers_.front()->RenewRemoteLeases(remote_endpoint, uuids);
+}
+
+std::vector<int32_t> NumaAwareKVCacheManager::CancelRemoteLeases(
+    const std::string& remote_endpoint, const std::vector<uint64_t>& uuids) {
+  if (sub_managers_.empty()) {
+    throw std::runtime_error("KVCacheManager has no transfer sub-managers");
+  }
+  return sub_managers_.front()->CancelRemoteLeases(remote_endpoint, uuids);
+}
+
 std::vector<RaidenTransferEndpoint>
 NumaAwareKVCacheManager::get_local_data_endpoints() const {
   std::vector<RaidenTransferEndpoint> res;
@@ -823,8 +842,7 @@ NumaAwareKVCacheManager::H2hRead(
   return std::make_pair(std::move(all_ids), std::move(composite));
 }
 
-absl::StatusOr<raiden::PjRtCopyFuture>
-NumaAwareKVCacheManager::H2hReadExplicit(
+absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::H2hReadExplicit(
     const std::vector<RaidenTransferEndpoint>& remote_descriptors,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids) {
@@ -893,10 +911,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::H2dRead(
       matched_ep = remote_descriptors[0].endpoint;
     }
 
-    ASSIGN_OR_RETURN(auto fut, sub_managers_[s]->H2dRead(
-                                   matched_ep, src_host_offsets,
-                                   dst_host_offsets, dst_device_offsets,
-                                   copy_sizes));
+    ASSIGN_OR_RETURN(auto fut,
+                     sub_managers_[s]->H2dRead(matched_ep, src_host_offsets,
+                                               dst_host_offsets,
+                                               dst_device_offsets, copy_sizes));
     sub_copy_futures.push_back(std::move(fut));
   }
   // Event-aware join (see D2h/H2d): on TPU the per-shard transfers complete via

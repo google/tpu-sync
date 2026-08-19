@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -460,6 +461,11 @@ void KVCacheManagerBase::InitBackgroundWorker() {
 }
 
 KVCacheManagerBase::~KVCacheManagerBase() {
+  CancelTransportOperations();
+  if (!WaitForManagerCallbacks(std::chrono::seconds(30))) {
+    LOG(FATAL) << "KV cache manager callbacks did not drain before base "
+                  "manager teardown";
+  }
   if (worker_thread_.joinable()) {
     {
       absl::MutexLock lock(queue_mu_);
@@ -1065,26 +1071,40 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWrite(
   for (size_t i = 0; i < num_chunks; ++i) {
     int staging_block_id = chunks[i].staging_block_id;
     int dst_block_id = chunks[i].dst_block_id;
+    std::shared_ptr<void> callback_guard = TrackManagerCallback();
     chunks[i].d2h_fut.OnReady([this, pool, state, peer_str, staging_block_id,
-                               dst_block_id](auto status_or) {
+                               dst_block_id,
+                               callback_guard](auto status_or) mutable {
+      // Keep the manager alive first through this PJRT callback and then, on
+      // successful D2H, through the queued H2H task. Copying the guard into the
+      // task leaves this local copy intact if Schedule throws.
+      std::shared_ptr<void> callback_lifetime = std::move(callback_guard);
       if (!status_or.ok()) {
         state->SetError(status_or.status());
         state->MarkChunkComplete();
         return;
       }
-      pool->Schedule([this, state, peer_str, staging_block_id, dst_block_id]() {
-        if (state->HasFailed()) {
+      try {
+        pool->Schedule([this, state, peer_str, staging_block_id, dst_block_id,
+                        callback_lifetime]() {
+          (void)callback_lifetime;
+          if (state->HasFailed()) {
+            state->MarkChunkComplete();
+            return;
+          }
+          absl::Status status =
+              H2hWriteDirect(peer_str, {staging_block_id}, {dst_block_id})
+                  .status();
+          if (!status.ok()) {
+            state->SetError(status);
+          }
           state->MarkChunkComplete();
-          return;
-        }
-        absl::Status status =
-            H2hWriteDirect(peer_str, {staging_block_id}, {dst_block_id})
-                .status();
-        if (!status.ok()) {
-          state->SetError(status);
-        }
+        });
+      } catch (const std::exception& e) {
+        state->SetError(absl::InternalError(
+            absl::StrCat("Failed to schedule D2H push task: ", e.what())));
         state->MarkChunkComplete();
-      });
+      }
     });
   }
 
@@ -1197,23 +1217,15 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2hReadExplicit(
     const std::vector<uint8_t*>& explicit_dst_ptrs, int parallelism,
     tpu_raiden::transport::MajorOrder major_order,
     tpu_raiden::transport::BlockReceivedCallback on_block_received) {
-  // Copy the transport pointer under lock and execute SyncPull unlocked to
-  // avoid blocking concurrent transfers.
-  tpu_raiden::transport::BlockTransport* transport_server = nullptr;
-  {
-    // TODO: Initialize server_ eagerly in every constructor and remove the
-    // post-construction InitTransportServer() call sites. Then remove the lock.
-    absl::MutexLock lock(server_init_mu_);
-    transport_server = server_.get();
-  }
-  if (!transport_server) {
+  std::shared_ptr<transport::BlockTransport> transport = GetTransportServer();
+  if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
   }
   ASSIGN_OR_RETURN(
       std::vector<int> allocated_ids,
-      transport_server->SyncPull({peer}, src_block_ids, local_block_ids,
-                                 explicit_dst_ptrs, parallelism, major_order,
-                                 on_block_received, kLeaseAuthorizedPullUuid));
+      transport->SyncPull({peer}, src_block_ids, local_block_ids,
+                          explicit_dst_ptrs, parallelism, major_order,
+                          on_block_received, kLeaseAuthorizedPullUuid));
   return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
 }
 
@@ -1419,11 +1431,11 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hDirect(
     const std::vector<int64_t>& dst_offsets,
     const std::vector<int64_t>& copy_sizes, int64_t device_id) {
   const absl::Time d2h_start = absl::Now();
-  ASSIGN_OR_RETURN(
-      auto futures,
-      DispatchD2hChunks(src_offsets, dst_offsets, copy_sizes,
-                        /*slot_idx=*/std::nullopt, /*layer_idx=*/std::nullopt,
-                        /*shard_idx=*/std::nullopt, device_id));
+  ASSIGN_OR_RETURN(auto futures,
+                   DispatchD2hChunks(src_offsets, dst_offsets, copy_sizes,
+                                     /*slot_idx=*/std::nullopt,
+                                     /*layer_idx=*/std::nullopt,
+                                     /*shard_idx=*/std::nullopt, device_id));
   return JoinAndRecordTelemetry(absl::MakeSpan(futures), d2h_start,
                                 telemetry::metric_names::kD2hTransferTimeMs);
 }
@@ -2551,7 +2563,11 @@ absl::Status KVCacheManagerBase::PushKVCacheResharded(
     }
   }
 
-  d2h_future.OnReady([this, request, peer_transfers, numa](auto status_or) {
+  std::shared_ptr<void> callback_guard = TrackManagerCallback();
+  d2h_future.OnReady([this, request, peer_transfers, numa,
+                      callback_guard](auto status_or) mutable {
+    std::shared_ptr<void> callback_lifetime = std::move(callback_guard);
+    (void)callback_lifetime;
     if (!status_or.ok()) {
       LOG(ERROR) << "D2H copy failed for resharded push uuid " << request.uuid()
                  << ": " << status_or.status().ToString();
@@ -2563,11 +2579,8 @@ absl::Status KVCacheManagerBase::PushKVCacheResharded(
               << "): uuid=" << request.uuid() << ", numa=" << numa;
     }
 
-    transport::BlockTransport* transport_server = nullptr;
-    {
-      absl::MutexLock lock(server_init_mu_);
-      transport_server = server_.get();
-    }
+    std::shared_ptr<transport::BlockTransport> transport_server =
+        GetTransportServer();
     if (!transport_server) {
       LOG(ERROR)
           << "Transport server is not running during resharded push for uuid "
@@ -2743,11 +2756,8 @@ absl::Status KVCacheManagerBase::UnregisterActivePlan(uint64_t uuid) {
   }
   // Receive-progress counters key on the uuid; drop them with the plan so a
   // finished, failed, or timed-out uuid can be safely reused.
-  transport::BlockTransport* transport_server = nullptr;
-  {
-    absl::MutexLock lock(server_init_mu_);
-    transport_server = server_.get();
-  }
+  std::shared_ptr<transport::BlockTransport> transport_server =
+      GetTransportServer();
   if (transport_server != nullptr) {
     transport_server->ForgetPushProgress(uuid);
   }

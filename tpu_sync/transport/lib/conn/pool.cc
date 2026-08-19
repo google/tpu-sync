@@ -48,6 +48,9 @@ void CloseSocket(const int fd) {
 absl::StatusOr<int> ConnPool::Borrow(
     absl::string_view peer, absl::string_view local_ip, bool require_psp,
     std::shared_ptr<grpc::Channel> channel) {
+  if (stop_requested_.load(std::memory_order_acquire)) {
+    return absl::FailedPreconditionError("ConnPool is closed.");
+  }
   const Key key = GenPoolKey(peer, local_ip);
   {
     absl::MutexLock lock(mu_);
@@ -65,11 +68,24 @@ absl::StatusOr<int> ConnPool::Borrow(
           CloseSocket(fd);
           continue;
         }
+        borrowed_.insert(fd);
         return fd;
       }
     }
   }
-  return ConnectToPeer(peer, local_ip, require_psp, channel);
+  absl::StatusOr<int> connected = ConnectToPeer(
+      peer, local_ip, require_psp, std::move(channel), &stop_requested_);
+  if (!connected.ok()) return connected.status();
+  const int fd = *connected;
+  {
+    absl::MutexLock lock(mu_);
+    if (stop_) {
+      CloseSocket(fd);
+      return absl::CancelledError("ConnPool closed while connecting.");
+    }
+    borrowed_.insert(fd);
+  }
+  return fd;
 }
 
 void ConnPool::Return(bool ok, int fd, absl::string_view peer,
@@ -78,14 +94,10 @@ void ConnPool::Return(bool ok, int fd, absl::string_view peer,
     return;
   }
 
-  DCHECK_GE(fd, 0);
-  if ABSL_PREDICT_FALSE (!ok) {
-    CloseSocket(fd);
-    return;
-  }
-
   absl::MutexLock lock(mu_);
-  if ABSL_PREDICT_FALSE (stop_) {
+  DCHECK_GE(fd, 0);
+  borrowed_.erase(fd);
+  if ABSL_PREDICT_FALSE (!ok || stop_) {
     CloseSocket(fd);
   } else {
     const Key key = GenPoolKey(peer, local_ip);
@@ -94,8 +106,15 @@ void ConnPool::Return(bool ok, int fd, absl::string_view peer,
 }
 
 void ConnPool::Close() {
+  stop_requested_.store(true, std::memory_order_release);
   absl::MutexLock lock(mu_);
+  if (stop_) return;
   stop_ = true;
+  // Borrowers retain close ownership. shutdown() is sufficient to interrupt
+  // blocking reads/writes without risking close() against a reused fd.
+  for (const int fd : borrowed_) {
+    ::shutdown(fd, SHUT_RDWR);
+  }
   for (auto& [_, fds] : pool_) {
     for (const int fd : fds) {
       CloseSocket(fd);

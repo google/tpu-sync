@@ -120,6 +120,23 @@ class KVCacheManager:
     """
     return bool(self._impl.notify_for_read(req_id, uuid, block_ids))
 
+  def renew_leases(self, remote_endpoint: str, uuids: List[int]) -> List[int]:
+    """Renews queued producer sends without extending them indefinitely.
+
+    Results align positionally with ``uuids``: 1 means applied, 0 is not yet
+    registered, -1 is terminal/expired, -2 is already transferring, and -3
+    reached the producer's absolute retention cap.
+    """
+    return self._impl.renew_leases(remote_endpoint, uuids)
+
+  def cancel_leases(self, remote_endpoint: str, uuids: List[int]) -> List[int]:
+    """Releases queued producer sends that will no longer be pulled.
+
+    Status values match :meth:`renew_leases`. A claimed transfer is never
+    interrupted and returns -2.
+    """
+    return self._impl.cancel_leases(remote_endpoint, uuids)
+
   def start_read(
       self,
       req_id: str,

@@ -15,12 +15,14 @@
 #include "tpu_sync/core/raiden_manager_base.h"
 
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -92,8 +94,17 @@ RaidenManagerBase::RaidenManagerBase(size_t num_layers, size_t num_shards,
 }
 
 RaidenManagerBase::~RaidenManagerBase() {
-  if (server_) {
-    server_.reset();
+  std::shared_ptr<tpu_raiden::transport::BlockTransport> transport;
+  {
+    absl::MutexLock lock(server_init_mu_);
+    transport = std::move(server_);
+  }
+  if (transport) {
+    transport->CancelPendingOperations();
+    if (!transport->WaitForPendingOperations(std::chrono::seconds(30))) {
+      LOG(FATAL) << "Transport operations did not drain before base manager "
+                    "destruction";
+    }
   }
 }
 
@@ -101,10 +112,10 @@ std::vector<HostNicAddress> RaidenManagerBase::GetHostNics() const {
   return GetLocalHostNicAddresses();
 }
 
-tpu_raiden::transport::BlockTransport*
+std::shared_ptr<tpu_raiden::transport::BlockTransport>
 RaidenManagerBase::InitTransportServer() {
   absl::MutexLock lock(server_init_mu_);
-  if (server_) return server_.get();
+  if (server_) return server_;
 
   std::vector<std::string> collected_ips;
   if (bind_ip_cfg_.has_value() && !bind_ip_cfg_->empty()) {
@@ -167,25 +178,66 @@ RaidenManagerBase::InitTransportServer() {
     std::cerr << "InitTransportServer: Local IP: " << ip << std::endl;
   }
 
-  server_ = std::make_unique<tpu_raiden::transport::BlockTransport>(
+  server_ = std::make_shared<tpu_raiden::transport::BlockTransport>(
       this, local_port_cfg_, local_ips_, parallelism_);
-  return server_.get();
+  return server_;
+}
+
+std::shared_ptr<tpu_raiden::transport::BlockTransport>
+RaidenManagerBase::GetTransportServer() const {
+  absl::MutexLock lock(server_init_mu_);
+  return server_;
+}
+
+void RaidenManagerBase::CancelTransportOperations() {
+  std::shared_ptr<tpu_raiden::transport::BlockTransport> transport =
+      GetTransportServer();
+  if (!transport) return;
+  transport->CancelPendingOperations();
+  if (!transport->WaitForPendingOperations(std::chrono::seconds(30))) {
+    LOG(FATAL) << "Transport operations did not drain while the derived "
+                  "manager was alive";
+  }
+}
+
+std::shared_ptr<void> RaidenManagerBase::TrackManagerCallback() {
+  {
+    std::lock_guard<std::mutex> lock(manager_callbacks_mu_);
+    ++active_manager_callbacks_;
+  }
+  return std::shared_ptr<void>(this, [this](void*) {
+    {
+      std::lock_guard<std::mutex> lock(manager_callbacks_mu_);
+      if (active_manager_callbacks_ == 0) {
+        LOG(FATAL) << "Manager callback tracker underflow";
+      }
+      --active_manager_callbacks_;
+    }
+    manager_callbacks_cv_.notify_all();
+  });
+}
+
+bool RaidenManagerBase::WaitForManagerCallbacks(
+    std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lock(manager_callbacks_mu_);
+  return manager_callbacks_cv_.wait_for(
+      lock, timeout, [this]() { return active_manager_callbacks_ == 0; });
 }
 
 std::optional<int> RaidenManagerBase::local_port() const {
-  auto* transport = const_cast<RaidenManagerBase*>(this)->InitTransportServer();
+  auto transport = const_cast<RaidenManagerBase*>(this)->InitTransportServer();
   if (transport) return transport->local_port();
   return std::nullopt;
 }
 
 std::string RaidenManagerBase::local_ip() const {
-  auto* transport = const_cast<RaidenManagerBase*>(this)->InitTransportServer();
+  auto transport = const_cast<RaidenManagerBase*>(this)->InitTransportServer();
   if (transport) return transport->bound_ip();
   return "127.0.0.1";
 }
 
 std::vector<std::string> RaidenManagerBase::local_ips() const {
-  auto* transport = const_cast<RaidenManagerBase*>(this)->InitTransportServer();
+  auto transport = const_cast<RaidenManagerBase*>(this)->InitTransportServer();
   if (local_ips_.empty()) {
     return {transport ? transport->bound_ip() : "127.0.0.1"};
   }
@@ -247,7 +299,7 @@ absl::StatusOr<std::vector<int>> RaidenManagerBase::H2hWriteDirect(
     const std::vector<std::string>& peers,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx) {
-  auto* transport = InitTransportServer();
+  auto transport = InitTransportServer();
   if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
   }
@@ -261,7 +313,7 @@ void RaidenManagerBase::H2hWriteDirectAsync(
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx,
     std::function<void(absl::StatusOr<std::vector<int>>)> on_complete) {
-  auto* transport = InitTransportServer();
+  auto transport = InitTransportServer();
   if (!transport) {
     on_complete(
         absl::FailedPreconditionError("Transport server is not running"));
@@ -275,7 +327,7 @@ void RaidenManagerBase::H2hWriteDirectAsync(
 absl::StatusOr<std::vector<int>> RaidenManagerBase::H2hReadDirect(
     const std::vector<std::string>& peers,
     const std::vector<int>& src_block_ids) {
-  auto* transport = InitTransportServer();
+  auto transport = InitTransportServer();
   if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
   }
@@ -286,7 +338,7 @@ absl::Status RaidenManagerBase::PushWeightsChunk(
     absl::string_view peer, size_t dst_shard_idx, size_t dst_offset_bytes,
     const uint8_t* data_ptr, size_t size_bytes, uint64_t uuid,
     size_t layer_idx) {
-  auto* transport = InitTransportServer();
+  auto transport = InitTransportServer();
   if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
   }
@@ -297,7 +349,7 @@ absl::Status RaidenManagerBase::PushWeightsChunk(
 absl::Status RaidenManagerBase::PushWeightsChunks(
     const std::vector<transport::BufferPushTask>& tasks, int parallelism,
     uint64_t uuid) {
-  auto* transport = InitTransportServer();
+  auto transport = InitTransportServer();
   if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
   }
@@ -306,7 +358,7 @@ absl::Status RaidenManagerBase::PushWeightsChunks(
 
 absl::Status RaidenManagerBase::RegisterExpectedChunks(
     uint64_t uuid, uint32_t expected_chunks) {
-  auto* transport = InitTransportServer();
+  auto transport = InitTransportServer();
   if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
   }
@@ -316,7 +368,7 @@ absl::Status RaidenManagerBase::RegisterExpectedChunks(
 absl::Status RaidenManagerBase::RegisterExpectedLayerChunks(
     uint64_t uuid,
     const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) {
-  auto* transport = InitTransportServer();
+  auto transport = InitTransportServer();
   if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
   }
@@ -324,7 +376,7 @@ absl::Status RaidenManagerBase::RegisterExpectedLayerChunks(
 }
 
 void RaidenManagerBase::ForgetPushProgress(uint64_t uuid) {
-  auto* transport = InitTransportServer();
+  auto transport = InitTransportServer();
   if (transport) {
     transport->ForgetPushProgress(uuid);
   }

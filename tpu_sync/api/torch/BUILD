@@ -295,3 +295,20 @@ py_test(
         "@torch_tpu//src/torch_tpu",
     ],
 )
+
+py_library(
+    name = "kv_cache_offloader_py",
+    srcs = ["kv_cache_offloader.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":torch_abi",
+        ":torch_tpu_common_loader",
+        "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
+    ],
+)
+
+py_test(
+    name = "kv_cache_offloader_test",
+    srcs = ["kv_cache_offloader_test.py"],
+    deps = [":kv_cache_offloader_py"],
+)

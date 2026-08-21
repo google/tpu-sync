@@ -254,6 +254,9 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     std::string req_id;
     uint64_t uuid = 0;
     int64_t slot_idx = -1;
+    // Host blocks held under demand staging, released on completion. Empty
+    // when the transfer holds a fixed slot instead.
+    std::vector<int> staged_host_blocks;
     int64_t num_blocks = 0;
     int64_t registered_num_blocks = 0;
     int64_t total_bytes = 0;
@@ -332,10 +335,21 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   static void ValidateRequestedBlocks(
       const SendEntry& entry, const std::vector<int64_t>& requested_block_ids);
 
+  static bool DynamicHostStagingEnabled();
   absl::Status InitializeSlotPool(int64_t num_slots);
   Slot AcquireSlot();
   Slot AcquireSlotLocked();
   void ReleaseSlotLocked(int64_t slot_idx);
+  struct RecvEntry;  // defined below; staging helpers take it by pointer
+  // Host staging for one incoming read: exactly `num_blocks` blocks under
+  // demand staging, a whole fixed slot otherwise. Returns nullopt when the
+  // staging pool cannot seat the request.
+  std::optional<std::vector<int64_t>> AcquireRecvStagingLocked(
+      int64_t num_blocks, RecvEntry* entry);
+  void ReleaseRecvStagingLocked(RecvEntry* entry);
+  // Same, for paths that have already taken the entry's staging out of it.
+  void ReleaseStagingLocked(int64_t slot_idx,
+                            std::vector<int>* staged_host_blocks);
   void ReleaseEntrySlotLocked(const std::shared_ptr<SendEntry>& entry);
 
   void StartControlServer();
@@ -365,6 +379,9 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   struct RecvEntry {
     std::string req_id;
     int64_t slot_idx = -1;  // host staging slot to release on completion
+    // Host blocks held under demand staging, released on completion. Empty
+    // when the transfer holds a fixed slot instead.
+    std::vector<int> staged_host_blocks;
     CopySpec h2d_copy;
     std::vector<int64_t> chip_block_ids;
     absl::flat_hash_map<int64_t, int64_t> host_to_chip;
@@ -449,6 +466,10 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   int local_data_port_ = 0;
   int64_t max_blocks_ = 0;
   int64_t num_slots_ = 0;
+  // Allocate host staging per request instead of carving the pool into
+  // fixed slots. A short request then costs its own pages rather than a
+  // whole slot, so the same pool seats more transfers at once.
+  bool dynamic_host_staging_ = false;
   double timeout_s_ = 120.0;
   bool unsafe_skip_buffer_lock_ = true;
 

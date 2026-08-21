@@ -26,7 +26,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
-#include "torch_tpu/eager/tensor_to_buffer.h"
+#include "torch_tpu/csrc/eager/tensor_to_buffer.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 

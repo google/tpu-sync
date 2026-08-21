@@ -29,7 +29,7 @@
 #include "absl/types/span.h"
 #include "c10/core/Device.h"
 #include "torch/headeronly/core/DeviceType.h"
-#include "torch_tpu/eager/device_buffer.h"
+#include "torch_tpu/csrc/eager/device_buffer.h"
 #include "xla/future.h"
 #include "xla/layout.h"
 #include "xla/pjrt/pjrt_client.h"

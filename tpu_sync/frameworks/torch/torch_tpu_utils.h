@@ -21,7 +21,7 @@
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
-#include "torch_tpu/eager/device_buffer.h"
+#include "torch_tpu/csrc/eager/device_buffer.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 

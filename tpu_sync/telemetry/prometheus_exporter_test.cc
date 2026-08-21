@@ -74,11 +74,11 @@ TEST(PrometheusExporterTest, RecordAndExportFormat) {
               HasSubstr("# TYPE tpu_raiden_h2d_transfer_time_ms histogram"));
   EXPECT_THAT(
       output,
-      HasSubstr("tpu_raiden_h2d_transfer_time_ms_bucket{le=\"25.000000\"} 1"));
+      HasSubstr("tpu_raiden_h2d_transfer_time_ms_bucket{le=\"25\"} 1"));
   EXPECT_THAT(
       output,
       HasSubstr(
-          "tpu_raiden_h2d_transfer_time_ms_bucket{le=\"5000.000000\"} 1"));
+          "tpu_raiden_h2d_transfer_time_ms_bucket{le=\"5000\"} 1"));
 }
 
 TEST(PrometheusExporterTest, MetricSpecificCustomBuckets) {
@@ -91,26 +91,26 @@ TEST(PrometheusExporterTest, MetricSpecificCustomBuckets) {
   // Verify custom millisecond buckets for H2D
   EXPECT_THAT(
       output,
-      HasSubstr("tpu_raiden_h2d_transfer_time_ms_bucket{le=\"0.100000\"} 0"));
+      HasSubstr("tpu_raiden_h2d_transfer_time_ms_bucket{le=\"0.1\"} 0"));
   EXPECT_THAT(
       output,
-      HasSubstr("tpu_raiden_h2d_transfer_time_ms_bucket{le=\"2.500000\"} 1"));
+      HasSubstr("tpu_raiden_h2d_transfer_time_ms_bucket{le=\"2.5\"} 1"));
   EXPECT_THAT(
       output,
       HasSubstr(
-          "tpu_raiden_h2d_transfer_time_ms_bucket{le=\"5000.000000\"} 1"));
+          "tpu_raiden_h2d_transfer_time_ms_bucket{le=\"5000\"} 1"));
 
   // Verify custom millisecond buckets for D2H
   EXPECT_THAT(
       output,
-      HasSubstr("tpu_raiden_d2h_transfer_time_ms_bucket{le=\"100.000000\"} 0"));
+      HasSubstr("tpu_raiden_d2h_transfer_time_ms_bucket{le=\"100\"} 0"));
   EXPECT_THAT(
       output,
-      HasSubstr("tpu_raiden_d2h_transfer_time_ms_bucket{le=\"250.000000\"} 1"));
+      HasSubstr("tpu_raiden_d2h_transfer_time_ms_bucket{le=\"250\"} 1"));
   EXPECT_THAT(
       output,
       HasSubstr(
-          "tpu_raiden_d2h_transfer_time_ms_bucket{le=\"5000.000000\"} 1"));
+          "tpu_raiden_d2h_transfer_time_ms_bucket{le=\"5000\"} 1"));
 }
 
 TEST(PrometheusExporterTest, UnmappedMetricIgnored) {

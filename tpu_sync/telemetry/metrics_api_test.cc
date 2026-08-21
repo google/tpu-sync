@@ -584,7 +584,7 @@ TEST_F(MetricsApiTest, InitializeFromBackendNamesDeduplicates) {
 
   store_.IncrementCounter(metric_names::kSentBytesTotal, {}, 1);
   EXPECT_THAT(store_.GetTextSnapshot(),
-              HasSubstr("tpu_raiden_sent_bytes_total 1.000000\n"));
+              HasSubstr("tpu_raiden_sent_bytes_total 1\n"));
   EXPECT_THAT(store_.GetAndResetMetricSamples(), IsEmpty());
 }
 

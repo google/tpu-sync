@@ -307,6 +307,7 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     uint64_t num_blocks = 0;
     uint32_t num_ips = 0;
     uint8_t consumer_ips[kMaxNics][16] = {{0}};
+    uint32_t padding = 0;
   };
 
   struct alignas(8) ControlResponseHeader {

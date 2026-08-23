@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>  // NOLINT
@@ -44,8 +45,10 @@
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
@@ -67,6 +70,9 @@ using ::peregrine::WriteExact;
 using ::peregrine::WriteVExact;
 
 namespace {
+
+constexpr int kMaxPushThreads = 16;
+
 absl::Status InternalError(absl::string_view msg, int _errno) {
   return absl::InternalError(absl::StrCat(msg, ": ", std::strerror(_errno)));
 }
@@ -690,33 +696,31 @@ absl::Status RawBufferTransport::PushBuffers(
     return absl::OkStatus();
   }
 
-  // Parallel execution using standard threads.
-  std::vector<std::thread> threads;
-  std::atomic<size_t> next_batch_idx(0);
-  std::vector<absl::Status> statuses(batches.size(), absl::OkStatus());
-
-  int num_threads = std::min(static_cast<size_t>(parallelism), batches.size());
-  threads.reserve(num_threads);
-  for (int t = 0; t < num_threads; ++t) {
-    threads.push_back(std::thread([&]() {
-      while (true) {
-        size_t idx = next_batch_idx.fetch_add(1);
-        if (idx >= batches.size()) break;
-        const auto& batch = batches[idx];
-        statuses[idx] = PushBatch(batch.peer, grouped_tasks, batch.start_idx,
-                                  batch.count, uuid);
-      }
-    }));
-  }
-
-  for (auto& thread : threads) {
-    if (thread.joinable()) {
-      thread.join();
+  tpu_raiden::NumaThreadPool* pool = nullptr;
+  {
+    absl::MutexLock lock(push_pool_mu_);
+    if (!push_pool_) {
+      push_pool_ =
+          std::make_unique<tpu_raiden::NumaThreadPool>(kMaxPushThreads);
     }
+    pool = push_pool_.get();
   }
+
+  absl::BlockingCounter counter(batches.size());
+  std::vector<absl::Status> statuses(batches.size(), absl::OkStatus());
+  for (size_t i = 0; i < batches.size(); ++i) {
+    pool->Schedule([this, peer = batches[i].peer, &grouped_tasks,
+                    start_idx = batches[i].start_idx, count = batches[i].count,
+                    uuid, &counter, &status = statuses[i]]() {
+      status = PushBatch(peer, grouped_tasks, start_idx, count, uuid);
+      counter.DecrementCount();
+    });
+  }
+
+  counter.Wait();
 
   for (const auto& s : statuses) {
-    if (!s.ok()) return s;
+    RETURN_IF_ERROR(s);
   }
   return absl::OkStatus();
 }

@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>  // NOLINT
@@ -34,6 +35,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
@@ -175,6 +177,10 @@ class RawBufferTransport final {
   absl::Mutex raw_progress_mu_;
   absl::flat_hash_map<uint64_t, RawProgress> raw_progress_
       ABSL_GUARDED_BY(raw_progress_mu_);
+
+  absl::Mutex push_pool_mu_;
+  std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_
+      ABSL_GUARDED_BY(push_pool_mu_);
 
   std::thread listener_thread_;
   std::vector<std::thread> worker_threads_;

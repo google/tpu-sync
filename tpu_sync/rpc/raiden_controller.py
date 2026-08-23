@@ -15,7 +15,6 @@
 """Raiden Controller providing high-level transfer API and resharding plans."""
 
 import asyncio
-import copy
 import dataclasses
 import enum
 import functools
@@ -2062,23 +2061,19 @@ class RaidenController:
                 src_units,
                 dst_units,
             )
-            computed_schedules = copy.deepcopy(
-                cached_schedule.computed_schedules
-            )
-            direct_schedules = copy.deepcopy(cached_schedule.direct_schedules)
-            broadcast_groups = copy.deepcopy(cached_schedule.broadcast_groups)
-            local_skip_tiling = dict(cached_schedule.local_skip_tiling)
+            computed_schedules = cached_schedule.computed_schedules
+            direct_schedules = cached_schedule.direct_schedules
+            broadcast_groups = cached_schedule.broadcast_groups
+            local_skip_tiling = cached_schedule.local_skip_tiling
             if expected_block_count == 0:
               expected_block_count = cached_schedule.expected_block_count
-            dst_unit_layer_counts = copy.deepcopy(
-                cached_schedule.dst_unit_layer_counts
-            )
-            data_address_to_unit = dict(cached_schedule.data_address_to_unit)
-            direct_dsts = list(cached_schedule.direct_dsts)
+            dst_unit_layer_counts = cached_schedule.dst_unit_layer_counts
+            data_address_to_unit = cached_schedule.data_address_to_unit
+            direct_dsts = cached_schedule.direct_dsts
             rpc_addresses = dict(self.worker_rpc_client.get_worker_endpoints())
             rpc_addresses.update(cached_schedule.rpc_addresses)
-            data_addresses = copy.deepcopy(cached_schedule.data_addresses)
-            dst_unit_counts = copy.deepcopy(cached_schedule.dst_unit_counts)
+            data_addresses = cached_schedule.data_addresses
+            dst_unit_counts = cached_schedule.dst_unit_counts
 
           else:
             # 1. Retrieve destination metadata (either from remote dst_controller
@@ -2747,19 +2742,19 @@ class RaidenController:
             ):
               with self._lock:
                 self._plan_cache[cache_key] = _CachedTransferSchedule(
-                    computed_schedules=copy.deepcopy(computed_schedules),
-                    direct_schedules=copy.deepcopy(direct_schedules),
-                    broadcast_groups=copy.deepcopy(broadcast_groups),
+                    computed_schedules=computed_schedules,
+                    direct_schedules=direct_schedules,
+                    broadcast_groups=broadcast_groups,
                     local_skip_tiling=dict(local_skip_tiling)
                     if local_skip_tiling
                     else {},
                     expected_block_count=expected_block_count,
-                    dst_unit_layer_counts=copy.deepcopy(dst_unit_layer_counts),
+                    dst_unit_layer_counts=dst_unit_layer_counts,
                     data_address_to_unit=dict(data_address_to_unit),
                     direct_dsts=list(direct_dsts),
                     rpc_addresses=dict(rpc_addresses),
-                    data_addresses=copy.deepcopy(data_addresses),
-                    dst_unit_counts=copy.deepcopy(dst_unit_counts),
+                    data_addresses=data_addresses,
+                    dst_unit_counts=dst_unit_counts,
                 )
 
           # Build final plan and replace the partial plan

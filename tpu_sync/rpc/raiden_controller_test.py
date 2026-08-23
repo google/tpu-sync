@@ -2095,6 +2095,81 @@ class GetGlobalIndicesTest(absltest.TestCase):
         len(plan2.shard_push_schedules), len(plan.shard_push_schedules)
     )
 
+  def test_zero_copy_plan_cache_immutability_and_reuse(self):
+    dummy_client = DummyWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=10012, worker_rpc_client=dummy_client, enable_plan_cache=True
+    )
+    src_unit = raiden_controller.RaidenId(
+        job_name="trainer",
+        job_replica_id="0",
+        data_name="weights_0",
+        data_replica_idx=0,
+    )
+    dst_unit = raiden_controller.RaidenId(
+        job_name="inference",
+        job_replica_id="0",
+        data_name="weights_0",
+        data_replica_idx=0,
+    )
+    vars_list = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0.weight",
+            shape=[1024, 1024],
+            mesh_shape=[1, 1],
+            layout=[1, 0],
+            item_size=4,
+            layer_idx=0,
+            sharding_spec=["fsdp", "tp"],
+        )
+    ]
+    controller.register_work_unit(
+        src_unit,
+        ["10.0.0.1:8000"],
+        control_plane_rpc_address="10.0.0.1:9000",
+        mesh_shape=[1, 1],
+        mesh_axes=["fsdp", "tp"],
+        variables=vars_list,
+    )
+    controller.register_work_unit(
+        dst_unit,
+        ["10.0.0.2:8000"],
+        control_plane_rpc_address="10.0.0.2:9000",
+        mesh_shape=[1, 1],
+        mesh_axes=["fsdp", "tp"],
+        variables=vars_list,
+    )
+
+    # First transfer compiles and caches the plan
+    fut1 = controller.start_transfer(
+        src_units=[src_unit],
+        dst_units=[dst_unit],
+        use_block_chunks=True,
+        uuid=1001,
+        req_id="zero_copy_req_0",
+    )
+    asyncio.run(fut1.wait())
+    plan1 = controller.get_plan("zero_copy_req_0")
+    self.assertIsNotNone(plan1)
+
+    # Second transfer reuses cached plan with zero-copy
+    fut2 = controller.start_transfer(
+        src_units=[src_unit],
+        dst_units=[dst_unit],
+        use_block_chunks=True,
+        uuid=1002,
+        req_id="zero_copy_req_1",
+    )
+    asyncio.run(fut2.wait())
+    plan2 = controller.get_plan("zero_copy_req_1")
+    self.assertIsNotNone(plan2)
+
+    # Verify requests have independent dynamic IDs but share identical
+    # pre-computed schedules
+    self.assertEqual(plan1.uuid, 1001)
+    self.assertEqual(plan2.uuid, 1002)
+    self.assertEqual(plan1.shard_push_schedules, plan2.shard_push_schedules)
+
 
 if __name__ == "__main__":
   absltest.main()

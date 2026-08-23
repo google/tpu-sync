@@ -683,9 +683,9 @@ cc_test(
         "//tpu_sync/telemetry:mock_metrics_backend",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/types:span",
+        "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest_main",
-    ],
-)
+    ],)
 
 cc_test(
     name = "kv_cache_manager_perf_test",

@@ -35,6 +35,8 @@
 
 #include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -2228,6 +2230,52 @@ absl::Status KVCacheManagerBase::PushKVCacheResharded(
 absl::Status KVCacheManagerBase::RegisterActivePlan(
     uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
     bool is_sender) {
+  return RegisterActivePlan(uuid, request, is_sender, {});
+}
+
+absl::StatusOr<std::vector<HostBlockId>> KVCacheManagerBase::PlanHostBlocks(
+    uint64_t uuid, const std::vector<DeviceBlockId>& block_ids) const {
+  std::shared_ptr<const RegisteredPlan> plan;
+  {
+    absl::MutexLock l(plans_mu_);
+    auto it = active_plans_.find(uuid);
+    if (it != active_plans_.end()) plan = it->second;
+  }
+  if (plan == nullptr) {
+    return absl::NotFoundError(
+        absl::StrCat("no active transfer plan with uuid ", uuid));
+  }
+  if (plan->request.pool_groups_size() > 0) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "transfer plan ", uuid, " is pool-addressed; its bytes are staged at "
+        "pool offsets, not per-block host blocks"));
+  }
+  std::vector<int64_t> out;
+  out.reserve(block_ids.size());
+  for (int64_t id : block_ids) {
+    if (!plan->staged_device_blocks.contains(id)) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "block ", id, " is not staged by transfer plan ", uuid));
+    }
+    if (plan->host_block_of.empty()) {
+      out.push_back(id);
+      continue;
+    }
+    auto it = plan->host_block_of.find(id);
+    if (it == plan->host_block_of.end()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "block ", id, " is not staged by transfer plan ", uuid));
+    }
+    out.push_back(it->second);
+  }
+  return out;
+}
+
+absl::Status KVCacheManagerBase::RegisterActivePlan(
+    uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
+    bool is_sender,
+    absl::flat_hash_map<DeviceBlockId, HostBlockId> host_block_of,
+    uint64_t generation) {
   // Structural contract for pool-addressed plans. Pool selection is request
   // data resolved by the controller; raiden validates consistency (indices
   // resolve against this manager's pool table, explicit or implicit) and
@@ -2280,10 +2328,20 @@ absl::Status KVCacheManagerBase::RegisterActivePlan(
       }
     }
   }
+  absl::flat_hash_set<int64_t> staged_device_blocks;
+  if (request.pool_groups_size() == 0) {
+    for (const auto& [src_shard, schedule] : request.shard_push_schedules()) {
+      for (const auto& entry : schedule.entries()) {
+        staged_device_blocks.insert(is_sender ? entry.src_block_id()
+                                              : entry.dst_block_id());
+      }
+    }
+  }
   absl::MutexLock l(plans_mu_);
   if (auto [it, inserted] = active_plans_.try_emplace(
-          uuid, std::make_shared<const RegisteredPlan>(
-                    RegisteredPlan{request, is_sender}));
+          uuid, std::make_shared<const RegisteredPlan>(RegisteredPlan{
+                    request, is_sender, std::move(host_block_of),
+                    std::move(staged_device_blocks), generation}));
       !inserted) {
     return absl::AlreadyExistsError(
         absl::StrCat("Plan with UUID ", uuid, " is already registered!"));
@@ -2421,7 +2479,18 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
 
   for (int64_t block_id : block_ids) {
     if (accumulated_bytes >= total_bytes) break;
-    size_t block_start_byte = static_cast<size_t>(block_id) * block_size_bytes;
+    // The wire names device blocks; the bytes live wherever this side staged
+    // them, which is the block's own id unless the plan says otherwise.
+    int64_t host_block = block_id;
+    if (!plan_snapshot->host_block_of.empty()) {
+      auto hb = plan_snapshot->host_block_of.find(block_id);
+      if (hb == plan_snapshot->host_block_of.end()) {
+        return {};
+      }
+      host_block = hb->second;
+    }
+    size_t block_start_byte =
+        static_cast<size_t>(host_block) * block_size_bytes;
     std::vector<tpu_raiden::transport::BlockChunk> block_resolved_chunks;
 
     if (is_sender) {

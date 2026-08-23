@@ -272,6 +272,9 @@ NB_MODULE(_tpu_raiden_torch, m) {
           "unregister_active_plan",
           [](KVCacheManager& self, uint64_t uuid) {
             absl::Status status = self.UnregisterActivePlan(uuid);
+            // A plan that already settled is gone; unregistering it again is
+            // a no-op rather than an error.
+            if (absl::IsNotFound(status)) return;
             if (!status.ok()) {
               throw std::runtime_error(
                   "KVCacheManager unregister_active_plan failed: " +
@@ -279,6 +282,17 @@ NB_MODULE(_tpu_raiden_torch, m) {
             }
           },
           nb::arg("uuid"))
+      .def(
+          "plan_host_blocks",
+          [](KVCacheManager& self, uint64_t uuid,
+             const std::vector<int64_t>& block_ids) {
+            auto blocks = self.PlanHostBlocks(uuid, block_ids);
+            if (!blocks.ok()) {
+              throw std::runtime_error(std::string(blocks.status().message()));
+            }
+            return *std::move(blocks);
+          },
+          nb::arg("uuid"), nb::arg("block_ids"))
       .def(
           "push_registered_plan",
           [](KVCacheManager& self, uint64_t uuid, const std::string& peer,

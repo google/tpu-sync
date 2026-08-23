@@ -688,16 +688,69 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
 absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
     uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
     bool is_sender) {
-  // 1. Call base class implementation to register the plan in active_plans_
-  TF_RETURN_IF_ERROR(kv_cache::KVCacheManagerBase::RegisterActivePlan(
-      uuid, request, is_sender));
+  // Registration is one indivisible step: a concurrent unregister or a
+  // second registration of the same uuid waits for it, so a plan is never
+  // visible without the staging and receive state that belong to it.
+  absl::MutexLock lifecycle(plan_lifecycle_mu_);
+  if (kv_cache::KVCacheManagerBase::HasActivePlan(uuid)) {
+    return absl::AlreadyExistsError(
+        absl::StrCat("Plan with UUID ", uuid, " is already registered!"));
+  }
+  const uint64_t generation = ++plan_generation_counter_;
+  // Under demand staging a plan's device blocks are staged in host blocks
+  // allocated for the plan, so the host mirror no longer has to span the
+  // device block space. Pool-addressed plans keep their own addressing.
+  absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>
+      host_block_of;
+  std::vector<int> plan_blocks;
+  if (dynamic_host_staging_ && request.pool_groups_size() == 0) {
+    std::vector<int64_t> device_blocks;
+    absl::flat_hash_set<int64_t> seen;
+    for (const auto& [src_shard, schedule] : request.shard_push_schedules()) {
+      for (const auto& e : schedule.entries()) {
+        int64_t id = is_sender ? e.src_block_id() : e.dst_block_id();
+        if (seen.insert(id).second) device_blocks.push_back(id);
+      }
+    }
+    if (!device_blocks.empty()) {
+      absl::MutexLock lock(mu_);
+      auto allocated = host_block_manager_->Allocate(
+          static_cast<int>(device_blocks.size()), /*lock=*/true);
+      if (!allocated.ok()) {
+        return absl::ResourceExhaustedError(absl::StrCat(
+            "cannot stage ", device_blocks.size(), " blocks for plan ", uuid,
+            ": ", allocated.status().message()));
+      }
+      plan_blocks = *allocated;
+      for (size_t i = 0; i < device_blocks.size(); ++i) {
+        host_block_of[device_blocks[i]] = plan_blocks[i];
+      }
+    }
+  }
+
+
+  // Staging ownership is settled before the plan is published. An HBM
+  // receiver's blocks belong to its receive entry and return when the
+  // upload settles; a sender's blocks, and a host-memory receiver's,
+  // belong to the plan and return when it is unregistered.
+  const bool hbm_receiver =
+      !is_sender && request.dst_mem_type() == ::tpu_sync::rpc::MEMORY_TYPE_HBM;
+  if (!plan_blocks.empty() && !hbm_receiver) {
+    absl::MutexLock lock(mu_);
+    plan_staging_[uuid] = plan_blocks;
+  }
 
   // 2. If we are the receiver and the destination memory type is HBM,
   //    populate active_recv_entries_ to enable automatic H2D copy!
-  if (!is_sender &&
-      request.dst_mem_type() == ::tpu_sync::rpc::MEMORY_TYPE_HBM) {
+  if (hbm_receiver) {
     absl::MutexLock lock(mu_);
     RecvEntry recv_entry;
+    recv_entry.staged_host_blocks = std::move(plan_blocks);
+    // Once its receive settles, a demand-staged receiver plan would map
+    // host blocks that are already freed; the plan is therefore dropped
+    // together with the receive instead of outliving it.
+    recv_entry.unregister_on_settle = !recv_entry.staged_host_blocks.empty();
+    recv_entry.plan_generation = generation;
     std::string req_id = request.req_id().empty()
                              ? absl::StrCat("resharded_transfer_", uuid)
                              : request.req_id();
@@ -710,8 +763,10 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
       absl::flat_hash_set<std::pair<int, int>>
           unique_transfers_from_this_source;
       for (const auto& push_entry : schedule.entries()) {
-        recv_entry.host_to_chip[push_entry.dst_block_id()] =
-            push_entry.dst_block_id();
+        const int64_t dst = push_entry.dst_block_id();
+        auto hb = host_block_of.find(dst);
+        recv_entry.host_to_chip[hb == host_block_of.end() ? dst : hb->second] =
+            dst;
         unique_transfers_from_this_source.insert(
             {push_entry.src_block_id(), push_entry.dst_block_id()});
         unique_dst_blocks.insert(push_entry.dst_block_id());
@@ -723,14 +778,22 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
     recv_entry.deadline = DeadlineFromNow();
     recv_entry.start_time = std::chrono::steady_clock::now();
 
-    // Populate h2d_copy spec for unique destination blocks
-    std::vector<int64_t> h2d_host_block_ids(unique_dst_blocks.begin(),
-                                            unique_dst_blocks.end());
-    std::vector<int64_t> h2d_local_block_ids =
-        h2d_host_block_ids;  // 1-to-1 mapping
+    // H2D reads each destination block from wherever it was staged.
+    std::vector<int64_t> h2d_local_block_ids(unique_dst_blocks.begin(),
+                                             unique_dst_blocks.end());
+    std::vector<int64_t> h2d_host_block_ids;
+    h2d_host_block_ids.reserve(h2d_local_block_ids.size());
+    for (int64_t dst : h2d_local_block_ids) {
+      auto hb = host_block_of.find(dst);
+      h2d_host_block_ids.push_back(hb == host_block_of.end() ? dst
+                                                             : hb->second);
+    }
     recv_entry.h2d_copy =
         BuildCoalescedCopySpec(h2d_host_block_ids, h2d_local_block_ids);
 
+    if (total_blocks == 0) {
+      ReleaseRecvStagingLocked(&recv_entry);
+    }
     if (total_blocks > 0) {
       active_recv_entries_[uuid] = std::move(recv_entry);
       LOG(INFO) << "RegisterActivePlan (Receiver): Populated "
@@ -739,6 +802,26 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
                 << " total physical block-pushes (including duplicates across "
                    "sources) for automatic H2D.";
     }
+  }
+
+  // Publish the plan last: pushes resolve through it, so everything they
+  // may touch exists by the time it is visible.
+  absl::Status registered = kv_cache::KVCacheManagerBase::RegisterActivePlan(
+      uuid, request, is_sender, host_block_of, generation);
+  if (!registered.ok()) {
+    absl::MutexLock lock(mu_);
+    auto staged = plan_staging_.find(uuid);
+    if (staged != plan_staging_.end()) {
+      (void)host_block_manager_->Unlock(staged->second);
+      (void)host_block_manager_->Deallocate(staged->second);
+      plan_staging_.erase(staged);
+    }
+    auto recv = active_recv_entries_.find(uuid);
+    if (recv != active_recv_entries_.end()) {
+      ReleaseRecvStagingLocked(&recv->second);
+      active_recv_entries_.erase(recv);
+    }
+    return registered;
   }
   return absl::OkStatus();
 }
@@ -1450,6 +1533,49 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
   return absl::OkStatus();
 }
 
+absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {
+  absl::MutexLock lifecycle(plan_lifecycle_mu_);
+  bool deferred = false;
+  {
+    absl::MutexLock lock(mu_);
+    auto it = plan_staging_.find(uuid);
+    if (it != plan_staging_.end()) {
+      (void)host_block_manager_->Unlock(it->second);
+      (void)host_block_manager_->Deallocate(it->second);
+      plan_staging_.erase(it);
+    }
+    // A receive still in flight keeps its plan: pushes the transport has
+    // already accepted must keep resolving into the plan's staging blocks.
+    // The plan is dropped when the receive completes, fails, or times out.
+    auto recv = active_recv_entries_.find(uuid);
+    if (recv != active_recv_entries_.end() && !recv->second.is_pool_reshard) {
+      recv->second.unregister_on_settle = true;
+      deferred = true;
+    }
+  }
+  if (deferred) return absl::OkStatus();
+  return kv_cache::KVCacheManagerBase::UnregisterActivePlan(uuid);
+}
+
+void KVCacheManagerWithTransfer::UnregisterSettledPlan(uint64_t uuid,
+                                                       uint64_t generation) {
+  // Serialized with registration so cleanup for one registration can never
+  // remove a newer one reusing the uuid, or race its progress counters.
+  absl::MutexLock lifecycle(plan_lifecycle_mu_);
+  if (generation != 0) {
+    std::optional<uint64_t> current = ActivePlanGeneration(uuid);
+    if (!current.has_value() || *current != generation) {
+      return;  // the plan is gone, or the uuid already belongs to a newer one
+    }
+  }
+  absl::Status status =
+      kv_cache::KVCacheManagerBase::UnregisterActivePlan(uuid);
+  if (!status.ok() && !absl::IsNotFound(status)) {
+    LOG(ERROR) << "Failed to unregister settled transfer plan " << uuid << ": "
+               << status;
+  }
+}
+
 std::vector<RaidenTransferEndpoint>
 KVCacheManagerWithTransfer::get_local_endpoints() const {
   // NOTE: prefers the CONTROL port when a control server is running, because
@@ -1576,7 +1702,8 @@ void KVCacheManagerWithTransfer::StartRead(
     }
     recv_slot = staging.slot_idx;
     staged_host_blocks = std::move(staging.staged_host_blocks);
-    absl::flat_hash_map<int64_t, int64_t> local_to_host;
+    absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>
+        local_to_host;
     size_t host_block_idx = 0;
     host_block_ids.reserve(local_block_ids.size());
     for (size_t k = 0; k < local_block_ids.size(); ++k) {
@@ -1702,7 +1829,7 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
   std::vector<std::string> done_sending;
   std::vector<std::string> done_recving;
   std::vector<std::string> failed_recving;
-  std::vector<uint64_t> timed_out_plan_uuids;
+  std::vector<std::pair<uint64_t, uint64_t>> settled_plans;
   {
     absl::MutexLock lock(mu_);
     const auto now = std::chrono::steady_clock::now();
@@ -1713,7 +1840,7 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
         // never sent, so the transfer failed.
         failed_recving_.insert(entry->req_id);
         ReleaseEntrySlotLocked(entry);
-        timed_out_plan_uuids.push_back(it->first);
+        settled_plans.emplace_back(it->first, 0);
         it = send_entries_.erase(it);
       } else {
         ++it;
@@ -1724,7 +1851,7 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
       const auto& entry = it->second;
       if (entry->deadline <= now) {
         failed_recving_.insert(entry->req_id);
-        timed_out_plan_uuids.push_back(it->first);
+        settled_plans.emplace_back(it->first, 0);
         auto erase_it = it++;
         active_pool_reshard_sends_.erase(erase_it);
       } else {
@@ -1752,6 +1879,9 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
                     << entry.req_id;
           done_recving_.insert(entry.req_id);
           ReleaseRecvStagingLocked(&entry);
+          if (entry.unregister_on_settle) {
+            settled_plans.emplace_back(it->first, entry.plan_generation);
+          }
           active_recv_entries_.erase(it++);
           continue;
         }
@@ -1760,7 +1890,7 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
       if (entry.deadline <= now) {
         failed_recving_.insert(entry.req_id);
         ReleaseRecvStagingLocked(&entry);
-        timed_out_plan_uuids.push_back(it->first);
+        settled_plans.emplace_back(it->first, entry.plan_generation);
         active_recv_entries_.erase(it++);
       } else {
         ++it;
@@ -1774,13 +1904,9 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
     failed_recving_.clear();
   }
   // Unregistering drops the plan and its transport receive-progress counters
-  // (ForgetPushProgress), so a timed-out uuid is reusable.
-  for (uint64_t uuid : timed_out_plan_uuids) {
-    absl::Status status = UnregisterActivePlan(uuid);
-    if (!status.ok() && !absl::IsNotFound(status)) {
-      LOG(ERROR) << "Failed to unregister timed-out transfer plan " << uuid
-                 << ": " << status;
-    }
+  // (ForgetPushProgress), so a settled uuid is reusable.
+  for (const auto& [uuid, generation] : settled_plans) {
+    UnregisterSettledPlan(uuid, generation);
   }
   return {done_sending, done_recving, failed_recving};
 }
@@ -2753,8 +2879,11 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
   int64_t recv_slot = -1;
   std::vector<int> recv_staged;
   CopySpec h2d_copy;
-  absl::flat_hash_map<int64_t, int64_t> host_to_chip;
+  absl::flat_hash_map<kv_cache::HostBlockId, kv_cache::DeviceBlockId>
+      host_to_chip;
   bool found = false;
+  bool unregister_plan = false;
+  uint64_t plan_generation = 0;
   std::vector<int> accumulated_host_blocks;
 
   std::chrono::steady_clock::time_point start_time;
@@ -2793,6 +2922,8 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
           }
           found = true;
           recv_staged = std::move(it->second.staged_host_blocks);
+          unregister_plan = it->second.unregister_on_settle;
+          plan_generation = it->second.plan_generation;
           active_recv_entries_.erase(it);
         }
       } else {
@@ -2819,6 +2950,7 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
     done_recving_.insert(req_id);
     ReleaseStagingLocked(recv_slot, &recv_staged);
   }
+  if (unregister_plan) UnregisterSettledPlan(uuid, plan_generation);
 
   LOG(INFO) << "OnBlocksReceived (Network + H2D complete): req_id=" << req_id
             << ", uuid=" << uuid
@@ -2999,54 +3131,70 @@ absl::Status KVCacheManagerWithTransfer::OnLayerReceived(size_t layer_idx,
                                    h2d_copy.sizes, /*slot_idx=*/std::nullopt,
                                    /*layer_idx=*/layer_idx);
   if (!future_or.ok()) {
-    absl::MutexLock lock(mu_);
-    failed_recving_.insert(req_id);
-    auto it = active_recv_entries_.find(uuid);
-    if (it != active_recv_entries_.end()) {
-      ReleaseRecvStagingLocked(&it->second);
-      active_recv_entries_.erase(it);
+    bool unregister_plan = false;
+    uint64_t plan_generation = 0;
+    {
+      absl::MutexLock lock(mu_);
+      failed_recving_.insert(req_id);
+      auto it = active_recv_entries_.find(uuid);
+      if (it != active_recv_entries_.end()) {
+        ReleaseRecvStagingLocked(&it->second);
+        unregister_plan = it->second.unregister_on_settle;
+        plan_generation = it->second.plan_generation;
+        active_recv_entries_.erase(it);
+      }
     }
+    if (unregister_plan) UnregisterSettledPlan(uuid, plan_generation);
     return future_or.status();
   }
 
   auto future = future_or.value();
   future.OnReady([this, uuid, layer_idx, recv_slot, req_id,
                   metrics_collector = metrics_collector_](auto status_or) {
-    absl::MutexLock lock(mu_);
-    auto it = active_recv_entries_.find(uuid);
-    if (it == active_recv_entries_.end()) {
-      return;
-    }
-    auto& entry = it->second;
-    if (status_or.ok()) {
-      LOG(INFO) << "OnLayerReceived (H2D copy complete) layer " << layer_idx
-                << ": req_id=" << req_id
-                << ", numa=" << assigned_numa_node().value_or(-1);
-      entry.num_completed_layers++;
-      if (entry.num_completed_layers == num_layers()) {
-        // TODO: Find a way to optimize this by moving out of the mutex.
-        RecordTransferDuration(
-            DurationMs(entry.start_time, std::chrono::steady_clock::now()));
+    bool unregister_plan = false;
+    uint64_t plan_generation = 0;
+    {
+      absl::MutexLock lock(mu_);
+      auto it = active_recv_entries_.find(uuid);
+      if (it == active_recv_entries_.end()) {
+        return;
+      }
+      auto& entry = it->second;
+      if (status_or.ok()) {
+        LOG(INFO) << "OnLayerReceived (H2D copy complete) layer " << layer_idx
+                  << ": req_id=" << req_id
+                  << ", numa=" << assigned_numa_node().value_or(-1);
+        entry.num_completed_layers++;
+        if (entry.num_completed_layers == num_layers()) {
+          // TODO: Find a way to optimize this by moving out of the mutex.
+          RecordTransferDuration(
+              DurationMs(entry.start_time, std::chrono::steady_clock::now()));
 
-        if (metrics_collector) {
-          metrics_collector->RecordH2dComplete(uuid);
+          if (metrics_collector) {
+            metrics_collector->RecordH2dComplete(uuid);
+          }
+          LOG(INFO) << "All layers H2D copy complete: req_id=" << req_id;
+          if (metrics_collector) {
+            metrics_collector->RecordEnd(uuid);
+          }
+          done_recving_.insert(req_id);
+          ReleaseRecvStagingLocked(&entry);
+          unregister_plan = entry.unregister_on_settle;
+          plan_generation = entry.plan_generation;
+          active_recv_entries_.erase(uuid);
         }
-        LOG(INFO) << "All layers H2D copy complete: req_id=" << req_id;
-        if (metrics_collector) {
-          metrics_collector->RecordEnd(uuid);
-        }
-        done_recving_.insert(req_id);
+      } else {
+        LOG(ERROR) << "OnLayerReceived (H2D copy failed) layer " << layer_idx
+                   << " for req_id: " << req_id
+                   << ", error: " << status_or.status().ToString();
+        failed_recving_.insert(req_id);
         ReleaseRecvStagingLocked(&entry);
+        unregister_plan = entry.unregister_on_settle;
+        plan_generation = entry.plan_generation;
         active_recv_entries_.erase(uuid);
       }
-    } else {
-      LOG(ERROR) << "OnLayerReceived (H2D copy failed) layer " << layer_idx
-                 << " for req_id: " << req_id
-                 << ", error: " << status_or.status().ToString();
-      failed_recving_.insert(req_id);
-      ReleaseRecvStagingLocked(&entry);
-      active_recv_entries_.erase(uuid);
     }
+    if (unregister_plan) UnregisterSettledPlan(uuid, plan_generation);
   });
 
   {

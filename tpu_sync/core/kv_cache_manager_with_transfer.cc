@@ -620,6 +620,14 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
 
 KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
   StopControlServer();
+  // Pull-serve workers read this object's state; nothing may be torn down
+  // while one is still running.
+  shutting_down_.store(true, std::memory_order_relaxed);
+  {
+    absl::MutexLock lock(pull_workers_mu_);
+    pull_workers_mu_.Await(absl::Condition(
+        +[](int* active) { return *active == 0; }, &active_pull_workers_));
+  }
   push_pool_.reset();
   pull_pool_.reset();
   if (host_block_manager_ && !all_slots_.empty()) {
@@ -1556,6 +1564,13 @@ void KVCacheManagerWithTransfer::StartRead(
     if (!staged.has_value()) {
       // Request larger than the staging pool can seat: surface as a recv
       // failure (the connector can recompute) rather than throwing.
+      LOG(ERROR) << "StartRead: cannot stage " << unique_local_bids.size()
+                 << " blocks for req_id=" << req_id
+                 << " (dynamic=" << dynamic_host_staging_
+                 << ", free_host_blocks="
+                 << host_block_manager_->num_free_blocks()
+                 << ", free_slots=" << free_slots_.size()
+                 << ", max_blocks=" << max_blocks_ << ")";
       failed_recving_.insert(req_id);
       return;
     }
@@ -1694,7 +1709,9 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
     for (auto it = send_entries_.begin(); it != send_entries_.end();) {
       const auto& entry = it->second;
       if (entry->deadline <= now) {
-        done_sending_.insert(entry->req_id);
+        // Nothing pulled this entry within its deadline; the bytes were
+        // never sent, so the transfer failed.
+        failed_recving_.insert(entry->req_id);
         ReleaseEntrySlotLocked(entry);
         timed_out_plan_uuids.push_back(it->first);
         it = send_entries_.erase(it);
@@ -1923,9 +1940,14 @@ KVCacheManagerWithTransfer::AcquireRecvStagingLocked(int64_t num_blocks,
     return blocks;
   }
   // Lock the pages so the pool's LRU cannot evict staging that is mid-flight.
+  // An allocation miss is only reported back; this helper neither retries
+  // nor logs. The producer retries it until its deadline, the consumer
+  // fails it at once, and each logs its own verdict.
   auto allocated = host_block_manager_->Allocate(static_cast<int>(num_blocks),
                                                  /*lock=*/true);
-  if (!allocated.ok()) return std::nullopt;
+  if (!allocated.ok()) {
+    return std::nullopt;
+  }
   entry->staged_host_blocks = *allocated;
   std::vector<int64_t> blocks;
   blocks.reserve(allocated->size());
@@ -2150,6 +2172,10 @@ void KVCacheManagerWithTransfer::StopControlServer() {
       RemoveStagingReadinessLocked(staging_readiness_.begin()->first);
     }
   }
+  // Wake workers parked in ProcessPullStream waiting for a send entry that
+  // will never arrive, so their loops observe stopping_ and the pools can
+  // join them.
+  cv_.SignalAll();
   if (control_fd_ >= 0) {
     shutdown(control_fd_, SHUT_RDWR);
     close(control_fd_);
@@ -2319,11 +2345,87 @@ void KVCacheManagerWithTransfer::ProcessPullStream(
     }
   }
 
+  {
+    absl::MutexLock lock(pull_workers_mu_);
+    ++active_pull_workers_;
+  }
   std::thread([this, uuid = req.uuid, remote_data_endpoints, src_block_ids,
                dst_block_ids]() {
     StartPushInternal(uuid, remote_data_endpoints, src_block_ids,
                       dst_block_ids);
+    absl::MutexLock lock(pull_workers_mu_);
+    --active_pull_workers_;
   }).detach();
+}
+
+bool KVCacheManagerWithTransfer::AcquireSendStagingWithRetry(
+    uint64_t uuid, const std::vector<int64_t>& src_block_ids,
+    std::vector<int64_t>* host_block_ids) {
+  // The entry's deadline, set when the producer registered the request,
+  // bounds the whole transfer; the wait for staging shares it rather than
+  // starting a later one of its own.
+  std::chrono::steady_clock::time_point stage_deadline;
+  while (true) {
+    if (shutting_down_.load(std::memory_order_relaxed)) {
+      return false;  // the manager is being destroyed; its state goes with it
+    }
+    {
+      absl::MutexLock lock(mu_);
+      auto it = send_entries_.find(uuid);
+      if (it == send_entries_.end()) {
+        return false;  // request cancelled while waiting for staging
+      }
+      stage_deadline = it->second->deadline;
+      // Staging that can never seat this request fails it now rather than
+      // after the deadline: a fixed slot holds max_blocks_ pages, the
+      // per-transfer pool holds total_blocks() pages.
+      const int64_t capacity = dynamic_host_staging_
+                                   ? host_block_manager_->total_blocks()
+                                   : max_blocks_;
+      if (static_cast<int64_t>(src_block_ids.size()) > capacity) {
+        LOG(ERROR) << "StartPushInternal: request " << it->second->req_id
+                   << " needs " << src_block_ids.size() << " blocks but "
+                   << (dynamic_host_staging_ ? "the host staging pool holds "
+                                             : "a staging slot holds ")
+                   << capacity;
+        failed_recving_.insert(it->second->req_id);
+        ReleaseEntrySlotLocked(it->second);
+        send_entries_.erase(it);
+        return false;
+      }
+      RecvEntry staging;
+      auto staged = AcquireRecvStagingLocked(
+          static_cast<int64_t>(src_block_ids.size()), &staging);
+      if (staged.has_value()) {
+        it->second->slot_idx = staging.slot_idx;
+        it->second->staged_host_blocks = std::move(staging.staged_host_blocks);
+        *host_block_ids = std::move(*staged);
+        return true;
+      }
+    }
+    // Staging exhausted: wait for in-flight sends to hand blocks back
+    // instead of reporting a send that never happened. The consumer's own
+    // deadline still bounds the total wait.
+    if (std::chrono::steady_clock::now() >= stage_deadline) {
+      absl::MutexLock lock(mu_);
+      auto it = send_entries_.find(uuid);
+      if (it != send_entries_.end()) {
+        LOG(ERROR) << "StartPushInternal: staging exhausted serving "
+                   << it->second->req_id << " (" << src_block_ids.size()
+                   << " blocks; free_host_blocks="
+                   << host_block_manager_->num_free_blocks()
+                   << ", total_host_blocks="
+                   << host_block_manager_->total_blocks()
+                   << ", free_slots=" << free_slots_.size()
+                   << "); reporting transfer failure";
+        failed_recving_.insert(it->second->req_id);
+        ReleaseEntrySlotLocked(it->second);
+        send_entries_.erase(it);
+      }
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 }
 
 void KVCacheManagerWithTransfer::StartPushInternal(
@@ -2335,24 +2437,8 @@ void KVCacheManagerWithTransfer::StartPushInternal(
   // pool. Writing D2H straight to host[src_block_id] overflows the host buffer
   // once a device block id exceeds num_host_blocks.
   std::vector<int64_t> host_block_ids;
-  {
-    absl::MutexLock lock(mu_);
-    auto it = send_entries_.find(uuid);
-    if (it == send_entries_.end()) {
-      return;
-    }
-    RecvEntry staging;
-    auto staged = AcquireRecvStagingLocked(
-        static_cast<int64_t>(src_block_ids.size()), &staging);
-    if (!staged.has_value()) {
-      done_sending_.insert(it->second->req_id);
-      ReleaseEntrySlotLocked(it->second);
-      send_entries_.erase(it);
-      return;
-    }
-    it->second->slot_idx = staging.slot_idx;
-    it->second->staged_host_blocks = std::move(staging.staged_host_blocks);
-    host_block_ids = std::move(*staged);
+  if (!AcquireSendStagingWithRetry(uuid, src_block_ids, &host_block_ids)) {
+    return;
   }
 
   // Coalesce contiguous (device,host) block runs into a few large copies. With
@@ -2386,15 +2472,18 @@ void KVCacheManagerWithTransfer::StartPushInternal(
                                      d2h_copy.sizes, /*slot_idx=*/std::nullopt,
                                      /*layer_idx=*/l);
     if (!future_or.ok()) {
+      // A copy that cannot even be issued fails the transfer; the worker
+      // thread has no caller for an exception to reach.
+      LOG(ERROR) << "StartPushInternal: failed to issue D2H for layer " << l
+                 << ": " << future_or.status();
       absl::MutexLock lock(mu_);
       auto it = send_entries_.find(uuid);
       if (it != send_entries_.end()) {
-        done_sending_.insert(it->second->req_id);
+        failed_recving_.insert(it->second->req_id);
         ReleaseEntrySlotLocked(it->second);
         send_entries_.erase(it);
       }
-      ThrowStatus("Failed to issue D2H in StartPushInternal layer loop",
-                  future_or.status());
+      return;
     }
     entry->d2h_layer_futures.push_back(std::move(future_or.value()));
   }
@@ -2431,7 +2520,7 @@ void KVCacheManagerWithTransfer::SendNextLayer(uint64_t uuid, size_t l) {
       absl::MutexLock lock(mu_);
       auto it = send_entries_.find(uuid);
       if (it != send_entries_.end()) {
-        done_sending_.insert(it->second->req_id);
+        failed_recving_.insert(it->second->req_id);
         ReleaseEntrySlotLocked(it->second);
         send_entries_.erase(it);
       }
@@ -2470,7 +2559,7 @@ void KVCacheManagerWithTransfer::SendNextLayer(uint64_t uuid, size_t l) {
               absl::MutexLock lock(mu_);
               if (auto it = send_entries_.find(uuid);
                   it != send_entries_.end()) {
-                done_sending_.insert(entry->req_id);
+                failed_recving_.insert(entry->req_id);
                 ReleaseEntrySlotLocked(entry);
                 send_entries_.erase(it);
               }

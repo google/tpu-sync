@@ -52,6 +52,7 @@
 #include "grpcpp/support/status.h"
 #include "grpcpp/support/sync_stream.h"
 #include "xla/tsl/concurrency/future.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/controller/controller_client.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/controller/test_util.h"
@@ -2178,7 +2179,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, EvictKeepsASkippedHashRegistered) {
   RegisterAndInitWorker(*controller, "worker_0",
                         test_server_->server_address);
 
-  ASSERT_OK_AND_ASSIGN(std::vector<int> host_block_ids,
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> host_block_ids,
                        controller->AllocateBlockIds(2));
   ASSERT_EQ(host_block_ids.size(), 2);
 
@@ -2223,7 +2224,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, EvictKeepsASkippedHashRegistered) {
   }
   EXPECT_TRUE(free_unregistered);
 
-  ASSERT_OK_AND_ASSIGN(auto pinned_res, registry_client.Lookup({"pinned_1"}));
+  TF_ASSERT_OK_AND_ASSIGN(auto pinned_res, registry_client.Lookup({"pinned_1"}));
   EXPECT_FALSE(pinned_res.empty());
 }
 
@@ -2248,7 +2249,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, EvictOnSave) {
       grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
   global_registry::GlobalRegistryClient registry_client(channel);
 
-  ASSERT_OK_AND_ASSIGN(std::vector<int> host_block_ids,
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> host_block_ids,
                        controller_ptr->AllocateBlockIds(2));
   ASSERT_EQ(host_block_ids.size(), 2);
 
@@ -2293,7 +2294,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, EvictOnSave) {
   EXPECT_EQ(PeekLookup(store, {"block_B"})->size(), 0);
   EXPECT_EQ(PeekLookup(store, {"block_A"})->size(), 1);
 
-  ASSERT_OK_AND_ASSIGN(auto lookup_res, PeekLookup(store, {"block_C"}));
+  TF_ASSERT_OK_AND_ASSIGN(auto lookup_res, PeekLookup(store, {"block_C"}));
   ASSERT_EQ(lookup_res.size(), 1);
   EXPECT_EQ(lookup_res[0].second.status, BlockStatus::HOST_AND_HBM);
   EXPECT_EQ(lookup_res[0].second.host_block_id, host_block_ids[1]);

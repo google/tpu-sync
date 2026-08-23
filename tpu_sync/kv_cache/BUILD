@@ -497,6 +497,7 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@xla//xla/tsl/concurrency:future",
+        "@xla//xla/tsl/platform:statusor",
     ],
 )
 

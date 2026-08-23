@@ -41,6 +41,7 @@ struct Request {
   uint32_t count_or_size;
   uint64_t uuid;
   uint32_t request_id;
+  int shard_idx;
 };
 
 }  // namespace lib

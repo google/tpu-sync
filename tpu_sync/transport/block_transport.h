@@ -164,11 +164,11 @@ class BlockTransport final {
                       MajorOrder major_order, uint64_t uuid = 0,
                       int layer_idx = -1, int parallelism = 1);
 
-  lib::Request BuildBlockRequest(uint8_t socket_opcode, uint8_t* laddr,
-                                 size_t len, uint32_t count_or_size,
-                                 int layer_idx, uint32_t request_id,
-                                 uint64_t uuid, int parallelism,
-                                 MajorOrder major_order);
+  lib::Request BuildBlockRequest(
+      uint8_t socket_opcode, uint8_t* laddr, size_t len, uint32_t count_or_size,
+      int layer_idx, uint32_t request_id, uint64_t uuid, int parallelism,
+      MajorOrder major_order, uint32_t remote_id, uint32_t local_id,
+      int shard_idx);
 
   // Builds a batch of Requests for block transfer.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockRequests(
@@ -184,6 +184,20 @@ class BlockTransport final {
                                  const std::vector<int>& dst_block_ids,
                                  size_t block_offset,
                                  std::vector<int>& allocated_ids);
+
+  // Builds a batch of Requests for block pull transfer.
+  absl::StatusOr<std::vector<lib::Request>> BuildBlockPullRequests(
+      size_t local_block_offset, size_t local_block_count,
+      size_t remote_block_offset, size_t remote_block_count,
+      const std::vector<int>& src_block_ids,
+      const std::vector<int>& allocated_ids,
+      const std::vector<uint8_t*>& explicit_dst_ptrs, MajorOrder major_order,
+      uint64_t uuid = 0);
+
+  absl::Status ProcessSocketPull(
+      absl::string_view peer, absl::string_view local_ip,
+      absl::Span<const lib::Request> requests,
+      BlockReceivedCallback on_block_received = {});
 
   void H2hReadWorker(int stream_idx, absl::string_view peer,
                      absl::string_view local_ip, size_t local_block_offset,

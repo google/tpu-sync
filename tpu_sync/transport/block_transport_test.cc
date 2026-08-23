@@ -1298,6 +1298,90 @@ TEST(BlockTransportTest, MultiShardPushLayerMajor) {
   }
 }
 
+TEST(BlockTransportTest, MultiShardPullBlockMajor) {
+  constexpr size_t kBlockSize = 256;
+  constexpr int kNumBlocks = 3;
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kNumShards = 2;
+
+  MockDelegate sender_delegate(kBlockSize, kNumBlocks, kNumLayers, kNumShards);
+  MockDelegate receiver_delegate(kBlockSize, kNumBlocks, kNumLayers,
+                                 kNumShards);
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        std::memset(sender_delegate.block_data(b, l, sh),
+                    static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b),
+                    kBlockSize);
+        std::memset(receiver_delegate.block_data(b, l, sh), 0, kBlockSize);
+      }
+    }
+  }
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+
+  ASSERT_OK(receiver.SyncPull(
+      {absl::StrCat("localhost:", sender.local_port())},
+      /*src_block_ids=*/{0, 1, 2}, /*local_block_ids=*/{0, 1, 2},
+      /*explicit_dst_ptrs=*/{}, /*parallelism=*/1, MajorOrder::kBlockMajor,
+      /*on_block_received=*/{}, /*uuid=*/0));
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        int expected = static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[0], expected);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[kBlockSize - 1],
+                  expected);
+      }
+    }
+  }
+}
+
+TEST(BlockTransportTest, MultiShardPullLayerMajor) {
+  constexpr size_t kBlockSize = 256;
+  constexpr int kNumBlocks = 3;
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kNumShards = 2;
+
+  MockDelegate sender_delegate(kBlockSize, kNumBlocks, kNumLayers, kNumShards);
+  MockDelegate receiver_delegate(kBlockSize, kNumBlocks, kNumLayers,
+                                 kNumShards);
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        std::memset(sender_delegate.block_data(b, l, sh),
+                    static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b),
+                    kBlockSize);
+        std::memset(receiver_delegate.block_data(b, l, sh), 0, kBlockSize);
+      }
+    }
+  }
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+
+  ASSERT_OK(receiver.SyncPull(
+      {absl::StrCat("localhost:", sender.local_port())},
+      /*src_block_ids=*/{0, 1, 2}, /*local_block_ids=*/{0, 1, 2},
+      /*explicit_dst_ptrs=*/{}, /*parallelism=*/1, MajorOrder::kLayerMajor,
+      /*on_block_received=*/{}, /*uuid=*/0));
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        int expected = static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[0], expected);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[kBlockSize - 1],
+                  expected);
+      }
+    }
+  }
+}
+
 TEST(BlockTransportTest, PushBufferCorrectness) {
   constexpr size_t size = 64 * 1024;
   MockDelegate src(size);

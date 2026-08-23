@@ -276,6 +276,7 @@ cc_library(
         ":raiden_transfer_endpoint",
         ":raw_transfer_core",
         ":status_macros",
+        "//tpu_sync/kv_cache/storage",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

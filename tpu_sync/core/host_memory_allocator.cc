@@ -447,4 +447,55 @@ SharedMemoryHostMemoryAllocator::AllocateDmaMappedForDevice(
   return alloc_or;
 }
 
+absl::StatusOr<SharedMemoryInfo>
+SharedMemoryHostMemoryAllocator::GetSharedMemoryInfo(const void* ptr) const {
+  if (mapped_ptr_ == nullptr || mapped_ptr_ == MAP_FAILED) {
+    return absl::FailedPreconditionError("Shared memory is not mapped");
+  }
+  const uint8_t* p = static_cast<const uint8_t*>(ptr);
+  const uint8_t* start = static_cast<const uint8_t*>(mapped_ptr_);
+  const uint8_t* end = start + mapped_size_;
+  if (p < start || p >= end) {
+    return absl::InvalidArgumentError(
+        "Pointer does not belong to this allocator");
+  }
+  SharedMemoryInfo info;
+  info.shm_key = shm_key_;
+  info.size = mapped_size_;
+  info.offset = p - start;
+  info.base_ptr = mapped_ptr_;
+  info.fd = shm_fd_;
+  return info;
+}
+
+HostBufferAllocator CreateHostMemoryAllocator(xla::PjRtClient* client,
+                                              size_t num_blocks,
+                                              size_t block_size) {
+  SharedMemoryHeader expected_schema;
+  expected_schema.magic = 0x52414944454E5348;  // "RAIDENSH"
+  expected_schema.version = 1;
+  std::strncpy(expected_schema.model_uid, "mock_model_uid",
+               sizeof(expected_schema.model_uid));
+  expected_schema.global_mesh_shape[0] = 1;  // Single rank dummy mesh
+  expected_schema.num_blocks = num_blocks;
+  expected_schema.block_size = block_size;
+  expected_schema.total_payload_bytes = num_blocks * block_size;
+  expected_schema.reference_count = 0;
+
+  const char* shm_key_env = std::getenv("RAIDEN_SHM_KEY");
+  std::string shm_key =
+      (shm_key_env != nullptr) ? shm_key_env : "raiden_shm_key";
+
+  auto shm_alloc_or =
+      SharedMemoryHostMemoryAllocator::Create(client, shm_key, expected_schema);
+  if (!shm_alloc_or.ok()) {
+    LOG(ERROR) << "Failed to create SharedMemoryHostMemoryAllocator: "
+               << shm_alloc_or.status().ToString();
+    return nullptr;
+  }
+  auto shm_alloc = std::shared_ptr<SharedMemoryHostMemoryAllocator>(
+      std::move(shm_alloc_or).value());
+  return HostBufferAllocator(std::move(shm_alloc));
+}
+
 }  // namespace tpu_raiden

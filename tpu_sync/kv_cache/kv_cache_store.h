@@ -45,6 +45,7 @@
 #include "tpu_sync/kv_cache/lru_cache.h"
 #include "tpu_sync/kv_cache/raiden_id.h"
 #include "tpu_sync/kv_cache/reshard/reshard_service.h"
+#include "tpu_sync/kv_cache/storage/storage.h"
 
 namespace tpu_raiden {
 
@@ -563,6 +564,7 @@ class KVCacheStore {
     tsl::Future<> future;
     std::vector<std::string> block_hashes;
     std::vector<int> host_block_ids;
+    std::string target_scheme;
   };
 
   struct LoadState {

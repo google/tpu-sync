@@ -29,3 +29,4 @@ class BlockStatus(enum.Enum):
   HOST_AND_HBM = (
       4  # Resident in both local Host DRAM and TPU HBM device memory.
   )
+  STORAGE = 5  # Resident in persistent storage backend.

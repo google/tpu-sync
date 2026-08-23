@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,7 @@
 #include "tpu_sync/core/controller/worker_service_client.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/raiden_id.h"
+#include "tpu_sync/kv_cache/storage/storage.h"
 #include "tpu_sync/proto/controller_service.grpc.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -143,7 +145,9 @@ class RaidenController {
       absl::string_view worker_id, absl::Span<const Buffer> src_buffers,
       absl::Span<const Buffer> dst_buffers,
       absl::Span<const Buffer> staging_host_buffers = {},
-      absl::Span<const int64_t> copy_sizes = {});
+      absl::Span<const int64_t> copy_sizes = {},
+      std::optional<::tpu_sync::proto::StorageTransferSpec> storage_spec =
+          std::nullopt);
 
   // Broadcast transfer to all registered workers (staging_host_buffers as
   // above).
@@ -151,7 +155,33 @@ class RaidenController {
       absl::Span<const Buffer> src_buffers,
       absl::Span<const Buffer> dst_buffers,
       absl::Span<const Buffer> staging_host_buffers = {},
-      absl::Span<const int64_t> copy_sizes = {});
+      absl::Span<const int64_t> copy_sizes = {},
+      std::optional<::tpu_sync::proto::StorageTransferSpec> storage_spec =
+          std::nullopt);
+
+  // Synchronous transfer worker that executes TransferBuffers and waits for
+  // completion.
+  absl::Status ExecuteTransferBuffersgRPCSync(
+      absl::Span<const Buffer> src_buffers,
+      absl::Span<const Buffer> dst_buffers,
+      absl::Span<const Buffer> staging_host_buffers = {},
+      absl::Span<const int64_t> copy_sizes = {},
+      std::optional<::tpu_sync::proto::StorageTransferSpec> storage_spec =
+          std::nullopt);
+
+  // Registers storage backends dynamically on all registered workers.
+  absl::Status RegisterBackends(
+      const std::vector<::tpu_sync::proto::BackendConfig>& configs);
+
+  void SetMapper(std::shared_ptr<kv_cache::storage::BlockKeyMapper> mapper) {
+    absl::MutexLock lock(&mutex_);
+    mapper_ = std::move(mapper);
+  }
+
+  std::shared_ptr<kv_cache::storage::BlockKeyMapper> mapper() const {
+    absl::MutexLock lock(&mutex_);
+    return mapper_;
+  }
 
   // Reads blocks from a remote source, receiver-initiated: this controller's
   // own workers pull the bytes, so the write window belongs to the destination
@@ -254,7 +284,9 @@ class RaidenController {
       absl::Span<const Buffer> src_buffers,
       absl::Span<const Buffer> dst_buffers,
       absl::Span<const Buffer> staging_host_buffers = {},
-      absl::Span<const int64_t> copy_sizes = {});
+      absl::Span<const int64_t> copy_sizes = {},
+      std::optional<::tpu_sync::proto::StorageTransferSpec> storage_spec =
+          std::nullopt);
 
  private:
   RaidenController(const ::tpu_sync::rpc::RaidenIdProto& unit, int num_blocks,
@@ -278,6 +310,8 @@ class RaidenController {
   std::vector<::tpu_sync::proto::BufferProto> all_sharded_buffers_;
   std::shared_ptr<core::controller::WorkerRegistry> worker_registry_;
   mutable absl::Mutex mutex_;
+  std::shared_ptr<kv_cache::storage::BlockKeyMapper> mapper_
+      ABSL_GUARDED_BY(mutex_);
   std::unique_ptr<kv_cache::LogicalBlockManager> block_manager_
       ABSL_GUARDED_BY(mutex_);
   std::string raiden_controller_address_;

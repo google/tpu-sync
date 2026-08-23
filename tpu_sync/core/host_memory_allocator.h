@@ -34,11 +34,78 @@ struct HostBufferAllocation {
   std::shared_ptr<void> owner;
 };
 
-// Returns a HostBufferAllocation of at least the requested size for a given
-// device. If device is nullptr, it allocates on the default/current NUMA node.
-// On failure, returns a non-OK status.
-using HostBufferAllocator = std::function<absl::StatusOr<HostBufferAllocation>(
-    size_t, const xla::PjRtDevice*)>;
+struct SharedMemoryInfo {
+  std::string shm_key;
+  size_t size = 0;
+  size_t offset = 0;
+  void* base_ptr = nullptr;
+  int fd = -1;
+};
+
+class HostMemoryAllocator;
+
+// A wrapper class behaving like a callback while keeping allocator references.
+class HostBufferAllocator {
+ public:
+  HostBufferAllocator() = default;
+  HostBufferAllocator(std::nullptr_t) {}  // NOLINT
+
+  // Construct from std::function
+  HostBufferAllocator(  // NOLINT
+      std::function<
+          absl::StatusOr<HostBufferAllocation>(size_t, const xla::PjRtDevice*)>
+          alloc_fn)
+      : alloc_fn_(std::move(alloc_fn)) {}
+
+  // Construct from shared_ptr to HostMemoryAllocator
+  HostBufferAllocator(
+      std::shared_ptr<HostMemoryAllocator> allocator);  // NOLINT
+
+  // Construct from general lambdas
+  template <
+      typename F,
+      typename = std::enable_if_t<
+          !std::is_same_v<std::decay_t<F>, HostBufferAllocator> &&
+          !std::is_same_v<std::decay_t<F>,
+                          std::shared_ptr<HostMemoryAllocator>> &&
+          std::is_invocable_r_v<absl::StatusOr<HostBufferAllocation>, F, size_t,
+                                const xla::PjRtDevice*>>>
+  HostBufferAllocator(F&& f)  // NOLINT
+      : alloc_fn_(std::forward<F>(f)) {}
+
+  absl::StatusOr<HostBufferAllocation> operator()(
+      size_t size, const xla::PjRtDevice* device) const {
+    if (!alloc_fn_) {
+      return absl::FailedPreconditionError("Allocator is not initialized");
+    }
+    return alloc_fn_(size, device);
+  }
+
+  explicit operator bool() const { return static_cast<bool>(alloc_fn_); }
+
+  std::shared_ptr<HostMemoryAllocator> host_memory_allocator() const {
+    return allocator_;
+  }
+
+  friend bool operator==(const HostBufferAllocator& a, std::nullptr_t) {
+    return !a.alloc_fn_;
+  }
+  friend bool operator==(std::nullptr_t, const HostBufferAllocator& a) {
+    return !a.alloc_fn_;
+  }
+  friend bool operator!=(const HostBufferAllocator& a, std::nullptr_t) {
+    return static_cast<bool>(a.alloc_fn_);
+  }
+  friend bool operator!=(std::nullptr_t, const HostBufferAllocator& a) {
+    return static_cast<bool>(a.alloc_fn_);
+  }
+
+ private:
+  std::function<absl::StatusOr<HostBufferAllocation>(size_t,
+                                                     const xla::PjRtDevice*)>
+      alloc_fn_;
+  std::shared_ptr<HostMemoryAllocator> allocator_;
+};
 
 // High-performance host memory allocator that allocates DMA-capable pinned
 // memory using PJRT APIs or standard fallback allocations.
@@ -66,7 +133,25 @@ class HostMemoryAllocator {
       size_t size_bytes, const xla::PjRtDevice* device) {
     return AllocateDmaMapped(size_bytes);
   }
+
+  // Returns shared memory info (fd, offset, size, base pointer) for a given
+  // host pointer if the memory was allocated via shared memory.
+  virtual absl::StatusOr<SharedMemoryInfo> GetSharedMemoryInfo(
+      const void* ptr) const {
+    return absl::UnimplementedError(
+        "GetSharedMemoryInfo is not supported for this allocator.");
+  }
 };
+
+inline HostBufferAllocator::HostBufferAllocator(
+    std::shared_ptr<HostMemoryAllocator> allocator)
+    : allocator_(allocator) {
+  if (allocator) {
+    alloc_fn_ = [allocator](size_t size, const xla::PjRtDevice* device) {
+      return allocator->AllocateDmaMappedForDevice(size, device);
+    };
+  }
+}
 
 class XlaHostMemoryAllocator : public HostMemoryAllocator {
  public:
@@ -121,6 +206,9 @@ class SharedMemoryHostMemoryAllocator : public HostMemoryAllocator {
   absl::StatusOr<HostBufferAllocation> AllocateDmaMappedForDevice(
       size_t size_bytes, const xla::PjRtDevice* device) override;
 
+  absl::StatusOr<SharedMemoryInfo> GetSharedMemoryInfo(
+      const void* ptr) const override;
+
  private:
   SharedMemoryHostMemoryAllocator(xla::PjRtClient* client,
                                   absl::string_view shm_key,
@@ -134,6 +222,11 @@ class SharedMemoryHostMemoryAllocator : public HostMemoryAllocator {
   size_t mapped_size_ = 0;
   bool dma_mapped_ = false;
 };
+
+// Factory to create allocators wrapped in HostBufferAllocator
+HostBufferAllocator CreateHostMemoryAllocator(xla::PjRtClient* client,
+                                              size_t num_blocks,
+                                              size_t block_size);
 
 }  // namespace tpu_raiden
 

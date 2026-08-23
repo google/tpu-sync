@@ -487,7 +487,8 @@ absl::StatusOr<::tpu_sync::proto::TransferBuffersRequest>
 RaidenController::BuildTransferBuffersRequest(
     absl::Span<const Buffer> src_buffers, absl::Span<const Buffer> dst_buffers,
     absl::Span<const Buffer> staging_host_buffers,
-    absl::Span<const int64_t> copy_sizes) {
+    absl::Span<const int64_t> copy_sizes,
+    std::optional<::tpu_sync::proto::StorageTransferSpec> storage_spec) {
   if (src_buffers.empty() || src_buffers.size() != dst_buffers.size()) {
     return absl::InvalidArgumentError(
         "Source and destination buffers must have the same non-zero length");
@@ -536,6 +537,10 @@ RaidenController::BuildTransferBuffersRequest(
     added_buf->set_index(buf.index());
   }
 
+  if (storage_spec.has_value()) {
+    *transfer->mutable_storage_spec() = *storage_spec;
+  }
+
   return request;
 }
 
@@ -543,9 +548,10 @@ tsl::Future<> RaidenController::TransferBuffers(
     absl::string_view worker_id, absl::Span<const Buffer> src_buffers,
     absl::Span<const Buffer> dst_buffers,
     absl::Span<const Buffer> staging_host_buffers,
-    absl::Span<const int64_t> copy_sizes) {
+    absl::Span<const int64_t> copy_sizes,
+    std::optional<::tpu_sync::proto::StorageTransferSpec> storage_spec) {
   auto request_or = BuildTransferBuffersRequest(
-      src_buffers, dst_buffers, staging_host_buffers, copy_sizes);
+      src_buffers, dst_buffers, staging_host_buffers, copy_sizes, storage_spec);
   if (!request_or.ok()) {
     return tsl::Future<>(request_or.status());
   }
@@ -568,7 +574,8 @@ tsl::Future<> RaidenController::TransferBuffers(
 tsl::Future<> RaidenController::TransferBuffers(
     absl::Span<const Buffer> src_buffers, absl::Span<const Buffer> dst_buffers,
     absl::Span<const Buffer> staging_host_buffers,
-    absl::Span<const int64_t> copy_sizes) {
+    absl::Span<const int64_t> copy_sizes,
+    std::optional<::tpu_sync::proto::StorageTransferSpec> storage_spec) {
   if (src_buffers.empty() || src_buffers.size() != dst_buffers.size()) {
     return tsl::Future<>(absl::InvalidArgumentError(
         "Source and destination buffers must have the same non-zero length"));
@@ -751,10 +758,27 @@ tsl::Future<> RaidenController::TransferBuffers(
 
     if (worker_src.empty()) continue;
 
+    std::optional<::tpu_sync::proto::StorageTransferSpec> worker_storage_spec;
+    if (storage_spec.has_value()) {
+      if (workers.size() > 1) {
+        ::tpu_sync::proto::StorageTransferSpec rank_spec = *storage_spec;
+        rank_spec.clear_keys_by_buffer_index();
+        auto it =
+            storage_spec->keys_by_buffer_index().find(static_cast<int32_t>(w));
+        if (it != storage_spec->keys_by_buffer_index().end()) {
+          (*rank_spec.mutable_keys_by_buffer_index())[0] = it->second;
+        }
+        worker_storage_spec = std::move(rank_spec);
+      } else {
+        worker_storage_spec = storage_spec;
+      }
+    }
+
     // Every worker owns a shard of every block, so the (host) staging offsets
     // are identical across workers.
-    auto req_or = BuildTransferBuffersRequest(
-        worker_src, worker_dst, request_staging, worker_copy_sizes);
+    auto req_or =
+        BuildTransferBuffersRequest(worker_src, worker_dst, request_staging,
+                                    worker_copy_sizes, worker_storage_spec);
     if (!req_or.ok()) {
       return tsl::Future<>(req_or.status());
     }
@@ -781,6 +805,16 @@ tsl::Future<> RaidenController::TransferBuffers(
   }
 
   return aggregate_future;
+}
+
+absl::Status RaidenController::ExecuteTransferBuffersgRPCSync(
+    absl::Span<const Buffer> src_buffers, absl::Span<const Buffer> dst_buffers,
+    absl::Span<const Buffer> staging_host_buffers,
+    absl::Span<const int64_t> copy_sizes,
+    std::optional<::tpu_sync::proto::StorageTransferSpec> storage_spec) {
+  return TransferBuffers(src_buffers, dst_buffers, staging_host_buffers,
+                         copy_sizes, storage_spec)
+      .Await();
 }
 
 void RaidenController::SetReadRemoteHooks(
@@ -1130,6 +1164,30 @@ RaidenController::SubmitTransferProgram(
                      "' has no WorkerService channel")));
   }
   return registration->worker_service_client->SubmitTransferProgram(request);
+}
+
+absl::Status RaidenController::RegisterBackends(
+    const std::vector<::tpu_sync::proto::BackendConfig>& configs) {
+  if (!worker_registry_) {
+    return absl::FailedPreconditionError("Worker registry is not initialized");
+  }
+  ::tpu_sync::proto::RegisterBackendsRequest request;
+  for (const auto& config : configs) {
+    *request.add_configs() = config;
+  }
+  for (const auto& reg : worker_registry_->GetRegisteredWorkers()) {
+    if (!reg.worker_service_client) continue;
+    auto resp_or = reg.worker_service_client->RegisterBackends(request).Await();
+    if (!resp_or.ok()) {
+      return resp_or.status();
+    }
+    if (!resp_or->success()) {
+      return absl::InternalError(
+          absl::StrCat("Worker registration failed on worker ", reg.worker_id,
+                       ": ", resp_or->error_message()));
+    }
+  }
+  return absl::OkStatus();
 }
 
 }  // namespace controller

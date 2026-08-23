@@ -32,6 +32,7 @@
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/status_macros.h"
+#include "tpu_sync/kv_cache/storage/storage.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
@@ -194,6 +195,73 @@ template <typename T>
 inline constexpr bool has_pool_reshard_register_recv_v =
     has_pool_reshard_register_recv<T>::value;
 
+template <typename T, typename = void>
+struct has_d2h_write_to_backend : std::false_type {};
+
+template <typename T>
+struct has_d2h_write_to_backend<
+    T, std::void_t<decltype(std::declval<T&>().D2hWriteToBackend(
+           std::declval<std::shared_ptr<kv_cache::storage::KVBackend>>(),
+           std::declval<const std::vector<kv_cache::storage::BlockKey>&>(),
+           std::declval<const std::vector<int64_t>&>(),
+           std::declval<const std::vector<int64_t>&>(),
+           std::declval<const std::vector<int64_t>&>()))>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_d2h_write_to_backend_v =
+    has_d2h_write_to_backend<T>::value;
+
+template <typename T, typename = void>
+struct has_h2d_read_from_backend : std::false_type {};
+
+template <typename T>
+struct has_h2d_read_from_backend<
+    T, std::void_t<decltype(std::declval<T&>().H2dReadFromBackend(
+           std::declval<std::shared_ptr<kv_cache::storage::KVBackend>>(),
+           std::declval<const std::vector<kv_cache::storage::BlockKey>&>(),
+           std::declval<const std::vector<int64_t>&>(),
+           std::declval<const std::vector<int64_t>&>(),
+           std::declval<const std::vector<int64_t>&>()))>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_h2d_read_from_backend_v =
+    has_h2d_read_from_backend<T>::value;
+
+template <typename T, typename = void>
+struct has_register_backend : std::false_type {};
+
+template <typename T>
+struct has_register_backend<
+    T, std::void_t<decltype(std::declval<T&>().RegisterBackend(
+           std::declval<const std::string&>(),
+           std::declval<std::shared_ptr<kv_cache::storage::KVBackend>>()))>>
+    : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_register_backend_v = has_register_backend<T>::value;
+
+template <typename T, typename = void>
+struct has_get_backend : std::false_type {};
+
+template <typename T>
+struct has_get_backend<T, std::void_t<decltype(std::declval<T&>().GetBackend(
+                              std::declval<const std::string&>()))>>
+    : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_get_backend_v = has_get_backend<T>::value;
+
+template <typename T, typename = void>
+struct has_bytes_per_block : std::false_type {};
+
+template <typename T>
+struct has_bytes_per_block<
+    T, std::void_t<decltype(std::declval<T&>().bytes_per_block())>>
+    : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_bytes_per_block_v = has_bytes_per_block<T>::value;
+
 }  // namespace internal
 
 // Type-erased wrapper for any KV Cache Manager or Transfer Manager
@@ -259,6 +327,24 @@ class KVManagerHolder {
     virtual absl::Status PoolReshardRegisterRecv(
         const tpu_sync::rpc::StartTransferRequest& request,
         absl::Span<const int64_t> chip_block_ids) = 0;
+    virtual absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+        std::shared_ptr<kv_cache::storage::KVBackend> backend,
+        const std::vector<kv_cache::storage::BlockKey>& block_keys,
+        const std::vector<int64_t>& src_device_offsets,
+        const std::vector<int64_t>& dst_host_offsets,
+        const std::vector<int64_t>& copy_sizes) = 0;
+    virtual absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+        std::shared_ptr<kv_cache::storage::KVBackend> backend,
+        const std::vector<kv_cache::storage::BlockKey>& block_keys,
+        const std::vector<int64_t>& src_host_offsets,
+        const std::vector<int64_t>& dst_device_offsets,
+        const std::vector<int64_t>& copy_sizes) = 0;
+    virtual void RegisterBackend(
+        const std::string& scheme,
+        std::shared_ptr<kv_cache::storage::KVBackend> backend) = 0;
+    virtual std::shared_ptr<kv_cache::storage::KVBackend> GetBackend(
+        const std::string& scheme) const = 0;
+    virtual int64_t bytes_per_block() const = 0;
   };
 
   template <typename T>
@@ -450,6 +536,58 @@ class KVManagerHolder {
             "transfer manager.");
       }
     }
+    absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+        std::shared_ptr<kv_cache::storage::KVBackend> backend,
+        const std::vector<kv_cache::storage::BlockKey>& block_keys,
+        const std::vector<int64_t>& src_device_offsets,
+        const std::vector<int64_t>& dst_host_offsets,
+        const std::vector<int64_t>& copy_sizes) override {
+      if constexpr (internal::has_d2h_write_to_backend_v<T>) {
+        return impl_->D2hWriteToBackend(backend, block_keys, src_device_offsets,
+                                        dst_host_offsets, copy_sizes);
+      } else {
+        return absl::UnimplementedError(
+            "D2hWriteToBackend is not implemented by the underlying transfer "
+            "manager.");
+      }
+    }
+    absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+        std::shared_ptr<kv_cache::storage::KVBackend> backend,
+        const std::vector<kv_cache::storage::BlockKey>& block_keys,
+        const std::vector<int64_t>& src_host_offsets,
+        const std::vector<int64_t>& dst_device_offsets,
+        const std::vector<int64_t>& copy_sizes) override {
+      if constexpr (internal::has_h2d_read_from_backend_v<T>) {
+        return impl_->H2dReadFromBackend(backend, block_keys, src_host_offsets,
+                                         dst_device_offsets, copy_sizes);
+      } else {
+        return absl::UnimplementedError(
+            "H2dReadFromBackend is not implemented by the underlying transfer "
+            "manager.");
+      }
+    }
+    void RegisterBackend(
+        const std::string& scheme,
+        std::shared_ptr<kv_cache::storage::KVBackend> backend) override {
+      if constexpr (internal::has_register_backend_v<T>) {
+        impl_->RegisterBackend(scheme, std::move(backend));
+      }
+    }
+    std::shared_ptr<kv_cache::storage::KVBackend> GetBackend(
+        const std::string& scheme) const override {
+      if constexpr (internal::has_get_backend_v<T>) {
+        return impl_->GetBackend(scheme);
+      } else {
+        return nullptr;
+      }
+    }
+    int64_t bytes_per_block() const override {
+      if constexpr (internal::has_bytes_per_block_v<T>) {
+        return impl_->bytes_per_block();
+      } else {
+        return 0;
+      }
+    }
 
    private:
     absl::StatusOr<std::vector<int>> SafeCastOffsets(
@@ -610,6 +748,55 @@ class KVManagerHolder {
       return absl::InternalError("KVManagerHolder is null");
     }
     return self_->PoolReshardRegisterRecv(request, chip_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+      std::shared_ptr<kv_cache::storage::KVBackend> backend,
+      const std::vector<kv_cache::storage::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_offsets,
+      const std::vector<int64_t>& dst_host_offsets,
+      const std::vector<int64_t>& copy_sizes) const {
+    if (!self_) {
+      return absl::InternalError("KVManagerHolder is null");
+    }
+    return self_->D2hWriteToBackend(backend, block_keys, src_device_offsets,
+                                    dst_host_offsets, copy_sizes);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+      std::shared_ptr<kv_cache::storage::KVBackend> backend,
+      const std::vector<kv_cache::storage::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_host_offsets,
+      const std::vector<int64_t>& dst_device_offsets,
+      const std::vector<int64_t>& copy_sizes) const {
+    if (!self_) {
+      return absl::InternalError("KVManagerHolder is null");
+    }
+    return self_->H2dReadFromBackend(backend, block_keys, src_host_offsets,
+                                     dst_device_offsets, copy_sizes);
+  }
+
+  void RegisterBackend(
+      const std::string& scheme,
+      std::shared_ptr<kv_cache::storage::KVBackend> backend) const {
+    if (self_) {
+      self_->RegisterBackend(scheme, std::move(backend));
+    }
+  }
+
+  std::shared_ptr<kv_cache::storage::KVBackend> GetBackend(
+      const std::string& scheme) const {
+    if (!self_) {
+      return nullptr;
+    }
+    return self_->GetBackend(scheme);
+  }
+
+  int64_t bytes_per_block() const {
+    if (!self_) {
+      return 0;
+    }
+    return self_->bytes_per_block();
   }
 
   explicit operator bool() const { return self_ != nullptr; }

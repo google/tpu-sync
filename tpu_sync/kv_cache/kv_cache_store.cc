@@ -1041,9 +1041,43 @@ absl::Status KVCacheStore::SaveLocal(
                              ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
   }
 
+  std::string storage_scheme;
+  for (const auto& b : backends_) {
+    if (b && !b->scheme().empty()) {
+      storage_scheme = b->scheme();
+      break;
+    }
+  }
+
+  std::optional<::tpu_sync::proto::StorageTransferSpec> storage_spec;
+  if (!storage_scheme.empty()) {
+    ::tpu_sync::proto::StorageTransferSpec spec;
+    spec.set_direction(::tpu_sync::proto::TRANSFER_DIR_OFFLOAD);
+    spec.set_scheme(storage_scheme);
+
+    auto ctrl_mapper = (raiden_controller_ != nullptr)
+                           ? raiden_controller_->mapper()
+                           : nullptr;
+    int tp_size = (ctrl_mapper != nullptr) ? ctrl_mapper->tp_size() : 1;
+
+    for (size_t i = 0; i < block_hashes.size(); ++i) {
+      for (int r = 0; r < tp_size; ++r) {
+        storage::BlockKey resolved_key =
+            (ctrl_mapper != nullptr)
+                ? ctrl_mapper->MapKey(block_hashes[i], r)
+                : storage::BlockKey{block_hashes[i], block_hashes[i]};
+        ::tpu_sync::proto::StorageKeyDescriptor key_desc;
+        key_desc.set_storage_key(resolved_key.resolved_key);
+        int32_t buf_idx = static_cast<int32_t>(i * tp_size + r);
+        (*spec.mutable_keys_by_buffer_index())[buf_idx] = key_desc;
+      }
+    }
+    storage_spec = std::move(spec);
+  }
+
   tsl::Future<> future = raiden_controller_->TransferBuffers(
       src_buffers, dst_buffers, /*staging_host_buffers=*/{},
-      /*copy_sizes=*/{});
+      /*copy_sizes=*/{}, storage_spec);
 
   {
     absl::MutexLock lock(mutex_);
@@ -1051,6 +1085,7 @@ absl::Status KVCacheStore::SaveLocal(
         .future = std::move(future),
         .block_hashes = block_hashes,
         .host_block_ids = host_block_ids,
+        .target_scheme = storage_scheme,
     });
   }
 
@@ -2139,6 +2174,19 @@ void KVCacheStore::PollSavesInternal(std::vector<SaveState> ready_saves) {
                   .raiden_id = raiden_id_,
                   .block_id = state.host_block_ids[i],
               });
+              if (!state.target_scheme.empty()) {
+                RaidenId storage_id{
+                    .job_name = raiden_id_.job_name,
+                    .job_replica_id = raiden_id_.job_replica_id,
+                    .data_name = state.target_scheme,
+                    .data_replica_idx = raiden_id_.data_replica_idx,
+                };
+                write_through_regs.push_back({
+                    .prefix_hash = hash,
+                    .raiden_id = storage_id,
+                    .block_id = state.host_block_ids[i],
+                });
+              }
             }
           }
           done_saves_.push_back(hash);

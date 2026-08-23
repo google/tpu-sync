@@ -47,6 +47,10 @@ class WorkerServiceClient {
   tsl::Future<> TransferBuffers(
       const ::tpu_sync::proto::TransferBuffersRequest& request);
 
+  // Registers storage backends on the remote transfer worker asynchronously.
+  tsl::Future<::tpu_sync::proto::RegisterBackendsResponse> RegisterBackends(
+      const ::tpu_sync::proto::RegisterBackendsRequest& request);
+
   // Submits a transfer program and resolves with the full response. The
   // reshard coordinator needs success + message verbatim for its
   // abandon-claim contract, so admission verdicts are not collapsed into a

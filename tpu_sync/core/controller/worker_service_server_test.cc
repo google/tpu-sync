@@ -78,6 +78,28 @@ TEST(WorkerServiceServerTest, StartServerWithInvalidPortFails) {
   EXPECT_THAT(status, StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
+TEST(WorkerServiceServerTest, RegisterBackendsViaClient) {
+  WorkerServiceServer& server = WorkerServiceServer::GetInstance();
+  ABSL_ASSERT_OK(server.StartServer(/*host_allocator=*/nullptr, /*port=*/0));
+  int port = server.GetRaidenWorkerPort();
+  EXPECT_GT(port, 0);
+
+  std::string server_address = "localhost:" + std::to_string(port);
+  auto channel =
+      grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
+  WorkerServiceClient client(channel);
+
+  ::tpu_sync::proto::RegisterBackendsRequest req;
+  auto* config = req.add_configs();
+  config->set_name("PosixBackend");
+  config->set_scheme("posix_test");
+
+  auto resp_or = client.RegisterBackends(req).Await();
+  ABSL_ASSERT_OK(resp_or);
+  // Expect false if transfer_manager is null, or true if configured.
+  // The RPC should succeed without transport errors.
+}
+
 }  // namespace
 }  // namespace controller
 }  // namespace tpu_raiden

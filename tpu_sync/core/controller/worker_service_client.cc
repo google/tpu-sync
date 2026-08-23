@@ -122,5 +122,28 @@ tsl::Future<> WorkerServiceClient::TransferBuffers(
   return future;
 }
 
+tsl::Future<::tpu_sync::proto::RegisterBackendsResponse>
+WorkerServiceClient::RegisterBackends(
+    const ::tpu_sync::proto::RegisterBackendsRequest& request) {
+  auto [promise, future] =
+      tsl::MakePromise<::tpu_sync::proto::RegisterBackendsResponse>();
+  auto context = std::make_shared<grpc::ClientContext>();
+  auto response =
+      std::make_shared<::tpu_sync::proto::RegisterBackendsResponse>();
+
+  stub_->async()->RegisterBackends(
+      context.get(), &request, response.get(),
+      [context, response,
+       promise = std::move(promise).ToShared()](grpc::Status status) {
+        if (!status.ok()) {
+          promise->Set(absl::InternalError(absl::StrCat(
+              "RegisterBackends RPC failed: ", status.error_message())));
+        } else {
+          promise->Set(std::move(*response));
+        }
+      });
+  return future;
+}
+
 }  // namespace controller
 }  // namespace tpu_raiden

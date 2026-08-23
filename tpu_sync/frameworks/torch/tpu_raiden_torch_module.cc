@@ -590,7 +590,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
       .value("REMOTE", tpu_raiden::kv_cache::BlockStatus::REMOTE)
       .value("HBM", tpu_raiden::kv_cache::BlockStatus::HBM)
       .value("HOST", tpu_raiden::kv_cache::BlockStatus::HOST)
-      .value("HOST_AND_HBM", tpu_raiden::kv_cache::BlockStatus::HOST_AND_HBM);
+      .value("HOST_AND_HBM", tpu_raiden::kv_cache::BlockStatus::HOST_AND_HBM)
+      .value("STORAGE", tpu_raiden::kv_cache::BlockStatus::STORAGE);
 
   nb::class_<tpu_raiden::kv_cache::RaidenBlockId>(m, "RaidenBlockId")
       .def(nb::init<tpu_raiden::kv_cache::RaidenId, int,

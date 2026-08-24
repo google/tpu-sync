@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <memory>
 #include <vector>
 
 #include "absl/base/optimization.h"
@@ -26,6 +27,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "grpcpp/channel.h"
 #include "tpu_sync/transport/lib/socket/util.h"
 
 namespace tpu_raiden::transport::lib {
@@ -43,8 +45,9 @@ void CloseSocket(const int fd) {
 }
 }  // namespace
 
-absl::StatusOr<int> ConnPool::Borrow(absl::string_view peer,
-                                     absl::string_view local_ip) {
+absl::StatusOr<int> ConnPool::Borrow(
+    absl::string_view peer, absl::string_view local_ip, bool require_psp,
+    std::shared_ptr<grpc::Channel> channel) {
   const Key key = GenPoolKey(peer, local_ip);
   {
     absl::MutexLock lock(mu_);
@@ -66,7 +69,7 @@ absl::StatusOr<int> ConnPool::Borrow(absl::string_view peer,
       }
     }
   }
-  return ConnectToPeer(peer, local_ip);
+  return ConnectToPeer(peer, local_ip, require_psp, channel);
 }
 
 void ConnPool::Return(bool ok, int fd, absl::string_view peer,

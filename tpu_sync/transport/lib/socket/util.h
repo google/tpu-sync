@@ -12,20 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_TRANSPORT_LIB_SOCKET_UTIL_H_
-#define THIRD_PARTY_TPU_RAIDEN_TRANSPORT_LIB_SOCKET_UTIL_H_
+#ifndef TPU_SYNC_TRANSPORT_LIB_SOCKET_UTIL_H_
+#define TPU_SYNC_TRANSPORT_LIB_SOCKET_UTIL_H_
 
-#include <sys/uio.h>
+#include <memory>
 
-#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "grpcpp/channel.h"
 
 namespace tpu_raiden::transport::lib {
 
-absl::StatusOr<int> ConnectToPeer(absl::string_view peer,
-                                  absl::string_view local_ip = "");
+// Connects to remote TCP peer with optional local IP binding and optional
+// gRPC channel for TCP-over-PSP out-of-band key exchange.
+absl::StatusOr<int> ConnectToPeer(
+    absl::string_view peer, absl::string_view local_ip = "",
+    bool require_psp = false,
+    std::shared_ptr<grpc::Channel> channel = nullptr);
 
 }  // namespace tpu_raiden::transport::lib
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_TRANSPORT_LIB_SOCKET_UTIL_H_
+#endif  // TPU_SYNC_TRANSPORT_LIB_SOCKET_UTIL_H_

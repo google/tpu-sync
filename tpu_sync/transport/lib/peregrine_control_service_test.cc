@@ -68,8 +68,65 @@ TEST(PeregrineControlServiceTest, InProcessGrpcExchangePspKey) {
   grpc::ClientContext ctx;
 
   grpc::Status status = stub->ExchangePspKey(&ctx, req, &resp);
-  // TODO(yyd): update test once the implementation is done.
-  EXPECT_EQ(status.error_code(), grpc::StatusCode::INTERNAL);
+  // Status is ok or unavailable depending on hardware PSP kernel support.
+  if (status.ok()) {
+    EXPECT_NE(resp.server_spi(), 0);
+    EXPECT_EQ(resp.server_key().size(), 16);
+  }
+
+  server->Shutdown();
+}
+
+TEST(PeregrineControlServiceTest, RejectsInvalidClientKey) {
+  FakeRawDelegate raw_delegate;
+  RawBufferTransport transport(&raw_delegate, /*local_port=*/0);
+  PeregrineControlServiceImpl service(&transport);
+
+  grpc::ServerBuilder builder;
+  builder.RegisterService(&service);
+  std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+  ASSERT_THAT(server, NotNull());
+
+  std::shared_ptr<grpc::Channel> channel =
+      server->InProcessChannel(grpc::ChannelArguments());
+  auto stub =
+      ::peregrine::internal::control::PeregrineService::NewStub(channel);
+
+  ::peregrine::internal::control::PspKeyExchangeRequest req;
+  req.set_client_spi(0x12345678);
+  req.set_client_key("short_key");  // Not 16 bytes
+  ::peregrine::internal::control::PspKeyExchangeResponse resp;
+  grpc::ClientContext ctx;
+
+  grpc::Status status = stub->ExchangePspKey(&ctx, req, &resp);
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+
+  server->Shutdown();
+}
+
+TEST(PeregrineControlServiceTest, RejectsZeroClientSpi) {
+  FakeRawDelegate raw_delegate;
+  RawBufferTransport transport(&raw_delegate, /*local_port=*/0);
+  PeregrineControlServiceImpl service(&transport);
+
+  grpc::ServerBuilder builder;
+  builder.RegisterService(&service);
+  std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+  ASSERT_THAT(server, NotNull());
+
+  std::shared_ptr<grpc::Channel> channel =
+      server->InProcessChannel(grpc::ChannelArguments());
+  auto stub =
+      ::peregrine::internal::control::PeregrineService::NewStub(channel);
+
+  ::peregrine::internal::control::PspKeyExchangeRequest req;
+  req.set_client_spi(0);  // Invalid SPI
+  req.set_client_key(std::string(16, 'x'));
+  ::peregrine::internal::control::PspKeyExchangeResponse resp;
+  grpc::ClientContext ctx;
+
+  grpc::Status status = stub->ExchangePspKey(&ctx, req, &resp);
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
 
   server->Shutdown();
 }

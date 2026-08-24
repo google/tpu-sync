@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_TRANSPORT_LIB_CONN_POOL_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_TRANSPORT_LIB_CONN_POOL_H_
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "grpcpp/channel.h"
 
 namespace tpu_raiden::transport::lib {
 
@@ -45,8 +47,10 @@ class ConnPool {
   // Borrows a connection from the pool. If no connection is available, creates
   // a new one. Returns the socket descriptor of the connection if successful.
   // Otherwise returns an error status.
-  absl::StatusOr<int> Borrow(absl::string_view peer,
-                             absl::string_view local_ip = "");
+  absl::StatusOr<int> Borrow(
+      absl::string_view peer, absl::string_view local_ip = "",
+      bool require_psp = false,
+      std::shared_ptr<grpc::Channel> channel = nullptr);
 
   // Returns a connection to the pool if ok is true. Otherwise, closes the
   // connection.

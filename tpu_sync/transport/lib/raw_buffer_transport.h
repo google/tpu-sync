@@ -29,6 +29,7 @@
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/flags/flag.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -41,6 +42,7 @@
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
+#include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 
 namespace tpu_raiden::transport::lib {
 
@@ -78,10 +80,15 @@ class RawBufferTransport final {
   // Return the local IP addresses.
   absl::Span<const std::string> local_ips() const { return local_ips_; }
 
-  // Borrows a connection from the connection pool.
+  // Borrows a connection from the connection pool, resolving the gRPC channel
+  // for PSP key exchange if enabled.
   absl::StatusOr<int> BorrowConnection(absl::string_view peer,
                                        absl::string_view local_ip = "") {
-    return conn_pool_.Borrow(peer, local_ip);
+    std::shared_ptr<grpc::Channel> channel = nullptr;
+    if (require_psp_tcp_ && raw_delegate_ != nullptr) {
+      channel = raw_delegate_->GetPeregrineChannel(peer);
+    }
+    return conn_pool_.Borrow(peer, local_ip, require_psp_tcp_, channel);
   }
 
   // Returns a connection to the connection pool.
@@ -124,13 +131,8 @@ class RawBufferTransport final {
   // Drops receive-progress counters belonging to the give `uuid`.
   void ForgetPushProgress(uint64_t uuid);
 
-  // TODO(yyd): Move this struct to psp_tcp_helper.h.
-  struct PspPeerKey {
-    uint32_t spi = 0;
-    std::string key;
-  };
-
   // Registers incoming client PSP key and returns server's allocated RX key.
+  // Triggered by ExchangePspKey() in PeregrineControlServiceImpl.
   absl::StatusOr<PspPeerKey> RegisterPspPeer(uint32_t client_spi,
                                              absl::string_view client_key);
 
@@ -161,6 +163,7 @@ class RawBufferTransport final {
   const std::string bound_ip_;
   const std::vector<std::string> local_ips_;
   int local_port_;
+  const bool require_psp_tcp_;
   std::atomic<int> server_fd_;  // owned by listener_thread_
   std::atomic<bool> stopping_;
 
@@ -170,7 +173,7 @@ class RawBufferTransport final {
   absl::Mutex mu_;
   absl::flat_hash_set<int> active_client_fds_ ABSL_GUARDED_BY(mu_);
 
-  // The conn_pool_ owns the sockets that connect to peers. in comparison, the
+  // The conn_pool_ owns the sockets that connect to peers. In comparison, the
   // active_client_fds above are those sockets accepted from peers.
   ConnPool conn_pool_;
 
@@ -181,6 +184,9 @@ class RawBufferTransport final {
   absl::Mutex push_pool_mu_;
   std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_
       ABSL_GUARDED_BY(push_pool_mu_);
+
+  // To protect multiple gRPC threads can call RegisterPspPeer concurrently
+  absl::Mutex psp_mu_;
 
   std::thread listener_thread_;
   std::vector<std::thread> worker_threads_;

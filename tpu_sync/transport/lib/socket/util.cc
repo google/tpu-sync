@@ -18,14 +18,13 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <poll.h>
 #include <sys/socket.h>
-#include <sys/uio.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <cstddef>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -36,11 +35,19 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "grpcpp/channel.h"
+#include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 
 namespace tpu_raiden::transport::lib {
 
-absl::StatusOr<int> ConnectToPeer(absl::string_view peer,
-                                  absl::string_view local_ip) {
+absl::StatusOr<int> ConnectToPeer(
+    absl::string_view peer, absl::string_view local_ip, bool require_psp,
+    std::shared_ptr<grpc::Channel> channel) {
+  if (require_psp && channel == nullptr) {
+    return absl::InvalidArgumentError(
+        "gRPC channel is required for PSP connection");
+  }
+
   std::string host;
   std::string port_str;
 
@@ -78,6 +85,7 @@ absl::StatusOr<int> ConnectToPeer(absl::string_view peer,
   int sock_fd = -1;
   struct addrinfo* rp;
   int last_errno = 0;
+  absl::Status last_status = absl::OkStatus();
   for (rp = result; rp != nullptr; rp = rp->ai_next) {
     sock_fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
     if (sock_fd < 0) {
@@ -126,11 +134,24 @@ absl::StatusOr<int> ConnectToPeer(absl::string_view peer,
       }
     }
 
-    if (connect(sock_fd, rp->ai_addr, rp->ai_addrlen) >= 0) {
+    absl::Status connect_status;
+    if (require_psp) {
+      connect_status =
+          TcpPspConnect(sock_fd, rp->ai_addr, rp->ai_addrlen, channel);
+    } else {
+      if (connect(sock_fd, rp->ai_addr, rp->ai_addrlen) >= 0) {
+        connect_status = absl::OkStatus();
+      } else {
+        last_errno = errno;
+        connect_status = absl::ErrnoToStatus(errno, "connect failed");
+      }
+    }
+
+    if (connect_status.ok()) {
       break; /* Success */
     }
 
-    last_errno = errno;
+    last_status = connect_status;
     close(sock_fd);
     sock_fd = -1;
   }
@@ -138,6 +159,10 @@ absl::StatusOr<int> ConnectToPeer(absl::string_view peer,
   freeaddrinfo(result);
 
   if (sock_fd < 0) {
+    if (!last_status.ok()) {
+      return absl::UnavailableError(absl::StrCat(
+          "Failed to connect to peer ", peer, ": ", last_status.message()));
+    }
     return absl::UnavailableError(absl::StrCat(
         "Failed to connect to peer ", peer, ": ", std::strerror(last_errno)));
   }

@@ -1540,6 +1540,13 @@ void KVCacheManagerWithTransfer::StartRead(
         free_slots_.empty()) {
       // Request larger than a slot, or staging pool exhausted: surface as a
       // recv failure (the connector can recompute) rather than throwing.
+      LOG(ERROR) << "StartRead: cannot stage req_id=" << req_id
+                 << " uuid=" << uuid
+                 << ": unique_local_blocks=" << unique_local_bids.size()
+                 << " max_blocks=" << max_blocks_
+                 << " free_slots=" << free_slots_.size()
+                 << " num_slots=" << all_slots_.size()
+                 << ". Reported as a recv failure.";
       failed_recving_.insert(req_id);
       return;
     }
@@ -2266,9 +2273,28 @@ void KVCacheManagerWithTransfer::StartPushInternal(
         free_slots_.empty()) {
       auto it = send_entries_.find(uuid);
       if (it != send_entries_.end()) {
-        done_sending_.insert(it->second->req_id);
+        // The transfer is abandoned here. The protocol carries no
+        // producer->consumer failure message, so the consumer is not told and
+        // blocks until its own deadline; this is the only place the cause is
+        // known. Report failed rather than sent, mirroring what the pool
+        // reshard send completion path already does for a send-side failure.
+        LOG(ERROR) << "StartPushInternal: abandoning transfer req_id="
+                   << it->second->req_id << " uuid=" << uuid
+                   << ": src_blocks=" << src_block_ids.size()
+                   << " max_blocks=" << max_blocks_
+                   << " free_slots=" << free_slots_.size()
+                   << " num_slots=" << all_slots_.size()
+                   << ". The consumer is not notified and will block until its "
+                      "deadline.";
+        failed_recving_.insert(it->second->req_id);
         ReleaseEntrySlotLocked(it->second);
         send_entries_.erase(it);
+      } else {
+        LOG(ERROR) << "StartPushInternal: abandoning transfer uuid=" << uuid
+                   << " with no send entry: src_blocks=" << src_block_ids.size()
+                   << " max_blocks=" << max_blocks_
+                   << " free_slots=" << free_slots_.size()
+                   << ". Nothing is reported for this request.";
       }
       return;
     }
@@ -2316,7 +2342,8 @@ void KVCacheManagerWithTransfer::StartPushInternal(
       absl::MutexLock lock(mu_);
       auto it = send_entries_.find(uuid);
       if (it != send_entries_.end()) {
-        done_sending_.insert(it->second->req_id);
+        // The D2H never ran: this request did not send.
+        failed_recving_.insert(it->second->req_id);
         ReleaseEntrySlotLocked(it->second);
         send_entries_.erase(it);
       }
@@ -2358,7 +2385,8 @@ void KVCacheManagerWithTransfer::SendNextLayer(uint64_t uuid, size_t l) {
       absl::MutexLock lock(mu_);
       auto it = send_entries_.find(uuid);
       if (it != send_entries_.end()) {
-        done_sending_.insert(it->second->req_id);
+        // The D2H copy failed: this request did not send.
+        failed_recving_.insert(it->second->req_id);
         ReleaseEntrySlotLocked(it->second);
         send_entries_.erase(it);
       }

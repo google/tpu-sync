@@ -504,6 +504,9 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   struct PoolReshardSendEntry {
     std::string req_id;
     uint64_t uuid = 0;
+    // Generation of the plan this send belongs to; settlement cleanup only
+    // touches that registration.
+    uint64_t plan_generation = 0;
     int parallelism = 8;
     int remaining_pool_peer_pushes = 0;
     bool failed = false;
@@ -540,9 +543,12 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   // corruption; the arming worker validates for itself.
   absl::Status ValidatePoolReshardReceiverCoverage(
       const ::tpu_sync::rpc::StartTransferRequest& plan);
-  void StartPoolReshardPush(uint64_t uuid, size_t pool_idx);
-  void FinishPoolReshardSend(uint64_t uuid, const absl::Status& status);
+  void StartPoolReshardPush(uint64_t uuid, size_t pool_idx,
+                            uint64_t generation);
+  void FinishPoolReshardSend(uint64_t uuid, uint64_t generation,
+                             const absl::Status& status);
   void FinishPoolReshardRecvPool(uint64_t uuid, size_t pool_idx,
+                                 uint64_t generation,
                                  const absl::Status& status);
   // Launches H2D uploads for every wire-complete pool whose order-rank
   // prerequisites (all lower-rank pools uploaded) are satisfied.

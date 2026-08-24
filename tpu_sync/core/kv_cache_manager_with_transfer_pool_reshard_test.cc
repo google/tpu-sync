@@ -699,7 +699,9 @@ TEST(PoolReshardRecvTest, FinishPoolReshardRecvRecordsDurationMetric) {
       manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}).ok());
 
   // Simulate pool completion
-  manager.FinishPoolReshardRecvPool(3001, /*pool_idx=*/0, absl::OkStatus());
+  manager.FinishPoolReshardRecvPool(3001, /*pool_idx=*/0,
+                                    manager.ActivePlanGeneration(3001).value(),
+                                    absl::OkStatus());
 }
 
 TEST(PoolReshardRecvTest, FinishPoolReshardRecvDoesNotRecordMetricOnFailure) {
@@ -719,9 +721,40 @@ TEST(PoolReshardRecvTest, FinishPoolReshardRecvDoesNotRecordMetricOnFailure) {
 
   // Simulate pool failure
   manager.FinishPoolReshardRecvPool(3002, /*pool_idx=*/0,
+                                    manager.ActivePlanGeneration(3002).value(),
                                     absl::InternalError("simulated failure"));
 }
 
+
+TEST(PoolReshardRecvTest, CleanupIsScopedToItsOwnRegistration) {
+  TestManager manager;
+  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  manager.AttachPlaceholderDeviceHold();
+
+  StartTransferRequest plan = ValidPlan(/*uuid=*/3003);
+  ASSERT_TRUE(
+      manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}).ok());
+  const uint64_t generation = manager.ActivePlanGeneration(3003).value();
+  ASSERT_GT(generation, 0u);
+
+  // Cleanup carrying another registration's generation must leave this
+  // registration and its receive state untouched.
+  manager.FinishPoolReshardRecvPool(3003, /*pool_idx=*/0, generation + 1,
+                                    absl::InternalError("stale cleanup"));
+  EXPECT_TRUE(manager.HasActivePlan(3003));
+  EXPECT_EQ(
+      manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}).code(),
+      absl::StatusCode::kAlreadyExists);
+
+  // Cleanup for this registration settles it; the uuid is registrable
+  // again and the new registration carries a fresh generation.
+  manager.FinishPoolReshardRecvPool(3003, /*pool_idx=*/0, generation,
+                                    absl::InternalError("real failure"));
+  EXPECT_FALSE(manager.HasActivePlan(3003));
+  ASSERT_TRUE(
+      manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}).ok());
+  EXPECT_NE(manager.ActivePlanGeneration(3003).value(), generation);
+}
 
 TEST(SendDeadlineTest, ExpiredSendEntryFailsInsteadOfReportingDone) {
   TestManager manager(/*timeout_s=*/0.05);

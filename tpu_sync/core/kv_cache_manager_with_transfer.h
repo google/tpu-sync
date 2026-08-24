@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
@@ -281,6 +282,18 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     std::vector<int> src_ints;
     std::vector<int> dst_ints;
     std::atomic<size_t> remaining_h2h_layers{0};
+    // Identity of this entry in draining bookkeeping, assigned with its
+    // first accepted operation; a reused uuid cannot confuse late callbacks.
+    uint64_t op_token = 0;
+    // Accepted asynchronous operations (issued D2H copies, H2H pushes) that
+    // still read this entry's staging.
+    int outstanding_ops = 0;
+    // Layers whose D2H future has a completion callback attached; an early
+    // settle hands the remaining futures drain-only callbacks.
+    size_t chained_d2h_layers = 0;
+    // The entry has settled (its outcome is published) and waits only for
+    // outstanding operations to drain before its staging is released.
+    bool draining = false;
   };
 
   struct StagingLayerReady {
@@ -368,6 +381,31 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
                             std::vector<int>* staged_host_blocks);
   void ReleaseEntrySlotLocked(const std::shared_ptr<SendEntry>& entry);
 
+  // Deferred reclamation: a settle publishes the entry's outcome at once,
+  // but its staging is released only when every accepted operation has
+  // drained. Work that must run after mu_ is dropped (attaching drain
+  // callbacks, retiring uuids, unregistering settled plans) is handed back
+  // in a SettleActions the caller applies.
+  struct SettleActions {
+    uint64_t uuid = 0;
+    uint64_t op_token = 0;
+    bool is_sender = false;
+    std::vector<raiden::PjRtCopyFuture> drain_futures;
+    std::optional<std::pair<uint64_t, uint64_t>> unregister_plan;
+  };
+  uint64_t EnsureOpTokenLocked(uint64_t* op_token);
+  void AddSendOpLocked(const std::shared_ptr<SendEntry>& entry);
+  void AddRecvOpLocked(RecvEntry* entry);
+  void ReapSendLocked(const std::shared_ptr<SendEntry>& entry);
+  void SettleSendLocked(uint64_t uuid, bool failed, SettleActions* actions);
+  void FinishSendOpLocked(uint64_t uuid, uint64_t op_token,
+                          SettleActions* actions);
+  void SettleRecvLocked(uint64_t uuid, bool failed, SettleActions* actions);
+  void FinishRecvOpLocked(uint64_t uuid, uint64_t op_token,
+                          SettleActions* actions);
+  void ApplySettleActions(SettleActions* actions);
+  void DrainOp(uint64_t uuid, uint64_t op_token, bool is_sender);
+
   void StartControlServer();
   void StopControlServer();
   void ControlServerLoop();
@@ -380,6 +418,8 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
       size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
       transport::BlockTransportDelegate::HostBlockReadyCallback cb) override;
   void ScheduleAsyncTask(std::function<void()> task) override;
+  uint64_t BeginPayloadResolution(uint64_t uuid) override;
+  void EndPayloadResolution(uint64_t uuid, uint64_t token) override;
   std::shared_ptr<StagingReadinessState> CreateStagingReadiness(
       int64_t slot_idx, int64_t num_blocks);
   void MarkStagingLayerReady(
@@ -438,8 +478,28 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     // Multi-tag plans: each pool uploads only its own group's destination
     // block ids (the flat chip_block_ids list concatenates all groups).
     std::map<size_t, std::vector<int64_t>> pool_dst_block_ids;
+    // The transfer this entry belongs to; set when the entry starts
+    // draining, so a payload lease can still find it.
+    uint64_t uuid = 0;
+    // Identity of this entry in draining bookkeeping, assigned with its
+    // first accepted operation; a reused uuid cannot confuse late callbacks.
+    uint64_t op_token = 0;
+    // Accepted asynchronous operations (issued H2D copies, payload reads)
+    // that still write into this entry's staging.
+    int outstanding_ops = 0;
+    // The entry has settled (its outcome is published) and waits only for
+    // outstanding operations to drain before its staging is released.
+    bool draining = false;
+    // Whether the published outcome was a failure; a drained failed entry
+    // also retires its uuid.
+    bool settled_failed = false;
   };
   absl::flat_hash_map<uint64_t, RecvEntry> active_recv_entries_;
+  // Entries that settled while accepted operations still hold their staging,
+  // keyed by op_token; reaped when the last operation drains.
+  absl::flat_hash_map<uint64_t, std::shared_ptr<SendEntry>> draining_sends_
+      ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<uint64_t, RecvEntry> draining_recvs_ ABSL_GUARDED_BY(mu_);
 
   struct PoolReshardSendEntry {
     std::string req_id;
@@ -509,6 +569,10 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   std::atomic<bool> shutting_down_{false};
   absl::Mutex pull_workers_mu_;
   int active_pull_workers_ ABSL_GUARDED_BY(pull_workers_mu_) = 0;
+  // Control sockets whose handler is queued or running; shut down on stop
+  // so a handler blocked in a read unwinds and its pool can join.
+  absl::flat_hash_set<int> accepted_control_fds_
+      ABSL_GUARDED_BY(pull_workers_mu_);
   double timeout_s_ = 120.0;
   bool unsafe_skip_buffer_lock_ = true;
 
@@ -532,6 +596,14 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
       active_producer_blocks_;
   absl::Mutex mu_;
   absl::CondVar cv_;
+  // Sum of outstanding operations across all entries, active and draining,
+  // plus pool copy callbacks; destruction waits for it to reach zero.
+  int total_outstanding_ops_ ABSL_GUARDED_BY(mu_) = 0;
+  // H2H pushes between their queueing decision and their hand-off to the
+  // transport; destruction stops the transport only once this is zero.
+  int pending_h2h_launches_ ABSL_GUARDED_BY(mu_) = 0;
+  // Source of entry op_token values.
+  uint64_t op_token_counter_ ABSL_GUARDED_BY(mu_) = 0;
   int control_fd_ = -1;
   std::atomic<bool> stopping_{false};
   std::thread control_thread_;

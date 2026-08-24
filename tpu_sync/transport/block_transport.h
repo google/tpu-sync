@@ -64,6 +64,11 @@ class BlockTransport final {
   // Destructor closes all sockets and joins all threads.
   ~BlockTransport();
 
+  // Fails every started push by shutting down its socket, without waiting.
+  // Each push reports through its completion callback as usual; a push still
+  // queued behind a worker runs later against its own socket.
+  void AbortActiveSends();
+
   // Return the TCP listening socket port.
   int local_port() const { return raw_transport_.local_port(); }
 
@@ -144,6 +149,9 @@ class BlockTransport final {
     int stream_idx;
     std::string peer;
     std::function<void()> run;
+    // Fails this stream's share of the push without running it; fires the
+    // aggregated completion when it is the last share to finish.
+    std::function<void(const absl::Status&)> cancel;
   };
 
   struct PeerQueue {

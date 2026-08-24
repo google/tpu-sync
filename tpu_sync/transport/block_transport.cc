@@ -241,6 +241,23 @@ BlockTransport::~BlockTransport() {
   for (auto& t : socket_workers_) {
     if (t.joinable()) t.join();
   }
+  // Workers are joined, so anything still queued will never run; cancelling
+  // each task fires its completion exactly once and no caller waits forever.
+  std::vector<std::unique_ptr<WriteTask>> orphaned_tasks;
+  {
+    absl::MutexLock lock(scheduler_mu_);
+    for (auto& queue_entry : peer_queues_) {
+      for (auto& task : queue_entry.second.tasks) {
+        orphaned_tasks.push_back(std::move(task));
+      }
+      queue_entry.second.tasks.clear();
+    }
+  }
+  for (auto& task : orphaned_tasks) {
+    if (task && task->cancel) {
+      task->cancel(absl::CancelledError("transport shutting down"));
+    }
+  }
   {
     absl::MutexLock lock(active_sends_mu_);
     for (const auto& [uuid, state] : active_sends_) {
@@ -250,6 +267,15 @@ BlockTransport::~BlockTransport() {
     }
     active_sends_mu_.Await(absl::Condition(
         +[](const SendMap* s) { return s->empty(); }, &active_sends_));
+  }
+}
+
+void BlockTransport::AbortActiveSends() {
+  absl::MutexLock lock(active_sends_mu_);
+  for (const auto& [uuid, state] : active_sends_) {
+    if (state && state->client_fd >= 0) {
+      shutdown(state->client_fd, SHUT_RDWR);
+    }
   }
 }
 
@@ -328,6 +354,13 @@ absl::Status BlockTransport::HandleCustomRequest(
 absl::Status BlockTransport::HandleIncomingPush(
     int client_fd, const lib::ChunkHeader& header) {
   ASSIGN_OR_RETURN(MajorOrder major_order, ParseMajorOrder(header.flags));
+  // One lease spans the whole stream from admission: a stream blocked in
+  // any read below cannot outlive its transfer's staging unnoticed.
+  const uint64_t stream_token =
+      block_delegate_->BeginPayloadResolution(header.uuid);
+  absl::Cleanup end_stream_lease = [&] {
+    block_delegate_->EndPayloadResolution(header.uuid, stream_token);
+  };
   std::vector<int> target_layers;
   if (header.local_id == 0xFFFFFFFF) {
     target_layers.resize(block_delegate_->num_block_arrays());
@@ -404,6 +437,14 @@ absl::Status BlockTransport::HandleIncomingPush(
         uint8_t size_buf[lib::kChunkSizeFieldSize];
         RETURN_IF_ERROR(ReadExact(client_fd, size_buf, sizeof(size_buf)));
         const uint32_t sender_size = lib::DeserializeChunkSize(size_buf);
+        // The delegate may reclaim the memory behind resolved chunks when
+        // the transfer settles; the lease taken here keeps this payload's
+        // destination alive until its bytes have landed or the stream fails.
+        const uint64_t payload_token =
+            block_delegate_->BeginPayloadResolution(header.uuid);
+        absl::Cleanup end_payload_lease = [&] {
+          block_delegate_->EndPayloadResolution(header.uuid, payload_token);
+        };
 
         const int64_t block_id_val = dst_id;
         int64_t src_bid = -1;
@@ -849,6 +890,20 @@ void BlockTransport::AsyncPush(
     task->stream_idx = i;
     task->peer = remote_peer;
     task->run = std::move(task_run);
+    task->cancel = [i, statuses, remaining_workers,
+                    on_complete](const absl::Status& status) {
+      (*statuses)[i] = status;
+      if (remaining_workers->fetch_sub(1) == 1) {
+        absl::Status final_status = absl::OkStatus();
+        for (const auto& s : *statuses) {
+          if (!s.ok()) {
+            final_status = s;
+            break;
+          }
+        }
+        on_complete(final_status);
+      }
+    };
 
     {
       absl::MutexLock lock(scheduler_mu_);

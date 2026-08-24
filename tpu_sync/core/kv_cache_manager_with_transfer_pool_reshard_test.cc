@@ -734,6 +734,42 @@ TEST(SendDeadlineTest, ExpiredSendEntryFailsInsteadOfReportingDone) {
   EXPECT_THAT(failed_recving, Contains("expired_send_req"));
 }
 
+TEST(DrainingTest, PayloadLeaseDefersOutcomeStagingAndPlanUntilItEnds) {
+  TestManager manager(/*timeout_s=*/0.05);
+  manager.EnableDemandStaging();
+  auto* pool = manager.host_block_manager();
+  const int free_before = pool->num_free_blocks();
+  ASSERT_TRUE(manager
+                  .RegisterActivePlan(
+                      41, BlockPlan(41, {0, 1}, {2, 3}, MEMORY_TYPE_HBM),
+                      /*is_sender=*/false)
+                  .ok());
+  EXPECT_EQ(pool->num_free_blocks(), free_before - 2);
+  transport::BlockTransportDelegate* delegate = &manager;
+  const uint64_t token = delegate->BeginPayloadResolution(41);
+  ASSERT_GT(token, 0u);
+
+  // The transfer times out while the payload lease is open: no outcome is
+  // published, and the staging and the plan stay owned.
+  absl::SleepFor(absl::Milliseconds(120));
+  auto during = manager.CompleteReadRaw();
+  EXPECT_THAT(std::get<2>(during), IsEmpty());
+  EXPECT_EQ(pool->num_free_blocks(), free_before - 2);
+  EXPECT_TRUE(manager.HasActivePlan(41));
+
+  // Ending the lease drains the transfer: the failure is published, the
+  // staging returns, the plan is gone, and a late payload resolves nothing.
+  delegate->EndPayloadResolution(41, token);
+  auto after = manager.CompleteReadRaw();
+  EXPECT_THAT(std::get<2>(after), Contains("block_plan_req_41"));
+  EXPECT_EQ(pool->num_free_blocks(), free_before);
+  EXPECT_FALSE(manager.HasActivePlan(41));
+  const int64_t dst_block = 2;
+  EXPECT_TRUE(
+      manager.GetBlockChunks(0, 0, absl::MakeConstSpan(&dst_block, 1), 16, 41)
+          .empty());
+}
+
 TEST(DemandStagingTest, SenderPlanReturnsStagingOnUnregister) {
   TestManager manager;
   manager.EnableDemandStaging();

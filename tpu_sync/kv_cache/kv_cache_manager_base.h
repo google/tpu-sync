@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <deque>
 #include <optional>
 #include <queue>
 #include <string>
@@ -387,6 +388,15 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   virtual absl::Status UnregisterActivePlan(uint64_t uuid);
 
+  // Refuses planless payload resolution for a transfer that settled
+  // abnormally: a late push for its uuid must not land at identity-addressed
+  // blocks that may have new owners. Registering the uuid again lifts the
+  // refusal. The set is bounded; the oldest retirements fall off first.
+  void RetireTransferUuid(uint64_t uuid);
+  // Lifts an earlier retirement when a transfer legitimately reuses the
+  // uuid without registering a plan.
+  void ReviveTransferUuid(uint64_t uuid);
+
   // Whether a transfer plan is currently registered under `uuid`.
   bool HasActivePlan(uint64_t uuid) const {
     absl::MutexLock l(plans_mu_);
@@ -602,6 +612,13 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // previous copy semantics exactly.
   absl::flat_hash_map<uint64_t, std::shared_ptr<const RegisteredPlan>>
       active_plans_ ABSL_GUARDED_BY(plans_mu_);
+  void ReviveTransferUuidLocked(uint64_t uuid)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(plans_mu_);
+  static constexpr size_t kMaxRetiredTransferUuids = 4096;
+  // Uuids RetireTransferUuid() has retired, and their retirement order.
+  absl::flat_hash_set<uint64_t> retired_transfer_uuids_
+      ABSL_GUARDED_BY(plans_mu_);
+  std::deque<uint64_t> retired_transfer_uuid_order_ ABSL_GUARDED_BY(plans_mu_);
 
   // An asynchronous FFI task item representing a queued H2D or D2H copy
   // request. Bundles the work lambda with the XLA promise that signals Python

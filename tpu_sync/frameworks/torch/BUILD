@@ -527,8 +527,8 @@ py_test(
         "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
         "@torch_tpu//torch_tpu",
-        "@torch_tpu//torch_tpu/_internal/execution_mode",
-        "@torch_tpu//torch_tpu/_internal/sync",
+        "@torch_tpu//torch_tpu/src/torch_tpu/_internal/execution_mode",
+        "@torch_tpu//torch_tpu/src/torch_tpu/_internal/sync",
     ],
 )
 

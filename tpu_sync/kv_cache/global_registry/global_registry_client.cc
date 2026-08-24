@@ -127,20 +127,7 @@ tsl::Future<> GlobalRegistryClient::RegisterAsync(
 
 absl::Status GlobalRegistryClient::Register(
     const std::vector<Registration>& registrations) {
-  RegisterRequest request;
-  BuildRegisterRequest(registrations, &request);
-
-  RegisterResponse response;
-  grpc::ClientContext context;
-  grpc::Status status = stub_->Register(&context, request, &response);
-
-  if (!status.ok()) {
-    return absl::InternalError(status.error_message());
-  }
-  if (!response.success()) {
-    return absl::FailedPreconditionError(response.error_message());
-  }
-  return absl::OkStatus();
+  return RegisterAsync(registrations).Await();
 }
 
 absl::StatusOr<std::vector<KVBlockMetadata>> GlobalRegistryClient::Lookup(
@@ -234,20 +221,7 @@ tsl::Future<> GlobalRegistryClient::UnregisterAsync(
 
 absl::Status GlobalRegistryClient::Unregister(
     const std::vector<std::string>& prefix_hashes, const RaidenId& raiden_id) {
-  UnregisterRequest request;
-  BuildUnregisterRequest(prefix_hashes, raiden_id, &request);
-
-  UnregisterResponse response;
-  grpc::ClientContext context;
-  grpc::Status status = stub_->Unregister(&context, request, &response);
-
-  if (!status.ok()) {
-    return absl::InternalError(status.error_message());
-  }
-  if (!response.success()) {
-    return absl::FailedPreconditionError(response.error_message());
-  }
-  return absl::OkStatus();
+  return UnregisterAsync(prefix_hashes, raiden_id).Await();
 }
 
 absl::Status GlobalRegistryClient::RegisterStore(

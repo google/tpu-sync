@@ -564,21 +564,42 @@ void KVCacheStoreServiceImpl::Settle(const std::shared_ptr<WriteOp>& op) {
 void KVCacheStoreServiceImpl::OnTransferComplete(
     std::shared_ptr<Lifetime> lifetime, uint64_t op_id,
     absl::Status transfer_status) {
-  absl::MutexLock lock(lifetime->mu);
-  if (lifetime->svc != nullptr) {
-    lifetime->svc->CompleteWriteRemote(op_id, transfer_status);
+  std::optional<PendingPublish> pending;
+  {
+    absl::MutexLock lock(lifetime->mu);
+    if (lifetime->svc != nullptr) {
+      pending = lifetime->svc->CompleteWriteRemote(op_id, transfer_status);
+    }
   }
+  if (!pending.has_value()) {
+    return;
+  }
+  // Attached with `lifetime->mu` released, on purpose. OnReady on a future
+  // that is already resolved runs inline on this very thread, and the
+  // no-registry-configured backend hands back exactly such a future, so
+  // attaching above would deadlock on a mutex this thread already holds.
+  // Taking `mu` inside the callback is what keeps the service alive for the
+  // duration of FinishPublish.
+  std::move(pending->future)
+      .OnReady([lifetime, op = std::move(pending->op),
+                op_id](absl::Status registered) {
+        absl::MutexLock lock(lifetime->mu);
+        if (lifetime->svc != nullptr) {
+          lifetime->svc->FinishPublish(op, op_id, registered);
+        }
+      });
 }
 
-void KVCacheStoreServiceImpl::CompleteWriteRemote(
-    uint64_t op_id, absl::Status transfer_status) {
+std::optional<KVCacheStoreServiceImpl::PendingPublish>
+KVCacheStoreServiceImpl::CompleteWriteRemote(uint64_t op_id,
+                                             absl::Status transfer_status) {
   std::shared_ptr<WriteOp> op;
   bool claimed = false;
   {
     absl::MutexLock lock(write_mutex_);
     op = FindOp(op_id);
     if (op == nullptr) {
-      return;  // Aged out.
+      return std::nullopt;  // Aged out.
     }
     const absl::Time now = absl::Now();
     if (transfer_status.ok() && op->state == OpState::kPending &&
@@ -600,41 +621,21 @@ void KVCacheStoreServiceImpl::CompleteWriteRemote(
     // blocks and settle.
     ReleaseLandingBlocks(op);
     Settle(op);
-    return;
+    return std::nullopt;
   }
 
   // Claimed path: write_mutex_ NOT held across backend and registry calls.
-  auto finish = [&](OpState state, std::vector<std::string> existing) {
-    const bool kept_by_cache =
-        state == OpState::kCommitted || state == OpState::kStoredUnregistered;
-    {
-      absl::MutexLock lock(write_mutex_);
-      op->state = state;
-      op->existing_hashes = std::move(existing);
-      if (state == OpState::kStoredUnregistered) {
-        op->unregistered_hashes = op->block_hashes;
-      }
-      if (kept_by_cache) {
-        op->blocks_released = true;
-        op->next_leak_warning = absl::InfiniteFuture();
-      }
-    }
-    if (!kept_by_cache) {
-      ReleaseLandingBlocks(op);
-    }
-    Settle(op);
-  };
 
   // Re-check existence.
   std::vector<std::string> present =
       backend_->AlreadyPresentHostResident(op->block_hashes);
   if (present.size() == op->block_hashes.size()) {
-    finish(OpState::kAllExist, {});
-    return;
+    Finish(op, OpState::kAllExist, {});
+    return std::nullopt;
   }
   if (!present.empty()) {
-    finish(OpState::kPartialExist, std::move(present));
-    return;
+    Finish(op, OpState::kPartialExist, std::move(present));
+    return std::nullopt;
   }
 
   std::vector<RaidenBlockId> slices;
@@ -646,12 +647,22 @@ void KVCacheStoreServiceImpl::CompleteWriteRemote(
     slices.push_back(RaidenBlockId(local_id, block_id, BlockStatus::HOST));
   }
   if (!backend_->InsertAllOrNothing(op->block_hashes, slices)) {
-    finish(OpState::kFailed, {});
-    return;
+    Finish(op, OpState::kFailed, {});
+    return std::nullopt;
   }
 
-  absl::Status registered =
-      backend_->RegisterBlocksSync(op->block_hashes, op->landing_block_ids);
+  // The blocks are in the cache; publishing them is all that is left, and the
+  // caller finishes the operation when the registry answers. Handing the
+  // future back rather than attaching here is what keeps this off a gRPC
+  // callback thread that is holding `lifetime_->mu` -- see the declaration.
+  return PendingPublish{
+      backend_->RegisterBlocksAsync(op->block_hashes, op->landing_block_ids),
+      op};
+}
+
+void KVCacheStoreServiceImpl::FinishPublish(const std::shared_ptr<WriteOp>& op,
+                                            uint64_t op_id,
+                                            absl::Status registered) {
   if (!registered.ok()) {
     LOG(WARNING) << "Remote write " << op_id << " landed "
                  << op->block_hashes.size()
@@ -660,11 +671,33 @@ void KVCacheStoreServiceImpl::CompleteWriteRemote(
                  << registered.message()
                  << ". Keeping them; no peer will find them until something "
                     "re-registers them.";
-    finish(OpState::kStoredUnregistered, {});
+    Finish(op, OpState::kStoredUnregistered, {});
     return;
   }
+  Finish(op, OpState::kCommitted, {});
+}
 
-  finish(OpState::kCommitted, {});
+void KVCacheStoreServiceImpl::Finish(const std::shared_ptr<WriteOp>& op,
+                                     OpState state,
+                                     std::vector<std::string> existing) {
+  const bool kept_by_cache =
+      state == OpState::kCommitted || state == OpState::kStoredUnregistered;
+  {
+    absl::MutexLock lock(write_mutex_);
+    op->state = state;
+    op->existing_hashes = std::move(existing);
+    if (state == OpState::kStoredUnregistered) {
+      op->unregistered_hashes = op->block_hashes;
+    }
+    if (kept_by_cache) {
+      op->blocks_released = true;
+      op->next_leak_warning = absl::InfiniteFuture();
+    }
+  }
+  if (!kept_by_cache) {
+    ReleaseLandingBlocks(op);
+  }
+  Settle(op);
 }
 
 ::grpc::Status KVCacheStoreServiceImpl::PollWriteRemote(

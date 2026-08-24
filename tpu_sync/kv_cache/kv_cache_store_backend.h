@@ -254,17 +254,22 @@ class KVCacheStoreBackend {
   virtual void RollbackInsert(absl::Span<const std::string> block_hashes,
                               absl::Span<const int32_t> host_block_ids) {}
 
-  // Publishes `block_hashes` to the global registry and reports whether that
-  // succeeded.
+  // Publishes `block_hashes` to the global registry asynchronously.
   //
   // Not Insert()'s inline Register: that one logs and swallows the failure. A
   // remote write may only report COMMITTED once the blocks are globally
   // reachable, or the source frees its copy of blocks no lookup can find.
+  virtual tsl::Future<> RegisterBlocksAsync(
+      absl::Span<const std::string> block_hashes,
+      absl::Span<const int32_t> host_block_ids) {
+    return tsl::Future<>(absl::UnimplementedError(
+        "Backend does not implement RegisterBlocksAsync."));
+  }
+
   virtual absl::Status RegisterBlocksSync(
       absl::Span<const std::string> block_hashes,
       absl::Span<const int32_t> host_block_ids) {
-    return absl::UnimplementedError(
-        "Backend does not implement RegisterBlocksSync.");
+    return RegisterBlocksAsync(block_hashes, host_block_ids).Await();
   }
 
   // The peer-facing KVCacheStoreService server this backend hosts, if any.

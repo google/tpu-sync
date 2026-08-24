@@ -522,7 +522,6 @@ cc_test(
         "//tpu_sync/core/controller:test_util",
         "//tpu_sync/core/controller:worker_registry",
         "//tpu_sync/kv_cache/global_registry:global_registry_client_cc",
-        "//tpu_sync/kv_cache/global_registry:global_registry_server_lib",
         "//tpu_sync/kv_cache/global_registry:test_util",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
@@ -666,7 +665,6 @@ cc_test(
     local_defines = ["ABSL_DEFINE_UNQUALIFIED_STATUS_TESTING_MACROS"],
     deps = [
         ":host_offload_backend",
-        ":kv_cache_metadata",
         ":kv_cache_store",
         ":kv_cache_store_backend",
         ":kv_cache_store_client",

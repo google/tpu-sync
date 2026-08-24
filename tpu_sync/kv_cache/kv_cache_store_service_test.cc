@@ -41,6 +41,7 @@
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/kv_manager_holder.h"
+#include "tpu_sync/kv_cache/global_registry/global_registry_server.h"
 #include "tpu_sync/kv_cache/global_registry/test_util.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
@@ -907,6 +908,115 @@ TEST_F(WriteRemoteTest, PollRejectsTheReservedOperationId) {
   ::grpc::ServerContext context;
   auto status = service_->PollWriteRemote(&context, &request, &response);
   EXPECT_EQ(status.error_code(), ::grpc::StatusCode::INVALID_ARGUMENT);
+}
+
+// When the transfer completes, the thread that called Release() on that
+// completion must NOT be held while the registry call runs. A stalled registry
+// must not delay completing the transfer.
+TEST(WriteRemotePublishTest, PublishDoesNotBlockTheTransferCompletion) {
+  auto impl = std::make_unique<global_registry::GlobalRegistryServiceImpl>();
+  auto stalling_service =
+      std::make_unique<global_registry::StallingRegistryService>(
+          std::move(impl));
+  auto* registry_service = stalling_service.get();
+  registry_service->EnableStall();
+
+  auto registry_server =
+      global_registry::CreateTestGlobalRegistryServerWithService(
+          std::move(stalling_service));
+
+  const RaidenId dst_id{"dst_job_publish", "0", "dst_data", 0};
+  KVCacheStore store(/*capacity=*/8, registry_server->server_address, dst_id,
+                     /*num_shards=*/1, /*shard_size_bytes=*/1024,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  KVCacheStoreServiceImpl service(store.backend().get(),
+                                  store.raiden_controller());
+  TransferLatch latch;
+  service.SetTransferFnForTesting(
+      [&latch](absl::Span<const Buffer>, absl::Span<const Buffer>) {
+        return latch.Issue();
+      });
+
+  ::grpc::ServerBuilder builder;
+  int port = 0;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
+                           &port);
+  builder.RegisterService(&service);
+  auto server = builder.BuildAndStart();
+  KVCacheStoreClient client(
+      ::grpc::CreateChannel("localhost:" + std::to_string(port),
+                            ::grpc::InsecureChannelCredentials()));
+
+  ::tpu_sync::rpc::RaidenIdProto src_id;
+  src_id.set_job_name("src_job_publish");
+  src_id.set_job_replica_id("0");
+  src_id.set_data_name("src_data");
+  ::tpu_sync::proto::RaidenWorkerEndpointsProto group;
+  group.set_node_id(0);
+  group.set_worker_id("src_worker_0");
+  group.add_endpoints()->set_endpoint("127.0.0.1:9999");
+
+  std::vector<std::string> hashes = {"publish_a", "publish_b"};
+  std::vector<int32_t> src_ids = {200, 201};
+  auto response =
+      client.WriteRemote(src_id, hashes, src_ids, {group}, 5000).Await();
+  ASSERT_OK(response.status());
+  const uint64_t op_id = response->operation_id();
+  ASSERT_NE(op_id, 0);
+
+  // Hold the registry for kStall once it has been reached. A synchronous
+  // publish would make Release() below cost that long; an asynchronous one
+  // costs nothing. Released from another thread rather than after the timing
+  // window, so that a regression fails an assertion instead of deadlocking.
+  constexpr absl::Duration kStall = absl::Seconds(2);
+  std::thread releaser([registry_service, kStall] {
+    registry_service->WaitForStall();
+    absl::SleepFor(kStall);
+    registry_service->ReleaseStall();
+  });
+
+  const absl::Time before = absl::Now();
+  latch.Release(absl::OkStatus());
+  const absl::Duration completion_cost = absl::Now() - before;
+
+  EXPECT_LT(completion_cost, kStall / 2)
+      << "completing the transfer took " << completion_cost
+      << ", which means it waited on the registry stalled for " << kStall;
+
+  // ... and the operation has not settled, which is what proves the wait that
+  // did not happen was a real one rather than a registry that answered fast.
+  auto polled = client.PollWriteRemote(op_id).Await();
+  ASSERT_OK(polled.status());
+  EXPECT_EQ(polled->state(),
+            ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::PENDING);
+
+  releaser.join();
+
+  ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse final_poll;
+  for (int i = 0; i < 300; ++i) {
+    auto p = client.PollWriteRemote(op_id).Await();
+    ASSERT_OK(p.status());
+    if (p->state() !=
+        ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::PENDING) {
+      final_poll = *p;
+      break;
+    }
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  // Committed on a gRPC callback thread, not on the thread that released the
+  // transfer -- the half of the change that the Lifetime guard protects.
+  EXPECT_EQ(final_poll.state(),
+            ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::COMMITTED);
+  EXPECT_THAT(final_poll.committed_hashes(),
+              UnorderedElementsAre("publish_a", "publish_b"));
+
+  auto looked_up = registry_server->client->Lookup(hashes);
+  ASSERT_OK(looked_up.status());
+  EXPECT_EQ(looked_up->size(), 2)
+      << "the landed blocks were never advertised";
+
+  server->Shutdown();
 }
 
 // The bytes arrive but the destination cannot publish them.

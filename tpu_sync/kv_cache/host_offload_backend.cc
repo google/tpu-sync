@@ -941,13 +941,13 @@ void HostOffloadBackend::RollbackInsert(
   }
 }
 
-absl::Status HostOffloadBackend::RegisterBlocksSync(
+tsl::Future<> HostOffloadBackend::RegisterBlocksAsync(
     absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> host_block_ids) {
   if (block_hashes.size() != host_block_ids.size()) {
-    return absl::InvalidArgumentError(absl::StrCat(
+    return tsl::Future<>(absl::InvalidArgumentError(absl::StrCat(
         "Mismatched block_hashes count (", block_hashes.size(),
-        ") vs host_block_ids count (", host_block_ids.size(), ")."));
+        ") vs host_block_ids count (", host_block_ids.size(), ").")));
   }
   std::shared_ptr<global_registry::GlobalRegistryClient> client;
   RaidenId local_id;
@@ -959,7 +959,7 @@ absl::Status HostOffloadBackend::RegisterBlocksSync(
   if (client == nullptr) {
     // No registry configured, so there is nothing to advertise and no way for
     // these blocks to end up unreachable-but-believed-reachable. Success.
-    return absl::OkStatus();
+    return tsl::Future<>(absl::OkStatus());
   }
 
   std::vector<global_registry::Registration> registrations;
@@ -971,7 +971,13 @@ absl::Status HostOffloadBackend::RegisterBlocksSync(
         .block_id = host_block_ids[i],
     });
   }
-  return client->Register(registrations);
+  return client->RegisterAsync(registrations);
+}
+
+absl::Status HostOffloadBackend::RegisterBlocksSync(
+    absl::Span<const std::string> block_hashes,
+    absl::Span<const int32_t> host_block_ids) {
+  return RegisterBlocksAsync(block_hashes, host_block_ids).Await();
 }
 
 tsl::Future<> HostOffloadBackend::Load(

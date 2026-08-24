@@ -172,7 +172,34 @@ class KVCacheStoreServiceImpl
   static void OnTransferComplete(std::shared_ptr<Lifetime> lifetime,
                                  uint64_t op_id, absl::Status transfer_status);
 
-  void CompleteWriteRemote(uint64_t op_id, absl::Status transfer_status);
+  // A publish that CompleteWriteRemote started and could not finish inline.
+  // `future` resolves when the registry answers; `op` is the operation waiting
+  // on it.
+  struct PendingPublish {
+    tsl::Future<> future;
+    std::shared_ptr<WriteOp> op;
+  };
+
+  // Returns a PendingPublish when the operation reached the registry and the
+  // answer has not arrived yet. The continuation is deliberately NOT attached
+  // here: this runs with `lifetime_->mu` held, and Future::OnReady on an
+  // already-resolved future runs inline on the calling thread, so attaching
+  // here would re-enter that non-reentrant mutex. A backend with no registry
+  // configured returns an already-resolved future, so that is the common case,
+  // not a rare race.
+  std::optional<PendingPublish> CompleteWriteRemote(uint64_t op_id,
+                                                    absl::Status
+                                                        transfer_status);
+
+  // Second half of CompleteWriteRemote, run once the registry has answered.
+  void FinishPublish(const std::shared_ptr<WriteOp>& op, uint64_t op_id,
+                     absl::Status registered);
+
+  // Records an operation's verdict, releases its landing blocks when the cache
+  // did not keep them, and settles it. Must NOT be called with write_mutex_
+  // held.
+  void Finish(const std::shared_ptr<WriteOp>& op, OpState state,
+              std::vector<std::string> existing);
 
   // Wakes at the earliest interesting time across all operations: a deadline
   // to fire, or a deferred free to complain about. One joined thread, never

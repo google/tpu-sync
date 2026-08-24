@@ -19,7 +19,10 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "xla/tsl/concurrency/future.h"
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -55,17 +58,10 @@ void ToProto(const RaidenId& id, ::tpu_sync::rpc::RaidenIdProto* proto) {
   proto->set_data_name(id.data_name);
   proto->set_data_replica_idx(id.data_replica_idx);
 }
-}  // namespace
-
-GlobalRegistryClient::GlobalRegistryClient(
-    std::shared_ptr<grpc::Channel> channel)
-    : stub_(GlobalRegistryService::NewStub(channel)) {}
-
-absl::Status GlobalRegistryClient::Register(
-    const std::vector<Registration>& registrations) {
-  RegisterRequest request;
+void BuildRegisterRequest(const std::vector<Registration>& registrations,
+                          RegisterRequest* request) {
   for (const auto& reg : registrations) {
-    auto* entry = request.add_entries();
+    auto* entry = request->add_entries();
     entry->set_prefix_hash(reg.prefix_hash);
     auto* meta = entry->mutable_metadata();
     ToProto(reg.raiden_id, meta->mutable_raiden_id());
@@ -74,6 +70,65 @@ absl::Status GlobalRegistryClient::Register(
       entry->set_ttl_seconds(absl::ToInt64Seconds(reg.ttl));
     }
   }
+}
+
+void BuildUnregisterRequest(const std::vector<std::string>& prefix_hashes,
+                            const RaidenId& raiden_id,
+                            UnregisterRequest* request) {
+  request->mutable_prefix_hashes()->Reserve(prefix_hashes.size());
+  for (const auto& hash : prefix_hashes) {
+    request->add_prefix_hashes(hash);
+  }
+  ToProto(raiden_id, request->mutable_raiden_id());
+}
+
+}  // namespace
+
+GlobalRegistryClient::GlobalRegistryClient(
+    std::shared_ptr<grpc::Channel> channel)
+    : stub_(GlobalRegistryService::NewStub(channel)) {}
+
+tsl::Future<> GlobalRegistryClient::RegisterAsync(
+    const std::vector<Registration>& registrations, absl::Duration timeout,
+    RegistryCall* out_call) {
+  if (timeout <= absl::ZeroDuration()) {
+    return tsl::Future<>(absl::DeadlineExceededError(
+        "Registry call timeout is zero or negative, so it expired before it "
+        "was dispatched."));
+  }
+
+  auto [promise, future] = tsl::MakePromise<>();
+  auto context = std::make_shared<grpc::ClientContext>();
+  auto request = std::make_shared<RegisterRequest>();
+  auto response = std::make_shared<RegisterResponse>();
+  BuildRegisterRequest(registrations, request.get());
+  if (timeout < absl::InfiniteDuration()) {
+    context->set_deadline(absl::ToChronoTime(absl::Now() + timeout));
+  }
+  if (out_call != nullptr) {
+    out_call->context_ = context;
+  }
+
+  stub_->async()->Register(
+      context.get(), request.get(), response.get(),
+      [context, request, response, stub = stub_,
+       promise = std::move(promise).ToShared()](grpc::Status status) mutable {
+        if (!status.ok()) {
+          promise->Set(absl::InternalError(status.error_message()));
+        } else if (!response->success()) {
+          promise->Set(
+              absl::FailedPreconditionError(response->error_message()));
+        } else {
+          promise->Set(absl::OkStatus());
+        }
+      });
+  return future;
+}
+
+absl::Status GlobalRegistryClient::Register(
+    const std::vector<Registration>& registrations) {
+  RegisterRequest request;
+  BuildRegisterRequest(registrations, &request);
 
   RegisterResponse response;
   grpc::ClientContext context;
@@ -137,14 +192,50 @@ GlobalRegistryClient::PullOwned(const RaidenId& raiden_id) {
   return entries;
 }
 
+tsl::Future<> GlobalRegistryClient::UnregisterAsync(
+    const std::vector<std::string>& prefix_hashes, const RaidenId& raiden_id,
+    absl::Duration timeout, RegistryCall* out_call) {
+  if (timeout <= absl::ZeroDuration()) {
+    // Already expired. Decided here, not by gRPC: a deadline of exactly "now"
+    // races the round trip and on loopback the call usually wins, which would
+    // make "zero" silently mean "no timeout" for the callers that matter.
+    return tsl::Future<>(absl::DeadlineExceededError(
+        "Registry call timeout is zero or negative, so it expired before it "
+        "was dispatched."));
+  }
+
+  auto [promise, future] = tsl::MakePromise<>();
+  auto context = std::make_shared<grpc::ClientContext>();
+  auto request = std::make_shared<UnregisterRequest>();
+  auto response = std::make_shared<UnregisterResponse>();
+  BuildUnregisterRequest(prefix_hashes, raiden_id, request.get());
+  if (timeout < absl::InfiniteDuration()) {
+    context->set_deadline(absl::ToChronoTime(absl::Now() + timeout));
+  }
+  if (out_call != nullptr) {
+    out_call->context_ = context;
+  }
+
+  stub_->async()->Unregister(
+      context.get(), request.get(), response.get(),
+      [context, request, response, stub = stub_,
+       promise = std::move(promise).ToShared()](grpc::Status status) mutable {
+        if (!status.ok()) {
+          promise->Set(absl::InternalError(status.error_message()));
+        } else if (!response->success()) {
+          promise->Set(
+              absl::FailedPreconditionError(response->error_message()));
+        } else {
+          promise->Set(absl::OkStatus());
+        }
+      });
+  return future;
+}
+
 absl::Status GlobalRegistryClient::Unregister(
     const std::vector<std::string>& prefix_hashes, const RaidenId& raiden_id) {
   UnregisterRequest request;
-  request.mutable_prefix_hashes()->Reserve(prefix_hashes.size());
-  for (const auto& hash : prefix_hashes) {
-    request.add_prefix_hashes(hash);
-  }
-  ToProto(raiden_id, request.mutable_raiden_id());
+  BuildUnregisterRequest(prefix_hashes, raiden_id, &request);
 
   UnregisterResponse response;
   grpc::ClientContext context;

@@ -27,6 +27,8 @@
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "grpcpp/channel.h"
+#include "grpcpp/client_context.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
 #include "tpu_sync/kv_cache/raiden_id.h"
@@ -36,6 +38,24 @@ namespace kv_cache {
 namespace global_registry {
 
 using namespace ::tpu_raiden::kv_cache::global_registry;  // NOLINT
+
+class GlobalRegistryClient;
+
+// Cancels one in-flight registry call. TryCancel is safe from any thread, never
+// blocks, and is a no-op once the call has completed. Holds the context weakly,
+// so a handle kept after completion does not keep the call's state alive.
+class RegistryCall {
+ public:
+  void TryCancel() {
+    if (auto ctx = context_.lock()) {
+      ctx->TryCancel();
+    }
+  }
+
+ private:
+  friend class GlobalRegistryClient;
+  std::weak_ptr<grpc::ClientContext> context_;
+};
 
 struct Registration {
   std::string prefix_hash;
@@ -47,6 +67,26 @@ struct Registration {
 class GlobalRegistryClient {
  public:
   explicit GlobalRegistryClient(std::shared_ptr<grpc::Channel> channel);
+
+  // Registers a batch of KV cache entries asynchronously. The returned future
+  // resolves on a gRPC callback thread with OkStatus, FailedPrecondition when
+  // the server rejected the batch, or Internal when the RPC itself failed.
+  //
+  // `timeout` bounds the call as a gRPC deadline. Beware that zero does NOT
+  // mean the same thing here as it does for `Registration::ttl` and
+  // `RegisterStore`'s ttl, where zero means "never expires": a `timeout` of
+  // zero or less is already expired, and the returned future resolves
+  // DeadlineExceeded without the RPC ever being dispatched. That case is
+  // decided here rather than left to gRPC, whose behaviour for a deadline of
+  // exactly "now" is a race against the round trip -- on loopback the call
+  // usually wins. "No deadline" is `absl::InfiniteDuration()`, the default.
+  //
+  // `out_call`, when non-null, receives a handle for cancelling this call.
+  // The common caller passes nothing.
+  tsl::Future<> RegisterAsync(
+      const std::vector<Registration>& registrations,
+      absl::Duration timeout = absl::InfiniteDuration(),
+      RegistryCall* out_call = nullptr);
 
   // Registers a batch of KV cache entries.
   absl::Status Register(const std::vector<Registration>& registrations);
@@ -61,6 +101,15 @@ class GlobalRegistryClient {
   // hits before the first miss.
   absl::StatusOr<std::vector<KVBlockMetadata>> Lookup(
       const std::vector<std::string>& prefix_hashes);
+
+  // Unregisters a batch of KV cache entries for a raiden id asynchronously.
+  // See RegisterAsync for what the future resolves to, and for the meaning of
+  // `timeout` (zero is "expire now", not "never") and `out_call`.
+  tsl::Future<> UnregisterAsync(
+      const std::vector<std::string>& prefix_hashes,
+      const RaidenId& raiden_id,
+      absl::Duration timeout = absl::InfiniteDuration(),
+      RegistryCall* out_call = nullptr);
 
   // Unregisters a batch of KV cache entries for a raiden id.
   absl::Status Unregister(const std::vector<std::string>& prefix_hashes,
@@ -133,7 +182,12 @@ class GlobalRegistryClient {
       absl::string_view kv_pool_group);
 
  private:
-  std::unique_ptr<GlobalRegistryService::Stub> stub_;
+  // Shared, not unique, because an in-flight async callback captures it: the
+  // generated Stub holds the channel, so one capture keeps channel, transport
+  // and EventEngine alive for a call that outlives this client. The cost is
+  // that ~GlobalRegistryClient no longer deterministically releases the
+  // channel -- the last in-flight callback does.
+  std::shared_ptr<GlobalRegistryService::Stub> stub_;
 };
 
 // Cumulative hash helper.

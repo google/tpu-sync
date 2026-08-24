@@ -84,6 +84,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
+        "@xla//xla/tsl/concurrency:future",
     ],
 )
 
@@ -93,10 +94,13 @@ cc_library(
     hdrs = ["test_util.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":global_registry_cc_grpc",
         ":global_registry_client_cc",
         ":global_registry_server_lib",
         "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
     ],
 )

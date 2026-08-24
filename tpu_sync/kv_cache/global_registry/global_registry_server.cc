@@ -104,6 +104,9 @@ grpc::Status GlobalRegistryServiceImpl::Register(grpc::ServerContext* context,
                                                  const RegisterRequest* request,
                                                  RegisterResponse* response) {
   absl::MutexLock lock(mutex_);
+  if (context != nullptr && context->IsCancelled()) {
+    return grpc::Status(grpc::StatusCode::CANCELLED, "Call was cancelled");
+  }
 
   // 1. Fail-fast validation
   for (const auto& entry : request->entries()) {
@@ -200,6 +203,9 @@ grpc::Status GlobalRegistryServiceImpl::Unregister(
     grpc::ServerContext* context, const UnregisterRequest* request,
     UnregisterResponse* response) {
   absl::MutexLock lock(mutex_);
+  if (context != nullptr && context->IsCancelled()) {
+    return grpc::Status(grpc::StatusCode::CANCELLED, "Call was cancelled");
+  }
 
   if (!request->has_raiden_id() || request->raiden_id().job_name().empty()) {
     response->set_success(false);

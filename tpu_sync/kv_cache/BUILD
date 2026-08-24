@@ -472,7 +472,6 @@ cc_test(
         ":kv_cache_store_backend",
         ":kv_cache_store_backend_factory",
         ":kv_cache_store_client",
-        ":lru_cache",
         ":raiden_id",
         "//tpu_sync/core:kv_manager_holder",
         "//tpu_sync/core:raiden_transfer_endpoint",

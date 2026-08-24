@@ -67,7 +67,6 @@
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
-#include "tpu_sync/kv_cache/lru_cache.h"
 #include "tpu_sync/kv_cache/raiden_id.h"
 #include "tpu_sync/proto/kv_cache_store_service.grpc.pb.h"
 

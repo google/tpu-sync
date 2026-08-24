@@ -429,6 +429,7 @@ cc_library(
     tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
+        ":torch_tpu_device_buffer_headers",
         ":torch_tpu_tensor_to_buffer_headers",
         ":torch_utils_mock",
         "//tpu_sync/weight_sync:weight_synchronizer_base",

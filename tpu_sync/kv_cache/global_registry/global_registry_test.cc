@@ -587,6 +587,85 @@ TEST_F(GlobalRegistryTest, HeartbeatWithoutRegistrationIsNotFound) {
   EXPECT_TRUE(absl::IsNotFound(client_->ResolveStore(id).status()));
 }
 
+TEST_F(GlobalRegistryTest, ExpiredStorePurgesItsBlockEntries) {
+  RaidenId dead = {"jobDead", "r0", "dataS", 0};
+  RaidenId storeless = {"jobStoreless", "r0", "dataS", 0};
+  ASSERT_TRUE(client_
+                  ->RegisterStore(dead, "10.0.0.8:1111",
+                                  /*controller_address=*/"",
+                                  /*ttl=*/absl::Seconds(1))
+                  .ok());
+  ASSERT_TRUE(client_
+                  ->Register({{"hd1", dead, 1, absl::Seconds(300)},
+                              {"hshared", dead, 2, absl::Seconds(300)},
+                              {"hshared", storeless, 20, absl::Seconds(300)},
+                              {"hs1", storeless, 3, absl::Seconds(300)}})
+                  .ok());
+
+  absl::SleepFor(absl::Milliseconds(1500));
+  service_->CleanupExpiredEntries();
+
+  // The expired store's block entries left with its registration, including
+  // its copy of the shared hash...
+  EXPECT_EQ(service_->GetOwnerIndexSizeForTest(dead), 0);
+  auto res = client_->Lookup({"hd1"});
+  ASSERT_TRUE(res.ok());
+  EXPECT_EQ(res->size(), 0);
+  res = client_->Lookup({"hshared"});
+  ASSERT_TRUE(res.ok());
+  ASSERT_EQ(res->size(), 1);
+  EXPECT_EQ((*res)[0].block_id(), 20);
+  // ...while an owner that never registered a store keeps its entries.
+  EXPECT_EQ(service_->GetOwnerIndexSizeForTest(storeless), 2);
+  res = client_->Lookup({"hs1"});
+  ASSERT_TRUE(res.ok());
+  EXPECT_EQ(res->size(), 1);
+}
+
+TEST_F(GlobalRegistryTest, HeartbeatKeepsStoreBlocksThroughCleanup) {
+  RaidenId id = {"jobHb", "r0", "dataS", 0};
+  ASSERT_TRUE(client_
+                  ->RegisterStore(id, "10.0.0.9:1111",
+                                  /*controller_address=*/"",
+                                  /*ttl=*/absl::Seconds(2))
+                  .ok());
+  ASSERT_TRUE(client_->Register({{"hb1", id, 1, absl::Seconds(300)}}).ok());
+
+  // Same timing as HeartbeatRefreshesStoreTtl: refresh past the halfway
+  // point, then check beyond the original deadline.
+  absl::SleepFor(absl::Milliseconds(1500));
+  StoreStatus status;
+  status.set_free_blocks(5);
+  ASSERT_TRUE(client_->Heartbeat(id, status).ok());
+  absl::SleepFor(absl::Milliseconds(1500));
+  service_->CleanupExpiredEntries();
+
+  auto res = client_->Lookup({"hb1"});
+  ASSERT_TRUE(res.ok());
+  EXPECT_EQ(res->size(), 1);
+}
+
+TEST_F(GlobalRegistryTest, UnregisterStorePurgesItsBlockEntries) {
+  RaidenId id = {"jobBye", "r0", "dataS", 0};
+  ASSERT_TRUE(client_
+                  ->RegisterStore(id, "10.0.0.10:1111",
+                                  /*controller_address=*/"",
+                                  /*ttl=*/absl::ZeroDuration())
+                  .ok());
+  ASSERT_TRUE(client_
+                  ->Register({{"hu1", id, 1, absl::Seconds(300)},
+                              {"hu2", id, 2, absl::Seconds(300)}})
+                  .ok());
+  EXPECT_EQ(service_->GetOwnerIndexSizeForTest(id), 2);
+
+  ASSERT_TRUE(client_->UnregisterStore(id).ok());
+
+  EXPECT_EQ(service_->GetOwnerIndexSizeForTest(id), 0);
+  auto res = client_->Lookup({"hu1"});
+  ASSERT_TRUE(res.ok());
+  EXPECT_EQ(res->size(), 0);
+}
+
 TEST_F(GlobalRegistryTest, PlacementTargetsComeFromNearestGreaterTier) {
   auto register_store = [&](absl::string_view job, absl::string_view group,
                             int32_t tier) {

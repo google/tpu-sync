@@ -62,14 +62,19 @@ service GlobalRegistryService {
   // Resolves a RaidenId to the coordinates registered by RegisterStore.
   rpc ResolveStore(ResolveStoreRequest) returns (ResolveStoreResponse) {  }
 
-  // Removes a store registration. Called by a store on clean shutdown.
+  // Removes a store registration, together with every block entry the store
+  // owns: without an address the blocks cannot be read. Called by a store on
+  // clean shutdown.
   rpc UnregisterStore(UnregisterStoreRequest)
       returns (UnregisterStoreResponse) {  }
 
   // Refreshes a store registration's TTL and updates its mutable status
   // (free capacity today; further per-store signals are added to StoreStatus,
-  // not as new RPCs). A store that stops calling this past its TTL expires
-  // and drops out of ResolveStore and GetPlacementTargets.
+  // not as new RPCs). A store that stops calling this past its TTL expires:
+  // it drops out of ResolveStore and GetPlacementTargets, and the periodic
+  // cleanup purges the block entries it owns. A store whose registration
+  // lapsed must RegisterStore again and re-register blocks as it saves them;
+  // purged entries are not restored.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse) {  }
 
   // Returns the live stores a pressured store should offer its cold blocks

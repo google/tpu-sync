@@ -146,6 +146,14 @@ class GlobalRegistryServiceImpl final : public GlobalRegistryService::Service {
   void EraseFromOwnerIndex(const RaidenId& raiden_id, const std::string& hash)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
+  // Removes every `registry_` entry owned by `raiden_id` and drops its
+  // owner-index key. Called when a store registration expires or is
+  // unregistered: the store's pool is unreachable, so block entries it owns
+  // would otherwise keep answering Lookups until their own TTLs (infinite by
+  // default) run out.
+  void PurgeOwnedEntries(const RaidenId& raiden_id)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
   absl::Duration default_ttl_;
   absl::Duration cleanup_interval_;
   const int64_t pull_owned_batch_size_;
@@ -170,8 +178,11 @@ class GlobalRegistryServiceImpl final : public GlobalRegistryService::Service {
       owner_index_ ABSL_GUARDED_BY(mutex_);
 
   // Key: store identity. Value: where to reach it. Independent of `registry_`:
-  // a store may be registered with no blocks, and blocks may outlive their
-  // store's registration (a lookup then hits, and ResolveStore misses).
+  // a store may be registered with no blocks, and an owner may register
+  // blocks with no store. But not the reverse: losing a store registration
+  // (TTL expiry or UnregisterStore) purges the blocks it owns, since without
+  // an address they cannot be read. Between a store's expiry and the next
+  // cleanup pass a Lookup can still hit them and ResolveStore misses.
   absl::flat_hash_map<RaidenId, StoreRecord, RaidenIdHash> store_registry_
       ABSL_GUARDED_BY(mutex_);
 

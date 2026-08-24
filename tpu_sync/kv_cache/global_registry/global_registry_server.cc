@@ -398,7 +398,14 @@ grpc::Status GlobalRegistryServiceImpl::UnregisterStore(
   }
 
   absl::MutexLock lock(mutex_);
-  const size_t erased = store_registry_.erase(FromProto(request->raiden_id()));
+  const RaidenId raiden_id = FromProto(request->raiden_id());
+  const size_t erased = store_registry_.erase(raiden_id);
+  if (erased > 0) {
+    // The address just became undialable, so the block entries this store
+    // owns are unreadable; they leave with the registration. An owner that
+    // never registered a store is not affected: erased == 0 skips the purge.
+    PurgeOwnedEntries(raiden_id);
+  }
   response->set_success(erased > 0);
   if (erased == 0) {
     response->set_error_message("no store registered for that raiden_id");
@@ -640,9 +647,47 @@ void GlobalRegistryServiceImpl::EraseFromOwnerIndex(const RaidenId& raiden_id,
   }
 }
 
+void GlobalRegistryServiceImpl::PurgeOwnedEntries(const RaidenId& raiden_id) {
+  auto owner_it = owner_index_.find(raiden_id);
+  if (owner_it == owner_index_.end()) {
+    return;
+  }
+  for (const std::string& hash : owner_it->second) {
+    auto it = registry_.find(hash);
+    if (it == registry_.end()) {
+      continue;
+    }
+    auto& entries = it->second;
+    entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                 [&raiden_id](const RegistryEntry& entry) {
+                                   return entry.raiden_id == raiden_id;
+                                 }),
+                  entries.end());
+    if (entries.empty()) {
+      registry_.erase(it);
+      round_robin_indices_.erase(hash);
+    }
+  }
+  owner_index_.erase(owner_it);
+}
+
 void GlobalRegistryServiceImpl::CleanupExpiredEntries() {
   absl::MutexLock lock(mutex_);
   absl::Time now = absl::Now();
+
+  // Expired store registrations go first, taking every block entry the store
+  // owns with them: a store that stopped heartbeating past its TTL is
+  // presumed dead, and its blocks are unreadable without an address.
+  std::vector<RaidenId> stores_to_remove;
+  for (const auto& [raiden_id, record] : store_registry_) {
+    if (record.expire_time <= now) {
+      stores_to_remove.push_back(raiden_id);
+    }
+  }
+  for (const auto& raiden_id : stores_to_remove) {
+    PurgeOwnedEntries(raiden_id);
+    store_registry_.erase(raiden_id);
+  }
 
   std::vector<std::string> keys_to_remove;
 
@@ -666,18 +711,6 @@ void GlobalRegistryServiceImpl::CleanupExpiredEntries() {
   for (const auto& key : keys_to_remove) {
     registry_.erase(key);
     round_robin_indices_.erase(key);
-  }
-
-  // Store registrations expire independently of block entries. Records with an
-  // infinite expiry (the default -- see StoreInfo.ttl_seconds) never match.
-  std::vector<RaidenId> stores_to_remove;
-  for (const auto& [raiden_id, record] : store_registry_) {
-    if (record.expire_time <= now) {
-      stores_to_remove.push_back(raiden_id);
-    }
-  }
-  for (const auto& raiden_id : stores_to_remove) {
-    store_registry_.erase(raiden_id);
   }
 }
 

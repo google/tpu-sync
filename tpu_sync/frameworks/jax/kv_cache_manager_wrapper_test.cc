@@ -64,6 +64,10 @@ class MockSubManager : public KVCacheManagerWithTransfer {
   std::string lease_endpoint;
   std::vector<uint64_t> lease_uuids;
   bool lease_cancelled = false;
+  int renew_lease_calls = 0;
+  int cancel_lease_calls = 0;
+  std::vector<int32_t> renew_lease_results;
+  std::vector<int32_t> cancel_lease_results;
 
   int d2h_calls = 0;
   int h2d_calls = 0;
@@ -101,18 +105,22 @@ class MockSubManager : public KVCacheManagerWithTransfer {
   std::vector<int32_t> RenewRemoteLeases(
       const std::string& remote_endpoint,
       const std::vector<uint64_t>& uuids) override {
+    ++renew_lease_calls;
     lease_endpoint = remote_endpoint;
     lease_uuids = uuids;
     lease_cancelled = false;
+    if (!renew_lease_results.empty()) return renew_lease_results;
     return std::vector<int32_t>(uuids.size(), 1);
   }
 
   std::vector<int32_t> CancelRemoteLeases(
       const std::string& remote_endpoint,
       const std::vector<uint64_t>& uuids) override {
+    ++cancel_lease_calls;
     lease_endpoint = remote_endpoint;
     lease_uuids = uuids;
     lease_cancelled = true;
+    if (!cancel_lease_results.empty()) return cancel_lease_results;
     return std::vector<int32_t>(uuids.size(), 1);
   }
 
@@ -208,22 +216,40 @@ TEST(KVCacheManagerWrapperTest, LeaseOperationsUseExactlyOneControlClient) {
   auto sub1 = std::make_unique<MockSubManager>();
   MockSubManager* ptr0 = sub0.get();
   MockSubManager* ptr1 = sub1.get();
+  ptr0->renew_lease_results = {1, 0, -1, -2, -3};
+  ptr0->cancel_lease_results = {-3, -2, -1, 0, 1};
   std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
   subs.push_back(std::move(sub0));
   subs.push_back(std::move(sub1));
   KVCacheManager manager(std::move(subs));
 
-  EXPECT_EQ(manager.RenewRemoteLeases("10.0.0.1:45000", {1, 2}),
-            std::vector<int32_t>({1, 1}));
+  const std::vector<uint64_t> renew_uuids = {1, 2, 3, 4, 5};
+  EXPECT_EQ(manager.RenewRemoteLeases("10.0.0.1:45000", renew_uuids),
+            std::vector<int32_t>({1, 0, -1, -2, -3}));
+  EXPECT_EQ(ptr0->renew_lease_calls, 1);
   EXPECT_EQ(ptr0->lease_endpoint, "10.0.0.1:45000");
-  EXPECT_EQ(ptr0->lease_uuids, std::vector<uint64_t>({1, 2}));
+  EXPECT_EQ(ptr0->lease_uuids, renew_uuids);
+  EXPECT_EQ(ptr1->renew_lease_calls, 0);
   EXPECT_TRUE(ptr1->lease_endpoint.empty());
 
-  EXPECT_EQ(manager.CancelRemoteLeases("10.0.0.1:45000", {3}),
-            std::vector<int32_t>({1}));
+  const std::vector<uint64_t> cancel_uuids = {6, 7, 8, 9, 10};
+  EXPECT_EQ(manager.CancelRemoteLeases("10.0.0.1:45000", cancel_uuids),
+            std::vector<int32_t>({-3, -2, -1, 0, 1}));
+  EXPECT_EQ(ptr0->cancel_lease_calls, 1);
   EXPECT_TRUE(ptr0->lease_cancelled);
-  EXPECT_EQ(ptr0->lease_uuids, std::vector<uint64_t>({3}));
+  EXPECT_EQ(ptr0->lease_uuids, cancel_uuids);
+  EXPECT_EQ(ptr1->cancel_lease_calls, 0);
   EXPECT_TRUE(ptr1->lease_endpoint.empty());
+}
+
+TEST(KVCacheManagerWrapperTest, LeaseOperationsRejectEmptyManager) {
+  KVCacheManager manager(
+      std::vector<std::unique_ptr<KVCacheManagerWithTransfer>>{});
+
+  EXPECT_THROW(manager.RenewRemoteLeases("10.0.0.1:45000", {1}),
+               std::runtime_error);
+  EXPECT_THROW(manager.CancelRemoteLeases("10.0.0.1:45000", {1}),
+               std::runtime_error);
 }
 
 TEST(KVCacheManagerWrapperTest,

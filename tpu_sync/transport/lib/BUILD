@@ -128,6 +128,7 @@ cc_test(
     ],
     features = ["-use_header_modules"],
     deps = [
+        ":chunk_serializer",
         ":peregrine_control_service",
         ":raw_buffer_transport",
         ":raw_buffer_transport_delegate",

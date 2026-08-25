@@ -14,20 +14,27 @@
 
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+#include <netinet/in.h>
 #include <signal.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
+#include <cerrno>
 #include <chrono>  // NOLINT
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>  // NOLINT
 #include <utility>
 #include <vector>
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/flags/flag.h"
@@ -41,10 +48,11 @@
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
-#include "tpu_sync/transport/lib/socket/psp_syscall_mock.h" // NOLINT
+#include "tpu_sync/transport/lib/socket/psp_syscall_mock.h"  // NOLINT
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 #include "tpu_sync/transport/peregrine/src/util/util.h"
 
@@ -364,6 +372,78 @@ TEST_P(ConnPoolTest, MultiIpPoolingIsolation) {
 
   // Close the pool.
   pool.Close();
+}
+
+TEST_P(ConnPoolTest, CloseInterruptsButDoesNotCloseBorrowedDescriptor) {
+  RawMockDelegate delegate(1024);
+  RawBufferTransport listener(&delegate, 0);
+  auto channel = StartControlServer(&listener);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  ConnPool pool;
+  const std::string addr = GetIpPort(listener);
+  const bool require_psp = absl::GetFlag(FLAGS_require_psp_tcp);
+  const auto fd_or =
+      pool.Borrow(addr, "127.0.0.1", require_psp, std::move(channel));
+  ASSERT_OK(fd_or) << fd_or.status().message();
+  const int fd = *fd_or;
+
+  pool.Close();
+  EXPECT_NE(fcntl(fd, F_GETFD), -1);
+
+  pool.Return(/*ok=*/false, fd, addr, "127.0.0.1");
+  errno = 0;
+  EXPECT_EQ(fcntl(fd, F_GETFD), -1);
+  EXPECT_EQ(errno, EBADF);
+}
+
+TEST_P(RawBufferTransportTest,
+       CancellationInterruptsBlockedRequestAndDrainsWorker) {
+  if (GetParam()) {
+    GTEST_SKIP() << "The raw socket in this test does not perform PSP setup.";
+  }
+
+  RawMockDelegate delegate(1024);
+  std::promise<void> handler_started;
+  std::future<void> handler_started_future = handler_started.get_future();
+  RawBufferTransport transport(
+      &delegate, 0, {}, [&handler_started](int client_fd, const ChunkHeader&) {
+        handler_started.set_value();
+        uint8_t byte = 0;
+        const ssize_t bytes_read = read(client_fd, &byte, sizeof(byte));
+        return bytes_read == 1 ? absl::OkStatus()
+                               : absl::CancelledError("request interrupted");
+      });
+
+  const int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(client_fd, 0);
+  sockaddr_in address = {};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(transport.local_port());
+  ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr), 1);
+  ASSERT_EQ(connect(client_fd, reinterpret_cast<sockaddr*>(&address),
+                    sizeof(address)),
+            0);
+
+  ChunkHeader header = {};
+  header.version = 1;
+  header.op = 0xff;
+  const auto serialized = SerializeChunkHeader(header);
+  ASSERT_EQ(write(client_fd, serialized.data(), serialized.size()),
+            static_cast<ssize_t>(serialized.size()));
+  const std::future_status started =
+      handler_started_future.wait_for(std::chrono::seconds(1));
+  EXPECT_EQ(started, std::future_status::ready);
+  if (started != std::future_status::ready) {
+    transport.CancelPendingOperations();
+    (void)transport.WaitForPendingOperations(std::chrono::seconds(1));
+    close(client_fd);
+    return;
+  }
+
+  transport.CancelPendingOperations();
+  EXPECT_TRUE(transport.WaitForPendingOperations(std::chrono::seconds(1)));
+  close(client_fd);
 }
 
 TEST_P(RawBufferTransportTest, PushBuffersCoalescedCorrectness) {

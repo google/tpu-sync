@@ -3623,6 +3623,12 @@ void KVCacheManagerWithTransfer::ProcessPullStream(
                        << e.what();
             FinishSendLayer(entry, absl::InternalError(e.what()),
                             "accepted send failed during startup");
+          } catch (...) {
+            LOG(ERROR) << "Failed to start accepted send UUID " << uuid
+                       << ": unknown exception";
+            FinishSendLayer(entry,
+                            absl::InternalError("unknown startup exception"),
+                            "accepted send failed during startup");
           }
         });
   } catch (const std::exception& e) {
@@ -3632,6 +3638,13 @@ void KVCacheManagerWithTransfer::ProcessPullStream(
     // handler attempt to append a contradictory second response.
     LOG(ERROR) << "Failed to schedule accepted send UUID " << req.uuid << ": "
                << e.what();
+  } catch (...) {
+    FinishSendLayer(entry, absl::InternalError("unknown scheduling exception"),
+                    "accepted send could not be scheduled");
+    // The positive response is already on the wire. Do not make the outer
+    // handler attempt to append a contradictory second response.
+    LOG(ERROR) << "Failed to schedule accepted send UUID " << req.uuid
+               << ": unknown exception";
   }
 }
 

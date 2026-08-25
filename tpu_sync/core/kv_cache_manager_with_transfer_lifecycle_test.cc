@@ -220,7 +220,7 @@ class MetadataTransferManager : public KVCacheManagerWithTransfer {
     absl::MutexLock lock(mu_);
     auto it = active_recv_entries_.find(uuid);
     if (it == active_recv_entries_.end()) return;
-    ReleaseSlotLocked(it->second.slot_idx);
+    ReleaseRecvStagingLocked(&it->second);
     active_recv_entries_.erase(it);
   }
 
@@ -290,10 +290,20 @@ class MetadataTransferManager : public KVCacheManagerWithTransfer {
   }
 
  protected:
-  void StartPushInternal(uint64_t, const std::vector<std::string>&,
+  void StartPushInternal(uint64_t uuid, const std::vector<std::string>&,
                          const std::vector<int64_t>&,
                          const std::vector<int64_t>&) override {
-    // Keep the entry claimed without requiring TPU buffers.
+    // Keep the entry claimed without requiring TPU buffers, while releasing
+    // the startup guard installed before the positive pull response.
+    absl::MutexLock lock(mu_);
+    auto it = send_entries_.find(uuid);
+    if (it != send_entries_.end() &&
+        it->second->phase == SendEntry::Phase::kTransferring &&
+        it->second->pending_layer_callbacks > 0) {
+      --it->second->pending_layer_callbacks;
+      if (active_send_callbacks_ > 0) --active_send_callbacks_;
+      cv_.SignalAll();
+    }
   }
 };
 

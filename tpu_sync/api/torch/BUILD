@@ -31,7 +31,6 @@ py_library(
     deps = [
         ":torch_abi",
         "@torch_tpu//torch_tpu",
-        "@torch_tpu//torch_tpu:_loader",
     ],
 )
 
@@ -115,7 +114,6 @@ py_library(
         "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
         "//tpu_sync/rpc:raiden_service_py_pb2",
         "@torch_tpu//torch_tpu",
-        "@torch_tpu//torch_tpu:_loader",
     ],
 )
 
@@ -203,6 +201,52 @@ py_test(
     ],
     deps = [
         ":kv_cache_manager_torch_py",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@com_google_absl_py//absl/testing:parameterized",
+        "@pypi//numpy",
+        "@torch_tpu//shims/torch:pytorch",
+        "@torch_tpu//torch_tpu",
+    ],
+)
+
+py_test(
+    name = "kv_cache_store_e2e_test",
+    timeout = "long",
+    srcs = ["kv_cache_store_e2e_test.py"],
+    data = [
+        "//tpu_sync/kv_cache/global_registry:global_registry_server",
+    ],
+    tags = [
+        "manual",
+    ],
+    deps = [
+        ":kv_cache_manager_torch_py",
+        ":kv_cache_store",
+        "//pyglib:resources",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@com_google_absl_py//absl/testing:parameterized",
+        "@pypi//numpy",
+        "@torch_tpu//shims/torch:pytorch",
+        "@torch_tpu//torch_tpu",
+    ],
+)
+
+py_test(
+    name = "kv_cache_store_mpmd_e2e_test",
+    timeout = "long",
+    srcs = ["kv_cache_store_mpmd_e2e_test.py"],
+    data = [
+        "//tpu_sync/kv_cache/global_registry:global_registry_server",
+    ],
+    tags = [
+        "manual",
+    ],
+    deps = [
+        ":kv_cache_manager_torch_py",
+        ":kv_cache_store",
+        "//pyglib:resources",
+        "@com_google_absl_py//absl:app",
+        "@com_google_absl_py//absl/flags",
         "@com_google_absl_py//absl/testing:absltest",
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",

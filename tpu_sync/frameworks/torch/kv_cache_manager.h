@@ -238,6 +238,11 @@ class KVCacheManager {
     return torch_manager_->UnregisterActivePlan(uuid);
   }
 
+  absl::StatusOr<std::vector<int64_t>> PlanHostBlocks(
+      uint64_t uuid, const std::vector<int64_t>& block_ids) {
+    return torch_manager_->PlanHostBlocks(uuid, block_ids);
+  }
+
   absl::Status RegisterRecv(uint64_t uuid, const std::string& req_id,
                             int64_t expected_block_count) {
     return torch_manager_->RegisterRecv(uuid, req_id, expected_block_count);

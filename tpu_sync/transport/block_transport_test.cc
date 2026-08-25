@@ -355,9 +355,14 @@ class PlanRequiringDelegate : public MockDelegate {
   }
 };
 
-class BlockTransportTest : public ::testing::Test {
+class BlockTransportTest : public ::testing::TestWithParam<bool> {
  protected:
-  void SetUp() override { absl::SetFlag(&FLAGS_require_psp_tcp, true); }
+  void SetUp() override {
+    if (GetParam() && !lib::IsPspSupported()) {
+      GTEST_SKIP() << "PSP-TCP is unimplemented.";
+    }
+    absl::SetFlag(&FLAGS_require_psp_tcp, GetParam());
+  }
 
   void TearDown() override {
     for (auto& server : servers_) {
@@ -394,7 +399,7 @@ class BlockTransportTest : public ::testing::Test {
   std::vector<std::unique_ptr<grpc::Server>> servers_;
 };
 
-TEST_F(BlockTransportTest, PoolModeReceiverRejectsPlanlessExplicitPush) {
+TEST_P(BlockTransportTest, PoolModeReceiverRejectsPlanlessExplicitPush) {
   size_t size = 1024;
   MockDelegate sender_delegate(size);
   PlanRequiringDelegate receiver_delegate(size);
@@ -427,7 +432,7 @@ TEST_F(BlockTransportTest, PoolModeReceiverRejectsPlanlessExplicitPush) {
   EXPECT_EQ(receiver_delegate.data()[0], 0xAB);
 }
 
-TEST_F(BlockTransportTest, PushAndPullCorrectness) {
+TEST_P(BlockTransportTest, PushAndPullCorrectness) {
   size_t size = 1024;
   MockDelegate delegate1(size);
   MockDelegate delegate2(size);
@@ -470,7 +475,7 @@ TEST_F(BlockTransportTest, PushAndPullCorrectness) {
   EXPECT_EQ(delegate2.data()[size - 1], 0xAB);
 }
 
-TEST_F(BlockTransportTest, PullNonContiguous) {
+TEST_P(BlockTransportTest, PullNonContiguous) {
   size_t size = 1024;
   // Delegate 1 has 3 blocks capacity
   MockDelegate delegate1(size, 3);
@@ -510,7 +515,7 @@ TEST_F(BlockTransportTest, PullNonContiguous) {
   EXPECT_EQ(delegate2.block_data(1)[size - 1], 0xCC);
 }
 
-TEST_F(BlockTransportTest,
+TEST_P(BlockTransportTest,
        PullExplicitDestPtrsMultiLayerUnevenParallelism) {
   constexpr size_t kSliceSize = 16;
   constexpr int kNumBlocks = 3;
@@ -552,7 +557,7 @@ TEST_F(BlockTransportTest,
   }
 }
 
-TEST_F(BlockTransportTest, PullRejectsOutOfBoundsRemoteBlock) {
+TEST_P(BlockTransportTest, PullRejectsOutOfBoundsRemoteBlock) {
   constexpr size_t kSliceSize = 16;
   constexpr int kNumBlocks = 1;
   MockDelegate source(kSliceSize, kNumBlocks);
@@ -574,7 +579,7 @@ TEST_F(BlockTransportTest, PullRejectsOutOfBoundsRemoteBlock) {
   EXPECT_FALSE(pull_res.ok());
 }
 
-TEST_F(BlockTransportTest, PullSupportsBlockMajorOrder) {
+TEST_P(BlockTransportTest, PullSupportsBlockMajorOrder) {
   constexpr size_t kSliceSize = 16;
   constexpr int kNumBlocks = 2;
   constexpr size_t kNumLayers = 2;
@@ -617,7 +622,7 @@ TEST_F(BlockTransportTest, PullSupportsBlockMajorOrder) {
             }));
 }
 
-TEST_F(BlockTransportTest, SamePeerFanoutFiltersEachDestinationStream) {
+TEST_P(BlockTransportTest, SamePeerFanoutFiltersEachDestinationStream) {
   SamePeerFanoutDelegate sender;
   MockDelegate receiver(/*slice_size=*/64, /*max_blocks=*/4);
   for (int page = 0; page < 4; ++page) {
@@ -644,7 +649,7 @@ TEST_F(BlockTransportTest, SamePeerFanoutFiltersEachDestinationStream) {
   }
 }
 
-TEST_F(BlockTransportTest, LayerCompletesOnlyAfterEveryDeclaredSender) {
+TEST_P(BlockTransportTest, LayerCompletesOnlyAfterEveryDeclaredSender) {
   constexpr uint64_t kUuid = 905;
   constexpr size_t kSliceSize = 32;
   constexpr size_t kNumLayers = 2;
@@ -690,7 +695,7 @@ TEST_F(BlockTransportTest, LayerCompletesOnlyAfterEveryDeclaredSender) {
   EXPECT_EQ(receiver.layer_completion_count(), 3);
 }
 
-TEST_F(BlockTransportTest, DeclaredSendersEachCompleteTheirOwnParallelism) {
+TEST_P(BlockTransportTest, DeclaredSendersEachCompleteTheirOwnParallelism) {
   constexpr uint64_t kUuid = 906;
   constexpr size_t kSliceSize = 32;
   NodeDelegate sender_a(/*node_id=*/0, kSliceSize, /*max_blocks=*/2,
@@ -726,7 +731,7 @@ TEST_F(BlockTransportTest, DeclaredSendersEachCompleteTheirOwnParallelism) {
   EXPECT_EQ(receiver.layer_completion_count(), 1);
 }
 
-TEST_F(BlockTransportTest, SenderOverDeliveryIsRejected) {
+TEST_P(BlockTransportTest, SenderOverDeliveryIsRejected) {
   constexpr uint64_t kUuid = 908;
   constexpr size_t kSliceSize = 32;
   constexpr size_t kNumLayers = 2;
@@ -763,7 +768,7 @@ TEST_F(BlockTransportTest, SenderOverDeliveryIsRejected) {
   EXPECT_EQ(receiver.layer_completion_count(), 1);
 }
 
-TEST_F(BlockTransportTest, SenderChangingDeclaredStreamCountIsRejected) {
+TEST_P(BlockTransportTest, SenderChangingDeclaredStreamCountIsRejected) {
   constexpr uint64_t kUuid = 909;
   constexpr size_t kSliceSize = 32;
   NodeDelegate sender_a(/*node_id=*/0, kSliceSize, /*max_blocks=*/2,
@@ -796,7 +801,7 @@ TEST_F(BlockTransportTest, SenderChangingDeclaredStreamCountIsRejected) {
   EXPECT_EQ(receiver.layer_completion_count(), 0);
 }
 
-TEST_F(BlockTransportTest, UndeclaredUuidKeepsHeaderDeclaredCompletion) {
+TEST_P(BlockTransportTest, UndeclaredUuidKeepsHeaderDeclaredCompletion) {
   constexpr uint64_t kUuid = 907;
   constexpr size_t kSliceSize = 32;
   NodeDelegate sender_a(/*node_id=*/0, kSliceSize, /*max_blocks=*/1,
@@ -830,7 +835,7 @@ TEST_F(BlockTransportTest, UndeclaredUuidKeepsHeaderDeclaredCompletion) {
   EXPECT_EQ(receiver.layer_completion_count(), 2);
 }
 
-TEST_F(BlockTransportTest, ForgetPushProgressAllowsUuidReuse) {
+TEST_P(BlockTransportTest, ForgetPushProgressAllowsUuidReuse) {
   constexpr uint64_t kUuid = 902;
   MockDelegate sender(/*slice_size=*/32, /*max_blocks=*/1,
                       /*num_layers=*/2);
@@ -862,7 +867,7 @@ TEST_F(BlockTransportTest, ForgetPushProgressAllowsUuidReuse) {
   EXPECT_EQ(receiver.layer_completion_count(), 4);
 }
 
-TEST_F(BlockTransportTest,
+TEST_P(BlockTransportTest,
        PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires) {
   constexpr uint64_t kUuid = 903;
   MockDelegate sender(/*slice_size=*/32, /*max_blocks=*/1,
@@ -901,7 +906,7 @@ TEST_F(BlockTransportTest,
   EXPECT_EQ(receiver.pool_completion_count(), 3);
 }
 
-TEST_F(BlockTransportTest, ForgetPushProgressResetsPartialPoolGeneration) {
+TEST_P(BlockTransportTest, ForgetPushProgressResetsPartialPoolGeneration) {
   constexpr uint64_t kUuid = 904;
   MockDelegate sender(/*slice_size=*/32);
   MockDelegate receiver(/*slice_size=*/32);
@@ -958,7 +963,7 @@ class MockBlockTransport : public BlockTransport {
   std::vector<CallRecord> acquire_calls_ ABSL_GUARDED_BY(mock_mu_);
 };
 
-TEST_F(BlockTransportTest, RoundRobinDistribution) {
+TEST_P(BlockTransportTest, RoundRobinDistribution) {
   constexpr size_t kSliceSize = 16;
   MockDelegate delegate(kSliceSize);
 
@@ -1000,7 +1005,7 @@ TEST_F(BlockTransportTest, RoundRobinDistribution) {
 }
 #endif
 
-TEST_F(BlockTransportTest, SentBytesTelemetryIncrementedOnPushAndPull) {
+TEST_P(BlockTransportTest, SentBytesTelemetryIncrementedOnPushAndPull) {
   ScopedPrometheusBackend scoped_telemetry;
 
   constexpr size_t kSize = 1024;
@@ -1040,7 +1045,7 @@ TEST_F(BlockTransportTest, SentBytesTelemetryIncrementedOnPushAndPull) {
   EXPECT_THAT(snapshot2, HasSubstr(kExpectedPullResponseMetric));
 }
 
-TEST_F(BlockTransportTest, ReceivedBytesTelemetryIncrementedOnPushAndPull) {
+TEST_P(BlockTransportTest, ReceivedBytesTelemetryIncrementedOnPushAndPull) {
   ScopedPrometheusBackend scoped_telemetry;
 
   constexpr size_t kSize = 1024;
@@ -1084,7 +1089,7 @@ TEST_F(BlockTransportTest, ReceivedBytesTelemetryIncrementedOnPushAndPull) {
   EXPECT_THAT(snapshot2, HasSubstr(kExpectedPullResponseMetric));
 }
 
-TEST_F(BlockTransportTest, TransferFailuresTelemetryPushValidationFailures) {
+TEST_P(BlockTransportTest, TransferFailuresTelemetryPushValidationFailures) {
   ScopedPrometheusBackend scoped_telemetry;
 
   constexpr size_t kSize = 1024;
@@ -1128,7 +1133,7 @@ TEST_F(BlockTransportTest, TransferFailuresTelemetryPushValidationFailures) {
               HasSubstr(kExpectedError3));
 }
 
-TEST_F(BlockTransportTest, TransferFailuresTelemetryPushTransferFailure) {
+TEST_P(BlockTransportTest, TransferFailuresTelemetryPushTransferFailure) {
   ScopedPrometheusBackend scoped_telemetry;
 
   constexpr size_t kSize = 1024;
@@ -1149,7 +1154,7 @@ TEST_F(BlockTransportTest, TransferFailuresTelemetryPushTransferFailure) {
   EXPECT_THAT(WaitForMetricSnapshot(kExpectedError), HasSubstr(kExpectedError));
 }
 
-TEST_F(BlockTransportTest,
+TEST_P(BlockTransportTest,
        TransferFailuresTelemetryPushBufferAndPushBuffers) {
   ScopedPrometheusBackend scoped_telemetry;
 
@@ -1192,7 +1197,7 @@ TEST_F(BlockTransportTest,
               HasSubstr(kExpectedError2));
 }
 
-TEST_F(BlockTransportTest, TransferFailuresTelemetryPullValidationFailures) {
+TEST_P(BlockTransportTest, TransferFailuresTelemetryPullValidationFailures) {
   ScopedPrometheusBackend scoped_telemetry;
 
   constexpr size_t kSize = 1024;
@@ -1268,7 +1273,7 @@ TEST_F(BlockTransportTest, TransferFailuresTelemetryPullValidationFailures) {
               HasSubstr(kExpectedError5));
 }
 
-TEST_F(BlockTransportTest, TransferFailuresTelemetryPullTransferFailure) {
+TEST_P(BlockTransportTest, TransferFailuresTelemetryPullTransferFailure) {
   ScopedPrometheusBackend scoped_telemetry;
 
   constexpr size_t kSliceSize = 16;
@@ -1294,7 +1299,7 @@ TEST_F(BlockTransportTest, TransferFailuresTelemetryPullTransferFailure) {
   EXPECT_THAT(WaitForMetricSnapshot(kExpectedError), HasSubstr(kExpectedError));
 }
 
-TEST_F(BlockTransportTest, NoTransferFailuresTelemetryOnSuccess) {
+TEST_P(BlockTransportTest, NoTransferFailuresTelemetryOnSuccess) {
   ScopedPrometheusBackend scoped_telemetry;
 
   constexpr size_t kSize = 1024;
@@ -1329,7 +1334,7 @@ TEST_F(BlockTransportTest, NoTransferFailuresTelemetryOnSuccess) {
               Not(HasSubstr(kNotExpectedError)));
 }
 
-TEST_F(BlockTransportTest, MultiShardPushBlockMajor) {
+TEST_P(BlockTransportTest, MultiShardPushBlockMajor) {
   constexpr size_t kBlockSize = 256;
   constexpr int kNumBlocks = 3;
   constexpr size_t kNumLayers = 2;
@@ -1373,7 +1378,7 @@ TEST_F(BlockTransportTest, MultiShardPushBlockMajor) {
   }
 }
 
-TEST_F(BlockTransportTest, MultiShardPushLayerMajor) {
+TEST_P(BlockTransportTest, MultiShardPushLayerMajor) {
   constexpr size_t kBlockSize = 256;
   constexpr int kNumBlocks = 3;
   constexpr size_t kNumLayers = 2;
@@ -1417,7 +1422,7 @@ TEST_F(BlockTransportTest, MultiShardPushLayerMajor) {
   }
 }
 
-TEST_F(BlockTransportTest, MultiShardPullBlockMajor) {
+TEST_P(BlockTransportTest, MultiShardPullBlockMajor) {
   constexpr size_t kBlockSize = 256;
   constexpr int kNumBlocks = 3;
   constexpr size_t kNumLayers = 2;
@@ -1461,7 +1466,7 @@ TEST_F(BlockTransportTest, MultiShardPullBlockMajor) {
   }
 }
 
-TEST_F(BlockTransportTest, MultiShardPullLayerMajor) {
+TEST_P(BlockTransportTest, MultiShardPullLayerMajor) {
   constexpr size_t kBlockSize = 256;
   constexpr int kNumBlocks = 3;
   constexpr size_t kNumLayers = 2;
@@ -1505,7 +1510,7 @@ TEST_F(BlockTransportTest, MultiShardPullLayerMajor) {
   }
 }
 
-TEST_F(BlockTransportTest, PushBufferCorrectness) {
+TEST_P(BlockTransportTest, PushBufferCorrectness) {
   constexpr size_t size = 64 * 1024;
   MockDelegate src(size);
   MockDelegate dst(size);
@@ -1538,7 +1543,7 @@ TEST_F(BlockTransportTest, PushBufferCorrectness) {
               Each(Eq(0)));
 }
 
-TEST_F(BlockTransportTest, PollEINTRIsBenign) {
+TEST_P(BlockTransportTest, PollEINTRIsBenign) {
   // Set up src/dst buffers.
   constexpr size_t size = 4096;
   MockDelegate src(size);
@@ -1566,6 +1571,12 @@ TEST_F(BlockTransportTest, PollEINTRIsBenign) {
       /*uuid=*/0);
   EXPECT_OK(push_res) << push_res.message();
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    PspAndPlainTcp, BlockTransportTest, ::testing::Bool(),
+    [](const ::testing::TestParamInfo<bool>& info) {
+      return info.param ? "PSP" : "PlainTcp";
+    });
 
 }  // namespace
 }  // namespace transport

@@ -123,9 +123,14 @@ class RawMockDelegate : public RawBufferTransportDelegate {
       peer_channels_ ABSL_GUARDED_BY(mu_);
 };
 
-class RawBufferTransportTest : public ::testing::Test {
+class RawBufferTransportTest : public ::testing::TestWithParam<bool> {
  protected:
-  void SetUp() override { absl::SetFlag(&FLAGS_require_psp_tcp, true); }
+  void SetUp() override {
+    if (GetParam() && !IsPspSupported()) {
+      GTEST_SKIP() << "PSP-TCP is unimplemented.";
+    }
+    absl::SetFlag(&FLAGS_require_psp_tcp, GetParam());
+  }
 
   void TearDown() override {
     for (auto& entry : servers_) {
@@ -170,7 +175,7 @@ class RawBufferTransportTest : public ::testing::Test {
 
 using ConnPoolTest = RawBufferTransportTest;
 
-TEST_F(RawBufferTransportTest, PullBufferCorrectness) {
+TEST_P(RawBufferTransportTest, PullBufferCorrectness) {
   // Set up src/dst buffers.
   constexpr size_t size = 64 * 1024;
   RawMockDelegate src(size);
@@ -204,7 +209,7 @@ TEST_F(RawBufferTransportTest, PullBufferCorrectness) {
               Each(Eq(0)));
 }
 
-TEST_F(RawBufferTransportTest, PushBuffersCorrectness) {
+TEST_P(RawBufferTransportTest, PushBuffersCorrectness) {
   // Set up src/dst buffers.
   constexpr size_t size = 128 * 1024;
   RawMockDelegate src(size);
@@ -285,7 +290,7 @@ TEST_F(RawBufferTransportTest, PushBuffersCorrectness) {
   EXPECT_TRUE(dst2.on_data_received());
 }
 
-TEST_F(RawBufferTransportTest, RejectsOutOfBounds) {
+TEST_P(RawBufferTransportTest, RejectsOutOfBounds) {
   // Set up src/dst buffers.
   constexpr size_t size = 1024;
   RawMockDelegate src(size);
@@ -309,7 +314,7 @@ TEST_F(RawBufferTransportTest, RejectsOutOfBounds) {
   EXPECT_FALSE(pull_res.ok()) << pull_res.message();
 }
 
-TEST_F(ConnPoolTest, MultiIpPoolingIsolation) {
+TEST_P(ConnPoolTest, MultiIpPoolingIsolation) {
   // Set up src/dst buffers.
   RawMockDelegate src(1024);
 
@@ -361,7 +366,7 @@ TEST_F(ConnPoolTest, MultiIpPoolingIsolation) {
   pool.Close();
 }
 
-TEST_F(RawBufferTransportTest, PushBuffersCoalescedCorrectness) {
+TEST_P(RawBufferTransportTest, PushBuffersCoalescedCorrectness) {
   // Set up src/dst buffers.
   constexpr size_t size = 128 * 1024;
   RawMockDelegate src(size);
@@ -370,8 +375,8 @@ TEST_F(RawBufferTransportTest, PushBuffersCoalescedCorrectness) {
 
   // Create transports. Pass 4096 to enable coalescing for the sender.
   RawBufferTransport src_transport(&src, kLocalPort, /*local_ips=*/{},
-                                   /*custom_request_handler=*/nullptr,
-                                   /*coalesce_window_bytes=*/4096);
+                                    /*custom_request_handler=*/nullptr,
+                                    /*coalesce_window_bytes=*/4096);
   RawBufferTransport dst_transport1(&dst1, kLocalPort);
   RawBufferTransport dst_transport2(&dst2, kLocalPort);
   auto ch1 = StartControlServer(&dst_transport1);
@@ -444,7 +449,7 @@ TEST_F(RawBufferTransportTest, PushBuffersCoalescedCorrectness) {
   EXPECT_TRUE(dst2.on_data_received());
 }
 
-TEST_F(RawBufferTransportTest, PushBuffersLargeBatchCorrectness) {
+TEST_P(RawBufferTransportTest, PushBuffersLargeBatchCorrectness) {
   constexpr size_t num_tasks = 1025;  // IOV_MAX (1024) + 1
   constexpr size_t buffer_size = num_tasks;
 
@@ -487,6 +492,18 @@ TEST_F(RawBufferTransportTest, PushBuffersLargeBatchCorrectness) {
               Pointwise(Eq(), absl::MakeConstSpan(payload)));
   EXPECT_TRUE(dst.on_data_received());
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    PspAndPlainTcp, RawBufferTransportTest, ::testing::Bool(),
+    [](const ::testing::TestParamInfo<bool>& info) {
+      return info.param ? "PSP" : "PlainTcp";
+    });
+
+INSTANTIATE_TEST_SUITE_P(
+    PspAndPlainTcp, ConnPoolTest, ::testing::Bool(),
+    [](const ::testing::TestParamInfo<bool>& info) {
+      return info.param ? "PSP" : "PlainTcp";
+    });
 
 }  // namespace
 }  // namespace tpu_raiden::transport::lib

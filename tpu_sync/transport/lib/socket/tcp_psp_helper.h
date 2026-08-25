@@ -42,6 +42,9 @@ struct PspPeerKey {
   std::string key;
 };
 
+// Returns true if PSP-TCP is supported.
+bool IsPspSupported();
+
 // Registers a client's PSP key on server_fd and returns the allocated server
 // RX key.
 absl::StatusOr<PspPeerKey> RegisterPspPeerKey(

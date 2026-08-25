@@ -72,6 +72,9 @@ class FakePeregrineService final
 };
 
 TEST(TcpPspHelperTest, RegisterPspKey) {
+  if (!IsPspSupported()) {
+    GTEST_SKIP() << "PSP-TCP is unimplemented.";
+  }
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   ASSERT_GE(server_fd, 0);
 
@@ -86,6 +89,9 @@ TEST(TcpPspHelperTest, RegisterPspKey) {
 }
 
 TEST(TcpPspHelperTest, PspEnabledVerification) {
+  if (!IsPspSupported()) {
+    GTEST_SKIP() << "PSP-TCP is unimplemented.";
+  }
   int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
   ASSERT_GE(sock_fd, 0);
 
@@ -96,6 +102,9 @@ TEST(TcpPspHelperTest, PspEnabledVerification) {
 }
 
 TEST(TcpPspHelperTest, EndToEndPspKeyExchangeAndConnect) {
+  if (!IsPspSupported()) {
+    GTEST_SKIP() << "PSP-TCP is unimplemented.";
+  }
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   ASSERT_GE(server_fd, 0);
   struct sockaddr_in addr = {};

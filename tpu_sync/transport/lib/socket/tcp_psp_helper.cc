@@ -34,6 +34,8 @@ ABSL_FLAG(bool, require_psp_tcp, false,
 
 namespace tpu_raiden::transport::lib {
 
+bool IsPspSupported() { return false; }
+
 absl::StatusOr<PspPeerKey> RegisterPspPeerKey(
     int server_fd, uint32_t client_spi, absl::string_view client_key) {
   return absl::UnimplementedError("PSP-TCP is unimplemented.");

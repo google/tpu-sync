@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -65,6 +66,17 @@ std::string ResolveExporterHost() {
     return std::string(env_host);
   }
   return std::string(kDefaultExporterHost);
+}
+
+std::optional<std::string> ResolveLocalRank() {
+  const char* env_rank = std::getenv(kLocalRankEnvVar);
+  if (env_rank != nullptr && *env_rank != '\0') {
+    absl::string_view trimmed = absl::StripAsciiWhitespace(env_rank);
+    if (!trimmed.empty()) {
+      return std::string(trimmed);
+    }
+  }
+  return std::nullopt;
 }
 
 }  // namespace
@@ -114,6 +126,7 @@ absl::Status RaidenMetricStore::InitializeFromBackendNames(
           std::make_unique<PrometheusExporter>(ExporterOptions{
               .bind_address = ResolveExporterHost(),
               .port = ResolveExporterPort(),
+              .local_rank = ResolveLocalRank(),
           }));
     } else if (name == kBuffered) {
       new_backends.push_back(std::make_unique<BufferedMetricsExporter>());

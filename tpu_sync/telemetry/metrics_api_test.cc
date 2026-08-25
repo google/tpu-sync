@@ -692,5 +692,11 @@ TEST_F(MetricsApiTest,
   EXPECT_TRUE(store_.HasBackends());
 }
 
+TEST_F(MetricsApiTest, InitializeWithLocalRankEnvironmentVariable) {
+  ScopedEnvironmentVariable env(kLocalRankEnvVar, "5");
+  ASSERT_OK(store_.InitializeFromBackendNames({"prometheus"}));
+  EXPECT_TRUE(store_.HasBackends());
+}
+
 }  // namespace
 }  // namespace tpu_raiden::telemetry

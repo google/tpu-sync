@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,10 @@ struct ExporterOptions {
   // Non-owning view of histogram bucket boundaries. Defaults to
   // kDefaultHistogramBuckets and is copied by the exporter during construction.
   absl::Span<const double> custom_buckets = kDefaultHistogramBuckets;
+  // Worker local rank identifier in distributed multi-rank environments. If
+  // unset (std::nullopt) or empty, telemetry initialization falls back to the
+  // LOCAL_RANK environment variable.
+  std::optional<std::string> local_rank;
 };
 
 // Structure defining centralized metadata for a Raiden metric.

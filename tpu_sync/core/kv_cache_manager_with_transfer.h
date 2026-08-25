@@ -429,6 +429,13 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   absl::flat_hash_map<uint64_t, std::shared_ptr<PoolReshardSendEntry>>
       active_pool_reshard_sends_;
 
+  // Acquires host staging for a pull-serve send, retrying while other
+  // transfers hand blocks back, bounded by the entry's deadline. Returns
+  // false when the transfer was failed or cancelled instead; the caller
+  // has nothing left to do.
+  bool AcquireSendStagingWithRetry(uint64_t uuid,
+                                   const std::vector<int64_t>& src_block_ids,
+                                   std::vector<int64_t>* host_block_ids);
   void StartPushInternal(uint64_t uuid,
                          const std::vector<std::string>& remote_data_endpoints,
                          const std::vector<int64_t>& src_block_ids,
@@ -470,6 +477,12 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   // fixed slots. A short request then costs its own pages rather than a
   // whole slot, so the same pool seats more transfers at once.
   bool dynamic_host_staging_ = false;
+
+  // Pull-serve workers launched by ProcessPullStream. The destructor waits
+  // for them, and shutting_down_ ends a worker's staging wait early.
+  std::atomic<bool> shutting_down_{false};
+  absl::Mutex pull_workers_mu_;
+  int active_pull_workers_ ABSL_GUARDED_BY(pull_workers_mu_) = 0;
   double timeout_s_ = 120.0;
   bool unsafe_skip_buffer_lock_ = true;
 

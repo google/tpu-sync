@@ -242,7 +242,11 @@ NB_MODULE(_tpu_raiden_host, m) {
       .def(
           "unregister_active_plan",
           [](HostKVCacheManager& self, uint64_t uuid) {
-            ThrowIfError(self.UnregisterActivePlan(uuid),
+            absl::Status status = self.UnregisterActivePlan(uuid);
+            // A plan that already settled is gone; unregistering it again is
+            // a no-op rather than an error.
+            if (absl::IsNotFound(status)) return;
+            ThrowIfError(status,
                          "KVCacheManager unregister_active_plan failed");
           },
           nb::arg("uuid"))

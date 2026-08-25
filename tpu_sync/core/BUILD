@@ -682,6 +682,7 @@ cc_test(
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:mock_metrics_backend",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
     ],

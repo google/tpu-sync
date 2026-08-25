@@ -204,6 +204,10 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   absl::Status RegisterActivePlan(
       uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
       bool is_sender) override;
+  absl::Status UnregisterActivePlan(uint64_t uuid) override;
+  // Drops the plan of a receive that has settled; a plan already gone, or
+  // a newer registration reusing the uuid, is left alone.
+  void UnregisterSettledPlan(uint64_t uuid, uint64_t generation);
 
   absl::Status RegisterRecv(uint64_t uuid, const std::string& req_id,
                             int64_t expected_block_count) override;
@@ -341,6 +345,18 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   Slot AcquireSlotLocked();
   void ReleaseSlotLocked(int64_t slot_idx);
   struct RecvEntry;  // defined below; staging helpers take it by pointer
+  // Serializes plan registration and unregistration, so a plan is never
+  // published without its staging owner or torn down against a half-built
+  // registration.
+  absl::Mutex plan_lifecycle_mu_;
+  // Source of plan generations: the uuid names a transfer, a generation
+  // names one registration of it (the same uuid may come back, e.g. on a
+  // retry of the same transfer).
+  uint64_t plan_generation_counter_ ABSL_GUARDED_BY(plan_lifecycle_mu_) = 0;
+  // Host staging held by a plan: a sender's, or a receiver's whose
+  // destination is host memory. Released when the plan is unregistered.
+  absl::flat_hash_map<uint64_t, std::vector<int>> plan_staging_
+      ABSL_GUARDED_BY(mu_);
   // Host staging for one incoming read: exactly `num_blocks` blocks under
   // demand staging, a whole fixed slot otherwise. Returns nullopt when the
   // staging pool cannot seat the request.
@@ -384,7 +400,8 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     std::vector<int> staged_host_blocks;
     CopySpec h2d_copy;
     std::vector<int64_t> chip_block_ids;
-    absl::flat_hash_map<int64_t, int64_t> host_to_chip;
+    absl::flat_hash_map<kv_cache::HostBlockId, kv_cache::DeviceBlockId>
+        host_to_chip;
     std::map<std::pair<size_t, size_t>, std::vector<PendingCopy>>
         pending_h2d_copies;
     std::vector<H2dIssueFuture> h2d_dispatch_futures;
@@ -399,6 +416,15 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     std::chrono::steady_clock::time_point start_time;
     std::vector<raiden::PjRtCopyFuture> h2d_futures;
     bool is_pool_reshard = false;
+    // The plan is dropped when this receive settles: set for every
+    // demand-staged receiver plan (whose mapping would otherwise outlive its
+    // freed blocks) and when an unregister arrives while the receive is in
+    // flight (the plan stays mapped until then so late pushes resolve
+    // through its blocks).
+    bool unregister_on_settle = false;
+    // Generation of the plan this receive belongs to; settlement cleanup
+    // only touches that registration.
+    uint64_t plan_generation = 0;
     std::set<size_t> expected_pool_indices;
     std::set<size_t> started_pool_indices;
     std::set<size_t> completed_pool_indices;

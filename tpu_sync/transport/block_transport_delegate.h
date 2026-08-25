@@ -115,6 +115,14 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
     return result;
   }
 
+  // Brackets one incoming payload's use of the chunk pointers GetBlockChunks
+  // resolves for it: Begin runs before resolution, End after the payload's
+  // last byte has landed or its stream has failed. A delegate that recycles
+  // the memory behind its chunks keeps it alive between the two. End receives
+  // Begin's return value unchanged.
+  virtual uint64_t BeginPayloadResolution(uint64_t uuid) { return 0; }
+  virtual void EndPayloadResolution(uint64_t uuid, uint64_t token) {}
+
   virtual absl::StatusOr<std::vector<int>> AllocateBlocks(
       size_t num_blocks, uint64_t uuid = 0) = 0;
 

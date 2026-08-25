@@ -97,6 +97,24 @@ RaidenManagerBase::~RaidenManagerBase() {
   }
 }
 
+tpu_raiden::transport::BlockTransport*
+RaidenManagerBase::transport_server_if_started() {
+  absl::MutexLock lock(server_init_mu_);
+  return server_.get();
+}
+
+void RaidenManagerBase::StopTransportServer() {
+  std::unique_ptr<tpu_raiden::transport::BlockTransport> server;
+  {
+    absl::MutexLock lock(server_init_mu_);
+    server = std::move(server_);
+  }
+  // The destructor joins transport workers; it runs unlocked so a worker
+  // that lazily consults the server pointer on its way out cannot deadlock
+  // against a stop in progress.
+  server.reset();
+}
+
 std::vector<HostNicAddress> RaidenManagerBase::GetHostNics() const {
   return GetLocalHostNicAddresses();
 }

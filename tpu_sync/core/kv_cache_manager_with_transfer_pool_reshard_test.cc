@@ -699,7 +699,9 @@ TEST(PoolReshardRecvTest, FinishPoolReshardRecvRecordsDurationMetric) {
       manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}).ok());
 
   // Simulate pool completion
-  manager.FinishPoolReshardRecvPool(3001, /*pool_idx=*/0, absl::OkStatus());
+  manager.FinishPoolReshardRecvPool(3001, /*pool_idx=*/0,
+                                    manager.ActivePlanGeneration(3001).value(),
+                                    absl::OkStatus());
 }
 
 TEST(PoolReshardRecvTest, FinishPoolReshardRecvDoesNotRecordMetricOnFailure) {
@@ -719,9 +721,40 @@ TEST(PoolReshardRecvTest, FinishPoolReshardRecvDoesNotRecordMetricOnFailure) {
 
   // Simulate pool failure
   manager.FinishPoolReshardRecvPool(3002, /*pool_idx=*/0,
+                                    manager.ActivePlanGeneration(3002).value(),
                                     absl::InternalError("simulated failure"));
 }
 
+
+TEST(PoolReshardRecvTest, CleanupIsScopedToItsOwnRegistration) {
+  TestManager manager;
+  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  manager.AttachPlaceholderDeviceHold();
+
+  StartTransferRequest plan = ValidPlan(/*uuid=*/3003);
+  ASSERT_TRUE(
+      manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}).ok());
+  const uint64_t generation = manager.ActivePlanGeneration(3003).value();
+  ASSERT_GT(generation, 0u);
+
+  // Cleanup carrying another registration's generation must leave this
+  // registration and its receive state untouched.
+  manager.FinishPoolReshardRecvPool(3003, /*pool_idx=*/0, generation + 1,
+                                    absl::InternalError("stale cleanup"));
+  EXPECT_TRUE(manager.HasActivePlan(3003));
+  EXPECT_EQ(
+      manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}).code(),
+      absl::StatusCode::kAlreadyExists);
+
+  // Cleanup for this registration settles it; the uuid is registrable
+  // again and the new registration carries a fresh generation.
+  manager.FinishPoolReshardRecvPool(3003, /*pool_idx=*/0, generation,
+                                    absl::InternalError("real failure"));
+  EXPECT_FALSE(manager.HasActivePlan(3003));
+  ASSERT_TRUE(
+      manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}).ok());
+  EXPECT_NE(manager.ActivePlanGeneration(3003).value(), generation);
+}
 
 TEST(SendDeadlineTest, ExpiredSendEntryFailsInsteadOfReportingDone) {
   TestManager manager(/*timeout_s=*/0.05);
@@ -732,6 +765,42 @@ TEST(SendDeadlineTest, ExpiredSendEntryFailsInsteadOfReportingDone) {
       manager.CompleteReadRaw();
   EXPECT_THAT(done_sending, IsEmpty());
   EXPECT_THAT(failed_recving, Contains("expired_send_req"));
+}
+
+TEST(DrainingTest, PayloadLeaseDefersOutcomeStagingAndPlanUntilItEnds) {
+  TestManager manager(/*timeout_s=*/0.05);
+  manager.EnableDemandStaging();
+  auto* pool = manager.host_block_manager();
+  const int free_before = pool->num_free_blocks();
+  ASSERT_TRUE(manager
+                  .RegisterActivePlan(
+                      41, BlockPlan(41, {0, 1}, {2, 3}, MEMORY_TYPE_HBM),
+                      /*is_sender=*/false)
+                  .ok());
+  EXPECT_EQ(pool->num_free_blocks(), free_before - 2);
+  transport::BlockTransportDelegate* delegate = &manager;
+  const uint64_t token = delegate->BeginPayloadResolution(41);
+  ASSERT_GT(token, 0u);
+
+  // The transfer times out while the payload lease is open: no outcome is
+  // published, and the staging and the plan stay owned.
+  absl::SleepFor(absl::Milliseconds(120));
+  auto during = manager.CompleteReadRaw();
+  EXPECT_THAT(std::get<2>(during), IsEmpty());
+  EXPECT_EQ(pool->num_free_blocks(), free_before - 2);
+  EXPECT_TRUE(manager.HasActivePlan(41));
+
+  // Ending the lease drains the transfer: the failure is published, the
+  // staging returns, the plan is gone, and a late payload resolves nothing.
+  delegate->EndPayloadResolution(41, token);
+  auto after = manager.CompleteReadRaw();
+  EXPECT_THAT(std::get<2>(after), Contains("block_plan_req_41"));
+  EXPECT_EQ(pool->num_free_blocks(), free_before);
+  EXPECT_FALSE(manager.HasActivePlan(41));
+  const int64_t dst_block = 2;
+  EXPECT_TRUE(
+      manager.GetBlockChunks(0, 0, absl::MakeConstSpan(&dst_block, 1), 16, 41)
+          .empty());
 }
 
 TEST(DemandStagingTest, SenderPlanReturnsStagingOnUnregister) {

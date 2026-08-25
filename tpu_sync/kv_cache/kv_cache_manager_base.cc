@@ -2338,6 +2338,8 @@ absl::Status KVCacheManagerBase::RegisterActivePlan(
     }
   }
   absl::MutexLock l(plans_mu_);
+  // A new registration supersedes any earlier retirement of this uuid.
+  ReviveTransferUuidLocked(uuid);
   if (auto [it, inserted] = active_plans_.try_emplace(
           uuid, std::make_shared<const RegisteredPlan>(RegisteredPlan{
                     request, is_sender, std::move(host_block_of),
@@ -2350,6 +2352,34 @@ absl::Status KVCacheManagerBase::RegisterActivePlan(
           << ", is_sender: " << is_sender << ", shard_push_schedules size: "
           << request.shard_push_schedules().size();
   return absl::OkStatus();
+}
+
+void KVCacheManagerBase::ReviveTransferUuidLocked(uint64_t uuid) {
+  if (retired_transfer_uuids_.erase(uuid) == 0) {
+    return;
+  }
+  auto order_it = std::find(retired_transfer_uuid_order_.begin(),
+                            retired_transfer_uuid_order_.end(), uuid);
+  if (order_it != retired_transfer_uuid_order_.end()) {
+    retired_transfer_uuid_order_.erase(order_it);
+  }
+}
+
+void KVCacheManagerBase::ReviveTransferUuid(uint64_t uuid) {
+  absl::MutexLock l(plans_mu_);
+  ReviveTransferUuidLocked(uuid);
+}
+
+void KVCacheManagerBase::RetireTransferUuid(uint64_t uuid) {
+  absl::MutexLock l(plans_mu_);
+  if (!retired_transfer_uuids_.insert(uuid).second) {
+    return;
+  }
+  retired_transfer_uuid_order_.push_back(uuid);
+  while (retired_transfer_uuid_order_.size() > kMaxRetiredTransferUuids) {
+    retired_transfer_uuids_.erase(retired_transfer_uuid_order_.front());
+    retired_transfer_uuid_order_.pop_front();
+  }
 }
 
 absl::Status KVCacheManagerBase::UnregisterActivePlan(uint64_t uuid) {
@@ -2384,12 +2414,22 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
                                    absl::string_view peer, int64_t src_block_id,
                                    int64_t dst_block_id) {
   std::shared_ptr<const RegisteredPlan> plan_snapshot;
+  bool retired = false;
   {
     absl::MutexLock l(plans_mu_);
-    auto it = active_plans_.find(uuid);
-    if (it != active_plans_.end()) {
-      plan_snapshot = it->second;
+    retired = retired_transfer_uuids_.contains(uuid);
+    if (!retired) {
+      auto it = active_plans_.find(uuid);
+      if (it != active_plans_.end()) {
+        plan_snapshot = it->second;
+      }
     }
+  }
+  // A retired transfer's late payloads resolve nothing at all — neither
+  // through a still-registered plan nor through the planless identity
+  // fallback: the blocks they name may already belong to someone else.
+  if (retired) {
+    return {};
   }
   const bool has_plan = plan_snapshot != nullptr;
 

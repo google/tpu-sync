@@ -146,6 +146,12 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   std::vector<std::string> local_ips_;
 
   tpu_raiden::transport::BlockTransport* InitTransportServer();
+  // The data transport, or nullptr when no transfer has started one.
+  tpu_raiden::transport::BlockTransport* transport_server_if_started();
+  // Stops the data transport and joins its workers, so transport threads
+  // stop calling into the delegate before the state they use is torn down.
+  // Idempotent; a later transfer would lazily start a fresh transport.
+  void StopTransportServer();
   virtual std::vector<HostNicAddress> GetHostNics() const;
 
   void DetectAndAssignNumaNode(

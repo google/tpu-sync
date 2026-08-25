@@ -18,6 +18,11 @@ load("@rules_python//python:defs.bzl", "py_library", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 
+_X86_MARCH_COPTS = select({
+    "//third_party/bazel_platforms/cpu:x86_64": ["-march=x86-64-v2"],
+    "//conditions:default": [],
+})
+
 cc_library(
     name = "kv_cache_manager_jax",
     srcs = [
@@ -29,8 +34,7 @@ cc_library(
     copts = [
         "-fexceptions",
         "-frtti",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = [
         "-use_header_modules",
     ],
@@ -128,9 +132,8 @@ nanobind_extension(
     copts = [
         "-fexceptions",
         "-frtti",
-        "-march=x86-64-v2",
         "-fvisibility=hidden",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = [
         "-use_header_modules",
     ],
@@ -166,8 +169,7 @@ cc_library(
     ],
     copts = [
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = [
         "-use_header_modules",
     ],
@@ -193,9 +195,8 @@ nanobind_extension(
     copts = [
         "-fexceptions",
         "-frtti",
-        "-march=x86-64-v2",
         "-fvisibility=hidden",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = [
         "-use_header_modules",
     ],
@@ -219,8 +220,7 @@ cc_library(
     ],
     copts = [
         "-fexceptions",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = [
         "-use_header_modules",
     ],
@@ -252,8 +252,7 @@ nanobind_extension(
     copts = [
         "-fexceptions",
         "-frtti",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = [
         "-use_header_modules",
     ],
@@ -387,8 +386,7 @@ cc_library(
     copts = [
         "-fexceptions",
         "-frtti",
-        "-march=x86-64-v2",
-    ],
+    ] + _X86_MARCH_COPTS,
     features = ["-use_header_modules"],
     deps = [
         "//tpu_sync/weight_sync:weight_synchronizer_base",

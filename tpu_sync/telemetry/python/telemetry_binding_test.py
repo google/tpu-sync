@@ -16,6 +16,7 @@
 
 import os
 from unittest import mock
+import urllib.request
 
 from absl.testing import absltest
 import portpicker
@@ -31,55 +32,32 @@ class TelemetryBindingTest(absltest.TestCase):
 
   def test_configure_telemetry_enable_prometheus(self):
     telemetry_ext.configure_telemetry(["prometheus"])
-    snapshot = telemetry_ext.get_raiden_metrics_prometheus_text()
-    self.assertIn(
-        "# HELP tpu_raiden_sent_bytes_total Total count of bytes sent over TPU"
-        " Raiden interfaces.",
-        snapshot,
+    self.assertEqual(
+        telemetry_ext.get_metric_metadata(), telemetry_ext.ALL_METRICS
     )
-    self.assertIn("# TYPE tpu_raiden_sent_bytes_total counter", snapshot)
-    self.assertIn(
-        "# HELP tpu_raiden_received_bytes_total Total count of bytes received"
-        " over TPU Raiden interfaces.",
-        snapshot,
-    )
-    self.assertIn("# TYPE tpu_raiden_received_bytes_total counter", snapshot)
-    self.assertIn(
-        "# HELP tpu_raiden_transfer_failures_total Cumulative total count of"
-        " transfer failures across all interfaces.",
-        snapshot,
-    )
-    self.assertIn("# TYPE tpu_raiden_transfer_failures_total counter", snapshot)
+    self.assertEqual(telemetry_ext.get_raiden_metrics_prometheus_text(), "")
 
   def test_configure_telemetry_case_insensitive(self):
     telemetry_ext.configure_telemetry(["Prometheus"])
-    snapshot = telemetry_ext.get_raiden_metrics_prometheus_text()
-    self.assertIn(
-        "# HELP tpu_raiden_sent_bytes_total Total count of bytes sent over TPU"
-        " Raiden interfaces.",
-        snapshot,
+    self.assertEqual(
+        telemetry_ext.get_metric_metadata(), telemetry_ext.ALL_METRICS
     )
-    self.assertIn("# TYPE tpu_raiden_sent_bytes_total counter", snapshot)
 
-  def test_configure_telemetry_duplicate_backends_deduplicated(self):
+  def test_configure_telemetry_duplicate_backends_accepted(self):
+    """Verifies passing duplicate backend names is safely accepted."""
     telemetry_ext.configure_telemetry(["prometheus", "prometheus"])
-    snapshot = telemetry_ext.get_raiden_metrics_prometheus_text()
     self.assertEqual(
-        snapshot.count(
-            "# HELP tpu_raiden_sent_bytes_total Total count of bytes sent over"
-            " TPU Raiden interfaces."
-        ),
-        1,
-    )
-    self.assertEqual(
-        snapshot.count("# TYPE tpu_raiden_sent_bytes_total counter"), 1
+        telemetry_ext.get_metric_metadata(), telemetry_ext.ALL_METRICS
     )
 
   def test_configure_telemetry_empty_backends_clears_backends(self):
     telemetry_ext.configure_telemetry(["prometheus"])
+    self.assertEqual(
+        telemetry_ext.get_metric_metadata(), telemetry_ext.ALL_METRICS
+    )
     telemetry_ext.configure_telemetry([])
-    snapshot = telemetry_ext.get_raiden_metrics_prometheus_text()
-    self.assertEqual(snapshot, "")
+    self.assertEqual(telemetry_ext.get_metric_metadata(), [])
+    self.assertEqual(telemetry_ext.get_raiden_metrics_prometheus_text(), "")
 
   def test_configure_telemetry_unknown_backend_raises_value_error(self):
     with self.assertRaisesRegex(
@@ -89,8 +67,9 @@ class TelemetryBindingTest(absltest.TestCase):
 
   def test_configure_telemetry_tuple_sequence_supported(self):
     telemetry_ext.configure_telemetry(("prometheus",))
-    snapshot = telemetry_ext.get_raiden_metrics_prometheus_text()
-    self.assertIn("# TYPE tpu_raiden_sent_bytes_total counter", snapshot)
+    self.assertEqual(
+        telemetry_ext.get_metric_metadata(), telemetry_ext.ALL_METRICS
+    )
 
   def test_configure_telemetry_set_raises_type_error(self):
     with self.assertRaises(TypeError):
@@ -120,8 +99,6 @@ class TelemetryBindingTest(absltest.TestCase):
       self.assertEqual(
           telemetry_ext.get_metric_metadata(), telemetry_ext.ALL_METRICS
       )
-      snapshot = telemetry_ext.get_raiden_metrics_prometheus_text()
-      self.assertIn("# TYPE tpu_raiden_sent_bytes_total counter", snapshot)
 
   def test_configure_telemetry_none_initializes_from_environment_buffered(self):
     with mock.patch.dict(
@@ -144,8 +121,6 @@ class TelemetryBindingTest(absltest.TestCase):
       self.assertEqual(
           telemetry_ext.get_metric_metadata(), telemetry_ext.ALL_METRICS
       )
-      snapshot = telemetry_ext.get_raiden_metrics_prometheus_text()
-      self.assertIn("# TYPE tpu_raiden_sent_bytes_total counter", snapshot)
 
   def test_configure_telemetry_environment_unknown_backend_raises_value_error(
       self,
@@ -166,8 +141,9 @@ class TelemetryBindingTest(absltest.TestCase):
         os.environ, {"TPU_RAIDEN_TELEMETRY_BACKENDS": "invalid_backend"}
     ):
       telemetry_ext.configure_telemetry()
-      snapshot = telemetry_ext.get_raiden_metrics_prometheus_text()
-      self.assertIn("# TYPE tpu_raiden_sent_bytes_total counter", snapshot)
+      self.assertEqual(
+          telemetry_ext.get_metric_metadata(), telemetry_ext.ALL_METRICS
+      )
 
   def test_metric_type_enum(self):
     self.assertTrue(hasattr(telemetry_ext.MetricType, "COUNTER"))
@@ -236,18 +212,13 @@ class TelemetryBindingTest(absltest.TestCase):
     metadata = telemetry_ext.get_metric_metadata()
     self.assertEqual(metadata, [])
 
-  def test_get_metric_metadata_with_prometheus(self):
-    telemetry_ext.configure_telemetry(["prometheus"])
-    metadata = telemetry_ext.get_metric_metadata()
-    self.assertIsInstance(metadata, list)
-    self.assertEqual(metadata, telemetry_ext.ALL_METRICS)
-
   def test_get_and_reset_metric_samples_empty_when_no_backends(self):
     telemetry_ext.configure_telemetry([])
     samples = telemetry_ext.get_and_reset_metric_samples()
     self.assertEqual(samples, {})
 
   def test_get_and_reset_metric_samples_with_prometheus(self):
+    """Verifies non-buffered Prometheus exporter safely returns empty sample dict."""
     telemetry_ext.configure_telemetry(["prometheus"])
     samples = telemetry_ext.get_and_reset_metric_samples()
     self.assertEqual(samples, {})
@@ -265,8 +236,8 @@ class TelemetryBindingTest(absltest.TestCase):
         "os.environ", {"TPU_RAIDEN_PROMETHEUS_PORT": port}
     ):
       telemetry_ext.configure_telemetry(["prometheus"])
-      snapshot = telemetry_ext.get_raiden_metrics_prometheus_text()
-      self.assertIn("# TYPE tpu_raiden_sent_bytes_total counter", snapshot)
+      with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics") as resp:
+        self.assertEqual(resp.status, 200)
 
 
 if __name__ == "__main__":

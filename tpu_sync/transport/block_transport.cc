@@ -189,25 +189,6 @@ absl::Status ForEachPayload(MajorOrder major_order,
   return absl::InvalidArgumentError("Unknown block transport major order");
 }
 
-absl::StatusOr<lib::Request> BuildBufferRequest(
-    size_t buffer_id, size_t dst_shard_idx, size_t dst_offset_bytes,
-    const uint8_t* data_ptr, size_t size_bytes, uint64_t uuid) {
-  return lib::Request{
-      .socket_opcode = lib::kOpBufferPush,
-      .laddr = const_cast<uint8_t*>(data_ptr),
-      .raddr = nullptr,
-      .len = size_bytes,
-      .major_order = 0,
-      .layer_idx = static_cast<int>(buffer_id),
-      .parallelism = 1,
-      .remote_id = static_cast<uint32_t>(dst_offset_bytes),
-      .local_id = static_cast<uint32_t>(dst_shard_idx),
-      .count_or_size = static_cast<uint32_t>(size_bytes),
-      .uuid = uuid,
-      .request_id = 0,
-  };
-}
-
 }  // namespace
 
 BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
@@ -1494,8 +1475,9 @@ absl::Status BlockTransport::PushBuffer(absl::string_view peer,
                                         const uint8_t* data_ptr,
                                         size_t size_bytes, uint64_t uuid) {
   ASSIGN_OR_RETURN(
-      auto req, BuildBufferRequest(buffer_id, dst_shard_idx, dst_offset_bytes,
-                                   data_ptr, size_bytes, uuid));
+      const lib::Request req,
+      lib::BuildBufferRequest(buffer_id, dst_shard_idx, dst_offset_bytes,
+                              data_ptr, size_bytes, uuid, lib::kOpBufferPush));
   absl::Status status = raw_transport_.ProcessSocketBufferPush(peer, req);
   if (!status.ok()) {
     RecordTransferFailure(status, metric_labels::kDirectionPush);

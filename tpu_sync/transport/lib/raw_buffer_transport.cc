@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -609,11 +610,15 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
         absl::StrCat("Unsupported buffer push opcode: ", opcode));
   }
 
+  if (request.remote_id > std::numeric_limits<uint32_t>::max()) {
+    return absl::InvalidArgumentError("Destination offset exceeds uint32 max");
+  }
+
   ChunkHeader header = {};
   header.version = 1;
   header.op = kOpBufferPush;
   header.buffer_id = static_cast<uint16_t>(request.layer_idx);
-  header.remote_id = request.remote_id;
+  header.remote_id = static_cast<uint32_t>(request.remote_id);
   header.local_id = request.local_id;
   header.count_or_size = static_cast<uint32_t>(request.len);
   header.uuid = uuid;
@@ -637,6 +642,43 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
 
   ok_to_pool = true;
   return absl::OkStatus();
+}
+
+absl::StatusOr<Request> BuildBufferRequest(size_t buffer_id,
+                                           size_t dst_shard_idx,
+                                           size_t dst_offset_bytes,
+                                           const uint8_t* data_ptr,
+                                           size_t size_bytes, uint64_t uuid,
+                                           uint8_t socket_opcode) {
+  return Request{
+      .socket_opcode = socket_opcode,
+      .laddr = const_cast<uint8_t*>(data_ptr),
+      .raddr = nullptr,
+      .len = size_bytes,
+      .major_order = 0,
+      .layer_idx = static_cast<int>(buffer_id),
+      .parallelism = 1,
+      .remote_id = dst_offset_bytes,
+      .local_id = static_cast<uint32_t>(dst_shard_idx),
+      .count_or_size = static_cast<uint32_t>(size_bytes),
+      .uuid = uuid,
+      .request_id = 0,
+  };
+}
+
+absl::StatusOr<std::vector<Request>> BuildBufferRequests(
+    absl::Span<const BufferPushTask> tasks, uint64_t uuid,
+    uint8_t socket_opcode) {
+  std::vector<Request> requests;
+  requests.reserve(tasks.size());
+  for (const auto& task : tasks) {
+    ASSIGN_OR_RETURN(auto req,
+                     BuildBufferRequest(task.buffer_id, task.dst_shard_idx,
+                                        task.dst_offset_bytes, task.data_ptr,
+                                        task.size_bytes, uuid, socket_opcode));
+    requests.push_back(std::move(req));
+  }
+  return requests;
 }
 
 absl::Status RawBufferTransport::PushBuffers(
@@ -706,10 +748,18 @@ absl::Status RawBufferTransport::PushBuffers(
     return absl::OkStatus();
   }
 
+  auto push_batch = [&](const BatchInfo& batch) -> absl::Status {
+    ASSIGN_OR_RETURN(
+        std::vector<Request> requests,
+        BuildBufferRequests(absl::MakeConstSpan(grouped_tasks)
+                                .subspan(batch.start_idx, batch.count),
+                            uuid, kOpBufferPushBatched));
+    return ProcessSocketBufferBatchPush(batch.peer, requests);
+  };
+
   if (parallelism <= 1 || batches.size() == 1) {
     for (const auto& batch : batches) {
-      RETURN_IF_ERROR(PushBatch(batch.peer, grouped_tasks, batch.start_idx,
-                                batch.count, uuid));
+      RETURN_IF_ERROR(push_batch(batch));
     }
     return absl::OkStatus();
   }
@@ -727,12 +777,11 @@ absl::Status RawBufferTransport::PushBuffers(
   absl::BlockingCounter counter(batches.size());
   std::vector<absl::Status> statuses(batches.size(), absl::OkStatus());
   for (size_t i = 0; i < batches.size(); ++i) {
-    pool->Schedule([this, peer = batches[i].peer, &grouped_tasks,
-                    start_idx = batches[i].start_idx, count = batches[i].count,
-                    uuid, &counter, &status = statuses[i]]() {
-      status = PushBatch(peer, grouped_tasks, start_idx, count, uuid);
-      counter.DecrementCount();
-    });
+    pool->Schedule(
+        [&push_batch, &batch = batches[i], &counter, &status = statuses[i]]() {
+          status = push_batch(batch);
+          counter.DecrementCount();
+        });
   }
 
   counter.Wait();
@@ -743,18 +792,23 @@ absl::Status RawBufferTransport::PushBuffers(
   return absl::OkStatus();
 }
 
-absl::Status RawBufferTransport::PushBatch(
-    absl::string_view peer, const std::vector<BufferPushTask>& tasks,
-    size_t start_idx, size_t batch_size, uint64_t uuid) {
+absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
+    absl::string_view peer, absl::Span<const Request> requests) {
   if (peer.empty()) {
     return absl::InvalidArgumentError(
         "Destination peer address cannot be empty");
+  }
+  if (requests.empty()) {
+    return absl::OkStatus();
   }
 
   ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer));
   bool ok_to_pool = false;
   auto fd_cleaner =
       absl::MakeCleanup([&] { ReturnConnection(ok_to_pool, fd, peer); });
+
+  const size_t batch_size = requests.size();
+  const uint64_t uuid = requests.front().uuid;
 
   ChunkHeader header = {};
   header.version = 1;
@@ -769,18 +823,18 @@ absl::Status RawBufferTransport::PushBatch(
   std::vector<char> s_metadata_buf(batch_size * header.metadata_size);
   size_t total_bytes = 0;
   for (size_t i = 0; i < batch_size; ++i) {
-    const auto& task = tasks[start_idx + i];
+    const auto& req = requests[i];
     ChunkMetadata meta = {
-        .layer_idx = static_cast<uint32_t>(task.buffer_id),
-        .dst_shard_idx = static_cast<uint32_t>(task.dst_shard_idx),
-        .dst_offset_bytes = static_cast<uint64_t>(task.dst_offset_bytes),
-        .size_bytes = static_cast<uint64_t>(task.size_bytes),
+        .layer_idx = static_cast<uint32_t>(req.layer_idx),
+        .dst_shard_idx = req.local_id,
+        .dst_offset_bytes = req.remote_id,
+        .size_bytes = req.len,
     };
     const auto s_meta = SerializeChunkMetadata(meta);
     DCHECK_EQ(s_meta.size(), header.metadata_size);
     std::memcpy(s_metadata_buf.data() + i * header.metadata_size, s_meta.data(),
                 s_meta.size());
-    total_bytes += task.size_bytes;
+    total_bytes += req.len;
   }
   const auto s_header = SerializeChunkHeader(header);
   const std::array<struct iovec, 2> iovs = {
@@ -794,22 +848,31 @@ absl::Status RawBufferTransport::PushBatch(
     std::vector<uint8_t> pack_buf(total_bytes);
     size_t pack_offset = 0;
     for (size_t i = 0; i < batch_size; ++i) {
-      const auto& task = tasks[start_idx + i];
-      std::memcpy(pack_buf.data() + pack_offset, task.data_ptr,
-                  task.size_bytes);
-      pack_offset += task.size_bytes;
+      const auto& req = requests[i];
+      if (req.len > 0) {
+        if (req.laddr == nullptr) {
+          return absl::InvalidArgumentError(
+              "Null data pointer in batch push request");
+        }
+        std::memcpy(pack_buf.data() + pack_offset, req.laddr, req.len);
+        pack_offset += req.len;
+      }
     }
     RETURN_IF_ERROR(WriteExact(fd, pack_buf.data(), total_bytes));
   } else {
-    // Uncoalesced path: gather write (writev) directly from task pointers
+    // Uncoalesced path: gather write (writev) directly from requests.
     std::vector<struct iovec> iovs;
     iovs.reserve(batch_size);
     for (size_t i = 0; i < batch_size; ++i) {
-      const auto& task = tasks[start_idx + i];
-      if (task.size_bytes > 0) {
+      const auto& req = requests[i];
+      if (req.len > 0) {
+        if (req.laddr == nullptr) {
+          return absl::InvalidArgumentError(
+              "Null data pointer in batch push request");
+        }
         struct iovec iov;
-        iov.iov_base = const_cast<uint8_t*>(task.data_ptr);
-        iov.iov_len = task.size_bytes;
+        iov.iov_base = req.laddr;
+        iov.iov_len = req.len;
         iovs.push_back(iov);
       }
     }
@@ -821,7 +884,8 @@ absl::Status RawBufferTransport::PushBatch(
   uint8_t ack = 0;
   RETURN_IF_ERROR(ReadExact(fd, &ack, 1));
   if (ack != 1) {
-    return absl::InternalError("PushBatch verification failed");
+    return absl::InternalError(
+        "ProcessSocketBufferBatchPush verification failed");
   }
 
   ok_to_pool = true;

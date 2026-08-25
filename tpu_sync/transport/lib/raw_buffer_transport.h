@@ -54,6 +54,19 @@ struct RawProgress {
   absl::flat_hash_set<size_t> triggered_layers;
 };
 
+// Builds a single Request struct for buffer push operations.
+absl::StatusOr<Request> BuildBufferRequest(size_t buffer_id,
+                                           size_t dst_shard_idx,
+                                           size_t dst_offset_bytes,
+                                           const uint8_t* data_ptr,
+                                           size_t size_bytes, uint64_t uuid,
+                                           uint8_t socket_opcode);
+
+// Builds a batch of Requests for a span of BufferPushTasks.
+absl::StatusOr<std::vector<Request>> BuildBufferRequests(
+    absl::Span<const BufferPushTask> tasks, uint64_t uuid,
+    uint8_t socket_opcode);
+
 // Standalone raw buffer TCP socket transport engine.
 class RawBufferTransport final {
  public:
@@ -112,7 +125,8 @@ class RawBufferTransport final {
   absl::Status ProcessSocketBufferPush(absl::string_view peer,
                                        const Request& request);
 
-  // Pushes a vector of buffers to multiple peers using `PushBatch()`.
+  // Pushes a vector of buffers to multiple peers using
+  // `ProcessSocketBufferBatchPush()`.
   absl::Status PushBuffers(const std::vector<BufferPushTask>& tasks,
                            int parallelism, uint64_t uuid);
 
@@ -137,13 +151,9 @@ class RawBufferTransport final {
                                              absl::string_view client_key);
 
  private:
-  // Pushes a batch of buffers to the remote `peer`, by sending out a
-  // `kOpBufferPushBatched ChunkHeader` followed by a `batch_size` sequence
-  // of metadata and then the data.
-  // This is the internal function that is called by `PushBuffers`.
-  absl::Status PushBatch(absl::string_view peer,
-                         const std::vector<BufferPushTask>& tasks,
-                         size_t start_idx, size_t batch_size, uint64_t uuid);
+  // Pushes buffer requests to `peer` over a borrowed TCP connection.
+  absl::Status ProcessSocketBufferBatchPush(absl::string_view peer,
+                                            absl::Span<const Request> requests);
 
   // Processes a single peer request from the given `client_fd`. These requests
   // are those sent by `PullBuffer`, `PushBuffer`, `PushBuffers` calls.

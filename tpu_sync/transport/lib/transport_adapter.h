@@ -34,7 +34,7 @@ struct Request {
   uint8_t major_order;
   int layer_idx;
   int parallelism;
-  uint32_t remote_id;  // Block: sender node_id / remote block ID | Buffer:
+  uint64_t remote_id;  // Block: sender node_id / remote block ID | Buffer:
                        // dst/src byte offset.
   uint32_t local_id;   // Block: layer_idx / local block ID |
                        // Buffer: dst/src shard index.

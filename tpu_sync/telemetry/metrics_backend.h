@@ -26,7 +26,7 @@
 
 namespace tpu_raiden::telemetry {
 
-enum class MetricType {
+enum class MetricType : uint8_t {
   kCounter,
   kGauge,
   kHistogram,

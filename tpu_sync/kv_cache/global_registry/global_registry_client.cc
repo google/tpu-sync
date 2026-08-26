@@ -14,15 +14,10 @@
 
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 
-#include <grpcpp/grpcpp.h>
-
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
-
-#include "xla/tsl/concurrency/future.h"
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -35,6 +30,7 @@
 #include "grpcpp/client_context.h"
 #include "grpcpp/support/status.h"
 #include <openssl/sha.h>
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
 #include "tpu_sync/kv_cache/raiden_id.h"
@@ -58,6 +54,7 @@ void ToProto(const RaidenId& id, ::tpu_sync::rpc::RaidenIdProto* proto) {
   proto->set_data_name(id.data_name);
   proto->set_data_replica_idx(id.data_replica_idx);
 }
+
 void BuildRegisterRequest(const std::vector<Registration>& registrations,
                           RegisterRequest* request) {
   for (const auto& reg : registrations) {
@@ -89,9 +86,15 @@ GlobalRegistryClient::GlobalRegistryClient(
     : stub_(GlobalRegistryService::NewStub(channel)) {}
 
 tsl::Future<> GlobalRegistryClient::RegisterAsync(
-    const std::vector<Registration>& registrations, absl::Duration timeout,
-    RegistryCall* out_call) {
+    const std::vector<Registration>& registrations, absl::Duration timeout) {
+  if (registrations.empty()) {
+    // Nothing to publish, so there is no RPC to make and nothing to wait on.
+    return tsl::Future<>(absl::OkStatus());
+  }
   if (timeout <= absl::ZeroDuration()) {
+    // Already expired. Decided here, not by gRPC: a deadline of exactly "now"
+    // races the round trip and on loopback the call usually wins, which would
+    // make "zero" silently mean "no timeout" for the callers that matter.
     return tsl::Future<>(absl::DeadlineExceededError(
         "Registry call timeout is zero or negative, so it expired before it "
         "was dispatched."));
@@ -104,9 +107,6 @@ tsl::Future<> GlobalRegistryClient::RegisterAsync(
   BuildRegisterRequest(registrations, request.get());
   if (timeout < absl::InfiniteDuration()) {
     context->set_deadline(absl::ToChronoTime(absl::Now() + timeout));
-  }
-  if (out_call != nullptr) {
-    out_call->context_ = context;
   }
 
   stub_->async()->Register(
@@ -126,8 +126,8 @@ tsl::Future<> GlobalRegistryClient::RegisterAsync(
 }
 
 absl::Status GlobalRegistryClient::Register(
-    const std::vector<Registration>& registrations) {
-  return RegisterAsync(registrations).Await();
+    const std::vector<Registration>& registrations, absl::Duration timeout) {
+  return RegisterAsync(registrations, timeout).Await();
 }
 
 absl::StatusOr<std::vector<KVBlockMetadata>> GlobalRegistryClient::Lookup(
@@ -181,7 +181,11 @@ GlobalRegistryClient::PullOwned(const RaidenId& raiden_id) {
 
 tsl::Future<> GlobalRegistryClient::UnregisterAsync(
     const std::vector<std::string>& prefix_hashes, const RaidenId& raiden_id,
-    absl::Duration timeout, RegistryCall* out_call) {
+    absl::Duration timeout) {
+  if (prefix_hashes.empty()) {
+    // Nothing to withdraw, so there is no RPC to make and nothing to wait on.
+    return tsl::Future<>(absl::OkStatus());
+  }
   if (timeout <= absl::ZeroDuration()) {
     // Already expired. Decided here, not by gRPC: a deadline of exactly "now"
     // races the round trip and on loopback the call usually wins, which would
@@ -198,9 +202,6 @@ tsl::Future<> GlobalRegistryClient::UnregisterAsync(
   BuildUnregisterRequest(prefix_hashes, raiden_id, request.get());
   if (timeout < absl::InfiniteDuration()) {
     context->set_deadline(absl::ToChronoTime(absl::Now() + timeout));
-  }
-  if (out_call != nullptr) {
-    out_call->context_ = context;
   }
 
   stub_->async()->Unregister(
@@ -220,8 +221,9 @@ tsl::Future<> GlobalRegistryClient::UnregisterAsync(
 }
 
 absl::Status GlobalRegistryClient::Unregister(
-    const std::vector<std::string>& prefix_hashes, const RaidenId& raiden_id) {
-  return UnregisterAsync(prefix_hashes, raiden_id).Await();
+    const std::vector<std::string>& prefix_hashes, const RaidenId& raiden_id,
+    absl::Duration timeout) {
+  return UnregisterAsync(prefix_hashes, raiden_id, timeout).Await();
 }
 
 absl::Status GlobalRegistryClient::RegisterStore(

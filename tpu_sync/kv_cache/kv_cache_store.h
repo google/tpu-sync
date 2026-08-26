@@ -36,7 +36,6 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
-#include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
@@ -764,12 +763,53 @@ class KVCacheStore {
   absl::flat_hash_set<std::string> reading_hashes_ ABSL_GUARDED_BY(mutex_);
 
   std::unique_ptr<std::thread> poller_thread_;
-  std::unique_ptr<tpu_raiden::NumaThreadPool> write_through_pool_;
   std::atomic<bool> stop_poller_{false};
+
+  // Write-throughs that have been published to the global registry and are
+  // waiting for an answer.
+  //
+  // Two things need this. The destructor cancels every outstanding call before
+  // it unregisters the store, because a registration that landed afterwards
+  // would advertise blocks against a store record that no longer resolves --
+  // and since the raiden id is stable across restart, the next process would
+  // inherit those orphans and truncate every lookup that reached one.
+  //
+  // And the outstanding calls have to be bounded, because each one holds a pin
+  // on every block in its batch and a pinned entry is invisible to eviction.
+  // A registry that accepts connections and never answers would otherwise let
+  // saves accumulate never-settling calls until nothing is evictable and the
+  // host block pool drains -- with the registry reachable and the process
+  // otherwise healthy. Past the bound the advertisement is dropped and the
+  // pins released: an unadvertised block is invisible to peers, an unevictable
+  // one stops the node.
+  struct WriteThroughState {
+    absl::Mutex mutex;
+    size_t in_flight_blocks ABSL_GUARDED_BY(mutex) = 0;
+    size_t max_in_flight_blocks ABSL_GUARDED_BY(mutex) =
+        kDefaultMaxInFlightWriteThroughBlocks;
+  };
+  std::shared_ptr<WriteThroughState> wt_state_ =
+      std::make_shared<WriteThroughState>();
+  static constexpr size_t kDefaultMaxInFlightWriteThroughBlocks = 4096;
 
   absl::StatusOr<std::vector<int>> AllocateBlockIds(int needed);
   void DeallocateBlockIds(absl::Span<const int> block_ids);
 
+ public:
+  // Lowers the outstanding-write-through bound so a test can reach it without
+  // saving thousands of blocks.
+  void SetMaxInFlightWriteThroughBlocksForTesting(size_t max_blocks) {
+    absl::MutexLock lock(&wt_state_->mutex);
+    wt_state_->max_in_flight_blocks = max_blocks;
+  }
+
+  // Blocks currently held by write-throughs waiting on the registry.
+  size_t InFlightWriteThroughBlocksForTesting() const {
+    absl::MutexLock lock(&wt_state_->mutex);
+    return wt_state_->in_flight_blocks;
+  }
+
+ private:
   // The two halves of Save(), split by destination. Save() validates nothing
   // itself -- each half has its own residency and pin preconditions, and they
   // are genuinely different operations sharing a name and a status queue.

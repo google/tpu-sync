@@ -47,7 +47,6 @@
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/core/buffer.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
-#include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
@@ -443,8 +442,7 @@ KVCacheStore::KVCacheStore(
     : backends_(std::move(backends)),
       raiden_id_(std::move(raiden_id)),
       raiden_controller_(std::move(raiden_controller)),
-      store_server_ip_(store_server_ip),
-      write_through_pool_(std::make_unique<::tpu_raiden::NumaThreadPool>(4)) {
+      store_server_ip_(store_server_ip) {
   if (absl::Status v = ValidateConstructionRules(
           store_server_ip, raiden_controller_ != nullptr ? 1 : 0);
       !v.ok()) {
@@ -514,8 +512,7 @@ KVCacheStore::KVCacheStore(
     absl::string_view store_server_ip, int raiden_controller_port,
     std::optional<KVCacheMetadata> metadata, int expected_worker_count)
     : raiden_id_(raiden_id),
-      store_server_ip_(store_server_ip),
-      write_through_pool_(std::make_unique<::tpu_raiden::NumaThreadPool>(4)) {
+      store_server_ip_(store_server_ip) {
   if (absl::Status v = ValidateConstructionRules(store_server_ip, num_shards);
       !v.ok()) {
     LOG(FATAL) << "KVCacheStore construction validation failed: " << v.message()
@@ -579,8 +576,7 @@ KVCacheStore::KVCacheStore(
     std::optional<KVCacheMetadata> metadata, absl::string_view store_server_ip)
     : raiden_id_(raiden_id),
       raiden_controller_(std::move(raiden_controller)),
-      store_server_ip_(store_server_ip),
-      write_through_pool_(std::make_unique<::tpu_raiden::NumaThreadPool>(4)) {
+      store_server_ip_(store_server_ip) {
   if (absl::Status v =
           ValidateConstructionRules(store_server_ip, /*num_shards=*/1);
       !v.ok()) {
@@ -2149,30 +2145,64 @@ void KVCacheStore::PollSavesInternal(std::vector<SaveState> ready_saves) {
       } else {
         DeallocateBlockIds(state.host_block_ids);
       }
-      if (!write_through_regs.empty() && registry_client_ &&
-          write_through_pool_) {
-        // The caller's pin is consumed INSIDE this task, after Register
+      if (!write_through_regs.empty() && registry_client_) {
+        // The caller's pin is consumed in the OnReady callback, after Register
         // returns, not here. Releasing inline would let the entry be evicted
         // while the queued registration is still pending, and the late
         // Register would then publish a host block id this node has already
         // freed -- a registry advertising blocks that are not here.
-        write_through_pool_->Schedule([backend = this->backend(),
-                                       client = registry_client_,
-                                       regs = std::move(write_through_regs),
-                                       saved = update_hashes]() {
-          auto status = client->Register(regs);
-          if (!status.ok()) {
-            LOG(WARNING) << "Async write-through failed after Save: "
-                         << status.message();
+        const size_t num_blocks = write_through_regs.size();
+        bool admitted = false;
+        {
+          absl::MutexLock wt_lock(&wt_state_->mutex);
+          admitted = wt_state_->in_flight_blocks + num_blocks <=
+                     wt_state_->max_in_flight_blocks;
+          if (admitted) {
+            wt_state_->in_flight_blocks += num_blocks;
           } else {
-            LOG(INFO) << "Async write-through succeeded after Save for "
-                      << regs.size() << " blocks";
+            LOG_EVERY_N_SEC(WARNING, 5)
+                << "Not advertising " << num_blocks
+                << " saved block(s) to the global registry: "
+                << wt_state_->in_flight_blocks
+                << " blocks are already pinned by write-throughs waiting on "
+                   "it, at the bound of "
+                << wt_state_->max_in_flight_blocks
+                << ". Peers will not find these blocks; the alternative is "
+                   "pinning them out of reach of eviction until the registry "
+                   "answers, which drains the host block pool.";
           }
-          // Whether or not publishing worked: the save itself succeeded, so
-          // the pin it was granted is spent. Holding it on a registry failure
-          // would leak one pin per block with nothing to release it.
-          if (backend != nullptr) backend->Release(saved);
-        });
+        }
+        if (!admitted) {
+          if (!update_hashes.empty()) {
+            backend()->Release(update_hashes);
+          }
+        } else {
+          // OnReady can run inline on this thread, which holds `mutex_`, so
+          // Release may run under it -- the same order as the branch below.
+          registry_client_
+              ->RegisterAsync(write_through_regs,
+                              global_registry::kUnwaitedMutationTimeout)
+              .OnReady([wt_state = wt_state_, backend = this->backend(),
+                        saved = update_hashes,
+                        num_blocks](absl::Status s) {
+                {
+                  absl::MutexLock wt_lock(&wt_state->mutex);
+                  wt_state->in_flight_blocks -= num_blocks;
+                }
+                if (!s.ok()) {
+                  LOG(WARNING) << "Async write-through failed after Save: "
+                               << s.message();
+                } else {
+                  LOG(INFO) << "Async write-through succeeded after Save for "
+                            << num_blocks << " blocks";
+                }
+                // Whether or not publishing worked: the save itself succeeded,
+                // so the pin it was granted is spent. Holding it on a registry
+                // failure would leak one pin per block with nothing to release
+                // it.
+                if (backend != nullptr) backend->Release(saved);
+              });
+        }
       } else if (!update_hashes.empty()) {
         // No write-through to outlive, so the release is correct right here.
         backend()->Release(update_hashes);

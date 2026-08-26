@@ -67,6 +67,7 @@
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
+#include "tpu_sync/kv_cache/lru_cache.h"
 #include "tpu_sync/kv_cache/raiden_id.h"
 #include "tpu_sync/proto/kv_cache_store_service.grpc.pb.h"
 
@@ -1781,6 +1782,9 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadRemoteWithSlicesRecordsNothing) {
   ASSERT_OK(registry_client->RegisterStore(remote_rid,
                                            remote_server->GetServerAddress(),
                                            controller->controller_address()));
+  // And advertise the block: indexing it in the remote backend does not, and
+  // this case needs the registry to answer for a hash the store lacks.
+  ASSERT_OK(registry_client->Register({{"slice_load_hash", remote_rid, 42}}));
 
   KVCacheStore store(10, std::move(controller), registry_address, local_rid,
                      std::nullopt, /*store_server_ip=*/"127.0.0.1");
@@ -2079,6 +2083,115 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, SaveWriteThrough) {
             1);  // second host block allocated is 1
 }
 
+// A registry that accepts connections and never answers must not be able to
+// drain the host block pool.
+//
+// Every outstanding write-through holds a pin on each block in its batch, and
+// a pinned entry is invisible to eviction. Without a bound on how many blocks
+// can be pinned that way, saves keep adding never-settling calls until
+// GetEvictableKeys finds nothing, Evict returns nothing, the pool drains and
+// Save fails ResourceExhausted -- with the registry reachable and the process
+// otherwise healthy. Past the bound the advertisement is dropped instead: the
+// blocks are invisible to peers, which is recoverable, rather than
+// unevictable, which is not.
+TEST_F(KVCacheStoreEmbeddedControllerTest,
+       WriteThroughInFlightCapSurvivesStalledRegistry) {
+  auto impl = std::make_unique<global_registry::GlobalRegistryServiceImpl>();
+  auto stalling_service =
+      std::make_unique<global_registry::StallingRegistryService>(
+          std::move(impl));
+  auto* service_ptr = stalling_service.get();
+  // Only Register stalls, so the store still registers itself at construction.
+  service_ptr->EnableStall();
+  auto registry = global_registry::CreateTestGlobalRegistryServerWithService(
+      std::move(stalling_service));
+
+  ::tpu_raiden::controller::MockTransferManager mock_mgr;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&mock_mgr));
+  auto controller = MakeController();
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  constexpr int kCapacity = 10;
+  constexpr size_t kCap = 2;
+  constexpr int kSaves = 6;
+
+  {
+    KVCacheStore store(kCapacity, std::move(controller),
+                       registry->server_address, rid, std::nullopt,
+                       /*store_server_ip=*/"127.0.0.1");
+    // Two blocks rather than the production default of a few thousand, so the
+    // bound is reachable without saving thousands of blocks.
+    store.SetMaxInFlightWriteThroughBlocksForTesting(kCap);
+
+    std::vector<std::string> saved;
+    for (int i = 0; i < kSaves; ++i) {
+      const std::string hash = absl::StrCat("capped_hash_", i);
+      std::vector<std::string> batch = {hash};
+      std::vector<RaidenBlockId> slices = {
+          RaidenBlockId(rid, -1, i, BlockStatus::HBM)};
+      ASSERT_TRUE(InsertResident(store, batch, slices, false));
+      // Lookup takes the pin that Save consumes.
+      ASSERT_TRUE(store.Lookup(batch).ok());
+
+      // The pool has not drained, which is the failure this bound prevents.
+      absl::Status status = store.Save(batch);
+      ASSERT_TRUE(status.ok())
+          << "save " << i << " failed: " << status.ToString();
+      ASSERT_FALSE(absl::IsResourceExhausted(status));
+      saved.push_back(hash);
+
+      bool done = false;
+      absl::Time deadline = absl::Now() + absl::Seconds(10);
+      while (!done && absl::Now() < deadline) {
+        auto [save_done, save_failed, save_pending, save_existing,
+              save_unregistered] = store.PollSaveStatus();
+        ASSERT_TRUE(save_failed.empty()) << "save " << i << " reported failed";
+        if (!save_done.empty()) done = true;
+        if (!done) absl::SleepFor(absl::Milliseconds(5));
+      }
+      ASSERT_TRUE(done) << "save " << i << " never completed";
+    }
+
+    // The registry is holding the calls that were admitted, and only those.
+    service_ptr->WaitForStall();
+    EXPECT_EQ(store.InFlightWriteThroughBlocksForTesting(), kCap)
+        << "the outstanding write-throughs are not bounded";
+
+    // Everything past the bound had its pin released, so eviction can still
+    // make progress -- which is the whole point.
+    auto evictable = store.backend()->GetEvictableKeys(kSaves);
+    EXPECT_EQ(evictable.size(), kSaves - kCap)
+        << "a stalled registry made " << kSaves - evictable.size()
+        << " of " << kSaves << " saved blocks unevictable";
+    for (const auto& hash : evictable) {
+      EXPECT_EQ(store.backend()->GetPinCount(hash), 0);
+    }
+    EXPECT_FALSE(store.backend()->Evict(evictable).empty())
+        << "Evict found nothing to free while the registry was stalled";
+
+    // Letting the registry answer releases the rest.
+    service_ptr->ReleaseStall();
+    absl::Time deadline = absl::Now() + absl::Seconds(10);
+    while (store.InFlightWriteThroughBlocksForTesting() != 0 &&
+           absl::Now() < deadline) {
+      absl::SleepFor(absl::Milliseconds(10));
+    }
+    EXPECT_EQ(store.InFlightWriteThroughBlocksForTesting(), 0);
+
+    // The admitted ones did reach the registry; the dropped ones did not, and
+    // that is the trade the bound makes.
+    int published = 0;
+    for (const auto& hash : saved) {
+      auto looked_up = registry->client->Lookup({hash});
+      if (looked_up.ok() && !looked_up->empty()) ++published;
+    }
+    EXPECT_EQ(published, kCap)
+        << "expected exactly the admitted write-throughs to be advertised";
+  }
+}
+
 // Evicting a hash erases the entry, unlocks its host block, and
 // unregisters it globally -- identically for a HOST_AND_HBM entry and a
 // HOST-only one, which is the point of running both statuses through one
@@ -2223,7 +2336,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, EvictKeepsASkippedHashRegistered) {
   }
   EXPECT_TRUE(free_unregistered);
 
-  TF_ASSERT_OK_AND_ASSIGN(auto pinned_res, registry_client.Lookup({"pinned_1"}));
+  TF_ASSERT_OK_AND_ASSIGN(auto pinned_res,
+                          registry_client.Lookup({"pinned_1"}));
   EXPECT_FALSE(pinned_res.empty());
 }
 
@@ -3858,11 +3972,19 @@ TEST_F(StoreDiscoveryTest, CapacityConstructedStoreJoinsTheGlobalTier) {
   auto* backend = dynamic_cast<HostOffloadBackend*>(store.backend().get());
   ASSERT_NE(backend, nullptr);
 
-  // The backend's non-locking Insert registers globally; the store-level
-  // Insert (which locks) deliberately does not.
-  backend->Insert({"tiered_hash"}, {RaidenBlockId(rid, 3, BlockStatus::HOST)},
-                  /*on_host=*/true);
-  auto looked_up = client_->Lookup({"tiered_hash"});
+  // The backend holds a real registry client, so what it publishes reaches
+  // the global tier. Inserting does not publish; a completed save does,
+  // through this path -- so drive it directly.
+  ASSERT_OK(backend->RegisterBlocksSync({"tiered_hash"}, {3}));
+  absl::StatusOr<std::vector<global_registry::KVBlockMetadata>> looked_up;
+  absl::Time deadline = absl::Now() + absl::Seconds(5);
+  while (absl::Now() < deadline) {
+    looked_up = client_->Lookup({"tiered_hash"});
+    if (looked_up.ok() && !looked_up->empty()) {
+      break;
+    }
+    absl::SleepFor(absl::Milliseconds(10));
+  }
   ASSERT_TRUE(looked_up.ok()) << looked_up.status().ToString();
   ASSERT_EQ(looked_up->size(), 1);
   EXPECT_EQ((*looked_up)[0].block_id(), 3);
@@ -5392,11 +5514,13 @@ std::unique_ptr<StoreInterleaveFixture> MakeStoreInterleaveFixture(
   InsertResident(*f->store, {"l1", "l2"},
                  {RaidenBlockId(f->store_id, 11, BlockStatus::HOST),
                   RaidenBlockId(f->store_id, 12, BlockStatus::HOST)},
-                   /*on_host=*/true);
-  // Insert publishes what it caches. Withdrawing those registrations keeps the
-  // registry unable to answer for "l1"/"l2", which is what makes the source of
-  // each entry in the answer identifiable.
-  CHECK_OK(f->registry->client->Unregister({"l1", "l2"}, f->store_id));
+                 /*on_host=*/true);
+  // Nothing advertises "l1"/"l2": inserting only indexes them, and no save
+  // runs here. So the registry answers for "r1"/"r2" and nothing else, which
+  // is what makes each entry's source identifiable.
+  auto local = f->registry->client->Lookup({"l1", "l2"});
+  CHECK_OK(local.status());
+  CHECK(local->empty()) << "inserting a block must not advertise it";
   return f;
 }
 

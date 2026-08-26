@@ -182,9 +182,9 @@ class RaidenControllerServiceImpl final
   // was already not-live (someone else got there first). Caller MUST invoke
   // the unpin hook OUTSIDE mutex_ -- the hook takes the store's mutex, and
   // taking store-after-service here while the store takes service-after-store
-  // elsewhere would close a lock cycle. Marking first is what A9 requires: a
-  // Renew landing in the gap sees the mark and answers REVOKED, never HELD on
-  // pins that are about to drop.
+  // elsewhere would close a lock cycle. Marking first is what keeps the gap
+  // honest: a Renew landing in it sees the mark and answers REVOKED, never
+  // HELD on pins that are about to drop.
   std::vector<std::string> TransitionOutOfLive(uint64_t lease_id, bool revoked)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 

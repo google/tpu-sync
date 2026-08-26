@@ -307,11 +307,6 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
             *existing = slices[i];
             SetMetadataEntry(hash, slices[i]);
           }
-          registrations.push_back({
-              .prefix_hash = hash,
-              .raiden_id = raiden_id_,
-              .block_id = slices[i].host_block_id,
-          });
         }
         continue;
       }
@@ -331,7 +326,7 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
       if (evicted.has_value()) {
         evicted_entries.push_back(std::move(*evicted));
       }
-      if (i < slices.size()) {
+      if (i < slices.size() && slices[i].host_block_id >= 0) {
         registrations.push_back({
             .prefix_hash = hash,
             .raiden_id = raiden_id_,
@@ -343,25 +338,22 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
     local_id = raiden_id_;
   }
 
-  if (client != nullptr) {
-    if (!registrations.empty()) {
-      auto status = client->Register(registrations);
-      if (!status.ok()) {
-        LOG(WARNING) << "Global registry register failed: " << status.message();
-      }
+  if (client != nullptr && !evicted_entries.empty()) {
+    std::vector<std::string> evicted_hashes;
+    evicted_hashes.reserve(evicted_entries.size());
+    for (const auto& [hash, block_id] : evicted_entries) {
+      evicted_hashes.push_back(hash);
     }
-    if (!evicted_entries.empty()) {
-      std::vector<std::string> evicted_hashes;
-      evicted_hashes.reserve(evicted_entries.size());
-      for (const auto& [hash, block_id] : evicted_entries) {
-        evicted_hashes.push_back(hash);
-      }
-      auto status = client->Unregister(evicted_hashes, local_id);
-      if (!status.ok()) {
-        LOG(WARNING) << "Global registry unregister for evicted blocks failed: "
-                     << status.message();
-      }
-    }
+    client
+        ->UnregisterAsync(evicted_hashes, local_id,
+                          global_registry::kUnwaitedMutationTimeout)
+        .OnReady([](absl::Status status) {
+          if (!status.ok()) {
+            LOG(WARNING)
+                << "Global registry unregister for evicted blocks failed: "
+                << status.message();
+          }
+        });
   }
 
   return std::make_pair(all_inserted, std::move(evicted_entries));
@@ -506,10 +498,15 @@ void HostOffloadBackend::Delete(absl::Span<const std::string> block_hashes,
   }
 
   if (client != nullptr && !deleted_hashes.empty()) {
-    auto status = client->Unregister(deleted_hashes, local_id);
-    if (!status.ok()) {
-      LOG(WARNING) << "Global registry unregister failed: " << status.message();
-    }
+    client
+        ->UnregisterAsync(deleted_hashes, local_id,
+                          global_registry::kUnwaitedMutationTimeout)
+        .OnReady([](absl::Status status) {
+          if (!status.ok()) {
+            LOG(WARNING) << "Global registry unregister failed: "
+                         << status.message();
+          }
+        });
   }
 }
 
@@ -678,10 +675,15 @@ std::vector<int> HostOffloadBackend::Evict(
   }
 
   if (client != nullptr && !evicted_hashes.empty()) {
-    auto status = client->Unregister(evicted_hashes, local_id);
-    if (!status.ok()) {
-      LOG(WARNING) << "Global registry unregister failed: " << status.message();
-    }
+    client
+        ->UnregisterAsync(evicted_hashes, local_id,
+                          global_registry::kUnwaitedMutationTimeout)
+        .OnReady([](absl::Status status) {
+          if (!status.ok()) {
+            LOG(WARNING) << "Global registry unregister failed: "
+                         << status.message();
+          }
+        });
   }
 
   return host_ids_to_deallocate;
@@ -966,7 +968,7 @@ tsl::Future<> HostOffloadBackend::RegisterBlocksAsync(
   registrations.reserve(block_hashes.size());
   for (size_t i = 0; i < block_hashes.size(); ++i) {
     registrations.push_back({
-        .prefix_hash = block_hashes[i],
+        .prefix_hash = std::string(block_hashes[i]),
         .raiden_id = local_id,
         .block_id = host_block_ids[i],
     });

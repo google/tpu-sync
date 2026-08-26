@@ -15,8 +15,6 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_KV_CACHE_GLOBAL_REGISTRY_GLOBAL_REGISTRY_CLIENT_H_
 #define THIRD_PARTY_TPU_RAIDEN_KV_CACHE_GLOBAL_REGISTRY_GLOBAL_REGISTRY_CLIENT_H_
 
-#include <grpcpp/grpcpp.h>
-
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -27,7 +25,6 @@
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "grpcpp/channel.h"
-#include "grpcpp/client_context.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
@@ -39,23 +36,10 @@ namespace global_registry {
 
 using namespace ::tpu_raiden::kv_cache::global_registry;  // NOLINT
 
-class GlobalRegistryClient;
-
-// Cancels one in-flight registry call. TryCancel is safe from any thread, never
-// blocks, and is a no-op once the call has completed. Holds the context weakly,
-// so a handle kept after completion does not keep the call's state alive.
-class RegistryCall {
- public:
-  void TryCancel() {
-    if (auto ctx = context_.lock()) {
-      ctx->TryCancel();
-    }
-  }
-
- private:
-  friend class GlobalRegistryClient;
-  std::weak_ptr<grpc::ClientContext> context_;
-};
+// Deadline for a registry mutation nobody waits on. Finite so that an
+// unanswered call cannot run its continuation after main() has returned, and
+// so a stalled write-through gives its pins back.
+inline constexpr absl::Duration kUnwaitedMutationTimeout = absl::Seconds(30);
 
 struct Registration {
   std::string prefix_hash;
@@ -81,15 +65,23 @@ class GlobalRegistryClient {
   // exactly "now" is a race against the round trip -- on loopback the call
   // usually wins. "No deadline" is `absl::InfiniteDuration()`, the default.
   //
-  // `out_call`, when non-null, receives a handle for cancelling this call.
-  // The common caller passes nothing.
+  // NOT ORDERED against any other call, including one on the same block hash.
+  // A publish and the withdraw that undoes it can reach the server in either
+  // order, and the registry keeps whichever landed last. A withdraw that
+  // overtakes its publish therefore leaves an entry naming this node for a
+  // block hash it no longer holds, which HostOffloadBackend::Lookup treats as
+  // unverifiable: it ends the answer there, and no TTL removes the entry. The
+  // callers accept that cost -- it costs a peer one refused fetch and this
+  // node the tail of one lookup -- in exchange for not serialising registry
+  // traffic per block hash.
   tsl::Future<> RegisterAsync(
       const std::vector<Registration>& registrations,
-      absl::Duration timeout = absl::InfiniteDuration(),
-      RegistryCall* out_call = nullptr);
+      absl::Duration timeout = absl::InfiniteDuration());
 
   // Registers a batch of KV cache entries.
-  absl::Status Register(const std::vector<Registration>& registrations);
+  absl::Status Register(
+      const std::vector<Registration>& registrations,
+      absl::Duration timeout = absl::InfiniteDuration());
 
   // Looks up KV cache entries for a batch of prefix hashes.
   // The lookup processes prefix hashes sequentially and stops at the first miss
@@ -104,16 +96,17 @@ class GlobalRegistryClient {
 
   // Unregisters a batch of KV cache entries for a raiden id asynchronously.
   // See RegisterAsync for what the future resolves to, and for the meaning of
-  // `timeout` (zero is "expire now", not "never") and `out_call`.
+  // `timeout` (zero is "expire now", not "never").
   tsl::Future<> UnregisterAsync(
       const std::vector<std::string>& prefix_hashes,
       const RaidenId& raiden_id,
-      absl::Duration timeout = absl::InfiniteDuration(),
-      RegistryCall* out_call = nullptr);
+      absl::Duration timeout = absl::InfiniteDuration());
 
   // Unregisters a batch of KV cache entries for a raiden id.
-  absl::Status Unregister(const std::vector<std::string>& prefix_hashes,
-                          const RaidenId& raiden_id);
+  absl::Status Unregister(
+      const std::vector<std::string>& prefix_hashes,
+      const RaidenId& raiden_id,
+      absl::Duration timeout = absl::InfiniteDuration());
 
   // A single active registration returned by PullOwned.
   struct PulledEntry {

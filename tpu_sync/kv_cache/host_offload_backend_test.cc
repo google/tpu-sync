@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Unit tests for HostOffloadBackend.
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 
 #include <cstddef>
@@ -29,6 +28,8 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
@@ -1010,8 +1011,8 @@ TEST(HostOffloadBackendWriteRemoteTest,
   EXPECT_EQ((*looked_up)[1].block_id(), 8);
 }
 
-// Unlike Insert's inline Register, which logs and swallows. COMMITTED is only
-// allowed to mean "globally reachable", so this failure has to be visible.
+// COMMITTED is only allowed to mean "globally reachable", so a publish that
+// fails has to reach the caller rather than be logged and swallowed.
 TEST(HostOffloadBackendWriteRemoteTest, RegisterBlocksSyncReportsFailure) {
   RaidenId id{"job_regfail", "0", "data", 0};
   // Port 1 is reserved and never listening.
@@ -1169,16 +1170,6 @@ void RegisterGlobal(global_registry::GlobalRegistryClient* client,
       {{.prefix_hash = hash, .raiden_id = owner, .block_id = block_id}}));
 }
 
-// Withdraws this node's own registration for `hash`. Insert() publishes
-// everything it caches, so a test that needs a locally cached block the
-// registry cannot answer for has to take that registration back out. The
-// registry holds one entry per owner rather than overwriting, so dropping ours
-// is also what makes a peer the sole owner of a hash we hold.
-void UnregisterLocal(global_registry::GlobalRegistryClient* client,
-                     const RaidenId& local_id, const std::string& hash) {
-  ASSERT_OK(client->Unregister({hash}, local_id));
-}
-
 TEST(HostOffloadBackendTest, LookupInterleavesLocalAndRemoteHits) {
   auto f = MakeInterleavedFixture();
   // [remote, local, remote, local, miss]
@@ -1234,11 +1225,10 @@ TEST(HostOffloadBackendTest,
   auto f = MakeInterleavedFixture();
   RegisterGlobal(f->registry->client.get(), f->peer_id, "r1", 42);
   InsertLocal(f->backend.get(), f->local_id, "l1", 11);
-  // Leave a peer as the registry's only owner of a block we hold ourselves, at
-  // a different id. Consulting the registry for a hash the local index already
-  // resolved is what used to make this block look remote: the caller would read
-  // it over the network, from a block id that is not the one we hold.
-  UnregisterLocal(f->registry->client.get(), f->local_id, "l1");
+  // A peer is the registry's only owner of a block we hold ourselves, at a
+  // different id (inserting does not advertise, so nothing lists us). Consulting
+  // the registry for a hash the local index resolved is what used to make this
+  // block look remote, read from a block id that is not the one we hold.
   RegisterGlobal(f->registry->client.get(), f->peer_id, "l1", 91);
 
   auto res = f->backend->Lookup({"r1", "l1"});
@@ -1286,10 +1276,6 @@ TEST(HostOffloadBackendTest, LookupInterleavedDisabledStopsAtFirstLocalMiss) {
   auto f = MakeInterleavedFixture();
   RegisterGlobal(f->registry->client.get(), f->peer_id, "r1", 42);
   InsertLocal(f->backend.get(), f->local_id, "l1", 11);
-  // Only the local index knows "l1", so the two modes give visibly different
-  // answers: without interleaving the sweep stops at "r1" and "l1" can only be
-  // looked for in the registry, which cannot answer for it.
-  UnregisterLocal(f->registry->client.get(), f->local_id, "l1");
 
   auto legacy = f->backend->Lookup(
       {"r1", "l1"}, LookupOptions{.enable_interleaved_lookup = false});

@@ -61,12 +61,6 @@ class StallingRegistryService final : public GlobalRegistryService::Service {
         in_stall_.Notify();
       }
       stall_release_.WaitForNotification();
-      if (wait_for_cancellation_) {
-        absl::Time deadline = absl::Now() + absl::Seconds(2);
-        while (!context->IsCancelled() && absl::Now() < deadline) {
-          absl::SleepFor(absl::Milliseconds(2));
-        }
-      }
     }
     return impl_->Register(context, request, response);
   }
@@ -139,13 +133,11 @@ class StallingRegistryService final : public GlobalRegistryService::Service {
       stall_release_.Notify();
     }
   }
-  void SetWaitForCancellation(bool val) { wait_for_cancellation_ = val; }
 
  private:
   std::unique_ptr<GlobalRegistryServiceImpl> impl_;
   // Set from the test thread, read on a server handler thread.
   std::atomic<bool> stall_register_ = false;
-  std::atomic<bool> wait_for_cancellation_ = false;
   absl::Notification in_stall_;
   absl::Notification stall_release_;
 };

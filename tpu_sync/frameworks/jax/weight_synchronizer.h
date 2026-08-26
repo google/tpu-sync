@@ -22,6 +22,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "tpu_sync/core/raiden_future.h"
+#include "tpu_sync/core/raiden_transfer_endpoint.h"
 #ifndef WITHOUT_PYTHON
 #include "tpu_sync/frameworks/jax/jax_utils.h"
 #endif
@@ -70,6 +71,7 @@ class WeightSynchronizer {
   std::optional<int> local_port() const;
   std::optional<int> listener_port() const;
   bool is_listener_active() const;
+  std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
   size_t num_layers() const;
   size_t num_shards() const;
   size_t slice_byte_size() const;

@@ -58,6 +58,7 @@ cc_library(
         "//tpu_sync/core:host_memory_allocator",
         "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:raiden_manager_base",
+        "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:status_macros",
         "//tpu_sync/core:xla_raw_transfer_headers",

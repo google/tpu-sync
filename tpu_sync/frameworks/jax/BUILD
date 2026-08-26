@@ -285,6 +285,7 @@ cc_library(
     deps = [
         ":jax_utils",
         ":utils",
+        "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/status",

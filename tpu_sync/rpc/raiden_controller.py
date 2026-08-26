@@ -393,32 +393,39 @@ def connect_socket(
 ) -> socket.socket:
   """Connects to an IPv4 or IPv6 endpoint robustly with optional coordinate name resolution."""
   start_time = time.time()
-  if resolver:
-    address_str = resolver.resolve(address_str)
-
-  rindex = address_str.rfind(":")
-  host = address_str[:rindex]
-  port = int(address_str[rindex + 1 :])
-  if host.startswith("[") and host.endswith("]"):
-    host = host[1:-1]
 
   while True:
-    try:
-      for res in socket.getaddrinfo(
-          host, port, socket.AF_UNSPEC, socket.SOCK_STREAM
-      ):
-        af, socktype, proto, _, sa = res
-        sock = None
-        try:
-          sock = socket.socket(af, socktype, proto)
-          sock.settimeout(timeout)
-          sock.connect(sa)
-          return sock
-        except OSError:
-          if sock:
-            sock.close()
-    except OSError:
-      pass
+    resolved_addr = address_str
+    if resolver:
+      try:
+        resolved_addr = resolver.resolve(address_str)
+      except Exception:  # pylint: disable=broad-except
+        pass
+
+    rindex = resolved_addr.rfind(":")
+    if rindex != -1:
+      host = resolved_addr[:rindex]
+      try:
+        port = int(resolved_addr[rindex + 1 :])
+        if host.startswith("[") and host.endswith("]"):
+          host = host[1:-1]
+
+        for res in socket.getaddrinfo(
+            host, port, socket.AF_UNSPEC, socket.SOCK_STREAM
+        ):
+          af, socktype, proto, _, sa = res
+          sock = None
+          try:
+            sock = socket.socket(af, socktype, proto)
+            sock.settimeout(min(10.0, timeout))
+            sock.connect(sa)
+            sock.settimeout(timeout)
+            return sock
+          except OSError:
+            if sock:
+              sock.close()
+      except (ValueError, OSError):
+        pass
 
     if time.time() - start_time > timeout:
       raise RuntimeError(
@@ -920,6 +927,14 @@ def generate_strided_copy_chunks(
       count)
   """
   rank = len(src_shard_slice)
+  if rank == 0:
+    return [(0, 0, itemsize, 0, 0, 1)]
+  if rank == 1:
+    s_s, _ = src_shard_slice[0]
+    d_s, _ = dst_shard_slice[0]
+    i_s, i_e = intersection_slice[0]
+    size = (i_e - i_s) * itemsize
+    return [((i_s - s_s) * itemsize, (i_s - d_s) * itemsize, size, 0, 0, 1)]
   src_shape = [e - s for s, e in src_shard_slice]
   dst_shape = [e - s for s, e in dst_shard_slice]
   int_shape = [e - s for s, e in intersection_slice]
@@ -2500,29 +2515,44 @@ class RaidenController:
                               dst_stride,
                               count,
                           ) in chunks:
-                            src_block_bytes = (
-                                math.prod([e - s for s, e in src_slice[1:]])
-                                * itemsize
-                                if len(src_slice) > 1
-                                else itemsize
-                            )
-                            dst_block_bytes = (
-                                math.prod([e - s for s, e in dst_slice[1:]])
-                                * itemsize
-                                if len(dst_slice) > 1
-                                else itemsize
-                            )
-                            src_block_id = src_offset // src_block_bytes
-                            dst_block_id = dst_offset // dst_block_bytes
-
                             is_legacy = is_legacy_by_unit.get(
                                 src_unit, True
                             ) or is_legacy_by_unit.get(dst_unit, True)
-                            if is_legacy:
-                              src_block_offset = src_offset % src_block_bytes
-                              dst_block_offset = dst_offset % dst_block_bytes
+
+                            if len(src_slice) > 1:
+                              src_block_bytes = (
+                                  math.prod([e - s for s, e in src_slice[1:]])
+                                  * itemsize
+                              )
+                              src_block_id = src_offset // src_block_bytes
+                              src_block_offset = (
+                                  src_offset % src_block_bytes
+                                  if is_legacy
+                                  else src_offset
+                              )
                             else:
+                              src_block_bytes = (
+                                  src_slice[0][1] - src_slice[0][0]
+                              ) * itemsize
+                              src_block_id = 0
                               src_block_offset = src_offset
+
+                            if len(dst_slice) > 1:
+                              dst_block_bytes = (
+                                  math.prod([e - s for s, e in dst_slice[1:]])
+                                  * itemsize
+                              )
+                              dst_block_id = dst_offset // dst_block_bytes
+                              dst_block_offset = (
+                                  dst_offset % dst_block_bytes
+                                  if is_legacy
+                                  else dst_offset
+                              )
+                            else:
+                              dst_block_bytes = (
+                                  dst_slice[0][1] - dst_slice[0][0]
+                              ) * itemsize
+                              dst_block_id = 0
                               dst_block_offset = dst_offset
 
                             shard_entries.append((

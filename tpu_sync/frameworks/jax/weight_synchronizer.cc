@@ -26,6 +26,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "xla/tsl/platform/errors.h"
+#include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 namespace tpu_raiden {
@@ -96,6 +97,10 @@ std::optional<int> WeightSynchronizer::listener_port() const {
 }
 bool WeightSynchronizer::is_listener_active() const {
   return impl_->is_listener_active();
+}
+std::vector<RaidenTransferEndpoint> WeightSynchronizer::get_local_endpoints()
+    const {
+  return impl_->get_local_endpoints();
 }
 size_t WeightSynchronizer::num_layers() const { return impl_->num_layers(); }
 size_t WeightSynchronizer::num_shards() const { return impl_->num_shards(); }

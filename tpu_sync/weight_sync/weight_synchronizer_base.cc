@@ -33,6 +33,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
@@ -47,6 +48,7 @@
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_manager_base.h"
+#include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/buffer_push_task.h"
@@ -300,6 +302,21 @@ bool WeightSynchronizerBase::is_listener_active() const {
     return listener_->is_active();
   }
   return false;
+}
+
+std::vector<RaidenTransferEndpoint>
+WeightSynchronizerBase::get_local_endpoints() const {
+  std::vector<int64_t> shards;
+  shards.reserve(num_shards_);
+  for (size_t i = 0; i < num_shards_; ++i) {
+    shards.push_back(static_cast<int64_t>(i));
+  }
+  const std::string ip = local_ip();
+  const int port = local_port().value_or(0);
+  std::string ep = absl::StrContains(ip, ':')
+                       ? absl::StrCat("[", ip, "]:", port)
+                       : absl::StrCat(ip, ":", port);
+  return {RaidenTransferEndpoint{ep, std::move(shards)}};
 }
 
 WeightSynchronizerBase::~WeightSynchronizerBase() = default;

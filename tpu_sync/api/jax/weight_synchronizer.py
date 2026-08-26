@@ -14,7 +14,7 @@
 
 """High-performance JAX Weight Synchronizer for RL Trainer-Inference Pipelines."""
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 # Import Nanobind binary library directly E2E!
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _weight_synchronizer
@@ -86,6 +86,10 @@ class WeightSynchronizer:
       shard_idx: Target shard index to fetch.
     """
     return self._impl.get_host_buffer(layer_idx, shard_idx)
+
+  def get_local_endpoints(self) -> List[Dict[str, Any]]:
+    """Returns the list of transfer endpoints advertised by this instance."""
+    return self._impl.get_local_endpoints()
 
   @property
   def local_port(self) -> Optional[int]:

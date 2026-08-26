@@ -1763,6 +1763,22 @@ class GetGlobalIndicesTest(absltest.TestCase):
         )
     )
 
+  def test_generate_strided_copy_chunks_1d(self):
+    src_slice = [(0, 5376)]
+    dst_slice_0 = [(0, 2688)]
+    intersection_0 = [(0, 2688)]
+    chunks_0 = raiden_controller.generate_strided_copy_chunks(
+        src_slice, dst_slice_0, intersection_0, itemsize=2
+    )
+    self.assertEqual(chunks_0, [(0, 0, 2688 * 2, 0, 0, 1)])
+
+    dst_slice_1 = [(2688, 5376)]
+    intersection_1 = [(2688, 5376)]
+    chunks_1 = raiden_controller.generate_strided_copy_chunks(
+        src_slice, dst_slice_1, intersection_1, itemsize=2
+    )
+    self.assertEqual(chunks_1, [(2688 * 2, 0, 2688 * 2, 0, 0, 1)])
+
   def test_generate_strided_copy_chunks_tile_aware_1d(self):
     src_slice = [(0, 2304)]
     dst_slice = [(0, 1152)]
@@ -2169,6 +2185,134 @@ class GetGlobalIndicesTest(absltest.TestCase):
     self.assertEqual(plan1.uuid, 1001)
     self.assertEqual(plan2.uuid, 1002)
     self.assertEqual(plan1.shard_push_schedules, plan2.shard_push_schedules)
+
+  def test_1d_rank1_tensor_resharding_offsets(self):
+    client = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=10000, worker_rpc_client=client
+    )
+    num_hosts = 2
+    num_shards_per_host = 8
+    src_units = [
+        raiden_controller.RaidenId("trainer", str(r), "model_weights")
+        for r in range(num_hosts)
+    ]
+    dst_units = [
+        raiden_controller.RaidenId("sampler", str(r), "model_weights")
+        for r in range(num_hosts)
+    ]
+
+    # 1D layernorm (shape (5376,), P("fsdp"), item_size 2)
+    # 2D projection matrix (shape (5376, 4096), P("fsdp", "tp"), item_size 2)
+    src_vars = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0.input_layernorm",
+            shape=[5376],
+            mesh_shape=[1],
+            layout=[0],
+            item_size=2,
+            layer_idx=0,
+            sharding_spec=["fsdp"],
+        ),
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0.attn.q_proj",
+            shape=[5376, 4096],
+            mesh_shape=[1, 16],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=1,
+            sharding_spec=["fsdp", "tp"],
+        ),
+    ]
+
+    dst_vars = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0.input_layernorm",
+            shape=[5376],
+            mesh_shape=[2],
+            layout=[0],
+            item_size=2,
+            layer_idx=0,
+            sharding_spec=["fsdp"],
+        ),
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0.attn.q_proj",
+            shape=[5376, 4096],
+            mesh_shape=[2, 8],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=1,
+            sharding_spec=["fsdp", "tp"],
+        ),
+    ]
+
+    for r in range(num_hosts):
+      shards_src = [f"10.0.0.{r}:{s}" for s in range(num_shards_per_host)]
+      controller.register_work_unit(
+          src_units[r],
+          shards_src,
+          f"10.0.0.{r}:10000",
+          mesh_shape=[1, 16],
+          variables=src_vars,
+          mesh_axes=["fsdp", "tp"],
+      )
+      shards_dst = [f"10.0.1.{r}:{s}" for s in range(num_shards_per_host)]
+      controller.register_work_unit(
+          dst_units[r],
+          shards_dst,
+          f"10.0.1.{r}:10000",
+          mesh_shape=[2, 8],
+          variables=dst_vars,
+          mesh_axes=["fsdp", "tp"],
+      )
+
+    fut = controller.start_transfer(
+        src_units=src_units,
+        dst_units=dst_units,
+        use_block_chunks=True,
+        uuid=1001,
+        req_id="test_req_0",
+    )
+    asyncio.run(fut.wait())
+
+    plans_sent = {target: plan for target, plan in client.calls}
+    self.assertIn(src_units[0], plans_sent)
+    self.assertIn(src_units[1], plans_sent)
+
+    # Validate 1D layernorm schedule entries:
+    # Destination Host 0 (fsdp=0) slice [0:2688] -> src_block_offset=0, dst_block_offset=0, size=5376 bytes
+    # Destination Host 1 (fsdp=1) slice [2688:5376] -> src_block_offset=5376, dst_block_offset=0, size=5376 bytes
+    host0_layernorm_entries = []
+    host1_layernorm_entries = []
+    for s_unit in src_units:
+      plan = plans_sent[s_unit]
+      for shard_idx, entries in plan.shard_push_schedules[s_unit].items():
+        for entry in entries:
+          # entry tuple format:
+          # (dst_peer, local_dst_idx, dst_block_offset, src_block_offset, size, src_block_id, dst_block_id, src_stride, dst_stride, count, layer_idx, 0)
+          if entry[10] == 0:  # layer_idx == 0 (input_layernorm)
+            dst_peer = entry[0]
+            if "10.0.1.0" in dst_peer:
+              host0_layernorm_entries.append(entry)
+            elif "10.0.1.1" in dst_peer:
+              host1_layernorm_entries.append(entry)
+
+    self.assertLen(host0_layernorm_entries, num_shards_per_host)
+    self.assertLen(host1_layernorm_entries, num_shards_per_host)
+
+    for entry in host0_layernorm_entries:
+      self.assertEqual(entry[2], 0)  # dst_block_offset
+      self.assertEqual(entry[3], 0)  # src_block_offset
+      self.assertEqual(entry[4], 2688 * 2)  # size in bytes
+      self.assertEqual(entry[5], 0)  # src_block_id
+      self.assertEqual(entry[6], 0)  # dst_block_id
+
+    for entry in host1_layernorm_entries:
+      self.assertEqual(entry[2], 0)  # dst_block_offset
+      self.assertEqual(entry[3], 2688 * 2)  # src_block_offset = 5376 bytes
+      self.assertEqual(entry[4], 2688 * 2)  # size in bytes
+      self.assertEqual(entry[5], 0)  # src_block_id
+      self.assertEqual(entry[6], 0)  # dst_block_id
 
 
 if __name__ == "__main__":

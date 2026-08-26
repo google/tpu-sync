@@ -306,8 +306,7 @@ NB_MODULE(_tpu_raiden_jax, m) {
            nb::arg("parallelism") = 1,
            nb::arg("unsafe_skip_buffer_lock") = false,
            nb::arg("listener_port") = nb::none(),
-           nb::arg("bind_ip") = nb::none(),
-           nb::arg("auto_h2d") = false)
+           nb::arg("bind_ip") = nb::none(), nb::arg("auto_h2d") = false)
 
       .def(
           "D2h",
@@ -383,6 +382,18 @@ NB_MODULE(_tpu_raiden_jax, m) {
       .def_prop_ro("listener_port", &WeightSynchronizer::listener_port)
       .def_prop_ro("is_listener_active",
                    &WeightSynchronizer::is_listener_active)
+      .def("get_local_endpoints",
+           [](const WeightSynchronizer& self) {
+             auto eps = self.get_local_endpoints();
+             nb::list py_eps;
+             for (const auto& ep : eps) {
+               nb::dict d;
+               d["endpoint"] = ep.endpoint;
+               d["shards"] = ep.shards;
+               py_eps.append(d);
+             }
+             return py_eps;
+           })
       .def_prop_ro("num_layers", &WeightSynchronizer::num_layers)
       .def_prop_ro("num_shards", &WeightSynchronizer::num_shards)
       .def_prop_ro("slice_byte_size", &WeightSynchronizer::slice_byte_size)

@@ -33,6 +33,7 @@
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_manager_base.h"
+#include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 
 namespace tpu_sync {
@@ -114,6 +115,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   std::optional<int> listener_port() const;
   bool is_listener_active() const;
+  virtual std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
 
   ~WeightSynchronizerBase() override;
 

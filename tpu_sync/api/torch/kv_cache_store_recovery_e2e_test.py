@@ -84,8 +84,12 @@ def _make_cache(host_data):
 def _build_stack(tpu_cache):
   """Builds a store (with controller) and a manager wired to it."""
   # pylint: disable=g-import-not-at-top
-  from tpu_sync.api.torch import kv_cache_manager
-  from tpu_sync.api.torch import kv_cache_store
+  try:
+    from tpu_sync.api.torch import kv_cache_manager
+    from tpu_sync.api.torch import kv_cache_store
+  except ImportError:
+    from tpu_sync.api.torch import kv_cache_manager
+    from tpu_sync.api.torch import kv_cache_store
   # pylint: enable=g-import-not-at-top
 
   controller_port = _find_free_port()
@@ -128,7 +132,11 @@ def _phase_a():
   """Saves distinct bytes to the shared-memory host pool, then crashes."""
   # pylint: disable=g-import-not-at-top
   import numpy as np
-  from tpu_sync.api.torch import kv_cache_store
+
+  try:
+    from tpu_sync.api.torch import kv_cache_store
+  except ImportError:
+    from tpu_sync.api.torch import kv_cache_store
   # pylint: enable=g-import-not-at-top
 
   host_data = np.arange(np.prod(_SHAPE), dtype=np.float32).reshape(_SHAPE)
@@ -167,7 +175,11 @@ def _phase_b(expect_recovery: bool):
   """Restarts the stack and serves the recovered blocks from host memory."""
   # pylint: disable=g-import-not-at-top
   import numpy as np
-  from tpu_sync.api.torch import kv_cache_store
+
+  try:
+    from tpu_sync.api.torch import kv_cache_store
+  except ImportError:
+    from tpu_sync.api.torch import kv_cache_store
   # pylint: enable=g-import-not-at-top
 
   host_data = np.arange(np.prod(_SHAPE), dtype=np.float32).reshape(_SHAPE)

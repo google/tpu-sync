@@ -24,6 +24,8 @@
 #include "absl/log/initialize.h"
 #include "absl/flags/flag.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/server.h"
@@ -41,7 +43,7 @@ ABSL_FLAG(
         kDefaultPullOwnedBatchSize,
     "Maximum number of entries per streamed PullOwned response message");
 
-void RunServer() {
+absl::Status RunServer() {
   std::string server_address =
       "[::]:" + std::to_string(absl::GetFlag(FLAGS_port));
 
@@ -60,12 +62,20 @@ void RunServer() {
   builder.RegisterService(&service);
   // Finally assemble the server.
   std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
+  if (server == nullptr) {
+    return absl::InternalError(
+        absl::StrCat("Failed to listen on ", server_address,
+                     ": the port is already in use or not permitted for this "
+                     "process"));
+  }
+
   std::cout << "Server listening on " << server_address << std::endl;
   LOG(INFO) << "Server listening on " << server_address;
 
   // Wait for the server to shutdown. Note that some other thread must be
   // responsible for shutting down the server for this call to ever return.
   server->Wait();
+  return absl::OkStatus();
 }
 
 int main(int argc, char** argv) {
@@ -74,6 +84,12 @@ int main(int argc, char** argv) {
 #ifndef _WIN32
   std::signal(SIGPIPE, SIG_IGN);
 #endif
-  RunServer();
+  absl::Status status = RunServer();
+  if (!status.ok()) {
+    // LOG(ERROR) reaches stderr on its own; only the announcement in
+    // RunServer needs std::cout to be visible without a log sink.
+    LOG(ERROR) << status;
+    return 1;
+  }
   return 0;
 }

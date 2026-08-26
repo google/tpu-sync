@@ -263,17 +263,10 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   void ClearMetadataEntry(const RaidenBlockId& block)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
-  // INVARIANT: no thread holds `mutex_` across a registry RPC.
-  //
-  // Every registry call in this class is made after an explicit unlock --
-  // Insert, Delete, Evict, RegisterBlocksSync, Lookup and the peer-resolution
-  // path all release before calling out -- and nothing enforces that but the
-  // shape of those functions, so it is written down here.
-  //
-  // It matters because the synchronous Register and Unregister are now Await()
-  // over an asynchronous call whose promise is set on a gRPC callback thread.
-  // Holding this mutex across one of them puts a lock the callback path can
-  // need on the far side of a wait for that same callback path.
+  // INVARIANT: no thread holds `mutex_` across a registry RPC. Every call site
+  // unlocks first, and nothing enforces that but their shape. The synchronous
+  // Register and Unregister are Await() on a promise a gRPC callback thread
+  // sets, so holding this across one waits for a path that may need it.
   mutable absl::Mutex mutex_;
   LRUCache<std::string, RaidenBlockId> lru_cache_ ABSL_GUARDED_BY(mutex_);
   std::optional<KVCacheMetadata> metadata_ ABSL_GUARDED_BY(mutex_);

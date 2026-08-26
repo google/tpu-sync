@@ -748,6 +748,10 @@ KVCacheStore::~KVCacheStore() {
   // service dereferences is destroyed. `backends_` is declared before
   // `raiden_controller_`, so member destruction would otherwise free the
   // controller while the server is still accepting RPCs that use it.
+  //
+  // Withdrawing the store record is also what retires this store's block
+  // entries: the server purges everything this raiden id owns. Nothing waits
+  // for the publishes still in flight.
   if (registered_in_global_registry_ && registry_client_ != nullptr) {
     absl::Status status = registry_client_->UnregisterStore(raiden_id_);
     if (!status.ok()) {
@@ -2146,11 +2150,9 @@ void KVCacheStore::PollSavesInternal(std::vector<SaveState> ready_saves) {
         DeallocateBlockIds(state.host_block_ids);
       }
       if (!write_through_regs.empty() && registry_client_) {
-        // The caller's pin is consumed in the OnReady callback, after Register
-        // returns, not here. Releasing inline would let the entry be evicted
-        // while the queued registration is still pending, and the late
-        // Register would then publish a host block id this node has already
-        // freed -- a registry advertising blocks that are not here.
+        // The pin is spent in the callback, not here: released inline, the
+        // entry could be evicted while the publish is in flight, and the
+        // publish would then advertise a host block already freed.
         const size_t num_blocks = write_through_regs.size();
         bool admitted = false;
         {
@@ -2167,9 +2169,9 @@ void KVCacheStore::PollSavesInternal(std::vector<SaveState> ready_saves) {
                 << " blocks are already pinned by write-throughs waiting on "
                    "it, at the bound of "
                 << wt_state_->max_in_flight_blocks
-                << ". Peers will not find these blocks; the alternative is "
-                   "pinning them out of reach of eviction until the registry "
-                   "answers, which drains the host block pool.";
+                << ". Peers will not find them; the alternative is pinning "
+                   "them out of reach of eviction until the registry answers, "
+                   "which drains the host block pool.";
           }
         }
         if (!admitted) {

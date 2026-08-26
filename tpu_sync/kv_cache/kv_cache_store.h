@@ -765,23 +765,14 @@ class KVCacheStore {
   std::unique_ptr<std::thread> poller_thread_;
   std::atomic<bool> stop_poller_{false};
 
-  // Write-throughs that have been published to the global registry and are
-  // waiting for an answer.
+  // Blocks pinned by write-throughs still waiting on the registry. Bounded,
+  // because a pinned block is invisible to eviction: a registry that connects
+  // and never answers would otherwise pin the host block pool dry. Past the
+  // bound the advertisement is dropped and the pins released -- invisible to
+  // peers is recoverable, unevictable is not.
   //
-  // Two things need this. The destructor cancels every outstanding call before
-  // it unregisters the store, because a registration that landed afterwards
-  // would advertise blocks against a store record that no longer resolves --
-  // and since the raiden id is stable across restart, the next process would
-  // inherit those orphans and truncate every lookup that reached one.
-  //
-  // And the outstanding calls have to be bounded, because each one holds a pin
-  // on every block in its batch and a pinned entry is invisible to eviction.
-  // A registry that accepts connections and never answers would otherwise let
-  // saves accumulate never-settling calls until nothing is evictable and the
-  // host block pool drains -- with the registry reachable and the process
-  // otherwise healthy. Past the bound the advertisement is dropped and the
-  // pins released: an unadvertised block is invisible to peers, an unevictable
-  // one stops the node.
+  // The calls are not tracked; teardown's UnregisterStore purges what this
+  // raiden id owns.
   struct WriteThroughState {
     absl::Mutex mutex;
     size_t in_flight_blocks ABSL_GUARDED_BY(mutex) = 0;

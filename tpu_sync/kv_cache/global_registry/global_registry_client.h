@@ -56,24 +56,17 @@ class GlobalRegistryClient {
   // resolves on a gRPC callback thread with OkStatus, FailedPrecondition when
   // the server rejected the batch, or Internal when the RPC itself failed.
   //
-  // `timeout` bounds the call as a gRPC deadline. Beware that zero does NOT
-  // mean the same thing here as it does for `Registration::ttl` and
-  // `RegisterStore`'s ttl, where zero means "never expires": a `timeout` of
-  // zero or less is already expired, and the returned future resolves
-  // DeadlineExceeded without the RPC ever being dispatched. That case is
-  // decided here rather than left to gRPC, whose behaviour for a deadline of
-  // exactly "now" is a race against the round trip -- on loopback the call
-  // usually wins. "No deadline" is `absl::InfiniteDuration()`, the default.
+  // `timeout` is a gRPC deadline; `absl::InfiniteDuration()` (the default) is
+  // none. Zero or less means "already expired" and resolves DeadlineExceeded
+  // without dispatching -- unlike `Registration::ttl` and `RegisterStore`'s
+  // ttl, where zero means "never". Decided here because a gRPC deadline of
+  // exactly "now" races the round trip.
   //
-  // NOT ORDERED against any other call, including one on the same block hash.
-  // A publish and the withdraw that undoes it can reach the server in either
-  // order, and the registry keeps whichever landed last. A withdraw that
-  // overtakes its publish therefore leaves an entry naming this node for a
-  // block hash it no longer holds, which HostOffloadBackend::Lookup treats as
-  // unverifiable: it ends the answer there, and no TTL removes the entry. The
-  // callers accept that cost -- it costs a peer one refused fetch and this
-  // node the tail of one lookup -- in exchange for not serialising registry
-  // traffic per block hash.
+  // NOT ORDERED, even against a call on the same block hash: the registry
+  // keeps whichever landed last. A withdraw that overtakes its publish leaves
+  // an entry this node cannot back -- a peer pays one refused fetch, and this
+  // node's own lookups truncate there. Accepted, rather than pay for a
+  // per-hash barrier on every batch.
   tsl::Future<> RegisterAsync(
       const std::vector<Registration>& registrations,
       absl::Duration timeout = absl::InfiniteDuration());

@@ -975,7 +975,6 @@ TEST_F(GlobalRegistryTest, KVTransferSpecRejectsEmptyTransferGroup) {
   EXPECT_TRUE(absl::IsInvalidArgument(client_->GetKVTransferSpec("").status()));
 }
 
-// A1: RegisterAsync and UnregisterAsync resolve OK and reflect in Lookup
 TEST_F(GlobalRegistryTest, RegisterAsyncResolvesOk) {
   std::string hash = "async_hash1";
   RaidenId host = {"job1", "replica1", "data1", 0};

@@ -2083,17 +2083,12 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, SaveWriteThrough) {
             1);  // second host block allocated is 1
 }
 
-// A registry that accepts connections and never answers must not be able to
-// drain the host block pool.
-//
-// Every outstanding write-through holds a pin on each block in its batch, and
-// a pinned entry is invisible to eviction. Without a bound on how many blocks
-// can be pinned that way, saves keep adding never-settling calls until
-// GetEvictableKeys finds nothing, Evict returns nothing, the pool drains and
-// Save fails ResourceExhausted -- with the registry reachable and the process
-// otherwise healthy. Past the bound the advertisement is dropped instead: the
-// blocks are invisible to peers, which is recoverable, rather than
-// unevictable, which is not.
+// A registry that connects and never answers must not drain the host block
+// pool. Each outstanding write-through pins its batch, and a pinned block is
+// invisible to eviction, so without a bound saves keep adding never-settling
+// calls until Evict finds nothing and Save fails ResourceExhausted. Past the
+// bound the advertisement is dropped instead: invisible to peers, which is
+// recoverable, rather than unevictable, which is not.
 TEST_F(KVCacheStoreEmbeddedControllerTest,
        WriteThroughInFlightCapSurvivesStalledRegistry) {
   auto impl = std::make_unique<global_registry::GlobalRegistryServiceImpl>();
@@ -3976,15 +3971,7 @@ TEST_F(StoreDiscoveryTest, CapacityConstructedStoreJoinsTheGlobalTier) {
   // the global tier. Inserting does not publish; a completed save does,
   // through this path -- so drive it directly.
   ASSERT_OK(backend->RegisterBlocksSync({"tiered_hash"}, {3}));
-  absl::StatusOr<std::vector<global_registry::KVBlockMetadata>> looked_up;
-  absl::Time deadline = absl::Now() + absl::Seconds(5);
-  while (absl::Now() < deadline) {
-    looked_up = client_->Lookup({"tiered_hash"});
-    if (looked_up.ok() && !looked_up->empty()) {
-      break;
-    }
-    absl::SleepFor(absl::Milliseconds(10));
-  }
+  auto looked_up = client_->Lookup({"tiered_hash"});
   ASSERT_TRUE(looked_up.ok()) << looked_up.status().ToString();
   ASSERT_EQ(looked_up->size(), 1);
   EXPECT_EQ((*looked_up)[0].block_id(), 3);

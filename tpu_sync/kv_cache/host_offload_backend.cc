@@ -292,7 +292,6 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
     absl::Span<const RaidenBlockId> slices, bool /*on_host*/) {
   BlockSliceList evicted_entries;
   bool all_inserted = true;
-  std::vector<global_registry::Registration> registrations;
   std::shared_ptr<global_registry::GlobalRegistryClient> client;
   RaidenId local_id;
 
@@ -326,18 +325,13 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
       if (evicted.has_value()) {
         evicted_entries.push_back(std::move(*evicted));
       }
-      if (i < slices.size() && slices[i].host_block_id >= 0) {
-        registrations.push_back({
-            .prefix_hash = hash,
-            .raiden_id = raiden_id_,
-            .block_id = slices[i].host_block_id,
-        });
-      }
     }
     client = registry_client_;
     local_id = raiden_id_;
   }
 
+  // Withdraw only: a completed save publishes, this does not. What was evicted
+  // to make room is unreadable from now on, and nothing else retires it.
   if (client != nullptr && !evicted_entries.empty()) {
     std::vector<std::string> evicted_hashes;
     evicted_hashes.reserve(evicted_entries.size());

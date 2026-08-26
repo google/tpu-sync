@@ -19,7 +19,7 @@ load("@rules_python//python:defs.bzl", "py_library", "py_test")
 package(default_visibility = ["//visibility:public"])
 
 _X86_MARCH_COPTS = select({
-    "//third_party/bazel_platforms/cpu:x86_64": ["-march=x86-64-v2"],
+    "@platforms//cpu:x86_64": ["-march=x86-64-v2"],
     "//conditions:default": [],
 })
 

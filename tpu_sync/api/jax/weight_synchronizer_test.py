@@ -446,7 +446,8 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     )
     eps = ws.get_local_endpoints()
     self.assertNotEmpty(eps)
-    # 2x2 mesh with 4 local devices should automatically derive flat indices [0, 1, 2, 3]
+    # 2x2 mesh with 4 local devices should automatically derive flat indices
+    # [0, 1, 2, 3].
     self.assertEqual(eps[0]["shards"], [0, 1, 2, 3])
 
   def test_non_contiguous_subgrid_transfer(self):
@@ -508,6 +509,36 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     np.testing.assert_array_equal(
         np.asarray(dst_arrs[0]), np.asarray(src_arrs[0])
     )
+
+  def test_backend_selection(self):
+    arrs = [
+        jax.device_put(jnp.ones(self.shape, dtype=self.dtype), self.sharding)
+    ]
+    # Default backend (non-FFI)
+    ws_default = WeightSynchronizer(
+        jax_arrays=arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+    )
+    self.assertIsNotNone(ws_default.local_port)
+    self.assertEqual(ws_default.num_layers, 1)
+    self.assertFalse(hasattr(ws_default, "destroy"))
+    ws_default.close()
+
+    # Pathways backend (FFI)
+    ws_pathways = WeightSynchronizer(
+        jax_arrays=arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+        backend="pathways",
+    )
+    self.assertIsNotNone(ws_pathways.local_port)
+    self.assertEqual(ws_pathways.num_layers, 1)
+    self.assertIsInstance(ws_pathways.get_metrics(), dict)
+    ws_pathways.d2h()
+    ws_pathways.h2d()
+    self.assertFalse(hasattr(ws_pathways, "destroy"))
+    ws_pathways.close()
 
 
 class ShardSortingUtilTest(absltest.TestCase):

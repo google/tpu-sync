@@ -313,7 +313,7 @@ NB_MODULE(_tpu_raiden_jax, m) {
            nb::arg("global_shard_indices") = nb::none())
 
       .def(
-          "D2h",
+          "d2h",
           [](WeightSynchronizer& self) {
             auto status_or_future = self.D2h();
             if (!status_or_future.ok()) {
@@ -329,7 +329,7 @@ NB_MODULE(_tpu_raiden_jax, m) {
           },
           nb::call_guard<nb::gil_scoped_release>())
       .def(
-          "H2d",
+          "h2d",
           [](WeightSynchronizer& self) {
             auto status_or_future = self.H2d();
             if (!status_or_future.ok()) {

@@ -284,6 +284,7 @@ nanobind_extension(
     deps = [
         ":weight_synchronizer_ffi",
         ":weight_synchronizer_jax",
+        "@com_google_absl//absl/container:flat_hash_set",
         "@nanobind",
     ],
 )

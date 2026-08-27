@@ -18,8 +18,25 @@ from typing import Any, Dict, List, Optional
 
 import jax
 
-# Import Nanobind binary library directly E2E!
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _weight_synchronizer
+from tpu_sync.frameworks.jax import weight_synchronizer_ffi as _weight_synchronizer_ffi
+
+
+def is_pathways_backend() -> bool:
+  """Returns True if the current JAX environment is targeting Pathways."""
+  try:
+    if jax.config.read("jax_platforms") == "pathways":
+      return True
+    devices = jax.devices()
+    if (
+        devices
+        and hasattr(devices[0], "client")
+        and hasattr(devices[0].client, "runtime_type")
+    ):
+      return "pathways" in str(devices[0].client.runtime_type).lower()
+  except Exception:  # pylint: disable=broad-exception-caught
+    pass
+  return False
 
 
 class WeightSynchronizer:
@@ -35,6 +52,7 @@ class WeightSynchronizer:
       bind_ip: Optional[str] = None,
       auto_h2d: bool = False,
       global_shard_indices: Optional[List[int]] = None,
+      backend: Optional[str] = None,
   ):
     """Instantiates the Weight Synchronizer on a JAX weights list.
 
@@ -47,56 +65,73 @@ class WeightSynchronizer:
       bind_ip: Sockets server bind IP address.
       auto_h2d: Automatically execute H2D ingestion upon data arrival.
       global_shard_indices: Explicit vector of global shard indices.
+      backend: Explicit backend selection ('pathways' or 'pjrt'/'default'). If
+        None, automatically detected based on the active JAX runtime.
     """
-    if global_shard_indices is None:
-      if jax_arrays and hasattr(jax_arrays[0], "addressable_shards"):
-        arr = jax_arrays[0]
-        if (
-            hasattr(arr, "sharding")
-            and getattr(arr.sharding, "mesh", None) is not None
-        ):
-          mesh = arr.sharding.mesh
-          flat_devices = list(mesh.devices.flat)
-          indices = []
-          for s in arr.addressable_shards:
-            try:
-              indices.append(flat_devices.index(s.device))
-            except (ValueError, AttributeError):
-              pass
-          if len(indices) == len(arr.addressable_shards):
-            global_shard_indices = indices
-
-    if global_shard_indices is None:
-      num_shards = (
-          len(jax_arrays[0].addressable_shards)
-          if jax_arrays and hasattr(jax_arrays[0], "addressable_shards")
-          else len(jax.local_devices())
-      )
-      offset = (
-          jax.process_index() * len(jax.local_devices())
-          if jax.process_count() > 1
-          else 0
-      )
-      global_shard_indices = [offset + i for i in range(num_shards)]
-
-    self._impl = _weight_synchronizer.WeightSynchronizer(
-        jax_arrays,
-        local_port,
-        parallelism,
-        unsafe_skip_buffer_lock,
-        listener_port,
-        bind_ip,
-        auto_h2d,
-        global_shard_indices,
+    use_ffi = (backend == "pathways") or (
+        backend is None and is_pathways_backend()
     )
+    if use_ffi:
+      self._impl = _weight_synchronizer_ffi.WeightSynchronizer(
+          jax_arrays=jax_arrays,
+          local_port=local_port,
+          parallelism=parallelism,
+          unsafe_skip_buffer_lock=unsafe_skip_buffer_lock,
+          listener_port=listener_port,
+          bind_ip=bind_ip,
+          auto_h2d=auto_h2d,
+      )
+    else:
+      if global_shard_indices is None:
+        if jax_arrays and hasattr(jax_arrays[0], "addressable_shards"):
+          arr = jax_arrays[0]
+          mesh_to_use = None
+          if (
+              hasattr(arr, "sharding")
+              and getattr(arr.sharding, "mesh", None) is not None
+          ):
+            mesh_to_use = arr.sharding.mesh
+          if mesh_to_use is not None:
+            flat_devices = list(mesh_to_use.devices.flat)
+            indices = []
+            for s in arr.addressable_shards:
+              try:
+                indices.append(flat_devices.index(s.device))
+              except (ValueError, AttributeError):
+                pass
+            if len(indices) == len(arr.addressable_shards):
+              global_shard_indices = indices
+
+      if global_shard_indices is None:
+        if jax_arrays and hasattr(jax_arrays[0], "addressable_shards"):
+          shards_count = len(jax_arrays[0].addressable_shards)
+        else:
+          shards_count = len(jax.local_devices())
+        offset = (
+            jax.process_index() * len(jax.local_devices())
+            if jax.process_count() > 1
+            else 0
+        )
+        global_shard_indices = [offset + i for i in range(shards_count)]
+
+      self._impl = _weight_synchronizer.WeightSynchronizer(
+          jax_arrays,
+          local_port,
+          parallelism,
+          unsafe_skip_buffer_lock,
+          listener_port,
+          bind_ip,
+          auto_h2d,
+          global_shard_indices,
+      )
 
   def d2h(self) -> None:
     """Triggers asynchronous Device-to-Host (D2H) copy of current weights to Host buffer."""
-    self._impl.D2h()
+    self._impl.d2h()
 
-  def h2d(self) -> None:
+  def h2d(self) -> Any:
     """Triggers asynchronous Host-to-Device (H2D) copy of staged host buffer back to Device memory E2E."""
-    self._impl.H2d()
+    return self._impl.h2d()
 
   def wait_for_transfer_completion(self, uuid: Optional[int] = None) -> None:
     """Blocks until the transfer with the given UUID (or any transfer if None) has finished ingestion."""
@@ -104,10 +139,13 @@ class WeightSynchronizer:
 
   def test_only_set_skip_tiling(self, skip: bool | List[bool]) -> None:
     """Sets whether D2H/H2D should skip CPU tiling/detiling (for testing only)."""
-    if isinstance(skip, bool):
-      self._impl.set_skip_tiling(skip)
-    else:
-      self._impl.set_skip_tiling(list(skip))
+    if hasattr(self._impl, "set_skip_tiling"):
+      if isinstance(skip, bool):
+        self._impl.set_skip_tiling(skip)
+      else:
+        self._impl.set_skip_tiling(list(skip))
+    elif hasattr(self._impl, "test_only_set_skip_tiling"):
+      self._impl.test_only_set_skip_tiling(skip)
 
   def bind_weights(self, jax_arrays: List[any]) -> None:
     """Binds the JAX arrays to the weight synchronizer in-place.
@@ -164,6 +202,8 @@ class WeightSynchronizer:
   def get_metrics(self) -> dict[str, float | int]:
     """Returns a dictionary of internal performance metrics."""
     m = self._impl.get_metrics()
+    if isinstance(m, dict):
+      return m
     d2h_time_s = max(m.last_d2h_time_ms / 1000.0, 1e-9)
     h2h_time_s = max(m.last_h2h_time_ms / 1000.0, 1e-9)
     tiling_time_s = max(m.last_tiling_time_ms / 1000.0, 1e-9)
@@ -218,3 +258,8 @@ class WeightSynchronizer:
   def reset_metrics(self) -> None:
     """Resets all recorded internal metrics."""
     self._impl.reset_metrics()
+
+  def close(self) -> None:
+    """Closes and tears down internal buffers and servers."""
+    if hasattr(self._impl, "close"):
+      self._impl.close()

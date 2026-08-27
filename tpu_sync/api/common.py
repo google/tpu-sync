@@ -16,9 +16,11 @@
 
 import enum
 
-from tpu_sync.common import _raiden_id
-
-RaidenId = _raiden_id.RaidenId
+def __getattr__(name: str):
+  if name == "RaidenId":
+    from tpu_sync.common import _raiden_id  # pylint: disable=g-import-not-at-top
+    return _raiden_id.RaidenId
+  raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
 class BlockStatus(enum.Enum):

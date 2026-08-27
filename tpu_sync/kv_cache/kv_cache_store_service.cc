@@ -194,6 +194,11 @@ void KVCacheStoreServiceImpl::PauseDeadlineFiringForTesting() {
   deadline_firing_paused_for_testing_ = true;
 }
 
+size_t KVCacheStoreServiceImpl::InFlightWriteOpsCountForTesting() const {
+  absl::MutexLock lock(write_mutex_);
+  return write_ops_.size();
+}
+
 void KVCacheStoreServiceImpl::SetTransferFnForTesting(TransferFn transfer_fn) {
   {
     absl::MutexLock lock(write_mutex_);
@@ -400,6 +405,7 @@ void KVCacheStoreServiceImpl::ReleaseLandingBlocks(
     op->blocks_released = true;
     op->next_leak_warning = absl::InfiniteFuture();
     to_free = op->landing_block_ids;
+    deadline_cv_.Signal();
   }
   // Deallocate outside write_mutex_: controller_ has its own lock.
   (void)controller_->DeallocateBlockIds(
@@ -633,7 +639,8 @@ KVCacheStoreServiceImpl::CompleteWriteRemote(uint64_t op_id,
       // Transfer was OK but past the deadline, or transfer failed before the
       // deadline thread noticed. Set the verdict here rather than leaving
       // the op PENDING forever.
-      op->state = OpState::kFailed;
+      MarkTerminal(op, OpState::kFailed, {});
+      deadline_cv_.Signal();
     }
   }
 
@@ -698,6 +705,22 @@ void KVCacheStoreServiceImpl::FinishPublish(const std::shared_ptr<WriteOp>& op,
   Finish(op, OpState::kCommitted, {});
 }
 
+void KVCacheStoreServiceImpl::MarkTerminal(const std::shared_ptr<WriteOp>& op,
+                                           OpState state,
+                                           std::vector<std::string> existing) {
+  op->state = state;
+  op->existing_hashes = std::move(existing);
+  if (state == OpState::kStoredUnregistered) {
+    op->unregistered_hashes = op->block_hashes;
+  }
+  const bool kept_by_cache =
+      state == OpState::kCommitted || state == OpState::kStoredUnregistered;
+  if (kept_by_cache) {
+    op->blocks_released = true;
+    op->next_leak_warning = absl::InfiniteFuture();
+  }
+}
+
 void KVCacheStoreServiceImpl::Finish(const std::shared_ptr<WriteOp>& op,
                                      OpState state,
                                      std::vector<std::string> existing) {
@@ -705,15 +728,8 @@ void KVCacheStoreServiceImpl::Finish(const std::shared_ptr<WriteOp>& op,
       state == OpState::kCommitted || state == OpState::kStoredUnregistered;
   {
     absl::MutexLock lock(write_mutex_);
-    op->state = state;
-    op->existing_hashes = std::move(existing);
-    if (state == OpState::kStoredUnregistered) {
-      op->unregistered_hashes = op->block_hashes;
-    }
-    if (kept_by_cache) {
-      op->blocks_released = true;
-      op->next_leak_warning = absl::InfiniteFuture();
-    }
+    MarkTerminal(op, state, std::move(existing));
+    deadline_cv_.Signal();
   }
   if (!kept_by_cache) {
     ReleaseLandingBlocks(op);
@@ -778,7 +794,7 @@ void KVCacheStoreServiceImpl::DeadlineLoop() {
       if (op->state == OpState::kPending &&
           !deadline_firing_paused_for_testing_) {
         if (now >= op->deadline) {
-          op->state = OpState::kFailed;
+          MarkTerminal(op, OpState::kFailed, {});
         } else {
           wake_at = std::min(wake_at, op->deadline);
         }
@@ -797,7 +813,20 @@ void KVCacheStoreServiceImpl::DeadlineLoop() {
         }
         wake_at = std::min(wake_at, op->next_leak_warning);
       }
+      if (op->state != OpState::kCompleting &&
+          op->state != OpState::kPending && op->blocks_released) {
+        if (now < op->expires_at) {
+          wake_at = std::min(wake_at, op->expires_at);
+        }
+      }
     }
+
+    absl::erase_if(write_ops_, [now](const auto& entry) {
+      const auto& op = entry.second;
+      return op->state != OpState::kCompleting &&
+             op->state != OpState::kPending && op->blocks_released &&
+             now >= op->expires_at;
+    });
 
     if (wake_at == absl::InfiniteFuture()) {
       deadline_cv_.Wait(&write_mutex_);

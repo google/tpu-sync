@@ -850,6 +850,12 @@ TEST_F(WriteRemoteTest, ATransferThatResolvesPastTheDeadlineNeverCommits) {
   ASSERT_EQ(Poll(op_id)->state(),
             ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::FAILED);
 
+  // The landing blocks are NOT handed back to the pool while the transfer
+  // is still in flight, preventing a concurrent operation from allocating
+  // them while this pull is still writing.
+  EXPECT_FALSE(store_->raiden_controller()->AllocateBlockIds(kCapacity).ok())
+      << "landing blocks were released before the transfer completed";
+
   latch_.Release(absl::OkStatus());
   // Give the completion time to run and lose the claim.
   absl::SleepFor(absl::Milliseconds(200));
@@ -861,6 +867,29 @@ TEST_F(WriteRemoteTest, ATransferThatResolvesPastTheDeadlineNeverCommits) {
   auto reallocated = store_->raiden_controller()->AllocateBlockIds(kCapacity);
   EXPECT_TRUE(reallocated.ok()) << "the deferred free never happened: "
                                 << reallocated.status().ToString();
+}
+
+TEST_F(WriteRemoteTest, WriteOpsShrinksWithoutPollingTraffic) {
+  auto response = Offer({"a", "b"}, /*deadline_ms=*/100);
+  ASSERT_OK(response.status());
+  const uint64_t op_id = response->operation_id();
+  ASSERT_EQ(service_->InFlightWriteOpsCountForTesting(), 1);
+
+  latch_.Release(absl::OkStatus());
+  ASSERT_EQ(AwaitTerminal(op_id),
+            ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::COMMITTED);
+
+  // The operation is terminal and settled. We do NOT issue any PollWriteRemote
+  // calls. DeadlineLoop automatically wakes up at expires_at and garbage
+  // collects the record.
+  constexpr absl::Duration kMaxWait = absl::Seconds(10);
+  const absl::Time deadline = absl::Now() + kMaxWait;
+  while (service_->InFlightWriteOpsCountForTesting() > 0 &&
+         absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(100));
+  }
+  EXPECT_EQ(service_->InFlightWriteOpsCountForTesting(), 0)
+      << "write_ops_ was not garbage collected by DeadlineLoop without polling traffic";
 }
 
 // Same rule as the case above, but reached WITHOUT the deadline thread having

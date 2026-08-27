@@ -22,6 +22,7 @@
 
 #include "ATen/ops/from_blob.h"
 #include "nanobind/nanobind.h"
+#include "nanobind/operators.h"
 #include "nanobind/stl/optional.h"
 #include "nanobind/stl/pair.h"
 #include "nanobind/stl/shared_ptr.h"
@@ -597,7 +598,27 @@ NB_MODULE(_tpu_raiden_torch, m) {
       .def_rw("job_replica_id", &tpu_raiden::kv_cache::RaidenId::job_replica_id)
       .def_rw("data_name", &tpu_raiden::kv_cache::RaidenId::data_name)
       .def_rw("data_replica_idx",
-              &tpu_raiden::kv_cache::RaidenId::data_replica_idx);
+              &tpu_raiden::kv_cache::RaidenId::data_replica_idx)
+      .def("empty", &tpu_raiden::kv_cache::RaidenId::empty)
+      .def(nb::self == nb::self)
+      .def(nb::self != nb::self)
+      .def("__hash__",
+           [](const tpu_raiden::kv_cache::RaidenId& id) {
+             return tpu_raiden::RaidenIdHash()(id);
+           })
+      .def("__repr__",
+           [](const tpu_raiden::kv_cache::RaidenId& id) {
+             return absl::StrCat(
+                 "RaidenId(job_name='", id.job_name, "', job_replica_id='",
+                 id.job_replica_id, "', data_name='", id.data_name,
+                 "', data_replica_idx=", id.data_replica_idx, ")");
+           })
+      .def("__str__", [](const tpu_raiden::kv_cache::RaidenId& id) {
+        return absl::StrCat(
+            "RaidenId(job_name='", id.job_name, "', job_replica_id='",
+            id.job_replica_id, "', data_name='", id.data_name,
+            "', data_replica_idx=", id.data_replica_idx, ")");
+      });
 
   nb::enum_<tpu_raiden::kv_cache::BlockStatus>(m, "BlockStatus")
       .value("INIT", tpu_raiden::kv_cache::BlockStatus::INIT)

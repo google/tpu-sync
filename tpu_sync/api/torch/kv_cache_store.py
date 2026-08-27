@@ -33,57 +33,7 @@ _impl = torch_abi.load_extension(
 from tpu_sync.api import common
 
 BlockStatus = common.BlockStatus
-
-
-class RaidenId:
-  """Wrapper around compiled C++ RaidenId."""
-
-  def __init__(
-      self,
-      job_name: str = "",
-      job_replica_id: str = "",
-      data_name: str = "",
-      data_replica_idx: int = 0,
-      impl: Any = None,
-  ):
-    if impl is not None:
-      self._impl = impl
-    else:
-      self._impl = _impl.RaidenId(
-          job_name, job_replica_id, data_name, data_replica_idx
-      )
-
-  @property
-  def job_name(self) -> str:
-    return self._impl.job_name
-
-  @property
-  def job_replica_id(self) -> str:
-    return self._impl.job_replica_id
-
-  @property
-  def data_name(self) -> str:
-    return self._impl.data_name
-
-  @property
-  def data_replica_idx(self) -> int:
-    return self._impl.data_replica_idx
-
-  def __repr__(self) -> str:
-    return (
-        f"RaidenId(job='{self.job_name}', replica='{self.job_replica_id}',"
-        f" data='{self.data_name}', data_idx={self.data_replica_idx})"
-    )
-
-  def __eq__(self, other: Any) -> bool:
-    if not isinstance(other, RaidenId):
-      return False
-    return (
-        self.job_name == other.job_name
-        and self.job_replica_id == other.job_replica_id
-        and self.data_name == other.data_name
-        and self.data_replica_idx == other.data_replica_idx
-    )
+RaidenId = _impl.RaidenId
 
 
 class RaidenBlockId:
@@ -102,18 +52,21 @@ class RaidenBlockId:
     else:
       if raiden_id is None:
         raiden_id = RaidenId()
+      raw_raiden_id = (
+          raiden_id._impl if hasattr(raiden_id, "_impl") else raiden_id  # pylint: disable=protected-access
+      )
       # Map Python enum to C++ enum
       status_val = getattr(_impl.BlockStatus, status.name)
       self._impl = _impl.RaidenBlockId(
-          raiden_id._impl,
+          raw_raiden_id,
           host_block_id,
           device_block_id,
-          status_val,  # pylint: disable=protected-access
+          status_val,
       )
 
   @property
   def raiden_id(self) -> RaidenId:
-    return RaidenId(impl=self._impl.raiden_id)
+    return self._impl.raiden_id
 
   @property
   def host_block_id(self) -> int:
@@ -244,7 +197,9 @@ class KVCacheStore:
     """
     raw_raiden_id = _impl.RaidenId()
     if raiden_id is not None:
-      raw_raiden_id = raiden_id._impl  # pylint: disable=protected-access
+      raw_raiden_id = (
+          raiden_id._impl if hasattr(raiden_id, "_impl") else raiden_id  # pylint: disable=protected-access
+      )
     self._impl = _impl.KVCacheStore(
         capacity=capacity,
         global_registry_address=global_registry_address,
@@ -260,7 +215,7 @@ class KVCacheStore:
   @property
   def raiden_id(self) -> RaidenId:
     """Returns the RaidenId associated with this store."""
-    return RaidenId(impl=self._impl.raiden_id)
+    return self._impl.raiden_id
 
   @property
   def raiden_controller_address(self) -> str:
@@ -419,7 +374,11 @@ class KVCacheStore:
     raw_dst = (
         None
         if dst_raiden_id is None
-        else dst_raiden_id._impl  # pylint: disable=protected-access
+        else (
+            dst_raiden_id._impl
+            if hasattr(dst_raiden_id, "_impl")
+            else dst_raiden_id
+        )
     )
     return self._impl.save(block_hashes, raw_dst)
 

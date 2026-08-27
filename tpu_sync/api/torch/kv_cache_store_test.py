@@ -224,7 +224,7 @@ class KVCacheStoreTest(absltest.TestCase):
 
     # Case 2: Both local and global have the same hit, but we return local.
     local_id = kv_cache_store._impl.RaidenBlockId(
-        kv_cache_store._impl.RaidenId("local_job", "0", "kv_cache", 1)
+        kv_cache_store.RaidenId("local_job", "0", "kv_cache", 1)
     )
     mock_impl.lookup.return_value = [(b"shared_hash", local_id)]
 
@@ -237,10 +237,10 @@ class KVCacheStoreTest(absltest.TestCase):
 
     # Case 3: No local hit, only global hits.
     remote_id1 = kv_cache_store._impl.RaidenBlockId(
-        kv_cache_store._impl.RaidenId("10.0.0.1:1234", "0", "kv_cache", 42)
+        kv_cache_store.RaidenId("10.0.0.1:1234", "0", "kv_cache", 42)
     )
     remote_id2 = kv_cache_store._impl.RaidenBlockId(
-        kv_cache_store._impl.RaidenId("10.0.0.2:1234", "0", "kv_cache", 43)
+        kv_cache_store.RaidenId("10.0.0.2:1234", "0", "kv_cache", 43)
     )
     mock_impl.lookup.return_value = [
         (b"global_1", remote_id1),

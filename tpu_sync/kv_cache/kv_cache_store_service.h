@@ -98,6 +98,9 @@ class KVCacheStoreServiceImpl
   // to let a commit through after the source has released its pin.
   void PauseDeadlineFiringForTesting();
 
+  // Returns the count of tracked operations in write_ops_. TESTS ONLY.
+  size_t InFlightWriteOpsCountForTesting() const;
+
  private:
   // Withdraws `hash` from the global registry, unless this store still holds it
   // in host DRAM. Fire and forget; the result is not inspected. The residency
@@ -201,6 +204,13 @@ class KVCacheStoreServiceImpl
   // Second half of CompleteWriteRemote, run once the registry has answered.
   void FinishPublish(const std::shared_ptr<WriteOp>& op, uint64_t op_id,
                      absl::Status registered);
+
+  // Funnels all terminal state transitions under write_mutex_. Sets the state,
+  // populates existing / unregistered hashes, and marks blocks_released if kept
+  // by cache. Must BE called with write_mutex_ held.
+  void MarkTerminal(const std::shared_ptr<WriteOp>& op, OpState state,
+                    std::vector<std::string> existing)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(write_mutex_);
 
   // Records an operation's verdict, releases its landing blocks when the cache
   // did not keep them, and settles it. Must NOT be called with write_mutex_

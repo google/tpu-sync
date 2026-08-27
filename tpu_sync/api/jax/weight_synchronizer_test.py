@@ -288,6 +288,33 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     )
     self._run_resharding_test(src_sharding, dst_sharding, (8, 8))
 
+  def test_backend_selection(self):
+    arrs = [
+        jax.device_put(jnp.ones(self.shape, dtype=self.dtype), self.sharding)
+    ]
+    # Default backend (non-FFI)
+    ws_default = WeightSynchronizer(
+        jax_arrays=arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+    )
+    self.assertIsNotNone(ws_default.local_port)
+    self.assertEqual(ws_default.num_layers, 1)
+
+    # Pathways backend (FFI)
+    ws_pathways = WeightSynchronizer(
+        jax_arrays=arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+        backend="pathways",
+    )
+    self.assertIsNotNone(ws_pathways.local_port)
+    self.assertEqual(ws_pathways.num_layers, 1)
+    self.assertIsInstance(ws_pathways.get_metrics(), dict)
+    ws_pathways.d2h()
+    ws_pathways.h2d()
+    ws_pathways.close()
+
 class ShardSortingUtilTest(absltest.TestCase):
 
   def setUp(self):

@@ -26,6 +26,7 @@
 #include "absl/status/status.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "grpcpp/channel.h"
@@ -33,6 +34,7 @@
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
 #include "grpcpp/support/status.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
@@ -971,47 +973,49 @@ TEST_F(GlobalRegistryTest, KVTransferSpecRejectsEmptyTransferGroup) {
   EXPECT_TRUE(absl::IsInvalidArgument(client_->GetKVTransferSpec("").status()));
 }
 
-// RegisterAsync and UnregisterAsync resolve OK and reflect in Lookup
-TEST_F(GlobalRegistryTest, RegisterAsyncAndUnregisterAsyncSucceed) {
-  std::string hash = "async_test_hash_1";
+// A1: RegisterAsync and UnregisterAsync resolve OK and reflect in Lookup
+TEST_F(GlobalRegistryTest, RegisterAsyncResolvesOk) {
+  std::string hash = "async_hash1";
   RaidenId host = {"job1", "replica1", "data1", 0};
-  int32_t block = 42;
+  int32_t block = 10;
 
-  auto reg_future = client_->RegisterAsync({{hash, host, block}});
-  auto reg_status = reg_future.Await();
-  EXPECT_TRUE(reg_status.ok()) << reg_status.ToString();
+  auto future = client_->RegisterAsync({{hash, host, block}});
+  auto status = future.Await();
+  EXPECT_TRUE(status.ok()) << status.ToString();
 
   auto lookup_res = client_->Lookup({hash});
   ASSERT_TRUE(lookup_res.ok()) << lookup_res.status().ToString();
   ASSERT_EQ(lookup_res->size(), 1);
   EXPECT_EQ((*lookup_res)[0].block_id(), block);
-
-  auto unreg_future = client_->UnregisterAsync({hash}, host);
-  auto unreg_status = unreg_future.Await();
-  EXPECT_TRUE(unreg_status.ok()) << unreg_status.ToString();
-
-  auto lookup_after = client_->Lookup({hash});
-  ASSERT_TRUE(lookup_after.ok()) << lookup_after.status().ToString();
-  EXPECT_EQ(lookup_after->size(), 0);
 }
 
-// Asynchronous registration with explicit deadline timeout
-TEST_F(GlobalRegistryTest, RegisterAsyncTimeoutFails) {
-  std::string hash = "timeout_test_hash";
+TEST_F(GlobalRegistryTest, UnregisterAsyncResolvesOk) {
+  std::string hash = "async_hash2";
   RaidenId host = {"job1", "replica1", "data1", 0};
+  int32_t block = 20;
 
-  auto future =
-      client_->RegisterAsync({{hash, host, 1}}, absl::Milliseconds(5000));
+  ASSERT_TRUE(client_->Register({{hash, host, block}}).ok());
+  auto future = client_->UnregisterAsync({hash}, host);
   auto status = future.Await();
   EXPECT_TRUE(status.ok()) << status.ToString();
 
   auto lookup_res = client_->Lookup({hash});
   ASSERT_TRUE(lookup_res.ok()) << lookup_res.status().ToString();
-  ASSERT_EQ(lookup_res->size(), 1);
+  EXPECT_EQ(lookup_res->size(), 0);
 }
 
-// Issue latency of async registration against a stalled registry server
-TEST(GlobalRegistryAsyncTest, AsyncIssueLatencyIsNotBlockedByStalledServer) {
+// FailedPrecondition, not Internal: the sync form's contract, which is now
+// this fold.
+TEST_F(GlobalRegistryTest, RegisterAsyncReportsServerRejection) {
+  std::string empty_hash = "";
+  RaidenId host = {"job1", "replica1", "data1", 0};
+
+  auto future = client_->RegisterAsync({{empty_hash, host, 5}});
+  auto status = future.Await();
+  EXPECT_TRUE(absl::IsFailedPrecondition(status)) << status.ToString();
+}
+
+TEST(GlobalRegistryAsyncTest, AsyncCallDoesNotBlockTheCaller) {
   auto impl = std::make_unique<GlobalRegistryServiceImpl>();
   auto stalling_service =
       std::make_unique<StallingRegistryService>(std::move(impl));
@@ -1020,25 +1024,39 @@ TEST(GlobalRegistryAsyncTest, AsyncIssueLatencyIsNotBlockedByStalledServer) {
 
   auto server =
       CreateTestGlobalRegistryServerWithService(std::move(stalling_service));
-  std::string hash = "stall_latency_hash";
+  std::string hash = "stall_hash";
   RaidenId host = {"job1", "replica1", "data1", 0};
 
-  absl::Time start = absl::Now();
+  // The server sits in Register until ReleaseStall, so a blocking client would
+  // not return for at least kStall. Time the call itself.
+  constexpr absl::Duration kStall = absl::Milliseconds(500);
+  absl::Notification issued;
+  std::thread releaser([&] {
+    issued.WaitForNotification();
+    service_ptr->WaitForStall();
+    absl::SleepFor(kStall);
+    service_ptr->ReleaseStall();
+  });
+
+  absl::Time before = absl::Now();
   auto future = server->client->RegisterAsync({{hash, host, 1}});
-  absl::Duration issue_duration = absl::Now() - start;
+  absl::Duration issue_cost = absl::Now() - before;
+  issued.Notify();
 
-  EXPECT_LT(issue_duration, absl::Milliseconds(50))
-      << "RegisterAsync issue latency was too high: " << issue_duration;
-
-  service_ptr->WaitForStall();
-  service_ptr->ReleaseStall();
+  EXPECT_LT(issue_cost, kStall / 5)
+      << "RegisterAsync blocked for " << issue_cost
+      << ", which is not meaningfully shorter than the " << kStall
+      << " server stall it was supposed to return ahead of";
+  EXPECT_FALSE(future.IsReady());
 
   auto status = future.Await();
   EXPECT_TRUE(status.ok()) << status.ToString();
+  EXPECT_GE(absl::Now() - before, kStall)
+      << "the stall did not actually happen, so this test proved nothing";
+  releaser.join();
 }
 
-// RegisterAsync times out when server stalls past client deadline
-TEST(GlobalRegistryAsyncTest, RegisterAsyncDeadlineExceeded) {
+TEST(GlobalRegistryAsyncTest, AsyncCallHonoursItsDeadline) {
   auto impl = std::make_unique<GlobalRegistryServiceImpl>();
   auto stalling_service =
       std::make_unique<StallingRegistryService>(std::move(impl));
@@ -1047,7 +1065,7 @@ TEST(GlobalRegistryAsyncTest, RegisterAsyncDeadlineExceeded) {
 
   auto server =
       CreateTestGlobalRegistryServerWithService(std::move(stalling_service));
-  std::string hash = "stall_timeout_hash";
+  std::string hash = "deadline_hash";
   RaidenId host = {"job1", "replica1", "data1", 0};
 
   auto future = server->client->RegisterAsync({{hash, host, 1}},
@@ -1060,7 +1078,8 @@ TEST(GlobalRegistryAsyncTest, RegisterAsyncDeadlineExceeded) {
   service_ptr->ReleaseStall();
 }
 
-// In-flight async registration completes even if GlobalRegistryClient is destroyed
+// The callback captures the stub, so the channel outlives the client that
+// opened it.
 TEST_F(GlobalRegistryTest, AsyncSurvivesClientDestruction) {
   std::string hash = "survive_client_destruction_hash";
   RaidenId host = {"job1", "replica1", "data1", 0};
@@ -1087,7 +1106,7 @@ TEST_F(GlobalRegistryTest, AsyncSurvivesClientDestruction) {
   EXPECT_EQ((*lookup_res)[0].block_id(), block);
 }
 
-// RegisterAsync with ZeroDuration sets immediate deadline and fails
+// Zero means "already expired" here, unlike the ttl parameters beside it.
 TEST_F(GlobalRegistryTest, RegisterAsyncZeroTimeout) {
   std::string hash = "zero_timeout_hash";
   RaidenId host = {"job1", "replica1", "data1", 0};
@@ -1134,7 +1153,7 @@ TEST_F(GlobalRegistryTest, UnregisterAsyncZeroTimeout) {
   EXPECT_EQ(lookup_res->size(), 1);
 }
 
-// Concurrent async registrations from many threads succeed
+// Catches non-atomic stub access and any per-call state that is not per-call.
 TEST_F(GlobalRegistryTest, ConcurrentAsyncRegistersFromManyThreads) {
   constexpr int kNumThreads = 8;
   constexpr int kEntriesPerThread = 10;
@@ -1171,7 +1190,7 @@ TEST_F(GlobalRegistryTest, ConcurrentAsyncRegistersFromManyThreads) {
   }
 }
 
-// Dropped future still executes on the server
+// tsl::Future has no cancellation: dropping one must not drop the RPC.
 TEST_F(GlobalRegistryTest, DroppedFutureStillReachesTheServer) {
   std::string hash = "dropped_future_hash";
   RaidenId host = {"job1", "replica1", "data1", 0};
@@ -1194,7 +1213,8 @@ TEST_F(GlobalRegistryTest, DroppedFutureStillReachesTheServer) {
   EXPECT_TRUE(found) << "Dropped future registration never appeared in registry";
 }
 
-// RegisterAsync with empty batch and multi-entry batch
+// A one-entry batch cannot catch a half-built request; an empty one must
+// resolve rather than hang.
 TEST_F(GlobalRegistryTest, RegisterAsyncBatchAndEmptyBatch) {
   // Empty batch
   auto empty_future = client_->RegisterAsync({});
@@ -1221,37 +1241,6 @@ TEST_F(GlobalRegistryTest, RegisterAsyncBatchAndEmptyBatch) {
   for (int i = 0; i < kBatchSize; ++i) {
     EXPECT_EQ((*lookup_res)[i].block_id(), i);
   }
-}
-
-// Cancelled Register call does not mutate the registry
-TEST(GlobalRegistryAsyncTest, CancelledRegisterDoesNotMutateTheRegistry) {
-  auto impl = std::make_unique<GlobalRegistryServiceImpl>();
-  auto stalling_service =
-      std::make_unique<StallingRegistryService>(std::move(impl));
-  auto* service_ptr = stalling_service.get();
-  service_ptr->EnableStall();
-  service_ptr->SetWaitForCancellation(true);
-
-  auto server =
-      CreateTestGlobalRegistryServerWithService(std::move(stalling_service));
-  std::string hash = "cancelled_reg_hash";
-  RaidenId host = {"job1", "replica1", "data1", 0};
-
-  RegistryCall call;
-  auto future = server->client->RegisterAsync({{hash, host, 42}},
-                                              absl::InfiniteDuration(), &call);
-  service_ptr->WaitForStall();
-
-  call.TryCancel();
-  service_ptr->ReleaseStall();
-
-  auto status = future.Await();
-  EXPECT_FALSE(status.ok());
-
-  // Verify that the entry was not added to the registry
-  auto lookup_res = server->client->Lookup({hash});
-  ASSERT_TRUE(lookup_res.ok()) << lookup_res.status().ToString();
-  EXPECT_EQ(lookup_res->size(), 0);
 }
 
 }  // namespace

@@ -15,8 +15,6 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_KV_CACHE_GLOBAL_REGISTRY_GLOBAL_REGISTRY_CLIENT_H_
 #define THIRD_PARTY_TPU_RAIDEN_KV_CACHE_GLOBAL_REGISTRY_GLOBAL_REGISTRY_CLIENT_H_
 
-#include <grpcpp/grpcpp.h>
-
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -27,7 +25,6 @@
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "grpcpp/channel.h"
-#include "grpcpp/client_context.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
@@ -39,23 +36,10 @@ namespace global_registry {
 
 using namespace ::tpu_raiden::kv_cache::global_registry;  // NOLINT
 
-class GlobalRegistryClient;
-
-// Cancels one in-flight registry call. TryCancel is safe from any thread, never
-// blocks, and is a no-op once the call has completed. Holds the context weakly,
-// so a handle kept after completion does not keep the call's state alive.
-class RegistryCall {
- public:
-  void TryCancel() {
-    if (auto ctx = context_.lock()) {
-      ctx->TryCancel();
-    }
-  }
-
- private:
-  friend class GlobalRegistryClient;
-  std::weak_ptr<grpc::ClientContext> context_;
-};
+// Deadline for a registry mutation nobody waits on. Finite so that an
+// unanswered call cannot run its continuation after main() has returned, and
+// so a stalled write-through gives its pins back.
+inline constexpr absl::Duration kUnwaitedMutationTimeout = absl::Seconds(30);
 
 struct Registration {
   std::string prefix_hash;
@@ -72,24 +56,25 @@ class GlobalRegistryClient {
   // resolves on a gRPC callback thread with OkStatus, FailedPrecondition when
   // the server rejected the batch, or Internal when the RPC itself failed.
   //
-  // `timeout` bounds the call as a gRPC deadline. Beware that zero does NOT
-  // mean the same thing here as it does for `Registration::ttl` and
-  // `RegisterStore`'s ttl, where zero means "never expires": a `timeout` of
-  // zero or less is already expired, and the returned future resolves
-  // DeadlineExceeded without the RPC ever being dispatched. That case is
-  // decided here rather than left to gRPC, whose behaviour for a deadline of
-  // exactly "now" is a race against the round trip -- on loopback the call
-  // usually wins. "No deadline" is `absl::InfiniteDuration()`, the default.
+  // `timeout` is a gRPC deadline; `absl::InfiniteDuration()` (the default) is
+  // none. Zero or less means "already expired" and resolves DeadlineExceeded
+  // without dispatching -- unlike `Registration::ttl` and `RegisterStore`'s
+  // ttl, where zero means "never". Decided here because a gRPC deadline of
+  // exactly "now" races the round trip.
   //
-  // `out_call`, when non-null, receives a handle for cancelling this call.
-  // The common caller passes nothing.
+  // NOT ORDERED, even against a call on the same block hash: the registry
+  // keeps whichever landed last. A withdraw that overtakes its publish leaves
+  // an entry this node cannot back -- a peer pays one refused fetch, and this
+  // node's own lookups truncate there. Accepted, rather than pay for a
+  // per-hash barrier on every batch.
   tsl::Future<> RegisterAsync(
       const std::vector<Registration>& registrations,
-      absl::Duration timeout = absl::InfiniteDuration(),
-      RegistryCall* out_call = nullptr);
+      absl::Duration timeout = absl::InfiniteDuration());
 
   // Registers a batch of KV cache entries.
-  absl::Status Register(const std::vector<Registration>& registrations);
+  absl::Status Register(
+      const std::vector<Registration>& registrations,
+      absl::Duration timeout = absl::InfiniteDuration());
 
   // Looks up KV cache entries for a batch of prefix hashes.
   // The lookup processes prefix hashes sequentially and stops at the first miss
@@ -104,16 +89,17 @@ class GlobalRegistryClient {
 
   // Unregisters a batch of KV cache entries for a raiden id asynchronously.
   // See RegisterAsync for what the future resolves to, and for the meaning of
-  // `timeout` (zero is "expire now", not "never") and `out_call`.
+  // `timeout` (zero is "expire now", not "never").
   tsl::Future<> UnregisterAsync(
       const std::vector<std::string>& prefix_hashes,
       const RaidenId& raiden_id,
-      absl::Duration timeout = absl::InfiniteDuration(),
-      RegistryCall* out_call = nullptr);
+      absl::Duration timeout = absl::InfiniteDuration());
 
   // Unregisters a batch of KV cache entries for a raiden id.
-  absl::Status Unregister(const std::vector<std::string>& prefix_hashes,
-                          const RaidenId& raiden_id);
+  absl::Status Unregister(
+      const std::vector<std::string>& prefix_hashes,
+      const RaidenId& raiden_id,
+      absl::Duration timeout = absl::InfiniteDuration());
 
   // A single active registration returned by PullOwned.
   struct PulledEntry {

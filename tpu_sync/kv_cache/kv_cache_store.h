@@ -36,7 +36,6 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
-#include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
@@ -764,12 +763,44 @@ class KVCacheStore {
   absl::flat_hash_set<std::string> reading_hashes_ ABSL_GUARDED_BY(mutex_);
 
   std::unique_ptr<std::thread> poller_thread_;
-  std::unique_ptr<tpu_raiden::NumaThreadPool> write_through_pool_;
   std::atomic<bool> stop_poller_{false};
+
+  // Blocks pinned by write-throughs still waiting on the registry. Bounded,
+  // because a pinned block is invisible to eviction: a registry that connects
+  // and never answers would otherwise pin the host block pool dry. Past the
+  // bound the advertisement is dropped and the pins released -- invisible to
+  // peers is recoverable, unevictable is not.
+  //
+  // The calls are not tracked; teardown's UnregisterStore purges what this
+  // raiden id owns.
+  struct WriteThroughState {
+    absl::Mutex mutex;
+    size_t in_flight_blocks ABSL_GUARDED_BY(mutex) = 0;
+    size_t max_in_flight_blocks ABSL_GUARDED_BY(mutex) =
+        kDefaultMaxInFlightWriteThroughBlocks;
+  };
+  std::shared_ptr<WriteThroughState> wt_state_ =
+      std::make_shared<WriteThroughState>();
+  static constexpr size_t kDefaultMaxInFlightWriteThroughBlocks = 4096;
 
   absl::StatusOr<std::vector<int>> AllocateBlockIds(int needed);
   void DeallocateBlockIds(absl::Span<const int> block_ids);
 
+ public:
+  // Lowers the outstanding-write-through bound so a test can reach it without
+  // saving thousands of blocks.
+  void SetMaxInFlightWriteThroughBlocksForTesting(size_t max_blocks) {
+    absl::MutexLock lock(wt_state_->mutex);
+    wt_state_->max_in_flight_blocks = max_blocks;
+  }
+
+  // Blocks currently held by write-throughs waiting on the registry.
+  size_t InFlightWriteThroughBlocksForTesting() const {
+    absl::MutexLock lock(wt_state_->mutex);
+    return wt_state_->in_flight_blocks;
+  }
+
+ private:
   // The two halves of Save(), split by destination. Save() validates nothing
   // itself -- each half has its own residency and pin preconditions, and they
   // are genuinely different operations sharing a name and a status queue.

@@ -200,6 +200,96 @@ TEST_F(GlobalRegistryTest, MultiRegistrationAndRoundRobinLookup) {
             host1.job_replica_id);
 }
 
+TEST_F(GlobalRegistryTest, LookupDoesNotNameTheCallerToItself) {
+  const std::string hash = "hash1";
+  const RaidenId caller = {"job1", "replica1", "data1", 0};
+
+  ASSERT_TRUE(client_->Register({{hash, caller, 42}}).ok());
+
+  // Caller is skipped and its stale registration is deleted.
+  auto self = client_->Lookup({hash}, caller);
+  ASSERT_TRUE(self.ok()) << self.status().ToString();
+  EXPECT_TRUE(self->empty());
+
+  // Since caller was the only holder, the registry entry was purged.
+  const RaidenId peer = {"job1", "replica2", "data1", 1};
+  auto from_peer = client_->Lookup({hash}, peer);
+  ASSERT_TRUE(from_peer.ok()) << from_peer.status().ToString();
+  EXPECT_TRUE(from_peer->empty());
+}
+
+TEST_F(GlobalRegistryTest, LookupPrunesExpiredEntriesEagerly) {
+  const std::string hash = "expired_lookup_hash";
+  const RaidenId host = {"job1", "replica1", "data1", 0};
+
+  ASSERT_TRUE(client_->Register({{hash, host, 42, absl::Seconds(1)}}).ok());
+  absl::SleepFor(absl::Seconds(2));
+
+  auto res = client_->Lookup({hash});
+  ASSERT_TRUE(res.ok()) << res.status().ToString();
+  EXPECT_TRUE(res->empty());
+}
+
+TEST_F(GlobalRegistryTest, LookupOffersAnotherHolderWhenTheCallerIsOne) {
+  const std::string hash1 = "hash1";
+  const std::string hash2 = "hash2";
+  const RaidenId caller = {"job1", "replica1", "data1", 0};
+  const RaidenId peer = {"job1", "replica2", "data1", 1};
+
+  ASSERT_TRUE(client_
+                  ->Register({{hash1, caller, 42},
+                              {hash1, peer, 43},
+                              {hash2, peer, 44}})
+                  .ok());
+
+  // Skipping caller on hash1 offers peer instead, continuing the prefix walk.
+  auto res = client_->Lookup({hash1, hash2}, caller);
+  ASSERT_TRUE(res.ok()) << res.status().ToString();
+  ASSERT_EQ(res->size(), 2);
+  EXPECT_EQ((*res)[0].raiden_id().job_replica_id(), peer.job_replica_id);
+  EXPECT_EQ((*res)[0].block_id(), 43);
+  EXPECT_EQ((*res)[1].raiden_id().job_replica_id(), peer.job_replica_id);
+  EXPECT_EQ((*res)[1].block_id(), 44);
+}
+
+TEST_F(GlobalRegistryTest, LookupRoundRobinsOverTheHoldersLeftAfterTheSkip) {
+  const std::string hash = "hash1";
+  const RaidenId caller = {"job1", "replica1", "data1", 0};
+  const RaidenId peer_a = {"job1", "replica2", "data1", 1};
+  const RaidenId peer_b = {"job1", "replica3", "data1", 2};
+
+  ASSERT_TRUE(client_
+                  ->Register({{hash, caller, 42},
+                              {hash, peer_a, 43},
+                              {hash, peer_b, 44}})
+                  .ok());
+
+  // Round-robin cycles through remaining peers.
+  auto first = client_->Lookup({hash}, caller);
+  ASSERT_TRUE(first.ok()) << first.status().ToString();
+  ASSERT_EQ(first->size(), 1);
+  EXPECT_EQ((*first)[0].raiden_id().job_replica_id(), peer_a.job_replica_id);
+
+  auto second = client_->Lookup({hash}, caller);
+  ASSERT_TRUE(second.ok()) << second.status().ToString();
+  ASSERT_EQ(second->size(), 1);
+  EXPECT_EQ((*second)[0].raiden_id().job_replica_id(), peer_b.job_replica_id);
+}
+
+TEST_F(GlobalRegistryTest, LookupWithoutACallerIdIsUnfiltered) {
+  const std::string hash = "hash1";
+  const RaidenId host = {"job1", "replica1", "data1", 0};
+
+  ASSERT_TRUE(client_->Register({{hash, host, 42}}).ok());
+
+  // Unfiltered when caller is unset.
+  auto res = client_->Lookup({hash});
+  ASSERT_TRUE(res.ok()) << res.status().ToString();
+  ASSERT_EQ(res->size(), 1);
+  EXPECT_EQ((*res)[0].raiden_id().job_replica_id(), host.job_replica_id);
+  EXPECT_EQ((*res)[0].block_id(), 42);
+}
+
 TEST_F(GlobalRegistryTest, OverwriteRegistrationSameHost) {
   std::string hash = "hash1";
   RaidenId host = {"job1", "replica1", "data1", 0};

@@ -132,11 +132,15 @@ absl::Status GlobalRegistryClient::Register(
 }
 
 absl::StatusOr<std::vector<KVBlockMetadata>> GlobalRegistryClient::Lookup(
-    const std::vector<std::string>& prefix_hashes) {
+    const std::vector<std::string>& prefix_hashes,
+    const RaidenId& client_raiden_id) {
   LookupRequest request;
   request.mutable_prefix_hashes()->Reserve(prefix_hashes.size());
   for (const auto& hash : prefix_hashes) {
     request.add_prefix_hashes(hash);
+  }
+  if (!client_raiden_id.empty()) {
+    ToProto(client_raiden_id, request.mutable_client_raiden_id());
   }
 
   LookupResponse response;

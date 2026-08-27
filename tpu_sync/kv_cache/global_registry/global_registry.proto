@@ -151,6 +151,10 @@ message LookupRequest {
   // first miss.
   // `bytes` for the reason given on RegisterEntry.prefix_hash.
   repeated bytes prefix_hashes = 1;
+
+  // Optional. If set, the server skips this caller and offers other holders
+  // for the same hash instead of returning the caller to itself.
+  tpu_sync.rpc.RaidenIdProto client_raiden_id = 2;
 }
 
 message LookupResponse {

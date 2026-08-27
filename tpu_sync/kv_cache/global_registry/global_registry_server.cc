@@ -163,6 +163,9 @@ grpc::Status GlobalRegistryServiceImpl::Register(grpc::ServerContext* context,
 grpc::Status GlobalRegistryServiceImpl::Lookup(grpc::ServerContext* context,
                                                const LookupRequest* request,
                                                LookupResponse* response) {
+  const RaidenId caller = FromProto(request->client_raiden_id());
+  const bool filter_caller = !caller.empty();
+
   absl::MutexLock lock(mutex_);
   absl::Time now = absl::Now();
 
@@ -172,23 +175,31 @@ grpc::Status GlobalRegistryServiceImpl::Lookup(grpc::ServerContext* context,
       break;
     }
 
-    const auto& entries = it->second;
-    std::vector<RegistryEntry> valid_entries;
-    valid_entries.reserve(entries.size());
+    auto& entries = it->second;
     for (const auto& entry : entries) {
-      if (entry.expire_time > now) {
-        valid_entries.push_back(entry);
+      if (entry.expire_time <= now ||
+          (filter_caller && entry.raiden_id == caller)) {
+        EraseFromOwnerIndex(entry.raiden_id, hash);
       }
     }
+    entries.erase(
+        std::remove_if(entries.begin(), entries.end(),
+                       [now, filter_caller, &caller](const RegistryEntry& entry) {
+                         return entry.expire_time <= now ||
+                                (filter_caller && entry.raiden_id == caller);
+                       }),
+        entries.end());
 
-    if (valid_entries.empty()) {
+    if (entries.empty()) {
+      registry_.erase(it);
+      round_robin_indices_.erase(hash);
       break;
     }
 
     // Round-robin selection
     size_t& idx = round_robin_indices_[hash];
-    idx = idx % valid_entries.size();
-    const auto& picked = valid_entries[idx];
+    idx = idx % entries.size();
+    const auto& picked = entries[idx];
     idx++;  // Increment for next lookup
 
     auto* meta = response->add_results();

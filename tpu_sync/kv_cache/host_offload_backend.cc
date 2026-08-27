@@ -216,7 +216,7 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
   // at the first one.
   std::vector<global_registry::KVBlockMetadata> remote_hits;
   if (!missing_hashes.empty() && options.enable_global && client != nullptr) {
-    auto global_res_or = client->Lookup(missing_hashes);
+    auto global_res_or = client->Lookup(missing_hashes, local_id);
     if (global_res_or.ok()) {
       remote_hits = std::move(global_res_or).value();
     } else {
@@ -263,9 +263,7 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
           .data_replica_idx = proto_id.data_replica_idx(),
       };
       if (remote_id == local_id) {
-        // The registry claims this block lives on this node, but it wasn't
-        // present during our sweep (or was evicted since). Returning this as
-        // an unverified HOST hit is unsafe, so this is a miss.
+        // Unverified HOST hit from a registry that did not filter the caller.
         break;
       }
       results.emplace_back(

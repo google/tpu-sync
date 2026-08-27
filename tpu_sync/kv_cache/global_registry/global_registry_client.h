@@ -81,11 +81,11 @@ class GlobalRegistryClient {
   // (a hash with no active registrations). All subsequent prefix hashes in the
   // input vector are treated as misses and are omitted from the response.
   // The returned vector is aligned in order with the input `prefix_hashes` (the
-  // i-th element of the returned vector corresponds to the i-th input hash).
-  // The size of the returned vector will be equal to the number of sequential
-  // hits before the first miss.
+  // If `client_raiden_id` is set, the server excludes it when returning
+  // holders.
   absl::StatusOr<std::vector<KVBlockMetadata>> Lookup(
-      const std::vector<std::string>& prefix_hashes);
+      const std::vector<std::string>& prefix_hashes,
+      const RaidenId& client_raiden_id = {});
 
   // Unregisters a batch of KV cache entries for a raiden id asynchronously.
   // See RegisterAsync for what the future resolves to, and for the meaning of

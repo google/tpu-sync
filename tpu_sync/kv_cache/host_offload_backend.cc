@@ -968,10 +968,27 @@ tsl::Future<> HostOffloadBackend::RegisterBlocksAsync(
   return client->RegisterAsync(registrations);
 }
 
-absl::Status HostOffloadBackend::RegisterBlocksSync(
-    absl::Span<const std::string> block_hashes,
-    absl::Span<const int32_t> host_block_ids) {
-  return RegisterBlocksAsync(block_hashes, host_block_ids).Await();
+tsl::Future<> HostOffloadBackend::UnregisterBlocksAsync(
+    absl::Span<const std::string> block_hashes) {
+  if (block_hashes.empty()) {
+    return tsl::Future<>(absl::OkStatus());
+  }
+  std::shared_ptr<global_registry::GlobalRegistryClient> client;
+  RaidenId local_id;
+  {
+    absl::MutexLock lock(mutex_);
+    client = registry_client_;
+    local_id = raiden_id_;
+  }
+  if (client == nullptr) {
+    // Nothing was ever advertised, so there is nothing to take back. Success.
+    return tsl::Future<>(absl::OkStatus());
+  }
+  // Scoped to this store's own id, so a mistake here can only reach entries
+  // this store published.
+  return client->UnregisterAsync(
+      std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
+      local_id, global_registry::kUnwaitedMutationTimeout);
 }
 
 tsl::Future<> HostOffloadBackend::Load(

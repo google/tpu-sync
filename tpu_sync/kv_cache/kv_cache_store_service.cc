@@ -204,6 +204,20 @@ void KVCacheStoreServiceImpl::SetTransferFnForTesting(TransferFn transfer_fn) {
   transfer_fn_override_ = std::move(transfer_fn);
 }
 
+void KVCacheStoreServiceImpl::WithdrawEntryIfUnbacked(const std::string& hash) {
+  if (backend_ == nullptr) {
+    return;
+  }
+  // A lookup miss does not mean the block is gone: the lookup cannot see an
+  // eviction candidate, and a candidate still holds its host block. So probe
+  // with AlreadyPresentHostResident, which does see candidates, and leave the
+  // entry alone if one is what the lookup missed.
+  if (!backend_->AlreadyPresentHostResident({hash}).empty()) {
+    return;
+  }
+  backend_->UnregisterBlocksAsync({hash}).OnReady([](absl::Status) {});
+}
+
 ::grpc::Status KVCacheStoreServiceImpl::Fetch(
     ::grpc::ServerContext* context,
     const ::tpu_raiden::kv_cache::proto::FetchRequest* request,
@@ -229,36 +243,10 @@ void KVCacheStoreServiceImpl::SetTransferFnForTesting(TransferFn transfer_fn) {
   }
 
   // =========================================================================
-  // STEP 1: Validation
-  // Validate block_hashes exist in local index and reside in host memory.
+  // STEP 1: Request validation
+  // Answerable from the request alone, so it runs before anything is matched
+  // or pinned -- a refusal here then has nothing to give back.
   // =========================================================================
-  auto lookup_or = backend_->Lookup(block_hashes);
-  if (!lookup_or.ok()) {
-    return ::grpc::Status(
-        ::grpc::StatusCode::NOT_FOUND,
-        absl::StrCat("Validation failed: ", lookup_or.status().message()));
-  }
-  const auto& lookup_slices = lookup_or.value();
-  if (lookup_slices.size() < block_hashes.size()) {
-    return ::grpc::Status(
-        ::grpc::StatusCode::NOT_FOUND,
-        absl::StrCat("Partial block match: found ", lookup_slices.size(),
-                     " out of ", block_hashes.size()));
-  }
-
-  std::vector<int32_t> src_host_block_ids;
-  src_host_block_ids.reserve(lookup_slices.size());
-  for (const auto& [hash, slice] : lookup_slices) {
-    if (slice.status != BlockStatus::HOST &&
-        slice.status != BlockStatus::HOST_AND_HBM) {
-      return ::grpc::Status(
-          ::grpc::StatusCode::FAILED_PRECONDITION,
-          absl::StrCat("Block hash '", hash, "' is not resident in host DRAM"));
-    }
-    src_host_block_ids.push_back(slice.host_block_id);
-  }
-
-  // Cross-node validation: require worker endpoints if request is from peer controller.
   RaidenId client_id{
       request->client_raiden_id().job_name(),
       request->client_raiden_id().job_replica_id(),
@@ -279,25 +267,58 @@ void KVCacheStoreServiceImpl::SetTransferFnForTesting(TransferFn transfer_fn) {
   }
 
   // =========================================================================
-  // STEP 2: Pinning
-  // Protect source host blocks against LRU eviction during DMA transfer.
+  // STEP 2: Match the blocks and pin them, in one step
+  // Validate block_hashes exist in local index and reside in host memory.
   // =========================================================================
-  if (!backend_->Pin(block_hashes)) {
-    return ::grpc::Status(::grpc::StatusCode::RESOURCE_EXHAUSTED,
-                          "Failed to pin host blocks; blocks may be locked or "
-                          "undergoing eviction.");
+  //
+  // pin_found, so that the pin is taken under the same lock that matched the
+  // entry. Matching first and pinning afterwards leaves a window in which the
+  // block can be evicted, and the host block ids read out of the match then
+  // name blocks that have gone back to the pool and been refilled with
+  // unrelated bytes.
+  LookupOptions options;
+  options.enable_global = false;
+  options.pin_found = true;
+  auto lookup_or = backend_->Lookup(block_hashes, options);
+  if (!lookup_or.ok()) {
+    return ::grpc::Status(
+        ::grpc::StatusCode::NOT_FOUND,
+        absl::StrCat("Validation failed: ", lookup_or.status().message()));
+  }
+  const auto& lookup_slices = lookup_or.value();
+
+  // The lookup pinned everything it returned. Release that on every exit,
+  // including the refusals below.
+  std::vector<std::string> pinned;
+  pinned.reserve(lookup_slices.size());
+  for (const auto& entry : lookup_slices) {
+    pinned.push_back(entry.first);
+  }
+  auto unpin_cleanup =
+      absl::MakeCleanup([this, &pinned]() { backend_->Release(pinned); });
+
+  if (lookup_slices.size() < block_hashes.size()) {
+    WithdrawEntryIfUnbacked(block_hashes[lookup_slices.size()]);
+    return ::grpc::Status(
+        ::grpc::StatusCode::NOT_FOUND,
+        absl::StrCat("Partial block match: found ", lookup_slices.size(),
+                     " out of ", block_hashes.size()));
+  }
+
+  std::vector<int32_t> src_host_block_ids;
+  src_host_block_ids.reserve(lookup_slices.size());
+  for (const auto& [hash, slice] : lookup_slices) {
+    if (slice.status != BlockStatus::HOST &&
+        slice.status != BlockStatus::HOST_AND_HBM) {
+      return ::grpc::Status(
+          ::grpc::StatusCode::FAILED_PRECONDITION,
+          absl::StrCat("Block hash '", hash, "' is not resident in host DRAM"));
+    }
+    src_host_block_ids.push_back(slice.host_block_id);
   }
 
   // =========================================================================
-  // STEP 3: Unpinning Guarantee (RAII / absl::Cleanup)
-  // Ensure unpinning ALWAYS executes when exiting this scope, even on error
-  // or RPC cancellation.
-  // =========================================================================
-  auto unpin_cleanup = absl::MakeCleanup(
-      [this, &block_hashes]() { backend_->Release(block_hashes); });
-
-  // =========================================================================
-  // STEP 4: Transfer Execution
+  // STEP 3: Transfer Execution
   // Transfer data from local source host DRAM directly to destination host DRAM
   // using RaidenController::TransferBuffers with Buffer structs.
   // =========================================================================

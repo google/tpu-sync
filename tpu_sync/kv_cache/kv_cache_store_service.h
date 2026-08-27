@@ -99,6 +99,13 @@ class KVCacheStoreServiceImpl
   void PauseDeadlineFiringForTesting();
 
  private:
+  // Withdraws `hash` from the global registry, unless this store still holds it
+  // in host DRAM. Fire and forget; the result is not inspected. The residency
+  // check costs one index probe and counts an eviction candidate as held,
+  // since a candidate still has its host block and a local access promotes it
+  // back.
+  void WithdrawEntryIfUnbacked(const std::string& hash);
+
   // A transfer-completion callback and the deadline thread both outlive the
   // call that started them, so neither may capture `this`. Both hold `mu` for
   // as long as they touch the service; the destructor clears `svc` under `mu`,

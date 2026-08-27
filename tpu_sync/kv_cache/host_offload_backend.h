@@ -139,9 +139,8 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       absl::Span<const std::string> block_hashes,
       absl::Span<const int32_t> host_block_ids) override;
 
-  absl::Status RegisterBlocksSync(
-      absl::Span<const std::string> block_hashes,
-      absl::Span<const int32_t> host_block_ids) override;
+  tsl::Future<> UnregisterBlocksAsync(
+      absl::Span<const std::string> block_hashes) override;
 
   // --- Remote write, source side ------------------------------------------
   //

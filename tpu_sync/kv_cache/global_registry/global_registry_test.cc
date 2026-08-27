@@ -242,7 +242,9 @@ TEST_F(GlobalRegistryTest, LookupOffersAnotherHolderWhenTheCallerIsOne) {
                               {hash2, peer, 44}})
                   .ok());
 
-  // Skipping caller on hash1 offers peer instead, continuing the prefix walk.
+  // Both positions must come back, and hash1's must name the peer. Naming the
+  // caller there would be an answer it cannot use, and its own walk stops at a
+  // hash it is told it holds -- so hash2 would be lost with it.
   auto res = client_->Lookup({hash1, hash2}, caller);
   ASSERT_TRUE(res.ok()) << res.status().ToString();
   ASSERT_EQ(res->size(), 2);

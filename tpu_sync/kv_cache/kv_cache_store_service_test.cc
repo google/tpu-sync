@@ -54,6 +54,7 @@ namespace kv_cache {
 namespace {
 
 using ::absl_testing::StatusIs;
+using ::testing::Contains;
 using ::testing::UnorderedElementsAre;
 
 class KVCacheStoreServiceTest : public ::testing::Test {
@@ -254,6 +255,61 @@ TEST_F(KVCacheStoreServiceTest, FetchValidationFailsForNonHostBlock) {
   auto response_or = future.Await();
   EXPECT_THAT(response_or.status(),
               StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+// A short answer still pins the prefix it did match, and the refusal has to
+// hand those pins back -- otherwise a peer asking for one hash this store does
+// not have makes every hash in front of it permanently unevictable.
+TEST_F(KVCacheStoreServiceTest, ARefusedFetchLeavesNoPinBehind) {
+  // Insert pins what it takes, so the fixture's blocks start out pinned. What
+  // must hold is that the fetch returns whatever it took, not that the count
+  // reaches zero.
+  const int before = store_->backend()->GetPinCount("block_hash_1");
+
+  std::vector<std::string> hashes = {"block_hash_1", "no_such_hash"};
+  std::vector<int32_t> host_block_ids = {100, 101};
+
+  auto response_or =
+      client_->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids).Await();
+  EXPECT_THAT(response_or.status(), StatusIs(absl::StatusCode::kNotFound));
+
+  EXPECT_EQ(store_->backend()->GetPinCount("block_hash_1"), before);
+}
+
+// The other half: a refusal must not hand back a pin it never took. The miss
+// ends the answer, so the hash BEHIND it was swept and unpinned by the lookup
+// itself and is not this call's to release. Releasing the whole request would
+// drop somebody else's pin -- and a block whose pin count reaches zero can be
+// reclaimed while their transfer is still reading it.
+TEST_F(KVCacheStoreServiceTest, ARefusedFetchDoesNotReleaseAPinItDidNotTake) {
+  const int before = store_->backend()->GetPinCount("block_hash_1");
+
+  std::vector<std::string> hashes = {"block_hash_2", "no_such_hash",
+                                     "block_hash_1"};
+  std::vector<int32_t> host_block_ids = {100, 101, 102};
+
+  auto response_or =
+      client_->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids).Await();
+  EXPECT_THAT(response_or.status(), StatusIs(absl::StatusCode::kNotFound));
+
+  EXPECT_EQ(store_->backend()->GetPinCount("block_hash_1"), before);
+}
+
+// The same guarantee on the path that succeeds: the pin lasts exactly as long
+// as the transfer reading the block.
+TEST_F(KVCacheStoreServiceTest, ACompletedFetchLeavesNoPinBehind) {
+  const int before_1 = store_->backend()->GetPinCount("block_hash_1");
+  const int before_2 = store_->backend()->GetPinCount("block_hash_2");
+
+  std::vector<std::string> hashes = {"block_hash_1", "block_hash_2"};
+  std::vector<int32_t> host_block_ids = {100, 101};
+
+  auto response_or =
+      client_->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids).Await();
+  ASSERT_OK(response_or.status());
+
+  EXPECT_EQ(store_->backend()->GetPinCount("block_hash_1"), before_1);
+  EXPECT_EQ(store_->backend()->GetPinCount("block_hash_2"), before_2);
 }
 
 TEST_F(KVCacheStoreServiceTest, FetchMismatchedHostBlockCount) {
@@ -540,7 +596,7 @@ class WriteRemoteTest : public ::testing::Test {
 
   void SetUp() override {
     dst_id_ = RaidenId{"dst_job", "0", "dst_data", 0};
-    // No registry: RegisterBlocksSync then succeeds trivially, which keeps
+    // No registry: RegisterBlocksAsync then succeeds trivially, which keeps
     // these cases about the state machine rather than about publication.
     store_ = std::make_unique<KVCacheStore>(
         /*capacity=*/kCapacity, /*global_registry_address=*/"", dst_id_,
@@ -1130,6 +1186,331 @@ TEST_F(WriteRemoteTest, TeardownWithAnOutstandingTransferIsBoundedAndSafe) {
   // touch the object that was just destroyed.
   latch_.Release(absl::OkStatus());
   absl::SleepFor(absl::Milliseconds(100));
+}
+
+// A registry that counts the Unregisters it receives. Lets a test that must
+// show NO withdraw was sent fail the moment one arrives, instead of sleeping a
+// fixed time and passing on any machine where the round trip is slower.
+struct CountingRegistry {
+  std::unique_ptr<global_registry::TestGlobalRegistryServer> server;
+  global_registry::StallingRegistryService* service = nullptr;
+};
+
+CountingRegistry MakeCountingRegistry() {
+  auto impl = std::make_unique<global_registry::GlobalRegistryServiceImpl>();
+  auto stalling = std::make_unique<global_registry::StallingRegistryService>(
+      std::move(impl));
+  auto* raw = stalling.get();
+  auto server = global_registry::CreateTestGlobalRegistryServerWithService(
+      std::move(stalling));
+  return CountingRegistry{std::move(server), raw};
+}
+
+void ExpectNoWithdrawWithin(global_registry::StallingRegistryService* registry,
+                            absl::Duration budget) {
+  const absl::Time give_up = absl::Now() + budget;
+  while (absl::Now() < give_up) {
+    ASSERT_EQ(registry->unregister_calls(), 0)
+        << "the refusal withdrew an entry it was supposed to keep";
+    absl::SleepFor(absl::Milliseconds(20));
+  }
+}
+
+// A refused fetch is the first place in the deployment where an entry that has
+// outlived its block becomes visible: the peer only knocked because the global
+// registry sent it here, and residency is this store's own state. So the
+// refusal takes the entry back -- but only the entries it really cannot back.
+TEST(FetchWithdrawTest, ARefusedFetchWithdrawsOnlyTheEntriesItCannotBack) {
+  auto registry_server = global_registry::CreateTestGlobalRegistryServer();
+  auto* registry = registry_server->client.get();
+
+  const RaidenId src_id{"src_job_withdraw", "0", "src_data", 0};
+  KVCacheStore store(/*capacity=*/8, registry_server->server_address, src_id,
+                     /*num_shards=*/1, /*shard_size_bytes=*/1024,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  // Two blocks this store really holds...
+  ASSERT_OK(store.Insert({"held_a", "held_b"},
+                         {RaidenBlockId(src_id, 10, BlockStatus::HOST),
+                          RaidenBlockId(src_id, 11, BlockStatus::HOST)},
+                         /*on_host=*/true));
+  // ...and three entries advertising it, one of which names a block that was
+  // never inserted. That is what a peer follows to get here.
+  ASSERT_OK(registry->Register({{"gone", src_id, 12},
+                                {"held_a", src_id, 10},
+                                {"held_b", src_id, 11}}));
+
+  KVCacheStoreServiceImpl service(store.backend().get(),
+                                  store.raiden_controller());
+  ::grpc::ServerBuilder builder;
+  int port = 0;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
+                           &port);
+  builder.RegisterService(&service);
+  auto server = builder.BuildAndStart();
+  KVCacheStoreClient client(
+      ::grpc::CreateChannel("localhost:" + std::to_string(port),
+                            ::grpc::InsecureChannelCredentials()));
+
+  // The dead hash sits in the MIDDLE, and the peer chose that order. Two
+  // things ride on this shape: the retired hash is found by index rather than
+  // by search, so it has to be the one the answer stopped at and not simply
+  // the first of the request; and a missing set read off the lookup's answer
+  // would name the whole tail, so this store would withdraw held_b, which it
+  // is holding, because of a request it does not control.
+  auto response =
+      client.Fetch({"held_a", "gone", "held_b"}, /*device_block_ids=*/{},
+                   /*host_block_ids=*/{100, 101, 102})
+          .Await();
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kNotFound));
+
+  // The withdraw is fire-and-forget, so wait for it to land rather than
+  // assuming it already has.
+  const RaidenId peer{"peer_job_withdraw", "0", "peer_data", 0};
+  const absl::Time give_up = absl::Now() + absl::Seconds(5);
+  while (absl::Now() < give_up) {
+    auto gone = registry->Lookup({"gone"}, peer);
+    ASSERT_OK(gone.status());
+    if (gone->empty()) break;
+    absl::SleepFor(absl::Milliseconds(20));
+  }
+
+  // Asked as a peer, so the caller filter does not hide the answer.
+  auto gone = registry->Lookup({"gone"}, peer);
+  ASSERT_OK(gone.status());
+  EXPECT_TRUE(gone->empty()) << "the entry this store cannot back survived";
+
+  auto held = registry->Lookup({"held_a", "held_b"}, peer);
+  ASSERT_OK(held.status());
+  EXPECT_EQ(held->size(), 2)
+      << "a refused fetch withdrew blocks this store is holding";
+
+  server->Shutdown();
+}
+
+// The withdraw is a side effect of a refusal, not part of answering it. A peer
+// that cannot be served must learn so at once; if the refusal waited on the
+// registry, one slow registry would add its latency to every failed fetch in
+// the deployment.
+TEST(FetchWithdrawTest, TheWithdrawDoesNotDelayTheRefusal) {
+  auto counting = MakeCountingRegistry();
+  auto* registry_service = counting.service;
+  auto* registry = counting.server->client.get();
+  registry_service->EnableUnregisterStall();
+
+  const RaidenId src_id{"src_job_nonblocking", "0", "src_data", 0};
+  KVCacheStore store(/*capacity=*/8, counting.server->server_address, src_id,
+                     /*num_shards=*/1, /*shard_size_bytes=*/1024,
+                     /*store_server_ip=*/"127.0.0.1");
+  ASSERT_OK(registry->Register({{"gone", src_id, 12}}));
+
+  KVCacheStoreServiceImpl service(store.backend().get(),
+                                  store.raiden_controller());
+  ::grpc::ServerBuilder builder;
+  int port = 0;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
+                           &port);
+  builder.RegisterService(&service);
+  auto server = builder.BuildAndStart();
+  KVCacheStoreClient client(
+      ::grpc::CreateChannel("localhost:" + std::to_string(port),
+                            ::grpc::InsecureChannelCredentials()));
+
+  // Released from another thread on a timer rather than on the stall itself,
+  // so a withdraw that never arrives cannot hang the test and a synchronous
+  // one fails the bound below instead of deadlocking.
+  constexpr absl::Duration kStall = absl::Seconds(2);
+  std::thread releaser([registry_service, kStall] {
+    absl::SleepFor(kStall);
+    registry_service->ReleaseUnregisterStall();
+  });
+
+  const absl::Time start = absl::Now();
+  auto response = client.Fetch({"gone"}, /*device_block_ids=*/{},
+                               /*host_block_ids=*/{100})
+                      .Await();
+  const absl::Duration refusal_cost = absl::Now() - start;
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_LT(refusal_cost, kStall)
+      << "the peer waited for this store's registry call";
+
+  releaser.join();
+  // And it really was sent, rather than the refusal being fast by skipping it.
+  EXPECT_GE(registry_service->unregister_calls(), 1);
+
+  server->Shutdown();
+}
+
+// A block whose bytes are in HBM is one this store still HOLDS, so a fetch it
+// cannot serve says nothing about the registry entry. HBM-only is also the
+// state a save to host starts from, so the entry is about to become correct;
+// withdrawing here races that save's publish and can erase it for good.
+TEST(FetchWithdrawTest, AFetchRefusedOnTheWrongTierKeepsTheEntry) {
+  auto counting = MakeCountingRegistry();
+  auto* registry_service = counting.service;
+  auto* registry = counting.server->client.get();
+
+  const RaidenId src_id{"src_job_tier", "0", "src_data", 0};
+  KVCacheStore store(/*capacity=*/8, counting.server->server_address, src_id,
+                     /*num_shards=*/1, /*shard_size_bytes=*/1024,
+                     /*store_server_ip=*/"127.0.0.1");
+  auto* backend = store.backend().get();
+
+  // Local, matched by the lookup, but with no host block to send.
+  ASSERT_TRUE(backend
+                  ->Insert({"staged"},
+                           {RaidenBlockId(src_id, /*host_block_id=*/-1,
+                                          /*device_block_id=*/50,
+                                          BlockStatus::HBM)},
+                           /*on_host=*/false)
+                  .first);
+  ASSERT_OK(registry->Register({{"staged", src_id, 10}}));
+
+  KVCacheStoreServiceImpl service(backend, store.raiden_controller());
+  ::grpc::ServerBuilder builder;
+  int port = 0;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
+                           &port);
+  builder.RegisterService(&service);
+  auto server = builder.BuildAndStart();
+  KVCacheStoreClient client(
+      ::grpc::CreateChannel("localhost:" + std::to_string(port),
+                            ::grpc::InsecureChannelCredentials()));
+
+  auto response = client.Fetch({"staged"}, /*device_block_ids=*/{},
+                               /*host_block_ids=*/{100})
+                      .Await();
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kFailedPrecondition));
+
+  ExpectNoWithdrawWithin(registry_service, absl::Seconds(2));
+  const RaidenId peer{"peer_job_tier", "0", "peer_data", 0};
+  auto after = registry->Lookup({"staged"}, peer);
+  ASSERT_OK(after.status());
+  EXPECT_EQ(after->size(), 1)
+      << "a fetch refused on tier withdrew an entry for a block this store "
+         "still holds";
+
+  server->Shutdown();
+}
+
+// An eviction candidate is invisible to the lookup but is NOT a dead entry: it
+// still holds its host block, a local access promotes it back into the active
+// list, and some paths demote an entry to candidate without withdrawing it, so
+// its registry entry stays live. The refusal must probe before it withdraws,
+// or it retires a block this store can still bring back -- and nothing
+// republishes one.
+TEST(FetchWithdrawTest, ARefusedFetchKeepsAnEvictionCandidatesEntry) {
+  auto counting = MakeCountingRegistry();
+  auto* registry_service = counting.service;
+  auto* registry = counting.server->client.get();
+
+  const RaidenId src_id{"src_job_candidate", "0", "src_data", 0};
+  KVCacheStore store(/*capacity=*/1, counting.server->server_address, src_id,
+                     /*num_shards=*/1, /*shard_size_bytes=*/1024,
+                     /*store_server_ip=*/"127.0.0.1");
+  auto* backend = store.backend().get();
+
+  // Unpinned, so it can be displaced. Insert also withdraws whatever it
+  // evicts, and this first one evicts nothing.
+  ASSERT_TRUE(backend
+                  ->Insert({"demoted"},
+                           {RaidenBlockId(src_id, 10, BlockStatus::HOST)},
+                           /*on_host=*/true)
+                  .first);
+  ASSERT_OK(registry->Register({{"demoted", src_id, 10}}));
+
+  // InsertAndLock, not Insert: it discards what Put displaces, on purpose --
+  // the displaced entry becomes a candidate that still holds its host block.
+  // So this demotes "demoted" and withdraws nothing, which is exactly the
+  // state the refusal below must not mistake for a dead entry.
+  ASSERT_TRUE(backend->InsertAndLock(
+      {"newcomer"}, {RaidenBlockId(src_id, 11, BlockStatus::HOST)},
+      /*on_host=*/true));
+  ASSERT_THAT(backend->GetEvictCandidateKeys(), Contains("demoted"));
+
+  KVCacheStoreServiceImpl service(backend, store.raiden_controller());
+  ::grpc::ServerBuilder builder;
+  int port = 0;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
+                           &port);
+  builder.RegisterService(&service);
+  auto server = builder.BuildAndStart();
+  KVCacheStoreClient client(
+      ::grpc::CreateChannel("localhost:" + std::to_string(port),
+                            ::grpc::InsecureChannelCredentials()));
+
+  // The lookup cannot see a candidate, so the fetch is refused...
+  auto response = client.Fetch({"demoted"}, /*device_block_ids=*/{},
+                               /*host_block_ids=*/{100})
+                      .Await();
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kNotFound));
+
+  // ...but the entry must survive the refusal.
+  ExpectNoWithdrawWithin(registry_service, absl::Seconds(2));
+  const RaidenId peer{"peer_job_candidate", "0", "peer_data", 0};
+  auto after = registry->Lookup({"demoted"}, peer);
+  ASSERT_OK(after.status());
+  EXPECT_EQ(after->size(), 1)
+      << "a refused fetch withdrew an eviction candidate, which still holds "
+         "its host block";
+
+  server->Shutdown();
+}
+
+// Fetch asks whether THIS store can serve the bytes, which is a question about
+// its own host DRAM. A hash that only a peer holds is a plain miss, not a
+// half-answer -- and refusing it must not disturb the peer's entry.
+TEST(FetchWithdrawTest, AHashOnlyAPeerHoldsIsAMissAndThePeerKeepsItsEntry) {
+  auto counting = MakeCountingRegistry();
+  auto* registry_service = counting.service;
+  auto* registry = counting.server->client.get();
+
+  const RaidenId src_id{"src_job_peeronly", "0", "src_data", 0};
+  const RaidenId peer_id{"peer_job_peeronly", "0", "peer_data", 0};
+  KVCacheStore store(/*capacity=*/8, counting.server->server_address, src_id,
+                     /*num_shards=*/1, /*shard_size_bytes=*/1024,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  // Registered, but on somebody else. This store never held it.
+  ASSERT_OK(registry->Register({{"peer_only", peer_id, 7}}));
+
+  KVCacheStoreServiceImpl service(store.backend().get(),
+                                  store.raiden_controller());
+  ::grpc::ServerBuilder builder;
+  int port = 0;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
+                           &port);
+  builder.RegisterService(&service);
+  auto server = builder.BuildAndStart();
+  KVCacheStoreClient client(
+      ::grpc::CreateChannel("localhost:" + std::to_string(port),
+                            ::grpc::InsecureChannelCredentials()));
+
+  // NOT_FOUND. A validation that consulted the registry would come back with a
+  // full-length answer carrying a REMOTE slice, and report the wrong thing --
+  // that the blocks are here but unservable.
+  auto response = client.Fetch({"peer_only"}, /*device_block_ids=*/{},
+                               /*host_block_ids=*/{100})
+                      .Await();
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kNotFound));
+
+  // The refusal does send a withdraw, under this store's own id. Wait for it
+  // to be served -- otherwise the entry below survives merely because nothing
+  // has touched it yet -- and then check the peer's entry is untouched.
+  const absl::Time give_up = absl::Now() + absl::Seconds(5);
+  while (registry_service->unregister_calls() == 0 && absl::Now() < give_up) {
+    absl::SleepFor(absl::Milliseconds(20));
+  }
+  ASSERT_GE(registry_service->unregister_calls(), 1)
+      << "the refusal never withdrew anything, so this proves nothing";
+
+  const RaidenId asker{"asker_job", "0", "asker_data", 0};
+  auto after = registry->Lookup({"peer_only"}, asker);
+  ASSERT_OK(after.status());
+  ASSERT_EQ(after->size(), 1);
+  EXPECT_EQ((*after)[0].raiden_id().job_name(), peer_id.job_name);
+
+  server->Shutdown();
 }
 
 }  // namespace

@@ -985,13 +985,13 @@ TEST(HostOffloadBackendWriteRemoteTest, RollbackInsertErasesAndFreesBlocks) {
 // be believed reachable when they are not -- so this is success, not an error
 // that would fail every write on a registry-less node.
 TEST(HostOffloadBackendWriteRemoteTest,
-     RegisterBlocksSyncIsOkWithoutARegistry) {
+     RegisterBlocksAsyncIsOkWithoutARegistry) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/8);
-  EXPECT_TRUE(backend.RegisterBlocksSync({"a"}, {1}).ok());
+  EXPECT_TRUE(backend.RegisterBlocksAsync({"a"}, {1}).Await().ok());
 }
 
 TEST(HostOffloadBackendWriteRemoteTest,
-     RegisterBlocksSyncPublishesToTheRegistry) {
+     RegisterBlocksAsyncPublishesToTheRegistry) {
   auto reg_server = global_registry::CreateTestGlobalRegistryServer();
 
   RaidenId id{"job_regsync", "0", "data", 0};
@@ -1000,7 +1000,7 @@ TEST(HostOffloadBackendWriteRemoteTest,
       std::make_shared<global_registry::GlobalRegistryClient>(
           reg_server->channel));
 
-  ASSERT_TRUE(backend.RegisterBlocksSync({"a", "b"}, {7, 8}).ok());
+  ASSERT_TRUE(backend.RegisterBlocksAsync({"a", "b"}, {7, 8}).Await().ok());
 
   auto looked_up = reg_server->client->Lookup({"a", "b"});
   ASSERT_TRUE(looked_up.ok()) << looked_up.status().ToString();
@@ -1011,7 +1011,7 @@ TEST(HostOffloadBackendWriteRemoteTest,
 
 // COMMITTED is only allowed to mean "globally reachable", so a publish that
 // fails has to reach the caller rather than be logged and swallowed.
-TEST(HostOffloadBackendWriteRemoteTest, RegisterBlocksSyncReportsFailure) {
+TEST(HostOffloadBackendWriteRemoteTest, RegisterBlocksAsyncReportsFailure) {
   RaidenId id{"job_regfail", "0", "data", 0};
   // Port 1 is reserved and never listening.
   auto channel =
@@ -1020,14 +1020,14 @@ TEST(HostOffloadBackendWriteRemoteTest, RegisterBlocksSyncReportsFailure) {
       /*capacity=*/8, std::nullopt, id, /*raiden_controller=*/nullptr,
       std::make_shared<global_registry::GlobalRegistryClient>(channel));
 
-  EXPECT_FALSE(backend.RegisterBlocksSync({"a"}, {1}).ok());
+  EXPECT_FALSE(backend.RegisterBlocksAsync({"a"}, {1}).Await().ok());
 }
 
 TEST(HostOffloadBackendWriteRemoteTest,
-     RegisterBlocksSyncRejectsMismatchedSizes) {
+     RegisterBlocksAsyncRejectsMismatchedSizes) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/8);
-  EXPECT_TRUE(
-      absl::IsInvalidArgument(backend.RegisterBlocksSync({"a", "b"}, {1})));
+  EXPECT_TRUE(absl::IsInvalidArgument(
+      backend.RegisterBlocksAsync({"a", "b"}, {1}).Await()));
 }
 
 TEST(HostOffloadBackendTest, LookupAndPinBasicHits) {

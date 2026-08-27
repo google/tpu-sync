@@ -73,6 +73,11 @@ class StallingRegistryService final : public GlobalRegistryService::Service {
   grpc::Status Unregister(grpc::ServerContext* context,
                           const UnregisterRequest* request,
                           UnregisterResponse* response) override {
+    // Counted before the stall, so a test can tell "arrived" from "finished".
+    unregister_calls_.fetch_add(1);
+    if (stall_unregister_) {
+      unregister_release_.WaitForNotification();
+    }
     return impl_->Unregister(context, request, response);
   }
 
@@ -133,12 +138,26 @@ class StallingRegistryService final : public GlobalRegistryService::Service {
     }
   }
 
+  void EnableUnregisterStall() { stall_unregister_ = true; }
+  void ReleaseUnregisterStall() {
+    if (!unregister_release_.HasBeenNotified()) {
+      unregister_release_.Notify();
+    }
+  }
+  // How many Unregister RPCs have reached the server, for a test that must
+  // wait until one has landed, or show that none was sent without timing how
+  // long to wait for one that never comes.
+  int unregister_calls() const { return unregister_calls_.load(); }
+
  private:
   std::unique_ptr<GlobalRegistryServiceImpl> impl_;
   // Set from the test thread, read on a server handler thread.
   std::atomic<bool> stall_register_ = false;
   absl::Notification in_stall_;
   absl::Notification stall_release_;
+  std::atomic<bool> stall_unregister_ = false;
+  std::atomic<int> unregister_calls_ = 0;
+  absl::Notification unregister_release_;
 };
 
 // Holds an in-process GlobalRegistry service, gRPC server, channel, and client.

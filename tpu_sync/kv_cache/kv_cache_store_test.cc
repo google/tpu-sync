@@ -3969,7 +3969,7 @@ TEST_F(StoreDiscoveryTest, CapacityConstructedStoreJoinsTheGlobalTier) {
   // The backend holds a real registry client, so what it publishes reaches
   // the global tier. Inserting does not publish; a completed save does,
   // through this path -- so drive it directly.
-  ASSERT_OK(backend->RegisterBlocksSync({"tiered_hash"}, {3}));
+  ASSERT_OK(backend->RegisterBlocksAsync({"tiered_hash"}, {3}).Await());
   auto looked_up = client_->Lookup({"tiered_hash"});
   ASSERT_TRUE(looked_up.ok()) << looked_up.status().ToString();
   ASSERT_EQ(looked_up->size(), 1);
@@ -4084,10 +4084,15 @@ TEST_F(StoreDiscoveryTest, FailedLoadDropsTheCachedPeerClient) {
 
   ASSERT_FALSE(peer.store_server_address().empty());
 
+  // What this pins is that the peer ANSWERED: a dead cached client would still
+  // be UNAVAILABLE. The answer itself is about the request rather than about
+  // the hash, because Fetch validates its arguments before it looks anything
+  // up, and this store registers no workers to name as endpoints.
   auto second = backend->Load(peer_rid, {"h"}, {0}).Await();
-  EXPECT_TRUE(absl::IsNotFound(second))
+  EXPECT_TRUE(absl::IsInvalidArgument(second))
       << "expected the restarted peer to answer; got " << second.ToString()
       << " -- the cached client still points at the address it had";
+  EXPECT_FALSE(absl::IsUnavailable(second));
 }
 
 // ===========================================================================

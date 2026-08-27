@@ -263,12 +263,13 @@ class KVCacheStoreBackend {
         "Backend does not implement RegisterBlocksAsync."));
   }
 
-  // RegisterBlocksAsync, waited on. For a caller that has no continuation to
-  // hang the rest of its work off; the publish itself is identical.
-  virtual absl::Status RegisterBlocksSync(
-      absl::Span<const std::string> block_hashes,
-      absl::Span<const int32_t> host_block_ids) {
-    return RegisterBlocksAsync(block_hashes, host_block_ids).Await();
+  // Withdraws `block_hashes` from the global registry under this store's own
+  // id, asynchronously. The mirror of RegisterBlocksAsync, for a store that
+  // has found the registry advertising blocks it cannot serve.
+  virtual tsl::Future<> UnregisterBlocksAsync(
+      absl::Span<const std::string> block_hashes) {
+    return tsl::Future<>(absl::UnimplementedError(
+        "Backend does not implement UnregisterBlocksAsync."));
   }
 
   // The peer-facing KVCacheStoreService server this backend hosts, if any.

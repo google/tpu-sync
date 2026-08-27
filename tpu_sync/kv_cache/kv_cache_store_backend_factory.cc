@@ -93,7 +93,7 @@ void KVCacheStoreBackendFactory::RegisterBuiltInBackends() {}
 
 absl::Status KVCacheStoreBackendFactory::RegisterBackend(
     absl::string_view type_name, BackendCreator creator) {
-  absl::MutexLock lock(&mutex_);
+  absl::MutexLock lock(mutex_);
   auto [it, inserted] =
       creators_.try_emplace(std::string(type_name), std::move(creator));
   if (!inserted) {
@@ -109,7 +109,7 @@ KVCacheStoreBackendFactory::CreateBackend(
     controller::RaidenController* controller) const {
   BackendCreator creator;
   {
-    absl::MutexLock lock(&mutex_);
+    absl::MutexLock lock(mutex_);
     auto it = creators_.find(config.type);
     if (it == creators_.end()) {
       return absl::NotFoundError(absl::StrCat(
@@ -125,13 +125,13 @@ KVCacheStoreBackendFactory::CreateBackend(
 
 bool KVCacheStoreBackendFactory::IsRegistered(
     absl::string_view type_name) const {
-  absl::MutexLock lock(&mutex_);
+  absl::MutexLock lock(mutex_);
   return creators_.contains(type_name);
 }
 
 std::vector<std::string> KVCacheStoreBackendFactory::GetRegisteredTypes()
     const {
-  absl::MutexLock lock(&mutex_);
+  absl::MutexLock lock(mutex_);
   std::vector<std::string> types;
   types.reserve(creators_.size());
   for (const auto& [type, _] : creators_) {

@@ -42,7 +42,7 @@ absl::Status KVCacheStoreServer::StartServer(
     KVCacheStoreBackend* backend,
     tpu_raiden::controller::RaidenController* controller,
     absl::string_view server_address) {
-  absl::MutexLock lock(&mutex_);
+  absl::MutexLock lock(mutex_);
   if (started_) {
     return absl::OkStatus();
   }
@@ -97,12 +97,12 @@ absl::Status KVCacheStoreServer::StartServerInternal(
 }
 
 int KVCacheStoreServer::GetGrpcPort() const {
-  absl::MutexLock lock(&mutex_);
+  absl::MutexLock lock(mutex_);
   return grpc_port_;
 }
 
 std::string KVCacheStoreServer::GetServerAddress() const {
-  absl::MutexLock lock(&mutex_);
+  absl::MutexLock lock(mutex_);
   if (grpc_port_ <= 0) {
     return "";
   }
@@ -116,7 +116,7 @@ std::string KVCacheStoreServer::GetServerAddress() const {
 }
 
 void KVCacheStoreServer::Shutdown() {
-  absl::MutexLock lock(&mutex_);
+  absl::MutexLock lock(mutex_);
   if (grpc_server_) {
     grpc_server_->Shutdown();
     grpc_server_.reset();

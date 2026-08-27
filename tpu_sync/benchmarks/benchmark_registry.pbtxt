@@ -44,3 +44,28 @@ benchmarks {
   metrics { name: "1048576B_x64_P1/cpp_gbs" unit: "GB/s" stats { stat: MEAN } }
   metrics { name: "1048576B_x64_P8/cpp_gbs" unit: "GB/s" stats { stat: MEAN } }
 }
+
+benchmarks {
+  name: "h2d_d2h_multihost"
+  description: "Multi-host benchmark on linux-x86-ct5lp-4tpu-x4"
+  owner: "raiden-dev"
+
+  workload {
+    action: "./ml_actions/actions/workload_executors/bazel"
+    action_inputs { key: "target" value: "//tpu_sync/benchmarks:h2d_d2h_benchmark_gating" }
+    action_inputs { key: "runtime_flags" value: "" }
+  }
+
+  environment_configs {
+    id: "tpu-v5e-multi-node"
+    runner_label: "linux-x86-ct5lp-4tpu-x4"
+    container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers"
+    workload_action_inputs { key: "bazel_run_flags" value: "-c opt --config=oss --config=ci" }
+  }
+
+  metrics { name: "int32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
+  metrics { name: "int32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
+  metrics { name: "float32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
+  metrics { name: "float32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
+}
+

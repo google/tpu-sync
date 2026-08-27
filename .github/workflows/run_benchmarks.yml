@@ -48,6 +48,11 @@ on:
         required: false
         type: string
         default: "{}"
+      multi_host:
+        description: "If true, isolates workspace writes into a unique folder per job on shared multi-host volumes."
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -55,11 +60,11 @@ permissions:
 
 jobs: 
   run_benchmarks:
-    name: Run Single Host Benchmarks
-    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@aa854ba7bdb77966a9cc1a013417f1c1a208c4c0 # main
+    name: Run Benchmarks
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@978df5f466ac8a598aca4924f813b32574992d72 # multi-host-support
     with:
       registry_file: "tpu_sync/benchmarks/benchmark_registry.pbtxt"
-      bap_ref: "aa854ba7bdb77966a9cc1a013417f1c1a208c4c0"
+      bap_ref: "978df5f466ac8a598aca4924f813b32574992d72"
       runner: "linux-x86-n2-8"
       ab_mode: ${{ inputs.ab_mode }}
       baseline_ref: ${{ inputs.baseline_ref }}
@@ -67,3 +72,4 @@ jobs:
       benchmark_filter: ${{ inputs.benchmark_filter }}
       environment_filter: ${{ inputs.environment_filter }}
       custom_metadata: ${{ inputs.custom_metadata }}
+      multi_host: ${{ inputs.multi_host }}

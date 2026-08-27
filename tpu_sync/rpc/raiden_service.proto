@@ -232,3 +232,11 @@ message ControlResponse {
   string response_data = 3;
   GetMetadataResponse get_metadata_response = 4;
 }
+
+// Service providing a gRPC communication channel for Weight Synchronizer worker control plane.
+service WeightSynchronizationWorkerService {
+  // Handles generic ControlRequest commands (such as START_TRANSFER, SHUTDOWN).
+  rpc HandleControl(ControlRequest) returns (ControlResponse) {  }
+}
+
+

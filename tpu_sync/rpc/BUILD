@@ -38,10 +38,25 @@ cc_proto_library(
     deps = [":raiden_service_proto"],
 )
 
+cc_grpc_library(
+    name = "raiden_service_cc_grpc",
+    srcs = [":raiden_service_proto"],
+    generate_mocks = True,
+    visibility = ["//visibility:public"],
+    deps = [":raiden_service_cc_proto"],
+)
+
 py_proto_library(
     name = "raiden_service_py_pb2",
     visibility = ["//visibility:public"],
     deps = [":raiden_service_proto"],
+)
+
+py_grpc_library(
+    name = "raiden_service_py_pb2_grpc",
+    srcs = [":raiden_service_proto"],
+    visibility = ["//visibility:public"],
+    deps = [":raiden_service_py_pb2"],
 )
 
 proto_library(

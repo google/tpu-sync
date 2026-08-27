@@ -413,6 +413,18 @@ cc_test(
 )
 
 cc_library(
+    name = "completion_executor",
+    srcs = ["completion_executor.cc"],
+    hdrs = ["completion_executor.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_sync/core:numa_thread_pool",
+        "@com_google_absl//absl/base:no_destructor",
+        "@com_google_absl//absl/functional:any_invocable",
+    ],
+)
+
+cc_library(
     name = "kv_cache_store",
     srcs = ["kv_cache_store.cc"],
     hdrs = ["kv_cache_store.h"],
@@ -423,6 +435,7 @@ cc_library(
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
+        ":completion_executor",
         ":host_offload_backend",
         ":kv_cache_metadata",
         ":kv_cache_store_backend",

@@ -55,6 +55,7 @@ namespace kv_cache {
 
 namespace global_registry {
 class GlobalRegistryClient;
+class RegistryCall;
 }
 
 class StoreMonitor;
@@ -99,6 +100,7 @@ class StoreMonitor;
 class KVCacheStore {
  public:
   friend class KVCacheStoreTest;
+  friend class RemoteWriteSourceTest;
 
   // NETWORK ADDRESSING (`store_server_ip`, `raiden_controller_port`)
   //
@@ -508,6 +510,9 @@ class KVCacheStore {
              std::vector<std::string>>
   PollRemoteReadStatus();
 
+  // Returns the count of active remote write operations. TESTS ONLY.
+  size_t InFlightRemoteWritesCountForTesting() const;
+
 
   // Rebuilds this store's LRU cache after an engine restart from the
   // crash-persistent KVCacheMetadata table in local shared memory, without
@@ -689,7 +694,10 @@ class KVCacheStore {
   // all, and for the sweep those are the common outcome, not the rare one.
   enum class SaveOwner { kApplication, kSweep };
 
+  using OperationKey = uint64_t;
+
   struct RemoteWriteState {
+    OperationKey key = 0;
     RaidenId dst_raiden_id;
     uint64_t operation_id = 0;
     std::vector<std::string> block_hashes;
@@ -711,18 +719,23 @@ class KVCacheStore {
     std::vector<std::string> unregistered;
   };
 
+  // Lifetime fence ensuring background completion tasks can safely check
+  // if the store is still alive.
+  struct Lifetime {
+    absl::Mutex mu;
+    KVCacheStore* store ABSL_GUARDED_BY(mu) = nullptr;
+  };
+  std::shared_ptr<Lifetime> lifetime_;
+
   std::vector<SaveState> active_saves_ ABSL_GUARDED_BY(mutex_);
   std::vector<LoadState> active_loads_ ABSL_GUARDED_BY(mutex_);
   absl::flat_hash_map<tsl::Future<>, RemoteReadState, FutureHash, FutureEqual>
       active_remote_reads_ ABSL_GUARDED_BY(mutex_);
 
-  std::vector<RemoteWriteState> active_remote_writes_ ABSL_GUARDED_BY(mutex_);
-  // Operations a poller has claimed and is currently asking the destination
-  // about. Polling drops mutex_ to make that RPC, so without a claim two
-  // concurrent pollers both see the same operation as committed, both call
-  // FinishRemoteWrite, and the internal pin is released twice while the hashes
-  // are reported twice.
-  absl::flat_hash_set<uint64_t> polling_remote_writes_ ABSL_GUARDED_BY(mutex_);
+  absl::flat_hash_map<OperationKey, RemoteWriteState> active_remote_writes_
+      ABSL_GUARDED_BY(mutex_);
+  OperationKey next_op_key_ ABSL_GUARDED_BY(mutex_) = 1;
+
   // Addressed by owner, so the two consumers cannot take each other's mail.
   // PollSaveStatus() drains the application's; the evict sweep drains its own
   // through DrainSweepVerdicts().
@@ -818,11 +831,25 @@ class KVCacheStore {
   // second one.
   void PollRemoteWritesInternal();
 
+  // Atomically extracts an operation from active_remote_writes_ under mutex_.
+  // Whoever receives the state owns settling it; concurrent callers receive
+  // std::nullopt and do nothing.
+  std::optional<RemoteWriteState> TakeRemoteWrite(OperationKey key);
+
+  // Settles a taken operation by releasing internal pins and filing verdicts.
+  // Must NOT be called with mutex_ held.
+  void OnWriteRemoteVerdict(RemoteWriteState state, bool succeeded,
+                            std::vector<std::string> existing,
+                            std::vector<std::string> unregistered = {});
+
   // Releases this store's internal pin and clears saving_hashes_. Called once
   // per operation, whichever way it ends.
   void FinishRemoteWrite(const RemoteWriteState& state, bool succeeded,
                          std::vector<std::string> existing,
-                         std::vector<std::string> unregistered = {});
+                         std::vector<std::string> unregistered = {}) {
+    OnWriteRemoteVerdict(state, succeeded, std::move(existing),
+                         std::move(unregistered));
+  }
 
   // Takes the sweep's settled remote writes. Drives the pollers first for the
   // same reason PollSaveStatus() does: on the monitor's thread nothing else

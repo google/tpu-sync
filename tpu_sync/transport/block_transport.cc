@@ -950,46 +950,72 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
   }
   if (static_cast<int>(local_blocks) < P) P = local_blocks;
 
+  ASSIGN_OR_RETURN(
+      const auto requests,
+      BuildBlockPullRequests(src_block_ids, allocated_ids, explicit_dst_ptrs,
+                             major_order, uuid, P));
+
+  RETURN_IF_ERROR(PostSocketPull(peers, requests, on_block_received));
+  return allocated_ids;
+}
+
+absl::Status BlockTransport::PostSocketPull(
+    const std::vector<std::string>& peers,
+    absl::Span<const lib::Request> requests,
+    BlockReceivedCallback on_block_received) {
+  if (peers.empty()) {
+    return absl::InvalidArgumentError("peers list cannot be empty");
+  }
+  if (requests.empty()) {
+    return absl::OkStatus();
+  }
+  const auto& req = requests.front();
+  const int P = req.parallelism;
+  if (P <= 0) {
+    return absl::InvalidArgumentError("parallelism must be positive");
+  }
+
   std::vector<std::thread> threads;
   std::vector<absl::Status> statuses(P, absl::OkStatus());
 
   threads.reserve(P);
-  const size_t base_blocks_per_stream = local_blocks / P;
-  const size_t remainder = local_blocks % P;
-  size_t local_block_offset = 0;
-  size_t remote_block_offset = 0;
 
+  size_t req_offset = 0;
   for (int i = 0; i < P; ++i) {
-    const size_t local_block_count =
-        base_blocks_per_stream + (static_cast<size_t>(i) < remainder ? 1 : 0);
-    const size_t remote_block_count =
-        local_block_count * block_delegate_->shard_factor();
+    size_t req_end = req_offset;
+    while (req_end < requests.size() && requests[req_end].stream_idx == i) {
+      ++req_end;
+    }
+
+    absl::Span<const lib::Request> stream_requests =
+        requests.subspan(req_offset, req_end - req_offset);
+    req_offset = req_end;
 
     const auto local_ips = raw_transport_.local_ips();
     const size_t n = local_ips.size();
     const std::string local_ip = n >= 1 ? local_ips[i % n] : "";
     const std::string remote_peer = peers[i % peers.size()];
 
-    threads.push_back(std::thread(
-        &BlockTransport::H2hReadWorker, this, i, remote_peer, local_ip,
-        local_block_offset, local_block_count, remote_block_offset,
-        remote_block_count, std::ref(src_block_ids), std::ref(allocated_ids),
-        std::ref(explicit_dst_ptrs), std::ref(statuses), major_order,
-        on_block_received, uuid));
-
-    local_block_offset += local_block_count;
-    remote_block_offset += remote_block_count;
+    threads.emplace_back([this, i, remote_peer, local_ip, stream_requests,
+                          on_block_received, &statuses]() {
+      statuses[i] = PostSocketPullInternal(
+          remote_peer, local_ip, stream_requests, on_block_received);
+    });
   }
 
   for (auto& t : threads) {
     if (t.joinable()) t.join();
   }
 
+  if (req_offset != requests.size()) {
+    return absl::InvalidArgumentError(
+        "Unprocessed requests remain; requests might be out of order.");
+  }
+
   for (int i = 0; i < P; ++i) {
     if (!statuses[i].ok()) return statuses[i];
   }
-
-  return allocated_ids;
+  return absl::OkStatus();
 }
 
 lib::Request BlockTransport::BuildBlockRequest(
@@ -1216,19 +1242,39 @@ absl::Status BlockTransport::PostSocketPushInternal(
 
 absl::StatusOr<std::vector<lib::Request>>
 BlockTransport::BuildBlockPullRequests(
-    size_t local_block_offset, size_t local_block_count,
-    size_t remote_block_offset, size_t remote_block_count,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& allocated_ids,
     const std::vector<uint8_t*>& explicit_dst_ptrs, MajorOrder major_order,
-    uint64_t uuid) {
-  if (remote_block_offset > src_block_ids.size() ||
-      remote_block_count > src_block_ids.size() - remote_block_offset) {
-    return absl::OutOfRangeError(
-        "Remote block range exceeds source block list");
+    uint64_t uuid, int parallelism) {
+  if (parallelism <= 0) {
+    return absl::InvalidArgumentError("parallelism must be positive");
   }
 
-  size_t SF = block_delegate_->shard_factor();
+  const size_t num_blocks = src_block_ids.size();
+  if (num_blocks == 0) {
+    return std::vector<lib::Request>{};
+  }
+  const size_t SF = block_delegate_->shard_factor();
+  const size_t local_blocks = num_blocks / SF;
+  const size_t base_blocks_per_stream = local_blocks / parallelism;
+  const size_t remainder = local_blocks % parallelism;
+
+  std::vector<lib::Request> requests;
+
+  for (int i = 0; i < parallelism; ++i) {
+    const size_t local_block_count =
+        base_blocks_per_stream + (static_cast<size_t>(i) < remainder ? 1 : 0);
+    const size_t local_block_offset =
+        i * base_blocks_per_stream + std::min<size_t>(i, remainder);
+    const size_t remote_block_count = local_block_count * SF;
+    const size_t remote_block_offset = local_block_offset * SF;
+
+    if (remote_block_offset > src_block_ids.size() ||
+        remote_block_count > src_block_ids.size() - remote_block_offset) {
+      return absl::OutOfRangeError(
+          "Remote block range exceeds source block list");
+    }
+
 
   struct PullChunk {
     size_t local_start_idx;
@@ -1264,7 +1310,6 @@ BlockTransport::BuildBlockPullRequests(
                       curr_local_count * SF});
   }
 
-  std::vector<lib::Request> requests;
   uint32_t request_id = 0;
 
   for (const auto& chunk : chunks) {
@@ -1327,18 +1372,19 @@ BlockTransport::BuildBlockPullRequests(
             }
             requests.push_back(BuildBlockRequest(
                 /*socket_opcode=*/2, bc.ptr, bc.size, count_or_size, layer_id,
-                request_id, uuid, /*parallelism=*/1, major_order, remote_id,
-                local_id, shard_idx));
+                request_id, uuid, parallelism, major_order, remote_id,
+                local_id, shard_idx, /*stream_idx=*/i));
           }
           ++request_id;
           return absl::OkStatus();
         }));
   }
+}
 
   return requests;
 }
 
-absl::Status BlockTransport::ProcessSocketPull(
+absl::Status BlockTransport::PostSocketPullInternal(
     absl::string_view peer, absl::string_view local_ip,
     absl::Span<const lib::Request> requests,
     BlockReceivedCallback on_block_received) {
@@ -1447,32 +1493,6 @@ absl::Status BlockTransport::ProcessSocketPull(
 
   ok_to_pool = true;
   return absl::OkStatus();
-}
-
-void BlockTransport::H2hReadWorker(
-    int stream_idx, absl::string_view peer, absl::string_view local_ip,
-    size_t local_block_offset, size_t local_block_count,
-    size_t remote_block_offset, size_t remote_block_count,
-    const std::vector<int>& src_block_ids,
-    const std::vector<int>& allocated_ids,
-    const std::vector<uint8_t*>& explicit_dst_ptrs,
-    std::vector<absl::Status>& statuses, MajorOrder major_order,
-    BlockReceivedCallback on_block_received, uint64_t uuid) {
-  absl::StatusOr<std::vector<lib::Request>> requests = BuildBlockPullRequests(
-      local_block_offset, local_block_count, remote_block_offset,
-      remote_block_count, src_block_ids, allocated_ids, explicit_dst_ptrs,
-      major_order, uuid);
-  if (!requests.ok()) {
-    statuses[stream_idx] = requests.status();
-    return;
-  }
-
-  absl::Status s =
-      ProcessSocketPull(peer, local_ip, *requests, on_block_received);
-  if (!s.ok()) {
-    statuses[stream_idx] = s;
-    return;
-  }
 }
 
 void BlockTransport::ForgetPushProgress(uint64_t uuid) {

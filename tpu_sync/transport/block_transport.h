@@ -185,29 +185,20 @@ class BlockTransport final {
 
   // Builds a batch of Requests for block pull transfer.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockPullRequests(
-      size_t local_block_offset, size_t local_block_count,
-      size_t remote_block_offset, size_t remote_block_count,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& allocated_ids,
       const std::vector<uint8_t*>& explicit_dst_ptrs, MajorOrder major_order,
-      uint64_t uuid = 0);
+      uint64_t uuid = 0, int parallelism = 1);
 
-  absl::Status ProcessSocketPull(
-      absl::string_view peer, absl::string_view local_ip,
+  absl::Status PostSocketPull(
+      const std::vector<std::string>& peers,
       absl::Span<const lib::Request> requests,
       BlockReceivedCallback on_block_received = {});
 
-  void H2hReadWorker(int stream_idx, absl::string_view peer,
-                     absl::string_view local_ip, size_t local_block_offset,
-                     size_t local_block_count, size_t remote_block_offset,
-                     size_t remote_block_count,
-                     const std::vector<int>& src_block_ids,
-                     const std::vector<int>& allocated_ids,
-                     const std::vector<uint8_t*>& explicit_dst_ptrs,
-                     std::vector<absl::Status>& statuses,
-                     MajorOrder major_order,
-                     BlockReceivedCallback on_block_received,
-                     uint64_t uuid = 0);
+  absl::Status PostSocketPullInternal(
+      absl::string_view peer, absl::string_view local_ip,
+      absl::Span<const lib::Request> requests,
+      BlockReceivedCallback on_block_received = {});
 
   absl::Status HandleIncomingPush(int client_fd,
                                   const lib::ChunkHeader& header);

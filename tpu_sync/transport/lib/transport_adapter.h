@@ -42,6 +42,7 @@ struct Request {
   uint64_t uuid;
   uint32_t request_id;
   int shard_idx;
+  int stream_idx;
 };
 
 }  // namespace lib

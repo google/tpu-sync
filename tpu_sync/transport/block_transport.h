@@ -155,35 +155,33 @@ class BlockTransport final {
   std::unique_ptr<WriteTask> SelectNextTask()
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(scheduler_mu_);
 
-  void H2hWriteWorker(int stream_idx, absl::string_view peer,
-                      absl::string_view local_ip, size_t block_offset,
-                      size_t block_count, const std::vector<int>& src_block_ids,
-                      const std::vector<int>& dst_block_ids,
-                      std::vector<int>& allocated_ids,
-                      std::vector<absl::Status>& statuses,
-                      MajorOrder major_order, uint64_t uuid = 0,
-                      int layer_idx = -1, int parallelism = 1);
+  void PostSocketPush(
+      const std::vector<std::string>& peers, std::vector<lib::Request> requests,
+      const std::vector<int>& src_block_ids,
+      const std::vector<int>& dst_block_ids,
+      std::function<void(absl::StatusOr<std::vector<int>>)> on_complete);
 
-  lib::Request BuildBlockRequest(
-      uint8_t socket_opcode, uint8_t* laddr, size_t len, uint32_t count_or_size,
-      int layer_idx, uint32_t request_id, uint64_t uuid, int parallelism,
-      MajorOrder major_order, uint32_t remote_id, uint32_t local_id,
-      int shard_idx);
+  lib::Request BuildBlockRequest(uint8_t socket_opcode, uint8_t* laddr,
+                                 size_t len, uint32_t count_or_size,
+                                 int layer_idx, uint32_t request_id,
+                                 uint64_t uuid, int parallelism,
+                                 MajorOrder major_order, uint32_t remote_id,
+                                 uint32_t local_id, int shard_idx,
+                                 int stream_idx = 0);
 
   // Builds a batch of Requests for block transfer.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockRequests(
-      absl::string_view peer, size_t block_offset, size_t block_count,
-      const std::vector<int>& src_block_ids,
+      absl::string_view peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids, MajorOrder major_order,
       uint64_t uuid = 0, int layer_idx = -1, int parallelism = 1);
 
-  absl::Status ProcessSocketPush(absl::string_view peer,
-                                 absl::string_view local_ip,
-                                 absl::Span<const lib::Request> requests,
-                                 const std::vector<int>& src_block_ids,
-                                 const std::vector<int>& dst_block_ids,
-                                 size_t block_offset,
-                                 std::vector<int>& allocated_ids);
+  absl::Status PostSocketPushInternal(absl::string_view peer,
+                                      absl::string_view local_ip,
+                                      absl::Span<const lib::Request> requests,
+                                      const std::vector<int>& src_block_ids,
+                                      const std::vector<int>& dst_block_ids,
+                                      size_t block_offset,
+                                      std::vector<int>& allocated_ids);
 
   // Builds a batch of Requests for block pull transfer.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockPullRequests(

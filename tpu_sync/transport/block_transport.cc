@@ -780,6 +780,37 @@ void BlockTransport::AsyncPush(
   }
   if (static_cast<int>(num_blocks) < P) P = num_blocks;
 
+  // In multi-NIC setups, `peers` contains all NIC rail endpoints for the
+  // destination host. Request chunk resolution is identical across NICs, so
+  // we pass `peers[0]` as the destination peer to build requests.
+  auto requests = BuildBlockRequests(peers[0], src_block_ids, dst_block_ids,
+                                     major_order, uuid, layer_idx, P);
+  if (!requests.ok()) {
+    on_complete(requests.status());
+    return;
+  }
+
+  PostSocketPush(peers, std::move(*requests), src_block_ids, dst_block_ids,
+                 std::move(on_complete));
+}
+
+void BlockTransport::PostSocketPush(
+    const std::vector<std::string>& peers, std::vector<lib::Request> requests,
+    const std::vector<int>& src_block_ids,
+    const std::vector<int>& dst_block_ids,
+    std::function<void(absl::StatusOr<std::vector<int>>)> on_complete) {
+  if (requests.empty()) {
+    on_complete(absl::InvalidArgumentError("Requests cannot be empty"));
+    return;
+  }
+  const size_t num_blocks = src_block_ids.size();
+  const auto& req = requests.front();
+  const uint64_t uuid = req.uuid;
+  const int layer_idx = req.layer_idx;
+  const int P = req.parallelism;
+
+  auto shared_requests =
+      std::make_shared<std::vector<lib::Request>>(std::move(requests));
   auto shared_src_block_ids = std::make_shared<std::vector<int>>(src_block_ids);
   auto shared_dst_block_ids = std::make_shared<std::vector<int>>(dst_block_ids);
   auto allocated_ids = std::make_shared<std::vector<int>>(num_blocks, 0);
@@ -789,24 +820,34 @@ void BlockTransport::AsyncPush(
 
   const size_t base_blocks_per_stream = num_blocks / P;
   const size_t remainder = num_blocks % P;
-  size_t block_offset = 0;
-
+  size_t req_offset = 0;
   for (int i = 0; i < P; ++i) {
-    const size_t block_count =
-        base_blocks_per_stream + (static_cast<size_t>(i) < remainder ? 1 : 0);
+    const size_t block_offset =
+        i * base_blocks_per_stream + std::min<size_t>(i, remainder);
+
+    size_t req_end = req_offset;
+    while (req_end < shared_requests->size() &&
+           (*shared_requests)[req_end].stream_idx == i) {
+      ++req_end;
+    }
+
     const auto local_ips = raw_transport_.local_ips();
     const size_t n = local_ips.size();
     const std::string local_ip = n >= 1 ? local_ips[i % n] : "";
     const std::string remote_peer = peers[i % peers.size()];
 
-    auto task_run = [this, i, remote_peer, local_ip, block_offset, block_count,
-                     shared_src_block_ids, shared_dst_block_ids, allocated_ids,
-                     statuses, remaining_workers, major_order, uuid, layer_idx,
-                     P, on_complete]() {
-      H2hWriteWorker(i, remote_peer, local_ip, block_offset, block_count,
-                     *shared_src_block_ids, *shared_dst_block_ids,
-                     *allocated_ids, *statuses, major_order, uuid, layer_idx,
-                     P);
+    absl::Span<const lib::Request> stream_requests =
+        absl::MakeConstSpan(*shared_requests)
+            .subspan(req_offset, req_end - req_offset);
+    req_offset = req_end;
+
+    auto task_run = [this, i, remote_peer, local_ip, block_offset,
+                     shared_requests, stream_requests, shared_src_block_ids,
+                     shared_dst_block_ids, allocated_ids, statuses,
+                     remaining_workers, on_complete]() {
+      (*statuses)[i] = PostSocketPushInternal(
+          remote_peer, local_ip, stream_requests, *shared_src_block_ids,
+          *shared_dst_block_ids, block_offset, *allocated_ids);
 
       if (remaining_workers->fetch_sub(1) == 1) {
         absl::Status final_status = absl::OkStatus();
@@ -841,7 +882,6 @@ void BlockTransport::AsyncPush(
       }
     }
     scheduler_cv_.SignalAll();
-    block_offset += block_count;
   }
 }
 
@@ -956,7 +996,7 @@ lib::Request BlockTransport::BuildBlockRequest(
     uint8_t socket_opcode, uint8_t* laddr, size_t len, uint32_t count_or_size,
     int layer_idx, uint32_t request_id, uint64_t uuid, int parallelism,
     MajorOrder major_order, uint32_t remote_id, uint32_t local_id,
-    int shard_idx) {
+    int shard_idx, int stream_idx) {
   return lib::Request{
       .socket_opcode = socket_opcode,
       .laddr = laddr,
@@ -971,26 +1011,25 @@ lib::Request BlockTransport::BuildBlockRequest(
       .uuid = uuid,
       .request_id = request_id,
       .shard_idx = shard_idx,
+      .stream_idx = stream_idx,
   };
 }
 
 absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
-    absl::string_view peer, size_t block_offset, size_t block_count,
-    const std::vector<int>& src_block_ids,
+    absl::string_view peer, const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, MajorOrder major_order,
     uint64_t uuid, int layer_idx, int parallelism) {
+  const size_t num_blocks = src_block_ids.size();
   const uint8_t socket_opcode =
       static_cast<uint8_t>(dst_block_ids.empty() ? 1 : 6);
   const uint32_t remote_id = static_cast<uint32_t>(block_delegate_->node_id());
   const uint32_t local_id =
       layer_idx == -1 ? 0xFFFF'FFFF : static_cast<uint32_t>(layer_idx);
-  const uint32_t count_or_size = static_cast<uint32_t>(block_count);
-
-  if (block_count == 0) {
+  if (num_blocks == 0) {
     return std::vector<lib::Request>{BuildBlockRequest(
         socket_opcode, /*laddr=*/nullptr, /*len=*/0, /*count_or_size=*/0,
         layer_idx, /*request_id=*/0, uuid, parallelism, major_order, remote_id,
-        local_id, /*shard_idx=*/0)};
+        local_id, /*shard_idx=*/0, /*stream_idx=*/0)};
   }
 
   std::vector<int> target_layers;
@@ -1001,50 +1040,62 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
     target_layers = {layer_idx};
   }
 
+  const size_t base_blocks_per_stream = num_blocks / parallelism;
+  const size_t remainder = num_blocks % parallelism;
+
   std::vector<lib::Request> requests;
   requests.reserve(target_layers.size() * block_delegate_->num_shards() *
-                   block_count);
-  uint32_t request_id = 0;
-  absl::Status s = ForEachPayload(
-      major_order, target_layers, block_delegate_->num_shards(), block_count,
-      [&](size_t l, size_t sh, size_t k) -> absl::Status {
-        ABSL_DCHECK_LT(block_offset + k, src_block_ids.size());
-        const int src_id = src_block_ids[block_offset + k];
+                   num_blocks);
 
-        const int64_t block_id_val = src_id;
-        const int64_t dst_id_val =
-            block_offset + k < dst_block_ids.size()
-                ? static_cast<int64_t>(dst_block_ids[block_offset + k])
-                : -1;
-        std::vector<BlockChunk> chunks = block_delegate_->GetBlockChunks(
-            l, sh, absl::MakeConstSpan(&block_id_val, 1),
-            block_delegate_->block_bytes(l), uuid, -1, peer,
-            /*src_block_id=*/-1, /*dst_block_id=*/dst_id_val);
-        if (chunks.empty()) {
-          return absl::NotFoundError(
-              absl::StrCat("No transfer chunks found for block ", src_id,
-                           " and uuid ", uuid));
-        }
-        RETURN_IF_ERROR(ValidateChunks(block_delegate_, l, sh, chunks));
+  for (int i = 0; i < parallelism; ++i) {
+    const size_t stream_block_count =
+        base_blocks_per_stream + (static_cast<size_t>(i) < remainder ? 1 : 0);
+    const size_t stream_block_offset =
+        i * base_blocks_per_stream + std::min<size_t>(i, remainder);
+    const uint32_t count_or_size = static_cast<uint32_t>(stream_block_count);
+    uint32_t request_id = 0;
 
-        const int shard_idx = static_cast<int>(sh);
-        for (const auto& chunk : chunks) {
-          requests.push_back(BuildBlockRequest(
-              socket_opcode, chunk.ptr, chunk.size, count_or_size, layer_idx,
-              request_id, uuid, parallelism, major_order, remote_id, local_id,
-              shard_idx));
-        }
-        ++request_id;
-        return absl::OkStatus();
-      });
+    absl::Status s = ForEachPayload(
+        major_order, target_layers, block_delegate_->num_shards(),
+        stream_block_count, [&](size_t l, size_t sh, size_t k) -> absl::Status {
+          ABSL_DCHECK_LT(stream_block_offset + k, src_block_ids.size());
+          const int src_id = src_block_ids[stream_block_offset + k];
 
-  if (!s.ok()) {
-    return s;
+          const int64_t block_id_val = src_id;
+          const int64_t dst_id_val =
+              stream_block_offset + k < dst_block_ids.size()
+                  ? static_cast<int64_t>(dst_block_ids[stream_block_offset + k])
+                  : -1;
+          std::vector<BlockChunk> chunks = block_delegate_->GetBlockChunks(
+              l, sh, absl::MakeConstSpan(&block_id_val, 1),
+              block_delegate_->block_bytes(l), uuid, -1, peer,
+              /*src_block_id=*/-1, /*dst_block_id=*/dst_id_val);
+          if (chunks.empty()) {
+            return absl::NotFoundError(
+                absl::StrCat("No transfer chunks found for block ", src_id,
+                             " and uuid ", uuid));
+          }
+          RETURN_IF_ERROR(ValidateChunks(block_delegate_, l, sh, chunks));
+
+          const int shard_idx = static_cast<int>(sh);
+          for (const auto& chunk : chunks) {
+            requests.push_back(BuildBlockRequest(
+                socket_opcode, chunk.ptr, chunk.size, count_or_size, layer_idx,
+                request_id, uuid, parallelism, major_order, remote_id, local_id,
+                shard_idx, /*stream_idx=*/i));
+          }
+          ++request_id;
+          return absl::OkStatus();
+        });
+
+    if (!s.ok()) {
+      return s;
+    }
   }
   return requests;
 }
 
-absl::Status BlockTransport::ProcessSocketPush(
+absl::Status BlockTransport::PostSocketPushInternal(
     absl::string_view peer, absl::string_view local_ip,
     absl::Span<const lib::Request> requests,
     const std::vector<int>& src_block_ids,
@@ -1161,37 +1212,6 @@ absl::Status BlockTransport::ProcessSocketPush(
 
   ok_to_pool = true;
   return absl::OkStatus();
-}
-
-void BlockTransport::H2hWriteWorker(int stream_idx, absl::string_view peer,
-                                    absl::string_view local_ip,
-                                    size_t block_offset, size_t block_count,
-                                    const std::vector<int>& src_block_ids,
-                                    const std::vector<int>& dst_block_ids,
-                                    std::vector<int>& allocated_ids,
-                                    std::vector<absl::Status>& statuses,
-                                    MajorOrder major_order, uint64_t uuid,
-                                    int layer_idx, int parallelism) {
-  if (block_count > std::numeric_limits<uint32_t>::max()) {
-    statuses[stream_idx] = absl::OutOfRangeError("Block count exceeds uint32");
-    return;
-  }
-
-  auto requests_or = BuildBlockRequests(
-      peer, block_offset, block_count, src_block_ids, dst_block_ids,
-      major_order, uuid, layer_idx, parallelism);
-  if (!requests_or.ok()) {
-    statuses[stream_idx] = requests_or.status();
-    return;
-  }
-
-  absl::Status s =
-      ProcessSocketPush(peer, local_ip, *requests_or, src_block_ids,
-                        dst_block_ids, block_offset, allocated_ids);
-  if (!s.ok()) {
-    statuses[stream_idx] = s;
-    return;
-  }
 }
 
 absl::StatusOr<std::vector<lib::Request>>

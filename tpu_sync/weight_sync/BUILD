@@ -181,3 +181,50 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "weight_synchronization_worker_service_client",
+    srcs = ["weight_synchronization_worker_service_client.cc"],
+    hdrs = ["weight_synchronization_worker_service_client.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_sync/rpc:raiden_service_cc_grpc",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@xla//xla/tsl/concurrency:future",
+    ],
+)
+
+cc_test(
+    name = "weight_synchronization_worker_service_client_test",
+    srcs = ["weight_synchronization_worker_service_client_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":weight_synchronization_worker_service",
+        ":weight_synchronization_worker_service_client",
+        ":weight_synchronizer_base",
+        "//tpu_sync/rpc:raiden_service_cc_grpc",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/concurrency:future",
+    ],
+)

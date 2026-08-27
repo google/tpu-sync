@@ -34,3 +34,22 @@ py_test(
         "@com_google_absl_py//absl/testing:absltest",
     ],
 )
+
+py_library(
+    name = "weight_synchronizer_manager",
+    srcs = ["weight_synchronizer_manager.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_sync/rpc:raiden_controller",
+    ],
+)
+
+py_test(
+    name = "weight_synchronizer_manager_test",
+    srcs = ["weight_synchronizer_manager_test.py"],
+    deps = [
+        ":weight_synchronizer_manager",
+        "//tpu_sync/rpc:raiden_controller",
+        "@com_google_absl_py//absl/testing:absltest",
+    ],
+)

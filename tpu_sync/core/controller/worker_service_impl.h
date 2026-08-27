@@ -72,6 +72,13 @@ class WorkerServiceImpl final
       const ::tpu_sync::proto::TransferBuffersRequest* request,
       ::tpu_sync::proto::TransferBuffersResponse* response) override;
 
+  // Dynamically configures storage backends (e.g. POSIX disk, K5 thick client)
+  // on this worker node.
+  grpc::Status RegisterBackends(
+      grpc::ServerContext* context,
+      const ::tpu_sync::proto::RegisterBackendsRequest* request,
+      ::tpu_sync::proto::RegisterBackendsResponse* response) override;
+
   // Normalizes a pool-reshard transfer program, lowers it to the
   // byte-identical StartTransferRequest the framed entry would deliver, and
   // drives the same pool executor operations. Unsupported completion

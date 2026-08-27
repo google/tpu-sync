@@ -155,7 +155,7 @@ struct TransferPipelinedState {
   raiden::BufferHolders combined_holds;
 
   TransferPipelinedState(size_t total_chunks, xla::Promise<> p,
-                         raiden::BufferHolders holds)
+                         raiden::BufferHolders holds = {})
       : total_chunks(total_chunks),
         promise(std::move(p)),
         combined_holds(std::move(holds)) {}
@@ -2711,6 +2711,263 @@ void KVCacheManagerBase::UpdateAllocatedOccupancyMetric() const {
   telemetry::RaidenMetricStore::GetGlobalMetricStore().SetGauge(
       telemetry::metric_names::kBufferAllocatedBytes, {},
       static_cast<double>(total_host_dram));
+}
+
+void KVCacheManagerBase::RegisterBackend(
+    const std::string& scheme, std::shared_ptr<storage::KVBackend> backend) {
+  absl::MutexLock lock(&storage_backends_mu_);
+  storage_backends_[scheme] = std::move(backend);
+}
+
+std::shared_ptr<storage::KVBackend> KVCacheManagerBase::GetBackend(
+    const std::string& scheme) const {
+  absl::MutexLock lock(&storage_backends_mu_);
+  auto it = storage_backends_.find(scheme);
+  if (it == storage_backends_.end()) return nullptr;
+  return it->second;
+}
+
+absl::StatusOr<std::vector<int>> KVCacheManagerBase::ToHostBlockIds(
+    const std::vector<int64_t>& offsets) {
+  std::vector<int> block_ids;
+  block_ids.reserve(offsets.size());
+  size_t block_sz = bytes_per_block();
+  for (int64_t offset : offsets) {
+    if (offset % block_sz != 0) {
+      return absl::InvalidArgumentError(
+          "Offset is not aligned to bytes_per_block");
+    }
+    block_ids.push_back(static_cast<int>(offset / block_sz));
+  }
+  return block_ids;
+}
+
+// Save Path (implicit HBM -> DRAM -> Storage)
+absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
+    std::shared_ptr<storage::KVBackend> backend,
+    const std::vector<storage::BlockKey>& block_keys,
+    const std::vector<int64_t>& src_device_offsets,
+    const std::vector<int64_t>& dst_host_offsets,
+    const std::vector<int64_t>& copy_sizes) {
+  TF_ASSIGN_OR_RETURN(std::vector<int> staging_block_ids,
+                      ToHostBlockIds(dst_host_offsets));
+
+  size_t num_chunks = copy_sizes.size();
+  auto [promise, aggregate_future] = xla::MakePromise();
+
+  // Helper structure to hold the first-stage DMA future and target staging slot
+  // index
+  struct ChunkD2h {
+    raiden::PjRtCopyFuture d2h_fut;
+    int staging_block_id;
+  };
+  std::vector<ChunkD2h> chunks;
+  chunks.reserve(num_chunks);
+  raiden::BufferHolders all_holds;
+
+  // Step 1: Dispatch local PCIe HBM-to-DRAM DMA copies for each chunk
+  for (size_t i = 0; i < num_chunks; ++i) {
+    size_t block_sz = bytes_per_block();
+    int64_t src_block_idx = src_device_offsets[i] / block_sz;
+    int64_t dst_block_idx = dst_host_offsets[i] / block_sz;
+    int64_t size_blocks = copy_sizes[i] / block_sz;
+
+    // Trigger local DMA copy chunk (non-blocking)
+    TF_ASSIGN_OR_RETURN(
+        auto chunk_futures,
+        DispatchD2hChunks({src_block_idx}, {dst_block_idx}, {size_blocks}));
+    raiden::PjRtCopyFuture d2h_fut =
+        raiden::JoinPjRtCopyFutures(absl::MakeSpan(chunk_futures));
+    // Accumulate reference holds to prevent buffer reclaim
+    for (const auto& h : d2h_fut.holds) {
+      all_holds.push_back(h);
+    }
+    chunks.push_back({std::move(d2h_fut), staging_block_ids[i]});
+  }
+
+  // Aggregate completion state
+  auto state = std::make_shared<TransferPipelinedState>(
+      num_chunks, std::move(promise), std::move(all_holds));
+
+  // Step 2: Attach completion callbacks.
+  // As each block's local D2H copy completes, we schedule its storage write
+  // task to run asynchronously on the background `push_pool_`.
+  for (size_t i = 0; i < num_chunks; ++i) {
+    int staging_block_id = chunks[i].staging_block_id;
+    chunks[i].d2h_fut.OnReady(
+        [this, backend, state, staging_block_id,
+         key = block_keys[i]](absl::StatusOr<raiden::BufferHolders> status) {
+          if (!status.ok()) {
+            state->SetError(status.status());
+            state->MarkChunkComplete();
+            return;
+          }
+
+          // Dispatch synchronous block write to the push thread pool
+          push_pool_->Schedule([this, backend, state, staging_block_id, key]() {
+            absl::Status s =
+                WriteSingleBlockToBackendSync(backend, key, staging_block_id);
+            if (!s.ok()) state->SetError(s);
+            state->MarkChunkComplete();
+          });
+        });
+  }
+  return raiden::PjRtCopyFuture(std::move(aggregate_future),
+                                state->combined_holds);
+}
+
+// Load Path (implicit Storage -> DRAM -> HBM)
+absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
+    std::shared_ptr<storage::KVBackend> backend,
+    const std::vector<storage::BlockKey>& block_keys,
+    const std::vector<int64_t>& src_host_offsets,
+    const std::vector<int64_t>& dst_device_offsets,
+    const std::vector<int64_t>& copy_sizes) {
+  TF_ASSIGN_OR_RETURN(std::vector<int> staging_block_ids,
+                      ToHostBlockIds(src_host_offsets));
+
+  size_t num_chunks = src_host_offsets.size();
+  auto [promise, aggregate_future] = xla::MakePromise();
+  auto state =
+      std::make_shared<TransferPipelinedState>(num_chunks, std::move(promise));
+
+  // Step 1: Schedule storage read tasks.
+  // Since reading files from backends (e.g. Lustre/GCS) involves blocking I/O
+  // syscalls, we dispatch them to the background `pull_pool_` so they do not
+  // block the worker thread.
+  for (size_t i = 0; i < num_chunks; ++i) {
+    int staging_block_id = staging_block_ids[i];
+    size_t block_sz = bytes_per_block();
+    int64_t staging_block_idx = src_host_offsets[i] / block_sz;
+    int64_t device_block_idx = dst_device_offsets[i] / block_sz;
+    int64_t size_blocks = copy_sizes[i] / block_sz;
+    storage::BlockKey key = block_keys[i];
+
+    pull_pool_->Schedule([this, backend, state, key, staging_block_id,
+                          staging_block_idx, device_block_idx, size_blocks]() {
+      // 1. Synchronously read block from KVBackend storage into DRAM staging
+      // buffer
+      absl::Status read_status =
+          ReadSingleBlockFromBackendSync(backend, key, staging_block_id);
+      if (!read_status.ok()) {
+        state->SetError(read_status);
+        state->MarkChunkComplete();
+        return;
+      }
+      // 2. Immediately trigger Host DRAM -> TPU HBM DMA copy (second-stage
+      // pipeline)
+      auto h2d_fut_or =
+          H2d({staging_block_idx}, {device_block_idx}, {size_blocks});
+      if (!h2d_fut_or.ok()) {
+        state->SetError(h2d_fut_or.status());
+        state->MarkChunkComplete();
+        return;
+      }
+      h2d_fut_or->OnReady(
+          [state](absl::StatusOr<raiden::BufferHolders> status) {
+            if (!status.ok()) state->SetError(status.status());
+            state->MarkChunkComplete();
+          });
+    });
+  }
+  return raiden::PjRtCopyFuture(std::move(aggregate_future), /*holds=*/{});
+}
+
+// Explicit Write-back
+absl::Status KVCacheManagerBase::WriteToBackend(
+    std::shared_ptr<storage::KVBackend> backend,
+    const std::vector<storage::BlockKey>& block_keys,
+    const std::vector<int64_t>& host_offsets) {
+  TF_ASSIGN_OR_RETURN(std::vector<int> staging_block_ids,
+                      ToHostBlockIds(host_offsets));
+
+  size_t num_blocks = host_offsets.size();
+  std::atomic<size_t> completed(0);
+  absl::Notification all_done;
+  std::vector<absl::Status> statuses(num_blocks);
+
+  // Dispatch all block writes to the push thread pool concurrently
+  for (size_t i = 0; i < num_blocks; ++i) {
+    int staging_block_id = staging_block_ids[i];
+    push_pool_->Schedule([this, backend, key = block_keys[i], staging_block_id,
+                          i, &completed, &statuses, &all_done, num_blocks]() {
+      statuses[i] =
+          WriteSingleBlockToBackendSync(backend, key, staging_block_id);
+      if (++completed == num_blocks) all_done.Notify();
+    });
+  }
+  // Block calling thread until all writes are completed
+  all_done.WaitForNotification();
+  for (const auto& s : statuses) {
+    if (!s.ok()) return s;
+  }
+  return absl::OkStatus();
+}
+
+// Helper: Synchronously offloads a single block from local DRAM staging buffer
+// to the storage backend. Blocks the calling background thread until the
+// backend's async callback resolves.
+absl::Status KVCacheManagerBase::WriteSingleBlockToBackendSync(
+    std::shared_ptr<storage::KVBackend> backend, const storage::BlockKey& key,
+    int staging_block_id) {
+  absl::Notification done;
+  absl::Status status;
+  // Resolve host DRAM raw memory pointer for the staging slot (layer=0, shard=0
+  // in mock)
+  uint8_t* host_ptr =
+      GetBlockHostPointer(/*layer_idx=*/0, /*shard_idx=*/0, staging_block_id);
+  size_t size = bytes_per_block();
+
+  storage::StorageBufferDescriptor buffer;
+  buffer.ptr = host_ptr;
+  if (host_allocator_ && host_allocator_.host_memory_allocator() != nullptr) {
+    auto info_or =
+        host_allocator_.host_memory_allocator()->GetSharedMemoryInfo(host_ptr);
+    if (info_or.ok()) {
+      buffer.fd = info_or.value().fd;
+      buffer.offset = info_or.value().offset;
+    }
+  }
+
+  backend->WriteAsync(key, buffer, size, [&](const absl::Status& s) {
+    status = s;
+    done.Notify();
+  });
+  done.WaitForNotification();
+  return status;
+}
+
+// Helper: Synchronously reads a single block from the storage backend into a
+// local DRAM staging buffer. Blocks the calling background thread until the
+// backend's async callback resolves.
+absl::Status KVCacheManagerBase::ReadSingleBlockFromBackendSync(
+    std::shared_ptr<storage::KVBackend> backend, const storage::BlockKey& key,
+    int staging_block_id) {
+  absl::Notification done;
+  absl::Status status;
+  // Resolve host DRAM raw memory pointer for the staging slot (layer=0, shard=0
+  // in mock)
+  uint8_t* host_ptr =
+      GetBlockHostPointer(/*layer_idx=*/0, /*shard_idx=*/0, staging_block_id);
+  size_t size = bytes_per_block();
+
+  storage::StorageBufferDescriptor buffer;
+  buffer.ptr = host_ptr;
+  if (host_allocator_ && host_allocator_.host_memory_allocator() != nullptr) {
+    auto info_or =
+        host_allocator_.host_memory_allocator()->GetSharedMemoryInfo(host_ptr);
+    if (info_or.ok()) {
+      buffer.fd = info_or.value().fd;
+      buffer.offset = info_or.value().offset;
+    }
+  }
+
+  backend->ReadAsync(key, buffer, size, [&](const absl::Status& s) {
+    status = s;
+    done.Notify();
+  });
+  done.WaitForNotification();
+  return status;
 }
 
 }  // namespace kv_cache

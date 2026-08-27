@@ -42,6 +42,7 @@ enum class BlockStatus {
   HBM,
   HOST,
   HOST_AND_HBM,
+  STORAGE,
 };
 
 struct RaidenBlockId {
@@ -109,6 +110,9 @@ class KVCacheStoreBackend {
   // Name identifying the backend type (e.g., "LruCacheBackend",
   // "GlobalMemoryPoolingBackend").
   virtual std::string name() const = 0;
+
+  // URI scheme identifying the backend (e.g., "lustre", "k5", "posix").
+  virtual std::string scheme() const { return ""; }
 
   // Resolves cached block hashes in sequence.
   // Returns a list of matched (block_hash, RaidenBlockId) pairs up to the first

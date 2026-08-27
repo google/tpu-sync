@@ -28,12 +28,14 @@
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "grpcpp/server_context.h"
-#include "grpcpp/support/status.h"
+#include "google/protobuf/repeated_ptr_field.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/transfer_program_reshard.h"
+#include "tpu_sync/kv_cache/storage/k5_backend.h"
+#include "tpu_sync/kv_cache/storage/storage.h"
 #include "tpu_sync/proto/transfer_program.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -42,6 +44,14 @@ namespace tpu_raiden {
 namespace controller {
 
 namespace {
+
+bool HasStage(const google::protobuf::RepeatedPtrField<std::string>& pipeline,
+              absl::string_view stage) {
+  for (const auto& s : pipeline) {
+    if (s == stage) return true;
+  }
+  return false;
+}
 
 bool IsD2H(::tpu_sync::rpc::MemoryType src_mem_type,
            ::tpu_sync::rpc::MemoryType dst_mem_type) {
@@ -137,6 +147,109 @@ grpc::Status WorkerServiceImpl::TransferBuffers(
     ::tpu_sync::proto::TransferBuffersResponse* response) {
   absl::MutexLock lock(mutex_);
   const auto& transfer = request->transfer();
+
+  if (transfer.has_storage_spec()) {
+    if (!transfer_manager_) {
+      response->set_success(false);
+      response->set_message(
+          "Transfer manager is not configured on WorkerService");
+      return grpc::Status::OK;
+    }
+    const auto& storage_spec = transfer.storage_spec();
+    std::string scheme = storage_spec.scheme();
+    std::shared_ptr<kv_cache::storage::KVBackend> driver =
+        transfer_manager_.GetBackend(scheme);
+    if (!driver) {
+      LOG(ERROR) << "[Worker] No storage backend registered for scheme: "
+                 << scheme;
+      response->set_success(false);
+      response->set_message(
+          absl::StrCat("No storage backend registered for scheme: ", scheme));
+      return grpc::Status::OK;
+    }
+
+    // Unpack per-block descriptors from keys_by_buffer_index map
+    std::vector<kv_cache::storage::BlockKey> block_keys;
+    std::vector<int64_t> src_offsets;
+    std::vector<int64_t> dst_offsets;
+    std::vector<int64_t> copy_sizes;
+
+    size_t num_buffers = storage_spec.keys_by_buffer_index().size();
+    block_keys.reserve(num_buffers);
+    src_offsets.reserve(num_buffers);
+    dst_offsets.reserve(num_buffers);
+    copy_sizes.reserve(num_buffers);
+
+    for (size_t i = 0; i < num_buffers; ++i) {
+      auto it =
+          storage_spec.keys_by_buffer_index().find(static_cast<int32_t>(i));
+      if (it == storage_spec.keys_by_buffer_index().end()) {
+        response->set_success(false);
+        response->set_message(
+            absl::StrCat("Missing StorageKeyDescriptor for buffer_index: ", i));
+        return grpc::Status::OK;
+      }
+      kv_cache::storage::BlockKey key;
+      key.resolved_key = it->second.storage_key();
+      block_keys.push_back(key);
+
+      int64_t src_off = (i < transfer.src_offsets().size())
+                            ? transfer.src_offsets(i)
+                        : (i < transfer.src_buffers_size() &&
+                           transfer.src_buffers(i).has_index())
+                            ? transfer.src_buffers(i).index()
+                            : 0;
+      int64_t dst_off = (i < transfer.dst_offsets().size())
+                            ? transfer.dst_offsets(i)
+                        : (i < transfer.dst_buffers_size() &&
+                           transfer.dst_buffers(i).has_index())
+                            ? transfer.dst_buffers(i).index()
+                            : 0;
+      int64_t copy_sz = (i < transfer.copy_sizes().size())
+                            ? transfer.copy_sizes(i)
+                            : transfer_manager_.bytes_per_block();
+
+      src_offsets.push_back(src_off);
+      dst_offsets.push_back(dst_off);
+      copy_sizes.push_back(copy_sz);
+    }
+
+    absl::Status status;
+    switch (storage_spec.direction()) {
+      case ::tpu_sync::proto::TRANSFER_DIR_OFFLOAD: {
+        auto fut_or = transfer_manager_.D2hWriteToBackend(
+            driver, block_keys, src_offsets, dst_offsets, copy_sizes);
+        if (fut_or.ok()) {
+          status = fut_or.value().Await();
+        } else {
+          status = fut_or.status();
+        }
+        break;
+      }
+
+      case ::tpu_sync::proto::TRANSFER_DIR_RECALL: {
+        auto fut_or = transfer_manager_.H2dReadFromBackend(
+            driver, block_keys, src_offsets, dst_offsets, copy_sizes);
+        if (fut_or.ok()) {
+          status = fut_or.value().Await();
+        } else {
+          status = fut_or.status();
+        }
+        break;
+      }
+
+      default:
+        status = absl::InvalidArgumentError(
+            "Unrecognized storage transfer direction");
+        break;
+    }
+
+    response->set_success(status.ok());
+    if (!status.ok()) {
+      response->set_message(std::string(status.message()));
+    }
+    return grpc::Status::OK;
+  }
 
   ::tpu_sync::rpc::MemoryType src_mem_type = transfer.src_mem_type();
   ::tpu_sync::rpc::MemoryType dst_mem_type = transfer.dst_mem_type();
@@ -425,6 +538,61 @@ grpc::Status WorkerServiceImpl::AbortTransfer(
     ::tpu_sync::proto::AbortTransferResponse* response) {
   return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
                       "AbortTransfer is not implemented");
+}
+
+grpc::Status WorkerServiceImpl::RegisterBackends(
+    grpc::ServerContext* context,
+    const ::tpu_sync::proto::RegisterBackendsRequest* request,
+    ::tpu_sync::proto::RegisterBackendsResponse* response) {
+  absl::MutexLock lock(mutex_);
+  if (!transfer_manager_) {
+    response->set_success(false);
+    response->set_error_message(
+        "Transfer manager is not configured on WorkerService");
+    return grpc::Status::OK;
+  }
+  for (const auto& config : request->configs()) {
+    std::string name = config.name();
+    std::string scheme = config.scheme();
+    if (scheme.empty()) {
+      auto scheme_it = config.properties().find("scheme");
+      if (scheme_it != config.properties().end()) {
+        scheme = scheme_it->second;
+      }
+    }
+    if (name == "PosixBackend") {
+      if (scheme.empty()) {
+        response->set_success(false);
+        response->set_error_message("Missing 'scheme' in backend config");
+        return grpc::Status::OK;
+      }
+      auto backend = std::make_shared<kv_cache::storage::PosixBackend>();
+      transfer_manager_.RegisterBackend(scheme, backend);
+      LOG(INFO)
+          << "[Worker] Dynamically registered storage backend for scheme '"
+          << scheme << "' (name: " << name << ")";
+    } else if (name == "K5Backend" || name == "K5BackendMock") {
+      auto uds_it = config.properties().find("uds_path");
+      if (scheme.empty() || uds_it == config.properties().end()) {
+        response->set_success(false);
+        response->set_error_message(
+            "Missing 'scheme' or 'uds_path' in K5Backend config");
+        return grpc::Status::OK;
+      }
+      std::string uds_path = uds_it->second;
+      auto backend =
+          std::make_shared<kv_cache::storage::K5BackendMock>(uds_path);
+      transfer_manager_.RegisterBackend(scheme, backend);
+      LOG(INFO) << "[Worker] Dynamically registered K5 backend for scheme '"
+                << scheme << "' and UDS: " << uds_path;
+    } else {
+      response->set_success(false);
+      response->set_error_message("Unsupported backend name: " + name);
+      return grpc::Status::OK;
+    }
+  }
+  response->set_success(true);
+  return grpc::Status::OK;
 }
 
 }  // namespace controller

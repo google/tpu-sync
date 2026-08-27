@@ -47,6 +47,7 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
+#include "tpu_sync/kv_cache/storage/storage.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
@@ -259,6 +260,63 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Blocks until all pending asynchronous transfers/copies are complete.
   virtual absl::Status WaitForPendingWork() { return absl::OkStatus(); }
 
+  // Registers a storage driver plugin (e.g. Lustre POSIX mount or K5 driver).
+  void RegisterBackend(const std::string& scheme,
+                       std::shared_ptr<storage::KVBackend> backend);
+
+  // Returns the storage driver registered for the specified URI scheme, or
+  // nullptr if none.
+  std::shared_ptr<storage::KVBackend> GetBackend(
+      const std::string& scheme) const;
+
+  // Save Path (implicit HBM -> Host DRAM staging -> Storage write)
+  //
+  // Coordinates the two-stage pipeline to offload blocks:
+  // 1. Launches async device-to-host (D2H) copy from TPU HBM into local Host
+  // DRAM staging slots.
+  // 2. Registers a callback via `.OnReady` on the D2H future.
+  // 3. When the DMA finishes for a block, schedules a task on `push_pool_`
+  // thread pool
+  //    to synchronously write the staging DRAM buffer contents to the target
+  //    `KVBackend`.
+  //
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+      std::shared_ptr<storage::KVBackend> backend,
+      const std::vector<storage::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_offsets,
+      const std::vector<int64_t>& dst_host_offsets,
+      const std::vector<int64_t>& copy_sizes);
+
+  // Load Path (implicit Storage read -> Host DRAM staging -> HBM copy)
+  //
+  // Coordinates the two-stage pipeline to recall blocks:
+  // 1. For each block, schedules a task on `pull_pool_` thread pool to read
+  // the block
+  //    data from `KVBackend` into the host DRAM staging buffer (blocking FS
+  //    call).
+  // 2. Once the disk read completes on the pull thread, immediately
+  // triggers the Host-to-Device (H2D)
+  //    DMA copy using block index arrays to promote the block to HBM.
+  // 3. Chain block callbacks to notify the aggregate future when H2D copies
+  // finish.
+  //
+  // Returns an aggregate PjRtCopyFuture that signals complete when the
+  // final stage of H2D is done for all blocks.
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+      std::shared_ptr<storage::KVBackend> backend,
+      const std::vector<storage::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_host_offsets,
+      const std::vector<int64_t>& dst_device_offsets,
+      const std::vector<int64_t>& copy_sizes);
+
+  // Explicit DRAM -> Storage write
+  // Synchronously offloads a batch of blocks from local DRAM staging
+  // buffers to the storage backend. Blocks the calling thread until all
+  // disk write tasks complete.
+  absl::Status WriteToBackend(std::shared_ptr<storage::KVBackend> backend,
+                              const std::vector<storage::BlockKey>& block_keys,
+                              const std::vector<int64_t>& host_offsets);
+
   virtual absl::StatusOr<raiden::PjRtCopyFuture> H2hReadExplicit(
       std::string peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& local_block_ids,
@@ -291,12 +349,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       const std::vector<int64_t>& dst_offsets = {},
       const std::vector<int64_t>& copy_sizes = {}, int64_t device_id = -1);
 
-  // Layer-wise copies using caller-owned host buffers. The raw copy operation
-  // captures the supplied address when issued, so independent calls can overlap
-  // across layers.
-  // NOTE: These functions are temporary. Long-term, KVCacheManager should own
-  // these host buffers to enable serving prefix cache lookups directly from
-  // RAM.
+  // Layer-wise copies using caller-owned host buffers. The raw copy
+  // operation captures the supplied address when issued, so independent
+  // calls can overlap across layers. NOTE: These functions are temporary.
+  // Long-term, KVCacheManager should own these host buffers to enable
+  // serving prefix cache lookups directly from RAM.
 
   absl::Status ConfigureHostStagingSlots(int64_t num_slots,
                                          int64_t max_major_per_slot);
@@ -647,6 +704,21 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Initializes background worker thread if RAIDEN_ENABLE_ASYNC_DISPATCH is
   // enabled.
   void InitBackgroundWorker();
+
+  // Synchronous wrappers that wait on absl::Notification.
+  // Used as helper tasks scheduled on `push_pool_` or `pull_pool_`.
+  absl::Status WriteSingleBlockToBackendSync(
+      std::shared_ptr<storage::KVBackend> backend, const storage::BlockKey& key,
+      int staging_block_id);
+  absl::Status ReadSingleBlockFromBackendSync(
+      std::shared_ptr<storage::KVBackend> backend, const storage::BlockKey& key,
+      int staging_block_id);
+  absl::StatusOr<std::vector<int>> ToHostBlockIds(
+      const std::vector<int64_t>& offsets);
+
+  mutable absl::Mutex storage_backends_mu_;
+  absl::flat_hash_map<std::string, std::shared_ptr<storage::KVBackend>>
+      storage_backends_ ABSL_GUARDED_BY(storage_backends_mu_);
 };
 
 }  // namespace kv_cache

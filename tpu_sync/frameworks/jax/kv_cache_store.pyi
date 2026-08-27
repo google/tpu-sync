@@ -10,6 +10,7 @@ class BlockStatus(enum.Enum):
   # peer leaves no local entry at all -- its landing blocks are freed and no
   # host copy is kept.
   HOST_AND_HBM = ...
+  STORAGE = ...
 
 class RaidenId:
   job_name: str

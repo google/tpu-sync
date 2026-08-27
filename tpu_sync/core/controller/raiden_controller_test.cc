@@ -44,6 +44,7 @@
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
+#include "tpu_sync/kv_cache/storage/storage.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
@@ -1410,6 +1411,53 @@ TEST_F(RaidenControllerTest, TransferBuffersRemoteDramToLocalHbmSuccess) {
   EXPECT_EQ(mock_mgr.last_peer, "remote_host:9090");
   EXPECT_THAT(mock_mgr.last_src_offsets, ElementsAre(0));
   EXPECT_THAT(mock_mgr.last_dst_offsets, ElementsAre(1));
+}
+
+TEST_F(RaidenControllerTest, MapperAndRegisterBackends) {
+  MockTransferManager mock_mgr;
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock_mgr));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/1,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  EXPECT_EQ(controller->mapper(), nullptr);
+  auto mapper = std::make_shared<kv_cache::storage::PosixPathMapper>(
+      "/tmp/storage", "test_model", 1, 0);
+  controller->SetMapper(mapper);
+  EXPECT_EQ(controller->mapper(), mapper);
+
+  std::vector<::tpu_sync::proto::BackendConfig> configs;
+  ::tpu_sync::proto::BackendConfig config;
+  config.set_name("PosixBackend");
+  config.set_scheme("posix_test");
+  configs.push_back(config);
+
+  auto status = controller->RegisterBackends(configs);
+  EXPECT_TRUE(status.ok());
+}
+
+TEST_F(RaidenControllerTest, ExecuteTransferBuffersgRPCSyncSuccess) {
+  MockTransferManager mock_mgr;
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock_mgr));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/1,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto src_buffers, controller->AllocateBuffers(1));
+  src_buffers[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto dst_buffers, controller->AllocateBuffers(1));
+  dst_buffers[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+
+  auto status =
+      controller->ExecuteTransferBuffersgRPCSync(src_buffers, dst_buffers);
+  EXPECT_TRUE(status.ok());
 }
 
 }  // namespace

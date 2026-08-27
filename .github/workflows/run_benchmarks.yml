@@ -55,11 +55,11 @@ permissions:
 
 jobs: 
   run_benchmarks:
-    name: Run Single Host Benchmarks
-    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@aa854ba7bdb77966a9cc1a013417f1c1a208c4c0 # main
+    name: Run Benchmarks
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@c338f658d4f75feb3f3d5527e232944eb795ff56
     with:
       registry_file: "tpu_sync/benchmarks/benchmark_registry.pbtxt"
-      bap_ref: "aa854ba7bdb77966a9cc1a013417f1c1a208c4c0"
+      bap_ref: "c338f658d4f75feb3f3d5527e232944eb795ff56"
       runner: "linux-x86-n2-8"
       ab_mode: ${{ inputs.ab_mode }}
       baseline_ref: ${{ inputs.baseline_ref }}

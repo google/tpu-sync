@@ -16,8 +16,27 @@
 
 from typing import Any, Dict, List, Optional
 
-# Import Nanobind binary library directly E2E!
+import jax
+
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _weight_synchronizer
+from tpu_sync.frameworks.jax import weight_synchronizer_ffi as _weight_synchronizer_ffi
+
+
+def is_pathways_backend() -> bool:
+  """Returns True if the current JAX environment is targeting Pathways."""
+  try:
+    if jax.config.read("jax_platforms") == "pathways":
+      return True
+    devices = jax.devices()
+    if (
+        devices
+        and hasattr(devices[0], "client")
+        and hasattr(devices[0].client, "runtime_type")
+    ):
+      return "pathways" in str(devices[0].client.runtime_type).lower()
+  except Exception:
+    pass
+  return False
 
 
 class WeightSynchronizer:
@@ -32,6 +51,7 @@ class WeightSynchronizer:
       listener_port: Optional[int] = None,
       bind_ip: Optional[str] = None,
       auto_h2d: bool = False,
+      backend: Optional[str] = None,
   ):
     """Instantiates the Weight Synchronizer on a JAX weights list.
 
@@ -43,31 +63,50 @@ class WeightSynchronizer:
       listener_port: Sockets server port for incoming C++ Listener commands.
       bind_ip: Sockets server bind IP address.
       auto_h2d: Automatically execute H2D ingestion upon data arrival.
+      backend: Explicit backend selection ('pathways' or 'pjrt'/'default'). If
+        None, automatically detected based on the active JAX runtime.
     """
-    self._impl = _weight_synchronizer.WeightSynchronizer(
-        jax_arrays,
-        local_port,
-        parallelism,
-        unsafe_skip_buffer_lock,
-        listener_port,
-        bind_ip,
-        auto_h2d,
+    use_ffi = (backend == "pathways") or (
+        backend is None and is_pathways_backend()
     )
+    if use_ffi:
+      self._impl = _weight_synchronizer_ffi.WeightSynchronizer(
+          jax_arrays=jax_arrays,
+          local_port=local_port,
+          parallelism=parallelism,
+          unsafe_skip_buffer_lock=unsafe_skip_buffer_lock,
+          listener_port=listener_port,
+          bind_ip=bind_ip,
+          auto_h2d=auto_h2d,
+      )
+    else:
+      self._impl = _weight_synchronizer.WeightSynchronizer(
+          jax_arrays,
+          local_port,
+          parallelism,
+          unsafe_skip_buffer_lock,
+          listener_port,
+          bind_ip,
+          auto_h2d,
+      )
 
   def d2h(self) -> None:
     """Triggers asynchronous Device-to-Host (D2H) copy of current weights to Host buffer."""
-    self._impl.D2h()
+    self._impl.d2h()
 
   def h2d(self) -> None:
     """Triggers asynchronous Host-to-Device (H2D) copy of staged host buffer back to Device memory E2E."""
-    self._impl.H2d()
+    self._impl.h2d()
 
   def test_only_set_skip_tiling(self, skip: bool | List[bool]) -> None:
     """Sets whether D2H/H2D should skip CPU tiling/detiling (for testing only)."""
-    if isinstance(skip, bool):
-      self._impl.set_skip_tiling(skip)
-    else:
-      self._impl.set_skip_tiling(list(skip))
+    if hasattr(self._impl, "set_skip_tiling"):
+      if isinstance(skip, bool):
+        self._impl.set_skip_tiling(skip)
+      else:
+        self._impl.set_skip_tiling(list(skip))
+    elif hasattr(self._impl, "test_only_set_skip_tiling"):
+      self._impl.test_only_set_skip_tiling(skip)
 
   def bind_weights(self, jax_arrays: List[any]) -> None:
     """Binds the JAX arrays to the weight synchronizer in-place.
@@ -178,3 +217,17 @@ class WeightSynchronizer:
   def reset_metrics(self) -> None:
     """Resets all recorded internal metrics."""
     self._impl.reset_metrics()
+
+  def close(self) -> None:
+    """Closes and tears down internal buffers and servers."""
+    if hasattr(self._impl, "close"):
+      self._impl.close()
+    elif hasattr(self._impl, "destroy"):
+      self._impl.destroy()
+
+  def destroy(self) -> None:
+    """Destroys internal buffers and servers."""
+    if hasattr(self._impl, "destroy"):
+      self._impl.destroy()
+    elif hasattr(self._impl, "close"):
+      self._impl.close()

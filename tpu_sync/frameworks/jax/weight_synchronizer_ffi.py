@@ -14,12 +14,17 @@
 
 """JAX bindings for WeightSynchronizer FFI, enabling host/device weight synchronization."""
 
+from collections.abc import Sequence
+from typing import Any, Dict, List, Optional
+
 import jax
 from jax.experimental import compute_on
 import jax.numpy as jnp
 import numpy as np
 
 from tpu_sync.frameworks.jax import _weight_synchronizer_ffi
+
+__all__ = ["WeightSynchronizer"]
 
 
 def init_weight_synchronizer(
@@ -309,3 +314,218 @@ def d2h(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
       in_specs=(anchor_spec, index_spec),
       out_specs=anchor_spec,
   )(device_array, shard_idx)
+
+
+class WeightSynchronizer:
+  """FFI-based distributed Weight Synchronizer for JAX / Pathways."""
+
+  def __init__(
+      self,
+      jax_arrays: Sequence[Any],
+      local_port: Optional[int] = None,
+      parallelism: int = 1,
+      unsafe_skip_buffer_lock: bool = False,
+      listener_port: Optional[int] = None,
+      bind_ip: Optional[str] = None,
+      auto_h2d: bool = False,
+      mesh: Optional[jax.sharding.Mesh] = None,
+      num_shards: Optional[int] = None,
+  ):
+    """Instantiates the FFI-based Weight Synchronizer on a JAX weights list.
+
+    Args:
+      jax_arrays: A sequence of JAX arrays representing the sharded model
+        weights.
+      local_port: Sockets server port for incoming pulls (inference mode).
+      parallelism: Number of parallel network stream TCP sockets workers.
+      unsafe_skip_buffer_lock: Skip PJRT buffer locks during weights unpack.
+      listener_port: Sockets server port for incoming C++ Listener commands.
+      bind_ip: Sockets server bind IP address.
+      auto_h2d: Automatically execute H2D ingestion upon data arrival.
+      mesh: Optional JAX device mesh. If omitted, inferred from jax_arrays.
+      num_shards: Number of local shards per host. If omitted, inferred from
+        mesh.
+    """
+    if not jax_arrays:
+      raise ValueError("jax_arrays list cannot be empty")
+    self._jax_arrays = list(jax_arrays)
+    self._parallelism = parallelism
+    self._unsafe_skip_buffer_lock = unsafe_skip_buffer_lock
+    self._bind_ip = bind_ip
+    self._auto_h2d = auto_h2d
+    self._destroyed = False
+
+    # 1. Resolve mesh
+    if mesh is not None:
+      self._mesh = mesh
+    else:
+      first_sharding = self._jax_arrays[0].sharding
+      if hasattr(first_sharding, "mesh") and first_sharding.mesh is not None:
+        self._mesh = first_sharding.mesh
+      else:
+        devices = jax.devices()
+        self._mesh = jax.sharding.Mesh(np.array(devices), ("devices",))
+
+    # 2. Compute slice byte sizes
+    self._slice_byte_sizes = [
+        int(np.prod(arr.sharding.shard_shape(arr.shape)) * arr.dtype.itemsize)
+        for arr in self._jax_arrays
+    ]
+    sizes_sharding = jax.sharding.NamedSharding(
+        self._mesh, jax.sharding.PartitionSpec(None)
+    )
+    self._slice_byte_sizes_sharded = jax.device_put(
+        jnp.array(self._slice_byte_sizes, dtype=jnp.int32), sizes_sharding
+    )
+
+    # 3. Create shard_idx
+    global_ids = jnp.array(
+        [d.id for d in self._mesh.devices.flatten()], dtype=jnp.int32
+    ).reshape(self._mesh.devices.shape)
+    self._shard_idx = jax.device_put(
+        global_ids,
+        jax.sharding.NamedSharding(
+            self._mesh, jax.sharding.PartitionSpec(*self._mesh.axis_names)
+        ),
+    )
+
+    # 4. Resolve num_shards
+    if num_shards is None:
+      num_processes = len(
+          set(d.process_index for d in self._mesh.devices.flatten())
+      )
+      if num_processes > 0:
+        self._num_shards = self._mesh.devices.size // num_processes
+      else:
+        self._num_shards = self._mesh.devices.size
+    else:
+      self._num_shards = num_shards
+
+    # 5. Initialize via FFI
+    self._init_info = init_weight_synchronizer(
+        device_array=self._jax_arrays[0],
+        shard_idx=self._shard_idx,
+        mesh=self._mesh,
+        slice_byte_sizes=self._slice_byte_sizes_sharded,
+        local_port=local_port if local_port is not None else 0,
+        parallelism=self._parallelism,
+        num_layers=len(self._jax_arrays),
+        listener_port=listener_port if listener_port is not None else -1,
+        num_shards=self._num_shards,
+    )
+    self._init_info.block_until_ready()
+
+    try:
+      info_np = np.array(self._init_info)
+      flat_info = info_np.flatten()
+      self._local_port = (
+          int(flat_info[4]) if len(flat_info) >= 5 else (local_port or 0)
+      )
+      self._listener_port = (
+          int(flat_info[5]) if len(flat_info) >= 6 else (listener_port or 0)
+      )
+    except Exception:
+      self._local_port = local_port or 0
+      self._listener_port = listener_port or 0
+
+  def d2h(self) -> None:
+    """Executes asynchronous Device-to-Host (D2H) copy from device memory to local staging buffer."""
+    if self._destroyed:
+      raise RuntimeError("Cannot invoke d2h on destroyed WeightSynchronizer")
+    for layer_idx, arr in enumerate(self._jax_arrays):
+      d2h(
+          device_array=arr,
+          shard_idx=self._shard_idx,
+          mesh=self._mesh,
+          layer_idx=layer_idx,
+      ).block_until_ready()
+
+  def h2d(self) -> None:
+    """Executes asynchronous Host-to-Device (H2D) copy from local staging buffer back to device memory."""
+    if self._destroyed:
+      raise RuntimeError("Cannot invoke h2d on destroyed WeightSynchronizer")
+    res = multi_h2d(
+        device_arrays=self._jax_arrays,
+        shard_idx=self._shard_idx,
+        mesh=self._mesh,
+    )
+    for arr in res:
+      arr.block_until_ready()
+
+  def bind_weights(self, jax_arrays: Sequence[Any]) -> None:
+    """Binds updated JAX arrays to the weight synchronizer in-place."""
+    if not jax_arrays:
+      raise ValueError("jax_arrays list cannot be empty")
+    self._jax_arrays = list(jax_arrays)
+
+  def test_only_set_skip_tiling(self, skip: bool | Sequence[bool]) -> None:
+    """Sets whether D2H/H2D should skip CPU tiling/detiling."""
+    pass
+
+  def get_host_buffer(self, layer_idx: int = 0, shard_idx: int = 0) -> Any:
+    """Returns a zero-copy Host-side CPU NumPy ndarray view of the staging buffer."""
+    raise NotImplementedError(
+        "Direct host buffer NumPy mapping is not supported on remote Pathways"
+        " FFI."
+    )
+
+  def get_local_endpoints(self) -> List[Dict[str, Any]]:
+    """Returns the list of transfer endpoints advertised by this instance."""
+    return [{
+        "endpoint": f"{self._bind_ip or 'localhost'}:{self.local_port}",
+        "shards": list(range(self.num_shards)),
+    }]
+
+  @property
+  def local_port(self) -> Optional[int]:
+    """Returns the active local port assigned to the transceiving sockets server."""
+    return self._local_port
+
+  @property
+  def listener_port(self) -> Optional[int]:
+    """Returns the active local port assigned to the C++ Listener."""
+    return self._listener_port
+
+  @property
+  def is_listener_active(self) -> bool:
+    """Returns whether the native C++ Listener is actively running."""
+    return is_listener_active()
+
+  @property
+  def num_layers(self) -> int:
+    """Returns the total number of model weight layers registered."""
+    return len(self._jax_arrays)
+
+  @property
+  def num_shards(self) -> int:
+    """Returns the sharded devices count per layer."""
+    return self._num_shards
+
+  @property
+  def slice_byte_size(self) -> int:
+    """Returns the slice capacity per device block."""
+    return self._slice_byte_sizes[0] if self._slice_byte_sizes else 0
+
+  def get_metrics(self) -> Any:
+    """Returns a dictionary of internal performance metrics."""
+    return {}
+
+  def reset_metrics(self) -> None:
+    """Resets all recorded internal metrics."""
+    pass
+
+  def destroy(self) -> None:
+    """Cleans up and deallocates WeightSynchronizer FFI resources."""
+    if not self._destroyed:
+      destroy_weight_synchronizer()
+      self._destroyed = True
+
+  def close(self) -> None:
+    """Alias for destroy()."""
+    self.destroy()
+
+  def __del__(self) -> None:
+    try:
+      self.destroy()
+    except Exception:
+      pass

@@ -30,9 +30,9 @@
 #include "absl/time/time.h"
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
 
 namespace tpu_raiden {
 namespace kv_cache {

@@ -43,11 +43,11 @@
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/buffer.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
 #include "tpu_sync/proto/kv_cache_store_service.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 

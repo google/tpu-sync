@@ -29,6 +29,7 @@ from typing import Any, Optional
 
 from absl import logging
 
+from tpu_sync.api.common import RaidenId
 from tpu_sync.kv_cache import nd_slice_math
 from tpu_sync.rpc import controller_service_pb2
 from tpu_sync.rpc import raiden_service_pb2
@@ -95,22 +96,6 @@ class RaidenMemoryType(enum.IntEnum):
 
   DRAM = 1
   HBM = 2
-
-
-@dataclasses.dataclass(frozen=True)
-class RaidenId:
-  """Identifier for the work unit in Raiden owning a sharded set of data."""
-
-  # The name of the job, e.g., 'trainer', 'sampler', 'inference_server'
-  job_name: str
-  # Identifier of replicated jobs, combined with job name to identify the job,
-  # int or uuid, e.g., sampler 0, inference_server 215, etc.
-  job_replica_id: str = ""
-  # Name of the array/tensor, e.g., 'kv_cache', 'model.weights' etc.
-  data_name: str = ""
-  # Identifier for replicated data within the job, mostly for DP within a job
-  # replica
-  data_replica_idx: int = 0
 
 
 def _raiden_id_from_proto(unit: Any) -> RaidenId:

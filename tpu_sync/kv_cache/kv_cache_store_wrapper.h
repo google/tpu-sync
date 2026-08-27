@@ -20,10 +20,10 @@
 #include <memory>
 #include <string>
 
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata_shm.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
 
 namespace tpu_raiden {
 namespace kv_cache {

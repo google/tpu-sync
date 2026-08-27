@@ -16,6 +16,10 @@
 
 import enum
 
+from tpu_sync.common import _raiden_id
+
+RaidenId = _raiden_id.RaidenId
+
 
 class BlockStatus(enum.Enum):
   """Represents the residency status and location of a KV cache block."""

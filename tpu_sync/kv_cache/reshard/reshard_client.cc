@@ -24,7 +24,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/reshard/framed_rpc.h"
 #include "tpu_sync/rpc/controller_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"

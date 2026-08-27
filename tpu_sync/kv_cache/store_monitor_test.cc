@@ -26,10 +26,10 @@
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/global_registry/test_util.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
 
 namespace tpu_raiden {
 namespace kv_cache {

@@ -32,6 +32,7 @@
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
 #include "xla/tsl/platform/statusor.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/controller_client.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/controller/test_util.h"
@@ -43,7 +44,6 @@
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
 #include "tpu_sync/kv_cache/kv_cache_store_server.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {

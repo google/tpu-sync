@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load("@nanobind_bazel//:build_defs.bzl", "nanobind_extension")
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -28,5 +29,32 @@ cc_test(
     deps = [
         ":version",
         "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "raiden_id",
+    hdrs = ["raiden_id.h"],
+    visibility = ["//visibility:public"],
+    deps = ["@com_google_absl//absl/hash"],
+)
+
+cc_test(
+    name = "raiden_id_test",
+    srcs = ["raiden_id_test.cc"],
+    deps = [
+        ":raiden_id",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+nanobind_extension(
+    name = "_raiden_id",
+    srcs = ["raiden_id_binding.cc"],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":raiden_id",
+        "@com_google_absl//absl/strings:str_format",
     ],
 )

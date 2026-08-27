@@ -32,6 +32,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/worker_registry.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
@@ -40,7 +41,6 @@
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
 #include "tpu_sync/kv_cache/kv_cache_store_server.h"
 #include "tpu_sync/kv_cache/lru_cache.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
 #include "tpu_sync/proto/kv_cache_store_service.pb.h"
 
 namespace tpu_raiden {

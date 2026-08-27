@@ -28,11 +28,11 @@
 #include <gtest/gtest.h>
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/global_registry/test_util.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
 
 namespace tpu_raiden {
 namespace kv_cache {

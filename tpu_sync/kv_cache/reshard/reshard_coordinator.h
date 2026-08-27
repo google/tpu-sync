@@ -24,7 +24,7 @@
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/reshard/framed_rpc.h"
 #include "tpu_sync/kv_cache/reshard/pool_reshard_planner.h"
 #include "tpu_sync/kv_cache/reshard/request_block_registry.h"

@@ -20,7 +20,7 @@
 
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
+#include "tpu_sync/common/raiden_id.h"
 
 namespace tpu_raiden {
 namespace kv_cache {

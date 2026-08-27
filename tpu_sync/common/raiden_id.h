@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_KV_CACHE_RAIDEN_ID_H_
-#define THIRD_PARTY_TPU_RAIDEN_KV_CACHE_RAIDEN_ID_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_COMMON_RAIDEN_ID_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_COMMON_RAIDEN_ID_H_
 
 #include <cstddef>
 #include <ostream>
@@ -22,10 +22,9 @@
 #include "absl/hash/hash.h"
 
 namespace tpu_raiden {
-namespace kv_cache {
 
 // Represents a microservice slice identifier / entity address hosting a replica
-// of a Key-Value cache block.
+// of a Key-Value cache block or tensor data.
 struct RaidenId {
   std::string job_name;
   std::string job_replica_id;
@@ -62,7 +61,11 @@ struct RaidenIdHash {
   }
 };
 
+namespace kv_cache {
+using ::tpu_raiden::RaidenId;
+using ::tpu_raiden::RaidenIdHash;
 }  // namespace kv_cache
+
 }  // namespace tpu_raiden
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_KV_CACHE_RAIDEN_ID_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_COMMON_RAIDEN_ID_H_

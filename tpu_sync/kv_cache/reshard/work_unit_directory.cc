@@ -25,7 +25,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/synchronization/mutex.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/reshard/declaration_types.h"
 
 namespace tpu_raiden {

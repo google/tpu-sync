@@ -28,7 +28,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/reshard/declaration_types.h"
 #include "tpu_sync/kv_cache/reshard/work_unit_directory.h"
 

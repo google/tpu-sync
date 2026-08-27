@@ -26,7 +26,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
+#include "tpu_sync/common/raiden_id.h"
 
 namespace tpu_raiden {
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@rules_python//python:defs.bzl", "py_library")
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -20,4 +20,17 @@ py_library(
     name = "common",
     srcs = ["common.py"],
     visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_sync/common:_raiden_id",
+    ],
+)
+
+py_test(
+    name = "common_test",
+    srcs = ["common_test.py"],
+    main = "common_test.py",
+    deps = [
+        ":common",
+        "@com_google_absl_py//absl/testing:absltest",
+    ],
 )

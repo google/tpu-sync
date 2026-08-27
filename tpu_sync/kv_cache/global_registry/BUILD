@@ -45,7 +45,7 @@ cc_library(
     deps = [
         ":global_registry_cc_grpc",
         ":global_registry_cc_proto",
-        "//tpu_sync/kv_cache:raiden_id",
+        "//tpu_sync/common:raiden_id",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -79,7 +79,7 @@ cc_library(
     deps = [
         ":global_registry_cc_grpc",
         ":global_registry_cc_proto",
-        "//tpu_sync/kv_cache:raiden_id",
+        "//tpu_sync/common:raiden_id",
         "@boringssl//:crypto",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status",
@@ -116,7 +116,7 @@ cc_test(
         ":global_registry_client_cc",
         ":global_registry_server_lib",
         ":test_util",
-        "//tpu_sync/kv_cache:raiden_id",
+        "//tpu_sync/common:raiden_id",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",

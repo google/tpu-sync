@@ -28,7 +28,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/reshard/declaration_types.h"
 #include "tpu_sync/kv_cache/reshard/framed_rpc.h"
 #include "tpu_sync/kv_cache/reshard/request_block_registry.h"

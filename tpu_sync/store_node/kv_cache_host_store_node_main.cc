@@ -31,7 +31,7 @@
 #include "absl/log/initialize.h"
 #include "absl/log/log.h"
 #include "absl/status/statusor.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/store_node/grs_kv_transfer_spec_source.h"
 #include "tpu_sync/store_node/kv_cache_host_store_node.h"
 

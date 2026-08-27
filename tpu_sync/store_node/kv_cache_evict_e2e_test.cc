@@ -27,6 +27,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/controller_client.h"
 #include "tpu_sync/core/controller/worker_service_server.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
@@ -36,7 +37,6 @@
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
-#include "tpu_sync/kv_cache/raiden_id.h"
 #include "tpu_sync/store_node/kv_cache_host_store_node.h"
 #include "tpu_sync/store_node/kv_transfer_spec_source.h"
 

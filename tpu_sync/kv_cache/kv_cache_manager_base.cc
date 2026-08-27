@@ -1197,15 +1197,23 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2hReadExplicit(
     const std::vector<uint8_t*>& explicit_dst_ptrs, int parallelism,
     tpu_raiden::transport::MajorOrder major_order,
     tpu_raiden::transport::BlockReceivedCallback on_block_received) {
-  absl::MutexLock lock(server_init_mu_);
-  if (!server_) {
+  // Copy the transport pointer under lock and execute SyncPull unlocked to
+  // avoid blocking concurrent transfers.
+  tpu_raiden::transport::BlockTransport* transport_server = nullptr;
+  {
+    // TODO: Initialize server_ eagerly in every constructor and remove the
+    // post-construction InitTransportServer() call sites. Then remove the lock.
+    absl::MutexLock lock(server_init_mu_);
+    transport_server = server_.get();
+  }
+  if (!transport_server) {
     return absl::FailedPreconditionError("Transport server is not running");
   }
   ASSIGN_OR_RETURN(
       std::vector<int> allocated_ids,
-      server_->SyncPull({peer}, src_block_ids, local_block_ids,
-                        explicit_dst_ptrs, parallelism, major_order,
-                        on_block_received, kLeaseAuthorizedPullUuid));
+      transport_server->SyncPull({peer}, src_block_ids, local_block_ids,
+                                 explicit_dst_ptrs, parallelism, major_order,
+                                 on_block_received, kLeaseAuthorizedPullUuid));
   return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
 }
 

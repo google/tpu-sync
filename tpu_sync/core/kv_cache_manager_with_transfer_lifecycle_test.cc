@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <memory>
@@ -47,6 +48,35 @@
 
 namespace tpu_raiden {
 namespace {
+
+class ScopedEnvironmentVariable {
+ public:
+  ScopedEnvironmentVariable(const char* name, const char* value) : name_(name) {
+    const char* old_value = std::getenv(name);
+    if (old_value != nullptr) old_value_ = old_value;
+    if (value != nullptr) {
+      setenv(name, value, /*overwrite=*/1);
+    } else {
+      unsetenv(name);
+    }
+  }
+
+  ~ScopedEnvironmentVariable() {
+    if (old_value_.has_value()) {
+      setenv(name_.c_str(), old_value_->c_str(), /*overwrite=*/1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+  ScopedEnvironmentVariable(const ScopedEnvironmentVariable&) = delete;
+  ScopedEnvironmentVariable& operator=(const ScopedEnvironmentVariable&) =
+      delete;
+
+ private:
+  std::string name_;
+  std::optional<std::string> old_value_;
+};
 
 class MetadataTransferManager : public KVCacheManagerWithTransfer {
  public:
@@ -74,7 +104,19 @@ class MetadataTransferManager : public KVCacheManagerWithTransfer {
   static uint32_t RenewOp() { return kOpRenewLeases; }
   static uint32_t CancelOp() { return kOpCancelLeases; }
   static uint32_t ProtocolVersion() { return kLeaseProtocolVersion; }
-  static size_t MaxBatchSize() { return kMaxLeaseBatchSize; }
+  static size_t DefaultMaxBatchSize() { return kDefaultMaxLeaseBatchSize; }
+  static size_t MaxBatchSizeLimit() { return kMaxLeaseBatchSizeLimit; }
+
+  size_t MaxBatchSize() const { return max_lease_batch_size_; }
+  std::chrono::milliseconds SendTombstoneTtl() const {
+    return send_tombstone_ttl_;
+  }
+  std::chrono::milliseconds PendingAckTtl() const { return pending_ack_ttl_; }
+  size_t MaxSendTombstones() const { return max_send_tombstones_; }
+  size_t MaxPendingAcks() const { return max_pending_acks_; }
+  std::chrono::milliseconds ControlIoTimeout() const {
+    return control_io_timeout_;
+  }
 
   std::vector<int32_t> Apply(uint32_t op, const std::vector<uint64_t>& uuids) {
     absl::MutexLock lock(mu_);
@@ -106,7 +148,8 @@ class MetadataTransferManager : public KVCacheManagerWithTransfer {
     ++active_send_callbacks_;
   }
 
-  void FinishAsyncLayerForTest(uint64_t uuid) {
+  void FinishAsyncLayerForTest(uint64_t uuid,
+                               absl::Status status = absl::OkStatus()) {
     std::shared_ptr<SendEntry> entry;
     {
       absl::MutexLock lock(mu_);
@@ -118,7 +161,8 @@ class MetadataTransferManager : public KVCacheManagerWithTransfer {
         if (draining != draining_send_entries_.end()) entry = draining->second;
       }
     }
-    FinishSendLayer(entry, absl::OkStatus(), "");
+    FinishSendLayer(entry, status,
+                    status.ok() ? "" : "test asynchronous send failed");
   }
 
   std::chrono::steady_clock::time_point GetDeadline(uint64_t uuid) {
@@ -772,6 +816,46 @@ bool WaitForRetryableUnknowns(MetadataTransferManager* manager,
   return false;
 }
 
+TEST(LegacyControlConfigTest, ReadsEnvironmentOverridesAtConstruction) {
+  ScopedEnvironmentVariable tombstone_ttl("RAIDEN_SEND_TOMBSTONE_TTL_S", "7");
+  ScopedEnvironmentVariable pending_ack_ttl("RAIDEN_PENDING_ACK_TTL_S", "8");
+  ScopedEnvironmentVariable max_tombstones("RAIDEN_MAX_SEND_TOMBSTONES", "17");
+  ScopedEnvironmentVariable max_pending_acks("RAIDEN_MAX_PENDING_ACKS", "19");
+  ScopedEnvironmentVariable control_timeout("RAIDEN_CONTROL_IO_TIMEOUT_S", "9");
+  ScopedEnvironmentVariable max_batch("RAIDEN_MAX_LEASE_BATCH_SIZE", "2");
+
+  MetadataTransferManager manager;
+  EXPECT_EQ(manager.SendTombstoneTtl().count(), 7000);
+  EXPECT_EQ(manager.PendingAckTtl().count(), 8000);
+  EXPECT_EQ(manager.MaxSendTombstones(), 17);
+  EXPECT_EQ(manager.MaxPendingAcks(), 19);
+  EXPECT_EQ(manager.ControlIoTimeout().count(), 9000);
+  EXPECT_EQ(manager.MaxBatchSize(), 2);
+}
+
+TEST(LegacyControlConfigTest, InvalidEnvironmentValuesUseDefaults) {
+  const std::string over_limit_batch =
+      std::to_string(MetadataTransferManager::MaxBatchSizeLimit() + 1);
+  ScopedEnvironmentVariable tombstone_ttl("RAIDEN_SEND_TOMBSTONE_TTL_S", "0");
+  ScopedEnvironmentVariable pending_ack_ttl("RAIDEN_PENDING_ACK_TTL_S", "-1");
+  ScopedEnvironmentVariable max_tombstones("RAIDEN_MAX_SEND_TOMBSTONES",
+                                           "not-a-number");
+  ScopedEnvironmentVariable max_pending_acks("RAIDEN_MAX_PENDING_ACKS", "0");
+  ScopedEnvironmentVariable control_timeout("RAIDEN_CONTROL_IO_TIMEOUT_S",
+                                            "999999999999999999999");
+  ScopedEnvironmentVariable max_batch("RAIDEN_MAX_LEASE_BATCH_SIZE",
+                                      over_limit_batch.c_str());
+
+  MetadataTransferManager manager;
+  EXPECT_EQ(manager.SendTombstoneTtl().count(), 300000);
+  EXPECT_EQ(manager.PendingAckTtl().count(), 30000);
+  EXPECT_EQ(manager.MaxSendTombstones(), 4096);
+  EXPECT_EQ(manager.MaxPendingAcks(), 4096);
+  EXPECT_EQ(manager.ControlIoTimeout().count(), 30000);
+  EXPECT_EQ(manager.MaxBatchSize(),
+            MetadataTransferManager::DefaultMaxBatchSize());
+}
+
 TEST(SendLifecycleTest, ExpiryCreatesTombstoneAndReportsDoneOnce) {
   MetadataTransferManager manager;
   manager.NotifyForRead("expired", 101, {0});
@@ -938,6 +1022,23 @@ TEST(SendLifecycleTest, TransferTimeoutReportsButRetainsSlotUntilAsyncDrain) {
   EXPECT_TRUE(manager.HasTombstone(1060));
   EXPECT_EQ(manager.FreeSlotCount(), 0);
   manager.FinishAsyncLayerForTest(1060);
+  EXPECT_EQ(manager.FreeSlotCount(), 1);
+}
+
+TEST(SendLifecycleTest, FailedLayerReportsProducerSettlementExactlyOnce) {
+  MetadataTransferManager manager(/*start_control_server=*/true,
+                                  /*num_slots=*/1);
+  manager.NotifyForRead("failed-layer", 10601, {0});
+  ASSERT_EQ(Pull(&manager, 10601).status, 0);
+  manager.HoldAsyncLayerForTest(10601);
+
+  manager.FinishAsyncLayerForTest(
+      10601, absl::InternalError("injected asynchronous send failure"));
+  auto [done_sending, done_recving, failed_recving] = manager.CompleteReadRaw();
+  EXPECT_EQ(done_sending, std::vector<std::string>({"failed-layer"}));
+  EXPECT_TRUE(done_recving.empty());
+  EXPECT_TRUE(failed_recving.empty());
+  EXPECT_TRUE(std::get<0>(manager.CompleteReadRaw()).empty());
   EXPECT_EQ(manager.FreeSlotCount(), 1);
 }
 
@@ -1402,6 +1503,7 @@ TEST(LeaseTest, CancelVsPullHasOneLinearizedOwner) {
 }
 
 TEST(LeaseProtocolTest, VersionedWireApiPreservesOrderAndChunks) {
+  ScopedEnvironmentVariable max_batch("RAIDEN_MAX_LEASE_BATCH_SIZE", "2");
   MetadataTransferManager manager(/*start_control_server=*/true);
   manager.NotifyForRead("wire", 207, {0});
   EXPECT_EQ(manager.RenewRemoteLeases(
@@ -1409,7 +1511,7 @@ TEST(LeaseProtocolTest, VersionedWireApiPreservesOrderAndChunks) {
                 {999, 207, 999}),
             std::vector<int32_t>({0, 1, 0}));
 
-  std::vector<uint64_t> large(MetadataTransferManager::MaxBatchSize() + 1);
+  std::vector<uint64_t> large(manager.MaxBatchSize() * 2 + 1);
   for (size_t i = 0; i < large.size(); ++i) large[i] = 10000 + i;
   const std::vector<int32_t> results = manager.RenewRemoteLeases(
       "127.0.0.1:" + std::to_string(manager.local_control_port()), large);

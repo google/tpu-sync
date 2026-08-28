@@ -30,8 +30,7 @@ namespace tpu_raiden::transport::lib {
 // gRPC channel for TCP-over-PSP out-of-band key exchange.
 absl::StatusOr<int> ConnectToPeer(
     absl::string_view peer, absl::string_view local_ip = "",
-    bool require_psp = false,
-    std::shared_ptr<grpc::Channel> channel = nullptr,
+    bool require_psp = false, std::shared_ptr<grpc::Channel> channel = nullptr,
     const std::atomic<bool>* cancelled = nullptr,
     std::chrono::milliseconds timeout = std::chrono::seconds(30));
 

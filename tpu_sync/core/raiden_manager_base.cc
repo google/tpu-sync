@@ -14,8 +14,8 @@
 
 #include "tpu_sync/core/raiden_manager_base.h"
 
-#include <cstddef>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -34,11 +34,11 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
-#include "xla/future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "xla/future.h"
 
 namespace tpu_raiden {
 

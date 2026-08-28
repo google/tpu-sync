@@ -156,6 +156,25 @@ What this script does:
 1. Sets up `PYTHONPATH` so Python can locate the compiled `bazel-bin` and framework wrapper modules.
 2. Executes the selected unit test suites across JAX and/or PyTorch directly via `python`.
 
+### Legacy UUID Control-Plane Tuning
+
+The legacy UUID transfer path reads the following optional environment
+variables when each KV cache manager is constructed. Values must be positive
+integers; invalid values retain the listed default.
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `RAIDEN_SEND_TOMBSTONE_TTL_S` | `300` | Retention time for terminal UUID tombstones |
+| `RAIDEN_PENDING_ACK_TTL_S` | `30` | Retention time for acknowledgements that arrive before registration |
+| `RAIDEN_MAX_SEND_TOMBSTONES` | `4096` | Maximum retained terminal UUID tombstones |
+| `RAIDEN_MAX_PENDING_ACKS` | `4096` | Maximum retained pre-registration acknowledgements |
+| `RAIDEN_CONTROL_IO_TIMEOUT_S` | `30` | Absolute timeout for one control-plane socket operation |
+| `RAIDEN_MAX_LEASE_BATCH_SIZE` | `4096` | UUIDs per renew/cancel request; capped at the protocol safety limit of `8192` |
+
+Configure `RAIDEN_MAX_LEASE_BATCH_SIZE` consistently on communicating peers:
+the consumer uses it to chunk requests and the producer uses it as its accepted
+request limit.
+
 ### Playing with TPU Sync
 
 If you'd like to try out TPU Sync and see it in action, please refer to the [`examples/`](examples/) directory. This folder contains a collection of hands-on scripts designed for users to interact with the library, including:

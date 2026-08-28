@@ -34,6 +34,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -44,7 +45,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <cstdlib>
 #include <optional>
 #include <ratio>
 #include <set>
@@ -62,14 +62,13 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "xla/pjrt/pjrt_client.h"
-#include "xla/tsl/platform/errors.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/metrics_collector.h"
 #include "tpu_sync/core/raiden_manager_base.h"
@@ -83,6 +82,8 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "xla/pjrt/pjrt_client.h"
+#include "xla/tsl/platform/errors.h"
 
 namespace tpu_raiden {
 
@@ -106,6 +107,40 @@ bool EncodeIp(const std::string& ip_str, uint8_t* dst) {
 constexpr absl::Duration kPendingWorkTimeout = absl::Seconds(30);
 constexpr uint64_t kMaxControlMessageBytes = 64 * 1024;
 constexpr char kSendUuidNotRegistered[] = "send UUID is not registered yet";
+
+std::chrono::milliseconds PositiveDurationSecondsFromEnv(
+    const char* name, std::chrono::milliseconds fallback) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr) return fallback;
+  int64_t seconds = 0;
+  constexpr int64_t kMaxSeconds =
+      std::chrono::milliseconds::max().count() / 1000;
+  if (!absl::SimpleAtoi(raw, &seconds) || seconds <= 0 ||
+      seconds > kMaxSeconds) {
+    LOG(WARNING) << "Ignoring " << name << "=\"" << raw
+                 << "\"; expected a positive integer number of seconds. "
+                    "Using "
+                 << fallback.count() << "ms";
+    return fallback;
+  }
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::seconds(seconds));
+}
+
+size_t PositiveSizeFromEnv(
+    const char* name, size_t fallback,
+    size_t maximum = std::numeric_limits<size_t>::max()) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr) return fallback;
+  uint64_t value = 0;
+  if (!absl::SimpleAtoi(raw, &value) || value == 0 || value > maximum) {
+    LOG(WARNING) << "Ignoring " << name << "=\"" << raw
+                 << "\"; expected an integer in [1, " << maximum << "]. Using "
+                 << fallback;
+    return fallback;
+  }
+  return static_cast<size_t>(value);
+}
 
 class RemoteControlError : public std::runtime_error {
  public:
@@ -629,6 +664,24 @@ kv_cache::KVCacheCopySpec KVCacheManagerWithTransfer::ToKVCacheCopySpec(
   return ToKVCacheCopySpecImpl(spec);
 }
 
+void KVCacheManagerWithTransfer::ConfigureLegacyControlFromEnv() {
+  static_assert(kMaxLeaseBatchSizeLimit * sizeof(uint64_t) <=
+                kMaxControlMessageBytes);
+  send_tombstone_ttl_ = PositiveDurationSecondsFromEnv(
+      "RAIDEN_SEND_TOMBSTONE_TTL_S", send_tombstone_ttl_);
+  pending_ack_ttl_ = PositiveDurationSecondsFromEnv("RAIDEN_PENDING_ACK_TTL_S",
+                                                    pending_ack_ttl_);
+  max_send_tombstones_ =
+      PositiveSizeFromEnv("RAIDEN_MAX_SEND_TOMBSTONES", max_send_tombstones_);
+  max_pending_acks_ =
+      PositiveSizeFromEnv("RAIDEN_MAX_PENDING_ACKS", max_pending_acks_);
+  control_io_timeout_ = PositiveDurationSecondsFromEnv(
+      "RAIDEN_CONTROL_IO_TIMEOUT_S", control_io_timeout_);
+  max_lease_batch_size_ =
+      PositiveSizeFromEnv("RAIDEN_MAX_LEASE_BATCH_SIZE",
+                          kDefaultMaxLeaseBatchSize, kMaxLeaseBatchSizeLimit);
+}
+
 void KVCacheManagerWithTransfer::ValidateRequestedBlocks(
     const SendEntry& entry, const std::vector<int64_t>& requested_block_ids) {
   if (requested_block_ids.empty()) {
@@ -668,6 +721,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
       metrics_collector_(std::move(metrics_collector)) {
+  ConfigureLegacyControlFromEnv();
   if (local_control_port_ >= 0) {
     if (max_blocks_ <= 0) {
       throw std::invalid_argument("max_blocks must be positive");
@@ -724,6 +778,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
       metrics_collector_(std::move(metrics_collector)) {
+  ConfigureLegacyControlFromEnv();
   if (num_layers() == 0 || num_shards() == 0) {
     return;
   }
@@ -774,6 +829,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(false),
       metrics_collector_(std::move(metrics_collector)) {
+  ConfigureLegacyControlFromEnv();
   if (local_control_port_ >= 0) {
     if (max_blocks_ <= 0) {
       throw std::invalid_argument("max_blocks must be positive");
@@ -2750,9 +2806,9 @@ bool KVCacheManagerWithTransfer::TerminalizeSendEntryLocked(
 
   expected->terminal_requested = true;
   expected->terminal_message = message;
-  if (!expected->completion_reported) {
+  if (!expected->settlement_reported) {
     done_sending_.insert(expected->req_id);
-    expected->completion_reported = true;
+    expected->settlement_reported = true;
   }
   send_entries_.erase(it);
   InstallSendTombstoneLocked(uuid, message, std::chrono::steady_clock::now(),
@@ -2919,11 +2975,12 @@ std::vector<int32_t> KVCacheManagerWithTransfer::SendLeaseBatch(
     return results;
   }
 
-  if (uuids.size() > kMaxLeaseBatchSize) {
+  if (uuids.size() > max_lease_batch_size_) {
     std::vector<int32_t> combined;
     combined.reserve(uuids.size());
-    for (size_t begin = 0; begin < uuids.size(); begin += kMaxLeaseBatchSize) {
-      const size_t end = std::min(uuids.size(), begin + kMaxLeaseBatchSize);
+    for (size_t begin = 0; begin < uuids.size();
+         begin += max_lease_batch_size_) {
+      const size_t end = std::min(uuids.size(), begin + max_lease_batch_size_);
       std::vector<uint64_t> chunk(uuids.begin() + begin, uuids.begin() + end);
       std::vector<int32_t> chunk_results =
           SendLeaseBatch(remote_endpoint, op, chunk);
@@ -3560,8 +3617,8 @@ void KVCacheManagerWithTransfer::ProcessPullStream(
   }
 
   std::vector<int64_t> host_block_ids;
-  if (!AcquireSendStagingWithRetry(req.uuid, src_block_ids,
-                                   operation_deadline, &host_block_ids)) {
+  if (!AcquireSendStagingWithRetry(req.uuid, src_block_ids, operation_deadline,
+                                   &host_block_ids)) {
     RecordPullMetric("rejected");
     throw std::runtime_error(
         "producer staging unavailable before pull acceptance");
@@ -3654,7 +3711,7 @@ void KVCacheManagerWithTransfer::ProcessLeaseBatch(
   if (req.op != kOpRenewLeases && req.op != kOpCancelLeases) {
     throw std::invalid_argument("invalid lease batch operation");
   }
-  if (req.num_blocks == 0 || req.num_blocks > kMaxLeaseBatchSize) {
+  if (req.num_blocks == 0 || req.num_blocks > max_lease_batch_size_) {
     throw std::invalid_argument("lease batch size is out of range");
   }
 

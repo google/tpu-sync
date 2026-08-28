@@ -42,8 +42,8 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
-#include "tpu_sync/transport/lib/transport_adapter.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+#include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden::transport::lib {
 

@@ -41,12 +41,12 @@
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
-#include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "xla/pjrt/pjrt_client.h"
 
 namespace tpu_sync {
 namespace rpc {
@@ -216,6 +216,10 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
       const std::vector<int64_t>& local_block_ids, int parallelism = 1,
       std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt);
 
+  // Returns producer settlements, successful receives, and failed receives.
+  // A producer settlement means its request-owned KV blocks may be released;
+  // it includes failed, cancelled, and expired sends as well as successful
+  // delivery.
   virtual std::tuple<std::vector<std::string>, std::vector<std::string>,
                      std::vector<std::string>>
   CompleteReadRaw();
@@ -298,7 +302,10 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     bool failed = false;
     bool ack_received = false;
     bool terminal_requested = false;
-    bool completion_reported = false;
+    // The producer reports a request exactly once when its ownership is
+    // settled, regardless of whether delivery succeeded. The consumer reports
+    // delivery failures independently through failed_recving_.
+    bool settlement_reported = false;
     Phase phase = Phase::kWaitingForPull;
     bool slot_released = false;
     std::chrono::steady_clock::time_point deadline;
@@ -362,7 +369,11 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   static constexpr uint32_t kOpCancelLeases = 5;
   static constexpr uint32_t kLeaseProtocolVersion = 1;
   static constexpr int32_t kControlRetryableUnknown = 1;
-  static constexpr size_t kMaxLeaseBatchSize = 4096;
+  static constexpr size_t kDefaultMaxLeaseBatchSize = 4096;
+  // Keeps one lease request body at or below the 64 KiB control-message bound.
+  // RAIDEN_MAX_LEASE_BATCH_SIZE may tune the operational value up to this
+  // protocol safety ceiling.
+  static constexpr size_t kMaxLeaseBatchSizeLimit = 8192;
 
   std::string EndpointWithPort(const std::string& endpoint, int port) const;
   ControlResponseHeader ReadControlResponseHeader(
@@ -375,6 +386,7 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
       const SendEntry& entry, const std::vector<int64_t>& requested_block_ids);
 
   static bool DynamicHostStagingEnabled();
+  void ConfigureLegacyControlFromEnv();
   absl::Status InitializeSlotPool(int64_t num_slots);
   Slot AcquireSlot();
   Slot AcquireSlotLocked();
@@ -431,6 +443,9 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
                                std::chrono::steady_clock::time_point now);
   bool ConsumePendingAckLocked(uint64_t uuid,
                                std::chrono::steady_clock::time_point now);
+  // Settles producer ownership exactly once. Every terminal outcome is
+  // surfaced through done_sending_ so the producer can release its KV blocks;
+  // successful delivery is determined on the consumer side.
   bool TerminalizeSendEntryLocked(
       uint64_t uuid, const std::shared_ptr<SendEntry>& expected,
       const std::string& message, bool waiting_only,
@@ -629,8 +644,12 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   size_t max_send_tombstones_ = 4096;
   size_t max_pending_acks_ = 4096;
   std::chrono::milliseconds control_io_timeout_{std::chrono::seconds(30)};
+  size_t max_lease_batch_size_ = kDefaultMaxLeaseBatchSize;
   size_t active_send_callbacks_ = 0;
   std::atomic<uint64_t> retryable_unknown_pull_responses_{0};
+  // Producer-side lifecycle settlement, not a guarantee that the consumer
+  // received the bytes successfully. This signal lets the producer release
+  // request-owned KV blocks after success, cancellation, expiry, or failure.
   std::set<std::string> done_sending_;
   std::set<std::string> done_recving_;
   std::set<std::string> failed_recving_;

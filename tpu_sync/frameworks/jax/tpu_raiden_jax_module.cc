@@ -226,9 +226,8 @@ NB_MODULE(_tpu_raiden_jax, m) {
                    &tpu_raiden::kv_cache::jax::KVCacheManager::num_shards)
       .def_prop_ro("slice_byte_size",
                    &tpu_raiden::kv_cache::jax::KVCacheManager::slice_byte_size)
-      .def_prop_ro(
-          "num_block_arrays",
-          &tpu_raiden::kv_cache::jax::KVCacheManager::num_block_arrays)
+      .def_prop_ro("num_block_arrays",
+                   &tpu_raiden::kv_cache::jax::KVCacheManager::num_block_arrays)
       .def("block_bytes",
            &tpu_raiden::kv_cache::jax::KVCacheManager::block_bytes,
            nb::arg("block_array_idx"))
@@ -666,9 +665,9 @@ NB_MODULE(_tpu_raiden_jax, m) {
              {
                nb::gil_scoped_release release;
                auto res = self->PollSaveStatus();
-                done = std::move(res.done);
-                failed = std::move(res.failed);
-                pending = std::move(res.pending);
+               done = std::move(res.done);
+               failed = std::move(res.failed);
+               pending = std::move(res.pending);
                existing = std::move(res.existing);
                unregistered = std::move(res.unregistered);
              }

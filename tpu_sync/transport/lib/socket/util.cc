@@ -45,10 +45,11 @@
 
 namespace tpu_raiden::transport::lib {
 
-absl::StatusOr<int> ConnectToPeer(
-    absl::string_view peer, absl::string_view local_ip, bool require_psp,
-    std::shared_ptr<grpc::Channel> channel,
-    const std::atomic<bool>* cancelled, std::chrono::milliseconds timeout) {
+absl::StatusOr<int> ConnectToPeer(absl::string_view peer,
+                                  absl::string_view local_ip, bool require_psp,
+                                  std::shared_ptr<grpc::Channel> channel,
+                                  const std::atomic<bool>* cancelled,
+                                  std::chrono::milliseconds timeout) {
   if (require_psp && channel == nullptr) {
     return absl::InvalidArgumentError(
         "gRPC channel is required for PSP connection");
@@ -176,10 +177,10 @@ absl::StatusOr<int> ConnectToPeer(
         break;
       }
       if (connect_status.ok()) {
-        connect_status = is_cancelled()
-                             ? absl::CancelledError("connect cancelled")
-                             : absl::DeadlineExceededError(
-                                   "connect deadline exceeded");
+        connect_status =
+            is_cancelled()
+                ? absl::CancelledError("connect cancelled")
+                : absl::DeadlineExceededError("connect deadline exceeded");
       }
       last_status = connect_status;
     } else {

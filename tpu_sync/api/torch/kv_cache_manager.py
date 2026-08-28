@@ -452,7 +452,10 @@ class KVCacheManager:
 
     Returns:
       A tuple of (done_sending, done_recving, failed_recving) lists of request
-      IDs.
+      IDs. ``done_sending`` means the producer has settled the request and may
+      release its KV blocks; it does not by itself guarantee successful
+      delivery. Receive failures are reported by the consumer through
+      ``failed_recving``.
     """
     return self._impl.complete_read()
 

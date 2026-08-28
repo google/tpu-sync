@@ -111,7 +111,8 @@ class KVCacheManager:
 
     Args:
       req_id: The request ID of the transfer operation.
-      uuid: The UUID of the request.
+      uuid: The per-attempt UUID of the request. Generate a fresh value rather
+        than reusing a recently completed transfer UUID.
       block_ids: The list of block IDs to be read.
 
     Returns:
@@ -119,6 +120,23 @@ class KVCacheManager:
       transferred.
     """
     return bool(self._impl.notify_for_read(req_id, uuid, block_ids))
+
+  def renew_leases(self, remote_endpoint: str, uuids: List[int]) -> List[int]:
+    """Renews queued producer sends without extending them indefinitely.
+
+    Results align positionally with ``uuids``: 1 means applied, 0 is not yet
+    registered, -1 is terminal/expired, -2 is already transferring, and -3
+    reached the producer's absolute retention cap.
+    """
+    return self._impl.renew_leases(remote_endpoint, uuids)
+
+  def cancel_leases(self, remote_endpoint: str, uuids: List[int]) -> List[int]:
+    """Releases queued producer sends that will no longer be pulled.
+
+    Status values match :meth:`renew_leases`. A claimed transfer is never
+    interrupted and returns -2.
+    """
+    return self._impl.cancel_leases(remote_endpoint, uuids)
 
   def start_read(
       self,
@@ -144,7 +162,10 @@ class KVCacheManager:
 
     Returns:
       A tuple of (done_sending, done_recving, failed_recving) lists of request
-      IDs.
+      IDs. ``done_sending`` means the producer has settled the request and may
+      release its KV blocks; it does not by itself guarantee successful
+      delivery. Receive failures are reported by the consumer through
+      ``failed_recving``.
     """
     return self._impl.complete_read()
 

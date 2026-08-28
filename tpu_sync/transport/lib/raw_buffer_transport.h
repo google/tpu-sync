@@ -18,6 +18,7 @@
 #include <sys/uio.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -41,8 +42,8 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
-#include "tpu_sync/transport/lib/transport_adapter.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+#include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden::transport::lib {
 
@@ -82,6 +83,13 @@ class RawBufferTransport final {
 
   // Destructor closes all sockets and joins all threads.
   ~RawBufferTransport();
+
+  // Stops accepting work, interrupts accepted and borrowed sockets, and
+  // prevents future connector borrows. Socket owners retain close ownership.
+  void CancelPendingOperations();
+
+  // Waits until the listener and every accepted-socket worker have stopped.
+  bool WaitForPendingOperations(std::chrono::milliseconds timeout);
 
   // Return the TCP listening socket port.
   int local_port() const { return local_port_; }
@@ -174,13 +182,17 @@ class RawBufferTransport final {
   const std::vector<std::string> local_ips_;
   int local_port_;
   const bool require_psp_tcp_;
-  std::atomic<int> server_fd_;  // owned by listener_thread_
   std::atomic<bool> stopping_;
 
-  // The active_client_fds do not own the sockets it contains. It is only used
-  // to shutdown the sockets, thus unblocking worker_threads_. Each worker
-  // thread owns the client_fd passed to it.
+  // listener_thread_ owns close(server_fd_). Cancellation only shutdowns it
+  // while holding mu_, and listener_thread_ closes and clears it under the
+  // same mutex. This prevents stale-fd shutdown after descriptor reuse.
   absl::Mutex mu_;
+  absl::CondVar idle_cv_;
+  int server_fd_ ABSL_GUARDED_BY(mu_) = -1;
+  bool listener_exited_ ABSL_GUARDED_BY(mu_) = false;
+  // Each connection worker owns close(client_fd). Cancellation only shutdowns
+  // descriptors while holding mu_; workers close and erase under that mutex.
   absl::flat_hash_set<int> active_client_fds_ ABSL_GUARDED_BY(mu_);
 
   // The conn_pool_ owns the sockets that connect to peers. In comparison, the

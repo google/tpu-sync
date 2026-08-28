@@ -475,6 +475,27 @@ TEST_P(BlockTransportTest, PushAndPullCorrectness) {
   EXPECT_EQ(delegate2.data()[size - 1], 0xAB);
 }
 
+TEST_P(BlockTransportTest, RejectsNewAsyncPushAfterCancellation) {
+  MockDelegate delegate(/*slice_size=*/64);
+  BlockTransport transport(&delegate, 0);
+  transport.CancelPendingOperations();
+
+  int callback_count = 0;
+  std::optional<absl::Status> callback_status;
+  transport.AsyncPush(
+      {"127.0.0.1:1"}, /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
+      /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/123,
+      /*layer_idx=*/-1, [&](absl::StatusOr<std::vector<int>> result) {
+        ++callback_count;
+        callback_status = result.status();
+      });
+
+  ASSERT_TRUE(callback_status.has_value());
+  EXPECT_EQ(callback_count, 1);
+  EXPECT_EQ(callback_status->code(), absl::StatusCode::kCancelled);
+  EXPECT_TRUE(transport.WaitForPendingOperations(std::chrono::seconds(1)));
+}
+
 TEST_P(BlockTransportTest, PullNonContiguous) {
   size_t size = 1024;
   // Delegate 1 has 3 blocks capacity

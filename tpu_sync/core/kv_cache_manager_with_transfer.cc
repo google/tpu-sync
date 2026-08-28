@@ -16,6 +16,7 @@
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -23,24 +24,27 @@
 #include <stdio.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <cstdlib>
 #include <optional>
 #include <ratio>
 #include <set>
@@ -58,13 +62,13 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "xla/pjrt/pjrt_client.h"
-#include "xla/tsl/platform/errors.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/metrics_collector.h"
 #include "tpu_sync/core/raiden_manager_base.h"
@@ -78,6 +82,8 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "xla/pjrt/pjrt_client.h"
+#include "xla/tsl/platform/errors.h"
 
 namespace tpu_raiden {
 
@@ -99,6 +105,97 @@ bool EncodeIp(const std::string& ip_str, uint8_t* dst) {
 }
 
 constexpr absl::Duration kPendingWorkTimeout = absl::Seconds(30);
+constexpr uint64_t kMaxControlMessageBytes = 64 * 1024;
+constexpr char kSendUuidNotRegistered[] = "send UUID is not registered yet";
+
+std::chrono::milliseconds PositiveDurationSecondsFromEnv(
+    const char* name, std::chrono::milliseconds fallback) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr) return fallback;
+  int64_t seconds = 0;
+  constexpr int64_t kMaxSeconds =
+      std::chrono::milliseconds::max().count() / 1000;
+  if (!absl::SimpleAtoi(raw, &seconds) || seconds <= 0 ||
+      seconds > kMaxSeconds) {
+    LOG(WARNING) << "Ignoring " << name << "=\"" << raw
+                 << "\"; expected a positive integer number of seconds. "
+                    "Using "
+                 << fallback.count() << "ms";
+    return fallback;
+  }
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::seconds(seconds));
+}
+
+size_t PositiveSizeFromEnv(
+    const char* name, size_t fallback,
+    size_t maximum = std::numeric_limits<size_t>::max()) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr) return fallback;
+  uint64_t value = 0;
+  if (!absl::SimpleAtoi(raw, &value) || value == 0 || value > maximum) {
+    LOG(WARNING) << "Ignoring " << name << "=\"" << raw
+                 << "\"; expected an integer in [1, " << maximum << "]. Using "
+                 << fallback;
+    return fallback;
+  }
+  return static_cast<size_t>(value);
+}
+
+class RemoteControlError : public std::runtime_error {
+ public:
+  RemoteControlError(int32_t remote_status, std::string remote_message)
+      : std::runtime_error("remote Raiden control error: " + remote_message),
+        remote_status_(remote_status) {}
+
+  int32_t remote_status() const { return remote_status_; }
+
+ private:
+  int32_t remote_status_;
+};
+
+const char* LeaseOperationName(uint32_t op) {
+  switch (op) {
+    case 4:
+      return "renew";
+    case 5:
+      return "cancel";
+    default:
+      return "unknown";
+  }
+}
+
+const char* LeaseStatusName(int32_t status) {
+  switch (status) {
+    case 1:
+      return "applied";
+    case 0:
+      return "unknown";
+    case -1:
+      return "terminal";
+    case -2:
+      return "transferring";
+    case -3:
+      return "max_retention";
+    default:
+      return "invalid";
+  }
+}
+
+void RecordLeaseUpdateMetric(uint32_t op, int32_t status) {
+  const std::array<telemetry::MetricLabel, 2> labels = {
+      telemetry::MetricLabel{"operation", LeaseOperationName(op)},
+      telemetry::MetricLabel{"status", LeaseStatusName(status)}};
+  telemetry::RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
+      "tpu_raiden_legacy_uuid_lease_updates_total", labels);
+}
+
+void RecordPullMetric(absl::string_view result) {
+  const std::array<telemetry::MetricLabel, 1> labels = {
+      telemetry::MetricLabel{"result", result}};
+  telemetry::RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
+      "tpu_raiden_legacy_uuid_pull_claims_total", labels);
+}
 
 [[noreturn]] void ThrowStatus(const std::string& context,
                               const absl::Status& status) {
@@ -150,13 +247,81 @@ T ValueOrThrow(const std::string& context, absl::StatusOr<T> value_or) {
   return std::move(value_or).value();
 }
 
-absl::Status WriteExact(int fd, const void* buffer, size_t length) {
+int PollTimeoutMillis(std::chrono::steady_clock::time_point deadline) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) return 0;
+  const int64_t remaining_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(deadline - now)
+          .count();
+  return static_cast<int>(
+      std::min<int64_t>(std::numeric_limits<int>::max(),
+                        std::max<int64_t>(1, (remaining_us + 999) / 1000)));
+}
+
+absl::Status ReadExactUntil(int fd, void* buffer, size_t length,
+                            std::chrono::steady_clock::time_point deadline) {
+  uint8_t* ptr = static_cast<uint8_t*>(buffer);
+  size_t remaining = length;
+  while (remaining > 0) {
+    const int timeout_ms = PollTimeoutMillis(deadline);
+    if (timeout_ms == 0) {
+      return absl::DeadlineExceededError(
+          "control operation read deadline exceeded");
+    }
+    pollfd pfd{fd, POLLIN, 0};
+    const int ready = poll(&pfd, 1, timeout_ms);
+    if (ready < 0) {
+      if (errno == EINTR) continue;
+      return absl::InternalError("socket read poll failed: " +
+                                 std::string(std::strerror(errno)));
+    }
+    if (ready == 0) {
+      return absl::DeadlineExceededError(
+          "control operation read deadline exceeded");
+    }
+    const ssize_t bytes_read = recv(fd, ptr, remaining, MSG_DONTWAIT);
+    if (bytes_read < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+      return absl::InternalError("socket read failed: " +
+                                 std::string(std::strerror(errno)));
+    }
+    if (bytes_read == 0) {
+      return absl::InternalError("socket closed during read");
+    }
+    ptr += bytes_read;
+    remaining -= bytes_read;
+  }
+  return absl::OkStatus();
+}
+
+absl::Status WriteExactUntil(int fd, const void* buffer, size_t length,
+                             std::chrono::steady_clock::time_point deadline) {
   const uint8_t* ptr = static_cast<const uint8_t*>(buffer);
   size_t remaining = length;
   while (remaining > 0) {
-    ssize_t written = write(fd, ptr, remaining);
-    if (written < 0) {
+    const int timeout_ms = PollTimeoutMillis(deadline);
+    if (timeout_ms == 0) {
+      return absl::DeadlineExceededError(
+          "control operation write deadline exceeded");
+    }
+    pollfd pfd{fd, POLLOUT, 0};
+    const int ready = poll(&pfd, 1, timeout_ms);
+    if (ready < 0) {
       if (errno == EINTR) continue;
+      return absl::InternalError("socket write poll failed: " +
+                                 std::string(std::strerror(errno)));
+    }
+    if (ready == 0) {
+      return absl::DeadlineExceededError(
+          "control operation write deadline exceeded");
+    }
+    int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+    flags |= MSG_NOSIGNAL;
+#endif
+    const ssize_t written = send(fd, ptr, remaining, flags);
+    if (written < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
       return absl::InternalError("socket write failed: " +
                                  std::string(std::strerror(errno)));
     }
@@ -169,23 +334,16 @@ absl::Status WriteExact(int fd, const void* buffer, size_t length) {
   return absl::OkStatus();
 }
 
-absl::Status ReadExact(int fd, void* buffer, size_t length) {
-  uint8_t* ptr = static_cast<uint8_t*>(buffer);
-  size_t remaining = length;
-  while (remaining > 0) {
-    ssize_t bytes_read = read(fd, ptr, remaining);
-    if (bytes_read < 0) {
-      if (errno == EINTR) continue;
-      return absl::InternalError("socket read failed: " +
-                                 std::string(std::strerror(errno)));
-    }
-    if (bytes_read == 0) {
-      return absl::InternalError("socket closed during read");
-    }
-    ptr += bytes_read;
-    remaining -= bytes_read;
+void ConfigureSocketIoTimeout(int fd, std::chrono::milliseconds timeout) {
+  const int64_t timeout_us = std::max<int64_t>(1, timeout.count() * 1000);
+  timeval value;
+  value.tv_sec = timeout_us / 1000000;
+  value.tv_usec = timeout_us % 1000000;
+  if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &value, sizeof(value)) < 0 ||
+      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &value, sizeof(value)) < 0) {
+    throw std::runtime_error("setsockopt(control timeout) failed: " +
+                             std::string(std::strerror(errno)));
   }
-  return absl::OkStatus();
 }
 
 std::pair<std::string, int> SplitEndpoint(const std::string& endpoint) {
@@ -214,13 +372,24 @@ std::pair<std::string, int> SplitEndpoint(const std::string& endpoint) {
   return {host, port};
 }
 
-int ConnectTcp(const std::string& endpoint) {
+int ConnectTcp(const std::string& endpoint,
+               std::chrono::steady_clock::time_point deadline) {
   auto [host, port] = SplitEndpoint(endpoint);
   struct addrinfo hints;
   struct addrinfo* res = nullptr;
   std::memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
+  // All production control endpoints are numeric. Avoid the system resolver
+  // for those so the supplied deadline covers the full operation. Portable
+  // getaddrinfo offers no cancellation API; hostname DNS remains outside the
+  // strict socket deadline and is documented as such.
+  in_addr numeric_v4;
+  in6_addr numeric_v6;
+  if (inet_pton(AF_INET, host.c_str(), &numeric_v4) == 1 ||
+      inet_pton(AF_INET6, host.c_str(), &numeric_v6) == 1) {
+    hints.ai_flags |= AI_NUMERICHOST;
+  }
 
   std::string port_str = std::to_string(port);
   int err = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res);
@@ -229,22 +398,64 @@ int ConnectTcp(const std::string& endpoint) {
                              "': " + gai_strerror(err));
   }
 
-  int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  if (fd < 0) {
-    freeaddrinfo(res);
-    throw std::runtime_error("socket() failed: " +
-                             std::string(std::strerror(errno)));
-  }
-  int opt = 1;
-  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-  if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
-    std::string err_str = std::strerror(errno);
+  int fd = -1;
+  std::string last_error = "no resolved address";
+  for (addrinfo* candidate = res; candidate != nullptr;
+       candidate = candidate->ai_next) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      last_error = "deadline exceeded";
+      break;
+    }
+    fd = socket(candidate->ai_family, candidate->ai_socktype,
+                candidate->ai_protocol);
+    if (fd < 0) {
+      last_error = std::strerror(errno);
+      continue;
+    }
+    const int original_flags = fcntl(fd, F_GETFL, 0);
+    if (original_flags < 0 ||
+        fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) < 0) {
+      last_error = std::strerror(errno);
+      close(fd);
+      fd = -1;
+      continue;
+    }
+    const int opt = 1;
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    int connect_result = connect(fd, candidate->ai_addr, candidate->ai_addrlen);
+    if (connect_result < 0 && errno == EINPROGRESS) {
+      pollfd pfd{fd, POLLOUT, 0};
+      int ready;
+      do {
+        ready = poll(&pfd, 1, PollTimeoutMillis(deadline));
+      } while (ready < 0 && errno == EINTR);
+      if (ready > 0) {
+        int socket_error = 0;
+        socklen_t error_length = sizeof(socket_error);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                       &error_length) == 0 &&
+            socket_error == 0) {
+          connect_result = 0;
+        } else {
+          last_error = std::strerror(socket_error == 0 ? errno : socket_error);
+        }
+      } else {
+        last_error = ready == 0 ? "deadline exceeded" : std::strerror(errno);
+      }
+    } else if (connect_result < 0) {
+      last_error = std::strerror(errno);
+    }
+    if (connect_result == 0 && fcntl(fd, F_SETFL, original_flags) == 0) {
+      break;
+    }
+    if (connect_result == 0) last_error = std::strerror(errno);
     close(fd);
-    freeaddrinfo(res);
-    throw std::runtime_error("connect(" + endpoint + ") failed: " + err_str);
+    fd = -1;
   }
   freeaddrinfo(res);
+  if (fd < 0) {
+    throw std::runtime_error("connect(" + endpoint + ") failed: " + last_error);
+  }
   return fd;
 }
 
@@ -273,14 +484,19 @@ static std::string GetPeerIp(int fd) {
   }
   return std::string(ip_buf);
 }
-static void WriteBlockIds(int fd, const std::vector<int64_t>& block_ids) {
+static void WriteBlockIds(
+    int fd, const std::vector<int64_t>& block_ids,
+    std::chrono::steady_clock::time_point operation_deadline) {
   if (block_ids.empty()) return;
   CheckStatus(
       "control block ids write",
-      WriteExact(fd, block_ids.data(), block_ids.size() * sizeof(int64_t)));
+      WriteExactUntil(fd, block_ids.data(), block_ids.size() * sizeof(int64_t),
+                      operation_deadline));
 }
 
-static std::vector<int64_t> ReadBlockIds(int fd, uint64_t num_blocks) {
+static std::vector<int64_t> ReadBlockIds(
+    int fd, uint64_t num_blocks,
+    std::chrono::steady_clock::time_point operation_deadline) {
   if (num_blocks == 0) return {};
   if (num_blocks > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
     throw std::invalid_argument("num_blocks is too large");
@@ -288,7 +504,8 @@ static std::vector<int64_t> ReadBlockIds(int fd, uint64_t num_blocks) {
   std::vector<int64_t> block_ids(static_cast<size_t>(num_blocks));
   CheckStatus(
       "control block ids read",
-      ReadExact(fd, block_ids.data(), block_ids.size() * sizeof(int64_t)));
+      ReadExactUntil(fd, block_ids.data(), block_ids.size() * sizeof(int64_t),
+                     operation_deadline));
   return block_ids;
 }
 
@@ -447,6 +664,24 @@ kv_cache::KVCacheCopySpec KVCacheManagerWithTransfer::ToKVCacheCopySpec(
   return ToKVCacheCopySpecImpl(spec);
 }
 
+void KVCacheManagerWithTransfer::ConfigureLegacyControlFromEnv() {
+  static_assert(kMaxLeaseBatchSizeLimit * sizeof(uint64_t) <=
+                kMaxControlMessageBytes);
+  send_tombstone_ttl_ = PositiveDurationSecondsFromEnv(
+      "RAIDEN_SEND_TOMBSTONE_TTL_S", send_tombstone_ttl_);
+  pending_ack_ttl_ = PositiveDurationSecondsFromEnv("RAIDEN_PENDING_ACK_TTL_S",
+                                                    pending_ack_ttl_);
+  max_send_tombstones_ =
+      PositiveSizeFromEnv("RAIDEN_MAX_SEND_TOMBSTONES", max_send_tombstones_);
+  max_pending_acks_ =
+      PositiveSizeFromEnv("RAIDEN_MAX_PENDING_ACKS", max_pending_acks_);
+  control_io_timeout_ = PositiveDurationSecondsFromEnv(
+      "RAIDEN_CONTROL_IO_TIMEOUT_S", control_io_timeout_);
+  max_lease_batch_size_ =
+      PositiveSizeFromEnv("RAIDEN_MAX_LEASE_BATCH_SIZE",
+                          kDefaultMaxLeaseBatchSize, kMaxLeaseBatchSizeLimit);
+}
+
 void KVCacheManagerWithTransfer::ValidateRequestedBlocks(
     const SendEntry& entry, const std::vector<int64_t>& requested_block_ids) {
   if (requested_block_ids.empty()) {
@@ -486,6 +721,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
       metrics_collector_(std::move(metrics_collector)) {
+  ConfigureLegacyControlFromEnv();
   if (local_control_port_ >= 0) {
     if (max_blocks_ <= 0) {
       throw std::invalid_argument("max_blocks must be positive");
@@ -512,6 +748,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     }
     StartControlServer();
   }
+  if (push_pool_) StartRegistrationRetryScheduler();
 }
 
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
@@ -541,6 +778,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
       metrics_collector_(std::move(metrics_collector)) {
+  ConfigureLegacyControlFromEnv();
   if (num_layers() == 0 || num_shards() == 0) {
     return;
   }
@@ -570,6 +808,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     }
     StartControlServer();
   }
+  if (push_pool_) StartRegistrationRetryScheduler();
 }
 
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
@@ -590,6 +829,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(false),
       metrics_collector_(std::move(metrics_collector)) {
+  ConfigureLegacyControlFromEnv();
   if (local_control_port_ >= 0) {
     if (max_blocks_ <= 0) {
       throw std::invalid_argument("max_blocks must be positive");
@@ -616,17 +856,44 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     }
     StartControlServer();
   }
+  if (push_pool_) StartRegistrationRetryScheduler();
 }
 
 KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
-  StopControlServer();
-  // Pull-serve workers read this object's state; nothing may be torn down
-  // while one is still running.
   shutting_down_.store(true, std::memory_order_relaxed);
+  StopControlServer();
+  StopRegistrationRetryScheduler();
+  CancelTransportOperations();
   {
-    absl::MutexLock lock(pull_workers_mu_);
-    pull_workers_mu_.Await(absl::Condition(
-        +[](int* active) { return *active == 0; }, &active_pull_workers_));
+    absl::MutexLock lock(mu_);
+    while (!send_entries_.empty()) {
+      auto it = send_entries_.begin();
+      (void)TerminalizeSendEntryLocked(it->first, it->second,
+                                       "manager stopped during producer send",
+                                       /*waiting_only=*/false);
+    }
+    const absl::Time deadline = absl::Now() + absl::Seconds(30);
+    while (active_send_callbacks_ != 0 && absl::Now() < deadline) {
+      cv_.WaitWithDeadline(&mu_, deadline);
+    }
+    if (active_send_callbacks_ != 0) {
+      LOG(FATAL) << "Legacy send callbacks did not drain after transport "
+                    "cancellation; failing closed to prevent callback UAF or "
+                    "staging-slot reuse";
+    }
+  }
+  {
+    std::unique_lock<std::mutex> lock(async_callbacks_mu_);
+    if (!async_callbacks_cv_.wait_for(lock, std::chrono::seconds(30), [this]() {
+          return active_async_callbacks_ == 0;
+        })) {
+      LOG(FATAL) << "Asynchronous manager callbacks did not drain after "
+                    "transport cancellation; failing closed to prevent UAF";
+    }
+  }
+  if (!WaitForManagerCallbacks(std::chrono::seconds(30))) {
+    LOG(FATAL) << "Base pool-reshard callbacks did not drain before derived "
+                  "manager teardown";
   }
   push_pool_.reset();
   pull_pool_.reset();
@@ -642,20 +909,29 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
   }
 }
 
+std::shared_ptr<void> KVCacheManagerWithTransfer::TrackAsyncCallback() {
+  {
+    std::lock_guard<std::mutex> lock(async_callbacks_mu_);
+    ++active_async_callbacks_;
+  }
+  return std::shared_ptr<void>(this, [this](void*) {
+    {
+      std::lock_guard<std::mutex> lock(async_callbacks_mu_);
+      if (active_async_callbacks_ == 0) {
+        LOG(FATAL) << "Async callback tracker underflow";
+      }
+      --active_async_callbacks_;
+    }
+    async_callbacks_cv_.notify_all();
+  });
+}
+
 int64_t KVCacheManagerWithTransfer::NotifyForRead(
     const std::string& req_id, uint64_t uuid,
     const std::vector<int64_t>& block_ids) {
   const auto register_start = std::chrono::steady_clock::now();
   if (block_ids.empty()) {
     return 0;
-  }
-
-  {
-    absl::MutexLock lock(mu_);
-    if (pending_acks_.erase(uuid) > 0) {
-      done_sending_.insert(req_id);
-      return 0;
-    }
   }
 
   auto entry = std::make_shared<SendEntry>();
@@ -666,14 +942,62 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
   for (int64_t block_id : block_ids) {
     entry->registered_block_set.insert(block_id);
   }
-  entry->deadline = DeadlineFromNow();
+  const auto lease_duration = std::chrono::milliseconds(
+      std::max<int64_t>(1, static_cast<int64_t>(timeout_s_ * 1000.0)));
+  entry->deadline = register_start + lease_duration;
+  entry->retention_deadline = register_start + lease_duration * 10;
   entry->register_start = register_start;
 
+  bool consumed_early_ack = false;
+  bool consumed_early_cancel = false;
   {
     absl::MutexLock lock(mu_);
-    send_entries_[uuid] = entry;
+    const auto now = std::chrono::steady_clock::now();
+    PurgeSendTombstonesLocked(now);
+    auto tombstone = send_tombstones_.find(uuid);
+    if (tombstone != send_tombstones_.end()) {
+      if (tombstone->second.kind == SendTombstoneKind::kPreRegistrationCancel) {
+        InstallSendTombstoneLocked(uuid, "send cancelled before registration",
+                                   now, SendTombstoneKind::kCancelled);
+        done_sending_.insert(req_id);
+        (void)ConsumePendingAckLocked(uuid, now);
+        consumed_early_cancel = true;
+      } else {
+        throw std::invalid_argument(
+            "send UUID is quarantined by a previous terminal outcome; use a "
+            "fresh UUID or wait for RAIDEN_SEND_TOMBSTONE_TTL_S to expire");
+      }
+    }
+    if (!consumed_early_cancel &&
+        (send_entries_.find(uuid) != send_entries_.end() ||
+         draining_send_entries_.find(uuid) != draining_send_entries_.end())) {
+      throw std::invalid_argument("send UUID is already registered");
+    }
+    if (!consumed_early_cancel && ConsumePendingAckLocked(uuid, now)) {
+      done_sending_.insert(req_id);
+      InstallSendTombstoneLocked(uuid, "send was acknowledged before notify",
+                                 now);
+      consumed_early_ack = true;
+    } else if (!consumed_early_cancel) {
+      send_entries_.emplace(uuid, entry);
+    }
+    UpdateLegacySendGaugesLocked();
   }
   cv_.SignalAll();
+
+  if (consumed_early_ack || consumed_early_cancel) {
+    std::ostringstream timing;
+    timing << "RAIDEN_TIMING event=producer_registration_suppressed"
+           << " req_id=" << req_id << " uuid=" << uuid
+           << " node_id=" << node_id_ << " blocks=" << block_ids.size()
+           << " reason="
+           << (consumed_early_cancel ? "early_cancel" : "early_ack")
+           << " enqueue_ms="
+           << DurationMs(register_start, std::chrono::steady_clock::now())
+           << " failed=0";
+    EmitTimingLog(timing.str());
+    return 0;
+  }
 
   std::ostringstream timing;
   timing << "RAIDEN_TIMING event=producer_register"
@@ -683,6 +1007,16 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
          << " failed=0";
   EmitTimingLog(timing.str());
   return static_cast<int64_t>(uuid);
+}
+
+std::vector<int32_t> KVCacheManagerWithTransfer::RenewRemoteLeases(
+    const std::string& remote_endpoint, const std::vector<uint64_t>& uuids) {
+  return SendLeaseBatch(remote_endpoint, kOpRenewLeases, uuids);
+}
+
+std::vector<int32_t> KVCacheManagerWithTransfer::CancelRemoteLeases(
+    const std::string& remote_endpoint, const std::vector<uint64_t>& uuids) {
+  return SendLeaseBatch(remote_endpoint, kOpCancelLeases, uuids);
 }
 
 absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
@@ -777,6 +1111,7 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
     recv_entry.num_completed_blocks = 0;
     recv_entry.deadline = DeadlineFromNow();
     recv_entry.start_time = std::chrono::steady_clock::now();
+    recv_entry.phase = RecvEntry::Phase::kTransferring;
 
     // H2D reads each destination block from wherever it was staged.
     std::vector<int64_t> h2d_local_block_ids(unique_dst_blocks.begin(),
@@ -834,6 +1169,7 @@ absl::Status KVCacheManagerWithTransfer::RegisterRecv(
   recv_entry.total_blocks = expected_block_count;
   recv_entry.num_completed_blocks = 0;
   recv_entry.deadline = DeadlineFromNow();
+  recv_entry.phase = RecvEntry::Phase::kTransferring;
   // host_to_chip is left empty -> defaults to 1-to-1 mapping in
   // OnBlocksReceived
   active_recv_entries_[uuid] = std::move(recv_entry);
@@ -1373,10 +1709,18 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
     }
     raiden::PjRtCopyFuture future = std::move(future_or).value();
     state->d2h_futures.push_back(future);
-    future.OnReady([this, uuid = static_cast<uint64_t>(plan.uuid()),
-                    pool_idx](auto status_or) {
+    std::shared_ptr<void> callback_guard = TrackAsyncCallback();
+    future.OnReady([this, uuid = static_cast<uint64_t>(plan.uuid()), pool_idx,
+                    callback_guard](auto status_or) mutable {
+      std::shared_ptr<void> callback_lifetime = std::move(callback_guard);
+      (void)callback_lifetime;
       if (!status_or.ok()) {
         FinishPoolReshardSend(uuid, status_or.status());
+        return;
+      }
+      if (stopping_.load(std::memory_order_acquire)) {
+        FinishPoolReshardSend(
+            uuid, absl::CancelledError("manager stopped before pool push"));
         return;
       }
       StartPoolReshardPush(uuid, pool_idx);
@@ -1423,11 +1767,8 @@ void KVCacheManagerWithTransfer::StartPoolReshardPush(uint64_t uuid,
     }
   }
 
-  transport::BlockTransport* transport_server = nullptr;
-  {
-    absl::MutexLock lock(server_init_mu_);
-    transport_server = server_.get();
-  }
+  std::shared_ptr<transport::BlockTransport> transport_server =
+      GetTransportServer();
   if (transport_server == nullptr) {
     FinishPoolReshardSend(
         uuid, absl::FailedPreconditionError("transport server is not running"));
@@ -1443,10 +1784,14 @@ void KVCacheManagerWithTransfer::StartPoolReshardPush(uint64_t uuid,
       src_ids.push_back(src_id);
       dst_ids.push_back(dst_id);
     }
+    std::shared_ptr<void> callback_guard = TrackAsyncCallback();
     transport_server->AsyncPush(
         {peer}, src_ids, dst_ids, state->parallelism,
         transport::MajorOrder::kLayerMajor, uuid, static_cast<int>(pool_idx),
-        [this, uuid](absl::StatusOr<std::vector<int>> result) {
+        [this, uuid,
+         callback_guard](absl::StatusOr<std::vector<int>> result) mutable {
+          std::shared_ptr<void> callback_lifetime = std::move(callback_guard);
+          (void)callback_lifetime;
           FinishPoolReshardSend(
               uuid, result.ok() ? absl::OkStatus() : result.status());
         });
@@ -1573,6 +1918,7 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
   recv_entry.is_pool_reshard = true;
   recv_entry.deadline = DeadlineFromNow();
   recv_entry.start_time = std::chrono::steady_clock::now();
+  recv_entry.phase = RecvEntry::Phase::kTransferring;
   recv_entry.chip_block_ids.assign(chip_block_ids.begin(),
                                    chip_block_ids.end());
   // The wire lands at chip block ids (full mirrors address them directly;
@@ -1786,13 +2132,19 @@ void KVCacheManagerWithTransfer::StartRead(
   CopyPlan load_plan =
       BuildLoadCopyPlan(remote_block_ids, local_block_ids, host_block_ids);
 
+  const auto registration_deadline = DeadlineFromNow();
   {
     absl::MutexLock lock(mu_);
+    if (active_recv_entries_.find(uuid) != active_recv_entries_.end()) {
+      failed_recving_.insert(req_id);
+      ReleaseStagingLocked(recv_slot, &staged_host_blocks);
+      return;
+    }
     RecvEntry entry;
     entry.req_id = req_id;
     entry.slot_idx = recv_slot;
     entry.staged_host_blocks = std::move(staged_host_blocks);
-    entry.deadline = DeadlineFromNow();
+    entry.deadline = registration_deadline;
     entry.start_time = std::chrono::steady_clock::now();
     entry.chip_block_ids = load_plan.h2d_local_block_ids;
     entry.total_blocks = load_plan.num_blocks;
@@ -1807,7 +2159,7 @@ void KVCacheManagerWithTransfer::StartRead(
           load_plan.h2d_local_block_ids[i];
     }
     entry.h2d_dispatch_futures.reserve(load_plan.h2d_local_block_ids.size());
-    active_recv_entries_[uuid] = std::move(entry);
+    active_recv_entries_.emplace(uuid, std::move(entry));
   }
 
   if (metrics_collector_) {
@@ -1828,64 +2180,160 @@ void KVCacheManagerWithTransfer::StartRead(
     return;
   }
 
-  std::optional<int> target_node = assigned_numa_node();
+  const std::optional<int> target_node = assigned_numa_node();
+  NumaThreadPool* const registration_pool = push_pool_.get();
+  const auto registration_start = std::chrono::steady_clock::now();
+  auto shared_load_plan = std::make_shared<CopyPlan>(std::move(load_plan));
+  auto attempts = std::make_shared<size_t>(0);
+  auto retryable_unknowns = std::make_shared<size_t>(0);
 
-  push_pool_->Schedule(target_node, [this, req_id, uuid, remote_endpoint,
-                                     load_plan = std::move(load_plan)]() {
+  // A dedicated manager-owned timer paces retries, then submits each attempt
+  // as a separate FIFO pool task. No push/pull worker sleeps while the
+  // producer is still finishing prefill.
+  auto registration_attempt = std::make_shared<std::function<void()>>();
+  std::weak_ptr<std::function<void()>> weak_registration_attempt =
+      registration_attempt;
+  *registration_attempt = [this, req_id, uuid, remote_endpoint,
+                           registration_deadline, registration_start,
+                           target_node, shared_load_plan, attempts,
+                           retryable_unknowns, weak_registration_attempt]() {
+    auto fail_receive = [this, req_id, uuid]() {
+      absl::MutexLock lock(mu_);
+      auto it = active_recv_entries_.find(uuid);
+      if (it == active_recv_entries_.end() || it->second.req_id != req_id) {
+        return;
+      }
+      failed_recving_.insert(req_id);
+      ReleaseRecvStagingLocked(&it->second);
+      active_recv_entries_.erase(it);
+    };
+
     try {
-      LOG(INFO) << "StartRead (connecting): req_id=" << req_id
-                << ", uuid=" << uuid
-                << ", numa=" << assigned_numa_node().value_or(-1);
-      int control_fd = ConnectTcp(remote_endpoint);
-      auto control_cleanup =
-          std::unique_ptr<int, void (*)(int*)>(&control_fd, [](int* p) {
-            if (p && *p >= 0) close(*p);
-          });
-
-      ControlRequestHeader stream_request;
-      stream_request.magic = kControlMagic;
-      stream_request.op = kOpPullStream;
-      stream_request.uuid = uuid;
-      stream_request.ep_idx = 0;
-      stream_request.num_blocks = static_cast<uint64_t>(load_plan.num_blocks);
-      stream_request.consumer_data_port =
-          static_cast<uint32_t>(local_data_port_);
-
-      std::vector<std::string> ips = local_ips();
-      stream_request.num_ips =
-          std::min(ips.size(), static_cast<size_t>(kMaxNics));
-      for (size_t i = 0; i < stream_request.num_ips; ++i) {
-        if (!EncodeIp(ips[i], stream_request.consumer_ips[i])) {
-          std::memset(stream_request.consumer_ips[i], 0, 16);
+      const auto now = std::chrono::steady_clock::now();
+      if (stopping_) {
+        throw std::runtime_error(
+            "manager stopped while registering remote KV pull");
+      }
+      if (now >= registration_deadline) {
+        throw std::runtime_error(
+            "timed out retrying remote KV pull registration");
+      }
+      {
+        absl::MutexLock lock(mu_);
+        auto it = active_recv_entries_.find(uuid);
+        if (it == active_recv_entries_.end() || it->second.req_id != req_id ||
+            it->second.phase != RecvEntry::Phase::kRegistering) {
+          return;
         }
       }
-      CheckStatus(
-          "control pull stream write",
-          WriteExact(control_fd, &stream_request, sizeof(stream_request)));
-      WriteBlockIds(control_fd, load_plan.producer_remote_block_ids);
-      WriteBlockIds(control_fd, load_plan.transport_host_block_ids);
 
-      ControlResponseHeader response = ReadControlResponseHeader(control_fd);
-      if (response.status != 0) {
-        throw std::runtime_error(
-            "Remote producer rejected Hybrid Bridge read request");
+      ++*attempts;
+      const auto attempt_deadline =
+          std::min(registration_deadline, now + control_io_timeout_);
+      try {
+        LOG(INFO) << "StartRead (connecting): req_id=" << req_id
+                  << ", uuid=" << uuid << ", attempt=" << *attempts
+                  << ", numa=" << assigned_numa_node().value_or(-1);
+        int control_fd = ConnectTcp(remote_endpoint, attempt_deadline);
+        auto control_cleanup =
+            std::unique_ptr<int, void (*)(int*)>(&control_fd, [](int* p) {
+              if (p && *p >= 0) close(*p);
+            });
+        ConfigureSocketIoTimeout(control_fd, control_io_timeout_);
+
+        ControlRequestHeader stream_request;
+        stream_request.magic = kControlMagic;
+        stream_request.op = kOpPullStream;
+        stream_request.uuid = uuid;
+        stream_request.ep_idx = 0;
+        stream_request.num_blocks =
+            static_cast<uint64_t>(shared_load_plan->num_blocks);
+        stream_request.consumer_data_port =
+            static_cast<uint32_t>(local_data_port_);
+
+        std::vector<std::string> ips = local_ips();
+        stream_request.num_ips =
+            std::min(ips.size(), static_cast<size_t>(kMaxNics));
+        for (size_t i = 0; i < stream_request.num_ips; ++i) {
+          if (!EncodeIp(ips[i], stream_request.consumer_ips[i])) {
+            std::memset(stream_request.consumer_ips[i], 0, 16);
+          }
+        }
+        CheckStatus("control pull stream write",
+                    WriteExactUntil(control_fd, &stream_request,
+                                    sizeof(stream_request), attempt_deadline));
+        WriteBlockIds(control_fd, shared_load_plan->producer_remote_block_ids,
+                      attempt_deadline);
+        WriteBlockIds(control_fd, shared_load_plan->transport_host_block_ids,
+                      attempt_deadline);
+        (void)ReadControlResponseHeader(control_fd, attempt_deadline);
+      } catch (const RemoteControlError& e) {
+        if (e.remote_status() != kControlRetryableUnknown) throw;
+        ++*retryable_unknowns;
+        if (std::chrono::steady_clock::now() >= registration_deadline) {
+          throw std::runtime_error(
+              "timed out waiting for remote send UUID registration");
+        }
+        auto next_attempt = weak_registration_attempt.lock();
+        if (!next_attempt) {
+          throw std::runtime_error(
+              "remote KV registration retry task was released");
+        }
+        const auto retry_now = std::chrono::steady_clock::now();
+        const auto retry_delay =
+            ComputeRegistrationRetryDelay(uuid, *retryable_unknowns);
+        const auto retry_due =
+            std::min(registration_deadline, retry_now + retry_delay);
+        ScheduleRegistrationRetry(retry_due, target_node,
+                                  [next_attempt]() { (*next_attempt)(); });
+        return;
       }
-      VLOG(1) << "StartRead (Hybrid Bridge) successfully registered pull "
-                 "request with Producer. req_id: "
-              << req_id;
+
+      {
+        absl::MutexLock lock(mu_);
+        auto it = active_recv_entries_.find(uuid);
+        if (it == active_recv_entries_.end() || it->second.req_id != req_id ||
+            it->second.phase != RecvEntry::Phase::kRegistering) {
+          return;
+        }
+        it->second.phase = RecvEntry::Phase::kTransferring;
+        it->second.deadline = DeadlineFromNow();
+      }
+
+      std::ostringstream timing;
+      timing << "RAIDEN_TIMING event=consumer_pull_registered"
+             << " req_id=" << req_id << " uuid=" << uuid
+             << " node_id=" << node_id_
+             << " blocks=" << shared_load_plan->num_blocks
+             << " attempts=" << *attempts
+             << " registration_retries=" << *retryable_unknowns
+             << " registration_wait_ms="
+             << DurationMs(registration_start, std::chrono::steady_clock::now())
+             << " failed=0";
+      EmitTimingLog(timing.str());
     } catch (const std::exception& e) {
-      LOG(ERROR)
-          << "Raiden consumer error during Hybrid Bridge StartRead connect: "
-          << e.what();
-      absl::MutexLock lock(mu_);
-      failed_recving_.insert(req_id);
-      auto it = active_recv_entries_.find(uuid);
-      if (it != active_recv_entries_.end()) {
-        ReleaseRecvStagingLocked(&it->second);
-        active_recv_entries_.erase(it);
-      }
+      LOG(ERROR) << "Raiden consumer error during Hybrid Bridge StartRead "
+                    "connect: "
+                 << e.what() << " req_id=" << req_id << " uuid=" << uuid
+                 << " attempts=" << *attempts
+                 << " registration_retries=" << *retryable_unknowns;
+      fail_receive();
     }
-  });
+  };
+
+  try {
+    registration_pool->Schedule(
+        target_node, [registration_attempt]() { (*registration_attempt)(); });
+  } catch (...) {
+    absl::MutexLock lock(mu_);
+    auto it = active_recv_entries_.find(uuid);
+    if (it != active_recv_entries_.end() && it->second.req_id == req_id) {
+      failed_recving_.insert(req_id);
+      ReleaseRecvStagingLocked(&it->second);
+      active_recv_entries_.erase(it);
+    }
+    throw;
+  }
 }
 
 std::tuple<std::vector<std::string>, std::vector<std::string>,
@@ -1899,16 +2347,23 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
     absl::MutexLock lock(mu_);
     const auto now = std::chrono::steady_clock::now();
     for (auto it = send_entries_.begin(); it != send_entries_.end();) {
-      const auto& entry = it->second;
-      if (entry->deadline <= now) {
-        // Nothing pulled this entry within its deadline; the bytes were
-        // never sent, so the transfer failed.
-        failed_recving_.insert(entry->req_id);
-        ReleaseEntrySlotLocked(entry);
-        settled_plans.emplace_back(it->first, 0);
-        it = send_entries_.erase(it);
-      } else {
-        ++it;
+      const uint64_t uuid = it->first;
+      const std::shared_ptr<SendEntry> entry = it->second;
+      const bool waiting_expired =
+          entry->phase == SendEntry::Phase::kWaitingForPull &&
+          entry->deadline <= now;
+      const bool transfer_expired =
+          entry->phase == SendEntry::Phase::kTransferring &&
+          entry->transfer_deadline <= now;
+      ++it;
+      if (waiting_expired || transfer_expired) {
+        if (transfer_expired) entry->failed = true;
+        settled_plans.emplace_back(uuid, 0);
+        (void)TerminalizeSendEntryLocked(
+            uuid, entry,
+            waiting_expired ? "send expired while waiting for pull"
+                            : "send transfer exceeded its deadline",
+            /*waiting_only=*/waiting_expired);
       }
     }
     for (auto it = active_pool_reshard_sends_.begin();
@@ -1930,8 +2385,9 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
     for (auto it = active_recv_entries_.begin();
          it != active_recv_entries_.end();) {
       auto& entry = it->second;
-      if (entry.network_completed ||
-          entry.num_completed_layers == num_layers()) {
+      if (entry.phase == RecvEntry::Phase::kTransferring &&
+          (entry.network_completed ||
+           entry.num_completed_layers == num_layers())) {
         bool all_h2d_done = true;
         for (auto& f : entry.h2d_futures) {
           if (!f.IsReady()) {
@@ -1952,7 +2408,8 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
         }
       }
 
-      if (entry.deadline <= now) {
+      if (entry.phase == RecvEntry::Phase::kTransferring &&
+          entry.deadline <= now) {
         failed_recving_.insert(entry.req_id);
         ReleaseRecvStagingLocked(&entry);
         settled_plans.emplace_back(it->first, entry.plan_generation);
@@ -2118,6 +2575,13 @@ bool KVCacheManagerWithTransfer::DynamicHostStagingEnabled() {
   return raw != nullptr && std::string(raw) == "1";
 }
 
+int64_t KVCacheManagerWithTransfer::SendStagingCapacityBlocks() const {
+  if (!dynamic_host_staging_ || host_block_manager_ == nullptr) {
+    return max_blocks_;
+  }
+  return host_block_manager_->total_blocks();
+}
+
 std::optional<std::vector<int64_t>>
 KVCacheManagerWithTransfer::AcquireRecvStagingLocked(int64_t num_blocks,
                                                      RecvEntry* entry) {
@@ -2205,6 +2669,395 @@ void KVCacheManagerWithTransfer::ReleaseEntrySlotLocked(
     ReleaseSlotLocked(entry->slot_idx);
   }
   entry->slot_released = true;
+}
+
+void KVCacheManagerWithTransfer::PurgeSendTombstonesLocked(
+    std::chrono::steady_clock::time_point now) {
+  while (!send_tombstone_order_.empty()) {
+    const uint64_t uuid = send_tombstone_order_.front();
+    auto it = send_tombstones_.find(uuid);
+    if (it == send_tombstones_.end()) {
+      send_tombstone_order_.pop_front();
+      continue;
+    }
+    if (it->second.expires_at > now) break;
+    send_tombstone_order_.erase(it->second.order_it);
+    send_tombstones_.erase(it);
+  }
+  while (send_tombstones_.size() > max_send_tombstones_ &&
+         !send_tombstone_order_.empty()) {
+    const uint64_t uuid = send_tombstone_order_.front();
+    send_tombstone_order_.pop_front();
+    send_tombstones_.erase(uuid);
+  }
+}
+
+void KVCacheManagerWithTransfer::InstallSendTombstoneLocked(
+    uint64_t uuid, std::string message,
+    std::chrono::steady_clock::time_point now, SendTombstoneKind kind) {
+  auto existing = send_tombstones_.find(uuid);
+  if (existing != send_tombstones_.end()) {
+    send_tombstone_order_.erase(existing->second.order_it);
+    send_tombstones_.erase(existing);
+  }
+  if (max_send_tombstones_ == 0) return;
+  while (send_tombstones_.size() >= max_send_tombstones_ &&
+         !send_tombstone_order_.empty()) {
+    const uint64_t oldest = send_tombstone_order_.front();
+    send_tombstone_order_.pop_front();
+    send_tombstones_.erase(oldest);
+  }
+  send_tombstone_order_.push_back(uuid);
+  SendTombstone tombstone;
+  tombstone.message = std::move(message);
+  tombstone.kind = kind;
+  tombstone.expires_at = now + send_tombstone_ttl_;
+  tombstone.order_it = std::prev(send_tombstone_order_.end());
+  send_tombstones_.emplace(uuid, std::move(tombstone));
+  cv_.SignalAll();
+}
+
+void KVCacheManagerWithTransfer::PurgePendingAcksLocked(
+    std::chrono::steady_clock::time_point now) {
+  while (!pending_ack_order_.empty()) {
+    const uint64_t uuid = pending_ack_order_.front();
+    auto it = pending_acks_.find(uuid);
+    if (it == pending_acks_.end()) {
+      pending_ack_order_.pop_front();
+      continue;
+    }
+    if (it->second.expires_at > now) break;
+    pending_ack_order_.erase(it->second.order_it);
+    pending_acks_.erase(it);
+  }
+  while (pending_acks_.size() > max_pending_acks_ &&
+         !pending_ack_order_.empty()) {
+    const uint64_t uuid = pending_ack_order_.front();
+    pending_ack_order_.pop_front();
+    pending_acks_.erase(uuid);
+  }
+}
+
+void KVCacheManagerWithTransfer::InstallPendingAckLocked(
+    uint64_t uuid, std::chrono::steady_clock::time_point now) {
+  PurgePendingAcksLocked(now);
+  auto existing = pending_acks_.find(uuid);
+  if (existing != pending_acks_.end()) {
+    pending_ack_order_.erase(existing->second.order_it);
+    pending_acks_.erase(existing);
+  }
+  if (max_pending_acks_ == 0) return;
+  while (pending_acks_.size() >= max_pending_acks_ &&
+         !pending_ack_order_.empty()) {
+    const uint64_t oldest = pending_ack_order_.front();
+    pending_ack_order_.pop_front();
+    pending_acks_.erase(oldest);
+  }
+  pending_ack_order_.push_back(uuid);
+  PendingAck pending_ack;
+  pending_ack.expires_at = now + pending_ack_ttl_;
+  pending_ack.order_it = std::prev(pending_ack_order_.end());
+  pending_acks_.emplace(uuid, std::move(pending_ack));
+}
+
+bool KVCacheManagerWithTransfer::ConsumePendingAckLocked(
+    uint64_t uuid, std::chrono::steady_clock::time_point now) {
+  PurgePendingAcksLocked(now);
+  auto it = pending_acks_.find(uuid);
+  if (it == pending_acks_.end()) return false;
+  pending_ack_order_.erase(it->second.order_it);
+  pending_acks_.erase(it);
+  return true;
+}
+
+void KVCacheManagerWithTransfer::UpdateLegacySendGaugesLocked() const {
+  size_t waiting = 0;
+  size_t transferring = draining_send_entries_.size();
+  for (const auto& [uuid, entry] : send_entries_) {
+    (void)uuid;
+    if (entry->phase == SendEntry::Phase::kWaitingForPull) {
+      ++waiting;
+    } else {
+      ++transferring;
+    }
+  }
+  auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  const std::string node_id = std::to_string(node_id_);
+  const std::string control_port = std::to_string(local_control_port_);
+  const std::array<telemetry::MetricLabel, 3> waiting_label = {
+      telemetry::MetricLabel{"state", "waiting"},
+      telemetry::MetricLabel{"node_id", node_id},
+      telemetry::MetricLabel{"control_port", control_port}};
+  const std::array<telemetry::MetricLabel, 3> transferring_label = {
+      telemetry::MetricLabel{"state", "transferring"},
+      telemetry::MetricLabel{"node_id", node_id},
+      telemetry::MetricLabel{"control_port", control_port}};
+  const std::array<telemetry::MetricLabel, 3> tombstone_label = {
+      telemetry::MetricLabel{"state", "tombstone"},
+      telemetry::MetricLabel{"node_id", node_id},
+      telemetry::MetricLabel{"control_port", control_port}};
+  store.SetGauge("tpu_raiden_legacy_uuid_entries", waiting_label, waiting);
+  store.SetGauge("tpu_raiden_legacy_uuid_entries", transferring_label,
+                 transferring);
+  store.SetGauge("tpu_raiden_legacy_uuid_entries", tombstone_label,
+                 send_tombstones_.size());
+}
+
+bool KVCacheManagerWithTransfer::TerminalizeSendEntryLocked(
+    uint64_t uuid, const std::shared_ptr<SendEntry>& expected,
+    const std::string& message, bool waiting_only, SendTombstoneKind kind) {
+  auto it = send_entries_.find(uuid);
+  if (it == send_entries_.end() || it->second != expected) return false;
+  if (waiting_only && expected->phase != SendEntry::Phase::kWaitingForPull) {
+    return false;
+  }
+
+  expected->terminal_requested = true;
+  expected->terminal_message = message;
+  if (!expected->settlement_reported) {
+    done_sending_.insert(expected->req_id);
+    expected->settlement_reported = true;
+  }
+  send_entries_.erase(it);
+  InstallSendTombstoneLocked(uuid, message, std::chrono::steady_clock::now(),
+                             kind);
+  if (expected->phase == SendEntry::Phase::kTransferring &&
+      expected->pending_layer_callbacks != 0) {
+    draining_send_entries_[uuid] = expected;
+  } else {
+    ReleaseEntrySlotLocked(expected);
+  }
+  UpdateLegacySendGaugesLocked();
+  cv_.SignalAll();
+  return true;
+}
+
+void KVCacheManagerWithTransfer::FinalizeDrainedSendLocked(
+    const std::shared_ptr<SendEntry>& entry) {
+  if (!entry || entry->pending_layer_callbacks != 0) return;
+  auto draining = draining_send_entries_.find(entry->uuid);
+  if (draining != draining_send_entries_.end() && draining->second == entry) {
+    ReleaseEntrySlotLocked(entry);
+    draining_send_entries_.erase(draining);
+  }
+  UpdateLegacySendGaugesLocked();
+  cv_.SignalAll();
+}
+
+void KVCacheManagerWithTransfer::FinishSendLayer(
+    const std::shared_ptr<SendEntry>& entry, const absl::Status& status,
+    const std::string& message) {
+  absl::MutexLock lock(mu_);
+  if (!entry) return;
+  if (!status.ok()) {
+    entry->failed = true;
+    entry->terminal_requested = true;
+    entry->terminal_message = message;
+    (void)TerminalizeSendEntryLocked(entry->uuid, entry, message,
+                                     /*waiting_only=*/false);
+  }
+  if (entry->pending_layer_callbacks > 0) {
+    --entry->pending_layer_callbacks;
+  }
+  if (active_send_callbacks_ > 0) --active_send_callbacks_;
+  if (entry->pending_layer_callbacks == 0) {
+    if (send_entries_.find(entry->uuid) != send_entries_.end()) {
+      (void)TerminalizeSendEntryLocked(
+          entry->uuid, entry, status.ok() ? "send transfer completed" : message,
+          /*waiting_only=*/false);
+    }
+    FinalizeDrainedSendLocked(entry);
+  }
+  cv_.SignalAll();
+}
+
+std::vector<int32_t> KVCacheManagerWithTransfer::ApplyLeaseBatchLocked(
+    uint32_t op, const std::vector<uint64_t>& uuids,
+    std::chrono::steady_clock::time_point now) {
+  if (op != kOpRenewLeases && op != kOpCancelLeases) {
+    throw std::invalid_argument("invalid lease batch operation");
+  }
+  PurgeSendTombstonesLocked(now);
+  const auto lease_duration = std::chrono::milliseconds(
+      std::max<int64_t>(1, static_cast<int64_t>(timeout_s_ * 1000.0)));
+  std::map<uint64_t, int32_t> deduplicated;
+  std::vector<int32_t> results;
+  results.reserve(uuids.size());
+
+  for (uint64_t uuid : uuids) {
+    auto duplicate = deduplicated.find(uuid);
+    if (duplicate != deduplicated.end()) {
+      results.push_back(duplicate->second);
+      RecordLeaseUpdateMetric(op, duplicate->second);
+      continue;
+    }
+
+    LeaseUpdateStatus status = LeaseUpdateStatus::kUnknown;
+    auto tombstone = send_tombstones_.find(uuid);
+    if (tombstone != send_tombstones_.end()) {
+      if (op == kOpCancelLeases &&
+          (tombstone->second.kind ==
+               SendTombstoneKind::kPreRegistrationCancel ||
+           tombstone->second.kind == SendTombstoneKind::kCancelled)) {
+        const SendTombstoneKind kind = tombstone->second.kind;
+        const std::string message = tombstone->second.message;
+        InstallSendTombstoneLocked(uuid, message, now, kind);
+        status = LeaseUpdateStatus::kApplied;
+      } else {
+        status = LeaseUpdateStatus::kTerminal;
+      }
+    } else {
+      auto entry_it = send_entries_.find(uuid);
+      if (entry_it != send_entries_.end()) {
+        const std::shared_ptr<SendEntry> entry = entry_it->second;
+        if (entry->phase != SendEntry::Phase::kWaitingForPull) {
+          status = LeaseUpdateStatus::kTransferring;
+        } else if (now >= entry->retention_deadline) {
+          (void)TerminalizeSendEntryLocked(
+              uuid, entry, "send reached maximum heartbeat retention",
+              /*waiting_only=*/true);
+          status = LeaseUpdateStatus::kMaxRetentionReached;
+        } else if (now >= entry->deadline) {
+          (void)TerminalizeSendEntryLocked(uuid, entry,
+                                           "send expired before lease update",
+                                           /*waiting_only=*/true);
+          status = LeaseUpdateStatus::kTerminal;
+        } else if (op == kOpCancelLeases) {
+          (void)TerminalizeSendEntryLocked(
+              uuid, entry, "send released by remote decoder",
+              /*waiting_only=*/true, SendTombstoneKind::kCancelled);
+          status = LeaseUpdateStatus::kApplied;
+        } else {
+          entry->deadline =
+              std::min(entry->retention_deadline, now + lease_duration);
+          status = LeaseUpdateStatus::kApplied;
+        }
+      } else if (draining_send_entries_.find(uuid) !=
+                 draining_send_entries_.end()) {
+        status = LeaseUpdateStatus::kTransferring;
+      } else if (op == kOpCancelLeases) {
+        InstallSendTombstoneLocked(uuid, "send cancelled before registration",
+                                   now,
+                                   SendTombstoneKind::kPreRegistrationCancel);
+        (void)ConsumePendingAckLocked(uuid, now);
+        status = LeaseUpdateStatus::kApplied;
+      }
+    }
+
+    const int32_t wire_status = static_cast<int32_t>(status);
+    deduplicated.emplace(uuid, wire_status);
+    results.push_back(wire_status);
+    RecordLeaseUpdateMetric(op, wire_status);
+  }
+  UpdateLegacySendGaugesLocked();
+  return results;
+}
+
+std::vector<int32_t> KVCacheManagerWithTransfer::SendLeaseBatch(
+    const std::string& remote_endpoint, uint32_t op,
+    const std::vector<uint64_t>& uuids) {
+  if (uuids.empty()) return {};
+  if (op != kOpRenewLeases && op != kOpCancelLeases) {
+    throw std::invalid_argument("invalid lease control operation");
+  }
+
+  // Deduplicate before chunking so repeated cancellation remains idempotent
+  // even when duplicate positions straddle two bounded wire requests.
+  std::map<uint64_t, size_t> unique_index;
+  std::vector<uint64_t> unique_uuids;
+  std::vector<size_t> result_indices;
+  unique_uuids.reserve(uuids.size());
+  result_indices.reserve(uuids.size());
+  for (uint64_t uuid : uuids) {
+    auto [it, inserted] = unique_index.emplace(uuid, unique_uuids.size());
+    if (inserted) unique_uuids.push_back(uuid);
+    result_indices.push_back(it->second);
+  }
+  if (unique_uuids.size() != uuids.size()) {
+    const std::vector<int32_t> unique_results =
+        SendLeaseBatch(remote_endpoint, op, unique_uuids);
+    std::vector<int32_t> results;
+    results.reserve(uuids.size());
+    for (size_t index : result_indices)
+      results.push_back(unique_results[index]);
+    return results;
+  }
+
+  if (uuids.size() > max_lease_batch_size_) {
+    std::vector<int32_t> combined;
+    combined.reserve(uuids.size());
+    for (size_t begin = 0; begin < uuids.size();
+         begin += max_lease_batch_size_) {
+      const size_t end = std::min(uuids.size(), begin + max_lease_batch_size_);
+      std::vector<uint64_t> chunk(uuids.begin() + begin, uuids.begin() + end);
+      std::vector<int32_t> chunk_results =
+          SendLeaseBatch(remote_endpoint, op, chunk);
+      combined.insert(combined.end(), chunk_results.begin(),
+                      chunk_results.end());
+    }
+    return combined;
+  }
+
+  const auto operation_deadline =
+      std::chrono::steady_clock::now() + control_io_timeout_;
+  int control_fd = ConnectTcp(remote_endpoint, operation_deadline);
+  auto control_cleanup =
+      std::unique_ptr<int, void (*)(int*)>(&control_fd, [](int* p) {
+        if (p && *p >= 0) close(*p);
+      });
+  ConfigureSocketIoTimeout(control_fd, control_io_timeout_);
+
+  ControlRequestHeader request;
+  request.magic = kControlMagic;
+  request.op = op;
+  request.ep_idx = kLeaseProtocolVersion;
+  request.num_blocks = static_cast<uint64_t>(uuids.size());
+  CheckStatus("lease control header write",
+              WriteExactUntil(control_fd, &request, sizeof(request),
+                              operation_deadline));
+  CheckStatus(
+      "lease control UUID body write",
+      WriteExactUntil(control_fd, uuids.data(), uuids.size() * sizeof(uint64_t),
+                      operation_deadline));
+
+  ControlResponseHeader response;
+  CheckStatus("lease control response read",
+              ReadExactUntil(control_fd, &response, sizeof(response),
+                             operation_deadline));
+  if (response.magic != kResponseMagic) {
+    throw std::runtime_error("bad lease control response magic");
+  }
+  if (response.message_len > kMaxControlMessageBytes) {
+    throw std::runtime_error("lease control response body is too large");
+  }
+  if (response.status != 0) {
+    std::string message(response.message_len, '\0');
+    if (!message.empty()) {
+      CheckStatus("lease control error body read",
+                  ReadExactUntil(control_fd, message.data(), message.size(),
+                                 operation_deadline));
+    }
+    throw RemoteControlError(response.status, std::move(message));
+  }
+  if (response.num_layers != kLeaseProtocolVersion) {
+    throw std::runtime_error("lease control protocol version mismatch");
+  }
+  const size_t expected_bytes = uuids.size() * sizeof(int32_t);
+  if (response.message_len != expected_bytes) {
+    throw std::runtime_error("lease control response length mismatch");
+  }
+  std::vector<int32_t> results(uuids.size());
+  CheckStatus("lease control result body read",
+              ReadExactUntil(control_fd, results.data(), expected_bytes,
+                             operation_deadline));
+  for (int32_t status : results) {
+    if (status <
+            static_cast<int32_t>(LeaseUpdateStatus::kMaxRetentionReached) ||
+        status > static_cast<int32_t>(LeaseUpdateStatus::kApplied)) {
+      throw std::runtime_error("lease control returned an invalid status");
+    }
+  }
+  return results;
 }
 
 std::shared_ptr<KVCacheManagerWithTransfer::StagingReadinessState>
@@ -2310,6 +3163,116 @@ void KVCacheManagerWithTransfer::ScheduleAsyncTask(std::function<void()> task) {
   push_pool_->Schedule(std::move(task));
 }
 
+void KVCacheManagerWithTransfer::StartRegistrationRetryScheduler() {
+  std::lock_guard<std::mutex> lock(registration_retry_mu_);
+  if (registration_retry_thread_.joinable()) return;
+  registration_retry_stopping_ = false;
+  registration_retry_thread_ =
+      std::thread([this]() { RegistrationRetryLoop(); });
+}
+
+void KVCacheManagerWithTransfer::StopRegistrationRetryScheduler() {
+  {
+    std::lock_guard<std::mutex> lock(registration_retry_mu_);
+    registration_retry_stopping_ = true;
+    registration_retry_tasks_.clear();
+  }
+  registration_retry_cv_.notify_all();
+  if (registration_retry_thread_.joinable()) {
+    registration_retry_thread_.join();
+  }
+}
+
+void KVCacheManagerWithTransfer::RegistrationRetryLoop() {
+  while (true) {
+    RegistrationRetryTask retry;
+    {
+      std::unique_lock<std::mutex> lock(registration_retry_mu_);
+      while (true) {
+        if (registration_retry_stopping_) return;
+        if (registration_retry_tasks_.empty()) {
+          registration_retry_cv_.wait(lock, [this]() {
+            return registration_retry_stopping_ ||
+                   !registration_retry_tasks_.empty();
+          });
+          continue;
+        }
+
+        const auto due = registration_retry_tasks_.begin()->first;
+        if (std::chrono::steady_clock::now() < due) {
+          registration_retry_cv_.wait_until(lock, due, [this, due]() {
+            return registration_retry_stopping_ ||
+                   registration_retry_tasks_.empty() ||
+                   registration_retry_tasks_.begin()->first < due;
+          });
+          continue;
+        }
+
+        auto it = registration_retry_tasks_.begin();
+        retry = std::move(it->second);
+        registration_retry_tasks_.erase(it);
+        break;
+      }
+    }
+
+    if (stopping_.load(std::memory_order_acquire)) continue;
+    try {
+      push_pool_->Schedule(retry.target_node, std::move(retry.task));
+    } catch (const std::exception& e) {
+      if (!stopping_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "Failed to schedule remote KV registration retry: "
+                   << e.what();
+      }
+    }
+  }
+}
+
+void KVCacheManagerWithTransfer::ScheduleRegistrationRetry(
+    std::chrono::steady_clock::time_point due, std::optional<int> target_node,
+    std::function<void()> task) {
+  {
+    std::lock_guard<std::mutex> lock(registration_retry_mu_);
+    if (registration_retry_stopping_ ||
+        stopping_.load(std::memory_order_acquire)) {
+      throw std::runtime_error("registration retry scheduler is stopping");
+    }
+    registration_retry_tasks_.emplace(
+        due, RegistrationRetryTask{target_node, std::move(task)});
+  }
+  registration_retry_cv_.notify_one();
+}
+
+std::chrono::milliseconds
+KVCacheManagerWithTransfer::ComputeRegistrationRetryDelay(
+    uint64_t uuid, size_t retry_number) const {
+  retry_number = std::max<size_t>(1, retry_number);
+  const uint64_t exponent = std::min<size_t>(retry_number - 1, 20);
+  const int64_t base_ms =
+      std::max<int64_t>(1, registration_retry_base_delay_.count());
+  const int64_t max_ms =
+      std::max<int64_t>(base_ms, registration_retry_max_delay_.count());
+  const uint64_t factor = uint64_t{1} << exponent;
+  const int64_t exponential_ms =
+      static_cast<uint64_t>(base_ms) > static_cast<uint64_t>(max_ms) / factor
+          ? max_ms
+          : std::min<int64_t>(max_ms, base_ms * static_cast<int64_t>(factor));
+
+  // Stable per-(uuid, attempt) jitter makes behavior deterministic in tests
+  // while avoiding synchronized retry bursts across queued decoders.
+  uint64_t mixed = uuid + 0x9e3779b97f4a7c15ULL * retry_number;
+  mixed ^= mixed >> 30;
+  mixed *= 0xbf58476d1ce4e5b9ULL;
+  mixed ^= mixed >> 27;
+  mixed *= 0x94d049bb133111ebULL;
+  mixed ^= mixed >> 31;
+  const int64_t radius = std::max<int64_t>(1, exponential_ms / 4);
+  const int64_t jitter =
+      static_cast<int64_t>(mixed % static_cast<uint64_t>(2 * radius + 1)) -
+      radius;
+  return std::chrono::milliseconds(
+      std::clamp<int64_t>(exponential_ms + jitter, 1, max_ms));
+}
+
 void KVCacheManagerWithTransfer::StartControlServer() {
   control_fd_ = socket(AF_INET6, SOCK_STREAM, 0);
   if (control_fd_ < 0) {
@@ -2362,6 +3325,12 @@ void KVCacheManagerWithTransfer::StopControlServer() {
   stopping_ = true;
   {
     absl::MutexLock lock(mu_);
+    cv_.SignalAll();
+    for (int fd : active_control_fds_) {
+      // The worker owns close(). shutdown() interrupts a partial read without
+      // racing descriptor reuse.
+      (void)shutdown(fd, SHUT_RDWR);
+    }
     while (!staging_readiness_.empty()) {
       RemoveStagingReadinessLocked(staging_readiness_.begin()->first);
     }
@@ -2370,13 +3339,21 @@ void KVCacheManagerWithTransfer::StopControlServer() {
   // will never arrive, so their loops observe stopping_ and the pools can
   // join them.
   cv_.SignalAll();
-  if (control_fd_ >= 0) {
-    shutdown(control_fd_, SHUT_RDWR);
-    close(control_fd_);
-  }
+  const int control_fd = control_fd_;
+  if (control_fd >= 0) (void)shutdown(control_fd, SHUT_RDWR);
   if (control_thread_.joinable()) {
     control_thread_.join();
   }
+  {
+    // Every handler may schedule producer work on push_pool_. Keep both the
+    // manager and that pool alive until shutdown has interrupted and drained
+    // all accepted control connections.
+    absl::MutexLock lock(mu_);
+    while (!active_control_fds_.empty()) {
+      cv_.Wait(&mu_);
+    }
+  }
+  if (control_fd >= 0) close(control_fd);
   control_fd_ = -1;
 }
 
@@ -2396,25 +3373,70 @@ void KVCacheManagerWithTransfer::ControlServerLoop() {
       if (errno == EINTR) continue;
       break;
     }
-    std::optional<int> source_node = assigned_numa_node();
+    {
+      absl::MutexLock lock(mu_);
+      if (stopping_) {
+        (void)shutdown(client_fd, SHUT_RDWR);
+        close(client_fd);
+        break;
+      }
+      active_control_fds_.insert(client_fd);
+    }
+    const std::optional<int> source_node = assigned_numa_node();
 
-    pull_pool_->Schedule(source_node, [this, client_fd]() {
-      HandleControlConnection(client_fd);
+    try {
+      pull_pool_->Schedule(source_node, [this, client_fd]() {
+        try {
+          HandleControlConnection(client_fd);
+        } catch (...) {
+          LOG(ERROR) << "Unexpected non-standard control handler exception";
+        }
+        {
+          absl::MutexLock lock(mu_);
+          active_control_fds_.erase(client_fd);
+          cv_.SignalAll();
+        }
+        close(client_fd);
+      });
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Failed to schedule control connection: " << e.what();
+      {
+        absl::MutexLock lock(mu_);
+        active_control_fds_.erase(client_fd);
+        cv_.SignalAll();
+      }
+      (void)shutdown(client_fd, SHUT_RDWR);
       close(client_fd);
-    });
+    }
   }
 }
 
 void KVCacheManagerWithTransfer::HandleControlConnection(int fd) {
+  const auto operation_deadline =
+      std::chrono::steady_clock::now() + control_io_timeout_;
   try {
+    ConfigureSocketIoTimeout(fd, control_io_timeout_);
     ControlRequestHeader req;
     CheckStatus("control request header read",
-                ReadExact(fd, &req, sizeof(req)));
+                ReadExactUntil(fd, &req, sizeof(req), operation_deadline));
     if (req.magic != kControlMagic) {
       throw std::runtime_error("bad control request magic");
     }
-    if (req.op == kOpPullStream) {
-      ProcessPullStream(fd, req);
+    if (req.op == kOpAck || (req.op == kOpPullStream && req.num_blocks == 0)) {
+      if (req.num_blocks != 0) {
+        throw std::runtime_error("ack control request included a body");
+      }
+      AckSend(req.uuid);
+      ControlResponseHeader response;
+      response.magic = kResponseMagic;
+      response.status = 0;
+      CheckStatus(
+          "control ack response write",
+          WriteExactUntil(fd, &response, sizeof(response), operation_deadline));
+    } else if (req.op == kOpPullStream) {
+      ProcessPullStream(fd, req, operation_deadline);
+    } else if (req.op == kOpRenewLeases || req.op == kOpCancelLeases) {
+      ProcessLeaseBatch(fd, req, operation_deadline);
     } else {
       throw std::runtime_error("unknown control op code: " +
                                std::to_string(req.op));
@@ -2422,53 +3444,93 @@ void KVCacheManagerWithTransfer::HandleControlConnection(int fd) {
   } catch (const std::exception& e) {
     LOG(ERROR) << "Raiden producer error in control connection handler: "
                << e.what();
+    if (stopping_) return;
     ControlResponseHeader response;
     response.magic = kResponseMagic;
     response.status = -1;
     std::string message = e.what();
+    if (message.size() > kMaxControlMessageBytes) {
+      message.resize(kMaxControlMessageBytes);
+    }
     response.message_len = message.size();
-    (void)WriteExact(fd, &response, sizeof(response));
+    (void)WriteExactUntil(fd, &response, sizeof(response), operation_deadline);
     if (response.message_len > 0) {
-      (void)WriteExact(fd, message.data(), message.size());
+      (void)WriteExactUntil(fd, message.data(), message.size(),
+                            operation_deadline);
     }
   }
 }
 
 void KVCacheManagerWithTransfer::ProcessPullStream(
-    int fd, const ControlRequestHeader& req) {
+    int fd, const ControlRequestHeader& req,
+    std::chrono::steady_clock::time_point operation_deadline) {
+  const int64_t staging_capacity = SendStagingCapacityBlocks();
+  if (req.num_blocks == 0 || staging_capacity <= 0 ||
+      req.num_blocks > static_cast<uint64_t>(staging_capacity)) {
+    throw std::invalid_argument("pull stream num_blocks is out of range");
+  }
+  if (req.consumer_data_port == 0 ||
+      req.consumer_data_port > std::numeric_limits<uint16_t>::max()) {
+    throw std::invalid_argument("pull stream consumer data port is invalid");
+  }
+  if (req.num_ips > kMaxNics) {
+    throw std::invalid_argument("pull stream has too many consumer IPs");
+  }
+
+  // Always consume the bounded body before replying. Closing a socket with
+  // unread request bytes can reset TCP and discard a retryable response.
+  std::vector<int64_t> src_block_ids =
+      ReadBlockIds(fd, req.num_blocks, operation_deadline);
+  std::vector<int64_t> dst_block_ids =
+      ReadBlockIds(fd, req.num_blocks, operation_deadline);
+
   std::shared_ptr<SendEntry> entry;
+  std::string terminal_error;
   {
     absl::MutexLock lock(mu_);
-    while (true) {
+    const auto now = std::chrono::steady_clock::now();
+    PurgeSendTombstonesLocked(now);
+    auto tombstone = send_tombstones_.find(req.uuid);
+    if (tombstone != send_tombstones_.end()) {
+      terminal_error = "terminal send UUID: " + tombstone->second.message;
+    } else {
       auto it = send_entries_.find(req.uuid);
       if (it != send_entries_.end()) {
         entry = it->second;
-        break;
+        if (entry->phase != SendEntry::Phase::kWaitingForPull) {
+          terminal_error = "pull stream UUID was already claimed";
+        } else if (entry->deadline <= now) {
+          (void)TerminalizeSendEntryLocked(req.uuid, entry,
+                                           "send expired before pull claim",
+                                           /*waiting_only=*/true);
+          terminal_error = "send expired before pull claim";
+          entry.reset();
+        }
       }
-      if (stopping_.load()) {
-        break;
-      }
-      cv_.Wait(&mu_);
     }
   }
-  if (stopping_) return;
+  if (!terminal_error.empty()) {
+    RecordPullMetric("rejected");
+    throw std::runtime_error(terminal_error);
+  }
   if (!entry) {
-    throw std::runtime_error(
-        "KVCacheManagerWithTransfer is stopping during wait for send entry");
+    ControlResponseHeader response;
+    response.magic = kResponseMagic;
+    response.status = kControlRetryableUnknown;
+    const std::string message = kSendUuidNotRegistered;
+    response.message_len = message.size();
+    CheckStatus(
+        "control retryable response header write",
+        WriteExactUntil(fd, &response, sizeof(response), operation_deadline));
+    CheckStatus("control retryable response body write",
+                WriteExactUntil(fd, message.data(), message.size(),
+                                operation_deadline));
+    retryable_unknown_pull_responses_.fetch_add(1, std::memory_order_relaxed);
+    RecordPullMetric("retryable_unknown");
+    return;
   }
 
-  std::vector<int64_t> src_block_ids = ReadBlockIds(fd, req.num_blocks);
-  std::vector<int64_t> dst_block_ids = ReadBlockIds(fd, req.num_blocks);
   ValidateRequestedBlocks(*entry, src_block_ids);
-
-  // Acknowledge acceptance to consumer immediately
-  ControlResponseHeader response;
-  response.magic = kResponseMagic;
-  response.status = 0;
-  response.num_layers = static_cast<uint32_t>(num_layers() * num_shards());
-  response.data_port = static_cast<uint32_t>(local_data_port_);
-  CheckStatus("control stream response header write",
-              WriteExact(fd, &response, sizeof(response)));
 
   std::vector<std::string> peer_ips;
   if (req.num_ips > 0) {
@@ -2523,41 +3585,188 @@ void KVCacheManagerWithTransfer::ProcessPullStream(
     }
   }
 
+  if (remote_data_endpoints.empty()) {
+    RecordPullMetric("rejected");
+    throw std::runtime_error("pull stream has no usable consumer endpoint");
+  }
+
+  std::string preaccept_error;
+  {
+    // Linearization point: identity, phase, deadline, and staging capacity are
+    // checked and claimed atomically before success is observable.
+    absl::MutexLock lock(mu_);
+    const auto now = std::chrono::steady_clock::now();
+    PurgeSendTombstonesLocked(now);
+    auto it = send_entries_.find(req.uuid);
+    if (stopping_) {
+      preaccept_error = "manager stopped before pull claim";
+    } else if (it == send_entries_.end() || it->second != entry) {
+      preaccept_error = "send UUID disappeared before pull claim";
+    } else if (entry->phase != SendEntry::Phase::kWaitingForPull) {
+      preaccept_error = "pull stream UUID was already claimed";
+    } else if (now >= operation_deadline) {
+      preaccept_error = "control operation expired before pull claim";
+    } else if (entry->deadline <= now) {
+      preaccept_error = "send expired before pull claim";
+    } else {
+      entry->phase = SendEntry::Phase::kTransferring;
+      entry->transfer_deadline = DeadlineFromNow();
+      UpdateLegacySendGaugesLocked();
+    }
+    if (!preaccept_error.empty() && it != send_entries_.end() &&
+        it->second == entry &&
+        entry->phase == SendEntry::Phase::kWaitingForPull) {
+      (void)TerminalizeSendEntryLocked(req.uuid, entry, preaccept_error,
+                                       /*waiting_only=*/true);
+    }
+  }
+  if (!preaccept_error.empty()) {
+    RecordPullMetric("rejected");
+    throw std::runtime_error(preaccept_error);
+  }
+
+  std::vector<int64_t> host_block_ids;
+  if (!AcquireSendStagingWithRetry(req.uuid, src_block_ids, operation_deadline,
+                                   &host_block_ids)) {
+    RecordPullMetric("rejected");
+    throw std::runtime_error(
+        "producer staging unavailable before pull acceptance");
+  }
+  {
+    absl::MutexLock lock(mu_);
+    auto it = send_entries_.find(req.uuid);
+    if (stopping_ || it == send_entries_.end() || it->second != entry ||
+        entry->phase != SendEntry::Phase::kTransferring) {
+      preaccept_error = "send UUID disappeared before pull acceptance";
+    } else {
+      entry->remote_data_endpoints = remote_data_endpoints;
+      entry->src_ints.assign(host_block_ids.begin(), host_block_ids.end());
+      entry->dst_ints.assign(dst_block_ids.begin(), dst_block_ids.end());
+      // This startup guard prevents timeout/cancellation from releasing the
+      // staging allocation before StartPushInternal has attached callbacks.
+      entry->pending_layer_callbacks = 1;
+      ++active_send_callbacks_;
+    }
+  }
+  if (!preaccept_error.empty()) {
+    RecordPullMetric("rejected");
+    throw std::runtime_error(preaccept_error);
+  }
+
+  // A positive response means the producer irrevocably owns staging.
+  ControlResponseHeader response;
+  response.magic = kResponseMagic;
+  response.status = 0;
+  response.num_layers = static_cast<uint32_t>(num_layers() * num_shards());
+  response.data_port = static_cast<uint32_t>(local_data_port_);
+  const absl::Status response_status =
+      WriteExactUntil(fd, &response, sizeof(response), operation_deadline);
+  if (!response_status.ok()) {
+    FinishSendLayer(entry, response_status,
+                    "failed to send positive pull response");
+    RecordPullMetric("response_failed");
+    ThrowStatus("control stream response header write", response_status);
+  }
+  RecordPullMetric("accepted");
+
   VLOG(1) << "ProcessPullStream (Hybrid Bridge) successfully acknowledged "
              "consumer. Intercepting and launching StartPushInternal to "
           << (remote_data_endpoints.empty() ? "" : remote_data_endpoints[0])
           << (remote_data_endpoints.size() > 1 ? " and others" : "");
 
-  {
-    absl::MutexLock lock(mu_);
-    if (auto it = send_entries_.find(req.uuid); it != send_entries_.end()) {
-      if (it->second->pull_started) {
-        VLOG(1) << "StartPushInternal already running for UUID: " << req.uuid;
-        return;
-      }
-      it->second->pull_started = true;
-    }
+  try {
+    push_pool_->Schedule(
+        assigned_numa_node(),
+        [this, uuid = req.uuid, entry,
+         remote_data_endpoints = std::move(remote_data_endpoints),
+         src_block_ids = std::move(src_block_ids),
+         dst_block_ids = std::move(dst_block_ids)]() {
+          try {
+            StartPushInternal(uuid, remote_data_endpoints, src_block_ids,
+                              dst_block_ids);
+          } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to start accepted send UUID " << uuid << ": "
+                       << e.what();
+            FinishSendLayer(entry, absl::InternalError(e.what()),
+                            "accepted send failed during startup");
+          } catch (...) {
+            LOG(ERROR) << "Failed to start accepted send UUID " << uuid
+                       << ": unknown exception";
+            FinishSendLayer(entry,
+                            absl::InternalError("unknown startup exception"),
+                            "accepted send failed during startup");
+          }
+        });
+  } catch (const std::exception& e) {
+    FinishSendLayer(entry, absl::InternalError(e.what()),
+                    "accepted send could not be scheduled");
+    // The positive response is already on the wire. Do not make the outer
+    // handler attempt to append a contradictory second response.
+    LOG(ERROR) << "Failed to schedule accepted send UUID " << req.uuid << ": "
+               << e.what();
+  } catch (...) {
+    FinishSendLayer(entry, absl::InternalError("unknown scheduling exception"),
+                    "accepted send could not be scheduled");
+    // The positive response is already on the wire. Do not make the outer
+    // handler attempt to append a contradictory second response.
+    LOG(ERROR) << "Failed to schedule accepted send UUID " << req.uuid
+               << ": unknown exception";
+  }
+}
+
+void KVCacheManagerWithTransfer::ProcessLeaseBatch(
+    int fd, const ControlRequestHeader& req,
+    std::chrono::steady_clock::time_point operation_deadline) {
+  if (req.op != kOpRenewLeases && req.op != kOpCancelLeases) {
+    throw std::invalid_argument("invalid lease batch operation");
+  }
+  if (req.num_blocks == 0 || req.num_blocks > max_lease_batch_size_) {
+    throw std::invalid_argument("lease batch size is out of range");
   }
 
-  {
-    absl::MutexLock lock(pull_workers_mu_);
-    ++active_pull_workers_;
+  // Consume the bounded body before returning a version/field error. Closing
+  // with unread request bytes can reset TCP and hide the useful response.
+  std::vector<uint64_t> uuids(static_cast<size_t>(req.num_blocks));
+  CheckStatus("lease batch UUID body read",
+              ReadExactUntil(fd, uuids.data(), uuids.size() * sizeof(uint64_t),
+                             operation_deadline));
+  if (req.ep_idx != kLeaseProtocolVersion) {
+    throw std::invalid_argument("unsupported lease control protocol version");
   }
-  std::thread([this, uuid = req.uuid, remote_data_endpoints, src_block_ids,
-               dst_block_ids]() {
-    StartPushInternal(uuid, remote_data_endpoints, src_block_ids,
-                      dst_block_ids);
-    absl::MutexLock lock(pull_workers_mu_);
-    --active_pull_workers_;
-  }).detach();
+  if (req.uuid != 0 || req.consumer_data_port != 0 || req.num_ips != 0) {
+    throw std::invalid_argument("lease batch mixed incompatible fields");
+  }
+  std::vector<int32_t> results;
+  {
+    absl::MutexLock lock(mu_);
+    if (stopping_) {
+      throw std::runtime_error("manager stopped during lease update");
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= operation_deadline) {
+      throw std::runtime_error("control operation expired before lease update");
+    }
+    results = ApplyLeaseBatchLocked(req.op, uuids, now);
+  }
+
+  ControlResponseHeader response;
+  response.magic = kResponseMagic;
+  response.status = 0;
+  response.num_layers = kLeaseProtocolVersion;
+  response.message_len = results.size() * sizeof(int32_t);
+  CheckStatus(
+      "lease batch response header write",
+      WriteExactUntil(fd, &response, sizeof(response), operation_deadline));
+  CheckStatus("lease batch response body write",
+              WriteExactUntil(fd, results.data(), response.message_len,
+                              operation_deadline));
 }
 
 bool KVCacheManagerWithTransfer::AcquireSendStagingWithRetry(
     uint64_t uuid, const std::vector<int64_t>& src_block_ids,
+    std::chrono::steady_clock::time_point operation_deadline,
     std::vector<int64_t>* host_block_ids) {
-  // The entry's deadline, set when the producer registered the request,
-  // bounds the whole transfer; the wait for staging shares it rather than
-  // starting a later one of its own.
+  // Both the producer lease and this control request bound the staging wait.
   std::chrono::steady_clock::time_point stage_deadline;
   while (true) {
     if (shutting_down_.load(std::memory_order_relaxed)) {
@@ -2569,22 +3778,21 @@ bool KVCacheManagerWithTransfer::AcquireSendStagingWithRetry(
       if (it == send_entries_.end()) {
         return false;  // request cancelled while waiting for staging
       }
-      stage_deadline = it->second->deadline;
+      stage_deadline = std::min(it->second->deadline, operation_deadline);
       // Staging that can never seat this request fails it now rather than
       // after the deadline: a fixed slot holds max_blocks_ pages, the
       // per-transfer pool holds total_blocks() pages.
-      const int64_t capacity = dynamic_host_staging_
-                                   ? host_block_manager_->total_blocks()
-                                   : max_blocks_;
+      const int64_t capacity = SendStagingCapacityBlocks();
       if (static_cast<int64_t>(src_block_ids.size()) > capacity) {
         LOG(ERROR) << "StartPushInternal: request " << it->second->req_id
                    << " needs " << src_block_ids.size() << " blocks but "
                    << (dynamic_host_staging_ ? "the host staging pool holds "
                                              : "a staging slot holds ")
                    << capacity;
-        failed_recving_.insert(it->second->req_id);
-        ReleaseEntrySlotLocked(it->second);
-        send_entries_.erase(it);
+        it->second->failed = true;
+        (void)TerminalizeSendEntryLocked(
+            uuid, it->second, "send exceeds producer staging capacity",
+            /*waiting_only=*/false);
         return false;
       }
       RecvEntry staging;
@@ -2612,9 +3820,10 @@ bool KVCacheManagerWithTransfer::AcquireSendStagingWithRetry(
                    << host_block_manager_->total_blocks()
                    << ", free_slots=" << free_slots_.size()
                    << "); reporting transfer failure";
-        failed_recving_.insert(it->second->req_id);
-        ReleaseEntrySlotLocked(it->second);
-        send_entries_.erase(it);
+        it->second->failed = true;
+        (void)TerminalizeSendEntryLocked(
+            uuid, it->second, "producer staging wait exceeded its deadline",
+            /*waiting_only=*/false);
       }
       return false;
     }
@@ -2631,8 +3840,26 @@ void KVCacheManagerWithTransfer::StartPushInternal(
   // pool. Writing D2H straight to host[src_block_id] overflows the host buffer
   // once a device block id exceeds num_host_blocks.
   std::vector<int64_t> host_block_ids;
-  if (!AcquireSendStagingWithRetry(uuid, src_block_ids, &host_block_ids)) {
-    return;
+  std::shared_ptr<SendEntry> entry;
+  {
+    absl::MutexLock lock(mu_);
+    auto it = send_entries_.find(uuid);
+    if (it == send_entries_.end()) {
+      throw std::runtime_error("send entry disappeared after pull acceptance");
+    }
+    entry = it->second;
+    if (entry->phase != SendEntry::Phase::kTransferring ||
+        entry->pending_layer_callbacks == 0) {
+      throw std::runtime_error(
+          "accepted send does not own its startup callback guard");
+    }
+    host_block_ids.assign(entry->src_ints.begin(), entry->src_ints.end());
+    if (host_block_ids.size() != src_block_ids.size() ||
+        entry->dst_ints.size() != dst_block_ids.size()) {
+      throw std::runtime_error("accepted send staging metadata is incomplete");
+    }
+    entry->remote_data_endpoints = remote_data_endpoints;
+    entry->dst_ints.assign(dst_block_ids.begin(), dst_block_ids.end());
   }
 
   // Coalesce contiguous (device,host) block runs into a few large copies. With
@@ -2640,148 +3867,152 @@ void KVCacheManagerWithTransfer::StartPushInternal(
   // that flood the command queue with small ops and serialize against prefill
   // GEMMs on the shared TensorCore; coalescing collapses a contiguous range to
   // one copy, matching the pre-Hybrid-Push pull path.
-  std::shared_ptr<SendEntry> entry;
-  {
-    absl::MutexLock lock(mu_);
-    auto it = send_entries_.find(uuid);
-    if (it != send_entries_.end()) {
-      entry = it->second;
-    }
-  }
-
-  if (!entry) {
-    LOG(ERROR) << "SendEntry not found for UUID: " << uuid;
-    return;
-  }
-
-  CopySpec d2h_copy = BuildCoalescedCopySpec(src_block_ids, host_block_ids);
-  entry->d2h_layer_futures.reserve(num_layers());
-
-  // 1. Issue D2H copies layer-by-layer!
-  for (size_t l = 0; l < num_layers(); ++l) {
-    LOG(INFO) << "StartPushInternal (D2H start) layer " << l
-              << ": uuid=" << uuid
-              << ", numa=" << assigned_numa_node().value_or(-1);
-    auto future_or = D2hSyncDispatch(d2h_copy.src_offsets, d2h_copy.dst_offsets,
-                                     d2h_copy.sizes, /*slot_idx=*/std::nullopt,
-                                     /*layer_idx=*/l);
-    if (!future_or.ok()) {
-      // A copy that cannot even be issued fails the transfer; the worker
-      // thread has no caller for an exception to reach.
-      LOG(ERROR) << "StartPushInternal: failed to issue D2H for layer " << l
-                 << ": " << future_or.status();
-      absl::MutexLock lock(mu_);
-      auto it = send_entries_.find(uuid);
-      if (it != send_entries_.end()) {
-        failed_recving_.insert(it->second->req_id);
-        ReleaseEntrySlotLocked(it->second);
-        send_entries_.erase(it);
-      }
-      return;
-    }
-    entry->d2h_layer_futures.push_back(std::move(future_or.value()));
-  }
-
-  entry->remote_data_endpoints = remote_data_endpoints;
-  entry->src_ints.assign(host_block_ids.begin(), host_block_ids.end());
-  entry->dst_ints.assign(dst_block_ids.begin(), dst_block_ids.end());
-  entry->remaining_h2h_layers.store(num_layers());
-
-  SendNextLayer(uuid, 0);
-}
-
-void KVCacheManagerWithTransfer::SendNextLayer(uint64_t uuid, size_t l) {
-  std::shared_ptr<SendEntry> entry;
-  {
-    absl::MutexLock lock(mu_);
-    auto it = send_entries_.find(uuid);
-    if (it == send_entries_.end()) {
-      return;
-    }
-    entry = it->second;
-  }
-
-  if (l >= num_layers()) {
-    // Reached end of layer loop. Background asynchronous transfers will clean
-    // up when remaining_h2h_layers reaches 0.
-    return;
-  }
-
-  entry->d2h_layer_futures[l].OnReady([this, uuid, l](auto status_or) {
-    if (!status_or.ok()) {
-      LOG(ERROR) << "StartPushInternal: D2H copy failed for layer " << l
-                 << ", status: " << status_or.status().ToString();
-      absl::MutexLock lock(mu_);
-      auto it = send_entries_.find(uuid);
-      if (it != send_entries_.end()) {
-        failed_recving_.insert(it->second->req_id);
-        ReleaseEntrySlotLocked(it->second);
-        send_entries_.erase(it);
-      }
-      return;
-    }
-
-    push_pool_->Schedule([this, uuid, l]() {
-      std::shared_ptr<SendEntry> entry;
-      {
-        absl::MutexLock lock(mu_);
-        auto it = send_entries_.find(uuid);
-        if (it == send_entries_.end()) {
-          return;
-        }
-        entry = it->second;
-      }
-      LOG(INFO) << "StartPushInternal (H2H start layer " << l
-                << "): uuid=" << uuid
+  std::vector<raiden::PjRtCopyFuture> futures;
+  absl::Status issue_status = absl::OkStatus();
+  try {
+    CopySpec d2h_copy = BuildCoalescedCopySpec(src_block_ids, host_block_ids);
+    futures.reserve(num_layers());
+    for (size_t layer_idx = 0; layer_idx < num_layers(); ++layer_idx) {
+      LOG(INFO) << "StartPushInternal (D2H start) layer " << layer_idx
+                << ": uuid=" << uuid
                 << ", numa=" << assigned_numa_node().value_or(-1);
-      H2hWriteDirectAsync(
-          entry->remote_data_endpoints, entry->src_ints, entry->dst_ints, uuid,
-          l, [this, uuid, l](absl::StatusOr<std::vector<int>> push_res) {
-            std::shared_ptr<SendEntry> entry;
-            {
-              absl::MutexLock lock(mu_);
-              auto it = send_entries_.find(uuid);
-              if (it != send_entries_.end()) {
-                entry = it->second;
-              }
-            }
-            if (!entry) return;
+      auto future_or = D2hSyncDispatch(
+          d2h_copy.src_offsets, d2h_copy.dst_offsets, d2h_copy.sizes,
+          /*slot_idx=*/std::nullopt, /*layer_idx=*/layer_idx);
+      if (!future_or.ok()) {
+        issue_status = future_or.status();
+        break;
+      }
+      futures.push_back(std::move(future_or.value()));
+    }
+  } catch (const std::exception& e) {
+    issue_status = absl::InternalError(e.what());
+  } catch (...) {
+    issue_status =
+        absl::InternalError("unknown exception while issuing producer D2H");
+  }
 
-            if (!push_res.ok()) {
-              LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
-                         << push_res.status().ToString();
-              absl::MutexLock lock(mu_);
-              if (auto it = send_entries_.find(uuid);
-                  it != send_entries_.end()) {
-                failed_recving_.insert(entry->req_id);
-                ReleaseEntrySlotLocked(entry);
-                send_entries_.erase(it);
-              }
+  {
+    absl::MutexLock lock(mu_);
+    entry->d2h_layer_futures = std::move(futures);
+    entry->pending_layer_callbacks += entry->d2h_layer_futures.size();
+    active_send_callbacks_ += entry->d2h_layer_futures.size();
+    --active_send_callbacks_;
+    --entry->pending_layer_callbacks;
+    if (!issue_status.ok()) {
+      entry->failed = true;
+      (void)TerminalizeSendEntryLocked(uuid, entry, "producer D2H issue failed",
+                                       /*waiting_only=*/false);
+    }
+    if (entry->pending_layer_callbacks == 0) {
+      if (send_entries_.find(uuid) != send_entries_.end()) {
+        (void)TerminalizeSendEntryLocked(uuid, entry,
+                                         issue_status.ok()
+                                             ? "send transfer completed"
+                                             : "producer D2H issue failed",
+                                         /*waiting_only=*/false);
+      }
+      FinalizeDrainedSendLocked(entry);
+    }
+    cv_.SignalAll();
+  }
+
+  if (entry->d2h_layer_futures.empty()) {
+    return;
+  }
+
+  for (size_t layer_idx = 0; layer_idx < entry->d2h_layer_futures.size();
+       ++layer_idx) {
+    auto completed = std::make_shared<std::atomic<bool>>(false);
+    auto finish_once = [this, entry, completed](const absl::Status& status,
+                                                const std::string& message) {
+      if (!completed->exchange(true)) {
+        FinishSendLayer(entry, status, message);
+      }
+    };
+    try {
+      entry->d2h_layer_futures[layer_idx].OnReady(
+          [this, entry, layer_idx, completed, finish_once](auto status_or) {
+            if (!status_or.ok()) {
+              LOG(ERROR) << "StartPushInternal: D2H copy failed for layer "
+                         << layer_idx
+                         << ", status: " << status_or.status().ToString();
+              finish_once(status_or.status(), "producer D2H completion failed");
               return;
             }
-
-            LOG(INFO) << "StartPushInternal (H2H complete layer " << l
-                      << "): uuid=" << uuid
-                      << ", numa=" << assigned_numa_node().value_or(-1);
-
-            if (entry->remaining_h2h_layers.fetch_sub(1) == 1) {
-              LOG(INFO) << "StartPushInternal (All H2H complete): uuid="
-                        << uuid;
-              absl::MutexLock lock(mu_);
-              if (auto it = send_entries_.find(uuid);
-                  it != send_entries_.end()) {
-                done_sending_.insert(entry->req_id);
-                ReleaseEntrySlotLocked(entry);
-                send_entries_.erase(it);
-              }
+            try {
+              push_pool_->Schedule(assigned_numa_node(),
+                                   [this, entry, layer_idx, completed]() {
+                                     SendNextLayer(entry, layer_idx, completed);
+                                   });
+            } catch (const std::exception& e) {
+              finish_once(absl::InternalError(e.what()),
+                          "failed to schedule producer H2H transfer");
+            } catch (...) {
+              finish_once(
+                  absl::InternalError(
+                      "unknown exception scheduling producer H2H transfer"),
+                  "failed to schedule producer H2H transfer");
             }
           });
+    } catch (const std::exception& e) {
+      finish_once(absl::InternalError(e.what()),
+                  "producer D2H callback registration failed");
+    } catch (...) {
+      finish_once(absl::InternalError(
+                      "unknown producer D2H callback registration exception"),
+                  "producer D2H callback registration failed");
+    }
+  }
+}
 
-      // Immediately queue the next layer's push without waiting for this one to
-      // finish
-      SendNextLayer(uuid, l + 1);
-    });
-  });
+void KVCacheManagerWithTransfer::SendNextLayer(
+    const std::shared_ptr<SendEntry>& entry, size_t layer_idx,
+    const std::shared_ptr<std::atomic<bool>>& completed) {
+  auto finish_once = [this, entry, completed](const absl::Status& status,
+                                              const std::string& message) {
+    if (!completed->exchange(true)) {
+      FinishSendLayer(entry, status, message);
+    }
+  };
+  bool skip = false;
+  {
+    absl::MutexLock lock(mu_);
+    auto it = send_entries_.find(entry->uuid);
+    skip = stopping_ || entry->terminal_requested ||
+           it == send_entries_.end() || it->second != entry;
+  }
+  if (skip) {
+    finish_once(absl::OkStatus(), "send transfer was terminalized");
+    return;
+  }
+
+  LOG(INFO) << "StartPushInternal (H2H start layer " << layer_idx
+            << "): uuid=" << entry->uuid
+            << ", numa=" << assigned_numa_node().value_or(-1);
+  const int numa_node = assigned_numa_node().value_or(-1);
+  try {
+    H2hWriteDirectAsync(
+        entry->remote_data_endpoints, entry->src_ints, entry->dst_ints,
+        entry->uuid, layer_idx,
+        [entry, layer_idx, numa_node,
+         finish_once](absl::StatusOr<std::vector<int>> push_res) {
+          if (!push_res.ok()) {
+            LOG(ERROR) << "H2hWrite failed for layer " << layer_idx << ": "
+                       << push_res.status().ToString();
+            finish_once(push_res.status(), "producer H2H transfer failed");
+            return;
+          }
+          LOG(INFO) << "StartPushInternal (H2H complete layer " << layer_idx
+                    << "): uuid=" << entry->uuid << ", numa=" << numa_node;
+          finish_once(absl::OkStatus(), "");
+        });
+  } catch (const std::exception& e) {
+    finish_once(absl::InternalError(e.what()), "producer H2H issue threw");
+  } catch (...) {
+    finish_once(absl::InternalError("unknown producer H2H issue exception"),
+                "producer H2H issue threw");
+  }
 }
 
 absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
@@ -2805,7 +4036,19 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
         }
         if (recv_pending) break;
       }
-      if (!recv_pending && active_pool_reshard_sends_.empty()) {
+      bool legacy_send_pending =
+          active_send_callbacks_ != 0 || !draining_send_entries_.empty();
+      if (!legacy_send_pending) {
+        for (const auto& [uuid, entry] : send_entries_) {
+          (void)uuid;
+          if (entry->phase == SendEntry::Phase::kTransferring) {
+            legacy_send_pending = true;
+            break;
+          }
+        }
+      }
+      if (!recv_pending && !legacy_send_pending &&
+          active_pool_reshard_sends_.empty()) {
         break;
       }
       const absl::Duration elapsed = absl::Now() - start;
@@ -2829,11 +4072,14 @@ std::string KVCacheManagerWithTransfer::EndpointWithPort(
 
 void KVCacheManagerWithTransfer::AckRemote(const std::string& remote_endpoint,
                                            uint64_t uuid) {
-  int control_fd = ConnectTcp(remote_endpoint);
+  const auto operation_deadline =
+      std::chrono::steady_clock::now() + control_io_timeout_;
+  int control_fd = ConnectTcp(remote_endpoint, operation_deadline);
   auto control_cleanup =
       std::unique_ptr<int, void (*)(int*)>(&control_fd, [](int* p) {
         if (p && *p >= 0) close(*p);
       });
+  ConfigureSocketIoTimeout(control_fd, control_io_timeout_);
   ControlRequestHeader stream_request;
   stream_request.magic = kControlMagic;
   stream_request.op = kOpPullStream;
@@ -2841,43 +4087,64 @@ void KVCacheManagerWithTransfer::AckRemote(const std::string& remote_endpoint,
   stream_request.ep_idx = 0;
   stream_request.num_blocks = 0;
   CheckStatus("control pull stream write (empty)",
-              WriteExact(control_fd, &stream_request, sizeof(stream_request)));
-  (void)ReadControlResponseHeader(control_fd);
+              WriteExactUntil(control_fd, &stream_request,
+                              sizeof(stream_request), operation_deadline));
+  (void)ReadControlResponseHeader(control_fd, operation_deadline);
 }
 
 KVCacheManagerWithTransfer::ControlResponseHeader
-KVCacheManagerWithTransfer::ReadControlResponseHeader(int fd) {
+KVCacheManagerWithTransfer::ReadControlResponseHeader(
+    int fd, std::chrono::steady_clock::time_point operation_deadline) {
   ControlResponseHeader response;
-  CheckStatus("control response read",
-              ReadExact(fd, &response, sizeof(response)));
+  CheckStatus(
+      "control response read",
+      ReadExactUntil(fd, &response, sizeof(response), operation_deadline));
   if (response.magic != kResponseMagic) {
     throw std::runtime_error("bad control response magic");
+  }
+  if (response.message_len > kMaxControlMessageBytes) {
+    throw std::runtime_error("control response body is too large");
   }
   if (response.status != 0) {
     std::string message(response.message_len, '\0');
     if (response.message_len > 0) {
       CheckStatus("control error body read",
-                  ReadExact(fd, message.data(), message.size()));
+                  ReadExactUntil(fd, message.data(), message.size(),
+                                 operation_deadline));
     }
-    throw std::runtime_error("remote Raiden control error: " + message);
+    throw RemoteControlError(response.status, std::move(message));
   }
   return response;
 }
 
 void KVCacheManagerWithTransfer::AckSend(uint64_t uuid) {
   std::shared_ptr<SendEntry> entry;
+  bool terminalized = false;
   {
     absl::MutexLock lock(mu_);
+    const auto now = std::chrono::steady_clock::now();
+    PurgeSendTombstonesLocked(now);
+    if (send_tombstones_.find(uuid) != send_tombstones_.end()) return;
+    auto draining = draining_send_entries_.find(uuid);
+    if (draining != draining_send_entries_.end()) {
+      draining->second->ack_received = true;
+      return;
+    }
     auto it = send_entries_.find(uuid);
     if (it == send_entries_.end()) {
-      pending_acks_.insert(uuid);
+      InstallPendingAckLocked(uuid, now);
       return;
     }
     entry = it->second;
-    done_sending_.insert(entry->req_id);
-    ReleaseEntrySlotLocked(entry);
-    send_entries_.erase(it);
+    if (entry->phase == SendEntry::Phase::kTransferring) {
+      // Async D2H/H2H still owns the staging slot after acceptance.
+      entry->ack_received = true;
+      return;
+    }
+    terminalized = TerminalizeSendEntryLocked(
+        uuid, entry, "send was acknowledged", /*waiting_only=*/false);
   }
+  if (!terminalized) return;
   const auto ack_done = std::chrono::steady_clock::now();
   std::ostringstream timing;
   timing << "RAIDEN_TIMING event=producer_ack"
@@ -3100,7 +4367,11 @@ void KVCacheManagerWithTransfer::LaunchEligiblePoolH2ds(uint64_t uuid) {
       continue;
     }
     raiden::PjRtCopyFuture future = std::move(future_or).value();
-    future.OnReady([this, uuid, pool_idx = pool_idx](auto status_or) {
+    std::shared_ptr<void> callback_guard = TrackAsyncCallback();
+    future.OnReady([this, uuid, pool_idx = pool_idx,
+                    callback_guard](auto status_or) mutable {
+      std::shared_ptr<void> callback_lifetime = std::move(callback_guard);
+      (void)callback_lifetime;
       FinishPoolReshardRecvPool(
           uuid, pool_idx,
           status_or.ok() ? absl::OkStatus() : status_or.status());
@@ -3221,8 +4492,12 @@ absl::Status KVCacheManagerWithTransfer::OnLayerReceived(size_t layer_idx,
   }
 
   auto future = future_or.value();
+  std::shared_ptr<void> callback_guard = TrackAsyncCallback();
   future.OnReady([this, uuid, layer_idx, recv_slot, req_id,
-                  metrics_collector = metrics_collector_](auto status_or) {
+                  metrics_collector = metrics_collector_,
+                  callback_guard](auto status_or) mutable {
+    std::shared_ptr<void> callback_lifetime = std::move(callback_guard);
+    (void)callback_lifetime;
     bool unregister_plan = false;
     uint64_t plan_generation = 0;
     {

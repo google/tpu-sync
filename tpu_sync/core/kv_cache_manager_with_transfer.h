@@ -23,6 +23,7 @@
 #include <deque>
 #include <functional>
 #include <future>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -40,12 +41,12 @@
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
-#include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "xla/pjrt/pjrt_client.h"
 
 namespace tpu_sync {
 namespace rpc {
@@ -141,6 +142,16 @@ struct PendingCopy {
 
 class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
  public:
+  // Per-UUID result returned by the legacy producer-registration lease
+  // protocol. These numeric values are part of the wire/Python API.
+  enum class LeaseUpdateStatus : int32_t {
+    kApplied = 1,
+    kUnknown = 0,
+    kTerminal = -1,
+    kTransferring = -2,
+    kMaxRetentionReached = -3,
+  };
+
   struct Slot {
     int64_t slot_idx;
     std::vector<int> block_ids;
@@ -183,6 +194,14 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   virtual int64_t NotifyForRead(const std::string& req_id, uint64_t uuid,
                                 const std::vector<int64_t>& block_ids);
 
+  // Extends or releases legacy producer-side WAITING send registrations at a
+  // single remote control endpoint. Results are positionally aligned with
+  // `uuids`, including duplicates. Transport/protocol failures throw.
+  virtual std::vector<int32_t> RenewRemoteLeases(
+      const std::string& remote_endpoint, const std::vector<uint64_t>& uuids);
+  virtual std::vector<int32_t> CancelRemoteLeases(
+      const std::string& remote_endpoint, const std::vector<uint64_t>& uuids);
+
   virtual void StartRead(
       const std::string& req_id, uint64_t uuid,
       const std::string& remote_endpoint,
@@ -197,6 +216,10 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
       const std::vector<int64_t>& local_block_ids, int parallelism = 1,
       std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt);
 
+  // Returns producer settlements, successful receives, and failed receives.
+  // A producer settlement means its request-owned KV blocks may be released;
+  // it includes failed, cancelled, and expired sends as well as successful
+  // delivery.
   virtual std::tuple<std::vector<std::string>, std::vector<std::string>,
                      std::vector<std::string>>
   CompleteReadRaw();
@@ -236,8 +259,7 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   // open a data connection, notably worker registration: the registry's
   // endpoints are what a remote ReadRemote pulls from, and pointing a pull
   // at a control port hangs both sides silently.
-  virtual std::vector<RaidenTransferEndpoint> get_local_data_endpoints()
-      const;
+  virtual std::vector<RaidenTransferEndpoint> get_local_data_endpoints() const;
 
   static bool EncodeIpToIpv6Bytes(const std::string& ip, uint8_t out[16]);
 
@@ -255,6 +277,11 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   std::vector<RaidenTransferEndpoint> BuildEndpoints(int64_t port) const;
 
   struct SendEntry {
+    enum class Phase {
+      kWaitingForPull,
+      kTransferring,
+    };
+
     std::string req_id;
     uint64_t uuid = 0;
     int64_t slot_idx = -1;
@@ -273,14 +300,23 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     std::chrono::steady_clock::time_point d2h_done;
     bool stage_done = false;
     bool failed = false;
-    bool pull_started = false;
+    bool ack_received = false;
+    bool terminal_requested = false;
+    // The producer reports a request exactly once when its ownership is
+    // settled, regardless of whether delivery succeeded. The consumer reports
+    // delivery failures independently through failed_recving_.
+    bool settlement_reported = false;
+    Phase phase = Phase::kWaitingForPull;
     bool slot_released = false;
     std::chrono::steady_clock::time_point deadline;
+    std::chrono::steady_clock::time_point retention_deadline;
+    std::chrono::steady_clock::time_point transfer_deadline;
     std::vector<raiden::PjRtCopyFuture> d2h_layer_futures;
     std::vector<std::string> remote_data_endpoints;
     std::vector<int> src_ints;
     std::vector<int> dst_ints;
-    std::atomic<size_t> remaining_h2h_layers{0};
+    size_t pending_layer_callbacks = 0;
+    std::string terminal_message;
   };
 
   struct StagingLayerReady {
@@ -329,9 +365,19 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   static constexpr uint32_t kResponseMagic = 0x44494152;
   static constexpr uint32_t kOpAck = 2;
   static constexpr uint32_t kOpPullStream = 3;
+  static constexpr uint32_t kOpRenewLeases = 4;
+  static constexpr uint32_t kOpCancelLeases = 5;
+  static constexpr uint32_t kLeaseProtocolVersion = 1;
+  static constexpr int32_t kControlRetryableUnknown = 1;
+  static constexpr size_t kDefaultMaxLeaseBatchSize = 4096;
+  // Keeps one lease request body at or below the 64 KiB control-message bound.
+  // RAIDEN_MAX_LEASE_BATCH_SIZE may tune the operational value up to this
+  // protocol safety ceiling.
+  static constexpr size_t kMaxLeaseBatchSizeLimit = 8192;
 
   std::string EndpointWithPort(const std::string& endpoint, int port) const;
-  ControlResponseHeader ReadControlResponseHeader(int fd);
+  ControlResponseHeader ReadControlResponseHeader(
+      int fd, std::chrono::steady_clock::time_point operation_deadline);
   void AckSend(uint64_t uuid);
   void ConfigureDataPortFromKvTransfer();
 
@@ -340,6 +386,8 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
       const SendEntry& entry, const std::vector<int64_t>& requested_block_ids);
 
   static bool DynamicHostStagingEnabled();
+  void ConfigureLegacyControlFromEnv();
+  int64_t SendStagingCapacityBlocks() const;
   absl::Status InitializeSlotPool(int64_t num_slots);
   Slot AcquireSlot();
   Slot AcquireSlotLocked();
@@ -368,11 +416,62 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
                             std::vector<int>* staged_host_blocks);
   void ReleaseEntrySlotLocked(const std::shared_ptr<SendEntry>& entry);
 
+  enum class SendTombstoneKind {
+    kTerminal,
+    kPreRegistrationCancel,
+    kCancelled,
+  };
+
+  struct SendTombstone {
+    std::string message;
+    SendTombstoneKind kind = SendTombstoneKind::kTerminal;
+    std::chrono::steady_clock::time_point expires_at;
+    std::list<uint64_t>::iterator order_it;
+  };
+
+  struct PendingAck {
+    std::chrono::steady_clock::time_point expires_at;
+    std::list<uint64_t>::iterator order_it;
+  };
+
+  void PurgeSendTombstonesLocked(std::chrono::steady_clock::time_point now);
+  void InstallSendTombstoneLocked(
+      uint64_t uuid, std::string message,
+      std::chrono::steady_clock::time_point now,
+      SendTombstoneKind kind = SendTombstoneKind::kTerminal);
+  void PurgePendingAcksLocked(std::chrono::steady_clock::time_point now);
+  void InstallPendingAckLocked(uint64_t uuid,
+                               std::chrono::steady_clock::time_point now);
+  bool ConsumePendingAckLocked(uint64_t uuid,
+                               std::chrono::steady_clock::time_point now);
+  // Settles producer ownership exactly once. Every terminal outcome is
+  // surfaced through done_sending_ so the producer can release its KV blocks;
+  // successful delivery is determined on the consumer side.
+  bool TerminalizeSendEntryLocked(
+      uint64_t uuid, const std::shared_ptr<SendEntry>& expected,
+      const std::string& message, bool waiting_only,
+      SendTombstoneKind kind = SendTombstoneKind::kTerminal);
+  void FinishSendLayer(const std::shared_ptr<SendEntry>& entry,
+                       const absl::Status& status, const std::string& message);
+  void FinalizeDrainedSendLocked(const std::shared_ptr<SendEntry>& entry);
+  void UpdateLegacySendGaugesLocked() const;
+  std::vector<int32_t> ApplyLeaseBatchLocked(
+      uint32_t op, const std::vector<uint64_t>& uuids,
+      std::chrono::steady_clock::time_point now);
+  std::vector<int32_t> SendLeaseBatch(const std::string& remote_endpoint,
+                                      uint32_t op,
+                                      const std::vector<uint64_t>& uuids);
+
   void StartControlServer();
   void StopControlServer();
   void ControlServerLoop();
   void HandleControlConnection(int fd);
-  void ProcessPullStream(int fd, const ControlRequestHeader& req);
+  void ProcessPullStream(
+      int fd, const ControlRequestHeader& req,
+      std::chrono::steady_clock::time_point operation_deadline);
+  void ProcessLeaseBatch(
+      int fd, const ControlRequestHeader& req,
+      std::chrono::steady_clock::time_point operation_deadline);
   void AckRemote(const std::string& remote_endpoint, uint64_t uuid);
   absl::Status OnLayerReceived(size_t layer_idx, uint64_t uuid) override;
   absl::Status OnPoolReceived(size_t pool_idx, uint64_t uuid) override;
@@ -380,6 +479,17 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
       size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
       transport::BlockTransportDelegate::HostBlockReadyCallback cb) override;
   void ScheduleAsyncTask(std::function<void()> task) override;
+  void StartRegistrationRetryScheduler();
+  void StopRegistrationRetryScheduler();
+  void RegistrationRetryLoop();
+  void ScheduleRegistrationRetry(std::chrono::steady_clock::time_point due,
+                                 std::optional<int> target_node,
+                                 std::function<void()> task);
+  // A token pins the derived manager until an asynchronous D2H/H2D/transport
+  // callback has run (or its callback object is destroyed during cancellation).
+  std::shared_ptr<void> TrackAsyncCallback();
+  std::chrono::milliseconds ComputeRegistrationRetryDelay(
+      uint64_t uuid, size_t retry_number) const;
   std::shared_ptr<StagingReadinessState> CreateStagingReadiness(
       int64_t slot_idx, int64_t num_blocks);
   void MarkStagingLayerReady(
@@ -393,6 +503,11 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   absl::Status WaitForPendingWork() override;
 
   struct RecvEntry {
+    enum class Phase {
+      kRegistering,
+      kTransferring,
+    };
+
     std::string req_id;
     int64_t slot_idx = -1;  // host staging slot to release on completion
     // Host blocks held under demand staging, released on completion. Empty
@@ -414,6 +529,7 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     std::vector<int> accumulated_host_block_ids;
     std::chrono::steady_clock::time_point deadline;
     std::chrono::steady_clock::time_point start_time;
+    Phase phase = Phase::kRegistering;
     std::vector<raiden::PjRtCopyFuture> h2d_futures;
     bool is_pool_reshard = false;
     // The plan is dropped when this receive settles: set for every
@@ -459,14 +575,16 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   // transfers hand blocks back, bounded by the entry's deadline. Returns
   // false when the transfer was failed or cancelled instead; the caller
   // has nothing left to do.
-  bool AcquireSendStagingWithRetry(uint64_t uuid,
-                                   const std::vector<int64_t>& src_block_ids,
-                                   std::vector<int64_t>* host_block_ids);
-  void StartPushInternal(uint64_t uuid,
-                         const std::vector<std::string>& remote_data_endpoints,
-                         const std::vector<int64_t>& src_block_ids,
-                         const std::vector<int64_t>& dst_block_ids);
-  void SendNextLayer(uint64_t uuid, size_t l);
+  bool AcquireSendStagingWithRetry(
+      uint64_t uuid, const std::vector<int64_t>& src_block_ids,
+      std::chrono::steady_clock::time_point operation_deadline,
+      std::vector<int64_t>* host_block_ids);
+  virtual void StartPushInternal(
+      uint64_t uuid, const std::vector<std::string>& remote_data_endpoints,
+      const std::vector<int64_t>& src_block_ids,
+      const std::vector<int64_t>& dst_block_ids);
+  void SendNextLayer(const std::shared_ptr<SendEntry>& entry, size_t layer_idx,
+                     const std::shared_ptr<std::atomic<bool>>& completed);
 
   absl::Status ValidatePoolReshardPlan(
       const ::tpu_sync::rpc::StartTransferRequest& plan,
@@ -504,11 +622,8 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   // whole slot, so the same pool seats more transfers at once.
   bool dynamic_host_staging_ = false;
 
-  // Pull-serve workers launched by ProcessPullStream. The destructor waits
-  // for them, and shutting_down_ ends a worker's staging wait early.
+  // Ends queued pull work and any producer staging wait during teardown.
   std::atomic<bool> shutting_down_{false};
-  absl::Mutex pull_workers_mu_;
-  int active_pull_workers_ ABSL_GUARDED_BY(pull_workers_mu_) = 0;
   double timeout_s_ = 120.0;
   bool unsafe_skip_buffer_lock_ = true;
 
@@ -518,7 +633,27 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   // main thread, but accessed asynchronously in control worker threads
   // handling pull connections.
   std::map<uint64_t, std::shared_ptr<SendEntry>> send_entries_;
-  std::set<uint64_t> pending_acks_;
+  // Terminal entries that are still draining async callbacks stay separate
+  // from the live UUID namespace so they cannot be renewed or resurrected.
+  std::map<uint64_t, std::shared_ptr<SendEntry>> draining_send_entries_;
+  std::map<uint64_t, SendTombstone> send_tombstones_;
+  std::list<uint64_t> send_tombstone_order_;
+  std::map<uint64_t, PendingAck> pending_acks_;
+  std::list<uint64_t> pending_ack_order_;
+  // Quarantines a terminal UUID so delayed ACK/cancel/pull messages from its
+  // old transfer cannot affect a newer transfer. The UUID becomes reusable
+  // after this TTL; callers should normally generate a fresh UUID per attempt.
+  std::chrono::milliseconds send_tombstone_ttl_{std::chrono::minutes(5)};
+  std::chrono::milliseconds pending_ack_ttl_{std::chrono::seconds(30)};
+  size_t max_send_tombstones_ = 4096;
+  size_t max_pending_acks_ = 4096;
+  std::chrono::milliseconds control_io_timeout_{std::chrono::seconds(30)};
+  size_t max_lease_batch_size_ = kDefaultMaxLeaseBatchSize;
+  size_t active_send_callbacks_ = 0;
+  std::atomic<uint64_t> retryable_unknown_pull_responses_{0};
+  // Producer-side lifecycle settlement, not a guarantee that the consumer
+  // received the bytes successfully. This signal lets the producer release
+  // request-owned KV blocks after success, cancellation, expiry, or failure.
   std::set<std::string> done_sending_;
   std::set<std::string> done_recving_;
   std::set<std::string> failed_recving_;
@@ -533,8 +668,26 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   absl::Mutex mu_;
   absl::CondVar cv_;
   int control_fd_ = -1;
+  std::set<int> active_control_fds_;
   std::atomic<bool> stopping_{false};
   std::thread control_thread_;
+
+  struct RegistrationRetryTask {
+    std::optional<int> target_node;
+    std::function<void()> task;
+  };
+  std::mutex registration_retry_mu_;
+  std::condition_variable registration_retry_cv_;
+  std::multimap<std::chrono::steady_clock::time_point, RegistrationRetryTask>
+      registration_retry_tasks_;
+  bool registration_retry_stopping_ = false;
+  std::thread registration_retry_thread_;
+  std::chrono::milliseconds registration_retry_base_delay_{10};
+  std::chrono::milliseconds registration_retry_max_delay_{500};
+
+  std::mutex async_callbacks_mu_;
+  std::condition_variable async_callbacks_cv_;
+  size_t active_async_callbacks_ = 0;
 
  private:
   std::optional<int> GetLocalTpuNumaNode(xla::PjRtBuffer* buf) const;

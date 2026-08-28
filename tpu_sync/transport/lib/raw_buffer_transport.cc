@@ -49,6 +49,8 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/transport/buffer_push_task.h"
@@ -167,7 +169,6 @@ RawBufferTransport::RawBufferTransport(
       local_ips_(local_ips),
       local_port_(local_port),
       require_psp_tcp_(absl::GetFlag(FLAGS_require_psp_tcp)),
-      server_fd_(-1),
       stopping_(false) {
   // 1. Setup server listening socket.
   const absl::StatusOr<std::pair<int, int>> fd_port = CreateSocket(local_port_);
@@ -192,21 +193,11 @@ RawBufferTransport::RawBufferTransport(
 }
 
 RawBufferTransport::~RawBufferTransport() {
-  stopping_ = true;
-
-  // 1. Listener side:
-  // 1.1 Shutdown on all active sockets to unblock the threads.
-  if (server_fd_ >= 0) {
-    DCHECK(IsValidSocket(server_fd_));
-    shutdown(server_fd_, SHUT_RDWR);
+  CancelPendingOperations();
+  if (!WaitForPendingOperations(std::chrono::seconds(30))) {
+    LOG(FATAL) << "RawBufferTransport workers did not stop after socket "
+                  "cancellation; failing closed to protect the delegate";
   }
-  {
-    absl::MutexLock _(mu_);
-    for (int fd : active_client_fds_) {
-      shutdown(fd, SHUT_RDWR);
-    }
-  }
-  // 1.2 Join all threads.
   if (listener_thread_.joinable()) {
     listener_thread_.join();
   }
@@ -215,15 +206,32 @@ RawBufferTransport::~RawBufferTransport() {
       t.join();
     }
   }
-  {
-    // Each worker thread should have closed its own client_fd.
-    absl::MutexLock _(mu_);
-    DCHECK(active_client_fds_.empty());
-  }
-
-  // 2. Connector side:
-  // Close all pooled file descriptors _after_ all the threads are joined.
+  // Idempotent; pooled descriptors may already have been closed by explicit
+  // manager cancellation.
   conn_pool_.Close();
+}
+
+void RawBufferTransport::CancelPendingOperations() {
+  stopping_.store(true, std::memory_order_release);
+  conn_pool_.Close();
+  absl::MutexLock lock(mu_);
+  if (server_fd_ >= 0) {
+    (void)shutdown(server_fd_, SHUT_RDWR);
+  }
+  for (int fd : active_client_fds_) {
+    (void)shutdown(fd, SHUT_RDWR);
+  }
+}
+
+bool RawBufferTransport::WaitForPendingOperations(
+    std::chrono::milliseconds timeout) {
+  const absl::Time deadline = absl::Now() + absl::Milliseconds(timeout.count());
+  absl::MutexLock lock(mu_);
+  while ((!listener_exited_ || !active_client_fds_.empty()) &&
+         absl::Now() < deadline) {
+    idle_cv_.WaitWithDeadline(&mu_, deadline);
+  }
+  return listener_exited_ && active_client_fds_.empty();
 }
 
 absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
@@ -424,10 +432,13 @@ void RawBufferTransport::ConnectionWorker(int client_fd) {
 
   DCHECK_GE(client_fd, 0);
   {
-    absl::MutexLock _( mu_ );
+    absl::MutexLock lock(mu_);
+    // Close and erase are serialized with cancellation's shutdown scan. The
+    // descriptor cannot be observed stale after the kernel reuses its number.
+    close(client_fd);
     active_client_fds_.erase(client_fd);
+    idle_cv_.SignalAll();
   }
-  close(client_fd);
 }
 
 absl::StatusOr<PspPeerKey>
@@ -438,6 +449,7 @@ RawBufferTransport::RegisterPspPeer(uint32_t client_spi,
         "PSP is not enabled in transport");
   }
   absl::MutexLock lock(psp_mu_);
+  absl::MutexLock socket_lock(mu_);
   if (stopping_ || server_fd_ < 0) {
     return absl::FailedPreconditionError(
         "Transport is stopping or listening socket is not initialized.");
@@ -448,9 +460,14 @@ RawBufferTransport::RegisterPspPeer(uint32_t client_spi,
 
 void RawBufferTransport::ListenerLoop() {
   while (!stopping_) {
-    DCHECK(IsValidSocket(server_fd_));
+    int server_fd;
+    {
+      absl::MutexLock lock(mu_);
+      server_fd = server_fd_;
+    }
+    if (server_fd < 0) break;
     struct pollfd pfd;
-    pfd.fd = server_fd_;
+    pfd.fd = server_fd;
     pfd.events = POLLIN;
     int ret = poll(&pfd, 1, 50);
     if (ret <= 0) {
@@ -461,7 +478,7 @@ void RawBufferTransport::ListenerLoop() {
     struct sockaddr_in6 client_addr;
     socklen_t clilen = sizeof(client_addr);
     int client_fd = accept(
-        server_fd_, reinterpret_cast<struct sockaddr*>(&client_addr), &clilen);
+        server_fd, reinterpret_cast<struct sockaddr*>(&client_addr), &clilen);
     if (client_fd < 0) {
       if (stopping_) break;
       continue;
@@ -481,17 +498,26 @@ void RawBufferTransport::ListenerLoop() {
 
     DCHECK_GE(client_fd, 0);
     {
-      absl::MutexLock _( mu_ );
+      absl::MutexLock lock(mu_);
+      if (stopping_) {
+        close(client_fd);
+        break;
+      }
       active_client_fds_.insert(client_fd);
     }
     worker_threads_.push_back(
         std::thread([this, client_fd]() { ConnectionWorker(client_fd); }));
   }
 
-  DCHECK(IsValidSocket(server_fd_));
-  close(server_fd_);
-  server_fd_ = -1;
-  DCHECK(!IsValidSocket(server_fd_));
+  {
+    absl::MutexLock lock(mu_);
+    if (server_fd_ >= 0) {
+      close(server_fd_);
+      server_fd_ = -1;
+    }
+    listener_exited_ = true;
+    idle_cv_.SignalAll();
+  }
 }
 
 absl::Status RawBufferTransport::PullBuffer(

@@ -295,6 +295,18 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "kv_cache_manager_lifecycle_test",
+    srcs = ["kv_cache_manager_lifecycle_test.cc"],
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],
+    deps = [
+        ":kv_cache_manager_base",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "raiden_id",
     visibility = ["//visibility:public"],

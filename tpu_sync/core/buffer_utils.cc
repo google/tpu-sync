@@ -20,6 +20,9 @@
 #include <vector>
 
 #include "absl/strings/str_cat.h"
+#include "xla/pjrt/c/pjrt_c_api.h"
+#include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
+#include "xla/pjrt/c/pjrt_c_api_raw_buffer_internal.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 
@@ -44,9 +47,17 @@ std::vector<std::vector<raiden::RaidenBufferHandle>> UnpackLayers(
     std::vector<raiden::RaidenBufferHandle> shard_buffers;
     shard_buffers.reserve(num_shards);
     for (size_t sh = 0; sh < num_shards; ++sh) {
+      xla::PjRtBuffer* pjrt_buf = device_buffers[l][sh];
+      const PJRT_Api* c_api = nullptr;
+      const PJRT_RawBuffer_Extension* extension =
+          ::raiden::GetRawBufferExtension(pjrt_buf, &c_api);
+      if (extension == nullptr) {
+        static const PJRT_RawBuffer_Extension kCpuRawBufferExtension =
+            pjrt::CreateRawBufferExtension(nullptr);
+        extension = &kCpuRawBufferExtension;
+      }
       auto handle_or = raiden::RaidenBufferHandle::Acquire(
-          device_buffers[l][sh], /*c_api=*/nullptr, /*extension=*/nullptr,
-          unsafe_skip_buffer_lock);
+          pjrt_buf, c_api, extension, unsafe_skip_buffer_lock);
       if (!handle_or.ok()) {
         throw std::runtime_error(absl::StrCat(
             "Failed to acquire RaidenBufferHandle: ",

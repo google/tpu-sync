@@ -54,10 +54,9 @@ struct RawProgress {
   absl::flat_hash_set<size_t> triggered_layers;
 };
 
-// Builds a single Request struct for buffer push operations.
-absl::StatusOr<Request> BuildBufferRequest(size_t buffer_id,
-                                           size_t dst_shard_idx,
-                                           size_t dst_offset_bytes,
+// Builds a single Request struct for buffer push/ pull operations.
+absl::StatusOr<Request> BuildBufferRequest(size_t buffer_id, size_t shard_idx,
+                                           size_t offset_bytes,
                                            const uint8_t* data_ptr,
                                            size_t size_bytes, uint64_t uuid,
                                            uint8_t socket_opcode);
@@ -151,6 +150,10 @@ class RawBufferTransport final {
                                              absl::string_view client_key);
 
  private:
+  // Pulls a buffer request from `peer` over a borrowed TCP connection.
+  absl::Status ProcessSocketBufferPull(absl::string_view peer,
+                                       const Request& request);
+
   // Pushes buffer requests to `peer` over a borrowed TCP connection.
   absl::Status ProcessSocketBufferBatchPush(absl::string_view peer,
                                             absl::Span<const Request> requests);

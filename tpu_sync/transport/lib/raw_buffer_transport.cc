@@ -509,6 +509,21 @@ absl::Status RawBufferTransport::PullBuffer(
         ", Size: ", size_bytes, ", Shard Host Size: ", host_size));
   }
 
+  uint8_t* dest_ptr = raw_delegate_->GetHostPointer(buffer_id, dst_shard_idx) +
+                      dst_offset_bytes;
+  ASSIGN_OR_RETURN(const Request req,
+                   BuildBufferRequest(buffer_id, src_shard_idx,
+                                      src_offset_bytes, dest_ptr, size_bytes,
+                                      /*uuid=*/0, kOpBufferPull));
+  return ProcessSocketBufferPull(peer, req);
+}
+
+absl::Status RawBufferTransport::ProcessSocketBufferPull(
+    absl::string_view peer, const Request& request) {
+  if (peer.empty()) {
+    return absl::InvalidArgumentError("Source peer address cannot be empty");
+  }
+
   ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer));
   bool ok_to_pool = false;
   auto fd_cleaner =
@@ -517,16 +532,20 @@ absl::Status RawBufferTransport::PullBuffer(
   ChunkHeader header = {};
   header.version = 1;
   header.op = kOpBufferPull;
-  header.buffer_id = static_cast<uint16_t>(buffer_id);
-  header.remote_id = static_cast<uint32_t>(src_offset_bytes);
-  header.local_id = static_cast<uint32_t>(src_shard_idx);
-  header.count_or_size = static_cast<uint32_t>(size_bytes);
+  header.buffer_id = static_cast<uint16_t>(request.layer_idx);
+  header.remote_id = static_cast<uint32_t>(request.remote_id);
+  header.local_id = request.local_id;
+  header.count_or_size = static_cast<uint32_t>(request.len);
+
   const auto s_header = SerializeChunkHeader(header);
   RETURN_IF_ERROR(WriteExact(fd, s_header.data(), s_header.size()));
 
-  uint8_t* dest_ptr = raw_delegate_->GetHostPointer(buffer_id, dst_shard_idx) +
-                      dst_offset_bytes;
-  RETURN_IF_ERROR(ReadExact(fd, dest_ptr, size_bytes));
+  if (request.len > 0) {
+    if (request.laddr == nullptr) {
+      return absl::InvalidArgumentError("Destination host pointer is null");
+    }
+    RETURN_IF_ERROR(ReadExact(fd, request.laddr, request.len));
+  }
 
   ok_to_pool = true;
   return absl::OkStatus();
@@ -644,9 +663,8 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
   return absl::OkStatus();
 }
 
-absl::StatusOr<Request> BuildBufferRequest(size_t buffer_id,
-                                           size_t dst_shard_idx,
-                                           size_t dst_offset_bytes,
+absl::StatusOr<Request> BuildBufferRequest(size_t buffer_id, size_t shard_idx,
+                                           size_t offset_bytes,
                                            const uint8_t* data_ptr,
                                            size_t size_bytes, uint64_t uuid,
                                            uint8_t socket_opcode) {
@@ -658,8 +676,8 @@ absl::StatusOr<Request> BuildBufferRequest(size_t buffer_id,
       .major_order = 0,
       .layer_idx = static_cast<int>(buffer_id),
       .parallelism = 1,
-      .remote_id = dst_offset_bytes,
-      .local_id = static_cast<uint32_t>(dst_shard_idx),
+      .remote_id = offset_bytes,
+      .local_id = static_cast<uint32_t>(shard_idx),
       .count_or_size = static_cast<uint32_t>(size_bytes),
       .uuid = uuid,
       .request_id = 0,

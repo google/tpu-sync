@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
@@ -29,8 +30,8 @@
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 ABSL_DECLARE_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size);
 
@@ -218,8 +219,10 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedExactBoundary) {
   entry->set_count(1);
   entry->set_layer_idx(0);
 
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 1));
   absl::Status status = ws_source->PushWeightsResharded(request);
   EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
 
   for (size_t i = 0; i < slice_byte_size; ++i) {
     EXPECT_EQ(dest_host_ptr[i], 0xAB) << "Mismatch at byte " << i;
@@ -407,8 +410,10 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedFallbackByNameSuccess) {
   entry->set_count(1);
   // Do not set layer_idx (forces fallback)
 
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 1));
   absl::Status status = ws_source->PushWeightsResharded(request);
   EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
 
   for (size_t i = 0; i < slice_byte_sizes[1]; ++i) {
     EXPECT_EQ(dest_l1_ptr[i], 0xAB) << "Mismatch at byte " << i;
@@ -537,8 +542,10 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedSkipD2h) {
   entry->set_count(1);
   entry->set_layer_idx(0);
 
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 1));
   absl::Status status = ws_source->PushWeightsResharded(request);
   EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
 
   for (size_t i = 0; i < slice_byte_size; ++i) {
     EXPECT_EQ(dest_host_ptr[i], 0xAA) << "Mismatch at byte " << i;
@@ -546,11 +553,164 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedSkipD2h) {
 
   std::memset(dest_host_ptr, 0x00, slice_byte_size);
   request.set_skip_d2h(false);
+  request.set_uuid(12346);
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 1));
   status = ws_source->PushWeightsResharded(request);
   EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
 
   for (size_t i = 0; i < slice_byte_size; ++i) {
     EXPECT_EQ(dest_host_ptr[i], 0xDD) << "Mismatch at byte " << i;
+  }
+}
+
+TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiLayerPipelineGrouped) {
+  size_t num_layers = 4;
+  size_t num_shards = 2;
+  size_t slice_byte_size = 1024;
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
+
+  for (size_t l = 0; l < num_layers; ++l) {
+    for (size_t s = 0; s < num_shards; ++s) {
+      uint8_t* src_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(l, s));
+      uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s));
+      ASSERT_NE(src_ptr, nullptr);
+      ASSERT_NE(dst_ptr, nullptr);
+      std::memset(src_ptr, static_cast<int>(l * 16 + s + 1), slice_byte_size);
+      std::memset(dst_ptr, 0x00, slice_byte_size);
+    }
+  }
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  request.set_uuid(99901);
+
+  auto* schedules = request.mutable_shard_push_schedules();
+  for (size_t s = 0; s < num_shards; ++s) {
+    for (size_t l = 0; l < num_layers; ++l) {
+      auto* entry = (*schedules)[static_cast<int32_t>(s)].add_entries();
+      entry->set_dst_peer(dest_peer);
+      entry->set_dst_shard_idx(s);
+      entry->set_src_offset_bytes(0);
+      entry->set_dst_offset_bytes(0);
+      entry->set_size_bytes(slice_byte_size);
+      entry->set_count(1);
+      entry->set_layer_idx(static_cast<int32_t>(l));
+    }
+  }
+
+  // Test 1: Pipeline group size = 2 (2 layers per group)
+  ws_source->SetPipelineGroupSize(2);
+  EXPECT_EQ(ws_source->GetPipelineGroupSize(), 2);
+  request.set_uuid(20001);
+  ASSERT_OK(
+      ws_dest->RegisterExpectedChunks(request.uuid(), num_layers * num_shards));
+  absl::Status status = ws_source->PushWeightsResharded(request);
+  EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+  for (size_t l = 0; l < num_layers; ++l) {
+    for (size_t s = 0; s < num_shards; ++s) {
+      uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s));
+      uint8_t expected_val = static_cast<uint8_t>(l * 16 + s + 1);
+      for (size_t b = 0; b < slice_byte_size; ++b) {
+        EXPECT_EQ(dst_ptr[b], expected_val)
+            << "Mismatch at layer " << l << " shard " << s << " byte " << b;
+      }
+    }
+  }
+
+  // Test 2: Pipeline group size = 1 (layer-by-layer)
+  for (size_t l = 0; l < num_layers; ++l) {
+    for (size_t s = 0; s < num_shards; ++s) {
+      std::memset(const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s)), 0x00,
+                  slice_byte_size);
+    }
+  }
+  ws_source->SetPipelineGroupSize(1);
+  EXPECT_EQ(ws_source->GetPipelineGroupSize(), 1);
+  request.set_uuid(20002);
+  ASSERT_OK(
+      ws_dest->RegisterExpectedChunks(request.uuid(), num_layers * num_shards));
+  status = ws_source->PushWeightsResharded(request);
+  EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+  for (size_t l = 0; l < num_layers; ++l) {
+    for (size_t s = 0; s < num_shards; ++s) {
+      uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s));
+      uint8_t expected_val = static_cast<uint8_t>(l * 16 + s + 1);
+      for (size_t b = 0; b < slice_byte_size; ++b) {
+        EXPECT_EQ(dst_ptr[b], expected_val)
+            << "Mismatch at layer " << l << " shard " << s << " byte " << b;
+      }
+    }
+  }
+
+  // Test 3: Pipeline group size = 0 (all layers in 1 group)
+  for (size_t l = 0; l < num_layers; ++l) {
+    for (size_t s = 0; s < num_shards; ++s) {
+      std::memset(const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s)), 0x00,
+                  slice_byte_size);
+    }
+  }
+  ws_source->SetPipelineGroupSize(0);
+  EXPECT_EQ(ws_source->GetPipelineGroupSize(), 0);
+  request.set_uuid(20003);
+  ASSERT_OK(
+      ws_dest->RegisterExpectedChunks(request.uuid(), num_layers * num_shards));
+  status = ws_source->PushWeightsResharded(request);
+  EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+  for (size_t l = 0; l < num_layers; ++l) {
+    for (size_t s = 0; s < num_shards; ++s) {
+      uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s));
+      uint8_t expected_val = static_cast<uint8_t>(l * 16 + s + 1);
+      for (size_t b = 0; b < slice_byte_size; ++b) {
+        EXPECT_EQ(dst_ptr[b], expected_val)
+            << "Mismatch at layer " << l << " shard " << s << " byte " << b;
+      }
+    }
+  }
+
+  // Test 4: Pipeline group size configured via environment variable
+  for (size_t l = 0; l < num_layers; ++l) {
+    for (size_t s = 0; s < num_shards; ++s) {
+      std::memset(const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s)), 0x00,
+                  slice_byte_size);
+    }
+  }
+  ws_source->SetPipelineGroupSize(std::nullopt);
+  setenv("RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE", "3", 1);
+  EXPECT_EQ(ws_source->GetPipelineGroupSize(), 3);
+  request.set_uuid(20004);
+  ASSERT_OK(
+      ws_dest->RegisterExpectedChunks(request.uuid(), num_layers * num_shards));
+  status = ws_source->PushWeightsResharded(request);
+  EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+  unsetenv("RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE");
+
+  for (size_t l = 0; l < num_layers; ++l) {
+    for (size_t s = 0; s < num_shards; ++s) {
+      uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s));
+      uint8_t expected_val = static_cast<uint8_t>(l * 16 + s + 1);
+      for (size_t b = 0; b < slice_byte_size; ++b) {
+        EXPECT_EQ(dst_ptr[b], expected_val)
+            << "Mismatch at layer " << l << " shard " << s << " byte " << b;
+      }
+    }
   }
 }
 
@@ -670,8 +830,10 @@ TEST_F(WeightSynchronizerTest, BindWeights) {
   entry->set_count(1);
   entry->set_layer_idx(0);
 
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 1));
   status = ws_source->PushWeightsResharded(request);
   EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
 
   auto h2d_future_or = ws_dest->H2d();
   ASSERT_TRUE(h2d_future_or.ok()) << h2d_future_or.status().message();

@@ -29,11 +29,13 @@
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/flags/flag.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
@@ -320,6 +322,20 @@ WeightSynchronizerBase::get_local_endpoints() const {
 }
 
 WeightSynchronizerBase::~WeightSynchronizerBase() = default;
+
+size_t WeightSynchronizerBase::GetPipelineGroupSize() const {
+  if (pipeline_group_size_override_.has_value()) {
+    return *pipeline_group_size_override_;
+  }
+  const char* env = std::getenv("RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE");
+  if (env != nullptr && *env != '\0') {
+    size_t val = 0;
+    if (absl::SimpleAtoi(env, &val)) {
+      return val;
+    }
+  }
+  return 1;
+}
 
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
     size_t layer_idx, uint64_t uuid) {
@@ -722,29 +738,50 @@ absl::Status WeightSynchronizerBase::PushWeightsResharded(
   size_t total_h2h_bytes = 0;
   size_t total_d2h_bytes = 0;
   double first_d2h_time_ms = 0.0;
-  std::vector<std::future<absl::Status>> push_futures;
-  push_futures.reserve(num_layers_);
 
-  for (size_t l = 0; l < num_layers_; ++l) {
-    for (size_t s = 0; s < num_shards_; ++s) {
-      total_d2h_bytes += GetHostSize(l, s);
-    }
-    if (!request.skip_d2h() && !already_completed) {
-      TF_RETURN_IF_ERROR(d2h_layer_futures[l].Await());
-      if (l == 0) {
-        first_d2h_time_ms = absl::ToDoubleMilliseconds(absl::Now() - d2h_start);
+  size_t pipeline_group_size = GetPipelineGroupSize();
+  size_t group_size =
+      (pipeline_group_size == 0) ? num_layers_ : pipeline_group_size;
+  if (group_size == 0) {
+    group_size = 1;
+  }
+
+  std::vector<std::future<absl::Status>> push_futures;
+  push_futures.reserve((num_layers_ + group_size - 1) / group_size);
+
+  for (size_t group_start = 0; group_start < num_layers_;
+       group_start += group_size) {
+    size_t group_end = std::min(num_layers_, group_start + group_size);
+    std::vector<transport::BufferPushTask> group_tasks;
+
+    for (size_t l = group_start; l < group_end; ++l) {
+      for (size_t s = 0; s < num_shards_; ++s) {
+        total_d2h_bytes += GetHostSize(l, s);
+      }
+      if (!request.skip_d2h() && !already_completed) {
+        TF_RETURN_IF_ERROR(d2h_layer_futures[l].Await());
+        if (l == 0) {
+          first_d2h_time_ms =
+              absl::ToDoubleMilliseconds(absl::Now() - d2h_start);
+        }
+      }
+      const auto& layer_tasks = tasks_by_layer[l];
+      if (!layer_tasks.empty()) {
+        for (const auto& t : layer_tasks) {
+          total_h2h_bytes += t.size_bytes;
+        }
+        group_tasks.insert(group_tasks.end(), layer_tasks.begin(),
+                           layer_tasks.end());
       }
     }
-    const auto& layer_tasks = tasks_by_layer[l];
-    if (!layer_tasks.empty()) {
-      for (const auto& t : layer_tasks) {
-        total_h2h_bytes += t.size_bytes;
-      }
+
+    if (!group_tasks.empty()) {
       int push_parallelism =
           request.parallelism() > 0 ? request.parallelism() : parallelism_;
-      push_futures.push_back(push_pool_->Schedule(
-          [this, layer_tasks, push_parallelism, uuid = request.uuid()]() {
-            return PushWeightsChunks(layer_tasks, push_parallelism, uuid);
+      push_futures.push_back(
+          push_pool_->Schedule([this, group_tasks = std::move(group_tasks),
+                                push_parallelism, uuid = request.uuid()]() {
+            return PushWeightsChunks(group_tasks, push_parallelism, uuid);
           }));
     }
   }
@@ -862,7 +899,15 @@ absl::Status WeightSynchronizerBase::OnLayerDataReceived(size_t layer_idx,
 }
 
 absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
+  auto record_completion = [this, uuid]() {
+    if (uuid > 0) {
+      absl::MutexLock lock(completed_transfers_mu_);
+      completed_transfers_.insert(uuid);
+    }
+  };
+
   if (!auto_h2d_) {
+    record_completion();
     return absl::OkStatus();
   }
   VLOG(1) << "Starting OnDataReceived (auto_h2d for uuid=" << uuid << ")...";
@@ -914,8 +959,22 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
     metrics_.last_h2d_time_ms = h2d_time_ms;
     metrics_.total_h2d_time_ms += h2d_time_ms;
   }
+  record_completion();
   VLOG(1) << "Done with OnDataReceived (auto_h2d for uuid=" << uuid
           << ", h2d_time=" << h2d_time_ms << " ms).";
+  return absl::OkStatus();
+}
+
+absl::Status WeightSynchronizerBase::WaitForTransferCompletion(uint64_t uuid) {
+  absl::MutexLock lock(completed_transfers_mu_);
+  auto condition_fn =
+      +[](std::pair<absl::flat_hash_set<uint64_t>*, uint64_t>* p)
+           ABSL_NO_THREAD_SAFETY_ANALYSIS {
+             return p->first->contains(p->second);
+           };
+  std::pair<absl::flat_hash_set<uint64_t>*, uint64_t> ctx{&completed_transfers_,
+                                                          uuid};
+  completed_transfers_mu_.Await(absl::Condition(condition_fn, &ctx));
   return absl::OkStatus();
 }
 
@@ -946,6 +1005,10 @@ absl::Status WeightSynchronizerBase::OnBlocksReceived(
 
 void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
   RaidenManagerBase::ForgetPushProgress(uuid);
+  {
+    absl::MutexLock lock(completed_transfers_mu_);
+    completed_transfers_.erase(uuid);
+  }
   {
     absl::MutexLock lock(skip_tiling_mu_);
     uuid_to_skip_tiling_.erase(uuid);

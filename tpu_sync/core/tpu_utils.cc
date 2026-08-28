@@ -31,6 +31,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <optional>
@@ -407,7 +408,8 @@ int GetTotalNumaNodes(absl::string_view sysfs_root) {
   return count > 0 ? count : 1;
 }
 
-NicClassification ClassifyNic(absl::string_view bdf, int mtu) {
+// Dedicated classifier for GKE / Cloud TPU VMs
+NicClassification ClassifyNicGke(absl::string_view bdf, int mtu) {
   if (bdf.empty()) {
     return NicClassification::kControlPlane;
   }
@@ -415,6 +417,11 @@ NicClassification ClassifyNic(absl::string_view bdf, int mtu) {
     return NicClassification::kDataPlane;
   }
   return NicClassification::kControlPlane;
+}
+
+NicClassification ClassifyNic(absl::string_view ifname, absl::string_view bdf,
+                              int mtu) {
+  return ClassifyNicGke(bdf, mtu);
 }
 
 std::string ClassificationToString(NicClassification classification) {
@@ -451,7 +458,8 @@ std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(
           int node = GetInterfaceNumaNode(ifa->ifa_name, sysfs_root);
           int mtu = GetInterfaceMtu(ifa->ifa_name, sysfs_root);
           std::string bdf = GetInterfaceBdf(ifa->ifa_name, sysfs_root);
-          NicClassification classification = ClassifyNic(bdf, mtu);
+          NicClassification classification =
+              ClassifyNic(ifa->ifa_name, bdf, mtu);
           nics.push_back({ifa->ifa_name, ip_str, node, classification});
         }
       }
@@ -471,7 +479,8 @@ std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(
           int node = GetInterfaceNumaNode(ifa->ifa_name, sysfs_root);
           int mtu = GetInterfaceMtu(ifa->ifa_name, sysfs_root);
           std::string bdf = GetInterfaceBdf(ifa->ifa_name, sysfs_root);
-          NicClassification classification = ClassifyNic(bdf, mtu);
+          NicClassification classification =
+              ClassifyNic(ifa->ifa_name, bdf, mtu);
           nics.push_back({ifa->ifa_name, ip_str, node, classification});
         }
       }

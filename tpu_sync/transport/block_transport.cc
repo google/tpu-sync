@@ -25,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <future>  // NOLINT
@@ -43,6 +44,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
@@ -59,14 +61,21 @@
 #include "tpu_sync/transport/lib/transport_adapter.h"
 #include "tpu_sync/transport/peregrine/src/api/socket_util.h"
 
-ABSL_FLAG(size_t, raiden_transport_coalesce_window_bytes, 0,
-          "Maximum size in bytes of the host-side coalescing buffer used "
-          "for network transfers. Set to 0 to disable coalescing.");
-
 namespace tpu_raiden {
 namespace transport {
 
 namespace {
+
+size_t GetCoalesceWindowBytes() {
+  const char* env = std::getenv("RAIDEN_TRANSPORT_COALESCE_WINDOW_BYTES");
+  if (env != nullptr && *env != '\0') {
+    size_t val = 0;
+    if (absl::SimpleAtoi(env, &val)) {
+      return val;
+    }
+  }
+  return 0;
+}
 
 using ::peregrine::ReadExact;
 using ::peregrine::ReadVExact;
@@ -203,7 +212,7 @@ BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
           [this](int client_fd, const lib::ChunkHeader& header) {
             return HandleCustomRequest(client_fd, header);
           },
-          absl::GetFlag(FLAGS_raiden_transport_coalesce_window_bytes)),
+          GetCoalesceWindowBytes()),
       peregrine_control_(
           std::make_unique<lib::PeregrineControlServiceImpl>(&raw_transport_)) {
   socket_workers_.reserve(parallelism_);

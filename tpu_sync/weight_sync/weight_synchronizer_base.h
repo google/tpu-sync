@@ -195,6 +195,14 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
     metrics_ = WeightSyncMetrics{};
   }
 
+  void SetPipelineGroupSize(std::optional<size_t> group_size) {
+    pipeline_group_size_override_ = group_size;
+  }
+  std::optional<size_t> pipeline_group_size_override() const {
+    return pipeline_group_size_override_;
+  }
+  size_t GetPipelineGroupSize() const;
+
   absl::Status OnBlocksReceived(const std::vector<int>& block_ids,
                                 uint64_t uuid = 0) override;
 
@@ -208,6 +216,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   absl::Status OnLayerDataReceived(size_t layer_idx,
                                    uint64_t uuid = 0) override;
   absl::Status OnDataReceived(uint64_t uuid = 0) override;
+
+  absl::Status WaitForTransferCompletion(uint64_t uuid);
 
   void ForgetPushProgress(uint64_t uuid) override;
 
@@ -264,6 +274,12 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   mutable absl::Mutex metrics_mu_;
   WeightSyncMetrics metrics_ ABSL_GUARDED_BY(metrics_mu_);
+
+  mutable absl::Mutex completed_transfers_mu_;
+  absl::flat_hash_set<uint64_t> completed_transfers_
+      ABSL_GUARDED_BY(completed_transfers_mu_);
+
+  std::optional<size_t> pipeline_group_size_override_;
 };
 
 }  // namespace weight_sync

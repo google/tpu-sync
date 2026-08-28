@@ -202,43 +202,9 @@ def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
 
   phys_mesh = [logical_mesh_shape[d] for d in major_to_minor]
 
-  host_axis_logical = None
-  for d, size in enumerate(logical_mesh_shape):
-    if size == num_physical_hosts:
-      host_axis_logical = d
-      break
-
-  if host_axis_logical is not None:
-    non_host_axes = [
-        d for d in range(len(logical_mesh_shape)) if d != host_axis_logical
-    ]
-
-    controller_global_indices = []
-    for j in range(num_shards):
-      local_coords = {}
-      temp = j
-      for d in reversed(non_host_axes):
-        size = logical_mesh_shape[d]
-        local_coords[d] = temp % size
-        temp = temp // size
-
-      full_coords = [0] * len(logical_mesh_shape)
-      for d in range(len(logical_mesh_shape)):
-        if d == host_axis_logical:
-          full_coords[d] = replica_id
-        else:
-          full_coords[d] = local_coords.get(d, 0)
-
-      tensor_coords = [full_coords[m_axis] for m_axis in major_to_minor]
-
-      global_idx = 0
-      stride = 1
-      for val, size in zip(reversed(tensor_coords), reversed(phys_mesh)):
-        global_idx += val * stride
-        stride *= size
-      controller_global_indices.append(global_idx)
-  else:
-    # Use physical mesh mapping when host_axis_logical is not found
+  use_spec_mapping = bool(spec is not None and mesh is not None)
+  if use_spec_mapping:
+    # Use physical mesh mapping (matching raiden_controller.py use_spec_mapping)
     devices_per_host = jax.local_device_count()
     controller_global_indices = []
     for j in range(num_shards):
@@ -270,6 +236,41 @@ def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
       global_idx = 0
       stride = 1
       for val, size in zip(reversed(tensor_coords), reversed(tensor_shape)):
+        global_idx += val * stride
+        stride *= size
+      controller_global_indices.append(global_idx)
+  else:
+    # Legacy mapping fallback
+    host_axis_logical = None
+    for d, size in enumerate(logical_mesh_shape):
+      if size == num_physical_hosts:
+        host_axis_logical = d
+        break
+    non_host_axes = [
+        d for d in range(len(logical_mesh_shape)) if d != host_axis_logical
+    ]
+
+    controller_global_indices = []
+    for j in range(num_shards):
+      local_coords = {}
+      temp = j
+      for d in reversed(non_host_axes):
+        size = logical_mesh_shape[d]
+        local_coords[d] = temp % size
+        temp = temp // size
+
+      full_coords = [0] * len(logical_mesh_shape)
+      for d in range(len(logical_mesh_shape)):
+        if d == host_axis_logical:
+          full_coords[d] = replica_id
+        else:
+          full_coords[d] = local_coords.get(d, 0)
+
+      tensor_coords = [full_coords[m_axis] for m_axis in major_to_minor]
+
+      global_idx = 0
+      stride = 1
+      for val, size in zip(reversed(tensor_coords), reversed(phys_mesh)):
         global_idx += val * stride
         stride *= size
       controller_global_indices.append(global_idx)

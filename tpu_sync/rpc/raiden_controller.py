@@ -46,6 +46,17 @@ class _VariableMetadata:
   sharding_spec: list[str] = dataclasses.field(default_factory=list)
 
 
+def _is_variable_spec_identical(
+    src_var: _VariableMetadata, dst_var: _VariableMetadata
+) -> bool:
+  """Returns True if the shape, layout, and mesh_shape match between variables."""
+  return (
+      list(src_var.shape) == list(dst_var.shape)
+      and list(src_var.layout) == list(dst_var.layout)
+      and list(src_var.mesh_shape) == list(dst_var.mesh_shape)
+  )
+
+
 @dataclasses.dataclass
 class _CachedTransferSchedule:
   """Cached pre-computed transfer schedules and metadata for resharding plans."""
@@ -145,12 +156,7 @@ def _get_global_indices(
       host_axis_logical = d
       break
 
-  use_spec_mapping = (
-      host_axis_logical is None
-      and sharding_spec
-      and mesh_axes
-      and physical_mesh_shape
-  )
+  use_spec_mapping = bool(sharding_spec and mesh_axes and physical_mesh_shape)
 
   if use_spec_mapping:
     # Use physical mesh mapping when host_axis_logical is not found
@@ -2253,6 +2259,9 @@ class RaidenController:
                         None,
                     )
                     if dst_var:
+                      is_identical = _is_variable_spec_identical(
+                          src_var, dst_var
+                      )
                       s_slices = computed_slices.get(
                           reference_src_unit, {}
                       ).get(src_var.name, [])
@@ -2273,7 +2282,10 @@ class RaidenController:
                               break
                         if not all_aligned:
                           break
-                      local_skip_tiling[layer_idx] = all_aligned
+                      is_2d_identical = is_identical and len(src_var.shape) >= 2
+                      local_skip_tiling[layer_idx] = (
+                          is_2d_identical or all_aligned
+                      )
 
               # Pre-index source slice holders to deduplicate and load-balance
               # across replicated source shards.

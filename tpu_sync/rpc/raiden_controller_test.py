@@ -1582,6 +1582,147 @@ class GetGlobalIndicesTest(absltest.TestCase):
     )
     self.assertEqual(indices, [(0, 4), (1, 5), (2, 6), (3, 7)])
 
+  def test_multi_host_2d_mesh_with_spec_fsdp_tp(self):
+    unit0 = raiden_controller.RaidenId("trainer", "0", "weights")
+    unit1 = raiden_controller.RaidenId("trainer", "1", "weights")
+    shards = ["10.0.0.1:8000"] * 8
+    indices0 = raiden_controller._get_global_indices(
+        unit0,
+        shards,
+        logical_mesh_shape=[2, 8],
+        layout=[1, 0],
+        num_physical_hosts=2,
+        sharding_spec=["fsdp", "tp"],
+        mesh_axes=["fsdp", "tp"],
+        physical_mesh_shape=[2, 8],
+    )
+    self.assertEqual(indices0, [(i, i) for i in range(8)])
+    indices1 = raiden_controller._get_global_indices(
+        unit1,
+        shards,
+        logical_mesh_shape=[2, 8],
+        layout=[1, 0],
+        num_physical_hosts=2,
+        sharding_spec=["fsdp", "tp"],
+        mesh_axes=["fsdp", "tp"],
+        physical_mesh_shape=[2, 8],
+    )
+    self.assertEqual(indices1, [(i, i + 8) for i in range(8)])
+
+  def test_multi_host_2d_mesh_with_spec_tp_fsdp(self):
+    unit0 = raiden_controller.RaidenId("trainer", "0", "weights")
+    unit1 = raiden_controller.RaidenId("trainer", "1", "weights")
+    shards = ["10.0.0.1:8000"] * 8
+    indices0 = raiden_controller._get_global_indices(
+        unit0,
+        shards,
+        logical_mesh_shape=[8, 2],
+        layout=[0, 1],
+        num_physical_hosts=2,
+        sharding_spec=["tp", "fsdp"],
+        mesh_axes=["fsdp", "tp"],
+        physical_mesh_shape=[2, 8],
+    )
+    self.assertEqual(indices0, [(i, i * 2) for i in range(8)])
+    indices1 = raiden_controller._get_global_indices(
+        unit1,
+        shards,
+        logical_mesh_shape=[8, 2],
+        layout=[0, 1],
+        num_physical_hosts=2,
+        sharding_spec=["tp", "fsdp"],
+        mesh_axes=["fsdp", "tp"],
+        physical_mesh_shape=[2, 8],
+    )
+    self.assertEqual(indices1, [(i, i * 2 + 1) for i in range(8)])
+
+  def test_multi_host_2d_mesh_1d_tensor_with_spec(self):
+    unit0 = raiden_controller.RaidenId("trainer", "0", "weights")
+    unit1 = raiden_controller.RaidenId("trainer", "1", "weights")
+    shards = ["10.0.0.1:8000"] * 8
+    indices0 = raiden_controller._get_global_indices(
+        unit0,
+        shards,
+        logical_mesh_shape=[2],
+        layout=[0],
+        num_physical_hosts=2,
+        sharding_spec=["fsdp"],
+        mesh_axes=["fsdp", "tp"],
+        physical_mesh_shape=[2, 8],
+    )
+    self.assertEqual(indices0, [(i, 0) for i in range(8)])
+    indices1 = raiden_controller._get_global_indices(
+        unit1,
+        shards,
+        logical_mesh_shape=[2],
+        layout=[0],
+        num_physical_hosts=2,
+        sharding_spec=["fsdp"],
+        mesh_axes=["fsdp", "tp"],
+        physical_mesh_shape=[2, 8],
+    )
+    self.assertEqual(indices1, [(i, 1) for i in range(8)])
+
+  def test_multi_host_3d_mesh_data_parallelism_with_spec(self):
+    unit0 = raiden_controller.RaidenId("sampler", "0", "weights")
+    unit1 = raiden_controller.RaidenId("sampler", "1", "weights")
+    shards = ["10.0.0.1:8000"] * 8
+    indices0 = raiden_controller._get_global_indices(
+        unit0,
+        shards,
+        logical_mesh_shape=[2, 4],
+        layout=[1, 0],
+        num_physical_hosts=2,
+        sharding_spec=["fsdp", "tp"],
+        mesh_axes=["data", "fsdp", "tp"],
+        physical_mesh_shape=[2, 2, 4],
+    )
+    self.assertEqual(indices0, [(i, i) for i in range(8)])
+    indices1 = raiden_controller._get_global_indices(
+        unit1,
+        shards,
+        logical_mesh_shape=[2, 4],
+        layout=[1, 0],
+        num_physical_hosts=2,
+        sharding_spec=["fsdp", "tp"],
+        mesh_axes=["data", "fsdp", "tp"],
+        physical_mesh_shape=[2, 2, 4],
+    )
+    self.assertEqual(indices1, [(i, i) for i in range(8)])
+
+  def test_multi_host_3d_mesh_1d_tensor_with_spec(self):
+    unit0 = raiden_controller.RaidenId("sampler", "0", "weights")
+    unit1 = raiden_controller.RaidenId("sampler", "1", "weights")
+    shards = ["10.0.0.1:8000"] * 8
+    indices0 = raiden_controller._get_global_indices(
+        unit0,
+        shards,
+        logical_mesh_shape=[2],
+        layout=[0],
+        num_physical_hosts=2,
+        sharding_spec=["fsdp"],
+        mesh_axes=["data", "fsdp", "tp"],
+        physical_mesh_shape=[2, 2, 4],
+    )
+    self.assertEqual(
+        indices0,
+        [(0, 0), (1, 0), (2, 0), (3, 0), (4, 1), (5, 1), (6, 1), (7, 1)],
+    )
+    indices1 = raiden_controller._get_global_indices(
+        unit1,
+        shards,
+        logical_mesh_shape=[2],
+        layout=[0],
+        num_physical_hosts=2,
+        sharding_spec=["fsdp"],
+        mesh_axes=["data", "fsdp", "tp"],
+        physical_mesh_shape=[2, 2, 4],
+    )
+    self.assertEqual(
+        indices1,
+        [(0, 0), (1, 0), (2, 0), (3, 0), (4, 1), (5, 1), (6, 1), (7, 1)],
+    )
+
   def test_replicated_variable(self):
     unit = raiden_controller.RaidenId("trainer", "1", "weights")
     shards = ["10.0.0.2:8000"] * 4
@@ -2313,6 +2454,182 @@ class GetGlobalIndicesTest(absltest.TestCase):
       self.assertEqual(entry[4], 2688 * 2)  # size in bytes
       self.assertEqual(entry[5], 0)  # src_block_id
       self.assertEqual(entry[6], 0)  # dst_block_id
+
+  def test_skip_tiling_2d_vs_1d_behavior(self):
+    """Verifies that 2D layers skip tiling while 1D layers use CPU tiling."""
+    client = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=10000,
+        worker_rpc_client=client,
+    )
+
+    src_units = [
+        raiden_controller.RaidenId("trainer", "0", "weights"),
+        raiden_controller.RaidenId("trainer", "1", "weights"),
+    ]
+    dst_units = [
+        raiden_controller.RaidenId("sampler", "0", "weights"),
+    ]
+
+    vars_list = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0.input_layernorm",
+            shape=[5376],
+            mesh_shape=[2],
+            layout=[0],
+            item_size=2,
+            layer_idx=0,
+            sharding_spec=["fsdp"],
+        ),
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0.attn.q_proj",
+            shape=[5376, 4096],
+            mesh_shape=[2, 8],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=1,
+            sharding_spec=["fsdp", "tp"],
+        ),
+    ]
+
+    # Register Source: (fsdp=2, tp=8) across 2 hosts
+    for r in range(2):
+      shards_src = [f"10.0.0.{r}:{s}" for s in range(8)]
+      controller.register_work_unit(
+          src_units[r],
+          shards_src,
+          f"10.0.0.{r}:10000",
+          mesh_shape=[2, 8],
+          variables=vars_list,
+          mesh_axes=["fsdp", "tp"],
+      )
+
+    # Register Destination: (fsdp=2, tp=4) on 1 host
+    shards_dst = [f"10.0.1.0:{s}" for s in range(8)]
+    dst_vars = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0.input_layernorm",
+            shape=[5376],
+            mesh_shape=[2],
+            layout=[0],
+            item_size=2,
+            layer_idx=0,
+            sharding_spec=["fsdp"],
+        ),
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0.attn.q_proj",
+            shape=[5376, 4096],
+            mesh_shape=[2, 4],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=1,
+            sharding_spec=["fsdp", "tp"],
+        ),
+    ]
+    controller.register_work_unit(
+        dst_units[0],
+        shards_dst,
+        "10.0.1.0:10000",
+        mesh_shape=[2, 4],
+        variables=dst_vars,
+        mesh_axes=["fsdp", "tp"],
+    )
+
+    fut = controller.start_transfer(
+        src_units=src_units,
+        dst_units=dst_units,
+        use_block_chunks=True,
+        uuid=2002,
+        req_id="test_req_skip_tiling",
+    )
+    asyncio.run(fut.wait())
+
+    plans_sent = {target: plan for target, plan in client.calls}
+    for s_unit in src_units:
+      plan = plans_sent[s_unit]
+      # Layer 0 (1D Layernorm) MUST NOT skip tiling (skip_tiling=False)
+      self.assertFalse(plan.skip_tiling.get(0, False))
+      # Layer 1 (2D Q_Proj) MUST skip tiling (skip_tiling=True)
+      self.assertTrue(plan.skip_tiling.get(1, False))
+
+  def test_skip_tiling_identical_reference_case(self):
+    """Verifies reference case (identical topology): 2D weights skip tiling, 1D do not."""
+    client = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=10000,
+        worker_rpc_client=client,
+    )
+
+    src_units = [
+        raiden_controller.RaidenId("trainer", "0", "weights"),
+        raiden_controller.RaidenId("trainer", "1", "weights"),
+    ]
+    dst_units = [
+        raiden_controller.RaidenId("sampler", "0", "weights"),
+        raiden_controller.RaidenId("sampler", "1", "weights"),
+    ]
+
+    vars_list = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0.input_layernorm",
+            shape=[5376],
+            mesh_shape=[2],
+            layout=[0],
+            item_size=2,
+            layer_idx=0,
+            sharding_spec=["fsdp"],
+        ),
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0.attn.q_proj",
+            shape=[5376, 4096],
+            mesh_shape=[2, 8],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=1,
+            sharding_spec=["fsdp", "tp"],
+        ),
+    ]
+
+    # Register Source: (fsdp=2, tp=8) across 2 hosts
+    for r in range(2):
+      shards_src = [f"10.0.0.{r}:{s}" for s in range(8)]
+      controller.register_work_unit(
+          src_units[r],
+          shards_src,
+          f"10.0.0.{r}:10000",
+          mesh_shape=[2, 8],
+          variables=vars_list,
+          mesh_axes=["fsdp", "tp"],
+      )
+
+    # Register Destination with identical topology and variables
+    for r in range(2):
+      shards_dst = [f"10.0.1.{r}:{s}" for s in range(8)]
+      controller.register_work_unit(
+          dst_units[r],
+          shards_dst,
+          f"10.0.1.{r}:10000",
+          mesh_shape=[2, 8],
+          variables=vars_list,
+          mesh_axes=["fsdp", "tp"],
+      )
+
+    fut = controller.start_transfer(
+        src_units=src_units,
+        dst_units=dst_units,
+        use_block_chunks=True,
+        uuid=2003,
+        req_id="test_req_identical_ref_case",
+    )
+    asyncio.run(fut.wait())
+
+    plans_sent = {target: plan for target, plan in client.calls}
+    for s_unit in src_units:
+      plan = plans_sent[s_unit]
+      # 1D Layernorm has rank=1: must NOT skip tiling
+      self.assertFalse(plan.skip_tiling.get(0, False))
+      # 2D Q_Proj is identical: MUST skip tiling (zero copy)
+      self.assertTrue(plan.skip_tiling.get(1, False))
 
 
 if __name__ == "__main__":

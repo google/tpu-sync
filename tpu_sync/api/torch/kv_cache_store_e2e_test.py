@@ -168,13 +168,206 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
   def tearDown(self):
     super().tearDown()
 
-  def _run_e2e_save_and_load(self, use_slices: bool = False):
+  def _wait_for_save(
+      self, store: kv_cache_store.KVCacheStore, timeout_s: float = 5.0
+  ) -> list[bytes]:
+    """Polls until save finishes, asserting no failure or unexpected remote states."""
+    start = time.time()
+    while time.time() - start < timeout_s:
+      save_done, save_failed, _, save_existing, save_unregistered = (
+          store.poll_save_status()
+      )
+      if save_failed:
+        raise RuntimeError(f"Async Save failed: {save_failed}")
+      self.assertEmpty(save_existing)
+      self.assertEmpty(save_unregistered)
+      if save_done:
+        return save_done
+      time.sleep(0.01)
+    raise TimeoutError("Timed out waiting for save to complete")
+
+  def _wait_for_save_verdict(
+      self, store: kv_cache_store.KVCacheStore, timeout_s: float = 5.0
+  ) -> tuple[list[bytes], list[bytes], list[bytes], list[bytes]]:
+    """Polls save status until settled, returning (done, failed, existing, unregistered)."""
+    start = time.time()
+    while time.time() - start < timeout_s:
+      done, failed, pending, existing, unregistered = store.poll_save_status()
+      if done or failed:
+        return done, failed, existing, unregistered
+      if not pending:
+        raise RuntimeError("Save vanished without a verdict")
+      time.sleep(0.01)
+    raise TimeoutError(
+        f"Timed out waiting for save to settle within {timeout_s}s"
+    )
+
+  def _wait_for_load(
+      self, store: kv_cache_store.KVCacheStore, timeout_s: float = 5.0
+  ) -> list[bytes]:
+    """Polls until load finishes, asserting no failures."""
+    start = time.time()
+    while time.time() - start < timeout_s:
+      load_done, load_failed, _ = store.poll_load_status()
+      if load_failed:
+        raise RuntimeError(f"Async Load failed: {load_failed}")
+      if load_done:
+        return load_done
+      time.sleep(0.01)
+    raise TimeoutError("Timed out waiting for load to complete")
+
+  def _wait_for_remote_read(
+      self,
+      store: kv_cache_store.KVCacheStore,
+      expected_count: int = 2,
+      timeout_s: float = 5.0,
+  ) -> list[bytes]:
+    """Polls until remote read finishes, asserting no failures."""
+    start = time.time()
+    while time.time() - start < timeout_s:
+      read_done, read_failed, _ = store.poll_remote_read_status()
+      if read_failed:
+        raise RuntimeError(f"Job B ReadRemote failed: {read_failed}")
+      if len(read_done) == expected_count:
+        return read_done
+      time.sleep(0.01)
+    raise TimeoutError("Timed out waiting for remote read to complete")
+
+  def _wait_for_remote_read_failure(
+      self, store: kv_cache_store.KVCacheStore, timeout_s: float = 5.0
+  ) -> list[bytes]:
+    """Polls until remote read reports a failure."""
+    start = time.time()
+    while time.time() - start < timeout_s:
+      _, read_failed, _ = store.poll_remote_read_status()
+      if read_failed:
+        return read_failed
+      time.sleep(0.01)
+    raise TimeoutError("Timed out waiting for remote read failure")
+
+  def _create_node(
+      self,
+      tag: str,
+      job_name: str,
+      tpu_cache: torch.Tensor,
+      node_id: int = 0,
+      enable_global_registry: bool = False,
+      num_blocks: int = 4,
+      expected_worker_count: int = 0,
+      kv_pool_group: str = "",
+  ) -> tuple[
+      kv_cache_store.KVCacheStore,
+      kv_cache_manager.KVCacheManager,
+      kv_cache_store.RaidenId,
+  ]:
+    """Creates and binds a paired KVCacheStore and KVCacheManager."""
+    controller_port = find_free_port()
+    worker_port = find_free_port()
+    block_elements = 128 * 8 * 8 * 128
+    shard_size_bytes = (block_elements * 4) // self.num_devices
+
+    rid = kv_cache_store.RaidenId(
+        f"{tag}_{job_name}", "0", f"{tag}_cache_{job_name}", 0
+    )
+
+    if expected_worker_count > 0:
+      built = {}
+      thread_error = None
+
+      def build_manager():
+        nonlocal thread_error
+        try:
+          built["manager"] = kv_cache_manager.KVCacheManager(
+              kv_caches=[[tpu_cache]],
+              local_control_port=0,
+              max_blocks=num_blocks,
+              num_slots=2,
+              unsafe_skip_buffer_lock=self.skip_lock,
+              raiden_worker_port=worker_port,
+              raiden_controller_address=f"localhost:{controller_port}",
+              worker_id=f"{tag}_worker_{job_name}",
+              host_blocks_to_allocate=num_blocks,
+              node_id=node_id,
+          )
+        except Exception as e:
+          thread_error = e
+
+      worker_thread = threading.Thread(target=build_manager)
+      worker_thread.start()
+      store = kv_cache_store.KVCacheStore(
+          capacity=num_blocks,
+          global_registry_address=(
+              f"localhost:{_registry_port}" if enable_global_registry else ""
+          ),
+          raiden_id=rid,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=controller_port,
+          expected_worker_count=expected_worker_count,
+          kv_pool_group=kv_pool_group,
+      )
+      worker_thread.join(timeout=30)
+      if worker_thread.is_alive():
+        raise RuntimeError(
+            "worker_thread timed out initializing KVCacheManager"
+        )
+      if thread_error is not None:
+        raise RuntimeError(
+            f"worker_thread failed: {thread_error}"
+        ) from thread_error
+      manager = built["manager"]
+    else:
+      store = kv_cache_store.KVCacheStore(
+          capacity=num_blocks,
+          global_registry_address=(
+              f"localhost:{_registry_port}" if enable_global_registry else ""
+          ),
+          raiden_id=rid,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=controller_port,
+          kv_pool_group=kv_pool_group,
+      )
+      manager = kv_cache_manager.KVCacheManager(
+          kv_caches=[[tpu_cache]],
+          local_control_port=0,
+          max_blocks=num_blocks,
+          num_slots=2,
+          unsafe_skip_buffer_lock=self.skip_lock,
+          raiden_worker_port=worker_port,
+          raiden_controller_address=f"localhost:{controller_port}",
+          worker_id=f"{tag}_worker_{job_name}",
+          host_blocks_to_allocate=num_blocks,
+          node_id=node_id,
+      )
+    return store, manager, rid
+
+  def _insert_hbm_blocks(
+      self,
+      store: kv_cache_store.KVCacheStore,
+      rid: kv_cache_store.RaidenId,
+      hashes: list[bytes],
+      device_blocks: list[int],
+  ):
+    """Registers HBM block descriptors in the store."""
+    slices = [
+        kv_cache_store.RaidenBlockId(
+            rid,
+            host_block_id=-1,
+            device_block_id=d,
+            status=kv_cache_store.BlockStatus.HBM,
+        )
+        for d in device_blocks
+    ]
+    self.assertTrue(store.insert(hashes, slices, on_host=False))
+
+  def _run_e2e_save_and_load(self, use_slices: bool):
     num_blocks = 4
     shape = (num_blocks, 128, 8, 8, 128)
 
     # 1. Generate sequential distinct cache data
-    # np.arange creates unique values for each element, ensuring different
-    # values for different shards
     host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
     tpu_cache = torch.tensor(host_data, device=self.device)
 
@@ -183,154 +376,66 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     expected_ref[2] = host_data[0]
     expected_ref[3] = host_data[1]
 
-    # 2. Get free port for controller
-    controller_port = find_free_port()
-
-    # Calculate shard size in bytes
-    block_elements = 128 * 8 * 8 * 128
-    shard_size_bytes = (block_elements * 4) // self.num_devices
-
-    # 3. Create KVCacheStore (Controller)
-    print("=== [Step 3/9] Creating KVCacheStore (Controller) ===")
+    # 2. Setup Node (Store & Manager)
     tag = f"save_{uuid.uuid4().hex[:8]}"
-    rid = kv_cache_store.RaidenId(f"{tag}_job", "0", f"{tag}_cache", 0)
-    store = kv_cache_store.KVCacheStore(
-        capacity=num_blocks,
-        raiden_id=rid,
-        num_shards=self.num_devices,
-        shard_size_bytes=shard_size_bytes,
-        store_server_ip="localhost",
-        raiden_controller_port=controller_port,
+    store, manager, rid = self._create_node(
+        tag=tag,
+        job_name="job",
+        tpu_cache=tpu_cache,
+        enable_global_registry=False,
     )
 
-    # 4. Create KVCacheManager (Worker)
-    print("=== [Step 4/9] Creating KVCacheManager (Worker) ===")
-    manager = kv_cache_manager.KVCacheManager(
-        kv_caches=[tpu_cache],
-        local_control_port=0,
-        max_blocks=num_blocks,
-        num_slots=2,
-        unsafe_skip_buffer_lock=self.skip_lock,
-        raiden_worker_port=0,
-        # Must match the address the store's controller binds
-        # ("localhost:{controller_port}", see the KVCacheStore above); using
-        # get_local_ip() here dials a LAN IP the controller is not listening on,
-        # so RegisterWorker never lands and Save fails with "No registered
-        # workers available for TransferBuffers".
-        raiden_controller_address=f"localhost:{controller_port}",
-        worker_id=f"{tag}_worker_0",
-    )
-
-    # 5. Insert HBM blocks to KVCacheStore
-    print("=== [Step 5/9] Inserting HBM blocks into KVCacheStore ===")
+    # 3. Insert initial HBM blocks to KVCacheStore
     hashes = [b"hash_0", b"hash_1"]
-    slices = [
-        kv_cache_store.RaidenBlockId(
-            rid,
-            host_block_id=-1,
-            device_block_id=0,
-            status=kv_cache_store.BlockStatus.HBM,
-        ),
-        kv_cache_store.RaidenBlockId(
-            rid,
-            host_block_id=-1,
-            device_block_id=1,
-            status=kv_cache_store.BlockStatus.HBM,
-        ),
-    ]
-    self.assertTrue(store.insert(hashes, slices, on_host=False))
+    self._insert_hbm_blocks(store, rid, hashes, device_blocks=[0, 1])
 
-    # Verify status in store is HBM
+    # Verify initial status in store is HBM
     lookup_res = store.lookup(hashes, pin_found=False)
-    self.assertLen(lookup_res, 2)
-    self.assertEqual(lookup_res[0][1].status, kv_cache_store.BlockStatus.HBM)
-    self.assertEqual(lookup_res[0][1].device_block_id, 0)
-    self.assertEqual(lookup_res[1][1].status, kv_cache_store.BlockStatus.HBM)
-    self.assertEqual(lookup_res[1][1].device_block_id, 1)
+    self.assertEqual([h for h, _ in lookup_res], hashes)
+    self.assertEqual([b.device_block_id for _, b in lookup_res], [0, 1])
+    for _, b in lookup_res:
+      self.assertEqual(b.status, kv_cache_store.BlockStatus.HBM)
 
-    # 6. Save HBM blocks to host memory
-    print("=== [Step 6/9] Saving HBM blocks to Host DRAM (store.save) ===")
-
-    def get_slice_e2e(x):
-      return x[0, 0, 0, 0, 0:16].cpu().numpy()
-
-    print(f"DEBUG: test_e2e tpu_cache before Save: {get_slice_e2e(tpu_cache)}")
-
+    # 4. Save HBM blocks to Host DRAM
     store.save(hashes)
+    self._wait_for_save(store)
 
-    # Wait for save completion
-    done = False
-    while not done:
-      save_done, save_failed, _, save_existing, save_unregistered = (
-          store.poll_save_status()
-      )
-      if save_failed:
-        raise RuntimeError(f"Async Save failed: {save_failed}")
-      # A local save never produces the remote-only outcomes.
-      self.assertEmpty(save_existing)
-      self.assertEmpty(save_unregistered)
-      if save_done:
-        done = True
-      if not done:
-        time.sleep(0.01)
-
-    # Verify status in store is updated to HOST_AND_HBM
+    # Verify status in store is updated to HOST_AND_HBM with assigned host_block_ids
     lookup_res = store.lookup(hashes, pin_found=False)
-    self.assertLen(lookup_res, 2)
-    self.assertEqual(
-        lookup_res[0][1].status, kv_cache_store.BlockStatus.HOST_AND_HBM
-    )
-    self.assertEqual(lookup_res[0][1].host_block_id, 0)
-    self.assertEqual(
-        lookup_res[1][1].status, kv_cache_store.BlockStatus.HOST_AND_HBM
-    )
-    self.assertEqual(lookup_res[1][1].host_block_id, 1)
+    self.assertEqual([h for h, _ in lookup_res], hashes)
+    self.assertEqual([b.host_block_id for _, b in lookup_res], [0, 1])
+    for _, b in lookup_res:
+      self.assertEqual(b.status, kv_cache_store.BlockStatus.HOST_AND_HBM)
 
-    # 7. Load from host DRAM into device HBM blocks [2, 3]
-    print("=== [Step 7/8] Loading checkpoint from Host DRAM into TPU HBM blocks [2, 3] (store.load) ===")
+    # 5. Load from Host DRAM into TPU HBM blocks [2, 3]
     if use_slices:
-      # lookup() pins the returned entries; load(..., slices=...) consumes the pin on success.
       load_slices = [entry for _, entry in store.lookup(hashes)]
-      self.assertLen(load_slices, 2)
-      for entry in load_slices:
-        self.assertEqual(entry.status, kv_cache_store.BlockStatus.HOST_AND_HBM)
+      self.assertEqual(
+          [s.status for s in load_slices],
+          [kv_cache_store.BlockStatus.HOST_AND_HBM] * 2,
+      )
       self.assertTrue(store.load(hashes, [2, 3], slices=load_slices))
     else:
-      # lookup() pins the returned entries; load() consumes the pin on success.
       self.assertLen(store.lookup(hashes), 2)
       self.assertTrue(store.load(hashes, [2, 3]))
 
-    # Wait for load completion
-    done = False
-    while not done:
-      load_done, load_failed, _ = store.poll_load_status()
-      if load_failed:
-        raise RuntimeError(f"Async Load failed: {load_failed}")
-      if load_done:
-        done = True
-      if not done:
-        time.sleep(0.01)
+    self._wait_for_load(store)
 
+    # 6. Verify restored TPU device memory matches expected array [a, b, a, b]
     try:
       torch.tpu.synchronize()
     except (AttributeError, RuntimeError):
       pass
-    # 8. Verify device memory blocks [2, 3] match saved blocks [0, 1]
-    print("=== [Step 8/8] Verifying restored TPU memory matches expected array [a, b, a, b] ===")
+
     np.testing.assert_array_equal(tpu_cache.cpu().numpy(), expected_ref)
-    print("=== [SUCCESS] E2E Save/Load [0, 1] -> [2, 3] roundtrip verified on physical TPU! ===")
     del manager, store
 
-  def test_e2e_save_and_load(self):
-    self._run_e2e_save_and_load()
-
-  # The same save/load/compare pipeline, driven through the slices form of
-  # load. Running it as a variant rather than a separate test is the point:
-  # `slices` is a shortcut past the store's own lookup, not a different
-  # transfer, so the bytes that land in blocks [2, 3] must be the ones the
-  # no-slices path produces.
-  def test_e2e_save_and_load_with_slices(self):
-    self._run_e2e_save_and_load(use_slices=True)
+  @parameterized.named_parameters(
+      ("direct", False),
+      ("with_slices", True),
+  )
+  def test_e2e_save_and_load(self, use_slices: bool):
+    self._run_e2e_save_and_load(use_slices=use_slices)
 
   def _run_remote_read_e2e_test(
       self,
@@ -341,6 +446,9 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
   ):
     num_blocks = 4
     shape = (num_blocks, 128, 8, 8, 128)
+    src_device_blocks = [0, 2]
+    dst_device_blocks = [1, 3]
+    sentinel_blocks = [0, 2]
 
     # 1. Generate sequential distinct cache data for Job A
     host_data_a = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
@@ -350,112 +458,42 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     zeros_b = np.zeros(shape, dtype=np.float32)
     tpu_cache_b = torch.tensor(zeros_b, device=self.device)
 
-    # Calculate shard size in bytes
-    block_elements = 128 * 8 * 8 * 128
-    shard_size_bytes = (block_elements * 4) // self.num_devices
-
-    controller_port_a = find_free_port()
-    worker_port_a = find_free_port()
-    worker_port_b = find_free_port()
-
-    # 2. Create Job A's KVCacheStore & KVCacheManager
+    # 2. Create Job A & Job B nodes
     tag = f"read_{uuid.uuid4().hex[:8]}"
-    rid_a = kv_cache_store.RaidenId(f"{tag}_job_a", "0", f"{tag}_cache_a", 0)
-    store_a = kv_cache_store.KVCacheStore(
-        capacity=4,
-        global_registry_address=f"localhost:{_registry_port}",
-        raiden_id=rid_a,
-        num_shards=self.num_devices,
-        shard_size_bytes=shard_size_bytes,
-        store_server_ip="localhost",
-        raiden_controller_port=controller_port_a,
-    )
-    manager_a = kv_cache_manager.KVCacheManager(
-        kv_caches=[[tpu_cache_a]],
-        local_control_port=0,
-        max_blocks=num_blocks,
-        num_slots=2,
-        unsafe_skip_buffer_lock=self.skip_lock,
-        raiden_worker_port=worker_port_a,
-        raiden_controller_address=f"localhost:{controller_port_a}",
-        worker_id=f"{tag}_worker_a",
-        host_blocks_to_allocate=4,
+    store_a, manager_a, rid_a = self._create_node(
+        tag=tag,
+        job_name="job_a",
+        tpu_cache=tpu_cache_a,
         node_id=producer_node_id,
+        enable_global_registry=True,
     )
-
-    controller_port_b = find_free_port()
-    # 3. Create Job B's KVCacheStore & KVCacheManager
-    rid_b = kv_cache_store.RaidenId(f"{tag}_job_b", "0", f"{tag}_cache_b", 0)
-    store_b = kv_cache_store.KVCacheStore(
-        capacity=4,
-        global_registry_address=f"localhost:{_registry_port}",
-        raiden_id=rid_b,
-        num_shards=self.num_devices,
-        shard_size_bytes=shard_size_bytes,
-        store_server_ip="localhost",
-        raiden_controller_port=controller_port_b,
-    )
-    manager_b = kv_cache_manager.KVCacheManager(
-        kv_caches=[[tpu_cache_b]],
-        local_control_port=0,
-        max_blocks=num_blocks,
-        num_slots=2,
-        unsafe_skip_buffer_lock=self.skip_lock,
-        raiden_worker_port=worker_port_b,
-        raiden_controller_address=f"localhost:{controller_port_b}",
-        worker_id=f"{tag}_worker_b",
-        host_blocks_to_allocate=4,
+    store_b, manager_b, _ = self._create_node(
+        tag=tag,
+        job_name="job_b",
+        tpu_cache=tpu_cache_b,
         node_id=consumer_node_id,
+        enable_global_registry=True,
     )
 
     try:
       # Wait for listeners to start
       time.sleep(1)
 
-      # Raw non-UTF-8 bytes on purpose: production hashes are binary
-      # digests, and the registry round-trip must survive them (the proto
-      # hash fields are `bytes`; as `string` they were UTF-8-verified on
-      # the wire and cross-store sharing silently found nothing).
       hashes = [
           b"\x93\xff\x00" + f"{tag}_h0".encode(),
           b"\x93\xff\x00" + f"{tag}_h1".encode(),
       ]
 
-      # 4. Job A inserts HBM status and calls Save
-      slices_a = [
-          kv_cache_store.RaidenBlockId(
-              rid_a,
-              host_block_id=-1,
-              device_block_id=0,
-              status=kv_cache_store.BlockStatus.HBM,
-          ),
-          kv_cache_store.RaidenBlockId(
-              rid_a,
-              host_block_id=-1,
-              device_block_id=1,
-              status=kv_cache_store.BlockStatus.HBM,
-          ),
-      ]
-      self.assertTrue(
-          store_a.insert(hashes, slices_a, on_host=False)
+      # 3. Job A inserts HBM status and calls Save
+      self._insert_hbm_blocks(
+          store_a, rid_a, hashes, device_blocks=src_device_blocks
       )
+      self.assertTrue(store_a.save(hashes))
+      done = self._wait_for_save(store_a)
+      self.assertCountEqual(done, hashes)
 
-      store_a.save(hashes)
-
-      # Wait for save completion
-      done = False
-      while not done:
-        save_done, save_failed, _, _, _ = store_a.poll_save_status()
-        if save_failed:
-          raise RuntimeError(f"Job A Async Save failed: {save_failed}")
-        if save_done:
-          done = True
-        if not done:
-          time.sleep(0.01)
-
-      # 5. Job B calls Lookup (enable_global=True)
+      # 4. Job B calls Lookup (enable_global=True)
       time.sleep(0.5)
-      # Registry-resolved hits are REMOTE and never pinned locally.
       lookup_res_b = store_b.lookup(
           hashes, enable_global=True, pin_found=False
       )
@@ -483,170 +521,212 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
           lookup_res_b[1][1].host_block_id, lookup_res_a[1][1].host_block_id
       )
 
-      # 6. Job B pulls straight from Job A into its own device blocks. The
-      # source coordinates come from the lookup answer, so nothing needs to be
-      # inserted into Job B's cache first. Two transports cover the same
-      # contract: read_remote, and the slices form of load() -- the only
-      # sanctioned peer path in load.
+      # 5. Job B pulls straight from Job A into its own device blocks.
       slices_b = [lookup_res_b[0][1], lookup_res_b[1][1]]
       if use_slices:
-        # lookup only synthesised the REMOTE answer; no pin exists and the
-        # peer load neither needs nor consumes one.
-        self.assertTrue(store_b.load(hashes, [0, 1], slices=slices_b))
-        done = False
-        while not done:
-          load_done, load_failed, _ = store_b.poll_load_status()
-          if load_failed:
-            raise RuntimeError(f"Job B peer load failed: {load_failed}")
-          if len(load_done) == 2:
-            done = True
-          if not done:
-            time.sleep(0.01)
+        self.assertTrue(
+            store_b.load(hashes, dst_device_blocks, slices=slices_b)
+        )
+        self._wait_for_load(store_b)
       else:
-        self.assertTrue(store_b.read_remote(hashes, slices_b, [0, 1]))
+        self.assertTrue(
+            store_b.read_remote(hashes, slices_b, dst_device_blocks)
+        )
 
         if not expect_read_success:
-          failed = False
-          for _ in range(500):
-            _, read_failed, _ = store_b.poll_remote_read_status()
-            if read_failed:
-              self.assertEqual(set(read_failed), set(hashes))
-              failed = True
-              break
-            time.sleep(0.01)
-          self.assertTrue(
-              failed,
-              "expected read_remote to fail on producer/consumer node_id mismatch",
-          )
+          failed = self._wait_for_remote_read_failure(store_b)
+          self.assertEqual(set(failed), set(hashes))
           return
 
-        # Wait for ReadRemote completion
-        done = False
-        while not done:
-          read_done, read_failed, _ = store_b.poll_remote_read_status()
-          if read_failed:
-            raise RuntimeError(f"Job B ReadRemote failed: {read_failed}")
-          if len(read_done) == 2:
-            done = True
-          if not done:
-            time.sleep(0.01)
+        self._wait_for_remote_read(store_b)
 
-      # 8. The bytes are already in HBM -- there is no second Load step, and
-      # no local record of it either. Job B's cache is still a miss for these
-      # hashes: the bytes live only in the device blocks it named.
+      # 8. The bytes are already in HBM
       self.assertEmpty(store_b.lookup(hashes))
-      # No host copy was left behind either, so a later LOCAL load of the
-      # same hashes has nothing to read from and is refused. Pulling is not a
-      # way to warm the local cache; a caller that wants a host copy must
-      # save() what it pulled.
       self.assertFalse(
-          store_b.load(hashes, [2, 3]),
+          store_b.load(hashes, sentinel_blocks),
           "the pull must not leave a host copy behind",
       )
 
-      # 9. Verify byte-exact match on Job B TPU device, and that the pull
-      # touched ONLY the destination blocks: 2 and 3 stay as created.
+      # 9. Verify byte-exact match on Job B TPU device, sentinels stay as created.
       try:
         torch.tpu.synchronize()
       except (AttributeError, RuntimeError):
         pass
       actual_b = tpu_cache_b.cpu().numpy()
-      np.testing.assert_array_equal(actual_b[0:2], host_data_a[0:2])
-      np.testing.assert_array_equal(
-          actual_b[2:4],
-          zeros_b[2:4],
-          err_msg="sentinel device blocks were clobbered by the pull",
-      )
+      for src_blk, dst_blk in zip(src_device_blocks, dst_device_blocks):
+        np.testing.assert_array_equal(
+            actual_b[dst_blk],
+            host_data_a[src_blk],
+            err_msg=(
+                f"device block {dst_blk} does not match source block {src_blk}"
+            ),
+        )
+      for blk in sentinel_blocks:
+        np.testing.assert_array_equal(
+            actual_b[blk],
+            zeros_b[blk],
+            err_msg=f"sentinel device block {blk} was clobbered by the pull",
+        )
     finally:
       del manager_a, manager_b, store_a, store_b
 
-  def test_remote_read_e2e_with_slices(self):
-    # The same pull, through load(slices=REMOTE) -- the only peer path in
-    # load(). Before this driver existed the use_slices branch was dead and
-    # the torch suite had no live coverage of the peer load at all.
-    self._run_remote_read_e2e_test(use_slices=True)
+  @parameterized.named_parameters(
+      ("direct", False, 0, 0, True),
+      ("with_slices", True, 0, 0, True),
+      ("matching_node_id", False, 7, 7, True),
+      ("mismatched_node_id_fails", False, 1, 2, False),
+  )
+  def test_remote_read_e2e(
+      self,
+      use_slices: bool,
+      producer_node_id: int,
+      consumer_node_id: int,
+      expect_read_success: bool,
+  ):
+    self._run_remote_read_e2e_test(
+        producer_node_id=producer_node_id,
+        consumer_node_id=consumer_node_id,
+        expect_read_success=expect_read_success,
+        use_slices=use_slices,
+    )
+
+  def _run_remote_read_to_hbm_test(self, use_slices: bool = False):
+    """Direct peer-to-HBM load bypassing local host DRAM allocation."""
+    num_blocks = 4
+    shape = (num_blocks, 128, 8, 8, 128)
+    src_device_blocks = [0, 2]
+    dst_device_blocks = [1, 3]
+    sentinel_blocks = [0, 2]
+
+    # Generate random payloads
+    rng_a = np.random.default_rng(20260728)
+    host_data_a = rng_a.standard_normal(shape).astype(np.float32)
+    tpu_cache_a = torch.tensor(host_data_a, device=self.device)
+
+    # Job B starts with distinct random sentinel data
+    rng_b = np.random.default_rng(31415926)
+    host_data_b = rng_b.standard_normal(shape).astype(np.float32)
+    tpu_cache_b = torch.tensor(host_data_b, device=self.device)
+
+    tag = f"read_hbm_{uuid.uuid4().hex[:8]}"
+    store_a, manager_a, rid_a = self._create_node(
+        tag=tag,
+        job_name="job_a",
+        tpu_cache=tpu_cache_a,
+        enable_global_registry=True,
+    )
+    store_b, manager_b, _ = self._create_node(
+        tag=tag,
+        job_name="job_b",
+        tpu_cache=tpu_cache_b,
+        enable_global_registry=True,
+    )
+
+    try:
+      time.sleep(1)
+      hashes = [f"{tag}_h0".encode(), f"{tag}_h1".encode()]
+
+      # Job A saves to Host DRAM so blocks are leasable
+      self._insert_hbm_blocks(
+          store_a, rid_a, hashes, device_blocks=src_device_blocks
+      )
+      self.assertTrue(store_a.save(hashes))
+      done = self._wait_for_save(store_a)
+      self.assertCountEqual(done, hashes)
+
+      # Job B discovers blocks as REMOTE
+      time.sleep(0.5)
+      lookup_b = store_b.lookup(hashes, enable_global=True, pin_found=False)
+      self.assertLen(lookup_b, len(hashes))
+      for _, blk in lookup_b:
+        self.assertEqual(blk.status, kv_cache_store.BlockStatus.REMOTE)
+        self.assertEqual(blk.raiden_id, rid_a)
+
+      slices_b = [b for _, b in lookup_b]
+      if use_slices:
+        # One-step peer-fetch load straight into TPU HBM
+        self.assertTrue(
+            store_b.load(hashes, dst_device_blocks, slices=slices_b)
+        )
+        self._wait_for_load(store_b)
+      else:
+        # Pull straight into HBM via read_remote
+        self.assertTrue(
+            store_b.read_remote(hashes, slices_b, dst_device_blocks)
+        )
+        self._wait_for_remote_read(store_b)
+
+      # Remote read to HBM leaves NO local host copy behind
+      self.assertEmpty(store_b.lookup(hashes))
+
+      try:
+        torch.tpu.synchronize()
+      except (AttributeError, RuntimeError):
+        pass
+      actual_b = tpu_cache_b.cpu().numpy()
+      for src_blk, dst_blk in zip(src_device_blocks, dst_device_blocks):
+        np.testing.assert_array_equal(
+            actual_b[dst_blk],
+            host_data_a[src_blk],
+            err_msg=(
+                f"device block {dst_blk} does not match source block {src_blk}"
+            ),
+        )
+      for blk in sentinel_blocks:
+        np.testing.assert_array_equal(
+            actual_b[blk],
+            host_data_b[blk],
+            err_msg=f"sentinel device block {blk} was clobbered by the pull",
+        )
+
+      if not use_slices:
+        self.assertFalse(
+            store_b.load(hashes, sentinel_blocks),
+            "read_remote must not leave a host copy behind",
+        )
+    finally:
+      del manager_a, manager_b, store_a, store_b
+
+  @parameterized.named_parameters(
+      ("direct", False),
+      ("with_slices", True),
+  )
+  def test_remote_read_to_hbm(self, use_slices: bool):
+    self._run_remote_read_to_hbm_test(use_slices=use_slices)
 
   def _run_remote_write_e2e_test(
       self,
       producer_node_id: int = 0,
       consumer_node_id: int = 0,
       expect_write_success: bool = True,
+      preload_count: int = 0,
   ):
-    """Job A offers blocks it owns; Job B pulls them and keeps them.
-
-    The mirror image of _run_remote_read_e2e_test: there the destination asks,
-    here the source offers. What this adds over the read path is the
-    WriteRemote control plane -- the ack, the destination's all-or-nothing
-    insert, global registration, and the source polling to COMMITTED -- with a
-    byte comparison at the end, because every control-plane assertion can pass
-    while nothing is actually transferred.
-
-    NOTE: like every torch test in this tree, this is written for parity with
-    the jax suite and is NOT part of any gate. It has never been executed.
-    """
+    """Job A offers blocks it owns; Job B pulls them and keeps them."""
     num_blocks = 4
     shape = (num_blocks, 128, 8, 8, 128)
+    src_device_blocks = [0, 2]
+    dst_device_blocks = [1, 3]
 
     host_data_a = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
     tpu_cache_a = torch.tensor(host_data_a, device=self.device)
     # Zeroed, so a byte comparison cannot pass on data already present.
-    tpu_cache_b = torch.tensor(
-        np.zeros(shape, dtype=np.float32), device=self.device
-    )
-
-    block_elements = 128 * 8 * 8 * 128
-    shard_size_bytes = (block_elements * 4) // self.num_devices
-
-    controller_port_a = find_free_port()
-    worker_port_a = find_free_port()
-    worker_port_b = find_free_port()
+    zeros_b = np.zeros(shape, dtype=np.float32)
+    tpu_cache_b = torch.tensor(zeros_b, device=self.device)
 
     tag = f"write_{uuid.uuid4().hex[:8]}"
-    rid_a = kv_cache_store.RaidenId(f"{tag}_job_a", "0", f"{tag}_cache_a", 0)
-    store_a = kv_cache_store.KVCacheStore(
-        capacity=4,
-        global_registry_address=f"localhost:{_registry_port}",
-        raiden_id=rid_a,
-        num_shards=self.num_devices,
-        shard_size_bytes=shard_size_bytes,
-        store_server_ip="localhost",
-        raiden_controller_port=controller_port_a,
-    )
-    manager_a = kv_cache_manager.KVCacheManager(
-        kv_caches=[[tpu_cache_a]],
-        local_control_port=0,
-        max_blocks=num_blocks,
-        num_slots=2,
-        unsafe_skip_buffer_lock=self.skip_lock,
-        raiden_worker_port=worker_port_a,
-        raiden_controller_address=f"localhost:{controller_port_a}",
-        worker_id=f"{tag}_worker_a",
-        host_blocks_to_allocate=4,
+    store_a, manager_a, rid_a = self._create_node(
+        tag=tag,
+        job_name="job_a",
+        tpu_cache=tpu_cache_a,
         node_id=producer_node_id,
+        enable_global_registry=True,
     )
-
-    controller_port_b = find_free_port()
-    rid_b = kv_cache_store.RaidenId(f"{tag}_job_b", "0", f"{tag}_cache_b", 0)
-    store_b = kv_cache_store.KVCacheStore(
-        capacity=4,
-        global_registry_address=f"localhost:{_registry_port}",
-        raiden_id=rid_b,
-        num_shards=self.num_devices,
-        shard_size_bytes=shard_size_bytes,
-        store_server_ip="localhost",
-        raiden_controller_port=controller_port_b,
-    )
-    manager_b = kv_cache_manager.KVCacheManager(
-        kv_caches=[[tpu_cache_b]],
-        local_control_port=0,
-        max_blocks=num_blocks,
-        num_slots=2,
-        unsafe_skip_buffer_lock=self.skip_lock,
-        raiden_worker_port=worker_port_b,
-        raiden_controller_address=f"localhost:{controller_port_b}",
-        worker_id=f"{tag}_worker_b",
-        host_blocks_to_allocate=4,
+    store_b, manager_b, rid_b = self._create_node(
+        tag=tag,
+        job_name="job_b",
+        tpu_cache=tpu_cache_b,
         node_id=consumer_node_id,
+        enable_global_registry=True,
     )
 
     try:
@@ -655,50 +735,47 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
 
       # 1. Job A puts the blocks in HBM and saves them to host DRAM. Only
       #    host-resident blocks can be offered: the pull reads host memory.
-      slices_a = [
-          kv_cache_store.RaidenBlockId(
-              rid_a,
-              host_block_id=-1,
-              device_block_id=i,
-              status=kv_cache_store.BlockStatus.HBM,
-          )
-          for i in range(2)
-      ]
-      self.assertTrue(
-          store_a.insert(hashes, slices_a, on_host=False)
+      self._insert_hbm_blocks(
+          store_a, rid_a, hashes, device_blocks=src_device_blocks
       )
-      store_a.save(hashes)
+      self.assertTrue(store_a.save(hashes))
+      done = self._wait_for_save(store_a)
+      self.assertCountEqual(done, hashes)
 
-      deadline = time.time() + 120
-      while True:
-        save_done, save_failed, _, _, _ = store_a.poll_save_status()
-        if save_failed:
-          raise RuntimeError(f"Job A Async Save failed: {save_failed}")
-        if len(save_done) == len(hashes):
-          break
-        if time.time() > deadline:
-          raise RuntimeError("Job A save did not complete in time")
-        time.sleep(0.01)
+      preloaded = hashes[:preload_count]
+      if preloaded:
+        # Pre-seed Job B directly into host memory
+        self.assertTrue(
+            store_b.insert(
+                preloaded,
+                [
+                    kv_cache_store.RaidenBlockId(
+                        rid_b,
+                        host_block_id=i,
+                        status=kv_cache_store.BlockStatus.HOST,
+                    )
+                    for i in range(len(preloaded))
+                ],
+                on_host=True,
+            )
+        )
+        store_b.release(preloaded)
 
-      # 2. Job A offers them. Returns once Job B has decided, not once the
-      #    bytes have moved.
-      #
-      # The local save above consumed the pin insert()/pin() granted, so the
-      # offer needs its own. This is the documented remote-save flow: lookup()
-      # answers "yes, host-resident here" AND grants the pin that save(dst)
-      # spends.
+      # 2. Job A offers them.
       self.assertLen(store_a.lookup(hashes), len(hashes))
       self.assertTrue(store_a.save(hashes, rid_b))
 
-      deadline = time.time() + 120
-      done, failed, existing = [], [], []
-      while time.time() < deadline:
-        done, failed, pending, existing, unregistered = (
-            store_a.poll_save_status()
-        )
-        if done or failed or existing:
-          break
-        time.sleep(0.01)
+      done, failed, existing, unregistered = self._wait_for_save_verdict(
+          store_a
+      )
+
+      if 0 < preload_count < len(hashes):
+        self.assertCountEqual(failed, hashes)
+        self.assertEmpty(done)
+        self.assertCountEqual(existing, preloaded)
+        self.assertEmpty(unregistered)
+        store_a.release(hashes)
+        return
 
       if not expect_write_success:
         self.assertNotEmpty(failed)
@@ -709,133 +786,73 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       self.assertEmpty(failed)
       self.assertEmpty(existing)
       self.assertEmpty(unregistered)
-      # No release: the successful remote save consumed the pin lookup()
-      # granted.
 
-      # 3. Job B holds them locally, host-resident, as its own. lookup() resolves
-      #    and pins the landed entries.
-      lookup_b = store_b.lookup(hashes, enable_global=False)
+      # 3. Job B holds them locally, host-resident, as its own.
+      lookup_b = store_b.lookup(hashes, enable_global=False, pin_found=False)
       self.assertLen(lookup_b, len(hashes))
       for _, slice_b in lookup_b:
         self.assertEqual(slice_b.status, kv_cache_store.BlockStatus.HOST)
 
+      if preloaded:
+        return
+
       # 4. Prove the bytes are real. load() consumes the pin on success.
-      self.assertTrue(store_b.load(hashes, [0, 1]))
-      deadline = time.time() + 120
-      while True:
-        load_done, load_failed, _ = store_b.poll_load_status()
-        if load_failed:
-          raise RuntimeError(f"Job B Load failed: {load_failed}")
-        if len(load_done) == len(hashes):
-          break
-        if time.time() > deadline:
-          raise RuntimeError("Job B load did not complete in time")
-        time.sleep(0.01)
+      self.assertLen(store_b.lookup(hashes), len(hashes))
+      self.assertTrue(store_b.load(hashes, dst_device_blocks))
+      self._wait_for_load(store_b)
 
       try:
         torch.tpu.synchronize()
       except (AttributeError, RuntimeError):
         pass
-      np.testing.assert_array_equal(
-          tpu_cache_b[0:2].cpu().numpy(),
-          host_data_a[0:2],
-          err_msg=(
-              "Job B's device memory does not byte-match what Job A offered:"
-              " the remote write reported COMMITTED without moving the data"
-          ),
-      )
+      actual_b = tpu_cache_b.cpu().numpy()
+      for src_blk, dst_blk in zip(src_device_blocks, dst_device_blocks):
+        np.testing.assert_array_equal(
+            actual_b[dst_blk],
+            host_data_a[src_blk],
+            err_msg=(
+                f"device block {dst_blk} does not match source block {src_blk}"
+            ),
+        )
     finally:
       del manager_a, manager_b, store_a, store_b
 
-  def test_remote_write_e2e(self):
-    self._run_remote_write_e2e_test()
-
-  def test_remote_write_e2e_matching_node_id(self):
+  @parameterized.named_parameters(
+      ("matching_node_id", 0, 0, True, 0),
+      ("mismatched_node_id_fails", 0, 1, False, 0),
+      ("all_exist_moves_nothing", 0, 0, True, 2),
+      ("partial_exist_reports_the_overlap", 0, 0, False, 1),
+  )
+  def test_remote_write_e2e(
+      self,
+      producer_node_id: int,
+      consumer_node_id: int,
+      expect_write_success: bool,
+      preload_count: int,
+  ):
     self._run_remote_write_e2e_test(
-        producer_node_id=0,
-        consumer_node_id=0,
-        expect_write_success=True,
-    )
-
-  def test_remote_write_e2e_mismatched_node_id_fails(self):
-    # The destination pairs each of its workers with the source worker holding
-    # its shards by node_id; a mismatch leaves the pull with no group to read
-    # from, so the transfer fails and the source is told rather than left
-    # pending.
-    self._run_remote_write_e2e_test(
-        producer_node_id=0,
-        consumer_node_id=1,
-        expect_write_success=False,
-    )
-
-  def test_remote_read_e2e_matching_node_id(self):
-    self._run_remote_read_e2e_test(
-        producer_node_id=7,
-        consumer_node_id=7,
-        expect_read_success=True,
-    )
-
-  def test_remote_read_e2e_mismatched_node_id_fails(self):
-    self._run_remote_read_e2e_test(
-        producer_node_id=1,
-        consumer_node_id=2,
-        expect_read_success=False,
+        producer_node_id=producer_node_id,
+        consumer_node_id=consumer_node_id,
+        expect_write_success=expect_write_success,
+        preload_count=preload_count,
     )
 
   def test_remote_read_e2e_source_missing_block_fails(self):
-    num_blocks = 4
-    shape = (num_blocks, 128, 8, 8, 128)
-    tpu_cache_a = torch.zeros(shape, dtype=torch.float32, device=self.device)
-    tpu_cache_b = torch.zeros(shape, dtype=torch.float32, device=self.device)
-
-    block_elements = 128 * 8 * 8 * 128
-    shard_size_bytes = (block_elements * 4) // self.num_devices
-    controller_port_a = find_free_port()
-    controller_port_b = find_free_port()
-
     tag = f"miss_{uuid.uuid4().hex[:8]}"
-    rid_a = kv_cache_store.RaidenId(f"{tag}_job_a", "0", f"{tag}_cache_a", 0)
-    store_a = kv_cache_store.KVCacheStore(
-        capacity=4,
-        global_registry_address=f"localhost:{_registry_port}",
-        raiden_id=rid_a,
-        num_shards=self.num_devices,
-        shard_size_bytes=shard_size_bytes,
-        store_server_ip="localhost",
-        raiden_controller_port=controller_port_a,
+    zeros = torch.zeros(
+        (4, 128, 8, 8, 128), dtype=torch.float32, device=self.device
     )
-    manager_a = kv_cache_manager.KVCacheManager(
-        kv_caches=[[tpu_cache_a]],
-        local_control_port=0,
-        max_blocks=num_blocks,
-        num_slots=2,
-        unsafe_skip_buffer_lock=self.skip_lock,
-        raiden_worker_port=find_free_port(),
-        raiden_controller_address=f"localhost:{controller_port_a}",
-        worker_id=f"{tag}_worker_a",
-        host_blocks_to_allocate=4,
+    store_a, manager_a, rid_a = self._create_node(
+        tag=tag,
+        job_name="job_a",
+        tpu_cache=zeros,
+        enable_global_registry=True,
     )
-
-    rid_b = kv_cache_store.RaidenId(f"{tag}_job_b", "0", f"{tag}_cache_b", 0)
-    store_b = kv_cache_store.KVCacheStore(
-        capacity=4,
-        global_registry_address=f"localhost:{_registry_port}",
-        raiden_id=rid_b,
-        num_shards=self.num_devices,
-        shard_size_bytes=shard_size_bytes,
-        store_server_ip="localhost",
-        raiden_controller_port=controller_port_b,
-    )
-    manager_b = kv_cache_manager.KVCacheManager(
-        kv_caches=[[tpu_cache_b]],
-        local_control_port=0,
-        max_blocks=num_blocks,
-        num_slots=2,
-        unsafe_skip_buffer_lock=self.skip_lock,
-        raiden_worker_port=find_free_port(),
-        raiden_controller_address=f"localhost:{controller_port_b}",
-        worker_id=f"{tag}_worker_b",
-        host_blocks_to_allocate=4,
+    store_b, manager_b, _ = self._create_node(
+        tag=tag,
+        job_name="job_b",
+        tpu_cache=zeros,
+        enable_global_registry=True,
     )
 
     try:
@@ -850,102 +867,37 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
           )
       ]
       self.assertTrue(store_b.read_remote(ghost, slices, [0]))
-
-      failed = False
-      for _ in range(500):
-        _, read_failed, _ = store_b.poll_remote_read_status()
-        if read_failed:
-          self.assertEqual(set(read_failed), set(ghost))
-          failed = True
-          break
-        time.sleep(0.01)
-      self.assertTrue(
-          failed, "expected read_remote to fail (source is missing the block)"
-      )
+      failed = self._wait_for_remote_read_failure(store_b)
+      self.assertEqual(set(failed), set(ghost))
     finally:
       del manager_a, manager_b, store_a, store_b
 
   def test_remote_read_e2e_source_wrong_status_fails(self):
-    num_blocks = 4
-    shape = (num_blocks, 128, 8, 8, 128)
-    tpu_cache_a = torch.zeros(shape, dtype=torch.float32, device=self.device)
-    tpu_cache_b = torch.zeros(shape, dtype=torch.float32, device=self.device)
-
-    block_elements = 128 * 8 * 8 * 128
-    shard_size_bytes = (block_elements * 4) // self.num_devices
-    controller_port_a = find_free_port()
-    controller_port_b = find_free_port()
-
     tag = f"ws_{uuid.uuid4().hex[:8]}"
-    rid_a = kv_cache_store.RaidenId(f"{tag}_job_a", "0", f"{tag}_cache_a", 0)
-    store_a = kv_cache_store.KVCacheStore(
-        capacity=4,
-        global_registry_address=f"localhost:{_registry_port}",
-        raiden_id=rid_a,
-        num_shards=self.num_devices,
-        shard_size_bytes=shard_size_bytes,
-        store_server_ip="localhost",
-        raiden_controller_port=controller_port_a,
+    zeros = torch.zeros(
+        (4, 128, 8, 8, 128), dtype=torch.float32, device=self.device
     )
-    manager_a = kv_cache_manager.KVCacheManager(
-        kv_caches=[[tpu_cache_a]],
-        local_control_port=0,
-        max_blocks=num_blocks,
-        num_slots=2,
-        unsafe_skip_buffer_lock=self.skip_lock,
-        raiden_worker_port=find_free_port(),
-        raiden_controller_address=f"localhost:{controller_port_a}",
-        worker_id=f"{tag}_worker_a",
-        host_blocks_to_allocate=4,
+    store_a, manager_a, rid_a = self._create_node(
+        tag=tag,
+        job_name="job_a",
+        tpu_cache=zeros,
+        enable_global_registry=True,
     )
-
-    rid_b = kv_cache_store.RaidenId(f"{tag}_job_b", "0", f"{tag}_cache_b", 0)
-    store_b = kv_cache_store.KVCacheStore(
-        capacity=4,
-        global_registry_address=f"localhost:{_registry_port}",
-        raiden_id=rid_b,
-        num_shards=self.num_devices,
-        shard_size_bytes=shard_size_bytes,
-        store_server_ip="localhost",
-        raiden_controller_port=controller_port_b,
-    )
-    manager_b = kv_cache_manager.KVCacheManager(
-        kv_caches=[[tpu_cache_b]],
-        local_control_port=0,
-        max_blocks=num_blocks,
-        num_slots=2,
-        unsafe_skip_buffer_lock=self.skip_lock,
-        raiden_worker_port=find_free_port(),
-        raiden_controller_address=f"localhost:{controller_port_b}",
-        worker_id=f"{tag}_worker_b",
-        host_blocks_to_allocate=4,
+    store_b, manager_b, _ = self._create_node(
+        tag=tag,
+        job_name="job_b",
+        tpu_cache=zeros,
+        enable_global_registry=True,
     )
 
     try:
       time.sleep(1)
-      # Raw non-UTF-8 bytes on purpose: production hashes are binary
-      # digests, and the registry round-trip must survive them (the proto
-      # hash fields are `bytes`; as `string` they were UTF-8-verified on
-      # the wire and cross-store sharing silently found nothing).
       hashes = [
           b"\x93\xff\x00" + f"{tag}_h0".encode(),
           b"\x93\xff\x00" + f"{tag}_h1".encode(),
       ]
-      slices_a = [
-          kv_cache_store.RaidenBlockId(
-              rid_a,
-              host_block_id=-1,
-              device_block_id=0,
-              status=kv_cache_store.BlockStatus.HBM,
-          ),
-          kv_cache_store.RaidenBlockId(
-              rid_a,
-              host_block_id=-1,
-              device_block_id=1,
-              status=kv_cache_store.BlockStatus.HBM,
-          ),
-      ]
-      self.assertTrue(store_a.insert(hashes, slices_a, on_host=False))
+      # Source inserts as HBM, but does not save to Host DRAM.
+      self._insert_hbm_blocks(store_a, rid_a, hashes, device_blocks=[0, 1])
 
       time.sleep(0.5)
       slices_b = [
@@ -964,30 +916,21 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       ]
       self.assertTrue(store_b.read_remote(hashes, slices_b, [0, 1]))
 
-      failed = False
-      for _ in range(500):
-        _, read_failed, _ = store_b.poll_remote_read_status()
-        if read_failed:
-          self.assertEqual(set(read_failed), set(hashes))
-          failed = True
-          break
-        time.sleep(0.01)
-      self.assertTrue(
-          failed,
-          "expected read_remote to fail (source only has block in HBM)",
-      )
+      failed = self._wait_for_remote_read_failure(store_b)
+      self.assertEqual(set(failed), set(hashes))
     finally:
       del manager_a, manager_b, store_a, store_b
 
   def test_expected_worker_count_waits_for_a_concurrent_registration(self):
     """The barrier replaces the sleep-and-hope idiom."""
-    tpu_cache = torch.zeros(
-        (2, 128, 8, 8, 128), dtype=torch.float32, device="tpu"
-    )
     controller_port = find_free_port()
+    worker_port = find_free_port()
     num_blocks = 2
     block_elements = 128 * 8 * 8 * 128
     shard_size_bytes = (block_elements * 4) // self.num_devices
+    tpu_cache = torch.zeros(
+        (num_blocks, 128, 8, 8, 128), dtype=torch.float32, device=self.device
+    )
 
     registration_delay_s = 2.0
     built = {}
@@ -995,14 +938,15 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     def build_manager_after_a_delay():
       time.sleep(registration_delay_s)
       built["manager"] = kv_cache_manager.KVCacheManager(
-          kv_caches=[tpu_cache],
+          kv_caches=[[tpu_cache]],
           local_control_port=0,
           max_blocks=num_blocks,
           num_slots=2,
           unsafe_skip_buffer_lock=self.skip_lock,
-          raiden_worker_port=0,
+          raiden_worker_port=worker_port,
           raiden_controller_address=f"localhost:{controller_port}",
           worker_id="worker_0",
+          host_blocks_to_allocate=num_blocks,
       )
 
     worker_thread = threading.Thread(target=build_manager_after_a_delay)
@@ -1026,31 +970,13 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     self.assertFalse(worker_thread.is_alive())
     self.assertGreaterEqual(elapsed, registration_delay_s)
 
+    # Verify that the store and late-registered worker function normally
     hashes = [b"barrier_hash_0", b"barrier_hash_1"]
-    slices = [
-        kv_cache_store.RaidenBlockId(
-            rid,
-            host_block_id=-1,
-            device_block_id=i,
-            status=kv_cache_store.BlockStatus.HBM,
-        )
-        for i in range(num_blocks)
-    ]
-    inserted = store.insert(hashes, slices, on_host=False)
-    self.assertTrue(inserted)
+    self._insert_hbm_blocks(store, rid, hashes, device_blocks=[0, 1])
     self.assertTrue(store.save(hashes))
-
-    deadline = time.time() + 60
-    done = []
-    while time.time() < deadline:
-      done, failed, _, _, _ = store.poll_save_status()
-      self.assertEmpty(failed)
-      if done:
-        break
-      time.sleep(0.01)
+    done = self._wait_for_save(store)
     self.assertCountEqual(done, hashes)
-    # No release: the successful save consumed the pin insert() granted.
-    del built
+    del built, store
 
   def test_sweep_demotes_to_the_store_node_and_reads_back(self):
     """The evict chain end to end: it all happens behind the existing API.
@@ -1076,57 +1002,23 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       os.environ[key] = value
       self.addCleanup(os.environ.pop, key, None)
 
-    # 6 of 8 blocks in use after the saves: free ratio 0.25, below the 0.5
-    # low watermark, so the sweep must demote down to the 0.75 high one.
     capacity = 8
     num_insert = 6
     shape = (capacity, 128, 8, 8, 128)
     host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
     tpu_cache = torch.tensor(host_data, device=self.device)
     block_elements = 128 * 8 * 8 * 128
-    shard_size_bytes = (block_elements * 4) // self.num_devices
-
-    controller_port = find_free_port()
     pool_group = "evict_e2e_pool"
 
-    # The registration is what fills in the KVTransferSpec the store
-    # publishes for the node, and expected_worker_count is the barrier that
-    # waits for it (see the dedicated barrier test above).
-    built = {}
-
-    def build_manager_after_a_delay():
-      time.sleep(1.0)
-      built["manager"] = kv_cache_manager.KVCacheManager(
-          kv_caches=[[tpu_cache]],
-          local_control_port=0,
-          max_blocks=capacity,
-          num_slots=2,
-          unsafe_skip_buffer_lock=self.skip_lock,
-          raiden_worker_port=0,
-          raiden_controller_address=f"localhost:{controller_port}",
-          worker_id="evict_e2e_worker_0",
-          host_blocks_to_allocate=capacity,
-          node_id=0,
-      )
-
-    worker_thread = threading.Thread(target=build_manager_after_a_delay)
-    worker_thread.start()
-    rid = kv_cache_store.RaidenId("evict_e2e_serving", "0", "evict_cache", 0)
-    try:
-      store = kv_cache_store.KVCacheStore(
-          capacity=capacity,
-          global_registry_address=f"localhost:{_registry_port}",
-          raiden_id=rid,
-          num_shards=self.num_devices,
-          shard_size_bytes=shard_size_bytes,
-          store_server_ip="localhost",
-          raiden_controller_port=controller_port,
-          expected_worker_count=1,
-          kv_pool_group=pool_group,
-      )
-    finally:
-      worker_thread.join(timeout=180)
-    self.assertFalse(worker_thread.is_alive())
+    store, manager, rid = self._create_node(
+        tag="evict_e2e",
+        job_name="serving",
+        tpu_cache=tpu_cache,
+        enable_global_registry=True,
+        num_blocks=capacity,
+        expected_worker_count=1,
+        kv_pool_group=pool_group,
+    )
 
     node_binary = _node_binary_path()
     node_log = open("/tmp/raiden_store_node.log", "w")
@@ -1161,27 +1053,14 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
         time.sleep(0.5)
 
       hashes = [f"evict_e2e_blk_{i}".encode() for i in range(num_insert)]
-      slices = [
-          kv_cache_store.RaidenBlockId(
-              rid,
-              host_block_id=-1,
-              device_block_id=i,
-              status=kv_cache_store.BlockStatus.HBM,
-          )
-          for i in range(num_insert)
-      ]
-      self.assertTrue(store.insert(hashes, slices, on_host=False))
+      self._insert_hbm_blocks(
+          store, rid, hashes, device_blocks=list(range(num_insert))
+      )
 
       # insert() pins; a successful save consumes that pin, leaving the
       # blocks host-resident and unpinned -- exactly what the sweep demotes.
       self.assertTrue(store.save(hashes))
-      deadline = time.time() + 60
-      done = []
-      while time.time() < deadline and len(done) < num_insert:
-        save_done, save_failed, _, _, _ = store.poll_save_status()
-        self.assertEmpty(save_failed, f"save failed for {save_failed}")
-        done += save_done
-        time.sleep(0.05)
+      done = self._wait_for_save(store)
       self.assertLen(done, num_insert)
 
       # A demoted block is gone locally. lookup() halts at its first miss, so
@@ -1216,12 +1095,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       # own arange values, distinct from the demoted block's pattern.
       dst_device_block = num_insert
       self.assertTrue(store.read_remote([probe], [remote], [dst_device_block]))
-      deadline = time.time() + 60
-      read_done = []
-      while time.time() < deadline and not read_done:
-        read_done, read_failed, _ = store.poll_remote_read_status()
-        self.assertEmpty(read_failed, f"read_remote failed for {read_failed}")
-        time.sleep(0.05)
+      read_done = self._wait_for_remote_read(store, expected_count=1)
       self.assertNotEmpty(read_done, "read_remote never completed")
 
       try:
@@ -1237,7 +1111,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       except subprocess.TimeoutExpired:
         node_process.kill()
       node_log.close()
-    del built
+      del manager, store
 
   def test_sweep_without_a_store_node_drops_cold_blocks_locally(self):
     """The no-target half of the evict sweep: pressure wins over retention.
@@ -1272,95 +1146,52 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     shape = (capacity, 128, 8, 8, 128)
     host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
     tpu_cache = torch.tensor(host_data, device=self.device)
-    block_elements = 128 * 8 * 8 * 128
-    shard_size_bytes = (block_elements * 4) // self.num_devices
 
-    controller_port = find_free_port()
-
-    built = {}
-
-    def build_manager_after_a_delay():
-      time.sleep(1.0)
-      built["manager"] = kv_cache_manager.KVCacheManager(
-          kv_caches=[[tpu_cache]],
-          local_control_port=0,
-          max_blocks=capacity,
-          num_slots=2,
-          unsafe_skip_buffer_lock=self.skip_lock,
-          raiden_worker_port=0,
-          raiden_controller_address=f"localhost:{controller_port}",
-          worker_id="evict_drop_worker_0",
-          host_blocks_to_allocate=capacity,
-          node_id=0,
-      )
-
-    worker_thread = threading.Thread(target=build_manager_after_a_delay)
-    worker_thread.start()
-    rid = kv_cache_store.RaidenId("evict_drop_serving", "0", "evict_cache", 0)
-    try:
-      store = kv_cache_store.KVCacheStore(
-          capacity=capacity,
-          global_registry_address=f"localhost:{_registry_port}",
-          raiden_id=rid,
-          num_shards=self.num_devices,
-          shard_size_bytes=shard_size_bytes,
-          store_server_ip="localhost",
-          raiden_controller_port=controller_port,
-          expected_worker_count=1,
-          # No store node ever joins this group: GetPlacementTargets stays
-          # empty and every pressure episode takes the local-drop path.
-          kv_pool_group="evict_drop_pool",
-      )
-    finally:
-      worker_thread.join(timeout=180)
-    self.assertFalse(worker_thread.is_alive())
-
-    hashes = [f"evict_drop_blk_{i}".encode() for i in range(num_insert)]
-    slices = [
-        kv_cache_store.RaidenBlockId(
-            rid,
-            host_block_id=-1,
-            device_block_id=i,
-            status=kv_cache_store.BlockStatus.HBM,
-        )
-        for i in range(num_insert)
-    ]
-    self.assertTrue(store.insert(hashes, slices, on_host=False))
-
-    # insert() pins; a successful save consumes that pin, leaving the
-    # blocks host-resident and unpinned -- exactly what the sweep drops.
-    self.assertTrue(store.save(hashes))
-    deadline = time.time() + 60
-    done = []
-    while time.time() < deadline and len(done) < num_insert:
-      save_done, save_failed, _, _, _ = store.poll_save_status()
-      self.assertEmpty(save_failed, f"save failed for {save_failed}")
-      done += save_done
-      time.sleep(0.05)
-    self.assertLen(done, num_insert)
-
-    def missing_locally(h):
-      return not store.lookup([h], enable_global=False, pin_found=False)
-
-    deadline = time.time() + 60
-    dropped = []
-    while time.time() < deadline and len(dropped) < 4:
-      dropped = [h for h in hashes if missing_locally(h)]
-      time.sleep(1)
-    self.assertGreaterEqual(
-        len(dropped),
-        4,
-        "the sweep never freed down to the high watermark",
+    store, manager, rid = self._create_node(
+        tag="evict_drop",
+        job_name="serving",
+        tpu_cache=tpu_cache,
+        enable_global_registry=True,
+        num_blocks=capacity,
+        expected_worker_count=1,
+        kv_pool_group="evict_drop_pool",
     )
 
-    # Dropped means dropped: a global lookup must come back empty, or the
-    # sweep would have demoted (published an owner) instead of discarding.
-    for h in dropped:
-      self.assertEmpty(
-          store.lookup([h], enable_global=True, pin_found=False),
-          f"{h!r} was dropped locally yet resurfaced through the registry",
+    try:
+      hashes = [f"evict_drop_blk_{i}".encode() for i in range(num_insert)]
+      self._insert_hbm_blocks(
+          store, rid, hashes, device_blocks=list(range(num_insert))
       )
-    del built
+
+      # insert() pins; a successful save consumes that pin, leaving the
+      # blocks host-resident and unpinned -- exactly what the sweep drops.
+      self.assertTrue(store.save(hashes))
+      done = self._wait_for_save(store)
+      self.assertLen(done, num_insert)
+
+      def missing_locally(h):
+        return not store.lookup([h], enable_global=False, pin_found=False)
+
+      deadline = time.time() + 60
+      dropped = []
+      while time.time() < deadline and len(dropped) < 4:
+        dropped = [h for h in hashes if missing_locally(h)]
+        time.sleep(1)
+      self.assertGreaterEqual(
+          len(dropped),
+          4,
+          "the sweep never freed down to the high watermark",
+      )
+
+      # Dropped means dropped: a global lookup must come back empty, or the
+      # sweep would have demoted (published an owner) instead of discarding.
+      for h in dropped:
+        self.assertEmpty(
+            store.lookup([h], enable_global=True, pin_found=False),
+            f"{h!r} was dropped locally yet resurfaced through the registry",
+        )
+    finally:
+      del manager, store
 
 
 if __name__ == "__main__":

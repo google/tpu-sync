@@ -387,6 +387,7 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
 
   static bool DynamicHostStagingEnabled();
   void ConfigureLegacyControlFromEnv();
+  int64_t SendStagingCapacityBlocks() const;
   absl::Status InitializeSlotPool(int64_t num_slots);
   Slot AcquireSlot();
   Slot AcquireSlotLocked();
@@ -639,6 +640,9 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   std::list<uint64_t> send_tombstone_order_;
   std::map<uint64_t, PendingAck> pending_acks_;
   std::list<uint64_t> pending_ack_order_;
+  // Quarantines a terminal UUID so delayed ACK/cancel/pull messages from its
+  // old transfer cannot affect a newer transfer. The UUID becomes reusable
+  // after this TTL; callers should normally generate a fresh UUID per attempt.
   std::chrono::milliseconds send_tombstone_ttl_{std::chrono::minutes(5)};
   std::chrono::milliseconds pending_ack_ttl_{std::chrono::seconds(30)};
   size_t max_send_tombstones_ = 4096;

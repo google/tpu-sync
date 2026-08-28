@@ -164,7 +164,7 @@ integers; invalid values retain the listed default.
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
-| `RAIDEN_SEND_TOMBSTONE_TTL_S` | `300` | Retention time for terminal UUID tombstones |
+| `RAIDEN_SEND_TOMBSTONE_TTL_S` | `300` | UUID reuse quarantine after a transfer reaches a terminal state |
 | `RAIDEN_PENDING_ACK_TTL_S` | `30` | Retention time for acknowledgements that arrive before registration |
 | `RAIDEN_MAX_SEND_TOMBSTONES` | `4096` | Maximum retained terminal UUID tombstones |
 | `RAIDEN_MAX_PENDING_ACKS` | `4096` | Maximum retained pre-registration acknowledgements |
@@ -174,6 +174,11 @@ integers; invalid values retain the listed default.
 Configure `RAIDEN_MAX_LEASE_BATCH_SIZE` consistently on communicating peers:
 the consumer uses it to chunk requests and the producer uses it as its accepted
 request limit.
+
+Use a fresh UUID for each transfer attempt. A terminal UUID remains quarantined
+for `RAIDEN_SEND_TOMBSTONE_TTL_S` so a delayed ACK, cancellation, or pull from
+the previous attempt cannot affect a new transfer. Reuse is allowed after the
+tombstone expires.
 
 ### Playing with TPU Sync
 

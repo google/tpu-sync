@@ -419,7 +419,8 @@ class KVCacheManager:
 
     Args:
       req_id: The request ID of the transfer operation.
-      uuid: The UUID of the request.
+      uuid: The per-attempt UUID of the request. Generate a fresh value rather
+        than reusing a recently completed transfer UUID.
       block_ids: The list of block IDs to be read.
 
     Returns:

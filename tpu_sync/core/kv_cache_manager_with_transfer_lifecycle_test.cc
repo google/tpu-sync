@@ -181,6 +181,16 @@ class MetadataTransferManager : public KVCacheManagerWithTransfer {
     return send_tombstones_.contains(uuid);
   }
 
+  void ExpireTombstoneForTest(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    auto it = send_tombstones_.find(uuid);
+    if (it == send_tombstones_.end()) {
+      throw std::runtime_error("send tombstone does not exist");
+    }
+    it->second.expires_at =
+        std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+  }
+
   bool IsClaimed(uint64_t uuid) {
     absl::MutexLock lock(mu_);
     auto it = send_entries_.find(uuid);
@@ -748,21 +758,27 @@ WireResponse RawExchange(MetadataTransferManager* manager,
   return response;
 }
 
-WireResponse Pull(MetadataTransferManager* manager, uint64_t uuid) {
+WireResponse Pull(MetadataTransferManager* manager, uint64_t uuid,
+                  const std::vector<int64_t>& block_ids) {
   const int fd = ConnectLoopback(manager->local_control_port());
   MetadataTransferManager::ControlRequestHeader request;
   request.op = 3;
   request.uuid = uuid;
-  request.num_blocks = 1;
+  request.num_blocks = block_ids.size();
   request.consumer_data_port = 1;
   EXPECT_TRUE(WriteAll(fd, &request, sizeof(request)));
-  const int64_t block_id = 0;
-  EXPECT_TRUE(WriteAll(fd, &block_id, sizeof(block_id)));
-  EXPECT_TRUE(WriteAll(fd, &block_id, sizeof(block_id)));
+  EXPECT_TRUE(WriteAll(fd, block_ids.data(),
+                       block_ids.size() * sizeof(block_ids.front())));
+  EXPECT_TRUE(WriteAll(fd, block_ids.data(),
+                       block_ids.size() * sizeof(block_ids.front())));
   WireResponse response = ReadResponse(fd);
   (void)shutdown(fd, SHUT_RDWR);
   close(fd);
   return response;
+}
+
+WireResponse Pull(MetadataTransferManager* manager, uint64_t uuid) {
+  return Pull(manager, uuid, {0});
 }
 
 WireResponse Ack(MetadataTransferManager* manager, uint64_t uuid,
@@ -866,6 +882,16 @@ TEST(SendLifecycleTest, ExpiryCreatesTombstoneAndReportsDoneOnce) {
             std::vector<std::string>({"expired"}));
   EXPECT_TRUE(manager.HasTombstone(101));
   EXPECT_TRUE(std::get<0>(manager.CompleteReadRaw()).empty());
+}
+
+TEST(SendLifecycleTest, DynamicStagingAcceptsMoreThanOneFixedSlot) {
+  ScopedEnvironmentVariable dynamic_staging("TPU_RAIDEN_DYNAMIC_HOST_STAGING",
+                                            "1");
+  MetadataTransferManager manager(/*start_control_server=*/true,
+                                  /*num_slots=*/2);
+  manager.NotifyForRead("dynamic-large", 10101, {0, 1});
+
+  EXPECT_EQ(Pull(&manager, 10101, {0, 1}).status, 0);
 }
 
 TEST(SendLifecycleTest, UnknownAndLatePullsFailWithoutBlockingWorkers) {
@@ -1427,7 +1453,7 @@ TEST(SendLifecycleTest, SimultaneousPullsHaveExactlyOneWinner) {
   manager.FinishForTest(107);
 }
 
-TEST(SendLifecycleTest, EarlyAcksAreBoundedAndQuarantineReuse) {
+TEST(SendLifecycleTest, EarlyAcksAreBoundedAndQuarantineReuseUntilExpiry) {
   MetadataTransferManager manager(/*start_control_server=*/true);
   manager.SetPendingAckCapacity(2);
   EXPECT_EQ(Ack(&manager, 110).status, 0);
@@ -1441,6 +1467,9 @@ TEST(SendLifecycleTest, EarlyAcksAreBoundedAndQuarantineReuse) {
             std::vector<std::string>({"early-ack"}));
   EXPECT_TRUE(manager.HasTombstone(111));
   EXPECT_THROW(manager.NotifyForRead("reuse", 111, {0}), std::invalid_argument);
+
+  manager.ExpireTombstoneForTest(111);
+  EXPECT_EQ(manager.NotifyForRead("reuse-after-expiry", 111, {0}), 111);
 }
 
 TEST(LeaseTest, OrderedStatusesCoverEveryLifecycleState) {

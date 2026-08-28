@@ -964,7 +964,8 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
         consumed_early_cancel = true;
       } else {
         throw std::invalid_argument(
-            "send UUID is quarantined by a previous terminal outcome");
+            "send UUID is quarantined by a previous terminal outcome; use a "
+            "fresh UUID or wait for RAIDEN_SEND_TOMBSTONE_TTL_S to expire");
       }
     }
     if (!consumed_early_cancel &&
@@ -2574,6 +2575,13 @@ bool KVCacheManagerWithTransfer::DynamicHostStagingEnabled() {
   return raw != nullptr && std::string(raw) == "1";
 }
 
+int64_t KVCacheManagerWithTransfer::SendStagingCapacityBlocks() const {
+  if (!dynamic_host_staging_ || host_block_manager_ == nullptr) {
+    return max_blocks_;
+  }
+  return host_block_manager_->total_blocks();
+}
+
 std::optional<std::vector<int64_t>>
 KVCacheManagerWithTransfer::AcquireRecvStagingLocked(int64_t num_blocks,
                                                      RecvEntry* entry) {
@@ -3456,8 +3464,9 @@ void KVCacheManagerWithTransfer::HandleControlConnection(int fd) {
 void KVCacheManagerWithTransfer::ProcessPullStream(
     int fd, const ControlRequestHeader& req,
     std::chrono::steady_clock::time_point operation_deadline) {
-  if (req.num_blocks == 0 ||
-      req.num_blocks > static_cast<uint64_t>(max_blocks_)) {
+  const int64_t staging_capacity = SendStagingCapacityBlocks();
+  if (req.num_blocks == 0 || staging_capacity <= 0 ||
+      req.num_blocks > static_cast<uint64_t>(staging_capacity)) {
     throw std::invalid_argument("pull stream num_blocks is out of range");
   }
   if (req.consumer_data_port == 0 ||
@@ -3773,9 +3782,7 @@ bool KVCacheManagerWithTransfer::AcquireSendStagingWithRetry(
       // Staging that can never seat this request fails it now rather than
       // after the deadline: a fixed slot holds max_blocks_ pages, the
       // per-transfer pool holds total_blocks() pages.
-      const int64_t capacity = dynamic_host_staging_
-                                   ? host_block_manager_->total_blocks()
-                                   : max_blocks_;
+      const int64_t capacity = SendStagingCapacityBlocks();
       if (static_cast<int64_t>(src_block_ids.size()) > capacity) {
         LOG(ERROR) << "StartPushInternal: request " << it->second->req_id
                    << " needs " << src_block_ids.size() << " blocks but "

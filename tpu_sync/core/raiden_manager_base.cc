@@ -217,6 +217,15 @@ size_t RaidenManagerBase::GetHostSize(size_t layer_idx, size_t shard_idx) {
   return layers_[layer_idx].shards[local_idx].host_size;
 }
 
+size_t RaidenManagerBase::GetHostSize(size_t layer_idx,
+                                      size_t shard_idx) const {
+  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
+    return 0;
+  }
+  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
+  return layers_[layer_idx].shards[local_idx].host_size;
+}
+
 // Const overload resolving host memory pointer for a specific layer and shard
 // using multi-host modulo indexing.
 const uint8_t* RaidenManagerBase::GetHostPointer(size_t layer_idx,

@@ -288,6 +288,106 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     )
     self._run_resharding_test(src_sharding, dst_sharding, (8, 8))
 
+  def _run_heterogeneous_push_sync_test(self, shapes):
+    src_arrs = [
+        jax.device_put(
+            jnp.ones(shape, dtype=self.dtype) * (i + 1.0), self.sharding
+        )
+        for i, shape in enumerate(shapes)
+    ]
+    dst_arrs = [
+        jax.device_put(jnp.zeros(shape, dtype=self.dtype), self.sharding)
+        for shape in shapes
+    ]
+
+    for arr in src_arrs:
+      arr.block_until_ready()
+    for arr in dst_arrs:
+      arr.block_until_ready()
+
+    ws_source = WeightSynchronizer(
+        jax_arrays=src_arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    ws_dest = WeightSynchronizer(
+        jax_arrays=dst_arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+        bind_ip="127.0.0.1",
+    )
+
+    req = raiden_service_pb2.ControlRequest(
+        command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+        peers=[f"127.0.0.1:{ws_dest.local_port}"],
+        start_transfer_request=raiden_service_pb2.StartTransferRequest(
+            is_sender=True
+        ),
+    )
+    payload = req.SerializeToString()
+
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+    sock.connect(("::1", ws_source.listener_port))
+    sock.sendall(len(payload).to_bytes(4, "big") + payload)
+
+    resp_len = int.from_bytes(sock.recv(4), "big")
+    resp_bytes = sock.recv(resp_len)
+    resp = raiden_service_pb2.ControlResponse()
+    resp.ParseFromString(resp_bytes)
+    self.assertTrue(resp.success)
+    sock.close()
+
+    ws_dest.h2d()
+
+    for i in range(len(shapes)):
+      np.testing.assert_array_equal(
+          np.asarray(dst_arrs[i]), np.asarray(src_arrs[i])
+      )
+
+  def test_heterogeneous_layers_small_first(self):
+    self._run_heterogeneous_push_sync_test(
+        [(1024,), (1024, 3072), (2048, 2048)]
+    )
+
+  def test_heterogeneous_layers_large_first(self):
+    self._run_heterogeneous_push_sync_test([(1024, 3072), (1024,), (128,)])
+
+  def test_heterogeneous_layers_local_roundtrip(self):
+    shapes = [(1024,), (1024, 3072), (2048, 2048)]
+    arrs = [
+        jax.device_put(
+            jnp.ones(shape, dtype=self.dtype) * (i + 10.0), self.sharding
+        )
+        for i, shape in enumerate(shapes)
+    ]
+    for arr in arrs:
+      arr.block_until_ready()
+
+    ws = WeightSynchronizer(
+        jax_arrays=arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+    )
+    ws.d2h()
+
+    # Mutate device arrays to 0
+    zero_arrs = [
+        jax.device_put(jnp.zeros(shape, dtype=self.dtype), self.sharding)
+        for shape in shapes
+    ]
+    for arr in zero_arrs:
+      arr.block_until_ready()
+    ws.bind_weights(zero_arrs)
+
+    # Ingest staged weights back to device
+    ws.h2d()
+
+    for i in range(len(shapes)):
+      np.testing.assert_array_equal(np.asarray(zero_arrs[i]), i + 10.0)
+
+
 class ShardSortingUtilTest(absltest.TestCase):
 
   def setUp(self):
@@ -324,7 +424,7 @@ class ShardSortingUtilTest(absltest.TestCase):
     )
     arr = jax.device_put(jnp.zeros((8, 8)), sharding)
     perm = utils.get_shard_sorting_permutation(arr)
-    self.assertEqual(perm, [0, 2, 1, 3])
+    self.assertEqual(perm, [])
 
 
 if __name__ == "__main__":

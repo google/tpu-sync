@@ -362,7 +362,6 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
 
   const auto& layer_info = layers_[layer_idx];
   const auto& layer_holds = buffer_holds_[layer_idx];
-  size_t layer_size = block_bytes(layer_idx);
   std::vector<xla::Future<raiden::BufferHolder>> shard_futures_to_join;
 
   for (size_t i = 0; i < num_shards_; ++i) {
@@ -384,7 +383,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
                                                 : "unknown")
             << ", is_tiled=" << is_tiled << ", skip_flag=" << skip_flag
             << ", shape=" << shard_hold.shape.ToString()
-            << ", size=" << layer_size << " bytes)";
+            << ", size=" << shard_info.device_size << " bytes)";
 
     std::vector<xla::Future<>> shard_futures;
     if (is_tiled) {
@@ -417,8 +416,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
       xla::Future<> mapped_future = future.Map([temp_buffer]() {});
       shard_futures.push_back(std::move(mapped_future));
     } else {
-      xla::Future<> future =
-          shard_hold.CopyRawHostToDevice(shard_info.host_ptr, 0, layer_size);
+      xla::Future<> future = shard_hold.CopyRawHostToDevice(
+          shard_info.host_ptr, 0, shard_info.device_size);
       shard_futures.push_back(std::move(future));
     }
     shard_futures_to_join.push_back(raiden::CreateBufferFuture(
@@ -477,7 +476,6 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
 
   const auto& layer_info = layers_[layer_idx];
   const auto& layer_holds = buffer_holds_[layer_idx];
-  size_t layer_size = block_bytes(layer_idx);
 
   std::vector<xla::Future<raiden::BufferHolder>> shard_futures_to_join;
   for (size_t i = 0; i < num_shards_; ++i) {
@@ -500,7 +498,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
                                                 : "unknown")
             << ", is_tiled=" << is_tiled << ", skip_flag=" << skip_flag
             << ", shape=" << shard_hold.shape.ToString()
-            << ", size=" << layer_size << " bytes)";
+            << ", size=" << shard_info.device_size << " bytes)";
 
     std::vector<xla::Future<>> shard_futures;
     if (is_tiled) {
@@ -537,8 +535,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
 
       shard_futures.push_back(std::move(detile_future));
     } else {
-      xla::Future<> future =
-          shard_hold.CopyRawDeviceToHost(dst_host_ptr, 0, layer_size);
+      xla::Future<> future = shard_hold.CopyRawDeviceToHost(
+          dst_host_ptr, 0, shard_info.device_size);
       shard_futures.push_back(std::move(future));
     }
     shard_futures_to_join.push_back(raiden::CreateBufferFuture(

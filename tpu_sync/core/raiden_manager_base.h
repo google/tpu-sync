@@ -106,6 +106,7 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
 
   virtual const uint8_t* GetHostPointer(size_t layer_idx,
                                         size_t shard_idx) const;
+  virtual size_t GetHostSize(size_t layer_idx, size_t shard_idx) const;
 
   void SetExternalHostPointers(const std::vector<const uint8_t*>& host_ptrs,
                                const std::vector<size_t>& host_sizes);

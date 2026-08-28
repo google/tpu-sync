@@ -92,6 +92,11 @@ RaidenManagerBase::RaidenManagerBase(size_t num_layers, size_t num_shards,
 }
 
 RaidenManagerBase::~RaidenManagerBase() {
+  StopTransportServer();
+}
+
+void RaidenManagerBase::StopTransportServer() {
+  absl::MutexLock lock(server_init_mu_);
   if (server_) {
     server_.reset();
   }

@@ -460,6 +460,7 @@ void KVCacheManagerBase::InitBackgroundWorker() {
 }
 
 KVCacheManagerBase::~KVCacheManagerBase() {
+  StopTransportServer();
   if (worker_thread_.joinable()) {
     {
       absl::MutexLock lock(queue_mu_);

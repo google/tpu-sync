@@ -96,6 +96,9 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
 
   virtual void ForgetPushProgress(uint64_t uuid);
 
+  // Stops and joins the underlying raw transport server if active.
+  void StopTransportServer();
+
   virtual std::optional<int> local_port() const;
   virtual std::string local_ip() const;
   virtual std::vector<std::string> local_ips() const;

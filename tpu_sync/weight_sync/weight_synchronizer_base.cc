@@ -321,7 +321,12 @@ WeightSynchronizerBase::get_local_endpoints() const {
   return {RaidenTransferEndpoint{ep, std::move(shards)}};
 }
 
-WeightSynchronizerBase::~WeightSynchronizerBase() = default;
+WeightSynchronizerBase::~WeightSynchronizerBase() {
+  StopTransportServer();
+  listener_.reset();
+  h2d_pool_.reset();
+  push_pool_.reset();
+}
 
 size_t WeightSynchronizerBase::GetPipelineGroupSize() const {
   if (pipeline_group_size_override_.has_value()) {

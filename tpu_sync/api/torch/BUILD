@@ -165,16 +165,14 @@ py_test(
     ],
 )
 
+# Base accelerator test requiring physical TPU devices via torch_tpu.
+# Tagged "manual" because generic CPU Forge runners lack TPU hardware.
+# For remote execution on Forge, use the _gf (TPU v4) or _gl (TPU v5e) targets below.
 py_test(
     name = "kv_cache_store_recovery_e2e_test",
     srcs = ["kv_cache_store_recovery_e2e_test.py"],
     tags = [
-        "cpu:8",
-        "nobuilder",
-        "notap",
-        "requires-accel-hbm",
-        "requires-ghostlite:8",
-        "requires-net:external",
+        "manual",
     ],
     deps = [
         ":kv_cache_manager_torch_py",

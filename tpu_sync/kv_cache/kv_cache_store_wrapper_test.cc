@@ -27,6 +27,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/global_registry/test_util.h"
@@ -77,12 +78,19 @@ class KVCacheStoreWrapperTest : public ::testing::Test {
     ClearMonitorEnv();
   }
 
+  static RaidenId TestRaidenId() {
+    return RaidenId{"wrapper_test_job", "0", "wrapper_test_cache", 0};
+  }
+
+  // TestRaidenId()'s contribution to the metadata segment name.
+  static constexpr absl::string_view kIdentitySuffix =
+      "_wrapper_test_job_0_wrapper_test_cache_0";
+
   std::unique_ptr<KVCacheStoreWrapper> MakeWrapper(
       size_t capacity, int num_shards,
       const std::string& global_registry_address = "") {
-    RaidenId rid{"wrapper_test_job", "0", "wrapper_test_cache", 0};
     return std::make_unique<KVCacheStoreWrapper>(
-        capacity, global_registry_address, rid, num_shards,
+        capacity, global_registry_address, TestRaidenId(), num_shards,
         /*shard_size_bytes=*/512,
         /*store_server_ip=*/"127.0.0.1");
   }
@@ -98,15 +106,18 @@ class KVCacheStoreWrapperTest : public ::testing::Test {
   }
 
   void UnlinkSegments() {
-    shm_unlink(absl::StrCat("/", shm_key_, "_metadata").c_str());
-    shm_unlink(absl::StrCat("/", shm_key_, "_metadata_test_server").c_str());
+    shm_unlink(
+        absl::StrCat("/", shm_key_, "_metadata", kIdentitySuffix).c_str());
+    shm_unlink(absl::StrCat("/", shm_key_, "_metadata_test_server",
+                            kIdentitySuffix)
+                   .c_str());
   }
 
   // Inserts `hashes` as host-resident blocks 0..n-1, mirroring them into the
   // metadata table.
   void InsertHostBlocks(KVCacheStoreWrapper& wrapper,
                         const std::vector<std::string>& hashes) {
-    RaidenId rid{"wrapper_test_job", "0", "wrapper_test_cache", 0};
+    RaidenId rid = TestRaidenId();
     std::vector<RaidenBlockId> slices;
     slices.reserve(hashes.size());
     for (int i = 0; i < static_cast<int>(hashes.size()); ++i) {
@@ -124,7 +135,8 @@ class KVCacheStoreWrapperTest : public ::testing::Test {
 TEST_F(KVCacheStoreWrapperTest, NoShmKeySkipsMetadataTable) {
   unsetenv("RAIDEN_SHM_KEY");
   auto wrapper = MakeWrapper(/*capacity=*/4, /*num_shards=*/1);
-  EXPECT_FALSE(MetadataSegmentExists("_metadata"));
+  EXPECT_FALSE(
+      MetadataSegmentExists(absl::StrCat("_metadata", kIdentitySuffix)));
   EXPECT_EQ((*wrapper)->capacity(), 4);
 }
 
@@ -139,7 +151,8 @@ TEST_F(KVCacheStoreWrapperTest, NumShardsZeroThrows) {
 
 TEST_F(KVCacheStoreWrapperTest, ColdStartCreatesMetadataTable) {
   auto wrapper = MakeWrapper(/*capacity=*/4, /*num_shards=*/1);
-  EXPECT_TRUE(MetadataSegmentExists("_metadata"));
+  EXPECT_TRUE(
+      MetadataSegmentExists(absl::StrCat("_metadata", kIdentitySuffix)));
   auto lookup_or = (*wrapper)->Lookup({"host_1"}, LookupOptions{});
   ASSERT_TRUE(lookup_or.ok());
   EXPECT_THAT(*lookup_or, IsEmpty());
@@ -148,8 +161,49 @@ TEST_F(KVCacheStoreWrapperTest, ColdStartCreatesMetadataTable) {
 TEST_F(KVCacheStoreWrapperTest, ServerNameSuffixesMetadataSegment) {
   setenv("RAIDEN_SHM_SERVER_NAME", "test_server", /*overwrite=*/1);
   auto wrapper = MakeWrapper(/*capacity=*/4, /*num_shards=*/1);
-  EXPECT_TRUE(MetadataSegmentExists("_metadata_test_server"));
-  EXPECT_FALSE(MetadataSegmentExists("_metadata"));
+  EXPECT_TRUE(MetadataSegmentExists(
+      absl::StrCat("_metadata_test_server", kIdentitySuffix)));
+  EXPECT_FALSE(
+      MetadataSegmentExists(absl::StrCat("_metadata", kIdentitySuffix)));
+}
+
+TEST_F(KVCacheStoreWrapperTest, MetadataShmKeyAppendsStoreIdentity) {
+  EXPECT_EQ(MetadataShmKey(RaidenId{"job_a", "1", "kv_cache", 2}),
+            absl::StrCat(shm_key_, "_metadata_job_a_1_kv_cache_2"));
+  setenv("RAIDEN_SHM_SERVER_NAME", "replica0", /*overwrite=*/1);
+  EXPECT_EQ(MetadataShmKey(RaidenId{"job_a", "1", "kv_cache", 2}),
+            absl::StrCat(shm_key_, "_metadata_replica0_job_a_1_kv_cache_2"));
+}
+
+// Colocated stores share the host's env block, so the RaidenId must be what
+// tells their tables apart -- and it may hold characters (path separators,
+// borg cell prefixes) that are illegal inside a shm name.
+TEST_F(KVCacheStoreWrapperTest, MetadataShmKeySanitizesTheIdentity) {
+  EXPECT_EQ(MetadataShmKey(RaidenId{"cell/job:a", "0", "kv cache", 0}),
+            absl::StrCat(shm_key_, "_metadata_cell_job_a_0_kv_cache_0"));
+  EXPECT_NE(MetadataShmKey(RaidenId{"job_a", "0", "kv_cache", 0}),
+            MetadataShmKey(RaidenId{"job_a", "1", "kv_cache", 0}));
+}
+
+TEST_F(KVCacheStoreWrapperTest, MetadataShmKeyEmptyIdentityAddsNoSuffix) {
+  EXPECT_EQ(MetadataShmKey(RaidenId{}),
+            absl::StrCat(shm_key_, "_metadata"));
+}
+
+// A malformed shm env value is a configuration error: it must throw (a
+// Python ValueError), not degrade to silently serving without recovery.
+TEST_F(KVCacheStoreWrapperTest, MalformedShmKeyThrows) {
+  setenv("RAIDEN_SHM_KEY", "tmp/raiden", /*overwrite=*/1);
+  EXPECT_THROW(
+      { MakeWrapper(/*capacity=*/4, /*num_shards=*/1); },
+      std::invalid_argument);
+}
+
+TEST_F(KVCacheStoreWrapperTest, MalformedShmServerNameThrows) {
+  setenv("RAIDEN_SHM_SERVER_NAME", "rep lica", /*overwrite=*/1);
+  EXPECT_THROW(
+      { MakeWrapper(/*capacity=*/4, /*num_shards=*/1); },
+      std::invalid_argument);
 }
 
 TEST_F(KVCacheStoreWrapperTest, RecoversHostBlocksAfterRestart) {

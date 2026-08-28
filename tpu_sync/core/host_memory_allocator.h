@@ -19,9 +19,11 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "absl/base/nullability.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -112,6 +114,24 @@ class SharedMemoryHostMemoryAllocator : public HostMemoryAllocator {
   static absl::StatusOr<std::unique_ptr<SharedMemoryHostMemoryAllocator>>
   Create(xla::PjRtClient* client, absl::string_view shm_key,
          const SharedMemoryHeader& expected_schema);
+
+
+  // The shm_open name for this allocator's segment: `shm_key` plus an
+  // optional "_<RAIDEN_SHM_SERVER_NAME>" suffix from the environment, plus
+  // "_dev_<global_device_id>" when a device is given, "/"-prefixed.
+  static std::string ComposeSegmentName(
+      absl::string_view shm_key, std::optional<int64_t> global_device_id);
+
+  // Validates the user-supplied segment-name inputs: `shm_key` (a
+  // RAIDEN_SHM_KEY value; one leading '/' is tolerated as the shm_open name
+  // prefix) and, when set, the RAIDEN_SHM_SERVER_NAME environment value.
+  // Each must be non-empty, at most 200 characters (leaving NAME_MAX room
+  // for the composed suffixes), and hold only letters, digits, '.', '_' and
+  // '-' -- shm names are single path components, so '/' in particular makes
+  // shm_open fail. Violations are an InvalidArgumentError naming the
+  // variable and the offending character; user configuration is never
+  // silently rewritten.
+  static absl::Status ValidateShmNameParts(absl::string_view shm_key);
 
   ~SharedMemoryHostMemoryAllocator() override;
 

@@ -133,6 +133,7 @@ cc_library(
         ":kv_cache_store",
         ":kv_cache_store_backend_factory",
         "//tpu_sync/common:raiden_id",
+        "//tpu_sync/core:host_memory_allocator",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

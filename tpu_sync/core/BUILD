@@ -464,6 +464,24 @@ cc_test(
 )
 
 cc_test(
+    name = "host_memory_allocator_shm_key_test",
+    srcs = ["host_memory_allocator_shm_key_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    deps = [
+        ":host_memory_allocator",
+        "@xla//xla/tsl/platform:test",
+        "@xla//xla/tsl/platform:test_main",
+    ],
+)
+
+cc_test(
     name = "tpu_utils_test",
     srcs = ["tpu_utils_test.cc"],
     copts = [

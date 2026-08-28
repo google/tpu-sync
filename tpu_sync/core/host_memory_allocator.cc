@@ -24,15 +24,20 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
+#include <string>
 #include <utility>
 
 #include "absl/base/nullability.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/escaping.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
 #include "xla/pjrt/host_memory_allocator.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/tpu_utils.h"
@@ -213,10 +218,74 @@ absl::StatusOr<HostBufferAllocation> MallocHostMemoryAllocator::Allocate(
   return alloc;
 }
 
+std::string SharedMemoryHostMemoryAllocator::ComposeSegmentName(
+    absl::string_view shm_key, std::optional<int64_t> global_device_id) {
+  std::string name(shm_key);
+  const char* server_name_env = std::getenv("RAIDEN_SHM_SERVER_NAME");
+  if (server_name_env != nullptr && std::strlen(server_name_env) > 0) {
+    absl::StrAppend(&name, "_", server_name_env);
+  }
+  if (global_device_id.has_value()) {
+    absl::StrAppend(&name, "_dev_", *global_device_id);
+  }
+  if (name.empty() || name[0] != '/') {
+    name.insert(0, "/");
+  }
+  return name;
+}
+
+absl::Status SharedMemoryHostMemoryAllocator::ValidateShmNameParts(
+    absl::string_view shm_key) {
+  // The same charset SanitizeForShmName (kv_cache_store_wrapper.cc) keeps;
+  // there internal identities are rewritten to it, here user configuration
+  // is rejected against it.
+  auto validate_part = [](absl::string_view part,
+                          absl::string_view what) -> absl::Status {
+    constexpr size_t kMaxPartLength = 200;
+    if (part.empty()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat(what, " must not be empty"));
+    }
+    if (part.size() > kMaxPartLength) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          what, "=\"", part, "\" is ", part.size(),
+          " characters; a shm segment name allows at most ", kMaxPartLength,
+          " here, leaving room for the composed suffixes"));
+    }
+    for (char c : part) {
+      if (!absl::ascii_isalnum(c) && c != '_' && c != '-' && c != '.') {
+        return absl::InvalidArgumentError(absl::StrCat(
+            what, "=\"", part, "\" contains '",
+            absl::CEscape(absl::string_view(&c, 1)),
+            "'; a shm segment name allows only letters, digits, '.', '_' and "
+            "'-'"));
+      }
+    }
+    return absl::OkStatus();
+  };
+
+  absl::Status valid =
+      validate_part(absl::StripPrefix(shm_key, "/"), "RAIDEN_SHM_KEY");
+  if (!valid.ok()) {
+    return valid;
+  }
+  const char* server_name_env = std::getenv("RAIDEN_SHM_SERVER_NAME");
+  if (server_name_env != nullptr && std::strlen(server_name_env) > 0) {
+    return validate_part(server_name_env, "RAIDEN_SHM_SERVER_NAME");
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<std::unique_ptr<SharedMemoryHostMemoryAllocator>>
 SharedMemoryHostMemoryAllocator::Create(
     xla::PjRtClient* client, absl::string_view shm_key,
     const SharedMemoryHeader& expected_schema) {
+  // Failing here gives the misconfiguration a clear boot-time error instead
+  // of a bare shm_open errno at the first allocation.
+  absl::Status valid = ValidateShmNameParts(shm_key);
+  if (!valid.ok()) {
+    return valid;
+  }
   return std::unique_ptr<SharedMemoryHostMemoryAllocator>(
       new SharedMemoryHostMemoryAllocator(client, shm_key, expected_schema));
 }
@@ -264,18 +333,11 @@ absl::StatusOr<HostBufferAllocation> SharedMemoryHostMemoryAllocator::Allocate(
       (sizeof(SharedMemoryHeader) + aligned_payload_size + 4095) & ~4095;
   mapped_size_ = total_size;
 
-  std::string full_shm_key = shm_key_;
-  const char* server_name_env = std::getenv("RAIDEN_SHM_SERVER_NAME");
-  if (server_name_env != nullptr && std::strlen(server_name_env) > 0) {
-    absl::StrAppend(&full_shm_key, "_", server_name_env);
-  }
-  if (g_current_device != nullptr) {
-    absl::StrAppend(&full_shm_key, "_dev_",
-                    g_current_device->local_device_id().value());
-  }
-  if (full_shm_key.empty() || full_shm_key[0] != '/') {
-    full_shm_key.insert(0, "/");
-  }
+  const std::string full_shm_key = ComposeSegmentName(
+      shm_key_, g_current_device != nullptr
+                    ? std::optional<int64_t>(
+                          g_current_device->global_device_id().value())
+                    : std::nullopt);
 
   VLOG(1) << "[SHM_ALLOCATOR] Attempting to open/create shm key: "
           << full_shm_key << " of size " << total_size;

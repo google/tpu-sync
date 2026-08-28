@@ -34,7 +34,9 @@ from nothing but the environment and the surviving shared memory.
 
 The test drives one TPU device through torch_tpu. Production deployments run
 one worker process per device, each with its own shared-memory data segment;
-a single device mirrors one such worker.
+a single device mirrors one such worker. The skipped test below pins one
+intended contract: a KV pool of several backing arrays must keep its own
+shared-memory mirror per array.
 """
 
 import os
@@ -42,6 +44,7 @@ import socket
 import subprocess
 import sys
 import time
+import unittest
 
 from absl import app
 from absl import flags
@@ -56,6 +59,13 @@ _SIGKILL = 9
 _NUM_BLOCKS = 2
 _SHAPE = (_NUM_BLOCKS, 128, 8, 8, 128)  # float32
 _HASHES = [b"hash_0", b"hash_1"]
+
+_PENDING_SEGMENT_FIX = unittest.skip(
+    "The shared-memory allocator returns the same single segment for every"
+    " allocation in a process, so the host mirrors of a second KV array alias"
+    " (and corrupt) the first; enable once each allocation gets its own"
+    " segment."
+)
 
 # The phases run in subprocesses, so their detailed assertions are invisible
 # to the test process. Each phase prints one of these markers only after all
@@ -74,14 +84,24 @@ def _find_free_port() -> int:
     return s.getsockname()[1]
 
 
-def _make_cache(host_data):
-  """Puts host_data on the single TPU device."""
+def _array_fill(shape, index):
+  """A distinct, exactly float32-representable pattern per KV array."""
+  import numpy as np  # pylint: disable=g-import-not-at-top
+
+  size = int(np.prod(shape))
+  return (np.arange(size, dtype=np.float32) + index * 3_000_000.0).reshape(
+      shape
+  )
+
+
+def _make_caches(host_arrays):
+  """Puts each host array on the single TPU device."""
   import torch  # pylint: disable=g-import-not-at-top
 
-  return torch.tensor(host_data, device="tpu")
+  return [torch.tensor(host_data, device="tpu") for host_data in host_arrays]
 
 
-def _build_stack(tpu_cache):
+def _build_stack(tpu_caches):
   """Builds a store (with controller) and a manager wired to it."""
   # pylint: disable=g-import-not-at-top
   from tpu_sync.api.torch import kv_cache_manager
@@ -100,7 +120,7 @@ def _build_stack(tpu_cache):
       raiden_controller_port=controller_port,
   )
   manager = kv_cache_manager.KVCacheManager(
-      kv_caches=[tpu_cache],
+      kv_caches=tpu_caches,
       local_control_port=0,
       max_blocks=_NUM_BLOCKS,
       num_slots=2,
@@ -124,18 +144,17 @@ def _poll(poll_fn, want: int, what: str):
   raise RuntimeError(f"{what} timed out")
 
 
-def _phase_a():
+def _phase_a(shapes=(_SHAPE,)):
   """Saves distinct bytes to the shared-memory host pool, then crashes."""
   # pylint: disable=g-import-not-at-top
-  import numpy as np
   from tpu_sync.api.torch import kv_cache_store
   # pylint: enable=g-import-not-at-top
 
-  host_data = np.arange(np.prod(_SHAPE), dtype=np.float32).reshape(_SHAPE)
-  tpu_cache = _make_cache(host_data)
+  host_arrays = [_array_fill(shape, i) for i, shape in enumerate(shapes)]
+  tpu_caches = _make_caches(host_arrays)
   # The manager must stay referenced: it is the worker the store drives via
   # RPC for save/load.
-  store, manager, rid = _build_stack(tpu_cache)
+  store, manager, rid = _build_stack(tpu_caches)
 
   slices = [
       kv_cache_store.RaidenBlockId(
@@ -163,19 +182,18 @@ def _phase_a():
   os.kill(os.getpid(), _SIGKILL)
 
 
-def _phase_b(expect_recovery: bool):
+def _phase_b(expect_recovery: bool, shapes=(_SHAPE,)):
   """Restarts the stack and serves the recovered blocks from host memory."""
   # pylint: disable=g-import-not-at-top
   import numpy as np
   from tpu_sync.api.torch import kv_cache_store
   # pylint: enable=g-import-not-at-top
 
-  host_data = np.arange(np.prod(_SHAPE), dtype=np.float32).reshape(_SHAPE)
-  zeros = np.zeros(_SHAPE, dtype=np.float32)
-  tpu_cache = _make_cache(zeros)
+  zeros = [np.zeros(shape, dtype=np.float32) for shape in shapes]
+  tpu_caches = _make_caches(zeros)
   # Recovery happens inside the store construction: it attaches to the
   # surviving metadata table and rebuilds the LRU cache from it.
-  store, manager, rid = _build_stack(tpu_cache)
+  store, manager, rid = _build_stack(tpu_caches)
   del rid
 
   lookup_res = store.lookup(_HASHES)
@@ -200,7 +218,10 @@ def _phase_b(expect_recovery: bool):
   store.load(_HASHES, list(range(_NUM_BLOCKS)))
   _poll(store.poll_load_status, _NUM_BLOCKS, "load")
 
-  np.testing.assert_array_equal(tpu_cache.cpu().numpy(), host_data)
+  for i, (tpu_cache, shape) in enumerate(zip(tpu_caches, shapes)):
+    np.testing.assert_array_equal(
+        tpu_cache.cpu().numpy(), _array_fill(shape, i)
+    )
   print(_PHASE_B_BYTES_MARKER, flush=True)
 
 
@@ -255,8 +276,8 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
         check=False,
     )
 
-  def _crash_phase_a(self, model_uid: str = "recovery_model"):
-    result = self._run_phase("a", model_uid)
+  def _crash_phase_a(self, model_uid: str = "recovery_model", phase: str = "a"):
+    result = self._run_phase(phase, model_uid)
     self.assertEqual(
         result.returncode,
         -_SIGKILL,
@@ -286,6 +307,21 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
     )
     self.assertIn(_PHASE_B_COLD_MARKER, result.stdout)
 
+  @_PENDING_SEGMENT_FIX
+  def test_recovers_hybrid_model_arrays_after_crash(self):
+    # A hybrid model's KV pool reaches the manager as several backing arrays,
+    # all reshaped to one uniform kernel geometry (the connectors pad every
+    # group's pages to the same size). The host mirror of each array must be
+    # its own memory and survive the crash unclobbered by the others'.
+    self._crash_phase_a(phase="a_hybrid")
+
+    result = self._run_phase("b_hybrid", "recovery_model")
+    self.assertEqual(
+        result.returncode, 0, f"phase B failed:\n{result.stderr[-4000:]}"
+    )
+    self.assertIn(_PHASE_B_RECOVERED_MARKER, result.stdout)
+    self.assertIn(_PHASE_B_BYTES_MARKER, result.stdout)
+
 
 def main(argv):
   del argv  # Unused.
@@ -295,6 +331,10 @@ def main(argv):
     _phase_b(expect_recovery=True)
   elif _PHASE.value == "b_cold":
     _phase_b(expect_recovery=False)
+  elif _PHASE.value == "a_hybrid":
+    _phase_a(shapes=(_SHAPE, _SHAPE))
+  elif _PHASE.value == "b_hybrid":
+    _phase_b(expect_recovery=True, shapes=(_SHAPE, _SHAPE))
 
 
 if __name__ == "__main__":

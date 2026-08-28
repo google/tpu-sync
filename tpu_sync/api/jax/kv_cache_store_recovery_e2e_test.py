@@ -36,7 +36,8 @@ process per device, each with its own shared-memory data segment; a single
 device mirrors one such worker. (A single process managing several shards
 over one shared-memory segment is not a deployed configuration: every
 allocation from one SharedMemoryHostMemoryAllocator returns a view of the
-same segment.)
+same segment. The skipped multi-array and multi-shard tests below pin the
+intended contract for those configurations.)
 """
 
 import os
@@ -44,6 +45,7 @@ import socket
 import subprocess
 import sys
 import time
+import unittest
 
 from absl import app
 from absl import flags
@@ -58,6 +60,13 @@ _SIGKILL = 9
 _NUM_BLOCKS = 2
 _SHAPE = (_NUM_BLOCKS, 128, 8, 8, 128)  # float32
 _HASHES = [b"hash_0", b"hash_1"]
+
+_PENDING_SEGMENT_FIX = unittest.skip(
+    "The shared-memory allocator returns the same single segment for every"
+    " allocation in a process, so the host mirrors of a second KV array or a"
+    " second shard alias (and corrupt) the first; enable once each allocation"
+    " gets its own segment."
+)
 
 # The phases run in subprocesses, so their detailed assertions are invisible
 # to the test process. Each phase prints one of these markers only after all
@@ -76,22 +85,35 @@ def _find_free_port() -> int:
     return s.getsockname()[1]
 
 
-def _make_cache(host_data):
-  """Puts host_data on the single device with the layout the manager expects."""
+def _array_fill(shape, index):
+  """A distinct, exactly float32-representable pattern per KV array."""
+  import numpy as np
+
+  size = int(np.prod(shape))
+  return (np.arange(size, dtype=np.float32) + index * 3_000_000.0).reshape(
+      shape
+  )
+
+
+def _make_caches(host_arrays, num_devices=1):
+  """Puts each host array on the mesh with the layout the manager expects."""
   import jax
   import jax.numpy as jnp
   import numpy as np
 
-  devices = np.array(jax.devices()[:1]).reshape(1, 1)
+  devices = np.array(jax.devices()[:num_devices]).reshape(1, num_devices)
   mesh = jax.sharding.Mesh(devices, ("data", "model"))
   spec = jax.sharding.PartitionSpec(None, None, "model", None, None)
   sharding = jax.sharding.NamedSharding(mesh, spec)
-  cache = jax.device_put(jnp.array(host_data), sharding)
-  jax.block_until_ready(cache)
-  return cache
+  caches = [
+      jax.device_put(jnp.array(host_data), sharding)
+      for host_data in host_arrays
+  ]
+  jax.block_until_ready(caches)
+  return caches
 
 
-def _build_stack(tpu_cache):
+def _build_stack(tpu_caches, num_shards=1):
   """Builds a store (with controller) and a manager wired to it."""
   from tpu_sync.api.jax import kv_cache_manager
   from tpu_sync.api.jax import kv_cache_store
@@ -102,13 +124,13 @@ def _build_stack(tpu_cache):
   store = kv_cache_store.KVCacheStore(
       capacity=_NUM_BLOCKS,
       raiden_id=rid,
-      num_shards=1,
-      shard_size_bytes=block_elements * 4,
+      num_shards=num_shards,
+      shard_size_bytes=block_elements * 4 // num_shards,
       store_server_ip="localhost",
       raiden_controller_port=controller_port,
   )
   manager = kv_cache_manager.KVCacheManager(
-      kv_caches=[tpu_cache],
+      kv_caches=tpu_caches,
       local_control_port=0,
       max_blocks=_NUM_BLOCKS,
       num_slots=2,
@@ -135,16 +157,15 @@ def _poll(poll_fn, want: int, what: str):
   raise RuntimeError(f"{what} timed out")
 
 
-def _phase_a():
+def _phase_a(shapes=(_SHAPE,), num_shards=1, num_devices=1):
   """Saves distinct bytes to the shared-memory host pool, then crashes."""
-  import numpy as np
   from tpu_sync.api.jax import kv_cache_store
 
-  host_data = np.arange(np.prod(_SHAPE), dtype=np.float32).reshape(_SHAPE)
-  tpu_cache = _make_cache(host_data)
+  host_arrays = [_array_fill(shape, i) for i, shape in enumerate(shapes)]
+  tpu_caches = _make_caches(host_arrays, num_devices)
   # The manager must stay referenced: it is the worker the store drives via
   # RPC for save/load.
-  store, manager, rid = _build_stack(tpu_cache)
+  store, manager, rid = _build_stack(tpu_caches, num_shards)
 
   slices = [
       kv_cache_store.RaidenBlockId(
@@ -172,17 +193,18 @@ def _phase_a():
   os.kill(os.getpid(), _SIGKILL)
 
 
-def _phase_b(expect_recovery: bool):
+def _phase_b(
+    expect_recovery: bool, shapes=(_SHAPE,), num_shards=1, num_devices=1
+):
   """Restarts the stack and serves the recovered blocks from host memory."""
   import numpy as np
   from tpu_sync.api.jax import kv_cache_store
 
-  host_data = np.arange(np.prod(_SHAPE), dtype=np.float32).reshape(_SHAPE)
-  zeros = np.zeros(_SHAPE, dtype=np.float32)
-  tpu_cache = _make_cache(zeros)
+  zeros = [np.zeros(shape, dtype=np.float32) for shape in shapes]
+  tpu_caches = _make_caches(zeros, num_devices)
   # Recovery happens inside the store construction: it attaches to the
   # surviving metadata table and rebuilds the LRU cache from it.
-  store, manager, rid = _build_stack(tpu_cache)
+  store, manager, rid = _build_stack(tpu_caches, num_shards)
   del rid
 
   lookup_res = store.lookup(_HASHES)
@@ -204,11 +226,13 @@ def _phase_b(expect_recovery: bool):
     assert blk.host_block_id == i, (i, blk.host_block_id)
   print(_PHASE_B_RECOVERED_MARKER, flush=True)
 
-  # lookup() already resolved and pinned the recovered blocks; load() consumes the pin on success.
+  # lookup() already resolved and pinned the recovered blocks; load() consumes
+  # the pin on success.
   store.load(_HASHES, list(range(_NUM_BLOCKS)))
   _poll(store.poll_load_status, _NUM_BLOCKS, "load")
 
-  np.testing.assert_array_equal(np.asarray(tpu_cache), host_data)
+  for i, (tpu_cache, shape) in enumerate(zip(tpu_caches, shapes)):
+    np.testing.assert_array_equal(np.asarray(tpu_cache), _array_fill(shape, i))
   print(_PHASE_B_BYTES_MARKER, flush=True)
 
 
@@ -232,7 +256,7 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
           pass
     super().tearDown()
 
-  def _phase_env(self, model_uid: str) -> dict:
+  def _phase_env(self, model_uid: str, num_devices: int = 1) -> dict:
     env = dict(os.environ)
     env.update({
         # The KV pool and the metadata table are shm-backed under this single
@@ -242,7 +266,7 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
         "RAIDEN_SHM_MODEL_UID": model_uid,
         "RAIDEN_DISABLE_SINGLETON_WORKER": "1",
         "JAX_PLATFORMS": "cpu",
-        "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
+        "XLA_FLAGS": f"--xla_force_host_platform_device_count={num_devices}",
         # Keep the child's import path identical to this process's, whether
         # running under bazel runfiles or directly.
         "PYTHONPATH": os.pathsep.join(sys.path),
@@ -250,7 +274,7 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
     return env
 
   def _run_phase(
-      self, phase: str, model_uid: str
+      self, phase: str, model_uid: str, num_devices: int = 1
   ) -> subprocess.CompletedProcess:
     if sys.executable:
       cmd = [sys.executable, os.path.abspath(__file__), f"--phase={phase}"]
@@ -258,15 +282,20 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
       cmd = [os.path.abspath(sys.argv[0]), f"--phase={phase}"]
     return subprocess.run(
         cmd,
-        env=self._phase_env(model_uid),
+        env=self._phase_env(model_uid, num_devices),
         capture_output=True,
         text=True,
         timeout=300,
         check=False,
     )
 
-  def _crash_phase_a(self, model_uid: str = "recovery_model"):
-    result = self._run_phase("a", model_uid)
+  def _crash_phase_a(
+      self,
+      model_uid: str = "recovery_model",
+      phase: str = "a",
+      num_devices: int = 1,
+  ):
+    result = self._run_phase(phase, model_uid, num_devices)
     self.assertEqual(
         result.returncode,
         -_SIGKILL,
@@ -296,6 +325,34 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
     )
     self.assertIn(_PHASE_B_COLD_MARKER, result.stdout)
 
+  @_PENDING_SEGMENT_FIX
+  def test_recovers_hybrid_model_arrays_after_crash(self):
+    # A hybrid model's KV pool reaches the manager as several backing arrays,
+    # all reshaped to one uniform kernel geometry (the connectors pad every
+    # group's pages to the same size). The host mirror of each array must be
+    # its own memory and survive the crash unclobbered by the others'.
+    self._crash_phase_a(phase="a_hybrid")
+
+    result = self._run_phase("b_hybrid", "recovery_model")
+    self.assertEqual(
+        result.returncode, 0, f"phase B failed:\n{result.stderr[-4000:]}"
+    )
+    self.assertIn(_PHASE_B_RECOVERED_MARKER, result.stdout)
+    self.assertIn(_PHASE_B_BYTES_MARKER, result.stdout)
+
+  @_PENDING_SEGMENT_FIX
+  def test_recovers_sharded_array_after_crash(self):
+    # Two shards of one array allocate through the same allocator instance;
+    # each shard's mirror must be its own memory.
+    self._crash_phase_a(phase="a_sharded", num_devices=2)
+
+    result = self._run_phase("b_sharded", "recovery_model", num_devices=2)
+    self.assertEqual(
+        result.returncode, 0, f"phase B failed:\n{result.stderr[-4000:]}"
+    )
+    self.assertIn(_PHASE_B_RECOVERED_MARKER, result.stdout)
+    self.assertIn(_PHASE_B_BYTES_MARKER, result.stdout)
+
 
 def main(argv):
   del argv  # Unused.
@@ -305,6 +362,14 @@ def main(argv):
     _phase_b(expect_recovery=True)
   elif _PHASE.value == "b_cold":
     _phase_b(expect_recovery=False)
+  elif _PHASE.value == "a_hybrid":
+    _phase_a(shapes=(_SHAPE, _SHAPE))
+  elif _PHASE.value == "b_hybrid":
+    _phase_b(expect_recovery=True, shapes=(_SHAPE, _SHAPE))
+  elif _PHASE.value == "a_sharded":
+    _phase_a(num_shards=2, num_devices=2)
+  elif _PHASE.value == "b_sharded":
+    _phase_b(expect_recovery=True, num_shards=2, num_devices=2)
 
 
 if __name__ == "__main__":

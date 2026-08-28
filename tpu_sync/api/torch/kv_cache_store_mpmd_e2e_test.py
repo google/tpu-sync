@@ -13,11 +13,12 @@
 # limitations under the License.
 
 import os
+import pathlib
 import socket
 import subprocess
-import time
-import pathlib
 import sys
+import time
+import unittest
 
 _LOG_DIR = os.environ.get("TEST_TMPDIR", os.environ.get("TMPDIR", "/tmp"))
 os.environ.setdefault("TPU_LOG_DIR", _LOG_DIR)
@@ -62,6 +63,7 @@ _TOPOLOGY_BY_TPU_PCI_DEVICE_ID = {
     "0x0076": {2: "1,1,1,2", 4: "1,2,1,2", 8: "2,2,1,2"},
 }
 
+
 def _scan_pci_tpus():
   count = 0
   topology_map = None
@@ -87,11 +89,19 @@ def _scan_pci_tpus():
       continue
   return count, topology_map
 
+
 def get_tpu_topology(world_size: int) -> str:
   _, topology_map = _scan_pci_tpus()
   if topology_map and world_size in topology_map:
     return topology_map[world_size]
-  return "2x4" if world_size == 8 else "2x2" if world_size == 4 else f"1x{world_size}"
+  return (
+      "2x4"
+      if world_size == 8
+      else "2x2"
+      if world_size == 4
+      else f"1x{world_size}"
+  )
+
 
 def pick_unused_ports(count: int) -> list[int]:
   ports = []
@@ -103,6 +113,7 @@ def pick_unused_ports(count: int) -> list[int]:
     s.close()
   return ports
 
+
 def prepare_tpu_environment(world_size: int) -> None:
   log_dir = os.environ.get("TEST_TMPDIR", os.environ.get("TMPDIR", "/tmp"))
   os.environ["TPU_LOG_DIR"] = log_dir
@@ -113,12 +124,16 @@ def prepare_tpu_environment(world_size: int) -> None:
   if "TORCH_TPU_XPROF_SESSION_ID" not in os.environ:
     os.environ["TORCH_TPU_XPROF_SESSION_ID"] = str(time.time_ns())
   ports = pick_unused_ports(world_size)
-  os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join([f"localhost:{p}" for p in ports])
+  os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+      [f"localhost:{p}" for p in ports]
+  )
   if "TORCH_TPU_TOPOLOGY" not in os.environ:
     os.environ["TORCH_TPU_TOPOLOGY"] = get_tpu_topology(world_size)
 
+
 _registry_process = None
 _registry_port = None
+
 
 def start_servers():
   global _registry_process
@@ -152,6 +167,7 @@ def start_servers():
   )
   time.sleep(2)
 
+
 def stop_servers():
   global _registry_process
   if _registry_process:
@@ -167,12 +183,15 @@ def stop_servers():
     _registry_process.wait()
     _registry_process = None
 
+
 def setUpModule():
   os.environ["RAIDEN_DISABLE_SINGLETON_WORKER"] = "1"
   os.environ["GLOG_alsologtostderr"] = "1"
 
+
 def tearDownModule():
   pass
+
 
 def _worker_save_load_main(argv):
   rank = FLAGS.rank
@@ -191,13 +210,20 @@ def _worker_save_load_main(argv):
   os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
   os.environ["GLOG_alsologtostderr"] = "1"
 
-  dist.init_process_group(backend="gloo", init_method=f"tcp://127.0.0.1:{master_port}", rank=rank, world_size=world_size)
+  dist.init_process_group(
+      backend="gloo",
+      init_method=f"tcp://127.0.0.1:{master_port}",
+      rank=rank,
+      world_size=world_size,
+  )
 
   try:
     device = torch.device("tpu")
     num_blocks = 4
     shape = (num_blocks, 128, 8, 8, 128)
-    host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) + (rank * 1000.0)
+    host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) + (
+        rank * 1000.0
+    )
     tpu_cache = torch.tensor(host_data, device=device)
 
     # Expected reference after loading saved blocks 0 and 1 into blocks 2 and 3: [a, b, a, b]
@@ -210,7 +236,7 @@ def _worker_save_load_main(argv):
 
     if rank == 0:
       block_elements = 128 * 8 * 8 * 128
-      shard_size_bytes = (block_elements * 4)
+      shard_size_bytes = block_elements * 4
 
       rid = kv_cache_store.RaidenId("mpmd_e2e_job", "0", "mpmd_cache", 0)
       # Init store first on rank 0, this binds the local controller server!
@@ -225,10 +251,22 @@ def _worker_save_load_main(argv):
       )
 
       slices = [
-          kv_cache_store.RaidenBlockId(rid, host_block_id=-1, device_block_id=0, status=kv_cache_store.BlockStatus.HBM),
-          kv_cache_store.RaidenBlockId(rid, host_block_id=-1, device_block_id=1, status=kv_cache_store.BlockStatus.HBM),
+          kv_cache_store.RaidenBlockId(
+              rid,
+              host_block_id=-1,
+              device_block_id=0,
+              status=kv_cache_store.BlockStatus.HBM,
+          ),
+          kv_cache_store.RaidenBlockId(
+              rid,
+              host_block_id=-1,
+              device_block_id=1,
+              status=kv_cache_store.BlockStatus.HBM,
+          ),
       ]
-      assert store.insert(hashes, slices, on_host=False), "Failed to insert blocks to store"
+      assert store.insert(
+          hashes, slices, on_host=False
+      ), "Failed to insert blocks to store"
 
     dist.barrier()
 
@@ -265,20 +303,23 @@ def _worker_save_load_main(argv):
       # A successful save consumed the pin; nothing to release.
 
     if rank == 0:
-      print("=== [Rank 0] Loading checkpoint from Host DRAM into TPU HBM blocks [2, 3] (store.load) ===")
+      print(
+          "=== [Rank 0] Loading checkpoint from Host DRAM into TPU HBM blocks"
+          " [2, 3] (store.load) ==="
+      )
       if FLAGS.use_slices:
         # lookup() pins the returned entries; load(..., slices=...) consumes the pin on success.
         load_slices = [entry for _, entry in store.lookup(hashes)]
-        assert len(load_slices) == len(hashes), (
-            f"expected {len(hashes)} entries, got {load_slices}"
-        )
+        assert len(load_slices) == len(
+            hashes
+        ), f"expected {len(hashes)} entries, got {load_slices}"
         for entry in load_slices:
-          assert entry.status == kv_cache_store.BlockStatus.HOST_AND_HBM, (
-              f"entry is {entry.status}, not HOST_AND_HBM"
-          )
-        assert store.load(hashes, [2, 3], slices=load_slices), (
-            "load with slices failed"
-        )
+          assert (
+              entry.status == kv_cache_store.BlockStatus.HOST_AND_HBM
+          ), f"entry is {entry.status}, not HOST_AND_HBM"
+        assert store.load(
+            hashes, [2, 3], slices=load_slices
+        ), "load with slices failed"
       else:
         # lookup() pins the returned entries; load() consumes the pin on success.
         assert len(store.lookup(hashes)) == len(hashes)
@@ -298,9 +339,15 @@ def _worker_save_load_main(argv):
       torch.tpu.synchronize()
     except (AttributeError, RuntimeError):
       pass
-    print(f"=== [Rank {rank}] Verifying TPU memory blocks [2, 3] match saved blocks [0, 1] ===")
+    print(
+        f"=== [Rank {rank}] Verifying TPU memory blocks [2, 3] match saved"
+        " blocks [0, 1] ==="
+    )
     np.testing.assert_array_equal(tpu_cache.cpu().numpy(), expected_ref)
-    print(f"=== [Rank {rank}] SUCCESS: E2E MPMD Save/Load [0, 1] -> [2, 3] roundtrip verified on physical TPU! ===")
+    print(
+        f"=== [Rank {rank}] SUCCESS: E2E MPMD Save/Load [0, 1] -> [2, 3]"
+        " roundtrip verified on physical TPU! ==="
+    )
 
   finally:
     dist.barrier()
@@ -394,7 +441,9 @@ def _worker_read_remote_main(argv):
               status=kv_cache_store.BlockStatus.HBM,
           ),
       ]
-      assert store_a.insert(hashes, slices_a, on_host=False), "Failed to insert blocks to store_a"
+      assert store_a.insert(
+          hashes, slices_a, on_host=False
+      ), "Failed to insert blocks to store_a"
 
     dist.barrier()
 
@@ -454,14 +503,19 @@ def _worker_read_remote_main(argv):
         if len(lookup_res_b) == 2:
           break
         time.sleep(0.5)
-      assert len(lookup_res_b) == 2, (
-          f"Expected 2 remote blocks, got {len(lookup_res_b)}"
-      )
+      assert (
+          len(lookup_res_b) == 2
+      ), f"Expected 2 remote blocks, got {len(lookup_res_b)}"
 
       slices_b = [lookup_res_b[0][1], lookup_res_b[1][1]]
       if use_slices:
-        print("=== [Rank 0] Launching peer-fetch Load from Job A to Job B with slices ===")
-        assert store_b.load(hashes, [0, 1], slices=slices_b), "load failed on store_b"
+        print(
+            "=== [Rank 0] Launching peer-fetch Load from Job A to Job B with"
+            " slices ==="
+        )
+        assert store_b.load(
+            hashes, [0, 1], slices=slices_b
+        ), "load failed on store_b"
         done = False
         while not done:
           load_done, load_failed, _ = store_b.poll_load_status()
@@ -496,7 +550,9 @@ def _worker_read_remote_main(argv):
       if use_slices:
         # A load from a peer records nothing locally: no host copy was kept, so
         # the cache is a miss for these hashes.
-        assert not store_b.lookup(hashes), "peer load must record nothing locally"
+        assert not store_b.lookup(
+            hashes
+        ), "peer load must record nothing locally"
 
     dist.barrier()
     try:
@@ -605,7 +661,9 @@ def _worker_write_remote_main(argv):
               status=kv_cache_store.BlockStatus.HBM,
           ),
       ]
-      assert store_a.insert(hashes, slices_a, on_host=False), "Failed to insert blocks to store_a"
+      assert store_a.insert(
+          hashes, slices_a, on_host=False
+      ), "Failed to insert blocks to store_a"
 
     dist.barrier()
 
@@ -663,16 +721,12 @@ def _worker_write_remote_main(argv):
       # lookup() answers "host-resident here" AND grants the pin that
       # save(dst) spends -- the documented remote-save flow.
       assert len(store_a.lookup(hashes)) == len(hashes), "hashes not resident"
-      assert store_a.save(
-          hashes, rid_b
-      ), "remote save launch failed on store_a"
+      assert store_a.save(hashes, rid_b), "remote save launch failed on store_a"
 
       deadline = time.time() + 120
       done = False
       while time.time() < deadline:
-        wr_done, wr_failed, wr_pending, _, _ = (
-            store_a.poll_save_status()
-        )
+        wr_done, wr_failed, wr_pending, _, _ = store_a.poll_save_status()
         if wr_failed:
           raise RuntimeError(f"Job A WriteRemote failed: {wr_failed}")
         if len(wr_done) == 2:
@@ -800,8 +854,63 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
     if failed:
       self.fail("One or more workers failed!")
 
+  # The same 8-rank save/load/compare run with the KV pools (and metadata
+  # tables) placed in shared memory. Every rank runs in its own process on the
+  # same host, so this is the configuration that needs per-rank segment names
+  # and one real segment per allocation; today the ranks collide on one name
+  # and the pools are additionally left unregistered with the DMA engine on
+  # multi-process TPUv7 (the DmaMap workaround). Enable only after the
+  # shared-memory allocator rework AND the libtpu release that fixes
+  # multi-process DmaMap (with the workaround removed) — the run is not
+  # production-representative before both.
+  @unittest.skip(
+      "Shared-memory segments collide across same-host MPMD ranks and the"
+      " allocator aliases every allocation into one segment; also requires"
+      " the libtpu multi-process DmaMap fix. Enable after the allocator"
+      " rework and the libtpu pin bump."
+  )
+  def test_mpmd_8rank_e2e_save_and_load_in_shared_memory(self):
+    world_size = 8
+    prepare_tpu_environment(world_size)
+    master_port = pick_unused_ports(1)[0]
+    controller_port = pick_unused_ports(1)[0]
+    shm_key = f"raiden_mpmd_e2e_{os.getpid()}"
 
+    procs = []
+    try:
+      for rank in range(world_size):
+        env = os.environ.copy()
+        env["RAIDEN_SHM_KEY"] = shm_key
+        env["RAIDEN_SHM_MODEL_UID"] = "mpmd_e2e_model"
+        cmd = [
+            sys.argv[0],
+            "--run_worker",
+            f"--rank={rank}",
+            f"--world_size={world_size}",
+            f"--master_port={master_port}",
+            f"--controller_port={controller_port}",
+            f"--registry_port={_registry_port}",
+        ]
+        procs.append(subprocess.Popen(cmd, env=env))
 
+      failed = False
+      for p in procs:
+        p.wait()
+        if p.returncode != 0:
+          failed = True
+
+      if failed:
+        self.fail("One or more workers failed!")
+    finally:
+      # Nothing in the serving stack ever unlinks the segments (they must
+      # outlive any crash); decommissioning is the operator's explicit
+      # shm_unlink — here, the test.
+      for name in os.listdir("/dev/shm"):
+        if name.startswith(shm_key):
+          try:
+            os.unlink(os.path.join("/dev/shm", name))
+          except OSError:
+            pass
 
   def test_mpmd_8rank_e2e_write_remote(self):
     world_size = 8

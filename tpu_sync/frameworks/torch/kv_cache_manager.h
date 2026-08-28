@@ -351,8 +351,27 @@ class KVCacheManager {
     return torch_manager_->H2hRead(std::move(peer), src_block_ids);
   }
 
-  absl::Status RegisterPools(std::vector<kv_cache::PoolSpec> pools) {
-    return torch_manager_->RegisterPools(std::move(pools));
+  absl::Status RegisterPools(std::vector<kv_cache::PoolSpec> pools,
+                             int64_t staging_leases = 0) {
+    return torch_manager_->RegisterPools(std::move(pools), staging_leases);
+  }
+
+  // Bounded host staging introspection.
+  std::vector<kv_cache::KVCacheManagerBase::PoolStagingStorageSummary>
+  PoolStagingSummary() const {
+    return torch_manager_->PoolStagingSummary();
+  }
+  int64_t pool_staging_leases() const {
+    return torch_manager_->pool_staging_leases();
+  }
+  absl::Status AcquirePoolStagingLease(uint64_t uuid, size_t storage_idx,
+                                       absl::Span<const int64_t> block_ids,
+                                       absl::Duration timeout) {
+    return torch_manager_->AcquirePoolStagingLease(uuid, storage_idx, block_ids,
+                                                   timeout);
+  }
+  void ReleasePoolStagingLeases(uint64_t uuid) {
+    torch_manager_->ReleasePoolStagingLeases(uuid);
   }
 
   absl::StatusOr<kv_cache::PoolBlockRef> GetPoolBlockRef(
@@ -387,14 +406,16 @@ class KVCacheManager {
 
   absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
-      std::optional<size_t> shard_idx = std::nullopt) {
-    return torch_manager_->D2hPoolBlocks(pool_idx, block_ids, shard_idx);
+      std::optional<size_t> shard_idx = std::nullopt,
+      std::optional<uint64_t> uuid = std::nullopt) {
+    return torch_manager_->D2hPoolBlocks(pool_idx, block_ids, shard_idx, uuid);
   }
 
   absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
-      std::optional<size_t> shard_idx = std::nullopt) {
-    return torch_manager_->H2dPoolBlocks(pool_idx, block_ids, shard_idx);
+      std::optional<size_t> shard_idx = std::nullopt,
+      std::optional<uint64_t> uuid = std::nullopt) {
+    return torch_manager_->H2dPoolBlocks(pool_idx, block_ids, shard_idx, uuid);
   }
 
  private:

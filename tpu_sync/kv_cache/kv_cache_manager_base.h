@@ -35,6 +35,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
@@ -337,6 +338,47 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // block_stride LayerBlockByteSize) and all legacy paths are unchanged.
   absl::Status RegisterPools(std::vector<PoolSpec> pools);
 
+  // Same, with bounded host staging.
+  // `staging_leases` is the number of concurrent transfers to provision host
+  // staging for. A device-backed storage whose pools all declare
+  // PoolSpec::staging_blocks_per_request > 0 gets a host arena of
+  // staging_leases x max(hint) slots of one storage page each instead of a
+  // full shadow of the device pool; transfers lease slots per uuid
+  // (AcquirePoolStagingLease) and every host address of a pool block goes
+  // through the lease's block->slot map. staging_leases == 0, or any pool on
+  // the storage without a hint, keeps the full mirror for that storage.
+  absl::Status RegisterPools(std::vector<PoolSpec> pools,
+                             int64_t staging_leases);
+
+  // Leases staging slots on `storage_idx` for `block_ids` under `uuid`
+  // (device block ids; ids already leased by this uuid are no-ops). Waits up
+  // to `timeout` for slots held by other uuids, then fails ResourceExhausted.
+  // No-op for storages that are not bounded.
+  absl::Status AcquirePoolStagingLease(uint64_t uuid, size_t storage_idx,
+                                       absl::Span<const int64_t> block_ids,
+                                       absl::Duration timeout);
+  // Releases every storage's lease held by `uuid` (no-op if none).
+  void ReleasePoolStagingLeases(uint64_t uuid);
+  // True when storage_idx's host mirror is a bounded staging arena.
+  bool PoolStorageStagingBounded(size_t storage_idx) const;
+  // Host bytes held by pool staging arenas / full mirrors, and a one-line
+  // human-readable summary per storage (for admission logs).
+  struct PoolStagingStorageSummary {
+    size_t storage_index = 0;
+    bool bounded = false;
+    int64_t stride_bytes = 0;
+    int64_t num_slots = 0;
+    int64_t blocks_per_lease = 0;
+    int64_t host_bytes_per_shard = 0;
+    int64_t free_slots = 0;
+  };
+  std::vector<PoolStagingStorageSummary> PoolStagingSummary() const;
+  int64_t pool_staging_leases() const { return pool_staging_leases_; }
+  // Lease wait bound (RAIDEN_POOL_STAGING_LEASE_TIMEOUT_MS, default 10 s).
+  absl::Duration pool_staging_lease_timeout() const {
+    return pool_staging_lease_timeout_;
+  }
+
   absl::StatusOr<PoolBlockRef> GetPoolBlockRef(size_t pool_idx,
                                                size_t shard_idx,
                                                int64_t block_id) const;
@@ -353,14 +395,18 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // each block from device storage to the same offsets in the host mirror.
   // Padding and live regions belonging only to aliased sibling pools are
   // preserved. All shards unless shard_idx is given.
+  // `uuid` selects the staging lease on bounded storages (required there);
+  // unbounded storages ignore it.
   absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
-      std::optional<size_t> shard_idx = std::nullopt);
+      std::optional<size_t> shard_idx = std::nullopt,
+      std::optional<uint64_t> uuid = std::nullopt);
 
   // Inverse of D2hPoolBlocks: host mirror -> device storage.
   absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
-      std::optional<size_t> shard_idx = std::nullopt);
+      std::optional<size_t> shard_idx = std::nullopt,
+      std::optional<uint64_t> uuid = std::nullopt);
 
   bool AcceptsPlanlessExplicitPush(uint64_t uuid) const override;
 
@@ -566,7 +612,46 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Shared implementation of D2hPoolBlocks/H2dPoolBlocks.
   absl::StatusOr<raiden::PjRtCopyFuture> CopyPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
-      std::optional<size_t> shard_idx, bool device_to_host);
+      std::optional<size_t> shard_idx, bool device_to_host,
+      std::optional<uint64_t> uuid);
+
+  // ---- Bounded pool staging ----
+  // One storage's staging arena. Unbounded storages keep the full mirror and
+  // the identity block->host mapping; bounded storages map device block ids to
+  // arena slots per uuid lease. Leases are copy-on-write shared_ptrs so hot
+  // readers (GetBlockChunks, CopyPoolBlocks) snapshot without holding
+  // staging_mu_ across the copy.
+  struct PoolStagingLease {
+    absl::flat_hash_map<int64_t, int32_t> slot_by_block;
+    std::vector<int32_t> slots;
+  };
+  struct PoolStagingStorage {
+    bool bounded = false;
+    int64_t stride_bytes = 0;
+    int64_t num_slots = 0;
+    int64_t blocks_per_lease = 0;
+    std::vector<int32_t> free_slots;
+    absl::flat_hash_map<uint64_t, std::shared_ptr<const PoolStagingLease>>
+        leases;
+  };
+  mutable absl::Mutex staging_mu_;
+  absl::CondVar staging_cv_ ABSL_GUARDED_BY(staging_mu_);
+  std::vector<PoolStagingStorage> pool_staging_ ABSL_GUARDED_BY(staging_mu_);
+  int64_t pool_staging_leases_ = 0;
+  absl::Duration pool_staging_lease_timeout_ = absl::Seconds(10);
+  // Sizes and allocates the arenas/mirrors for `pools` (called by
+  // RegisterPools once the pool table validated).
+  absl::Status ConfigurePoolStaging(const std::vector<PoolSpec>& pools,
+                                    int64_t staging_leases);
+  // Snapshot of uuid's lease on storage_idx (nullptr if none / unbounded).
+  std::shared_ptr<const PoolStagingLease> PoolStagingLeaseSnapshot(
+      size_t storage_idx, uint64_t uuid) const;
+  // Host address of pool block `block_id` (shard `shard_idx`) = storage host
+  // base + (slot or block) x stride + pool.base_offset. Bounded storages need
+  // a lease for `uuid` covering block_id.
+  absl::StatusOr<uint8_t*> PoolBlockHostBase(const PoolSpec& pool,
+                                             size_t shard_idx, int64_t block_id,
+                                             std::optional<uint64_t> uuid);
 
   HostBufferAllocator host_allocator_ = nullptr;
   std::unique_ptr<xla::Semaphore> semaphore_;

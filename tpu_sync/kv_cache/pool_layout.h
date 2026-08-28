@@ -58,6 +58,13 @@ struct PoolSpec {
   int64_t num_blocks = 0;
   std::vector<RegionSpec> regions;
   std::string dtype_tag;
+  // Max blocks of this pool one transfer can touch (FA: pages per max-length
+  // request; GDN state: one block per group). When every pool of a storage
+  // declares a positive value and RegisterPools is given a lease count, that
+  // storage's host mirror becomes a bounded staging arena of
+  // leases x max(hint) slots instead of a full shadow of the device pool.
+  // 0 (default) keeps the full mirror.
+  int64_t staging_blocks_per_request = 0;
 
   // Absolute end of the last declared live byte in the backing storage.
   // Inter-block and trailing padding are not part of the pool's addressable

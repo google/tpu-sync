@@ -95,6 +95,8 @@ tpu_sync/rpc/*_pb2*.py
 
 # Binaries
 tpu_raiden/kv_cache/global_registry/global_registry_server
+tpu_sync/kv_cache/global_registry/global_registry_server
+tpu_sync/store_node/kv_cache_host_store_node_main
 
 # Built wheels
 dist/*

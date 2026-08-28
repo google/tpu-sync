@@ -136,11 +136,56 @@ void BindPoolApi(ClassT& cls) {
   using ManagerT = typename ClassT::Type;
   cls.def(
          "register_pools_native",
-         [](ManagerT& self, const std::vector<PoolTuple>& pools) {
-           ThrowIfNotOk(self.RegisterPools(PoolsFromTuples(pools)),
+         [](ManagerT& self, const std::vector<PoolTuple>& pools,
+            int64_t staging_leases,
+            const std::vector<int64_t>& staging_blocks_per_pool) {
+           std::vector<kv_cache::PoolSpec> specs = PoolsFromTuples(pools);
+           // Bounded host staging hints:
+           // one entry per pool, or empty for the full-mirror default.
+           if (!staging_blocks_per_pool.empty()) {
+             if (staging_blocks_per_pool.size() != specs.size()) {
+               throw std::invalid_argument(
+                   absl::StrCat("staging_blocks_per_pool has ",
+                                staging_blocks_per_pool.size(), " entries for ",
+                                specs.size(), " pools"));
+             }
+             for (size_t i = 0; i < specs.size(); ++i) {
+               specs[i].staging_blocks_per_request = staging_blocks_per_pool[i];
+             }
+           }
+           ThrowIfNotOk(self.RegisterPools(std::move(specs), staging_leases),
                         "KVCacheManager register_pools failed");
          },
-         nb::arg("pools"))
+         nb::arg("pools"), nb::arg("staging_leases") = 0,
+         nb::arg("staging_blocks_per_pool") = std::vector<int64_t>{})
+      .def("pool_staging_summary_native",
+           [](const ManagerT& self) {
+             nb::dict result;
+             nb::list storages;
+             bool any_bounded = false;
+             int64_t bounded_bytes = 0;
+             int64_t full_bytes = 0;
+             for (const auto& s : self.PoolStagingSummary()) {
+               nb::dict d;
+               d["storage_index"] = s.storage_index;
+               d["bounded"] = s.bounded;
+               d["stride_bytes"] = s.stride_bytes;
+               d["num_slots"] = s.num_slots;
+               d["blocks_per_lease"] = s.blocks_per_lease;
+               d["host_bytes_per_shard"] = s.host_bytes_per_shard;
+               d["free_slots"] = s.free_slots;
+               storages.append(d);
+               any_bounded |= s.bounded;
+               (s.bounded ? bounded_bytes : full_bytes) +=
+                   s.host_bytes_per_shard;
+             }
+             result["mode"] = any_bounded ? "bounded" : "full";
+             result["leases"] = self.pool_staging_leases();
+             result["bounded_storage_bytes_per_shard"] = bounded_bytes;
+             result["full_storage_bytes_per_shard"] = full_bytes;
+             result["storages"] = storages;
+             return result;
+           })
       .def(
           "get_pool_block_ref_native",
           [](ManagerT& self, size_t pool_idx, size_t shard_idx,
@@ -196,8 +241,9 @@ void BindPoolApi(ClassT& cls) {
           "d2h_pool_blocks",
           [](ManagerT& self, size_t pool_idx,
              const std::vector<int64_t>& block_ids,
-             std::optional<size_t> shard_idx) {
-            auto status_or = self.D2hPoolBlocks(pool_idx, block_ids, shard_idx);
+             std::optional<size_t> shard_idx, std::optional<uint64_t> uuid) {
+            auto status_or =
+                self.D2hPoolBlocks(pool_idx, block_ids, shard_idx, uuid);
             if (!status_or.ok()) {
               throw std::runtime_error(
                   absl::StrCat("KVCacheManager d2h_pool_blocks failed: ",
@@ -206,14 +252,15 @@ void BindPoolApi(ClassT& cls) {
             return FutureT{std::move(status_or).value()};
           },
           nb::arg("pool_idx"), nb::arg("block_ids"),
-          nb::arg("shard_idx") = nb::none(),
+          nb::arg("shard_idx") = nb::none(), nb::arg("uuid") = nb::none(),
           nb::call_guard<nb::gil_scoped_release>())
       .def(
           "h2d_pool_blocks",
           [](ManagerT& self, size_t pool_idx,
              const std::vector<int64_t>& block_ids,
-             std::optional<size_t> shard_idx) {
-            auto status_or = self.H2dPoolBlocks(pool_idx, block_ids, shard_idx);
+             std::optional<size_t> shard_idx, std::optional<uint64_t> uuid) {
+            auto status_or =
+                self.H2dPoolBlocks(pool_idx, block_ids, shard_idx, uuid);
             if (!status_or.ok()) {
               throw std::runtime_error(
                   absl::StrCat("KVCacheManager h2d_pool_blocks failed: ",
@@ -222,7 +269,7 @@ void BindPoolApi(ClassT& cls) {
             return FutureT{std::move(status_or).value()};
           },
           nb::arg("pool_idx"), nb::arg("block_ids"),
-          nb::arg("shard_idx") = nb::none(),
+          nb::arg("shard_idx") = nb::none(), nb::arg("uuid") = nb::none(),
           nb::call_guard<nb::gil_scoped_release>());
 }
 

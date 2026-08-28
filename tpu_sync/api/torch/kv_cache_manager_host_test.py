@@ -108,6 +108,21 @@ class KVCacheManagerHostTest(unittest.TestCase):
             "pools": 2,
             "storages": 1,
             "tags": {"kind_a": 1, "kind_b": 1},
+            "host_staging": {
+                "mode": "full",
+                "leases": 0,
+                "bounded_storage_bytes_per_shard": 0,
+                "full_storage_bytes_per_shard": 1024,
+                "storages": [{
+                    "storage_index": 0,
+                    "bounded": False,
+                    "stride_bytes": 0,
+                    "num_slots": 0,
+                    "blocks_per_lease": 0,
+                    "host_bytes_per_shard": 1024,
+                    "free_slots": 0,
+                }],
+            },
         },
     )
     self.assertEqual(manager.admission_summary(), summary)

@@ -1523,6 +1523,21 @@ size_t KVCacheManagerBase::GetBlockArrayHostSize(size_t block_array_idx,
   const PoolSpec& pool = pools_[block_array_idx];
   const size_t storage_size = GetHostSize(pool.storage_index, shard_idx);
   const size_t base_offset = static_cast<size_t>(pool.base_offset_bytes);
+  {
+    // Bounded staging: the addressable host span is the whole arena (leased
+    // slots can sit anywhere in it), not the pool's device extent.
+    absl::MutexLock l(staging_mu_);
+    if (pool.storage_index < pool_staging_.size() &&
+        pool_staging_[pool.storage_index].bounded) {
+      const PoolStagingStorage& st = pool_staging_[pool.storage_index];
+      const uint64_t arena = static_cast<uint64_t>(st.num_slots) *
+                             static_cast<uint64_t>(st.stride_bytes);
+      if (arena > storage_size || base_offset > arena) {
+        return 0;
+      }
+      return static_cast<size_t>(arena - base_offset);
+    }
+  }
   const int64_t storage_end = pool.storage_extent_end_bytes();
   if (storage_end < pool.base_offset_bytes ||
       static_cast<uint64_t>(storage_end) > storage_size ||
@@ -1660,9 +1675,294 @@ absl::Status KVCacheManagerBase::EnsureHostMirrorCovers(size_t storage_idx,
   return absl::OkStatus();
 }
 
+// ---- Bounded pool staging ------------------------------------------------
+// A bounded storage's host mirror is an arena of num_slots storage pages;
+// a transfer (uuid) leases one slot per distinct device block id it touches
+// on that storage, and every host address of a pool block is storage_host +
+// slot * stride + pool.base_offset instead of the full-shadow identity
+// storage_host + block * stride + base_offset.
+
+absl::Status KVCacheManagerBase::ConfigurePoolStaging(
+    const std::vector<PoolSpec>& pools, int64_t staging_leases) {
+  struct StorageAgg {
+    bool seen = false;
+    bool device_backed = false;
+    int64_t stride = -1;  // -2 = pools disagree
+    int64_t num_blocks = -1;
+    int64_t hint_min = std::numeric_limits<int64_t>::max();
+    int64_t hint_max = 0;
+    int64_t extent_end = 0;
+  };
+  std::vector<StorageAgg> aggs(num_layers_);
+  for (const PoolSpec& pool : pools) {
+    StorageAgg& agg = aggs[pool.storage_index];
+    agg.seen = true;
+    agg.device_backed = pool.storage_index < buffer_holds_.size() &&
+                        buffer_holds_[pool.storage_index].physical_size > 0;
+    if (agg.stride == -1) {
+      agg.stride = pool.block_stride_bytes;
+    } else if (agg.stride != pool.block_stride_bytes) {
+      agg.stride = -2;
+    }
+    if (agg.num_blocks == -1) {
+      agg.num_blocks = pool.num_blocks;
+    } else if (agg.num_blocks != pool.num_blocks) {
+      agg.num_blocks = -2;
+    }
+    agg.hint_min = std::min(agg.hint_min, pool.staging_blocks_per_request);
+    agg.hint_max = std::max(agg.hint_max, pool.staging_blocks_per_request);
+    agg.extent_end = std::max(agg.extent_end, pool.storage_extent_end_bytes());
+  }
+
+  std::vector<PoolStagingStorage> staging(num_layers_);
+  size_t bounded_storages = 0;
+  size_t full_storages = 0;
+  size_t bounded_bytes = 0;
+  size_t full_bytes = 0;
+  for (size_t s = 0; s < num_layers_; ++s) {
+    const StorageAgg& agg = aggs[s];
+    if (!agg.seen || !agg.device_backed) {
+      // Host-only managers keep their caller-sized buffers (the host buffer IS
+      // the storage there); storages without pools keep whatever they have.
+      continue;
+    }
+    bool bounded = staging_leases > 0 && agg.hint_min > 0 && agg.stride > 0 &&
+                   agg.num_blocks > 0;
+    int64_t slots = 0;
+    if (bounded) {
+      if (agg.hint_max > std::numeric_limits<int64_t>::max() / staging_leases) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("storage ", s, ": staging slot count overflows"));
+      }
+      slots = staging_leases * agg.hint_max;
+      // An arena at least as large as the pool buys nothing: keep the
+      // identity mapping (no leases needed) for small pools.
+      if (slots >= agg.num_blocks) {
+        bounded = false;
+      }
+    }
+    if (bounded) {
+      if (slots > std::numeric_limits<int64_t>::max() / agg.stride) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("storage ", s, ": staging arena bytes overflow"));
+      }
+      const int64_t arena_bytes = slots * agg.stride;
+      absl::Status status = EnsureHostMirrorCovers(s, arena_bytes);
+      if (!status.ok()) {
+        return status;
+      }
+      PoolStagingStorage& st = staging[s];
+      st.bounded = true;
+      st.stride_bytes = agg.stride;
+      st.num_slots = slots;
+      st.blocks_per_lease = agg.hint_max;
+      st.free_slots.reserve(static_cast<size_t>(slots));
+      // LIFO free list: slot 0 is handed out first.
+      for (int64_t slot = slots - 1; slot >= 0; --slot) {
+        st.free_slots.push_back(static_cast<int32_t>(slot));
+      }
+      ++bounded_storages;
+      bounded_bytes += static_cast<size_t>(arena_bytes) * num_shards_;
+    } else {
+      // Full mirror: grow this storage's host buffer so pool refs and D2H/H2D
+      // can address the last declared live region at storage offsets.
+      absl::Status status = EnsureHostMirrorCovers(s, agg.extent_end);
+      if (!status.ok()) {
+        return status;
+      }
+      ++full_storages;
+      full_bytes += static_cast<size_t>(agg.extent_end) * num_shards_;
+    }
+  }
+  {
+    absl::MutexLock l(staging_mu_);
+    pool_staging_ = std::move(staging);
+    pool_staging_leases_ = staging_leases;
+  }
+  LOG(INFO) << "KVCacheManagerBase: pool host staging configured: leases="
+            << staging_leases << " bounded_storages=" << bounded_storages
+            << " (" << bounded_bytes
+            << " B) full_mirror_storages=" << full_storages << " ("
+            << full_bytes << " B)";
+  return absl::OkStatus();
+}
+
+bool KVCacheManagerBase::PoolStorageStagingBounded(size_t storage_idx) const {
+  absl::MutexLock l(staging_mu_);
+  return storage_idx < pool_staging_.size() &&
+         pool_staging_[storage_idx].bounded;
+}
+
+std::shared_ptr<const KVCacheManagerBase::PoolStagingLease>
+KVCacheManagerBase::PoolStagingLeaseSnapshot(size_t storage_idx,
+                                             uint64_t uuid) const {
+  absl::MutexLock l(staging_mu_);
+  if (storage_idx >= pool_staging_.size() ||
+      !pool_staging_[storage_idx].bounded) {
+    return nullptr;
+  }
+  const auto& leases = pool_staging_[storage_idx].leases;
+  auto it = leases.find(uuid);
+  return it == leases.end() ? nullptr : it->second;
+}
+
+absl::Status KVCacheManagerBase::AcquirePoolStagingLease(
+    uint64_t uuid, size_t storage_idx, absl::Span<const int64_t> block_ids,
+    absl::Duration timeout) {
+  absl::MutexLock l(staging_mu_);
+  if (storage_idx >= pool_staging_.size() ||
+      !pool_staging_[storage_idx].bounded) {
+    return absl::OkStatus();
+  }
+  PoolStagingStorage& st = pool_staging_[storage_idx];
+  // New ids only (idempotent per uuid; multiple pools on one storage share
+  // the page lease).
+  std::vector<int64_t> missing;
+  {
+    auto it = st.leases.find(uuid);
+    const PoolStagingLease* cur =
+        it == st.leases.end() ? nullptr : it->second.get();
+    absl::flat_hash_set<int64_t> seen;
+    for (int64_t block_id : block_ids) {
+      if (block_id < 0) {
+        return absl::InvalidArgumentError("block id must be non-negative");
+      }
+      if (cur != nullptr && cur->slot_by_block.contains(block_id)) continue;
+      if (seen.insert(block_id).second) missing.push_back(block_id);
+    }
+  }
+  if (missing.empty()) {
+    return absl::OkStatus();
+  }
+  if (static_cast<int64_t>(missing.size()) > st.num_slots) {
+    return absl::ResourceExhaustedError(absl::StrCat(
+        "pool staging: uuid ", uuid, " needs ", missing.size(),
+        " slots on storage ", storage_idx, " but the arena holds only ",
+        st.num_slots, " (leases=", pool_staging_leases_,
+        " x blocks_per_lease=", st.blocks_per_lease, ")"));
+  }
+  const absl::Time deadline = absl::Now() + timeout;
+  while (st.free_slots.size() < missing.size()) {
+    if (staging_cv_.WaitWithDeadline(&staging_mu_, deadline)) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "pool staging: uuid ", uuid, " waited ",
+          absl::FormatDuration(timeout), " for ", missing.size(),
+          " slots on storage ", storage_idx, " (free=", st.free_slots.size(),
+          " of ", st.num_slots, ", active leases=", st.leases.size(), ")"));
+    }
+  }
+  auto lease = std::make_shared<PoolStagingLease>();
+  if (auto it = st.leases.find(uuid); it != st.leases.end()) {
+    *lease = *it->second;  // copy-on-write: readers hold the old snapshot
+  }
+  for (int64_t block_id : missing) {
+    const int32_t slot = st.free_slots.back();
+    st.free_slots.pop_back();
+    lease->slot_by_block[block_id] = slot;
+    lease->slots.push_back(slot);
+  }
+  st.leases[uuid] = std::move(lease);
+  return absl::OkStatus();
+}
+
+void KVCacheManagerBase::ReleasePoolStagingLeases(uint64_t uuid) {
+  absl::MutexLock l(staging_mu_);
+  bool released = false;
+  for (PoolStagingStorage& st : pool_staging_) {
+    if (!st.bounded) continue;
+    auto it = st.leases.find(uuid);
+    if (it == st.leases.end()) continue;
+    for (int32_t slot : it->second->slots) {
+      st.free_slots.push_back(slot);
+    }
+    st.leases.erase(it);
+    released = true;
+  }
+  if (released) {
+    staging_cv_.SignalAll();
+  }
+}
+
+std::vector<KVCacheManagerBase::PoolStagingStorageSummary>
+KVCacheManagerBase::PoolStagingSummary() const {
+  std::vector<PoolStagingStorageSummary> out;
+  absl::MutexLock l(staging_mu_);
+  for (size_t s = 0; s < pool_staging_.size(); ++s) {
+    const PoolStagingStorage& st = pool_staging_[s];
+    PoolStagingStorageSummary summary;
+    summary.storage_index = s;
+    summary.bounded = st.bounded;
+    summary.stride_bytes = st.stride_bytes;
+    summary.num_slots = st.num_slots;
+    summary.blocks_per_lease = st.blocks_per_lease;
+    summary.host_bytes_per_shard =
+        s < layers_.size() && !layers_[s].shards.empty()
+            ? static_cast<int64_t>(layers_[s].shards[0].host_size)
+            : 0;
+    summary.free_slots = static_cast<int64_t>(st.free_slots.size());
+    out.push_back(summary);
+  }
+  return out;
+}
+
+absl::StatusOr<uint8_t*> KVCacheManagerBase::PoolBlockHostBase(
+    const PoolSpec& pool, size_t shard_idx, int64_t block_id,
+    std::optional<uint64_t> uuid) {
+  if (block_id < 0 || block_id >= pool.num_blocks) {
+    return absl::OutOfRangeError(
+        absl::StrCat("block_id ", block_id, " out of range for pool ", pool.tag,
+                     ": num_blocks=", pool.num_blocks));
+  }
+  uint8_t* storage_base = GetHostPointer(pool.storage_index, shard_idx);
+  if (storage_base == nullptr) {
+    return absl::FailedPreconditionError("host pointer is null");
+  }
+  std::shared_ptr<const PoolStagingLease> lease;
+  {
+    absl::MutexLock l(staging_mu_);
+    if (pool.storage_index < pool_staging_.size() &&
+        pool_staging_[pool.storage_index].bounded) {
+      if (!uuid.has_value()) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "pool ", pool.tag, " storage ", pool.storage_index,
+            " uses bounded host staging: a transfer uuid with a lease is "
+            "required to address block ",
+            block_id));
+      }
+      auto it = pool_staging_[pool.storage_index].leases.find(*uuid);
+      if (it == pool_staging_[pool.storage_index].leases.end()) {
+        return absl::FailedPreconditionError(
+            absl::StrCat("pool staging: uuid ", *uuid,
+                         " holds no lease on storage ", pool.storage_index));
+      }
+      lease = it->second;
+    }
+  }
+  if (lease == nullptr) {
+    return storage_base + pool.base_offset_bytes +
+           block_id * pool.block_stride_bytes;
+  }
+  auto slot_it = lease->slot_by_block.find(block_id);
+  if (slot_it == lease->slot_by_block.end()) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("pool staging: uuid ", *uuid, " lease on storage ",
+                     pool.storage_index, " does not cover block ", block_id));
+  }
+  return storage_base + pool.base_offset_bytes +
+         static_cast<int64_t>(slot_it->second) * pool.block_stride_bytes;
+}
+
 absl::Status KVCacheManagerBase::RegisterPools(std::vector<PoolSpec> pools) {
+  return RegisterPools(std::move(pools), /*staging_leases=*/0);
+}
+
+absl::Status KVCacheManagerBase::RegisterPools(std::vector<PoolSpec> pools,
+                                               int64_t staging_leases) {
   if (pools.empty()) {
     return absl::InvalidArgumentError("pool table must be non-empty");
+  }
+  if (staging_leases < 0) {
+    return absl::InvalidArgumentError("staging_leases must be >= 0");
   }
   {
     absl::MutexLock l(plans_mu_);
@@ -1699,17 +1999,23 @@ absl::Status KVCacheManagerBase::RegisterPools(std::vector<PoolSpec> pools) {
       return absl::InvalidArgumentError(
           absl::StrCat("invalid pool ", pool_idx, ": ", status.message()));
     }
-    // Host staging is sized at the uniform layer-0 slice by the
-    // constructors, which can under-cover heterogeneous device storages;
-    // grow this storage's mirror so pool refs and D2H/H2D can address the
-    // last declared live region at storage offsets. Host-only managers keep
-    // their caller-sized buffers (the host buffer IS the storage there).
-    if (device_backed) {
-      status = EnsureHostMirrorCovers(pool.storage_index,
-                                      pool.storage_extent_end_bytes());
-      if (!status.ok()) {
-        return status;
-      }
+    if (pool.staging_blocks_per_request < 0) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("invalid pool ", pool_idx,
+                       ": staging_blocks_per_request must be "
+                       ">= 0"));
+    }
+    (void)device_backed;
+  }
+  // Host staging is sized at the uniform layer-0 slice by the constructors,
+  // which can under-cover heterogeneous device storages. Per storage this
+  // either grows the mirror to the full pool extent (legacy) or carves a
+  // bounded staging arena . Host-onlymanagers keep their caller-sized buffers
+  // (the host buffer IS the storage there).
+  {
+    absl::Status status = ConfigurePoolStaging(pools, staging_leases);
+    if (!status.ok()) {
+      return status;
     }
   }
   {
@@ -1748,6 +2054,13 @@ absl::StatusOr<PoolBlockRef> KVCacheManagerBase::GetPoolBlockRef(
     return absl::OutOfRangeError(
         absl::StrCat("block_id ", block_id, " out of range for pool ", pool_idx,
                      " (", pool.tag, "): num_blocks=", pool.num_blocks));
+  }
+  if (PoolStorageStagingBounded(pool.storage_index)) {
+    // Debug/offload surface: on a bounded storage a block only has host bytes
+    // while a transfer leases it (addressed through the lease, not here).
+    return absl::FailedPreconditionError(absl::StrCat(
+        "pool ", pool_idx, " (", pool.tag, ") storage ", pool.storage_index,
+        " uses bounded host staging; blocks have no standing host residency"));
   }
   const int64_t offset =
       pool.base_offset_bytes + block_id * pool.block_stride_bytes;
@@ -1798,7 +2111,8 @@ std::vector<size_t> KVCacheManagerBase::PoolIndicesWithTag(
 
 absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::CopyPoolBlocks(
     size_t pool_idx, absl::Span<const int64_t> block_ids,
-    std::optional<size_t> shard_idx, bool device_to_host) {
+    std::optional<size_t> shard_idx, bool device_to_host,
+    std::optional<uint64_t> uuid) {
   const absl::Time copy_start = absl::Now();
   EnsureImplicitPools();
   if (pool_idx >= pools_.size()) {
@@ -1814,8 +2128,64 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::CopyPoolBlocks(
   if (shard_idx.has_value() && *shard_idx >= num_shards_) {
     return absl::OutOfRangeError("shard index out of range");
   }
-  ASSIGN_OR_RETURN(std::vector<PoolBlockCopyExtent> extents,
-                   ComputePoolBlockCopyExtents(pool, block_ids));
+
+  // Device side: the pool's declared-live extents at storage offsets. Host
+  // side: the same offsets on a full mirror, or the leased staging slot of
+  // each block on a bounded storage (host_off = dev_off + (slot-block)*stride).
+  struct HostDeviceExtent {
+    int64_t device_offset = 0;
+    int64_t host_offset = 0;
+    int64_t size = 0;
+  };
+  std::vector<HostDeviceExtent> extents;
+  std::shared_ptr<const PoolStagingLease> lease;
+  bool bounded = false;
+  {
+    absl::MutexLock l(staging_mu_);
+    bounded = pool.storage_index < pool_staging_.size() &&
+              pool_staging_[pool.storage_index].bounded;
+    if (bounded) {
+      if (!uuid.has_value()) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "pool ", pool.tag, " storage ", pool.storage_index,
+            " uses bounded host staging: D2H/H2D need the transfer uuid"));
+      }
+      auto it = pool_staging_[pool.storage_index].leases.find(*uuid);
+      if (it == pool_staging_[pool.storage_index].leases.end()) {
+        return absl::FailedPreconditionError(
+            absl::StrCat("pool staging: uuid ", *uuid,
+                         " holds no lease on storage ", pool.storage_index));
+      }
+      lease = it->second;
+    }
+  }
+  if (!bounded) {
+    ASSIGN_OR_RETURN(std::vector<PoolBlockCopyExtent> merged,
+                     ComputePoolBlockCopyExtents(pool, block_ids));
+    extents.reserve(merged.size());
+    for (const PoolBlockCopyExtent& extent : merged) {
+      extents.push_back(
+          {extent.offset_bytes, extent.offset_bytes, extent.size_bytes});
+    }
+  } else {
+    for (int64_t block_id : block_ids) {
+      auto slot_it = lease->slot_by_block.find(block_id);
+      if (slot_it == lease->slot_by_block.end()) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "pool staging: uuid ", *uuid, " lease on storage ",
+            pool.storage_index, " does not cover block ", block_id));
+      }
+      const int64_t delta = (static_cast<int64_t>(slot_it->second) - block_id) *
+                            pool.block_stride_bytes;
+      ASSIGN_OR_RETURN(
+          std::vector<PoolBlockCopyExtent> block_extents,
+          ComputePoolBlockCopyExtents(pool, absl::MakeConstSpan(&block_id, 1)));
+      for (const PoolBlockCopyExtent& extent : block_extents) {
+        extents.push_back({extent.offset_bytes, extent.offset_bytes + delta,
+                           extent.size_bytes});
+      }
+    }
+  }
 
   std::vector<raiden::PjRtCopyFuture> shard_futures;
   for (size_t sh = 0; sh < num_shards_; ++sh) {
@@ -1827,13 +2197,14 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::CopyPoolBlocks(
     if (shard_info.host_ptr == nullptr) {
       return absl::FailedPreconditionError("host pointer is null");
     }
-    for (const PoolBlockCopyExtent& extent : extents) {
-      const int64_t end = extent.offset_bytes + extent.size_bytes;
-      if (end > static_cast<int64_t>(shard_info.host_size)) {
+    for (const HostDeviceExtent& extent : extents) {
+      if (extent.host_offset < 0 ||
+          extent.host_offset + extent.size >
+              static_cast<int64_t>(shard_info.host_size)) {
         return absl::OutOfRangeError(
             "pool block copy exceeds host buffer size");
       }
-      if (end > shard_info.device_size) {
+      if (extent.device_offset + extent.size > shard_info.device_size) {
         return absl::OutOfRangeError(
             "pool block copy exceeds device buffer size");
       }
@@ -1842,9 +2213,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::CopyPoolBlocks(
       std::vector<raiden::D2hCopy> copies;
       copies.reserve(extents.size());
       uint8_t* host_base = const_cast<uint8_t*>(shard_info.host_ptr);
-      for (const PoolBlockCopyExtent& extent : extents) {
-        copies.push_back({host_base + extent.offset_bytes, extent.offset_bytes,
-                          extent.size_bytes});
+      for (const HostDeviceExtent& extent : extents) {
+        copies.push_back({host_base + extent.host_offset, extent.device_offset,
+                          extent.size});
       }
       TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture cf,
                           raiden::IssueD2hShard(shard_hold, copies));
@@ -1852,9 +2223,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::CopyPoolBlocks(
     } else {
       std::vector<raiden::H2dCopy> copies;
       copies.reserve(extents.size());
-      for (const PoolBlockCopyExtent& extent : extents) {
-        copies.push_back({shard_info.host_ptr + extent.offset_bytes,
-                          extent.offset_bytes, extent.size_bytes});
+      for (const HostDeviceExtent& extent : extents) {
+        copies.push_back({shard_info.host_ptr + extent.host_offset,
+                          extent.device_offset, extent.size});
       }
       TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture cf,
                           raiden::IssueH2dShard(shard_hold, copies));
@@ -1869,16 +2240,16 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::CopyPoolBlocks(
 
 absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hPoolBlocks(
     size_t pool_idx, absl::Span<const int64_t> block_ids,
-    std::optional<size_t> shard_idx) {
+    std::optional<size_t> shard_idx, std::optional<uint64_t> uuid) {
   return CopyPoolBlocks(pool_idx, block_ids, shard_idx,
-                        /*device_to_host=*/true);
+                        /*device_to_host=*/true, uuid);
 }
 
 absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dPoolBlocks(
     size_t pool_idx, absl::Span<const int64_t> block_ids,
-    std::optional<size_t> shard_idx) {
+    std::optional<size_t> shard_idx, std::optional<uint64_t> uuid) {
   return CopyPoolBlocks(pool_idx, block_ids, shard_idx,
-                        /*device_to_host=*/false);
+                        /*device_to_host=*/false, uuid);
 }
 
 bool KVCacheManagerBase::AcceptsPlanlessExplicitPush(uint64_t uuid) const {
@@ -2406,6 +2777,12 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
   // inside its storage. Otherwise the legacy uniform layer addressing applies.
   size_t block_size_bytes = block_bytes(layer_idx);
   uint8_t* base_host_ptr = nullptr;
+  // Bounded host staging: on a bounded
+  // storage a block's host bytes live in the slot leased to this uuid, not at
+  // block_id * stride. `staging_lease` is the snapshot used below; null means
+  // the storage is a full mirror (identity mapping).
+  std::shared_ptr<const PoolStagingLease> staging_lease;
+  bool staging_bounded = false;
   if (explicit_pools_) {
     if (layer_idx >= pools_.size()) {
       return {};
@@ -2422,11 +2799,38 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
       return {};
     }
     base_host_ptr = storage_base + pool.base_offset_bytes;
+    staging_bounded = PoolStorageStagingBounded(pool.storage_index);
+    if (staging_bounded) {
+      staging_lease = PoolStagingLeaseSnapshot(pool.storage_index, uuid);
+      if (staging_lease == nullptr) {
+        // No lease for this uuid: there is no host residency to address.
+        return {};
+      }
+    }
   } else {
     base_host_ptr = GetHostPointer(layer_idx, shard_idx);
   }
+  // Host base of `block_id`: identity on full mirrors, leased slot otherwise.
+  // `host_block` is the (possibly plan-remapped) host block id for full
+  // mirrors; bounded storages ignore it and use the lease's slot.
+  const auto block_host_base = [&](int64_t block_id,
+                                   int64_t host_block) -> uint8_t* {
+    if (!staging_bounded) {
+      return base_host_ptr + static_cast<size_t>(host_block) * block_size_bytes;
+    }
+    auto it = staging_lease->slot_by_block.find(block_id);
+    if (it == staging_lease->slot_by_block.end()) {
+      return nullptr;
+    }
+    return base_host_ptr + static_cast<size_t>(it->second) * block_size_bytes;
+  };
 
   if (!has_plan || uuid == 0) {
+    if (staging_bounded) {
+      // Plan-less pushes address the full block-id space; bounded storages
+      // only have host bytes for leased blocks of an active plan.
+      return {};
+    }
     std::vector<tpu_raiden::transport::BlockChunk> chunks;
     size_t accumulated_bytes = 0;
     if (explicit_pools_) {
@@ -2487,8 +2891,10 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
 
   for (int64_t block_id : block_ids) {
     if (accumulated_bytes >= total_bytes) break;
-    // The wire names device blocks; the bytes live wherever this side staged
-    // them, which is the block's own id unless the plan says otherwise.
+    // Block-addressed plans under demand staging: the wire names device
+    // blocks, the bytes live in the host block the plan allocated for them
+    // (own id unless the plan says otherwise). Pool-addressed plans on a
+    // bounded-staging storage resolve through the uuid's arena lease instead.
     int64_t host_block = block_id;
     if (!plan_snapshot->host_block_of.empty()) {
       auto hb = plan_snapshot->host_block_of.find(block_id);
@@ -2497,8 +2903,11 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
       }
       host_block = hb->second;
     }
-    size_t block_start_byte =
-        static_cast<size_t>(host_block) * block_size_bytes;
+    uint8_t* const block_base = block_host_base(block_id, host_block);
+    if (block_base == nullptr) {
+      // Bounded storage: this uuid's lease does not cover the block.
+      return {};
+    }
     std::vector<tpu_raiden::transport::BlockChunk> block_resolved_chunks;
 
     if (is_sender) {
@@ -2524,8 +2933,7 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
             for (int c = 0; c < count; ++c) {
               size_t src_offset = src_base_offset + c * src_stride;
               block_resolved_chunks.push_back(
-                  {.ptr = base_host_ptr + block_start_byte + src_offset,
-                   .size = size});
+                  {.ptr = block_base + src_offset, .size = size});
             }
           }
         }
@@ -2578,8 +2986,7 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
               for (int c = 0; c < count; ++c) {
                 size_t dst_offset = dst_base_offset + c * dst_stride;
                 block_resolved_chunks.push_back(
-                    {.ptr = base_host_ptr + block_start_byte + dst_offset,
-                     .size = size});
+                    {.ptr = block_base + dst_offset, .size = size});
               }
             }
           }
@@ -2615,6 +3022,11 @@ uint8_t* KVCacheManagerBase::GetBlockHostPointer(size_t layer_idx,
     const PoolSpec& pool = pools_[layer_idx];
     uint8_t* storage_base = GetHostPointer(pool.storage_index, shard_idx);
     if (storage_base == nullptr) {
+      return nullptr;
+    }
+    if (PoolStorageStagingBounded(pool.storage_index)) {
+      // Plan-less per-block addressing has no meaning on a bounded storage
+      // (host bytes exist only under a transfer's lease).
       return nullptr;
     }
     return storage_base + pool.base_offset_bytes +

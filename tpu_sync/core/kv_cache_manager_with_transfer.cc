@@ -1351,7 +1351,22 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
         continue;
       }
     }
-    auto future_or = D2hPoolBlocks(pool_idx, pool_src_block_ids);
+    // Bounded host staging: lease one arena slot per source page of this
+    // pool's storage for the transfer before staging its bytes (no-op on
+    // full-mirror storages). Released in FinishPoolReshardSend.
+    if (const kv_cache::PoolSpec* pool_spec = pool(pool_idx);
+        pool_spec != nullptr) {
+      absl::Status lease_status = AcquirePoolStagingLease(
+          plan.uuid(), pool_spec->storage_index, pool_src_block_ids,
+          pool_staging_lease_timeout());
+      if (!lease_status.ok()) {
+        FinishPoolReshardSend(plan.uuid(), lease_status);
+        return lease_status;
+      }
+    }
+    auto future_or = D2hPoolBlocks(pool_idx, pool_src_block_ids,
+                                   /*shard_idx=*/std::nullopt,
+                                   static_cast<uint64_t>(plan.uuid()));
     if (!future_or.ok()) {
       FinishPoolReshardSend(plan.uuid(), future_or.status());
       return future_or.status();
@@ -1464,6 +1479,9 @@ void KVCacheManagerWithTransfer::FinishPoolReshardSend(
       LOG(ERROR) << "Failed to unregister pool reshard sender plan " << uuid
                  << ": " << unregister;
     }
+    // Every push of every pool has completed (or the send failed): the host
+    // staging bytes are no longer read, so the arena slots go back.
+    ReleasePoolStagingLeases(uuid);
     absl::MutexLock lock(mu_);
     auto it = active_pool_reshard_sends_.find(uuid);
     if (it == active_pool_reshard_sends_.end()) return;
@@ -1501,8 +1519,55 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
     }
   }
 
-  TF_RETURN_IF_ERROR(kv_cache::KVCacheManagerBase::RegisterActivePlan(
-      plan.uuid(), plan, /*is_sender=*/false));
+  // Bounded host staging: the wire still lands at device (chip) block ids,
+  // but on a bounded storage those ids are remapped to arena slots leased to
+  // this uuid. Lease the union of every pool's destination ids per storage
+  // before arming; a failure here refuses the arm cleanly (the coordinator
+  // abandons the claim and no sender is dispatched). Full-mirror storages are
+  // no-ops. Released in FinishPoolReshardRecvPool / the deadline sweep.
+  {
+    std::map<size_t, std::set<int64_t>> dst_ids_by_storage;
+    std::map<size_t, std::vector<int64_t>> group_dst_by_pool;
+    for (const auto& group : plan.pool_groups()) {
+      std::vector<int64_t> group_dst_ids(group.dst_device_block_ids().begin(),
+                                         group.dst_device_block_ids().end());
+      for (int32_t pool_idx : group.pool_indices()) {
+        group_dst_by_pool[static_cast<size_t>(pool_idx)] = group_dst_ids;
+      }
+    }
+    for (int32_t encoded_pool_idx : plan.transfer_pool_indices()) {
+      const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
+      const kv_cache::PoolSpec* pool_spec = pool(pool_idx);
+      if (pool_spec == nullptr ||
+          !PoolStorageStagingBounded(pool_spec->storage_index)) {
+        continue;
+      }
+      auto ids_it = group_dst_by_pool.find(pool_idx);
+      const std::vector<int64_t> fallback(chip_block_ids.begin(),
+                                          chip_block_ids.end());
+      const std::vector<int64_t>& ids =
+          ids_it == group_dst_by_pool.end() ? fallback : ids_it->second;
+      dst_ids_by_storage[pool_spec->storage_index].insert(ids.begin(),
+                                                          ids.end());
+    }
+    for (const auto& [storage_idx, ids] : dst_ids_by_storage) {
+      std::vector<int64_t> id_list(ids.begin(), ids.end());
+      absl::Status lease_status = AcquirePoolStagingLease(
+          plan.uuid(), storage_idx, id_list, pool_staging_lease_timeout());
+      if (!lease_status.ok()) {
+        ReleasePoolStagingLeases(plan.uuid());
+        return lease_status;
+      }
+    }
+  }
+
+  absl::Status register_status =
+      kv_cache::KVCacheManagerBase::RegisterActivePlan(plan.uuid(), plan,
+                                                       /*is_sender=*/false);
+  if (!register_status.ok()) {
+    ReleasePoolStagingLeases(plan.uuid());
+    return register_status;
+  }
   RecvEntry recv_entry;
   recv_entry.req_id = plan.req_id();
   recv_entry.is_pool_reshard = true;
@@ -1510,8 +1575,8 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
   recv_entry.start_time = std::chrono::steady_clock::now();
   recv_entry.chip_block_ids.assign(chip_block_ids.begin(),
                                    chip_block_ids.end());
-  // Pool host mirrors cover the complete block-id space, so the wire lands at
-  // chip block ids directly; no staging-id remap is needed.
+  // The wire lands at chip block ids (full mirrors address them directly;
+  // bounded storages through the lease acquired above).
   for (int32_t pool_idx : plan.transfer_pool_indices()) {
     recv_entry.expected_pool_indices.insert(static_cast<size_t>(pool_idx));
     recv_entry.pool_order_ranks[static_cast<size_t>(pool_idx)] = 0;
@@ -1907,6 +1972,9 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
   // (ForgetPushProgress), so a settled uuid is reusable.
   for (const auto& [uuid, generation] : settled_plans) {
     UnregisterSettledPlan(uuid, generation);
+    // A settled (completed or timed-out) pool-reshard sender/receiver may
+    // still hold bounded-staging arena slots.
+    ReleasePoolStagingLeases(uuid);
   }
   return {done_sending, done_recving, failed_recving};
 }
@@ -3025,7 +3093,8 @@ void KVCacheManagerWithTransfer::LaunchEligiblePoolH2ds(uint64_t uuid) {
     }
   }
   for (auto& [pool_idx, chip_block_ids] : to_launch) {
-    auto future_or = H2dPoolBlocks(pool_idx, chip_block_ids);
+    auto future_or = H2dPoolBlocks(pool_idx, chip_block_ids,
+                                   /*shard_idx=*/std::nullopt, uuid);
     if (!future_or.ok()) {
       FinishPoolReshardRecvPool(uuid, pool_idx, future_or.status());
       continue;
@@ -3078,6 +3147,9 @@ void KVCacheManagerWithTransfer::FinishPoolReshardRecvPool(
       LOG(ERROR) << "Failed to unregister pool reshard receiver plan " << uuid
                  << ": " << unregister;
     }
+    // All pools uploaded (or the receive failed): the staging bytes have been
+    // consumed by the H2D, so the arena slots go back to the pool.
+    ReleasePoolStagingLeases(uuid);
     absl::MutexLock lock(mu_);
     auto it = active_recv_entries_.find(uuid);
     if (it == active_recv_entries_.end()) return;

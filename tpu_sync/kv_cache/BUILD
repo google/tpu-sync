@@ -192,6 +192,26 @@ cc_library(
 )
 
 cc_test(
+    name = "pool_staging_test",
+    srcs = ["pool_staging_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":kv_cache_manager_base",
+        ":pool_layout",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/transport:block_transport_delegate",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "pool_layout_test",
     srcs = ["pool_layout_test.cc"],
     copts = [

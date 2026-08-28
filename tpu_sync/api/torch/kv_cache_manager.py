@@ -255,16 +255,31 @@ class KVCacheManager:
     """Overwrites one host block with bytes."""
     self._impl.write_block_bytes(layer_idx, block_id, payload)
 
-  def register_pools(self, pools: Sequence[Any]) -> Dict[str, Any]:
+  def register_pools(
+      self,
+      pools: Sequence[Any],
+      *,
+      staging_leases: int = 0,
+      staging_blocks_per_pool: Optional[Sequence[int]] = None,
+  ) -> Dict[str, Any]:
     """Registers explicit block pools over the wrapped storages.
 
     Args:
       pools: Sequence of ``pool_layout.PoolSpec`` (or equivalent mappings) in
         the caller's canonical order. Pool indices travel on the wire, so both
         transfer peers must agree on this order.
+      staging_leases: Bounded host staging:
+        number of concurrent transfers to provision host staging for. With
+        ``staging_blocks_per_pool`` this replaces the full host shadow of each
+        device pool by an arena of ``staging_leases x max(blocks_per_pool)``
+        storage pages leased per transfer. 0 keeps the full mirror.
+      staging_blocks_per_pool: Per pool (same order as ``pools``), the most
+        blocks one transfer can touch in that pool (FA: pages per max-length
+        request; GDN state: 1). Storages with any pool at 0 stay full mirrors.
 
     Returns:
-      A generic admission summary (also served by ``admission_summary``).
+      A generic admission summary (also served by ``admission_summary``),
+      including ``host_staging`` (mode/leases/bytes per storage).
     """
     # pylint: disable=g-import-not-at-top
     from tpu_sync.api.torch import pool_layout
@@ -285,8 +300,21 @@ class KVCacheManager:
             f"{pool.storage_index} out of range: manager wraps "
             f"{num_storages} storages"
         )
+    staging_leases = int(staging_leases)
+    if staging_leases < 0:
+      raise ValueError("staging_leases must be >= 0")
+    hints: List[int] = []
+    if staging_blocks_per_pool is not None:
+      hints = [int(h) for h in staging_blocks_per_pool]
+      if len(hints) != len(coerced):
+        raise ValueError(
+            f"staging_blocks_per_pool has {len(hints)} entries for "
+            f"{len(coerced)} pools"
+        )
+      if any(h < 0 for h in hints):
+        raise ValueError("staging_blocks_per_pool entries must be >= 0")
     self._impl.register_pools_native(
-        [pool.to_native_tuple() for pool in coerced]
+        [pool.to_native_tuple() for pool in coerced], staging_leases, hints
     )
     tags: Dict[str, int] = {}
     for pool in coerced:
@@ -297,6 +325,7 @@ class KVCacheManager:
         "pools": len(coerced),
         "storages": storages,
         "tags": tags,
+        "host_staging": dict(self._impl.pool_staging_summary_native()),
     }
     self._admission_summary = dict(summary)
     return dict(summary)
@@ -331,18 +360,31 @@ class KVCacheManager:
       pool_idx: int,
       block_ids: Sequence[int],
       shard_idx: Optional[int] = None,
+      uuid: Optional[int] = None,
   ) -> Any:
-    """Partial D2H of whole pool blocks into the host mirror."""
-    return self._impl.d2h_pool_blocks(pool_idx, list(block_ids), shard_idx)
+    """Partial D2H of whole pool blocks into the host mirror.
+
+    ``uuid`` selects the staging lease on a bounded-staging storage (required
+    there); full-mirror storages ignore it.
+    """
+    return self._impl.d2h_pool_blocks(
+        pool_idx, list(block_ids), shard_idx, uuid
+    )
 
   def h2d_pool_blocks(
       self,
       pool_idx: int,
       block_ids: Sequence[int],
       shard_idx: Optional[int] = None,
+      uuid: Optional[int] = None,
   ) -> Any:
-    """Partial H2D of whole pool blocks from the host mirror."""
-    return self._impl.h2d_pool_blocks(pool_idx, list(block_ids), shard_idx)
+    """Partial H2D of whole pool blocks from the host mirror (see
+
+    ``d2h_pool_blocks`` for ``uuid``).
+    """
+    return self._impl.h2d_pool_blocks(
+        pool_idx, list(block_ids), shard_idx, uuid
+    )
 
   def admission_summary(self) -> Dict[str, Any]:
     """Returns the last successful pool admission summary."""

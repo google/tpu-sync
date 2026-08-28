@@ -29,6 +29,7 @@ from jax.experimental import mesh_utils
 import jax.numpy as jnp
 import numpy as np
 
+resources = None
 from tpu_sync.api.jax import kv_cache_store
 from tpu_sync.api.jax.kv_cache_manager import KVCacheManager
 
@@ -49,7 +50,17 @@ _registry_port = None
 
 
 def _registry_binary_path():
-  pass
+  this_dir = os.path.dirname(os.path.abspath(__file__))
+  return os.path.abspath(
+      os.path.join(
+          this_dir,
+          "..",
+          "..",
+          "kv_cache",
+          "global_registry",
+          "global_registry_server",
+      )
+  )
 
 
 def setUpModule():
@@ -57,8 +68,8 @@ def setUpModule():
   global _registry_port
   _registry_port = _pick_unused_port()
 
-  )
-  extra_flags = []
+  registry_binary = _registry_binary_path()
+  extra_flags = ["--alsologtostderr"] if resources else []
 
   print(f"Starting Registry on port {_registry_port}")
   reg_log = open("/tmp/raiden_registry.log", "w")

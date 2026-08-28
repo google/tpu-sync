@@ -20,6 +20,7 @@ import unittest
 
 from absl.testing import absltest
 
+resources = None
 from tpu_sync.api.torch import kv_cache_store
 
 
@@ -29,15 +30,23 @@ def _pick_unused_port():
     return s.getsockname()[1]
 
 
-
-
 # Global variables for subprocesses
 _registry_process = None
 _registry_port = None
 
 
 def _registry_binary_path():
-  pass
+  this_dir = os.path.dirname(os.path.abspath(__file__))
+  return os.path.abspath(
+      os.path.join(
+          this_dir,
+          "..",
+          "..",
+          "kv_cache",
+          "global_registry",
+          "global_registry_server",
+      )
+  )
 
 
 def setUpModule():
@@ -46,7 +55,7 @@ def setUpModule():
   _registry_port = _pick_unused_port()
 
   registry_binary = _registry_binary_path()
-  extra_flags = []
+  extra_flags = ["--alsologtostderr"] if resources else []
 
   print(f"Starting Registry on port {_registry_port}")
   reg_log = open("/tmp/raiden_registry.log", "w")

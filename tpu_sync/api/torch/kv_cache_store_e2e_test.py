@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torch_tpu
 
+resources = None
 from tpu_sync.api.torch import kv_cache_manager
 from tpu_sync.api.torch import kv_cache_store
 
@@ -59,14 +60,41 @@ _registry_port = None
 _reg_log_file = None
 
 
+def _registry_binary_path():
+  this_dir = os.path.dirname(os.path.abspath(__file__))
+  return os.path.abspath(
+      os.path.join(
+          this_dir,
+          "..",
+          "..",
+          "kv_cache",
+          "global_registry",
+          "global_registry_server",
+      )
+  )
+
+
+def _node_binary_path():
+  this_dir = os.path.dirname(os.path.abspath(__file__))
+  return os.path.abspath(
+      os.path.join(
+          this_dir,
+          "..",
+          "..",
+          "store_node",
+          "kv_cache_host_store_node_main",
+      )
+  )
+
+
 def start_servers():
   global _registry_process
   global _registry_port
 
   _registry_port = _pick_unused_port()
 
-  pass
-  extra_flags = []
+  registry_binary = _registry_binary_path()
+  extra_flags = ["--alsologtostderr"] if resources else []
 
   global _reg_log_file
   print(f"Starting Registry on port {_registry_port}")
@@ -1100,12 +1128,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       worker_thread.join(timeout=180)
     self.assertFalse(worker_thread.is_alive())
 
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    node_binary = os.path.abspath(
-        os.path.join(
-            this_dir, "..", "..", "store_node", "kv_cache_host_store_node_main"
-        )
-    )
+    node_binary = _node_binary_path()
     node_log = open("/tmp/raiden_store_node.log", "w")
     node_process = subprocess.Popen(
         [

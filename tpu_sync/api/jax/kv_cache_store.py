@@ -15,8 +15,11 @@
 """Python wrapper for the compiled C++ KVCacheStore."""
 
 from typing import Any
-from tpu_sync.api import common
+
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _impl
+
+# pylint: disable=g-bad-import-order
+from tpu_sync.api import common
 
 BlockStatus = common.BlockStatus
 RaidenId = _impl.RaidenId
@@ -298,13 +301,9 @@ class KVCacheStore:
       raw_slices.append(s._impl)  # pylint: disable=protected-access
     return self._impl.insert(block_hashes, raw_slices, on_host)
 
-
-
-
   def capacity(self) -> int:
     """Returns the maximum capacity of the store in blocks."""
     return self._impl.capacity()
-
 
   def release(self, block_hashes: list[bytes]) -> None:
     """Releases previously pinned block hashes.
@@ -541,4 +540,3 @@ class KVCacheStore:
         pending: List of block hashes whose remote read is still in progress.
     """
     return self._impl.poll_remote_read_status()
-

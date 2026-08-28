@@ -28,6 +28,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+resources = None
 from tpu_sync.api.jax import kv_cache_manager
 from tpu_sync.api.jax import kv_cache_store
 
@@ -59,14 +60,41 @@ _registry_process = None
 _registry_port = None
 
 
+def _registry_binary_path():
+  this_dir = os.path.dirname(os.path.abspath(__file__))
+  return os.path.abspath(
+      os.path.join(
+          this_dir,
+          "..",
+          "..",
+          "kv_cache",
+          "global_registry",
+          "global_registry_server",
+      )
+  )
+
+
+def _node_binary_path():
+  this_dir = os.path.dirname(os.path.abspath(__file__))
+  return os.path.abspath(
+      os.path.join(
+          this_dir,
+          "..",
+          "..",
+          "store_node",
+          "kv_cache_host_store_node_main",
+      )
+  )
+
+
 def start_servers():
   global _registry_process
   global _registry_port
 
   _registry_port = _pick_unused_port()
 
-  pass
-  extra_flags = []
+  registry_binary = _registry_binary_path()
+  extra_flags = ["--alsologtostderr"] if resources else []
 
   print(f"Starting Registry on port {_registry_port}")
   reg_log = open("/tmp/raiden_registry.log", "w")
@@ -529,7 +557,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     if use_slices:
       # 6. Job B controller calls load directly with slices
       self.assertTrue(store_b.load(hashes, [0, 1], slices=slices_b))
-  
+
       if not expect_read_success:
         failed = False
         for _ in range(500):
@@ -543,7 +571,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
             "expected Load to fail on producer/consumer node_id mismatch",
         )
         return
-  
+
       # Wait for Load completion
       done = False
       while not done:
@@ -576,7 +604,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
             "expected ReadRemote to fail on producer/consumer node_id mismatch",
         )
         return
-  
+
       # Wait for ReadRemote completion
       done = False
       while not done:
@@ -587,7 +615,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
           done = True
         if not done:
           time.sleep(0.01)
-  
+
       # 8. The read is already in HBM -- there is no second Load step, and no
       # local record of it either. Job B's cache is still a miss for these
       # hashes: the bytes live only in the device blocks it named.
@@ -1097,7 +1125,6 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
   def test_remote_read_to_hbm_with_slices_without_multi_numa(self):
     self._run_remote_read_to_hbm_test(enable_multi_numa=False, use_slices=True)
 
-
   def test_remote_read_e2e_with_slices_without_multi_numa(self):
     self._run_remote_read_e2e_test(enable_multi_numa=False, use_slices=True)
 
@@ -1519,12 +1546,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       worker_thread.join(timeout=180)
     self.assertFalse(worker_thread.is_alive())
 
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    node_binary = os.path.abspath(
-        os.path.join(
-            this_dir, "..", "..", "store_node", "kv_cache_host_store_node_main"
-        )
-    )
+    node_binary = _node_binary_path()
     node_log = open("/tmp/raiden_store_node.log", "w")
     node_process = subprocess.Popen(
         [

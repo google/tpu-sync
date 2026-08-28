@@ -64,6 +64,8 @@ TORCH_REQUIRES = COMMON_REQUIRES + TORCH_REQ
 # Framework-agnostic python deps for the py_library aggregator.
 #
 COMMON_DEPS = [
+    "//tpu_sync/api:common",
+    "//tpu_sync/common:_raiden_id",
     "//tpu_sync/rpc:coordination_helper",
     "//tpu_sync/rpc:raiden_controller",
 ]

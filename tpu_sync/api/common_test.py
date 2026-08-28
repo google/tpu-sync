@@ -73,6 +73,12 @@ class CommonApiTest(absltest.TestCase):
     id_set = {id1}
     self.assertIn(id2, id_set)
 
+  def test_raiden_id_empty(self):
+    empty_id = RaidenId()
+    self.assertTrue(empty_id.empty())
+    non_empty = RaidenId(job_name="trainer")
+    self.assertFalse(non_empty.empty())
+
   def test_raiden_id_repr_and_str(self):
     raiden_id = RaidenId(
         job_name="jobA",
@@ -85,6 +91,18 @@ class CommonApiTest(absltest.TestCase):
     self.assertIn("kv", repr(raiden_id))
     self.assertIn("3", repr(raiden_id))
     self.assertIn("jobA", str(raiden_id))
+
+  def test_pure_python_raiden_id(self):
+    from tpu_sync.api.common import _PurePythonRaidenId  # pylint: disable=g-import-not-at-top
+
+    id1 = _PurePythonRaidenId("jobA", "0", "dataA", 0)
+    id2 = _PurePythonRaidenId("jobA", "0", "dataA", 0)
+    id3 = _PurePythonRaidenId("jobB", "0", "dataA", 0)
+    self.assertEqual(id1, id2)
+    self.assertNotEqual(id1, id3)
+    self.assertEqual(hash(id1), hash(id2))
+    self.assertFalse(id1.empty())
+    self.assertTrue(_PurePythonRaidenId().empty())
 
   def test_block_status_enum(self):
     self.assertEqual(BlockStatus.INIT.value, 0)

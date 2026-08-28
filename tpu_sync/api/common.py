@@ -14,13 +14,34 @@
 
 """Shared common types and enums for TPU Raiden Python APIs."""
 
+import dataclasses
 import enum
 
-def __getattr__(name: str):
-  if name == "RaidenId":
-    from tpu_sync.common import _raiden_id  # pylint: disable=g-import-not-at-top
-    return _raiden_id.RaidenId
-  raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+@dataclasses.dataclass(unsafe_hash=True)
+class _PurePythonRaidenId:
+  """Identifier for the work unit in Raiden owning a sharded set of data."""
+
+  job_name: str = ""
+  job_replica_id: str = ""
+  data_name: str = ""
+  data_replica_idx: int = 0
+
+  def empty(self) -> bool:
+    return (
+        not self.job_name
+        and not self.job_replica_id
+        and not self.data_name
+        and self.data_replica_idx == 0
+    )
+
+
+try:
+  from tpu_sync.common import _raiden_id  # pylint: disable=g-import-not-at-top
+
+  RaidenId = _raiden_id.RaidenId
+except (ImportError, ModuleNotFoundError, AttributeError):
+  RaidenId = _PurePythonRaidenId
 
 
 class BlockStatus(enum.Enum):

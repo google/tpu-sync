@@ -14,6 +14,7 @@
 
 #include "tpu_sync/kv_cache/kv_cache_store_service.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -126,8 +127,10 @@ class KVCacheStoreServiceTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    client_.reset();
     if (server_) {
-      server_->Shutdown();
+      server_->Shutdown(std::chrono::system_clock::now() +
+                        std::chrono::milliseconds(200));
     }
   }
 
@@ -622,7 +625,11 @@ class WriteRemoteTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    if (server_) server_->Shutdown();
+    client_.reset();
+    if (server_) {
+      server_->Shutdown(std::chrono::system_clock::now() +
+                        std::chrono::milliseconds(200));
+    }
   }
 
   static ::tpu_sync::rpc::RaidenIdProto SrcIdProto() {
@@ -643,13 +650,13 @@ class WriteRemoteTest : public ::testing::Test {
     return {group};
   }
 
-  absl::StatusOr<::tpu_raiden::kv_cache::proto::WriteRemoteResponse> Offer(
+  absl::StatusOr<::tpu_raiden::kv_cache::proto::WriteRemoteAck> Offer(
       const std::vector<std::string>& hashes, int64_t deadline_ms = 5000) {
     std::vector<int32_t> src_ids(hashes.size(), 0);
     for (size_t i = 0; i < src_ids.size(); ++i) src_ids[i] = 100 + i;
     return client_
         ->WriteRemote(SrcIdProto(), hashes, src_ids, SrcEndpoints(),
-                      deadline_ms)
+                      deadline_ms, absl::Seconds(30))
         .Await();
   }
 
@@ -689,7 +696,7 @@ TEST_F(WriteRemoteTest, RejectsAnEmptyOffer) {
   std::vector<int32_t> no_ids;
   auto response = client_
                       ->WriteRemote(SrcIdProto(), {}, no_ids, SrcEndpoints(),
-                                    /*deadline_ms=*/5000)
+                                    /*deadline_ms=*/5000, absl::Seconds(30))
                       .Await();
   EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
@@ -699,7 +706,10 @@ TEST_F(WriteRemoteTest, RejectsAnEmptyOffer) {
 TEST_F(WriteRemoteTest, RejectsMissingSourceEndpointsWhenAPullIsNeeded) {
   std::vector<int32_t> src_ids = {100};
   auto response =
-      client_->WriteRemote(SrcIdProto(), {"a"}, src_ids, {}, 5000).Await();
+      client_
+          ->WriteRemote(SrcIdProto(), {"a"}, src_ids, {}, 5000,
+                        absl::Seconds(30))
+          .Await();
   EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
@@ -709,7 +719,10 @@ TEST_F(WriteRemoteTest, AllExistNeedsNoSourceEndpoints) {
 
   std::vector<int32_t> src_ids = {100};
   auto response =
-      client_->WriteRemote(SrcIdProto(), {"a"}, src_ids, {}, 5000).Await();
+      client_
+          ->WriteRemote(SrcIdProto(), {"a"}, src_ids, {}, 5000,
+                        absl::Seconds(30))
+          .Await();
   ASSERT_OK(response.status());
   EXPECT_EQ(response->exist_state(),
             ::tpu_raiden::kv_cache::proto::WRITE_ALL_EXIST);
@@ -720,18 +733,13 @@ TEST_F(WriteRemoteTest, AllExistNeedsNoSourceEndpoints) {
 // message about deadlines, which is not what is wrong.
 TEST_F(WriteRemoteTest, RejectsAnUnsetDeadline) {
   std::vector<int32_t> src_ids = {100};
-  ::tpu_raiden::kv_cache::proto::WriteRemoteRequest request;
-  *request.mutable_src_raiden_id() = SrcIdProto();
-  request.add_block_hashes("a");
-  request.add_src_host_block_ids(100);
-  *request.add_src_worker_endpoints() = SrcEndpoints()[0];
-  request.set_deadline_ms(0);
-
-  ::tpu_raiden::kv_cache::proto::WriteRemoteResponse response;
-  ::grpc::ServerContext context;
-  auto status = service_->WriteRemote(&context, &request, &response);
-  EXPECT_EQ(status.error_code(), ::grpc::StatusCode::INVALID_ARGUMENT);
-  EXPECT_THAT(status.error_message(), ::testing::HasSubstr("deadline_ms"));
+  auto response =
+      client_
+          ->WriteRemote(SrcIdProto(), {"a"}, src_ids, SrcEndpoints(),
+                        /*deadline_ms=*/0, absl::Seconds(30))
+          .Await();
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(response.status().message(), ::testing::HasSubstr("deadline_ms"));
 }
 
 TEST_F(WriteRemoteTest, RejectsAnOfferFromItself) {
@@ -743,7 +751,10 @@ TEST_F(WriteRemoteTest, RejectsAnOfferFromItself) {
 
   std::vector<int32_t> src_ids = {100};
   auto response =
-      client_->WriteRemote(self, {"a"}, src_ids, SrcEndpoints(), 5000).Await();
+      client_
+          ->WriteRemote(self, {"a"}, src_ids, SrcEndpoints(), 5000,
+                        absl::Seconds(30))
+          .Await();
   EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
@@ -987,12 +998,8 @@ TEST_F(WriteRemoteTest, PollOfAnUnknownOperationIsUnknown) {
 }
 
 TEST_F(WriteRemoteTest, PollRejectsTheReservedOperationId) {
-  ::tpu_raiden::kv_cache::proto::PollWriteRemoteRequest request;
-  request.set_operation_id(0);
-  ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse response;
-  ::grpc::ServerContext context;
-  auto status = service_->PollWriteRemote(&context, &request, &response);
-  EXPECT_EQ(status.error_code(), ::grpc::StatusCode::INVALID_ARGUMENT);
+  auto poll = client_->PollWriteRemote(0).Await();
+  EXPECT_THAT(poll.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 // When the transfer completes, the thread that called Release() on that
@@ -1045,7 +1052,9 @@ TEST(WriteRemotePublishTest, PublishDoesNotBlockTheTransferCompletion) {
   std::vector<std::string> hashes = {"publish_a", "publish_b"};
   std::vector<int32_t> src_ids = {200, 201};
   auto response =
-      client.WriteRemote(src_id, hashes, src_ids, {group}, 5000).Await();
+      client.WriteRemote(src_id, hashes, src_ids, {group}, 5000,
+                         absl::Seconds(30))
+          .Await();
   ASSERT_OK(response.status());
   const uint64_t op_id = response->operation_id();
   ASSERT_NE(op_id, 0);
@@ -1154,7 +1163,9 @@ TEST(WriteRemoteRegistryFailureTest, StoredButUnregisteredIsReportedAsSuch) {
   std::vector<std::string> hashes = {"unreg_a", "unreg_b"};
   std::vector<int32_t> src_ids = {100, 101};
   auto response =
-      client.WriteRemote(src_id, hashes, src_ids, {group}, 5000).Await();
+      client.WriteRemote(src_id, hashes, src_ids, {group}, 5000,
+                         absl::Seconds(30))
+          .Await();
   ASSERT_OK(response.status());
   const uint64_t op_id = response->operation_id();
   ASSERT_NE(op_id, 0);

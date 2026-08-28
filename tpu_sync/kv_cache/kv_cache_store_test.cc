@@ -49,6 +49,7 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/server_context.h"
+#include "grpcpp/support/server_callback.h"
 #include "grpcpp/support/status.h"
 #include "grpcpp/support/sync_stream.h"
 #include "xla/tsl/concurrency/future.h"
@@ -4108,41 +4109,207 @@ TEST_F(StoreDiscoveryTest, FailedLoadDropsTheCachedPeerClient) {
 // implication. STORED_UNREGISTERED is the clearest case: producing it for real
 // needs a registry that fails at one exact moment mid-transfer.
 class FakeDestinationService
-    : public ::tpu_raiden::kv_cache::proto::KVCacheStoreService::Service {
+    : public ::tpu_raiden::kv_cache::proto::KVCacheStoreService::CallbackService {
  public:
   static constexpr uint64_t kOperationId = 4242;
 
-  ::grpc::Status WriteRemote(
-      ::grpc::ServerContext* /*context*/,
-      const ::tpu_raiden::kv_cache::proto::WriteRemoteRequest* request,
-      ::tpu_raiden::kv_cache::proto::WriteRemoteResponse* response) override {
+  class FakeServerReactor
+      : public ::grpc::ServerWriteReactor<
+            ::tpu_raiden::kv_cache::proto::WriteRemoteEvent> {
+   public:
+    FakeServerReactor(FakeDestinationService* parent,
+                      proto::WriteRemoteEvent ack_event,
+                      std::optional<proto::WriteRemoteEvent> result_event,
+                      bool is_ack_only = false)
+        : parent_(parent),
+          ack_event_(std::move(ack_event)) {
+      if (result_event.has_value()) {
+        result_event_ = std::move(*result_event);
+        has_result_ = true;
+      }
+      if (is_ack_only) {
+        finished_ = true;
+        StartWriteAndFinish(&ack_event_, grpc::WriteOptions(),
+                            ::grpc::Status::OK);
+      } else {
+        StartWrite(&ack_event_);
+      }
+    }
+
+    void FinishWithError(::grpc::Status status) {
+      bool should_finish = false;
+      {
+        absl::MutexLock lock(mu_);
+        if (!finished_) {
+          finished_ = true;
+          should_finish = true;
+        }
+      }
+      if (should_finish) {
+        Finish(status);
+      }
+    }
+
+    void SendResult(proto::WriteRemoteEvent result_event) {
+      bool should_write = false;
+      {
+        absl::MutexLock lock(mu_);
+        result_event_ = std::move(result_event);
+        has_result_ = true;
+        if (ack_done_ && !finished_) {
+          finished_ = true;
+          should_write = true;
+        }
+      }
+      if (should_write) {
+        StartWriteAndFinish(&result_event_, grpc::WriteOptions(),
+                            ::grpc::Status::OK);
+      }
+    }
+
+    void OnWriteDone(bool ok) override {
+      if (!ok) {
+        FinishWithError(
+            ::grpc::Status(::grpc::StatusCode::CANCELLED, "Write failed"));
+        return;
+      }
+      bool should_write = false;
+      {
+        absl::MutexLock lock(mu_);
+        ack_done_ = true;
+        if (has_result_ && !finished_) {
+          finished_ = true;
+          should_write = true;
+        }
+      }
+      if (should_write) {
+        StartWriteAndFinish(&result_event_, grpc::WriteOptions(),
+                            ::grpc::Status::OK);
+      }
+    }
+
+    void OnDone() override {
+      parent_->OnReactorDone(this);
+      delete this;
+    }
+
+   private:
+    FakeDestinationService* const parent_;
+    absl::Mutex mu_;
+    proto::WriteRemoteEvent ack_event_;
+    proto::WriteRemoteEvent result_event_;
+    bool ack_done_ ABSL_GUARDED_BY(mu_) = false;
+    bool has_result_ ABSL_GUARDED_BY(mu_) = false;
+    bool finished_ ABSL_GUARDED_BY(mu_) = false;
+  };
+
+  void CancelAllReactors() {
+    absl::MutexLock lock(mutex_);
+    for (auto* reactor : active_reactors_) {
+      reactor->FinishWithError(::grpc::Status(::grpc::StatusCode::UNAVAILABLE,
+                                              "Service shutting down"));
+    }
+    active_reactors_.clear();
+  }
+
+  ~FakeDestinationService() override {
+    CancelAllReactors();
+  }
+
+  ::grpc::ServerWriteReactor<::tpu_raiden::kv_cache::proto::WriteRemoteEvent>*
+  WriteRemote(
+      ::grpc::CallbackServerContext* /*context*/,
+      const ::tpu_raiden::kv_cache::proto::WriteRemoteRequest* request) override {
     absl::MutexLock lock(mutex_);
     ++write_calls_;
     requested_deadline_ms_ = request->deadline_ms();
     if (!write_status_.ok()) {
-      return write_status_;
+      auto* reactor =
+          new FakeServerReactor(this, {}, std::nullopt, /*is_ack_only=*/false);
+      reactor->Finish(write_status_);
+      return reactor;
     }
-    response->set_operation_id(kOperationId);
-    response->set_exist_state(exist_state_);
-    response->set_granted_deadline_ms(request->deadline_ms());
-    return ::grpc::Status::OK;
+
+    proto::WriteRemoteEvent ack_event;
+    auto* ack = ack_event.mutable_ack();
+    ack->set_operation_id(kOperationId);
+    ack->set_exist_state(exist_state_);
+    ack->set_granted_deadline_ms(request->deadline_ms());
+    for (const auto& hash : existing_hashes_) {
+      ack->add_existing_hashes(hash);
+    }
+
+    if (exist_state_ == proto::WRITE_ALL_EXIST ||
+        exist_state_ == proto::WRITE_PARTIAL_EXIST) {
+      return new FakeServerReactor(this, std::move(ack_event), std::nullopt,
+                                   /*is_ack_only=*/true);
+    }
+
+    std::optional<proto::WriteRemoteEvent> result_event;
+    if (poll_response_.state() !=
+            proto::PollWriteRemoteResponse::STATE_UNSPECIFIED &&
+        poll_response_.state() != proto::PollWriteRemoteResponse::PENDING) {
+      proto::WriteRemoteEvent res;
+      auto* r = res.mutable_result();
+      r->set_state(poll_response_.state());
+      for (const auto& hash : poll_response_.existing_hashes()) {
+        r->add_existing_hashes(hash);
+      }
+      for (const auto& hash : poll_response_.unregistered_hashes()) {
+        r->add_unregistered_hashes(hash);
+      }
+      result_event = std::move(res);
+    }
+
+    const bool has_result = result_event.has_value();
+    auto* reactor =
+        new FakeServerReactor(this, std::move(ack_event),
+                              std::move(result_event), /*is_ack_only=*/false);
+    if (!has_result) {
+      active_reactors_.push_back(reactor);
+    }
+    return reactor;
   }
 
-  ::grpc::Status PollWriteRemote(
-      ::grpc::ServerContext* /*context*/,
+  ::grpc::ServerUnaryReactor* PollWriteRemote(
+      ::grpc::CallbackServerContext* context,
       const ::tpu_raiden::kv_cache::proto::PollWriteRemoteRequest* /*request*/,
       ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse* response)
       override {
+    auto* reactor = context->DefaultReactor();
     absl::MutexLock lock(mutex_);
     ++poll_calls_;
     *response = poll_response_;
-    return ::grpc::Status::OK;
+    reactor->Finish(::grpc::Status::OK);
+    return reactor;
   }
 
   void SetPollResponse(
       ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse response) {
     absl::MutexLock lock(mutex_);
     poll_response_ = std::move(response);
+    if (poll_response_.state() !=
+            proto::PollWriteRemoteResponse::STATE_UNSPECIFIED &&
+        poll_response_.state() != proto::PollWriteRemoteResponse::PENDING) {
+      proto::WriteRemoteEvent res;
+      auto* r = res.mutable_result();
+      r->set_state(poll_response_.state());
+      for (const auto& hash : poll_response_.existing_hashes()) {
+        r->add_existing_hashes(hash);
+      }
+      for (const auto& hash : poll_response_.unregistered_hashes()) {
+        r->add_unregistered_hashes(hash);
+      }
+      for (auto* reactor : active_reactors_) {
+        reactor->SendResult(res);
+      }
+      active_reactors_.clear();
+    }
+  }
+
+  void OnReactorDone(FakeServerReactor* reactor) {
+    absl::MutexLock lock(mutex_);
+    std::erase(active_reactors_, reactor);
   }
 
   // What the ACK says, as opposed to the later poll verdict. ALL_EXIST makes
@@ -4150,6 +4317,11 @@ class FakeDestinationService
   void SetWriteExistState(proto::WriteExistState state) {
     absl::MutexLock lock(mutex_);
     exist_state_ = state;
+  }
+
+  void SetExistingHashes(std::vector<std::string> hashes) {
+    absl::MutexLock lock(mutex_);
+    existing_hashes_ = std::move(hashes);
   }
 
   // Non-OK makes WriteRemote answer with that status instead of accepting,
@@ -4163,6 +4335,10 @@ class FakeDestinationService
     absl::MutexLock lock(mutex_);
     return write_calls_;
   }
+  int poll_calls() const {
+    absl::MutexLock lock(mutex_);
+    return poll_calls_;
+  }
   int64_t requested_deadline_ms() const {
     absl::MutexLock lock(mutex_);
     return requested_deadline_ms_;
@@ -4170,6 +4346,8 @@ class FakeDestinationService
 
  private:
   mutable absl::Mutex mutex_;
+  std::vector<FakeServerReactor*> active_reactors_ ABSL_GUARDED_BY(mutex_);
+  std::vector<std::string> existing_hashes_ ABSL_GUARDED_BY(mutex_);
   ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse poll_response_
       ABSL_GUARDED_BY(mutex_);
   ::tpu_raiden::kv_cache::proto::WriteExistState exist_state_
@@ -4265,7 +4443,11 @@ class RemoteWriteSourceTest : public StoreDiscoveryTest {
   }
 
   void TearDown() override {
-    if (fake_destination_server_) fake_destination_server_->Shutdown();
+    fake_destination_.CancelAllReactors();
+    if (fake_destination_server_) {
+      fake_destination_server_->Shutdown(std::chrono::system_clock::now() +
+                                         std::chrono::milliseconds(200));
+    }
     StoreDiscoveryTest::TearDown();
   }
 
@@ -4437,14 +4619,16 @@ TEST_F(RemoteWriteSourceTest, RefusesASecondConcurrentOfferOfTheSameHash) {
   RaidenId src{"rw_src_concurrent", "0", "kv", 0};
   RaidenId dst{"rw_dst_concurrent", "0", "kv", 0};
   auto src_store = MakeStore(src);
-  auto dst_store = MakeStore(dst);
-  RegisterWorker(*src_store);
   Populate(*src_store, src, {"a"});
+  StartFakeDestination(dst);
+
+  proto::PollWriteRemoteResponse verdict;
+  verdict.set_state(proto::PollWriteRemoteResponse::PENDING);
+  fake_destination_.SetPollResponse(verdict);
 
   ASSERT_TRUE(src_store->Save({"a"}, dst).ok());
   auto second = src_store->Save({"a"}, dst);
   EXPECT_TRUE(absl::IsFailedPrecondition(second)) << second.ToString();
-  AwaitWriteSettled(*src_store);
 }
 
 // The verdict this whole state exists for: the peer HAS the bytes but could
@@ -4622,6 +4806,53 @@ TEST_F(RemoteWriteSourceTest, TheOfferAsksForLessThanTheSourceWillHold) {
   // Default HOLD is 30s and the margin 5s.
   EXPECT_EQ(fake_destination_.requested_deadline_ms(),
             absl::ToInt64Milliseconds(absl::Seconds(25)));
+}
+
+// Plan §12 Test 1: Destination commits -> source settles with ZERO PollWriteRemote calls.
+TEST_F(RemoteWriteSourceTest, DestinationCommitsSettlesWithZeroPollCalls) {
+  RaidenId src{"rw_src_zero_poll", "0", "kv", 0};
+  RaidenId dst{"rw_dst_zero_poll", "0", "kv", 0};
+  auto src_store = MakeStore(src);
+  Populate(*src_store, src, {"a"});
+  StartFakeDestination(dst);
+
+  proto::PollWriteRemoteResponse verdict;
+  verdict.set_state(proto::PollWriteRemoteResponse::COMMITTED);
+  verdict.add_committed_hashes("a");
+  fake_destination_.SetPollResponse(verdict);
+
+  ASSERT_TRUE(src_store->Save({"a"}, dst).ok());
+  auto [done, failed, existing, unregistered] = AwaitWriteSettled(*src_store);
+
+  EXPECT_THAT(done, ::testing::UnorderedElementsAre("a"));
+  EXPECT_TRUE(failed.empty());
+  EXPECT_EQ(fake_destination_.write_calls(), 1);
+  EXPECT_EQ(fake_destination_.poll_calls(), 0)
+      << "Destination commit must be received reactively over the WriteRemote "
+         "stream without any PollWriteRemote RPCs";
+}
+
+// Plan §12 Test 9: STORED_UNREGISTERED and PARTIAL_EXIST lists survive the streamed path byte-for-byte.
+TEST_F(RemoteWriteSourceTest,
+       StoredUnregisteredAndPartialExistSurviveStreamByteForByte) {
+  RaidenId src{"rw_src_unreg_stream", "0", "kv", 0};
+  RaidenId dst{"rw_dst_unreg_stream", "0", "kv", 0};
+  auto src_store = MakeStore(src);
+  Populate(*src_store, src, {"x", "y"});
+  StartFakeDestination(dst);
+
+  proto::PollWriteRemoteResponse verdict;
+  verdict.set_state(proto::PollWriteRemoteResponse::STORED_UNREGISTERED);
+  verdict.add_unregistered_hashes("x");
+  verdict.add_unregistered_hashes("y");
+  fake_destination_.SetPollResponse(verdict);
+
+  ASSERT_TRUE(src_store->Save({"x", "y"}, dst).ok());
+  auto [done, failed, existing, unregistered] = AwaitWriteSettled(*src_store);
+
+  EXPECT_TRUE(done.empty());
+  EXPECT_THAT(failed, ::testing::UnorderedElementsAre("x", "y"));
+  EXPECT_THAT(unregistered, ::testing::UnorderedElementsAre("x", "y"));
 }
 
 // Polling a remote write means asking the destination, which cannot be done

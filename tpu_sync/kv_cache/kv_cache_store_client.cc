@@ -12,20 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "tpu_sync/kv_cache/completion_executor.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
 
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "grpcpp/client_context.h"
 #include "grpcpp/impl/status.h"
+#include "grpcpp/support/client_callback.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/proto/kv_cache_store_service.grpc.pb.h"
 #include "tpu_sync/proto/kv_cache_store_service.pb.h"
@@ -121,26 +125,108 @@ KVCacheStoreClient::Fetch(
   return future;
 }
 
-tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteResponse>
+class WriteRemoteClientReactor
+    : public ::grpc::ClientReadReactor<
+          ::tpu_raiden::kv_cache::proto::WriteRemoteEvent> {
+ public:
+  WriteRemoteClientReactor(
+      ::tpu_raiden::kv_cache::proto::KVCacheStoreService::StubInterface* stub,
+      const ::tpu_raiden::kv_cache::proto::WriteRemoteRequest& request,
+      absl::Duration hold_window,
+      tsl::Promise<::tpu_raiden::kv_cache::proto::WriteRemoteAck> ack_promise,
+      KVCacheStoreClient::WriteRemoteVerdictCallback on_verdict)
+      : ack_promise_(std::move(ack_promise)),
+        on_verdict_(std::move(on_verdict)) {
+    context_.set_deadline(std::chrono::system_clock::now() +
+                          std::chrono::milliseconds(
+                              absl::ToInt64Milliseconds(hold_window)));
+    stub->async()->WriteRemote(&context_, &request, this);
+    StartRead(&event_);
+    StartCall();
+  }
+
+  void OnReadDone(bool ok) override {
+    if (!ok) {
+      return;
+    }
+
+    if (event_.has_ack()) {
+      ack_received_ = true;
+      ack_promise_.Set(event_.ack());
+      if (event_.ack().exist_state() ==
+          ::tpu_raiden::kv_cache::proto::WRITE_EXIST_STATE_UNSPECIFIED) {
+        StartRead(&event_);
+      }
+    } else if (event_.has_result()) {
+      has_result_ = true;
+      result_ = event_.result();
+      StartRead(&event_);
+    }
+  }
+
+  void OnDone(const ::grpc::Status& status) override {
+    bool initial_ack_failed = !ack_received_;
+    if (!ack_received_) {
+      ack_promise_.Set(absl::Status(
+          static_cast<absl::StatusCode>(status.error_code()),
+          status.error_message()));
+      ack_received_ = true;
+    }
+
+    absl::Status rpc_status =
+        status.ok()
+            ? absl::OkStatus()
+            : absl::Status(static_cast<absl::StatusCode>(status.error_code()),
+                           status.error_message());
+
+    std::optional<proto::WriteRemoteResult> result;
+    if (has_result_) {
+      result = std::move(result_);
+    }
+
+    if (on_verdict_ && !initial_ack_failed) {
+      CompletionExecutor::Schedule(
+          [on_verdict = std::move(on_verdict_), rpc_status,
+           result = std::move(result)]() mutable {
+            on_verdict(rpc_status, std::move(result));
+          });
+    }
+
+    delete this;
+  }
+
+ private:
+  ::grpc::ClientContext context_;
+  proto::WriteRemoteEvent event_;
+  tsl::Promise<proto::WriteRemoteAck> ack_promise_;
+  KVCacheStoreClient::WriteRemoteVerdictCallback on_verdict_;
+  bool ack_received_ = false;
+  bool has_result_ = false;
+  proto::WriteRemoteResult result_;
+};
+
+tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>
 KVCacheStoreClient::WriteRemote(
     const ::tpu_sync::rpc::RaidenIdProto& src_raiden_id,
     absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> src_host_block_ids,
     absl::Span<const ::tpu_sync::proto::RaidenWorkerEndpointsProto>
         src_worker_endpoints,
-    int64_t deadline_ms) {
+    int64_t deadline_ms,
+    absl::Duration hold_window,
+    WriteRemoteVerdictCallback on_verdict) {
   if (block_hashes.empty()) {
-    return tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteResponse>(
+    return tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(
         absl::InvalidArgumentError("WriteRemote requires at least one hash."));
   }
   if (src_host_block_ids.size() != block_hashes.size()) {
-    return tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteResponse>(
+    return tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(
         absl::InvalidArgumentError(absl::StrCat(
             "Mismatched src_host_block_ids count (", src_host_block_ids.size(),
             ") vs block_hashes count (", block_hashes.size(), ").")));
   }
   if (deadline_ms <= 0) {
-    return tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteResponse>(
+    return tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(
         absl::InvalidArgumentError(
             absl::StrCat("WriteRemote requires a positive deadline_ms, got ",
                          deadline_ms, ".")));
@@ -161,30 +247,15 @@ KVCacheStoreClient::WriteRemote(
   request.set_deadline_ms(deadline_ms);
 
   auto [promise, future] =
-      tsl::MakePromise<::tpu_raiden::kv_cache::proto::WriteRemoteResponse>();
-  auto context = std::make_shared<grpc::ClientContext>();
-  context->set_deadline(std::chrono::system_clock::now() + kRpcDeadline);
-  auto response =
-      std::make_shared<::tpu_raiden::kv_cache::proto::WriteRemoteResponse>();
+      tsl::MakePromise<::tpu_raiden::kv_cache::proto::WriteRemoteAck>();
 
-  stub_->async()->WriteRemote(
-      context.get(), &request, response.get(),
-      [context, response,
-       promise = std::move(promise).ToShared()](grpc::Status status) mutable {
-        if (!status.ok()) {
-          promise->Set(
-              absl::Status(static_cast<absl::StatusCode>(status.error_code()),
-                           absl::StrCat("WriteRemote RPC failed: ",
-                                        status.error_message())));
-        } else {
-          promise->Set(std::move(*response));
-        }
-      });
+  new WriteRemoteClientReactor(stub_.get(), request, hold_window,
+                               std::move(promise), std::move(on_verdict));
   return future;
 }
 
 tsl::Future<::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse>
-KVCacheStoreClient::PollWriteRemote(uint64_t operation_id) {
+KVCacheStoreClient::PollWriteRemote(uint64_t operation_id, int64_t wait_ms) {
   if (operation_id == 0) {
     return tsl::Future<::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse>(
         absl::InvalidArgumentError(
@@ -193,6 +264,7 @@ KVCacheStoreClient::PollWriteRemote(uint64_t operation_id) {
 
   ::tpu_raiden::kv_cache::proto::PollWriteRemoteRequest request;
   request.set_operation_id(operation_id);
+  request.set_wait_ms(wait_ms);
 
   auto [promise, future] = tsl::MakePromise<
       ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse>();
@@ -209,7 +281,7 @@ KVCacheStoreClient::PollWriteRemote(uint64_t operation_id) {
           promise->Set(
               absl::Status(static_cast<absl::StatusCode>(status.error_code()),
                            absl::StrCat("PollWriteRemote RPC failed: ",
-                                        status.error_message())));
+                                         status.error_message())));
         } else {
           promise->Set(std::move(*response));
         }

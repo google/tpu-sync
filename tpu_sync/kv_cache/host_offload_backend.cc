@@ -738,7 +738,9 @@ absl::StatusOr<HostOffloadBackend::RemoteWriteAck>
 HostOffloadBackend::BeginWriteRemote(
     const RaidenId& dst_raiden_id, absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> src_host_block_ids,
-    absl::Duration requested_deadline) {
+    absl::Duration requested_deadline,
+    absl::Duration hold_window,
+    WriteRemoteVerdictCallback on_verdict) {
   if (block_hashes.empty()) {
     return absl::InvalidArgumentError("WriteRemote requires at least one hash");
   }
@@ -758,7 +760,8 @@ HostOffloadBackend::BeginWriteRemote(
           ->WriteRemote(raiden_controller_->unit(), block_hashes,
                         src_host_block_ids,
                         BuildLocalWorkerEndpoints(raiden_controller_),
-                        absl::ToInt64Milliseconds(requested_deadline))
+                        absl::ToInt64Milliseconds(requested_deadline),
+                        hold_window, std::move(on_verdict))
           .Await();
   if (!response_or.ok()) {
     // On a transport error the peer may have restarted on a new port; drop

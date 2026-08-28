@@ -39,8 +39,10 @@
 namespace tpu_raiden {
 namespace kv_cache {
 
+class WriteRemoteServerReactor;
+
 class KVCacheStoreServiceImpl
-    : public ::tpu_raiden::kv_cache::proto::KVCacheStoreService::Service {
+    : public ::tpu_raiden::kv_cache::proto::KVCacheStoreService::CallbackService {
  public:
   // A stand-in for the pull, used ONLY by tests. Production calls
   // controller_->TransferBuffers directly and never touches this.
@@ -60,28 +62,30 @@ class KVCacheStoreServiceImpl
                           tpu_raiden::controller::RaidenController* controller);
   ~KVCacheStoreServiceImpl() override;
 
-  ::grpc::Status Fetch(
-      ::grpc::ServerContext* context,
+  ::grpc::ServerUnaryReactor* Fetch(
+      ::grpc::CallbackServerContext* context,
       const ::tpu_raiden::kv_cache::proto::FetchRequest* request,
       ::tpu_raiden::kv_cache::proto::FetchResponse* response) override;
 
   // Accepts an offer of blocks from a peer -- the destination side of that
   // peer's save(dst): decides whether the write is worth doing, allocates
-  // landing blocks, issues the pull, and answers with an operation id. Never
-  // waits for the bytes.
-  ::grpc::Status WriteRemote(
-      ::grpc::ServerContext* context,
-      const ::tpu_raiden::kv_cache::proto::WriteRemoteRequest* request,
-      ::tpu_raiden::kv_cache::proto::WriteRemoteResponse* response) override;
+  // landing blocks, issues the pull, and answers with an operation id. Streams
+  // back the result upon terminal completion.
+  ::grpc::ServerWriteReactor<::tpu_raiden::kv_cache::proto::WriteRemoteEvent>*
+  WriteRemote(
+      ::grpc::CallbackServerContext* context,
+      const ::tpu_raiden::kv_cache::proto::WriteRemoteRequest* request) override;
 
   // Reports what became of an accepted operation. UNKNOWN once the record has
   // aged out, which the source cannot distinguish from "never happened" and
   // must treat as failure.
-  ::grpc::Status PollWriteRemote(
-      ::grpc::ServerContext* context,
+  ::grpc::ServerUnaryReactor* PollWriteRemote(
+      ::grpc::CallbackServerContext* context,
       const ::tpu_raiden::kv_cache::proto::PollWriteRemoteRequest* request,
       ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse* response)
       override;
+
+  void DetachReactor(uint64_t op_id);
 
   // Diverts the pull through `transfer_fn` instead of the controller. TESTS
   // ONLY, and only before the server serves: the member is not mutex-guarded,
@@ -169,6 +173,10 @@ class KVCacheStoreServiceImpl
     // meaningful while blocks are outstanding.
     absl::Time next_leak_warning = absl::InfiniteFuture();
 
+    // The server write reactor for streaming WriteRemoteEvent back to the source.
+    // Cleared under write_mutex_ when the result is sent or the client disconnects.
+    WriteRemoteServerReactor* reactor = nullptr;
+
     // Resolves once the operation is terminal AND its blocks are settled.
     // Teardown waits on these rather than on the raw transfer futures: Await()
     // on a future does not order with its own OnReady continuation.
@@ -231,6 +239,8 @@ class KVCacheStoreServiceImpl
 
   std::shared_ptr<WriteOp> FindOp(uint64_t op_id)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(write_mutex_);
+  static proto::WriteRemoteEvent MakeResultEvent(
+      const std::shared_ptr<WriteOp>& op);
 
   KVCacheStoreBackend* const backend_ = nullptr;
   tpu_raiden::controller::RaidenController* const controller_ = nullptr;

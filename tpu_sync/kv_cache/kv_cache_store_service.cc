@@ -41,6 +41,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "grpcpp/server_context.h"
+#include "grpcpp/support/server_callback.h"
 #include "grpcpp/support/status.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
@@ -119,6 +120,105 @@ std::vector<RaidenWorkerEndpoints> UnpackWorkerEndpointsProto(
 
 }  // namespace
 
+class WriteRemoteServerReactor
+    : public ::grpc::ServerWriteReactor<
+          ::tpu_raiden::kv_cache::proto::WriteRemoteEvent> {
+ public:
+  WriteRemoteServerReactor(KVCacheStoreServiceImpl* service, uint64_t op_id)
+      : service_(service), op_id_(op_id) {}
+
+  void StartAck(proto::WriteRemoteEvent ack_event) {
+    ack_event_ = std::move(ack_event);
+    StartWrite(&ack_event_);
+  }
+
+  void StartAckAndFinish(proto::WriteRemoteEvent ack_event) {
+    {
+      absl::MutexLock lock(mu_);
+      ack_event_ = std::move(ack_event);
+      finished_ = true;
+    }
+    StartWriteAndFinish(&ack_event_, grpc::WriteOptions(), ::grpc::Status::OK);
+  }
+
+  void FinishWithError(::grpc::Status status) {
+    bool should_finish = false;
+    {
+      absl::MutexLock lock(mu_);
+      if (!finished_) {
+        finished_ = true;
+        should_finish = true;
+      }
+    }
+    if (should_finish) {
+      Finish(status);
+    }
+  }
+
+  void SendResultAndFinish(proto::WriteRemoteEvent result_event) {
+    bool should_write = false;
+    {
+      absl::MutexLock lock(mu_);
+      result_event_ = std::move(result_event);
+      has_result_ = true;
+      if (ack_written_ && !finished_) {
+        finished_ = true;
+        should_write = true;
+      }
+    }
+    if (should_write) {
+      StartWriteAndFinish(&result_event_, grpc::WriteOptions(),
+                          ::grpc::Status::OK);
+    }
+  }
+
+  void OnWriteDone(bool ok) override {
+    if (!ok) {
+      FinishWithError(
+          ::grpc::Status(::grpc::StatusCode::CANCELLED, "Write failed"));
+      return;
+    }
+    bool should_write = false;
+    {
+      absl::MutexLock lock(mu_);
+      if (!ack_written_) {
+        ack_written_ = true;
+        if (has_result_ && !finished_) {
+          finished_ = true;
+          should_write = true;
+        }
+      }
+    }
+    if (should_write) {
+      StartWriteAndFinish(&result_event_, grpc::WriteOptions(),
+                          ::grpc::Status::OK);
+    }
+  }
+
+  void OnCancel() override {
+    if (service_ != nullptr && op_id_ != 0) {
+      service_->DetachReactor(op_id_);
+    }
+  }
+
+  void OnDone() override {
+    if (service_ != nullptr && op_id_ != 0) {
+      service_->DetachReactor(op_id_);
+    }
+    delete this;
+  }
+
+ private:
+  KVCacheStoreServiceImpl* const service_;
+  const uint64_t op_id_;
+  absl::Mutex mu_;
+  proto::WriteRemoteEvent ack_event_;
+  proto::WriteRemoteEvent result_event_ ABSL_GUARDED_BY(mu_);
+  bool ack_written_ ABSL_GUARDED_BY(mu_) = false;
+  bool has_result_ ABSL_GUARDED_BY(mu_) = false;
+  bool finished_ ABSL_GUARDED_BY(mu_) = false;
+};
+
 KVCacheStoreServiceImpl::KVCacheStoreServiceImpl(
     KVCacheStoreBackend* backend,
     tpu_raiden::controller::RaidenController* controller)
@@ -172,9 +272,24 @@ KVCacheStoreServiceImpl::~KVCacheStoreServiceImpl() {
       LOG(ERROR) << "KVCacheStoreServiceImpl teardown gave up after "
                  << kTeardownQuiesceTimeout
                  << " waiting for in-flight remote writes to settle; their "
-                    "landing blocks stay held. A source is wedged, or the "
-                    "global registry is not answering.";
+                     "landing blocks stay held. A source is wedged, or the "
+                     "global registry is not answering.";
     }
+  }
+
+  std::vector<WriteRemoteServerReactor*> reactors_to_finish;
+  {
+    absl::MutexLock lock(write_mutex_);
+    for (auto& [id, op] : write_ops_) {
+      if (op->reactor != nullptr) {
+        reactors_to_finish.push_back(op->reactor);
+        op->reactor = nullptr;
+      }
+    }
+  }
+  for (auto* reactor : reactors_to_finish) {
+    reactor->FinishWithError(::grpc::Status(
+        ::grpc::StatusCode::UNAVAILABLE, "Server shutting down"));
   }
 
   // Clearing under `mu` is what makes a late completion safe: it either has
@@ -223,13 +338,37 @@ void KVCacheStoreServiceImpl::WithdrawEntryIfUnbacked(const std::string& hash) {
   backend_->UnregisterBlocksAsync({hash}).OnReady([](absl::Status) {});
 }
 
-::grpc::Status KVCacheStoreServiceImpl::Fetch(
-    ::grpc::ServerContext* context,
+void KVCacheStoreServiceImpl::DetachReactor(uint64_t op_id) {
+  absl::MutexLock lock(write_mutex_);
+  auto it = write_ops_.find(op_id);
+  if (it != write_ops_.end() && it->second != nullptr) {
+    it->second->reactor = nullptr;
+  }
+}
+
+proto::WriteRemoteEvent KVCacheStoreServiceImpl::MakeResultEvent(
+    const std::shared_ptr<WriteOp>& op) {
+  proto::WriteRemoteEvent event;
+  auto* result = event.mutable_result();
+  result->set_state(ToWireState(op->state));
+  for (const auto& hash : op->existing_hashes) {
+    result->add_existing_hashes(hash);
+  }
+  for (const auto& hash : op->unregistered_hashes) {
+    result->add_unregistered_hashes(hash);
+  }
+  return event;
+}
+
+::grpc::ServerUnaryReactor* KVCacheStoreServiceImpl::Fetch(
+    ::grpc::CallbackServerContext* context,
     const ::tpu_raiden::kv_cache::proto::FetchRequest* request,
     ::tpu_raiden::kv_cache::proto::FetchResponse* response) {
+  auto* reactor = context->DefaultReactor();
   if (backend_ == nullptr || controller_ == nullptr) {
-    return ::grpc::Status(::grpc::StatusCode::FAILED_PRECONDITION,
-                          "Backend or RaidenController non-initialized");
+    reactor->Finish(::grpc::Status(::grpc::StatusCode::FAILED_PRECONDITION,
+                                  "Backend or RaidenController non-initialized"));
+    return reactor;
   }
 
   const std::vector<std::string> block_hashes(request->block_hashes().begin(),
@@ -238,13 +377,15 @@ void KVCacheStoreServiceImpl::WithdrawEntryIfUnbacked(const std::string& hash) {
       request->host_block_ids().begin(), request->host_block_ids().end());
 
   if (block_hashes.empty()) {
-    return ::grpc::Status::OK;
+    reactor->Finish(::grpc::Status::OK);
+    return reactor;
   }
 
   if (dst_host_block_ids.size() != block_hashes.size()) {
-    return ::grpc::Status(
+    reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::INVALID_ARGUMENT,
-        "Mismatched host_block_ids count vs block_hashes count.");
+        "Mismatched host_block_ids count vs block_hashes count."));
+    return reactor;
   }
 
   // =========================================================================
@@ -266,9 +407,10 @@ void KVCacheStoreServiceImpl::WithdrawEntryIfUnbacked(const std::string& hash) {
        client_id.data_name != server_unit.data_name() ||
        client_id.data_replica_idx != server_unit.data_replica_idx());
   if (is_cross_node && request->client_worker_endpoints().empty()) {
-    return ::grpc::Status(
+    reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::INVALID_ARGUMENT,
-        "Cross-node FetchRequest requires non-empty client_worker_endpoints.");
+        "Cross-node FetchRequest requires non-empty client_worker_endpoints."));
+    return reactor;
   }
 
   // =========================================================================
@@ -286,9 +428,10 @@ void KVCacheStoreServiceImpl::WithdrawEntryIfUnbacked(const std::string& hash) {
   options.pin_found = true;
   auto lookup_or = backend_->Lookup(block_hashes, options);
   if (!lookup_or.ok()) {
-    return ::grpc::Status(
+    reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::NOT_FOUND,
-        absl::StrCat("Validation failed: ", lookup_or.status().message()));
+        absl::StrCat("Validation failed: ", lookup_or.status().message())));
+    return reactor;
   }
   const auto& lookup_slices = lookup_or.value();
 
@@ -304,10 +447,11 @@ void KVCacheStoreServiceImpl::WithdrawEntryIfUnbacked(const std::string& hash) {
 
   if (lookup_slices.size() < block_hashes.size()) {
     WithdrawEntryIfUnbacked(block_hashes[lookup_slices.size()]);
-    return ::grpc::Status(
+    reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::NOT_FOUND,
         absl::StrCat("Partial block match: found ", lookup_slices.size(),
-                     " out of ", block_hashes.size()));
+                     " out of ", block_hashes.size())));
+    return reactor;
   }
 
   std::vector<int32_t> src_host_block_ids;
@@ -315,9 +459,10 @@ void KVCacheStoreServiceImpl::WithdrawEntryIfUnbacked(const std::string& hash) {
   for (const auto& [hash, slice] : lookup_slices) {
     if (slice.status != BlockStatus::HOST &&
         slice.status != BlockStatus::HOST_AND_HBM) {
-      return ::grpc::Status(
+      reactor->Finish(::grpc::Status(
           ::grpc::StatusCode::FAILED_PRECONDITION,
-          absl::StrCat("Block hash '", hash, "' is not resident in host DRAM"));
+          absl::StrCat("Block hash '", hash, "' is not resident in host DRAM")));
+      return reactor;
     }
     src_host_block_ids.push_back(slice.host_block_id);
   }
@@ -354,16 +499,18 @@ void KVCacheStoreServiceImpl::WithdrawEntryIfUnbacked(const std::string& hash) {
   absl::Status transfer_status = transfer_future.Await();
 
   if (!transfer_status.ok()) {
-    return ::grpc::Status(::grpc::StatusCode::INTERNAL,
+    reactor->Finish(::grpc::Status(::grpc::StatusCode::INTERNAL,
                           absl::StrCat("Fetch TransferBuffers failed: ",
-                                       transfer_status.message()));
+                                       transfer_status.message())));
+    return reactor;
   }
 
   for (const auto& hash : block_hashes) {
     response->add_done_block_hashes(hash);
   }
 
-  return ::grpc::Status::OK;
+  reactor->Finish(::grpc::Status::OK);
+  return reactor;
 }
 
 ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::State
@@ -420,13 +567,15 @@ void KVCacheStoreServiceImpl::Settle(const std::shared_ptr<WriteOp>& op) {
   }
 }
 
-::grpc::Status KVCacheStoreServiceImpl::WriteRemote(
-    ::grpc::ServerContext* context,
-    const ::tpu_raiden::kv_cache::proto::WriteRemoteRequest* request,
-    ::tpu_raiden::kv_cache::proto::WriteRemoteResponse* response) {
+::grpc::ServerWriteReactor<::tpu_raiden::kv_cache::proto::WriteRemoteEvent>*
+KVCacheStoreServiceImpl::WriteRemote(
+    ::grpc::CallbackServerContext* context,
+    const ::tpu_raiden::kv_cache::proto::WriteRemoteRequest* request) {
   if (backend_ == nullptr || controller_ == nullptr) {
-    return ::grpc::Status(::grpc::StatusCode::FAILED_PRECONDITION,
-                          "Backend or RaidenController non-initialized");
+    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    reactor->Finish(::grpc::Status(::grpc::StatusCode::FAILED_PRECONDITION,
+                                  "Backend or RaidenController non-initialized"));
+    return reactor;
   }
 
   const std::vector<std::string> block_hashes(request->block_hashes().begin(),
@@ -436,21 +585,27 @@ void KVCacheStoreServiceImpl::Settle(const std::shared_ptr<WriteOp>& op) {
       request->src_host_block_ids().end());
 
   if (block_hashes.empty()) {
-    return ::grpc::Status(
+    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::INVALID_ARGUMENT,
-        "WriteRemoteRequest requires non-empty block_hashes.");
+        "WriteRemoteRequest requires non-empty block_hashes."));
+    return reactor;
   }
   if (src_host_block_ids.size() != block_hashes.size()) {
-    return ::grpc::Status(
+    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::INVALID_ARGUMENT,
-        "Mismatched src_host_block_ids count vs block_hashes count.");
+        "Mismatched src_host_block_ids count vs block_hashes count."));
+    return reactor;
   }
   if (request->deadline_ms() <= 0) {
-    return ::grpc::Status(
+    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::INVALID_ARGUMENT,
         absl::StrCat("WriteRemote requires a positive deadline_ms; got ",
                      request->deadline_ms(),
-                     " (an unset field is indistinguishable from 0)."));
+                     " (an unset field is indistinguishable from 0).")));
+    return reactor;
   }
 
   const RaidenId src_id{
@@ -464,9 +619,11 @@ void KVCacheStoreServiceImpl::Settle(const std::shared_ptr<WriteOp>& op) {
       src_id.job_replica_id == unit.job_replica_id() &&
       src_id.data_name == unit.data_name() &&
       src_id.data_replica_idx == unit.data_replica_idx()) {
-    return ::grpc::Status(
+    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::INVALID_ARGUMENT,
-        "WriteRemote destination is this store; there is nothing to transfer.");
+        "WriteRemote destination is this store; there is nothing to transfer."));
+    return reactor;
   }
 
   // Quick check: if we ALREADY hold every requested hash in host DRAM, answer
@@ -474,44 +631,52 @@ void KVCacheStoreServiceImpl::Settle(const std::shared_ptr<WriteOp>& op) {
   std::vector<std::string> present =
       backend_->AlreadyPresentHostResident(block_hashes);
   if (present.size() == block_hashes.size()) {
-    response->set_exist_state(::tpu_raiden::kv_cache::proto::WRITE_ALL_EXIST);
+    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    proto::WriteRemoteEvent ack_event;
+    auto* ack = ack_event.mutable_ack();
+    ack->set_exist_state(::tpu_raiden::kv_cache::proto::WRITE_ALL_EXIST);
     for (const auto& hash : present) {
-      response->add_existing_hashes(hash);
+      ack->add_existing_hashes(hash);
     }
-    return ::grpc::Status::OK;
+    reactor->StartAckAndFinish(std::move(ack_event));
+    return reactor;
   }
   if (!present.empty()) {
-    response->set_exist_state(
+    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    proto::WriteRemoteEvent ack_event;
+    auto* ack = ack_event.mutable_ack();
+    ack->set_exist_state(
         ::tpu_raiden::kv_cache::proto::WRITE_PARTIAL_EXIST);
     for (const auto& hash : present) {
-      response->add_existing_hashes(hash);
+      ack->add_existing_hashes(hash);
     }
-    return ::grpc::Status::OK;
+    reactor->StartAckAndFinish(std::move(ack_event));
+    return reactor;
   }
 
-  // Only now do the source's worker endpoints matter. Everything above was
-  // answerable without them, and demanding a data-plane description in order
-  // to say "I already have these" would refuse offers this node could satisfy
-  // for free -- a peer whose workers are not up yet still knows what it holds.
+  // Only now do the source's worker endpoints matter.
   if (request->src_worker_endpoints().empty()) {
-    return ::grpc::Status(
+    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::INVALID_ARGUMENT,
         "WriteRemote requires the source's worker endpoints: the destination "
-        "pulls, so it needs somewhere to pull from.");
+        "pulls, so it needs somewhere to pull from."));
+    return reactor;
   }
 
-  // Cap the requested deadline. The source requested a deadline; we grant at
-  // most DeadlineCap().
+  // Cap the requested deadline.
   const absl::Duration granted_deadline =
       std::min(absl::Milliseconds(request->deadline_ms()), DeadlineCap());
 
   // Allocate landing blocks in destination host DRAM for the transfer.
   auto allocated_ids_or = controller_->AllocateBlockIds(block_hashes.size());
   if (!allocated_ids_or.ok()) {
-    return ::grpc::Status(
+    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::RESOURCE_EXHAUSTED,
         absl::StrCat("Failed to allocate destination landing blocks: ",
-                     allocated_ids_or.status().message()));
+                     allocated_ids_or.status().message())));
+    return reactor;
   }
   std::vector<int32_t> landing_block_ids(allocated_ids_or->begin(),
                                          allocated_ids_or->end());
@@ -544,6 +709,12 @@ void KVCacheStoreServiceImpl::Settle(const std::shared_ptr<WriteOp>& op) {
     op->settled = std::move(future);
     write_ops_[op_id] = op;
     deadline_cv_.Signal();
+  }
+
+  auto* reactor = new WriteRemoteServerReactor(this, op_id);
+  {
+    absl::MutexLock lock(write_mutex_);
+    op->reactor = reactor;
   }
 
   // Issue the DMA pull from source to local landing blocks.
@@ -580,12 +751,17 @@ void KVCacheStoreServiceImpl::Settle(const std::shared_ptr<WriteOp>& op) {
     OnTransferComplete(lifetime, op_id, status);
   });
 
-  response->set_exist_state(
+  proto::WriteRemoteEvent ack_event;
+  auto* ack = ack_event.mutable_ack();
+  ack->set_exist_state(
       ::tpu_raiden::kv_cache::proto::WRITE_EXIST_STATE_UNSPECIFIED);
-  response->set_operation_id(op_id);
-  response->set_granted_deadline_ms(
+  ack->set_operation_id(op_id);
+  ack->set_granted_deadline_ms(
       absl::ToInt64Milliseconds(granted_deadline));
-  return ::grpc::Status::OK;
+  ack->set_record_ttl_ms(absl::ToInt64Milliseconds(kRecordMargin));
+
+  reactor->StartAck(std::move(ack_event));
+  return reactor;
 }
 
 void KVCacheStoreServiceImpl::OnTransferComplete(
@@ -647,6 +823,19 @@ KVCacheStoreServiceImpl::CompleteWriteRemote(uint64_t op_id,
   if (!claimed) {
     // Deferred free: transfer failed, or succeeded too late. Release landing
     // blocks and settle.
+    WriteRemoteServerReactor* reactor_to_notify = nullptr;
+    proto::WriteRemoteEvent result_event;
+    {
+      absl::MutexLock lock(write_mutex_);
+      reactor_to_notify = op->reactor;
+      if (reactor_to_notify != nullptr) {
+        result_event = MakeResultEvent(op);
+        op->reactor = nullptr;
+      }
+    }
+    if (reactor_to_notify != nullptr) {
+      reactor_to_notify->SendResultAndFinish(std::move(result_event));
+    }
     ReleaseLandingBlocks(op);
     Settle(op);
     return std::nullopt;
@@ -726,10 +915,20 @@ void KVCacheStoreServiceImpl::Finish(const std::shared_ptr<WriteOp>& op,
                                      std::vector<std::string> existing) {
   const bool kept_by_cache =
       state == OpState::kCommitted || state == OpState::kStoredUnregistered;
+  WriteRemoteServerReactor* reactor_to_notify = nullptr;
+  proto::WriteRemoteEvent result_event;
   {
     absl::MutexLock lock(write_mutex_);
     MarkTerminal(op, state, std::move(existing));
     deadline_cv_.Signal();
+    reactor_to_notify = op->reactor;
+    if (reactor_to_notify != nullptr) {
+      result_event = MakeResultEvent(op);
+      op->reactor = nullptr;
+    }
+  }
+  if (reactor_to_notify != nullptr) {
+    reactor_to_notify->SendResultAndFinish(std::move(result_event));
   }
   if (!kept_by_cache) {
     ReleaseLandingBlocks(op);
@@ -737,14 +936,16 @@ void KVCacheStoreServiceImpl::Finish(const std::shared_ptr<WriteOp>& op,
   Settle(op);
 }
 
-::grpc::Status KVCacheStoreServiceImpl::PollWriteRemote(
-    ::grpc::ServerContext* context,
+::grpc::ServerUnaryReactor* KVCacheStoreServiceImpl::PollWriteRemote(
+    ::grpc::CallbackServerContext* context,
     const ::tpu_raiden::kv_cache::proto::PollWriteRemoteRequest* request,
     ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse* response) {
+  auto* reactor = context->DefaultReactor();
   if (request->operation_id() == 0) {
-    return ::grpc::Status(
+    reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::INVALID_ARGUMENT,
-        "operation_id 0 is reserved and never identifies an operation.");
+        "operation_id 0 is reserved and never identifies an operation."));
+    return reactor;
   }
 
   absl::MutexLock lock(write_mutex_);
@@ -761,7 +962,8 @@ void KVCacheStoreServiceImpl::Finish(const std::shared_ptr<WriteOp>& op,
   if (it == write_ops_.end()) {
     response->set_state(
         ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::UNKNOWN);
-    return ::grpc::Status::OK;
+    reactor->Finish(::grpc::Status::OK);
+    return reactor;
   }
 
   const auto& op = it->second;
@@ -781,57 +983,74 @@ void KVCacheStoreServiceImpl::Finish(const std::shared_ptr<WriteOp>& op,
   for (const auto& hash : op->existing_hashes) {
     response->add_existing_hashes(hash);
   }
-  return ::grpc::Status::OK;
+  reactor->Finish(::grpc::Status::OK);
+  return reactor;
 }
 
 void KVCacheStoreServiceImpl::DeadlineLoop() {
-  absl::MutexLock lock(write_mutex_);
-  while (!stop_deadline_thread_) {
-    const absl::Time now = absl::Now();
+  while (true) {
+    std::vector<std::pair<WriteRemoteServerReactor*, proto::WriteRemoteEvent>>
+        reactors_to_notify;
     absl::Time wake_at = absl::InfiniteFuture();
+    {
+      absl::MutexLock lock(write_mutex_);
+      if (stop_deadline_thread_) {
+        break;
+      }
+      const absl::Time now = absl::Now();
 
-    for (auto& [id, op] : write_ops_) {
-      if (op->state == OpState::kPending &&
-          !deadline_firing_paused_for_testing_) {
-        if (now >= op->deadline) {
-          MarkTerminal(op, OpState::kFailed, {});
+      for (auto& [id, op] : write_ops_) {
+        if (op->state == OpState::kPending &&
+            !deadline_firing_paused_for_testing_) {
+          if (now >= op->deadline) {
+            MarkTerminal(op, OpState::kFailed, {});
+            if (op->reactor != nullptr) {
+              reactors_to_notify.push_back({op->reactor, MakeResultEvent(op)});
+              op->reactor = nullptr;
+            }
+          } else {
+            wake_at = std::min(wake_at, op->deadline);
+          }
+        }
+        if (!op->blocks_released && !op->landing_block_ids.empty()) {
+          if (now >= op->next_leak_warning) {
+            LOG(ERROR) << "Remote write " << id << " has held "
+                       << op->landing_block_ids.size()
+                       << " landing block(s) for " << (now - op->accepted_at)
+                       << ", past " << kLeakWarningDeadlineMultiple
+                       << "x its granted deadline of " << op->granted_deadline
+                       << ". The transfer has not resolved, and nothing bounds "
+                          "it: these blocks may not come back until this "
+                          "process restarts.";
+            op->next_leak_warning = now + kLeakWarningInterval;
+          }
+          wake_at = std::min(wake_at, op->next_leak_warning);
+        }
+        if (op->state != OpState::kCompleting &&
+            op->state != OpState::kPending && op->blocks_released) {
+          if (now < op->expires_at) {
+            wake_at = std::min(wake_at, op->expires_at);
+          }
+        }
+      }
+
+      if (reactors_to_notify.empty()) {
+        absl::erase_if(write_ops_, [now](const auto& entry) {
+          const auto& op = entry.second;
+          return op->state != OpState::kCompleting &&
+                 op->state != OpState::kPending && op->blocks_released &&
+                 now >= op->expires_at;
+        });
+        if (wake_at == absl::InfiniteFuture()) {
+          deadline_cv_.Wait(&write_mutex_);
         } else {
-          wake_at = std::min(wake_at, op->deadline);
-        }
-      }
-      if (!op->blocks_released && !op->landing_block_ids.empty()) {
-        if (now >= op->next_leak_warning) {
-          LOG(ERROR) << "Remote write " << id << " has held "
-                     << op->landing_block_ids.size() << " landing block(s) for "
-                     << (now - op->accepted_at) << ", past "
-                     << kLeakWarningDeadlineMultiple
-                     << "x its granted deadline of " << op->granted_deadline
-                     << ". The transfer has not resolved, and nothing bounds "
-                        "it: these blocks may not come back until this "
-                        "process restarts.";
-          op->next_leak_warning = now + kLeakWarningInterval;
-        }
-        wake_at = std::min(wake_at, op->next_leak_warning);
-      }
-      if (op->state != OpState::kCompleting &&
-          op->state != OpState::kPending && op->blocks_released) {
-        if (now < op->expires_at) {
-          wake_at = std::min(wake_at, op->expires_at);
+          deadline_cv_.WaitWithDeadline(&write_mutex_, wake_at);
         }
       }
     }
 
-    absl::erase_if(write_ops_, [now](const auto& entry) {
-      const auto& op = entry.second;
-      return op->state != OpState::kCompleting &&
-             op->state != OpState::kPending && op->blocks_released &&
-             now >= op->expires_at;
-    });
-
-    if (wake_at == absl::InfiniteFuture()) {
-      deadline_cv_.Wait(&write_mutex_);
-    } else {
-      deadline_cv_.WaitWithDeadline(&write_mutex_, wake_at);
+    for (auto& [reactor, event] : reactors_to_notify) {
+      reactor->SendResultAndFinish(std::move(event));
     }
   }
 }

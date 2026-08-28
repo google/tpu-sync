@@ -340,6 +340,7 @@ cc_library(
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -656,6 +657,7 @@ cc_library(
     hdrs = ["kv_cache_store_client.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":completion_executor",
         "//tpu_sync/proto:kv_cache_store_service_cc_grpc",
         "//tpu_sync/proto:kv_cache_store_service_cc_proto",
         "//tpu_sync/proto:worker_service_cc_proto",
@@ -664,6 +666,7 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@xla//xla/tsl/concurrency:future",
     ],

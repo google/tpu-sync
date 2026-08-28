@@ -50,26 +50,33 @@ class KVCacheStoreClient {
       absl::Span<const ::tpu_sync::proto::RaidenWorkerEndpointsProto>
           client_worker_endpoints = {});
 
+  using WriteRemoteVerdictCallback = std::function<void(
+      absl::Status rpc_status,
+      std::optional<::tpu_raiden::kv_cache::proto::WriteRemoteResult> result)>;
+
   // Asynchronous non-blocking WriteRemote RPC: offer `block_hashes` to the
   // peer this client is connected to -- the source side of KVCacheStore's
   // save to a destination. The peer decides, allocates landing
   // blocks and starts pulling; it does NOT wait for the bytes, so the
-  // returned future resolves as soon as the offer is accepted or refused.
+  // returned future resolves as soon as the offer ack is received.
+  // When the operation reaches a terminal state, on_verdict is invoked.
   //
   // `deadline_ms` must be > 0 -- see WriteRemoteRequest.deadline_ms.
-  tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteResponse> WriteRemote(
+  tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck> WriteRemote(
       const ::tpu_sync::rpc::RaidenIdProto& src_raiden_id,
       absl::Span<const std::string> block_hashes,
       absl::Span<const int32_t> src_host_block_ids,
       absl::Span<const ::tpu_sync::proto::RaidenWorkerEndpointsProto>
           src_worker_endpoints,
-      int64_t deadline_ms);
+      int64_t deadline_ms,
+      absl::Duration hold_window,
+      WriteRemoteVerdictCallback on_verdict = nullptr);
 
   // Asynchronous non-blocking PollWriteRemote RPC: ask the peer what became
   // of an operation it accepted. Returns UNKNOWN once the peer's record has
   // aged out, which is indistinguishable from "never happened".
   tsl::Future<::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse>
-  PollWriteRemote(uint64_t operation_id);
+  PollWriteRemote(uint64_t operation_id, int64_t wait_ms = 0);
 
  private:
   std::unique_ptr<

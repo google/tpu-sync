@@ -55,7 +55,7 @@ service KVCacheStoreService {
   //
   // There is deliberately NO lease here, unlike the read path: the source
   // INITIATES and holds its own pins, so there is nothing to negotiate.
-  rpc WriteRemote(WriteRemoteRequest) returns (WriteRemoteResponse);
+  rpc WriteRemote(WriteRemoteRequest) returns (stream WriteRemoteEvent);
   rpc PollWriteRemote(PollWriteRemoteRequest) returns (PollWriteRemoteResponse);
 }
 
@@ -142,28 +142,30 @@ message WriteRemoteRequest {
   int64 deadline_ms = 5;
 }
 
-// Response describing the outcome of a remote write request.
-message WriteRemoteResponse {
-  // Non-zero => accepted and the transfer is proceeding. Zero together with
-  // WRITE_EXIST_STATE_UNSPECIFIED is a PROTOCOL ERROR (a default-initialised
-  // message), not a silent no-op.
+message WriteRemoteEvent {
+  oneof event {
+    WriteRemoteAck ack = 1;
+    WriteRemoteResult result = 2;
+  }
+}
+
+message WriteRemoteAck {
   uint64 operation_id = 1;
-
   WriteExistState exist_state = 2;
-
-  // Populated iff WRITE_PARTIAL_EXIST.
   repeated bytes existing_hashes = 3;
-
-  // The deadline actually armed, after clamping to the destination's own cap.
-  // AUTHORITATIVE: the source validates that its own HOLD exceeds this. The
-  // two values live in different processes, so neither side can check the
-  // invariant alone -- and an inverted pair lets the source stop protecting
-  // its blocks while the destination is still pulling them.
   int64 granted_deadline_ms = 4;
+  int64 record_ttl_ms = 5;
+}
+
+message WriteRemoteResult {
+  PollWriteRemoteResponse.State state = 1;
+  repeated bytes existing_hashes = 2;
+  repeated bytes unregistered_hashes = 3;
 }
 
 message PollWriteRemoteRequest {
   uint64 operation_id = 1;
+  int64 wait_ms = 2;
 }
 
 message PollWriteRemoteResponse {

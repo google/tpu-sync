@@ -1960,9 +1960,66 @@ absl::Status KVCacheStore::SaveRemote(
   // by rollback.
   std::move(rollback).Cancel();
 
+  auto on_verdict = [lifetime = lifetime_, op_key](
+                        absl::Status status,
+                        std::optional<proto::WriteRemoteResult> result) {
+    absl::MutexLock lock(lifetime->mu);
+    if (lifetime->store == nullptr) {
+      return;
+    }
+    if (result.has_value()) {
+      switch (result->state()) {
+        case proto::PollWriteRemoteResponse::COMMITTED:
+        case proto::PollWriteRemoteResponse::ALL_EXIST: {
+          auto taken = lifetime->store->TakeRemoteWrite(op_key);
+          if (taken.has_value()) {
+            lifetime->store->OnWriteRemoteVerdict(std::move(*taken),
+                                                 /*succeeded=*/true, {});
+          }
+          break;
+        }
+        case proto::PollWriteRemoteResponse::PARTIAL_EXIST: {
+          auto taken = lifetime->store->TakeRemoteWrite(op_key);
+          if (taken.has_value()) {
+            lifetime->store->OnWriteRemoteVerdict(
+                std::move(*taken), /*succeeded=*/false,
+                std::vector<std::string>(result->existing_hashes().begin(),
+                                         result->existing_hashes().end()));
+          }
+          break;
+        }
+        case proto::PollWriteRemoteResponse::STORED_UNREGISTERED: {
+          auto taken = lifetime->store->TakeRemoteWrite(op_key);
+          if (taken.has_value()) {
+            lifetime->store->OnWriteRemoteVerdict(
+                std::move(*taken), /*succeeded=*/false, {},
+                std::vector<std::string>(result->unregistered_hashes().begin(),
+                                         result->unregistered_hashes().end()));
+          }
+          break;
+        }
+        default: {
+          auto taken = lifetime->store->TakeRemoteWrite(op_key);
+          if (taken.has_value()) {
+            lifetime->store->OnWriteRemoteVerdict(std::move(*taken),
+                                                 /*succeeded=*/false, {});
+          }
+          break;
+        }
+      }
+    } else if (absl::IsDeadlineExceeded(status)) {
+      auto taken = lifetime->store->TakeRemoteWrite(op_key);
+      if (taken.has_value()) {
+        lifetime->store->OnWriteRemoteVerdict(std::move(*taken),
+                                             /*succeeded=*/false, {});
+      }
+    }
+  };
+
   auto ack_or =
       backend->BeginWriteRemote(dst_raiden_id, block_hashes, src_host_block_ids,
-                                hold - kRemoteWriteMargin);
+                                hold - kRemoteWriteMargin, hold,
+                                std::move(on_verdict));
   if (!ack_or.ok()) {
     const auto& status = ack_or.status();
     // If the failure was an explicit refusal by the destination (e.g. RESOURCE_EXHAUSTED)
@@ -1972,7 +2029,15 @@ absl::Status KVCacheStore::SaveRemote(
     if (!should_hold_pin) {
       auto taken = TakeRemoteWrite(op_key);
       if (taken.has_value()) {
-        OnWriteRemoteVerdict(std::move(*taken), /*succeeded=*/false, {});
+        auto* host_backend =
+            dynamic_cast<HostOffloadBackend*>(backends_[0].get());
+        if (host_backend != nullptr) {
+          host_backend->Release(taken->block_hashes);
+        }
+        absl::MutexLock lock(mutex_);
+        for (const auto& hash : marked) {
+          saving_hashes_.erase(hash);
+        }
       }
     } else {
       LOG(WARNING) << "Remote write offer to " << dst_raiden_id
@@ -2452,9 +2517,6 @@ void KVCacheStore::PollFuturesInternal() {
   PollSavesInternal(std::move(ready_saves));
   PollLoadsInternal(std::move(ready_loads));
   PollRemoteReadsInternal(std::move(ready_remote_reads));
-  // Unlike the three above, a remote write has no local future to become
-  // ready: the work is happening on the destination, so this asks.
-  PollRemoteWritesInternal();
 }
 
 }  // namespace kv_cache

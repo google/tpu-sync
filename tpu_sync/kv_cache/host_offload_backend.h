@@ -165,6 +165,10 @@ class HostOffloadBackend : public KVCacheStoreBackend {
     absl::Duration granted_deadline;
   };
 
+  using WriteRemoteVerdictCallback = std::function<void(
+      absl::Status rpc_status,
+      std::optional<::tpu_raiden::kv_cache::proto::WriteRemoteResult> result)>;
+
   // `requested_deadline` is how long the destination may hold its landing
   // blocks; it grants at most this and at most its own cap, and reports what
   // it actually armed. Blocking, on the caller's thread -- this is a control
@@ -173,7 +177,9 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   absl::StatusOr<RemoteWriteAck> BeginWriteRemote(
       const RaidenId& dst_raiden_id, absl::Span<const std::string> block_hashes,
       absl::Span<const int32_t> src_host_block_ids,
-      absl::Duration requested_deadline);
+      absl::Duration requested_deadline,
+      absl::Duration hold_window,
+      WriteRemoteVerdictCallback on_verdict = nullptr);
 
   // Mirrors PollWriteRemoteResponse::State without depending on it, so the
   // wire enum stays an implementation detail of this file.

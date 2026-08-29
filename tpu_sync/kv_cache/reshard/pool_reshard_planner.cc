@@ -28,6 +28,8 @@
 #include <utility>
 #include <vector>
 
+#include "absl/container/btree_map.h"
+#include "absl/container/btree_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -143,9 +145,9 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
     return absl::InvalidArgumentError(
         "uuid must be positive for pool resharding");
   }
-  if (request.dst_units.size() != 1) {
+  if (request.dst_units.empty()) {
     return absl::InvalidArgumentError(
-        "Pool resharding requires exactly one destination unit");
+        "Pool resharding requires at least one destination unit");
   }
   {
     std::set<RaidenId, RequestBlockRegistry::RaidenIdLess> unique_src(
@@ -179,16 +181,18 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
   auto dst_by_unit_or = MetadataByUnit(request.dst_metadata, request.dst_units);
   if (!dst_by_unit_or.ok()) return dst_by_unit_or.status();
   auto& dst_by_unit = *dst_by_unit_or;
-  const RaidenId& dst_unit = request.dst_units[0];
+  // All destinations must share one local pool geometry (validated below).
   const tpu_sync::rpc::RegisterWorkUnitRequest& dst_meta =
-      *dst_by_unit.at(dst_unit);
+      *dst_by_unit.at(request.dst_units[0]);
 
   std::vector<const tpu_sync::rpc::RegisterWorkUnitRequest*> all_metadata;
-  all_metadata.reserve(request.src_units.size() + 1);
+  all_metadata.reserve(request.src_units.size() + request.dst_units.size());
   for (const RaidenId& unit : request.src_units) {
     all_metadata.push_back(src_by_unit.at(unit));
   }
-  all_metadata.push_back(&dst_meta);
+  for (const RaidenId& unit : request.dst_units) {
+    all_metadata.push_back(dst_by_unit.at(unit));
+  }
   for (const auto* meta : all_metadata) {
     RaidenId unit = RaidenIdFromProto(meta->unit());
     if (meta->layout_fingerprint().empty()) {
@@ -227,6 +231,7 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
   }
 
   std::vector<std::pair<std::string, std::string>> dst_identity;
+  dst_identity.reserve(dst_meta.pools().size());
   for (const auto& pool : dst_meta.pools()) {
     dst_identity.emplace_back(pool.tag(), pool.dtype_tag());
   }
@@ -235,8 +240,10 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
         "Destination pool manifest must not be empty");
   }
   for (const RaidenId& src_unit : request.src_units) {
+    const auto& src_pools = src_by_unit.at(src_unit)->pools();
     std::vector<std::pair<std::string, std::string>> src_identity;
-    for (const auto& pool : src_by_unit.at(src_unit)->pools()) {
+    src_identity.reserve(src_pools.size());
+    for (const auto& pool : src_pools) {
       src_identity.emplace_back(pool.tag(), pool.dtype_tag());
     }
     if (src_identity != dst_identity) {
@@ -244,6 +251,37 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
           "Canonical pool manifest mismatch between source and destination "
           "for ",
           PythonRepr(src_unit)));
+    }
+  }
+  {
+    std::vector<std::string> reference_dst_geometry;
+    reference_dst_geometry.reserve(dst_meta.pools().size());
+    for (const auto& pool : dst_meta.pools()) {
+      reference_dst_geometry.push_back(GeometrySignature(pool));
+    }
+    for (size_t i = 1; i < request.dst_units.size(); ++i) {
+      const RaidenId& unit = request.dst_units[i];
+      const auto& other_meta = *dst_by_unit.at(unit);
+      std::vector<std::pair<std::string, std::string>> other_identity;
+      other_identity.reserve(other_meta.pools().size());
+      for (const auto& pool : other_meta.pools()) {
+        other_identity.emplace_back(pool.tag(), pool.dtype_tag());
+      }
+      if (other_identity != dst_identity) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Canonical pool manifest mismatch between destinations at ",
+            PythonRepr(unit)));
+      }
+      std::vector<std::string> other_geometry;
+      other_geometry.reserve(other_meta.pools().size());
+      for (const auto& pool : other_meta.pools()) {
+        other_geometry.push_back(GeometrySignature(pool));
+      }
+      if (other_geometry != reference_dst_geometry) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("Destination pool geometry differs across units at ",
+                         PythonRepr(unit)));
+      }
     }
   }
 
@@ -484,7 +522,23 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
   // Per-tag planning: each requested tag selects its own pools, owns its
   // own destination block-id space and coverage validation, and emits one
   // entry group.
-  const std::string dst_peer = dst_meta.shards(0);
+  absl::btree_map<RaidenId, std::string, RequestBlockRegistry::RaidenIdLess>
+      dst_peers;
+  {
+    absl::btree_set<std::string> unique_peers;
+    for (const RaidenId& unit : request.dst_units) {
+      const std::string peer = dst_by_unit.at(unit)->shards(0);
+      unique_peers.insert(peer);
+      dst_peers.emplace(unit, peer);
+    }
+    if (unique_peers.size() != request.dst_units.size()) {
+      std::vector<std::string> sorted_peers(unique_peers.begin(),
+                                            unique_peers.end());
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Destinations must register distinct data-plane endpoints; got ",
+          PyStrListRepr(sorted_peers)));
+    }
+  }
   std::map<RaidenId, std::vector<ScheduleEntry>,
            RequestBlockRegistry::RaidenIdLess>
       schedules;
@@ -736,8 +790,11 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
           return std::tie(a.span->dst_block_index, a.span->dst_offset_bytes) <
                  std::tie(b.span->dst_block_index, b.span->dst_offset_bytes);
         });
-    std::map<RaidenId, std::set<std::tuple<std::string, int64_t, int64_t>>,
-             RequestBlockRegistry::RaidenIdLess>
+    std::map<
+        RaidenId,
+        std::map<RaidenId, std::set<std::tuple<std::string, int64_t, int64_t>>,
+                 RequestBlockRegistry::RaidenIdLess>,
+        RequestBlockRegistry::RaidenIdLess>
         transfer_pairs_per_sender;
     for (const OrderedSpan& ordered : ordered_spans) {
       const PoolByteSpan& span = *ordered.span;
@@ -754,37 +811,57 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
             TranslateLiveCopy(precheck.src_segments, precheck.dst_segments,
                               src_offset, dst_offset, span.size_bytes);
         if (!translated.ok()) return translated.status();
-        emitted_chunks += static_cast<int64_t>(translated->size());
+        emitted_chunks += static_cast<int64_t>(translated->size()) *
+                          static_cast<int64_t>(request.dst_units.size());
         if (emitted_chunks > kMaxLiveSegments) {
           return absl::InvalidArgumentError(
               "Byte-span plan exceeds the live-region expansion bound");
         }
+        // Replicated caches: every destination receives the identical
+        // chunk, so emission is the (chunk x destination) cross product and
+        // entries differ only in dst_peer. For supporting sharded
+        // destionations, this needs to be updated.
         for (const LiveCopyChunk& chunk : *translated) {
-          ScheduleEntry schedule_entry;
-          schedule_entry.dst_peer = dst_peer;
-          schedule_entry.dst_shard_idx = 0;
-          schedule_entry.dst_offset_bytes = chunk.dst_physical;
-          schedule_entry.src_offset_bytes = chunk.src_physical;
-          schedule_entry.size_bytes = chunk.size;
-          schedule_entry.src_block_id = src_block_id;
-          schedule_entry.dst_block_id = dst_block_id;
-          schedule_entry.src_stride_bytes = 0;
-          schedule_entry.dst_stride_bytes = 0;
-          schedule_entry.count = 1;
-          schedule_entry.layer_idx = 0;
-          schedule_entry.pool_group = static_cast<int32_t>(group_idx);
-          schedules[src_unit].push_back(std::move(schedule_entry));
+          for (const RaidenId& dst_unit_id : request.dst_units) {
+            ScheduleEntry schedule_entry;
+            schedule_entry.dst_peer = dst_peers.at(dst_unit_id);
+            schedule_entry.dst_shard_idx = 0;
+            schedule_entry.dst_offset_bytes = chunk.dst_physical;
+            schedule_entry.src_offset_bytes = chunk.src_physical;
+            schedule_entry.size_bytes = chunk.size;
+            schedule_entry.src_block_id = src_block_id;
+            schedule_entry.dst_block_id = dst_block_id;
+            schedule_entry.src_stride_bytes = 0;
+            schedule_entry.dst_stride_bytes = 0;
+            schedule_entry.count = 1;
+            schedule_entry.layer_idx = 0;
+            schedule_entry.pool_group = static_cast<int32_t>(group_idx);
+            schedules[src_unit].push_back(std::move(schedule_entry));
+          }
         }
       }
-      transfer_pairs_per_sender[src_unit].insert(
-          std::make_tuple(dst_peer, src_block_id, dst_block_id));
+      auto& sender_pairs = transfer_pairs_per_sender[src_unit];
+      for (const RaidenId& dst_unit_id : request.dst_units) {
+        sender_pairs[dst_unit_id].insert(std::make_tuple(
+            dst_peers.at(dst_unit_id), src_block_id, dst_block_id));
+      }
     }
 
-    int64_t group_expected_pushes = 0;
-    for (const auto& [unit, pairs] : transfer_pairs_per_sender) {
-      group_expected_pushes +=
-          std::min(requested_parallelism, static_cast<int64_t>(pairs.size()));
+    // Computed expected pushes for the receiver.
+    std::map<RaidenId, int32_t, RequestBlockRegistry::RaidenIdLess>
+        expected_pushes_by_dst;
+    for (const RaidenId& dst_unit_id : request.dst_units) {
+      int64_t dst_pushes = 0;
+      for (const auto& [unit, by_dst] : transfer_pairs_per_sender) {
+        auto pairs_it = by_dst.find(dst_unit_id);
+        if (pairs_it == by_dst.end()) continue;
+        dst_pushes += std::min(requested_parallelism,
+                               static_cast<int64_t>(pairs_it->second.size()));
+      }
+      expected_pushes_by_dst[dst_unit_id] = static_cast<int32_t>(dst_pushes);
     }
+    const int64_t group_expected_pushes =
+        expected_pushes_by_dst.at(request.dst_units[0]);
     if (group_expected_pushes <= 0) {
       return absl::InvalidArgumentError(
           absl::StrCat("Pool reshard plan contains no source pushes for tag ",
@@ -793,7 +870,7 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
     PlanPoolGroup group;
     group.pool_indices = precheck.selected;
     group.dst_device_block_ids = dst_ids_g;
-    group.expected_pushes = static_cast<int32_t>(group_expected_pushes);
+    group.expected_pushes_by_dst = std::move(expected_pushes_by_dst);
     group.dst_expected_extent_bytes = extents;
     // FA (the first requested tag by connector convention) uploads first;
     // state classes land after it on aliased arena pages.
@@ -830,17 +907,18 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
       plan.src_units.push_back(unit);
     }
   }
-  plan.dst_unit = dst_unit;
+  plan.dst_units = request.dst_units;
   plan.schedules = std::move(schedules);
   for (const auto* meta : all_metadata) {
     plan.worker_rpc_addresses[RaidenIdFromProto(meta->unit())] =
         meta->control_plane_rpc_address();
   }
-  plan.dst_peer = dst_peer;
+  plan.dst_peers = std::move(dst_peers);
   plan.uuid = uuid;
   plan.req_id = req_id;
   plan.expected_block_count = static_cast<int64_t>(dst_ids.size());
-  plan.expected_pushes_per_pool = pool_groups[0].expected_pushes;
+  plan.expected_pushes_per_pool =
+      pool_groups[0].expected_pushes_by_dst.at(request.dst_units[0]);
   plan.transfer_pool_indices = union_selected;
   for (const auto& pool : dst_meta.pools()) {
     plan.pool_dtype_tags.push_back(pool.dtype_tag());

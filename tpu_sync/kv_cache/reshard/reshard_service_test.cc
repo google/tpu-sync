@@ -14,6 +14,7 @@
 
 #include "tpu_sync/kv_cache/reshard/reshard_service.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -51,10 +52,10 @@ RaidenId Unit(int rank) {
   return id;
 }
 
-RaidenId DstUnit() {
+RaidenId DstUnit(int idx = 0) {
   RaidenId id;
   id.job_name = "decode";
-  id.job_replica_id = "0";
+  id.job_replica_id = absl::StrCat(idx);
   id.data_name = "kv_cache";
   id.data_replica_idx = 0;
   return id;
@@ -118,10 +119,35 @@ class ReshardStackTest : public ::testing::Test {
     service_ = std::make_unique<ReshardService>(options);
   }
 
-  // Registers rank units 0..7 plus the decode unit through the framed
+  // Registers one decode unit. Destination idx 0 keeps the legacy
+  // addresses (shard 10.0.0.2:9400, control 10.0.0.2:9600); siblings
+  // stagger off them. Overrides support mismatch tests (registration is
+  // replacement).
+  void RegisterDstUnit(int idx, int num_src, int64_t live, int64_t stride,
+                       int64_t num_blocks,
+                       const std::string& fingerprint = "fp1",
+                       const std::string& shard_override = "") {
+    tpu_sync::rpc::ControlRequest req;
+    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+    auto* reg = req.mutable_register_work_unit_request();
+    *reg->mutable_unit() = RaidenIdToProto(DstUnit(idx));
+    reg->add_shards(shard_override.empty()
+                        ? absl::StrCat("10.0.0.2:", 9400 + idx)
+                        : shard_override);
+    reg->set_control_plane_rpc_address(absl::StrCat("10.0.0.2:", 9600 + idx));
+    *reg->add_pools() = MakePool("fa", live, stride, num_blocks);
+    reg->set_layout_fingerprint(fingerprint);
+    reg->set_page_tokens(4096);
+    reg->set_transfer_parallelism(num_src);
+    reg->set_transfer_rank(0);
+    tpu_sync::rpc::ControlResponse resp = Handle(req.SerializeAsString());
+    ASSERT_TRUE(resp.success()) << resp.message();
+  }
+
+  // Registers rank units 0..7 plus the decode unit(s) through the framed
   // surface (byte-level, like the real facade would).
   void RegisterAllUnits(int num_src, int64_t live, int64_t stride,
-                        int64_t num_blocks) {
+                        int64_t num_blocks, int num_dst = 1) {
     for (int rank = 0; rank < num_src; ++rank) {
       tpu_sync::rpc::ControlRequest req;
       req.set_command(
@@ -139,19 +165,9 @@ class ReshardStackTest : public ::testing::Test {
       tpu_sync::rpc::ControlResponse resp = Handle(req.SerializeAsString());
       ASSERT_TRUE(resp.success()) << resp.message();
     }
-    tpu_sync::rpc::ControlRequest req;
-    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
-    auto* reg = req.mutable_register_work_unit_request();
-    *reg->mutable_unit() = RaidenIdToProto(DstUnit());
-    reg->add_shards("10.0.0.2:9400");
-    reg->set_control_plane_rpc_address("10.0.0.2:9600");
-    *reg->add_pools() = MakePool("fa", live, stride, num_blocks);
-    reg->set_layout_fingerprint("fp1");
-    reg->set_page_tokens(4096);
-    reg->set_transfer_parallelism(num_src);
-    reg->set_transfer_rank(0);
-    tpu_sync::rpc::ControlResponse resp = Handle(req.SerializeAsString());
-    ASSERT_TRUE(resp.success()) << resp.message();
+    for (int idx = 0; idx < num_dst; ++idx) {
+      RegisterDstUnit(idx, num_src, live, stride, num_blocks);
+    }
   }
 
   void RegisterSpans(int rank, const std::string& req_id, int64_t uuid,
@@ -241,8 +257,8 @@ class ReshardStackTest : public ::testing::Test {
 
   tpu_sync::rpc::ControllerResponse Coordinate(
       const std::string& req_id, int64_t uuid, int num_src,
-      std::vector<int64_t> dst_blocks,
-      std::vector<int64_t> dst_skip = {}) {
+      std::vector<int64_t> dst_blocks, std::vector<int64_t> dst_skip = {},
+      int num_dst = 1) {
     tpu_sync::rpc::ControllerRequest req;
     req.set_command(
         tpu_sync::rpc::ControllerRequest::COMMAND_COORDINATE_TRANSFER);
@@ -250,7 +266,9 @@ class ReshardStackTest : public ::testing::Test {
     for (int rank = 0; rank < num_src; ++rank) {
       *coord->add_src_units() = RaidenIdToProto(Unit(rank));
     }
-    *coord->add_dst_units() = RaidenIdToProto(DstUnit());
+    for (int idx = 0; idx < num_dst; ++idx) {
+      *coord->add_dst_units() = RaidenIdToProto(DstUnit(idx));
+    }
     coord->set_uuid(uuid);
     coord->set_is_sender(true);
     coord->set_dst_mem_type(tpu_sync::rpc::MEMORY_TYPE_HBM);
@@ -579,6 +597,119 @@ TEST_F(ReshardStackTest, TtlPurgesExpiredRegistrations) {
   tpu_sync::rpc::ControllerResponse resp = Coordinate("req-7", 48, 1, {7});
   ASSERT_FALSE(resp.success());
   EXPECT_THAT(resp.message(), HasSubstr("Missing producer block registration"));
+}
+
+// One plan replicates the identical byte set to N destinations.
+TEST_F(ReshardStackTest, TwoDestinationsArmEachThenDispatchSendersOnce) {
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16, /*num_dst=*/2);
+  RegisterSpans(0, "req-mc", 60, 1024, /*src_block=*/3, /*dst_index=*/0,
+                /*dst_offset=*/0, /*size=*/1024);
+  RegisterSpans(1, "req-mc", 60, 1024, /*src_block=*/5, /*dst_index=*/1,
+                /*dst_offset=*/0, /*size=*/512);
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-mc", 60, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_TRUE(resp.success()) << resp.message();
+
+  // 4 calls: 2 concurrent arms (order between them unspecified), then 2
+  // sender dispatches — every arm strictly precedes every dispatch.
+  ASSERT_EQ(transport_.calls_.size(), 4u);
+  std::vector<std::string> arm_addresses = {transport_.calls_[0].first,
+                                            transport_.calls_[1].first};
+  std::sort(arm_addresses.begin(), arm_addresses.end());
+  EXPECT_EQ(arm_addresses[0], "10.0.0.2:9600");
+  EXPECT_EQ(arm_addresses[1], "10.0.0.2:9601");
+
+  for (int i = 0; i < 2; ++i) {
+    tpu_sync::rpc::ControlRequest arm;
+    ASSERT_TRUE(arm.ParseFromString(transport_.calls_[i].second));
+    const auto& start_req = arm.start_transfer_request();
+    EXPECT_FALSE(start_req.is_sender());
+    // The arm names only the armed unit (controller-delivery worker
+    // resolution reads dst_units(0)).
+    ASSERT_EQ(start_req.dst_units_size(), 1);
+    const std::string own_peer = transport_.calls_[i].first == "10.0.0.2:9600"
+                                     ? "10.0.0.2:9400"
+                                     : "10.0.0.2:9401";
+    // Filtered schedule: both sources, each contributing its single pair,
+    // every entry addressed to this receiver's own data endpoint.
+    ASSERT_EQ(start_req.shard_push_schedules_size(), 2);
+    int entry_count = 0;
+    for (const auto& keyed_schedule : start_req.shard_push_schedules()) {
+      for (const auto& entry : keyed_schedule.second.entries()) {
+        EXPECT_EQ(entry.dst_peer(), own_peer);
+        ++entry_count;
+      }
+    }
+    EXPECT_EQ(entry_count, 2);
+    // Per-destination expected pushes match what the receiver recomputes
+    // from its filtered schedule: two senders x one pair each.
+    ASSERT_EQ(start_req.pool_groups_size(), 1);
+    EXPECT_EQ(start_req.pool_groups(0).expected_pushes(), 2);
+  }
+
+  for (int i = 2; i < 4; ++i) {
+    tpu_sync::rpc::ControlRequest dispatch;
+    ASSERT_TRUE(dispatch.ParseFromString(transport_.calls_[i].second));
+    const auto& start_req = dispatch.start_transfer_request();
+    EXPECT_TRUE(start_req.is_sender());
+    EXPECT_EQ(start_req.dst_units_size(), 2);
+    // The sender's local schedule carries one entry per destination for
+    // its single chunk — same bytes, both peers, one D2H amortized
+    // executor-side.
+    ASSERT_EQ(start_req.shard_push_schedules_size(), 1);
+    const auto& schedule = start_req.shard_push_schedules().at(0);
+    ASSERT_EQ(schedule.entries_size(), 2);
+    std::vector<std::string> peers = {schedule.entries(0).dst_peer(),
+                                      schedule.entries(1).dst_peer()};
+    std::sort(peers.begin(), peers.end());
+    EXPECT_EQ(peers[0], "10.0.0.2:9400");
+    EXPECT_EQ(peers[1], "10.0.0.2:9401");
+    EXPECT_EQ(schedule.entries(0).dst_offset_bytes(),
+              schedule.entries(1).dst_offset_bytes());
+    EXPECT_EQ(schedule.entries(0).size_bytes(),
+              schedule.entries(1).size_bytes());
+  }
+}
+
+TEST_F(ReshardStackTest, MismatchedDestinationsFailClosed) {
+  RegisterAllUnits(/*num_src=*/1, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16, /*num_dst=*/2);
+  RegisterSpans(0, "req-mcgeo", 62, 1024, 3, 0, 0, 1024);
+
+  // Destination geometry must be identical across units.
+  RegisterDstUnit(1, /*num_src=*/1, /*live=*/1024, /*stride=*/1024,
+                  /*num_blocks=*/8);
+  tpu_sync::rpc::ControllerResponse geometry =
+      Coordinate("req-mcgeo", 62, 1, {7}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_FALSE(geometry.success());
+  EXPECT_THAT(geometry.message(),
+              HasSubstr("Destination pool geometry differs across units"));
+
+  // Fingerprints must be identical across every unit of the pair.
+  RegisterDstUnit(1, /*num_src=*/1, /*live=*/1024, /*stride=*/1024,
+                  /*num_blocks=*/16, /*fingerprint=*/"fp2");
+  tpu_sync::rpc::ControllerResponse fingerprint =
+      Coordinate("req-mcgeo", 62, 1, {7}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_FALSE(fingerprint.success());
+  EXPECT_THAT(fingerprint.message(), HasSubstr("Layout fingerprint mismatch"));
+
+  // Destinations must expose distinct data-plane endpoints.
+  RegisterDstUnit(1, /*num_src=*/1, /*live=*/1024, /*stride=*/1024,
+                  /*num_blocks=*/16, /*fingerprint=*/"fp1",
+                  /*shard_override=*/"10.0.0.2:9400");
+  tpu_sync::rpc::ControllerResponse duplicate =
+      Coordinate("req-mcgeo", 62, 1, {7}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_FALSE(duplicate.success());
+  EXPECT_THAT(duplicate.message(), HasSubstr("distinct data-plane endpoints"));
+
+  // All three rejections precede the claim or abandon it: the healthy
+  // registration still coordinates.
+  RegisterDstUnit(1, /*num_src=*/1, /*live=*/1024, /*stride=*/1024,
+                  /*num_blocks=*/16);
+  tpu_sync::rpc::ControllerResponse ok =
+      Coordinate("req-mcgeo", 62, 1, {7}, /*dst_skip=*/{}, /*num_dst=*/2);
+  EXPECT_TRUE(ok.success()) << ok.message();
 }
 
 TEST_F(ReshardStackTest, LegacyCommandsFailClosed) {

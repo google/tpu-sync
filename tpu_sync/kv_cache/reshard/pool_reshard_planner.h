@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/container/btree_map.h"
 #include "absl/status/statusor.h"
 #include "tpu_sync/kv_cache/raiden_id.h"
 #include "tpu_sync/kv_cache/reshard/request_block_registry.h"
@@ -52,7 +53,8 @@ struct ScheduleEntry {
 struct PlanPoolGroup {
   std::vector<int32_t> pool_indices;
   std::vector<int64_t> dst_device_block_ids;
-  int32_t expected_pushes = 0;
+  std::map<RaidenId, int32_t, RequestBlockRegistry::RaidenIdLess>
+      expected_pushes_by_dst;
   std::vector<int64_t> dst_expected_extent_bytes;
   int32_t order_rank = 0;
 };
@@ -60,9 +62,11 @@ struct PlanPoolGroup {
 // The pool-path subset of TransferPlan that the encoder and coordinator
 // consume. Field-for-field mirror of _build_byte_span_plan_claimed's
 // return value.
+// Note: Multi-destination plans replicate one identical byte set
+// to every destination (TP>1 decode engine).
 struct PoolReshardPlan {
   std::vector<RaidenId> src_units;  // active source units, rank order
-  RaidenId dst_unit;
+  std::vector<RaidenId> dst_units;
   // Per source unit: shard 0's entry list (pool planning enforces one
   // endpoint per unit, so the inner Python dict always has the single key
   // 0). Keyed in src_units order.
@@ -71,7 +75,9 @@ struct PoolReshardPlan {
       schedules;
   std::map<RaidenId, std::string, RequestBlockRegistry::RaidenIdLess>
       worker_rpc_addresses;
-  std::string dst_peer;  // worker_data_addresses[dst_unit][0]
+  // worker_data_addresses[unit][0] per destination unit.
+  absl::btree_map<RaidenId, std::string, RequestBlockRegistry::RaidenIdLess>
+      dst_peers;
   int64_t uuid = 0;
   std::string req_id;
   int64_t expected_block_count = 0;

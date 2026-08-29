@@ -112,11 +112,20 @@ tpu_sync::rpc::StartTransferRequest BuildStartTransferForTarget(
     const PoolReshardPlan& plan, const RaidenId& target) {
   const bool is_sender = std::find(plan.src_units.begin(), plan.src_units.end(),
                                    target) != plan.src_units.end();
+  const bool is_receiver =
+      std::find(plan.dst_units.begin(), plan.dst_units.end(), target) !=
+      plan.dst_units.end();
   tpu_sync::rpc::StartTransferRequest start_req;
   for (const RaidenId& unit : plan.src_units) {
     *start_req.add_src_units() = RaidenIdToProto(unit);
   }
-  *start_req.add_dst_units() = RaidenIdToProto(plan.dst_unit);
+  if (is_receiver) {
+    *start_req.add_dst_units() = RaidenIdToProto(target);
+  } else {
+    for (const RaidenId& unit : plan.dst_units) {
+      *start_req.add_dst_units() = RaidenIdToProto(unit);
+    }
+  }
   start_req.set_uuid(plan.uuid);
   start_req.set_is_sender(is_sender);
   start_req.set_dst_mem_type(tpu_sync::rpc::MEMORY_TYPE_HBM);
@@ -176,7 +185,13 @@ tpu_sync::rpc::StartTransferRequest BuildStartTransferForTarget(
     for (int64_t block_id : group.dst_device_block_ids) {
       group_proto->add_dst_device_block_ids(block_id);
     }
-    group_proto->set_expected_pushes(group.expected_pushes);
+    const RaidenId& count_key = is_receiver ? target : plan.dst_units[0];
+    int32_t expected_pushes = 0;
+    auto by_dst_it = group.expected_pushes_by_dst.find(count_key);
+    if (by_dst_it != group.expected_pushes_by_dst.end()) {
+      expected_pushes = by_dst_it->second;
+    }
+    group_proto->set_expected_pushes(expected_pushes);
     for (int64_t extent : group.dst_expected_extent_bytes) {
       group_proto->add_dst_expected_extent_bytes(extent);
     }
@@ -206,16 +221,17 @@ tpu_sync::rpc::StartTransferRequest BuildStartTransferForTarget(
         }
       };
 
-  if (target == plan.dst_unit) {
+  if (is_receiver) {
     // Receiver path: every source's schedule, keyed by the source's transfer
     // rank (the node id its pushes carry), filtered to entries targeting
     // this receiver (single-endpoint pool plans always match).
+    const std::string& target_peer = plan.dst_peers.at(target);
     for (const auto& [src_unit, entries] : plan.schedules) {
       auto key_it = plan.src_schedule_keys.find(src_unit);
       if (key_it == plan.src_schedule_keys.end()) continue;
       std::vector<ScheduleEntry> filtered;
       for (const ScheduleEntry& entry : entries) {
-        if (entry.dst_peer == plan.dst_peer) filtered.push_back(entry);
+        if (entry.dst_peer == target_peer) filtered.push_back(entry);
       }
       if (filtered.empty()) continue;
       tpu_sync::rpc::ShardPushScheduleProto schedule_proto;
@@ -240,7 +256,9 @@ std::string EncodeStartTransfer(const PoolReshardPlan& plan,
   tpu_sync::rpc::ControlRequest req;
   req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_START_TRANSFER);
   // peers: the destination units' data endpoints (one dst, one endpoint).
-  req.add_peers(plan.dst_peer);
+  for (const RaidenId& unit : plan.dst_units) {
+    req.add_peers(plan.dst_peers.at(unit));
+  }
   *req.mutable_start_transfer_request() =
       BuildStartTransferForTarget(plan, target);
   return req.SerializeAsString();
@@ -389,26 +407,38 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
   const int64_t plan_build_end_ns = MonotonicNs();
 
   // Receivers must be armed before any sender can put bytes on the wire.
+  // Multi-destination plans arm every receiver concurrently and join
+  // before dispatching senders.
   const int64_t receiver_arm_start_ns = MonotonicNs();
   {
-    auto addr_it = plan.worker_rpc_addresses.find(plan.dst_unit);
-    if (addr_it == plan.worker_rpc_addresses.end()) {
-      registry_->AbandonClaim(args.req_id, uuid, claim_owner);
-      return absl::InternalError(absl::StrCat(
-          "No control endpoint recorded for ", PythonRepr(plan.dst_unit)));
+    std::vector<absl::Status> arm_status(plan.dst_units.size());
+    std::vector<std::thread> armers;
+    armers.reserve(plan.dst_units.size());
+    for (size_t i = 0; i < plan.dst_units.size(); ++i) {
+      const RaidenId& unit = plan.dst_units[i];
+      armers.emplace_back([this, &plan, &arm_status, i, unit]() {
+        auto addr_it = plan.worker_rpc_addresses.find(unit);
+        if (addr_it == plan.worker_rpc_addresses.end()) {
+          arm_status[i] = absl::InternalError(absl::StrCat(
+              "No control endpoint recorded for ", PythonRepr(unit)));
+          return;
+        }
+        std::fprintf(stderr,
+                     "{\"event\": \"raiden_pool_reshard_arm\", \"dst_unit\": "
+                     "\"%s\", \"pool_dtype_tags\": \"%s\", \"uuid\": %lld}\n",
+                     PythonRepr(unit).c_str(),
+                     absl::StrJoin(plan.pool_dtype_tags, ",").c_str(),
+                     static_cast<long long>(plan.uuid));
+        const std::string arm_payload = EncodeStartTransfer(plan, unit);
+        arm_status[i] = SendWorkerRpc(transport_, addr_it->second, arm_payload);
+      });
     }
-    std::fprintf(stderr,
-                 "{\"event\": \"raiden_pool_reshard_arm\", \"dst_unit\": "
-                 "\"%s\", \"pool_dtype_tags\": \"%s\", \"uuid\": %lld}\n",
-                 PythonRepr(plan.dst_unit).c_str(),
-                 absl::StrJoin(plan.pool_dtype_tags, ",").c_str(),
-                 static_cast<long long>(plan.uuid));
-    const std::string arm_payload = EncodeStartTransfer(plan, plan.dst_unit);
-    absl::Status arm_status =
-        SendWorkerRpc(transport_, addr_it->second, arm_payload);
-    if (!arm_status.ok()) {
-      registry_->AbandonClaim(args.req_id, uuid, claim_owner);
-      return arm_status;
+    for (std::thread& t : armers) t.join();
+    for (const absl::Status& status : arm_status) {
+      if (!status.ok()) {
+        registry_->AbandonClaim(args.req_id, uuid, claim_owner);
+        return status;
+      }
     }
   }
   const int64_t receiver_arm_ack_ns = MonotonicNs();
@@ -517,6 +547,7 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
       ", \"controller_total_ms\": ",
       JsonFloat((sender_dispatch_end_ns - controller_start_ns) / 1e6),
       ", \"destination_pages\": ", plan.expected_block_count,
+      ", \"destination_units\": ", plan.dst_units.size(),
       ", \"event\": \"raiden_pool_reshard_senders_dispatched\"",
       ", \"expected_pushes_per_pool\": ", plan.expected_pushes_per_pool,
       ", \"num_tokens\": ", plan.num_tokens, ", \"plan_build_ms\": ",

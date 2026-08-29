@@ -100,6 +100,7 @@ cc_library(
         "//tpu_sync/kv_cache:pool_layout",
         "//tpu_sync/kv_cache:raiden_id",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",

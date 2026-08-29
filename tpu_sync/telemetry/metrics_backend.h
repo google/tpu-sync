@@ -16,6 +16,7 @@
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TELEMETRY_METRICS_BACKEND_H_
 
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <string>
@@ -26,7 +27,7 @@
 
 namespace tpu_raiden::telemetry {
 
-enum class MetricType {
+enum class MetricType : uint8_t {
   kCounter,
   kGauge,
   kHistogram,
@@ -55,6 +56,22 @@ struct ExporterOptions {
   // unset (std::nullopt) or empty, telemetry initialization falls back to the
   // LOCAL_RANK environment variable.
   std::optional<std::string> local_rank;
+  // Base directory for POSIX shared-memory segments. If empty, falls back to
+  // the SHM_DIR environment variable, or "/dev/shm".
+  std::string base_shm_dir;
+
+  // Returns the resolved shared-memory directory, checking `base_shm_dir`,
+  // the SHM_DIR environment variable, and falling back to "/dev/shm".
+  std::string GetShmDir() const {
+    if (!base_shm_dir.empty()) {
+      return base_shm_dir;
+    }
+    const char* env_shm = std::getenv("SHM_DIR");
+    if (env_shm != nullptr && *env_shm != '\0') {
+      return env_shm;
+    }
+    return "/dev/shm";
+  }
 };
 
 // Structure defining centralized metadata for a Raiden metric.

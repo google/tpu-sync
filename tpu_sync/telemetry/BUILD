@@ -132,3 +132,93 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "base_shm_exporter",
+    srcs = ["base_shm_exporter.cc"],
+    hdrs = ["base_shm_exporter.h"],
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],
+    deps = [
+        ":metrics_backend",
+        "//tpu_sync/telemetry/shm:shm_collector",
+        "//tpu_sync/telemetry/shm:shm_writer",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "base_shm_exporter_test",
+    srcs = ["base_shm_exporter_test.cc"],
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],
+    deps = [
+        ":base_shm_exporter",
+        ":metrics_backend",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "prometheus_shm_exporter",
+    srcs = ["prometheus_shm_exporter.cc"],
+    hdrs = ["prometheus_shm_exporter.h"],
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],
+    deps = [
+        ":base_shm_exporter",
+        ":metrics_backend",
+        "//tpu_sync/telemetry/shm:shm_collector",
+        "//tpu_sync/telemetry/shm:shm_layout",
+        "@com_github_jupp0r_prometheus_cpp//core",
+        "@com_github_jupp0r_prometheus_cpp//pull",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+    ],
+)
+
+cc_test(
+    name = "prometheus_shm_exporter_test",
+    srcs = ["prometheus_shm_exporter_test.cc"],
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],
+    deps = [
+        ":base_shm_exporter",
+        ":metrics_api",
+        ":metrics_backend",
+        ":prometheus_shm_exporter",
+        ":test_util",
+        "@com_github_jupp0r_prometheus_cpp//core",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "prometheus_shm_exporter_challenger_test",
+    srcs = ["prometheus_shm_exporter_challenger_test.cc"],
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],
+    deps = [
+        ":base_shm_exporter",
+        ":metrics_api",
+        ":metrics_backend",
+        ":prometheus_shm_exporter",
+        ":test_util",
+        "//tpu_sync/telemetry/shm:shm_layout",
+        "@com_github_jupp0r_prometheus_cpp//core",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

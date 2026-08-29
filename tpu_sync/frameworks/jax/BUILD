@@ -41,6 +41,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":utils",
+        "//tpu_sync/core:buffer_utils",
         "//tpu_sync/core:host_memory_allocator",
         "//tpu_sync/core:kv_cache_manager_with_transfer",
         "//tpu_sync/core:kv_manager_holder",
@@ -696,6 +697,7 @@ cc_library(
     defines = ["WITHOUT_PYTHON"],
     features = ["-use_header_modules"],
     deps = [
+        "//tpu_sync/core:buffer_utils",
         "//tpu_sync/core:host_memory_allocator",
         "//tpu_sync/core:kv_cache_manager_with_transfer",
         "//tpu_sync/core:kv_manager_holder",
@@ -739,6 +741,8 @@ cc_test(
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@xla//xla/pjrt:pjrt_client",
+        "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
         "@xla//xla/tsl/platform:statusor",
         "@xla//xla/tsl/platform:test",
         "@xla//xla/tsl/platform:test_main",

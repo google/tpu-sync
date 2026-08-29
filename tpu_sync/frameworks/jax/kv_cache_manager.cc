@@ -40,6 +40,7 @@
 #include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/tsl/platform/logging.h"
+#include "tpu_sync/core/buffer_utils.h"
 #include "tpu_sync/core/controller/controller_client.h"
 #include "tpu_sync/core/controller/worker_service_server.h"
 #include "tpu_sync/core/host_memory_allocator.h"
@@ -197,6 +198,17 @@ NumaAwareKVCacheManager::NumaAwareKVCacheManager(
                   local_control_port, max_blocks, num_slots, timeout_s);
 }
 #endif
+
+NumaAwareKVCacheManager::NumaAwareKVCacheManager(
+    const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+    bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id) {
+  auto layer_buffers =
+      ::tpu_raiden::UnpackLayers(device_buffers, unsafe_skip_buffer_lock);
+  InitSubManagers(layer_buffers, local_port, host_blocks_to_allocate,
+                  unsafe_skip_buffer_lock, parallelism, node_id, -1, 0, 0,
+                  120.0);
+}
 
 NumaAwareKVCacheManager::NumaAwareKVCacheManager(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,
@@ -948,6 +960,18 @@ KVCacheManager::KVCacheManager(
   StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
 }
 #endif
+
+KVCacheManager::KVCacheManager(
+    const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+    bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port,
+    std::optional<std::string> raiden_controller_address,
+    std::optional<std::string> worker_id, int64_t node_id)
+    : numa_manager_(std::make_unique<NumaAwareKVCacheManager>(
+          device_buffers, local_port, host_blocks_to_allocate,
+          unsafe_skip_buffer_lock, parallelism, node_id)) {
+  StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
+}
 
 KVCacheManager::KVCacheManager(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,

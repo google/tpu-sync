@@ -78,6 +78,14 @@ class NumaAwareKVCacheManager {
                           bool unsafe_skip_buffer_lock, int parallelism);
 #endif
 
+  // Raw PjRtBuffer constructor
+  NumaAwareKVCacheManager(
+      const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+      std::optional<int> local_port = std::nullopt,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      bool unsafe_skip_buffer_lock = false, int parallelism = 1,
+      int64_t node_id = 0);
+
   // FFI metadata constructor (cache-only by default)
   NumaAwareKVCacheManager(size_t num_layers, size_t num_shards,
                           size_t slice_byte_size, std::optional<int> local_port,
@@ -266,6 +274,16 @@ class KVCacheManager {
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt);
 #endif
+
+  // Raw PjRtBuffer constructor
+  KVCacheManager(
+      const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+      std::optional<int> local_port = std::nullopt,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      bool unsafe_skip_buffer_lock = false, int parallelism = 1,
+      int raiden_worker_port = 0,
+      std::optional<std::string> raiden_controller_address = std::nullopt,
+      std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0);
 
   // FFI metadata constructor (cache-only by default)
   KVCacheManager(

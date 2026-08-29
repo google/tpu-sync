@@ -176,6 +176,7 @@ cc_library(
     deps = [
         ":torch_tpu_tensor_to_buffer_headers",
         ":torch_utils",
+        "//tpu_sync/core:buffer_utils",
         "//tpu_sync/core:kv_cache_manager_with_transfer",
         "//tpu_sync/core:kv_manager_holder",
         "//tpu_sync/core:tpu_utils",
@@ -397,6 +398,7 @@ cc_library(
     deps = [
         ":torch_tpu_tensor_to_buffer_headers",
         ":torch_utils_mock",
+        "//tpu_sync/core:buffer_utils",
         "//tpu_sync/core:kv_cache_manager_with_transfer",
         "//tpu_sync/core:kv_manager_holder",
         "//tpu_sync/core:tpu_utils",

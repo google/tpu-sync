@@ -75,6 +75,36 @@ TEST_F(KVCacheManagerTorchTest, ConstructorSucceedsWithMocks) {
   EXPECT_EQ(manager.bytes_per_block(), 1024 * sizeof(float));
 }
 
+TEST_F(KVCacheManagerTorchTest, ConstructorWithRawPjRtBuffersSucceeds) {
+  // Create a real CPU PJRT buffer
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client_->addressable_devices()[0]->default_memory_space());
+  std::vector<float> data(8 * 1024, 1.0f);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pjrt_buffer, client_->BufferFromHostBuffer(
+                            data.data(), xla::F32, {8, 1024},
+                            /*byte_strides=*/std::nullopt,
+                            xla::PjRtClient::HostBufferSemantics::
+                                kImmutableUntilTransferCompletes,
+                            /*on_done_with_host_buffer=*/nullptr, memory_space,
+                            /*device_layout=*/nullptr));
+
+  // Prepare 2D vector of raw PjRtBuffer pointers
+  std::vector<std::vector<xla::PjRtBuffer*>> device_buffers = {
+      {pjrt_buffer.get()}};
+
+  // Construct KVCacheManager directly from raw PjRtBuffers
+  KVCacheManager manager(device_buffers,
+                         /*local_port=*/std::nullopt,
+                         /*host_blocks_to_allocate=*/8,
+                         /*unsafe_skip_buffer_lock=*/true);
+
+  EXPECT_EQ(manager.num_layers(), 1);
+  EXPECT_EQ(manager.num_shards(), 1);
+  EXPECT_EQ(manager.bytes_per_block(), 1024 * sizeof(float));
+}
+
 TEST_F(KVCacheManagerTorchTest, GrpcServerOptionalAndOffByDefault) {
   KVCacheManager mgr_default(/*num_layers=*/1, /*num_shards=*/1,
                              /*slice_byte_size=*/1024, /*node_id=*/0,

@@ -25,6 +25,8 @@
 
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "xla/pjrt/pjrt_client.h"
+#include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
 #include "tpu_sync/core/buffer.h"
@@ -600,6 +602,37 @@ TEST(KVCacheManagerWrapperTest, WorkerSelfRegistrationWithControllerSuccess) {
   EXPECT_NE(workers[0].raiden_worker_endpoint.find(
                 std::to_string(mgr.GetRaidenWorkerPort())),
             std::string::npos);
+}
+
+TEST(KVCacheManagerWrapperTest, ConstructorWithRawPjRtBuffersSucceeds) {
+  TF_ASSERT_OK_AND_ASSIGN(auto client,
+                          xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client->addressable_devices()[0]->default_memory_space());
+  std::vector<float> data(8 * 1024, 1.0f);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pjrt_buffer, client->BufferFromHostBuffer(
+                            data.data(), xla::F32, {8, 1024},
+                            /*byte_strides=*/std::nullopt,
+                            xla::PjRtClient::HostBufferSemantics::
+                                kImmutableUntilTransferCompletes,
+                            /*on_done_with_host_buffer=*/nullptr, memory_space,
+                            /*device_layout=*/nullptr));
+
+  // Prepare 2D vector of raw PjRtBuffer pointers
+  std::vector<std::vector<xla::PjRtBuffer*>> device_buffers = {
+      {pjrt_buffer.get()}};
+
+  // Construct KVCacheManager directly from raw PjRtBuffers
+  KVCacheManager manager(device_buffers,
+                         /*local_port=*/std::nullopt,
+                         /*host_blocks_to_allocate=*/8,
+                         /*unsafe_skip_buffer_lock=*/true);
+
+  EXPECT_EQ(manager.num_layers(), 1);
+  EXPECT_EQ(manager.num_shards(), 1);
+  EXPECT_EQ(manager.slice_byte_size(), 1024 * sizeof(float));
 }
 
 }  // namespace

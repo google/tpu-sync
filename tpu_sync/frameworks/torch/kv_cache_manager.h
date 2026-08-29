@@ -52,6 +52,14 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
       int64_t node_id = 0);
 
+  // Raw PjRtBuffer sharded constructor
+  TorchKVCacheManager(
+      const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+      std::optional<int> local_port = std::nullopt,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      bool unsafe_skip_buffer_lock = false, int parallelism = 1,
+      int64_t node_id = 0);
+
   // New transfer-enabled constructor (flat list of tensors, single shard per
   // layer)
   TorchKVCacheManager(const std::vector<at::Tensor>& kv_caches, int64_t node_id,
@@ -109,6 +117,9 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
   static UnpackedLayers UnpackLayers(
       const std::vector<std::vector<at::Tensor>>& device_tensors,
       bool unsafe_skip_buffer_lock = false);
+  static UnpackedLayers UnpackLayers(
+      const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+      bool unsafe_skip_buffer_lock = false);
 
   // Delegated-to constructor for BOTH public ctors. Moves the keep-alive refs
   // into buffer_refs_ so the materialized device buffers survive for this
@@ -131,6 +142,15 @@ class KVCacheManager {
  public:
   KVCacheManager(
       const std::vector<std::vector<at::Tensor>>& device_tensors,
+      std::optional<int> local_port = std::nullopt,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      bool unsafe_skip_buffer_lock = false, int parallelism = 1,
+      int raiden_worker_port = 0,
+      std::optional<std::string> raiden_controller_address = std::nullopt,
+      std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0);
+
+  KVCacheManager(
+      const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,

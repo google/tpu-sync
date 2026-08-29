@@ -32,6 +32,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "xla/pjrt/pjrt_client.h"
+#include "tpu_sync/core/buffer_utils.h"
 #include "tpu_sync/core/controller/controller_client.h"
 #include "tpu_sync/core/controller/worker_service_server.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
@@ -82,7 +83,21 @@ TorchKVCacheManager::UnpackedLayers TorchKVCacheManager::UnpackLayers(
   unpacked.logical_slice_byte_size = u.logical_slice_byte_size;
   unpacked.logical_physical_size = u.logical_physical_size;
   unpacked.has_logical_metadata = u.has_logical_metadata;
-  if (!unpacked.buffers.empty() && !unpacked.buffers[0].empty()) {
+  if (!unpacked.buffers.empty() && !unpacked.buffers[0].empty() &&
+      unpacked.buffers[0][0].device) {
+    unpacked.client = unpacked.buffers[0][0].device->client();
+  }
+  return unpacked;
+}
+
+TorchKVCacheManager::UnpackedLayers TorchKVCacheManager::UnpackLayers(
+    const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+    bool unsafe_skip_buffer_lock) {
+  UnpackedLayers unpacked;
+  unpacked.buffers =
+      ::tpu_raiden::UnpackLayers(device_buffers, unsafe_skip_buffer_lock);
+  if (!unpacked.buffers.empty() && !unpacked.buffers[0].empty() &&
+      unpacked.buffers[0][0].device) {
     unpacked.client = unpacked.buffers[0][0].device->client();
   }
   return unpacked;
@@ -93,6 +108,18 @@ TorchKVCacheManager::TorchKVCacheManager(
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id)
     : TorchKVCacheManager(UnpackLayers(device_tensors, unsafe_skip_buffer_lock),
+                          local_port, host_blocks_to_allocate,
+                          unsafe_skip_buffer_lock, parallelism, node_id,
+                          /*local_control_port=*/-1,
+                          /*max_blocks=*/0, /*num_slots=*/0,
+                          /*timeout_s=*/120.0,
+                          /*kv_caches=*/{}) {}
+
+TorchKVCacheManager::TorchKVCacheManager(
+    const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+    bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id)
+    : TorchKVCacheManager(UnpackLayers(device_buffers, unsafe_skip_buffer_lock),
                           local_port, host_blocks_to_allocate,
                           unsafe_skip_buffer_lock, parallelism, node_id,
                           /*local_control_port=*/-1,
@@ -276,6 +303,18 @@ KVCacheManager::KVCacheManager(
     std::optional<std::string> worker_id, int64_t node_id)
     : torch_manager_(std::make_unique<TorchKVCacheManager>(
           device_tensors, local_port, host_blocks_to_allocate,
+          unsafe_skip_buffer_lock, parallelism, node_id)) {
+  StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
+}
+
+KVCacheManager::KVCacheManager(
+    const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
+    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+    bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port,
+    std::optional<std::string> raiden_controller_address,
+    std::optional<std::string> worker_id, int64_t node_id)
+    : torch_manager_(std::make_unique<TorchKVCacheManager>(
+          device_buffers, local_port, host_blocks_to_allocate,
           unsafe_skip_buffer_lock, parallelism, node_id)) {
   StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
 }

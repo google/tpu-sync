@@ -78,6 +78,40 @@ cc_library(
 )
 
 cc_library(
+    name = "buffer_utils",
+    srcs = ["buffer_utils.cc"],
+    hdrs = ["buffer_utils.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":raw_transfer_core",
+        "@com_google_absl//absl/strings",
+        "@xla//xla/pjrt:pjrt_client",
+    ],
+)
+
+cc_test(
+    name = "buffer_utils_test",
+    srcs = ["buffer_utils_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":buffer_utils",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla/pjrt:pjrt_client",
+        "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
+        "@xla//xla/tsl/platform:statusor",
+    ],
+)
+
+cc_library(
     name = "raiden_manager_base",
     srcs = [
         "raiden_manager_base.cc",

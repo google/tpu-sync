@@ -19,7 +19,7 @@ import enum
 
 
 @dataclasses.dataclass(unsafe_hash=True)
-class _PurePythonRaidenId:
+class RaidenId:
   """Identifier for the work unit in Raiden owning a sharded set of data."""
 
   job_name: str = ""
@@ -36,12 +36,7 @@ class _PurePythonRaidenId:
     )
 
 
-try:
-  from tpu_sync.common import _raiden_id  # pylint: disable=g-import-not-at-top
-
-  RaidenId = _raiden_id.RaidenId
-except (ImportError, ModuleNotFoundError, AttributeError):
-  RaidenId = _PurePythonRaidenId
+_PurePythonRaidenId = RaidenId
 
 
 class BlockStatus(enum.Enum):

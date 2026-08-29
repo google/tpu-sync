@@ -20,9 +20,6 @@ py_library(
     name = "common",
     srcs = ["common.py"],
     visibility = ["//visibility:public"],
-    deps = [
-        "//tpu_sync/common:_raiden_id",
-    ],
 )
 
 py_test(

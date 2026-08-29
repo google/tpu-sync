@@ -23,6 +23,8 @@
 namespace nb = nanobind;
 
 NB_MODULE(_raiden_id, m) {
+  nb::set_leak_warnings(false);
+
   nb::class_<tpu_raiden::RaidenId>(m, "RaidenId")
       .def(nb::init<std::string, std::string, std::string, int>(),
            nb::arg("job_name") = "", nb::arg("job_replica_id") = "",

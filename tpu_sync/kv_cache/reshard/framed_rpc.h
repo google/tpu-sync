@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
 #include <vector>
@@ -79,6 +80,14 @@ class FramedServer final {
   int port() const { return port_; }
 
  private:
+  // One handler thread per accepted connection; `done` lets the accept loop
+  // reap finished threads so a long-lived server does not accumulate one
+  // un-joined thread (and its stack) per request.
+  struct Connection {
+    std::thread thread;
+    std::atomic<bool> done{false};
+  };
+
   void AcceptLoop();
   void ServeConnection(int client_fd);
 
@@ -88,7 +97,7 @@ class FramedServer final {
   Handler handler_;
   std::atomic<bool> stopping_{false};
   std::thread accept_thread_;
-  std::vector<std::thread> connection_threads_;
+  std::vector<std::unique_ptr<Connection>> connections_;
 };
 
 }  // namespace reshard

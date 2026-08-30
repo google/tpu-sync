@@ -14,8 +14,16 @@
 
 """High-performance JAX KV Cache Manager (repurposed as TransferEngine)."""
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+# pool_layout is framework-neutral (pure dataclasses, no torch import, and
+# tpu_raiden ships as a namespace package so importing it pulls nothing else
+# from the torch API). It is shared rather than duplicated so the JAX and
+# torch pool descriptors cannot drift.
+from tpu_sync.api.torch import pool_layout
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _impl
+
+PoolSpec = pool_layout.PoolSpec
+RegionSpec = pool_layout.RegionSpec
 
 
 class KVCacheManager:
@@ -39,6 +47,7 @@ class KVCacheManager:
       raiden_worker_port: int = 0,
       raiden_controller_address: Optional[str] = None,
       worker_id: Optional[str] = None,
+      listener_port: Optional[int] = None,
   ):
     """Instantiates the TransferEngine-based KVCacheManager.
 
@@ -58,7 +67,14 @@ class KVCacheManager:
       raiden_controller_address: Optional address of central RaidenController.
         If provided, the WorkerService gRPC server is enabled.
       worker_id: Optional identifier for this worker.
+      listener_port: Optional port for the control-plane KVCacheListener. A
+        RaidenController talks to this socket to arm a receiver
+        (PoolReshardRegisterRecv) and to fire a sender (PoolReshardPush) for a
+        pool-addressed reshard plan. Distinct from raiden_worker_port, which
+        is the buffer-oriented WorkerService gRPC server. Requires a manager
+        with exactly one NUMA sub-manager.
     """
+    self._admission_summary: Optional[Dict[str, Any]] = None
     if host_blocks_to_allocate is not None:
       self._impl = _impl.KVCacheManager(
           kv_caches,
@@ -72,6 +88,7 @@ class KVCacheManager:
           # Pass node_id so ReadRemote can always match src<->dst workers by
           # node_id (see the non-host_blocks branch, which already forwards it).
           node_id=node_id,
+          listener_port=listener_port,
       )
     else:
       if max_blocks is None or num_slots is None:
@@ -91,6 +108,7 @@ class KVCacheManager:
           raiden_worker_port=raiden_worker_port,
           raiden_controller_address=raiden_controller_address,
           worker_id=worker_id,
+          listener_port=listener_port,
       )
 
   def get_raiden_worker_port(self) -> int:
@@ -235,3 +253,160 @@ class KVCacheManager:
       A JSON string representing the collected telemetry metrics.
     """
     return self._impl.dump_metrics_to_string()
+
+  # =========================================================================
+  # POOL-ADDRESSED RESHARD APIs
+  # Mirrors api/torch/kv_cache_manager.py so a caller (e.g. the TPU vLLM
+  # connector) can drive either framework through the same names and shapes.
+  # =========================================================================
+
+  @property
+  def listener_port(self) -> Optional[int]:
+    """Returns the control-plane KVCacheListener port, or None if disabled."""
+    return self._impl.listener_port
+
+  @property
+  def is_control_listener_active(self) -> bool:
+    """Returns True if the control-plane KVCacheListener is running.
+
+    Distinct from ``is_listener_active``, which reports on the buffer-oriented
+    WorkerService gRPC server. The two are separate sockets and either can be
+    up without the other.
+    """
+    return self._impl.is_listener_active
+
+  @property
+  def listener_address(self) -> str:
+    """Returns the formatted control listener endpoint string (host:port)."""
+    return self._impl.listener_address
+
+  @property
+  def transfer_address(self) -> str:
+    """Returns the formatted data transfer endpoint string (host:port)."""
+    return self._impl.transfer_address
+
+  def register_pools(self, pools: Sequence[Any]) -> Dict[str, Any]:
+    """Registers explicit block pools over the wrapped storages.
+
+    Args:
+      pools: Sequence of ``pool_layout.PoolSpec`` (or equivalent mappings) in
+        the caller's canonical order. Pool indices travel on the wire, so both
+        transfer peers must agree on this order.
+
+    Returns:
+      A generic admission summary (also served by ``admission_summary``).
+    """
+    coerced = tuple(pool_layout.coerce_pool_spec(pool) for pool in pools)
+    if not coerced:
+      raise ValueError("pool table must be non-empty")
+    num_storages = int(self._impl.num_layers)
+    for pool_idx, pool in enumerate(coerced):
+      try:
+        pool.validate()
+      except Exception as exc:
+        raise ValueError(f"invalid pool {pool_idx}: {exc}") from exc
+      if pool.storage_index >= num_storages:
+        raise ValueError(
+            f"pool {pool_idx} ({pool.tag}) storage_index "
+            f"{pool.storage_index} out of range: manager wraps "
+            f"{num_storages} storages"
+        )
+    self._impl.register_pools_native(
+        [pool.to_native_tuple() for pool in coerced]
+    )
+    tags: Dict[str, int] = {}
+    for pool in coerced:
+      tags[pool.tag] = tags.get(pool.tag, 0) + 1
+    storages = len({pool.storage_index for pool in coerced})
+    summary = {
+        "admitted": True,
+        "pools": len(coerced),
+        "storages": storages,
+        "tags": tags,
+    }
+    self._admission_summary = dict(summary)
+    return dict(summary)
+
+  def get_block_ref(
+      self, pool_idx: int, block_id: int, shard_idx: int = 0
+  ) -> Dict[str, Any]:
+    """Returns a reference descriptor for one host-side pool block."""
+    return dict(
+        self._impl.get_pool_block_ref_native(
+            pool_idx=pool_idx, shard_idx=shard_idx, block_id=block_id
+        )
+    )
+
+  def pool_ids_with_tag(self, tag: str) -> List[int]:
+    """Returns the pool indices registered with the given opaque tag."""
+    return [
+        int(pool_idx)
+        for pool_idx in self._impl.pool_indices_with_tag_native(tag)
+    ]
+
+  def num_pools(self) -> int:
+    """Returns the number of pools (implicit or explicit)."""
+    return int(self._impl.num_pools())
+
+  def has_explicit_pools(self) -> bool:
+    """Returns True if an explicit pool table was admitted."""
+    return bool(self._impl.has_explicit_pools())
+
+  def pool_spec(self, pool_idx: int) -> Dict[str, Any]:
+    """Returns one pool's descriptor as a dict."""
+    return dict(self._impl.pool_spec_native(pool_idx))
+
+  def d2h_pool_blocks(
+      self,
+      pool_idx: int,
+      block_ids: Sequence[int],
+      shard_idx: Optional[int] = None,
+  ) -> Any:
+    """Partial D2H of whole pool blocks into the host mirror."""
+    return self._impl.d2h_pool_blocks(pool_idx, list(block_ids), shard_idx)
+
+  def h2d_pool_blocks(
+      self,
+      pool_idx: int,
+      block_ids: Sequence[int],
+      shard_idx: Optional[int] = None,
+  ) -> Any:
+    """Partial H2D of whole pool blocks from the host mirror."""
+    return self._impl.h2d_pool_blocks(pool_idx, list(block_ids), shard_idx)
+
+  def admission_summary(self) -> Dict[str, Any]:
+    """Returns the last successful pool admission summary."""
+    if self._admission_summary is None:
+      return {"admitted": False}
+    return dict(self._admission_summary)
+
+  def register_active_plan(
+      self, uuid: int, request: Union[bytes, Any], is_sender: bool
+  ) -> None:
+    """Registers a serialized StartTransferRequest for strided push."""
+    if hasattr(request, "SerializeToString"):
+      request = request.SerializeToString()
+    if not isinstance(request, (bytes, bytearray)):
+      raise TypeError("request must be bytes or a protobuf message")
+    self._impl.register_active_plan(uuid, bytes(request), is_sender)
+
+  def unregister_active_plan(self, uuid: int) -> None:
+    """Removes a previously registered strided push plan."""
+    self._impl.unregister_active_plan(uuid)
+
+  def register_recv(
+      self, uuid: int, req_id: str, expected_block_count: int
+  ) -> None:
+    """[EXPERIMENTAL] Registers expected incoming blocks for push resharding.
+
+    Allocates staging slots in the C++ receiver engine and sets the barrier for
+    the expected physical block-pushes; the engine triggers H2D into TPU HBM
+    once the count is reached.
+
+    Args:
+      uuid: Unique identifier for the transfer transaction.
+      req_id: Request ID associated with the transfer.
+      expected_block_count: Total number of physical block-pushes expected from
+        all contributing source ranks.
+    """
+    self._impl.register_recv(uuid, req_id, expected_block_count)

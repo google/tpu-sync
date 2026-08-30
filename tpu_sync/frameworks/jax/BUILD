@@ -53,6 +53,9 @@ cc_library(
         "//tpu_sync/core:utils",
         "//tpu_sync/core/controller:controller_client",
         "//tpu_sync/core/controller:worker_service_server",
+        "//tpu_sync/kv_cache:kv_cache_listener",
+        "//tpu_sync/kv_cache:pool_layout",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -145,11 +148,6 @@ nanobind_extension(
         ":nb_statusor",
         ":raw_transfer_jax",
         ":weight_synchronizer_jax",
-        "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/kv_cache:kv_cache_store",
-        "//tpu_sync/kv_cache:kv_cache_store_wrapper",
-        "//tpu_sync/telemetry/python:telemetry_binding",
-        "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
@@ -157,6 +155,16 @@ nanobind_extension(
         "@nanobind",
         "@rules_python//python/cc:current_py_cc_headers",
         "@xla//xla/pjrt:status_casters",
+        "//tpu_sync/core:raw_transfer_core",
+        # Framework-neutral despite living under frameworks/torch: the header
+        # includes no torch and its cc_library has no torch dep, so binding
+        # the same pool surface here keeps JAX and torch from diverging.
+        "//tpu_sync/frameworks/torch:pool_layout_nanobind",
+        "//tpu_sync/kv_cache:kv_cache_store",
+        "//tpu_sync/kv_cache:kv_cache_store_wrapper",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/telemetry/python:telemetry_binding",
+        "//tpu_sync/weight_sync:weight_synchronizer_base",
     ],
 )
 
@@ -709,6 +717,9 @@ cc_library(
         "//tpu_sync/core:utils",
         "//tpu_sync/core/controller:controller_client",
         "//tpu_sync/core/controller:worker_service_server",
+        "//tpu_sync/kv_cache:kv_cache_listener",
+        "//tpu_sync/kv_cache:pool_layout",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

@@ -36,6 +36,13 @@
 #include "tpu_sync/core/controller/worker_service_server.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/tpu_utils.h"
+// Included rather than forward declared: KVCacheManager owns the listener by
+// unique_ptr and keeps an inline defaulted move constructor, which nanobind
+// instantiates (detail::wrap_move) when it wraps the class. That instantiation
+// needs unique_ptr's deleter, hence the complete type. Torch gets away with a
+// forward declaration because its bound manager is not move-wrapped.
+#include "tpu_sync/kv_cache/kv_cache_listener.h"
+#include "tpu_sync/kv_cache/pool_layout.h"
 
 namespace xla {
 class PjRtBuffer;
@@ -45,6 +52,7 @@ namespace tpu_raiden {
 class MetricsCollector;
 
 namespace kv_cache {
+
 namespace jax {
 
 struct UnpackedCache {
@@ -131,6 +139,18 @@ class NumaAwareKVCacheManager {
 
   std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
   std::vector<RaidenTransferEndpoint> get_local_data_endpoints() const;
+
+  size_t num_sub_managers() const { return sub_managers_.size(); }
+
+  // The sole sub-manager. Pool admission and the pool-addressed reshard path
+  // are byte-space operations over one manager's storages; under
+  // ENABLE_MULTI_NUMA they would have to fan out across sub-managers with
+  // global_shard_to_submanager_ remapping, which is deliberately not
+  // implemented yet. Returns nullptr in that case so callers fail loudly
+  // rather than silently addressing only sub-manager 0.
+  KVCacheManagerWithTransfer* sole_sub_manager() const {
+    return sub_managers_.size() == 1 ? sub_managers_[0].get() : nullptr;
+  }
 
   void SetSubmanagerShardsForTesting(
       const std::vector<std::vector<int64_t>>& assignment) {
@@ -263,7 +283,8 @@ class KVCacheManager {
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
       int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0);
+      std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0,
+      std::optional<int> listener_port = std::nullopt);
 
   // New transfer-enabled constructor (flat list of arrays, single shard per
   // layer)
@@ -272,7 +293,8 @@ class KVCacheManager {
       int64_t max_blocks, int64_t num_slots, double timeout_s,
       bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt);
+      std::optional<std::string> worker_id = std::nullopt,
+      std::optional<int> listener_port = std::nullopt);
 #endif
 
   // Raw PjRtBuffer constructor
@@ -291,16 +313,31 @@ class KVCacheManager {
       std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
       int parallelism = 1, int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt);
+      std::optional<std::string> worker_id = std::nullopt,
+      std::optional<int> listener_port = std::nullopt);
 
   // Test-only constructor for sub-manager mock injection
   explicit KVCacheManager(
       std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> sub_managers,
       int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt);
+      std::optional<std::string> worker_id = std::nullopt,
+      std::optional<int> listener_port = std::nullopt);
 
   ~KVCacheManager();
+
+  // --- Control-plane listener -------------------------------------------
+  // The KVCacheListener decodes START_TRANSFER off a raw socket and drives
+  // PoolReshardRegisterRecv / PoolReshardPush. It is how a RaidenController
+  // arms a receiver and fires a sender. Torch has had this since
+  // frameworks/torch/kv_cache_manager.cc; these mirror that surface exactly.
+  //
+  // Note this is NOT the WorkerService gRPC port (get_raiden_worker_port()):
+  // that is the buffer-oriented worker service, a separate server.
+  std::optional<int> listener_port() const;
+  bool is_listener_active() const;
+  std::string listener_address() const;
+  std::string transfer_address() const;
 
   NumaAwareKVCacheManager* numa_manager() const { return numa_manager_.get(); }
   int GetRaidenWorkerPort() const;
@@ -468,13 +505,92 @@ class KVCacheManager {
                                           dst_block_ids);
   }
 
+  // --- Pool admission + pool-addressed reshard --------------------------
+  // Thin forwarders onto the sole sub-manager, in the same spirit as the
+  // NotifyForRead / StartRead forwarders above. They exist because
+  // BindPoolApi<> (frameworks/torch/pool_layout_nanobind.h) resolves these
+  // names on the bound class, and the JAX facade is a NumaAware* wrapper
+  // rather than a KVCacheManagerBase subclass -- so it cannot inherit them.
+  // Signatures are copied verbatim from KVCacheManagerBase so the template
+  // instantiates identically for JAX and for torch.
+  absl::Status RegisterPools(std::vector<PoolSpec> pools) {
+    return PoolTarget().RegisterPools(std::move(pools));
+  }
+
+  absl::StatusOr<PoolBlockRef> GetPoolBlockRef(size_t pool_idx,
+                                               size_t shard_idx,
+                                               int64_t block_id) const {
+    return PoolTarget().GetPoolBlockRef(pool_idx, shard_idx, block_id);
+  }
+
+  const PoolSpec* pool(size_t pool_idx) const {
+    return PoolTarget().pool(pool_idx);
+  }
+
+  size_t num_pools() const { return PoolTarget().num_pools(); }
+
+  bool has_explicit_pools() const {
+    return PoolTarget().has_explicit_pools();
+  }
+
+  std::vector<size_t> PoolIndicesWithTag(absl::string_view tag) const {
+    return PoolTarget().PoolIndicesWithTag(tag);
+  }
+
+  int64_t LayerBlockByteSize(size_t layer_idx) const {
+    return PoolTarget().LayerBlockByteSize(layer_idx);
+  }
+
+  absl::StatusOr<uintptr_t> GetBlockHostPointerValue(size_t layer_idx,
+                                                     size_t shard_idx,
+                                                     int block_id) {
+    return PoolTarget().GetBlockHostPointerValue(layer_idx, shard_idx,
+                                                 block_id);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks(
+      size_t pool_idx, absl::Span<const int64_t> block_ids,
+      std::optional<size_t> shard_idx = std::nullopt) {
+    return PoolTarget().D2hPoolBlocks(pool_idx, block_ids, shard_idx);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
+      size_t pool_idx, absl::Span<const int64_t> block_ids,
+      std::optional<size_t> shard_idx = std::nullopt) {
+    return PoolTarget().H2dPoolBlocks(pool_idx, block_ids, shard_idx);
+  }
+
+  absl::Status RegisterActivePlan(
+      uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
+      bool is_sender) {
+    return PoolTarget().RegisterActivePlan(uuid, request, is_sender);
+  }
+
+  absl::Status UnregisterActivePlan(uint64_t uuid) {
+    return PoolTarget().UnregisterActivePlan(uuid);
+  }
+
+  absl::Status RegisterRecv(uint64_t uuid, const std::string& req_id,
+                            int64_t expected_block_count) {
+    return PoolTarget().RegisterRecv(uuid, req_id, expected_block_count);
+  }
+
  private:
+  // Resolves the sub-manager every pool op addresses, or throws. Throwing
+  // (rather than returning a Status) keeps the forwarders signature-identical
+  // to KVCacheManagerBase's, which is what lets BindPoolApi<> instantiate
+  // unchanged; nanobind turns it into a Python exception at the boundary.
+  KVCacheManagerWithTransfer& PoolTarget() const;
+
+  void StartListener(std::optional<int> listener_port);
+
   void StartGrpcServer(
       int raiden_worker_port,
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt);
 
   std::unique_ptr<NumaAwareKVCacheManager> numa_manager_;
+  std::unique_ptr<tpu_raiden::kv_cache::KVCacheListener> listener_;
   std::unique_ptr<tpu_raiden::controller::WorkerServiceServer>
       private_grpc_server_;
 };

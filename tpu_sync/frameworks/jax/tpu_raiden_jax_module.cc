@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -41,8 +42,10 @@
 #include "tpu_sync/frameworks/jax/nb_statusor.h"  // IWYU pragma: keep
 #include "tpu_sync/frameworks/jax/raw_transfer_internal.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer.h"
+#include "tpu_sync/frameworks/torch/pool_layout_nanobind.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_wrapper.h"
+#include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/python/telemetry_binding.h"
 
 namespace nb = nanobind;
@@ -98,26 +101,31 @@ NB_MODULE(_tpu_raiden_jax, m) {
       .def("IsReady", &tpu_raiden::RaidenFuture::IsReady)
       .def("is_ready", &tpu_raiden::RaidenFuture::IsReady);
 
-  nb::class_<tpu_raiden::kv_cache::jax::KVCacheManager>(m, "KVCacheManager")
+  auto manager_cls =
+      nb::class_<tpu_raiden::kv_cache::jax::KVCacheManager>(m,
+                                                            "KVCacheManager");
+  manager_cls
       .def(nb::init<nb::list, std::optional<int>, std::optional<int>, bool, int,
                     int, std::optional<std::string>, std::optional<std::string>,
-                    int64_t>(),
+                    int64_t, std::optional<int>>(),
            nb::arg("device_arrays"), nb::arg("local_port") = nb::none(),
            nb::arg("host_blocks_to_allocate") = nb::none(),
            nb::arg("unsafe_skip_buffer_lock") = false,
            nb::arg("parallelism") = 1, nb::arg("raiden_worker_port") = 0,
            nb::arg("raiden_controller_address") = nb::none(),
-           nb::arg("worker_id") = nb::none(), nb::arg("node_id") = 0)
+           nb::arg("worker_id") = nb::none(), nb::arg("node_id") = 0,
+           nb::arg("listener_port") = nb::none())
       .def(nb::init<nanobind::list, int64_t, int64_t, int64_t, int64_t, double,
                     bool, int, int, std::optional<std::string>,
-                    std::optional<std::string>>(),
+                    std::optional<std::string>, std::optional<int>>(),
            nb::arg("kv_caches"), nb::arg("node_id") = 0,
            nb::arg("local_control_port"), nb::arg("max_blocks"),
            nb::arg("num_slots"), nb::arg("timeout_s") = 120.0,
            nb::arg("unsafe_skip_buffer_lock") = true,
            nb::arg("parallelism") = 4, nb::arg("raiden_worker_port") = 0,
            nb::arg("raiden_controller_address") = nb::none(),
-           nb::arg("worker_id") = nb::none())
+           nb::arg("worker_id") = nb::none(),
+           nb::arg("listener_port") = nb::none())
 
       // Use lambdas to wrap the returned raiden::PjRtCopyFuture into
       // KVCacheManagerFuture
@@ -295,7 +303,59 @@ NB_MODULE(_tpu_raiden_jax, m) {
            &tpu_raiden::kv_cache::jax::KVCacheManager::UnlockBlocks,
            nb::arg("block_ids"))
       .def("dump_metrics_to_string",
-           &tpu_raiden::kv_cache::jax::KVCacheManager::DumpMetricsToString);
+           &tpu_raiden::kv_cache::jax::KVCacheManager::DumpMetricsToString)
+
+      // Control-plane listener, mirroring the torch module's surface. This is
+      // the socket a RaidenController talks to when it arms a receiver or
+      // fires a sender for a pool-addressed reshard plan; distinct from
+      // get_raiden_worker_port(), which is the WorkerService gRPC port.
+      .def_prop_ro(
+          "listener_port",
+          &tpu_raiden::kv_cache::jax::KVCacheManager::listener_port)
+      .def_prop_ro(
+          "is_listener_active",
+          &tpu_raiden::kv_cache::jax::KVCacheManager::is_listener_active)
+      .def_prop_ro(
+          "listener_address",
+          &tpu_raiden::kv_cache::jax::KVCacheManager::listener_address)
+      .def_prop_ro(
+          "transfer_address",
+          &tpu_raiden::kv_cache::jax::KVCacheManager::transfer_address)
+
+      .def(
+          "register_active_plan",
+          [](tpu_raiden::kv_cache::jax::KVCacheManager& self, uint64_t uuid,
+             nb::bytes serialized, bool is_sender) {
+            ::tpu_sync::rpc::StartTransferRequest request;
+            if (!request.ParseFromArray(serialized.c_str(),
+                                        static_cast<int>(serialized.size()))) {
+              throw std::runtime_error(
+                  "register_active_plan: could not parse StartTransferRequest");
+            }
+            tpu_raiden::torch_bindings::ThrowIfNotOk(self.RegisterActivePlan(uuid, request, is_sender),
+                         "KVCacheManager register_active_plan failed");
+          },
+          nb::arg("uuid"), nb::arg("request"), nb::arg("is_sender"))
+      .def(
+          "unregister_active_plan",
+          [](tpu_raiden::kv_cache::jax::KVCacheManager& self, uint64_t uuid) {
+            tpu_raiden::torch_bindings::ThrowIfNotOk(self.UnregisterActivePlan(uuid),
+                         "KVCacheManager unregister_active_plan failed");
+          },
+          nb::arg("uuid"))
+      .def(
+          "register_recv",
+          [](tpu_raiden::kv_cache::jax::KVCacheManager& self, uint64_t uuid,
+             const std::string& req_id, int64_t expected_block_count) {
+            tpu_raiden::torch_bindings::ThrowIfNotOk(self.RegisterRecv(uuid, req_id, expected_block_count),
+                         "KVCacheManager register_recv failed");
+          },
+          nb::arg("uuid"), nb::arg("req_id"), nb::arg("expected_block_count"));
+
+  // Pool admission + partial D2H/H2D, shared verbatim with the torch and host
+  // modules so the three surfaces cannot drift.
+  tpu_raiden::torch_bindings::BindPoolApi<tpu_raiden::RaidenFuture>(
+      manager_cls);
 
   // =========================================================================
   // 2. Bind WeightSynchronizer

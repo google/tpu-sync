@@ -54,6 +54,7 @@
 #include "tpu_sync/core/utils.h"  // IWYU pragma: keep
 #ifndef WITHOUT_PYTHON
 #include "tpu_sync/frameworks/jax/utils.h"
+#include "tpu_sync/kv_cache/kv_cache_listener.h"
 
 namespace nb = nanobind;
 #endif
@@ -142,6 +143,17 @@ namespace {
 
     return alloc;
   };
+}
+
+// Same bracketing rule as the torch manager uses, so the address strings the
+// controller sees are identical whichever framework produced them. Defined
+// outside the Python-only section because listener_address() and
+// transfer_address() are declared unconditionally.
+std::string FormatAddressWithPort(absl::string_view ip, int port) {
+  if (absl::StrContains(ip, ':')) {
+    return absl::StrCat("[", ip, "]:", port);
+  }
+  return absl::StrCat(ip, ":", port);
 }
 }  // namespace
 
@@ -941,10 +953,12 @@ KVCacheManager::KVCacheManager(
     std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
     int parallelism, int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id, int64_t node_id)
+    std::optional<std::string> worker_id, int64_t node_id,
+    std::optional<int> listener_port)
     : numa_manager_(std::make_unique<NumaAwareKVCacheManager>(
           std::move(device_arrays), local_port, host_blocks_to_allocate,
           unsafe_skip_buffer_lock, parallelism, node_id)) {
+  StartListener(listener_port);
   StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
 }
 
@@ -953,10 +967,11 @@ KVCacheManager::KVCacheManager(
     int64_t max_blocks, int64_t num_slots, double timeout_s,
     bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id)
+    std::optional<std::string> worker_id, std::optional<int> listener_port)
     : numa_manager_(std::make_unique<NumaAwareKVCacheManager>(
           std::move(kv_caches), node_id, local_control_port, max_blocks,
           num_slots, timeout_s, unsafe_skip_buffer_lock, parallelism)) {
+  StartListener(listener_port);
   StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
 }
 #endif
@@ -978,10 +993,11 @@ KVCacheManager::KVCacheManager(
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id)
+    std::optional<std::string> worker_id, std::optional<int> listener_port)
     : numa_manager_(std::make_unique<NumaAwareKVCacheManager>(
           num_layers, num_shards, slice_byte_size, local_port,
           host_blocks_to_allocate, parallelism)) {
+  StartListener(listener_port);
   StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
 }
 
@@ -989,10 +1005,59 @@ KVCacheManager::KVCacheManager(
     std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> sub_managers,
     int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id)
+    std::optional<std::string> worker_id, std::optional<int> listener_port)
     : numa_manager_(
           std::make_unique<NumaAwareKVCacheManager>(std::move(sub_managers))) {
+  StartListener(listener_port);
   StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
+}
+
+KVCacheManagerWithTransfer& KVCacheManager::PoolTarget() const {
+  KVCacheManagerWithTransfer* target = numa_manager_->sole_sub_manager();
+  if (target == nullptr) {
+    throw std::runtime_error(absl::StrCat(
+        "pool operations require exactly one NUMA sub-manager, but this "
+        "manager has ",
+        numa_manager_->num_sub_managers(),
+        ". Multi-NUMA pool fan-out is not implemented; construct the manager "
+        "without ENABLE_MULTI_NUMA."));
+  }
+  return *target;
+}
+
+void KVCacheManager::StartListener(std::optional<int> listener_port) {
+  if (!listener_port.has_value()) {
+    return;
+  }
+  // Bind against the sub-manager, not the facade: KVCacheListener drives
+  // KVCacheManagerBase, and the facade is not one. PoolTarget() also enforces
+  // the single-sub-manager restriction, so a multi-NUMA manager refuses to
+  // start a listener instead of arming only shard group 0.
+  listener_ = std::make_unique<kv_cache::KVCacheListener>(&PoolTarget(),
+                                                          *listener_port);
+}
+
+std::optional<int> KVCacheManager::listener_port() const {
+  if (listener_) {
+    return listener_->listener_port();
+  }
+  return std::nullopt;
+}
+
+bool KVCacheManager::is_listener_active() const {
+  return listener_ ? listener_->is_active() : false;
+}
+
+std::string KVCacheManager::listener_address() const {
+  auto port = listener_port();
+  if (!port.has_value()) return "";
+  return FormatAddressWithPort(PoolTarget().local_ip(), *port);
+}
+
+std::string KVCacheManager::transfer_address() const {
+  auto port = numa_manager_->local_port();
+  if (!port.has_value()) return "";
+  return FormatAddressWithPort(PoolTarget().local_ip(), *port);
 }
 
 KVCacheManager::~KVCacheManager() {

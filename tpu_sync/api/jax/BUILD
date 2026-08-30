@@ -21,8 +21,32 @@ py_library(
     srcs = ["kv_cache_manager.py"],
     visibility = ["//visibility:public"],
     deps = [
+        # Framework-neutral despite living under api/torch: pure dataclasses,
+        # no torch import. Shared rather than duplicated so the JAX and torch
+        # pool descriptors cannot drift.
+        "//tpu_sync/api/torch:pool_layout",
         "//tpu_sync/frameworks/jax:_tpu_raiden_jax",
         "//tpu_sync/frameworks/jax:jax_test_utils",
+    ],
+)
+
+py_test(
+    name = "kv_cache_manager_pool_test",
+    srcs = ["kv_cache_manager_pool_test.py"],
+    args = ["--device_type=cpu"],
+    # TODO(jawadamin): drop "notap" once //tpu_sync/kv_cache:kv_cache_store
+    # compiles again. Every py_test in this package links it and none of them build today.
+    tags = [
+        "cpu:2",
+        "notap",
+    ],
+    deps = [
+        ":kv_cache_manager_jax_py",
+        "//tpu_sync/api/torch:pool_layout",
+        "@com_google_absl_py//absl/flags",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@jax//jax",
+        "@pypi//numpy",
     ],
 )
 

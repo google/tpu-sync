@@ -30,45 +30,25 @@ service KVCacheStoreService {
   // source; the caller performs its own H2D afterwards.
   rpc Fetch(FetchRequest) returns (FetchResponse);
 
-  // --- Remote write (source-offered, destination-pulled) -------------------
+  // --- Remote write ---------------------------------------------------------
   //
-  // WriteRemote makes a peer take a copy of blocks this node owns. These two
-  // RPCs are the wire transport behind KVCacheStore's save to a destination
-  // (save(hashes, dst)), not a caller-facing API of their own. The use case
-  // is proactive eviction: a node under memory pressure offers cold blocks to
-  // a peer, then frees them locally.
+  // Wire transport for KVCacheStore's save to a destination. The source
+  // offers blocks on a WriteRemote call and keeps the call open. The
+  // destination allocates landing blocks, pulls the bytes with its own
+  // workers, and answers on the same call: one ack, then at most one result.
+  // An ack that reports all-exist or partial-exist ends the stream with no
+  // operation.
   //
-  //   WriteRemote      the SOURCE offers, on a call it then KEEPS OPEN. The
-  //                    destination tests what it already holds, allocates
-  //                    landing blocks all-or-nothing, issues the pull, and
-  //                    writes an ack carrying an operation_id -- it does NOT
-  //                    wait for the data. When the operation becomes terminal
-  //                    it writes the result on that same call and closes it.
-  //   (no RPC)         the DESTINATION's own workers pull the bytes.
-  //   PollWriteRemote  only for a source that LOST the call and wants to ask
-  //                    once more. Not on any hot path.
+  // The destination pulls, never the reverse: if the source wrote into
+  // destination memory, blocks freed mid-transfer could be reallocated and
+  // corrupted for an unrelated tenant.
   //
-  // Why the destination pulls, and why this is not negotiable: if the
-  // SOURCE's workers wrote into destination blocks, a destination that gave
-  // up mid-transfer would free and reallocate them, and the source's
-  // in-flight write would corrupt an unrelated tenant. No commit-time check
-  // can detect that, because the damage is to a third party. With a pull,
-  // only the destination writes its own memory, so it simply does not free
-  // blocks whose transfer future it still holds.
-  //
-  // There is deliberately NO lease here, unlike the read path: the source
-  // INITIATES and holds its own pins, so there is nothing to negotiate.
-  //
-  // Exactly one Ack, then AT MOST one Result. An Ack reporting all-exist or
-  // partial-exist ends the stream: no operation is created and there is
-  // nothing further to report.
-  //
-  // The call's DEADLINE is the source's HOLD window -- the period it promises
-  // to keep the offered blocks intact. That is not decoration: it is the only
-  // clock in this protocol, and it is why neither side runs a timer for a
-  // remote write. The result arrives on the call, and the HOLD expiring
-  // arrives on the same call as DEADLINE_EXCEEDED.
+  // The call's deadline is the source's HOLD window: how long the source
+  // keeps the offered blocks intact.
   rpc WriteRemote(WriteRemoteRequest) returns (stream WriteRemoteEvent);
+
+  // Recovery only: a source that lost the WriteRemote stream asks once for
+  // the operation's state.
   rpc PollWriteRemote(PollWriteRemoteRequest) returns (PollWriteRemoteResponse);
 }
 
@@ -112,49 +92,40 @@ message FetchResponse {
   string error_message = 3;
 }
 
-// What the destination already holds of the offered batch. Applied by ONE
-// rule, at BOTH ack time and insert time -- which is what makes the two
-// coherent. Without a single rule the same condition is success if a race
-// lands early and failure if it lands late.
+// What the destination already holds of the offered batch. The same rule is
+// applied at ack time and at insert time.
 enum WriteExistState {
   WRITE_EXIST_STATE_UNSPECIFIED = 0;  // nothing was already present
-  // Every offered hash is already present. SUCCESS: hashes are content-
-  // addressed, so the peer having it means the peer has the same bytes --
-  // exactly the post-condition the caller wanted. No transfer is performed.
+  // Every offered hash is already present. Success: hashes are
+  // content-addressed, so the peer already has the same bytes. No transfer.
   WRITE_ALL_EXIST = 1;
-  // Some but not all are present. FAILURE: a partial batch does not satisfy
-  // the request, and reporting success would let an eviction caller free
-  // blocks the peer does not have. existing_hashes lists what it does have,
-  // so the source can re-offer only the difference.
+  // Some but not all are present. Failure; existing_hashes lists what the
+  // peer holds, so the source can re-offer the rest.
   WRITE_PARTIAL_EXIST = 2;
 }
 
 // The source offers blocks it owns; the destination decides and pulls.
 message WriteRemoteRequest {
-  // Identifies the offering node. The destination pulls FROM it.
+  // The offering node. The destination pulls from it.
   tpu_sync.rpc.RaidenIdProto src_raiden_id = 1;
 
-  // MUST be non-empty; an empty list is INVALID_ARGUMENT.
+  // Must be non-empty; an empty list is INVALID_ARGUMENT.
   repeated bytes block_hashes = 2;
 
-  // The source's authoritative host block ids, in block_hashes order. Unlike
-  // the read path's advisory ids these are correct by construction: the
-  // source holds an internal pin on every one for the life of the operation.
+  // The source's host block ids, in block_hashes order. The source pins each
+  // one for the life of the operation, so the ids stay valid.
   repeated int32 src_host_block_ids = 3;
 
-  // The source's worker endpoint groups, tagged with node_id so each
-  // destination worker pairs with the source worker holding its shards.
-  // DATA-plane endpoints, not control.
+  // The source's data-plane worker endpoints, tagged with node_id so each
+  // destination worker pairs with the right source worker.
   repeated tpu_sync.proto.RaidenWorkerEndpointsProto src_worker_endpoints = 4;
 
-  // Requested destination deadline, in milliseconds. MUST be > 0.
-  //
-  // proto3 gives a scalar no presence, so an unset field arrives as 0 and
-  // would otherwise read as "deadline already passed", failing every write at
-  // the pre-pull check. 0 is therefore a protocol error, not a default.
+  // Requested destination deadline, in milliseconds. Must be > 0: proto3
+  // sends an unset field as 0, so 0 is a protocol error, not a default.
   int64 deadline_ms = 5;
 }
 
+// One message on the WriteRemote stream: the ack first, the result later.
 message WriteRemoteEvent {
   oneof event {
     WriteRemoteAck ack = 1;
@@ -162,38 +133,33 @@ message WriteRemoteEvent {
   }
 }
 
-// What became of the OFFER: accepted, or settled on the spot by what the
+// What became of the offer: accepted, or settled at once by what the
 // destination already holds.
 message WriteRemoteAck {
-  // Non-zero => accepted and the transfer is proceeding. Zero together with
-  // WRITE_EXIST_STATE_UNSPECIFIED is a PROTOCOL ERROR (a default-initialised
-  // message), not a silent no-op.
+  // Non-zero means accepted and the transfer is running. Zero together with
+  // WRITE_EXIST_STATE_UNSPECIFIED is a protocol error.
   uint64 operation_id = 1;
 
+  // What the destination already held of the batch.
   WriteExistState exist_state = 2;
 
   // Populated iff WRITE_PARTIAL_EXIST.
   repeated bytes existing_hashes = 3;
 
-  // The deadline actually armed, after clamping to the destination's own cap.
-  // AUTHORITATIVE: the source validates that its own HOLD exceeds this. The
-  // two values live in different processes, so neither side can check the
-  // invariant alone -- and an inverted pair lets the source stop protecting
-  // its blocks while the destination is still pulling them.
+  // The deadline the destination actually armed, after clamping to its own
+  // cap. The source must protect the offered blocks at least this long.
   int64 granted_deadline_ms = 4;
 
-  // How long this destination keeps the operation's record after it goes
-  // terminal. Without it, a source that lost the call cannot tell an UNKNOWN
-  // meaning "never happened" from one meaning "you asked too late": the two
-  // hosts can be configured differently and nothing else on the wire says so.
+  // How long, from this ack, the destination keeps the operation's record.
+  // Lets a source that lost the call tell "never happened" from "asked too
+  // late".
   int64 record_ttl_ms = 5;
 }
 
-// What became of the OPERATION. Written the moment it goes terminal, and the
-// stream closes after it.
+// The operation's final state. Sent once; the stream closes after it.
 message WriteRemoteResult {
-  // The same enum the poll answers with, deliberately: one set of states with
-  // one meaning, so the streamed and the polled answer cannot drift.
+  // The same enum PollWriteRemote answers with, so the two answers cannot
+  // drift apart.
   PollWriteRemoteResponse.State state = 1;
   // Populated iff PARTIAL_EXIST.
   repeated bytes existing_hashes = 2;
@@ -201,64 +167,50 @@ message WriteRemoteResult {
   repeated bytes unregistered_hashes = 3;
 }
 
+// Asks what became of an accepted offer.
 message PollWriteRemoteRequest {
+  // The id from the ack.
   uint64 operation_id = 1;
 
-  // 0 (the default) is the original behaviour: answer with whatever the state
-  // is right now. Non-zero asks the destination to HOLD the call open until
-  // the operation is terminal or this many milliseconds pass, whichever comes
-  // first -- so that a source which lost the stream can wait for the real
-  // answer instead of being told PENDING. The source still bounds the wait
-  // with its own call deadline, and the destination caps it independently;
-  // this only tells the destination it may keep the answer rather than send
-  // PENDING straight back.
+  // 0 answers immediately with the current state. Non-zero asks the
+  // destination to hold the call open until the operation is terminal or
+  // this many milliseconds pass. The destination caps the wait.
   int64 wait_ms = 2;
 }
 
 message PollWriteRemoteResponse {
   enum State {
     STATE_UNSPECIFIED = 0;
+    // Not terminal yet.
     PENDING = 1;
-    // Inserted AND registered globally. SUCCESS -- and the only state an
-    // eviction caller may free its own copy on. A COMMITTED that meant
-    // "inserted" alone would let the source free blocks that no lookup
-    // anywhere can reach.
+    // Inserted and registered globally. Success, and the only state that
+    // lets an eviction caller free its own copy.
     COMMITTED = 2;
-    // A concurrent writer committed every one of our hashes first. SUCCESS:
-    // our blocks are freed and the bytes we moved are discarded, but the
-    // post-condition holds.
+    // A concurrent writer committed every hash first. Success: the
+    // post-condition holds; the transferred bytes are discarded.
     ALL_EXIST = 3;
-    // Some of our hashes were present at insert time. FAILURE;
-    // existing_hashes is set. Our blocks are freed.
+    // Some hashes were present at insert time. Failure; existing_hashes is
+    // set.
     PARTIAL_EXIST = 4;
+    // The transfer failed, or finished past the deadline.
     FAILED = 5;
-    // Aged out, or the destination restarted. Indistinguishable from "never
-    // happened": treat as failure.
+    // No record: aged out, or the destination restarted. Treat as failure.
     UNKNOWN = 6;
-    // The bytes ARRIVED and the destination kept them, but publishing them to
-    // the global registry failed, so no peer can find them.
-    //
-    // Deliberately not COMMITTED. Nothing is corrupt -- hashes are content-
-    // addressed and an unpublished block is invisible, not wrong -- but
-    // COMMITTED is what licenses an eviction caller to drop its own copy, and
-    // doing that here would move the block from "on the source, findable" to
-    // "on the destination, findable by nobody". That is worse than never
-    // having sent it, and it costs a full transfer to get there.
-    //
-    // So the destination reports what actually happened and the SOURCE
-    // decides: keep its copy (the safe default), free it anyway because the
-    // peer is good enough, or leave it alone rather than re-offering bytes the
-    // peer already holds. unregistered_hashes carries the list.
+    // The bytes arrived and the destination kept them, but publishing to the
+    // global registry failed, so no peer can find them. Not COMMITTED:
+    // COMMITTED lets the source free its own copy, which here would leave no
+    // findable copy anywhere. The source decides what to do;
+    // unregistered_hashes carries the list.
     STORED_UNREGISTERED = 7;
   }
   State state = 1;
+  // Populated iff COMMITTED.
   repeated bytes committed_hashes = 2;
+  // Populated iff FAILED.
   repeated bytes failed_hashes = 3;
-  // Populated iff PARTIAL_EXIST. Carried here as well as on
-  // WriteRemoteResponse so the source never has to remember which reply the
-  // list arrived on.
+  // Populated iff PARTIAL_EXIST. Also carried on the ack and the streamed
+  // result.
   repeated bytes existing_hashes = 4;
-  // Populated iff STORED_UNREGISTERED: the destination holds these, but no
-  // lookup will find them.
+  // Populated iff STORED_UNREGISTERED.
   repeated bytes unregistered_hashes = 5;
 }

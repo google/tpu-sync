@@ -749,9 +749,8 @@ HostOffloadBackend::BeginWriteRemote(
         "src_host_block_ids must have one entry per block hash");
   }
 
-  // This resolves the peer through the global registry, and its own
-  // FailedPrecondition ("No global registry client") IS the registry
-  // precondition for the whole feature -- there is no separate check.
+  // Resolves the peer through the global registry. A missing registry
+  // client fails here; there is no separate precondition check.
   ASSIGN_OR_RETURN(std::shared_ptr<KVCacheStoreClient> client,
                    GetKVCacheStoreClient(dst_raiden_id));
 
@@ -763,11 +762,9 @@ HostOffloadBackend::BeginWriteRemote(
   auto response_or = call.ack.Await();
   if (!response_or.ok()) {
     // On a transport error the peer may have restarted on a new port; drop
-    // the store client so the next attempt re-resolves instead of
-    // redialling a dead one. An application answer -- e.g. the
-    // RESOURCE_EXHAUSTED refusing a batch the peer cannot fit -- proves the
-    // peer is alive on this channel, and refusals cluster exactly when a
-    // reconnect is most wasteful: under memory pressure.
+    // the cached client so the next attempt re-resolves it. An application
+    // error (e.g. RESOURCE_EXHAUSTED) means the peer is alive, so the
+    // channel is kept.
     if (IsTransportError(response_or.status())) {
       InvalidateStoreClient(dst_raiden_id);
     }
@@ -790,9 +787,8 @@ HostOffloadBackend::BeginWriteRemote(
       break;
   }
   if (ack.operation_id == 0) {
-    // Neither an existence answer nor an accepted operation: a
-    // default-initialised reply, which is a protocol error rather than a
-    // silent no-op.
+    // Neither an existence answer nor an accepted operation: a protocol
+    // error, not a silent no-op.
     return absl::InternalError(
         "Destination accepted the offer but returned no operation id.");
   }
@@ -815,9 +811,8 @@ std::vector<std::string> HostOffloadBackend::AlreadyPresentHostResident(
   absl::MutexLock lock(mutex_);
   std::vector<std::string> present;
   for (const auto& hash : block_hashes) {
-    // PeekIncludingCandidates, not Peek: an eviction candidate still holds its
-    // host block, so calling it absent would let a duplicate insert through.
-    // Peek also promotes LRU order, which a question has no business doing.
+    // PeekIncludingCandidates: an eviction candidate still holds its host
+    // block, so it must count as present. Peek would also promote LRU order.
     const RaidenBlockId* entry = lru_cache_.PeekIncludingCandidates(hash);
     if (entry != nullptr && (entry->status == BlockStatus::HOST ||
                              entry->status == BlockStatus::HOST_AND_HBM)) {
@@ -835,19 +830,10 @@ bool HostOffloadBackend::InsertAllOrNothing(
   }
   absl::MutexLock lock(mutex_);
 
-  // Phase 1: validate the WHOLE batch before touching anything. Three things
-  // this has to get right that a plain Insert does not:
-  //
-  //   * PeekIncludingCandidates, not Contains. Contains reports false for an
-  //     eviction candidate, but a candidate is still HOST with its block
-  //     still allocated, so Contains would let a duplicate through.
-  //   * available_space(), not capacity(). available_space() subtracts the
-  //     pinned entries; capacity() ignores them, so a cache full of pinned
-  //     entries looks roomy.
-  //   * Do not trust the precheck alone. Put has silent do-nothing paths --
-  //     with everything pinned, its internal evict finds no victim and it
-  //     inserts nothing -- which would commit some hashes, drop others, and
-  //     report success for all.
+  // Phase 1: validate the whole batch before touching anything.
+  // - PeekIncludingCandidates, not Contains: an eviction candidate is still
+  //   HOST and must count as a duplicate.
+  // - available_space(), not capacity(): pinned entries take space.
   for (const auto& hash : block_hashes) {
     if (lru_cache_.PeekIncludingCandidates(hash) != nullptr) {
       return false;
@@ -857,9 +843,9 @@ bool HostOffloadBackend::InsertAllOrNothing(
     return false;
   }
 
-  // Phase 2: insert. Phase 1 rejected duplicates, so no Put can rebind an
-  // existing hash in place and orphan its old host block. The check below is
-  // what keeps that true if Phase 1 ever changes.
+  // Phase 2: insert. Phase 1 rejected duplicates, so Put never rebinds an
+  // existing hash. Put can also silently insert nothing (e.g. everything
+  // pinned), so each insert is verified and the batch rolled back if not.
   for (size_t i = 0; i < block_hashes.size(); ++i) {
     const std::string& hash = block_hashes[i];
     std::optional<std::pair<std::string, RaidenBlockId>> evicted =
@@ -873,32 +859,11 @@ bool HostOffloadBackend::InsertAllOrNothing(
       return false;
     }
     SetMetadataEntry(hash, slices[i]);
-    // An eviction here only demotes an entry to the candidate list; its host
-    // block stays allocated, so there is nothing to free.
+    // An eviction here only demotes the entry to a candidate; its host block
+    // stays allocated, so there is nothing to free.
     (void)evicted;
   }
   return true;
-}
-
-void HostOffloadBackend::RollbackInsert(
-    absl::Span<const std::string> block_hashes,
-    absl::Span<const int32_t> host_block_ids) {
-  {
-    absl::MutexLock lock(mutex_);
-    for (const auto& hash : block_hashes) {
-      if (const RaidenBlockId* entry =
-              lru_cache_.PeekIncludingCandidates(hash)) {
-        ClearMetadataEntry(*entry);
-      }
-      lru_cache_.Erase(hash);
-    }
-  }
-  // Erasing an entry does NOT return its block to the pool. Without this a
-  // failed registration leaks every landing block it touched.
-  if (!host_block_ids.empty()) {
-    (void)raiden_controller_->DeallocateBlockIds(
-        std::vector<int>(host_block_ids.begin(), host_block_ids.end()));
-  }
 }
 
 tsl::Future<> HostOffloadBackend::RegisterBlocksAsync(
@@ -917,8 +882,7 @@ tsl::Future<> HostOffloadBackend::RegisterBlocksAsync(
     local_id = raiden_id_;
   }
   if (client == nullptr) {
-    // No registry configured, so there is nothing to advertise and no way for
-    // these blocks to end up unreachable-but-believed-reachable. Success.
+    // No registry configured, so there is nothing to advertise. Success.
     return tsl::Future<>(absl::OkStatus());
   }
 

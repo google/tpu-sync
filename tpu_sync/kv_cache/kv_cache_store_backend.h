@@ -245,15 +245,6 @@ class KVCacheStoreBackend {
     return false;
   }
 
-  // Undoes an InsertAllOrNothing: erases the entries, clears their metadata,
-  // AND returns the host blocks to the pool.
-  //
-  // Not Delete(): Delete silently skips pinned hashes and issues its own
-  // Unregister. A rollback that skipped a pinned entry would leave an LRU
-  // entry pointing at a block this then frees.
-  virtual void RollbackInsert(absl::Span<const std::string> block_hashes,
-                              absl::Span<const int32_t> host_block_ids) {}
-
   // Publishes `block_hashes` to the global registry asynchronously. Insert()
   // does not publish; a remote write awaits this before reporting COMMITTED.
   virtual tsl::Future<> RegisterBlocksAsync(

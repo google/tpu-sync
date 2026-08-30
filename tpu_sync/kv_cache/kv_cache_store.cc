@@ -811,14 +811,9 @@ KVCacheStore::~KVCacheStore() {
     }
   }
 
-  // Abandon any remote write still outstanding, now that no poller can race
-  // us. This does NOT wait for them: a remote write goes terminal only when
-  // the destination answers or the HOLD (~30s) expires, so waiting would make
-  // destroying a store block for half a minute behind a slow or dead peer.
-  //
-  // Releasing the internal pin is the part that has to happen. `backends_`
-  // holds shared_ptrs, so a backend can outlive the store that pinned into it;
-  // a pin left behind there is a host block nothing can ever reclaim.
+  // Abandon outstanding remote writes without waiting (waiting could block
+  // ~30s on a dead peer). The internal pins must be released here: a backend
+  // can outlive this store, and a leftover pin is never reclaimed.
   {
     std::vector<RemoteWriteState> abandoned;
     {
@@ -829,12 +824,9 @@ KVCacheStore::~KVCacheStore() {
       }
       active_remote_writes_.clear();
     }
-    // Cancelled BEFORE the pins go back, and for the destination's sake
-    // rather than this store's. Nothing waits for the calls to end --
-    // TryCancel does not block, and each reactor settles itself -- but a
-    // destination still holding an open call keeps that operation alive and
-    // its landing blocks reserved for the rest of the hold window, waiting on
-    // an answer from a source that no longer exists.
+    // Cancel each open call before releasing the pins, so the destination
+    // is not left holding a call nobody will answer for the rest of the
+    // hold window. TryCancel does not block.
     for (const auto& state : abandoned) {
       if (state.cancel != nullptr) {
         state.cancel->TryCancel();
@@ -1480,9 +1472,8 @@ absl::Status KVCacheStore::ReadRemote(
 }
 
 KVCacheStore::PollSaveStatusResult KVCacheStore::PollSaveStatus() {
-  // Drives the LOCAL saves whose DMA has landed; a remote save needs no
-  // driving here -- its verdict arrives on the offer's own call, and this
-  // only reads the mailbox it was filed in.
+  // Drives pending local saves; remote verdicts arrive on their own calls
+  // and are only read from the mailbox here.
   PollFuturesInternal();
   absl::MutexLock lock(mutex_);
   std::vector<std::string> pending;
@@ -1492,10 +1483,9 @@ KVCacheStore::PollSaveStatusResult KVCacheStore::PollSaveStatus() {
     }
   }
   for (const auto& [key, state] : active_remote_writes_) {
-    // The sweep's operations are not this caller's to wait on: it will never
-    // receive a verdict for them, so reporting them as pending would describe
-    // a wait that never ends. Unaccepted / failed offers (operation_id == 0)
-    // already reported their error synchronously to the caller.
+    // Report only the application's accepted offers as pending: the caller
+    // never gets a verdict for sweep operations, and an unaccepted offer
+    // (operation_id == 0) already reported its error synchronously.
     if (state.owner != SaveOwner::kApplication || state.operation_id == 0) {
       continue;
     }
@@ -1507,9 +1497,8 @@ KVCacheStore::PollSaveStatusResult KVCacheStore::PollSaveStatus() {
   std::vector<std::string> failed = std::move(failed_saves_);
   done_saves_.clear();
   failed_saves_.clear();
-  // The application's mailbox only. A sweep verdict drained here would be
-  // discarded -- nothing in this result names an owner -- and the sweep would
-  // then wait for it forever.
+  // Drain the application's mailbox only; a sweep verdict drained here would
+  // be lost and the sweep would wait for it forever.
   RemoteWriteVerdicts remote;
   remote.done.swap(application_remote_writes_.done);
   remote.failed.swap(application_remote_writes_.failed);
@@ -1670,10 +1659,8 @@ bool KVCacheStore::SweepOnce() {
   // either sends the batch or drops one target, so this ends.
   while (!placement_targets_.empty()) {
     const RaidenId dst = placement_targets_.front();
-    // SaveRemote's pin contract: the caller pins, and only success consumes
-    // the pin. The sweep is its own caller here; whatever a refusal or a
-    // failed transfer leaves pinned is released below, or the blocks would
-    // never become evictable again.
+    // The sweep is the caller here, so it takes the caller pin itself.
+    // Whatever a failed offer leaves pinned is released below.
     if (!backend()->Pin(batch)) {
       return end_episode();
     }
@@ -1743,12 +1730,9 @@ KVCacheStore::RemoteWriteVerdicts KVCacheStore::DrainSweepVerdicts() {
 
 KVCacheStore::BatchWriteResult KVCacheStore::WaitForBatchWriteResult(
     const std::vector<std::string>& batch) {
-  // Everything drained here belongs to this batch. SaveRemote tags the
-  // operation with its owner and FinishRemoteWrite files the verdict under
-  // that owner, so the application cannot take these and this cannot take the
-  // application's; and the monitor's thread, the only caller, runs one batch
-  // at a time. SaveRemote's HOLD deadline guarantees each block eventually
-  // leaves `pending`.
+  // Everything drained here belongs to this batch: verdicts are filed per
+  // owner, and the monitor thread (the only caller) runs one batch at a
+  // time. The HOLD deadline guarantees every block eventually settles.
   absl::flat_hash_set<std::string> pending(batch.begin(), batch.end());
   BatchWriteResult result;
   while (!pending.empty()) {
@@ -1763,12 +1747,10 @@ KVCacheStore::BatchWriteResult KVCacheStore::WaitForBatchWriteResult(
       pending.erase(hash);
       result.still_pinned.push_back(hash);
     }
-    // `existing` annotates refusals whose bytes the peer already holds -- as
-    // freeable as a completed transfer. It is a SUBSET of `failed`, so those
-    // hashes are both unpinned above and freed here: nothing consumed the
-    // sweep's pin, yet the local copy is droppable. Everything else that
-    // failed (including `unregistered`: landed but unfindable there) keeps its
-    // local copy.
+    // `existing` is a subset of `failed`: the peer already holds these
+    // bytes, so the local copy is freeable even though the offer failed. The
+    // hash is also in still_pinned, and the sweep releases that pin itself.
+    // All other failures keep their local copy.
     for (const std::string& hash : verdicts.existing) {
       result.freeable.push_back(hash);
     }
@@ -1835,20 +1817,17 @@ void KVCacheStore::DeallocateBlockIds(absl::Span<const int> block_ids) {
 
 namespace {
 
-// How long this source keeps its blocks intact and keeps asking. The
-// destination is asked for HOLD minus a margin, and clamps that to its own
-// cap, so the source always outlives the destination's verdict.
+// Default HOLD window: how long the source keeps offered blocks pinned. The
+// destination is asked for HOLD minus the margin, so the source outlives the
+// destination's deadline.
 constexpr absl::Duration kDefaultRemoteWriteHold = absl::Seconds(30);
 
-// Covers one-way RPC latency, clock skew between the two hosts, and scheduler
-// jitter -- none of which this design controls. Not a tuning knob: the two
-// timers live in different processes and are armed at different moments, so
-// without a gap the destination's deadline outlives the source's HOLD by the
-// time it took the request to arrive. In that window the source has unpinned
-// and reported failure while the destination can still commit, and globally
-// register, bytes read out of blocks the source may already have reused.
+// Safety gap between the source's HOLD and the deadline it requests. Covers
+// RPC latency and clock skew; without it the destination could still commit
+// after the source has unpinned and possibly reused the blocks.
 constexpr absl::Duration kRemoteWriteMargin = absl::Seconds(5);
 
+// The HOLD window, from RAIDEN_REMOTE_WRITE_HOLD_S or the default.
 absl::Duration RemoteWriteHold() {
   const char* env = std::getenv("RAIDEN_REMOTE_WRITE_HOLD_S");
   if (env == nullptr) {
@@ -1890,8 +1869,8 @@ absl::Status KVCacheStore::SaveRemote(
         "A remote save requires a HostOffloadBackend at tier 0");
   }
 
-  // Everything before the RPC is undone by this if we do not get as far as
-  // recording the operation.
+  // Undoes the pin and the saving marks if we fail before the operation is
+  // recorded.
   std::vector<std::string> marked;
   std::vector<std::string> pinned;
   auto rollback = absl::MakeCleanup([&]() {
@@ -1926,10 +1905,7 @@ absl::Status KVCacheStore::SaveRemote(
             "offer: ",
             absl::BytesToHexString(hash)));
       }
-      // The caller's pin, which a successful save consumes. The local branch
-      // has always required it; this one did not, and its old contract said
-      // the caller's pin was separate and might not exist at all -- which made
-      // "a save consumes one pin" unstatable for half the API.
+      // The caller's pin, which a successful save consumes.
       if (backend->GetPinCount(hash) <= 0) {
         return absl::FailedPreconditionError(absl::StrCat(
             "Block is not pinned: ", absl::BytesToHexString(hash)));
@@ -1944,8 +1920,8 @@ absl::Status KVCacheStore::SaveRemote(
     }
   }
 
-  // The INTERNAL pin, separate from whatever the caller holds. The block ids
-  // we are about to send are only authoritative for as long as this holds.
+  // The internal pin, separate from the caller's. The block ids sent below
+  // stay valid only while this pin holds.
   if (!backend->Pin(block_hashes)) {
     return absl::ResourceExhaustedError(
         "Failed to pin host blocks for a remote write");
@@ -1959,9 +1935,7 @@ absl::Status KVCacheStore::SaveRemote(
         ") must exceed the ", absl::FormatDuration(kRemoteWriteMargin),
         " margin, or there is no deadline left to ask the destination for."));
   }
-  // Armed HERE, with the pin, rather than after the ack: the pin has to be
-  // protected even if the RPC itself hangs. The cost of that ordering is that
-  // the margin must also cover the round trip.
+  // Armed before the RPC, so the pin is protected even if the RPC hangs.
   const absl::Time hold_expiry = absl::Now() + hold;
 
   OperationKey op_key = 0;
@@ -1977,11 +1951,14 @@ absl::Status KVCacheStore::SaveRemote(
         .owner = owner,
     };
   }
-  // Recorded before the call: the internal pin is now managed by
-  // active_remote_writes_ and will only be released by a settle path, never
-  // by rollback.
+  // The operation is recorded; from here the pin is released only by a
+  // settle path, never by rollback.
   std::move(rollback).Cancel();
 
+  // Runs when the offer's call ends after the ack: with a result, an error,
+  // or its deadline. (A call that fails before any ack reports through
+  // BeginWriteRemote's return instead.) Every settle claims the operation
+  // via TakeRemoteWrite, so exactly one path settles it.
   auto on_verdict = [lifetime = lifetime_, op_key, dst_raiden_id](
                         absl::Status status,
                         std::optional<proto::WriteRemoteResult> result,
@@ -2028,22 +2005,17 @@ absl::Status KVCacheStore::SaveRemote(
           std::vector<std::string>(result->unregistered_hashes().begin(),
                                    result->unregistered_hashes().end()));
     } else {
-      // The stream ended without a verdict. Decide on the clock this store
-      // owns -- the operation's CURRENT hold_expiry -- not on the status the
-      // call carried. The two can disagree: the destination grants its own
-      // deadline, the ack may have extended hold_expiry past the deadline this
-      // call was armed with, and the lambda's captured copy cannot see that
-      // extension. A DEADLINE_EXCEEDED from a call whose deadline the grant
-      // outran arrives while the destination is still entitled to pull, and
-      // must recover, not settle. Both values are read in one locked lookup.
+      // The call ended without a verdict. Decide on the operation's CURRENT
+      // hold_expiry, not on the call's status: the ack may have extended the
+      // hold past the call's fixed deadline, in which case the destination
+      // may still be pulling and we must recover, not settle.
       uint64_t op_id = stream_op_id;
       absl::Time current_hold_expiry = absl::InfinitePast();
       {
         absl::MutexLock lock(lifetime->store->mutex_);
         auto it = lifetime->store->active_remote_writes_.find(op_key);
         if (it == lifetime->store->active_remote_writes_.end()) {
-          // Already settled (all-exist/partial-exist inside save(), or
-          // teardown took it). Nothing to do, and nothing to ask about.
+          // Already settled elsewhere; nothing to do.
           return;
         }
         if (op_id == 0) {
@@ -2053,17 +2025,15 @@ absl::Status KVCacheStore::SaveRemote(
       }
       const absl::Duration remaining_hold = current_hold_expiry - absl::Now();
       if (op_id == 0 || remaining_hold <= absl::ZeroDuration()) {
-        // Either the destination never told this source an operation exists
-        // (no ack arrived, so there is nothing to ask about -- see the S5
-        // comment in SaveRemote), or the hold this store promised has fully
-        // elapsed: the ordinary ending of an unanswered offer.
+        // No operation id to ask about, or the hold has fully elapsed:
+        // settle as failed.
         settle_verdict(lifetime->store, op_key,
                        proto::PollWriteRemoteResponse::FAILED, {}, {});
         return;
       }
-      // The operation is still inside its hold: ask the destination once, and
-      // ask it to hold the answer until the operation is terminal or the hold
-      // ends. One attempt, ever -- the continuation below always settles.
+      // Still inside the hold: ask the destination once to hold the answer
+      // until the operation is terminal. One attempt; the continuation
+      // always settles.
       auto* host_backend =
           dynamic_cast<HostOffloadBackend*>(lifetime->store->backends_[0].get());
       if (host_backend != nullptr) {
@@ -2102,33 +2072,14 @@ absl::Status KVCacheStore::SaveRemote(
                                 hold - kRemoteWriteMargin, hold,
                                 std::move(on_verdict));
   if (!ack_or.ok()) {
-    // The offer is undone completely: pin released, marks dropped, no verdict
-    // filed -- the caller is told by the return value, which is how a
-    // synchronous refusal has always been reported. A DEADLINE_EXCEEDED here
-    // is no exception: the only deadline on the offer call is the hold window
-    // itself, so by the time it fires the hold this store promised has fully
-    // elapsed, and there is nothing left to protect by keeping the pin. (An
-    // earlier revision kept the pin "until hold_expiry" for this case, but no
-    // settle path ever fired for an operation with no ack -- the pin and the
-    // record leaked until the store was destroyed.)
+    // The offer failed before any ack. Undo it completely: release the pin,
+    // clear the marks, and report only through the return status.
     //
-    // KNOWN GAP, deliberately left as it is (review finding S5). The
-    // destination records the operation and starts pulling BEFORE it answers,
-    // so a lost ANSWER is not a lost offer: it may be pulling from these
-    // blocks right now, and releasing the pin lets the LRU hand one to another
-    // hash underneath it. Holding instead is a one-line change here -- keep
-    // the operation, let the HOLD expiring settle it -- and it is not made
-    // because of what it costs everywhere else: a peer that is simply DOWN
-    // fails the same way, and every offer to it would then freeze its batch
-    // for the whole HOLD. The evict sweep is built on the opposite assumption,
-    // that an unreachable target is dropped and the same batch goes to the
-    // next one immediately. gRPC reports "nothing listens there" and "the
-    // connection broke after the server took it" both as UNAVAILABLE, so the
-    // frequent, harmless case cannot be told from the rare, dangerous one.
-    //
-    // Trading a common recovery path for a narrow race needs a decision this
-    // code cannot make for itself, so it keeps today's behaviour and states
-    // the hazard instead of hiding it.
+    // KNOWN GAP: the destination starts pulling before it answers, so if
+    // only the answer was lost it may still be reading these blocks. We
+    // release anyway: holding for the full HOLD would stall the sweep
+    // whenever a peer is simply down, and gRPC reports both cases as
+    // UNAVAILABLE.
     if (auto taken = TakeRemoteWrite(op_key); taken.has_value()) {
       backend->Release(taken->block_hashes);
       absl::MutexLock lock(mutex_);
@@ -2150,8 +2101,7 @@ absl::Status KVCacheStore::SaveRemote(
     return absl::OkStatus();
   }
   if (!ack.existing_hashes.empty()) {
-    // FAILURE, and this store does not retry the remainder: the caller gets
-    // the list and decides.
+    // FAILURE. The caller gets the list and decides what to re-offer.
     auto taken = TakeRemoteWrite(op_key);
     if (taken.has_value()) {
       OnWriteRemoteVerdict(std::move(*taken), /*succeeded=*/false,
@@ -2160,14 +2110,10 @@ absl::Status KVCacheStore::SaveRemote(
     return absl::OkStatus();
   }
 
-  // Belt and braces. The destination clamps to its own cap, which is below the
-  // default HOLD, so this should be unreachable -- but the two values live in
-  // different processes and neither side can check the invariant alone. If it
-  // ever inverts, keep the pin until the granted deadline has elapsed rather
-  // than releasing it while the destination may still be pulling. The extended
-  // hold_expiry written below is what on_verdict reads when the call dies: the
-  // call's own deadline cannot be moved once the call is made, so a
-  // DEADLINE_EXCEEDED inside the extended hold recovers instead of settling.
+  // The granted deadline should always be shorter than the HOLD, but the two
+  // values come from different processes. If the grant is longer, extend
+  // hold_expiry to cover it (on_verdict reads the extended value), so the
+  // pin is never released while the destination may still be pulling.
   if (ack.granted_deadline >= hold) {
     LOG(ERROR) << "Destination granted a deadline of " << ack.granted_deadline
                << ", which is not shorter than this "
@@ -2205,19 +2151,12 @@ void KVCacheStore::OnWriteRemoteVerdict(RemoteWriteState state, bool succeeded,
                                         std::vector<std::string> existing,
                                         std::vector<std::string> unregistered) {
   if (auto* backend = this->backend().get(); backend != nullptr) {
-    // The INTERNAL pin, which protected the blocks while the destination might
-    // still be reading them. Dropped whichever way the offer ended.
+    // Release the internal pin, whichever way the offer ended.
     backend->Release(state.block_hashes);
     if (succeeded) {
-      // ...and separately the CALLER's, which a successful save consumes. Two
-      // releases because they are two different pins: the caller's says "I am
-      // using this", the internal one says "a peer may still be pulling it".
-      //
-      // Doing it here covers BOTH terminal routes: the streamed (or
-      // recovered) verdict and the synchronous all-exist path, which settles
-      // inside SaveRemote and never produces a verdict message at all. An
-      // auto-unpin keyed to arriving verdicts would leak the caller's pin on
-      // every batch the destination already held.
+      // A successful save also consumes the caller's pin. Released here so
+      // every terminal route is covered, including the all-exist path that
+      // settles with no verdict message.
       backend->Release(state.block_hashes);
     }
   }

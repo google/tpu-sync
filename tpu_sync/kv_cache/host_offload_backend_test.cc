@@ -948,39 +948,6 @@ TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRespectsPinnedSpace) {
       {"c"}, {RaidenBlockId(id, 3, BlockStatus::HOST)}));
 }
 
-// The assertion that matters for E1: a failed registration must leave the LRU
-// empty AND the blocks back in the pool. Erasing an entry does not return its
-// block, so a rollback that only erased would leak one block per attempt.
-TEST(HostOffloadBackendWriteRemoteTest, RollbackInsertErasesAndFreesBlocks) {
-  RaidenId id{"job", "0", "data", 0};
-  TF_ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
-                                               ToProto(id), /*num_blocks=*/4,
-                                               /*num_shards=*/1,
-                                               /*shard_size_bytes=*/1024));
-  HostOffloadBackendTest::Backend backend(/*capacity=*/8, std::nullopt, id,
-                                          controller.get());
-
-  TF_ASSERT_OK_AND_ASSIGN(auto ids, controller->AllocateBlockIds(4));
-  // The pool is now empty, which is what makes the free observable.
-  EXPECT_FALSE(controller->AllocateBlockIds(1).ok());
-
-  std::vector<std::string> hashes = {"a", "b", "c", "d"};
-  std::vector<RaidenBlockId> slices;
-  for (int32_t block_id : ids) {
-    slices.push_back(RaidenBlockId(id, block_id, BlockStatus::HOST));
-  }
-  ASSERT_TRUE(backend.InsertAllOrNothing(hashes, slices));
-
-  backend.RollbackInsert(hashes, ids);
-
-  EXPECT_TRUE(backend.AlreadyPresentHostResident(hashes).empty());
-  EXPECT_EQ(backend.GetSize(), 0);
-  auto reallocated = controller->AllocateBlockIds(4);
-  EXPECT_TRUE(reallocated.ok())
-      << "rollback erased the entries but never returned their blocks: "
-      << reallocated.status().ToString();
-}
-
 // With no registry there is nothing to advertise, and no way for the blocks to
 // be believed reachable when they are not -- so this is success, not an error
 // that would fail every write on a registry-less node.

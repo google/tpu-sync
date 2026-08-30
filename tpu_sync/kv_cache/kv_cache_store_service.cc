@@ -57,34 +57,26 @@ namespace kv_cache {
 
 namespace {
 
-// How long this destination will hold landing blocks for ANY source, whatever
-// deadline that source asked for. Deliberately BELOW the source's default HOLD
-// (30 s), so that the invariant "the source outlives the destination's
-// verdict" survives a source whose own margin is misconfigured to zero -- and
-// the source's margin covers the reverse, a destination whose cap is
-// misconfigured high. Either alone would hold the invariant; both together
-// mean one bad environment variable cannot break it.
+// The longest deadline this destination grants, whatever the source asked
+// for. Kept below the source's default HOLD (30 s), so the source protects
+// its blocks until this destination has given up.
 constexpr absl::Duration kDefaultDeadlineCap = absl::Seconds(25);
 
-// The gap between the source's HOLD and the deadline it requests. Reused here
-// as the op record's grace period, which is why there is no separate retention
-// constant: a record lives until deadline + margin, and the source stops
-// polling at HOLD, which is the same duration measured from the earlier of the
-// two events (the pin is taken before the RPC is sent). So the record always
-// outlives the last poll that can arrive, by construction rather than by
-// choosing a number large enough.
+// Grace period after an operation's deadline before its record may be
+// collected. With default settings this is long enough for the source's one
+// recovery ask to still find the record.
 constexpr absl::Duration kRecordMargin = absl::Seconds(5);
 
-// A free deferred this far past the granted deadline means the source is
-// wedged rather than slow: the transfer is unbounded, so those blocks may
-// never come back. Nothing branches on this; it exists so the leak is visible
-// in a log rather than silent.
+// A free still deferred this far past the granted deadline is logged: nothing
+// bounds a transfer, so those blocks may never come back.
 constexpr int kLeakWarningDeadlineMultiple = 3;
+// How often to repeat that warning.
 constexpr absl::Duration kLeakWarningInterval = absl::Seconds(60);
 
 // See ~KVCacheStoreServiceImpl for why teardown does not wait indefinitely.
 constexpr absl::Duration kTeardownQuiesceTimeout = absl::Seconds(10);
 
+// The deadline cap; RAIDEN_REMOTE_WRITE_DEADLINE_S overrides the default.
 absl::Duration DeadlineCap() {
   const char* env = std::getenv("RAIDEN_REMOTE_WRITE_DEADLINE_S");
   if (env == nullptr) {
@@ -99,10 +91,8 @@ absl::Duration DeadlineCap() {
   return absl::Seconds(seconds);
 }
 
-// The longest a waiting PollWriteRemote may hold its gRPC thread, derived
-// from the longest an operation can live plus the margin its record survives
-// after that -- NOT a round number: raise RAIDEN_REMOTE_WRITE_DEADLINE_S and
-// the bound follows. A bound only the caller chooses is not a bound, so the
+// The longest a waiting PollWriteRemote may hold its gRPC thread: the longest
+// an operation can live, plus the margin its record survives after that. The
 // handler clamps every requested wait to this.
 absl::Duration MaxPollWait() { return DeadlineCap() + kRecordMargin; }
 
@@ -127,35 +117,31 @@ std::vector<RaidenWorkerEndpoints> UnpackWorkerEndpointsProto(
 
 }  // namespace
 
-// Co-owned by a WriteOp and the reactor answering it. Every call from the
-// service into the reactor goes through `mu`: a sender that finds `reactor`
-// non-null calls into it while still holding the lock, and OnDone nulls
-// `reactor` under the same lock before deleting -- so a sender either keeps
-// the reactor alive for the length of its call, or finds nothing and drops
-// the answer (a source that has gone away is owed nothing). Without this, a
-// sender that copied the raw pointer under write_mutex_ and then dropped the
-// lock could call into a reactor that deleted itself in between
-// (OnWriteDone(!ok) -> FinishWithError -> Finish -> OnDone -> delete this).
+// Co-owned by a WriteOp and the reactor answering it. Senders reach the
+// reactor only while holding `mu`; OnDone nulls `reactor` under `mu` before
+// the reactor deletes itself. So a sender either finds a live reactor, or
+// finds null and drops the answer. Never copy the raw pointer out.
 struct WriteRemoteReactorGate {
   absl::Mutex mu;
   WriteRemoteServerReactor* reactor ABSL_GUARDED_BY(mu) = nullptr;
 };
 
+// Streams the ack and, later, the result of one WriteRemote call back to the
+// source. Owns itself; deletes itself in OnDone.
 class WriteRemoteServerReactor
     : public ::grpc::ServerWriteReactor<
           ::tpu_raiden::kv_cache::proto::WriteRemoteEvent> {
  public:
-  // `gate` is null for a refused offer: no operation exists, so nothing will
-  // ever need to reach this reactor after the constructor returns.
+  // `gate` is null when the offer creates no operation (a refusal or an
+  // existence answer): nothing needs to reach this reactor later.
   explicit WriteRemoteServerReactor(std::shared_ptr<WriteRemoteReactorGate> gate)
       : gate_(std::move(gate)) {}
 
   void StartAck(proto::WriteRemoteEvent ack_event) {
     {
       absl::MutexLock lock(mu_);
-      // The service's destructor can finish this call between the operation
-      // being recorded and the ack going out; a write after Finish is
-      // undefined, so the ack is simply dropped.
+      // The destructor's sweep can finish this call before the ack goes out;
+      // a write after Finish is undefined, so the ack is dropped.
       if (finished_) {
         return;
       }
@@ -164,6 +150,7 @@ class WriteRemoteServerReactor
     StartWrite(&ack_event_);
   }
 
+  // Sends the ack and closes the call; for offers that create no operation.
   void StartAckAndFinish(proto::WriteRemoteEvent ack_event) {
     {
       absl::MutexLock lock(mu_);
@@ -173,6 +160,7 @@ class WriteRemoteServerReactor
     StartWriteAndFinish(&ack_event_, grpc::WriteOptions(), ::grpc::Status::OK);
   }
 
+  // Closes the call with `status`. Safe to call more than once.
   void FinishWithError(::grpc::Status status) {
     bool should_finish = false;
     {
@@ -187,6 +175,7 @@ class WriteRemoteServerReactor
     }
   }
 
+  // Sends the result and closes the call, once the ack write has finished.
   void SendResultAndFinish(proto::WriteRemoteEvent result_event) {
     bool should_write = false;
     {
@@ -228,12 +217,9 @@ class WriteRemoteServerReactor
   }
 
   void OnCancel() override {
-    // gRPC does not deliver OnDone until the application calls Finish, so a
-    // cancelled call that is only detached leaks this reactor and counts as a
-    // pending RPC forever -- a deadline-less grpc_server_->Shutdown() then
-    // never returns. Finishing is idempotent through `finished_`, and the
-    // operation itself carries on regardless: cancellation says the source
-    // stopped listening, not that the transfer stopped.
+    // A cancelled call must still be finished: gRPC withholds OnDone until
+    // Finish, and an unfinished call stays a pending RPC forever. Only the
+    // call ends here; the operation carries on.
     FinishWithError(::grpc::Status::CANCELLED);
   }
 
@@ -248,21 +234,24 @@ class WriteRemoteServerReactor
   }
 
  private:
+  // Shared with the WriteOp; OnDone nulls the reactor in it before deleting.
   const std::shared_ptr<WriteRemoteReactorGate> gate_;
   absl::Mutex mu_;
+  // The two messages; they must outlive their gRPC writes.
   proto::WriteRemoteEvent ack_event_;
   proto::WriteRemoteEvent result_event_ ABSL_GUARDED_BY(mu_);
+  // True once the ack write completed.
   bool ack_written_ ABSL_GUARDED_BY(mu_) = false;
+  // True once a result is stored, waiting for the ack write to complete.
   bool has_result_ ABSL_GUARDED_BY(mu_) = false;
+  // True once Finish was requested; no further writes are allowed.
   bool finished_ ABSL_GUARDED_BY(mu_) = false;
 };
 
 namespace {
 
-// The one way a result reaches a reactor. Null gate (already claimed by an
-// earlier sender, or a refused offer) and null reactor (the call already
-// ended) both mean the answer is dropped, which is correct: whoever it was
-// for is not listening.
+// The one way a result reaches a reactor. A null gate or a null reactor
+// means nobody is listening; the answer is dropped.
 void SendResultThroughGate(const std::shared_ptr<WriteRemoteReactorGate>& gate,
                            proto::WriteRemoteEvent result_event) {
   if (gate == nullptr) {
@@ -300,21 +289,12 @@ KVCacheStoreServiceImpl::~KVCacheStoreServiceImpl() {
     deadline_thread_->join();
   }
 
-  // Wait for in-flight operations to settle, so their landing blocks go back
-  // to the pool before the controller that owns the pool is destroyed.
-  //
-  // BOUNDED, deliberately. This destructor runs from
-  // KVCacheStoreServer::Shutdown() with the server's own mutex held, so an
-  // unbounded wait here would hang every GetServerAddress() caller as well as
-  // teardown. Nothing bounds a transfer (the block transport has no timeouts)
-  // or the registry call inside a completion, so an unbounded wait is a real
-  // possibility rather than a theoretical one.
-  //
-  // The wait is on each operation's settled flag, not on its transfer future,
-  // for two reasons: Await() on a future does not order with that future's own
-  // OnReady continuation, so a resolved transfer says nothing about whether
-  // the completion has run -- and Await() takes no deadline, so it cannot be
-  // bounded at all.
+  // Wait (bounded) for in-flight operations to settle, so their landing
+  // blocks go back to the pool before the controller that owns it dies.
+  // Bounded because this runs inside KVCacheStoreServer::Shutdown() with the
+  // server's mutex held, and nothing bounds a transfer or a registry call.
+  // The wait is on the settle_done flag: a resolved transfer future does not
+  // mean its completion has run, and Await() takes no deadline.
   {
     absl::MutexLock lock(write_mutex_);
     const auto all_settled = [this]() ABSL_NO_THREAD_SAFETY_ANALYSIS {
@@ -334,6 +314,8 @@ KVCacheStoreServiceImpl::~KVCacheStoreServiceImpl() {
     }
   }
 
+  // End the calls of operations that never answered, so their sources see
+  // UNAVAILABLE instead of waiting out their deadlines.
   std::vector<std::shared_ptr<WriteRemoteReactorGate>> reactors_to_finish;
   {
     absl::MutexLock lock(write_mutex_);
@@ -352,14 +334,10 @@ KVCacheStoreServiceImpl::~KVCacheStoreServiceImpl() {
     }
   }
 
-  // Clearing under `mu` is what makes a late completion safe: it either has
-  // not started (and then finds a null service and does nothing) or is already
-  // running, and this waits for it to finish.
-  //
-  // This last wait is NOT bounded, and cannot be: the alternative is freeing
-  // this object while a callback is still inside it. It only blocks if a
-  // completion is executing right now, and the one step in a completion with
-  // no bound of its own is the global registry call.
+  // Clearing `svc` under `mu` makes a late completion safe: it either finds a
+  // null service and does nothing, or is already running and this waits for
+  // it. Unbounded on purpose; the alternative is freeing the object while a
+  // callback is still inside it.
   absl::MutexLock lock(lifetime_->mu);
   lifetime_->svc = nullptr;
 }
@@ -613,10 +591,7 @@ void KVCacheStoreServiceImpl::ReleaseLandingBlocks(
 
 void KVCacheStoreServiceImpl::Settle(const std::shared_ptr<WriteOp>& op) {
   absl::MutexLock lock(write_mutex_);
-  if (!op->settle_done) {
-    op->settle_done = true;
-    op->settled_promise.Set();
-  }
+  op->settle_done = true;
 }
 
 ::grpc::ServerWriteReactor<::tpu_raiden::kv_cache::proto::WriteRemoteEvent>*
@@ -755,10 +730,6 @@ KVCacheStoreServiceImpl::WriteRemote(
     do {
       op_id = absl::Uniform<uint64_t>(op_id_rng_);
     } while (op_id == 0 || write_ops_.contains(op_id));
-    op->id = op_id;
-    auto [promise, future] = tsl::MakePromise<>();
-    op->settled_promise = std::move(promise);
-    op->settled = std::move(future);
     write_ops_[op_id] = op;
     deadline_cv_.Signal();
   }
@@ -815,10 +786,8 @@ KVCacheStoreServiceImpl::WriteRemote(
   ack->set_operation_id(op_id);
   ack->set_granted_deadline_ms(
       absl::ToInt64Milliseconds(granted_deadline));
-  // How long this operation's record survives from the ack, so a source that
-  // lost the stream can tell "you asked too late" from "never happened". The
-  // record lives to expires_at = granted deadline + margin; the margin alone
-  // under-reports it by the whole grant.
+  // How long the record survives from this ack, so a source that lost the
+  // stream can tell "asked too late" from "never happened".
   ack->set_record_ttl_ms(
       absl::ToInt64Milliseconds(granted_deadline + kRecordMargin));
 
@@ -847,12 +816,10 @@ void KVCacheStoreServiceImpl::OnTransferComplete(
   if (!pending.has_value()) {
     return;
   }
-  // Attached with `lifetime->mu` released, on purpose. OnReady on a future
-  // that is already resolved runs inline on this very thread, and the
-  // no-registry-configured backend hands back exactly such a future, so
-  // attaching above would deadlock on a mutex this thread already holds.
-  // Taking `mu` inside the callback is what keeps the service alive for the
-  // duration of FinishPublish.
+  // Attach with `lifetime->mu` released: OnReady on an already-resolved
+  // future (the no-registry case) runs inline, and would deadlock if this
+  // thread still held the mutex. Taking `mu` inside the callback keeps the
+  // service alive through FinishPublish.
   std::move(pending->future)
       .OnReady([lifetime, op = std::move(pending->op),
                 op_id](absl::Status registered) {
@@ -935,10 +902,8 @@ KVCacheStoreServiceImpl::CompleteWriteRemote(uint64_t op_id,
     return std::nullopt;
   }
 
-  // The blocks are in the cache; publishing them is all that is left, and the
-  // caller finishes the operation when the registry answers. Handing the
-  // future back rather than attaching here is what keeps this off a gRPC
-  // callback thread that is holding `lifetime_->mu` -- see the declaration.
+  // The blocks are in the cache; only the publish is left. The caller
+  // attaches the continuation -- see the declaration for why not here.
   return PendingPublish{
       backend_->RegisterBlocksAsync(op->block_hashes, op->landing_block_ids),
       op};
@@ -1014,6 +979,8 @@ void KVCacheStoreServiceImpl::Finish(const std::shared_ptr<WriteOp>& op,
 
   absl::MutexLock lock(write_mutex_);
 
+  // Opportunistic collection of expired records; DeadlineLoop is what
+  // guarantees it.
   const absl::Time now = absl::Now();
   absl::erase_if(write_ops_, [now](const auto& entry) {
     const auto& op = entry.second;

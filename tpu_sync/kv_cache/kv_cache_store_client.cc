@@ -39,11 +39,8 @@ namespace tpu_raiden {
 namespace kv_cache {
 namespace {
 
-// RPC deadline for WriteRemote and PollWriteRemote. Both handlers answer
-// from local state without waiting on the transfer, so this only needs to
-// cover bookkeeping plus network latency. Without it, a peer that accepts
-// connections but never answers would hang the caller -- and the evict
-// sweep shares its thread with the store's heartbeats.
+// RPC deadline for PollWriteRemote, added on top of any requested wait.
+// WriteRemote does not use this: its deadline is the caller's hold window.
 constexpr std::chrono::seconds kRpcDeadline{10};
 
 }  // namespace
@@ -125,6 +122,10 @@ KVCacheStoreClient::Fetch(
   return future;
 }
 
+// The source's end of one WriteRemote call. The ack resolves `ack_promise_`.
+// When the call ends, OnDone hands the status and any streamed result to
+// `on_verdict_` via the CompletionExecutor, then deletes the reactor. If the
+// call fails before any ack, only the ack future reports the error.
 class WriteRemoteClientReactor
     : public ::grpc::ClientReadReactor<
           ::tpu_raiden::kv_cache::proto::WriteRemoteEvent> {
@@ -201,18 +202,21 @@ class WriteRemoteClientReactor
   }
 
  private:
-  // Shared, not owned outright, so a WriteRemoteCancel handle can reach it
-  // without keeping the call's state alive past OnDone.
+  // The call's context. Shared with the cancel handle, which holds it weakly.
   std::shared_ptr<::grpc::ClientContext> context_;
-  // Owned here: gRPC's callback API requires the request to stay valid for
-  // the life of the call, and the reactor is the only thing that lives that
-  // long.
+  // Owned here: gRPC requires the request to stay valid until the call ends.
   proto::WriteRemoteRequest request_;
+  // Read buffer for the next stream message.
   proto::WriteRemoteEvent event_;
+  // Resolved by the ack, or by the call's error if no ack arrived.
   tsl::Promise<proto::WriteRemoteAck> ack_promise_;
+  // Invoked from OnDone with the call's outcome. May be null.
   KVCacheStoreClient::WriteRemoteVerdictCallback on_verdict_;
+  // Operation id from the ack; 0 until the ack arrives.
   uint64_t operation_id_ = 0;
+  // True once ack_promise_ has been set.
   bool ack_received_ = false;
+  // True when the peer streamed a result; result_ then holds it.
   bool has_result_ = false;
   proto::WriteRemoteResult result_;
 };
@@ -268,17 +272,15 @@ KVCacheStoreClient::WriteRemoteCall KVCacheStoreClient::WriteRemote(
   auto [promise, future] =
       tsl::MakePromise<::tpu_raiden::kv_cache::proto::WriteRemoteAck>();
 
-  // THE call deadline is the HOLD window. Nothing on the source times a
-  // remote write; this is what ends one that never gets an answer.
+  // The call's deadline is the hold window; it is what ends a call that
+  // never gets an answer.
   auto context = std::make_shared<::grpc::ClientContext>();
   context->set_deadline(
       std::chrono::system_clock::now() +
       std::chrono::milliseconds(absl::ToInt64Milliseconds(hold_window)));
 
-  // Made here rather than inside the reactor because the reactor owns itself
-  // and there is no safe moment afterwards to reach into it. The handle holds
-  // the context weakly; the reactor holds it strongly for the life of the
-  // call.
+  // The handle holds the context weakly; the reactor holds it strongly for
+  // the life of the call.
   auto cancel = std::make_shared<WriteRemoteCancel>();
   {
     absl::MutexLock lock(&cancel->state_->mutex);
@@ -298,9 +300,8 @@ void WriteRemoteCancel::TryCancel() {
     absl::MutexLock lock(&state_->mutex);
     context = state_->context.lock();
   }
-  // Outside the lock: TryCancel does not block, but there is no reason to
-  // hold anything while calling into grpc. A call that has already finished
-  // leaves nothing to lock onto, and cancelling it is a no-op by omission.
+  // If the call already ended, the weak pointer is empty and there is
+  // nothing to cancel.
   if (context != nullptr) {
     context->TryCancel();
   }

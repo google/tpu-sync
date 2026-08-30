@@ -658,7 +658,7 @@ class WriteRemoteTest : public ::testing::Test {
     return client_
         ->WriteRemote(SrcIdProto(), hashes, src_ids, SrcEndpoints(),
                       deadline_ms, absl::Seconds(30))
-        .Await();
+        .ack.Await();
   }
 
   absl::StatusOr<::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse> Poll(
@@ -698,7 +698,7 @@ TEST_F(WriteRemoteTest, RejectsAnEmptyOffer) {
   auto response = client_
                       ->WriteRemote(SrcIdProto(), {}, no_ids, SrcEndpoints(),
                                     /*deadline_ms=*/5000, absl::Seconds(30))
-                      .Await();
+                      .ack.Await();
   EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
@@ -710,7 +710,7 @@ TEST_F(WriteRemoteTest, RejectsMissingSourceEndpointsWhenAPullIsNeeded) {
       client_
           ->WriteRemote(SrcIdProto(), {"a"}, src_ids, {}, 5000,
                         absl::Seconds(30))
-          .Await();
+          .ack.Await();
   EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
@@ -723,7 +723,7 @@ TEST_F(WriteRemoteTest, AllExistNeedsNoSourceEndpoints) {
       client_
           ->WriteRemote(SrcIdProto(), {"a"}, src_ids, {}, 5000,
                         absl::Seconds(30))
-          .Await();
+          .ack.Await();
   ASSERT_OK(response.status());
   EXPECT_EQ(response->exist_state(),
             ::tpu_raiden::kv_cache::proto::WRITE_ALL_EXIST);
@@ -738,7 +738,7 @@ TEST_F(WriteRemoteTest, RejectsAnUnsetDeadline) {
       client_
           ->WriteRemote(SrcIdProto(), {"a"}, src_ids, SrcEndpoints(),
                         /*deadline_ms=*/0, absl::Seconds(30))
-          .Await();
+          .ack.Await();
   EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
   EXPECT_THAT(response.status().message(), ::testing::HasSubstr("deadline_ms"));
 }
@@ -755,7 +755,7 @@ TEST_F(WriteRemoteTest, RejectsAnOfferFromItself) {
       client_
           ->WriteRemote(self, {"a"}, src_ids, SrcEndpoints(), 5000,
                         absl::Seconds(30))
-          .Await();
+          .ack.Await();
   EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
@@ -1055,7 +1055,7 @@ TEST(WriteRemotePublishTest, PublishDoesNotBlockTheTransferCompletion) {
   auto response =
       client.WriteRemote(src_id, hashes, src_ids, {group}, 5000,
                          absl::Seconds(30))
-          .Await();
+          .ack.Await();
   ASSERT_OK(response.status());
   const uint64_t op_id = response->operation_id();
   ASSERT_NE(op_id, 0);
@@ -1166,7 +1166,7 @@ TEST(WriteRemoteRegistryFailureTest, StoredButUnregisteredIsReportedAsSuch) {
   auto response =
       client.WriteRemote(src_id, hashes, src_ids, {group}, 5000,
                          absl::Seconds(30))
-          .Await();
+          .ack.Await();
   ASSERT_OK(response.status());
   const uint64_t op_id = response->operation_id();
   ASSERT_NE(op_id, 0);
@@ -1585,6 +1585,103 @@ TEST_F(WriteRemoteTest, PollWriteRemoteWithWaitMsAwaitsUntilTerminal) {
   EXPECT_EQ(poll_resp.state(), proto::PollWriteRemoteResponse::COMMITTED);
   EXPECT_THAT(poll_resp.committed_hashes(),
               UnorderedElementsAre("wait_a", "wait_b"));
+}
+
+// A source that cancels mid-operation (a crash and a network break arrive the
+// same way) must not leave its reactor pending: gRPC withholds OnDone until
+// the application calls Finish, so an OnCancel that only detaches leaks the
+// reactor and keeps the RPC pending forever -- and the deadline-less
+// grpc_server_->Shutdown() that production uses then never returns. The
+// operation itself carries on regardless: cancellation says the source
+// stopped listening, not that the transfer stopped.
+TEST_F(WriteRemoteTest, ACancelledOfferEndsItsCallAndShutdownReturns) {
+  auto channel = server_->InProcessChannel(::grpc::ChannelArguments());
+  auto stub = proto::KVCacheStoreService::NewStub(channel);
+
+  proto::WriteRemoteRequest request;
+  *request.mutable_src_raiden_id() = SrcIdProto();
+  request.add_block_hashes("cancel_a");
+  request.add_src_host_block_ids(100);
+  for (const auto& group : SrcEndpoints()) {
+    *request.add_src_worker_endpoints() = group;
+  }
+  request.set_deadline_ms(5000);
+
+  ::grpc::ClientContext ctx;
+  auto reader = stub->WriteRemote(&ctx, request);
+  proto::WriteRemoteEvent event;
+  ASSERT_TRUE(reader->Read(&event));
+  ASSERT_TRUE(event.has_ack());
+  ASSERT_EQ(latch_.issued(), 1);
+
+  // The transfer is still running when the source goes away. The pause before
+  // releasing the latch lets the cancellation reach the server first: the
+  // defect this test pins was an OnCancel that detached the reactor, so the
+  // completion that came later found nothing to finish.
+  ctx.TryCancel();
+  auto finish_status = reader->Finish();
+  EXPECT_EQ(finish_status.error_code(), ::grpc::StatusCode::CANCELLED);
+  absl::SleepFor(absl::Milliseconds(300));
+
+  // Settle the operation so teardown's quiesce has nothing to wait for; this
+  // test is about the CALL, not the operation.
+  latch_.Release(absl::OkStatus());
+
+  std::atomic<bool> shutdown_returned{false};
+  std::thread shutdown_thread([&]() {
+    server_->Shutdown();
+    shutdown_returned = true;
+  });
+  for (int i = 0; i < 200 && !shutdown_returned.load(); ++i) {
+    absl::SleepFor(absl::Milliseconds(100));
+  }
+  EXPECT_TRUE(shutdown_returned.load())
+      << "a cancelled-but-unfinished WriteRemote held Shutdown";
+  if (!shutdown_returned.load()) {
+    // Unwedge the thread so the test binary can end; the failure is recorded.
+    server_->Shutdown(std::chrono::system_clock::now());
+  }
+  shutdown_thread.join();
+}
+
+// A bound only the caller chooses is not a bound: the destination caps a
+// waiting poll on its own clock, derived from the longest an operation can
+// live (the deadline cap) plus the margin its record survives after that.
+// Without the clamp, any source could park one of this server's gRPC callback
+// threads for as long as it liked against an operation whose transfer never
+// resolves -- and nothing bounds a transfer.
+TEST_F(WriteRemoteTest, AWaitingPollIsCappedByTheServersOwnClock) {
+  // A one-second deadline cap makes the derived bound six seconds -- small
+  // enough to observe. The deadline thread is paused so the operation stays
+  // pending past its deadline: a wedged transfer is exactly the case the cap
+  // exists for.
+  const char* previous = std::getenv("RAIDEN_REMOTE_WRITE_DEADLINE_S");
+  setenv("RAIDEN_REMOTE_WRITE_DEADLINE_S", "1", /*overwrite=*/1);
+  service_->PauseDeadlineFiringForTesting();
+
+  auto ack_or = Offer({"cap_a"});
+  ASSERT_OK(ack_or.status());
+  ASSERT_EQ(latch_.issued(), 1);
+
+  const absl::Time before = absl::Now();
+  auto resp_or =
+      client_->PollWriteRemote(ack_or->operation_id(), /*wait_ms=*/60000)
+          .Await();
+  const absl::Duration waited = absl::Now() - before;
+
+  if (previous != nullptr) {
+    setenv("RAIDEN_REMOTE_WRITE_DEADLINE_S", previous, /*overwrite=*/1);
+  } else {
+    unsetenv("RAIDEN_REMOTE_WRITE_DEADLINE_S");
+  }
+
+  ASSERT_OK(resp_or.status());
+  EXPECT_EQ(resp_or->state(), proto::PollWriteRemoteResponse::PENDING);
+  EXPECT_GE(waited, absl::Seconds(4)) << "the poll did not wait at all";
+  EXPECT_LT(waited, absl::Seconds(30))
+      << "the requested one-minute wait was honoured instead of clamped";
+
+  latch_.Release(absl::OkStatus());
 }
 }  // namespace
 }  // namespace kv_cache

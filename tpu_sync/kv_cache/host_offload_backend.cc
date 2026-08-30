@@ -755,14 +755,12 @@ HostOffloadBackend::BeginWriteRemote(
   ASSIGN_OR_RETURN(std::shared_ptr<KVCacheStoreClient> client,
                    GetKVCacheStoreClient(dst_raiden_id));
 
-  auto response_or =
-      client
-          ->WriteRemote(raiden_controller_->unit(), block_hashes,
-                        src_host_block_ids,
-                        BuildLocalWorkerEndpoints(raiden_controller_),
-                        absl::ToInt64Milliseconds(requested_deadline),
-                        hold_window, std::move(on_verdict))
-          .Await();
+  auto call = client->WriteRemote(raiden_controller_->unit(), block_hashes,
+                                  src_host_block_ids,
+                                  BuildLocalWorkerEndpoints(raiden_controller_),
+                                  absl::ToInt64Milliseconds(requested_deadline),
+                                  hold_window, std::move(on_verdict));
+  auto response_or = call.ack.Await();
   if (!response_or.ok()) {
     // On a transport error the peer may have restarted on a new port; drop
     // the store client so the next attempt re-resolves instead of
@@ -777,6 +775,7 @@ HostOffloadBackend::BeginWriteRemote(
   }
 
   RemoteWriteAck ack;
+  ack.cancel = std::move(call.cancel);
   ack.operation_id = response_or->operation_id();
   ack.granted_deadline = absl::Milliseconds(response_or->granted_deadline_ms());
   switch (response_or->exist_state()) {
@@ -798,53 +797,6 @@ HostOffloadBackend::BeginWriteRemote(
         "Destination accepted the offer but returned no operation id.");
   }
   return ack;
-}
-
-absl::StatusOr<HostOffloadBackend::RemoteWriteStatus>
-HostOffloadBackend::PollWriteRemote(const RaidenId& dst_raiden_id,
-                                    uint64_t operation_id, int64_t wait_ms) {
-  ASSIGN_OR_RETURN(std::shared_ptr<KVCacheStoreClient> client,
-                   GetKVCacheStoreClient(dst_raiden_id));
-
-  auto response_or = client->PollWriteRemote(operation_id, wait_ms).Await();
-  if (!response_or.ok()) {
-    // Same rule as BeginWriteRemote: only a suspect channel is dropped.
-    if (IsTransportError(response_or.status())) {
-      InvalidateStoreClient(dst_raiden_id);
-    }
-    return response_or.status();
-  }
-
-  RemoteWriteStatus status;
-  switch (response_or->state()) {
-    case ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::PENDING:
-      status.state = RemoteWriteState::kPending;
-      break;
-    case ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::COMMITTED:
-      status.state = RemoteWriteState::kCommitted;
-      break;
-    case ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::ALL_EXIST:
-      status.state = RemoteWriteState::kAllExist;
-      break;
-    case ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::PARTIAL_EXIST:
-      status.state = RemoteWriteState::kPartialExist;
-      break;
-    case ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::FAILED:
-      status.state = RemoteWriteState::kFailed;
-      break;
-    case ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::
-        STORED_UNREGISTERED:
-      status.state = RemoteWriteState::kStoredUnregistered;
-      break;
-    default:
-      status.state = RemoteWriteState::kUnknown;
-      break;
-  }
-  status.existing_hashes.assign(response_or->existing_hashes().begin(),
-                                response_or->existing_hashes().end());
-  status.unregistered_hashes.assign(response_or->unregistered_hashes().begin(),
-                                    response_or->unregistered_hashes().end());
-  return status;
 }
 
 tsl::Future<proto::PollWriteRemoteResponse>

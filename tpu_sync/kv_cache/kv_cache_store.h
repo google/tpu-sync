@@ -53,6 +53,8 @@ class RaidenController;
 
 namespace kv_cache {
 
+class WriteRemoteCancel;
+
 namespace global_registry {
 class GlobalRegistryClient;
 }
@@ -700,6 +702,11 @@ class KVCacheStore {
     RaidenId dst_raiden_id;
     uint64_t operation_id = 0;
     std::vector<std::string> block_hashes;
+    // Ends the call this offer was made on. Held for as long as this store is
+    // protecting the blocks, and used when it stops: a destination left
+    // holding an open call reserves its landing blocks for the rest of the
+    // hold window, waiting on a peer that has gone.
+    std::shared_ptr<WriteRemoteCancel> cancel;
     // When this source stops protecting the blocks and gives up, whatever the
     // destination is doing. Must outlive the deadline the destination granted,
     // or this store would unpin while the destination could still legitimately
@@ -823,12 +830,6 @@ class KVCacheStore {
   // deciding it.
   absl::Status SaveRemote(const std::vector<std::string>& block_hashes,
                           const RaidenId& dst_raiden_id, SaveOwner owner);
-
-  // Asks the destination what became of each accepted offer, and gives up on
-  // any whose HOLD has expired. Runs on the store's own poller, at the same
-  // cadence as the save/load pollers, so remote writes do not introduce a
-  // second one.
-  void PollRemoteWritesInternal();
 
   // Atomically extracts an operation from active_remote_writes_ under mutex_.
   // Whoever receives the state owns settling it; concurrent callers receive

@@ -4203,6 +4203,13 @@ class FakeDestinationService
       }
     }
 
+    void OnCancel() override {
+      // Without this, a cancelled stream never reaches OnDone (gRPC withholds
+      // it until Finish is called) and the reactor stays in active_reactors_
+      // forever -- so open_streams() could not observe a cancellation.
+      FinishWithError(::grpc::Status::CANCELLED);
+    }
+
     void OnDone() override {
       parent_->OnReactorDone(this);
       delete this;
@@ -4249,7 +4256,9 @@ class FakeDestinationService
     auto* ack = ack_event.mutable_ack();
     ack->set_operation_id(kOperationId);
     ack->set_exist_state(exist_state_);
-    ack->set_granted_deadline_ms(request->deadline_ms());
+    ack->set_granted_deadline_ms(granted_deadline_ms_override_ > 0
+                                     ? granted_deadline_ms_override_
+                                     : request->deadline_ms());
     for (const auto& hash : existing_hashes_) {
       ack->add_existing_hashes(hash);
     }
@@ -4377,6 +4386,14 @@ class FakeDestinationService
     write_status_ = std::move(status);
   }
 
+  // Overrides the granted deadline in the ack (0 echoes the request), so a
+  // test can make the grant outrun the source's HOLD -- the inversion the
+  // destination's own clamp normally prevents.
+  void SetGrantedDeadlineMs(int64_t ms) {
+    absl::MutexLock lock(mutex_);
+    granted_deadline_ms_override_ = ms;
+  }
+
   int write_calls() const {
     absl::MutexLock lock(mutex_);
     return write_calls_;
@@ -4384,6 +4401,12 @@ class FakeDestinationService
   int poll_calls() const {
     absl::MutexLock lock(mutex_);
     return poll_calls_;
+  }
+  // Streams accepted and not yet ended -- each one is an operation this
+  // destination is still holding open for its source.
+  int open_streams() const {
+    absl::MutexLock lock(mutex_);
+    return static_cast<int>(active_reactors_.size());
   }
   int64_t requested_deadline_ms() const {
     absl::MutexLock lock(mutex_);
@@ -4403,6 +4426,7 @@ class FakeDestinationService
   int write_calls_ ABSL_GUARDED_BY(mutex_) = 0;
   int poll_calls_ ABSL_GUARDED_BY(mutex_) = 0;
   int64_t requested_deadline_ms_ ABSL_GUARDED_BY(mutex_) = 0;
+  int64_t granted_deadline_ms_override_ ABSL_GUARDED_BY(mutex_) = 0;
 };
 
 class RemoteWriteSourceTest : public StoreDiscoveryTest {
@@ -4456,8 +4480,8 @@ class RemoteWriteSourceTest : public StoreDiscoveryTest {
   // Returns {done, failed, existing, unregistered}.
   std::tuple<std::vector<std::string>, std::vector<std::string>,
              std::vector<std::string>, std::vector<std::string>>
-  AwaitWriteSettled(KVCacheStore& store) {
-    for (int i = 0; i < 300; ++i) {
+  AwaitWriteSettled(KVCacheStore& store, int attempts = 300) {
+    for (int i = 0; i < attempts; ++i) {
       auto [done, failed, pending, existing, unregistered] =
           store.PollSaveStatus();
       if (pending.empty() && (!done.empty() || !failed.empty())) {
@@ -5165,11 +5189,13 @@ TEST_F(RemoteWriteSourceTest, DestroyingAStoreMidOfferDoesNotWaitForTheHold) {
       << "destruction blocked on the remote write's hold window";
 }
 
-// An offer whose BeginWriteRemote RPC fails (e.g. transport error or
-// timeout) must NOT release its internal pin in rollback. The destination may
-// have started DMA pulling before the response failed, so the pin must remain
-// held to hold_expiry.
-TEST_F(RemoteWriteSourceTest, AckFailureHoldsInternalPinUntilHoldExpiry) {
+// An offer whose BeginWriteRemote RPC fails with DEADLINE_EXCEEDED before any
+// ack releases its internal pin right there. The only deadline on the offer
+// call is the hold window itself, so by the time it fires the promised hold
+// has fully elapsed -- keeping the pin would protect nothing, and (as an
+// earlier revision demonstrated) nothing ever settles an operation that never
+// got an ack: the pin and the record would leak until the store died.
+TEST_F(RemoteWriteSourceTest, AckDeadlineReleasesThePinAndTheRecord) {
   RaidenId src{"rw_src_ack_fail", "0", "kv", 0};
   RaidenId dst{"rw_dst_ack_fail", "0", "kv", 0};
   auto src_store = MakeStore(src);
@@ -5184,15 +5210,245 @@ TEST_F(RemoteWriteSourceTest, AckFailureHoldsInternalPinUntilHoldExpiry) {
   EXPECT_FALSE(status.ok());
   EXPECT_TRUE(absl::IsDeadlineExceeded(status)) << status;
 
-  // The internal pin MUST remain held despite the offer failure,
-  // preventing blocks from being prematurely freed or reused while destination
-  // might still be pulling.
-  EXPECT_EQ(src_store->GetPinCount("a"), 2);
-  EXPECT_EQ(src_store->InFlightRemoteWritesCountForTesting(), 1);
+  // The offer is fully undone: only the caller's pin remains, no operation
+  // stays on the books, and the hash may be offered again immediately.
+  EXPECT_EQ(src_store->GetPinCount("a"), 1);
+  EXPECT_EQ(src_store->InFlightRemoteWritesCountForTesting(), 0);
 
-  // Destructor cleanly reaps the held pin without waiting for hold.
-  std::shared_ptr<KVCacheStoreBackend> backend = src_store->backend();
+  fake_destination_.SetWriteRemoteStatus(::grpc::Status::OK);
+  proto::PollWriteRemoteResponse verdict;
+  verdict.set_state(proto::PollWriteRemoteResponse::COMMITTED);
+  verdict.add_committed_hashes("a");
+  fake_destination_.SetPollResponse(verdict);
+  EXPECT_TRUE(src_store->Save({"a"}, dst).ok());
+  AwaitWriteSettled(*src_store);
+}
+
+// The failed offer released the blocks while the destination may in fact have
+// started pulling them -- the KNOWN GAP (review finding S5) stated in
+// SaveRemote. This test pins the CONTRACT chosen there: a lost answer undoes
+// the offer completely (pin back to what it was, nothing outstanding, no
+// verdict filed) so the sweep can re-offer to the next target immediately.
+// Holding instead would freeze a batch for the whole HOLD every time a peer is
+// merely down, which is the common case and indistinguishable at the status
+// code. See the comment in SaveRemote.
+TEST_F(RemoteWriteSourceTest, ALostAnswerUndoesTheOfferAndAllowsARetry) {
+  RaidenId src{"rw_src_lost_ack", "0", "kv", 0};
+  RaidenId dst{"rw_dst_lost_ack", "0", "kv", 0};
+  auto src_store = MakeStore(src);
+  Populate(*src_store, src, {"a"});
+  StartFakeDestination(dst);
+
+  const int pinned_before = src_store->backend()->GetPinCount("a");
+
+  fake_destination_.SetWriteRemoteStatus(
+      ::grpc::Status(::grpc::StatusCode::UNAVAILABLE, "connection reset"));
+  auto lost = src_store->Save({"a"}, dst);
+  EXPECT_TRUE(absl::IsUnavailable(lost)) << lost.ToString();
+
+  // Nothing outstanding, and no verdict filed: the return value was the
+  // report.
+  auto [done, failed, pending, existing, unregistered] =
+      src_store->PollSaveStatus();
+  EXPECT_TRUE(pending.empty()) << "an offer that failed stayed active";
+  EXPECT_TRUE(done.empty());
+  EXPECT_TRUE(failed.empty());
+  EXPECT_EQ(src_store->backend()->GetPinCount("a"), pinned_before)
+      << "the internal pin outlived the offer it belonged to";
+
+  // The hash is free to be offered again straight away.
+  fake_destination_.SetWriteRemoteStatus(::grpc::Status::OK);
+  proto::PollWriteRemoteResponse verdict;
+  verdict.set_state(proto::PollWriteRemoteResponse::COMMITTED);
+  verdict.add_committed_hashes("a");
+  fake_destination_.SetPollResponse(verdict);
+  EXPECT_TRUE(src_store->Save({"a"}, dst).ok());
+  AwaitWriteSettled(*src_store);
+}
+
+// Sets RAIDEN_REMOTE_WRITE_HOLD_S for one test and puts it back. The HOLD is
+// 30 seconds by default, which is the right number in production and far too
+// long to wait for in a test -- and it is the clock the two cases below are
+// about.
+class ScopedRemoteWriteHold {
+ public:
+  explicit ScopedRemoteWriteHold(const char* seconds) {
+    const char* previous = std::getenv("RAIDEN_REMOTE_WRITE_HOLD_S");
+    if (previous != nullptr) {
+      had_previous_ = true;
+      previous_ = previous;
+    }
+    setenv("RAIDEN_REMOTE_WRITE_HOLD_S", seconds, /*overwrite=*/1);
+  }
+  ~ScopedRemoteWriteHold() {
+    if (had_previous_) {
+      setenv("RAIDEN_REMOTE_WRITE_HOLD_S", previous_.c_str(), /*overwrite=*/1);
+    } else {
+      unsetenv("RAIDEN_REMOTE_WRITE_HOLD_S");
+    }
+  }
+
+ private:
+  bool had_previous_ = false;
+  std::string previous_;
+};
+
+// The one case the source cannot check for itself. The destination is supposed
+// to grant a deadline SHORTER than this source's HOLD -- it clamps to its own
+// cap to make sure -- but the two numbers live in different processes and
+// either can be moved by an environment variable. If the grant wins, the call
+// carrying the offer still dies at the HOLD, and treating that as the end of
+// the operation hands the blocks back while the destination is still entitled
+// to be pulling from them.
+//
+// So the clock that decides is the store's own hold_expiry, which the ack
+// extends to cover the grant -- not the call's deadline, which cannot be moved
+// once the call is made.
+TEST_F(RemoteWriteSourceTest, AGrantPastTheHoldKeepsTheBlocksForTheGrant) {
+  ScopedRemoteWriteHold hold("6");
+  RaidenId src{"rw_src_grant", "0", "kv", 0};
+  RaidenId dst{"rw_dst_grant", "0", "kv", 0};
+  auto src_store = MakeStore(src);
+  Populate(*src_store, src, {"a"});
+  StartFakeDestination(dst);
+
+  // Granted far past the six-second HOLD, and then silent: no result on the
+  // stream, so the call dies of its own deadline with the operation still
+  // live on the destination. The fake's poll parks while its response is
+  // unset, exactly like a destination whose transfer is still running.
+  fake_destination_.SetGrantedDeadlineMs(20000);
+
+  ASSERT_TRUE(src_store->Save({"a"}, dst).ok());
+  EXPECT_EQ(src_store->GetPinCount("a"), 2);
+
+  // The HOLD runs out. What must NOT happen is the operation being settled
+  // here; what must happen is one ask, for what is left of the grant.
+  for (int i = 0; i < 1500 && fake_destination_.poll_calls() == 0; ++i) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  ASSERT_EQ(fake_destination_.poll_calls(), 1)
+      << "the call died at the hold and the operation was settled there, "
+         "while the destination still had its grant to run";
+  EXPECT_EQ(src_store->GetPinCount("a"), 2)
+      << "the source stopped protecting blocks the destination was granted "
+         "more time to read";
+
+  proto::PollWriteRemoteResponse verdict;
+  verdict.set_state(proto::PollWriteRemoteResponse::COMMITTED);
+  verdict.add_committed_hashes("a");
+  fake_destination_.SetPollResponse(verdict);
+
+  auto [done, failed, existing, unregistered] =
+      AwaitWriteSettled(*src_store, /*attempts=*/2000);
+  EXPECT_THAT(done, ::testing::UnorderedElementsAre("a"));
+  EXPECT_TRUE(failed.empty());
+}
+
+// The ordinary end of a remote write nobody answers: the HOLD runs out, the
+// source stops protecting the blocks and reports the batch failed. Safe only
+// because the destination refuses to commit anything it could not claim
+// inside its own, shorter deadline -- which is why the case above, where that
+// ordering inverts, has to be handled differently.
+TEST_F(RemoteWriteSourceTest, AHoldThatRunsOutReleasesThePinAndFailsTheBatch) {
+  ScopedRemoteWriteHold hold("6");
+  RaidenId src{"rw_src_holdout", "0", "kv", 0};
+  RaidenId dst{"rw_dst_holdout", "0", "kv", 0};
+  auto src_store = MakeStore(src);
+  Populate(*src_store, src, {"a"});
+  StartFakeDestination(dst);
+
+  // Accepted, and then nothing: no result, and no grant to outlive the hold.
+  ASSERT_TRUE(src_store->Save({"a"}, dst).ok());
+  EXPECT_EQ(src_store->GetPinCount("a"), 2);
+
+  auto [done, failed, existing, unregistered] =
+      AwaitWriteSettled(*src_store, /*attempts=*/2000);
+  EXPECT_TRUE(done.empty());
+  EXPECT_THAT(failed, ::testing::UnorderedElementsAre("a"));
+  // The internal pin is gone; the caller's stays, because the save failed.
+  EXPECT_EQ(src_store->GetPinCount("a"), 1);
+  EXPECT_EQ(fake_destination_.poll_calls(), 0)
+      << "nothing should have been asked: the hold was over";
+}
+
+// What the DESTINATION is left with when a source goes away. The call an
+// offer was made on is what reserves the peer's landing blocks: it holds them
+// until it can answer, and an answer is what the source is no longer there to
+// receive. Left alone, that reservation stands for the rest of the hold
+// window -- on a peer whose whole reason for accepting the offer was that it
+// had space to spare.
+//
+// So teardown ends the calls it is abandoning. It does not wait for them:
+// cancelling is for the peer's benefit, not this store's.
+TEST_F(RemoteWriteSourceTest, TeardownEndsTheCallsItAbandons) {
+  ScopedRemoteWriteHold hold("6");
+  RaidenId src{"rw_src_cancel", "0", "kv", 0};
+  RaidenId dst{"rw_dst_cancel", "0", "kv", 0};
+  auto src_store = MakeStore(src);
+  Populate(*src_store, src, {"a"});
+  StartFakeDestination(dst);
+
+  // Accepted, and then silent: the destination sits on the stream, so within
+  // the two seconds observed below, the call ending can only be the
+  // cancellation -- the six-second hold has not run out yet.
+  ASSERT_TRUE(src_store->Save({"a"}, dst).ok());
+  ASSERT_EQ(fake_destination_.open_streams(), 1);
+
   src_store.reset();
+
+  for (int i = 0; i < 200 && fake_destination_.open_streams() != 0; ++i) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_EQ(fake_destination_.open_streams(), 0)
+      << "the destination is still holding the call, and its landing blocks "
+         "with it, for a source that no longer exists";
+}
+
+// The recovery ask does not own a thread while it waits. It asks the
+// destination to hold the answer for what is left of the HOLD -- most of half
+// a minute -- and a store must be destructible during that, without the pin
+// being left behind. This is what the ask being asynchronous buys; a blocking
+// one parks a completion thread AND holds the lifetime fence ~KVCacheStore
+// takes, so teardown would wait out the peer.
+TEST_F(RemoteWriteSourceTest, TeardownDoesNotWaitForARecoveryAskToBeAnswered) {
+  RaidenId src{"rw_src_recover_async", "0", "kv", 0};
+  RaidenId dst{"rw_dst_recover_async", "0", "kv", 0};
+  auto src_store = MakeStore(src);
+  Populate(*src_store, src, {"a"});
+  StartFakeDestination(dst);
+
+  // Accepted, then the stream drops -- and the destination then sits on the
+  // recovery ask rather than answering it (the fake's poll parks while its
+  // response is unset).
+  ASSERT_TRUE(src_store->Save({"a"}, dst).ok());
+  fake_destination_.BreakActiveStreams(
+      ::grpc::Status(::grpc::StatusCode::UNAVAILABLE, "stream lost"));
+  for (int i = 0; i < 500 && fake_destination_.poll_calls() == 0; ++i) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  ASSERT_EQ(fake_destination_.poll_calls(), 1)
+      << "the stream broke and nothing asked the destination about it";
+
+  std::shared_ptr<KVCacheStoreBackend> backend = src_store->backend();
+  absl::Notification destroyed;
+  std::thread reaper([&]() {
+    src_store.reset();
+    destroyed.Notify();
+  });
+  EXPECT_TRUE(destroyed.WaitForNotificationWithTimeout(absl::Seconds(10)))
+      << "destroying the store waited for a peer that has not answered";
+
+  // Unpark the fake's poll so its server thread can end, then collect the
+  // reaper -- after the assertion, so a hang is reported rather than waited
+  // out.
+  proto::PollWriteRemoteResponse verdict;
+  verdict.set_state(proto::PollWriteRemoteResponse::COMMITTED);
+  verdict.add_committed_hashes("a");
+  fake_destination_.SetPollResponse(verdict);
+  reaper.join();
+
+  // Teardown released the internal pin. The caller's is still there: the save
+  // did not succeed, and only success consumes it.
   EXPECT_EQ(backend->GetPinCount("a"), 1);
 }
 

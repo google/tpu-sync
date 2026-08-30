@@ -520,7 +520,6 @@ cc_test(
         ":kv_cache_store_backend",
         ":kv_cache_store_backend_factory",
         ":kv_cache_store_client",
-        ":lru_cache",
         "//tpu_sync/common:raiden_id",
         "//tpu_sync/core:kv_manager_holder",
         "//tpu_sync/core:raiden_transfer_endpoint",
@@ -592,7 +591,6 @@ cc_library(
     hdrs = ["kv_cache_store_service.h"],
     visibility = ["//visibility:public"],
     deps = [
-        ":completion_executor",
         ":kv_cache_store_backend",
         "//tpu_sync/common:raiden_id",
         "//tpu_sync/core:buffer",

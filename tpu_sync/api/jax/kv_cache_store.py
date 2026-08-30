@@ -22,7 +22,7 @@ from tpu_sync.frameworks.jax import _tpu_raiden_jax as _impl
 from tpu_sync.api import common
 
 BlockStatus = common.BlockStatus
-RaidenId = _impl.RaidenId
+RaidenId = getattr(_impl, "RaidenId", common.RaidenId)
 
 
 class RaidenBlockId:
@@ -184,7 +184,7 @@ class KVCacheStore:
       kv_pool_group: KV pool group this store's KVTransferSpec is published
         under in global registry; empty falls back to raiden_id.job_name.
     """
-    raw_raiden_id = _impl.RaidenId()
+    raw_raiden_id = RaidenId()
     if raiden_id is not None:
       raw_raiden_id = (
           raiden_id._impl if hasattr(raiden_id, "_impl") else raiden_id  # pylint: disable=protected-access

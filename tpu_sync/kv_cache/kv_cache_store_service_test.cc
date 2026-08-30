@@ -14,6 +14,7 @@
 
 #include "tpu_sync/kv_cache/kv_cache_store_service.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -26,7 +27,6 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
@@ -1553,6 +1553,38 @@ TEST(FetchWithdrawTest, AHashOnlyAPeerHoldsIsAMissAndThePeerKeepsItsEntry) {
   server->Shutdown();
 }
 
+// Verifies that PollWriteRemote with wait_ms parks while the operation is
+// pending and returns immediately as soon as the transfer completes and
+// marks terminal.
+TEST_F(WriteRemoteTest, PollWriteRemoteWithWaitMsAwaitsUntilTerminal) {
+  auto ack_or = Offer({"wait_a", "wait_b"});
+  ASSERT_OK(ack_or.status());
+  const uint64_t op_id = ack_or->operation_id();
+  ASSERT_EQ(latch_.issued(), 1);
+
+  std::atomic<bool> poll_done = false;
+  proto::PollWriteRemoteResponse poll_resp;
+  std::thread poll_thread([&]() {
+    auto resp_or = client_->PollWriteRemote(op_id, /*wait_ms=*/5000).Await();
+    if (resp_or.ok()) {
+      poll_resp = *resp_or;
+    }
+    poll_done = true;
+  });
+
+  // Verify poll is currently waiting / parked.
+  absl::SleepFor(absl::Milliseconds(50));
+  EXPECT_FALSE(poll_done.load());
+
+  // Complete the transfer: destination marks terminal and wakes the parked poll.
+  latch_.Release(absl::OkStatus());
+
+  poll_thread.join();
+  EXPECT_TRUE(poll_done.load());
+  EXPECT_EQ(poll_resp.state(), proto::PollWriteRemoteResponse::COMMITTED);
+  EXPECT_THAT(poll_resp.committed_hashes(),
+              UnorderedElementsAre("wait_a", "wait_b"));
+}
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

@@ -802,11 +802,11 @@ HostOffloadBackend::BeginWriteRemote(
 
 absl::StatusOr<HostOffloadBackend::RemoteWriteStatus>
 HostOffloadBackend::PollWriteRemote(const RaidenId& dst_raiden_id,
-                                    uint64_t operation_id) {
+                                    uint64_t operation_id, int64_t wait_ms) {
   ASSIGN_OR_RETURN(std::shared_ptr<KVCacheStoreClient> client,
                    GetKVCacheStoreClient(dst_raiden_id));
 
-  auto response_or = client->PollWriteRemote(operation_id).Await();
+  auto response_or = client->PollWriteRemote(operation_id, wait_ms).Await();
   if (!response_or.ok()) {
     // Same rule as BeginWriteRemote: only a suspect channel is dropped.
     if (IsTransportError(response_or.status())) {
@@ -845,6 +845,17 @@ HostOffloadBackend::PollWriteRemote(const RaidenId& dst_raiden_id,
   status.unregistered_hashes.assign(response_or->unregistered_hashes().begin(),
                                     response_or->unregistered_hashes().end());
   return status;
+}
+
+tsl::Future<proto::PollWriteRemoteResponse>
+HostOffloadBackend::PollWriteRemoteAsync(const RaidenId& dst_raiden_id,
+                                        uint64_t operation_id,
+                                        int64_t wait_ms) {
+  auto client_or = GetKVCacheStoreClient(dst_raiden_id);
+  if (!client_or.ok()) {
+    return tsl::Future<proto::PollWriteRemoteResponse>(client_or.status());
+  }
+  return (*client_or)->PollWriteRemote(operation_id, wait_ms);
 }
 
 std::vector<std::string> HostOffloadBackend::AlreadyPresentHostResident(

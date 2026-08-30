@@ -55,7 +55,6 @@ namespace kv_cache {
 
 namespace global_registry {
 class GlobalRegistryClient;
-class RegistryCall;
 }
 
 class StoreMonitor;

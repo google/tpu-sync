@@ -156,7 +156,6 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
     ],
 )
 
@@ -185,7 +184,6 @@ cc_binary(
         ":framed_rpc",
         ":reshard_service",
         "//tpu_sync/core:transfer_program_reshard",
-        "//tpu_sync/proto:transfer_program_cc_proto",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",

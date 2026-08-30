@@ -440,9 +440,22 @@ cc_library(
     hdrs = ["completion_executor.h"],
     visibility = ["//visibility:public"],
     deps = [
-        "//tpu_sync/core:numa_thread_pool",
+        "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/base:no_destructor",
         "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/synchronization",
+        "@xla//xla/tsl/concurrency:executor",
+    ],
+)
+
+cc_test(
+    name = "completion_executor_test",
+    srcs = ["completion_executor_test.cc"],
+    deps = [
+        ":completion_executor",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 
@@ -577,6 +590,7 @@ cc_library(
     hdrs = ["kv_cache_store_service.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":completion_executor",
         ":kv_cache_store_backend",
         "//tpu_sync/common:raiden_id",
         "//tpu_sync/core:buffer",
@@ -663,9 +677,11 @@ cc_library(
         "//tpu_sync/proto:worker_service_cc_proto",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@xla//xla/tsl/concurrency:future",

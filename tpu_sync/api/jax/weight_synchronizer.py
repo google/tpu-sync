@@ -20,6 +20,53 @@ from typing import Any, Dict, List, Optional
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _weight_synchronizer
 
 
+
+def _ws_logical_bytes(arr):
+  import numpy as _np
+  itembytes = arr.dtype.itemsize if hasattr(arr.dtype, "itemsize") else _np.dtype(arr.dtype).itemsize
+  n = 1
+  for d in arr.shape:
+    n *= int(d)
+  return n * itembytes
+
+
+def _ws_on_device_bytes(arr):
+  try:
+    shards = arr.addressable_shards
+    if shards:
+      return sum(int(s.data.on_device_size_in_bytes()) for s in shards)
+  except Exception:
+    pass
+  try:
+    return int(arr.on_device_size_in_bytes())
+  except Exception:
+    return -1
+
+
+def assert_tile_representable_v2(jax_arrays):
+  """DAYLIGHT3/RAIDEN-LANDING BUG1 GUARD V2 (runtime-derived, dtype-proof).
+
+  MEASURED ON SILICON: the WeightSynchronizer D2H stages LOGICAL bytes but completion accounting is driven by
+  the on-device (tiled) size. When on_device_size_in_bytes(arr) > logical_bytes(arr), the receiver waits for
+  tiled bytes that never arrive after detiling, H2D never fires, and the destination silently stays
+  zero-initialized (BUG1). This guard reads the ACTUAL per-dtype device layout and rejects iff
+  tiled_bytes > logical_bytes. No hardcoded tile constant -> correct for f32 ((8,128)), bf16 ((8,128)+(2,1)),
+  int8 ((8,128)+(4,1)), MoE/1D/narrow, and any future dtype.
+  """
+  for i, arr in enumerate(jax_arrays):
+    logical = _ws_logical_bytes(arr)
+    odb = _ws_on_device_bytes(arr)
+    if odb > 0 and odb > logical:
+      raise ValueError(
+          "WeightSynchronizer cannot safely transfer weight[%d] shape=%s dtype=%s: its on-device (tiled) size "
+          "%d B exceeds its logical size %d B. The current D2H/H2D path stages logical bytes but accounts for "
+          "tiled bytes, so the destination would silently remain zero-initialized (BUG1). Pad the shard so its "
+          "device layout carries no extra tiling bytes, or route this variable through a tiling-aware transfer. "
+          "(Guard derived from runtime on_device_size_in_bytes, dtype-proof.)"
+          % (i, tuple(arr.shape), arr.dtype, odb, logical)
+      )
+
+
 class WeightSynchronizer:
   """Zero-copy distributed Weight Synchronizer for JAX."""
 
@@ -44,6 +91,7 @@ class WeightSynchronizer:
       bind_ip: Sockets server bind IP address.
       auto_h2d: Automatically execute H2D ingestion upon data arrival.
     """
+    assert_tile_representable_v2(jax_arrays)  # BUG1 GUARD V2 (runtime-derived, dtype-proof)
     self._impl = _weight_synchronizer.WeightSynchronizer(
         jax_arrays,
         local_port,
@@ -76,6 +124,7 @@ class WeightSynchronizer:
       jax_arrays: A list of JAX arrays representing the updated sharded model
         weights.
     """
+    assert_tile_representable_v2(jax_arrays)  # BUG1 GUARD V2 (runtime-derived, dtype-proof)
     self._impl.bind_weights(jax_arrays)
 
   def get_host_buffer(self, layer_idx: int = 0, shard_idx: int = 0) -> any:

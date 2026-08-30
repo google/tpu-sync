@@ -108,15 +108,25 @@ class KVCacheStoreTest {
                            : std::vector<std::string>{};
   }
 
-  // Plants an index entry BELOW the store's Insert gate, which refuses
-  // REMOTE slices. Cases that assert engine behavior for an index already
-  // holding one (backend-level paths can still create them) set up here.
-  // The entry is left UNPINNED, like InsertResident.
   static void PlantIndexEntry(KVCacheStore& store,
                               const std::vector<std::string>& block_hashes,
                               const std::vector<RaidenBlockId>& slices,
                               bool on_host) {
     store.backend()->Insert(block_hashes, slices, on_host);
+  }
+
+  static std::optional<KVCacheStore::RemoteWriteState> TakeRemoteWrite(
+      KVCacheStore& store, KVCacheStore::OperationKey key) {
+    return store.TakeRemoteWrite(key);
+  }
+
+  static void OnWriteRemoteVerdict(KVCacheStore& store,
+                                   KVCacheStore::RemoteWriteState state,
+                                   bool succeeded,
+                                   std::vector<std::string> existing = {},
+                                   std::vector<std::string> unregistered = {}) {
+    store.OnWriteRemoteVerdict(std::move(state), succeeded, std::move(existing),
+                               std::move(unregistered));
   }
 };
 
@@ -3605,7 +3615,12 @@ class StoreDiscoveryTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    if (server_) server_->Shutdown();
+    client_.reset();
+    channel_.reset();
+    if (server_) {
+      server_->Shutdown(std::chrono::system_clock::now() +
+                        std::chrono::milliseconds(200));
+    }
   }
 
   std::string registry_address_;
@@ -4273,15 +4288,46 @@ class FakeDestinationService
 
   ::grpc::ServerUnaryReactor* PollWriteRemote(
       ::grpc::CallbackServerContext* context,
-      const ::tpu_raiden::kv_cache::proto::PollWriteRemoteRequest* /*request*/,
+      const ::tpu_raiden::kv_cache::proto::PollWriteRemoteRequest* request,
       ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse* response)
       override {
     auto* reactor = context->DefaultReactor();
     absl::MutexLock lock(mutex_);
     ++poll_calls_;
+    if (request->wait_ms() > 0 &&
+        (poll_response_.state() ==
+             proto::PollWriteRemoteResponse::STATE_UNSPECIFIED ||
+         poll_response_.state() ==
+             proto::PollWriteRemoteResponse::PENDING)) {
+      mutex_.AwaitWithTimeout(
+          absl::Condition(
+              +[](FakeDestinationService* svc) {
+                svc->mutex_.AssertHeld();
+                return svc->poll_response_.state() !=
+                           proto::PollWriteRemoteResponse::STATE_UNSPECIFIED &&
+                       svc->poll_response_.state() !=
+                           proto::PollWriteRemoteResponse::PENDING;
+              },
+              this),
+          absl::Milliseconds(request->wait_ms()));
+    }
     *response = poll_response_;
     reactor->Finish(::grpc::Status::OK);
     return reactor;
+  }
+
+  void BreakActiveStreams(::grpc::Status error_status) {
+    absl::MutexLock lock(mutex_);
+    for (auto* reactor : active_reactors_) {
+      reactor->FinishWithError(error_status);
+    }
+    active_reactors_.clear();
+  }
+
+  void SetPollRecoveryResponse(
+      ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse response) {
+    absl::MutexLock lock(mutex_);
+    poll_response_ = std::move(response);
   }
 
   void SetPollResponse(
@@ -4855,6 +4901,72 @@ TEST_F(RemoteWriteSourceTest,
   EXPECT_THAT(unregistered, ::testing::UnorderedElementsAre("x", "y"));
 }
 
+// Plan §12 Test 5: Stream broken mid-flight -> OnDone fires -> pin held; recovery call returns true verdict.
+TEST_F(RemoteWriteSourceTest, StreamBrokenMidFlightRecoversViaWaitingPoll) {
+  RaidenId src{"rw_src_stream_break", "0", "kv", 0};
+  RaidenId dst{"rw_dst_stream_break", "0", "kv", 0};
+  auto src_store = MakeStore(src);
+  Populate(*src_store, src, {"a"});
+  StartFakeDestination(dst);
+
+  // Keep the stream pending initially so the ack is read but no result is sent yet.
+  proto::PollWriteRemoteResponse pending_verdict;
+  pending_verdict.set_state(proto::PollWriteRemoteResponse::PENDING);
+  fake_destination_.SetPollResponse(pending_verdict);
+
+  ASSERT_TRUE(src_store->Save({"a"}, dst).ok());
+  // The offer was accepted and is in flight. Internal pin is held.
+  EXPECT_EQ(src_store->GetPinCount("a"), 2);
+
+  // Set the eventual verdict that the destination will report when asked.
+  proto::PollWriteRemoteResponse committed_verdict;
+  committed_verdict.set_state(proto::PollWriteRemoteResponse::COMMITTED);
+  committed_verdict.add_committed_hashes("a");
+  fake_destination_.SetPollRecoveryResponse(committed_verdict);
+
+  // Abruptly break the active stream (simulating network drop / reset).
+  fake_destination_.BreakActiveStreams(::grpc::Status(
+      ::grpc::StatusCode::UNAVAILABLE, "Stream broken mid-flight"));
+
+  // The source's OnDone catches the break and issues PollWriteRemote(wait_ms),
+  // recovering the true verdict without a polling thread or timer loop.
+  auto [done, failed, existing, unregistered] = AwaitWriteSettled(*src_store);
+
+  EXPECT_THAT(done, ::testing::UnorderedElementsAre("a"));
+  EXPECT_TRUE(failed.empty());
+  EXPECT_EQ(fake_destination_.write_calls(), 1);
+  EXPECT_EQ(fake_destination_.poll_calls(), 1)
+      << "Recovery must issue exactly one PollWriteRemote call";
+}
+
+// Plan §12 Test 5b: Stream broken during teardown -> destructor's take wins; OnDone issues no recovery call.
+TEST_F(RemoteWriteSourceTest,
+       StreamBrokenDuringTeardownDoesNotIssueRecoveryPoll) {
+  RaidenId src{"rw_src_break_dtor", "0", "kv", 0};
+  RaidenId dst{"rw_dst_break_dtor", "0", "kv", 0};
+  auto src_store = MakeStore(src);
+  Populate(*src_store, src, {"a"});
+  StartFakeDestination(dst);
+
+  proto::PollWriteRemoteResponse pending_verdict;
+  pending_verdict.set_state(proto::PollWriteRemoteResponse::PENDING);
+  fake_destination_.SetPollResponse(pending_verdict);
+
+  ASSERT_TRUE(src_store->Save({"a"}, dst).ok());
+  EXPECT_EQ(src_store->InFlightRemoteWritesCountForTesting(), 1);
+
+  // Destroy the store while stream is in flight: destructor takes and cancels.
+  src_store.reset();
+
+  // The stream breaks because server/client shuts down.
+  fake_destination_.BreakActiveStreams(::grpc::Status(
+      ::grpc::StatusCode::UNAVAILABLE, "Stream broken"));
+
+  // OnDone must not issue a recovery poll because the operation was already taken during teardown.
+  EXPECT_EQ(fake_destination_.poll_calls(), 0)
+      << "Teardown must not leave an orphaned recovery poll in flight";
+}
+
 // Polling a remote write means asking the destination, which cannot be done
 // holding the store's lock. Every public poll entry point drives that ask, and
 // so does the background loop, so several can be in it at once. If the poller
@@ -5051,6 +5163,85 @@ TEST_F(RemoteWriteSourceTest, DestroyingAStoreMidOfferDoesNotWaitForTheHold) {
   // The HOLD is 30s; anything near it means the drain waited.
   EXPECT_LT(took, absl::Seconds(10))
       << "destruction blocked on the remote write's hold window";
+}
+
+// An offer whose BeginWriteRemote RPC fails (e.g. transport error or
+// timeout) must NOT release its internal pin in rollback. The destination may
+// have started DMA pulling before the response failed, so the pin must remain
+// held to hold_expiry.
+TEST_F(RemoteWriteSourceTest, AckFailureHoldsInternalPinUntilHoldExpiry) {
+  RaidenId src{"rw_src_ack_fail", "0", "kv", 0};
+  RaidenId dst{"rw_dst_ack_fail", "0", "kv", 0};
+  auto src_store = MakeStore(src);
+  Populate(*src_store, src, {"a"});
+  StartFakeDestination(dst);
+
+  // Destination times out before ack (simulating lost ack / slow peer).
+  fake_destination_.SetWriteRemoteStatus(::grpc::Status(
+      ::grpc::StatusCode::DEADLINE_EXCEEDED, "deadline exceeded before ack"));
+
+  auto status = src_store->Save({"a"}, dst);
+  EXPECT_FALSE(status.ok());
+  EXPECT_TRUE(absl::IsDeadlineExceeded(status)) << status;
+
+  // The internal pin MUST remain held despite the offer failure,
+  // preventing blocks from being prematurely freed or reused while destination
+  // might still be pulling.
+  EXPECT_EQ(src_store->GetPinCount("a"), 2);
+  EXPECT_EQ(src_store->InFlightRemoteWritesCountForTesting(), 1);
+
+  // Destructor cleanly reaps the held pin without waiting for hold.
+  std::shared_ptr<KVCacheStoreBackend> backend = src_store->backend();
+  src_store.reset();
+  EXPECT_EQ(backend->GetPinCount("a"), 1);
+}
+
+// TakeRemoteWrite is the atomic claim function: across multiple concurrent
+// callers or threads, exactly one caller receives the RemoteWriteState and all
+// others receive std::nullopt.
+TEST_F(RemoteWriteSourceTest, TakeRemoteWriteSettlesExactlyOnce) {
+  RaidenId src{"rw_src_take_once", "0", "kv", 0};
+  RaidenId dst{"rw_dst_take_once", "0", "kv", 0};
+  auto src_store = MakeStore(src);
+  Populate(*src_store, src, {"a"});
+  StartFakeDestination(dst);
+
+  proto::PollWriteRemoteResponse verdict;
+  verdict.set_state(proto::PollWriteRemoteResponse::PENDING);
+  fake_destination_.SetPollResponse(verdict);
+
+  ASSERT_TRUE(src_store->Save({"a"}, dst).ok());
+  ASSERT_EQ(src_store->InFlightRemoteWritesCountForTesting(), 1);
+
+  constexpr int kNumThreads = 10;
+  std::vector<std::thread> threads;
+  std::atomic<int> success_count{0};
+  using ResultType = decltype(KVCacheStoreTest::TakeRemoteWrite(*src_store, 1));
+  std::vector<ResultType> results(kNumThreads);
+
+  for (int i = 0; i < kNumThreads; ++i) {
+    threads.emplace_back([&, i]() {
+      results[i] = KVCacheStoreTest::TakeRemoteWrite(*src_store, 1);
+      if (results[i].has_value()) {
+        success_count.fetch_add(1);
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  EXPECT_EQ(success_count.load(), 1);
+  EXPECT_EQ(src_store->InFlightRemoteWritesCountForTesting(), 0);
+
+  // Settle the single taken state.
+  for (auto& res : results) {
+    if (res.has_value()) {
+      KVCacheStoreTest::OnWriteRemoteVerdict(*src_store, std::move(*res),
+                                             /*succeeded=*/false, {});
+    }
+  }
+  EXPECT_EQ(src_store->GetPinCount("a"), 1);
 }
 
 // A destination that vanished after registering. The source must get a prompt

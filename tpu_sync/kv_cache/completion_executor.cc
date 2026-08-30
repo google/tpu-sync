@@ -15,32 +15,67 @@
 #include "tpu_sync/kv_cache/completion_executor.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 
 #include "absl/base/no_destructor.h"
-#include "absl/functional/any_invocable.h"
-#include "tpu_sync/core/numa_thread_pool.h"
+#include "absl/log/log.h"
+#include "absl/synchronization/mutex.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
 
-namespace {
-constexpr size_t kDefaultCompletionThreadPoolSize = 8;
-
-NumaThreadPool& GlobalThreadPool() {
-  static absl::NoDestructor<NumaThreadPool> pool(
-      kDefaultCompletionThreadPoolSize);
-  return *pool;
-}
-}  // namespace
-
-void CompletionExecutor::Schedule(absl::AnyInvocable<void() &&> task) {
-  GlobalThreadPool().Schedule(
-      [task = std::move(task)]() mutable { std::move(task)(); });
+CompletionExecutor& CompletionExecutor::Instance() {
+  static absl::NoDestructor<CompletionExecutor> executor(kCompletionThreads);
+  return *executor;
 }
 
-size_t CompletionExecutor::DefaultPoolSize() {
-  return kDefaultCompletionThreadPoolSize;
+CompletionExecutor::CompletionExecutor(int threads) {
+  workers_.reserve(threads);
+  for (int i = 0; i < threads; ++i) {
+    workers_.emplace_back(&CompletionExecutor::WorkerLoop, this);
+  }
+  for (std::thread& worker : workers_) worker.detach();
+}
+
+void CompletionExecutor::Execute(Task task) noexcept {
+  try {
+    absl::MutexLock lock(&mu_);
+    queue_.push_back(std::move(task));
+  } catch (...) {
+    LOG(ERROR) << "CompletionExecutor could not queue a completion; running it inline.";
+    std::move(task)();
+  }
+}
+
+void CompletionExecutor::WorkerLoop() {
+  for (;;) {
+    Task task;
+    {
+      absl::MutexLock lock(&mu_);
+      mu_.Await(absl::Condition(
+          +[](std::deque<Task>* q) { return !q->empty(); }, &queue_));
+      ++wakeups_;
+      task = std::move(queue_.front());
+      queue_.pop_front();
+      ++running_;
+    }
+    std::move(task)();
+    absl::MutexLock lock(&mu_);
+    --running_;
+  }
+}
+
+void CompletionExecutor::DrainForTesting() {
+  absl::MutexLock lock(&mu_);
+  mu_.Await(absl::Condition(this, &CompletionExecutor::IsIdle));
+}
+
+int64_t CompletionExecutor::WakeupsForTesting() const {
+  absl::MutexLock lock(&mu_);
+  return wakeups_;
 }
 
 }  // namespace kv_cache

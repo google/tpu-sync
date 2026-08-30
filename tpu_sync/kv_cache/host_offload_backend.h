@@ -26,6 +26,7 @@
 #include "absl/base/nullability.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -167,8 +168,8 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   using WriteRemoteVerdictCallback = std::function<void(
       absl::Status rpc_status,
-      std::optional<::tpu_raiden::kv_cache::proto::WriteRemoteResult> result)>;
-
+      std::optional<::tpu_raiden::kv_cache::proto::WriteRemoteResult> result,
+      uint64_t operation_id)>;
   // `requested_deadline` is how long the destination may hold its landing
   // blocks; it grants at most this and at most its own cap, and reports what
   // it actually armed. Blocking, on the caller's thread -- this is a control
@@ -205,7 +206,12 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   };
 
   absl::StatusOr<RemoteWriteStatus> PollWriteRemote(
-      const RaidenId& dst_raiden_id, uint64_t operation_id);
+      const RaidenId& dst_raiden_id, uint64_t operation_id,
+      int64_t wait_ms = 0);
+
+  tsl::Future<proto::PollWriteRemoteResponse> PollWriteRemoteAsync(
+      const RaidenId& dst_raiden_id, uint64_t operation_id,
+      int64_t wait_ms = 0);
 
   // Drops the cached client for `remote_id`, so the next call re-resolves the
   // peer through the registry instead of redialling the address it had.

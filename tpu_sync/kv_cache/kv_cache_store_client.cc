@@ -152,6 +152,7 @@ class WriteRemoteClientReactor
 
     if (event_.has_ack()) {
       ack_received_ = true;
+      operation_id_ = event_.ack().operation_id();
       ack_promise_.Set(event_.ack());
       if (event_.ack().exist_state() ==
           ::tpu_raiden::kv_cache::proto::WRITE_EXIST_STATE_UNSPECIFIED) {
@@ -187,8 +188,8 @@ class WriteRemoteClientReactor
     if (on_verdict_ && !initial_ack_failed) {
       CompletionExecutor::Schedule(
           [on_verdict = std::move(on_verdict_), rpc_status,
-           result = std::move(result)]() mutable {
-            on_verdict(rpc_status, std::move(result));
+           result = std::move(result), op_id = operation_id_]() mutable {
+            on_verdict(rpc_status, std::move(result), op_id);
           });
     }
 
@@ -200,6 +201,7 @@ class WriteRemoteClientReactor
   proto::WriteRemoteEvent event_;
   tsl::Promise<proto::WriteRemoteAck> ack_promise_;
   KVCacheStoreClient::WriteRemoteVerdictCallback on_verdict_;
+  uint64_t operation_id_ = 0;
   bool ack_received_ = false;
   bool has_result_ = false;
   proto::WriteRemoteResult result_;
@@ -269,7 +271,10 @@ KVCacheStoreClient::PollWriteRemote(uint64_t operation_id, int64_t wait_ms) {
   auto [promise, future] = tsl::MakePromise<
       ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse>();
   auto context = std::make_shared<grpc::ClientContext>();
-  context->set_deadline(std::chrono::system_clock::now() + kRpcDeadline);
+  const auto deadline_duration =
+      (wait_ms > 0) ? (std::chrono::milliseconds(wait_ms) + kRpcDeadline)
+                    : kRpcDeadline;
+  context->set_deadline(std::chrono::system_clock::now() + deadline_duration);
   auto response = std::make_shared<
       ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse>();
 

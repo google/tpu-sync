@@ -959,6 +959,27 @@ void KVCacheStoreServiceImpl::Finish(const std::shared_ptr<WriteOp>& op,
   });
 
   auto it = write_ops_.find(request->operation_id());
+  if (it != write_ops_.end() && request->wait_ms() > 0 &&
+      (it->second->state == OpState::kPending ||
+       it->second->state == OpState::kCompleting)) {
+    struct WaitArg {
+      KVCacheStoreServiceImpl* svc;
+      uint64_t id;
+    } arg{this, request->operation_id()};
+    write_mutex_.AwaitWithTimeout(
+        absl::Condition(
+            +[](WaitArg* a) {
+              a->svc->write_mutex_.AssertHeld();
+              auto found = a->svc->write_ops_.find(a->id);
+              if (found == a->svc->write_ops_.end()) return true;
+              return found->second->state != OpState::kPending &&
+                     found->second->state != OpState::kCompleting;
+            },
+            &arg),
+        absl::Milliseconds(request->wait_ms()));
+    it = write_ops_.find(request->operation_id());
+  }
+
   if (it == write_ops_.end()) {
     response->set_state(
         ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::UNKNOWN);

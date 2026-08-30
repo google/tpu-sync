@@ -52,8 +52,8 @@ class KVCacheStoreClient {
 
   using WriteRemoteVerdictCallback = std::function<void(
       absl::Status rpc_status,
-      std::optional<::tpu_raiden::kv_cache::proto::WriteRemoteResult> result)>;
-
+      std::optional<::tpu_raiden::kv_cache::proto::WriteRemoteResult> result,
+      uint64_t operation_id)>;
   // Asynchronous non-blocking WriteRemote RPC: offer `block_hashes` to the
   // peer this client is connected to -- the source side of KVCacheStore's
   // save to a destination. The peer decides, allocates landing

@@ -32,7 +32,7 @@ description = "High-bandwidth PJRT raw-transfer / KV-cache DMA engine for TPU (J
 dependencies = [
     "jax==0.11.0",
     "jaxlib==0.11.0",
-    "libtpu==0.0.44",
+    "libtpu==0.0.47",  # ahead of jax's [tpu] pin; first with the DmaMap fix
     "tpu-info==0.7.1",
     "numpy",
     "absl-py",

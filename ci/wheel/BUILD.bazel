@@ -56,7 +56,7 @@ COMMON_REQUIRES = [
 JAX_REQUIRES = COMMON_REQUIRES + [
     "jax==0.11.0",
     "jaxlib==0.11.0",
-    "libtpu==0.0.44",
+    "libtpu==0.0.47",
 ]
 
 TORCH_REQUIRES = COMMON_REQUIRES + TORCH_REQ

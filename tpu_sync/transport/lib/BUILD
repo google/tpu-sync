@@ -100,6 +100,7 @@ cc_library(
         "//tpu_sync/transport:buffer_push_task",
         "//tpu_sync/transport/lib/conn:pool",
         "//tpu_sync/transport/lib/socket:tcp_psp_helper",
+        "//tpu_sync/transport/lib/socket:util",
         "//tpu_sync/transport/peregrine/src/api:socket_util",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",

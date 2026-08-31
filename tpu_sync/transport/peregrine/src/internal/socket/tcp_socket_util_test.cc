@@ -25,7 +25,10 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/log/check.h"
+#include "absl/status/status.h"
 #include "absl/synchronization/notification.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/peregrine/src/internal/base/endpoint.h"
 #include "tpu_sync/transport/peregrine/src/internal/base/types.h"
@@ -155,6 +158,59 @@ TEST_F(TcpIPv6SocketUtilTest, BigData) {
 
   // Check that the server got the client's data.
   EXPECT_THAT(recv_buf, Pointwise(Eq(), send_buf));
+}
+
+TEST_F(TcpIPv4SocketUtilTest, SendReportsDeadlineExceededWhenPeerStopsReading) {
+  // A peer that accepts and then stops reading is the case SO_SNDTIMEO exists
+  // for. The connection stays open, so no FIN or RST ever arrives to fail the
+  // send; without a deadline this call blocks for as long as the peer lives.
+  constexpr int kSmallBufferBytes = 4 << 10;
+  ASSERT_EQ(setsockopt(listener_->fd().value(), SOL_SOCKET, SO_RCVBUF,
+                       &kSmallBufferBytes, sizeof(kSmallBufferBytes)),
+            0);
+  ASSERT_EQ(setsockopt(connector_->fd().value(), SOL_SOCKET, SO_SNDBUF,
+                       &kSmallBufferBytes, sizeof(kSmallBufferBytes)),
+            0);
+
+  absl::Notification server_ready;
+  absl::Notification client_done;
+  std::thread server([&]() {
+    CHECK(listener_->Listen(local_));
+    server_ready.Notify();
+    const fd_t new_fd = listener_->Accept();
+    CHECK_GE(new_fd.value(), 0);
+    auto new_socket = TcpSocket::Create(new_fd, AF_INET);
+    CHECK(new_socket->IsConnected());
+    // Hold the connection open without reading a byte of it.
+    client_done.WaitForNotification();
+  });
+
+  server_ready.WaitForNotification();
+  CHECK(connector_->Connect(local_));
+  ASSERT_TRUE(connector_->IsBlocking());
+
+  constexpr absl::Duration kSendTimeout = absl::Milliseconds(250);
+  const struct timeval tv = absl::ToTimeval(kSendTimeout);
+  ASSERT_EQ(setsockopt(connector_->fd().value(), SOL_SOCKET, SO_SNDTIMEO, &tv,
+                       sizeof(tv)),
+            0);
+
+  // Far more than the shrunk buffers plus anything in flight can absorb.
+  constexpr size_t kDataSize = 8UL << 20;
+  std::vector<Byte> send_buf(kDataSize, 0x01);
+
+  const absl::Time start = absl::Now();
+  const absl::Status status =
+      TcpSocketUtil::Send(connector_->fd(), send_buf.data(), kDataSize);
+  const absl::Duration elapsed = absl::Now() - start;
+
+  EXPECT_EQ(status.code(), absl::StatusCode::kDeadlineExceeded) << status;
+  // The point is that the call returns at all. The ceiling is loose so the
+  // test stays stable on a loaded machine.
+  EXPECT_LT(elapsed, absl::Seconds(60));
+
+  client_done.Notify();
+  server.join();
 }
 
 }  // namespace

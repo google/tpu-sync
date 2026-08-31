@@ -56,6 +56,11 @@ void BindTelemetryApi(nb::module_& m) {
                      return std::vector<double>(self.buckets.begin(),
                                                 self.buckets.end());
                    })
+      .def_prop_ro("label_names",
+                   [](const MetricMetadata& self) {
+                     return std::vector<std::string>(self.label_names.begin(),
+                                                     self.label_names.end());
+                   })
       .def("__repr__",
            [](const MetricMetadata& self) {
              std::string type_str;
@@ -72,10 +77,17 @@ void BindTelemetryApi(nb::module_& m) {
              }
              std::string buckets_str =
                  absl::StrCat("[", absl::StrJoin(self.buckets, ", "), "]");
+             std::string labels_str =
+                 self.label_names.empty()
+                     ? "[]"
+                     : absl::StrCat("['",
+                                    absl::StrJoin(self.label_names, "', '"),
+                                    "']");
              return absl::StrCat("MetricMetadata(name='", self.name,
                                  "', description='", self.description,
                                  "', type=", type_str,
-                                 ", buckets=", buckets_str, ")");
+                                 ", buckets=", buckets_str,
+                                 ", label_names=", labels_str, ")");
            })
       .def(nb::self == nb::self)
       .def(nb::self != nb::self);

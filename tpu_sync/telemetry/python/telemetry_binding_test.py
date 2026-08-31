@@ -167,6 +167,7 @@ class TelemetryBindingTest(absltest.TestCase):
     sent_bytes_meta = metrics[0]
     self.assertEqual(sent_bytes_meta.name, "sent_bytes_total")
     self.assertIn("sent", sent_bytes_meta.description.lower())
+    self.assertEqual(sent_bytes_meta.label_names, [])
     self.assertEqual(
         sent_bytes_meta.buckets,
         [
@@ -197,6 +198,7 @@ class TelemetryBindingTest(absltest.TestCase):
     repr_str = repr(sent_bytes_meta)
     self.assertIn("sent_bytes_total", repr_str)
     self.assertIn("MetricType.COUNTER", repr_str)
+    self.assertIn("label_names=[]", repr_str)
 
     # Test equality with same object / identical values
     self.assertEqual(sent_bytes_meta, metrics[0])
@@ -206,6 +208,18 @@ class TelemetryBindingTest(absltest.TestCase):
     self.assertIsNotNone(sent_bytes_meta)
     self.assertNotEqual(sent_bytes_meta, "sent_bytes_total")
     self.assertNotEqual(sent_bytes_meta, 42)
+
+    # Verify label names for all standard metrics
+    metrics_by_name = {m.name: m for m in metrics}
+    self.assertEqual(metrics_by_name["sent_bytes_total"].label_names, [])
+    self.assertEqual(metrics_by_name["received_bytes_total"].label_names, [])
+    self.assertEqual(
+        metrics_by_name["transfer_failures_total"].label_names, []
+    )
+    self.assertEqual(metrics_by_name["transfer_duration_ms"].label_names, [])
+    self.assertEqual(metrics_by_name["buffer_allocated_bytes"].label_names, [])
+    self.assertEqual(metrics_by_name["h2d_transfer_time_ms"].label_names, [])
+    self.assertEqual(metrics_by_name["d2h_transfer_time_ms"].label_names, [])
 
   def test_get_metric_metadata_empty_when_no_backends(self):
     telemetry_ext.configure_telemetry([])

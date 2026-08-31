@@ -63,6 +63,7 @@ struct MetricMetadata {
   absl::string_view description;
   MetricType type;
   absl::Span<const double> buckets = kDefaultHistogramBuckets;
+  absl::Span<const absl::string_view> label_names = {};
 
   // Enables compile-time member-wise value equality comparisons and test
   // assertions with zero runtime overhead.
@@ -164,6 +165,8 @@ inline constexpr absl::string_view kErrorCode = "error_code";
 struct MetricLabel {
   absl::string_view key;
   absl::string_view value;
+
+  auto operator<=>(const MetricLabel& other) const = default;
 };
 
 // Allocation-free label view span type definition

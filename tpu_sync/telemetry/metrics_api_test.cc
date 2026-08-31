@@ -116,6 +116,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kSentBytesTotal.description,
             "Total count of bytes sent over TPU Raiden interfaces.");
   EXPECT_EQ(metric_metadata::kSentBytesTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kSentBytesTotal.label_names, IsEmpty());
 
   // ReceivedBytesTotal
   EXPECT_EQ(metric_names::kReceivedBytesTotal, "received_bytes_total");
@@ -125,6 +126,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kReceivedBytesTotal.description,
             "Total count of bytes received over TPU Raiden interfaces.");
   EXPECT_EQ(metric_metadata::kReceivedBytesTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kReceivedBytesTotal.label_names, IsEmpty());
 
   // TransferFailuresTotal
   EXPECT_EQ(metric_names::kTransferFailuresTotal, "transfer_failures_total");
@@ -136,6 +138,9 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(
       metric_metadata::kTransferFailuresTotal.description,
       "Cumulative total count of transfer failures across all interfaces.");
+  EXPECT_EQ(metric_metadata::kTransferFailuresTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kTransferFailuresTotal.label_names, IsEmpty());
+
   // H2dTransferTimeMs
   EXPECT_EQ(metric_names::kH2dTransferTimeMs, "h2d_transfer_time_ms");
   EXPECT_EQ(metric_descriptions::kH2dTransferTimeMs,
@@ -144,6 +149,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kH2dTransferTimeMs.description,
             "Host-to-Device transfer latency in milliseconds.");
   EXPECT_EQ(metric_metadata::kH2dTransferTimeMs.type, MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kH2dTransferTimeMs.label_names, IsEmpty());
 
   // D2hTransferTimeMs
   EXPECT_EQ(metric_names::kD2hTransferTimeMs, "d2h_transfer_time_ms");
@@ -153,6 +159,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kD2hTransferTimeMs.description,
             "Device-to-Host transfer latency in milliseconds.");
   EXPECT_EQ(metric_metadata::kD2hTransferTimeMs.type, MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kD2hTransferTimeMs.label_names, IsEmpty());
 
   // TransferDurationMs
   EXPECT_EQ(metric_names::kTransferDurationMs, "transfer_duration_ms");
@@ -166,6 +173,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
       "Measures End-to-End (E2E) latency bound around the entire request in "
       "milliseconds, including setup delays.");
   EXPECT_EQ(metric_metadata::kTransferDurationMs.type, MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kTransferDurationMs.label_names, IsEmpty());
 
   // BufferAllocatedBytes
   EXPECT_EQ(metric_names::kBufferAllocatedBytes, "buffer_allocated_bytes");
@@ -180,6 +188,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
             "staging "
             "across all layers and shards.");
   EXPECT_EQ(metric_metadata::kBufferAllocatedBytes.type, MetricType::kGauge);
+  EXPECT_THAT(metric_metadata::kBufferAllocatedBytes.label_names, IsEmpty());
 
   // Direction Labels
   EXPECT_EQ(metric_labels::kDirection, "direction");

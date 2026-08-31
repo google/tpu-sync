@@ -118,11 +118,9 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   // --- Global Memory Pooling & RPC Methods ---
   // The peer-facing server this backend hosts, or nullptr until StartServer()
-  // succeeds (construction no longer pre-creates it -- with no registry, no
-  // server is started anywhere). Once started, the owning KVCacheStore adopts THIS
-  // server instead of standing up a second one -- a node must never serve
-  // peers from two ports. The override was lost when GlobalMemoryPoolingBackend
-  // was consolidated into this class.
+  // succeeds -- with no registry, no server is started anywhere. Once started,
+  // the owning KVCacheStore adopts THIS server instead of standing up a second
+  // one: a node must never serve peers from two ports.
   KVCacheStoreServer* store_server() const override;
 
   // Starts this backend's own server bound to `server_address`, which must be
@@ -139,17 +137,13 @@ class HostOffloadBackend : public KVCacheStoreBackend {
                      absl::Span<const int32_t> device_block_ids,
                      absl::Span<const RaidenBlockId> slices = {}) override;
 
-  // --- Remote write (WriteRemote), the transport under KVCacheStore::Save
-  // with a destination; see KVCacheStoreBackend for why each of these
-  // exists rather than reusing Lookup/Insert/Delete.
+  // --- Remote write, destination side. Helpers the service uses while a
+  // peer's offer lands here; see KVCacheStoreBackend for their contracts.
   std::vector<std::string> AlreadyPresentHostResident(
       absl::Span<const std::string> block_hashes) const override;
 
   bool InsertAllOrNothing(absl::Span<const std::string> block_hashes,
                           absl::Span<const RaidenBlockId> slices) override;
-
-  void RollbackInsert(absl::Span<const std::string> block_hashes,
-                      absl::Span<const int32_t> host_block_ids) override;
 
   tsl::Future<> RegisterBlocksAsync(
       absl::Span<const std::string> block_hashes,
@@ -160,39 +154,38 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   // --- Remote write, source side ------------------------------------------
   //
-  // The two halves of the source's role in the store's Save(dst) flow. The
-  // synchronous half offers blocks and comes back with the destination's
-  // decision; the polling half asks
-  // what became of an accepted offer. Neither owns the retry cadence or the
-  // pins -- KVCacheStore does, because it is what holds the blocks.
+  // BeginWriteRemote offers blocks; the verdict arrives later through
+  // on_verdict, on the same call. PollWriteRemoteAsync is recovery for a
+  // source that lost that call. KVCacheStore owns the pins.
 
   // What the destination decided, before any bytes have moved.
   struct RemoteWriteAck {
-    // Zero when the destination answered without starting a transfer, which
-    // is the case for both existence outcomes.
+    // Identifies the accepted operation. Zero when the destination answered
+    // from what it already holds and started no transfer.
     uint64_t operation_id = 0;
-    // Every offered hash was already there. A SUCCESS: content-addressed
-    // hashes mean the peer having them is the post-condition we wanted.
+    // Every offered hash was already there. A success; nothing to transfer.
     bool all_exist = false;
-    // Non-empty only when the destination held a strict subset. A FAILURE --
-    // the destination does not do partial writes -- and this is the list the
-    // caller needs to decide what, if anything, to re-offer.
+    // Set when the destination held some but not all hashes. A failure; the
+    // caller decides what to re-offer.
     std::vector<std::string> existing_hashes;
+    // The deadline the destination armed, clamped to its own cap. The source
+    // must protect the blocks at least this long.
     absl::Duration granted_deadline;
-    // Ends the call early. The source holds this for as long as it is
-    // protecting the blocks, and uses it when it stops -- see ~KVCacheStore.
+    // Ends the open call early; ~KVCacheStore uses it for abandoned offers.
     std::shared_ptr<WriteRemoteCancel> cancel;
   };
 
+  // Reports how the offer's call ended, once an ack has arrived; same shape
+  // as KVCacheStoreClient::WriteRemoteVerdictCallback.
   using WriteRemoteVerdictCallback = std::function<void(
       absl::Status rpc_status,
       std::optional<::tpu_raiden::kv_cache::proto::WriteRemoteResult> result,
       uint64_t operation_id)>;
-  // `requested_deadline` is how long the destination may hold its landing
-  // blocks; it grants at most this and at most its own cap, and reports what
-  // it actually armed. Blocking, on the caller's thread -- this is a control
-  // RPC that returns as soon as the destination has decided, not when the
-  // bytes have arrived.
+  // Offers `block_hashes` to `dst_raiden_id` and blocks until the ack (not
+  // the bytes). `requested_deadline` is how long the destination may hold
+  // its landing blocks; `hold_window` is the call's deadline. `on_verdict`
+  // runs when the call ends; if the call fails before any ack, the failure
+  // is the return status and on_verdict never runs.
   absl::StatusOr<RemoteWriteAck> BeginWriteRemote(
       const RaidenId& dst_raiden_id, absl::Span<const std::string> block_hashes,
       absl::Span<const int32_t> src_host_block_ids,
@@ -200,20 +193,16 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       absl::Duration hold_window,
       WriteRemoteVerdictCallback on_verdict = nullptr);
 
-  // Asks the destination what became of an accepted offer, without blocking:
-  // recovery for a source that lost its stream. `wait_ms > 0` asks the
-  // destination to hold the answer until the operation is terminal. The raw
-  // wire response is returned; KVCacheStore maps it where it maps the
-  // streamed result, so the two answers cannot drift apart.
+  // Asks the destination what became of an accepted offer; recovery for a
+  // source that lost its stream. `wait_ms > 0` asks it to hold the answer
+  // until the operation is terminal. Returns the raw wire response.
   tsl::Future<proto::PollWriteRemoteResponse> PollWriteRemoteAsync(
       const RaidenId& dst_raiden_id, uint64_t operation_id,
       int64_t wait_ms = 0);
 
-  // Drops the cached client for `remote_id`, so the next call re-resolves the
-  // peer through the registry instead of redialling the address it had.
-  // Without this a peer that restarts on a new port stays undialable for the
-  // life of THIS process, even after the registry has healed: store_clients_
-  // is a cache with no invalidation of its own.
+  // Drops the cached client for `remote_id`; the next call re-resolves the
+  // peer through the registry. store_clients_ never invalidates itself, so
+  // without this a peer that restarts on a new port would stay unreachable.
   void InvalidateStoreClient(const RaidenId& remote_id);
 
   // Composes the KVTransferSpec from the workers currently registered with

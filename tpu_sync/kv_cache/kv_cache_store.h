@@ -290,38 +290,17 @@ class KVCacheStore {
   // check is performed here.
   void Release(const std::vector<std::string>& block_hashes);
 
-  // Saves blocks, asynchronously. Source and destination depend on
-  // `dst_raiden_id`:
+  // Saves blocks asynchronously; results come back through PollSaveStatus().
+  // Without `dst_raiden_id`: local save, device HBM to host DRAM (blocks must
+  // be HBM-resident; one already on host is refused). With it: remote save,
+  // offer host-resident blocks to that peer, which pulls its own copy
+  // (the source needs a global registry to resolve the peer).
   //
-  //   absent  -- LOCAL save, device (HBM) to host (DRAM). Requires each block
-  //              to have status HBM here; one already host-resident
-  //              (HOST_AND_HBM) has nothing left to save and is refused.
-  //   present -- REMOTE save: offer the blocks to that peer, which takes its
-  //              own copy. Requires each block to be HOST-resident here
-  //              already, because the bytes are pulled out of host DRAM. There
-  //              is no two-hop: a block only in HBM must be saved locally
-  //              first.
+  // Pin contract: every hash must be pinned on entry. A successful save
+  // consumes that pin; a failed save leaves it with the caller.
   //
-  // Both kinds are polled with PollSaveStatus().
-  //
-  // PIN CONTRACT: every hash must be pinned on entry -- Lookup() grants that
-  // pin for a remote save, Insert() for a local one -- and a SUCCESSFUL save
-  // consumes exactly one pin per hash. The caller does not release afterwards.
-  // A FAILED save does not consume it: the entry stays pinned so the caller
-  // can retry or release deliberately.
-  //
-  // A remote save also takes a SEPARATE internal pin for as long as the
-  // destination may still be reading, released when the operation goes
-  // terminal or the HOLD expires. That one is not the caller's.
-  //
-  // A remote save requires a global registry at both ends: that is how the
-  // destination is resolved, and how the blocks become reachable once they
-  // land.
-  //
-  // IMPORTANT: a remote destination allocates landing blocks from FREE blocks
-  // only and never evicts to make room, so a peer with a warm cache refuses
-  // every offer with RESOURCE_EXHAUSTED. Destination-side eviction is
-  // separate, unimplemented work.
+  // Note: a destination allocates landing blocks from free space only and
+  // never evicts, so a peer with a full cache refuses every offer.
   absl::Status Save(const std::vector<std::string>& block_hashes,
                     const std::optional<RaidenId>& dst_raiden_id = std::nullopt);
 
@@ -413,33 +392,15 @@ class KVCacheStore {
     return raiden_controller_.get();
   }
 
-  // Polls the status of all active/inflight Save operations, local and remote.
-  // For local saves it iterates pending futures, updates cache metadata to
-  // HOST_AND_HBM on success and deallocates host blocks on failure; for remote
-  // saves it asks each destination for a verdict.
+  // Reports the status of all in-flight Save operations, local and remote.
+  // Drives pending local-save futures; remote verdicts arrive on their own
+  // calls and are only read here. Results are drained on read.
   //
-  // Returns {done, failed, pending, existing, unregistered}. The last two are
-  // annotations on REMOTE failures, not separate outcomes -- a hash in either
-  // also appears in `failed` -- and they exist because this store never
-  // decides on the caller's behalf:
-  //
-  //   existing:     the destination already held these, so it refused the
-  //                 batch. Reissuing with the remainder is the caller's call.
-  //   unregistered: the destination HAS these -- the transfer succeeded -- but
-  //                 could not publish them, so no peer can find them. Reported
-  //                 as failed because the safe default is for the caller to
-  //                 keep its own copy. A caller that only needed the peer to
-  //                 have the bytes may treat it as success; one that was about
-  //                 to free its copy must not.
-  //
-  // Both lists are empty for local saves.
-  //
-  // `pending` means different things on the two paths, and the difference is
-  // worth knowing before waiting on it: for a local save it is bounded by a
-  // DMA, for a remote one by the destination answering or the ~30s HOLD
-  // window elapsing.
-  //
-  // Terminal results are drained on read.
+  // `existing` and `unregistered` annotate remote failures; their hashes also
+  // appear in `failed`. `existing`: the destination already held these and
+  // refused the batch. `unregistered`: the bytes landed but were not published
+  // to the registry, so no peer can find them; the caller decides what that
+  // means for its own copy.
   struct PollSaveStatusResult {
     std::vector<std::string> done;
     std::vector<std::string> failed;
@@ -635,16 +596,17 @@ class KVCacheStore {
   // batches remain. Same single-caller contract as SweepOnce.
   bool RepublishOnce();
 
-  // What became of one offered batch, polled until every block is terminal.
+  // What became of one offered batch.
   struct BatchWriteResult {
     // Blocks the peer now holds; their local copies are safe to free.
     std::vector<std::string> freeable;
-    // Blocks whose offer settled without success, so the sweep's caller pin
-    // was not consumed and the sweep must release it itself.
+    // Blocks whose offer failed, so the sweep still holds their caller pin
+    // and must release it itself.
     std::vector<std::string> still_pinned;
-    // At least one block's transfer failed outright; its local copy stays.
+    // True when at least one transfer failed outright; those copies stay.
     bool transfer_failed = false;
   };
+  // Waits until every block in `batch` has a verdict. Sweep thread only.
   BatchWriteResult WaitForBatchWriteResult(
       const std::vector<std::string>& batch);
 
@@ -692,43 +654,40 @@ class KVCacheStore {
   // thing in the destructor, before anything its callbacks touch goes away.
   std::unique_ptr<StoreMonitor> store_monitor_;
 
-  // Who asked for a remote save, and therefore who its verdict is addressed
-  // to. Verdicts are drained on read, so a single shared queue lets either
-  // consumer take the other's mail: an application PollSaveStatus() would
-  // strand the evict sweep in WaitForBatchWriteResult, which waits for a
-  // verdict that has already been thrown away, and a sweep drain would
-  // silently swallow verdicts the application is waiting for.
-  //
-  // The owner rides on the state because it is known where the operation is
-  // created and unrecoverable everywhere it is needed -- a poller thread, a
-  // destructor. Keying a side table by operation_id would not do: the two
-  // paths that settle inside SaveRemote itself never record an operation at
-  // all, and for the sweep those are the common outcome, not the rare one.
+  // Who asked for a remote save: the application or the evict sweep. Each
+  // owner has its own verdict mailbox, so the two consumers cannot drain each
+  // other's results.
   enum class SaveOwner { kApplication, kSweep };
 
+  // Source-local id of one remote-write operation; the key of
+  // active_remote_writes_. Never sent on the wire.
   using OperationKey = uint64_t;
 
+  // One in-flight remote-write operation on the source side.
   struct RemoteWriteState {
+    // This store's own key for the operation; equals its
+    // active_remote_writes_ map key.
     OperationKey key = 0;
+    // The destination this offer was made to.
     RaidenId dst_raiden_id;
+    // The id the destination assigned in its ack; 0 until the ack arrives.
     uint64_t operation_id = 0;
+    // The offered hashes; each holds one internal pin until the operation
+    // settles.
     std::vector<std::string> block_hashes;
-    // Ends the call this offer was made on. Held for as long as this store is
-    // protecting the blocks, and used when it stops: a destination left
-    // holding an open call reserves its landing blocks for the rest of the
-    // hold window, waiting on a peer that has gone.
+    // Cancels the offer's call. The destructor uses it so a dead source does
+    // not leave the destination holding the call for the rest of the hold.
     std::shared_ptr<WriteRemoteCancel> cancel;
-    // When this source stops protecting the blocks and gives up, whatever the
-    // destination is doing. Must outlive the deadline the destination granted,
-    // or this store would unpin while the destination could still legitimately
-    // commit bytes read out of blocks it has released.
+    // When this source stops protecting the blocks. Extended if the
+    // destination grants a longer deadline, so the pin is never released
+    // while the destination may still be reading.
     absl::Time hold_expiry;
+    // Whose mailbox the verdict goes to.
     SaveOwner owner = SaveOwner::kApplication;
   };
 
   // One owner's mailbox of settled remote writes. `existing` and
-  // `unregistered` ANNOTATE entries that are also in `failed`; they do not
-  // replace them.
+  // `unregistered` annotate hashes that are also in `failed`.
   struct RemoteWriteVerdicts {
     std::vector<std::string> done;
     std::vector<std::string> failed;
@@ -749,13 +708,14 @@ class KVCacheStore {
   absl::flat_hash_map<tsl::Future<>, RemoteReadState, FutureHash, FutureEqual>
       active_remote_reads_ ABSL_GUARDED_BY(mutex_);
 
+  // In-flight remote-write operations, keyed by their source-local id.
   absl::flat_hash_map<OperationKey, RemoteWriteState> active_remote_writes_
       ABSL_GUARDED_BY(mutex_);
+  // Next OperationKey to hand out.
   OperationKey next_op_key_ ABSL_GUARDED_BY(mutex_) = 1;
 
-  // Addressed by owner, so the two consumers cannot take each other's mail.
-  // PollSaveStatus() drains the application's; the evict sweep drains its own
-  // through DrainSweepVerdicts().
+  // Per-owner verdict mailboxes: PollSaveStatus() drains the application's,
+  // DrainSweepVerdicts() the sweep's.
   RemoteWriteVerdicts application_remote_writes_ ABSL_GUARDED_BY(mutex_);
   RemoteWriteVerdicts sweep_remote_writes_ ABSL_GUARDED_BY(mutex_);
 
@@ -766,11 +726,8 @@ class KVCacheStore {
   std::vector<std::string> done_remote_reads_ ABSL_GUARDED_BY(mutex_);
   std::vector<std::string> failed_remote_reads_ ABSL_GUARDED_BY(mutex_);
 
-  // In-flight saves of BOTH kinds. Local and remote saves were tracked
-  // separately, which was safe only by accident: a local save requires the
-  // block in HBM and a remote one requires it in host DRAM, so the two sets
-  // could not overlap. One set makes that explicit and, more usefully, makes
-  // "already saving" mean it whichever kind is in flight.
+  // In-flight saves of both kinds, in one set: a hash counts as already
+  // saving whichever kind is in flight.
   absl::flat_hash_set<std::string> saving_hashes_ ABSL_GUARDED_BY(mutex_);
   absl::flat_hash_set<std::string> loading_hashes_ ABSL_GUARDED_BY(mutex_);
   // Peer -> its RaidenController address, as last resolved from the global
@@ -831,40 +788,26 @@ class KVCacheStore {
   }
 
  private:
-  // The two halves of Save(), split by destination. Save() validates nothing
-  // itself -- each half has its own residency and pin preconditions, and they
-  // are genuinely different operations sharing a name and a status queue.
+  // The local half of Save(): device HBM to host DRAM.
   absl::Status SaveLocal(const std::vector<std::string>& block_hashes);
-  // `owner` is deliberately not defaulted: both call sites state it. The bug
-  // this replaced was an unwritten assumption about who drains the verdict,
-  // and a default is how the next caller inherits that answer without ever
-  // deciding it.
+  // The remote half of Save(): offer `block_hashes` to `dst_raiden_id`.
+  // `owner` has no default so every call site decides who gets the verdict.
   absl::Status SaveRemote(const std::vector<std::string>& block_hashes,
                           const RaidenId& dst_raiden_id, SaveOwner owner);
 
-  // Atomically extracts an operation from active_remote_writes_ under mutex_.
-  // Whoever receives the state owns settling it; concurrent callers receive
-  // std::nullopt and do nothing.
+  // Atomically removes and returns one operation from active_remote_writes_.
+  // The caller that gets it settles it; concurrent callers get std::nullopt.
   std::optional<RemoteWriteState> TakeRemoteWrite(OperationKey key);
 
-  // Settles a taken operation by releasing internal pins and filing verdicts.
-  // Must NOT be called with mutex_ held.
+  // Settles a taken operation: releases the internal pin (and the caller's
+  // pin on success) and files the verdict. Must not be called with mutex_
+  // held.
   void OnWriteRemoteVerdict(RemoteWriteState state, bool succeeded,
                             std::vector<std::string> existing,
                             std::vector<std::string> unregistered = {});
 
-  // Releases this store's internal pin and clears saving_hashes_. Called once
-  // per operation, whichever way it ends.
-  void FinishRemoteWrite(const RemoteWriteState& state, bool succeeded,
-                         std::vector<std::string> existing,
-                         std::vector<std::string> unregistered = {}) {
-    OnWriteRemoteVerdict(state, succeeded, std::move(existing),
-                         std::move(unregistered));
-  }
-
-  // Takes the sweep's settled remote writes. Drives the pollers first for the
-  // same reason PollSaveStatus() does: on the monitor's thread nothing else
-  // moves an accepted offer to a verdict.
+  // Drains the sweep's verdict mailbox, waiting up to one second for it to
+  // be non-empty.
   RemoteWriteVerdicts DrainSweepVerdicts();
 
   void PollerLoop();

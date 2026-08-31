@@ -4170,14 +4170,9 @@ TEST_F(StoreDiscoveryTest, FailedLoadDropsTheCachedPeerClient) {
 // Remote write -- source side.
 // ===========================================================================
 
-// A destination that says whatever the test tells it to.
-//
-// The source's job is to turn each terminal verdict into the right thing for
-// its caller, and that is worth testing on its own. Driving a real destination
-// into a given verdict means arranging the destination's internal state --
-// which tests the destination, and reaches the source's handling only by
-// implication. STORED_UNREGISTERED is the clearest case: producing it for real
-// needs a registry that fails at one exact moment mid-transfer.
+// A fake destination that answers whatever the test tells it to, so each
+// verdict can be driven directly instead of by arranging a real
+// destination's internal state.
 class FakeDestinationService
     : public ::tpu_raiden::kv_cache::proto::KVCacheStoreService::CallbackService {
  public:
@@ -4422,8 +4417,8 @@ class FakeDestinationService
     std::erase(active_reactors_, reactor);
   }
 
-  // What the ACK says, as opposed to the later poll verdict. ALL_EXIST makes
-  // the offer settle synchronously inside Save, without a poller.
+  // What the ACK says, as opposed to the later result. ALL_EXIST makes the
+  // offer settle synchronously inside Save, with no result message.
   void SetWriteExistState(proto::WriteExistState state) {
     absl::MutexLock lock(mutex_);
     exist_state_ = state;
@@ -4498,10 +4493,8 @@ class RemoteWriteSourceTest : public StoreDiscoveryTest {
         /*raiden_controller_port=*/0);
   }
 
-  // A source with no registered workers has no data plane to be pulled from,
-  // and the destination refuses such an offer -- correctly, but it means every
-  // case below needs one. The worker is real (registration allocates buffers
-  // on it) but nothing here drives a transfer to completion through it.
+  // Registers one real worker so the source has a data plane to offer from;
+  // the destination refuses an offer without one.
   void RegisterWorker(KVCacheStore& store) {
     worker_server_ = ::tpu_raiden::controller::CreateTestWorkerServer();
     transfer_mock_ = std::make_unique<
@@ -4531,7 +4524,7 @@ class RemoteWriteSourceTest : public StoreDiscoveryTest {
     ASSERT_TRUE(store.Insert(hashes, slices, /*on_host=*/true).ok());
   }
 
-  // Drives the store's poller until the write leaves the pending set.
+  // Reads PollSaveStatus() until the write leaves the pending set.
   // Returns {done, failed, existing, unregistered}.
   std::tuple<std::vector<std::string>, std::vector<std::string>,
              std::vector<std::string>, std::vector<std::string>>
@@ -4619,9 +4612,8 @@ TEST_F(RemoteWriteSourceTest, RefusesToOfferBlocksItDoesNotHold) {
   EXPECT_TRUE(absl::IsNotFound(status)) << status.ToString();
 }
 
-// A remote save consumes one caller pin on success, so it has to require one
-// on entry -- the local branch always did. Without this the two halves of
-// Save() would have different pin contracts behind one name.
+// A remote save consumes one caller pin on success, so it requires one on
+// entry: both halves of Save() share one pin contract behind one name.
 TEST_F(RemoteWriteSourceTest, RefusesToOfferAnUnpinnedBlock) {
   RaidenId src{"rw_src_unpinned", "0", "kv", 0};
   auto store = MakeStore(src);
@@ -4636,10 +4628,8 @@ TEST_F(RemoteWriteSourceTest, RefusesToOfferAnUnpinnedBlock) {
               ::testing::HasSubstr("not pinned"));
 }
 
-// No two-hop: a remote save pulls the bytes out of host DRAM, so a block
-// that lives only in HBM must be saved locally first. Accepting it would
-// either transfer garbage or silently do the local save on the caller's
-// behalf; it refuses instead.
+// A remote save pulls bytes out of host DRAM, so a block that lives only in
+// HBM is refused; it must be saved locally first.
 TEST_F(RemoteWriteSourceTest, RefusesToOfferAnHbmOnlyBlock) {
   RaidenId src{"rw_src_hbm_only", "0", "kv", 0};
   auto store = MakeStore(src);
@@ -4663,8 +4653,8 @@ TEST_F(RemoteWriteSourceTest, RefusesToOfferToItself) {
   EXPECT_TRUE(absl::IsInvalidArgument(store->Save({"a"}, src)));
 }
 
-// The destination already had everything. A SUCCESS that moves no bytes and
-// never creates an operation to poll.
+// All-exist: the destination already had everything. A success that moves no
+// bytes and creates no operation.
 TEST_F(RemoteWriteSourceTest, AllExistSettlesDoneWithoutATransfer) {
   RaidenId src{"rw_src_allexist", "0", "kv", 0};
   RaidenId dst{"rw_dst_allexist", "0", "kv", 0};
@@ -4686,9 +4676,8 @@ TEST_F(RemoteWriteSourceTest, AllExistSettlesDoneWithoutATransfer) {
   EXPECT_TRUE(existing.empty());
 }
 
-// The destination held a strict subset. This is a FAILURE, the list reaches
-// the caller, and the store does NOT reissue with the difference -- that is
-// the caller's decision, and it needs the list to make it.
+// Partial-exist: the destination held a subset. Reported as a failure with
+// the list; the store does not reissue the difference on its own.
 TEST_F(RemoteWriteSourceTest, PartialExistIsReportedAndNotRetried) {
   RaidenId src{"rw_src_partial", "0", "kv", 0};
   RaidenId dst{"rw_dst_partial", "0", "kv", 0};
@@ -4712,12 +4701,10 @@ TEST_F(RemoteWriteSourceTest, PartialExistIsReportedAndNotRetried) {
   EXPECT_EQ(dst_store->backend()->GetSize(), 1);
 }
 
-// The full source loop: offer, get an operation id back, poll it to a verdict
-// through the store's own poller, and release the internal pin. The transfer
-// itself fails here (this destination has no workers registered), which is
-// the outcome under test -- what matters is that the source reaches a
-// terminal answer and lets go.
-TEST_F(RemoteWriteSourceTest, AnAcceptedOfferIsPolledToATerminalVerdict) {
+// The full source loop: offer, receive the verdict on the offer's own call,
+// and release the internal pin. The transfer fails here (no workers on the
+// destination); what matters is that the source settles and lets go.
+TEST_F(RemoteWriteSourceTest, AnAcceptedOfferSettlesOnATerminalVerdict) {
   RaidenId src{"rw_src_accept", "0", "kv", 0};
   RaidenId dst{"rw_dst_accept", "0", "kv", 0};
   auto src_store = MakeStore(src);
@@ -4738,8 +4725,7 @@ TEST_F(RemoteWriteSourceTest, AnAcceptedOfferIsPolledToATerminalVerdict) {
   AwaitWriteSettled(*src_store);
 }
 
-// Two offers of the same hash at once would send two sets of authoritative
-// block ids for one pin.
+// A hash already being offered cannot be offered again concurrently.
 TEST_F(RemoteWriteSourceTest, RefusesASecondConcurrentOfferOfTheSameHash) {
   RaidenId src{"rw_src_concurrent", "0", "kv", 0};
   RaidenId dst{"rw_dst_concurrent", "0", "kv", 0};
@@ -4756,13 +4742,9 @@ TEST_F(RemoteWriteSourceTest, RefusesASecondConcurrentOfferOfTheSameHash) {
   EXPECT_TRUE(absl::IsFailedPrecondition(second)) << second.ToString();
 }
 
-// The verdict this whole state exists for: the peer HAS the bytes but could
-// not publish them.
-//
-// The source must not report it as done -- done is what tells a caller it may
-// drop its own copy, and dropping it here moves the block from findable-here
-// to findable-nowhere. It must report failed AND hand over the list, so a
-// caller that only needed the peer to hold the bytes can decide otherwise.
+// STORED_UNREGISTERED (peer has the bytes but could not publish them) must
+// be reported as failed, with the list, so the caller does not drop a copy
+// that no peer can find.
 TEST_F(RemoteWriteSourceTest, StoredUnregisteredIsFailedAndNamesTheBlocks) {
   RaidenId src{"rw_src_unreg", "0", "kv", 0};
   RaidenId dst{"rw_dst_unreg", "0", "kv", 0};
@@ -4793,8 +4775,7 @@ TEST_F(RemoteWriteSourceTest, StoredUnregisteredIsFailedAndNamesTheBlocks) {
   AwaitWriteSettled(*src_store);
 }
 
-// The ordinary success, driven through the same seam so the two are directly
-// comparable: same offer, different verdict, opposite bucket.
+// A COMMITTED verdict is reported as done.
 TEST_F(RemoteWriteSourceTest, CommittedIsReportedAsDone) {
   RaidenId src{"rw_src_committed", "0", "kv", 0};
   RaidenId dst{"rw_dst_committed", "0", "kv", 0};
@@ -4818,10 +4799,8 @@ TEST_F(RemoteWriteSourceTest, CommittedIsReportedAsDone) {
   EXPECT_TRUE(existing.empty());
 }
 
-// A refusal is an application answer, not a channel failure: the peer is
-// alive on this exact connection, so the store client survives and the next
-// offer skips the registry resolve and the reconnect -- which would otherwise
-// land under the same memory pressure that caused the refusal.
+// A refusal is an application answer, not a channel failure: the cached
+// store client survives, so the next offer skips the resolve and reconnect.
 TEST_F(RemoteWriteSourceTest, ARefusalKeepsTheStoreClient) {
   RaidenId src{"rw_src_refusal", "0", "kv", 0};
   RaidenId dst{"rw_dst_refusal", "0", "kv", 0};
@@ -4850,9 +4829,8 @@ TEST_F(RemoteWriteSourceTest, ARefusalKeepsTheStoreClient) {
   AwaitWriteSettled(*src_store);
 }
 
-// A channel-level failure is the one case the store client must NOT
-// survive: the peer may be back under a new address, and only a fresh
-// resolve finds it.
+// A channel-level failure drops the cached store client: the peer may be
+// back under a new address, and only a fresh resolve finds it.
 TEST_F(RemoteWriteSourceTest, ATransportErrorInvalidatesTheStoreClient) {
   RaidenId src{"rw_src_transport", "0", "kv", 0};
   RaidenId dst{"rw_dst_transport", "0", "kv", 0};
@@ -4884,10 +4862,8 @@ TEST_F(RemoteWriteSourceTest, ATransportErrorInvalidatesTheStoreClient) {
   AwaitWriteSettled(*src_store);
 }
 
-// Aged out, or the destination restarted. Indistinguishable from "never
-// happened", so it must land as a plain failure with no annotations -- in
-// particular it must NOT be mistaken for the stored-but-unpublished case,
-// where the peer really does hold the data.
+// UNKNOWN (record aged out, or the destination restarted) lands as a plain
+// failure with no annotations.
 TEST_F(RemoteWriteSourceTest, UnknownIsReportedAsAPlainFailure) {
   RaidenId src{"rw_src_unknown", "0", "kv", 0};
   RaidenId dst{"rw_dst_unknown", "0", "kv", 0};
@@ -4908,9 +4884,8 @@ TEST_F(RemoteWriteSourceTest, UnknownIsReportedAsAPlainFailure) {
   EXPECT_TRUE(unregistered.empty());
 }
 
-// The deadline the source asks for is HOLD minus the margin, so the
-// destination's grant can never outlive the source's pin. Checked here because
-// the fake records what actually arrived on the wire.
+// The source asks for HOLD minus the margin, so the destination's grant
+// cannot outlive the source's pin.
 TEST_F(RemoteWriteSourceTest, TheOfferAsksForLessThanTheSourceWillHold) {
   RaidenId src{"rw_src_deadline", "0", "kv", 0};
   RaidenId dst{"rw_dst_deadline", "0", "kv", 0};
@@ -4933,7 +4908,8 @@ TEST_F(RemoteWriteSourceTest, TheOfferAsksForLessThanTheSourceWillHold) {
             absl::ToInt64Milliseconds(absl::Seconds(25)));
 }
 
-// Plan §12 Test 1: Destination commits -> source settles with ZERO PollWriteRemote calls.
+// A commit settles with zero PollWriteRemote calls: the verdict arrives on
+// the offer's own call.
 TEST_F(RemoteWriteSourceTest, DestinationCommitsSettlesWithZeroPollCalls) {
   RaidenId src{"rw_src_zero_poll", "0", "kv", 0};
   RaidenId dst{"rw_dst_zero_poll", "0", "kv", 0};
@@ -4957,7 +4933,8 @@ TEST_F(RemoteWriteSourceTest, DestinationCommitsSettlesWithZeroPollCalls) {
          "stream without any PollWriteRemote RPCs";
 }
 
-// Plan §12 Test 9: STORED_UNREGISTERED and PARTIAL_EXIST lists survive the streamed path byte-for-byte.
+// The STORED_UNREGISTERED and PARTIAL_EXIST hash lists survive the streamed
+// result byte-for-byte.
 TEST_F(RemoteWriteSourceTest,
        StoredUnregisteredAndPartialExistSurviveStreamByteForByte) {
   RaidenId src{"rw_src_unreg_stream", "0", "kv", 0};
@@ -4980,7 +4957,8 @@ TEST_F(RemoteWriteSourceTest,
   EXPECT_THAT(unregistered, ::testing::UnorderedElementsAre("x", "y"));
 }
 
-// Plan §12 Test 5: Stream broken mid-flight -> OnDone fires -> pin held; recovery call returns true verdict.
+// A stream broken mid-flight keeps the pin and recovers the true verdict
+// with one waiting PollWriteRemote, triggered by the break itself.
 TEST_F(RemoteWriteSourceTest, StreamBrokenMidFlightRecoversViaWaitingPoll) {
   RaidenId src{"rw_src_stream_break", "0", "kv", 0};
   RaidenId dst{"rw_dst_stream_break", "0", "kv", 0};
@@ -5018,7 +4996,8 @@ TEST_F(RemoteWriteSourceTest, StreamBrokenMidFlightRecoversViaWaitingPoll) {
       << "Recovery must issue exactly one PollWriteRemote call";
 }
 
-// Plan §12 Test 5b: Stream broken during teardown -> destructor's take wins; OnDone issues no recovery call.
+// A stream that breaks during teardown issues no recovery ask: the
+// destructor's take wins the operation, so the break finds nothing to act on.
 TEST_F(RemoteWriteSourceTest,
        StreamBrokenDuringTeardownDoesNotIssueRecoveryPoll) {
   RaidenId src{"rw_src_break_dtor", "0", "kv", 0};
@@ -5046,13 +5025,9 @@ TEST_F(RemoteWriteSourceTest,
       << "Teardown must not leave an orphaned recovery poll in flight";
 }
 
-// Polling a remote write means asking the destination, which cannot be done
-// holding the store's lock. Every public poll entry point drives that ask, and
-// so does the background loop, so several can be in it at once. If the poller
-// works off a copy of the active list rather than claiming entries, two of
-// them settle the same operation: the internal pin is released twice -- the
-// second release landing on whatever now owns that block -- and every hash is
-// reported to the caller twice.
+// Settling must claim the operation, not work off a copy: two settles of one
+// operation would release the internal pin twice and report every hash
+// twice.
 TEST_F(RemoteWriteSourceTest, ConcurrentPollsSettleAnOfferExactlyOnce) {
   RaidenId src{"rw_src_race", "0", "kv", 0};
   RaidenId dst{"rw_dst_race", "0", "kv", 0};
@@ -5068,10 +5043,8 @@ TEST_F(RemoteWriteSourceTest, ConcurrentPollsSettleAnOfferExactlyOnce) {
 
   ASSERT_TRUE(src_store->Save({"a", "b"}, dst).ok());
 
-  // PollSaveStatus both DRIVES the write poller and DRAINS its results, so
-  // every one of these threads can be the one that settles the offer and the
-  // one that collects it. They pool what they see: the invariant is that each
-  // hash appears exactly once across all of them, not once per caller.
+  // Each thread drains PollSaveStatus and pools what it sees. The invariant:
+  // every hash appears exactly once across all of them.
   absl::Mutex settled_mu;
   std::vector<std::string> settled;
   std::atomic<bool> stop{false};
@@ -5107,18 +5080,14 @@ TEST_F(RemoteWriteSourceTest, ConcurrentPollsSettleAnOfferExactlyOnce) {
 
   EXPECT_THAT(settled, ::testing::UnorderedElementsAre("a", "b"))
       << "the offer was settled more than once";
-  // A successful save consumes the caller's pin, and the internal pin goes
-  // with the operation, so both are spent. Note this count is NOT what detects
-  // a double settle -- Unpin clamps at zero, so surplus releases land on the
-  // same floor. The `settled` list above is the detector.
+  // Both pins are spent by the success. The double-settle detector is the
+  // `settled` list above, not this count: Unpin clamps at zero.
   EXPECT_EQ(src_store->GetPinCount("a"), 0);
   EXPECT_EQ(src_store->GetPinCount("b"), 0);
 }
 
 // A successful remote save consumes the caller's pin, exactly as a local one
-// does. Two pins are in play and they are not the same pin: the caller's, and
-// the internal one that protects the blocks while the destination may still be
-// pulling. Both are spent by a success; only the internal one by a failure.
+// does.
 TEST_F(RemoteWriteSourceTest, ASuccessfulRemoteSaveConsumesTheCallerPin) {
   RaidenId src{"rw_src_unpin_ok", "0", "kv", 0};
   RaidenId dst{"rw_dst_unpin_ok", "0", "kv", 0};
@@ -5140,9 +5109,8 @@ TEST_F(RemoteWriteSourceTest, ASuccessfulRemoteSaveConsumesTheCallerPin) {
       << "a successful remote save must consume the caller's pin";
 }
 
-// A FAILED remote save must not. Retrying, or giving up, is the caller's
-// decision, and an entry silently unpinned under a retry is evictable while
-// the caller still believes it holds it.
+// A failed remote save keeps the caller's pin; retrying or releasing is the
+// caller's decision.
 TEST_F(RemoteWriteSourceTest, AFailedRemoteSaveKeepsTheCallerPin) {
   RaidenId src{"rw_src_unpin_fail", "0", "kv", 0};
   RaidenId dst{"rw_dst_unpin_fail", "0", "kv", 0};
@@ -5162,9 +5130,8 @@ TEST_F(RemoteWriteSourceTest, AFailedRemoteSaveKeepsTheCallerPin) {
       << "a failed remote save must leave the caller's pin alone";
 }
 
-// The all-exist path settles SYNCHRONOUSLY inside Save and never reaches a
-// poller, so an auto-unpin written into the poller would leak the caller's pin
-// on every batch the destination already held. This is that path.
+// The all-exist path settles synchronously inside Save with no verdict
+// message, and still consumes the caller's pin.
 TEST_F(RemoteWriteSourceTest, AnAllExistRemoteSaveConsumesTheCallerPinToo) {
   RaidenId src{"rw_src_unpin_allexist", "0", "kv", 0};
   RaidenId dst{"rw_dst_unpin_allexist", "0", "kv", 0};
@@ -5186,10 +5153,8 @@ TEST_F(RemoteWriteSourceTest, AnAllExistRemoteSaveConsumesTheCallerPinToo) {
   EXPECT_TRUE(pending.empty());
 }
 
-// A store destroyed with an offer still outstanding must not leave its
-// internal pin behind. Backends are shared_ptrs and can outlive the store that
-// pinned into them, and nothing else knows to release that pin -- the block
-// would sit unreclaimable for the life of the backend.
+// A store destroyed with an offer outstanding releases its internal pin: the
+// backend can outlive the store, and nothing else would release it.
 TEST_F(RemoteWriteSourceTest, DestroyingAStoreMidOfferReleasesItsInternalPin) {
   RaidenId src{"rw_src_dtor_pin", "0", "kv", 0};
   RaidenId dst{"rw_dst_dtor_pin", "0", "kv", 0};
@@ -5214,9 +5179,8 @@ TEST_F(RemoteWriteSourceTest, DestroyingAStoreMidOfferReleasesItsInternalPin) {
       << "the offer's internal pin outlived the store that took it";
 }
 
-// The same drain must not WAIT for those offers. An offer goes terminal only
-// when the destination answers or the ~30s HOLD expires, so waiting would turn
-// destroying a store behind a dead peer into a half-minute stall.
+// Destruction must not wait for outstanding offers: that could stall ~30s
+// behind a dead peer.
 TEST_F(RemoteWriteSourceTest, DestroyingAStoreMidOfferDoesNotWaitForTheHold) {
   RaidenId src{"rw_src_dtor_fast", "0", "kv", 0};
   RaidenId dst{"rw_dst_dtor_fast", "0", "kv", 0};
@@ -5244,12 +5208,9 @@ TEST_F(RemoteWriteSourceTest, DestroyingAStoreMidOfferDoesNotWaitForTheHold) {
       << "destruction blocked on the remote write's hold window";
 }
 
-// An offer whose BeginWriteRemote RPC fails with DEADLINE_EXCEEDED before any
-// ack releases its internal pin right there. The only deadline on the offer
-// call is the hold window itself, so by the time it fires the promised hold
-// has fully elapsed -- keeping the pin would protect nothing, and (as an
-// earlier revision demonstrated) nothing ever settles an operation that never
-// got an ack: the pin and the record would leak until the store died.
+// An offer that dies with DEADLINE_EXCEEDED before any ack releases its pin
+// and record right there; no settle path ever fires for an ack-less
+// operation, so a kept pin would leak.
 TEST_F(RemoteWriteSourceTest, AckDeadlineReleasesThePinAndTheRecord) {
   RaidenId src{"rw_src_ack_fail", "0", "kv", 0};
   RaidenId dst{"rw_dst_ack_fail", "0", "kv", 0};
@@ -5279,14 +5240,9 @@ TEST_F(RemoteWriteSourceTest, AckDeadlineReleasesThePinAndTheRecord) {
   AwaitWriteSettled(*src_store);
 }
 
-// The failed offer released the blocks while the destination may in fact have
-// started pulling them -- the KNOWN GAP (review finding S5) stated in
-// SaveRemote. This test pins the CONTRACT chosen there: a lost answer undoes
-// the offer completely (pin back to what it was, nothing outstanding, no
-// verdict filed) so the sweep can re-offer to the next target immediately.
-// Holding instead would freeze a batch for the whole HOLD every time a peer is
-// merely down, which is the common case and indistinguishable at the status
-// code. See the comment in SaveRemote.
+// A lost answer undoes the offer completely (pin restored, nothing
+// outstanding, no verdict filed), so the sweep can re-offer to the next
+// target right away. This pins the KNOWN GAP contract stated in SaveRemote.
 TEST_F(RemoteWriteSourceTest, ALostAnswerUndoesTheOfferAndAllowsARetry) {
   RaidenId src{"rw_src_lost_ack", "0", "kv", 0};
   RaidenId dst{"rw_dst_lost_ack", "0", "kv", 0};
@@ -5321,10 +5277,8 @@ TEST_F(RemoteWriteSourceTest, ALostAnswerUndoesTheOfferAndAllowsARetry) {
   AwaitWriteSettled(*src_store);
 }
 
-// Sets RAIDEN_REMOTE_WRITE_HOLD_S for one test and puts it back. The HOLD is
-// 30 seconds by default, which is the right number in production and far too
-// long to wait for in a test -- and it is the clock the two cases below are
-// about.
+// Sets RAIDEN_REMOTE_WRITE_HOLD_S for one test and restores it after: the
+// default 30s HOLD is too long to wait for in a test.
 class ScopedRemoteWriteHold {
  public:
   explicit ScopedRemoteWriteHold(const char* seconds) {
@@ -5348,17 +5302,10 @@ class ScopedRemoteWriteHold {
   std::string previous_;
 };
 
-// The one case the source cannot check for itself. The destination is supposed
-// to grant a deadline SHORTER than this source's HOLD -- it clamps to its own
-// cap to make sure -- but the two numbers live in different processes and
-// either can be moved by an environment variable. If the grant wins, the call
-// carrying the offer still dies at the HOLD, and treating that as the end of
-// the operation hands the blocks back while the destination is still entitled
-// to be pulling from them.
-//
-// So the clock that decides is the store's own hold_expiry, which the ack
-// extends to cover the grant -- not the call's deadline, which cannot be moved
-// once the call is made.
+// If the destination grants a deadline LONGER than the source's HOLD, the
+// call still dies at the HOLD -- but the blocks must stay protected for the
+// grant. The deciding clock is hold_expiry, which the ack extends, not the
+// call's fixed deadline.
 TEST_F(RemoteWriteSourceTest, AGrantPastTheHoldKeepsTheBlocksForTheGrant) {
   ScopedRemoteWriteHold hold("6");
   RaidenId src{"rw_src_grant", "0", "kv", 0};
@@ -5367,10 +5314,8 @@ TEST_F(RemoteWriteSourceTest, AGrantPastTheHoldKeepsTheBlocksForTheGrant) {
   Populate(*src_store, src, {"a"});
   StartFakeDestination(dst);
 
-  // Granted far past the six-second HOLD, and then silent: no result on the
-  // stream, so the call dies of its own deadline with the operation still
-  // live on the destination. The fake's poll parks while its response is
-  // unset, exactly like a destination whose transfer is still running.
+  // Grant far past the six-second HOLD, then stay silent: the call dies at
+  // its own deadline with the operation still live on the destination.
   fake_destination_.SetGrantedDeadlineMs(20000);
 
   ASSERT_TRUE(src_store->Save({"a"}, dst).ok());
@@ -5399,11 +5344,8 @@ TEST_F(RemoteWriteSourceTest, AGrantPastTheHoldKeepsTheBlocksForTheGrant) {
   EXPECT_TRUE(failed.empty());
 }
 
-// The ordinary end of a remote write nobody answers: the HOLD runs out, the
-// source stops protecting the blocks and reports the batch failed. Safe only
-// because the destination refuses to commit anything it could not claim
-// inside its own, shorter deadline -- which is why the case above, where that
-// ordering inverts, has to be handled differently.
+// The ordinary end of an unanswered offer: the HOLD runs out, the source
+// releases the pin and reports the batch failed, and asks nothing.
 TEST_F(RemoteWriteSourceTest, AHoldThatRunsOutReleasesThePinAndFailsTheBatch) {
   ScopedRemoteWriteHold hold("6");
   RaidenId src{"rw_src_holdout", "0", "kv", 0};
@@ -5426,15 +5368,9 @@ TEST_F(RemoteWriteSourceTest, AHoldThatRunsOutReleasesThePinAndFailsTheBatch) {
       << "nothing should have been asked: the hold was over";
 }
 
-// What the DESTINATION is left with when a source goes away. The call an
-// offer was made on is what reserves the peer's landing blocks: it holds them
-// until it can answer, and an answer is what the source is no longer there to
-// receive. Left alone, that reservation stands for the rest of the hold
-// window -- on a peer whose whole reason for accepting the offer was that it
-// had space to spare.
-//
-// So teardown ends the calls it is abandoning. It does not wait for them:
-// cancelling is for the peer's benefit, not this store's.
+// Teardown cancels the calls it abandons (without waiting for them), so the
+// destination is not left holding a call nobody will answer for the rest of
+// the hold window.
 TEST_F(RemoteWriteSourceTest, TeardownEndsTheCallsItAbandons) {
   ScopedRemoteWriteHold hold("6");
   RaidenId src{"rw_src_cancel", "0", "kv", 0};
@@ -5459,12 +5395,8 @@ TEST_F(RemoteWriteSourceTest, TeardownEndsTheCallsItAbandons) {
          "with it, for a source that no longer exists";
 }
 
-// The recovery ask does not own a thread while it waits. It asks the
-// destination to hold the answer for what is left of the HOLD -- most of half
-// a minute -- and a store must be destructible during that, without the pin
-// being left behind. This is what the ask being asynchronous buys; a blocking
-// one parks a completion thread AND holds the lifetime fence ~KVCacheStore
-// takes, so teardown would wait out the peer.
+// The recovery ask is asynchronous, so a store can be destroyed while the
+// destination sits on the ask, and the internal pin is still released.
 TEST_F(RemoteWriteSourceTest, TeardownDoesNotWaitForARecoveryAskToBeAnswered) {
   RaidenId src{"rw_src_recover_async", "0", "kv", 0};
   RaidenId dst{"rw_dst_recover_async", "0", "kv", 0};
@@ -5812,10 +5744,9 @@ TEST_F(EvictSweepTest, AnApplicationPollNeitherSeesNorStealsSweepVerdicts) {
   EXPECT_THAT(existing, ::testing::IsEmpty());
   EXPECT_THAT(unregistered, ::testing::IsEmpty());
 
-  // Now poll hard while the verdict actually lands. PollSaveStatus() DRIVES
-  // the write poller as well as draining it, so this thread is very likely to
-  // be the one that settles the sweep's offer -- and it must still file the
-  // verdict under the sweep rather than hand it back here.
+  // Now poll hard while the verdict actually lands, so the application's
+  // drain races the sweep's -- the verdict must still be filed under the
+  // sweep rather than handed back here.
   std::atomic<bool> stop{false};
   absl::Mutex seen_mu;
   std::vector<std::string> seen;
@@ -5855,7 +5786,7 @@ TEST_F(EvictSweepTest, TheSweepDoesNotSwallowAnApplicationVerdict) {
   StartFakeDestination(dst, "appverdictgroup", /*evict_tier=*/1);
   // ALL_EXIST settles an offer synchronously inside Save, so the
   // application's verdict is in its mailbox before the sweep ever runs and
-  // the test does not race the poller.
+  // the test does not race the verdict delivery.
   fake_destination_.SetWriteExistState(proto::WRITE_ALL_EXIST);
 
   // Two blocks, still under the low watermark for free blocks (6 of 8 free),

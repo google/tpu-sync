@@ -45,17 +45,9 @@ struct WriteRemoteReactorGate;
 class KVCacheStoreServiceImpl
     : public ::tpu_raiden::kv_cache::proto::KVCacheStoreService::CallbackService {
  public:
-  // A stand-in for the pull, used ONLY by tests. Production calls
-  // controller_->TransferBuffers directly and never touches this.
-  //
-  // It exists because everything that makes a remote write correct happens
-  // between "the pull was issued" and "the bytes arrived": the commit claim, a
-  // deadline firing mid-transfer, the deferred free, teardown with an
-  // operation outstanding. Testing any of those means holding a transfer
-  // suspended and choosing the moment it resolves. The real call cannot do
-  // that -- RaidenController is concrete with no virtual methods, and its
-  // future resolves on its own schedule -- so a test supplies a future backed
-  // by a promise it sets by hand.
+  // A stand-in for the pull. Tests only; production always calls
+  // controller_->TransferBuffers. Lets a test hold a transfer open and
+  // choose when it resolves.
   using TransferFn = std::function<tsl::Future<>(absl::Span<const Buffer>,
                                                  absl::Span<const Buffer>)>;
 
@@ -68,40 +60,34 @@ class KVCacheStoreServiceImpl
       const ::tpu_raiden::kv_cache::proto::FetchRequest* request,
       ::tpu_raiden::kv_cache::proto::FetchResponse* response) override;
 
-  // Accepts an offer of blocks from a peer -- the destination side of that
-  // peer's save(dst): decides whether the write is worth doing, allocates
-  // landing blocks, issues the pull, and answers with an operation id. Streams
-  // back the result upon terminal completion.
+  // The destination side of a peer's save(dst). Applies the existence rule,
+  // allocates landing blocks, issues the pull, and acks without waiting for
+  // the bytes. When the operation goes terminal, writes the result on the
+  // same call and closes it.
   ::grpc::ServerWriteReactor<::tpu_raiden::kv_cache::proto::WriteRemoteEvent>*
   WriteRemote(
       ::grpc::CallbackServerContext* context,
       const ::tpu_raiden::kv_cache::proto::WriteRemoteRequest* request) override;
 
-  // Reports what became of an accepted operation. UNKNOWN once the record has
-  // aged out, which the source cannot distinguish from "never happened" and
-  // must treat as failure.
+  // Reports the state of an accepted operation; recovery for a source that
+  // lost its WriteRemote call. `wait_ms > 0` holds the answer (capped by
+  // MaxPollWait()) until the operation is terminal. UNKNOWN = no record.
   ::grpc::ServerUnaryReactor* PollWriteRemote(
       ::grpc::CallbackServerContext* context,
       const ::tpu_raiden::kv_cache::proto::PollWriteRemoteRequest* request,
       ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse* response)
       override;
 
-  // Diverts the pull through `transfer_fn` instead of the controller. TESTS
-  // ONLY, and only before the server serves: the member is not mutex-guarded,
-  // so setting it on a live service races with in-flight handlers. The
-  // CHECK-fail on a non-empty operation map catches only the obvious half of
-  // that.
+  // Replaces the pull with `transfer_fn`. Tests only; set it before the
+  // server serves, because the member is not mutex-guarded.
   void SetTransferFnForTesting(TransferFn transfer_fn);
 
   // Stops the deadline thread firing deadlines, without stopping the thread.
-  // Exists so a test can show that a late transfer is refused by the wall-clock
-  // check in the claim itself, rather than only because the deadline thread
-  // happened to run first. That distinction is the whole point of the
-  // wall-clock term: a descheduled or wedged deadline thread must not be able
-  // to let a commit through after the source has released its pin.
+  // Tests only; lets a test show that the commit claim checks the wall clock
+  // itself.
   void PauseDeadlineFiringForTesting();
 
-  // Returns the count of tracked operations in write_ops_. TESTS ONLY.
+  // Number of tracked operations in write_ops_. Tests only.
   size_t InFlightWriteOpsCountForTesting() const;
 
  private:
@@ -112,101 +98,92 @@ class KVCacheStoreServiceImpl
   // back.
   void WithdrawEntryIfUnbacked(const std::string& hash);
 
-  // A transfer-completion callback and the deadline thread both outlive the
-  // call that started them, so neither may capture `this`. Both hold `mu` for
-  // as long as they touch the service; the destructor clears `svc` under `mu`,
-  // so teardown either happens first (and the callback then does nothing) or
-  // waits for the callback to finish.
+  // Keeps late callbacks away from a destroyed service. A callback holds `mu`
+  // and checks `svc` while it runs; the destructor clears `svc` under `mu`,
+  // so it either runs first or waits for the callback to finish.
   struct Lifetime {
     absl::Mutex mu;
     KVCacheStoreServiceImpl* svc ABSL_GUARDED_BY(mu) = nullptr;
   };
 
-  // The destination's own state machine. COMPLETING has no wire
-  // representation on purpose: it means "claimed, and being finished right
-  // now", which to the source is indistinguishable from PENDING. Keeping it
-  // out of the proto stops it becoming a state a peer can reason about.
+  // The destination's state machine for one operation. kCompleting has no
+  // wire form: to the source it looks the same as PENDING.
   enum class OpState {
+    // Accepted; the pull is running.
     kPending,
+    // Claimed by a finished transfer; being committed right now.
     kCompleting,
+    // Inserted and registered globally. Success.
     kCommitted,
+    // Every hash was already here. Success.
     kAllExist,
+    // Some hashes were already here. Failure.
     kPartialExist,
+    // The transfer failed, or finished past the deadline.
     kFailed,
-    // Inserted here, but not published to the registry. See
-    // PollWriteRemoteResponse::STORED_UNREGISTERED -- the source decides what
-    // to do about it, because only the source knows whether it was going to
-    // free its copy.
+    // Inserted here, but not published to the registry. The source decides
+    // what to do; see PollWriteRemoteResponse::STORED_UNREGISTERED.
     kStoredUnregistered,
   };
 
+  // Maps an OpState to its wire state. kCompleting reports PENDING.
   static ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::State
   ToWireState(OpState state);
 
+  // One accepted offer, tracked until its record expires.
   struct WriteOp {
-    uint64_t id = 0;
+    // Current state; terminal transitions go through MarkTerminal.
     OpState state = OpState::kPending;
+    // The offered hashes.
     std::vector<std::string> block_hashes;
+    // Host blocks allocated here for the pull to land in.
     std::vector<int32_t> landing_block_ids;
     // Populated only for PARTIAL_EXIST.
     std::vector<std::string> existing_hashes;
     // Populated only for STORED_UNREGISTERED.
     std::vector<std::string> unregistered_hashes;
 
+    // When the offer was accepted.
     absl::Time accepted_at;
-    // Wall clock, not a timer reading: the commit check compares against this
-    // directly so that commit safety does not depend on the deadline thread
-    // having been scheduled.
+    // Last moment a finished transfer may commit. The commit claim checks
+    // the wall clock against this directly.
     absl::Time deadline;
-    // deadline + margin. Derived rather than a separate retention constant --
-    // see the comment on kRecordMargin.
+    // When the record may be collected: deadline + kRecordMargin.
     absl::Time expires_at;
+    // The deadline granted to this operation.
     absl::Duration granted_deadline;
 
-    // The landing blocks return to the pool exactly once, from whichever path
-    // reaches them first. COMMITTED and STORED_UNREGISTERED never release
-    // them -- the cache owns the blocks then, and they are marked released so
-    // no later path frees them out from under it.
+    // True once the landing blocks were freed, or the cache kept them. Stops
+    // a second path freeing them again.
     bool blocks_released = false;
-    // When to next log a warning that a free is still deferred; only
-    // meaningful while blocks are outstanding.
+    // When to next warn that the landing blocks are still held.
     absl::Time next_leak_warning = absl::InfiniteFuture();
 
-    // The way to the reactor streaming WriteRemoteEvent back to the source.
-    // A sender claims it (moves it out) under write_mutex_, then locks the
-    // gate to reach the reactor -- which may already be gone: the reactor
-    // nulls itself in the gate before self-deleting. See the gate's
-    // definition for why the raw pointer must never be copied out instead.
+    // Path to the reactor that streams events back to the source. A sender
+    // moves it out under write_mutex_, then locks the gate to reach the
+    // reactor; see the gate's definition.
     std::shared_ptr<WriteRemoteReactorGate> reactor_gate;
 
-    // Resolves once the operation is terminal AND its blocks are settled.
-    // Teardown waits on these rather than on the raw transfer futures: Await()
-    // on a future does not order with its own OnReady continuation.
-    tsl::Future<> settled;
-    tsl::Promise<> settled_promise;
+    // True once the operation is terminal and its blocks are settled.
+    // Teardown waits on this flag, not on transfer futures.
     bool settle_done = false;
   };
 
-  // Runs when a transfer resolves. Static, taking the lifetime handle, so it
-  // cannot accidentally capture `this`.
+  // Runs when a transfer resolves. Static so it cannot capture `this`.
   static void OnTransferComplete(std::shared_ptr<Lifetime> lifetime,
                                  uint64_t op_id, absl::Status transfer_status);
 
-  // A publish that CompleteWriteRemote started and could not finish inline.
-  // `future` resolves when the registry answers; `op` is the operation waiting
-  // on it.
+  // A registry publish still in flight. `future` resolves when the registry
+  // answers; `op` is the operation waiting on it.
   struct PendingPublish {
     tsl::Future<> future;
     std::shared_ptr<WriteOp> op;
   };
 
-  // Returns a PendingPublish when the operation reached the registry and the
-  // answer has not arrived yet. The continuation is deliberately NOT attached
-  // here: this runs with `lifetime_->mu` held, and Future::OnReady on an
-  // already-resolved future runs inline on the calling thread, so attaching
-  // here would re-enter that non-reentrant mutex. A backend with no registry
-  // configured returns an already-resolved future, so that is the common case,
-  // not a rare race.
+  // Handles a finished transfer: claims the operation, re-checks existence,
+  // inserts, and starts the registry publish. Returns a PendingPublish when
+  // the registry has not answered yet; the caller attaches the continuation,
+  // because this runs with lifetime_->mu held and OnReady can run inline.
   std::optional<PendingPublish> CompleteWriteRemote(uint64_t op_id,
                                                     absl::Status
                                                         transfer_status);
@@ -215,50 +192,61 @@ class KVCacheStoreServiceImpl
   void FinishPublish(const std::shared_ptr<WriteOp>& op, uint64_t op_id,
                      absl::Status registered);
 
-  // Funnels all terminal state transitions under write_mutex_. Sets the state,
-  // populates existing / unregistered hashes, and marks blocks_released if kept
-  // by cache. Must BE called with write_mutex_ held.
+  // The one place an operation goes terminal. Sets the state, fills the hash
+  // lists, and marks blocks_released when the cache keeps the blocks.
   void MarkTerminal(const std::shared_ptr<WriteOp>& op, OpState state,
                     std::vector<std::string> existing)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(write_mutex_);
 
-  // Records an operation's verdict, releases its landing blocks when the cache
-  // did not keep them, and settles it. Must NOT be called with write_mutex_
-  // held.
+  // Marks the operation terminal, sends the result to the source, releases
+  // the landing blocks if the cache did not keep them, and settles. Must not
+  // be called with write_mutex_ held.
   void Finish(const std::shared_ptr<WriteOp>& op, OpState state,
               std::vector<std::string> existing);
 
-  // Wakes at the earliest interesting time across all operations: a deadline
-  // to fire, or a deferred free to complain about. One joined thread, never
-  // one per operation.
+  // One thread that sleeps until the next deadline, leak warning, or expired
+  // record. Fires deadlines and collects settled records.
   void DeadlineLoop();
 
-  // Marks the blocks free exactly once and returns them to the pool. Must NOT
-  // be called with write_mutex_ held.
+  // Returns the landing blocks to the pool, exactly once. Must not be called
+  // with write_mutex_ held.
   void ReleaseLandingBlocks(const std::shared_ptr<WriteOp>& op);
 
+  // Marks the operation settled, so teardown can stop waiting for it.
   void Settle(const std::shared_ptr<WriteOp>& op);
 
+  // Looks up an operation by id; nullptr when the record is gone.
   std::shared_ptr<WriteOp> FindOp(uint64_t op_id)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(write_mutex_);
+
+  // Builds the result message from the operation's terminal state.
   static proto::WriteRemoteEvent MakeResultEvent(
       const std::shared_ptr<WriteOp>& op);
 
   KVCacheStoreBackend* const backend_ = nullptr;
   tpu_raiden::controller::RaidenController* const controller_ = nullptr;
 
+  // Test-only pull override; see SetTransferFnForTesting.
   TransferFn transfer_fn_override_;
 
+  // Fence between this service and callbacks that outlive a call.
   std::shared_ptr<Lifetime> lifetime_;
 
+  // Guards write_ops_ and everything reached through it.
   mutable absl::Mutex write_mutex_;
+  // Live and recently settled operations, keyed by operation id.
   absl::flat_hash_map<uint64_t, std::shared_ptr<WriteOp>> write_ops_
       ABSL_GUARDED_BY(write_mutex_);
+  // Generates operation ids.
   absl::BitGen op_id_rng_ ABSL_GUARDED_BY(write_mutex_);
+  // Tells DeadlineLoop to exit.
   bool stop_deadline_thread_ ABSL_GUARDED_BY(write_mutex_) = false;
+  // Tests only; see PauseDeadlineFiringForTesting.
   bool deadline_firing_paused_for_testing_ ABSL_GUARDED_BY(write_mutex_) =
       false;
+  // Wakes DeadlineLoop early: a new operation, a terminal one, or shutdown.
   absl::CondVar deadline_cv_;
+  // Runs DeadlineLoop.
   std::unique_ptr<std::thread> deadline_thread_;
 };
 

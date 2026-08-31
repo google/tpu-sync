@@ -563,10 +563,8 @@ TEST_F(KVCacheStoreServiceTest, FetchWithUnmatchedNodeIdFails) {
 // Remote write -- the destination state machine.
 // ===========================================================================
 
-// Holds a transfer pending until the test says otherwise. RaidenController has
-// no virtual methods, so without the service's transfer seam there is no way
-// to observe a destination between "issued the pull" and "the bytes arrived",
-// which is where every race in this design lives.
+// Holds a transfer pending until the test releases it, so a test can observe
+// the destination between "pull issued" and "bytes arrived".
 class TransferLatch {
  public:
   tsl::Future<> Issue() {
@@ -703,8 +701,7 @@ TEST_F(WriteRemoteTest, RejectsAnEmptyOffer) {
   EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
-// Only once a transfer is actually going to happen. An offer the destination
-// can answer from what it already holds needs no data plane.
+// Endpoints are required only when a pull will actually run.
 TEST_F(WriteRemoteTest, RejectsMissingSourceEndpointsWhenAPullIsNeeded) {
   std::vector<int32_t> src_ids = {100};
   auto response =
@@ -730,9 +727,8 @@ TEST_F(WriteRemoteTest, AllExistNeedsNoSourceEndpoints) {
             ::tpu_raiden::kv_cache::proto::WRITE_ALL_EXIST);
 }
 
-// proto3 gives a scalar no presence, so an unset deadline arrives as 0. If 0
-// meant "already expired" every write would fail at the deadline check with a
-// message about deadlines, which is not what is wrong.
+// proto3 sends an unset deadline as 0, so 0 must be rejected as invalid, not
+// treated as an already-expired deadline.
 TEST_F(WriteRemoteTest, RejectsAnUnsetDeadline) {
   std::vector<int32_t> src_ids = {100};
   auto response =
@@ -760,8 +756,8 @@ TEST_F(WriteRemoteTest, RejectsAnOfferFromItself) {
   EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
-// SUCCESS, not failure: hashes are content-addressed, so the destination
-// already having them is the post-condition the source wanted.
+// Success: the destination already having every hash is what the source
+// wanted.
 TEST_F(WriteRemoteTest, AllExistIsAnImmediateSuccess) {
   ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
       {"a", "b"}, {RaidenBlockId(dst_id_, 1, BlockStatus::HOST),
@@ -775,8 +771,7 @@ TEST_F(WriteRemoteTest, AllExistIsAnImmediateSuccess) {
   EXPECT_EQ(latch_.issued(), 0) << "nothing should have been transferred";
 }
 
-// FAILURE, and the destination does not do partial writes: reporting success
-// would let an eviction caller free blocks this node does not have.
+// Failure: the destination does no partial writes, and reports what it holds.
 TEST_F(WriteRemoteTest, PartialExistIsRefusedAndNamesWhatItHas) {
   ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
       {"a"}, {RaidenBlockId(dst_id_, 1, BlockStatus::HOST)}));
@@ -809,8 +804,7 @@ TEST_F(WriteRemoteTest, AcceptsAndAnswersWithoutWaitingForBytes) {
             ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::COMMITTED);
 }
 
-// The cap bounds how long this node holds landing blocks for ANY source,
-// whatever that source asks for.
+// The granted deadline is clamped to the local cap, whatever the source asks.
 TEST_F(WriteRemoteTest, GrantedDeadlineIsClampedToTheLocalCap) {
   auto response =
       Offer({"a"}, /*deadline_ms=*/absl::ToInt64Milliseconds(absl::Hours(1)));
@@ -848,10 +842,8 @@ TEST_F(WriteRemoteTest, TransferFailureFreesTheLandingBlocks) {
   EXPECT_TRUE(reallocated.ok()) << reallocated.status().ToString();
 }
 
-// The claim rule, which is the one invariant everything else leans on: a
-// transfer that resolves after the deadline must not insert or register
-// anything, however it lost the race. The bytes are discarded and the blocks
-// come back.
+// A transfer that resolves after the deadline must not insert or register
+// anything. The bytes are discarded and the blocks come back.
 TEST_F(WriteRemoteTest, ATransferThatResolvesPastTheDeadlineNeverCommits) {
   auto response = Offer({"a", "b"}, /*deadline_ms=*/100);
   ASSERT_OK(response.status());
@@ -905,10 +897,8 @@ TEST_F(WriteRemoteTest, WriteOpsShrinksWithoutPollingTraffic) {
       << "write_ops_ was not garbage collected by DeadlineLoop without polling traffic";
 }
 
-// Same rule as the case above, but reached WITHOUT the deadline thread having
-// run. The claim compares against the wall clock precisely so that commit
-// safety does not depend on that thread being scheduled -- a wedged one must
-// not be able to let a commit through after the source has unpinned.
+// The commit claim checks the wall clock itself, so a late transfer is
+// refused even when the deadline thread never ran.
 TEST_F(WriteRemoteTest, TheClaimRefusesALateTransferEvenIfNoThreadFiredIt) {
   service_->PauseDeadlineFiringForTesting();
 
@@ -931,10 +921,8 @@ TEST_F(WriteRemoteTest, TheClaimRefusesALateTransferEvenIfNoThreadFiredIt) {
   EXPECT_TRUE(reallocated.ok()) << reallocated.status().ToString();
 }
 
-// A concurrent writer landed the hashes while the bytes were in flight. The
-// same existence rule as at ack time, which is what keeps the two coherent.
-// This is the CLAIMED path's free: the operation succeeded at claiming and
-// then found nothing to do, so its landing blocks must still come back.
+// A concurrent writer landed every hash mid-flight: the claimed path reports
+// ALL_EXIST and still frees its landing blocks.
 TEST_F(WriteRemoteTest, LosingTheRaceAtInsertTimeReportsAllExistAndFrees) {
   auto response = Offer({"a", "b"});
   ASSERT_OK(response.status());
@@ -951,11 +939,8 @@ TEST_F(WriteRemoteTest, LosingTheRaceAtInsertTimeReportsAllExistAndFrees) {
                                 << reallocated.status().ToString();
 }
 
-// The other arrival path for a PARTIAL_EXIST verdict. At ack time nothing was
-// present, so the offer was accepted; by the time the bytes landed a
-// concurrent writer had committed one of the two hashes. The source must get
-// the same answer, and the same list, whichever reply carried it -- otherwise
-// it would have to remember which call to look at.
+// A PARTIAL_EXIST found at insert time reaches the poll with the same list
+// as an ack-time answer.
 TEST_F(WriteRemoteTest, PartialExistDiscoveredAtInsertTimeReachesThePoll) {
   auto response = Offer({"a", "b"});
   ASSERT_OK(response.status());
@@ -974,10 +959,8 @@ TEST_F(WriteRemoteTest, PartialExistDiscoveredAtInsertTimeReachesThePoll) {
   EXPECT_TRUE(reallocated.ok()) << reallocated.status().ToString();
 }
 
-// Free blocks only -- this path never evicts, which is why a warm destination
-// refuses every write until destination-side eviction is implemented. The
-// cache must be untouched: that is what makes this a deliberate omission
-// rather than an eviction bug.
+// Landing blocks come from free blocks only; a full destination refuses the
+// write and leaves the cache untouched.
 TEST_F(WriteRemoteTest, RefusesWhenThereAreNoFreeBlocksAndEvictsNothing) {
   ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
       {"victim"}, {RaidenBlockId(dst_id_, 0, BlockStatus::HOST)}));
@@ -1004,9 +987,8 @@ TEST_F(WriteRemoteTest, PollRejectsTheReservedOperationId) {
   EXPECT_THAT(poll.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
-// When the transfer completes, the thread that called Release() on that
-// completion must NOT be held while the registry call runs. A stalled registry
-// must not delay completing the transfer.
+// The transfer-completion thread must not be held while the registry call
+// runs.
 TEST(WriteRemotePublishTest, PublishDoesNotBlockTheTransferCompletion) {
   auto impl = std::make_unique<global_registry::GlobalRegistryServiceImpl>();
   auto stalling_service =
@@ -1115,18 +1097,10 @@ TEST(WriteRemotePublishTest, PublishDoesNotBlockTheTransferCompletion) {
   server->Shutdown();
 }
 
-// The bytes arrive but the destination cannot publish them.
-//
-// Not a failure and not a commit. Discarding them would throw away a completed
-// transfer to fix nothing -- an unpublished block is invisible, not wrong.
-// Reporting COMMITTED would be worse: that is what licenses the source to drop
-// its own copy, and the block would go from findable-on-the-source to
-// findable-by-nobody. So the destination keeps them, says so, and lets the
-// source decide.
-//
-// A live registry is required at construction (a store that cannot register
-// itself does not build), so this kills the registry afterwards, which is also
-// how it happens in practice.
+// The bytes arrived but publishing failed: reported as STORED_UNREGISTERED,
+// not COMMITTED, so the source does not drop the only findable copy. The
+// registry is killed after construction, which is also how this happens in
+// practice.
 TEST(WriteRemoteRegistryFailureTest, StoredButUnregisteredIsReportedAsSuch) {
   auto registry_server = global_registry::CreateTestGlobalRegistryServer();
 
@@ -1207,10 +1181,8 @@ TEST(WriteRemoteRegistryFailureTest, StoredButUnregisteredIsReportedAsSuch) {
   server->Shutdown();
 }
 
-// Teardown with a transfer still outstanding must not hang and must not leave
-// a callback pointing at freed memory. The bound is what keeps this from
-// hanging every GetServerAddress() caller, since the destructor runs under the
-// server's own mutex.
+// Teardown with a transfer still outstanding must return within its bound
+// and must not leave a callback pointing at freed memory.
 TEST_F(WriteRemoteTest, TeardownWithAnOutstandingTransferIsBoundedAndSafe) {
   auto response = Offer({"a", "b"});
   ASSERT_OK(response.status());
@@ -1555,9 +1527,8 @@ TEST(FetchWithdrawTest, AHashOnlyAPeerHoldsIsAMissAndThePeerKeepsItsEntry) {
   server->Shutdown();
 }
 
-// Verifies that PollWriteRemote with wait_ms parks while the operation is
-// pending and returns immediately as soon as the transfer completes and
-// marks terminal.
+// A poll with wait_ms parks while the operation is pending and returns as
+// soon as it goes terminal.
 TEST_F(WriteRemoteTest, PollWriteRemoteWithWaitMsAwaitsUntilTerminal) {
   auto ack_or = Offer({"wait_a", "wait_b"});
   ASSERT_OK(ack_or.status());
@@ -1588,13 +1559,9 @@ TEST_F(WriteRemoteTest, PollWriteRemoteWithWaitMsAwaitsUntilTerminal) {
               UnorderedElementsAre("wait_a", "wait_b"));
 }
 
-// A source that cancels mid-operation (a crash and a network break arrive the
-// same way) must not leave its reactor pending: gRPC withholds OnDone until
-// the application calls Finish, so an OnCancel that only detaches leaks the
-// reactor and keeps the RPC pending forever -- and the deadline-less
-// grpc_server_->Shutdown() that production uses then never returns. The
-// operation itself carries on regardless: cancellation says the source
-// stopped listening, not that the transfer stopped.
+// A cancelled offer must still end its call: an unfinished call stays a
+// pending RPC forever, and a deadline-less Shutdown() never returns. The
+// operation itself carries on.
 TEST_F(WriteRemoteTest, ACancelledOfferEndsItsCallAndShutdownReturns) {
   auto channel = server_->InProcessChannel(::grpc::ChannelArguments());
   auto stub = proto::KVCacheStoreService::NewStub(channel);
@@ -1616,9 +1583,8 @@ TEST_F(WriteRemoteTest, ACancelledOfferEndsItsCallAndShutdownReturns) {
   ASSERT_EQ(latch_.issued(), 1);
 
   // The transfer is still running when the source goes away. The pause before
-  // releasing the latch lets the cancellation reach the server first: the
-  // defect this test pins was an OnCancel that detached the reactor, so the
-  // completion that came later found nothing to finish.
+  // releasing the latch lets the cancellation reach the server first, so the
+  // finish-on-cancel path -- not the result path -- is what ends the call.
   ctx.TryCancel();
   auto finish_status = reader->Finish();
   EXPECT_EQ(finish_status.error_code(), ::grpc::StatusCode::CANCELLED);
@@ -1645,17 +1611,12 @@ TEST_F(WriteRemoteTest, ACancelledOfferEndsItsCallAndShutdownReturns) {
   shutdown_thread.join();
 }
 
-// A bound only the caller chooses is not a bound: the destination caps a
-// waiting poll on its own clock, derived from the longest an operation can
-// live (the deadline cap) plus the margin its record survives after that.
-// Without the clamp, any source could park one of this server's gRPC callback
-// threads for as long as it liked against an operation whose transfer never
-// resolves -- and nothing bounds a transfer.
+// The destination clamps a requested wait to MaxPollWait, so no source can
+// park a gRPC thread longer than that against a wedged transfer.
 TEST_F(WriteRemoteTest, AWaitingPollIsCappedByTheServersOwnClock) {
-  // A one-second deadline cap makes the derived bound six seconds -- small
-  // enough to observe. The deadline thread is paused so the operation stays
-  // pending past its deadline: a wedged transfer is exactly the case the cap
-  // exists for.
+  // A one-second cap makes the bound six seconds. The deadline thread is
+  // paused so the operation stays pending past its deadline, like a wedged
+  // transfer would.
   const char* previous = std::getenv("RAIDEN_REMOTE_WRITE_DEADLINE_S");
   setenv("RAIDEN_REMOTE_WRITE_DEADLINE_S", "1", /*overwrite=*/1);
   service_->PauseDeadlineFiringForTesting();

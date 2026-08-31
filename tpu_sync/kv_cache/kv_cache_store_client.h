@@ -34,16 +34,10 @@
 namespace tpu_raiden {
 namespace kv_cache {
 
-// Ends a WriteRemote call early, from outside the call. Exists for one
-// caller: a KVCacheStore being destroyed, which is abandoning offers whose
-// answers nobody will receive -- the destination would otherwise keep each
-// operation, and its landing blocks, alive for the rest of the hold window
-// waiting for a peer that no longer exists. Cancelling ends both sides at
-// once.
-//
-// The context is held weakly, so keeping a handle after the call is over does
-// not keep the call's state alive, and TryCancel on a finished call is a
-// no-op by omission.
+// Cancels an open WriteRemote call from outside it. ~KVCacheStore uses this
+// to end abandoned offers, so the destination is not left holding a call
+// nobody will answer. Holds the call's context weakly: the handle does not
+// keep the call alive, and TryCancel does nothing after the call has ended.
 class WriteRemoteCancel {
  public:
   void TryCancel();
@@ -51,10 +45,8 @@ class WriteRemoteCancel {
  private:
   friend class KVCacheStoreClient;
 
-  // Shared with the reactor, which owns itself and outlives every handle to
-  // it. No latch is needed here, unlike the registry client's equivalent:
-  // the call is started before this handle is returned, so there is no
-  // window in which cancelling would have nothing to act on.
+  // Shared with the reactor, which owns itself. The call starts before the
+  // handle is returned, so `context` is set before TryCancel can run.
   struct State {
     absl::Mutex mutex;
     std::weak_ptr<::grpc::ClientContext> context ABSL_GUARDED_BY(mutex);
@@ -82,21 +74,22 @@ class KVCacheStoreClient {
       absl::Span<const ::tpu_sync::proto::RaidenWorkerEndpointsProto>
           client_worker_endpoints = {});
 
+  // Reports how the offer's call ended, once an ack has arrived: `result` is
+  // the streamed verdict if the peer sent one; otherwise `rpc_status` says
+  // how the call ended.
   using WriteRemoteVerdictCallback = std::function<void(
       absl::Status rpc_status,
       std::optional<::tpu_raiden::kv_cache::proto::WriteRemoteResult> result,
       uint64_t operation_id)>;
-  // Asynchronous non-blocking WriteRemote RPC: offer `block_hashes` to the
-  // peer this client is connected to -- the source side of KVCacheStore's
-  // save to a destination. The peer decides, allocates landing
-  // blocks and starts pulling; it does NOT wait for the bytes, so the
-  // ack future resolves as soon as the offer ack is received.
-  // When the operation reaches a terminal state, on_verdict is invoked.
-  //
-  // `deadline_ms` must be > 0 -- see WriteRemoteRequest.deadline_ms.
+  // Offers `block_hashes` to the connected peer, on one streaming call whose
+  // deadline is `hold_window`. `ack` resolves when the peer has decided; it
+  // does not wait for the bytes. `on_verdict` runs on the CompletionExecutor
+  // when the call ends. If the call fails before any ack, the error goes to
+  // `ack` and `on_verdict` never runs. `deadline_ms` must be > 0.
   struct WriteRemoteCall {
+    // The peer's decision, or the error that ended the call before it.
     tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck> ack;
-    // Null only for a call this client refused to make at all.
+    // Cancels the open call. Null only if this client refused to make it.
     std::shared_ptr<WriteRemoteCancel> cancel;
   };
   WriteRemoteCall WriteRemote(
@@ -109,9 +102,9 @@ class KVCacheStoreClient {
       absl::Duration hold_window,
       WriteRemoteVerdictCallback on_verdict = nullptr);
 
-  // Asynchronous non-blocking PollWriteRemote RPC: ask the peer what became
-  // of an operation it accepted. Returns UNKNOWN once the peer's record has
-  // aged out, which is indistinguishable from "never happened".
+  // Asks the peer what became of an accepted operation. `wait_ms > 0` asks
+  // it to hold the answer until the operation is terminal. UNKNOWN means the
+  // peer's record is gone; callers must treat that as failure.
   tsl::Future<::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse>
   PollWriteRemote(uint64_t operation_id, int64_t wait_ms = 0);
 

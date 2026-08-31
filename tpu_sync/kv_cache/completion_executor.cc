@@ -35,6 +35,8 @@ CompletionExecutor::CompletionExecutor(int threads) {
   for (int i = 0; i < threads; ++i) {
     workers_.emplace_back(&CompletionExecutor::WorkerLoop, this);
   }
+  // Detached: the singleton is never destroyed (NoDestructor), so the workers
+  // run for the life of the process and there is nothing to join.
   for (std::thread& worker : workers_) worker.detach();
 }
 

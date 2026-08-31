@@ -30,8 +30,15 @@
 namespace tpu_raiden {
 namespace kv_cache {
 
+// Worker threads in the process-wide pool.
 inline constexpr int kCompletionThreads = 4;
 
+// Process-wide thread pool for completion callbacks; gRPC and transfer
+// threads are shared, so store work must not run on them. Schedule always
+// enqueues and never runs the task on the calling thread, so scheduling
+// under a lock or from an already-resolved future is safe. (Exception: if
+// enqueueing itself throws, Execute runs the task inline.) The pool outlives
+// every store, so tasks must check a lifetime fence (KVCacheStore::Lifetime).
 class CompletionExecutor final : public tsl::Executor {
  public:
   static CompletionExecutor& Instance();
@@ -44,8 +51,10 @@ class CompletionExecutor final : public tsl::Executor {
 
   void Execute(Task task) noexcept final;
 
+  // Blocks until the queue is empty and no task is running. TESTS ONLY.
   void DrainForTesting();
 
+  // Number of tasks workers have dequeued. TESTS ONLY.
   int64_t WakeupsForTesting() const;
 
  private:
@@ -60,9 +69,13 @@ class CompletionExecutor final : public tsl::Executor {
   void WorkerLoop();
 
   mutable absl::Mutex mu_;
+  // Tasks waiting to run.
   std::deque<Task> queue_ ABSL_GUARDED_BY(mu_);
+  // Tasks currently running.
   int running_ ABSL_GUARDED_BY(mu_) = 0;
+  // Total tasks dequeued; read by WakeupsForTesting.
   int64_t wakeups_ ABSL_GUARDED_BY(mu_) = 0;
+  // Detached worker threads; see the constructor.
   std::vector<std::thread> workers_;
 };
 

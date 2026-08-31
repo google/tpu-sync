@@ -38,12 +38,15 @@ service KVCacheStoreService {
   // is proactive eviction: a node under memory pressure offers cold blocks to
   // a peer, then frees them locally.
   //
-  //   WriteRemote      the SOURCE offers. The destination tests what it
-  //                    already holds, allocates landing blocks
-  //                    all-or-nothing, issues the pull, and ACKS with an
-  //                    operation_id -- it does NOT wait for the data.
+  //   WriteRemote      the SOURCE offers, on a call it then KEEPS OPEN. The
+  //                    destination tests what it already holds, allocates
+  //                    landing blocks all-or-nothing, issues the pull, and
+  //                    writes an ack carrying an operation_id -- it does NOT
+  //                    wait for the data. When the operation becomes terminal
+  //                    it writes the result on that same call and closes it.
   //   (no RPC)         the DESTINATION's own workers pull the bytes.
-  //   PollWriteRemote  the source polls until terminal.
+  //   PollWriteRemote  only for a source that LOST the call and wants to ask
+  //                    once more. Not on any hot path.
   //
   // Why the destination pulls, and why this is not negotiable: if the
   // SOURCE's workers wrote into destination blocks, a destination that gave
@@ -55,6 +58,16 @@ service KVCacheStoreService {
   //
   // There is deliberately NO lease here, unlike the read path: the source
   // INITIATES and holds its own pins, so there is nothing to negotiate.
+  //
+  // Exactly one Ack, then AT MOST one Result. An Ack reporting all-exist or
+  // partial-exist ends the stream: no operation is created and there is
+  // nothing further to report.
+  //
+  // The call's DEADLINE is the source's HOLD window -- the period it promises
+  // to keep the offered blocks intact. That is not decoration: it is the only
+  // clock in this protocol, and it is why neither side runs a timer for a
+  // remote write. The result arrives on the call, and the HOLD expiring
+  // arrives on the same call as DEADLINE_EXCEEDED.
   rpc WriteRemote(WriteRemoteRequest) returns (stream WriteRemoteEvent);
   rpc PollWriteRemote(PollWriteRemoteRequest) returns (PollWriteRemoteResponse);
 }
@@ -149,22 +162,56 @@ message WriteRemoteEvent {
   }
 }
 
+// What became of the OFFER: accepted, or settled on the spot by what the
+// destination already holds.
 message WriteRemoteAck {
+  // Non-zero => accepted and the transfer is proceeding. Zero together with
+  // WRITE_EXIST_STATE_UNSPECIFIED is a PROTOCOL ERROR (a default-initialised
+  // message), not a silent no-op.
   uint64 operation_id = 1;
+
   WriteExistState exist_state = 2;
+
+  // Populated iff WRITE_PARTIAL_EXIST.
   repeated bytes existing_hashes = 3;
+
+  // The deadline actually armed, after clamping to the destination's own cap.
+  // AUTHORITATIVE: the source validates that its own HOLD exceeds this. The
+  // two values live in different processes, so neither side can check the
+  // invariant alone -- and an inverted pair lets the source stop protecting
+  // its blocks while the destination is still pulling them.
   int64 granted_deadline_ms = 4;
+
+  // How long this destination keeps the operation's record after it goes
+  // terminal. Without it, a source that lost the call cannot tell an UNKNOWN
+  // meaning "never happened" from one meaning "you asked too late": the two
+  // hosts can be configured differently and nothing else on the wire says so.
   int64 record_ttl_ms = 5;
 }
 
+// What became of the OPERATION. Written the moment it goes terminal, and the
+// stream closes after it.
 message WriteRemoteResult {
+  // The same enum the poll answers with, deliberately: one set of states with
+  // one meaning, so the streamed and the polled answer cannot drift.
   PollWriteRemoteResponse.State state = 1;
+  // Populated iff PARTIAL_EXIST.
   repeated bytes existing_hashes = 2;
+  // Populated iff STORED_UNREGISTERED.
   repeated bytes unregistered_hashes = 3;
 }
 
 message PollWriteRemoteRequest {
   uint64 operation_id = 1;
+
+  // 0 (the default) is the original behaviour: answer with whatever the state
+  // is right now. Non-zero asks the destination to HOLD the call open until
+  // the operation is terminal or this many milliseconds pass, whichever comes
+  // first -- so that a source which lost the stream can wait for the real
+  // answer instead of being told PENDING. The source still bounds the wait
+  // with its own call deadline, and the destination caps it independently;
+  // this only tells the destination it may keep the answer rather than send
+  // PENDING straight back.
   int64 wait_ms = 2;
 }
 

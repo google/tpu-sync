@@ -179,6 +179,9 @@ class HostOffloadBackend : public KVCacheStoreBackend {
     // caller needs to decide what, if anything, to re-offer.
     std::vector<std::string> existing_hashes;
     absl::Duration granted_deadline;
+    // Ends the call early. The source holds this for as long as it is
+    // protecting the blocks, and uses it when it stops -- see ~KVCacheStore.
+    std::shared_ptr<WriteRemoteCancel> cancel;
   };
 
   using WriteRemoteVerdictCallback = std::function<void(
@@ -197,33 +200,11 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       absl::Duration hold_window,
       WriteRemoteVerdictCallback on_verdict = nullptr);
 
-  // Mirrors PollWriteRemoteResponse::State without depending on it, so the
-  // wire enum stays an implementation detail of this file.
-  enum class RemoteWriteState {
-    kPending,
-    kCommitted,
-    kAllExist,
-    kPartialExist,
-    kFailed,
-    // Aged out, or the destination restarted. Indistinguishable from "never
-    // happened", so callers must treat it as failure.
-    kUnknown,
-    // The destination holds the bytes but could not publish them, so no peer
-    // can find them. Not a success and not a plain failure: the transfer
-    // worked. What to do about it is the source's call.
-    kStoredUnregistered,
-  };
-
-  struct RemoteWriteStatus {
-    RemoteWriteState state = RemoteWriteState::kPending;
-    std::vector<std::string> existing_hashes;
-    std::vector<std::string> unregistered_hashes;
-  };
-
-  absl::StatusOr<RemoteWriteStatus> PollWriteRemote(
-      const RaidenId& dst_raiden_id, uint64_t operation_id,
-      int64_t wait_ms = 0);
-
+  // Asks the destination what became of an accepted offer, without blocking:
+  // recovery for a source that lost its stream. `wait_ms > 0` asks the
+  // destination to hold the answer until the operation is terminal. The raw
+  // wire response is returned; KVCacheStore maps it where it maps the
+  // streamed result, so the two answers cannot drift apart.
   tsl::Future<proto::PollWriteRemoteResponse> PollWriteRemoteAsync(
       const RaidenId& dst_raiden_id, uint64_t operation_id,
       int64_t wait_ms = 0);

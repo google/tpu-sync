@@ -40,6 +40,7 @@ namespace tpu_raiden {
 namespace kv_cache {
 
 class WriteRemoteServerReactor;
+struct WriteRemoteReactorGate;
 
 class KVCacheStoreServiceImpl
     : public ::tpu_raiden::kv_cache::proto::KVCacheStoreService::CallbackService {
@@ -84,8 +85,6 @@ class KVCacheStoreServiceImpl
       const ::tpu_raiden::kv_cache::proto::PollWriteRemoteRequest* request,
       ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse* response)
       override;
-
-  void DetachReactor(uint64_t op_id);
 
   // Diverts the pull through `transfer_fn` instead of the controller. TESTS
   // ONLY, and only before the server serves: the member is not mutex-guarded,
@@ -173,9 +172,12 @@ class KVCacheStoreServiceImpl
     // meaningful while blocks are outstanding.
     absl::Time next_leak_warning = absl::InfiniteFuture();
 
-    // The server write reactor for streaming WriteRemoteEvent back to the source.
-    // Cleared under write_mutex_ when the result is sent or the client disconnects.
-    WriteRemoteServerReactor* reactor = nullptr;
+    // The way to the reactor streaming WriteRemoteEvent back to the source.
+    // A sender claims it (moves it out) under write_mutex_, then locks the
+    // gate to reach the reactor -- which may already be gone: the reactor
+    // nulls itself in the gate before self-deleting. See the gate's
+    // definition for why the raw pointer must never be copied out instead.
+    std::shared_ptr<WriteRemoteReactorGate> reactor_gate;
 
     // Resolves once the operation is terminal AND its blocks are settled.
     // Teardown waits on these rather than on the raw transfer futures: Await()

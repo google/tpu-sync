@@ -99,6 +99,13 @@ absl::Duration DeadlineCap() {
   return absl::Seconds(seconds);
 }
 
+// The longest a waiting PollWriteRemote may hold its gRPC thread, derived
+// from the longest an operation can live plus the margin its record survives
+// after that -- NOT a round number: raise RAIDEN_REMOTE_WRITE_DEADLINE_S and
+// the bound follows. A bound only the caller chooses is not a bound, so the
+// handler clamps every requested wait to this.
+absl::Duration MaxPollWait() { return DeadlineCap() + kRecordMargin; }
+
 template <typename ProtoContainer>
 std::vector<RaidenWorkerEndpoints> UnpackWorkerEndpointsProto(
     const ProtoContainer& proto_groups) {
@@ -120,15 +127,40 @@ std::vector<RaidenWorkerEndpoints> UnpackWorkerEndpointsProto(
 
 }  // namespace
 
+// Co-owned by a WriteOp and the reactor answering it. Every call from the
+// service into the reactor goes through `mu`: a sender that finds `reactor`
+// non-null calls into it while still holding the lock, and OnDone nulls
+// `reactor` under the same lock before deleting -- so a sender either keeps
+// the reactor alive for the length of its call, or finds nothing and drops
+// the answer (a source that has gone away is owed nothing). Without this, a
+// sender that copied the raw pointer under write_mutex_ and then dropped the
+// lock could call into a reactor that deleted itself in between
+// (OnWriteDone(!ok) -> FinishWithError -> Finish -> OnDone -> delete this).
+struct WriteRemoteReactorGate {
+  absl::Mutex mu;
+  WriteRemoteServerReactor* reactor ABSL_GUARDED_BY(mu) = nullptr;
+};
+
 class WriteRemoteServerReactor
     : public ::grpc::ServerWriteReactor<
           ::tpu_raiden::kv_cache::proto::WriteRemoteEvent> {
  public:
-  WriteRemoteServerReactor(KVCacheStoreServiceImpl* service, uint64_t op_id)
-      : service_(service), op_id_(op_id) {}
+  // `gate` is null for a refused offer: no operation exists, so nothing will
+  // ever need to reach this reactor after the constructor returns.
+  explicit WriteRemoteServerReactor(std::shared_ptr<WriteRemoteReactorGate> gate)
+      : gate_(std::move(gate)) {}
 
   void StartAck(proto::WriteRemoteEvent ack_event) {
-    ack_event_ = std::move(ack_event);
+    {
+      absl::MutexLock lock(mu_);
+      // The service's destructor can finish this call between the operation
+      // being recorded and the ack going out; a write after Finish is
+      // undefined, so the ack is simply dropped.
+      if (finished_) {
+        return;
+      }
+      ack_event_ = std::move(ack_event);
+    }
     StartWrite(&ack_event_);
   }
 
@@ -196,21 +228,27 @@ class WriteRemoteServerReactor
   }
 
   void OnCancel() override {
-    if (service_ != nullptr && op_id_ != 0) {
-      service_->DetachReactor(op_id_);
-    }
+    // gRPC does not deliver OnDone until the application calls Finish, so a
+    // cancelled call that is only detached leaks this reactor and counts as a
+    // pending RPC forever -- a deadline-less grpc_server_->Shutdown() then
+    // never returns. Finishing is idempotent through `finished_`, and the
+    // operation itself carries on regardless: cancellation says the source
+    // stopped listening, not that the transfer stopped.
+    FinishWithError(::grpc::Status::CANCELLED);
   }
 
   void OnDone() override {
-    if (service_ != nullptr && op_id_ != 0) {
-      service_->DetachReactor(op_id_);
+    if (gate_ != nullptr) {
+      // After this, no sender can reach the object again; anyone already
+      // inside a call through the gate holds gate_->mu, which this waits for.
+      absl::MutexLock lock(gate_->mu);
+      gate_->reactor = nullptr;
     }
     delete this;
   }
 
  private:
-  KVCacheStoreServiceImpl* const service_;
-  const uint64_t op_id_;
+  const std::shared_ptr<WriteRemoteReactorGate> gate_;
   absl::Mutex mu_;
   proto::WriteRemoteEvent ack_event_;
   proto::WriteRemoteEvent result_event_ ABSL_GUARDED_BY(mu_);
@@ -218,6 +256,25 @@ class WriteRemoteServerReactor
   bool has_result_ ABSL_GUARDED_BY(mu_) = false;
   bool finished_ ABSL_GUARDED_BY(mu_) = false;
 };
+
+namespace {
+
+// The one way a result reaches a reactor. Null gate (already claimed by an
+// earlier sender, or a refused offer) and null reactor (the call already
+// ended) both mean the answer is dropped, which is correct: whoever it was
+// for is not listening.
+void SendResultThroughGate(const std::shared_ptr<WriteRemoteReactorGate>& gate,
+                           proto::WriteRemoteEvent result_event) {
+  if (gate == nullptr) {
+    return;
+  }
+  absl::MutexLock lock(gate->mu);
+  if (gate->reactor != nullptr) {
+    gate->reactor->SendResultAndFinish(std::move(result_event));
+  }
+}
+
+}  // namespace
 
 KVCacheStoreServiceImpl::KVCacheStoreServiceImpl(
     KVCacheStoreBackend* backend,
@@ -277,19 +334,22 @@ KVCacheStoreServiceImpl::~KVCacheStoreServiceImpl() {
     }
   }
 
-  std::vector<WriteRemoteServerReactor*> reactors_to_finish;
+  std::vector<std::shared_ptr<WriteRemoteReactorGate>> reactors_to_finish;
   {
     absl::MutexLock lock(write_mutex_);
     for (auto& [id, op] : write_ops_) {
-      if (op->reactor != nullptr) {
-        reactors_to_finish.push_back(op->reactor);
-        op->reactor = nullptr;
+      if (op->reactor_gate != nullptr) {
+        reactors_to_finish.push_back(std::move(op->reactor_gate));
+        op->reactor_gate = nullptr;
       }
     }
   }
-  for (auto* reactor : reactors_to_finish) {
-    reactor->FinishWithError(::grpc::Status(
-        ::grpc::StatusCode::UNAVAILABLE, "Server shutting down"));
+  for (const auto& gate : reactors_to_finish) {
+    absl::MutexLock lock(gate->mu);
+    if (gate->reactor != nullptr) {
+      gate->reactor->FinishWithError(::grpc::Status(
+          ::grpc::StatusCode::UNAVAILABLE, "Server shutting down"));
+    }
   }
 
   // Clearing under `mu` is what makes a late completion safe: it either has
@@ -336,14 +396,6 @@ void KVCacheStoreServiceImpl::WithdrawEntryIfUnbacked(const std::string& hash) {
     return;
   }
   backend_->UnregisterBlocksAsync({hash}).OnReady([](absl::Status) {});
-}
-
-void KVCacheStoreServiceImpl::DetachReactor(uint64_t op_id) {
-  absl::MutexLock lock(write_mutex_);
-  auto it = write_ops_.find(op_id);
-  if (it != write_ops_.end() && it->second != nullptr) {
-    it->second->reactor = nullptr;
-  }
 }
 
 proto::WriteRemoteEvent KVCacheStoreServiceImpl::MakeResultEvent(
@@ -572,7 +624,7 @@ KVCacheStoreServiceImpl::WriteRemote(
     ::grpc::CallbackServerContext* context,
     const ::tpu_raiden::kv_cache::proto::WriteRemoteRequest* request) {
   if (backend_ == nullptr || controller_ == nullptr) {
-    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    auto* reactor = new WriteRemoteServerReactor(/*gate=*/nullptr);
     reactor->Finish(::grpc::Status(::grpc::StatusCode::FAILED_PRECONDITION,
                                   "Backend or RaidenController non-initialized"));
     return reactor;
@@ -585,21 +637,21 @@ KVCacheStoreServiceImpl::WriteRemote(
       request->src_host_block_ids().end());
 
   if (block_hashes.empty()) {
-    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    auto* reactor = new WriteRemoteServerReactor(/*gate=*/nullptr);
     reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::INVALID_ARGUMENT,
         "WriteRemoteRequest requires non-empty block_hashes."));
     return reactor;
   }
   if (src_host_block_ids.size() != block_hashes.size()) {
-    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    auto* reactor = new WriteRemoteServerReactor(/*gate=*/nullptr);
     reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::INVALID_ARGUMENT,
         "Mismatched src_host_block_ids count vs block_hashes count."));
     return reactor;
   }
   if (request->deadline_ms() <= 0) {
-    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    auto* reactor = new WriteRemoteServerReactor(/*gate=*/nullptr);
     reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::INVALID_ARGUMENT,
         absl::StrCat("WriteRemote requires a positive deadline_ms; got ",
@@ -619,7 +671,7 @@ KVCacheStoreServiceImpl::WriteRemote(
       src_id.job_replica_id == unit.job_replica_id() &&
       src_id.data_name == unit.data_name() &&
       src_id.data_replica_idx == unit.data_replica_idx()) {
-    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    auto* reactor = new WriteRemoteServerReactor(/*gate=*/nullptr);
     reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::INVALID_ARGUMENT,
         "WriteRemote destination is this store; there is nothing to transfer."));
@@ -631,7 +683,7 @@ KVCacheStoreServiceImpl::WriteRemote(
   std::vector<std::string> present =
       backend_->AlreadyPresentHostResident(block_hashes);
   if (present.size() == block_hashes.size()) {
-    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    auto* reactor = new WriteRemoteServerReactor(/*gate=*/nullptr);
     proto::WriteRemoteEvent ack_event;
     auto* ack = ack_event.mutable_ack();
     ack->set_exist_state(::tpu_raiden::kv_cache::proto::WRITE_ALL_EXIST);
@@ -642,7 +694,7 @@ KVCacheStoreServiceImpl::WriteRemote(
     return reactor;
   }
   if (!present.empty()) {
-    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    auto* reactor = new WriteRemoteServerReactor(/*gate=*/nullptr);
     proto::WriteRemoteEvent ack_event;
     auto* ack = ack_event.mutable_ack();
     ack->set_exist_state(
@@ -656,7 +708,7 @@ KVCacheStoreServiceImpl::WriteRemote(
 
   // Only now do the source's worker endpoints matter.
   if (request->src_worker_endpoints().empty()) {
-    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    auto* reactor = new WriteRemoteServerReactor(/*gate=*/nullptr);
     reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::INVALID_ARGUMENT,
         "WriteRemote requires the source's worker endpoints: the destination "
@@ -671,7 +723,7 @@ KVCacheStoreServiceImpl::WriteRemote(
   // Allocate landing blocks in destination host DRAM for the transfer.
   auto allocated_ids_or = controller_->AllocateBlockIds(block_hashes.size());
   if (!allocated_ids_or.ok()) {
-    auto* reactor = new WriteRemoteServerReactor(this, 0);
+    auto* reactor = new WriteRemoteServerReactor(/*gate=*/nullptr);
     reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::RESOURCE_EXHAUSTED,
         absl::StrCat("Failed to allocate destination landing blocks: ",
@@ -711,10 +763,15 @@ KVCacheStoreServiceImpl::WriteRemote(
     deadline_cv_.Signal();
   }
 
-  auto* reactor = new WriteRemoteServerReactor(this, op_id);
+  auto gate = std::make_shared<WriteRemoteReactorGate>();
+  auto* reactor = new WriteRemoteServerReactor(gate);
+  {
+    absl::MutexLock lock(gate->mu);
+    gate->reactor = reactor;
+  }
   {
     absl::MutexLock lock(write_mutex_);
-    op->reactor = reactor;
+    op->reactor_gate = gate;
   }
 
   // Issue the DMA pull from source to local landing blocks.
@@ -758,9 +815,22 @@ KVCacheStoreServiceImpl::WriteRemote(
   ack->set_operation_id(op_id);
   ack->set_granted_deadline_ms(
       absl::ToInt64Milliseconds(granted_deadline));
-  ack->set_record_ttl_ms(absl::ToInt64Milliseconds(kRecordMargin));
+  // How long this operation's record survives from the ack, so a source that
+  // lost the stream can tell "you asked too late" from "never happened". The
+  // record lives to expires_at = granted deadline + margin; the margin alone
+  // under-reports it by the whole grant.
+  ack->set_record_ttl_ms(
+      absl::ToInt64Milliseconds(granted_deadline + kRecordMargin));
 
-  reactor->StartAck(std::move(ack_event));
+  // Through the gate, not the raw pointer: the destructor's sweep can finish
+  // (and, via OnDone, delete) this reactor between the operation being
+  // recorded above and this line.
+  {
+    absl::MutexLock lock(gate->mu);
+    if (gate->reactor != nullptr) {
+      gate->reactor->StartAck(std::move(ack_event));
+    }
+  }
   return reactor;
 }
 
@@ -823,19 +893,16 @@ KVCacheStoreServiceImpl::CompleteWriteRemote(uint64_t op_id,
   if (!claimed) {
     // Deferred free: transfer failed, or succeeded too late. Release landing
     // blocks and settle.
-    WriteRemoteServerReactor* reactor_to_notify = nullptr;
+    std::shared_ptr<WriteRemoteReactorGate> gate;
     proto::WriteRemoteEvent result_event;
     {
       absl::MutexLock lock(write_mutex_);
-      reactor_to_notify = op->reactor;
-      if (reactor_to_notify != nullptr) {
+      gate = std::move(op->reactor_gate);
+      if (gate != nullptr) {
         result_event = MakeResultEvent(op);
-        op->reactor = nullptr;
       }
     }
-    if (reactor_to_notify != nullptr) {
-      reactor_to_notify->SendResultAndFinish(std::move(result_event));
-    }
+    SendResultThroughGate(gate, std::move(result_event));
     ReleaseLandingBlocks(op);
     Settle(op);
     return std::nullopt;
@@ -915,21 +982,18 @@ void KVCacheStoreServiceImpl::Finish(const std::shared_ptr<WriteOp>& op,
                                      std::vector<std::string> existing) {
   const bool kept_by_cache =
       state == OpState::kCommitted || state == OpState::kStoredUnregistered;
-  WriteRemoteServerReactor* reactor_to_notify = nullptr;
+  std::shared_ptr<WriteRemoteReactorGate> gate;
   proto::WriteRemoteEvent result_event;
   {
     absl::MutexLock lock(write_mutex_);
     MarkTerminal(op, state, std::move(existing));
     deadline_cv_.Signal();
-    reactor_to_notify = op->reactor;
-    if (reactor_to_notify != nullptr) {
+    gate = std::move(op->reactor_gate);
+    if (gate != nullptr) {
       result_event = MakeResultEvent(op);
-      op->reactor = nullptr;
     }
   }
-  if (reactor_to_notify != nullptr) {
-    reactor_to_notify->SendResultAndFinish(std::move(result_event));
-  }
+  SendResultThroughGate(gate, std::move(result_event));
   if (!kept_by_cache) {
     ReleaseLandingBlocks(op);
   }
@@ -976,7 +1040,7 @@ void KVCacheStoreServiceImpl::Finish(const std::shared_ptr<WriteOp>& op,
                      found->second->state != OpState::kCompleting;
             },
             &arg),
-        absl::Milliseconds(request->wait_ms()));
+        std::min(absl::Milliseconds(request->wait_ms()), MaxPollWait()));
     it = write_ops_.find(request->operation_id());
   }
 
@@ -1010,7 +1074,8 @@ void KVCacheStoreServiceImpl::Finish(const std::shared_ptr<WriteOp>& op,
 
 void KVCacheStoreServiceImpl::DeadlineLoop() {
   while (true) {
-    std::vector<std::pair<WriteRemoteServerReactor*, proto::WriteRemoteEvent>>
+    std::vector<std::pair<std::shared_ptr<WriteRemoteReactorGate>,
+                          proto::WriteRemoteEvent>>
         reactors_to_notify;
     absl::Time wake_at = absl::InfiniteFuture();
     {
@@ -1025,9 +1090,10 @@ void KVCacheStoreServiceImpl::DeadlineLoop() {
             !deadline_firing_paused_for_testing_) {
           if (now >= op->deadline) {
             MarkTerminal(op, OpState::kFailed, {});
-            if (op->reactor != nullptr) {
-              reactors_to_notify.push_back({op->reactor, MakeResultEvent(op)});
-              op->reactor = nullptr;
+            if (op->reactor_gate != nullptr) {
+              reactors_to_notify.push_back(
+                  {std::move(op->reactor_gate), MakeResultEvent(op)});
+              op->reactor_gate = nullptr;
             }
           } else {
             wake_at = std::min(wake_at, op->deadline);
@@ -1070,8 +1136,8 @@ void KVCacheStoreServiceImpl::DeadlineLoop() {
       }
     }
 
-    for (auto& [reactor, event] : reactors_to_notify) {
-      reactor->SendResultAndFinish(std::move(event));
+    for (auto& [gate, event] : reactors_to_notify) {
+      SendResultThroughGate(gate, std::move(event));
     }
   }
 }

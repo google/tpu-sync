@@ -25,6 +25,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "grpcpp/client_context.h"
@@ -131,16 +132,15 @@ class WriteRemoteClientReactor
  public:
   WriteRemoteClientReactor(
       ::tpu_raiden::kv_cache::proto::KVCacheStoreService::StubInterface* stub,
-      const ::tpu_raiden::kv_cache::proto::WriteRemoteRequest& request,
-      absl::Duration hold_window,
+      ::tpu_raiden::kv_cache::proto::WriteRemoteRequest request,
+      std::shared_ptr<::grpc::ClientContext> context,
       tsl::Promise<::tpu_raiden::kv_cache::proto::WriteRemoteAck> ack_promise,
       KVCacheStoreClient::WriteRemoteVerdictCallback on_verdict)
-      : ack_promise_(std::move(ack_promise)),
+      : context_(std::move(context)),
+        request_(std::move(request)),
+        ack_promise_(std::move(ack_promise)),
         on_verdict_(std::move(on_verdict)) {
-    context_.set_deadline(std::chrono::system_clock::now() +
-                          std::chrono::milliseconds(
-                              absl::ToInt64Milliseconds(hold_window)));
-    stub->async()->WriteRemote(&context_, &request, this);
+    stub->async()->WriteRemote(context_.get(), &request_, this);
     StartRead(&event_);
     StartCall();
   }
@@ -157,6 +157,11 @@ class WriteRemoteClientReactor
       if (event_.ack().exist_state() ==
           ::tpu_raiden::kv_cache::proto::WRITE_EXIST_STATE_UNSPECIFIED) {
         StartRead(&event_);
+      } else {
+        // Existence answers (ALL_EXIST / PARTIAL_EXIST) settle synchronously
+        // inside SaveRemote via the ack promise. Clearing on_verdict_ prevents
+        // OnDone from scheduling an unneeded verdict that races with SaveRemote.
+        on_verdict_ = nullptr;
       }
     } else if (event_.has_result()) {
       has_result_ = true;
@@ -197,7 +202,13 @@ class WriteRemoteClientReactor
   }
 
  private:
-  ::grpc::ClientContext context_;
+  // Shared, not owned outright, so a WriteRemoteCancel handle can reach it
+  // without keeping the call's state alive past OnDone.
+  std::shared_ptr<::grpc::ClientContext> context_;
+  // Owned here: gRPC's callback API requires the request to stay valid for
+  // the life of the call, and the reactor is the only thing that lives that
+  // long.
+  proto::WriteRemoteRequest request_;
   proto::WriteRemoteEvent event_;
   tsl::Promise<proto::WriteRemoteAck> ack_promise_;
   KVCacheStoreClient::WriteRemoteVerdictCallback on_verdict_;
@@ -207,8 +218,7 @@ class WriteRemoteClientReactor
   proto::WriteRemoteResult result_;
 };
 
-tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>
-KVCacheStoreClient::WriteRemote(
+KVCacheStoreClient::WriteRemoteCall KVCacheStoreClient::WriteRemote(
     const ::tpu_sync::rpc::RaidenIdProto& src_raiden_id,
     absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> src_host_block_ids,
@@ -218,20 +228,28 @@ KVCacheStoreClient::WriteRemote(
     absl::Duration hold_window,
     WriteRemoteVerdictCallback on_verdict) {
   if (block_hashes.empty()) {
-    return tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(
-        absl::InvalidArgumentError("WriteRemote requires at least one hash."));
+    return WriteRemoteCall{
+        tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(
+            absl::InvalidArgumentError(
+                "WriteRemote requires at least one hash.")),
+        nullptr};
   }
   if (src_host_block_ids.size() != block_hashes.size()) {
-    return tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(
-        absl::InvalidArgumentError(absl::StrCat(
-            "Mismatched src_host_block_ids count (", src_host_block_ids.size(),
-            ") vs block_hashes count (", block_hashes.size(), ").")));
+    return WriteRemoteCall{
+        tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(
+            absl::InvalidArgumentError(absl::StrCat(
+                "Mismatched src_host_block_ids count (",
+                src_host_block_ids.size(), ") vs block_hashes count (",
+                block_hashes.size(), ")."))),
+        nullptr};
   }
   if (deadline_ms <= 0) {
-    return tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(
-        absl::InvalidArgumentError(
-            absl::StrCat("WriteRemote requires a positive deadline_ms, got ",
-                         deadline_ms, ".")));
+    return WriteRemoteCall{
+        tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(
+            absl::InvalidArgumentError(absl::StrCat(
+                "WriteRemote requires a positive deadline_ms, got ",
+                deadline_ms, "."))),
+        nullptr};
   }
 
   ::tpu_raiden::kv_cache::proto::WriteRemoteRequest request;
@@ -251,9 +269,42 @@ KVCacheStoreClient::WriteRemote(
   auto [promise, future] =
       tsl::MakePromise<::tpu_raiden::kv_cache::proto::WriteRemoteAck>();
 
-  new WriteRemoteClientReactor(stub_.get(), request, hold_window,
-                               std::move(promise), std::move(on_verdict));
-  return future;
+  // THE call deadline is the HOLD window. Nothing on the source times a
+  // remote write; this is what ends one that never gets an answer.
+  auto context = std::make_shared<::grpc::ClientContext>();
+  context->set_deadline(
+      std::chrono::system_clock::now() +
+      std::chrono::milliseconds(absl::ToInt64Milliseconds(hold_window)));
+
+  // Made here rather than inside the reactor because the reactor owns itself
+  // and there is no safe moment afterwards to reach into it. The handle holds
+  // the context weakly; the reactor holds it strongly for the life of the
+  // call.
+  auto cancel = std::make_shared<WriteRemoteCancel>();
+  {
+    absl::MutexLock lock(&cancel->state_->mutex);
+    cancel->state_->context = context;
+  }
+
+  // Owns itself until OnDone.
+  new WriteRemoteClientReactor(stub_.get(), std::move(request),
+                               std::move(context), std::move(promise),
+                               std::move(on_verdict));
+  return WriteRemoteCall{std::move(future), std::move(cancel)};
+}
+
+void WriteRemoteCancel::TryCancel() {
+  std::shared_ptr<::grpc::ClientContext> context;
+  {
+    absl::MutexLock lock(&state_->mutex);
+    context = state_->context.lock();
+  }
+  // Outside the lock: TryCancel does not block, but there is no reason to
+  // hold anything while calling into grpc. A call that has already finished
+  // leaves nothing to lock onto, and cancelling it is a no-op by omission.
+  if (context != nullptr) {
+    context->TryCancel();
+  }
 }
 
 tsl::Future<::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse>

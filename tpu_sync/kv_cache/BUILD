@@ -590,7 +590,6 @@ cc_library(
     hdrs = ["kv_cache_store_service.h"],
     visibility = ["//visibility:public"],
     deps = [
-        ":completion_executor",
         ":kv_cache_store_backend",
         "//tpu_sync/common:raiden_id",
         "//tpu_sync/core:buffer",
@@ -730,6 +729,7 @@ cc_test(
         "//tpu_sync/core/controller:test_util",
         "//tpu_sync/kv_cache/global_registry:global_registry_server_lib",
         "//tpu_sync/kv_cache/global_registry:test_util",
+        "//tpu_sync/proto:kv_cache_store_service_cc_grpc",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/synchronization",

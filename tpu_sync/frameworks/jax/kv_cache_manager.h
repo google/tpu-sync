@@ -68,14 +68,16 @@ class NumaAwareKVCacheManager {
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
-      int64_t node_id = 0);
+      int64_t node_id = 0, bool enable_shm = false);
 
   // New transfer-enabled constructor (flat list of arrays, single shard per
-  // layer)
+  // layer). enable_shm opts this manager's host buffers into the shared-memory
+  // segments named by RAIDEN_SHM_KEY; without it the env var is ignored.
   NumaAwareKVCacheManager(nanobind::list kv_caches, int64_t node_id,
                           int64_t local_control_port, int64_t max_blocks,
                           int64_t num_slots, double timeout_s,
-                          bool unsafe_skip_buffer_lock, int parallelism);
+                          bool unsafe_skip_buffer_lock, int parallelism,
+                          bool enable_shm = false);
 #endif
 
   // Raw PjRtBuffer constructor
@@ -84,7 +86,7 @@ class NumaAwareKVCacheManager {
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
-      int64_t node_id = 0);
+      int64_t node_id = 0, bool enable_shm = false);
 
   // FFI metadata constructor (cache-only by default)
   NumaAwareKVCacheManager(size_t num_layers, size_t num_shards,
@@ -215,12 +217,13 @@ class NumaAwareKVCacheManager {
   NumaAwareKVCacheManager(UnpackedCache&& cache, std::optional<int> local_port,
                           std::optional<int> host_blocks_to_allocate,
                           bool unsafe_skip_buffer_lock, int parallelism,
-                          int64_t node_id = 0);
+                          int64_t node_id = 0, bool enable_shm = false);
 
   NumaAwareKVCacheManager(UnpackedCache&& cache, int64_t node_id,
                           int64_t local_control_port, int64_t max_blocks,
                           int64_t num_slots, double timeout_s,
-                          bool unsafe_skip_buffer_lock, int parallelism);
+                          bool unsafe_skip_buffer_lock, int parallelism,
+                          bool enable_shm = false);
 
   std::optional<nanobind::list> device_arrays_;
 #endif
@@ -230,7 +233,7 @@ class NumaAwareKVCacheManager {
       std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
       bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id,
       int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
-      double timeout_s);
+      double timeout_s, bool enable_shm);
 
   static constexpr uint64_t k48BitMask = 0xFFFFFFFFFFFFULL;
   std::atomic<uint64_t> global_seq_counter_{1};
@@ -263,16 +266,19 @@ class KVCacheManager {
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
       int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0);
+      std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0,
+      bool enable_shm = false);
 
   // New transfer-enabled constructor (flat list of arrays, single shard per
-  // layer)
+  // layer). enable_shm opts this manager's host buffers into the shared-memory
+  // segments named by RAIDEN_SHM_KEY; without it the env var is ignored.
   KVCacheManager(
       nanobind::list kv_caches, int64_t node_id, int64_t local_control_port,
       int64_t max_blocks, int64_t num_slots, double timeout_s,
       bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt);
+      std::optional<std::string> worker_id = std::nullopt,
+      bool enable_shm = false);
 #endif
 
   // Raw PjRtBuffer constructor

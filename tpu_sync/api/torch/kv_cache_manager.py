@@ -74,6 +74,7 @@ class KVCacheManager:
       raiden_worker_port: int = 0,
       raiden_controller_address: Optional[str] = None,
       worker_id: Optional[str] = None,
+      enable_shm: bool = False,
   ):
     """Instantiates the TransferEngine-based KVCacheManager.
 
@@ -95,6 +96,10 @@ class KVCacheManager:
       raiden_controller_address: Address of the Raiden Controller.
       worker_id: Unique identifier for the worker node registered with
         controller.
+      enable_shm: Opt this manager's host buffers into the shared-memory
+        segments named by RAIDEN_SHM_KEY. The env var supplies the segment
+        namespace; this flag supplies the per-manager decision. Managers whose
+        host buffers are transient staging must leave it off.
     """
     self._admission_summary = None
     impl = _torch_impl()
@@ -111,6 +116,7 @@ class KVCacheManager:
           # Pass node_id so ReadRemote can always match src<->dst workers by
           # node_id (see the non-host_blocks branch, which already forwards it).
           node_id=node_id,
+          enable_shm=enable_shm,
       )
     else:
       if max_blocks is None or num_slots is None:
@@ -131,6 +137,7 @@ class KVCacheManager:
           raiden_worker_port=raiden_worker_port,
           raiden_controller_address=raiden_controller_address,
           worker_id=worker_id,
+          enable_shm=enable_shm,
       )
 
   @classmethod

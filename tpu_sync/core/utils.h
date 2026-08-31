@@ -45,11 +45,15 @@ inline std::optional<std::vector<const uint8_t*>> CastExternalPointers(
   return cast_ptrs;
 }
 
+// Picks the host buffer allocator for a KVCacheManager. Shared memory is
+// used only when the manager opted in (enable_shm) AND the deployment
+// provides a segment namespace (RAIDEN_SHM_KEY); managers whose host buffers
+// are transient staging (transfer engines) must not use shm.
 inline HostBufferAllocator CreateHostMemoryAllocator(
-    xla::PjRtClient* client, int64_t max_blocks = 0,
+    xla::PjRtClient* client, bool enable_shm, int64_t max_blocks = 0,
     size_t total_payload_bytes = 0) {
   const char* shm_key_env = std::getenv("RAIDEN_SHM_KEY");
-  if (shm_key_env != nullptr && std::strlen(shm_key_env) > 0) {
+  if (enable_shm && shm_key_env != nullptr && std::strlen(shm_key_env) > 0) {
     SharedMemoryHeader expected_schema;
     const char* model_uid_env = std::getenv("RAIDEN_SHM_MODEL_UID");
     if (model_uid_env != nullptr) {
@@ -89,6 +93,10 @@ inline HostBufferAllocator CreateHostMemoryAllocator(
              -> absl::StatusOr<HostBufferAllocation> {
     return allocator->AllocateDmaMappedForDevice(size_bytes, device);
   };
+}
+
+inline HostBufferAllocator CreateHostMemoryAllocator(xla::PjRtClient* client) {
+  return CreateHostMemoryAllocator(client, /*enable_shm=*/false);
 }
 
 struct RawCopyChunk {

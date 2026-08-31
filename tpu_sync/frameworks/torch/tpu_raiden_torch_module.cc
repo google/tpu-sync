@@ -219,16 +219,18 @@ NB_MODULE(_tpu_raiden_torch, m) {
       .def(nb::init<const std::vector<std::vector<at::Tensor>>&,
                     std::optional<int>, std::optional<int>, bool, int, int,
                     std::optional<std::string>, std::optional<std::string>,
-                    int64_t>(),
+                    int64_t, bool>(),
            nb::arg("device_tensors"), nb::arg("local_port") = nb::none(),
            nb::arg("host_blocks_to_allocate") = nb::none(),
            nb::arg("unsafe_skip_buffer_lock") = false,
            nb::arg("parallelism") = 1, nb::arg("raiden_worker_port") = 0,
            nb::arg("raiden_controller_address") = nb::none(),
-           nb::arg("worker_id") = nb::none(), nb::arg("node_id") = 0)
+           nb::arg("worker_id") = nb::none(), nb::arg("node_id") = 0,
+           nb::arg("enable_shm") = false)
       .def(nb::init<const std::vector<at::Tensor>&, int64_t, int64_t, int64_t,
                     int64_t, double, bool, int, std::optional<int>, int,
-                    std::optional<std::string>, std::optional<std::string>>(),
+                    std::optional<std::string>, std::optional<std::string>,
+                    bool>(),
            nb::arg("kv_caches"), nb::arg("node_id"),
            nb::arg("local_control_port"), nb::arg("max_blocks"),
            nb::arg("num_slots"), nb::arg("timeout_s") = 120.0,
@@ -236,7 +238,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
            nb::arg("parallelism") = 4, nb::arg("listener_port") = nb::none(),
            nb::arg("raiden_worker_port") = 0,
            nb::arg("raiden_controller_address") = nb::none(),
-           nb::arg("worker_id") = nb::none())
+           nb::arg("worker_id") = nb::none(), nb::arg("enable_shm") = false)
       .def(nb::init<size_t, size_t, size_t, int64_t, std::optional<int>,
                     std::optional<int>, int, int, std::optional<std::string>,
                     std::optional<std::string>>(),

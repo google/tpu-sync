@@ -50,7 +50,7 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
-      int64_t node_id = 0);
+      int64_t node_id = 0, bool enable_shm = false);
 
   // Raw PjRtBuffer sharded constructor
   TorchKVCacheManager(
@@ -58,15 +58,17 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
-      int64_t node_id = 0);
+      int64_t node_id = 0, bool enable_shm = false);
 
   // New transfer-enabled constructor (flat list of tensors, single shard per
-  // layer)
+  // layer). enable_shm opts this manager's host buffers into the shared-memory
+  // segments named by RAIDEN_SHM_KEY; without it the env var is ignored.
   TorchKVCacheManager(const std::vector<at::Tensor>& kv_caches, int64_t node_id,
                       int64_t local_control_port, int64_t max_blocks,
                       int64_t num_slots, double timeout_s,
                       bool unsafe_skip_buffer_lock, int parallelism = 4,
-                      std::optional<int> listener_port = std::nullopt);
+                      std::optional<int> listener_port = std::nullopt,
+                      bool enable_shm = false);
 
   // Metadata-only constructor for host-memory Stage 1 resharding tests.
   TorchKVCacheManager(size_t num_layers, size_t num_shards,
@@ -130,7 +132,7 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
                       bool unsafe_skip_buffer_lock, int parallelism,
                       int64_t node_id, int64_t local_control_port,
                       int64_t max_blocks, int64_t num_slots, double timeout_s,
-                      std::vector<at::Tensor> kv_caches);
+                      std::vector<at::Tensor> kv_caches, bool enable_shm);
 
   std::vector<at::Tensor> kv_caches_;
   // Keep-alives for the materialized device buffers backing the manager.
@@ -147,7 +149,8 @@ class KVCacheManager {
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
       int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0);
+      std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0,
+      bool enable_shm = false);
 
   KVCacheManager(
       const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
@@ -156,7 +159,8 @@ class KVCacheManager {
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
       int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0);
+      std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0,
+      bool enable_shm = false);
 
   KVCacheManager(
       const std::vector<at::Tensor>& kv_caches, int64_t node_id,
@@ -165,7 +169,8 @@ class KVCacheManager {
       int parallelism = 4, std::optional<int> listener_port = std::nullopt,
       int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt);
+      std::optional<std::string> worker_id = std::nullopt,
+      bool enable_shm = false);
 
   KVCacheManager(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,

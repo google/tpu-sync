@@ -47,6 +47,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_boolean("run_worker", False, "")
 flags.DEFINE_string("worker_mode", "save_load", "")
 flags.DEFINE_boolean("use_slices", False, "")
+flags.DEFINE_boolean("enable_shm", False, "")
 flags.DEFINE_integer("rank", 0, "")
 flags.DEFINE_integer("world_size", 0, "")
 flags.DEFINE_integer("master_port", 0, "")
@@ -286,6 +287,7 @@ def _worker_save_load_main(argv):
             worker_id=f"worker_{rank}",
             host_blocks_to_allocate=4,
             node_id=rank,
+            enable_shm=FLAGS.enable_shm,
         )
       dist.barrier()
 
@@ -885,6 +887,7 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
         cmd = [
             sys.argv[0],
             "--run_worker",
+            "--enable_shm",
             f"--rank={rank}",
             f"--world_size={world_size}",
             f"--master_port={master_port}",

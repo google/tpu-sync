@@ -106,33 +106,35 @@ TorchKVCacheManager::UnpackedLayers TorchKVCacheManager::UnpackLayers(
 TorchKVCacheManager::TorchKVCacheManager(
     const std::vector<std::vector<at::Tensor>>& device_tensors,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
-    bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id)
+    bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id,
+    bool enable_shm)
     : TorchKVCacheManager(UnpackLayers(device_tensors, unsafe_skip_buffer_lock),
                           local_port, host_blocks_to_allocate,
                           unsafe_skip_buffer_lock, parallelism, node_id,
                           /*local_control_port=*/-1,
                           /*max_blocks=*/0, /*num_slots=*/0,
                           /*timeout_s=*/120.0,
-                          /*kv_caches=*/{}) {}
+                          /*kv_caches=*/{}, enable_shm) {}
 
 TorchKVCacheManager::TorchKVCacheManager(
     const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
-    bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id)
+    bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id,
+    bool enable_shm)
     : TorchKVCacheManager(UnpackLayers(device_buffers, unsafe_skip_buffer_lock),
                           local_port, host_blocks_to_allocate,
                           unsafe_skip_buffer_lock, parallelism, node_id,
                           /*local_control_port=*/-1,
                           /*max_blocks=*/0, /*num_slots=*/0,
                           /*timeout_s=*/120.0,
-                          /*kv_caches=*/{}) {}
+                          /*kv_caches=*/{}, enable_shm) {}
 
 TorchKVCacheManager::TorchKVCacheManager(
     UnpackedLayers unpacked, std::optional<int> local_port,
     std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
     int parallelism, int64_t node_id, int64_t local_control_port,
     int64_t max_blocks, int64_t num_slots, double timeout_s,
-    std::vector<at::Tensor> kv_caches)
+    std::vector<at::Tensor> kv_caches, bool enable_shm)
     : KVCacheManagerWithTransfer(
           unpacked.buffers,
           unpacked.has_logical_metadata ? unpacked.logical_slice_byte_size : 0,
@@ -142,7 +144,7 @@ TorchKVCacheManager::TorchKVCacheManager(
           local_port, host_blocks_to_allocate, unsafe_skip_buffer_lock,
           parallelism,
           CreateHostMemoryAllocator(
-              unpacked.client, max_blocks,
+              unpacked.client, enable_shm, max_blocks,
               (unpacked.buffers.empty() || unpacked.buffers[0].empty() ||
                unpacked.buffers[0][0].buffer == nullptr)
                   ? 0
@@ -160,13 +162,13 @@ TorchKVCacheManager::TorchKVCacheManager(
     const std::vector<at::Tensor>& kv_caches, int64_t node_id,
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
     double timeout_s, bool unsafe_skip_buffer_lock, int parallelism,
-    std::optional<int> listener_port)
+    std::optional<int> listener_port, bool enable_shm)
     : TorchKVCacheManager(UnpackLayers(SingleShardLayers(kv_caches)),
                           /*local_port=*/std::nullopt,
                           /*host_blocks_to_allocate=*/std::nullopt,
                           unsafe_skip_buffer_lock, parallelism, node_id,
                           local_control_port, max_blocks, num_slots, timeout_s,
-                          kv_caches) {
+                          kv_caches, enable_shm) {
   if (listener_port) {
     listener_ =
         std::make_unique<kv_cache::KVCacheListener>(this, *listener_port);
@@ -300,10 +302,10 @@ KVCacheManager::KVCacheManager(
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id, int64_t node_id)
+    std::optional<std::string> worker_id, int64_t node_id, bool enable_shm)
     : torch_manager_(std::make_unique<TorchKVCacheManager>(
           device_tensors, local_port, host_blocks_to_allocate,
-          unsafe_skip_buffer_lock, parallelism, node_id)) {
+          unsafe_skip_buffer_lock, parallelism, node_id, enable_shm)) {
   StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
 }
 
@@ -312,10 +314,10 @@ KVCacheManager::KVCacheManager(
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id, int64_t node_id)
+    std::optional<std::string> worker_id, int64_t node_id, bool enable_shm)
     : torch_manager_(std::make_unique<TorchKVCacheManager>(
           device_buffers, local_port, host_blocks_to_allocate,
-          unsafe_skip_buffer_lock, parallelism, node_id)) {
+          unsafe_skip_buffer_lock, parallelism, node_id, enable_shm)) {
   StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
 }
 
@@ -325,10 +327,11 @@ KVCacheManager::KVCacheManager(
     double timeout_s, bool unsafe_skip_buffer_lock, int parallelism,
     std::optional<int> listener_port, int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id)
+    std::optional<std::string> worker_id, bool enable_shm)
     : torch_manager_(std::make_unique<TorchKVCacheManager>(
           kv_caches, node_id, local_control_port, max_blocks, num_slots,
-          timeout_s, unsafe_skip_buffer_lock, parallelism, listener_port)) {
+          timeout_s, unsafe_skip_buffer_lock, parallelism, listener_port,
+          enable_shm)) {
   StartGrpcServer(raiden_worker_port, raiden_controller_address, worker_id);
 }
 

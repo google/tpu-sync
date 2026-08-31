@@ -77,6 +77,7 @@ _PHASE_A_MARKER = "PHASE_A_SAVED"
 _PHASE_B_RECOVERED_MARKER = "PHASE_B_RECOVERED"
 _PHASE_B_COLD_MARKER = "PHASE_B_COLD"
 _PHASE_B_BYTES_MARKER = "PHASE_B_BYTES_MATCH"
+_PHASE_GATE_MARKER = "PHASE_GATE_OK"
 
 
 def _find_free_port() -> int:
@@ -138,6 +139,7 @@ def _build_stack(tpu_caches, num_shards=1):
       raiden_worker_port=0,
       raiden_controller_address=f"localhost:{controller_port}",
       worker_id="worker_0",
+      enable_shm=True,
   )
   return store, manager, rid
 
@@ -236,6 +238,33 @@ def _phase_b(
   print(_PHASE_B_BYTES_MARKER, flush=True)
 
 
+def _phase_gate(enable_shm: bool):
+  """Constructs a bare manager and asserts it created no shm segments.
+
+  Covers both gate legs: with the env key present but enable_shm off, the
+  manager must stay out of shared memory; with enable_shm on but no env key,
+  construction must fall back to private host memory rather than fail.
+  """
+  import numpy as np
+  from tpu_sync.api.jax import kv_cache_manager
+
+  tpu_caches = _make_caches([np.zeros(_SHAPE, dtype=np.float32)])
+  manager = kv_cache_manager.KVCacheManager(
+      kv_caches=tpu_caches,
+      local_control_port=0,
+      max_blocks=_NUM_BLOCKS,
+      num_slots=2,
+      unsafe_skip_buffer_lock=True,
+      enable_shm=enable_shm,
+  )
+  key = os.environ.get("RAIDEN_SHM_KEY", "")
+  if key:
+    segments = [n for n in os.listdir("/dev/shm") if n.startswith(key)]
+    assert not segments, f"shared-memory segments appeared: {segments}"
+  del manager
+  print(_PHASE_GATE_MARKER, flush=True)
+
+
 class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
 
   def setUp(self):
@@ -256,13 +285,12 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
           pass
     super().tearDown()
 
-  def _phase_env(self, model_uid: str, num_devices: int = 1) -> dict:
+  def _phase_env(
+      self, model_uid: str, num_devices: int = 1, with_shm_key: bool = True
+  ) -> dict:
     env = dict(os.environ)
+    env.pop("RAIDEN_SHM_KEY", None)
     env.update({
-        # The KV pool and the metadata table are shm-backed under this single
-        # gate; recovery is exercised through the public construction path
-        # only, with no recovery-specific configuration.
-        "RAIDEN_SHM_KEY": self.shm_key,
         "RAIDEN_SHM_MODEL_UID": model_uid,
         "RAIDEN_DISABLE_SINGLETON_WORKER": "1",
         "JAX_PLATFORMS": "cpu",
@@ -271,10 +299,19 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
         # running under bazel runfiles or directly.
         "PYTHONPATH": os.pathsep.join(sys.path),
     })
+    if with_shm_key:
+      # The KV pool and the metadata table are shm-backed under this single
+      # deployment-level key; recovery is exercised through the public
+      # construction path only, with no recovery-specific configuration.
+      env["RAIDEN_SHM_KEY"] = self.shm_key
     return env
 
   def _run_phase(
-      self, phase: str, model_uid: str, num_devices: int = 1
+      self,
+      phase: str,
+      model_uid: str,
+      num_devices: int = 1,
+      with_shm_key: bool = True,
   ) -> subprocess.CompletedProcess:
     if sys.executable:
       cmd = [sys.executable, os.path.abspath(__file__), f"--phase={phase}"]
@@ -282,7 +319,7 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
       cmd = [os.path.abspath(sys.argv[0]), f"--phase={phase}"]
     return subprocess.run(
         cmd,
-        env=self._phase_env(model_uid, num_devices),
+        env=self._phase_env(model_uid, num_devices, with_shm_key),
         capture_output=True,
         text=True,
         timeout=300,
@@ -353,6 +390,28 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
     self.assertIn(_PHASE_B_RECOVERED_MARKER, result.stdout)
     self.assertIn(_PHASE_B_BYTES_MARKER, result.stdout)
 
+  def test_env_key_alone_does_not_pull_manager_into_shm(self):
+    # RAIDEN_SHM_KEY is a deployment-level setting shared by every manager in
+    # the process, including those whose host buffers are transient staging
+    # with nothing to persist. A manager that did not opt in via enable_shm
+    # must stay out of shared memory even with the key present.
+    result = self._run_phase("gate_default_off", "recovery_model")
+    self.assertEqual(
+        result.returncode, 0, f"gate phase failed:\n{result.stderr[-4000:]}"
+    )
+    self.assertIn(_PHASE_GATE_MARKER, result.stdout)
+
+  def test_enable_shm_without_env_key_falls_back(self):
+    # Opting in without a deployment key degrades to private host memory; it
+    # must not fail construction.
+    result = self._run_phase(
+        "gate_no_env", "recovery_model", with_shm_key=False
+    )
+    self.assertEqual(
+        result.returncode, 0, f"gate phase failed:\n{result.stderr[-4000:]}"
+    )
+    self.assertIn(_PHASE_GATE_MARKER, result.stdout)
+
 
 def main(argv):
   del argv  # Unused.
@@ -370,6 +429,10 @@ def main(argv):
     _phase_a(num_shards=2, num_devices=2)
   elif _PHASE.value == "b_sharded":
     _phase_b(expect_recovery=True, num_shards=2, num_devices=2)
+  elif _PHASE.value == "gate_default_off":
+    _phase_gate(enable_shm=False)
+  elif _PHASE.value == "gate_no_env":
+    _phase_gate(enable_shm=True)
 
 
 if __name__ == "__main__":

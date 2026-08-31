@@ -21,10 +21,12 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
@@ -40,16 +42,19 @@ inline constexpr size_t kDefaultQueueBufferSize = 4096;
 template <size_t N = kDefaultQueueBufferSize>
 class QueueBuffer {
  public:
-  explicit QueueBuffer(size_t max_capacity = N)
-      : max_capacity_(max_capacity) {}
+  explicit QueueBuffer(size_t max_capacity = N) : max_capacity_(max_capacity) {}
 
-  // Adds a value to the buffer. If the buffer is full, the value is dropped.
+  // Adds a value to the buffer. If the buffer is full, the value is dropped and
+  // a rate-limited warning is logged.
   void Push(double val) {
     absl::MutexLock lock(mutex_);
     if (samples_.size() < max_capacity_) {
       samples_.push_back(val);
+    } else {
+      LOG_EVERY_N_SEC(WARNING, 5)
+          << "QueueBuffer capacity (" << max_capacity_
+          << ") exceeded; dropping metric sample.";
     }
-    // else: drop the value. Figure out if we want to log this.
   }
 
   // Returns the values in the buffer and resets the buffer to empty.
@@ -84,6 +89,70 @@ class LockFreeCounterAccumulator {
   std::atomic<uint64_t> value_{0};
 };
 
+inline constexpr size_t kMaxLabeledSeries = 512;
+// Formats canonical Prometheus label string for in-memory series
+// identification. Returns "{key1=\"val1\",key2=\"val2\"}" sorted by key, with
+// Prometheus character escaping. Returns "" if labels are empty.
+std::string FormatCanonicalLabels(LabelSpan labels);
+
+// Encapsulates all time-series buffers for a single metric family.
+template <typename AccumulatorType>
+class MetricFamilyBuffer {
+ public:
+  MetricFamilyBuffer() = default;
+
+  MetricFamilyBuffer(const MetricFamilyBuffer&) = delete;
+  MetricFamilyBuffer& operator=(const MetricFamilyBuffer&) = delete;
+  MetricFamilyBuffer(MetricFamilyBuffer&&) = delete;
+  MetricFamilyBuffer& operator=(MetricFamilyBuffer&&) = delete;
+
+  // Returns the accumulator for the given label span, creating one if it does
+  // not yet exist. When labels are empty, returns the unlabeled_ fast path
+  // without locks.
+  AccumulatorType* GetOrCreate(LabelSpan labels) const {
+    if (labels.empty()) {
+      return &unlabeled_;
+    }
+    std::string canonical_labels = FormatCanonicalLabels(labels);
+    {
+      absl::ReaderMutexLock lock(labeled_mu_);
+      if (auto it = labeled_.find(canonical_labels); it != labeled_.end()) {
+        return it->second.get();
+      }
+    }
+    absl::MutexLock lock(labeled_mu_);
+    auto it = labeled_.find(canonical_labels);
+    if (it != labeled_.end()) {
+      return it->second.get();
+    }
+    if (labeled_.size() >= kMaxLabeledSeries) {
+      LOG_EVERY_N_SEC(WARNING, 5)
+          << "Max labeled series capacity (" << kMaxLabeledSeries
+          << ") exceeded; dropping metric series for labels: "
+          << canonical_labels;
+      return nullptr;
+    }
+    auto [insert_it, _] = labeled_.try_emplace(
+        std::move(canonical_labels), std::make_unique<AccumulatorType>());
+    return insert_it->second.get();
+  }
+
+  template <typename Fn>
+  void ForEachAccumulator(Fn&& fn) const {
+    fn(/*canonical_labels=*/"", &unlabeled_);
+    absl::ReaderMutexLock lock(labeled_mu_);
+    for (const auto& [canonical_labels, acc] : labeled_) {
+      fn(canonical_labels, acc.get());
+    }
+  }
+
+ private:
+  mutable AccumulatorType unlabeled_;
+  mutable absl::Mutex labeled_mu_;
+  mutable absl::flat_hash_map<std::string, std::unique_ptr<AccumulatorType>>
+      labeled_ ABSL_GUARDED_BY(labeled_mu_);
+};
+
 // MetricsBackend for step-level sample buffering.
 //
 // Thread Safety:
@@ -116,10 +185,18 @@ class BufferedMetricsExporter : public MetricsBackend {
       override;
 
  private:
-  absl::flat_hash_map<std::string, std::unique_ptr<LockFreeCounterAccumulator>>
+  absl::flat_hash_map<
+      std::string,
+      std::unique_ptr<MetricFamilyBuffer<LockFreeCounterAccumulator>>>
       counters_;
-  absl::flat_hash_map<std::string, std::unique_ptr<QueueBuffer<>>> gauges_;
-  absl::flat_hash_map<std::string, std::unique_ptr<QueueBuffer<>>> histograms_;
+  absl::flat_hash_map<
+      std::string,
+      std::unique_ptr<MetricFamilyBuffer<QueueBuffer<>>>>
+      gauges_;
+  absl::flat_hash_map<
+      std::string,
+      std::unique_ptr<MetricFamilyBuffer<QueueBuffer<>>>>
+      histograms_;
 };
 
 }  // namespace tpu_raiden::telemetry

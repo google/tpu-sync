@@ -25,6 +25,9 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden::telemetry {
@@ -218,6 +221,208 @@ TEST(LockFreeCounterAccumulatorTest, ConcurrentAddStress) {
 }
 
 // -----------------------------------------------------------------------------
+// MetricFamilyBuffer Tests
+// -----------------------------------------------------------------------------
+
+TEST(MetricFamilyBufferTest, EmptyLabelsReturnsUnlabeledAccumulator) {
+  MetricFamilyBuffer<LockFreeCounterAccumulator> family_buffer;
+  auto* acc1 = family_buffer.GetOrCreate({});
+  ASSERT_NE(acc1, nullptr);
+
+  acc1->Add(42);
+
+  auto* acc2 = family_buffer.GetOrCreate({});
+  EXPECT_EQ(acc1, acc2);
+  EXPECT_EQ(acc2->ExchangeAndReset(), 42);
+}
+
+TEST(MetricFamilyBufferTest, DistinctLabelsReturnDistinctAccumulators) {
+  MetricFamilyBuffer<LockFreeCounterAccumulator> family_buffer;
+  MetricLabel label_a[] = {{"type", "a"}};
+  MetricLabel label_b[] = {{"type", "b"}};
+
+  auto* acc_unlabeled = family_buffer.GetOrCreate({});
+  auto* acc_a = family_buffer.GetOrCreate(label_a);
+  auto* acc_b = family_buffer.GetOrCreate(label_b);
+
+  ASSERT_NE(acc_unlabeled, nullptr);
+  ASSERT_NE(acc_a, nullptr);
+  ASSERT_NE(acc_b, nullptr);
+  EXPECT_NE(acc_unlabeled, acc_a);
+  EXPECT_NE(acc_unlabeled, acc_b);
+  EXPECT_NE(acc_a, acc_b);
+
+  // Calling again with same labels returns same pointer
+  EXPECT_EQ(family_buffer.GetOrCreate(label_a), acc_a);
+}
+
+TEST(MetricFamilyBufferTest, SameLabelsInDifferentOrderReturnSameAccumulator) {
+  MetricFamilyBuffer<LockFreeCounterAccumulator> family_buffer;
+  MetricLabel labels_order1[] = {{"k1", "v1"}, {"k2", "v2"}};
+  MetricLabel labels_order2[] = {{"k2", "v2"}, {"k1", "v1"}};
+
+  auto* acc1 = family_buffer.GetOrCreate(labels_order1);
+  auto* acc2 = family_buffer.GetOrCreate(labels_order2);
+
+  ASSERT_NE(acc1, nullptr);
+  EXPECT_EQ(acc1, acc2);
+}
+
+TEST(MetricFamilyBufferTest, CapacityLimitEnforced) {
+  MetricFamilyBuffer<LockFreeCounterAccumulator> family_buffer;
+  for (size_t i = 0; i < kMaxLabeledSeries; ++i) {
+    std::string val = absl::StrCat("val_", i);
+    MetricLabel label[] = {{"key", val}};
+    EXPECT_NE(family_buffer.GetOrCreate(label), nullptr);
+  }
+
+  MetricLabel overflow_label[] = {{"key", "overflow"}};
+  EXPECT_EQ(family_buffer.GetOrCreate(overflow_label), nullptr);
+}
+
+TEST(MetricFamilyBufferTest, ForEachAccumulatorTraversesUnlabeledAndLabeled) {
+  MetricFamilyBuffer<LockFreeCounterAccumulator> family_buffer;
+  family_buffer.GetOrCreate({})->Add(10);
+
+  MetricLabel label_a[] = {{"type", "a"}};
+  MetricLabel label_b[] = {{"type", "b"}};
+  family_buffer.GetOrCreate(label_a)->Add(20);
+  family_buffer.GetOrCreate(label_b)->Add(30);
+
+  std::map<std::string, uint64_t> visited;
+  family_buffer.ForEachAccumulator(
+      [&](absl::string_view canonical_labels,
+          LockFreeCounterAccumulator* acc) {
+        visited[std::string(canonical_labels)] = acc->ExchangeAndReset();
+      });
+
+  EXPECT_EQ(visited[""], 10);
+  EXPECT_EQ(visited["{type=\"a\"}"], 20);
+  EXPECT_EQ(visited["{type=\"b\"}"], 30);
+}
+
+TEST(MetricFamilyBufferTest, ConcurrentGetOrCreateThreadSafe) {
+  MetricFamilyBuffer<LockFreeCounterAccumulator> family_buffer;
+  constexpr int kNumThreads = 8;
+  constexpr int kIterations = 1000;
+
+  std::vector<std::thread> threads;
+  threads.reserve(kNumThreads);
+  for (int t = 0; t < kNumThreads; ++t) {
+    threads.emplace_back([&family_buffer, t] {
+      for (int i = 0; i < kIterations; ++i) {
+        if (i % 2 == 0) {
+          auto* acc = family_buffer.GetOrCreate({});
+          ASSERT_NE(acc, nullptr);
+          acc->Add(1);
+        } else {
+          std::string label_val = absl::StrCat("val_", (t * 10 + i) % 10);
+          MetricLabel label[] = {{"shard", label_val}};
+          auto* acc = family_buffer.GetOrCreate(label);
+          ASSERT_NE(acc, nullptr);
+          acc->Add(1);
+        }
+      }
+    });
+  }
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  uint64_t total = 0;
+  family_buffer.ForEachAccumulator(
+      [&](absl::string_view, LockFreeCounterAccumulator* acc) {
+        total += acc->ExchangeAndReset();
+      });
+
+  constexpr uint64_t kExpectedTotal =
+      static_cast<uint64_t>(kNumThreads) * kIterations;
+  EXPECT_EQ(total, kExpectedTotal);
+}
+
+// -----------------------------------------------------------------------------
+// FormatCanonicalLabels Tests
+// -----------------------------------------------------------------------------
+
+TEST(FormatCanonicalLabelsTest, EmptyLabelsReturnsEmptyString) {
+  EXPECT_EQ(FormatCanonicalLabels({}), "");
+}
+
+TEST(FormatCanonicalLabelsTest, SingleLabelFormattedCorrectly) {
+  MetricLabel label{"direction", "push"};
+  EXPECT_EQ(FormatCanonicalLabels(absl::MakeConstSpan(&label, 1)),
+            "{direction=\"push\"}");
+}
+
+TEST(FormatCanonicalLabelsTest, MultipleLabelsSortedLexicographically) {
+  MetricLabel labels_order1[] = {
+      {"mode", "direct"},
+      {"direction", "pull"},
+  };
+  MetricLabel labels_order2[] = {
+      {"direction", "pull"},
+      {"mode", "direct"},
+  };
+  EXPECT_EQ(FormatCanonicalLabels(labels_order1),
+            "{direction=\"pull\",mode=\"direct\"}");
+  EXPECT_EQ(FormatCanonicalLabels(labels_order2),
+            "{direction=\"pull\",mode=\"direct\"}");
+}
+
+TEST(FormatCanonicalLabelsTest, EscapesSpecialCharactersInValues) {
+  MetricLabel label1{"msg", "hello \"world\""};
+  MetricLabel label2{"path", "C:\\new\\folder"};
+  MetricLabel label3{"multiline", "line1\nline2"};
+
+  EXPECT_EQ(FormatCanonicalLabels(absl::MakeConstSpan(&label1, 1)),
+            "{msg=\"hello \\\"world\\\"\"}");
+  EXPECT_EQ(FormatCanonicalLabels(absl::MakeConstSpan(&label2, 1)),
+            "{path=\"C:\\\\new\\\\folder\"}");
+  EXPECT_EQ(FormatCanonicalLabels(absl::MakeConstSpan(&label3, 1)),
+            "{multiline=\"line1\\nline2\"}");
+}
+
+TEST(FormatCanonicalLabelsTest, ExactInlinedCapacityBoundary) {
+  MetricLabel labels[] = {
+      {"d_label", "4"},
+      {"b_label", "2"},
+      {"a_label", "1"},
+      {"c_label", "3"},
+  };
+  EXPECT_EQ(FormatCanonicalLabels(labels),
+            "{a_label=\"1\",b_label=\"2\",c_label=\"3\",d_label=\"4\"}");
+}
+
+TEST(FormatCanonicalLabelsTest, EmptyValueFormattedCorrectly) {
+  MetricLabel label{"empty_key", ""};
+  EXPECT_EQ(FormatCanonicalLabels(absl::MakeConstSpan(&label, 1)),
+            "{empty_key=\"\"}");
+}
+
+TEST(FormatCanonicalLabelsTest, ExceedsInlinedCapacityCorrectly) {
+  MetricLabel labels[] = {
+      {"z_label", "6"}, {"e_label", "5"}, {"d_label", "4"},
+      {"c_label", "3"}, {"b_label", "2"}, {"a_label", "1"},
+  };
+  EXPECT_EQ(FormatCanonicalLabels(labels),
+            "{a_label=\"1\",b_label=\"2\",c_label=\"3\",d_label=\"4\",e_label=\"5\",z_label=\"6\"}");
+}
+
+TEST(FormatCanonicalLabelsTest, LongLabelsFormattedCorrectly) {
+  MetricLabel long_labels[] = {
+      {"extremely_long_label_key_number_one",
+       "extremely_long_label_value_number_one_exceeding_standard_sso"},
+      {"extremely_long_label_key_number_two",
+       "extremely_long_label_value_number_two_exceeding_standard_sso"},
+  };
+  EXPECT_EQ(
+      FormatCanonicalLabels(long_labels),
+      "{extremely_long_label_key_number_one=\"extremely_long_label_value_number_one_exceeding_standard_sso\","
+      "extremely_long_label_key_number_two=\"extremely_long_label_value_number_two_exceeding_standard_sso\"}");
+}
+
+// -----------------------------------------------------------------------------
 // BufferedMetricsExporter Tests
 // -----------------------------------------------------------------------------
 
@@ -281,17 +486,118 @@ TEST(BufferedMetricsExporterTest, GaugeAndHistogramMetricsExport) {
   EXPECT_THAT(exporter.GetAndResetMetricSamples(), IsEmpty());
 }
 
-TEST(BufferedMetricsExporterTest, MetricLabelsPassedWithoutError) {
+TEST(BufferedMetricsExporterTest, MetricLabelsPassedAndAccumulatedSeparately) {
   BufferedMetricsExporter exporter;
-  MetricLabel labels[] = {
+  MetricLabel push_labels[] = {
       {"direction", "push"},
-      {"peer_id", "42"},
+  };
+  MetricLabel pull_labels[] = {
+      {"direction", "pull"},
   };
 
-  exporter.IncrementCounter(metric_names::kSentBytesTotal, labels, 1024);
+  exporter.IncrementCounter(metric_names::kSentBytesTotal, push_labels, 1024);
+  exporter.IncrementCounter(metric_names::kSentBytesTotal, push_labels, 512);
+  exporter.IncrementCounter(metric_names::kSentBytesTotal, pull_labels, 2048);
+  exporter.IncrementCounter(metric_names::kSentBytesTotal, {}, 100);
+
   auto samples = exporter.GetAndResetMetricSamples();
+  EXPECT_EQ(samples["tpu_raiden_sent_bytes_total{direction=\"push\"}"],
+            (std::vector<double>{1536.0}));
+  EXPECT_EQ(samples["tpu_raiden_sent_bytes_total{direction=\"pull\"}"],
+            (std::vector<double>{2048.0}));
   EXPECT_EQ(samples["tpu_raiden_sent_bytes_total"],
-            (std::vector<double>{1024.0}));
+            (std::vector<double>{100.0}));
+}
+
+TEST(BufferedMetricsExporterTest, MultiDimensionalLabelsSortingInvariance) {
+  BufferedMetricsExporter exporter;
+  MetricLabel labels1[] = {
+      {"error_code", "DEADLINE_EXCEEDED"},
+      {"direction", "pull"},
+  };
+  MetricLabel labels2[] = {
+      {"direction", "pull"},
+      {"error_code", "DEADLINE_EXCEEDED"},
+  };
+
+  exporter.IncrementCounter(metric_names::kTransferFailuresTotal, labels1, 1);
+  exporter.IncrementCounter(metric_names::kTransferFailuresTotal, labels2, 2);
+
+  auto samples = exporter.GetAndResetMetricSamples();
+  EXPECT_EQ(
+      samples["tpu_raiden_transfer_failures_total{direction=\"pull\",error_code=\"DEADLINE_EXCEEDED\"}"],
+      (std::vector<double>{3.0}));
+}
+
+TEST(BufferedMetricsExporterTest, UnlabeledGaugesAndHistograms) {
+  BufferedMetricsExporter exporter;
+  exporter.SetGauge(metric_names::kBufferAllocatedBytes, {}, 1024.0 * 1024.0);
+  exporter.ObserveHistogram(metric_names::kTransferDurationMs, {}, 15.5);
+  exporter.ObserveHistogram(metric_names::kH2dTransferTimeMs, {}, 2.5);
+  exporter.ObserveHistogram(metric_names::kD2hTransferTimeMs, {}, 3.5);
+
+  auto samples = exporter.GetAndResetMetricSamples();
+  EXPECT_EQ(samples["tpu_raiden_buffer_allocated_bytes"],
+            (std::vector<double>{1024.0 * 1024.0}));
+  EXPECT_EQ(samples["tpu_raiden_transfer_duration_ms"],
+            (std::vector<double>{15.5}));
+  EXPECT_EQ(samples["tpu_raiden_h2d_transfer_time_ms"],
+            (std::vector<double>{2.5}));
+  EXPECT_EQ(samples["tpu_raiden_d2h_transfer_time_ms"],
+            (std::vector<double>{3.5}));
+}
+
+TEST(BufferedMetricsExporterTest, LabeledGaugesAndHistograms) {
+  MetricMetadata custom_metrics[] = {
+      MetricMetadata{
+          .name = "custom_gauge",
+          .description = "Custom labeled gauge.",
+          .type = MetricType::kGauge,
+      },
+      MetricMetadata{
+          .name = "custom_histogram",
+          .description = "Custom labeled histogram.",
+          .type = MetricType::kHistogram,
+      },
+  };
+  BufferedMetricsExporter exporter(custom_metrics);
+
+  MetricLabel label_a[] = {{"type", "a"}};
+  MetricLabel label_b[] = {{"type", "b"}};
+
+  exporter.SetGauge("custom_gauge", label_a, 1024.0 * 1024.0);
+  exporter.SetGauge("custom_gauge", label_b, 2048.0 * 1024.0);
+
+  MetricLabel direct_pull[] = {{"direction", "pull"}, {"mode", "direct"}};
+  MetricLabel reshard_pull[] = {{"direction", "pull"}, {"mode", "reshard"}};
+
+  exporter.ObserveHistogram("custom_histogram", direct_pull, 15.5);
+  exporter.ObserveHistogram("custom_histogram", reshard_pull, 42.0);
+
+  auto samples = exporter.GetAndResetMetricSamples();
+  EXPECT_EQ(samples["tpu_raiden_custom_gauge{type=\"a\"}"],
+            (std::vector<double>{1024.0 * 1024.0}));
+  EXPECT_EQ(samples["tpu_raiden_custom_gauge{type=\"b\"}"],
+            (std::vector<double>{2048.0 * 1024.0}));
+  EXPECT_EQ(
+      samples["tpu_raiden_custom_histogram{direction=\"pull\",mode=\"direct\"}"],
+      (std::vector<double>{15.5}));
+  EXPECT_EQ(
+      samples["tpu_raiden_custom_histogram{direction=\"pull\",mode=\"reshard\"}"],
+      (std::vector<double>{42.0}));
+}
+
+TEST(BufferedMetricsExporterTest, CardinalitySafeguardCap) {
+  BufferedMetricsExporter exporter;
+  for (int i = 0; i < 600; ++i) {
+    std::string val = absl::StrCat("tag_", i);
+    MetricLabel label[] = {{"series", val}};
+    exporter.IncrementCounter(metric_names::kSentBytesTotal, label, 1);
+  }
+
+  auto samples = exporter.GetAndResetMetricSamples();
+  // Bounded to at most kMaxLabeledSeries (512)
+  EXPECT_LE(samples.size(), kMaxLabeledSeries);
 }
 
 TEST(BufferedMetricsExporterTest, UnknownMetricNameIsIgnoredSafely) {
@@ -354,6 +660,34 @@ TEST(BufferedMetricsExporterTest,
       static_cast<double>(kNumWriters * kIncrementsPerWriter * kDelta);
   EXPECT_DOUBLE_EQ(total_extracted.load(), kExpectedTotal);
   EXPECT_THAT(exporter.GetAndResetMetricSamples(), IsEmpty());
+}
+
+TEST(BufferedMetricsExporterTest, ConcurrentLabeledEmissions) {
+  BufferedMetricsExporter exporter;
+  constexpr int kNumWriters = 4;
+  constexpr int kIncrementsPerWriter = 1000;
+
+  std::vector<std::thread> writers;
+  writers.reserve(kNumWriters);
+  for (int w = 0; w < kNumWriters; ++w) {
+    writers.emplace_back([&exporter, w] {
+      std::string dir = (w % 2 == 0) ? "push" : "pull";
+      MetricLabel labels[] = {{"direction", dir}};
+      for (int i = 0; i < kIncrementsPerWriter; ++i) {
+        exporter.IncrementCounter(metric_names::kSentBytesTotal, labels, 10);
+      }
+    });
+  }
+
+  for (auto& writer : writers) {
+    writer.join();
+  }
+
+  auto samples = exporter.GetAndResetMetricSamples();
+  EXPECT_EQ(samples["tpu_raiden_sent_bytes_total{direction=\"push\"}"],
+            (std::vector<double>{20000.0}));
+  EXPECT_EQ(samples["tpu_raiden_sent_bytes_total{direction=\"pull\"}"],
+            (std::vector<double>{20000.0}));
 }
 
 }  // namespace

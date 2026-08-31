@@ -45,6 +45,7 @@ py_library(
         ":pool_layout",
         ":torch_abi",
         ":torch_tpu_common_loader",
+        # buildcleaner: keep
         "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
         "//tpu_sync/rpc:raiden_service_py_pb2",
     ],
@@ -56,8 +57,9 @@ py_library(
     visibility = ["//visibility:public"],
     deps = [
         ":pool_layout",
+        ":torch_abi",
+        ":torch_tpu_common_loader",
         "//tpu_sync/frameworks/torch:_tpu_raiden_host",
-        "//tpu_sync/rpc:raiden_service_py_pb2",
     ],
 )
 
@@ -139,9 +141,13 @@ py_test(
         "//tpu_sync/kv_cache/global_registry:global_registry_server",
     ],
     deps = [
+        ":kv_cache_manager_torch_py",
         ":kv_cache_store",
         "//pyglib:resources",
         "@com_google_absl_py//absl/testing:absltest",
+        "@pypi//numpy",
+        "@torch_tpu//shims/torch:pytorch",
+        "@torch_tpu//torch_tpu",
     ],
 )
 
@@ -166,7 +172,7 @@ py_test(
 
 # Base accelerator test requiring physical TPU devices via torch_tpu.
 # Tagged "manual" because generic CPU Forge runners lack TPU hardware.
-# For remote execution on Forge, use the _gf (TPU v4) or _gl (TPU v5e) targets below.
+# For remote execution on Forge, use the _gl (TPU v6e) target below.
 py_test(
     name = "kv_cache_store_recovery_e2e_test",
     srcs = ["kv_cache_store_recovery_e2e_test.py"],
@@ -199,7 +205,6 @@ py_test(
         ":kv_cache_manager_torch_py",
         "@com_google_absl_py//absl/testing:absltest",
         "@com_google_absl_py//absl/testing:parameterized",
-        "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
         "@torch_tpu//torch_tpu",
     ],

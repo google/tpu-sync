@@ -44,6 +44,13 @@ namespace kv_cache {
 // returning true; the heartbeat check is interleaved between steps, so
 // sweeping delays a heartbeat by at most one bounded step.
 //
+// With a RepublishFn, a successful re-register also kicks off an inventory
+// republish -- the lapse that forced the re-register means the registry may
+// have purged (or, after a registry restart, lost) every block entry this
+// store owns. It runs on the same bounded-step contract as the sweep, and
+// RequestRepublish() starts one without a lapse (the boot-after-recovery
+// case).
+//
 // Owned by KVCacheStore; deliberately talks to the store only through the
 // callbacks so it never sees store internals.
 class StoreMonitor {
@@ -64,12 +71,15 @@ class StoreMonitor {
   // in which case the monitor runs the next step right away; false parks the
   // sweep until the next period or request.
   using SweepFn = std::function<bool()>;
+  // One bounded step of inventory republish; same contract as SweepFn.
+  using RepublishFn = std::function<bool()>;
 
   StoreMonitor(const Options& options,
                std::shared_ptr<global_registry::GlobalRegistryClient>
                    registry_client,
                RaidenId raiden_id, StatusFn status_fn,
-               ReregisterFn reregister_fn, SweepFn sweep_fn = nullptr);
+               ReregisterFn reregister_fn, SweepFn sweep_fn = nullptr,
+               RepublishFn republish_fn = nullptr);
 
   // Stops the threads; the callbacks must outlive this call, not the object.
   ~StoreMonitor();
@@ -92,9 +102,21 @@ class StoreMonitor {
   // sweep period later. No-op without a SweepFn or after Stop().
   void RequestSweep();
 
+  // Request an inventory republish without waiting for a registration lapse.
+  // Called after a crash restart recovers blocks from the local manifest,
+  // whose registry entries a purge may have removed in the meantime. No-op
+  // without a RepublishFn or after Stop().
+  void RequestRepublish();
+
  private:
   void Loop();
-  void HeartbeatOnce();
+  // Returns true ONLY when the heartbeat came back NotFound (the registry
+  // holds no live registration) AND reregister_fn_ then succeeded. That
+  // combination is what triggers the inventory republish: the lapse means
+  // the registry may have purged this store's block entries, and the fresh
+  // registration means it is ready to take them back. A healthy heartbeat,
+  // a transport error, or a failed re-register all return false.
+  bool HeartbeatOnce();
 
   const Options options_;
   const std::shared_ptr<global_registry::GlobalRegistryClient>
@@ -103,13 +125,15 @@ class StoreMonitor {
   const StatusFn status_fn_;
   const ReregisterFn reregister_fn_;
   const SweepFn sweep_fn_;
+  const RepublishFn republish_fn_;
 
   absl::Mutex mu_;
-  // Signaled on Stop() and RequestSweep(); the loop waits on it with a
-  // deadline, so a signal is its only early wake-up.
+  // Signaled on Stop(), RequestSweep() and RequestRepublish(); the loop waits
+  // on it with a deadline, so a signal is its only early wake-up.
   absl::CondVar cv_;
   bool stop_ ABSL_GUARDED_BY(mu_) = false;
   bool sweep_requested_ ABSL_GUARDED_BY(mu_) = false;
+  bool republish_requested_ ABSL_GUARDED_BY(mu_) = false;
   std::thread thread_;
 };
 

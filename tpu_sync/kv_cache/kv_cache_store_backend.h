@@ -211,6 +211,7 @@ class KVCacheStoreBackend {
   // testing/diagnostics).
   virtual std::vector<std::string> GetEvictCandidateKeys() const { return {}; }
 
+
   // --- Remote write (WriteRemote) ------------------------------------------
   //
   // These four exist because a WriteRemote handler holds only this interface,

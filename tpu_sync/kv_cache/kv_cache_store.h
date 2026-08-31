@@ -626,6 +626,13 @@ class KVCacheStore {
   // the only caller, which is why the episode state below needs no lock.
   bool SweepOnce();
 
+  // One bounded step of the inventory republish that runs after this store's
+  // registration lapsed at the registry (see StoreMonitor::RepublishFn): on
+  // the first step snapshots every host-resident hash, then per step pins
+  // one batch, re-registers it, and releases the pins. Returns true while
+  // batches remain. Same single-caller contract as SweepOnce.
+  bool RepublishOnce();
+
   // What became of one offered batch, polled until every block is terminal.
   struct BatchWriteResult {
     // Blocks the peer now holds; their local copies are safe to free.
@@ -675,6 +682,10 @@ class KVCacheStore {
   // episode and reused until it ends or every target has been dropped.
   bool sweep_active_ = false;
   std::vector<RaidenId> placement_targets_;
+  // Hashes still to republish, drained from the back by RepublishOnce on the
+  // monitor's thread (its only toucher, so no lock). Non-empty exactly while
+  // a republish is in progress.
+  std::vector<std::string> republish_queue_;
   // Constructed and started at the end of Create when enabled; stopped first
   // thing in the destructor, before anything its callbacks touch goes away.
   std::unique_ptr<StoreMonitor> store_monitor_;

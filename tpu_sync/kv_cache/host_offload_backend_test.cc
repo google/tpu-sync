@@ -107,6 +107,52 @@ TEST(HostOffloadBackendTest, BasicInsertAndLookup) {
   EXPECT_TRUE(miss_res->empty());
 }
 
+TEST(HostOffloadBackendTest, SnapshotAndPinHostResidentForRepublish) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/4);
+  RaidenId id{"job", "0", "data", 0};
+  std::vector<std::string> hashes = {"h1", "h2"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(id, 10, BlockStatus::HOST),
+      RaidenBlockId(id, 11, BlockStatus::HOST_AND_HBM)};
+  backend.Insert(hashes, slices, /*on_host=*/true);
+
+  EXPECT_THAT(backend.SnapshotHostResidentHashes(),
+              UnorderedElementsAre("h1", "h2"));
+
+  // A hash evicted after the snapshot must be skipped, not resurrected --
+  // republishing it would advertise a block that is gone.
+  backend.Evict({"h2"});
+  const int base_pins = backend.GetPinCount("h1");
+  auto pinned = backend.PinPresentHostResident(
+      std::vector<std::string>{"h1", "h2", "never_inserted"});
+  ASSERT_EQ(pinned.size(), 1);
+  EXPECT_EQ(pinned[0].first, "h1");
+  EXPECT_EQ(pinned[0].second, 10);
+  EXPECT_EQ(backend.GetPinCount("h1"), base_pins + 1);
+  backend.Release({"h1"});
+  EXPECT_EQ(backend.GetPinCount("h1"), base_pins);
+}
+
+TEST(HostOffloadBackendTest, RepublishSkipsEvictionCandidates) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/2);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"h1", "h2"},
+                 {RaidenBlockId(id, 10, BlockStatus::HOST),
+                  RaidenBlockId(id, 11, BlockStatus::HOST)},
+                 /*on_host=*/true);
+  // A third insert overflows capacity 2 and demotes the LRU entry ("h1") to
+  // an eviction candidate: still holding its host block, but on its way out.
+  backend.Insert({"h3"}, {RaidenBlockId(id, 12, BlockStatus::HOST)},
+                 /*on_host=*/true);
+  ASSERT_THAT(backend.GetEvictCandidateKeys(),
+              UnorderedElementsAre("h1"));
+
+  EXPECT_THAT(backend.SnapshotHostResidentHashes(),
+              UnorderedElementsAre("h2", "h3"));
+  EXPECT_TRUE(
+      backend.PinPresentHostResident(std::vector<std::string>{"h1"}).empty());
+}
+
 TEST(HostOffloadBackendTest, LookupUnboundedByAvailableSpace) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/2);
   std::vector<std::string> hashes = {"h1", "h2"};

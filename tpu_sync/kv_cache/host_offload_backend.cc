@@ -681,6 +681,45 @@ std::vector<int> HostOffloadBackend::Evict(
   return host_ids_to_deallocate;
 }
 
+std::vector<std::string> HostOffloadBackend::SnapshotHostResidentHashes()
+    const {
+  absl::MutexLock lock(mutex_);
+  std::vector<std::string> hashes;
+  hashes.reserve(lru_cache_.size());
+  for (const auto& [hash, it] : lru_cache_.map()) {
+    // Candidates are excluded on purpose: they are queued for eviction, and
+    // republishing one would advertise a block that is about to disappear.
+    if (it->location != NodeLocation::kCandidate &&
+        (it->value.status == BlockStatus::HOST ||
+         it->value.status == BlockStatus::HOST_AND_HBM)) {
+      hashes.push_back(hash);
+    }
+  }
+  return hashes;
+}
+
+std::vector<std::pair<std::string, int32_t>>
+HostOffloadBackend::PinPresentHostResident(
+    absl::Span<const std::string> block_hashes) {
+  absl::MutexLock lock(mutex_);
+  std::vector<std::pair<std::string, int32_t>> pinned;
+  pinned.reserve(block_hashes.size());
+  for (const std::string& hash : block_hashes) {
+    // Peek before Pin: Pin resurrects eviction candidates, and a hash that
+    // became a candidate since the caller's snapshot must stay on its way
+    // out rather than be re-advertised.
+    const RaidenBlockId* entry = lru_cache_.Peek(hash);
+    if (entry == nullptr || (entry->status != BlockStatus::HOST &&
+                             entry->status != BlockStatus::HOST_AND_HBM)) {
+      continue;
+    }
+    if (lru_cache_.Pin(hash)) {
+      pinned.push_back({hash, entry->host_block_id});
+    }
+  }
+  return pinned;
+}
+
 std::vector<std::string> HostOffloadBackend::GetEvictCandidateKeys() const {
   absl::MutexLock lock(mutex_);
   return lru_cache_.GetEvictCandidateKeys();

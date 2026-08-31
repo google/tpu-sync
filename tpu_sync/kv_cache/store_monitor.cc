@@ -34,13 +34,14 @@ StoreMonitor::StoreMonitor(
     const Options& options,
     std::shared_ptr<global_registry::GlobalRegistryClient> registry_client,
     RaidenId raiden_id, StatusFn status_fn, ReregisterFn reregister_fn,
-    SweepFn sweep_fn)
+    SweepFn sweep_fn, RepublishFn republish_fn)
     : options_(options),
       registry_client_(std::move(registry_client)),
       raiden_id_(std::move(raiden_id)),
       status_fn_(std::move(status_fn)),
       reregister_fn_(std::move(reregister_fn)),
-      sweep_fn_(std::move(sweep_fn)) {}
+      sweep_fn_(std::move(sweep_fn)),
+      republish_fn_(std::move(republish_fn)) {}
 
 StoreMonitor::~StoreMonitor() { Stop(); }
 
@@ -66,6 +67,15 @@ void StoreMonitor::RequestSweep() {
   cv_.Signal();
 }
 
+void StoreMonitor::RequestRepublish() {
+  if (republish_fn_ == nullptr) {
+    return;
+  }
+  absl::MutexLock lock(mu_);
+  republish_requested_ = true;
+  cv_.Signal();
+}
+
 void StoreMonitor::Loop() {
   const bool sweeping = sweep_fn_ != nullptr;
   absl::Time next_heartbeat = absl::Now() + options_.heartbeat_period;
@@ -73,14 +83,17 @@ void StoreMonitor::Loop() {
   // True while a sweep request is pending or the last sweep step reported more
   // work; the loop then skips the wait, but still passes the heartbeat
   // check between steps -- so a long drain delays a heartbeat by at most
-  // one bounded step.
+  // one bounded step. republish_now works the same way; the sweep step runs
+  // first so republishing never delays pressure relief.
   bool sweep_now = false;
+  bool republish_now = false;
   while (true) {
     {
       absl::MutexLock lock(mu_);
       const absl::Time wake =
           sweeping ? std::min(next_heartbeat, next_sweep) : next_heartbeat;
-      while (!stop_ && !sweep_requested_ && !sweep_now && absl::Now() < wake) {
+      while (!stop_ && !sweep_requested_ && !republish_requested_ &&
+             !sweep_now && !republish_now && absl::Now() < wake) {
         cv_.WaitWithDeadline(&mu_, wake);
       }
       if (stop_) {
@@ -88,38 +101,46 @@ void StoreMonitor::Loop() {
       }
       sweep_now = sweep_now || sweep_requested_;
       sweep_requested_ = false;
+      republish_now = republish_now || republish_requested_;
+      republish_requested_ = false;
     }
     if (absl::Now() >= next_heartbeat) {
-      HeartbeatOnce();
+      if (HeartbeatOnce() && republish_fn_ != nullptr) {
+        republish_now = true;
+      }
       next_heartbeat = absl::Now() + options_.heartbeat_period;
     }
     if (sweeping && (sweep_now || absl::Now() >= next_sweep)) {
       sweep_now = sweep_fn_();
       next_sweep = absl::Now() + options_.sweep_period;
     }
+    if (republish_fn_ != nullptr && republish_now) {
+      republish_now = republish_fn_();
+    }
   }
 }
 
-void StoreMonitor::HeartbeatOnce() {
+bool StoreMonitor::HeartbeatOnce() {
   absl::Status status = registry_client_->Heartbeat(raiden_id_, status_fn_());
   if (status.ok()) {
-    return;
+    return false;
   }
   if (!absl::IsNotFound(status)) {
     LOG(WARNING) << "Store heartbeat to the global registry failed: " << status
                  << ". Retrying next period; the registration expires if this "
                     "keeps failing.";
-    return;
+    return false;
   }
   absl::Status reregistered = reregister_fn_();
   if (reregistered.ok()) {
     LOG(INFO) << "Store registration lapsed at the global registry "
                  "(registry restart or expired TTL); re-registered.";
-  } else {
-    LOG(WARNING) << "Store registration lapsed at the global registry and "
-                    "re-registering failed: "
-                 << reregistered << ". Retrying next period.";
+    return true;
   }
+  LOG(WARNING) << "Store registration lapsed at the global registry and "
+                  "re-registering failed: "
+               << reregistered << ". Retrying next period.";
+  return false;
 }
 
 }  // namespace kv_cache

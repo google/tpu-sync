@@ -3838,6 +3838,61 @@ TEST_F(StoreDiscoveryTest, StoreMonitorHeartbeatsTheRegistration) {
   EXPECT_TRUE(absl::IsNotFound(client_->ResolveStore(rid).status()));
 }
 
+// A registration lapse means the registry may have purged this store's block
+// entries (its dead-store cascade). The heartbeat that discovers the lapse
+// re-registers and must then republish the store's host-resident inventory.
+TEST_F(StoreDiscoveryTest, LapsedRegistrationRepublishesBlockEntries) {
+  RaidenId rid{"disco_job_republish", "0", "kv_cache", 0};
+  BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = 16;
+  config.raiden_id = rid;
+  config.global_registry_address = registry_address_;
+  config.kv_pool_group = "groupA";
+  config.evict_tier = 1;
+  config.monitor_config.enable = true;
+  config.monitor_config.heartbeat_period = absl::Milliseconds(300);
+
+  auto store_or = KVCacheStore::Create(config, /*capacity=*/16,
+                                       registry_address_, rid,
+                                       /*num_shards=*/1,
+                                       /*shard_size_bytes=*/512,
+                                       /*store_server_ip=*/"127.0.0.1");
+  ASSERT_TRUE(store_or.ok()) << store_or.status().ToString();
+  KVCacheStore& store = **store_or;
+
+  // Host-resident blocks with no registry entries: exactly the state the
+  // dead-store cascade leaves behind (and what Insert alone produces --
+  // publishing normally happens when a save completes).
+  const std::vector<std::string> hashes = {"rp_h1", "rp_h2"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(rid, /*host_id=*/5, BlockStatus::HOST),
+      RaidenBlockId(rid, /*host_id=*/6, BlockStatus::HOST)};
+  ASSERT_TRUE(store.Insert(hashes, slices, /*on_host=*/true).ok());
+  auto looked = client_->Lookup(hashes);
+  ASSERT_TRUE(looked.ok());
+  ASSERT_EQ(looked->size(), 0);
+
+  // Drop the store registration; the heartbeat has to discover the lapse.
+  ASSERT_TRUE(client_->UnregisterStore(rid).ok());
+
+  // The next heartbeat gets NotFound, re-registers, and republishes.
+  const absl::Time deadline = absl::Now() + absl::Seconds(5);
+  size_t republished = 0;
+  while (absl::Now() < deadline) {
+    auto again = client_->Lookup(hashes);
+    if (again.ok() && again->size() == hashes.size()) {
+      republished = again->size();
+      EXPECT_EQ((*again)[0].block_id(), 5);
+      EXPECT_EQ((*again)[1].block_id(), 6);
+      break;
+    }
+    absl::SleepFor(absl::Milliseconds(100));
+  }
+  EXPECT_EQ(republished, hashes.size());
+  EXPECT_TRUE(client_->ResolveStore(rid).ok());
+}
+
 // The flag promises heartbeats; without a registry there is no registration
 // to refresh, and Create says so instead of quietly not monitoring.
 TEST_F(StoreDiscoveryTest, StoreMonitorWithoutARegistryIsAnError) {

@@ -221,6 +221,68 @@ TEST_F(StoreMonitorTest, ARequestWithoutASweepIsANoOp) {
   monitor.Stop();
 }
 
+TEST_F(StoreMonitorTest, ASuccessfulReregisterTriggersTheRepublish) {
+  RaidenId id = {"monitored", "r0", "dataS", 0};
+  // No prior registration: the first heartbeat lapses, re-registers, and
+  // must then drive the republish step by step while it reports more work.
+  std::atomic<int> republish_calls{0};
+  StoreMonitor monitor(
+      StoreMonitor::Options{.heartbeat_period = absl::Milliseconds(300)},
+      client_, id, ReportFreeBlocks(7),
+      /*reregister_fn=*/
+      [this, &id] {
+        return client_->RegisterStore(id, "10.0.0.7:1111",
+                                      /*controller_address=*/"",
+                                      /*ttl=*/absl::Seconds(5), "groupA",
+                                      /*evict_tier=*/1);
+      },
+      /*sweep_fn=*/nullptr,
+      /*republish_fn=*/[&republish_calls] { return ++republish_calls < 3; });
+  monitor.Start();
+
+  absl::SleepFor(absl::Seconds(1));
+  // Exactly three: the steps chain while the callback reports more work,
+  // and the healthy heartbeats after the re-register start no new report.
+  EXPECT_EQ(republish_calls.load(), 3);
+  monitor.Stop();
+}
+
+TEST_F(StoreMonitorTest, ARequestStartsARepublishWithoutALapse) {
+  RaidenId id = {"monitored", "r0", "dataS", 0};
+  ASSERT_TRUE(client_
+                  ->RegisterStore(id, "10.0.0.7:1111",
+                                  /*controller_address=*/"",
+                                  /*ttl=*/absl::ZeroDuration())
+                  .ok());
+  std::atomic<int> republish_calls{0};
+  StoreMonitor monitor(
+      StoreMonitor::Options{.heartbeat_period = absl::Hours(1)}, client_, id,
+      ReportFreeBlocks(7),
+      /*reregister_fn=*/[] { return absl::OkStatus(); },
+      /*sweep_fn=*/nullptr,
+      /*republish_fn=*/[&republish_calls] {
+        ++republish_calls;
+        return false;
+      });
+  monitor.Start();
+  monitor.RequestRepublish();
+
+  absl::SleepFor(absl::Milliseconds(500));
+  EXPECT_EQ(republish_calls.load(), 1);
+  monitor.Stop();
+}
+
+TEST_F(StoreMonitorTest, ARequestWithoutARepublishFnIsANoOp) {
+  RaidenId id = {"monitored", "r0", "dataS", 0};
+  StoreMonitor monitor(
+      StoreMonitor::Options{.heartbeat_period = absl::Hours(1)}, client_, id,
+      ReportFreeBlocks(1),
+      /*reregister_fn=*/[] { return absl::OkStatus(); });
+  monitor.Start();
+  monitor.RequestRepublish();
+  monitor.Stop();
+}
+
 TEST_F(StoreMonitorTest, DestructorStopsAnUnstoppedMonitor) {
   RaidenId id = {"monitored", "r0", "dataS", 0};
   {

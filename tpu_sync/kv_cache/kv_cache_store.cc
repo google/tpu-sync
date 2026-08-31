@@ -82,6 +82,10 @@ constexpr double kDefaultEvictHighWatermark = 0.05;
 constexpr int kMaxEvictBatchBlocks = 128;
 // Placement targets requested per pressure episode.
 constexpr int32_t kMaxPlacementTargets = 4;
+// Cap on one inventory-republish batch: bounds both the registry's lock hold
+// per Register RPC and how long the batch's blocks stay pinned. Larger than
+// kMaxEvictBatchBlocks because a step is one metadata RPC, not a transfer.
+constexpr size_t kMaxRepublishBatchBlocks = 512;
 
 // Bind-and-advertise address for this store's RaidenController.
 //
@@ -351,7 +355,8 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
                                          : s->raiden_id_.job_name,
               s->evict_tier_);
         },
-        std::move(sweep_fn));
+        std::move(sweep_fn),
+        /*republish_fn=*/[s = store.get()] { return s->RepublishOnce(); });
     store->store_monitor_->Start();
   }
 
@@ -1566,7 +1571,13 @@ absl::StatusOr<size_t> KVCacheStore::RecoverFromLocalManifest() {
     return absl::FailedPreconditionError(
         "RecoverFromLocalManifest can only be called on an empty cache store");
   }
-  return backend()->RecoverFromLocalManifest();
+  absl::StatusOr<size_t> recovered = backend()->RecoverFromLocalManifest();
+  if (recovered.ok() && *recovered > 0 && store_monitor_ != nullptr) {
+    // The recovered blocks predate this process; if the downtime outlived the
+    // registration TTL, the registry has purged their entries. Report them.
+    store_monitor_->RequestRepublish();
+  }
+  return recovered;
 }
 
 size_t KVCacheStore::Evict(const std::vector<std::string>& block_hashes) {
@@ -1705,6 +1716,70 @@ bool KVCacheStore::SweepOnce() {
     return end_episode();
   }
   return true;
+}
+
+bool KVCacheStore::RepublishOnce() {
+  auto* host_backend = dynamic_cast<HostOffloadBackend*>(backend().get());
+  if (host_backend == nullptr) {
+    return false;
+  }
+
+  if (republish_queue_.empty()) {
+    republish_queue_ = host_backend->SnapshotHostResidentHashes();
+    if (republish_queue_.empty()) {
+      return false;
+    }
+    LOG(INFO) << "Republishing " << republish_queue_.size()
+              << " host-resident block(s) to the global registry.";
+  }
+
+  const size_t take =
+      std::min(kMaxRepublishBatchBlocks, republish_queue_.size());
+  std::vector<std::string> batch(republish_queue_.end() - take,
+                                 republish_queue_.end());
+  republish_queue_.resize(republish_queue_.size() - take);
+
+  // Pin-validate against the live cache: hashes evicted since the snapshot
+  // are skipped here, and the pins keep the rest resident until the registry
+  // has acknowledged them -- an eviction's Unregister can then only run
+  // after this batch's Register, never be overwritten by it.
+  const std::vector<std::pair<std::string, int32_t>> pinned =
+      host_backend->PinPresentHostResident(batch);
+  if (pinned.empty()) {
+    return !republish_queue_.empty();
+  }
+  std::vector<global_registry::Registration> registrations;
+  std::vector<std::string> pinned_hashes;
+  registrations.reserve(pinned.size());
+  pinned_hashes.reserve(pinned.size());
+  for (const auto& [hash, host_block_id] : pinned) {
+    registrations.push_back({
+        .prefix_hash = hash,
+        .raiden_id = raiden_id_,
+        .block_id = host_block_id,
+    });
+    pinned_hashes.push_back(hash);
+  }
+
+  // The deadline must stay under the heartbeat period: this blocks the
+  // monitor thread, and a Register hanging longer than a period could
+  // starve the heartbeats whose TTL budget is a small multiple of it.
+  const absl::Duration timeout =
+      std::min(monitor_config_.heartbeat_period, absl::Seconds(10));
+  const absl::Status registered =
+      registry_client_->RegisterAsync(registrations, timeout).Await();
+  host_backend->Release(pinned_hashes);
+
+  if (!registered.ok()) {
+    LOG(WARNING) << "Inventory republish failed with "
+                 << republish_queue_.size()
+                 << " block(s) still unreported: " << registered
+                 << ". Dropping the rest; the next registration lapse "
+                    "restarts the report.";
+    republish_queue_.clear();
+    return false;
+  }
+  return !republish_queue_.empty();
 }
 
 KVCacheStore::RemoteWriteVerdicts KVCacheStore::DrainSweepVerdicts() {

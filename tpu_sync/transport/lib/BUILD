@@ -33,6 +33,30 @@ cc_library(
 cc_library(
     name = "transport_adapter",
     hdrs = ["transport_adapter.h"],
+    deps = [
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
+    name = "socket_transport_adapter",
+    srcs = ["socket_transport_adapter.cc"],
+    hdrs = ["socket_transport_adapter.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":raw_buffer_transport",
+        ":transport_adapter",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+    ],
 )
 
 cc_library(

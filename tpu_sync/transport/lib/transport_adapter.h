@@ -17,6 +17,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <vector>
+
+#include "absl/functional/any_invocable.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/types/span.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -43,6 +50,32 @@ struct Request {
   uint32_t request_id;
   int shard_idx;
   int stream_idx;
+};
+
+// Transport operation status.
+enum class Status : int {
+  kNotFound = 2,
+  kInProgress = 1,
+  kSuccess = 0,
+  kFailure = -1,
+};
+
+// Callback invoked when a transport Post operation completes.
+using CompletionCallback =
+    absl::AnyInvocable<void(absl::StatusOr<std::vector<int>>)>;
+
+// Abstract transport adapter interface for Post and Poll operations.
+class TransportAdapter {
+ public:
+  virtual ~TransportAdapter() = default;
+
+  virtual absl::StatusOr<Handle> Post(
+      absl::Span<const std::string> peers, absl::Span<const Request> requests,
+      absl::Span<const int> src_block_ids = {},
+      absl::Span<const int> dst_block_ids = {},
+      CompletionCallback on_complete = nullptr) = 0;
+
+  virtual absl::StatusOr<Status> Poll(Handle handle) = 0;
 };
 
 }  // namespace lib

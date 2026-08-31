@@ -2632,5 +2632,76 @@ class GetGlobalIndicesTest(absltest.TestCase):
       self.assertTrue(plan.skip_tiling.get(1, False))
 
 
+class FormatUnitHelpersTest(absltest.TestCase):
+
+  def test_format_unit(self):
+    u1 = raiden_controller.RaidenId(
+        job_name="trainer",
+        job_replica_id="0",
+        data_name="weights",
+        data_replica_idx=0,
+    )
+    self.assertEqual(raiden_controller._format_unit(u1), "trainer:0[weights]")
+
+    u2 = raiden_controller.RaidenId(
+        job_name="trainer",
+        job_replica_id="0",
+        data_name="weights",
+        data_replica_idx=1,
+    )
+    self.assertEqual(
+        raiden_controller._format_unit(u2), "trainer:0[weights#1]"
+    )
+
+    u3 = raiden_controller.RaidenId(
+        job_name="actor", job_replica_id="1", data_name="", data_replica_idx=0
+    )
+    self.assertEqual(raiden_controller._format_unit(u3), "actor:1")
+
+    u4 = raiden_controller.RaidenId(
+        job_name="actor", job_replica_id="", data_name="", data_replica_idx=0
+    )
+    self.assertEqual(raiden_controller._format_unit(u4), "actor")
+
+    self.assertEqual(
+        raiden_controller._format_unit("endpoint:1000"), "endpoint:1000"
+    )
+
+  def test_format_units(self):
+    u1 = raiden_controller.RaidenId(
+        job_name="trainer",
+        job_replica_id="0",
+        data_name="weights",
+        data_replica_idx=0,
+    )
+    u2 = raiden_controller.RaidenId(
+        job_name="trainer",
+        job_replica_id="1",
+        data_name="weights",
+        data_replica_idx=1,
+    )
+
+    # List of units
+    self.assertEqual(
+        raiden_controller._format_units([u1, u2]),
+        "[trainer:0[weights], trainer:1[weights#1]]",
+    )
+
+    # Generator / custom iterable
+    self.assertEqual(
+        raiden_controller._format_units(u for u in [u1]),
+        "[trainer:0[weights]]",
+    )
+
+    # Single unit
+    self.assertEqual(
+        raiden_controller._format_units(u1), "trainer:0[weights]"
+    )
+
+    # Single string / bytes (must not be iterated as chars)
+    self.assertEqual(raiden_controller._format_units("unit_str"), "unit_str")
+    self.assertEqual(raiden_controller._format_units(b"unit_bytes"), "b'unit_bytes'")
+
+
 if __name__ == "__main__":
   absltest.main()

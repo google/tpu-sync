@@ -15,6 +15,7 @@
 """Raiden Controller providing high-level transfer API and resharding plans."""
 
 import asyncio
+from collections import abc
 import dataclasses
 import enum
 import functools
@@ -861,6 +862,28 @@ class RaidenFuture:
 def _proto_to_nd_slice(proto_slice: Any) -> list[tuple[int, int]]:
   """Converts an NDSliceProto message to a Python list of (start, end) tuples."""
   return [(dim.start, dim.end) for dim in proto_slice.dimensions]
+
+
+def _format_unit(unit: Any) -> str:
+  """Formats a RaidenId or work unit into a concise identifier string."""
+  if hasattr(unit, "job_name"):
+    job = unit.job_name or "unknown"
+    rep = f":{unit.job_replica_id}" if unit.job_replica_id else ""
+    data_rep = (
+        f"#{unit.data_replica_idx}"
+        if getattr(unit, "data_replica_idx", 0)
+        else ""
+    )
+    data = f"[{unit.data_name}{data_rep}]" if unit.data_name else ""
+    return f"{job}{rep}{data}"
+  return str(unit)
+
+
+def _format_units(units: Any) -> str:
+  """Formats a collection of units into a concise comma-separated list string."""
+  if isinstance(units, abc.Iterable) and not isinstance(units, (str, bytes)):
+    return f"[{', '.join(_format_unit(u) for u in units)}]"
+  return _format_unit(units)
 
 
 def intersect_nd_slices(
@@ -1967,16 +1990,19 @@ class RaidenController:
 
         if not is_sender:
           # --- ROLE: DESTINATION CONTROLLER (RECEIVER COORDINATOR) ---
-          logging.info(
-              "RaidenController acting as DESTINATION COORDINATOR"
-              " (is_sender=False) for uuid %s",
-              uuid,
-          )
-
           # 1. Discover local destination units
           local_dst_units = [
               u for u in dst_units if u in self._registered_shards
           ]
+          logging.info(
+              "RaidenController acting as DESTINATION COORDINATOR"
+              " (is_sender=False) for req_id %s (uuid=%s): destination=%s"
+              " (source=%s)",
+              req_id,
+              uuid,
+              _format_units(local_dst_units),
+              _format_units(src_units),
+          )
           if not local_dst_units:
             logging.warning("No local destination units found to prepare!")
             return
@@ -2011,7 +2037,7 @@ class RaidenController:
             logging.info(
                 "Triggering preparation RPCs on local destination workers: %s,"
                 " expected blocks: %d",
-                local_dst_units,
+                _format_units(local_dst_units),
                 expected_block_count,
             )
             await asyncio.gather(*[
@@ -2031,8 +2057,11 @@ class RaidenController:
           # --- ROLE: SENDER CONTROLLER (SENDER COORDINATOR) ---
           logging.info(
               "RaidenController acting as SENDER COORDINATOR (is_sender=True)"
-              " for uuid %s",
+              " for req_id %s (uuid=%s): %s -> %s",
+              req_id,
               uuid,
+              _format_units(src_units),
+              _format_units(dst_units),
           )
 
           cache_key = (
@@ -2061,11 +2090,14 @@ class RaidenController:
               cached_schedule = self._plan_cache.get(cache_key)
 
           if cached_schedule is not None:
-            logging.vlog(
-                1,
-                "Reusing cached transfer schedule for %s -> %s",
-                src_units,
-                dst_units,
+            logging.info(
+                "Transfer %s (uuid=%s): reusing cached schedule for %s -> %s"
+                " (%d expected blocks)",
+                req_id,
+                uuid,
+                _format_units(src_units),
+                _format_units(dst_units),
+                cached_schedule.expected_block_count,
             )
             computed_schedules = cached_schedule.computed_schedules
             direct_schedules = cached_schedule.direct_schedules
@@ -2099,7 +2131,9 @@ class RaidenController:
 
             # 2. Compute slices or use pre-computed schedules centrally
             computed_schedules = {}
+            computed_slices = {}
             data_address_to_unit = {}
+            num_vars = 0
             if shard_push_schedules:
               logging.info("Using pre-computed shard_push_schedules")
               computed_schedules = shard_push_schedules
@@ -2108,7 +2142,6 @@ class RaidenController:
                 for shard in meta.shards:
                   data_address_to_unit[shard] = unit
             else:
-              computed_slices = {}
               is_legacy_by_unit = {}
               # Source slices (always local to sender controller)
               for unit in src_units:
@@ -2138,6 +2171,7 @@ class RaidenController:
                     src_vars = []
                   is_legacy_by_unit[unit] = True
 
+                num_vars = max(num_vars, len(src_vars))
                 computed_slices[unit] = {}
                 for var in src_vars:
                   phys_shape, phys_mesh = to_physical(
@@ -2148,11 +2182,11 @@ class RaidenController:
                       phys_shape, phys_mesh
                   )
                   computed_slices[unit][var.name] = slices
-                  logging.info(
+                  logging.debug(
                       "Computed source slices for %s var %s: %s",
                       unit,
                       var.name,
-                      slices,
+                      nd_slice_math.format_nd_slices(slices),
                   )
 
               # Destination slices
@@ -2199,11 +2233,11 @@ class RaidenController:
                       phys_shape, phys_mesh
                   )
                   computed_slices[unit][var.name] = slices
-                  logging.info(
+                  logging.debug(
                       "Computed destination slices for %s var %s: %s",
                       unit,
                       var.name,
-                      slices,
+                      nd_slice_math.format_nd_slices(slices),
                   )
 
               # Compute skip_tiling if not provided
@@ -2744,11 +2778,17 @@ class RaidenController:
                       )
               if expected_block_count == 0 and dst_unit_counts:
                 expected_block_count = max(dst_unit_counts.values())
-                logging.info(
-                    "Auto-calculated expected_block_count: %d (counts: %s)",
-                    expected_block_count,
-                    dst_unit_counts,
-                )
+              vars_info = f"{num_vars} variable(s), " if num_vars > 0 else ""
+              logging.info(
+                  "Transfer %s (uuid=%s): generated schedule for %s -> %s"
+                  " (%s%d expected blocks)",
+                  req_id,
+                  uuid,
+                  _format_units(src_units),
+                  _format_units(dst_units),
+                  vars_info,
+                  expected_block_count,
+              )
             else:
               dst_unit_counts = {}
               dst_unit_layer_counts = {}

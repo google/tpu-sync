@@ -68,3 +68,23 @@ def compute_nd_shard_slices(
     shard_slices.append(slice_proto)
 
   return shard_slices
+
+
+def format_nd_slice(slice_proto: raiden_service_pb2.NDSliceProto) -> str:
+  """Formats an NDSliceProto into a compact single-line slice string e.g.
+
+  [0:512, 0:2048].
+  """
+  dims = ", ".join(f"{d.start}:{d.end}" for d in slice_proto.dimensions)
+  return f"[{dims}]"
+
+
+def format_nd_slices(slices: List[raiden_service_pb2.NDSliceProto]) -> str:
+  """Formats a list of NDSliceProto into a compact single-line string representation.
+
+  Examples:
+    1D: [[0:512], [512:1024], [1024:1536], [1536:2048]]
+    2D: [[0:1536, 0:2048], [1536:3072, 0:2048], [3072:4608, 0:2048], [4608:6144,
+    0:2048]]
+  """
+  return f"[{', '.join(format_nd_slice(s) for s in slices)}]"

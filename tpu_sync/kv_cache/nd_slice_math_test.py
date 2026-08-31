@@ -104,6 +104,48 @@ assert sys.modules["jax"] is None
         )
         self.assertEqual(neutral_output, golden)
 
+  def test_format_nd_slices(self):
+    slices_1d = nd_slice_math.compute_nd_shard_slices((2048,), (4,))
+    self.assertEqual(
+        nd_slice_math.format_nd_slices(slices_1d),
+        "[[0:512], [512:1024], [1024:1536], [1536:2048]]",
+    )
+
+    slices_2d = nd_slice_math.compute_nd_shard_slices((6144, 2048), (4, 1))
+    self.assertEqual(
+        nd_slice_math.format_nd_slices(slices_2d),
+        "[[0:1536, 0:2048], [1536:3072, 0:2048], [3072:4608, 0:2048],"
+        " [4608:6144, 0:2048]]",
+    )
+
+    slices_3d = nd_slice_math.compute_nd_shard_slices((2048, 8, 128), (1, 4, 1))
+    self.assertEqual(
+        nd_slice_math.format_nd_slices(slices_3d),
+        "[[0:2048, 0:2, 0:128], [0:2048, 2:4, 0:128], [0:2048, 4:6, 0:128],"
+        " [0:2048, 6:8, 0:128]]",
+    )
+
+    slices_3d_multi_axis = nd_slice_math.compute_nd_shard_slices(
+        (2048, 8, 128), (2, 2, 2)
+    )
+    self.assertEqual(
+        nd_slice_math.format_nd_slices(slices_3d_multi_axis),
+        "[[0:1024, 0:4, 0:64], [0:1024, 0:4, 64:128], [0:1024, 4:8, 0:64],"
+        " [0:1024, 4:8, 64:128], [1024:2048, 0:4, 0:64], [1024:2048, 0:4,"
+        " 64:128], [1024:2048, 4:8, 0:64], [1024:2048, 4:8, 64:128]]",
+    )
+
+    slices_4d_multi_axis = nd_slice_math.compute_nd_shard_slices(
+        (32, 16, 128, 64), (2, 2, 2, 1)
+    )
+    self.assertEqual(
+        nd_slice_math.format_nd_slices(slices_4d_multi_axis),
+        "[[0:16, 0:8, 0:64, 0:64], [0:16, 0:8, 64:128, 0:64], [0:16, 8:16,"
+        " 0:64, 0:64], [0:16, 8:16, 64:128, 0:64], [16:32, 0:8, 0:64, 0:64],"
+        " [16:32, 0:8, 64:128, 0:64], [16:32, 8:16, 0:64, 0:64], [16:32, 8:16,"
+        " 64:128, 0:64]]",
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

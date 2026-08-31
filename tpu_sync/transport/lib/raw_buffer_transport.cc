@@ -524,10 +524,10 @@ absl::Status RawBufferTransport::ProcessSocketBufferPull(
     return absl::InvalidArgumentError("Source peer address cannot be empty");
   }
 
-  ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer));
+  ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
   bool ok_to_pool = false;
-  auto fd_cleaner =
-      absl::MakeCleanup([&] { ReturnConnection(ok_to_pool, fd, peer); });
+  auto fd_cleaner = absl::MakeCleanup(
+      [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
 
   ChunkHeader header = {};
   header.version = 1;
@@ -616,10 +616,10 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
         "Destination peer address cannot be empty");
   }
 
-  ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer));
+  ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
   bool ok_to_pool = false;
-  auto fd_cleaner =
-      absl::MakeCleanup([&] { ReturnConnection(ok_to_pool, fd, peer); });
+  auto fd_cleaner = absl::MakeCleanup(
+      [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
 
   const uint8_t opcode = request.socket_opcode;
   const uint64_t uuid = request.uuid;
@@ -820,10 +820,10 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
     return absl::OkStatus();
   }
 
-  ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer));
+  ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
   bool ok_to_pool = false;
-  auto fd_cleaner =
-      absl::MakeCleanup([&] { ReturnConnection(ok_to_pool, fd, peer); });
+  auto fd_cleaner = absl::MakeCleanup(
+      [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
 
   const size_t batch_size = requests.size();
   const uint64_t uuid = requests.front().uuid;

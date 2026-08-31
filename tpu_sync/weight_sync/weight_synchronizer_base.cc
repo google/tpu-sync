@@ -309,9 +309,13 @@ bool WeightSynchronizerBase::is_listener_active() const {
 std::vector<RaidenTransferEndpoint>
 WeightSynchronizerBase::get_local_endpoints() const {
   std::vector<int64_t> shards;
-  shards.reserve(num_shards_);
-  for (size_t i = 0; i < num_shards_; ++i) {
-    shards.push_back(static_cast<int64_t>(i));
+  if (!global_shard_indices_.empty()) {
+    shards = global_shard_indices_;
+  } else {
+    shards.reserve(num_shards_);
+    for (size_t i = 0; i < num_shards_; ++i) {
+      shards.push_back(static_cast<int64_t>(i));
+    }
   }
   const std::string ip = local_ip();
   const int port = local_port().value_or(0);
@@ -332,11 +336,11 @@ size_t WeightSynchronizerBase::GetPipelineGroupSize() const {
   if (pipeline_group_size_override_.has_value()) {
     return *pipeline_group_size_override_;
   }
-  const char* env = std::getenv("RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE");
-  if (env != nullptr && *env != '\0') {
-    size_t val = 0;
-    if (absl::SimpleAtoi(env, &val)) {
-      return val;
+  const char* env_val = std::getenv("RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE");
+  if (env_val != nullptr) {
+    int parsed_val = 0;
+    if (absl::SimpleAtoi(env_val, &parsed_val) && parsed_val >= 0) {
+      return static_cast<size_t>(parsed_val);
     }
   }
   return 1;
@@ -576,6 +580,14 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2h(
 
 absl::Status WeightSynchronizerBase::PushWeights(
     const std::vector<std::string>& peers) {
+  if (control_delegate_ != nullptr) {
+    return control_delegate_->PushWeights(peers);
+  }
+  return PushWeightsLocal(peers);
+}
+
+absl::Status WeightSynchronizerBase::PushWeightsLocal(
+    const std::vector<std::string>& peers) {
   if (peers.empty()) {
     return absl::InvalidArgumentError(
         "Peer list cannot be empty for trainer weights sync");
@@ -593,10 +605,18 @@ absl::Status WeightSynchronizerBase::PushWeights(
 
 absl::Status WeightSynchronizerBase::PushWeightsResharded(
     const tpu_sync::rpc::StartTransferRequest& request) {
+  if (control_delegate_ != nullptr) {
+    return control_delegate_->PushWeightsResharded(request);
+  }
+  return PushWeightsReshardedLocal(request);
+}
+
+absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
+    const tpu_sync::rpc::StartTransferRequest& request) {
   VLOG(1) << "Starting PushWeightsResharded for uuid=" << request.uuid()
           << " across " << num_layers_
           << " layers (skip_d2h=" << request.skip_d2h() << ")...";
-  StoreSkipTiling(request.uuid(), request);
+  StoreSkipTilingLocal(request.uuid(), request);
   int fallback_layer_idx = -1;
   bool checked_fallback = false;
   auto get_fallback_layer_idx = [&]() -> absl::StatusOr<int> {
@@ -633,7 +653,8 @@ absl::Status WeightSynchronizerBase::PushWeightsResharded(
       num_layers_);
   const auto& schedules = request.shard_push_schedules();
   for (size_t i = 0; i < num_shards_; ++i) {
-    auto it = schedules.find(static_cast<int32_t>(i));
+    int64_t global_shard = global_shard_index(i);
+    auto it = schedules.find(static_cast<int32_t>(global_shard));
     if (it == schedules.end()) {
       continue;
     }
@@ -781,8 +802,8 @@ absl::Status WeightSynchronizerBase::PushWeightsResharded(
     if (!group_tasks.empty()) {
       int push_parallelism =
           request.parallelism() > 0 ? request.parallelism() : parallelism_;
-      push_futures.push_back(
-          push_pool_->Schedule([this, group_tasks = std::move(group_tasks),
+      push_futures.push_back(push_pool_->Schedule(
+          assigned_numa_node_, [this, group_tasks = std::move(group_tasks),
                                 push_parallelism, uuid = request.uuid()]() {
             return PushWeightsChunks(group_tasks, push_parallelism, uuid);
           }));
@@ -858,6 +879,14 @@ absl::Status WeightSynchronizerBase::BindWeights(
 
 absl::Status WeightSynchronizerBase::RegisterExpectedChunks(
     uint64_t uuid, uint32_t expected_chunks) {
+  if (control_delegate_ != nullptr) {
+    return control_delegate_->RegisterExpectedChunks(uuid, expected_chunks);
+  }
+  return RegisterExpectedChunksLocal(uuid, expected_chunks);
+}
+
+absl::Status WeightSynchronizerBase::RegisterExpectedChunksLocal(
+    uint64_t uuid, uint32_t expected_chunks) {
   {
     absl::MutexLock lock(pending_h2d_mu_);
     if (pending_h2d_states_[uuid].expected_layers == 0) {
@@ -868,6 +897,16 @@ absl::Status WeightSynchronizerBase::RegisterExpectedChunks(
 }
 
 absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunks(
+    uint64_t uuid,
+    const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) {
+  if (control_delegate_ != nullptr) {
+    return control_delegate_->RegisterExpectedLayerChunks(
+        uuid, expected_layer_chunks);
+  }
+  return RegisterExpectedLayerChunksLocal(uuid, expected_layer_chunks);
+}
+
+absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunksLocal(
     uint64_t uuid,
     const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) {
   {
@@ -889,14 +928,14 @@ absl::Status WeightSynchronizerBase::OnLayerDataReceived(size_t layer_idx,
   }
   {
     absl::MutexLock lock(pending_h2d_mu_);
+    active_h2d_uuids_.insert(uuid);
     auto& state = pending_h2d_states_[uuid];
     if (state.expected_layers == 0) {
       state.expected_layers = num_layers_;
     }
-    state.layer_futures[layer_idx] =
-        h2d_pool_->Schedule([this, layer_idx, uuid]() {
-          return H2dLayer(layer_idx, uuid);
-        });
+    state.layer_futures[layer_idx] = h2d_pool_->Schedule(
+        assigned_numa_node_,
+        [this, layer_idx, uuid]() { return H2dLayer(layer_idx, uuid); });
   }
   return absl::OkStatus();
 }
@@ -963,12 +1002,61 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
     metrics_.total_h2d_time_ms += h2d_time_ms;
   }
   record_completion();
+  {
+    absl::MutexLock lock(pending_h2d_mu_);
+    active_h2d_uuids_.erase(uuid);
+  }
   VLOG(1) << "Done with OnDataReceived (auto_h2d for uuid=" << uuid
           << ", h2d_time=" << h2d_time_ms << " ms).";
   return absl::OkStatus();
 }
 
+void WeightSynchronizerBase::DrainPendingH2d() {
+  if (!auto_h2d_) return;
+
+  absl::flat_hash_map<uint64_t, PendingH2dState> remaining_states;
+  {
+    absl::MutexLock lock(pending_h2d_mu_);
+    remaining_states = std::move(pending_h2d_states_);
+    pending_h2d_states_.clear();
+  }
+
+  for (auto& [uuid, state] : remaining_states) {
+    std::vector<raiden::PjRtCopyFuture> futures_to_await;
+    futures_to_await.reserve(state.layer_futures.size());
+    for (auto& [layer_idx, f] : state.layer_futures) {
+      if (f.valid()) {
+        auto status_or_future = f.get();
+        if (status_or_future.ok()) {
+          futures_to_await.push_back(std::move(status_or_future.value()));
+        }
+      }
+    }
+    if (!futures_to_await.empty()) {
+      raiden::PjRtCopyFuture joined_future =
+          raiden::JoinPjRtCopyFutures(futures_to_await);
+      (void)joined_future.Await();
+    }
+    if (uuid > 0) {
+      absl::MutexLock lock(completed_transfers_mu_);
+      completed_transfers_.insert(uuid);
+    }
+  }
+
+  {
+    absl::MutexLock lock(pending_h2d_mu_);
+    auto condition_fn =
+        +[](WeightSynchronizerBase* self) ABSL_NO_THREAD_SAFETY_ANALYSIS {
+          return self->active_h2d_uuids_.empty();
+        };
+    pending_h2d_mu_.Await(absl::Condition(condition_fn, this));
+  }
+}
+
 absl::Status WeightSynchronizerBase::WaitForTransferCompletion(uint64_t uuid) {
+  if (control_delegate_ != nullptr) {
+    return control_delegate_->WaitForTransferCompletion(uuid);
+  }
   absl::MutexLock lock(completed_transfers_mu_);
   auto condition_fn =
       +[](std::pair<absl::flat_hash_set<uint64_t>*, uint64_t>* p)
@@ -982,6 +1070,15 @@ absl::Status WeightSynchronizerBase::WaitForTransferCompletion(uint64_t uuid) {
 }
 
 void WeightSynchronizerBase::StoreSkipTiling(
+    uint64_t uuid, const tpu_sync::rpc::StartTransferRequest& request) {
+  if (control_delegate_ != nullptr) {
+    control_delegate_->StoreSkipTiling(uuid, request);
+    return;
+  }
+  StoreSkipTilingLocal(uuid, request);
+}
+
+void WeightSynchronizerBase::StoreSkipTilingLocal(
     uint64_t uuid, const tpu_sync::rpc::StartTransferRequest& request) {
   std::vector<bool> skip(num_layers_, false);
   for (const auto& [layer_idx, skip_val] : request.skip_tiling()) {
@@ -1007,6 +1104,10 @@ absl::Status WeightSynchronizerBase::OnBlocksReceived(
 }
 
 void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
+  if (control_delegate_ != nullptr) {
+    control_delegate_->ForgetPushProgress(uuid);
+    return;
+  }
   RaidenManagerBase::ForgetPushProgress(uuid);
   {
     absl::MutexLock lock(completed_transfers_mu_);

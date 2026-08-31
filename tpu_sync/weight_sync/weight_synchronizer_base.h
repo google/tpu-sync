@@ -80,6 +80,24 @@ struct WeightSyncMetrics {
 
 class WeightSynchronizerListener;
 
+class WeightSynchronizerControlDelegate {
+ public:
+  virtual ~WeightSynchronizerControlDelegate() = default;
+  virtual absl::Status PushWeights(const std::vector<std::string>& peers) = 0;
+  virtual absl::Status PushWeightsResharded(
+      const tpu_sync::rpc::StartTransferRequest& request) = 0;
+  virtual void StoreSkipTiling(
+      uint64_t uuid, const tpu_sync::rpc::StartTransferRequest& request) = 0;
+  virtual absl::Status RegisterExpectedChunks(uint64_t uuid,
+                                              uint32_t expected_chunks) = 0;
+  virtual absl::Status RegisterExpectedLayerChunks(
+      uint64_t uuid,
+      const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) = 0;
+  virtual absl::Status WaitForTransferCompletion(uint64_t uuid) = 0;
+  virtual void ForgetPushProgress(uint64_t uuid) = 0;
+  virtual void DrainPendingH2d() = 0;
+};
+
 class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
  public:
   // Symmetrical core constructor wrapping raw PJRT buffers directly E2E
@@ -119,9 +137,24 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   ~WeightSynchronizerBase() override;
 
-  // Trainer pushes current weights to all inference server peers E2E (D2H +
-  // network push)
-  absl::Status PushWeights(const std::vector<std::string>& peers);
+  void SetControlDelegate(WeightSynchronizerControlDelegate* delegate) {
+    control_delegate_ = delegate;
+  }
+  WeightSynchronizerControlDelegate* control_delegate() const {
+    return control_delegate_;
+  }
+  void SetGlobalShardIndices(std::vector<int64_t> indices) {
+    global_shard_indices_ = std::move(indices);
+  }
+  int64_t global_shard_index(size_t local_shard_idx) const {
+    if (local_shard_idx < global_shard_indices_.size()) {
+      return global_shard_indices_[local_shard_idx];
+    }
+    return static_cast<int64_t>(local_shard_idx);
+  }
+
+  virtual absl::Status PushWeights(const std::vector<std::string>& peers);
+  virtual absl::Status PushWeightsLocal(const std::vector<std::string>& peers);
 
   /**
    * Executes a distributed resharding push transfer based on precise
@@ -138,7 +171,9 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
    * @return absl::OkStatus() upon complete, successfully ACK-handshaked
    * delivery to all remote peers.
    */
-  absl::Status PushWeightsResharded(
+  virtual absl::Status PushWeightsResharded(
+      const tpu_sync::rpc::StartTransferRequest& request);
+  virtual absl::Status PushWeightsReshardedLocal(
       const tpu_sync::rpc::StartTransferRequest& request);
 
   const uint8_t* GetHostBufferPtr(size_t layer_idx, size_t shard_idx) const {
@@ -151,10 +186,10 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // Returns the list of layer names associated with the weight synchronizer.
   const std::vector<std::string>& layer_names() const { return layer_names_; }
 
-  absl::StatusOr<raiden::PjRtCopyFuture> H2d(uint64_t uuid = 0);
+  virtual absl::StatusOr<raiden::PjRtCopyFuture> H2d(uint64_t uuid = 0);
   absl::StatusOr<raiden::PjRtCopyFuture> H2dLayer(size_t layer_idx,
                                                   uint64_t uuid = 0);
-  absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
+  virtual absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
   absl::StatusOr<raiden::PjRtCopyFuture> D2hLayer(size_t layer_idx,
                                                   uint64_t uuid = 0);
 
@@ -173,8 +208,10 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       const std::vector<std::vector<raiden::RaidenBufferHandle>>&
           layer_buffers);
 
-  void StoreSkipTiling(uint64_t uuid,
-                       const tpu_sync::rpc::StartTransferRequest& request);
+  virtual void StoreSkipTiling(
+      uint64_t uuid, const tpu_sync::rpc::StartTransferRequest& request);
+  virtual void StoreSkipTilingLocal(
+      uint64_t uuid, const tpu_sync::rpc::StartTransferRequest& request);
 
   void SetSkipTiling(const std::vector<bool>& skip_tiling) {
     absl::MutexLock lock(skip_tiling_mu_);
@@ -185,14 +222,19 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
     latest_skip_tiling_.assign(num_layers_, skip_all);
   }
 
-  WeightSyncMetrics GetMetrics() const {
+  virtual WeightSyncMetrics GetMetrics() const {
     absl::MutexLock lock(metrics_mu_);
     return metrics_;
   }
 
-  void ResetMetrics() {
+  virtual void ResetMetrics() {
     absl::MutexLock lock(metrics_mu_);
     metrics_ = WeightSyncMetrics{};
+  }
+
+  void SetMetricsForTesting(const WeightSyncMetrics& m) {
+    absl::MutexLock lock(metrics_mu_);
+    metrics_ = m;
   }
 
   void SetPipelineGroupSize(std::optional<size_t> group_size) {
@@ -208,16 +250,23 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   absl::Status RegisterExpectedChunks(uint64_t uuid,
                                       uint32_t expected_chunks) override;
+  virtual absl::Status RegisterExpectedChunksLocal(uint64_t uuid,
+                                                   uint32_t expected_chunks);
+
   absl::Status RegisterExpectedLayerChunks(
       uint64_t uuid,
       const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks)
       override;
+  virtual absl::Status RegisterExpectedLayerChunksLocal(
+      uint64_t uuid,
+      const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks);
 
   absl::Status OnLayerDataReceived(size_t layer_idx,
                                    uint64_t uuid = 0) override;
   absl::Status OnDataReceived(uint64_t uuid = 0) override;
 
-  absl::Status WaitForTransferCompletion(uint64_t uuid);
+  virtual absl::Status WaitForTransferCompletion(uint64_t uuid);
+  virtual void DrainPendingH2d();
 
   void ForgetPushProgress(uint64_t uuid) override;
 
@@ -246,6 +295,9 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   }
 
  private:
+  WeightSynchronizerControlDelegate* control_delegate_ = nullptr;
+  std::vector<int64_t> global_shard_indices_;
+
   // When enabled, automatically schedules asynchronous device transfers (H2D)
   // upon complete host buffer writes.
   bool auto_h2d_ = false;
@@ -270,6 +322,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   mutable absl::Mutex pending_h2d_mu_;
   absl::flat_hash_map<uint64_t, PendingH2dState> pending_h2d_states_
+      ABSL_GUARDED_BY(pending_h2d_mu_);
+  absl::flat_hash_set<uint64_t> active_h2d_uuids_
       ABSL_GUARDED_BY(pending_h2d_mu_);
 
   mutable absl::Mutex metrics_mu_;

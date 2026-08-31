@@ -228,8 +228,15 @@ void WeightSynchronizerListener::ConnectionWorker(int client_fd) {
       }
     }
   } else if (req.command() == tpu_sync::rpc::ControlRequest::COMMAND_SHUTDOWN) {
-    LOG(INFO) << "C++ Listener received SHUTDOWN command. Initiating "
-                 "clean exit.";
+    LOG(INFO) << "C++ Listener received SHUTDOWN command. Draining pending H2D "
+                 "and initiating clean exit.";
+    if (engine_) {
+      if (engine_->control_delegate()) {
+        engine_->control_delegate()->DrainPendingH2d();
+      } else {
+        engine_->DrainPendingH2d();
+      }
+    }
     stopping_ = true;
     int fd = server_fd_.exchange(-1);
     if (fd >= 0) {

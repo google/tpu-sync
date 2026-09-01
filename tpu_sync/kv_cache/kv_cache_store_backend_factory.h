@@ -33,6 +33,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "tpu_sync/common/raiden_id.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 
@@ -85,6 +86,8 @@ struct BackendConfig {
   std::string type;
   size_t capacity = 0;
   std::string global_registry_address;
+  // Serving topology this backend instance participates in.
+  backends::ParallelismConfig parallelism;
   RaidenId raiden_id;
   std::optional<KVCacheMetadata> metadata = std::nullopt;
   std::vector<BackendConfig> sub_backends;

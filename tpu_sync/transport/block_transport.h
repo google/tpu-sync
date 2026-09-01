@@ -138,29 +138,6 @@ class BlockTransport final {
   }
 
  private:
-  struct WriteTask {
-    uint64_t uuid;
-    int layer_idx;
-    int stream_idx;
-    std::string peer;
-    std::function<void()> run;
-  };
-
-  struct PeerQueue {
-    std::deque<std::unique_ptr<WriteTask>> tasks;
-    int active_streams = 0;
-  };
-
-  void SocketWorkerLoop();
-  std::unique_ptr<WriteTask> SelectNextTask()
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(scheduler_mu_);
-
-  void PostSocketPush(
-      const std::vector<std::string>& peers, std::vector<lib::Request> requests,
-      const std::vector<int>& src_block_ids,
-      const std::vector<int>& dst_block_ids,
-      std::function<void(absl::StatusOr<std::vector<int>>)> on_complete);
-
   lib::Request BuildBlockRequest(uint8_t socket_opcode, uint8_t* laddr,
                                  size_t len, uint32_t count_or_size,
                                  int layer_idx, uint32_t request_id,
@@ -174,14 +151,6 @@ class BlockTransport final {
       absl::string_view peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids, MajorOrder major_order,
       uint64_t uuid = 0, int layer_idx = -1, int parallelism = 1);
-
-  absl::Status PostSocketPushInternal(absl::string_view peer,
-                                      absl::string_view local_ip,
-                                      absl::Span<const lib::Request> requests,
-                                      const std::vector<int>& src_block_ids,
-                                      const std::vector<int>& dst_block_ids,
-                                      size_t block_offset,
-                                      std::vector<int>& allocated_ids);
 
   // Builds a batch of Requests for block pull transfer.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockPullRequests(
@@ -265,17 +234,9 @@ class BlockTransport final {
   absl::Mutex progress_mu_;
   ProgressMap layer_progress_ ABSL_GUARDED_BY(progress_mu_);
 
-  absl::Mutex scheduler_mu_;
-  absl::CondVar scheduler_cv_;
-  absl::flat_hash_map<std::string, PeerQueue> peer_queues_
-      ABSL_GUARDED_BY(scheduler_mu_);
-  std::vector<std::string> active_peers_ ABSL_GUARDED_BY(scheduler_mu_);
-  size_t rr_index_ ABSL_GUARDED_BY(scheduler_mu_);
-  std::atomic<bool> scheduler_stopping_;
-
   lib::RawBufferTransport raw_transport_;
   std::unique_ptr<lib::PeregrineControlServiceImpl> peregrine_control_;
-  std::vector<std::thread> socket_workers_;
+  std::unique_ptr<lib::TransportAdapter> transport_adapter_;
 };
 
 }  // namespace transport

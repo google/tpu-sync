@@ -90,10 +90,14 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq wget gnupg ca-certificates patchelf patch >/dev/null
 # Add the LLVM jammy-18 apt repo manually (the container's add-apt-repository is
-# broken: python apt_pkg is missing for python3.12).
-wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
-echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" \
-  > /etc/apt/sources.list.d/llvm18.list
+# broken: python apt_pkg is missing for python3.12) unless the image already
+# carries it: apt refuses to read its sources when the same suite is listed
+# twice under different keyrings.
+if ! grep -rqs 'apt.llvm.org/jammy/ llvm-toolchain-jammy-18' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+  wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+  echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" \
+    > /etc/apt/sources.list.d/llvm18.list
+fi
 apt-get update -qq
 # clang ships no standard library of its own: it compiles against the newest
 # GCC installation present. The container carries only libstdc++ 11, which

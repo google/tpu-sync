@@ -44,3 +44,17 @@ py_binary(
         "@pypi//numpy",
     ],
 )
+
+py_binary(
+    name = "torch_d2d_read_benchmark_runner",
+    srcs = ["torch_d2d_read_benchmark_runner.py"],
+    deps = [
+        "//tpu_sync/api/torch:kv_cache_manager_torch_py",
+        "//tpu_sync/rpc:coordination_helper",
+        "@com_google_absl_py//absl:app",
+        "@com_google_absl_py//absl/flags",
+        "@pypi//numpy",
+        "@torch_tpu//shims/torch:pytorch",
+        "@torch_tpu//torch_tpu",
+    ],
+)

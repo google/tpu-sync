@@ -36,12 +36,12 @@ TORCH_REQ = select({
     "//conditions:default": ["torch"],
 })
 
-# Runtime deps that live on a public index. torch_tpu is intentionally omitted
-# (private Artifact Registry) — see pyproject.toml. libtpu appears only in the
-# JAX wheel, in jax/jaxlib lockstep. The torch wheel declares NO libtpu: the
-# torch extension loads TPU support through torch_tpu (which vendors its own
-# libtpu), so a raiden-side pin can only conflict with the consuming
-# environment's libtpu choice.
+# Runtime deps that live on a public index, and the authoritative list for both
+# wheels (pyproject.toml declares none). torch_tpu is intentionally omitted: it
+# is published only to a private Artifact Registry, and it is a documented
+# prerequisite for the torch extensions that has to match the torch_tpu build
+# raiden was compiled against. Each wheel states its own libtpu requirement --
+# the JAX wheel pins it in jax/jaxlib lockstep, the Torch wheel sets a floor.
 COMMON_REQUIRES = [
     "tpu-info==0.7.1",
     "numpy",
@@ -59,7 +59,12 @@ JAX_REQUIRES = COMMON_REQUIRES + [
     "libtpu==0.0.47",
 ]
 
-TORCH_REQUIRES = COMMON_REQUIRES + TORCH_REQ
+# The torch extension reaches the TPU through torch_tpu. Multi-process TPU v7 needs
+# the DmaMap fix that shipped in 0.0.47, and an older libtpu aborts inside the
+# driver instead of returning an error, so there is nothing to fall back to at
+# runtime. State the floor here and let the resolver enforce it at install time.
+# A floor, not a pin: the environment stays free to move ahead.
+TORCH_REQUIRES = COMMON_REQUIRES + TORCH_REQ + ["libtpu>=0.0.47"]
 
 # Framework-agnostic python deps for the py_library aggregator.
 #

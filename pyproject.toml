@@ -12,30 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Wheel metadata for tpu_raiden. The Bazel `py_wheel` rule in
-# //ci/wheel:raiden_wheel reads [project].version from here (via
-# //bazel:wheel_version.bzl) and appends WHEEL_VERSION_EXTRAS (e.g.
-# ".dev<timestamp>") at build time. There is no setuptools build-system: the
-# wheel is built by Bazel, not pip.
+# Wheel metadata for tpu_raiden. Only [project].version is read from this file:
+# //bazel:wheel_version.bzl parses it and appends WHEEL_VERSION_EXTRAS (e.g.
+# ".dev<timestamp>") at build time. There is no setuptools build-system -- the
+# wheels are built by Bazel, not pip.
+#
+# Runtime dependencies are NOT declared here. //ci/wheel:raiden_jax_wheel and
+# //ci/wheel:raiden_torch_wheel are separate wheels with different requirements
+# (only the JAX one carries the JAX stack, and the two state different libtpu
+# constraints), so one list here could not describe both. //ci/wheel/BUILD.bazel
+# holds them, in JAX_REQUIRES and TORCH_REQUIRES.
 [project]
 name = "tpu_raiden"
 version = "0.0.1"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 description = "High-bandwidth PJRT raw-transfer / KV-cache DMA engine for TPU (JAX + PyTorch/torch_tpu)."
-
-# Runtime dependencies that live on a public index. NOTE: the torch path also
-# requires `torch_tpu`, which is published only to a private Artifact Registry
-# and is therefore NOT declared here — it is a documented prerequisite for the
-# torch extensions and must match the torch_tpu build raiden was compiled
-# against (jax/jaxlib/libtpu are version-coupled too; keep them in lockstep).
-dependencies = [
-    "jax==0.11.0",
-    "jaxlib==0.11.0",
-    "libtpu==0.0.47",  # ahead of jax's [tpu] pin; first with the DmaMap fix
-    "tpu-info==0.7.1",
-    "numpy",
-    "absl-py",
-    "torch",
-    "requests",
-]

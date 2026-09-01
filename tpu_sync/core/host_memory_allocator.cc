@@ -34,40 +34,15 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/escaping.h"
-#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/strip.h"
-#include "xla/pjrt/host_memory_allocator.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/tpu_utils.h"
 
 namespace tpu_raiden {
 namespace {
 thread_local const xla::PjRtDevice* g_current_device = nullptr;
-
-// PJRT_Client_DmaMap aborts inside libtpu on multi-process TPUv7 pods
-// (tpu::System::DmaMap raw_hash_map::at out-of-range), so DMA mapping must be
-// skipped there.
-bool ShouldSkipDmaMap(xla::PjRtClient* client) {
-  bool is_tpuv7 = false;
-  if (client != nullptr) {
-    absl::string_view version = client->platform_version();
-    if (absl::StrContains(version, "7") || absl::StrContains(version, "v7")) {
-      is_tpuv7 = true;
-    }
-    if (!client->devices().empty() && client->devices()[0] != nullptr) {
-      absl::string_view kind = client->devices()[0]->device_kind();
-      if (absl::StrContains(kind, "7") || absl::StrContains(kind, "v7")) {
-        is_tpuv7 = true;
-      }
-    }
-  }
-  const bool is_multi_process =
-      (std::getenv("PJRT_LOCAL_PROCESS_RANK") != nullptr ||
-       std::getenv("RANK") != nullptr || std::getenv("LOCAL_RANK") != nullptr);
-  return is_tpuv7 && is_multi_process;
-}
 }  // namespace
 
 absl::StatusOr<std::unique_ptr<HostMemoryAllocator>>
@@ -136,32 +111,6 @@ absl::StatusOr<HostBufferAllocation> XlaHostMemoryAllocator::Allocate(
     return alloc;
   }
 
-  const bool skip_dma_map = ShouldSkipDmaMap(client_);
-
-  // HYBRID PATH: When skipping DmaMap on multi-process TPUv7 pods, delegate
-  // directly to libtpu's internal host memory allocator pool. This yields
-  // pre-mapped VFIO staged DMA memory (~175 GB/s H2D / ~128 GB/s D2H) rather
-  // than raw unpinned OS memory (~106 GB/s), saving ~70 GB/s on MPMD workloads.
-  if (skip_dma_map && client_ != nullptr &&
-      client_->GetHostMemoryAllocator() != nullptr) {
-    xla::HostMemoryAllocator::AllocateOptions alloc_opts;
-    if (g_current_device != nullptr) {
-      alloc_opts.numa_node = GetPjRtDeviceNumaNode(g_current_device);
-      alloc_opts.local_device_id = g_current_device->local_device_id();
-    }
-    xla::HostMemoryAllocator* host_alloc = client_->GetHostMemoryAllocator();
-    xla::HostMemoryAllocator::OwnedPtr data =
-        host_alloc->Allocate(size_bytes, alloc_opts);
-    if (data != nullptr) {
-      HostBufferAllocation alloc;
-      alloc.ptr = data.get();
-      alloc.size = size_bytes;
-      alloc.owner = std::shared_ptr<void>(
-          data.get(), [d = std::move(data)](void*) mutable { d.reset(); });
-      return alloc;
-    }
-  }
-
   size_t aligned_size = (size_bytes + 4095) & ~4095;
 
   void* ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE,
@@ -171,17 +120,11 @@ absl::StatusOr<HostBufferAllocation> XlaHostMemoryAllocator::Allocate(
         absl::StrCat("mmap failed for size: ", aligned_size));
   }
 
-  bool dma_mapped = false;
-
-  if (!skip_dma_map) {
-    auto status = client_->DmaMap(ptr, aligned_size);
-    if (status.ok()) {
-      dma_mapped = true;
-    } else {
-      munmap(ptr, aligned_size);
-      return absl::InternalError(
-          absl::StrCat("DmaMap failed: ", status.message()));
-    }
+  auto status = client_->DmaMap(ptr, aligned_size);
+  if (!status.ok()) {
+    munmap(ptr, aligned_size);
+    return absl::InternalError(
+        absl::StrCat("DmaMap failed: ", status.message()));
   }
 
   HostBufferAllocation alloc;
@@ -189,13 +132,10 @@ absl::StatusOr<HostBufferAllocation> XlaHostMemoryAllocator::Allocate(
   alloc.size = size_bytes;
 
   xla::PjRtClient* client = client_;
-  alloc.owner =
-      std::shared_ptr<void>(ptr, [client, aligned_size, dma_mapped](void* p) {
-        if (dma_mapped) {
-          (void)client->DmaUnmap(p);
-        }
-        munmap(p, aligned_size);
-      });
+  alloc.owner = std::shared_ptr<void>(ptr, [client, aligned_size](void* p) {
+    (void)client->DmaUnmap(p);
+    munmap(p, aligned_size);
+  });
 
   return alloc;
 }
@@ -472,8 +412,7 @@ SharedMemoryHostMemoryAllocator::AllocateDmaMapped(size_t size_bytes) {
   auto alloc_or = Allocate(size_bytes);
   if (!alloc_or.ok()) return alloc_or;
 
-  if (!dma_mapped_ && client_ != nullptr && client_->platform_name() != "cpu" &&
-      !ShouldSkipDmaMap(client_)) {
+  if (!dma_mapped_ && client_ != nullptr && client_->platform_name() != "cpu") {
     VLOG(1) << "[SHM_ALLOCATOR] Registering shared memory mapping with PjRt "
                "DMA engine...";
     auto status = client_->DmaMap(mapped_ptr_, mapped_size_);

@@ -131,6 +131,16 @@ def prepare_tpu_environment(world_size: int) -> None:
   if "TORCH_TPU_TOPOLOGY" not in os.environ:
     os.environ["TORCH_TPU_TOPOLOGY"] = get_tpu_topology(world_size)
 
+def worker_launch_cmd() -> list[str]:
+  """The command prefix that re-enters this file as a worker rank.
+
+  Under the build system argv[0] is an executable wrapper, so re-running it is
+  all that is needed. Run straight from the source tree and argv[0] is a plain
+  .py file that cannot be exec'd, so name the interpreter explicitly.
+  """
+  if os.access(sys.argv[0], os.X_OK):
+    return [sys.argv[0]]
+  return [sys.executable, os.path.abspath(__file__)]
 
 _registry_process = None
 _registry_port = None
@@ -801,8 +811,7 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
     procs = []
     for rank in range(world_size):
       env = os.environ.copy()
-      cmd = [
-          sys.argv[0],
+      cmd = worker_launch_cmd() + [
           "--run_worker",
           f"--rank={rank}",
           f"--world_size={world_size}",
@@ -835,8 +844,7 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
     procs = []
     for rank in range(world_size):
       env = os.environ.copy()
-      cmd = [
-          sys.argv[0],
+      cmd = worker_launch_cmd() + [
           "--run_worker",
           "--use_slices",
           f"--rank={rank}",
@@ -884,8 +892,7 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
         env = os.environ.copy()
         env["RAIDEN_SHM_KEY"] = shm_key
         env["RAIDEN_SHM_MODEL_UID"] = "mpmd_e2e_model"
-        cmd = [
-            sys.argv[0],
+        cmd = worker_launch_cmd() + [
             "--run_worker",
             "--enable_shm",
             f"--rank={rank}",
@@ -925,8 +932,7 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
     procs = []
     for rank in range(world_size):
       env = os.environ.copy()
-      cmd = [
-          sys.argv[0],
+      cmd = worker_launch_cmd() + [
           "--run_worker",
           "--worker_mode=write_remote",
           f"--rank={rank}",
@@ -957,8 +963,7 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
     procs = []
     for rank in range(world_size):
       env = os.environ.copy()
-      cmd = [
-          sys.argv[0],
+      cmd = worker_launch_cmd() + [
           "--run_worker",
           "--worker_mode=read_remote",
           f"--rank={rank}",

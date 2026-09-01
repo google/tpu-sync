@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
-#include "torch_tpu/eager/device_buffer.h"
+#include "torch_tpu/csrc/eager/device_buffer.h"
 #include "tpu_sync/frameworks/torch/torch_utils.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
@@ -38,6 +38,9 @@ class WeightSynchronizer : public weight_sync::WeightSynchronizerBase {
                      bool unsafe_skip_buffer_lock = true,
                      bool auto_h2d = false);
 
+  absl::Status BindWeights(
+      const std::vector<std::vector<at::Tensor>>& device_tensors);
+
   ~WeightSynchronizer() override;
 
  private:
@@ -49,6 +52,7 @@ class WeightSynchronizer : public weight_sync::WeightSynchronizerBase {
                      bool unsafe_skip_buffer_lock, bool auto_h2d);
 
   std::vector<torch_tpu::DeviceBufferRef> buffer_refs_;
+  bool unsafe_skip_buffer_lock_ = true;
 };
 
 }  // namespace torch

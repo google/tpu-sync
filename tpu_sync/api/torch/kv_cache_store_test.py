@@ -19,9 +19,15 @@ import time
 import unittest
 
 from absl.testing import absltest
+import numpy as np
+import torch
+import torch_tpu
 
 resources = None
+from tpu_sync.api.torch import kv_cache_manager
 from tpu_sync.api.torch import kv_cache_store
+
+KVCacheManager = kv_cache_manager.KVCacheManager
 
 
 def _pick_unused_port():
@@ -135,6 +141,13 @@ class KVCacheStoreTest(absltest.TestCase):
     )
     self.assertNotEqual(block_1.device_block_id, block_3.device_block_id)
 
+  def _require_tpu(self):
+    try:
+      _ = torch_tpu
+      _ = torch.zeros(1, device="tpu")
+    except Exception as e:
+      self.skipTest(f"This test requires TPU hardware: {e}")
+
   def test_basic_tests(self):
     controller = kv_cache_store.KVCacheStore(
         capacity=20, num_shards=1, store_server_ip="127.0.0.1"
@@ -176,8 +189,6 @@ class KVCacheStoreTest(absltest.TestCase):
     # 3. Re-insert once more: still succeeds, and still pins.
     self.assertTrue(controller.insert(hashes, slices, True))
     controller.release(hashes)
-
-
 
   def test_large_and_arbitrary_length_hashes(self):
     controller = kv_cache_store.KVCacheStore(
@@ -299,7 +310,6 @@ class KVCacheStoreTest(absltest.TestCase):
     res = controller.lookup(hashes, enable_global=True)
     self.assertEmpty(res)
 
-
   def test_insert_rejects_remote_slices(self):
     # The LRU cache holds LOCAL blocks only; a REMOTE slice names a block on
     # another node. The whole batch is refused before anything is touched, so
@@ -392,6 +402,7 @@ class KVCacheStoreTest(absltest.TestCase):
     self.assertTrue(store.insert(hashes, slices, False))
     if store.save(hashes):
       # Submission succeeded; the transfer itself must then fail.
+      failed = []
       deadline = time.time() + 30
       while time.time() < deadline:
         _, failed, pending, _, _ = store.poll_save_status()
@@ -672,6 +683,398 @@ class KVCacheStoreTest(absltest.TestCase):
         controller.poll_load_status(), ([], [b"hash_1"], [b"hash_2"])
     )
     mock_impl.poll_load_status.assert_called_once()
+
+  def test_e2e_load(self):
+    """Tests end-to-end load (H2D) on TPU."""
+    self._require_tpu()
+    listener_port = _pick_unused_port()
+
+    num_blocks = 10
+    num_layers = 10
+    shape = (num_blocks, 128, 8, 8, 128)
+    device = torch.device("tpu")
+
+    device_caches = []
+    for l in range(num_layers):
+      data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) + (
+          l * 1000000.0
+      )
+      device_caches.append(torch.from_numpy(data).to(device))
+
+    bytes_per_block = 128 * 8 * 8 * 128 * 4
+    num_shards = 1
+    local_bytes_per_block = bytes_per_block // num_shards
+
+    store_id = kv_cache_store.RaidenId("store_job", "0", "kv_cache", 0)
+    store = kv_cache_store.KVCacheStore(
+        capacity=10,
+        global_registry_address=f"localhost:{_registry_port}",
+        raiden_id=store_id,
+        num_shards=num_shards,
+        shard_size_bytes=local_bytes_per_block,
+        store_server_ip="localhost",
+    )
+
+    manager = KVCacheManager(
+        kv_caches=device_caches,
+        node_id=0,
+        local_control_port=0,
+        max_blocks=num_blocks,
+        num_slots=2,
+        raiden_worker_port=listener_port,
+        raiden_controller_address=store.raiden_controller_address,
+    )
+    self.assertTrue(manager.is_listener_active)
+
+    time.sleep(1)
+
+    # Populate DRAM (HOST blocks 3 and 4) using D2H
+    manager.d2h([0, 1], [3, 4]).wait()
+
+    # Insert blocks to store directory as HOST status
+    slices_1 = [
+        kv_cache_store.RaidenBlockId(
+            store_id, 3, kv_cache_store.BlockStatus.HOST
+        )
+    ]
+    self.assertTrue(store.insert([b"hash1"], slices_1, True))
+
+    slices_2 = [
+        kv_cache_store.RaidenBlockId(
+            store_id, 4, kv_cache_store.BlockStatus.HOST
+        )
+    ]
+    self.assertTrue(store.insert([b"hash2"], slices_2, True))
+    store.release([b"hash1", b"hash2"])
+
+    lookup_res = store.lookup([b"hash1", b"hash2"])
+    self.assertLen(lookup_res, 2)
+
+    # Trigger Load to HBM block 5 and 6 (consumes the pin granted by lookup)
+    self.assertTrue(store.load([b"hash1", b"hash2"], [5, 6]))
+
+    done = False
+    for _ in range(50):
+      done_loading, failed_loading, _ = store.poll_load_status()
+      if failed_loading:
+        self.fail(f"Load failed: {failed_loading}")
+      if len(done_loading) == 2:
+        done = True
+        break
+      time.sleep(0.1)
+    self.assertTrue(done, "Load did not finish in time")
+
+    # Verify Data on Device
+    for l in range(num_layers):
+      self.assertTrue(
+          torch.equal(device_caches[l][5].cpu(), device_caches[l][0].cpu())
+      )
+      self.assertTrue(
+          torch.equal(device_caches[l][6].cpu(), device_caches[l][1].cpu())
+      )
+
+    lookup_res1 = store.lookup([b"hash1"], pin_found=False)
+    self.assertLen(lookup_res1, 1)
+    self.assertEqual(
+        lookup_res1[0][1].status, kv_cache_store.BlockStatus.HOST_AND_HBM
+    )
+    self.assertEqual(lookup_res1[0][1].host_block_id, 3)
+    self.assertEqual(lookup_res1[0][1].device_block_id, 5)
+
+    lookup_res2 = store.lookup([b"hash2"], pin_found=False)
+    self.assertLen(lookup_res2, 1)
+    self.assertEqual(
+        lookup_res2[0][1].status, kv_cache_store.BlockStatus.HOST_AND_HBM
+    )
+    self.assertEqual(lookup_res2[0][1].host_block_id, 4)
+    self.assertEqual(lookup_res2[0][1].device_block_id, 6)
+
+    probe_hashes = [b"probe_%d" % i for i in range(9)]
+    probe_slices = [
+        kv_cache_store.RaidenBlockId(
+            store_id, 100 + i, kv_cache_store.BlockStatus.HOST
+        )
+        for i in range(9)
+    ]
+    self.assertTrue(
+        store.insert(probe_hashes, probe_slices, True),
+        "a leaked pin on hash1/hash2 is blocking eviction",
+    )
+    store.release(probe_hashes)
+
+  def test_e2e_load_with_slices(self):
+    """Tests end-to-end load (H2D) driven by pre-resolved slices, on TPU."""
+    self._require_tpu()
+    listener_port = _pick_unused_port()
+
+    num_blocks = 10
+    num_layers = 10
+    shape = (num_blocks, 128, 8, 8, 128)
+    device = torch.device("tpu")
+
+    device_caches = []
+    for l in range(num_layers):
+      data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) + (
+          l * 7919.0
+      )
+      device_caches.append(torch.from_numpy(data).to(device))
+
+    bytes_per_block = 128 * 8 * 8 * 128 * 4
+    num_shards = 1
+    local_bytes_per_block = bytes_per_block // num_shards
+
+    store_id = kv_cache_store.RaidenId("slices_job", "0", "kv_cache", 0)
+    store = kv_cache_store.KVCacheStore(
+        capacity=10,
+        global_registry_address=f"localhost:{_registry_port}",
+        raiden_id=store_id,
+        num_shards=num_shards,
+        shard_size_bytes=local_bytes_per_block,
+        store_server_ip="localhost",
+    )
+
+    manager = KVCacheManager(
+        kv_caches=device_caches,
+        node_id=0,
+        local_control_port=0,
+        max_blocks=num_blocks,
+        num_slots=2,
+        raiden_worker_port=listener_port,
+        raiden_controller_address=store.raiden_controller_address,
+    )
+    self.assertTrue(manager.is_listener_active)
+    time.sleep(1)
+
+    # Stage device blocks 0 and 1 into host blocks 3 and 4.
+    manager.d2h([0, 1], [3, 4]).wait()
+
+    hashes = [b"slice_hash1", b"slice_hash2"]
+    self.assertTrue(
+        store.insert(
+            [hashes[0]],
+            [
+                kv_cache_store.RaidenBlockId(
+                    store_id, 3, kv_cache_store.BlockStatus.HOST
+                )
+            ],
+            True,
+        )
+    )
+    self.assertTrue(
+        store.insert(
+            [hashes[1]],
+            [
+                kv_cache_store.RaidenBlockId(
+                    store_id, 4, kv_cache_store.BlockStatus.HOST
+                )
+            ],
+            True,
+        )
+    )
+
+    store.release(hashes)
+
+    looked_up = store.lookup(hashes)
+    self.assertLen(looked_up, 2)
+    slices = [entry for _, entry in looked_up]
+    self.assertEqual(slices[0].host_block_id, 3)
+    self.assertEqual(slices[1].host_block_id, 4)
+
+    self.assertTrue(store.load(hashes, [5, 6], slices=slices))
+
+    done = False
+    for _ in range(50):
+      done_loading, failed_loading, _ = store.poll_load_status()
+      if failed_loading:
+        self.fail(f"Load failed: {failed_loading}")
+      if len(done_loading) == 2:
+        done = True
+        break
+      time.sleep(0.1)
+    self.assertTrue(done, "Load did not finish in time")
+
+    # Byte-exact, every layer: block 5 must equal block 0 and 6 equal 1.
+    for l in range(num_layers):
+      self.assertTrue(
+          torch.equal(device_caches[l][5].cpu(), device_caches[l][0].cpu())
+      )
+      self.assertTrue(
+          torch.equal(device_caches[l][6].cpu(), device_caches[l][1].cpu())
+      )
+
+    for hash_val, expected_host, expected_device in (
+        (hashes[0], 3, 5),
+        (hashes[1], 4, 6),
+    ):
+      res = store.lookup([hash_val], pin_found=False)
+      self.assertLen(res, 1)
+      self.assertEqual(
+          res[0][1].status, kv_cache_store.BlockStatus.HOST_AND_HBM
+      )
+      self.assertEqual(res[0][1].host_block_id, expected_host)
+      self.assertEqual(res[0][1].device_block_id, expected_device)
+
+  def test_e2e_save(self):
+    """Tests end-to-end save (D2H) and load (H2D) back on TPU."""
+    self._require_tpu()
+    listener_port = _pick_unused_port()
+
+    num_blocks = 10
+    num_layers = 10
+    shape = (num_blocks, 128, 8, 8, 128)
+    device = torch.device("tpu")
+
+    device_caches = []
+    for l in range(num_layers):
+      data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) + (
+          l * 1000000.0
+      )
+      device_caches.append(torch.from_numpy(data).to(device))
+
+    bytes_per_block = 128 * 8 * 8 * 128 * 4
+    num_shards = 1
+    local_bytes_per_block = bytes_per_block // num_shards
+
+    store_id = kv_cache_store.RaidenId("store_job", "0", "kv_cache", 0)
+    store = kv_cache_store.KVCacheStore(
+        capacity=10,
+        global_registry_address=f"localhost:{_registry_port}",
+        raiden_id=store_id,
+        num_shards=num_shards,
+        shard_size_bytes=local_bytes_per_block,
+        store_server_ip="localhost",
+    )
+
+    num_slots = 2
+    manager = KVCacheManager(
+        kv_caches=device_caches,
+        node_id=0,
+        local_control_port=0,
+        max_blocks=num_blocks,
+        num_slots=num_slots,
+        raiden_worker_port=listener_port,
+        raiden_controller_address=store.raiden_controller_address,
+        host_blocks_to_allocate=num_slots * num_blocks + 2,
+    )
+    self.assertTrue(manager.is_listener_active)
+
+    time.sleep(1)
+
+    # Insert blocks to store directory as HBM status
+    slices_1 = [
+        kv_cache_store.RaidenBlockId(
+            store_id,
+            host_block_id=-1,
+            device_block_id=0,
+            status=kv_cache_store.BlockStatus.HBM,
+        )
+    ]
+    self.assertTrue(store.insert([b"hash1"], slices_1, False))
+
+    slices_2 = [
+        kv_cache_store.RaidenBlockId(
+            store_id,
+            host_block_id=-1,
+            device_block_id=1,
+            status=kv_cache_store.BlockStatus.HBM,
+        )
+    ]
+    self.assertTrue(store.insert([b"hash2"], slices_2, False))
+
+    # Trigger Save (D2H)
+    self.assertTrue(store.save([b"hash1", b"hash2"]))
+
+    done = False
+    for _ in range(50):
+      done_saving, failed_saving, _, _, _ = store.poll_save_status()
+      if failed_saving:
+        self.fail(f"Save failed: {failed_saving}")
+      if len(done_saving) == 2:
+        done = True
+        break
+      time.sleep(0.1)
+    self.assertTrue(done, "Save did not finish in time")
+
+    lookup_res1 = store.lookup([b"hash1"], pin_found=False)
+    self.assertLen(lookup_res1, 1)
+    self.assertEqual(
+        lookup_res1[0][1].status, kv_cache_store.BlockStatus.HOST_AND_HBM
+    )
+    host_block_id1 = lookup_res1[0][1].host_block_id
+    self.assertGreaterEqual(host_block_id1, 0)
+
+    lookup_res2 = store.lookup([b"hash2"], pin_found=False)
+    self.assertLen(lookup_res2, 1)
+    self.assertEqual(
+        lookup_res2[0][1].status, kv_cache_store.BlockStatus.HOST_AND_HBM
+    )
+    host_block_id2 = lookup_res2[0][1].host_block_id
+    self.assertGreaterEqual(host_block_id2, 0)
+    self.assertNotEqual(host_block_id1, host_block_id2)
+
+    # Verify registration in global registry using a second store instance
+    store2 = kv_cache_store.KVCacheStore(
+        capacity=10,
+        global_registry_address=f"localhost:{_registry_port}",
+        raiden_id=kv_cache_store.RaidenId("receiver_job", "0", "kv_cache", 0),
+        num_shards=1,
+        store_server_ip="localhost",
+    )
+    global_verified = False
+    for _ in range(50):
+      lookup_res = store2.lookup([b"hash1", b"hash2"], enable_global=True)
+      if len(lookup_res) == 2:
+        self.assertEqual(lookup_res[0][0], b"hash1")
+        self.assertEqual(
+            lookup_res[0][1].status, kv_cache_store.BlockStatus.REMOTE
+        )
+        self.assertEqual(lookup_res[0][1].raiden_id, store_id)
+
+        self.assertEqual(lookup_res[1][0], b"hash2")
+        self.assertEqual(
+            lookup_res[1][1].status, kv_cache_store.BlockStatus.REMOTE
+        )
+        self.assertEqual(lookup_res[1][1].raiden_id, store_id)
+        global_verified = True
+        break
+      time.sleep(0.1)
+    self.assertTrue(global_verified, "Global registration lookup failed")
+
+    # Trigger Load (H2D) to DIFFERENT HBM blocks (5 and 6)
+    self.assertLen(store.lookup([b"hash1", b"hash2"]), 2)
+    self.assertTrue(store.load([b"hash1", b"hash2"], [5, 6]))
+
+    done = False
+    for _ in range(50):
+      done_loading, failed_loading, _ = store.poll_load_status()
+      if failed_loading:
+        self.fail(f"Load failed: {failed_loading}")
+      if len(done_loading) == 2:
+        done = True
+        break
+      time.sleep(0.1)
+    self.assertTrue(done, "Load did not finish in time")
+
+    for l in range(num_layers):
+      self.assertTrue(
+          torch.equal(device_caches[l][5].cpu(), device_caches[l][0].cpu())
+      )
+      self.assertTrue(
+          torch.equal(device_caches[l][6].cpu(), device_caches[l][1].cpu())
+      )
+
+    probe_hashes = [b"probe_%d" % i for i in range(9)]
+    probe_slices = [
+        kv_cache_store.RaidenBlockId(
+            store_id, 100 + i, kv_cache_store.BlockStatus.HOST
+        )
+        for i in range(9)
+    ]
+    self.assertTrue(
+        store.insert(probe_hashes, probe_slices, True),
+        "a leaked pin on hash1/hash2 is blocking eviction",
+    )
+    store.release(probe_hashes)
 
   def test_expected_worker_count_zero_does_not_block(self):
     """The default must stay non-blocking."""

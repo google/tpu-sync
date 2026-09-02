@@ -136,3 +136,28 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "label_util",
+    srcs = ["label_util.cc"],
+    hdrs = ["label_util.h"],
+    deps = [
+        ":metrics_backend",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "label_util_test",
+    srcs = ["label_util_test.cc"],
+    deps = [
+        ":label_util",
+        ":metrics_backend",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

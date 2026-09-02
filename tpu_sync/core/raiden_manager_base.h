@@ -132,6 +132,11 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
     std::unique_ptr<uint8_t[], void (*)(void*)> owned_host_buffer = {
         nullptr, [](void*) {}};
     std::shared_ptr<void> host_owner;
+    std::unique_ptr<uint8_t[], void (*)(void*)> owned_tiled_buffer = {
+        nullptr, [](void*) {}};
+    std::shared_ptr<void> tiled_owner;
+    uint8_t* tiled_ptr = nullptr;
+    size_t tiled_size = 0;
   };
 
   struct LayerInfoBase {

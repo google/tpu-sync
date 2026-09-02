@@ -16,6 +16,8 @@
 
 from typing import Any, Dict, List, Optional
 
+import jax
+
 # Import Nanobind binary library directly E2E!
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _weight_synchronizer
 
@@ -44,6 +46,10 @@ class WeightSynchronizer:
       bind_ip: Sockets server bind IP address.
       auto_h2d: Automatically execute H2D ingestion upon data arrival.
     """
+    global_shard_offset = 0
+    if jax.process_count() > 1:
+      global_shard_offset = jax.process_index() * len(jax.local_devices())
+
     self._impl = _weight_synchronizer.WeightSynchronizer(
         jax_arrays,
         local_port,
@@ -52,6 +58,7 @@ class WeightSynchronizer:
         listener_port,
         bind_ip,
         auto_h2d,
+        global_shard_offset,
     )
 
   def d2h(self) -> None:

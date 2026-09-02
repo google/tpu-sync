@@ -303,12 +303,13 @@ NB_MODULE(_tpu_raiden_jax, m) {
   // =========================================================================
   nb::class_<WeightSynchronizer>(m, "WeightSynchronizer")
       .def(nb::init<nb::list, std::optional<int>, int, bool, std::optional<int>,
-                    std::optional<std::string>, bool>(),
+                    std::optional<std::string>, bool, std::optional<int>>(),
            nb::arg("jax_arrays"), nb::arg("local_port") = nb::none(),
            nb::arg("parallelism") = 1,
            nb::arg("unsafe_skip_buffer_lock") = false,
            nb::arg("listener_port") = nb::none(),
-           nb::arg("bind_ip") = nb::none(), nb::arg("auto_h2d") = false)
+           nb::arg("bind_ip") = nb::none(), nb::arg("auto_h2d") = false,
+           nb::arg("global_shard_offset") = nb::none())
 
       .def(
           "D2h",

@@ -89,6 +89,7 @@ class MockSubWeightSynchronizer : public weight_sync::WeightSynchronizerBase {
   uint32_t last_registered_chunks = 0;
   absl::flat_hash_map<size_t, uint32_t> last_registered_layer_chunks;
   int wait_completion_calls = 0;
+  int drain_pending_h2d_calls = 0;
 
   absl::Status RegisterExpectedChunksLocal(uint64_t uuid,
                                            uint32_t expected_chunks) override {
@@ -108,6 +109,8 @@ class MockSubWeightSynchronizer : public weight_sync::WeightSynchronizerBase {
     wait_completion_calls++;
     return absl::OkStatus();
   }
+
+  void DrainPendingH2d() override { drain_pending_h2d_calls++; }
 
   void SetMockMetrics(const weight_sync::WeightSyncMetrics& m) {
     SetMetricsForTesting(m);
@@ -332,6 +335,65 @@ TEST(WeightSynchronizerWrapperTest,
   EXPECT_TRUE(numa_ws.WaitForTransferCompletion(100).ok());
   EXPECT_EQ(sub0_raw->wait_completion_calls, 1);
   EXPECT_EQ(sub1_raw->wait_completion_calls, 1);
+}
+
+TEST(WeightSynchronizerWrapperTest,
+     RegisterExpectedCountsWithReplicatedTensors) {
+  auto sub0_raw = new MockSubWeightSynchronizer(2, 4, 1024);
+  auto sub1_raw = new MockSubWeightSynchronizer(2, 4, 1024);
+
+  std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>> subs;
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub0_raw));
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub1_raw));
+
+  NumaAwareWeightSynchronizer numa_ws(std::move(subs));
+
+  // 1 chunk for a replicated layer (e.g. 1D layer norm across 8 shards)
+  absl::flat_hash_map<size_t, uint32_t> layer_counts = {{0, 1}};
+  EXPECT_TRUE(numa_ws.RegisterExpectedLayerChunks(101, layer_counts).ok());
+  EXPECT_TRUE(numa_ws.RegisterExpectedChunks(101, 1).ok());
+
+  // Both sub0 and sub1 must register count 1 for layer 0, not drop to 0
+  EXPECT_EQ(sub0_raw->last_registered_chunks, 1);
+  EXPECT_EQ(sub0_raw->last_registered_layer_chunks[0], 1);
+
+  EXPECT_EQ(sub1_raw->last_registered_chunks, 1);
+  EXPECT_EQ(sub1_raw->last_registered_layer_chunks[0], 1);
+}
+
+TEST(WeightSynchronizerWrapperTest, DrainPendingH2dDispatchesToAllSubs) {
+  auto sub0_raw = new MockSubWeightSynchronizer(2, 4, 1024);
+  auto sub1_raw = new MockSubWeightSynchronizer(2, 4, 1024);
+
+  std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>> subs;
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub0_raw));
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub1_raw));
+
+  NumaAwareWeightSynchronizer numa_ws(std::move(subs));
+
+  numa_ws.DrainPendingH2d();
+  EXPECT_EQ(sub0_raw->drain_pending_h2d_calls, 1);
+  EXPECT_EQ(sub1_raw->drain_pending_h2d_calls, 1);
+}
+
+TEST(WeightSynchronizerWrapperTest, GlobalShardOffsetMapping) {
+  // Test constructing WeightSynchronizer with global_shard_offset=4
+  WeightSynchronizer ws(2, 4, 1024, /*local_port=*/std::nullopt,
+                        /*parallelism=*/1, /*listener_port=*/std::nullopt,
+                        /*bind_ip=*/std::nullopt, /*auto_h2d=*/false,
+                        /*global_shard_offset=*/4);
+
+  EXPECT_EQ(ws.num_layers(), 2);
+  EXPECT_EQ(ws.num_shards(), 4);
+  EXPECT_EQ(ws.slice_byte_size(), 1024);
+
+  auto eps = ws.get_local_endpoints();
+  ASSERT_EQ(eps.size(), 1);
+  EXPECT_EQ(eps[0].shards, (std::vector<int64_t>{4, 5, 6, 7}));
 }
 
 }  // namespace

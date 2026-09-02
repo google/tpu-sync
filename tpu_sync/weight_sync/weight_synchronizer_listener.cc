@@ -243,6 +243,7 @@ void WeightSynchronizerListener::ConnectionWorker(int client_fd) {
       shutdown(fd, SHUT_RDWR);
       close(fd);
     }
+    resp.set_success(true);
   } else {
     resp.set_success(false);
     resp.set_message("COMMAND_UNSPECIFIED");

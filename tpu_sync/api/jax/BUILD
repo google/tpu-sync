@@ -83,6 +83,7 @@ py_library(
     deps = [
         "//tpu_sync/frameworks/jax:_tpu_raiden_jax",
         "//tpu_sync/frameworks/jax:jax_test_utils",
+        "@jax//jax",
     ],
 )
 

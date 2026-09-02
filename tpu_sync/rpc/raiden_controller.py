@@ -451,8 +451,11 @@ class WorkerRpcClient:
       name_resolver: Interface for resolving remote coordinates (e.g. BNS).
       proto_module: Optional protobuf module to use for ControlRequest/Response.
     """
-    self._endpoints = endpoint_addresses or {}
-    self._pending_endpoints: dict[RaidenId, asyncio.Future[str]] = {}
+    self._endpoints = {}
+    if endpoint_addresses:
+      for k, v in endpoint_addresses.items():
+        self._endpoints[k] = [v] if isinstance(v, str) else list(v)
+    self._pending_endpoints: dict[RaidenId, asyncio.Future[list[str]]] = {}
     self._resolve_timeout = resolve_timeout
     self._name_resolver = name_resolver
     self._proto_module = proto_module or raiden_service_pb2
@@ -473,48 +476,63 @@ class WorkerRpcClient:
       worker_name: Participating worker RaidenId coordinate.
       rpc_address: TCP server address in 'IP:Port' or Google BNS format.
     """
-    self._endpoints[worker_name] = rpc_address
+    if worker_name not in self._endpoints:
+      self._endpoints[worker_name] = []
+    if rpc_address not in self._endpoints[worker_name]:
+      self._endpoints[worker_name].append(rpc_address)
     future = self._pending_endpoints.pop(worker_name, None)
     if future and not future.done():
-      future.set_result(rpc_address)
+      future.set_result(self._endpoints[worker_name])
 
   def unregister_worker_endpoint(self, worker_name: RaidenId) -> None:
     """Removes a stale worker endpoint during work-unit replacement."""
     self._endpoints.pop(worker_name, None)
 
   async def _resolve_endpoint(self, target_id: RaidenId) -> str:
-    """Resolves worker RPC address asynchronously or suspends execution until registered.
+    addrs = await self._resolve_endpoints(target_id)
+    return addrs[0] if addrs else ""
+
+  async def _resolve_endpoints(self, target_id: RaidenId) -> list[str]:
+    """Resolves worker RPC addresses asynchronously or suspends execution until registered.
 
     Args:
       target_id: Target worker RaidenId coordinate to resolve.
 
     Returns:
-      Resolved remote RPC TCP server address string.
+      List of resolved remote RPC TCP server address strings.
 
     Raises:
       RuntimeError: If the remote endpoint fails to self-register within
         `resolve_timeout`.
     """
-    addr = self._endpoints.get(target_id)
-    if addr:
-      return addr
+    addrs = self._endpoints.get(target_id)
+    if addrs:
+      return list(addrs)
 
     future = self._pending_endpoints.setdefault(target_id, asyncio.Future())
     try:
-      return await asyncio.wait_for(future, timeout=self._resolve_timeout)
+      res = await asyncio.wait_for(future, timeout=self._resolve_timeout)
+      return list(res)
     except asyncio.TimeoutError as e:
       raise RuntimeError(
           f"Timeout ({self._resolve_timeout}s) waiting for remote RPC"
           f" endpoint {target_id} to self-register"
       ) from e
 
-  async def _send_rpc(self, addr: str, payload: bytes) -> bytes:
+  async def _send_rpc(
+      self, addr: str, payload: bytes, timeout: float = 600.0
+  ) -> bytes:
     """Connects to remote address, sends payload, and returns the response bytes."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, self._send_rpc_sync, addr, payload)
+    return await loop.run_in_executor(
+        None, self._send_rpc_sync, addr, payload, timeout
+    )
 
-  def _send_rpc_sync(self, addr: str, payload: bytes) -> bytes:
-    sock = connect_socket(addr, timeout=600.0, resolver=self._name_resolver)
+  def _send_rpc_sync(
+      self, addr: str, payload: bytes, timeout: float = 600.0
+  ) -> bytes:
+    """Connects synchronously, sends payload, and returns response bytes."""
+    sock = connect_socket(addr, timeout=timeout, resolver=self._name_resolver)
     try:
       sock.sendall(len(payload).to_bytes(4, "big") + payload)
 
@@ -568,7 +586,12 @@ class WorkerRpcClient:
         return
     except NotImplementedError:
       return
-    addr = address or await self._resolve_endpoint(target_id)
+    addrs = [address] if address else await self._resolve_endpoints(target_id)
+    await asyncio.gather(
+        *[self._send_and_verify(addr, payload) for addr in addrs]
+    )
+
+  async def _send_and_verify(self, addr: str, payload: bytes) -> None:
     resp_bytes = await self._send_rpc(addr, payload)
     self._verify_response(resp_bytes)
 
@@ -763,15 +786,24 @@ class WorkerRpcClient:
 
   def get_worker_endpoints(self) -> dict[RaidenId, str]:
     """Returns active read-only snapshot of known registered Worker RPC endpoints."""
-    return dict(self._endpoints)
+    return {k: v[0] for k, v in self._endpoints.items() if v}
 
-  async def shutdown_workers(self) -> None:
+  def get_registered_endpoints(self, worker_name: RaidenId) -> list[str]:
+    """Returns list of registered RPC endpoints for the given worker."""
+    return list(self._endpoints.get(worker_name, []))
+
+  async def shutdown_workers(self, timeout: float = 10.0) -> None:
     """Dispatches remote shutdown signaling payloads to all registered worker daemons."""
     payload = self._encode_shutdown()
-    unique_addrs = set(self._endpoints.values())
-    if unique_addrs:
+    all_addrs = set()
+    for addrs in self._endpoints.values():
+      all_addrs.update(addrs)
+    if all_addrs:
       await asyncio.gather(
-          *[self._send_rpc(addr, payload) for addr in unique_addrs],
+          *[
+              self._send_rpc(addr, payload, timeout=timeout)
+              for addr in all_addrs
+          ],
           return_exceptions=True,
       )
 
@@ -1463,6 +1495,11 @@ class RaidenController:
       return [
           self._metadata_proto_locked(unit) for unit in self._registered_shards
       ]
+
+  def get_registered_units(self) -> set[RaidenId]:
+    """Returns the set of currently registered work unit IDs."""
+    with self._lock:
+      return set(self._registered_shards.keys())
 
   def _resolve_shards(self, unit: RaidenId) -> list[str]:
     with self._lock:

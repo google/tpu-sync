@@ -274,8 +274,8 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
       prog.completed_chunks++;
       prog.completed_chunks_per_layer[buf_id]++;
       auto it = prog.expected_chunks_per_layer.find(buf_id);
-      if (it != prog.expected_chunks_per_layer.end() &&
-          prog.completed_chunks_per_layer[buf_id] == it->second &&
+      if (it != prog.expected_chunks_per_layer.end() && it->second > 0 &&
+          prog.completed_chunks_per_layer[buf_id] >= it->second &&
           !prog.triggered_layers.contains(buf_id)) {
         prog.triggered_layers.insert(buf_id);
         layers_to_trigger.push_back(buf_id);
@@ -362,8 +362,8 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
         size_t l = metadata[i].layer_idx;
         prog.completed_chunks_per_layer[l]++;
         auto it = prog.expected_chunks_per_layer.find(l);
-        if (it != prog.expected_chunks_per_layer.end() &&
-            prog.completed_chunks_per_layer[l] == it->second &&
+        if (it != prog.expected_chunks_per_layer.end() && it->second > 0 &&
+            prog.completed_chunks_per_layer[l] >= it->second &&
             !prog.triggered_layers.contains(l)) {
           prog.triggered_layers.insert(l);
           layers_to_trigger.push_back(l);
@@ -592,9 +592,10 @@ absl::Status RawBufferTransport::RegisterExpectedLayerChunks(
     auto& prog = raw_progress_[uuid];
     prog.expected_chunks_per_layer = expected_layer_chunks;
     for (const auto& [layer_idx, expected_count] : expected_layer_chunks) {
+      if (expected_count == 0) continue;
       auto it = prog.completed_chunks_per_layer.find(layer_idx);
       if (it != prog.completed_chunks_per_layer.end() &&
-          it->second == expected_count &&
+          it->second >= expected_count &&
           !prog.triggered_layers.contains(layer_idx)) {
         prog.triggered_layers.insert(layer_idx);
         layers_to_trigger.push_back(layer_idx);

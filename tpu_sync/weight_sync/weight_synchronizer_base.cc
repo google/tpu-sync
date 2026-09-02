@@ -63,21 +63,6 @@ ABSL_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size, 256 * 1024,
 
 namespace tpu_raiden {
 namespace weight_sync {
-namespace {
-
-// Allocates an uninitialized shared buffer, using
-// std::make_shared_for_overwrite when supported (C++20), falling back to
-// std::shared_ptr<uint8_t[]>(new uint8_t[size]).
-inline std::shared_ptr<uint8_t[]> MakeSharedBufferForOverwrite(size_t size) {
-#if defined(__cpp_lib_smart_ptr_for_overwrite) && \
-    __cpp_lib_smart_ptr_for_overwrite >= 202002L
-  return std::make_shared_for_overwrite<uint8_t[]>(size);
-#else
-  return std::shared_ptr<uint8_t[]>(new uint8_t[size]);
-#endif
-}
-
-}  // namespace
 
 WeightSynchronizerBase::WeightSynchronizerBase(
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -189,6 +174,40 @@ WeightSynchronizerBase::WeightSynchronizerBase(
                     static_cast<uint8_t*>(ptr), [](void* p) { free(p); });
             shard_info.host_ptr = shard_info.owned_host_buffer.get();
             shard_info.host_size = alloc_size;
+          }
+        }
+      }
+
+      const xla::Layout* xla_layout = nullptr;
+      if (dst_buffer.shape.has_layout()) {
+        xla_layout = &dst_buffer.shape.layout();
+      }
+      if (xla_layout && !xla_layout->tiles().empty()) {
+        int64_t itemsize = xla::ShapeUtil::ByteSizeOfPrimitiveType(
+            dst_buffer.shape.element_type());
+        size_t physical_bytes =
+            tpu_raiden::weight_sync::GetTiledBufferElements(dst_buffer.shape) *
+            itemsize;
+        if (physical_bytes > 0) {
+          shard_info.tiled_size = physical_bytes;
+          if (host_allocator && dst_buffer.device) {
+            auto alloc = host_allocator->AllocateDmaMappedForDevice(
+                physical_bytes, dst_buffer.device);
+            if (alloc.ok()) {
+              shard_info.tiled_ptr = (*alloc).ptr;
+              shard_info.tiled_owner = (*alloc).owner;
+            }
+          }
+          if (shard_info.tiled_ptr == nullptr) {
+            void* ptr = nullptr;
+            if (posix_memalign(&ptr, 64, physical_bytes) != 0) {
+              throw std::runtime_error(
+                  "Failed to allocate host tiled scratch buffer");
+            }
+            shard_info.owned_tiled_buffer =
+                std::unique_ptr<uint8_t[], void (*)(void*)>(
+                    static_cast<uint8_t*>(ptr), [](void* p) { free(p); });
+            shard_info.tiled_ptr = shard_info.owned_tiled_buffer.get();
           }
         }
       }
@@ -401,11 +420,14 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
       size_t physical_bytes =
           tpu_raiden::weight_sync::GetTiledBufferElements(shard_hold.shape) *
           itemsize;
-      auto temp_buffer = MakeSharedBufferForOverwrite(physical_bytes);
+      uint8_t* tiled_buffer_ptr = shard_info.tiled_ptr;
+      if (tiled_buffer_ptr == nullptr) {
+        return absl::InternalError(
+            "Tiled buffer pointer is null for tiled shape");
+      }
       auto tile_start = absl::Now();
       auto status = tpu_raiden::weight_sync::TileBuffer(
-          shard_info.host_ptr, temp_buffer.get(), shard_hold.shape,
-          *xla_layout);
+          shard_info.host_ptr, tiled_buffer_ptr, shard_hold.shape, *xla_layout);
       if (!status.ok()) {
         return status;
       }
@@ -420,10 +442,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
         metrics_.total_tiled_bytes += physical_bytes;
       }
 
-      xla::Future<> future = shard_hold.CopyRawHostToDevice(
-          temp_buffer.get(), 0, physical_bytes);
-      xla::Future<> mapped_future = future.Map([temp_buffer]() {});
-      shard_futures.push_back(std::move(mapped_future));
+      xla::Future<> future =
+          shard_hold.CopyRawHostToDevice(tiled_buffer_ptr, 0, physical_bytes);
+      shard_futures.push_back(std::move(future));
     } else {
       xla::Future<> future = shard_hold.CopyRawHostToDevice(
           shard_info.host_ptr, 0, shard_info.device_size);
@@ -516,26 +537,28 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
       size_t physical_bytes =
           tpu_raiden::weight_sync::GetTiledBufferElements(shard_hold.shape) *
           itemsize;
-      auto temp_buffer = MakeSharedBufferForOverwrite(physical_bytes);
-      uint8_t* temp_buffer_ptr = temp_buffer.get();
+      uint8_t* tiled_buffer_ptr = shard_info.tiled_ptr;
+      if (tiled_buffer_ptr == nullptr) {
+        return absl::InternalError(
+            "Tiled buffer pointer is null for tiled shape");
+      }
 
       xla::Future<> copy_future =
-          shard_hold.CopyRawDeviceToHost(temp_buffer_ptr, 0, physical_bytes);
+          shard_hold.CopyRawDeviceToHost(tiled_buffer_ptr, 0, physical_bytes);
 
       xla::Future<> detile_future = copy_future.Map(
-          [this, temp_buffer, dst_host_ptr, shape = shard_hold.shape,
+          [this, tiled_buffer_ptr, dst_host_ptr, shape = shard_hold.shape,
            layout = *xla_layout, physical_bytes]() -> absl::Status {
             auto detile_start = absl::Now();
             absl::Status status = tpu_raiden::weight_sync::DetileBuffer(
-                temp_buffer.get(), dst_host_ptr, shape, layout);
+                tiled_buffer_ptr, dst_host_ptr, shape, layout);
             double detile_time_ms =
                 absl::ToDoubleMilliseconds(absl::Now() - detile_start);
             if (status.ok()) {
               absl::MutexLock lock(metrics_mu_);
               metrics_.last_detiling_time_ms =
                   std::max(metrics_.last_detiling_time_ms, detile_time_ms);
-              metrics_.total_detiling_time_ms =
-                  std::max(metrics_.total_detiling_time_ms, detile_time_ms);
+              metrics_.total_detiling_time_ms += detile_time_ms;
               metrics_.last_detiled_bytes += physical_bytes;
               metrics_.total_detiled_bytes += physical_bytes;
             }
@@ -855,12 +878,26 @@ absl::Status WeightSynchronizerBase::BindWeights(
     }
   }
 
+  xla::PjRtClient* client = nullptr;
   if (!layer_buffers.empty() && !layer_buffers[0].empty()) {
     const auto& first_handle = layer_buffers[0][0];
     physical_size_ = first_handle.GetOnDeviceSizeInBytes();
     if (!first_handle.is_common_buffer && first_handle.c_hold) {
       c_api_ = first_handle.c_hold->c_api;
       extension_ = first_handle.c_hold->extension;
+    }
+    if (first_handle.buffer) {
+      client = const_cast<xla::PjRtClient*>(first_handle.buffer->client());
+    } else if (first_handle.device) {
+      client = const_cast<xla::PjRtClient*>(first_handle.device->client());
+    }
+  }
+
+  std::unique_ptr<HostMemoryAllocator> host_allocator;
+  if (client) {
+    auto alloc = HostMemoryAllocator::Create(client);
+    if (alloc.ok()) {
+      host_allocator = *std::move(alloc);
     }
   }
 
@@ -870,7 +907,46 @@ absl::Status WeightSynchronizerBase::BindWeights(
     std::vector<raiden::BufferHoldAndAlias> hold_info;
     hold_info.reserve(num_shards_);
     for (size_t shard_idx = 0; shard_idx < num_shards_; ++shard_idx) {
-      hold_info.push_back(layer_buffers[layer_idx][shard_idx]);
+      const auto& new_buffer = layer_buffers[layer_idx][shard_idx];
+      auto& shard_info = layers_[layer_idx].shards[shard_idx];
+      const xla::Layout* xla_layout = nullptr;
+      if (new_buffer.shape.has_layout()) {
+        xla_layout = &new_buffer.shape.layout();
+      }
+      if (xla_layout && !xla_layout->tiles().empty()) {
+        int64_t itemsize = xla::ShapeUtil::ByteSizeOfPrimitiveType(
+            new_buffer.shape.element_type());
+        size_t physical_bytes =
+            tpu_raiden::weight_sync::GetTiledBufferElements(new_buffer.shape) *
+            itemsize;
+        if (physical_bytes > 0 && (shard_info.tiled_ptr == nullptr ||
+                                   shard_info.tiled_size < physical_bytes)) {
+          shard_info.tiled_size = physical_bytes;
+          shard_info.tiled_ptr = nullptr;
+          shard_info.tiled_owner.reset();
+          shard_info.owned_tiled_buffer.reset();
+          if (host_allocator && new_buffer.device) {
+            auto alloc = host_allocator->AllocateDmaMappedForDevice(
+                physical_bytes, new_buffer.device);
+            if (alloc.ok()) {
+              shard_info.tiled_ptr = (*alloc).ptr;
+              shard_info.tiled_owner = (*alloc).owner;
+            }
+          }
+          if (shard_info.tiled_ptr == nullptr) {
+            void* ptr = nullptr;
+            if (posix_memalign(&ptr, 64, physical_bytes) != 0) {
+              return absl::InternalError(
+                  "Failed to allocate host tiled scratch buffer");
+            }
+            shard_info.owned_tiled_buffer =
+                std::unique_ptr<uint8_t[], void (*)(void*)>(
+                    static_cast<uint8_t*>(ptr), [](void* p) { free(p); });
+            shard_info.tiled_ptr = shard_info.owned_tiled_buffer.get();
+          }
+        }
+      }
+      hold_info.push_back(new_buffer);
     }
     buffer_holds_.push_back(std::move(hold_info));
   }
@@ -980,19 +1056,24 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
     }
   }
 
-  if (!layer_futures_map.empty()) {
-    std::vector<raiden::PjRtCopyFuture> futures_to_await;
-    futures_to_await.reserve(layer_futures_map.size());
-    for (auto& [layer_idx, f] : layer_futures_map) {
-      TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future, f.get());
+  std::vector<raiden::PjRtCopyFuture> futures_to_await;
+  futures_to_await.reserve(num_layers_);
+  for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
+    auto it = layer_futures_map.find(layer_idx);
+    if (it != layer_futures_map.end() && it->second.valid()) {
+      TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
+                          it->second.get());
+      futures_to_await.push_back(std::move(layer_future));
+    } else {
+      TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
+                          H2dLayer(layer_idx, uuid));
       futures_to_await.push_back(std::move(layer_future));
     }
+  }
+  if (!futures_to_await.empty()) {
     raiden::PjRtCopyFuture joined_future =
         raiden::JoinPjRtCopyFutures(futures_to_await);
     TF_RETURN_IF_ERROR(joined_future.Await());
-  } else {
-    TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture h2d_future, H2d(uuid));
-    TF_RETURN_IF_ERROR(h2d_future.Await());
   }
 
   double h2d_time_ms = absl::ToDoubleMilliseconds(absl::Now() - h2d_start);
@@ -1014,42 +1095,21 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
 void WeightSynchronizerBase::DrainPendingH2d() {
   if (!auto_h2d_) return;
 
-  absl::flat_hash_map<uint64_t, PendingH2dState> remaining_states;
+  std::vector<uint64_t> active_uuids;
   {
     absl::MutexLock lock(pending_h2d_mu_);
-    remaining_states = std::move(pending_h2d_states_);
-    pending_h2d_states_.clear();
-  }
-
-  for (auto& [uuid, state] : remaining_states) {
-    std::vector<raiden::PjRtCopyFuture> futures_to_await;
-    futures_to_await.reserve(state.layer_futures.size());
-    for (auto& [layer_idx, f] : state.layer_futures) {
-      if (f.valid()) {
-        auto status_or_future = f.get();
-        if (status_or_future.ok()) {
-          futures_to_await.push_back(std::move(status_or_future.value()));
-        }
+    for (const auto& [uuid, _] : pending_h2d_states_) {
+      if (uuid > 0) {
+        active_uuids.push_back(uuid);
       }
     }
-    if (!futures_to_await.empty()) {
-      raiden::PjRtCopyFuture joined_future =
-          raiden::JoinPjRtCopyFutures(futures_to_await);
-      (void)joined_future.Await();
-    }
-    if (uuid > 0) {
-      absl::MutexLock lock(completed_transfers_mu_);
-      completed_transfers_.insert(uuid);
-    }
   }
-
-  {
-    absl::MutexLock lock(pending_h2d_mu_);
-    auto condition_fn =
-        +[](WeightSynchronizerBase* self) ABSL_NO_THREAD_SAFETY_ANALYSIS {
-          return self->active_h2d_uuids_.empty();
-        };
-    pending_h2d_mu_.Await(absl::Condition(condition_fn, this));
+  for (uint64_t uuid : active_uuids) {
+    absl::Status status = WaitForTransferCompletion(uuid);
+    if (!status.ok()) {
+      LOG(ERROR) << "Failed waiting for transfer completion (uuid=" << uuid
+                 << ") during DrainPendingH2d: " << status;
+    }
   }
 }
 

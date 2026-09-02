@@ -143,8 +143,13 @@ TorchKVCacheManager::TorchKVCacheManager(
           unpacked.has_logical_metadata ? unpacked.logical_physical_size : 0,
           local_port, host_blocks_to_allocate, unsafe_skip_buffer_lock,
           parallelism,
+          // The same resolution the KVCacheManagerWithTransfer base applies,
+          // so the segment identity records the pool size actually allocated.
           CreateHostMemoryAllocator(
-              unpacked.client, enable_shm, max_blocks,
+              unpacked.client, enable_shm,
+              host_blocks_to_allocate.has_value()
+                  ? static_cast<int64_t>(*host_blocks_to_allocate)
+                  : num_slots * max_blocks,
               (unpacked.buffers.empty() || unpacked.buffers[0].empty() ||
                unpacked.buffers[0][0].buffer == nullptr)
                   ? 0

@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -43,6 +44,67 @@
 namespace tpu_raiden {
 namespace {
 thread_local const xla::PjRtDevice* g_current_device = nullptr;
+
+// Reserves [offset, offset + length) of the segment file, extending it if
+// needed, so /dev/shm exhaustion surfaces here as an error instead of a
+// SIGBUS at first touch.
+absl::Status ReserveSegmentRange(int fd, size_t offset, size_t length,
+                                 const std::string& segment_name) {
+  int err;
+  do {
+    err = posix_fallocate(fd, offset, length);
+  } while (err == EINTR);
+  if (err != 0) {
+    return absl::ResourceExhaustedError(
+        absl::StrCat("posix_fallocate failed on shm segment ", segment_name,
+                     ": ", std::strerror(err)));
+  }
+  return absl::OkStatus();
+}
+
+// Compares the identity fields. block_size is deliberately absent: the
+// allocator derives it from the first allocation and validates it against
+// that derivation (OpenSegment), not against the caller schema, which
+// leaves it zero.
+bool HeaderMatchesSchema(const SharedMemoryHeader& header,
+                         const SharedMemoryHeader& expected) {
+  bool compatible = true;
+  if (header.magic != expected.magic) {
+    VLOG(1) << "magic mismatch: " << header.magic << " vs " << expected.magic;
+    compatible = false;
+  }
+  if (header.version != expected.version) {
+    VLOG(1) << "version mismatch: " << header.version << " vs "
+            << expected.version;
+    compatible = false;
+  }
+  if (std::strcmp(header.model_uid, expected.model_uid) != 0) {
+    VLOG(1) << "model_uid mismatch: " << header.model_uid << " vs "
+            << expected.model_uid;
+    compatible = false;
+  }
+  if (header.num_blocks != expected.num_blocks) {
+    VLOG(1) << "num_blocks mismatch: " << header.num_blocks << " vs "
+            << expected.num_blocks;
+    compatible = false;
+  }
+  if (header.num_heads != expected.num_heads) {
+    VLOG(1) << "num_heads mismatch: " << header.num_heads << " vs "
+            << expected.num_heads;
+    compatible = false;
+  }
+  if (header.head_dim != expected.head_dim) {
+    VLOG(1) << "head_dim mismatch: " << header.head_dim << " vs "
+            << expected.head_dim;
+    compatible = false;
+  }
+  if (header.itemsize != expected.itemsize) {
+    VLOG(1) << "itemsize mismatch: " << header.itemsize << " vs "
+            << expected.itemsize;
+    compatible = false;
+  }
+  return compatible;
+}
 }  // namespace
 
 absl::StatusOr<std::unique_ptr<HostMemoryAllocator>>
@@ -236,19 +298,237 @@ SharedMemoryHostMemoryAllocator::SharedMemoryHostMemoryAllocator(
     : client_(client), shm_key_(shm_key), expected_schema_(expected_schema) {}
 
 SharedMemoryHostMemoryAllocator::~SharedMemoryHostMemoryAllocator() {
-  if (mapped_ptr_ != nullptr && mapped_ptr_ != MAP_FAILED) {
-    SharedMemoryHeader* header = static_cast<SharedMemoryHeader*>(mapped_ptr_);
-    if (header->reference_count > 0) {
-      header->reference_count--;
+  for (auto& [name, segment] : segments_) {
+    for (PayloadRegion& region : segment.regions) {
+      if (region.dma_mapped && client_ != nullptr) {
+        (void)client_->DmaUnmap(region.ptr);
+      }
+      munmap(region.ptr, region.size_bytes);
     }
-    if (dma_mapped_ && client_ != nullptr) {
-      (void)client_->DmaUnmap(mapped_ptr_);
+    if (segment.header != nullptr) {
+      if (segment.header->reference_count > 0) {
+        segment.header->reference_count--;
+      }
+      munmap(segment.header, kPayloadOffset);
     }
-    munmap(mapped_ptr_, mapped_size_);
+    if (segment.fd >= 0) {
+      close(segment.fd);
+    }
+    // Never shm_unlink: the segment must outlive this process for the next
+    // run to recover from.
   }
-  if (shm_fd_ >= 0) {
-    close(shm_fd_);
+}
+
+absl::StatusOr<SharedMemoryHostMemoryAllocator::Segment*>
+SharedMemoryHostMemoryAllocator::OpenSegment(const std::string& segment_name,
+                                             size_t first_request_bytes) {
+  VLOG(1) << "[SHM_ALLOCATOR] Opening shm segment: " << segment_name;
+
+  const size_t aligned_request = (first_request_bytes + 4095) & ~4095;
+  // The request is num_blocks * bytes-per-block, so a pinned block count
+  // recovers the bytes-per-block factor of the region stride that the
+  // identity fields alone cannot.
+  uint64_t bytes_per_block = 0;
+  if (expected_schema_.num_blocks > 0 &&
+      first_request_bytes % expected_schema_.num_blocks == 0) {
+    bytes_per_block = first_request_bytes / expected_schema_.num_blocks;
+    if (bytes_per_block > std::numeric_limits<uint32_t>::max()) {
+      bytes_per_block = 0;
+    }
   }
+
+  int fd = shm_open(segment_name.c_str(), O_RDWR, 0666);
+  bool warm = (fd >= 0);
+  SharedMemoryHeader* header = nullptr;
+
+  if (warm) {
+    VLOG(1)
+        << "[SHM_ALLOCATOR] Found existing shm segment. Validating schema...";
+    struct stat st;
+    bool compatible =
+        fstat(fd, &st) == 0 && st.st_size >= static_cast<off_t>(kPayloadOffset);
+    if (compatible) {
+      void* header_ptr = mmap(nullptr, kPayloadOffset, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, fd, 0);
+      if (header_ptr == MAP_FAILED) {
+        LOG(ERROR)
+            << "[SHM_ALLOCATOR] Failed to map shm header for verification";
+        compatible = false;
+      } else {
+        header = static_cast<SharedMemoryHeader*>(header_ptr);
+        compatible = HeaderMatchesSchema(*header, expected_schema_);
+        // The file must still hold the recorded payload. Unsigned space:
+        // the recorded total is untrusted, and a huge value cast to off_t
+        // would slip past a signed comparison.
+        if (compatible &&
+            header->total_payload_bytes >
+                static_cast<uint64_t>(st.st_size) - kPayloadOffset) {
+          VLOG(1) << "recorded payload " << header->total_payload_bytes
+                  << " exceeds the file size " << st.st_size;
+          compatible = false;
+        }
+        if (compatible) {
+          if (bytes_per_block > 0) {
+            // Exact stride check: the predecessor's regions must have been
+            // this run's size, or their bytes belong to other offsets.
+            if (header->block_size != bytes_per_block) {
+              VLOG(1) << "block size mismatch: " << header->block_size
+                      << " vs derived " << bytes_per_block;
+              compatible = false;
+            }
+          } else if (header->total_payload_bytes % aligned_request != 0) {
+            // Without a pinned block count, whole-multiple divisibility is
+            // the only replay tripwire available.
+            VLOG(1) << "recorded payload " << header->total_payload_bytes
+                    << " is not a multiple of the request "
+                    << aligned_request;
+            compatible = false;
+          }
+        }
+        if (!compatible) {
+          munmap(header_ptr, kPayloadOffset);
+          header = nullptr;
+        }
+      }
+    }
+    if (!compatible) {
+      VLOG(1) << "[SHM_ALLOCATOR] Existing shm segment incompatible. "
+                 "Re-creating...";
+      close(fd);
+      fd = -1;
+      shm_unlink(segment_name.c_str());
+      warm = false;
+    } else {
+      header->reference_count++;
+      VLOG(1) << "[SHM_ALLOCATOR] Successfully attached to existing shm "
+                 "segment. Reference count: "
+              << header->reference_count;
+    }
+  }
+
+  if (!warm) {
+    fd = shm_open(segment_name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
+    if (fd < 0) {
+      fd = shm_open(segment_name.c_str(), O_CREAT | O_RDWR, 0666);
+    }
+    if (fd < 0) {
+      return absl::InternalError(
+          absl::StrCat("shm_open failed to create segment ", segment_name,
+                       ": ", std::strerror(errno)));
+    }
+    absl::Status reserved =
+        ReserveSegmentRange(fd, 0, kPayloadOffset, segment_name);
+    if (!reserved.ok()) {
+      close(fd);
+      shm_unlink(segment_name.c_str());
+      return reserved;
+    }
+    void* header_ptr = mmap(nullptr, kPayloadOffset, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, fd, 0);
+    if (header_ptr == MAP_FAILED) {
+      close(fd);
+      shm_unlink(segment_name.c_str());
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "mmap failed on shm segment ", segment_name, ": ",
+          std::strerror(errno)));
+    }
+    VLOG(1) << "[SHM_ALLOCATOR] Initializing fresh shm header schema...";
+    header = static_cast<SharedMemoryHeader*>(header_ptr);
+    std::memcpy(header, &expected_schema_, sizeof(SharedMemoryHeader));
+    header->block_size = static_cast<uint32_t>(bytes_per_block);
+    header->total_payload_bytes = 0;
+    header->reference_count = 1;
+  }
+
+  Segment& segment = segments_[segment_name];
+  segment.fd = fd;
+  segment.warm = warm;
+  segment.header = header;
+  return &segment;
+}
+
+absl::StatusOr<SharedMemoryHostMemoryAllocator::PayloadRegion*>
+SharedMemoryHostMemoryAllocator::AllocateRegion(size_t size_bytes) {
+  const size_t aligned_size = (size_bytes + 4095) & ~4095;
+  const std::string segment_name = ComposeSegmentName(
+      shm_key_, g_current_device != nullptr
+                    ? std::optional<int64_t>(
+                          g_current_device->global_device_id().value())
+                    : std::nullopt);
+
+  Segment* segment;
+  auto it = segments_.find(segment_name);
+  if (it != segments_.end()) {
+    // A later allocation against a device whose segment an earlier call
+    // already opened (e.g. the next array or shard on that device): reuse
+    // the open segment and its warm/cold decision.
+    segment = &it->second;
+  } else {
+    // The first allocation against this device: open its segment, deciding
+    // warm or cold for the rest of the run.
+    auto segment_or = OpenSegment(segment_name, size_bytes);
+    if (!segment_or.ok()) {
+      return segment_or.status();
+    }
+    segment = *segment_or;
+  }
+
+  if (segment->region_size == 0) {
+    segment->region_size = aligned_size;
+  } else if (aligned_size != segment->region_size) {
+    return absl::InternalError(absl::StrCat(
+        "shm segment ", segment_name, " serves ", segment->region_size,
+        "-byte regions; refusing a ", aligned_size,
+        "-byte allocation, the recovery layout assumes one uniform size"));
+  }
+
+  const size_t region_offset = kPayloadOffset + segment->payload_cursor;
+  bool zero_fill = !segment->warm;
+  if (segment->warm && segment->payload_cursor + aligned_size >
+                           segment->header->total_payload_bytes) {
+    if (!segment->degradation_warned) {
+      LOG(WARNING) << "[SHM_ALLOCATOR] Segment " << segment_name
+                   << " recorded " << segment->header->total_payload_bytes
+                   << " payload bytes; allocations beyond them are served "
+                      "zeroed instead of recovered";
+      segment->degradation_warned = true;
+    } else {
+      VLOG(1) << "[SHM_ALLOCATOR] Region at offset " << region_offset
+              << " of segment " << segment_name << " served zeroed";
+    }
+    zero_fill = true;
+  }
+  if (zero_fill) {
+    absl::Status reserved = ReserveSegmentRange(segment->fd, region_offset,
+                                                aligned_size, segment_name);
+    if (!reserved.ok()) {
+      return reserved;
+    }
+  }
+
+  void* ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   segment->fd, region_offset);
+  if (ptr == MAP_FAILED) {
+    return absl::ResourceExhaustedError(absl::StrCat(
+        "mmap failed on shm segment ", segment_name, ": ",
+        std::strerror(errno)));
+  }
+
+  if (zero_fill) {
+    // First-touch under the caller's NUMA mempolicy places the pages; a warm
+    // region is never touched, its bytes are the recovered data.
+    volatile uint8_t* p = static_cast<volatile uint8_t*>(ptr);
+    for (size_t i = 0; i < aligned_size; i += 4096) {
+      p[i] = 0;
+    }
+  }
+
+  segment->payload_cursor += aligned_size;
+  if (segment->payload_cursor > segment->header->total_payload_bytes) {
+    segment->header->total_payload_bytes = segment->payload_cursor;
+  }
+  segment->regions.push_back(PayloadRegion{ptr, aligned_size, false});
+  return &segment->regions.back();
 }
 
 absl::StatusOr<HostBufferAllocation> SharedMemoryHostMemoryAllocator::Allocate(
@@ -260,170 +540,46 @@ absl::StatusOr<HostBufferAllocation> SharedMemoryHostMemoryAllocator::Allocate(
     return alloc;
   }
 
-  if (mapped_ptr_ != nullptr && mapped_ptr_ != MAP_FAILED) {
-    HostBufferAllocation alloc;
-    alloc.ptr = static_cast<uint8_t*>(mapped_ptr_) + sizeof(SharedMemoryHeader);
-    alloc.size = size_bytes;
-    alloc.owner = std::shared_ptr<void>(mapped_ptr_, [](void*) {});
-    return alloc;
-  }
-
-  size_t aligned_payload_size = (size_bytes + 4095) & ~4095;
-  size_t total_size =
-      (sizeof(SharedMemoryHeader) + aligned_payload_size + 4095) & ~4095;
-  mapped_size_ = total_size;
-
-  const std::string full_shm_key = ComposeSegmentName(
-      shm_key_, g_current_device != nullptr
-                    ? std::optional<int64_t>(
-                          g_current_device->global_device_id().value())
-                    : std::nullopt);
-
-  VLOG(1) << "[SHM_ALLOCATOR] Attempting to open/create shm key: "
-          << full_shm_key << " of size " << total_size;
-
-  shm_fd_ = shm_open(full_shm_key.c_str(), O_RDWR, 0666);
-  bool is_warm_boot = (shm_fd_ >= 0);
-  VLOG(2) << "[SHM_DEBUG] shm_open for warm boot key: " << full_shm_key
-          << ", fd: " << shm_fd_ << ", errno: " << errno << " ("
-          << std::strerror(errno) << ")";
-
-  if (is_warm_boot) {
-    VLOG(1)
-        << "[SHM_ALLOCATOR] Found existing shm segment. Validating schema...";
-    void* header_ptr = mmap(nullptr, sizeof(SharedMemoryHeader),
-                            PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_, 0);
-    if (header_ptr != MAP_FAILED) {
-      SharedMemoryHeader* header = static_cast<SharedMemoryHeader*>(header_ptr);
-      bool compatible = true;
-      if (header->magic != expected_schema_.magic) {
-        VLOG(1) << "magic mismatch: " << header->magic << " vs "
-                << expected_schema_.magic;
-        compatible = false;
-      }
-      if (header->version != expected_schema_.version) {
-        VLOG(1) << "version mismatch: " << header->version << " vs "
-                << expected_schema_.version;
-        compatible = false;
-      }
-      if (std::strcmp(header->model_uid, expected_schema_.model_uid) != 0) {
-        VLOG(1) << "model_uid mismatch: " << header->model_uid << " vs "
-                << expected_schema_.model_uid;
-        compatible = false;
-      }
-      if (header->num_blocks != expected_schema_.num_blocks) {
-        VLOG(1) << "num_blocks mismatch: " << header->num_blocks << " vs "
-                << expected_schema_.num_blocks;
-        compatible = false;
-      }
-      if (header->block_size != expected_schema_.block_size) {
-        VLOG(1) << "block_size mismatch: " << header->block_size << " vs "
-                << expected_schema_.block_size;
-        compatible = false;
-      }
-      if (header->num_heads != expected_schema_.num_heads) {
-        VLOG(1) << "num_heads mismatch: " << header->num_heads << " vs "
-                << expected_schema_.num_heads;
-        compatible = false;
-      }
-      if (header->head_dim != expected_schema_.head_dim) {
-        VLOG(1) << "head_dim mismatch: " << header->head_dim << " vs "
-                << expected_schema_.head_dim;
-        compatible = false;
-      }
-      if (header->itemsize != expected_schema_.itemsize) {
-        VLOG(1) << "itemsize mismatch: " << header->itemsize << " vs "
-                << expected_schema_.itemsize;
-        compatible = false;
-      }
-      munmap(header_ptr, sizeof(SharedMemoryHeader));
-
-      if (!compatible) {
-        VLOG(1) << "[SHM_ALLOCATOR] Existing shm schema incompatible. "
-                   "Re-creating...";
-        close(shm_fd_);
-        shm_fd_ = -1;
-        shm_unlink(full_shm_key.c_str());
-        is_warm_boot = false;
-      }
-    } else {
-      LOG(ERROR) << "[SHM_ALLOCATOR] Failed to map shm header for verification";
-      close(shm_fd_);
-      shm_fd_ = -1;
-      is_warm_boot = false;
-    }
-  }
-
-  if (!is_warm_boot) {
-    shm_fd_ = shm_open(full_shm_key.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
-    if (shm_fd_ < 0) {
-      shm_fd_ = shm_open(full_shm_key.c_str(), O_CREAT | O_RDWR, 0666);
-    }
-    if (shm_fd_ < 0) {
-      return absl::InternalError(absl::StrCat(
-          "shm_open failed to create segment: ", std::strerror(errno)));
-    }
-
-    if (ftruncate(shm_fd_, total_size) != 0) {
-      close(shm_fd_);
-      shm_fd_ = -1;
-      shm_unlink(full_shm_key.c_str());
-      return absl::InternalError(absl::StrCat(
-          "ftruncate failed on shm segment: ", std::strerror(errno)));
-    }
-  }
-
-  mapped_ptr_ =
-      mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_, 0);
-  if (mapped_ptr_ == MAP_FAILED) {
-    close(shm_fd_);
-    shm_fd_ = -1;
-    return absl::ResourceExhaustedError(
-        absl::StrCat("mmap failed on shm segment: ", std::strerror(errno)));
-  }
-
-  SharedMemoryHeader* header = static_cast<SharedMemoryHeader*>(mapped_ptr_);
-  if (!is_warm_boot) {
-    VLOG(1) << "[SHM_ALLOCATOR] Initializing fresh shm header schema...";
-    std::memcpy(header, &expected_schema_, sizeof(SharedMemoryHeader));
-    header->total_payload_bytes = size_bytes;
-    header->reference_count = 1;
-
-    volatile uint8_t* p = static_cast<volatile uint8_t*>(mapped_ptr_);
-    for (size_t i = 4096; i < total_size; i += 4096) {
-      p[i] = 0;
-    }
-  } else {
-    header->reference_count++;
-    VLOG(1) << "[SHM_ALLOCATOR] Successfully attached to existing shm segment. "
-               "Reference count: "
-            << header->reference_count;
-  }
+  auto region_or = AllocateRegion(size_bytes);
+  if (!region_or.ok()) return region_or.status();
 
   HostBufferAllocation alloc;
-  alloc.ptr = static_cast<uint8_t*>(mapped_ptr_) + sizeof(SharedMemoryHeader);
+  alloc.ptr = static_cast<uint8_t*>((*region_or)->ptr);
   alloc.size = size_bytes;
-  alloc.owner = std::shared_ptr<void>(mapped_ptr_, [](void*) {});
+  alloc.owner = std::shared_ptr<void>((*region_or)->ptr, [](void*) {});
   return alloc;
 }
 
 absl::StatusOr<HostBufferAllocation>
 SharedMemoryHostMemoryAllocator::AllocateDmaMapped(size_t size_bytes) {
-  auto alloc_or = Allocate(size_bytes);
-  if (!alloc_or.ok()) return alloc_or;
-
-  if (!dma_mapped_ && client_ != nullptr && client_->platform_name() != "cpu") {
-    VLOG(1) << "[SHM_ALLOCATOR] Registering shared memory mapping with PjRt "
-               "DMA engine...";
-    auto status = client_->DmaMap(mapped_ptr_, mapped_size_);
-    if (!status.ok()) {
-      return absl::InternalError(absl::StrCat(
-          "DmaMap failed on shared memory segment: ", status.message()));
-    }
-    dma_mapped_ = true;
+  if (size_bytes == 0) {
+    HostBufferAllocation alloc;
+    alloc.ptr = nullptr;
+    alloc.size = 0;
+    return alloc;
   }
 
-  return alloc_or;
+  auto region_or = AllocateRegion(size_bytes);
+  if (!region_or.ok()) return region_or.status();
+  PayloadRegion* region = *region_or;
+
+  if (!region->dma_mapped && client_ != nullptr &&
+      client_->platform_name() != "cpu") {
+    VLOG(1) << "[SHM_ALLOCATOR] Registering shared memory region with PjRt "
+               "DMA engine...";
+    auto status = client_->DmaMap(region->ptr, region->size_bytes);
+    if (!status.ok()) {
+      return absl::InternalError(absl::StrCat(
+          "DmaMap failed on shared memory region: ", status.message()));
+    }
+    region->dma_mapped = true;
+  }
+
+  HostBufferAllocation alloc;
+  alloc.ptr = static_cast<uint8_t*>(region->ptr);
+  alloc.size = size_bytes;
+  alloc.owner = std::shared_ptr<void>(region->ptr, [](void*) {});
+  return alloc;
 }
 
 absl::StatusOr<HostBufferAllocation>

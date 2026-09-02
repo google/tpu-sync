@@ -50,7 +50,7 @@ inline std::optional<std::vector<const uint8_t*>> CastExternalPointers(
 // provides a segment namespace (RAIDEN_SHM_KEY); managers whose host buffers
 // are transient staging (transfer engines) must not use shm.
 inline HostBufferAllocator CreateHostMemoryAllocator(
-    xla::PjRtClient* client, bool enable_shm, int64_t max_blocks = 0,
+    xla::PjRtClient* client, bool enable_shm, int64_t num_host_blocks = 0,
     size_t total_payload_bytes = 0) {
   const char* shm_key_env = std::getenv("RAIDEN_SHM_KEY");
   if (enable_shm && shm_key_env != nullptr && std::strlen(shm_key_env) > 0) {
@@ -63,7 +63,7 @@ inline HostBufferAllocator CreateHostMemoryAllocator(
       absl::SNPrintF(expected_schema.model_uid,
                      sizeof(expected_schema.model_uid), "default_model");
     }
-    expected_schema.num_blocks = max_blocks;
+    expected_schema.num_blocks = num_host_blocks;
     expected_schema.total_payload_bytes = total_payload_bytes;
 
     auto allocator_or = SharedMemoryHostMemoryAllocator::Create(

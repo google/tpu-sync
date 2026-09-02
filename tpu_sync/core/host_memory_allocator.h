@@ -21,8 +21,10 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "absl/base/nullability.h"
+#include "absl/container/node_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -96,25 +98,42 @@ class MallocHostMemoryAllocator : public HostMemoryAllocator {
 
 struct alignas(64) SharedMemoryHeader {
   uint64_t magic = 0x52414944454E5348;  // "RAIDENSH"
-  uint32_t version = 1;
+  // Segment layout revision; a mismatch cold-starts the segment. Version 2
+  // placed each allocation in its own page-aligned region after the header
+  // page (version 1 segments held a single payload right after the header).
+  uint32_t version = 2;
   char model_uid[256] = {0};
   uint32_t global_mesh_shape[5] = {0};
   uint32_t shard_layout[5] = {0};
+  // Number of blocks in the host pool this segment backs;
   uint32_t num_blocks = 0;
+  // Bytes per block, derived by the allocator from its first allocation
+  // (0 when num_blocks is unknown).
   uint32_t block_size = 0;
   uint32_t num_heads = 0;
   uint32_t head_dim = 0;
   uint32_t itemsize = 0;
+  // Cumulative payload bytes ever allocated from this segment. A warm boot
+  // replays its allocations in order against this bound.
   uint64_t total_payload_bytes = 0;
   uint32_t reference_count = 0;
 };
 
+// Persists host KV mirrors across process restarts in POSIX shared memory.
+// Each device gets one segment (ComposeSegmentName); within it, allocations
+// occupy consecutive page-aligned regions after the header page, in
+// allocation order. Whether a run is warm (re-attaching to a predecessor's
+// data) or cold is decided once, when the segment is first opened; every
+// later allocation follows that decision.
 class SharedMemoryHostMemoryAllocator : public HostMemoryAllocator {
  public:
+  // Payload regions start page-aligned after the header so that each can be
+  // mmapped individually; the header owns the segment's first page.
+  static constexpr size_t kPayloadOffset = 4096;
+
   static absl::StatusOr<std::unique_ptr<SharedMemoryHostMemoryAllocator>>
   Create(xla::PjRtClient* client, absl::string_view shm_key,
          const SharedMemoryHeader& expected_schema);
-
 
   // The shm_open name for this allocator's segment: `shm_key` plus an
   // optional "_<RAIDEN_SHM_SERVER_NAME>" suffix from the environment, plus
@@ -146,14 +165,53 @@ class SharedMemoryHostMemoryAllocator : public HostMemoryAllocator {
                                   absl::string_view shm_key,
                                   const SharedMemoryHeader& expected_schema);
 
+  // One payload region per Allocate() call, mmapped individually at its
+  // page-aligned offset within the segment.
+  struct PayloadRegion {
+    void* ptr = nullptr;
+    size_t size_bytes = 0;
+    bool dma_mapped = false;
+  };
+
+  struct Segment {
+    int fd = -1;
+    bool warm = false;
+    // Payload bytes handed out from this segment so far in this run.
+    size_t payload_cursor = 0;
+    // The uniform page-aligned per-allocation size, set by the first
+    // allocation; the recovery layout assumes it, so later allocations must
+    // match it.
+    size_t region_size = 0;
+    // The warm->degraded transition has been logged for this segment.
+    bool degradation_warned = false;
+    // The segment's first page, mapped for the allocator's lifetime.
+    SharedMemoryHeader* header = nullptr;
+    std::vector<PayloadRegion> regions;
+  };
+
+  // Opens the named segment, deciding warm (exists and matches
+  // expected_schema_) or cold (created, or reformatted on a mismatch) for
+  // the rest of the run. first_request_bytes is the first allocation's
+  // requested size, for validating a warm segment's recorded layout against
+  // this run's replay.
+  absl::StatusOr<Segment*> OpenSegment(const std::string& segment_name,
+                                       size_t first_request_bytes);
+
+  // Bump-allocates the next page-aligned region of the per-device segment,
+  // opening the segment on its first allocation.
+  absl::StatusOr<PayloadRegion*> AllocateRegion(size_t size_bytes);
+
   xla::PjRtClient* client_ = nullptr;
   std::string shm_key_;
   SharedMemoryHeader expected_schema_;
-  int shm_fd_ = -1;
-  void* mapped_ptr_ = nullptr;
-  size_t mapped_size_ = 0;
-  bool dma_mapped_ = false;
+  // Keyed by segment name; absl::node_hash_map for pointer stability of the
+  // values.
+  absl::node_hash_map<std::string, Segment> segments_;
 };
+
+static_assert(sizeof(SharedMemoryHeader) <=
+                  SharedMemoryHostMemoryAllocator::kPayloadOffset,
+              "the segment header must fit in the page before the payload");
 
 }  // namespace tpu_raiden
 

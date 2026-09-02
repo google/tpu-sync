@@ -34,9 +34,9 @@ from nothing but the environment and the surviving shared memory.
 
 The test drives one TPU device through torch_tpu. Production deployments run
 one worker process per device, each with its own shared-memory data segment;
-a single device mirrors one such worker. The skipped test below pins one
-intended contract: a KV pool of several backing arrays must keep its own
-shared-memory mirror per array.
+a single device mirrors one such worker. Within a device's segment every
+allocation owns its own region, so a KV pool of several backing arrays keeps
+one shared-memory mirror per array (the hybrid test below).
 """
 
 import os
@@ -44,7 +44,6 @@ import socket
 import subprocess
 import sys
 import time
-import unittest
 
 from absl import app
 from absl import flags
@@ -59,13 +58,6 @@ _SIGKILL = 9
 _NUM_BLOCKS = 2
 _SHAPE = (_NUM_BLOCKS, 128, 8, 8, 128)  # float32
 _HASHES = [b"hash_0", b"hash_1"]
-
-_PENDING_SEGMENT_FIX = unittest.skip(
-    "The shared-memory allocator returns the same single segment for every"
-    " allocation in a process, so the host mirrors of a second KV array alias"
-    " (and corrupt) the first; enable once each allocation gets its own"
-    " segment."
-)
 
 # The phases run in subprocesses, so their detailed assertions are invisible
 # to the test process. Each phase prints one of these markers only after all
@@ -340,7 +332,6 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
     )
     self.assertIn(_PHASE_B_COLD_MARKER, result.stdout)
 
-  @_PENDING_SEGMENT_FIX
   def test_recovers_hybrid_model_arrays_after_crash(self):
     # A hybrid model's KV pool reaches the manager as several backing arrays,
     # all reshaped to one uniform kernel geometry (the connectors pad every

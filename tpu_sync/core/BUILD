@@ -190,6 +190,7 @@ cc_library(
         ":tpu_utils",
         ":xla_raw_transfer_headers",
         "@com_google_absl//absl/base:nullability",
+        "@com_google_absl//absl/container:node_hash_map",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -528,6 +529,7 @@ cc_test(
     deps = [
         ":host_memory_allocator",
         ":tpu_pjrt_manager",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/strings:str_format",
         "@xla//xla/tsl/platform:statusor",
         "@xla//xla/tsl/platform:test",

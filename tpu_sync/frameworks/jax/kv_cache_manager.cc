@@ -341,8 +341,13 @@ void NumaAwareKVCacheManager::InitSubManagers(
       ::tpu_raiden::HostBufferAllocator host_alloc;
       const char* shm_key_env = std::getenv("RAIDEN_SHM_KEY");
       if (enable_shm && shm_key_env != nullptr && std::strlen(shm_key_env) > 0) {
+        // The same resolution KVCacheManagerWithTransfer applies, so the SHM
+        // segment identity records the pool size actually allocated.
+        const int64_t num_host_blocks = host_blocks_to_allocate.has_value()
+                                            ? *host_blocks_to_allocate
+                                            : num_slots * max_blocks;
         host_alloc = ::tpu_raiden::CreateHostMemoryAllocator(
-            client, enable_shm, max_blocks,
+            client, enable_shm, num_host_blocks,
             (sub_buffers.empty() || sub_buffers[0].empty())
                 ? 0
                 : sub_buffers[0][0].GetOnDeviceSizeInBytes());

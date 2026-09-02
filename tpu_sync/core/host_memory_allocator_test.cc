@@ -14,13 +14,16 @@
 
 #include "tpu_sync/core/host_memory_allocator.h"
 
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
 
+#include "absl/log/check.h"
 #include "absl/strings/str_format.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
@@ -28,6 +31,41 @@
 
 namespace tpu_raiden {
 namespace {
+
+// The payload mappings are detached from the header page, so the tests read
+// the header straight from the segment file.
+SharedMemoryHeader ReadSegmentHeader(const std::string& shm_key) {
+  const std::string name = SharedMemoryHostMemoryAllocator::ComposeSegmentName(
+      shm_key, std::nullopt);
+  int fd = shm_open(name.c_str(), O_RDONLY, 0666);
+  CHECK_GE(fd, 0) << "shm_open failed for " << name;
+  void* ptr =
+      mmap(nullptr, sizeof(SharedMemoryHeader), PROT_READ, MAP_SHARED, fd, 0);
+  CHECK_NE(ptr, MAP_FAILED);
+  SharedMemoryHeader header = *static_cast<SharedMemoryHeader*>(ptr);
+  munmap(ptr, sizeof(SharedMemoryHeader));
+  close(fd);
+  return header;
+}
+
+// Creates a segment file holding only the given header, as a predecessor
+// that died before its first allocation (or an older-version run) leaves it.
+void WriteBareSegment(const std::string& shm_key,
+                      const SharedMemoryHeader& header) {
+  const std::string name = SharedMemoryHostMemoryAllocator::ComposeSegmentName(
+      shm_key, std::nullopt);
+  int fd = shm_open(name.c_str(), O_CREAT | O_RDWR, 0666);
+  CHECK_GE(fd, 0) << "shm_open failed for " << name;
+  CHECK_EQ(
+      posix_fallocate(fd, 0, SharedMemoryHostMemoryAllocator::kPayloadOffset),
+      0);
+  void* ptr = mmap(nullptr, sizeof(SharedMemoryHeader), PROT_READ | PROT_WRITE,
+                   MAP_SHARED, fd, 0);
+  CHECK_NE(ptr, MAP_FAILED);
+  *static_cast<SharedMemoryHeader*>(ptr) = header;
+  munmap(ptr, sizeof(SharedMemoryHeader));
+  close(fd);
+}
 
 TEST(HostMemoryAllocatorTest, FallbackAllocationWithoutClient) {
   TF_ASSERT_OK_AND_ASSIGN(auto allocator, HostMemoryAllocator::Create(nullptr));
@@ -107,11 +145,10 @@ TEST(HostMemoryAllocatorTest, SharedMemoryColdAndWarmBoot) {
 
     std::memset(alloc1.ptr, 0x55, 1024);
 
-    SharedMemoryHeader* header1 = reinterpret_cast<SharedMemoryHeader*>(
-        static_cast<uint8_t*>(alloc1.ptr) - sizeof(SharedMemoryHeader));
-    EXPECT_EQ(header1->reference_count, 1);
-    EXPECT_EQ(header1->version, 1);
-    EXPECT_STREQ(header1->model_uid, "test_model_v1");
+    SharedMemoryHeader header1 = ReadSegmentHeader(shm_key);
+    EXPECT_EQ(header1.reference_count, 1);
+    EXPECT_EQ(header1.version, 1);
+    EXPECT_STREQ(header1.model_uid, "test_model_v1");
 
     {
       TF_ASSERT_OK_AND_ASSIGN(
@@ -127,12 +164,10 @@ TEST(HostMemoryAllocatorTest, SharedMemoryColdAndWarmBoot) {
         ASSERT_EQ(alloc2.ptr[i], 0x55);
       }
 
-      SharedMemoryHeader* header2 = reinterpret_cast<SharedMemoryHeader*>(
-          static_cast<uint8_t*>(alloc2.ptr) - sizeof(SharedMemoryHeader));
-      EXPECT_EQ(header2->reference_count, 2);
+      EXPECT_EQ(ReadSegmentHeader(shm_key).reference_count, 2);
     }
 
-    EXPECT_EQ(header1->reference_count, 1);
+    EXPECT_EQ(ReadSegmentHeader(shm_key).reference_count, 1);
 
     {
       SharedMemoryHeader schema2 = schema1;
@@ -148,16 +183,248 @@ TEST(HostMemoryAllocatorTest, SharedMemoryColdAndWarmBoot) {
                               allocator3->Allocate(1024));
       EXPECT_NE(alloc3.ptr, nullptr);
 
-      SharedMemoryHeader* header3 = reinterpret_cast<SharedMemoryHeader*>(
-          static_cast<uint8_t*>(alloc3.ptr) - sizeof(SharedMemoryHeader));
-      EXPECT_EQ(header3->reference_count, 1);
-      EXPECT_EQ(header3->version, 2);
-      EXPECT_STREQ(header3->model_uid, "test_model_v2");
+      SharedMemoryHeader header3 = ReadSegmentHeader(shm_key);
+      EXPECT_EQ(header3.reference_count, 1);
+      EXPECT_EQ(header3.version, 2);
+      EXPECT_STREQ(header3.model_uid, "test_model_v2");
 
       for (size_t i = 0; i < 1024; ++i) {
         ASSERT_EQ(alloc3.ptr[i], 0);
       }
     }
+  }
+
+  shm_unlink(shm_key.c_str());
+}
+
+TEST(HostMemoryAllocatorTest, SharedMemoryAllocationsAreDistinctRegions) {
+  std::string shm_key = "/test_raiden_shm_multi_" + std::to_string(getpid());
+  shm_unlink(shm_key.c_str());
+
+  SharedMemoryHeader schema = {};
+  absl::SNPrintF(schema.model_uid, sizeof(schema.model_uid), "multi_model");
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto allocator,
+      SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+
+  TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc1,
+                          allocator->Allocate(1024));
+  TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc2,
+                          allocator->Allocate(1024));
+  ASSERT_NE(alloc1.ptr, nullptr);
+  ASSERT_NE(alloc2.ptr, nullptr);
+  EXPECT_NE(alloc1.ptr, alloc2.ptr);
+
+  // Writing one allocation must not show through the other.
+  std::memset(alloc1.ptr, 0x11, 1024);
+  std::memset(alloc2.ptr, 0x22, 1024);
+  for (size_t i = 0; i < 1024; ++i) {
+    ASSERT_EQ(alloc1.ptr[i], 0x11);
+    ASSERT_EQ(alloc2.ptr[i], 0x22);
+  }
+
+  // Each allocation advanced the recorded payload by a full page.
+  EXPECT_EQ(ReadSegmentHeader(shm_key).total_payload_bytes, 2 * 4096);
+
+  shm_unlink(shm_key.c_str());
+}
+
+TEST(HostMemoryAllocatorTest, SharedMemoryWarmBootPreservesEachAllocation) {
+  std::string shm_key = "/test_raiden_shm_warm_" + std::to_string(getpid());
+  shm_unlink(shm_key.c_str());
+
+  SharedMemoryHeader schema = {};
+  absl::SNPrintF(schema.model_uid, sizeof(schema.model_uid), "warm_model");
+
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc1,
+                            allocator->Allocate(1024));
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc2,
+                            allocator->Allocate(1024));
+    std::memset(alloc1.ptr, 0x11, 1024);
+    std::memset(alloc2.ptr, 0x22, 1024);
+  }
+
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc1,
+                            allocator->Allocate(1024));
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc2,
+                            allocator->Allocate(1024));
+    // The allocations replay in order, each recovering its own bytes.
+    for (size_t i = 0; i < 1024; ++i) {
+      ASSERT_EQ(alloc1.ptr[i], 0x11);
+      ASSERT_EQ(alloc2.ptr[i], 0x22);
+    }
+  }
+
+  shm_unlink(shm_key.c_str());
+}
+
+TEST(HostMemoryAllocatorTest, SharedMemoryWarmBootBeyondRecordedPayload) {
+  std::string shm_key = "/test_raiden_shm_beyond_" + std::to_string(getpid());
+  shm_unlink(shm_key.c_str());
+
+  SharedMemoryHeader schema = {};
+  absl::SNPrintF(schema.model_uid, sizeof(schema.model_uid), "beyond_model");
+
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
+                            allocator->Allocate(1024));
+    std::memset(alloc.ptr, 0x77, 1024);
+  }
+
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc1,
+                            allocator->Allocate(1024));
+    // Allocating past what the previous run recorded degrades that region
+    // to zeroed memory but keeps the earlier region's recovered bytes.
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc2,
+                            allocator->Allocate(1024));
+    for (size_t i = 0; i < 1024; ++i) {
+      ASSERT_EQ(alloc1.ptr[i], 0x77);
+      ASSERT_EQ(alloc2.ptr[i], 0);
+    }
+    EXPECT_EQ(ReadSegmentHeader(shm_key).total_payload_bytes, 2 * 4096);
+  }
+
+  shm_unlink(shm_key.c_str());
+}
+
+TEST(HostMemoryAllocatorTest, SharedMemoryBlockSizeChangeColdStarts) {
+  std::string shm_key = "/test_raiden_shm_bpb_" + std::to_string(getpid());
+  shm_unlink(shm_key.c_str());
+
+  SharedMemoryHeader schema = {};
+  absl::SNPrintF(schema.model_uid, sizeof(schema.model_uid), "block_model");
+  schema.num_blocks = 4;
+
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
+                            allocator->Allocate(8192));
+    std::memset(alloc.ptr, 0x77, 8192);
+  }
+  EXPECT_EQ(ReadSegmentHeader(shm_key).block_size, 8192 / 4);
+
+  {
+    // Same block count and identity, but halved bytes per block: the halved
+    // request divides the recorded payload evenly, so only the recorded
+    // block size tells the layouts apart. The segment must cold-start.
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
+                            allocator->Allocate(4096));
+    for (size_t i = 0; i < 4096; ++i) {
+      ASSERT_EQ(alloc.ptr[i], 0);
+    }
+    SharedMemoryHeader header = ReadSegmentHeader(shm_key);
+    EXPECT_EQ(header.block_size, 4096 / 4);
+    EXPECT_EQ(header.total_payload_bytes, 4096);
+  }
+
+  shm_unlink(shm_key.c_str());
+}
+
+TEST(HostMemoryAllocatorTest, SharedMemoryHeaderOnlySegmentServesZeroed) {
+  std::string shm_key = "/test_raiden_shm_bare_" + std::to_string(getpid());
+  shm_unlink(shm_key.c_str());
+
+  SharedMemoryHeader schema = {};
+  absl::SNPrintF(schema.model_uid, sizeof(schema.model_uid), "crashed_model");
+  // A predecessor that died after creating the header but before its first
+  // allocation: zero recorded payload.
+  WriteBareSegment(shm_key, schema);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto allocator,
+      SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+  TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
+                          allocator->Allocate(1024));
+  ASSERT_NE(alloc.ptr, nullptr);
+  for (size_t i = 0; i < 1024; ++i) {
+    ASSERT_EQ(alloc.ptr[i], 0);
+  }
+  SharedMemoryHeader header = ReadSegmentHeader(shm_key);
+  EXPECT_EQ(header.total_payload_bytes, 4096);
+  EXPECT_EQ(header.reference_count, 1);
+
+  shm_unlink(shm_key.c_str());
+}
+
+TEST(HostMemoryAllocatorTest, SharedMemoryVersionOneSegmentColdStarts) {
+  std::string shm_key = "/test_raiden_shm_v1_" + std::to_string(getpid());
+  shm_unlink(shm_key.c_str());
+
+  SharedMemoryHeader v1 = {};
+  v1.version = 1;
+  absl::SNPrintF(v1.model_uid, sizeof(v1.model_uid), "upgrade_model");
+  v1.total_payload_bytes = 512;
+  WriteBareSegment(shm_key, v1);
+
+  // The production attach side: a default-constructed schema carries the
+  // current version, so a version-1 segment reformats once on upgrade.
+  SharedMemoryHeader schema = {};
+  absl::SNPrintF(schema.model_uid, sizeof(schema.model_uid), "upgrade_model");
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto allocator,
+      SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+  TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
+                          allocator->Allocate(1024));
+  for (size_t i = 0; i < 1024; ++i) {
+    ASSERT_EQ(alloc.ptr[i], 0);
+  }
+  SharedMemoryHeader header = ReadSegmentHeader(shm_key);
+  EXPECT_EQ(header.version, 2);
+  EXPECT_EQ(header.reference_count, 1);
+  EXPECT_EQ(header.total_payload_bytes, 4096);
+
+  shm_unlink(shm_key.c_str());
+}
+
+TEST(HostMemoryAllocatorTest, SharedMemoryRequestSizeChangeColdStarts) {
+  std::string shm_key = "/test_raiden_shm_resize_" + std::to_string(getpid());
+  shm_unlink(shm_key.c_str());
+
+  SharedMemoryHeader schema = {};
+  absl::SNPrintF(schema.model_uid, sizeof(schema.model_uid), "resize_model");
+
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
+                            allocator->Allocate(1024));
+    std::memset(alloc.ptr, 0x77, 1024);
+  }
+
+  {
+    // A different request size means a different region layout; the recorded
+    // payload no longer divides into it, so the segment cold-starts.
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
+                            allocator->Allocate(8192));
+    for (size_t i = 0; i < 8192; ++i) {
+      ASSERT_EQ(alloc.ptr[i], 0);
+    }
+    EXPECT_EQ(ReadSegmentHeader(shm_key).total_payload_bytes, 8192);
   }
 
   shm_unlink(shm_key.c_str());

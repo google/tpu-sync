@@ -33,11 +33,9 @@ from nothing but the environment and the surviving shared memory.
 
 The test runs on a single CPU device. Production deployments run one worker
 process per device, each with its own shared-memory data segment; a single
-device mirrors one such worker. (A single process managing several shards
-over one shared-memory segment is not a deployed configuration: every
-allocation from one SharedMemoryHostMemoryAllocator returns a view of the
-same segment. The skipped multi-array and multi-shard tests below pin the
-intended contract for those configurations.)
+device mirrors one such worker. Within a device's segment every allocation
+owns its own region, so one process managing several arrays or shards is
+also covered (the multi-array and multi-shard tests below).
 """
 
 import os
@@ -45,7 +43,6 @@ import socket
 import subprocess
 import sys
 import time
-import unittest
 
 from absl import app
 from absl import flags
@@ -60,13 +57,6 @@ _SIGKILL = 9
 _NUM_BLOCKS = 2
 _SHAPE = (_NUM_BLOCKS, 128, 8, 8, 128)  # float32
 _HASHES = [b"hash_0", b"hash_1"]
-
-_PENDING_SEGMENT_FIX = unittest.skip(
-    "The shared-memory allocator returns the same single segment for every"
-    " allocation in a process, so the host mirrors of a second KV array or a"
-    " second shard alias (and corrupt) the first; enable once each allocation"
-    " gets its own segment."
-)
 
 # The phases run in subprocesses, so their detailed assertions are invisible
 # to the test process. Each phase prints one of these markers only after all
@@ -362,7 +352,6 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
     )
     self.assertIn(_PHASE_B_COLD_MARKER, result.stdout)
 
-  @_PENDING_SEGMENT_FIX
   def test_recovers_hybrid_model_arrays_after_crash(self):
     # A hybrid model's KV pool reaches the manager as several backing arrays,
     # all reshaped to one uniform kernel geometry (the connectors pad every
@@ -377,7 +366,6 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
     self.assertIn(_PHASE_B_RECOVERED_MARKER, result.stdout)
     self.assertIn(_PHASE_B_BYTES_MARKER, result.stdout)
 
-  @_PENDING_SEGMENT_FIX
   def test_recovers_sharded_array_after_crash(self):
     # Two shards of one array allocate through the same allocator instance;
     # each shard's mirror must be its own memory.

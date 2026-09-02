@@ -18,10 +18,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include "absl/log/check.h"
 #include "absl/strings/str_format.h"
@@ -428,6 +431,72 @@ TEST(HostMemoryAllocatorTest, SharedMemoryRequestSizeChangeColdStarts) {
   }
 
   shm_unlink(shm_key.c_str());
+}
+
+TEST(HostMemoryAllocatorTest, ScopedShmLockSerializesHolders) {
+  const std::string name = "/test_raiden_shm_lock_" + std::to_string(getpid());
+
+  std::optional<ScopedShmLock> first;
+  {
+    TF_ASSERT_OK_AND_ASSIGN(ScopedShmLock lock, ScopedShmLock::Acquire(name));
+    first.emplace(std::move(lock));
+  }
+
+  std::atomic<bool> second_acquired{false};
+  std::thread contender([&] {
+    TF_ASSERT_OK_AND_ASSIGN(ScopedShmLock lock, ScopedShmLock::Acquire(name));
+    second_acquired.store(true);
+  });
+
+  // The contender must still be blocked while the first hold is live. A
+  // sleep cannot prove blocking, but a broken lock makes this fail with high
+  // probability rather than ever failing a correct implementation.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  EXPECT_FALSE(second_acquired.load());
+
+  first.reset();
+  contender.join();
+  EXPECT_TRUE(second_acquired.load());
+
+  shm_unlink((name + ".lock").c_str());
+}
+
+TEST(HostMemoryAllocatorTest, SharedMemoryCreationLockOutlivesSegment) {
+  std::string shm_key = "/test_raiden_shm_lockfile_" + std::to_string(getpid());
+  const std::string lock_file =
+      std::string("/dev/shm") + shm_key + ".lock";
+  shm_unlink(shm_key.c_str());
+  shm_unlink((shm_key + ".lock").c_str());
+
+  SharedMemoryHeader schema = {};
+  absl::SNPrintF(schema.model_uid, sizeof(schema.model_uid), "lock_model");
+
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
+                            allocator->Allocate(1024));
+    std::memset(alloc.ptr, 0x11, 1024);
+    EXPECT_EQ(access(lock_file.c_str(), F_OK), 0);
+  }
+
+  // The lock file survives the allocator (it is never unlinked) and a warm
+  // boot next to it still recovers the data.
+  EXPECT_EQ(access(lock_file.c_str(), F_OK), 0);
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
+                            allocator->Allocate(1024));
+    for (size_t i = 0; i < 1024; ++i) {
+      ASSERT_EQ(alloc.ptr[i], 0x11);
+    }
+  }
+
+  shm_unlink(shm_key.c_str());
+  shm_unlink((shm_key + ".lock").c_str());
 }
 
 }  // namespace

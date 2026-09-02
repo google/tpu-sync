@@ -96,6 +96,35 @@ class MallocHostMemoryAllocator : public HostMemoryAllocator {
   absl::StatusOr<HostBufferAllocation> Allocate(size_t size_bytes) override;
 };
 
+// Serializes attach-or-create decisions on a shared-memory segment across
+// processes: without it, a process can open a peer's segment before its
+// header is written, judge it incompatible, and unlink a live segment.
+// Locks via flock(2) on a companion "<name>.lock" file that is never
+// unlinked, so its identity survives the guarded segment's re-creation;
+// the kernel releases the lock when its holder exits, so a crashed holder
+// cannot wedge later boots. Taken only when a segment is opened or
+// released -- once per segment per process lifetime, at boot and shutdown
+// -- so it adds no cost to the allocation or serving paths; contention
+// only serializes same-host processes booting against the same segment
+// name, for the microseconds the peer needs to set up a header.
+class ScopedShmLock {
+ public:
+  // Blocks until the lock guarding `segment_name` is held.
+  static absl::StatusOr<ScopedShmLock> Acquire(absl::string_view segment_name);
+
+  ScopedShmLock(ScopedShmLock&& other) noexcept : fd_(other.fd_) {
+    other.fd_ = -1;
+  }
+  ScopedShmLock(const ScopedShmLock&) = delete;
+  ScopedShmLock& operator=(const ScopedShmLock&) = delete;
+  ScopedShmLock& operator=(ScopedShmLock&&) = delete;
+  ~ScopedShmLock();
+
+ private:
+  explicit ScopedShmLock(int fd) : fd_(fd) {}
+  int fd_ = -1;
+};
+
 struct alignas(64) SharedMemoryHeader {
   uint64_t magic = 0x52414944454E5348;  // "RAIDENSH"
   // Segment layout revision; a mismatch cold-starts the segment. Version 2

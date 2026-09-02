@@ -111,6 +111,8 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":kv_cache_metadata",
+        "//tpu_sync/core:host_memory_allocator",
+        "//tpu_sync/core:status_macros",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

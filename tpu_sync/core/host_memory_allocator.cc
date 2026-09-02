@@ -15,6 +15,7 @@
 #include "tpu_sync/core/host_memory_allocator.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -106,6 +107,35 @@ bool HeaderMatchesSchema(const SharedMemoryHeader& header,
   return compatible;
 }
 }  // namespace
+
+absl::StatusOr<ScopedShmLock> ScopedShmLock::Acquire(
+    absl::string_view segment_name) {
+  const std::string lock_name = absl::StrCat(segment_name, ".lock");
+  int fd = shm_open(lock_name.c_str(), O_CREAT | O_RDWR, 0666);
+  if (fd < 0) {
+    return absl::InternalError(absl::StrCat("shm_open failed on lock file ",
+                                            lock_name, ": ",
+                                            std::strerror(errno)));
+  }
+  int err;
+  do {
+    err = flock(fd, LOCK_EX);
+  } while (err != 0 && errno == EINTR);
+  if (err != 0) {
+    absl::Status status = absl::InternalError(absl::StrCat(
+        "flock failed on lock file ", lock_name, ": ", std::strerror(errno)));
+    close(fd);
+    return status;
+  }
+  return ScopedShmLock(fd);
+}
+
+ScopedShmLock::~ScopedShmLock() {
+  if (fd_ >= 0) {
+    // Closing the descriptor releases the flock.
+    close(fd_);
+  }
+}
 
 absl::StatusOr<std::unique_ptr<HostMemoryAllocator>>
 HostMemoryAllocator::Create(xla::PjRtClient* pjrt_client) {
@@ -306,6 +336,14 @@ SharedMemoryHostMemoryAllocator::~SharedMemoryHostMemoryAllocator() {
       munmap(region.ptr, region.size_bytes);
     }
     if (segment.header != nullptr) {
+      // The shared refcount needs the same cross-process lock as
+      // OpenSegment's increment. A destructor cannot fail, so a failed
+      // acquire only costs the decrement's atomicity.
+      absl::StatusOr<ScopedShmLock> lock = ScopedShmLock::Acquire(name);
+      if (!lock.ok()) {
+        LOG(WARNING) << "[SHM_ALLOCATOR] Releasing segment " << name
+                     << " without its creation lock: " << lock.status();
+      }
       if (segment.header->reference_count > 0) {
         segment.header->reference_count--;
       }
@@ -323,6 +361,14 @@ absl::StatusOr<SharedMemoryHostMemoryAllocator::Segment*>
 SharedMemoryHostMemoryAllocator::OpenSegment(const std::string& segment_name,
                                              size_t first_request_bytes) {
   VLOG(1) << "[SHM_ALLOCATOR] Opening shm segment: " << segment_name;
+
+  // The whole warm-or-cold decision -- open, validate, possibly unlink and
+  // re-create -- runs under the segment's creation lock, so a concurrent
+  // opener cannot unlink a live segment whose header is not written yet.
+  absl::StatusOr<ScopedShmLock> lock = ScopedShmLock::Acquire(segment_name);
+  if (!lock.ok()) {
+    return lock.status();
+  }
 
   const size_t aligned_request = (first_request_bytes + 4095) & ~4095;
   // The request is num_blocks * bytes-per-block, so a pinned block count
@@ -407,10 +453,9 @@ SharedMemoryHostMemoryAllocator::OpenSegment(const std::string& segment_name,
   }
 
   if (!warm) {
+    // Under the creation lock an EEXIST can only be an uncooperative
+    // writer: fail loudly rather than overwrite its header.
     fd = shm_open(segment_name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
-    if (fd < 0) {
-      fd = shm_open(segment_name.c_str(), O_CREAT | O_RDWR, 0666);
-    }
     if (fd < 0) {
       return absl::InternalError(
           absl::StrCat("shm_open failed to create segment ", segment_name,

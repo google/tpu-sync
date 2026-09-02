@@ -33,6 +33,8 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "tpu_sync/core/host_memory_allocator.h"
+#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 
 namespace tpu_raiden {
@@ -60,6 +62,12 @@ KVCacheMetadataShmRegion::AttachOrFormat(absl::string_view shm_key,
                                          absl::string_view model_uid) {
   const std::string key = NormalizeShmKey(shm_key);
   const size_t size = PageAlignedTableSize(num_blocks);
+
+  // The attach-or-create decision runs under the segment's creation lock
+  // (the same discipline SharedMemoryHostMemoryAllocator applies to the KV
+  // pool segments), so a concurrent opener cannot unlink a half-created
+  // table as incompatible.
+  ASSIGN_OR_RETURN(ScopedShmLock lock, ScopedShmLock::Acquire(key));
 
   // Warm path: attach to a segment left behind by a previous incarnation and
   // validate the table it carries. Any incompatibility falls through to the
@@ -93,11 +101,10 @@ KVCacheMetadataShmRegion::AttachOrFormat(absl::string_view shm_key,
     shm_unlink(key.c_str());
   }
 
-  // Cold path: create the segment and format an empty table into it.
+  // Cold path: create the segment and format an empty table into it. Under
+  // the creation lock an EEXIST can only be an uncooperative writer: fail
+  // loudly rather than overwrite its table.
   fd = shm_open(key.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
-  if (fd < 0) {
-    fd = shm_open(key.c_str(), O_CREAT | O_RDWR, 0666);
-  }
   if (fd < 0) {
     return absl::InternalError(
         absl::StrCat("shm_open failed to create KV metadata segment ", key,

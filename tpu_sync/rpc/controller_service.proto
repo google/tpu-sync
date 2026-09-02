@@ -78,6 +78,13 @@ message PoolByteSpan {
   int64 src_stride_bytes = 6;
   int64 dst_stride_bytes = 7;
   int32 count = 8;
+  // Multi-destination routing: index into the coordinate request's
+  // dst_units. Absent = the span reaches every destination unit (replicated
+  // caches; also the legacy single-destination meaning). Present = that
+  // destination only (sharded destinations, e.g. a head-split KV cache). The
+  // upper bound is checked at plan time against the transfer's destination
+  // list; the controller attaches no meaning beyond the routing.
+  optional int32 dst_unit_ordinal = 9;
 }
 
 // A rank's declared contribution to one pool tag, lowered to bytes by the

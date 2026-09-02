@@ -209,6 +209,8 @@ std::string ReshardService::HandleControllerCommand(
           byte_span.src_stride_bytes = span.src_stride_bytes();
           byte_span.dst_stride_bytes = span.dst_stride_bytes();
           byte_span.count = span.count();
+          byte_span.dst_unit_ordinal =
+              span.has_dst_unit_ordinal() ? span.dst_unit_ordinal() : -1;
           registration.spans.push_back(byte_span);
         }
         registration.declared_bytes = entry.declared_bytes();

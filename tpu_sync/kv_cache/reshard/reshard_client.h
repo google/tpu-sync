@@ -75,6 +75,9 @@ struct ClientByteSpan {
   int64_t src_stride_bytes = 0;
   int64_t dst_stride_bytes = 0;
   int64_t count = 0;
+  // -1 = every destination (absent on the wire); >= 0 routes the span to
+  // that destination unit only.
+  int32_t dst_unit_ordinal = -1;
 };
 
 struct ClientPoolSpans {

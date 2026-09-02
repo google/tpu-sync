@@ -147,6 +147,9 @@ tpu_sync::rpc::ControllerRequest ReshardClient::BuildRegisterRequestBlocks(
       span_proto->set_src_stride_bytes(span.src_stride_bytes);
       span_proto->set_dst_stride_bytes(span.dst_stride_bytes);
       span_proto->set_count(span.count);
+      if (span.dst_unit_ordinal >= 0) {
+        span_proto->set_dst_unit_ordinal(span.dst_unit_ordinal);
+      }
     }
   }
   return req;

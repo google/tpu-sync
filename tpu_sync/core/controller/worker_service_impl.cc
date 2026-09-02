@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -35,6 +36,7 @@
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/transfer_program_reshard.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/proto/transfer_program.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -138,6 +140,146 @@ grpc::Status WorkerServiceImpl::TransferBuffers(
     ::tpu_sync::proto::TransferBuffersResponse* response) {
   absl::MutexLock lock(mutex_);
   const auto& transfer = request->transfer();
+
+  if (!transfer.backend_specs().empty()) {
+    if (!transfer_manager_) {
+      response->set_success(false);
+      response->set_message(
+          "Transfer manager is not configured on WorkerService");
+      return grpc::Status::OK;
+    }
+
+    if (transfer.backend_specs_size() > 1) {
+      response->set_success(false);
+      response->set_message(
+          "WorkerService currently supports at most 1 secondary backend_spec");
+      return grpc::Status::OK;
+    }
+
+    for (const auto& backend_spec : transfer.backend_specs()) {
+      size_t num_blocks = backend_spec.block_hashes_size();
+      if (num_blocks == 0) {
+        LOG(ERROR) << "[Worker] Backend transfer spec contains 0 block hashes";
+        response->set_success(false);
+        response->set_message(
+            "Backend transfer spec must specify at least one block hash");
+        return grpc::Status::OK;
+      }
+
+      // -----------------------------------------------------------------------
+      // Strict 1:1 validation across src_buffers, dst_buffers, and
+      // block_hashes. Eliminates ambiguous fallback heuristics and ensures
+      // deterministic buffer-to-block mapping.
+      // -----------------------------------------------------------------------
+      if (transfer.src_buffers_size() != num_blocks ||
+          transfer.dst_buffers_size() != num_blocks) {
+        LOG(ERROR) << "[Worker] Buffer count mismatch: src_buffers ("
+                   << transfer.src_buffers_size() << "), dst_buffers ("
+                   << transfer.dst_buffers_size() << "), block_hashes ("
+                   << num_blocks << ")";
+        response->set_success(false);
+        response->set_message(absl::StrCat(
+            "Mismatch between transfer buffer count (src: ",
+            transfer.src_buffers_size(), ", dst: ", transfer.dst_buffers_size(),
+            ") and backend block_hashes count (", num_blocks, ")"));
+        return grpc::Status::OK;
+      }
+
+      std::string backend_name = backend_spec.name();
+      std::shared_ptr<kv_cache::backends::KVBackend> driver =
+          transfer_manager_.GetKVBackend(backend_name);
+      if (!driver) {
+        LOG(ERROR) << "[Worker] No backend registered for backend_name: "
+                   << backend_name;
+        response->set_success(false);
+        response->set_message(absl::StrCat(
+            "No backend registered for backend_name: ", backend_name));
+        return grpc::Status::OK;
+      }
+
+      std::vector<int64_t> src_block_ids;
+      std::vector<int64_t> dst_block_ids;
+      src_block_ids.reserve(num_blocks);
+      dst_block_ids.reserve(num_blocks);
+
+      for (const auto& buf : transfer.src_buffers()) {
+        if (!buf.has_index() || buf.index() < 0) {
+          response->set_success(false);
+          response->set_message(
+              "BufferProto missing valid index in src_buffers");
+          return grpc::Status::OK;
+        }
+        src_block_ids.push_back(buf.index());
+      }
+      for (const auto& buf : transfer.dst_buffers()) {
+        if (!buf.has_index() || buf.index() < 0) {
+          response->set_success(false);
+          response->set_message(
+              "BufferProto missing valid index in dst_buffers");
+          return grpc::Status::OK;
+        }
+        dst_block_ids.push_back(buf.index());
+      }
+
+      if (!driver->mapper()) {
+        LOG(ERROR) << "[Worker] Backend driver '" << backend_name
+                   << "' has no mapper configured";
+        response->set_success(false);
+        response->set_message(absl::StrCat("Backend driver '", backend_name,
+                                           "' has no mapper configured"));
+        return grpc::Status::OK;
+      }
+
+      std::vector<kv_cache::backends::BlockKey> block_keys;
+      block_keys.reserve(num_blocks);
+      for (const auto& hash : backend_spec.block_hashes()) {
+        block_keys.push_back(driver->mapper()->MapKey(hash));
+      }
+
+      absl::StatusOr<raiden::PjRtCopyFuture> copy_future;
+      switch (backend_spec.direction()) {
+        case ::tpu_sync::proto::TRANSFER_DIR_OFFLOAD: {
+          // OFFLOAD: src = Device HBM, dst = Host DRAM Staging
+          copy_future = transfer_manager_.D2hWriteToBackend(
+              driver, block_keys, src_block_ids, dst_block_ids);
+          break;
+        }
+
+        case ::tpu_sync::proto::TRANSFER_DIR_RECALL: {
+          // RECALL: src = Host DRAM Staging, dst = Device HBM
+          copy_future = transfer_manager_.H2dReadFromBackend(
+              driver, block_keys, src_block_ids, dst_block_ids);
+          break;
+        }
+
+        default:
+          response->set_success(false);
+          response->set_message(absl::StrCat("Unsupported transfer direction: ",
+                                             backend_spec.direction()));
+          return grpc::Status::OK;
+      }
+
+      if (!copy_future.ok()) {
+        LOG(ERROR) << "[Worker] Backend transfer dispatch failed: "
+                   << copy_future.status();
+        response->set_success(false);
+        response->set_message(copy_future.status().message());
+        return grpc::Status::OK;
+      }
+
+      absl::Status status = copy_future.value().Await();
+      if (!status.ok()) {
+        LOG(ERROR) << "[Worker] Pipelined backend transfer failed: " << status;
+        response->set_success(false);
+        response->set_message(status.message());
+        return grpc::Status::OK;
+      }
+    }
+
+    response->set_success(true);
+    response->set_message("SUCCESS");
+    return grpc::Status::OK;
+  }
 
   ::tpu_sync::rpc::MemoryType src_mem_type = transfer.src_mem_type();
   ::tpu_sync::rpc::MemoryType dst_mem_type = transfer.dst_mem_type();

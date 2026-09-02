@@ -30,7 +30,6 @@
 namespace tpu_raiden::telemetry {
 namespace {
 
-constexpr size_t kDefaultPrometheusStackBufferSize = 256;
 
 // Lightweight buffer writer that bounds-checks appends into a char span.
 class BufferWriter {
@@ -123,29 +122,6 @@ size_t ComputePrometheusLabelsSize(LabelSpan labels) {
   return total;
 }
 
-// Generic 2-stage stack-to-heap allocation fallback orchestrator.
-template <size_t StackBufferSize, typename SizeFn, typename BufferFormatFn>
-std::string FormatWithStackBufferFallback(LabelSpan labels, SizeFn size_fn,
-                                          BufferFormatFn format_fn) {
-  if (labels.empty()) return "";
-
-  char stack_buffer[StackBufferSize];
-  if (std::optional<absl::string_view> formatted =
-          format_fn(labels, absl::MakeSpan(stack_buffer));
-      formatted.has_value()) {
-    return std::string(*formatted);
-  }
-
-  // Exact-size dynamic fallback for label sets exceeding stack buffer.
-  std::string result(size_fn(labels), '\0');
-  std::optional<absl::string_view> formatted =
-      format_fn(labels, absl::MakeSpan(result));
-  if (!formatted.has_value()) {
-    return "";
-  }
-  result.resize(formatted->size());
-  return result;
-}
 
 }  // namespace
 
@@ -254,9 +230,24 @@ std::optional<absl::string_view> FormatPrometheusLabelsToBuffer(
   return writer.view();
 }
 
-std::string FormatPrometheusLabels(LabelSpan labels) {
-  return FormatWithStackBufferFallback<kDefaultPrometheusStackBufferSize>(
-      labels, ComputePrometheusLabelsSize, FormatPrometheusLabelsToBuffer);
+PrometheusLabelView::PrometheusLabelView(LabelSpan labels) {
+  if (labels.empty()) return;
+
+  auto formatted =
+      FormatPrometheusLabelsToBuffer(labels, absl::MakeSpan(stack_buf_));
+  if (formatted.has_value()) {
+    view_ = *formatted;
+  } else {
+    heap_fallback_.resize(ComputePrometheusLabelsSize(labels));
+    auto heap_formatted =
+        FormatPrometheusLabelsToBuffer(labels, absl::MakeSpan(heap_fallback_));
+    if (heap_formatted.has_value()) {
+      heap_fallback_.resize(heap_formatted->size());
+      view_ = heap_fallback_;
+    } else {
+      heap_fallback_.clear();
+    }
+  }
 }
 
 }  // namespace tpu_raiden::telemetry

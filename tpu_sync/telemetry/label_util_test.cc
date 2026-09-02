@@ -18,6 +18,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -226,8 +227,8 @@ TEST(LabelUtilTest, RoundTripInvariance) {
 // Prometheus Canonical Formatting Tests
 // ============================================================================
 
-TEST(LabelUtilTest, FormatPrometheusLabelsEmpty) {
-  EXPECT_EQ(FormatPrometheusLabels({}), "");
+TEST(LabelUtilTest, FormatPrometheusLabelsToBufferEmpty) {
+  EXPECT_TRUE(PrometheusLabelView({}).view().empty());
 
   char output_buffer[64];
   std::optional<absl::string_view> result =
@@ -243,9 +244,9 @@ TEST(LabelUtilTest, FormatPrometheusLabelsEmpty) {
   EXPECT_EQ(*empty_buffer_result, "");
 }
 
-TEST(LabelUtilTest, FormatPrometheusLabelsSingleFastPath) {
+TEST(LabelUtilTest, FormatPrometheusLabelsToBufferSingleFastPath) {
   MetricLabel labels[] = {{"direction", "pull"}};
-  EXPECT_EQ(FormatPrometheusLabels(labels), "{direction=\"pull\"}");
+  EXPECT_EQ(PrometheusLabelView(labels).view(), "{direction=\"pull\"}");
 
   // Exact-fit buffer: "{direction=\"pull\"}" is 18 bytes.
   char exact_buffer[18];
@@ -263,18 +264,18 @@ TEST(LabelUtilTest, FormatPrometheusLabelsSingleFastPath) {
   // Very large label set exceeding 256 bytes to exercise heap fallback.
   std::string long_value(300, 'y');
   MetricLabel large_labels[] = {{"long_key", long_value}};
-  std::string formatted_large = FormatPrometheusLabels(large_labels);
-  EXPECT_EQ(formatted_large, absl::StrCat("{long_key=\"", long_value, "\"}"));
+  EXPECT_EQ(PrometheusLabelView(large_labels).view(),
+            absl::StrCat("{long_key=\"", long_value, "\"}"));
 }
 
-TEST(LabelUtilTest, FormatPrometheusLabelsMultiSorted) {
+TEST(LabelUtilTest, FormatPrometheusLabelsToBufferMultiSorted) {
   // Input unsorted by key.
   MetricLabel labels[] = {
       {"tag", "0"},
       {"direction", "pull"},
       {"mode", "direct"},
   };
-  EXPECT_EQ(FormatPrometheusLabels(labels),
+  EXPECT_EQ(PrometheusLabelView(labels).view(),
             "{direction=\"pull\",mode=\"direct\",tag=\"0\"}");
 
   char output_buffer[64];
@@ -289,14 +290,14 @@ TEST(LabelUtilTest, FormatPrometheusLabelsMultiSorted) {
       {"k04", "v4"}, {"k03", "v3"}, {"k02", "v2"}, {"k01", "v1"}, {"k00", "v0"},
   };
   EXPECT_EQ(
-      FormatPrometheusLabels(ten_labels),
+      PrometheusLabelView(ten_labels).view(),
       "{k00=\"v0\",k01=\"v1\",k02=\"v2\",k03=\"v3\",k04=\"v4\",k05=\"v5\","
       "k06=\"v6\",k07=\"v7\",k08=\"v8\",k09=\"v9\"}");
 }
 
-TEST(LabelUtilTest, FormatPrometheusLabelsEscapingAndUtf8Value) {
+TEST(LabelUtilTest, FormatPrometheusLabelsToBufferEscapingAndUtf8Value) {
   MetricLabel labels[] = {{"query", "line1\nline2\"quoted\"with\\slash"}};
-  EXPECT_EQ(FormatPrometheusLabels(labels),
+  EXPECT_EQ(PrometheusLabelView(labels).view(),
             "{query=\"line1\\nline2\\\"quoted\\\"with\\\\slash\"}");
 
   char output_buffer[128];
@@ -307,22 +308,22 @@ TEST(LabelUtilTest, FormatPrometheusLabelsEscapingAndUtf8Value) {
 
   // UTF-8 in value combined with newline and quotes.
   MetricLabel utf8_labels[] = {{"error_detail", "失敗: \"IO\\Error\"\n詳細"}};
-  EXPECT_EQ(FormatPrometheusLabels(utf8_labels),
+  EXPECT_EQ(PrometheusLabelView(utf8_labels).view(),
             "{error_detail=\"失敗: \\\"IO\\\\Error\\\"\\n詳細\"}");
 }
 
-TEST(LabelUtilTest, FormatPrometheusLabelsRawKeys) {
-  // Verifies that FormatPrometheusLabels acts as a raw serializer without
+TEST(LabelUtilTest, FormatPrometheusLabelsToBufferRawKeys) {
+  // Verifies that PrometheusLabelView acts as a raw serializer without
   // enforcing Prometheus key naming restrictions or duplicate key rejection.
   MetricLabel raw_labels[] = {
       {"replica", "1"},
       {"replica", "0"},
   };
-  EXPECT_EQ(FormatPrometheusLabels(raw_labels),
+  EXPECT_EQ(PrometheusLabelView(raw_labels).view(),
             "{replica=\"0\",replica=\"1\"}");
 
   MetricLabel special_keys[] = {{"bad-key", "value"}};
-  EXPECT_EQ(FormatPrometheusLabels(special_keys), "{bad-key=\"value\"}");
+  EXPECT_EQ(PrometheusLabelView(special_keys).view(), "{bad-key=\"value\"}");
 }
 
 TEST(LabelUtilTest, FormatPrometheusLabelsToBufferOverflow) {
@@ -470,5 +471,105 @@ TEST(LabelUtilTest, ResolveLabelsConstexprEvaluation) {
   static_assert(kPartialResolved[1] == "val_b");
 }
 
+TEST(LabelUtilTest, PrometheusLabelViewEmpty) {
+  PrometheusLabelView view({});
+  EXPECT_TRUE(view.view().empty());
+  EXPECT_TRUE(PrometheusLabelView({}).ToOwned().empty());
+}
+
+TEST(LabelUtilTest, PrometheusLabelViewStackFit) {
+  const std::array<MetricLabel, 2> labels = {
+      MetricLabel{.key = "direction", .value = "push"},
+      MetricLabel{.key = "mode", .value = "direct"},
+  };
+  PrometheusLabelView view(labels);
+  EXPECT_EQ(view.view(), "{direction=\"push\",mode=\"direct\"}");
+  EXPECT_EQ(PrometheusLabelView(labels).ToOwned(),
+            "{direction=\"push\",mode=\"direct\"}");
+}
+
+TEST(LabelUtilTest, PrometheusLabelViewDefaultCapacityOverflow) {
+  std::string long_val(300, 'x');
+  const std::array<MetricLabel, 1> labels = {
+      MetricLabel{.key = "key", .value = long_val},
+  };
+  PrometheusLabelView view(labels);
+  std::string expected = absl::StrCat("{key=\"", long_val, "\"}");
+  EXPECT_EQ(view.view(), expected);
+  std::string owned = std::move(view).ToOwned();
+  EXPECT_EQ(owned, expected);
+}
+
+TEST(LabelUtilTest, PrometheusLabelViewNonCopyableNonMovable) {
+  static_assert(!std::is_copy_constructible_v<PrometheusLabelView>);
+  static_assert(!std::is_copy_assignable_v<PrometheusLabelView>);
+  static_assert(!std::is_move_constructible_v<PrometheusLabelView>);
+  static_assert(!std::is_move_assignable_v<PrometheusLabelView>);
+}
+
+TEST(LabelUtilTest, PrometheusLabelViewUnsortedLabels) {
+  const std::array<MetricLabel, 2> labels = {
+      MetricLabel{.key = "z", .value = "1"},
+      MetricLabel{.key = "a", .value = "2"},
+  };
+  PrometheusLabelView view(labels);
+  EXPECT_EQ(view.view(), "{a=\"2\",z=\"1\"}");
+  EXPECT_EQ(PrometheusLabelView(labels).ToOwned(), "{a=\"2\",z=\"1\"}");
+}
+
+TEST(LabelUtilTest, PrometheusLabelViewUnsortedLabelsOverflow) {
+  std::string long_val(300, 'x');
+  const std::array<MetricLabel, 2> labels = {
+      MetricLabel{.key = "z", .value = long_val},
+      MetricLabel{.key = "a", .value = "first"},
+  };
+  PrometheusLabelView view(labels);
+  std::string expected = absl::StrCat("{a=\"first\",z=\"", long_val, "\"}");
+  EXPECT_EQ(view.view(), expected);
+  EXPECT_EQ(std::move(view).ToOwned(), expected);
+}
+
+TEST(LabelUtilTest, PrometheusLabelViewEscapedCharacters) {
+  const std::array<MetricLabel, 1> labels = {
+      MetricLabel{.key = "msg", .value = "hello \"world\"\npath\\to"},
+  };
+  PrometheusLabelView view(labels);
+  EXPECT_EQ(view.view(), "{msg=\"hello \\\"world\\\"\\npath\\\\to\"}");
+  EXPECT_EQ(PrometheusLabelView(labels).ToOwned(),
+            "{msg=\"hello \\\"world\\\"\\npath\\\\to\"}");
+}
+
+TEST(LabelUtilTest, PrometheusLabelViewEscapingOverflow) {
+  // 140 quotes: unescaped length is 140, but escaped length is 280 > 256.
+  std::string quotes(140, '"');
+  const std::array<MetricLabel, 1> labels = {
+      MetricLabel{.key = "q", .value = quotes},
+  };
+  PrometheusLabelView view(labels);
+  std::string expected_val;
+  expected_val.reserve(280);
+  for (int i = 0; i < 140; ++i) {
+    expected_val += "\\\"";
+  }
+  std::string expected = absl::StrCat("{q=\"", expected_val, "\"}");
+  EXPECT_EQ(view.view(), expected);
+  EXPECT_EQ(std::move(view).ToOwned(), expected);
+}
+
+TEST(LabelUtilTest, PrometheusLabelViewToOwnedStackAndHeap) {
+  // Stack path
+  const std::array<MetricLabel, 1> stack_labels = {
+      MetricLabel{.key = "env", .value = "prod"},
+  };
+  EXPECT_EQ(PrometheusLabelView(stack_labels).ToOwned(), "{env=\"prod\"}");
+
+  // Heap path
+  std::string long_val(300, 'x');
+  const std::array<MetricLabel, 1> heap_labels = {
+      MetricLabel{.key = "env", .value = long_val},
+  };
+  std::string expected = absl::StrCat("{env=\"", long_val, "\"}");
+  EXPECT_EQ(PrometheusLabelView(heap_labels).ToOwned(), expected);
+}
 }  // namespace
 }  // namespace tpu_raiden::telemetry

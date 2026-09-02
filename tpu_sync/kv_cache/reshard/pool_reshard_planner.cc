@@ -637,6 +637,7 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
           split_span.dst_block_index = page_index;
           split_span.dst_offset_bytes = in_page;
           split_span.size_bytes = take;
+          split_span.dst_unit_ordinal = span.dst_unit_ordinal;
           split_entry.spans.push_back(split_span);
           global_offset += take;
           src_offset += take;
@@ -675,17 +676,33 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
       }
     }
 
-    // Validate: expand every span's uniform repeats; the union of all
-    // repeats must cover each destination block exactly once as a
-    // prefix-shaped extent.
-    std::vector<std::vector<std::pair<int64_t, int64_t>>> coverage(
-        dst_ids_g.size());
+    // Validate: expand every span's uniform repeats; for every destination
+    // unit, the union of the repeats routed to it must cover each
+    // destination block exactly once as a prefix-shaped extent. A span
+    // without a dst_unit_ordinal (absent on the wire) is replicated to every
+    // destination; a span with an ordinal belongs to that destination only
+    // (sharded destinations, e.g. head-split KV caches). Declared/covered
+    // byte accounting counts each span repeat once however many
+    // destinations it reaches.
+    const size_t num_dst = request.dst_units.size();
+    std::vector<std::vector<std::vector<std::pair<int64_t, int64_t>>>>
+        coverage_by_dst(num_dst,
+                        std::vector<std::vector<std::pair<int64_t, int64_t>>>(
+                            dst_ids_g.size()));
     int64_t expanded_repeats = 0;
     int64_t declared_total = 0;
     int64_t covered_total = 0;
+    int64_t replicated_total = 0;
     for (const auto& [unit, entry] : declared) {
       declared_total += entry->declared_bytes;
       for (const PoolByteSpan& span : entry->spans) {
+        if (span.dst_unit_ordinal >= static_cast<int64_t>(num_dst)) {
+          return absl::InvalidArgumentError(
+              absl::StrCat("Byte span dst_unit_ordinal ", span.dst_unit_ordinal,
+                           " exceeds the transfer's ", num_dst,
+                           " destination units for tag ", PyStrRepr(plan_tag),
+                           " (declared by ", PythonRepr(unit), ")"));
+        }
         if (span.dst_block_index >= static_cast<int64_t>(dst_ids_g.size())) {
           return absl::InvalidArgumentError(
               absl::StrCat("Byte span destination index ", span.dst_block_index,
@@ -718,40 +735,68 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
         for (int32_t repeat = 0; repeat < span.count; ++repeat) {
           const int64_t start =
               span.dst_offset_bytes + repeat * span.dst_stride_bytes;
-          coverage[span.dst_block_index].emplace_back(start,
-                                                      start + span.size_bytes);
+          if (span.dst_unit_ordinal < 0) {
+            for (size_t d = 0; d < num_dst; ++d) {
+              coverage_by_dst[d][span.dst_block_index].emplace_back(
+                  start, start + span.size_bytes);
+            }
+            replicated_total += span.size_bytes;
+          } else {
+            coverage_by_dst[span.dst_unit_ordinal][span.dst_block_index]
+                .emplace_back(start, start + span.size_bytes);
+          }
           covered_total += span.size_bytes;
         }
       }
     }
     std::vector<int64_t> extents;
-    for (size_t index = 0; index < dst_ids_g.size(); ++index) {
-      std::vector<std::pair<int64_t, int64_t>>& intervals = coverage[index];
-      std::sort(intervals.begin(), intervals.end());
-      if (intervals.empty()) {
-        return absl::InvalidArgumentError(absl::StrCat(
-            "Destination block index ", index,
-            " has no declared coverage for tag ", PyStrRepr(plan_tag)));
-      }
-      int64_t covered_until = 0;
-      for (const auto& [start, end] : intervals) {
-        if (start != covered_until) {
-          const bool overlap = start < covered_until;
+    for (size_t d = 0; d < num_dst; ++d) {
+      // Single-destination plans keep the historical error strings; the
+      // destination suffix appears only for multi-destination plans.
+      const std::string dst_suffix =
+          num_dst > 1 ? absl::StrCat(" at destination unit ", d) : "";
+      std::vector<int64_t> dst_extents;
+      for (size_t index = 0; index < dst_ids_g.size(); ++index) {
+        std::vector<std::pair<int64_t, int64_t>>& intervals =
+            coverage_by_dst[d][index];
+        std::sort(intervals.begin(), intervals.end());
+        if (intervals.empty()) {
           return absl::InvalidArgumentError(
-              absl::StrCat("Declared byte spans have a destination coverage ",
-                           overlap ? "overlap" : "gap", " at byte ",
-                           std::min(start, covered_until),
-                           " of destination block index ", index));
+              absl::StrCat("Destination block index ", index,
+                           " has no declared coverage for tag ",
+                           PyStrRepr(plan_tag), dst_suffix));
         }
-        covered_until = end;
+        int64_t covered_until = 0;
+        for (const auto& [start, end] : intervals) {
+          if (start != covered_until) {
+            const bool overlap = start < covered_until;
+            return absl::InvalidArgumentError(absl::StrCat(
+                "Declared byte spans have a destination coverage ",
+                overlap ? "overlap" : "gap", " at byte ",
+                std::min(start, covered_until), " of destination block index ",
+                index, dst_suffix));
+          }
+          covered_until = end;
+        }
+        if (index != dst_ids_g.size() - 1 && covered_until != dst_live) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "Destination block index ", index, " is covered to ",
+              covered_until, " of ", dst_live,
+              " live bytes; only the final block may be partial", dst_suffix));
+        }
+        dst_extents.push_back(covered_until);
       }
-      if (index != dst_ids_g.size() - 1 && covered_until != dst_live) {
-        return absl::InvalidArgumentError(
-            absl::StrCat("Destination block index ", index, " is covered to ",
-                         covered_until, " of ", dst_live,
-                         " live bytes; only the final block may be partial"));
+      if (d == 0) {
+        extents = std::move(dst_extents);
+      } else if (dst_extents != extents) {
+        // One extent vector per group travels to every receiver; sharded
+        // destinations must therefore cover the same byte prefix of every
+        // destination block (true for head-split caches by construction).
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Destination units must share uniform coverage extents for tag ",
+            PyStrRepr(plan_tag), "; destination unit ", d,
+            " differs from destination unit 0"));
       }
-      extents.push_back(covered_until);
     }
     if (declared_total != covered_total + tag_clipped_bytes) {
       if (tag_clipped_bytes == 0) {
@@ -765,9 +810,13 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
           ", clipped=", tag_clipped_bytes));
     }
     {
+      // Every destination covers extent_sum bytes; replicated spans are
+      // counted once in covered_total but reach all num_dst destinations.
       int64_t extent_sum = 0;
       for (int64_t extent : extents) extent_sum += extent;
-      if (covered_total != extent_sum) {
+      if (static_cast<int64_t>(num_dst) * extent_sum !=
+          covered_total +
+              static_cast<int64_t>(num_dst - 1) * replicated_total) {
         return absl::InternalError("byte coverage accounting failed");
       }
     }
@@ -802,6 +851,15 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
       const int64_t src_block_id =
           ordered.entry->block_ids[span.src_block_ordinal];
       const int64_t dst_block_id = dst_ids_g[span.dst_block_index];
+      // A span without an ordinal replicates its chunks to every
+      // destination (entries differ only in dst_peer); a span with an
+      // ordinal reaches that destination only.
+      std::vector<RaidenId> targets;
+      if (span.dst_unit_ordinal < 0) {
+        targets = request.dst_units;
+      } else {
+        targets.push_back(request.dst_units[span.dst_unit_ordinal]);
+      }
       for (int32_t repeat = 0; repeat < span.count; ++repeat) {
         const int64_t src_offset =
             span.src_offset_bytes + repeat * span.src_stride_bytes;
@@ -812,17 +870,13 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
                               src_offset, dst_offset, span.size_bytes);
         if (!translated.ok()) return translated.status();
         emitted_chunks += static_cast<int64_t>(translated->size()) *
-                          static_cast<int64_t>(request.dst_units.size());
+                          static_cast<int64_t>(targets.size());
         if (emitted_chunks > kMaxLiveSegments) {
           return absl::InvalidArgumentError(
               "Byte-span plan exceeds the live-region expansion bound");
         }
-        // Replicated caches: every destination receives the identical
-        // chunk, so emission is the (chunk x destination) cross product and
-        // entries differ only in dst_peer. For supporting sharded
-        // destionations, this needs to be updated.
         for (const LiveCopyChunk& chunk : *translated) {
-          for (const RaidenId& dst_unit_id : request.dst_units) {
+          for (const RaidenId& dst_unit_id : targets) {
             ScheduleEntry schedule_entry;
             schedule_entry.dst_peer = dst_peers.at(dst_unit_id);
             schedule_entry.dst_shard_idx = 0;
@@ -841,7 +895,7 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
         }
       }
       auto& sender_pairs = transfer_pairs_per_sender[src_unit];
-      for (const RaidenId& dst_unit_id : request.dst_units) {
+      for (const RaidenId& dst_unit_id : targets) {
         sender_pairs[dst_unit_id].insert(std::make_tuple(
             dst_peers.at(dst_unit_id), src_block_id, dst_block_id));
       }
@@ -860,12 +914,15 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
       }
       expected_pushes_by_dst[dst_unit_id] = static_cast<int32_t>(dst_pushes);
     }
-    const int64_t group_expected_pushes =
-        expected_pushes_by_dst.at(request.dst_units[0]);
-    if (group_expected_pushes <= 0) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("Pool reshard plan contains no source pushes for tag ",
-                       PyStrRepr(plan_tag)));
+    for (const RaidenId& dst_unit_id : request.dst_units) {
+      if (expected_pushes_by_dst.at(dst_unit_id) <= 0) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Pool reshard plan contains no source pushes for tag ",
+            PyStrRepr(plan_tag),
+            num_dst > 1
+                ? absl::StrCat(" at destination unit ", PythonRepr(dst_unit_id))
+                : ""));
+      }
     }
     PlanPoolGroup group;
     group.pool_indices = precheck.selected;

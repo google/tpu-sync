@@ -243,6 +243,62 @@ class ReshardStackTest : public ::testing::Test {
     ASSERT_TRUE(resp.success()) << resp.message();
   }
 
+  // One rank's page-indexed "fa" declaration over one source block whose
+  // spans are routed per destination unit (dst_unit_ordinal >= 0) or
+  // replicated (ordinal -1 = absent on the wire). Returns the controller
+  // response so callers can assert on refusals.
+  struct RoutedSpan {
+    int64_t src_offset;
+    int64_t dst_index;
+    int64_t dst_offset;
+    int64_t size;
+    int32_t dst_unit_ordinal;
+  };
+  tpu_sync::rpc::ControllerResponse RegisterRoutedSpans(
+      int rank, const std::string& req_id, int64_t uuid, int64_t src_block,
+      const std::vector<RoutedSpan>& spans) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_REGISTER_REQUEST_BLOCKS);
+    auto* block_req = req.mutable_register_request_blocks_request();
+    block_req->set_req_id(req_id);
+    block_req->set_uuid(uuid);
+    *block_req->mutable_unit() = RaidenIdToProto(Unit(rank));
+    block_req->add_block_ids(src_block);
+    auto* entry = block_req->add_pool_spans();
+    entry->set_tag("fa");
+    entry->add_block_ids(src_block);
+    int64_t declared = 0;
+    for (const RoutedSpan& span : spans) {
+      auto* out = entry->add_spans();
+      out->set_src_block_ordinal(0);
+      out->set_src_offset_bytes(span.src_offset);
+      out->set_dst_block_index(span.dst_index);
+      out->set_dst_offset_bytes(span.dst_offset);
+      out->set_size_bytes(span.size);
+      out->set_count(1);
+      if (span.dst_unit_ordinal != -1) {
+        out->set_dst_unit_ordinal(span.dst_unit_ordinal);
+      }
+      declared += span.size;
+    }
+    entry->set_declared_bytes(declared);
+    entry->set_dst_space_version(0);
+    return HandleController(req.SerializeAsString());
+  }
+
+  // Two sources (live 1024) feeding two head-shard destinations (live 512):
+  // the TP2 shape where each destination receives a different half of
+  // every source block.
+  void RegisterShardedPair() {
+    RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                     /*num_blocks=*/16, /*num_dst=*/0);
+    RegisterDstUnit(0, /*num_src=*/2, /*live=*/512, /*stride=*/512,
+                    /*num_blocks=*/16);
+    RegisterDstUnit(1, /*num_src=*/2, /*live=*/512, /*stride=*/512,
+                    /*num_blocks=*/16);
+  }
+
   tpu_sync::rpc::ControlResponse Handle(const std::string& bytes) {
     tpu_sync::rpc::ControlResponse resp;
     resp.ParseFromString(service_->HandleFrame(bytes));
@@ -710,6 +766,169 @@ TEST_F(ReshardStackTest, MismatchedDestinationsFailClosed) {
   tpu_sync::rpc::ControllerResponse ok =
       Coordinate("req-mcgeo", 62, 1, {7}, /*dst_skip=*/{}, /*num_dst=*/2);
   EXPECT_TRUE(ok.success()) << ok.message();
+}
+
+// Sharded destinations: every span names its destination unit; each receiver
+// is armed with only its own bytes and push count, while one sender program
+// carries both peers with different source offsets.
+TEST_F(ReshardStackTest, TwoDestinationsShardedSpansRouteBytesPerReceiver) {
+  RegisterShardedPair();
+  // Rank 0 owns source block 3 -> destination block index 0; rank 1 owns
+  // source block 5 -> destination block index 1. Destination unit d takes
+  // the source half at offset d*512.
+  ASSERT_TRUE(RegisterRoutedSpans(0, "req-sh", 70, 3,
+                                  {{0, 0, 0, 512, 0}, {512, 0, 0, 512, 1}})
+                  .success());
+  ASSERT_TRUE(RegisterRoutedSpans(1, "req-sh", 70, 5,
+                                  {{0, 1, 0, 512, 0}, {512, 1, 0, 512, 1}})
+                  .success());
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-sh", 70, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_TRUE(resp.success()) << resp.message();
+
+  // 2 concurrent arms, then 2 sender dispatches.
+  ASSERT_EQ(transport_.calls_.size(), 4u);
+  for (int i = 0; i < 2; ++i) {
+    tpu_sync::rpc::ControlRequest arm;
+    ASSERT_TRUE(arm.ParseFromString(transport_.calls_[i].second));
+    const auto& start_req = arm.start_transfer_request();
+    EXPECT_FALSE(start_req.is_sender());
+    ASSERT_EQ(start_req.dst_units_size(), 1);
+    const bool is_dst0 = transport_.calls_[i].first == "10.0.0.2:9600";
+    const std::string own_peer = is_dst0 ? "10.0.0.2:9400" : "10.0.0.2:9401";
+    const int64_t own_src_offset = is_dst0 ? 0 : 512;
+    // Both senders contribute exactly one entry each, addressed to this
+    // receiver's endpoint, sourced from this destination's half.
+    ASSERT_EQ(start_req.shard_push_schedules_size(), 2);
+    for (const auto& keyed_schedule : start_req.shard_push_schedules()) {
+      ASSERT_EQ(keyed_schedule.second.entries_size(), 1);
+      const auto& entry = keyed_schedule.second.entries(0);
+      EXPECT_EQ(entry.dst_peer(), own_peer);
+      EXPECT_EQ(entry.src_offset_bytes(), own_src_offset);
+      EXPECT_EQ(entry.dst_offset_bytes(), 0);
+      EXPECT_EQ(entry.size_bytes(), 512);
+    }
+    ASSERT_EQ(start_req.pool_groups_size(), 1);
+    EXPECT_EQ(start_req.pool_groups(0).expected_pushes(), 2);
+    ASSERT_EQ(start_req.pool_groups(0).dst_expected_extent_bytes_size(), 2);
+    EXPECT_EQ(start_req.pool_groups(0).dst_expected_extent_bytes(0), 512);
+    EXPECT_EQ(start_req.pool_groups(0).dst_expected_extent_bytes(1), 512);
+  }
+  for (int i = 2; i < 4; ++i) {
+    tpu_sync::rpc::ControlRequest dispatch;
+    ASSERT_TRUE(dispatch.ParseFromString(transport_.calls_[i].second));
+    const auto& start_req = dispatch.start_transfer_request();
+    EXPECT_TRUE(start_req.is_sender());
+    EXPECT_EQ(start_req.dst_units_size(), 2);
+    ASSERT_EQ(start_req.shard_push_schedules_size(), 1);
+    const auto& schedule = start_req.shard_push_schedules().at(0);
+    // One entry per destination, each with that destination's source half.
+    ASSERT_EQ(schedule.entries_size(), 2);
+    for (const auto& entry : schedule.entries()) {
+      const int64_t expected_src =
+          entry.dst_peer() == "10.0.0.2:9400" ? 0 : 512;
+      EXPECT_EQ(entry.src_offset_bytes(), expected_src);
+      EXPECT_EQ(entry.dst_offset_bytes(), 0);
+      EXPECT_EQ(entry.size_bytes(), 512);
+    }
+    EXPECT_NE(schedule.entries(0).dst_peer(), schedule.entries(1).dst_peer());
+    // Senders carry the largest per-destination push count.
+    ASSERT_EQ(start_req.pool_groups_size(), 1);
+    EXPECT_EQ(start_req.pool_groups(0).expected_pushes(), 2);
+  }
+}
+
+TEST_F(ReshardStackTest, ShardedSpanOrdinalOutOfRangeFailsClosed) {
+  RegisterShardedPair();
+  // Ordinal 2 with two destination units: accepted by the registry (the
+  // upper bound is a plan-time fact), refused by the planner.
+  ASSERT_TRUE(RegisterRoutedSpans(0, "req-oob", 71, 3,
+                                  {{0, 0, 0, 512, 0}, {512, 0, 0, 512, 2}})
+                  .success());
+  ASSERT_TRUE(RegisterRoutedSpans(1, "req-oob", 71, 5,
+                                  {{0, 1, 0, 512, 0}, {512, 1, 0, 512, 1}})
+                  .success());
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-oob", 71, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("dst_unit_ordinal 2 exceeds"));
+  EXPECT_TRUE(transport_.calls_.empty());
+}
+
+TEST_F(ReshardStackTest, ShardedDestinationWithoutCoverageFailsClosed) {
+  RegisterShardedPair();
+  // Everything routed to destination 0: destination 1 has no bytes.
+  ASSERT_TRUE(RegisterRoutedSpans(0, "req-nocov", 72, 3, {{0, 0, 0, 512, 0}})
+                  .success());
+  ASSERT_TRUE(RegisterRoutedSpans(1, "req-nocov", 72, 5, {{0, 1, 0, 512, 0}})
+                  .success());
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-nocov", 72, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("has no declared coverage"));
+  EXPECT_THAT(resp.message(), HasSubstr("at destination unit 1"));
+  EXPECT_TRUE(transport_.calls_.empty());
+}
+
+TEST_F(ReshardStackTest, ShardedNonUniformExtentsFailClosed) {
+  RegisterShardedPair();
+  // A single (final) destination block: destination 0 gets 512 bytes,
+  // destination 1 only 256 — both prefix-shaped, but the group carries one
+  // extent vector, so the shards must agree.
+  ASSERT_TRUE(RegisterRoutedSpans(0, "req-ext", 73, 3,
+                                  {{0, 0, 0, 512, 0}, {512, 0, 0, 256, 1}})
+                  .success());
+  ASSERT_TRUE(RegisterRoutedSpans(1, "req-ext", 73, 5, {}).success());
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-ext", 73, 2, {7}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("uniform coverage extents"));
+  EXPECT_TRUE(transport_.calls_.empty());
+}
+
+TEST_F(ReshardStackTest, NegativeOrdinalRejectedAtRegistration) {
+  RegisterShardedPair();
+  tpu_sync::rpc::ControllerResponse resp =
+      RegisterRoutedSpans(0, "req-neg", 74, 3, {{0, 0, 0, 512, -2}});
+  ASSERT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("dst_unit_ordinal must be -1"));
+}
+
+// Mixed routing: a replicated span (no ordinal) reaches both destinations
+// while routed spans reach one each; coverage and pushes account per
+// destination.
+TEST_F(ReshardStackTest, ReplicatedAndRoutedSpansCombine) {
+  RegisterShardedPair();
+  // Rank 0: block index 0 replicated (the same 512 bytes to both);
+  // rank 1: block index 1 sharded.
+  ASSERT_TRUE(
+      RegisterRoutedSpans(0, "req-mix", 75, 3, {{0, 0, 0, 512, -1}}).success());
+  ASSERT_TRUE(RegisterRoutedSpans(1, "req-mix", 75, 5,
+                                  {{0, 1, 0, 512, 0}, {512, 1, 0, 512, 1}})
+                  .success());
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-mix", 75, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_TRUE(resp.success()) << resp.message();
+  ASSERT_EQ(transport_.calls_.size(), 4u);
+  for (int i = 0; i < 2; ++i) {
+    tpu_sync::rpc::ControlRequest arm;
+    ASSERT_TRUE(arm.ParseFromString(transport_.calls_[i].second));
+    const auto& start_req = arm.start_transfer_request();
+    int entries = 0;
+    for (const auto& keyed_schedule : start_req.shard_push_schedules()) {
+      entries += keyed_schedule.second.entries_size();
+    }
+    EXPECT_EQ(entries, 2);
+    EXPECT_EQ(start_req.pool_groups(0).expected_pushes(), 2);
+  }
+  for (int i = 2; i < 4; ++i) {
+    tpu_sync::rpc::ControlRequest dispatch;
+    ASSERT_TRUE(dispatch.ParseFromString(transport_.calls_[i].second));
+    const auto& schedule =
+        dispatch.start_transfer_request().shard_push_schedules().at(0);
+    // Rank 0 (replicated): 2 entries (one per peer); rank 1 (sharded): 2.
+    EXPECT_EQ(schedule.entries_size(), 2);
+  }
 }
 
 TEST_F(ReshardStackTest, LegacyCommandsFailClosed) {

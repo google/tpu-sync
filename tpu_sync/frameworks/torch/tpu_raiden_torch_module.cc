@@ -138,18 +138,25 @@ std::vector<reshard::ClientPoolSpans> SpansOf(nb::handle sequence) {
     entry.dst_space_version =
         static_cast<int32_t>(DictInt(d, "dst_space_version", 0));
     for (nb::handle span_item : d["spans"]) {
-      auto t = nb::cast<std::tuple<int64_t, int64_t, int64_t, int64_t,
-                                   int64_t, int64_t, int64_t, int64_t>>(
-          span_item);
+      // 8 fields (legacy) or 9 with the trailing dst_unit_ordinal (-1 =
+      // every destination, >= 0 = one destination unit).
+      nb::tuple t = nb::cast<nb::tuple>(span_item);
+      if (t.size() != 8 && t.size() != 9) {
+        throw std::runtime_error(
+            "byte span tuple must have 8 fields (9 with dst_unit_ordinal)");
+      }
       reshard::ClientByteSpan span;
-      span.src_block_ordinal = std::get<0>(t);
-      span.src_offset_bytes = std::get<1>(t);
-      span.dst_block_index = std::get<2>(t);
-      span.dst_offset_bytes = std::get<3>(t);
-      span.size_bytes = std::get<4>(t);
-      span.src_stride_bytes = std::get<5>(t);
-      span.dst_stride_bytes = std::get<6>(t);
-      span.count = std::get<7>(t);
+      span.src_block_ordinal = nb::cast<int64_t>(t[0]);
+      span.src_offset_bytes = nb::cast<int64_t>(t[1]);
+      span.dst_block_index = nb::cast<int64_t>(t[2]);
+      span.dst_offset_bytes = nb::cast<int64_t>(t[3]);
+      span.size_bytes = nb::cast<int64_t>(t[4]);
+      span.src_stride_bytes = nb::cast<int64_t>(t[5]);
+      span.dst_stride_bytes = nb::cast<int64_t>(t[6]);
+      span.count = nb::cast<int64_t>(t[7]);
+      if (t.size() == 9) {
+        span.dst_unit_ordinal = static_cast<int32_t>(nb::cast<int64_t>(t[8]));
+      }
       entry.spans.push_back(span);
     }
     out.push_back(std::move(entry));

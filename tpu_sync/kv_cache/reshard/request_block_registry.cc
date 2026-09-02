@@ -217,6 +217,12 @@ absl::Status RequestBlockRegistry::Register(
           return absl::InvalidArgumentError(absl::StrCat(
               "byte span fields must be non-negative (", tag, ")"));
         }
+        if (span.dst_unit_ordinal < -1) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "byte span dst_unit_ordinal must be -1 (every destination) or "
+              "a non-negative destination index (",
+              tag, ")"));
+        }
         if (span.src_block_ordinal < 0 ||
             span.src_block_ordinal >= static_cast<int64_t>(entry_ids.size())) {
           return absl::InvalidArgumentError(

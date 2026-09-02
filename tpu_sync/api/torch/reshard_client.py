@@ -50,7 +50,6 @@ SUPPORTS_DST_SKIP_BYTES = bool(
     getattr(_impl, "reshard_client_supports_dst_skip_bytes", False))
 
 
-
 def _unit_tuple(unit: Any) -> tuple:
   """Duck-typed: accepts the rpc dataclass, the bound RaidenId, or alikes."""
   return (
@@ -59,6 +58,12 @@ def _unit_tuple(unit: Any) -> tuple:
       str(getattr(unit, "data_name", "")),
       int(getattr(unit, "data_replica_idx", 0)),
   )
+
+
+def _dst_unit_ordinal(span: Any) -> int:
+  """-1 = every destination (absent on the wire); >= 0 = one destination."""
+  value = getattr(span, "dst_unit_ordinal", None)
+  return -1 if value is None else int(value)
 
 
 def _span_entry_dict(entry: Any) -> dict:
@@ -77,6 +82,7 @@ def _span_entry_dict(entry: Any) -> dict:
               int(span.src_stride_bytes),
               int(span.dst_stride_bytes),
               int(span.count),
+              _dst_unit_ordinal(span),
           )
           for span in entry.spans
       ],

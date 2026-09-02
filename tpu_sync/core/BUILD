@@ -369,6 +369,40 @@ cc_test(
     ],
 )
 
+# Pure helper: how many (pool, peer) push completions a sender-side pool
+# reshard plan produces (multi-destination aware). Header-only over the
+# service proto so it unit-tests without a device-attached manager.
+cc_library(
+    name = "pool_reshard_send_slots",
+    srcs = ["pool_reshard_send_slots.cc"],
+    hdrs = ["pool_reshard_send_slots.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+    ],
+)
+
+cc_test(
+    name = "pool_reshard_send_slots_test",
+    srcs = ["pool_reshard_send_slots_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":pool_reshard_send_slots",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "kv_cache_manager_with_transfer",
     srcs = [
@@ -386,6 +420,7 @@ cc_library(
     deps = [
         ":host_memory_allocator",
         ":metrics_collector",
+        ":pool_reshard_send_slots",
         ":raiden_manager_base",
         ":raiden_transfer_endpoint",
         ":raw_transfer_core",

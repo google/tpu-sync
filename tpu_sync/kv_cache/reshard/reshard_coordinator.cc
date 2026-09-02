@@ -150,11 +150,19 @@ tpu_sync::rpc::StartTransferRequest BuildStartTransferForTarget(
     for (int64_t block_id : group.dst_device_block_ids) {
       group_proto->add_dst_device_block_ids(block_id);
     }
-    const RaidenId& count_key = is_receiver ? target : plan.dst_units[0];
     int32_t expected_pushes = 0;
-    auto by_dst_it = group.expected_pushes_by_dst.find(count_key);
-    if (by_dst_it != group.expected_pushes_by_dst.end()) {
-      expected_pushes = by_dst_it->second;
+    if (is_receiver) {
+      auto by_dst_it = group.expected_pushes_by_dst.find(target);
+      if (by_dst_it != group.expected_pushes_by_dst.end()) {
+        expected_pushes = by_dst_it->second;
+      }
+    } else {
+      // Senders carry the largest per-destination count: sender-side plan
+      // validation only requires a positive value, and with sharded
+      // destinations the per-receiver counts differ.
+      for (const auto& [unit, count] : group.expected_pushes_by_dst) {
+        expected_pushes = std::max(expected_pushes, count);
+      }
     }
     group_proto->set_expected_pushes(expected_pushes);
     for (int64_t extent : group.dst_expected_extent_bytes) {

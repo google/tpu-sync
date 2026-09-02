@@ -31,6 +31,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -40,7 +41,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <cstdlib>
 #include <optional>
 #include <ratio>
 #include <set>
@@ -67,6 +67,7 @@
 #include "xla/tsl/platform/errors.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/metrics_collector.h"
+#include "tpu_sync/core/pool_reshard_send_slots.h"
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -1294,8 +1295,15 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
   state->req_id = plan.req_id();
   state->uuid = plan.uuid();
   state->parallelism = parallelism;
+  // One completion per (pool, peer-with-entries): with sharded destinations
+  // a group may push each of its pools to a single peer, so pools x peers
+  // would wait for completions that never come (tpu-sync follow-up on #744).
   state->remaining_pool_peer_pushes =
-      plan.transfer_pool_indices_size() * peers.size();
+      static_cast<int>(CountPoolReshardSendSlots(plan, schedule_it->second));
+  if (state->remaining_pool_peer_pushes <= 0) {
+    (void)kv_cache::KVCacheManagerBase::UnregisterActivePlan(plan.uuid());
+    return absl::InvalidArgumentError("sender plan schedules no pushes");
+  }
   state->plan = plan;
   state->deadline = DeadlineFromNow();
   {
@@ -1342,12 +1350,10 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
       pool_src_block_ids.assign(group_src_ids.begin(), group_src_ids.end());
       if (pool_src_block_ids.empty()) {
         // This sender owns none of the group's bytes (e.g. a PCP rank whose
-        // interleave slices all fall past a short prefix): release the pool's
-        // per-peer completion slots instead of failing the plan. The
+        // interleave slices all fall past a short prefix, or a state group
+        // this sender routes to no destination): the pool produces no push
+        // and CountPoolReshardSendSlots counted no slot for it. The
         // receiver's expected pushes count only senders with scheduled pairs.
-        for (size_t peer_idx = 0; peer_idx < peers.size(); ++peer_idx) {
-          FinishPoolReshardSend(plan.uuid(), absl::OkStatus());
-        }
         continue;
       }
     }

@@ -43,6 +43,11 @@ struct PoolByteSpan {
   int64_t src_stride_bytes = 0;
   int64_t dst_stride_bytes = 0;
   int32_t count = 1;
+  // Multi-destination routing: -1 (absent on the wire) = the span reaches
+  // every destination unit of the transfer (replicated caches, and the
+  // legacy single-destination meaning); >= 0 = index into the coordinate
+  // request's dst_units, that destination only (sharded destinations).
+  int32_t dst_unit_ordinal = -1;
 
   friend bool operator==(const PoolByteSpan& a, const PoolByteSpan& b) {
     return a.src_block_ordinal == b.src_block_ordinal &&
@@ -51,7 +56,8 @@ struct PoolByteSpan {
            a.dst_offset_bytes == b.dst_offset_bytes &&
            a.size_bytes == b.size_bytes &&
            a.src_stride_bytes == b.src_stride_bytes &&
-           a.dst_stride_bytes == b.dst_stride_bytes && a.count == b.count;
+           a.dst_stride_bytes == b.dst_stride_bytes && a.count == b.count &&
+           a.dst_unit_ordinal == b.dst_unit_ordinal;
   }
 };
 

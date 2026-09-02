@@ -653,7 +653,8 @@ StartTransferRequest TwoGroupPlan(int64_t uuid) {
   return plan;
 }
 
-TEST(PoolReshardSendTest, SenderWithNoBytesForAnyTransferredPoolCompletes) {
+TEST(PoolReshardSendTest,
+     SenderWithNoBytesForAnyTransferredPoolRefusedUpFront) {
   TestManager manager;
   ASSERT_TRUE(
       manager.RegisterPools({DensePool("fa"), DensePool("state")}).ok());
@@ -661,22 +662,19 @@ TEST(PoolReshardSendTest, SenderWithNoBytesForAnyTransferredPoolCompletes) {
 
   // The sender's only schedule entry names group 1, while the transfer set
   // holds just pool 0 (group 0) — the shape of a PCP rank owning no bytes of
-  // any transferred pool. Such a sender must finish as done_sending with no
-  // device work; failing the plan here is the regression that turned a
-  // short-prefix transfer into a plan-wide INVALID_ARGUMENT.
+  // any transferred pool. With CountPoolReshardSendSlots, a plan that
+  // schedules zero pushes is refused up front (and unregisters itself).
   StartTransferRequest plan = TwoGroupPlan(/*uuid=*/2004);
   (*plan.mutable_shard_push_schedules())[0].mutable_entries(0)->set_pool_group(
       1);
 
   const absl::Status push_status =
       manager.PoolReshardPush(plan, std::vector<int64_t>{0});
-  ASSERT_TRUE(push_status.ok()) << push_status.ToString();
-
-  const auto [done_sending, done_recving, failed_recving] =
-      manager.CompleteReadRaw();
-  EXPECT_EQ(done_sending, std::vector<std::string>{plan.req_id()});
-  EXPECT_TRUE(done_recving.empty()) << done_recving.size();
-  EXPECT_TRUE(failed_recving.empty()) << failed_recving.size();
+  EXPECT_FALSE(push_status.ok());
+  EXPECT_EQ(push_status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(push_status.message(),
+              ::testing::HasSubstr("sender plan schedules no pushes"));
+  EXPECT_FALSE(manager.HasActivePlan(plan.uuid()));
 }
 
 TEST(PoolReshardRecvTest, FinishPoolReshardRecvRecordsDurationMetric) {

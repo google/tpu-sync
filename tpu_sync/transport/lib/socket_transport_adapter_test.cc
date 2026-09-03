@@ -242,5 +242,56 @@ TEST(SocketTransportAdapterTest, PostSocketPushOp6ExplicitPushSuccess) {
   ASSERT_THAT(push_result, IsOkAndHolds(::testing::ElementsAre(55)));
 }
 
+TEST(SocketTransportAdapterTest, PostSocketPullOp2Success) {
+  auto server_handler = [](int client_fd,
+                           const ChunkHeader& header) -> absl::Status {
+    if (header.op != 2) {
+      return absl::InvalidArgumentError("Expected op 2");
+    }
+    // Echo back pull response header with identical count_or_size and flags.
+    ChunkHeader resp = header;
+    const auto s_resp = SerializeChunkHeader(resp);
+    if (auto s =
+            ::peregrine::WriteExact(client_fd, s_resp.data(), s_resp.size());
+        !s.ok()) {
+      return s;
+    }
+
+    std::vector<uint8_t> payload = {1, 2, 3, 4};
+    const auto s_size = SerializeChunkSize(payload.size());
+    if (auto s =
+            ::peregrine::WriteExact(client_fd, s_size.data(), s_size.size());
+        !s.ok()) {
+      return s;
+    }
+    return ::peregrine::WriteExact(client_fd, payload.data(), payload.size());
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+
+  std::vector<uint8_t> recv_buf(4, 0);
+  Request req = {};
+  req.socket_opcode = 2;
+  req.laddr = recv_buf.data();
+  req.len = recv_buf.size();
+  req.count_or_size = 1;
+  req.remote_id = 10;
+  req.local_id = 20;
+  req.uuid = 99;
+  req.parallelism = 1;
+  req.request_id = 0;
+  req.stream_idx = 0;
+
+  auto handle = client_adapter.Post(
+      /*peers=*/{GetIpPort(server_transport)},
+      /*requests=*/absl::MakeConstSpan(&req, 1));
+
+  ASSERT_THAT(handle.status(), absl_testing::IsOk());
+  EXPECT_THAT(recv_buf, ::testing::ElementsAre(1, 2, 3, 4));
+}
+
 }  // namespace
 }  // namespace tpu_raiden::transport::lib

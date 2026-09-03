@@ -52,6 +52,7 @@ namespace lib {
 namespace {
 
 using ::peregrine::ReadExact;
+using ::peregrine::ReadVExact;
 using ::peregrine::WriteExact;
 using ::peregrine::WriteVExact;
 using ::tpu_raiden::telemetry::MetricLabel;
@@ -62,6 +63,18 @@ namespace metric_names = ::tpu_raiden::telemetry::metric_names;
 constexpr MetricLabel kPushLabels[] = {
     {.key = metric_labels::kDirection, .value = metric_labels::kDirectionPush},
 };
+
+constexpr MetricLabel kPullResponseLabels[] = {
+    {.key = metric_labels::kDirection,
+     .value = metric_labels::kDirectionPullResponse},
+};
+
+absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
+  if (on_complete) {
+    on_complete(status);
+  }
+  return status;
+}
 
 }  // namespace
 
@@ -143,24 +156,23 @@ absl::StatusOr<Handle> SocketTransportAdapter::Post(
     absl::Span<const int> src_block_ids, absl::Span<const int> dst_block_ids,
     CompletionCallback on_complete) {
   if (requests.empty()) {
-    if (on_complete) {
-      on_complete(absl::InvalidArgumentError("Requests cannot be empty"));
-    }
-    return absl::InvalidArgumentError("Requests cannot be empty");
+    return ReportError(on_complete,
+                       absl::InvalidArgumentError("Requests cannot be empty"));
   }
 
   const uint8_t opcode = requests.front().socket_opcode;
-  if (opcode == 1 || opcode == 6) {
-    return PostSocketPush(peers, requests, src_block_ids, dst_block_ids,
-                          std::move(on_complete));
+  switch (opcode) {
+    case 1:
+    case 6:
+      return PostSocketPush(peers, requests, src_block_ids, dst_block_ids,
+                            std::move(on_complete));
+    case 2:
+      return PostSocketPull(peers, requests, std::move(on_complete));
+    default:
+      return ReportError(on_complete,
+                         absl::UnimplementedError(absl::StrCat(
+                             "Unsupported socket opcode: ", opcode)));
   }
-
-  const auto status = absl::UnimplementedError(
-      absl::StrCat("Unsupported socket opcode: ", opcode));
-  if (on_complete) {
-    on_complete(status);
-  }
-  return status;
 }
 
 absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
@@ -173,12 +185,8 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
   const int layer_idx = req.layer_idx;
   const int P = req.parallelism;
   if (P <= 0) {
-    const auto status =
-        absl::InvalidArgumentError("parallelism must be positive");
-    if (on_complete) {
-      on_complete(status);
-    }
-    return status;
+    return ReportError(on_complete, absl::InvalidArgumentError(
+                                        "parallelism must be positive"));
   }
 
   auto shared_requests =
@@ -378,6 +386,187 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
   s = ReadExact(fd, &ack, 1);
   if (!s.ok() || ack != 1) {
     return absl::InternalError("Push verification failed");
+  }
+
+  ok_to_pool = true;
+  return absl::OkStatus();
+}
+
+absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPull(
+    absl::Span<const std::string> peers, absl::Span<const Request> requests,
+    CompletionCallback on_complete) {
+  if (requests.empty()) {
+    return ReportError(on_complete, absl::InvalidArgumentError(
+                                        "requests list cannot be empty"));
+  }
+  if (peers.empty()) {
+    return ReportError(
+        on_complete, absl::InvalidArgumentError("peers list cannot be empty"));
+  }
+  const auto& req = requests.front();
+  const int P = req.parallelism;
+  if (P <= 0) {
+    return ReportError(on_complete, absl::InvalidArgumentError(
+                                        "parallelism must be positive"));
+  }
+
+  std::vector<std::thread> threads;
+  std::vector<absl::Status> statuses(P, absl::OkStatus());
+
+  threads.reserve(P);
+
+  size_t req_offset = 0;
+  for (int i = 0; i < P; ++i) {
+    size_t req_end = req_offset;
+    while (req_end < requests.size() && requests[req_end].stream_idx == i) {
+      ++req_end;
+    }
+
+    absl::Span<const Request> stream_requests =
+        requests.subspan(req_offset, req_end - req_offset);
+    req_offset = req_end;
+
+    const auto local_ips = raw_transport_->local_ips();
+    const size_t n = local_ips.size();
+    const std::string local_ip = n >= 1 ? local_ips[i % n] : "";
+    const std::string remote_peer = peers[i % peers.size()];
+
+    threads.emplace_back(
+        [this, i, remote_peer, local_ip, stream_requests, &statuses]() {
+          statuses[i] =
+              PostSocketPullInternal(remote_peer, local_ip, stream_requests);
+        });
+  }
+
+  for (auto& t : threads) {
+    if (t.joinable()) t.join();
+  }
+
+  if (req_offset != requests.size()) {
+    return ReportError(
+        on_complete,
+        absl::InvalidArgumentError(
+            "Unprocessed requests remain; requests might be out of order."));
+  }
+
+  for (int i = 0; i < P; ++i) {
+    if (!statuses[i].ok()) {
+      return ReportError(on_complete, statuses[i]);
+    }
+  }
+
+  if (on_complete) {
+    on_complete(std::vector<int>{});
+  }
+  return 0;
+}
+
+absl::Status SocketTransportAdapter::PostSocketPullInternal(
+    absl::string_view peer, absl::string_view local_ip,
+    absl::Span<const Request> requests) {
+  if (requests.empty()) {
+    return absl::OkStatus();
+  }
+
+  const auto& first = requests.front();
+  const uint64_t uuid = first.uuid;
+  const uint8_t major_order = first.major_order;
+  const uint8_t socket_opcode = first.socket_opcode;
+
+  auto borrowed_fd = raw_transport_->BorrowConnection(peer, local_ip);
+  if (!borrowed_fd.ok()) {
+    return borrowed_fd.status();
+  }
+
+  const int fd = borrowed_fd.value();
+  bool ok_to_pool = false;
+  auto fd_cleaner = absl::MakeCleanup([&] {
+    raw_transport_->ReturnConnection(ok_to_pool, fd, peer, local_ip);
+  });
+
+  uint64_t stream_bytes_received = 0;
+
+  for (size_t i = 0; i < requests.size();) {
+    const auto& seg_first = requests[i];
+    const uint32_t remote_read_block_id = seg_first.remote_id;
+    const uint32_t remote_count = seg_first.count_or_size;
+
+    ChunkHeader header = {};
+    header.version = 1;
+    header.op = socket_opcode;
+    header.flags = major_order;
+    header.remote_id = remote_read_block_id;
+    header.count_or_size = remote_count;
+    header.uuid = uuid;
+    const auto s_header = SerializeChunkHeader(header);
+    RETURN_IF_ERROR(WriteExact(fd, s_header.data(), s_header.size()));
+
+    char resp_buf[kChunkHeaderSize];
+    RETURN_IF_ERROR(ReadExact(fd, resp_buf, sizeof(resp_buf)));
+    ASSIGN_OR_RETURN(const ChunkHeader resp_header,
+                     DeserializeChunkHeader(resp_buf));
+    if (resp_header.op != socket_opcode ||
+        resp_header.count_or_size != remote_count) {
+      return absl::InternalError("Unexpected block pull response header");
+    }
+    if (resp_header.flags != major_order) {
+      return absl::InternalError("Unexpected block pull response major order");
+    }
+
+    while (i < requests.size() &&
+           requests[i].remote_id == remote_read_block_id &&
+           requests[i].count_or_size == remote_count) {
+      const uint32_t cur_req_id = requests[i].request_id;
+      const size_t l = static_cast<size_t>(requests[i].layer_idx);
+      const size_t sh = static_cast<size_t>(requests[i].shard_idx);
+      const int dst_id = static_cast<int>(requests[i].local_id);
+
+      size_t j = i;
+      uint32_t expected_size = 0;
+      std::vector<struct iovec> iov;
+      while (j < requests.size() && requests[j].request_id == cur_req_id) {
+        expected_size += static_cast<uint32_t>(requests[j].len);
+        if (requests[j].len > 0) {
+          if (requests[j].laddr == nullptr) {
+            return absl::FailedPreconditionError(
+                "Destination host pointer is null");
+          }
+          iov.push_back(
+              {.iov_base = requests[j].laddr, .iov_len = requests[j].len});
+        }
+        ++j;
+      }
+
+      uint8_t size_buf[kChunkSizeFieldSize];
+      RETURN_IF_ERROR(ReadExact(fd, size_buf, sizeof(size_buf)));
+      const uint32_t sender_size = DeserializeChunkSize(size_buf);
+
+      if (sender_size != expected_size) {
+        return absl::InternalError(absl::StrCat(
+            "Block transfer size mismatch! Sender offered: ", sender_size,
+            " bytes, but Receiver expected: ", expected_size,
+            " bytes for Block ID: ", dst_id));
+      }
+
+      if (expected_size > 0) {
+        RETURN_IF_ERROR(ReadVExact(fd, absl::MakeSpan(iov)));
+        stream_bytes_received += expected_size;
+      }
+
+      if (requests[i].on_block_received != nullptr) {
+        RETURN_IF_ERROR(
+            requests[i].on_block_received(l, sh, dst_id, expected_size));
+      }
+      i = j;
+    }
+  }
+
+  if (stream_bytes_received > 0) {
+    // TODO: Add interface name (e.g. eth0, lo) using
+    // GetSocketLocalNic(fd) as a label key.
+    RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
+        metric_names::kReceivedBytesTotal, kPullResponseLabels,
+        stream_bytes_received);
   }
 
   ok_to_pool = true;

@@ -87,6 +87,15 @@ class SocketTransportAdapter : public TransportAdapter {
                                       size_t block_offset,
                                       std::vector<int>& allocated_ids);
 
+  // Block-level Socket Pull (Op 2).
+  absl::StatusOr<Handle> PostSocketPull(absl::Span<const std::string> peers,
+                                        absl::Span<const Request> requests,
+                                        CompletionCallback on_complete);
+
+  absl::Status PostSocketPullInternal(absl::string_view peer,
+                                      absl::string_view local_ip,
+                                      absl::Span<const Request> requests);
+
  private:
   RawBufferTransport* const raw_transport_;
   const int parallelism_;

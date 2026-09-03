@@ -49,8 +49,7 @@ enum class MajorOrder : uint8_t {
   kBlockMajor = 1,
 };
 
-using BlockReceivedCallback = std::function<absl::Status(
-    size_t layer_idx, size_t shard_idx, int block_id, size_t size_bytes)>;
+using BlockReceivedCallback = lib::BlockReceivedCallback;
 
 // High-speed Key-Value block transport engine.
 class BlockTransport final {
@@ -138,13 +137,12 @@ class BlockTransport final {
   }
 
  private:
-  lib::Request BuildBlockRequest(uint8_t socket_opcode, uint8_t* laddr,
-                                 size_t len, uint32_t count_or_size,
-                                 int layer_idx, uint32_t request_id,
-                                 uint64_t uuid, int parallelism,
-                                 MajorOrder major_order, uint32_t remote_id,
-                                 uint32_t local_id, int shard_idx,
-                                 int stream_idx = 0);
+  lib::Request BuildBlockRequest(
+      uint8_t socket_opcode, uint8_t* laddr, size_t len, uint32_t count_or_size,
+      int layer_idx, uint32_t request_id, uint64_t uuid, int parallelism,
+      MajorOrder major_order, uint32_t remote_id, uint32_t local_id,
+      int shard_idx, int stream_idx = 0,
+      BlockReceivedCallback on_block_received = nullptr);
 
   // Builds a batch of Requests for block transfer.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockRequests(
@@ -157,17 +155,8 @@ class BlockTransport final {
       const std::vector<int>& src_block_ids,
       const std::vector<int>& allocated_ids,
       const std::vector<uint8_t*>& explicit_dst_ptrs, MajorOrder major_order,
-      uint64_t uuid = 0, int parallelism = 1);
-
-  absl::Status PostSocketPull(
-      const std::vector<std::string>& peers,
-      absl::Span<const lib::Request> requests,
-      BlockReceivedCallback on_block_received = {});
-
-  absl::Status PostSocketPullInternal(
-      absl::string_view peer, absl::string_view local_ip,
-      absl::Span<const lib::Request> requests,
-      BlockReceivedCallback on_block_received = {});
+      uint64_t uuid = 0, int parallelism = 1,
+      BlockReceivedCallback on_block_received = nullptr);
 
   absl::Status HandleIncomingPush(int client_fd,
                                   const lib::ChunkHeader& header);

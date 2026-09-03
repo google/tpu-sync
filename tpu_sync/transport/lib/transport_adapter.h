@@ -17,6 +17,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -31,6 +33,10 @@ namespace lib {
 
 // `Handle` uniquely identifies a transport request.
 using Handle = uint32_t;
+
+// Callback invoked when a single block chunk is received during Pull.
+using BlockReceivedCallback = std::function<absl::Status(
+    size_t layer_idx, size_t shard_idx, int block_id, size_t size_bytes)>;
 
 struct Request {
   uint8_t socket_opcode;
@@ -50,6 +56,8 @@ struct Request {
   uint32_t request_id;
   int shard_idx;
   int stream_idx;
+
+  BlockReceivedCallback on_block_received = nullptr;
 };
 
 // Transport operation status.

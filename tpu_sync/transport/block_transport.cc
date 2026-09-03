@@ -814,76 +814,17 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
   ASSIGN_OR_RETURN(
       const auto requests,
       BuildBlockPullRequests(src_block_ids, allocated_ids, explicit_dst_ptrs,
-                             major_order, uuid, P));
+                             major_order, uuid, P, on_block_received));
 
-  RETURN_IF_ERROR(PostSocketPull(peers, requests, on_block_received));
+  RETURN_IF_ERROR(transport_adapter_->Post(peers, requests).status());
   return allocated_ids;
-}
-
-absl::Status BlockTransport::PostSocketPull(
-    const std::vector<std::string>& peers,
-    absl::Span<const lib::Request> requests,
-    BlockReceivedCallback on_block_received) {
-  if (peers.empty()) {
-    return absl::InvalidArgumentError("peers list cannot be empty");
-  }
-  if (requests.empty()) {
-    return absl::OkStatus();
-  }
-  const auto& req = requests.front();
-  const int P = req.parallelism;
-  if (P <= 0) {
-    return absl::InvalidArgumentError("parallelism must be positive");
-  }
-
-  std::vector<std::thread> threads;
-  std::vector<absl::Status> statuses(P, absl::OkStatus());
-
-  threads.reserve(P);
-
-  size_t req_offset = 0;
-  for (int i = 0; i < P; ++i) {
-    size_t req_end = req_offset;
-    while (req_end < requests.size() && requests[req_end].stream_idx == i) {
-      ++req_end;
-    }
-
-    absl::Span<const lib::Request> stream_requests =
-        requests.subspan(req_offset, req_end - req_offset);
-    req_offset = req_end;
-
-    const auto local_ips = raw_transport_.local_ips();
-    const size_t n = local_ips.size();
-    const std::string local_ip = n >= 1 ? local_ips[i % n] : "";
-    const std::string remote_peer = peers[i % peers.size()];
-
-    threads.emplace_back([this, i, remote_peer, local_ip, stream_requests,
-                          on_block_received, &statuses]() {
-      statuses[i] = PostSocketPullInternal(
-          remote_peer, local_ip, stream_requests, on_block_received);
-    });
-  }
-
-  for (auto& t : threads) {
-    if (t.joinable()) t.join();
-  }
-
-  if (req_offset != requests.size()) {
-    return absl::InvalidArgumentError(
-        "Unprocessed requests remain; requests might be out of order.");
-  }
-
-  for (int i = 0; i < P; ++i) {
-    if (!statuses[i].ok()) return statuses[i];
-  }
-  return absl::OkStatus();
 }
 
 lib::Request BlockTransport::BuildBlockRequest(
     uint8_t socket_opcode, uint8_t* laddr, size_t len, uint32_t count_or_size,
     int layer_idx, uint32_t request_id, uint64_t uuid, int parallelism,
     MajorOrder major_order, uint32_t remote_id, uint32_t local_id,
-    int shard_idx, int stream_idx) {
+    int shard_idx, int stream_idx, BlockReceivedCallback on_block_received) {
   return lib::Request{
       .socket_opcode = socket_opcode,
       .laddr = laddr,
@@ -899,6 +840,7 @@ lib::Request BlockTransport::BuildBlockRequest(
       .request_id = request_id,
       .shard_idx = shard_idx,
       .stream_idx = stream_idx,
+      .on_block_received = std::move(on_block_received),
   };
 }
 
@@ -982,14 +924,12 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
   return requests;
 }
 
-
-
 absl::StatusOr<std::vector<lib::Request>>
 BlockTransport::BuildBlockPullRequests(
     const std::vector<int>& src_block_ids,
     const std::vector<int>& allocated_ids,
     const std::vector<uint8_t*>& explicit_dst_ptrs, MajorOrder major_order,
-    uint64_t uuid, int parallelism) {
+    uint64_t uuid, int parallelism, BlockReceivedCallback on_block_received) {
   if (parallelism <= 0) {
     return absl::InvalidArgumentError("parallelism must be positive");
   }
@@ -1018,7 +958,6 @@ BlockTransport::BuildBlockPullRequests(
       return absl::OutOfRangeError(
           "Remote block range exceeds source block list");
     }
-
 
   struct PullChunk {
     size_t local_start_idx;
@@ -1116,8 +1055,8 @@ BlockTransport::BuildBlockPullRequests(
             }
             requests.push_back(BuildBlockRequest(
                 /*socket_opcode=*/2, bc.ptr, bc.size, count_or_size, layer_id,
-                request_id, uuid, parallelism, major_order, remote_id,
-                local_id, shard_idx, /*stream_idx=*/i));
+                request_id, uuid, parallelism, major_order, remote_id, local_id,
+                shard_idx, /*stream_idx=*/i, on_block_received));
           }
           ++request_id;
           return absl::OkStatus();
@@ -1126,117 +1065,6 @@ BlockTransport::BuildBlockPullRequests(
 }
 
   return requests;
-}
-
-absl::Status BlockTransport::PostSocketPullInternal(
-    absl::string_view peer, absl::string_view local_ip,
-    absl::Span<const lib::Request> requests,
-    BlockReceivedCallback on_block_received) {
-  if (requests.empty()) {
-    return absl::OkStatus();
-  }
-
-  const auto& first = requests.front();
-  const uint64_t uuid = first.uuid;
-  const uint8_t major_order = first.major_order;
-  const uint8_t socket_opcode = first.socket_opcode;
-
-  auto borrowed_fd = raw_transport_.BorrowConnection(peer, local_ip);
-  if (!borrowed_fd.ok()) {
-    return borrowed_fd.status();
-  }
-
-  const int fd = borrowed_fd.value();
-  bool ok_to_pool = false;
-  auto fd_cleaner = absl::MakeCleanup(
-      [&] { raw_transport_.ReturnConnection(ok_to_pool, fd, peer, local_ip); });
-
-  uint64_t stream_bytes_received = 0;
-
-  for (size_t i = 0; i < requests.size();) {
-    const auto& seg_first = requests[i];
-    const uint32_t remote_read_block_id = seg_first.remote_id;
-    const uint32_t remote_count = seg_first.count_or_size;
-
-    lib::ChunkHeader header = {};
-    header.version = 1;
-    header.op = socket_opcode;
-    header.flags = major_order;
-    header.remote_id = remote_read_block_id;
-    header.count_or_size = remote_count;
-    header.uuid = uuid;
-    const auto s_header = lib::SerializeChunkHeader(header);
-    RETURN_IF_ERROR(WriteExact(fd, s_header.data(), s_header.size()));
-
-    char resp_buf[lib::kChunkHeaderSize];
-    RETURN_IF_ERROR(ReadExact(fd, resp_buf, sizeof(resp_buf)));
-    ASSIGN_OR_RETURN(const lib::ChunkHeader resp_header,
-                     lib::DeserializeChunkHeader(resp_buf));
-    if (resp_header.op != socket_opcode ||
-        resp_header.count_or_size != remote_count) {
-      return absl::InternalError("Unexpected block pull response header");
-    }
-    if (resp_header.flags != major_order) {
-      return absl::InternalError("Unexpected block pull response major order");
-    }
-
-    while (i < requests.size() &&
-           requests[i].remote_id == remote_read_block_id &&
-           requests[i].count_or_size == remote_count) {
-      const uint32_t cur_req_id = requests[i].request_id;
-      const size_t l = static_cast<size_t>(requests[i].layer_idx);
-      const size_t sh = static_cast<size_t>(requests[i].shard_idx);
-      const int dst_id = static_cast<int>(requests[i].local_id);
-
-      size_t j = i;
-      uint32_t expected_size = 0;
-      std::vector<struct iovec> iov;
-      while (j < requests.size() && requests[j].request_id == cur_req_id) {
-        expected_size += static_cast<uint32_t>(requests[j].len);
-        if (requests[j].len > 0) {
-          if (requests[j].laddr == nullptr) {
-            return absl::FailedPreconditionError(
-                "Destination host pointer is null");
-          }
-          iov.push_back(
-              {.iov_base = requests[j].laddr, .iov_len = requests[j].len});
-        }
-        ++j;
-      }
-
-      uint8_t size_buf[lib::kChunkSizeFieldSize];
-      RETURN_IF_ERROR(ReadExact(fd, size_buf, sizeof(size_buf)));
-      const uint32_t sender_size = lib::DeserializeChunkSize(size_buf);
-
-      if (sender_size != expected_size) {
-        return absl::InternalError(absl::StrCat(
-            "Block transfer size mismatch! Sender offered: ", sender_size,
-            " bytes, but Receiver expected: ", expected_size,
-            " bytes for Block ID: ", dst_id));
-      }
-
-      if (expected_size > 0) {
-        RETURN_IF_ERROR(ReadVExact(fd, absl::MakeSpan(iov)));
-        stream_bytes_received += expected_size;
-      }
-
-      if (on_block_received != nullptr) {
-        RETURN_IF_ERROR(on_block_received(l, sh, dst_id, expected_size));
-      }
-      i = j;
-    }
-  }
-
-  if (stream_bytes_received > 0) {
-    // TODO: Add interface name (e.g. eth0, lo) using
-    // GetSocketLocalNic(fd) as a label key.
-    RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
-        metric_names::kReceivedBytesTotal, kPullResponseLabels,
-        stream_bytes_received);
-  }
-
-  ok_to_pool = true;
-  return absl::OkStatus();
 }
 
 void BlockTransport::ForgetPushProgress(uint64_t uuid) {

@@ -887,6 +887,84 @@ TEST_F(ReshardStackTest, SpansForAnUnregisteredTagAreRefusedAtRegistration) {
               HasSubstr("does not match any registered pool"));
 }
 
+TEST_F(ReshardStackTest, SourceTagsAbsentOnTheDestinationAreIgnored) {
+  // Pipeline-parallel on both sides: prefill stage 0 registers layers 0
+  // and 1, decode stage 0 registers layer 0 only. Planning layer 0 pairs
+  // the shared tag and ignores the source's extra layer.
+  {
+    tpu_sync::rpc::ControlRequest req;
+    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+    auto* reg = req.mutable_register_work_unit_request();
+    *reg->mutable_unit() = RaidenIdToProto(Unit(0));
+    reg->add_shards("10.0.0.1:9000");
+    reg->set_control_plane_rpc_address("10.0.0.1:9100");
+    *reg->add_pools() = MakePool("fa.l0", 1024, 1024, 16);
+    *reg->add_pools() = MakePool("fa.l1", 1024, 1024, 16);
+    reg->set_layout_fingerprint("fp1");
+    reg->set_page_tokens(512);
+    reg->set_transfer_parallelism(1);
+    reg->set_transfer_rank(0);
+    ASSERT_TRUE(Handle(req.SerializeAsString()).success());
+  }
+  {
+    tpu_sync::rpc::ControlRequest req;
+    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+    auto* reg = req.mutable_register_work_unit_request();
+    *reg->mutable_unit() = RaidenIdToProto(DstUnit());
+    reg->add_shards("10.0.0.2:9400");
+    reg->set_control_plane_rpc_address("10.0.0.2:9600");
+    *reg->add_pools() = MakePool("fa.l0", 1024, 1024, 16);
+    reg->set_layout_fingerprint("fp1");
+    reg->set_page_tokens(512);
+    reg->set_transfer_parallelism(1);
+    reg->set_transfer_rank(0);
+    ASSERT_TRUE(Handle(req.SerializeAsString()).success());
+  }
+  {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_REGISTER_REQUEST_BLOCKS);
+    auto* block_req = req.mutable_register_request_blocks_request();
+    block_req->set_req_id("req-pp2pp");
+    block_req->set_uuid(78);
+    *block_req->mutable_unit() = RaidenIdToProto(Unit(0));
+    block_req->add_block_ids(3);
+    for (const char* tag : {"fa.l0", "fa.l1"}) {
+      auto* entry = block_req->add_pool_spans();
+      entry->set_tag(tag);
+      entry->add_block_ids(3);
+      auto* span = entry->add_spans();
+      span->set_size_bytes(1024);
+      span->set_count(1);
+      entry->set_declared_bytes(1024);
+      entry->set_dst_space_version(1);
+    }
+    ASSERT_TRUE(HandleController(req.SerializeAsString()).success());
+  }
+  tpu_sync::rpc::ControllerRequest req;
+  req.set_command(tpu_sync::rpc::ControllerRequest::COMMAND_COORDINATE_TRANSFER);
+  auto* coord = req.mutable_coordinate_transfer_request();
+  *coord->add_src_units() = RaidenIdToProto(Unit(0));
+  *coord->add_dst_units() = RaidenIdToProto(DstUnit());
+  coord->set_uuid(78);
+  coord->set_is_sender(true);
+  coord->set_dst_mem_type(tpu_sync::rpc::MEMORY_TYPE_HBM);
+  coord->set_use_block_chunks(true);
+  coord->set_req_id("req-pp2pp");
+  coord->add_dst_device_block_ids(7);
+  coord->add_transfer_pool_tags("fa.l0");
+  tpu_sync::rpc::ControllerResponse resp =
+      HandleController(req.SerializeAsString());
+  ASSERT_TRUE(resp.success()) << resp.message();
+  ASSERT_EQ(transport_.calls_.size(), 2u);
+  tpu_sync::rpc::ControlRequest dispatch;
+  ASSERT_TRUE(dispatch.ParseFromString(transport_.calls_[1].second));
+  const auto& send_req = dispatch.start_transfer_request();
+  ASSERT_EQ(send_req.transfer_pool_indices_size(), 1);
+  EXPECT_EQ(send_req.transfer_pool_indices(0), 0);
+  ASSERT_EQ(send_req.pool_dtype_tags_size(), 2);
+}
+
 TEST_F(ReshardStackTest, MismatchedDestinationsFailClosed) {
   RegisterAllUnits(/*num_src=*/1, /*live=*/1024, /*stride=*/1024,
                    /*num_blocks=*/16, /*num_dst=*/2);

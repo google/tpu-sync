@@ -243,11 +243,10 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
     return absl::InvalidArgumentError(
         "Destination pool manifest must not be empty");
   }
-  // Pools pair up by tag. A source unit may register a subset of the
-  // destination's tags (a pipeline stage holds a layer subset), but every
-  // tag it registers must carry the destination's pool count and dtype for
-  // that tag, in manifest order; a source tag the destination lacks is a
-  // mismatch.
+  // Pools pair up by tag. Source and destination units may each register a
+  // subset of the model's tags (a pipeline stage holds a layer subset);
+  // every tag both sides register must carry the same pool count and dtype
+  // for that tag, in manifest order.
   std::map<std::string, std::vector<int32_t>> dst_pools_by_tag;
   for (int i = 0; i < dst_meta.pools_size(); ++i) {
     dst_pools_by_tag[dst_meta.pools(i).tag()].push_back(i);
@@ -263,8 +262,11 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
     }
     for (const auto& [tag, src_indices] : by_tag) {
       auto dst_it = dst_pools_by_tag.find(tag);
-      bool matches = dst_it != dst_pools_by_tag.end() &&
-                     dst_it->second.size() == src_indices.size();
+      // A source tag the destination lacks is simply not transferable
+      // (a pipeline-parallel destination stage holds a layer subset too);
+      // requesting it fails below with "do not match any registered pool".
+      if (dst_it == dst_pools_by_tag.end()) continue;
+      bool matches = dst_it->second.size() == src_indices.size();
       for (size_t k = 0; matches && k < src_indices.size(); ++k) {
         matches = src_pools.Get(src_indices[k]).dtype_tag() ==
                   dst_meta.pools(dst_it->second[k]).dtype_tag();

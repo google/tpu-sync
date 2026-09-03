@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/strings/str_join.h"
 #include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -396,6 +397,12 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
       return absl::InternalError(absl::StrCat(
           "No control endpoint recorded for ", PythonRepr(plan.dst_unit)));
     }
+    std::fprintf(stderr,
+                 "{\"event\": \"raiden_pool_reshard_arm\", \"dst_unit\": "
+                 "\"%s\", \"pool_dtype_tags\": \"%s\", \"uuid\": %lld}\n",
+                 PythonRepr(plan.dst_unit).c_str(),
+                 absl::StrJoin(plan.pool_dtype_tags, ",").c_str(),
+                 static_cast<long long>(plan.uuid));
     const std::string arm_payload = EncodeStartTransfer(plan, plan.dst_unit);
     absl::Status arm_status =
         SendWorkerRpc(transport_, addr_it->second, arm_payload);
@@ -462,6 +469,18 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
           return;
         }
         const std::string payload = EncodeStartTransfer(plan, unit);
+        auto tags_it = plan.src_pool_dtype_tags.find(unit);
+        std::fprintf(
+            stderr,
+            "{\"event\": \"raiden_pool_reshard_sender\", \"unit\": \"%s\", "
+            "\"address\": \"%s\", \"pool_dtype_tags\": \"%s\", \"uuid\": "
+            "%lld}\n",
+            PythonRepr(unit).c_str(), addr_it->second.c_str(),
+            (tags_it == plan.src_pool_dtype_tags.end()
+                 ? absl::StrJoin(plan.pool_dtype_tags, ",")
+                 : absl::StrJoin(tags_it->second, ","))
+                .c_str(),
+            static_cast<long long>(plan.uuid));
         sender_status[i] = SendWorkerRpc(transport_, addr_it->second, payload);
       });
     }

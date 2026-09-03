@@ -728,6 +728,165 @@ TEST_F(ReshardStackTest, TwoDestinationsArmEachThenDispatchSendersOnce) {
   }
 }
 
+TEST_F(ReshardStackTest, SubsetSourceManifestsPairPoolsByTag) {
+  // Pipeline-parallel source: rank r registers only its own layer's pool
+  // (tag fa.l<r>), and the destination registers both layers. Each rank
+  // covers the whole request for its layer; the plan pairs pools by tag,
+  // hands the receiver destination-canonical pool indices, and rewrites
+  // every sender's request into that sender's own pool index space.
+  for (int rank = 0; rank < 2; ++rank) {
+    tpu_sync::rpc::ControlRequest req;
+    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+    auto* reg = req.mutable_register_work_unit_request();
+    *reg->mutable_unit() = RaidenIdToProto(Unit(rank));
+    reg->add_shards(absl::StrCat("10.0.0.1:", 9000 + rank));
+    reg->set_control_plane_rpc_address(absl::StrCat("10.0.0.1:", 9100 + rank));
+    *reg->add_pools() = MakePool(absl::StrCat("fa.l", rank), 1024, 1024, 16);
+    reg->set_layout_fingerprint("fp1");
+    reg->set_page_tokens(512);
+    reg->set_transfer_parallelism(2);
+    reg->set_transfer_rank(rank);
+    ASSERT_TRUE(Handle(req.SerializeAsString()).success());
+  }
+  {
+    tpu_sync::rpc::ControlRequest req;
+    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+    auto* reg = req.mutable_register_work_unit_request();
+    *reg->mutable_unit() = RaidenIdToProto(DstUnit(0));
+    reg->add_shards("10.0.0.2:9400");
+    reg->set_control_plane_rpc_address("10.0.0.2:9600");
+    *reg->add_pools() = MakePool("fa.l0", 1024, 1024, 16);
+    *reg->add_pools() = MakePool("fa.l1", 1024, 1024, 16);
+    reg->set_layout_fingerprint("fp1");
+    reg->set_page_tokens(512);
+    reg->set_transfer_parallelism(2);
+    reg->set_transfer_rank(0);
+    ASSERT_TRUE(Handle(req.SerializeAsString()).success());
+  }
+  for (int rank = 0; rank < 2; ++rank) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_REGISTER_REQUEST_BLOCKS);
+    auto* block_req = req.mutable_register_request_blocks_request();
+    block_req->set_req_id("req-pp");
+    block_req->set_uuid(77);
+    *block_req->mutable_unit() = RaidenIdToProto(Unit(rank));
+    block_req->add_block_ids(3 + rank);
+    auto* entry = block_req->add_pool_spans();
+    entry->set_tag(absl::StrCat("fa.l", rank));
+    entry->add_block_ids(3 + rank);
+    auto* span = entry->add_spans();
+    span->set_src_block_ordinal(0);
+    span->set_src_offset_bytes(0);
+    span->set_dst_block_index(0);
+    span->set_dst_offset_bytes(0);
+    span->set_size_bytes(1024);
+    span->set_count(1);
+    entry->set_declared_bytes(1024);
+    entry->set_dst_space_version(1);
+    ASSERT_TRUE(HandleController(req.SerializeAsString()).success());
+  }
+
+  tpu_sync::rpc::ControllerRequest req;
+  req.set_command(tpu_sync::rpc::ControllerRequest::COMMAND_COORDINATE_TRANSFER);
+  auto* coord = req.mutable_coordinate_transfer_request();
+  *coord->add_src_units() = RaidenIdToProto(Unit(0));
+  *coord->add_src_units() = RaidenIdToProto(Unit(1));
+  *coord->add_dst_units() = RaidenIdToProto(DstUnit(0));
+  coord->set_uuid(77);
+  coord->set_is_sender(true);
+  coord->set_dst_mem_type(tpu_sync::rpc::MEMORY_TYPE_HBM);
+  coord->set_use_block_chunks(true);
+  coord->set_req_id("req-pp");
+  // Both tags land on the same destination page (one page per layer pool).
+  coord->add_dst_device_block_ids(7);
+  coord->add_dst_device_block_ids(7);
+  coord->add_transfer_pool_tags("fa.l0");
+  coord->add_transfer_pool_tags("fa.l1");
+  coord->add_dst_block_counts(1);
+  coord->add_dst_block_counts(1);
+  tpu_sync::rpc::ControllerResponse resp =
+      HandleController(req.SerializeAsString());
+  ASSERT_TRUE(resp.success()) << resp.message();
+
+  // One arm, two sender dispatches.
+  ASSERT_EQ(transport_.calls_.size(), 3u);
+  tpu_sync::rpc::ControlRequest arm;
+  ASSERT_TRUE(arm.ParseFromString(transport_.calls_[0].second));
+  const auto& arm_req = arm.start_transfer_request();
+  EXPECT_FALSE(arm_req.is_sender());
+  // Receiver: destination-canonical pools 0 and 1, one group per tag, each
+  // fed by exactly one sender.
+  ASSERT_EQ(arm_req.transfer_pool_indices_size(), 2);
+  EXPECT_EQ(arm_req.transfer_pool_indices(0), 0);
+  EXPECT_EQ(arm_req.transfer_pool_indices(1), 1);
+  ASSERT_EQ(arm_req.pool_dtype_tags_size(), 2);
+  ASSERT_EQ(arm_req.pool_groups_size(), 2);
+  for (int g = 0; g < 2; ++g) {
+    ASSERT_EQ(arm_req.pool_groups(g).pool_indices_size(), 1);
+    EXPECT_EQ(arm_req.pool_groups(g).pool_indices(0), g);
+    EXPECT_EQ(arm_req.pool_groups(g).expected_pushes(), 1);
+  }
+  EXPECT_EQ(arm_req.shard_push_schedules_size(), 2);
+
+  // Senders: each request is rewritten into the sender's own single-pool
+  // index space; the group it does not feed is kept (positionally) but
+  // names no local pool.
+  for (int i = 1; i <= 2; ++i) {
+    tpu_sync::rpc::ControlRequest dispatch;
+    ASSERT_TRUE(dispatch.ParseFromString(transport_.calls_[i].second));
+    const auto& send_req = dispatch.start_transfer_request();
+    EXPECT_TRUE(send_req.is_sender());
+    ASSERT_EQ(send_req.transfer_pool_indices_size(), 1);
+    EXPECT_EQ(send_req.transfer_pool_indices(0), 0);
+    ASSERT_EQ(send_req.pool_dtype_tags_size(), 1);
+    ASSERT_EQ(send_req.pool_groups_size(), 2);
+    const int rank = transport_.calls_[i].first == "10.0.0.1:9100" ? 0 : 1;
+    for (int g = 0; g < 2; ++g) {
+      if (g == rank) {
+        ASSERT_EQ(send_req.pool_groups(g).pool_indices_size(), 1);
+        EXPECT_EQ(send_req.pool_groups(g).pool_indices(0), 0);
+      } else {
+        EXPECT_EQ(send_req.pool_groups(g).pool_indices_size(), 0);
+      }
+    }
+    ASSERT_EQ(send_req.shard_push_schedules_size(), 1);
+    const auto& schedule = send_req.shard_push_schedules().at(0);
+    ASSERT_EQ(schedule.entries_size(), 1);
+    EXPECT_EQ(schedule.entries(0).pool_group(), rank);
+    EXPECT_EQ(schedule.entries(0).src_block_id(), 3 + rank);
+    EXPECT_EQ(schedule.entries(0).dst_block_id(), 7);
+  }
+}
+
+TEST_F(ReshardStackTest, SpansForAnUnregisteredTagAreRefusedAtRegistration) {
+  // A rank that registers no pool for a tag cannot declare spans for it:
+  // the registry refuses the declaration before it can reach planning.
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  tpu_sync::rpc::ControllerRequest req;
+  req.set_command(
+      tpu_sync::rpc::ControllerRequest::COMMAND_REGISTER_REQUEST_BLOCKS);
+  auto* block_req = req.mutable_register_request_blocks_request();
+  block_req->set_req_id("req-x");
+  block_req->set_uuid(43);
+  *block_req->mutable_unit() = RaidenIdToProto(Unit(1));
+  block_req->add_block_ids(5);
+  auto* entry = block_req->add_pool_spans();
+  entry->set_tag("fa.other");
+  entry->add_block_ids(5);
+  auto* span = entry->add_spans();
+  span->set_dst_block_index(1);
+  span->set_size_bytes(1024);
+  span->set_count(1);
+  entry->set_declared_bytes(1024);
+  tpu_sync::rpc::ControllerResponse resp =
+      HandleController(req.SerializeAsString());
+  ASSERT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(),
+              HasSubstr("does not match any registered pool"));
+}
+
 TEST_F(ReshardStackTest, MismatchedDestinationsFailClosed) {
   RegisterAllUnits(/*num_src=*/1, /*live=*/1024, /*stride=*/1024,
                    /*num_blocks=*/16, /*num_dst=*/2);

@@ -122,7 +122,11 @@ MetadataByUnit(
 }
 
 struct TagPrecheck {
-  std::vector<int32_t> selected;
+  std::vector<int32_t> selected;  // destination pool indices
+  // The source unit whose pools define the tag's source geometry, and its
+  // pool indices for the tag (aligned 1:1 with `selected`).
+  RaidenId src_reference_unit;
+  std::vector<int32_t> src_selected;
   int64_t src_live = 0;
   int64_t dst_live = 0;
   std::vector<PoolLiveSegment> src_segments;
@@ -239,18 +243,38 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
     return absl::InvalidArgumentError(
         "Destination pool manifest must not be empty");
   }
+  // Pools pair up by tag. A source unit may register a subset of the
+  // destination's tags (a pipeline stage holds a layer subset), but every
+  // tag it registers must carry the destination's pool count and dtype for
+  // that tag, in manifest order; a source tag the destination lacks is a
+  // mismatch.
+  std::map<std::string, std::vector<int32_t>> dst_pools_by_tag;
+  for (int i = 0; i < dst_meta.pools_size(); ++i) {
+    dst_pools_by_tag[dst_meta.pools(i).tag()].push_back(i);
+  }
+  std::map<RaidenId, std::map<std::string, std::vector<int32_t>>,
+           RequestBlockRegistry::RaidenIdLess>
+      src_pools_by_tag;
   for (const RaidenId& src_unit : request.src_units) {
     const auto& src_pools = src_by_unit.at(src_unit)->pools();
-    std::vector<std::pair<std::string, std::string>> src_identity;
-    src_identity.reserve(src_pools.size());
-    for (const auto& pool : src_pools) {
-      src_identity.emplace_back(pool.tag(), pool.dtype_tag());
+    auto& by_tag = src_pools_by_tag[src_unit];
+    for (int i = 0; i < src_pools.size(); ++i) {
+      by_tag[src_pools.Get(i).tag()].push_back(i);
     }
-    if (src_identity != dst_identity) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "Canonical pool manifest mismatch between source and destination "
-          "for ",
-          PythonRepr(src_unit)));
+    for (const auto& [tag, src_indices] : by_tag) {
+      auto dst_it = dst_pools_by_tag.find(tag);
+      bool matches = dst_it != dst_pools_by_tag.end() &&
+                     dst_it->second.size() == src_indices.size();
+      for (size_t k = 0; matches && k < src_indices.size(); ++k) {
+        matches = src_pools.Get(src_indices[k]).dtype_tag() ==
+                  dst_meta.pools(dst_it->second[k]).dtype_tag();
+      }
+      if (!matches) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Canonical pool manifest mismatch between source and destination "
+            "for ",
+            PythonRepr(src_unit), " at tag ", PyStrRepr(tag)));
+      }
     }
   }
   {
@@ -285,23 +309,26 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
     }
   }
 
-  const tpu_sync::rpc::RegisterWorkUnitRequest& reference_src =
-      *src_by_unit.at(request.src_units[0]);
+  // Source geometry is compared per tag across the ranks that register the
+  // tag; the first such rank (in request order) is the tag's reference.
+  std::map<std::string, RaidenId> tag_reference_unit;
   {
-    std::vector<std::string> reference_geometry;
-    for (const auto& pool : reference_src.pools()) {
-      reference_geometry.push_back(GeometrySignature(pool));
-    }
-    for (size_t i = 1; i < request.src_units.size(); ++i) {
-      const RaidenId& src_unit = request.src_units[i];
-      std::vector<std::string> geometry;
-      for (const auto& pool : src_by_unit.at(src_unit)->pools()) {
-        geometry.push_back(GeometrySignature(pool));
-      }
-      if (geometry != reference_geometry) {
-        return absl::InvalidArgumentError(
-            absl::StrCat("Source pool geometry differs across ranks at ",
-                         PythonRepr(src_unit)));
+    std::map<std::string, std::vector<std::string>> reference_geometry;
+    for (const RaidenId& src_unit : request.src_units) {
+      const auto& src_pools = src_by_unit.at(src_unit)->pools();
+      for (const auto& [tag, src_indices] : src_pools_by_tag.at(src_unit)) {
+        std::vector<std::string> geometry;
+        for (int32_t idx : src_indices) {
+          geometry.push_back(GeometrySignature(src_pools.Get(idx)));
+        }
+        auto [it, inserted] = reference_geometry.emplace(tag, geometry);
+        if (inserted) {
+          tag_reference_unit.emplace(tag, src_unit);
+        } else if (it->second != geometry) {
+          return absl::InvalidArgumentError(
+              absl::StrCat("Source pool geometry differs across ranks at ",
+                           PythonRepr(src_unit), " for tag ", PyStrRepr(tag)));
+        }
       }
     }
   }
@@ -450,13 +477,26 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
         precheck.selected.push_back(i);
       }
     }
+    {
+      auto ref_it = tag_reference_unit.find(plan_tag);
+      if (ref_it == tag_reference_unit.end()) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "No source unit registers pools for tag ", PyStrRepr(plan_tag)));
+      }
+      precheck.src_reference_unit = ref_it->second;
+      precheck.src_selected =
+          src_pools_by_tag.at(ref_it->second).at(plan_tag);
+    }
+    const tpu_sync::rpc::RegisterWorkUnitRequest& reference_src =
+        *src_by_unit.at(precheck.src_reference_unit);
 
     std::set<int64_t> src_live_values;
     std::set<int64_t> dst_live_values;
     std::vector<std::vector<PoolLiveSegment>> src_segment_maps;
     std::vector<std::vector<PoolLiveSegment>> dst_segment_maps;
-    for (int32_t pool_idx : precheck.selected) {
-      const auto& src_pool = reference_src.pools(pool_idx);
+    for (size_t k = 0; k < precheck.selected.size(); ++k) {
+      const int32_t pool_idx = precheck.selected[k];
+      const auto& src_pool = reference_src.pools(precheck.src_selected[k]);
       const auto& dst_pool = dst_meta.pools(pool_idx);
       auto src_segments = LiveSegments(src_pool);
       if (!src_segments.ok()) return src_segments.status();
@@ -561,9 +601,15 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
       const RequestBlockRegistration& registration = registrations.at(unit);
       for (const PoolSpanRegistration& entry : registration.pool_spans) {
         if (entry.tag != plan_tag) continue;
-        if (!entry.spans.empty()) {
-          declared.emplace_back(unit, &entry);
+        if (entry.spans.empty()) continue;
+        if (src_pools_by_tag.at(unit).find(plan_tag) ==
+            src_pools_by_tag.at(unit).end()) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "Byte spans are declared for tag ", PyStrRepr(plan_tag),
+              " by ", PythonRepr(unit),
+              ", which registers no pool with that tag"));
         }
+        declared.emplace_back(unit, &entry);
       }
     }
     if (declared.empty()) {
@@ -655,11 +701,14 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
     }
     declared = std::move(converted);
 
-    for (int32_t pool_idx : precheck.selected) {
+    for (size_t k = 0; k < precheck.selected.size(); ++k) {
+      const int32_t pool_idx = precheck.selected[k];
       const int64_t dst_num_blocks = dst_meta.pools(pool_idx).num_blocks();
       for (const auto& [unit, entry] : declared) {
+        const int32_t src_pool_idx =
+            src_pools_by_tag.at(unit).at(plan_tag)[k];
         const int64_t limit =
-            src_by_unit.at(unit)->pools(pool_idx).num_blocks();
+            src_by_unit.at(unit)->pools(src_pool_idx).num_blocks();
         for (int64_t block_id : entry->block_ids) {
           if (block_id >= limit) {
             return absl::InvalidArgumentError(
@@ -979,6 +1028,22 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
   plan.transfer_pool_indices = union_selected;
   for (const auto& pool : dst_meta.pools()) {
     plan.pool_dtype_tags.push_back(pool.dtype_tag());
+  }
+  for (const RaidenId& unit : plan.src_units) {
+    const auto& src_pools = src_by_unit.at(unit)->pools();
+    std::vector<std::string>& dtype_tags = plan.src_pool_dtype_tags[unit];
+    for (const auto& pool : src_pools) {
+      dtype_tags.push_back(pool.dtype_tag());
+    }
+    std::map<int32_t, int32_t>& remap = plan.src_pool_indices[unit];
+    const auto& by_tag = src_pools_by_tag.at(unit);
+    for (const TagPrecheck& precheck : tag_precheck) {
+      auto tag_it = by_tag.find(dst_meta.pools(precheck.selected[0]).tag());
+      if (tag_it == by_tag.end()) continue;
+      for (size_t k = 0; k < precheck.selected.size(); ++k) {
+        remap[precheck.selected[k]] = tag_it->second[k];
+      }
+    }
   }
   plan.dst_device_block_ids = dst_ids;
   for (size_t ordinal = 0; ordinal < plan.src_units.size(); ++ordinal) {

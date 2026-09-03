@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <map>
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
 #include <utility>
@@ -130,11 +131,36 @@ tpu_sync::rpc::StartTransferRequest BuildStartTransferForTarget(
   start_req.set_use_block_chunks(true);
   start_req.set_expected_block_count(plan.expected_block_count);
   start_req.set_req_id(plan.req_id);
-  for (int32_t index : plan.transfer_pool_indices) {
-    start_req.add_transfer_pool_indices(index);
+  // The plan addresses pools in the destination's index space. A sender
+  // executes against its own pool table, which may register only a subset
+  // of the destination's tags, so its request is rewritten into its own
+  // index space: transferred pools it does not register are dropped (their
+  // groups keep their position so entry pool_group references hold), and
+  // the dtype tag list is the sender's own.
+  const std::map<int32_t, int32_t>* sender_remap = nullptr;
+  if (is_sender && !is_receiver) {
+    auto remap_it = plan.src_pool_indices.find(target);
+    if (remap_it != plan.src_pool_indices.end()) {
+      sender_remap = &remap_it->second;
+    }
   }
-  for (const std::string& tag : plan.pool_dtype_tags) {
-    start_req.add_pool_dtype_tags(tag);
+  auto local_pool_index = [sender_remap](int32_t index) -> int32_t {
+    if (sender_remap == nullptr) return index;
+    auto it = sender_remap->find(index);
+    return it == sender_remap->end() ? -1 : it->second;
+  };
+  for (int32_t index : plan.transfer_pool_indices) {
+    const int32_t local = local_pool_index(index);
+    if (local >= 0) start_req.add_transfer_pool_indices(local);
+  }
+  if (sender_remap != nullptr) {
+    for (const std::string& tag : plan.src_pool_dtype_tags.at(target)) {
+      start_req.add_pool_dtype_tags(tag);
+    }
+  } else {
+    for (const std::string& tag : plan.pool_dtype_tags) {
+      start_req.add_pool_dtype_tags(tag);
+    }
   }
   start_req.set_parallelism(plan.parallelism);
   // Python assigns transfer_plan.skip_d2h unconditionally, which marks the
@@ -145,7 +171,8 @@ tpu_sync::rpc::StartTransferRequest BuildStartTransferForTarget(
   for (const PlanPoolGroup& group : plan.pool_groups) {
     tpu_sync::rpc::PoolGroupProto* group_proto = start_req.add_pool_groups();
     for (int32_t index : group.pool_indices) {
-      group_proto->add_pool_indices(index);
+      const int32_t local = local_pool_index(index);
+      if (local >= 0) group_proto->add_pool_indices(local);
     }
     for (int64_t block_id : group.dst_device_block_ids) {
       group_proto->add_dst_device_block_ids(block_id);

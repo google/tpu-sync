@@ -27,6 +27,7 @@
 
 #include <gtest/gtest.h>
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/weight_sync/weight_synchronization_worker_service_client.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace tpu_raiden {
@@ -286,6 +287,106 @@ TEST(WeightSynchronizerListenerTest, PushWeightsReshardedSuccess) {
   }
 
   close(sock);
+}
+
+TEST(WeightSynchronizerListenerTest, GrpcModePushWeightsReshardedSuccess) {
+  WeightSynchronizerBase src_engine(
+      /*num_layers=*/1, /*num_shards=*/4, /*slice_byte_size=*/16,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+      /*parallelism=*/1, /*listener_port=*/0, /*bind_ip=*/std::nullopt,
+      /*layer_names=*/{}, /*auto_h2d=*/false, /*use_grpc=*/true);
+  ASSERT_TRUE(src_engine.listener_port().has_value());
+  EXPECT_TRUE(src_engine.is_listener_active());
+
+  WeightSynchronizerBase dst_engine(
+      /*num_layers=*/1, /*num_shards=*/4, /*slice_byte_size=*/16,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+      /*parallelism=*/1, /*listener_port=*/0, /*bind_ip=*/std::nullopt,
+      /*layer_names=*/{}, /*auto_h2d=*/false, /*use_grpc=*/true);
+  ASSERT_TRUE(dst_engine.local_port().has_value());
+  ASSERT_TRUE(dst_engine.listener_port().has_value());
+  EXPECT_TRUE(dst_engine.is_listener_active());
+
+  std::string dst_peer =
+      "127.0.0.1:" + std::to_string(*dst_engine.local_port());
+
+  // Populate source buffers
+  std::vector<std::vector<uint8_t>> src_data = {
+      {0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27},
+      {4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31},
+      {32, 33, 34, 35, 40, 41, 42, 43, 48, 49, 50, 51, 56, 57, 58, 59},
+      {36, 37, 38, 39, 44, 45, 46, 47, 52, 53, 54, 55, 60, 61, 62, 63},
+  };
+
+  for (size_t i = 0; i < 4; ++i) {
+    uint8_t* ptr = src_engine.GetHostPointer(0, i);
+    ASSERT_NE(ptr, nullptr);
+    std::memcpy(ptr, src_data[i].data(), 16);
+  }
+
+  uint64_t test_uuid = 112233;
+
+  WeightSynchronizationWorkerServiceClient dst_client(
+      "localhost:" + std::to_string(*dst_engine.listener_port()));
+  WeightSynchronizationWorkerServiceClient src_client(
+      "localhost:" + std::to_string(*src_engine.listener_port()));
+
+  // 1. Arm destination receiver using gRPC client
+  StartTransferRequest dst_start_req;
+  dst_start_req.set_is_sender(false);
+  dst_start_req.set_uuid(test_uuid);
+  dst_start_req.set_expected_block_count(8);
+
+  auto dst_resp_or = dst_client.StartTransfer(dst_start_req).Await();
+  ASSERT_TRUE(dst_resp_or.ok());
+  EXPECT_TRUE(dst_resp_or->success());
+
+  // 2. Dispatch sender push schedules using gRPC client
+  StartTransferRequest src_start_req;
+  src_start_req.set_is_sender(true);
+  src_start_req.set_uuid(test_uuid);
+
+  auto& push_schedules = *src_start_req.mutable_shard_push_schedules();
+
+  // S0 -> D0
+  ShardPushScheduleProto s0_sched;
+  for (int r = 0; r < 4; ++r) {
+    ShardPushEntryProto* e = s0_sched.add_entries();
+    e->set_dst_peer(dst_peer);
+    e->set_dst_shard_idx(0);
+    e->set_src_offset_bytes(r * 4);
+    e->set_dst_offset_bytes(r * 2);
+    e->set_size_bytes(2);
+    e->set_layer_idx(0);
+  }
+  push_schedules[0] = s0_sched;
+
+  // S2 -> D0
+  ShardPushScheduleProto s2_sched;
+  for (int r = 0; r < 4; ++r) {
+    ShardPushEntryProto* e = s2_sched.add_entries();
+    e->set_dst_peer(dst_peer);
+    e->set_dst_shard_idx(0);
+    e->set_src_offset_bytes(r * 4);
+    e->set_dst_offset_bytes(8 + r * 2);
+    e->set_size_bytes(2);
+    e->set_layer_idx(0);
+  }
+  push_schedules[2] = s2_sched;
+
+  auto src_resp_or = src_client.StartTransfer(src_start_req).Await();
+  ASSERT_TRUE(src_resp_or.ok());
+  EXPECT_TRUE(src_resp_or->success());
+
+  // Verify Destination Shard 0 host memory
+  uint8_t* dst_ptr = dst_engine.GetHostPointer(0, 0);
+  ASSERT_NE(dst_ptr, nullptr);
+
+  std::vector<uint8_t> expected_d0 = {0,  1,  8,  9,  16, 17, 24, 25,
+                                      32, 33, 40, 41, 48, 49, 56, 57};
+  for (size_t k = 0; k < 16; ++k) {
+    EXPECT_EQ(dst_ptr[k], expected_d0[k]) << "Mismatch at byte " << k;
+  }
 }
 
 }  // namespace

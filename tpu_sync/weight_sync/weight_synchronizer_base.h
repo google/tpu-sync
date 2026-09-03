@@ -79,6 +79,7 @@ struct WeightSyncMetrics {
 };
 
 class WeightSynchronizerListener;
+class WeightSynchronizationWorkerService;
 
 class WeightSynchronizerControlDelegate {
  public:
@@ -109,7 +110,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt,
-      std::vector<std::string> layer_names = {}, bool auto_h2d = false);
+      std::vector<std::string> layer_names = {}, bool auto_h2d = false,
+      bool use_grpc = false);
 
   // CPU-only constructor for remote workers and mock E2E testing
   WeightSynchronizerBase(
@@ -118,7 +120,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       int parallelism = 1, std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt,
-      std::vector<std::string> layer_names = {}, bool auto_h2d = false);
+      std::vector<std::string> layer_names = {}, bool auto_h2d = false,
+      bool use_grpc = false);
 
   // CPU-only constructor for remote workers and mock E2E testing supporting
   // heterogeneous slice sizes and custom layer names.
@@ -129,7 +132,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       int parallelism = 1, std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt,
-      std::vector<std::string> layer_names = {}, bool auto_h2d = false);
+      std::vector<std::string> layer_names = {}, bool auto_h2d = false,
+      bool use_grpc = false);
 
   std::optional<int> listener_port() const;
   bool is_listener_active() const;
@@ -287,6 +291,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
  protected:
   std::unique_ptr<WeightSynchronizerListener> listener_;
+  std::unique_ptr<WeightSynchronizationWorkerService> grpc_service_;
+  bool use_grpc_ = false;
   const PJRT_Api* c_api_ = nullptr;
   const PJRT_RawBuffer_Extension* extension_ = nullptr;
   size_t physical_size_ = 0;

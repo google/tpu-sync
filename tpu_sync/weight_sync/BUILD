@@ -41,10 +41,12 @@ cc_library(
 cc_library(
     name = "weight_synchronizer_base",
     srcs = [
+        "weight_synchronization_worker_service.cc",
         "weight_synchronizer_base.cc",
         "weight_synchronizer_listener.cc",
     ],
     hdrs = [
+        "weight_synchronization_worker_service.h",
         "weight_synchronizer_base.h",
         "weight_synchronizer_listener.h",
     ],
@@ -63,8 +65,10 @@ cc_library(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:status_macros",
         "//tpu_sync/core:xla_raw_transfer_headers",
+        "//tpu_sync/rpc:raiden_service_cc_grpc",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/transport:buffer_push_task",
+        "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
@@ -115,6 +119,7 @@ cc_test(
     ],
     features = ["-use_header_modules"],
     deps = [
+        ":weight_synchronization_worker_service_client",
         ":weight_synchronizer_base",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_googletest//:gtest",
@@ -141,24 +146,13 @@ cc_test(
 
 cc_library(
     name = "weight_synchronization_worker_service",
-    srcs = ["weight_synchronization_worker_service.cc"],
     hdrs = ["weight_synchronization_worker_service.h"],
-    copts = [
-        "-fno-strict-aliasing",
-        "-fexceptions",
-    ],
-    features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
         ":weight_synchronizer_base",
         "//tpu_sync/rpc:raiden_service_cc_grpc",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/time",
     ],
 )
 

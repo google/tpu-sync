@@ -56,11 +56,15 @@
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/weight_sync/tiling_utils.h"
+#include "tpu_sync/weight_sync/weight_synchronization_worker_service.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_listener.h"
 
 ABSL_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size, 256 * 1024,
           "Amount of scratchpad to allocate to host buffers for resharding "
           "pulls.");
+ABSL_FLAG(bool, raiden_weight_sync_use_grpc, false,
+          "Whether to use gRPC WeightSynchronizationWorkerService instead of "
+          "raw TCP socket listener.");
 
 namespace tpu_raiden {
 namespace weight_sync {
@@ -71,13 +75,15 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     std::optional<std::vector<const uint8_t*>> external_host_ptrs,
     bool unsafe_skip_buffer_lock, int parallelism,
     std::optional<int> listener_port, std::optional<std::string> bind_ip,
-    std::vector<std::string> layer_names, bool auto_h2d)
+    std::vector<std::string> layer_names, bool auto_h2d, bool use_grpc)
     : tpu_raiden::RaidenManagerBase(
           layer_buffers.size(),
           layer_buffers.empty() ? 0 : layer_buffers[0].size(),
           layer_buffers.empty() ? 0
                                 : layer_buffers[0][0].GetOnDeviceSizeInBytes(),
           local_port, parallelism, bind_ip),
+      use_grpc_(use_grpc || absl::GetFlag(FLAGS_raiden_weight_sync_use_grpc) ||
+                (std::getenv("RAIDEN_WEIGHT_SYNC_USE_GRPC") != nullptr)),
       auto_h2d_(auto_h2d) {
   if (layer_names.empty()) {
     layer_names_.reserve(num_layers_);
@@ -221,8 +227,13 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   }
 
   if (listener_port) {
-    listener_ =
-        std::make_unique<WeightSynchronizerListener>(this, *listener_port);
+    if (use_grpc_) {
+      grpc_service_ = std::make_unique<WeightSynchronizationWorkerService>(
+          this, *listener_port);
+    } else {
+      listener_ =
+          std::make_unique<WeightSynchronizerListener>(this, *listener_port);
+    }
   }
   if (auto_h2d_) {
     h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
@@ -237,23 +248,25 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, std::vector<std::string> layer_names,
-    bool auto_h2d)
+    bool auto_h2d, bool use_grpc)
     : WeightSynchronizerBase(num_layers, num_shards,
                              std::vector<size_t>(num_layers, slice_byte_size),
                              local_port, host_blocks_to_allocate, parallelism,
                              listener_port, bind_ip, std::move(layer_names),
-                             auto_h2d) {}
+                             auto_h2d, use_grpc) {}
 
 WeightSynchronizerBase::WeightSynchronizerBase(
     size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, std::vector<std::string> layer_names,
-    bool auto_h2d)
+    bool auto_h2d, bool use_grpc)
     : tpu_raiden::RaidenManagerBase(
           num_layers, num_shards,
           slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0], local_port,
           parallelism, bind_ip),
+      use_grpc_(use_grpc || absl::GetFlag(FLAGS_raiden_weight_sync_use_grpc) ||
+                (std::getenv("RAIDEN_WEIGHT_SYNC_USE_GRPC") != nullptr)),
       auto_h2d_(auto_h2d) {
   if (layer_names.empty()) {
     layer_names_.reserve(num_layers_);
@@ -301,8 +314,13 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   }
 
   if (listener_port) {
-    listener_ =
-        std::make_unique<WeightSynchronizerListener>(this, *listener_port);
+    if (use_grpc_) {
+      grpc_service_ = std::make_unique<WeightSynchronizationWorkerService>(
+          this, *listener_port);
+    } else {
+      listener_ =
+          std::make_unique<WeightSynchronizerListener>(this, *listener_port);
+    }
   }
   if (auto_h2d_) {
     h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
@@ -313,6 +331,9 @@ WeightSynchronizerBase::WeightSynchronizerBase(
 }
 
 std::optional<int> WeightSynchronizerBase::listener_port() const {
+  if (grpc_service_) {
+    return grpc_service_->server_port();
+  }
   if (listener_) {
     return listener_->listener_port();
   }
@@ -320,6 +341,9 @@ std::optional<int> WeightSynchronizerBase::listener_port() const {
 }
 
 bool WeightSynchronizerBase::is_listener_active() const {
+  if (grpc_service_) {
+    return grpc_service_->is_active();
+  }
   if (listener_) {
     return listener_->is_active();
   }
@@ -347,6 +371,7 @@ WeightSynchronizerBase::get_local_endpoints() const {
 
 WeightSynchronizerBase::~WeightSynchronizerBase() {
   StopTransportServer();
+  grpc_service_.reset();
   listener_.reset();
   h2d_pool_.reset();
   push_pool_.reset();

@@ -102,10 +102,11 @@ bool ShmWriter::AllocateNewChunk() const {
   }
 
   uint32_t chunk_idx = static_cast<uint32_t>(chunks_.size());
-  std::string path =
+  std::string base_path =
       absl::StrCat(options_.shm_dir, "/", kShmFilePrefix, options_.local_rank,
-                   "_", uuid_, "_chunk_", chunk_idx, kShmFileExtension);
-  std::string tmp_path = absl::StrCat(path, ".tmp");
+                   "_", uuid_, "_chunk_", chunk_idx);
+  std::string path = absl::StrCat(base_path, kShmFileExtension);
+  std::string tmp_path = absl::StrCat(base_path, kShmTmpFileExtension);
 
   int fd = open(tmp_path.c_str(),
                 O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,

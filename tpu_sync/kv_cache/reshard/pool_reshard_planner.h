@@ -96,6 +96,8 @@ struct PoolReshardPlan {
            RequestBlockRegistry::RaidenIdLess>
       src_pool_dtype_tags;
   std::vector<int64_t> dst_device_block_ids;
+  // A source's schedule key is its registered transfer rank: the worker id
+  // it dispatches under and the node id a receiver resolves its pushes by.
   std::map<RaidenId, int32_t, RequestBlockRegistry::RaidenIdLess>
       src_schedule_keys;
   int32_t parallelism = 1;

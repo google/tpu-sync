@@ -1049,8 +1049,8 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
   }
   plan.dst_device_block_ids = dst_ids;
   for (size_t ordinal = 0; ordinal < plan.src_units.size(); ++ordinal) {
-    plan.src_schedule_keys[plan.src_units[ordinal]] =
-        static_cast<int32_t>(ordinal);
+    plan.src_schedule_keys[plan.src_units[ordinal]] = static_cast<int32_t>(
+        src_by_unit.at(plan.src_units[ordinal])->transfer_rank());
   }
   plan.parallelism = static_cast<int32_t>(requested_parallelism);
   plan.num_tokens = std::max<int64_t>(request.num_tokens, 0);

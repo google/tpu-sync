@@ -953,6 +953,13 @@ TEST_F(ReshardStackTest, PipelinedDestinationStagesShareOneRequestClaim) {
   EXPECT_EQ(transport_.calls_[1].first, "10.0.0.1:9100");
   EXPECT_EQ(transport_.calls_[2].first, "10.0.0.2:9601");
   EXPECT_EQ(transport_.calls_[3].first, "10.0.0.1:9101");
+  // Stage 1's arm carries its single source under that source's transfer
+  // rank, which is the node id the receiver resolves the pushes by.
+  tpu_sync::rpc::ControlRequest arm;
+  ASSERT_TRUE(arm.ParseFromString(transport_.calls_[2].second));
+  const auto& arm_req = arm.start_transfer_request();
+  ASSERT_EQ(arm_req.shard_push_schedules_size(), 1);
+  EXPECT_EQ(arm_req.shard_push_schedules().count(1), 1u);
 }
 
 TEST_F(ReshardStackTest, SpansForAnUnregisteredTagAreRefusedAtRegistration) {

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -226,5 +227,30 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@xla//xla/tsl/concurrency:future",
+    ],
+)
+
+py_library(
+    name = "weight_synchronization_worker_service_client_py",
+    srcs = ["weight_synchronization_worker_service_client.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_sync/rpc:raiden_service_py_pb2",
+        "//tpu_sync/rpc:raiden_service_py_pb2_grpc",
+        "@com_github_grpc_grpc//src/python/grpcio/grpc:grpcio",
+    ],
+)
+
+py_test(
+    name = "weight_synchronization_worker_service_client_py_test",
+    srcs = ["weight_synchronization_worker_service_client_test.py"],
+    main = "weight_synchronization_worker_service_client_test.py",
+    deps = [
+        ":weight_synchronization_worker_service_client_py",
+        "//net/grpc/python:use_insecure_channel_for_test",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
+        "//tpu_sync/rpc:raiden_service_py_pb2_grpc",
+        "@com_github_grpc_grpc//src/python/grpcio/grpc:grpcio",
+        "@com_google_absl_py//absl/testing:absltest",
     ],
 )

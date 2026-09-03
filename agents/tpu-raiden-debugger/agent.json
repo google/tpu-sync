@@ -1,0 +1,6 @@
+{
+  "name": "tpu-raiden-debugger",
+  "configPath": {
+    "relativePathToConfig": "config.yaml"
+  }
+}

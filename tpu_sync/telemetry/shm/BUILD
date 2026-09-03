@@ -34,3 +34,37 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "shm_writer",
+    srcs = ["shm_writer.cc"],
+    hdrs = ["shm_writer.h"],
+    deps = [
+        ":shm_layout",
+        "//tpu_sync/telemetry:label_util",
+        "//tpu_sync/telemetry:metrics_backend",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/hash",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/random",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "shm_writer_test",
+    srcs = ["shm_writer_test.cc"],
+    deps = [
+        ":shm_layout",
+        ":shm_writer",
+        "//tpu_sync/telemetry:label_util",
+        "//tpu_sync/telemetry:metrics_backend",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

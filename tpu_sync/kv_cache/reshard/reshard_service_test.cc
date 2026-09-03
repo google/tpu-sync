@@ -828,6 +828,7 @@ TEST_F(ReshardStackTest, SubsetSourceManifestsPairPoolsByTag) {
     EXPECT_EQ(arm_req.pool_groups(g).expected_pushes(), 1);
   }
   EXPECT_EQ(arm_req.shard_push_schedules_size(), 2);
+  EXPECT_EQ(arm_req.wire_pool_indices_size(), 0);
 
   // Senders: each request is rewritten into the sender's own single-pool
   // index space; the group it does not feed is kept (positionally) but
@@ -856,6 +857,10 @@ TEST_F(ReshardStackTest, SubsetSourceManifestsPairPoolsByTag) {
     EXPECT_EQ(schedule.entries(0).pool_group(), rank);
     EXPECT_EQ(schedule.entries(0).src_block_id(), 3 + rank);
     EXPECT_EQ(schedule.entries(0).dst_block_id(), 7);
+    // The sender's single local pool is named on the wire by the
+    // destination index it feeds.
+    ASSERT_EQ(send_req.wire_pool_indices_size(), 1);
+    EXPECT_EQ(send_req.wire_pool_indices().at(0), rank);
   }
 }
 

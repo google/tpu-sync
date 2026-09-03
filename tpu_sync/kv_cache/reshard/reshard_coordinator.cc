@@ -153,6 +153,13 @@ tpu_sync::rpc::StartTransferRequest BuildStartTransferForTarget(
     const int32_t local = local_pool_index(index);
     if (local >= 0) start_req.add_transfer_pool_indices(local);
   }
+  // The receiver resolves each push against its own pool table, so a
+  // rewritten sender still names pools on the wire by destination index.
+  if (sender_remap != nullptr) {
+    for (const auto& [dst_index, local] : *sender_remap) {
+      (*start_req.mutable_wire_pool_indices())[local] = dst_index;
+    }
+  }
   if (sender_remap != nullptr) {
     for (const std::string& tag : plan.src_pool_dtype_tags.at(target)) {
       start_req.add_pool_dtype_tags(tag);

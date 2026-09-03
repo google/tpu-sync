@@ -77,13 +77,17 @@ class BlockTransport final {
     return peregrine_control_.get();
   }
 
-  // Asynchronous Scatter-Gather Push
+  // Asynchronous Scatter-Gather Push. `layer_idx` selects the local block
+  // array; `wire_layer_idx`, when set, is the index the receiver resolves the
+  // pushed blocks against (a sender whose pool table is a subset of the
+  // receiver's).
   void AsyncPush(
       const std::vector<std::string>& peers,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids, int parallelism,
       MajorOrder major_order, uint64_t uuid, int layer_idx,
-      std::function<void(absl::StatusOr<std::vector<int>>)> raw_on_complete);
+      std::function<void(absl::StatusOr<std::vector<int>>)> raw_on_complete,
+      std::optional<int> wire_layer_idx = std::nullopt);
 
   // Synchronous Scatter-Gather Push (op = 1 / op = 6)
   absl::StatusOr<std::vector<int>> SyncPush(
@@ -150,7 +154,8 @@ class BlockTransport final {
   absl::StatusOr<std::vector<lib::Request>> BuildBlockRequests(
       absl::string_view peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids, MajorOrder major_order,
-      uint64_t uuid = 0, int layer_idx = -1, int parallelism = 1);
+      uint64_t uuid = 0, int layer_idx = -1, int parallelism = 1,
+      std::optional<int> wire_layer_idx = std::nullopt);
 
   // Builds a batch of Requests for block pull transfer.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockPullRequests(

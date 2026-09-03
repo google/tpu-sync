@@ -184,6 +184,11 @@ message StartTransferRequest {
   // destined for this receiver for each layer/tensor. Used to trigger pipelined
   // per-layer H2D upon completion of all chunks for a layer.
   map<int32, int64> expected_layer_chunk_counts = 21;
+  // A sender whose pool table registers only a subset of the destination's
+  // tags addresses its own pools by local index; this maps each local index
+  // to the destination index that names the pool on the wire. Senders with
+  // the destination's full pool table leave it empty.
+  map<int32, int32> wire_pool_indices = 22;
 }
 
 // One tag class's slice of a multi-tag byte-span transfer.

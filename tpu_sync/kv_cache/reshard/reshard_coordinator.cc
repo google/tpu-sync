@@ -207,9 +207,9 @@ tpu_sync::rpc::StartTransferRequest BuildStartTransferForTarget(
       };
 
   if (target == plan.dst_unit) {
-    // Receiver path: every source's schedule, keyed by source ordinal,
-    // filtered to entries targeting this receiver (single-endpoint pool
-    // plans always match).
+    // Receiver path: every source's schedule, keyed by the source's transfer
+    // rank (the node id its pushes carry), filtered to entries targeting
+    // this receiver (single-endpoint pool plans always match).
     for (const auto& [src_unit, entries] : plan.schedules) {
       auto key_it = plan.src_schedule_keys.find(src_unit);
       if (key_it == plan.src_schedule_keys.end()) continue;

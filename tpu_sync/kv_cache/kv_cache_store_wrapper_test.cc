@@ -106,11 +106,15 @@ class KVCacheStoreWrapperTest : public ::testing::Test {
   }
 
   void UnlinkSegments() {
-    shm_unlink(
-        absl::StrCat("/", shm_key_, "_metadata", kIdentitySuffix).c_str());
-    shm_unlink(absl::StrCat("/", shm_key_, "_metadata_test_server",
-                            kIdentitySuffix)
-                   .c_str());
+    // The serving stack never unlinks a segment or its ".lock" companion;
+    // decommissioning is the operator's job -- here, the test's.
+    for (const std::string& name :
+         {absl::StrCat("/", shm_key_, "_metadata", kIdentitySuffix),
+          absl::StrCat("/", shm_key_, "_metadata_test_server",
+                       kIdentitySuffix)}) {
+      shm_unlink(name.c_str());
+      shm_unlink(absl::StrCat(name, ".lock").c_str());
+    }
   }
 
   // Inserts `hashes` as host-resident blocks 0..n-1, mirroring them into the

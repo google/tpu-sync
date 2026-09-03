@@ -25,12 +25,15 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/log/check.h"
 #include "absl/strings/str_format.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
 #include "tpu_sync/core/tpu_pjrt_manager.h"
+#include "tpu_sync/core/utils.h"
 
 namespace tpu_raiden {
 namespace {
@@ -497,6 +500,38 @@ TEST(HostMemoryAllocatorTest, SharedMemoryCreationLockOutlivesSegment) {
 
   shm_unlink(shm_key.c_str());
   shm_unlink((shm_key + ".lock").c_str());
+}
+
+TEST(HostMemoryAllocatorTest, WarnAboutOrphanShmSegmentsReportsUnattached) {
+  const std::string shm_key =
+      "/test_raiden_shm_orphan_" + std::to_string(getpid());
+  const std::string own = shm_key + "_dev_1";
+  const std::string sibling = shm_key + "_dev_99";
+  const std::string metadata = shm_key + "_metadata_other";
+  const std::string leftover = shm_key + "_old_run";
+  const std::string lock_file = shm_key + ".lock";
+  auto cleanup = absl::MakeCleanup([&]() {
+    for (const std::string& name :
+         {own, sibling, metadata, leftover, lock_file}) {
+      shm_unlink(name.c_str());
+    }
+  });
+
+  for (const std::string& name :
+       {own, sibling, metadata, leftover, lock_file}) {
+    shm_unlink(name.c_str());
+    int fd = shm_open(name.c_str(), O_CREAT | O_RDWR, 0666);
+    ASSERT_GE(fd, 0);
+    close(fd);
+  }
+
+  // The expected own segment is silent, the sibling-shaped and metadata
+  // names surface at INFO only, ".lock" companions are skipped; the
+  // unclassifiable leftover is the one returned finding.
+  std::vector<std::string> reported =
+      WarnAboutOrphanShmSegments(shm_key, {own});
+  ASSERT_EQ(reported.size(), 1u);
+  EXPECT_EQ(reported[0], leftover.substr(1));
 }
 
 }  // namespace

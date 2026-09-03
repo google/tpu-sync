@@ -15,6 +15,9 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_CORE_UTILS_H_
 #define THIRD_PARTY_TPU_RAIDEN_CORE_UTILS_H_
 
+#include <dirent.h>
+
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -22,12 +25,20 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/strip.h"
+#include "absl/strings/string_view.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/shape.h"
 #include "tpu_sync/core/host_memory_allocator.h"
@@ -45,10 +56,93 @@ inline std::optional<std::vector<const uint8_t*>> CastExternalPointers(
   return cast_ptrs;
 }
 
+// Scans /dev/shm for segments that carry `shm_key`'s prefix but are not in
+// `expected_segment_names` (this process's own segments), and surfaces each
+// one -- nothing is removed, because liveness cannot be proven from here: a
+// crashed run's segment looks identical to a live sibling's. A name
+// matching this job's per-device naming ("<base>_dev_<N>") is most likely a
+// same-host sibling rank's segment, and a "<key>_metadata..." name is a
+// store's metadata table (this process's own or a colocated store's); both
+// are logged at INFO. Anything else does not belong to a running shape of
+// this job and is logged at WARNING as a possibly stale leftover. ".lock"
+// companion files are skipped. Returns the WARNING-class names (without the
+// leading '/'), so tests can observe what was flagged.
+inline std::vector<std::string> WarnAboutOrphanShmSegments(
+    absl::string_view shm_key,
+    const std::vector<std::string>& expected_segment_names) {
+  std::vector<std::string> stale_suspects;
+  const absl::string_view prefix = absl::StripPrefix(shm_key, "/");
+  if (prefix.empty()) {
+    return stale_suspects;
+  }
+  // Directory entries carry no leading '/'; compare stripped.
+  std::vector<std::string> expected;
+  expected.reserve(expected_segment_names.size());
+  for (const std::string& name : expected_segment_names) {
+    expected.emplace_back(absl::StripPrefix(name, "/"));
+  }
+  // This job's per-device names look like "<base>_dev_<N>"; an unexpected
+  // one is most likely a same-host sibling rank's segment.
+  const std::string sibling_prefix = absl::StrCat(
+      absl::StripPrefix(
+          SharedMemoryHostMemoryAllocator::ComposeSegmentName(shm_key,
+                                                              std::nullopt),
+          "/"),
+      "_dev_");
+  const std::string metadata_prefix = absl::StrCat(prefix, "_metadata");
+  DIR* dir = opendir("/dev/shm");
+  if (dir == nullptr) {
+    // No scannable shm directory on this system; nothing to surface.
+    return stale_suspects;
+  }
+  auto close_dir = absl::MakeCleanup([dir]() { closedir(dir); });
+  while (const dirent* entry = readdir(dir)) {
+    const absl::string_view name(entry->d_name);
+    if (!absl::StartsWith(name, prefix)) continue;
+    if (absl::EndsWith(name, ".lock")) continue;
+    if (std::find(expected.begin(), expected.end(), name) != expected.end()) {
+      continue;
+    }
+    const absl::string_view device_suffix =
+        absl::StartsWith(name, sibling_prefix)
+            ? name.substr(sibling_prefix.size())
+            : absl::string_view();
+    if (!device_suffix.empty() &&
+        std::all_of(device_suffix.begin(), device_suffix.end(),
+                    absl::ascii_isdigit)) {
+      LOG(INFO) << "[SHM_ALLOCATOR] /dev/shm/" << name
+                << " matches this job's per-device segment naming but is not "
+                << "one of this manager's segments; likely a sibling rank's "
+                << "segment on this host (stale only if no such rank is "
+                << "running).";
+      continue;
+    }
+    if (absl::StartsWith(name, metadata_prefix)) {
+      LOG(INFO) << "[SHM_ALLOCATOR] /dev/shm/" << name
+                << " is a KV metadata table under this key -- this store's "
+                << "own or a colocated store's.";
+      continue;
+    }
+    LOG(WARNING) << "[SHM_ALLOCATOR] /dev/shm/" << name << " carries the "
+                 << "shm key prefix but does not match this job's segment "
+                 << "naming; possibly a stale leftover. /dev/shm is never "
+                 << "cleaned automatically.";
+    stale_suspects.push_back(std::string(name));
+  }
+  return stale_suspects;
+}
+
 // Picks the host buffer allocator for a KVCacheManager. Shared memory is
 // used only when the manager opted in (enable_shm) AND the deployment
 // provides a segment namespace (RAIDEN_SHM_KEY); managers whose host buffers
 // are transient staging (transfer engines) must not use shm.
+//
+// num_host_blocks is the resolved host pool block count -- the same
+// host_blocks_to_allocate-or-num_slots*max_blocks resolution the manager
+// applies -- and feeds the segment identity, so a pool resize is detected
+// as an incompatible segment instead of warm-attaching at the wrong stride.
+// total_payload_bytes only seeds the expected-schema field of that name,
+// which the allocator owns (cumulative payload) and never validates.
 inline HostBufferAllocator CreateHostMemoryAllocator(
     xla::PjRtClient* client, bool enable_shm, int64_t num_host_blocks = 0,
     size_t total_payload_bytes = 0) {
@@ -73,6 +167,21 @@ inline HostBufferAllocator CreateHostMemoryAllocator(
       return [status](size_t size_bytes, const xla::PjRtDevice* device)
                  -> absl::StatusOr<HostBufferAllocation> { return status; };
     }
+    // The segment names this process can own are one per addressable device
+    // (plus the no-device name used without a device context); classification
+    // is by name alone, so scanning before any segment is created is safe.
+    std::vector<std::string> expected_segments;
+    if (client != nullptr) {
+      for (const xla::PjRtDevice* device : client->addressable_devices()) {
+        expected_segments.push_back(
+            SharedMemoryHostMemoryAllocator::ComposeSegmentName(
+                shm_key_env, device->global_device_id().value()));
+      }
+    }
+    expected_segments.push_back(
+        SharedMemoryHostMemoryAllocator::ComposeSegmentName(shm_key_env,
+                                                            std::nullopt));
+    (void)WarnAboutOrphanShmSegments(shm_key_env, expected_segments);
     std::shared_ptr<HostMemoryAllocator> allocator =
         std::move(allocator_or).value();
     return [allocator](size_t size_bytes, const xla::PjRtDevice* device)

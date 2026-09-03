@@ -43,19 +43,31 @@
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi_internal.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace tpu_raiden {
 namespace weight_sync {
 
+WeightSynchronizerBase* g_weight_synchronizers[32] = {nullptr};
+std::unique_ptr<stream_executor::Stream> g_streams[32] = {nullptr};
+
 static absl::Mutex ws_mu;
 static auto* ws_map =
     new absl::flat_hash_map<int32_t, WeightSynchronizerBase*>();
+static auto* ws_shard_to_slot_map =
+    new absl::flat_hash_map<WeightSynchronizerBase*,
+                            absl::flat_hash_map<int32_t, size_t>>();
 
 void ClearSharedWsMap() {
   absl::MutexLock lock(ws_mu);
   ws_map->clear();
+  ws_shard_to_slot_map->clear();
+  for (int i = 0; i < 32; ++i) {
+    g_weight_synchronizers[i] = nullptr;
+    g_streams[i].reset();
+  }
 }
 
 // Retains and returns a thread-safe singleton instance of
@@ -68,23 +80,75 @@ static WeightSynchronizerBase* GetSharedWs(
     int32_t parallelism, const std::vector<size_t>& slice_byte_sizes,
     int32_t local_port, int32_t num_shards) {
   absl::MutexLock lock(ws_mu);
-  // Support 0 as a valid port for auto-allocation, while keeping it shared in
-  // the process.
-  int32_t key = (listener_port >= 0) ? listener_port : -(shard_idx + 1);
+  int32_t submanager_idx = (num_shards > 0) ? (shard_idx / num_shards) : 0;
+  int32_t key = (listener_port > 0)
+                    ? (listener_port + submanager_idx)
+                    : (listener_port == 0 ? -(submanager_idx + 1)
+                                          : -(submanager_idx + 1000));
   auto& ws = (*ws_map)[key];
   if (ws == nullptr) {
     std::optional<int> opt_listener_port =
-        (listener_port >= 0) ? std::make_optional(listener_port) : std::nullopt;
+        (listener_port >= 0)
+            ? std::make_optional(
+                  listener_port > 0 ? (listener_port + submanager_idx) : 0)
+            : std::nullopt;
+    std::optional<int> opt_local_port =
+        (local_port > 0)
+            ? std::make_optional(local_port + submanager_idx)
+            : (local_port == 0 ? std::make_optional(0) : std::nullopt);
+
+    std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses();
+    std::vector<HostNicAddress> data_nics;
+    for (const auto& nic : host_nics) {
+      if (nic.classification == NicClassification::kDataPlane) {
+        data_nics.push_back(nic);
+      }
+    }
+    std::optional<std::string> sub_bind_ip = std::nullopt;
+    if (submanager_idx < static_cast<int>(data_nics.size())) {
+      sub_bind_ip = data_nics[submanager_idx].ip_address;
+    } else if (!data_nics.empty()) {
+      sub_bind_ip = data_nics[submanager_idx % data_nics.size()].ip_address;
+    }
+
     ws = new WeightSynchronizerBase(
         static_cast<size_t>(num_layers), static_cast<size_t>(num_shards),
-        slice_byte_sizes, std::make_optional(local_port), std::nullopt,
-        parallelism, opt_listener_port);
+        slice_byte_sizes, opt_local_port, std::nullopt, parallelism,
+        opt_listener_port, sub_bind_ip);
+  }
+  auto& slot_map = (*ws_shard_to_slot_map)[ws];
+  auto [it, inserted] = slot_map.try_emplace(
+      shard_idx, static_cast<size_t>(shard_idx) % ws->num_shards());
+  if (inserted) {
+    std::vector<int64_t> indices(ws->num_shards(), -1);
+    for (const auto& [s_id, s_slot] : slot_map) {
+      if (s_slot < indices.size()) {
+        indices[s_slot] = s_id;
+      }
+    }
+    ws->SetGlobalShardIndices(std::move(indices));
   }
   return ws;
 }
 
-WeightSynchronizerBase* g_weight_synchronizers[32] = {nullptr};
-std::unique_ptr<stream_executor::Stream> g_streams[32] = {nullptr};
+static size_t GetLocalSlot(int32_t shard_idx) {
+  if (shard_idx < 0 || shard_idx >= 32) {
+    return 0;
+  }
+  WeightSynchronizerBase* ws = g_weight_synchronizers[shard_idx];
+  if (ws == nullptr) {
+    return static_cast<size_t>(shard_idx);
+  }
+  absl::MutexLock lock(ws_mu);
+  auto it = ws_shard_to_slot_map->find(ws);
+  if (it != ws_shard_to_slot_map->end()) {
+    auto slot_it = it->second.find(shard_idx);
+    if (slot_it != it->second.end()) {
+      return slot_it->second;
+    }
+  }
+  return static_cast<size_t>(shard_idx) % ws->num_shards();
+}
 
 // FFI Init custom call implementation for WeightSynchronizer (Host CPU
 // Executed)
@@ -302,8 +366,7 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
   }
 
   // --- D2H Part (Loop through all passed layers) ---
-  size_t local_slot = static_cast<size_t>(shard_idx) %
-                      g_weight_synchronizers[shard_idx]->num_shards();
+  size_t local_slot = GetLocalSlot(shard_idx);
 
   for (size_t i = 0; i < jax_arrays.size(); ++i) {
     auto anchor = jax_arrays[i];
@@ -388,8 +451,7 @@ xla::ffi::Error TriggerH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
   }
 
   size_t size = g_weight_synchronizers[shard_idx]->block_bytes(layer_idx);
-  size_t local_slot = static_cast<size_t>(shard_idx) %
-                      g_weight_synchronizers[shard_idx]->num_shards();
+  size_t local_slot = GetLocalSlot(shard_idx);
   const uint8_t* src_host_ptr =
       g_weight_synchronizers[shard_idx]->GetHostBufferPtr(layer_idx,
                                                           local_slot);
@@ -433,8 +495,7 @@ xla::ffi::Error TriggerMultiH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
   }
 
   size_t num_layers = rets.size();
-  size_t local_slot = static_cast<size_t>(shard_idx) %
-                      g_weight_synchronizers[shard_idx]->num_shards();
+  size_t local_slot = GetLocalSlot(shard_idx);
 
   for (size_t i = 0; i < num_layers; ++i) {
     auto ret_or = rets.get<xla::ffi::AnyBuffer>(i);
@@ -496,8 +557,7 @@ xla::ffi::Error TriggerD2HImpl(xla::ffi::AnyBuffer anchor,
   }
 
   size_t size = g_weight_synchronizers[shard_idx]->block_bytes(layer_idx);
-  size_t local_slot = static_cast<size_t>(shard_idx) %
-                      g_weight_synchronizers[shard_idx]->num_shards();
+  size_t local_slot = GetLocalSlot(shard_idx);
   uint8_t* dst_host_ptr =
       const_cast<uint8_t*>(g_weight_synchronizers[shard_idx]->GetHostBufferPtr(
           layer_idx, local_slot));

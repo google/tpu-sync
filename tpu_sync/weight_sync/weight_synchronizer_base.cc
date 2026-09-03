@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -677,9 +678,13 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   const auto& schedules = request.shard_push_schedules();
   for (size_t i = 0; i < num_shards_; ++i) {
     int64_t global_shard = global_shard_index(i);
+    int64_t local_shard = local_shard_index(i);
     auto it = schedules.find(static_cast<int32_t>(global_shard));
     if (it == schedules.end()) {
-      continue;
+      it = schedules.find(static_cast<int32_t>(local_shard));
+      if (it == schedules.end()) {
+        continue;
+      }
     }
     const auto& schedule = it->second;
 
@@ -1037,22 +1042,8 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
     absl::MutexLock lock(pending_h2d_mu_);
     auto it = pending_h2d_states_.find(uuid);
     if (it != pending_h2d_states_.end()) {
-      auto condition_fn =
-          +[](std::pair<WeightSynchronizerBase*, uint64_t>* p)
-              ABSL_NO_THREAD_SAFETY_ANALYSIS {
-                auto it = p->first->pending_h2d_states_.find(p->second);
-                if (it == p->first->pending_h2d_states_.end()) return true;
-                return it->second.layer_futures.size() >=
-                       it->second.expected_layers;
-              };
-      std::pair<WeightSynchronizerBase*, uint64_t> ctx{this, uuid};
-      pending_h2d_mu_.Await(absl::Condition(condition_fn, &ctx));
-
-      it = pending_h2d_states_.find(uuid);
-      if (it != pending_h2d_states_.end()) {
-        layer_futures_map = std::move(it->second.layer_futures);
-        pending_h2d_states_.erase(it);
-      }
+      layer_futures_map = std::move(it->second.layer_futures);
+      pending_h2d_states_.erase(it);
     }
   }
 
@@ -1095,28 +1086,30 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
 void WeightSynchronizerBase::DrainPendingH2d() {
   if (!auto_h2d_) return;
 
-  std::vector<uint64_t> active_uuids;
+  absl::flat_hash_map<uint64_t, PendingH2dState> pending_states;
   {
     absl::MutexLock lock(pending_h2d_mu_);
-    for (const auto& [uuid, _] : pending_h2d_states_) {
-      if (uuid > 0) {
-        active_uuids.push_back(uuid);
+    pending_states = std::move(pending_h2d_states_);
+    pending_h2d_states_.clear();
+    active_h2d_uuids_.clear();
+  }
+  for (auto& [uuid, state] : pending_states) {
+    for (auto& [layer_idx, future] : state.layer_futures) {
+      if (future.valid()) {
+        auto status_or_future = future.get();
+        if (status_or_future.ok()) {
+          (void)status_or_future->Await();
+        }
       }
     }
-  }
-  for (uint64_t uuid : active_uuids) {
-    absl::Status status = WaitForTransferCompletion(uuid);
-    if (!status.ok()) {
-      LOG(ERROR) << "Failed waiting for transfer completion (uuid=" << uuid
-                 << ") during DrainPendingH2d: " << status;
+    if (uuid > 0) {
+      absl::MutexLock lock(completed_transfers_mu_);
+      completed_transfers_.insert(uuid);
     }
   }
 }
 
 absl::Status WeightSynchronizerBase::WaitForTransferCompletion(uint64_t uuid) {
-  if (control_delegate_ != nullptr) {
-    return control_delegate_->WaitForTransferCompletion(uuid);
-  }
   absl::MutexLock lock(completed_transfers_mu_);
   auto condition_fn =
       +[](std::pair<absl::flat_hash_set<uint64_t>*, uint64_t>* p)
@@ -1164,10 +1157,6 @@ absl::Status WeightSynchronizerBase::OnBlocksReceived(
 }
 
 void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
-  if (control_delegate_ != nullptr) {
-    control_delegate_->ForgetPushProgress(uuid);
-    return;
-  }
   RaidenManagerBase::ForgetPushProgress(uuid);
   {
     absl::MutexLock lock(completed_transfers_mu_);
@@ -1185,6 +1174,101 @@ void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
     absl::MutexLock lock(pending_h2d_mu_);
     pending_h2d_states_.erase(uuid);
   }
+}
+
+uint8_t* WeightSynchronizerBase::GetHostPointer(size_t layer_idx,
+                                                size_t shard_idx) {
+  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
+    return nullptr;
+  }
+  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
+  if (!global_shard_indices_.empty()) {
+    auto it =
+        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
+                  static_cast<int64_t>(shard_idx));
+    if (it != global_shard_indices_.end()) {
+      local_idx = std::distance(global_shard_indices_.begin(), it);
+    }
+  } else if (!local_shard_indices_.empty()) {
+    auto it =
+        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
+                  static_cast<int>(shard_idx));
+    if (it != local_shard_indices_.end()) {
+      local_idx = std::distance(local_shard_indices_.begin(), it);
+    }
+  }
+  return const_cast<uint8_t*>(layers_[layer_idx].shards[local_idx].host_ptr);
+}
+
+size_t WeightSynchronizerBase::GetHostSize(size_t layer_idx, size_t shard_idx) {
+  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
+    return 0;
+  }
+  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
+  if (!global_shard_indices_.empty()) {
+    auto it =
+        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
+                  static_cast<int64_t>(shard_idx));
+    if (it != global_shard_indices_.end()) {
+      local_idx = std::distance(global_shard_indices_.begin(), it);
+    }
+  } else if (!local_shard_indices_.empty()) {
+    auto it =
+        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
+                  static_cast<int>(shard_idx));
+    if (it != local_shard_indices_.end()) {
+      local_idx = std::distance(local_shard_indices_.begin(), it);
+    }
+  }
+  return layers_[layer_idx].shards[local_idx].host_size;
+}
+
+const uint8_t* WeightSynchronizerBase::GetHostPointer(size_t layer_idx,
+                                                      size_t shard_idx) const {
+  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
+    return nullptr;
+  }
+  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
+  if (!global_shard_indices_.empty()) {
+    auto it =
+        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
+                  static_cast<int64_t>(shard_idx));
+    if (it != global_shard_indices_.end()) {
+      local_idx = std::distance(global_shard_indices_.begin(), it);
+    }
+  } else if (!local_shard_indices_.empty()) {
+    auto it =
+        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
+                  static_cast<int>(shard_idx));
+    if (it != local_shard_indices_.end()) {
+      local_idx = std::distance(local_shard_indices_.begin(), it);
+    }
+  }
+  return layers_[layer_idx].shards[local_idx].host_ptr;
+}
+
+size_t WeightSynchronizerBase::GetHostSize(size_t layer_idx,
+                                           size_t shard_idx) const {
+  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
+    return 0;
+  }
+  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
+  if (!global_shard_indices_.empty()) {
+    auto it =
+        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
+                  static_cast<int64_t>(shard_idx));
+    if (it != global_shard_indices_.end()) {
+      local_idx = std::distance(global_shard_indices_.begin(), it);
+    }
+  } else if (!local_shard_indices_.empty()) {
+    auto it =
+        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
+                  static_cast<int>(shard_idx));
+    if (it != local_shard_indices_.end()) {
+      local_idx = std::distance(local_shard_indices_.begin(), it);
+    }
+  }
+  return layers_[layer_idx].shards[local_idx].host_size;
 }
 
 }  // namespace weight_sync

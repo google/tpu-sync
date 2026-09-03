@@ -396,6 +396,35 @@ TEST(WeightSynchronizerWrapperTest, GlobalShardOffsetMapping) {
   EXPECT_EQ(eps[0].shards, (std::vector<int64_t>{4, 5, 6, 7}));
 }
 
+TEST(WeightSynchronizerWrapperTest,
+     RegisterExpectedCountsRemainderDistribution) {
+  auto sub0_raw = new MockSubWeightSynchronizer(2, 4, 1024);
+  auto sub1_raw = new MockSubWeightSynchronizer(2, 4, 1024);
+
+  std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>> subs;
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub0_raw));
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub1_raw));
+
+  NumaAwareWeightSynchronizer numa_ws(std::move(subs));
+
+  // 5 chunks total for layer 0 (5 is not evenly divisible by 2
+  // sub-synchronizers)
+  absl::flat_hash_map<size_t, uint32_t> layer_counts = {{0, 5}};
+  EXPECT_TRUE(numa_ws.RegisterExpectedLayerChunks(202, layer_counts).ok());
+  EXPECT_TRUE(numa_ws.RegisterExpectedChunks(202, 5).ok());
+
+  // Remainder is distributed: sub0 receives 3, sub1 receives 2, sum is 5
+  EXPECT_EQ(sub0_raw->last_registered_chunks, 3);
+  EXPECT_EQ(sub0_raw->last_registered_layer_chunks[0], 3);
+
+  EXPECT_EQ(sub1_raw->last_registered_chunks, 2);
+  EXPECT_EQ(sub1_raw->last_registered_layer_chunks[0], 2);
+  EXPECT_EQ(sub0_raw->last_registered_chunks + sub1_raw->last_registered_chunks,
+            5);
+}
+
 }  // namespace
 }  // namespace jax
 }  // namespace tpu_raiden

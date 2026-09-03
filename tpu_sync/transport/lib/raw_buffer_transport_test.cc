@@ -493,6 +493,56 @@ TEST_P(RawBufferTransportTest, PushBuffersLargeBatchCorrectness) {
   EXPECT_TRUE(dst.on_data_received());
 }
 
+TEST_P(RawBufferTransportTest,
+       PushBuffersTriggersOnDataReceivedWhenChunksExceedOrEqualExpected) {
+  constexpr size_t num_tasks = 4;
+  constexpr size_t buffer_size = num_tasks;
+
+  RawMockDelegate src(buffer_size);
+  RawMockDelegate dst(buffer_size);
+
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  BindControlChannels(&src_transport, &src, &dst_transport, &dst);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  std::vector<uint8_t> payload(num_tasks);
+  RandomNonZero(absl::MakeSpan(payload));
+
+  uint64_t uuid = 12345;
+  // Register 3 expected chunks, but push 4 chunks (completed >= expected).
+  ASSERT_OK(dst_transport.RegisterExpectedChunks(uuid, 3));
+
+  std::vector<BufferPushTask> tasks;
+  tasks.reserve(num_tasks);
+  for (size_t i = 0; i < num_tasks; ++i) {
+    tasks.push_back({
+        .peer = dst_addr,
+        .buffer_id = kBufferId,
+        .dst_shard_idx = kDstShardIdx,
+        .dst_offset_bytes = i,
+        .data_ptr = &payload[i],
+        .size_bytes = 1,
+    });
+  }
+
+  const auto push_res =
+      src_transport.PushBuffers(tasks, /*parallelism=*/1, uuid);
+  EXPECT_OK(push_res) << push_res.message();
+
+  EXPECT_THAT(dst.DataSpan(0, num_tasks),
+              Pointwise(Eq(), absl::MakeConstSpan(payload)));
+  EXPECT_TRUE(dst.on_data_received());
+}
+
+TEST_P(RawBufferTransportTest, RegisterExpectedChunksZeroCountOk) {
+  RawMockDelegate dst(1024);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  EXPECT_OK(dst_transport.RegisterExpectedChunks(999, 0));
+}
+
 INSTANTIATE_TEST_SUITE_P(
     PspAndPlainTcp, RawBufferTransportTest, ::testing::Bool(),
     [](const ::testing::TestParamInfo<bool>& info) {

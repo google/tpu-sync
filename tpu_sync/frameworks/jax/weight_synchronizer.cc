@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -141,6 +142,7 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
   if (!sub_synchronizers_.empty() && sub_synchronizers_[0]) {
     sub_synchronizers_[0]->SetGlobalShardIndices(
         submanager_to_global_shards_[0]);
+    sub_synchronizers_[0]->SetLocalShardIndices(submanager_to_local_shards_[0]);
     sub_synchronizers_[0]->SetControlDelegate(this);
   }
 }
@@ -176,6 +178,8 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
     if (sub_synchronizers_[s]) {
       sub_synchronizers_[s]->SetGlobalShardIndices(
           submanager_to_global_shards_[s]);
+      sub_synchronizers_[s]->SetLocalShardIndices(
+          submanager_to_local_shards_[s]);
       if (s == 0) {
         sub_synchronizers_[s]->SetControlDelegate(this);
       }
@@ -200,7 +204,7 @@ void NumaAwareWeightSynchronizer::InitSubManagers(
   global_shard_offset_ = global_shard_offset.value_or(0);
   global_shard_to_submanager_.resize(total_num_shards_);
 
-  absl::flat_hash_map<int, std::vector<int>> numa_to_shards;
+  absl::btree_map<int, std::vector<int>> numa_to_shards;
   for (size_t sh = 0; sh < total_num_shards_; ++sh) {
     int numa = 0;
     if (layer_buffers[0][sh].device != nullptr) {
@@ -337,6 +341,7 @@ void NumaAwareWeightSynchronizer::InitSubManagers(
       }
 
       sub_sync->SetGlobalShardIndices(submanager_to_global_shards_[sub_idx]);
+      sub_sync->SetLocalShardIndices(submanager_to_local_shards_[sub_idx]);
       if (sub_idx == 0) {
         sub_sync->SetControlDelegate(this);
       }
@@ -664,7 +669,11 @@ absl::Status NumaAwareWeightSynchronizer::RegisterExpectedChunks(
                               ? submanager_to_global_shards_[s].size()
                               : 0;
       if (total_num_shards_ > 0 && sub_shards > 0) {
-        sub_totals[s] = (expected_chunks * sub_shards) / total_num_shards_;
+        uint32_t base_count =
+            (expected_chunks * sub_shards) / total_num_shards_;
+        uint32_t remainder = (expected_chunks * sub_shards) % total_num_shards_;
+        uint32_t remainder_subs = remainder / sub_shards;
+        sub_totals[s] = base_count + (s < remainder_subs ? 1 : 0);
         if (sub_totals[s] == 0 && expected_chunks > 0) {
           sub_totals[s] = expected_chunks;
         }
@@ -712,7 +721,10 @@ absl::Status NumaAwareWeightSynchronizer::RegisterExpectedLayerChunks(
         if (count == 0) continue;
         uint32_t sub_count = count;
         if (total_num_shards_ > 0 && sub_shards > 0) {
-          sub_count = (count * sub_shards) / total_num_shards_;
+          uint32_t base_count = (count * sub_shards) / total_num_shards_;
+          uint32_t remainder = (count * sub_shards) % total_num_shards_;
+          uint32_t remainder_subs = remainder / sub_shards;
+          sub_count = base_count + (s < remainder_subs ? 1 : 0);
           if (sub_count == 0) {
             sub_count = count;
           }

@@ -1158,6 +1158,89 @@ TEST_F(WeightSynchronizerTest, OneDimensionalTiledTensorH2dAndD2hRoundtrip) {
   }
 }
 
+TEST_F(WeightSynchronizerTest, DrainPendingH2dDrainsActivePendingFutures) {
+  auto ws = std::make_unique<WeightSynchronizerBase>(
+      /*num_layers=*/2, /*num_shards=*/1, slice_byte_size_,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+      /*parallelism=*/2, /*listener_port=*/0, /*bind_ip=*/std::nullopt,
+      /*layer_names=*/std::vector<std::string>{"layer_0", "layer_1"},
+      /*auto_h2d=*/true);
+
+  uint64_t uuid = 54321;
+  EXPECT_TRUE(ws->OnLayerDataReceived(0, uuid).ok());
+  EXPECT_TRUE(ws->OnLayerDataReceived(1, uuid).ok());
+
+  // DrainPendingH2d should drain all scheduled futures and mark uuid completed
+  ws->DrainPendingH2d();
+
+  EXPECT_TRUE(ws->WaitForTransferCompletion(uuid).ok());
+  ws->ForgetPushProgress(uuid);
+}
+
+TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeNonContiguousGlobalShards) {
+  const size_t num_layers = 2;
+  const size_t num_shards = 4;
+  const size_t slice_size = 1024;
+  auto ws = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  // Configure non-contiguous global shards, e.g., NUMA node 0 managing shards
+  // {0, 2, 4, 6}
+  ws->SetGlobalShardIndices({0, 2, 4, 6});
+
+  // Check that GetHostPointer correctly maps global shard indices to internal
+  // slots 0, 1, 2, 3
+  uint8_t* ptr_shard0 = ws->GetHostPointer(0, 0);
+  uint8_t* ptr_shard2 = ws->GetHostPointer(0, 2);
+  uint8_t* ptr_shard4 = ws->GetHostPointer(0, 4);
+  uint8_t* ptr_shard6 = ws->GetHostPointer(0, 6);
+
+  ASSERT_NE(ptr_shard0, nullptr);
+  ASSERT_NE(ptr_shard2, nullptr);
+  ASSERT_NE(ptr_shard4, nullptr);
+  ASSERT_NE(ptr_shard6, nullptr);
+
+  EXPECT_EQ(ptr_shard0, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 0)));
+  EXPECT_EQ(ptr_shard2, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 1)));
+  EXPECT_EQ(ptr_shard4, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 2)));
+  EXPECT_EQ(ptr_shard6, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 3)));
+
+  // Ensure all 4 resolved pointers are distinct
+  EXPECT_NE(ptr_shard0, ptr_shard2);
+  EXPECT_NE(ptr_shard0, ptr_shard4);
+  EXPECT_NE(ptr_shard0, ptr_shard6);
+  EXPECT_NE(ptr_shard2, ptr_shard4);
+  EXPECT_NE(ptr_shard2, ptr_shard6);
+  EXPECT_NE(ptr_shard4, ptr_shard6);
+
+  // Check sizes
+  EXPECT_EQ(ws->GetHostSize(0, 0), slice_size);
+  EXPECT_EQ(ws->GetHostSize(0, 2), slice_size);
+  EXPECT_EQ(ws->GetHostSize(0, 4), slice_size);
+  EXPECT_EQ(ws->GetHostSize(0, 6), slice_size);
+
+  // Const overloads
+  const auto* const_ws = ws.get();
+  EXPECT_EQ(const_ws->GetHostPointer(0, 0), ws->GetHostBufferPtr(0, 0));
+  EXPECT_EQ(const_ws->GetHostPointer(0, 2), ws->GetHostBufferPtr(0, 1));
+  EXPECT_EQ(const_ws->GetHostPointer(0, 4), ws->GetHostBufferPtr(0, 2));
+  EXPECT_EQ(const_ws->GetHostPointer(0, 6), ws->GetHostBufferPtr(0, 3));
+  EXPECT_EQ(const_ws->GetHostSize(0, 0), slice_size);
+  EXPECT_EQ(const_ws->GetHostSize(0, 2), slice_size);
+
+  // Verify memory writes do not collide
+  std::memset(ptr_shard0, 0x11, slice_size);
+  std::memset(ptr_shard2, 0x22, slice_size);
+  std::memset(ptr_shard4, 0x33, slice_size);
+  std::memset(ptr_shard6, 0x44, slice_size);
+
+  EXPECT_EQ(ws->GetHostBufferPtr(0, 0)[0], 0x11);
+  EXPECT_EQ(ws->GetHostBufferPtr(0, 1)[0], 0x22);
+  EXPECT_EQ(ws->GetHostBufferPtr(0, 2)[0], 0x33);
+  EXPECT_EQ(ws->GetHostBufferPtr(0, 3)[0], 0x44);
+}
+
 }  // namespace
 }  // namespace weight_sync
 }  // namespace tpu_raiden

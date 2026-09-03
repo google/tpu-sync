@@ -228,6 +228,7 @@ cc_library(
     tags = ["manual"],
     visibility = ["//visibility:public"],
     deps = [
+        "//tpu_sync/core:tpu_utils",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
@@ -293,6 +294,7 @@ cc_library(
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
+        "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
@@ -400,6 +402,7 @@ cc_library(
     ] + _X86_MARCH_COPTS,
     features = ["-use_header_modules"],
     deps = [
+        "//tpu_sync/core:tpu_utils",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
@@ -459,6 +462,7 @@ cc_library(
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
+        "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",

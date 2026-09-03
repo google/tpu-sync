@@ -152,6 +152,15 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
     }
     return static_cast<int64_t>(local_shard_idx);
   }
+  void SetLocalShardIndices(std::vector<int> indices) {
+    local_shard_indices_ = std::move(indices);
+  }
+  int64_t local_shard_index(size_t local_shard_idx) const {
+    if (local_shard_idx < local_shard_indices_.size()) {
+      return local_shard_indices_[local_shard_idx];
+    }
+    return static_cast<int64_t>(local_shard_idx);
+  }
 
   virtual absl::Status PushWeights(const std::vector<std::string>& peers);
   virtual absl::Status PushWeightsLocal(const std::vector<std::string>& peers);
@@ -182,6 +191,12 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
     }
     return layers_[layer_idx].shards[shard_idx].host_ptr;
   }
+
+  uint8_t* GetHostPointer(size_t layer_idx, size_t shard_idx) override;
+  size_t GetHostSize(size_t layer_idx, size_t shard_idx) override;
+  const uint8_t* GetHostPointer(size_t layer_idx,
+                                size_t shard_idx) const override;
+  size_t GetHostSize(size_t layer_idx, size_t shard_idx) const override;
 
   // Returns the list of layer names associated with the weight synchronizer.
   const std::vector<std::string>& layer_names() const { return layer_names_; }
@@ -297,6 +312,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
  private:
   WeightSynchronizerControlDelegate* control_delegate_ = nullptr;
   std::vector<int64_t> global_shard_indices_;
+  std::vector<int> local_shard_indices_;
 
   // When enabled, automatically schedules asynchronous device transfers (H2D)
   // upon complete host buffer writes.

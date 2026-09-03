@@ -34,3 +34,67 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "shm_writer",
+    srcs = ["shm_writer.cc"],
+    hdrs = ["shm_writer.h"],
+    deps = [
+        ":shm_layout",
+        "//tpu_sync/telemetry:metrics_backend",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/hash",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/random",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "shm_writer_test",
+    srcs = ["shm_writer_test.cc"],
+    deps = [
+        ":shm_layout",
+        ":shm_writer",
+        "//tpu_sync/telemetry:metrics_backend",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "shm_collector",
+    srcs = ["shm_collector.cc"],
+    hdrs = ["shm_collector.h"],
+    deps = [
+        ":shm_layout",
+        "//tpu_sync/telemetry:metrics_backend",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "shm_collector_test",
+    srcs = ["shm_collector_test.cc"],
+    deps = [
+        ":shm_collector",
+        ":shm_layout",
+        ":shm_writer",
+        "//tpu_sync/telemetry:metrics_backend",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

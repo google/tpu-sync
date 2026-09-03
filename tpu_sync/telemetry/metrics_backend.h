@@ -55,6 +55,9 @@ struct ExporterOptions {
   // unset (std::nullopt) or empty, telemetry initialization falls back to the
   // LOCAL_RANK environment variable.
   std::optional<std::string> local_rank;
+  // Base directory for POSIX shared-memory segments for inter-worker telemetry
+  // aggregation.
+  std::optional<std::string> shm_dir;
 };
 
 // Structure defining centralized metadata for a Raiden metric.

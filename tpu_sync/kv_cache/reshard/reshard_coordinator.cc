@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/strings/str_join.h"
 #include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -430,6 +431,12 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
               "No control endpoint recorded for ", PythonRepr(unit)));
           return;
         }
+        std::fprintf(stderr,
+                     "{\"event\": \"raiden_pool_reshard_arm\", \"dst_unit\": "
+                     "\"%s\", \"pool_dtype_tags\": \"%s\", \"uuid\": %lld}\n",
+                     PythonRepr(unit).c_str(),
+                     absl::StrJoin(plan.pool_dtype_tags, ",").c_str(),
+                     static_cast<long long>(plan.uuid));
         const std::string arm_payload = EncodeStartTransfer(plan, unit);
         arm_status[i] = SendWorkerRpc(transport_, addr_it->second, arm_payload);
       });

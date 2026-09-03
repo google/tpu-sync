@@ -421,20 +421,11 @@ RequestBlockRegistry::LookupAndClaim(const std::string& req_id, int64_t uuid,
   }
   std::set<RaidenId, RaidenIdLess> claimed_units(units.begin(), units.end());
   auto existing_units_it = claimed_units_.find(lifecycle_key);
-  if (existing_units_it != claimed_units_.end()) {
-    auto owner_it = claimed_owners_.find(lifecycle_key);
-    const void* existing_owner =
-        owner_it == claimed_owners_.end() ? nullptr : owner_it->second;
-    if (existing_owner != claim_owner) {
-      return absl::InvalidArgumentError(
-          "Request block snapshot is already claimed by another planning "
-          "attempt");
-    }
-    if (existing_units_it->second != claimed_units) {
-      return absl::InvalidArgumentError(
-          "Request block snapshot was already claimed for a different "
-          "source unit set");
-    }
+  if (existing_units_it != claimed_units_.end() &&
+      existing_units_it->second != claimed_units) {
+    return absl::InvalidArgumentError(
+        "Request block snapshot was already claimed for a different "
+        "source unit set");
   }
   std::map<RaidenId, RequestBlockRegistration, RaidenIdLess> result;
   for (const RaidenId& unit : units) {
@@ -450,7 +441,7 @@ RequestBlockRegistry::LookupAndClaim(const std::string& req_id, int64_t uuid,
   // validated and copied while cancellation is excluded by the shared lock.
   claimed_[lifecycle_key] = now + ttl_s_;
   claimed_units_[lifecycle_key] = claimed_units;
-  claimed_owners_[lifecycle_key] = claim_owner;
+  claimed_owners_[lifecycle_key].insert(claim_owner);
   auto completion_it = completed_units_.find(lifecycle_key);
   if (completion_it != completed_units_.end()) {
     completion_it->second.expires_at = now + ttl_s_;
@@ -474,14 +465,15 @@ bool RequestBlockRegistry::AbandonClaim(const std::string& req_id, int64_t uuid,
   absl::MutexLock lock(*mu_);
   auto claimed_it = claimed_.find(lifecycle_key);
   auto owner_it = claimed_owners_.find(lifecycle_key);
-  const void* existing_owner =
-      owner_it == claimed_owners_.end() ? nullptr : owner_it->second;
-  if (claimed_it == claimed_.end() || existing_owner != claim_owner) {
+  if (claimed_it == claimed_.end() || owner_it == claimed_owners_.end() ||
+      owner_it->second.erase(claim_owner) == 0) {
     return false;
   }
-  claimed_.erase(lifecycle_key);
-  claimed_units_.erase(lifecycle_key);
-  claimed_owners_.erase(lifecycle_key);
+  if (owner_it->second.empty()) {
+    claimed_.erase(lifecycle_key);
+    claimed_units_.erase(lifecycle_key);
+    claimed_owners_.erase(lifecycle_key);
+  }
   return true;
 }
 

@@ -864,6 +864,97 @@ TEST_F(ReshardStackTest, SubsetSourceManifestsPairPoolsByTag) {
   }
 }
 
+TEST_F(ReshardStackTest, PipelinedDestinationStagesShareOneRequestClaim) {
+  // Pipeline-parallel on both sides: source rank r and destination stage r
+  // each register only layer r's pool. Every destination stage plans the
+  // same request against the whole source rank set; the planner keeps the
+  // source with its layer, and the request claim is shared by the stages.
+  auto dst_stage = [](int stage) {
+    RaidenId unit = DstUnit();
+    unit.job_replica_id = absl::StrCat(unit.job_replica_id, "-rank", stage);
+    return unit;
+  };
+  for (int rank = 0; rank < 2; ++rank) {
+    tpu_sync::rpc::ControlRequest req;
+    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+    auto* reg = req.mutable_register_work_unit_request();
+    *reg->mutable_unit() = RaidenIdToProto(Unit(rank));
+    reg->add_shards(absl::StrCat("10.0.0.1:", 9000 + rank));
+    reg->set_control_plane_rpc_address(absl::StrCat("10.0.0.1:", 9100 + rank));
+    *reg->add_pools() = MakePool(absl::StrCat("fa.l", rank), 1024, 1024, 16);
+    reg->set_layout_fingerprint("fp1");
+    reg->set_page_tokens(512);
+    reg->set_transfer_parallelism(2);
+    reg->set_transfer_rank(rank);
+    ASSERT_TRUE(Handle(req.SerializeAsString()).success());
+  }
+  for (int stage = 0; stage < 2; ++stage) {
+    tpu_sync::rpc::ControlRequest req;
+    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+    auto* reg = req.mutable_register_work_unit_request();
+    *reg->mutable_unit() = RaidenIdToProto(dst_stage(stage));
+    reg->add_shards(absl::StrCat("10.0.0.2:", 9400 + stage));
+    reg->set_control_plane_rpc_address(absl::StrCat("10.0.0.2:", 9600 + stage));
+    *reg->add_pools() = MakePool(absl::StrCat("fa.l", stage), 1024, 1024, 16);
+    reg->set_layout_fingerprint("fp1");
+    reg->set_page_tokens(512);
+    reg->set_transfer_parallelism(2);
+    reg->set_transfer_rank(stage);
+    ASSERT_TRUE(Handle(req.SerializeAsString()).success());
+  }
+  for (int rank = 0; rank < 2; ++rank) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_REGISTER_REQUEST_BLOCKS);
+    auto* block_req = req.mutable_register_request_blocks_request();
+    block_req->set_req_id("req-pp2");
+    block_req->set_uuid(78);
+    *block_req->mutable_unit() = RaidenIdToProto(Unit(rank));
+    block_req->add_block_ids(3 + rank);
+    auto* entry = block_req->add_pool_spans();
+    entry->set_tag(absl::StrCat("fa.l", rank));
+    entry->add_block_ids(3 + rank);
+    auto* span = entry->add_spans();
+    span->set_src_block_ordinal(0);
+    span->set_src_offset_bytes(0);
+    span->set_dst_block_index(0);
+    span->set_dst_offset_bytes(0);
+    span->set_size_bytes(1024);
+    span->set_count(1);
+    entry->set_declared_bytes(1024);
+    entry->set_dst_space_version(1);
+    ASSERT_TRUE(HandleController(req.SerializeAsString()).success());
+  }
+
+  for (int stage = 0; stage < 2; ++stage) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_COORDINATE_TRANSFER);
+    auto* coord = req.mutable_coordinate_transfer_request();
+    *coord->add_src_units() = RaidenIdToProto(Unit(0));
+    *coord->add_src_units() = RaidenIdToProto(Unit(1));
+    *coord->add_dst_units() = RaidenIdToProto(dst_stage(stage));
+    coord->set_uuid(78);
+    coord->set_is_sender(true);
+    coord->set_dst_mem_type(tpu_sync::rpc::MEMORY_TYPE_HBM);
+    coord->set_use_block_chunks(true);
+    coord->set_req_id("req-pp2");
+    coord->add_dst_device_block_ids(7);
+    coord->add_transfer_pool_tags(absl::StrCat("fa.l", stage));
+    coord->add_dst_block_counts(1);
+    tpu_sync::rpc::ControllerResponse resp =
+        HandleController(req.SerializeAsString());
+    ASSERT_TRUE(resp.success()) << "stage " << stage << ": " << resp.message();
+  }
+
+  // Per stage: one arm on that stage, one sender on the rank with its layer.
+  ASSERT_EQ(transport_.calls_.size(), 4u);
+  EXPECT_EQ(transport_.calls_[0].first, "10.0.0.2:9600");
+  EXPECT_EQ(transport_.calls_[1].first, "10.0.0.1:9100");
+  EXPECT_EQ(transport_.calls_[2].first, "10.0.0.2:9601");
+  EXPECT_EQ(transport_.calls_[3].first, "10.0.0.1:9101");
+}
+
 TEST_F(ReshardStackTest, SpansForAnUnregisteredTagAreRefusedAtRegistration) {
   // A rank that registers no pool for a tag cannot declare spans for it:
   // the registry refuses the declaration before it can reach planning.

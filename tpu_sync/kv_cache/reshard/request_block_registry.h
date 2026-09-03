@@ -127,7 +127,11 @@ class RequestBlockRegistry {
   std::map<LifecycleKey, double> claimed_ ABSL_GUARDED_BY(mu_);
   std::map<LifecycleKey, std::set<RaidenId, RaidenIdLess>> claimed_units_
       ABSL_GUARDED_BY(mu_);
-  std::map<LifecycleKey, const void*> claimed_owners_ ABSL_GUARDED_BY(mu_);
+  // Every planning attempt holding the claim; a pipelined consumer plans
+  // one request once per destination stage, all against the same source
+  // unit set, and the claim outlives the last of them.
+  std::map<LifecycleKey, std::set<const void*>> claimed_owners_
+      ABSL_GUARDED_BY(mu_);
   std::map<LifecycleKey, Completions> completed_units_ ABSL_GUARDED_BY(mu_);
   std::map<LifecycleKey, double> cancelled_ ABSL_GUARDED_BY(mu_);
 };

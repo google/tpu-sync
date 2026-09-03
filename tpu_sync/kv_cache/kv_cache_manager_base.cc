@@ -41,6 +41,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
@@ -2701,10 +2702,17 @@ absl::Status KVCacheManagerBase::RegisterActivePlan(
     }
     for (size_t pool_idx = 0; pool_idx < pools_.size(); ++pool_idx) {
       if (request.pool_dtype_tags(pool_idx) != pools_[pool_idx].dtype_tag) {
+        std::string local_pools;
+        for (size_t i = 0; i < pools_.size(); ++i) {
+          absl::StrAppend(&local_pools, i ? "," : "", pools_[i].tag, ":",
+                          pools_[i].dtype_tag);
+        }
         return absl::InvalidArgumentError(absl::StrCat(
             "plan dtype tag mismatch for pool ", pool_idx, " (",
             pools_[pool_idx].tag, "): plan=", request.pool_dtype_tags(pool_idx),
-            " local=", pools_[pool_idx].dtype_tag));
+            " local=", pools_[pool_idx].dtype_tag, "; plan dtype tags=[",
+            absl::StrJoin(request.pool_dtype_tags(), ","),
+            "] local pools=[", local_pools, "]"));
       }
     }
   }

@@ -59,6 +59,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -940,10 +941,17 @@ absl::Status KVCacheManagerWithTransfer::ValidatePoolReshardPlan(
           absl::StrCat("transfer pool index out of range: ", pool_idx));
     }
     if (plan.pool_dtype_tags(pool_idx) != spec->dtype_tag) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("plan dtype tag mismatch for pool ", pool_idx, " (",
-                       spec->tag, "): plan=", plan.pool_dtype_tags(pool_idx),
-                       " local=", spec->dtype_tag));
+      std::string local_pools;
+      for (size_t i = 0; i < num_pools(); ++i) {
+        absl::StrAppend(&local_pools, i ? "," : "", pool(i)->tag, ":",
+                        pool(i)->dtype_tag);
+      }
+      return absl::InvalidArgumentError(absl::StrCat(
+          "plan dtype tag mismatch for pool ", pool_idx, " (", spec->tag,
+          "): plan=", plan.pool_dtype_tags(pool_idx), " local=",
+          spec->dtype_tag, "; plan dtype tags=[",
+          absl::StrJoin(plan.pool_dtype_tags(), ","), "] local pools=[",
+          local_pools, "]"));
     }
     for (int64_t block_id : local_block_ids) {
       if (block_id >= spec->num_blocks) {

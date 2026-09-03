@@ -77,13 +77,17 @@ class BlockTransport final {
     return peregrine_control_.get();
   }
 
-  // Asynchronous Scatter-Gather Push
+  // Asynchronous Scatter-Gather Push. `layer_idx` selects the local block
+  // array; `wire_layer_idx`, when set, is the index the receiver resolves the
+  // pushed blocks against (a sender whose pool table is a subset of the
+  // receiver's).
   void AsyncPush(
       const std::vector<std::string>& peers,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids, int parallelism,
       MajorOrder major_order, uint64_t uuid, int layer_idx,
-      std::function<void(absl::StatusOr<std::vector<int>>)> raw_on_complete);
+      std::function<void(absl::StatusOr<std::vector<int>>)> raw_on_complete,
+      std::optional<int> wire_layer_idx = std::nullopt);
 
   // Synchronous Scatter-Gather Push (op = 1 / op = 6)
   absl::StatusOr<std::vector<int>> SyncPush(
@@ -162,7 +166,8 @@ class BlockTransport final {
                       std::vector<int>& allocated_ids,
                       std::vector<absl::Status>& statuses,
                       MajorOrder major_order, uint64_t uuid = 0,
-                      int layer_idx = -1, int parallelism = 1);
+                      int layer_idx = -1, int parallelism = 1,
+                      std::optional<int> wire_layer_idx = std::nullopt);
 
   lib::Request BuildBlockRequest(
       uint8_t socket_opcode, uint8_t* laddr, size_t len, uint32_t count_or_size,
@@ -175,7 +180,8 @@ class BlockTransport final {
       absl::string_view peer, size_t block_offset, size_t block_count,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids, MajorOrder major_order,
-      uint64_t uuid = 0, int layer_idx = -1, int parallelism = 1);
+      uint64_t uuid = 0, int layer_idx = -1, int parallelism = 1,
+      std::optional<int> wire_layer_idx = std::nullopt);
 
   absl::Status ProcessSocketPush(absl::string_view peer,
                                  absl::string_view local_ip,

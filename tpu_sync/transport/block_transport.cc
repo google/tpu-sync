@@ -756,7 +756,8 @@ void BlockTransport::AsyncPush(
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, int parallelism,
     MajorOrder major_order, uint64_t uuid, int layer_idx,
-    std::function<void(absl::StatusOr<std::vector<int>>)> raw_on_complete) {
+    std::function<void(absl::StatusOr<std::vector<int>>)> raw_on_complete,
+    std::optional<int> wire_layer_idx) {
   auto on_complete = [raw_on_complete](absl::StatusOr<std::vector<int>> res) {
     if (!res.ok()) {
       RecordTransferFailure(res.status(), metric_labels::kDirectionPush);
@@ -802,11 +803,11 @@ void BlockTransport::AsyncPush(
     auto task_run = [this, i, remote_peer, local_ip, block_offset, block_count,
                      shared_src_block_ids, shared_dst_block_ids, allocated_ids,
                      statuses, remaining_workers, major_order, uuid, layer_idx,
-                     P, on_complete]() {
+                     P, on_complete, wire_layer_idx]() {
       H2hWriteWorker(i, remote_peer, local_ip, block_offset, block_count,
                      *shared_src_block_ids, *shared_dst_block_ids,
                      *allocated_ids, *statuses, major_order, uuid, layer_idx,
-                     P);
+                     P, wire_layer_idx);
 
       if (remaining_workers->fetch_sub(1) == 1) {
         absl::Status final_status = absl::OkStatus();
@@ -978,19 +979,24 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
     absl::string_view peer, size_t block_offset, size_t block_count,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, MajorOrder major_order,
-    uint64_t uuid, int layer_idx, int parallelism) {
+    uint64_t uuid, int layer_idx, int parallelism,
+    std::optional<int> wire_layer_idx) {
   const uint8_t socket_opcode =
       static_cast<uint8_t>(dst_block_ids.empty() ? 1 : 6);
   const uint32_t remote_id = static_cast<uint32_t>(block_delegate_->node_id());
-  const uint32_t local_id =
-      layer_idx == -1 ? 0xFFFF'FFFF : static_cast<uint32_t>(layer_idx);
+  // Chunks are read from the local block array `layer_idx`; the request
+  // header names the array the receiver writes into.
+  const int header_layer_idx = wire_layer_idx.value_or(layer_idx);
+  const uint32_t local_id = header_layer_idx == -1
+                                ? 0xFFFF'FFFF
+                                : static_cast<uint32_t>(header_layer_idx);
   const uint32_t count_or_size = static_cast<uint32_t>(block_count);
 
   if (block_count == 0) {
     return std::vector<lib::Request>{BuildBlockRequest(
         socket_opcode, /*laddr=*/nullptr, /*len=*/0, /*count_or_size=*/0,
-        layer_idx, /*request_id=*/0, uuid, parallelism, major_order, remote_id,
-        local_id, /*shard_idx=*/0)};
+        header_layer_idx, /*request_id=*/0, uuid, parallelism, major_order,
+        remote_id, local_id, /*shard_idx=*/0)};
   }
 
   std::vector<int> target_layers;
@@ -1030,9 +1036,9 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
         const int shard_idx = static_cast<int>(sh);
         for (const auto& chunk : chunks) {
           requests.push_back(BuildBlockRequest(
-              socket_opcode, chunk.ptr, chunk.size, count_or_size, layer_idx,
-              request_id, uuid, parallelism, major_order, remote_id, local_id,
-              shard_idx));
+              socket_opcode, chunk.ptr, chunk.size, count_or_size,
+              header_layer_idx, request_id, uuid, parallelism, major_order,
+              remote_id, local_id, shard_idx));
         }
         ++request_id;
         return absl::OkStatus();
@@ -1171,7 +1177,8 @@ void BlockTransport::H2hWriteWorker(int stream_idx, absl::string_view peer,
                                     std::vector<int>& allocated_ids,
                                     std::vector<absl::Status>& statuses,
                                     MajorOrder major_order, uint64_t uuid,
-                                    int layer_idx, int parallelism) {
+                                    int layer_idx, int parallelism,
+                                    std::optional<int> wire_layer_idx) {
   if (block_count > std::numeric_limits<uint32_t>::max()) {
     statuses[stream_idx] = absl::OutOfRangeError("Block count exceeds uint32");
     return;
@@ -1179,7 +1186,7 @@ void BlockTransport::H2hWriteWorker(int stream_idx, absl::string_view peer,
 
   auto requests_or = BuildBlockRequests(
       peer, block_offset, block_count, src_block_ids, dst_block_ids,
-      major_order, uuid, layer_idx, parallelism);
+      major_order, uuid, layer_idx, parallelism, wire_layer_idx);
   if (!requests_or.ok()) {
     statuses[stream_idx] = requests_or.status();
     return;

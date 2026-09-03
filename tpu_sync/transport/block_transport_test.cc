@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -37,6 +38,23 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+
+// Status assertions from google3's gtest, for builds whose gtest lacks them.
+#ifndef ASSERT_OK
+#define ASSERT_OK(expr) ASSERT_THAT((expr), ::absl_testing::IsOk())
+#endif
+#ifndef EXPECT_OK
+#define EXPECT_OK(expr) EXPECT_THAT((expr), ::absl_testing::IsOk())
+#endif
+#ifndef ASSERT_OK_AND_ASSIGN
+#define RAIDEN_TEST_CONCAT_INNER(a, b) a##b
+#define RAIDEN_TEST_CONCAT(a, b) RAIDEN_TEST_CONCAT_INNER(a, b)
+#define ASSERT_OK_AND_ASSIGN(lhs, rexpr)                                 \
+  auto RAIDEN_TEST_CONCAT(status_or_, __LINE__) = (rexpr);               \
+  ASSERT_THAT(RAIDEN_TEST_CONCAT(status_or_, __LINE__).status(),         \
+              ::absl_testing::IsOk());                                    \
+  lhs = std::move(RAIDEN_TEST_CONCAT(status_or_, __LINE__)).value()
+#endif
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
@@ -473,6 +491,71 @@ TEST_P(BlockTransportTest, PushAndPullCorrectness) {
   // Verify pull parity
   EXPECT_EQ(delegate2.data()[0], 0xAB);
   EXPECT_EQ(delegate2.data()[size - 1], 0xAB);
+}
+
+// Resolves chunks inside the block array named by `layer_idx`, so a test can
+// tell which of the receiver's arrays a push landed in.
+class LayerRoutedDelegate : public MockDelegate {
+ public:
+  using MockDelegate::MockDelegate;
+
+  std::vector<BlockChunk> GetBlockChunks(size_t layer_idx, size_t shard_idx,
+                                         absl::Span<const int64_t> block_ids,
+                                         size_t total_bytes, uint64_t uuid,
+                                         int64_t sender_node_id = -1,
+                                         absl::string_view peer = "",
+                                         int64_t src_block_id = -1,
+                                         int64_t dst_block_id = -1) override {
+    (void)total_bytes;
+    (void)uuid;
+    (void)sender_node_id;
+    (void)peer;
+    (void)src_block_id;
+    // A sender names the block by `dst_block_id`; a receiver passes it in
+    // `block_ids`.
+    const int64_t block =
+        dst_block_id >= 0 ? dst_block_id : (block_ids.empty() ? -1 : block_ids[0]);
+    if (block < 0 || block >= 4) {
+      return {};
+    }
+    return {{.ptr = data(layer_idx, shard_idx) + block * 64, .size = 64}};
+  }
+};
+
+TEST_P(BlockTransportTest, PushNamesTheReceiversArrayByWireLayerIndex) {
+  const size_t size = 1024;
+  // The sender holds one block array; the receiver holds two.
+  LayerRoutedDelegate sender_delegate(size, /*max_blocks=*/4,
+                                      /*num_layers=*/1);
+  LayerRoutedDelegate receiver_delegate(size, /*max_blocks=*/4,
+                                        /*num_layers=*/2);
+  std::memset(sender_delegate.data(0), 0xAB, size);
+  std::memset(receiver_delegate.data(0), 0x00, size);
+  std::memset(receiver_delegate.data(1), 0x00, size);
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Chunks come from the sender's array 0; the wire names the receiver's
+  // array 1.
+  std::promise<absl::StatusOr<std::vector<int>>> promise;
+  auto future = promise.get_future();
+  sender.AsyncPush(
+      {absl::StrCat("localhost:", receiver.local_port())},
+      /*src_block_ids=*/{0}, /*dst_block_ids=*/{0}, /*parallelism=*/1,
+      MajorOrder::kLayerMajor, /*uuid=*/0, /*layer_idx=*/0,
+      [&promise](absl::StatusOr<std::vector<int>> res) {
+        promise.set_value(std::move(res));
+      },
+      /*wire_layer_idx=*/1);
+  auto pushed = future.get();
+  ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+
+  EXPECT_EQ(receiver_delegate.data(1)[0], 0xAB);
+  EXPECT_EQ(receiver_delegate.data(1)[63], 0xAB);
+  EXPECT_EQ(receiver_delegate.data(0)[0], 0x00);
 }
 
 TEST_P(BlockTransportTest, PullNonContiguous) {

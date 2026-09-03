@@ -160,6 +160,9 @@ message ReshardBinding {
   repeated tpu_sync.rpc.RaidenIdProto dst_units = 2;
   repeated int32 transfer_pool_indices = 3;
   repeated string pool_dtype_tags = 4;
+  // Local pool index -> the destination index that names the pool on the
+  // wire, for a sender whose pool table is a subset of the destination's.
+  map<int32, int32> wire_pool_indices = 5;
 }
 
 message TransferProgram {

@@ -39,23 +39,6 @@ cc_library(
 )
 
 cc_library(
-    name = "status_macros",
-    hdrs = [
-        "status_macros.h",
-    ],
-    copts = [
-        "-fno-strict-aliasing",
-        "-fexceptions",
-    ],
-    features = ["-use_header_modules"],
-    visibility = ["//visibility:public"],
-    deps = [
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/status",
-    ],
-)
-
-cc_library(
     name = "buffer",
     srcs = [
         "buffer.cc",
@@ -301,9 +284,9 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":raw_transfer_core",
-        ":status_macros",
         ":xla_raw_transfer_headers",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:span",
     ],
@@ -317,9 +300,9 @@ cc_library(
     deps = [
         ":raiden_transfer_endpoint",
         ":raw_transfer_core",
-        ":status_macros",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
@@ -429,7 +412,6 @@ cc_library(
         ":raiden_manager_base",
         ":raiden_transfer_endpoint",
         ":raw_transfer_core",
-        ":status_macros",
         ":tpu_utils",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
         "//tpu_sync/kv_cache:pool_layout",
@@ -441,6 +423,7 @@ cc_library(
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",

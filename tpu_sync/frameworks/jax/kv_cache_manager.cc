@@ -34,6 +34,7 @@
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"  // IWYU pragma: keep
@@ -49,7 +50,6 @@
 #include "tpu_sync/core/metrics_collector.h"  // IWYU pragma: keep
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/core/utils.h"  // IWYU pragma: keep
 #ifndef WITHOUT_PYTHON
@@ -618,8 +618,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::H2d(
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   sub_copy_futures.reserve(sub_managers_.size());
   for (auto& sub : sub_managers_) {
-    ASSIGN_OR_RETURN(auto f, sub->H2d(src_offsets, dst_offsets, copy_sizes,
-                                      slot_idx, layer_idx, shard_idx));
+    ABSL_ASSIGN_OR_RETURN(auto f, sub->H2d(src_offsets, dst_offsets, copy_sizes,
+                                           slot_idx, layer_idx, shard_idx));
     sub_copy_futures.push_back(std::move(f));
   }
   // Use the event-aware join. On TPU the per-shard copies complete via the
@@ -641,8 +641,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::D2h(
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   sub_copy_futures.reserve(sub_managers_.size());
   for (auto& sub : sub_managers_) {
-    ASSIGN_OR_RETURN(auto f, sub->D2h(src_offsets, dst_offsets, copy_sizes,
-                                      slot_idx, layer_idx, shard_idx));
+    ABSL_ASSIGN_OR_RETURN(auto f, sub->D2h(src_offsets, dst_offsets, copy_sizes,
+                                           slot_idx, layer_idx, shard_idx));
     sub_copy_futures.push_back(std::move(f));
   }
   // Use the event-aware join (see H2d above): on TPU the per-shard copies
@@ -662,7 +662,7 @@ NumaAwareKVCacheManager::D2hAutoAllocate(
   std::vector<int> all_ids;
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         auto res, sub_managers_[s]->D2hAutoAllocate(src_offsets, copy_sizes));
     if (s == 0) {
       all_ids = res.first;
@@ -702,7 +702,7 @@ NumaAwareKVCacheManager::H2hWrite(std::string peer,
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
     std::string sub_peer =
         (base_port >= 0) ? host_prefix + std::to_string(base_port + s) : peer;
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         auto res, sub_managers_[s]->H2hWrite(sub_peer, src_block_ids,
                                              dst_block_ids, uuid, layer_idx));
     if (s == 0) {
@@ -741,8 +741,8 @@ NumaAwareKVCacheManager::H2hRead(std::string peer,
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
     std::string sub_peer =
         (base_port >= 0) ? host_prefix + std::to_string(base_port + s) : peer;
-    ASSIGN_OR_RETURN(auto res,
-                     sub_managers_[s]->H2hRead(sub_peer, src_block_ids));
+    ABSL_ASSIGN_OR_RETURN(auto res,
+                          sub_managers_[s]->H2hRead(sub_peer, src_block_ids));
     if (s == 0) {
       all_ids = res.first;
     }
@@ -784,7 +784,7 @@ NumaAwareKVCacheManager::H2hWrite(
       matched_ep = remote_descriptors[0].endpoint;
     }
 
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         auto res, sub_managers_[s]->H2hWrite(matched_ep, src_block_ids,
                                              dst_block_ids, uuid, layer_idx));
     if (s == 0) {
@@ -827,8 +827,8 @@ NumaAwareKVCacheManager::H2hRead(
       matched_ep = remote_descriptors[0].endpoint;
     }
 
-    ASSIGN_OR_RETURN(auto res,
-                     sub_managers_[s]->H2hRead(matched_ep, src_block_ids));
+    ABSL_ASSIGN_OR_RETURN(auto res,
+                          sub_managers_[s]->H2hRead(matched_ep, src_block_ids));
     if (s == 0) {
       all_ids = res.first;
     }
@@ -871,9 +871,10 @@ NumaAwareKVCacheManager::H2hReadExplicit(
       matched_ep = remote_descriptors[0].endpoint;
     }
 
-    ASSIGN_OR_RETURN(auto fut, sub_managers_[s]->H2hReadExplicit(
-                                   matched_ep, src_block_ids, dst_block_ids,
-                                   /*explicit_dst_ptrs=*/{}));
+    ABSL_ASSIGN_OR_RETURN(
+        auto fut, sub_managers_[s]->H2hReadExplicit(matched_ep, src_block_ids,
+                                                    dst_block_ids,
+                                                    /*explicit_dst_ptrs=*/{}));
     sub_copy_futures.push_back(std::move(fut));
   }
   return raiden::JoinPjRtCopyFutures(absl::MakeSpan(sub_copy_futures));
@@ -912,10 +913,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::H2dRead(
       matched_ep = remote_descriptors[0].endpoint;
     }
 
-    ASSIGN_OR_RETURN(auto fut, sub_managers_[s]->H2dRead(
-                                   matched_ep, src_host_offsets,
-                                   dst_host_offsets, dst_device_offsets,
-                                   copy_sizes));
+    ABSL_ASSIGN_OR_RETURN(
+        auto fut, sub_managers_[s]->H2dRead(matched_ep, src_host_offsets,
+                                            dst_host_offsets,
+                                            dst_device_offsets, copy_sizes));
     sub_copy_futures.push_back(std::move(fut));
   }
   // Event-aware join (see D2h/H2d): on TPU the per-shard transfers complete via

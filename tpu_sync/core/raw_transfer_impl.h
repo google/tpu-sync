@@ -33,7 +33,6 @@
 #include "xla/tsl/platform/logging.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/core/status_macros.h"
 
 namespace raiden {
 

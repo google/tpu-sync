@@ -27,6 +27,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
@@ -41,7 +42,6 @@
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/buffer.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
@@ -129,7 +129,8 @@ absl::StatusOr<std::shared_ptr<KVCacheStoreBackend>> HostOffloadBackend::Create(
       config.capacity, config.metadata, config.raiden_id, controller,
       std::move(registry_client), config.kv_pool_group));
   if (config.kv_transfer_spec.has_value()) {
-    RETURN_IF_ERROR(backend->RegisterKVTransferSpec(*config.kv_transfer_spec));
+    ABSL_RETURN_IF_ERROR(
+        backend->RegisterKVTransferSpec(*config.kv_transfer_spec));
   }
   return backend;
 }
@@ -751,8 +752,8 @@ HostOffloadBackend::GetKVCacheStoreClient(const RaidenId& remote_id) {
         "No global registry client; cannot resolve peer store address");
   }
 
-  ASSIGN_OR_RETURN(global_registry::StoreInfo store_info,
-                   registry->ResolveStore(remote_id));
+  ABSL_ASSIGN_OR_RETURN(global_registry::StoreInfo store_info,
+                        registry->ResolveStore(remote_id));
   if (store_info.store_server_address().empty()) {
     return absl::NotFoundError(
         "Peer is registered but published an empty store server address");
@@ -790,8 +791,8 @@ HostOffloadBackend::BeginWriteRemote(
 
   // Resolves the peer through the global registry. A missing registry
   // client fails here; there is no separate precondition check.
-  ASSIGN_OR_RETURN(std::shared_ptr<KVCacheStoreClient> client,
-                   GetKVCacheStoreClient(dst_raiden_id));
+  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<KVCacheStoreClient> client,
+                        GetKVCacheStoreClient(dst_raiden_id));
 
   auto call = client->WriteRemote(raiden_controller_->unit(), block_hashes,
                                   src_host_block_ids,
@@ -1170,7 +1171,7 @@ absl::Status HostOffloadBackend::RegisterKVTransferSpecFromWorkers() {
         "HostOffloadBackend has no RaidenController; there are no worker "
         "registrations to derive a KVTransferSpec from.");
   }
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       const KVTransferSpecConfig spec,
       ComposeKVTransferSpec(
           raiden_controller_->worker_registry()->GetRegisteredWorkers()));

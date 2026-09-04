@@ -433,40 +433,28 @@ class KVCacheStore {
   // owning peers straight into local HBM. Returns as soon as the reads are
   // issued; poll with PollRemoteReadStatus().
   //
-  // The caller supplies the source coordinates directly: `slices[i]` is the
-  // REMOTE RaidenBlockId for `block_hashes[i]`, and only two of its fields are
-  // read -- `raiden_id` (which peer owns the block) and `host_block_id` (which
-  // block on that peer). A lookup() answer can be passed straight through.
+  // NOTE: This API delegates internally to Load(block_hashes, slices,
+  // device_block_ids).
   //
-  // This store's LRU is not consulted and not modified. The hashes need not be
-  // present locally and need not be pinned, nothing is inserted on success,
-  // and nothing is left behind on failure. The bytes land ONLY in the caller's
-  // device blocks; the host blocks this call allocates are pure staging and
-  // are returned to the pool on both the success and the failure path. No
-  // local host copy is retained, so a later local load() of the same hash is
-  // still a miss.
+  // The caller supplies the source coordinates directly: `slices[i]` is the
+  // REMOTE RaidenBlockId for `block_hashes[i]`. If slices span multiple peers,
+  // they are grouped by peer and dispatched via Load().
+  //
+  // This store's LRU is not modified. A later local lookup() of the same hash
+  // is still a miss.
   //
   // device_block_ids is mandatory and must match block_hashes in size, as must
   // slices; any other size is InvalidArgument.
   //
-  // The device blocks are written before the source's verdict is known, so on
-  // failure their contents are UNDEFINED -- treat them as scratch until the
-  // read reports success.
-  //
-  // Compare with Load(): both bring a peer's block into local HBM. Load()
-  // fetches through the store's own path and is the right call when the hash
-  // may be resident locally; ReadRemote() takes a lease on the source and is
-  // the right call when the caller already knows the source coordinates and
-  // wants no local record of the transfer.
-  //
-  // Requires a global registry: it is what maps the owning peer to the
-  // controller address this store acquires its read lease from. A store built
-  // without one fails every read with FailedPrecondition.
+  // Requires a global registry: it is what maps the owning peer to the store
+  // address this store loads from. A store built without one fails with
+  // FailedPrecondition.
   absl::Status ReadRemote(const std::vector<std::string>& block_hashes,
                           const std::vector<RaidenBlockId>& slices,
                           const std::vector<int32_t>& device_block_ids);
 
   // Polls status of active remote reads.
+  // NOTE: Delegates to PollLoadStatus().
   // Returns {done_hashes, failed_hashes, pending_hashes}
   std::tuple<std::vector<std::string>, std::vector<std::string>,
              std::vector<std::string>>
@@ -541,31 +529,6 @@ class KVCacheStore {
     bool from_remote = false;
   };
 
-  struct RemoteReadState {
-    std::vector<std::string> block_hashes;
-    // The peers this batch read from. Carried so a failed read can drop their
-    // cached controller addresses -- the poller is where failure is observed,
-    // and by then the grouping is gone.
-    std::vector<RaidenId> src_raiden_ids;
-    // The local staging blocks the bytes hop through on their way to HBM. They
-    // live HERE and nowhere else: no LRU entry ever points at them, so the
-    // poller returns them to the pool on both the success and the failure
-    // path. The caller's device blocks are not tracked -- once the transfer is
-    // terminal this store has no further interest in them.
-    std::vector<int> host_block_ids;
-  };
-
-  struct FutureHash {
-    size_t operator()(const tsl::Future<>& f) const {
-      return reinterpret_cast<size_t>(f.async_value());
-    }
-  };
-
-  struct FutureEqual {
-    bool operator()(const tsl::Future<>& lhs, const tsl::Future<>& rhs) const {
-      return lhs.async_value() == rhs.async_value();
-    }
-  };
 
   // Starts (if needed) the peer-facing store server, computes
   // store_server_address_, and publishes it to the global registry.
@@ -705,8 +668,6 @@ class KVCacheStore {
 
   std::vector<SaveState> active_saves_ ABSL_GUARDED_BY(mutex_);
   std::vector<LoadState> active_loads_ ABSL_GUARDED_BY(mutex_);
-  absl::flat_hash_map<tsl::Future<>, RemoteReadState, FutureHash, FutureEqual>
-      active_remote_reads_ ABSL_GUARDED_BY(mutex_);
 
   // In-flight remote-write operations, keyed by their source-local id.
   absl::flat_hash_map<OperationKey, RemoteWriteState> active_remote_writes_
@@ -723,32 +684,10 @@ class KVCacheStore {
   std::vector<std::string> failed_saves_ ABSL_GUARDED_BY(mutex_);
   std::vector<std::string> done_loads_ ABSL_GUARDED_BY(mutex_);
   std::vector<std::string> failed_loads_ ABSL_GUARDED_BY(mutex_);
-  std::vector<std::string> done_remote_reads_ ABSL_GUARDED_BY(mutex_);
-  std::vector<std::string> failed_remote_reads_ ABSL_GUARDED_BY(mutex_);
-
   // In-flight saves of both kinds, in one set: a hash counts as already
   // saving whichever kind is in flight.
   absl::flat_hash_set<std::string> saving_hashes_ ABSL_GUARDED_BY(mutex_);
   absl::flat_hash_set<std::string> loading_hashes_ ABSL_GUARDED_BY(mutex_);
-  // Peer -> its RaidenController address, as last resolved from the global
-  // registry. Read on the prefill path, so it is worth not paying a registry
-  // round trip per read.
-  //
-  // Every entry is dropped as soon as a read against that peer FAILS, for any
-  // reason. That looks over-broad -- a revoked lease or a transfer error says
-  // nothing about the address -- and it is deliberate: an unnecessary
-  // invalidation costs one resolve on the next read, while a missed one leaves
-  // a peer that restarted on a new port unreachable for the life of this
-  // process. That was the shape of the bug this cache replaced, and it is the
-  // reason the old one had to go.
-  //
-  // Consequence worth knowing: the first read after a peer restarts still
-  // fails, on the stale address, and the retry is what succeeds.
-  absl::flat_hash_map<RaidenId, std::string, RaidenIdHash>
-      resolved_peer_controllers_ ABSL_GUARDED_BY(mutex_);
-
-  absl::flat_hash_set<std::string> reading_hashes_ ABSL_GUARDED_BY(mutex_);
-
   std::unique_ptr<std::thread> poller_thread_;
   std::atomic<bool> stop_poller_{false};
 
@@ -813,9 +752,6 @@ class KVCacheStore {
   void PollerLoop();
   void PollSavesInternal(std::vector<SaveState> ready_saves);
   void PollLoadsInternal(std::vector<LoadState> ready_loads);
-  void PollRemoteReadsInternal(
-      std::vector<std::pair<tsl::Future<>, RemoteReadState>>
-          ready_remote_reads);
   void PollFuturesInternal();
 };
 

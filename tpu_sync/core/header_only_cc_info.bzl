@@ -18,6 +18,11 @@
 
 def _header_only_cc_info_impl(ctx):
     compilation_contexts = [dep[CcInfo].compilation_context for dep in ctx.attr.deps]
+    if ctx.attr.defines:
+        defines_context = cc_common.create_compilation_context(
+            defines = depset(ctx.attr.defines),
+        )
+        compilation_contexts.append(defines_context)
     return [
         CcInfo(
             compilation_context = cc_common.merge_compilation_contexts(
@@ -32,6 +37,7 @@ def _header_only_cc_info_impl(ctx):
 header_only_cc_info = rule(
     attrs = {
         "deps": attr.label_list(),
+        "defines": attr.string_list(),
     },
     implementation = _header_only_cc_info_impl,
 )

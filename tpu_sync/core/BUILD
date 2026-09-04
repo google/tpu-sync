@@ -19,9 +19,20 @@ package(default_visibility = ["//visibility:public"])
 
 header_only_cc_info(
     name = "tsl_platform_headers",
+    defines = ["ABSL_DEFINE_UNQUALIFIED_STATUS_MACROS"],
     deps = [
         "@xla//xla/tsl/platform:errors",
         "@xla//xla/tsl/platform:statusor",
+    ],
+)
+
+header_only_cc_info(
+    name = "xla_pjrt_headers",
+    defines = ["ABSL_DEFINE_UNQUALIFIED_STATUS_MACROS"],
+    deps = [
+        "@xla//xla/pjrt:common_pjrt_client",
+        "@xla//xla/pjrt:pjrt_client",
+        "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
     ],
 )
 
@@ -36,23 +47,6 @@ cc_library(
     ],
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
-)
-
-cc_library(
-    name = "status_macros",
-    hdrs = [
-        "status_macros.h",
-    ],
-    copts = [
-        "-fno-strict-aliasing",
-        "-fexceptions",
-    ],
-    features = ["-use_header_modules"],
-    visibility = ["//visibility:public"],
-    deps = [
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/status",
-    ],
 )
 
 cc_library(
@@ -89,8 +83,8 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":raw_transfer_core",
+        ":xla_pjrt_headers",
         "@com_google_absl//absl/strings",
-        "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/pjrt/c:pjrt_c_api_hdrs",
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_extension_hdrs",
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_internal",
@@ -107,10 +101,10 @@ cc_test(
     features = ["-use_header_modules"],
     deps = [
         ":buffer_utils",
+        ":tsl_platform_headers",
+        ":xla_pjrt_headers",
         "@com_google_googletest//:gtest_main",
-        "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
-        "@xla//xla/tsl/platform:statusor",
     ],
 )
 
@@ -148,6 +142,7 @@ cc_library(
 
 header_only_cc_info(
     name = "xla_raw_transfer_headers",
+    defines = ["ABSL_DEFINE_UNQUALIFIED_STATUS_MACROS"],
     deps = [
         "@xla//xla:future",
         "@xla//xla:shape_util",
@@ -213,8 +208,8 @@ cc_library(
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
+        ":xla_pjrt_headers",
         "@com_google_absl//absl/strings",
-        "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/tsl/platform:logging",
     ],
 )
@@ -301,9 +296,9 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":raw_transfer_core",
-        ":status_macros",
         ":xla_raw_transfer_headers",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:span",
     ],
@@ -317,9 +312,9 @@ cc_library(
     deps = [
         ":raiden_transfer_endpoint",
         ":raw_transfer_core",
-        ":status_macros",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
@@ -429,8 +424,9 @@ cc_library(
         ":raiden_manager_base",
         ":raiden_transfer_endpoint",
         ":raw_transfer_core",
-        ":status_macros",
         ":tpu_utils",
+        ":tsl_platform_headers",
+        ":xla_pjrt_headers",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
         "//tpu_sync/kv_cache:pool_layout",
         "//tpu_sync/telemetry:metrics_api",
@@ -441,13 +437,12 @@ cc_library(
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
-        "@xla//xla/pjrt:pjrt_client",
-        "@xla//xla/tsl/platform:errors",
     ],
 )
 
@@ -466,6 +461,7 @@ cc_library(
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
+        ":xla_pjrt_headers",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -473,7 +469,6 @@ cc_library(
         "@com_google_absl//absl/types:span",
         "@xla//xla:literal",
         "@xla//xla:shape_util",
-        "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/pjrt/plugin/xla_tpu:xla_tpu_pjrt_client",
     ],
 )

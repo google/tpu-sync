@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -101,6 +102,12 @@ bool EncodeIp(const std::string& ip_str, uint8_t* dst) {
 
 constexpr absl::Duration kPendingWorkTimeout = absl::Seconds(30);
 
+// How long a pull request waits for the producer to register the read it
+// names. The registration normally precedes the announcement the consumer
+// acts on, so this only covers reordering between the two; a pull whose
+// registration expired, or never happened, is rejected once it lapses.
+constexpr absl::Duration kPullRegistrationGrace = absl::Seconds(5);
+
 [[noreturn]] void ThrowStatus(const std::string& context,
                               const absl::Status& status) {
   throw std::runtime_error(context + ": " + std::string(status.message()));
@@ -158,6 +165,9 @@ absl::Status WriteExact(int fd, const void* buffer, size_t length) {
     ssize_t written = write(fd, ptr, remaining);
     if (written < 0) {
       if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return absl::DeadlineExceededError("socket write timed out");
+      }
       return absl::InternalError("socket write failed: " +
                                  std::string(std::strerror(errno)));
     }
@@ -177,6 +187,9 @@ absl::Status ReadExact(int fd, void* buffer, size_t length) {
     ssize_t bytes_read = read(fd, ptr, remaining);
     if (bytes_read < 0) {
       if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return absl::DeadlineExceededError("socket read timed out");
+      }
       return absl::InternalError("socket read failed: " +
                                  std::string(std::strerror(errno)));
     }
@@ -215,7 +228,23 @@ std::pair<std::string, int> SplitEndpoint(const std::string& endpoint) {
   return {host, port};
 }
 
-int ConnectTcp(const std::string& endpoint) {
+// Bounds every blocking call on `fd`: reads, writes, and for a socket that
+// is not yet connected, the connect itself. A non-positive timeout leaves
+// the socket blocking.
+absl::Status SetSocketTimeouts(int fd, double timeout_s) {
+  if (timeout_s <= 0) return absl::OkStatus();
+  timeval tv;
+  tv.tv_sec = static_cast<time_t>(timeout_s);
+  tv.tv_usec = static_cast<suseconds_t>((timeout_s - tv.tv_sec) * 1e6);
+  if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0 ||
+      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+    return absl::InternalError("setsockopt(SO_RCVTIMEO/SO_SNDTIMEO) failed: " +
+                               std::string(std::strerror(errno)));
+  }
+  return absl::OkStatus();
+}
+
+int ConnectTcp(const std::string& endpoint, double timeout_s) {
   auto [host, port] = SplitEndpoint(endpoint);
   struct addrinfo hints;
   struct addrinfo* res = nullptr;
@@ -238,6 +267,11 @@ int ConnectTcp(const std::string& endpoint) {
   }
   int opt = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+  if (absl::Status status = SetSocketTimeouts(fd, timeout_s); !status.ok()) {
+    close(fd);
+    freeaddrinfo(res);
+    throw std::runtime_error(std::string(status.message()));
+  }
 
   if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
     std::string err_str = std::strerror(errno);
@@ -1854,7 +1888,7 @@ void KVCacheManagerWithTransfer::StartRead(
       LOG(INFO) << "StartRead (connecting): req_id=" << req_id
                 << ", uuid=" << uuid
                 << ", numa=" << assigned_numa_node().value_or(-1);
-      int control_fd = ConnectTcp(remote_endpoint);
+      int control_fd = ConnectTcp(remote_endpoint, timeout_s_);
       auto control_cleanup =
           std::unique_ptr<int, void (*)(int*)>(&control_fd, [](int* p) {
             if (p && *p >= 0) close(*p);
@@ -2414,6 +2448,10 @@ void KVCacheManagerWithTransfer::ControlServerLoop() {
       if (errno == EINTR) continue;
       break;
     }
+    if (absl::Status status = SetSocketTimeouts(client_fd, timeout_s_);
+        !status.ok()) {
+      LOG(WARNING) << "control connection: " << status.message();
+    }
     std::optional<int> source_node = assigned_numa_node();
 
     pull_pool_->Schedule(source_node, [this, client_fd]() {
@@ -2454,29 +2492,37 @@ void KVCacheManagerWithTransfer::HandleControlConnection(int fd) {
 
 void KVCacheManagerWithTransfer::ProcessPullStream(
     int fd, const ControlRequestHeader& req) {
+  // The whole request is read before anything can reject it, so a
+  // rejection leaves no unread bytes behind on the connection.
+  std::vector<int64_t> src_block_ids = ReadBlockIds(fd, req.num_blocks);
+  std::vector<int64_t> dst_block_ids = ReadBlockIds(fd, req.num_blocks);
+
   std::shared_ptr<SendEntry> entry;
+  const absl::Duration grace =
+      std::min(kPullRegistrationGrace, absl::Seconds(timeout_s_));
   {
     absl::MutexLock lock(mu_);
+    const absl::Time give_up = absl::Now() + grace;
     while (true) {
       auto it = send_entries_.find(req.uuid);
       if (it != send_entries_.end()) {
         entry = it->second;
         break;
       }
-      if (stopping_.load()) {
+      const absl::Duration left = give_up - absl::Now();
+      if (stopping_.load() || left <= absl::ZeroDuration()) {
         break;
       }
-      cv_.Wait(&mu_);
+      cv_.WaitWithTimeout(&mu_, left);
     }
   }
   if (stopping_) return;
   if (!entry) {
-    throw std::runtime_error(
-        "KVCacheManagerWithTransfer is stopping during wait for send entry");
+    throw std::runtime_error(absl::StrCat(
+        "no read registered for uuid ", req.uuid, " within ",
+        absl::FormatDuration(grace),
+        ": the producer expired it or never registered it"));
   }
-
-  std::vector<int64_t> src_block_ids = ReadBlockIds(fd, req.num_blocks);
-  std::vector<int64_t> dst_block_ids = ReadBlockIds(fd, req.num_blocks);
   ValidateRequestedBlocks(*entry, src_block_ids);
 
   // Acknowledge acceptance to consumer immediately
@@ -2847,7 +2893,7 @@ std::string KVCacheManagerWithTransfer::EndpointWithPort(
 
 void KVCacheManagerWithTransfer::AckRemote(const std::string& remote_endpoint,
                                            uint64_t uuid) {
-  int control_fd = ConnectTcp(remote_endpoint);
+  int control_fd = ConnectTcp(remote_endpoint, timeout_s_);
   auto control_cleanup =
       std::unique_ptr<int, void (*)(int*)>(&control_fd, [](int* p) {
         if (p && *p >= 0) close(*p);

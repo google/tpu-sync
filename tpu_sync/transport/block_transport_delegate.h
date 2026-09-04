@@ -73,7 +73,7 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
   // delegates inherit the uniform layer behavior; pool-aware delegates may
   // map an array to an interior range of a different backing storage.
   virtual size_t block_bytes(size_t block_array_idx) const {
-    return bytes_per_block();
+    return slice_byte_size();
   }
   virtual uint8_t* GetBlockArrayHostPointer(size_t block_array_idx,
                                             size_t shard_idx) {
@@ -179,7 +179,6 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
     return base + static_cast<size_t>(block_id) * block_bytes(layer_idx);
   }
 
-  virtual size_t bytes_per_block() const { return slice_byte_size(); }
 
   virtual int GetRemoteReadBlockId(int base_remote_id, int chunk_k) = 0;
 

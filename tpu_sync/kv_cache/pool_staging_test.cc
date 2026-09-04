@@ -46,7 +46,7 @@ class StagingTestManager : public KVCacheManagerBase {
     for (size_t l = 0; l < num_layers; ++l) {
       buffer_holds_[l].holds.resize(num_shards);
       for (size_t sh = 0; sh < num_shards; ++sh) {
-        layers_[l].shards[sh].device_size = host_blocks * bytes_per_block();
+        layers_[l].shards[sh].device_size = host_blocks * slice_byte_size;
       }
     }
   }

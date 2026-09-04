@@ -344,15 +344,13 @@ void RaidenManagerBase::ForgetPushProgress(uint64_t uuid) {
   }
 }
 
-size_t RaidenManagerBase::bytes_per_block() const { return slice_byte_size_; }
-
 size_t RaidenManagerBase::block_bytes(size_t layer_idx) const {
   if (layers_.empty() || layer_idx >= layers_.size() ||
       layers_[layer_idx].shards.empty()) {
-    return bytes_per_block();
+    return slice_byte_size_;
   }
   size_t dev_size = layers_[layer_idx].shards[0].device_size;
-  return dev_size > 0 ? dev_size : bytes_per_block();
+  return dev_size > 0 ? dev_size : slice_byte_size_;
 }
 
 }  // namespace tpu_raiden

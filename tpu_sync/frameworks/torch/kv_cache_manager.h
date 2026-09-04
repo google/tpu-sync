@@ -243,7 +243,6 @@ class KVCacheManager {
   size_t num_layers() const { return torch_manager_->num_layers(); }
   size_t num_shards() const { return torch_manager_->num_shards(); }
   size_t slice_byte_size() const { return torch_manager_->slice_byte_size(); }
-  size_t bytes_per_block() const { return torch_manager_->bytes_per_block(); }
   size_t num_block_arrays() const { return torch_manager_->num_block_arrays(); }
   size_t block_bytes(size_t block_array_idx) const {
     return torch_manager_->block_bytes(block_array_idx);

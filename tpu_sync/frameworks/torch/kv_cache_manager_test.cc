@@ -72,7 +72,7 @@ TEST_F(KVCacheManagerTorchTest, ConstructorSucceedsWithMocks) {
                          /*local_port=*/std::nullopt,
                          /*host_blocks_to_allocate=*/8);
 
-  EXPECT_EQ(manager.bytes_per_block(), 1024 * sizeof(float));
+  EXPECT_EQ(manager.slice_byte_size(), 1024 * sizeof(float));
 }
 
 TEST_F(KVCacheManagerTorchTest, ConstructorWithRawPjRtBuffersSucceeds) {
@@ -102,7 +102,7 @@ TEST_F(KVCacheManagerTorchTest, ConstructorWithRawPjRtBuffersSucceeds) {
 
   EXPECT_EQ(manager.num_layers(), 1);
   EXPECT_EQ(manager.num_shards(), 1);
-  EXPECT_EQ(manager.bytes_per_block(), 1024 * sizeof(float));
+  EXPECT_EQ(manager.slice_byte_size(), 1024 * sizeof(float));
 }
 
 TEST_F(KVCacheManagerTorchTest, GrpcServerOptionalAndOffByDefault) {

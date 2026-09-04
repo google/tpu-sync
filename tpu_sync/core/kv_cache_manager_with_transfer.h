@@ -166,6 +166,18 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
       std::optional<int> assigned_numa_node = std::nullopt,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
+  // Metadata-based constructor for a heterogeneous registration:
+  // slice_byte_sizes carries one stride per block array, in registration
+  // order.  Used by the host store node, which mirrors a serving host's
+  // geometry CPU-side and must match it array for array.
+  KVCacheManagerWithTransfer(
+      size_t num_layers, size_t num_shards,
+      std::vector<size_t> slice_byte_sizes, std::optional<int> local_port,
+      std::optional<int> host_blocks_to_allocate, int parallelism = 1,
+      int64_t node_id = 0, int64_t local_control_port = -1,
+      int64_t max_blocks = 0, int64_t num_slots = 0, double timeout_s = 120.0,
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+
   // Metadata-based constructor for FFI / CPU-only testing
   KVCacheManagerWithTransfer(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,

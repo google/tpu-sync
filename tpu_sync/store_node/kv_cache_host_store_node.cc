@@ -30,6 +30,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -128,18 +129,11 @@ KVCacheHostStoreNode::Create(const Options& options,
   ASSIGN_OR_RETURN(const size_t num_host_blocks,
                    NumBlocksForBudget(options.dram_budget_bytes, spec));
 
-  // The CPU-only manager constructor below models one uniform stride across
-  // all block arrays; hybrid models (whose state arrays have differing
-  // block_bytes) need per-array constructor support that does not exist yet.
-  for (uint64_t array_bytes : spec.block_array_bytes) {
-    if (array_bytes != spec.block_array_bytes[0]) {
-      return absl::UnimplementedError(absl::StrCat(
-          "host store node only supports uniform block arrays for now; got ",
-          spec.block_array_bytes[0], " and ", array_bytes, " bytes"));
-    }
-  }
+  // One stride per block array, in the spec's order.  Hybrid models register
+  // arrays of differing block_bytes (a DeepSeek-V4 rank registers four).
   const size_t num_block_arrays = spec.block_array_bytes.size();
-  const uint64_t block_bytes_per_array = spec.block_array_bytes[0];
+  const std::vector<size_t> block_bytes_per_array(
+      spec.block_array_bytes.begin(), spec.block_array_bytes.end());
 
   // Phase B: the same assembly a serving host deployment runs, CPU-backed.
   std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> managers;
@@ -194,7 +188,7 @@ KVCacheHostStoreNode::Create(const Options& options,
                    backend_config, /*capacity=*/num_host_blocks,
                    options.global_registry_address, options.raiden_id,
                    static_cast<int>(spec.num_kv_shards),
-                   static_cast<int64_t>(block_bytes_per_array),
+                   static_cast<int64_t>(block_bytes_per_array[0]),
                    options.store_server_ip, options.raiden_controller_port));
   } catch (const std::exception& e) {
     return absl::UnavailableError(
@@ -239,7 +233,8 @@ KVCacheHostStoreNode::Create(const Options& options,
             << " host blocks x " << node->managers().size()
             << " workers (num_block_arrays=" << num_block_arrays
             << " num_kv_shards=" << spec.num_kv_shards
-            << " block_bytes_per_array=" << block_bytes_per_array
+            << " block_bytes_per_array=["
+            << absl::StrJoin(block_bytes_per_array, ",") << "]"
             << "), store server " << node->store_server_address()
             << ", controller " << node->raiden_controller_address();
   return node;

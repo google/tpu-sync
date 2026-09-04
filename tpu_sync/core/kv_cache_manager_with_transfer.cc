@@ -579,8 +579,20 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     int parallelism, int64_t node_id, int64_t local_control_port,
     int64_t max_blocks, int64_t num_slots, double timeout_s,
     std::shared_ptr<MetricsCollector> metrics_collector)
+    : KVCacheManagerWithTransfer(
+          num_layers, num_shards,
+          std::vector<size_t>(num_layers, slice_byte_size), local_port,
+          host_blocks_to_allocate, parallelism, node_id, local_control_port,
+          max_blocks, num_slots, timeout_s, std::move(metrics_collector)) {}
+
+KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
+    size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
+    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+    int parallelism, int64_t node_id, int64_t local_control_port,
+    int64_t max_blocks, int64_t num_slots, double timeout_s,
+    std::shared_ptr<MetricsCollector> metrics_collector)
     : KVCacheManagerBase(
-          num_layers, num_shards, slice_byte_size, local_port,
+          num_layers, num_shards, std::move(slice_byte_sizes), local_port,
           host_blocks_to_allocate.value_or(num_slots * max_blocks), parallelism,
           nullptr),
       node_id_(node_id),

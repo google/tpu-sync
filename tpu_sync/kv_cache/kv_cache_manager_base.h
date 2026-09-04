@@ -131,9 +131,19 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<size_t> logical_physical_size = std::nullopt,
       std::optional<int> assigned_numa_node_override = std::nullopt);
 
-  // Standard CPU-only Constructor for remote workers E2E
+  // Standard CPU-only constructor for remote workers E2E.
   KVCacheManagerBase(size_t num_layers, size_t num_shards,
                      size_t slice_byte_size,
+                     std::optional<int> local_port = std::nullopt,
+                     std::optional<int> host_blocks_to_allocate = std::nullopt,
+                     int parallelism = 1,
+                     HostBufferAllocator host_allocator = nullptr,
+                     std::optional<std::string> bind_ip = std::nullopt);
+
+  // same as above, but with a vector of slice byte sizes for heterogeneous
+  // registration.
+  KVCacheManagerBase(size_t num_layers, size_t num_shards,
+                     std::vector<size_t> slice_byte_sizes,
                      std::optional<int> local_port = std::nullopt,
                      std::optional<int> host_blocks_to_allocate = std::nullopt,
                      int parallelism = 1,
@@ -313,8 +323,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     return host_block_manager_.get();
   }
 
-  size_t bytes_per_block() const override;
-
   // BlockTransport's wire index addresses pools after explicit admission and
   // constructor storages otherwise.
   size_t num_block_arrays() const override;
@@ -327,7 +335,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   int64_t LayerBlockByteSize(size_t layer_idx) const;
 
   // Returns the host address of one legacy (layer, shard, block) block.
-  // Shared by the framework bindings; block granularity is bytes_per_block().
+  // Shared by the framework bindings; block granularity is the layer's own
+  // row, block_bytes(layer_idx).
   absl::StatusOr<uintptr_t> GetBlockHostPointerValue(size_t layer_idx,
                                                      size_t shard_idx,
                                                      int block_id);
@@ -512,14 +521,29 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   mutable std::vector<PoolSpec> pools_;
   bool explicit_pools_ = false;
 
+  // Per-layer block (row) byte size, one entry per layer, in registration
+  // order.
+  std::vector<int64_t> layer_row_bytes_;
+
+  // Returns the per-block byte size of a layer whose on-device buffer is
+  // physical_size bytes.  Only the device-backed constructor needs this, to
+  // turn an on-device size into the row it stores in layer_row_bytes_;
+  // everything else reads layer_block_byte_size() instead.
+  int64_t row_byte_size(size_t physical_size) const {
+    return major_dim_size_ > 0
+               ? static_cast<int64_t>(physical_size) / major_dim_size_
+               : static_cast<int64_t>(slice_byte_size_);
+  }
+
   // Returns the per-block byte size for a given layer.  Uses the layer's
   // actual physical_size when available (device-backed path); falls back
   // to the uniform slice_byte_size_ (CPU-only / test path).
   int64_t layer_block_byte_size(size_t layer_idx) const {
-    const auto& info = buffer_holds_[layer_idx];
-    return info.physical_size > 0
-               ? static_cast<int64_t>(info.physical_size) / major_dim_size_
-               : slice_byte_size_;
+    if (layer_idx < layer_row_bytes_.size() &&
+        layer_row_bytes_[layer_idx] > 0) {
+      return layer_row_bytes_[layer_idx];
+    }
+    return static_cast<int64_t>(slice_byte_size_);
   }
 
   std::unique_ptr<NumaThreadPool> dma_pool_;

@@ -118,8 +118,7 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   size_t num_layers() const override { return num_layers_; }
   size_t num_shards() const override { return num_shards_; }
   size_t slice_byte_size() const override { return slice_byte_size_; }
-  size_t bytes_per_block() const override;
-  // Returns the layer-specific block size, falling back to bytes_per_block() if
+  // Returns the layer-specific block size, falling back to slice_byte_size() if
   // the layer size is not initialized (0).
   size_t block_bytes(size_t layer_idx) const override;
   size_t shard_factor() const override { return shard_factor_; }

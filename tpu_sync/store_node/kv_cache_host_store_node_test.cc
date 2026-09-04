@@ -210,17 +210,23 @@ TEST_F(KVCacheHostStoreNodeBootTest, RequiresKVTransferSpecSource) {
   EXPECT_TRUE(absl::IsInvalidArgument(node.status()));
 }
 
-TEST_F(KVCacheHostStoreNodeBootTest, RejectsHeterogeneousBlockArraysForNow) {
-  // A hybrid-model spec: block arrays with differing strides. Valid as a
-  // spec, but the CPU-only manager cannot express it yet, so boot must fail
-  // loudly instead of allocating a wrong-shaped pool.
+TEST_F(KVCacheHostStoreNodeBootTest, BootsOnHeterogeneousBlockArrays) {
+  // A hybrid-model spec: block arrays with differing strides. The manager
+  // sizes each host buffer at the width that addresses it, so the mirror
+  // here matches the serving host array for array.
   StaticKVTransferSpecSource source(
       KVTransferSpec{/*block_array_bytes=*/{256, 512}, /*num_kv_shards=*/1,
                      /*num_workers=*/1});
   absl::StatusOr<std::unique_ptr<KVCacheHostStoreNode>> node =
       KVCacheHostStoreNode::Create(BootOptions(), &source);
-  EXPECT_TRUE(absl::IsUnimplemented(node.status())) << node.status();
-  EXPECT_THAT(node.status().message(), HasSubstr("uniform block arrays"));
+  ASSERT_TRUE(node.ok()) << node.status();
+
+  // One block costs 256 + 512 bytes across the two arrays, so the budget
+  // buys fewer blocks than the uniform 2x256 spec of TestSpec() would.
+  EXPECT_EQ((*node)->num_host_blocks(),
+            BootOptions().dram_budget_bytes / (256 + 512));
+  EXPECT_EQ((*node)->spec().block_array_bytes,
+            (std::vector<uint64_t>{256, 512}));
 }
 
 TEST_F(KVCacheHostStoreNodeBootTest, BootsWithoutRegistryButServesNoPeers) {

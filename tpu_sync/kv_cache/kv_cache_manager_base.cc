@@ -275,6 +275,7 @@ KVCacheManagerBase::KVCacheManagerBase(
 
   layers_.reserve(num_layers_);
   buffer_holds_.reserve(num_layers_);
+  layer_row_bytes_.reserve(num_layers_);
   size_t total_host_dram_bytes = 0;
 
   for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
@@ -295,6 +296,30 @@ KVCacheManagerBase::KVCacheManagerBase(
     VLOG(1) << "KVCacheManagerBase: layer " << layer_idx << " on_device_shape: "
             << layer_buffers[layer_idx][0].shape.ToString()
             << " size: " << device_info.physical_size;
+
+    // Record this layer's row, the width that indexes it everywhere else.
+    // row_byte_size divides by the shared major_dim_size_, which is only this
+    // layer's own row if the layer really does hold that many blocks.
+    if (major_dim_size_ > 0 && logical_dimensions.empty()) {
+      const xla::Shape& layer_shape = layer_buffers[layer_idx][0].shape;
+      if (!layer_shape.dimensions().empty() &&
+          layer_shape.dimensions(0) != major_dim_size_) {
+        throw std::runtime_error(absl::StrCat(
+            "Layer ", layer_idx, " has major dimension ",
+            layer_shape.dimensions(0), " but layer 0 has ", major_dim_size_,
+            "; every layer must hold the same number of blocks because they "
+            "share one block-id space (layers may differ only in row width)"));
+      }
+      if (device_info.physical_size % static_cast<size_t>(major_dim_size_) !=
+          0) {
+        throw std::runtime_error(absl::StrCat(
+            "Layer ", layer_idx, " on-device size ", device_info.physical_size,
+            " is not a whole number of blocks at major dimension ",
+            major_dim_size_));
+      }
+    }
+    layer_row_bytes_.push_back(row_byte_size(device_info.physical_size));
+
     layer_info.shards.reserve(num_shards_);
     device_info.holds.reserve(num_shards_);
 
@@ -308,9 +333,8 @@ KVCacheManagerBase::KVCacheManagerBase(
             "Device buffer shard size smaller than physical size");
       }
 
-      // Allocate host buffer using the max slice size (bytes_per_block)
-      // so the buffer is large enough for any layer.
-      size_t alloc_size = num_host_blocks * bytes_per_block();
+      // Allocate this layer's host buffer at its OWN row size.
+      size_t alloc_size = num_host_blocks * layer_block_byte_size(layer_idx);
       if (host_allocator) {
         const xla::PjRtDevice* target_dev = dst_buffer.device;
         auto status_or_allocation = host_allocator(alloc_size, target_dev);
@@ -378,12 +402,36 @@ KVCacheManagerBase::KVCacheManagerBase(
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, HostBufferAllocator host_allocator,
     std::optional<std::string> bind_ip)
-    : RaidenManagerBase(num_layers, num_shards, slice_byte_size, local_port,
-                        parallelism, bind_ip),
+    : KVCacheManagerBase(num_layers, num_shards,
+                         std::vector<size_t>(num_layers, slice_byte_size),
+                         local_port, host_blocks_to_allocate, parallelism,
+                         std::move(host_allocator), std::move(bind_ip)) {}
+
+KVCacheManagerBase::KVCacheManagerBase(
+    size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
+    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+    int parallelism, HostBufferAllocator host_allocator,
+    std::optional<std::string> bind_ip)
+    : RaidenManagerBase(num_layers, num_shards,
+                        slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0],
+                        local_port, parallelism, bind_ip),
       host_allocator_(host_allocator) {
   int total_blocks = host_blocks_to_allocate.value_or(0);
   host_block_manager_ = std::make_unique<LogicalBlockManager>(total_blocks);
   semaphore_ = std::make_unique<xla::Semaphore>(std::max<int>(4, parallelism));
+
+  // Each array's own stride, so a heterogeneous host-side mirror allocates
+  // each buffer at the width that will address it.  Arrays past the end of
+  // the vector fall back to slice_byte_size_ via layer_block_byte_size().
+  layer_row_bytes_.reserve(num_layers_);
+  if (slice_byte_sizes.size() != num_layers_) {
+    throw std::runtime_error(
+        "slice_byte_sizes.size() != num_layers_; slice_byte_sizes must have "
+        "length equal to num_layers");
+  }
+  for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
+    layer_row_bytes_.push_back(slice_byte_sizes[layer_idx]);
+  }
 
   layers_.reserve(num_layers_);
   size_t total_host_dram_bytes = 0;
@@ -395,7 +443,7 @@ KVCacheManagerBase::KVCacheManagerBase(
       ShardBufferInfoBase shard_info;
 
       int num_host_blocks = host_blocks_to_allocate.value_or(0);
-      size_t alloc_size = num_host_blocks * bytes_per_block();
+      size_t alloc_size = num_host_blocks * layer_block_byte_size(layer_idx);
       if (host_allocator) {
         auto status_or_allocation = host_allocator(alloc_size, nullptr);
         if (!status_or_allocation.ok()) {
@@ -1476,8 +1524,6 @@ absl::StatusOr<KVCacheHostSpan> KVCacheManagerBase::HostSpan(
       .shard_idx = shard_idx};
 }
 
-size_t KVCacheManagerBase::bytes_per_block() const { return slice_byte_size_; }
-
 size_t KVCacheManagerBase::num_block_arrays() const {
   return explicit_pools_ ? pools_.size() : num_layers_;
 }
@@ -1488,7 +1534,7 @@ size_t KVCacheManagerBase::block_bytes(size_t block_array_idx) const {
     if (per_layer > 0) {
       return static_cast<size_t>(per_layer);
     }
-    return bytes_per_block();
+    return slice_byte_size_;
   }
   if (block_array_idx >= pools_.size() ||
       pools_[block_array_idx].block_stride_bytes <= 0) {
@@ -1552,10 +1598,7 @@ int64_t KVCacheManagerBase::LayerBlockByteSize(size_t layer_idx) const {
   if (layer_idx >= num_layers_) {
     return -1;
   }
-  if (layer_idx < buffer_holds_.size()) {
-    return layer_block_byte_size(layer_idx);
-  }
-  return static_cast<int64_t>(slice_byte_size_);
+  return layer_block_byte_size(layer_idx);
 }
 
 absl::StatusOr<uintptr_t> KVCacheManagerBase::GetBlockHostPointerValue(

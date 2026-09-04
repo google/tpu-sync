@@ -22,17 +22,20 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
 #include <utility>
 
 #include "absl/log/log.h"
+#include "absl/strings/ascii.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
@@ -54,7 +57,41 @@ size_t PageAlignedTableSize(int num_blocks) {
              4095};
 }
 
+// The charset SharedMemoryHostMemoryAllocator::ValidateShmNameParts enforces
+// on user configuration; internal identities are rewritten to it instead --
+// anything else (above all '/', fatal to shm_open) becomes '_'.
+std::string SanitizeForShmName(absl::string_view part) {
+  std::string sanitized(part);
+  for (char& c : sanitized) {
+    if (!absl::ascii_isalnum(c) && c != '_' && c != '-' && c != '.') {
+      c = '_';
+    }
+  }
+  return sanitized;
+}
+
 }  // namespace
+
+std::string MetadataShmKey(const RaidenId& raiden_id) {
+  const char* shm_key = std::getenv("RAIDEN_SHM_KEY");
+  if (shm_key == nullptr || std::strlen(shm_key) == 0) {
+    return "";
+  }
+  // No per-device suffix — the table spans the store, not one device — so
+  // the RaidenId is the only thing telling colocated stores' tables apart.
+  std::string key = absl::StrCat(shm_key, "_metadata");
+  const char* server_name = std::getenv("RAIDEN_SHM_SERVER_NAME");
+  if (server_name != nullptr && std::strlen(server_name) > 0) {
+    absl::StrAppend(&key, "_", server_name);
+  }
+  if (!raiden_id.empty()) {
+    absl::StrAppend(&key, "_",
+                    SanitizeForShmName(absl::StrCat(
+                        raiden_id.job_name, "_", raiden_id.job_replica_id, "_",
+                        raiden_id.data_name, "_", raiden_id.data_replica_idx)));
+  }
+  return key;
+}
 
 absl::StatusOr<std::unique_ptr<KVCacheMetadataShmRegion>>
 KVCacheMetadataShmRegion::AttachOrFormat(absl::string_view shm_key,

@@ -39,6 +39,7 @@
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
+#include "tpu_sync/kv_cache/kv_cache_metadata_shm.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_server.h"
@@ -125,6 +126,12 @@ class KVCacheStore {
   // controller's exception) if they have not all registered within
   // RAIDEN_EXPECTED_WORKERS_TIMEOUT_S seconds (default 120). Callers whose
   // workers register only after the store exists must leave it 0.
+  //
+  // CRASH RECOVERY (RAIDEN_SHM_KEY)
+  //
+  // When the KV pool lives in shared memory (RAIDEN_SHM_KEY) and the store
+  // hosts a controller (num_shards > 0), Create() keeps the crash-persistent
+  // KVCacheMetadata table in shared memory too.
 
   // Safe factory method to create KVCacheStore from a single BackendConfig.
   static absl::StatusOr<std::unique_ptr<KVCacheStore>> Create(
@@ -653,6 +660,10 @@ class KVCacheStore {
   // Constructed and started at the end of Create when enabled; stopped first
   // thing in the destructor, before anything its callbacks touch goes away.
   std::unique_ptr<StoreMonitor> store_monitor_;
+  // Owns the shm mapping behind the crash-persistent KV metadata table when
+  // Create wired one up from the environment (see CRASH RECOVERY above);
+  // null when the caller injected a metadata view or shm is not configured.
+  std::unique_ptr<KVCacheMetadataShmRegion> metadata_region_;
 
   // Who asked for a remote save: the application or the evict sweep. Each
   // owner has its own verdict mailbox, so the two consumers cannot drain each

@@ -22,10 +22,17 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
+
+// The shm name (sans "/" prefix) of the store's crash-persistent KV metadata
+// table: RAIDEN_SHM_KEY + "_metadata", an optional "_<RAIDEN_SHM_SERVER_NAME>"
+// suffix, then the store's sanitized RaidenId. The RaidenId keeps the table
+// private to its store.
+std::string MetadataShmKey(const RaidenId& raiden_id);
 
 // Owns the POSIX shared-memory mapping that backs a KVCacheMetadata table
 // and keeps it alive for the lifetime of this object.

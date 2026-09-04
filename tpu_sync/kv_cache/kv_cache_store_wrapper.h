@@ -21,7 +21,6 @@
 #include <string>
 
 #include "tpu_sync/common/raiden_id.h"
-#include "tpu_sync/kv_cache/kv_cache_metadata_shm.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 
@@ -44,23 +43,8 @@ namespace kv_cache {
 // shared env block never breaks a local-only boot.
 StoreMonitorConfig StoreMonitorConfigFromEnv();
 
-// The shm name (sans "/" prefix) of the store's crash-persistent KV metadata
-// table: RAIDEN_SHM_KEY + "_metadata", an optional "_<RAIDEN_SHM_SERVER_NAME>"
-// suffix, then the store's sanitized RaidenId. The RaidenId keeps the table
-// private to its store.
-std::string MetadataShmKey(const RaidenId& raiden_id);
-
 // Constructs the KVCacheStore behind the framework Python bindings (the jax
-// and torch modules both bind this class) and owns it together with its
-// crash-recovery state.
-//
-// When the KV pool lives in shared memory (RAIDEN_SHM_KEY), the
-// crash-persistent KVCacheMetadata table is kept there too — the data and
-// its metadata are always shm-backed together, never separately — and the
-// LRU cache is rebuilt from a surviving table on restart. Any failure in
-// that wiring degrades to serving without recovery; it never blocks
-// construction — except a malformed RAIDEN_SHM_KEY / RAIDEN_SHM_SERVER_NAME
-// value, which is a configuration error and throws.
+// and torch modules both bind this class).
 class KVCacheStoreWrapper {
  public:
   explicit KVCacheStoreWrapper(
@@ -76,7 +60,6 @@ class KVCacheStoreWrapper {
   KVCacheStore& operator*() { return *controller_; }
 
  private:
-  std::unique_ptr<KVCacheMetadataShmRegion> metadata_region_;
   std::unique_ptr<KVCacheStore> controller_;
 };
 

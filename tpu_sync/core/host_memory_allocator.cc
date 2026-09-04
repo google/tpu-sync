@@ -268,7 +268,7 @@ std::string SharedMemoryHostMemoryAllocator::ComposeSegmentName(
 
 absl::Status SharedMemoryHostMemoryAllocator::ValidateShmNameParts(
     absl::string_view shm_key) {
-  // The same charset SanitizeForShmName (kv_cache_store_wrapper.cc) keeps;
+  // The same charset SanitizeForShmName (kv_cache_metadata_shm.cc) keeps;
   // there internal identities are rewritten to it, here user configuration
   // is rejected against it.
   auto validate_part = [](absl::string_view part,

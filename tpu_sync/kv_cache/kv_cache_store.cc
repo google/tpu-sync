@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -48,12 +49,14 @@
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/buffer.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
+#include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/kv_cache/completion_executor.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/completion_executor.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
+#include "tpu_sync/kv_cache/kv_cache_metadata_shm.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/reshard/reshard_service.h"
@@ -204,6 +207,32 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
     effective_config0.raiden_id = raiden_id;
   }
 
+  // Attach to or create the crash-persistent KV metadata table next to the
+  // shm-backed KV pool. An explicitly injected metadata view (merged above)
+  // wins over the environment. Attach failure degrades to serving without
+  // recovery; recovery itself runs once the store is up, below.
+  std::unique_ptr<KVCacheMetadataShmRegion> metadata_region;
+  if (num_shards > 0 && !effective_config0.metadata.has_value()) {
+    const char* shm_key_env = std::getenv("RAIDEN_SHM_KEY");
+    if (shm_key_env != nullptr && std::strlen(shm_key_env) > 0) {
+      RETURN_IF_ERROR(
+          SharedMemoryHostMemoryAllocator::ValidateShmNameParts(shm_key_env));
+      const char* model_uid = std::getenv("RAIDEN_SHM_MODEL_UID");
+      auto region_or = KVCacheMetadataShmRegion::AttachOrFormat(
+          MetadataShmKey(effective_config0.raiden_id),
+          static_cast<int>(effective_config0.capacity),
+          model_uid != nullptr ? model_uid : "default_model");
+      if (region_or.ok()) {
+        metadata_region = *std::move(region_or);
+        effective_config0.metadata = metadata_region->metadata();
+      } else {
+        LOG(WARNING) << "KV metadata table unavailable, serving without "
+                        "crash recovery: "
+                     << region_or.status().message();
+      }
+    }
+  }
+
   RaidenId effective_raiden_id = effective_config0.raiden_id;
   std::unique_ptr<::tpu_raiden::controller::RaidenController> raiden_controller;
   if (num_shards > 0) {
@@ -292,6 +321,28 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
     store->RegisterReadRemoteHooks();
     store->poller_thread_ =
         std::make_unique<std::thread>(&KVCacheStore::PollerLoop, store.get());
+  }
+
+  // Recovery runs before the monitor starts, so the first inventory the
+  // monitor publishes already carries the recovered blocks.
+  if (metadata_region != nullptr) {
+    store->metadata_region_ = std::move(metadata_region);
+    if (store->metadata_region_->warm()) {
+      absl::StatusOr<size_t> recovered = store->RecoverFromLocalManifest();
+      if (recovered.ok()) {
+        LOG(INFO) << "Recovered " << *recovered
+                  << " blocks from the local KV metadata table";
+      } else {
+        LOG(WARNING) << "KV metadata recovery failed, falling back to a cold "
+                        "start: "
+                     << recovered.status().message();
+        absl::Status reformat_status = store->metadata_region_->Reformat();
+        if (!reformat_status.ok()) {
+          LOG(WARNING) << "Failed to reformat the KV metadata table: "
+                       << reformat_status.message();
+        }
+      }
+    }
   }
 
   // The constructor above returned, so the expected workers have all

@@ -27,6 +27,7 @@
 #include "absl/memory/memory.h"
 #include "absl/random/random.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
@@ -37,7 +38,6 @@
 #include "tpu_sync/core/controller/worker_service_server.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/kv_manager_holder.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/store_node/kv_transfer_spec_source.h"
@@ -75,7 +75,7 @@ absl::StatusOr<KVTransferSpec> KVCacheHostStoreNode::WaitForSpec(
   while (true) {
     absl::StatusOr<KVTransferSpec> spec = source.Get();
     if (spec.ok()) {
-      RETURN_IF_ERROR(ValidateSpec(*spec));
+      ABSL_RETURN_IF_ERROR(ValidateSpec(*spec));
       return spec;
     }
     if (!absl::IsNotFound(spec.status()) &&
@@ -95,7 +95,7 @@ absl::StatusOr<KVTransferSpec> KVCacheHostStoreNode::WaitForSpec(
 
 absl::StatusOr<size_t> KVCacheHostStoreNode::NumBlocksForBudget(
     size_t dram_budget_bytes, const KVTransferSpec& spec) {
-  RETURN_IF_ERROR(ValidateSpec(spec));
+  ABSL_RETURN_IF_ERROR(ValidateSpec(spec));
   size_t bytes_per_shard = 0;
   for (uint64_t array_bytes : spec.block_array_bytes) {
     bytes_per_shard += array_bytes;
@@ -116,17 +116,17 @@ absl::StatusOr<size_t> KVCacheHostStoreNode::NumBlocksForBudget(
 absl::StatusOr<std::unique_ptr<KVCacheHostStoreNode>>
 KVCacheHostStoreNode::Create(const Options& options,
                              KVTransferSpecSource* kv_transfer_spec_source) {
-  RETURN_IF_ERROR(ValidateOptions(options));
+  ABSL_RETURN_IF_ERROR(ValidateOptions(options));
   if (kv_transfer_spec_source == nullptr) {
     return absl::InvalidArgumentError(
         "kv_transfer_spec_source must not be null");
   }
 
   // Phase A: the only input the node cannot know on its own.
-  ASSIGN_OR_RETURN(const KVTransferSpec spec,
-                   WaitForSpec(*kv_transfer_spec_source, options));
-  ASSIGN_OR_RETURN(const size_t num_host_blocks,
-                   NumBlocksForBudget(options.dram_budget_bytes, spec));
+  ABSL_ASSIGN_OR_RETURN(const KVTransferSpec spec,
+                        WaitForSpec(*kv_transfer_spec_source, options));
+  ABSL_ASSIGN_OR_RETURN(const size_t num_host_blocks,
+                        NumBlocksForBudget(options.dram_budget_bytes, spec));
 
   // The CPU-only manager constructor below models one uniform stride across
   // all block arrays; hybrid models (whose state arrays have differing
@@ -189,7 +189,7 @@ KVCacheHostStoreNode::Create(const Options& options,
     backend_config.monitor_config.enable =
         options.enable_store_monitor &&
         !options.global_registry_address.empty();
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         store, kv_cache::KVCacheStore::Create(
                    backend_config, /*capacity=*/num_host_blocks,
                    options.global_registry_address, options.raiden_id,
@@ -212,7 +212,7 @@ KVCacheHostStoreNode::Create(const Options& options,
       store->raiden_controller_address());
   for (size_t rank = 0; rank < managers.size(); ++rank) {
     auto worker_server = controller::WorkerServiceServer::Create();
-    RETURN_IF_ERROR(worker_server->StartServer(
+    ABSL_RETURN_IF_ERROR(worker_server->StartServer(
         /*host_allocator=*/nullptr, KVManagerHolder(managers[rank].get()),
         /*port=*/0));
     const std::string worker_endpoint = ComposeEndpoint(

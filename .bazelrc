@@ -17,3 +17,5 @@ build:ci --remote_local_fallback
 # targets set per-target and the flags kokoro presubmit passes globally.
 build --cxxopt=-std=c++20
 build --host_cxxopt=-std=c++20
+build --copt=-DABSL_DEFINE_UNQUALIFIED_STATUS_MACROS
+build --host_copt=-DABSL_DEFINE_UNQUALIFIED_STATUS_MACROS

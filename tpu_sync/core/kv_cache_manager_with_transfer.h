@@ -531,7 +531,6 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   std::map<int64_t, std::shared_ptr<StagingReadinessState>>
       active_producer_blocks_;
   absl::Mutex mu_;
-  absl::CondVar cv_;
   int control_fd_ = -1;
   std::atomic<bool> stopping_{false};
   std::thread control_thread_;

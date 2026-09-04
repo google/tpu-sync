@@ -674,7 +674,6 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
     absl::MutexLock lock(mu_);
     send_entries_[uuid] = entry;
   }
-  cv_.SignalAll();
 
   std::ostringstream timing;
   timing << "RAIDEN_TIMING event=producer_register"
@@ -2372,10 +2371,6 @@ void KVCacheManagerWithTransfer::StopControlServer() {
       RemoveStagingReadinessLocked(staging_readiness_.begin()->first);
     }
   }
-  // Wake workers parked in ProcessPullStream waiting for a send entry that
-  // will never arrive, so their loops observe stopping_ and the pools can
-  // join them.
-  cv_.SignalAll();
   if (control_fd_ >= 0) {
     shutdown(control_fd_, SHUT_RDWR);
     close(control_fd_);
@@ -2445,22 +2440,14 @@ void KVCacheManagerWithTransfer::ProcessPullStream(
   std::shared_ptr<SendEntry> entry;
   {
     absl::MutexLock lock(mu_);
-    while (true) {
-      auto it = send_entries_.find(req.uuid);
-      if (it != send_entries_.end()) {
-        entry = it->second;
-        break;
-      }
-      if (stopping_.load()) {
-        break;
-      }
-      cv_.Wait(&mu_);
+    auto it = send_entries_.find(req.uuid);
+    // The producer registers before publishing the UUID, so an unknown pull
+    // cannot become valid later.
+    if (it == send_entries_.end()) {
+      throw std::runtime_error(
+          absl::StrCat("no send registration for UUID ", req.uuid));
     }
-  }
-  if (stopping_) return;
-  if (!entry) {
-    throw std::runtime_error(
-        "KVCacheManagerWithTransfer is stopping during wait for send entry");
+    entry = it->second;
   }
 
   std::vector<int64_t> src_block_ids = ReadBlockIds(fd, req.num_blocks);

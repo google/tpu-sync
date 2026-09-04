@@ -1738,6 +1738,17 @@ class RaidenController:
                       plan.shard_push_schedules,
                       dst_mem_type,
                       skip_d2h=plan.skip_d2h,
+                      # skip_tiling must cross the controller boundary with
+                      # skip_d2h. The sender's D2h honours this map (it
+                      # reaches the local source worker via the
+                      # start_transfer(s_node, plan) call below), so
+                      # omitting it here leaves the receiver's H2d with an
+                      # empty active_skip while the sender detiled
+                      # according to a populated one. The two sides then
+                      # disagree about the host staging buffer's format and
+                      # the landed weights are silently wrong: no bounds
+                      # check fires and the chunk counts still match.
+                      skip_tiling=plan.skip_tiling,
                   ),
               )
               if not success:

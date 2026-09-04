@@ -711,6 +711,76 @@ class RaidenControllerTest(absltest.TestCase):
       controller.start_transfer = original_start_transfer
       server.stop()
 
+  def test_slice_broadcast_forwards_skip_tiling_to_remote_controller(self):
+    """skip_tiling must cross the controller boundary alongside skip_d2h.
+
+    Both configure how the host staging buffer is interpreted. The
+    remote-coordination branch of _execute_slice_broadcast forwarded only
+    skip_d2h, so the sender's D2h detiled according to a populated map while
+    the receiver's H2d re-tiled according to an empty one. Nothing detects
+    that: no bounds check fires, the chunk counts still match, the transfer
+    reports success, and the landed weights are silently wrong.
+    """
+    controller = raiden_controller.RaidenController(port=0)
+
+    src = raiden_controller.RaidenId("trainer", "0", "weights")
+    dst = raiden_controller.RaidenId("sampler", "0", "weights")
+
+    recorded = []
+
+    class RecordingFacade:
+
+      def __init__(self, address, name_resolver=None):
+        del address, name_resolver
+
+      def register_transfer_schedule(self, *args, **kwargs):
+        recorded.append((args, kwargs))
+        return True
+
+    skip_tiling = {7: True, 9: False}
+    final_plan = raiden_controller.TransferPlan(
+        src_units=[src],
+        dst_units=[dst],
+        plan=None,
+        shard_push_schedules={},
+        worker_rpc_addresses={},
+        worker_data_addresses={},
+        uuid=1,
+        dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+        use_block_chunks=True,
+        is_sender=True,
+        expected_block_count=0,
+        req_id="req-bcast",
+        skip_d2h=True,
+        skip_tiling=skip_tiling,
+    )
+
+    # key: (src_unit, shard_idx, src_block_id, src_block_offset, size,
+    #       src_stride, count, layer_idx, pool_group)
+    key = (src, 0, 0, 0, 4096, 0, 1, 7, 0)
+    # target: (dst_unit, dst_peer, dst_shard_idx, dst_block_id,
+    #          dst_block_offset, dst_stride)
+    targets = [(dst, "10.0.0.2:8000", 0, 0, 0, 0)]
+
+    with mock.patch.object(
+        raiden_controller, "RaidenControllerClientFacade", RecordingFacade
+    ):
+      asyncio.run(
+          controller._execute_slice_broadcast(
+              keys_and_targets=[(key, targets)],
+              final_plan=final_plan,
+              fanout_k=1,
+              req_id="req-bcast",
+              dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+              dst_controller_address="10.0.0.2:9000",
+          )
+      )
+
+    self.assertLen(recorded, 1)
+    _, kwargs = recorded[0]
+    self.assertTrue(kwargs.get("skip_d2h"))
+    self.assertEqual(kwargs.get("skip_tiling"), skip_tiling)
+
   def test_multi_variable_resharding_planning(self):
     """Verifies resharding planning for multiple variables using absolute offsets."""
     client = RecordingWorkerRpcClient()

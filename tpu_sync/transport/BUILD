@@ -50,7 +50,6 @@ cc_library(
     deps = [
         ":block_transport_delegate",
         ":buffer_push_task",
-        "//tpu_sync/core:status_macros",
         "//tpu_sync/core:tsl_platform_headers",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
@@ -68,6 +67,7 @@ cc_library(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",

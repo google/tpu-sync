@@ -48,6 +48,18 @@ _impl = torch_abi.load_extension(
 # coordinate_transfer. Absent on older shims, so consumers must getattr.
 SUPPORTS_DST_SKIP_BYTES = bool(
     getattr(_impl, "reshard_client_supports_dst_skip_bytes", False))
+# True iff get_request_block_status (read-only registry lifecycle probe)
+# is available; absent on older shims, so consumers must getattr.
+SUPPORTS_REQUEST_BLOCK_STATUS = bool(
+    getattr(_impl, "reshard_client_supports_request_block_status", False)
+)
+
+# GetRequestBlockStatusResponse.Status values returned by
+# get_request_block_status.
+REQUEST_BLOCK_STATUS_UNKNOWN = 1
+REQUEST_BLOCK_STATUS_REGISTERED = 2
+REQUEST_BLOCK_STATUS_CLAIMED = 3
+REQUEST_BLOCK_STATUS_CANCELLED = 4
 
 
 def _unit_tuple(unit: Any) -> tuple:
@@ -190,6 +202,20 @@ class ReshardClient:
                                          uuid: int) -> bool:
     return bool(
         self._impl.cancel_request_blocks_if_unclaimed(str(req_id), int(uuid)))
+
+  def get_request_block_status(
+      self, keys: typing.Sequence[tuple[str, int]]
+  ) -> list[int]:
+    """Read-only registry lifecycle probe: one REQUEST_BLOCK_STATUS_* value
+
+    per (req_id, uuid) key, in order.
+    """
+    return [
+        int(status)
+        for status in self._impl.get_request_block_status(
+            [(str(req_id), int(uuid)) for req_id, uuid in keys]
+        )
+    ]
 
   def coordinate_transfer(
       self,

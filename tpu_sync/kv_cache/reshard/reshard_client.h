@@ -31,6 +31,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -162,6 +163,8 @@ class ReshardClient {
       const StartTransferArgs& args);
   static tpu_sync::rpc::ControllerRequest BuildGetTransferStatus(
       const std::string& req_id, int64_t uuid);
+  static tpu_sync::rpc::ControllerRequest BuildGetRequestBlockStatus(
+      const std::vector<std::pair<std::string, int64_t>>& keys);
   static tpu_sync::rpc::ControlRequest BuildGetMetadata();
   static tpu_sync::rpc::ControlRequest BuildShutdown();
 
@@ -179,6 +182,9 @@ class ReshardClient {
   absl::StatusOr<bool> StartTransfer(const StartTransferArgs& args);
   absl::StatusOr<int32_t> GetTransferStatus(const std::string& req_id,
                                             int64_t uuid);
+  // GetRequestBlockStatusResponse::Status values, parallel to keys.
+  absl::StatusOr<std::vector<int32_t>> GetRequestBlockStatus(
+      const std::vector<std::pair<std::string, int64_t>>& keys);
   // Serialized RegisterWorkUnitRequest payloads; the Python shim parses
   // them back into pb2 objects so callers see the facade's return shape.
   absl::StatusOr<std::vector<std::string>> GetMetadata();

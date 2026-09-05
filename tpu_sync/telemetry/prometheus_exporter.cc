@@ -75,6 +75,7 @@ void PrometheusExporter::RegisterKnownFamilies() {
                             .Name(prometheus_name)
                             .Help(std::string(meta.description))
                             .Register(*registry_);
+        family->Add({});
         counter_families_.emplace(meta.name, family);
         break;
       }
@@ -83,6 +84,7 @@ void PrometheusExporter::RegisterKnownFamilies() {
                             .Name(prometheus_name)
                             .Help(std::string(meta.description))
                             .Register(*registry_);
+        family->Add({});
         gauge_families_.emplace(meta.name, family);
         break;
       }
@@ -91,6 +93,7 @@ void PrometheusExporter::RegisterKnownFamilies() {
                             .Name(prometheus_name)
                             .Help(std::string(meta.description))
                             .Register(*registry_);
+        family->Add({}, default_buckets_);
         histogram_families_.emplace(meta.name, family);
         break;
       }

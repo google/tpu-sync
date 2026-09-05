@@ -228,6 +228,7 @@ cc_library(
     tags = ["manual"],
     visibility = ["//visibility:public"],
     deps = [
+        "//tpu_sync/common:trace",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -287,6 +288,7 @@ cc_library(
     deps = [
         ":jax_utils",
         ":utils",
+        "//tpu_sync/common:trace",
         "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",
@@ -402,6 +404,7 @@ cc_library(
     ] + _X86_MARCH_COPTS,
     features = ["-use_header_modules"],
     deps = [
+        "//tpu_sync/common:trace",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -455,6 +458,7 @@ cc_library(
         "-use_header_modules",
     ],
     deps = [
+        "//tpu_sync/common:trace",
         "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",

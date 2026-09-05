@@ -29,6 +29,7 @@
 #include "grpcpp/security/credentials.h"
 #include "grpcpp/support/status.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/rpc/raiden_service.grpc.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
@@ -93,6 +94,7 @@ tsl::Future<::tpu_sync::rpc::ControlResponse>
 WeightSynchronizationWorkerServiceClient::StartTransfer(
     const ::tpu_sync::rpc::StartTransferRequest& start_transfer_request,
     const std::vector<std::string>& peers, absl::Duration timeout) {
+  RAIDEN_TRACE("WSyncClient::StartTransfer");
   ::tpu_sync::rpc::ControlRequest req;
   req.set_command(::tpu_sync::rpc::ControlRequest::COMMAND_START_TRANSFER);
   *req.mutable_start_transfer_request() = start_transfer_request;

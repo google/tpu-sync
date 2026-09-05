@@ -645,6 +645,17 @@ py_library(
 )
 
 py_test(
+    name = "utils_test",
+    srcs = ["utils_test.py"],
+    deps = [
+        ":jax_test_utils",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@jax//jax",
+        "@pypi//numpy",
+    ],
+)
+
+py_test(
     name = "raw_transfer_perf_gl",
     timeout = "long",
     srcs = ["raw_transfer_perf_test.py"],

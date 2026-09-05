@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <exception>
 #include <future>  // NOLINT
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -61,14 +62,15 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
     nanobind::list jax_arrays, std::optional<int> local_port, int parallelism,
     bool unsafe_skip_buffer_lock, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, bool auto_h2d,
-    std::optional<int> global_shard_offset)
+    std::optional<std::vector<int64_t>> global_shard_indices)
     : unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
-      global_shard_offset_(global_shard_offset.value_or(0)) {
+      global_shard_indices_(
+          global_shard_indices.value_or(std::vector<int64_t>{})) {
   auto layer_buffers =
       tpu_raiden::jax::UnpackJaxArrays(jax_arrays, unsafe_skip_buffer_lock);
   InitSubManagers(layer_buffers, local_port, unsafe_skip_buffer_lock,
                   parallelism, listener_port, bind_ip, auto_h2d,
-                  global_shard_offset);
+                  global_shard_indices);
 }
 
 absl::Status NumaAwareWeightSynchronizer::BindWeights(
@@ -120,11 +122,12 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,
     std::optional<int> local_port, int parallelism,
     std::optional<int> listener_port, std::optional<std::string> bind_ip,
-    bool auto_h2d, std::optional<int> global_shard_offset)
+    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices)
     : total_num_shards_(num_shards),
       num_layers_(num_layers),
       slice_byte_size_(slice_byte_size),
-      global_shard_offset_(global_shard_offset.value_or(0)) {
+      global_shard_indices_(
+          global_shard_indices.value_or(std::vector<int64_t>{})) {
   auto sub = std::make_unique<weight_sync::WeightSynchronizerBase>(
       num_layers, num_shards, slice_byte_size, local_port,
       /*host_blocks_to_allocate=*/std::nullopt, parallelism, listener_port,
@@ -133,10 +136,11 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
   global_shard_to_submanager_.resize(total_num_shards_);
   submanager_to_global_shards_.resize(1);
   submanager_to_local_shards_.resize(1);
-  int base_offset = global_shard_offset_;
   for (size_t i = 0; i < total_num_shards_; ++i) {
     global_shard_to_submanager_[i] = {0, static_cast<int>(i)};
-    submanager_to_global_shards_[0].push_back(base_offset + i);
+    int64_t gidx = (i < global_shard_indices_.size()) ? global_shard_indices_[i]
+                                                      : static_cast<int64_t>(i);
+    submanager_to_global_shards_[0].push_back(gidx);
     submanager_to_local_shards_[0].push_back(static_cast<int>(i));
   }
   if (!sub_synchronizers_.empty() && sub_synchronizers_[0]) {
@@ -162,6 +166,8 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
   global_shard_to_submanager_.resize(total_num_shards_);
   submanager_to_global_shards_.resize(sub_synchronizers_.size());
   submanager_to_local_shards_.resize(sub_synchronizers_.size());
+  global_shard_indices_.clear();
+  global_shard_indices_.reserve(total_num_shards_);
   int global_idx = 0;
   for (size_t s = 0; s < sub_synchronizers_.size(); ++s) {
     size_t nsh =
@@ -169,8 +175,10 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
     for (size_t l = 0; l < nsh; ++l) {
       global_shard_to_submanager_[global_idx] = {static_cast<int>(s),
                                                  static_cast<int>(l)};
-      submanager_to_global_shards_[s].push_back(global_idx);
+      int64_t gidx = static_cast<int64_t>(global_idx);
+      submanager_to_global_shards_[s].push_back(gidx);
       submanager_to_local_shards_[s].push_back(static_cast<int>(l));
+      global_shard_indices_.push_back(gidx);
       global_idx++;
     }
   }
@@ -194,14 +202,16 @@ void NumaAwareWeightSynchronizer::InitSubManagers(
     std::optional<int> local_port, bool unsafe_skip_buffer_lock,
     int parallelism, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, bool auto_h2d,
-    std::optional<int> global_shard_offset) {
+    std::optional<std::vector<int64_t>> global_shard_indices) {
   if (layer_buffers.empty()) return;
   num_layers_ = layer_buffers.size();
   total_num_shards_ = layer_buffers[0].size();
   slice_byte_size_ = layer_buffers[0].empty()
                          ? 0
                          : layer_buffers[0][0].GetOnDeviceSizeInBytes();
-  global_shard_offset_ = global_shard_offset.value_or(0);
+  if (global_shard_indices.has_value()) {
+    global_shard_indices_ = *global_shard_indices;
+  }
   global_shard_to_submanager_.resize(total_num_shards_);
 
   absl::btree_map<int, std::vector<int>> numa_to_shards;
@@ -268,15 +278,19 @@ void NumaAwareWeightSynchronizer::InitSubManagers(
     std::optional<int> bound_base_listener_port = std::nullopt;
     bool bind_conflict = false;
 
-    int base_shard_offset = global_shard_offset_;
     for (const auto& [numa, shards] : numa_to_shards) {
       int sub_idx = static_cast<int>(sub_synchronizers_.size());
       std::vector<int64_t> gshards;
       gshards.reserve(shards.size());
       for (size_t local_sh = 0; local_sh < shards.size(); ++local_sh) {
-        global_shard_to_submanager_[shards[local_sh]] = {
-            sub_idx, static_cast<int>(local_sh)};
-        gshards.push_back(base_shard_offset + shards[local_sh]);
+        int sh_idx = shards[local_sh];
+        global_shard_to_submanager_[sh_idx] = {sub_idx,
+                                               static_cast<int>(local_sh)};
+        int64_t gidx =
+            (static_cast<size_t>(sh_idx) < global_shard_indices_.size())
+                ? global_shard_indices_[sh_idx]
+                : static_cast<int64_t>(sh_idx);
+        gshards.push_back(gidx);
       }
       submanager_to_global_shards_.push_back(std::move(gshards));
       submanager_to_local_shards_.push_back(shards);
@@ -601,11 +615,15 @@ void NumaAwareWeightSynchronizer::StoreSkipTiling(
       for (const auto& entry : schedule.entries()) {
         int dst_shard_idx = entry.dst_shard_idx();
         int target_sub = -1;
-        int local_dst_shard = dst_shard_idx - global_shard_offset_;
-        if (local_dst_shard >= 0 && static_cast<size_t>(local_dst_shard) <
-                                        global_shard_to_submanager_.size()) {
-          target_sub = global_shard_to_submanager_[local_dst_shard].first;
-        } else if (dst_shard_idx >= 0 &&
+        auto it = std::find(global_shard_indices_.begin(),
+                            global_shard_indices_.end(), dst_shard_idx);
+        if (it != global_shard_indices_.end()) {
+          size_t local_dst_shard =
+              std::distance(global_shard_indices_.begin(), it);
+          if (local_dst_shard < global_shard_to_submanager_.size()) {
+            target_sub = global_shard_to_submanager_[local_dst_shard].first;
+          }
+        } else if (global_shard_indices_.empty() && dst_shard_idx >= 0 &&
                    static_cast<size_t>(dst_shard_idx) <
                        global_shard_to_submanager_.size()) {
           target_sub = global_shard_to_submanager_[dst_shard_idx].first;
@@ -790,17 +808,20 @@ void NumaAwareWeightSynchronizer::SetSubmanagerShardsForTesting(
   submanager_to_local_shards_.clear();
   submanager_to_local_shards_.resize(assignment.size());
   global_shard_to_submanager_.clear();
+  global_shard_indices_.clear();
   total_num_shards_ = 0;
   for (size_t s = 0; s < assignment.size(); ++s) {
     total_num_shards_ += assignment[s].size();
   }
   global_shard_to_submanager_.resize(total_num_shards_);
+  global_shard_indices_.reserve(total_num_shards_);
   int local_idx = 0;
   for (size_t s = 0; s < assignment.size(); ++s) {
     for (size_t l = 0; l < assignment[s].size(); ++l) {
       submanager_to_local_shards_[s].push_back(local_idx);
       global_shard_to_submanager_[local_idx] = {static_cast<int>(s),
                                                 static_cast<int>(l)};
+      global_shard_indices_.push_back(assignment[s][l]);
       local_idx++;
     }
   }
@@ -821,10 +842,10 @@ WeightSynchronizer::WeightSynchronizer(
     nanobind::list jax_arrays, std::optional<int> local_port, int parallelism,
     bool unsafe_skip_buffer_lock, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, bool auto_h2d,
-    std::optional<int> global_shard_offset) {
+    std::optional<std::vector<int64_t>> global_shard_indices) {
   numa_manager_ = std::make_unique<NumaAwareWeightSynchronizer>(
       jax_arrays, local_port, parallelism, unsafe_skip_buffer_lock,
-      listener_port, bind_ip, auto_h2d, global_shard_offset);
+      listener_port, bind_ip, auto_h2d, global_shard_indices);
 }
 
 absl::Status WeightSynchronizer::BindWeights(nanobind::list jax_arrays) {
@@ -836,10 +857,10 @@ WeightSynchronizer::WeightSynchronizer(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,
     std::optional<int> local_port, int parallelism,
     std::optional<int> listener_port, std::optional<std::string> bind_ip,
-    bool auto_h2d, std::optional<int> global_shard_offset) {
+    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices) {
   numa_manager_ = std::make_unique<NumaAwareWeightSynchronizer>(
       num_layers, num_shards, slice_byte_size, local_port, parallelism,
-      listener_port, bind_ip, auto_h2d, global_shard_offset);
+      listener_port, bind_ip, auto_h2d, global_shard_indices);
 }
 
 WeightSynchronizer::WeightSynchronizer(

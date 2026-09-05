@@ -18,7 +18,6 @@ import socket
 import subprocess
 import sys
 import time
-import unittest
 
 _LOG_DIR = os.environ.get("TEST_TMPDIR", os.environ.get("TMPDIR", "/tmp"))
 os.environ.setdefault("TPU_LOG_DIR", _LOG_DIR)
@@ -865,20 +864,9 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
       self.fail("One or more workers failed!")
 
   # The same 8-rank save/load/compare run with the KV pools (and metadata
-  # tables) placed in shared memory. Every rank runs in its own process on the
-  # same host, so this is the configuration that needs per-rank segment names
-  # and one real segment per allocation; today the ranks collide on one name
-  # and the pools are additionally left unregistered with the DMA engine on
-  # multi-process TPUv7 (the DmaMap workaround). Enable only after the
-  # shared-memory allocator rework AND the libtpu release that fixes
-  # multi-process DmaMap (with the workaround removed) — the run is not
-  # production-representative before both.
-  @unittest.skip(
-      "Shared-memory segments collide across same-host MPMD ranks and the"
-      " allocator aliases every allocation into one segment; also requires"
-      " the libtpu multi-process DmaMap fix. Enable after the allocator"
-      " rework and the libtpu pin bump."
-  )
+  # tables) placed in shared memory. Every rank runs in its own process on
+  # the same host, so this exercises per-rank segment names, one region per
+  # allocation within a segment, and true multi-process DMA mapping.
   def test_mpmd_8rank_e2e_save_and_load_in_shared_memory(self):
     world_size = 8
     prepare_tpu_environment(world_size)

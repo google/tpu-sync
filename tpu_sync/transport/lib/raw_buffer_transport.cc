@@ -62,6 +62,7 @@
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
+#include "tpu_sync/transport/lib/socket/util.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 #include "tpu_sync/transport/peregrine/src/api/socket_util.h"
 
@@ -483,6 +484,9 @@ void RawBufferTransport::ListenerLoop() {
     int buf_opt = 16 * 1024 * 1024;  // 16MB
     setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &buf_opt, sizeof(buf_opt));
     setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buf_opt, sizeof(buf_opt));
+    // The accepted side serves pulls and reads pushes, so it blocks on the
+    // same peers the connect side does and needs the same bounds.
+    ApplyDataPlaneSocketOptions(client_fd);
 
     DCHECK_GE(client_fd, 0);
     {

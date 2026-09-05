@@ -211,6 +211,7 @@ nanobind_extension(
     tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
+        ":kv_cache_offloader",
         ":kv_cache_manager_torch",
         ":pool_layout_nanobind",
         ":torch_nanobind_utils",
@@ -501,6 +502,73 @@ cc_test(
         ":torch_raw_transfer_torch_mock",
         ":torch_tpu_utils_mock",
         "@torch_tpu//shims/torch",
+        "@torch_tpu//shims/torch:torch_headers",
+        "@xla//xla/pjrt:pjrt_client",
+        "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
+        "@xla//xla/tsl/platform:statusor",
+        "@xla//xla/tsl/platform:test",
+        "@xla//xla/tsl/platform:test_main",
+    ],
+)
+
+cc_library(
+    name = "kv_cache_offloader",
+    srcs = ["kv_cache_offloader.cc"],
+    hdrs = ["kv_cache_offloader.h"],
+    copts = [
+        "-std=c++20",
+        "-fexceptions",
+        "-march=x86-64-v2",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":torch_tpu_utils",
+        "//tpu_sync/core:raw_transfer_core",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@torch_tpu//shims/torch:aten_headers",
+        "@xla//xla/pjrt:pjrt_client",
+    ],
+)
+
+cc_library(
+    name = "kv_cache_offloader_mock",
+    srcs = ["kv_cache_offloader.cc"],
+    hdrs = ["kv_cache_offloader.h"],
+    copts = [
+        "-std=c++20",
+        "-fexceptions",
+        "-march=x86-64-v2",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":torch_tpu_utils_mock",
+        "//tpu_sync/core:raw_transfer_core",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@torch_tpu//shims/torch:aten_headers",
+        "@xla//xla/pjrt:pjrt_client",
+    ],
+)
+
+cc_test(
+    name = "kv_cache_offloader_test",
+    srcs = ["kv_cache_offloader_test.cc"],
+    copts = [
+        "-std=c++20",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":kv_cache_offloader_mock",
+        ":torch_tpu_utils_mock",
+        "@com_google_absl//absl/status",
+        "@torch_tpu//shims/torch",
+        "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
         "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",

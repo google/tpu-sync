@@ -98,6 +98,7 @@ JAX_DEPS = [
 TORCH_DEPS = [
     "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
     "//tpu_sync/api/torch:kv_cache_manager_torch_py",
+    "//tpu_sync/api/torch:kv_cache_offloader_py",
     "//tpu_sync/api/torch:reshard_client",
     "//tpu_sync/api/torch:reshard_store",
     "//tpu_sync/api/torch:weight_synchronizer_torch_py",

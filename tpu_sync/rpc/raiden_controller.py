@@ -365,7 +365,13 @@ def create_server_socket(port: int) -> socket.socket:
   """Creates an IPv6 socket (supporting IPv4 dual-stack on Linux) or falls back to IPv4."""
   try:
     sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    try:
+      sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    except OSError:
+      # IPv6-only environment (e.g. TI VM under enforced isolation): the
+      # dual-stack toggle is refused but the v6 socket itself works.
+      # Keep it and listen v6-only.
+      pass
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("::", port))
     sock.listen(128)
@@ -376,7 +382,6 @@ def create_server_socket(port: int) -> socket.socket:
     sock.bind(("0.0.0.0", port))
     sock.listen(128)
     return sock
-
 
 def connect_socket(
     address_str: str,

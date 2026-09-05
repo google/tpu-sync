@@ -16,6 +16,7 @@
 
 import asyncio
 import socket
+from unittest import mock
 from absl.testing import absltest
 from tpu_sync.rpc import raiden_controller
 from tpu_sync.rpc import raiden_service_pb2
@@ -2701,6 +2702,72 @@ class FormatUnitHelpersTest(absltest.TestCase):
     # Single string / bytes (must not be iterated as chars)
     self.assertEqual(raiden_controller._format_units("unit_str"), "unit_str")
     self.assertEqual(raiden_controller._format_units(b"unit_bytes"), "b'unit_bytes'")
+
+  def test_multi_endpoint_registration_and_get_worker_endpoints(self):
+    controller = raiden_controller.RaidenController(port=10099)
+    unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+    controller.register_work_unit(
+        unit,
+        ["10.0.0.1:8000", "10.0.0.2:8000"],
+        control_plane_rpc_address="10.0.0.1:9001,10.0.0.2:9002",
+    )
+    self.assertEqual(
+        controller.worker_rpc_client.get_registered_endpoints(unit),
+        ["10.0.0.1:9001", "10.0.0.2:9002"],
+    )
+    self.assertEqual(
+        controller.worker_rpc_client.get_worker_endpoints()[unit],
+        "10.0.0.1:9001,10.0.0.2:9002",
+    )
+    # Re-registration replaces endpoints
+    controller.register_work_unit(
+        unit,
+        ["10.0.0.3:8000"],
+        control_plane_rpc_address="10.0.0.3:9003",
+    )
+    self.assertEqual(
+        controller.worker_rpc_client.get_registered_endpoints(unit),
+        ["10.0.0.3:9003"],
+    )
+
+  def test_start_transfer_multi_endpoint_broadcast(self):
+    recorded_calls = []
+
+    class MockWorkerClient(raiden_controller.WorkerRpcClient):
+
+      def _encode_start_transfer(self, target_id, transfer_plan):
+        return b"dummy_payload"
+
+      async def _send_and_verify(self, addr, payload):
+        recorded_calls.append((addr, payload))
+
+    client = MockWorkerClient()
+    unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+    client.register_worker_endpoint(unit, "10.0.0.1:9001")
+    client.register_worker_endpoint(unit, "10.0.0.2:9002")
+
+    plan = mock.MagicMock(spec=raiden_controller.TransferPlan)
+    asyncio.run(client.start_transfer(unit, plan))
+    self.assertEqual(
+        recorded_calls,
+        [
+            ("10.0.0.1:9001", b"dummy_payload"),
+            ("10.0.0.2:9002", b"dummy_payload"),
+        ],
+    )
+
+    # Test explicit comma-separated address parameter
+    recorded_calls.clear()
+    asyncio.run(
+        client.start_transfer(unit, plan, address="10.0.0.3:9003,10.0.0.4:9004")
+    )
+    self.assertEqual(
+        recorded_calls,
+        [
+            ("10.0.0.3:9003", b"dummy_payload"),
+            ("10.0.0.4:9004", b"dummy_payload"),
+        ],
+    )
 
 
 if __name__ == "__main__":

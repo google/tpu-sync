@@ -586,7 +586,10 @@ class WorkerRpcClient:
         return
     except NotImplementedError:
       return
-    addrs = [address] if address else await self._resolve_endpoints(target_id)
+    if address:
+      addrs = [a.strip() for a in address.split(",") if a.strip()]
+    else:
+      addrs = await self._resolve_endpoints(target_id)
     await asyncio.gather(
         *[self._send_and_verify(addr, payload) for addr in addrs]
     )
@@ -786,7 +789,7 @@ class WorkerRpcClient:
 
   def get_worker_endpoints(self) -> dict[RaidenId, str]:
     """Returns active read-only snapshot of known registered Worker RPC endpoints."""
-    return {k: v[0] for k, v in self._endpoints.items() if v}
+    return {k: ",".join(v) for k, v in self._endpoints.items() if v}
 
   def get_registered_endpoints(self, worker_name: RaidenId) -> list[str]:
     """Returns list of registered RPC endpoints for the given worker."""
@@ -1440,14 +1443,21 @@ class RaidenController:
         self._registered_transfer_ranks[unit] = transfer_rank
       if variables is not None:
         self._registered_variables[unit] = list(variables)
+      if hasattr(self.worker_rpc_client, "unregister_worker_endpoint"):
+        self.worker_rpc_client.unregister_worker_endpoint(unit)
       if control_plane_rpc_address and hasattr(
           self.worker_rpc_client, "register_worker_endpoint"
       ):
-        self.worker_rpc_client.register_worker_endpoint(
-            unit, control_plane_rpc_address
-        )
-      elif hasattr(self.worker_rpc_client, "unregister_worker_endpoint"):
-        self.worker_rpc_client.unregister_worker_endpoint(unit)
+        if isinstance(control_plane_rpc_address, (list, tuple)):
+          endpoints = list(control_plane_rpc_address)
+        else:
+          endpoints = [
+              a.strip()
+              for a in str(control_plane_rpc_address).split(",")
+              if a.strip()
+          ]
+        for addr in endpoints:
+          self.worker_rpc_client.register_worker_endpoint(unit, addr)
       self._plan_cache.clear()
 
   def clear_plan_cache(self) -> None:

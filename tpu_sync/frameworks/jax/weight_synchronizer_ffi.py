@@ -81,9 +81,7 @@ def init_weight_synchronizer(
     )
 
   axis_names = mesh.axis_names
-  anchor_spec = jax.sharding.PartitionSpec(
-      *axis_names, *([None] * (len(device_array.shape) - len(axis_names)))
-  )
+  anchor_spec = device_array.sharding.spec
   index_spec = jax.sharding.PartitionSpec(*axis_names)
   sizes_spec = jax.sharding.PartitionSpec(None)
   out_spec = jax.sharding.PartitionSpec(*axis_names, None)

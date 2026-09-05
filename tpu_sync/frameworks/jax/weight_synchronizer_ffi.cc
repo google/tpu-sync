@@ -50,8 +50,8 @@
 namespace tpu_raiden {
 namespace weight_sync {
 
-WeightSynchronizerBase* g_weight_synchronizers[32] = {nullptr};
-std::unique_ptr<stream_executor::Stream> g_streams[32] = {nullptr};
+WeightSynchronizerBase* g_weight_synchronizers[kMaxShards] = {nullptr};
+std::unique_ptr<stream_executor::Stream> g_streams[kMaxShards] = {nullptr};
 
 static absl::Mutex ws_mu;
 static auto* ws_map =
@@ -64,7 +64,7 @@ void ClearSharedWsMap() {
   absl::MutexLock lock(ws_mu);
   ws_map->clear();
   ws_shard_to_slot_map->clear();
-  for (int i = 0; i < 32; ++i) {
+  for (size_t i = 0; i < kMaxShards; ++i) {
     g_weight_synchronizers[i] = nullptr;
     g_streams[i].reset();
   }
@@ -117,27 +117,31 @@ static WeightSynchronizerBase* GetSharedWs(
         opt_listener_port, sub_bind_ip);
   }
   auto& slot_map = (*ws_shard_to_slot_map)[ws];
-  auto [it, inserted] = slot_map.try_emplace(
-      shard_idx, static_cast<size_t>(shard_idx) % ws->num_shards());
+  size_t assigned_slot =
+      (num_shards > 0) ? (static_cast<size_t>(shard_idx) % num_shards) : 0;
+  auto [it, inserted] = slot_map.try_emplace(shard_idx, assigned_slot);
   if (inserted) {
     std::vector<int64_t> indices(ws->num_shards(), -1);
+    std::vector<int> local_indices(ws->num_shards(), -1);
     for (const auto& [s_id, s_slot] : slot_map) {
       if (s_slot < indices.size()) {
         indices[s_slot] = s_id;
+        local_indices[s_slot] = static_cast<int>(s_slot);
       }
     }
     ws->SetGlobalShardIndices(std::move(indices));
+    ws->SetLocalShardIndices(std::move(local_indices));
   }
   return ws;
 }
 
 static size_t GetLocalSlot(int32_t shard_idx) {
-  if (shard_idx < 0 || shard_idx >= 32) {
+  if (shard_idx < 0 || static_cast<size_t>(shard_idx) >= kMaxShards) {
     return 0;
   }
   WeightSynchronizerBase* ws = g_weight_synchronizers[shard_idx];
   if (ws == nullptr) {
-    return static_cast<size_t>(shard_idx);
+    return 0;
   }
   absl::MutexLock lock(ws_mu);
   auto it = ws_shard_to_slot_map->find(ws);
@@ -147,7 +151,9 @@ static size_t GetLocalSlot(int32_t shard_idx) {
       return slot_it->second;
     }
   }
-  return static_cast<size_t>(shard_idx) % ws->num_shards();
+  return (ws->num_shards() > 0)
+             ? (static_cast<size_t>(shard_idx) % ws->num_shards())
+             : 0;
 }
 
 // FFI Init custom call implementation for WeightSynchronizer (Host CPU
@@ -164,10 +170,10 @@ xla::ffi::Error TriggerWeightSynchronizerInitImpl(
   }
   int32_t shard_idx =
       *reinterpret_cast<const int32_t*>(shard_idx_buf.untyped_data());
-  if (shard_idx < 0 || shard_idx >= 32) {
-    return xla::ffi::Error(
-        xla::ffi::ErrorCode::kInvalidArgument,
-        absl::StrCat("shard_idx out of bounds [0, 32): ", shard_idx));
+  if (shard_idx < 0 || static_cast<size_t>(shard_idx) >= kMaxShards) {
+    return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
+                           absl::StrCat("shard_idx out of bounds [0, ",
+                                        kMaxShards, "): ", shard_idx));
   }
 
   if (slice_byte_sizes_buf.untyped_data() == nullptr) {
@@ -274,10 +280,10 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
   }
   int32_t shard_idx =
       *reinterpret_cast<const int32_t*>(shard_idx_buf.untyped_data());
-  if (shard_idx < 0 || shard_idx >= 32) {
-    return xla::ffi::Error(
-        xla::ffi::ErrorCode::kInvalidArgument,
-        absl::StrCat("shard_idx out of bounds [0, 32): ", shard_idx));
+  if (shard_idx < 0 || static_cast<size_t>(shard_idx) >= kMaxShards) {
+    return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
+                           absl::StrCat("shard_idx out of bounds [0, ",
+                                        kMaxShards, "): ", shard_idx));
   }
 
   if (slice_byte_sizes_buf.untyped_data() == nullptr) {
@@ -444,7 +450,7 @@ xla::ffi::Error TriggerH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
   }
   int32_t shard_idx =
       *reinterpret_cast<const int32_t*>(shard_idx_buf.untyped_data());
-  if (shard_idx < 0 || shard_idx >= 32 ||
+  if (shard_idx < 0 || static_cast<size_t>(shard_idx) >= kMaxShards ||
       g_weight_synchronizers[shard_idx] == nullptr) {
     return xla::ffi::Error(xla::ffi::ErrorCode::kInternal,
                            "WS not initialized.");
@@ -488,7 +494,7 @@ xla::ffi::Error TriggerMultiH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
   }
   int32_t shard_idx =
       *reinterpret_cast<const int32_t*>(shard_idx_buf.untyped_data());
-  if (shard_idx < 0 || shard_idx >= 32 ||
+  if (shard_idx < 0 || static_cast<size_t>(shard_idx) >= kMaxShards ||
       g_weight_synchronizers[shard_idx] == nullptr) {
     return xla::ffi::Error(xla::ffi::ErrorCode::kInternal,
                            "WS not initialized.");

@@ -62,7 +62,7 @@ class NumaAwareWeightSynchronizer
       int parallelism = 1, bool unsafe_skip_buffer_lock = false,
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<int> global_shard_offset = std::nullopt);
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
 
   absl::Status BindWeights(nanobind::list jax_arrays);
 #endif
@@ -73,7 +73,7 @@ class NumaAwareWeightSynchronizer
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<int> global_shard_offset = std::nullopt);
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
 
   // Test-only constructor for injecting mock sub-synchronizers
   explicit NumaAwareWeightSynchronizer(
@@ -134,7 +134,7 @@ class NumaAwareWeightSynchronizer
       std::optional<int> local_port, bool unsafe_skip_buffer_lock,
       int parallelism, std::optional<int> listener_port,
       std::optional<std::string> bind_ip, bool auto_h2d,
-      std::optional<int> global_shard_offset = std::nullopt);
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
 
   std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>>
       sub_synchronizers_;
@@ -145,7 +145,7 @@ class NumaAwareWeightSynchronizer
   size_t num_layers_ = 0;
   size_t slice_byte_size_ = 0;
   bool unsafe_skip_buffer_lock_ = false;
-  int global_shard_offset_ = 0;
+  std::vector<int64_t> global_shard_indices_;
   std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_;
 
   absl::Mutex expected_counts_mu_;
@@ -164,25 +164,22 @@ class WeightSynchronizer {
   WeightSynchronizer& operator=(WeightSynchronizer&&) = default;
 
 #ifndef WITHOUT_PYTHON
-  WeightSynchronizer(nanobind::list jax_arrays,
-                     std::optional<int> local_port = std::nullopt,
-                     int parallelism = 1, bool unsafe_skip_buffer_lock = false,
-                     std::optional<int> listener_port = std::nullopt,
-                     std::optional<std::string> bind_ip = std::nullopt,
-                     bool auto_h2d = false,
-                     std::optional<int> global_shard_offset = std::nullopt);
+  WeightSynchronizer(
+      nanobind::list jax_arrays, std::optional<int> local_port = std::nullopt,
+      int parallelism = 1, bool unsafe_skip_buffer_lock = false,
+      std::optional<int> listener_port = std::nullopt,
+      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
   absl::Status BindWeights(nanobind::list jax_arrays);
 #endif
 
   // CPU / Mock metadata constructor for tests without PJRT TPU devices
-  WeightSynchronizer(size_t num_layers, size_t num_shards,
-                     size_t slice_byte_size,
-                     std::optional<int> local_port = std::nullopt,
-                     int parallelism = 1,
-                     std::optional<int> listener_port = std::nullopt,
-                     std::optional<std::string> bind_ip = std::nullopt,
-                     bool auto_h2d = false,
-                     std::optional<int> global_shard_offset = std::nullopt);
+  WeightSynchronizer(
+      size_t num_layers, size_t num_shards, size_t slice_byte_size,
+      std::optional<int> local_port = std::nullopt, int parallelism = 1,
+      std::optional<int> listener_port = std::nullopt,
+      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
 
   // Test-only constructor for injecting mock sub-synchronizers
   explicit WeightSynchronizer(

@@ -15,6 +15,7 @@
 """Utilities for JAX."""
 
 import contextlib
+import math
 from typing import Tuple
 
 from absl import flags
@@ -177,6 +178,31 @@ def create_single_layer_kv_cache(
   return sharded_allocate()
 
 
+def _get_host_subgrid(
+    physical_mesh_shape: list[int], devices_per_host: int
+) -> list[int]:
+  """Computes host subgrid cuboid shape within the physical TPU mesh."""
+  if len(physical_mesh_shape) == 3:
+    if (
+        devices_per_host == 4
+        and physical_mesh_shape[1] % 2 == 0
+        and physical_mesh_shape[2] % 2 == 0
+    ):
+      return [1, 2, 2]
+  # General fallback: factor devices_per_host starting from minor dimension
+  subgrid = [1] * len(physical_mesh_shape)
+  rem = devices_per_host
+  for i in range(len(physical_mesh_shape) - 1, -1, -1):
+    dim = physical_mesh_shape[i]
+    factor = math.gcd(dim, rem)
+    subgrid[i] = factor
+    rem //= factor
+  if rem != 1:
+    subgrid = [1] * len(physical_mesh_shape)
+    subgrid[-1] = devices_per_host
+  return subgrid
+
+
 def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
   """Computes the permutation to sort JAX shards for Raiden Controller."""
   if len(arr.addressable_shards) <= 1:
@@ -205,19 +231,33 @@ def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
   use_spec_mapping = bool(spec is not None and mesh is not None)
   if use_spec_mapping:
     # Use physical mesh mapping (matching raiden_controller.py use_spec_mapping)
-    devices_per_host = jax.local_device_count()
+    physical_mesh_shape = list(mesh.devices.shape)
+    devices_per_host = num_shards
+    host_subgrid = _get_host_subgrid(physical_mesh_shape, devices_per_host)
+    host_grid = [
+        p // s if s > 0 else 1
+        for p, s in zip(physical_mesh_shape, host_subgrid)
+    ]
+
+    host_coords = []
+    temp_h = replica_id
+    for size in reversed(host_grid):
+      host_coords.append(temp_h % size if size > 0 else 0)
+      temp_h //= size if size > 0 else 1
+    host_coords.reverse()
+
     controller_global_indices = []
     for j in range(num_shards):
-      global_device_id = replica_id * devices_per_host + j
-      if global_device_id >= mesh.devices.size:
-        raise ValueError(
-            f'global_device_id {global_device_id} out of bounds for mesh size'
-            f' {mesh.devices.size}'
-        )
-      device = mesh.devices.flat[global_device_id]
-      coords = np.argwhere(mesh.devices == device)
-      m_coords = coords[0]
-      full_coords = list(m_coords)
+      local_coords = []
+      temp_l = j
+      for size in reversed(host_subgrid):
+        local_coords.append(temp_l % size if size > 0 else 0)
+        temp_l //= size if size > 0 else 1
+      local_coords.reverse()
+
+      phys_coords = [
+          h * s + l for h, s, l in zip(host_coords, host_subgrid, local_coords)
+      ]
 
       tensor_coords = []
       tensor_shape = []
@@ -226,12 +266,19 @@ def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
           tensor_coords.append(0)
           tensor_shape.append(1)
         elif isinstance(axis, str):
-          tensor_coords.append(full_coords[mesh.axis_names.index(axis)])
+          tensor_coords.append(phys_coords[mesh.axis_names.index(axis)])
           tensor_shape.append(mesh.shape[axis])
         else:
+          sub_coord = 0
+          sub_size = 1
           for ax in axis:
-            tensor_coords.append(full_coords[mesh.axis_names.index(ax)])
-            tensor_shape.append(mesh.shape[ax])
+            ax_idx = mesh.axis_names.index(ax)
+            sub_coord = (
+                sub_coord * mesh.devices.shape[ax_idx] + phys_coords[ax_idx]
+            )
+            sub_size *= mesh.shape[ax]
+          tensor_coords.append(sub_coord)
+          tensor_shape.append(sub_size)
 
       global_idx = 0
       stride = 1
@@ -296,9 +343,16 @@ def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
         tensor_coords.append(full_coords[mesh.axis_names.index(axis)])
         tensor_shape.append(mesh.shape[axis])
       else:
+        sub_coord = 0
+        sub_size = 1
         for ax in axis:
-          tensor_coords.append(full_coords[mesh.axis_names.index(ax)])
-          tensor_shape.append(mesh.shape[ax])
+          ax_idx = mesh.axis_names.index(ax)
+          sub_coord = (
+              sub_coord * mesh.devices.shape[ax_idx] + full_coords[ax_idx]
+          )
+          sub_size *= mesh.shape[ax]
+        tensor_coords.append(sub_coord)
+        tensor_shape.append(sub_size)
 
     # Compute flat index (row-major)
     global_idx = 0
@@ -308,22 +362,37 @@ def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
       stride *= size
     jax_shard_global_indices.append(global_idx)
 
-  # 4. Sort indices
-  indices = list(range(len(arr.addressable_shards)))
+  # 4. Construct permutation matching controller slots to addressable shards
+  perm = []
+  used_indices = set()
+  for j, expected_g in enumerate(controller_global_indices):
+    occurrence = controller_global_indices[:j].count(expected_g)
+    matched_idx = None
+    curr_occ = 0
+    for idx, actual_g in enumerate(jax_shard_global_indices):
+      if actual_g == expected_g:
+        if curr_occ == occurrence:
+          matched_idx = idx
+          break
+        curr_occ += 1
+    if matched_idx is None or matched_idx in used_indices:
+      raise ValueError(
+          'Strict bijection failed for shard sorting: cannot map controller'
+          f' slot {j} (expected global index {expected_g}) to an unused JAX'
+          f' shard. JAX shards: {jax_shard_global_indices}, Controller'
+          f' expected: {controller_global_indices}'
+      )
+    perm.append(matched_idx)
+    used_indices.add(matched_idx)
 
-  def sort_key(idx):
-    g = jax_shard_global_indices[idx]
-    occurrence = jax_shard_global_indices[:idx].count(g)
-    matching_indices = [
-        i for i, val in enumerate(controller_global_indices) if val == g
-    ]
-    if occurrence < len(matching_indices):
-      target_j = matching_indices[occurrence]
-    else:
-      target_j = matching_indices[-1]
-    return target_j
+  if len(perm) != len(arr.addressable_shards) or len(used_indices) != len(
+      arr.addressable_shards
+  ):
+    raise ValueError(
+        f'Strict bijection failed: perm {perm} does not cover all'
+        f' {len(arr.addressable_shards)} addressable shards.'
+    )
 
-  sorted_indices = sorted(indices, key=sort_key)
-  if sorted_indices == indices:
+  if perm == list(range(len(arr.addressable_shards))):
     return []
-  return sorted_indices
+  return perm

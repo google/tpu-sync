@@ -21,11 +21,12 @@
 #include "absl/types/span.h"
 #include "xla/ffi/api/ffi.h"
 #include "xla/stream_executor/stream.h"
+#include "tpu_sync/frameworks/jax/weight_synchronizer_ffi.h"
 
 namespace tpu_raiden {
 namespace weight_sync {
 
-extern std::unique_ptr<stream_executor::Stream> g_streams[32];
+extern std::unique_ptr<stream_executor::Stream> g_streams[kMaxShards];
 void ClearSharedWsMap();
 
 xla::ffi::Error TriggerWeightSynchronizerInitImpl(

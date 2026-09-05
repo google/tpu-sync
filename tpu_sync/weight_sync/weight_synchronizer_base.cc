@@ -369,6 +369,8 @@ size_t WeightSynchronizerBase::GetPipelineGroupSize() const {
 
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
     size_t layer_idx, uint64_t uuid) {
+  RAIDEN_TRACE_FN("WSyncBase::H2dLayer",
+                  [&]() { return absl::StrCat("layer=", layer_idx); });
   if (buffer_holds_.empty() || layer_idx >= num_layers_) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
@@ -428,8 +430,13 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
             "Tiled buffer pointer is null for tiled shape");
       }
       auto tile_start = absl::Now();
-      auto status = tpu_raiden::weight_sync::TileBuffer(
-          shard_info.host_ptr, tiled_buffer_ptr, shard_hold.shape, *xla_layout);
+      absl::Status status;
+      {
+        RAIDEN_TRACE_SCOPE("WSync::TileBuffer");
+        status = tpu_raiden::weight_sync::TileBuffer(
+            shard_info.host_ptr, tiled_buffer_ptr, shard_hold.shape,
+            *xla_layout);
+      }
       if (!status.ok()) {
         return status;
       }
@@ -486,6 +493,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
 
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
     size_t layer_idx, uint64_t uuid) {
+  RAIDEN_TRACE_FN("WSyncBase::D2hLayer",
+                  [&]() { return absl::StrCat("layer=", layer_idx); });
   if (buffer_holds_.empty() || layer_idx >= num_layers_) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
@@ -553,8 +562,12 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
           [this, tiled_buffer_ptr, dst_host_ptr, shape = shard_hold.shape,
            layout = *xla_layout, physical_bytes]() -> absl::Status {
             auto detile_start = absl::Now();
-            absl::Status status = tpu_raiden::weight_sync::DetileBuffer(
-                tiled_buffer_ptr, dst_host_ptr, shape, layout);
+            absl::Status status;
+            {
+              RAIDEN_TRACE_SCOPE("WSync::DetileBuffer");
+              status = tpu_raiden::weight_sync::DetileBuffer(
+                  tiled_buffer_ptr, dst_host_ptr, shape, layout);
+            }
             double detile_time_ms =
                 absl::ToDoubleMilliseconds(absl::Now() - detile_start);
             if (status.ok()) {
@@ -616,6 +629,7 @@ absl::Status WeightSynchronizerBase::PushWeights(
 
 absl::Status WeightSynchronizerBase::PushWeightsLocal(
     const std::vector<std::string>& peers) {
+  RAIDEN_TRACE("WSyncBase::PushWeightsLocal");
   if (peers.empty()) {
     return absl::InvalidArgumentError(
         "Peer list cannot be empty for trainer weights sync");
@@ -642,6 +656,7 @@ absl::Status WeightSynchronizerBase::PushWeightsResharded(
 
 absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     const tpu_sync::rpc::StartTransferRequest& request) {
+  RAIDEN_TRACE("WSyncBase::PushWeightsReshardedLocal");
   VLOG(1) << "Starting PushWeightsResharded for uuid=" << request.uuid()
           << " across " << num_layers_
           << " layers (skip_d2h=" << request.skip_d2h() << ")...";
@@ -1090,6 +1105,7 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
 }
 
 void WeightSynchronizerBase::DrainPendingH2d() {
+  RAIDEN_TRACE("WSyncBase::DrainPendingH2d");
   if (!auto_h2d_) return;
 
   absl::flat_hash_map<uint64_t, PendingH2dState> pending_states;
@@ -1116,6 +1132,7 @@ void WeightSynchronizerBase::DrainPendingH2d() {
 }
 
 absl::Status WeightSynchronizerBase::WaitForTransferCompletion(uint64_t uuid) {
+  RAIDEN_TRACE("WSyncBase::WaitForTransferCompletion");
   absl::MutexLock lock(completed_transfers_mu_);
   auto condition_fn =
       +[](std::pair<absl::flat_hash_set<uint64_t>*, uint64_t>* p)
@@ -1155,6 +1172,7 @@ void WeightSynchronizerBase::StoreSkipTilingLocal(
 
 absl::Status WeightSynchronizerBase::OnBlocksReceived(
     const std::vector<int>& block_ids, uint64_t uuid) {
+  RAIDEN_TRACE("WSyncBase::OnBlocksReceived");
   if (!auto_h2d_) {
     return absl::OkStatus();
   }

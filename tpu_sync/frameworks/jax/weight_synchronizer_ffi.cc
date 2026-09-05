@@ -43,6 +43,7 @@
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi_internal.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
@@ -267,6 +268,7 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
     absl::Span<const xla::ffi::AnyBuffer> jax_arrays, int32_t local_port,
     int32_t parallelism, int32_t num_layers, int32_t listener_port,
     int32_t num_shards, xla::ffi::Result<xla::ffi::AnyBuffer> out) {
+  RAIDEN_TRACE("WSyncFFI::InitAndD2h");
   // --- Init Part ---
   if (shard_idx_buf.untyped_data() == nullptr) {
     return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
@@ -438,6 +440,7 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hImpl(
 xla::ffi::Error TriggerH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
                                int32_t layer_idx,
                                xla::ffi::Result<xla::ffi::AnyBuffer> out) {
+  RAIDEN_TRACE("WSyncFFI::H2d");
   if (shard_idx_buf.untyped_data() == nullptr) {
     return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
                            "shard_idx_buf null.");

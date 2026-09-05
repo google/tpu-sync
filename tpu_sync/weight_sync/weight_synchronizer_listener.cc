@@ -30,6 +30,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
@@ -148,6 +149,7 @@ void WeightSynchronizerListener::ConnectionWorker(int client_fd) {
   resp.set_message("SUCCESS");
 
   if (req.command() == tpu_sync::rpc::ControlRequest::COMMAND_START_TRANSFER) {
+    RAIDEN_TRACE("WSyncListener::HandleStartTransfer");
     bool is_sender = true;
     bool is_resharded = false;
     if (req.has_start_transfer_request()) {

@@ -25,10 +25,7 @@
 #include <Python.h>
 
 #include <nanobind/nanobind.h>
-#include "jaxlib/py_array.h"
-#include "xla/python/ifrt/array.h"
-#include "xla/python/ifrt/client.h"
-#include "xla/python/pjrt_ifrt/pjrt_array.h"
+#include "tpu_sync/frameworks/jax/jax_compat.h"
 #else
 #include "tpu_sync/frameworks/jax/mock_nanobind.h"
 #endif
@@ -40,53 +37,13 @@ namespace nb = nanobind;
 namespace jax {
 
 #ifndef WITHOUT_PYTHON
-inline xla::ifrt::PjRtCompatibleArray* CastToPjRtCompatibleArray(
-    xla::ifrt::Array* ifrt_array) {
-  if (ifrt_array == nullptr) return nullptr;
-  if (ifrt_array->client()->runtime_type() == "pjrt_ifrt") {
-    return static_cast<xla::ifrt::PjRtCompatibleArray*>(ifrt_array);
-  }
-  return nullptr;
-}
-
-struct PyArrayObject {
-  PyObject_HEAD;
-#if PY_VERSION_HEX < 0x030C0000
-  PyObject* weakrefs;
-  PyObject* dict;
-#endif  // PY_VERSION_HEX < 0x030C0000
-  bool initialized;
-  alignas(PyArray::Storage) char array_storage[sizeof(PyArray::Storage)];
-};
-
-inline PyArray::Storage* GetPyArrayStorageFromObject(
-    PyArrayObject* py_array_object) {
-  return std::launder(
-      reinterpret_cast<PyArray::Storage*>(py_array_object->array_storage));
-}
-
+// Forward to jax_compat layer which isolates jaxlib's private PyArray layout.
 inline xla::PjRtBuffer* GetPjrtBufferFromPyObject(PyObject* obj) {
-  auto* py_array_obj = reinterpret_cast<PyArrayObject*>(obj);
-  if (!py_array_obj->initialized) {
-    throw std::runtime_error("PyArrayObject not initialized");
-  }
-  auto* storage = GetPyArrayStorageFromObject(py_array_obj);
-  xla::ifrt::Array* ifrt_array = storage->ifrt_array.get();
-
-  auto* arr = CastToPjRtCompatibleArray(ifrt_array);
-  if (arr == nullptr) {
-    throw std::runtime_error("Not a PjRt compatible array");
-  }
-  return arr->pjrt_buffers().front().get();
+  return raiden::PjRtBufferFromPyArray(obj);
 }
 
 inline xla::ifrt::Array* GetIfrtArrayFromPyObject(PyObject* obj) {
-  auto* py_array_obj = reinterpret_cast<PyArrayObject*>(obj);
-  if (!py_array_obj->initialized) {
-    throw std::runtime_error("PyArrayObject not initialized");
-  }
-  auto* storage = GetPyArrayStorageFromObject(py_array_obj);
-  return storage->ifrt_array.get();
+  return raiden::IfrtArrayFromPyArray(obj);
 }
 
 // FFI helper to convert nanobind lists to native std::vector

@@ -65,6 +65,26 @@ cc_library(
 )
 
 cc_library(
+    name = "jax_compat",
+    srcs = ["jax_compat.cc"],
+    hdrs = ["jax_compat.h"],
+    copts = [
+        "-fexceptions",
+        "-frtti",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/base:core_headers",
+        "@jax//jaxlib:py_client",
+        "@rules_python//python/cc:current_py_cc_headers",
+        "@xla//xla/pjrt:pjrt_client",
+        "@xla//xla/python/ifrt",
+        "@xla//xla/python/pjrt_ifrt",
+    ],
+)
+
+cc_library(
     name = "jax_utils",
     hdrs = [
         "jax_utils.h",
@@ -78,6 +98,7 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":jax_compat",
         ":mock_nanobind",
         "//tpu_sync/core:raw_transfer_core",
         "@jax//jaxlib:py_client",

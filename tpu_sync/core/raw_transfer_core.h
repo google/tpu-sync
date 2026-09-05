@@ -20,6 +20,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -42,6 +43,18 @@
 #include "xla/tsl/concurrency/ref_count.h"
 
 namespace raiden {
+
+// Version-agnostic name for XLA's common raw-buffer type.
+//
+// XLA renamed this class from `xla::PjRtRawBufferInterface` to
+// `xla::CommonPjRtRawBuffer` (see xla/pjrt/raw_buffer.h). Naming the concrete
+// class directly makes this header fail to compile against XLA revisions on the
+// other side of that rename. The `xla::PjRtRawBufferRef` alias
+// (`tsl::RCReference<...>`) is stable across the rename, so we derive the
+// pointee type from it. This keeps `raw_transfer_core.h` buildable against both
+// pre- and post-rename XLA without a preprocessor version gate.
+using RaidenRawBuffer =
+    std::remove_reference_t<decltype(*std::declval<xla::PjRtRawBufferRef>())>;
 
 struct RawBufferHolder {
   const PJRT_Api* c_api;
@@ -150,7 +163,7 @@ struct RaidenBufferHandle {
   bool is_common_buffer = false;
 
   // For CommonPjRtBuffer:
-  tsl::RCReference<xla::PjRtRawBufferInterface> common_raw_buffer;
+  tsl::RCReference<RaidenRawBuffer> common_raw_buffer;
   std::shared_ptr<xla::CommonPjRtBuffer::ScopedHold> common_hold;
 
   // For PjRtCApiBuffer:
@@ -179,8 +192,8 @@ struct RaidenBufferHandle {
         return hold.status();
       }
       // Workaround for OSS type discrepancies.
-      result.common_raw_buffer = tsl::FormRef<xla::PjRtRawBufferInterface>(
-          reinterpret_cast<xla::PjRtRawBufferInterface*>(
+      result.common_raw_buffer = tsl::FormRef<RaidenRawBuffer>(
+          reinterpret_cast<RaidenRawBuffer*>(
               hold.buffer()->raw_buffer().get()));
       if (!unsafe_skip_buffer_lock) {
         result.common_hold =
@@ -213,7 +226,7 @@ struct RaidenBufferHandle {
   }
 
   static absl::StatusOr<RaidenBufferHandle> AcquireFromRaw(
-      xla::PjRtRawBufferInterface* raw_buf, const xla::Shape& shape,
+      RaidenRawBuffer* raw_buf, const xla::Shape& shape,
       bool unsafe_skip_buffer_lock = false) {
     RaidenBufferHandle result;
     result.shape = shape;

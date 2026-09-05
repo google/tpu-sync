@@ -431,11 +431,11 @@ cc_library(
     tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
-        ":torch_tpu_tensor_to_buffer_headers",
         ":torch_utils_mock",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
+        "@torch_tpu//torch_tpu/eager:device_buffer",
     ],
 )
 

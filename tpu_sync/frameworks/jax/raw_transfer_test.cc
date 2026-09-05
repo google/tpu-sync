@@ -24,6 +24,7 @@
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/pjrt/raw_buffer.h"
+#include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -147,7 +148,7 @@ TEST_F(RawTransferTest, TestTransferD2HAsync) {
                           transfer_d2h_async(src_arr, dst_arr));
 
   // Wait
-  ASSERT_OK(future.Await());
+  TF_ASSERT_OK(future.Await());
 
   // Verify data
   EXPECT_EQ(dst_data, src_data);
@@ -185,11 +186,11 @@ TEST_F(RawTransferTest, TestTransferH2DAsync) {
                           transfer_h2d_async(src_arr, dst_arr));
 
   // Wait
-  ASSERT_OK(future.Await());
+  TF_ASSERT_OK(future.Await());
 
   // Verify data by reading back from PJRT buffer
   std::vector<uint8_t> dst_data(kSize, 0);
-  ASSERT_OK(dst_buffer->CopyRawToHost(dst_data.data(), 0, kSize).Await());
+  TF_ASSERT_OK(dst_buffer->CopyRawToHost(dst_data.data(), 0, kSize).Await());
   EXPECT_EQ(dst_data, src_data);
 }
 
@@ -238,7 +239,7 @@ TEST_F(RawTransferTest, TestTransferD2HBatchAsync) {
                           transfer_d2h_batch_async(src_arrs, dst_arrs));
 
   // Wait
-  ASSERT_OK(future.Await());
+  TF_ASSERT_OK(future.Await());
 
   // Verify all
   for (size_t b = 0; b < kBatch; ++b) {
@@ -290,12 +291,13 @@ TEST_F(RawTransferTest, TestTransferH2DBatchAsync) {
                           transfer_h2d_batch_async(src_arrs, dst_arrs));
 
   // Wait
-  ASSERT_OK(future.Await());
+  TF_ASSERT_OK(future.Await());
 
   // Verify all by reading back
   for (size_t b = 0; b < kBatch; ++b) {
     std::vector<uint8_t> dst_data(kSize, 0);
-    ASSERT_OK(dst_buffers[b]->CopyRawToHost(dst_data.data(), 0, kSize).Await());
+    TF_ASSERT_OK(
+        dst_buffers[b]->CopyRawToHost(dst_data.data(), 0, kSize).Await());
     EXPECT_EQ(dst_data, src_datas[b]);
   }
 }

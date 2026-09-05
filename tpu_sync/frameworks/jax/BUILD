@@ -574,6 +574,7 @@ cc_test(
         "@xla//xla/pjrt:raw_buffer",
         "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
         "@xla//xla/stream_executor/host:host_platform",
+        "@xla//xla/tsl/lib/core:status_test_util",
         "@xla//xla/tsl/platform:statusor",
         "@xla//xla/tsl/platform:test",
         "@xla//xla/tsl/platform:test_main",

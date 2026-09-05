@@ -143,7 +143,9 @@ inline std::vector<raiden::RaidenBufferHandle> ExtractPjRtBuffersFromPyArray(
   for (size_t i = 0; i < num_shards; ++i) {
     nb::object shard = addressable_shards[i];
     nb::object shard_data = shard.attr("data");
-    xla::PjRtBuffer* buf = reinterpret_cast<xla::PjRtBuffer*>(shard_data.ptr());
+    // In mock tests, read the PjRtBuffer pointer from the "ptr" attribute.
+    xla::PjRtBuffer* buf = reinterpret_cast<xla::PjRtBuffer*>(
+        nb::cast<size_t>(shard_data.attr("ptr")));
     auto handle = raiden::RaidenBufferHandle::Acquire(buf, nullptr, nullptr,
                                                       unsafe_skip_buffer_lock);
     if (!handle.ok()) {

@@ -104,8 +104,11 @@ class KVCacheManager:
     self._admission_summary = None
     impl = _torch_impl()
     if host_blocks_to_allocate is not None:
+      tensors = kv_caches
+      if tensors and not isinstance(tensors[0], (list, tuple)):
+        tensors = [[t] for t in tensors]
       self._impl = impl.KVCacheManager(
-          kv_caches,
+          tensors,
           local_control_port if local_control_port > 0 else None,
           host_blocks_to_allocate,
           unsafe_skip_buffer_lock,
@@ -512,5 +515,7 @@ class KVCacheManager:
 
   @property
   def is_listener_active(self) -> bool:
-    """Returns whether the native C++ KVCacheListener is actively running."""
-    return self._impl.is_listener_active
+    """Returns whether the native C++ listener or gRPC service is active."""
+    return (
+        self._impl.is_listener_active or self._impl.get_raiden_worker_port() > 0
+    )

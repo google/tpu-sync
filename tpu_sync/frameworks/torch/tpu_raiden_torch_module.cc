@@ -542,6 +542,18 @@ NB_MODULE(_tpu_raiden_torch, m) {
             }
           },
           nb::arg("peers"), nb::call_guard<nb::gil_scoped_release>())
+      .def(
+          "bind_weights",
+          [](WeightSynchronizer& self,
+             const std::vector<std::vector<at::Tensor>>& device_tensors) {
+            absl::Status s = self.BindWeights(device_tensors);
+            if (!s.ok()) {
+              throw std::runtime_error(
+                  "WeightSynchronizer bind_weights failed: " +
+                  std::string(s.message()));
+            }
+          },
+          nb::arg("device_tensors"), nb::call_guard<nb::gil_scoped_release>())
 
       .def(
           "D2h",

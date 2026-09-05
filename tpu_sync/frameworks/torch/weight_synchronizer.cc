@@ -45,7 +45,17 @@ WeightSynchronizer::WeightSynchronizer(
           /*external_host_ptrs=*/std::nullopt, unsafe_skip_buffer_lock,
           parallelism, listener_port, bind_ip,
           /*layer_names=*/{}, auto_h2d),
-      buffer_refs_(std::move(unpacked.refs)) {}
+      buffer_refs_(std::move(unpacked.refs)),
+      unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock) {}
+
+absl::Status WeightSynchronizer::BindWeights(
+    const std::vector<std::vector<at::Tensor>>& device_tensors) {
+  UnpackedTensors unpacked =
+      UnpackTorchTensors(device_tensors, unsafe_skip_buffer_lock_);
+  buffer_refs_ = std::move(unpacked.refs);
+  return weight_sync::WeightSynchronizerBase::BindWeights(
+      std::move(unpacked.buffers));
+}
 
 WeightSynchronizer::~WeightSynchronizer() = default;
 

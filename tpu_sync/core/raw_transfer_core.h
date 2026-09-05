@@ -29,17 +29,15 @@
 #include "absl/types/span.h"
 #include "xla/future.h"
 #include "xla/layout.h"
-#include "xla/pjrt/abstract_tracked_device_buffer.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_external.h"
-#include "xla/pjrt/c_api_client/pjrt_c_api_client.h"
 #include "xla/pjrt/pjrt_client.h"
-#include "xla/pjrt/raw_buffer.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/concurrency/async_value.h"
 #include "xla/tsl/concurrency/ref_count.h"
+#include "tpu_sync/core/xla_compat.h"
 
 namespace raiden {
 
@@ -79,17 +77,6 @@ inline absl::Status PjrtErrorToStatusLocal(const PJRT_Api* c_api,
   return absl::InternalError(msg);
 }
 
-inline const PJRT_RawBuffer_Extension* GetRawBufferExtension(
-    const xla::PjRtBuffer* buffer, const PJRT_Api** out_c_api = nullptr) {
-  auto* capi_buffer = dynamic_cast<const xla::PjRtCApiBuffer*>(buffer);
-  if (!capi_buffer) return nullptr;
-  if (out_c_api) *out_c_api = capi_buffer->pjrt_c_api();
-  auto* capi_client = dynamic_cast<xla::PjRtCApiClient*>(
-      const_cast<xla::PjRtClient*>(capi_buffer->client()));
-  if (!capi_client) return nullptr;
-  return capi_client->FindExtension<PJRT_RawBuffer_Extension>(
-      PJRT_Extension_Type::PJRT_Extension_Type_RawBuffer);
-}
 
 inline int64_t GetMajorSliceByteSize(const xla::Shape& shape) {
   if (shape.dimensions_size() == 0) return 0;
@@ -150,8 +137,8 @@ struct RaidenBufferHandle {
   bool is_common_buffer = false;
 
   // For CommonPjRtBuffer:
-  tsl::RCReference<xla::PjRtRawBufferInterface> common_raw_buffer;
-  std::shared_ptr<xla::CommonPjRtBuffer::ScopedHold> common_hold;
+  RawBufferRef common_raw_buffer;
+  ScopedHold common_hold;
 
   // For PjRtCApiBuffer:
   PJRT_RawBuffer* c_raw_buffer = nullptr;
@@ -168,52 +155,42 @@ struct RaidenBufferHandle {
       result.device = buf->device();
     }
 
-    auto* common_buf = dynamic_cast<xla::CommonPjRtBuffer*>(buf);
-    auto* capi_buf = dynamic_cast<xla::PjRtCApiBuffer*>(buf);
-
-    if (common_buf) {
-      result.is_common_buffer = true;
-      auto hold = common_buf->GetBufferWithHold(
-          xla::CommonPjRtBuffer::ScopedHold::kUsage);
-      if (!hold.ok()) {
-        return hold.status();
-      }
-      // Workaround for OSS type discrepancies.
-      result.common_raw_buffer = tsl::FormRef<xla::PjRtRawBufferInterface>(
-          reinterpret_cast<xla::PjRtRawBufferInterface*>(
-              hold.buffer()->raw_buffer().get()));
-      if (!unsafe_skip_buffer_lock) {
-        result.common_hold =
-            std::make_shared<xla::CommonPjRtBuffer::ScopedHold>(
-                std::move(hold));
-      }
-      return result;
-    }
-
-    if (capi_buf) {
-      result.is_common_buffer = false;
-      if (!extension) {
-        extension = GetRawBufferExtension(buf, &c_api);
-        if (!extension) {
-          return absl::InternalError("RawBuffer extension missing");
+    switch (ClassifyBuffer(buf)) {
+      case BufferKind::kCommon: {
+        auto acquisition = AcquireCommonRawBuffer(buf, unsafe_skip_buffer_lock);
+        if (!acquisition.ok()) {
+          return acquisition.status();
         }
+        result.is_common_buffer = true;
+        result.common_raw_buffer = std::move(acquisition->raw_buffer);
+        result.common_hold = std::move(acquisition->hold);
+        return result;
       }
-      auto status_or_raw = pjrt::PjRtCApiBuffer_CreateRawAliasOfBuffer(
-          c_api, extension, capi_buf->c_buffer());
-      if (!status_or_raw.ok()) {
-        return status_or_raw.status();
+      case BufferKind::kCApi: {
+        result.is_common_buffer = false;
+        if (!extension) {
+          extension = GetRawBufferExtension(buf, &c_api);
+          if (!extension) {
+            return absl::InternalError("RawBuffer extension missing");
+          }
+        }
+        auto raw_buffer = CreateCApiRawAlias(buf, c_api, extension);
+        if (!raw_buffer.ok()) {
+          return raw_buffer.status();
+        }
+        result.c_raw_buffer = raw_buffer.value();
+        result.c_hold = std::make_shared<RawBufferHolder>(c_api, extension,
+                                                          result.c_raw_buffer);
+        return result;
       }
-      result.c_raw_buffer = status_or_raw.value();
-      result.c_hold = std::make_shared<RawBufferHolder>(c_api, extension,
-                                                        result.c_raw_buffer);
-      return result;
+      case BufferKind::kUnsupported:
+        return absl::InvalidArgumentError("Unsupported PjRtBuffer type");
     }
-
     return absl::InvalidArgumentError("Unsupported PjRtBuffer type");
   }
 
   static absl::StatusOr<RaidenBufferHandle> AcquireFromRaw(
-      xla::PjRtRawBufferInterface* raw_buf, const xla::Shape& shape,
+      RawBuffer* raw_buf, const xla::Shape& shape,
       bool unsafe_skip_buffer_lock = false) {
     RaidenBufferHandle result;
     result.shape = shape;
@@ -314,7 +291,7 @@ using BufferHoldAndAlias = RaidenBufferHandle;
 
 struct BufferHolder {
   std::shared_ptr<RawBufferHolder> c_api_hold;
-  std::shared_ptr<xla::CommonPjRtBuffer::ScopedHold> hold;
+  ScopedHold hold;
   std::shared_ptr<xla::PjRtBuffer::ExternalReference> ext_hold;
   std::shared_ptr<void> user_hold;
 };
@@ -324,7 +301,7 @@ using BufferHolders = std::vector<BufferHolder>;
 inline xla::Future<BufferHolder> CreateBufferFuture(
     std::vector<xla::Future<>> futures,
     std::shared_ptr<RawBufferHolder> c_api_hold = nullptr,
-    std::shared_ptr<xla::CommonPjRtBuffer::ScopedHold> hold = nullptr,
+    ScopedHold hold = nullptr,
     std::shared_ptr<xla::PjRtBuffer::ExternalReference> ext_hold = nullptr,
     std::shared_ptr<void> user_hold = nullptr) {
   auto join_future = xla::JoinFutures(futures);

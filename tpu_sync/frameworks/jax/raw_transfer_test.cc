@@ -20,14 +20,13 @@
 #include <vector>
 
 #include "absl/log/check.h"
-#include "xla/pjrt/abstract_tracked_device_buffer.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
-#include "xla/pjrt/raw_buffer.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/xla_compat.h"
 #include "tpu_sync/frameworks/jax/mock_nanobind.h"
 #include "tpu_sync/frameworks/jax/raw_transfer_internal.h"
 
@@ -66,14 +65,10 @@ nb::object CreateMockDeviceArray(xla::PjRtBuffer* pjrt_buffer) {
   nb::object shard;
   nb::object shard_data;
 
-  xla::PjRtRawBufferInterface* raw_buf = nullptr;
-  auto* common_buf = dynamic_cast<xla::CommonPjRtBuffer*>(pjrt_buffer);
-  if (common_buf) {
-    auto hold = common_buf->GetBufferWithHold(
-        xla::CommonPjRtBuffer::ScopedHold::kUsage);
-    if (hold.ok()) {
-      raw_buf = hold.buffer()->raw_buffer().get();
-    }
+  RawBuffer* raw_buf = nullptr;
+  auto acquisition = AcquireCommonRawBuffer(pjrt_buffer);
+  if (acquisition.ok()) {
+    raw_buf = acquisition->raw_buffer.get();
   }
 
   // We must have a valid raw buffer for this test path.

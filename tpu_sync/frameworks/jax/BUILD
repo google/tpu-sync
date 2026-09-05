@@ -568,10 +568,9 @@ cc_test(
     deps = [
         ":raw_transfer_jax_mock",
         "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:xla_compat",
         "@com_google_absl//absl/log:check",
-        "@xla//xla/pjrt:common_pjrt_client",
         "@xla//xla/pjrt:pjrt_client",
-        "@xla//xla/pjrt:raw_buffer",
         "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
         "@xla//xla/stream_executor/host:host_platform",
         "@xla//xla/tsl/lib/core:status_test_util",

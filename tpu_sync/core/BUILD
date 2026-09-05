@@ -263,6 +263,27 @@ cc_library(
     ],
 )
 
+# Encapsulates version-fragile XLA PJRT types. Uses header-only XLA deps so the
+# extension resolves symbols dynamically against the runtime loaded in process.
+cc_library(
+    name = "xla_compat",
+    srcs = ["xla_compat.cc"],
+    hdrs = ["xla_compat.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":xla_raw_transfer_headers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        # buildcleaner: keep
+        "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",
+    ],
+)
+
 cc_library(
     name = "raw_transfer_core",
     hdrs = [
@@ -276,6 +297,7 @@ cc_library(
     ],
     features = ["-use_header_modules"],
     deps = [
+        ":xla_compat",
         ":xla_raw_transfer_headers",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",

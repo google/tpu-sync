@@ -26,9 +26,7 @@
 #include "xla/future.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
-#include "xla/pjrt/c_api_client/pjrt_c_api_client.h"
 #include "xla/pjrt/pjrt_client.h"
-#include "xla/pjrt/raw_buffer.h"
 #include "xla/shape.h"
 #include "xla/tsl/platform/logging.h"
 #include "xla/tsl/platform/statusor.h"
@@ -38,7 +36,6 @@
 namespace raiden {
 
 using ::xla::PjRtBuffer;
-using ::xla::PjRtCApiBuffer;
 using ::xla::Shape;
 
 // Pure C++ implementation of D2H transfer core

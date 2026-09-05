@@ -34,6 +34,7 @@ from tpu_sync.api.common import RaidenId
 from tpu_sync.kv_cache import nd_slice_math
 from tpu_sync.rpc import controller_service_pb2
 from tpu_sync.rpc import raiden_service_pb2
+from tpu_sync.weight_sync import weight_synchronization_worker_service_client
 
 
 @dataclasses.dataclass
@@ -427,12 +428,34 @@ def connect_socket(
     time.sleep(2.0)
 
 
+async def _await_grpc_future(fut: Any) -> Any:
+  """Adapts a grpc.Future to an asyncio awaitable without blocking the event loop."""
+  loop = asyncio.get_running_loop()
+  async_fut = loop.create_future()
+
+  def _done_callback(f):
+    try:
+      res = f.result()
+      loop.call_soon_threadsafe(
+          lambda: not async_fut.done() and async_fut.set_result(res)
+      )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      loop.call_soon_threadsafe(
+          lambda: not async_fut.done() and async_fut.set_exception(e)
+      )
+
+  fut.add_done_callback(_done_callback)
+  return await async_fut
+
+
 class WorkerRpcClient:
   """Distributed RPC Client connecting to Native C++ Control Daemons with Event-Driven resolution.
 
   Maintains an asynchronous endpoint catalog that resolves worker network
   coordinates instantaneously when participating worker tasks self-register,
   completely eliminating hardcoded active polling loops or arbitrary delays.
+  Supports both raw TCP socket streams and gRPC
+  WeightSynchronizationWorkerService.
   """
 
   def __init__(
@@ -441,6 +464,7 @@ class WorkerRpcClient:
       resolve_timeout: float = 300.0,
       name_resolver: Optional[NameResolver] = None,
       proto_module: Optional[Any] = None,
+      use_grpc: bool = False,
   ):
     """Instantiates RPC Client with an optional initial endpoint mapping.
 
@@ -450,6 +474,8 @@ class WorkerRpcClient:
         task to self-register before raising a Timeout RuntimeError.
       name_resolver: Interface for resolving remote coordinates (e.g. BNS).
       proto_module: Optional protobuf module to use for ControlRequest/Response.
+      use_grpc: If True, uses gRPC WeightSynchronizationWorkerServiceClient
+        instead of raw TCP socket streams.
     """
     self._endpoints = {}
     if endpoint_addresses:
@@ -459,10 +485,43 @@ class WorkerRpcClient:
     self._resolve_timeout = resolve_timeout
     self._name_resolver = name_resolver
     self._proto_module = proto_module or raiden_service_pb2
+    self._use_grpc = use_grpc
+    self._grpc_clients: dict[
+        str,
+        weight_synchronization_worker_service_client.WeightSynchronizationWorkerServiceClient,
+    ] = {}
+    self._grpc_lock = threading.Lock()
 
   @property
   def name_resolver(self) -> Optional[NameResolver]:
     return self._name_resolver
+
+  @property
+  def use_grpc(self) -> bool:
+    return self._use_grpc
+
+  def get_grpc_client(
+      self, addr: str
+  ) -> (
+      weight_synchronization_worker_service_client.WeightSynchronizationWorkerServiceClient
+  ):
+    """Returns or creates a cached WeightSynchronizationWorkerServiceClient for addr."""
+    if not self._use_grpc:
+      raise ValueError("WorkerRpcClient is not configured to use gRPC")
+    resolved_addr = addr
+    if self._name_resolver:
+      try:
+        resolved_addr = self._name_resolver.resolve(addr)
+      except Exception:  # pylint: disable=broad-except
+        pass
+    with self._grpc_lock:
+      client = self._grpc_clients.get(resolved_addr)
+      if client is None:
+        client = weight_synchronization_worker_service_client.WeightSynchronizationWorkerServiceClient(
+            target=resolved_addr
+        )
+        self._grpc_clients[resolved_addr] = client
+      return client
 
   def register_worker_endpoint(
       self, worker_name: RaidenId, rpc_address: str
@@ -559,13 +618,34 @@ class WorkerRpcClient:
     finally:
       sock.close()
 
+  async def _send_control_request(
+      self, addr: str, req: Any, timeout: float = 600.0
+  ) -> Any:
+    """Sends a ControlRequest via gRPC or raw TCP socket, verifying success."""
+    if self._use_grpc:
+      client = self.get_grpc_client(addr)
+      fut = client.handle_control(req, timeout=timeout)
+      resp = await _await_grpc_future(fut)
+    else:
+      resp_bytes = await self._send_rpc(
+          addr, req.SerializeToString(), timeout=timeout
+      )
+      resp = self._proto_module.ControlResponse()
+      resp.ParseFromString(resp_bytes)
+
+    if not resp.success:
+      raise RuntimeError(
+          f"Raiden remote native execution failed: {resp.message}"
+      )
+    return resp
+
   async def start_transfer(
       self,
       target_id: RaidenId,
       transfer_plan: TransferPlan,
       address: Optional[str] = None,
   ) -> None:
-    """Connects to remote Worker servicer and dispatches encoded collective transfer commands.
+    """Connects to remote Worker servicer and dispatches collective transfer commands.
 
     Args:
       target_id: Target participating worker RaidenId.
@@ -581,8 +661,8 @@ class WorkerRpcClient:
         native execution reports failure status.
     """
     try:
-      payload = self._encode_start_transfer(target_id, transfer_plan)
-      if not payload:
+      req = self._build_start_transfer_request(target_id, transfer_plan)
+      if req is None:
         return
     except NotImplementedError:
       return
@@ -591,12 +671,8 @@ class WorkerRpcClient:
     else:
       addrs = await self._resolve_endpoints(target_id)
     await asyncio.gather(
-        *[self._send_and_verify(addr, payload) for addr in addrs]
+        *[self._send_control_request(addr, req) for addr in addrs]
     )
-
-  async def _send_and_verify(self, addr: str, payload: bytes) -> None:
-    resp_bytes = await self._send_rpc(addr, payload)
-    self._verify_response(resp_bytes)
 
   def _raiden_id_to_proto(self, unit: RaidenId) -> Any:
     return self._proto_module.RaidenIdProto(
@@ -606,18 +682,10 @@ class WorkerRpcClient:
         data_replica_idx=unit.data_replica_idx,
     )
 
-  def _encode_start_transfer(
+  def _build_start_transfer_request(
       self, target_id: RaidenId, transfer_plan: TransferPlan
-  ) -> Optional[bytes]:
-    """Serializes domain-specific binary Protobuf command for collective transfer kickoff.
-
-    Args:
-      target_id: Target worker RaidenId coordinate.
-      transfer_plan: Top-level distributed Collective Transfer execution plan.
-
-    Returns:
-      Serialized binary bytes payload, or None for no-op execution.
-    """
+  ) -> Optional[Any]:
+    """Constructs domain-specific Protobuf ControlRequest for collective transfer kickoff."""
     if (
         target_id not in transfer_plan.src_units
         and target_id not in transfer_plan.dst_units
@@ -776,7 +844,14 @@ class WorkerRpcClient:
             start_req.shard_push_schedules[shard_idx].CopyFrom(schedule_proto)
 
     req.start_transfer_request.CopyFrom(start_req)
-    return req.SerializeToString()
+    return req
+
+  def _encode_start_transfer(
+      self, target_id: RaidenId, transfer_plan: TransferPlan
+  ) -> Optional[bytes]:
+    """Serializes domain-specific binary Protobuf command for collective transfer kickoff."""
+    req = self._build_start_transfer_request(target_id, transfer_plan)
+    return req.SerializeToString() if req is not None else None
 
   def _verify_response(self, resp_bytes: bytes) -> None:
     """Validates demarshaled remote response bytes returned from C++ workers."""
@@ -797,25 +872,54 @@ class WorkerRpcClient:
 
   async def shutdown_workers(self, timeout: float = 10.0) -> None:
     """Dispatches remote shutdown signaling payloads to all registered worker daemons."""
-    payload = self._encode_shutdown()
     all_addrs = set()
     for addrs in self._endpoints.values():
       all_addrs.update(addrs)
-    if all_addrs:
-      await asyncio.gather(
-          *[
-              self._send_rpc(addr, payload, timeout=timeout)
-              for addr in all_addrs
-          ],
-          return_exceptions=True,
-      )
+    if not all_addrs:
+      return
+
+    req = self._build_shutdown_request()
+    await asyncio.gather(
+        *[
+            self._send_control_request(addr, req, timeout=timeout)
+            for addr in all_addrs
+        ],
+        return_exceptions=True,
+    )
+
+  def _build_shutdown_request(self) -> Any:
+    """Constructs domain-specific binary command for remote shutdown signaling."""
+    return self._proto_module.ControlRequest(
+        command=self._proto_module.ControlRequest.COMMAND_SHUTDOWN
+    )
 
   def _encode_shutdown(self) -> bytes:
     """Serializes domain-specific binary command for remote shutdown signaling."""
-    req = self._proto_module.ControlRequest(
-        command=self._proto_module.ControlRequest.COMMAND_SHUTDOWN
-    )
+    req = self._build_shutdown_request()
     return req.SerializeToString()
+
+  async def query_metadata(
+      self, addr: str, timeout: float = 600.0
+  ) -> list[Any]:
+    """Queries metadata from a remote worker endpoint."""
+    req = self._proto_module.ControlRequest(
+        command=self._proto_module.ControlRequest.COMMAND_GET_METADATA
+    )
+    resp = await self._send_control_request(addr, req, timeout=timeout)
+    return list(resp.get_metadata_response.metadata)
+
+  def close(self) -> None:
+    """Closes all cached gRPC client channels."""
+    with self._grpc_lock:
+      for client in self._grpc_clients.values():
+        client.close()
+      self._grpc_clients.clear()
+
+  def __enter__(self) -> "WorkerRpcClient":
+    return self
+
+  def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    self.close()
 
 
 class WeightSyncWorkerRpcClient(WorkerRpcClient):
@@ -1257,6 +1361,7 @@ class RaidenController:
       request_registry_ttl_s: float = 600.0,
       broadcast_k: Optional[int] = None,
       enable_plan_cache: bool = True,
+      use_grpc: bool = False,
   ):
     """Initializes the RaidenController.
 
@@ -1267,6 +1372,8 @@ class RaidenController:
       broadcast_k: Fan-out factor K for tree-based broadcast transfers.
       enable_plan_cache: Whether to cache transfer planning and resharding
         schedules across transfer invocations with identical topologies.
+      use_grpc: Whether to default to WorkerRpcClient in gRPC mode if
+        worker_rpc_client is not specified.
     """
     self.port = port
     self.broadcast_k = (
@@ -1297,7 +1404,13 @@ class RaidenController:
     if request_registry_ttl_s <= 0:
       raise ValueError("request_registry_ttl_s must be positive")
     self._request_registry_ttl_s = request_registry_ttl_s
-    self.worker_rpc_client = worker_rpc_client or WorkerRpcClient()
+    use_grpc_effective = use_grpc or (
+        os.environ.get("RAIDEN_WEIGHT_SYNC_USE_GRPC", "").lower()
+        in ("1", "true")
+    )
+    self.worker_rpc_client = worker_rpc_client or WorkerRpcClient(
+        use_grpc=use_grpc_effective
+    )
     self._registered_variables = {}
 
   def register_work_unit(
@@ -1519,17 +1632,8 @@ class RaidenController:
       return list(shards)
 
   async def _query_remote_metadata(self, addr: str) -> list[Any]:
-    req = raiden_service_pb2.ControlRequest(
-        command=raiden_service_pb2.ControlRequest.COMMAND_GET_METADATA
-    )
-    resp_bytes = await self.worker_rpc_client._send_rpc(
-        addr, req.SerializeToString()
-    )
-    resp = raiden_service_pb2.ControlResponse()
-    resp.ParseFromString(resp_bytes)
-    if not resp.success:
-      raise RuntimeError(f"Failed to query remote metadata: {resp.message}")
-    return list(resp.get_metadata_response.metadata)
+    """Queries metadata from a remote controller or worker endpoint."""
+    return await self.worker_rpc_client.query_metadata(addr)
 
   def _get_local_metadata(self, units: list[RaidenId]) -> list[Any]:
     with self._lock:

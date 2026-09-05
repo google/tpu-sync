@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Raiden Controller high-level transfer API under rpc/."""
-
 import asyncio
+from concurrent import futures
 import socket
 from unittest import mock
 from absl.testing import absltest
+import grpc
 from tpu_sync.rpc import raiden_controller
 from tpu_sync.rpc import raiden_service_pb2
+from tpu_sync.rpc import raiden_service_pb2_grpc
 
 
 class DummyWorkerRpcClient(raiden_controller.WorkerRpcClient):
@@ -2768,6 +2769,148 @@ class FormatUnitHelpersTest(absltest.TestCase):
             ("10.0.0.4:9004", b"dummy_payload"),
         ],
     )
+
+
+class FakeWeightSyncWorkerServicer(
+    raiden_service_pb2_grpc.WeightSynchronizationWorkerServiceServicer
+):
+  """Fake gRPC servicer for testing WeightSynchronizationWorkerService."""
+
+  def __init__(self, succeed: bool = True, failure_message: str = "Error"):
+    self.requests = []
+    self.succeed = succeed
+    self.failure_message = failure_message
+
+  def HandleControl(self, request, context):
+    self.requests.append(request)
+    resp = raiden_service_pb2.ControlResponse()
+    resp.success = self.succeed
+    resp.message = "SUCCESS" if self.succeed else self.failure_message
+    return resp
+
+
+class WorkerRpcClientGrpcModeTest(absltest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.servicer = FakeWeightSyncWorkerServicer()
+    self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    raiden_service_pb2_grpc.add_WeightSynchronizationWorkerServiceServicer_to_server(
+        self.servicer, self.server
+    )
+    port = self.server.add_insecure_port("127.0.0.1:0")
+    self.server.start()
+    self.server_port = port
+    self.server_address = f"127.0.0.1:{port}"
+
+  def tearDown(self):
+    self.server.stop(grace=None)
+    super().tearDown()
+
+  def test_controller_default_and_grpc_instantiation(self):
+    controller_grpc = raiden_controller.RaidenController(port=0, use_grpc=True)
+    self.assertTrue(controller_grpc.worker_rpc_client.use_grpc)
+    self.assertIsNotNone(
+        controller_grpc.worker_rpc_client.get_grpc_client("127.0.0.1:8000")
+    )
+
+    controller_default = raiden_controller.RaidenController(port=0)
+    self.assertFalse(controller_default.worker_rpc_client.use_grpc)
+    with self.assertRaisesRegex(
+        ValueError, "WorkerRpcClient is not configured to use gRPC"
+    ):
+      controller_default.worker_rpc_client.get_grpc_client("127.0.0.1:8000")
+
+  def test_grpc_mode_start_transfer_and_shutdown(self):
+    client = raiden_controller.WorkerRpcClient(use_grpc=True)
+    src_unit = raiden_controller.RaidenId("trainer", "0", "weights")
+    dst_unit = raiden_controller.RaidenId("sampler", "0", "weights")
+
+    client.register_worker_endpoint(src_unit, self.server_address)
+
+    plan = raiden_controller.TransferPlan(
+        src_units=[src_unit],
+        dst_units=[dst_unit],
+        plan={},
+        worker_data_addresses={dst_unit: ["127.0.0.1:8000"]},
+        uuid=12345,
+    )
+
+    asyncio.run(client.start_transfer(src_unit, plan))
+    self.assertLen(self.servicer.requests, 1)
+    req = self.servicer.requests[0]
+    self.assertEqual(
+        req.command, raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER
+    )
+    self.assertEqual(req.start_transfer_request.uuid, 12345)
+    self.assertTrue(req.start_transfer_request.is_sender)
+
+    asyncio.run(client.shutdown_workers())
+    self.assertLen(self.servicer.requests, 2)
+    shutdown_req = self.servicer.requests[1]
+    self.assertEqual(
+        shutdown_req.command, raiden_service_pb2.ControlRequest.COMMAND_SHUTDOWN
+    )
+
+    client.close()
+
+  def test_grpc_mode_error_handling(self):
+    self.servicer.succeed = False
+    self.servicer.failure_message = "Native execution failure"
+
+    client = raiden_controller.WorkerRpcClient(use_grpc=True)
+    src_unit = raiden_controller.RaidenId("trainer", "0", "weights")
+    dst_unit = raiden_controller.RaidenId("sampler", "0", "weights")
+    client.register_worker_endpoint(src_unit, self.server_address)
+
+    plan = raiden_controller.TransferPlan(
+        src_units=[src_unit],
+        dst_units=[dst_unit],
+        plan={},
+        worker_data_addresses={dst_unit: ["127.0.0.1:8000"]},
+        uuid=12345,
+    )
+
+    with self.assertRaisesRegex(RuntimeError, "Native execution failure"):
+      asyncio.run(client.start_transfer(src_unit, plan))
+
+    client.close()
+
+  def test_controller_e2e_with_grpc_mode(self):
+    controller = raiden_controller.RaidenController(port=0, use_grpc=True)
+
+    src_unit = raiden_controller.RaidenId("trainer", "0", "weights")
+    dst_unit = raiden_controller.RaidenId("sampler", "0", "weights")
+
+    controller.register_work_unit(
+        src_unit,
+        ["127.0.0.1:8000"],
+        control_plane_rpc_address=self.server_address,
+    )
+    controller.register_work_unit(
+        dst_unit,
+        ["127.0.0.1:8001"],
+        control_plane_rpc_address=self.server_address,
+    )
+
+    fut = controller.start_transfer(
+        src_units=[src_unit],
+        dst_units=[dst_unit],
+        req_id="grpc_e2e_req",
+    )
+    asyncio.run(fut.wait())
+
+    # Verify both destination and source workers received start_transfer
+    self.assertGreaterEqual(len(self.servicer.requests), 2)
+    commands = [r.command for r in self.servicer.requests]
+    self.assertTrue(
+        all(
+            c == raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER
+            for c in commands
+        )
+    )
+
+    controller.worker_rpc_client.close()
 
 
 if __name__ == "__main__":

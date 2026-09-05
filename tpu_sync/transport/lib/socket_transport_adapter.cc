@@ -31,12 +31,12 @@
 #include "absl/cleanup/cleanup.h"
 #include "absl/log/absl_check.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/lib/chunk.h"
@@ -327,10 +327,10 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
     ABSL_DCHECK_LE(block_offset + block_count, dst_block_ids.size());
     const auto s_dst_ids =
         SerializeBlockIds({dst_block_ids.data() + block_offset, block_count});
-    RETURN_IF_ERROR(WriteExact(fd, s_dst_ids.data(), s_dst_ids.size()));
+    ABSL_RETURN_IF_ERROR(WriteExact(fd, s_dst_ids.data(), s_dst_ids.size()));
     const auto s_src_ids =
         SerializeBlockIds({src_block_ids.data() + block_offset, block_count});
-    RETURN_IF_ERROR(WriteExact(fd, s_src_ids.data(), s_src_ids.size()));
+    ABSL_RETURN_IF_ERROR(WriteExact(fd, s_src_ids.data(), s_src_ids.size()));
     uint8_t ack = 0;
     s = ReadExact(fd, &ack, 1);
     if (!s.ok() || ack != 1) {
@@ -341,7 +341,7 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
     }
   } else {
     std::vector<uint8_t> ids_buf(block_count * sizeof(uint32_t));
-    RETURN_IF_ERROR(ReadExact(fd, ids_buf.data(), ids_buf.size()));
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, ids_buf.data(), ids_buf.size()));
     const std::vector<int> stream_allocated_ids = DeserializeBlockIds(ids_buf);
 
     for (size_t k = 0; k < block_count; ++k) {
@@ -368,9 +368,9 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
 
       const std::array<uint8_t, kChunkSizeFieldSize> s_size =
           SerializeChunkSize(total_size);
-      RETURN_IF_ERROR(WriteExact(fd, s_size.data(), s_size.size()));
+      ABSL_RETURN_IF_ERROR(WriteExact(fd, s_size.data(), s_size.size()));
       if (total_size > 0) {
-        RETURN_IF_ERROR(WriteVExact(fd, absl::MakeSpan(iov)));
+        ABSL_RETURN_IF_ERROR(WriteVExact(fd, absl::MakeSpan(iov)));
         stream_bytes_sent += total_size;
       }
       i = j;
@@ -499,12 +499,12 @@ absl::Status SocketTransportAdapter::PostSocketPullInternal(
     header.count_or_size = remote_count;
     header.uuid = uuid;
     const auto s_header = SerializeChunkHeader(header);
-    RETURN_IF_ERROR(WriteExact(fd, s_header.data(), s_header.size()));
+    ABSL_RETURN_IF_ERROR(WriteExact(fd, s_header.data(), s_header.size()));
 
     char resp_buf[kChunkHeaderSize];
-    RETURN_IF_ERROR(ReadExact(fd, resp_buf, sizeof(resp_buf)));
-    ASSIGN_OR_RETURN(const ChunkHeader resp_header,
-                     DeserializeChunkHeader(resp_buf));
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, resp_buf, sizeof(resp_buf)));
+    ABSL_ASSIGN_OR_RETURN(const ChunkHeader resp_header,
+                          DeserializeChunkHeader(resp_buf));
     if (resp_header.op != socket_opcode ||
         resp_header.count_or_size != remote_count) {
       return absl::InternalError("Unexpected block pull response header");
@@ -538,7 +538,7 @@ absl::Status SocketTransportAdapter::PostSocketPullInternal(
       }
 
       uint8_t size_buf[kChunkSizeFieldSize];
-      RETURN_IF_ERROR(ReadExact(fd, size_buf, sizeof(size_buf)));
+      ABSL_RETURN_IF_ERROR(ReadExact(fd, size_buf, sizeof(size_buf)));
       const uint32_t sender_size = DeserializeChunkSize(size_buf);
 
       if (sender_size != expected_size) {
@@ -549,12 +549,12 @@ absl::Status SocketTransportAdapter::PostSocketPullInternal(
       }
 
       if (expected_size > 0) {
-        RETURN_IF_ERROR(ReadVExact(fd, absl::MakeSpan(iov)));
+        ABSL_RETURN_IF_ERROR(ReadVExact(fd, absl::MakeSpan(iov)));
         stream_bytes_received += expected_size;
       }
 
       if (requests[i].on_block_received != nullptr) {
-        RETURN_IF_ERROR(
+        ABSL_RETURN_IF_ERROR(
             requests[i].on_block_received(l, sh, dst_id, expected_size));
       }
       i = j;

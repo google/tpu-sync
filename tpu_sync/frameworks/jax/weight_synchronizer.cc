@@ -30,6 +30,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/synchronization/mutex.h"
@@ -38,7 +39,6 @@
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
@@ -418,7 +418,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareWeightSynchronizer::D2h(
   sub_copy_futures.reserve(sub_synchronizers_.size());
   for (auto& sub : sub_synchronizers_) {
     if (sub) {
-      ASSIGN_OR_RETURN(auto f, sub->D2h(uuid));
+      ABSL_ASSIGN_OR_RETURN(auto f, sub->D2h(uuid));
       sub_copy_futures.push_back(std::move(f));
     }
   }
@@ -432,7 +432,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareWeightSynchronizer::H2d(
   sub_copy_futures.reserve(sub_synchronizers_.size());
   for (auto& sub : sub_synchronizers_) {
     if (sub) {
-      ASSIGN_OR_RETURN(auto f, sub->H2d(uuid));
+      ABSL_ASSIGN_OR_RETURN(auto f, sub->H2d(uuid));
       sub_copy_futures.push_back(std::move(f));
     }
   }

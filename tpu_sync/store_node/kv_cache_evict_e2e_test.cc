@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <gtest/gtest.h>
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -32,7 +33,6 @@
 #include "tpu_sync/core/controller/worker_service_server.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/kv_manager_holder.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/kv_cache/global_registry/test_util.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
@@ -100,21 +100,21 @@ class EvictE2ETest : public ::testing::Test {
     config.monitor_config.evict_sweep_period = absl::Milliseconds(200);
     config.monitor_config.evict_low_watermark = 0.5;
     config.monitor_config.evict_high_watermark = 0.75;
-    ASSIGN_OR_RETURN(src.store,
-                     kv_cache::KVCacheStore::Create(
-                         config, kSourceCapacity, registry_->server_address, id,
-                         /*num_shards=*/1,
-                         /*shard_size_bytes=*/kArrayBytes,
-                         /*store_server_ip=*/"localhost",
-                         /*raiden_controller_port=*/0));
+    ABSL_ASSIGN_OR_RETURN(
+        src.store, kv_cache::KVCacheStore::Create(
+                       config, kSourceCapacity, registry_->server_address, id,
+                       /*num_shards=*/1,
+                       /*shard_size_bytes=*/kArrayBytes,
+                       /*store_server_ip=*/"localhost",
+                       /*raiden_controller_port=*/0));
 
     src.worker_server = controller::WorkerServiceServer::Create();
-    RETURN_IF_ERROR(src.worker_server->StartServer(
+    ABSL_RETURN_IF_ERROR(src.worker_server->StartServer(
         /*host_allocator=*/nullptr, KVManagerHolder(src.manager.get()),
         /*port=*/0));
     core::controller::RaidenControllerClient controller_client(
         src.store->raiden_controller_address());
-    RETURN_IF_ERROR(controller_client.RegisterWorker(
+    ABSL_RETURN_IF_ERROR(controller_client.RegisterWorker(
         "worker_0",
         absl::StrCat("localhost:", src.worker_server->GetRaidenWorkerPort()),
         src.manager->get_local_data_endpoints(), /*node_id=*/0));

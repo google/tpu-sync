@@ -357,9 +357,9 @@ cc_library(
     deps = [
         ":torch_tpu_device_buffer_headers",
         "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:xla_pjrt_headers",
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
-        "@xla//xla/pjrt:pjrt_client",
     ],
 )
 
@@ -451,12 +451,12 @@ cc_test(
     deps = [
         ":kv_cache_manager_torch_mock",
         ":torch_tpu_utils_mock",
+        "//tpu_sync/core:xla_pjrt_headers",
         "//tpu_sync/core/controller:controller_service",
         "//tpu_sync/core/controller:test_util",
         "@com_google_absl//absl/strings",
         "@torch_tpu//shims/torch",
         "@torch_tpu//shims/torch:torch_headers",
-        "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
         "@xla//xla/tsl/platform:statusor",
         "@xla//xla/tsl/platform:test",
@@ -476,11 +476,11 @@ cc_test(
     deps = [
         ":kv_cache_manager_torch_mock",
         ":torch_tpu_utils_mock",
+        "//tpu_sync/core:xla_pjrt_headers",
         "@torch_tpu//shims/torch",
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
         "@torch_tpu//shims/torch/c10/core:base_headers",
-        "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
         "@xla//xla/tsl/platform:statusor",
         "@xla//xla/tsl/platform:test",
@@ -500,9 +500,9 @@ cc_test(
     deps = [
         ":torch_raw_transfer_torch_mock",
         ":torch_tpu_utils_mock",
+        "//tpu_sync/core:xla_pjrt_headers",
         "@torch_tpu//shims/torch",
         "@torch_tpu//shims/torch:torch_headers",
-        "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/pjrt/plugin/xla_cpu:xla_cpu_pjrt_client",
         "@xla//xla/tsl/platform:statusor",
         "@xla//xla/tsl/platform:test",

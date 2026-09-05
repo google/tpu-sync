@@ -39,6 +39,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -57,7 +58,6 @@
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
@@ -847,7 +847,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hSyncDispatch(
     std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
     std::optional<size_t> shard_idx) {
   const absl::Time d2h_start = absl::Now();
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       auto logical_futures,
       DispatchD2hChunks(src_offsets_major_dim, dst_offsets_major_dim,
                         copy_sizes_major_dim, slot_idx, layer_idx, shard_idx));
@@ -873,10 +873,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dWrite(
         "must have the same length");
   }
 
-  ASSIGN_OR_RETURN(std::vector<int> src_block_ids,
-                   ToHostBlockIds(src_host_offsets_major_dim));
-  ASSIGN_OR_RETURN(std::vector<int> staging_block_ids,
-                   ToHostBlockIds(dst_host_offsets_major_dim));
+  ABSL_ASSIGN_OR_RETURN(std::vector<int> src_block_ids,
+                        ToHostBlockIds(src_host_offsets_major_dim));
+  ABSL_ASSIGN_OR_RETURN(std::vector<int> staging_block_ids,
+                        ToHostBlockIds(dst_host_offsets_major_dim));
   TF_RETURN_IF_ERROR(ValidateOffsetsAndSizes(src_host_offsets_major_dim,
                                              dst_device_offsets_major_dim,
                                              copy_sizes_major_dim));
@@ -887,8 +887,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dWrite(
   // is not yet executed by this call; dst_device_offsets_major_dim identifies
   // the eventual remote HBM destination for the receiver-side device copy.
   if (num_chunks == 1 || !push_pool_) {
-    ASSIGN_OR_RETURN(auto h2h_res, H2hWrite(std::string(peer), src_block_ids,
-                                            staging_block_ids));
+    ABSL_ASSIGN_OR_RETURN(
+        auto h2h_res,
+        H2hWrite(std::string(peer), src_block_ids, staging_block_ids));
     return h2h_res.second;
   }
 
@@ -937,10 +938,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dRead(
         "must have the same length");
   }
 
-  ASSIGN_OR_RETURN(std::vector<int> src_block_ids,
-                   ToHostBlockIds(src_host_offsets_major_dim));
-  ASSIGN_OR_RETURN(std::vector<int> staging_block_ids,
-                   ToHostBlockIds(dst_host_offsets_major_dim));
+  ABSL_ASSIGN_OR_RETURN(std::vector<int> src_block_ids,
+                        ToHostBlockIds(src_host_offsets_major_dim));
+  ABSL_ASSIGN_OR_RETURN(std::vector<int> staging_block_ids,
+                        ToHostBlockIds(dst_host_offsets_major_dim));
   TF_RETURN_IF_ERROR(ValidateOffsetsAndSizes(dst_host_offsets_major_dim,
                                              dst_device_offsets_major_dim,
                                              copy_sizes_major_dim));
@@ -949,11 +950,11 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dRead(
   // (dst_host_offsets_major_dim) -- never into an aliased copy of the remote
   // src id -- then H2D the staging blocks into the local device destination.
   if (num_chunks == 1 || !pull_pool_) {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         auto h2h_fut,
         H2hReadExplicit(std::string(peer), src_block_ids, staging_block_ids,
                         /*explicit_dst_ptrs=*/{}));
-    RETURN_IF_ERROR(h2h_fut.Await());
+    ABSL_RETURN_IF_ERROR(h2h_fut.Await());
 
     return H2dSyncDispatch(dst_host_offsets_major_dim,
                            dst_device_offsets_major_dim, copy_sizes_major_dim);
@@ -1046,10 +1047,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWrite(
         "must have the same length");
   }
 
-  ASSIGN_OR_RETURN(std::vector<int> staging_block_ids,
-                   ToHostBlockIds(src_host_offsets_major_dim));
-  ASSIGN_OR_RETURN(std::vector<int> dst_block_ids,
-                   ToHostBlockIds(dst_host_offsets_major_dim));
+  ABSL_ASSIGN_OR_RETURN(std::vector<int> staging_block_ids,
+                        ToHostBlockIds(src_host_offsets_major_dim));
+  ABSL_ASSIGN_OR_RETURN(std::vector<int> dst_block_ids,
+                        ToHostBlockIds(dst_host_offsets_major_dim));
   TF_RETURN_IF_ERROR(ValidateOffsetsAndSizes(src_device_offsets_major_dim,
                                              src_host_offsets_major_dim,
                                              copy_sizes_major_dim));
@@ -1058,14 +1059,15 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWrite(
   // (src_host_offsets_major_dim) -- never into an aliased copy of the remote
   // dst id -- then push the staging blocks to the peer's host destination.
   if (num_chunks == 1 || !push_pool_) {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         auto d2h_future,
         D2hSyncDispatch(src_device_offsets_major_dim,
                         src_host_offsets_major_dim, copy_sizes_major_dim));
-    RETURN_IF_ERROR(d2h_future.Await());
+    ABSL_RETURN_IF_ERROR(d2h_future.Await());
 
-    ASSIGN_OR_RETURN(auto h2h_res, H2hWrite(std::string(peer),
-                                            staging_block_ids, dst_block_ids));
+    ABSL_ASSIGN_OR_RETURN(
+        auto h2h_res,
+        H2hWrite(std::string(peer), staging_block_ids, dst_block_ids));
     return h2h_res.second;
   }
 
@@ -1085,10 +1087,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWrite(
   all_d2h_futures.reserve(num_chunks);
 
   for (size_t i = 0; i < num_chunks; ++i) {
-    ASSIGN_OR_RETURN(auto chunk_futures,
-                     DispatchD2hChunks({src_device_offsets_major_dim[i]},
-                                       {src_host_offsets_major_dim[i]},
-                                       {copy_sizes_major_dim[i]}));
+    ABSL_ASSIGN_OR_RETURN(auto chunk_futures,
+                          DispatchD2hChunks({src_device_offsets_major_dim[i]},
+                                            {src_host_offsets_major_dim[i]},
+                                            {copy_sizes_major_dim[i]}));
     raiden::PjRtCopyFuture d2h_fut =
         raiden::JoinPjRtCopyFutures(chunk_futures);
     for (const auto& h : d2h_fut.holds) {
@@ -1162,8 +1164,8 @@ KVCacheManagerBase::D2hAutoAllocate(
     blocks_per_chunk.push_back(needed);
   }
 
-  ASSIGN_OR_RETURN(std::vector<int> allocated_block_ids,
-                   AllocateBlocks(total_blocks_to_allocate));
+  ABSL_ASSIGN_OR_RETURN(std::vector<int> allocated_block_ids,
+                        AllocateBlocks(total_blocks_to_allocate));
 
   std::vector<int64_t> flat_src_offsets;
   std::vector<int64_t> flat_dst_offsets;
@@ -1185,8 +1187,8 @@ KVCacheManagerBase::D2hAutoAllocate(
     }
   }
 
-  ASSIGN_OR_RETURN(auto future,
-                   D2h(flat_src_offsets, flat_dst_offsets, flat_copy_sizes));
+  ABSL_ASSIGN_OR_RETURN(
+      auto future, D2h(flat_src_offsets, flat_dst_offsets, flat_copy_sizes));
   return std::make_pair(allocated_block_ids, std::move(future));
 }
 
@@ -1195,7 +1197,7 @@ KVCacheManagerBase::H2hWrite(const std::vector<std::string>& peers,
                              const std::vector<int>& src_block_ids,
                              const std::vector<int>& dst_block_ids,
                              uint64_t uuid, int layer_idx) {
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       std::vector<int> allocated_ids,
       H2hWriteDirect(peers, src_block_ids, dst_block_ids, uuid, layer_idx));
   return std::make_pair(
@@ -1215,8 +1217,8 @@ KVCacheManagerBase::H2hWrite(std::string peer,
 absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
 KVCacheManagerBase::H2hRead(const std::vector<std::string>& peers,
                             const std::vector<int>& src_block_ids) {
-  ASSIGN_OR_RETURN(std::vector<int> allocated_ids,
-                   H2hReadDirect(peers, src_block_ids));
+  ABSL_ASSIGN_OR_RETURN(std::vector<int> allocated_ids,
+                        H2hReadDirect(peers, src_block_ids));
   return std::make_pair(
       allocated_ids,
       raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{}));
@@ -1258,7 +1260,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2hReadExplicit(
   if (!transport_server) {
     return absl::FailedPreconditionError("Transport server is not running");
   }
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       std::vector<int> allocated_ids,
       transport_server->SyncPull({peer}, src_block_ids, local_block_ids,
                                  explicit_dst_ptrs, parallelism, major_order,
@@ -1468,7 +1470,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hDirect(
     const std::vector<int64_t>& dst_offsets,
     const std::vector<int64_t>& copy_sizes, int64_t device_id) {
   const absl::Time d2h_start = absl::Now();
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       auto futures,
       DispatchD2hChunks(src_offsets, dst_offsets, copy_sizes,
                         /*slot_idx=*/std::nullopt, /*layer_idx=*/std::nullopt,
@@ -1680,8 +1682,8 @@ absl::Status KVCacheManagerBase::EnsureHostMirrorCovers(size_t storage_idx,
     const size_t alloc_size = static_cast<size_t>(needed_bytes);
     const size_t prev_size = shard_info.host_size;
     if (host_allocator_) {
-      ASSIGN_OR_RETURN(HostBufferAllocation allocation,
-                       host_allocator_(alloc_size, nullptr));
+      ABSL_ASSIGN_OR_RETURN(HostBufferAllocation allocation,
+                            host_allocator_(alloc_size, nullptr));
       if (allocation.ptr == nullptr || allocation.size < alloc_size) {
         return absl::InternalError(absl::StrCat(
             "host allocator returned undersized buffer for pool mirror: ",
@@ -2204,8 +2206,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::CopyPoolBlocks(
     }
   }
   if (!bounded) {
-    ASSIGN_OR_RETURN(std::vector<PoolBlockCopyExtent> merged,
-                     ComputePoolBlockCopyExtents(pool, block_ids));
+    ABSL_ASSIGN_OR_RETURN(std::vector<PoolBlockCopyExtent> merged,
+                          ComputePoolBlockCopyExtents(pool, block_ids));
     extents.reserve(merged.size());
     for (const PoolBlockCopyExtent& extent : merged) {
       extents.push_back(
@@ -2221,7 +2223,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::CopyPoolBlocks(
       }
       const int64_t delta = (static_cast<int64_t>(slot_it->second) - block_id) *
                             pool.block_stride_bytes;
-      ASSIGN_OR_RETURN(
+      ABSL_ASSIGN_OR_RETURN(
           std::vector<PoolBlockCopyExtent> block_extents,
           ComputePoolBlockCopyExtents(pool, absl::MakeConstSpan(&block_id, 1)));
       for (const PoolBlockCopyExtent& extent : block_extents) {
@@ -2584,7 +2586,7 @@ absl::Status KVCacheManagerBase::PushKVCacheResharded(
   }
 
   // 2. D2H to copy from device to host.
-  ASSIGN_OR_RETURN(raiden::PjRtCopyFuture d2h_future, D2hSyncDispatch());
+  ABSL_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture d2h_future, D2hSyncDispatch());
 
   // 3. Group entries by dst_peer and collect unique block IDs
   std::map<std::string, std::vector<std::pair<int, int>>> peer_transfers;

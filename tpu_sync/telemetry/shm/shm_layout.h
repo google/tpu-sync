@@ -34,6 +34,7 @@ namespace tpu_raiden::telemetry {
 inline constexpr uint32_t kRaidenShmMagic = 0xABCD1234;
 inline constexpr absl::string_view kShmFilePrefix = "worker_rank_";
 inline constexpr absl::string_view kShmFileExtension = ".mmap";
+inline constexpr absl::string_view kShmTmpFileExtension = ".mmap.tmp";
 
 inline constexpr size_t kMaxTocEntries = 1024;
 // Data pool capacity for metric slots in a single chunk (64 KB).

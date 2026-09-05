@@ -48,6 +48,34 @@ cc_test(
     ],
 )
 
+cc_library(
+    name = "trace",
+    srcs = ["trace.cc"],
+    hdrs = ["trace.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@perfetto//:libperfetto_client_experimental",
+        "@tsl//tsl/profiler/lib:traceme",
+        "@tsl//tsl/profiler/lib:traceme_encode",
+    ],
+)
+
+cc_test(
+    name = "trace_test",
+    srcs = ["trace_test.cc"],
+    deps = [
+        ":trace",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest_main",
+        "@perfetto//:libperfetto_client_experimental",
+    ],
+)
+
 nanobind_extension(
     name = "_raiden_id",
     srcs = ["raiden_id_binding.cc"],

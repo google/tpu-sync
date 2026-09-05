@@ -48,6 +48,7 @@
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_manager_base.h"
@@ -460,6 +461,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
 
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
     uint64_t uuid) {
+  RAIDEN_TRACE("WeightSynchronizerBase::H2d");
   if (buffer_holds_.empty()) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
@@ -581,6 +583,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
 
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2h(
     uint64_t uuid) {
+  RAIDEN_TRACE("WeightSynchronizerBase::D2h");
   if (buffer_holds_.empty()) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
@@ -604,6 +607,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2h(
 
 absl::Status WeightSynchronizerBase::PushWeights(
     const std::vector<std::string>& peers) {
+  RAIDEN_TRACE("WeightSynchronizerBase::PushWeights");
   if (control_delegate_ != nullptr) {
     return control_delegate_->PushWeights(peers);
   }
@@ -629,6 +633,7 @@ absl::Status WeightSynchronizerBase::PushWeightsLocal(
 
 absl::Status WeightSynchronizerBase::PushWeightsResharded(
     const tpu_sync::rpc::StartTransferRequest& request) {
+  RAIDEN_TRACE("WeightSynchronizerBase::PushWeightsResharded");
   if (control_delegate_ != nullptr) {
     return control_delegate_->PushWeightsResharded(request);
   }
@@ -867,6 +872,7 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
 
 absl::Status WeightSynchronizerBase::BindWeights(
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers) {
+  RAIDEN_TRACE("WeightSynchronizerBase::BindWeights");
   if (layer_buffers.size() != num_layers_) {
     return absl::InvalidArgumentError("Number of layers mismatch");
   }

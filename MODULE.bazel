@@ -89,6 +89,12 @@ bazel_dep(name = "boringssl", version = "0.20240913.0")
 llvm = use_extension("@xla//third_party/extensions:llvm.bzl", "llvm_extension")
 use_repo(llvm, "llvm-project")
 
+tsl_extension = use_extension("@xla//third_party/extensions:tsl.bzl", "tsl_extension")
+use_repo(
+    tsl_extension,
+    "tsl",
+)
+
 jax_python_wheel_repository = use_repo_rule(
     "@jax//jaxlib:jax_python_wheel.bzl",
     "jax_python_wheel_repository",
@@ -102,6 +108,7 @@ bazel_dep(name = "googletest", version = "1.17.0.bcr.2", repo_name = "com_google
 bazel_dep(name = "flatbuffers", version = "25.12.19", repo_name = "com_github_google_flatbuffers")
 bazel_dep(name = "highway", version = "1.2.0")
 bazel_dep(name = "prometheus-cpp", version = "1.3.0", repo_name = "com_github_jupp0r_prometheus_cpp")
+bazel_dep(name = "perfetto")
 
 pybind11_internal_configure = use_extension(
     "@pybind11_bazel//:internal_configure.bzl",
@@ -141,6 +148,16 @@ git_override(
         "//:third_party/nanobind_abseil/inject_module_block.patch",
     ],
     remote = "https://github.com/google/nanobind_abseil.git",
+)
+
+git_override(
+    module_name = "perfetto",
+    commit = "d0d8c6fa5f7411b59fccacf99233e79bcf94e3fc",
+    patch_strip = 1,
+    patches = [
+        "//:third_party/perfetto/no_android_deps.patch",
+    ],
+    remote = "https://github.com/google/perfetto.git",
 )
 
 # Single-sources the wheel version from pyproject.toml [project].version and

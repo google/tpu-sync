@@ -79,6 +79,20 @@ class RequestBlockRegistry {
   absl::StatusOr<bool> CancelIfUnclaimed(const std::string& req_id,
                                          int64_t uuid);
 
+  enum class RequestBlockStatus {
+    kUnknown = 0,
+    kRegistered = 1,
+    kClaimed = 2,
+    kCancelled = 3,
+  };
+  using RequestBlockKey = std::pair<std::string, int64_t>;
+
+  // Read-only lifecycle probe (get_request_block_status): one status per
+  // key, in order. Expired state is purged first so a TTL-lapsed row reads
+  // as kUnknown. Precedence: cancelled tombstone > claim > registered row.
+  std::vector<RequestBlockStatus> Status(
+      const std::vector<RequestBlockKey>& keys);
+
   // _lookup_request_blocks: the claim linearization point. claim_owner is
   // an opaque identity pointer (Python: `object()`).
   absl::StatusOr<std::map<RaidenId, RequestBlockRegistration, RaidenIdLess>>

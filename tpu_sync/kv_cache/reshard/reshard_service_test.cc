@@ -620,6 +620,72 @@ TEST_F(ReshardStackTest, CancelTombstoneBlocksLateRegistration) {
                         "req_id=req-5, uuid=46"));
 }
 
+TEST_F(ReshardStackTest, RequestBlockStatusProbeTracksLifecycle) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  auto probe = [&](std::vector<std::pair<std::string, int64_t>> keys) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_GET_REQUEST_BLOCK_STATUS);
+    for (const auto& [req_id, uuid] : keys) {
+      auto* key = req.mutable_get_request_block_status_request()->add_keys();
+      key->set_req_id(req_id);
+      key->set_uuid(uuid);
+    }
+    tpu_sync::rpc::ControllerResponse resp =
+        HandleController(req.SerializeAsString());
+    EXPECT_TRUE(resp.success()) << resp.message();
+    std::vector<int> statuses;
+    for (int status : resp.get_request_block_status_response().statuses()) {
+      statuses.push_back(status);
+    }
+    return statuses;
+  };
+  auto cancel = [&](const std::string& req_id, int64_t uuid) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(tpu_sync::rpc::ControllerRequest::
+                        COMMAND_CANCEL_REQUEST_BLOCKS_IF_UNCLAIMED);
+    req.mutable_cancel_request_blocks_if_unclaimed_request()->set_req_id(
+        req_id);
+    req.mutable_cancel_request_blocks_if_unclaimed_request()->set_uuid(uuid);
+    return HandleController(req.SerializeAsString());
+  };
+
+  // Never registered.
+  EXPECT_EQ(probe({{"req-s", 60}}),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+
+  // Registered (one rank is enough) and unclaimed.
+  RegisterSpans(0, "req-s", 60, 1024, 3, 0, 0, 1024);
+  EXPECT_EQ(probe({{"req-s", 60}}),
+            std::vector<int>{ProtoStatus::STATUS_REGISTERED});
+
+  // The consumer's release-only cancel: the row is gone, the tombstone
+  // reports it — this is what the producer worker polls for.
+  tpu_sync::rpc::ControllerResponse cancel_resp = cancel("req-s", 60);
+  ASSERT_TRUE(cancel_resp.success());
+  EXPECT_EQ(cancel_resp.response_data(), "true");
+  EXPECT_EQ(probe({{"req-s", 60}}),
+            std::vector<int>{ProtoStatus::STATUS_CANCELLED});
+
+  // Claimed registrations refuse cancellation and read as claimed; the
+  // batch keeps key order.
+  RegisterSpans(0, "req-c", 61, 1024, 5, 0, 0, 1024);
+  RegisterSpans(1, "req-c", 61, 1024, 7, 1, 0, 512);
+  ASSERT_TRUE(Coordinate("req-c", 61, 2, {7, 9}).success());
+  EXPECT_EQ(probe({{"req-c", 61}, {"req-s", 60}, {"req-none", 1}}),
+            (std::vector<int>{ProtoStatus::STATUS_CLAIMED,
+                              ProtoStatus::STATUS_CANCELLED,
+                              ProtoStatus::STATUS_UNKNOWN}));
+  EXPECT_EQ(cancel("req-c", 61).response_data(), "false");
+
+  // Tombstones lapse with the TTL and read as unknown.
+  now_ += 601.0;
+  EXPECT_EQ(probe({{"req-s", 60}}),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+}
+
 TEST_F(ReshardStackTest, CompletionVotesRetireAfterClaim) {
   RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
                    /*num_blocks=*/16);

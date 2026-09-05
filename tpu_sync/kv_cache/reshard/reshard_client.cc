@@ -248,6 +248,20 @@ tpu_sync::rpc::ControllerRequest ReshardClient::BuildGetTransferStatus(
   return req;
 }
 
+tpu_sync::rpc::ControllerRequest ReshardClient::BuildGetRequestBlockStatus(
+    const std::vector<std::pair<std::string, int64_t>>& keys) {
+  tpu_sync::rpc::ControllerRequest req;
+  req.set_command(
+      tpu_sync::rpc::ControllerRequest::COMMAND_GET_REQUEST_BLOCK_STATUS);
+  auto* status = req.mutable_get_request_block_status_request();
+  for (const auto& [req_id, uuid] : keys) {
+    auto* key = status->add_keys();
+    key->set_req_id(req_id);
+    key->set_uuid(uuid);
+  }
+  return req;
+}
+
 tpu_sync::rpc::ControlRequest ReshardClient::BuildGetMetadata() {
   tpu_sync::rpc::ControlRequest req;
   req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_GET_METADATA);
@@ -346,6 +360,23 @@ absl::StatusOr<int32_t> ReshardClient::GetTransferStatus(
   if (!response.ok()) return response.status();
   return static_cast<int32_t>(
       response->get_transfer_status_response().status());
+}
+
+absl::StatusOr<std::vector<int32_t>> ReshardClient::GetRequestBlockStatus(
+    const std::vector<std::pair<std::string, int64_t>>& keys) {
+  absl::StatusOr<tpu_sync::rpc::ControllerResponse> response =
+      CallController(BuildGetRequestBlockStatus(keys));
+  if (!response.ok()) return response.status();
+  const auto& body = response->get_request_block_status_response();
+  if (static_cast<size_t>(body.statuses_size()) != keys.size()) {
+    return absl::InternalError(
+        absl::StrCat("Remote Controller Server returned ", body.statuses_size(),
+                     " request block statuses for ", keys.size(), " keys"));
+  }
+  std::vector<int32_t> statuses;
+  statuses.reserve(keys.size());
+  for (int status : body.statuses()) statuses.push_back(status);
+  return statuses;
 }
 
 absl::StatusOr<std::vector<std::string>> ReshardClient::GetMetadata() {

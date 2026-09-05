@@ -997,6 +997,15 @@ NB_MODULE(_tpu_raiden_torch, m) {
              ::tpu_raiden::kv_cache::reshardpb2::ThrowIfError(result.status());
              return *result;
            })
+      .def("get_request_block_status",
+           [](::tpu_raiden::kv_cache::reshardpb2::ClientHandle& self,
+              const std::vector<std::pair<std::string, int64_t>>& keys) {
+             nb::gil_scoped_release release;
+             absl::StatusOr<std::vector<int32_t>> result =
+                 self.client->GetRequestBlockStatus(keys);
+             ::tpu_raiden::kv_cache::reshardpb2::ThrowIfError(result.status());
+             return *result;
+           })
       .def("start_transfer",
            [](::tpu_raiden::kv_cache::reshardpb2::ClientHandle& self,
               const std::vector<::tpu_raiden::kv_cache::reshardpb2::UnitTuple>&
@@ -1077,6 +1086,9 @@ NB_MODULE(_tpu_raiden_torch, m) {
   // Capability marker for the vLLM connector's version-skew probe: present
   // and true iff start_transfer accepts the dst_skip_bytes clip.
   m.attr("reshard_client_supports_dst_skip_bytes") = true;
+  // Present and true iff get_request_block_status (the read-only registry
+  // lifecycle probe) is bound.
+  m.attr("reshard_client_supports_request_block_status") = true;
 
   // NOTE: KVCacheStoreWrapper is already bound above as "KVCacheStore";
   // nanobind keys class bindings by C++ type, so a second nb::class_ for the

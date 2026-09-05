@@ -148,6 +148,36 @@ message GetTransferStatusRequest {
   int64 uuid = 2;
 }
 
+message RequestBlockKey {
+  string req_id = 1;
+  int64 uuid = 2;
+}
+
+// Read-only lifecycle probe over the request-block registry. Producer
+// workers poll it for registrations that have not reached a native
+// terminal, so a consumer-side cancel_request_blocks_if_unclaimed (which
+// only retires the registry row) becomes observable before the TTL sweep.
+message GetRequestBlockStatusRequest {
+  repeated RequestBlockKey keys = 1;
+}
+
+message GetRequestBlockStatusResponse {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    // No row, claim, or tombstone for the key (never registered, retired
+    // after completion, or purged by TTL).
+    STATUS_UNKNOWN = 1;
+    // At least one rank row is registered and unclaimed.
+    STATUS_REGISTERED = 2;
+    // Claimed by a transfer plan (in flight).
+    STATUS_CLAIMED = 3;
+    // Cancelled while unclaimed; tombstone still live.
+    STATUS_CANCELLED = 4;
+  }
+  // Parallel to GetRequestBlockStatusRequest.keys.
+  repeated Status statuses = 1;
+}
+
 message GetTransferStatusResponse {
   enum Status {
     STATUS_UNSPECIFIED = 0;
@@ -168,6 +198,7 @@ message ControllerRequest {
     COMMAND_RELEASE_REQUEST_BLOCKS = 4;
     COMMAND_COMPLETE_REQUEST_BLOCKS = 5;
     COMMAND_CANCEL_REQUEST_BLOCKS_IF_UNCLAIMED = 6;
+    COMMAND_GET_REQUEST_BLOCK_STATUS = 7;
   }
   Command command = 1;
 
@@ -185,6 +216,7 @@ message ControllerRequest {
   CompleteRequestBlocksRequest complete_request_blocks_request = 10;
   CancelRequestBlocksIfUnclaimedRequest
       cancel_request_blocks_if_unclaimed_request = 11;
+  GetRequestBlockStatusRequest get_request_block_status_request = 14;
 }
 
 message ControllerResponse {
@@ -193,4 +225,5 @@ message ControllerResponse {
   GetTransferStatusResponse get_transfer_status_response = 3;
   // Command-specific scalar result (e.g. cancellation verdict, retire count).
   string response_data = 4;
+  GetRequestBlockStatusResponse get_request_block_status_response = 5;
 }

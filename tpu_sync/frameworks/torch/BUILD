@@ -63,9 +63,24 @@ cc_library(
     deps = [
         # buildcleaner: keep
         ":torch_tpu_device_buffer_headers",
+        # buildcleaner: keep
         ":torch_tpu_tensor_to_buffer_headers",
         ":torch_utils",
+        "@com_google_absl//absl/container:btree",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
         "@torch_tpu//shims/torch:aten_headers",
+        "//tpu_sync/core:numa_thread_pool",
+        "//tpu_sync/core:raiden_transfer_endpoint",
+        "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:status_macros",
+        "//tpu_sync/core:tpu_utils",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
     ],
 )
@@ -431,11 +446,86 @@ cc_library(
     tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
-        ":torch_tpu_tensor_to_buffer_headers",
+        # buildcleaner: keep
+        ":torch_tpu_device_buffer_headers",
         ":torch_utils_mock",
-        "//tpu_sync/weight_sync:weight_synchronizer_base",
+        "@com_google_absl//absl/container:btree",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
+        "//tpu_sync/core:numa_thread_pool",
+        "//tpu_sync/core:raiden_transfer_endpoint",
+        "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:status_macros",
+        "//tpu_sync/core:tpu_utils",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/weight_sync:weight_synchronizer_base",
+    ],
+)
+
+cc_library(
+    name = "weight_synchronizer_torch_core_lib",
+    srcs = [
+        "weight_synchronizer.cc",
+    ],
+    hdrs = [
+        "weight_synchronizer.h",
+    ],
+    copts = [
+        "-std=c++20",
+        "-fexceptions",
+        "-frtti",
+    ],
+    defines = ["WITHOUT_PYTHON"],
+    features = [
+        "-use_header_modules",
+    ],
+    tags = ["nobuilder"],
+    deps = [
+        "//tpu_sync/core:numa_thread_pool",
+        "//tpu_sync/core:raiden_transfer_endpoint",
+        "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:status_macros",
+        "//tpu_sync/core:tpu_utils",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/weight_sync:weight_synchronizer_base",
+        "@com_google_absl//absl/container:btree",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "weight_synchronizer_wrapper_test",
+    srcs = ["weight_synchronizer_wrapper_test.cc"],
+    copts = [
+        "-std=c++20",
+        "-DWITHOUT_PYTHON",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    tags = ["nobuilder"],
+    deps = [
+        ":weight_synchronizer_torch_core_lib",
+        "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/weight_sync:weight_synchronizer_base",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@xla//xla/tsl/platform:test",
+        "@xla//xla/tsl/platform:test_main",
     ],
 )
 

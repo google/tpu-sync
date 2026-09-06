@@ -592,9 +592,95 @@ NB_MODULE(_tpu_raiden_torch, m) {
       .def_prop_ro("listener_port", &WeightSynchronizer::listener_port)
       .def_prop_ro("is_listener_active",
                    &WeightSynchronizer::is_listener_active)
+      .def("get_local_endpoints",
+           [](const WeightSynchronizer& self) {
+             auto eps = self.get_local_endpoints();
+             nb::list py_eps;
+             for (const auto& ep : eps) {
+               nb::dict d;
+               d["endpoint"] = ep.endpoint;
+               d["shards"] = ep.shards;
+               py_eps.append(d);
+             }
+             return py_eps;
+           })
       .def_prop_ro("num_layers", &WeightSynchronizer::num_layers)
       .def_prop_ro("num_shards", &WeightSynchronizer::num_shards)
-      .def_prop_ro("slice_byte_size", &WeightSynchronizer::slice_byte_size);
+      .def_prop_ro("slice_byte_size", &WeightSynchronizer::slice_byte_size)
+      .def("get_metrics", &WeightSynchronizer::GetMetrics)
+      .def("reset_metrics", &WeightSynchronizer::ResetMetrics)
+      .def(
+          "set_skip_tiling",
+          [](WeightSynchronizer& self, bool skip_all) {
+            self.SetSkipTiling(skip_all);
+          },
+          nb::arg("skip_all"))
+      .def(
+          "set_skip_tiling",
+          [](WeightSynchronizer& self, const std::vector<bool>& skip_tiling) {
+            self.SetSkipTiling(skip_tiling);
+          },
+          nb::arg("skip_tiling"));
+
+  nb::class_<tpu_raiden::weight_sync::WeightSyncMetrics>(m, "WeightSyncMetrics")
+      .def_ro("last_d2h_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::last_d2h_time_ms)
+      .def_ro("last_h2d_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::last_h2d_time_ms)
+      .def_ro("last_h2h_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::last_h2h_time_ms)
+      .def_ro("last_staging_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::last_staging_time_ms)
+      .def_ro("last_tiling_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::last_tiling_time_ms)
+      .def_ro("last_detiling_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::
+                  last_detiling_time_ms)
+      .def_ro("last_total_push_resharded_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::
+                  last_total_push_resharded_time_ms)
+      .def_ro("last_d2h_bytes",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::last_d2h_bytes)
+      .def_ro("last_h2d_bytes",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::last_h2d_bytes)
+      .def_ro("last_h2h_bytes",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::last_h2h_bytes)
+      .def_ro("last_tiled_bytes",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::last_tiled_bytes)
+      .def_ro("last_detiled_bytes",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::last_detiled_bytes)
+      .def_ro("total_d2h_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::total_d2h_time_ms)
+      .def_ro("total_h2d_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::total_h2d_time_ms)
+      .def_ro("total_h2h_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::total_h2h_time_ms)
+      .def_ro("total_staging_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::
+                  total_staging_time_ms)
+      .def_ro("total_tiling_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::total_tiling_time_ms)
+      .def_ro("total_detiling_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::
+                  total_detiling_time_ms)
+      .def_ro("total_push_resharded_time_ms",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::
+                  total_push_resharded_time_ms)
+      .def_ro("total_d2h_bytes",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::total_d2h_bytes)
+      .def_ro("total_h2d_bytes",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::total_h2d_bytes)
+      .def_ro("total_h2h_bytes",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::total_h2h_bytes)
+      .def_ro("total_tiled_bytes",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::total_tiled_bytes)
+      .def_ro("total_detiled_bytes",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::total_detiled_bytes)
+      .def_ro("d2h_call_count",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::d2h_call_count)
+      .def_ro("push_resharded_call_count",
+              &tpu_raiden::weight_sync::WeightSyncMetrics::
+                  push_resharded_call_count);
 
   // =========================================================================
   // 4. Bind KVCacheStore

@@ -228,11 +228,11 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   virtual void StoreSkipTilingLocal(
       uint64_t uuid, const tpu_sync::rpc::StartTransferRequest& request);
 
-  void SetSkipTiling(const std::vector<bool>& skip_tiling) {
+  virtual void SetSkipTiling(const std::vector<bool>& skip_tiling) {
     absl::MutexLock lock(skip_tiling_mu_);
     latest_skip_tiling_ = skip_tiling;
   }
-  void SetSkipTiling(bool skip_all) {
+  virtual void SetSkipTiling(bool skip_all) {
     absl::MutexLock lock(skip_tiling_mu_);
     latest_skip_tiling_.assign(num_layers_, skip_all);
   }

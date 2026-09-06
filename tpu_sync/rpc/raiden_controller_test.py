@@ -1724,6 +1724,118 @@ class GetGlobalIndicesTest(absltest.TestCase):
         [(0, 0), (1, 0), (2, 0), (3, 0), (4, 1), (5, 1), (6, 1), (7, 1)],
     )
 
+  def test_multi_host_non_contiguous_subgrid_4x4x4_mesh_3d_tensor(self):
+    """Tests 1x2x2 host subgrids on a 4x4x4 physical mesh (16 hosts, 4 chips/host)."""
+    unit0 = raiden_controller.RaidenId("trainer", "0", "weights")
+    unit1 = raiden_controller.RaidenId("trainer", "1", "weights")
+    unit2 = raiden_controller.RaidenId("trainer", "2", "weights")
+    shards = ["10.0.0.1:8000"] * 4
+
+    # Full 3D sharding across (x, y, z)
+    indices0 = raiden_controller._get_global_indices(
+        unit0,
+        shards,
+        logical_mesh_shape=[4, 4, 4],
+        layout=[2, 1, 0],
+        num_physical_hosts=16,
+        sharding_spec=["x", "y", "z"],
+        mesh_axes=["x", "y", "z"],
+        physical_mesh_shape=[4, 4, 4],
+    )
+    # Host 0 (0,0,0) -> chips (0,0,0)->0, (0,0,1)->1, (0,1,0)->4, (0,1,1)->5
+    self.assertEqual(indices0, [(0, 0), (1, 1), (2, 4), (3, 5)])
+
+    indices1 = raiden_controller._get_global_indices(
+        unit1,
+        shards,
+        logical_mesh_shape=[4, 4, 4],
+        layout=[2, 1, 0],
+        num_physical_hosts=16,
+        sharding_spec=["x", "y", "z"],
+        mesh_axes=["x", "y", "z"],
+        physical_mesh_shape=[4, 4, 4],
+    )
+    # Host 1 (0,0,1) -> chips (0,0,2)->2, (0,0,3)->3, (0,1,2)->6, (0,1,3)->7
+    self.assertEqual(indices1, [(0, 2), (1, 3), (2, 6), (3, 7)])
+
+    indices2 = raiden_controller._get_global_indices(
+        unit2,
+        shards,
+        logical_mesh_shape=[4, 4, 4],
+        layout=[2, 1, 0],
+        num_physical_hosts=16,
+        sharding_spec=["x", "y", "z"],
+        mesh_axes=["x", "y", "z"],
+        physical_mesh_shape=[4, 4, 4],
+    )
+    # Host 2 (0,1,0) -> chips (0,2,0)->8, (0,2,1)->9, (0,3,0)->12, (0,3,1)->13
+    self.assertEqual(indices2, [(0, 8), (1, 9), (2, 12), (3, 13)])
+
+  def test_multi_host_non_contiguous_subgrid_4x4x4_mesh_2d_tensor(self):
+    """Tests 2D sharded tensor on 1x2x2 host subgrids on a 4x4x4 physical mesh."""
+    unit0 = raiden_controller.RaidenId("trainer", "0", "weights")
+    unit1 = raiden_controller.RaidenId("trainer", "1", "weights")
+    shards = ["10.0.0.1:8000"] * 4
+
+    indices0 = raiden_controller._get_global_indices(
+        unit0,
+        shards,
+        logical_mesh_shape=[4, 4],
+        layout=[1, 0],
+        num_physical_hosts=16,
+        sharding_spec=["x", "y"],
+        mesh_axes=["x", "y", "z"],
+        physical_mesh_shape=[4, 4, 4],
+    )
+    # Host 0 coords (0,0,0) -> (x,y)=(0,0), (0,0), (0,1), (0,1) -> global (0, 0, 1, 1)
+    self.assertEqual(indices0, [(0, 0), (1, 0), (2, 1), (3, 1)])
+
+    indices1 = raiden_controller._get_global_indices(
+        unit1,
+        shards,
+        logical_mesh_shape=[4, 4],
+        layout=[1, 0],
+        num_physical_hosts=16,
+        sharding_spec=["x", "y"],
+        mesh_axes=["x", "y", "z"],
+        physical_mesh_shape=[4, 4, 4],
+    )
+    # Host 1 coords (0,0,1) -> (x,y)=(0,0), (0,0), (0,1), (0,1) -> global (0, 0, 1, 1)
+    self.assertEqual(indices1, [(0, 0), (1, 0), (2, 1), (3, 1)])
+
+  def test_multi_host_non_contiguous_subgrid_4x4x4_mesh_trailing_unpartitioned(
+      self,
+  ):
+    """Tests 2D tensor on (4, 4, 4) mesh partitioned only on first dimension."""
+    unit0 = raiden_controller.RaidenId("trainer", "0", "weights")
+    shards = ["10.0.0.1:8000"] * 4
+    indices0 = raiden_controller._get_global_indices(
+        unit0,
+        shards,
+        logical_mesh_shape=[4, 2],
+        layout=[1, 0],
+        num_physical_hosts=16,
+        sharding_spec=["x"],
+        mesh_axes=["x", "y", "z"],
+        physical_mesh_shape=[4, 4, 4],
+    )
+    # x=0 on (4, 2) mesh with trailing unpartitioned dim -> global_idx = 0*2 + 0 = 0
+    self.assertEqual(indices0, [(0, 0), (1, 0), (2, 0), (3, 0)])
+
+    unit4 = raiden_controller.RaidenId("trainer", "4", "weights")
+    # Host 4 coords in host_grid (4, 2, 2): temp_h=4 -> (1, 0, 0) -> x=1 -> global_idx = 1*2 + 0 = 2
+    indices4 = raiden_controller._get_global_indices(
+        unit4,
+        shards,
+        logical_mesh_shape=[4, 2],
+        layout=[1, 0],
+        num_physical_hosts=16,
+        sharding_spec=["x"],
+        mesh_axes=["x", "y", "z"],
+        physical_mesh_shape=[4, 4, 4],
+    )
+    self.assertEqual(indices4, [(0, 2), (1, 2), (2, 2), (3, 2)])
+
   def test_replicated_variable(self):
     unit = raiden_controller.RaidenId("trainer", "1", "weights")
     shards = ["10.0.0.2:8000"] * 4
@@ -2632,6 +2744,231 @@ class GetGlobalIndicesTest(absltest.TestCase):
       # 2D Q_Proj is identical: MUST skip tiling (zero copy)
       self.assertTrue(plan.skip_tiling.get(1, False))
 
+  def test_multi_endpoint_registration_and_get_worker_endpoints(self):
+    controller = raiden_controller.RaidenController(port=10099)
+    unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+    controller.register_work_unit(
+        unit,
+        ["10.0.0.1:8000", "10.0.0.2:8000"],
+        control_plane_rpc_address="10.0.0.1:9001,10.0.0.2:9002",
+    )
+    self.assertEqual(
+        controller.worker_rpc_client.get_registered_endpoints(unit),
+        ["10.0.0.1:9001", "10.0.0.2:9002"],
+    )
+    self.assertEqual(
+        controller.worker_rpc_client.get_worker_endpoints()[unit],
+        "10.0.0.1:9001,10.0.0.2:9002",
+    )
+    # Re-registration replaces endpoints
+    controller.register_work_unit(
+        unit,
+        ["10.0.0.3:8000"],
+        control_plane_rpc_address="10.0.0.3:9003",
+    )
+    self.assertEqual(
+        controller.worker_rpc_client.get_registered_endpoints(unit),
+        ["10.0.0.3:9003"],
+    )
+
+  def test_start_transfer_multi_endpoint_broadcast(self):
+    recorded_calls = []
+
+    class MockWorkerClient(raiden_controller.WorkerRpcClient):
+
+      def _encode_start_transfer(self, target_id, transfer_plan):
+        return b"dummy_payload"
+
+      async def _send_and_verify(self, addr, payload):
+        recorded_calls.append((addr, payload))
+
+    client = MockWorkerClient()
+    unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+    client.register_worker_endpoint(unit, "10.0.0.1:9001")
+    client.register_worker_endpoint(unit, "10.0.0.2:9002")
+
+    plan = mock.MagicMock(spec=raiden_controller.TransferPlan)
+    asyncio.run(client.start_transfer(unit, plan))
+    self.assertEqual(
+        recorded_calls,
+        [
+            ("10.0.0.1:9001", b"dummy_payload"),
+            ("10.0.0.2:9002", b"dummy_payload"),
+        ],
+    )
+
+    # Test explicit comma-separated address parameter
+    recorded_calls.clear()
+    asyncio.run(
+        client.start_transfer(unit, plan, address="10.0.0.3:9003,10.0.0.4:9004")
+    )
+    self.assertEqual(
+        recorded_calls,
+        [
+            ("10.0.0.3:9003", b"dummy_payload"),
+            ("10.0.0.4:9004", b"dummy_payload"),
+        ],
+    )
+
+  def test_resharding_plan3_fsdp16_tp4_to_fsdp2_tp4(self):
+    dummy_client = DummyWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=10042, worker_rpc_client=dummy_client
+    )
+
+    src_unit = raiden_controller.RaidenId("trainer", "0", "gemma2_2b_weights")
+    dst_unit = raiden_controller.RaidenId("sampler", "0", "gemma2_2b_weights")
+
+    src_shards = ["10.0.0.1:8000"] * 64
+    dst_shards = ["10.0.0.2:8000"] * 8
+
+    src_var = raiden_service_pb2.VariableMetadataProto(
+        name="layer_0.attn.q_proj",
+        shape=[2304, 2048],
+        mesh_shape=[16, 4],
+        layout=[1, 0],
+        item_size=2,
+        layer_idx=0,
+        sharding_spec=["fsdp", "tp"],
+    )
+
+    dst_var = raiden_service_pb2.VariableMetadataProto(
+        name="layer_0.attn.q_proj",
+        shape=[2304, 2048],
+        mesh_shape=[2, 4],
+        layout=[1, 0],
+        item_size=2,
+        layer_idx=0,
+        sharding_spec=["fsdp", "tp"],
+    )
+
+    controller.register_work_unit(
+        src_unit,
+        src_shards,
+        control_plane_rpc_address="10.0.0.1:9000",
+        variables=[src_var],
+        mesh_shape=[16, 4],
+        mesh_axes=["fsdp", "tp"],
+    )
+
+    controller.register_work_unit(
+        dst_unit,
+        dst_shards,
+        control_plane_rpc_address="10.0.0.2:9000",
+        variables=[dst_var],
+        mesh_shape=[2, 4],
+        mesh_axes=["fsdp", "tp"],
+    )
+
+    future = controller.start_transfer(
+        src_units=[src_unit],
+        dst_units=[dst_unit],
+        use_block_chunks=True,
+        req_id="plan3_test_req",
+    )
+    asyncio.run(future.wait())
+    plan = controller.get_plan("plan3_test_req")
+    self.assertIsNotNone(plan)
+    self.assertIn(src_unit, plan.shard_push_schedules)
+    schedules = plan.shard_push_schedules[src_unit]
+    self.assertEqual(len(schedules), 64)
+    # Each destination shard in (2, 4) corresponds to 8 source shards in (16, 4)
+    for shard_idx, entries in schedules.items():
+      self.assertNotEmpty(entries)
+
+  def test_resharding_plan3_multi_source_tasks_to_single_dst_task(self):
+    dummy_client = DummyWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=10043, worker_rpc_client=dummy_client
+    )
+
+    src_units = [
+        raiden_controller.RaidenId(
+            "pathways_trainer", str(i), "gemma2_2b_weights"
+        )
+        for i in range(32)
+    ]
+    dst_unit = raiden_controller.RaidenId(
+        "mc_jax_sampler", "0", "gemma2_2b_weights"
+    )
+
+    src_embed_var = raiden_service_pb2.VariableMetadataProto(
+        name="embedder.input_embedding",
+        shape=[256128, 2304],
+        mesh_shape=[4, 16],
+        layout=[1, 0],
+        item_size=2,
+        layer_idx=0,
+        sharding_spec=["tp", "fsdp"],
+    )
+    src_q_var = raiden_service_pb2.VariableMetadataProto(
+        name="layer_0.attn.q_proj",
+        shape=[2304, 2048],
+        mesh_shape=[16, 4],
+        layout=[1, 0],
+        item_size=2,
+        layer_idx=1,
+        sharding_spec=["fsdp", "tp"],
+    )
+
+    dst_embed_var = raiden_service_pb2.VariableMetadataProto(
+        name="embedder.input_embedding",
+        shape=[256128, 2304],
+        mesh_shape=[4, 2],
+        layout=[1, 0],
+        item_size=2,
+        layer_idx=0,
+        sharding_spec=["tp", "fsdp"],
+    )
+    dst_q_var = raiden_service_pb2.VariableMetadataProto(
+        name="layer_0.attn.q_proj",
+        shape=[2304, 2048],
+        mesh_shape=[2, 4],
+        layout=[1, 0],
+        item_size=2,
+        layer_idx=1,
+        sharding_spec=["fsdp", "tp"],
+    )
+
+    for i, u in enumerate(src_units):
+      controller.register_work_unit(
+          u,
+          [f"10.0.0.{i+1}:8000", f"10.0.0.{i+1}:8000"],
+          control_plane_rpc_address=f"10.0.0.{i+1}:9000",
+          variables=[src_embed_var, src_q_var],
+          mesh_shape=[16, 4],
+          mesh_axes=["fsdp", "tp"],
+      )
+
+    controller.register_work_unit(
+        dst_unit,
+        [f"10.0.1.1:{8000+j}" for j in range(8)],
+        control_plane_rpc_address="10.0.1.1:9000",
+        variables=[dst_embed_var, dst_q_var],
+        mesh_shape=[2, 4],
+        mesh_axes=["fsdp", "tp"],
+    )
+
+    future = controller.start_transfer(
+        src_units=src_units,
+        dst_units=[dst_unit],
+        use_block_chunks=True,
+        req_id="plan3_multi_task_req",
+    )
+    asyncio.run(future.wait())
+    plan = controller.get_plan("plan3_multi_task_req")
+    self.assertIsNotNone(plan)
+
+    total_scheduled_src_shards = 0
+    for u in src_units:
+      self.assertIn(u, plan.shard_push_schedules)
+      schedules = plan.shard_push_schedules[u]
+      self.assertEqual(len(schedules), 2)
+      for shard_idx, entries in schedules.items():
+        self.assertNotEmpty(entries)
+        total_scheduled_src_shards += 1
+    self.assertEqual(total_scheduled_src_shards, 64)
+
 
 class FormatUnitHelpersTest(absltest.TestCase):
 
@@ -2702,72 +3039,6 @@ class FormatUnitHelpersTest(absltest.TestCase):
     # Single string / bytes (must not be iterated as chars)
     self.assertEqual(raiden_controller._format_units("unit_str"), "unit_str")
     self.assertEqual(raiden_controller._format_units(b"unit_bytes"), "b'unit_bytes'")
-
-  def test_multi_endpoint_registration_and_get_worker_endpoints(self):
-    controller = raiden_controller.RaidenController(port=10099)
-    unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
-    controller.register_work_unit(
-        unit,
-        ["10.0.0.1:8000", "10.0.0.2:8000"],
-        control_plane_rpc_address="10.0.0.1:9001,10.0.0.2:9002",
-    )
-    self.assertEqual(
-        controller.worker_rpc_client.get_registered_endpoints(unit),
-        ["10.0.0.1:9001", "10.0.0.2:9002"],
-    )
-    self.assertEqual(
-        controller.worker_rpc_client.get_worker_endpoints()[unit],
-        "10.0.0.1:9001,10.0.0.2:9002",
-    )
-    # Re-registration replaces endpoints
-    controller.register_work_unit(
-        unit,
-        ["10.0.0.3:8000"],
-        control_plane_rpc_address="10.0.0.3:9003",
-    )
-    self.assertEqual(
-        controller.worker_rpc_client.get_registered_endpoints(unit),
-        ["10.0.0.3:9003"],
-    )
-
-  def test_start_transfer_multi_endpoint_broadcast(self):
-    recorded_calls = []
-
-    class MockWorkerClient(raiden_controller.WorkerRpcClient):
-
-      def _encode_start_transfer(self, target_id, transfer_plan):
-        return b"dummy_payload"
-
-      async def _send_and_verify(self, addr, payload):
-        recorded_calls.append((addr, payload))
-
-    client = MockWorkerClient()
-    unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
-    client.register_worker_endpoint(unit, "10.0.0.1:9001")
-    client.register_worker_endpoint(unit, "10.0.0.2:9002")
-
-    plan = mock.MagicMock(spec=raiden_controller.TransferPlan)
-    asyncio.run(client.start_transfer(unit, plan))
-    self.assertEqual(
-        recorded_calls,
-        [
-            ("10.0.0.1:9001", b"dummy_payload"),
-            ("10.0.0.2:9002", b"dummy_payload"),
-        ],
-    )
-
-    # Test explicit comma-separated address parameter
-    recorded_calls.clear()
-    asyncio.run(
-        client.start_transfer(unit, plan, address="10.0.0.3:9003,10.0.0.4:9004")
-    )
-    self.assertEqual(
-        recorded_calls,
-        [
-            ("10.0.0.3:9003", b"dummy_payload"),
-            ("10.0.0.4:9004", b"dummy_payload"),
-        ],
-    )
 
 
 if __name__ == "__main__":

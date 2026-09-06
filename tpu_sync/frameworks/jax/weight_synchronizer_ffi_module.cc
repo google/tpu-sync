@@ -44,7 +44,7 @@ nb::list prepare_extended_info(nb::list gathered_info_list, nb::list device_ids,
 
 NB_MODULE(_weight_synchronizer_ffi, m) {
   m.def("destroy_weight_synchronizer", []() {
-    for (int i = 0; i < 32; ++i) {
+    for (size_t i = 0; i < tpu_raiden::weight_sync::kMaxShards; ++i) {
       if (tpu_raiden::weight_sync::g_weight_synchronizers[i] != nullptr) {
         delete tpu_raiden::weight_sync::g_weight_synchronizers[i];
         tpu_raiden::weight_sync::g_weight_synchronizers[i] = nullptr;
@@ -55,13 +55,15 @@ NB_MODULE(_weight_synchronizer_ffi, m) {
   m.def(
       "is_listener_active",
       [](int shard_idx = 0) -> bool {
-        if (shard_idx >= 0 && shard_idx < 32 &&
+        if (shard_idx >= 0 &&
+            static_cast<size_t>(shard_idx) <
+                tpu_raiden::weight_sync::kMaxShards &&
             tpu_raiden::weight_sync::g_weight_synchronizers[shard_idx] !=
                 nullptr) {
           return tpu_raiden::weight_sync::g_weight_synchronizers[shard_idx]
               ->is_listener_active();
         }
-        for (int i = 0; i < 32; ++i) {
+        for (size_t i = 0; i < tpu_raiden::weight_sync::kMaxShards; ++i) {
           if (tpu_raiden::weight_sync::g_weight_synchronizers[i] != nullptr &&
               tpu_raiden::weight_sync::g_weight_synchronizers[i]
                   ->is_listener_active()) {

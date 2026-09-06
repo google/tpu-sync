@@ -387,6 +387,120 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     for i in range(len(shapes)):
       np.testing.assert_array_equal(np.asarray(zero_arrs[i]), i + 10.0)
 
+  def test_explicit_global_shard_indices(self):
+    sharding_2d = jax.sharding.NamedSharding(
+        self.mesh_2d, jax.sharding.PartitionSpec("x", "y")
+    )
+    arrs = [jax.device_put(jnp.zeros((8, 8), dtype=self.dtype), sharding_2d)]
+    for arr in arrs:
+      arr.block_until_ready()
+
+    ws = WeightSynchronizer(
+        jax_arrays=arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+        global_shard_indices=[0, 1, 4, 5],
+    )
+    eps = ws.get_local_endpoints()
+    self.assertNotEmpty(eps)
+    self.assertEqual(eps[0]["shards"], [0, 1, 4, 5])
+
+  def test_explicit_global_shard_indices_8_shards(self):
+    arrs = [
+        jax.device_put(jnp.zeros(self.shape, dtype=self.dtype), self.sharding)
+    ]
+    for arr in arrs:
+      arr.block_until_ready()
+
+    expected_indices = [0, 1, 4, 5, 8, 9, 12, 13]
+    ws = WeightSynchronizer(
+        jax_arrays=arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+        global_shard_indices=expected_indices,
+    )
+    eps = ws.get_local_endpoints()
+    self.assertNotEmpty(eps)
+    self.assertEqual(eps[0]["shards"], expected_indices)
+
+  def test_automatic_global_shard_indices_derivation(self):
+    sharding_2d = jax.sharding.NamedSharding(
+        self.mesh_2d, jax.sharding.PartitionSpec("x", "y")
+    )
+    arrs = [jax.device_put(jnp.zeros((8, 8), dtype=self.dtype), sharding_2d)]
+    for arr in arrs:
+      arr.block_until_ready()
+
+    ws = WeightSynchronizer(
+        jax_arrays=arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+    )
+    eps = ws.get_local_endpoints()
+    self.assertNotEmpty(eps)
+    # 2x2 mesh with 4 local devices should automatically derive flat indices [0, 1, 2, 3]
+    self.assertEqual(eps[0]["shards"], [0, 1, 2, 3])
+
+  def test_non_contiguous_subgrid_transfer(self):
+    sharding_2d = jax.sharding.NamedSharding(
+        self.mesh_2d, jax.sharding.PartitionSpec("x", "y")
+    )
+    src_arrs = [
+        jax.device_put(
+            jnp.arange(64, dtype=self.dtype).reshape(8, 8), sharding_2d
+        )
+    ]
+    dst_arrs = [
+        jax.device_put(jnp.zeros((8, 8), dtype=self.dtype), sharding_2d)
+    ]
+    for arr in src_arrs:
+      arr.block_until_ready()
+    for arr in dst_arrs:
+      arr.block_until_ready()
+
+    # Configure non-contiguous global shard indices [0, 1, 4, 5] on both sides
+    ws_source = WeightSynchronizer(
+        jax_arrays=src_arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+        global_shard_indices=[0, 1, 4, 5],
+    )
+    ws_dest = WeightSynchronizer(
+        jax_arrays=dst_arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+        bind_ip="127.0.0.1",
+        global_shard_indices=[0, 1, 4, 5],
+    )
+
+    req = raiden_service_pb2.ControlRequest(
+        command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+        peers=[f"127.0.0.1:{ws_dest.local_port}"],
+        start_transfer_request=raiden_service_pb2.StartTransferRequest(
+            is_sender=True
+        ),
+    )
+    payload = req.SerializeToString()
+
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+    sock.connect(("::1", ws_source.listener_port))
+    sock.sendall(len(payload).to_bytes(4, "big") + payload)
+
+    resp_len = int.from_bytes(sock.recv(4), "big")
+    resp_bytes = sock.recv(resp_len)
+    resp = raiden_service_pb2.ControlResponse()
+    resp.ParseFromString(resp_bytes)
+    self.assertTrue(resp.success)
+    sock.close()
+
+    ws_dest.h2d()
+
+    np.testing.assert_array_equal(
+        np.asarray(dst_arrs[0]), np.asarray(src_arrs[0])
+    )
+
 
 class ShardSortingUtilTest(absltest.TestCase):
 

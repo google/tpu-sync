@@ -34,6 +34,7 @@ class WeightSynchronizer:
       listener_port: Optional[int] = None,
       bind_ip: Optional[str] = None,
       auto_h2d: bool = False,
+      global_shard_indices: Optional[List[int]] = None,
   ):
     """Instantiates the Weight Synchronizer on a JAX weights list.
 
@@ -45,10 +46,38 @@ class WeightSynchronizer:
       listener_port: Sockets server port for incoming C++ Listener commands.
       bind_ip: Sockets server bind IP address.
       auto_h2d: Automatically execute H2D ingestion upon data arrival.
+      global_shard_indices: Explicit vector of global shard indices.
     """
-    global_shard_offset = 0
-    if jax.process_count() > 1:
-      global_shard_offset = jax.process_index() * len(jax.local_devices())
+    if global_shard_indices is None:
+      if jax_arrays and hasattr(jax_arrays[0], "addressable_shards"):
+        arr = jax_arrays[0]
+        if (
+            hasattr(arr, "sharding")
+            and getattr(arr.sharding, "mesh", None) is not None
+        ):
+          mesh = arr.sharding.mesh
+          flat_devices = list(mesh.devices.flat)
+          indices = []
+          for s in arr.addressable_shards:
+            try:
+              indices.append(flat_devices.index(s.device))
+            except (ValueError, AttributeError):
+              pass
+          if len(indices) == len(arr.addressable_shards):
+            global_shard_indices = indices
+
+    if global_shard_indices is None:
+      num_shards = (
+          len(jax_arrays[0].addressable_shards)
+          if jax_arrays and hasattr(jax_arrays[0], "addressable_shards")
+          else len(jax.local_devices())
+      )
+      offset = (
+          jax.process_index() * len(jax.local_devices())
+          if jax.process_count() > 1
+          else 0
+      )
+      global_shard_indices = [offset + i for i in range(num_shards)]
 
     self._impl = _weight_synchronizer.WeightSynchronizer(
         jax_arrays,
@@ -58,7 +87,7 @@ class WeightSynchronizer:
         listener_port,
         bind_ip,
         auto_h2d,
-        global_shard_offset,
+        global_shard_indices,
     )
 
   def d2h(self) -> None:

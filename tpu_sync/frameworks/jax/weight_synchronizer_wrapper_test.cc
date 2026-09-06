@@ -380,12 +380,13 @@ TEST(WeightSynchronizerWrapperTest, DrainPendingH2dDispatchesToAllSubs) {
   EXPECT_EQ(sub1_raw->drain_pending_h2d_calls, 1);
 }
 
-TEST(WeightSynchronizerWrapperTest, GlobalShardOffsetMapping) {
-  // Test constructing WeightSynchronizer with global_shard_offset=4
-  WeightSynchronizer ws(2, 4, 1024, /*local_port=*/std::nullopt,
-                        /*parallelism=*/1, /*listener_port=*/std::nullopt,
-                        /*bind_ip=*/std::nullopt, /*auto_h2d=*/false,
-                        /*global_shard_offset=*/4);
+TEST(WeightSynchronizerWrapperTest, GlobalShardIndicesMapping) {
+  // Test constructing WeightSynchronizer with global_shard_indices={4, 5, 6, 7}
+  WeightSynchronizer ws(
+      2, 4, 1024, /*local_port=*/std::nullopt,
+      /*parallelism=*/1, /*listener_port=*/std::nullopt,
+      /*bind_ip=*/std::nullopt, /*auto_h2d=*/false,
+      /*global_shard_indices=*/std::vector<int64_t>{4, 5, 6, 7});
 
   EXPECT_EQ(ws.num_layers(), 2);
   EXPECT_EQ(ws.num_shards(), 4);
@@ -394,6 +395,24 @@ TEST(WeightSynchronizerWrapperTest, GlobalShardOffsetMapping) {
   auto eps = ws.get_local_endpoints();
   ASSERT_EQ(eps.size(), 1);
   EXPECT_EQ(eps[0].shards, (std::vector<int64_t>{4, 5, 6, 7}));
+}
+
+TEST(WeightSynchronizerWrapperTest, NonContiguousGlobalShardIndicesMapping) {
+  // Test constructing WeightSynchronizer with non-contiguous
+  // global_shard_indices={0, 1, 4, 5}
+  WeightSynchronizer ws(
+      2, 4, 1024, /*local_port=*/std::nullopt,
+      /*parallelism=*/1, /*listener_port=*/std::nullopt,
+      /*bind_ip=*/std::nullopt, /*auto_h2d=*/false,
+      /*global_shard_indices=*/std::vector<int64_t>{0, 1, 4, 5});
+
+  EXPECT_EQ(ws.num_layers(), 2);
+  EXPECT_EQ(ws.num_shards(), 4);
+  EXPECT_EQ(ws.slice_byte_size(), 1024);
+
+  auto eps = ws.get_local_endpoints();
+  ASSERT_EQ(eps.size(), 1);
+  EXPECT_EQ(eps[0].shards, (std::vector<int64_t>{0, 1, 4, 5}));
 }
 
 TEST(WeightSynchronizerWrapperTest,
@@ -423,6 +442,80 @@ TEST(WeightSynchronizerWrapperTest,
   EXPECT_EQ(sub1_raw->last_registered_layer_chunks[0], 2);
   EXPECT_EQ(sub0_raw->last_registered_chunks + sub1_raw->last_registered_chunks,
             5);
+}
+
+TEST(WeightSynchronizerWrapperTest, StoreSkipTilingNonContiguousRouting) {
+  auto sub0_raw = new MockSubWeightSynchronizer(2, 2, 1024);
+  auto sub1_raw = new MockSubWeightSynchronizer(2, 2, 1024);
+
+  std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>> subs;
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub0_raw));
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub1_raw));
+
+  NumaAwareWeightSynchronizer numa_ws(std::move(subs));
+  // Non-contiguous sub-manager assignment: sub0={0, 1}, sub1={4, 5}
+  numa_ws.SetSubmanagerShardsForTesting({{0, 1}, {4, 5}});
+
+  tpu_sync::rpc::StartTransferRequest req;
+  req.set_uuid(300);
+
+  auto* sched_proto = req.mutable_shard_push_schedules();
+  auto& s0 = (*sched_proto)[0];
+
+  // Entry 1: dst_shard_idx=0 (layer 0) -> sub0
+  auto* e1 = s0.add_entries();
+  e1->set_dst_shard_idx(0);
+  e1->set_layer_idx(0);
+  e1->set_count(1);
+  e1->set_size_bytes(1024);
+  e1->set_src_stride_bytes(1024);
+  e1->set_dst_stride_bytes(1024);
+
+  // Entry 2: dst_shard_idx=4 (layer 0) -> sub1
+  auto* e2 = s0.add_entries();
+  e2->set_dst_shard_idx(4);
+  e2->set_layer_idx(0);
+  e2->set_count(1);
+  e2->set_size_bytes(1024);
+  e2->set_src_stride_bytes(1024);
+  e2->set_dst_stride_bytes(1024);
+
+  // Entry 3: dst_shard_idx=5 (layer 1) -> sub1
+  auto* e3 = s0.add_entries();
+  e3->set_dst_shard_idx(5);
+  e3->set_layer_idx(1);
+  e3->set_count(1);
+  e3->set_size_bytes(1024);
+  e3->set_src_stride_bytes(1024);
+  e3->set_dst_stride_bytes(1024);
+
+  // Entry 4: dst_shard_idx=2 (belongs to foreign host) -> MUST NOT route to
+  // sub0/sub1
+  auto* e4 = s0.add_entries();
+  e4->set_dst_shard_idx(2);
+  e4->set_layer_idx(0);
+  e4->set_count(1);
+  e4->set_size_bytes(1024);
+  e4->set_src_stride_bytes(1024);
+  e4->set_dst_stride_bytes(1024);
+
+  numa_ws.StoreSkipTiling(300, req);
+
+  absl::flat_hash_map<size_t, uint32_t> layer_counts = {{0, 2}, {1, 1}};
+  EXPECT_TRUE(numa_ws.RegisterExpectedLayerChunks(300, layer_counts).ok());
+  EXPECT_TRUE(numa_ws.RegisterExpectedChunks(300, 3).ok());
+
+  // sub0 must receive 1 chunk for layer 0 only
+  EXPECT_EQ(sub0_raw->last_registered_chunks, 1);
+  EXPECT_EQ(sub0_raw->last_registered_layer_chunks[0], 1);
+  EXPECT_EQ(sub0_raw->last_registered_layer_chunks[1], 0);
+
+  // sub1 must receive 1 chunk for layer 0 and 1 chunk for layer 1 (total 2)
+  EXPECT_EQ(sub1_raw->last_registered_chunks, 2);
+  EXPECT_EQ(sub1_raw->last_registered_layer_chunks[0], 1);
+  EXPECT_EQ(sub1_raw->last_registered_layer_chunks[1], 1);
 }
 
 }  // namespace

@@ -63,7 +63,7 @@ class WeightSynchronizerFfiTest : public ::testing::Test {
   void TearDown() override {
     // Clean up global registry between tests
     absl::flat_hash_set<WeightSynchronizerBase*> deleted;
-    for (int i = 0; i < 32; ++i) {
+    for (size_t i = 0; i < kMaxShards; ++i) {
       if (g_weight_synchronizers[i] != nullptr) {
         if (deleted.insert(g_weight_synchronizers[i]).second) {
           delete g_weight_synchronizers[i];

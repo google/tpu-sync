@@ -521,12 +521,7 @@ class KVCacheStore:
     Returns:
       True if successfully launched.
     """
-    raw_slices = []
-    for s in slices:
-      if isinstance(s, RaidenId):
-        s = RaidenBlockId(raiden_id=s)
-      raw_slices.append(s._impl)  # pylint: disable=protected-access
-    return self._impl.read_remote(block_hashes, raw_slices, device_block_ids)
+    return self.load(block_hashes, device_block_ids, slices=slices)
 
   def poll_remote_read_status(
       self,
@@ -539,4 +534,4 @@ class KVCacheStore:
         failed: List of block hashes whose remote read failed.
         pending: List of block hashes whose remote read is still in progress.
     """
-    return self._impl.poll_remote_read_status()
+    return self.poll_load_status()

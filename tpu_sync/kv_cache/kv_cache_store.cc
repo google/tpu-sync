@@ -1355,177 +1355,7 @@ absl::Status KVCacheStore::ReadRemote(
     const std::vector<std::string>& block_hashes,
     const std::vector<RaidenBlockId>& slices,
     const std::vector<int32_t>& device_block_ids) {
-  if (block_hashes.empty()) {
-    return absl::OkStatus();
-  }
-
-  // Validate before allocating anything: an early return past the allocation
-  // owes the cleanup below, and there is nothing to clean up yet here.
-  if (slices.size() != block_hashes.size()) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("slices size ", slices.size(),
-                     " must match block_hashes size ", block_hashes.size()));
-  }
-  if (device_block_ids.size() != block_hashes.size()) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "device_block_ids size ", device_block_ids.size(),
-        " must match block_hashes size ", block_hashes.size(),
-        ": read_remote always reads into local HBM"));
-  }
-
-  auto host_blocks_or = AllocateBlockIds(block_hashes.size());
-  if (!host_blocks_or.ok()) {
-    return host_blocks_or.status();
-  }
-
-  // Unwinds everything this call has claimed so far. Every failure below is an
-  // early return, and each one owes both the reading marks and the landing
-  // blocks: an error path that returned without freeing them leaked N host
-  // blocks per call, silently and permanently.
-  std::vector<std::string> successfully_marked_as_reading;
-  successfully_marked_as_reading.reserve(block_hashes.size());
-  auto cleanup = absl::MakeCleanup(
-      [this, &successfully_marked_as_reading, &host_blocks_or]() {
-        DeallocateBlockIds(host_blocks_or.value());
-        absl::MutexLock lock(mutex_);
-        for (const auto& hash : successfully_marked_as_reading) {
-          reading_hashes_.erase(hash);
-        }
-      });
-
-  std::vector<int> dst_host_block_ids = host_blocks_or.value();
-
-  struct RemoteReadGroup {
-    RaidenId src_raiden_id;
-    // The peer's ControllerService address, resolved from the global registry
-    // below. The controller holds no directory of its own.
-    std::string src_controller_address;
-    std::vector<int32_t> src_host_block_ids;
-    std::vector<int32_t> dst_host_block_ids;
-    std::vector<std::string> block_hashes;
-    std::vector<int32_t> device_block_ids;
-  };
-  std::vector<RemoteReadGroup> groups;
-
-  {
-    // The source coordinates come from the caller, not from this store's
-    // index: `slices[i].raiden_id` names the owning peer and
-    // `slices[i].host_block_id` the block on it. The lock still guards
-    // reading_hashes_, which is this store's own in-flight marker.
-    absl::MutexLock lock(mutex_);
-    for (size_t i = 0; i < block_hashes.size(); ++i) {
-      const auto& hash = block_hashes[i];
-      if (!reading_hashes_.insert(hash).second) {
-        return absl::FailedPreconditionError(
-            absl::StrCat("Block is already reading remote: ", hash));
-      }
-      successfully_marked_as_reading.push_back(hash);
-
-      const auto& src_id = slices[i].raiden_id;
-      auto it = std::find_if(groups.begin(), groups.end(),
-                             [&src_id](const RemoteReadGroup& g) {
-                               return g.src_raiden_id == src_id;
-                             });
-      if (it == groups.end()) {
-        groups.push_back(RemoteReadGroup{.src_raiden_id = src_id});
-        it = groups.end() - 1;
-      }
-      it->src_host_block_ids.push_back(slices[i].host_block_id);
-      it->dst_host_block_ids.push_back(dst_host_block_ids[i]);
-      it->block_hashes.push_back(hash);
-      it->device_block_ids.push_back(device_block_ids[i]);
-    }
-  }
-
-  if (!raiden_controller_) {
-    return absl::FailedPreconditionError(
-        "RaidenController is not initialized for ReadRemote");
-  }
-
-  // Resolve every peer BEFORE issuing anything. Resolving inside the issue loop
-  // would leave the first group's lease acquired and its transfer running with
-  // nothing tracking it when a later group turns out to be unreachable.
-  //
-  // Cached per peer (resolved_peer_controllers_), and dropped whenever a read
-  // against that peer fails -- see the member's comment for why invalidation is
-  // what makes a cache here safe at all.
-  if (registry_client_ == nullptr) {
-    return absl::FailedPreconditionError(
-        "ReadRemote needs a global registry: it is what maps the owning peer "
-        "to the controller address this store acquires a read lease from. "
-        "Construct this store with a global_registry_address.");
-  }
-  for (auto& group : groups) {
-    {
-      absl::MutexLock lock(mutex_);
-      auto it = resolved_peer_controllers_.find(group.src_raiden_id);
-      if (it != resolved_peer_controllers_.end()) {
-        group.src_controller_address = it->second;
-      }
-    }
-    if (!group.src_controller_address.empty()) continue;
-
-    absl::StatusOr<global_registry::StoreInfo> store_info =
-        registry_client_->ResolveStore(group.src_raiden_id);
-    if (!store_info.ok()) {
-      return store_info.status();
-    }
-    if (store_info->controller_address().empty()) {
-      return absl::FailedPreconditionError(absl::StrCat(
-          "Peer ", group.src_raiden_id.job_name, "/",
-          group.src_raiden_id.job_replica_id, "/",
-          group.src_raiden_id.data_name, "/",
-          group.src_raiden_id.data_replica_idx,
-          " is registered but published no controller address, so it cannot "
-          "serve a remote read."));
-    }
-    group.src_controller_address = store_info->controller_address();
-    {
-      absl::MutexLock lock(mutex_);
-      resolved_peer_controllers_[group.src_raiden_id] =
-          group.src_controller_address;
-    }
-  }
-
-  // One lease per owning peer. The per-group futures are joined, so if ANY
-  // group fails -- transfer error or a verdict other than HELD -- the whole
-  // batch discards, including groups whose bytes landed perfectly. That is
-  // fail-closed and consistent with the commit-as-a-unit invariant. Committing
-  // only the healthy groups would need per-group RemoteReadState and is
-  // exactly where a partial-promote bug would enter; do not "optimise" it
-  // without splitting the state first.
-  std::vector<tsl::Future<>> futures;
-  futures.reserve(groups.size());
-  for (const auto& group : groups) {
-    futures.push_back(raiden_controller_->ReadRemote(
-        group.src_controller_address, group.src_host_block_ids,
-        group.dst_host_block_ids, group.block_hashes, group.device_block_ids));
-  }
-
-  tsl::Future<> combined_future;
-  if (futures.size() == 1) {
-    combined_future = std::move(futures[0]);
-  } else {
-    combined_future = tsl::JoinFutures(futures);
-  }
-
-  {
-    absl::MutexLock lock(mutex_);
-    std::vector<RaidenId> peers;
-    peers.reserve(groups.size());
-    for (const auto& group : groups) peers.push_back(group.src_raiden_id);
-    active_remote_reads_.emplace(std::move(combined_future),
-                                 RemoteReadState{
-                                     .block_hashes = block_hashes,
-                                     .src_raiden_ids = std::move(peers),
-                                     .host_block_ids = dst_host_block_ids,
-                                 });
-  }
-
-  // Issued: the staging blocks now belong to the read, and the reading marks
-  // are cleared by the poller when it goes terminal.
-  std::move(cleanup).Cancel();
-  return absl::OkStatus();
+  return Load(block_hashes, slices, device_block_ids);
 }
 
 KVCacheStore::PollSaveStatusResult KVCacheStore::PollSaveStatus() {
@@ -1600,19 +1430,9 @@ KVCacheStore::PollLoadStatusResult KVCacheStore::PollLoadStatus() {
 std::tuple<std::vector<std::string>, std::vector<std::string>,
            std::vector<std::string>>
 KVCacheStore::PollRemoteReadStatus() {
-  PollFuturesInternal();
-  absl::MutexLock lock(mutex_);
-  std::vector<std::string> pending;
-  for (const auto& [fut, state] : active_remote_reads_) {
-    for (const auto& hash : state.block_hashes) {
-      pending.push_back(hash);
-    }
-  }
-  std::vector<std::string> done = std::move(done_remote_reads_);
-  std::vector<std::string> failed = std::move(failed_remote_reads_);
-  done_remote_reads_.clear();
-  failed_remote_reads_.clear();
-  return std::make_tuple(done, failed, pending);
+  PollLoadStatusResult res = PollLoadStatus();
+  return std::make_tuple(std::move(res.done), std::move(res.failed),
+                         std::move(res.pending));
 }
 
 absl::StatusOr<size_t> KVCacheStore::RecoverFromLocalManifest() {
@@ -2485,50 +2305,9 @@ void KVCacheStore::PollLoadsInternal(std::vector<LoadState> ready_loads) {
   }
 }
 
-void KVCacheStore::PollRemoteReadsInternal(
-    std::vector<std::pair<tsl::Future<>, RemoteReadState>> ready_remote_reads) {
-  for (auto& [future, state] : ready_remote_reads) {
-    absl::Status status = future.Await();
-    absl::MutexLock lock(mutex_);
-
-    if (status.ok()) {
-      // Nothing to record. The bytes are in the caller's device blocks and
-      // this store keeps no account of them: no LRU entry, no registry
-      // advertisement. Reporting the hashes done is the whole commit.
-      for (const auto& hash : state.block_hashes) {
-        done_remote_reads_.push_back(hash);
-      }
-    } else {
-      // The caller's device blocks may hold garbage -- by design: nothing
-      // points at them, and the caller treats them as scratch until this
-      // reports success.
-      LOG(WARNING) << "Async ReadRemote failed: " << status.ToString();
-      // Drop these peers' cached controller addresses. Most failures are not
-      // address failures, and dropping anyway is the point: re-resolving costs
-      // one RPC on the next read, whereas keeping an address that moved leaves
-      // the peer unreachable until this process dies.
-      for (const auto& peer : state.src_raiden_ids) {
-        resolved_peer_controllers_.erase(peer);
-      }
-      for (const auto& hash : state.block_hashes) {
-        failed_remote_reads_.push_back(hash);
-      }
-    }
-    // The staging blocks were a hop, not a destination, so they go back to the
-    // pool whichever way the read went. Success is not an exception: no LRU
-    // entry points at them, so leaking them here would burn a host block per
-    // read with nothing able to reclaim it.
-    DeallocateBlockIds(state.host_block_ids);
-    for (const auto& hash : state.block_hashes) {
-      reading_hashes_.erase(hash);
-    }
-  }
-}
-
 void KVCacheStore::PollFuturesInternal() {
   std::vector<SaveState> ready_saves;
   std::vector<LoadState> ready_loads;
-  std::vector<std::pair<tsl::Future<>, RemoteReadState>> ready_remote_reads;
 
   {
     absl::MutexLock lock(mutex_);
@@ -2551,21 +2330,10 @@ void KVCacheStore::PollFuturesInternal() {
         ++jt;
       }
     }
-
-    auto kt = active_remote_reads_.begin();
-    while (kt != active_remote_reads_.end()) {
-      if (kt->first.IsReady()) {
-        ready_remote_reads.push_back({kt->first, std::move(kt->second)});
-        active_remote_reads_.erase(kt++);
-      } else {
-        ++kt;
-      }
-    }
   }
 
   PollSavesInternal(std::move(ready_saves));
   PollLoadsInternal(std::move(ready_loads));
-  PollRemoteReadsInternal(std::move(ready_remote_reads));
 }
 
 }  // namespace kv_cache

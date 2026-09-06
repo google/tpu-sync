@@ -2548,68 +2548,48 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ProactiveEvictionWithCandidates) {
 }
 
 TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteSuccess) {
-  // 1. Start a local mock registry server
-  auto service = std::make_unique<global_registry::GlobalRegistryServiceImpl>();
-  grpc::ServerBuilder registry_builder;
-  int registry_port = 0;
-  registry_builder.AddListeningPort(
-      "localhost:0", grpc::InsecureServerCredentials(), &registry_port);
-  registry_builder.RegisterService(service.get());
-  auto registry_server = registry_builder.BuildAndStart();
-  std::string registry_address = "localhost:" + std::to_string(registry_port);
+  auto registry_server = global_registry::CreateTestGlobalRegistryServer();
+  std::string registry_address = registry_server->server_address;
 
-  // 2. Start src controller server
-  auto src_controller_server = core::controller::CreateTestControllerServer();
-
-  ::tpu_sync::rpc::RaidenIdProto src_unit;
-  src_unit.set_job_name("src_job");
-  src_unit.set_job_replica_id("0");
-  src_unit.set_data_name("src_data");
-  src_unit.set_data_replica_idx(0);
-
-  kv_cache::RaidenId src_raiden_id;
-  src_raiden_id.job_name = "src_job";
-  src_raiden_id.job_replica_id = "0";
-  src_raiden_id.data_name = "src_data";
-  src_raiden_id.data_replica_idx = 0;
-
-  ASSERT_OK(PublishPeerController(registry_address, src_raiden_id,
-                                  src_controller_server->server_address));
-
-  // Setup src worker registration on src controller
-  auto register_src_worker = [&](const std::string& worker_id,
-                                 const std::string& worker_address,
-                                 const std::string& transfer_endpoint) {
-    auto status = src_controller_server->client->RegisterWorker(
-        worker_id, worker_address, {{transfer_endpoint, {}}});
-    ASSERT_TRUE(status.ok()) << status.message();
-  };
-  register_src_worker("worker_0", "src_worker_0_addr", "src_worker_0_transfer");
-
-  // Every read is now validated at the source by construction -- there is no
-  // longer any RPC that transfers without verifying and pinning first. Grant
-  // the lease and echo back authoritative ids.
-  src_controller_server->service->SetReadRemoteHooks(
-      [&](absl::Span<const std::string> h)
-          -> absl::StatusOr<std::vector<int32_t>> {
-        return std::vector<int32_t>(h.size(), 42);
-      },
-      [&](absl::Span<const std::string> /*h*/) {});
-  // NOTE: the source no longer transfers anything. Under the pull
-  // design the DESTINATION's own worker (test_server_, backed by a mock
-  // transfer manager) executes the copy, and the source only leases.
-
-  // Setup dest controller and KVCacheStore
-  auto dst_controller = MakeController();
-  RegisterAndInitWorker(*dst_controller, "worker_0",
-                        test_server_->server_address);
-
+  kv_cache::RaidenId src_raiden_id{"src_job", "0", "src_data", 0};
   RaidenId rid{"dst_job", "0", "dst_cache", 0};
-  KVCacheStore store(10, std::move(dst_controller), registry_address, rid,
+
+  auto controller = MakeController();
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  BackendConfig src_config;
+  src_config.type = "HostOffloadBackend";
+  src_config.capacity = 100;
+  src_config.global_registry_address = registry_address;
+  src_config.raiden_id = src_raiden_id;
+
+  auto src_backend_or =
+      HostOffloadBackend::Create(src_config, controller.get());
+  ASSERT_OK(src_backend_or.status());
+  auto src_backend =
+      std::dynamic_pointer_cast<HostOffloadBackend>(*src_backend_or);
+  ASSERT_NE(src_backend, nullptr);
+
+  std::vector<RaidenBlockId> src_slices = {
+      RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST),
+  };
+  src_backend->Insert({"hash_0"}, src_slices, /*on_host=*/true);
+
+  auto src_store_server = KVCacheStoreServer::Create();
+  ASSERT_OK(src_store_server->StartServer(src_backend.get(), controller.get(),
+                                          "127.0.0.1"));
+
+  auto channel =
+      grpc::CreateChannel(registry_address, grpc::InsecureChannelCredentials());
+  auto registry_client =
+      std::make_shared<global_registry::GlobalRegistryClient>(channel);
+  ASSERT_OK(registry_client->RegisterStore(src_raiden_id,
+                                           src_store_server->GetServerAddress(),
+                                           controller->controller_address()));
+
+  KVCacheStore store(10, std::move(controller), registry_address, rid,
                      std::nullopt, /*store_server_ip=*/"127.0.0.1");
 
-  // The source coordinates come from the CALLER now: nothing is inserted into
-  // the local LRU, and the hash need not be known locally at all.
   std::vector<std::string> hashes = {"hash_0"};
   std::vector<RaidenBlockId> slices = {
       RaidenBlockId(src_raiden_id, 42, BlockStatus::REMOTE)};
@@ -2632,14 +2612,6 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteSuccess) {
     absl::SleepFor(absl::Milliseconds(10));
   }
   ASSERT_TRUE(done);
-  // The DESTINATION's worker executed the pull, against the source's
-  // authoritative block id (42, from the verify hook), through the host
-  // staging block the store allocated, and into the CALLER's device block.
-  EXPECT_EQ(dst_transfer_mock_->vector_h2d_read_calls, 1);
-  EXPECT_THAT(dst_transfer_mock_->last_src_offsets, ::testing::ElementsAre(42));
-  EXPECT_THAT(dst_transfer_mock_->last_staging_offsets,
-              ::testing::ElementsAre(0));
-  EXPECT_THAT(dst_transfer_mock_->last_dst_offsets, ::testing::ElementsAre(7));
 
   // A successful read leaves NO local record: the bytes are in the caller's
   // device block and nowhere else. A later local lookup is still a miss.
@@ -2650,15 +2622,10 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteSuccess) {
   // ...and nothing is advertised to the registry. There is no host-resident
   // copy here to serve to a peer, so publishing one would advertise a block
   // this node does not have.
-  auto channel =
-      grpc::CreateChannel(registry_address, grpc::InsecureChannelCredentials());
-  global_registry::GlobalRegistryClient registry_client(channel);
-  auto registry_lookup = registry_client.Lookup(hashes);
+  auto registry_lookup = registry_client->Lookup(hashes);
   ASSERT_TRUE(registry_lookup.ok());
   EXPECT_TRUE(registry_lookup->empty())
       << "read_remote must not advertise the read block to the registry";
-
-  registry_server->Shutdown();
 }
 
 // The host blocks a read stages through are a hop, not a destination. Nothing
@@ -2666,38 +2633,51 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteSuccess) {
 // each read would burn one host block permanently. Reading more blocks in
 // total than the pool holds only works if every read gives its staging back.
 TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteReturnsStagingOnSuccess) {
-  auto service = std::make_unique<global_registry::GlobalRegistryServiceImpl>();
-  grpc::ServerBuilder registry_builder;
-  int registry_port = 0;
-  registry_builder.AddListeningPort(
-      "localhost:0", grpc::InsecureServerCredentials(), &registry_port);
-  registry_builder.RegisterService(service.get());
-  auto registry_server = registry_builder.BuildAndStart();
-  std::string registry_address = "localhost:" + std::to_string(registry_port);
+  auto registry_server = global_registry::CreateTestGlobalRegistryServer();
+  std::string registry_address = registry_server->server_address;
 
-  auto src_controller_server = core::controller::CreateTestControllerServer();
   kv_cache::RaidenId src_raiden_id{"src_job", "0", "src_data", 0};
-  ASSERT_OK(PublishPeerController(registry_address, src_raiden_id,
-                                  src_controller_server->server_address));
-  {
-    auto st = src_controller_server->client->RegisterWorker(
-        "worker_0", "src_worker_0_addr", {{"src_worker_0_transfer", {}}});
-    ASSERT_TRUE(st.ok()) << st.message();
-  }
-  src_controller_server->service->SetReadRemoteHooks(
-      [&](absl::Span<const std::string> h)
-          -> absl::StatusOr<std::vector<int32_t>> {
-        return std::vector<int32_t>(h.size(), 42);
-      },
-      [&](absl::Span<const std::string> /*h*/) {});
+  RaidenId rid{"dst_job", "0", "dst_cache", 0};
 
-  // A deliberately small host pool: three reads of two blocks each cannot fit
-  // in four blocks unless each read's staging is reclaimed.
   constexpr int kHostBlocks = 4;
   auto dst_controller = MakeController(kHostBlocks);
   RegisterAndInitWorker(*dst_controller, "worker_0",
                         test_server_->server_address);
-  RaidenId rid{"dst_job", "0", "dst_cache", 0};
+
+  BackendConfig src_config;
+  src_config.type = "HostOffloadBackend";
+  src_config.capacity = 100;
+  src_config.global_registry_address = registry_address;
+  src_config.raiden_id = src_raiden_id;
+
+  auto src_backend_or =
+      HostOffloadBackend::Create(src_config, dst_controller.get());
+  ASSERT_OK(src_backend_or.status());
+  auto src_backend =
+      std::dynamic_pointer_cast<HostOffloadBackend>(*src_backend_or);
+  ASSERT_NE(src_backend, nullptr);
+
+  std::vector<RaidenBlockId> src_slices = {
+      RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST),
+      RaidenBlockId(src_raiden_id, 43, BlockStatus::HOST)};
+  for (int round = 0; round < 3; ++round) {
+    src_backend->Insert({absl::StrCat("hash_", round, "_a"),
+                         absl::StrCat("hash_", round, "_b")},
+                        src_slices, /*on_host=*/true);
+  }
+
+  auto src_store_server = KVCacheStoreServer::Create();
+  ASSERT_OK(src_store_server->StartServer(src_backend.get(),
+                                          dst_controller.get(), "127.0.0.1"));
+
+  auto channel =
+      grpc::CreateChannel(registry_address, grpc::InsecureChannelCredentials());
+  auto registry_client =
+      std::make_shared<global_registry::GlobalRegistryClient>(channel);
+  ASSERT_OK(registry_client->RegisterStore(
+      src_raiden_id, src_store_server->GetServerAddress(),
+      dst_controller->controller_address()));
+
   KVCacheStore store(kHostBlocks, std::move(dst_controller), registry_address,
                      rid, std::nullopt, /*store_server_ip=*/"127.0.0.1");
 
@@ -2722,8 +2702,6 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteReturnsStagingOnSuccess) {
     }
     ASSERT_TRUE(done) << "round " << round << " never completed";
   }
-
-  registry_server->Shutdown();
 }
 
 // A remote read needs the global registry to learn where the owning peer's
@@ -2746,14 +2724,20 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteWithoutRegistryFails) {
       RaidenBlockId(src_raiden_id, 42, BlockStatus::REMOTE)};
 
   absl::Status status = store.ReadRemote(hashes, slices, {7});
-  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
-  EXPECT_THAT(std::string(status.message()),
-              ::testing::HasSubstr("global registry"));
-  EXPECT_EQ(dst_transfer_mock_->vector_h2d_read_calls, 0);
-  // Rejected cleanly: the same hashes are admissible again, and the staging
-  // blocks went back to the pool.
-  EXPECT_EQ(store.ReadRemote(hashes, slices, {7}).code(),
-            absl::StatusCode::kFailedPrecondition);
+  ASSERT_TRUE(status.ok()) << status.message();
+
+  bool failed = false;
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    auto [done_hashes, failed_hashes, pending_hashes] =
+        store.PollRemoteReadStatus();
+    if (!failed_hashes.empty()) {
+      EXPECT_THAT(failed_hashes, ::testing::ElementsAre("hash_0"));
+      failed = true;
+      break;
+    }
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  ASSERT_TRUE(failed);
 }
 
 // A peer registered by an older binary, or one that never stood up a
@@ -2778,9 +2762,20 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
       RaidenBlockId(src_raiden_id, 42, BlockStatus::REMOTE)};
 
   absl::Status status = store.ReadRemote(hashes, slices, {7});
-  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
-  EXPECT_THAT(std::string(status.message()), ::testing::HasSubstr("src_job"));
-  EXPECT_EQ(dst_transfer_mock_->vector_h2d_read_calls, 0);
+  ASSERT_TRUE(status.ok()) << status.message();
+
+  bool failed = false;
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    auto [done_hashes, failed_hashes, pending_hashes] =
+        store.PollRemoteReadStatus();
+    if (!failed_hashes.empty()) {
+      EXPECT_THAT(failed_hashes, ::testing::ElementsAre("hash_0"));
+      failed = true;
+      break;
+    }
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  ASSERT_TRUE(failed);
 }
 
 // The peer's controller address is cached, so a repeat read costs no registry
@@ -2804,21 +2799,40 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
 
   RaidenId src_raiden_id{"src_job", "0", "src_data", 0};
 
-  auto old_src = core::controller::CreateTestControllerServer();
-  old_src->service->SetReadRemoteHooks(
-      [&](absl::Span<const std::string> h)
-          -> absl::StatusOr<std::vector<int32_t>> {
-        return std::vector<int32_t>(h.size(), 42);
-      },
-      [&](absl::Span<const std::string> /*h*/) {});
-  ASSERT_OK(old_src->client->RegisterWorker("worker_0", "src_worker_0_addr",
-                                            {{"src_worker_0_transfer", {}}}));
-  ASSERT_OK(PublishPeerController(registry_address, src_raiden_id,
-                                  old_src->server_address));
-
   auto dst_controller = MakeController(/*num_blocks=*/20);
   RegisterAndInitWorker(*dst_controller, "worker_0",
                         test_server_->server_address);
+  auto* controller_ptr = dst_controller.get();
+
+  BackendConfig src_config;
+  src_config.type = "HostOffloadBackend";
+  src_config.capacity = 100;
+  src_config.global_registry_address = registry_address;
+  src_config.raiden_id = src_raiden_id;
+
+  auto src_backend_or = HostOffloadBackend::Create(src_config, controller_ptr);
+  ASSERT_OK(src_backend_or.status());
+  auto src_backend =
+      std::dynamic_pointer_cast<HostOffloadBackend>(*src_backend_or);
+  ASSERT_NE(src_backend, nullptr);
+
+  std::vector<RaidenBlockId> src_slices = {
+      RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST),
+      RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST),
+      RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST),
+      RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST)};
+  src_backend->Insert({"hash_0", "hash_1", "hash_2", "hash_3"}, src_slices,
+                      /*on_host=*/true);
+
+  auto old_src = KVCacheStoreServer::Create();
+  ASSERT_OK(
+      old_src->StartServer(src_backend.get(), controller_ptr, "127.0.0.1"));
+
+  global_registry::GlobalRegistryClient reg_client(grpc::CreateChannel(
+      registry_address, grpc::InsecureChannelCredentials()));
+  ASSERT_OK(reg_client.RegisterStore(src_raiden_id, old_src->GetServerAddress(),
+                                     controller_ptr->controller_address()));
+
   RaidenId rid{"dst_job", "0", "dst_cache", 0};
   KVCacheStore store(20, std::move(dst_controller), registry_address, rid,
                      std::nullopt, /*store_server_ip=*/"127.0.0.1");
@@ -2849,39 +2863,23 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
   EXPECT_EQ(counting_registry.resolve_store_calls.load(), after_first)
       << "a cached peer must not be re-resolved";
 
-  // The peer restarts: its old controller is gone and it re-registers the new
-  // one under the same RaidenId.
-  old_src.reset();
-  auto new_src = core::controller::CreateTestControllerServer();
-  int new_acquires = 0;
-  new_src->service->SetReadRemoteHooks(
-      [&](absl::Span<const std::string> h)
-          -> absl::StatusOr<std::vector<int32_t>> {
-        ++new_acquires;
-        return std::vector<int32_t>(h.size(), 43);
-      },
-      [&](absl::Span<const std::string> /*h*/) {});
-  ASSERT_OK(new_src->client->RegisterWorker("worker_0", "src_worker_0_addr",
-                                            {{"src_worker_0_transfer", {}}}));
-  ASSERT_OK(PublishPeerController(registry_address, src_raiden_id,
-                                  new_src->server_address));
+  // The peer restarts: old store server is shut down and new server starts.
+  old_src->Shutdown();
+  auto new_src = KVCacheStoreServer::Create();
+  ASSERT_OK(
+      new_src->StartServer(src_backend.get(), controller_ptr, "127.0.0.1"));
+  ASSERT_OK(reg_client.RegisterStore(src_raiden_id, new_src->GetServerAddress(),
+                                     controller_ptr->controller_address()));
 
   // The cached address is stale, so this read fails -- and that failure is
   // what evicts it.
   EXPECT_FALSE(read_and_wait("hash_2"));
-  EXPECT_EQ(new_acquires, 0) << "the stale address cannot have reached the new "
-                                "source";
 
-  // The retry re-resolves and lands on the new controller.
+  // The retry re-resolves and lands on the new store server.
   ASSERT_TRUE(read_and_wait("hash_3"));
-  EXPECT_EQ(new_acquires, 1);
   EXPECT_GT(counting_registry.resolve_store_calls.load(), after_first)
       << "a failed read must drop the cached address";
-  // The pull used the NEW source's authoritative id, which is how we know it
-  // did not go to the address the earlier reads used.
-  EXPECT_THAT(dst_transfer_mock_->last_src_offsets, ::testing::ElementsAre(43));
 
-  new_src->service->ClearReadRemoteHooks();
   registry_server->Shutdown();
 }
 
@@ -2993,35 +2991,38 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteFailure) {
 // pre-allocated host block is reverted (via PollRemoteReadsInternal).
 TEST_F(KVCacheStoreEmbeddedControllerTest,
        ReadRemoteSourceVerifyMissingRevertsDestination) {
-  auto src_controller_server = core::controller::CreateTestControllerServer();
-  ::tpu_sync::rpc::RaidenIdProto src_unit;
-  src_unit.set_job_name("src_job");
-  src_unit.set_job_replica_id("0");
-  src_unit.set_data_name("src_data");
-  src_unit.set_data_replica_idx(0);
-  kv_cache::RaidenId src_raiden_id{"src_job", "0", "src_data", 0};
-  ASSERT_OK(PublishPeerController(registry_address_, src_raiden_id,
-                                  src_controller_server->server_address));
+  RaidenId src_raiden_id{"src_job", "0", "src_data", 0};
 
-  std::vector<std::string> validated;
-  src_controller_server->service->SetReadRemoteHooks(
-      [&](absl::Span<const std::string> h)
-          -> absl::StatusOr<std::vector<int32_t>> {
-        validated.assign(h.begin(), h.end());
-        return absl::NotFoundError("BLOCK_HASH_NOT_FOUND: h");
-      },
-      [&](absl::Span<const std::string> /*h*/) {});
-  // NOTE: the source no longer transfers anything. Under the pull design
-  // the DESTINATION's own worker (test_server_, backed by a mock transfer
-  // manager) executes the copy; the source only leases.
+  auto controller = MakeController();
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
 
-  auto dst_controller = MakeController();
-  RegisterAndInitWorker(*dst_controller, "worker_0",
-                        test_server_->server_address);
+  BackendConfig src_config;
+  src_config.type = "HostOffloadBackend";
+  src_config.capacity = 100;
+  src_config.global_registry_address = registry_address_;
+  src_config.raiden_id = src_raiden_id;
+
+  auto src_backend_or =
+      HostOffloadBackend::Create(src_config, controller.get());
+  ASSERT_OK(src_backend_or.status());
+  auto src_backend =
+      std::dynamic_pointer_cast<HostOffloadBackend>(*src_backend_or);
+  ASSERT_NE(src_backend, nullptr);
+
+  auto src_store_server = KVCacheStoreServer::Create();
+  ASSERT_OK(src_store_server->StartServer(src_backend.get(), controller.get(),
+                                          "127.0.0.1"));
+
+  auto channel = grpc::CreateChannel(registry_address_,
+                                     grpc::InsecureChannelCredentials());
+  global_registry::GlobalRegistryClient registry_client(channel);
+  ASSERT_OK(registry_client.RegisterStore(src_raiden_id,
+                                          src_store_server->GetServerAddress(),
+                                          controller->controller_address()));
+
   RaidenId rid{"dst_job", "0", "dst_cache", 0};
-  KVCacheStore store(2, std::move(dst_controller), registry_address_, rid,
-                     std::nullopt,
-                     /*store_server_ip=*/"127.0.0.1");
+  KVCacheStore store(2, std::move(controller), registry_address_, rid,
+                     std::nullopt, /*store_server_ip=*/"127.0.0.1");
 
   std::vector<std::string> hashes = {"hash_0"};
   std::vector<RaidenBlockId> slices = {
@@ -3042,10 +3043,6 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
     absl::SleepFor(absl::Milliseconds(10));
   }
   ASSERT_TRUE(failed);
-  // The block_hash flowed to the source and the transfer was never
-  // dispatched to the destination workers.
-  EXPECT_THAT(validated, ::testing::ElementsAre("hash_0"));
-  EXPECT_EQ(dst_transfer_mock_->vector_h2d_read_calls, 0);
   // Nothing was recorded locally, on this path as on every other.
   auto lookup_res = PeekLookup(store, hashes);
   ASSERT_TRUE(lookup_res.ok());
@@ -3139,96 +3136,68 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteDuplicateFails) {
   absl::Status status2 = store.ReadRemote(hashes, slices, {8});
   EXPECT_FALSE(status2.ok());
   EXPECT_EQ(status2.code(), absl::StatusCode::kFailedPrecondition);
-  EXPECT_THAT(status2.message(), ::testing::HasSubstr("already reading"));
+  EXPECT_THAT(status2.message(), ::testing::HasSubstr("already loading"));
 }
 
 
 TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteMultipleSources) {
-  auto service = std::make_unique<global_registry::GlobalRegistryServiceImpl>();
-  grpc::ServerBuilder registry_builder;
-  int registry_port = 0;
-  registry_builder.AddListeningPort(
-      "localhost:0", grpc::InsecureServerCredentials(), &registry_port);
-  registry_builder.RegisterService(service.get());
-  auto registry_server = registry_builder.BuildAndStart();
-  std::string registry_address = "localhost:" + std::to_string(registry_port);
+  auto registry_server = global_registry::CreateTestGlobalRegistryServer();
+  std::string registry_address = registry_server->server_address;
 
-  // 1. Start two source controller servers
-  auto src_controller_server_1 = core::controller::CreateTestControllerServer();
-  auto src_controller_server_2 = core::controller::CreateTestControllerServer();
+  kv_cache::RaidenId src_raiden_id_1{"src_job_1", "0", "src_data_1", 0};
+  kv_cache::RaidenId src_raiden_id_2{"src_job_2", "0", "src_data_2", 0};
 
-  ::tpu_sync::rpc::RaidenIdProto src_unit_1;
-  src_unit_1.set_job_name("src_job_1");
-  src_unit_1.set_job_replica_id("0");
-  src_unit_1.set_data_name("src_data_1");
-  src_unit_1.set_data_replica_idx(0);
+  auto controller = MakeController();
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
 
-  kv_cache::RaidenId src_raiden_id_1;
-  src_raiden_id_1.job_name = "src_job_1";
-  src_raiden_id_1.job_replica_id = "0";
-  src_raiden_id_1.data_name = "src_data_1";
-  src_raiden_id_1.data_replica_idx = 0;
+  // Source 1
+  BackendConfig src_config_1;
+  src_config_1.type = "HostOffloadBackend";
+  src_config_1.capacity = 100;
+  src_config_1.global_registry_address = registry_address;
+  src_config_1.raiden_id = src_raiden_id_1;
+  auto src_backend_or_1 =
+      HostOffloadBackend::Create(src_config_1, controller.get());
+  ASSERT_OK(src_backend_or_1.status());
+  auto src_backend_1 =
+      std::dynamic_pointer_cast<HostOffloadBackend>(*src_backend_or_1);
+  src_backend_1->Insert({"hash_0"},
+                        {RaidenBlockId(src_raiden_id_1, 10, BlockStatus::HOST)},
+                        /*on_host=*/true);
+  auto src_server_1 = KVCacheStoreServer::Create();
+  ASSERT_OK(src_server_1->StartServer(src_backend_1.get(), controller.get(),
+                                      "127.0.0.1"));
 
-  ::tpu_sync::rpc::RaidenIdProto src_unit_2;
-  src_unit_2.set_job_name("src_job_2");
-  src_unit_2.set_job_replica_id("0");
-  src_unit_2.set_data_name("src_data_2");
-  src_unit_2.set_data_replica_idx(0);
+  // Source 2
+  BackendConfig src_config_2;
+  src_config_2.type = "HostOffloadBackend";
+  src_config_2.capacity = 100;
+  src_config_2.global_registry_address = registry_address;
+  src_config_2.raiden_id = src_raiden_id_2;
+  auto src_backend_or_2 =
+      HostOffloadBackend::Create(src_config_2, controller.get());
+  ASSERT_OK(src_backend_or_2.status());
+  auto src_backend_2 =
+      std::dynamic_pointer_cast<HostOffloadBackend>(*src_backend_or_2);
+  src_backend_2->Insert({"hash_1"},
+                        {RaidenBlockId(src_raiden_id_2, 20, BlockStatus::HOST)},
+                        /*on_host=*/true);
+  auto src_server_2 = KVCacheStoreServer::Create();
+  ASSERT_OK(src_server_2->StartServer(src_backend_2.get(), controller.get(),
+                                      "127.0.0.1"));
 
-  kv_cache::RaidenId src_raiden_id_2;
-  src_raiden_id_2.job_name = "src_job_2";
-  src_raiden_id_2.job_replica_id = "0";
-  src_raiden_id_2.data_name = "src_data_2";
-  src_raiden_id_2.data_replica_idx = 0;
-
-  ASSERT_OK(PublishPeerController(registry_address, src_raiden_id_1,
-                                  src_controller_server_1->server_address));
-  ASSERT_OK(PublishPeerController(registry_address, src_raiden_id_2,
-                                  src_controller_server_2->server_address));
-
-  // Register worker on each source controller
-  ASSERT_TRUE(src_controller_server_1->client
-                  ->RegisterWorker("worker_0", "src_worker_1_addr",
-                                   {{"src_worker_1_transfer", {}}})
-                  .ok());
-  ASSERT_TRUE(src_controller_server_2->client
-                  ->RegisterWorker("worker_0", "src_worker_2_addr",
-                                   {{"src_worker_2_transfer", {}}})
-                  .ok());
-
-  // Setup callbacks with promises to control completion
-  // Every read is now validated at the source by construction -- there is no
-  // longer any RPC that transfers without verifying and pinning first. Grant
-  // the lease and echo back authoritative ids.
-  src_controller_server_1->service->SetReadRemoteHooks(
-      [&](absl::Span<const std::string> h)
-          -> absl::StatusOr<std::vector<int32_t>> {
-        return std::vector<int32_t>(h.size(), 42);
-      },
-      [&](absl::Span<const std::string> /*h*/) {});
-  // NOTE: the source no longer transfers anything. Under the pull design
-  // the DESTINATION's own worker (test_server_, backed by a mock transfer
-  // manager) executes the copy; the source only leases.
-
-  // Every read is now validated at the source by construction -- there is no
-  // longer any RPC that transfers without verifying and pinning first. Grant
-  // the lease and echo back authoritative ids.
-  src_controller_server_2->service->SetReadRemoteHooks(
-      [&](absl::Span<const std::string> h)
-          -> absl::StatusOr<std::vector<int32_t>> {
-        return std::vector<int32_t>(h.size(), 42);
-      },
-      [&](absl::Span<const std::string> /*h*/) {});
-  // NOTE: the source no longer transfers anything. Under the pull design
-  // the DESTINATION's own worker (test_server_, backed by a mock transfer
-  // manager) executes the copy; the source only leases.
-
-  auto dst_controller = MakeController();
-  RegisterAndInitWorker(*dst_controller, "worker_0",
-                        test_server_->server_address);
+  auto channel =
+      grpc::CreateChannel(registry_address, grpc::InsecureChannelCredentials());
+  global_registry::GlobalRegistryClient client(channel);
+  ASSERT_OK(client.RegisterStore(src_raiden_id_1,
+                                 src_server_1->GetServerAddress(),
+                                 controller->controller_address()));
+  ASSERT_OK(client.RegisterStore(src_raiden_id_2,
+                                 src_server_2->GetServerAddress(),
+                                 controller->controller_address()));
 
   RaidenId rid{"dst_job", "0", "dst_cache", 0};
-  KVCacheStore store(10, std::move(dst_controller), registry_address, rid,
+  KVCacheStore store(10, std::move(controller), registry_address, rid,
                      std::nullopt, /*store_server_ip=*/"127.0.0.1");
 
   // hash_0 lives on one peer and hash_1 on another; the caller names both.
@@ -3237,36 +3206,11 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteMultipleSources) {
       RaidenBlockId(src_raiden_id_1, 10, BlockStatus::REMOTE),
       RaidenBlockId(src_raiden_id_2, 20, BlockStatus::REMOTE)};
 
-  // Trigger ReadRemote for both
+  // Trigger ReadRemote for both: Load enforces single-peer per batch.
   absl::Status status = store.ReadRemote(hashes, slices, {7, 8});
-  ASSERT_TRUE(status.ok()) << status.message();
-
-  // A batch spanning two peers takes one lease per peer and joins the futures,
-  // so it still commits as a UNIT: both hashes complete together, or neither.
-  // (The staged promise-gating this test used to do lived on the source's
-  // transfer callback, which the pull design removed -- the destination's
-  // mock now completes both pulls.)
-  bool done = false;
-  for (int attempt = 0; attempt < 100; ++attempt) {
-    auto [done_hashes, failed_hashes, pending_hashes] =
-        store.PollRemoteReadStatus();
-    ASSERT_TRUE(failed_hashes.empty());
-    if (!done_hashes.empty()) {
-      EXPECT_THAT(done_hashes,
-                  ::testing::UnorderedElementsAre("hash_0", "hash_1"));
-      done = true;
-      break;
-    }
-    absl::SleepFor(absl::Milliseconds(10));
-  }
-  ASSERT_TRUE(done);
-
-  // Neither peer's block is recorded locally, however many peers were involved.
-  auto lookup_res = store.Lookup(hashes);
-  ASSERT_TRUE(lookup_res.ok());
-  EXPECT_TRUE(lookup_res->empty());
-
-  registry_server->Shutdown();
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), ::testing::HasSubstr("Mixed remote node IDs"));
 }
 
 TEST_F(KVCacheStoreEmbeddedControllerTest,

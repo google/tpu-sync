@@ -38,6 +38,7 @@
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata_shm.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
@@ -660,15 +661,6 @@ class KVCacheStore {
     SaveOwner owner = SaveOwner::kApplication;
   };
 
-  // One owner's mailbox of settled remote writes. `existing` and
-  // `unregistered` annotate hashes that are also in `failed`.
-  struct RemoteWriteVerdicts {
-    std::vector<std::string> done;
-    std::vector<std::string> failed;
-    std::vector<std::string> existing;
-    std::vector<std::string> unregistered;
-  };
-
   // Lifetime fence ensuring background completion tasks can safely check
   // if the store is still alive.
   struct Lifetime {
@@ -686,19 +678,9 @@ class KVCacheStore {
   // Next OperationKey to hand out.
   OperationKey next_op_key_ ABSL_GUARDED_BY(mutex_) = 1;
 
-  // Per-owner verdict mailboxes: PollSaveStatus() drains the application's,
-  // DrainSweepVerdicts() the sweep's.
-  RemoteWriteVerdicts application_remote_writes_ ABSL_GUARDED_BY(mutex_);
-  RemoteWriteVerdicts sweep_remote_writes_ ABSL_GUARDED_BY(mutex_);
-
-  std::vector<std::string> done_saves_ ABSL_GUARDED_BY(mutex_);
-  std::vector<std::string> failed_saves_ ABSL_GUARDED_BY(mutex_);
-  std::vector<std::string> done_loads_ ABSL_GUARDED_BY(mutex_);
-  std::vector<std::string> failed_loads_ ABSL_GUARDED_BY(mutex_);
-  // In-flight saves of both kinds, in one set: a hash counts as already
-  // saving whichever kind is in flight.
-  absl::flat_hash_set<std::string> saving_hashes_ ABSL_GUARDED_BY(mutex_);
-  absl::flat_hash_set<std::string> loading_hashes_ ABSL_GUARDED_BY(mutex_);
+  BlockTracker save_tracker_;
+  BlockTracker load_tracker_;
+  BlockTracker sweep_tracker_;
   std::unique_ptr<std::thread> poller_thread_;
   std::atomic<bool> stop_poller_{false};
 
@@ -758,7 +740,7 @@ class KVCacheStore {
 
   // Drains the sweep's verdict mailbox, waiting up to one second for it to
   // be non-empty.
-  RemoteWriteVerdicts DrainSweepVerdicts();
+  BlockTracker::StatusResult DrainSweepVerdicts();
 
   void PollerLoop();
   void PollSavesInternal(std::vector<SaveState> ready_saves);

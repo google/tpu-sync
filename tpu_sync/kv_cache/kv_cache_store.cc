@@ -1085,23 +1085,18 @@ absl::Status KVCacheStore::SaveLocal(
         return absl::FailedPreconditionError(
             absl::StrCat("Block is not pinned: ", hash));
       }
-      if (saving_hashes_.contains(hash)) {
+      if (save_tracker_.IsPending(hash) || sweep_tracker_.IsPending(hash)) {
         return absl::FailedPreconditionError(
             absl::StrCat("Block is already saving: ", hash));
       }
       src_device_block_ids.push_back(existing.device_block_id);
     }
-    for (const auto& hash : block_hashes) {
-      saving_hashes_.insert(hash);
-    }
+    save_tracker_.AddPending(block_hashes);
   }
 
   auto host_blocks_or = AllocateBlockIds(block_hashes.size());
   if (!host_blocks_or.ok()) {
-    absl::MutexLock lock(mutex_);
-    for (const auto& hash : block_hashes) {
-      saving_hashes_.erase(hash);
-    }
+    save_tracker_.RemovePending(block_hashes);
     return host_blocks_or.status();
   }
   const auto& host_block_ids = host_blocks_or.value();
@@ -1174,7 +1169,7 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
         return absl::FailedPreconditionError(
             absl::StrCat("Block is not pinned: ", hash));
       }
-      if (loading_hashes_.contains(hash)) {
+      if (load_tracker_.IsPending(hash)) {
         return absl::FailedPreconditionError(
             absl::StrCat("Block is already loading: ", hash));
       }
@@ -1188,9 +1183,7 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
             absl::StrCat("Block host_block_id is -1: ", hash));
       }
     }
-    for (const auto& hash : block_hashes) {
-      loading_hashes_.insert(hash);
-    }
+    load_tracker_.AddPending(block_hashes);
   }
 
   tsl::Future<> future = backend()->Load(
@@ -1243,7 +1236,7 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
     for (size_t i = 0; i < slices.size(); ++i) {
       const auto& hash = block_hashes[i];
       const auto& existing = slices[i];
-      if (loading_hashes_.contains(hash)) {
+      if (load_tracker_.IsPending(hash)) {
         return absl::FailedPreconditionError(
             absl::StrCat("Block is already loading: ", hash));
       }
@@ -1276,9 +1269,7 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
         }
       }
     }
-    for (const auto& hash : block_hashes) {
-      loading_hashes_.insert(hash);
-    }
+    load_tracker_.AddPending(block_hashes);
   }
 
   tsl::Future<> future = backend()->Load(
@@ -1359,71 +1350,24 @@ absl::Status KVCacheStore::ReadRemote(
 }
 
 KVCacheStore::PollSaveStatusResult KVCacheStore::PollSaveStatus() {
-  // Drives pending local saves; remote verdicts arrive on their own calls
-  // and are only read from the mailbox here.
   PollFuturesInternal();
-  absl::MutexLock lock(mutex_);
-  std::vector<std::string> pending;
-  for (const auto& state : active_saves_) {
-    for (const auto& hash : state.block_hashes) {
-      pending.push_back(hash);
-    }
-  }
-  for (const auto& [key, state] : active_remote_writes_) {
-    // Report only the application's accepted offers as pending: the caller
-    // never gets a verdict for sweep operations, and an unaccepted offer
-    // (operation_id == 0) already reported its error synchronously.
-    if (state.owner != SaveOwner::kApplication || state.operation_id == 0) {
-      continue;
-    }
-    pending.insert(pending.end(), state.block_hashes.begin(),
-                   state.block_hashes.end());
-  }
-
-  std::vector<std::string> done = std::move(done_saves_);
-  std::vector<std::string> failed = std::move(failed_saves_);
-  done_saves_.clear();
-  failed_saves_.clear();
-  // Drain the application's mailbox only; a sweep verdict drained here would
-  // be lost and the sweep would wait for it forever.
-  RemoteWriteVerdicts remote;
-  remote.done.swap(application_remote_writes_.done);
-  remote.failed.swap(application_remote_writes_.failed);
-  remote.existing.swap(application_remote_writes_.existing);
-  remote.unregistered.swap(application_remote_writes_.unregistered);
-
-  done.insert(done.end(), remote.done.begin(), remote.done.end());
-  failed.insert(failed.end(), remote.failed.begin(), remote.failed.end());
-
-  std::vector<std::string> existing = std::move(remote.existing);
-  std::vector<std::string> unregistered = std::move(remote.unregistered);
-
+  BlockTracker::StatusResult status = save_tracker_.Poll();
   return PollSaveStatusResult{
-      .done = std::move(done),
-      .failed = std::move(failed),
-      .pending = std::move(pending),
-      .existing = std::move(existing),
-      .unregistered = std::move(unregistered),
+      .done = std::move(status.done),
+      .failed = std::move(status.failed),
+      .pending = std::move(status.pending),
+      .existing = std::move(status.existing),
+      .unregistered = std::move(status.unregistered),
   };
 }
 
 KVCacheStore::PollLoadStatusResult KVCacheStore::PollLoadStatus() {
   PollFuturesInternal();
-  absl::MutexLock lock(mutex_);
-  std::vector<std::string> pending;
-  for (const auto& state : active_loads_) {
-    for (const auto& hash : state.block_hashes) {
-      pending.push_back(hash);
-    }
-  }
-  std::vector<std::string> done = std::move(done_loads_);
-  std::vector<std::string> failed = std::move(failed_loads_);
-  done_loads_.clear();
-  failed_loads_.clear();
+  BlockTracker::StatusResult status = load_tracker_.Poll();
   return PollLoadStatusResult{
-      .done = std::move(done),
-      .failed = std::move(failed),
-      .pending = std::move(pending),
+      .done = std::move(status.done),
+      .failed = std::move(status.failed),
+      .pending = std::move(status.pending),
   };
 }
 
@@ -1653,26 +1597,9 @@ bool KVCacheStore::RepublishOnce() {
   return !republish_queue_.empty();
 }
 
-KVCacheStore::RemoteWriteVerdicts KVCacheStore::DrainSweepVerdicts() {
+BlockTracker::StatusResult KVCacheStore::DrainSweepVerdicts() {
   PollFuturesInternal();
-  absl::MutexLock lock(mutex_);
-  mutex_.AwaitWithTimeout(
-      absl::Condition(
-          +[](KVCacheStore* store) {
-            store->mutex_.AssertHeld();
-            return !store->sweep_remote_writes_.done.empty() ||
-                   !store->sweep_remote_writes_.failed.empty() ||
-                   !store->sweep_remote_writes_.existing.empty() ||
-                   !store->sweep_remote_writes_.unregistered.empty();
-          },
-          this),
-      absl::Seconds(1));
-  RemoteWriteVerdicts verdicts;
-  verdicts.done.swap(sweep_remote_writes_.done);
-  verdicts.failed.swap(sweep_remote_writes_.failed);
-  verdicts.existing.swap(sweep_remote_writes_.existing);
-  verdicts.unregistered.swap(sweep_remote_writes_.unregistered);
-  return verdicts;
+  return sweep_tracker_.Poll(absl::Seconds(1));
 }
 
 KVCacheStore::BatchWriteResult KVCacheStore::WaitForBatchWriteResult(
@@ -1683,7 +1610,7 @@ KVCacheStore::BatchWriteResult KVCacheStore::WaitForBatchWriteResult(
   absl::flat_hash_set<std::string> pending(batch.begin(), batch.end());
   BatchWriteResult result;
   while (!pending.empty()) {
-    const RemoteWriteVerdicts verdicts = DrainSweepVerdicts();
+    const BlockTracker::StatusResult verdicts = DrainSweepVerdicts();
     // Completed transfers: the peer holds these blocks now, and success
     // already consumed the sweep's pin.
     for (const std::string& hash : verdicts.done) {
@@ -1825,9 +1752,10 @@ absl::Status KVCacheStore::SaveRemote(
       backend->Release(pinned);
     }
     if (!marked.empty()) {
-      absl::MutexLock lock(mutex_);
-      for (const auto& hash : marked) {
-        saving_hashes_.erase(hash);
+      if (owner == SaveOwner::kApplication) {
+        save_tracker_.RemovePending(marked);
+      } else {
+        sweep_tracker_.RemovePending(marked);
       }
     }
   });
@@ -1857,10 +1785,15 @@ absl::Status KVCacheStore::SaveRemote(
         return absl::FailedPreconditionError(absl::StrCat(
             "Block is not pinned: ", absl::BytesToHexString(hash)));
       }
-      if (!saving_hashes_.insert(hash).second) {
+      if (save_tracker_.IsPending(hash) || sweep_tracker_.IsPending(hash)) {
         return absl::FailedPreconditionError(
             absl::StrCat("Block is already saving: ",
                          absl::BytesToHexString(hash)));
+      }
+      if (owner == SaveOwner::kApplication) {
+        save_tracker_.AddPending(hash);
+      } else {
+        sweep_tracker_.AddPending(hash);
       }
       marked.push_back(hash);
       src_host_block_ids.push_back(slice.host_block_id);
@@ -2029,9 +1962,10 @@ absl::Status KVCacheStore::SaveRemote(
     // UNAVAILABLE.
     if (auto taken = TakeRemoteWrite(op_key); taken.has_value()) {
       backend->Release(taken->block_hashes);
-      absl::MutexLock lock(mutex_);
-      for (const auto& hash : taken->block_hashes) {
-        saving_hashes_.erase(hash);
+      if (taken->owner == SaveOwner::kApplication) {
+        save_tracker_.RemovePending(taken->block_hashes);
+      } else {
+        sweep_tracker_.RemovePending(taken->block_hashes);
       }
     }
     return ack_or.status();
@@ -2107,20 +2041,22 @@ void KVCacheStore::OnWriteRemoteVerdict(RemoteWriteState state, bool succeeded,
       backend->Release(state.block_hashes);
     }
   }
-  absl::MutexLock lock(mutex_);
-  // Addressed to whoever asked for this save; see SaveOwner.
-  RemoteWriteVerdicts& verdicts = state.owner == SaveOwner::kSweep
-                                      ? sweep_remote_writes_
-                                      : application_remote_writes_;
-  for (const auto& hash : state.block_hashes) {
-    saving_hashes_.erase(hash);
-    (succeeded ? verdicts.done : verdicts.failed).push_back(hash);
+  BlockTracker verdict_tracker;
+  if (succeeded) {
+    verdict_tracker.MarkDone(state.block_hashes);
+  } else {
+    verdict_tracker.MarkFailed(state.block_hashes);
   }
-  for (auto& hash : existing) {
-    verdicts.existing.push_back(std::move(hash));
+  if (!existing.empty()) {
+    verdict_tracker.MarkExisting(existing);
   }
-  for (auto& hash : unregistered) {
-    verdicts.unregistered.push_back(std::move(hash));
+  if (!unregistered.empty()) {
+    verdict_tracker.MarkUnregistered(unregistered);
+  }
+  if (state.owner == SaveOwner::kApplication) {
+    save_tracker_.Merge(std::move(verdict_tracker));
+  } else {
+    sweep_tracker_.Merge(std::move(verdict_tracker));
   }
 }
 
@@ -2162,7 +2098,6 @@ void KVCacheStore::PollSavesInternal(std::vector<SaveState> ready_saves) {
               });
             }
           }
-          done_saves_.push_back(hash);
         }
         if (!update_hashes.empty()) {
           backend()->Insert(update_hashes, update_slices, /*on_host=*/true);
@@ -2170,6 +2105,7 @@ void KVCacheStore::PollSavesInternal(std::vector<SaveState> ready_saves) {
       } else {
         DeallocateBlockIds(state.host_block_ids);
       }
+      save_tracker_.MarkDone(state.block_hashes);
       if (!write_through_regs.empty() && registry_client_) {
         // The pin is spent in the callback, not here: released inline, the
         // entry could be evicted while the publish is in flight, and the
@@ -2233,12 +2169,7 @@ void KVCacheStore::PollSavesInternal(std::vector<SaveState> ready_saves) {
     } else {
       LOG(ERROR) << "Async Save failed: " << status.ToString();
       DeallocateBlockIds(state.host_block_ids);
-      for (const auto& hash : state.block_hashes) {
-        failed_saves_.push_back(hash);
-      }
-    }
-    for (const auto& hash : state.block_hashes) {
-      saving_hashes_.erase(hash);
+      save_tracker_.MarkFailed(state.block_hashes);
     }
   }
 }
@@ -2257,9 +2188,7 @@ void KVCacheStore::PollLoadsInternal(std::vector<LoadState> ready_loads) {
       // The consequence is deliberate: a later lookup() of the same hash is a
       // miss, and a repeat request re-fetches unless the caller's own block
       // manager remembers it already owns the device block.
-      for (const auto& hash : state.block_hashes) {
-        done_loads_.push_back(hash);
-      }
+      load_tracker_.MarkDone(state.block_hashes);
     } else if (status.ok()) {
       // Local source: the entry exists here by construction, so this lookup is
       // purely local -- no registry fallback, which would otherwise put a
@@ -2279,7 +2208,6 @@ void KVCacheStore::PollLoadsInternal(std::vector<LoadState> ready_loads) {
             update_hashes.push_back(hash);
             update_slices.push_back(block);
           }
-          done_loads_.push_back(hash);
         }
         if (!update_hashes.empty()) {
           backend()->Insert(update_hashes, update_slices, /*on_host=*/true);
@@ -2293,14 +2221,10 @@ void KVCacheStore::PollLoadsInternal(std::vector<LoadState> ready_loads) {
           backend()->Release(update_hashes);
         }
       }
+      load_tracker_.MarkDone(state.block_hashes);
     } else {
       LOG(ERROR) << "Async Load failed: " << status.ToString();
-      for (const auto& hash : state.block_hashes) {
-        failed_loads_.push_back(hash);
-      }
-    }
-    for (const auto& hash : state.block_hashes) {
-      loading_hashes_.erase(hash);
+      load_tracker_.MarkFailed(state.block_hashes);
     }
   }
 }

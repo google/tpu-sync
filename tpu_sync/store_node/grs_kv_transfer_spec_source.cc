@@ -18,11 +18,11 @@
 #include <cstdint>
 #include <string>
 
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
 #include "tpu_sync/store_node/kv_transfer_spec_source.h"
 namespace tpu_raiden {
@@ -35,7 +35,7 @@ GrsKVTransferSpecSource::GrsKVTransferSpecSource(
       kv_pool_group_(kv_pool_group) {}
 
 absl::StatusOr<KVTransferSpec> GrsKVTransferSpecSource::Get() {
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       const ::tpu_raiden::kv_cache::global_registry::KVTransferSpec proto,
       client_.GetKVTransferSpec(kv_pool_group_));
   KVTransferSpec spec;

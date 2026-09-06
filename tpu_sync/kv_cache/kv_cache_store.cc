@@ -34,6 +34,7 @@
 #include "absl/log/log.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/escaping.h"
 #include "absl/strings/numbers.h"
@@ -50,11 +51,9 @@
 #include "tpu_sync/core/buffer.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/host_memory_allocator.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/kv_cache/completion_executor.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
-#include "tpu_sync/kv_cache/completion_executor.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata_shm.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
@@ -185,7 +184,7 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
     return absl::InvalidArgumentError("backend_configs must not be empty");
   }
   // Before any resource is created (violation must not leak).
-  RETURN_IF_ERROR(ValidateConstructionRules(store_server_ip, num_shards));
+  ABSL_RETURN_IF_ERROR(ValidateConstructionRules(store_server_ip, num_shards));
 
   BackendConfig effective_config0 = backend_configs[0];
   if (!effective_config0.global_registry_address.empty() &&
@@ -236,7 +235,7 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
   RaidenId effective_raiden_id = effective_config0.raiden_id;
   std::unique_ptr<::tpu_raiden::controller::RaidenController> raiden_controller;
   if (num_shards > 0) {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         raiden_controller,
         MakeRaidenController(effective_raiden_id, effective_config0.capacity,
                              num_shards, shard_size_bytes, store_server_ip,
@@ -261,9 +260,9 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
       effective_config.raiden_id = raiden_id;
     }
 
-    ASSIGN_OR_RETURN(auto backend,
-                     KVCacheStoreBackendFactory::Instance().CreateBackend(
-                         effective_config, raiden_controller.get()));
+    ABSL_ASSIGN_OR_RETURN(auto backend,
+                          KVCacheStoreBackendFactory::Instance().CreateBackend(
+                              effective_config, raiden_controller.get()));
     // A custom registration may return OK with a null pointer; that would sail
     // past ValidateBackends for any tier but 0, and crash later.
     if (backend == nullptr) {
@@ -273,7 +272,7 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
     backends.push_back(std::move(backend));
   }
 
-  RETURN_IF_ERROR(ValidateBackends(backends));
+  ABSL_RETURN_IF_ERROR(ValidateBackends(backends));
 
   // The private constructor used here deliberately does no controller
   // wiring (the public ones do, and FATAL on failure) -- that would defeat
@@ -316,7 +315,7 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
   }
 
   if (store->raiden_controller_ != nullptr) {
-    RETURN_IF_ERROR(
+    ABSL_RETURN_IF_ERROR(
         store->SetRaidenController(store->raiden_controller_.get()));
     store->RegisterReadRemoteHooks();
     store->poller_thread_ =
@@ -362,7 +361,7 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
           "registering the KVTransferSpec requires a HostOffloadBackend at "
           "tier 0");
     }
-    RETURN_IF_ERROR(host_backend->RegisterKVTransferSpecFromWorkers());
+    ABSL_RETURN_IF_ERROR(host_backend->RegisterKVTransferSpecFromWorkers());
   }
 
   if (monitor_config.enable) {
@@ -448,13 +447,14 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::CreateReshardStore(
 
   // num_shards=1 gives the controller an initial partition; workers dynamically
   // register their actual shard assignments via WorkerService.
-  ASSIGN_OR_RETURN(auto store, KVCacheStore::Create(
-                                   cfg, /*capacity=*/1,
-                                   /*global_registry_address=*/"", raiden_id,
-                                   /*num_shards=*/1, /*shard_size_bytes=*/0,
-                                   store_server_ip, raiden_controller_port,
-                                   /*metadata=*/std::nullopt,
-                                   /*expected_worker_count=*/0));
+  ABSL_ASSIGN_OR_RETURN(
+      auto store,
+      KVCacheStore::Create(cfg, /*capacity=*/1,
+                           /*global_registry_address=*/"", raiden_id,
+                           /*num_shards=*/1, /*shard_size_bytes=*/0,
+                           store_server_ip, raiden_controller_port,
+                           /*metadata=*/std::nullopt,
+                           /*expected_worker_count=*/0));
 
   // Initialize ReshardService with WorkerDelivery::Mode::kController.
   reshard::ReshardService::Options reshard_opts;
@@ -464,7 +464,7 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::CreateReshardStore(
 
   store->reshard_service_ =
       std::make_unique<reshard::ReshardService>(reshard_opts);
-  RETURN_IF_ERROR(store->reshard_service_->StartServer());
+  ABSL_RETURN_IF_ERROR(store->reshard_service_->StartServer());
   return store;
 }
 
@@ -490,7 +490,7 @@ KVCacheStore::CreateReshardSidecar(int reshard_port,
   options.port = reshard_port;
   options.request_registry_ttl_s = request_registry_ttl_s;
   store->reshard_service_ = std::make_unique<reshard::ReshardService>(options);
-  RETURN_IF_ERROR(store->reshard_service_->StartServer());
+  ABSL_RETURN_IF_ERROR(store->reshard_service_->StartServer());
   return store;
 }
 

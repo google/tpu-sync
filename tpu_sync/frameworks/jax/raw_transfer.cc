@@ -30,10 +30,10 @@ namespace xla {
 class PjRtBuffer;
 class PjRtClient;
 }  // namespace xla
+#include "absl/status/status_macros.h"
 #include "xla/pjrt/status_casters.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/raw_transfer_impl.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/frameworks/jax/jax_utils.h"
 #ifndef WITHOUT_PYTHON
 #include <nanobind/nanobind.h>
@@ -148,7 +148,7 @@ inline absl::StatusOr<PjRtCopyFuture> transfer_d2h_batch_async_impl(
   std::vector<int64_t> c_sizes = jax::UnpackListToVector(copy_sizes_major_dim);
 
   for (size_t i = 0; i < n; ++i) {
-    ASSIGN_OR_RETURN(PjRtCopyFuture f,
+    ABSL_ASSIGN_OR_RETURN(PjRtCopyFuture f,
                           transfer_d2h_async_internal(
                               src_arrs[i], dst_arrs[i], s_offsets, d_offsets,
                               c_sizes, unsafe_skip_buffer_lock));
@@ -179,7 +179,7 @@ inline absl::StatusOr<PjRtCopyFuture> transfer_h2d_batch_async_impl(
   std::vector<int64_t> c_sizes = jax::UnpackListToVector(copy_sizes_major_dim);
 
   for (size_t i = 0; i < n; ++i) {
-    ASSIGN_OR_RETURN(PjRtCopyFuture f,
+    ABSL_ASSIGN_OR_RETURN(PjRtCopyFuture f,
                           transfer_h2d_async_internal(
                               src_arrs[i], dst_arrs[i], s_offsets, d_offsets,
                               c_sizes, unsafe_skip_buffer_lock));

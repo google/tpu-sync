@@ -57,7 +57,7 @@
 #ifndef IOV_MAX
 #define IOV_MAX 1024
 #endif
-#include "tpu_sync/core/status_macros.h"
+#include "absl/status/status_macros.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
@@ -228,9 +228,9 @@ RawBufferTransport::~RawBufferTransport() {
 
 absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
   char header_buf[kChunkHeaderSize];
-  RETURN_IF_ERROR(ReadExact(client_fd, header_buf, sizeof(header_buf)));
-  ASSIGN_OR_RETURN(const ChunkHeader header,
-                   DeserializeChunkHeader(header_buf));
+  ABSL_RETURN_IF_ERROR(ReadExact(client_fd, header_buf, sizeof(header_buf)));
+  ABSL_ASSIGN_OR_RETURN(const ChunkHeader header,
+                        DeserializeChunkHeader(header_buf));
 
   if ABSL_PREDICT_FALSE (header.op == kOpBufferPull) {  // peer pull request
     const uint32_t src_offset = header.remote_id;
@@ -245,7 +245,7 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
       return absl::InvalidArgumentError("Source out of bounds");
     }
     uint8_t* const src_ptr = base_host_ptr + src_offset;
-    RETURN_IF_ERROR(WriteExact(client_fd, src_ptr, size_bytes));
+    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, src_ptr, size_bytes));
     return absl::OkStatus();
 
   } else if (header.op == kOpBufferPush) {  // peer push request
@@ -261,10 +261,10 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
       return absl::InvalidArgumentError("Destination out of bounds");
     }
     uint8_t* const dest_ptr = base_host_ptr + dst_offset;
-    RETURN_IF_ERROR(ReadExact(client_fd, dest_ptr, size_bytes));
+    ABSL_RETURN_IF_ERROR(ReadExact(client_fd, dest_ptr, size_bytes));
 
     const uint8_t ack = 1;
-    RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
+    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
 
     bool trigger_h2d = false;
     std::vector<size_t> layers_to_trigger;
@@ -301,10 +301,10 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     }
 
     for (size_t l : layers_to_trigger) {
-      RETURN_IF_ERROR(raw_delegate_->OnLayerDataReceived(l, header.uuid));
+      ABSL_RETURN_IF_ERROR(raw_delegate_->OnLayerDataReceived(l, header.uuid));
     }
     if (trigger_h2d) {
-      RETURN_IF_ERROR(raw_delegate_->OnDataReceived(header.uuid));
+      ABSL_RETURN_IF_ERROR(raw_delegate_->OnDataReceived(header.uuid));
     }
 
     return absl::OkStatus();
@@ -317,13 +317,14 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     }
     const size_t m_size = GetChunkMetadataSize(header.version);
     std::vector<char> meta_buf(m_size * batch_size);
-    RETURN_IF_ERROR(ReadExact(client_fd, meta_buf.data(), meta_buf.size()));
+    ABSL_RETURN_IF_ERROR(
+        ReadExact(client_fd, meta_buf.data(), meta_buf.size()));
 
     std::vector<ChunkMetadata> metadata(batch_size);
     for (uint32_t i = 0; i < batch_size; ++i) {
       absl::Span<const char> item_bytes(meta_buf.data() + i * m_size, m_size);
-      ASSIGN_OR_RETURN(metadata[i],
-                       DeserializeChunkMetadata(item_bytes, header.version));
+      ABSL_ASSIGN_OR_RETURN(
+          metadata[i], DeserializeChunkMetadata(item_bytes, header.version));
     }
 
     std::vector<struct iovec> iovs;
@@ -351,11 +352,11 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     }
 
     if (total_bytes > 0) {
-      RETURN_IF_ERROR(ReadVExact(client_fd, iovs));
+      ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, iovs));
     }
 
     const uint8_t ack = 1;
-    RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
+    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
 
     bool trigger_h2d = false;
     std::vector<size_t> layers_to_trigger;
@@ -389,10 +390,10 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     }
 
     for (size_t l : layers_to_trigger) {
-      RETURN_IF_ERROR(raw_delegate_->OnLayerDataReceived(l, header.uuid));
+      ABSL_RETURN_IF_ERROR(raw_delegate_->OnLayerDataReceived(l, header.uuid));
     }
     if (trigger_h2d) {
-      RETURN_IF_ERROR(raw_delegate_->OnDataReceived(header.uuid));
+      ABSL_RETURN_IF_ERROR(raw_delegate_->OnDataReceived(header.uuid));
     }
 
     return absl::OkStatus();
@@ -516,10 +517,11 @@ absl::Status RawBufferTransport::PullBuffer(
 
   uint8_t* dest_ptr = raw_delegate_->GetHostPointer(buffer_id, dst_shard_idx) +
                       dst_offset_bytes;
-  ASSIGN_OR_RETURN(const Request req,
-                   BuildBufferRequest(buffer_id, src_shard_idx,
-                                      src_offset_bytes, dest_ptr, size_bytes,
-                                      /*uuid=*/0, kOpBufferPull));
+  ABSL_ASSIGN_OR_RETURN(
+      const Request req,
+      BuildBufferRequest(buffer_id, src_shard_idx, src_offset_bytes, dest_ptr,
+                         size_bytes,
+                         /*uuid=*/0, kOpBufferPull));
   return ProcessSocketBufferPull(peer, req);
 }
 
@@ -529,7 +531,7 @@ absl::Status RawBufferTransport::ProcessSocketBufferPull(
     return absl::InvalidArgumentError("Source peer address cannot be empty");
   }
 
-  ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
+  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup(
       [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
@@ -543,13 +545,13 @@ absl::Status RawBufferTransport::ProcessSocketBufferPull(
   header.count_or_size = static_cast<uint32_t>(request.len);
 
   const auto s_header = SerializeChunkHeader(header);
-  RETURN_IF_ERROR(WriteExact(fd, s_header.data(), s_header.size()));
+  ABSL_RETURN_IF_ERROR(WriteExact(fd, s_header.data(), s_header.size()));
 
   if (request.len > 0) {
     if (request.laddr == nullptr) {
       return absl::InvalidArgumentError("Destination host pointer is null");
     }
-    RETURN_IF_ERROR(ReadExact(fd, request.laddr, request.len));
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, request.laddr, request.len));
   }
 
   ok_to_pool = true;
@@ -578,7 +580,7 @@ absl::Status RawBufferTransport::RegisterExpectedChunks(
   }
 
   if (trigger_h2d) {
-    RETURN_IF_ERROR(raw_delegate_->OnDataReceived(uuid));
+    ABSL_RETURN_IF_ERROR(raw_delegate_->OnDataReceived(uuid));
   }
 
   return absl::OkStatus();
@@ -609,7 +611,7 @@ absl::Status RawBufferTransport::RegisterExpectedLayerChunks(
   }
 
   for (size_t layer_idx : layers_to_trigger) {
-    RETURN_IF_ERROR(raw_delegate_->OnLayerDataReceived(layer_idx, uuid));
+    ABSL_RETURN_IF_ERROR(raw_delegate_->OnLayerDataReceived(layer_idx, uuid));
   }
 
   return absl::OkStatus();
@@ -622,7 +624,7 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
         "Destination peer address cannot be empty");
   }
 
-  ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
+  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup(
       [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
@@ -657,10 +659,10 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
       iovec(const_cast<char*>(s_header.data()), s_header.size()),
       iovec(request.laddr, request.len),
   };
-  RETURN_IF_ERROR(WriteVExact(fd, iovs));
+  ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
 
   uint8_t ack = 0;
-  RETURN_IF_ERROR(ReadExact(fd, &ack, 1));
+  ABSL_RETURN_IF_ERROR(ReadExact(fd, &ack, 1));
   if (ack != 1) {
     return absl::InternalError("PushBuffer verification failed");
   }
@@ -696,10 +698,10 @@ absl::StatusOr<std::vector<Request>> BuildBufferRequests(
   std::vector<Request> requests;
   requests.reserve(tasks.size());
   for (const auto& task : tasks) {
-    ASSIGN_OR_RETURN(auto req,
-                     BuildBufferRequest(task.buffer_id, task.dst_shard_idx,
-                                        task.dst_offset_bytes, task.data_ptr,
-                                        task.size_bytes, uuid, socket_opcode));
+    ABSL_ASSIGN_OR_RETURN(
+        auto req, BuildBufferRequest(task.buffer_id, task.dst_shard_idx,
+                                     task.dst_offset_bytes, task.data_ptr,
+                                     task.size_bytes, uuid, socket_opcode));
     requests.push_back(std::move(req));
   }
   return requests;
@@ -773,7 +775,7 @@ absl::Status RawBufferTransport::PushBuffers(
   }
 
   auto push_batch = [&](const BatchInfo& batch) -> absl::Status {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         std::vector<Request> requests,
         BuildBufferRequests(absl::MakeConstSpan(grouped_tasks)
                                 .subspan(batch.start_idx, batch.count),
@@ -783,7 +785,7 @@ absl::Status RawBufferTransport::PushBuffers(
 
   if (parallelism <= 1 || batches.size() == 1) {
     for (const auto& batch : batches) {
-      RETURN_IF_ERROR(push_batch(batch));
+      ABSL_RETURN_IF_ERROR(push_batch(batch));
     }
     return absl::OkStatus();
   }
@@ -811,7 +813,7 @@ absl::Status RawBufferTransport::PushBuffers(
   counter.Wait();
 
   for (const auto& s : statuses) {
-    RETURN_IF_ERROR(s);
+    ABSL_RETURN_IF_ERROR(s);
   }
   return absl::OkStatus();
 }
@@ -826,7 +828,7 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
     return absl::OkStatus();
   }
 
-  ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
+  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup(
       [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
@@ -865,7 +867,7 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
       iovec(const_cast<char*>(s_header.data()), s_header.size()),
       iovec(s_metadata_buf.data(), s_metadata_buf.size()),
   };
-  RETURN_IF_ERROR(WriteVExact(fd, iovs));
+  ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
 
   if (coalesce_window_bytes_ > 0) {
     // Coalesced path: pack and write
@@ -882,7 +884,7 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
         pack_offset += req.len;
       }
     }
-    RETURN_IF_ERROR(WriteExact(fd, pack_buf.data(), total_bytes));
+    ABSL_RETURN_IF_ERROR(WriteExact(fd, pack_buf.data(), total_bytes));
   } else {
     // Uncoalesced path: gather write (writev) directly from requests.
     std::vector<struct iovec> iovs;
@@ -901,12 +903,12 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
       }
     }
     if (!iovs.empty()) {
-      RETURN_IF_ERROR(WriteVExact(fd, iovs));
+      ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
     }
   }
 
   uint8_t ack = 0;
-  RETURN_IF_ERROR(ReadExact(fd, &ack, 1));
+  ABSL_RETURN_IF_ERROR(ReadExact(fd, &ack, 1));
   if (ack != 1) {
     return absl::InternalError(
         "ProcessSocketBufferBatchPush verification failed");

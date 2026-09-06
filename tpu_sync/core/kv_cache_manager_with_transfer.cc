@@ -57,6 +57,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
@@ -72,7 +73,6 @@
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
@@ -2150,9 +2150,9 @@ absl::Status KVCacheManagerWithTransfer::InitializeSlotPool(int64_t num_slots) {
   all_slots_.clear();
   all_slots_.reserve(num_slots);
   for (int64_t i = 0; i < num_slots; ++i) {
-    ASSIGN_OR_RETURN(std::vector<int> allocated_ids,
-                     host_block_manager_->Allocate(max_blocks_,
-                                                   /*lock=*/true));
+    ABSL_ASSIGN_OR_RETURN(std::vector<int> allocated_ids,
+                          host_block_manager_->Allocate(max_blocks_,
+                                                        /*lock=*/true));
     if (allocated_ids.size() != max_blocks_) {
       return absl::InternalError(absl::StrCat(
           "Slot pool allocation returned incorrect number of blocks: ",

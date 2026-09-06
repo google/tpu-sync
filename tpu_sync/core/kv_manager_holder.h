@@ -25,13 +25,13 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
@@ -280,7 +280,8 @@ class KVManagerHolder {
     absl::StatusOr<raiden::PjRtCopyFuture> H2hRead(
         absl::string_view peer, const std::vector<int64_t>& src_offsets,
         const std::vector<int64_t>& dst_offsets) override {
-      ASSIGN_OR_RETURN(std::vector<int> src_ids, SafeCastOffsets(src_offsets));
+      ABSL_ASSIGN_OR_RETURN(std::vector<int> src_ids,
+                            SafeCastOffsets(src_offsets));
       // When the caller named its destination blocks, land the data THERE:
       // plain H2hRead auto-allocates destination blocks from the manager's
       // own accounting, which neither matches the ids the caller reserved
@@ -288,29 +289,33 @@ class KVManagerHolder {
       // already handed out.
       if constexpr (internal::has_peer_h2h_read_explicit_v<T>) {
         if (!dst_offsets.empty()) {
-          ASSIGN_OR_RETURN(std::vector<int> dst_ids,
-                           SafeCastOffsets(dst_offsets));
+          ABSL_ASSIGN_OR_RETURN(std::vector<int> dst_ids,
+                                SafeCastOffsets(dst_offsets));
           return impl_->H2hReadExplicit(std::string(peer), src_ids, dst_ids,
                                         /*explicit_dst_ptrs=*/{});
         }
       }
-      ASSIGN_OR_RETURN(auto res, impl_->H2hRead(std::string(peer), src_ids));
+      ABSL_ASSIGN_OR_RETURN(auto res,
+                            impl_->H2hRead(std::string(peer), src_ids));
       return res.second;
     }
     absl::StatusOr<raiden::PjRtCopyFuture> H2hWrite(
         absl::string_view peer, const std::vector<int64_t>& src_offsets,
         const std::vector<int64_t>& dst_offsets) override {
-      ASSIGN_OR_RETURN(std::vector<int> src_ids, SafeCastOffsets(src_offsets));
-      ASSIGN_OR_RETURN(std::vector<int> dst_ids, SafeCastOffsets(dst_offsets));
-      ASSIGN_OR_RETURN(auto res,
-                       impl_->H2hWrite(std::string(peer), src_ids, dst_ids));
+      ABSL_ASSIGN_OR_RETURN(std::vector<int> src_ids,
+                            SafeCastOffsets(src_offsets));
+      ABSL_ASSIGN_OR_RETURN(std::vector<int> dst_ids,
+                            SafeCastOffsets(dst_offsets));
+      ABSL_ASSIGN_OR_RETURN(
+          auto res, impl_->H2hWrite(std::string(peer), src_ids, dst_ids));
       return res.second;
     }
     absl::StatusOr<raiden::PjRtCopyFuture> H2hRead(
         const std::vector<RaidenTransferEndpoint>& remote_descriptors,
         const std::vector<int64_t>& src_offsets,
         const std::vector<int64_t>& dst_offsets) override {
-      ASSIGN_OR_RETURN(std::vector<int> src_ids, SafeCastOffsets(src_offsets));
+      ABSL_ASSIGN_OR_RETURN(std::vector<int> src_ids,
+                            SafeCastOffsets(src_offsets));
       // When the caller named its destination blocks, land the data THERE.
       // Plain H2hRead auto-allocates, which is fine for a fire-and-forget pull
       // but wrong for a store-level read: the store already reserved landing
@@ -318,28 +323,29 @@ class KVManagerHolder {
       // blocks would leave the directory pointing at the wrong memory.
       if constexpr (internal::has_vector_h2h_read_explicit_v<T>) {
         if (!dst_offsets.empty()) {
-          ASSIGN_OR_RETURN(std::vector<int> dst_ids,
-                           SafeCastOffsets(dst_offsets));
+          ABSL_ASSIGN_OR_RETURN(std::vector<int> dst_ids,
+                                SafeCastOffsets(dst_offsets));
           return impl_->H2hReadExplicit(remote_descriptors, src_ids, dst_ids);
         }
       } else if constexpr (internal::has_peer_h2h_read_explicit_v<T>) {
         // No descriptor-shaped explicit read; the peer-string one lands the
         // blocks just as precisely.
         if (!dst_offsets.empty() && !remote_descriptors.empty()) {
-          ASSIGN_OR_RETURN(std::vector<int> dst_ids,
-                           SafeCastOffsets(dst_offsets));
+          ABSL_ASSIGN_OR_RETURN(std::vector<int> dst_ids,
+                                SafeCastOffsets(dst_offsets));
           return impl_->H2hReadExplicit(remote_descriptors[0].endpoint,
                                         src_ids, dst_ids,
                                         /*explicit_dst_ptrs=*/{});
         }
       }
       if constexpr (internal::has_vector_h2h_read_v<T>) {
-        ASSIGN_OR_RETURN(auto res, impl_->H2hRead(remote_descriptors, src_ids));
+        ABSL_ASSIGN_OR_RETURN(auto res,
+                              impl_->H2hRead(remote_descriptors, src_ids));
         return res.second;
       } else {
         std::string peer =
             remote_descriptors.empty() ? "" : remote_descriptors[0].endpoint;
-        ASSIGN_OR_RETURN(auto res, impl_->H2hRead(peer, src_ids));
+        ABSL_ASSIGN_OR_RETURN(auto res, impl_->H2hRead(peer, src_ids));
         return res.second;
       }
     }
@@ -347,16 +353,19 @@ class KVManagerHolder {
         const std::vector<RaidenTransferEndpoint>& remote_descriptors,
         const std::vector<int64_t>& src_offsets,
         const std::vector<int64_t>& dst_offsets) override {
-      ASSIGN_OR_RETURN(std::vector<int> src_ids, SafeCastOffsets(src_offsets));
-      ASSIGN_OR_RETURN(std::vector<int> dst_ids, SafeCastOffsets(dst_offsets));
+      ABSL_ASSIGN_OR_RETURN(std::vector<int> src_ids,
+                            SafeCastOffsets(src_offsets));
+      ABSL_ASSIGN_OR_RETURN(std::vector<int> dst_ids,
+                            SafeCastOffsets(dst_offsets));
       if constexpr (internal::has_vector_h2h_write_v<T>) {
-        ASSIGN_OR_RETURN(auto res,
-                         impl_->H2hWrite(remote_descriptors, src_ids, dst_ids));
+        ABSL_ASSIGN_OR_RETURN(
+            auto res, impl_->H2hWrite(remote_descriptors, src_ids, dst_ids));
         return res.second;
       } else {
         std::string peer =
             remote_descriptors.empty() ? "" : remote_descriptors[0].endpoint;
-        ASSIGN_OR_RETURN(auto res, impl_->H2hWrite(peer, src_ids, dst_ids));
+        ABSL_ASSIGN_OR_RETURN(auto res,
+                              impl_->H2hWrite(peer, src_ids, dst_ids));
         return res.second;
       }
     }

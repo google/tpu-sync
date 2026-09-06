@@ -43,13 +43,13 @@
 #include "absl/log/absl_check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
@@ -181,7 +181,7 @@ absl::Status ForEachPayload(MajorOrder major_order,
       for (int l : layer_ids) {
         for (size_t sh = 0; sh < num_shards; ++sh) {
           for (size_t k = 0; k < num_blocks; ++k) {
-            RETURN_IF_ERROR(fn(l, sh, k));
+            ABSL_RETURN_IF_ERROR(fn(l, sh, k));
           }
         }
       }
@@ -190,7 +190,7 @@ absl::Status ForEachPayload(MajorOrder major_order,
       for (size_t k = 0; k < num_blocks; ++k) {
         for (int l : layer_ids) {
           for (size_t sh = 0; sh < num_shards; ++sh) {
-            RETURN_IF_ERROR(fn(l, sh, k));
+            ABSL_RETURN_IF_ERROR(fn(l, sh, k));
           }
         }
       }
@@ -257,7 +257,7 @@ absl::Status BlockTransport::HandleCustomRequest(
 
 absl::Status BlockTransport::HandleIncomingPush(
     int client_fd, const lib::ChunkHeader& header) {
-  ASSIGN_OR_RETURN(MajorOrder major_order, ParseMajorOrder(header.flags));
+  ABSL_ASSIGN_OR_RETURN(MajorOrder major_order, ParseMajorOrder(header.flags));
   std::vector<int> target_layers;
   if (header.local_id == 0xFFFFFFFF) {
     target_layers.resize(block_delegate_->num_block_arrays());
@@ -278,7 +278,7 @@ absl::Status BlockTransport::HandleIncomingPush(
   // header-declared (legacy) contract.
   std::optional<PoolPushProgressSpec> pool_progress_spec;
   for (int target_layer : target_layers) {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         std::optional<PoolPushProgressSpec> candidate,
         block_delegate_->GetPoolPushProgressSpec(target_layer, header.uuid));
     if (!candidate.has_value()) {
@@ -310,29 +310,30 @@ absl::Status BlockTransport::HandleIncomingPush(
 
   std::vector<int> src_block_ids;
   if (header.op == 1) {
-    ASSIGN_OR_RETURN(allocated_ids, block_delegate_->AllocateBlocks(
-                                        header.count_or_size, header.uuid));
+    ABSL_ASSIGN_OR_RETURN(
+        allocated_ids,
+        block_delegate_->AllocateBlocks(header.count_or_size, header.uuid));
     const std::vector<uint8_t> s_ids = lib::SerializeBlockIds(allocated_ids);
-    RETURN_IF_ERROR(WriteExact(client_fd, s_ids.data(), s_ids.size()));
+    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s_ids.data(), s_ids.size()));
   } else {
     std::vector<uint8_t> ids_buf(header.count_or_size * sizeof(uint32_t));
-    RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
+    ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
     allocated_ids = lib::DeserializeBlockIds(ids_buf);
 
-    RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
+    ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
     src_block_ids = lib::DeserializeBlockIds(ids_buf);
     uint8_t ack = 1;
-    RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
+    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
   }
 
   uint64_t total_received_bytes = 0;
-  RETURN_IF_ERROR(ForEachPayload(
+  ABSL_RETURN_IF_ERROR(ForEachPayload(
       major_order, target_layers, block_delegate_->num_shards(),
       header.count_or_size, [&](size_t l, size_t sh, size_t k) -> absl::Status {
         ABSL_DCHECK_LT(k, allocated_ids.size());
         const int dst_id = allocated_ids[k];
         uint8_t size_buf[lib::kChunkSizeFieldSize];
-        RETURN_IF_ERROR(ReadExact(client_fd, size_buf, sizeof(size_buf)));
+        ABSL_RETURN_IF_ERROR(ReadExact(client_fd, size_buf, sizeof(size_buf)));
         const uint32_t sender_size = lib::DeserializeChunkSize(size_buf);
 
         const int64_t block_id_val = dst_id;
@@ -350,7 +351,7 @@ absl::Status BlockTransport::HandleIncomingPush(
               absl::StrCat("No transfer chunks found for block ", dst_id,
                            " and uuid ", header.uuid));
         }
-        RETURN_IF_ERROR(ValidateChunks(block_delegate_, l, sh, chunks));
+        ABSL_RETURN_IF_ERROR(ValidateChunks(block_delegate_, l, sh, chunks));
 
         uint32_t expected_size = 0;
         for (const auto& chunk : chunks) {
@@ -371,7 +372,7 @@ absl::Status BlockTransport::HandleIncomingPush(
         }
 
         if (expected_size > 0) {
-          RETURN_IF_ERROR(ReadVExact(client_fd, ToIovec(chunks)));
+          ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, ToIovec(chunks)));
           total_received_bytes += expected_size;
         }
         return absl::OkStatus();
@@ -509,25 +510,25 @@ absl::Status BlockTransport::HandleIncomingPush(
 
   if (trigger_completion) {
     if (plan_declared) {
-      RETURN_IF_ERROR(block_delegate_->OnPoolReceived(l, header.uuid));
+      ABSL_RETURN_IF_ERROR(block_delegate_->OnPoolReceived(l, header.uuid));
     } else {
-      RETURN_IF_ERROR(block_delegate_->OnLayerReceived(l, header.uuid));
+      ABSL_RETURN_IF_ERROR(block_delegate_->OnLayerReceived(l, header.uuid));
     }
   }
 
   LOG(INFO) << "HandleCustomRequest (H2H read complete): client_fd="
             << client_fd << ", uuid=" << header.uuid
             << ", numa=" << block_delegate_->node_id();
-  RETURN_IF_ERROR(
+  ABSL_RETURN_IF_ERROR(
       block_delegate_->OnBlocksReceived(allocated_ids, header.uuid));
   uint8_t ack = 1;
-  RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
+  ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
   return absl::OkStatus();
 }
 
 absl::Status BlockTransport::HandleIncomingPull(
     int client_fd, const lib::ChunkHeader& header) {
-  ASSIGN_OR_RETURN(MajorOrder major_order, ParseMajorOrder(header.flags));
+  ABSL_ASSIGN_OR_RETURN(MajorOrder major_order, ParseMajorOrder(header.flags));
   if (block_delegate_->shard_factor() == 0) {
     return absl::InvalidArgumentError("shard_factor must be positive");
   }
@@ -543,7 +544,7 @@ absl::Status BlockTransport::HandleIncomingPull(
   resp_header.local_id = 0;
   resp_header.count_or_size = header.count_or_size;
   const auto s = lib::SerializeChunkHeader(resp_header);
-  RETURN_IF_ERROR(WriteExact(client_fd, s.data(), s.size()));
+  ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s.data(), s.size()));
 
   size_t local_blocks = header.count_or_size / block_delegate_->shard_factor();
   if (header.remote_id >
@@ -801,8 +802,8 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
     }
     allocated_ids = local_block_ids;
   } else {
-    ASSIGN_OR_RETURN(allocated_ids,
-                     block_delegate_->AllocateBlocks(local_blocks));
+    ABSL_ASSIGN_OR_RETURN(allocated_ids,
+                          block_delegate_->AllocateBlocks(local_blocks));
   }
 
   int P = parallelism;
@@ -811,12 +812,12 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
   }
   if (static_cast<int>(local_blocks) < P) P = local_blocks;
 
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       const auto requests,
       BuildBlockPullRequests(src_block_ids, allocated_ids, explicit_dst_ptrs,
                              major_order, uuid, P, on_block_received));
 
-  RETURN_IF_ERROR(transport_adapter_->Post(peers, requests).status());
+  ABSL_RETURN_IF_ERROR(transport_adapter_->Post(peers, requests).status());
   return allocated_ids;
 }
 
@@ -904,7 +905,7 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
                 absl::StrCat("No transfer chunks found for block ", src_id,
                              " and uuid ", uuid));
           }
-          RETURN_IF_ERROR(ValidateChunks(block_delegate_, l, sh, chunks));
+          ABSL_RETURN_IF_ERROR(ValidateChunks(block_delegate_, l, sh, chunks));
 
           const int shard_idx = static_cast<int>(sh);
           for (const auto& chunk : chunks) {
@@ -1011,7 +1012,7 @@ BlockTransport::BuildBlockPullRequests(
 
     std::vector<int> target_layers(block_delegate_->num_block_arrays());
     std::iota(target_layers.begin(), target_layers.end(), 0);
-    RETURN_IF_ERROR(ForEachPayload(
+    ABSL_RETURN_IF_ERROR(ForEachPayload(
         major_order, target_layers, block_delegate_->num_shards(),
         chunk.local_count, [&](size_t l, size_t sh, size_t k) -> absl::Status {
           ABSL_DCHECK_LT(local_block_offset + chunk.local_start_idx + k,
@@ -1033,7 +1034,8 @@ BlockTransport::BuildBlockPullRequests(
                 absl::StrCat("No transfer chunks found for block ", dst_id,
                              " and uuid ", uuid));
           }
-          RETURN_IF_ERROR(ValidateChunks(block_delegate_, l, sh, block_chunks));
+          ABSL_RETURN_IF_ERROR(
+              ValidateChunks(block_delegate_, l, sh, block_chunks));
 
           uint8_t* default_base = nullptr;
           uint8_t* explicit_base = nullptr;
@@ -1086,7 +1088,7 @@ absl::Status BlockTransport::PushBuffer(absl::string_view peer,
                                         size_t dst_offset_bytes,
                                         const uint8_t* data_ptr,
                                         size_t size_bytes, uint64_t uuid) {
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       const lib::Request req,
       lib::BuildBufferRequest(buffer_id, dst_shard_idx, dst_offset_bytes,
                               data_ptr, size_bytes, uuid, lib::kOpBufferPush));

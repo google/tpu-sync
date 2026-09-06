@@ -18,20 +18,33 @@
 
 def _header_only_cc_info_impl(ctx):
     compilation_contexts = [dep[CcInfo].compilation_context for dep in ctx.attr.deps]
+    if ctx.attr.defines:
+        defines_context = cc_common.create_compilation_context(
+            defines = depset(ctx.attr.defines),
+        )
+        compilation_contexts.append(defines_context)
+    if getattr(ctx.attr, "header_only", False):
+        linking_context = cc_common.create_linking_context(
+            linker_inputs = depset(),
+        )
+    else:
+        linking_context = cc_common.merge_linking_contexts(
+            linking_contexts = [dep[CcInfo].linking_context for dep in ctx.attr.deps],
+        )
     return [
         CcInfo(
             compilation_context = cc_common.merge_compilation_contexts(
                 compilation_contexts = compilation_contexts,
             ),
-            linking_context = cc_common.create_linking_context(
-                linker_inputs = depset(),
-            ),
+            linking_context = linking_context,
         ),
     ]
 
 header_only_cc_info = rule(
     attrs = {
         "deps": attr.label_list(),
+        "defines": attr.string_list(),
+        "header_only": attr.bool(default = False),
     },
     implementation = _header_only_cc_info_impl,
 )

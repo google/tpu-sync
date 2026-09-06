@@ -35,6 +35,7 @@
 #include "absl/log/log.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
@@ -54,7 +55,6 @@
 #include "tpu_sync/core/controller/worker_registry.h"
 #include "tpu_sync/core/controller/worker_service_client.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/proto/controller_service.grpc.pb.h"
 #include "tpu_sync/proto/controller_service.pb.h"
@@ -416,8 +416,8 @@ RaidenController::Allocate(int num_blocks) {
         "that Physical/BufferProto mode is unavailable when the controller "
         "was built with preprovision_worker_buffers=false");
   }
-  ASSIGN_OR_RETURN(std::vector<int> block_ids,
-                   block_manager_->Allocate(num_blocks, /*lock=*/true));
+  ABSL_ASSIGN_OR_RETURN(std::vector<int> block_ids,
+                        block_manager_->Allocate(num_blocks, /*lock=*/true));
   std::vector<::tpu_sync::proto::BufferProto> result;
   result.reserve(num_blocks);
   for (int block_id : block_ids) {
@@ -428,8 +428,8 @@ RaidenController::Allocate(int num_blocks) {
 
 absl::StatusOr<std::vector<Buffer>> RaidenController::AllocateBuffers(
     int num_blocks) {
-  ASSIGN_OR_RETURN(std::vector<::tpu_sync::proto::BufferProto> protos,
-                   Allocate(num_blocks));
+  ABSL_ASSIGN_OR_RETURN(std::vector<::tpu_sync::proto::BufferProto> protos,
+                        Allocate(num_blocks));
   std::vector<Buffer> buffers;
   buffers.reserve(protos.size());
   for (const auto& proto : protos) {

@@ -29,15 +29,15 @@
 #include <utility>
 
 #include "absl/log/log.h"
-#include "absl/strings/ascii.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/host_memory_allocator.h"
-#include "tpu_sync/core/status_macros.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 
 namespace tpu_raiden {
@@ -104,7 +104,7 @@ KVCacheMetadataShmRegion::AttachOrFormat(absl::string_view shm_key,
   // (the same discipline SharedMemoryHostMemoryAllocator applies to the KV
   // pool segments), so a concurrent opener cannot unlink a half-created
   // table as incompatible.
-  ASSIGN_OR_RETURN(ScopedShmLock lock, ScopedShmLock::Acquire(key));
+  ABSL_ASSIGN_OR_RETURN(ScopedShmLock lock, ScopedShmLock::Acquire(key));
 
   // Warm path: attach to a segment left behind by a previous incarnation and
   // validate the table it carries. Any incompatibility falls through to the

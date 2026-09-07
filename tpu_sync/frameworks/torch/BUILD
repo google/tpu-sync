@@ -78,7 +78,6 @@ cc_library(
         "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/core:status_macros",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
@@ -462,7 +461,6 @@ cc_library(
         "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/core:status_macros",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
@@ -488,10 +486,10 @@ cc_library(
     ],
     tags = ["nobuilder"],
     deps = [
+        ":torch_utils_mock",
         "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/core:status_macros",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
@@ -503,6 +501,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
+        "@torch_tpu//torch_tpu/csrc/eager:device_buffer",
     ],
 )
 

@@ -27,11 +27,13 @@
 #include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
-#include "absl/synchronization/mutex.h"
 #include "absl/strings/string_view.h"
-#include "tpu_sync/core/raw_transfer_core.h"
+#include "absl/synchronization/mutex.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/raiden_manager_base.h"
+#include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -122,17 +124,17 @@ TEST(KVCacheManagerTest, RegisterPoolsValidatesAgainstStorage) {
                              /*slice_byte_size=*/128, /*host_blocks=*/2);
 
   // Overlapping pools on one storage are allowed (aliased-raw pattern).
-  absl::Status status = manager.RegisterPools({
+  ABSL_ASSERT_OK(manager.RegisterPools({
       DensePool("kind_a", 0, 0, 128, 2),
       StridedPool("kind_b", 0, 0, 128, 2),
       DensePool("kind_a", 1, 64, 64, 3),
-  });
-  ASSERT_TRUE(status.ok()) << status.ToString();
+  }));
   EXPECT_TRUE(manager.has_explicit_pools());
   EXPECT_EQ(manager.num_pools(), 3);
 
   // storage_index out of range.
-  status = manager.RegisterPools({DensePool("kind_a", 5, 0, 128, 2)});
+  absl::Status status =
+      manager.RegisterPools({DensePool("kind_a", 5, 0, 128, 2)});
   EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
   EXPECT_THAT(status.message(), testing::HasSubstr("storage_index"));
 
@@ -147,8 +149,8 @@ TEST(KVCacheManagerTest, RegisterPoolsValidatesAgainstStorage) {
   device_backed.SetLayerPhysicalSizeForTest(/*layer_idx=*/0,
                                             /*physical_size=*/128,
                                             /*major_dim_size=*/1);
-  EXPECT_TRUE(
-      device_backed.RegisterPools({DensePool("kind_a", 0, 0, 128, 1)}).ok());
+  ABSL_EXPECT_OK(
+      device_backed.RegisterPools({DensePool("kind_a", 0, 0, 128, 1)}));
   status = device_backed.RegisterPools({DensePool("kind_a", 0, 0, 128, 2)});
   EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
   EXPECT_THAT(status.message(), testing::HasSubstr("exceeds storage bytes"));
@@ -158,32 +160,30 @@ TEST(KVCacheManagerTest, RegisterPoolsValidatesAgainstStorage) {
 TEST(KVCacheManagerTest, GetPoolBlockRefPointerMath) {
   TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
                              /*slice_byte_size=*/128, /*host_blocks=*/4);
-  ASSERT_TRUE(manager
-                  .RegisterPools({
-                      DensePool("kind_a", 0, 0, 128, 2),
-                      DensePool("kind_b", 0, 256, 64, 4),
-                  })
-                  .ok());
+  ABSL_ASSERT_OK(manager.RegisterPools({
+      DensePool("kind_a", 0, 0, 128, 2),
+      DensePool("kind_b", 0, 256, 64, 4),
+  }));
 
   uint8_t* base = manager.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
 
-  auto ref = manager.GetPoolBlockRef(/*pool_idx=*/0, /*shard_idx=*/0,
-                                     /*block_id=*/1);
-  ASSERT_TRUE(ref.ok()) << ref.status().ToString();
-  EXPECT_EQ(ref->ptr, base + 128);
-  EXPECT_EQ(ref->block_stride_bytes, 128);
-  EXPECT_EQ(ref->pool->tag, "kind_a");
-  EXPECT_EQ(ref->pool_idx, 0);
-  EXPECT_EQ(ref->block_id, 1);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto ref,
+      manager.GetPoolBlockRef(/*pool_idx=*/0, /*shard_idx=*/0, /*block_id=*/1));
+  EXPECT_EQ(ref.ptr, base + 128);
+  EXPECT_EQ(ref.block_stride_bytes, 128);
+  EXPECT_EQ(ref.pool->tag, "kind_a");
+  EXPECT_EQ(ref.pool_idx, 0);
+  EXPECT_EQ(ref.block_id, 1);
 
-  ref = manager.GetPoolBlockRef(/*pool_idx=*/1, /*shard_idx=*/0,
-                                /*block_id=*/0);
-  ASSERT_TRUE(ref.ok()) << ref.status().ToString();
-  EXPECT_EQ(ref->ptr, base + 256);
-  ref = manager.GetPoolBlockRef(/*pool_idx=*/1, /*shard_idx=*/0,
-                                /*block_id=*/3);
-  ASSERT_TRUE(ref.ok()) << ref.status().ToString();
-  EXPECT_EQ(ref->ptr, base + 256 + 3 * 64);
+  TF_ASSERT_OK_AND_ASSIGN(
+      ref,
+      manager.GetPoolBlockRef(/*pool_idx=*/1, /*shard_idx=*/0, /*block_id=*/0));
+  EXPECT_EQ(ref.ptr, base + 256);
+  TF_ASSERT_OK_AND_ASSIGN(
+      ref,
+      manager.GetPoolBlockRef(/*pool_idx=*/1, /*shard_idx=*/0, /*block_id=*/3));
+  EXPECT_EQ(ref.ptr, base + 256 + 3 * 64);
 
   EXPECT_EQ(manager.GetPoolBlockRef(0, 0, 2).status().code(),
             absl::StatusCode::kOutOfRange);
@@ -207,9 +207,7 @@ TEST(KVCacheManagerTest, RegisterPoolsGrowsDeviceBackedHostMirror) {
   manager.SetLayerPhysicalSizeForTest(/*layer_idx=*/0,
                                       /*physical_size=*/256,
                                       /*major_dim_size=*/1);
-  absl::Status status =
-      manager.RegisterPools({DensePool("kind_a", 0, 0, 64, 4)});
-  ASSERT_TRUE(status.ok()) << status.ToString();
+  ABSL_ASSERT_OK(manager.RegisterPools({DensePool("kind_a", 0, 0, 64, 4)}));
   EXPECT_GE(manager.GetHostSize(/*layer_idx=*/0, /*shard_idx=*/0), 256);
 
   uint8_t* grown = manager.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
@@ -217,10 +215,10 @@ TEST(KVCacheManagerTest, RegisterPoolsGrowsDeviceBackedHostMirror) {
   for (size_t i = 0; i < 64; ++i) {
     EXPECT_EQ(grown[i], static_cast<uint8_t>(i));
   }
-  auto last_ref = manager.GetPoolBlockRef(/*pool_idx=*/0, /*shard_idx=*/0,
-                                          /*block_id=*/3);
-  ASSERT_TRUE(last_ref.ok()) << last_ref.status().ToString();
-  EXPECT_EQ(last_ref->ptr, grown + 3 * 64);
+  TF_ASSERT_OK_AND_ASSIGN(auto last_ref, manager.GetPoolBlockRef(
+                                             /*pool_idx=*/0, /*shard_idx=*/0,
+                                             /*block_id=*/3));
+  EXPECT_EQ(last_ref.ptr, grown + 3 * 64);
 }
 
 // The pool table is frozen while plans are active.
@@ -231,11 +229,11 @@ TEST(KVCacheManagerTest, RegisterPoolsFailsAfterActivePlanRegistered) {
   request.set_uuid(445566);
   request.set_is_sender(true);
 
-  absl::Status status =
-      manager.RegisterActivePlan(445566, request, /*is_sender=*/true);
-  ASSERT_TRUE(status.ok()) << status.ToString();
+  ABSL_ASSERT_OK(
+      manager.RegisterActivePlan(445566, request, /*is_sender=*/true));
 
-  status = manager.RegisterPools({DensePool("kind_a", 0, 0, 128, 1)});
+  absl::Status status =
+      manager.RegisterPools({DensePool("kind_a", 0, 0, 128, 1)});
   EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_THAT(status.message(), testing::HasSubstr("active plans"));
 }
@@ -245,13 +243,11 @@ TEST(KVCacheManagerTest, PoolIndicesWithTag) {
                              /*slice_byte_size=*/128, /*host_blocks=*/2);
   PoolSpec pool_b = DensePool("kind_b", 1, 0, 128, 2);
   pool_b.dtype_tag = "dtype_b";
-  ASSERT_TRUE(manager
-                  .RegisterPools({
-                      DensePool("kind_a", 0, 0, 128, 2),
-                      pool_b,
-                      StridedPool("kind_a", 1, 0, 128, 2),
-                  })
-                  .ok());
+  ABSL_ASSERT_OK(manager.RegisterPools({
+      DensePool("kind_a", 0, 0, 128, 2),
+      pool_b,
+      StridedPool("kind_a", 1, 0, 128, 2),
+  }));
 
   EXPECT_THAT(manager.PoolIndicesWithTag("kind_a"), testing::ElementsAre(0, 2));
   EXPECT_THAT(manager.PoolIndicesWithTag("kind_b"), testing::ElementsAre(1));
@@ -263,13 +259,11 @@ TEST(KVCacheManagerTest, RegisterActivePlanChecksPoolDtypeTags) {
                              /*slice_byte_size=*/128, /*host_blocks=*/2);
   PoolSpec pool_b = DensePool("kind_b", 1, 0, 128, 2);
   pool_b.dtype_tag = "dtype_b";
-  ASSERT_TRUE(manager
-                  .RegisterPools({
-                      DensePool("kind_a", 0, 0, 128, 2),
-                      pool_b,
-                      StridedPool("kind_a", 1, 0, 128, 2),
-                  })
-                  .ok());
+  ABSL_ASSERT_OK(manager.RegisterPools({
+      DensePool("kind_a", 0, 0, 128, 2),
+      pool_b,
+      StridedPool("kind_a", 1, 0, 128, 2),
+  }));
 
   tpu_sync::rpc::StartTransferRequest request;
   request.set_uuid(777);
@@ -287,21 +281,18 @@ TEST(KVCacheManagerTest, RegisterActivePlanChecksPoolDtypeTags) {
   EXPECT_THAT(status.message(), testing::HasSubstr("dtype tag mismatch"));
 
   request.set_pool_dtype_tags(1, "dtype_b");
-  status = manager.RegisterActivePlan(777, request, /*is_sender=*/true);
-  ASSERT_TRUE(status.ok()) << status.ToString();
-  EXPECT_TRUE(manager.UnregisterActivePlan(777).ok());
+  ABSL_ASSERT_OK(manager.RegisterActivePlan(777, request, /*is_sender=*/true));
+  ABSL_EXPECT_OK(manager.UnregisterActivePlan(777));
 }
 
 TEST(KVCacheManagerTest, ExplicitPoolAddressingUsesPoolBaseAndStride) {
   TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
                              /*slice_byte_size=*/128, /*host_blocks=*/4);
-  ASSERT_TRUE(manager
-                  .RegisterPools({
-                      DensePool("kind_a", /*storage_index=*/1,
-                                /*base_offset=*/128, /*stride=*/64,
-                                /*num_blocks=*/4),
-                  })
-                  .ok());
+  ABSL_ASSERT_OK(manager.RegisterPools({
+      DensePool("kind_a", /*storage_index=*/1,
+                /*base_offset=*/128, /*stride=*/64,
+                /*num_blocks=*/4),
+  }));
 
   uint8_t* storage_base =
       manager.GetHostPointer(/*layer_idx=*/1, /*shard_idx=*/0);
@@ -333,32 +324,31 @@ TEST(KVCacheManagerTest,
       DensePool("kind_a", /*storage_index=*/1, /*base_offset=*/64,
                 /*stride=*/128, /*num_blocks=*/2),
   };
-  ASSERT_TRUE(sender.RegisterPools(pools).ok());
-  ASSERT_TRUE(receiver.RegisterPools(pools).ok());
+  ABSL_ASSERT_OK(sender.RegisterPools(pools));
+  ABSL_ASSERT_OK(receiver.RegisterPools(pools));
 
-  auto src_ref = sender.GetPoolBlockRef(/*pool_idx=*/0, /*shard_idx=*/0,
-                                        /*block_id=*/0);
-  auto dst_ref = receiver.GetPoolBlockRef(/*pool_idx=*/0, /*shard_idx=*/0,
-                                          /*block_id=*/1);
-  ASSERT_TRUE(src_ref.ok()) << src_ref.status().ToString();
-  ASSERT_TRUE(dst_ref.ok()) << dst_ref.status().ToString();
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto src_ref,
+      sender.GetPoolBlockRef(/*pool_idx=*/0, /*shard_idx=*/0, /*block_id=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(auto dst_ref, receiver.GetPoolBlockRef(
+                                            /*pool_idx=*/0, /*shard_idx=*/0,
+                                            /*block_id=*/1));
   std::vector<uint8_t> pattern(128);
   for (size_t i = 0; i < pattern.size(); ++i) {
     pattern[i] = static_cast<uint8_t>((i * 17 + 3) % 251);
   }
-  std::memcpy(src_ref->ptr, pattern.data(), pattern.size());
+  std::memcpy(src_ref.ptr, pattern.data(), pattern.size());
 
   const std::optional<int> receiver_port = receiver.local_port();
   ASSERT_TRUE(receiver_port.has_value());
   tpu_sync::rpc::StartTransferRequest dummy_plan;
-  ASSERT_TRUE(
-      receiver.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false).ok());
-  auto pushed = sender.H2hWriteDirect(
+  ABSL_ASSERT_OK(
+      receiver.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
+  ABSL_ASSERT_OK(sender.H2hWriteDirect(
       absl::StrCat(receiver.local_ip(), ":", *receiver_port),
       /*src_block_ids=*/{0}, /*dst_block_ids=*/{1}, /*uuid=*/0,
-      /*layer_idx=*/0);
-  ASSERT_TRUE(pushed.ok()) << pushed.status().ToString();
-  EXPECT_EQ(std::memcmp(dst_ref->ptr, pattern.data(), pattern.size()), 0);
+      /*layer_idx=*/0));
+  EXPECT_EQ(std::memcmp(dst_ref.ptr, pattern.data(), pattern.size()), 0);
 
   const uint8_t* receiver_storage0 =
       receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
@@ -395,8 +385,8 @@ TEST(KVCacheManagerTest,
       StridedPool("aliased", /*storage_index=*/0, /*base_offset=*/32,
                   /*stride=*/128, /*num_blocks=*/2),
   };
-  ASSERT_TRUE(sender.RegisterPools(pools).ok());
-  ASSERT_TRUE(receiver.RegisterPools(pools).ok());
+  ABSL_ASSERT_OK(sender.RegisterPools(pools));
+  ABSL_ASSERT_OK(receiver.RegisterPools(pools));
 
   uint8_t* src = sender.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
   uint8_t* dst = receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
@@ -409,22 +399,21 @@ TEST(KVCacheManagerTest,
 
   // The logical two-stride array would end at byte 288. Its last live byte is
   // exactly byte 256, so admission and the last block reference are valid.
-  auto last_ref = sender.GetPoolBlockRef(/*pool_idx=*/0, /*shard_idx=*/0,
-                                         /*block_id=*/1);
-  ASSERT_TRUE(last_ref.ok()) << last_ref.status().ToString();
-  EXPECT_EQ(last_ref->ptr, src + 160);
+  TF_ASSERT_OK_AND_ASSIGN(auto last_ref, sender.GetPoolBlockRef(
+                                             /*pool_idx=*/0, /*shard_idx=*/0,
+                                             /*block_id=*/1));
+  EXPECT_EQ(last_ref.ptr, src + 160);
   EXPECT_EQ(sender.GetBlockArrayHostSize(/*pool_idx=*/0, /*shard_idx=*/0), 224);
 
   const std::optional<int> receiver_port = receiver.local_port();
   ASSERT_TRUE(receiver_port.has_value());
   tpu_sync::rpc::StartTransferRequest dummy_plan;
-  ASSERT_TRUE(
-      receiver.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false).ok());
-  auto pushed = sender.H2hWriteDirect(
+  ABSL_ASSERT_OK(
+      receiver.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
+  ABSL_ASSERT_OK(sender.H2hWriteDirect(
       absl::StrCat(receiver.local_ip(), ":", *receiver_port),
       /*src_block_ids=*/{0}, /*dst_block_ids=*/{1}, /*uuid=*/0,
-      /*layer_idx=*/0);
-  ASSERT_TRUE(pushed.ok()) << pushed.status().ToString();
+      /*layer_idx=*/0));
   EXPECT_TRUE(std::all_of(dst + 160, dst + 192,
                           [](uint8_t value) { return value == 0x11; }));
   EXPECT_TRUE(std::all_of(dst + 192, dst + 224,
@@ -444,63 +433,60 @@ TEST(KVCacheManagerTest, ExplicitPoolTransportEnumeratesAllPools) {
       DensePool("kind_b", /*storage_index=*/0, /*base_offset=*/256,
                 /*stride=*/64, /*num_blocks=*/2),
   };
-  ASSERT_TRUE(sender.RegisterPools(pools).ok());
-  ASSERT_TRUE(receiver.RegisterPools(pools).ok());
+  ABSL_ASSERT_OK(sender.RegisterPools(pools));
+  ABSL_ASSERT_OK(receiver.RegisterPools(pools));
   ASSERT_EQ(sender.num_block_arrays(), 2);
   ASSERT_EQ(receiver.num_block_arrays(), 2);
 
-  auto sender_a = sender.GetPoolBlockRef(0, 0, 0);
-  auto sender_b = sender.GetPoolBlockRef(1, 0, 0);
-  auto receiver_a = receiver.GetPoolBlockRef(0, 0, 1);
-  auto receiver_b = receiver.GetPoolBlockRef(1, 0, 1);
-  ASSERT_TRUE(sender_a.ok() && sender_b.ok() && receiver_a.ok() &&
-              receiver_b.ok());
-  std::memset(sender_a->ptr, 0xA1, 64);
-  std::memset(sender_b->ptr, 0xB2, 64);
+  TF_ASSERT_OK_AND_ASSIGN(auto sender_a, sender.GetPoolBlockRef(0, 0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(auto sender_b, sender.GetPoolBlockRef(1, 0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(auto receiver_a, receiver.GetPoolBlockRef(0, 0, 1));
+  TF_ASSERT_OK_AND_ASSIGN(auto receiver_b, receiver.GetPoolBlockRef(1, 0, 1));
+  std::memset(sender_a.ptr, 0xA1, 64);
+  std::memset(sender_b.ptr, 0xB2, 64);
 
   const std::optional<int> receiver_port = receiver.local_port();
   ASSERT_TRUE(receiver_port.has_value());
   tpu_sync::rpc::StartTransferRequest dummy_plan;
-  ASSERT_TRUE(
-      receiver.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false).ok());
-  auto pushed = sender.H2hWriteDirect(
+  ABSL_ASSERT_OK(
+      receiver.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
+  ABSL_ASSERT_OK(sender.H2hWriteDirect(
       absl::StrCat(receiver.local_ip(), ":", *receiver_port),
       /*src_block_ids=*/{0}, /*dst_block_ids=*/{1}, /*uuid=*/0,
-      /*layer_idx=*/-1);
-  ASSERT_TRUE(pushed.ok()) << pushed.status().ToString();
-  EXPECT_TRUE(std::all_of(receiver_a->ptr, receiver_a->ptr + 64,
+      /*layer_idx=*/-1));
+  EXPECT_TRUE(std::all_of(receiver_a.ptr, receiver_a.ptr + 64,
                           [](uint8_t value) { return value == 0xA1; }));
-  EXPECT_TRUE(std::all_of(receiver_b->ptr, receiver_b->ptr + 64,
+  EXPECT_TRUE(std::all_of(receiver_b.ptr, receiver_b.ptr + 64,
                           [](uint8_t value) { return value == 0xB2; }));
 
-  auto receiver_a0 = receiver.GetPoolBlockRef(0, 0, 0);
-  auto receiver_b0 = receiver.GetPoolBlockRef(1, 0, 0);
-  ASSERT_TRUE(receiver_a0.ok() && receiver_b0.ok());
-  std::memset(receiver_a0->ptr, 0, 64);
-  std::memset(receiver_b0->ptr, 0, 64);
+  TF_ASSERT_OK_AND_ASSIGN(auto receiver_a0, receiver.GetPoolBlockRef(0, 0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(auto receiver_b0, receiver.GetPoolBlockRef(1, 0, 0));
+  std::memset(receiver_a0.ptr, 0, 64);
+  std::memset(receiver_b0.ptr, 0, 64);
   const std::optional<int> sender_port = sender.local_port();
   ASSERT_TRUE(sender_port.has_value());
-  auto pulled =
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pulled,
       receiver.H2hReadDirect(absl::StrCat(sender.local_ip(), ":", *sender_port),
-                             /*src_block_ids=*/{0});
-  ASSERT_TRUE(pulled.ok()) << pulled.status().ToString();
-  ASSERT_EQ(*pulled, std::vector<int>({0}));
-  EXPECT_TRUE(std::all_of(receiver_a0->ptr, receiver_a0->ptr + 64,
+                             /*src_block_ids=*/{0}));
+  ASSERT_EQ(pulled, std::vector<int>({0}));
+  EXPECT_TRUE(std::all_of(receiver_a0.ptr, receiver_a0.ptr + 64,
                           [](uint8_t value) { return value == 0xA1; }));
-  EXPECT_TRUE(std::all_of(receiver_b0->ptr, receiver_b0->ptr + 64,
+  EXPECT_TRUE(std::all_of(receiver_b0.ptr, receiver_b0.ptr + 64,
                           [](uint8_t value) { return value == 0xB2; }));
 
   std::vector<uint8_t> external_a(2 * 64, 0);
   std::vector<uint8_t> external_b(2 * 64, 0);
   std::vector<uint8_t*> explicit_pool_bases = {external_a.data(),
                                                external_b.data()};
-  auto explicit_pull = receiver.H2hReadExplicit(
-      absl::StrCat(sender.local_ip(), ":", *sender_port),
-      /*src_block_ids=*/{0}, /*local_block_ids=*/{1}, explicit_pool_bases,
-      /*parallelism=*/1, transport::MajorOrder::kLayerMajor,
-      /*on_block_received=*/nullptr);
-  ASSERT_TRUE(explicit_pull.ok()) << explicit_pull.status().ToString();
-  ASSERT_TRUE(explicit_pull->Await().ok());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto explicit_pull,
+      receiver.H2hReadExplicit(
+          absl::StrCat(sender.local_ip(), ":", *sender_port),
+          /*src_block_ids=*/{0}, /*local_block_ids=*/{1}, explicit_pool_bases,
+          /*parallelism=*/1, transport::MajorOrder::kLayerMajor,
+          /*on_block_received=*/nullptr));
+  ABSL_ASSERT_OK(explicit_pull.Await());
   EXPECT_TRUE(std::all_of(external_a.begin(), external_a.begin() + 64,
                           [](uint8_t value) { return value == 0; }));
   EXPECT_TRUE(std::all_of(external_a.begin() + 64, external_a.end(),
@@ -516,7 +502,7 @@ TEST(KVCacheManagerTest, PoolBlockCopiesRejectHostOnlyManager) {
                              /*slice_byte_size=*/64,
                              /*local_port=*/std::nullopt,
                              /*host_blocks_to_allocate=*/2);
-  ASSERT_TRUE(manager.RegisterPools({DensePool("kind_a", 0, 0, 64, 2)}).ok());
+  ABSL_ASSERT_OK(manager.RegisterPools({DensePool("kind_a", 0, 0, 64, 2)}));
 
   auto d2h = manager.D2hPoolBlocks(/*pool_idx=*/0, /*block_ids=*/{0});
   ASSERT_FALSE(d2h.ok());
@@ -545,12 +531,12 @@ TEST(KVCacheManagerTest, ImplicitPoolsMirrorStorages) {
   EXPECT_EQ(pool->block_stride_bytes, 128);
   EXPECT_EQ(pool->num_blocks, 2);
 
-  auto ref = manager.GetPoolBlockRef(/*pool_idx=*/1, /*shard_idx=*/0,
-                                     /*block_id=*/1);
-  ASSERT_TRUE(ref.ok()) << ref.status().ToString();
-  EXPECT_EQ(ref->ptr, manager.GetHostPointer(/*layer_idx=*/1,
-                                             /*shard_idx=*/0) +
-                          128);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto ref, manager.GetPoolBlockRef(/*pool_idx=*/1, /*shard_idx=*/0,
+                                        /*block_id=*/1));
+  EXPECT_EQ(ref.ptr, manager.GetHostPointer(/*layer_idx=*/1,
+                                            /*shard_idx=*/0) +
+                         128);
 }
 
 TEST(KVCacheManagerTest, UnregisterActivePlanAllowsUuidReuse) {
@@ -563,17 +549,16 @@ TEST(KVCacheManagerTest, UnregisterActivePlanAllowsUuidReuse) {
   absl::Status status = manager.UnregisterActivePlan(112233);
   EXPECT_EQ(status.code(), absl::StatusCode::kNotFound);
 
-  status = manager.RegisterActivePlan(112233, request, /*is_sender=*/true);
-  EXPECT_TRUE(status.ok()) << status.ToString();
+  ABSL_EXPECT_OK(
+      manager.RegisterActivePlan(112233, request, /*is_sender=*/true));
 
   status = manager.RegisterActivePlan(112233, request, /*is_sender=*/true);
   EXPECT_EQ(status.code(), absl::StatusCode::kAlreadyExists);
 
-  status = manager.UnregisterActivePlan(112233);
-  EXPECT_TRUE(status.ok()) << status.ToString();
+  ABSL_EXPECT_OK(manager.UnregisterActivePlan(112233));
 
-  status = manager.RegisterActivePlan(112233, request, /*is_sender=*/true);
-  EXPECT_TRUE(status.ok()) << status.ToString();
+  ABSL_EXPECT_OK(
+      manager.RegisterActivePlan(112233, request, /*is_sender=*/true));
 }
 
 TEST(KVCacheManagerTest, D2hFailsWithMismatchedCopySpecLengths) {
@@ -685,14 +670,13 @@ TEST(KVCacheManagerTest, AsymmetricBlockSizesGetBlockChunks) {
   entry->set_dst_block_id(0);
 
   // Register active plan on both sides
-  absl::Status status =
-      sender.RegisterActivePlan(112233, request, /*is_sender=*/true);
-  ASSERT_TRUE(status.ok()) << status.ToString();
+  ABSL_ASSERT_OK(
+      sender.RegisterActivePlan(112233, request, /*is_sender=*/true));
 
   // Receiver schedule should be the same request but marked as is_sender=false
   request.set_is_sender(false);
-  status = receiver.RegisterActivePlan(112233, request, /*is_sender=*/false);
-  ASSERT_TRUE(status.ok()) << status.ToString();
+  ABSL_ASSERT_OK(
+      receiver.RegisterActivePlan(112233, request, /*is_sender=*/false));
 
   // 3. Resolve chunks on Sender (should return offset 64 from block 0 base)
   std::vector<int64_t> src_block_ids = {0};
@@ -836,9 +820,9 @@ TEST(KVCacheManagerTest, D2hWriteSuccessWithMockD2h) {
   std::vector<int64_t> dst_host_offsets = {1};  // remote destination
   std::vector<int64_t> copy_sizes = {1};
 
-  auto res = sender.D2hWrite(receiver_peer, src_device_offsets,
-                             src_host_offsets, dst_host_offsets, copy_sizes);
-  ASSERT_TRUE(res.ok()) << res.status().ToString();
+  ABSL_ASSERT_OK(sender.D2hWrite(receiver_peer, src_device_offsets,
+                                 src_host_offsets, dst_host_offsets,
+                                 copy_sizes));
   EXPECT_TRUE(sender.d2h_called_);
   EXPECT_EQ(sender.last_src_offsets_, src_device_offsets);
   // The D2H stage lands in the EXPLICIT local staging blocks, not in a local
@@ -873,10 +857,11 @@ TEST(KVCacheManagerTest, D2hWritePipelinedSuccess) {
   std::vector<int64_t> dst_host_offsets = {0, 1};  // remote destination
   std::vector<int64_t> copy_sizes = {1, 1};
 
-  auto res = sender.D2hWrite(receiver_peer, src_device_offsets,
-                             src_host_offsets, dst_host_offsets, copy_sizes);
-  ASSERT_TRUE(res.ok()) << res.status().ToString();
-  EXPECT_TRUE(res->Await().ok());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto res,
+      sender.D2hWrite(receiver_peer, src_device_offsets, src_host_offsets,
+                      dst_host_offsets, copy_sizes));
+  ABSL_EXPECT_OK(res.Await());
 
   EXPECT_TRUE(sender.dispatch_d2h_chunks_called_);
   EXPECT_EQ(sender.dispatched_src_offsets_.size(), 2);
@@ -909,17 +894,17 @@ TEST(KVCacheManagerTest, H2dReadSuccess) {
   std::memset(receiver_buf, 0, 256);
 
   // Test empty src_offsets returns OK empty future
-  auto empty_res = receiver.H2dRead(sender_peer, {}, {}, {}, {});
-  ASSERT_TRUE(empty_res.ok()) << empty_res.status().ToString();
-  EXPECT_TRUE(empty_res->Await().ok());
+  TF_ASSERT_OK_AND_ASSIGN(auto empty_res,
+                          receiver.H2dRead(sender_peer, {}, {}, {}, {}));
+  ABSL_EXPECT_OK(empty_res.Await());
 
   // Test H2dRead reading sender block 0 via local staging block 0 into
   // receiver device block 0.
-  auto res = receiver.H2dRead(sender_peer, /*src_host=*/{0},
-                              /*dst_host(staging)=*/{0}, /*dst_device=*/{0},
-                              /*copy_sizes=*/{1});
-  ASSERT_TRUE(res.ok()) << res.status().ToString();
-  EXPECT_TRUE(res->Await().ok());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto res, receiver.H2dRead(sender_peer, /*src_host=*/{0},
+                                 /*dst_host(staging)=*/{0}, /*dst_device=*/{0},
+                                 /*copy_sizes=*/{1}));
+  ABSL_EXPECT_OK(res.Await());
 
   EXPECT_TRUE(std::all_of(receiver_buf, receiver_buf + 128,
                           [](uint8_t v) { return v == 0xEF; }));
@@ -950,10 +935,11 @@ TEST(KVCacheManagerTest, H2dReadPipelinedSuccess) {
   std::vector<int64_t> dst_device_offsets = {0, 1};
   std::vector<int64_t> copy_sizes = {1, 1};
 
-  auto res = receiver.H2dRead(sender_peer, src_host_offsets, dst_host_offsets,
-                              dst_device_offsets, copy_sizes);
-  ASSERT_TRUE(res.ok()) << res.status().ToString();
-  EXPECT_TRUE(res->Await().ok());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto res,
+      receiver.H2dRead(sender_peer, src_host_offsets, dst_host_offsets,
+                       dst_device_offsets, copy_sizes));
+  ABSL_EXPECT_OK(res.Await());
 
   EXPECT_TRUE(std::all_of(receiver_buf, receiver_buf + 128,
                           [](uint8_t v) { return v == 0x55; }));
@@ -975,11 +961,11 @@ TEST(KVCacheManagerTest, H2dReadCallsH2dForTpuHbmDestination) {
   ASSERT_NE(sender_buf, nullptr);
   std::memset(sender_buf, 0x77, 128);
 
-  auto res = receiver.H2dRead(sender_peer, /*src_host=*/{0},
-                              /*dst_host(staging)=*/{0}, /*dst_device=*/{1},
-                              /*copy_sizes=*/{1});
-  ASSERT_TRUE(res.ok()) << res.status().ToString();
-  EXPECT_TRUE(res->Await().ok());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto res, receiver.H2dRead(sender_peer, /*src_host=*/{0},
+                                 /*dst_host(staging)=*/{0}, /*dst_device=*/{1},
+                                 /*copy_sizes=*/{1}));
+  ABSL_EXPECT_OK(res.Await());
 
   // H2dRead MUST trigger Stage 2 H2d DMA from the explicit staging block {0}
   // into TPU HBM destination offset {1}.
@@ -1014,10 +1000,11 @@ TEST(KVCacheManagerTest, H2dWriteSuccess) {
   std::vector<int64_t> dst_device_offsets = {0};
   std::vector<int64_t> copy_sizes = {1};
 
-  auto res = sender.H2dWrite(receiver_peer, src_host_offsets, dst_host_offsets,
-                             dst_device_offsets, copy_sizes);
-  ASSERT_TRUE(res.ok()) << res.status().ToString();
-  EXPECT_TRUE(res->Await().ok());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto res,
+      sender.H2dWrite(receiver_peer, src_host_offsets, dst_host_offsets,
+                      dst_device_offsets, copy_sizes));
+  ABSL_EXPECT_OK(res.Await());
 
   EXPECT_TRUE(std::all_of(receiver_buf, receiver_buf + 128,
                           [](uint8_t v) { return v == 0; }));
@@ -1051,10 +1038,11 @@ TEST(KVCacheManagerTest, H2dWritePipelinedSuccess) {
   std::vector<int64_t> dst_device_offsets = {0, 1};
   std::vector<int64_t> copy_sizes = {1, 1};
 
-  auto res = sender.H2dWrite(receiver_peer, src_host_offsets, dst_host_offsets,
-                             dst_device_offsets, copy_sizes);
-  ASSERT_TRUE(res.ok()) << res.status().ToString();
-  EXPECT_TRUE(res->Await().ok());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto res,
+      sender.H2dWrite(receiver_peer, src_host_offsets, dst_host_offsets,
+                      dst_device_offsets, copy_sizes));
+  ABSL_EXPECT_OK(res.Await());
 
   EXPECT_TRUE(std::all_of(receiver_buf, receiver_buf + 128,
                           [](uint8_t v) { return v == 0x33; }));
@@ -1088,11 +1076,11 @@ TEST(KVCacheManagerTest, H2dReadExplicitStagingDoesNotClobberAliasedBlock) {
   std::memset(receiver_buf, 0x99, 128);
   std::memset(receiver_buf + 128, 0, 128);
 
-  auto res = receiver.H2dRead(sender_peer, /*src_host=*/{0},
-                              /*dst_host(staging)=*/{1}, /*dst_device=*/{0},
-                              /*copy_sizes=*/{1});
-  ASSERT_TRUE(res.ok()) << res.status().ToString();
-  EXPECT_TRUE(res->Await().ok());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto res, receiver.H2dRead(sender_peer, /*src_host=*/{0},
+                                 /*dst_host(staging)=*/{1}, /*dst_device=*/{0},
+                                 /*copy_sizes=*/{1}));
+  ABSL_EXPECT_OK(res.Await());
 
   // Data staged into the explicit staging block 1.
   EXPECT_TRUE(std::all_of(receiver_buf + 128, receiver_buf + 256,
@@ -1131,11 +1119,11 @@ TEST(KVCacheManagerTest, D2hWriteExplicitStagingIsPushedNotAliasedBlock) {
   std::memset(sender_buf + 128, 0x99, 128);
   std::memset(receiver_buf, 0, 256);
 
-  auto res = sender.D2hWrite(receiver_peer, /*src_device=*/{0},
-                             /*src_host(staging)=*/{0}, /*dst_host=*/{1},
-                             /*copy_sizes=*/{1});
-  ASSERT_TRUE(res.ok()) << res.status().ToString();
-  EXPECT_TRUE(res->Await().ok());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto res, sender.D2hWrite(receiver_peer, /*src_device=*/{0},
+                                /*src_host(staging)=*/{0}, /*dst_host=*/{1},
+                                /*copy_sizes=*/{1}));
+  ABSL_EXPECT_OK(res.Await());
 
   // The peer received the STAGING block's payload, not the sentinel from the
   // sender's local block 1 (the would-be alias of the remote dst id).
@@ -1215,17 +1203,14 @@ TEST(KVCacheManagerTest, BackgroundWorkerThreadExecutesInFifoOrder) {
                                        /*slice_byte_size=*/128,
                                        /*host_blocks=*/2);
   // Queue H2D, D2H, H2D sequentially
-  auto f1 = manager.H2d({0}, {0}, {1});
-  auto f2 = manager.D2h({0}, {0}, {1});
-  auto f3 = manager.H2d({0}, {0}, {1});
-  ASSERT_TRUE(f1.ok());
-  ASSERT_TRUE(f2.ok());
-  ASSERT_TRUE(f3.ok());
+  TF_ASSERT_OK_AND_ASSIGN(auto f1, manager.H2d({0}, {0}, {1}));
+  TF_ASSERT_OK_AND_ASSIGN(auto f2, manager.D2h({0}, {0}, {1}));
+  TF_ASSERT_OK_AND_ASSIGN(auto f3, manager.H2d({0}, {0}, {1}));
 
   // Await all futures
-  EXPECT_TRUE(f1->Await().ok());
-  EXPECT_TRUE(f2->Await().ok());
-  EXPECT_TRUE(f3->Await().ok());
+  ABSL_EXPECT_OK(f1.Await());
+  ABSL_EXPECT_OK(f2.Await());
+  ABSL_EXPECT_OK(f3.Await());
 
   absl::MutexLock lock(manager.mu_);
   EXPECT_EQ(manager.h2d_count_, 2);
@@ -1242,8 +1227,7 @@ TEST(KVCacheManagerTest, BackgroundWorkerThreadDisabledByDefault) {
   TestBackgroundKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
                                        /*slice_byte_size=*/128,
                                        /*host_blocks=*/2);
-  auto f1 = manager.H2d({0}, {0}, {1});
-  ASSERT_TRUE(f1.ok());
+  ABSL_ASSERT_OK(manager.H2d({0}, {0}, {1}));
   absl::MutexLock lock(manager.mu_);
   EXPECT_EQ(manager.h2d_count_, 1);
 }
@@ -1270,13 +1254,13 @@ TEST(KVCacheManagerTest, TelemetryMetricsObservedWhenEnabled) {
   std::vector<int64_t> offsets = {0};
   std::vector<int64_t> sizes = {1};
 
-  ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture h2d_res,
-                       manager.H2d(offsets, offsets, sizes));
-  EXPECT_OK(h2d_res.Await());
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture h2d_res,
+                          manager.H2d(offsets, offsets, sizes));
+  ABSL_EXPECT_OK(h2d_res.Await());
 
-  ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture d2h_res,
-                       manager.D2h(offsets, offsets, sizes));
-  EXPECT_OK(d2h_res.Await());
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture d2h_res,
+                          manager.D2h(offsets, offsets, sizes));
+  ABSL_EXPECT_OK(d2h_res.Await());
 }
 
 TEST(KVCacheManagerTest, TelemetryMetricsSkippedWhenDisabled) {
@@ -1290,13 +1274,13 @@ TEST(KVCacheManagerTest, TelemetryMetricsSkippedWhenDisabled) {
   std::vector<int64_t> offsets = {0};
   std::vector<int64_t> sizes = {1};
 
-  ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture h2d_res,
-                       manager.H2d(offsets, offsets, sizes));
-  EXPECT_OK(h2d_res.Await());
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture h2d_res,
+                          manager.H2d(offsets, offsets, sizes));
+  ABSL_EXPECT_OK(h2d_res.Await());
 
-  ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture d2h_res,
-                       manager.D2h(offsets, offsets, sizes));
-  EXPECT_OK(d2h_res.Await());
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture d2h_res,
+                          manager.D2h(offsets, offsets, sizes));
+  ABSL_EXPECT_OK(d2h_res.Await());
 }
 
 TEST(KVCacheManagerTest, D2hWritePipelinedTelemetryBatchObservation) {
@@ -1327,11 +1311,11 @@ TEST(KVCacheManagerTest, D2hWritePipelinedTelemetryBatchObservation) {
   std::vector<int64_t> dst_host_offsets = {0, 1};
   std::vector<int64_t> copy_sizes = {1, 1};
 
-  ASSERT_OK_AND_ASSIGN(
+  TF_ASSERT_OK_AND_ASSIGN(
       raiden::PjRtCopyFuture res,
       sender.D2hWrite(receiver_peer, src_device_offsets, src_host_offsets,
                       dst_host_offsets, copy_sizes));
-  EXPECT_OK(res.Await());
+  ABSL_EXPECT_OK(res.Await());
 }
 
 TEST(KVCacheManagerTest, BufferAllocatedHostDramTelemetry) {
@@ -1383,10 +1367,9 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
   manager.SetLayerPhysicalSizeForTest(/*layer_idx=*/0,
                                       /*physical_size=*/1024,
                                       /*major_dim_size=*/1);
-  absl::Status status = manager.RegisterPools(
+  ABSL_ASSERT_OK(manager.RegisterPools(
       {DensePool("kind_a", /*storage_index=*/0, /*base_offset=*/0,
-                 /*stride=*/128, /*num_blocks=*/8)});
-  ASSERT_TRUE(status.ok()) << status.ToString();
+                 /*stride=*/128, /*num_blocks=*/8)}));
   EXPECT_EQ(manager.GetAllocatedHostDramBytes(), 3072);
 
   // Subsequent call to UpdateAllocatedOccupancyMetric maintains and reports

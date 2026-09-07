@@ -28,6 +28,7 @@
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/support/status.h"
 #include "xla/tsl/concurrency/future.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/raiden_future.h"
 #include "tpu_sync/proto/kv_cache_store_service.grpc.pb.h"
 #include "tpu_sync/proto/kv_cache_store_service.pb.h"
@@ -106,9 +107,8 @@ TEST_F(KVCacheStoreClientTest, FetchReturnsFutureWithFetchResponseSuccess) {
 
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch(hashes, /*device_block_ids=*/{}, host_ids, client_id);
-  auto response_or = future.Await();
-  ASSERT_OK(response_or.status());
-  EXPECT_THAT(response_or->done_block_hashes(),
+  TF_ASSERT_OK_AND_ASSIGN(auto response, future.Await());
+  EXPECT_THAT(response.done_block_hashes(),
               UnorderedElementsAre("hash_1", "hash_2"));
 }
 
@@ -119,8 +119,8 @@ TEST_F(KVCacheStoreClientTest, FetchReturnsFutureWithErrorStatusOnRPCFailure) {
 
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch(hashes, /*device_block_ids=*/{}, host_ids);
-  auto response_or = future.Await();
-  EXPECT_THAT(response_or.status(), StatusIs(absl::StatusCode::kInternal));
+  auto response = future.Await();
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInternal));
 }
 
 TEST_F(KVCacheStoreClientTest, FetchPopulatesRequestFieldsCorrectly) {
@@ -135,8 +135,7 @@ TEST_F(KVCacheStoreClientTest, FetchPopulatesRequestFieldsCorrectly) {
 
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch(hashes, dev_ids, host_ids, client_id);
-  auto response_or = future.Await();
-  ASSERT_OK(response_or.status());
+  TF_ASSERT_OK_AND_ASSIGN(auto response, future.Await());
 
   const auto& req = service_->last_request();
   EXPECT_THAT(req.block_hashes(), UnorderedElementsAre("hash_a", "hash_b"));
@@ -156,9 +155,8 @@ TEST_F(KVCacheStoreClientTest, FetchValidatesMismatchedDeviceBlockIds) {
 
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch(hashes, dev_ids);
-  auto response_or = future.Await();
-  EXPECT_THAT(response_or.status(),
-              StatusIs(absl::StatusCode::kInvalidArgument));
+  auto response = future.Await();
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST_F(KVCacheStoreClientTest, FetchValidatesMismatchedHostBlockIds) {
@@ -167,18 +165,16 @@ TEST_F(KVCacheStoreClientTest, FetchValidatesMismatchedHostBlockIds) {
 
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch(hashes, /*device_block_ids=*/{}, host_ids);
-  auto response_or = future.Await();
-  EXPECT_THAT(response_or.status(),
-              StatusIs(absl::StatusCode::kInvalidArgument));
+  auto response = future.Await();
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST_F(KVCacheStoreClientTest, FetchEmptyHashesReturnsEmptyResponse) {
   std::vector<std::string> hashes;
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch(hashes);
-  auto response_or = future.Await();
-  ASSERT_OK(response_or.status());
-  EXPECT_EQ(response_or->done_block_hashes_size(), 0);
+  TF_ASSERT_OK_AND_ASSIGN(auto response, future.Await());
+  EXPECT_EQ(response.done_block_hashes_size(), 0);
 }
 
 }  // namespace

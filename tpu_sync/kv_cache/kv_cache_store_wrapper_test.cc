@@ -26,9 +26,11 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/global_registry/test_util.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata_shm.h"
@@ -128,7 +130,7 @@ class KVCacheStoreWrapperTest : public ::testing::Test {
     for (int i = 0; i < static_cast<int>(hashes.size()); ++i) {
       slices.push_back(RaidenBlockId(rid, i, BlockStatus::HOST));
     }
-    ASSERT_TRUE(wrapper->Insert(hashes, slices, /*on_host=*/true).ok());
+    ABSL_ASSERT_OK(wrapper->Insert(hashes, slices, /*on_host=*/true));
     // Insert pins what it takes; these cases only want the blocks resident,
     // and a held pin would make them unevictable.
     wrapper->Release(hashes);
@@ -158,9 +160,9 @@ TEST_F(KVCacheStoreWrapperTest, ColdStartCreatesMetadataTable) {
   auto wrapper = MakeWrapper(/*capacity=*/4, /*num_shards=*/1);
   EXPECT_TRUE(
       MetadataSegmentExists(absl::StrCat("_metadata", kIdentitySuffix)));
-  auto lookup_or = (*wrapper)->Lookup({"host_1"}, LookupOptions{});
-  ASSERT_TRUE(lookup_or.ok());
-  EXPECT_THAT(*lookup_or, IsEmpty());
+  TF_ASSERT_OK_AND_ASSIGN(auto lookup,
+                          (*wrapper)->Lookup({"host_1"}, LookupOptions{}));
+  EXPECT_THAT(lookup, IsEmpty());
 }
 
 TEST_F(KVCacheStoreWrapperTest, ServerNameSuffixesMetadataSegment) {
@@ -221,15 +223,15 @@ TEST_F(KVCacheStoreWrapperTest, RecoversHostBlocksAfterRestart) {
   wrapper.reset();
   wrapper = MakeWrapper(/*capacity=*/4, /*num_shards=*/1);
 
-  auto lookup_or = (*wrapper)->Lookup({"host_1", "host_2"}, LookupOptions{});
-  ASSERT_TRUE(lookup_or.ok());
-  ASSERT_EQ(lookup_or->size(), 2);
-  EXPECT_EQ((*lookup_or)[0].first, "host_1");
-  EXPECT_EQ((*lookup_or)[0].second.status, BlockStatus::HOST);
-  EXPECT_EQ((*lookup_or)[0].second.host_block_id, 0);
-  EXPECT_EQ((*lookup_or)[1].first, "host_2");
-  EXPECT_EQ((*lookup_or)[1].second.status, BlockStatus::HOST);
-  EXPECT_EQ((*lookup_or)[1].second.host_block_id, 1);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto lookup, (*wrapper)->Lookup({"host_1", "host_2"}, LookupOptions{}));
+  ASSERT_EQ(lookup.size(), 2);
+  EXPECT_EQ(lookup[0].first, "host_1");
+  EXPECT_EQ(lookup[0].second.status, BlockStatus::HOST);
+  EXPECT_EQ(lookup[0].second.host_block_id, 0);
+  EXPECT_EQ(lookup[1].first, "host_2");
+  EXPECT_EQ(lookup[1].second.status, BlockStatus::HOST);
+  EXPECT_EQ(lookup[1].second.host_block_id, 1);
 }
 
 // Exercises the env contract StoreMonitorConfigFromEnv documents; the
@@ -324,9 +326,9 @@ TEST_F(KVCacheStoreWrapperTest, ModelUidMismatchColdStarts) {
   setenv("RAIDEN_SHM_MODEL_UID", "model_b", /*overwrite=*/1);
   wrapper = MakeWrapper(/*capacity=*/4, /*num_shards=*/1);
 
-  auto lookup_or = (*wrapper)->Lookup({"host_1"}, LookupOptions{});
-  ASSERT_TRUE(lookup_or.ok());
-  EXPECT_THAT(*lookup_or, IsEmpty());
+  TF_ASSERT_OK_AND_ASSIGN(auto lookup,
+                          (*wrapper)->Lookup({"host_1"}, LookupOptions{}));
+  EXPECT_THAT(lookup, IsEmpty());
 }
 
 }  // namespace

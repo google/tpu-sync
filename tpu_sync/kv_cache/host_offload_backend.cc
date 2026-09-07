@@ -217,13 +217,13 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
   // at the first one.
   std::vector<global_registry::KVBlockMetadata> remote_hits;
   if (!missing_hashes.empty() && options.enable_global && client != nullptr) {
-    auto global_res_or = client->Lookup(missing_hashes, local_id);
-    if (global_res_or.ok()) {
-      remote_hits = std::move(global_res_or).value();
-    } else {
-      LOG(WARNING) << "Global registry lookup failed: "
-                   << global_res_or.status().message();
-    }
+    auto lookup_remote = [&]() -> absl::Status {
+      ABSL_ASSIGN_OR_RETURN(
+          remote_hits, client->Lookup(missing_hashes, local_id),
+          _.LogWarning() << "Global registry lookup failed: ");
+      return absl::OkStatus();
+    };
+    (void)lookup_remote();
   }
 
   // Phases 3 and 4, under one lock: walk the request in order taking each hash
@@ -580,11 +580,7 @@ absl::StatusOr<size_t> HostOffloadBackend::RecoverFromLocalManifest() {
   for (const KVCacheMetadata::Entry* entry : recoverable) {
     block_ids.push_back(entry->block_id);
   }
-  absl::Status allocate_status =
-      raiden_controller_->AllocateTargetBlockIds(block_ids);
-  if (!allocate_status.ok()) {
-    return allocate_status;
-  }
+  ABSL_RETURN_IF_ERROR(raiden_controller_->AllocateTargetBlockIds(block_ids));
 
   uint64_t max_seq = 0;
   for (const KVCacheMetadata::Entry* entry : recoverable) {
@@ -799,29 +795,29 @@ HostOffloadBackend::BeginWriteRemote(
                                   BuildLocalWorkerEndpoints(raiden_controller_),
                                   absl::ToInt64Milliseconds(requested_deadline),
                                   hold_window, std::move(on_verdict));
-  auto response_or = call.ack.Await();
-  if (!response_or.ok()) {
+  auto response = call.ack.Await();
+  if (!response.ok()) {
     // On a transport error the peer may have restarted on a new port; drop
     // the cached client so the next attempt re-resolves it. An application
     // error (e.g. RESOURCE_EXHAUSTED) means the peer is alive, so the
     // channel is kept.
-    if (IsTransportError(response_or.status())) {
+    if (IsTransportError(response.status())) {
       InvalidateStoreClient(dst_raiden_id);
     }
-    return response_or.status();
+    return response.status();
   }
 
   RemoteWriteAck ack;
   ack.cancel = std::move(call.cancel);
-  ack.operation_id = response_or->operation_id();
-  ack.granted_deadline = absl::Milliseconds(response_or->granted_deadline_ms());
-  switch (response_or->exist_state()) {
+  ack.operation_id = response->operation_id();
+  ack.granted_deadline = absl::Milliseconds(response->granted_deadline_ms());
+  switch (response->exist_state()) {
     case ::tpu_raiden::kv_cache::proto::WRITE_ALL_EXIST:
       ack.all_exist = true;
       return ack;
     case ::tpu_raiden::kv_cache::proto::WRITE_PARTIAL_EXIST:
-      ack.existing_hashes.assign(response_or->existing_hashes().begin(),
-                                 response_or->existing_hashes().end());
+      ack.existing_hashes.assign(response->existing_hashes().begin(),
+                                 response->existing_hashes().end());
       return ack;
     default:
       break;
@@ -839,11 +835,11 @@ tsl::Future<proto::PollWriteRemoteResponse>
 HostOffloadBackend::PollWriteRemoteAsync(const RaidenId& dst_raiden_id,
                                         uint64_t operation_id,
                                         int64_t wait_ms) {
-  auto client_or = GetKVCacheStoreClient(dst_raiden_id);
-  if (!client_or.ok()) {
-    return tsl::Future<proto::PollWriteRemoteResponse>(client_or.status());
+  auto client = GetKVCacheStoreClient(dst_raiden_id);
+  if (!client.ok()) {
+    return tsl::Future<proto::PollWriteRemoteResponse>(client.status());
   }
-  return (*client_or)->PollWriteRemote(operation_id, wait_ms);
+  return (*client)->PollWriteRemote(operation_id, wait_ms);
 }
 
 std::vector<std::string> HostOffloadBackend::AlreadyPresentHostResident(
@@ -991,19 +987,18 @@ tsl::Future<> HostOffloadBackend::Load(
 tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
     const RaidenId& remote_id, absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> device_block_ids) {
-  auto client_or = GetKVCacheStoreClient(remote_id);
-  if (!client_or.ok()) {
-    return tsl::Future<>(client_or.status());
+  auto client = GetKVCacheStoreClient(remote_id);
+  if (!client.ok()) {
+    return tsl::Future<>(client.status());
   }
-  std::shared_ptr<KVCacheStoreClient> client = std::move(client_or.value());
+  std::shared_ptr<KVCacheStoreClient> client_ptr = *std::move(client);
 
-  auto host_blocks_or =
-      raiden_controller_->AllocateBlockIds(block_hashes.size());
-  if (!host_blocks_or.ok()) {
-    return tsl::Future<>(host_blocks_or.status());
+  auto host_blocks = raiden_controller_->AllocateBlockIds(block_hashes.size());
+  if (!host_blocks.ok()) {
+    return tsl::Future<>(host_blocks.status());
   }
-  std::vector<int32_t> dst_host_block_ids(host_blocks_or.value().begin(),
-                                          host_blocks_or.value().end());
+  std::vector<int32_t> dst_host_block_ids(host_blocks->begin(),
+                                          host_blocks->end());
 
   auto [load_promise, load_future] = tsl::MakePromise<>();
 
@@ -1011,8 +1006,8 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
   std::vector<::tpu_sync::proto::RaidenWorkerEndpointsProto>
       client_worker_endpoints = BuildLocalWorkerEndpoints(raiden_controller_);
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> fetch_future =
-      client->Fetch(block_hashes, device_block_ids, dst_host_block_ids,
-                    client_raiden_id, client_worker_endpoints);
+      client_ptr->Fetch(block_hashes, device_block_ids, dst_host_block_ids,
+                        client_raiden_id, client_worker_endpoints);
 
   fetch_future.OnReady(
       [this, remote_id, dst_host_block_ids,
@@ -1020,17 +1015,17 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
                                           device_block_ids.end()),
        load_promise = std::move(load_promise)](
           const absl::StatusOr<::tpu_raiden::kv_cache::proto::FetchResponse>&
-              response_or) mutable {
-        if (!response_or.ok()) {
+              fetch_response) mutable {
+        if (!fetch_response.ok()) {
           (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
           // The peer may have restarted on a new port; drop the cached client
           // so the next attempt re-resolves instead of redialling a dead one.
           InvalidateStoreClient(remote_id);
-          load_promise.Set(response_or.status());
+          load_promise.Set(fetch_response.status());
           return;
         }
 
-        const auto& response = response_or.value();
+        const auto& response = *fetch_response;
         if (!response.failed_block_hashes().empty()) {
           (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
           std::string err_msg = response.error_message().empty()

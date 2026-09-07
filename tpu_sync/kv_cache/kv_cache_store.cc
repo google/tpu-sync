@@ -214,20 +214,20 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
   if (num_shards > 0 && !effective_config0.metadata.has_value()) {
     const char* shm_key_env = std::getenv("RAIDEN_SHM_KEY");
     if (shm_key_env != nullptr && std::strlen(shm_key_env) > 0) {
-      RETURN_IF_ERROR(
+      ABSL_RETURN_IF_ERROR(
           SharedMemoryHostMemoryAllocator::ValidateShmNameParts(shm_key_env));
       const char* model_uid = std::getenv("RAIDEN_SHM_MODEL_UID");
-      auto region_or = KVCacheMetadataShmRegion::AttachOrFormat(
+      auto region = KVCacheMetadataShmRegion::AttachOrFormat(
           MetadataShmKey(effective_config0.raiden_id),
           static_cast<int>(effective_config0.capacity),
           model_uid != nullptr ? model_uid : "default_model");
-      if (region_or.ok()) {
-        metadata_region = *std::move(region_or);
+      if (region.ok()) {
+        metadata_region = *std::move(region);
         effective_config0.metadata = metadata_region->metadata();
       } else {
         LOG(WARNING) << "KV metadata table unavailable, serving without "
                         "crash recovery: "
-                     << region_or.status().message();
+                     << region.status().message();
       }
     }
   }
@@ -941,10 +941,11 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
     if (start_idx >= block_hashes.size()) break;
     if (!backend) continue;
 
-    auto res_or = backend->Lookup(
+    auto lookup_result = backend->Lookup(
         absl::MakeSpan(block_hashes).subspan(start_idx), options);
-    if (!res_or.ok()) {
-      if (!accumulated_results.empty() && absl::IsNotFound(res_or.status())) {
+    if (!lookup_result.ok()) {
+      if (!accumulated_results.empty() &&
+          absl::IsNotFound(lookup_result.status())) {
         break;
       }
       if (options.pin_found && !accumulated_results.empty()) {
@@ -955,10 +956,10 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
         }
         Release(matched_hashes);
       }
-      return res_or.status();
+      return lookup_result.status();
     }
 
-    const auto& res = res_or.value();
+    const auto& res = *lookup_result;
     for (const auto& pair : res) {
       accumulated_results.push_back(pair);
       ++start_idx;
@@ -1063,9 +1064,7 @@ absl::Status KVCacheStore::SaveLocal(
 
   {
     absl::MutexLock lock(mutex_);
-    auto lookup_or = backend()->Lookup(block_hashes);
-    if (!lookup_or.ok()) return lookup_or.status();
-    const auto& slices = lookup_or.value();
+    ABSL_ASSIGN_OR_RETURN(const auto& slices, backend()->Lookup(block_hashes));
     if (slices.size() < block_hashes.size()) {
       return absl::NotFoundError(
           absl::StrCat("Block hash not found: ", block_hashes[slices.size()]));
@@ -1094,12 +1093,12 @@ absl::Status KVCacheStore::SaveLocal(
     save_tracker_.AddPending(block_hashes);
   }
 
-  auto host_blocks_or = AllocateBlockIds(block_hashes.size());
-  if (!host_blocks_or.ok()) {
+  auto host_blocks = AllocateBlockIds(block_hashes.size());
+  if (!host_blocks.ok()) {
     save_tracker_.RemovePending(block_hashes);
-    return host_blocks_or.status();
+    return host_blocks.status();
   }
-  const auto& host_block_ids = host_blocks_or.value();
+  const auto& host_block_ids = *host_blocks;
 
   std::vector<Buffer> src_buffers;
   src_buffers.reserve(src_device_block_ids.size());
@@ -1145,9 +1144,7 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
 
   {
     absl::MutexLock lock(mutex_);
-    auto lookup_or = backend()->Lookup(block_hashes);
-    if (!lookup_or.ok()) return lookup_or.status();
-    const auto& slices = lookup_or.value();
+    ABSL_ASSIGN_OR_RETURN(const auto& slices, backend()->Lookup(block_hashes));
     if (slices.size() < block_hashes.size()) {
       return absl::NotFoundError(
           absl::StrCat("Block hash not found: ", block_hashes[slices.size()]));
@@ -1310,9 +1307,7 @@ void KVCacheStore::RegisterReadRemoteHooks() {
 absl::StatusOr<std::vector<int32_t>> KVCacheStore::ValidateAndPinHostBlocks(
     absl::Span<const std::string> block_hashes) {
   absl::MutexLock lock(mutex_);
-  auto lookup_or = backend()->Lookup(block_hashes);
-  if (!lookup_or.ok()) return lookup_or.status();
-  const auto& slices = lookup_or.value();
+  ABSL_ASSIGN_OR_RETURN(const auto& slices, backend()->Lookup(block_hashes));
   if (slices.size() < block_hashes.size()) {
     return absl::NotFoundError(
         absl::StrCat("BLOCK_HASH_NOT_FOUND: ", block_hashes[slices.size()]));
@@ -1446,10 +1441,10 @@ bool KVCacheStore::SweepOnce() {
     // staler placement data.
     sweep_active_ = true;
     placement_targets_.clear();
-    auto targets_or =
+    auto targets =
         registry_client_->GetPlacementTargets(raiden_id_, kMaxPlacementTargets);
-    if (targets_or.ok()) {
-      for (const auto& info : *targets_or) {
+    if (targets.ok()) {
+      for (const auto& info : *targets) {
         placement_targets_.push_back(RaidenId{
             info.raiden_id().job_name(), info.raiden_id().job_replica_id(),
             info.raiden_id().data_name(),
@@ -1457,7 +1452,7 @@ bool KVCacheStore::SweepOnce() {
       }
     } else {
       LOG(WARNING) << "Evict sweep could not fetch placement targets: "
-                   << targets_or.status()
+                   << targets.status()
                    << ". Dropping cold blocks locally instead.";
     }
   } else if (free_ratio >= monitor_config_.evict_high_watermark) {
@@ -1763,9 +1758,7 @@ absl::Status KVCacheStore::SaveRemote(
   std::vector<int32_t> src_host_block_ids;
   {
     absl::MutexLock lock(mutex_);
-    auto lookup_or = backend->Lookup(block_hashes);
-    if (!lookup_or.ok()) return lookup_or.status();
-    const auto& slices = lookup_or.value();
+    ABSL_ASSIGN_OR_RETURN(const auto& slices, backend->Lookup(block_hashes));
     if (slices.size() < block_hashes.size()) {
       return absl::NotFoundError(
           absl::StrCat("Block hash not found: ", block_hashes[slices.size()]));
@@ -1947,11 +1940,10 @@ absl::Status KVCacheStore::SaveRemote(
     }
   };
 
-  auto ack_or =
-      backend->BeginWriteRemote(dst_raiden_id, block_hashes, src_host_block_ids,
-                                hold - kRemoteWriteMargin, hold,
-                                std::move(on_verdict));
-  if (!ack_or.ok()) {
+  auto ack_res = backend->BeginWriteRemote(
+      dst_raiden_id, block_hashes, src_host_block_ids,
+      hold - kRemoteWriteMargin, hold, std::move(on_verdict));
+  if (!ack_res.ok()) {
     // The offer failed before any ack. Undo it completely: release the pin,
     // clear the marks, and report only through the return status.
     //
@@ -1968,11 +1960,10 @@ absl::Status KVCacheStore::SaveRemote(
         sweep_tracker_.RemovePending(taken->block_hashes);
       }
     }
-    return ack_or.status();
+    return ack_res.status();
   }
 
-
-  const auto& ack = *ack_or;
+  const auto& ack = *ack_res;
   if (ack.all_exist) {
     // SUCCESS with nothing to wait for.
     auto taken = TakeRemoteWrite(op_key);
@@ -2077,10 +2068,10 @@ void KVCacheStore::PollSavesInternal(std::vector<SaveState> ready_saves) {
       // Hoisted out of the lookup scope: the caller's pins on these hashes
       // are consumed below, on a path that may run after this scope ends.
       std::vector<std::string> update_hashes;
-      auto lookup_or = backend()->Lookup(state.block_hashes,
-                                         LookupOptions{.enable_global = false});
-      if (lookup_or.ok()) {
-        const auto& slices = lookup_or.value();
+      auto lookup = backend()->Lookup(state.block_hashes,
+                                      LookupOptions{.enable_global = false});
+      if (lookup.ok()) {
+        const auto& slices = *lookup;
         std::vector<RaidenBlockId> update_slices;
         for (size_t i = 0; i < state.block_hashes.size(); ++i) {
           const auto& hash = state.block_hashes[i];
@@ -2193,10 +2184,10 @@ void KVCacheStore::PollLoadsInternal(std::vector<LoadState> ready_loads) {
       // Local source: the entry exists here by construction, so this lookup is
       // purely local -- no registry fallback, which would otherwise put a
       // blocking RPC inside the poller while it holds mutex_.
-      auto lookup_or = backend()->Lookup(state.block_hashes,
-                                         LookupOptions{.enable_global = false});
-      if (lookup_or.ok()) {
-        const auto& slices = lookup_or.value();
+      auto lookup = backend()->Lookup(state.block_hashes,
+                                      LookupOptions{.enable_global = false});
+      if (lookup.ok()) {
+        const auto& slices = *lookup;
         std::vector<std::string> update_hashes;
         std::vector<RaidenBlockId> update_slices;
         for (size_t i = 0; i < state.block_hashes.size(); ++i) {

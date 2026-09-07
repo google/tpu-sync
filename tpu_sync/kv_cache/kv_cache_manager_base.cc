@@ -210,8 +210,8 @@ raiden::PjRtCopyFuture JoinAndRecordTelemetry(
   auto joined_future = raiden::JoinPjRtCopyFutures(futures);
   if (telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
     joined_future.OnReady([start_time, metric = std::string(metric_name)](
-                              auto status_or) {
-      if (status_or.ok()) {
+                              const auto& result) {
+      if (result.ok()) {
         telemetry::RaidenMetricStore::GetGlobalMetricStore().ObserveHistogram(
             metric, {}, absl::ToDoubleMilliseconds(absl::Now() - start_time));
       }
@@ -337,14 +337,13 @@ KVCacheManagerBase::KVCacheManagerBase(
       size_t alloc_size = num_host_blocks * layer_block_byte_size(layer_idx);
       if (host_allocator) {
         const xla::PjRtDevice* target_dev = dst_buffer.device;
-        auto status_or_allocation = host_allocator(alloc_size, target_dev);
-        if (!status_or_allocation.ok()) {
-          throw std::runtime_error(absl::StrCat(
-              "Host allocator failed for size: ", alloc_size,
-              ", error: ", status_or_allocation.status().ToString()));
+        auto host_alloc = host_allocator(alloc_size, target_dev);
+        if (!host_alloc.ok()) {
+          throw std::runtime_error(
+              absl::StrCat("Host allocator failed for size: ", alloc_size,
+                           ", error: ", host_alloc.status().ToString()));
         }
-        HostBufferAllocation allocation =
-            std::move(status_or_allocation).value();
+        HostBufferAllocation allocation = *std::move(host_alloc);
         if (alloc_size > 0 && allocation.ptr == nullptr) {
           throw std::runtime_error(absl::StrCat(
               "Host allocator returned null buffer for size: ", alloc_size));
@@ -445,14 +444,13 @@ KVCacheManagerBase::KVCacheManagerBase(
       int num_host_blocks = host_blocks_to_allocate.value_or(0);
       size_t alloc_size = num_host_blocks * layer_block_byte_size(layer_idx);
       if (host_allocator) {
-        auto status_or_allocation = host_allocator(alloc_size, nullptr);
-        if (!status_or_allocation.ok()) {
-          throw std::runtime_error(absl::StrCat(
-              "Host allocator failed for size: ", alloc_size,
-              ", error: ", status_or_allocation.status().ToString()));
+        auto host_alloc = host_allocator(alloc_size, nullptr);
+        if (!host_alloc.ok()) {
+          throw std::runtime_error(
+              absl::StrCat("Host allocator failed for size: ", alloc_size,
+                           ", error: ", host_alloc.status().ToString()));
         }
-        HostBufferAllocation allocation =
-            std::move(status_or_allocation).value();
+        HostBufferAllocation allocation = *std::move(host_alloc);
         if (alloc_size > 0 && allocation.ptr == nullptr) {
           throw std::runtime_error(absl::StrCat(
               "Host allocator returned null buffer for size: ", alloc_size));
@@ -543,21 +541,20 @@ void KVCacheManagerBase::WorkerLoop() {
       task = std::move(task_queue_.front());
       task_queue_.pop();
     }
-    auto status_or_future = std::move(task.work)();
-    if (!status_or_future.ok()) {
-      task.promise.Set(status_or_future.status());
+    auto future = std::move(task.work)();
+    if (!future.ok()) {
+      task.promise.Set(future.status());
     } else {
       // TODO(b/539581381): Research whether using PJRT_Event_OnReady in a
       // PJRT-owned thread or a dedicated completion polling thread is
       // preferable to per-call callback threads in OnReady.
-      status_or_future->OnReady(
-          [promise = std::move(task.promise)](auto status_or_holds) mutable {
-            if (status_or_holds.ok()) {
-              promise.Set();
-            } else {
-              promise.Set(status_or_holds.status());
-            }
-          });
+      future->OnReady([promise = std::move(task.promise)](auto holds) mutable {
+        if (holds.ok()) {
+          promise.Set();
+        } else {
+          promise.Set(holds.status());
+        }
+      });
     }
   }
 }
@@ -646,14 +643,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dSyncDispatch(
     for (const auto& [node, works] : grouped_work) {
       VLOG(1) << "H2d: Executing inline dispatch for NUMA node " << node
               << ", works count: " << works.size();
-      auto status_or_local_futures =
-          DispatchH2dWork(works, slot_idx, is_partial, src_c, dst_c, sizes_c);
-      if (!status_or_local_futures.ok()) {
-        VLOG(1) << "H2d: Inline dispatch failed: "
-                << status_or_local_futures.status().ToString();
-        return status_or_local_futures.status();
-      }
-      auto local_futures = std::move(status_or_local_futures).value();
+      ABSL_ASSIGN_OR_RETURN(
+          auto local_futures,
+          DispatchH2dWork(works, slot_idx, is_partial, src_c, dst_c, sizes_c),
+          _.VLog(1) << "H2d: Inline dispatch failed: ");
       for (size_t i = 0; i < works.size(); ++i) {
         const auto& work = works[i];
         logical_futures[work.layer_idx * num_shards_ + work.shard_idx] =
@@ -679,14 +672,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dSyncDispatch(
 
     VLOG(1) << "H2d: Awaiting scheduled dispatches...";
     for (auto& pf : pending_futures) {
-      auto status_or_local_futures = pf.future.get();
-      if (!status_or_local_futures.ok()) {
-        VLOG(1) << "H2d: Scheduled dispatch failed: "
-                << status_or_local_futures.status().ToString();
-        return status_or_local_futures.status();
-      }
+      ABSL_ASSIGN_OR_RETURN(auto local_futures, pf.future.get(),
+                            _.VLog(1) << "H2d: Scheduled dispatch failed: ");
       VLOG(1) << "H2d: Scheduled dispatch completed successfully.";
-      auto local_futures = std::move(status_or_local_futures).value();
       for (size_t i = 0; i < pf.works.size(); ++i) {
         const auto& work = pf.works[i];
         logical_futures[work.layer_idx * num_shards_ + work.shard_idx] =
@@ -784,14 +772,10 @@ KVCacheManagerBase::DispatchD2hChunks(const std::vector<int64_t>& src_offsets,
     for (const auto& [node, works] : grouped_work) {
       VLOG(1) << "DispatchD2hChunks: Executing inline dispatch for NUMA node "
               << node << ", works count: " << works.size();
-      auto status_or_local_futures =
-          DispatchD2hWork(works, slot_idx, is_partial, src_c, dst_c, sizes_c);
-      if (!status_or_local_futures.ok()) {
-        VLOG(1) << "DispatchD2hChunks: Inline dispatch failed: "
-                << status_or_local_futures.status().ToString();
-        return status_or_local_futures.status();
-      }
-      auto local_futures = std::move(status_or_local_futures).value();
+      ABSL_ASSIGN_OR_RETURN(
+          auto local_futures,
+          DispatchD2hWork(works, slot_idx, is_partial, src_c, dst_c, sizes_c),
+          _.VLog(1) << "DispatchD2hChunks: Inline dispatch failed: ");
       for (size_t i = 0; i < works.size(); ++i) {
         const auto& work = works[i];
         logical_futures[work.layer_idx * num_shards_ + work.shard_idx] =
@@ -818,15 +802,11 @@ KVCacheManagerBase::DispatchD2hChunks(const std::vector<int64_t>& src_offsets,
 
     VLOG(1) << "DispatchD2hChunks: Awaiting scheduled dispatches...";
     for (auto& pf : pending_futures) {
-      auto status_or_local_futures = pf.future.get();
-      if (!status_or_local_futures.ok()) {
-        VLOG(1) << "DispatchD2hChunks: Scheduled dispatch failed: "
-                << status_or_local_futures.status().ToString();
-        return status_or_local_futures.status();
-      }
+      ABSL_ASSIGN_OR_RETURN(
+          auto local_futures, pf.future.get(),
+          _.VLog(1) << "DispatchD2hChunks: Scheduled dispatch failed: ");
       VLOG(1)
           << "DispatchD2hChunks: Scheduled dispatch completed successfully.";
-      auto local_futures = std::move(status_or_local_futures).value();
       for (size_t i = 0; i < pf.works.size(); ++i) {
         const auto& work = pf.works[i];
         logical_futures[work.layer_idx * num_shards_ + work.shard_idx] =
@@ -987,16 +967,16 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dRead(
         return;
       }
 
-      auto h2h_fut_or =
+      auto h2h_fut =
           H2hReadExplicit(peer_str, {src_block_id}, {staging_block_id},
                           /*explicit_dst_ptrs=*/{});
-      if (!h2h_fut_or.ok()) {
-        state->SetError(h2h_fut_or.status());
+      if (!h2h_fut.ok()) {
+        state->SetError(h2h_fut.status());
         state->MarkChunkComplete();
         return;
       }
 
-      absl::Status h2h_status = h2h_fut_or->Await();
+      absl::Status h2h_status = h2h_fut->Await();
       if (!h2h_status.ok()) {
         state->SetError(h2h_status);
         state->MarkChunkComplete();
@@ -1008,17 +988,17 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dRead(
         return;
       }
 
-      auto h2d_fut_or =
+      auto h2d_fut =
           H2dSyncDispatch({staging_offset}, {dst_device_offset}, {size});
-      if (!h2d_fut_or.ok()) {
-        state->SetError(h2d_fut_or.status());
+      if (!h2d_fut.ok()) {
+        state->SetError(h2d_fut.status());
         state->MarkChunkComplete();
         return;
       }
 
-      h2d_fut_or->OnReady([state](auto status_or) {
-        if (!status_or.ok()) {
-          state->SetError(status_or.status());
+      h2d_fut->OnReady([state](const auto& result) {
+        if (!result.ok()) {
+          state->SetError(result.status());
         }
         state->MarkChunkComplete();
       });
@@ -1117,9 +1097,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWrite(
     int staging_block_id = chunks[i].staging_block_id;
     int dst_block_id = chunks[i].dst_block_id;
     chunks[i].d2h_fut.OnReady([this, pool, state, peer_str, staging_block_id,
-                               dst_block_id](auto status_or) {
-      if (!status_or.ok()) {
-        state->SetError(status_or.status());
+                               dst_block_id](const auto& result) {
+      if (!result.ok()) {
+        state->SetError(result.status());
         state->MarkChunkComplete();
         return;
       }
@@ -2597,10 +2577,10 @@ absl::Status KVCacheManagerBase::PushKVCacheResharded(
     }
   }
 
-  d2h_future.OnReady([this, request, peer_transfers, numa](auto status_or) {
-    if (!status_or.ok()) {
+  d2h_future.OnReady([this, request, peer_transfers, numa](const auto& result) {
+    if (!result.ok()) {
       LOG(ERROR) << "D2H copy failed for resharded push uuid " << request.uuid()
-                 << ": " << status_or.status().ToString();
+                 << ": " << result.status().ToString();
       return;
     }
 
@@ -2883,12 +2863,12 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
       const PoolSpec& pool = pools_[layer_idx];
       for (int64_t block_id : block_ids) {
         if (accumulated_bytes >= total_bytes) break;
-        auto extents_or = ComputePoolBlockCopyExtents(
+        auto extents_status = ComputePoolBlockCopyExtents(
             pool, absl::MakeConstSpan(&block_id, 1));
-        if (!extents_or.ok()) return {};
+        if (!extents_status.ok()) return {};
         uint8_t* storage_base = GetHostPointer(pool.storage_index, shard_idx);
         if (storage_base == nullptr) return {};
-        for (const PoolBlockCopyExtent& extent : *extents_or) {
+        for (const PoolBlockCopyExtent& extent : *extents_status) {
           if (accumulated_bytes >= total_bytes) break;
           const size_t size = std::min(static_cast<size_t>(extent.size_bytes),
                                        total_bytes - accumulated_bytes);

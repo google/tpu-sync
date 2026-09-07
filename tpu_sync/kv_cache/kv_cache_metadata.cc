@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -70,10 +71,7 @@ size_t KVCacheMetadata::RequiredSizeBytes(int num_blocks) {
 
 absl::StatusOr<KVCacheMetadata> KVCacheMetadata::Format(
     absl::Span<uint8_t> region, int num_blocks, absl::string_view model_uid) {
-  absl::Status status = ValidateRegion(region, num_blocks, model_uid);
-  if (!status.ok()) {
-    return status;
-  }
+  ABSL_RETURN_IF_ERROR(ValidateRegion(region, num_blocks, model_uid));
 
   std::memset(region.data(), 0, RequiredSizeBytes(num_blocks));
   auto* header = reinterpret_cast<KVCacheMetadataHeader*>(region.data());
@@ -90,10 +88,7 @@ absl::StatusOr<KVCacheMetadata> KVCacheMetadata::Format(
 
 absl::StatusOr<KVCacheMetadata> KVCacheMetadata::Attach(
     absl::Span<uint8_t> region, int num_blocks, absl::string_view model_uid) {
-  absl::Status status = ValidateRegion(region, num_blocks, model_uid);
-  if (!status.ok()) {
-    return status;
-  }
+  ABSL_RETURN_IF_ERROR(ValidateRegion(region, num_blocks, model_uid));
 
   auto* header = reinterpret_cast<KVCacheMetadataHeader*>(region.data());
   const KVCacheMetadataHeader expected;

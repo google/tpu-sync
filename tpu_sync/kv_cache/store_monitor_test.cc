@@ -22,10 +22,12 @@
 
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
@@ -61,12 +63,10 @@ class StoreMonitorTest : public ::testing::Test {
 
 TEST_F(StoreMonitorTest, HeartbeatsKeepTheRegistrationAlive) {
   RaidenId id = {"monitored", "r0", "dataS", 0};
-  ASSERT_TRUE(client_
-                  ->RegisterStore(id, "10.0.0.7:1111",
-                                  /*controller_address=*/"",
-                                  /*ttl=*/absl::Seconds(2), "groupA",
-                                  /*evict_tier=*/1)
-                  .ok());
+  ABSL_ASSERT_OK(client_->RegisterStore(id, "10.0.0.7:1111",
+                                        /*controller_address=*/"",
+                                        /*ttl=*/absl::Seconds(2), "groupA",
+                                        /*evict_tier=*/1));
 
   std::atomic<int> reregister_calls{0};
   StoreMonitor monitor(
@@ -80,7 +80,7 @@ TEST_F(StoreMonitorTest, HeartbeatsKeepTheRegistrationAlive) {
 
   // Well past the original 2s TTL: only the heartbeats keep it alive.
   absl::SleepFor(absl::Seconds(3));
-  EXPECT_TRUE(client_->ResolveStore(id).ok());
+  ABSL_EXPECT_OK(client_->ResolveStore(id));
   // Alive the whole time, so the heartbeats never needed the re-register
   // fallback.
   EXPECT_EQ(reregister_calls.load(), 0);
@@ -112,18 +112,16 @@ TEST_F(StoreMonitorTest, ReregistersWhenTheRegistrationLapses) {
 
   absl::SleepFor(absl::Seconds(1));
   EXPECT_GE(reregister_calls.load(), 1);
-  EXPECT_TRUE(client_->ResolveStore(id).ok());
+  ABSL_EXPECT_OK(client_->ResolveStore(id));
 }
 
 TEST_F(StoreMonitorTest, ReportedStatusFeedsThePlacementRanking) {
   auto register_store = [&](absl::string_view job, int32_t tier) {
     RaidenId id = {std::string(job), "r0", "dataS", 0};
-    EXPECT_TRUE(client_
-                    ->RegisterStore(id, absl::StrCat(job, ":1111"),
-                                    /*controller_address=*/"",
-                                    /*ttl=*/absl::ZeroDuration(), "groupA",
-                                    tier)
-                    .ok());
+    ABSL_EXPECT_OK(client_->RegisterStore(id, absl::StrCat(job, ":1111"),
+                                          /*controller_address=*/"",
+                                          /*ttl=*/absl::ZeroDuration(),
+                                          "groupA", tier));
     return id;
   };
   RaidenId caller = register_store("caller", 0);
@@ -132,7 +130,7 @@ TEST_F(StoreMonitorTest, ReportedStatusFeedsThePlacementRanking) {
 
   StoreStatus crowded_status;
   crowded_status.set_free_blocks(10);
-  ASSERT_TRUE(client_->Heartbeat(crowded, crowded_status).ok());
+  ABSL_ASSERT_OK(client_->Heartbeat(crowded, crowded_status));
 
   StoreMonitor monitor(
       StoreMonitor::Options{.heartbeat_period = absl::Milliseconds(300)},
@@ -141,11 +139,11 @@ TEST_F(StoreMonitorTest, ReportedStatusFeedsThePlacementRanking) {
   monitor.Start();
   absl::SleepFor(absl::Seconds(1));  // At least one heartbeat.
 
-  auto targets = client_->GetPlacementTargets(caller, /*max_targets=*/8);
-  ASSERT_TRUE(targets.ok());
-  ASSERT_EQ(targets->size(), 2);
-  EXPECT_EQ((*targets)[0].raiden_id().job_name(), "roomy");
-  EXPECT_EQ((*targets)[1].raiden_id().job_name(), "crowded");
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto targets, client_->GetPlacementTargets(caller, /*max_targets=*/8));
+  ASSERT_EQ(targets.size(), 2);
+  EXPECT_EQ(targets[0].raiden_id().job_name(), "roomy");
+  EXPECT_EQ(targets[1].raiden_id().job_name(), "crowded");
 }
 
 TEST_F(StoreMonitorTest, SweepRunsOnItsPeriod) {
@@ -249,11 +247,9 @@ TEST_F(StoreMonitorTest, ASuccessfulReregisterTriggersTheRepublish) {
 
 TEST_F(StoreMonitorTest, ARequestStartsARepublishWithoutALapse) {
   RaidenId id = {"monitored", "r0", "dataS", 0};
-  ASSERT_TRUE(client_
-                  ->RegisterStore(id, "10.0.0.7:1111",
-                                  /*controller_address=*/"",
-                                  /*ttl=*/absl::ZeroDuration())
-                  .ok());
+  ABSL_ASSERT_OK(client_->RegisterStore(id, "10.0.0.7:1111",
+                                        /*controller_address=*/"",
+                                        /*ttl=*/absl::ZeroDuration()));
   std::atomic<int> republish_calls{0};
   StoreMonitor monitor(
       StoreMonitor::Options{.heartbeat_period = absl::Hours(1)}, client_, id,

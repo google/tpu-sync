@@ -88,23 +88,20 @@ TEST(HostOffloadBackendTest, BasicInsertAndLookup) {
   EXPECT_EQ(backend.GetSize(), 2);
 
   // Lookup both
-  auto lookup_res = backend.Lookup({"h1", "h2"});
-  ASSERT_TRUE(lookup_res.ok());
-  EXPECT_EQ(lookup_res->size(), 2);
-  EXPECT_EQ((*lookup_res)[0].first, "h1");
-  EXPECT_EQ((*lookup_res)[0].second.host_block_id, 10);
-  EXPECT_EQ((*lookup_res)[1].first, "h2");
-  EXPECT_EQ((*lookup_res)[1].second.host_block_id, 11);
+  TF_ASSERT_OK_AND_ASSIGN(auto lookup_res, backend.Lookup({"h1", "h2"}));
+  EXPECT_EQ(lookup_res.size(), 2);
+  EXPECT_EQ(lookup_res[0].first, "h1");
+  EXPECT_EQ(lookup_res[0].second.host_block_id, 10);
+  EXPECT_EQ(lookup_res[1].first, "h2");
+  EXPECT_EQ(lookup_res[1].second.host_block_id, 11);
 
   // Partial miss at end
-  auto partial_res = backend.Lookup({"h1", "h2", "h3"});
-  ASSERT_TRUE(partial_res.ok());
-  EXPECT_EQ(partial_res->size(), 2);
+  TF_ASSERT_OK_AND_ASSIGN(auto partial_res, backend.Lookup({"h1", "h2", "h3"}));
+  EXPECT_EQ(partial_res.size(), 2);
 
   // Miss at start
-  auto miss_res = backend.Lookup({"h3", "h1"});
-  ASSERT_TRUE(miss_res.ok());
-  EXPECT_TRUE(miss_res->empty());
+  TF_ASSERT_OK_AND_ASSIGN(auto miss_res, backend.Lookup({"h3", "h1"}));
+  EXPECT_TRUE(miss_res.empty());
 }
 
 TEST(HostOffloadBackendTest, SnapshotAndPinHostResidentForRepublish) {
@@ -166,9 +163,8 @@ TEST(HostOffloadBackendTest, LookupUnboundedByAvailableSpace) {
   EXPECT_EQ(backend.GetAvailableSpace(), 0);
 
   // Lookup still succeeds completely despite available_space() == 0
-  auto lookup_res = backend.Lookup({"h1", "h2"});
-  ASSERT_TRUE(lookup_res.ok());
-  EXPECT_EQ(lookup_res->size(), 2);
+  TF_ASSERT_OK_AND_ASSIGN(auto lookup_res, backend.Lookup({"h1", "h2"}));
+  EXPECT_EQ(lookup_res.size(), 2);
 }
 
 TEST(HostOffloadBackendTest, InsertAndLockRollbackOnCapacityExceeded) {
@@ -214,11 +210,10 @@ TEST(HostOffloadBackendTest, InsertAndLockRebindsStaleHbmEntry) {
                        BlockStatus::HBM);
   ASSERT_TRUE(backend.InsertAndLock({"h1"}, {second}, /*on_host=*/false));
 
-  auto lookup_res = backend.Lookup({"h1"});
-  ASSERT_TRUE(lookup_res.ok());
-  ASSERT_EQ(lookup_res->size(), 1);
-  EXPECT_EQ((*lookup_res)[0].second.device_block_id, 9);
-  EXPECT_EQ((*lookup_res)[0].second.status, BlockStatus::HBM);
+  TF_ASSERT_OK_AND_ASSIGN(auto lookup_res, backend.Lookup({"h1"}));
+  ASSERT_EQ(lookup_res.size(), 1);
+  EXPECT_EQ(lookup_res[0].second.device_block_id, 9);
+  EXPECT_EQ(lookup_res[0].second.status, BlockStatus::HBM);
 }
 
 TEST(HostOffloadBackendTest, InsertAndLockKeepsHostResidentEntry) {
@@ -235,11 +230,10 @@ TEST(HostOffloadBackendTest, InsertAndLockKeepsHostResidentEntry) {
                         BlockStatus::HBM);
   ASSERT_TRUE(backend.InsertAndLock({"h1"}, {reoffer}, /*on_host=*/false));
 
-  auto lookup_res = backend.Lookup({"h1"});
-  ASSERT_TRUE(lookup_res.ok());
-  ASSERT_EQ(lookup_res->size(), 1);
-  EXPECT_EQ((*lookup_res)[0].second.status, BlockStatus::HOST);
-  EXPECT_EQ((*lookup_res)[0].second.host_block_id, 3);
+  TF_ASSERT_OK_AND_ASSIGN(auto lookup_res, backend.Lookup({"h1"}));
+  ASSERT_EQ(lookup_res.size(), 1);
+  EXPECT_EQ(lookup_res[0].second.status, BlockStatus::HOST);
+  EXPECT_EQ(lookup_res[0].second.host_block_id, 3);
 }
 
 TEST(HostOffloadBackendTest, LookupReturnsRemoteDescriptors) {
@@ -253,7 +247,7 @@ TEST(HostOffloadBackendTest, LookupReturnsRemoteDescriptors) {
       {.prefix_hash = "r_hash1", .raiden_id = remote_node_id, .block_id = 42},
       {.prefix_hash = "r_hash2", .raiden_id = remote_node_id, .block_id = 43},
   };
-  ASSERT_TRUE(registry_client->Register(regs).ok());
+  ABSL_ASSERT_OK(registry_client->Register(regs));
 
   RaidenId local_node_id{"local_job", "0", "data", 0};
   ::tpu_sync::rpc::RaidenIdProto unit_proto;
@@ -277,22 +271,22 @@ TEST(HostOffloadBackendTest, LookupReturnsRemoteDescriptors) {
                           HostOffloadBackend::Create(config, controller.get()));
   EXPECT_EQ(backend->name(), "HostOffloadBackend");
 
-  auto lookup_res = backend->Lookup({"r_hash1", "r_hash2"});
-  ASSERT_TRUE(lookup_res.ok());
-  EXPECT_EQ(lookup_res->size(), 2);
-  EXPECT_EQ((*lookup_res)[0].first, "r_hash1");
-  EXPECT_EQ((*lookup_res)[0].second.status, BlockStatus::REMOTE);
-  EXPECT_EQ((*lookup_res)[0].second.host_block_id, 42);
-  EXPECT_EQ((*lookup_res)[0].second.raiden_id, remote_node_id);
+  TF_ASSERT_OK_AND_ASSIGN(auto lookup_res,
+                          backend->Lookup({"r_hash1", "r_hash2"}));
+  EXPECT_EQ(lookup_res.size(), 2);
+  EXPECT_EQ(lookup_res[0].first, "r_hash1");
+  EXPECT_EQ(lookup_res[0].second.status, BlockStatus::REMOTE);
+  EXPECT_EQ(lookup_res[0].second.host_block_id, 42);
+  EXPECT_EQ(lookup_res[0].second.raiden_id, remote_node_id);
 
-  EXPECT_EQ((*lookup_res)[1].first, "r_hash2");
-  EXPECT_EQ((*lookup_res)[1].second.status, BlockStatus::REMOTE);
-  EXPECT_EQ((*lookup_res)[1].second.host_block_id, 43);
+  EXPECT_EQ(lookup_res[1].first, "r_hash2");
+  EXPECT_EQ(lookup_res[1].second.status, BlockStatus::REMOTE);
+  EXPECT_EQ(lookup_res[1].second.host_block_id, 43);
 
   // Lookup with miss stops at miss
-  auto partial_res = backend->Lookup({"r_hash1", "missing_hash"});
-  ASSERT_TRUE(partial_res.ok());
-  EXPECT_EQ(partial_res->size(), 1);
+  TF_ASSERT_OK_AND_ASSIGN(auto partial_res,
+                          backend->Lookup({"r_hash1", "missing_hash"}));
+  EXPECT_EQ(partial_res.size(), 1);
 }
 
 TEST(HostOffloadBackendTest,
@@ -308,7 +302,7 @@ TEST(HostOffloadBackendTest,
        .raiden_id = local_node_id,
        .block_id = 99},
   };
-  ASSERT_TRUE(registry_client->Register(regs).ok());
+  ABSL_ASSERT_OK(registry_client->Register(regs));
 
   ::tpu_sync::rpc::RaidenIdProto unit_proto;
   unit_proto.set_job_name(local_node_id.job_name);
@@ -330,9 +324,8 @@ TEST(HostOffloadBackendTest,
   TF_ASSERT_OK_AND_ASSIGN(auto backend,
                           HostOffloadBackend::Create(config, controller.get()));
 
-  auto lookup_res = backend->Lookup({"local_g_hash"});
-  ASSERT_TRUE(lookup_res.ok());
-  EXPECT_EQ(lookup_res->size(), 0);
+  TF_ASSERT_OK_AND_ASSIGN(auto lookup_res, backend->Lookup({"local_g_hash"}));
+  EXPECT_EQ(lookup_res.size(), 0);
 }
 
 TEST(HostOffloadBackendTest, CreateRegistersKVTransferSpecFromConfig) {
@@ -367,17 +360,17 @@ TEST(HostOffloadBackendTest, CreateRegistersKVTransferSpecFromConfig) {
   auto channel =
       grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
   global_registry::GlobalRegistryClient registry_client(channel);
-  auto spec = registry_client.GetKVTransferSpec("node_group");
-  ASSERT_TRUE(spec.ok()) << spec.status();
-  ASSERT_EQ(spec->block_arrays_size(), 2);
-  EXPECT_EQ(spec->block_arrays(0).block_bytes(), 4096);
-  EXPECT_EQ(spec->block_arrays(1).block_bytes(), 512);
-  EXPECT_EQ(spec->num_kv_shards(), 2);
-  EXPECT_EQ(spec->num_workers(), 2);
+  TF_ASSERT_OK_AND_ASSIGN(auto spec,
+                          registry_client.GetKVTransferSpec("node_group"));
+  ASSERT_EQ(spec.block_arrays_size(), 2);
+  EXPECT_EQ(spec.block_arrays(0).block_bytes(), 4096);
+  EXPECT_EQ(spec.block_arrays(1).block_bytes(), 512);
+  EXPECT_EQ(spec.num_kv_shards(), 2);
+  EXPECT_EQ(spec.num_workers(), 2);
 
   // Creating another backend with the identical spec is a no-op validation;
   // a differing spec fails creation.
-  EXPECT_TRUE(HostOffloadBackend::Create(config, controller.get()).ok());
+  ABSL_EXPECT_OK(HostOffloadBackend::Create(config, controller.get()));
   config.kv_transfer_spec->num_kv_shards = 4;
   EXPECT_TRUE(absl::IsInvalidArgument(
       HostOffloadBackend::Create(config, controller.get()).status()));
@@ -422,7 +415,7 @@ TEST(HostOffloadBackendTest, ComposeKVTransferSpecFromUniformWorkers) {
   workers.push_back(GeometryWorker("w0", /*node_id=*/0, {4096, 512}, 2));
 
   auto spec = HostOffloadBackendTest::ComposeKVTransferSpec(workers);
-  ASSERT_OK(spec.status());
+  ABSL_ASSERT_OK(spec.status());
   EXPECT_EQ(spec->block_array_bytes, (std::vector<uint64_t>{4096, 512}));
   EXPECT_EQ(spec->num_kv_shards, 2);
   EXPECT_EQ(spec->num_workers, 2);
@@ -502,7 +495,7 @@ TEST(HostOffloadBackendTest, ServerLifecycleAndControllerInitialization) {
   auto store_server = KVCacheStoreServer::Create();
   // A wildcard bind reports no publishable address,
   // so bind a real, dialable host.
-  ASSERT_OK(
+  ABSL_ASSERT_OK(
       store_server->StartServer(backend.get(), controller.get(), "127.0.0.1"));
   EXPECT_GT(store_server->GetGrpcPort(), 0);
   EXPECT_FALSE(store_server->GetServerAddress().empty());
@@ -537,7 +530,7 @@ TEST(HostOffloadBackendTest, StartServerStripsControllerPort) {
   auto store_server = KVCacheStoreServer::Create();
   std::string ctrl_addr = controller->controller_address();
   std::string target_host = ctrl_addr.substr(0, ctrl_addr.rfind(':'));
-  ASSERT_OK(
+  ABSL_ASSERT_OK(
       store_server->StartServer(backend.get(), controller.get(), target_host));
   EXPECT_GT(store_server->GetGrpcPort(), 0);
   EXPECT_NE(store_server->GetGrpcPort(), 12345);
@@ -563,7 +556,7 @@ TEST(HostOffloadBackendTest, EndToEndFetchRPC) {
   RaidenId src_raiden_id{"src_job", "0", "src_data", 0};
   RaidenId dst_raiden_id{"dst_job", "0", "dst_data", 0};
 
-  ASSERT_OK(src_controller_server->client->RegisterWorker(
+  ABSL_ASSERT_OK(src_controller_server->client->RegisterWorker(
       "worker_0", test_worker_server->server_address,
       {{test_worker_server->server_address, {}}}));
 
@@ -583,7 +576,7 @@ TEST(HostOffloadBackendTest, EndToEndFetchRPC) {
        .raiden_id = dst_raiden_id,
        .block_id = 102},
   };
-  ASSERT_OK(registry_client->Register(registrations));
+  ABSL_ASSERT_OK(registry_client->Register(registrations));
 
   // 6. Create destination HostOffloadBackend & RaidenController
   ::tpu_sync::rpc::RaidenIdProto dst_unit_proto;
@@ -619,15 +612,15 @@ TEST(HostOffloadBackendTest, EndToEndFetchRPC) {
 
   core::controller::RaidenControllerClient dst_controller_client(
       dst_controller->controller_address());
-  ASSERT_OK(dst_controller_client.RegisterWorker(
+  ABSL_ASSERT_OK(dst_controller_client.RegisterWorker(
       "dst_worker_0", test_worker_server->server_address,
       {{test_worker_server->server_address, {}}}));
 
   auto store_server = KVCacheStoreServer::Create();
   // A wildcard bind reports no publishable address,
   // so bind a real, dialable host.
-  ASSERT_OK(store_server->StartServer(backend.get(), dst_controller.get(),
-                                      "127.0.0.1"));
+  ABSL_ASSERT_OK(store_server->StartServer(backend.get(), dst_controller.get(),
+                                           "127.0.0.1"));
   EXPECT_GT(store_server->GetGrpcPort(), 0);
 
   // 7. Issue Fetch RPC using KVCacheStoreClient
@@ -641,7 +634,7 @@ TEST(HostOffloadBackendTest, EndToEndFetchRPC) {
                        .Fetch(hashes, /*device_block_ids=*/{}, host_ids,
                               dst_controller->unit())
                        .Await();
-  ASSERT_OK(fetch_res.status());
+  ABSL_ASSERT_OK(fetch_res.status());
   EXPECT_THAT(fetch_res->done_block_hashes(),
               UnorderedElementsAre("fetch_hash_1", "fetch_hash_2"));
 
@@ -699,7 +692,7 @@ TEST(HostOffloadBackendTest, LoadSuccess) {
        .raiden_id = remote_node_id,
        .block_id = 42},
   };
-  ASSERT_OK(registry_client->Register(regs));
+  ABSL_ASSERT_OK(registry_client->Register(regs));
 
   // Setup local RaidenController
   ::tpu_sync::rpc::RaidenIdProto local_unit;
@@ -737,12 +730,12 @@ TEST(HostOffloadBackendTest, LoadSuccess) {
   auto remote_server = KVCacheStoreServer::Create();
   // A wildcard bind reports no publishable address,
   // so bind a real, dialable host -- this test publishes it below.
-  ASSERT_OK(remote_server->StartServer(remote_backend.get(), controller.get(),
-                                       "127.0.0.1"));
+  ABSL_ASSERT_OK(remote_server->StartServer(remote_backend.get(),
+                                            controller.get(), "127.0.0.1"));
 
-  ASSERT_OK(registry_client->RegisterStore(remote_node_id,
-                                           remote_server->GetServerAddress(),
-                                           controller->controller_address()));
+  ABSL_ASSERT_OK(registry_client->RegisterStore(
+      remote_node_id, remote_server->GetServerAddress(),
+      controller->controller_address()));
 
   BackendConfig local_config;
   local_config.type = "HostOffloadBackend";
@@ -766,7 +759,7 @@ TEST(HostOffloadBackendTest, LoadSuccess) {
 
   core::controller::RaidenControllerClient controller_client(
       controller->controller_address());
-  ASSERT_OK(controller_client.RegisterWorker(
+  ABSL_ASSERT_OK(controller_client.RegisterWorker(
       "worker_0", test_worker_server->server_address,
       {{test_worker_server->server_address, {}}}));
 
@@ -774,7 +767,7 @@ TEST(HostOffloadBackendTest, LoadSuccess) {
   std::vector<std::string> hashes = {"load_hash_1"};
   std::vector<int32_t> dev_ids = {5};
   auto load_future = backend->Load(remote_node_id, hashes, dev_ids);
-  EXPECT_OK(load_future.Await());
+  ABSL_EXPECT_OK(load_future.Await());
 
   remote_server->Shutdown();
 }
@@ -799,7 +792,7 @@ TEST(HostOffloadBackendTest, LoadLocalSuccess) {
 
   core::controller::RaidenControllerClient controller_client(
       controller->controller_address());
-  ASSERT_OK(controller_client.RegisterWorker(
+  ABSL_ASSERT_OK(controller_client.RegisterWorker(
       "worker_0", test_worker_server->server_address,
       {{test_worker_server->server_address, {}}}));
 
@@ -818,7 +811,7 @@ TEST(HostOffloadBackendTest, LoadLocalSuccess) {
                   /*on_host=*/true);
 
   auto load_future = backend->Load(RaidenId{}, {"local_hash_1"}, {5});
-  EXPECT_OK(load_future.Await());
+  ABSL_EXPECT_OK(load_future.Await());
 }
 
 TEST(HostOffloadBackendTest, LoadLocalMissingBlockError) {
@@ -903,7 +896,7 @@ TEST(HostOffloadBackendTest, StoreServerOverride) {
   auto backend = std::dynamic_pointer_cast<HostOffloadBackend>(backend_base);
   ASSERT_NE(backend, nullptr);
   EXPECT_EQ(backend->store_server(), nullptr);
-  ASSERT_TRUE(backend->StartServer("127.0.0.1").ok());
+  ABSL_ASSERT_OK(backend->StartServer("127.0.0.1"));
   EXPECT_NE(backend->store_server(), nullptr);
   backend->store_server()->Shutdown();
 }
@@ -1000,7 +993,7 @@ TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRespectsPinnedSpace) {
 TEST(HostOffloadBackendWriteRemoteTest,
      RegisterBlocksAsyncIsOkWithoutARegistry) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/8);
-  EXPECT_TRUE(backend.RegisterBlocksAsync({"a"}, {1}).Await().ok());
+  ABSL_EXPECT_OK(backend.RegisterBlocksAsync({"a"}, {1}).Await());
 }
 
 TEST(HostOffloadBackendWriteRemoteTest,
@@ -1013,13 +1006,13 @@ TEST(HostOffloadBackendWriteRemoteTest,
       std::make_shared<global_registry::GlobalRegistryClient>(
           reg_server->channel));
 
-  ASSERT_TRUE(backend.RegisterBlocksAsync({"a", "b"}, {7, 8}).Await().ok());
+  ABSL_ASSERT_OK(backend.RegisterBlocksAsync({"a", "b"}, {7, 8}).Await());
 
-  auto looked_up = reg_server->client->Lookup({"a", "b"});
-  ASSERT_TRUE(looked_up.ok()) << looked_up.status().ToString();
-  ASSERT_EQ(looked_up->size(), 2);
-  EXPECT_EQ((*looked_up)[0].block_id(), 7);
-  EXPECT_EQ((*looked_up)[1].block_id(), 8);
+  TF_ASSERT_OK_AND_ASSIGN(auto looked_up,
+                          reg_server->client->Lookup({"a", "b"}));
+  ASSERT_EQ(looked_up.size(), 2);
+  EXPECT_EQ(looked_up[0].block_id(), 7);
+  EXPECT_EQ(looked_up[1].block_id(), 8);
 }
 
 // COMMITTED is only allowed to mean "globally reachable", so a publish that
@@ -1054,9 +1047,9 @@ TEST(HostOffloadBackendTest, LookupAndPinBasicHits) {
 
   backend.Insert(hashes, slices, /*on_host=*/true);
 
-  auto res = backend.Lookup(hashes, LookupOptions{.pin_found = true});
-  ASSERT_TRUE(res.ok());
-  EXPECT_EQ(res->size(), 3);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto res, backend.Lookup(hashes, LookupOptions{.pin_found = true}));
+  EXPECT_EQ(res.size(), 3);
   EXPECT_EQ(backend.GetPinCount("h1"), 1);
   EXPECT_EQ(backend.GetPinCount("h2"), 1);
   EXPECT_EQ(backend.GetPinCount("h3"), 1);
@@ -1072,10 +1065,10 @@ TEST(HostOffloadBackendTest, LookupAndPinPartialMiss) {
 
   backend.Insert(hashes, slices, /*on_host=*/true);
 
-  auto res =
-      backend.Lookup({"h1", "h2", "h3"}, LookupOptions{.pin_found = true});
-  ASSERT_TRUE(res.ok());
-  EXPECT_EQ(res->size(), 2);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto res,
+      backend.Lookup({"h1", "h2", "h3"}, LookupOptions{.pin_found = true}));
+  EXPECT_EQ(res.size(), 2);
   EXPECT_EQ(backend.GetPinCount("h1"), 1);
   EXPECT_EQ(backend.GetPinCount("h2"), 1);
   EXPECT_EQ(backend.GetPinCount("h3"), 0);
@@ -1090,7 +1083,7 @@ TEST(HostOffloadBackendTest, LookupAndPinRemoteDescriptorsUnpinnedLocally) {
   std::vector<global_registry::Registration> regs = {
       {.prefix_hash = "r1", .raiden_id = remote_node_id, .block_id = 42},
   };
-  ASSERT_TRUE(registry_client->Register(regs).ok());
+  ABSL_ASSERT_OK(registry_client->Register(regs));
 
   RaidenId local_node_id{"local_job", "0", "data", 0};
   ::tpu_sync::rpc::RaidenIdProto unit_proto;
@@ -1113,12 +1106,13 @@ TEST(HostOffloadBackendTest, LookupAndPinRemoteDescriptorsUnpinnedLocally) {
   TF_ASSERT_OK_AND_ASSIGN(auto backend,
                           HostOffloadBackend::Create(config, controller.get()));
 
-  auto lookup_res = backend->Lookup(
-      {"r1"}, LookupOptions{.enable_global = true, .pin_found = true});
-  ASSERT_TRUE(lookup_res.ok());
-  ASSERT_EQ(lookup_res->size(), 1);
-  EXPECT_EQ((*lookup_res)[0].first, "r1");
-  EXPECT_EQ((*lookup_res)[0].second.status, BlockStatus::REMOTE);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto lookup_res,
+      backend->Lookup({"r1"},
+                      LookupOptions{.enable_global = true, .pin_found = true}));
+  ASSERT_EQ(lookup_res.size(), 1);
+  EXPECT_EQ(lookup_res[0].first, "r1");
+  EXPECT_EQ(lookup_res[0].second.status, BlockStatus::REMOTE);
   EXPECT_EQ(backend->GetPinCount("r1"), 0);
 }
 
@@ -1177,7 +1171,7 @@ void InsertLocal(KVCacheStoreBackend* backend, const RaidenId& local_id,
 void RegisterGlobal(global_registry::GlobalRegistryClient* client,
                     const RaidenId& owner, const std::string& hash,
                     int block_id) {
-  ASSERT_OK(client->Register(
+  ABSL_ASSERT_OK(client->Register(
       {{.prefix_hash = hash, .raiden_id = owner, .block_id = block_id}}));
 }
 
@@ -1190,7 +1184,7 @@ TEST(HostOffloadBackendTest, LookupInterleavesLocalAndRemoteHits) {
   InsertLocal(f->backend.get(), f->local_id, "l2", 12);
 
   auto res = f->backend->Lookup({"r1", "l1", "r2", "l2", "nowhere"});
-  ASSERT_OK(res.status());
+  ABSL_ASSERT_OK(res.status());
   ASSERT_EQ(res->size(), 4) << "the answer must run to the first hash that "
                                "neither source can resolve";
 
@@ -1224,7 +1218,7 @@ TEST(HostOffloadBackendTest,
   InsertLocal(f->backend.get(), f->local_id, "l2", 12);
 
   auto res = f->backend->Lookup({"r1", "r2", "l1", "l2"});
-  ASSERT_OK(res.status());
+  ABSL_ASSERT_OK(res.status());
   ASSERT_EQ(res->size(), 4);
   EXPECT_EQ((*res)[2].second.status, BlockStatus::HOST);
   EXPECT_EQ((*res)[2].second.host_block_id, 11);
@@ -1243,7 +1237,7 @@ TEST(HostOffloadBackendTest,
   RegisterGlobal(f->registry->client.get(), f->peer_id, "l1", 91);
 
   auto res = f->backend->Lookup({"r1", "l1"});
-  ASSERT_OK(res.status());
+  ABSL_ASSERT_OK(res.status());
   ASSERT_EQ(res->size(), 2);
   EXPECT_EQ((*res)[1].first, "l1");
   EXPECT_EQ((*res)[1].second.status, BlockStatus::HOST);
@@ -1259,7 +1253,7 @@ TEST(HostOffloadBackendTest, LookupInterleavedStopsAtTheFirstAbsoluteMiss) {
   // may be reported however reachable it is.
 
   auto res = f->backend->Lookup({"l1", "gap", "l2"});
-  ASSERT_OK(res.status());
+  ABSL_ASSERT_OK(res.status());
   ASSERT_EQ(res->size(), 1);
   EXPECT_EQ((*res)[0].first, "l1");
 }
@@ -1275,7 +1269,7 @@ TEST(HostOffloadBackendTest, LookupInterleavedPinsOnlyTheReturnedPrefix) {
   // never release it.
   auto res = f->backend->Lookup({"r1", "l1", "gap", "l2"},
                                 LookupOptions{.pin_found = true});
-  ASSERT_OK(res.status());
+  ABSL_ASSERT_OK(res.status());
   ASSERT_EQ(res->size(), 2);
   EXPECT_EQ(f->backend->GetPinCount("l1"), 1);
   EXPECT_EQ(f->backend->GetPinCount("l2"), 0);
@@ -1290,12 +1284,12 @@ TEST(HostOffloadBackendTest, LookupInterleavedDisabledStopsAtFirstLocalMiss) {
 
   auto legacy = f->backend->Lookup(
       {"r1", "l1"}, LookupOptions{.enable_interleaved_lookup = false});
-  ASSERT_OK(legacy.status());
+  ABSL_ASSERT_OK(legacy.status());
   ASSERT_EQ(legacy->size(), 1);
   EXPECT_EQ((*legacy)[0].first, "r1");
 
   auto interleaved = f->backend->Lookup({"r1", "l1"});
-  ASSERT_OK(interleaved.status());
+  ABSL_ASSERT_OK(interleaved.status());
   ASSERT_EQ(interleaved->size(), 2);
   EXPECT_EQ((*interleaved)[1].first, "l1");
   EXPECT_EQ((*interleaved)[1].second.status, BlockStatus::HOST);
@@ -1309,13 +1303,13 @@ TEST(HostOffloadBackendTest, LookupInterleavedWithoutGlobalStopsAtLocalMiss) {
 
   auto res =
       f->backend->Lookup({"r1", "l1"}, LookupOptions{.enable_global = false});
-  ASSERT_OK(res.status());
+  ABSL_ASSERT_OK(res.status());
   EXPECT_TRUE(res->empty()) << "with no registry to consult, a local miss "
                                "still ends the answer";
 
   auto res2 =
       f->backend->Lookup({"l1", "r1"}, LookupOptions{.enable_global = false});
-  ASSERT_OK(res2.status());
+  ABSL_ASSERT_OK(res2.status());
   ASSERT_EQ(res2->size(), 1);
   EXPECT_EQ((*res2)[0].first, "l1");
 }
@@ -1332,7 +1326,7 @@ TEST(HostOffloadBackendTest, LookupInterleavedWithoutRegistryClient) {
 
   auto res =
       backend.Lookup({"l1", "gap", "l2"}, LookupOptions{.pin_found = true});
-  ASSERT_OK(res.status());
+  ABSL_ASSERT_OK(res.status());
   ASSERT_EQ(res->size(), 1);
   EXPECT_EQ((*res)[0].first, "l1");
   EXPECT_EQ(backend.GetPinCount("l1"), 1);
@@ -1350,7 +1344,7 @@ TEST(HostOffloadBackendTest, DeleteSkipsPinnedBlocks) {
   // Deleting a pinned block must skip it without erasing the block.
   backend.Delete({"h1"}, {});
   auto lookup_res = backend.Lookup({"h1"});
-  ASSERT_OK(lookup_res.status());
+  ABSL_ASSERT_OK(lookup_res.status());
   EXPECT_EQ(lookup_res->size(), 1);
 
   backend.Release({"h1"});
@@ -1359,7 +1353,7 @@ TEST(HostOffloadBackendTest, DeleteSkipsPinnedBlocks) {
   // Now that it's unpinned, Delete removes it.
   backend.Delete({"h1"}, {});
   auto lookup_after = backend.Lookup({"h1"});
-  ASSERT_OK(lookup_after.status());
+  ABSL_ASSERT_OK(lookup_after.status());
   EXPECT_TRUE(lookup_after->empty());
 }
 

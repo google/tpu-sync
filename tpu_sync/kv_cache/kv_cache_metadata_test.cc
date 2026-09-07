@@ -22,13 +22,16 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
 namespace {
 
+using ::absl_testing::StatusIs;
 using ::testing::ElementsAre;
 using ::testing::FieldsAre;
 using ::testing::IsEmpty;
@@ -51,103 +54,98 @@ class Region {
 
 TEST(KVCacheMetadataTest, FormatCreatesEmptyTable) {
   Region region(4);
-  auto metadata_or = KVCacheMetadata::Format(region.span(), 4);
-  ASSERT_TRUE(metadata_or.ok());
-  EXPECT_EQ(metadata_or->num_blocks(), 4);
-  EXPECT_THAT(metadata_or->ValidEntries(), IsEmpty());
+  TF_ASSERT_OK_AND_ASSIGN(auto metadata,
+                          KVCacheMetadata::Format(region.span(), 4));
+  EXPECT_EQ(metadata.num_blocks(), 4);
+  EXPECT_THAT(metadata.ValidEntries(), IsEmpty());
 }
 
 TEST(KVCacheMetadataTest, FormatRejectsInvalidRegions) {
   Region region(4);
-  EXPECT_EQ(KVCacheMetadata::Format(region.span(), 0).status().code(),
-            absl::StatusCode::kInvalidArgument);
-  EXPECT_EQ(KVCacheMetadata::Format(absl::Span<uint8_t>(), 4).status().code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(KVCacheMetadata::Format(region.span(), 0),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(KVCacheMetadata::Format(absl::Span<uint8_t>(), 4),
+              StatusIs(absl::StatusCode::kInvalidArgument));
   // Too small for 8 blocks.
-  EXPECT_EQ(
-      KVCacheMetadata::Format(region.span().subspan(0, 128), 8).status().code(),
-      absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(KVCacheMetadata::Format(region.span().subspan(0, 128), 8),
+              StatusIs(absl::StatusCode::kInvalidArgument));
   // Misaligned.
-  EXPECT_EQ(
-      KVCacheMetadata::Format(region.span().subspan(1), 2).status().code(),
-      absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(KVCacheMetadata::Format(region.span().subspan(1), 2),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST(KVCacheMetadataTest, SetAndClearRoundTrip) {
   Region region(4);
-  auto metadata_or = KVCacheMetadata::Format(region.span(), 4);
-  ASSERT_TRUE(metadata_or.ok());
+  TF_ASSERT_OK_AND_ASSIGN(auto metadata,
+                          KVCacheMetadata::Format(region.span(), 4));
 
-  ASSERT_TRUE(metadata_or->Set(1, "hash_b", /*seq=*/2).ok());
-  ASSERT_TRUE(metadata_or->Set(3, "hash_d", /*seq=*/1).ok());
-  EXPECT_THAT(
-      metadata_or->ValidEntries(),
-      ElementsAre(FieldsAre(1, "hash_b", 2), FieldsAre(3, "hash_d", 1)));
+  ABSL_ASSERT_OK(metadata.Set(1, "hash_b", /*seq=*/2));
+  ABSL_ASSERT_OK(metadata.Set(3, "hash_d", /*seq=*/1));
+  EXPECT_THAT(metadata.ValidEntries(), ElementsAre(FieldsAre(1, "hash_b", 2),
+                                                   FieldsAre(3, "hash_d", 1)));
 
-  ASSERT_TRUE(metadata_or->Clear(1).ok());
-  EXPECT_THAT(metadata_or->ValidEntries(),
-              ElementsAre(FieldsAre(3, "hash_d", 1)));
+  ABSL_ASSERT_OK(metadata.Clear(1));
+  EXPECT_THAT(metadata.ValidEntries(), ElementsAre(FieldsAre(3, "hash_d", 1)));
 }
 
 TEST(KVCacheMetadataTest, SetOverwritesPreviousBinding) {
   Region region(2);
-  auto metadata_or = KVCacheMetadata::Format(region.span(), 2);
-  ASSERT_TRUE(metadata_or.ok());
+  TF_ASSERT_OK_AND_ASSIGN(auto metadata,
+                          KVCacheMetadata::Format(region.span(), 2));
 
-  ASSERT_TRUE(metadata_or->Set(0, "old_hash", /*seq=*/1).ok());
-  ASSERT_TRUE(metadata_or->Set(0, "new", /*seq=*/2).ok());
-  EXPECT_THAT(metadata_or->ValidEntries(), ElementsAre(FieldsAre(0, "new", 2)));
+  ABSL_ASSERT_OK(metadata.Set(0, "old_hash", /*seq=*/1));
+  ABSL_ASSERT_OK(metadata.Set(0, "new", /*seq=*/2));
+  EXPECT_THAT(metadata.ValidEntries(), ElementsAre(FieldsAre(0, "new", 2)));
 }
 
 TEST(KVCacheMetadataTest, SetValidatesArguments) {
   Region region(2);
-  auto metadata_or = KVCacheMetadata::Format(region.span(), 2);
-  ASSERT_TRUE(metadata_or.ok());
+  TF_ASSERT_OK_AND_ASSIGN(auto metadata,
+                          KVCacheMetadata::Format(region.span(), 2));
 
-  EXPECT_EQ(metadata_or->Set(-1, "h", 0).code(),
-            absl::StatusCode::kInvalidArgument);
-  EXPECT_EQ(metadata_or->Set(2, "h", 0).code(),
-            absl::StatusCode::kInvalidArgument);
-  EXPECT_EQ(metadata_or->Set(0, "", 0).code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(metadata.Set(-1, "h", 0),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(metadata.Set(2, "h", 0),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(metadata.Set(0, "", 0),
+              StatusIs(absl::StatusCode::kInvalidArgument));
   std::string too_long(KVCacheMetadata::kMaxHashLength + 1, 'x');
-  EXPECT_EQ(metadata_or->Set(0, too_long, 0).code(),
-            absl::StatusCode::kInvalidArgument);
-  EXPECT_EQ(metadata_or->Clear(2).code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(metadata.Set(0, too_long, 0),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(metadata.Clear(2), StatusIs(absl::StatusCode::kInvalidArgument));
 
   std::string max_length(KVCacheMetadata::kMaxHashLength, 'y');
-  EXPECT_TRUE(metadata_or->Set(0, max_length, 0).ok());
-  EXPECT_THAT(metadata_or->ValidEntries(),
+  ABSL_EXPECT_OK(metadata.Set(0, max_length, 0));
+  EXPECT_THAT(metadata.ValidEntries(),
               ElementsAre(FieldsAre(0, max_length, 0)));
 }
 
 TEST(KVCacheMetadataTest, HashesAreOpaqueBytes) {
   Region region(1);
-  auto metadata_or = KVCacheMetadata::Format(region.span(), 1);
-  ASSERT_TRUE(metadata_or.ok());
+  TF_ASSERT_OK_AND_ASSIGN(auto metadata,
+                          KVCacheMetadata::Format(region.span(), 1));
 
   std::string binary_hash("\x00\xff\x00raiden\x01", 10);
-  ASSERT_TRUE(metadata_or->Set(0, binary_hash, /*seq=*/7).ok());
-  EXPECT_THAT(metadata_or->ValidEntries(),
+  ABSL_ASSERT_OK(metadata.Set(0, binary_hash, /*seq=*/7));
+  EXPECT_THAT(metadata.ValidEntries(),
               ElementsAre(FieldsAre(0, binary_hash, 7)));
 }
 
 TEST(KVCacheMetadataTest, AttachRecoversEntriesFromSurvivingRegion) {
   Region region(4);
   {
-    auto metadata_or = KVCacheMetadata::Format(region.span(), 4);
-    ASSERT_TRUE(metadata_or.ok());
-    ASSERT_TRUE(metadata_or->Set(0, "hash_a", /*seq=*/3).ok());
-    ASSERT_TRUE(metadata_or->Set(2, "hash_c", /*seq=*/4).ok());
+    TF_ASSERT_OK_AND_ASSIGN(auto metadata,
+                            KVCacheMetadata::Format(region.span(), 4));
+    ABSL_ASSERT_OK(metadata.Set(0, "hash_a", /*seq=*/3));
+    ABSL_ASSERT_OK(metadata.Set(2, "hash_c", /*seq=*/4));
     // The view is dropped here; the region survives, as shared memory would
     // across an engine crash.
   }
 
-  auto recovered_or = KVCacheMetadata::Attach(region.span(), 4);
-  ASSERT_TRUE(recovered_or.ok());
-  EXPECT_THAT(
-      recovered_or->ValidEntries(),
-      ElementsAre(FieldsAre(0, "hash_a", 3), FieldsAre(2, "hash_c", 4)));
+  TF_ASSERT_OK_AND_ASSIGN(auto recovered,
+                          KVCacheMetadata::Attach(region.span(), 4));
+  EXPECT_THAT(recovered.ValidEntries(), ElementsAre(FieldsAre(0, "hash_a", 3),
+                                                    FieldsAre(2, "hash_c", 4)));
 }
 
 TEST(KVCacheMetadataTest, AttachRejectsUnformattedOrMismatchedRegions) {
@@ -157,52 +155,48 @@ TEST(KVCacheMetadataTest, AttachRejectsUnformattedOrMismatchedRegions) {
 
   // Never formatted.
   std::memset(region.span().data(), 0, KVCacheMetadata::RequiredSizeBytes(4));
-  EXPECT_EQ(KVCacheMetadata::Attach(region.span(), 4).status().code(),
-            absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(KVCacheMetadata::Attach(region.span(), 4),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
 
-  ASSERT_TRUE(KVCacheMetadata::Format(region.span(), 4).ok());
+  ABSL_ASSERT_OK(KVCacheMetadata::Format(region.span(), 4));
   // Formatted for 4 blocks, attached expecting 8 (block pool resized across
   // the restart): the table no longer matches the pool, treat as cold start.
-  EXPECT_EQ(KVCacheMetadata::Attach(region.span(), 8).status().code(),
-            absl::StatusCode::kFailedPrecondition);
-  EXPECT_TRUE(KVCacheMetadata::Attach(region.span(), 4).ok());
+  EXPECT_THAT(KVCacheMetadata::Attach(region.span(), 8),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+  ABSL_EXPECT_OK(KVCacheMetadata::Attach(region.span(), 4));
 }
 
 TEST(KVCacheMetadataTest, AttachValidatesModelUid) {
   Region region(4);
-  ASSERT_TRUE(KVCacheMetadata::Format(region.span(), 4, "model_a").ok());
+  ABSL_ASSERT_OK(KVCacheMetadata::Format(region.span(), 4, "model_a"));
 
   // A table recorded under another model (or none) must not attach: its
   // bindings describe another model's blocks.
-  EXPECT_TRUE(KVCacheMetadata::Attach(region.span(), 4, "model_a").ok());
-  EXPECT_EQ(
-      KVCacheMetadata::Attach(region.span(), 4, "model_b").status().code(),
-      absl::StatusCode::kFailedPrecondition);
-  EXPECT_EQ(KVCacheMetadata::Attach(region.span(), 4).status().code(),
-            absl::StatusCode::kFailedPrecondition);
+  ABSL_EXPECT_OK(KVCacheMetadata::Attach(region.span(), 4, "model_a"));
+  EXPECT_THAT(KVCacheMetadata::Attach(region.span(), 4, "model_b"),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+  EXPECT_THAT(KVCacheMetadata::Attach(region.span(), 4),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
 
   // Longer than the header field can record.
-  EXPECT_EQ(KVCacheMetadata::Format(region.span(), 4, std::string(64, 'x'))
-                .status()
-                .code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(KVCacheMetadata::Format(region.span(), 4, std::string(64, 'x')),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST(KVCacheMetadataTest, FormatWipesSurvivingEntries) {
   Region region(2);
-  auto metadata_or = KVCacheMetadata::Format(region.span(), 2);
-  ASSERT_TRUE(metadata_or.ok());
-  ASSERT_TRUE(metadata_or->Set(0, "stale", /*seq=*/1).ok());
+  TF_ASSERT_OK_AND_ASSIGN(auto metadata,
+                          KVCacheMetadata::Format(region.span(), 2));
+  ABSL_ASSERT_OK(metadata.Set(0, "stale", /*seq=*/1));
 
-  auto reformatted_or = KVCacheMetadata::Format(region.span(), 2);
-  ASSERT_TRUE(reformatted_or.ok());
-  EXPECT_THAT(reformatted_or->ValidEntries(), IsEmpty());
+  TF_ASSERT_OK_AND_ASSIGN(auto reformatted,
+                          KVCacheMetadata::Format(region.span(), 2));
+  EXPECT_THAT(reformatted.ValidEntries(), IsEmpty());
 }
 
 TEST(KVCacheMetadataTest, UncommittedEntryIsInvisible) {
   Region region(2);
-  auto metadata_or = KVCacheMetadata::Format(region.span(), 2);
-  ASSERT_TRUE(metadata_or.ok());
+  ABSL_ASSERT_OK(KVCacheMetadata::Format(region.span(), 2));
 
   // Simulate a crash after the hash bytes landed but before the entry was
   // committed: write the fields directly and leave `valid` unset.
@@ -212,9 +206,9 @@ TEST(KVCacheMetadataTest, UncommittedEntryIsInvisible) {
   entry->hash_len = 4;
   std::memcpy(entry->hash, "torn", 4);
 
-  auto recovered_or = KVCacheMetadata::Attach(region.span(), 2);
-  ASSERT_TRUE(recovered_or.ok());
-  EXPECT_THAT(recovered_or->ValidEntries(), IsEmpty());
+  TF_ASSERT_OK_AND_ASSIGN(auto recovered,
+                          KVCacheMetadata::Attach(region.span(), 2));
+  EXPECT_THAT(recovered.ValidEntries(), IsEmpty());
 }
 
 }  // namespace

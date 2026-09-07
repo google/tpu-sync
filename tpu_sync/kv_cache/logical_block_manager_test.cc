@@ -20,12 +20,15 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
 namespace {
 
+using ::absl_testing::StatusIs;
 using ::testing::ElementsAre;
 using ::testing::Eq;
 using ::testing::Optional;
@@ -45,9 +48,8 @@ TEST(LogicalBlockManagerTest, InitialState) {
 
 TEST(LogicalBlockManagerTest, BasicAllocation) {
   LogicalBlockManager manager(5);
-  auto blocks_or = manager.Allocate(3, /*lock=*/false);
-  ASSERT_TRUE(blocks_or.ok());
-  EXPECT_THAT(*blocks_or, ElementsAre(0, 1, 2));
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks, manager.Allocate(3, /*lock=*/false));
+  EXPECT_THAT(blocks, ElementsAre(0, 1, 2));
 
   EXPECT_EQ(manager.num_free_blocks(), 2);
   EXPECT_EQ(manager.num_allocated_blocks(), 3);
@@ -61,9 +63,8 @@ TEST(LogicalBlockManagerTest, BasicAllocation) {
 
 TEST(LogicalBlockManagerTest, AllocationWithLocking) {
   LogicalBlockManager manager(5);
-  auto blocks_or = manager.Allocate(2, /*lock=*/true);
-  ASSERT_TRUE(blocks_or.ok());
-  EXPECT_THAT(*blocks_or, ElementsAre(0, 1));
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks, manager.Allocate(2, /*lock=*/true));
+  EXPECT_THAT(blocks, ElementsAre(0, 1));
 
   EXPECT_EQ(manager.num_locked_blocks(), 2);
   EXPECT_TRUE(manager.IsLocked(0));
@@ -74,72 +75,64 @@ TEST(LogicalBlockManagerTest, LruEvictionOrder) {
   LogicalBlockManager manager(4);
 
   // Allocate 2 blocks to entity 10 (unlocked).
-  auto blocks1 = manager.Allocate(2);
-  ASSERT_TRUE(blocks1.ok());
-  EXPECT_THAT(*blocks1, ElementsAre(0, 1));
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks1, manager.Allocate(2));
+  EXPECT_THAT(blocks1, ElementsAre(0, 1));
 
   // Allocate 2 blocks to entity 20 (unlocked).
-  auto blocks2 = manager.Allocate(2);
-  ASSERT_TRUE(blocks2.ok());
-  EXPECT_THAT(*blocks2, ElementsAre(2, 3));
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks2, manager.Allocate(2));
+  EXPECT_THAT(blocks2, ElementsAre(2, 3));
 
   EXPECT_EQ(manager.num_free_blocks(), 0);
 
   // Requesting 2 blocks for entity 30 should evict entity 10's blocks
   // because they were allocated earlier (LRU).
-  auto blocks3 = manager.Allocate(2);
-  ASSERT_TRUE(blocks3.ok());
-  EXPECT_THAT(*blocks3, ElementsAre(0, 1));
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks3, manager.Allocate(2));
+  EXPECT_THAT(blocks3, ElementsAre(0, 1));
 }
 
 TEST(LogicalBlockManagerTest, AccessUpdatesLruOrder) {
   LogicalBlockManager manager(4);
 
-  auto blocks1 = manager.Allocate(2);
-  ASSERT_TRUE(blocks1.ok());
-  auto blocks2 = manager.Allocate(2);
-  ASSERT_TRUE(blocks2.ok());
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks1, manager.Allocate(2));
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks2, manager.Allocate(2));
 
   // Access entity 10's blocks, making entity 20's blocks the least recently
   // used.
-  EXPECT_TRUE(manager.AccessBlock(0).ok());
-  EXPECT_TRUE(manager.AccessBlock(1).ok());
+  ABSL_EXPECT_OK(manager.AccessBlock(0));
+  ABSL_EXPECT_OK(manager.AccessBlock(1));
 
   // Allocate 2 blocks for entity 30. Should evict entity 20's blocks (2 and 3).
-  auto blocks3 = manager.Allocate(2);
-  ASSERT_TRUE(blocks3.ok());
-  EXPECT_THAT(*blocks3, ElementsAre(2, 3));
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks3, manager.Allocate(2));
+  EXPECT_THAT(blocks3, ElementsAre(2, 3));
 }
 
 TEST(LogicalBlockManagerTest, LockedBlocksPreventEviction) {
   LogicalBlockManager manager(4);
 
   // Allocate 2 locked blocks to entity 10.
-  ASSERT_TRUE(manager.Allocate(2, /*lock=*/true).ok());
+  ABSL_ASSERT_OK(manager.Allocate(2, /*lock=*/true));
   // Allocate 2 unlocked blocks.
-  ASSERT_TRUE(manager.Allocate(2, /*lock=*/false).ok());
+  ABSL_ASSERT_OK(manager.Allocate(2, /*lock=*/false));
 
   // Requesting 3 blocks should fail since only 2 blocks are evictable.
-  auto failed_or = manager.Allocate(3);
-  EXPECT_FALSE(failed_or.ok());
-  EXPECT_TRUE(absl::IsResourceExhausted(failed_or.status()));
+  EXPECT_THAT(manager.Allocate(3),
+              StatusIs(absl::StatusCode::kResourceExhausted));
 }
 
 TEST(LogicalBlockManagerTest, UnlockAllowsEviction) {
   LogicalBlockManager manager(4);
 
-  ASSERT_TRUE(manager.Allocate(2, /*lock=*/true).ok());
-  ASSERT_TRUE(manager.Allocate(2, /*lock=*/false).ok());
+  ABSL_ASSERT_OK(manager.Allocate(2, /*lock=*/true));
+  ABSL_ASSERT_OK(manager.Allocate(2, /*lock=*/false));
 
   // Unlock entity 10's blocks.
   std::vector<int> to_unlock = {0, 1};
-  EXPECT_TRUE(manager.Unlock(to_unlock).ok());
+  ABSL_EXPECT_OK(manager.Unlock(to_unlock));
   EXPECT_EQ(manager.num_locked_blocks(), 0);
 
   // Now requesting 3 blocks succeeds.
-  auto blocks_or = manager.Allocate(3);
-  EXPECT_TRUE(blocks_or.ok());
-  EXPECT_EQ(blocks_or->size(), 3);
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks, manager.Allocate(3));
+  EXPECT_EQ(blocks.size(), 3);
 }
 
 TEST(LogicalBlockManagerTest, InvalidArguments) {
@@ -160,7 +153,7 @@ TEST(LogicalBlockManagerTest, InvalidArguments) {
 
 TEST(LogicalBlockManagerTest, AllocateTargetMarksBlocksAllocatedAndLocked) {
   LogicalBlockManager manager(5);
-  ASSERT_TRUE(manager.AllocateTarget({1, 3}).ok());
+  ABSL_ASSERT_OK(manager.AllocateTarget({1, 3}));
   EXPECT_TRUE(manager.IsAllocated(1));
   EXPECT_TRUE(manager.IsLocked(1));
   EXPECT_TRUE(manager.IsAllocated(3));
@@ -168,26 +161,25 @@ TEST(LogicalBlockManagerTest, AllocateTargetMarksBlocksAllocatedAndLocked) {
   EXPECT_EQ(manager.num_free_blocks(), 3);
 
   // Target-allocated blocks are never handed out by subsequent allocations.
-  auto blocks_or = manager.Allocate(3, /*lock=*/true);
-  ASSERT_TRUE(blocks_or.ok());
-  EXPECT_THAT(*blocks_or, ElementsAre(0, 2, 4));
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks, manager.Allocate(3, /*lock=*/true));
+  EXPECT_THAT(blocks, ElementsAre(0, 2, 4));
   // Everything is locked now: further allocation must fail.
   EXPECT_FALSE(manager.Allocate(1).ok());
 }
 
 TEST(LogicalBlockManagerTest, AllocateTargetValidatesAtomically) {
   LogicalBlockManager manager(5);
-  ASSERT_TRUE(manager.Allocate(1).ok());  // Block 0 becomes allocated.
+  ABSL_ASSERT_OK(manager.Allocate(1));  // Block 0 becomes allocated.
 
   // Out of range.
-  EXPECT_EQ(manager.AllocateTarget({1, 5}).code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(manager.AllocateTarget({1, 5}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
   // Already allocated (even though unlocked).
-  EXPECT_EQ(manager.AllocateTarget({1, 0}).code(),
-            absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(manager.AllocateTarget({1, 0}),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
   // Duplicate ID within the batch.
-  EXPECT_EQ(manager.AllocateTarget({2, 2}).code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(manager.AllocateTarget({2, 2}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 
   // Failed calls must not have modified any state.
   EXPECT_FALSE(manager.IsAllocated(1));
@@ -197,12 +189,12 @@ TEST(LogicalBlockManagerTest, AllocateTargetValidatesAtomically) {
 
 TEST(LogicalBlockManagerTest, DeallocateReturnsBlocksToFreePool) {
   LogicalBlockManager manager(4);
-  ASSERT_TRUE(manager.Allocate(2, /*lock=*/true).ok());
-  ASSERT_TRUE(manager.Allocate(1, /*lock=*/false).ok());
+  ABSL_ASSERT_OK(manager.Allocate(2, /*lock=*/true));
+  ABSL_ASSERT_OK(manager.Allocate(1, /*lock=*/false));
   EXPECT_EQ(manager.num_free_blocks(), 1);
 
   // Deallocation works on locked and unlocked blocks alike.
-  ASSERT_TRUE(manager.Deallocate({0, 2}).ok());
+  ABSL_ASSERT_OK(manager.Deallocate({0, 2}));
   EXPECT_EQ(manager.num_free_blocks(), 3);
   EXPECT_EQ(manager.num_allocated_blocks(), 1);
   EXPECT_EQ(manager.num_locked_blocks(), 1);
@@ -211,42 +203,40 @@ TEST(LogicalBlockManagerTest, DeallocateReturnsBlocksToFreePool) {
   EXPECT_FALSE(manager.IsAllocated(2));
 
   // Deallocated blocks are free again for both allocation paths.
-  ASSERT_TRUE(manager.AllocateTarget({0}).ok());
-  auto blocks_or = manager.Allocate(1);
-  ASSERT_TRUE(blocks_or.ok());
-  EXPECT_THAT(*blocks_or, ElementsAre(2));
+  ABSL_ASSERT_OK(manager.AllocateTarget({0}));
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks, manager.Allocate(1));
+  EXPECT_THAT(blocks, ElementsAre(2));
 }
 
 TEST(LogicalBlockManagerTest, DeallocateValidatesAtomically) {
   LogicalBlockManager manager(3);
-  ASSERT_TRUE(manager.Allocate(1, /*lock=*/true).ok());  // Block 0.
+  ABSL_ASSERT_OK(manager.Allocate(1, /*lock=*/true));  // Block 0.
 
   // Out of range.
-  EXPECT_EQ(manager.Deallocate({0, 3}).code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(manager.Deallocate({0, 3}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
   // Not allocated.
-  EXPECT_EQ(manager.Deallocate({0, 1}).code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(manager.Deallocate({0, 1}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 
   // Failed calls must not have modified any state.
   EXPECT_TRUE(manager.IsAllocated(0));
   EXPECT_TRUE(manager.IsLocked(0));
 
-  ASSERT_TRUE(manager.Deallocate({0}).ok());
+  ABSL_ASSERT_OK(manager.Deallocate({0}));
   // Double deallocation fails.
-  EXPECT_EQ(manager.Deallocate({0}).code(),
-            absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(manager.Deallocate({0}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST(LogicalBlockManagerTest, TargetAllocatedBlocksReusableAfterUnlock) {
   LogicalBlockManager manager(3);
-  ASSERT_TRUE(manager.AllocateTarget({0, 1, 2}).ok());
-  ASSERT_TRUE(manager.Unlock({1}).ok());
+  ABSL_ASSERT_OK(manager.AllocateTarget({0, 1, 2}));
+  ABSL_ASSERT_OK(manager.Unlock({1}));
 
   // The unlocked target-allocated block is evictable and gets reused.
-  auto blocks_or = manager.Allocate(1);
-  ASSERT_TRUE(blocks_or.ok());
-  EXPECT_THAT(*blocks_or, ElementsAre(1));
+  TF_ASSERT_OK_AND_ASSIGN(auto blocks, manager.Allocate(1));
+  EXPECT_THAT(blocks, ElementsAre(1));
 }
 
 }  // namespace

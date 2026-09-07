@@ -23,6 +23,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
@@ -125,15 +126,14 @@ TEST(PoolSpecTest, AdmitsGdnSsmWhenLastLiveByteFitsSharedRawStorage) {
 TEST(PoolSpecTest, ProtoRoundTrip) {
   PoolSpec pool = ValidPool();
   tpu_sync::rpc::PoolSpecProto proto = ToProto(pool);
-  auto roundtrip = PoolSpecFromProto(proto);
-  ABSL_ASSERT_OK(roundtrip);
-  EXPECT_EQ(roundtrip->tag, pool.tag);
-  EXPECT_EQ(roundtrip->storage_index, pool.storage_index);
-  EXPECT_EQ(roundtrip->base_offset_bytes, pool.base_offset_bytes);
-  EXPECT_EQ(roundtrip->block_stride_bytes, pool.block_stride_bytes);
-  EXPECT_EQ(roundtrip->num_blocks, pool.num_blocks);
-  ASSERT_EQ(roundtrip->regions.size(), pool.regions.size());
-  EXPECT_EQ(roundtrip->regions[0].name, pool.regions[0].name);
+  TF_ASSERT_OK_AND_ASSIGN(auto roundtrip, PoolSpecFromProto(proto));
+  EXPECT_EQ(roundtrip.tag, pool.tag);
+  EXPECT_EQ(roundtrip.storage_index, pool.storage_index);
+  EXPECT_EQ(roundtrip.base_offset_bytes, pool.base_offset_bytes);
+  EXPECT_EQ(roundtrip.block_stride_bytes, pool.block_stride_bytes);
+  EXPECT_EQ(roundtrip.num_blocks, pool.num_blocks);
+  ASSERT_EQ(roundtrip.regions.size(), pool.regions.size());
+  EXPECT_EQ(roundtrip.regions[0].name, pool.regions[0].name);
 }
 
 TEST(RegionsCoverRangeTest, Basic) {
@@ -171,9 +171,8 @@ TEST(ComputePoolBlockCopyExtentsTest, Basic) {
       .num_units = 1,
       .units_per_stride = 1,
   }};
-  auto extents_or = ComputePoolBlockCopyExtents(pool, {0, 1, 3, 4, 5});
-  ABSL_ASSERT_OK(extents_or);
-  const auto& extents = *extents_or;
+  TF_ASSERT_OK_AND_ASSIGN(auto extents,
+                          ComputePoolBlockCopyExtents(pool, {0, 1, 3, 4, 5}));
   ASSERT_EQ(extents.size(), 2);
   EXPECT_EQ(extents[0].offset_bytes, 0);
   EXPECT_EQ(extents[0].size_bytes, 2000);  // block 0 and 1 coalesced
@@ -196,17 +195,17 @@ TEST(ComputePoolBlockCopyExtentsTest, OmitsInterRegionAndTrailingPadding) {
   }};
 
   ABSL_ASSERT_OK(pool.Validate(/*storage_bytes=*/184));
-  auto extents_or = ComputePoolBlockCopyExtents(pool, {0, 1});
-  ABSL_ASSERT_OK(extents_or);
-  ASSERT_EQ(extents_or->size(), 4);
-  EXPECT_EQ((*extents_or)[0].offset_bytes, 8);
-  EXPECT_EQ((*extents_or)[0].size_bytes, 16);
-  EXPECT_EQ((*extents_or)[1].offset_bytes, 40);
-  EXPECT_EQ((*extents_or)[1].size_bytes, 16);
-  EXPECT_EQ((*extents_or)[2].offset_bytes, 136);
-  EXPECT_EQ((*extents_or)[2].size_bytes, 16);
-  EXPECT_EQ((*extents_or)[3].offset_bytes, 168);
-  EXPECT_EQ((*extents_or)[3].size_bytes, 16);
+  TF_ASSERT_OK_AND_ASSIGN(auto extents,
+                          ComputePoolBlockCopyExtents(pool, {0, 1}));
+  ASSERT_EQ(extents.size(), 4);
+  EXPECT_EQ(extents[0].offset_bytes, 8);
+  EXPECT_EQ(extents[0].size_bytes, 16);
+  EXPECT_EQ(extents[1].offset_bytes, 40);
+  EXPECT_EQ(extents[1].size_bytes, 16);
+  EXPECT_EQ(extents[2].offset_bytes, 136);
+  EXPECT_EQ(extents[2].size_bytes, 16);
+  EXPECT_EQ(extents[3].offset_bytes, 168);
+  EXPECT_EQ(extents[3].size_bytes, 16);
 }
 
 TEST(ComputePoolBlockCopyExtentsTest,
@@ -231,24 +230,21 @@ TEST(ComputePoolBlockCopyExtentsTest,
   }
 
   ABSL_ASSERT_OK(pool.Validate(/*storage_bytes=*/1884160));
-  auto extents_or = ComputePoolBlockCopyExtents(pool, {0});
-  ABSL_ASSERT_OK(extents_or);
-  ASSERT_EQ(extents_or->size(), 4);
+  TF_ASSERT_OK_AND_ASSIGN(auto extents, ComputePoolBlockCopyExtents(pool, {0}));
+  ASSERT_EQ(extents.size(), 4);
   for (int64_t head_group = 0; head_group < 4; ++head_group) {
-    EXPECT_EQ((*extents_or)[head_group].offset_bytes, head_group * 540672);
-    EXPECT_EQ((*extents_or)[head_group].size_bytes, 262144);
+    EXPECT_EQ(extents[head_group].offset_bytes, head_group * 540672);
+    EXPECT_EQ(extents[head_group].size_bytes, 262144);
   }
 }
 
 TEST(PoolLiveSegmentsTest, ExpandsStridedRegionsToCompactRuns) {
-  absl::StatusOr<std::vector<PoolLiveSegment>> segments =
-      ExpandPoolLiveSegments(ValidPool());
-  ASSERT_TRUE(segments.ok()) << segments.status().ToString();
-  ASSERT_EQ(segments->size(), 5u);
+  TF_ASSERT_OK_AND_ASSIGN(auto segments, ExpandPoolLiveSegments(ValidPool()));
+  ASSERT_EQ(segments.size(), 5u);
   for (int64_t unit = 0; unit < 5; ++unit) {
-    EXPECT_EQ((*segments)[unit].logical_offset, unit * 20);
-    EXPECT_EQ((*segments)[unit].physical_offset, unit * 100);
-    EXPECT_EQ((*segments)[unit].size, 20);
+    EXPECT_EQ(segments[unit].logical_offset, unit * 20);
+    EXPECT_EQ(segments[unit].physical_offset, unit * 100);
+    EXPECT_EQ(segments[unit].size, 20);
   }
 }
 
@@ -272,13 +268,11 @@ TEST(PoolLiveSegmentsTest, CoalescesAbuttingRegionsAndRejectsOverlap) {
           .units_per_stride = 1,
       },
   };
-  absl::StatusOr<std::vector<PoolLiveSegment>> segments =
-      ExpandPoolLiveSegments(pool);
-  ASSERT_TRUE(segments.ok()) << segments.status().ToString();
-  ASSERT_EQ(segments->size(), 1u);
-  EXPECT_EQ((*segments)[0].logical_offset, 0);
-  EXPECT_EQ((*segments)[0].physical_offset, 0);
-  EXPECT_EQ((*segments)[0].size, 50);
+  TF_ASSERT_OK_AND_ASSIGN(auto segments, ExpandPoolLiveSegments(pool));
+  ASSERT_EQ(segments.size(), 1u);
+  EXPECT_EQ(segments[0].logical_offset, 0);
+  EXPECT_EQ(segments[0].physical_offset, 0);
+  EXPECT_EQ(segments[0].size, 50);
 
   pool.regions[1].offset_bytes = 10;
   EXPECT_THAT(ExpandPoolLiveSegments(pool).status(),
@@ -287,19 +281,16 @@ TEST(PoolLiveSegmentsTest, CoalescesAbuttingRegionsAndRejectsOverlap) {
 }
 
 TEST(PhysicalLiveRangeToLogicalTest, MapsWithinRunsAndRejectsPaddingCross) {
-  absl::StatusOr<std::vector<PoolLiveSegment>> segments =
-      ExpandPoolLiveSegments(ValidPool());
-  ASSERT_TRUE(segments.ok()) << segments.status().ToString();
+  TF_ASSERT_OK_AND_ASSIGN(auto segments, ExpandPoolLiveSegments(ValidPool()));
 
-  absl::StatusOr<std::pair<int64_t, int64_t>> range =
-      PhysicalLiveRangeToLogical(*segments, /*physical_offset=*/105,
-                                 /*size=*/10);
-  ASSERT_TRUE(range.ok()) << range.status().ToString();
-  EXPECT_EQ(range->first, 25);
-  EXPECT_EQ(range->second, 35);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto range, PhysicalLiveRangeToLogical(segments, /*physical_offset=*/105,
+                                             /*size=*/10));
+  EXPECT_EQ(range.first, 25);
+  EXPECT_EQ(range.second, 35);
 
   EXPECT_THAT(
-      PhysicalLiveRangeToLogical(*segments, /*physical_offset=*/15, /*size=*/10)
+      PhysicalLiveRangeToLogical(segments, /*physical_offset=*/15, /*size=*/10)
           .status(),
       StatusIs(absl::StatusCode::kInvalidArgument,
                HasSubstr("crosses padding")));

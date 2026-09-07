@@ -118,17 +118,17 @@ KVCacheMetadataShmRegion::AttachOrFormat(absl::string_view shm_key,
     }
     if (mapped != MAP_FAILED) {
       auto span = absl::MakeSpan(static_cast<uint8_t*>(mapped), size);
-      auto metadata_or = KVCacheMetadata::Attach(span, num_blocks, model_uid);
-      if (metadata_or.ok()) {
+      auto metadata = KVCacheMetadata::Attach(span, num_blocks, model_uid);
+      if (metadata.ok()) {
         VLOG(1) << "Attached to the surviving KV metadata table " << key;
         return std::unique_ptr<KVCacheMetadataShmRegion>(
-            new KVCacheMetadataShmRegion(fd, mapped, size, *metadata_or,
+            new KVCacheMetadataShmRegion(fd, mapped, size, *metadata,
                                          /*warm=*/true, num_blocks,
                                          std::string(model_uid)));
       }
       LOG(WARNING) << "Surviving KV metadata table " << key
                    << " failed validation, re-creating: "
-                   << metadata_or.status().message();
+                   << metadata.status().message();
       munmap(mapped, size);
     } else {
       LOG(WARNING) << "Surviving KV metadata segment " << key
@@ -165,17 +165,17 @@ KVCacheMetadataShmRegion::AttachOrFormat(absl::string_view shm_key,
     return status;
   }
   auto span = absl::MakeSpan(static_cast<uint8_t*>(mapped), size);
-  auto metadata_or = KVCacheMetadata::Format(span, num_blocks, model_uid);
-  if (!metadata_or.ok()) {
+  auto metadata = KVCacheMetadata::Format(span, num_blocks, model_uid);
+  if (!metadata.ok()) {
     munmap(mapped, size);
     close(fd);
     shm_unlink(key.c_str());
-    return metadata_or.status();
+    return metadata.status();
   }
   VLOG(1) << "Formatted a fresh KV metadata table " << key;
-  return std::unique_ptr<KVCacheMetadataShmRegion>(new KVCacheMetadataShmRegion(
-      fd, mapped, size, *metadata_or, /*warm=*/false, num_blocks,
-      std::string(model_uid)));
+  return std::unique_ptr<KVCacheMetadataShmRegion>(
+      new KVCacheMetadataShmRegion(fd, mapped, size, *metadata, /*warm=*/false,
+                                   num_blocks, std::string(model_uid)));
 }
 
 KVCacheMetadataShmRegion::KVCacheMetadataShmRegion(
@@ -196,11 +196,8 @@ KVCacheMetadataShmRegion::~KVCacheMetadataShmRegion() {
 
 absl::Status KVCacheMetadataShmRegion::Reformat() {
   auto span = absl::MakeSpan(static_cast<uint8_t*>(mapped_), mapped_size_);
-  auto metadata_or = KVCacheMetadata::Format(span, num_blocks_, model_uid_);
-  if (!metadata_or.ok()) {
-    return metadata_or.status();
-  }
-  metadata_ = *metadata_or;
+  ABSL_ASSIGN_OR_RETURN(metadata_,
+                        KVCacheMetadata::Format(span, num_blocks_, model_uid_));
   warm_ = false;
   return absl::OkStatus();
 }

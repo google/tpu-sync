@@ -456,14 +456,14 @@ proto::WriteRemoteEvent KVCacheStoreServiceImpl::MakeResultEvent(
   LookupOptions options;
   options.enable_global = false;
   options.pin_found = true;
-  auto lookup_or = backend_->Lookup(block_hashes, options);
-  if (!lookup_or.ok()) {
+  auto lookup = backend_->Lookup(block_hashes, options);
+  if (!lookup.ok()) {
     reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::NOT_FOUND,
-        absl::StrCat("Validation failed: ", lookup_or.status().message())));
+        absl::StrCat("Validation failed: ", lookup.status().message())));
     return reactor;
   }
-  const auto& lookup_slices = lookup_or.value();
+  const auto& lookup_slices = *lookup;
 
   // The lookup pinned everything it returned. Release that on every exit,
   // including the refusals below.
@@ -696,17 +696,17 @@ KVCacheStoreServiceImpl::WriteRemote(
       std::min(absl::Milliseconds(request->deadline_ms()), DeadlineCap());
 
   // Allocate landing blocks in destination host DRAM for the transfer.
-  auto allocated_ids_or = controller_->AllocateBlockIds(block_hashes.size());
-  if (!allocated_ids_or.ok()) {
+  auto allocated_ids = controller_->AllocateBlockIds(block_hashes.size());
+  if (!allocated_ids.ok()) {
     auto* reactor = new WriteRemoteServerReactor(/*gate=*/nullptr);
     reactor->Finish(::grpc::Status(
         ::grpc::StatusCode::RESOURCE_EXHAUSTED,
         absl::StrCat("Failed to allocate destination landing blocks: ",
-                     allocated_ids_or.status().message())));
+                     allocated_ids.status().message())));
     return reactor;
   }
-  std::vector<int32_t> landing_block_ids(allocated_ids_or->begin(),
-                                         allocated_ids_or->end());
+  std::vector<int32_t> landing_block_ids(allocated_ids->begin(),
+                                         allocated_ids->end());
 
   const absl::Time now = absl::Now();
   const absl::Time deadline = now + granted_deadline;

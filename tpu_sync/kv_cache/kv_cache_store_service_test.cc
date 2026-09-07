@@ -28,6 +28,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
@@ -38,6 +39,7 @@
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/support/status.h"
 #include "xla/tsl/concurrency/future.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/buffer.h"
 #include "tpu_sync/core/controller/controller_client.h"
@@ -76,7 +78,7 @@ class KVCacheStoreServiceTest : public ::testing::Test {
     RaidenId src_raiden_id{"src_job", "0", "src_data", 0};
     RaidenId dst_raiden_id{"dst_job", "0", "dst_data", 0};
 
-    ASSERT_OK(src_controller_server_->client->RegisterWorker(
+    ABSL_ASSERT_OK(src_controller_server_->client->RegisterWorker(
         "worker_0", test_worker_server_->server_address,
         {{test_worker_server_->server_address, {}}}));
 
@@ -97,7 +99,7 @@ class KVCacheStoreServiceTest : public ::testing::Test {
 
     ::tpu_raiden::core::controller::RaidenControllerClient
         dst_controller_client(store_->raiden_controller_address());
-    ASSERT_OK(dst_controller_client.RegisterWorker(
+    ABSL_ASSERT_OK(dst_controller_client.RegisterWorker(
         "dst_worker_0", test_worker_server_->server_address,
         {{test_worker_server_->server_address, {}}}));
 
@@ -110,7 +112,7 @@ class KVCacheStoreServiceTest : public ::testing::Test {
         RaidenBlockId(src_raiden_id, 12, BlockStatus::HOST),
         RaidenBlockId(src_raiden_id, 13, BlockStatus::HOST),
     };
-    ASSERT_TRUE(store_->Insert(test_hashes, slices, /*on_host=*/true).ok());
+    ABSL_ASSERT_OK(store_->Insert(test_hashes, slices, /*on_host=*/true));
 
     // Setup KVCacheStoreServiceImpl & gRPC server
     service_ = std::make_unique<KVCacheStoreServiceImpl>(
@@ -152,9 +154,8 @@ TEST_F(KVCacheStoreServiceTest, FetchEmptyRequest) {
   std::vector<std::string> empty_hashes;
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch(empty_hashes);
-  auto response_or = future.Await();
-  ASSERT_OK(response_or.status());
-  EXPECT_EQ(response_or->done_block_hashes_size(), 0);
+  TF_ASSERT_OK_AND_ASSIGN(auto response, future.Await());
+  EXPECT_EQ(response.done_block_hashes_size(), 0);
 }
 
 TEST_F(KVCacheStoreServiceTest, Fetch5StepWorkflowSuccess) {
@@ -173,11 +174,10 @@ TEST_F(KVCacheStoreServiceTest, Fetch5StepWorkflowSuccess) {
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids, client_id,
                      {client_ep});
-  auto response_or = future.Await();
-  ASSERT_OK(response_or.status());
-  EXPECT_THAT(response_or->done_block_hashes(),
+  TF_ASSERT_OK_AND_ASSIGN(auto response, future.Await());
+  EXPECT_THAT(response.done_block_hashes(),
               UnorderedElementsAre("block_hash_1", "block_hash_2"));
-  EXPECT_EQ(response_or->failed_block_hashes_size(), 0);
+  EXPECT_EQ(response.failed_block_hashes_size(), 0);
 }
 
 TEST_F(KVCacheStoreServiceTest, FetchCrossNodeMissingEndpointsFails) {
@@ -190,9 +190,8 @@ TEST_F(KVCacheStoreServiceTest, FetchCrossNodeMissingEndpointsFails) {
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids,
                      client_id);
-  auto response_or = future.Await();
-  EXPECT_FALSE(response_or.status().ok());
-  EXPECT_EQ(response_or.status().code(), absl::StatusCode::kInvalidArgument);
+  auto response = future.Await();
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST_F(KVCacheStoreServiceTest, FetchValidationFailsForMissingHash) {
@@ -201,8 +200,8 @@ TEST_F(KVCacheStoreServiceTest, FetchValidationFailsForMissingHash) {
 
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids);
-  auto response_or = future.Await();
-  EXPECT_THAT(response_or.status(), StatusIs(absl::StatusCode::kNotFound));
+  auto response = future.Await();
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kNotFound));
 }
 
 // Real block hashes are raw digests, not text. Every other case in this file
@@ -219,10 +218,9 @@ TEST_F(KVCacheStoreServiceTest, FetchValidationFailsForMissingHash) {
 TEST_F(KVCacheStoreServiceTest, FetchRoundTripsNonUtf8Hash) {
   const std::string binary_hash("\xff\xfe\x80\x00\x01\xc0\xaf\xed\xa0\x80", 10);
   RaidenId src_raiden_id{"src_job", "0", "src_data", 0};
-  ASSERT_TRUE(store_->Insert(
+  ABSL_ASSERT_OK(store_->Insert(
       {binary_hash}, {RaidenBlockId(src_raiden_id, 20, BlockStatus::HOST)},
-      /*on_host=*/true)
-                  .ok());
+      /*on_host=*/true));
 
   ::tpu_sync::rpc::RaidenIdProto client_id;
   client_id.set_job_name("client_job");
@@ -236,11 +234,9 @@ TEST_F(KVCacheStoreServiceTest, FetchRoundTripsNonUtf8Hash) {
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch({binary_hash}, /*device_block_ids=*/{},
                      /*host_block_ids=*/{102}, client_id, {client_ep});
-  auto response_or = future.Await();
-  ASSERT_OK(response_or.status());
-  EXPECT_THAT(response_or->done_block_hashes(),
-              UnorderedElementsAre(binary_hash));
-  EXPECT_EQ(response_or->failed_block_hashes_size(), 0);
+  TF_ASSERT_OK_AND_ASSIGN(auto response, future.Await());
+  EXPECT_THAT(response.done_block_hashes(), UnorderedElementsAre(binary_hash));
+  EXPECT_EQ(response.failed_block_hashes_size(), 0);
 }
 
 TEST_F(KVCacheStoreServiceTest, FetchValidationFailsForNonHostBlock) {
@@ -252,13 +248,13 @@ TEST_F(KVCacheStoreServiceTest, FetchValidationFailsForNonHostBlock) {
       RaidenBlockId(src_raiden_id, /*host_block_id=*/-1,
                     /*device_block_id=*/50, BlockStatus::HBM),
   };
-  ASSERT_TRUE(store_->Insert(hashes, slices, /*on_host=*/false).ok());
+  ABSL_ASSERT_OK(store_->Insert(hashes, slices, /*on_host=*/false));
 
   std::vector<int32_t> host_block_ids = {100};
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids);
-  auto response_or = future.Await();
-  EXPECT_THAT(response_or.status(),
+  auto response = future.Await();
+  EXPECT_THAT(response.status(),
               StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 
@@ -274,9 +270,9 @@ TEST_F(KVCacheStoreServiceTest, ARefusedFetchLeavesNoPinBehind) {
   std::vector<std::string> hashes = {"block_hash_1", "no_such_hash"};
   std::vector<int32_t> host_block_ids = {100, 101};
 
-  auto response_or =
+  auto response =
       client_->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids).Await();
-  EXPECT_THAT(response_or.status(), StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kNotFound));
 
   EXPECT_EQ(store_->backend()->GetPinCount("block_hash_1"), before);
 }
@@ -293,9 +289,9 @@ TEST_F(KVCacheStoreServiceTest, ARefusedFetchDoesNotReleaseAPinItDidNotTake) {
                                      "block_hash_1"};
   std::vector<int32_t> host_block_ids = {100, 101, 102};
 
-  auto response_or =
+  auto response =
       client_->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids).Await();
-  EXPECT_THAT(response_or.status(), StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kNotFound));
 
   EXPECT_EQ(store_->backend()->GetPinCount("block_hash_1"), before);
 }
@@ -309,9 +305,9 @@ TEST_F(KVCacheStoreServiceTest, ACompletedFetchLeavesNoPinBehind) {
   std::vector<std::string> hashes = {"block_hash_1", "block_hash_2"};
   std::vector<int32_t> host_block_ids = {100, 101};
 
-  auto response_or =
-      client_->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids).Await();
-  ASSERT_OK(response_or.status());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto response,
+      client_->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids).Await());
 
   EXPECT_EQ(store_->backend()->GetPinCount("block_hash_1"), before_1);
   EXPECT_EQ(store_->backend()->GetPinCount("block_hash_2"), before_2);
@@ -323,9 +319,8 @@ TEST_F(KVCacheStoreServiceTest, FetchMismatchedHostBlockCount) {
 
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       client_->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids);
-  auto response_or = future.Await();
-  EXPECT_THAT(response_or.status(),
-              StatusIs(absl::StatusCode::kInvalidArgument));
+  auto response = future.Await();
+  EXPECT_THAT(response.status(), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST_F(KVCacheStoreServiceTest, FetchNullStoreHandling) {
@@ -346,8 +341,8 @@ TEST_F(KVCacheStoreServiceTest, FetchNullStoreHandling) {
   std::vector<int32_t> host_block_ids = {100};
   tsl::Future<::tpu_raiden::kv_cache::proto::FetchResponse> future =
       null_client->Fetch(hashes, /*device_block_ids=*/{}, host_block_ids);
-  auto response_or = future.Await();
-  EXPECT_THAT(response_or.status(),
+  auto response = future.Await();
+  EXPECT_THAT(response.status(),
               StatusIs(absl::StatusCode::kFailedPrecondition));
   null_server->Shutdown();
 }
@@ -390,7 +385,7 @@ TEST_F(KVCacheStoreServiceTest, ConcurrentFetchRPCs) {
   }
 
   for (int i = 0; i < kNumThreads; ++i) {
-    ASSERT_OK(results[i].status());
+    ABSL_ASSERT_OK(results[i].status());
     EXPECT_THAT(
         results[i]->done_block_hashes(),
         UnorderedElementsAre("concurrent_hash_" + std::to_string(2 * i),
@@ -426,7 +421,7 @@ TEST_F(KVCacheStoreServiceTest, FetchRoutesToClientAdvertisedEndpoints) {
       client_
           ->Fetch(hashes, /*device_block_ids=*/{}, host_ids, client_id, groups)
           .Await();
-  ASSERT_TRUE(res.ok()) << res.status();
+  ABSL_ASSERT_OK(res);
 
   ASSERT_EQ(dst_transfer_mock_->last_write_descriptors.size(), 1);
   EXPECT_EQ(dst_transfer_mock_->last_write_descriptors[0].endpoint,
@@ -457,7 +452,7 @@ TEST_F(KVCacheStoreServiceTest, SameNodeFetchNeedsNoEndpoints) {
   std::vector<std::string> hashes = {"block_hash_1"};
   std::vector<int32_t> host_ids = {201};
   auto res = client_->Fetch(hashes, /*device_block_ids=*/{}, host_ids).Await();
-  EXPECT_TRUE(res.ok()) << res.status();
+  ABSL_EXPECT_OK(res);
 }
 
 // Two workers on this node, each with its own transfer manager, and two client
@@ -488,17 +483,17 @@ TEST_F(KVCacheStoreServiceTest, FetchWithMultiWorkerEndpointsRoutesPerWorker) {
                      /*store_server_ip=*/"127.0.0.1");
   ::tpu_raiden::core::controller::RaidenControllerClient ctrl_client(
       store.raiden_controller_address());
-  ASSERT_OK(ctrl_client.RegisterWorker("w_a", worker_a->server_address,
-                                       {{worker_a->server_address, {}}},
-                                       /*node_id=*/10));
-  ASSERT_OK(ctrl_client.RegisterWorker("w_b", worker_b->server_address,
-                                       {{worker_b->server_address, {}}},
-                                       /*node_id=*/20));
+  ABSL_ASSERT_OK(ctrl_client.RegisterWorker("w_a", worker_a->server_address,
+                                            {{worker_a->server_address, {}}},
+                                            /*node_id=*/10));
+  ABSL_ASSERT_OK(ctrl_client.RegisterWorker("w_b", worker_b->server_address,
+                                            {{worker_b->server_address, {}}},
+                                            /*node_id=*/20));
 
   std::vector<std::string> hashes = {"multi_hash"};
   std::vector<RaidenBlockId> slices = {
       RaidenBlockId(multi_id, 7, BlockStatus::HOST)};
-  ASSERT_TRUE(store.Insert(hashes, slices, /*on_host=*/true).ok());
+  ABSL_ASSERT_OK(store.Insert(hashes, slices, /*on_host=*/true));
 
   KVCacheStoreServiceImpl service(store.backend().get(),
                                   store.raiden_controller());
@@ -524,7 +519,7 @@ TEST_F(KVCacheStoreServiceTest, FetchWithMultiWorkerEndpointsRoutesPerWorker) {
                  .Fetch(hashes, /*device_block_ids=*/{},
                         /*host_block_ids=*/{301}, client_id, groups)
                  .Await();
-  ASSERT_OK(res.status());
+  ABSL_ASSERT_OK(res.status());
 
   // Each worker saw its own peer -- not the other's, and not both.
   ASSERT_EQ(mock_a->last_write_descriptors.size(), 1);
@@ -722,7 +717,7 @@ TEST_F(WriteRemoteTest, AllExistNeedsNoSourceEndpoints) {
           ->WriteRemote(SrcIdProto(), {"a"}, src_ids, {}, 5000,
                         absl::Seconds(30))
           .ack.Await();
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
   EXPECT_EQ(response->exist_state(),
             ::tpu_raiden::kv_cache::proto::WRITE_ALL_EXIST);
 }
@@ -764,7 +759,7 @@ TEST_F(WriteRemoteTest, AllExistIsAnImmediateSuccess) {
                    RaidenBlockId(dst_id_, 2, BlockStatus::HOST)}));
 
   auto response = Offer({"a", "b"});
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
   EXPECT_EQ(response->operation_id(), 0);
   EXPECT_EQ(response->exist_state(),
             ::tpu_raiden::kv_cache::proto::WRITE_ALL_EXIST);
@@ -777,7 +772,7 @@ TEST_F(WriteRemoteTest, PartialExistIsRefusedAndNamesWhatItHas) {
       {"a"}, {RaidenBlockId(dst_id_, 1, BlockStatus::HOST)}));
 
   auto response = Offer({"a", "b"});
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
   EXPECT_EQ(response->operation_id(), 0);
   EXPECT_EQ(response->exist_state(),
             ::tpu_raiden::kv_cache::proto::WRITE_PARTIAL_EXIST);
@@ -788,7 +783,7 @@ TEST_F(WriteRemoteTest, PartialExistIsRefusedAndNamesWhatItHas) {
 
 TEST_F(WriteRemoteTest, AcceptsAndAnswersWithoutWaitingForBytes) {
   auto response = Offer({"a", "b"});
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
   EXPECT_NE(response->operation_id(), 0);
   EXPECT_EQ(response->exist_state(),
             ::tpu_raiden::kv_cache::proto::WRITE_EXIST_STATE_UNSPECIFIED);
@@ -808,7 +803,7 @@ TEST_F(WriteRemoteTest, AcceptsAndAnswersWithoutWaitingForBytes) {
 TEST_F(WriteRemoteTest, GrantedDeadlineIsClampedToTheLocalCap) {
   auto response =
       Offer({"a"}, /*deadline_ms=*/absl::ToInt64Milliseconds(absl::Hours(1)));
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
   EXPECT_LE(response->granted_deadline_ms(),
             absl::ToInt64Milliseconds(absl::Seconds(25)));
   latch_.Release(absl::CancelledError("done with this test"));
@@ -817,7 +812,7 @@ TEST_F(WriteRemoteTest, GrantedDeadlineIsClampedToTheLocalCap) {
 
 TEST_F(WriteRemoteTest, CommitInsertsTheBlocksAndReportsThem) {
   auto response = Offer({"a", "b"});
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
   latch_.Release(absl::OkStatus());
 
   ASSERT_EQ(AwaitTerminal(response->operation_id()),
@@ -829,7 +824,7 @@ TEST_F(WriteRemoteTest, CommitInsertsTheBlocksAndReportsThem) {
 
 TEST_F(WriteRemoteTest, TransferFailureFreesTheLandingBlocks) {
   auto response = Offer({"a", "b"});
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
   latch_.Release(absl::InternalError("pull failed"));
 
   ASSERT_EQ(AwaitTerminal(response->operation_id()),
@@ -838,15 +833,14 @@ TEST_F(WriteRemoteTest, TransferFailureFreesTheLandingBlocks) {
   EXPECT_TRUE(
       store_->backend()->AlreadyPresentHostResident({"a", "b"}).empty());
   // The blocks came back: the whole pool is allocatable again.
-  auto reallocated = store_->raiden_controller()->AllocateBlockIds(kCapacity);
-  EXPECT_TRUE(reallocated.ok()) << reallocated.status().ToString();
+  ABSL_EXPECT_OK(store_->raiden_controller()->AllocateBlockIds(kCapacity));
 }
 
 // A transfer that resolves after the deadline must not insert or register
 // anything. The bytes are discarded and the blocks come back.
 TEST_F(WriteRemoteTest, ATransferThatResolvesPastTheDeadlineNeverCommits) {
   auto response = Offer({"a", "b"}, /*deadline_ms=*/100);
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
   const uint64_t op_id = response->operation_id();
 
   absl::SleepFor(absl::Milliseconds(300));
@@ -869,14 +863,13 @@ TEST_F(WriteRemoteTest, ATransferThatResolvesPastTheDeadlineNeverCommits) {
             ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::FAILED);
   EXPECT_TRUE(store_->backend()->AlreadyPresentHostResident({"a", "b"}).empty())
       << "a post-deadline transfer inserted its bytes anyway";
-  auto reallocated = store_->raiden_controller()->AllocateBlockIds(kCapacity);
-  EXPECT_TRUE(reallocated.ok()) << "the deferred free never happened: "
-                                << reallocated.status().ToString();
+  ABSL_EXPECT_OK(store_->raiden_controller()->AllocateBlockIds(kCapacity))
+      << "the deferred free never happened";
 }
 
 TEST_F(WriteRemoteTest, WriteOpsShrinksWithoutPollingTraffic) {
   auto response = Offer({"a", "b"}, /*deadline_ms=*/100);
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
   const uint64_t op_id = response->operation_id();
   ASSERT_EQ(service_->InFlightWriteOpsCountForTesting(), 1);
 
@@ -903,7 +896,7 @@ TEST_F(WriteRemoteTest, TheClaimRefusesALateTransferEvenIfNoThreadFiredIt) {
   service_->PauseDeadlineFiringForTesting();
 
   auto response = Offer({"a", "b"}, /*deadline_ms=*/100);
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
   const uint64_t op_id = response->operation_id();
 
   absl::SleepFor(absl::Milliseconds(300));
@@ -917,15 +910,14 @@ TEST_F(WriteRemoteTest, TheClaimRefusesALateTransferEvenIfNoThreadFiredIt) {
       << "a transfer that resolved past its deadline was allowed to commit";
   EXPECT_TRUE(
       store_->backend()->AlreadyPresentHostResident({"a", "b"}).empty());
-  auto reallocated = store_->raiden_controller()->AllocateBlockIds(kCapacity);
-  EXPECT_TRUE(reallocated.ok()) << reallocated.status().ToString();
+  ABSL_EXPECT_OK(store_->raiden_controller()->AllocateBlockIds(kCapacity));
 }
 
 // A concurrent writer landed every hash mid-flight: the claimed path reports
 // ALL_EXIST and still frees its landing blocks.
 TEST_F(WriteRemoteTest, LosingTheRaceAtInsertTimeReportsAllExistAndFrees) {
   auto response = Offer({"a", "b"});
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
 
   ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
       {"a", "b"}, {RaidenBlockId(dst_id_, 6, BlockStatus::HOST),
@@ -934,16 +926,15 @@ TEST_F(WriteRemoteTest, LosingTheRaceAtInsertTimeReportsAllExistAndFrees) {
   latch_.Release(absl::OkStatus());
   ASSERT_EQ(AwaitTerminal(response->operation_id()),
             ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::ALL_EXIST);
-  auto reallocated = store_->raiden_controller()->AllocateBlockIds(kCapacity);
-  EXPECT_TRUE(reallocated.ok()) << "the landing blocks were never returned: "
-                                << reallocated.status().ToString();
+  ABSL_EXPECT_OK(store_->raiden_controller()->AllocateBlockIds(kCapacity))
+      << "the landing blocks were never returned";
 }
 
 // A PARTIAL_EXIST found at insert time reaches the poll with the same list
 // as an ack-time answer.
 TEST_F(WriteRemoteTest, PartialExistDiscoveredAtInsertTimeReachesThePoll) {
   auto response = Offer({"a", "b"});
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
 
   ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
       {"a"}, {RaidenBlockId(dst_id_, 6, BlockStatus::HOST)}));
@@ -955,8 +946,7 @@ TEST_F(WriteRemoteTest, PartialExistDiscoveredAtInsertTimeReachesThePoll) {
   EXPECT_THAT(last_poll_.existing_hashes(), UnorderedElementsAre("a"));
   // "b" was never inserted: this destination does not do partial writes.
   EXPECT_TRUE(store_->backend()->AlreadyPresentHostResident({"b"}).empty());
-  auto reallocated = store_->raiden_controller()->AllocateBlockIds(kCapacity);
-  EXPECT_TRUE(reallocated.ok()) << reallocated.status().ToString();
+  ABSL_EXPECT_OK(store_->raiden_controller()->AllocateBlockIds(kCapacity));
 }
 
 // Landing blocks come from free blocks only; a full destination refuses the
@@ -964,8 +954,7 @@ TEST_F(WriteRemoteTest, PartialExistDiscoveredAtInsertTimeReachesThePoll) {
 TEST_F(WriteRemoteTest, RefusesWhenThereAreNoFreeBlocksAndEvictsNothing) {
   ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
       {"victim"}, {RaidenBlockId(dst_id_, 0, BlockStatus::HOST)}));
-  auto drained = store_->raiden_controller()->AllocateBlockIds(kCapacity);
-  ASSERT_TRUE(drained.ok()) << drained.status().ToString();
+  ABSL_ASSERT_OK(store_->raiden_controller()->AllocateBlockIds(kCapacity));
 
   auto response = Offer({"a"});
   EXPECT_THAT(response.status(),
@@ -977,7 +966,7 @@ TEST_F(WriteRemoteTest, RefusesWhenThereAreNoFreeBlocksAndEvictsNothing) {
 
 TEST_F(WriteRemoteTest, PollOfAnUnknownOperationIsUnknown) {
   auto poll = Poll(999999);
-  ASSERT_OK(poll.status());
+  ABSL_ASSERT_OK(poll.status());
   EXPECT_EQ(poll->state(),
             ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::UNKNOWN);
 }
@@ -1039,7 +1028,7 @@ TEST(WriteRemotePublishTest, PublishDoesNotBlockTheTransferCompletion) {
       client.WriteRemote(src_id, hashes, src_ids, {group}, 5000,
                          absl::Seconds(30))
           .ack.Await();
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
   const uint64_t op_id = response->operation_id();
   ASSERT_NE(op_id, 0);
 
@@ -1065,7 +1054,7 @@ TEST(WriteRemotePublishTest, PublishDoesNotBlockTheTransferCompletion) {
   // ... and the operation has not settled, which is what proves the wait that
   // did not happen was a real one rather than a registry that answered fast.
   auto polled = client.PollWriteRemote(op_id).Await();
-  ASSERT_OK(polled.status());
+  ABSL_ASSERT_OK(polled.status());
   EXPECT_EQ(polled->state(),
             ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::PENDING);
 
@@ -1074,7 +1063,7 @@ TEST(WriteRemotePublishTest, PublishDoesNotBlockTheTransferCompletion) {
   ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse final_poll;
   for (int i = 0; i < 300; ++i) {
     auto p = client.PollWriteRemote(op_id).Await();
-    ASSERT_OK(p.status());
+    ABSL_ASSERT_OK(p.status());
     if (p->state() !=
         ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::PENDING) {
       final_poll = *p;
@@ -1090,7 +1079,7 @@ TEST(WriteRemotePublishTest, PublishDoesNotBlockTheTransferCompletion) {
               UnorderedElementsAre("publish_a", "publish_b"));
 
   auto looked_up = registry_server->client->Lookup(hashes);
-  ASSERT_OK(looked_up.status());
+  ABSL_ASSERT_OK(looked_up.status());
   EXPECT_EQ(looked_up->size(), 2)
       << "the landed blocks were never advertised";
 
@@ -1142,7 +1131,7 @@ TEST(WriteRemoteRegistryFailureTest, StoredButUnregisteredIsReportedAsSuch) {
       client.WriteRemote(src_id, hashes, src_ids, {group}, 5000,
                          absl::Seconds(30))
           .ack.Await();
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
   const uint64_t op_id = response->operation_id();
   ASSERT_NE(op_id, 0);
 
@@ -1153,7 +1142,7 @@ TEST(WriteRemoteRegistryFailureTest, StoredButUnregisteredIsReportedAsSuch) {
   ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse poll;
   for (int i = 0; i < 300; ++i) {
     auto polled = client.PollWriteRemote(op_id).Await();
-    ASSERT_OK(polled.status());
+    ABSL_ASSERT_OK(polled.status());
     if (polled->state() !=
         ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::PENDING) {
       poll = *polled;
@@ -1185,7 +1174,7 @@ TEST(WriteRemoteRegistryFailureTest, StoredButUnregisteredIsReportedAsSuch) {
 // and must not leave a callback pointing at freed memory.
 TEST_F(WriteRemoteTest, TeardownWithAnOutstandingTransferIsBoundedAndSafe) {
   auto response = Offer({"a", "b"});
-  ASSERT_OK(response.status());
+  ABSL_ASSERT_OK(response.status());
   ASSERT_EQ(latch_.issued(), 1);
 
   server_->Shutdown();
@@ -1244,15 +1233,14 @@ TEST(FetchWithdrawTest, ARefusedFetchWithdrawsOnlyTheEntriesItCannotBack) {
                      /*store_server_ip=*/"127.0.0.1");
 
   // Two blocks this store really holds...
-  ASSERT_OK(store.Insert({"held_a", "held_b"},
-                         {RaidenBlockId(src_id, 10, BlockStatus::HOST),
-                          RaidenBlockId(src_id, 11, BlockStatus::HOST)},
-                         /*on_host=*/true));
+  ABSL_ASSERT_OK(store.Insert({"held_a", "held_b"},
+                              {RaidenBlockId(src_id, 10, BlockStatus::HOST),
+                               RaidenBlockId(src_id, 11, BlockStatus::HOST)},
+                              /*on_host=*/true));
   // ...and three entries advertising it, one of which names a block that was
   // never inserted. That is what a peer follows to get here.
-  ASSERT_OK(registry->Register({{"gone", src_id, 12},
-                                {"held_a", src_id, 10},
-                                {"held_b", src_id, 11}}));
+  ABSL_ASSERT_OK(registry->Register(
+      {{"gone", src_id, 12}, {"held_a", src_id, 10}, {"held_b", src_id, 11}}));
 
   KVCacheStoreServiceImpl service(store.backend().get(),
                                   store.raiden_controller());
@@ -1284,18 +1272,18 @@ TEST(FetchWithdrawTest, ARefusedFetchWithdrawsOnlyTheEntriesItCannotBack) {
   const absl::Time give_up = absl::Now() + absl::Seconds(5);
   while (absl::Now() < give_up) {
     auto gone = registry->Lookup({"gone"}, peer);
-    ASSERT_OK(gone.status());
+    ABSL_ASSERT_OK(gone.status());
     if (gone->empty()) break;
     absl::SleepFor(absl::Milliseconds(20));
   }
 
   // Asked as a peer, so the caller filter does not hide the answer.
   auto gone = registry->Lookup({"gone"}, peer);
-  ASSERT_OK(gone.status());
+  ABSL_ASSERT_OK(gone.status());
   EXPECT_TRUE(gone->empty()) << "the entry this store cannot back survived";
 
   auto held = registry->Lookup({"held_a", "held_b"}, peer);
-  ASSERT_OK(held.status());
+  ABSL_ASSERT_OK(held.status());
   EXPECT_EQ(held->size(), 2)
       << "a refused fetch withdrew blocks this store is holding";
 
@@ -1316,7 +1304,7 @@ TEST(FetchWithdrawTest, TheWithdrawDoesNotDelayTheRefusal) {
   KVCacheStore store(/*capacity=*/8, counting.server->server_address, src_id,
                      /*num_shards=*/1, /*shard_size_bytes=*/1024,
                      /*store_server_ip=*/"127.0.0.1");
-  ASSERT_OK(registry->Register({{"gone", src_id, 12}}));
+  ABSL_ASSERT_OK(registry->Register({{"gone", src_id, 12}}));
 
   KVCacheStoreServiceImpl service(store.backend().get(),
                                   store.raiden_controller());
@@ -1378,7 +1366,7 @@ TEST(FetchWithdrawTest, AFetchRefusedOnTheWrongTierKeepsTheEntry) {
                                           BlockStatus::HBM)},
                            /*on_host=*/false)
                   .first);
-  ASSERT_OK(registry->Register({{"staged", src_id, 10}}));
+  ABSL_ASSERT_OK(registry->Register({{"staged", src_id, 10}}));
 
   KVCacheStoreServiceImpl service(backend, store.raiden_controller());
   ::grpc::ServerBuilder builder;
@@ -1399,7 +1387,7 @@ TEST(FetchWithdrawTest, AFetchRefusedOnTheWrongTierKeepsTheEntry) {
   ExpectNoWithdrawWithin(registry_service, absl::Seconds(2));
   const RaidenId peer{"peer_job_tier", "0", "peer_data", 0};
   auto after = registry->Lookup({"staged"}, peer);
-  ASSERT_OK(after.status());
+  ABSL_ASSERT_OK(after.status());
   EXPECT_EQ(after->size(), 1)
       << "a fetch refused on tier withdrew an entry for a block this store "
          "still holds";
@@ -1431,7 +1419,7 @@ TEST(FetchWithdrawTest, ARefusedFetchKeepsAnEvictionCandidatesEntry) {
                            {RaidenBlockId(src_id, 10, BlockStatus::HOST)},
                            /*on_host=*/true)
                   .first);
-  ASSERT_OK(registry->Register({{"demoted", src_id, 10}}));
+  ABSL_ASSERT_OK(registry->Register({{"demoted", src_id, 10}}));
 
   // InsertAndLock, not Insert: it discards what Put displaces, on purpose --
   // the displaced entry becomes a candidate that still holds its host block.
@@ -1463,7 +1451,7 @@ TEST(FetchWithdrawTest, ARefusedFetchKeepsAnEvictionCandidatesEntry) {
   ExpectNoWithdrawWithin(registry_service, absl::Seconds(2));
   const RaidenId peer{"peer_job_candidate", "0", "peer_data", 0};
   auto after = registry->Lookup({"demoted"}, peer);
-  ASSERT_OK(after.status());
+  ABSL_ASSERT_OK(after.status());
   EXPECT_EQ(after->size(), 1)
       << "a refused fetch withdrew an eviction candidate, which still holds "
          "its host block";
@@ -1486,7 +1474,7 @@ TEST(FetchWithdrawTest, AHashOnlyAPeerHoldsIsAMissAndThePeerKeepsItsEntry) {
                      /*store_server_ip=*/"127.0.0.1");
 
   // Registered, but on somebody else. This store never held it.
-  ASSERT_OK(registry->Register({{"peer_only", peer_id, 7}}));
+  ABSL_ASSERT_OK(registry->Register({{"peer_only", peer_id, 7}}));
 
   KVCacheStoreServiceImpl service(store.backend().get(),
                                   store.raiden_controller());
@@ -1520,7 +1508,7 @@ TEST(FetchWithdrawTest, AHashOnlyAPeerHoldsIsAMissAndThePeerKeepsItsEntry) {
 
   const RaidenId asker{"asker_job", "0", "asker_data", 0};
   auto after = registry->Lookup({"peer_only"}, asker);
-  ASSERT_OK(after.status());
+  ABSL_ASSERT_OK(after.status());
   ASSERT_EQ(after->size(), 1);
   EXPECT_EQ((*after)[0].raiden_id().job_name(), peer_id.job_name);
 
@@ -1530,17 +1518,16 @@ TEST(FetchWithdrawTest, AHashOnlyAPeerHoldsIsAMissAndThePeerKeepsItsEntry) {
 // A poll with wait_ms parks while the operation is pending and returns as
 // soon as it goes terminal.
 TEST_F(WriteRemoteTest, PollWriteRemoteWithWaitMsAwaitsUntilTerminal) {
-  auto ack_or = Offer({"wait_a", "wait_b"});
-  ASSERT_OK(ack_or.status());
-  const uint64_t op_id = ack_or->operation_id();
+  TF_ASSERT_OK_AND_ASSIGN(auto ack, Offer({"wait_a", "wait_b"}));
+  const uint64_t op_id = ack.operation_id();
   ASSERT_EQ(latch_.issued(), 1);
 
   std::atomic<bool> poll_done = false;
   proto::PollWriteRemoteResponse poll_resp;
   std::thread poll_thread([&]() {
-    auto resp_or = client_->PollWriteRemote(op_id, /*wait_ms=*/5000).Await();
-    if (resp_or.ok()) {
-      poll_resp = *resp_or;
+    auto poll_res = client_->PollWriteRemote(op_id, /*wait_ms=*/5000).Await();
+    if (poll_res.ok()) {
+      poll_resp = *poll_res;
     }
     poll_done = true;
   });
@@ -1621,14 +1608,12 @@ TEST_F(WriteRemoteTest, AWaitingPollIsCappedByTheServersOwnClock) {
   setenv("RAIDEN_REMOTE_WRITE_DEADLINE_S", "1", /*overwrite=*/1);
   service_->PauseDeadlineFiringForTesting();
 
-  auto ack_or = Offer({"cap_a"});
-  ASSERT_OK(ack_or.status());
+  TF_ASSERT_OK_AND_ASSIGN(auto ack, Offer({"cap_a"}));
   ASSERT_EQ(latch_.issued(), 1);
 
   const absl::Time before = absl::Now();
-  auto resp_or =
-      client_->PollWriteRemote(ack_or->operation_id(), /*wait_ms=*/60000)
-          .Await();
+  auto poll_res =
+      client_->PollWriteRemote(ack.operation_id(), /*wait_ms=*/60000).Await();
   const absl::Duration waited = absl::Now() - before;
 
   if (previous != nullptr) {
@@ -1637,8 +1622,8 @@ TEST_F(WriteRemoteTest, AWaitingPollIsCappedByTheServersOwnClock) {
     unsetenv("RAIDEN_REMOTE_WRITE_DEADLINE_S");
   }
 
-  ASSERT_OK(resp_or.status());
-  EXPECT_EQ(resp_or->state(), proto::PollWriteRemoteResponse::PENDING);
+  TF_ASSERT_OK_AND_ASSIGN(auto resp, poll_res);
+  EXPECT_EQ(resp.state(), proto::PollWriteRemoteResponse::PENDING);
   EXPECT_GE(waited, absl::Seconds(4)) << "the poll did not wait at all";
   EXPECT_LT(waited, absl::Seconds(30))
       << "the requested one-minute wait was honoured instead of clamped";

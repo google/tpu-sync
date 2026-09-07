@@ -23,9 +23,12 @@
 #include <string>
 #include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/time/time.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -34,6 +37,8 @@
 namespace tpu_raiden {
 namespace kv_cache {
 namespace {
+
+using ::absl_testing::StatusIs;
 
 class StagingTestManager : public KVCacheManagerBase {
  public:
@@ -118,7 +123,7 @@ TEST(PoolStagingTest, BoundedArenaLeasesAndAddressing) {
       manager.RegisterPools({DensePool("fa", 0, 0, kStride, kNumBlocks,
                                        /*staging_blocks_per_request=*/2)},
                             /*staging_leases=*/2);
-  ASSERT_TRUE(status.ok()) << status.ToString();
+  ABSL_ASSERT_OK(status);
   EXPECT_TRUE(manager.PoolStorageStagingBounded(0));
   const size_t host_size = manager.GetHostSize(/*layer_idx=*/0, 0);
   EXPECT_GE(host_size, static_cast<size_t>(4 * kStride));
@@ -134,8 +139,8 @@ TEST(PoolStagingTest, BoundedArenaLeasesAndAddressing) {
             static_cast<size_t>(4 * kStride));
 
   // No standing host residency on a bounded storage.
-  EXPECT_EQ(manager.GetPoolBlockRef(0, 0, 5).status().code(),
-            absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(manager.GetPoolBlockRef(0, 0, 5),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
   EXPECT_EQ(manager.GetBlockHostPointer(/*layer_idx=*/0, 0, /*block_id=*/5),
             nullptr);
 
@@ -143,11 +148,11 @@ TEST(PoolStagingTest, BoundedArenaLeasesAndAddressing) {
   status = manager.AcquirePoolStagingLease(/*uuid=*/7, /*storage_idx=*/0,
                                            std::vector<int64_t>{5, 9},
                                            absl::Milliseconds(50));
-  ASSERT_TRUE(status.ok()) << status.ToString();
+  ABSL_ASSERT_OK(status);
   // Re-acquiring the same ids is a no-op; adding one more takes slot 2.
   status = manager.AcquirePoolStagingLease(7, 0, std::vector<int64_t>{9, 11},
                                            absl::Milliseconds(50));
-  ASSERT_TRUE(status.ok()) << status.ToString();
+  ABSL_ASSERT_OK(status);
   EXPECT_EQ(manager.PoolStagingSummary()[0].free_slots, 1);
 
   // Receiver-side chunk resolution lands dst block 9 at its slot, not at
@@ -164,7 +169,7 @@ TEST(PoolStagingTest, BoundedArenaLeasesAndAddressing) {
   entry->set_src_offset_bytes(0);
   entry->set_size_bytes(16);
   status = manager.RegisterActivePlan(7, request, /*is_sender=*/false);
-  ASSERT_TRUE(status.ok()) << status.ToString();
+  ABSL_ASSERT_OK(status);
   uint8_t* host_base = manager.GetHostPointer(/*layer_idx=*/0, 0);
   std::vector<transport::BlockChunk> chunks = manager.GetBlockChunks(
       /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{9},
@@ -181,21 +186,20 @@ TEST(PoolStagingTest, BoundedArenaLeasesAndAddressing) {
   // Another transfer needing more slots than are free waits, then fails.
   status = manager.AcquirePoolStagingLease(
       /*uuid=*/8, 0, std::vector<int64_t>{1, 2}, absl::Milliseconds(20));
-  EXPECT_EQ(status.code(), absl::StatusCode::kResourceExhausted)
-      << status.ToString();
+  EXPECT_THAT(status, StatusIs(absl::StatusCode::kResourceExhausted));
   // More blocks than the whole arena is rejected outright.
   status = manager.AcquirePoolStagingLease(/*uuid=*/9, 0,
                                            std::vector<int64_t>{1, 2, 3, 4, 6},
                                            absl::Milliseconds(20));
-  EXPECT_EQ(status.code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_THAT(status, StatusIs(absl::StatusCode::kResourceExhausted));
 
   // Releasing uuid 7 returns its three slots; uuid 8 now fits.
-  ASSERT_TRUE(manager.UnregisterActivePlan(7).ok());
+  ABSL_ASSERT_OK(manager.UnregisterActivePlan(7));
   manager.ReleasePoolStagingLeases(7);
   EXPECT_EQ(manager.PoolStagingSummary()[0].free_slots, 4);
   status = manager.AcquirePoolStagingLease(8, 0, std::vector<int64_t>{1, 2},
                                            absl::Milliseconds(20));
-  ASSERT_TRUE(status.ok()) << status.ToString();
+  ABSL_ASSERT_OK(status);
   EXPECT_EQ(manager.PoolStagingSummary()[0].free_slots, 2);
   manager.ReleasePoolStagingLeases(8);
   // Releasing an unknown uuid is a no-op.
@@ -217,18 +221,15 @@ TEST(PoolStagingTest, FallsBackToFullMirrorWithoutHintsOrLeases) {
                               variant == 0 ? 0 : 2);
     absl::Status status =
         manager.RegisterPools({pool}, /*staging_leases=*/variant == 0 ? 2 : 0);
-    ASSERT_TRUE(status.ok()) << status.ToString();
+    ABSL_ASSERT_OK(status);
     EXPECT_FALSE(manager.PoolStorageStagingBounded(0));
     EXPECT_GE(manager.GetHostSize(0, 0),
               static_cast<size_t>(kStride * kNumBlocks));
-    auto ref = manager.GetPoolBlockRef(0, 0, 9);
-    ASSERT_TRUE(ref.ok()) << ref.status().ToString();
-    EXPECT_EQ(ref->ptr, manager.GetHostPointer(0, 0) + 9 * kStride);
+    TF_ASSERT_OK_AND_ASSIGN(auto ref, manager.GetPoolBlockRef(0, 0, 9));
+    EXPECT_EQ(ref.ptr, manager.GetHostPointer(0, 0) + 9 * kStride);
     // Leases are no-ops on unbounded storages.
-    EXPECT_TRUE(manager
-                    .AcquirePoolStagingLease(1, 0, std::vector<int64_t>{9},
-                                             absl::Milliseconds(1))
-                    .ok());
+    ABSL_EXPECT_OK(manager.AcquirePoolStagingLease(
+        1, 0, std::vector<int64_t>{9}, absl::Milliseconds(1)));
     EXPECT_FALSE(manager.PoolStagingSummary()[0].bounded);
   }
 }
@@ -245,7 +246,7 @@ TEST(PoolStagingTest, SmallPoolIdentitySharedStorageAndStrideMismatch) {
   absl::Status status =
       small.RegisterPools({DensePool("fa", 0, 0, kStride, /*num_blocks=*/4, 2)},
                           /*staging_leases=*/2);
-  ASSERT_TRUE(status.ok()) << status.ToString();
+  ABSL_ASSERT_OK(status);
   EXPECT_FALSE(small.PoolStorageStagingBounded(0));
 
   StagingTestManager shared(/*num_layers=*/1, /*num_shards=*/1,
@@ -255,14 +256,11 @@ TEST(PoolStagingTest, SmallPoolIdentitySharedStorageAndStrideMismatch) {
       {StridedPool("gdn.conv", 0, /*base_offset=*/0, kStride, 32, 1),
        StridedPool("gdn.ssm", 0, /*base_offset=*/16, kStride, 32, 1)},
       /*staging_leases=*/3);
-  ASSERT_TRUE(status.ok()) << status.ToString();
+  ABSL_ASSERT_OK(status);
   EXPECT_TRUE(shared.PoolStorageStagingBounded(0));
   EXPECT_EQ(shared.PoolStagingSummary()[0].num_slots, 3);
-  ASSERT_TRUE(shared
-                  .AcquirePoolStagingLease(/*uuid=*/5, 0,
-                                           std::vector<int64_t>{20},
-                                           absl::Milliseconds(10))
-                  .ok());
+  ABSL_ASSERT_OK(shared.AcquirePoolStagingLease(
+      /*uuid=*/5, 0, std::vector<int64_t>{20}, absl::Milliseconds(10)));
   EXPECT_EQ(shared.PoolStagingSummary()[0].free_slots, 2);
   // Both pools of the storage address device page 20 through the same slot
   // (slot 0), each at its own base offset.
@@ -279,7 +277,7 @@ TEST(PoolStagingTest, SmallPoolIdentitySharedStorageAndStrideMismatch) {
     entry->set_size_bytes(16);
     entry->set_layer_idx(pool_idx);
   }
-  ASSERT_TRUE(shared.RegisterActivePlan(5, request, /*is_sender=*/false).ok());
+  ABSL_ASSERT_OK(shared.RegisterActivePlan(5, request, /*is_sender=*/false));
   uint8_t* base = shared.GetHostPointer(0, 0);
   auto conv_chunks =
       shared.GetBlockChunks(/*layer_idx=*/0, 0, std::vector<int64_t>{20}, 16, 5,
@@ -298,7 +296,7 @@ TEST(PoolStagingTest, SmallPoolIdentitySharedStorageAndStrideMismatch) {
   status = mixed.RegisterPools({DensePool("a", 0, 0, kStride, 32, 1),
                                 DensePool("b", 0, 0, kStride / 2, 64, 1)},
                                /*staging_leases=*/3);
-  ASSERT_TRUE(status.ok()) << status.ToString();
+  ABSL_ASSERT_OK(status);
   EXPECT_FALSE(mixed.PoolStorageStagingBounded(0));
 }
 

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
@@ -159,28 +160,29 @@ absl::Status RegionSpec::Validate(int64_t slot_bytes) const {
     return absl::InvalidArgumentError(
         absl::StrCat("region ", name, " stride_bytes must be positive"));
   }
-  auto packed_bytes =
+  ABSL_ASSIGN_OR_RETURN(
+      int64_t packed_bytes,
       CheckedMul(units_per_stride, unit_bytes,
-                 absl::StrCat("region ", name, " packed unit bytes"));
-  if (!packed_bytes.ok()) return packed_bytes.status();
-  if (num_units > 0 && stride_bytes < *packed_bytes) {
+                 absl::StrCat("region ", name, " packed unit bytes")));
+  if (num_units > 0 && stride_bytes < packed_bytes) {
     return absl::InvalidArgumentError(absl::StrCat(
         "region ", name, " stride_bytes is smaller than packed units"));
   }
-  auto stride_extent =
+  ABSL_ASSIGN_OR_RETURN(
+      int64_t stride_extent,
       CheckedMul(num_units > 0 ? num_units - 1 : 0, stride_bytes,
-                 absl::StrCat("region ", name, " stride extent"));
-  if (!stride_extent.ok()) return stride_extent.status();
-  auto extent_start =
-      CheckedAdd(offset_bytes, *stride_extent,
-                 absl::StrCat("region ", name, " extent start"));
-  if (!extent_start.ok()) return extent_start.status();
-  auto extent_end = CheckedAdd(*extent_start, *packed_bytes,
-                               absl::StrCat("region ", name, " extent end"));
-  if (!extent_end.ok()) return extent_end.status();
-  if (*extent_end > slot_bytes) {
+                 absl::StrCat("region ", name, " stride extent")));
+  ABSL_ASSIGN_OR_RETURN(
+      int64_t extent_start,
+      CheckedAdd(offset_bytes, stride_extent,
+                 absl::StrCat("region ", name, " extent start")));
+  ABSL_ASSIGN_OR_RETURN(
+      int64_t extent_end,
+      CheckedAdd(extent_start, packed_bytes,
+                 absl::StrCat("region ", name, " extent end")));
+  if (extent_end > slot_bytes) {
     return absl::InvalidArgumentError(
-        absl::StrCat("region ", name, " exceeds slot bytes: end=", *extent_end,
+        absl::StrCat("region ", name, " exceeds slot bytes: end=", extent_end,
                      " slot=", slot_bytes));
   }
   return absl::OkStatus();
@@ -280,59 +282,54 @@ absl::StatusOr<std::vector<PoolBlockCopyExtent>> ComputePoolBlockCopyExtents(
                                                 block_id, " out of range [0, ",
                                                 pool.num_blocks, ")"));
     }
-    auto block_delta_or =
+    ABSL_ASSIGN_OR_RETURN(
+        const int64_t block_delta,
         CheckedMul(block_id, pool.block_stride_bytes,
-                   absl::StrCat("pool ", pool.tag, " block offset"));
-    if (!block_delta_or.ok()) return block_delta_or.status();
-    const int64_t block_delta = *block_delta_or;
-    auto block_base_or =
+                   absl::StrCat("pool ", pool.tag, " block offset")));
+    ABSL_ASSIGN_OR_RETURN(
+        const int64_t block_base,
         CheckedAdd(pool.base_offset_bytes, block_delta,
-                   absl::StrCat("pool ", pool.tag, " block base"));
-    if (!block_base_or.ok()) return block_base_or.status();
-    const int64_t block_base = *block_base_or;
+                   absl::StrCat("pool ", pool.tag, " block base")));
     for (const RegionSpec& region : pool.regions) {
-      auto packed_bytes_or =
+      ABSL_ASSIGN_OR_RETURN(
+          const int64_t packed_bytes,
           CheckedMul(region.unit_bytes, region.units_per_stride,
                      absl::StrCat("pool ", pool.tag, " region ", region.name,
-                                  " packed bytes"));
-      if (!packed_bytes_or.ok()) return packed_bytes_or.status();
-      const int64_t packed_bytes = *packed_bytes_or;
+                                  " packed bytes")));
       if (region.num_units == 0 || packed_bytes == 0) continue;
 
       // A tightly packed strided region is one contiguous DMA extent. Sparse
       // regions retain one extent per unit so padding is never staged.
       if (region.stride_bytes == packed_bytes) {
-        auto region_bytes_or =
+        ABSL_ASSIGN_OR_RETURN(
+            const int64_t region_bytes,
             CheckedMul(region.num_units, packed_bytes,
                        absl::StrCat("pool ", pool.tag, " region ", region.name,
-                                    " live bytes"));
-        if (!region_bytes_or.ok()) return region_bytes_or.status();
-        const int64_t region_bytes = *region_bytes_or;
-        auto offset_or = CheckedAdd(block_base, region.offset_bytes,
-                                    absl::StrCat("pool ", pool.tag, " region ",
-                                                 region.name, " offset"));
-        if (!offset_or.ok()) return offset_or.status();
-        const int64_t offset = *offset_or;
+                                    " live bytes")));
+        ABSL_ASSIGN_OR_RETURN(
+            const int64_t offset,
+            CheckedAdd(block_base, region.offset_bytes,
+                       absl::StrCat("pool ", pool.tag, " region ", region.name,
+                                    " offset")));
         extents.push_back({.offset_bytes = offset, .size_bytes = region_bytes});
         continue;
       }
       for (int64_t unit = 0; unit < region.num_units; ++unit) {
-        auto unit_delta_or =
+        ABSL_ASSIGN_OR_RETURN(
+            const int64_t unit_delta,
             CheckedMul(unit, region.stride_bytes,
                        absl::StrCat("pool ", pool.tag, " region ", region.name,
-                                    " unit offset"));
-        if (!unit_delta_or.ok()) return unit_delta_or.status();
-        const int64_t unit_delta = *unit_delta_or;
-        auto region_base_or = CheckedAdd(
-            block_base, region.offset_bytes,
-            absl::StrCat("pool ", pool.tag, " region ", region.name, " base"));
-        if (!region_base_or.ok()) return region_base_or.status();
-        const int64_t region_base = *region_base_or;
-        auto offset_or = CheckedAdd(region_base, unit_delta,
-                                    absl::StrCat("pool ", pool.tag, " region ",
-                                                 region.name, " unit address"));
-        if (!offset_or.ok()) return offset_or.status();
-        const int64_t offset = *offset_or;
+                                    " unit offset")));
+        ABSL_ASSIGN_OR_RETURN(
+            const int64_t region_base,
+            CheckedAdd(block_base, region.offset_bytes,
+                       absl::StrCat("pool ", pool.tag, " region ", region.name,
+                                    " base")));
+        ABSL_ASSIGN_OR_RETURN(
+            const int64_t offset,
+            CheckedAdd(region_base, unit_delta,
+                       absl::StrCat("pool ", pool.tag, " region ", region.name,
+                                    " unit address")));
         extents.push_back({.offset_bytes = offset, .size_bytes = packed_bytes});
       }
     }
@@ -348,21 +345,20 @@ absl::StatusOr<std::vector<PoolBlockCopyExtent>> ComputePoolBlockCopyExtents(
   std::vector<PoolBlockCopyExtent> merged;
   merged.reserve(extents.size());
   for (const PoolBlockCopyExtent& extent : extents) {
-    auto extent_end_or =
+    ABSL_ASSIGN_OR_RETURN(
+        const int64_t extent_end,
         CheckedAdd(extent.offset_bytes, extent.size_bytes,
-                   absl::StrCat("pool ", pool.tag, " copy extent end"));
-    if (!extent_end_or.ok()) return extent_end_or.status();
-    const int64_t extent_end = *extent_end_or;
+                   absl::StrCat("pool ", pool.tag, " copy extent end")));
     if (merged.empty()) {
       merged.push_back(extent);
       continue;
     }
     PoolBlockCopyExtent& previous = merged.back();
-    auto previous_end_or = CheckedAdd(
-        previous.offset_bytes, previous.size_bytes,
-        absl::StrCat("pool ", pool.tag, " previous copy extent end"));
-    if (!previous_end_or.ok()) return previous_end_or.status();
-    const int64_t previous_end = *previous_end_or;
+    ABSL_ASSIGN_OR_RETURN(
+        const int64_t previous_end,
+        CheckedAdd(
+            previous.offset_bytes, previous.size_bytes,
+            absl::StrCat("pool ", pool.tag, " previous copy extent end")));
     if (extent.offset_bytes > previous_end) {
       merged.push_back(extent);
       continue;
@@ -543,9 +539,8 @@ absl::StatusOr<PoolSpec> PoolSpecFromProto(
   pool.num_blocks = proto.num_blocks();
   pool.regions.reserve(proto.regions_size());
   for (const auto& region_proto : proto.regions()) {
-    absl::StatusOr<RegionSpec> region = RegionSpecFromProto(region_proto);
-    if (!region.ok()) return region.status();
-    pool.regions.push_back(*region);
+    ABSL_ASSIGN_OR_RETURN(RegionSpec region, RegionSpecFromProto(region_proto));
+    pool.regions.push_back(std::move(region));
   }
   pool.dtype_tag = proto.dtype_tag();
   return pool;
@@ -583,13 +578,13 @@ absl::StatusOr<std::vector<LiveCopyChunk>> TranslateLiveCopy(
   int64_t src_cursor = src_offset;
   int64_t dst_cursor = dst_offset;
   while (remaining > 0) {
-    auto src_loc = locate(src_segments, src_cursor);
-    if (!src_loc.ok()) return src_loc.status();
-    auto dst_loc = locate(dst_segments, dst_cursor);
-    if (!dst_loc.ok()) return dst_loc.status();
+    ABSL_ASSIGN_OR_RETURN(const auto& src_loc,
+                          locate(src_segments, src_cursor));
+    ABSL_ASSIGN_OR_RETURN(const auto& dst_loc,
+                          locate(dst_segments, dst_cursor));
     const int64_t chunk_size =
-        std::min({remaining, src_loc->second, dst_loc->second});
-    chunks.push_back(LiveCopyChunk{src_loc->first, dst_loc->first, chunk_size});
+        std::min({remaining, src_loc.second, dst_loc.second});
+    chunks.push_back(LiveCopyChunk{src_loc.first, dst_loc.first, chunk_size});
     if (static_cast<int64_t>(chunks.size()) > kMaxLiveSegments) {
       return absl::InvalidArgumentError(
           "Compact-live copy exceeds the segment expansion bound");

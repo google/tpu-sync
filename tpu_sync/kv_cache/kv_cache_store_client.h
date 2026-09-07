@@ -23,6 +23,7 @@
 #include "absl/base/thread_annotations.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "grpcpp/channel.h"
 #include "grpcpp/client_context.h"
@@ -33,6 +34,8 @@
 
 namespace tpu_raiden {
 namespace kv_cache {
+
+class BlockTracker;
 
 // Cancels an open WriteRemote call from outside it. ~KVCacheStore uses this
 // to end abandoned offers, so the destination is not left holding a call
@@ -74,21 +77,16 @@ class KVCacheStoreClient {
       absl::Span<const ::tpu_sync::proto::RaidenWorkerEndpointsProto>
           client_worker_endpoints = {});
 
-  // Reports how the offer's call ended, once an ack has arrived: `result` is
-  // the streamed verdict if the peer sent one; otherwise `rpc_status` says
-  // how the call ended.
-  using WriteRemoteVerdictCallback = std::function<void(
-      absl::Status rpc_status,
-      std::optional<::tpu_raiden::kv_cache::proto::WriteRemoteResult> result,
-      uint64_t operation_id)>;
   // Offers `block_hashes` to the connected peer, on one streaming call whose
   // deadline is `hold_window`. `ack` resolves when the peer has decided; it
-  // does not wait for the bytes. `on_verdict` runs on the CompletionExecutor
-  // when the call ends. If the call fails before any ack, the error goes to
-  // `ack` and `on_verdict` never runs. `deadline_ms` must be > 0.
+  // does not wait for the bytes. `result` resolves when the stream ends with
+  // a verdict or error. If `tracker` is non-null, its status is updated with
+  // the streamed verdict when the call ends. `deadline_ms` must be > 0.
   struct WriteRemoteCall {
     // The peer's decision, or the error that ended the call before it.
     tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck> ack;
+    // The final result streamed by the peer, or the error if the stream failed.
+    tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteResult> result;
     // Cancels the open call. Null only if this client refused to make it.
     std::shared_ptr<WriteRemoteCancel> cancel;
   };
@@ -98,9 +96,8 @@ class KVCacheStoreClient {
       absl::Span<const int32_t> src_host_block_ids,
       absl::Span<const ::tpu_sync::proto::RaidenWorkerEndpointsProto>
           src_worker_endpoints,
-      int64_t deadline_ms,
-      absl::Duration hold_window,
-      WriteRemoteVerdictCallback on_verdict = nullptr);
+      int64_t deadline_ms, absl::Duration hold_window,
+      BlockTracker* tracker = nullptr);
 
   // Asks the peer what became of an accepted operation. `wait_ms > 0` asks
   // it to hold the answer until the operation is terminal. UNKNOWN means the

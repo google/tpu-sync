@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/kv_cache/completion_executor.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
 
 #include <chrono>
@@ -21,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -32,6 +32,7 @@
 #include "grpcpp/impl/status.h"
 #include "grpcpp/support/client_callback.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/proto/kv_cache_store_service.grpc.pb.h"
 #include "tpu_sync/proto/kv_cache_store_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -124,9 +125,10 @@ KVCacheStoreClient::Fetch(
 }
 
 // The source's end of one WriteRemote call. The ack resolves `ack_promise_`.
-// When the call ends, OnDone hands the status and any streamed result to
-// `on_verdict_` via the CompletionExecutor, then deletes the reactor. If the
-// call fails before any ack, only the ack future reports the error.
+// When the stream ends, OnDone fulfills `result_promise_` with the verdict
+// or error, then deletes the reactor. If `tracker_` is provided, OnDone
+// updates it with the streamed verdict. If the call fails before any ack, both
+// the ack and result futures report the error.
 class WriteRemoteClientReactor
     : public ::grpc::ClientReadReactor<
           ::tpu_raiden::kv_cache::proto::WriteRemoteEvent> {
@@ -136,11 +138,14 @@ class WriteRemoteClientReactor
       ::tpu_raiden::kv_cache::proto::WriteRemoteRequest request,
       std::shared_ptr<::grpc::ClientContext> context,
       tsl::Promise<::tpu_raiden::kv_cache::proto::WriteRemoteAck> ack_promise,
-      KVCacheStoreClient::WriteRemoteVerdictCallback on_verdict)
+      tsl::Promise<::tpu_raiden::kv_cache::proto::WriteRemoteResult>
+          result_promise,
+      BlockTracker* tracker)
       : context_(std::move(context)),
         request_(std::move(request)),
         ack_promise_(std::move(ack_promise)),
-        on_verdict_(std::move(on_verdict)) {
+        result_promise_(std::move(result_promise)),
+        tracker_(tracker) {
     stub->async()->WriteRemote(context_.get(), &request_, this);
     StartRead(&event_);
     StartCall();
@@ -153,16 +158,15 @@ class WriteRemoteClientReactor
 
     if (event_.has_ack()) {
       ack_received_ = true;
-      operation_id_ = event_.ack().operation_id();
       ack_promise_.Set(event_.ack());
       if (event_.ack().exist_state() ==
           ::tpu_raiden::kv_cache::proto::WRITE_EXIST_STATE_UNSPECIFIED) {
         StartRead(&event_);
       } else {
         // Existence answers (ALL_EXIST / PARTIAL_EXIST) settle synchronously
-        // inside SaveRemote via the ack promise. Clearing on_verdict_ prevents
-        // OnDone from scheduling an unneeded verdict that races with SaveRemote.
-        on_verdict_ = nullptr;
+        // inside SaveRemote/BeginWriteRemote via the ack promise. Clearing
+        // tracker_ prevents OnDone from recording an unneeded verdict.
+        tracker_ = nullptr;
       }
     } else if (event_.has_result()) {
       has_result_ = true;
@@ -174,29 +178,47 @@ class WriteRemoteClientReactor
   void OnDone(const ::grpc::Status& status) override {
     bool initial_ack_failed = !ack_received_;
     if (!ack_received_) {
-      ack_promise_.Set(absl::Status(
+      absl::Status rpc_status(
           static_cast<absl::StatusCode>(status.error_code()),
-          status.error_message()));
+          status.error_message());
+      ack_promise_.Set(rpc_status);
+      result_promise_.Set(rpc_status);
       ack_received_ = true;
+    } else if (has_result_) {
+      result_promise_.Set(result_);
+    } else if (status.ok()) {
+      result_promise_.Set(
+          absl::InternalError("WriteRemote stream closed without result"));
+    } else {
+      result_promise_.Set(
+          absl::Status(static_cast<absl::StatusCode>(status.error_code()),
+                       status.error_message()));
     }
 
-    absl::Status rpc_status =
-        status.ok()
-            ? absl::OkStatus()
-            : absl::Status(static_cast<absl::StatusCode>(status.error_code()),
-                           status.error_message());
-
-    std::optional<proto::WriteRemoteResult> result;
-    if (has_result_) {
-      result = std::move(result_);
-    }
-
-    if (on_verdict_ && !initial_ack_failed) {
-      CompletionExecutor::Schedule(
-          [on_verdict = std::move(on_verdict_), rpc_status,
-           result = std::move(result), op_id = operation_id_]() mutable {
-            on_verdict(rpc_status, std::move(result), op_id);
-          });
+    if (tracker_ != nullptr && !initial_ack_failed && has_result_) {
+      std::vector<std::string> hashes(request_.block_hashes().begin(),
+                                      request_.block_hashes().end());
+      switch (result_.state()) {
+        case proto::PollWriteRemoteResponse::COMMITTED:
+        case proto::PollWriteRemoteResponse::ALL_EXIST:
+          tracker_->MarkDone(hashes);
+          break;
+        case proto::PollWriteRemoteResponse::PARTIAL_EXIST:
+          tracker_->MarkFailedWithExisting(
+              hashes,
+              std::vector<std::string>(result_.existing_hashes().begin(),
+                                       result_.existing_hashes().end()));
+          break;
+        case proto::PollWriteRemoteResponse::STORED_UNREGISTERED:
+          tracker_->MarkFailedWithUnregistered(
+              hashes,
+              std::vector<std::string>(result_.unregistered_hashes().begin(),
+                                       result_.unregistered_hashes().end()));
+          break;
+        default:
+          tracker_->MarkFailed(hashes);
+          break;
+      }
     }
 
     delete this;
@@ -211,10 +233,10 @@ class WriteRemoteClientReactor
   proto::WriteRemoteEvent event_;
   // Resolved by the ack, or by the call's error if no ack arrived.
   tsl::Promise<proto::WriteRemoteAck> ack_promise_;
-  // Invoked from OnDone with the call's outcome. May be null.
-  KVCacheStoreClient::WriteRemoteVerdictCallback on_verdict_;
-  // Operation id from the ack; 0 until the ack arrives.
-  uint64_t operation_id_ = 0;
+  // Resolved when the stream delivers a verdict or ends.
+  tsl::Promise<proto::WriteRemoteResult> result_promise_;
+  // Updated with the streamed verdict if non-null.
+  BlockTracker* tracker_ = nullptr;
   // True once ack_promise_ has been set.
   bool ack_received_ = false;
   // True when the peer streamed a result; result_ then holds it.
@@ -228,31 +250,30 @@ KVCacheStoreClient::WriteRemoteCall KVCacheStoreClient::WriteRemote(
     absl::Span<const int32_t> src_host_block_ids,
     absl::Span<const ::tpu_sync::proto::RaidenWorkerEndpointsProto>
         src_worker_endpoints,
-    int64_t deadline_ms,
-    absl::Duration hold_window,
-    WriteRemoteVerdictCallback on_verdict) {
+    int64_t deadline_ms, absl::Duration hold_window, BlockTracker* tracker) {
   if (block_hashes.empty()) {
+    absl::Status status =
+        absl::InvalidArgumentError("WriteRemote requires at least one hash.");
     return WriteRemoteCall{
-        tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(
-            absl::InvalidArgumentError(
-                "WriteRemote requires at least one hash.")),
+        tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(status),
+        tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteResult>(status),
         nullptr};
   }
   if (src_host_block_ids.size() != block_hashes.size()) {
+    absl::Status status = absl::InvalidArgumentError(absl::StrCat(
+        "Mismatched src_host_block_ids count (", src_host_block_ids.size(),
+        ") vs block_hashes count (", block_hashes.size(), ")."));
     return WriteRemoteCall{
-        tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(
-            absl::InvalidArgumentError(absl::StrCat(
-                "Mismatched src_host_block_ids count (",
-                src_host_block_ids.size(), ") vs block_hashes count (",
-                block_hashes.size(), ")."))),
+        tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(status),
+        tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteResult>(status),
         nullptr};
   }
   if (deadline_ms <= 0) {
+    absl::Status status = absl::InvalidArgumentError(absl::StrCat(
+        "WriteRemote requires a positive deadline_ms, got ", deadline_ms, "."));
     return WriteRemoteCall{
-        tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(
-            absl::InvalidArgumentError(absl::StrCat(
-                "WriteRemote requires a positive deadline_ms, got ",
-                deadline_ms, "."))),
+        tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteAck>(status),
+        tsl::Future<::tpu_raiden::kv_cache::proto::WriteRemoteResult>(status),
         nullptr};
   }
 
@@ -270,8 +291,10 @@ KVCacheStoreClient::WriteRemoteCall KVCacheStoreClient::WriteRemote(
   }
   request.set_deadline_ms(deadline_ms);
 
-  auto [promise, future] =
+  auto [ack_promise, ack_future] =
       tsl::MakePromise<::tpu_raiden::kv_cache::proto::WriteRemoteAck>();
+  auto [result_promise, result_future] =
+      tsl::MakePromise<::tpu_raiden::kv_cache::proto::WriteRemoteResult>();
 
   // The call's deadline is the hold window; it is what ends a call that
   // never gets an answer.
@@ -284,21 +307,22 @@ KVCacheStoreClient::WriteRemoteCall KVCacheStoreClient::WriteRemote(
   // the life of the call.
   auto cancel = std::make_shared<WriteRemoteCancel>();
   {
-    absl::MutexLock lock(&cancel->state_->mutex);
+    absl::MutexLock lock(cancel->state_->mutex);
     cancel->state_->context = context;
   }
 
   // Owns itself until OnDone.
   new WriteRemoteClientReactor(stub_.get(), std::move(request),
-                               std::move(context), std::move(promise),
-                               std::move(on_verdict));
-  return WriteRemoteCall{std::move(future), std::move(cancel)};
+                               std::move(context), std::move(ack_promise),
+                               std::move(result_promise), tracker);
+  return WriteRemoteCall{std::move(ack_future), std::move(result_future),
+                         std::move(cancel)};
 }
 
 void WriteRemoteCancel::TryCancel() {
   std::shared_ptr<::grpc::ClientContext> context;
   {
-    absl::MutexLock lock(&state_->mutex);
+    absl::MutexLock lock(state_->mutex);
     context = state_->context.lock();
   }
   // If the call already ended, the weak pointer is empty and there is

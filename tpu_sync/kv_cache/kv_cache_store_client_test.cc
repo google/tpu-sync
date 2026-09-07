@@ -23,13 +23,16 @@
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/time/time.h"
 #include "grpcpp/grpcpp.h"
 #include "grpcpp/security/credentials.h"
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/support/status.h"
+#include "grpcpp/support/sync_stream.h"
 #include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/raiden_future.h"
+#include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/proto/kv_cache_store_service.grpc.pb.h"
 #include "tpu_sync/proto/kv_cache_store_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -60,13 +63,36 @@ class TestKVCacheStoreService
     return ::grpc::Status::OK;
   }
 
+  ::grpc::Status WriteRemote(
+      ::grpc::ServerContext* context,
+      const ::tpu_raiden::kv_cache::proto::WriteRemoteRequest* request,
+      ::grpc::ServerWriter<::tpu_raiden::kv_cache::proto::WriteRemoteEvent>*
+          writer) override {
+    if (fail_write_remote_) {
+      return ::grpc::Status(::grpc::StatusCode::INTERNAL,
+                            "Simulated WriteRemote RPC error");
+    }
+    ::tpu_raiden::kv_cache::proto::WriteRemoteEvent ack_event;
+    ack_event.mutable_ack()->set_operation_id(12345);
+    ack_event.mutable_ack()->set_granted_deadline_ms(5000);
+    writer->Write(ack_event);
+
+    ::tpu_raiden::kv_cache::proto::WriteRemoteEvent result_event;
+    result_event.mutable_result()->set_state(
+        ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::COMMITTED);
+    writer->Write(result_event);
+    return ::grpc::Status::OK;
+  }
+
   void SetFailRpc(bool fail) { fail_rpc_ = fail; }
+  void SetFailWriteRemote(bool fail) { fail_write_remote_ = fail; }
   const ::tpu_raiden::kv_cache::proto::FetchRequest& last_request() const {
     return last_request_;
   }
 
  private:
   bool fail_rpc_ = false;
+  bool fail_write_remote_ = false;
   ::tpu_raiden::kv_cache::proto::FetchRequest last_request_;
 };
 
@@ -175,6 +201,53 @@ TEST_F(KVCacheStoreClientTest, FetchEmptyHashesReturnsEmptyResponse) {
       client_->Fetch(hashes);
   TF_ASSERT_OK_AND_ASSIGN(auto response, future.Await());
   EXPECT_EQ(response.done_block_hashes_size(), 0);
+}
+
+TEST_F(KVCacheStoreClientTest, WriteRemoteUpdatesBlockTrackerOnSuccess) {
+  BlockTracker tracker;
+  std::vector<std::string> hashes = {"hash_1", "hash_2"};
+  std::vector<int32_t> host_ids = {10, 11};
+  tracker.AddPending(hashes);
+
+  auto call = client_->WriteRemote(
+      ::tpu_sync::rpc::RaidenIdProto(), hashes, host_ids, {},
+      /*deadline_ms=*/5000, absl::Seconds(10), &tracker);
+  auto ack = call.ack.Await();
+  ABSL_ASSERT_OK(ack);
+  EXPECT_EQ(ack->operation_id(), 12345);
+
+  auto result = call.result.Await();
+  ABSL_ASSERT_OK(result);
+  EXPECT_EQ(result->state(),
+            ::tpu_raiden::kv_cache::proto::PollWriteRemoteResponse::COMMITTED);
+
+  auto status = tracker.Poll();
+  EXPECT_THAT(status.done, UnorderedElementsAre("hash_1", "hash_2"));
+  EXPECT_TRUE(status.pending.empty());
+}
+
+TEST_F(KVCacheStoreClientTest, WriteRemoteValidatesArguments) {
+  BlockTracker tracker;
+  // Empty hashes
+  auto empty_call =
+      client_->WriteRemote(::tpu_sync::rpc::RaidenIdProto(), {}, {}, {}, 5000,
+                           absl::Seconds(10), &tracker);
+  EXPECT_THAT(empty_call.ack.Await().status(),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+
+  // Mismatched host ids
+  auto mismatch_call =
+      client_->WriteRemote(::tpu_sync::rpc::RaidenIdProto(), {"a"}, {1, 2}, {},
+                           5000, absl::Seconds(10), &tracker);
+  EXPECT_THAT(mismatch_call.ack.Await().status(),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+
+  // Non-positive deadline
+  auto deadline_call =
+      client_->WriteRemote(::tpu_sync::rpc::RaidenIdProto(), {"a"}, {1}, {}, 0,
+                           absl::Seconds(10), &tracker);
+  EXPECT_THAT(deadline_call.ack.Await().status(),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 }  // namespace

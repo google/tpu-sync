@@ -52,6 +52,8 @@ class RaidenController;
 
 namespace kv_cache {
 
+class BlockTracker;
+
 class HostOffloadBackend : public KVCacheStoreBackend {
  public:
   static absl::StatusOr<std::shared_ptr<KVCacheStoreBackend>> Create(
@@ -154,8 +156,8 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   // --- Remote write, source side ------------------------------------------
   //
-  // BeginWriteRemote offers blocks; the verdict arrives later through
-  // on_verdict, on the same call. PollWriteRemoteAsync is recovery for a
+  // BeginWriteRemote offers blocks; the verdict arrives later on the same
+  // call and updates save_tracker. PollWriteRemoteAsync is recovery for a
   // source that lost that call. KVCacheStore owns the pins.
 
   // What the destination decided, before any bytes have moved.
@@ -175,23 +177,16 @@ class HostOffloadBackend : public KVCacheStoreBackend {
     std::shared_ptr<WriteRemoteCancel> cancel;
   };
 
-  // Reports how the offer's call ended, once an ack has arrived; same shape
-  // as KVCacheStoreClient::WriteRemoteVerdictCallback.
-  using WriteRemoteVerdictCallback = std::function<void(
-      absl::Status rpc_status,
-      std::optional<::tpu_raiden::kv_cache::proto::WriteRemoteResult> result,
-      uint64_t operation_id)>;
   // Offers `block_hashes` to `dst_raiden_id` and blocks until the ack (not
   // the bytes). `requested_deadline` is how long the destination may hold
-  // its landing blocks; `hold_window` is the call's deadline. `on_verdict`
-  // runs when the call ends; if the call fails before any ack, the failure
-  // is the return status and on_verdict never runs.
+  // its landing blocks; `hold_window` is the call's deadline. If
+  // `save_tracker` is non-null, its transfer status is updated when the
+  // operation completes or settles.
   absl::StatusOr<RemoteWriteAck> BeginWriteRemote(
       const RaidenId& dst_raiden_id, absl::Span<const std::string> block_hashes,
       absl::Span<const int32_t> src_host_block_ids,
-      absl::Duration requested_deadline,
-      absl::Duration hold_window,
-      WriteRemoteVerdictCallback on_verdict = nullptr);
+      absl::Duration requested_deadline, absl::Duration hold_window,
+      BlockTracker* save_tracker = nullptr);
 
   // Asks the destination what became of an accepted offer; recovery for a
   // source that lost its stream. `wait_ms > 0` asks it to hold the answer
@@ -279,6 +274,12 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   absl::flat_hash_map<RaidenId, std::shared_ptr<KVCacheStoreClient>,
                       RaidenIdHash>
       store_clients_ ABSL_GUARDED_BY(mutex_);
+
+  struct Lifetime {
+    absl::Mutex mu;
+    bool is_alive ABSL_GUARDED_BY(mu) = true;
+  };
+  std::shared_ptr<Lifetime> lifetime_ = std::make_shared<Lifetime>();
 };
 
 }  // namespace kv_cache

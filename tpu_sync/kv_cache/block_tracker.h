@@ -70,6 +70,12 @@ class BlockTracker {
   void MarkUnregistered(absl::Span<const std::string> block_hashes);
   void MarkUnregistered(const std::string& block_hash);
 
+  // Atomically records failed blocks alongside existing or unregistered blocks.
+  void MarkFailedWithExisting(absl::Span<const std::string> failed,
+                              absl::Span<const std::string> existing);
+  void MarkFailedWithUnregistered(absl::Span<const std::string> failed,
+                                  absl::Span<const std::string> unregistered);
+
   void Update(absl::Span<const std::string> done,
               absl::Span<const std::string> failed = {});
 

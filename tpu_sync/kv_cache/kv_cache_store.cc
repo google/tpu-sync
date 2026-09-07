@@ -1828,157 +1828,21 @@ absl::Status KVCacheStore::SaveRemote(
   // settle path, never by rollback.
   std::move(rollback).Cancel();
 
-  // Runs when the offer's call ends after the ack: with a result, an error,
-  // or its deadline. (A call that fails before any ack reports through
-  // BeginWriteRemote's return instead.) Every settle claims the operation
-  // via TakeRemoteWrite, so exactly one path settles it.
-  auto on_verdict = [lifetime = lifetime_, op_key, dst_raiden_id](
-                        absl::Status status,
-                        std::optional<proto::WriteRemoteResult> result,
-                        uint64_t stream_op_id) {
-    absl::MutexLock lock(lifetime->mu);
-    if (lifetime->store == nullptr) {
-      return;
-    }
-
-    auto settle_verdict = [](KVCacheStore* store, OperationKey key,
-                             proto::PollWriteRemoteResponse::State state,
-                             std::vector<std::string> existing_hashes,
-                             std::vector<std::string> unregistered_hashes) {
-      auto taken = store->TakeRemoteWrite(key);
-      if (!taken.has_value()) {
-        return;
-      }
-      switch (state) {
-        case proto::PollWriteRemoteResponse::COMMITTED:
-        case proto::PollWriteRemoteResponse::ALL_EXIST:
-          store->OnWriteRemoteVerdict(std::move(*taken),
-                                      /*succeeded=*/true, {});
-          break;
-        case proto::PollWriteRemoteResponse::PARTIAL_EXIST:
-          store->OnWriteRemoteVerdict(std::move(*taken), /*succeeded=*/false,
-                                      std::move(existing_hashes));
-          break;
-        case proto::PollWriteRemoteResponse::STORED_UNREGISTERED:
-          store->OnWriteRemoteVerdict(std::move(*taken), /*succeeded=*/false, {},
-                                      std::move(unregistered_hashes));
-          break;
-        default:
-          store->OnWriteRemoteVerdict(std::move(*taken),
-                                      /*succeeded=*/false, {});
-          break;
-      }
-    };
-
-    if (result.has_value()) {
-      settle_verdict(
-          lifetime->store, op_key, result->state(),
-          std::vector<std::string>(result->existing_hashes().begin(),
-                                   result->existing_hashes().end()),
-          std::vector<std::string>(result->unregistered_hashes().begin(),
-                                   result->unregistered_hashes().end()));
-    } else {
-      // The call ended without a verdict. Decide on the operation's CURRENT
-      // hold_expiry, not on the call's status: the ack may have extended the
-      // hold past the call's fixed deadline, in which case the destination
-      // may still be pulling and we must recover, not settle.
-      uint64_t op_id = stream_op_id;
-      absl::Time current_hold_expiry = absl::InfinitePast();
-      {
-        absl::MutexLock lock(lifetime->store->mutex_);
-        auto it = lifetime->store->active_remote_writes_.find(op_key);
-        if (it == lifetime->store->active_remote_writes_.end()) {
-          // Already settled elsewhere; nothing to do.
-          return;
-        }
-        if (op_id == 0) {
-          op_id = it->second.operation_id;
-        }
-        current_hold_expiry = it->second.hold_expiry;
-      }
-      const absl::Duration remaining_hold = current_hold_expiry - absl::Now();
-      if (op_id == 0 || remaining_hold <= absl::ZeroDuration()) {
-        // No operation id to ask about, or the hold has fully elapsed:
-        // settle as failed.
-        settle_verdict(lifetime->store, op_key,
-                       proto::PollWriteRemoteResponse::FAILED, {}, {});
-        return;
-      }
-      // Still inside the hold: ask the destination once to hold the answer
-      // until the operation is terminal. One attempt; the continuation
-      // always settles.
-      auto* host_backend =
-          dynamic_cast<HostOffloadBackend*>(lifetime->store->backends_[0].get());
-      if (host_backend != nullptr) {
-          auto fut = host_backend->PollWriteRemoteAsync(
-              dst_raiden_id, op_id, absl::ToInt64Milliseconds(remaining_hold));
-          fut.OnReady([lifetime, op_key, settle_verdict](
-                          absl::StatusOr<proto::PollWriteRemoteResponse> resp) {
-            CompletionExecutor::Schedule(
-                [lifetime, op_key, settle_verdict, resp = std::move(resp)]() {
-                  absl::MutexLock lock(lifetime->mu);
-                  if (lifetime->store == nullptr) {
-                    return;
-                  }
-                  if (resp.ok()) {
-                    settle_verdict(
-                        lifetime->store, op_key, resp->state(),
-                        std::vector<std::string>(resp->existing_hashes().begin(),
-                                                 resp->existing_hashes().end()),
-                        std::vector<std::string>(resp->unregistered_hashes().begin(),
-                                                 resp->unregistered_hashes().end()));
-                  } else {
-                    settle_verdict(lifetime->store, op_key,
-                                   proto::PollWriteRemoteResponse::FAILED, {}, {});
-                  }
-                });
-          });
-          return;
-      }
-      settle_verdict(lifetime->store, op_key,
-                     proto::PollWriteRemoteResponse::FAILED, {}, {});
-    }
-  };
-
-  auto ack_res = backend->BeginWriteRemote(
-      dst_raiden_id, block_hashes, src_host_block_ids,
-      hold - kRemoteWriteMargin, hold, std::move(on_verdict));
+  BlockTracker* save_tracker =
+      (owner == SaveOwner::kApplication) ? &save_tracker_ : &sweep_tracker_;
+  auto ack_res =
+      backend->BeginWriteRemote(dst_raiden_id, block_hashes, src_host_block_ids,
+                                hold - kRemoteWriteMargin, hold, save_tracker);
   if (!ack_res.ok()) {
-    // The offer failed before any ack. Undo it completely: release the pin,
-    // clear the marks, and report only through the return status.
-    //
-    // KNOWN GAP: the destination starts pulling before it answers, so if
-    // only the answer was lost it may still be reading these blocks. We
-    // release anyway: holding for the full HOLD would stall the sweep
-    // whenever a peer is simply down, and gRPC reports both cases as
-    // UNAVAILABLE.
-    if (auto taken = TakeRemoteWrite(op_key); taken.has_value()) {
-      backend->Release(taken->block_hashes);
-      if (taken->owner == SaveOwner::kApplication) {
-        save_tracker_.RemovePending(taken->block_hashes);
-      } else {
-        sweep_tracker_.RemovePending(taken->block_hashes);
-      }
-    }
+    backend->Release(block_hashes);
+    save_tracker->RemovePending(block_hashes);
+    TakeRemoteWrite(op_key);
     return ack_res.status();
   }
 
   const auto& ack = *ack_res;
-  if (ack.all_exist) {
-    // SUCCESS with nothing to wait for.
-    auto taken = TakeRemoteWrite(op_key);
-    if (taken.has_value()) {
-      OnWriteRemoteVerdict(std::move(*taken), /*succeeded=*/true, {});
-    }
-    return absl::OkStatus();
-  }
-  if (!ack.existing_hashes.empty()) {
-    // FAILURE. The caller gets the list and decides what to re-offer.
-    auto taken = TakeRemoteWrite(op_key);
-    if (taken.has_value()) {
-      OnWriteRemoteVerdict(std::move(*taken), /*succeeded=*/false,
-                           std::move(ack.existing_hashes));
-    }
+  if (ack.all_exist || !ack.existing_hashes.empty()) {
+    TakeRemoteWrite(op_key);
     return absl::OkStatus();
   }
 

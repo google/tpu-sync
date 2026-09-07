@@ -336,6 +336,7 @@ cc_library(
     hdrs = ["host_offload_backend.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":block_tracker",
         ":kv_cache_metadata",
         ":kv_cache_store_backend",
         ":kv_cache_store_backend_factory",
@@ -726,7 +727,7 @@ cc_library(
     hdrs = ["kv_cache_store_client.h"],
     visibility = ["//visibility:public"],
     deps = [
-        ":completion_executor",
+        ":block_tracker",
         "//tpu_sync/proto:kv_cache_store_service_cc_grpc",
         "//tpu_sync/proto:kv_cache_store_service_cc_proto",
         "//tpu_sync/proto:worker_service_cc_proto",
@@ -748,6 +749,7 @@ cc_test(
     srcs = ["kv_cache_store_client_test.cc"],
     local_defines = ["ABSL_DEFINE_UNQUALIFIED_STATUS_TESTING_MACROS"],
     deps = [
+        ":block_tracker",
         ":kv_cache_store_client",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/proto:kv_cache_store_service_cc_grpc",
@@ -756,6 +758,7 @@ cc_test(
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@xla//xla/tsl/concurrency:future",

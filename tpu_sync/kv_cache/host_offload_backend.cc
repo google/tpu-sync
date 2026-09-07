@@ -34,6 +34,7 @@
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "grpcpp/create_channel.h"
@@ -42,6 +43,7 @@
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/buffer.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
+#include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
@@ -102,6 +104,10 @@ HostOffloadBackend::HostOffloadBackend(
       registry_client_(std::move(registry_client)) {}
 
 HostOffloadBackend::~HostOffloadBackend() {
+  {
+    absl::MutexLock lock(lifetime_->mu);
+    lifetime_->is_alive = false;
+  }
   if (server_) {
     server_->Shutdown();
   }
@@ -774,9 +780,8 @@ absl::StatusOr<HostOffloadBackend::RemoteWriteAck>
 HostOffloadBackend::BeginWriteRemote(
     const RaidenId& dst_raiden_id, absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> src_host_block_ids,
-    absl::Duration requested_deadline,
-    absl::Duration hold_window,
-    WriteRemoteVerdictCallback on_verdict) {
+    absl::Duration requested_deadline, absl::Duration hold_window,
+    BlockTracker* save_tracker) {
   if (block_hashes.empty()) {
     return absl::InvalidArgumentError("WriteRemote requires at least one hash");
   }
@@ -790,11 +795,12 @@ HostOffloadBackend::BeginWriteRemote(
   ABSL_ASSIGN_OR_RETURN(std::shared_ptr<KVCacheStoreClient> client,
                         GetKVCacheStoreClient(dst_raiden_id));
 
-  auto call = client->WriteRemote(raiden_controller_->unit(), block_hashes,
-                                  src_host_block_ids,
-                                  BuildLocalWorkerEndpoints(raiden_controller_),
-                                  absl::ToInt64Milliseconds(requested_deadline),
-                                  hold_window, std::move(on_verdict));
+  auto hold_expiry = std::make_shared<absl::Time>(absl::Now() + hold_window);
+
+  auto call = client->WriteRemote(
+      raiden_controller_->unit(), block_hashes, src_host_block_ids,
+      BuildLocalWorkerEndpoints(raiden_controller_),
+      absl::ToInt64Milliseconds(requested_deadline), hold_window, save_tracker);
   auto response = call.ack.Await();
   if (!response.ok()) {
     // On a transport error the peer may have restarted on a new port; drop
@@ -811,13 +817,26 @@ HostOffloadBackend::BeginWriteRemote(
   ack.cancel = std::move(call.cancel);
   ack.operation_id = response->operation_id();
   ack.granted_deadline = absl::Milliseconds(response->granted_deadline_ms());
+  if (ack.granted_deadline >= hold_window) {
+    *hold_expiry = std::max(*hold_expiry, absl::Now() + ack.granted_deadline);
+  }
   switch (response->exist_state()) {
     case ::tpu_raiden::kv_cache::proto::WRITE_ALL_EXIST:
       ack.all_exist = true;
+      if (save_tracker != nullptr) {
+        save_tracker->MarkDone(block_hashes);
+      }
+      // Release both the transfer's hold and the caller's pin.
+      Release(block_hashes);
+      Release(block_hashes);
       return ack;
     case ::tpu_raiden::kv_cache::proto::WRITE_PARTIAL_EXIST:
       ack.existing_hashes.assign(response->existing_hashes().begin(),
                                  response->existing_hashes().end());
+      if (save_tracker != nullptr) {
+        save_tracker->MarkFailedWithExisting(block_hashes, ack.existing_hashes);
+      }
+      Release(block_hashes);
       return ack;
     default:
       break;
@@ -827,6 +846,81 @@ HostOffloadBackend::BeginWriteRemote(
     // error, not a silent no-op.
     return absl::InternalError(
         "Destination accepted the offer but returned no operation id.");
+  }
+  if (save_tracker != nullptr) {
+    std::vector<std::string> hashes(block_hashes.begin(), block_hashes.end());
+    call.result.OnReady([this, lifetime = lifetime_, dst_raiden_id,
+                         save_tracker, hashes = std::move(hashes), hold_expiry,
+                         op_id = ack.operation_id](
+                            absl::StatusOr<proto::WriteRemoteResult>
+                                result_or) {
+      absl::MutexLock lock(lifetime->mu);
+      if (!lifetime->is_alive) {
+        return;
+      }
+      if (!result_or.ok() &&
+          result_or.status().code() == absl::StatusCode::kCancelled) {
+        return;
+      }
+      bool succeeded = false;
+      if (result_or.ok()) {
+        const auto& result = *result_or;
+        succeeded =
+            (result.state() == proto::PollWriteRemoteResponse::COMMITTED ||
+             result.state() == proto::PollWriteRemoteResponse::ALL_EXIST);
+      } else {
+        const absl::Duration remaining_hold = *hold_expiry - absl::Now();
+        if (op_id != 0 && remaining_hold > absl::ZeroDuration()) {
+          auto fut = PollWriteRemoteAsync(
+              dst_raiden_id, op_id, absl::ToInt64Milliseconds(remaining_hold));
+          fut.OnReady([this, lifetime, save_tracker, hashes](
+                          absl::StatusOr<proto::PollWriteRemoteResponse> resp) {
+            absl::MutexLock lock(lifetime->mu);
+            if (!lifetime->is_alive) {
+              return;
+            }
+            bool poll_succeeded = false;
+            if (resp.ok()) {
+              switch (resp->state()) {
+                case proto::PollWriteRemoteResponse::COMMITTED:
+                case proto::PollWriteRemoteResponse::ALL_EXIST:
+                  save_tracker->MarkDone(hashes);
+                  poll_succeeded = true;
+                  break;
+                case proto::PollWriteRemoteResponse::PARTIAL_EXIST:
+                  save_tracker->MarkFailedWithExisting(
+                      hashes,
+                      std::vector<std::string>(resp->existing_hashes().begin(),
+                                               resp->existing_hashes().end()));
+                  break;
+                case proto::PollWriteRemoteResponse::STORED_UNREGISTERED:
+                  save_tracker->MarkFailedWithUnregistered(
+                      hashes, std::vector<std::string>(
+                                  resp->unregistered_hashes().begin(),
+                                  resp->unregistered_hashes().end()));
+                  break;
+                default:
+                  save_tracker->MarkFailed(hashes);
+                  break;
+              }
+            } else {
+              save_tracker->MarkFailed(hashes);
+            }
+            Release(hashes);
+            if (poll_succeeded) {
+              Release(hashes);
+            }
+          });
+          return;
+        } else {
+          save_tracker->MarkFailed(hashes);
+        }
+      }
+      Release(hashes);
+      if (succeeded) {
+        Release(hashes);
+      }
+    });
   }
   return ack;
 }

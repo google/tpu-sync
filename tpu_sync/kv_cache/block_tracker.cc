@@ -146,6 +146,22 @@ void BlockTracker::MarkUnregistered(const std::string& block_hash) {
   MarkUnregistered(absl::MakeConstSpan(&block_hash, 1));
 }
 
+void BlockTracker::MarkFailedWithExisting(
+    absl::Span<const std::string> failed,
+    absl::Span<const std::string> existing) {
+  absl::MutexLock lock(mutex_);
+  MarkExistingLocked(existing);
+  MarkFailedLocked(failed);
+}
+
+void BlockTracker::MarkFailedWithUnregistered(
+    absl::Span<const std::string> failed,
+    absl::Span<const std::string> unregistered) {
+  absl::MutexLock lock(mutex_);
+  MarkUnregisteredLocked(unregistered);
+  MarkFailedLocked(failed);
+}
+
 void BlockTracker::Update(absl::Span<const std::string> done,
                           absl::Span<const std::string> failed) {
   absl::MutexLock lock(mutex_);

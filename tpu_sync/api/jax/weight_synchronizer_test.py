@@ -117,6 +117,14 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     for arr in dst2_arrs:
       np.testing.assert_array_equal(np.asarray(arr), 5.0)
 
+  def test_wait_for_transfer_completion_api_exists(self):
+    arrs = [
+        jax.device_put(jnp.zeros(self.shape, dtype=self.dtype), self.sharding)
+    ]
+    ws = WeightSynchronizer(jax_arrays=arrs, local_port=0)
+    self.assertTrue(hasattr(ws, "wait_for_transfer_completion"))
+    self.assertTrue(callable(ws.wait_for_transfer_completion))
+
   def test_bind_weights(self):
     src_arrs = [
         jax.device_put(

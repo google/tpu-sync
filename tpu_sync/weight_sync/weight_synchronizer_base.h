@@ -93,7 +93,7 @@ class WeightSynchronizerControlDelegate {
   virtual absl::Status RegisterExpectedLayerChunks(
       uint64_t uuid,
       const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) = 0;
-  virtual absl::Status WaitForTransferCompletion(uint64_t uuid) = 0;
+  virtual absl::Status WaitForTransferCompletion(uint64_t uuid = 0) = 0;
   virtual void ForgetPushProgress(uint64_t uuid) = 0;
   virtual void DrainPendingH2d() = 0;
 };
@@ -280,7 +280,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
                                    uint64_t uuid = 0) override;
   absl::Status OnDataReceived(uint64_t uuid = 0) override;
 
-  virtual absl::Status WaitForTransferCompletion(uint64_t uuid);
+  virtual absl::Status WaitForTransferCompletion(uint64_t uuid = 0);
   virtual void DrainPendingH2d();
 
   void ForgetPushProgress(uint64_t uuid) override;

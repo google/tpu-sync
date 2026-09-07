@@ -345,6 +345,18 @@ NB_MODULE(_tpu_raiden_jax, m) {
           },
           nb::call_guard<nb::gil_scoped_release>())
       .def(
+          "wait_for_transfer_completion",
+          [](WeightSynchronizer& self, std::optional<uint64_t> uuid) {
+            absl::Status status =
+                self.WaitForTransferCompletion(uuid.value_or(0));
+            if (!status.ok()) {
+              throw std::runtime_error("WaitForTransferCompletion failed: " +
+                                       std::string(status.message()));
+            }
+          },
+          nb::call_guard<nb::gil_scoped_release>(),
+          nb::arg("uuid") = nb::none())
+      .def(
           "set_skip_tiling",
           [](WeightSynchronizer& self, bool skip_all) {
             self.SetSkipTiling(skip_all);

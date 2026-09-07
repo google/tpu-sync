@@ -338,6 +338,28 @@ TEST(WeightSynchronizerWrapperTest,
 }
 
 TEST(WeightSynchronizerWrapperTest,
+     WeightSynchronizerWaitForTransferCompletionDelegates) {
+  auto sub0_raw = new MockSubWeightSynchronizer(2, 4, 1024);
+  auto sub1_raw = new MockSubWeightSynchronizer(2, 4, 1024);
+
+  std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>> subs;
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub0_raw));
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub1_raw));
+
+  WeightSynchronizer ws(std::move(subs));
+
+  EXPECT_TRUE(ws.WaitForTransferCompletion(100).ok());
+  EXPECT_EQ(sub0_raw->wait_completion_calls, 1);
+  EXPECT_EQ(sub1_raw->wait_completion_calls, 1);
+
+  EXPECT_TRUE(ws.WaitForTransferCompletion().ok());
+  EXPECT_EQ(sub0_raw->wait_completion_calls, 2);
+  EXPECT_EQ(sub1_raw->wait_completion_calls, 2);
+}
+
+TEST(WeightSynchronizerWrapperTest,
      RegisterExpectedCountsWithReplicatedTensors) {
   auto sub0_raw = new MockSubWeightSynchronizer(2, 4, 1024);
   auto sub1_raw = new MockSubWeightSynchronizer(2, 4, 1024);

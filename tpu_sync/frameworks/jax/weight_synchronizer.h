@@ -116,7 +116,7 @@ class NumaAwareWeightSynchronizer
       uint64_t uuid,
       const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks)
       override;
-  absl::Status WaitForTransferCompletion(uint64_t uuid) override;
+  absl::Status WaitForTransferCompletion(uint64_t uuid = 0) override;
   void ForgetPushProgress(uint64_t uuid) override;
   void DrainPendingH2d() override;
 
@@ -194,6 +194,7 @@ class WeightSynchronizer {
 
   absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
   absl::StatusOr<raiden::PjRtCopyFuture> H2d(uint64_t uuid = 0);
+  absl::Status WaitForTransferCompletion(uint64_t uuid = 0);
   void SetSkipTiling(const std::vector<bool>& skip_tiling);
   void SetSkipTiling(bool skip_all);
 

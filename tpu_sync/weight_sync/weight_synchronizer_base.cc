@@ -1120,7 +1120,8 @@ absl::Status WeightSynchronizerBase::WaitForTransferCompletion(uint64_t uuid) {
   auto condition_fn =
       +[](std::pair<absl::flat_hash_set<uint64_t>*, uint64_t>* p)
            ABSL_NO_THREAD_SAFETY_ANALYSIS {
-             return p->first->contains(p->second);
+             return p->second == 0 ? !p->first->empty()
+                                   : p->first->contains(p->second);
            };
   std::pair<absl::flat_hash_set<uint64_t>*, uint64_t> ctx{&completed_transfers_,
                                                           uuid};

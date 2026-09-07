@@ -880,6 +880,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizer::H2d(uint64_t uuid) {
   return numa_manager_->H2d(uuid);
 }
 
+absl::Status WeightSynchronizer::WaitForTransferCompletion(uint64_t uuid) {
+  return numa_manager_->WaitForTransferCompletion(uuid);
+}
+
 void WeightSynchronizer::SetSkipTiling(const std::vector<bool>& skip_tiling) {
   numa_manager_->SetSkipTiling(skip_tiling);
 }

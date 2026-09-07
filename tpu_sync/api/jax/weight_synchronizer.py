@@ -98,6 +98,10 @@ class WeightSynchronizer:
     """Triggers asynchronous Host-to-Device (H2D) copy of staged host buffer back to Device memory E2E."""
     self._impl.H2d()
 
+  def wait_for_transfer_completion(self, uuid: Optional[int] = None) -> None:
+    """Blocks until the transfer with the given UUID (or any transfer if None) has finished ingestion."""
+    self._impl.wait_for_transfer_completion(uuid)
+
   def test_only_set_skip_tiling(self, skip: bool | List[bool]) -> None:
     """Sets whether D2H/H2D should skip CPU tiling/detiling (for testing only)."""
     if isinstance(skip, bool):

@@ -404,6 +404,37 @@ absl::StatusOr<bool> RequestBlockRegistry::CancelIfUnclaimed(
   return true;
 }
 
+std::vector<RequestBlockRegistry::RequestBlockStatus>
+RequestBlockRegistry::Status(const std::vector<RequestBlockKey>& keys) {
+  const double now = clock_();
+  absl::MutexLock lock(*mu_);
+  PurgeExpiredRequestBlocksLocked(now);
+  PurgeExpiredLifecycleLocked(now);
+  std::vector<RequestBlockStatus> statuses;
+  statuses.reserve(keys.size());
+  for (const RequestBlockKey& key : keys) {
+    const LifecycleKey lifecycle_key{key.first, key.second};
+    if (cancelled_.find(lifecycle_key) != cancelled_.end()) {
+      statuses.push_back(RequestBlockStatus::kCancelled);
+      continue;
+    }
+    if (claimed_.find(lifecycle_key) != claimed_.end()) {
+      statuses.push_back(RequestBlockStatus::kClaimed);
+      continue;
+    }
+    bool registered = false;
+    for (const auto& [block_key, registration] : request_blocks_) {
+      if (block_key.first == key.first && registration.uuid == key.second) {
+        registered = true;
+        break;
+      }
+    }
+    statuses.push_back(registered ? RequestBlockStatus::kRegistered
+                                  : RequestBlockStatus::kUnknown);
+  }
+  return statuses;
+}
+
 absl::StatusOr<std::map<RaidenId, RequestBlockRegistration,
                         RequestBlockRegistry::RaidenIdLess>>
 RequestBlockRegistry::LookupAndClaim(const std::string& req_id, int64_t uuid,

@@ -117,7 +117,10 @@ std::string ReshardService::HandleFrame(const std::string& request_bytes) {
        req.has_complete_request_blocks_request()) ||
       (req.command() == tpu_sync::rpc::ControllerRequest::
                             COMMAND_CANCEL_REQUEST_BLOCKS_IF_UNCLAIMED &&
-       req.has_cancel_request_blocks_if_unclaimed_request());
+       req.has_cancel_request_blocks_if_unclaimed_request()) ||
+      (req.command() ==
+           tpu_sync::rpc::ControllerRequest::COMMAND_GET_REQUEST_BLOCK_STATUS &&
+       req.has_get_request_block_status_request());
   if (is_controller_command) {
     return HandleControllerCommand(req);
   }
@@ -271,6 +274,35 @@ std::string ReshardService::HandleControllerCommand(
         break;
       }
       resp.set_response_data(*cancelled ? "true" : "false");
+      resp.set_success(true);
+      break;
+    }
+    case tpu_sync::rpc::ControllerRequest::COMMAND_GET_REQUEST_BLOCK_STATUS: {
+      const auto& status_req = req.get_request_block_status_request();
+      std::vector<RequestBlockRegistry::RequestBlockKey> keys;
+      keys.reserve(status_req.keys_size());
+      for (const auto& key : status_req.keys()) {
+        keys.emplace_back(key.req_id(), key.uuid());
+      }
+      auto* out = resp.mutable_get_request_block_status_response();
+      for (RequestBlockRegistry::RequestBlockStatus status :
+           registry_->Status(keys)) {
+        using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+        switch (status) {
+          case RequestBlockRegistry::RequestBlockStatus::kRegistered:
+            out->add_statuses(ProtoStatus::STATUS_REGISTERED);
+            break;
+          case RequestBlockRegistry::RequestBlockStatus::kClaimed:
+            out->add_statuses(ProtoStatus::STATUS_CLAIMED);
+            break;
+          case RequestBlockRegistry::RequestBlockStatus::kCancelled:
+            out->add_statuses(ProtoStatus::STATUS_CANCELLED);
+            break;
+          case RequestBlockRegistry::RequestBlockStatus::kUnknown:
+            out->add_statuses(ProtoStatus::STATUS_UNKNOWN);
+            break;
+        }
+      }
       resp.set_success(true);
       break;
     }

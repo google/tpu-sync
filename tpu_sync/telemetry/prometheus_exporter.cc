@@ -30,16 +30,14 @@
 #include "prometheus/text_serializer.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
-#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "tpu_sync/telemetry/exporter_util.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden::telemetry {
 
 namespace {
-
-constexpr absl::string_view kMetricPrefix = "tpu_raiden_";
 
 std::map<std::string, std::string> ConvertLabels(LabelSpan labels) {
   if (labels.empty()) {
@@ -52,13 +50,6 @@ std::map<std::string, std::string> ConvertLabels(LabelSpan labels) {
   return result;
 }
 
-std::string JoinHostPort(absl::string_view host, int port) {
-  if (absl::StrContains(host, ':') && !absl::StartsWith(host, "[")) {
-    return absl::StrCat("[", host, "]:", port);
-  }
-  return absl::StrCat(host, ":", port);
-}
-
 }  // namespace
 
 void PrometheusExporter::RegisterKnownFamilies() {
@@ -68,7 +59,8 @@ void PrometheusExporter::RegisterKnownFamilies() {
         histogram_families_.contains(meta.name)) {
       continue;
     }
-    std::string prometheus_name = absl::StrCat(kMetricPrefix, meta.name);
+    const std::string prometheus_name =
+        absl::StrCat(kPrometheusMetricPrefix, meta.name);
     switch (meta.type) {
       case MetricType::kCounter: {
         auto* family = &prometheus::BuildCounter()
@@ -118,7 +110,7 @@ PrometheusExporter::PrometheusExporter(const ExporterOptions& options)
                  << ": " << e.what();
       exposer_.reset();
     }
-  } else if (options_.port != 0) {
+  } else if (options_.port > 0) {
     LOG(WARNING) << "Invalid port configured for Prometheus HTTP exporter: "
                  << options_.port << ". Expected port in range [" << kMinPort
                  << ", " << kMaxPort << "].";

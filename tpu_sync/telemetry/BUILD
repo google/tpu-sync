@@ -87,6 +87,7 @@ cc_library(
     # Disables Clang header modules due to incompatibility with prometheus-cpp / CivetWeb headers.
     features = ["-use_header_modules"],
     deps = [
+        ":exporter_util",
         ":metrics_backend",
         "@com_github_jupp0r_prometheus_cpp//core",
         "@com_github_jupp0r_prometheus_cpp//pull",
@@ -114,6 +115,7 @@ cc_library(
     srcs = ["buffered_metrics_exporter.cc"],
     hdrs = ["buffered_metrics_exporter.h"],
     deps = [
+        ":exporter_util",
         ":metrics_backend",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -187,6 +189,64 @@ cc_test(
         "//tpu_sync/telemetry/shm:shm_layout",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "prometheus_shm_exporter",
+    srcs = ["prometheus_shm_exporter.cc"],
+    hdrs = ["prometheus_shm_exporter.h"],
+    # -fexceptions is required because prometheus-cpp Exposer throws C++
+    # exceptions (std::runtime_error) on socket binding and initialization failure.
+    copts = ["-fexceptions"],
+    # Disables Clang header modules due to incompatibility with prometheus-cpp / CivetWeb headers.
+    features = ["-use_header_modules"],
+    deps = [
+        ":base_shm_exporter",
+        ":exporter_util",
+        ":label_util",
+        ":metrics_backend",
+        "//tpu_sync/telemetry/shm:shm_collector",
+        "//tpu_sync/telemetry/shm:shm_layout",
+        "@com_github_jupp0r_prometheus_cpp//core",
+        "@com_github_jupp0r_prometheus_cpp//pull",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "prometheus_shm_exporter_test",
+    srcs = ["prometheus_shm_exporter_test.cc"],
+    deps = [
+        ":metrics_backend",
+        ":prometheus_shm_exporter",
+        ":test_util",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "exporter_util",
+    srcs = ["exporter_util.cc"],
+    hdrs = ["exporter_util.h"],
+    deps = [
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "exporter_util_test",
+    srcs = ["exporter_util_test.cc"],
+    deps = [
+        ":exporter_util",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
     ],
 )

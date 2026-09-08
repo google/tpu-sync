@@ -26,13 +26,12 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "tpu_sync/telemetry/exporter_util.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden::telemetry {
 
 namespace {
-
-constexpr absl::string_view kMetricPrefix = "tpu_raiden_";
 
 std::string EscapeLabelValue(absl::string_view value) {
   std::string escaped;
@@ -154,8 +153,8 @@ BufferedMetricsExporter::GetAndResetMetricSamples() {
             LockFreeCounterAccumulator* counter) {
           uint64_t delta = counter->ExchangeAndReset();
           if (delta > 0) {
-            std::string full_name =
-                absl::StrCat(kMetricPrefix, name, canonical_labels);
+            const std::string full_name =
+                absl::StrCat(kPrometheusMetricPrefix, name, canonical_labels);
             result[full_name].push_back(static_cast<double>(delta));
           }
         });
@@ -166,8 +165,8 @@ BufferedMetricsExporter::GetAndResetMetricSamples() {
         [&](absl::string_view canonical_labels, QueueBuffer<>* gauge) {
           std::vector<double> samples = gauge->ExtractAndReset();
           if (!samples.empty()) {
-            std::string full_name =
-                absl::StrCat(kMetricPrefix, name, canonical_labels);
+            const std::string full_name =
+                absl::StrCat(kPrometheusMetricPrefix, name, canonical_labels);
             result[full_name] = std::move(samples);
           }
         });
@@ -179,7 +178,7 @@ BufferedMetricsExporter::GetAndResetMetricSamples() {
           std::vector<double> samples = histogram->ExtractAndReset();
           if (!samples.empty()) {
             std::string full_name =
-                absl::StrCat(kMetricPrefix, name, canonical_labels);
+                absl::StrCat(kPrometheusMetricPrefix, name, canonical_labels);
             result[full_name] = std::move(samples);
           }
         });

@@ -61,10 +61,14 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "grpcpp/channel.h"
+#include "grpcpp/server_context.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/tsl/platform/errors.h"
 #include "tpu_sync/common/trace.h"
@@ -75,6 +79,8 @@
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_utils.h"
+#include "tpu_sync/core/transfer_control_client.h"
+#include "tpu_sync/core/transfer_control_server.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -99,6 +105,23 @@ bool EncodeIp(const std::string& ip_str, uint8_t* dst) {
     return true;
   }
   return false;
+}
+
+static std::string ExtractIpFromGrpcPeer(absl::string_view peer_uri) {
+  if (absl::StartsWith(peer_uri, "ipv4:")) {
+    peer_uri = absl::StripPrefix(peer_uri, "ipv4:");
+  } else if (absl::StartsWith(peer_uri, "ipv6:")) {
+    peer_uri = absl::StripPrefix(peer_uri, "ipv6:");
+  }
+  if (absl::StartsWith(peer_uri, "[") && absl::StrContains(peer_uri, "]")) {
+    size_t end_bracket = peer_uri.find(']');
+    return std::string(peer_uri.substr(1, end_bracket - 1));
+  }
+  size_t colon = peer_uri.rfind(':');
+  if (colon != absl::string_view::npos) {
+    return std::string(peer_uri.substr(0, colon));
+  }
+  return std::string(peer_uri);
 }
 
 constexpr absl::Duration kPendingWorkTimeout = absl::Seconds(30);
@@ -510,6 +533,23 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     HostBufferAllocator host_allocator, int64_t node_id,
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
     double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector)
+    : KVCacheManagerWithTransfer(
+          layer_buffers, local_port, host_blocks_to_allocate,
+          unsafe_skip_buffer_lock, parallelism, host_allocator, node_id,
+          local_control_port,
+          (local_control_port >= 0 ? 0 : TransferControlServer::kDisabledPort),
+          (local_control_port >= 0 ? ControlPlaneMode::kDual
+                                   : ControlPlaneMode::kRawTcp),
+          max_blocks, num_slots, timeout_s, std::move(metrics_collector)) {}
+
+KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
+    const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
+    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+    bool unsafe_skip_buffer_lock, int parallelism,
+    HostBufferAllocator host_allocator, int64_t node_id,
+    int64_t local_control_port, int64_t local_grpc_control_port,
+    ControlPlaneMode control_plane_mode, int64_t max_blocks, int64_t num_slots,
+    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector)
     : KVCacheManagerBase(
           layer_buffers, local_port,
           host_blocks_to_allocate.value_or(num_slots * max_blocks),
@@ -521,8 +561,22 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       num_slots_(num_slots),
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
+      control_plane_mode_(control_plane_mode),
+      local_grpc_control_port_(static_cast<int>(local_grpc_control_port)),
+      grpc_control_client_(
+          std::make_unique<TransferControlClient>(absl::Seconds(timeout_s_))),
       metrics_collector_(std::move(metrics_collector)) {
-  if (local_control_port_ >= 0) {
+  bool should_start_raw_tcp =
+      (control_plane_mode_ == ControlPlaneMode::kRawTcp ||
+       control_plane_mode_ == ControlPlaneMode::kDual) &&
+      local_control_port_ >= 0;
+  bool should_start_grpc =
+      (control_plane_mode_ == ControlPlaneMode::kGrpc ||
+       control_plane_mode_ == ControlPlaneMode::kDual) &&
+      (local_grpc_control_port_ >= 0 ||
+       local_grpc_control_port_ == TransferControlServer::kInProcessPort);
+
+  if (should_start_raw_tcp || should_start_grpc) {
     if (max_blocks_ <= 0) {
       throw std::invalid_argument("max_blocks must be positive");
     }
@@ -559,6 +613,26 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
     double timeout_s, std::optional<int> assigned_numa_node,
     std::shared_ptr<MetricsCollector> metrics_collector)
+    : KVCacheManagerWithTransfer(
+          layer_buffers, slice_byte_size, dimensions, physical_size, local_port,
+          host_blocks_to_allocate, unsafe_skip_buffer_lock, parallelism,
+          host_allocator, node_id, local_control_port,
+          (local_control_port >= 0 ? 0 : TransferControlServer::kDisabledPort),
+          (local_control_port >= 0 ? ControlPlaneMode::kDual
+                                   : ControlPlaneMode::kRawTcp),
+          max_blocks, num_slots, timeout_s, assigned_numa_node,
+          std::move(metrics_collector)) {}
+
+KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
+    const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
+    size_t slice_byte_size, const std::vector<int64_t>& dimensions,
+    size_t physical_size, std::optional<int> local_port,
+    std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
+    int parallelism, HostBufferAllocator host_allocator, int64_t node_id,
+    int64_t local_control_port, int64_t local_grpc_control_port,
+    ControlPlaneMode control_plane_mode, int64_t max_blocks, int64_t num_slots,
+    double timeout_s, std::optional<int> assigned_numa_node,
+    std::shared_ptr<MetricsCollector> metrics_collector)
     : KVCacheManagerBase(
           layer_buffers, local_port,
           host_blocks_to_allocate.value_or(num_slots * max_blocks),
@@ -576,11 +650,25 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       num_slots_(num_slots),
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
+      control_plane_mode_(control_plane_mode),
+      local_grpc_control_port_(static_cast<int>(local_grpc_control_port)),
+      grpc_control_client_(
+          std::make_unique<TransferControlClient>(absl::Seconds(timeout_s_))),
       metrics_collector_(std::move(metrics_collector)) {
   if (num_layers() == 0 || num_shards() == 0) {
     return;
   }
-  if (local_control_port_ >= 0) {
+  bool should_start_raw_tcp =
+      (control_plane_mode_ == ControlPlaneMode::kRawTcp ||
+       control_plane_mode_ == ControlPlaneMode::kDual) &&
+      local_control_port_ >= 0;
+  bool should_start_grpc =
+      (control_plane_mode_ == ControlPlaneMode::kGrpc ||
+       control_plane_mode_ == ControlPlaneMode::kDual) &&
+      (local_grpc_control_port_ >= 0 ||
+       local_grpc_control_port_ == TransferControlServer::kInProcessPort);
+
+  if (should_start_raw_tcp || should_start_grpc) {
     if (max_blocks_ <= 0) {
       throw std::invalid_argument("max_blocks must be positive");
     }
@@ -615,15 +703,46 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     int64_t max_blocks, int64_t num_slots, double timeout_s,
     std::shared_ptr<MetricsCollector> metrics_collector)
     : KVCacheManagerWithTransfer(
+          num_layers, num_shards, slice_byte_size, local_port,
+          host_blocks_to_allocate, parallelism, node_id, local_control_port,
+          (local_control_port >= 0 ? 0 : TransferControlServer::kDisabledPort),
+          (local_control_port >= 0 ? ControlPlaneMode::kDual
+                                   : ControlPlaneMode::kRawTcp),
+          max_blocks, num_slots, timeout_s, std::move(metrics_collector)) {}
+
+KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
+    size_t num_layers, size_t num_shards, size_t slice_byte_size,
+    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+    int parallelism, int64_t node_id, int64_t local_control_port,
+    int64_t local_grpc_control_port, ControlPlaneMode control_plane_mode,
+    int64_t max_blocks, int64_t num_slots, double timeout_s,
+    std::shared_ptr<MetricsCollector> metrics_collector)
+    : KVCacheManagerWithTransfer(
           num_layers, num_shards,
           std::vector<size_t>(num_layers, slice_byte_size), local_port,
           host_blocks_to_allocate, parallelism, node_id, local_control_port,
+          local_grpc_control_port, control_plane_mode, max_blocks, num_slots,
+          timeout_s, std::move(metrics_collector)) {}
+
+KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
+    size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
+    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+    int parallelism, int64_t node_id, int64_t local_control_port,
+    int64_t max_blocks, int64_t num_slots, double timeout_s,
+    std::shared_ptr<MetricsCollector> metrics_collector)
+    : KVCacheManagerWithTransfer(
+          num_layers, num_shards, std::move(slice_byte_sizes), local_port,
+          host_blocks_to_allocate, parallelism, node_id, local_control_port,
+          (local_control_port >= 0 ? 0 : TransferControlServer::kDisabledPort),
+          (local_control_port >= 0 ? ControlPlaneMode::kDual
+                                   : ControlPlaneMode::kRawTcp),
           max_blocks, num_slots, timeout_s, std::move(metrics_collector)) {}
 
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, int64_t node_id, int64_t local_control_port,
+    int64_t local_grpc_control_port, ControlPlaneMode control_plane_mode,
     int64_t max_blocks, int64_t num_slots, double timeout_s,
     std::shared_ptr<MetricsCollector> metrics_collector)
     : KVCacheManagerBase(
@@ -637,8 +756,22 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       num_slots_(num_slots),
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(false),
+      control_plane_mode_(control_plane_mode),
+      local_grpc_control_port_(static_cast<int>(local_grpc_control_port)),
+      grpc_control_client_(
+          std::make_unique<TransferControlClient>(absl::Seconds(timeout_s_))),
       metrics_collector_(std::move(metrics_collector)) {
-  if (local_control_port_ >= 0) {
+  bool should_start_raw_tcp =
+      (control_plane_mode_ == ControlPlaneMode::kRawTcp ||
+       control_plane_mode_ == ControlPlaneMode::kDual) &&
+      local_control_port_ >= 0;
+  bool should_start_grpc =
+      (control_plane_mode_ == ControlPlaneMode::kGrpc ||
+       control_plane_mode_ == ControlPlaneMode::kDual) &&
+      (local_grpc_control_port_ >= 0 ||
+       local_grpc_control_port_ == TransferControlServer::kInProcessPort);
+
+  if (should_start_raw_tcp || should_start_grpc) {
     if (max_blocks_ <= 0) {
       throw std::invalid_argument("max_blocks must be positive");
     }
@@ -1915,43 +2048,112 @@ void KVCacheManagerWithTransfer::StartRead(
       LOG(INFO) << "StartRead (connecting): req_id=" << req_id
                 << ", uuid=" << uuid
                 << ", numa=" << assigned_numa_node().value_or(-1);
-      int control_fd = ConnectTcp(remote_endpoint, timeout_s_);
-      auto control_cleanup =
-          std::unique_ptr<int, void (*)(int*)>(&control_fd, [](int* p) {
-            if (p && *p >= 0) close(*p);
-          });
+      bool use_grpc = (control_plane_mode_ == ControlPlaneMode::kGrpc);
+      std::string target_endpoint = remote_endpoint;
 
-      ControlRequestHeader stream_request;
-      stream_request.magic = kControlMagic;
-      stream_request.op = kOpPullStream;
-      stream_request.uuid = uuid;
-      stream_request.ep_idx = 0;
-      stream_request.num_blocks = static_cast<uint64_t>(load_plan.num_blocks);
-      stream_request.consumer_data_port =
-          static_cast<uint32_t>(local_data_port_);
-
-      std::vector<std::string> ips = local_ips();
-      stream_request.num_ips =
-          std::min(ips.size(), static_cast<size_t>(kMaxNics));
-      for (size_t i = 0; i < stream_request.num_ips; ++i) {
-        if (!EncodeIp(ips[i], stream_request.consumer_ips[i])) {
-          std::memset(stream_request.consumer_ips[i], 0, 16);
+      if (absl::StartsWith(remote_endpoint, "grpc://")) {
+        use_grpc = true;
+        target_endpoint =
+            std::string(absl::StripPrefix(remote_endpoint, "grpc://"));
+      } else if (absl::StartsWith(remote_endpoint, "inproc://")) {
+        use_grpc = true;
+      } else if (absl::StartsWith(remote_endpoint, "tcp://")) {
+        use_grpc = false;
+        target_endpoint =
+            std::string(absl::StripPrefix(remote_endpoint, "tcp://"));
+      } else if (control_plane_mode_ == ControlPlaneMode::kDual) {
+        try {
+          auto [host, port] = SplitEndpoint(target_endpoint);
+          if (local_grpc_control_port_ > 0 &&
+              port == local_grpc_control_port_) {
+            use_grpc = true;
+          } else if (local_control_port_ > 0 && port == local_control_port_) {
+            use_grpc = false;
+          } else if (local_control_port_ < 0 && local_grpc_control_port_ >= 0) {
+            use_grpc = true;
+          } else {
+            use_grpc = false;
+          }
+        } catch (...) {
+          use_grpc = (local_control_port_ < 0);
         }
       }
-      CheckStatus(
-          "control pull stream write",
-          WriteExact(control_fd, &stream_request, sizeof(stream_request)));
-      WriteBlockIds(control_fd, load_plan.producer_remote_block_ids);
-      WriteBlockIds(control_fd, load_plan.transport_host_block_ids);
 
-      ControlResponseHeader response = ReadControlResponseHeader(control_fd);
-      if (response.status != 0) {
-        throw std::runtime_error(
-            "Remote producer rejected Hybrid Bridge read request");
+      if (use_grpc) {
+        ::tpu_sync::proto::PullStreamRequest request;
+        request.set_uuid(uuid);
+        request.set_req_id(req_id);
+        request.set_ep_idx(0);
+        request.set_consumer_data_port(local_data_port_);
+        for (const auto& ip : local_ips()) {
+          request.add_consumer_ips(ip);
+        }
+        for (int64_t bid : load_plan.producer_remote_block_ids) {
+          request.add_src_block_ids(bid);
+        }
+        for (int64_t bid : load_plan.transport_host_block_ids) {
+          request.add_dst_block_ids(bid);
+        }
+        request.set_timeout_ms(static_cast<int64_t>(timeout_s_ * 1000));
+
+        auto pull_response = grpc_control_client_->PullStream(
+            target_endpoint, request, absl::Seconds(timeout_s_));
+        if (!pull_response.ok()) {
+          LOG(ERROR) << "gRPC PullStream failed for req_id=" << req_id
+                     << " uuid=" << uuid << ": "
+                     << pull_response.status().message();
+          absl::MutexLock lock(mu_);
+          failed_recving_.insert(req_id);
+          auto it = active_recv_entries_.find(uuid);
+          if (it != active_recv_entries_.end()) {
+            ReleaseRecvStagingLocked(&it->second);
+            active_recv_entries_.erase(it);
+          }
+          return;
+        }
+
+        VLOG(1) << "StartRead (gRPC) successfully registered pull "
+                   "request with Producer. req_id: "
+                << req_id;
+      } else {
+        int control_fd = ConnectTcp(target_endpoint, timeout_s_);
+        auto control_cleanup =
+            std::unique_ptr<int, void (*)(int*)>(&control_fd, [](int* p) {
+              if (p && *p >= 0) close(*p);
+            });
+
+        ControlRequestHeader stream_request;
+        stream_request.magic = kControlMagic;
+        stream_request.op = kOpPullStream;
+        stream_request.uuid = uuid;
+        stream_request.ep_idx = 0;
+        stream_request.num_blocks = static_cast<uint64_t>(load_plan.num_blocks);
+        stream_request.consumer_data_port =
+            static_cast<uint32_t>(local_data_port_);
+
+        std::vector<std::string> ips = local_ips();
+        stream_request.num_ips =
+            std::min(ips.size(), static_cast<size_t>(kMaxNics));
+        for (size_t i = 0; i < stream_request.num_ips; ++i) {
+          if (!EncodeIp(ips[i], stream_request.consumer_ips[i])) {
+            std::memset(stream_request.consumer_ips[i], 0, 16);
+          }
+        }
+        CheckStatus(
+            "control pull stream write",
+            WriteExact(control_fd, &stream_request, sizeof(stream_request)));
+        WriteBlockIds(control_fd, load_plan.producer_remote_block_ids);
+        WriteBlockIds(control_fd, load_plan.transport_host_block_ids);
+
+        ControlResponseHeader response = ReadControlResponseHeader(control_fd);
+        if (response.status != 0) {
+          throw std::runtime_error(
+              "Remote producer rejected Hybrid Bridge read request");
+        }
+        VLOG(1) << "StartRead (Hybrid Bridge) successfully registered pull "
+                   "request with Producer. req_id: "
+                << req_id;
       }
-      VLOG(1) << "StartRead (Hybrid Bridge) successfully registered pull "
-                 "request with Producer. req_id: "
-              << req_id;
     } catch (const std::exception& e) {
       LOG(ERROR)
           << "Raiden consumer error during Hybrid Bridge StartRead connect: "
@@ -2394,51 +2596,76 @@ void KVCacheManagerWithTransfer::ScheduleAsyncTask(std::function<void()> task) {
 }
 
 void KVCacheManagerWithTransfer::StartControlServer() {
-  control_fd_ = socket(AF_INET6, SOCK_STREAM, 0);
-  if (control_fd_ < 0) {
-    throw std::runtime_error("control socket() failed: " +
-                             std::string(std::strerror(errno)));
-  }
-  int opt = 1;
-  setsockopt(control_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-  setsockopt(control_fd_, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-  int ipv6only = 0;
-  if (setsockopt(control_fd_, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6only,
-                 sizeof(ipv6only)) < 0) {
-    LOG(WARNING) << "setsockopt IPV6_V6ONLY=0 failed: " << std::strerror(errno);
-  }
-
-  sockaddr_in6 addr;
-  std::memset(&addr, 0, sizeof(addr));
-  addr.sin6_family = AF_INET6;
-  addr.sin6_addr = in6addr_any;
-  addr.sin6_port = htons(local_control_port_);
-
-  if (bind(control_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-    std::string err = std::strerror(errno);
-    close(control_fd_);
-    control_fd_ = -1;
-    throw std::runtime_error("control bind(" +
-                             std::to_string(local_control_port_) +
-                             ") failed: " + err);
-  }
-  socklen_t len = sizeof(addr);
-  if (getsockname(control_fd_, reinterpret_cast<sockaddr*>(&addr), &len) < 0) {
-    close(control_fd_);
-    control_fd_ = -1;
-    throw std::runtime_error("getsockname() failed: " +
-                             std::string(std::strerror(errno)));
-  }
-  local_control_port_ = ntohs(addr.sin6_port);
-  if (listen(control_fd_, 128) < 0) {
-    close(control_fd_);
-    control_fd_ = -1;
-    throw std::runtime_error("listen() failed: " +
-                             std::string(std::strerror(errno)));
-  }
   stopping_ = false;
-  control_thread_ = std::thread([this]() { ControlServerLoop(); });
+
+  // 1. Start gRPC Control Server
+  if (control_plane_mode_ == ControlPlaneMode::kGrpc ||
+      control_plane_mode_ == ControlPlaneMode::kDual) {
+    if (local_grpc_control_port_ >= 0 ||
+        local_grpc_control_port_ == TransferControlServer::kInProcessPort) {
+      grpc_control_server_ = std::make_unique<TransferControlServer>(
+          this, local_grpc_control_port_);
+      local_grpc_control_port_ = grpc_control_server_->port();
+      LOG(INFO) << "TransferControlService gRPC server running on port "
+                << local_grpc_control_port_;
+    }
+  }
+
+  // 2. Start Legacy POSIX TCP Server (only on distinct local_control_port_)
+  if (control_plane_mode_ == ControlPlaneMode::kRawTcp ||
+      control_plane_mode_ == ControlPlaneMode::kDual) {
+    if (local_control_port_ >= 0) {
+      control_fd_ = socket(AF_INET6, SOCK_STREAM, 0);
+      if (control_fd_ < 0) {
+        throw std::runtime_error("control socket() failed: " +
+                                 std::string(std::strerror(errno)));
+      }
+      int opt = 1;
+      setsockopt(control_fd_, SOL_SOCKET,
+                 SO_REUSEADDR,  // NOLINT(misc-include-cleaner)
+                 &opt, sizeof(opt));
+      setsockopt(control_fd_, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+      int ipv6only = 0;
+      if (setsockopt(control_fd_, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6only,
+                     sizeof(ipv6only)) < 0) {
+        LOG(WARNING) << "setsockopt IPV6_V6ONLY=0 failed: "
+                     << std::strerror(errno);
+      }
+
+      sockaddr_in6 addr;
+      std::memset(&addr, 0, sizeof(addr));
+      addr.sin6_family = AF_INET6;
+      addr.sin6_addr = in6addr_any;
+      addr.sin6_port = htons(local_control_port_);
+
+      if (bind(control_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) <
+          0) {
+        std::string err = std::strerror(errno);
+        close(control_fd_);
+        control_fd_ = -1;
+        throw std::runtime_error("control bind(" +
+                                 std::to_string(local_control_port_) +
+                                 ") failed: " + err);
+      }
+      socklen_t len = sizeof(addr);
+      if (getsockname(control_fd_, reinterpret_cast<sockaddr*>(&addr), &len) <
+          0) {
+        close(control_fd_);
+        control_fd_ = -1;
+        throw std::runtime_error("getsockname() failed: " +
+                                 std::string(std::strerror(errno)));
+      }
+      local_control_port_ = ntohs(addr.sin6_port);
+      if (listen(control_fd_, 128) < 0) {
+        close(control_fd_);
+        control_fd_ = -1;
+        throw std::runtime_error("listen() failed: " +
+                                 std::string(std::strerror(errno)));
+      }
+      control_thread_ = std::thread([this]() { ControlServerLoop(); });
+    }
+  }
 }
 
 void KVCacheManagerWithTransfer::StopControlServer() {
@@ -2453,6 +2680,9 @@ void KVCacheManagerWithTransfer::StopControlServer() {
   // will never arrive, so their loops observe stopping_ and the pools can
   // join them.
   cv_.SignalAll();
+  if (grpc_control_server_) {
+    grpc_control_server_->Shutdown();
+  }
   if (control_fd_ >= 0) {
     shutdown(control_fd_, SHUT_RDWR);
     close(control_fd_);
@@ -2656,6 +2886,259 @@ void KVCacheManagerWithTransfer::ProcessPullStream(
     absl::MutexLock lock(pull_workers_mu_);
     --active_pull_workers_;
   }).detach();
+}
+
+std::shared_ptr<grpc::Channel>
+KVCacheManagerWithTransfer::InProcessControlChannel() {
+  if (!grpc_control_server_) return nullptr;
+  return grpc_control_server_->InProcessChannel();
+}
+
+void KVCacheManagerWithTransfer::RegisterInProcessControlChannel(
+    const std::string& endpoint, std::shared_ptr<grpc::Channel> channel) {
+  if (grpc_control_client_) {
+    grpc_control_client_->RegisterInProcessChannel(endpoint,
+                                                   std::move(channel));
+  }
+}
+
+absl::Status KVCacheManagerWithTransfer::HandleGrpcPullStream(
+    grpc::ServerContext* context,
+    const ::tpu_sync::proto::PullStreamRequest& req,
+    ::tpu_sync::proto::PullStreamResponse* response) {
+  if (response == nullptr) {
+    return absl::InvalidArgumentError("Null response pointer");
+  }
+
+  RAIDEN_TRACE_FN("KVTransfer::HandleGrpcPullStream", [&]() {
+    return absl::StrCat("uuid=", req.uuid(),
+                        " blocks=", req.src_block_ids_size());
+  });
+
+  // 1. Validate block lists and data port
+  if (req.src_block_ids_size() == 0 ||
+      req.src_block_ids_size() != req.dst_block_ids_size()) {
+    response->set_success(false);
+    response->set_status(::tpu_sync::proto::STATUS_BLOCK_VALIDATION_FAILED);
+    response->set_error_message(
+        absl::StrCat("Mismatched block IDs: src=", req.src_block_ids_size(),
+                     " dst=", req.dst_block_ids_size()));
+    return absl::OkStatus();
+  }
+  if (req.consumer_data_port() == 0) {
+    response->set_success(false);
+    response->set_status(::tpu_sync::proto::STATUS_BLOCK_VALIDATION_FAILED);
+    response->set_error_message("consumer_data_port must be positive");
+    return absl::OkStatus();
+  }
+
+  std::vector<int64_t> src_block_ids(req.src_block_ids().begin(),
+                                     req.src_block_ids().end());
+  std::vector<int64_t> dst_block_ids(req.dst_block_ids().begin(),
+                                     req.dst_block_ids().end());
+
+  // 2. Clamp grace period by client deadline
+  absl::Duration grace =
+      std::min(kPullRegistrationGrace, absl::Seconds(timeout_s_));
+  if (context != nullptr) {
+    auto deadline = context->deadline();
+    if (deadline != std::chrono::system_clock::time_point::max()) {
+      auto sys_now = std::chrono::system_clock::now();
+      if (deadline > sys_now) {
+        auto remaining_s =
+            std::chrono::duration<double>(deadline - sys_now).count();
+        grace = std::min(grace, absl::Seconds(remaining_s));
+      } else {
+        grace = absl::ZeroDuration();
+      }
+    }
+  }
+
+  std::shared_ptr<SendEntry> entry;
+  {
+    absl::MutexLock lock(mu_);
+    const absl::Time give_up = absl::Now() + grace;
+    while (true) {
+      auto it = send_entries_.find(req.uuid());
+      if (it != send_entries_.end()) {
+        entry = it->second;
+        break;
+      }
+      const absl::Duration left = give_up - absl::Now();
+      if (stopping_.load() || left <= absl::ZeroDuration() ||
+          (context != nullptr && context->IsCancelled())) {
+        break;
+      }
+      cv_.WaitWithTimeout(&mu_, left);
+    }
+  }
+
+  // 3. Early exit if cancelled or shutting down
+  if (stopping_.load()) {
+    response->set_success(false);
+    response->set_status(::tpu_sync::proto::STATUS_SHUTTING_DOWN);
+    response->set_error_message("Producer is shutting down");
+    return absl::OkStatus();
+  }
+
+  if (context != nullptr && context->IsCancelled()) {
+    response->set_success(false);
+    response->set_status(::tpu_sync::proto::STATUS_INTERNAL_ERROR);
+    response->set_error_message("Client cancelled request before registration");
+    return absl::OkStatus();
+  }
+
+  if (!entry) {
+    response->set_success(false);
+    response->set_status(::tpu_sync::proto::STATUS_NOT_REGISTERED);
+    response->set_error_message(
+        absl::StrCat("no read registered for uuid ", req.uuid(), " within ",
+                     absl::FormatDuration(grace),
+                     ": the producer expired it or never registered it"));
+    return absl::OkStatus();
+  }
+
+  try {
+    ValidateRequestedBlocks(*entry, src_block_ids);
+  } catch (const std::exception& e) {
+    response->set_success(false);
+    response->set_status(::tpu_sync::proto::STATUS_BLOCK_VALIDATION_FAILED);
+    response->set_error_message(e.what());
+    return absl::OkStatus();
+  }
+
+  // 4. Populate successful response
+  response->set_success(true);
+  response->set_status(::tpu_sync::proto::STATUS_OK);
+  response->set_num_layers(static_cast<uint32_t>(num_layers() * num_shards()));
+  response->set_data_port(static_cast<uint32_t>(local_data_port_));
+
+  // 5. Resolve peer data endpoints with inproc fallback
+  std::vector<std::string> peer_ips(req.consumer_ips().begin(),
+                                    req.consumer_ips().end());
+  if (peer_ips.empty() && context != nullptr) {
+    std::string peer_uri = context->peer();
+    if (absl::StrContains(peer_uri, "inproc")) {
+      peer_ips.push_back("127.0.0.1");
+    } else {
+      std::string peer_ip = ExtractIpFromGrpcPeer(peer_uri);
+      if (!peer_ip.empty()) {
+        peer_ips.push_back(peer_ip);
+      }
+    }
+  }
+
+  std::vector<std::string> remote_data_endpoints;
+  for (const auto& peer_ip : peer_ips) {
+    if (absl::StrContains(peer_ip, ':')) {
+      remote_data_endpoints.push_back(
+          absl::StrCat("[", peer_ip, "]:", req.consumer_data_port()));
+    } else {
+      remote_data_endpoints.push_back(
+          absl::StrCat(peer_ip, ":", req.consumer_data_port()));
+    }
+  }
+
+  // 6. Check cancellation once more before launching worker thread
+  if (context != nullptr && context->IsCancelled()) {
+    response->set_success(false);
+    response->set_status(::tpu_sync::proto::STATUS_INTERNAL_ERROR);
+    response->set_error_message("Request cancelled by client");
+    return absl::OkStatus();
+  }
+
+  {
+    absl::MutexLock lock(mu_);
+    if (auto it = send_entries_.find(req.uuid()); it != send_entries_.end()) {
+      if (it->second->pull_started) {
+        VLOG(1) << "StartPushInternal already running for UUID: " << req.uuid();
+        return absl::OkStatus();
+      }
+      it->second->pull_started = true;
+    }
+  }
+
+  {
+    absl::MutexLock lock(pull_workers_mu_);
+    ++active_pull_workers_;
+  }
+
+  std::thread([this, uuid = req.uuid(), remote_data_endpoints, src_block_ids,
+               dst_block_ids]() {
+    StartPushInternal(uuid, remote_data_endpoints, src_block_ids,
+                      dst_block_ids);
+    absl::MutexLock lock(pull_workers_mu_);
+    --active_pull_workers_;
+  }).detach();
+
+  return absl::OkStatus();
+}
+
+absl::Status KVCacheManagerWithTransfer::HandleGrpcAck(
+    grpc::ServerContext* context,
+    const ::tpu_sync::proto::TransferAckRequest& req,
+    ::tpu_sync::proto::TransferAckResponse* response) {
+  if (response == nullptr) {
+    return absl::InvalidArgumentError("Null response pointer");
+  }
+
+  std::shared_ptr<SendEntry> entry;
+  {
+    absl::MutexLock lock(mu_);
+    auto it = send_entries_.find(req.uuid());
+    if (it == send_entries_.end()) {
+      pending_acks_.insert(req.uuid());
+      response->set_success(true);
+      response->set_message("ACK_PENDING");
+      return absl::OkStatus();
+    }
+    entry = it->second;
+
+    // Drain remaining in-flight layers before releasing host staging slot
+    const absl::Time deadline = absl::Now() + absl::Seconds(timeout_s_);
+    while (entry->remaining_h2h_layers.load() > 0) {
+      const absl::Duration left = deadline - absl::Now();
+      if (stopping_.load() || left <= absl::ZeroDuration()) {
+        LOG(WARNING) << "HandleGrpcAck: timed out waiting for in-flight layers "
+                     << "to drain for uuid=" << req.uuid();
+        break;
+      }
+      cv_.WaitWithTimeout(&mu_, absl::Milliseconds(20));
+    }
+
+    done_sending_.insert(entry->req_id);
+    ReleaseEntrySlotLocked(entry);
+    send_entries_.erase(it);
+  }
+
+  std::ostringstream timing;
+  timing << "RAIDEN_TIMING event=producer_ack_grpc"
+         << " req_id=" << entry->req_id << " uuid=" << entry->uuid
+         << " node_id=" << node_id_ << " blocks=" << entry->num_blocks
+         << " bytes=" << entry->total_bytes
+         << " success=" << (req.success() ? 1 : 0);
+  EmitTimingLog(timing.str());
+
+  response->set_success(true);
+  response->set_message("SUCCESS");
+  return absl::OkStatus();
+}
+
+absl::Status KVCacheManagerWithTransfer::HandleGrpcCheckLiveness(
+    grpc::ServerContext* context,
+    const ::tpu_sync::proto::TransferLivenessRequest& req,
+    ::tpu_sync::proto::TransferLivenessResponse* response) {
+  if (response == nullptr) {
+    return absl::InvalidArgumentError("Null response pointer");
+  }
+
+  response->set_ready(!stopping_.load() && !shutting_down_.load());
+  {
+    absl::MutexLock lock(pull_workers_mu_);
+    response->set_active_workers(active_pull_workers_);
+  }
+  response->set_version("1.0.0");
+  return absl::OkStatus();
 }
 
 bool KVCacheManagerWithTransfer::AcquireSendStagingWithRetry(
@@ -2941,7 +3424,50 @@ std::string KVCacheManagerWithTransfer::EndpointWithPort(
 
 void KVCacheManagerWithTransfer::AckRemote(const std::string& remote_endpoint,
                                            uint64_t uuid) {
-  int control_fd = ConnectTcp(remote_endpoint, timeout_s_);
+  bool use_grpc = (control_plane_mode_ == ControlPlaneMode::kGrpc);
+  std::string target_endpoint = remote_endpoint;
+
+  if (absl::StartsWith(remote_endpoint, "grpc://")) {
+    use_grpc = true;
+    target_endpoint =
+        std::string(absl::StripPrefix(remote_endpoint, "grpc://"));
+  } else if (absl::StartsWith(remote_endpoint, "inproc://")) {
+    use_grpc = true;
+  } else if (absl::StartsWith(remote_endpoint, "tcp://")) {
+    use_grpc = false;
+    target_endpoint = std::string(absl::StripPrefix(remote_endpoint, "tcp://"));
+  } else if (control_plane_mode_ == ControlPlaneMode::kDual) {
+    try {
+      auto [host, port] = SplitEndpoint(target_endpoint);
+      if (local_grpc_control_port_ > 0 && port == local_grpc_control_port_) {
+        use_grpc = true;
+      } else if (local_control_port_ > 0 && port == local_control_port_) {
+        use_grpc = false;
+      } else if (local_control_port_ < 0 && local_grpc_control_port_ >= 0) {
+        use_grpc = true;
+      } else {
+        use_grpc = false;
+      }
+    } catch (...) {
+      use_grpc = (local_control_port_ < 0);
+    }
+  }
+
+  if (use_grpc) {
+    ::tpu_sync::proto::TransferAckRequest ack_req;
+    ack_req.set_uuid(uuid);
+    ack_req.set_success(true);
+    auto ack_response = grpc_control_client_->Ack(target_endpoint, ack_req,
+                                                  absl::Seconds(timeout_s_));
+    if (!ack_response.ok()) {
+      LOG(WARNING) << "gRPC Ack failed for uuid=" << uuid << " to "
+                   << target_endpoint << ": "
+                   << ack_response.status().message();
+    }
+    return;
+  }
+
+  int control_fd = ConnectTcp(target_endpoint, timeout_s_);
   auto control_cleanup =
       std::unique_ptr<int, void (*)(int*)>(&control_fd, [](int* p) {
         if (p && *p >= 0) close(*p);

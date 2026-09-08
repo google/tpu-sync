@@ -39,12 +39,17 @@
 #include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "grpcpp/client_context.h"
+#include "grpcpp/support/status.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/proto/transfer_control.grpc.pb.h"
+#include "tpu_sync/proto/transfer_control.pb.h"
 
 namespace tpu_raiden {
 namespace {
 
 using ::testing::Contains;
+using ::testing::Eq;
 using ::testing::HasSubstr;
 
 // Both ends of a control handshake share one pool of four workers, so four
@@ -54,13 +59,17 @@ constexpr double kTimeoutS = 0.5;
 
 class TestManager : public KVCacheManagerWithTransfer {
  public:
-  TestManager()
+  explicit TestManager(int control_port = 0, int grpc_control_port = 0,
+                       ControlPlaneMode mode = ControlPlaneMode::kDual)
       : KVCacheManagerWithTransfer(
             /*num_layers=*/0, /*num_shards=*/1, /*slice_byte_size=*/128,
             /*local_port=*/std::nullopt,
             /*host_blocks_to_allocate=*/std::nullopt,
             /*parallelism=*/1, /*node_id=*/0,
-            /*local_control_port=*/0, /*max_blocks=*/1,
+            /*local_control_port=*/control_port,
+            /*local_grpc_control_port=*/grpc_control_port,
+            /*control_plane_mode=*/mode,
+            /*max_blocks=*/1,
             /*num_slots=*/2 * kPoolSize, kTimeoutS) {}
 
   using KVCacheManagerWithTransfer::ControlRequestHeader;
@@ -279,6 +288,84 @@ TEST(ControlHandshakeTest, ConsumerGivesUpOnProducerThatNeverAnswers) {
   for (int i = 0; i < reads; ++i) {
     EXPECT_THAT(settled, Contains(absl::StrCat("req", i)));
   }
+}
+
+TEST(ControlHandshakeGrpcTest, InProcessPullStreamSuccess) {
+  TestManager producer(/*control_port=*/-1, /*grpc_control_port=*/-1,
+                       KVCacheManagerWithTransfer::ControlPlaneMode::kGrpc);
+  auto channel = producer.InProcessControlChannel();
+  ASSERT_NE(channel, nullptr);
+  auto stub = ::tpu_sync::proto::TransferControlService::NewStub(channel);
+
+  producer.NotifyForRead("req_test", 101, /*block_ids=*/{0});
+
+  ::tpu_sync::proto::PullStreamRequest request;
+  request.set_uuid(101);
+  request.set_req_id("req_test");
+  request.set_consumer_data_port(54321);
+  request.add_src_block_ids(0);
+  request.add_dst_block_ids(0);
+
+  grpc::ClientContext context;
+  context.set_deadline(std::chrono::system_clock::now() +
+                       std::chrono::seconds(2));
+  ::tpu_sync::proto::PullStreamResponse response;
+  grpc::Status status = stub->PullStream(&context, request, &response);
+
+  EXPECT_TRUE(status.ok());
+  EXPECT_THAT(response.status(), Eq(::tpu_sync::proto::STATUS_OK));
+}
+
+TEST(ControlHandshakeGrpcTest, PullWithoutRegistrationReturnsNotRegistered) {
+  TestManager producer(/*control_port=*/-1, /*grpc_control_port=*/-1,
+                       KVCacheManagerWithTransfer::ControlPlaneMode::kGrpc);
+  auto channel = producer.InProcessControlChannel();
+  ASSERT_NE(channel, nullptr);
+  auto stub = ::tpu_sync::proto::TransferControlService::NewStub(channel);
+
+  ::tpu_sync::proto::PullStreamRequest request;
+  request.set_uuid(404);
+  request.set_req_id("req_unregistered");
+  request.set_consumer_data_port(54321);
+  request.add_src_block_ids(0);
+  request.add_dst_block_ids(0);
+
+  grpc::ClientContext context;
+  context.set_deadline(std::chrono::system_clock::now() +
+                       std::chrono::milliseconds(200));
+  ::tpu_sync::proto::PullStreamResponse response;
+  grpc::Status status = stub->PullStream(&context, request, &response);
+
+  EXPECT_TRUE(status.ok());
+  EXPECT_THAT(response.status(), Eq(::tpu_sync::proto::STATUS_NOT_REGISTERED));
+}
+
+TEST(ControlHandshakeGrpcTest, CheckLivenessAndAck) {
+  TestManager producer(/*control_port=*/-1, /*grpc_control_port=*/-1,
+                       KVCacheManagerWithTransfer::ControlPlaneMode::kGrpc);
+  auto channel = producer.InProcessControlChannel();
+  ASSERT_NE(channel, nullptr);
+  auto stub = ::tpu_sync::proto::TransferControlService::NewStub(channel);
+
+  // CheckLiveness
+  ::tpu_sync::proto::TransferLivenessRequest liveness_req;
+  ::tpu_sync::proto::TransferLivenessResponse liveness_resp;
+  grpc::ClientContext liveness_ctx;
+  grpc::Status liveness_status =
+      stub->CheckLiveness(&liveness_ctx, liveness_req, &liveness_resp);
+  EXPECT_TRUE(liveness_status.ok());
+  EXPECT_TRUE(liveness_resp.ready());
+  EXPECT_EQ(liveness_resp.version(), "1.0.0");
+
+  // Ack
+  ::tpu_sync::proto::TransferAckRequest ack_req;
+  ack_req.set_uuid(999);
+  ack_req.set_success(true);
+  ::tpu_sync::proto::TransferAckResponse ack_resp;
+  grpc::ClientContext ack_ctx;
+  grpc::Status ack_status = stub->Ack(&ack_ctx, ack_req, &ack_resp);
+  EXPECT_TRUE(ack_status.ok());
+  EXPECT_TRUE(ack_resp.success());
 }
 
 }  // namespace

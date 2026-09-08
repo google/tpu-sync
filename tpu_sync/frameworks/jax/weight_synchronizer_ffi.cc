@@ -78,9 +78,12 @@ void ClearSharedWsMap() {
 static WeightSynchronizerBase* GetSharedWs(
     int32_t shard_idx, int32_t listener_port, int32_t num_layers,
     int32_t parallelism, const std::vector<size_t>& slice_byte_sizes,
-    int32_t local_port, int32_t num_shards) {
+    int32_t local_port, int32_t num_shards, int32_t local_slot = -1,
+    int32_t submanager_idx = -1) {
   absl::MutexLock lock(ws_mu);
-  int32_t submanager_idx = (num_shards > 0) ? (shard_idx / num_shards) : 0;
+  if (submanager_idx < 0) {
+    submanager_idx = (num_shards > 0) ? (shard_idx / num_shards) : 0;
+  }
   int32_t key = (listener_port > 0)
                     ? (listener_port + submanager_idx)
                     : (listener_port == 0 ? -(submanager_idx + 1)
@@ -117,8 +120,15 @@ static WeightSynchronizerBase* GetSharedWs(
         opt_listener_port, sub_bind_ip);
   }
   auto& slot_map = (*ws_shard_to_slot_map)[ws];
-  size_t assigned_slot =
-      (num_shards > 0) ? (static_cast<size_t>(shard_idx) % num_shards) : 0;
+  size_t assigned_slot;
+  if (local_slot >= 0 && ws->num_shards() > 0 &&
+      static_cast<size_t>(local_slot) < ws->num_shards()) {
+    assigned_slot = static_cast<size_t>(local_slot);
+  } else {
+    assigned_slot = (ws->num_shards() > 0)
+                        ? (slot_map.size() % ws->num_shards())
+                        : slot_map.size();
+  }
   auto [it, inserted] = slot_map.try_emplace(shard_idx, assigned_slot);
   if (inserted) {
     std::vector<int64_t> indices(ws->num_shards(), -1);
@@ -168,8 +178,13 @@ xla::ffi::Error TriggerWeightSynchronizerInitImpl(
     return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
                            "shard_idx_buf null.");
   }
-  int32_t shard_idx =
-      *reinterpret_cast<const int32_t*>(shard_idx_buf.untyped_data());
+  const int32_t* shard_ptr =
+      reinterpret_cast<const int32_t*>(shard_idx_buf.untyped_data());
+  int32_t shard_idx = shard_ptr[0];
+  int32_t local_slot = (shard_idx_buf.element_count() >= 2) ? shard_ptr[1] : -1;
+  int32_t submanager_idx =
+      (shard_idx_buf.element_count() >= 3) ? shard_ptr[2] : -1;
+
   if (shard_idx < 0 || static_cast<size_t>(shard_idx) >= kMaxShards) {
     return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
                            absl::StrCat("shard_idx out of bounds [0, ",
@@ -191,11 +206,12 @@ xla::ffi::Error TriggerWeightSynchronizerInitImpl(
   if (g_weight_synchronizers[shard_idx] == nullptr) {
     VLOG(1)
         << "[TPU Worker FFI] >>> WS LAZY INITIALIZATION TRIGGERED <<< Shard: "
-        << shard_idx;
+        << shard_idx << ", Local Slot: " << local_slot
+        << ", Submanager: " << submanager_idx;
 
-    g_weight_synchronizers[shard_idx] =
-        GetSharedWs(shard_idx, listener_port, num_layers, parallelism,
-                    slice_byte_sizes, local_port, num_shards);
+    g_weight_synchronizers[shard_idx] = GetSharedWs(
+        shard_idx, listener_port, num_layers, parallelism, slice_byte_sizes,
+        local_port, num_shards, local_slot, submanager_idx);
 
     // Allocate the StreamExecutor Stream once per shard, and cache E2E!
     int64_t dev_id = static_cast<int64_t>(shard_idx);
@@ -278,8 +294,14 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
     return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
                            "shard_idx_buf has null untyped data.");
   }
-  int32_t shard_idx =
-      *reinterpret_cast<const int32_t*>(shard_idx_buf.untyped_data());
+  const int32_t* shard_ptr =
+      reinterpret_cast<const int32_t*>(shard_idx_buf.untyped_data());
+  int32_t shard_idx = shard_ptr[0];
+  int32_t local_slot_in =
+      (shard_idx_buf.element_count() >= 2) ? shard_ptr[1] : -1;
+  int32_t submanager_idx =
+      (shard_idx_buf.element_count() >= 3) ? shard_ptr[2] : -1;
+
   if (shard_idx < 0 || static_cast<size_t>(shard_idx) >= kMaxShards) {
     return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
                            absl::StrCat("shard_idx out of bounds [0, ",
@@ -301,11 +323,12 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
   if (g_weight_synchronizers[shard_idx] == nullptr) {
     VLOG(1)
         << "[TPU Worker FFI] >>> WS LAZY INITIALIZATION TRIGGERED <<< Shard: "
-        << shard_idx;
+        << shard_idx << ", Local Slot: " << local_slot_in
+        << ", Submanager: " << submanager_idx;
 
-    g_weight_synchronizers[shard_idx] =
-        GetSharedWs(shard_idx, listener_port, num_layers, parallelism,
-                    slice_byte_sizes, local_port, num_shards);
+    g_weight_synchronizers[shard_idx] = GetSharedWs(
+        shard_idx, listener_port, num_layers, parallelism, slice_byte_sizes,
+        local_port, num_shards, local_slot_in, submanager_idx);
 
     int64_t dev_id = static_cast<int64_t>(shard_idx);
     auto platform_or =
@@ -556,7 +579,7 @@ xla::ffi::Error TriggerD2HImpl(xla::ffi::AnyBuffer anchor,
   }
   int32_t shard_idx =
       *reinterpret_cast<const int32_t*>(shard_idx_buf.untyped_data());
-  if (shard_idx < 0 || shard_idx >= 32 ||
+  if (shard_idx < 0 || static_cast<size_t>(shard_idx) >= kMaxShards ||
       g_weight_synchronizers[shard_idx] == nullptr) {
     return xla::ffi::Error(xla::ffi::ErrorCode::kInternal,
                            "WS not initialized.");

@@ -15,6 +15,7 @@
 """Tests for Raiden Controller high-level transfer API under rpc/."""
 
 import asyncio
+import math
 import socket
 from unittest import mock
 from absl.testing import absltest
@@ -1610,6 +1611,32 @@ class GetGlobalIndicesTest(absltest.TestCase):
     )
     self.assertEqual(indices1, [(i, i + 8) for i in range(8)])
 
+  def test_multi_host_2d_mesh_square_mesh_single_axis_partitioned(self):
+    """Tests 4x4 physical mesh across 4 hosts (4 devices/host)."""
+    unit0 = raiden_controller.RaidenId("trainer", "0", "weights")
+    unit1 = raiden_controller.RaidenId("trainer", "1", "weights")
+    unit2 = raiden_controller.RaidenId("trainer", "2", "weights")
+    unit3 = raiden_controller.RaidenId("trainer", "3", "weights")
+    shards = ["10.0.0.1:8000"] * 4
+    expected_indices = {
+        unit0: [(0, 0), (1, 1), (2, 4), (3, 5)],
+        unit1: [(0, 2), (1, 3), (2, 6), (3, 7)],
+        unit2: [(0, 8), (1, 9), (2, 12), (3, 13)],
+        unit3: [(0, 10), (1, 11), (2, 14), (3, 15)],
+    }
+    for unit in [unit0, unit1, unit2, unit3]:
+      indices = raiden_controller._get_global_indices(
+          unit,
+          shards,
+          logical_mesh_shape=[4, 4],
+          layout=[1, 0],
+          num_physical_hosts=4,
+          sharding_spec=["fsdp", "tp"],
+          mesh_axes=["fsdp", "tp"],
+          physical_mesh_shape=[4, 4],
+      )
+      self.assertEqual(indices, expected_indices[unit])
+
   def test_multi_host_2d_mesh_with_spec_tp_fsdp(self):
     unit0 = raiden_controller.RaidenId("trainer", "0", "weights")
     unit1 = raiden_controller.RaidenId("trainer", "1", "weights")
@@ -2969,6 +2996,64 @@ class GetGlobalIndicesTest(absltest.TestCase):
         total_scheduled_src_shards += 1
     self.assertEqual(total_scheduled_src_shards, 64)
 
+  def test_compute_host_subgrid(self):
+    test_cases = [
+        # (physical_mesh_shape, devices_per_host, expected_subgrid, expected_grid)
+        # 1D meshes
+        ([16], 4, [4], [4]),
+        ([16], 8, [8], [2]),
+        ([8], 2, [2], [4]),
+        # 2D meshes (row-major minor-to-major factoring)
+        ([4, 4], 2, [1, 2], [4, 2]),
+        ([4, 4], 4, [2, 2], [2, 2]),
+        ([4, 4], 8, [2, 4], [2, 1]),
+        ([4, 4], 16, [4, 4], [1, 1]),
+        ([4, 8], 4, [1, 4], [4, 2]),
+        ([4, 8], 8, [2, 4], [2, 2]),
+        ([4, 8], 16, [2, 8], [2, 1]),
+        ([8, 4], 8, [2, 4], [4, 1]),
+        ([8, 8], 8, [2, 4], [4, 2]),
+        ([2, 8], 4, [1, 4], [2, 2]),
+        ([2, 8], 8, [1, 8], [2, 1]),
+        ([8, 2], 4, [2, 2], [4, 1]),
+        ([8, 2], 8, [4, 2], [2, 1]),
+        ([16, 4], 2, [1, 2], [16, 2]),
+        ([2, 4], 8, [2, 4], [1, 1]),
+        ([16, 1], 4, [4, 1], [4, 1]),
+        # 3D meshes
+        ([2, 2, 2], 2, [1, 1, 2], [2, 2, 1]),
+        ([2, 2, 2], 4, [1, 2, 2], [2, 1, 1]),
+        ([2, 4, 4], 4, [1, 2, 2], [2, 2, 2]),
+        ([4, 4, 4], 4, [1, 2, 2], [4, 2, 2]),
+        ([4, 4, 4], 8, [2, 2, 2], [2, 2, 2]),
+        ([4, 4, 4], 16, [2, 2, 4], [2, 2, 1]),
+        ([2, 4, 8], 8, [1, 2, 4], [2, 2, 2]),
+        ([2, 4, 8], 16, [1, 2, 8], [2, 2, 1]),
+        # 4D meshes
+        ([2, 2, 4, 4], 4, [1, 1, 2, 2], [2, 2, 2, 2]),
+        ([2, 2, 4, 4], 8, [1, 1, 2, 4], [2, 2, 2, 1]),
+        ([2, 2, 4, 4], 16, [1, 1, 4, 4], [2, 2, 1, 1]),
+        ([4, 4, 4, 4], 4, [1, 1, 2, 2], [4, 4, 2, 2]),
+        ([4, 4, 4, 4], 8, [1, 2, 2, 2], [4, 2, 2, 2]),
+        ([4, 4, 4, 4], 16, [2, 2, 2, 2], [2, 2, 2, 2]),
+        ([2, 2, 2, 4], 4, [1, 1, 1, 4], [2, 2, 2, 1]),
+        ([2, 4, 4, 8], 8, [1, 2, 2, 2], [2, 2, 2, 4]),
+        ([2, 4, 4, 8], 16, [1, 2, 2, 4], [2, 2, 2, 2]),
+        # Edge cases
+        ([], 4, [], []),
+        ([4, 4], 0, [], []),
+        ([4, 4], -1, [], []),
+        ([2, 2], 8, [2, 2], [1, 1]),
+    ]
+    for mesh, k, expected_subgrid, expected_grid in test_cases:
+      with self.subTest(mesh=mesh, k=k):
+        subgrid, grid = raiden_controller.compute_host_subgrid(mesh, k)
+        self.assertEqual(subgrid, expected_subgrid)
+        self.assertEqual(grid, expected_grid)
+        if subgrid:
+          self.assertEqual(math.prod(subgrid), min(k, math.prod(mesh)))
+          self.assertEqual([s * g for s, g in zip(subgrid, grid)], mesh)
+
 
 class FormatUnitHelpersTest(absltest.TestCase):
 
@@ -3039,6 +3124,109 @@ class FormatUnitHelpersTest(absltest.TestCase):
     # Single string / bytes (must not be iterated as chars)
     self.assertEqual(raiden_controller._format_units("unit_str"), "unit_str")
     self.assertEqual(raiden_controller._format_units(b"unit_bytes"), "b'unit_bytes'")
+
+  def test_heterogeneous_host_mesh_weight_transfer(self):
+    client = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=10000, worker_rpc_client=client
+    )
+    vars_metadata = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="w_in",
+            shape=[8, 8],
+            mesh_shape=[4, 4],
+            layout=[1, 0],
+            item_size=4,
+            layer_idx=0,
+            sharding_spec=["fsdp", "tp"],
+        ),
+        raiden_service_pb2.VariableMetadataProto(
+            name="w_out",
+            shape=[8, 8],
+            mesh_shape=[4, 4],
+            layout=[1, 0],
+            item_size=4,
+            layer_idx=1,
+            sharding_spec=["tp", "fsdp"],
+        ),
+        raiden_service_pb2.VariableMetadataProto(
+            name="norm",
+            shape=[8],
+            mesh_shape=[4],
+            layout=[0],
+            item_size=4,
+            layer_idx=2,
+            sharding_spec=["fsdp"],
+        ),
+    ]
+
+    src_units = []
+    for i in range(4):
+      u = raiden_controller.RaidenId("src_job", str(i), "weights", 0)
+      src_units.append(u)
+      controller.register_work_unit(
+          u,
+          [f"10.0.0.{i+1}:{8000+j}" for j in range(4)],
+          control_plane_rpc_address=f"10.0.0.{i+1}:9000",
+          mesh_shape=[4, 4],
+          variables=vars_metadata,
+          mesh_axes=["fsdp", "tp"],
+      )
+
+    dst_units = []
+    for i in range(2):
+      u = raiden_controller.RaidenId("dst_job", str(i), "weights", 0)
+      dst_units.append(u)
+      controller.register_work_unit(
+          u,
+          [f"10.0.1.{i+1}:{8000+j}" for j in range(8)],
+          control_plane_rpc_address=f"10.0.1.{i+1}:9000",
+          mesh_shape=[4, 4],
+          variables=vars_metadata,
+          mesh_axes=["fsdp", "tp"],
+      )
+
+    loop = asyncio.new_event_loop()
+    try:
+      future = controller.start_transfer(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+          use_block_chunks=True,
+          uuid=123456,
+          req_id="hetero_mesh_test",
+          expected_block_count=0,
+          group_size=1,
+      )
+      loop.run_until_complete(future.wait())
+    finally:
+      loop.close()
+
+    # Verify calls received by worker RPC client
+    self.assertEqual(len(client.calls), 6)  # 2 dst + 4 src
+    dst_calls = [c for c in client.calls if c[0] in dst_units]
+    src_calls = [c for c in client.calls if c[0] in src_units]
+    self.assertEqual(len(dst_calls), 2)
+    self.assertEqual(len(src_calls), 4)
+
+    # Check start_transfer_request proto formatting for both src and dst
+    for unit, plan in client.calls:
+      req_bytes = controller.worker_rpc_client._encode_start_transfer(
+          unit, plan
+      )
+      req = raiden_service_pb2.ControlRequest()
+      req.ParseFromString(req_bytes)
+      start_req = req.start_transfer_request
+      print(f"\n--- Call for {unit} ---")
+      print(f"expected_block_count={start_req.expected_block_count}")
+      print(f"num_shard_push_schedules={len(start_req.shard_push_schedules)}")
+      for shard_idx, sched in start_req.shard_push_schedules.items():
+        print(f"  shard {shard_idx}: {len(sched.entries)} entries")
+        for e in sched.entries[:2]:
+          print(
+              f"    dst_peer={e.dst_peer} dst_shard={e.dst_shard_idx}"
+              f" layer={e.layer_idx} size={e.size_bytes}"
+          )
 
 
 if __name__ == "__main__":

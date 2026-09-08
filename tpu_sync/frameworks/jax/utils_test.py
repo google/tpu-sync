@@ -39,17 +39,52 @@ class UtilsTest(absltest.TestCase):
         np.array(self.devices[:4]).reshape(2, 2), ("x", "y")
     )
 
-  def test_get_host_subgrid_3d(self):
-    # 4-chip host on 4x4x4 physical TPU torus mesh -> [1, 2, 2]
-    self.assertEqual(utils._get_host_subgrid([4, 4, 4], 4), [1, 2, 2])
-    # 4-chip host on 2x4x4 physical TPU torus mesh -> [1, 2, 2]
-    self.assertEqual(utils._get_host_subgrid([2, 4, 4], 4), [1, 2, 2])
-    # 8-chip host on 4x4x4 physical TPU torus mesh -> [1, 2, 4]
-    self.assertEqual(utils._get_host_subgrid([4, 4, 4], 8), [1, 2, 4])
-    # 4-chip host on 2D mesh [4, 8] -> [1, 4]
-    self.assertEqual(utils._get_host_subgrid([4, 8], 4), [1, 4])
-    # 4-chip host on 1D mesh [16] -> [4]
-    self.assertEqual(utils._get_host_subgrid([16], 4), [4])
+  def test_compute_host_subgrid(self):
+    # 1D meshes
+    self.assertEqual(utils.compute_host_subgrid([16], 4)[0], [4])
+    self.assertEqual(utils.compute_host_subgrid([16], 8)[0], [8])
+    self.assertEqual(utils.compute_host_subgrid([8], 2)[0], [2])
+
+    # 2D meshes
+    self.assertEqual(utils.compute_host_subgrid([4, 4], 4)[0], [2, 2])
+    self.assertEqual(utils.compute_host_subgrid([4, 8], 4)[0], [1, 4])
+    self.assertEqual(utils.compute_host_subgrid([2, 8], 4)[0], [1, 4])
+    self.assertEqual(utils.compute_host_subgrid([2, 8], 8)[0], [1, 8])
+    self.assertEqual(utils.compute_host_subgrid([8, 8], 2)[0], [1, 2])
+    self.assertEqual(utils.compute_host_subgrid([16, 4], 2)[0], [1, 2])
+    self.assertEqual(utils.compute_host_subgrid([8, 2], 4)[0], [2, 2])
+    self.assertEqual(utils.compute_host_subgrid([2, 4], 8)[0], [2, 4])
+
+    # 3D meshes
+    self.assertEqual(utils.compute_host_subgrid([4, 4, 4], 4)[0], [1, 2, 2])
+    self.assertEqual(utils.compute_host_subgrid([2, 4, 4], 4)[0], [1, 2, 2])
+    self.assertEqual(utils.compute_host_subgrid([2, 4, 8], 8)[0], [1, 2, 4])
+    self.assertEqual(utils.compute_host_subgrid([4, 4, 4], 8)[0], [2, 2, 2])
+
+    # 4D meshes
+    self.assertEqual(
+        utils.compute_host_subgrid([2, 2, 4, 4], 4)[0], [1, 1, 2, 2]
+    )
+    self.assertEqual(
+        utils.compute_host_subgrid([2, 2, 4, 4], 8)[0], [1, 1, 2, 4]
+    )
+    self.assertEqual(
+        utils.compute_host_subgrid([2, 2, 2, 4], 4)[0], [1, 1, 1, 4]
+    )
+    self.assertEqual(
+        utils.compute_host_subgrid([4, 4, 4, 4], 4)[0], [1, 1, 2, 2]
+    )
+    self.assertEqual(
+        utils.compute_host_subgrid([4, 4, 4, 4], 8)[0], [1, 2, 2, 2]
+    )
+
+    subgrid, grid = utils.compute_host_subgrid([4, 4], 4)
+    self.assertEqual(subgrid, [2, 2])
+    self.assertEqual(grid, [2, 2])
+
+    subgrid, grid = utils.compute_host_subgrid([2, 4, 4], 4)
+    self.assertEqual(subgrid, [1, 2, 2])
+    self.assertEqual(grid, [2, 2, 2])
 
   def test_get_shard_sorting_permutation_aligned_2d(self):
     sharding = jax.sharding.NamedSharding(
@@ -153,6 +188,59 @@ class UtilsTest(absltest.TestCase):
     ), mock.patch.object(jax, "process_count", return_value=16):
       perm_reordered = utils.get_shard_sorting_permutation(mock_arr0)
       self.assertEqual(perm_reordered, [1, 0, 3, 2])
+
+  def test_get_shard_sorting_permutation_4x4_mesh_4_hosts(self):
+    mock_devices = np.empty((4, 4), dtype=object)
+    for i in range(4):
+      for j in range(4):
+        mock_devices[i, j] = mock.MagicMock(spec=jax.Device)
+
+    mesh_2d = jax.sharding.Mesh(mock_devices, ("fsdp", "tp"))
+    sharding = jax.sharding.NamedSharding(
+        mesh_2d, jax.sharding.PartitionSpec("fsdp", "tp")
+    )
+
+    host_subgrid_devices = {
+        0: [
+            mock_devices[0, 0],
+            mock_devices[0, 1],
+            mock_devices[1, 0],
+            mock_devices[1, 1],
+        ],
+        1: [
+            mock_devices[0, 2],
+            mock_devices[0, 3],
+            mock_devices[1, 2],
+            mock_devices[1, 3],
+        ],
+        2: [
+            mock_devices[2, 0],
+            mock_devices[2, 1],
+            mock_devices[3, 0],
+            mock_devices[3, 1],
+        ],
+        3: [
+            mock_devices[2, 2],
+            mock_devices[2, 3],
+            mock_devices[3, 2],
+            mock_devices[3, 3],
+        ],
+    }
+
+    for host_idx in range(4):
+      host_devices = host_subgrid_devices[host_idx]
+      host_shards = [mock.MagicMock(device=d) for d in host_devices]
+
+      mock_arr = mock.MagicMock()
+      mock_arr.shape = (8, 8)
+      mock_arr.sharding = sharding
+      mock_arr.addressable_shards = host_shards
+
+      with mock.patch.object(
+          jax, "process_index", return_value=host_idx
+      ), mock.patch.object(jax, "process_count", return_value=4):
+        perm = utils.get_shard_sorting_permutation(mock_arr)
+        self.assertEqual(perm, [])
 
 
 if __name__ == "__main__":

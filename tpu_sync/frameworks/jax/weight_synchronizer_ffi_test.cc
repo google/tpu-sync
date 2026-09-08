@@ -574,6 +574,161 @@ TEST_F(WeightSynchronizerFfiTest,
   }
 }
 
+TEST_F(WeightSynchronizerFfiTest, NonContiguousShardsInitAndD2hTest) {
+  constexpr int kNumLayers = 3;
+  constexpr int kSliceElements = 256;
+  constexpr int kShardsPerHost = 4;
+  constexpr int32_t kListenerPort = 61000;
+
+  // 2 hosts with non-contiguous 2D subgrid shards:
+  // Host 0: global shards [0, 1, 4, 5], local slots [0, 1, 2, 3]
+  // Host 1: global shards [2, 3, 6, 7], local slots [0, 1, 2, 3]
+  struct ShardAssignment {
+    int32_t global_shard;
+    int32_t local_slot;
+    int32_t host_idx;
+  };
+  std::vector<ShardAssignment> assignments = {
+      {0, 0, 0}, {1, 1, 0}, {4, 2, 0}, {5, 3, 0},
+      {2, 0, 1}, {3, 1, 1}, {6, 2, 1}, {7, 3, 1},
+  };
+
+  std::vector<int32_t> slice_byte_sizes(kNumLayers,
+                                        kSliceElements * sizeof(int32_t));
+  FfiBufferFixture slice_sizes_fixture(XLA_FFI_DataType_S32,
+                                       slice_byte_sizes.data(), {kNumLayers});
+  xla::ffi::AnyBuffer slice_byte_sizes_buf = slice_sizes_fixture.AsAnyBuffer();
+
+  // Distinct test data per shard and per layer
+  absl::flat_hash_map<int32_t, std::vector<std::vector<int32_t>>>
+      shard_layer_data;
+  for (const auto& a : assignments) {
+    auto& layers = shard_layer_data[a.global_shard];
+    layers.resize(kNumLayers);
+    for (int l = 0; l < kNumLayers; ++l) {
+      layers[l].resize(kSliceElements);
+      for (int i = 0; i < kSliceElements; ++i) {
+        layers[l][i] = (a.global_shard + 1) * 100000 + (l + 1) * 1000 + i;
+      }
+    }
+  }
+
+  for (const auto& a : assignments) {
+    int32_t shard_info[3] = {a.global_shard, a.local_slot, a.host_idx};
+    FfiBufferFixture shard_fixture(XLA_FFI_DataType_S32, shard_info, {3});
+    xla::ffi::AnyBuffer shard_buf = shard_fixture.AsAnyBuffer();
+
+    std::vector<FfiBufferFixture> anchor_fixtures;
+    std::vector<xla::ffi::AnyBuffer> jax_arrays;
+    anchor_fixtures.reserve(kNumLayers);
+    jax_arrays.reserve(kNumLayers);
+    for (int l = 0; l < kNumLayers; ++l) {
+      anchor_fixtures.emplace_back(XLA_FFI_DataType_S32,
+                                   shard_layer_data[a.global_shard][l].data(),
+                                   std::vector<int64_t>{kSliceElements});
+      jax_arrays.push_back(anchor_fixtures.back().AsAnyBuffer());
+    }
+
+    std::vector<int32_t> out_data(6, 0);
+    FfiBufferFixture out_fixture(XLA_FFI_DataType_S32, out_data.data(), {6});
+    xla::ffi::Result<xla::ffi::AnyBuffer> out = out_fixture.AsAnyBuffer();
+
+    xla::ffi::Error err = TriggerWeightSynchronizerInitAndD2hHelper(
+        shard_buf, slice_byte_sizes_buf, jax_arrays,
+        /*local_port=*/0, /*parallelism=*/1, kNumLayers, kListenerPort,
+        kShardsPerHost, out);
+    ASSERT_TRUE(err.success()) << "InitAndD2h failed for shard "
+                               << a.global_shard << ": " << err.message();
+  }
+
+  // Host 0: shards 0, 1, 4, 5
+  WeightSynchronizerBase* ws_0 = g_weight_synchronizers[0];
+  ASSERT_NE(ws_0, nullptr);
+  EXPECT_EQ(g_weight_synchronizers[1], ws_0);
+  EXPECT_EQ(g_weight_synchronizers[4], ws_0);
+  EXPECT_EQ(g_weight_synchronizers[5], ws_0);
+
+  // Host 1: shards 2, 3, 6, 7
+  WeightSynchronizerBase* ws_1 = g_weight_synchronizers[2];
+  ASSERT_NE(ws_1, nullptr);
+  EXPECT_EQ(g_weight_synchronizers[3], ws_1);
+  EXPECT_EQ(g_weight_synchronizers[6], ws_1);
+  EXPECT_EQ(g_weight_synchronizers[7], ws_1);
+
+  EXPECT_NE(ws_0, ws_1);
+
+  // Verify global shard indices for host 0 and host 1
+  EXPECT_EQ(ws_0->global_shard_index(0), 0);
+  EXPECT_EQ(ws_0->global_shard_index(1), 1);
+  EXPECT_EQ(ws_0->global_shard_index(2), 4);
+  EXPECT_EQ(ws_0->global_shard_index(3), 5);
+
+  EXPECT_EQ(ws_1->global_shard_index(0), 2);
+  EXPECT_EQ(ws_1->global_shard_index(1), 3);
+  EXPECT_EQ(ws_1->global_shard_index(2), 6);
+  EXPECT_EQ(ws_1->global_shard_index(3), 7);
+
+  // Verify host buffer data in ws_0 and ws_1
+  for (const auto& a : assignments) {
+    WeightSynchronizerBase* ws = (a.host_idx == 0) ? ws_0 : ws_1;
+    for (int l = 0; l < kNumLayers; ++l) {
+      const uint8_t* host_ptr = ws->GetHostBufferPtr(l, a.local_slot);
+      ASSERT_NE(host_ptr, nullptr);
+      const int32_t* host_data = reinterpret_cast<const int32_t*>(host_ptr);
+      for (int i = 0; i < kSliceElements; ++i) {
+        EXPECT_EQ(host_data[i], shard_layer_data[a.global_shard][l][i])
+            << "Mismatch at shard " << a.global_shard << " (slot "
+            << a.local_slot << "), layer " << l << ", index " << i;
+      }
+    }
+  }
+
+  // Verify H2D roundtrip for all shards
+  for (const auto& a : assignments) {
+    int32_t shard_info[3] = {a.global_shard, a.local_slot, a.host_idx};
+    FfiBufferFixture shard_fixture(XLA_FFI_DataType_S32, shard_info, {3});
+    xla::ffi::AnyBuffer shard_buf = shard_fixture.AsAnyBuffer();
+
+    std::vector<std::vector<int32_t>> dst_data(
+        kNumLayers, std::vector<int32_t>(kSliceElements, 0));
+    std::vector<FfiBufferFixture> dst_fixtures;
+    dst_fixtures.reserve(kNumLayers);
+    std::vector<XLA_FFI_Buffer> ffi_bufs;
+    ffi_bufs.reserve(kNumLayers);
+    for (int l = 0; l < kNumLayers; ++l) {
+      dst_fixtures.emplace_back(XLA_FFI_DataType_S32, dst_data[l].data(),
+                                std::vector<int64_t>{kSliceElements});
+      ffi_bufs.push_back(dst_fixtures.back().ffi_buf);
+    }
+
+    std::vector<XLA_FFI_RetType> types(kNumLayers, XLA_FFI_RetType_BUFFER);
+    std::vector<void*> rets_ptrs(kNumLayers);
+    for (int l = 0; l < kNumLayers; ++l) {
+      rets_ptrs[l] = &ffi_bufs[l];
+    }
+
+    XLA_FFI_Rets rets;
+    rets.struct_size = sizeof(XLA_FFI_Rets);
+    rets.extension_start = nullptr;
+    rets.size = kNumLayers;
+    rets.types = types.data();
+    rets.rets = rets_ptrs.data();
+
+    xla::ffi::RemainingRets remaining_rets(&rets, 0);
+    xla::ffi::Error err = TriggerMultiH2DImpl(shard_buf, remaining_rets);
+    EXPECT_TRUE(err.success()) << "MultiH2D failed for shard " << a.global_shard
+                               << ": " << err.message();
+
+    for (int l = 0; l < kNumLayers; ++l) {
+      for (int i = 0; i < kSliceElements; ++i) {
+        EXPECT_EQ(dst_data[l][i], shard_layer_data[a.global_shard][l][i])
+            << "H2D mismatch at shard " << a.global_shard << ", layer " << l
+            << ", index " << i;
+      }
+    }
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(FfiTypeTests, WeightSynchronizerFfiParamTest,
                          ::testing::Values(FfiType::kInit, FfiType::kInitAndD2h));
 

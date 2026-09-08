@@ -20,6 +20,59 @@ import jax.numpy as jnp
 import numpy as np
 
 from tpu_sync.frameworks.jax import _weight_synchronizer_ffi
+from tpu_sync.frameworks.jax import utils
+
+
+def _prepare_shard_info(
+    shard_idx: jax.Array,
+    mesh: jax.sharding.Mesh,
+    num_shards: int,
+) -> jax.Array:
+  """Packs [shard_idx, local_slot, host_idx] for FFI custom call.
+
+  If shard_idx is already packed (trailing dimension >= 3), returns shard_idx.
+  Otherwise, computes local_slot and host_idx based on the mesh physical layout
+  and host subgrid decomposition, and returns a sharded array with shape
+  `mesh.devices.shape + (3,)` and PartitionSpec(*mesh.axis_names, None).
+  """
+  if shard_idx.ndim > len(mesh.axis_names) and shard_idx.shape[-1] >= 3:
+    return shard_idx
+
+  physical_mesh_shape = list(mesh.devices.shape)
+  devices_per_host = num_shards
+  host_subgrid, host_grid = utils.compute_host_subgrid(
+      physical_mesh_shape, devices_per_host
+  )
+
+  local_slots_np = np.zeros(mesh.devices.shape, dtype=np.int32)
+  host_indices_np = np.zeros(mesh.devices.shape, dtype=np.int32)
+
+  for coord in np.ndindex(*mesh.devices.shape):
+    h_idx = 0
+    for c, s, g in zip(coord, host_subgrid, host_grid):
+      h = c // s if s > 0 else 0
+      h_idx = h_idx * g + h
+    l_slot = 0
+    for c, s in zip(coord, host_subgrid):
+      l = c % s if s > 0 else 0
+      l_slot = l_slot * s + l
+    local_slots_np[coord] = l_slot
+    host_indices_np[coord] = h_idx
+
+  spec = jax.sharding.PartitionSpec(*mesh.axis_names)
+  sharding = jax.sharding.NamedSharding(mesh, spec)
+
+  local_slots = jax.device_put(
+      jnp.array(local_slots_np, dtype=jnp.int32), sharding
+  )
+  host_indices = jax.device_put(
+      jnp.array(host_indices_np, dtype=jnp.int32), sharding
+  )
+
+  if shard_idx.shape != tuple(physical_mesh_shape):
+    shard_idx = shard_idx.reshape(tuple(physical_mesh_shape))
+
+  return jnp.stack([shard_idx, local_slots, host_indices], axis=-1)
 
 
 def init_weight_synchronizer(
@@ -58,6 +111,8 @@ def init_weight_synchronizer(
     num_processes = len(set(d.process_index for d in mesh.devices.flatten()))
     num_shards = mesh.devices.size // num_processes
 
+  shard_info = _prepare_shard_info(shard_idx, mesh, num_shards)
+
   @compute_on.compute_on(
       compute_type="device_host", out_memory_spaces=jax.memory.Space.Device
   )
@@ -82,7 +137,7 @@ def init_weight_synchronizer(
 
   axis_names = mesh.axis_names
   anchor_spec = device_array.sharding.spec
-  index_spec = jax.sharding.PartitionSpec(*axis_names)
+  index_spec = jax.sharding.PartitionSpec(*axis_names, None)
   sizes_spec = jax.sharding.PartitionSpec(None)
   out_spec = jax.sharding.PartitionSpec(*axis_names, None)
 
@@ -91,7 +146,7 @@ def init_weight_synchronizer(
       mesh=mesh,
       in_specs=(anchor_spec, index_spec, sizes_spec),
       out_specs=out_spec,
-  )(device_array, shard_idx, slice_byte_sizes)
+  )(device_array, shard_info, slice_byte_sizes)
 
 
 def init_weight_synchronizer_and_d2h(
@@ -130,6 +185,8 @@ def init_weight_synchronizer_and_d2h(
     num_processes = len(set(d.process_index for d in mesh.devices.flatten()))
     num_shards = mesh.devices.size // num_processes
 
+  shard_info = _prepare_shard_info(shard_idx, mesh, num_shards)
+
   @compute_on.compute_on(
       compute_type="device_host", out_memory_spaces=jax.memory.Space.Device
   )
@@ -153,7 +210,7 @@ def init_weight_synchronizer_and_d2h(
     )
 
   axis_names = mesh.axis_names
-  index_spec = jax.sharding.PartitionSpec(*axis_names)
+  index_spec = jax.sharding.PartitionSpec(*axis_names, None)
   sizes_spec = jax.sharding.PartitionSpec(None)
   out_spec = jax.sharding.PartitionSpec(*axis_names, None)
 
@@ -166,7 +223,7 @@ def init_weight_synchronizer_and_d2h(
       mesh=mesh,
       in_specs=in_specs,
       out_specs=out_spec,
-  )(shard_idx, slice_byte_sizes, *device_arrays)
+  )(shard_info, slice_byte_sizes, *device_arrays)
 
 
 def prepare_extended_info(
@@ -218,7 +275,11 @@ def h2d(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
     )(s_idx, layer_idx=np.int32(layer_idx))
 
   axis_names = mesh.axis_names
-  index_spec = jax.sharding.PartitionSpec(*axis_names)
+  index_spec = (
+      jax.sharding.PartitionSpec(*axis_names, None)
+      if shard_idx.ndim > len(axis_names)
+      else jax.sharding.PartitionSpec(*axis_names)
+  )
   out_spec = sharding.spec
 
   return jax.shard_map(
@@ -264,7 +325,11 @@ def multi_h2d(device_arrays, shard_idx, mesh) -> list[jax.Array]:
     )(s_idx)
 
   axis_names = mesh.axis_names
-  index_spec = jax.sharding.PartitionSpec(*axis_names)
+  index_spec = (
+      jax.sharding.PartitionSpec(*axis_names, None)
+      if shard_idx.ndim > len(axis_names)
+      else jax.sharding.PartitionSpec(*axis_names)
+  )
 
   return jax.shard_map(
       _local_multi_h2d,
@@ -299,7 +364,11 @@ def d2h(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
 
   axis_names = mesh.axis_names
   anchor_spec = device_array.sharding.spec
-  index_spec = jax.sharding.PartitionSpec(*axis_names)
+  index_spec = (
+      jax.sharding.PartitionSpec(*axis_names, None)
+      if shard_idx.ndim > len(axis_names)
+      else jax.sharding.PartitionSpec(*axis_names)
+  )
 
   return jax.shard_map(
       _local_d2h,

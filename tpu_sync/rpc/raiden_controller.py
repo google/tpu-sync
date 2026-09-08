@@ -122,29 +122,84 @@ def _raiden_id_from_proto(unit: Any) -> RaidenId:
 NDSlice = list[tuple[int, int]]
 
 
-def _get_host_subgrid(
-    physical_mesh_shape: list[int], devices_per_host: int
-) -> list[int]:
-  """Computes host subgrid cuboid shape within the physical TPU mesh."""
-  if len(physical_mesh_shape) == 3:
-    if (
-        devices_per_host == 4
-        and physical_mesh_shape[1] % 2 == 0
-        and physical_mesh_shape[2] % 2 == 0
-    ):
-      return [1, 2, 2]
-  # General fallback: factor devices_per_host starting from minor dimension
-  subgrid = [1] * len(physical_mesh_shape)
-  rem = devices_per_host
-  for i in range(len(physical_mesh_shape) - 1, -1, -1):
-    dim = physical_mesh_shape[i]
-    factor = math.gcd(dim, rem)
-    subgrid[i] = factor
-    rem //= factor
-  if rem != 1:
-    subgrid = [1] * len(physical_mesh_shape)
-    subgrid[-1] = devices_per_host
-  return subgrid
+def compute_host_subgrid(
+    physical_mesh_shape: typing.Sequence[int],
+    devices_per_host: int,
+) -> tuple[list[int], list[int]]:
+  """Computes (host_subgrid, host_grid) for a physical TPU mesh shape and devices per host.
+
+  Args:
+    physical_mesh_shape: The shape of the physical mesh.
+    devices_per_host: The number of devices assigned to each host process.
+
+  Returns:
+    A tuple of (host_subgrid, host_grid) where:
+      - math.prod(host_subgrid) == devices_per_host (or total devices if fewer)
+      - host_grid[i] = physical_mesh_shape[i] // host_subgrid[i]
+  """
+  num_dims = len(physical_mesh_shape)
+  if num_dims == 0 or devices_per_host <= 0:
+    return [], []
+
+  total_devices = math.prod(physical_mesh_shape)
+  if total_devices <= devices_per_host:
+    subgrid = list(physical_mesh_shape)
+    grid = [1] * num_dims
+    return subgrid, grid
+
+  if num_dims == 1:
+    subgrid = [devices_per_host]
+    grid = [physical_mesh_shape[0] // devices_per_host]
+    return subgrid, grid
+
+  candidates: list[list[int]] = []
+
+  def find_factors(dim_idx: int, rem_k: int, current: list[int]):
+    if dim_idx == num_dims - 1:
+      if physical_mesh_shape[dim_idx] % rem_k == 0:
+        candidates.append(current + [rem_k])
+      return
+    p_dim = physical_mesh_shape[dim_idx]
+    divisors = [
+        d for d in range(1, int(math.isqrt(rem_k)) + 1) if rem_k % d == 0
+    ]
+    all_divisors = sorted(set(divisors + [rem_k // d for d in divisors]))
+    for d in all_divisors:
+      if p_dim % d == 0:
+        find_factors(dim_idx + 1, rem_k // d, current + [d])
+
+  find_factors(0, devices_per_host, [])
+  if not candidates:
+    subgrid = [1] * num_dims
+    subgrid[-1] = min(devices_per_host, physical_mesh_shape[-1])
+    grid = [
+        p // s if s > 0 else 1 for p, s in zip(physical_mesh_shape, subgrid)
+    ]
+    return subgrid, grid
+
+  def score(s: list[int]):
+    h = [p // si for p, si in zip(physical_mesh_shape, s)]
+    h_monotonic_violations = sum(
+        1 for i in range(len(h) - 1) if h[i] < h[i + 1]
+    )
+    s_monotonic_violations = sum(
+        1 for i in range(len(s) - 1) if s[i] > s[i + 1]
+    )
+    return (
+        h_monotonic_violations,
+        s_monotonic_violations,
+        max(s),
+        max(h),
+        tuple(-x for x in reversed(s)),
+    )
+
+  candidates.sort(key=score)
+  chosen_subgrid = candidates[0]
+  chosen_grid = [
+      p // s if s > 0 else 1
+      for p, s in zip(physical_mesh_shape, chosen_subgrid)
+  ]
+  return chosen_subgrid, chosen_grid
 
 
 def _get_global_indices(
@@ -186,11 +241,9 @@ def _get_global_indices(
 
   if use_spec_mapping:
     devices_per_host = num_shards
-    host_subgrid = _get_host_subgrid(physical_mesh_shape, devices_per_host)
-    host_grid = [
-        p // s if s > 0 else 1
-        for p, s in zip(physical_mesh_shape, host_subgrid)
-    ]
+    host_subgrid, host_grid = compute_host_subgrid(
+        physical_mesh_shape, devices_per_host
+    )
 
     host_coords = []
     temp_h = replica_id

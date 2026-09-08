@@ -15,13 +15,14 @@
 """Utilities for JAX."""
 
 import contextlib
-import math
 from typing import Tuple
 
 from absl import flags
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from tpu_sync.rpc import raiden_controller
 
 # JAX-native open-source profiler imports loaded dynamically on export
 
@@ -178,29 +179,7 @@ def create_single_layer_kv_cache(
   return sharded_allocate()
 
 
-def _get_host_subgrid(
-    physical_mesh_shape: list[int], devices_per_host: int
-) -> list[int]:
-  """Computes host subgrid cuboid shape within the physical TPU mesh."""
-  if len(physical_mesh_shape) == 3:
-    if (
-        devices_per_host == 4
-        and physical_mesh_shape[1] % 2 == 0
-        and physical_mesh_shape[2] % 2 == 0
-    ):
-      return [1, 2, 2]
-  # General fallback: factor devices_per_host starting from minor dimension
-  subgrid = [1] * len(physical_mesh_shape)
-  rem = devices_per_host
-  for i in range(len(physical_mesh_shape) - 1, -1, -1):
-    dim = physical_mesh_shape[i]
-    factor = math.gcd(dim, rem)
-    subgrid[i] = factor
-    rem //= factor
-  if rem != 1:
-    subgrid = [1] * len(physical_mesh_shape)
-    subgrid[-1] = devices_per_host
-  return subgrid
+compute_host_subgrid = raiden_controller.compute_host_subgrid
 
 
 def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
@@ -233,11 +212,9 @@ def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
     # Use physical mesh mapping (matching raiden_controller.py use_spec_mapping)
     physical_mesh_shape = list(mesh.devices.shape)
     devices_per_host = num_shards
-    host_subgrid = _get_host_subgrid(physical_mesh_shape, devices_per_host)
-    host_grid = [
-        p // s if s > 0 else 1
-        for p, s in zip(physical_mesh_shape, host_subgrid)
-    ]
+    host_subgrid, host_grid = compute_host_subgrid(
+        physical_mesh_shape, devices_per_host
+    )
 
     host_coords = []
     temp_h = replica_id

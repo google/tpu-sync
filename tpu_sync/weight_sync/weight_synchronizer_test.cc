@@ -1241,6 +1241,116 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeNonContiguousGlobalShards) {
   EXPECT_EQ(ws->GetHostBufferPtr(0, 3)[0], 0x44);
 }
 
+TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeLocalAndGlobalIndices) {
+  const size_t num_layers = 2;
+  const size_t num_shards = 4;
+  const size_t slice_size = 1024;
+  auto ws = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  // Configure non-contiguous global shards, e.g., Host 1 managing global shards
+  // {2, 3, 6, 7} with local slots {0, 1, 2, 3}.
+  ws->SetGlobalShardIndices({2, 3, 6, 7});
+  ws->SetLocalShardIndices({0, 1, 2, 3});
+
+  // Local slot indices should map directly to internal slots 0, 1, 2, 3
+  // without being falsely remapped by global shard indices {2, 3, 6, 7}.
+  uint8_t* ptr_slot0 = ws->GetHostPointer(0, 0);
+  uint8_t* ptr_slot1 = ws->GetHostPointer(0, 1);
+  uint8_t* ptr_slot2 = ws->GetHostPointer(0, 2);
+  uint8_t* ptr_slot3 = ws->GetHostPointer(0, 3);
+
+  ASSERT_NE(ptr_slot0, nullptr);
+  ASSERT_NE(ptr_slot1, nullptr);
+  ASSERT_NE(ptr_slot2, nullptr);
+  ASSERT_NE(ptr_slot3, nullptr);
+
+  EXPECT_EQ(ptr_slot0, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 0)));
+  EXPECT_EQ(ptr_slot1, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 1)));
+  EXPECT_EQ(ptr_slot2, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 2)));
+  EXPECT_EQ(ptr_slot3, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 3)));
+
+  // Global shard indices not matching local slots (e.g. 6 and 7) should still
+  // map to their corresponding internal slots (slots 2 and 3).
+  uint8_t* ptr_global6 = ws->GetHostPointer(0, 6);
+  uint8_t* ptr_global7 = ws->GetHostPointer(0, 7);
+  EXPECT_EQ(ptr_global6, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 2)));
+  EXPECT_EQ(ptr_global7, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 3)));
+
+  // Const overloads
+  const auto* const_ws = ws.get();
+  EXPECT_EQ(const_ws->GetHostPointer(0, 2), ws->GetHostBufferPtr(0, 2));
+  EXPECT_EQ(const_ws->GetHostPointer(0, 3), ws->GetHostBufferPtr(0, 3));
+  EXPECT_EQ(const_ws->GetHostSize(0, 2), slice_size);
+  EXPECT_EQ(const_ws->GetHostSize(0, 3), slice_size);
+}
+
+TEST_F(WeightSynchronizerTest,
+       PushWeightsReshardedLocalShardIndicesPrioritized) {
+  const size_t num_layers = 1;
+  const size_t num_shards = 4;
+  const size_t slice_byte_size = 256;
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
+
+  // Global shards {2, 3, 6, 7} overlap with local slots {0, 1, 2, 3} at
+  // different positions (global 2 and 3 match local slots 2 and 3).
+  ws_source->SetGlobalShardIndices({2, 3, 6, 7});
+  ws_source->SetLocalShardIndices({0, 1, 2, 3});
+  ws_dest->SetGlobalShardIndices({2, 3, 6, 7});
+  ws_dest->SetLocalShardIndices({0, 1, 2, 3});
+
+  const uint8_t fill_bytes[4] = {0x11, 0x22, 0x33, 0x44};
+  for (size_t s = 0; s < num_shards; ++s) {
+    uint8_t* src_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, s));
+    uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, s));
+    ASSERT_NE(src_ptr, nullptr);
+    ASSERT_NE(dst_ptr, nullptr);
+    std::memset(src_ptr, fill_bytes[s], slice_byte_size);
+    std::memset(dst_ptr, 0x00, slice_byte_size);
+  }
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  request.set_uuid(54321);
+
+  auto* schedules = request.mutable_shard_push_schedules();
+  for (size_t s = 0; s < num_shards; ++s) {
+    auto* entry = (*schedules)[s].add_entries();
+    entry->set_dst_peer(dest_peer);
+    entry->set_dst_shard_idx(s);
+    entry->set_src_offset_bytes(0);
+    entry->set_dst_offset_bytes(0);
+    entry->set_size_bytes(slice_byte_size);
+    entry->set_count(1);
+    entry->set_layer_idx(0);
+  }
+
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), num_shards));
+  absl::Status status = ws_source->PushWeightsResharded(request);
+  EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+  for (size_t s = 0; s < num_shards; ++s) {
+    const uint8_t* dst_ptr = ws_dest->GetHostBufferPtr(0, s);
+    ASSERT_NE(dst_ptr, nullptr);
+    for (size_t b = 0; b < slice_byte_size; ++b) {
+      EXPECT_EQ(dst_ptr[b], fill_bytes[s])
+          << "Mismatch at slot " << s << " byte " << b;
+    }
+  }
+}
+
 }  // namespace
 }  // namespace weight_sync
 }  // namespace tpu_raiden

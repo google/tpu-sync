@@ -40,12 +40,17 @@
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "grpcpp/channel.h"
+#include "grpcpp/server_context.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/transfer_control_client.h"
+#include "tpu_sync/core/transfer_control_server.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/proto/transfer_control.pb.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_sync {
@@ -141,8 +146,15 @@ struct PendingCopy {
   int64_t chip_block_id;
 };
 
-class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
+class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase,
+                                   public TransferControlDelegate {
  public:
+  enum class ControlPlaneMode {
+    kRawTcp = 0,
+    kGrpc = 1,
+    kDual = 2,
+  };
+
   struct Slot {
     int64_t slot_idx;
     std::vector<int> block_ids;
@@ -159,11 +171,33 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
 
   KVCacheManagerWithTransfer(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
+      std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+      bool unsafe_skip_buffer_lock, int parallelism,
+      HostBufferAllocator host_allocator, int64_t node_id,
+      int64_t local_control_port, int64_t local_grpc_control_port,
+      ControlPlaneMode control_plane_mode, int64_t max_blocks = 0,
+      int64_t num_slots = 0, double timeout_s = 120.0,
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+
+  KVCacheManagerWithTransfer(
+      const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
       size_t slice_byte_size, const std::vector<int64_t>& dimensions,
       size_t physical_size, std::optional<int> local_port,
       std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
       int parallelism, HostBufferAllocator host_allocator, int64_t node_id = 0,
       int64_t local_control_port = -1, int64_t max_blocks = 0,
+      int64_t num_slots = 0, double timeout_s = 120.0,
+      std::optional<int> assigned_numa_node = std::nullopt,
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+
+  KVCacheManagerWithTransfer(
+      const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
+      size_t slice_byte_size, const std::vector<int64_t>& dimensions,
+      size_t physical_size, std::optional<int> local_port,
+      std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
+      int parallelism, HostBufferAllocator host_allocator, int64_t node_id,
+      int64_t local_control_port, int64_t local_grpc_control_port,
+      ControlPlaneMode control_plane_mode, int64_t max_blocks = 0,
       int64_t num_slots = 0, double timeout_s = 120.0,
       std::optional<int> assigned_numa_node = std::nullopt,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
@@ -180,11 +214,28 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
       int64_t max_blocks = 0, int64_t num_slots = 0, double timeout_s = 120.0,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
+  KVCacheManagerWithTransfer(
+      size_t num_layers, size_t num_shards,
+      std::vector<size_t> slice_byte_sizes, std::optional<int> local_port,
+      std::optional<int> host_blocks_to_allocate, int parallelism,
+      int64_t node_id, int64_t local_control_port,
+      int64_t local_grpc_control_port, ControlPlaneMode control_plane_mode,
+      int64_t max_blocks = 0, int64_t num_slots = 0, double timeout_s = 120.0,
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+
   // Metadata-based constructor for FFI / CPU-only testing
   KVCacheManagerWithTransfer(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
       std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
       int parallelism = 1, int64_t node_id = 0, int64_t local_control_port = -1,
+      int64_t max_blocks = 0, int64_t num_slots = 0, double timeout_s = 120.0,
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+
+  KVCacheManagerWithTransfer(
+      size_t num_layers, size_t num_shards, size_t slice_byte_size,
+      std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+      int parallelism, int64_t node_id, int64_t local_control_port,
+      int64_t local_grpc_control_port, ControlPlaneMode control_plane_mode,
       int64_t max_blocks = 0, int64_t num_slots = 0, double timeout_s = 120.0,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
@@ -262,7 +313,32 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
       const std::vector<int64_t>& local_block_ids, int parallelism = 1,
       std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt);
 
+  // In-Process gRPC Channel Accessors
+  std::shared_ptr<grpc::Channel> InProcessControlChannel();
+  void RegisterInProcessControlChannel(const std::string& endpoint,
+                                       std::shared_ptr<grpc::Channel> channel);
+
+  // TransferControlDelegate Implementation
+  absl::Status HandleGrpcPullStream(
+      grpc::ServerContext* context,
+      const ::tpu_sync::proto::PullStreamRequest& request,
+      ::tpu_sync::proto::PullStreamResponse* response) override;
+
+  absl::Status HandleGrpcAck(
+      grpc::ServerContext* context,
+      const ::tpu_sync::proto::TransferAckRequest& request,
+      ::tpu_sync::proto::TransferAckResponse* response) override;
+
+  absl::Status HandleGrpcCheckLiveness(
+      grpc::ServerContext* context,
+      const ::tpu_sync::proto::TransferLivenessRequest& request,
+      ::tpu_sync::proto::TransferLivenessResponse* response) override;
+
   virtual int local_control_port() const { return local_control_port_; }
+  virtual int local_grpc_control_port() const {
+    return local_grpc_control_port_;
+  }
+  ControlPlaneMode control_plane_mode() const { return control_plane_mode_; }
   virtual int64_t node_id() const { return node_id_; }
 
  protected:
@@ -549,6 +625,11 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   int control_fd_ = -1;
   std::atomic<bool> stopping_{false};
   std::thread control_thread_;
+
+  ControlPlaneMode control_plane_mode_ = ControlPlaneMode::kDual;
+  int local_grpc_control_port_ = 0;
+  std::unique_ptr<TransferControlServer> grpc_control_server_;
+  std::unique_ptr<TransferControlClient> grpc_control_client_;
 
  private:
   std::optional<int> GetLocalTpuNumaNode(xla::PjRtBuffer* buf) const;

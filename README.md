@@ -215,4 +215,4 @@ To reclaim memory, unlink/delete the shared memory files:
 ```bash
 rm -f /dev/shm/raiden_cache_*
 ```
-*(Note: unlinking deletes the filenames immediately, and the physical host DRAM pages are freed by the kernel as soon as all active serving processes detach or exit).*
+*(Note: unlinking deletes the filenames immediately, and the physical host DRAM pages are freed by the kernel as soon as all active serving processes detach or exit).* 

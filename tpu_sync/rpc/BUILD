@@ -42,6 +42,7 @@ cc_grpc_library(
     name = "raiden_service_cc_grpc",
     srcs = [":raiden_service_proto"],
     generate_mocks = True,
+    grpc_only = True,
     visibility = ["//visibility:public"],
     deps = [":raiden_service_cc_proto"],
 )
@@ -116,8 +117,11 @@ py_library(
     deps = [
         ":controller_service_py_pb2",
         ":raiden_service_py_pb2",
+        ":raiden_service_py_pb2_grpc",
         "//tpu_sync/api:common",
         "//tpu_sync/kv_cache:nd_slice_math",
+        "//tpu_sync/weight_sync:weight_synchronization_worker_service_client_py",
+        "@com_github_grpc_grpc//src/python/grpcio/grpc:grpcio",
         "@com_google_absl_py//absl/logging",
     ],
 )
@@ -128,6 +132,9 @@ py_test(
     deps = [
         ":raiden_controller",
         ":raiden_service_py_pb2",
+        ":raiden_service_py_pb2_grpc",
+        "//net/grpc/python:use_insecure_channel_for_test",
+        "@com_github_grpc_grpc//src/python/grpcio/grpc:grpcio",
         "@com_google_absl_py//absl/testing:absltest",
     ],
 )

@@ -140,6 +140,13 @@ grpc::Status WeightSynchronizationWorkerServiceImpl::HandleControl(
              tpu_sync::rpc::ControlRequest::COMMAND_SHUTDOWN) {
     LOG(INFO) << "gRPC WeightSynchronizationWorkerService received SHUTDOWN "
                  "command. Initiating clean exit.";
+    if (engine_) {
+      if (engine_->control_delegate()) {
+        engine_->control_delegate()->DrainPendingH2d();
+      } else {
+        engine_->DrainPendingH2d();
+      }
+    }
     if (shutdown_callback_) {
       std::thread([cb = shutdown_callback_]() {
         absl::SleepFor(absl::Milliseconds(50));

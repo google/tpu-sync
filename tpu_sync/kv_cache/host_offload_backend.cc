@@ -25,6 +25,7 @@
 
 #include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
@@ -781,7 +782,8 @@ HostOffloadBackend::BeginWriteRemote(
     const RaidenId& dst_raiden_id, absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> src_host_block_ids,
     absl::Duration requested_deadline, absl::Duration hold_window,
-    BlockTracker* save_tracker) {
+    BlockTracker* absl_nonnull save_tracker) {
+  CHECK(save_tracker != nullptr);
   if (block_hashes.empty()) {
     return absl::InvalidArgumentError("WriteRemote requires at least one hash");
   }
@@ -823,9 +825,7 @@ HostOffloadBackend::BeginWriteRemote(
   switch (response->exist_state()) {
     case ::tpu_raiden::kv_cache::proto::WRITE_ALL_EXIST:
       ack.all_exist = true;
-      if (save_tracker != nullptr) {
-        save_tracker->MarkDone(block_hashes);
-      }
+      save_tracker->MarkDone(block_hashes);
       // Release both the transfer's hold and the caller's pin.
       Release(block_hashes);
       Release(block_hashes);
@@ -833,9 +833,7 @@ HostOffloadBackend::BeginWriteRemote(
     case ::tpu_raiden::kv_cache::proto::WRITE_PARTIAL_EXIST:
       ack.existing_hashes.assign(response->existing_hashes().begin(),
                                  response->existing_hashes().end());
-      if (save_tracker != nullptr) {
-        save_tracker->MarkFailedWithExisting(block_hashes, ack.existing_hashes);
-      }
+      save_tracker->MarkFailedWithExisting(block_hashes, ack.existing_hashes);
       Release(block_hashes);
       return ack;
     default:
@@ -847,81 +845,78 @@ HostOffloadBackend::BeginWriteRemote(
     return absl::InternalError(
         "Destination accepted the offer but returned no operation id.");
   }
-  if (save_tracker != nullptr) {
-    std::vector<std::string> hashes(block_hashes.begin(), block_hashes.end());
-    call.result.OnReady([this, lifetime = lifetime_, dst_raiden_id,
-                         save_tracker, hashes = std::move(hashes), hold_expiry,
-                         op_id = ack.operation_id](
-                            absl::StatusOr<proto::WriteRemoteResult>
-                                result_or) {
-      absl::MutexLock lock(lifetime->mu);
-      if (!lifetime->is_alive) {
-        return;
-      }
-      if (!result_or.ok() &&
-          result_or.status().code() == absl::StatusCode::kCancelled) {
-        return;
-      }
-      bool succeeded = false;
-      if (result_or.ok()) {
-        const auto& result = *result_or;
-        succeeded =
-            (result.state() == proto::PollWriteRemoteResponse::COMMITTED ||
-             result.state() == proto::PollWriteRemoteResponse::ALL_EXIST);
-      } else {
-        const absl::Duration remaining_hold = *hold_expiry - absl::Now();
-        if (op_id != 0 && remaining_hold > absl::ZeroDuration()) {
-          auto fut = PollWriteRemoteAsync(
-              dst_raiden_id, op_id, absl::ToInt64Milliseconds(remaining_hold));
-          fut.OnReady([this, lifetime, save_tracker, hashes](
-                          absl::StatusOr<proto::PollWriteRemoteResponse> resp) {
-            absl::MutexLock lock(lifetime->mu);
-            if (!lifetime->is_alive) {
-              return;
+  std::vector<std::string> hashes(block_hashes.begin(), block_hashes.end());
+  call.result.OnReady([this, lifetime = lifetime_, dst_raiden_id, save_tracker,
+                       hashes = std::move(hashes), hold_expiry,
+                       op_id = ack.operation_id](
+                          absl::StatusOr<proto::WriteRemoteResult> result_or) {
+    absl::MutexLock lock(lifetime->mu);
+    if (!lifetime->is_alive) {
+      return;
+    }
+    if (!result_or.ok() &&
+        result_or.status().code() == absl::StatusCode::kCancelled) {
+      return;
+    }
+    bool succeeded = false;
+    if (result_or.ok()) {
+      const auto& result = *result_or;
+      succeeded =
+          (result.state() == proto::PollWriteRemoteResponse::COMMITTED ||
+           result.state() == proto::PollWriteRemoteResponse::ALL_EXIST);
+    } else {
+      const absl::Duration remaining_hold = *hold_expiry - absl::Now();
+      if (op_id != 0 && remaining_hold > absl::ZeroDuration()) {
+        auto fut = PollWriteRemoteAsync(
+            dst_raiden_id, op_id, absl::ToInt64Milliseconds(remaining_hold));
+        fut.OnReady([this, lifetime, save_tracker, hashes](
+                        absl::StatusOr<proto::PollWriteRemoteResponse> resp) {
+          absl::MutexLock lock(lifetime->mu);
+          if (!lifetime->is_alive) {
+            return;
+          }
+          bool poll_succeeded = false;
+          if (resp.ok()) {
+            switch (resp->state()) {
+              case proto::PollWriteRemoteResponse::COMMITTED:
+              case proto::PollWriteRemoteResponse::ALL_EXIST:
+                save_tracker->MarkDone(hashes);
+                poll_succeeded = true;
+                break;
+              case proto::PollWriteRemoteResponse::PARTIAL_EXIST:
+                save_tracker->MarkFailedWithExisting(
+                    hashes,
+                    std::vector<std::string>(resp->existing_hashes().begin(),
+                                             resp->existing_hashes().end()));
+                break;
+              case proto::PollWriteRemoteResponse::STORED_UNREGISTERED:
+                save_tracker->MarkFailedWithUnregistered(
+                    hashes, std::vector<std::string>(
+                                resp->unregistered_hashes().begin(),
+                                resp->unregistered_hashes().end()));
+                break;
+              default:
+                save_tracker->MarkFailed(hashes);
+                break;
             }
-            bool poll_succeeded = false;
-            if (resp.ok()) {
-              switch (resp->state()) {
-                case proto::PollWriteRemoteResponse::COMMITTED:
-                case proto::PollWriteRemoteResponse::ALL_EXIST:
-                  save_tracker->MarkDone(hashes);
-                  poll_succeeded = true;
-                  break;
-                case proto::PollWriteRemoteResponse::PARTIAL_EXIST:
-                  save_tracker->MarkFailedWithExisting(
-                      hashes,
-                      std::vector<std::string>(resp->existing_hashes().begin(),
-                                               resp->existing_hashes().end()));
-                  break;
-                case proto::PollWriteRemoteResponse::STORED_UNREGISTERED:
-                  save_tracker->MarkFailedWithUnregistered(
-                      hashes, std::vector<std::string>(
-                                  resp->unregistered_hashes().begin(),
-                                  resp->unregistered_hashes().end()));
-                  break;
-                default:
-                  save_tracker->MarkFailed(hashes);
-                  break;
-              }
-            } else {
-              save_tracker->MarkFailed(hashes);
-            }
+          } else {
+            save_tracker->MarkFailed(hashes);
+          }
+          Release(hashes);
+          if (poll_succeeded) {
             Release(hashes);
-            if (poll_succeeded) {
-              Release(hashes);
-            }
-          });
-          return;
-        } else {
-          save_tracker->MarkFailed(hashes);
-        }
+          }
+        });
+        return;
+      } else {
+        save_tracker->MarkFailed(hashes);
       }
+    }
+    Release(hashes);
+    if (succeeded) {
       Release(hashes);
-      if (succeeded) {
-        Release(hashes);
-      }
-    });
-  }
+    }
+  });
   return ack;
 }
 
@@ -1054,13 +1049,16 @@ tsl::Future<> HostOffloadBackend::UnregisterBlocksAsync(
 tsl::Future<> HostOffloadBackend::Load(
     const RaidenId& remote_id, absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> device_block_ids,
-    absl::Span<const RaidenBlockId> slices) {
+    absl::Span<const RaidenBlockId> slices,
+    BlockTracker* absl_nonnull load_tracker) {
+  CHECK(load_tracker != nullptr);
   if (block_hashes.empty()) {
     return tsl::Future<>(absl::OkStatus());
   }
 
   // Every hash needs a destination device block.
   if (device_block_ids.size() != block_hashes.size()) {
+    load_tracker->MarkFailed(block_hashes);
     return tsl::Future<>(absl::InvalidArgumentError(absl::StrCat(
         "Mismatched device_block_ids count (", device_block_ids.size(),
         ") vs block_hashes count (", block_hashes.size(), ").")));
@@ -1073,22 +1071,28 @@ tsl::Future<> HostOffloadBackend::Load(
   }
 
   if (is_remote) {
-    return LoadRemoteBlocks(remote_id, block_hashes, device_block_ids);
+    return LoadRemoteBlocks(remote_id, block_hashes, device_block_ids,
+                            load_tracker);
   }
-  return LoadLocalHostBlocks(block_hashes, device_block_ids, slices);
+  return LoadLocalHostBlocks(block_hashes, device_block_ids, slices,
+                             load_tracker);
 }
 
 tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
     const RaidenId& remote_id, absl::Span<const std::string> block_hashes,
-    absl::Span<const int32_t> device_block_ids) {
+    absl::Span<const int32_t> device_block_ids,
+    BlockTracker* absl_nonnull load_tracker) {
+  CHECK(load_tracker != nullptr);
   auto client = GetKVCacheStoreClient(remote_id);
   if (!client.ok()) {
+    load_tracker->MarkFailed(block_hashes);
     return tsl::Future<>(client.status());
   }
   std::shared_ptr<KVCacheStoreClient> client_ptr = *std::move(client);
 
   auto host_blocks = raiden_controller_->AllocateBlockIds(block_hashes.size());
   if (!host_blocks.ok()) {
+    load_tracker->MarkFailed(block_hashes);
     return tsl::Future<>(host_blocks.status());
   }
   std::vector<int32_t> dst_host_block_ids(host_blocks->begin(),
@@ -1105,9 +1109,11 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
 
   fetch_future.OnReady(
       [this, remote_id, dst_host_block_ids,
+       hashes =
+           std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
        dev_ids_vec = std::vector<int32_t>(device_block_ids.begin(),
                                           device_block_ids.end()),
-       load_promise = std::move(load_promise)](
+       load_tracker, load_promise = std::move(load_promise)](
           const absl::StatusOr<::tpu_raiden::kv_cache::proto::FetchResponse>&
               fetch_response) mutable {
         if (!fetch_response.ok()) {
@@ -1115,6 +1121,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
           // The peer may have restarted on a new port; drop the cached client
           // so the next attempt re-resolves instead of redialling a dead one.
           InvalidateStoreClient(remote_id);
+          load_tracker->MarkFailed(hashes);
           load_promise.Set(fetch_response.status());
           return;
         }
@@ -1125,6 +1132,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
           std::string err_msg = response.error_message().empty()
                                     ? "Fetch RPC returned failed blocks"
                                     : response.error_message();
+          load_tracker->MarkFailed(hashes);
           load_promise.Set(absl::InternalError(err_msg));
           return;
         }
@@ -1147,9 +1155,15 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
             raiden_controller_->TransferBuffers(src_buffers, dst_buffers);
 
         h2d_future.OnReady(
-            [this, dst_host_block_ids, load_promise = std::move(load_promise)](
-                absl::Status status) mutable {
+            [this, dst_host_block_ids, hashes = std::move(hashes), load_tracker,
+             load_promise =
+                 std::move(load_promise)](absl::Status status) mutable {
               (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
+              if (status.ok()) {
+                load_tracker->MarkDone(hashes);
+              } else {
+                load_tracker->MarkFailed(hashes);
+              }
               load_promise.Set(status);
             });
       });
@@ -1160,16 +1174,20 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
 tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
     absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> device_block_ids,
-    absl::Span<const RaidenBlockId> slices) {
+    absl::Span<const RaidenBlockId> slices,
+    BlockTracker* absl_nonnull load_tracker) {
+  CHECK(load_tracker != nullptr);
   std::vector<int64_t> src_host_block_ids;
   src_host_block_ids.reserve(block_hashes.size());
   if (!slices.empty()) {
     if (slices.size() != block_hashes.size()) {
+      load_tracker->MarkFailed(block_hashes);
       return tsl::Future<>(absl::InvalidArgumentError(
           "Mismatched slices count vs block_hashes count."));
     }
     for (size_t i = 0; i < slices.size(); ++i) {
       if (slices[i].host_block_id == -1) {
+        load_tracker->MarkFailed(block_hashes);
         return tsl::Future<>(absl::FailedPreconditionError(
             absl::StrCat("Block host_block_id is -1: ", block_hashes[i])));
       }
@@ -1180,20 +1198,29 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
     for (const auto& hash : block_hashes) {
       const RaidenBlockId* entry = lru_cache_.Peek(hash);
       if (entry == nullptr) {
+        load_tracker->MarkFailed(block_hashes);
         return tsl::Future<>(absl::NotFoundError(
             absl::StrCat("Block hash not found in host backend: ", hash)));
       }
       if (entry->status != BlockStatus::HOST &&
           entry->status != BlockStatus::HOST_AND_HBM) {
+        load_tracker->MarkFailed(block_hashes);
         return tsl::Future<>(absl::FailedPreconditionError(
             absl::StrCat("Block is not on host: ", hash)));
       }
       if (entry->host_block_id == -1) {
+        load_tracker->MarkFailed(block_hashes);
         return tsl::Future<>(absl::FailedPreconditionError(
             absl::StrCat("Block host_block_id is -1: ", hash)));
       }
       src_host_block_ids.push_back(entry->host_block_id);
     }
+  }
+
+  if (raiden_controller_ == nullptr) {
+    load_tracker->MarkFailed(block_hashes);
+    return tsl::Future<>(
+        absl::FailedPreconditionError("RaidenController is not initialized"));
   }
 
   std::vector<Buffer> src_buffers;
@@ -1210,7 +1237,137 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
                              ::tpu_sync::rpc::MEMORY_TYPE_HBM);
   }
 
-  return raiden_controller_->TransferBuffers(src_buffers, dst_buffers);
+  tsl::Future<> h2d_future =
+      raiden_controller_->TransferBuffers(src_buffers, dst_buffers);
+
+  auto [promise, future] = tsl::MakePromise<>();
+  h2d_future.OnReady([this,
+                      hashes = std::vector<std::string>(block_hashes.begin(),
+                                                        block_hashes.end()),
+                      dev_ids = std::vector<int32_t>(device_block_ids.begin(),
+                                                     device_block_ids.end()),
+                      load_tracker, promise = std::move(promise)](
+                         absl::Status status) mutable {
+    if (status.ok()) {
+      std::vector<std::string> update_hashes;
+      std::vector<RaidenBlockId> update_slices;
+      update_hashes.reserve(hashes.size());
+      update_slices.reserve(hashes.size());
+      {
+        absl::MutexLock lock(mutex_);
+        for (size_t i = 0; i < hashes.size(); ++i) {
+          const std::string& hash = hashes[i];
+          if (const RaidenBlockId* existing = lru_cache_.Peek(hash)) {
+            RaidenBlockId block = *existing;
+            block.device_block_id = dev_ids[i];
+            block.status = BlockStatus::HOST_AND_HBM;
+            update_hashes.push_back(hash);
+            update_slices.push_back(block);
+          }
+        }
+      }
+      if (!update_hashes.empty()) {
+        Insert(update_hashes, update_slices, /*on_host=*/true);
+        Release(update_hashes);
+      }
+      load_tracker->MarkDone(hashes);
+      promise.Set(absl::OkStatus());
+    } else {
+      load_tracker->MarkFailed(hashes);
+      promise.Set(status);
+    }
+  });
+  return future;
+}
+
+tsl::Future<> HostOffloadBackend::Save(
+    absl::Span<const std::string> block_hashes,
+    absl::Span<const int64_t> src_device_block_ids,
+    absl::Span<const int32_t> dst_host_block_ids,
+    BlockTracker* absl_nonnull save_tracker) {
+  CHECK(save_tracker != nullptr);
+  if (block_hashes.empty()) {
+    return tsl::Future<>(absl::OkStatus());
+  }
+  if (src_device_block_ids.size() != block_hashes.size() ||
+      dst_host_block_ids.size() != block_hashes.size()) {
+    save_tracker->MarkFailed(block_hashes);
+    return tsl::Future<>(absl::InvalidArgumentError(
+        "Mismatched block_hashes, src_device_block_ids, or dst_host_block_ids "
+        "count."));
+  }
+  if (raiden_controller_ == nullptr) {
+    save_tracker->MarkFailed(block_hashes);
+    return tsl::Future<>(
+        absl::FailedPreconditionError("RaidenController is not initialized"));
+  }
+
+  std::vector<Buffer> src_buffers;
+  src_buffers.reserve(src_device_block_ids.size());
+  for (int64_t id : src_device_block_ids) {
+    src_buffers.emplace_back(id, std::vector<BufferShard>{}, std::nullopt,
+                             ::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  }
+  std::vector<Buffer> dst_buffers;
+  dst_buffers.reserve(dst_host_block_ids.size());
+  for (int32_t id : dst_host_block_ids) {
+    dst_buffers.emplace_back(id, std::vector<BufferShard>{}, std::nullopt,
+                             ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  }
+
+  tsl::Future<> transfer_future = raiden_controller_->TransferBuffers(
+      src_buffers, dst_buffers, /*staging_host_buffers=*/{},
+      /*copy_sizes=*/{});
+
+  auto [save_promise, save_future] = tsl::MakePromise<>();
+  transfer_future.OnReady(
+      [this,
+       hashes =
+           std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
+       src_device_ids = std::vector<int64_t>(src_device_block_ids.begin(),
+                                             src_device_block_ids.end()),
+       dst_host_ids = std::vector<int32_t>(dst_host_block_ids.begin(),
+                                           dst_host_block_ids.end()),
+       save_tracker,
+       save_promise = std::move(save_promise)](absl::Status status) mutable {
+        if (status.ok()) {
+          std::vector<std::string> update_hashes;
+          std::vector<RaidenBlockId> update_slices;
+          update_hashes.reserve(hashes.size());
+          update_slices.reserve(hashes.size());
+          {
+            absl::MutexLock lock(mutex_);
+            for (size_t i = 0; i < hashes.size(); ++i) {
+              const std::string& hash = hashes[i];
+              const RaidenBlockId* existing = lru_cache_.Peek(hash);
+              RaidenBlockId block =
+                  existing != nullptr
+                      ? *existing
+                      : RaidenBlockId(raiden_id_, dst_host_ids[i],
+                                      src_device_ids[i],
+                                      BlockStatus::HOST_AND_HBM);
+              block.host_block_id = dst_host_ids[i];
+              block.device_block_id = src_device_ids[i];
+              block.status = BlockStatus::HOST_AND_HBM;
+              update_hashes.push_back(hash);
+              update_slices.push_back(block);
+            }
+          }
+          if (!update_hashes.empty()) {
+            Insert(update_hashes, update_slices, /*on_host=*/true);
+          }
+          save_tracker->MarkDone(hashes);
+          save_promise.Set(absl::OkStatus());
+        } else {
+          if (raiden_controller_ != nullptr) {
+            (void)raiden_controller_->DeallocateBlockIds(dst_host_ids);
+          }
+          save_tracker->MarkFailed(hashes);
+          save_promise.Set(status);
+        }
+      });
+
+  return save_future;
 }
 
 absl::StatusOr<KVTransferSpecConfig> HostOffloadBackend::ComposeKVTransferSpec(

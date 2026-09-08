@@ -30,6 +30,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/nullability.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
@@ -60,6 +61,7 @@
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
+#include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_server.h"
@@ -1186,7 +1188,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadSuccess) {
   // Poll for completion
   bool done = false;
   while (!done) {
-    auto [load_done, load_failed, load_pending] = store.PollLoadStatus();
+    auto [load_done, load_failed, load_pending, load_existing,
+          load_unregistered] = store.PollLoadStatus();
     if (!load_failed.empty()) {
       FAIL() << "Async Load failed during polling";
     }
@@ -1243,7 +1246,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadWithSlicesSuccess) {
 
   bool done = false;
   while (!done) {
-    auto [load_done, load_failed, load_pending] = store.PollLoadStatus();
+    auto [load_done, load_failed, load_pending, load_existing,
+          load_unregistered] = store.PollLoadStatus();
     if (!load_failed.empty()) {
       FAIL() << "Async Load failed during polling";
     }
@@ -1313,7 +1317,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadWithSlicesUnpinnedFails) {
   ABSL_ASSERT_OK(store.Load(hashes, slices, {2}));
   bool done = false;
   for (int attempt = 0; attempt < 100 && !done; ++attempt) {
-    auto [load_done, load_failed, load_pending] = store.PollLoadStatus();
+    auto [load_done, load_failed, load_pending, load_existing,
+          load_unregistered] = store.PollLoadStatus();
     ASSERT_TRUE(load_failed.empty());
     if (!load_done.empty()) done = true;
     if (!done) absl::SleepFor(absl::Milliseconds(10));
@@ -1405,7 +1410,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LocalLoadConsumesTheCallerPin) {
 
   bool done = false;
   for (int attempt = 0; attempt < 100 && !done; ++attempt) {
-    auto [load_done, load_failed, load_pending] = store.PollLoadStatus();
+    auto [load_done, load_failed, load_pending, load_existing,
+          load_unregistered] = store.PollLoadStatus();
     ASSERT_TRUE(load_failed.empty());
     if (!load_done.empty()) done = true;
     if (!done) absl::SleepFor(absl::Milliseconds(10));
@@ -1450,7 +1456,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, FailedLocalLoadKeepsTheCallerPin) {
 
   bool failed = false;
   for (int attempt = 0; attempt < 100 && !failed; ++attempt) {
-    auto [load_done, load_failed, load_pending] = store.PollLoadStatus();
+    auto [load_done, load_failed, load_pending, load_existing,
+          load_unregistered] = store.PollLoadStatus();
     ASSERT_TRUE(load_done.empty());
     if (!load_failed.empty()) {
       EXPECT_THAT(load_failed, ::testing::ElementsAre("hash_1"));
@@ -1620,6 +1627,28 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadWithSlicesTwoPeersFails) {
 }
 
 TEST_F(KVCacheStoreEmbeddedControllerTest, LoadWithSlicesAlreadyLoadingFails) {
+  struct BlockingTransferManager
+      : public ::tpu_raiden::controller::ShardAwareMockTransferManager {
+    absl::Notification started;
+    absl::Notification release;
+    absl::Notification done;
+
+    auto H2d(const std::vector<int64_t>& src_offsets,
+             const std::vector<int64_t>& dst_offsets,
+             const std::vector<int64_t>& copy_sizes) {
+      started.Notify();
+      release.WaitForNotification();
+      auto res = ShardAwareMockTransferManager::H2d(src_offsets, dst_offsets,
+                                                    copy_sizes);
+      done.Notify();
+      return res;
+    }
+  };
+
+  BlockingTransferManager blocking_mgr;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&blocking_mgr));
+
   auto controller = MakeController();
   RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
 
@@ -1636,11 +1665,20 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadWithSlicesAlreadyLoadingFails) {
 
   absl::Status status1 = store.Load(hashes, slices, {2});
   ABSL_ASSERT_OK(status1);
+  blocking_mgr.started.WaitForNotification();
 
   absl::Status status2 = store.Load(hashes, slices, {3});
   EXPECT_TRUE(absl::IsFailedPrecondition(status2));
   EXPECT_THAT(std::string(status2.message()),
               ::testing::HasSubstr("Block is already loading"));
+
+  blocking_mgr.release.Notify();
+  blocking_mgr.done.WaitForNotification();
+  while (store.PollLoadStatus().done.empty()) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(dst_transfer_mock_.get()));
 }
 
 TEST_F(KVCacheStoreEmbeddedControllerTest, LoadWithSlicesMixedStatusesFails) {
@@ -1725,7 +1763,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadWithSlicesRemoteSuccess) {
 
   bool done = false;
   for (int attempt = 0; attempt < 100; ++attempt) {
-    auto [load_done, load_failed, load_pending] = store.PollLoadStatus();
+    auto [load_done, load_failed, load_pending, load_existing,
+          load_unregistered] = store.PollLoadStatus();
     ASSERT_TRUE(load_failed.empty());
     if (!load_done.empty()) {
       EXPECT_THAT(load_done,
@@ -1811,7 +1850,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadRemoteWithSlicesRecordsNothing) {
 
   bool done = false;
   for (int attempt = 0; attempt < 100 && !done; ++attempt) {
-    auto [load_done, load_failed, load_pending] = store.PollLoadStatus();
+    auto [load_done, load_failed, load_pending, load_existing,
+          load_unregistered] = store.PollLoadStatus();
     ASSERT_TRUE(load_failed.empty());
     if (!load_done.empty()) {
       EXPECT_THAT(load_done, ::testing::UnorderedElementsAre("slice_load_hash"));
@@ -1964,7 +2004,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadMultiWorkerSuccess) {
   // Poll for completion
   bool done = false;
   while (!done) {
-    auto [load_done, load_failed, load_pending] = store.PollLoadStatus();
+    auto [load_done, load_failed, load_pending, load_existing,
+          load_unregistered] = store.PollLoadStatus();
     if (!load_failed.empty()) {
       FAIL() << "Async Load failed during polling";
     }
@@ -4074,7 +4115,9 @@ TEST_F(StoreDiscoveryTest, FailedLoadDropsTheCachedPeerClient) {
                                         /*controller_address=*/""));
   // Load requires a destination for every hash. The device block is never written 
   // as the loads below fail while resolving or querying the peer.
-  auto first = backend->Load(peer_rid, {"h"}, {0}).Await();
+  BlockTracker tracker;
+  auto first =
+      backend->Load(peer_rid, {"h"}, {0}, /*slices=*/{}, &tracker).Await();
   ASSERT_FALSE(first.ok());
   ASSERT_TRUE(absl::IsUnavailable(first)) << first.ToString();
 
@@ -4090,7 +4133,8 @@ TEST_F(StoreDiscoveryTest, FailedLoadDropsTheCachedPeerClient) {
   // be UNAVAILABLE. The answer itself is about the request rather than about
   // the hash, because Fetch validates its arguments before it looks anything
   // up, and this store registers no workers to name as endpoints.
-  auto second = backend->Load(peer_rid, {"h"}, {0}).Await();
+  auto second =
+      backend->Load(peer_rid, {"h"}, {0}, /*slices=*/{}, &tracker).Await();
   EXPECT_TRUE(absl::IsInvalidArgument(second))
       << "expected the restarted peer to answer; got " << second.ToString()
       << " -- the cached client still points at the address it had";
@@ -5869,7 +5913,9 @@ class ErrorLookupBackend : public KVCacheStoreBackend {
   tsl::Future<> Load(const RaidenId& remote_id,
                      absl::Span<const std::string> block_hashes,
                      absl::Span<const int32_t> device_block_ids,
-                     absl::Span<const RaidenBlockId> slices = {}) override {
+                     absl::Span<const RaidenBlockId> slices,
+                     BlockTracker* absl_nonnull load_tracker) override {
+    CHECK(load_tracker != nullptr);
     return {};
   }
   std::pair<bool, BlockSliceList> Insert(

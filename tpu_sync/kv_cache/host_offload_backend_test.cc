@@ -38,6 +38,7 @@
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/controller/worker_registry.h"
 #include "tpu_sync/core/kv_manager_holder.h"
+#include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/global_registry/test_util.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
@@ -669,7 +670,9 @@ TEST(HostOffloadBackendTest, LoadMismatchedDeviceBlockCount) {
 
   std::vector<std::string> hashes = {"hash1", "hash2"};
   std::vector<int32_t> dev_ids = {10};  // Mismatched count
-  auto load_future = backend->Load(node_id, hashes, dev_ids);
+  BlockTracker tracker;
+  auto load_future =
+      backend->Load(node_id, hashes, dev_ids, /*slices=*/{}, &tracker);
   EXPECT_THAT(load_future.Await(),
               absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
 }
@@ -766,7 +769,9 @@ TEST(HostOffloadBackendTest, LoadSuccess) {
   // Perform Load
   std::vector<std::string> hashes = {"load_hash_1"};
   std::vector<int32_t> dev_ids = {5};
-  auto load_future = backend->Load(remote_node_id, hashes, dev_ids);
+  BlockTracker tracker;
+  auto load_future =
+      backend->Load(remote_node_id, hashes, dev_ids, /*slices=*/{}, &tracker);
   ABSL_EXPECT_OK(load_future.Await());
 
   remote_server->Shutdown();
@@ -810,7 +815,9 @@ TEST(HostOffloadBackendTest, LoadLocalSuccess) {
                   {RaidenBlockId(node_id, 10, BlockStatus::HOST)},
                   /*on_host=*/true);
 
-  auto load_future = backend->Load(RaidenId{}, {"local_hash_1"}, {5});
+  BlockTracker tracker1;
+  auto load_future = backend->Load(RaidenId{}, {"local_hash_1"}, {5},
+                                   /*slices=*/{}, &tracker1);
   ABSL_EXPECT_OK(load_future.Await());
 }
 
@@ -836,7 +843,9 @@ TEST(HostOffloadBackendTest, LoadLocalMissingBlockError) {
   auto backend = std::dynamic_pointer_cast<HostOffloadBackend>(backend_base);
   ASSERT_NE(backend, nullptr);
 
-  auto load_future = backend->Load(RaidenId{}, {"missing_hash"}, {5});
+  BlockTracker tracker2;
+  auto load_future = backend->Load(RaidenId{}, {"missing_hash"}, {5},
+                                   /*slices=*/{}, &tracker2);
   EXPECT_THAT(load_future.Await(),
               absl_testing::StatusIs(absl::StatusCode::kNotFound));
 }
@@ -868,7 +877,9 @@ TEST(HostOffloadBackendTest, LoadLocalNonHostBlockError) {
                   {RaidenBlockId(remote_id, 10, BlockStatus::REMOTE)},
                   /*on_host=*/true);
 
-  auto load_future = backend->Load(RaidenId{}, {"remote_hash"}, {5});
+  BlockTracker tracker3;
+  auto load_future =
+      backend->Load(RaidenId{}, {"remote_hash"}, {5}, /*slices=*/{}, &tracker3);
   EXPECT_THAT(load_future.Await(),
               absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
 }
@@ -1355,6 +1366,141 @@ TEST(HostOffloadBackendTest, DeleteSkipsPinnedBlocks) {
   auto lookup_after = backend.Lookup({"h1"});
   ABSL_ASSERT_OK(lookup_after.status());
   EXPECT_TRUE(lookup_after->empty());
+}
+
+TEST(HostOffloadBackendTest, LoadUpdatesTrackerOnSuccessAndFailure) {
+  RaidenId node_id{"node_job", "0", "data", 0};
+  ::tpu_sync::rpc::RaidenIdProto unit_proto;
+  unit_proto.set_job_name(node_id.job_name);
+  unit_proto.set_job_replica_id(node_id.job_replica_id);
+  unit_proto.set_data_name(node_id.data_name);
+  unit_proto.set_data_replica_idx(node_id.data_replica_idx);
+
+  ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
+                                            unit_proto, /*num_blocks=*/100,
+                                            /*num_shards=*/1,
+                                            /*shard_size_bytes=*/1024));
+  auto test_worker_server = controller::CreateTestWorkerServer();
+  auto transfer_mock =
+      std::make_unique<controller::ShardAwareMockTransferManager>();
+  test_worker_server->service->SetTransferManager(
+      KVManagerHolder(transfer_mock.get()));
+
+  core::controller::RaidenControllerClient controller_client(
+      controller->controller_address());
+  ABSL_ASSERT_OK(controller_client.RegisterWorker(
+      "worker_0", test_worker_server->server_address,
+      {{test_worker_server->server_address, {}}}));
+
+  BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = 100;
+  config.raiden_id = node_id;
+
+  ASSERT_OK_AND_ASSIGN(auto backend_base,
+                       HostOffloadBackend::Create(config, controller.get()));
+  auto backend = std::dynamic_pointer_cast<HostOffloadBackend>(backend_base);
+  ASSERT_NE(backend, nullptr);
+
+  // Success path:
+  backend->Insert({"load_success_1"},
+                  {RaidenBlockId(node_id, 10, BlockStatus::HOST)},
+                  /*on_host=*/true);
+
+  BlockTracker success_tracker;
+  success_tracker.AddPending("load_success_1");
+  auto success_future =
+      backend->Load(RaidenId{}, {"load_success_1"}, {5}, {}, &success_tracker);
+  ABSL_EXPECT_OK(success_future.Await());
+
+  BlockTracker::StatusResult success_res = success_tracker.Poll();
+  EXPECT_THAT(success_res.done, UnorderedElementsAre("load_success_1"));
+  EXPECT_TRUE(success_res.failed.empty());
+
+  // Failure path (transfer failure):
+  backend->Insert({"load_fail_1"},
+                  {RaidenBlockId(node_id, 11, BlockStatus::HOST)},
+                  /*on_host=*/true);
+  transfer_mock->fail_transfers = true;
+
+  BlockTracker failure_tracker;
+  failure_tracker.AddPending("load_fail_1");
+  auto failure_future =
+      backend->Load(RaidenId{}, {"load_fail_1"}, {6}, {}, &failure_tracker);
+  EXPECT_FALSE(failure_future.Await().ok());
+
+  BlockTracker::StatusResult failure_res = failure_tracker.Poll();
+  EXPECT_TRUE(failure_res.done.empty());
+  EXPECT_THAT(failure_res.failed, UnorderedElementsAre("load_fail_1"));
+}
+
+TEST(HostOffloadBackendTest, SaveUpdatesTrackerOnSuccessAndFailure) {
+  RaidenId node_id{"node_job", "0", "data", 0};
+  ::tpu_sync::rpc::RaidenIdProto unit_proto;
+  unit_proto.set_job_name(node_id.job_name);
+  unit_proto.set_job_replica_id(node_id.job_replica_id);
+  unit_proto.set_data_name(node_id.data_name);
+  unit_proto.set_data_replica_idx(node_id.data_replica_idx);
+
+  ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
+                                            unit_proto, /*num_blocks=*/100,
+                                            /*num_shards=*/1,
+                                            /*shard_size_bytes=*/1024));
+  auto test_worker_server = controller::CreateTestWorkerServer();
+  auto transfer_mock =
+      std::make_unique<controller::ShardAwareMockTransferManager>();
+  test_worker_server->service->SetTransferManager(
+      KVManagerHolder(transfer_mock.get()));
+
+  core::controller::RaidenControllerClient controller_client(
+      controller->controller_address());
+  ABSL_ASSERT_OK(controller_client.RegisterWorker(
+      "worker_0", test_worker_server->server_address,
+      {{test_worker_server->server_address, {}}}));
+
+  BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = 100;
+  config.raiden_id = node_id;
+
+  ASSERT_OK_AND_ASSIGN(auto backend_base,
+                       HostOffloadBackend::Create(config, controller.get()));
+  auto backend = std::dynamic_pointer_cast<HostOffloadBackend>(backend_base);
+  ASSERT_NE(backend, nullptr);
+
+  // Success path:
+  backend->Insert({"save_success_1"},
+                  {RaidenBlockId(node_id, -1, 7, BlockStatus::HBM)},
+                  /*on_host=*/false);
+
+  BlockTracker success_tracker;
+  success_tracker.AddPending("save_success_1");
+  auto success_future =
+      backend->Save({"save_success_1"}, {7}, {10}, &success_tracker);
+  ABSL_EXPECT_OK(success_future.Await());
+
+  BlockTracker::StatusResult success_res = success_tracker.Poll();
+  EXPECT_THAT(success_res.done, UnorderedElementsAre("save_success_1"));
+  EXPECT_TRUE(success_res.failed.empty());
+
+  auto lookup_res = backend->Lookup({"save_success_1"});
+  ABSL_ASSERT_OK(lookup_res.status());
+  ASSERT_EQ(lookup_res->size(), 1);
+  EXPECT_EQ((*lookup_res)[0].second.status, BlockStatus::HOST_AND_HBM);
+  EXPECT_EQ((*lookup_res)[0].second.host_block_id, 10);
+  EXPECT_EQ((*lookup_res)[0].second.device_block_id, 7);
+
+  // Failure path (transfer failure):
+  transfer_mock->fail_transfers = true;
+  BlockTracker failure_tracker;
+  failure_tracker.AddPending("save_fail_1");
+  auto failure_future =
+      backend->Save({"save_fail_1"}, {8}, {11}, &failure_tracker);
+  EXPECT_FALSE(failure_future.Await().ok());
+
+  BlockTracker::StatusResult failure_res = failure_tracker.Poll();
+  EXPECT_TRUE(failure_res.done.empty());
+  EXPECT_THAT(failure_res.failed, UnorderedElementsAre("save_fail_1"));
 }
 
 }  // namespace

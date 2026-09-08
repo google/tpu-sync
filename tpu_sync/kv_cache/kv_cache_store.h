@@ -409,13 +409,7 @@ class KVCacheStore {
   // refused the batch. `unregistered`: the bytes landed but were not published
   // to the registry, so no peer can find them; the caller decides what that
   // means for its own copy.
-  struct PollSaveStatusResult {
-    std::vector<std::string> done;
-    std::vector<std::string> failed;
-    std::vector<std::string> pending;
-    std::vector<std::string> existing;
-    std::vector<std::string> unregistered;
-  };
+  using PollSaveStatusResult = BlockTracker::StatusResult;
   PollSaveStatusResult PollSaveStatus();
 
   // Polls the status of all active/inflight Load operations.
@@ -430,11 +424,7 @@ class KVCacheStore {
   // of such a hash is therefore a miss, and the caller's own block manager is
   // what remembers it already owns the device block.
   //
-  struct PollLoadStatusResult {
-    std::vector<std::string> done;
-    std::vector<std::string> failed;
-    std::vector<std::string> pending;
-  };
+  using PollLoadStatusResult = BlockTracker::StatusResult;
   PollLoadStatusResult PollLoadStatus();
 
   // Launches an async receiver-initiated read of REMOTE blocks from their
@@ -521,21 +511,7 @@ class KVCacheStore {
   // Output: Number of successfully evicted host blocks.
   size_t Evict(const std::vector<std::string>& block_hashes);
 
-  struct SaveState {
-    tsl::Future<> future;
-    std::vector<std::string> block_hashes;
-    std::vector<int> host_block_ids;
-  };
 
-  struct LoadState {
-    tsl::Future<> future;
-    std::vector<std::string> block_hashes;
-    std::vector<int> device_block_ids;
-    // Whether the source was a peer. Decided at submit time and carried here
-    // because the poller cannot re-derive it: a remote load records nothing
-    // locally, so by completion there is no entry to read a status off.
-    bool from_remote = false;
-  };
 
 
   // Starts (if needed) the peer-facing store server, computes
@@ -669,9 +645,6 @@ class KVCacheStore {
   };
   std::shared_ptr<Lifetime> lifetime_;
 
-  std::vector<SaveState> active_saves_ ABSL_GUARDED_BY(mutex_);
-  std::vector<LoadState> active_loads_ ABSL_GUARDED_BY(mutex_);
-
   // In-flight remote-write operations, keyed by their source-local id.
   absl::flat_hash_map<OperationKey, RemoteWriteState> active_remote_writes_
       ABSL_GUARDED_BY(mutex_);
@@ -681,8 +654,6 @@ class KVCacheStore {
   BlockTracker save_tracker_;
   BlockTracker load_tracker_;
   BlockTracker sweep_tracker_;
-  std::unique_ptr<std::thread> poller_thread_;
-  std::atomic<bool> stop_poller_{false};
 
   // Blocks pinned by write-throughs still waiting on the registry. Bounded,
   // because a pinned block is invisible to eviction: a registry that connects
@@ -741,11 +712,6 @@ class KVCacheStore {
   // Drains the sweep's verdict mailbox, waiting up to one second for it to
   // be non-empty.
   BlockTracker::StatusResult DrainSweepVerdicts();
-
-  void PollerLoop();
-  void PollSavesInternal(std::vector<SaveState> ready_saves);
-  void PollLoadsInternal(std::vector<LoadState> ready_loads);
-  void PollFuturesInternal();
 };
 
 }  // namespace kv_cache

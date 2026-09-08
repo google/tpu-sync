@@ -137,7 +137,13 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   tsl::Future<> Load(const RaidenId& remote_id,
                      absl::Span<const std::string> block_hashes,
                      absl::Span<const int32_t> device_block_ids,
-                     absl::Span<const RaidenBlockId> slices = {}) override;
+                     absl::Span<const RaidenBlockId> slices,
+                     BlockTracker* absl_nonnull load_tracker) override;
+
+  tsl::Future<> Save(absl::Span<const std::string> block_hashes,
+                     absl::Span<const int64_t> src_device_block_ids,
+                     absl::Span<const int32_t> dst_host_block_ids,
+                     BlockTracker* absl_nonnull save_tracker) override;
 
   // --- Remote write, destination side. Helpers the service uses while a
   // peer's offer lands here; see KVCacheStoreBackend for their contracts.
@@ -179,14 +185,13 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   // Offers `block_hashes` to `dst_raiden_id` and blocks until the ack (not
   // the bytes). `requested_deadline` is how long the destination may hold
-  // its landing blocks; `hold_window` is the call's deadline. If
-  // `save_tracker` is non-null, its transfer status is updated when the
-  // operation completes or settles.
+  // its landing blocks; `hold_window` is the call's deadline. The tracker's
+  // transfer status is updated when the operation completes or settles.
   absl::StatusOr<RemoteWriteAck> BeginWriteRemote(
       const RaidenId& dst_raiden_id, absl::Span<const std::string> block_hashes,
       absl::Span<const int32_t> src_host_block_ids,
       absl::Duration requested_deadline, absl::Duration hold_window,
-      BlockTracker* save_tracker = nullptr);
+      BlockTracker* absl_nonnull save_tracker);
 
   // Asks the destination what became of an accepted offer; recovery for a
   // source that lost its stream. `wait_ms > 0` asks it to hold the answer
@@ -239,14 +244,16 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   // a DRAM->HBM copy chained off it.
   tsl::Future<> LoadRemoteBlocks(const RaidenId& remote_id,
                                  absl::Span<const std::string> block_hashes,
-                                 absl::Span<const int32_t> device_block_ids);
+                                 absl::Span<const int32_t> device_block_ids,
+                                 BlockTracker* absl_nonnull load_tracker);
 
   // Copies blocks already resident in this node's host DRAM into
   // `device_block_ids`, as a single TransferBuffers.
   // `slices` is the caller's pre-resolved index entries.
   tsl::Future<> LoadLocalHostBlocks(absl::Span<const std::string> block_hashes,
                                     absl::Span<const int32_t> device_block_ids,
-                                    absl::Span<const RaidenBlockId> slices);
+                                    absl::Span<const RaidenBlockId> slices,
+                                    BlockTracker* absl_nonnull load_tracker);
 
   void SetMetadataEntry(absl::string_view hash, const RaidenBlockId& block)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);

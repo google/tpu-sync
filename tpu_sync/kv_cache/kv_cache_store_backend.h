@@ -21,6 +21,8 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -35,6 +37,7 @@ namespace kv_cache {
 // Forward-declared rather than included: kv_cache_store_server.h includes this
 // header, so including it back would be circular.
 class KVCacheStoreServer;
+class BlockTracker;
 
 enum class BlockStatus {
   INIT,
@@ -130,7 +133,27 @@ class KVCacheStoreBackend {
   virtual tsl::Future<> Load(const RaidenId& remote_id,
                              absl::Span<const std::string> block_hashes,
                              absl::Span<const int32_t> device_block_ids,
-                             absl::Span<const RaidenBlockId> slices = {}) = 0;
+                             absl::Span<const RaidenBlockId> slices,
+                             BlockTracker* absl_nonnull load_tracker) = 0;
+
+  virtual tsl::Future<> Load(const RaidenId& remote_id,
+                             absl::Span<const std::string> block_hashes,
+                             absl::Span<const int32_t> device_block_ids,
+                             BlockTracker* absl_nonnull load_tracker) {
+    return Load(remote_id, block_hashes, device_block_ids, /*slices=*/{},
+                load_tracker);
+  }
+
+  // Asynchronously saves KV cache blocks from device (HBM) to host DRAM.
+  // The tracker's transfer status is updated when the operation completes or
+  // settles.
+  virtual tsl::Future<> Save(absl::Span<const std::string> block_hashes,
+                             absl::Span<const int64_t> src_device_block_ids,
+                             absl::Span<const int32_t> dst_host_block_ids,
+                             BlockTracker* absl_nonnull save_tracker) {
+    CHECK(save_tracker != nullptr);
+    return tsl::Future<>(absl::UnimplementedError("Save not implemented."));
+  }
 
   // Inserts key-block mappings into the backend. Backend-internal: the store
   // facade does not expose this form -- KVCacheStore::Insert() maps to

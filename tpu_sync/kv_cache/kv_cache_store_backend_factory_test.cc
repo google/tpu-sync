@@ -22,6 +22,8 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/nullability.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
@@ -32,6 +34,7 @@
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
+#include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
@@ -51,7 +54,9 @@ class CustomTestBackend : public KVCacheStoreBackend {
   tsl::Future<> Load(const RaidenId& remote_id,
                      absl::Span<const std::string> block_hashes,
                      absl::Span<const int32_t> device_block_ids,
-                     absl::Span<const RaidenBlockId> slices = {}) override {
+                     absl::Span<const RaidenBlockId> slices,
+                     BlockTracker* absl_nonnull load_tracker) override {
+    CHECK(load_tracker != nullptr);
     return tsl::Future<>(absl::UnimplementedError("Load is not supported."));
   }
   std::pair<bool, BlockSliceList> Insert(absl::Span<const std::string>,

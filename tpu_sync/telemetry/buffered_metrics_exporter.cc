@@ -15,7 +15,6 @@
 #include "tpu_sync/telemetry/buffered_metrics_exporter.h"
 
 #include <algorithm>
-#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -34,7 +33,6 @@ namespace tpu_raiden::telemetry {
 namespace {
 
 constexpr absl::string_view kMetricPrefix = "tpu_raiden_";
-constexpr size_t kDefaultInlinedLabelCapacity = 4;
 
 std::string EscapeLabelValue(absl::string_view value) {
   std::string escaped;

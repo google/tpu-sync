@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TELEMETRY_METRICS_BACKEND_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TELEMETRY_METRICS_BACKEND_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -50,11 +51,19 @@ struct ExporterOptions {
   int port = kDefaultExporterPort;
   // Non-owning view of histogram bucket boundaries. Defaults to
   // kDefaultHistogramBuckets and is copied by the exporter during construction.
+  // Note: Shared-memory backends (e.g. BaseShmExporter and its derived
+  // exporters like PrometheusShmExporter) ignore custom bucket spans and use
+  // fixed compile-time bucket layouts (kDefaultHistogramBuckets).
   absl::Span<const double> custom_buckets = kDefaultHistogramBuckets;
-  // Worker local rank identifier in distributed multi-rank environments. If
-  // unset (std::nullopt) or empty, telemetry initialization falls back to the
-  // LOCAL_RANK environment variable.
+  // Worker local rank identifier in distributed multi-rank environments. Note:
+  // Fallback to the LOCAL_RANK environment variable is handled at the
+  // metrics_api initialization layer; backend constructors (such as
+  // BaseShmExporter) expect an already-resolved, valid rank string.
   std::optional<std::string> local_rank;
+  // Absolute path of the directory for POSIX shared-memory segments used for
+  // inter-worker telemetry aggregation via BaseShmExporter and its derived
+  // exporters. Trailing slashes are stripped; the root path "/" is prohibited.
+  std::optional<std::string> shm_dir;
 };
 
 // Structure defining centralized metadata for a Raiden metric.
@@ -159,6 +168,7 @@ inline constexpr absl::string_view kDirectionPull = "pull";
 inline constexpr absl::string_view kDirectionPullResponse = "pull_response";
 
 inline constexpr absl::string_view kErrorCode = "error_code";
+inline constexpr absl::string_view kLocalRank = "local_rank";
 }  // namespace metric_labels
 
 // Structure defining a metric key-value label pair.
@@ -171,6 +181,10 @@ struct MetricLabel {
 
 // Allocation-free label view span type definition
 using LabelSpan = absl::Span<const MetricLabel>;
+
+// Standard inline capacity for label containers across telemetry pipelines.
+// Guarantees zero heap allocation for label sets up to this size.
+inline constexpr size_t kDefaultInlinedLabelCapacity = 8;
 
 // Abstract Dual-Backend Interface
 class MetricsBackend {

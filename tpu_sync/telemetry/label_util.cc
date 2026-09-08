@@ -30,7 +30,6 @@
 namespace tpu_raiden::telemetry {
 namespace {
 
-constexpr size_t kDefaultInlinedLabelCapacity = 8;
 constexpr size_t kDefaultPrometheusStackBufferSize = 256;
 
 // Lightweight buffer writer that bounds-checks appends into a char span.

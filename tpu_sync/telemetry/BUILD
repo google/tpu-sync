@@ -161,3 +161,32 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "base_shm_exporter",
+    srcs = ["base_shm_exporter.cc"],
+    hdrs = ["base_shm_exporter.h"],
+    deps = [
+        ":metrics_backend",
+        "//tpu_sync/telemetry/shm:shm_collector",
+        "//tpu_sync/telemetry/shm:shm_writer",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "base_shm_exporter_test",
+    srcs = ["base_shm_exporter_test.cc"],
+    deps = [
+        ":base_shm_exporter",
+        ":metrics_backend",
+        "//tpu_sync/telemetry/shm:shm_collector",
+        "//tpu_sync/telemetry/shm:shm_layout",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

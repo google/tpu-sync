@@ -282,6 +282,7 @@ PY
   BAZEL_TARGETS+=(
     "//tpu_sync/frameworks/torch:_tpu_raiden_host"
     "//tpu_sync/frameworks/torch:_tpu_raiden_torch"
+    "//tpu_sync/frameworks/torch:_torch_raw_transfer"
   )
 else
   DEFINE_FLAGS+=" --define with_torch=false"
@@ -344,39 +345,34 @@ if [ "$BUILD_JAX" = true ]; then
   cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/jax/_tpu_raiden_jax.so" "${WORKSPACE_DIR}/tpu_sync/frameworks/jax/"
 fi
 
-if [ "$BUILD_TORCH" = true ]; then
-  echo "Copying Torch artifacts..."
-  HOST_SO="${WORKSPACE_DIR}/tpu_sync/frameworks/torch/_tpu_raiden_host.so"
-  cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/torch/_tpu_raiden_host.so" "${HOST_SO}"
-
-  TORCH_SO="${WORKSPACE_DIR}/tpu_sync/frameworks/torch/_tpu_raiden_torch.so"
-  cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/torch/_tpu_raiden_torch.so" "${TORCH_SO}"
-  chmod u+w "${TORCH_SO}"
-  # The torch extension statically links its own XLA and references a few
-  # torch_tpu symbols (MaterializeAndReturn, AwaitBuffer). Add a NEEDED
-  # dependency on libpywrap so those resolve in *local* scope at import time
-  # (the loader imports the extension RTLD_LOCAL, see api/torch/
-  # kv_cache_manager.py). This keeps raiden's XLA private and avoids the
-  # duplicate AllocatorFactory registration that a global libpywrap preload
-  # would trigger. torch_tpu must already be imported (libpywrap loaded) when
-  # the extension imports, so no RUNPATH is required.
-  # torch_tpu ships libpywrap as a per-torch-version glue whose SONAME embeds
-  # the torch release it was built for (glue_<v>/libpywrap_<v>_common.so), so
-  # the NEEDED entry must name the glue matching the torch this build compiled
-  # against — the loader satisfies it from the copy torch_tpu has already
-  # loaded. torch_tpu builds that predate the per-version glue layout export
-  # the unversioned name instead; RAIDEN_PYWRAP_SONAME overrides for those.
-  TORCH_GLUE_SUFFIX=$(python3 -c 'import torch, re; v = re.match(r"(\d+)\.(\d+)\.(\d+)", torch.__version__); print(f"{v.group(1)}_{v.group(2)}_{v.group(3)}")')
-  PYWRAP_SONAME="${RAIDEN_PYWRAP_SONAME:-libpywrap_${TORCH_GLUE_SUFFIX}_common.so}"
+if [ "${BUILD_TORCH}" = true ]; then
+  echo "=== Copying torch extension modules into source tree ==="
+  # Python tests and source-checkout consumers import the extensions from the
+  # package directory; Bazel emits them under bazel-bin/.
+  for so in _tpu_raiden_host.so _tpu_raiden_torch.so _torch_raw_transfer.so; do
+    src="${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/torch/${so}"
+    if [ -e "${src}" ]; then
+      cp -f "${src}" "${WORKSPACE_DIR}/tpu_sync/frameworks/torch/${so}"
+      chmod u+w "${WORKSPACE_DIR}/tpu_sync/frameworks/torch/${so}"
+    fi
+  done
+  # The torch-linked extensions are built with --allow-shlib-undefined and no
+  # NEEDED entries; the wheel packaging adds the per-version glue dependency.
+  # For source-tree runs, add a NEEDED on the unversioned common library so
+  # dlopen resolves torch_tpu/torch symbols through the dependency chain that
+  # tpu_sync.api.torch.torch_tpu_common_loader preloads (RTLD_LOCAL; a global
+  # load would collide with the extension's statically linked gRPC/XLA).
   if command -v patchelf > /dev/null; then
-    patchelf --add-needed "${PYWRAP_SONAME}" "${TORCH_SO}"
-    echo "patchelf: added NEEDED ${PYWRAP_SONAME} to torch extension"
+    for so in _tpu_raiden_torch.so _torch_raw_transfer.so; do
+      dst="${WORKSPACE_DIR}/tpu_sync/frameworks/torch/${so}"
+      if [ -e "${dst}" ] && \
+         ! readelf -d "${dst}" | grep -q "libpywrap_torch_tpu_common.so"; then
+        patchelf --add-needed libpywrap_torch_tpu_common.so "${dst}"
+      fi
+    done
   else
-    echo "ERROR: patchelf not found! The PyTorch extension requires patchelf" \
-         "to inject NEEDED libpywrap_torch_tpu_common.so so symbols resolve in local" \
-         "scope without duplicate XLA allocator crashes. Please install patchelf" \
-         "(e.g., 'sudo apt-get install -y patchelf') and rebuild." >&2
-    exit 1
+    echo "WARNING: patchelf not found; in-tree torch extensions will not" \
+         "import outside bazel (missing libpywrap NEEDED)." >&2
   fi
 fi
 

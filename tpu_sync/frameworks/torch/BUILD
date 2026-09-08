@@ -228,6 +228,7 @@ nanobind_extension(
         ":kv_cache_manager_torch",
         ":pool_layout_nanobind",
         ":torch_nanobind_utils",
+        ":torch_raw_transfer_bindings",
         ":weight_synchronizer_torch",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
@@ -293,6 +294,7 @@ cc_library(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:utils",
         "//tpu_sync/core:xla_raw_transfer_headers",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
@@ -300,6 +302,28 @@ cc_library(
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch/c10/core:base_headers",
         "@torch_tpu//shims/torch/torch/headeronly:torch_headeronly",
+    ],
+    alwayslink = 1,
+)
+
+cc_library(
+    name = "torch_raw_transfer_bindings",
+    srcs = ["torch_raw_transfer_bindings.cc"],
+    hdrs = ["torch_raw_transfer_bindings.h"],
+    copts = [
+        "-std=c++20",
+        "-fexceptions",
+        "-march=x86-64-v2",
+    ],
+    features = ["-use_header_modules"],
+    tags = ["nobuilder"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":torch_nanobind_utils",
+        ":torch_raw_transfer_torch",
+        "@com_google_absl//absl/status",
+        "@nanobind",
+        "@torch_tpu//shims/torch:aten_headers",
     ],
     alwayslink = 1,
 )
@@ -312,15 +336,7 @@ nanobind_extension(
     tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
-        ":torch_nanobind_utils",
-        ":torch_raw_transfer_torch",
-        "//tpu_sync/core:host_memory_allocator",
-        "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/core:utils",
-        "//tpu_sync/core:xla_raw_transfer_headers",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@torch_tpu//shims/torch:aten_headers",
+        ":torch_raw_transfer_bindings",
     ],
 )
 
@@ -344,6 +360,7 @@ cc_library(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:utils",
         "//tpu_sync/core:xla_raw_transfer_headers",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
@@ -639,6 +656,7 @@ py_test(
     deps = [
         ":_torch_raw_transfer",
         "//pyglib/contrib/g3_multiprocessing",
+        "@com_google_absl_py//absl/flags",
         "@com_google_absl_py//absl/testing:absltest",
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",
@@ -663,6 +681,7 @@ py_test(
     deps = [
         ":_torch_raw_transfer",
         "//pyglib/contrib/g3_multiprocessing",
+        "@com_google_absl_py//absl/flags",
         "@com_google_absl_py//absl/testing:absltest",
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",
@@ -695,6 +714,8 @@ py_test(
     ],
     deps = [
         ":_torch_raw_transfer",
+        ":_tpu_raiden_torch",
+        "//tpu_sync/api/torch:raw_transfer",
         "@com_google_absl_py//absl/testing:absltest",
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",
@@ -718,6 +739,8 @@ py_test(
     ],
     deps = [
         ":_torch_raw_transfer",
+        ":_tpu_raiden_torch",
+        "//tpu_sync/api/torch:raw_transfer",
         "@com_google_absl_py//absl/testing:absltest",
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",

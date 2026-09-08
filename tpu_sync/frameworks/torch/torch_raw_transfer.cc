@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,7 @@
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
+#include "absl/log/log.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -155,11 +157,48 @@ void ValidateCpuTensor(const at::Tensor& tensor, absl::string_view role) {
   if (!tensor.is_contiguous()) {
     throw std::invalid_argument(absl::StrCat(role, " must be contiguous"));
   }
+  // Raw DMA against pageable host memory silently degrades to staged copies
+  // inside libtpu, so surface unpinned buffers instead of quietly losing an
+  // order of magnitude of bandwidth. is_pinned() consults the active
+  // accelerator's pinned-memory hooks; a backend that cannot answer counts as
+  // unknown and stays quiet.
+  bool known_unpinned = false;
+  try {
+    known_unpinned = !tensor.is_pinned();
+  } catch (const std::exception&) {
+    // No accelerator hooks registered (e.g. torch_tpu not loaded).
+  }
+  if (known_unpinned) {
+    static const bool require_pinned = [] {
+      const char* v = std::getenv("TPU_RAIDEN_RAW_REQUIRE_PINNED_HOST");
+      return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (require_pinned) {
+      throw std::invalid_argument(absl::StrCat(
+          role,
+          " tensor is not pinned host memory and "
+          "TPU_RAIDEN_RAW_REQUIRE_PINNED_HOST is set; allocate it with "
+          "pin_memory=True or use RawHostBuffer."));
+    }
+    LOG_FIRST_N(WARNING, 4)
+        << role
+        << " tensor is not pinned host memory; the raw copy will fall back "
+           "to staged unpinned transfers. Allocate it with pin_memory=True "
+           "or use RawHostBuffer (set TPU_RAIDEN_RAW_REQUIRE_PINNED_HOST=1 "
+           "to make this an error).";
+  }
 }
 
+// The raw PJRT copy API does not chain on buffer readiness, so wait for the
+// producing computation to commit the buffer before issuing DMA against it.
 void AwaitReady(xla::PjRtBuffer* buffer, absl::string_view role) {
-  (void)buffer;
-  (void)role;
+  if (buffer == nullptr) {
+    return;
+  }
+  absl::Status status = buffer->GetReadyFuture().Await();
+  if (!status.ok()) {
+    ThrowStatus(absl::StrCat(role, " buffer failed to become ready"), status);
+  }
 }
 
 // Raw transfer addresses the device buffer as a flat array of equal-size
@@ -293,7 +332,8 @@ PjRtCopyFuture TransferD2HBatchAsync(
     const TensorList& src_arrs, const TensorList& dst_arrs,
     const std::vector<int64_t>& src_offsets_major_dim,
     const std::vector<int64_t>& dst_offsets_major_dim,
-    const std::vector<int64_t>& copy_sizes_major_dim) {
+    const std::vector<int64_t>& copy_sizes_major_dim,
+    bool unsafe_skip_buffer_lock) {
   if (src_arrs.size() != dst_arrs.size()) {
     throw std::invalid_argument("Lengths of src_arrs and dst_arrs must match");
   }
@@ -303,7 +343,8 @@ PjRtCopyFuture TransferD2HBatchAsync(
   futures.reserve(src_arrs.size());
   for (size_t i = 0; i < src_arrs.size(); ++i) {
     ValidateCpuTensor(dst_arrs[i], "Destination");
-    auto unpacked = UnpackTorchTensor(src_arrs[i]);
+    auto unpacked = UnpackTorchTensor(src_arrs[i], unsafe_skip_buffer_lock);
+    AwaitReady(unpacked.buffer.buffer, "Source");
     const RaidenBufferHandle& src_buffer = unpacked.buffer;
 
     auto torch_holds = std::make_shared<std::vector<at::Tensor>>();
@@ -329,7 +370,8 @@ PjRtCopyFuture TransferH2DBatchAsync(
     const TensorList& src_arrs, const TensorList& dst_arrs,
     const std::vector<int64_t>& src_offsets_major_dim,
     const std::vector<int64_t>& dst_offsets_major_dim,
-    const std::vector<int64_t>& copy_sizes_major_dim) {
+    const std::vector<int64_t>& copy_sizes_major_dim,
+    bool unsafe_skip_buffer_lock) {
   if (src_arrs.size() != dst_arrs.size()) {
     throw std::invalid_argument("Lengths of src_arrs and dst_arrs must match");
   }
@@ -339,7 +381,10 @@ PjRtCopyFuture TransferH2DBatchAsync(
   futures.reserve(src_arrs.size());
   for (size_t i = 0; i < src_arrs.size(); ++i) {
     ValidateCpuTensor(src_arrs[i], "Source");
-    auto unpacked = UnpackTorchTensor(dst_arrs[i]);
+    auto unpacked = UnpackTorchTensor(dst_arrs[i], unsafe_skip_buffer_lock);
+    // The destination buffer's ready future signals that it is safe to write
+    // into (allocation defined, no pending producer).
+    AwaitReady(unpacked.buffer.buffer, "Destination");
     const RaidenBufferHandle& dst_buffer = unpacked.buffer;
 
     auto torch_holds = std::make_shared<std::vector<at::Tensor>>();
@@ -365,18 +410,22 @@ PjRtCopyFuture TransferD2HAsync(
     const at::Tensor& src_arr, const at::Tensor& dst_arr,
     const std::vector<int64_t>& src_offsets_major_dim,
     const std::vector<int64_t>& dst_offsets_major_dim,
-    const std::vector<int64_t>& copy_sizes_major_dim) {
+    const std::vector<int64_t>& copy_sizes_major_dim,
+    bool unsafe_skip_buffer_lock) {
   return TransferD2HBatchAsync({src_arr}, {dst_arr}, src_offsets_major_dim,
-                               dst_offsets_major_dim, copy_sizes_major_dim);
+                               dst_offsets_major_dim, copy_sizes_major_dim,
+                               unsafe_skip_buffer_lock);
 }
 
 PjRtCopyFuture TransferH2DAsync(
     const at::Tensor& src_arr, const at::Tensor& dst_arr,
     const std::vector<int64_t>& src_offsets_major_dim,
     const std::vector<int64_t>& dst_offsets_major_dim,
-    const std::vector<int64_t>& copy_sizes_major_dim) {
+    const std::vector<int64_t>& copy_sizes_major_dim,
+    bool unsafe_skip_buffer_lock) {
   return TransferH2DBatchAsync({src_arr}, {dst_arr}, src_offsets_major_dim,
-                               dst_offsets_major_dim, copy_sizes_major_dim);
+                               dst_offsets_major_dim, copy_sizes_major_dim,
+                               unsafe_skip_buffer_lock);
 }
 
 PreparedTorchRawTransfer::PreparedTorchRawTransfer(
@@ -387,6 +436,7 @@ PreparedTorchRawTransfer::PreparedTorchRawTransfer(
     throw std::invalid_argument("host_buffer must not be None");
   }
   auto unpacked = UnpackTorchTensor(tpu_tensor, unsafe_skip_buffer_lock);
+  AwaitReady(unpacked.buffer.buffer, "TPU tensor");
   buffer_ = std::move(unpacked.buffer);
   buffer_ref_ = std::move(unpacked.ref);  // keep the materialized buffer alive
   host_buffer_->EnsureBoundToDevice(buffer_.device);

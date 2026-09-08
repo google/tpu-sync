@@ -30,9 +30,11 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "xla/future.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/transport/block_transport.h"
@@ -261,6 +263,10 @@ absl::StatusOr<std::vector<int>> RaidenManagerBase::H2hWriteDirect(
     const std::vector<std::string>& peers,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx) {
+  RAIDEN_TRACE_FN("RaidenBase::H2hWriteDirect", [&]() {
+    return absl::StrCat("blocks=", src_block_ids.size(),
+                        " peers=", peers.size(), " uuid=", uuid);
+  });
   auto* transport = InitTransportServer();
   if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
@@ -275,6 +281,10 @@ void RaidenManagerBase::H2hWriteDirectAsync(
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx,
     std::function<void(absl::StatusOr<std::vector<int>>)> on_complete) {
+  RAIDEN_TRACE_FN("RaidenBase::H2hWriteDirectAsync", [&]() {
+    return absl::StrCat("blocks=", src_block_ids.size(),
+                        " peers=", peers.size(), " uuid=", uuid);
+  });
   auto* transport = InitTransportServer();
   if (!transport) {
     on_complete(
@@ -289,6 +299,10 @@ void RaidenManagerBase::H2hWriteDirectAsync(
 absl::StatusOr<std::vector<int>> RaidenManagerBase::H2hReadDirect(
     const std::vector<std::string>& peers,
     const std::vector<int>& src_block_ids) {
+  RAIDEN_TRACE_FN("RaidenBase::H2hReadDirect", [&]() {
+    return absl::StrCat("blocks=", src_block_ids.size(),
+                        " peers=", peers.size());
+  });
   auto* transport = InitTransportServer();
   if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
@@ -300,6 +314,10 @@ absl::Status RaidenManagerBase::PushWeightsChunk(
     absl::string_view peer, size_t dst_shard_idx, size_t dst_offset_bytes,
     const uint8_t* data_ptr, size_t size_bytes, uint64_t uuid,
     size_t layer_idx) {
+  RAIDEN_TRACE_FN("RaidenBase::PushWeightsChunk", [&]() {
+    return absl::StrCat("peer=", peer, " layer=", layer_idx,
+                        " shard=", dst_shard_idx, " bytes=", size_bytes);
+  });
   auto* transport = InitTransportServer();
   if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
@@ -311,6 +329,9 @@ absl::Status RaidenManagerBase::PushWeightsChunk(
 absl::Status RaidenManagerBase::PushWeightsChunks(
     const std::vector<transport::BufferPushTask>& tasks, int parallelism,
     uint64_t uuid) {
+  RAIDEN_TRACE_FN("RaidenBase::PushWeightsChunks", [&]() {
+    return absl::StrCat("tasks=", tasks.size(), " uuid=", uuid);
+  });
   auto* transport = InitTransportServer();
   if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");

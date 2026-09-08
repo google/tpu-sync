@@ -50,6 +50,7 @@
 #include "grpcpp/security/credentials.h"
 #include "grpcpp/support/status.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/buffer.h"
 #include "tpu_sync/core/controller/controller_server.h"
 #include "tpu_sync/core/controller/worker_registry.h"
@@ -544,6 +545,10 @@ tsl::Future<> RaidenController::TransferBuffers(
     absl::Span<const Buffer> dst_buffers,
     absl::Span<const Buffer> staging_host_buffers,
     absl::Span<const int64_t> copy_sizes) {
+  RAIDEN_TRACE_FN("RaidenCtrl::TransferBuffers", [&]() {
+    return absl::StrCat("src_buffers=", src_buffers.size(),
+                        " dst_buffers=", dst_buffers.size());
+  });
   auto request_or = BuildTransferBuffersRequest(
       src_buffers, dst_buffers, staging_host_buffers, copy_sizes);
   if (!request_or.ok()) {
@@ -569,6 +574,10 @@ tsl::Future<> RaidenController::TransferBuffers(
     absl::Span<const Buffer> src_buffers, absl::Span<const Buffer> dst_buffers,
     absl::Span<const Buffer> staging_host_buffers,
     absl::Span<const int64_t> copy_sizes) {
+  RAIDEN_TRACE_FN("RaidenCtrl::TransferBuffers", [&]() {
+    return absl::StrCat("src_buffers=", src_buffers.size(),
+                        " dst_buffers=", dst_buffers.size());
+  });
   if (src_buffers.empty() || src_buffers.size() != dst_buffers.size()) {
     return tsl::Future<>(absl::InvalidArgumentError(
         "Source and destination buffers must have the same non-zero length"));
@@ -798,6 +807,7 @@ void RaidenController::SetReadRemoteHooks(
 // without capturing `this` -- controller teardown mid-read must not be a
 // use-after-free.
 struct RemoteReadState {
+  std::string src_controller_address;
   std::shared_ptr<::tpu_sync::proto::RaidenControllerService::Stub> stub;
   std::shared_ptr<tsl::Promise<>> promise;
   std::vector<int32_t> dst_host_block_ids;
@@ -823,6 +833,12 @@ tsl::Future<> RaidenController::ReadRemote(
     const std::vector<int32_t>& dst_host_block_ids,
     const std::vector<std::string>& block_hashes,
     const std::vector<int32_t>& dst_device_block_ids) {
+  const bool to_hbm = !dst_device_block_ids.empty();
+  RAIDEN_TRACE_FN("RaidenCtrl::ReadRemote", [&]() {
+    return absl::StrCat("src=", src_controller_address,
+                        " blocks=", src_host_block_ids.size(),
+                        " to_hbm=", to_hbm);
+  });
   CheckTimingTripleOnce();
 
   if (src_host_block_ids.size() != dst_host_block_ids.size()) {
@@ -843,7 +859,6 @@ tsl::Future<> RaidenController::ReadRemote(
   }
   // Reject a wrong-sized device list BEFORE acquiring, so a caller error never
   // pins anything at the source.
-  const bool to_hbm = !dst_device_block_ids.empty();
   if (to_hbm && dst_device_block_ids.size() != dst_host_block_ids.size()) {
     return tsl::Future<>(absl::InvalidArgumentError(
         absl::StrCat("dst_device_block_ids size ", dst_device_block_ids.size(),
@@ -896,6 +911,7 @@ tsl::Future<> RaidenController::ReadRemote(
 
   auto [promise, future] = tsl::MakePromise<>();
   auto state = std::make_shared<RemoteReadState>();
+  state->src_controller_address = controller_address;
   state->stub = stub;
   state->promise = std::move(promise).ToShared();
   state->dst_host_block_ids = dst_host_block_ids;
@@ -1012,6 +1028,12 @@ void RaidenController::PullAndRelease(
     const std::vector<int32_t>& src_host_block_ids,
     const std::vector<RaidenWorkerEndpoints>& src_groups,
     const std::shared_ptr<RemoteReadState>& state, bool to_hbm) {
+  const std::string& src_controller_address =
+      state ? state->src_controller_address : "";
+  RAIDEN_TRACE_FN("RaidenCtrl::PullAndRelease", [&]() {
+    return absl::StrCat("src=", src_controller_address,
+                        " blocks=", src_host_block_ids.size());
+  });
   // Pull direction: the peer's endpoint groups ride on the SRC buffers, and
   // TransferBuffers pairs each local worker with the source group sharing its
   // node_id (hard failure if unmatched -- never a broadcast).

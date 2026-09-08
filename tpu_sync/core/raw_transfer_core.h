@@ -26,6 +26,7 @@
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"  // IWYU pragma: keep
 #include "absl/types/span.h"
 #include "xla/future.h"
 #include "xla/layout.h"
@@ -37,6 +38,7 @@
 #include "xla/shape_util.h"
 #include "xla/tsl/concurrency/async_value.h"
 #include "xla/tsl/concurrency/ref_count.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/xla_compat.h"
 
 namespace raiden {
@@ -522,6 +524,7 @@ struct PjRtCopyFuture {
   }
 
   absl::Status Await() {
+    RAIDEN_TRACE("RawTransfer::CopyFutureAwait");
     absl::Status status = absl::OkStatus();
     for (const auto& b : event_bundles) {
       if (!b || !b->c_api) continue;
@@ -614,6 +617,8 @@ struct H2dCopy {
 // xla::Future path. `copies` offsets are already in bytes.
 inline absl::StatusOr<PjRtCopyFuture> IssueD2hShard(
     const BufferHoldAndAlias& hold, const std::vector<D2hCopy>& copies) {
+  RAIDEN_TRACE_FN("RawTransfer::IssueD2hShard",
+                  [&]() { return absl::StrCat("copies=", copies.size()); });
   BufferHolders holds{
       BufferHolder{hold.c_hold, hold.common_hold, nullptr, nullptr}};
   if (!hold.is_common_buffer && hold.c_hold == nullptr) {
@@ -642,6 +647,8 @@ inline absl::StatusOr<PjRtCopyFuture> IssueD2hShard(
 
 inline absl::StatusOr<PjRtCopyFuture> IssueH2dShard(
     const BufferHoldAndAlias& hold, const std::vector<H2dCopy>& copies) {
+  RAIDEN_TRACE_FN("RawTransfer::IssueH2dShard",
+                  [&]() { return absl::StrCat("copies=", copies.size()); });
   BufferHolders holds{
       BufferHolder{hold.c_hold, hold.common_hold, nullptr, nullptr}};
   if (!hold.is_common_buffer && hold.c_hold == nullptr) {

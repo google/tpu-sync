@@ -22,6 +22,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"  // IWYU pragma: keep
 #include "absl/types/span.h"
 #include "xla/future.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
@@ -30,6 +31,7 @@
 #include "xla/shape.h"
 #include "xla/tsl/platform/logging.h"
 #include "xla/tsl/platform/statusor.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 
 namespace raiden {
@@ -69,6 +71,10 @@ inline absl::StatusOr<PjRtCopyFuture> transfer_d2h_core(
       break;
     }
   }
+
+  RAIDEN_TRACE_FN("RawTransfer::D2H", [&]() {
+    return absl::StrCat("num_shards=", num_shards, " partial=", is_partial);
+  });
 
   if (is_partial) {
     if (shape.dimensions_size() < 3) {
@@ -177,6 +183,10 @@ inline absl::StatusOr<PjRtCopyFuture> transfer_h2d_core(
       break;
     }
   }
+
+  RAIDEN_TRACE_FN("RawTransfer::H2D", [&]() {
+    return absl::StrCat("num_shards=", num_shards, " partial=", is_partial);
+  });
 
   if (is_partial) {
     if (shape.dimensions_size() < 3) {

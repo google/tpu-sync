@@ -23,6 +23,7 @@
 #include "grpcpp/client_context.h"
 #include "grpcpp/support/status.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/proto/worker_service.grpc.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 
@@ -79,6 +80,7 @@ WorkerServiceClient::DeleteBuffers(
 tsl::Future<::tpu_sync::proto::TransferProgramResponse>
 WorkerServiceClient::SubmitTransferProgram(
     const ::tpu_sync::proto::TransferProgramRequest& request) {
+  RAIDEN_TRACE("WorkerClient::SubmitTransferProgram");
   auto [promise, future] =
       tsl::MakePromise<::tpu_sync::proto::TransferProgramResponse>();
   auto context = std::make_shared<grpc::ClientContext>();
@@ -101,6 +103,7 @@ WorkerServiceClient::SubmitTransferProgram(
 
 tsl::Future<> WorkerServiceClient::TransferBuffers(
     const ::tpu_sync::proto::TransferBuffersRequest& request) {
+  RAIDEN_TRACE("WorkerClient::TransferBuffers");
   auto [promise, future] = tsl::MakePromise<>();
   auto context = std::make_shared<grpc::ClientContext>();
   auto response =

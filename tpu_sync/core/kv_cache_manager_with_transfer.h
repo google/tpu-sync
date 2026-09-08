@@ -41,6 +41,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -71,6 +72,7 @@ class TransferFuture {
   }
 
   void Await() {
+    RAIDEN_TRACE("KVTransfer::TransferFutureAwait");
     for (auto& future : futures_) {
       if (future.IsValid()) {
         absl::Status status = future.Await();

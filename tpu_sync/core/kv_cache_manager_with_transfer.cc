@@ -67,6 +67,7 @@
 #include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/tsl/platform/errors.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/metrics_collector.h"
 #include "tpu_sync/core/pool_reshard_send_slots.h"
@@ -692,6 +693,10 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
 int64_t KVCacheManagerWithTransfer::NotifyForRead(
     const std::string& req_id, uint64_t uuid,
     const std::vector<int64_t>& block_ids) {
+  RAIDEN_TRACE_FN("KVTransfer::NotifyForRead", [&]() {
+    return absl::StrCat("req=", req_id, " uuid=", uuid,
+                        " blocks=", block_ids.size());
+  });
   const auto register_start = std::chrono::steady_clock::now();
   if (block_ids.empty()) {
     return 0;
@@ -1303,6 +1308,10 @@ absl::Status KVCacheManagerWithTransfer::ValidatePoolReshardReceiverCoverage(
 absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
     const ::tpu_sync::rpc::StartTransferRequest& plan,
     absl::Span<const int64_t> src_block_ids, int parallelism) {
+  RAIDEN_TRACE_FN("KVTransfer::PoolReshardPush", [&]() {
+    return absl::StrCat("uuid=", plan.uuid(),
+                        " src_blocks=", src_block_ids.size());
+  });
   TF_RETURN_IF_ERROR(
       ValidatePoolReshardPlan(plan, src_block_ids, /*is_sender=*/true));
   // Device-only executor: without device attachments there are no bytes this
@@ -1439,6 +1448,9 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
 
 void KVCacheManagerWithTransfer::StartPoolReshardPush(uint64_t uuid,
                                                       size_t pool_idx) {
+  RAIDEN_TRACE_FN("KVTransfer::StartPoolReshardPush", [&]() {
+    return absl::StrCat("uuid=", uuid, " pool=", pool_idx);
+  });
   std::shared_ptr<PoolReshardSendEntry> state;
   {
     absl::MutexLock lock(mu_);
@@ -1507,6 +1519,9 @@ void KVCacheManagerWithTransfer::StartPoolReshardPush(uint64_t uuid,
 
 void KVCacheManagerWithTransfer::FinishPoolReshardSend(
     uint64_t uuid, const absl::Status& status) {
+  RAIDEN_TRACE_FN("KVTransfer::FinishPoolReshardSend", [&]() {
+    return absl::StrCat("uuid=", uuid, " status=", status.code());
+  });
   bool finished = false;
   {
     absl::MutexLock lock(mu_);
@@ -1550,6 +1565,10 @@ void KVCacheManagerWithTransfer::FinishPoolReshardSend(
 absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
     const ::tpu_sync::rpc::StartTransferRequest& plan,
     absl::Span<const int64_t> chip_block_ids) {
+  RAIDEN_TRACE_FN("KVTransfer::PoolReshardRegisterRecv", [&]() {
+    return absl::StrCat("uuid=", plan.uuid(),
+                        " chip_blocks=", chip_block_ids.size());
+  });
   TF_RETURN_IF_ERROR(
       ValidatePoolReshardPlan(plan, chip_block_ids, /*is_sender=*/false));
   // Device-only executor (see PoolReshardPush): arming a receive on a
@@ -1745,6 +1764,10 @@ void KVCacheManagerWithTransfer::StartRead(
     const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids, int parallelism,
     std::optional<std::vector<int64_t>> local_host_block_ids) {
+  RAIDEN_TRACE_FN("KVTransfer::StartRead", [&]() {
+    return absl::StrCat("req=", req_id, " uuid=", uuid,
+                        " blocks=", remote_block_ids.size());
+  });
   std::string target_ep;
   if (!remote_endpoints.empty()) {
     target_ep = remote_endpoints[0];
@@ -1759,6 +1782,10 @@ void KVCacheManagerWithTransfer::StartRead(
     const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids, int parallelism,
     std::optional<std::vector<int64_t>> local_host_block_ids) {
+  RAIDEN_TRACE_FN("KVTransfer::StartRead", [&]() {
+    return absl::StrCat("req=", req_id, " uuid=", uuid,
+                        " blocks=", remote_block_ids.size());
+  });
   if (remote_descriptors.empty()) {
     return;
   }
@@ -1943,6 +1970,7 @@ void KVCacheManagerWithTransfer::StartRead(
 std::tuple<std::vector<std::string>, std::vector<std::string>,
            std::vector<std::string>>
 KVCacheManagerWithTransfer::CompleteReadRaw() {
+  RAIDEN_TRACE("KVTransfer::CompleteReadRaw");
   std::vector<std::string> done_sending;
   std::vector<std::string> done_recving;
   std::vector<std::string> failed_recving;
@@ -2034,6 +2062,9 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
 StageResult KVCacheManagerWithTransfer::IssueH2D(
     int64_t slot_idx, int64_t num_blocks,
     const std::vector<int64_t>& local_block_ids) {
+  RAIDEN_TRACE_FN("KVTransfer::IssueH2D", [&]() {
+    return absl::StrCat("slot=", slot_idx, " blocks=", num_blocks);
+  });
   if (num_layers() == 0) {
     throw std::runtime_error("KV cache manager is not registered");
   }
@@ -2500,6 +2531,9 @@ void KVCacheManagerWithTransfer::HandleControlConnection(int fd) {
 
 void KVCacheManagerWithTransfer::ProcessPullStream(
     int fd, const ControlRequestHeader& req) {
+  RAIDEN_TRACE_FN("KVTransfer::ProcessPullStream", [&]() {
+    return absl::StrCat("uuid=", req.uuid, " blocks=", req.num_blocks);
+  });
   // The whole request is read before anything can reject it, so a
   // rejection leaves no unread bytes behind on the connection.
   std::vector<int64_t> src_block_ids = ReadBlockIds(fd, req.num_blocks);
@@ -2698,6 +2732,9 @@ void KVCacheManagerWithTransfer::StartPushInternal(
     uint64_t uuid, const std::vector<std::string>& remote_data_endpoints,
     const std::vector<int64_t>& src_block_ids,
     const std::vector<int64_t>& dst_block_ids) {
+  RAIDEN_TRACE_FN("KVTransfer::StartPushInternal", [&]() {
+    return absl::StrCat("uuid=", uuid, " blocks=", src_block_ids.size());
+  });
   // Stage the producer's device KV into a host slot (slot.block_ids) and send
   // those host blocks to the consumer, keeping host offsets within the staging
   // pool. Writing D2H straight to host[src_block_id] overflows the host buffer
@@ -2763,6 +2800,8 @@ void KVCacheManagerWithTransfer::StartPushInternal(
 }
 
 void KVCacheManagerWithTransfer::SendNextLayer(uint64_t uuid, size_t l) {
+  RAIDEN_TRACE_FN("KVTransfer::SendNextLayer",
+                  [&]() { return absl::StrCat("uuid=", uuid, " layer=", l); });
   std::shared_ptr<SendEntry> entry;
   {
     absl::MutexLock lock(mu_);
@@ -2857,6 +2896,7 @@ void KVCacheManagerWithTransfer::SendNextLayer(uint64_t uuid, size_t l) {
 }
 
 absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
+  RAIDEN_TRACE("KVTransfer::WaitForPendingWork");
   LOG(INFO) << "Waiting for pending transfer work to complete...";
   const absl::Time start = absl::Now();
   while (true) {
@@ -3012,6 +3052,9 @@ std::optional<int> KVCacheManagerWithTransfer::GetLocalTpuNumaNode(
 
 absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
     const std::vector<int>& block_ids, uint64_t uuid) {
+  RAIDEN_TRACE_FN("KVTransfer::OnBlocksReceived", [&]() {
+    return absl::StrCat("blocks=", block_ids.size(), " uuid=", uuid);
+  });
   VLOG(1) << "KVCacheManagerWithTransfer::OnBlocksReceived called. uuid: "
           << uuid << ", received blocks count: " << block_ids.size();
 
@@ -3100,6 +3143,9 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
 
 absl::Status KVCacheManagerWithTransfer::OnPoolReceived(size_t pool_idx,
                                                         uint64_t uuid) {
+  RAIDEN_TRACE_FN("KVTransfer::OnPoolReceived", [&]() {
+    return absl::StrCat("pool=", pool_idx, " uuid=", uuid);
+  });
   {
     absl::MutexLock lock(mu_);
     auto it = active_recv_entries_.find(uuid);
@@ -3133,6 +3179,8 @@ absl::Status KVCacheManagerWithTransfer::OnPoolReceived(size_t pool_idx,
 }
 
 void KVCacheManagerWithTransfer::LaunchEligiblePoolH2ds(uint64_t uuid) {
+  RAIDEN_TRACE_FN("KVTransfer::LaunchEligiblePoolH2ds",
+                  [&]() { return absl::StrCat("uuid=", uuid); });
   std::vector<std::pair<size_t, std::vector<int64_t>>> to_launch;
   {
     absl::MutexLock lock(mu_);
@@ -3189,6 +3237,10 @@ void KVCacheManagerWithTransfer::LaunchEligiblePoolH2ds(uint64_t uuid) {
 
 void KVCacheManagerWithTransfer::FinishPoolReshardRecvPool(
     uint64_t uuid, size_t pool_idx, const absl::Status& status) {
+  RAIDEN_TRACE_FN("KVTransfer::FinishPoolReshardRecvPool", [&]() {
+    return absl::StrCat("uuid=", uuid, " pool=", pool_idx,
+                        " status=", status.code());
+  });
   bool finished = false;
   {
     absl::MutexLock lock(mu_);
@@ -3244,6 +3296,9 @@ void KVCacheManagerWithTransfer::FinishPoolReshardRecvPool(
 
 absl::Status KVCacheManagerWithTransfer::OnLayerReceived(size_t layer_idx,
                                                          uint64_t uuid) {
+  RAIDEN_TRACE_FN("KVTransfer::OnLayerReceived", [&]() {
+    return absl::StrCat("layer=", layer_idx, " uuid=", uuid);
+  });
   CopySpec h2d_copy;
   std::string req_id;
   int64_t recv_slot;

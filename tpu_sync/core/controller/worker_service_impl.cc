@@ -29,6 +29,7 @@
 #include "absl/synchronization/mutex.h"
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
@@ -215,6 +216,11 @@ grpc::Status WorkerServiceImpl::TransferBuffers(
     return grpc::Status::OK;
   }
 
+  RAIDEN_TRACE_FN("WorkerService::StartTransfer", [&]() {
+    return absl::StrCat("is_d2h=", is_d2h, " is_h2d=", is_h2d,
+                        " is_h2h=", is_h2h, " segments=", src_offsets.size());
+  });
+
   if (!transfer_manager_) {
     response->set_success(false);
     response->set_message(
@@ -361,6 +367,7 @@ grpc::Status WorkerServiceImpl::SubmitTransferProgram(
     grpc::ServerContext* context,
     const ::tpu_sync::proto::TransferProgramRequest* request,
     ::tpu_sync::proto::TransferProgramResponse* response) {
+  RAIDEN_TRACE("WorkerService::SubmitTransferProgram");
   // Class rejection is a dispatch failure, not an admission verdict: the
   // dormant contract classes and malformed programs fail loudly at the gRPC
   // layer so nothing mistakes them for an executed-and-failed transfer.

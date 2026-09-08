@@ -23,6 +23,7 @@ cc_library(
     hdrs = ["worker_service_client.h"],
     visibility = ["//visibility:public"],
     deps = [
+        "//tpu_sync/common:trace",
         "//tpu_sync/proto:worker_service_cc_grpc",
         "//tpu_sync/proto:worker_service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
@@ -39,6 +40,7 @@ cc_library(
     hdrs = ["worker_service_impl.h"],
     visibility = ["//visibility:public"],
     deps = [
+        "//tpu_sync/common:trace",
         "//tpu_sync/core:host_memory_allocator",
         "//tpu_sync/core:kv_manager_holder",
         "//tpu_sync/core:raiden_transfer_endpoint",
@@ -87,6 +89,7 @@ cc_library(
         ":worker_registry",
         ":worker_service_client",
         "//tpu_sync/common:raiden_id",
+        "//tpu_sync/common:trace",
         "//tpu_sync/core:buffer",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/kv_cache:logical_block_manager",

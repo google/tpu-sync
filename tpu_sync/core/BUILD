@@ -125,6 +125,7 @@ cc_library(
         ":raw_transfer_core",
         ":tpu_utils",
         ":xla_raw_transfer_headers",
+        "//tpu_sync/common:trace",
         "//tpu_sync/transport:block_transport",
         "//tpu_sync/transport:block_transport_delegate",
         "//tpu_sync/transport:buffer_push_task",
@@ -300,6 +301,8 @@ cc_library(
         # buildcleaner: keep
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",
         "@xla//xla/tsl/concurrency:async_value",
+        "@com_google_absl//absl/strings",
+        "//tpu_sync/common:trace",
     ],
 )
 
@@ -318,9 +321,11 @@ cc_library(
     deps = [
         ":raw_transfer_core",
         ":xla_raw_transfer_headers",
+        "//tpu_sync/common:trace",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
     ],
 )
@@ -448,6 +453,7 @@ cc_library(
         ":tpu_utils",
         ":tsl_platform_headers",
         ":xla_pjrt_headers",
+        "//tpu_sync/common:trace",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
         "//tpu_sync/kv_cache:pool_layout",
         "//tpu_sync/telemetry:metrics_api",

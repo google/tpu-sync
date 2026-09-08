@@ -58,7 +58,7 @@ class ShmWriter {
  public:
   static constexpr size_t kMaxChunks = 16;
 
-  explicit ShmWriter(const ShmWriterOptions& options = {});
+  explicit ShmWriter(const ShmWriterOptions& options);
   ~ShmWriter();
 
   ShmWriter(const ShmWriter&) = delete;

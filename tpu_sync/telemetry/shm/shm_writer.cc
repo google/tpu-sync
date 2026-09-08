@@ -18,7 +18,6 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -34,6 +33,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/random/random.h"
 #include "absl/strings/str_cat.h"
@@ -48,10 +48,8 @@
 namespace tpu_raiden::telemetry {
 
 ShmWriter::ShmWriter(const ShmWriterOptions& options) : options_(options) {
-  if (options_.shm_dir.empty() || options_.local_rank.empty()) {
-    LOG(WARNING) << "ShmWriter disabled: shm_dir or local_rank is empty";
-    return;
-  }
+  CHECK(!options_.shm_dir.empty() && !options_.local_rank.empty())
+      << "ShmWriter requires non-empty shm_dir and local_rank";
 
   std::error_code ec;
   std::filesystem::create_directories(options_.shm_dir, ec);
@@ -102,10 +100,11 @@ bool ShmWriter::AllocateNewChunk() const {
   }
 
   uint32_t chunk_idx = static_cast<uint32_t>(chunks_.size());
-  std::string path =
+  std::string base_path =
       absl::StrCat(options_.shm_dir, "/", kShmFilePrefix, options_.local_rank,
-                   "_", uuid_, "_chunk_", chunk_idx, kShmFileExtension);
-  std::string tmp_path = absl::StrCat(path, ".tmp");
+                   "_", uuid_, "_chunk_", chunk_idx);
+  const std::string path = absl::StrCat(base_path, kShmFileExtension);
+  std::string tmp_path = absl::StrCat(base_path, kShmTmpFileExtension);
 
   int fd = open(tmp_path.c_str(),
                 O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,

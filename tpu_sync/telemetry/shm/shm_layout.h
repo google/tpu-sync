@@ -34,6 +34,7 @@ namespace tpu_raiden::telemetry {
 inline constexpr uint32_t kRaidenShmMagic = 0xABCD1234;
 inline constexpr absl::string_view kShmFilePrefix = "worker_rank_";
 inline constexpr absl::string_view kShmFileExtension = ".mmap";
+inline constexpr absl::string_view kShmTmpFileExtension = ".mmap.tmp";
 
 inline constexpr size_t kMaxTocEntries = 1024;
 // Data pool capacity for metric slots in a single chunk (64 KB).
@@ -101,6 +102,7 @@ struct alignas(64) ShmTocEntry {
 // updating distinct metric streams on different CPU cores.
 struct alignas(64) ShmTocHeader {
   std::atomic<uint32_t> magic{0};
+  uint32_t reserved{0};
   int64_t pid{0};
   std::atomic<uint32_t> toc_entry_count{0};
   uint32_t max_toc_entries{kMaxTocEntries};

@@ -765,19 +765,20 @@ TEST_F(ShmWriterTest, InputValidationAndFailureResilience) {
   ASSERT_GE(fd, 0);
   close(fd);
 
+  EXPECT_DEATH(ShmWriter(ShmWriterOptions{.shm_dir = "", .local_rank = "0"}),
+               "ShmWriter requires non-empty shm_dir and local_rank");
+  EXPECT_DEATH(
+      ShmWriter(ShmWriterOptions{.shm_dir = test_dir_, .local_rank = ""}),
+      "ShmWriter requires non-empty shm_dir and local_rank");
+
   MetricLabel dummy_label{metric_labels::kDirection,
                           metric_labels::kDirectionPush};
-  for (const ShmWriterOptions& opt :
-       {ShmWriterOptions{.shm_dir = "", .local_rank = "0"},
-        ShmWriterOptions{.shm_dir = test_dir_, .local_rank = ""},
-        ShmWriterOptions{.shm_dir = absl::StrCat(regular_file, "/x"),
-                         .local_rank = "0"}}) {
-    ShmWriter bad_writer(opt);
-    bad_writer.IncrementCounter(metric_names::kSentBytesTotal,
-                                {&dummy_label, 1}, 10);
-    bad_writer.SetGauge("any_g", {&dummy_label, 1}, 1.0);
-    bad_writer.ObserveHistogram("any_h", {&dummy_label, 1}, 2.0);
-  }
+  ShmWriter bad_writer(ShmWriterOptions{
+      .shm_dir = absl::StrCat(regular_file, "/x"), .local_rank = "0"});
+  bad_writer.IncrementCounter(metric_names::kSentBytesTotal, {&dummy_label, 1},
+                              10);
+  bad_writer.SetGauge("any_g", {&dummy_label, 1}, 1.0);
+  bad_writer.ObserveHistogram("any_h", {&dummy_label, 1}, 2.0);
 
   EXPECT_FALSE(MappedSegment("").is_valid());
   EXPECT_FALSE(MappedSegment(test_dir_, "").is_valid());

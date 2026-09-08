@@ -113,6 +113,7 @@ py_library(
 py_library(
     name = "raiden_controller",
     srcs = ["raiden_controller.py"],
+    visibility = ["//visibility:public"],
     deps = [
         ":controller_service_py_pb2",
         ":raiden_service_py_pb2",

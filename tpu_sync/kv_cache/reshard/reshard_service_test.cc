@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -91,6 +92,9 @@ class FakeTransport final : public FramedTransport {
       absl::MutexLock lock(mu_);
       calls_.emplace_back(std::string(address), std::string(payload));
     }
+    if (!metadata_addr_.empty() && metadata_addr_ == address) {
+      return metadata_responder_();
+    }
     if (fail_addr_ == address) {
       tpu_sync::rpc::ControlResponse failed;
       failed.set_success(false);
@@ -104,9 +108,17 @@ class FakeTransport final : public FramedTransport {
 
   void FailFor(const std::string& addr) { fail_addr_ = addr; }
 
+  void ServeMetadata(const std::string& addr,
+                     std::function<std::string()> responder) {
+    metadata_addr_ = addr;
+    metadata_responder_ = std::move(responder);
+  }
+
   absl::Mutex mu_;
   std::vector<std::pair<std::string, std::string>> calls_;
   std::string fail_addr_;
+  std::string metadata_addr_;
+  std::function<std::string()> metadata_responder_;
 };
 
 class ReshardStackTest : public ::testing::Test {
@@ -147,7 +159,8 @@ class ReshardStackTest : public ::testing::Test {
   // Registers rank units 0..7 plus the decode unit(s) through the framed
   // surface (byte-level, like the real facade would).
   void RegisterAllUnits(int num_src, int64_t live, int64_t stride,
-                        int64_t num_blocks, int num_dst = 1) {
+                        int64_t num_blocks, int num_dst = 1,
+                        const std::string& fingerprint = "fp1") {
     for (int rank = 0; rank < num_src; ++rank) {
       tpu_sync::rpc::ControlRequest req;
       req.set_command(
@@ -158,7 +171,7 @@ class ReshardStackTest : public ::testing::Test {
       reg->set_control_plane_rpc_address(
           absl::StrCat("10.0.0.1:", 9100 + 2 * rank));
       *reg->add_pools() = MakePool("fa", live, stride, num_blocks);
-      reg->set_layout_fingerprint("fp1");
+      reg->set_layout_fingerprint(fingerprint);
       reg->set_page_tokens(512);
       reg->set_transfer_parallelism(num_src);
       reg->set_transfer_rank(rank);
@@ -166,7 +179,7 @@ class ReshardStackTest : public ::testing::Test {
       ASSERT_TRUE(resp.success()) << resp.message();
     }
     for (int idx = 0; idx < num_dst; ++idx) {
-      RegisterDstUnit(idx, num_src, live, stride, num_blocks);
+      RegisterDstUnit(idx, num_src, live, stride, num_blocks, fingerprint);
     }
   }
 
@@ -314,7 +327,7 @@ class ReshardStackTest : public ::testing::Test {
   tpu_sync::rpc::ControllerResponse Coordinate(
       const std::string& req_id, int64_t uuid, int num_src,
       std::vector<int64_t> dst_blocks, std::vector<int64_t> dst_skip = {},
-      int num_dst = 1) {
+      int num_dst = 1, const std::string& dst_controller_address = "") {
     tpu_sync::rpc::ControllerRequest req;
     req.set_command(
         tpu_sync::rpc::ControllerRequest::COMMAND_COORDINATE_TRANSFER);
@@ -336,6 +349,9 @@ class ReshardStackTest : public ::testing::Test {
     coord->add_transfer_pool_tags("fa");
     for (int64_t skip : dst_skip) {
       coord->add_dst_skip_bytes(skip);
+    }
+    if (!dst_controller_address.empty()) {
+      coord->set_dst_controller_address(dst_controller_address);
     }
     return HandleController(req.SerializeAsString());
   }
@@ -588,6 +604,119 @@ TEST_F(ReshardStackTest, ArmFailureAbandonsClaimAndSkipsSenders) {
   tpu_sync::rpc::ControllerResponse retry = Coordinate("req-4", 45, 1, {7});
   ASSERT_TRUE(retry.success()) << retry.message();
   EXPECT_EQ(transport_.calls_.size(), 2u);
+}
+
+TEST_F(ReshardStackTest, RemoteMetadataCachedAndRefreshedOnStaleFailure) {
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16, /*num_dst=*/0);
+  const std::string dst_ctrl = "10.7.7.7:28000";
+  std::string dst_fp = "fp1";
+  auto dst_metadata = [&dst_fp]() {
+    tpu_sync::rpc::ControlResponse resp;
+    resp.set_success(true);
+    auto* meta = resp.mutable_get_metadata_response()->add_metadata();
+    *meta->mutable_unit() = RaidenIdToProto(DstUnit());
+    meta->add_shards("10.0.0.2:9400");
+    meta->set_control_plane_rpc_address("10.0.0.2:9600");
+    *meta->add_pools() = MakePool("fa", 1024, 1024, 16);
+    meta->set_layout_fingerprint(dst_fp);
+    meta->set_page_tokens(4096);
+    meta->set_transfer_parallelism(2);
+    meta->set_transfer_rank(0);
+    return resp.SerializeAsString();
+  };
+  transport_.ServeMetadata(dst_ctrl, dst_metadata);
+  auto metadata_queries = [&]() {
+    int count = 0;
+    for (const auto& call : transport_.calls_) {
+      if (call.first == dst_ctrl) ++count;
+    }
+    return count;
+  };
+
+  RegisterSpans(0, "req-m1", 61, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-m1", 61, 1024, 5, 1, 0, 512);
+  ASSERT_TRUE(Coordinate("req-m1", 61, 2, {7, 9}, {}, /*num_dst=*/1, dst_ctrl)
+                  .success());
+  EXPECT_EQ(metadata_queries(), 1);
+
+  // Second request is served from the metadata cache: no new query.
+  RegisterSpans(0, "req-m2", 62, 1024, 4, 0, 0, 1024);
+  RegisterSpans(1, "req-m2", 62, 1024, 6, 1, 0, 512);
+  ASSERT_TRUE(Coordinate("req-m2", 62, 2, {11, 12}, {}, /*num_dst=*/1, dst_ctrl)
+                  .success());
+  EXPECT_EQ(metadata_queries(), 1);
+
+  // The peer re-admits with a new layout: sources move to fp2 and the
+  // remote now reports fp2. The fp1 cache entry fails plan build once,
+  // is invalidated, refetched, and the replay succeeds.
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16, /*num_dst=*/0, "fp2");
+  dst_fp = "fp2";
+  RegisterSpans(0, "req-m3", 63, 1024, 8, 0, 0, 1024);
+  RegisterSpans(1, "req-m3", 63, 1024, 9, 1, 0, 512);
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-m3", 63, 2, {13, 14}, {}, /*num_dst=*/1, dst_ctrl);
+  ASSERT_TRUE(resp.success()) << resp.message();
+  EXPECT_EQ(metadata_queries(), 2);
+}
+
+TEST_F(ReshardStackTest, PartialReceiverArmFailureDropsCacheWithoutReplay) {
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16, /*num_dst=*/0);
+  const std::string dst_ctrl = "10.7.7.7:28000";
+  auto dst_metadata = []() {
+    tpu_sync::rpc::ControlResponse resp;
+    resp.set_success(true);
+    for (int idx = 0; idx < 2; ++idx) {
+      auto* meta = resp.mutable_get_metadata_response()->add_metadata();
+      *meta->mutable_unit() = RaidenIdToProto(DstUnit(idx));
+      meta->add_shards(absl::StrCat("10.0.0.2:", 9400 + idx));
+      meta->set_control_plane_rpc_address(
+          absl::StrCat("10.0.0.2:", 9600 + idx));
+      *meta->add_pools() = MakePool("fa", 1024, 1024, 16);
+      meta->set_layout_fingerprint("fp1");
+      meta->set_page_tokens(4096);
+      meta->set_transfer_parallelism(2);
+      meta->set_transfer_rank(0);
+    }
+    return resp.SerializeAsString();
+  };
+  transport_.ServeMetadata(dst_ctrl, dst_metadata);
+  auto metadata_queries = [&]() {
+    int count = 0;
+    for (const auto& call : transport_.calls_) {
+      if (call.first == dst_ctrl) ++count;
+    }
+    return count;
+  };
+
+  RegisterSpans(0, "req-p1", 71, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-p1", 71, 1024, 5, 1, 0, 512);
+  ASSERT_TRUE(Coordinate("req-p1", 71, 2, {7, 9}, {}, /*num_dst=*/2, dst_ctrl)
+                  .success());
+  EXPECT_EQ(metadata_queries(), 1);
+
+  // One of the two receivers refuses its arm while the other acknowledges:
+  // the request fails with that refusal and is not replayed (a replay would
+  // re-arm the acknowledged receiver), but the cache entry is dropped.
+  transport_.FailFor("10.0.0.2:9601");
+  RegisterSpans(0, "req-p2", 72, 1024, 4, 0, 0, 1024);
+  RegisterSpans(1, "req-p2", 72, 1024, 6, 1, 0, 512);
+  tpu_sync::rpc::ControllerResponse refused =
+      Coordinate("req-p2", 72, 2, {11, 12}, {}, /*num_dst=*/2, dst_ctrl);
+  ASSERT_FALSE(refused.success());
+  EXPECT_THAT(refused.message(), HasSubstr("injected arm refusal"));
+  EXPECT_EQ(metadata_queries(), 1);
+
+  // The next request re-queries the destination before planning.
+  transport_.FailFor("");
+  RegisterSpans(0, "req-p3", 73, 1024, 8, 0, 0, 1024);
+  RegisterSpans(1, "req-p3", 73, 1024, 9, 1, 0, 512);
+  ASSERT_TRUE(
+      Coordinate("req-p3", 73, 2, {13, 14}, {}, /*num_dst=*/2, dst_ctrl)
+          .success());
+  EXPECT_EQ(metadata_queries(), 2);
 }
 
 TEST_F(ReshardStackTest, CancelTombstoneBlocksLateRegistration) {

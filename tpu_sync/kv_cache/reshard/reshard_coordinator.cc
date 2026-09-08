@@ -328,21 +328,64 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
         "(the destination-side relay is retired)");
   }
 
-  const int64_t controller_start_ns = MonotonicNs();
-  const int64_t plan_build_start_ns = controller_start_ns;
-
-  auto src_metadata = directory_->LocalMetadata(args.src_units);
-  if (!src_metadata.ok()) return src_metadata.status();
   std::vector<tpu_sync::rpc::RegisterWorkUnitRequest> dst_metadata;
+  bool used_cache = false;
   if (!args.dst_controller_address.empty()) {
-    auto remote = QueryRemoteMetadata(args.dst_controller_address);
-    if (!remote.ok()) return remote.status();
-    dst_metadata = *std::move(remote);
+    {
+      absl::MutexLock lock(metadata_cache_mu_);
+      auto it = remote_metadata_cache_.find(args.dst_controller_address);
+      if (it != remote_metadata_cache_.end()) {
+        dst_metadata = it->second;
+        used_cache = true;
+      }
+    }
+    if (!used_cache) {
+      auto remote = QueryRemoteMetadata(args.dst_controller_address);
+      if (!remote.ok()) return remote.status();
+      dst_metadata = *std::move(remote);
+      absl::MutexLock lock(metadata_cache_mu_);
+      remote_metadata_cache_[args.dst_controller_address] = dst_metadata;
+    }
   } else {
     auto local = directory_->LocalMetadata(args.dst_units);
     if (!local.ok()) return local.status();
     dst_metadata = *std::move(local);
   }
+
+  bool receiver_armed = false;
+  absl::Status status =
+      ExecutePoolReshardAttempt(args, dst_metadata, &receiver_armed);
+  if (status.ok() || !used_cache) return status;
+  // Cached destination metadata can be stale after an engine replacement,
+  // so a failed attempt drops the entry and the next request re-queries.
+  // Planning and arming are side-effect-free beyond the abandoned claim
+  // until a receiver acknowledges its arm, so the attempt is replayed on
+  // fresh metadata only while no receiver has acknowledged.
+  {
+    absl::MutexLock lock(metadata_cache_mu_);
+    remote_metadata_cache_.erase(args.dst_controller_address);
+  }
+  if (receiver_armed) return status;
+  auto remote = QueryRemoteMetadata(args.dst_controller_address);
+  if (!remote.ok()) return remote.status();
+  dst_metadata = *std::move(remote);
+  {
+    absl::MutexLock lock(metadata_cache_mu_);
+    remote_metadata_cache_[args.dst_controller_address] = dst_metadata;
+  }
+  receiver_armed = false;
+  return ExecutePoolReshardAttempt(args, dst_metadata, &receiver_armed);
+}
+
+absl::Status ReshardCoordinator::ExecutePoolReshardAttempt(
+    const PoolReshardArgs& args,
+    const std::vector<tpu_sync::rpc::RegisterWorkUnitRequest>& dst_metadata,
+    bool* receiver_armed) {
+  const int64_t controller_start_ns = MonotonicNs();
+  const int64_t plan_build_start_ns = controller_start_ns;
+
+  auto src_metadata = directory_->LocalMetadata(args.src_units);
+  if (!src_metadata.ok()) return src_metadata.status();
 
   int64_t uuid = args.uuid;
   if (uuid <= 0) {
@@ -355,7 +398,7 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
   plan_request.src_units = args.src_units;
   plan_request.dst_units = args.dst_units;
   plan_request.src_metadata = *std::move(src_metadata);
-  plan_request.dst_metadata = std::move(dst_metadata);
+  plan_request.dst_metadata = dst_metadata;
   plan_request.req_id = args.req_id;
   plan_request.uuid = uuid;
   plan_request.dst_device_block_ids = args.dst_device_block_ids;
@@ -401,6 +444,9 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
       });
     }
     for (std::thread& t : armers) t.join();
+    for (const absl::Status& status : arm_status) {
+      if (status.ok()) *receiver_armed = true;
+    }
     for (const absl::Status& status : arm_status) {
       if (!status.ok()) {
         registry_->AbandonClaim(args.req_id, uuid, claim_owner);

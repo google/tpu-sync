@@ -17,12 +17,15 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
 #include <utility>
@@ -58,6 +61,33 @@ bool SendAll(int fd, const char* data, size_t n) {
     total += static_cast<size_t>(w);
   }
   return true;
+}
+
+// Sends the 4-byte length prefix and the body as ONE buffer. Two separate
+// send() calls under Nagle stall the body until the peer ACKs the prefix
+// segment (delayed-ACK interaction), putting a tens-of-ms floor on small
+// RPCs.
+bool SendFramed(int fd, absl::string_view payload) {
+  std::string framed;
+  framed.reserve(sizeof(uint32_t) + payload.size());
+  uint32_t net_len = htonl(static_cast<uint32_t>(payload.size()));
+  framed.append(reinterpret_cast<const char*>(&net_len), sizeof(net_len));
+  framed.append(payload.data(), payload.size());
+  return SendAll(fd, framed.data(), framed.size());
+}
+
+// Control-plane RPCs are short request/response exchanges: disable Nagle so
+// each frame goes out immediately, and enable keepalive plus
+// TCP_USER_TIMEOUT so a black-holed peer surfaces as a socket error within
+// the I/O timeout instead of only at the full receive deadline.
+void ConfigureControlSocket(int fd, absl::Duration io_timeout) {
+  int one = 1;
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+  unsigned int user_timeout_ms = static_cast<unsigned int>(
+      absl::ToInt64Milliseconds(io_timeout));
+  setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms,
+             sizeof(user_timeout_ms));
 }
 
 // Splits "host:port" at the last colon; strips IPv6 brackets, mirroring
@@ -104,6 +134,7 @@ int TryConnectOnce(const std::string& host, int port,
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    ConfigureControlSocket(fd, io_timeout);
     if (connect(fd, res->ai_addr, res->ai_addrlen) == 0) break;
     close(fd);
     fd = -1;
@@ -140,10 +171,7 @@ absl::StatusOr<std::string> SocketFramedTransport::Call(
 
   std::string response;
   {
-    uint32_t net_len = htonl(static_cast<uint32_t>(payload.size()));
-    if (!SendAll(fd, reinterpret_cast<const char*>(&net_len),
-                 sizeof(net_len)) ||
-        !SendAll(fd, payload.data(), payload.size())) {
+    if (!SendFramed(fd, payload)) {
       close(fd);
       return absl::UnavailableError(
           absl::StrCat("Failed to send framed payload to ", address, ": ",
@@ -242,10 +270,10 @@ void FramedServer::Stop() {
     server_fd_ = -1;
   }
   if (accept_thread_.joinable()) accept_thread_.join();
-  for (std::thread& t : connection_threads_) {
-    if (t.joinable()) t.join();
+  for (const std::unique_ptr<Connection>& connection : connections_) {
+    if (connection->thread.joinable()) connection->thread.join();
   }
-  connection_threads_.clear();
+  connections_.clear();
 }
 
 void FramedServer::AcceptLoop() {
@@ -262,12 +290,29 @@ void FramedServer::AcceptLoop() {
       close(client_fd);
       break;
     }
-    connection_threads_.emplace_back(&FramedServer::ServeConnection, this,
-                                     client_fd);
+    connections_.erase(
+        std::remove_if(connections_.begin(), connections_.end(),
+                       [](const std::unique_ptr<Connection>& connection) {
+                         if (!connection->done.load()) return false;
+                         if (connection->thread.joinable()) {
+                           connection->thread.join();
+                         }
+                         return true;
+                       }),
+        connections_.end());
+    auto connection = std::make_unique<Connection>();
+    Connection* raw = connection.get();
+    raw->thread = std::thread([this, raw, client_fd]() {
+      ServeConnection(client_fd);
+      raw->done.store(true);
+    });
+    connections_.push_back(std::move(connection));
   }
 }
 
 void FramedServer::ServeConnection(int client_fd) {
+  int one = 1;
+  setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
   uint32_t net_len = 0;
   if (!ReadExactly(client_fd, reinterpret_cast<char*>(&net_len),
                    sizeof(net_len))) {
@@ -281,10 +326,7 @@ void FramedServer::ServeConnection(int client_fd) {
     return;
   }
   std::string response = handler_(request);
-  uint32_t resp_net_len = htonl(static_cast<uint32_t>(response.size()));
-  SendAll(client_fd, reinterpret_cast<const char*>(&resp_net_len),
-          sizeof(resp_net_len));
-  SendAll(client_fd, response.data(), response.size());
+  SendFramed(client_fd, response);
   close(client_fd);
 }
 

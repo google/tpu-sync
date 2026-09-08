@@ -112,6 +112,15 @@ class ReshardCoordinator {
  private:
   absl::Status ExecutePoolReshard(const PoolReshardArgs& args);
 
+  // One planning/arming/dispatch pass over the given destination metadata.
+  // Sets *receiver_armed once any destination acknowledges its arm; past
+  // that point the transfer has side effects beyond the abandoned claim and
+  // must not be replayed.
+  absl::Status ExecutePoolReshardAttempt(
+      const PoolReshardArgs& args,
+      const std::vector<tpu_sync::rpc::RegisterWorkUnitRequest>& dst_metadata,
+      bool* receiver_armed);
+
   // GET_METADATA against the destination controller (dst_controller_address
   // path), recorded shape-identical to Python's _query_remote_metadata.
   absl::StatusOr<std::vector<tpu_sync::rpc::RegisterWorkUnitRequest>>
@@ -124,6 +133,16 @@ class ReshardCoordinator {
 
   mutable absl::Mutex status_mu_;
   std::map<std::string, Status> transfer_status_ ABSL_GUARDED_BY(status_mu_);
+
+  // Destination work-unit metadata rarely changes (units register once per
+  // engine lifetime), so the per-request GET_METADATA round trip is served
+  // from this per-address cache. Staleness surfaces as a plan-build or
+  // receiver-arm failure; a failed attempt drops the entry, and
+  // ExecutePoolReshard replays once on fresh metadata while no receiver
+  // has acknowledged its arm.
+  mutable absl::Mutex metadata_cache_mu_;
+  std::map<std::string, std::vector<tpu_sync::rpc::RegisterWorkUnitRequest>>
+      remote_metadata_cache_ ABSL_GUARDED_BY(metadata_cache_mu_);
 };
 
 }  // namespace reshard

@@ -1,0 +1,6 @@
+{
+  "name": "tpu-raiden-coder",
+  "configPath": {
+    "relativePathToConfig": "config.yaml"
+  }
+}

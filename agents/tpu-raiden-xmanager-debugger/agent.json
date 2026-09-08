@@ -1,0 +1,6 @@
+{
+  "name": "tpu-raiden-xmanager-debugger",
+  "configPath": {
+    "relativePathToConfig": "config.yaml"
+  }
+}

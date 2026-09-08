@@ -145,6 +145,17 @@ py_test(
 )
 
 py_test(
+    name = "reshard_store_test",
+    srcs = ["reshard_store_test.py"],
+    tags = ["nobuilder"],
+    deps = [
+        ":kv_cache_store",
+        ":reshard_store",
+        "@com_google_absl_py//absl/testing:absltest",
+    ],
+)
+
+py_test(
     name = "weight_synchronizer_test",
     srcs = ["weight_synchronizer_test.py"],
     tags = [

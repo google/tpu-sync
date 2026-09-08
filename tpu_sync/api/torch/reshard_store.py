@@ -49,7 +49,7 @@ class ReshardStore:
     # nb::class_ registration of the same wrapper type would be silently
     # dropped by nanobind.
     self._impl = _impl.create_reshard_store(
-        raiden_id._impl,
+        getattr(raiden_id, "_impl", raiden_id),
         store_server_ip,
         raiden_controller_port,
         reshard_service_port,

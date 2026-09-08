@@ -66,6 +66,7 @@ cc_test(
     name = "metrics_api_test",
     srcs = ["metrics_api_test.cc"],
     deps = [
+        ":exporter_util",
         ":metrics_api",
         ":metrics_backend",
         ":mock_metrics_backend",

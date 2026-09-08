@@ -112,6 +112,27 @@ bool RaidenMetricStore::HasBackends() const {
 
 absl::Status RaidenMetricStore::InitializeFromBackendNames(
     absl::Span<const absl::string_view> backend_names) {
+  // Pre-validate all backend names first to guarantee all-or-nothing semantics:
+  // if any backend name is unrecognized, existing backends remain unchanged.
+  for (absl::string_view backend_key : backend_names) {
+    std::string name =
+        absl::AsciiStrToLower(absl::StripAsciiWhitespace(backend_key));
+    if (name.empty()) {
+      continue;
+    }
+    if (name == kPrometheus ||
+        name == kBuffered
+    ) {
+      continue;
+    }
+    return absl::InvalidArgumentError(
+        absl::StrCat("Unknown telemetry backend: ", backend_key));
+  }
+
+  // Clear any existing backends so that previous global metric registrations
+  // are unregistered before new ones are built.
+  SetBackends({});
+
   std::vector<std::unique_ptr<MetricsBackend>> new_backends;
   absl::flat_hash_set<std::string> seen_backends;
 
@@ -130,9 +151,6 @@ absl::Status RaidenMetricStore::InitializeFromBackendNames(
           }));
     } else if (name == kBuffered) {
       new_backends.push_back(std::make_unique<BufferedMetricsExporter>());
-    } else {
-      return absl::InvalidArgumentError(
-          absl::StrCat("Unknown telemetry backend: ", backend_key));
     }
   }
 

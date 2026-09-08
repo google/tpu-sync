@@ -37,6 +37,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/errors.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -75,6 +76,7 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
 
 absl::Status NumaAwareWeightSynchronizer::BindWeights(
     nanobind::list jax_arrays) {
+  RAIDEN_TRACE("NumaWSync::BindWeights");
   try {
     auto layer_buffers =
         tpu_raiden::jax::UnpackJaxArrays(jax_arrays, unsafe_skip_buffer_lock_);
@@ -427,6 +429,7 @@ const uint8_t* NumaAwareWeightSynchronizer::GetHostBufferPtr(
 
 absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareWeightSynchronizer::D2h(
     uint64_t uuid) {
+  RAIDEN_TRACE("NumaWSync::D2h");
   if (sub_synchronizers_.empty()) return raiden::PjRtCopyFuture();
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   sub_copy_futures.reserve(sub_synchronizers_.size());
@@ -441,6 +444,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareWeightSynchronizer::D2h(
 
 absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareWeightSynchronizer::H2d(
     uint64_t uuid) {
+  RAIDEN_TRACE("NumaWSync::H2d");
   if (sub_synchronizers_.empty()) return raiden::PjRtCopyFuture();
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   sub_copy_futures.reserve(sub_synchronizers_.size());
@@ -533,6 +537,7 @@ void NumaAwareWeightSynchronizer::ResetMetrics() {
 
 absl::Status NumaAwareWeightSynchronizer::PushWeights(
     const std::vector<std::string>& peers) {
+  RAIDEN_TRACE("NumaWSync::PushWeights");
   if (sub_synchronizers_.empty()) return absl::OkStatus();
   if (sub_synchronizers_.size() == 1) {
     return sub_synchronizers_[0]->PushWeightsLocal(peers);
@@ -565,6 +570,7 @@ absl::Status NumaAwareWeightSynchronizer::PushWeights(
 
 absl::Status NumaAwareWeightSynchronizer::PushWeightsResharded(
     const tpu_sync::rpc::StartTransferRequest& request) {
+  RAIDEN_TRACE("NumaWSync::PushWeightsResharded");
   if (sub_synchronizers_.empty()) return absl::OkStatus();
   if (sub_synchronizers_.size() == 1) {
     return sub_synchronizers_[0]->PushWeightsReshardedLocal(request);
@@ -772,6 +778,7 @@ absl::Status NumaAwareWeightSynchronizer::RegisterExpectedLayerChunks(
 
 absl::Status NumaAwareWeightSynchronizer::WaitForTransferCompletion(
     uint64_t uuid) {
+  RAIDEN_TRACE("NumaWSync::WaitForTransferCompletion");
   if (sub_synchronizers_.empty()) return absl::OkStatus();
   for (auto& sub : sub_synchronizers_) {
     if (sub) {
@@ -795,6 +802,7 @@ void NumaAwareWeightSynchronizer::ForgetPushProgress(uint64_t uuid) {
 }
 
 void NumaAwareWeightSynchronizer::DrainPendingH2d() {
+  RAIDEN_TRACE("NumaWSync::DrainPendingH2d");
   for (auto& sub : sub_synchronizers_) {
     if (sub) {
       sub->DrainPendingH2d();
@@ -849,6 +857,7 @@ WeightSynchronizer::WeightSynchronizer(
 }
 
 absl::Status WeightSynchronizer::BindWeights(nanobind::list jax_arrays) {
+  RAIDEN_TRACE("WSync::BindWeights");
   return numa_manager_->BindWeights(jax_arrays);
 }
 #endif
@@ -873,10 +882,12 @@ WeightSynchronizer::WeightSynchronizer(
 WeightSynchronizer::~WeightSynchronizer() = default;
 
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizer::D2h(uint64_t uuid) {
+  RAIDEN_TRACE("WSync::D2h");
   return numa_manager_->D2h(uuid);
 }
 
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizer::H2d(uint64_t uuid) {
+  RAIDEN_TRACE("WSync::H2d");
   return numa_manager_->H2d(uuid);
 }
 

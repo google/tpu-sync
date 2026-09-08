@@ -152,6 +152,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":weight_synchronizer_base",
+        "//tpu_sync/common:trace",
         "//tpu_sync/rpc:raiden_service_cc_grpc",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
@@ -195,6 +196,7 @@ cc_library(
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
+        "//tpu_sync/common:trace",
         "//tpu_sync/rpc:raiden_service_cc_grpc",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",

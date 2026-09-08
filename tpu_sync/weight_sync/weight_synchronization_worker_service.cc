@@ -36,6 +36,7 @@
 #include "grpcpp/server_builder.h"
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
@@ -60,6 +61,7 @@ grpc::Status WeightSynchronizationWorkerServiceImpl::HandleControl(
 
   if (request->command() ==
       tpu_sync::rpc::ControlRequest::COMMAND_START_TRANSFER) {
+    RAIDEN_TRACE("WSyncService::HandleStartTransfer");
     bool is_sender = true;
     bool is_resharded = false;
     if (request->has_start_transfer_request()) {

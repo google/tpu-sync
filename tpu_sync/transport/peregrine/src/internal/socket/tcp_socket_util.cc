@@ -45,6 +45,23 @@ inline std::string ErrMsg(std::string_view what, fd_t fd, int last_errno) {
                          fd.value(), AddrPortPair(fd), last_errno,
                          std::strerror(last_errno));
 }
+
+// Maps a failed send/recv errno onto a status code the caller can act on.
+// SO_SNDTIMEO and SO_RCVTIMEO expire as EAGAIN or EWOULDBLOCK even on a
+// blocking socket, and TCP_USER_TIMEOUT fails the connection with ETIMEDOUT.
+// Every case leaves the stream mid-message, so the caller must close it
+// regardless; the distinct codes are what let it tell a stalled or dead peer
+// apart from a protocol error.
+inline absl::Status IoError(std::string_view what, fd_t fd, int last_errno) {
+  std::string msg = ErrMsg(what, fd, last_errno);
+  if (WouldBlock(last_errno)) {
+    return absl::DeadlineExceededError(std::move(msg));
+  }
+  if (last_errno == ETIMEDOUT) {
+    return absl::UnavailableError(std::move(msg));
+  }
+  return absl::InternalError(std::move(msg));
+}
 }  // namespace
 
 absl::Status TcpSocketUtil::Send(const fd_t fd, const Byte* const buf,
@@ -70,8 +87,7 @@ absl::Status TcpSocketUtil::Send(const fd_t fd, const Byte* const buf,
       if ABSL_PREDICT_TRUE (bytes < 0) {
         const auto last_errno = errno;
         if (Interrupted(last_errno)) continue;
-        DCHECK(!WouldBlock(last_errno));
-        return absl::InternalError(ErrMsg("send", fd, last_errno));
+        return IoError("send", fd, last_errno);
       } else {  // rarely happens
         DCHECK_EQ(bytes, 0);
         return absl::InternalError("send zero");
@@ -107,8 +123,7 @@ absl::Status TcpSocketUtil::Recv(const fd_t fd, Byte* const buf,
     } else {
       const auto last_errno = errno;
       if (Interrupted(last_errno)) continue;
-      DCHECK(!WouldBlock(last_errno));
-      return absl::InternalError(ErrMsg("recv", fd, last_errno));
+      return IoError("recv", fd, last_errno);
     }
   }
   DCHECK_EQ(left, 0);
@@ -149,8 +164,7 @@ absl::Status TcpSocketUtil::SendV(const fd_t fd,
       if ABSL_PREDICT_TRUE (bytes < 0) {
         const auto last_errno = errno;
         if (Interrupted(last_errno)) continue;
-        DCHECK(!WouldBlock(last_errno));
-        return absl::InternalError(ErrMsg("writev", fd, last_errno));
+        return IoError("writev", fd, last_errno);
       } else {  // rarely happens
         DCHECK_EQ(bytes, 0);
         return absl::InternalError("writev zero");
@@ -195,8 +209,7 @@ absl::Status TcpSocketUtil::RecvV(const fd_t fd,
     } else {
       const auto last_errno = errno;
       if (Interrupted(last_errno)) continue;
-      DCHECK(!WouldBlock(last_errno));
-      return absl::InternalError(ErrMsg("readv", fd, last_errno));
+      return IoError("readv", fd, last_errno);
     }
   }
   DCHECK_EQ(rcvd, len);

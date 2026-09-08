@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -34,6 +35,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -87,6 +89,7 @@ void WriteAll(int fd, const void* data, size_t len) {
   const uint8_t* p = static_cast<const uint8_t*>(data);
   while (len > 0) {
     ssize_t n = write(fd, p, len);
+    if (n < 0 && errno == EINTR) continue;
     ASSERT_GT(n, 0) << std::strerror(errno);
     p += n;
     len -= n;
@@ -98,7 +101,15 @@ bool ReadAll(int fd, void* data, size_t len) {
   uint8_t* p = static_cast<uint8_t*>(data);
   while (len > 0) {
     ssize_t n = read(fd, p, len);
-    if (n <= 0) return false;
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      LOG(ERROR) << "ReadAll failed: " << std::strerror(errno);
+      return false;
+    }
+    if (n == 0) {
+      LOG(ERROR) << "ReadAll EOF, remaining bytes: " << len;
+      return false;
+    }
     p += n;
     len -= n;
   }

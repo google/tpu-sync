@@ -816,6 +816,7 @@ cc_test(
     ],
     deps = [
         ":kv_cache_manager_with_transfer",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest_main",

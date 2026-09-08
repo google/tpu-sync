@@ -2456,6 +2456,7 @@ void KVCacheManagerWithTransfer::ControlServerLoop() {
 
     pull_pool_->Schedule(source_node, [this, client_fd]() {
       HandleControlConnection(client_fd);
+      shutdown(client_fd, SHUT_WR);
       close(client_fd);
     });
   }
@@ -2483,9 +2484,16 @@ void KVCacheManagerWithTransfer::HandleControlConnection(int fd) {
     response.status = -1;
     std::string message = e.what();
     response.message_len = message.size();
-    (void)WriteExact(fd, &response, sizeof(response));
+    if (absl::Status s = WriteExact(fd, &response, sizeof(response)); !s.ok()) {
+      LOG(WARNING) << "Failed to send control response header: " << s;
+      return;
+    }
     if (response.message_len > 0) {
-      (void)WriteExact(fd, message.data(), message.size());
+      if (absl::Status s = WriteExact(fd, message.data(), message.size());
+          !s.ok()) {
+        LOG(WARNING) << "Failed to send control response message: " << s;
+        return;
+      }
     }
   }
 }

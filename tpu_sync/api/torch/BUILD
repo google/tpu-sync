@@ -55,6 +55,23 @@ py_library(
 )
 
 py_library(
+    name = "kv_cache_offloader_py",
+    srcs = ["kv_cache_offloader.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":torch_abi",
+        ":torch_tpu_common_loader",
+        "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
+    ],
+)
+
+py_test(
+    name = "kv_cache_offloader_test",
+    srcs = ["kv_cache_offloader_test.py"],
+    deps = [":kv_cache_offloader_py"],
+)
+
+py_library(
     name = "kv_cache_manager_host_py",
     srcs = ["kv_cache_manager.py"],
     visibility = ["//visibility:public"],

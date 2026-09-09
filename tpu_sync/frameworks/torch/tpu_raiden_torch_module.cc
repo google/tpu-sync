@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -37,6 +38,7 @@
 #include "tpu_sync/core/raiden_future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/frameworks/torch/kv_cache_manager.h"
+#include "tpu_sync/frameworks/torch/kv_cache_offloader.h"
 #include "tpu_sync/frameworks/torch/pool_layout_nanobind.h"
 #include "tpu_sync/frameworks/torch/torch_nanobind_utils.h"
 #include "tpu_sync/frameworks/torch/weight_synchronizer.h"
@@ -49,7 +51,49 @@
 namespace nb = nanobind;
 
 using ::tpu_raiden::torch::KVCacheManager;
+using ::tpu_raiden::torch::KVCacheOffloader;
 using ::tpu_raiden::torch::WeightSynchronizer;
+
+namespace {
+
+class OffloaderValueError final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+class OffloaderIndexError final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+class OffloaderOSError final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+void ThrowOffloaderStatus(const absl::Status& status,
+                          absl::string_view operation) {
+  if (status.ok())
+    return;
+  const std::string message =
+      absl::StrCat(operation, " failed: ", status.message());
+  if (status
+          .GetPayload(
+              tpu_raiden::torch::offloader_internal::kPosixErrorPayloadUrl)
+          .has_value()) {
+    throw OffloaderOSError(message);
+  }
+  switch (status.code()) {
+    case absl::StatusCode::kInvalidArgument:
+      throw OffloaderValueError(message);
+    case absl::StatusCode::kOutOfRange:
+      throw OffloaderIndexError(message);
+    default:
+      throw std::runtime_error(message);
+  }
+}
+
+}  // namespace
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -181,6 +225,13 @@ struct ClientHandle {
 using ::tpu_raiden::kv_cache::ToStdStringVector;
 
 NB_MODULE(_tpu_raiden_torch, m) {
+  nb::exception<OffloaderValueError>(m, "_KVCacheOffloaderValueError",
+                                     PyExc_ValueError);
+  nb::exception<OffloaderIndexError>(m, "_KVCacheOffloaderIndexError",
+                                     PyExc_IndexError);
+  nb::exception<OffloaderOSError>(m, "_KVCacheOffloaderOSError",
+                                  PyExc_OSError);
+
   // =========================================================================
   // 1. Bind RaidenFuture
   // =========================================================================
@@ -217,6 +268,58 @@ NB_MODULE(_tpu_raiden_torch, m) {
         absl::Status status = self.PollError();
         return status.ok() ? std::string() : std::string(status.message());
       });
+
+  nb::class_<KVCacheOffloader>(m, "KVCacheOffloader")
+      .def(nb::init<const std::vector<at::Tensor>&, size_t>(),
+           nb::arg("kv_cache_tensors"), nb::arg("page_nbytes"),
+           nb::call_guard<nb::gil_scoped_release>())
+      .def(
+          "map_shared_memory",
+          [](KVCacheOffloader& self, uintptr_t mapped_address,
+             size_t pool_size_bytes) {
+            ThrowOffloaderStatus(
+                self.MapSharedMemory(reinterpret_cast<void*>(mapped_address),
+                                     pool_size_bytes),
+                "KVCacheOffloader.map_shared_memory");
+          },
+          nb::arg("mapped_address"), nb::arg("pool_size_bytes"),
+          nb::call_guard<nb::gil_scoped_release>())
+      .def(
+          "unmap_shared_memory",
+          [](KVCacheOffloader& self) {
+            ThrowOffloaderStatus(self.UnmapSharedMemory(),
+                                 "KVCacheOffloader.unmap_shared_memory");
+          },
+          nb::call_guard<nb::gil_scoped_release>())
+      .def(
+          "h2d",
+          [](KVCacheOffloader& self, const std::vector<int64_t>& block_ids,
+             const std::vector<at::Tensor>& object_tensors, int64_t rank_id) {
+            auto result = self.H2d(block_ids, object_tensors, rank_id);
+            if (!result.ok()) {
+              ThrowOffloaderStatus(result.status(), "KVCacheOffloader.h2d");
+            }
+            return tpu_raiden::RaidenFuture{std::move(result.value())};
+          },
+          nb::arg("block_ids"), nb::arg("object_tensors"), nb::arg("rank_id"),
+          nb::call_guard<nb::gil_scoped_release>())
+      .def(
+          "d2h",
+          [](KVCacheOffloader& self, const std::vector<int64_t>& block_ids,
+             const std::vector<at::Tensor>& object_tensors, int64_t rank_id) {
+            auto result = self.D2h(block_ids, object_tensors, rank_id);
+            if (!result.ok()) {
+              ThrowOffloaderStatus(result.status(), "KVCacheOffloader.d2h");
+            }
+            return tpu_raiden::RaidenFuture{std::move(result.value())};
+          },
+          nb::arg("block_ids"), nb::arg("object_tensors"), nb::arg("rank_id"),
+          nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_ro("num_layers", &KVCacheOffloader::num_layers)
+      .def_prop_ro("num_blocks", &KVCacheOffloader::num_blocks)
+      .def_prop_ro("page_nbytes", &KVCacheOffloader::page_nbytes)
+      .def_prop_ro("is_shared_memory_mapped",
+                   &KVCacheOffloader::is_shared_memory_mapped);
 
   // =========================================================================
   // 2. Bind KVCacheManager

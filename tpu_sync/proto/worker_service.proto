@@ -135,6 +135,26 @@ message DeleteBuffersResponse {
   string message = 2;
 }
 
+// Transfer direction enum for backend operations.
+enum TransferDirection {
+  TRANSFER_DIR_UNSPECIFIED = 0;
+  TRANSFER_DIR_OFFLOAD = 1;  // Host RAM -> Storage
+  TRANSFER_DIR_RECALL = 2;   // Storage -> Host RAM
+}
+
+// Backend transfer specification for an individual worker.
+// Optional: when omitted, executes device to host ram transfers.
+message BackendTransferSpec {
+  TransferDirection direction = 1;
+
+  // Name identifying the backend driver (e.g. "posix", "lustre", "k5").
+  string name = 2;
+
+  // Ordered list of logical cryptographic block hashes (e.g. SHA-256 token
+  // prefix hashes), 1:1 aligned with the transfer buffer block offsets.
+  repeated string block_hashes = 3;
+}
+
 // Specification for copying disjoint memory regions in one buffer.
 // The transfer applies uniformly to all buffers, i.e., across all shards and
 // all major dimensions (such as layers or blocks).
@@ -162,6 +182,10 @@ message TransferBufferSpec {
   // peer's block id. Required (same length as src/dst offsets) for those
   // transfer types; unused otherwise.
   repeated BufferProto staging_host_buffers = 9;
+  // Backend transfer specifications containing direction, name, and
+  // block_hashes. When empty, executes device to host ram transfers.
+  // Repeated to support multiple secondary backends in a single transfer.
+  repeated BackendTransferSpec backend_specs = 10;
 }
 
 // Request to transfer data across memory spaces on a transfer worker.

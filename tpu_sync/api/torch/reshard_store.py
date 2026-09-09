@@ -14,8 +14,7 @@
 
 """Thin store hosting RaidenController and ReshardService in-engine."""
 
-from typing import Optional
-from tpu_sync.api.torch import kv_cache_store
+from tpu_sync.api import common
 from tpu_sync.api.torch import torch_abi
 from tpu_sync.api.torch import torch_tpu_common_loader
 
@@ -28,6 +27,8 @@ _impl = torch_abi.load_extension(
 )
 # pylint: enable=g-import-not-at-top
 
+RaidenId = getattr(_impl, "RaidenId", common.RaidenId)
+
 
 class ReshardStore:
   """Thin store hosting RaidenController and ReshardService in-engine.
@@ -39,7 +40,7 @@ class ReshardStore:
 
   def __init__(
       self,
-      raiden_id: kv_cache_store.RaidenId,
+      raiden_id: RaidenId,
       store_server_ip: str,
       raiden_controller_port: int = 0,
       reshard_service_port: int = 0,
@@ -49,11 +50,15 @@ class ReshardStore:
     # nb::class_ registration of the same wrapper type would be silently
     # dropped by nanobind.
     self._impl = _impl.create_reshard_store(
-        raiden_id._impl,
+        raiden_id,
         store_server_ip,
         raiden_controller_port,
         reshard_service_port,
     )
+
+  @property
+  def raiden_id(self) -> RaidenId:
+    return self._impl.raiden_id
 
   @property
   def raiden_controller_address(self) -> str:

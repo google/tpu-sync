@@ -123,10 +123,20 @@ py_library(
     tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
-        ":kv_cache_store",
         ":torch_abi",
         ":torch_tpu_common_loader",
+        "//tpu_sync/api:common",
         "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
+    ],
+)
+
+py_test(
+    name = "reshard_store_test",
+    srcs = ["reshard_store_test.py"],
+    tags = ["nobuilder"],
+    deps = [
+        ":reshard_store",
+        "@com_google_absl_py//absl/testing:absltest",
     ],
 )
 

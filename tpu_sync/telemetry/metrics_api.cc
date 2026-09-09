@@ -38,21 +38,33 @@
 #include "tpu_sync/telemetry/buffered_metrics_exporter.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/prometheus_exporter.h"
+#include "tpu_sync/telemetry/prometheus_shm_exporter.h"
 
 namespace tpu_raiden::telemetry {
 
 namespace {
 
+std::optional<std::string> ResolveEnvVar(const char* env_var) {
+  const char* value = std::getenv(env_var);
+  if (value != nullptr && *value != '\0') {
+    absl::string_view trimmed = absl::StripAsciiWhitespace(value);
+    if (!trimmed.empty()) {
+      return std::string(trimmed);
+    }
+  }
+  return std::nullopt;
+}
+
 int ResolveExporterPort() {
-  const char* env_port = std::getenv(kPrometheusPortEnvVar);
-  if (env_port != nullptr && *env_port != '\0') {
+  if (std::optional<std::string> port_str =
+          ResolveEnvVar(kPrometheusPortEnvVar)) {
     int parsed_port = 0;
-    if (absl::SimpleAtoi(env_port, &parsed_port) && parsed_port >= kMinPort &&
+    if (absl::SimpleAtoi(*port_str, &parsed_port) && parsed_port >= kMinPort &&
         parsed_port <= kMaxPort) {
       return parsed_port;
     }
     LOG(WARNING) << "Invalid port specified in " << kPrometheusPortEnvVar
-                 << ": '" << env_port << "'. Expected integer in range ["
+                 << ": '" << *port_str << "'. Expected integer in range ["
                  << kMinPort << ", " << kMaxPort
                  << "]. Falling back to default port (" << kDefaultExporterPort
                  << ").";
@@ -60,24 +72,11 @@ int ResolveExporterPort() {
   return kDefaultExporterPort;
 }
 
-std::string ResolveExporterHost() {
-  const char* env_host = std::getenv(kPrometheusHostEnvVar);
-  if (env_host != nullptr && *env_host != '\0') {
-    return std::string(env_host);
-  }
-  return std::string(kDefaultExporterHost);
+std::string ResolveEnvVar(const char* env_var,
+                          absl::string_view default_value) {
+  return ResolveEnvVar(env_var).value_or(std::string(default_value));
 }
 
-std::optional<std::string> ResolveLocalRank() {
-  const char* env_rank = std::getenv(kLocalRankEnvVar);
-  if (env_rank != nullptr && *env_rank != '\0') {
-    absl::string_view trimmed = absl::StripAsciiWhitespace(env_rank);
-    if (!trimmed.empty()) {
-      return std::string(trimmed);
-    }
-  }
-  return std::nullopt;
-}
 
 }  // namespace
 
@@ -143,12 +142,27 @@ absl::Status RaidenMetricStore::InitializeFromBackendNames(
       continue;
     }
     if (name == kPrometheus) {
-      new_backends.push_back(
-          std::make_unique<PrometheusExporter>(ExporterOptions{
-              .bind_address = ResolveExporterHost(),
-              .port = ResolveExporterPort(),
-              .local_rank = ResolveLocalRank(),
-          }));
+      ExporterOptions exporter_options = {
+          .bind_address =
+              ResolveEnvVar(kPrometheusHostEnvVar, kDefaultExporterHost),
+          .port = ResolveExporterPort(),
+          .local_rank = ResolveEnvVar(kLocalRankEnvVar),
+          .shm_dir = ResolveEnvVar(kTelemetryMultiprocDirEnvVar),
+      };
+      if (exporter_options.shm_dir) {
+        if (!exporter_options.local_rank) {
+          return absl::FailedPreconditionError(
+              "LOCAL_RANK environment variable must be set when multi-process "
+              "directory (TPU_RAIDEN_TELEMETRY_MULTIPROC_DIR) is configured "
+              "for the prometheus backend.");
+        }
+        new_backends.push_back(
+            std::make_unique<PrometheusShmExporter>(
+                std::move(exporter_options)));
+      } else {
+        new_backends.push_back(
+            std::make_unique<PrometheusExporter>(std::move(exporter_options)));
+      }
     } else if (name == kBuffered) {
       new_backends.push_back(std::make_unique<BufferedMetricsExporter>());
     }

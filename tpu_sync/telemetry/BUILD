@@ -33,6 +33,7 @@ cc_library(
         ":buffered_metrics_exporter",
         ":metrics_3p_prometheus_exporter",
         ":metrics_backend",
+        ":prometheus_shm_exporter",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/base:no_destructor",
         "@com_google_absl//absl/container:flat_hash_set",

@@ -14,11 +14,16 @@
 
 #include "tpu_sync/telemetry/metrics_api.h"
 
+#include <stdlib.h>
+#include <unistd.h>
+
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <map>
 #include <memory>
 #include <string>
+#include <system_error>  // NOLINT(build/c++11)
 #include <thread>  // NOLINT(build/c++11)
 #include <type_traits>
 #include <utility>
@@ -28,6 +33,7 @@
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -680,6 +686,23 @@ TEST_F(MetricsApiTest, InitializeFromEnvironmentNoOpIfAlreadyInitialized) {
   EXPECT_TRUE(store_.HasBackends());
 }
 
+TEST_F(MetricsApiTest, InitializeFromEnvironmentCustomOptions) {
+  std::string test_dir =
+      absl::StrCat(::testing::TempDir(), "/metrics_api_env_opts_", getpid());
+  std::filesystem::create_directories(test_dir);
+
+  ScopedEnvironmentVariable env_var(kTelemetryBackendsEnvVar, "prometheus");
+  ScopedEnvironmentVariable shm_var(kTelemetryMultiprocDirEnvVar,
+                                    test_dir.c_str());
+  ScopedEnvironmentVariable rank_var("LOCAL_RANK", "0");
+
+  EXPECT_THAT(store_.InitializeFromEnvironment(), IsOk());
+  EXPECT_TRUE(store_.HasBackends());
+
+  std::error_code ec;
+  std::filesystem::remove_all(test_dir, ec);
+}
+
 TEST_F(MetricsApiTest, InitializeWithPrometheusPortEnvironmentVariable) {
   int port = PickUnusedPort();
   std::string port_str = absl::StrCat(port);
@@ -709,6 +732,73 @@ TEST_F(MetricsApiTest,
   ScopedEnvironmentVariable out_of_range_env(kPrometheusPortEnvVar, "99999");
   ASSERT_OK(store_.InitializeFromBackendNames({"prometheus"}));
   EXPECT_TRUE(store_.HasBackends());
+}
+
+TEST_F(MetricsApiTest, InitializeWithMultiprocDirSwitchesToShmExporter) {
+  const std::string test_dir = testing::TempDir();
+  std::filesystem::create_directories(test_dir);
+
+  ScopedEnvironmentVariable multiproc_env(kTelemetryMultiprocDirEnvVar,
+                                          test_dir.c_str());
+  ScopedEnvironmentVariable rank_env("LOCAL_RANK", "1");
+  EXPECT_THAT(store_.InitializeFromBackendNames({"prometheus"}), IsOk());
+  EXPECT_TRUE(store_.HasBackends());
+
+  const MetricLabel labels[] = {
+      {metric_labels::kDirection, metric_labels::kDirectionPush}};
+  store_.IncrementCounter(metric_names::kSentBytesTotal, labels, 555);
+  std::string snapshot = store_.GetTextSnapshot();
+  EXPECT_THAT(snapshot, HasSubstr("tpu_raiden_sent_bytes_total"));
+  EXPECT_THAT(snapshot, HasSubstr("555"));
+
+  store_.SetBackends({});
+  std::filesystem::remove_all(test_dir);
+}
+
+TEST_F(MetricsApiTest, InitializePrometheusWithMultiprocDirAndRankEnvironment) {
+  const std::string test_dir = testing::TempDir();
+  std::filesystem::create_directories(test_dir);
+
+  ScopedEnvironmentVariable shm_var(kTelemetryMultiprocDirEnvVar,
+                                    test_dir.c_str());
+  ScopedEnvironmentVariable rank_var("LOCAL_RANK", "2");
+
+  EXPECT_THAT(store_.InitializeFromBackendNames({"prometheus"}), IsOk());
+  EXPECT_TRUE(store_.HasBackends());
+
+  const MetricLabel labels[] = {
+      {metric_labels::kDirection, metric_labels::kDirectionPush}};
+  store_.IncrementCounter(metric_names::kSentBytesTotal, labels, 777);
+  std::string snapshot = store_.GetTextSnapshot();
+  EXPECT_THAT(snapshot, HasSubstr("tpu_raiden_sent_bytes_total"));
+  EXPECT_THAT(snapshot, HasSubstr("777"));
+
+  bool found_chunk = false;
+  for (const auto& entry : std::filesystem::directory_iterator(test_dir)) {
+    std::string fn = entry.path().filename().string();
+    if (absl::StartsWith(fn, "worker_rank_2_") &&
+        absl::EndsWith(fn, "_chunk_0.mmap")) {
+      found_chunk = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found_chunk);
+
+  store_.SetBackends({});
+  std::filesystem::remove_all(test_dir);
+}
+
+TEST_F(MetricsApiTest, InitializeWithMultiprocDirFailsWhenLocalRankUnset) {
+  ScopedEnvironmentVariable unset_rank("LOCAL_RANK", "");
+  unsetenv("LOCAL_RANK");
+  ScopedEnvironmentVariable shm_var(kTelemetryMultiprocDirEnvVar,
+                                    testing::TempDir().c_str());
+
+  absl::Status status = store_.InitializeFromBackendNames({"prometheus"});
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("LOCAL_RANK"));
 }
 
 TEST_F(MetricsApiTest, InitializeWithLocalRankEnvironmentVariable) {

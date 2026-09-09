@@ -37,6 +37,8 @@ inline constexpr char kTelemetryBackendsEnvVar[] =
 inline constexpr char kPrometheusPortEnvVar[] = "TPU_RAIDEN_PROMETHEUS_PORT";
 inline constexpr char kPrometheusHostEnvVar[] = "TPU_RAIDEN_PROMETHEUS_HOST";
 inline constexpr char kLocalRankEnvVar[] = "LOCAL_RANK";
+inline constexpr char kTelemetryMultiprocDirEnvVar[] =
+    "TPU_RAIDEN_TELEMETRY_MULTIPROC_DIR";
 // Environment Variables END.
 
 // Backend names START.

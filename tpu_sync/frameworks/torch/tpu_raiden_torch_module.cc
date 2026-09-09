@@ -987,6 +987,20 @@ NB_MODULE(_tpu_raiden_torch, m) {
                py_pending.push_back(nb::bytes(h.data(), h.size()));
              }
              return std::make_tuple(py_done, py_failed, py_pending);
+           })
+      .def("poll_evicted_hashes",
+           [](tpu_raiden::kv_cache::KVCacheStoreWrapper& self) {
+             std::vector<std::string> evicted;
+             {
+               nb::gil_scoped_release release;
+               evicted = self->PollEvictedHashes();
+             }
+             std::vector<nb::bytes> py_evicted;
+             py_evicted.reserve(evicted.size());
+             for (const auto& h : evicted) {
+               py_evicted.push_back(nb::bytes(h.data(), h.size()));
+             }
+             return py_evicted;
            });
 
   // C++-owned reshard client. The facade-compatible surface is provided by

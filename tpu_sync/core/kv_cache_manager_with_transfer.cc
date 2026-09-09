@@ -16,6 +16,7 @@
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -34,6 +35,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <exception>
 #include <functional>
@@ -278,7 +280,8 @@ int ConnectTcp(const std::string& endpoint, double timeout_s) {
     std::string err_str = std::strerror(errno);
     close(fd);
     freeaddrinfo(res);
-    throw std::runtime_error("connect(" + endpoint + ") failed: " + err_str);
+    throw std::runtime_error(
+        absl::StrCat("connect(", endpoint, ") failed: ", err_str));
   }
   freeaddrinfo(res);
   return fd;
@@ -522,6 +525,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
       metrics_collector_(std::move(metrics_collector)) {
+  circuit_breaker_enabled_ = IsCircuitBreakerEnvEnabled();
   if (local_control_port_ >= 0) {
     if (max_blocks_ <= 0) {
       throw std::invalid_argument("max_blocks must be positive");
@@ -577,6 +581,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
       metrics_collector_(std::move(metrics_collector)) {
+  circuit_breaker_enabled_ = IsCircuitBreakerEnvEnabled();
   if (num_layers() == 0 || num_shards() == 0) {
     return;
   }
@@ -618,7 +623,9 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
           num_layers, num_shards,
           std::vector<size_t>(num_layers, slice_byte_size), local_port,
           host_blocks_to_allocate, parallelism, node_id, local_control_port,
-          max_blocks, num_slots, timeout_s, std::move(metrics_collector)) {}
+          max_blocks, num_slots, timeout_s, std::move(metrics_collector)) {
+  circuit_breaker_enabled_ = IsCircuitBreakerEnvEnabled();
+}
 
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
@@ -638,6 +645,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(false),
       metrics_collector_(std::move(metrics_collector)) {
+  circuit_breaker_enabled_ = IsCircuitBreakerEnvEnabled();
   if (local_control_port_ >= 0) {
     if (max_blocks_ <= 0) {
       throw std::invalid_argument("max_blocks must be positive");
@@ -1802,12 +1810,76 @@ void KVCacheManagerWithTransfer::StartRead(
             local_block_ids, parallelism, local_host_block_ids);
 }
 
+bool KVCacheManagerWithTransfer::IsCircuitBreakerEnvEnabled() {
+  const char* env = std::getenv("TPU_RAIDEN_ENABLE_CIRCUIT_BREAKER");
+  if (env != nullptr) {
+    return absl::EqualsIgnoreCase(env, "1") ||
+           absl::EqualsIgnoreCase(env, "true");
+  }
+  return false;
+}
+
+bool KVCacheManagerWithTransfer::IsPeerBanned(
+    absl::string_view remote_endpoint) {
+  absl::MutexLock lock(circuit_breaker_mu_);
+  if (!circuit_breaker_enabled_) return false;
+  auto it = circuit_breakers_.find(remote_endpoint);
+  if (it != circuit_breakers_.end() && absl::Now() < it->second.banned_until) {
+    return true;
+  }
+  return false;
+}
+
+void KVCacheManagerWithTransfer::RecordCircuitBreakerSuccess(
+    absl::string_view remote_endpoint) {
+  absl::MutexLock lock(circuit_breaker_mu_);
+  if (!circuit_breaker_enabled_) return;
+  auto it = circuit_breakers_.find(remote_endpoint);
+  if (it != circuit_breakers_.end()) {
+    it->second.consecutive_failures = 0;
+    it->second.current_backoff = circuit_breaker_initial_backoff_;
+    it->second.banned_until = absl::InfinitePast();
+  }
+}
+
+void KVCacheManagerWithTransfer::RecordCircuitBreakerFailure(
+    absl::string_view remote_endpoint) {
+  absl::MutexLock lock(circuit_breaker_mu_);
+  if (!circuit_breaker_enabled_) return;
+  auto& cb = circuit_breakers_[remote_endpoint];
+  if (cb.current_backoff == absl::ZeroDuration()) {
+    cb.current_backoff = circuit_breaker_initial_backoff_;
+  }
+  // Straggler Protection: If already OPEN (banned), ignore stragglers!
+  if (absl::Now() < cb.banned_until) {
+    return;
+  }
+  if (++cb.consecutive_failures >= 2) {
+    cb.banned_until = absl::Now() + cb.current_backoff;
+    LOG(WARNING) << "Peer " << remote_endpoint
+                 << " failed 2 consecutive times. "
+                 << "Banning for " << cb.current_backoff << "!";
+    // Exponential backoff: double up to 16 minutes for the next ban
+    cb.current_backoff = std::min(cb.current_backoff * 2, absl::Minutes(16));
+    cb.consecutive_failures = 0;
+  }
+}
+
 void KVCacheManagerWithTransfer::StartRead(
     const std::string& req_id, uint64_t uuid,
     const std::string& remote_endpoint,
     const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids, int parallelism,
     std::optional<std::vector<int64_t>> local_host_block_ids) {
+  if (IsPeerBanned(remote_endpoint)) {
+    LOG(WARNING)
+        << "StartRead: peer " << remote_endpoint
+        << " is currently BANNED by circuit breaker. Fast-failing req_id="
+        << req_id;
+    absl::MutexLock lock(mu_);
+    failed_recving_.insert(req_id);
+    return;
+  }
   LOG(INFO) << "StartRead (initiate): req_id=" << req_id << ", uuid=" << uuid
             << ", numa=" << assigned_numa_node().value_or(-1);
   VLOG(1) << "KVCacheManagerWithTransfer::StartRead (Hybrid Bridge) called. "
@@ -1949,6 +2021,7 @@ void KVCacheManagerWithTransfer::StartRead(
         throw std::runtime_error(
             "Remote producer rejected Hybrid Bridge read request");
       }
+      RecordCircuitBreakerSuccess(remote_endpoint);
       VLOG(1) << "StartRead (Hybrid Bridge) successfully registered pull "
                  "request with Producer. req_id: "
               << req_id;
@@ -1956,6 +2029,7 @@ void KVCacheManagerWithTransfer::StartRead(
       LOG(ERROR)
           << "Raiden consumer error during Hybrid Bridge StartRead connect: "
           << e.what();
+      RecordCircuitBreakerFailure(remote_endpoint);
       absl::MutexLock lock(mu_);
       failed_recving_.insert(req_id);
       auto it = active_recv_entries_.find(uuid);
@@ -3348,7 +3422,7 @@ absl::Status KVCacheManagerWithTransfer::OnLayerReceived(size_t layer_idx,
   }
 
   auto future = future_or.value();
-  future.OnReady([this, uuid, layer_idx, recv_slot, req_id,
+  future.OnReady([this, uuid, layer_idx, req_id,
                   metrics_collector = metrics_collector_](auto status_or) {
     bool unregister_plan = false;
     uint64_t plan_generation = 0;

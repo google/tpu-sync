@@ -169,6 +169,9 @@ class KVCacheStore:
   def poll_load_status(self) -> tuple[list[bytes], list[bytes], list[bytes]]:
     """Polls status of asynchronous Load operations."""
     ...
+  def poll_evicted_hashes(self) -> list[bytes]:
+    """Polls logical block hashes that have been evicted from the host LRU cache."""
+    ...
   def read_remote(
       self,
       block_hashes: list[bytes],

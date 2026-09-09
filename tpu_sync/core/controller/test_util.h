@@ -15,16 +15,20 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_CORE_CONTROLLER_TEST_UTIL_H_
 #define THIRD_PARTY_TPU_RAIDEN_CORE_CONTROLLER_TEST_UTIL_H_
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "grpcpp/channel.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
@@ -37,6 +41,7 @@
 #include "tpu_sync/core/controller/worker_service_impl.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 
 namespace tpu_raiden {
 namespace controller {
@@ -161,6 +166,123 @@ struct MockTransferManager {
     last_src_offsets.assign(src_block_ids.begin(), src_block_ids.end());
     last_dst_offsets.assign(dst_block_ids.begin(), dst_block_ids.end());
     return std::make_pair(std::vector<int>{}, raiden::PjRtCopyFuture());
+  }
+
+  absl::flat_hash_map<std::string,
+                      std::shared_ptr<kv_cache::backends::KVBackend>>
+      backends;
+
+  void RegisterKVBackend(
+      const std::string& backend_name,
+      std::shared_ptr<kv_cache::backends::KVBackend> backend) {
+    backends[backend_name] = std::move(backend);
+  }
+
+  std::shared_ptr<kv_cache::backends::KVBackend> GetKVBackend(
+      absl::string_view backend_name) {
+    auto it = backends.find(std::string(backend_name));
+    if (it != backends.end()) return it->second;
+    class MockKVBackend : public kv_cache::backends::KVBackend {
+     public:
+      explicit MockKVBackend(std::string name) : name_(std::move(name)) {}
+      std::string name() const override { return name_; }
+      void WriteAsync(
+          const kv_cache::backends::BlockKey& key,
+          absl::Span<const kv_cache::backends::BackendBufferDescriptor> slices,
+          size_t total_bytes,
+          std::function<void(absl::Status)> callback) override {
+        if (callback) callback(absl::OkStatus());
+      }
+      void ReadAsync(
+          const kv_cache::backends::BlockKey& key,
+          absl::Span<const kv_cache::backends::BackendBufferDescriptor> slices,
+          size_t total_bytes,
+          std::function<void(absl::Status)> callback) override {
+        if (callback) callback(absl::OkStatus());
+      }
+      void BatchExistsAsync(
+          absl::Span<const kv_cache::backends::BlockKey> keys,
+          std::function<void(std::vector<absl::StatusOr<bool>>)> callback)
+          override {
+        if (callback) {
+          callback(std::vector<absl::StatusOr<bool>>(keys.size(), true));
+        }
+      }
+
+     private:
+      std::string name_;
+    };
+
+    class MockMapper : public kv_cache::backends::BlockKeyMapper {
+     public:
+      kv_cache::backends::BlockKey MapKey(
+          const std::string& block_hash,
+          const kv_cache::backends::KeyMappingOptions& options = {})
+          const override {
+        kv_cache::backends::BlockKey key;
+        key.block_hash = block_hash;
+        key.resolved_key = absl::StrCat(block_hash, ".bin");
+        return key;
+      }
+      int tp_size() const override { return 1; }
+    };
+    auto backend = std::make_shared<MockKVBackend>(std::string(backend_name));
+    backend->set_mapper(std::make_shared<MockMapper>());
+    backends[std::string(backend_name)] = backend;
+    return backend;
+  }
+
+  int h2d_read_from_backend_calls = 0;
+  int d2h_write_to_backend_calls = 0;
+  std::vector<kv_cache::backends::BlockKey> last_h2d_backend_keys;
+  std::vector<kv_cache::backends::BlockKey> last_d2h_backend_keys;
+  std::vector<int64_t> last_backend_src_block_ids;
+  std::vector<int64_t> last_backend_dst_block_ids;
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_host_block_ids,
+      const std::vector<int64_t>& dst_device_block_ids) {
+    ++h2d_read_from_backend_calls;
+    last_h2d_backend_keys = block_keys;
+    last_backend_src_block_ids = src_host_block_ids;
+    last_backend_dst_block_ids = dst_device_block_ids;
+    return H2d(src_host_block_ids, dst_device_block_ids, {1});
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+      std::shared_ptr<kv_cache::backends::KVBackend> backend,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_host_block_ids,
+      const std::vector<int64_t>& dst_device_block_ids) {
+    const std::shared_ptr<kv_cache::backends::KVBackend> b[] = {
+        std::move(backend)};
+    return H2dReadFromBackend(absl::MakeSpan(b), block_keys, src_host_block_ids,
+                              dst_device_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids,
+      const std::vector<int64_t>& dst_host_block_ids) {
+    ++d2h_write_to_backend_calls;
+    last_d2h_backend_keys = block_keys;
+    last_backend_src_block_ids = src_device_block_ids;
+    last_backend_dst_block_ids = dst_host_block_ids;
+    return D2h(src_device_block_ids, dst_host_block_ids, {1});
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+      std::shared_ptr<kv_cache::backends::KVBackend> backend,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids,
+      const std::vector<int64_t>& dst_host_block_ids) {
+    const std::shared_ptr<kv_cache::backends::KVBackend> b[] = {
+        std::move(backend)};
+    return D2hWriteToBackend(absl::MakeSpan(b), block_keys,
+                             src_device_block_ids, dst_host_block_ids);
   }
 };
 

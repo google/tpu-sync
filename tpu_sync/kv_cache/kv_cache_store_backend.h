@@ -45,6 +45,7 @@ enum class BlockStatus {
   HBM,
   HOST,
   HOST_AND_HBM,
+  SHARED_STORAGE,
 };
 
 struct RaidenBlockId {

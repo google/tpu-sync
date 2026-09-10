@@ -830,6 +830,31 @@ cc_test(
 )
 
 cc_test(
+    name = "kv_cache_manager_with_transfer_send_drain_test",
+    size = "small",
+    srcs = ["kv_cache_manager_with_transfer_send_drain_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    deps = [
+        ":kv_cache_manager_with_transfer",
+        ":raw_transfer_core",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla:future",
+    ],
+)
+
+cc_test(
     name = "kv_cache_manager_perf_test",
     timeout = "long",
     srcs = ["kv_cache_manager_perf_test.cc"],

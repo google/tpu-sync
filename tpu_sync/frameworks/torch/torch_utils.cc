@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
-#include "xla/pjrt/pjrt_client.h"
+#include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/frameworks/torch/torch_tpu_utils.h"
 
 namespace tpu_raiden {
@@ -76,8 +76,8 @@ UnpackedTensors UnpackTorchTensors(
         }
       }
       shard_buffers.push_back(unpacked.buffer);
-      // Retain every owning ref so view-materialized buffers survive for the
-      // lifetime of `out.refs`. (The test mock returns no ref -- nullopt --
+      // Retain every owning ref so the base storage buffers stay pinned for
+      // the lifetime of `out.refs`. (The test mock returns no ref -- nullopt --
       // since it hands back pre-registered buffers with no materialization.)
       if (unpacked.ref) {
         out.refs.push_back(std::move(*unpacked.ref));

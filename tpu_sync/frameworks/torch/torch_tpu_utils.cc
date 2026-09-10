@@ -14,17 +14,17 @@
 
 #include "tpu_sync/frameworks/torch/torch_tpu_utils.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <stdexcept>
-#include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/strings/str_cat.h"
 #include "ATen/core/TensorBody.h"
 #include "torch/headeronly/core/DeviceType.h"
-
-#include "torch_tpu/csrc/eager/materialize.h"
-#include "torch_tpu/csrc/eager/tensor_to_buffer.h"
+#include "torch_tpu/csrc/api/tensor_buffer.h"
+#include "tpu_sync/core/raw_transfer_core.h"
 
 namespace tpu_raiden {
 namespace torch {
@@ -59,20 +59,20 @@ UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
 
   // Raw transfer DMAs physical bytes directly into/out of the buffer, so it
   // must operate on the tensor's actual STORAGE buffer -- the one the model
-  // reads and writes -- NOT a materialized copy. MaterializeAndReturn returns
-  // the storage buffer only for a base tensor; for a layout-reinterpreting view
-  // (e.g. vLLM's `empty().set_(kv_cache.untyped_storage()).view(5D)`, where the
-  // model's on-device layout is tiled so the 5D reshape's layout differs from
-  // the base) it returns a SEPARATE materialized buffer. DMAing into that copy
-  // silently drops H2d (the model never sees the reload) and makes D2h read a
-  // one-off snapshot. GetBaseBuffer always returns the buffer backing the
+  // reads and writes -- NOT a materialized copy. Materializing a
+  // layout-reinterpreting view (e.g. vLLM's
+  // `empty().set_(kv_cache.untyped_storage()).view(5D)`, where the model's
+  // on-device layout is tiled so the 5D reshape's layout differs from the
+  // base) yields a SEPARATE buffer; DMAing into such a copy silently drops
+  // H2d (the model never sees the reload) and makes D2h read a one-off
+  // snapshot. GetBaseTensorBuffer always returns the buffer backing the
   // tensor's storage, so the DMA lands in the live cache regardless of view.
-  auto status_or_ref = torch_tpu::GetBaseBuffer(tensor);
+  auto status_or_ref = torch_tpu::GetBaseTensorBuffer(tensor);
   if (!status_or_ref.ok()) {
     throw std::runtime_error(absl::StrCat(
         "Failed to resolve base device buffer: ", status_or_ref.status().message()));
   }
-  torch_tpu::DeviceBufferRef base_ref = std::move(status_or_ref.value());
+  torch_tpu::TensorBufferHandle base_ref = std::move(status_or_ref.value());
 
   if (tensor.dim() == 0 || tensor.size(0) <= 0) {
     throw std::invalid_argument(
@@ -109,9 +109,7 @@ UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
   // Materialize deferred tensor so AwaitBuffer() won't hang. No-op if already
   // materialized. This should never return a separate buffer otherwise
   // all DMA operations will go to the wrong buffer.
-  if (auto status = torch_tpu::Materialize(
-          base_ref, torch_tpu::MaterializationReason::kExplicitSync);
-      !status.ok()) {
+  if (auto status = base_ref.Materialize(); !status.ok()) {
     throw std::runtime_error(absl::StrCat(
         "Failed to materialize base device buffer: ", status.message()));
   }

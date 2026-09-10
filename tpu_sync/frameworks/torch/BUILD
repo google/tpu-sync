@@ -19,29 +19,23 @@ load("//tpu_sync/core:header_only_cc_info.bzl", "header_only_cc_info")
 
 package(default_visibility = ["//visibility:public"])
 
-# Targets tagged "nobuilder" compile against a torch_tpu source checkout and
-# are built only by the external wheel build (build:oss in .bazelrc).
-header_only_cc_info(
-    name = "torch_tpu_device_buffer_headers",
-    tags = ["nobuilder"],
-    deps = [
-        "@torch_tpu//torch_tpu/csrc/eager:device_buffer",
-    ],
+config_setting(
+    name = "wheel_build",
+    values = {"define": "raiden_wheel_build=true"},
 )
 
+# Wrapper for the torch_tpu buffer API. The external wheel build (build.sh,
+# which passes --define raiden_wheel_build=true) compiles against it without
+# linking its objects and binds the symbols at import to the installed
+# torch_tpu wheel; every other build links it like a normal dependency.
 header_only_cc_info(
-    name = "torch_tpu_tensor_to_buffer_headers",
-    tags = ["nobuilder"],
+    name = "torch_tpu_tensor_buffer_headers",
+    header_only = select({
+        ":wheel_build": True,
+        "//conditions:default": False,
+    }),
     deps = [
-        "@torch_tpu//torch_tpu/csrc/eager:tensor_to_buffer",
-    ],
-)
-
-header_only_cc_info(
-    name = "torch_tpu_materialize_headers",
-    tags = ["nobuilder"],
-    deps = [
-        "@torch_tpu//torch_tpu/csrc/eager:materialize",
+        "@torch_tpu//torch_tpu/csrc/api:tensor_buffer",
     ],
 )
 
@@ -58,13 +52,10 @@ cc_library(
         "-use_header_modules",
     ],
     linkopts = ["-Wl,--allow-shlib-undefined"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
         # buildcleaner: keep
-        ":torch_tpu_device_buffer_headers",
-        # buildcleaner: keep
-        ":torch_tpu_tensor_to_buffer_headers",
+        ":torch_tpu_tensor_buffer_headers",
         ":torch_utils",
         "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -98,17 +89,15 @@ cc_library(
     features = [
         "-use_header_modules",
     ],
-    tags = ["nobuilder"],
     deps = [
-        ":torch_tpu_device_buffer_headers",
-        ":torch_tpu_materialize_headers",
-        ":torch_tpu_tensor_to_buffer_headers",
-        "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/core:xla_raw_transfer_headers",
         "@com_google_absl//absl/strings",
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
         "@torch_tpu//shims/torch/torch/headeronly:torch_headeronly",
+        # buildcleaner: keep
+        ":torch_tpu_tensor_buffer_headers",
+        "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:xla_raw_transfer_headers",
     ],
 )
 
@@ -124,14 +113,14 @@ cc_library(
     features = [
         "-use_header_modules",
     ],
-    tags = ["nobuilder"],
     deps = [
-        ":torch_tpu_tensor_to_buffer_headers",
         ":torch_tpu_utils",
-        "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/core:xla_raw_transfer_headers",
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
+        # buildcleaner: keep
+        ":torch_tpu_tensor_buffer_headers",
+        "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:xla_raw_transfer_headers",
     ],
 )
 
@@ -144,7 +133,6 @@ cc_library(
     features = [
         "-use_header_modules",
     ],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
         "@nanobind",
@@ -185,11 +173,18 @@ cc_library(
         "-use_header_modules",
     ],
     linkopts = ["-Wl,--allow-shlib-undefined"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
-        ":torch_tpu_tensor_to_buffer_headers",
         ":torch_utils",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@torch_tpu//shims/torch:aten_headers",
+        # buildcleaner: keep
+        ":torch_tpu_tensor_buffer_headers",
         "//tpu_sync/core:buffer_utils",
         "//tpu_sync/core:kv_cache_manager_with_transfer",
         "//tpu_sync/core:kv_manager_holder",
@@ -200,13 +195,6 @@ cc_library(
         "//tpu_sync/core/controller:worker_service_server",
         "//tpu_sync/kv_cache:kv_cache_listener",
         "//tpu_sync/transport:block_transport",
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:string_view",
-        "@com_google_absl//absl/synchronization",
-        "@torch_tpu//shims/torch:aten_headers",
     ],
 )
 
@@ -222,7 +210,6 @@ nanobind_extension(
         "-use_header_modules",
     ],
     linkopts = ["-Wl,--allow-shlib-undefined"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
         ":kv_cache_manager_torch",
@@ -283,16 +270,9 @@ cc_library(
         "-march=x86-64-v2",
     ],
     features = ["-use_header_modules"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
-        ":torch_tpu_device_buffer_headers",
-        ":torch_tpu_tensor_to_buffer_headers",
         ":torch_tpu_utils",
-        "//tpu_sync/core:host_memory_allocator",
-        "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/core:utils",
-        "//tpu_sync/core:xla_raw_transfer_headers",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
@@ -300,6 +280,12 @@ cc_library(
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch/c10/core:base_headers",
         "@torch_tpu//shims/torch/torch/headeronly:torch_headeronly",
+        # buildcleaner: keep
+        ":torch_tpu_tensor_buffer_headers",
+        "//tpu_sync/core:host_memory_allocator",
+        "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:utils",
+        "//tpu_sync/core:xla_raw_transfer_headers",
     ],
     alwayslink = 1,
 )
@@ -309,7 +295,6 @@ nanobind_extension(
     srcs = ["torch_raw_transfer_module.cc"],
     features = ["-use_header_modules"],
     linkopts = ["-Wl,--allow-shlib-undefined"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
         ":torch_nanobind_utils",
@@ -334,16 +319,9 @@ cc_library(
         "-march=x86-64-v2",
     ],
     features = ["-use_header_modules"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
-        ":torch_tpu_device_buffer_headers",
-        ":torch_tpu_tensor_to_buffer_headers",
         ":torch_tpu_utils_mock",
-        "//tpu_sync/core:host_memory_allocator",
-        "//tpu_sync/core:raw_transfer_core",
-        "//tpu_sync/core:utils",
-        "//tpu_sync/core:xla_raw_transfer_headers",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
@@ -351,6 +329,12 @@ cc_library(
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch/c10/core:base_headers",
         "@torch_tpu//shims/torch/torch/headeronly:torch_headeronly",
+        # buildcleaner: keep
+        ":torch_tpu_tensor_buffer_headers",
+        "//tpu_sync/core:host_memory_allocator",
+        "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:utils",
+        "//tpu_sync/core:xla_raw_transfer_headers",
     ],
 )
 
@@ -367,13 +351,13 @@ cc_library(
         "-march=x86-64-v2",
     ],
     features = ["-use_header_modules"],
-    tags = ["nobuilder"],
     deps = [
-        ":torch_tpu_device_buffer_headers",
-        "//tpu_sync/core:raw_transfer_core",
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
+        # buildcleaner: keep
+        ":torch_tpu_tensor_buffer_headers",
         "@xla//xla/pjrt:pjrt_client",
+        "//tpu_sync/core:raw_transfer_core",
     ],
 )
 
@@ -387,13 +371,13 @@ cc_library(
         "-march=x86-64-v2",
     ],
     features = ["-use_header_modules"],
-    tags = ["nobuilder"],
     deps = [
-        ":torch_tpu_tensor_to_buffer_headers",
         ":torch_tpu_utils_mock",
+        "@torch_tpu//shims/torch:aten_headers",
+        # buildcleaner: keep
+        ":torch_tpu_tensor_buffer_headers",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:xla_raw_transfer_headers",
-        "@torch_tpu//shims/torch:aten_headers",
     ],
 )
 
@@ -407,11 +391,18 @@ cc_library(
         "-march=x86-64-v2",
     ],
     features = ["-use_header_modules"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
-        ":torch_tpu_tensor_to_buffer_headers",
         ":torch_utils_mock",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@torch_tpu//shims/torch:aten_headers",
+        "@torch_tpu//shims/torch:torch_headers",
+        # buildcleaner: keep
+        ":torch_tpu_tensor_buffer_headers",
         "//tpu_sync/core:buffer_utils",
         "//tpu_sync/core:kv_cache_manager_with_transfer",
         "//tpu_sync/core:kv_manager_holder",
@@ -422,13 +413,6 @@ cc_library(
         "//tpu_sync/core/controller:worker_service_server",
         "//tpu_sync/kv_cache:kv_cache_listener",
         "//tpu_sync/transport:block_transport",
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/synchronization",
-        "@torch_tpu//shims/torch:aten_headers",
-        "@torch_tpu//shims/torch:torch_headers",
     ],
 )
 
@@ -442,11 +426,10 @@ cc_library(
         "-march=x86-64-v2",
     ],
     features = ["-use_header_modules"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
         # buildcleaner: keep
-        ":torch_tpu_device_buffer_headers",
+        ":torch_tpu_tensor_buffer_headers",
         ":torch_utils_mock",
         "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -501,7 +484,6 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
-        "@torch_tpu//torch_tpu/csrc/eager:device_buffer",
     ],
 )
 
@@ -536,7 +518,6 @@ cc_test(
         "-fexceptions",
     ],
     features = ["-use_header_modules"],
-    tags = ["nobuilder"],
     deps = [
         ":kv_cache_manager_torch_mock",
         ":torch_tpu_utils_mock",
@@ -561,7 +542,6 @@ cc_test(
         "-fexceptions",
     ],
     features = ["-use_header_modules"],
-    tags = ["nobuilder"],
     deps = [
         ":kv_cache_manager_torch_mock",
         ":torch_tpu_utils_mock",
@@ -585,7 +565,6 @@ cc_test(
         "-fexceptions",
     ],
     features = ["-use_header_modules"],
-    tags = ["nobuilder"],
     deps = [
         ":torch_raw_transfer_torch_mock",
         ":torch_tpu_utils_mock",
@@ -599,12 +578,17 @@ cc_test(
     ],
 )
 
+# kv_cache_manager_test.py imports torch_tpu-internal Python modules
+# (torch_tpu._internal.{execution_mode,sync}) that are not visible outside
+# torch_tpu: "manual" keeps the target out of wildcard builds and "nobuilder"
+# out of automated builders until torch_tpu publishes equivalents.
 py_test(
     name = "kv_cache_manager_test_py",
     srcs = ["kv_cache_manager_test.py"],
     main = "kv_cache_manager_test.py",
     tags = [
         "cpu:8",
+        "manual",
         "nobuilder",
         "notap",
         "requires-accel-hbm",
@@ -630,7 +614,6 @@ py_test(
     main = "torch_raw_transfer_perf_test.py",
     tags = [
         "cpu:8",
-        "nobuilder",
         "notap",
         "requires-accel-hbm",
         "requires-ghostlite:8",
@@ -654,7 +637,6 @@ py_test(
     main = "torch_raw_transfer_perf_test.py",
     tags = [
         "cpu:8",
-        "nobuilder",
         "notap",
         "requires-accel-hbm",
         "requires-ghostfish:4",
@@ -673,7 +655,6 @@ py_test(
 
 test_suite(
     name = "torch_raw_transfer_perf_test",
-    tags = ["nobuilder"],
     tests = [
         ":torch_raw_transfer_perf_test_gf",
         ":torch_raw_transfer_perf_test_gl",
@@ -687,7 +668,6 @@ py_test(
     main = "torch_raw_transfer_test.py",
     tags = [
         "cpu:8",
-        "nobuilder",
         "notap",
         "requires-accel-hbm",
         "requires-ghostlite:8",
@@ -710,7 +690,6 @@ py_test(
     main = "torch_raw_transfer_test.py",
     tags = [
         "cpu:8",
-        "nobuilder",
         "notap",
         "requires-accel-hbm",
         "requires-ghostfish:4",
@@ -728,7 +707,6 @@ py_test(
 
 test_suite(
     name = "torch_raw_transfer_test_py",
-    tags = ["nobuilder"],
     tests = [
         ":torch_raw_transfer_test_gf",
         ":torch_raw_transfer_test_gl",

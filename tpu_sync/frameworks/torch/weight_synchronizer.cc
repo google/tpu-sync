@@ -44,7 +44,6 @@
 
 #ifndef WITHOUT_PYTHON
 #include "ATen/core/TensorBody.h"
-#include "torch_tpu/csrc/eager/device_buffer.h"
 #include "tpu_sync/frameworks/torch/torch_utils.h"
 #endif
 

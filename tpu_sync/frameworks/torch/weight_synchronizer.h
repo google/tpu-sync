@@ -31,7 +31,7 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #ifndef WITHOUT_PYTHON
 #include "ATen/core/TensorBody.h"
-#include "torch_tpu/csrc/eager/device_buffer.h"
+#include "torch_tpu/csrc/api/tensor_buffer.h"
 #include "tpu_sync/frameworks/torch/torch_utils.h"
 #endif
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
@@ -154,7 +154,7 @@ class NumaAwareWeightSynchronizer
       ABSL_GUARDED_BY(expected_counts_mu_);
 
 #ifndef WITHOUT_PYTHON
-  std::vector<torch_tpu::DeviceBufferRef> buffer_refs_;
+  std::vector<torch_tpu::TensorBufferHandle> buffer_refs_;
 #endif
 };
 

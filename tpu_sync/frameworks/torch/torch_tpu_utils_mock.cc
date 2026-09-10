@@ -14,13 +14,17 @@
 
 #include "tpu_sync/frameworks/torch/torch_tpu_utils_mock.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
 #include "xla/pjrt/pjrt_client.h"
+#include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/frameworks/torch/torch_tpu_utils.h"
 
 namespace tpu_raiden {
@@ -62,7 +66,8 @@ UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
         "Failed to acquire RaidenBufferHandle for mock buffer");
   }
 
-  // Mock has no real materialization, hence no DeviceBufferRef to hand back.
+  // Mock has no real materialization, hence no TensorBufferHandle to hand
+  // back.
   if (tensor.dim() == 0 || tensor.size(0) <= 0) {
     return UnpackedTensor{.buffer = std::move(handle_or.value()),
                           .ref = std::nullopt};

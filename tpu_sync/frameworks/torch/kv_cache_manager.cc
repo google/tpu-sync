@@ -19,6 +19,7 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -71,9 +72,9 @@ std::string FormatAddressWithPort(absl::string_view ip, int port) {
 TorchKVCacheManager::UnpackedLayers TorchKVCacheManager::UnpackLayers(
     const std::vector<std::vector<at::Tensor>>& device_tensors,
     bool unsafe_skip_buffer_lock) {
-  // Retain the owning DeviceBufferRefs: for view tensors the materialized
-  // buffers are fresh allocations owned solely by these refs, so they must
-  // outlive every D2h/H2d the manager dispatches.
+  // Retain the owning TensorBufferHandles: they pin the base storage buffers
+  // backing the tensors, so they must outlive every D2h/H2d the manager
+  // dispatches.
   UnpackedTensors u =
       UnpackTorchTensors(device_tensors, unsafe_skip_buffer_lock);
   UnpackedLayers unpacked;

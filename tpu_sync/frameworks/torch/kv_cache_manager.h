@@ -26,7 +26,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
-#include "torch_tpu/csrc/eager/tensor_to_buffer.h"
+#include "torch_tpu/csrc/api/tensor_buffer.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 
@@ -106,10 +106,10 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
 
  private:
   // Buffers unpacked from a 2D tensor list, together with the owning
-  // DeviceBufferRefs that must outlive their use (see UnpackTorchTensor).
+  // TensorBufferHandles that must outlive their use (see UnpackTorchTensor).
   struct UnpackedLayers {
     std::vector<std::vector<raiden::RaidenBufferHandle>> buffers;
-    std::vector<torch_tpu::DeviceBufferRef> refs;
+    std::vector<torch_tpu::TensorBufferHandle> refs;
     xla::PjRtClient* client = nullptr;
     std::vector<int64_t> logical_dimensions;
     size_t logical_slice_byte_size = 0;
@@ -136,7 +136,7 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
 
   std::vector<at::Tensor> kv_caches_;
   // Keep-alives for the materialized device buffers backing the manager.
-  std::vector<torch_tpu::DeviceBufferRef> buffer_refs_;
+  std::vector<torch_tpu::TensorBufferHandle> buffer_refs_;
   std::unique_ptr<tpu_raiden::kv_cache::KVCacheListener> listener_;
 };
 

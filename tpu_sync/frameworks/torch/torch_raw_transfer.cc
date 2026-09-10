@@ -29,7 +29,7 @@
 #include "absl/types/span.h"
 #include "c10/core/Device.h"
 #include "torch/headeronly/core/DeviceType.h"
-#include "torch_tpu/csrc/eager/device_buffer.h"
+#include "torch_tpu/csrc/api/tensor_buffer.h"
 #include "xla/future.h"
 #include "xla/layout.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -314,10 +314,9 @@ PjRtCopyFuture TransferD2HBatchAsync(
         src_buffer, reinterpret_cast<uint8_t*>(dst_arrs[i].data_ptr()),
         dst_arrs[i].nbytes(), src_offsets_major_dim, dst_offsets_major_dim,
         copy_sizes_major_dim, std::move(torch_holds));
-    // Keep the materialized (possibly view) buffer alive until the copy is
-    // done.
+    // Keep the base storage buffer alive until the copy is done.
     if (unpacked.ref) {
-      fut.AddKeepAlive(std::make_shared<torch_tpu::DeviceBufferRef>(
+      fut.AddKeepAlive(std::make_shared<torch_tpu::TensorBufferHandle>(
           std::move(*unpacked.ref)));
     }
     futures.push_back(std::move(fut));
@@ -350,10 +349,9 @@ PjRtCopyFuture TransferH2DBatchAsync(
         reinterpret_cast<const uint8_t*>(src_arrs[i].data_ptr()),
         src_arrs[i].nbytes(), dst_buffer, src_offsets_major_dim,
         dst_offsets_major_dim, copy_sizes_major_dim, std::move(torch_holds));
-    // Keep the materialized (possibly view) buffer alive until the copy is
-    // done.
+    // Keep the base storage buffer alive until the copy is done.
     if (unpacked.ref) {
-      fut.AddKeepAlive(std::make_shared<torch_tpu::DeviceBufferRef>(
+      fut.AddKeepAlive(std::make_shared<torch_tpu::TensorBufferHandle>(
           std::move(*unpacked.ref)));
     }
     futures.push_back(std::move(fut));

@@ -21,12 +21,9 @@ py_library(
     srcs = ["torch_abi.py"],
 )
 
-# Targets tagged "nobuilder" compile against a torch_tpu source checkout and
-# are built only by the external wheel build (build:oss in .bazelrc).
 py_library(
     name = "torch_tpu_common_loader",
     srcs = ["torch_tpu_common_loader.py"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
         ":torch_abi",
@@ -43,7 +40,6 @@ py_library(
 py_library(
     name = "kv_cache_manager_torch_py",
     srcs = ["kv_cache_manager.py"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
         ":pool_layout",
@@ -77,7 +73,6 @@ py_test(
 py_library(
     name = "weight_synchronizer_torch_py",
     srcs = ["weight_synchronizer.py"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
         ":torch_abi",
@@ -91,7 +86,6 @@ py_library(
 py_library(
     name = "kv_cache_store",
     srcs = ["kv_cache_store.py"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
         "//tpu_sync/api:common",
@@ -106,7 +100,6 @@ py_library(
 py_library(
     name = "reshard_client",
     srcs = ["reshard_client.py"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
         ":torch_abi",
@@ -120,7 +113,6 @@ py_library(
 py_library(
     name = "reshard_store",
     srcs = ["reshard_store.py"],
-    tags = ["nobuilder"],
     visibility = ["//visibility:public"],
     deps = [
         ":torch_abi",
@@ -146,7 +138,6 @@ py_test(
     data = [
         "//tpu_sync/kv_cache/global_registry:global_registry_server",
     ],
-    tags = ["nobuilder"],
     deps = [
         ":kv_cache_store",
         "//pyglib:resources",
@@ -159,7 +150,6 @@ py_test(
     srcs = ["weight_synchronizer_test.py"],
     tags = [
         "cpu:8",
-        "nobuilder",
         "notap",
         "requires-accel-hbm",
         "requires-ghostlite:8",
@@ -200,7 +190,6 @@ py_test(
     srcs = ["kv_cache_manager_transfer_test.py"],
     tags = [
         "cpu:8",
-        "nobuilder",
         "notap",
         "requires-accel-hbm",
         "requires-ghostlite:8",

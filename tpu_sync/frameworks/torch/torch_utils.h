@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
-#include "torch_tpu/csrc/eager/tensor_to_buffer.h"
+#include "torch_tpu/csrc/api/tensor_buffer.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 
@@ -28,17 +28,17 @@ namespace tpu_raiden {
 namespace torch {
 
 // A 2D (layer x shard) batch of unpacked buffers together with the owning
-// DeviceBufferRefs (flattened). Returned by value -- rather than via an
+// TensorBufferHandles (flattened). Returned by value -- rather than via an
 // optional out-param -- precisely so the caller cannot silently drop the refs:
 // it MUST take `refs` and keep them alive for as long as it uses `buffers`
-// (view-materialized buffers are owned solely by these refs).
+// (the refs are what pin the base storage buffers behind `buffers`).
 //
 // IMPORTANT: the `buffer` pointer is only valid while `ref` is alive. Callers
 // that retain `buffer` past this call MUST keep `ref` alive for as long as they
 // use it (e.g. store it in a member / attach it to the transfer future).
 struct UnpackedTensors {
   std::vector<std::vector<raiden::RaidenBufferHandle>> buffers;
-  std::vector<torch_tpu::DeviceBufferRef> refs;
+  std::vector<torch_tpu::TensorBufferHandle> refs;
   std::vector<int64_t> logical_dimensions;
   size_t logical_slice_byte_size = 0;
   size_t logical_physical_size = 0;

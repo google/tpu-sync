@@ -157,7 +157,7 @@ BAZEL_TARGETS=(
   "//tpu_sync/kv_cache/global_registry:global_registry_server"
   "//tpu_sync/store_node:kv_cache_host_store_node_main"
 )
-DEFINE_FLAGS=""
+DEFINE_FLAGS=" --define raiden_wheel_build=true"
 BAZEL_MODULE_FLAGS=()
 TORCH_REPO_ENV_FLAGS=()
 

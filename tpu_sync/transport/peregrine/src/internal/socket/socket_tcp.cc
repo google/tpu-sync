@@ -172,7 +172,7 @@ ssize_t TcpSocket::Send(const Byte* const buf, const size_t len) const {
   size_t sent = 0;
   ssize_t left = len;
   while (left > 0) {
-    const ssize_t bytes = ::send(fd_.value(), ptr, left, /*flags=*/0);
+    const ssize_t bytes = ::send(fd_.value(), ptr, left, MSG_NOSIGNAL);
     if ABSL_PREDICT_TRUE (bytes > 0) {
       DCHECK_LE(bytes, left);
       ptr += bytes;
@@ -209,11 +209,14 @@ ssize_t TcpSocket::SendV(const absl::Span<const IoVec> iovecs) const {
   DCHECK_LE(len, std::numeric_limits<ssize_t>::max());
 
   std::vector<struct iovec> vecs{iovecs.begin(), iovecs.end()};
-  const int n = vecs.size();
+  const size_t n = vecs.size();
   size_t sent = 0;
-  int i = 0;
+  size_t i = 0;
+  struct msghdr msg = {};
   while (i < n) {
-    const ssize_t bytes = ::writev(fd_.value(), &vecs[i], n - i);
+    msg.msg_iov = &vecs[i];
+    msg.msg_iovlen = n - i;
+    const ssize_t bytes = ::sendmsg(fd_.value(), &msg, MSG_NOSIGNAL);
     if ABSL_PREDICT_TRUE (bytes > 0) {
       sent += bytes;
       if ABSL_PREDICT_TRUE (sent >= len) break;
@@ -232,11 +235,11 @@ ssize_t TcpSocket::SendV(const absl::Span<const IoVec> iovecs) const {
       if ABSL_PREDICT_TRUE (bytes < 0) {
         if (Interrupted(last_errno)) continue;
         DCHECK(!WouldBlock(last_errno));
-        LOG(WARNING) << errMsg("send", last_errno);
+        LOG(WARNING) << errMsg("sendmsg", last_errno);
         return -1;
       } else {  // rarely happens
         DCHECK_EQ(bytes, 0);
-        LOG(WARNING) << errMsg("send zero", last_errno);
+        LOG(WARNING) << errMsg("sendmsg zero", last_errno);
         return 0;
       }
     }
@@ -308,13 +311,13 @@ ssize_t TcpSocket::RecvV(const absl::Span<const IoVec> iovecs) const {
         vecs[i].iov_len -= b;
       }
     } else if (bytes == 0) {  // peer closed connection
-      LOG(INFO) << ioMsg("recv eof", 0);
+      LOG(INFO) << ioMsg("readv eof", 0);
       return 0;
     } else {
       const auto last_errno = errno;
       if (Interrupted(last_errno)) continue;
       DCHECK(!WouldBlock(last_errno));
-      LOG(WARNING) << errMsg("recv", last_errno);
+      LOG(WARNING) << errMsg("readv", last_errno);
       return -1;
     }
   }

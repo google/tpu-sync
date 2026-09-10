@@ -101,7 +101,7 @@ ssize_t UdpSocket::Send(const Byte* const buf, const size_t len) const {
   DCHECK_LE(len, std::numeric_limits<ssize_t>::max());
 
   while (true) {
-    const ssize_t bytes = ::send(fd_.value(), buf, len, /*flags=*/0);
+    const ssize_t bytes = ::send(fd_.value(), buf, len, MSG_NOSIGNAL);
     DCHECK(bytes == len || bytes < 0);
     if ABSL_PREDICT_TRUE (bytes == len) {
       VLOG(1) << ioMsg("send", bytes);

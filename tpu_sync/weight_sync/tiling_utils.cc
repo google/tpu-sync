@@ -14,7 +14,10 @@
 
 #include "tpu_sync/weight_sync/tiling_utils.h"
 
+#include <sched.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -38,7 +41,15 @@ namespace tpu_raiden::weight_sync {
 
 namespace {
 
-constexpr int64_t kParallelizationThresholdBytes = 2 * 1024 * 1024;
+// Tensors below this threshold are tiled inline directly on the calling thread
+// to preserve private L2 cache locality and avoid thread pool scheduling
+// overhead.
+constexpr int64_t kParallelizationThresholdBytes = 4 * 1024 * 1024;  // 4 MB
+
+// Maximum sub-task chunks per tensor when parallelizing across the thread pool,
+// ensuring a single large tensor does not monopolize the pool during concurrent
+// layer arrivals.
+constexpr int64_t kMaxChunksPerTensor = 4;
 
 constexpr int64_t kMaxNumThreads = 4;
 
@@ -544,7 +555,8 @@ void DetileSingleTilePackedWithPadding(const uint8_t* src_tile_ptr,
 // CPU cache pollution, instead zeroing padding elements locally per tile.
 absl::Status TileBufferNDOptimized(const uint8_t* src_linear,
                                    uint8_t* dst_tiled, const xla::Shape& shape,
-                                   const xla::Layout& layout) {
+                                   const xla::Layout& layout,
+                                   tpu_raiden::NumaThreadPool* pool = nullptr) {
   const int R = shape.dimensions().size();
   int64_t H = (R == 1) ? 1 : shape.dimensions(layout.minor_to_major(1));
   int64_t W = shape.dimensions(layout.minor_to_major(0));
@@ -697,26 +709,60 @@ absl::Status TileBufferNDOptimized(const uint8_t* src_linear,
           }
         };
 
-        tpu_raiden::NumaThreadPool* pool = GetThreadPool();
-        int64_t chunk_size =
-            (total_tasks + kMaxNumThreads - 1) / kMaxNumThreads;
-        int64_t num_chunks = (total_tasks + chunk_size - 1) / chunk_size;
-        absl::BlockingCounter counter(num_chunks);
+        tpu_raiden::NumaThreadPool* target_pool =
+            (pool != nullptr) ? pool : GetThreadPool();
+        int64_t pool_threads =
+            (target_pool != nullptr)
+                ? static_cast<int64_t>(target_pool->num_threads())
+                : 0;
+        int64_t max_threads =
+            std::min<int64_t>(kMaxChunksPerTensor, pool_threads);
 
-        for (int64_t t = 0; t < kMaxNumThreads; ++t) {
-          int64_t begin = t * chunk_size;
-          int64_t end = std::min(begin + chunk_size, total_tasks);
-          if (begin >= end) break;
-          pool->Schedule([&, begin, end]() {
-            for (int64_t i = begin; i < end; ++i) {
-              int64_t b = i / num_tiles_0;
-              int64_t tile_row = i % num_tiles_0;
-              run_task(b, tile_row);
+        if (max_threads > 1 && total_tasks >= max_threads) {
+          int64_t chunk_size = (total_tasks + max_threads - 1) / max_threads;
+          int64_t num_chunks = (total_tasks + chunk_size - 1) / chunk_size;
+          std::atomic<int64_t> remaining_tasks(num_chunks);
+
+          // Schedule chunks 1 .. num_chunks - 1 to the pool
+          for (int64_t t = 1; t < num_chunks; ++t) {
+            int64_t begin = t * chunk_size;
+            int64_t end = std::min(begin + chunk_size, total_tasks);
+            target_pool->Schedule(
+                [&run_task, &remaining_tasks, begin, end, num_tiles_0]() {
+                  for (int64_t i = begin; i < end; ++i) {
+                    int64_t b = i / num_tiles_0;
+                    int64_t tile_row = i % num_tiles_0;
+                    run_task(b, tile_row);
+                  }
+                  remaining_tasks.fetch_sub(1, std::memory_order_release);
+                });
+          }
+
+          // Execute chunk 0 directly on the calling thread
+          int64_t begin0 = 0;
+          int64_t end0 = std::min(chunk_size, total_tasks);
+          for (int64_t i = begin0; i < end0; ++i) {
+            int64_t b = i / num_tiles_0;
+            int64_t tile_row = i % num_tiles_0;
+            run_task(b, tile_row);
+          }
+          remaining_tasks.fetch_sub(1, std::memory_order_release);
+
+          // While waiting for other chunks to complete, help execute pending
+          // tasks from the pool
+          while (remaining_tasks.load(std::memory_order_acquire) > 0) {
+            if (target_pool != nullptr && target_pool->ExecuteOneTask()) {
+              continue;
             }
-            counter.DecrementCount();
-          });
+            sched_yield();
+          }
+        } else {
+          for (int64_t i = 0; i < total_tasks; ++i) {
+            int64_t b = i / num_tiles_0;
+            int64_t tile_row = i % num_tiles_0;
+            run_task(b, tile_row);
+          }
         }
-        counter.Wait();
       });
     }
   });
@@ -724,10 +770,9 @@ absl::Status TileBufferNDOptimized(const uint8_t* src_linear,
   return absl::OkStatus();
 }
 
-absl::Status DetileBufferNDOptimized(const uint8_t* src_tiled,
-                                     uint8_t* dst_linear,
-                                     const xla::Shape& shape,
-                                     const xla::Layout& layout) {
+absl::Status DetileBufferNDOptimized(
+    const uint8_t* src_tiled, uint8_t* dst_linear, const xla::Shape& shape,
+    const xla::Layout& layout, tpu_raiden::NumaThreadPool* pool = nullptr) {
   const int R = shape.dimensions().size();
   int64_t H = (R == 1) ? 1 : shape.dimensions(layout.minor_to_major(1));
   int64_t W = shape.dimensions(layout.minor_to_major(0));
@@ -873,26 +918,60 @@ absl::Status DetileBufferNDOptimized(const uint8_t* src_tiled,
           }
         };
 
-        tpu_raiden::NumaThreadPool* pool = GetThreadPool();
-        int64_t chunk_size =
-            (total_tasks + kMaxNumThreads - 1) / kMaxNumThreads;
-        int64_t num_chunks = (total_tasks + chunk_size - 1) / chunk_size;
-        absl::BlockingCounter counter(num_chunks);
+        tpu_raiden::NumaThreadPool* target_pool =
+            (pool != nullptr) ? pool : GetThreadPool();
+        int64_t pool_threads =
+            (target_pool != nullptr)
+                ? static_cast<int64_t>(target_pool->num_threads())
+                : 0;
+        int64_t max_threads =
+            std::min<int64_t>(kMaxChunksPerTensor, pool_threads);
 
-        for (int64_t t = 0; t < kMaxNumThreads; ++t) {
-          int64_t begin = t * chunk_size;
-          int64_t end = std::min(begin + chunk_size, total_tasks);
-          if (begin >= end) break;
-          pool->Schedule([&, begin, end]() {
-            for (int64_t i = begin; i < end; ++i) {
-              int64_t b = i / num_tiles_0;
-              int64_t tile_row = i % num_tiles_0;
-              run_detile_task(b, tile_row);
+        if (max_threads > 1 && total_tasks >= max_threads) {
+          int64_t chunk_size = (total_tasks + max_threads - 1) / max_threads;
+          int64_t num_chunks = (total_tasks + chunk_size - 1) / chunk_size;
+          std::atomic<int64_t> remaining_tasks(num_chunks);
+
+          // Schedule chunks 1 .. num_chunks - 1 to the pool
+          for (int64_t t = 1; t < num_chunks; ++t) {
+            int64_t begin = t * chunk_size;
+            int64_t end = std::min(begin + chunk_size, total_tasks);
+            target_pool->Schedule([&run_detile_task, &remaining_tasks, begin,
+                                   end, num_tiles_0]() {
+              for (int64_t i = begin; i < end; ++i) {
+                int64_t b = i / num_tiles_0;
+                int64_t tile_row = i % num_tiles_0;
+                run_detile_task(b, tile_row);
+              }
+              remaining_tasks.fetch_sub(1, std::memory_order_release);
+            });
+          }
+
+          // Execute chunk 0 directly on the calling thread
+          int64_t begin0 = 0;
+          int64_t end0 = std::min(chunk_size, total_tasks);
+          for (int64_t i = begin0; i < end0; ++i) {
+            int64_t b = i / num_tiles_0;
+            int64_t tile_row = i % num_tiles_0;
+            run_detile_task(b, tile_row);
+          }
+          remaining_tasks.fetch_sub(1, std::memory_order_release);
+
+          // While waiting for other chunks to complete, help execute pending
+          // tasks from the pool
+          while (remaining_tasks.load(std::memory_order_acquire) > 0) {
+            if (target_pool != nullptr && target_pool->ExecuteOneTask()) {
+              continue;
             }
-            counter.DecrementCount();
-          });
+            sched_yield();
+          }
+        } else {
+          for (int64_t i = 0; i < total_tasks; ++i) {
+            int64_t b = i / num_tiles_0;
+            int64_t tile_row = i % num_tiles_0;
+            run_detile_task(b, tile_row);
+          }
         }
-        counter.Wait();
       });
     }
   });
@@ -957,14 +1036,15 @@ int64_t GetTiledBufferElements(const xla::Shape& shape) {
 }
 
 absl::Status DetileBuffer(const uint8_t* src_tiled, uint8_t* dst_linear,
-                          const xla::Shape& shape, const xla::Layout& layout) {
+                          const xla::Shape& shape, const xla::Layout& layout,
+                          tpu_raiden::NumaThreadPool* pool) {
   if (layout.tiles().empty()) {
     std::memcpy(dst_linear, src_tiled, xla::ShapeUtil::ByteSizeOf(shape));
     return absl::OkStatus();
   }
 
   if (IsStandardRowMajorTiled(shape, layout)) {
-    return DetileBufferNDOptimized(src_tiled, dst_linear, shape, layout);
+    return DetileBufferNDOptimized(src_tiled, dst_linear, shape, layout, pool);
   }
 
   int64_t itemsize =
@@ -991,14 +1071,15 @@ absl::Status DetileBuffer(const uint8_t* src_tiled, uint8_t* dst_linear,
 }
 
 absl::Status TileBuffer(const uint8_t* src_linear, uint8_t* dst_tiled,
-                        const xla::Shape& shape, const xla::Layout& layout) {
+                        const xla::Shape& shape, const xla::Layout& layout,
+                        tpu_raiden::NumaThreadPool* pool) {
   if (layout.tiles().empty()) {
     std::memcpy(dst_tiled, src_linear, xla::ShapeUtil::ByteSizeOf(shape));
     return absl::OkStatus();
   }
 
   if (IsStandardRowMajorTiled(shape, layout)) {
-    return TileBufferNDOptimized(src_linear, dst_tiled, shape, layout);
+    return TileBufferNDOptimized(src_linear, dst_tiled, shape, layout, pool);
   }
 
   int64_t itemsize =

@@ -16,6 +16,7 @@
 #define THIRD_PARTY_TPU_RAIDEN_CORE_NUMA_THREAD_POOL_H_
 
 #include <condition_variable>
+#include <cstddef>
 #include <functional>
 #include <future>
 #include <memory>
@@ -86,6 +87,14 @@ class NumaThreadPool {
   // Returns true if the current thread is a worker thread of ANY
   // NumaThreadPool.
   static bool IsCurrentThreadWorker();
+
+  // Returns the number of worker threads in the pool.
+  size_t num_threads() const { return workers.size(); }
+
+  // Attempts to dequeue and execute one pending task.
+  // Returns true if a task was executed, false if the queue was empty or pool
+  // stopped.
+  bool ExecuteOneTask();
 
  private:
   void WorkerLoop();

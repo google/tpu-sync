@@ -81,4 +81,18 @@ NumaThreadPool::~NumaThreadPool() {
 
 bool NumaThreadPool::IsCurrentThreadWorker() { return is_worker_thread; }
 
+bool NumaThreadPool::ExecuteOneTask() {
+  std::function<void()> task;
+  {
+    std::unique_lock<std::mutex> lock(queue_mutex);  // NOLINT(build/c++11)
+    if (stop || tasks.empty()) {
+      return false;
+    }
+    task = std::move(tasks.front());
+    tasks.pop();
+  }
+  task();
+  return true;
+}
+
 }  // namespace tpu_raiden

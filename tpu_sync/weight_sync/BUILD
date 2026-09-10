@@ -133,6 +133,7 @@ cc_test(
     features = ["-use_header_modules"],
     deps = [
         ":tiling_utils",
+        "//tpu_sync/core:numa_thread_pool",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",

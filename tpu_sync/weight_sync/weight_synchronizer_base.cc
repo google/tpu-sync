@@ -429,7 +429,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
       }
       auto tile_start = absl::Now();
       auto status = tpu_raiden::weight_sync::TileBuffer(
-          shard_info.host_ptr, tiled_buffer_ptr, shard_hold.shape, *xla_layout);
+          shard_info.host_ptr, tiled_buffer_ptr, shard_hold.shape, *xla_layout,
+          h2d_pool_.get());
       if (!status.ok()) {
         return status;
       }
@@ -554,7 +555,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
            layout = *xla_layout, physical_bytes]() -> absl::Status {
             auto detile_start = absl::Now();
             absl::Status status = tpu_raiden::weight_sync::DetileBuffer(
-                tiled_buffer_ptr, dst_host_ptr, shape, layout);
+                tiled_buffer_ptr, dst_host_ptr, shape, layout,
+                push_pool_.get());
             double detile_time_ms =
                 absl::ToDoubleMilliseconds(absl::Now() - detile_start);
             if (status.ok()) {

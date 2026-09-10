@@ -177,24 +177,6 @@ class WriteRemoteClientReactor
 
   void OnDone(const ::grpc::Status& status) override {
     bool initial_ack_failed = !ack_received_;
-    if (!ack_received_) {
-      absl::Status rpc_status(
-          static_cast<absl::StatusCode>(status.error_code()),
-          status.error_message());
-      ack_promise_.Set(rpc_status);
-      result_promise_.Set(rpc_status);
-      ack_received_ = true;
-    } else if (has_result_) {
-      result_promise_.Set(result_);
-    } else if (status.ok()) {
-      result_promise_.Set(
-          absl::InternalError("WriteRemote stream closed without result"));
-    } else {
-      result_promise_.Set(
-          absl::Status(static_cast<absl::StatusCode>(status.error_code()),
-                       status.error_message()));
-    }
-
     if (tracker_ != nullptr && !initial_ack_failed && has_result_) {
       std::vector<std::string> hashes(request_.block_hashes().begin(),
                                       request_.block_hashes().end());
@@ -219,6 +201,24 @@ class WriteRemoteClientReactor
           tracker_->MarkFailed(hashes);
           break;
       }
+    }
+
+    if (!ack_received_) {
+      absl::Status rpc_status(
+          static_cast<absl::StatusCode>(status.error_code()),
+          status.error_message());
+      ack_promise_.Set(rpc_status);
+      result_promise_.Set(rpc_status);
+      ack_received_ = true;
+    } else if (has_result_) {
+      result_promise_.Set(result_);
+    } else if (status.ok()) {
+      result_promise_.Set(
+          absl::InternalError("WriteRemote stream closed without result"));
+    } else {
+      result_promise_.Set(
+          absl::Status(static_cast<absl::StatusCode>(status.error_code()),
+                       status.error_message()));
     }
 
     delete this;

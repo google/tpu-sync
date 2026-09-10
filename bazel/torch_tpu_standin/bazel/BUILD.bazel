@@ -1,0 +1,7 @@
+# Package marker so //bazel:*.bzl files are loadable.
+
+load("@nanobind_bazel//:build_defs.bzl", "nanobind_extension")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+package(default_visibility = ["//visibility:public"])

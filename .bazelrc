@@ -4,7 +4,7 @@ common --incompatible_disallow_empty_glob=false
 build:oss --experimental_repo_remote_exec
 build:oss --nocheck_visibility
 build:oss --copt=-DMLIR_PYTHON_PACKAGE_PREFIX=jaxlib.mlir.
-build:oss --override_module=torch_tpu=%workspace%/third_party/torch_tpu_stub
+build:oss --override_module=torch_tpu=%workspace%/bazel/torch_tpu_standin
 build:oss --action_env=CC=clang-18
 build:oss --action_env=CXX=clang++-18
 build:oss --repo_env=CC=clang-18

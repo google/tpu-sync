@@ -157,10 +157,10 @@ export BAZEL_OUTPUT_BASE=/cache/output_base
 # tpu_raiden_jax. Pick by BUILD_MODE.
 if [[ "${BUILD_MODE}" == "torch" ]]; then
   WHEEL_TARGET="//ci/wheel:raiden_torch_wheel"
-  WHEEL_DIST="tpu_raiden_torch"
+  WHEEL_DIST="tpu_sync_torch"
 else
   WHEEL_TARGET="//ci/wheel:raiden_jax_wheel"
-  WHEEL_DIST="tpu_raiden_jax"
+  WHEEL_DIST="tpu_sync_jax"
 fi
 # Match ONLY the wheel this build just produced. cache/output_base is shared
 # across builds, so its bin/ci/wheel/ dir accumulates wheels from earlier runs,

@@ -36,7 +36,7 @@ if [[ "${UPLOAD_WHEEL_TO_AR}" == "true" ]]; then
       uv run --isolated \
         --with twine \
         --with keyrings.google-artifactregistry-auth \
-        twine upload --repository-url ${REGISTRY_URL} /dist/tpu_raiden_*.whl
+        twine upload --repository-url ${REGISTRY_URL} /dist/tpu_*.whl
     "
   echo "===> Upload complete."
 fi

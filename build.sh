@@ -75,7 +75,12 @@ check_disk_space "/tmp" "Temporary Directory (/tmp)"
 
 echo "=== Navigating to workspace directory ==="
 cd "${WORKSPACE_DIR}"
-TORCH_TPU_MODULE_PATH="${TORCH_TPU_MODULE_PATH:-../torch_tpu}"
+# The torch_tpu Bazel module. By default this is the stand-in under
+# bazel/torch_tpu_standin, which provides everything the torch targets need
+# from torch_tpu (its public tensor_buffer header, the torch shims and the XLA
+# pin) without a torch_tpu checkout; point it at a torch_tpu checkout to build
+# against one instead.
+TORCH_TPU_MODULE_PATH="${TORCH_TPU_MODULE_PATH:-${WORKSPACE_DIR}/bazel/torch_tpu_standin}"
 
 # 0. Set up standalone Bazel environment in /tmp
 BAZEL_VERSION="$(cat .bazelversion | tr -d '[:space:]')"
@@ -89,14 +94,8 @@ fi
 
 "${BAZEL_BIN}" --version
 
-# Default behavior based on auto-detection
 BUILD_JAX=true
 BUILD_TORCH=true
-
-if [ ! -f "${TORCH_TPU_MODULE_PATH}/MODULE.bazel" ]; then
-  echo "torch_tpu checkout not found at ${TORCH_TPU_MODULE_PATH}. Defaulting to JAX-only build."
-  BUILD_TORCH=false
-fi
 
 # Parse command line arguments
 if [ "$#" -gt 0 ]; then
@@ -173,8 +172,7 @@ fi
 if [ "$BUILD_TORCH" = true ]; then
   echo "Configuring build for Torch..."
   if [[ ! -f "${TORCH_TPU_MODULE_PATH}/MODULE.bazel" ]]; then
-    echo "Error: Torch build requires a torch_tpu checkout at ${TORCH_TPU_MODULE_PATH}." >&2
-    echo "Set TORCH_TPU_MODULE_PATH to override the default ../torch_tpu location." >&2
+    echo "Error: no Bazel module at TORCH_TPU_MODULE_PATH=${TORCH_TPU_MODULE_PATH}." >&2
     exit 1
   fi
   TORCH_TPU_MODULE_PATH="$(cd "${TORCH_TPU_MODULE_PATH}" && pwd)"
@@ -285,12 +283,9 @@ PY
   )
 else
   DEFINE_FLAGS+=" --define with_torch=false"
-  DUMMY_TORCH_TPU_MODULE="${BAZEL_CACHE_BASE}/dummy_torch_tpu_module"
-  mkdir -p "${DUMMY_TORCH_TPU_MODULE}"
-  cat > "${DUMMY_TORCH_TPU_MODULE}/MODULE.bazel" <<'EOF'
-module(name = "torch_tpu", version = "0.1.1")
-EOF
-  BAZEL_MODULE_FLAGS+=("--override_module=torch_tpu=${DUMMY_TORCH_TPU_MODULE}")
+  # The jax targets reference nothing under @torch_tpu; the stand-in only has
+  # to satisfy the module dependency.
+  BAZEL_MODULE_FLAGS+=("--override_module=torch_tpu=${WORKSPACE_DIR}/bazel/torch_tpu_standin")
 fi
 
 if [ ${#BAZEL_TARGETS[@]} -eq 0 ]; then

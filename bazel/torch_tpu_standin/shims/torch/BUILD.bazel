@@ -1,0 +1,40 @@
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("@nanobind_bazel//:build_defs.bzl", "nanobind_extension")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+load("@rules_python//python:py_library.bzl", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Accepted so build.sh can pass --@torch_tpu//shims/torch:local_torch=True;
+# this stand-in always uses the locally installed torch.
+bool_flag(
+    name = "local_torch",
+    build_setting_default = True,
+)
+
+cc_library(
+    name = "aten_headers",
+    deps = ["@local_torch//:torch_headers"],
+)
+
+cc_library(
+    name = "torch_headers",
+    deps = [
+        "@local_torch//:torch_headers",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
+)
+
+# Torch symbols resolve at import from the torch already loaded in the
+# process, so nothing links the torch libraries.
+cc_library(
+    name = "torch",
+    deps = [":torch_headers"],
+)
+
+py_library(
+    name = "pytorch",
+    deps = ["@local_torch//:torch"],
+)

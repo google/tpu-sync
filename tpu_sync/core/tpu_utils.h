@@ -33,7 +33,14 @@ struct TpuPciDevice {
   int numa_node = -1;     // NUMA node, e.g. 0
 };
 
+// Memory policy modes matching Linux kernel set_mempolicy syscall:
+inline constexpr int kMpolDefault = 0;
+inline constexpr int kMpolPreferred = 1;
+inline constexpr int kMpolBind = 2;
+
 // Sets the memory policy for the current thread using set_mempolicy syscall.
+// If the environment variable RAIDEN_NUMA_POLICY is set, it overrides the
+// requested mode when node >= 0 (e.g. "preferred", "bind", "default").
 // Returns 0 on success, or a negative error code on failure.
 int64_t SetThreadMempolicy(int mode, int node = -1);
 
@@ -45,9 +52,10 @@ std::vector<int> GetNumaNodeCpuCores(int numa_node);
 // Returns 0 on success, or a negative error code on failure.
 int PinCurrentThreadToCores(const std::vector<int>& cores);
 
-// Pins the current thread to the given NUMA node and binds its memory
-// allocations. Returns 0 on success, or a negative error code on failure.
-int PinCurrentThreadToNumaNode(int node);
+// Pins the current thread to the given NUMA node and sets its memory
+// policy. By default uses kMpolBind (subject to RAIDEN_NUMA_POLICY override).
+// Returns 0 on success, or a negative error code on failure.
+int PinCurrentThreadToNumaNode(int node, int mode = kMpolBind);
 
 // Scans the PCI bus and returns all detected TPU PCI devices, sorted by BDF.
 const std::vector<TpuPciDevice>& GetTpuPciDevices();

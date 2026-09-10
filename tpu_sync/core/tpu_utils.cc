@@ -56,9 +56,29 @@
 
 namespace tpu_raiden {
 
+namespace {
+
+int GetConfiguredNumaPolicy(int fallback_mode) {
+  const char* env = std::getenv("RAIDEN_NUMA_POLICY");
+  if (!env || env[0] == '\0') {
+    return fallback_mode;
+  }
+  std::string_view policy(env);
+  if (absl::EqualsIgnoreCase(policy, "preferred") || policy == "1") {
+    return kMpolPreferred;
+  }
+  if (absl::EqualsIgnoreCase(policy, "bind") || policy == "2") {
+    return kMpolBind;
+  }
+  if (absl::EqualsIgnoreCase(policy, "default") || policy == "0") {
+    return kMpolDefault;
+  }
+  return fallback_mode;
+}
+
+}  // namespace
+
 int64_t SetThreadMempolicy(int mode, int node) {
-  constexpr int kMpolDefault = 0;
-  constexpr int kMpolBind = 2;
 #ifndef __NR_set_mempolicy
 #if defined(__x86_64__)
 #define __NR_set_mempolicy 238
@@ -68,19 +88,23 @@ int64_t SetThreadMempolicy(int mode, int node) {
 #endif
 
 #ifdef __NR_set_mempolicy
+  int effective_mode = (mode != kMpolDefault && node >= 0)
+                           ? GetConfiguredNumaPolicy(mode)
+                           : mode;
+
   int64_t res;
-  if (mode == kMpolDefault || node < 0) {
+  if (effective_mode == kMpolDefault || node < 0) {
     res = static_cast<int64_t>(
         syscall(__NR_set_mempolicy, kMpolDefault, nullptr, 0));
   } else {
     uint64_t mask = 1ULL << node;
     res = static_cast<int64_t>(
-        syscall(__NR_set_mempolicy, kMpolBind, &mask, sizeof(mask) * 8));
+        syscall(__NR_set_mempolicy, effective_mode, &mask, sizeof(mask) * 8));
   }
   if (res < 0) {
-    LOG(ERROR) << "SetThreadMempolicy(mode=" << mode << ", node=" << node
-               << ") failed: " << std::strerror(errno) << " (errno=" << errno
-               << ")";
+    LOG(ERROR) << "SetThreadMempolicy(mode=" << effective_mode
+               << ", node=" << node << ") failed: " << std::strerror(errno)
+               << " (errno=" << errno << ")";
   }
   return res;
 #else
@@ -161,7 +185,7 @@ int PinCurrentThreadToCores(const std::vector<int>& cores) {
 #endif
 }
 
-int PinCurrentThreadToNumaNode(int node) {
+int PinCurrentThreadToNumaNode(int node, int mode) {
   if (node < 0) return -1;
   std::vector<int> cores = GetNumaNodeCpuCores(node);
   if (cores.empty()) {
@@ -172,8 +196,7 @@ int PinCurrentThreadToNumaNode(int node) {
     int rc = PinCurrentThreadToCores(cores);
     if (rc != 0) return rc;
   }
-  constexpr int kMpolBind = 2;
-  int64_t mem_rc = SetThreadMempolicy(kMpolBind, node);
+  int64_t mem_rc = SetThreadMempolicy(mode, node);
   if (mem_rc < 0) return static_cast<int>(mem_rc);
   return 0;
 }

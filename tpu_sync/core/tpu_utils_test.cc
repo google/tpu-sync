@@ -20,6 +20,7 @@
 #include <sys/socket.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
@@ -102,6 +103,58 @@ TEST(TpuUtilsTest, PinCurrentThreadToNumaNodeTest) {
     LOG(WARNING)
         << "Could not resolve NUMA node for device, skipping pinning test.";
   }
+}
+
+TEST(TpuUtilsTest, SetThreadMempolicyWithoutFlagTest) {
+  unsetenv("RAIDEN_NUMA_POLICY");
+
+  int64_t rc_default = SetThreadMempolicy(kMpolDefault);
+  EXPECT_TRUE(rc_default == 0 || rc_default == -1);
+
+  int64_t rc_bind = SetThreadMempolicy(kMpolBind, 0);
+  EXPECT_TRUE(rc_bind == 0 || rc_bind == -1);
+
+  int64_t rc_preferred = SetThreadMempolicy(kMpolPreferred, 0);
+  EXPECT_TRUE(rc_preferred == 0 || rc_preferred == -1);
+
+  SetThreadMempolicy(kMpolDefault);
+}
+
+TEST(TpuUtilsTest, SetThreadMempolicyWithFlagTest) {
+  setenv("RAIDEN_NUMA_POLICY", "preferred", 1);
+  int64_t rc_pref = SetThreadMempolicy(kMpolBind, 0);
+  EXPECT_TRUE(rc_pref == 0 || rc_pref == -1);
+
+  setenv("RAIDEN_NUMA_POLICY", "bind", 1);
+  int64_t rc_bind = SetThreadMempolicy(kMpolBind, 0);
+  EXPECT_TRUE(rc_bind == 0 || rc_bind == -1);
+
+  setenv("RAIDEN_NUMA_POLICY", "default", 1);
+  int64_t rc_def = SetThreadMempolicy(kMpolBind, 0);
+  EXPECT_TRUE(rc_def == 0 || rc_def == -1);
+
+  unsetenv("RAIDEN_NUMA_POLICY");
+  SetThreadMempolicy(kMpolDefault);
+}
+
+TEST(TpuUtilsTest, PinCurrentThreadToNumaNodeWithAndWithoutFlagTest) {
+  unsetenv("RAIDEN_NUMA_POLICY");
+  int rc_noflag = PinCurrentThreadToNumaNode(0);
+  EXPECT_TRUE(rc_noflag == 0 || rc_noflag == -1 || rc_noflag == -22)
+      << "Unexpected failure without flag, rc=" << rc_noflag;
+
+  setenv("RAIDEN_NUMA_POLICY", "preferred", 1);
+  int rc_pref = PinCurrentThreadToNumaNode(0);
+  EXPECT_TRUE(rc_pref == 0 || rc_pref == -1 || rc_pref == -22)
+      << "Unexpected failure with RAIDEN_NUMA_POLICY=preferred, rc=" << rc_pref;
+
+  setenv("RAIDEN_NUMA_POLICY", "bind", 1);
+  int rc_bind = PinCurrentThreadToNumaNode(0);
+  EXPECT_TRUE(rc_bind == 0 || rc_bind == -1 || rc_bind == -22)
+      << "Unexpected failure with RAIDEN_NUMA_POLICY=bind, rc=" << rc_bind;
+
+  unsetenv("RAIDEN_NUMA_POLICY");
+  SetThreadMempolicy(kMpolDefault);
 }
 
 TEST(TpuUtilsTest, GetLocalHostNicAddressesTest) {

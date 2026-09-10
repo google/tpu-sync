@@ -69,31 +69,47 @@ class PreparedTorchRawTransfer
   RaidenBufferHandle buffer_;
 };
 
+// Raw device<->host DMA over torch tensors, mirroring the JAX-side
+// _raw_transfer surface. Each call materializes the TPU tensor's PjRtBuffer
+// and awaits its ready future before issuing the copy (the raw PJRT copy API
+// does not chain on buffer readiness), so a transfer issued right after the
+// producing op reads committed data. Later torch ops on the same tensor
+// produce new device buffers; re-issue the transfer (or re-create a
+// PreparedTorchRawTransfer) to observe them. Host tensors must be CPU,
+// contiguous, and SHOULD be pinned (pin_memory=True or RawHostBuffer):
+// pageable memory silently degrades to staged copies — a warning is logged,
+// and TPU_RAIDEN_RAW_REQUIRE_PINNED_HOST=1 turns it into an error.
+// `unsafe_skip_buffer_lock` skips the dynamic safety locking of the device
+// buffer for the duration of the copy, matching the JAX bindings' parameter.
 PjRtCopyFuture TransferD2HBatchAsync(
     const std::vector<at::Tensor>& src_arrs,
     const std::vector<at::Tensor>& dst_arrs,
     const std::vector<int64_t>& src_offsets_major_dim,
     const std::vector<int64_t>& dst_offsets_major_dim,
-    const std::vector<int64_t>& copy_sizes_major_dim);
+    const std::vector<int64_t>& copy_sizes_major_dim,
+    bool unsafe_skip_buffer_lock = false);
 
 PjRtCopyFuture TransferH2DBatchAsync(
     const std::vector<at::Tensor>& src_arrs,
     const std::vector<at::Tensor>& dst_arrs,
     const std::vector<int64_t>& src_offsets_major_dim,
     const std::vector<int64_t>& dst_offsets_major_dim,
-    const std::vector<int64_t>& copy_sizes_major_dim);
+    const std::vector<int64_t>& copy_sizes_major_dim,
+    bool unsafe_skip_buffer_lock = false);
 
 PjRtCopyFuture TransferD2HAsync(
     const at::Tensor& src_arr, const at::Tensor& dst_arr,
     const std::vector<int64_t>& src_offsets_major_dim,
     const std::vector<int64_t>& dst_offsets_major_dim,
-    const std::vector<int64_t>& copy_sizes_major_dim);
+    const std::vector<int64_t>& copy_sizes_major_dim,
+    bool unsafe_skip_buffer_lock = false);
 
 PjRtCopyFuture TransferH2DAsync(
     const at::Tensor& src_arr, const at::Tensor& dst_arr,
     const std::vector<int64_t>& src_offsets_major_dim,
     const std::vector<int64_t>& dst_offsets_major_dim,
-    const std::vector<int64_t>& copy_sizes_major_dim);
+    const std::vector<int64_t>& copy_sizes_major_dim,
+    bool unsafe_skip_buffer_lock = false);
 
 }  // namespace raiden
 

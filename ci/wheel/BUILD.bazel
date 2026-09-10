@@ -98,6 +98,9 @@ JAX_DEPS = [
 TORCH_DEPS = [
     "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
     "//tpu_sync/api/torch:kv_cache_manager_torch_py",
+    # Raw d2h/h2d DMA shim; the bindings themselves ride inside
+    # _tpu_raiden_torch as its raw_transfer submodule (no extra .so).
+    "//tpu_sync/api/torch:raw_transfer",
     "//tpu_sync/api/torch:reshard_client",
     "//tpu_sync/api/torch:reshard_store",
     "//tpu_sync/api/torch:weight_synchronizer_torch_py",

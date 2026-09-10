@@ -39,6 +39,7 @@
 #include "tpu_sync/frameworks/torch/kv_cache_manager.h"
 #include "tpu_sync/frameworks/torch/pool_layout_nanobind.h"
 #include "tpu_sync/frameworks/torch/torch_nanobind_utils.h"
+#include "tpu_sync/frameworks/torch/torch_raw_transfer_bindings.h"
 #include "tpu_sync/frameworks/torch/weight_synchronizer.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_wrapper.h"
@@ -1202,4 +1203,11 @@ NB_MODULE(_tpu_raiden_torch, m) {
       nb::call_guard<nb::gil_scoped_release>());
 
   tpu_raiden::telemetry::BindTelemetryApi(m);
+
+  // Raw device<->host DMA transfers over torch tensors, mirroring the JAX
+  // _raw_transfer module. Mounted as a submodule so the wheel ships a single
+  // ABI-dispatched extension instead of a second torch-linked .so.
+  nb::module_ raw_transfer = m.def_submodule(
+      "raw_transfer", "Raw device<->host DMA transfers for torch tensors.");
+  ::raiden::BindTorchRawTransfer(raw_transfer);
 }

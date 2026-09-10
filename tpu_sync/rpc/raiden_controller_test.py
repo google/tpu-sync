@@ -3229,5 +3229,203 @@ class FormatUnitHelpersTest(absltest.TestCase):
           )
 
 
+def _test_square(x):
+  return x * x
+
+
+class RaidenControllerMultiprocessingTest(absltest.TestCase):
+
+  def test_compute_schedule_with_mp_pool(self):
+    import multiprocessing as mp
+
+    src_u = raiden_controller.RaidenId("s", "0", "v", 0)
+    dst_u = raiden_controller.RaidenId("d", "0", "v", 0)
+    var = raiden_controller._VariableMetadata(
+        name="v0",
+        shape=[16, 64],
+        mesh_shape=[1, 2],
+        layout=[0, 1],
+        item_size=4,
+        layer_idx=0,
+    )
+    args = raiden_controller._ScheduleChunkArgs(
+        var_names=["v0"],
+        src_vars_by_unit={src_u: {"v0": var}},
+        dst_vars_by_unit={dst_u: {"v0": var}},
+        src_units=[src_u],
+        dst_units=[dst_u],
+        src_shards={src_u: ["127.0.0.1:8000", "127.0.0.1:8001"]},
+        dst_shards={dst_u: ["127.0.0.1:8002", "127.0.0.1:8003"]},
+        src_phys_mesh_shapes={src_u: [1, 2]},
+        src_mesh_axes={src_u: ["x", "y"]},
+        dst_phys_mesh_shapes={dst_u: [1, 2]},
+        dst_mesh_axes={dst_u: ["x", "y"]},
+        num_src_physical_hosts=1,
+        num_dst_physical_hosts=1,
+        is_legacy_by_unit={src_u: False, dst_u: False},
+        local_skip_tiling=None,
+    )
+    with mp.Pool(2) as p:
+      res = p.map(
+          raiden_controller._compute_schedule_for_variable_chunk, [args, args]
+      )
+    self.assertLen(res, 2)
+    self.assertIn(src_u, res[0].computed_schedules)
+
+  def test_controller_multiprocessing_transfer(self):
+    client = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=10001, worker_rpc_client=client, schedule_workers=2
+    )
+    src_unit = raiden_controller.RaidenId("src", "0", "v", 0)
+    dst_unit = raiden_controller.RaidenId("dst", "0", "v", 0)
+    vars_metadata = [
+        raiden_service_pb2.VariableMetadataProto(
+            name=f"var_{i}",
+            shape=[16, 64],
+            mesh_shape=[1, 2],
+            layout=[0, 1],
+            item_size=4,
+            layer_idx=i,
+        )
+        for i in range(4)
+    ]
+    controller.register_work_unit(
+        src_unit,
+        shards=["127.0.0.1:8000", "127.0.0.1:8001"],
+        control_plane_rpc_address="127.0.0.1:9000",
+        variables=vars_metadata,
+    )
+    controller.register_work_unit(
+        dst_unit,
+        shards=["127.0.0.1:8002", "127.0.0.1:8003"],
+        control_plane_rpc_address="127.0.0.1:9001",
+        variables=vars_metadata,
+    )
+    loop = asyncio.new_event_loop()
+    try:
+      future = controller.start_transfer(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          req_id="mp_test_req",
+          use_block_chunks=True,
+      )
+      loop.run_until_complete(future.wait())
+    finally:
+      loop.close()
+    self.assertNotEmpty(client.calls)
+    plan = controller.get_plan("mp_test_req")
+    self.assertIsNotNone(plan)
+    self.assertIn(src_unit, plan.shard_push_schedules)
+
+  def test_multi_variable_parallel_scheduling_and_caching(self):
+    import time
+
+    num_vars = 64
+    src_vars = []
+    dst_vars = []
+    for i in range(num_vars):
+      layer = i // 8
+      var_name = f"layer_{layer}/weight_{i % 8}"
+      src_vars.append(
+          raiden_service_pb2.VariableMetadataProto(
+              name=var_name,
+              shape=[128, 1024],
+              mesh_shape=[16, 4],
+              layout=[0, 1],
+              item_size=2,
+              layer_idx=layer,
+              sharding_spec=["fsdp", "tp"],
+          )
+      )
+      dst_vars.append(
+          raiden_service_pb2.VariableMetadataProto(
+              name=var_name,
+              shape=[128, 1024],
+              mesh_shape=[8, 2],
+              layout=[0, 1],
+              item_size=2,
+              layer_idx=layer,
+              sharding_spec=["fsdp", "tp"],
+          )
+      )
+
+    src_units = [
+        raiden_controller.RaidenId("pathways", str(h), "weights_0")
+        for h in range(16)
+    ]
+    dst_units = [
+        raiden_controller.RaidenId("mc_jax", str(h), "weights_0")
+        for h in range(2)
+    ]
+
+    skip_tiling = {i // 8: False for i in range(num_vars)}
+
+    # Benchmark with multiprocessing (16 workers)
+    client_mp = RecordingWorkerRpcClient()
+    ctrl_mp = raiden_controller.RaidenController(
+        port=10010, worker_rpc_client=client_mp, schedule_workers=16
+    )
+    for h, u in enumerate(src_units):
+      ctrl_mp.register_work_unit(
+          u,
+          shards=[f"10.0.0.{h}:{8000 + s}" for s in range(4)],
+          control_plane_rpc_address=f"10.0.0.{h}:9000",
+          mesh_shape=[16, 4],
+          variables=src_vars,
+          mesh_axes=["fsdp", "tp"],
+      )
+    for h, u in enumerate(dst_units):
+      ctrl_mp.register_work_unit(
+          u,
+          shards=[f"10.0.1.{h}:{8000 + s}" for s in range(8)],
+          control_plane_rpc_address=f"10.0.1.{h}:9000",
+          mesh_shape=[8, 2],
+          variables=dst_vars,
+          mesh_axes=["fsdp", "tp"],
+      )
+
+    loop = asyncio.new_event_loop()
+    try:
+      t0 = time.perf_counter()
+      fut_mp = ctrl_mp.start_transfer(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+          use_block_chunks=True,
+          req_id="qwen_mp_cold",
+          skip_tiling=skip_tiling,
+          group_size=128,
+          parallelism=16,
+      )
+      loop.run_until_complete(fut_mp.wait())
+      t_mp_cold = time.perf_counter() - t0
+
+      # Warm start
+      t0 = time.perf_counter()
+      fut_mp_warm = ctrl_mp.start_transfer(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+          use_block_chunks=True,
+          req_id="qwen_mp_warm",
+          skip_tiling=skip_tiling,
+          group_size=128,
+          parallelism=16,
+      )
+      loop.run_until_complete(fut_mp_warm.wait())
+      t_mp_warm = time.perf_counter() - t0
+    finally:
+      loop.close()
+
+    print(f"\n=======================================================")
+    print(f"64 VARIABLES, 16 SRC x 2 DST UNITS PARALLEL SCHEDULE")
+    print(f"Cold-Start (16 Workers mp.Pool): {t_mp_cold:.4f} seconds")
+    print(f"Warm-Start (Plan Cache Hit):     {t_mp_warm:.6f} seconds")
+    print(f"=======================================================\n")
+    self.assertLess(t_mp_cold, 10.0)
+    self.assertLess(t_mp_warm, 0.05)
+
+
 if __name__ == "__main__":
   absltest.main()

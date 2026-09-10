@@ -20,6 +20,7 @@ import dataclasses
 import enum
 import functools
 import math
+import multiprocessing as mp
 import os
 import random
 import socket
@@ -1342,6 +1343,289 @@ def generate_strided_copy_chunks_tile_aware(
   return [(src_offset, dst_offset, size_bytes, src_stride, dst_stride, count)]
 
 
+@dataclasses.dataclass
+class _ScheduleChunkArgs:
+  var_names: list[str]
+  src_vars_by_unit: dict[RaidenId, dict[str, _VariableMetadata]]
+  dst_vars_by_unit: dict[RaidenId, dict[str, _VariableMetadata]]
+  src_units: list[RaidenId]
+  dst_units: list[RaidenId]
+  src_shards: dict[RaidenId, list[str]]
+  dst_shards: dict[RaidenId, list[str]]
+  src_phys_mesh_shapes: dict[RaidenId, list[int]]
+  src_mesh_axes: dict[RaidenId, list[str]]
+  dst_phys_mesh_shapes: dict[RaidenId, list[int]]
+  dst_mesh_axes: dict[RaidenId, list[str]]
+  num_src_physical_hosts: int
+  num_dst_physical_hosts: int
+  is_legacy_by_unit: dict[RaidenId, bool]
+  local_skip_tiling: Optional[dict[int, bool]]
+
+
+@dataclasses.dataclass
+class _ScheduleChunkResult:
+  computed_schedules: dict[RaidenId, dict[int, list[tuple]]]
+  local_skip_tiling: dict[int, bool]
+  computed_phys_meshes: dict[RaidenId, list[int]]
+
+
+def _compute_schedule_for_variable_chunk(
+    args: _ScheduleChunkArgs,
+) -> _ScheduleChunkResult:
+  chunk_computed_slices = {u: {} for u in args.src_units + args.dst_units}
+  chunk_computed_schedules = {}
+  chunk_skip_tiling = (
+      dict(args.local_skip_tiling) if args.local_skip_tiling is not None else {}
+  )
+  chunk_phys_meshes = {}
+
+  for var_name in args.var_names:
+    # 1. Compute slices for this variable across all source units
+    for s_unit in args.src_units:
+      s_var = args.src_vars_by_unit.get(s_unit, {}).get(var_name)
+      if s_var:
+        phys_shape, phys_mesh = to_physical(
+            s_var.shape, s_var.mesh_shape, s_var.layout
+        )
+        chunk_phys_meshes[s_unit] = phys_mesh
+        slices = nd_slice_math.compute_nd_shard_slices(phys_shape, phys_mesh)
+        chunk_computed_slices[s_unit][var_name] = slices
+
+    # 2. Compute slices for this variable across all destination units
+    for d_unit in args.dst_units:
+      d_var = args.dst_vars_by_unit.get(d_unit, {}).get(var_name)
+      if d_var:
+        phys_shape, phys_mesh = to_physical(
+            list(d_var.shape), list(d_var.mesh_shape), list(d_var.layout)
+        )
+        chunk_phys_meshes[d_unit] = phys_mesh
+        slices = nd_slice_math.compute_nd_shard_slices(phys_shape, phys_mesh)
+        chunk_computed_slices[d_unit][var_name] = slices
+
+    # 3. Compute skip_tiling for this variable if not already provided
+    if args.local_skip_tiling is None and args.src_units and args.dst_units:
+      ref_src_u = args.src_units[0]
+      ref_dst_u = args.dst_units[0]
+      ref_s_var = args.src_vars_by_unit.get(ref_src_u, {}).get(var_name)
+      ref_d_var = args.dst_vars_by_unit.get(ref_dst_u, {}).get(var_name)
+      if ref_s_var and ref_d_var:
+        layer_idx = ref_s_var.layer_idx
+        is_identical = _is_variable_spec_identical(ref_s_var, ref_d_var)
+        s_slices = chunk_computed_slices.get(ref_src_u, {}).get(var_name, [])
+        d_slices = chunk_computed_slices.get(ref_dst_u, {}).get(var_name, [])
+        all_aligned = True
+        for s_proto in s_slices:
+          s_sl = _proto_to_nd_slice(s_proto)
+          for d_proto in d_slices:
+            d_sl = _proto_to_nd_slice(d_proto)
+            inter = intersect_nd_slices(s_sl, d_sl)
+            if inter:
+              if not is_nd_slice_tile_aligned(
+                  s_sl, d_sl, inter, tile_shape=(8, 128)
+              ):
+                all_aligned = False
+                break
+          if not all_aligned:
+            break
+        is_2d_identical = is_identical and len(ref_s_var.shape) >= 2
+        can_skip = is_2d_identical or all_aligned
+        if layer_idx in chunk_skip_tiling:
+          chunk_skip_tiling[layer_idx] = (
+              chunk_skip_tiling[layer_idx] and can_skip
+          )
+        else:
+          chunk_skip_tiling[layer_idx] = can_skip
+
+    # 4. Pre-index source slice holders for this variable
+    src_slice_holders = {}
+    src_indices_by_unit = {}
+    for s_unit in args.src_units:
+      s_var = args.src_vars_by_unit.get(s_unit, {}).get(var_name)
+      if not s_var:
+        continue
+      s_shards = args.src_shards.get(s_unit, [])
+      s_phys_mesh = args.src_phys_mesh_shapes.get(s_unit)
+      s_mesh_axes = args.src_mesh_axes.get(s_unit)
+      s_slices = chunk_computed_slices.get(s_unit, {}).get(var_name, [])
+      if not s_slices:
+        continue
+      s_indices = _get_global_indices(
+          s_unit,
+          s_shards,
+          list(s_var.mesh_shape),
+          list(s_var.layout),
+          args.num_src_physical_hosts,
+          sharding_spec=list(s_var.sharding_spec),
+          mesh_axes=s_mesh_axes,
+          physical_mesh_shape=s_phys_mesh,
+      )
+      src_indices_by_unit[s_unit] = s_indices
+      for l_s_idx, g_s_idx in s_indices:
+        if g_s_idx < len(s_slices):
+          s_proto = s_slices[g_s_idx]
+          sl = tuple(_proto_to_nd_slice(s_proto))
+          src_slice_holders.setdefault((var_name, sl), []).append(
+              (s_unit, l_s_idx)
+          )
+
+    # 5. Pre-compute destination indices and slices for this variable
+    dst_indices_by_unit = {}
+    for d_unit in args.dst_units:
+      d_var = args.dst_vars_by_unit.get(d_unit, {}).get(var_name)
+      if not d_var:
+        continue
+      d_shards = args.dst_shards.get(d_unit, ["127.0.0.1:8000"])
+      d_phys_mesh = args.dst_phys_mesh_shapes.get(d_unit)
+      d_mesh_axes = args.dst_mesh_axes.get(d_unit)
+      d_indices = _get_global_indices(
+          d_unit,
+          d_shards,
+          list(d_var.mesh_shape),
+          list(d_var.layout),
+          args.num_dst_physical_hosts,
+          sharding_spec=list(d_var.sharding_spec),
+          mesh_axes=d_mesh_axes,
+          physical_mesh_shape=d_phys_mesh,
+      )
+      dst_indices_by_unit[d_unit] = d_indices
+
+    # 6. Intersect source and destination slices for this variable
+    for s_unit in args.src_units:
+      s_var = args.src_vars_by_unit.get(s_unit, {}).get(var_name)
+      if not s_var:
+        continue
+      itemsize = s_var.item_size
+      layer_idx = s_var.layer_idx
+      s_slices = chunk_computed_slices.get(s_unit, {}).get(var_name)
+      if not s_slices:
+        continue
+      s_indices = src_indices_by_unit.get(s_unit, [])
+      unit_schedules = chunk_computed_schedules.setdefault(s_unit, {})
+
+      for local_src_idx, global_src_idx in s_indices:
+        if global_src_idx >= len(s_slices):
+          continue
+        src_slice = _proto_to_nd_slice(s_slices[global_src_idx])
+        shard_entries = unit_schedules.setdefault(local_src_idx, [])
+
+        for d_unit in args.dst_units:
+          d_var = args.dst_vars_by_unit.get(d_unit, {}).get(var_name)
+          if not d_var:
+            continue
+          d_slices = chunk_computed_slices.get(d_unit, {}).get(var_name)
+          if not d_slices:
+            continue
+          d_shards = args.dst_shards.get(d_unit, ["127.0.0.1:8000"])
+          d_indices = dst_indices_by_unit.get(d_unit, [])
+
+          for local_dst_idx, global_dst_idx in d_indices:
+            if global_dst_idx >= len(d_slices):
+              continue
+            dst_slice = _proto_to_nd_slice(d_slices[global_dst_idx])
+            dst_peer = (
+                d_shards[local_dst_idx]
+                if local_dst_idx < len(d_shards)
+                else d_shards[0]
+            )
+
+            intersection = intersect_nd_slices(src_slice, dst_slice)
+            if intersection:
+              s_key = (var_name, tuple(src_slice))
+              candidates = src_slice_holders.get(
+                  s_key, [(s_unit, local_src_idx)]
+              )
+              if len(candidates) > 1:
+                dst_global_idx = (
+                    args.dst_units.index(d_unit)
+                    if d_unit in args.dst_units
+                    else 0
+                ) * max(1, len(d_shards)) + local_dst_idx
+                chosen_src = candidates[dst_global_idx % len(candidates)]
+                if (s_unit, local_src_idx) != chosen_src:
+                  continue
+
+              is_tile_aware = (
+                  chunk_skip_tiling.get(layer_idx, False)
+              ) and is_nd_slice_tile_aligned(
+                  src_slice, dst_slice, intersection, tile_shape=(8, 128)
+              )
+              if is_tile_aware:
+                chunks = generate_strided_copy_chunks_tile_aware(
+                    src_slice,
+                    dst_slice,
+                    intersection,
+                    itemsize,
+                    tile_shape=(8, 128),
+                )
+              else:
+                chunks = generate_strided_copy_chunks(
+                    src_slice, dst_slice, intersection, itemsize
+                )
+
+              for (
+                  src_offset,
+                  dst_offset,
+                  size,
+                  src_stride,
+                  dst_stride,
+                  count,
+              ) in chunks:
+                is_legacy = args.is_legacy_by_unit.get(
+                    s_unit, True
+                ) or args.is_legacy_by_unit.get(d_unit, True)
+
+                if len(src_slice) > 1:
+                  src_block_bytes = (
+                      math.prod([e - s for s, e in src_slice[1:]]) * itemsize
+                  )
+                  src_block_id = src_offset // src_block_bytes
+                  src_block_offset = (
+                      src_offset % src_block_bytes if is_legacy else src_offset
+                  )
+                else:
+                  src_block_bytes = (
+                      src_slice[0][1] - src_slice[0][0]
+                  ) * itemsize
+                  src_block_id = 0
+                  src_block_offset = src_offset
+
+                if len(dst_slice) > 1:
+                  dst_block_bytes = (
+                      math.prod([e - s for s, e in dst_slice[1:]]) * itemsize
+                  )
+                  dst_block_id = dst_offset // dst_block_bytes
+                  dst_block_offset = (
+                      dst_offset % dst_block_bytes if is_legacy else dst_offset
+                  )
+                else:
+                  dst_block_bytes = (
+                      dst_slice[0][1] - dst_slice[0][0]
+                  ) * itemsize
+                  dst_block_id = 0
+                  dst_block_offset = dst_offset
+
+                shard_entries.append((
+                    dst_peer,
+                    local_dst_idx,
+                    dst_block_offset,
+                    src_block_offset,
+                    size,
+                    src_block_id,
+                    dst_block_id,
+                    src_stride,
+                    dst_stride,
+                    count,
+                    layer_idx,
+                    0,
+                ))
+
+  return _ScheduleChunkResult(
+      computed_schedules=chunk_computed_schedules,
+      local_skip_tiling=chunk_skip_tiling,
+      computed_phys_meshes=chunk_phys_meshes,
+  )
+
+
 class RaidenController:
   """High-level transfer controller managing active transfers and generating transfer plans."""
 
@@ -1352,6 +1636,7 @@ class RaidenController:
       request_registry_ttl_s: float = 600.0,
       broadcast_k: Optional[int] = None,
       enable_plan_cache: bool = True,
+      schedule_workers: Optional[int] = None,
   ):
     """Initializes the RaidenController.
 
@@ -1362,6 +1647,9 @@ class RaidenController:
       broadcast_k: Fan-out factor K for tree-based broadcast transfers.
       enable_plan_cache: Whether to cache transfer planning and resharding
         schedules across transfer invocations with identical topologies.
+      schedule_workers: Number of worker processes to use for parallel schedule
+        planning. If None, defaults to RAIDEN_SCHEDULE_WORKERS environment
+        variable or 1 (original single-process behavior).
     """
     self.port = port
     self.broadcast_k = (
@@ -1370,6 +1658,11 @@ class RaidenController:
         else int(os.environ.get("RAIDEN_BROADCAST_K", "64"))
     )
     self.enable_plan_cache = enable_plan_cache
+    self.schedule_workers = (
+        schedule_workers
+        if schedule_workers is not None
+        else int(os.environ.get("RAIDEN_SCHEDULE_WORKERS", "1"))
+    )
     self._plan_cache: dict[Any, _CachedTransferSchedule] = {}
     self._active_transfers: dict[str, TransferPlan] = {}
     self._active_tasks: dict[str, RaidenFuture] = {}
@@ -2285,7 +2578,7 @@ class RaidenController:
                   data_address_to_unit[shard] = unit
             else:
               is_legacy_by_unit = {}
-              # Source slices (always local to sender controller)
+              src_vars_by_unit = {}
               for unit in src_units:
                 with self._lock:
                   variables = self._registered_variables.get(unit)
@@ -2312,27 +2605,12 @@ class RaidenController:
                   else:
                     src_vars = []
                   is_legacy_by_unit[unit] = True
+                src_vars_by_unit[unit] = {v.name: v for v in src_vars}
 
-                num_vars = max(num_vars, len(src_vars))
-                computed_slices[unit] = {}
-                for var in src_vars:
-                  phys_shape, phys_mesh = to_physical(
-                      var.shape, var.mesh_shape, var.layout
-                  )
-                  self._computed_phys_meshes[unit] = phys_mesh
-                  slices = nd_slice_math.compute_nd_shard_slices(
-                      phys_shape, phys_mesh
-                  )
-                  computed_slices[unit][var.name] = slices
-                  logging.debug(
-                      "Computed source slices for %s var %s: %s",
-                      unit,
-                      var.name,
-                      nd_slice_math.format_nd_slices(slices),
-                  )
-
-              # Destination slices
               dst_vars_by_unit = {}
+              dst_shards = {}
+              dst_phys_mesh_shapes = {}
+              dst_mesh_axes = {}
               for meta in dst_metadata:
                 unit = _raiden_id_from_proto(meta.unit)
                 for shard in meta.shards:
@@ -2361,390 +2639,162 @@ class RaidenController:
                   else:
                     dst_vars = []
                   is_legacy_by_unit[unit] = True
+                dst_vars_by_unit[unit] = {v.name: v for v in dst_vars}
+                dst_shards[unit] = (
+                    list(meta.shards) if meta.shards else ["127.0.0.1:8000"]
+                )
+                dst_phys_mesh_shapes[unit] = (
+                    list(meta.mesh_shape) if meta.mesh_shape else None
+                )
+                dst_mesh_axes[unit] = (
+                    list(meta.mesh_axes) if meta.mesh_axes else None
+                )
 
-                dst_vars_by_unit[unit] = dst_vars
-                computed_slices[unit] = {}
-                for var in dst_vars:
-                  phys_shape, phys_mesh = to_physical(
-                      list(var.shape),
-                      list(var.mesh_shape),
-                      list(var.layout),
-                  )
-                  self._computed_phys_meshes[unit] = phys_mesh
-                  slices = nd_slice_math.compute_nd_shard_slices(
-                      phys_shape, phys_mesh
-                  )
-                  computed_slices[unit][var.name] = slices
-                  logging.debug(
-                      "Computed destination slices for %s var %s: %s",
-                      unit,
-                      var.name,
-                      nd_slice_math.format_nd_slices(slices),
-                  )
+              src_shards = {}
+              src_phys_mesh_shapes = {}
+              src_mesh_axes = {}
+              for u in src_units:
+                src_shards[u] = self._resolve_shards(u)
+                with self._lock:
+                  src_phys_mesh_shapes[u] = self._registered_mesh_shapes.get(u)
+                  src_mesh_axes[u] = self._registered_mesh_axes.get(u)
 
-              # Compute skip_tiling if not provided
-              local_skip_tiling = skip_tiling
-              if local_skip_tiling is None:
-                local_skip_tiling = {}
-                if src_units and dst_units:
-                  reference_src_unit = src_units[0]
-                  with self._lock:
-                    reference_src_vars = self._registered_variables.get(
-                        reference_src_unit
+              with self._lock:
+                src_job_replicas = {
+                    u.job_replica_id
+                    for u in self._registered_shards
+                    if any(u.job_name == s.job_name for s in src_units)
+                }
+              num_src_physical_hosts = max(1, len(src_job_replicas))
+
+              with self._lock:
+                dst_job_replicas = {
+                    m.unit.job_replica_id
+                    for m in dst_metadata
+                    if any(m.unit.job_name == d.job_name for d in dst_units)
+                }
+              num_dst_physical_hosts = max(1, len(dst_job_replicas))
+
+              # Collect all distinct variable names preserving order
+              all_var_names_ordered = []
+              seen_var_names = set()
+              for unit in src_units:
+                for v in src_vars_by_unit.get(unit, {}).keys():
+                  if v not in seen_var_names:
+                    seen_var_names.add(v)
+                    all_var_names_ordered.append(v)
+              for unit in dst_units:
+                for v in dst_vars_by_unit.get(unit, {}).keys():
+                  if v not in seen_var_names:
+                    seen_var_names.add(v)
+                    all_var_names_ordered.append(v)
+
+              num_workers = (
+                  self.schedule_workers
+                  if self.schedule_workers is not None
+                  else 1
+              )
+              if num_workers <= 0:
+                num_workers = 1
+
+              num_chunks = min(num_workers, len(all_var_names_ordered))
+              if num_chunks <= 1:
+                chunk_args_list = [
+                    _ScheduleChunkArgs(
+                        var_names=all_var_names_ordered,
+                        src_vars_by_unit=src_vars_by_unit,
+                        dst_vars_by_unit=dst_vars_by_unit,
+                        src_units=src_units,
+                        dst_units=dst_units,
+                        src_shards=src_shards,
+                        dst_shards=dst_shards,
+                        src_phys_mesh_shapes=src_phys_mesh_shapes,
+                        src_mesh_axes=src_mesh_axes,
+                        dst_phys_mesh_shapes=dst_phys_mesh_shapes,
+                        dst_mesh_axes=dst_mesh_axes,
+                        num_src_physical_hosts=num_src_physical_hosts,
+                        num_dst_physical_hosts=num_dst_physical_hosts,
+                        is_legacy_by_unit=is_legacy_by_unit,
+                        local_skip_tiling=skip_tiling,
                     )
-                  if not reference_src_vars:
-                    with self._lock:
-                      global_shape = self._registered_global_shapes.get(
-                          reference_src_unit
+                ]
+                chunk_results = [
+                    _compute_schedule_for_variable_chunk(chunk_args_list[0])
+                ]
+              else:
+                chunk_size = math.ceil(len(all_var_names_ordered) / num_chunks)
+                chunk_args_list = []
+                for i in range(0, len(all_var_names_ordered), chunk_size):
+                  chunk_vars = all_var_names_ordered[i : i + chunk_size]
+                  chunk_vars_set = set(chunk_vars)
+                  chunk_args_list.append(
+                      _ScheduleChunkArgs(
+                          var_names=chunk_vars,
+                          src_vars_by_unit={
+                              u: {
+                                  k: v
+                                  for k, v in d.items()
+                                  if k in chunk_vars_set
+                              }
+                              for u, d in src_vars_by_unit.items()
+                          },
+                          dst_vars_by_unit={
+                              u: {
+                                  k: v
+                                  for k, v in d.items()
+                                  if k in chunk_vars_set
+                              }
+                              for u, d in dst_vars_by_unit.items()
+                          },
+                          src_units=src_units,
+                          dst_units=dst_units,
+                          src_shards=src_shards,
+                          dst_shards=dst_shards,
+                          src_phys_mesh_shapes=src_phys_mesh_shapes,
+                          src_mesh_axes=src_mesh_axes,
+                          dst_phys_mesh_shapes=dst_phys_mesh_shapes,
+                          dst_mesh_axes=dst_mesh_axes,
+                          num_src_physical_hosts=num_src_physical_hosts,
+                          num_dst_physical_hosts=num_dst_physical_hosts,
+                          is_legacy_by_unit=is_legacy_by_unit,
+                          local_skip_tiling=skip_tiling,
                       )
-                      mesh_shape = self._registered_mesh_shapes.get(
-                          reference_src_unit
-                      )
-                      layout = self._registered_layouts.get(reference_src_unit)
-                      itemsize = (
-                          self._registered_itemsizes.get(reference_src_unit)
-                          or 4
-                      )
-                    if global_shape and mesh_shape and layout:
-                      reference_src_vars = [
-                          _VariableMetadata(
-                              name=reference_src_unit.data_name,
-                              shape=global_shape,
-                              mesh_shape=mesh_shape,
-                              layout=layout,
-                              item_size=itemsize,
-                              layer_idx=0,
-                          )
-                      ]
-                    else:
-                      reference_src_vars = []
-
-                  reference_dst_unit = dst_units[0]
-                  reference_dst_vars = dst_vars_by_unit.get(
-                      reference_dst_unit, []
                   )
-
-                  for src_var in reference_src_vars:
-                    layer_idx = src_var.layer_idx
-                    dst_var = next(
-                        (
-                            v
-                            for v in reference_dst_vars
-                            if v.layer_idx == layer_idx
-                        ),
-                        None,
+                try:
+                  with mp.Pool(processes=len(chunk_args_list)) as pool:
+                    chunk_results = pool.map(
+                        _compute_schedule_for_variable_chunk, chunk_args_list
                     )
-                    if dst_var:
-                      is_identical = _is_variable_spec_identical(
-                          src_var, dst_var
-                      )
-                      s_slices = computed_slices.get(
-                          reference_src_unit, {}
-                      ).get(src_var.name, [])
-                      d_slices = computed_slices.get(
-                          reference_dst_unit, {}
-                      ).get(dst_var.name, [])
-                      all_aligned = True
-                      for s_proto in s_slices:
-                        s_sl = _proto_to_nd_slice(s_proto)
-                        for d_proto in d_slices:
-                          d_sl = _proto_to_nd_slice(d_proto)
-                          inter = intersect_nd_slices(s_sl, d_sl)
-                          if inter:
-                            if not is_nd_slice_tile_aligned(
-                                s_sl, d_sl, inter, tile_shape=(8, 128)
-                            ):
-                              all_aligned = False
-                              break
-                        if not all_aligned:
-                          break
-                      is_2d_identical = is_identical and len(src_var.shape) >= 2
+                except Exception as e:
+                  logging.warning(
+                      "multiprocessing.Pool failed (%s), falling back to"
+                      " sequential schedule computation",
+                      e,
+                  )
+                  chunk_results = [
+                      _compute_schedule_for_variable_chunk(args)
+                      for args in chunk_args_list
+                  ]
+
+              # Merge chunk results
+              computed_schedules = {}
+              local_skip_tiling = (
+                  dict(skip_tiling) if skip_tiling is not None else {}
+              )
+              for cr in chunk_results:
+                self._computed_phys_meshes.update(cr.computed_phys_meshes)
+                if skip_tiling is None:
+                  for layer_idx, can_skip in cr.local_skip_tiling.items():
+                    if layer_idx in local_skip_tiling:
                       local_skip_tiling[layer_idx] = (
-                          is_2d_identical or all_aligned
+                          local_skip_tiling[layer_idx] and can_skip
                       )
-
-              # Pre-index source slice holders to deduplicate and load-balance
-              # across replicated source shards.
-              src_slice_holders = {}
-              for s_unit in src_units:
-                with self._lock:
-                  variables = self._registered_variables.get(s_unit)
-                s_vars = variables if variables else []
-                s_shards = self._resolve_shards(s_unit)
-                with self._lock:
-                  s_job_reps = {
-                      u.job_replica_id
-                      for u in self._registered_shards
-                      if u.job_name == s_unit.job_name
-                  }
-                  s_phys_mesh = self._registered_mesh_shapes.get(s_unit)
-                  s_mesh_axes = self._registered_mesh_axes.get(s_unit)
-                num_src_hosts = max(1, len(s_job_reps))
-                for s_var in s_vars:
-                  s_slices_list = computed_slices.get(s_unit, {}).get(
-                      s_var.name
-                  )
-                  if not s_slices_list:
-                    continue
-                  s_indices_list = _get_global_indices(
-                      s_unit,
-                      s_shards,
-                      list(s_var.mesh_shape),
-                      list(s_var.layout),
-                      num_src_hosts,
-                      sharding_spec=list(s_var.sharding_spec),
-                      mesh_axes=s_mesh_axes,
-                      physical_mesh_shape=s_phys_mesh,
-                  )
-                  for l_s_idx, g_s_idx in s_indices_list:
-                    if g_s_idx < len(s_slices_list):
-                      s_proto = s_slices_list[g_s_idx]
-                      sl = tuple(_proto_to_nd_slice(s_proto))
-                      k = (s_var.name, sl)
-                      src_slice_holders.setdefault(k, []).append(
-                          (s_unit, l_s_idx)
-                      )
-
-              # 3. Generate plan (Intersection)
-              for src_unit in src_units:
-                with self._lock:
-                  variables = self._registered_variables.get(src_unit)
-                if variables:
-                  src_vars = variables
-                else:
-                  with self._lock:
-                    global_shape = self._registered_global_shapes.get(src_unit)
-                    mesh_shape = self._registered_mesh_shapes.get(src_unit)
-                    layout = self._registered_layouts.get(src_unit)
-                    itemsize = self._registered_itemsizes.get(src_unit) or 4
-                  if global_shape and mesh_shape and layout:
-                    src_vars = [
-                        _VariableMetadata(
-                            name=src_unit.data_name,
-                            shape=global_shape,
-                            mesh_shape=mesh_shape,
-                            layout=layout,
-                            item_size=itemsize,
-                            layer_idx=0,
-                        )
-                    ]
-                  else:
-                    src_vars = []
-
-                src_shards = self._resolve_shards(src_unit)
-                unit_schedules = {}
-
-                for src_var in src_vars:
-                  itemsize = src_var.item_size
-                  layer_idx = src_var.layer_idx
-                  var_name = src_var.name
-
-                  src_slices = computed_slices.get(src_unit, {}).get(var_name)
-                  if not src_slices:
-                    continue
-
-                  with self._lock:
-                    src_job_replicas = {
-                        u.job_replica_id
-                        for u in self._registered_shards
-                        if u.job_name == src_unit.job_name
-                    }
-                    src_phys_mesh_shape = self._registered_mesh_shapes.get(
-                        src_unit
-                    )
-                    src_mesh_axes = self._registered_mesh_axes.get(src_unit)
-                  num_src_physical_hosts = max(1, len(src_job_replicas))
-                  src_logical_mesh = list(src_var.mesh_shape)
-                  src_layout = list(src_var.layout)
-
-                  src_indices = _get_global_indices(
-                      src_unit,
-                      src_shards,
-                      src_logical_mesh,
-                      src_layout,
-                      num_src_physical_hosts,
-                      sharding_spec=list(src_var.sharding_spec),
-                      mesh_axes=src_mesh_axes,
-                      physical_mesh_shape=src_phys_mesh_shape,
-                  )
-
-                  for local_src_idx, global_src_idx in src_indices:
-                    if global_src_idx >= len(src_slices):
-                      continue
-
-                    src_slice_proto = src_slices[global_src_idx]
-                    src_slice = _proto_to_nd_slice(src_slice_proto)
-                    shard_entries = unit_schedules.setdefault(local_src_idx, [])
-
-                    for dst_unit in dst_units:
-                      dst_vars = dst_vars_by_unit.get(dst_unit, [])
-                      dst_var = next(
-                          (v for v in dst_vars if v.name == var_name), None
-                      )
-                      if not dst_var:
-                        continue
-
-                      d_slices = computed_slices.get(dst_unit, {}).get(var_name)
-                      if not d_slices:
-                        continue
-
-                      dst_shards = []
-                      dst_phys_mesh_shape = None
-                      dst_mesh_axes = None
-                      for meta in dst_metadata:
-                        meta_unit = _raiden_id_from_proto(meta.unit)
-                        if meta_unit == dst_unit:
-                          dst_shards = list(meta.shards)
-                          dst_phys_mesh_shape = (
-                              list(meta.mesh_shape) if meta.mesh_shape else None
-                          )
-                          dst_mesh_axes = (
-                              list(meta.mesh_axes) if meta.mesh_axes else None
-                          )
-                          break
-                      if not dst_shards:
-                        dst_shards = ["127.0.0.1:8000"]  # fallback
-
-                      with self._lock:
-                        dst_job_replicas = {
-                            m.unit.job_replica_id
-                            for m in dst_metadata
-                            if m.unit.job_name == dst_unit.job_name
-                        }
-                      num_dst_physical_hosts = max(1, len(dst_job_replicas))
-
-                      dst_logical_mesh = list(dst_var.mesh_shape)
-                      dst_layout = list(dst_var.layout)
-
-                      dst_indices = _get_global_indices(
-                          dst_unit,
-                          dst_shards,
-                          dst_logical_mesh,
-                          dst_layout,
-                          num_dst_physical_hosts,
-                          sharding_spec=list(dst_var.sharding_spec),
-                          mesh_axes=dst_mesh_axes,
-                          physical_mesh_shape=dst_phys_mesh_shape,
-                      )
-
-                      for local_dst_idx, global_dst_idx in dst_indices:
-                        if global_dst_idx >= len(d_slices):
-                          continue
-
-                        dst_slice_proto = d_slices[global_dst_idx]
-                        dst_slice = _proto_to_nd_slice(dst_slice_proto)
-
-                        dst_peer = (
-                            dst_shards[local_dst_idx]
-                            if local_dst_idx < len(dst_shards)
-                            else dst_shards[0]
-                        )
-
-                        intersection = intersect_nd_slices(src_slice, dst_slice)
-                        if intersection:
-                          s_key = (var_name, tuple(src_slice))
-                          candidates = src_slice_holders.get(
-                              s_key, [(src_unit, local_src_idx)]
-                          )
-                          if len(candidates) > 1:
-                            dst_global_idx = (
-                                dst_units.index(dst_unit)
-                                if dst_unit in dst_units
-                                else 0
-                            ) * max(1, len(dst_shards)) + local_dst_idx
-                            chosen_src = candidates[
-                                dst_global_idx % len(candidates)
-                            ]
-                            if (src_unit, local_src_idx) != chosen_src:
-                              continue
-
-                          is_tile_aware = (
-                              local_skip_tiling.get(layer_idx, False)
-                              if local_skip_tiling
-                              else False
-                          ) and is_nd_slice_tile_aligned(
-                              src_slice,
-                              dst_slice,
-                              intersection,
-                              tile_shape=(8, 128),
-                          )
-                          if is_tile_aware:
-                            chunks = generate_strided_copy_chunks_tile_aware(
-                                src_slice,
-                                dst_slice,
-                                intersection,
-                                itemsize,
-                                tile_shape=(8, 128),
-                            )
-                          else:
-                            chunks = generate_strided_copy_chunks(
-                                src_slice, dst_slice, intersection, itemsize
-                            )
-                          for (
-                              src_offset,
-                              dst_offset,
-                              size,
-                              src_stride,
-                              dst_stride,
-                              count,
-                          ) in chunks:
-                            is_legacy = is_legacy_by_unit.get(
-                                src_unit, True
-                            ) or is_legacy_by_unit.get(dst_unit, True)
-
-                            if len(src_slice) > 1:
-                              src_block_bytes = (
-                                  math.prod([e - s for s, e in src_slice[1:]])
-                                  * itemsize
-                              )
-                              src_block_id = src_offset // src_block_bytes
-                              src_block_offset = (
-                                  src_offset % src_block_bytes
-                                  if is_legacy
-                                  else src_offset
-                              )
-                            else:
-                              src_block_bytes = (
-                                  src_slice[0][1] - src_slice[0][0]
-                              ) * itemsize
-                              src_block_id = 0
-                              src_block_offset = src_offset
-
-                            if len(dst_slice) > 1:
-                              dst_block_bytes = (
-                                  math.prod([e - s for s, e in dst_slice[1:]])
-                                  * itemsize
-                              )
-                              dst_block_id = dst_offset // dst_block_bytes
-                              dst_block_offset = (
-                                  dst_offset % dst_block_bytes
-                                  if is_legacy
-                                  else dst_offset
-                              )
-                            else:
-                              dst_block_bytes = (
-                                  dst_slice[0][1] - dst_slice[0][0]
-                              ) * itemsize
-                              dst_block_id = 0
-                              dst_block_offset = dst_offset
-
-                            shard_entries.append((
-                                dst_peer,
-                                local_dst_idx,
-                                dst_block_offset,
-                                src_block_offset,
-                                size,
-                                src_block_id,
-                                dst_block_id,
-                                src_stride,
-                                dst_stride,
-                                count,
-                                layer_idx,
-                                0,
-                            ))
-
-                if unit_schedules:
-                  computed_schedules[src_unit] = unit_schedules
+                    else:
+                      local_skip_tiling[layer_idx] = can_skip
+                for unit, schedules in cr.computed_schedules.items():
+                  unit_sched = computed_schedules.setdefault(unit, {})
+                  for shard_idx, entries in schedules.items():
+                    unit_sched.setdefault(shard_idx, []).extend(entries)
 
             # Build rpc_addresses for local source workers
             rpc_addresses = self.worker_rpc_client.get_worker_endpoints()

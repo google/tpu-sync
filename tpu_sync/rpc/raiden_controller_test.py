@@ -3072,9 +3072,7 @@ class FormatUnitHelpersTest(absltest.TestCase):
         data_name="weights",
         data_replica_idx=1,
     )
-    self.assertEqual(
-        raiden_controller._format_unit(u2), "trainer:0[weights#1]"
-    )
+    self.assertEqual(raiden_controller._format_unit(u2), "trainer:0[weights#1]")
 
     u3 = raiden_controller.RaidenId(
         job_name="actor", job_replica_id="1", data_name="", data_replica_idx=0
@@ -3117,13 +3115,13 @@ class FormatUnitHelpersTest(absltest.TestCase):
     )
 
     # Single unit
-    self.assertEqual(
-        raiden_controller._format_units(u1), "trainer:0[weights]"
-    )
+    self.assertEqual(raiden_controller._format_units(u1), "trainer:0[weights]")
 
     # Single string / bytes (must not be iterated as chars)
     self.assertEqual(raiden_controller._format_units("unit_str"), "unit_str")
-    self.assertEqual(raiden_controller._format_units(b"unit_bytes"), "b'unit_bytes'")
+    self.assertEqual(
+        raiden_controller._format_units(b"unit_bytes"), "b'unit_bytes'"
+    )
 
   def test_heterogeneous_host_mesh_weight_transfer(self):
     client = RecordingWorkerRpcClient()
@@ -3227,6 +3225,95 @@ class FormatUnitHelpersTest(absltest.TestCase):
               f"    dst_peer={e.dst_peer} dst_shard={e.dst_shard_idx}"
               f" layer={e.layer_idx} size={e.size_bytes}"
           )
+
+
+class RaidenPlanWarmupTest(absltest.TestCase):
+  """Tests for background schedule warmup and plan caching."""
+
+  def test_warmup_transfer_plan_explicit(self):
+    client = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=0, worker_rpc_client=client, enable_plan_cache=True
+    )
+    vars_metadata = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer0",
+            shape=[16, 16],
+            mesh_shape=[2, 2],
+            layout=[1, 0],
+            item_size=4,
+            layer_idx=0,
+            sharding_spec=["fsdp", "tp"],
+        ),
+    ]
+    src_units = []
+    for i in range(2):
+      u = raiden_controller.RaidenId("src_job", str(i), "weights", 0)
+      src_units.append(u)
+      controller.register_work_unit(
+          u,
+          [f"10.0.0.{i+1}:{8000+j}" for j in range(2)],
+          control_plane_rpc_address=f"10.0.0.{i+1}:9000",
+          mesh_shape=[2, 2],
+          variables=vars_metadata,
+          mesh_axes=["fsdp", "tp"],
+      )
+
+    dst_units = []
+    for i in range(2):
+      u = raiden_controller.RaidenId("dst_job", str(i), "weights", 0)
+      dst_units.append(u)
+      controller.register_work_unit(
+          u,
+          [f"10.0.1.{i+1}:{8000+j}" for j in range(2)],
+          control_plane_rpc_address=f"10.0.1.{i+1}:9000",
+          mesh_shape=[2, 2],
+          variables=vars_metadata,
+          mesh_axes=["fsdp", "tp"],
+      )
+
+    self.assertEqual(controller.get_plan_cache_size(), 0)
+
+    # Explicit warmup outside critical path (e.g. during model compilation)
+    loop = asyncio.new_event_loop()
+    try:
+      cached = loop.run_until_complete(
+          controller.warmup_transfer_plan(
+              src_units=src_units,
+              dst_units=dst_units,
+          )
+      )
+      self.assertEqual(controller.get_plan_cache_size(), 1)
+      self.assertIsNotNone(cached)
+      self.assertGreater(cached.expected_block_count, 0)
+
+      # Subsequent start_transfer (with HBM) reuses the cached schedule
+      transfer_future = controller.start_transfer(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_mem_type="HBM",
+          use_block_chunks=True,
+          uuid=999,
+          req_id="test_req_hbm",
+      )
+      loop.run_until_complete(transfer_future.wait())
+
+      # A subsequent transfer to DRAM ALSO reuses the exact same cached schedule
+      transfer_future_dram = controller.start_transfer(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_mem_type="DRAM",
+          use_block_chunks=True,
+          uuid=1000,
+          req_id="test_req_dram",
+      )
+      loop.run_until_complete(transfer_future_dram.wait())
+    finally:
+      loop.close()
+
+    # Cache size remains 1 (both HBM and DRAM hit the same cached plan)
+    self.assertEqual(controller.get_plan_cache_size(), 1)
+    self.assertLen(client.calls, 8)
 
 
 if __name__ == "__main__":

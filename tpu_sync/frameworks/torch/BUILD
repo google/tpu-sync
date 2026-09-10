@@ -25,7 +25,7 @@ header_only_cc_info(
     name = "torch_tpu_device_buffer_headers",
     tags = ["nobuilder"],
     deps = [
-        "@torch_tpu//torch_tpu/csrc/eager:device_buffer",
+        "@torch_tpu//torch_tpu/eager:device_buffer",
     ],
 )
 
@@ -33,7 +33,7 @@ header_only_cc_info(
     name = "torch_tpu_tensor_to_buffer_headers",
     tags = ["nobuilder"],
     deps = [
-        "@torch_tpu//torch_tpu/csrc/eager:tensor_to_buffer",
+        "@torch_tpu//torch_tpu/eager:tensor_to_buffer",
     ],
 )
 
@@ -41,7 +41,7 @@ header_only_cc_info(
     name = "torch_tpu_materialize_headers",
     tags = ["nobuilder"],
     deps = [
-        "@torch_tpu//torch_tpu/csrc/eager:materialize",
+        "@torch_tpu//torch_tpu/eager:materialize",
     ],
 )
 
@@ -501,7 +501,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
-        "@torch_tpu//torch_tpu/csrc/eager:device_buffer",
+        ":torch_tpu_device_buffer_headers",
     ],
 )
 

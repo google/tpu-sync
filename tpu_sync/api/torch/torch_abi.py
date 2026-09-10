@@ -86,6 +86,25 @@ def resolve_suffix(running: str | None, built: list[str]) -> str:
   return max(candidates, key=_parse)
 
 
+def _preload_torch_tpu_glue(suffix: str | None) -> None:
+  """Preloads matching torch_tpu glue library into RTLD_GLOBAL so symbols resolve."""
+  try:
+    import torch_tpu  # pylint: disable=g-import-not-at-top
+    import ctypes  # pylint: disable=g-import-not-at-top
+    tpu_dir = pathlib.Path(torch_tpu.__file__).resolve().parent
+    candidates = []
+    if suffix:
+      candidates.append(tpu_dir / f"libpywrap_{suffix}_common.so")
+      candidates.append(tpu_dir / "common" / f"glue_{suffix}" / f"libpywrap_{suffix}_common.so")
+    candidates.append(tpu_dir / "common" / "libpywrap_torch_tpu_common.so")
+    for glue_path in candidates:
+      if glue_path.exists():
+        ctypes.CDLL(str(glue_path), mode=ctypes.RTLD_GLOBAL)
+        break
+  except Exception:  # pylint: disable=broad-except
+    pass
+
+
 def load_extension(package: str, stem: str):
   """Imports the extension ``<package>.<stem>``, dispatching on torch ABI.
 
@@ -99,6 +118,9 @@ def load_extension(package: str, stem: str):
   if name in sys.modules:
     return sys.modules[name]
 
+  running_suffix = running_torch_suffix()
+  _preload_torch_tpu_glue(running_suffix)
+
   pkg = importlib.import_module(package)
   # Works for regular and namespace packages alike (__file__ is None for the
   # latter); __path__ always carries the package directory.
@@ -111,8 +133,9 @@ def load_extension(package: str, stem: str):
   # Version-suffixed variants take precedence over an unversioned <stem>.so:
   # environments upgraded in place from a pre-variant install can carry a
   # stale unversioned extension alongside the wheel's variants.
-  suffix = resolve_suffix(running_torch_suffix(), built)
+  suffix = resolve_suffix(running_suffix, built)
   path = package_dir / f"{stem}_{suffix}.so"
+
   # The variant file still exports PyInit_<stem>; the loader's module name
   # (not the filename) determines the init symbol CPython looks up.
   loader = importlib.machinery.ExtensionFileLoader(stem, str(path))
@@ -128,3 +151,4 @@ def load_extension(package: str, stem: str):
     raise
   setattr(pkg, stem, module)
   return module
+

@@ -23,8 +23,8 @@
 #include "ATen/core/TensorBody.h"
 #include "torch/headeronly/core/DeviceType.h"
 
-#include "torch_tpu/csrc/eager/materialize.h"
-#include "torch_tpu/csrc/eager/tensor_to_buffer.h"
+#include "torch_tpu/eager/materialize.h"
+#include "torch_tpu/eager/tensor_to_buffer.h"
 
 namespace tpu_raiden {
 namespace torch {
@@ -67,7 +67,13 @@ UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
   // silently drops H2d (the model never sees the reload) and makes D2h read a
   // one-off snapshot. GetBaseBuffer always returns the buffer backing the
   // tensor's storage, so the DMA lands in the live cache regardless of view.
-  auto status_or_ref = torch_tpu::GetBaseBuffer(tensor);
+  // Note: We call GetBaseBuffer(tensor.storage()) directly to avoid the
+  // GetBaseBuffer(tensor) static allocator address equality assertion which
+  // fails when tpu_sync and torch_tpu are separate shared libraries.
+  if (!tensor.storage().data_ptr()) {
+    throw std::invalid_argument("Tensor storage data_ptr is null");
+  }
+  auto status_or_ref = torch_tpu::GetBaseBuffer(tensor.storage());
   if (!status_or_ref.ok()) {
     throw std::runtime_error(absl::StrCat(
         "Failed to resolve base device buffer: ", status_or_ref.status().message()));
@@ -106,16 +112,8 @@ UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
   const size_t logical_slice_byte_size =
       logical_physical_size / static_cast<size_t>(tensor.size(0));
 
-  // Materialize deferred tensor so AwaitBuffer() won't hang. No-op if already
-  // materialized. This should never return a separate buffer otherwise
-  // all DMA operations will go to the wrong buffer.
-  if (auto status = torch_tpu::Materialize(
-          base_ref, torch_tpu::MaterializationReason::kExplicitSync);
-      !status.ok()) {
-    throw std::runtime_error(absl::StrCat(
-        "Failed to materialize base device buffer: ", status.message()));
-  }
-
+  // Python pre-synchronization (sync.synchronize(wait=True)) guarantees graph dispatch.
+  // Directly await the underlying PjRtBuffer without triggering redundant C++ Materialize().
   auto status_or_buf = base_ref.AwaitBuffer();
   if (!status_or_buf.ok()) {
     throw std::runtime_error(absl::StrCat(

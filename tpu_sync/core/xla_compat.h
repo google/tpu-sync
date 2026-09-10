@@ -50,7 +50,7 @@ namespace raiden {
 // The transfer methods (memory_space, GetHostPointer, GetOnDeviceSizeInBytes,
 // CopyRawHostToDevice, CopyRawDeviceToHost) share identical names and
 // signatures.
-using RawBuffer = xla::PjRtRawBufferInterface;
+using RawBuffer = xla::CommonPjRtRawBuffer;
 using RawBufferRef = tsl::RCReference<RawBuffer>;
 
 // Type-erased wrapper for CommonPjRtBuffer::ScopedHold.

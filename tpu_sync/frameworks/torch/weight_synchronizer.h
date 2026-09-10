@@ -31,7 +31,7 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #ifndef WITHOUT_PYTHON
 #include "ATen/core/TensorBody.h"
-#include "torch_tpu/csrc/eager/device_buffer.h"
+#include "torch_tpu/eager/device_buffer.h"
 #include "tpu_sync/frameworks/torch/torch_utils.h"
 #endif
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"

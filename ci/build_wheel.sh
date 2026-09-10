@@ -54,8 +54,15 @@ fi
 # against). Space-separated; set to "" for a single-ABI build.
 RAIDEN_EXTRA_TORCH_ABIS="${RAIDEN_EXTRA_TORCH_ABIS-2.12.0 2.13.0}"
 TORCH_TPU_SRC="${TORCH_TPU_SRC:-${REPO_ROOT}/../torch_tpu}"
-WHEEL_DIR="${KOKORO_ARTIFACTS_DIR:-${HOME}/raiden_artifacts}/dist"
-CACHE_DIR="${RAIDEN_CONTAINER_CACHE:-${HOME}/.bazel_cache_container}"
+if [[ -d "/mnt/pd" && -w "/mnt/pd" ]]; then
+  DEFAULT_CACHE_DIR="/mnt/pd/bazel_cache_container"
+  DEFAULT_WHEEL_DIR="/mnt/pd/raiden_artifacts/dist"
+else
+  DEFAULT_CACHE_DIR="${HOME}/.bazel_cache_container"
+  DEFAULT_WHEEL_DIR="${HOME}/raiden_artifacts/dist"
+fi
+WHEEL_DIR="${KOKORO_ARTIFACTS_DIR:-${DEFAULT_WHEEL_DIR}}"
+CACHE_DIR="${RAIDEN_CONTAINER_CACHE:-${DEFAULT_CACHE_DIR}}"
 mkdir -p "${WHEEL_DIR}" "${REPO_ROOT}/dist" "${CACHE_DIR}"
 
 CONTAINER_IMAGE="us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest"
@@ -126,24 +133,9 @@ if [[ "${BUILD_MODE}" == "torch" ]]; then
     # e.g. line `torch==2.11.0+cpu \` -> `torch==2.11.0+cpu`
     TORCH_PIN=$(sed -n -E 's/^(torch==[0-9][0-9A-Za-z.+_-]*).*/\1/p' "${TORCH_REQ_FILE}" | head -1 || true)
   fi
-  if [[ -n "${TORCH_PIN}" ]]; then
-    echo "Installing torch pinned by torch_tpu (${TORCH_REQ_FILE}): ${TORCH_PIN}"
-    pip install -q "${TORCH_PIN}" --index-url https://download.pytorch.org/whl/cpu
-  else
-    # Fallback: the (looser) specifier from torch_tpu's pyproject.toml. This can
-    # float to the latest release and may NOT match torch_tpu's ABI, so warn.
-    TORCH_VERSION=""
-    if [[ -f /torch_tpu/pyproject.toml ]]; then
-      TORCH_VERSION=$(sed -n -E 's/.*["'\''`]torch[[:space:]]*([>=<~=]+[0-9.a-zA-Z+-]+)["'\''`].*/\1/p' /torch_tpu/pyproject.toml 2>/dev/null | head -1 || true)
-    fi
-    if [[ -z "${TORCH_VERSION}" ]]; then
-      echo "WARNING: could not determine torch pin from ${TORCH_REQ_FILE} or /torch_tpu/pyproject.toml. Installing latest torch — this may NOT match torch_tpu's ABI." >&2
-      pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-    else
-      echo "WARNING: no exact pin in ${TORCH_REQ_FILE}; falling back to torch_tpu pyproject specifier 'torch${TORCH_VERSION}', which may float to a torch that does not match torch_tpu's ABI." >&2
-      pip install -q "torch${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/cpu
-    fi
-  fi
+  TORCH_PIN="${TORCH_PIN:-torch==2.12.0}"
+  echo "Installing torch for base build: ${TORCH_PIN}"
+  pip install -q "${TORCH_PIN}" --index-url https://download.pytorch.org/whl/cpu
   TORCH_SOURCE="$(python3 -c 'import torch,pathlib;print(pathlib.Path(torch.__file__).resolve().parent.parent)')"
   export TORCH_SOURCE
   export TORCH_TPU_MODULE_PATH=/torch_tpu
@@ -220,7 +212,9 @@ if [[ "${BUILD_MODE}" == "torch" ]]; then
     unset RAIDEN_PYWRAP_SONAME
     cp /workspace/tpu_sync/frameworks/torch/_tpu_raiden_torch.so \
       "${EXT_DIR}/_tpu_raiden_torch_${SUFFIX}.so"
-    echo "wheel variant: _tpu_raiden_torch_${SUFFIX}.so"
+    patchelf --add-needed "libpywrap_${SUFFIX}_common.so" \
+      "${EXT_DIR}/_tpu_raiden_torch_${SUFFIX}.so"
+    echo "wheel variant: _tpu_raiden_torch_${SUFFIX}.so (NEEDED libpywrap_${SUFFIX}_common.so)"
   done
 
   rm -f "${WHL}"

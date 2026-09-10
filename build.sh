@@ -277,7 +277,6 @@ PY
   # Without the flag, the shims resolve to torch_tpu's pinned pypi torch and
   # TORCH_SOURCE never enters the build.
   DEFINE_FLAGS+=" --define=TORCH_SOURCE=local"
-  TORCH_REPO_ENV_FLAGS+=("--@torch_tpu//shims/torch:local_torch=True")
   TORCH_REPO_ENV_FLAGS+=("--repo_env=TORCH_SOURCE=${TORCH_SOURCE}")
   BAZEL_TARGETS+=(
     "//tpu_sync/frameworks/torch:_tpu_raiden_host"

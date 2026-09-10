@@ -62,6 +62,9 @@ class NumaAwareWeightSynchronizer
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt,
       bool unsafe_skip_buffer_lock = true, bool auto_h2d = false);
+
+  absl::Status BindWeights(
+      const std::vector<std::vector<at::Tensor>>& device_tensors);
 #endif
 
   // CPU / Mock metadata constructor for tests without PJRT TPU devices
@@ -169,6 +172,9 @@ class WeightSynchronizer {
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt,
       bool unsafe_skip_buffer_lock = true, bool auto_h2d = false);
+
+  absl::Status BindWeights(
+      const std::vector<std::vector<at::Tensor>>& device_tensors);
 #endif
 
   // CPU / Mock metadata constructor for tests without PJRT TPU devices

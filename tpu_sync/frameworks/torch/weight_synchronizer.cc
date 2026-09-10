@@ -68,6 +68,53 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
   InitSubManagers(unpacked.buffers, local_port, unsafe_skip_buffer_lock,
                   parallelism, listener_port, bind_ip, auto_h2d);
 }
+
+absl::Status NumaAwareWeightSynchronizer::BindWeights(
+    const std::vector<std::vector<at::Tensor>>& device_tensors) {
+  try {
+    UnpackedTensors unpacked =
+        UnpackTorchTensors(device_tensors, unsafe_skip_buffer_lock_);
+    const auto& layer_buffers = unpacked.buffers;
+    if (layer_buffers.empty()) {
+      return absl::InvalidArgumentError(
+          "Empty layer buffers provided to BindWeights");
+    }
+    if (layer_buffers.size() != num_layers_) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Layer count mismatch in BindWeights: expected ",
+                       num_layers_, ", got ", layer_buffers.size()));
+    }
+    if (layer_buffers[0].size() != total_num_shards_) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Shard count mismatch in BindWeights: expected ",
+                       total_num_shards_, ", got ", layer_buffers[0].size()));
+    }
+
+    for (size_t s = 0; s < sub_synchronizers_.size(); ++s) {
+      if (!sub_synchronizers_[s]) continue;
+      const auto& local_shards = (s < submanager_to_local_shards_.size())
+                                     ? submanager_to_local_shards_[s]
+                                     : std::vector<int>{};
+      std::vector<std::vector<raiden::RaidenBufferHandle>> sub_buffers(
+          num_layers_);
+      for (size_t l = 0; l < num_layers_; ++l) {
+        sub_buffers[l].reserve(local_shards.size());
+        for (int lsh : local_shards) {
+          if (lsh < 0 || lsh >= static_cast<int>(layer_buffers[l].size())) {
+            return absl::OutOfRangeError("Local shard index out of range");
+          }
+          sub_buffers[l].push_back(layer_buffers[l][lsh]);
+        }
+      }
+      auto status = sub_synchronizers_[s]->BindWeights(sub_buffers);
+      if (!status.ok()) return status;
+    }
+    buffer_refs_ = std::move(unpacked.refs);
+    return absl::OkStatus();
+  } catch (const std::exception& e) {
+    return absl::InternalError(e.what());
+  }
+}
 #endif
 
 NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
@@ -876,6 +923,11 @@ WeightSynchronizer::WeightSynchronizer(
   numa_manager_ = std::make_unique<NumaAwareWeightSynchronizer>(
       device_tensors, local_port, parallelism, listener_port, bind_ip,
       unsafe_skip_buffer_lock, auto_h2d);
+}
+
+absl::Status WeightSynchronizer::BindWeights(
+    const std::vector<std::vector<at::Tensor>>& device_tensors) {
+  return numa_manager_->BindWeights(device_tensors);
 }
 #endif
 

@@ -77,6 +77,10 @@ class WeightSynchronizer:
     else:
       self._impl.set_skip_tiling(list(skip))
 
+  def bind_weights(self, device_tensors: List[List[torch.Tensor]]) -> None:
+    """Dynamically re-binds new device weights in-place without daemon restart."""
+    self._impl.bind_weights(device_tensors)
+
   def d2h(self) -> None:
     """Triggers asynchronous D2H copy of current weights to Host buffer."""
     self._impl.D2h()

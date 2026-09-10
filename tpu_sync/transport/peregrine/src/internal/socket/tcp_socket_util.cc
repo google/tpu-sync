@@ -59,7 +59,7 @@ absl::Status TcpSocketUtil::Send(const fd_t fd, const Byte* const buf,
   size_t sent = 0;
   ssize_t left = len;
   while (left > 0) {
-    const ssize_t bytes = ::send(fd.value(), ptr, left, /*flags=*/0);
+    const ssize_t bytes = ::send(fd.value(), ptr, left, MSG_NOSIGNAL);
     if ABSL_PREDICT_TRUE (bytes > 0) {
       DCHECK_LE(bytes, left);
       ptr += bytes;
@@ -127,11 +127,14 @@ absl::Status TcpSocketUtil::SendV(const fd_t fd,
   if (len == 0) return absl::OkStatus();
 
   std::vector<struct iovec> vecs{iovecs.begin(), iovecs.end()};
-  const int n = vecs.size();
+  const size_t n = vecs.size();
   size_t sent = 0;
-  int i = 0;
+  size_t i = 0;
+  struct msghdr msg = {};
   while (i < n) {
-    const ssize_t bytes = ::writev(fd.value(), &vecs[i], n - i);
+    msg.msg_iov = &vecs[i];
+    msg.msg_iovlen = n - i;
+    const ssize_t bytes = ::sendmsg(fd.value(), &msg, MSG_NOSIGNAL);
     if ABSL_PREDICT_TRUE (bytes > 0) {
       sent += bytes;
       if ABSL_PREDICT_TRUE (sent >= len) break;
@@ -150,10 +153,10 @@ absl::Status TcpSocketUtil::SendV(const fd_t fd,
         const auto last_errno = errno;
         if (Interrupted(last_errno)) continue;
         DCHECK(!WouldBlock(last_errno));
-        return absl::InternalError(ErrMsg("writev", fd, last_errno));
+        return absl::InternalError(ErrMsg("sendmsg", fd, last_errno));
       } else {  // rarely happens
         DCHECK_EQ(bytes, 0);
-        return absl::InternalError("writev zero");
+        return absl::InternalError("sendmsg zero");
       }
     }
   }

@@ -19,9 +19,11 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -33,6 +35,8 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
+#include "absl/time/time.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "xla/future.h"
@@ -41,6 +45,7 @@ namespace tpu_raiden {
 namespace {
 
 using ::testing::Contains;
+using ::testing::ElementsAre;
 using ::testing::IsEmpty;
 
 constexpr int64_t kSlots = 2;
@@ -202,12 +207,26 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
         std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
   }
 
+  void BlockH2dDispatch() { block_dispatch_.store(true); }
+
+  bool WaitForH2dDispatch(absl::Duration timeout) {
+    return dispatch_entered_.WaitForNotificationWithTimeout(timeout);
+  }
+
+  void ReleaseH2dDispatch() {
+    if (!release_dispatch_.HasBeenNotified()) release_dispatch_.Notify();
+  }
+
   absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
       const std::vector<int64_t>& src_offsets_major_dim,
       const std::vector<int64_t>& dst_offsets_major_dim,
       const std::vector<int64_t>& copy_sizes_major_dim,
       std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
       std::optional<size_t> shard_idx) override {
+    if (block_dispatch_.load()) {
+      dispatch_entered_.Notify();
+      release_dispatch_.WaitForNotification();
+    }
     auto [promise, future] = xla::MakePromise<>();
     absl::MutexLock lock(copies_mu_);
     copies_.push_back(std::move(promise));
@@ -217,6 +236,24 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
  private:
   absl::Mutex copies_mu_;
   std::vector<xla::Promise<>> copies_;
+  std::atomic<bool> block_dispatch_{false};
+  absl::Notification dispatch_entered_;
+  absl::Notification release_dispatch_;
+};
+
+class DispatchReleaseGuard {
+ public:
+  explicit DispatchReleaseGuard(RecvTestManager* manager) : manager_(manager) {}
+  ~DispatchReleaseGuard() { Release(); }
+
+  void Release() {
+    if (manager_ == nullptr) return;
+    manager_->ReleaseH2dDispatch();
+    manager_ = nullptr;
+  }
+
+ private:
+  RecvTestManager* manager_;
 };
 
 using Reports = std::tuple<std::vector<std::string>, std::vector<std::string>,
@@ -445,6 +482,143 @@ TEST(RecvLifecycleTest, ReceiveWithoutTrafficFailsAtItsDeadline) {
   EXPECT_THAT(FailedRecving(reports), Contains("req"));
   EXPECT_FALSE(consumer.has_recv(24));
   EXPECT_EQ(consumer.free_slots(), kSlots);
+}
+
+TEST(RecvDrainTest, ExpiredReceiveKeepsStagingUntilH2dEnds) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/kTimeoutS);
+  consumer.AddRecv("req", /*uuid=*/25);
+  ASSERT_TRUE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/25).ok());
+  ASSERT_EQ(consumer.copies_issued(), 1);
+
+  consumer.ExpireRecv(/*uuid=*/25);
+  Reports during = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(during), IsEmpty());
+  EXPECT_THAT(DoneReceiving(during), IsEmpty());
+  EXPECT_THAT(FailedRecving(during), IsEmpty());
+  EXPECT_TRUE(consumer.has_recv(25));
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  consumer.FinishCopy(0, absl::OkStatus());
+  Reports after = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(after), IsEmpty());
+  EXPECT_THAT(DoneReceiving(after), IsEmpty());
+  EXPECT_THAT(FailedRecving(after), ElementsAre("req"));
+  EXPECT_FALSE(consumer.has_recv(25));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+  Reports repeated = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(repeated), IsEmpty());
+  EXPECT_THAT(DoneReceiving(repeated), IsEmpty());
+  EXPECT_THAT(FailedRecving(repeated), IsEmpty());
+}
+
+TEST(RecvDrainTest, DuplicateUuidIsRejectedUntilExpiredReceiveDrains) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/kTimeoutS);
+  consumer.AddRecv("old", /*uuid=*/28);
+  ASSERT_TRUE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/28).ok());
+  ASSERT_EQ(consumer.copies_issued(), 1);
+
+  consumer.ExpireRecv(/*uuid=*/28);
+  Reports during = consumer.CompleteReadRaw();
+  ASSERT_THAT(DoneSending(during), IsEmpty());
+  ASSERT_THAT(DoneReceiving(during), IsEmpty());
+  ASSERT_THAT(FailedRecving(during), IsEmpty());
+  ASSERT_TRUE(consumer.has_recv(28));
+
+  // Reusing a UUID while callbacks can still arrive would let old traffic
+  // mutate the replacement. The public registration API must keep the old
+  // entry authoritative until its issued work has drained.
+  EXPECT_FALSE(consumer.RegisterRecv(/*uuid=*/28, "retry",
+                                     /*expected_block_count=*/1)
+                   .ok());
+  EXPECT_TRUE(consumer.has_recv(28));
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  consumer.FinishCopy(0, absl::OkStatus());
+  Reports retired = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(retired), IsEmpty());
+  EXPECT_THAT(DoneReceiving(retired), IsEmpty());
+  EXPECT_THAT(FailedRecving(retired), ElementsAre("old"));
+  EXPECT_FALSE(consumer.has_recv(28));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+
+  EXPECT_TRUE(consumer.RegisterRecv(/*uuid=*/28, "retry",
+                                    /*expected_block_count=*/1)
+                  .ok());
+  consumer.ExpireRecv(/*uuid=*/28);
+  Reports retry = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(retry), IsEmpty());
+  EXPECT_THAT(DoneReceiving(retry), IsEmpty());
+  EXPECT_THAT(FailedRecving(retry), ElementsAre("retry"));
+  EXPECT_FALSE(consumer.has_recv(28));
+
+  Reports repeated = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(repeated), IsEmpty());
+  EXPECT_THAT(DoneReceiving(repeated), IsEmpty());
+  EXPECT_THAT(FailedRecving(repeated), IsEmpty());
+}
+
+TEST(RecvDrainTest, FailedLayerWaitsForOtherH2dCopies) {
+  RecvTestManager consumer(/*num_layers=*/2);
+  consumer.AddRecv("req", /*uuid=*/26);
+  ASSERT_TRUE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/26).ok());
+  ASSERT_TRUE(consumer.ReceiveLayer(/*layer=*/1, /*uuid=*/26).ok());
+  ASSERT_EQ(consumer.copies_issued(), 2);
+
+  consumer.FinishCopy(0, absl::InternalError("copy failed"));
+  Reports during = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(during), IsEmpty());
+  EXPECT_THAT(DoneReceiving(during), IsEmpty());
+  EXPECT_THAT(FailedRecving(during), IsEmpty());
+  EXPECT_TRUE(consumer.has_recv(26));
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  consumer.FinishCopy(1, absl::OkStatus());
+  Reports after = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(after), IsEmpty());
+  EXPECT_THAT(DoneReceiving(after), IsEmpty());
+  EXPECT_THAT(FailedRecving(after), ElementsAre("req"));
+  EXPECT_FALSE(consumer.has_recv(26));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+  Reports repeated = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(repeated), IsEmpty());
+  EXPECT_THAT(DoneReceiving(repeated), IsEmpty());
+  EXPECT_THAT(FailedRecving(repeated), IsEmpty());
+}
+
+TEST(RecvDrainTest, TimeoutDuringH2dDispatchKeepsStaging) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/kTimeoutS);
+  consumer.AddRecv("req", /*uuid=*/27);
+  consumer.BlockH2dDispatch();
+  auto receive = std::async(std::launch::async, [&consumer] {
+    return consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/27);
+  });
+  DispatchReleaseGuard release_dispatch(&consumer);
+  ASSERT_TRUE(consumer.WaitForH2dDispatch(absl::Seconds(5)));
+
+  consumer.ExpireRecv(/*uuid=*/27);
+  Reports during = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(during), IsEmpty());
+  EXPECT_THAT(DoneReceiving(during), IsEmpty());
+  EXPECT_THAT(FailedRecving(during), IsEmpty());
+  EXPECT_TRUE(consumer.has_recv(27));
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  release_dispatch.Release();
+  ASSERT_EQ(receive.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  ASSERT_TRUE(receive.get().ok());
+  ASSERT_EQ(consumer.copies_issued(), 1);
+  consumer.FinishCopy(0, absl::OkStatus());
+  Reports after = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(after), IsEmpty());
+  EXPECT_THAT(DoneReceiving(after), IsEmpty());
+  EXPECT_THAT(FailedRecving(after), ElementsAre("req"));
+  EXPECT_FALSE(consumer.has_recv(27));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+  Reports repeated = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(repeated), IsEmpty());
+  EXPECT_THAT(DoneReceiving(repeated), IsEmpty());
+  EXPECT_THAT(FailedRecving(repeated), IsEmpty());
 }
 
 }  // namespace

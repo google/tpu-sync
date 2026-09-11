@@ -25,14 +25,15 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -41,6 +42,7 @@
 
 #include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
@@ -58,20 +60,36 @@ constexpr double kTimeoutS = 0.5;
 
 class TestManager : public KVCacheManagerWithTransfer {
  public:
-  explicit TestManager(double timeout_s = kTimeoutS)
-      : KVCacheManagerWithTransfer(
-            /*num_layers=*/0, /*num_shards=*/1, /*slice_byte_size=*/128,
-            /*local_port=*/std::nullopt,
-            /*host_blocks_to_allocate=*/std::nullopt,
-            /*parallelism=*/1, /*node_id=*/0,
-            /*local_control_port=*/0, /*max_blocks=*/8,
-            /*num_slots=*/2 * kPoolSize, timeout_s) {}
+  explicit TestManager(double timeout_s = kTimeoutS, size_t num_layers = 0)
+      : KVCacheManagerWithTransfer(num_layers, /*num_shards=*/1,
+                                   /*slice_byte_size=*/128,
+                                   /*local_port=*/std::nullopt,
+                                   /*host_blocks_to_allocate=*/std::nullopt,
+                                   /*parallelism=*/1, /*node_id=*/0,
+                                   /*local_control_port=*/0, /*max_blocks=*/8,
+                                   /*num_slots=*/2 * kPoolSize, timeout_s) {}
 
   using KVCacheManagerWithTransfer::ControlRequestHeader;
   using KVCacheManagerWithTransfer::ControlResponseHeader;
   using KVCacheManagerWithTransfer::kControlMagic;
   using KVCacheManagerWithTransfer::kOpPullStream;
   using KVCacheManagerWithTransfer::kResponseMagic;
+
+  void ExpireRecv(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    active_recv_entries_.at(uuid).deadline =
+        std::chrono::steady_clock::now() - std::chrono::seconds(1);
+  }
+
+  size_t free_slots() {
+    absl::MutexLock lock(mu_);
+    return free_slots_.size();
+  }
+
+  bool has_recv(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    return active_recv_entries_.contains(uuid);
+  }
 };
 
 // These structs are copied directly onto the wire. Keep their ABI explicit so
@@ -357,7 +375,8 @@ TEST(ControlHandshakeTest, ShutdownUnblocksPendingPull) {
 // A producer that accepts control connections and never answers them.
 class SilentProducer {
  public:
-  SilentProducer() {
+  explicit SilentProducer(bool read_request = false)
+      : read_request_(read_request) {
     fd_ = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -372,27 +391,80 @@ class SilentProducer {
       while (true) {
         int client = accept(fd_, nullptr, nullptr);
         if (client < 0) return;
-        ++accepted_;
-        clients_.push_back(client);
+        {
+          std::lock_guard<std::mutex> lock(mu_);
+          if (stopping_) {
+            close(client);
+            return;
+          }
+          clients_.push_back(client);
+        }
+        cv_.notify_all();
+        if (!read_request_) continue;
+
+        TestManager::ControlRequestHeader request;
+        bool complete = ReadAll(client, &request, sizeof(request));
+        constexpr uint64_t kMaxTestBlocks = 64;
+        if (complete && request.num_blocks <= kMaxTestBlocks) {
+          std::vector<int64_t> block_ids(2 * request.num_blocks);
+          complete = ReadAll(client, block_ids.data(),
+                             block_ids.size() * sizeof(block_ids[0]));
+        } else {
+          complete = false;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        request_received_ = complete;
+        request_read_finished_ = true;
+        cv_.notify_all();
+        return;
       }
     });
   }
 
   ~SilentProducer() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      stopping_ = true;
+      for (int client : clients_) shutdown(client, SHUT_RDWR);
+    }
     shutdown(fd_, SHUT_RDWR);
     close(fd_);
+    fd_ = -1;
     thread_.join();
     for (int client : clients_) close(client);
   }
 
   std::string endpoint() const { return absl::StrCat("127.0.0.1:", port_); }
-  int accepted() const { return accepted_.load(); }
+
+  bool WaitUntilAccepted(size_t count, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this, count] {
+      return clients_.size() >= count || stopping_;
+    }) && clients_.size() >= count;
+  }
+
+  bool WaitUntilRequestReceived(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this] {
+      return request_read_finished_ || stopping_;
+    }) && request_received_;
+  }
+
+  void DropClient() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!clients_.empty()) shutdown(clients_.front(), SHUT_RDWR);
+  }
 
  private:
   int fd_ = -1;
   int port_ = 0;
-  std::atomic<int> accepted_{0};
+  const bool read_request_;
+  std::mutex mu_;
+  std::condition_variable cv_;
   std::vector<int> clients_;
+  bool request_received_ = false;
+  bool request_read_finished_ = false;
+  bool stopping_ = false;
   std::thread thread_;
 };
 
@@ -410,10 +482,7 @@ TEST(ControlHandshakeTest, ConsumerGivesUpOnProducerThatNeverAnswers) {
 
   // The last read connects only after a worker gives up on its silent
   // producer, which happens at the transfer timeout rather than never.
-  while (producer.accepted() < reads && SecondsSince(start) < 10.0) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
-  EXPECT_EQ(producer.accepted(), reads);
+  EXPECT_TRUE(producer.WaitUntilAccepted(reads, std::chrono::seconds(10)));
   EXPECT_LT(SecondsSince(start), 2 * kTimeoutS + 5.0);
 
   // Every read settles rather than leaking its receive entry. With no
@@ -431,6 +500,45 @@ TEST(ControlHandshakeTest, ConsumerGivesUpOnProducerThatNeverAnswers) {
   for (int i = 0; i < reads; ++i) {
     EXPECT_THAT(settled, Contains(absl::StrCat("req", i)));
   }
+}
+
+TEST(ControlHandshakeTest, ExpiredReceiveKeepsStagingUntilHandshakeEnds) {
+  SilentProducer producer(/*read_request=*/true);
+  TestManager consumer(/*timeout_s=*/5.0, /*num_layers=*/1);
+  const size_t free_before = consumer.free_slots();
+  consumer.StartRead("req", /*uuid=*/201, producer.endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+  ASSERT_TRUE(producer.WaitUntilRequestReceived(std::chrono::seconds(5)));
+  ASSERT_TRUE(consumer.has_recv(201));
+  ASSERT_EQ(consumer.free_slots(), free_before - 1);
+
+  consumer.ExpireRecv(201);
+  auto [done_sending, done_recving, failed_during] = consumer.CompleteReadRaw();
+  (void)done_sending;
+  EXPECT_THAT(done_recving, ::testing::IsEmpty());
+  EXPECT_THAT(failed_during, ::testing::IsEmpty());
+  EXPECT_EQ(consumer.free_slots(), free_before - 1);
+
+  producer.DropClient();
+  std::vector<std::string> done_after;
+  std::vector<std::string> failed_after;
+  const absl::Time deadline = absl::Now() + absl::Seconds(5);
+  while (failed_after.empty() && absl::Now() < deadline) {
+    auto [sent, received, failed] = consumer.CompleteReadRaw();
+    (void)sent;
+    done_after.insert(done_after.end(), received.begin(), received.end());
+    failed_after.insert(failed_after.end(), failed.begin(), failed.end());
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+  EXPECT_THAT(done_after, ::testing::IsEmpty());
+  EXPECT_THAT(failed_after, ::testing::ElementsAre("req"));
+  EXPECT_FALSE(consumer.has_recv(201));
+  EXPECT_EQ(consumer.free_slots(), free_before);
+
+  auto [sent_again, received_again, failed_again] = consumer.CompleteReadRaw();
+  EXPECT_THAT(sent_again, ::testing::IsEmpty());
+  EXPECT_THAT(received_again, ::testing::IsEmpty());
+  EXPECT_THAT(failed_again, ::testing::IsEmpty());
 }
 
 }  // namespace

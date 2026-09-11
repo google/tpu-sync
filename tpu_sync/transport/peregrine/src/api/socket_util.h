@@ -17,6 +17,7 @@
 
 #include <sys/uio.h>
 
+#include <algorithm>
 #include <cstddef>
 
 #include "absl/base/optimization.h"
@@ -51,6 +52,18 @@ inline absl::Status WriteVExact(int fd, absl::Span<const struct iovec> iovs) {
   if ABSL_PREDICT_TRUE (1 <= n && n <= IOV_MAX) {
     return internal::TcpSocketUtil::SendV(internal::fd_t(fd), iovs);
   }
+  if (n > IOV_MAX) {
+    // IOV_MAX limits one syscall, not the logical byte stream. Pool
+    // resharding can expose many small, non-contiguous state fragments.
+    while (!iovs.empty()) {
+      const size_t count = std::min(iovs.size(), size_t{IOV_MAX});
+      const absl::Status status = internal::TcpSocketUtil::SendV(
+          internal::fd_t(fd), iovs.subspan(0, count));
+      if (!status.ok()) return status;
+      iovs = iovs.subspan(count);
+    }
+    return absl::OkStatus();
+  }
   return absl::InvalidArgumentError(absl::StrCat("#iovs=", n));
 }
 
@@ -72,6 +85,17 @@ inline absl::Status ReadVExact(int fd, absl::Span<const struct iovec> iovs) {
   const size_t n = iovs.size();
   if ABSL_PREDICT_TRUE (1 <= n && n <= IOV_MAX) {
     return internal::TcpSocketUtil::RecvV(internal::fd_t(fd), iovs);
+  }
+  if (n > IOV_MAX) {
+    // Receive batch boundaries need not match the sender's boundaries.
+    while (!iovs.empty()) {
+      const size_t count = std::min(iovs.size(), size_t{IOV_MAX});
+      const absl::Status status = internal::TcpSocketUtil::RecvV(
+          internal::fd_t(fd), iovs.subspan(0, count));
+      if (!status.ok()) return status;
+      iovs = iovs.subspan(count);
+    }
+    return absl::OkStatus();
   }
   return absl::InvalidArgumentError(absl::StrCat("#iovs=", n));
 }

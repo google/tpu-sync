@@ -1937,6 +1937,9 @@ void KVCacheManagerWithTransfer::StartRead(
                  << ", uuid=" << uuid << ": " << inserted.message();
       return;
     }
+    if (load_plan.num_blocks > 0) {
+      BeginRecvOpLocked(&active_recv_entries_.at(uuid));
+    }
   }
 
   if (metrics_collector_) {
@@ -1947,12 +1950,13 @@ void KVCacheManagerWithTransfer::StartRead(
   }
 
   if (load_plan.num_blocks == 0) {
-    absl::MutexLock lock(mu_);
-    done_recving_.insert(req_id);
-    auto empty_it = active_recv_entries_.find(uuid);
-    if (empty_it != active_recv_entries_.end()) {
-      ReleaseRecvStagingLocked(&empty_it->second);
-      active_recv_entries_.erase(empty_it);
+    std::optional<uint64_t> plan_generation;
+    {
+      absl::MutexLock lock(mu_);
+      plan_generation = FinishRecvLocked(uuid, /*failed=*/false);
+    }
+    if (plan_generation.has_value()) {
+      UnregisterSettledPlan(uuid, *plan_generation);
     }
     return;
   }
@@ -1961,6 +1965,7 @@ void KVCacheManagerWithTransfer::StartRead(
 
   push_pool_->Schedule(target_node, [this, req_id, uuid, remote_endpoint,
                                      load_plan = std::move(load_plan)]() {
+    bool failed = false;
     try {
       LOG(INFO) << "StartRead (connecting): req_id=" << req_id
                 << ", uuid=" << uuid
@@ -2003,16 +2008,25 @@ void KVCacheManagerWithTransfer::StartRead(
                  "request with Producer. req_id: "
               << req_id;
     } catch (const std::exception& e) {
+      failed = true;
       LOG(ERROR)
           << "Raiden consumer error during Hybrid Bridge StartRead connect: "
           << e.what();
+    }
+
+    std::optional<uint64_t> plan_generation;
+    {
       absl::MutexLock lock(mu_);
-      failed_recving_.insert(req_id);
-      auto it = active_recv_entries_.find(uuid);
-      if (it != active_recv_entries_.end()) {
-        ReleaseRecvStagingLocked(&it->second);
-        active_recv_entries_.erase(it);
+      if (failed) {
+        plan_generation = FinishRecvLocked(uuid, /*failed=*/true);
       }
+      std::optional<uint64_t> ended = EndRecvOpLocked(uuid);
+      if (ended.has_value()) {
+        plan_generation = ended;
+      }
+    }
+    if (plan_generation.has_value()) {
+      UnregisterSettledPlan(uuid, *plan_generation);
     }
   });
 }
@@ -2060,7 +2074,43 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
     // the timeout as a recv failure so the connector can recompute the blocks.
     for (auto it = active_recv_entries_.begin();
          it != active_recv_entries_.end();) {
+      const uint64_t uuid = it->first;
       auto& entry = it->second;
+      if (entry.is_pool_reshard) {
+        if (entry.network_completed ||
+            entry.num_completed_layers == num_layers()) {
+          bool all_h2d_done = true;
+          for (auto& f : entry.h2d_futures) {
+            if (!f.IsReady()) {
+              all_h2d_done = false;
+              break;
+            }
+          }
+          if (all_h2d_done) {
+            LOG(INFO) << "CompleteReadRaw (polling completion): req_id="
+                      << entry.req_id;
+            done_recving_.insert(entry.req_id);
+            ReleaseRecvStagingLocked(&entry);
+            if (entry.unregister_on_settle) {
+              settled_plans.emplace_back(uuid, entry.plan_generation);
+            }
+            active_recv_entries_.erase(it++);
+            continue;
+          }
+        }
+        if (entry.deadline <= now) {
+          failed_recving_.insert(entry.req_id);
+          ReleaseRecvStagingLocked(&entry);
+          settled_plans.emplace_back(uuid, entry.plan_generation);
+          active_recv_entries_.erase(it++);
+        } else {
+          ++it;
+        }
+        continue;
+      }
+
+      ++it;  // FinishRecvLocked may erase this entry.
+      if (entry.draining) continue;
       if (entry.network_completed ||
           entry.num_completed_layers == num_layers()) {
         bool all_h2d_done = true;
@@ -2073,23 +2123,25 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
         if (all_h2d_done) {
           LOG(INFO) << "CompleteReadRaw (polling completion): req_id="
                     << entry.req_id;
-          done_recving_.insert(entry.req_id);
-          ReleaseRecvStagingLocked(&entry);
-          if (entry.unregister_on_settle) {
-            settled_plans.emplace_back(it->first, entry.plan_generation);
+          std::optional<uint64_t> generation =
+              FinishRecvLocked(uuid, /*failed=*/false);
+          if (generation.has_value()) {
+            settled_plans.emplace_back(uuid, *generation);
           }
-          active_recv_entries_.erase(it++);
           continue;
         }
       }
 
       if (entry.deadline <= now) {
-        failed_recving_.insert(entry.req_id);
-        ReleaseRecvStagingLocked(&entry);
-        settled_plans.emplace_back(it->first, entry.plan_generation);
-        active_recv_entries_.erase(it++);
-      } else {
-        ++it;
+        // Preserve the pre-existing timeout cleanup behavior even for
+        // receives registered without a plan: UnregisterSettledPlan also
+        // clears any transport-side progress associated with the UUID.
+        entry.unregister_on_settle = true;
+        std::optional<uint64_t> generation =
+            FinishRecvLocked(uuid, /*failed=*/true);
+        if (generation.has_value()) {
+          settled_plans.emplace_back(uuid, *generation);
+        }
       }
     }
     done_sending.assign(done_sending_.begin(), done_sending_.end());
@@ -2929,6 +2981,66 @@ void KVCacheManagerWithTransfer::SendNextLayer(
   });
 }
 
+std::optional<uint64_t> KVCacheManagerWithTransfer::FinishRecvLocked(
+    uint64_t uuid, bool failed) {
+  auto it = active_recv_entries_.find(uuid);
+  if (it == active_recv_entries_.end() || it->second.is_pool_reshard) {
+    return std::nullopt;
+  }
+  RecvEntry& entry = it->second;
+  if (failed) entry.failed = true;
+  if (entry.draining) return std::nullopt;
+  entry.draining = true;
+  if (entry.in_flight == 0) return RetireRecvLocked(uuid);
+  return std::nullopt;
+}
+
+std::optional<uint64_t> KVCacheManagerWithTransfer::RetireRecvLocked(
+    uint64_t uuid) {
+  auto it = active_recv_entries_.find(uuid);
+  if (it == active_recv_entries_.end() || it->second.is_pool_reshard) {
+    return std::nullopt;
+  }
+  RecvEntry& entry = it->second;
+  if (entry.in_flight != 0) {
+    LOG(DFATAL) << "Attempted to retire receive " << uuid << " with "
+                << entry.in_flight << " operations still in flight";
+    return std::nullopt;
+  }
+  (entry.failed ? failed_recving_ : done_recving_).insert(entry.req_id);
+  ReleaseRecvStagingLocked(&entry);
+  std::optional<uint64_t> plan_generation;
+  if (entry.unregister_on_settle) {
+    plan_generation = entry.plan_generation;
+  }
+  active_recv_entries_.erase(it);
+  return plan_generation;
+}
+
+void KVCacheManagerWithTransfer::BeginRecvOpLocked(RecvEntry* entry) {
+  ++entry->in_flight;
+}
+
+std::optional<uint64_t> KVCacheManagerWithTransfer::EndRecvOpLocked(
+    uint64_t uuid) {
+  auto it = active_recv_entries_.find(uuid);
+  if (it == active_recv_entries_.end()) {
+    LOG(DFATAL) << "Receive operation ended after UUID " << uuid
+                << " was retired";
+    return std::nullopt;
+  }
+  RecvEntry& entry = it->second;
+  if (entry.in_flight <= 0) {
+    LOG(DFATAL) << "Receive operation count underflow for UUID " << uuid;
+    return std::nullopt;
+  }
+  --entry.in_flight;
+  if (entry.draining && entry.in_flight == 0) {
+    return RetireRecvLocked(uuid);
+  }
+  return std::nullopt;
+}
+
 void KVCacheManagerWithTransfer::FinishSendLocked(
     const std::shared_ptr<SendEntry>& entry, bool failed) {
   if (failed) entry->failed = true;
@@ -3133,15 +3245,8 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
           << uuid << ", received blocks count: " << block_ids.size();
 
   std::string req_id;
-  int64_t recv_slot = -1;
-  std::vector<int> recv_staged;
-  CopySpec h2d_copy;
-  absl::flat_hash_map<kv_cache::HostBlockId, kv_cache::DeviceBlockId>
-      host_to_chip;
   bool found = false;
-  bool unregister_plan = false;
-  uint64_t plan_generation = 0;
-  std::vector<int> accumulated_host_blocks;
+  std::optional<uint64_t> plan_generation;
 
   std::chrono::steady_clock::time_point start_time;
   bool should_record_duration = false;
@@ -3152,6 +3257,7 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
       if (it->second.is_pool_reshard) {
         return absl::OkStatus();
       }
+      found = true;
       it->second.num_completed_blocks += block_ids.size();
       if (it->second.num_completed_blocks == block_ids.size()) {
         if (metrics_collector_) {
@@ -3166,7 +3272,6 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
           it->second.total_blocks * num_layers()) {
         it->second.network_completed = true;
         req_id = it->second.req_id;
-        recv_slot = it->second.slot_idx;
         if (metrics_collector_) {
           metrics_collector_->RecordLastPacket(uuid);
         }
@@ -3177,11 +3282,7 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
           if (metrics_collector_) {
             metrics_collector_->RecordEnd(uuid);
           }
-          found = true;
-          recv_staged = std::move(it->second.staged_host_blocks);
-          unregister_plan = it->second.unregister_on_settle;
-          plan_generation = it->second.plan_generation;
-          active_recv_entries_.erase(it);
+          plan_generation = FinishRecvLocked(uuid, /*failed=*/false);
         }
       } else {
         VLOG(1) << "OnBlocksReceived: Partial blocks received for uuid " << uuid
@@ -3202,16 +3303,15 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
     return RaidenManagerBase::OnBlocksReceived(block_ids, uuid);
   }
 
-  {
-    absl::MutexLock lock(mu_);
-    done_recving_.insert(req_id);
-    ReleaseStagingLocked(recv_slot, &recv_staged);
+  if (plan_generation.has_value()) {
+    UnregisterSettledPlan(uuid, *plan_generation);
   }
-  if (unregister_plan) UnregisterSettledPlan(uuid, plan_generation);
 
-  LOG(INFO) << "OnBlocksReceived (Network + H2D complete): req_id=" << req_id
-            << ", uuid=" << uuid
-            << ", numa=" << assigned_numa_node().value_or(-1);
+  if (should_record_duration) {
+    LOG(INFO) << "OnBlocksReceived (Network + H2D complete): req_id=" << req_id
+              << ", uuid=" << uuid
+              << ", numa=" << assigned_numa_node().value_or(-1);
+  }
   return absl::OkStatus();
 }
 
@@ -3375,7 +3475,6 @@ absl::Status KVCacheManagerWithTransfer::OnLayerReceived(size_t layer_idx,
   });
   CopySpec h2d_copy;
   std::string req_id;
-  int64_t recv_slot;
   bool trigger_enqueue = false;
   {
     absl::MutexLock lock(mu_);
@@ -3384,9 +3483,12 @@ absl::Status KVCacheManagerWithTransfer::OnLayerReceived(size_t layer_idx,
       return absl::OkStatus();
     }
     auto& entry = it->second;
+    if (entry.is_pool_reshard || entry.draining) {
+      return absl::OkStatus();
+    }
+    BeginRecvOpLocked(&entry);
     h2d_copy = entry.h2d_copy;
     req_id = entry.req_id;
-    recv_slot = entry.slot_idx;
     if (!entry.h2d_started) {
       entry.h2d_started = true;
       trigger_enqueue = true;
@@ -3404,32 +3506,30 @@ absl::Status KVCacheManagerWithTransfer::OnLayerReceived(size_t layer_idx,
                                    h2d_copy.sizes, /*slot_idx=*/std::nullopt,
                                    /*layer_idx=*/layer_idx);
   if (!future_or.ok()) {
-    bool unregister_plan = false;
-    uint64_t plan_generation = 0;
+    std::optional<uint64_t> plan_generation;
     {
       absl::MutexLock lock(mu_);
-      failed_recving_.insert(req_id);
-      auto it = active_recv_entries_.find(uuid);
-      if (it != active_recv_entries_.end()) {
-        ReleaseRecvStagingLocked(&it->second);
-        unregister_plan = it->second.unregister_on_settle;
-        plan_generation = it->second.plan_generation;
-        active_recv_entries_.erase(it);
+      plan_generation = FinishRecvLocked(uuid, /*failed=*/true);
+      std::optional<uint64_t> ended = EndRecvOpLocked(uuid);
+      if (ended.has_value()) {
+        plan_generation = ended;
       }
     }
-    if (unregister_plan) UnregisterSettledPlan(uuid, plan_generation);
+    if (plan_generation.has_value()) {
+      UnregisterSettledPlan(uuid, *plan_generation);
+    }
     return future_or.status();
   }
 
   auto future = future_or.value();
-  future.OnReady([this, uuid, layer_idx, recv_slot, req_id,
+  future.OnReady([this, uuid, layer_idx, req_id,
                   metrics_collector = metrics_collector_](auto status_or) {
-    bool unregister_plan = false;
-    uint64_t plan_generation = 0;
+    std::optional<uint64_t> plan_generation;
     {
       absl::MutexLock lock(mu_);
       auto it = active_recv_entries_.find(uuid);
       if (it == active_recv_entries_.end()) {
+        LOG(DFATAL) << "H2D callback for retired receive UUID " << uuid;
         return;
       }
       auto& entry = it->second;
@@ -3438,7 +3538,7 @@ absl::Status KVCacheManagerWithTransfer::OnLayerReceived(size_t layer_idx,
                   << ": req_id=" << req_id
                   << ", numa=" << assigned_numa_node().value_or(-1);
         entry.num_completed_layers++;
-        if (entry.num_completed_layers == num_layers()) {
+        if (entry.num_completed_layers == num_layers() && !entry.draining) {
           // TODO: Find a way to optimize this by moving out of the mutex.
           RecordTransferDuration(
               DurationMs(entry.start_time, std::chrono::steady_clock::now()));
@@ -3450,24 +3550,22 @@ absl::Status KVCacheManagerWithTransfer::OnLayerReceived(size_t layer_idx,
           if (metrics_collector) {
             metrics_collector->RecordEnd(uuid);
           }
-          done_recving_.insert(req_id);
-          ReleaseRecvStagingLocked(&entry);
-          unregister_plan = entry.unregister_on_settle;
-          plan_generation = entry.plan_generation;
-          active_recv_entries_.erase(uuid);
+          plan_generation = FinishRecvLocked(uuid, /*failed=*/false);
         }
       } else {
         LOG(ERROR) << "OnLayerReceived (H2D copy failed) layer " << layer_idx
                    << " for req_id: " << req_id
                    << ", error: " << status_or.status().ToString();
-        failed_recving_.insert(req_id);
-        ReleaseRecvStagingLocked(&entry);
-        unregister_plan = entry.unregister_on_settle;
-        plan_generation = entry.plan_generation;
-        active_recv_entries_.erase(uuid);
+        plan_generation = FinishRecvLocked(uuid, /*failed=*/true);
+      }
+      std::optional<uint64_t> ended = EndRecvOpLocked(uuid);
+      if (ended.has_value()) {
+        plan_generation = ended;
       }
     }
-    if (unregister_plan) UnregisterSettledPlan(uuid, plan_generation);
+    if (plan_generation.has_value()) {
+      UnregisterSettledPlan(uuid, *plan_generation);
+    }
   });
 
   {

@@ -31,7 +31,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <future>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -72,6 +74,10 @@ class TestManager : public KVCacheManagerWithTransfer {
   using KVCacheManagerWithTransfer::kControlMagic;
   using KVCacheManagerWithTransfer::kOpPullStream;
   using KVCacheManagerWithTransfer::kResponseMagic;
+
+  ControlResponseHeader ReadResponseHeaderForTest(int fd) {
+    return ReadControlResponseHeader(fd);
+  }
 };
 
 // These structs are copied directly onto the wire. Keep their ABI explicit so
@@ -86,6 +92,21 @@ static_assert(std::is_standard_layout_v<TestManager::ControlResponseHeader>);
 static_assert(sizeof(TestManager::ControlResponseHeader) == 24);
 static_assert(offsetof(TestManager::ControlResponseHeader, status) == 4);
 static_assert(offsetof(TestManager::ControlResponseHeader, message_len) == 16);
+
+class ScopedFd {
+ public:
+  explicit ScopedFd(int fd) : fd_(fd) {}
+  ~ScopedFd() {
+    if (fd_ >= 0) close(fd_);
+  }
+  ScopedFd(const ScopedFd&) = delete;
+  ScopedFd& operator=(const ScopedFd&) = delete;
+
+  int get() const { return fd_; }
+
+ private:
+  int fd_;
+};
 
 int Connect(int port) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -287,6 +308,24 @@ TEST(ControlHandshakeTest, EmptyPullIsRejected) {
   EXPECT_THAT(response.message, HasSubstr("requested no blocks"));
 }
 
+TEST(ControlHandshakeTest, OversizedPullIsRejectedBeforeReadingItsBody) {
+  TestManager producer;
+  ScopedFd fd(Connect(producer.local_control_port()));
+  TestManager::ControlRequestHeader request;
+  request.magic = TestManager::kControlMagic;
+  request.op = TestManager::kOpPullStream;
+  request.uuid = 48;
+  request.num_blocks = 9;  // TestManager is configured for at most 8 blocks.
+  WriteAll(fd.get(), &request, sizeof(request));
+  ASSERT_EQ(shutdown(fd.get(), SHUT_WR), 0);
+
+  // A hostile peer need not send a body proportional to its untrusted count.
+  Response response = ReadResponse(fd.get());
+  ASSERT_TRUE(response.received);
+  EXPECT_NE(response.status, 0);
+  EXPECT_THAT(response.message, HasSubstr("exceeds"));
+}
+
 TEST(ControlHandshakeTest, BadMagicIsRejected) {
   TestManager producer;
   int fd = Connect(producer.local_control_port());
@@ -311,6 +350,28 @@ TEST(ControlHandshakeTest, UnknownOperationIsRejected) {
   ASSERT_TRUE(response.received);
   EXPECT_NE(response.status, 0);
   EXPECT_THAT(response.message, HasSubstr("unknown control op code"));
+}
+
+TEST(ControlHandshakeTest, OversizedErrorResponseIsRejectedBeforeAllocation) {
+  TestManager consumer;
+  int sockets[2];
+  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+  ScopedFd writer(sockets[0]);
+  ScopedFd reader(sockets[1]);
+
+  TestManager::ControlResponseHeader response;
+  response.magic = TestManager::kResponseMagic;
+  response.status = -1;
+  response.message_len = std::numeric_limits<uint64_t>::max();
+  WriteAll(writer.get(), &response, sizeof(response));
+
+  std::string error_message;
+  try {
+    (void)consumer.ReadResponseHeaderForTest(reader.get());
+  } catch (const std::exception& error) {
+    error_message = error.what();
+  }
+  EXPECT_THAT(error_message, HasSubstr("too large"));
 }
 
 TEST(ControlHandshakeTest, HandlersOutliveConsumersThatNeverSpeak) {

@@ -25,14 +25,15 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -41,6 +42,7 @@
 
 #include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
@@ -50,6 +52,7 @@ namespace {
 
 using ::testing::Contains;
 using ::testing::HasSubstr;
+using ::testing::UnorderedElementsAre;
 
 // Both ends of a control handshake share one pool of four workers, so four
 // stuck handshakes are enough to starve either side.
@@ -58,20 +61,32 @@ constexpr double kTimeoutS = 0.5;
 
 class TestManager : public KVCacheManagerWithTransfer {
  public:
-  explicit TestManager(double timeout_s = kTimeoutS)
-      : KVCacheManagerWithTransfer(
-            /*num_layers=*/0, /*num_shards=*/1, /*slice_byte_size=*/128,
-            /*local_port=*/std::nullopt,
-            /*host_blocks_to_allocate=*/std::nullopt,
-            /*parallelism=*/1, /*node_id=*/0,
-            /*local_control_port=*/0, /*max_blocks=*/8,
-            /*num_slots=*/2 * kPoolSize, timeout_s) {}
+  explicit TestManager(double timeout_s = kTimeoutS, size_t num_layers = 0)
+      : KVCacheManagerWithTransfer(num_layers, /*num_shards=*/1,
+                                   /*slice_byte_size=*/128,
+                                   /*local_port=*/std::nullopt,
+                                   /*host_blocks_to_allocate=*/std::nullopt,
+                                   /*parallelism=*/1, /*node_id=*/0,
+                                   /*local_control_port=*/0, /*max_blocks=*/8,
+                                   /*num_slots=*/2 * kPoolSize, timeout_s) {}
 
   using KVCacheManagerWithTransfer::ControlRequestHeader;
   using KVCacheManagerWithTransfer::ControlResponseHeader;
   using KVCacheManagerWithTransfer::kControlMagic;
   using KVCacheManagerWithTransfer::kOpPullStream;
   using KVCacheManagerWithTransfer::kResponseMagic;
+
+  size_t free_slots() {
+    absl::MutexLock lock(mu_);
+    return free_slots_.size();
+  }
+
+  std::optional<std::string> recv_req_id(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    auto it = active_recv_entries_.find(uuid);
+    if (it == active_recv_entries_.end()) return std::nullopt;
+    return it->second.req_id;
+  }
 };
 
 // These structs are copied directly onto the wire. Keep their ABI explicit so
@@ -372,13 +387,24 @@ class SilentProducer {
       while (true) {
         int client = accept(fd_, nullptr, nullptr);
         if (client < 0) return;
-        ++accepted_;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (stopping_ || drop_clients_) {
+          shutdown(client, SHUT_RDWR);
+          close(client);
+          continue;
+        }
         clients_.push_back(client);
+        cv_.notify_all();
       }
     });
   }
 
   ~SilentProducer() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      stopping_ = true;
+      for (int client : clients_) shutdown(client, SHUT_RDWR);
+    }
     shutdown(fd_, SHUT_RDWR);
     close(fd_);
     thread_.join();
@@ -386,13 +412,33 @@ class SilentProducer {
   }
 
   std::string endpoint() const { return absl::StrCat("127.0.0.1:", port_); }
-  int accepted() const { return accepted_.load(); }
+
+  size_t accepted() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return clients_.size();
+  }
+
+  bool WaitUntilAccepted(size_t count, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this, count] {
+      return clients_.size() >= count || stopping_;
+    }) && clients_.size() >= count;
+  }
+
+  void DropClients() {
+    std::lock_guard<std::mutex> lock(mu_);
+    drop_clients_ = true;
+    for (int client : clients_) shutdown(client, SHUT_RDWR);
+  }
 
  private:
   int fd_ = -1;
   int port_ = 0;
-  std::atomic<int> accepted_{0};
+  std::mutex mu_;
+  std::condition_variable cv_;
   std::vector<int> clients_;
+  bool drop_clients_ = false;
+  bool stopping_ = false;
   std::thread thread_;
 };
 
@@ -431,6 +477,42 @@ TEST(ControlHandshakeTest, ConsumerGivesUpOnProducerThatNeverAnswers) {
   for (int i = 0; i < reads; ++i) {
     EXPECT_THAT(settled, Contains(absl::StrCat("req", i)));
   }
+}
+
+TEST(ControlHandshakeTest, DuplicateReceiveDoesNotReplaceOrLeakFirstRead) {
+  SilentProducer producer;
+  TestManager consumer(/*timeout_s=*/5.0, /*num_layers=*/1);
+  const size_t free_before = consumer.free_slots();
+
+  consumer.StartRead("first", /*uuid=*/200, producer.endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+  ASSERT_TRUE(producer.WaitUntilAccepted(1, std::chrono::seconds(5)));
+  ASSERT_EQ(consumer.recv_req_id(200), std::optional<std::string>("first"));
+  ASSERT_EQ(consumer.free_slots(), free_before - 1);
+
+  consumer.StartRead("duplicate", /*uuid=*/200, producer.endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+  EXPECT_EQ(consumer.recv_req_id(200), std::optional<std::string>("first"));
+  EXPECT_EQ(consumer.free_slots(), free_before - 1);
+  producer.DropClients();
+
+  std::vector<std::string> failed;
+  const absl::Time deadline = absl::Now() + absl::Seconds(5);
+  while (failed.size() < 2 && absl::Now() < deadline) {
+    auto [done_sending, done_recving, newly_failed] =
+        consumer.CompleteReadRaw();
+    EXPECT_THAT(done_sending, ::testing::IsEmpty());
+    EXPECT_THAT(done_recving, ::testing::IsEmpty());
+    failed.insert(failed.end(), newly_failed.begin(), newly_failed.end());
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+
+  EXPECT_THAT(failed, UnorderedElementsAre("first", "duplicate"));
+  EXPECT_EQ(consumer.free_slots(), free_before);
+  auto [done_again, received_again, failed_again] = consumer.CompleteReadRaw();
+  EXPECT_THAT(done_again, ::testing::IsEmpty());
+  EXPECT_THAT(received_again, ::testing::IsEmpty());
+  EXPECT_THAT(failed_again, ::testing::IsEmpty());
 }
 
 }  // namespace

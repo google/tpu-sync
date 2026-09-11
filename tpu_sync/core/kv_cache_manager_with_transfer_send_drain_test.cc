@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -41,6 +42,7 @@ namespace tpu_raiden {
 namespace {
 
 using ::testing::Contains;
+using ::testing::ElementsAre;
 using ::testing::IsEmpty;
 
 constexpr int64_t kSlots = 2;
@@ -285,6 +287,34 @@ TEST(SendDrainTest, SendNobodyPulledFailsAtItsDeadline) {
   EXPECT_EQ(producer.free_slots(), kSlots);
 }
 
+TEST(SendLifecycleTest, DuplicateRegistrationCannotReplaceLiveOffer) {
+  TestManager producer(/*num_layers=*/1);
+  ASSERT_GT(producer.NotifyForRead("first", /*uuid=*/10, {0}), 0);
+  EXPECT_EQ(producer.NotifyForRead("replacement", /*uuid=*/10, {0}), 0);
+  EXPECT_TRUE(producer.has_send(10));
+
+  producer.ExpireSend(/*uuid=*/10);
+  Reports reports = producer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(reports), IsEmpty());
+  EXPECT_THAT(DoneReceiving(reports), IsEmpty());
+  EXPECT_THAT(FailedRecving(reports), ElementsAre("first"));
+  Reports repeated = producer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(repeated), IsEmpty());
+  EXPECT_THAT(DoneReceiving(repeated), IsEmpty());
+  EXPECT_THAT(FailedRecving(repeated), IsEmpty());
+}
+
+TEST(SendLifecycleTest, DuplicateBlocksAreRejectedAtRegistration) {
+  TestManager producer(/*num_layers=*/1);
+
+  EXPECT_EQ(producer.NotifyForRead("req", /*uuid=*/15, {0, 0}), 0);
+  EXPECT_FALSE(producer.has_send(15));
+  Reports reports = producer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(reports), IsEmpty());
+  EXPECT_THAT(DoneReceiving(reports), IsEmpty());
+  EXPECT_THAT(FailedRecving(reports), IsEmpty());
+}
+
 TEST(SendLifecycleTest, SuccessfulSendWithoutWorkSettlesImmediately) {
   TestManager producer(/*num_layers=*/1);
   auto entry = producer.AddSyntheticSend("req", /*uuid=*/10, /*in_flight=*/0);
@@ -375,6 +405,19 @@ TEST(RecvLifecycleTest, NetworkCompletionWaitsForH2d) {
   EXPECT_THAT(FailedRecving(after), IsEmpty());
   EXPECT_FALSE(consumer.has_recv(20));
   EXPECT_EQ(consumer.free_slots(), kSlots);
+}
+
+TEST(RecvLifecycleTest, InvalidReadShapeDoesNotLeakStaging) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  const size_t free_before = consumer.free_slots();
+
+  EXPECT_THROW(consumer.StartRead("req", /*uuid=*/25,
+                                  /*remote_endpoint=*/"unused:1",
+                                  /*remote_block_ids=*/{0, 1},
+                                  /*local_block_ids=*/{0}),
+               std::invalid_argument);
+  EXPECT_EQ(consumer.free_slots(), free_before);
+  EXPECT_FALSE(consumer.has_recv(25));
 }
 
 TEST(RecvLifecycleTest, LateBlockAccountingAfterRetirementIsANoOp) {

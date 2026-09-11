@@ -166,7 +166,7 @@ absl::Status WriteExact(int fd, const void* buffer, size_t length) {
   const uint8_t* ptr = static_cast<const uint8_t*>(buffer);
   size_t remaining = length;
   while (remaining > 0) {
-    ssize_t written = write(fd, ptr, remaining);
+    ssize_t written = send(fd, ptr, remaining, MSG_NOSIGNAL);
     if (written < 0) {
       if (errno == EINTR) continue;
       if (errno == EAGAIN || errno == EWOULDBLOCK) {

@@ -87,6 +87,17 @@ class TestManager : public KVCacheManagerWithTransfer {
     if (it == active_recv_entries_.end()) return std::nullopt;
     return it->second.req_id;
   }
+
+  void MarkPullStarted(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    send_entries_.at(uuid)->pull_started = true;
+  }
+
+  void ExpireSend(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    send_entries_.at(uuid)->deadline =
+        std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+  }
 };
 
 // These structs are copied directly onto the wire. Keep their ABI explicit so
@@ -223,6 +234,28 @@ TEST(ControlHandshakeTest, PullWithoutRegistrationIsRejected) {
   EXPECT_LT(SecondsSince(start), 5.0);
 }
 
+TEST(ControlHandshakeTest, PullAfterRegistrationDeadlineIsRejected) {
+  TestManager producer(/*timeout_s=*/0.05);
+  ASSERT_GT(producer.NotifyForRead("expired", /*uuid=*/42, {0}), 0);
+  producer.ExpireSend(/*uuid=*/42);
+
+  int fd = Connect(producer.local_control_port());
+  const absl::Time start = absl::Now();
+  SendPull(fd, /*uuid=*/42);
+  Response response = ReadResponse(fd);
+  close(fd);
+
+  ASSERT_TRUE(response.received);
+  EXPECT_NE(response.status, 0);
+  EXPECT_THAT(response.message, HasSubstr("expired"));
+  EXPECT_LT(SecondsSince(start), 0.5);
+  auto [done_sending, done_recving, failed_recving] =
+      producer.CompleteReadRaw();
+  (void)done_recving;
+  EXPECT_THAT(done_sending, ::testing::IsEmpty());
+  EXPECT_THAT(failed_recving, Contains("expired"));
+}
+
 TEST(ControlHandshakeTest,
      PullAheadOfRegistrationIsAcknowledgedOnceRegistered) {
   TestManager producer;
@@ -256,6 +289,20 @@ TEST(ControlHandshakeTest, UniqueRegisteredSubsetIsAcknowledged) {
 
   ASSERT_TRUE(response.received);
   EXPECT_EQ(response.status, 0);
+}
+
+TEST(ControlHandshakeTest, DuplicatePullIsRejectedBeforeAcknowledgement) {
+  TestManager producer;
+  ASSERT_GT(producer.NotifyForRead("req", /*uuid=*/52, {0}), 0);
+  producer.MarkPullStarted(/*uuid=*/52);
+
+  int duplicate_fd = Connect(producer.local_control_port());
+  SendPull(duplicate_fd, /*uuid=*/52);
+  Response duplicate = ReadResponse(duplicate_fd);
+  close(duplicate_fd);
+  ASSERT_TRUE(duplicate.received);
+  EXPECT_NE(duplicate.status, 0);
+  EXPECT_THAT(duplicate.message, HasSubstr("already"));
 }
 
 TEST(ControlHandshakeTest, PullOfUnregisteredBlockIsRejected) {

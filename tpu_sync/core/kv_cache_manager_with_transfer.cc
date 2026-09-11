@@ -2587,11 +2587,11 @@ void KVCacheManagerWithTransfer::ProcessPullStream(
   std::vector<int64_t> src_block_ids = ReadBlockIds(fd, req.num_blocks);
   std::vector<int64_t> dst_block_ids = ReadBlockIds(fd, req.num_blocks);
 
-  std::shared_ptr<SendEntry> entry;
   const absl::Duration grace =
       std::min(kPullRegistrationGrace, absl::Seconds(timeout_s_));
   {
     absl::MutexLock lock(mu_);
+    std::shared_ptr<SendEntry> entry;
     const absl::Time give_up = absl::Now() + grace;
     while (true) {
       auto it = send_entries_.find(req.uuid);
@@ -2605,16 +2605,29 @@ void KVCacheManagerWithTransfer::ProcessPullStream(
       }
       cv_.WaitWithTimeout(&mu_, left);
     }
+    if (stopping_) return;
+    if (!entry) {
+      throw std::runtime_error(
+          absl::StrCat("no read registered for uuid ", req.uuid, " within ",
+                       absl::FormatDuration(grace),
+                       ": the producer expired it or never registered it"));
+    }
+    // Registration guards prevent a live entry from being replaced, so an
+    // expired entry cannot become valid while this pull waits out the grace.
+    if (entry->deadline <= std::chrono::steady_clock::now()) {
+      throw std::runtime_error(
+          absl::StrCat("read registration for uuid ", req.uuid, " expired"));
+    }
+    ValidateRequestedBlocks(*entry, src_block_ids);
+    if (entry->pull_started) {
+      throw std::runtime_error(
+          absl::StrCat("pull already started for uuid ", req.uuid));
+    }
+    entry->pull_started = true;
   }
-  if (stopping_) return;
-  if (!entry) {
-    throw std::runtime_error(
-        absl::StrCat("no read registered for uuid ", req.uuid, " within ",
-                     absl::FormatDuration(grace),
-                     ": the producer expired it or never registered it"));
-  }
-  ValidateRequestedBlocks(*entry, src_block_ids);
 
+  // The claim remains consumed if this write fails. The deadline sweep will
+  // retire it; admitting a retry could otherwise start two pushes.
   // Acknowledge acceptance to consumer immediately
   ControlResponseHeader response;
   response.magic = kResponseMagic;
@@ -2681,17 +2694,6 @@ void KVCacheManagerWithTransfer::ProcessPullStream(
              "consumer. Intercepting and launching StartPushInternal to "
           << (remote_data_endpoints.empty() ? "" : remote_data_endpoints[0])
           << (remote_data_endpoints.size() > 1 ? " and others" : "");
-
-  {
-    absl::MutexLock lock(mu_);
-    if (auto it = send_entries_.find(req.uuid); it != send_entries_.end()) {
-      if (it->second->pull_started) {
-        VLOG(1) << "StartPushInternal already running for UUID: " << req.uuid;
-        return;
-      }
-      it->second->pull_started = true;
-    }
-  }
 
   {
     absl::MutexLock lock(pull_workers_mu_);

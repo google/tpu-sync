@@ -29,3 +29,8 @@ jobs:
       registry_file: "tpu_sync/benchmarks/benchmark_registry.pbtxt"
       bap_ref: "aa854ba7bdb77966a9cc1a013417f1c1a208c4c0"
       runner: "linux-x86-n2-8"
+      # Benchmark the PR head commit by SHA. The reusable workflow otherwise
+      # checks out the head branch name from this repository, which does not
+      # exist for pull requests opened from forks or after the branch is
+      # deleted at merge time.
+      experiment_ref: ${{ github.event.pull_request.head.sha }}

@@ -137,13 +137,13 @@ py_package(
 
 raiden_framework_wheel(
     name = "raiden_jax_wheel",
-    distribution = "tpu_raiden_jax",
+    distribution = "tpu_sync_jax",
     package = ":raiden_jax_package",
     requires = JAX_REQUIRES,
     version = WHEEL_VERSION,
 )
 
-# ---- Torch wheel (tpu_raiden_torch) ----
+# ---- Torch wheel (tpu_sync_torch) ----
 py_library(
     name = "torch_raiden_files",
     visibility = ["//visibility:private"],
@@ -161,7 +161,7 @@ py_package(
 
 raiden_framework_wheel(
     name = "raiden_torch_wheel",
-    distribution = "tpu_raiden_torch",
+    distribution = "tpu_sync_torch",
     entry_points = TORCH_ENTRY_POINTS,
     package = ":raiden_torch_package",
     requires = TORCH_REQUIRES,

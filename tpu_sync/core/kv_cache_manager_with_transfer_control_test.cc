@@ -76,6 +76,12 @@ class TestManager : public KVCacheManagerWithTransfer {
   using KVCacheManagerWithTransfer::kOpPullStream;
   using KVCacheManagerWithTransfer::kResponseMagic;
 
+  void ExpireRecv(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    active_recv_entries_.at(uuid).deadline =
+        std::chrono::steady_clock::now() - std::chrono::seconds(1);
+  }
+
   size_t free_slots() {
     absl::MutexLock lock(mu_);
     return free_slots_.size();
@@ -86,6 +92,11 @@ class TestManager : public KVCacheManagerWithTransfer {
     auto it = active_recv_entries_.find(uuid);
     if (it == active_recv_entries_.end()) return std::nullopt;
     return it->second.req_id;
+  }
+
+  bool has_recv(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    return active_recv_entries_.contains(uuid);
   }
 };
 
@@ -427,6 +438,7 @@ class SilentProducer {
     }
     shutdown(fd_, SHUT_RDWR);
     close(fd_);
+    fd_ = -1;
     thread_.join();
     for (int client : clients_) close(client);
   }
@@ -491,10 +503,7 @@ TEST(ControlHandshakeTest, ConsumerGivesUpOnProducerThatNeverAnswers) {
 
   // The last read connects only after a worker gives up on its silent
   // producer, which happens at the transfer timeout rather than never.
-  while (producer.accepted() < reads && SecondsSince(start) < 10.0) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
-  EXPECT_EQ(producer.accepted(), reads);
+  EXPECT_TRUE(producer.WaitUntilAccepted(reads, std::chrono::seconds(10)));
   EXPECT_LT(SecondsSince(start), 2 * kTimeoutS + 5.0);
 
   // Every read settles rather than leaking its receive entry. With no
@@ -584,6 +593,45 @@ TEST(ControlHandshakeTest, RepeatedReceiveAnnouncementIsIdempotent) {
 
   auto [done_again, received_again, failed_again] = consumer.CompleteReadRaw();
   EXPECT_THAT(done_again, ::testing::IsEmpty());
+  EXPECT_THAT(received_again, ::testing::IsEmpty());
+  EXPECT_THAT(failed_again, ::testing::IsEmpty());
+}
+
+TEST(ControlHandshakeTest, ExpiredReceiveKeepsStagingUntilHandshakeEnds) {
+  SilentProducer producer(/*read_request=*/true);
+  TestManager consumer(/*timeout_s=*/5.0, /*num_layers=*/1);
+  const size_t free_before = consumer.free_slots();
+  consumer.StartRead("req", /*uuid=*/201, producer.endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+  ASSERT_TRUE(producer.WaitUntilRequestReceived(std::chrono::seconds(5)));
+  ASSERT_TRUE(consumer.has_recv(201));
+  ASSERT_EQ(consumer.free_slots(), free_before - 1);
+
+  consumer.ExpireRecv(201);
+  auto [done_sending, done_recving, failed_during] = consumer.CompleteReadRaw();
+  (void)done_sending;
+  EXPECT_THAT(done_recving, ::testing::IsEmpty());
+  EXPECT_THAT(failed_during, ::testing::IsEmpty());
+  EXPECT_EQ(consumer.free_slots(), free_before - 1);
+
+  producer.DropClient();
+  std::vector<std::string> done_after;
+  std::vector<std::string> failed_after;
+  const absl::Time deadline = absl::Now() + absl::Seconds(5);
+  while (failed_after.empty() && absl::Now() < deadline) {
+    auto [sent, received, failed] = consumer.CompleteReadRaw();
+    (void)sent;
+    done_after.insert(done_after.end(), received.begin(), received.end());
+    failed_after.insert(failed_after.end(), failed.begin(), failed.end());
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+  EXPECT_THAT(done_after, ::testing::IsEmpty());
+  EXPECT_THAT(failed_after, ::testing::ElementsAre("req"));
+  EXPECT_FALSE(consumer.has_recv(201));
+  EXPECT_EQ(consumer.free_slots(), free_before);
+
+  auto [sent_again, received_again, failed_again] = consumer.CompleteReadRaw();
+  EXPECT_THAT(sent_again, ::testing::IsEmpty());
   EXPECT_THAT(received_again, ::testing::IsEmpty());
   EXPECT_THAT(failed_again, ::testing::IsEmpty());
 }

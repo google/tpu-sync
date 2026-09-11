@@ -702,28 +702,37 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
     return 0;
   }
 
-  {
-    absl::MutexLock lock(mu_);
-    if (pending_acks_.erase(uuid) > 0) {
-      done_sending_.insert(req_id);
-      return 0;
-    }
-  }
-
   auto entry = std::make_shared<SendEntry>();
   entry->req_id = req_id;
   entry->uuid = uuid;
   entry->registered_num_blocks = static_cast<int64_t>(block_ids.size());
   entry->registered_block_ids = block_ids;
+  std::optional<int64_t> duplicate_block;
   for (int64_t block_id : block_ids) {
-    entry->registered_block_set.insert(block_id);
+    if (!entry->registered_block_set.insert(block_id).second) {
+      duplicate_block = block_id;
+    }
   }
   entry->deadline = DeadlineFromNow();
   entry->register_start = register_start;
 
   {
     absl::MutexLock lock(mu_);
-    send_entries_[uuid] = entry;
+    if (duplicate_block.has_value()) {
+      LOG(ERROR) << "NotifyForRead rejected duplicate block "
+                 << *duplicate_block << " for req_id=" << req_id
+                 << ", uuid=" << uuid;
+      return 0;
+    }
+    if (pending_acks_.erase(uuid) > 0) {
+      done_sending_.insert(req_id);
+      return 0;
+    }
+    if (!send_entries_.try_emplace(uuid, entry).second) {
+      LOG(ERROR) << "NotifyForRead rejected duplicate uuid=" << uuid
+                 << " for req_id=" << req_id;
+      return 0;
+    }
   }
   cv_.SignalAll();
 
@@ -735,6 +744,17 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
          << " failed=0";
   EmitTimingLog(timing.str());
   return static_cast<int64_t>(uuid);
+}
+
+absl::Status KVCacheManagerWithTransfer::EmplaceRecvEntryLocked(
+    uint64_t uuid, RecvEntry&& entry) {
+  // try_emplace leaves entry untouched on a duplicate. Callers rely on that
+  // guarantee to release staging owned by the rejected entry.
+  if (!active_recv_entries_.try_emplace(uuid, std::move(entry)).second) {
+    return absl::AlreadyExistsError(
+        absl::StrCat("Receive with UUID ", uuid, " is already registered"));
+  }
+  return absl::OkStatus();
 }
 
 absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
@@ -847,7 +867,12 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
       ReleaseRecvStagingLocked(&recv_entry);
     }
     if (total_blocks > 0) {
-      active_recv_entries_[uuid] = std::move(recv_entry);
+      absl::Status inserted =
+          EmplaceRecvEntryLocked(uuid, std::move(recv_entry));
+      if (!inserted.ok()) {
+        ReleaseRecvStagingLocked(&recv_entry);
+        return inserted;
+      }
       LOG(INFO) << "RegisterActivePlan (Receiver): Populated "
                    "active_recv_entries_ for UUID "
                 << uuid << " with " << total_blocks
@@ -888,7 +913,10 @@ absl::Status KVCacheManagerWithTransfer::RegisterRecv(
   recv_entry.deadline = DeadlineFromNow();
   // host_to_chip is left empty -> defaults to 1-to-1 mapping in
   // OnBlocksReceived
-  active_recv_entries_[uuid] = std::move(recv_entry);
+  absl::Status inserted = EmplaceRecvEntryLocked(uuid, std::move(recv_entry));
+  if (!inserted.ok()) {
+    return inserted;
+  }
   VLOG(1)
       << "RegisterRecv (Receiver): Registered expected block count for UUID "
       << uuid << " with " << expected_block_count << " expected blocks.";
@@ -1814,63 +1842,75 @@ void KVCacheManagerWithTransfer::StartRead(
              "req_id: "
           << req_id << ", uuid: " << uuid << ", remote: " << remote_endpoint
           << ", Thread: " << std::this_thread::get_id();
+  if (remote_block_ids.size() != local_block_ids.size() ||
+      (local_host_block_ids.has_value() &&
+       local_host_block_ids->size() != local_block_ids.size())) {
+    throw std::invalid_argument(
+        "remote_block_ids, local_block_ids, and local_host_block_ids must have "
+        "same length");
+  }
   // local_block_ids index the consumer's DEVICE KV cache, not the host staging
   // pool; reusing them as host indices overflows the host buffer once a device
   // block id exceeds num_host_blocks. If the caller didn't supply explicit host
   // indices, borrow a staging slot and stage into its reserved host blocks
   // (slot.block_ids -- the real, possibly non-contiguous host blocks).
-  std::vector<int64_t> host_block_ids;
-  int64_t recv_slot = -1;
-  std::vector<int> staged_host_blocks;
-  if (local_host_block_ids.has_value()) {
-    host_block_ids = *local_host_block_ids;
-  } else if (!local_block_ids.empty()) {
-    absl::MutexLock lock(mu_);
-    absl::flat_hash_set<int64_t> unique_local_bids(local_block_ids.begin(),
-                                                   local_block_ids.end());
-    RecvEntry staging;
-    auto staged = AcquireRecvStagingLocked(
-        static_cast<int64_t>(unique_local_bids.size()), &staging);
-    if (!staged.has_value()) {
-      // Request larger than the staging pool can seat: surface as a recv
-      // failure (the connector can recompute) rather than throwing.
-      LOG(ERROR) << "StartRead: cannot stage " << unique_local_bids.size()
-                 << " blocks for req_id=" << req_id
-                 << " (dynamic=" << dynamic_host_staging_
-                 << ", free_host_blocks="
-                 << host_block_manager_->num_free_blocks()
-                 << ", free_slots=" << free_slots_.size()
-                 << ", max_blocks=" << max_blocks_ << ")";
-      failed_recving_.insert(req_id);
-      return;
-    }
-    recv_slot = staging.slot_idx;
-    staged_host_blocks = std::move(staging.staged_host_blocks);
-    absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>
-        local_to_host;
-    size_t host_block_idx = 0;
-    host_block_ids.reserve(local_block_ids.size());
-    for (size_t k = 0; k < local_block_ids.size(); ++k) {
-      int64_t local_bid = local_block_ids[k];
-      auto it = local_to_host.find(local_bid);
-      if (it == local_to_host.end()) {
-        int64_t host_bid = (*staged)[host_block_idx++];
-        local_to_host[local_bid] = host_bid;
-        host_block_ids.push_back(host_bid);
-      } else {
-        host_block_ids.push_back(it->second);
-      }
-    }
-  }
-  CopyPlan load_plan =
-      BuildLoadCopyPlan(remote_block_ids, local_block_ids, host_block_ids);
-
+  CopyPlan load_plan;
   {
     absl::MutexLock lock(mu_);
+    auto incumbent = active_recv_entries_.find(uuid);
+    if (incumbent != active_recv_entries_.end()) {
+      LOG(ERROR) << "StartRead rejected duplicate uuid=" << uuid
+                 << " for req_id=" << req_id;
+      // Re-delivery of the same announcement is idempotent. The incumbent
+      // remains responsible for producing this request's one terminal report.
+      if (incumbent->second.req_id != req_id) {
+        failed_recving_.insert(req_id);
+      }
+      return;
+    }
+
+    std::vector<int64_t> host_block_ids;
     RecvEntry entry;
+    if (local_host_block_ids.has_value()) {
+      host_block_ids = *local_host_block_ids;
+    } else if (!local_block_ids.empty()) {
+      absl::flat_hash_set<int64_t> unique_local_bids(local_block_ids.begin(),
+                                                     local_block_ids.end());
+      auto staged = AcquireRecvStagingLocked(
+          static_cast<int64_t>(unique_local_bids.size()), &entry);
+      if (!staged.has_value()) {
+        // Request larger than the staging pool can seat: surface as a recv
+        // failure (the connector can recompute) rather than throwing.
+        LOG(ERROR) << "StartRead: cannot stage " << unique_local_bids.size()
+                   << " blocks for req_id=" << req_id
+                   << " (dynamic=" << dynamic_host_staging_
+                   << ", free_host_blocks="
+                   << host_block_manager_->num_free_blocks()
+                   << ", free_slots=" << free_slots_.size()
+                   << ", max_blocks=" << max_blocks_ << ")";
+        failed_recving_.insert(req_id);
+        return;
+      }
+      absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>
+          local_to_host;
+      size_t host_block_idx = 0;
+      host_block_ids.reserve(local_block_ids.size());
+      for (size_t k = 0; k < local_block_ids.size(); ++k) {
+        int64_t local_bid = local_block_ids[k];
+        auto it = local_to_host.find(local_bid);
+        if (it == local_to_host.end()) {
+          int64_t host_bid = (*staged)[host_block_idx++];
+          local_to_host[local_bid] = host_bid;
+          host_block_ids.push_back(host_bid);
+        } else {
+          host_block_ids.push_back(it->second);
+        }
+      }
+    }
+    load_plan =
+        BuildLoadCopyPlan(remote_block_ids, local_block_ids, host_block_ids);
+
     entry.req_id = req_id;
-    entry.slot_idx = recv_slot;
-    entry.staged_host_blocks = std::move(staged_host_blocks);
     entry.deadline = DeadlineFromNow();
     entry.start_time = std::chrono::steady_clock::now();
     entry.chip_block_ids = load_plan.h2d_local_block_ids;
@@ -1886,7 +1926,14 @@ void KVCacheManagerWithTransfer::StartRead(
           load_plan.h2d_local_block_ids[i];
     }
     entry.h2d_dispatch_futures.reserve(load_plan.h2d_local_block_ids.size());
-    active_recv_entries_[uuid] = std::move(entry);
+    absl::Status inserted = EmplaceRecvEntryLocked(uuid, std::move(entry));
+    if (!inserted.ok()) {
+      ReleaseRecvStagingLocked(&entry);
+      failed_recving_.insert(req_id);
+      LOG(ERROR) << "StartRead failed to register req_id=" << req_id
+                 << ", uuid=" << uuid << ": " << inserted.message();
+      return;
+    }
   }
 
   if (metrics_collector_) {

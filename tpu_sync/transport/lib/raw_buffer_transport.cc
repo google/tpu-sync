@@ -61,6 +61,7 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
+#include "tpu_sync/transport/lib/histogram.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 #include "tpu_sync/transport/peregrine/src/api/socket_util.h"
@@ -361,22 +362,36 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     bool trigger_h2d = false;
     std::vector<size_t> layers_to_trigger;
     if (header.uuid > 0) {
+      // Collapse the batch into a per-layer histogram *before* taking the
+      // lock. `metadata` is thread-local to this connection worker, so this
+      // needs no synchronization. Chunks of a batch normally all belong to the
+      // same layer, so the histogram usually holds a single entry: this turns
+      // ~3 hash operations per chunk under `raw_progress_mu_` into ~3 per
+      // distinct layer.
+      Histogram<size_t> layer_histogram;
+      for (uint32_t i = 0; i < batch_size; ++i) {
+        layer_histogram.Add(metadata[i].layer_idx, 1);
+      }
+
       absl::MutexLock lock(raw_progress_mu_);
       auto& prog = raw_progress_[header.uuid];
       prog.completed_chunks += batch_size;
-      for (uint32_t i = 0; i < batch_size; ++i) {
-        size_t l = metadata[i].layer_idx;
-        prog.completed_chunks_per_layer[l]++;
+      for (const auto& [l, count] : layer_histogram) {
+        // Adding the whole run at once crosses the per-layer threshold exactly
+        // when the equivalent sequence of single increments would, because the
+        // counter only ever grows.
+        uint32_t& completed = prog.completed_chunks_per_layer[l];
+        completed += count;
         auto it = prog.expected_chunks_per_layer.find(l);
         if (it != prog.expected_chunks_per_layer.end() && it->second > 0 &&
-            prog.completed_chunks_per_layer[l] >= it->second &&
-            !prog.triggered_layers.contains(l)) {
+            completed >= it->second && !prog.triggered_layers.contains(l)) {
           prog.triggered_layers.insert(l);
           layers_to_trigger.push_back(l);
         }
       }
       VLOG(1) << "Received batched chunks for uuid=" << header.uuid
               << " batch_size=" << batch_size
+              << " distinct_layers=" << layer_histogram.size()
               << " progress=" << prog.completed_chunks << "/"
               << (prog.expected_chunks.has_value()
                       ? std::to_string(*prog.expected_chunks)

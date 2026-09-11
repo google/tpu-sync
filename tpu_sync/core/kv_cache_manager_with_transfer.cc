@@ -1979,16 +1979,17 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
     absl::MutexLock lock(mu_);
     const auto now = std::chrono::steady_clock::now();
     for (auto it = send_entries_.begin(); it != send_entries_.end();) {
-      const auto& entry = it->second;
-      if (entry->deadline <= now) {
-        // Nothing pulled this entry within its deadline; the bytes were
-        // never sent, so the transfer failed.
-        failed_recving_.insert(entry->req_id);
-        ReleaseEntrySlotLocked(entry);
-        settled_plans.emplace_back(it->first, 0);
-        it = send_entries_.erase(it);
-      } else {
-        ++it;
+      const std::shared_ptr<SendEntry> entry = it->second;
+      const uint64_t uuid = it->first;
+      ++it;  // retiring the send erases its node
+      if (entry->draining || entry->deadline > now) continue;
+      // Past its deadline the transfer failed. One nobody pulled is
+      // reported now; one whose copies or pushes still run keeps its
+      // staging until they end, so the next transfer is never seated on
+      // memory a copy still writes.
+      FinishSendLocked(entry, /*failed=*/true);
+      if (send_entries_.find(uuid) == send_entries_.end()) {
+        settled_plans.emplace_back(uuid, 0);
       }
     }
     for (auto it = active_pool_reshard_sends_.begin();
@@ -2688,9 +2689,7 @@ bool KVCacheManagerWithTransfer::AcquireSendStagingWithRetry(
                    << (dynamic_host_staging_ ? "the host staging pool holds "
                                              : "a staging slot holds ")
                    << capacity;
-        failed_recving_.insert(it->second->req_id);
-        ReleaseEntrySlotLocked(it->second);
-        send_entries_.erase(it);
+        FinishSendLocked(it->second, /*failed=*/true);
         return false;
       }
       RecvEntry staging;
@@ -2718,9 +2717,7 @@ bool KVCacheManagerWithTransfer::AcquireSendStagingWithRetry(
                    << host_block_manager_->total_blocks()
                    << ", free_slots=" << free_slots_.size()
                    << "); reporting transfer failure";
-        failed_recving_.insert(it->second->req_id);
-        ReleaseEntrySlotLocked(it->second);
-        send_entries_.erase(it);
+        FinishSendLocked(it->second, /*failed=*/true);
       }
       return false;
     }
@@ -2766,8 +2763,17 @@ void KVCacheManagerWithTransfer::StartPushInternal(
   CopySpec d2h_copy = BuildCoalescedCopySpec(src_block_ids, host_block_ids);
   entry->d2h_layer_futures.reserve(num_layers());
 
-  // 1. Issue D2H copies layer-by-layer!
+  // 1. Issue D2H copies layer-by-layer. Each copy is counted against the
+  // send before it starts and released by its own completion, so the
+  // staging it writes stays owned for as long as it runs.
   for (size_t l = 0; l < num_layers(); ++l) {
+    {
+      absl::MutexLock lock(mu_);
+      // The send expired or failed while its copies were being issued:
+      // what was issued drains, nothing more starts.
+      if (entry->draining) return;
+      BeginSendOpLocked(entry);
+    }
     LOG(INFO) << "StartPushInternal (D2H start) layer " << l
               << ": uuid=" << uuid
               << ", numa=" << assigned_numa_node().value_or(-1);
@@ -2780,15 +2786,15 @@ void KVCacheManagerWithTransfer::StartPushInternal(
       LOG(ERROR) << "StartPushInternal: failed to issue D2H for layer " << l
                  << ": " << future_or.status();
       absl::MutexLock lock(mu_);
-      auto it = send_entries_.find(uuid);
-      if (it != send_entries_.end()) {
-        failed_recving_.insert(it->second->req_id);
-        ReleaseEntrySlotLocked(it->second);
-        send_entries_.erase(it);
-      }
+      FinishSendLocked(entry, /*failed=*/true);
+      EndSendOpLocked(entry);  // this copy never started
       return;
     }
     entry->d2h_layer_futures.push_back(std::move(future_or.value()));
+    entry->d2h_layer_futures.back().OnReady(
+        [this, entry](absl::StatusOr<raiden::BufferHolders>) {
+          EndSendOp(entry);
+        });
   }
 
   entry->remote_data_endpoints = remote_data_endpoints;
@@ -2796,78 +2802,49 @@ void KVCacheManagerWithTransfer::StartPushInternal(
   entry->dst_ints.assign(dst_block_ids.begin(), dst_block_ids.end());
   entry->remaining_h2h_layers.store(num_layers());
 
-  SendNextLayer(uuid, 0);
+  SendNextLayer(entry, 0);
 }
 
-void KVCacheManagerWithTransfer::SendNextLayer(uint64_t uuid, size_t l) {
-  RAIDEN_TRACE_FN("KVTransfer::SendNextLayer",
-                  [&]() { return absl::StrCat("uuid=", uuid, " layer=", l); });
-  std::shared_ptr<SendEntry> entry;
-  {
-    absl::MutexLock lock(mu_);
-    auto it = send_entries_.find(uuid);
-    if (it == send_entries_.end()) {
-      return;
-    }
-    entry = it->second;
-  }
-
+void KVCacheManagerWithTransfer::SendNextLayer(
+    const std::shared_ptr<SendEntry>& entry, size_t l) {
+  RAIDEN_TRACE_FN("KVTransfer::SendNextLayer", [&]() {
+    return absl::StrCat("uuid=", entry->uuid, " layer=", l);
+  });
   if (l >= num_layers()) {
     // Reached end of layer loop. Background asynchronous transfers will clean
     // up when remaining_h2h_layers reaches 0.
     return;
   }
+  const uint64_t uuid = entry->uuid;
 
-  entry->d2h_layer_futures[l].OnReady([this, uuid, l](auto status_or) {
+  entry->d2h_layer_futures[l].OnReady([this, entry, uuid, l](auto status_or) {
     if (!status_or.ok()) {
       LOG(ERROR) << "StartPushInternal: D2H copy failed for layer " << l
                  << ", status: " << status_or.status().ToString();
       absl::MutexLock lock(mu_);
-      auto it = send_entries_.find(uuid);
-      if (it != send_entries_.end()) {
-        failed_recving_.insert(it->second->req_id);
-        ReleaseEntrySlotLocked(it->second);
-        send_entries_.erase(it);
-      }
+      FinishSendLocked(entry, /*failed=*/true);
       return;
     }
+    {
+      absl::MutexLock lock(mu_);
+      // The send expired or failed while the copy ran: nothing is pushed.
+      if (entry->draining) return;
+      BeginSendOpLocked(entry);
+    }
 
-    push_pool_->Schedule([this, uuid, l]() {
-      std::shared_ptr<SendEntry> entry;
-      {
-        absl::MutexLock lock(mu_);
-        auto it = send_entries_.find(uuid);
-        if (it == send_entries_.end()) {
-          return;
-        }
-        entry = it->second;
-      }
+    push_pool_->Schedule([this, entry, uuid, l]() {
       LOG(INFO) << "StartPushInternal (H2H start layer " << l
                 << "): uuid=" << uuid
                 << ", numa=" << assigned_numa_node().value_or(-1);
       H2hWriteDirectAsync(
           entry->remote_data_endpoints, entry->src_ints, entry->dst_ints, uuid,
-          l, [this, uuid, l](absl::StatusOr<std::vector<int>> push_res) {
-            std::shared_ptr<SendEntry> entry;
-            {
-              absl::MutexLock lock(mu_);
-              auto it = send_entries_.find(uuid);
-              if (it != send_entries_.end()) {
-                entry = it->second;
-              }
-            }
-            if (!entry) return;
-
+          l, [this, entry, uuid, l](absl::StatusOr<std::vector<int>> push_res) {
             if (!push_res.ok()) {
               LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
                          << push_res.status().ToString();
               absl::MutexLock lock(mu_);
-              if (auto it = send_entries_.find(uuid);
-                  it != send_entries_.end()) {
-                failed_recving_.insert(entry->req_id);
-                ReleaseEntrySlotLocked(entry);
-                send_entries_.erase(it);
-              }
+              FinishSendLocked(entry, /*failed=*/true);
+              EndSendOpLocked(entry);
               return;
             }
 
@@ -2875,24 +2852,56 @@ void KVCacheManagerWithTransfer::SendNextLayer(uint64_t uuid, size_t l) {
                       << "): uuid=" << uuid
                       << ", numa=" << assigned_numa_node().value_or(-1);
 
-            if (entry->remaining_h2h_layers.fetch_sub(1) == 1) {
+            const bool last = entry->remaining_h2h_layers.fetch_sub(1) == 1;
+            absl::MutexLock lock(mu_);
+            if (last) {
               LOG(INFO) << "StartPushInternal (All H2H complete): uuid="
                         << uuid;
-              absl::MutexLock lock(mu_);
-              if (auto it = send_entries_.find(uuid);
-                  it != send_entries_.end()) {
-                done_sending_.insert(entry->req_id);
-                ReleaseEntrySlotLocked(entry);
-                send_entries_.erase(it);
-              }
+              FinishSendLocked(entry, /*failed=*/false);
             }
+            EndSendOpLocked(entry);
           });
 
       // Immediately queue the next layer's push without waiting for this one to
       // finish
-      SendNextLayer(uuid, l + 1);
+      SendNextLayer(entry, l + 1);
     });
   });
+}
+
+void KVCacheManagerWithTransfer::FinishSendLocked(
+    const std::shared_ptr<SendEntry>& entry, bool failed) {
+  if (failed) entry->failed = true;
+  if (entry->draining) return;  // the pending work retires it
+  entry->draining = true;
+  if (entry->in_flight == 0) RetireSendLocked(entry);
+}
+
+void KVCacheManagerWithTransfer::RetireSendLocked(
+    const std::shared_ptr<SendEntry>& entry) {
+  (entry->failed ? failed_recving_ : done_sending_).insert(entry->req_id);
+  ReleaseEntrySlotLocked(entry);
+  auto it = send_entries_.find(entry->uuid);
+  if (it != send_entries_.end() && it->second == entry) {
+    send_entries_.erase(it);
+  }
+}
+
+void KVCacheManagerWithTransfer::BeginSendOpLocked(
+    const std::shared_ptr<SendEntry>& entry) {
+  ++entry->in_flight;
+}
+
+void KVCacheManagerWithTransfer::EndSendOpLocked(
+    const std::shared_ptr<SendEntry>& entry) {
+  --entry->in_flight;
+  if (entry->draining && entry->in_flight == 0) RetireSendLocked(entry);
+}
+
+void KVCacheManagerWithTransfer::EndSendOp(
+    const std::shared_ptr<SendEntry>& entry) {
+  absl::MutexLock lock(mu_);
+  EndSendOpLocked(entry);
 }
 
 absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
@@ -2986,9 +2995,7 @@ void KVCacheManagerWithTransfer::AckSend(uint64_t uuid) {
       return;
     }
     entry = it->second;
-    done_sending_.insert(entry->req_id);
-    ReleaseEntrySlotLocked(entry);
-    send_entries_.erase(it);
+    FinishSendLocked(entry, /*failed=*/false);
   }
   const auto ack_done = std::chrono::steady_clock::now();
   std::ostringstream timing;

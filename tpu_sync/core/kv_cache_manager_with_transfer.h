@@ -289,6 +289,13 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     bool failed = false;
     bool pull_started = false;
     bool slot_released = false;
+    // Copies and pushes issued for this send whose completion has not been
+    // observed. The staging they read and write is held until it is zero.
+    // Guarded by mu_.
+    int in_flight = 0;
+    // The outcome is decided (failed, or every push done) and the send
+    // waits for its in-flight work before it is reported. Guarded by mu_.
+    bool draining = false;
     std::chrono::steady_clock::time_point deadline;
     std::vector<raiden::PjRtCopyFuture> d2h_layer_futures;
     std::vector<std::string> remote_data_endpoints;
@@ -480,7 +487,19 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
                          const std::vector<std::string>& remote_data_endpoints,
                          const std::vector<int64_t>& src_block_ids,
                          const std::vector<int64_t>& dst_block_ids);
-  void SendNextLayer(uint64_t uuid, size_t l);
+  void SendNextLayer(const std::shared_ptr<SendEntry>& entry, size_t l);
+  // Decides a pull-serve send's outcome. The send is reported and its
+  // staging returned once nothing issued for it is still running: at once
+  // for a send nobody pulled, otherwise when its last copy or push ends.
+  // A failure outranks a completion decided later.
+  void FinishSendLocked(const std::shared_ptr<SendEntry>& entry, bool failed);
+  // Reports the send's outcome, returns its staging and drops the entry.
+  void RetireSendLocked(const std::shared_ptr<SendEntry>& entry);
+  // Counts one copy or push issued for the send.
+  void BeginSendOpLocked(const std::shared_ptr<SendEntry>& entry);
+  // Counts one finished copy or push; retires a send that waited for it.
+  void EndSendOpLocked(const std::shared_ptr<SendEntry>& entry);
+  void EndSendOp(const std::shared_ptr<SendEntry>& entry);
 
   absl::Status ValidatePoolReshardPlan(
       const ::tpu_sync::rpc::StartTransferRequest& plan,

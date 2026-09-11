@@ -35,7 +35,7 @@ header_only_cc_info(
         "//conditions:default": False,
     }),
     deps = [
-        "@torch_tpu//torch_tpu/csrc/api:tensor_buffer",
+        "@torch_tpu//csrc/api:tensor_buffer",
     ],
 )
 
@@ -601,9 +601,9 @@ py_test(
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//torch_tpu",
-        "@torch_tpu//torch_tpu/_internal/execution_mode",
-        "@torch_tpu//torch_tpu/_internal/sync",
+        "@torch_tpu//src/torch_tpu",
+        "@torch_tpu//src/torch_tpu/_internal/execution_mode",
+        "@torch_tpu//src/torch_tpu/_internal/sync",
     ],
 )
 
@@ -626,7 +626,7 @@ py_test(
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//torch_tpu",
+        "@torch_tpu//src/torch_tpu",
     ],
 )
 
@@ -649,7 +649,7 @@ py_test(
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//torch_tpu",
+        "@torch_tpu//src/torch_tpu",
     ],
 )
 
@@ -679,7 +679,7 @@ py_test(
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//torch_tpu",
+        "@torch_tpu//src/torch_tpu",
     ],
 )
 
@@ -701,7 +701,7 @@ py_test(
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//torch_tpu",
+        "@torch_tpu//src/torch_tpu",
     ],
 )
 

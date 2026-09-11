@@ -21,7 +21,7 @@
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
-#include "torch_tpu/csrc/api/tensor_buffer.h"
+#include "csrc/api/tensor_buffer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 
 namespace tpu_raiden {

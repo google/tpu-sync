@@ -27,7 +27,7 @@ py_library(
     visibility = ["//visibility:public"],
     deps = [
         ":torch_abi",
-        "@torch_tpu//torch_tpu",
+        "@torch_tpu//src/torch_tpu",
     ],
 )
 
@@ -91,7 +91,7 @@ py_library(
         "//tpu_sync/api:common",
         ":torch_abi",
         ":torch_tpu_common_loader",
-        "@torch_tpu//torch_tpu",
+        "@torch_tpu//src/torch_tpu",
         # buildcleaner: keep
         "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
     ],
@@ -106,7 +106,7 @@ py_library(
         ":torch_tpu_common_loader",
         "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
         "//tpu_sync/rpc:raiden_service_py_pb2",
-        "@torch_tpu//torch_tpu",
+        "@torch_tpu//src/torch_tpu",
     ],
 )
 
@@ -160,7 +160,7 @@ py_test(
         "@com_google_absl_py//absl/testing:absltest",
         "@com_google_absl_py//absl/testing:parameterized",
         "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//torch_tpu",
+        "@torch_tpu//src/torch_tpu",
     ],
 )
 
@@ -181,7 +181,7 @@ py_test(
         "@com_google_absl_py//absl/testing:absltest",
         "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//torch_tpu",
+        "@torch_tpu//src/torch_tpu",
     ],
 )
 
@@ -201,7 +201,7 @@ py_test(
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//torch_tpu",
+        "@torch_tpu//src/torch_tpu",
     ],
 )
 
@@ -223,7 +223,7 @@ py_test(
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//torch_tpu",
+        "@torch_tpu//src/torch_tpu",
     ],
 )
 
@@ -247,6 +247,6 @@ py_test(
         "@com_google_absl_py//absl/testing:parameterized",
         "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//torch_tpu",
+        "@torch_tpu//src/torch_tpu",
     ],
 )

@@ -28,6 +28,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -58,13 +59,14 @@ constexpr double kTimeoutS = 0.5;
 
 class TestManager : public KVCacheManagerWithTransfer {
  public:
-  explicit TestManager(double timeout_s = kTimeoutS)
+  explicit TestManager(double timeout_s = kTimeoutS,
+                       int local_control_port = 0)
       : KVCacheManagerWithTransfer(
             /*num_layers=*/0, /*num_shards=*/1, /*slice_byte_size=*/128,
             /*local_port=*/std::nullopt,
             /*host_blocks_to_allocate=*/std::nullopt,
             /*parallelism=*/1, /*node_id=*/0,
-            /*local_control_port=*/0, /*max_blocks=*/8,
+            local_control_port, /*max_blocks=*/8,
             /*num_slots=*/2 * kPoolSize, timeout_s) {}
 
   using KVCacheManagerWithTransfer::ControlRequestHeader;
@@ -72,6 +74,8 @@ class TestManager : public KVCacheManagerWithTransfer {
   using KVCacheManagerWithTransfer::kControlMagic;
   using KVCacheManagerWithTransfer::kOpPullStream;
   using KVCacheManagerWithTransfer::kResponseMagic;
+
+  void HandleControlConnectionForTest(int fd) { HandleControlConnection(fd); }
 };
 
 // These structs are copied directly onto the wire. Keep their ABI explicit so
@@ -332,6 +336,41 @@ TEST(ControlHandshakeTest, HandlersOutliveConsumersThatNeverSpeak) {
   ASSERT_TRUE(response.received);
   EXPECT_NE(response.status, 0);
   EXPECT_LT(SecondsSince(start), 2 * kTimeoutS + 5.0);
+}
+
+TEST(ControlHandshakeTest, MidRequestDisconnectDoesNotRaiseSigpipe) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        std::signal(SIGPIPE, SIG_DFL);
+        TestManager producer(/*timeout_s=*/kTimeoutS,
+                             /*local_control_port=*/-1);
+        int sockets[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) _exit(2);
+
+        TestManager::ControlRequestHeader request;
+        request.magic = TestManager::kControlMagic;
+        request.op = TestManager::kOpPullStream;
+        request.uuid = 50;
+        request.num_blocks = 1;
+        if (write(sockets[0], &request, sizeof(request)) !=
+            static_cast<ssize_t>(sizeof(request))) {
+          _exit(3);
+        }
+        const int64_t source_block = 0;
+        if (write(sockets[0], &source_block, sizeof(source_block)) !=
+            static_cast<ssize_t>(sizeof(source_block))) {
+          _exit(4);
+        }
+
+        // The handler reads the source block, sees EOF where the destination
+        // block should be, and attempts to return an error to a closed peer.
+        close(sockets[0]);
+        producer.HandleControlConnectionForTest(sockets[1]);
+        close(sockets[1]);
+        _exit(0);
+      },
+      ::testing::ExitedWithCode(0), "");
 }
 
 TEST(ControlHandshakeTest, ShutdownUnblocksPendingPull) {

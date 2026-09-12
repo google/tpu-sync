@@ -952,11 +952,24 @@ absl::Status KVCacheManagerWithTransfer::ValidatePoolReshardPlan(
           absl::StrJoin(plan.pool_dtype_tags(), ","), "] local pools=[",
           local_pools, "]"));
     }
-    for (int64_t block_id : local_block_ids) {
-      if (block_id >= spec->num_blocks) {
-        return absl::InvalidArgumentError(
-            absl::StrCat("local block id ", block_id,
-                         " is out of range for pool ", pool_idx));
+  }
+
+  if (!is_sender) {
+    for (const auto& group : plan.pool_groups()) {
+      for (int32_t pool_idx : group.pool_indices()) {
+        const kv_cache::PoolSpec* spec =
+            pool_idx < 0 ? nullptr : pool(static_cast<size_t>(pool_idx));
+        if (spec == nullptr) {
+          return absl::InvalidArgumentError(
+              absl::StrCat("group pool index out of range: ", pool_idx));
+        }
+        for (int64_t block_id : group.dst_device_block_ids()) {
+          if (block_id >= spec->num_blocks) {
+            return absl::InvalidArgumentError(
+                absl::StrCat("local block id ", block_id,
+                             " is out of range for pool ", pool_idx));
+          }
+        }
       }
     }
   }
@@ -1026,6 +1039,15 @@ absl::Status KVCacheManagerWithTransfer::ValidatePoolReshardPlan(
       }
       for (size_t pool_idx : entry_pools) {
         const kv_cache::PoolSpec* spec = pool(pool_idx);
+        if (spec == nullptr) {
+          return absl::InvalidArgumentError(
+              absl::StrCat("group pool index out of range: ", pool_idx));
+        }
+        if (local_id >= spec->num_blocks) {
+          return absl::InvalidArgumentError(
+              absl::StrCat("local block id ", local_id,
+                           " is out of range for pool ", pool_idx));
+        }
         if (!StridedSpanFitsRegions(local_offset, local_stride,
                                     entry.size_bytes(), entry.count(),
                                     spec->block_stride_bytes, spec->regions)) {

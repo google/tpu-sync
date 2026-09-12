@@ -54,12 +54,12 @@ using ::tpu_sync::rpc::StartTransferRequest;
 
 class TestManager : public KVCacheManagerWithTransfer {
  public:
-  explicit TestManager(double timeout_s = 30.0)
+  explicit TestManager(double timeout_s = 30.0, int host_blocks = 4)
       : KVCacheManagerWithTransfer(
             /*num_layers=*/1, /*num_shards=*/1,
             /*slice_byte_size=*/128,
             /*local_port=*/std::nullopt,
-            /*host_blocks_to_allocate=*/std::make_optional(4),
+            /*host_blocks_to_allocate=*/std::make_optional(host_blocks),
             /*parallelism=*/1, /*node_id=*/0,
             /*local_control_port=*/-1, /*max_blocks=*/0, /*num_slots=*/0,
             timeout_s) {}
@@ -78,13 +78,14 @@ class TestManager : public KVCacheManagerWithTransfer {
 };
 
 kv_cache::PoolSpec DensePool(std::string tag, int64_t block_stride = 128,
-                             std::string dtype_tag = "bf16") {
+                             std::string dtype_tag = "bf16",
+                             int64_t num_blocks = 4) {
   return kv_cache::PoolSpec{
       .tag = std::move(tag),
       .storage_index = 0,
       .base_offset_bytes = 0,
       .block_stride_bytes = block_stride,
-      .num_blocks = 4,
+      .num_blocks = num_blocks,
       .regions = {kv_cache::RegionSpec{
           .name = "block",
           .offset_bytes = 0,
@@ -638,6 +639,118 @@ TEST(PoolReshardValidationTest, RejectsBlockIdsOutsideDeclaredPool) {
   ExpectInvalid(manager.ValidatePoolReshardPlan(plan, std::vector<int64_t>{},
                                                 /*is_sender=*/false),
                 "must not be empty");
+}
+
+StartTransferRequest IndependentPoolPlan(int64_t fa_block, int64_t swa_block) {
+  StartTransferRequest plan = ValidPlan(
+      /*uuid=*/1110, /*dtype_tags=*/{"bf16", "bf16"},
+      /*transferred_pools=*/{0, 1});
+  plan.clear_pool_groups();
+  plan.mutable_shard_push_schedules()->at(0).clear_entries();
+  for (int32_t index : {0, 1}) {
+    const int64_t block = index == 0 ? fa_block : swa_block;
+    AddEntry(plan, 0, block, /*dst_offset=*/0, /*size=*/16, index)
+        ->set_src_block_id(block);
+    auto* group = plan.add_pool_groups();
+    group->add_pool_indices(index);
+    group->add_dst_device_block_ids(block);
+    group->set_expected_pushes(1);
+    group->add_dst_expected_extent_bytes(16);
+    group->set_order_rank(index);
+  }
+  return plan;
+}
+
+TEST(PoolReshardValidationTest, AcceptsIndependentPoolPageRanges) {
+  for (bool reverse : {false, true}) {
+    TestManager manager(/*timeout_s=*/30.0, /*host_blocks=*/1025);
+    ASSERT_TRUE(manager
+                    .RegisterPools({
+                        DensePool("fa", 128, "bf16", reverse ? 65 : 1025),
+                        DensePool("swa", 128, "bf16", reverse ? 1025 : 65),
+                    })
+                    .ok());
+    const int64_t fa_block = reverse ? 3 : 65;
+    const int64_t swa_block = reverse ? 65 : 3;
+    const auto plan = IndependentPoolPlan(fa_block, swa_block);
+    for (bool is_sender : {false, true}) {
+      const auto status = manager.ValidatePoolReshardPlan(
+          plan, std::vector<int64_t>{fa_block, swa_block}, is_sender);
+      EXPECT_TRUE(status.ok()) << status.ToString();
+    }
+  }
+}
+
+TEST(PoolReshardValidationTest, RejectsIdsOutsideTheirOwnPool) {
+  TestManager manager(/*timeout_s=*/30.0, /*host_blocks=*/1025);
+  ASSERT_TRUE(manager
+                  .RegisterPools({DensePool("fa", 128, "bf16", 1025),
+                                  DensePool("swa", 128, "bf16", 65)})
+                  .ok());
+  for (bool is_sender : {false, true}) {
+    ExpectInvalid(manager.ValidatePoolReshardPlan(
+                      IndependentPoolPlan(1025, 3),
+                      std::vector<int64_t>{1025, 3}, is_sender),
+                  "out of range for pool 0");
+    ExpectInvalid(manager.ValidatePoolReshardPlan(
+                      IndependentPoolPlan(65, 65),
+                      std::vector<int64_t>{65, 65}, is_sender),
+                  "out of range for pool 1");
+    ExpectInvalid(manager.ValidatePoolReshardPlan(
+                      IndependentPoolPlan(65, -1),
+                      std::vector<int64_t>{65, -1}, is_sender),
+                  "must be non-negative");
+  }
+}
+
+TEST(PoolReshardValidationTest, ChecksUnusedReceiverIdsWithinTheirOwnPool) {
+  TestManager manager(/*timeout_s=*/30.0, /*host_blocks=*/1025);
+  ASSERT_TRUE(manager
+                  .RegisterPools({DensePool("fa", 128, "bf16", 1025),
+                                  DensePool("swa", 128, "bf16", 65)})
+                  .ok());
+  auto plan = IndependentPoolPlan(65, 3);
+  auto* swa_group = plan.mutable_pool_groups(1);
+  swa_group->add_dst_device_block_ids(65);
+  swa_group->add_dst_expected_extent_bytes(16);
+  ExpectInvalid(manager.ValidatePoolReshardPlan(
+                    plan, std::vector<int64_t>{65, 3, 65}, /*is_sender=*/false),
+                "out of range for pool 1");
+}
+
+TEST(PoolReshardValidationTest, ChecksSenderEntryAgainstItsOwnPool) {
+  TestManager manager(/*timeout_s=*/30.0, /*host_blocks=*/1025);
+  ASSERT_TRUE(manager
+                  .RegisterPools({DensePool("fa", 128, "bf16", 1025),
+                                  DensePool("swa", 128, "bf16", 65)})
+                  .ok());
+  auto plan = IndependentPoolPlan(65, 3);
+  plan.mutable_shard_push_schedules()->at(0).mutable_entries(1)->set_src_block_id(
+      65);
+  ExpectInvalid(manager.ValidatePoolReshardPlan(
+                    plan, std::vector<int64_t>{65, 3}, /*is_sender=*/true),
+                "out of range for pool 1");
+}
+
+TEST(PoolReshardValidationTest, KeepsIndependentPoolIdsScoped) {
+  TestManager manager(/*timeout_s=*/30.0, /*host_blocks=*/1025);
+  ASSERT_TRUE(manager
+                  .RegisterPools({DensePool("fa", 128, "bf16", 1025),
+                                  DensePool("swa", 128, "bf16", 65)})
+                  .ok());
+  const auto shared_ids = IndependentPoolPlan(3, 3);
+  for (bool is_sender : {false, true}) {
+    const auto status = manager.ValidatePoolReshardPlan(
+        shared_ids, std::vector<int64_t>{3, 3}, is_sender);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+  }
+
+  auto wrong_group = IndependentPoolPlan(65, 3);
+  AddEntry(wrong_group, 0, /*dst_block_id=*/3, /*dst_offset=*/0, /*size=*/16,
+           /*group_idx=*/0);
+  ExpectInvalid(manager.ValidatePoolReshardPlan(
+                    wrong_group, std::vector<int64_t>{65, 3}, /*is_sender=*/false),
+                "outside its group");
 }
 
 // Extends ValidPlan's single-group shape with a second group holding pool 1;

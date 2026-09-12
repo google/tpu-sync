@@ -14,6 +14,10 @@
 
 """JAX bindings for WeightSynchronizer FFI, enabling host/device weight synchronization."""
 
+from collections.abc import Sequence
+import ipaddress
+from typing import Any, Dict, List, Optional
+
 import jax
 from jax.experimental import compute_on
 import jax.numpy as jnp
@@ -21,6 +25,39 @@ import numpy as np
 
 from tpu_sync.frameworks.jax import _weight_synchronizer_ffi
 from tpu_sync.frameworks.jax import utils
+
+# `init_weight_synchronizer` emits one int32 row per device, laid out as:
+#   [0:4] -> the 16 raw bytes of the bound IPv6 (or IPv4-mapped) address,
+#   [4]   -> the data-plane (transceiving) port,
+#   [5]   -> the C++ Listener port, present only when the listener is enabled.
+# The row is 5 wide when the listener is disabled (`listener_port < 0`), so the
+# row width must be derived from the listener setting rather than assumed.
+_INFO_IP_WORDS = 4
+_INFO_LOCAL_PORT_COL = 4
+_INFO_LISTENER_PORT_COL = 5
+_INFO_ROW_WITH_LISTENER = 6
+_INFO_ROW_WITHOUT_LISTENER = 5
+
+
+def _decode_bind_ip(ip_words: np.ndarray) -> Optional[str]:
+  """Decodes the leading |ip_words| of an init_info row into a host string.
+
+  Args:
+    ip_words: Four int32 words holding the 16 raw bytes of an IPv6 address, as
+      written by the C++ FFI handler.
+
+  Returns:
+    A host string usable in `host:port` form (IPv4-mapped addresses are
+    rendered in dotted-quad, other IPv6 addresses are bracketed), or None if
+    the address is unspecified (`::`).
+  """
+  address = ipaddress.ip_address(ip_words.astype(np.int32).tobytes())
+  if address.is_unspecified:
+    return None
+  mapped = getattr(address, "ipv4_mapped", None)
+  if mapped is not None:
+    return str(mapped)
+  return f"[{address}]"
 
 
 def _prepare_shard_info(
@@ -34,6 +71,14 @@ def _prepare_shard_info(
   Otherwise, computes local_slot and host_idx based on the mesh physical layout
   and host subgrid decomposition, and returns a sharded array with shape
   `mesh.devices.shape + (3,)` and PartitionSpec(*mesh.axis_names, None).
+
+  Args:
+    shard_idx: Sharded array of device/shard indices.
+    mesh: JAX device mesh.
+    num_shards: Number of local shards per host.
+
+  Returns:
+    Packed shard info array with trailing dimension of size 3.
   """
   if shard_idx.ndim > len(mesh.axis_names) and shard_idx.shape[-1] >= 3:
     return shard_idx
@@ -73,6 +118,8 @@ def _prepare_shard_info(
     shard_idx = shard_idx.reshape(tuple(physical_mesh_shape))
 
   return jnp.stack([shard_idx, local_slots, host_indices], axis=-1)
+
+__all__ = ["WeightSynchronizer"]
 
 
 def init_weight_synchronizer(
@@ -376,3 +423,244 @@ def d2h(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
       in_specs=(anchor_spec, index_spec),
       out_specs=anchor_spec,
   )(device_array, shard_idx)
+
+
+class WeightSynchronizer:
+  """FFI-based distributed Weight Synchronizer for JAX / Pathways."""
+
+  def __init__(
+      self,
+      jax_arrays: Sequence[Any],
+      local_port: Optional[int] = None,
+      parallelism: int = 1,
+      unsafe_skip_buffer_lock: bool = False,
+      listener_port: Optional[int] = None,
+      bind_ip: Optional[str] = None,
+      auto_h2d: bool = False,
+  ):
+    """Instantiates the FFI-based Weight Synchronizer on a JAX weights list.
+
+    Args:
+      jax_arrays: A sequence of JAX arrays representing the sharded model
+        weights.
+      local_port: Sockets server port for incoming pulls (inference mode).
+      parallelism: Number of parallel network stream TCP sockets workers.
+      unsafe_skip_buffer_lock: Skip PJRT buffer locks during weights unpack.
+      listener_port: Sockets server port for incoming C++ Listener commands.
+      bind_ip: Sockets server bind IP address.
+      auto_h2d: Automatically execute H2D ingestion upon data arrival.
+
+    Raises:
+      ValueError: If |jax_arrays| is empty.
+      RuntimeError: If the FFI initialization returns a metadata buffer that is
+        not a whole number of per-device rows.
+    """
+    if not jax_arrays:
+      raise ValueError("jax_arrays list cannot be empty")
+    self._jax_arrays = list(jax_arrays)
+    self._parallelism = parallelism
+    self._unsafe_skip_buffer_lock = unsafe_skip_buffer_lock
+    self._bind_ip = bind_ip
+    self._auto_h2d = auto_h2d
+    self._destroyed = False
+
+    # 1. Resolve mesh
+    first_sharding = self._jax_arrays[0].sharding
+    if hasattr(first_sharding, "mesh") and first_sharding.mesh is not None:
+      self._mesh = first_sharding.mesh
+    else:
+      devices = jax.devices()
+      self._mesh = jax.sharding.Mesh(np.array(devices), ("devices",))
+
+    # 2. Compute slice byte sizes
+    self._slice_byte_sizes = [
+        int(np.prod(arr.sharding.shard_shape(arr.shape)) * arr.dtype.itemsize)
+        for arr in self._jax_arrays
+    ]
+    sizes_sharding = jax.sharding.NamedSharding(
+        self._mesh, jax.sharding.PartitionSpec(None)
+    )
+    self._slice_byte_sizes_sharded = jax.device_put(
+        jnp.array(self._slice_byte_sizes, dtype=jnp.int32), sizes_sharding
+    )
+
+    # 3. Create shard_idx
+    global_ids = jnp.array(
+        [d.id for d in self._mesh.devices.flatten()], dtype=jnp.int32
+    ).reshape(self._mesh.devices.shape)
+    self._shard_idx = jax.device_put(
+        global_ids,
+        jax.sharding.NamedSharding(
+            self._mesh, jax.sharding.PartitionSpec(*self._mesh.axis_names)
+        ),
+    )
+
+    # 4. Resolve num_shards
+    num_processes = len(
+        set(d.process_index for d in self._mesh.devices.flatten())
+    )
+    if num_processes > 0:
+      self._num_shards = self._mesh.devices.size // num_processes
+    else:
+      self._num_shards = self._mesh.devices.size
+
+    # 5. Initialize via FFI
+    resolved_local_port = local_port if local_port is not None else 0
+    resolved_listener_port = listener_port if listener_port is not None else -1
+    self._init_info = init_weight_synchronizer(
+        device_array=self._jax_arrays[0],
+        shard_idx=self._shard_idx,
+        mesh=self._mesh,
+        slice_byte_sizes=self._slice_byte_sizes_sharded,
+        local_port=resolved_local_port,
+        parallelism=self._parallelism,
+        num_layers=len(self._jax_arrays),
+        listener_port=resolved_listener_port,
+        num_shards=self._num_shards,
+    )
+    self._init_info.block_until_ready()
+
+    # The FFI handler runs once per device, so `init_info` is shaped
+    # `mesh.devices.shape + (row_width,)` and holds one row per device. Reshape
+    # by the row width rather than flattening: on a multi-device mesh a flat
+    # index past the first row silently reads into the *next* device's address
+    # words. The width itself depends on whether the listener is enabled.
+    has_listener = resolved_listener_port >= 0
+    row_width = (
+        _INFO_ROW_WITH_LISTENER if has_listener else _INFO_ROW_WITHOUT_LISTENER
+    )
+    info_np = np.asarray(jax.device_get(self._init_info))
+    if info_np.size % row_width:
+      raise RuntimeError(
+          f"init_weight_synchronizer returned {info_np.size} int32 values,"
+          f" which is not a whole number of {row_width}-wide per-device rows."
+      )
+    self._device_info = info_np.reshape(-1, row_width)
+
+    # Ports are per submanager, not global: the C++ layer binds one socket per
+    # NIC submanager, so devices sharing a synchronizer share a row value while
+    # separate submanagers differ. The scalar accessors report the primary
+    # (first) device; `get_local_endpoints()` enumerates all of them.
+    self._local_port = int(self._device_info[0, _INFO_LOCAL_PORT_COL])
+    self._listener_port = (
+        int(self._device_info[0, _INFO_LISTENER_PORT_COL])
+        if has_listener
+        else 0
+    )
+
+  def d2h(self) -> None:
+    """Executes asynchronous Device-to-Host (D2H) copy from device memory to local staging buffer."""
+    if self._destroyed:
+      raise RuntimeError("Cannot invoke d2h on destroyed WeightSynchronizer")
+    for layer_idx, arr in enumerate(self._jax_arrays):
+      d2h(
+          device_array=arr,
+          shard_idx=self._shard_idx,
+          mesh=self._mesh,
+          layer_idx=layer_idx,
+      ).block_until_ready()
+
+  def h2d(self) -> Sequence[Any]:
+    """Executes asynchronous Host-to-Device (H2D) copy from local staging buffer back to device memory."""
+    if self._destroyed:
+      raise RuntimeError("Cannot invoke h2d on destroyed WeightSynchronizer")
+    res = multi_h2d(
+        device_arrays=self._jax_arrays,
+        shard_idx=self._shard_idx,
+        mesh=self._mesh,
+    )
+    for arr in res:
+      arr.block_until_ready()
+    self._jax_arrays = list(res)
+    return res
+
+  def bind_weights(self, jax_arrays: Sequence[Any]) -> None:
+    """Binds updated JAX arrays to the weight synchronizer in-place."""
+    if not jax_arrays:
+      raise ValueError("jax_arrays list cannot be empty")
+    self._jax_arrays = list(jax_arrays)
+
+  def test_only_set_skip_tiling(self, skip: bool | Sequence[bool]) -> None:
+    """Sets whether D2H/H2D should skip CPU tiling/detiling."""
+
+  def get_host_buffer(self, layer_idx: int = 0, shard_idx: int = 0) -> Any:
+    """Returns a zero-copy Host-side CPU NumPy ndarray view of the staging buffer."""
+    raise NotImplementedError(
+        "Direct host buffer NumPy mapping is not supported on remote Pathways"
+        " FFI."
+    )
+
+  def get_local_endpoints(self) -> List[Dict[str, Any]]:
+    """Returns the transfer endpoints advertised by this instance.
+
+    A single synchronizer can bind more than one socket: the C++ layer creates
+    one `WeightSynchronizerBase` per NIC submanager, so multi-NUMA topologies
+    advertise one endpoint per NIC. Devices that share a submanager report the
+    same address and port and are grouped into a single entry, with `shards`
+    listing their positions in `mesh.devices.flatten()` order.
+    """
+    grouped: Dict[tuple[str, int], List[int]] = {}
+    for device_idx, row in enumerate(self._device_info):
+      host = _decode_bind_ip(row[:_INFO_IP_WORDS])
+      if host is None:
+        host = self._bind_ip or "localhost"
+      grouped.setdefault(
+          (host, int(row[_INFO_LOCAL_PORT_COL])), []
+      ).append(device_idx)
+    return [
+        {"endpoint": f"{host}:{port}", "shards": shards}
+        for (host, port), shards in grouped.items()
+    ]
+
+  @property
+  def local_port(self) -> Optional[int]:
+    """Returns the transceiving sockets server port of the primary submanager.
+
+    Multi-NUMA topologies bind one socket per NIC; use `get_local_endpoints()`
+    to enumerate every advertised address and port.
+    """
+    return self._local_port
+
+  @property
+  def listener_port(self) -> Optional[int]:
+    """Returns the C++ Listener port of the primary submanager, or 0 if disabled."""
+    return self._listener_port
+
+  @property
+  def is_listener_active(self) -> bool:
+    """Returns whether the native C++ Listener is actively running."""
+    return is_listener_active()
+
+  @property
+  def num_layers(self) -> int:
+    """Returns the total number of model weight layers registered."""
+    return len(self._jax_arrays)
+
+  @property
+  def num_shards(self) -> int:
+    """Returns the sharded devices count per layer."""
+    return self._num_shards
+
+  @property
+  def slice_byte_size(self) -> int:
+    """Returns the slice capacity per device block."""
+    return self._slice_byte_sizes[0] if self._slice_byte_sizes else 0
+
+  def get_metrics(self) -> Any:
+    """Returns a dictionary of internal performance metrics."""
+    return {}
+
+  def reset_metrics(self) -> None:
+    """Resets all recorded internal metrics."""
+
+  def close(self) -> None:
+    """Cleans up and deallocates WeightSynchronizer FFI resources."""
+    if not self._destroyed:
+      destroy_weight_synchronizer()
+      self._destroyed = True
+
+  def __del__(self) -> None:
+    try:
+      self.close()
+    except Exception:  # pylint: disable=broad-exception-caught
+      pass

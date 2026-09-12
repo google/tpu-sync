@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "absl/container/flat_hash_set.h"
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include "tpu_sync/frameworks/jax/weight_synchronizer.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi.h"
+#include "tpu_sync/frameworks/jax/weight_synchronizer_ffi_internal.h"
 
 namespace nb = nanobind;
 
@@ -44,12 +46,19 @@ nb::list prepare_extended_info(nb::list gathered_info_list, nb::list device_ids,
 
 NB_MODULE(_weight_synchronizer_ffi, m) {
   m.def("destroy_weight_synchronizer", []() {
+    absl::flat_hash_set<tpu_raiden::weight_sync::WeightSynchronizerBase*>
+        deleted;
     for (size_t i = 0; i < tpu_raiden::weight_sync::kMaxShards; ++i) {
       if (tpu_raiden::weight_sync::g_weight_synchronizers[i] != nullptr) {
-        delete tpu_raiden::weight_sync::g_weight_synchronizers[i];
+        if (deleted.insert(tpu_raiden::weight_sync::g_weight_synchronizers[i])
+                .second) {
+          delete tpu_raiden::weight_sync::g_weight_synchronizers[i];
+        }
         tpu_raiden::weight_sync::g_weight_synchronizers[i] = nullptr;
       }
+      tpu_raiden::weight_sync::g_streams[i].reset();
     }
+    tpu_raiden::weight_sync::ClearSharedWsMap();
   });
 
   m.def(

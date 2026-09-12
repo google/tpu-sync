@@ -82,9 +82,15 @@ py_library(
     visibility = ["//visibility:public"],
     deps = [
         "//tpu_sync/frameworks/jax:_tpu_raiden_jax",
-        "//tpu_sync/frameworks/jax:jax_test_utils",
+        "//tpu_sync/frameworks/jax:weight_synchronizer_ffi_py",
         "@jax//jax",
     ],
+)
+
+alias(
+    name = "weight_synchronizer",
+    actual = ":weight_synchronizer_jax_py",
+    visibility = ["//visibility:public"],
 )
 
 py_test(

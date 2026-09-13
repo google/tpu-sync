@@ -109,6 +109,20 @@ constexpr uint8_t kUseBlockChunksFlag = 0x80;
 #define IOV_MAX UIO_MAXIOV
 #endif
 
+absl::Status TransferIovBatches(
+    int fd, absl::Span<const struct iovec> iovs,
+    absl::Status (*transfer)(int, absl::Span<const struct iovec>)) {
+  if (iovs.size() <= IOV_MAX) {
+    return transfer(fd, iovs);
+  }
+  while (!iovs.empty()) {
+    const size_t count = std::min(iovs.size(), static_cast<size_t>(IOV_MAX));
+    RETURN_IF_ERROR(transfer(fd, iovs.first(count)));
+    iovs.remove_prefix(count);
+  }
+  return absl::OkStatus();
+}
+
 std::vector<struct iovec> ToIovec(const std::vector<BlockChunk>& chunks) {
   std::vector<struct iovec> iov;
   iov.reserve(chunks.size());
@@ -422,7 +436,8 @@ absl::Status BlockTransport::HandleIncomingPush(
         }
 
         if (expected_size > 0) {
-          RETURN_IF_ERROR(ReadVExact(client_fd, ToIovec(chunks)));
+          RETURN_IF_ERROR(
+              TransferIovBatches(client_fd, ToIovec(chunks), ReadVExact));
           total_received_bytes += expected_size;
         }
         return absl::OkStatus();
@@ -685,7 +700,7 @@ void BlockTransport::TriggerNextSendStep(
             return;
           }
           if (total_size > 0) {
-            s = WriteVExact(state->client_fd, ToIovec(chunks));
+            s = TransferIovBatches(state->client_fd, ToIovec(chunks), WriteVExact);
           }
           if (!s.ok()) {
             LOG(ERROR) << "Write payload failed: " << s.ToString();
@@ -1145,7 +1160,7 @@ absl::Status BlockTransport::ProcessSocketPush(
           lib::SerializeChunkSize(total_size);
       RETURN_IF_ERROR(WriteExact(fd, s_size.data(), s_size.size()));
       if (total_size > 0) {
-        RETURN_IF_ERROR(WriteVExact(fd, absl::MakeSpan(iov)));
+        RETURN_IF_ERROR(TransferIovBatches(fd, absl::MakeSpan(iov), WriteVExact));
         stream_bytes_sent += total_size;
       }
       i = j;
@@ -1413,7 +1428,7 @@ absl::Status BlockTransport::ProcessSocketPull(
       }
 
       if (expected_size > 0) {
-        RETURN_IF_ERROR(ReadVExact(fd, absl::MakeSpan(iov)));
+        RETURN_IF_ERROR(TransferIovBatches(fd, absl::MakeSpan(iov), ReadVExact));
         stream_bytes_received += expected_size;
       }
 

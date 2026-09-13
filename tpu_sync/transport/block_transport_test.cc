@@ -327,6 +327,38 @@ class SamePeerFanoutDelegate : public MockDelegate {
   }
 };
 
+class FragmentedBlockDelegate : public MockDelegate {
+ public:
+  explicit FragmentedBlockDelegate(size_t fragments)
+      : MockDelegate(/*slice_size=*/fragments * 4 + 16, /*max_blocks=*/3),
+        fragments_(fragments) {}
+
+  void set_fragment_count(size_t fragments) { fragments_ = fragments; }
+
+  std::vector<BlockChunk> GetBlockChunks(
+      size_t layer_idx, size_t shard_idx,
+      absl::Span<const int64_t> block_ids, size_t total_bytes, uint64_t uuid,
+      int64_t sender_node_id = -1, absl::string_view peer = "",
+      int64_t src_block_id = -1, int64_t dst_block_id = -1) override {
+    std::vector<BlockChunk> chunks;
+    size_t remaining = total_bytes;
+    for (int64_t block : block_ids) {
+      for (size_t fragment = 0; fragment < fragments_ && remaining > 0;
+           ++fragment) {
+        const size_t size = std::min(remaining, size_t{2});
+        chunks.push_back({.ptr = block_data(block, layer_idx, shard_idx) +
+                                    8 + fragment * 4,
+                          .size = size});
+        remaining -= size;
+      }
+    }
+    return chunks;
+  }
+
+ private:
+  size_t fragments_;
+};
+
 // Sender delegate with a fixed node id, so a receiver can tell two senders
 // of the same uuid apart.
 class NodeDelegate : public MockDelegate {
@@ -491,6 +523,79 @@ TEST_P(BlockTransportTest, PushAndPullCorrectness) {
   // Verify pull parity
   EXPECT_EQ(delegate2.data()[0], 0xAB);
   EXPECT_EQ(delegate2.data()[size - 1], 0xAB);
+}
+
+TEST_P(BlockTransportTest, FragmentedPushPreservesPageBytesAndGuards) {
+  FragmentedBlockDelegate source(/*fragments=*/32768);
+  FragmentedBlockDelegate destination(/*fragments=*/32768);
+  const size_t block_bytes = source.slice_byte_size();
+  const size_t storage_bytes = source.GetHostSize(0, 0);
+  BlockTransport sender(&source, 0);
+  BlockTransport receiver(&destination, 0);
+  BindControlChannels(&sender, &source, &receiver, &destination);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  for (size_t fragments : {size_t{1024}, size_t{1025}, size_t{32768}}) {
+    SCOPED_TRACE(fragments);
+    source.set_fragment_count(fragments);
+    destination.set_fragment_count(fragments);
+    std::memset(source.data(), 0xA5, storage_bytes);
+    std::memset(destination.data(), 0xA5, storage_bytes);
+    std::vector<uint8_t> expected(storage_bytes, 0xA5);
+    for (size_t i = 0; i < fragments; ++i) {
+      for (size_t byte = 0; byte < 2; ++byte) {
+        const uint8_t value =
+            static_cast<uint8_t>((i * 37 + i / 256 + byte) % 251);
+        source.block_data(1)[8 + i * 4 + byte] = value;
+        expected[2 * block_bytes + 8 + i * 4 + byte] = value;
+      }
+    }
+
+    auto result = sender.SyncPush(
+        {absl::StrCat("localhost:", receiver.local_port())}, {1}, {2},
+        /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0, /*layer_idx=*/-1);
+    ASSERT_OK(result.status());
+    EXPECT_EQ(*result, std::vector<int>({2}));
+    EXPECT_EQ(std::vector<uint8_t>(destination.data(),
+                                  destination.data() + storage_bytes),
+              expected);
+  }
+}
+
+TEST_P(BlockTransportTest, FragmentedPullPreservesPageBytesAndGuards) {
+  FragmentedBlockDelegate source(/*fragments=*/32768);
+  FragmentedBlockDelegate destination(/*fragments=*/32768);
+  const size_t block_bytes = source.slice_byte_size();
+  const size_t storage_bytes = source.GetHostSize(0, 0);
+  BlockTransport sender(&source, 0);
+  BlockTransport receiver(&destination, 0);
+  BindControlChannels(&sender, &source, &receiver, &destination);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  for (size_t fragments : {size_t{1024}, size_t{1025}, size_t{32768}}) {
+    SCOPED_TRACE(fragments);
+    source.set_fragment_count(fragments);
+    destination.set_fragment_count(fragments);
+    std::memset(source.data(), 0xA5, storage_bytes);
+    std::memset(destination.data(), 0xA5, storage_bytes);
+    std::vector<uint8_t> expected(storage_bytes, 0xA5);
+    for (size_t i = 0; i < fragments; ++i) {
+      for (size_t byte = 0; byte < 2; ++byte) {
+        const uint8_t value =
+            static_cast<uint8_t>((i * 37 + i / 256 + byte) % 251);
+        source.block_data(1)[8 + i * 4 + byte] = value;
+        expected[2 * block_bytes + 8 + i * 4 + byte] = value;
+      }
+    }
+
+    auto result = receiver.SyncPull(
+        {absl::StrCat("localhost:", sender.local_port())}, {1},
+        /*local_block_ids=*/{2}, /*explicit_dst_ptrs=*/{}, /*parallelism=*/1,
+        MajorOrder::kLayerMajor, /*on_block_received=*/{}, /*uuid=*/0);
+    ASSERT_OK(result.status());
+    EXPECT_EQ(*result, std::vector<int>({2}));
+    EXPECT_EQ(std::vector<uint8_t>(destination.data(),
+                                  destination.data() + storage_bytes),
+              expected);
+  }
 }
 
 // Resolves chunks inside the block array named by `layer_idx`, so a test can

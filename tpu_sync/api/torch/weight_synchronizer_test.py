@@ -124,6 +124,16 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
             torch.equal(dst2_tensors[l][sh].cpu(), src_tensors[l][sh].cpu())
         )
 
+  def test_wait_for_transfer_completion_api_exists(self):
+    shape = (self.block_size, 128, 8)
+    tensors = [
+        [torch.zeros(shape, dtype=torch.float32, device=self.device)]
+        for _ in range(self.num_layers)
+    ]
+    ws = WeightSynchronizer(tensors, local_port=0, bind_ip="127.0.0.1")
+    self.assertTrue(hasattr(ws, "wait_for_transfer_completion"))
+    self.assertTrue(callable(ws.wait_for_transfer_completion))
+
   @parameterized.named_parameters(
       ("fp32", torch.float32),
       ("bf16", torch.bfloat16),

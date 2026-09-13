@@ -979,6 +979,10 @@ void WeightSynchronizer::DrainPendingH2d() {
   numa_manager_->DrainPendingH2d();
 }
 
+absl::Status WeightSynchronizer::WaitForTransferCompletion(uint64_t uuid) {
+  return numa_manager_->WaitForTransferCompletion(uuid);
+}
+
 weight_sync::WeightSyncMetrics WeightSynchronizer::GetMetrics() const {
   return numa_manager_->GetMetrics();
 }

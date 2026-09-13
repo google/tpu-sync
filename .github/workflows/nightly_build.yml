@@ -9,8 +9,10 @@
 #   pip install --pre tpu_sync_jax \
 #     --extra-index-url https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/simple/
 #
-# Nightlies never go to PyPI; releases do, through .github/workflows/
-# release_wheels.yml.
+# Scheduled runs also publish the nightlies to PyPI as .dev pre-releases
+# through the OSS exit gate (publish_pypi.yml); a dispatch publishes only when
+# asked. Wheels above the PyPI file limit are skipped, not fatal, so the
+# registry always gets every wheel and PyPI gets the ones that fit.
 #
 # The torch wheel needs no torch_tpu checkout: the build resolves the
 # torch_tpu module from shims/torch_tpu, backed by the torch_tpu
@@ -18,9 +20,14 @@
 # torch release listed in ci/build_wheel_impl.sh; the extension binds
 # torch_tpu's symbols at import to the installed torch_tpu wheel.
 #
-# Required repository variables:
+# Repository variables:
 #   vars.RAIDEN_REGISTRY_URL      (optional) overrides the Artifact Registry
 #                                 upload URL
+#   vars.RAIDEN_NIGHTLY_TORCH_ABIS (optional) torch releases the scheduled
+#                                 torch wheel ships an extension variant for
+#                                 (default: the build script's list); a single
+#                                 release keeps the wheel under the PyPI limit
+#   vars.PYPI_FILE_LIMIT_MB       see publish_pypi.yml
 
 name: Nightly Wheels
 
@@ -31,6 +38,13 @@ on:
     inputs:
       upload_to_registry:
         description: "Upload wheels to the tpu-sync Artifact Registry?"
+        type: choice
+        default: "no"
+        options:
+          - "yes"
+          - "no"
+      publish_to_pypi:
+        description: "Publish the wheels to PyPI through the exit gate (as .dev pre-releases)?"
         type: choice
         default: "no"
         options:
@@ -94,8 +108,12 @@ jobs:
           BUILD_MODE: ${{ matrix.framework }}
           WHEEL_VERSION_EXTRAS: ${{ needs.version.outputs.wheel_version_extras }}
           EXTRA_BAZEL_FLAGS: ${{ (inputs.use_remote_cache || 'yes') == 'yes' && '--config=ci' || '' }}
+          NIGHTLY_TORCH_ABIS: ${{ vars.RAIDEN_NIGHTLY_TORCH_ABIS }}
         run: |
           export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          if [[ -n "${NIGHTLY_TORCH_ABIS}" ]]; then
+            export RAIDEN_TORCH_ABIS="${NIGHTLY_TORCH_ABIS}"
+          fi
           bash ci/build_wheel_impl.sh
       - name: Check wheel metadata
         working-directory: tpu-sync
@@ -170,3 +188,12 @@ jobs:
             dist/tpu_sync_*"${WHEEL_VERSION_EXTRAS}"-*.whl
           echo "Uploaded to ${RAIDEN_REGISTRY_URL}:" >> "$GITHUB_STEP_SUMMARY"
           ls dist/tpu_sync_*.whl >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: "Publish"
+    needs: [version, build]
+    if: github.event_name == 'schedule' || inputs.publish_to_pypi == 'yes'
+    uses: ./.github/workflows/publish_pypi.yml
+    with:
+      artifact_pattern: nightly-wheel-*
+      skip_over_limit: true

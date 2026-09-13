@@ -1,0 +1,135 @@
+# Publishes already-built tpu_sync wheels to PyPI through the OSS exit gate.
+# Called by the nightly and release workflows after their build jobs; the
+# wheels arrive as workflow artifacts matching artifact_pattern.
+#
+# The job never talks to PyPI itself: it stages the wheels in the project's
+# exit-gate Artifact Registry repository with the runner's ambient service
+# account, then writes a manifest naming exactly the staged packages and
+# versions to the exit-gate trigger bucket. The gate validates the files,
+# publishes them to PyPI with its own credentials and emails the outcome to
+# the project's notification address; on success it removes the staged files.
+#
+# PyPI enforces a per-file size limit (100 MB unless the project has been
+# granted more; vars.PYPI_FILE_LIMIT_MB records the granted value). A release
+# refuses to stage anything if one wheel is over the limit, so PyPI never
+# holds half of a release; a nightly skips the over-limit wheels and publishes
+# the rest (skip_over_limit).
+
+name: Publish to PyPI
+
+on:
+  workflow_call:
+    inputs:
+      artifact_pattern:
+        description: "Workflow artifacts holding the wheels to publish"
+        required: true
+        type: string
+      skip_over_limit:
+        description: "Skip wheels above the PyPI file limit instead of failing"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  EXIT_GATE_REPOSITORY_URL: https://us-python.pkg.dev/oss-exit-gate-prod/tpu-raiden--pypi/
+  EXIT_GATE_MANIFEST_PREFIX: gs://oss-exit-gate-prod-projects-bucket/tpu-raiden/pypi/manifests
+  PYPI_FILE_LIMIT_MB: ${{ vars.PYPI_FILE_LIMIT_MB || '100' }}
+
+jobs:
+  publish:
+    name: "Publish to PyPI through the exit gate"
+    runs-on: linux-x86-n2-32
+    container:
+      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
+    timeout-minutes: 30
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: ${{ inputs.artifact_pattern }}
+          merge-multiple: true
+          path: wheels
+      # PyPI rejects files over the project's limit one by one, after earlier
+      # files of the same upload have already been accepted. Decide up front
+      # which wheels go: none if one is too big and skipping is off, otherwise
+      # the ones that fit.
+      - name: Select wheels under the PyPI file limit
+        env:
+          SKIP_OVER_LIMIT: ${{ inputs.skip_over_limit }}
+        run: |
+          python3 - <<'PY'
+          import glob, os, shutil, sys
+          limit = int(os.environ['PYPI_FILE_LIMIT_MB']) * 1024 * 1024
+          skip = os.environ['SKIP_OVER_LIMIT'] == 'true'
+          wheels = sorted(glob.glob('wheels/*.whl'))
+          assert wheels, 'no wheels downloaded'
+          os.makedirs('release', exist_ok=True)
+          kept, too_big = [], []
+          for w in wheels:
+              size = os.path.getsize(w)
+              print(f'{size / 1048576:8.1f} MB  {os.path.basename(w)}')
+              (too_big if size > limit else kept).append(w)
+          if too_big and not skip:
+              print(f'ERROR: above the PyPI per-file limit of {limit // 1048576} MB: '
+                    + ', '.join(os.path.basename(w) for w in too_big), file=sys.stderr)
+              print('       Request a higher limit from PyPI and record it in the '
+                    'PYPI_FILE_LIMIT_MB repository variable, or build a smaller wheel.',
+                    file=sys.stderr)
+              sys.exit(1)
+          if not kept:
+              print(f'ERROR: every wheel is above the PyPI per-file limit of '
+                    f'{limit // 1048576} MB; nothing to publish.', file=sys.stderr)
+              sys.exit(1)
+          for w in kept:
+              shutil.copy(w, 'release/')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              if too_big:
+                  out.write(f'Skipped, above the PyPI file limit of {limit // 1048576} MB:\n')
+                  out.write(''.join(f'- {os.path.basename(w)}\n' for w in too_big))
+          PY
+      # The staging repository is the exit gate's own Artifact Registry
+      # repository for this project; the runner's ambient service account
+      # writes to it through the keyring backend. --skip-existing keeps
+      # re-runs idempotent (a staged file the gate has not consumed yet).
+      - name: Stage wheels in the exit-gate repository
+        run: |
+          uv run --isolated \
+            --with twine \
+            --with keyrings.google-artifactregistry-auth \
+            twine upload --skip-existing \
+            --repository-url "${EXIT_GATE_REPOSITORY_URL}" \
+            release/*.whl
+      # The manifest names exactly the packages and versions staged by this run
+      # (PyPI-normalized names, as registered with the gate), so the gate
+      # publishes only them and never a stale file left over in the repository.
+      - name: Write the publishing manifest
+        run: |
+          python3 - <<'PY'
+          import glob, json, re, zipfile
+          packages = []
+          for whl in sorted(glob.glob('release/*.whl')):
+              with zipfile.ZipFile(whl) as z:
+                  meta = next(n for n in z.namelist() if n.endswith('.dist-info/METADATA'))
+                  fields = dict(l.split(': ', 1) for l in z.read(meta).decode().splitlines()
+                                if l.startswith(('Name: ', 'Version: ')))
+              name = re.sub(r'[-_.]+', '-', fields['Name']).lower()
+              packages.append({'name': name, 'version': fields['Version']})
+          manifest = {'publish_all': False, 'publishing_groups': [{'packages': packages}]}
+          open('release/manifest.json', 'w').write(json.dumps(manifest, indent=2) + '\n')
+          print(json.dumps(manifest, indent=2))
+          PY
+      - name: Trigger the exit gate
+        env:
+          MANIFEST_NAME: manifest-${{ github.run_id }}-${{ github.run_attempt }}.json
+        run: |
+          gcloud storage cp release/manifest.json "${EXIT_GATE_MANIFEST_PREFIX}/${MANIFEST_NAME}"
+          {
+            echo "Exit-gate release triggered: ${EXIT_GATE_MANIFEST_PREFIX}/${MANIFEST_NAME}"
+            echo "The gate emails the outcome to the project's notification address."
+            echo '```'
+            cat release/manifest.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

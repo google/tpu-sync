@@ -75,7 +75,12 @@ check_disk_space "/tmp" "Temporary Directory (/tmp)"
 
 echo "=== Navigating to workspace directory ==="
 cd "${WORKSPACE_DIR}"
-TORCH_TPU_MODULE_PATH="${TORCH_TPU_MODULE_PATH:-../torch_tpu}"
+# The torch_tpu Bazel module. By default this is the wheel-backed module under
+# shims/torch_tpu, which takes torch_tpu's public header and XLA
+# pin from the installed torch_tpu wheel (TORCH_TPU_SOURCE, the site-packages
+# directory that contains torch_tpu/); point it at a torch_tpu checkout to
+# build against one instead.
+TORCH_TPU_MODULE_PATH="${TORCH_TPU_MODULE_PATH:-${WORKSPACE_DIR}/shims/torch_tpu}"
 
 # 0. Set up standalone Bazel environment in /tmp
 BAZEL_VERSION="$(cat .bazelversion | tr -d '[:space:]')"
@@ -93,10 +98,6 @@ fi
 BUILD_JAX=true
 BUILD_TORCH=true
 
-if [ ! -f "${TORCH_TPU_MODULE_PATH}/MODULE.bazel" ]; then
-  echo "torch_tpu checkout not found at ${TORCH_TPU_MODULE_PATH}. Defaulting to JAX-only build."
-  BUILD_TORCH=false
-fi
 
 # Parse command line arguments
 if [ "$#" -gt 0 ]; then
@@ -173,11 +174,29 @@ fi
 if [ "$BUILD_TORCH" = true ]; then
   echo "Configuring build for Torch..."
   if [[ ! -f "${TORCH_TPU_MODULE_PATH}/MODULE.bazel" ]]; then
-    echo "Error: Torch build requires a torch_tpu checkout at ${TORCH_TPU_MODULE_PATH}." >&2
-    echo "Set TORCH_TPU_MODULE_PATH to override the default ../torch_tpu location." >&2
+    echo "Error: no Bazel module at TORCH_TPU_MODULE_PATH=${TORCH_TPU_MODULE_PATH}." >&2
     exit 1
   fi
   TORCH_TPU_MODULE_PATH="$(cd "${TORCH_TPU_MODULE_PATH}" && pwd)"
+  # The wheel-backed module reads the API header and the XLA pin from the
+  # installed torch_tpu wheel; a checkout carries both itself.
+  if [[ "${TORCH_TPU_MODULE_PATH}" != "${WORKSPACE_DIR}/shims/torch_tpu" ]]; then
+    TORCH_TPU_SOURCE=""
+  elif [[ -z "${TORCH_TPU_SOURCE:-}" ]]; then
+    TORCH_TPU_SOURCE="$(python3 - <<'PY2'
+import importlib.util, pathlib
+spec = importlib.util.find_spec("torch_tpu")
+if spec is None or not spec.submodule_search_locations:
+  raise SystemExit("torch_tpu package not found on Python path; install the torch_tpu wheel or set TORCH_TPU_SOURCE")
+print(pathlib.Path(next(iter(spec.submodule_search_locations))).resolve().parent)
+PY2
+)"
+  fi
+  if [[ -n "${TORCH_TPU_SOURCE}" ]]; then
+    export TORCH_TPU_SOURCE
+    echo "Using installed torch_tpu from: ${TORCH_TPU_SOURCE}"
+    TORCH_REPO_ENV_FLAGS+=("--repo_env=TORCH_TPU_SOURCE=${TORCH_TPU_SOURCE}")
+  fi
   BAZEL_MODULE_FLAGS+=("--override_module=torch_tpu=${TORCH_TPU_MODULE_PATH}")
 
   # The torch extension calls virtual methods on PJRT objects that torch_tpu
@@ -225,10 +244,17 @@ if [ "$BUILD_TORCH" = true ]; then
     if [[ -n "${RAIDEN_TORCH_XLA:-}" ]]; then
       TORCH_XLA_DIR="$(cd "${RAIDEN_TORCH_XLA}" && pwd)"
     else
+      # A torch_tpu checkout pins XLA in bazel/xla_revision.bzl; the installed
+      # wheel carries the same commit in torch_tpu/include/XLA_COMMIT.
       XLA_REVISION_FILE="${TORCH_TPU_MODULE_PATH}/bazel/xla_revision.bzl"
-      XLA_COMMIT="$(sed -n -E 's/^XLA_COMMIT = "([0-9a-f]{40})".*/\1/p' "${XLA_REVISION_FILE}")"
-      if [[ -z "${XLA_COMMIT}" ]]; then
-        echo "Error: could not read XLA_COMMIT from ${XLA_REVISION_FILE}." >&2
+      if [[ -f "${XLA_REVISION_FILE}" ]]; then
+        XLA_COMMIT="$(sed -n -E 's/^XLA_COMMIT = "([0-9a-f]{40})".*/\1/p' "${XLA_REVISION_FILE}")"
+      else
+        XLA_REVISION_FILE="${TORCH_TPU_SOURCE}/torch_tpu/include/XLA_COMMIT"
+        XLA_COMMIT="$(tr -d '[:space:]' < "${XLA_REVISION_FILE}" 2>/dev/null || true)"
+      fi
+      if [[ ! "${XLA_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "Error: could not read a 40-hex XLA commit from ${XLA_REVISION_FILE}." >&2
         exit 1
       fi
       materialize_pinned_module "https://github.com/openxla/xla" \
@@ -285,12 +311,9 @@ PY
   )
 else
   DEFINE_FLAGS+=" --define with_torch=false"
-  DUMMY_TORCH_TPU_MODULE="${BAZEL_CACHE_BASE}/dummy_torch_tpu_module"
-  mkdir -p "${DUMMY_TORCH_TPU_MODULE}"
-  cat > "${DUMMY_TORCH_TPU_MODULE}/MODULE.bazel" <<'EOF'
-module(name = "torch_tpu", version = "0.1.1")
-EOF
-  BAZEL_MODULE_FLAGS+=("--override_module=torch_tpu=${DUMMY_TORCH_TPU_MODULE}")
+  # The jax targets reference nothing under @torch_tpu; the module only has to
+  # satisfy the dependency, and its repository rules run only when used.
+  BAZEL_MODULE_FLAGS+=("--override_module=torch_tpu=${WORKSPACE_DIR}/shims/torch_tpu")
 fi
 
 if [ ${#BAZEL_TARGETS[@]} -eq 0 ]; then

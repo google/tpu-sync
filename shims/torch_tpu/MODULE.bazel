@@ -1,0 +1,30 @@
+# The torch_tpu Bazel module for open-source builds, backed by the installed
+# torch_tpu wheel: raiden's torch targets reference @torch_tpu// for the
+# public tensor_buffer header, torch_tpu's torch shims and its Python
+# package. The header comes from the installed wheel (TORCH_TPU_SOURCE), the
+# shims resolve to the installed torch (TORCH_SOURCE), and the Python targets
+# are empty because torch_tpu is a runtime import. Nothing from torch_tpu's
+# source tree is copied here.
+module(name = "torch_tpu", version = "0.1.1")
+
+bazel_dep(name = "rules_cc", version = "0.2.9")
+bazel_dep(name = "rules_python", version = "1.8.5")
+# The export adds a nanobind load to every BUILD file; declare the module so
+# those loads resolve.
+bazel_dep(name = "nanobind_bazel", version = "2.12.0")
+bazel_dep(name = "bazel_skylib", version = "1.7.1")
+bazel_dep(name = "protobuf", version = "32.1", repo_name = "com_google_protobuf")
+bazel_dep(name = "abseil-cpp", version = "20260526.0", repo_name = "com_google_absl")
+bazel_dep(name = "xla")
+
+torch_local_repo = use_repo_rule("//bazel:torch_local_repo.bzl", "torch_local_repo")
+
+torch_local_repo(
+    name = "local_torch",
+)
+
+torch_tpu_wheel_repo = use_repo_rule("//bazel:torch_tpu_wheel_repo.bzl", "torch_tpu_wheel_repo")
+
+torch_tpu_wheel_repo(
+    name = "installed_torch_tpu",
+)

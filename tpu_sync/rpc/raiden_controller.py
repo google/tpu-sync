@@ -16,6 +16,7 @@
 
 import asyncio
 from collections import abc
+import concurrent.futures
 import dataclasses
 import enum
 import functools
@@ -536,6 +537,7 @@ class WorkerRpcClient:
       resolve_timeout: float = 300.0,
       name_resolver: Optional[NameResolver] = None,
       proto_module: Optional[Any] = None,
+      max_workers: Optional[int] = None,
   ):
     """Instantiates RPC Client with an optional initial endpoint mapping.
 
@@ -545,6 +547,9 @@ class WorkerRpcClient:
         task to self-register before raising a Timeout RuntimeError.
       name_resolver: Interface for resolving remote coordinates (e.g. BNS).
       proto_module: Optional protobuf module to use for ControlRequest/Response.
+      max_workers: Maximum number of worker threads for dispatching RPCs.
+        Defaults to max(128, (os.cpu_count() or 1) * 16) or the value specified
+        by the RAIDEN_RPC_CONCURRENCY environment variable.
     """
     self._endpoints = {}
     if endpoint_addresses:
@@ -554,6 +559,33 @@ class WorkerRpcClient:
     self._resolve_timeout = resolve_timeout
     self._name_resolver = name_resolver
     self._proto_module = proto_module or raiden_service_pb2
+    if max_workers is None:
+      env_concurrency = os.environ.get("RAIDEN_RPC_CONCURRENCY")
+      if env_concurrency:
+        try:
+          max_workers = int(env_concurrency)
+        except ValueError:
+          max_workers = None
+    if max_workers is None:
+      max_workers = max(128, (os.cpu_count() or 1) * 16)
+    self._executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="WorkerRpcClient",
+    )
+
+  @property
+  def executor(self) -> concurrent.futures.ThreadPoolExecutor:
+    return self._executor
+
+  def close(self) -> None:
+    """Shuts down the internal ThreadPoolExecutor."""
+    self._executor.shutdown(wait=False)
+
+  def __del__(self) -> None:
+    try:
+      self.close()
+    except Exception:  # pylint: disable=broad-exception-caught
+      pass
 
   @property
   def name_resolver(self) -> Optional[NameResolver]:
@@ -620,7 +652,7 @@ class WorkerRpcClient:
     """Connects to remote address, sends payload, and returns the response bytes."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        None, self._send_rpc_sync, addr, payload, timeout
+        self._executor, self._send_rpc_sync, addr, payload, timeout
     )
 
   def _send_rpc_sync(
@@ -921,12 +953,14 @@ class WeightSyncWorkerRpcClient(WorkerRpcClient):
       endpoint_addresses: Optional[dict[RaidenId, str]] = None,
       resolve_timeout: float = 300.0,
       name_resolver: Optional[NameResolver] = None,
+      max_workers: Optional[int] = None,
   ):
     super().__init__(
         endpoint_addresses=endpoint_addresses,
         resolve_timeout=resolve_timeout,
         name_resolver=name_resolver,
         proto_module=raiden_service_pb2,
+        max_workers=max_workers,
     )
 
 
@@ -1391,6 +1425,7 @@ class RaidenController:
     self._request_registry_ttl_s = request_registry_ttl_s
     self.worker_rpc_client = worker_rpc_client or WorkerRpcClient()
     self._registered_variables = {}
+    self._registered_control_plane_endpoints: dict[RaidenId, list[str]] = {}
 
   def register_work_unit(
       self,
@@ -1490,7 +1525,66 @@ class RaidenController:
     # never double-send. Pool/state reshard planning enforces its stricter
     # one-endpoint-per-unit contract at plan time.
 
+    endpoints: list[str] = []
+    if control_plane_rpc_address:
+      if isinstance(control_plane_rpc_address, (list, tuple)):
+        endpoints = [
+            str(a).strip() for a in control_plane_rpc_address if str(a).strip()
+        ]
+      else:
+        endpoints = [
+            a.strip()
+            for a in str(control_plane_rpc_address).split(",")
+            if a.strip()
+        ]
+
+    normalized_shards = list(shards)
+    new_mesh_shape = list(mesh_shape) if mesh_shape is not None else None
+    new_mesh_axes = list(mesh_axes) if mesh_axes is not None else None
+    new_layout = list(layout) if layout is not None else None
+    new_global_shape = list(global_shape) if global_shape is not None else None
+    new_itemsize = itemsize
+    new_pools = normalized_pools if has_reshard_metadata else None
+    new_layout_fingerprint = (
+        layout_fingerprint if has_reshard_metadata else None
+    )
+    new_page_tokens = page_tokens if has_reshard_metadata else None
+    new_transfer_parallelism = (
+        transfer_parallelism if has_reshard_metadata else None
+    )
+    new_transfer_rank = transfer_rank if has_reshard_metadata else None
+    new_variables = list(variables) if variables is not None else None
+
     with self._lock:
+      is_idempotent = False
+      if unit in self._registered_shards:
+        is_idempotent = (
+            self._registered_shards[unit] == normalized_shards
+            and self._registered_control_plane_endpoints.get(unit, [])
+            == endpoints
+            and self._registered_mesh_shapes.get(unit) == new_mesh_shape
+            and self._registered_mesh_axes.get(unit) == new_mesh_axes
+            and self._registered_layouts.get(unit) == new_layout
+            and self._registered_global_shapes.get(unit) == new_global_shape
+            and self._registered_itemsizes.get(unit) == new_itemsize
+            and self._registered_pool_manifests.get(unit) == new_pools
+            and self._registered_layout_fingerprints.get(unit)
+            == new_layout_fingerprint
+            and self._registered_page_tokens.get(unit) == new_page_tokens
+            and self._registered_transfer_parallelism.get(unit)
+            == new_transfer_parallelism
+            and self._registered_transfer_ranks.get(unit) == new_transfer_rank
+            and self._registered_variables.get(unit) == new_variables
+        )
+
+      if is_idempotent:
+        # Idempotent keepalive/heartbeat re-registration.
+        # Preserve cached plans and active tasks without clearing state.
+        if hasattr(self.worker_rpc_client, "register_worker_endpoint"):
+          for addr in endpoints:
+            self.worker_rpc_client.register_worker_endpoint(unit, addr)
+        return
+
       if unit in self._registered_shards:
         tasks_to_clear = []
         for req_id, units in self._task_units.items():
@@ -1500,7 +1594,8 @@ class RaidenController:
           self._active_tasks.pop(req_id, None)
           self._task_units.pop(req_id, None)
 
-      self._registered_shards[unit] = list(shards)
+      self._registered_shards[unit] = normalized_shards
+      self._registered_control_plane_endpoints[unit] = endpoints
       # Registration is replacement, not a patch: stale optional metadata
       # must disappear when a unit restarts with a different payload.
       for registry in (
@@ -1517,40 +1612,42 @@ class RaidenController:
           self._registered_variables,
       ):
         registry.pop(unit, None)
-      if mesh_shape is not None:
-        self._registered_mesh_shapes[unit] = list(mesh_shape)
-      if mesh_axes is not None:
-        self._registered_mesh_axes[unit] = list(mesh_axes)
-      if layout is not None:
-        self._registered_layouts[unit] = list(layout)
-      if global_shape is not None:
-        self._registered_global_shapes[unit] = list(global_shape)
-      if itemsize is not None:
-        self._registered_itemsizes[unit] = itemsize
+      if new_mesh_shape is not None:
+        self._registered_mesh_shapes[unit] = new_mesh_shape
+      if new_mesh_axes is not None:
+        self._registered_mesh_axes[unit] = new_mesh_axes
+      if new_layout is not None:
+        self._registered_layouts[unit] = new_layout
+      if new_global_shape is not None:
+        self._registered_global_shapes[unit] = new_global_shape
+      if new_itemsize is not None:
+        self._registered_itemsizes[unit] = new_itemsize
       if has_reshard_metadata:
-        self._registered_pool_manifests[unit] = normalized_pools
-        self._registered_layout_fingerprints[unit] = layout_fingerprint
-        self._registered_page_tokens[unit] = page_tokens
-        self._registered_transfer_parallelism[unit] = transfer_parallelism
-        self._registered_transfer_ranks[unit] = transfer_rank
-      if variables is not None:
-        self._registered_variables[unit] = list(variables)
+        self._registered_pool_manifests[unit] = new_pools
+        self._registered_layout_fingerprints[unit] = new_layout_fingerprint
+        self._registered_page_tokens[unit] = new_page_tokens
+        self._registered_transfer_parallelism[unit] = new_transfer_parallelism
+        self._registered_transfer_ranks[unit] = new_transfer_rank
+      if new_variables is not None:
+        self._registered_variables[unit] = new_variables
       if hasattr(self.worker_rpc_client, "unregister_worker_endpoint"):
         self.worker_rpc_client.unregister_worker_endpoint(unit)
-      if control_plane_rpc_address and hasattr(
+      if endpoints and hasattr(
           self.worker_rpc_client, "register_worker_endpoint"
       ):
-        if isinstance(control_plane_rpc_address, (list, tuple)):
-          endpoints = list(control_plane_rpc_address)
-        else:
-          endpoints = [
-              a.strip()
-              for a in str(control_plane_rpc_address).split(",")
-              if a.strip()
-          ]
         for addr in endpoints:
           self.worker_rpc_client.register_worker_endpoint(unit, addr)
-      self._plan_cache.clear()
+
+      # Invalidate cached plans involving this unit whose metadata changed.
+      keys_to_clear = [
+          k
+          for k in self._plan_cache
+          if isinstance(k, tuple)
+          and len(k) >= 2
+          and (unit in k[0] or unit in k[1])
+      ]
+      for k in keys_to_clear:
+        self._plan_cache.pop(k, None)
 
   def clear_plan_cache(self) -> None:
     """Clears all cached transfer schedules."""
@@ -1562,8 +1659,9 @@ class RaidenController:
     with self._lock:
       return len(self._plan_cache)
 
-  @staticmethod
+  @classmethod
   def _make_plan_cache_key(
+      cls,
       src_units: list[RaidenId],
       dst_units: list[RaidenId],
       group_size: int = 1,
@@ -2374,8 +2472,9 @@ class RaidenController:
         raise ValueError(f"Work units are not registered: {missing}")
       return [self._metadata_proto_locked(unit) for unit in units]
 
-  @staticmethod
+  @classmethod
   def _metadata_by_unit(
+      cls,
       metadata: typing.Sequence[Any], units: typing.Sequence[RaidenId]
   ) -> dict[RaidenId, Any]:
     """Selects exact requested metadata and rejects duplicate identities."""
@@ -2568,8 +2667,9 @@ class RaidenController:
                   name_resolver=self.worker_rpc_client.name_resolver,
               )
               loop = asyncio.get_running_loop()
+              rpc_executor = getattr(self.worker_rpc_client, "executor", None)
               success = await loop.run_in_executor(
-                  None,
+                  rpc_executor,
                   functools.partial(
                       dst_facade.register_transfer_schedule,
                       [s_node],
@@ -3066,8 +3166,9 @@ class RaidenController:
                   name_resolver=self.worker_rpc_client.name_resolver,
               )
               loop = asyncio.get_running_loop()
+              rpc_executor = getattr(self.worker_rpc_client, "executor", None)
               success = await loop.run_in_executor(
-                  None,
+                  rpc_executor,
                   dst_facade.register_transfer_schedule,
                   list(direct_schedules.keys()),
                   direct_dsts,
@@ -3110,8 +3211,9 @@ class RaidenController:
                   name_resolver=self.worker_rpc_client.name_resolver,
               )
               loop = asyncio.get_running_loop()
+              rpc_executor = getattr(self.worker_rpc_client, "executor", None)
               success = await loop.run_in_executor(
-                  None,
+                  rpc_executor,
                   dst_facade.register_transfer_schedule,
                   src_units,
                   dst_units,

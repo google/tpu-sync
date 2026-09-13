@@ -1,0 +1,323 @@
+# Release build of the tpu_sync wheels (tpu_sync_jax, tpu_sync_torch) and
+# their publication to PyPI as tpu-sync-jax / tpu-sync-torch. RELEASING.md
+# describes the full process.
+#
+# Two ways to run it:
+#   - Pushing a vX.Y.Z tag on main builds wheels whose version is exactly the
+#     pyproject.toml base version (which must equal the tag), publishes them
+#     to PyPI and attaches them to a GitHub Release.
+#   - workflow_dispatch builds .dev<UTC timestamp> wheels. By default it only
+#     keeps them as workflow artifacts (a dry run); with publish=yes it
+#     publishes them to PyPI as a developmental pre-release, which pip only
+#     selects with --pre. The frameworks input narrows a dispatch to one
+#     wheel, so one package can be published while the other is still over
+#     the PyPI file-size limit.
+#
+# Publication goes through the OSS exit gate rather than straight to PyPI:
+# the wheels are staged in the project's exit-gate Artifact Registry
+# repository, then a manifest naming each package and version is written to
+# the exit-gate trigger bucket. The gate validates the artifacts, publishes
+# them to PyPI with its own credentials and emails the outcome to the
+# project's notification address; on success it removes the staged files.
+# The runner's ambient service account is registered with the gate as a
+# builder, which is what authorizes both the staging upload and the manifest.
+#
+# PyPI enforces a per-file size limit (100 MB unless the project has been
+# granted more). The publish job refuses to stage a wheel above that limit
+# so the gate never publishes half of a release; set the repository variable
+# PYPI_FILE_LIMIT_MB once a higher limit has been granted.
+#
+# The torch wheel needs no torch_tpu checkout: the build resolves the
+# torch_tpu module from shims/torch_tpu, backed by the torch_tpu
+# wheel named in torch_tpu.version, and the extension binds torch_tpu's
+# symbols at import to the installed torch_tpu wheel. torch_tpu.version is
+# therefore both the build input and the pairing recorded in the release
+# notes. Update it before tagging.
+#
+# Required repository variables:
+#   vars.PYPI_FILE_LIMIT_MB       (optional) PyPI per-file limit granted to
+#                                 the project, in MB (default 100)
+
+name: Release Wheels
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the .dev wheels to PyPI through the exit gate? (no = dry run, wheels kept as workflow artifacts only)"
+        type: choice
+        default: "no"
+        options:
+          - "no"
+          - "yes"
+      frameworks:
+        description: "Wheels to build (and publish), space-separated: jax, torch, or both"
+        required: false
+        default: "jax torch"
+        type: string
+      torch_abis:
+        description: "torch releases the torch wheel ships an extension variant for, space-separated, primary first (a single release builds a single-ABI wheel)"
+        required: false
+        default: "2.11.0 2.12.0 2.13.0"
+        type: string
+      use_remote_cache:
+        description: "Use the remote bazel cache (--config=ci)?"
+        type: choice
+        default: "yes"
+        options:
+          - "yes"
+          - "no"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  EXIT_GATE_REPOSITORY_URL: https://us-python.pkg.dev/oss-exit-gate-prod/tpu-raiden--pypi/
+  EXIT_GATE_MANIFEST_PREFIX: gs://oss-exit-gate-prod-projects-bucket/tpu-raiden/pypi/manifests
+  PYPI_FILE_LIMIT_MB: ${{ vars.PYPI_FILE_LIMIT_MB || '100' }}
+
+jobs:
+  verify:
+    name: "Verify tag and version"
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      wheel_version_extras: ${{ steps.check.outputs.wheel_version_extras }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: check
+        run: |
+          BASE_VERSION=$(sed -n -E 's/^version = "(.*)"/\1/p' pyproject.toml | head -1)
+          echo "pyproject.toml version: ${BASE_VERSION}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [[ "${TAG_VERSION}" != "${BASE_VERSION}" ]]; then
+              echo "ERROR: tag ${GITHUB_REF_NAME} does not match pyproject.toml version ${BASE_VERSION}." >&2
+              echo "       Bump pyproject.toml [project].version on main before tagging." >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+              echo "ERROR: tag ${GITHUB_REF_NAME} is not reachable from origin/main; releases are cut from main only." >&2
+              exit 1
+            fi
+            EXTRAS=""
+          else
+            EXTRAS=".dev$(date -u +%Y%m%d%H%M%S)"
+          fi
+          echo "wheel version: ${BASE_VERSION}${EXTRAS}"
+          echo "version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "wheel_version_extras=${EXTRAS}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: "Build ${{ matrix.framework }} wheel"
+    needs: verify
+    # A tag release always builds both wheels; a dispatch builds the ones
+    # named in the frameworks input.
+    if: github.event_name != 'workflow_dispatch' || contains(inputs.frameworks, matrix.framework)
+    strategy:
+      fail-fast: false
+      matrix:
+        framework: [jax, torch]
+    runs-on: linux-x86-n2-32
+    container:
+      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
+    timeout-minutes: 300
+    steps:
+      - name: Checkout tpu-sync
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+          path: tpu-sync
+      # Git security patch (CVE-2022-24765) blocks root from operating on
+      # runner-owned directories. Tell Git explicitly to trust the workspace
+      # inside this ephemeral container.
+      - name: Fix Git Workspace Ownership
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/tpu-sync"
+      - name: Build wheel
+        working-directory: tpu-sync
+        env:
+          BUILD_MODE: ${{ matrix.framework }}
+          WHEEL_VERSION_EXTRAS: ${{ needs.verify.outputs.wheel_version_extras }}
+          INPUT_TORCH_ABIS: ${{ inputs.torch_abis }}
+          EXTRA_BAZEL_FLAGS: ${{ (inputs.use_remote_cache || 'yes') == 'yes' && '--config=ci' || '' }}
+        run: |
+          export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          # Tag builds take the script's default torch release list; a
+          # dispatch may narrow it (one release builds a single-ABI wheel).
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            export RAIDEN_TORCH_ABIS="${INPUT_TORCH_ABIS}"
+          fi
+          bash ci/build_wheel_impl.sh
+      # The torch wheel pairs with a torch_tpu wheel; record the version the
+      # release was validated with so the release notes carry it.
+      - name: Record torch_tpu pairing
+        if: matrix.framework == 'torch'
+        working-directory: tpu-sync
+        run: |
+          tr -d '\r\n ' < torch_tpu.version > dist/torch_tpu_version.txt
+          echo "torch_tpu wheel: $(cat dist/torch_tpu_version.txt)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check wheel metadata
+        working-directory: tpu-sync
+        env:
+          WHEEL_VERSION_EXTRAS: ${{ needs.verify.outputs.wheel_version_extras }}
+        run: uv run --isolated --with twine twine check dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl
+      # The JAX-stack coupling (jax/jaxlib/libtpu) is enforced through the
+      # wheel's own Requires-Dist pins; extract them so the release records the
+      # stack it must run with, mirroring torch_tpu_version.txt on the torch side.
+      - name: Record JAX stack pins
+        if: matrix.framework == 'jax'
+        working-directory: tpu-sync
+        run: |
+          python3 - <<'PY'
+          import glob, re, zipfile
+          whl = sorted(glob.glob('dist/tpu_sync_jax-*.whl'))[-1]
+          with zipfile.ZipFile(whl) as z:
+              meta = next(n for n in z.namelist() if n.endswith('.dist-info/METADATA'))
+              text = z.read(meta).decode()
+          pins = [l.removeprefix('Requires-Dist: ') for l in text.splitlines()
+                  if re.match(r'Requires-Dist: (jax|jaxlib|libtpu)\b', l)]
+          assert pins, f'no jax/jaxlib/libtpu pins found in {whl} METADATA'
+          open('dist/jax_pins.txt', 'w').write('\n'.join(pins) + '\n')
+          print('\n'.join(pins))
+          PY
+          echo "JAX stack pins:" >> "$GITHUB_STEP_SUMMARY"
+          cat dist/jax_pins.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: release-wheel-${{ matrix.framework }}
+          path: |
+            tpu-sync/dist/*${{ needs.verify.outputs.wheel_version_extras }}-*.whl
+            tpu-sync/dist/torch_tpu_version.txt
+            tpu-sync/dist/jax_pins.txt
+          if-no-files-found: error
+      - name: Summarize
+        working-directory: tpu-sync
+        env:
+          WHEEL_VERSION_EXTRAS: ${{ needs.verify.outputs.wheel_version_extras }}
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: "Publish to PyPI through the exit gate"
+    needs: [verify, build]
+    if: startsWith(github.ref, 'refs/tags/') || inputs.publish == 'yes'
+    runs-on: linux-x86-n2-32
+    container:
+      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
+    timeout-minutes: 30
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: release-wheel-*
+          merge-multiple: true
+          path: release
+      # PyPI rejects files over the project's limit one by one, after earlier
+      # files of the same upload have already been accepted. Refuse the whole
+      # release up front instead of leaving PyPI with half of it.
+      - name: Check wheel sizes against the PyPI limit
+        run: |
+          python3 - <<'PY'
+          import glob, os, sys
+          limit = int(os.environ['PYPI_FILE_LIMIT_MB']) * 1024 * 1024
+          wheels = sorted(glob.glob('release/*.whl'))
+          assert wheels, 'no wheels downloaded'
+          too_big = []
+          for w in wheels:
+              size = os.path.getsize(w)
+              print(f'{size / 1048576:8.1f} MB  {os.path.basename(w)}')
+              if size > limit:
+                  too_big.append(w)
+          if too_big:
+              print(f'ERROR: above the PyPI per-file limit of {limit // 1048576} MB: '
+                    + ', '.join(os.path.basename(w) for w in too_big), file=sys.stderr)
+              print('       Request a higher limit from PyPI and record it in the '
+                    'PYPI_FILE_LIMIT_MB repository variable, or build a smaller wheel.',
+                    file=sys.stderr)
+              sys.exit(1)
+          PY
+      # The staging repository is the exit gate's own Artifact Registry
+      # repository for this project; the runner's ambient service account
+      # writes to it through the keyring backend. --skip-existing keeps
+      # re-runs idempotent (a staged file the gate has not consumed yet).
+      - name: Stage wheels in the exit-gate repository
+        run: |
+          uv run --isolated \
+            --with twine \
+            --with keyrings.google-artifactregistry-auth \
+            twine upload --skip-existing \
+            --repository-url "${EXIT_GATE_REPOSITORY_URL}" \
+            release/*.whl
+      # The manifest names exactly the packages and versions built by this run
+      # (PyPI-normalized names, as registered with the gate), so the gate
+      # publishes only them and never a stale file left over in the repository.
+      - name: Write the publishing manifest
+        run: |
+          python3 - <<'PY'
+          import glob, json, re, zipfile
+          packages = []
+          for whl in sorted(glob.glob('release/*.whl')):
+              with zipfile.ZipFile(whl) as z:
+                  meta = next(n for n in z.namelist() if n.endswith('.dist-info/METADATA'))
+                  fields = dict(l.split(': ', 1) for l in z.read(meta).decode().splitlines()
+                                if l.startswith(('Name: ', 'Version: ')))
+              name = re.sub(r'[-_.]+', '-', fields['Name']).lower()
+              packages.append({'name': name, 'version': fields['Version']})
+          manifest = {'publish_all': False, 'publishing_groups': [{'packages': packages}]}
+          open('release/manifest.json', 'w').write(json.dumps(manifest, indent=2) + '\n')
+          print(json.dumps(manifest, indent=2))
+          PY
+      - name: Trigger the exit gate
+        env:
+          MANIFEST_NAME: manifest-${{ github.run_id }}-${{ github.run_attempt }}.json
+        run: |
+          gcloud storage cp release/manifest.json "${EXIT_GATE_MANIFEST_PREFIX}/${MANIFEST_NAME}"
+          {
+            echo "Exit-gate release triggered: ${EXIT_GATE_MANIFEST_PREFIX}/${MANIFEST_NAME}"
+            echo "The gate emails the outcome to the project's notification address."
+            echo '```'
+            cat release/manifest.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  github_release:
+    name: "Create GitHub Release"
+    needs: [verify, build, publish]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: release-wheel-*
+          merge-multiple: true
+          path: release
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES="$(printf 'torch_tpu wheel: %s\n\nJAX stack pins:\n%s\n' \
+            "$(cat release/torch_tpu_version.txt 2>/dev/null || echo 'n/a')" \
+            "$(cat release/jax_pins.txt 2>/dev/null || echo 'n/a')")"
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --generate-notes \
+            --notes "${NOTES}" \
+            release/*.whl release/*.txt

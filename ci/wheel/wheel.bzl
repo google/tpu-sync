@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Shared py_wheel template for the per-framework tpu_raiden wheels, so the
-# tpu_raiden_jax and tpu_raiden_torch wheels stay identical except for their
+# Shared py_wheel template for the per-framework tpu_sync wheels, so the
+# tpu_sync_jax and tpu_sync_torch wheels stay identical except for their
 # distribution name, requires list, and package contents.
 
 load("@rules_python//python:packaging.bzl", "py_wheel")
@@ -29,7 +29,7 @@ def raiden_framework_wheel(
 
     Args:
       name: wheel target name (e.g. raiden_torch_wheel).
-      distribution: PyPI distribution name (e.g. tpu_raiden_torch).
+      distribution: PyPI distribution name (e.g. tpu_sync_torch).
       package: the py_package target whose tpu_raiden files go in the wheel.
       requires: runtime dependency list for the wheel metadata.
       version: wheel version (typically @raiden_version//:WHEEL_VERSION).

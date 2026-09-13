@@ -90,6 +90,7 @@ jobs:
     outputs:
       version: ${{ steps.check.outputs.version }}
       wheel_version_extras: ${{ steps.check.outputs.wheel_version_extras }}
+      frameworks: ${{ steps.frameworks.outputs.list }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
         with:
@@ -117,17 +118,32 @@ jobs:
           echo "wheel version: ${BASE_VERSION}${EXTRAS}"
           echo "version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
           echo "wheel_version_extras=${EXTRAS}" >> "$GITHUB_OUTPUT"
+      # A tag release builds both wheels; a dispatch builds the ones named in
+      # the frameworks input. The list feeds the build matrix.
+      - id: frameworks
+        env:
+          INPUT_FRAMEWORKS: ${{ inputs.frameworks }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          known = ["jax", "torch"]
+          wanted = os.environ["INPUT_FRAMEWORKS"].split() or known
+          unknown = sorted(set(wanted) - set(known))
+          if unknown:
+              raise SystemExit(f"ERROR: unknown frameworks {unknown}; choose from {known}")
+          selected = [f for f in known if f in wanted]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write("list=" + json.dumps(selected) + "\n")
+          print("wheels to build:", selected)
+          PY
 
   build:
     name: "Build ${{ matrix.framework }} wheel"
     needs: verify
-    # A tag release always builds both wheels; a dispatch builds the ones
-    # named in the frameworks input.
-    if: github.event_name != 'workflow_dispatch' || contains(inputs.frameworks, matrix.framework)
     strategy:
       fail-fast: false
       matrix:
-        framework: [jax, torch]
+        framework: ${{ fromJSON(needs.verify.outputs.frameworks) }}
     runs-on: linux-x86-n2-32
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a

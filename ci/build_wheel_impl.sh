@@ -44,7 +44,7 @@
 #                            builds a single-ABI wheel)
 #   TORCH_TPU_INDEX_URL      pip index the torch_tpu wheel named by
 #                            torch_tpu.version is installed from (default:
-#                            the torch_tpu testing registry)
+#                            the torch_tpu virtual registry)
 #   TORCH_TPU_CHECKOUT       a torch_tpu source checkout to build the torch
 #                            wheel against instead of the installed wheel
 #                            (optional)
@@ -70,7 +70,7 @@ read -r -a TORCH_ABIS <<< "${RAIDEN_TORCH_ABIS:-2.11.0 2.12.0 2.13.0}"
 export BAZEL_CACHE_DIR="${BAZEL_CACHE_DIR:-/cache}"
 export BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE:-${BAZEL_CACHE_DIR}/output_base}"
 EXTRA_BAZEL_FLAGS="${EXTRA_BAZEL_FLAGS:-}"
-export TORCH_TPU_INDEX_URL="${TORCH_TPU_INDEX_URL:-https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-testing-registry/simple/}"
+export TORCH_TPU_INDEX_URL="${TORCH_TPU_INDEX_URL:-https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/}"
 echo "WHEEL_VERSION_EXTRAS: ${WHEEL_VERSION_EXTRAS}"
 
 export DEBIAN_FRONTEND=noninteractive

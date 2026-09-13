@@ -1,8 +1,8 @@
-# Builds the tpu_raiden Python wheels — one per framework, so the JAX and Torch
+# Builds the tpu_sync Python wheels — one per framework, so the JAX and Torch
 # stacks can be pinned/installed independently:
-#   //ci/wheel:raiden_jax_wheel    -> tpu_raiden_jax   (pulls jax/jaxlib)
-#   //ci/wheel:raiden_torch_wheel  -> tpu_raiden_torch (no jax deps)
-# Both share the tpu_raiden import root (tpu_raiden.frameworks.*, tpu_raiden.api.*)
+#   //ci/wheel:raiden_jax_wheel    -> tpu_sync_jax   (pulls jax/jaxlib)
+#   //ci/wheel:raiden_torch_wheel  -> tpu_sync_torch (no jax deps)
+# Both share the tpu_sync import root (tpu_sync.frameworks.*, tpu_sync.api.*)
 # and are mutually-exclusive variants — install one. Build with:
 #
 #   bazel build -c opt //ci/wheel:raiden_torch_wheel \
@@ -114,12 +114,12 @@ TORCH_ENTRY_POINTS = {
 }
 
 # Two separate wheels, one per framework, so the JAX and Torch stacks can be
-# pinned and installed independently (e.g. sglang/vLLM consume tpu_raiden_torch
-# without the JAX deps). Both share the `tpu_raiden` import root and are
+# pinned and installed independently (e.g. sglang/vLLM consume tpu_sync_torch
+# without the JAX deps). Both share the `tpu_sync` import root and are
 # mutually-exclusive variants (like opencv-python vs opencv-python-headless):
 # install one. Common py attributes are factored into //ci/wheel:wheel.bzl.
 
-# ---- JAX wheel (tpu_raiden_jax) ----
+# ---- JAX wheel (tpu_sync_jax) ----
 py_library(
     name = "jax_raiden_files",
     visibility = ["//visibility:private"],
@@ -137,13 +137,13 @@ py_package(
 
 raiden_framework_wheel(
     name = "raiden_jax_wheel",
-    distribution = "tpu_raiden_jax",
+    distribution = "tpu_sync_jax",
     package = ":raiden_jax_package",
     requires = JAX_REQUIRES,
     version = WHEEL_VERSION,
 )
 
-# ---- Torch wheel (tpu_raiden_torch) ----
+# ---- Torch wheel (tpu_sync_torch) ----
 py_library(
     name = "torch_raiden_files",
     visibility = ["//visibility:private"],
@@ -161,7 +161,7 @@ py_package(
 
 raiden_framework_wheel(
     name = "raiden_torch_wheel",
-    distribution = "tpu_raiden_torch",
+    distribution = "tpu_sync_torch",
     entry_points = TORCH_ENTRY_POINTS,
     package = ":raiden_torch_package",
     requires = TORCH_REQUIRES,

@@ -57,7 +57,18 @@ workflow's manifest only ever lists the versions it built, so leftovers are
 never published by a later run; a builder identity can delete them from the
 repository if they get in the way.
 
-### The PyPI file-size limit
+### Nightly pre-releases on PyPI
+
+The scheduled `Nightly Wheels` run also publishes its `.dev` wheels to PyPI
+through the exit gate (see `.github/workflows/publish_pypi.yml`), so
+`pip install --pre tpu-sync-torch` tracks main. A nightly skips any wheel
+above the PyPI file limit instead of failing; the registry still gets every
+wheel. Until the limit is raised, the repository variable
+`RAIDEN_NIGHTLY_TORCH_ABIS` (for example `2.11.0`) keeps the scheduled torch
+wheel single-ABI and under the limit. PyPI's 10 GB project quota holds a
+few months of daily wheels; request more once the project exists.
+
+## The PyPI file-size limit
 
 PyPI accepts files up to 100 MB per file unless the project has been granted
 a higher limit, and the exit gate uploads a release file by file, so a file

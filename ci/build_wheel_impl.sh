@@ -70,7 +70,7 @@ read -r -a TORCH_ABIS <<< "${RAIDEN_TORCH_ABIS:-2.11.0 2.12.0 2.13.0}"
 export BAZEL_CACHE_DIR="${BAZEL_CACHE_DIR:-/cache}"
 export BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE:-${BAZEL_CACHE_DIR}/output_base}"
 EXTRA_BAZEL_FLAGS="${EXTRA_BAZEL_FLAGS:-}"
-TORCH_TPU_INDEX_URL="${TORCH_TPU_INDEX_URL:-https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/}"
+export TORCH_TPU_INDEX_URL="${TORCH_TPU_INDEX_URL:-https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/}"
 echo "WHEEL_VERSION_EXTRAS: ${WHEEL_VERSION_EXTRAS}"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -120,8 +120,40 @@ if [[ "${BUILD_MODE}" == "torch" ]]; then
     # those files are read at build time, so the wheel's own requirements
     # (torch, libtpu) are not installed.
     TORCH_TPU_VERSION="$(tr -d '\r\n ' < "${REPO_ROOT}/torch_tpu.version")"
+    # The torch_tpu registry is read with a Google Cloud identity: pip takes it
+    # from a netrc entry holding the environment's access token (written from
+    # Python so the token never reaches the shell trace). --no-input turns a
+    # missing credential into a failure instead of a prompt.
+    if [[ "${TORCH_TPU_INDEX_URL}" == https://*.pkg.dev/* ]]; then
+      python3 - <<'PY2'
+import os, pathlib, subprocess, sys, urllib.error, urllib.request
+token = subprocess.run(["gcloud", "auth", "print-access-token"],
+                       capture_output=True, text=True, check=True).stdout.strip()
+index = os.environ["TORCH_TPU_INDEX_URL"]
+host = index.split("/")[2]
+netrc = pathlib.Path.home() / ".netrc"
+with netrc.open("a") as f:
+  f.write(f"machine {host} login oauth2accesstoken password {token}\n")
+netrc.chmod(0o600)
+# Confirm the identity can read the index before pip hides a refusal behind
+# "no matching distribution".
+request = urllib.request.Request(index.rstrip("/") + "/torch-tpu/",
+                                 headers={"Authorization": f"Bearer {token}"})
+try:
+  with urllib.request.urlopen(request) as response:
+    status = response.status
+except urllib.error.HTTPError as error:
+  status = error.code
+if status != 200:
+  account = subprocess.run(["gcloud", "config", "get-value", "account"],
+                           capture_output=True, text=True).stdout.strip()
+  sys.exit(f"ERROR: {index} answered HTTP {status} to {account or 'the ambient identity'}; "
+           "it needs Artifact Registry read access to that repository.")
+print(f"torch_tpu index readable: {index}")
+PY2
+    fi
     echo "Installing torch_tpu ${TORCH_TPU_VERSION}"
-    pip install -q --no-deps "torch_tpu==${TORCH_TPU_VERSION}" --index-url "${TORCH_TPU_INDEX_URL}"
+    pip install --no-input --no-deps "torch_tpu==${TORCH_TPU_VERSION}" --index-url "${TORCH_TPU_INDEX_URL}"
     # With torch_tpu installed, `import torch` autoloads the torch_tpu
     # backend, whose runtime dependencies are not installed here; the build
     # only reads the wheel's header and pin.
@@ -138,8 +170,8 @@ else
   WHEEL_TARGET="//ci/wheel:raiden_jax_wheel"
   WHEEL_DIST="tpu_sync_jax"
 fi
-# Match ONLY the wheel this build just produced. The output base is shared
-# across builds, so its bin/ci/wheel/ dir accumulates wheels from earlier runs,
+# Match ONLY the wheel this build just produced. The output directory is shared
+# across builds, so bazel-bin/ci/wheel/ accumulates wheels from earlier runs,
 # each with a distinct .dev<timestamp>. A broad "${WHEEL_DIST}-*.whl" glob would
 # also match those stale wheels and hand multiple paths to the single-wheel
 # patchelf step below (which then fails). WHEEL_VERSION_EXTRAS (.dev<timestamp>)
@@ -151,7 +183,9 @@ WHEEL_GLOB="${WHEEL_DIST}-*${WHEEL_VERSION_EXTRAS}-*.whl"
   ${EXTRA_BAZEL_FLAGS}
 
 mkdir -p "${REPO_ROOT}/dist"
-cp "${BAZEL_OUTPUT_BASE}"/execroot/_main/bazel-out/k8-opt/bin/ci/wheel/${WHEEL_GLOB} "${REPO_ROOT}/dist/"
+# bazel-bin is the convenience symlink build.sh leaves in the workspace; it
+# points at the output directory of whatever configuration the build used.
+cp "${REPO_ROOT}"/bazel-bin/ci/wheel/${WHEEL_GLOB} "${REPO_ROOT}/dist/"
 
 # The bazel-built _tpu_raiden_torch.so does not link libpywrap; the torch
 # extension loader (tpu_sync/api/torch/torch_abi.py) requires a NEEDED on

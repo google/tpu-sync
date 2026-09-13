@@ -126,14 +126,30 @@ if [[ "${BUILD_MODE}" == "torch" ]]; then
     # missing credential into a failure instead of a prompt.
     if [[ "${TORCH_TPU_INDEX_URL}" == https://*.pkg.dev/* ]]; then
       python3 - <<'PY2'
-import os, pathlib, subprocess
+import os, pathlib, subprocess, sys, urllib.error, urllib.request
 token = subprocess.run(["gcloud", "auth", "print-access-token"],
                        capture_output=True, text=True, check=True).stdout.strip()
-host = os.environ["TORCH_TPU_INDEX_URL"].split("/")[2]
+index = os.environ["TORCH_TPU_INDEX_URL"]
+host = index.split("/")[2]
 netrc = pathlib.Path.home() / ".netrc"
 with netrc.open("a") as f:
   f.write(f"machine {host} login oauth2accesstoken password {token}\n")
 netrc.chmod(0o600)
+# Confirm the identity can read the index before pip hides a refusal behind
+# "no matching distribution".
+request = urllib.request.Request(index.rstrip("/") + "/torch-tpu/",
+                                 headers={"Authorization": f"Bearer {token}"})
+try:
+  with urllib.request.urlopen(request) as response:
+    status = response.status
+except urllib.error.HTTPError as error:
+  status = error.code
+if status != 200:
+  account = subprocess.run(["gcloud", "config", "get-value", "account"],
+                           capture_output=True, text=True).stdout.strip()
+  sys.exit(f"ERROR: {index} answered HTTP {status} to {account or 'the ambient identity'}; "
+           "it needs Artifact Registry read access to that repository.")
+print(f"torch_tpu index readable: {index}")
 PY2
     fi
     echo "Installing torch_tpu ${TORCH_TPU_VERSION}"

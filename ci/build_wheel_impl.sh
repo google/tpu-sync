@@ -138,8 +138,8 @@ else
   WHEEL_TARGET="//ci/wheel:raiden_jax_wheel"
   WHEEL_DIST="tpu_sync_jax"
 fi
-# Match ONLY the wheel this build just produced. The output base is shared
-# across builds, so its bin/ci/wheel/ dir accumulates wheels from earlier runs,
+# Match ONLY the wheel this build just produced. The output directory is shared
+# across builds, so bazel-bin/ci/wheel/ accumulates wheels from earlier runs,
 # each with a distinct .dev<timestamp>. A broad "${WHEEL_DIST}-*.whl" glob would
 # also match those stale wheels and hand multiple paths to the single-wheel
 # patchelf step below (which then fails). WHEEL_VERSION_EXTRAS (.dev<timestamp>)
@@ -151,7 +151,9 @@ WHEEL_GLOB="${WHEEL_DIST}-*${WHEEL_VERSION_EXTRAS}-*.whl"
   ${EXTRA_BAZEL_FLAGS}
 
 mkdir -p "${REPO_ROOT}/dist"
-cp "${BAZEL_OUTPUT_BASE}"/execroot/_main/bazel-out/k8-opt/bin/ci/wheel/${WHEEL_GLOB} "${REPO_ROOT}/dist/"
+# bazel-bin is the convenience symlink build.sh leaves in the workspace; it
+# points at the output directory of whatever configuration the build used.
+cp "${REPO_ROOT}"/bazel-bin/ci/wheel/${WHEEL_GLOB} "${REPO_ROOT}/dist/"
 
 # The bazel-built _tpu_raiden_torch.so does not link libpywrap; the torch
 # extension loader (tpu_sync/api/torch/torch_abi.py) requires a NEEDED on

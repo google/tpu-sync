@@ -352,7 +352,7 @@ TEST(ControlHandshakeTest, UnknownOperationIsRejected) {
   EXPECT_THAT(response.message, HasSubstr("unknown control op code"));
 }
 
-TEST(ControlHandshakeTest, OversizedErrorResponseIsRejectedBeforeAllocation) {
+TEST(ControlHandshakeTest, OversizedErrorResponsePreservesBoundedPrefix) {
   TestManager consumer;
   int sockets[2];
   ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
@@ -364,6 +364,11 @@ TEST(ControlHandshakeTest, OversizedErrorResponseIsRejectedBeforeAllocation) {
   response.status = -1;
   response.message_len = std::numeric_limits<uint64_t>::max();
   WriteAll(writer.get(), &response, sizeof(response));
+  constexpr size_t kExpectedPrefixBytes = 4 * 1024;
+  std::string prefix(kExpectedPrefixBytes, 'x');
+  constexpr char kDiagnostic[] = "useful remote diagnostic";
+  prefix.replace(0, sizeof(kDiagnostic) - 1, kDiagnostic);
+  WriteAll(writer.get(), prefix.data(), prefix.size());
 
   std::string error_message;
   try {
@@ -371,7 +376,10 @@ TEST(ControlHandshakeTest, OversizedErrorResponseIsRejectedBeforeAllocation) {
   } catch (const std::exception& error) {
     error_message = error.what();
   }
-  EXPECT_THAT(error_message, HasSubstr("too large"));
+  EXPECT_THAT(error_message, HasSubstr(kDiagnostic));
+  EXPECT_THAT(error_message, HasSubstr("truncated"));
+  EXPECT_THAT(error_message,
+              HasSubstr(std::to_string(std::numeric_limits<uint64_t>::max())));
 }
 
 TEST(ControlHandshakeTest, HandlersOutliveConsumersThatNeverSpeak) {

@@ -2989,15 +2989,18 @@ KVCacheManagerWithTransfer::ReadControlResponseHeader(int fd) {
     throw std::runtime_error("bad control response magic");
   }
   if (response.status != 0) {
-    if (response.message_len > kMaxControlErrorMessageBytes) {
-      throw std::runtime_error(absl::StrCat(
-          "remote Raiden control error message is too large: ",
-          response.message_len, " bytes"));
-    }
-    std::string message(response.message_len, '\0');
-    if (response.message_len > 0) {
+    const bool truncated =
+        response.message_len > kMaxControlErrorMessageBytes;
+    const size_t message_bytes = static_cast<size_t>(
+        std::min(response.message_len, kMaxControlErrorMessageBytes));
+    std::string message(message_bytes, '\0');
+    if (message_bytes > 0) {
       CheckStatus("control error body read",
                   ReadExact(fd, message.data(), message.size()));
+    }
+    if (truncated) {
+      absl::StrAppend(&message, " [truncated; peer advertised ",
+                      response.message_len, " bytes]");
     }
     throw std::runtime_error("remote Raiden control error: " + message);
   }

@@ -24,7 +24,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -63,10 +62,10 @@ absl::Status ReserveSegmentRange(int fd, size_t offset, size_t length,
   return absl::OkStatus();
 }
 
-// Compares the identity fields. block_size is deliberately absent: the
-// allocator derives it from the first allocation and validates it against
-// that derivation (OpenSegment), not against the caller schema, which
-// leaves it zero.
+// Compares the identity fields. The region table is deliberately absent:
+// the allocator records it allocation by allocation and validates a warm
+// segment's table against the replay (OpenSegment and AllocateRegion), not
+// against the caller schema, which leaves it empty.
 bool HeaderMatchesSchema(const SharedMemoryHeader& header,
                          const SharedMemoryHeader& expected) {
   bool compatible = true;
@@ -371,17 +370,6 @@ SharedMemoryHostMemoryAllocator::OpenSegment(const std::string& segment_name,
   }
 
   const size_t aligned_request = (first_request_bytes + 4095) & ~4095;
-  // The request is num_blocks * bytes-per-block, so a pinned block count
-  // recovers the bytes-per-block factor of the region stride that the
-  // identity fields alone cannot.
-  uint64_t bytes_per_block = 0;
-  if (expected_schema_.num_blocks > 0 &&
-      first_request_bytes % expected_schema_.num_blocks == 0) {
-    bytes_per_block = first_request_bytes / expected_schema_.num_blocks;
-    if (bytes_per_block > std::numeric_limits<uint32_t>::max()) {
-      bytes_per_block = 0;
-    }
-  }
 
   int fd = shm_open(segment_name.c_str(), O_RDWR, 0666);
   bool warm = (fd >= 0);
@@ -414,19 +402,28 @@ SharedMemoryHostMemoryAllocator::OpenSegment(const std::string& segment_name,
           compatible = false;
         }
         if (compatible) {
-          if (bytes_per_block > 0) {
-            // Exact stride check: the predecessor's regions must have been
-            // this run's size, or their bytes belong to other offsets.
-            if (header->block_size != bytes_per_block) {
-              VLOG(1) << "block size mismatch: " << header->block_size
-                      << " vs derived " << bytes_per_block;
-              compatible = false;
+          // The recorded region table is the recovery layout; a corrupt
+          // table means the bytes cannot be replayed.
+          uint64_t recorded_total = 0;
+          bool table_ok = header->region_count > 0 &&
+                          header->region_count <= kMaxShmRegions;
+          for (uint32_t i = 0; table_ok && i < header->region_count; ++i) {
+            const uint64_t region = header->region_sizes[i];
+            if (region == 0 || region % 4096 != 0) {
+              table_ok = false;
             }
-          } else if (header->total_payload_bytes % aligned_request != 0) {
-            // Without a pinned block count, whole-multiple divisibility is
-            // the only replay tripwire available.
-            VLOG(1) << "recorded payload " << header->total_payload_bytes
-                    << " is not a multiple of the request "
+            recorded_total += region;
+          }
+          if (!table_ok || recorded_total != header->total_payload_bytes) {
+            VLOG(1) << "recorded region table is corrupt";
+            compatible = false;
+          } else if (header->region_sizes[0] != aligned_request) {
+            // A first region of a different size than this run's first
+            // request is a different geometry. Only the first region can be
+            // judged here -- later regions are checked as the replay
+            // reaches them, when a cold restart is no longer possible.
+            VLOG(1) << "first region size " << header->region_sizes[0]
+                    << " does not match this run's first request "
                     << aligned_request;
             compatible = false;
           }
@@ -480,14 +477,15 @@ SharedMemoryHostMemoryAllocator::OpenSegment(const std::string& segment_name,
     VLOG(1) << "[SHM_ALLOCATOR] Initializing fresh shm header schema...";
     header = static_cast<SharedMemoryHeader*>(header_ptr);
     std::memcpy(header, &expected_schema_, sizeof(SharedMemoryHeader));
-    header->block_size = static_cast<uint32_t>(bytes_per_block);
     header->total_payload_bytes = 0;
     header->reference_count = 1;
+    header->region_count = 0;
   }
 
   Segment& segment = segments_[segment_name];
   segment.fd = fd;
   segment.warm = warm;
+  segment.recovered_region_count = warm ? header->region_count : 0;
   segment.header = header;
   return &segment;
 }
@@ -518,30 +516,47 @@ SharedMemoryHostMemoryAllocator::AllocateRegion(size_t size_bytes) {
     segment = *segment_or;
   }
 
-  if (segment->region_size == 0) {
-    segment->region_size = aligned_size;
-  } else if (aligned_size != segment->region_size) {
-    return absl::InternalError(absl::StrCat(
-        "shm segment ", segment_name, " serves ", segment->region_size,
-        "-byte regions; refusing a ", aligned_size,
-        "-byte allocation, the recovery layout assumes one uniform size"));
-  }
-
+  const uint32_t index = segment->alloc_index;
   const size_t region_offset = kPayloadOffset + segment->payload_cursor;
   bool zero_fill = !segment->warm;
-  if (segment->warm && segment->payload_cursor + aligned_size >
-                           segment->header->total_payload_bytes) {
-    if (!segment->degradation_warned) {
-      LOG(WARNING) << "[SHM_ALLOCATOR] Segment " << segment_name
-                   << " recorded " << segment->header->total_payload_bytes
-                   << " payload bytes; allocations beyond them are served "
-                      "zeroed instead of recovered";
-      segment->degradation_warned = true;
-    } else {
-      VLOG(1) << "[SHM_ALLOCATOR] Region at offset " << region_offset
-              << " of segment " << segment_name << " served zeroed";
+  if (index < segment->recovered_region_count) {
+    // Replaying the recorded layout: this allocation must be the size the
+    // predecessor put at this position, or its bytes belong to other
+    // offsets. Only the sequence's first size could be judged when the
+    // segment was opened; by the time a later position diverges, earlier
+    // regions have already been handed out as recovered data, so a cold
+    // restart is no longer possible and the mismatch must fail loudly.
+    if (segment->header->region_sizes[index] != aligned_size) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "shm segment ", segment_name, " recorded a ",
+          segment->header->region_sizes[index], "-byte region at position ",
+          index, ", but this run requests ", aligned_size,
+          " bytes there: the segment holds a different geometry. Remove it "
+          "from /dev/shm (or change RAIDEN_SHM_KEY) to start cold."));
     }
-    zero_fill = true;
+  } else {
+    // Past the recorded layout: a fresh region, appended to the table so
+    // the next restart can replay it.
+    if (index >= kMaxShmRegions) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "shm segment ", segment_name, " cannot record more than ",
+          kMaxShmRegions, " regions"));
+    }
+    if (segment->warm) {
+      if (!segment->degradation_warned) {
+        LOG(WARNING) << "[SHM_ALLOCATOR] Segment " << segment_name
+                     << " recorded " << segment->recovered_region_count
+                     << " regions; allocations beyond them are served "
+                        "zeroed instead of recovered";
+        segment->degradation_warned = true;
+      } else {
+        VLOG(1) << "[SHM_ALLOCATOR] Region at offset " << region_offset
+                << " of segment " << segment_name << " served zeroed";
+      }
+      zero_fill = true;
+    }
+    segment->header->region_sizes[index] = aligned_size;
+    segment->header->region_count = index + 1;
   }
   if (zero_fill) {
     absl::Status reserved = ReserveSegmentRange(segment->fd, region_offset,
@@ -569,6 +584,7 @@ SharedMemoryHostMemoryAllocator::AllocateRegion(size_t size_bytes) {
   }
 
   segment->payload_cursor += aligned_size;
+  segment->alloc_index = index + 1;
   if (segment->payload_cursor > segment->header->total_payload_bytes) {
     segment->header->total_payload_bytes = segment->payload_cursor;
   }

@@ -143,6 +143,7 @@ jobs:
       - name: Fix Git Workspace Ownership
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE/tpu-sync"
       - name: Build wheel
+        shell: bash
         working-directory: tpu-sync
         env:
           BUILD_MODE: ${{ matrix.framework }}

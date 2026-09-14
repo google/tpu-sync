@@ -92,14 +92,13 @@ jobs:
           PY
       # The staging repository is the exit gate's own Artifact Registry
       # repository for this project; the runner's ambient service account
-      # writes to it through the keyring backend. --skip-existing keeps
-      # re-runs idempotent (a staged file the gate has not consumed yet).
+      # writes to it through the keyring backend.
       - name: Stage wheels in the exit-gate repository
         run: |
           uv run --isolated \
             --with twine \
             --with keyrings.google-artifactregistry-auth \
-            twine upload --skip-existing \
+            twine upload \
             --repository-url "${EXIT_GATE_REPOSITORY_URL}" \
             release/*.whl
       # The manifest names exactly the packages and versions staged by this run

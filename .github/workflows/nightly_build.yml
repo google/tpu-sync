@@ -103,6 +103,7 @@ jobs:
       - name: Fix Git Workspace Ownership
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE/tpu-sync"
       - name: Build wheel
+        shell: bash
         working-directory: tpu-sync
         env:
           BUILD_MODE: ${{ matrix.framework }}
@@ -175,7 +176,7 @@ jobs:
           merge-multiple: true
           path: dist
       # Auth uses the runner's ambient GCP service account via the Artifact
-      # Registry keyring backend. --skip-existing makes re-runs idempotent.
+      # Registry keyring backend.
       - name: Upload to Artifact Registry
         env:
           WHEEL_VERSION_EXTRAS: ${{ needs.version.outputs.wheel_version_extras }}
@@ -183,7 +184,7 @@ jobs:
           uv run --isolated \
             --with twine \
             --with keyrings.google-artifactregistry-auth \
-            twine upload --skip-existing \
+            twine upload \
             --repository-url "${RAIDEN_REGISTRY_URL}" \
             dist/tpu_sync_*"${WHEEL_VERSION_EXTRAS}"-*.whl
           echo "Uploaded to ${RAIDEN_REGISTRY_URL}:" >> "$GITHUB_STEP_SUMMARY"

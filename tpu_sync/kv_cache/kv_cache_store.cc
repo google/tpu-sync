@@ -1351,6 +1351,10 @@ KVCacheStore::PollRemoteReadStatus() {
                          std::move(res.pending));
 }
 
+std::vector<std::string> KVCacheStore::PollEvictedHashes() {
+  return {};
+}
+
 absl::StatusOr<size_t> KVCacheStore::RecoverFromLocalManifest() {
   if (!raiden_controller_) {
     return absl::FailedPreconditionError(

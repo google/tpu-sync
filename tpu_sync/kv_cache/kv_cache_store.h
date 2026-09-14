@@ -427,6 +427,10 @@ class KVCacheStore {
   using PollLoadStatusResult = BlockTracker::StatusResult;
   PollLoadStatusResult PollLoadStatus();
 
+  // Polls logical block hashes that have been evicted from the host LRU cache.
+  // Results are drained on read.
+  std::vector<std::string> PollEvictedHashes();
+
   // Launches an async receiver-initiated read of REMOTE blocks from their
   // owning peers straight into local HBM. Returns as soon as the reads are
   // issued; poll with PollRemoteReadStatus().

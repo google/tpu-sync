@@ -303,5 +303,136 @@ TEST(TpuUtilsTest, GetLocalHostNicAddresses_MultiNic_Classification) {
   fs::remove_all(sysfs);
 }
 
+TEST(TpuUtilsTest, GetLocalHostNicAddresses_AuthoritativeAllowlistAndDocker) {
+  namespace fs = std::filesystem;
+  std::string temp_dir_str = testing::TempDir();
+  fs::path sysfs = fs::path(temp_dir_str) / "mock_sysfs_allowlist";
+  fs::remove_all(sysfs);
+
+  // Setup sysfs
+  fs::create_directories(sysfs / "class/net/eth0");
+  fs::create_directories(sysfs / "class/net/eth1");
+  fs::create_directories(sysfs / "class/net/eth2");
+  fs::create_directories(sysfs / "class/net/docker0");
+  fs::create_directories(sysfs / "devices/system/node/node0");
+  fs::create_directories(sysfs / "devices/system/node/node1");
+  fs::create_directories(sysfs / "devices/pci0000:00/0000:00:01.0");
+  fs::create_directories(sysfs / "devices/pci0000:00/0000:00:02.0");
+
+  fs::create_directory_symlink("../../../devices/pci0000:00/0000:00:01.0",
+                               sysfs / "class/net/eth1/device");
+  fs::create_directory_symlink("../../../devices/pci0000:00/0000:00:02.0",
+                               sysfs / "class/net/eth2/device");
+
+  // Write MTUs
+  { std::ofstream(sysfs / "class/net/eth0/mtu") << "1500\n"; }
+  { std::ofstream(sysfs / "class/net/eth1/mtu") << "1460\n"; }
+  { std::ofstream(sysfs / "class/net/eth2/mtu") << "1460\n"; }
+  { std::ofstream(sysfs / "class/net/docker0/mtu") << "1500\n"; }
+
+  // ifaddrs: docker0, eth2, eth1, eth0, lo
+  sockaddr_in addr_docker0 = CreateSockAddr("172.17.0.1");
+  sockaddr_in addr_eth2 = CreateSockAddr("10.0.0.3");
+  sockaddr_in addr_eth1 = CreateSockAddr("10.0.0.2");
+  sockaddr_in addr_eth0 = CreateSockAddr("10.0.0.1");
+  sockaddr_in addr_lo = CreateSockAddr("127.0.0.1");
+
+  ifaddrs ifa_docker0 = {nullptr, const_cast<char*>("docker0"),
+                         0,       reinterpret_cast<sockaddr*>(&addr_docker0),
+                         nullptr, {nullptr},
+                         nullptr};
+  ifaddrs ifa_eth2 = {&ifa_docker0, const_cast<char*>("eth2"),
+                      0,            reinterpret_cast<sockaddr*>(&addr_eth2),
+                      nullptr,      {nullptr},
+                      nullptr};
+  ifaddrs ifa_eth1 = {&ifa_eth2, const_cast<char*>("eth1"),
+                      0,         reinterpret_cast<sockaddr*>(&addr_eth1),
+                      nullptr,   {nullptr},
+                      nullptr};
+  ifaddrs ifa_eth0 = {&ifa_eth1, const_cast<char*>("eth0"),
+                      0,         reinterpret_cast<sockaddr*>(&addr_eth0),
+                      nullptr,   {nullptr},
+                      nullptr};
+  ifaddrs ifa_lo = {&ifa_eth0, const_cast<char*>("lo"),
+                    0,         reinterpret_cast<sockaddr*>(&addr_lo),
+                    nullptr,   {nullptr},
+                    nullptr};
+
+  // Test 1: Without TPU_RAIDEN_DATA_NICS, docker0 is filtered out (control),
+  // while eth1 and eth2 are data plane.
+  unsetenv("TPU_RAIDEN_DATA_NICS");
+  auto nics1 =
+      internal::GetLocalHostNicAddressesInternal(&ifa_lo, sysfs.string());
+  auto it_dock = std::find_if(
+      nics1.begin(), nics1.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "docker0"; });
+  ASSERT_NE(it_dock, nics1.end());
+  EXPECT_EQ(it_dock->classification, NicClassification::kControlPlane);
+
+  // Test 2: With TPU_RAIDEN_DATA_NICS="eth1", ONLY eth1 is data plane.
+  // eth2 must NOT fall through to data plane!
+  setenv("TPU_RAIDEN_DATA_NICS", "eth1", 1);
+  auto nics2 =
+      internal::GetLocalHostNicAddressesInternal(&ifa_lo, sysfs.string());
+  unsetenv("TPU_RAIDEN_DATA_NICS");
+
+  auto it2_eth1 = std::find_if(
+      nics2.begin(), nics2.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "eth1"; });
+  ASSERT_NE(it2_eth1, nics2.end());
+  EXPECT_EQ(it2_eth1->classification, NicClassification::kDataPlane);
+
+  auto it2_eth2 = std::find_if(
+      nics2.begin(), nics2.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "eth2"; });
+  ASSERT_NE(it2_eth2, nics2.end());
+  // CRITICAL: eth2 was NOT in allowlist -> must be control plane!
+  EXPECT_EQ(it2_eth2->classification, NicClassification::kControlPlane);
+
+  fs::remove_all(sysfs);
+}
+
+TEST(TpuUtilsTest, ResolvePhysicalChipIndex_BasicMapping) {
+  // Typical v7x-8 topology (4 physical chips, 8 local ranks)
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(0, 8, 4), 0);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(1, 8, 4), 0);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(2, 8, 4), 1);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(3, 8, 4), 1);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(4, 8, 4), 2);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(5, 8, 4), 2);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(6, 8, 4), 3);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(7, 8, 4), 3);
+
+  // 1 process per chip (e.g. world_size 4, 4 physical chips)
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(0, 4, 4), 0);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(1, 4, 4), 1);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(2, 4, 4), 2);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(3, 4, 4), 3);
+
+  // Single-process multi-device mapping (local_device_count 8, 4 physical
+  // chips)
+  for (int dev_idx = 0; dev_idx < 8; ++dev_idx) {
+    EXPECT_EQ(internal::ResolvePhysicalChipIndex(dev_idx, 8, 4), dev_idx / 2);
+  }
+}
+
+TEST(TpuUtilsTest, ResolvePhysicalChipIndex_BoundariesAndInvalidInputs) {
+  // Rank exceeding world_size is clamped to last physical chip
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(8, 8, 4), 3);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(100, 8, 4), 3);
+
+  // Negative rank must return -1 (invalid)
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(-1, 8, 4), -1);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(-10, 8, 4), -1);
+
+  // Invalid physical chip count must return -1
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(0, 8, 0), -1);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(0, 8, -1), -1);
+
+  // Invalid world_size defaults to 8
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(0, 0, 4), 0);
+  EXPECT_EQ(internal::ResolvePhysicalChipIndex(2, -1, 4), 1);
+}
+
 }  // namespace
 }  // namespace tpu_raiden

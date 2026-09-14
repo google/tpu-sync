@@ -41,7 +41,9 @@
 #include <vector>
 
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/tsl/platform/logging.h"
@@ -340,15 +342,35 @@ int GetPjRtDeviceNumaNode(const xla::PjRtDevice* device) {
 
   if (local_device_count <= 0 || num_physical_chips <= 0) return -1;
 
-  int devices_per_chip = local_device_count / num_physical_chips;
-  if (devices_per_chip <= 0) devices_per_chip = 1;
-
-  int physical_chip_idx = chip_idx / devices_per_chip;
-  if (physical_chip_idx >= num_physical_chips) {
-    physical_chip_idx = num_physical_chips - 1;
+  int physical_chip_idx = -1;
+  if (local_device_count == 1 && num_physical_chips > 1) {
+    const char* local_rank_str = std::getenv("LOCAL_RANK");
+    int rank = 0;
+    if (local_rank_str && local_rank_str[0] != '\0' &&
+        absl::SimpleAtoi(local_rank_str, &rank) && rank >= 0) {
+      const char* world_size_str = std::getenv("LOCAL_WORLD_SIZE");
+      int world_size = 8;
+      if (world_size_str && world_size_str[0] != '\0') {
+        if (!absl::SimpleAtoi(world_size_str, &world_size) || world_size <= 0) {
+          world_size = 8;
+        }
+      }
+      physical_chip_idx = internal::ResolvePhysicalChipIndex(
+          rank, world_size, num_physical_chips);
+    } else {
+      LOG(WARNING) << "Multi-process TPU detected but LOCAL_RANK not set or "
+                  << "invalid; cannot determine NUMA node.";
+      return -1;
+    }
+  } else {
+    physical_chip_idx = internal::ResolvePhysicalChipIndex(
+        chip_idx, local_device_count, num_physical_chips);
+  }
+  if (physical_chip_idx >= 0 && physical_chip_idx < num_physical_chips) {
+    return unique_chips[physical_chip_idx].second;
   }
 
-  return unique_chips[physical_chip_idx].second;
+  return -1;
 }
 
 void PrintTpuHardwareTopology() {
@@ -431,12 +453,58 @@ int GetTotalNumaNodes(absl::string_view sysfs_root) {
   return count > 0 ? count : 1;
 }
 
+bool IsDefaultRouteInterface(absl::string_view ifname) {
+  std::ifstream route_file("/proc/net/route");
+  if (!route_file.is_open()) return false;
+  std::string line;
+  if (!std::getline(route_file, line)) return false;
+  while (std::getline(route_file, line)) {
+    std::vector<std::string> fields =
+        absl::StrSplit(line, absl::ByAnyChar(" \t"), absl::SkipEmpty());
+    if (fields.size() >= 8) {
+      if (fields[0] == ifname && fields[1] == "00000000" &&
+          fields[7] == "00000000") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // Dedicated classifier for GKE / Cloud TPU VMs
-NicClassification ClassifyNicGke(absl::string_view bdf, int mtu) {
+NicClassification ClassifyNicGke(absl::string_view ifname,
+                                 absl::string_view bdf, int mtu) {
+  if (ifname == "lo") {
+    return NicClassification::kControlPlane;
+  }
+
+  // 1. Authoritative Override: If TPU_RAIDEN_DATA_NICS is set, it is the sole
+  // authority. Any interface not explicitly listed is strictly control plane.
+  const char* env_data_nics = std::getenv("TPU_RAIDEN_DATA_NICS");
+  if (env_data_nics != nullptr && env_data_nics[0] != '\0') {
+    std::vector<std::string> allowed =
+        absl::StrSplit(env_data_nics, ',', absl::SkipEmpty());
+    for (const auto& nic : allowed) {
+      if (ifname == nic || (!bdf.empty() && bdf == nic)) {
+        return NicClassification::kDataPlane;
+      }
+    }
+    return NicClassification::kControlPlane;
+  }
+
+  // 2. Interfaces lacking physical PCI BDF are strictly control plane.
   if (bdf.empty()) {
     return NicClassification::kControlPlane;
   }
+
+  // 3. Heuristic discovery for GKE / Cloud TPU VMs when no allowlist is
+  // configured:
+  // Jumbo frame MTU > 1500
   if (mtu > 1500) {
+    return NicClassification::kDataPlane;
+  }
+  // Secondary interfaces without default route (GCE MTU 1460 multi-NIC VPCs)
+  if (!IsDefaultRouteInterface(ifname)) {
     return NicClassification::kDataPlane;
   }
   return NicClassification::kControlPlane;
@@ -444,7 +512,7 @@ NicClassification ClassifyNicGke(absl::string_view bdf, int mtu) {
 
 NicClassification ClassifyNic(absl::string_view ifname, absl::string_view bdf,
                               int mtu) {
-  return ClassifyNicGke(bdf, mtu);
+  return ClassifyNicGke(ifname, bdf, mtu);
 }
 
 std::string ClassificationToString(NicClassification classification) {
@@ -462,6 +530,19 @@ std::string ClassificationToString(NicClassification classification) {
 }  // namespace
 
 namespace internal {
+
+int ResolvePhysicalChipIndex(int rank, int world_size,
+                             int num_physical_chips) {
+  if (rank < 0 || num_physical_chips <= 0) return -1;
+  if (world_size <= 0) world_size = 8;
+  int ranks_per_chip = std::max(1, world_size / num_physical_chips);
+  int physical_chip_idx = rank / ranks_per_chip;
+  if (physical_chip_idx >= num_physical_chips) {
+    physical_chip_idx = num_physical_chips - 1;
+  }
+  return physical_chip_idx;
+}
+
 std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(
     struct ifaddrs* ifaddr, absl::string_view sysfs_root) {
   std::vector<HostNicAddress> nics;

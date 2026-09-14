@@ -92,6 +92,11 @@ std::vector<HostNicAddress> GetLocalHostNicAddresses(
 namespace internal {
 std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(
     struct ifaddrs* ifaddr, absl::string_view sysfs_root);
+
+// Resolves physical chip index given local rank/device index, local world
+// size/device count, and number of physical chips. Returns -1 if rank < 0 or
+// num_physical_chips <= 0.
+int ResolvePhysicalChipIndex(int rank, int world_size, int num_physical_chips);
 }  // namespace internal
 
 // Returns non-loopback IPv4 addresses discovered on this host.

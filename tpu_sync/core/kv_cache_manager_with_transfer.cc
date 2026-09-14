@@ -108,7 +108,9 @@ constexpr absl::Duration kPendingWorkTimeout = absl::Seconds(30);
 // acts on, so this only covers reordering between the two; a pull whose
 // registration expired, or never happened, is rejected once it lapses.
 constexpr absl::Duration kPullRegistrationGrace = absl::Seconds(5);
-constexpr uint64_t kMaxControlErrorMessageBytes = 4096;
+// Control error text is diagnostic and should remain small. Bound it to 4 KiB
+// so an untrusted peer cannot trigger an arbitrarily large allocation.
+constexpr uint64_t kMaxControlErrorMessageBytes = 4 * 1024;
 
 [[noreturn]] void ThrowStatus(const std::string& context,
                               const absl::Status& status) {

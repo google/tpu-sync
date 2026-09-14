@@ -75,13 +75,19 @@ A perf-floor failure blocks the PR, unless the author adds `[skip-perf-gate]`
 ## Running it
 
 ```bash
+# Full gate across both JAX and PyTorch (default):
 bazel run -c opt --config=oss --config=ci \
   //tpu_sync/benchmarks:h2d_d2h_benchmark_gating
+
+# Select a single framework:
+bazel run -c opt --config=oss --config=ci \
+  //tpu_sync/benchmarks:h2d_d2h_benchmark_gating -- --framework=torch # or --framework=jax
 ```
 
-In CI it runs as the `h2d_d2h_gating` workload in `benchmark_registry.pbtxt` via
-the `run_benchmarks` workflow (on pull requests). Re-record baselines with the
-`--record` flag (or the record workflow).
+In CI it runs as the unified `h2d_d2h_gating` workload in `benchmark_registry.pbtxt`
+via the `run_benchmarks` workflow (on pull requests), evaluating both frameworks
+on the assigned Cloud TPU runner. Re-record baselines for all frameworks with
+the `--record` flag (or the `h2d_d2h_record` workflow).
 
 ## Scope
 

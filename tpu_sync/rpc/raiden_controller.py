@@ -15,6 +15,7 @@
 """Raiden Controller providing high-level transfer API and resharding plans."""
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import enum
 import functools
@@ -464,6 +465,35 @@ class WorkerRpcClient:
     self._resolve_timeout = resolve_timeout
     self._name_resolver = name_resolver
     self._proto_module = proto_module or raiden_service_pb2
+    # Worker RPCs run on a dedicated pool; asyncio's default executor tops out
+    # at min(32, cpu + 4) threads and serializes concurrent transfers.
+    max_workers = None
+    env_concurrency = os.environ.get("RAIDEN_RPC_CONCURRENCY")
+    if env_concurrency:
+      try:
+        max_workers = int(env_concurrency)
+      except ValueError:
+        max_workers = None
+    if max_workers is None:
+      max_workers = max(128, (os.cpu_count() or 1) * 16)
+    self._executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="WorkerRpcClient",
+    )
+
+  @property
+  def executor(self) -> concurrent.futures.ThreadPoolExecutor:
+    return self._executor
+
+  def close(self) -> None:
+    """Shuts down the internal ThreadPoolExecutor."""
+    self._executor.shutdown(wait=False)
+
+  def __del__(self) -> None:
+    try:
+      self.close()
+    except Exception:  # pylint: disable=broad-exception-caught
+      pass
 
   @property
   def name_resolver(self) -> Optional[NameResolver]:
@@ -519,7 +549,8 @@ class WorkerRpcClient:
   async def _send_rpc(self, addr: str, payload: bytes) -> bytes:
     """Connects to remote address, sends payload, and returns the response bytes."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, self._send_rpc_sync, addr, payload)
+    return await loop.run_in_executor(
+        self._executor, self._send_rpc_sync, addr, payload)
 
   def _send_rpc_sync(self, addr: str, payload: bytes) -> bytes:
     sock = connect_socket(addr, timeout=600.0, resolver=self._name_resolver)
@@ -1671,8 +1702,9 @@ class RaidenController:
                   name_resolver=self.worker_rpc_client.name_resolver,
               )
               loop = asyncio.get_running_loop()
+              rpc_executor = getattr(self.worker_rpc_client, "executor", None)
               success = await loop.run_in_executor(
-                  None,
+                  rpc_executor,
                   functools.partial(
                       dst_facade.register_transfer_schedule,
                       [s_node],
@@ -2846,8 +2878,9 @@ class RaidenController:
                   name_resolver=self.worker_rpc_client.name_resolver,
               )
               loop = asyncio.get_running_loop()
+              rpc_executor = getattr(self.worker_rpc_client, "executor", None)
               success = await loop.run_in_executor(
-                  None,
+                  rpc_executor,
                   dst_facade.register_transfer_schedule,
                   list(direct_schedules.keys()),
                   direct_dsts,
@@ -2890,8 +2923,9 @@ class RaidenController:
                   name_resolver=self.worker_rpc_client.name_resolver,
               )
               loop = asyncio.get_running_loop()
+              rpc_executor = getattr(self.worker_rpc_client, "executor", None)
               success = await loop.run_in_executor(
-                  None,
+                  rpc_executor,
                   dst_facade.register_transfer_schedule,
                   src_units,
                   dst_units,

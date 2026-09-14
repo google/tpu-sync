@@ -37,6 +37,7 @@
 #include "absl/strings/string_view.h"
 #include "grpcpp/channel.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+#include "tpu_sync/transport/peregrine/src/api/socket_util.h"
 
 namespace tpu_raiden::transport::lib {
 
@@ -167,6 +168,8 @@ absl::StatusOr<int> ConnectToPeer(
         "Failed to connect to peer ", peer, ": ", std::strerror(last_errno)));
   }
 
+  LOG(INFO) << absl::StrCat("connected tcp socket ", sock_fd, ": ",
+                            peregrine::GetAddrPortPair(sock_fd));
   return sock_fd;
 }
 

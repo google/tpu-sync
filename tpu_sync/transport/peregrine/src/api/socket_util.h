@@ -18,6 +18,7 @@
 #include <sys/uio.h>
 
 #include <cstddef>
+#include <string>
 
 #include "absl/base/optimization.h"
 #include "absl/log/check.h"
@@ -74,6 +75,14 @@ inline absl::Status ReadVExact(int fd, absl::Span<const struct iovec> iovs) {
     return internal::TcpSocketUtil::RecvV(internal::fd_t(fd), iovs);
   }
   return absl::InvalidArgumentError(absl::StrCat("#iovs=", n));
+}
+
+// Returns a string of self/peer ip:port pair for the socket `fd`.
+inline std::string GetAddrPortPair(int fd) {
+  const internal::fd_t fd2(fd);
+  DCHECK(internal::IsValidSocket(fd2));
+  return absl::StrCat(internal::SelfAddrPort(fd2), " <> ",
+                      internal::PeerAddrPort(fd2));
 }
 
 }  // namespace peregrine

@@ -23,7 +23,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -34,12 +33,9 @@
 #include <numeric>
 #include <optional>
 #include <string>
-#include <thread>  // NOLINT
 #include <utility>
 #include <vector>
 
-#include "absl/cleanup/cleanup.h"
-#include "absl/flags/flag.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -47,6 +43,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
@@ -215,7 +212,11 @@ BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
       peregrine_control_(
           std::make_unique<lib::PeregrineControlServiceImpl>(&raw_transport_)),
       transport_adapter_(std::make_unique<lib::SocketTransportAdapter>(
-          &raw_transport_, parallelism_)) {}
+          &raw_transport_, parallelism_)) {
+  LOG(INFO) << "local_port=" << local_port
+            << ", local_ips=" << absl::StrJoin(local_ips, ",")
+            << ", parallelism=" << parallelism_;
+}
 
 BlockTransport::~BlockTransport() {
   {

@@ -89,8 +89,8 @@ cc_library(
     features = ["-use_header_modules"],
     deps = [
         ":tcp_psp_helper",
+        "//tpu_sync/transport/peregrine/src/api:socket_util",
         "@com_github_grpc_grpc//:grpc++",
-        "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

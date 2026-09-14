@@ -46,6 +46,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
@@ -187,6 +188,10 @@ RawBufferTransport::RawBufferTransport(
   if (listen(server_fd_, 128) < 0) {
     LOG(FATAL) << "Failed to listen on server socket: " << std::strerror(errno);
   }
+  LOG(INFO) << "bound_ip_: " << bound_ip_
+            << ", local_ips_: " << absl::StrJoin(local_ips_, ",")
+            << ", local_port_: " << local_port_ << ", listening tcp socket "
+            << server_fd_ << ": " << peregrine::GetAddrPortPair(server_fd_);
 
   // 2. Start listener
   listener_thread_ = std::thread(&RawBufferTransport::ListenerLoop, this);
@@ -501,6 +506,8 @@ void RawBufferTransport::ListenerLoop() {
     setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buf_opt, sizeof(buf_opt));
 
     DCHECK_GE(client_fd, 0);
+    LOG(INFO) << absl::StrCat("accepted tcp socket ", client_fd, ": ",
+                              peregrine::GetAddrPortPair(client_fd));
     {
       absl::MutexLock _( mu_ );
       active_client_fds_.insert(client_fd);

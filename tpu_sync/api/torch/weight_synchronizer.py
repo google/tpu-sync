@@ -89,6 +89,10 @@ class WeightSynchronizer:
     """Triggers asynchronous H2D copy of weights from Host buffer to Device."""
     self._impl.H2d()
 
+  def wait_for_transfer_completion(self, uuid: Optional[int] = None) -> None:
+    """Blocks until the transfer with the given UUID (or any transfer if None) has finished ingestion."""
+    self._impl.wait_for_transfer_completion(uuid)
+
   def get_host_buffer(
       self, layer_idx: int = 0, shard_idx: int = 0
   ) -> torch.Tensor:

@@ -16,7 +16,9 @@
 
 import asyncio
 import math
+import os
 import socket
+import time
 from unittest import mock
 from absl.testing import absltest
 from tpu_sync.rpc import raiden_controller
@@ -1289,10 +1291,24 @@ class RaidenControllerTest(absltest.TestCase):
     asyncio.run(future.wait())
     self.assertEqual(controller.get_plan_cache_size(), 1)
 
-    # Re-registering target invalidates plan cache
+    # Re-registering target with identical metadata (heartbeat keepalive)
+    # preserves plan cache.
     controller.register_work_unit(
         target,
         ["10.0.0.2:8000"],
+        mesh_shape=[1],
+        layout=[0],
+        global_shape=[64],
+        itemsize=4,
+        control_plane_rpc_address="10.0.0.2:9000",
+    )
+    self.assertEqual(controller.get_plan_cache_size(), 1)
+
+    # Re-registering target with changed metadata (e.g. shard changed)
+    # invalidates plan cache.
+    controller.register_work_unit(
+        target,
+        ["10.0.0.2:8001"],
         mesh_shape=[1],
         layout=[0],
         global_shape=[64],
@@ -1308,6 +1324,155 @@ class RaidenControllerTest(absltest.TestCase):
         use_block_chunks=True,
     )
     asyncio.run(future_2.wait())
+    self.assertEqual(controller.get_plan_cache_size(), 1)
+
+  def test_plan_caching_preserved_on_idempotent_reregistration_via_facade(self):
+    bind_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    bind_sock.bind(("127.0.0.1", 0))
+    port = bind_sock.getsockname()[1]
+    bind_sock.close()
+
+    client = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=port, worker_rpc_client=client, enable_plan_cache=True
+    )
+    server = raiden_controller.RaidenControllerServer(controller)
+    server.start()
+    facade = raiden_controller.RaidenControllerClientFacade(f"127.0.0.1:{port}")
+
+    src = raiden_controller.RaidenId(
+        job_name="trainer", job_replica_id="0", data_name="weights"
+    )
+    target = raiden_controller.RaidenId(
+        job_name="inference_server", job_replica_id="0", data_name="weights"
+    )
+    v1 = raiden_service_pb2.VariableMetadataProto(
+        name="layer_0.weight",
+        shape=[64],
+        mesh_shape=[1],
+        layout=[0],
+        item_size=4,
+        layer_idx=0,
+    )
+
+    try:
+      facade.register_work_unit(
+          src,
+          ["127.0.0.1:8000"],
+          control_plane_rpc_address="127.0.0.1:9000",
+          mesh_shape=[1],
+          variables=[v1],
+      )
+      facade.register_work_unit(
+          target,
+          ["127.0.0.1:8001"],
+          control_plane_rpc_address="127.0.0.1:9001",
+          mesh_shape=[1],
+          variables=[v1],
+      )
+
+      # Precompute transfer plan via warmup
+      asyncio.run(
+          controller.warmup_transfer_plan(
+              src_units=[src],
+              dst_units=[target],
+          )
+      )
+      self.assertEqual(controller.get_plan_cache_size(), 1)
+
+      # Periodic keepalive re-registration from workers over RPC (facade)
+      for _ in range(3):
+        facade.register_work_unit(
+            src,
+            ["127.0.0.1:8000"],
+            control_plane_rpc_address="127.0.0.1:9000",
+            mesh_shape=[1],
+            variables=[v1],
+        )
+        facade.register_work_unit(
+            target,
+            ["127.0.0.1:8001"],
+            control_plane_rpc_address="127.0.0.1:9001",
+            mesh_shape=[1],
+            variables=[v1],
+        )
+
+      # Plan cache must remain preserved (not invalidated by keepalive RPCs)
+      self.assertEqual(controller.get_plan_cache_size(), 1)
+
+      # Starting transfer reuses the cached plan
+      future = controller.start_transfer(
+          src_units=[src],
+          dst_units=[target],
+          use_block_chunks=True,
+          req_id="bench_iter",
+      )
+      asyncio.run(future.wait())
+      self.assertEqual(controller.get_plan_cache_size(), 1)
+
+      # Re-registering with changed shards via facade invalidates the cache
+      facade.register_work_unit(
+          target,
+          ["127.0.0.1:8002"],
+          control_plane_rpc_address="127.0.0.1:9001",
+          mesh_shape=[1],
+          variables=[v1],
+      )
+      self.assertEqual(controller.get_plan_cache_size(), 0)
+    finally:
+      server.stop()
+      server._thread.join(timeout=2)
+
+  def test_plan_caching_unrelated_unit_registration_does_not_invalidate(self):
+    client = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=10009, worker_rpc_client=client, enable_plan_cache=True
+    )
+
+    src = raiden_controller.RaidenId(
+        job_name="trainer", job_replica_id="0", data_name="weights"
+    )
+    target = raiden_controller.RaidenId(
+        job_name="inference_server", job_replica_id="0", data_name="weights"
+    )
+    controller.register_work_unit(
+        src,
+        ["10.0.0.1:8000"],
+        mesh_shape=[1],
+        layout=[0],
+        global_shape=[64],
+        itemsize=4,
+    )
+    controller.register_work_unit(
+        target,
+        ["10.0.0.2:8000"],
+        mesh_shape=[1],
+        layout=[0],
+        global_shape=[64],
+        itemsize=4,
+    )
+
+    future = controller.start_transfer(
+        src_units=[src],
+        dst_units=[target],
+        use_block_chunks=True,
+    )
+    asyncio.run(future.wait())
+    self.assertEqual(controller.get_plan_cache_size(), 1)
+
+    # Registering a brand new unrelated work unit does NOT invalidate
+    # existing plan.
+    other_unit = raiden_controller.RaidenId(
+        job_name="monitor", job_replica_id="0", data_name="metrics"
+    )
+    controller.register_work_unit(
+        other_unit,
+        ["10.0.0.3:8000"],
+        mesh_shape=[1],
+        layout=[0],
+        global_shape=[64],
+        itemsize=4,
+    )
     self.assertEqual(controller.get_plan_cache_size(), 1)
 
   def test_plan_caching_clear_cache(self):
@@ -3314,6 +3479,67 @@ class RaidenPlanWarmupTest(absltest.TestCase):
     # Cache size remains 1 (both HBM and DRAM hit the same cached plan)
     self.assertEqual(controller.get_plan_cache_size(), 1)
     self.assertLen(client.calls, 8)
+
+  def test_worker_rpc_client_executor_concurrency_defaults_to_at_least_128(
+      self,
+  ):
+    client = raiden_controller.WorkerRpcClient()
+    try:
+      self.assertIsNotNone(client.executor)
+      self.assertGreaterEqual(client.executor._max_workers, 128)
+    finally:
+      client.close()
+
+  def test_worker_rpc_client_custom_max_workers_and_env_var(self):
+    client = raiden_controller.WorkerRpcClient(max_workers=64)
+    try:
+      self.assertEqual(client.executor._max_workers, 64)
+    finally:
+      client.close()
+
+    with mock.patch.dict(os.environ, {"RAIDEN_RPC_CONCURRENCY": "256"}):
+      env_client = raiden_controller.WorkerRpcClient()
+      try:
+        self.assertEqual(env_client.executor._max_workers, 256)
+      finally:
+        env_client.close()
+
+  def test_weight_sync_worker_rpc_client_inherits_concurrency(self):
+    client = raiden_controller.WeightSyncWorkerRpcClient()
+    try:
+      self.assertIsNotNone(client.executor)
+      self.assertGreaterEqual(client.executor._max_workers, 128)
+    finally:
+      client.close()
+
+  def test_worker_rpc_client_send_rpc_runs_concurrently(self):
+    client = raiden_controller.WorkerRpcClient(max_workers=32)
+    try:
+      # Mock _send_rpc_sync to simulate 30ms network latency per worker
+      def mock_send(addr, payload, timeout=600.0):
+        del addr, payload, timeout
+        time.sleep(0.03)
+        return b"ok"
+
+      client._send_rpc_sync = mock_send
+
+      async def _run_all():
+        tasks = [client._send_rpc(f"worker_{i}", b"data") for i in range(32)]
+        return await asyncio.gather(*tasks)
+
+      loop = asyncio.new_event_loop()
+      try:
+        start_time = time.perf_counter()
+        results = loop.run_until_complete(_run_all())
+        elapsed = time.perf_counter() - start_time
+        self.assertEqual(results, [b"ok"] * 32)
+        # 32 serialized calls would take 32 * 0.03s = 0.96s.
+        # Concurrently on 32 workers, it should take < 0.25s.
+        self.assertLess(elapsed, 0.5)
+      finally:
+        loop.close()
+    finally:
+      client.close()
 
 
 if __name__ == "__main__":

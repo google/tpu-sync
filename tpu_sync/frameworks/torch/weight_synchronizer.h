@@ -207,6 +207,7 @@ class WeightSynchronizer {
   void SetSkipTiling(const std::vector<bool>& skip_tiling);
   void SetSkipTiling(bool skip_all);
   void DrainPendingH2d();
+  absl::Status WaitForTransferCompletion(uint64_t uuid = 0);
 
   weight_sync::WeightSyncMetrics GetMetrics() const;
   void ResetMetrics();

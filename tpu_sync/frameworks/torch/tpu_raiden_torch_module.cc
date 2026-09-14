@@ -632,7 +632,19 @@ NB_MODULE(_tpu_raiden_torch, m) {
           [](WeightSynchronizer& self, const std::vector<bool>& skip_tiling) {
             self.SetSkipTiling(skip_tiling);
           },
-          nb::arg("skip_tiling"));
+          nb::arg("skip_tiling"))
+      .def(
+          "wait_for_transfer_completion",
+          [](WeightSynchronizer& self, std::optional<uint64_t> uuid) {
+            absl::Status status =
+                self.WaitForTransferCompletion(uuid.value_or(0));
+            if (!status.ok()) {
+              throw std::runtime_error("WaitForTransferCompletion failed: " +
+                                       std::string(status.message()));
+            }
+          },
+          nb::call_guard<nb::gil_scoped_release>(),
+          nb::arg("uuid") = nb::none());
 
   nb::class_<tpu_raiden::weight_sync::WeightSyncMetrics>(m, "WeightSyncMetrics")
       .def_ro("last_d2h_time_ms",

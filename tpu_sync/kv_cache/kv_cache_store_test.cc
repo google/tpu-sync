@@ -14,6 +14,7 @@
 
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>  // NOLINT(build/c++11)
 #include <csignal>
@@ -36,6 +37,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
@@ -130,6 +132,11 @@ class KVCacheStoreTest {
     store.OnWriteRemoteVerdict(std::move(state), succeeded, std::move(existing),
                                std::move(unregistered));
   }
+
+  static void AddBackend(KVCacheStore& store,
+                         std::shared_ptr<KVCacheStoreBackend> backend) {
+    store.backends_.push_back(std::move(backend));
+  }
 };
 
 class HostOffloadBackendTest {
@@ -146,6 +153,45 @@ class HostOffloadBackendTest {
 
 // Direct-construction shorthand for the backend fixtures below.
 using TestHostOffloadBackend = HostOffloadBackendTest::Backend;
+
+class DummyStorageBackend : public TestHostOffloadBackend {
+ public:
+  explicit DummyStorageBackend(std::string name)
+      : TestHostOffloadBackend(/*capacity=*/16), name_(std::move(name)) {}
+
+  std::string name() const override { return name_; }
+
+ private:
+  std::string name_;
+};
+
+class DummySharedStorageLookupBackend : public DummyStorageBackend {
+ public:
+  DummySharedStorageLookupBackend(std::string name,
+                                  std::vector<std::string> known_hashes)
+      : DummyStorageBackend(std::move(name)),
+        known_hashes_(std::move(known_hashes)) {}
+
+  absl::StatusOr<BlockSliceList> Lookup(
+      absl::Span<const std::string> block_hashes,
+      const LookupOptions& options = {}) override {
+    BlockSliceList results;
+    for (const auto& h : block_hashes) {
+      if (std::find(known_hashes_.begin(), known_hashes_.end(), h) !=
+          known_hashes_.end()) {
+        RaidenBlockId slice(RaidenId{"storage_job", "0", name(), 0}, -1, -1,
+                            BlockStatus::SHARED_STORAGE);
+        results.push_back({h, slice});
+      } else {
+        break;
+      }
+    }
+    return results;
+  }
+
+ private:
+  std::vector<std::string> known_hashes_;
+};
 
 namespace {
 
@@ -6243,6 +6289,270 @@ TEST(KVCacheStoreTest, LookupInterleavedTruncatesToCapacityAndUnwindsPins) {
   EXPECT_EQ(f->store->GetPinCount("l1"), 1);
   EXPECT_EQ(f->store->GetPinCount("l2"), 0);
   EXPECT_EQ(f->store->GetPinCount("r2"), 0);
+}
+
+// ===========================================================================
+// Secondary Storage Backend Tiering & Coordination
+// ===========================================================================
+
+TEST(KVCacheStoreTest, MultiBackendConstructionValidation) {
+  auto CreateStore = [](std::vector<BackendConfig> configs) {
+    return KVCacheStore::Create(
+        configs, /*capacity=*/16, /*global_registry_address=*/"",
+        /*raiden_id=*/{}, /*num_shards=*/1, /*shard_size_bytes=*/512,
+        /*store_server_ip=*/"127.0.0.1");
+  };
+
+  BackendConfig tier0;
+  tier0.type = "HostOffloadBackend";
+  tier0.SetProperty("capacity", "16");
+
+  // Rejects empty backends vector.
+  EXPECT_TRUE(absl::IsInvalidArgument(
+      CreateStore(std::vector<BackendConfig>{}).status()));
+
+  // Accepts 1 tier-0 backend (0 secondary).
+  EXPECT_TRUE(CreateStore(std::vector<BackendConfig>{tier0}).ok());
+
+  // Accepts 1 tier-0 backend + 1 secondary backend.
+  BackendConfig sec1;
+  sec1.type = "PosixKVCacheStoreBackend";
+  sec1.SetProperty("storage_root", "/tmp/raiden_test_sec1");
+  EXPECT_TRUE(CreateStore(std::vector<BackendConfig>{tier0, sec1}).ok());
+
+  // Rejects 1 tier-0 backend + 2 secondary backends.
+  BackendConfig sec2;
+  sec2.type = "PosixKVCacheStoreBackend";
+  sec2.SetProperty("storage_root", "/tmp/raiden_test_sec2");
+  auto status =
+      CreateStore(std::vector<BackendConfig>{tier0, sec1, sec2}).status();
+  EXPECT_TRUE(absl::IsInvalidArgument(status));
+  EXPECT_TRUE(absl::StrContains(status.message(),
+                                "supports at most 1 secondary backend"));
+}
+
+TEST_F(KVCacheStoreEmbeddedControllerTest,
+       StorageRecallRetainsStagingHostBlocksAsHostAndHbm) {
+  ::tpu_raiden::controller::MockTransferManager mock_mgr;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&mock_mgr));
+
+  auto controller = MakeController();
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  KVCacheStore store(10, std::move(controller), "", rid, std::nullopt,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  KVCacheStoreTest::AddBackend(store,
+                               std::make_shared<DummyStorageBackend>("posix"));
+
+  RaidenBlockId slice(RaidenId{"test_job", "0", "posix", 0}, -1, -1,
+                      BlockStatus::SHARED_STORAGE);
+
+  absl::Status status = store.Load({"storage_hash"}, {slice}, {4});
+  ASSERT_TRUE(status.ok()) << status.message();
+
+  bool done = false;
+  while (!done) {
+    auto [load_done, load_failed, load_pending, load_existing,
+          load_unregistered] = store.PollLoadStatus();
+    if (!load_failed.empty()) {
+      FAIL() << "Async Load failed during polling: " << load_failed[0];
+    }
+    if (!load_done.empty()) {
+      EXPECT_THAT(load_done, ::testing::ElementsAre("storage_hash"));
+      done = true;
+    }
+    if (!done) {
+      absl::SleepFor(absl::Milliseconds(10));
+    }
+  }
+
+  EXPECT_EQ(mock_mgr.h2d_calls, 1);
+
+  auto lookup_res = PeekLookup(store, {"storage_hash"});
+  ASSERT_TRUE(lookup_res.ok());
+  ASSERT_EQ(lookup_res->size(), 1);
+  EXPECT_EQ((*lookup_res)[0].second.status, BlockStatus::HOST_AND_HBM);
+  EXPECT_EQ((*lookup_res)[0].second.device_block_id, 4);
+  EXPECT_GE((*lookup_res)[0].second.host_block_id, 0);
+
+  auto backend_lookup = store.backend()->Lookup(
+      {"storage_hash"}, LookupOptions{.enable_global = false});
+  ASSERT_TRUE(backend_lookup.ok());
+  ASSERT_EQ(backend_lookup->size(), 1);
+  EXPECT_EQ((*backend_lookup)[0].second.status, BlockStatus::HOST_AND_HBM);
+  EXPECT_EQ((*backend_lookup)[0].second.device_block_id, 4);
+  EXPECT_GE((*backend_lookup)[0].second.host_block_id, 0);
+}
+
+TEST_F(KVCacheStoreEmbeddedControllerTest,
+       StorageRecallFailureDeallocatesStagingHostBlocks) {
+  ::tpu_raiden::controller::MockTransferManager mock_mgr;
+  mock_mgr.fail_transfers = true;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&mock_mgr));
+
+  auto controller = MakeController();
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  KVCacheStore store(10, std::move(controller), "", rid, std::nullopt,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  int initial_free = KVCacheStoreTest::GetController(store)
+                         ->block_manager()
+                         ->num_free_blocks();
+
+  KVCacheStoreTest::AddBackend(store,
+                               std::make_shared<DummyStorageBackend>("posix"));
+
+  RaidenBlockId slice(RaidenId{"test_job", "0", "posix", 0}, -1, -1,
+                      BlockStatus::SHARED_STORAGE);
+
+  absl::Status status = store.Load({"storage_hash"}, {slice}, {4});
+  ASSERT_TRUE(status.ok()) << status.message();
+
+  bool done = false;
+  while (!done) {
+    auto [load_done, load_failed, load_pending, load_existing,
+          load_unregistered] = store.PollLoadStatus();
+    if (!load_done.empty()) {
+      FAIL() << "Async Load succeeded unexpectedly";
+    }
+    if (!load_failed.empty()) {
+      EXPECT_THAT(load_failed, ::testing::ElementsAre("storage_hash"));
+      done = true;
+    }
+    if (!done) {
+      absl::SleepFor(absl::Milliseconds(10));
+    }
+  }
+
+  EXPECT_EQ(KVCacheStoreTest::GetController(store)
+                ->block_manager()
+                ->num_free_blocks(),
+            initial_free);
+}
+
+TEST_F(KVCacheStoreEmbeddedControllerTest,
+       SaveLocalDispatchesOffloadToSecondaryBackend) {
+  ::tpu_raiden::controller::MockTransferManager mock_mgr;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&mock_mgr));
+
+  auto controller = MakeController();
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  KVCacheStore store(10, std::move(controller), "", rid, std::nullopt,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  KVCacheStoreTest::AddBackend(store,
+                               std::make_shared<DummyStorageBackend>("posix"));
+
+  std::vector<std::string> hashes = {"save_hash"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(rid, -1, 0, BlockStatus::HBM)};
+
+  ASSERT_TRUE(InsertResident(store, hashes, slices, /*on_host=*/false));
+
+  ASSERT_TRUE(store.Lookup(hashes).ok());
+
+  absl::Status status = store.Save(hashes);
+  ASSERT_TRUE(status.ok()) << status.message();
+
+  bool done = false;
+  while (!done) {
+    auto [save_done, save_failed, save_pending, save_existing,
+          save_unregistered] = store.PollSaveStatus();
+    if (!save_failed.empty()) {
+      FAIL() << "Async Save failed during polling: " << save_failed[0];
+    }
+    EXPECT_TRUE(save_existing.empty());
+    EXPECT_TRUE(save_unregistered.empty());
+    if (!save_done.empty()) {
+      EXPECT_THAT(save_done, ::testing::ElementsAre("save_hash"));
+      done = true;
+    }
+    if (!done) {
+      absl::SleepFor(absl::Milliseconds(10));
+    }
+  }
+
+  EXPECT_EQ(mock_mgr.d2h_calls, 1);
+
+  auto lookup_res = PeekLookup(store, hashes);
+  ASSERT_TRUE(lookup_res.ok());
+  ASSERT_EQ(lookup_res->size(), 1);
+  EXPECT_EQ((*lookup_res)[0].second.status, BlockStatus::HOST_AND_HBM);
+}
+
+
+
+TEST(KVCacheStoreTest, CreateWithProgrammaticSecondaryConfigs) {
+  BackendConfig host_cfg;
+  host_cfg.type = "HostOffloadBackend";
+  host_cfg.capacity = 4;
+
+  BackendConfig sec_cfg;
+  sec_cfg.type = "PosixKVCacheStoreBackend";
+  sec_cfg.properties["root_dir"] = "/tmp/test";
+
+  std::vector<BackendConfig> sec_cfgs = {sec_cfg};
+  auto store_or = KVCacheStore::Create(
+      host_cfg, /*capacity=*/4, /*global_registry_address=*/"", RaidenId{},
+      /*num_shards=*/1, /*shard_size_bytes=*/512,
+      /*store_server_ip=*/"127.0.0.1", /*raiden_controller_port=*/0,
+      /*metadata=*/std::nullopt, /*expected_worker_count=*/0,
+      std::move(sec_cfgs));
+  ASSERT_TRUE(store_or.ok()) << store_or.status();
+  auto& store = *store_or;
+  ASSERT_EQ(store->backends().size(), 2);
+  EXPECT_EQ(store->backends()[0]->name(), "HostOffloadBackend");
+  EXPECT_EQ(store->backends()[1]->name(), "PosixKVCacheStoreBackend");
+  ASSERT_EQ(store->backend_configs().size(), 2);
+  EXPECT_EQ(store->backend_configs()[1].GetProperty("root_dir"), "/tmp/test");
+}
+
+
+
+TEST(KVCacheStoreTest, PeerLookupPriorityOverStorageFallback) {
+  auto reg_server = global_registry::CreateTestGlobalRegistryServer();
+
+  std::string hash_peer = "peer_hash";
+  RaidenId host_peer{"peer_job", "0", "kv_cache", 0};
+  ASSERT_TRUE(reg_server->client->Register({{hash_peer, host_peer, 100}}).ok());
+
+  RaidenId store_id{"store_job", "0", "kv_cache", 0};
+  KVCacheStore store(50, reg_server->server_address, store_id,
+                     /*num_shards=*/1, /*shard_size_bytes=*/512,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  std::string hash_storage = "storage_hash";
+  auto storage_backend = std::make_shared<DummySharedStorageLookupBackend>(
+      "posix", std::vector<std::string>{hash_peer, hash_storage});
+  KVCacheStoreTest::AddBackend(store, storage_backend);
+
+  // Calls store.Lookup({"peer_hash"}, LookupOptions{.enable_global = true}).
+  // Asserts that (*lookup_res)[0].second.status == BlockStatus::REMOTE
+  // (verifying Peer RAM priority over storage).
+  auto peer_lookup =
+      store.Lookup({hash_peer}, LookupOptions{.enable_global = true});
+  ASSERT_TRUE(peer_lookup.ok()) << peer_lookup.status();
+  ASSERT_EQ(peer_lookup->size(), 1);
+  EXPECT_EQ((*peer_lookup)[0].second.status, BlockStatus::REMOTE);
+  EXPECT_EQ((*peer_lookup)[0].second.raiden_id, host_peer);
+
+  // Calls store.Lookup({"storage_hash"}, LookupOptions{.enable_global = true}).
+  // Asserts that (*lookup_res)[0].second.status == BlockStatus::SHARED_STORAGE
+  // (verifying fallback to storage when missed in local & peer RAM).
+  auto storage_lookup =
+      store.Lookup({hash_storage}, LookupOptions{.enable_global = true});
+  ASSERT_TRUE(storage_lookup.ok()) << storage_lookup.status();
+  ASSERT_EQ(storage_lookup->size(), 1);
+  EXPECT_EQ((*storage_lookup)[0].second.status, BlockStatus::SHARED_STORAGE);
 }
 
 }  // namespace

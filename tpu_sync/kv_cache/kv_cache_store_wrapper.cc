@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -32,6 +33,8 @@
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
+
+extern char** environ;
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -89,33 +92,51 @@ StoreMonitorConfig StoreMonitorConfigFromEnv() {
   return config;
 }
 
+namespace {
+std::vector<BackendConfig> ToSecondaryBackendConfigs(
+    std::optional<BackendConfig> secondary_backend_config) {
+  std::vector<BackendConfig> configs;
+  if (secondary_backend_config.has_value()) {
+    configs.push_back(std::move(*secondary_backend_config));
+  }
+  return configs;
+}
+}  // namespace
+
 KVCacheStoreWrapper::KVCacheStoreWrapper(
     size_t lru_capacity, std::string global_registry_address,
     RaidenId raiden_id, int num_shards, int64_t shard_size_bytes,
     std::string store_server_ip, int raiden_controller_port,
-    int expected_worker_count, std::string kv_pool_group) {
+    int expected_worker_count, std::string kv_pool_group,
+    std::vector<BackendConfig> secondary_backend_configs)
+    : secondary_backend_configs_(std::move(secondary_backend_configs)) {
+  if (!secondary_backend_configs_.empty()) {
+    secondary_backend_config_ = secondary_backend_configs_.front();
+  }
   // Routed through Create() (not the raw constructor) so a misconfigured
   // caller -- e.g. a missing store_server_ip -- gets a Python exception
   // instead of aborting the process.
-  BackendConfig config;
-  config.type = "HostOffloadBackend";
-  config.capacity = lru_capacity;
-  config.kv_pool_group = std::move(kv_pool_group);
+  BackendConfig host_config;
+  host_config.type = "HostOffloadBackend";
+  host_config.capacity = lru_capacity;
+  host_config.kv_pool_group = std::move(kv_pool_group);
   // Serving hosts sit on placement tier 0 (BackendConfig's default
   // evict_tier), demoting to higher tiers, never receiving.
-  config.monitor_config = StoreMonitorConfigFromEnv();
+  host_config.monitor_config = StoreMonitorConfigFromEnv();
   if (global_registry_address.empty()) {
     // The env block is shared across a fleet's processes, so the switches
     // must not break a registry-less (local-only) store: without a registry
     // the monitor has nothing to heartbeat and the sweep no way to find
     // targets, so they are dropped -- Create rejects the combination.
-    config.monitor_config.enable = false;
-    config.monitor_config.enable_evict_sweep = false;
+    host_config.monitor_config.enable = false;
+    host_config.monitor_config.enable_evict_sweep = false;
   }
+
   auto created_store = KVCacheStore::Create(
-      config, /*capacity=*/lru_capacity, global_registry_address, raiden_id,
-      num_shards, shard_size_bytes, store_server_ip, raiden_controller_port,
-      /*metadata=*/std::nullopt, expected_worker_count);
+      host_config, /*capacity=*/lru_capacity, global_registry_address,
+      raiden_id, num_shards, shard_size_bytes, store_server_ip,
+      raiden_controller_port, /*metadata=*/std::nullopt, expected_worker_count,
+      secondary_backend_configs_);
   if (!created_store.ok()) {
     // invalid_argument maps to Python ValueError, runtime_error to
     // RuntimeError: a bad configuration is the caller's mistake, everything
@@ -129,7 +150,26 @@ KVCacheStoreWrapper::KVCacheStoreWrapper(
     throw std::runtime_error(std::string(created_store.status().message()));
   }
   controller_ = std::move(*created_store);
+
+  if (controller_->backend_configs().size() > 1) {
+    secondary_backend_configs_.assign(
+        controller_->backend_configs().begin() + 1,
+        controller_->backend_configs().end());
+    secondary_backend_config_ = secondary_backend_configs_.front();
+  }
 }
 
+KVCacheStoreWrapper::KVCacheStoreWrapper(
+    size_t lru_capacity, std::string global_registry_address,
+    RaidenId raiden_id, int num_shards, int64_t shard_size_bytes,
+    std::string store_server_ip, int raiden_controller_port,
+    int expected_worker_count, std::string kv_pool_group,
+    std::optional<BackendConfig> secondary_backend_config)
+    : KVCacheStoreWrapper(
+          lru_capacity, std::move(global_registry_address),
+          std::move(raiden_id), num_shards, shard_size_bytes,
+          std::move(store_server_ip), raiden_controller_port,
+          expected_worker_count, std::move(kv_pool_group),
+          ToSecondaryBackendConfigs(std::move(secondary_backend_config))) {}
 }  // namespace kv_cache
 }  // namespace tpu_raiden

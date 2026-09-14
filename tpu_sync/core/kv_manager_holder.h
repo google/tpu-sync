@@ -32,9 +32,14 @@
 #include "absl/types/span.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
+
+namespace kv_cache {
+struct BackendConfig;
+}  // namespace kv_cache
 
 namespace internal {
 
@@ -194,6 +199,110 @@ template <typename T>
 inline constexpr bool has_pool_reshard_register_recv_v =
     has_pool_reshard_register_recv<T>::value;
 
+template <typename T, typename = void>
+struct has_d2h_write_to_backend : std::false_type {};
+
+template <typename T>
+struct has_d2h_write_to_backend<
+    T, std::void_t<decltype(std::declval<T&>().D2hWriteToBackend(
+           std::declval<absl::Span<
+               const std::shared_ptr<kv_cache::backends::KVBackend>>>(),
+           std::declval<const std::vector<kv_cache::backends::BlockKey>&>(),
+           std::declval<const std::vector<int64_t>&>(),
+           std::declval<const std::vector<int64_t>&>()))>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_d2h_write_to_backend_v =
+    has_d2h_write_to_backend<T>::value;
+
+template <typename T, typename = void>
+struct has_h2d_read_from_backend : std::false_type {};
+
+template <typename T>
+struct has_h2d_read_from_backend<
+    T, std::void_t<decltype(std::declval<T&>().H2dReadFromBackend(
+           std::declval<absl::Span<
+               const std::shared_ptr<kv_cache::backends::KVBackend>>>(),
+           std::declval<const std::vector<kv_cache::backends::BlockKey>&>(),
+           std::declval<const std::vector<int64_t>&>(),
+           std::declval<const std::vector<int64_t>&>()))>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_h2d_read_from_backend_v =
+    has_h2d_read_from_backend<T>::value;
+
+template <typename T, typename = void>
+struct has_get_kv_backend : std::false_type {};
+
+template <typename T>
+struct has_get_kv_backend<T,
+                          std::void_t<decltype(std::declval<T&>().GetKVBackend(
+                              std::declval<absl::string_view>()))>>
+    : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_get_kv_backend_v = has_get_kv_backend<T>::value;
+
+template <typename T, typename = void>
+struct has_initialize_secondary_backends_from_config : std::false_type {};
+
+template <typename T>
+struct has_initialize_secondary_backends_from_config<
+    T, std::void_t<decltype(std::declval<T&>()
+                                .InitializeSecondaryBackendsFromConfig())>>
+    : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_initialize_secondary_backends_from_config_v =
+    has_initialize_secondary_backends_from_config<T>::value;
+
+template <typename T, typename = void>
+struct has_initialize_secondary_backends : std::false_type {};
+
+template <typename T>
+struct has_initialize_secondary_backends<
+    T, std::void_t<decltype(std::declval<T&>().InitializeSecondaryBackends(
+           std::declval<absl::Span<const kv_cache::BackendConfig>>()))>>
+    : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_initialize_secondary_backends_v =
+    has_initialize_secondary_backends<T>::value;
+
+template <typename T, typename = void>
+struct has_initialize_secondary_backends_from_env_config : std::false_type {};
+
+template <typename T>
+struct has_initialize_secondary_backends_from_env_config<
+    T, std::void_t<decltype(std::declval<T&>()
+                                .InitializeSecondaryBackendsFromEnvConfig())>>
+    : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_initialize_secondary_backends_from_env_config_v =
+    has_initialize_secondary_backends_from_env_config<T>::value;
+
+template <typename T, typename = void>
+struct has_bytes_per_block : std::false_type {};
+
+template <typename T>
+struct has_bytes_per_block<
+    T, std::void_t<decltype(std::declval<T&>().bytes_per_block())>>
+    : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_bytes_per_block_v = has_bytes_per_block<T>::value;
+
+template <typename T, typename = void>
+struct has_resolve_block_slices : std::false_type {};
+template <typename T>
+struct has_resolve_block_slices<
+    T, std::void_t<decltype(std::declval<const T&>().ResolveBlockSlices(
+           std::declval<int>()))>> : std::true_type {};
+template <typename T>
+inline constexpr bool has_resolve_block_slices_v =
+    has_resolve_block_slices<T>::value;
+
 }  // namespace internal
 
 // Type-erased wrapper for any KV Cache Manager or Transfer Manager
@@ -259,6 +368,30 @@ class KVManagerHolder {
     virtual absl::Status PoolReshardRegisterRecv(
         const tpu_sync::rpc::StartTransferRequest& request,
         absl::Span<const int64_t> chip_block_ids) = 0;
+    virtual absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+        absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>>
+            backends,
+        const std::vector<kv_cache::backends::BlockKey>& block_keys,
+        const std::vector<int64_t>& src_device_block_ids,
+        const std::vector<int64_t>& dst_host_block_ids) = 0;
+    virtual absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+        absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>>
+            backends,
+        const std::vector<kv_cache::backends::BlockKey>& block_keys,
+        const std::vector<int64_t>& src_host_block_ids,
+        const std::vector<int64_t>& dst_device_block_ids) = 0;
+
+    // Returns the backend plugin registered for the specified backend name, or
+    // nullptr if none.
+    virtual std::shared_ptr<kv_cache::backends::KVBackend> GetKVBackend(
+        absl::string_view backend_name) const = 0;
+    virtual void InitializeSecondaryBackends(
+        absl::Span<const kv_cache::BackendConfig> configs) {}
+    virtual void InitializeSecondaryBackendsFromEnvConfig() {}
+    virtual void InitializeSecondaryBackendsFromConfig() {}
+    virtual int64_t bytes_per_block() const = 0;
+    virtual std::vector<kv_cache::backends::BackendBufferDescriptor>
+    ResolveBlockSlices(int staging_block_id) const = 0;
   };
 
   template <typename T>
@@ -459,6 +592,79 @@ class KVManagerHolder {
             "transfer manager.");
       }
     }
+    absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+        absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>>
+            backends,
+        const std::vector<kv_cache::backends::BlockKey>& block_keys,
+        const std::vector<int64_t>& src_device_block_ids,
+        const std::vector<int64_t>& dst_host_block_ids) override {
+      if constexpr (internal::has_d2h_write_to_backend_v<T>) {
+        return impl_->D2hWriteToBackend(
+            backends, block_keys, src_device_block_ids, dst_host_block_ids);
+      } else {
+        return absl::UnimplementedError(
+            "D2hWriteToBackend is not implemented by the underlying transfer "
+            "manager.");
+      }
+    }
+    absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+        absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>>
+            backends,
+        const std::vector<kv_cache::backends::BlockKey>& block_keys,
+        const std::vector<int64_t>& src_host_block_ids,
+        const std::vector<int64_t>& dst_device_block_ids) override {
+      if constexpr (internal::has_h2d_read_from_backend_v<T>) {
+        return impl_->H2dReadFromBackend(
+            backends, block_keys, src_host_block_ids, dst_device_block_ids);
+      } else {
+        return absl::UnimplementedError(
+            "H2dReadFromBackend is not implemented by the underlying transfer "
+            "manager.");
+      }
+    }
+
+    std::shared_ptr<kv_cache::backends::KVBackend> GetKVBackend(
+        absl::string_view backend_name) const override {
+      if constexpr (internal::has_get_kv_backend_v<T>) {
+        return impl_->GetKVBackend(backend_name);
+      } else {
+        return nullptr;
+      }
+    }
+    void InitializeSecondaryBackends(
+        absl::Span<const kv_cache::BackendConfig> configs) override {
+      if constexpr (internal::has_initialize_secondary_backends_v<T>) {
+        impl_->InitializeSecondaryBackends(configs);
+      }
+    }
+    void InitializeSecondaryBackendsFromEnvConfig() override {
+      if constexpr (internal::
+                        has_initialize_secondary_backends_from_env_config_v<
+                            T>) {
+        impl_->InitializeSecondaryBackendsFromEnvConfig();
+      }
+    }
+    void InitializeSecondaryBackendsFromConfig() override {
+      if constexpr (internal::has_initialize_secondary_backends_from_config_v<
+                        T>) {
+        impl_->InitializeSecondaryBackendsFromConfig();
+      }
+    }
+    int64_t bytes_per_block() const override {
+      if constexpr (internal::has_bytes_per_block_v<T>) {
+        return impl_->bytes_per_block();
+      } else {
+        return 0;
+      }
+    }
+    std::vector<kv_cache::backends::BackendBufferDescriptor> ResolveBlockSlices(
+        int staging_block_id) const override {
+      if constexpr (internal::has_resolve_block_slices_v<T>) {
+        return impl_->ResolveBlockSlices(staging_block_id);
+      } else {
+        return {};
+      }
+    }
 
    private:
     absl::StatusOr<std::vector<int>> SafeCastOffsets(
@@ -619,6 +825,96 @@ class KVManagerHolder {
       return absl::InternalError("KVManagerHolder is null");
     }
     return self_->PoolReshardRegisterRecv(request, chip_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids,
+      const std::vector<int64_t>& dst_host_block_ids) const {
+    if (!self_) {
+      return absl::InternalError("KVManagerHolder is null");
+    }
+    return self_->D2hWriteToBackend(backends, block_keys, src_device_block_ids,
+                                    dst_host_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+      const std::shared_ptr<kv_cache::backends::KVBackend>& backend,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids,
+      const std::vector<int64_t>& dst_host_block_ids) const {
+    const std::shared_ptr<kv_cache::backends::KVBackend> b[] = {backend};
+    return D2hWriteToBackend(absl::MakeSpan(b), block_keys,
+                             src_device_block_ids, dst_host_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_host_block_ids,
+      const std::vector<int64_t>& dst_device_block_ids) const {
+    if (!self_) {
+      return absl::InternalError("KVManagerHolder is null");
+    }
+    return self_->H2dReadFromBackend(backends, block_keys, src_host_block_ids,
+                                     dst_device_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+      const std::shared_ptr<kv_cache::backends::KVBackend>& backend,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_host_block_ids,
+      const std::vector<int64_t>& dst_device_block_ids) const {
+    const std::shared_ptr<kv_cache::backends::KVBackend> b[] = {backend};
+    return H2dReadFromBackend(absl::MakeSpan(b), block_keys, src_host_block_ids,
+                              dst_device_block_ids);
+  }
+
+  // Returns the backend plugin registered for the specified backend name, or
+  // nullptr if none.
+  std::shared_ptr<kv_cache::backends::KVBackend> GetKVBackend(
+      absl::string_view backend_name) const {
+    if (!self_) {
+      return nullptr;
+    }
+    return self_->GetKVBackend(backend_name);
+  }
+
+  void InitializeSecondaryBackends(
+      absl::Span<const kv_cache::BackendConfig> configs) const {
+    if (self_) {
+      self_->InitializeSecondaryBackends(configs);
+    }
+  }
+
+  void InitializeSecondaryBackendsFromEnvConfig() const {
+    if (self_) {
+      self_->InitializeSecondaryBackendsFromEnvConfig();
+    }
+  }
+
+  // Initializes secondary backends eagerly during worker startup from
+  // configuration or environment variables (e.g., RAIDEN_BACKENDS).
+  void InitializeSecondaryBackendsFromConfig() const {
+    if (self_) {
+      self_->InitializeSecondaryBackendsFromConfig();
+    }
+  }
+
+  int64_t bytes_per_block() const {
+    if (!self_) {
+      return 0;
+    }
+    return self_->bytes_per_block();
+  }
+
+  std::vector<kv_cache::backends::BackendBufferDescriptor> ResolveBlockSlices(
+      int staging_block_id) const {
+    if (!self_) {
+      return {};
+    }
+    return self_->ResolveBlockSlices(staging_block_id);
   }
 
   explicit operator bool() const { return self_ != nullptr; }

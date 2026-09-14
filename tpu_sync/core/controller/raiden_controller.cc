@@ -23,14 +23,12 @@
 #include <cstring>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
-#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
 #include "absl/memory/memory.h"
@@ -488,7 +486,9 @@ absl::StatusOr<::tpu_sync::proto::TransferBuffersRequest>
 RaidenController::BuildTransferBuffersRequest(
     absl::Span<const Buffer> src_buffers, absl::Span<const Buffer> dst_buffers,
     absl::Span<const Buffer> staging_host_buffers,
-    absl::Span<const int64_t> copy_sizes) {
+    absl::Span<const int64_t> copy_sizes,
+    absl::Span<const ::tpu_sync::proto::BackendTransferSpec>
+        worker_backend_specs) {
   if (src_buffers.empty() || src_buffers.size() != dst_buffers.size()) {
     return absl::InvalidArgumentError(
         "Source and destination buffers must have the same non-zero length");
@@ -537,6 +537,10 @@ RaidenController::BuildTransferBuffersRequest(
     added_buf->set_index(buf.index());
   }
 
+  for (const auto& spec : worker_backend_specs) {
+    *transfer->add_backend_specs() = spec;
+  }
+
   return request;
 }
 
@@ -544,13 +548,15 @@ tsl::Future<> RaidenController::TransferBuffers(
     absl::string_view worker_id, absl::Span<const Buffer> src_buffers,
     absl::Span<const Buffer> dst_buffers,
     absl::Span<const Buffer> staging_host_buffers,
-    absl::Span<const int64_t> copy_sizes) {
+    absl::Span<const int64_t> copy_sizes,
+    absl::Span<const ::tpu_sync::proto::BackendTransferSpec> backend_specs) {
   RAIDEN_TRACE_FN("RaidenCtrl::TransferBuffers", [&]() {
     return absl::StrCat("src_buffers=", src_buffers.size(),
                         " dst_buffers=", dst_buffers.size());
   });
-  auto request_or = BuildTransferBuffersRequest(
-      src_buffers, dst_buffers, staging_host_buffers, copy_sizes);
+  auto request_or = BuildTransferBuffersRequest(src_buffers, dst_buffers,
+                                                staging_host_buffers,
+                                                copy_sizes, backend_specs);
   if (!request_or.ok()) {
     return tsl::Future<>(request_or.status());
   }
@@ -573,7 +579,8 @@ tsl::Future<> RaidenController::TransferBuffers(
 tsl::Future<> RaidenController::TransferBuffers(
     absl::Span<const Buffer> src_buffers, absl::Span<const Buffer> dst_buffers,
     absl::Span<const Buffer> staging_host_buffers,
-    absl::Span<const int64_t> copy_sizes) {
+    absl::Span<const int64_t> copy_sizes,
+    absl::Span<const ::tpu_sync::proto::BackendTransferSpec> backend_specs) {
   RAIDEN_TRACE_FN("RaidenCtrl::TransferBuffers", [&]() {
     return absl::StrCat("src_buffers=", src_buffers.size(),
                         " dst_buffers=", dst_buffers.size());
@@ -758,12 +765,9 @@ tsl::Future<> RaidenController::TransferBuffers(
       }
     }
 
-    if (worker_src.empty()) continue;
-
-    // Every worker owns a shard of every block, so the (host) staging offsets
-    // are identical across workers.
-    auto req_or = BuildTransferBuffersRequest(
-        worker_src, worker_dst, request_staging, worker_copy_sizes);
+    auto req_or =
+        BuildTransferBuffersRequest(worker_src, worker_dst, request_staging,
+                                    worker_copy_sizes, backend_specs);
     if (!req_or.ok()) {
       return tsl::Future<>(req_or.status());
     }

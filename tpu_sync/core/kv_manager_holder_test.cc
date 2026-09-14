@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 
 namespace tpu_raiden {
 namespace {
@@ -96,6 +97,39 @@ TEST(KVManagerHolderTest, VectorH2dReadOnNullHolderFails) {
   KVManagerHolder holder;
   auto result = holder.H2dRead(TwoShardEndpoints(), {10}, {20}, {30}, {64});
   EXPECT_FALSE(result.ok());
+}
+
+struct MockManagerWithSlices : public MockTransferManager {
+  std::vector<kv_cache::backends::BackendBufferDescriptor> ResolveBlockSlices(
+      int staging_block_id) const {
+    kv_cache::backends::BackendBufferDescriptor desc;
+    desc.ptr = reinterpret_cast<void*>(0x1234);
+    desc.size = 1024;
+    desc.fd = 42;
+    desc.offset = staging_block_id * 1024;
+    return {desc};
+  }
+};
+
+TEST(KVManagerHolderTest, ResolveBlockSlicesDelegatesCorrectly) {
+  MockManagerWithSlices mock;
+  KVManagerHolder holder(&mock);
+
+  auto slices = holder.ResolveBlockSlices(5);
+  ASSERT_EQ(slices.size(), 1u);
+  EXPECT_EQ(slices[0].ptr, reinterpret_cast<void*>(0x1234));
+  EXPECT_EQ(slices[0].size, 1024u);
+  EXPECT_EQ(slices[0].fd, 42);
+  EXPECT_EQ(slices[0].offset, 5120);
+
+  // An impl without ResolveBlockSlices returns empty slices.
+  MockTransferManager mock_without;
+  KVManagerHolder holder_without(&mock_without);
+  EXPECT_TRUE(holder_without.ResolveBlockSlices(5).empty());
+
+  // Null holder returns empty slices.
+  KVManagerHolder null_holder;
+  EXPECT_TRUE(null_holder.ResolveBlockSlices(5).empty());
 }
 
 }  // namespace

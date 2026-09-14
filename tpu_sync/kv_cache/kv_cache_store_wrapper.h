@@ -18,9 +18,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
+#include "absl/status/status.h"
 #include "tpu_sync/common/raiden_id.h"
+#include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 
@@ -51,19 +55,38 @@ class KVCacheStoreWrapper {
       size_t lru_capacity, std::string global_registry_address = "",
       RaidenId raiden_id = {}, int num_shards = 0, int64_t shard_size_bytes = 0,
       std::string store_server_ip = "", int raiden_controller_port = 0,
-      int expected_worker_count = 0, std::string kv_pool_group = "");
+      int expected_worker_count = 0, std::string kv_pool_group = "",
+      std::vector<BackendConfig> secondary_backend_configs = {});
+
+  // Backwards compatibility overload for single secondary backend config.
+  KVCacheStoreWrapper(size_t lru_capacity, std::string global_registry_address,
+                      RaidenId raiden_id, int num_shards,
+                      int64_t shard_size_bytes, std::string store_server_ip,
+                      int raiden_controller_port, int expected_worker_count,
+                      std::string kv_pool_group,
+                      std::optional<BackendConfig> secondary_backend_config);
 
   explicit KVCacheStoreWrapper(std::unique_ptr<KVCacheStore> store)
       : controller_(std::move(store)) {}
+
+  KVCacheStore* store() const { return controller_.get(); }
+  const std::vector<BackendConfig>& secondary_backend_configs() const {
+    return secondary_backend_configs_;
+  }
+  const std::optional<BackendConfig>& secondary_backend_config() const {
+    return secondary_backend_config_;
+  }
 
   KVCacheStore* operator->() { return controller_.get(); }
   KVCacheStore& operator*() { return *controller_; }
 
  private:
   std::unique_ptr<KVCacheStore> controller_;
+  std::vector<BackendConfig> secondary_backend_configs_;
+  std::optional<BackendConfig> secondary_backend_config_;
 };
 
 }  // namespace kv_cache
 }  // namespace tpu_raiden
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_KV_CACHE_KV_CACHE_STORE_WRAPPER_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_KV_CACHE_KV_CACHE_STORE_WRAPPER_H_

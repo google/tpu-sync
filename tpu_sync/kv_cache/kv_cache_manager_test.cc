@@ -13,13 +13,18 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <chrono>  // NOLINT
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>  // NOLINT(build/c++17)
+#include <fstream>
+#include <ios>
 #include <memory>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -34,6 +39,8 @@
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -72,6 +79,83 @@ class TestKVCacheManager : public KVCacheManagerBase {
 
   using KVCacheManagerBase::layers_;
   using KVCacheManagerBase::UpdateAllocatedOccupancyMetric;
+};
+
+class TestPipelinedBackendKVCacheManager : public TestKVCacheManager {
+ public:
+  TestPipelinedBackendKVCacheManager(size_t num_layers, size_t num_shards,
+                                     size_t slice_byte_size, int host_blocks)
+      : TestKVCacheManager(num_layers, num_shards, slice_byte_size,
+                           host_blocks),
+        host_blocks_(host_blocks) {
+    device_memory_.resize(
+        num_layers * num_shards * host_blocks * slice_byte_size, 0);
+  }
+
+  uint8_t* GetDevicePointer(size_t layer, size_t shard, int64_t block_id) {
+    size_t offset = ((layer * num_shards_ + shard) * host_blocks_ + block_id) *
+                    slice_byte_size_;
+    return device_memory_.data() + offset;
+  }
+
+  uint8_t* GetDevicePointer(int64_t block_id) {
+    return GetDevicePointer(0, 0, block_id);
+  }
+
+  absl::StatusOr<std::vector<raiden::PjRtCopyFuture>> DispatchD2hChunks(
+      const std::vector<int64_t>& src_offsets,
+      const std::vector<int64_t>& dst_offsets,
+      const std::vector<int64_t>& copy_sizes,
+      std::optional<int64_t> slot_idx = std::nullopt,
+      std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> shard_idx = std::nullopt,
+      int64_t device_id = -1) override {
+    dispatch_d2h_called_ = true;
+    for (size_t i = 0; i < src_offsets.size(); ++i) {
+      int64_t dev_blk = src_offsets[i];
+      int64_t host_blk = dst_offsets[i];
+      for (size_t l = 0; l < num_layers_; ++l) {
+        for (size_t s = 0; s < num_shards_; ++s) {
+          uint8_t* host_ptr = GetBlockHostPointer(l, s, host_blk);
+          uint8_t* dev_ptr = GetDevicePointer(l, s, dev_blk);
+          if (host_ptr != nullptr && dev_ptr != nullptr) {
+            std::memcpy(host_ptr, dev_ptr, slice_byte_size_);
+          }
+        }
+      }
+    }
+    return std::vector<raiden::PjRtCopyFuture>{
+        raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{})};
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2d(
+      const std::vector<int64_t>& src_offsets_major_dim = {},
+      const std::vector<int64_t>& dst_offsets_major_dim = {},
+      const std::vector<int64_t>& copy_sizes_major_dim = {},
+      std::optional<int64_t> slot_idx = std::nullopt,
+      std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> shard_idx = std::nullopt) override {
+    h2d_called_ = true;
+    for (size_t i = 0; i < src_offsets_major_dim.size(); ++i) {
+      int64_t host_blk = src_offsets_major_dim[i];
+      int64_t dev_blk = dst_offsets_major_dim[i];
+      for (size_t l = 0; l < num_layers_; ++l) {
+        for (size_t s = 0; s < num_shards_; ++s) {
+          uint8_t* host_ptr = GetBlockHostPointer(l, s, host_blk);
+          uint8_t* dev_ptr = GetDevicePointer(l, s, dev_blk);
+          if (host_ptr != nullptr && dev_ptr != nullptr) {
+            std::memcpy(dev_ptr, host_ptr, slice_byte_size_);
+          }
+        }
+      }
+    }
+    return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
+  }
+
+  bool dispatch_d2h_called_ = false;
+  bool h2d_called_ = false;
+  int host_blocks_ = 4;
+  std::vector<uint8_t> device_memory_;
 };
 
 // Pool with one strided live region per block: live [0, 32) and [64, 96)
@@ -1380,6 +1464,212 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
                testing::IsEmpty(), testing::DoubleEq(3072.0)))
       .Times(1);
   manager.UpdateAllocatedOccupancyMetric();
+}
+
+struct ScopedStorageTestEnv {
+  explicit ScopedStorageTestEnv(absl::string_view prefix = "kv_mgr_test") {
+    dir = absl::StrCat(
+        testing::TempDir(), "/", prefix, "_", getpid(), "_",
+        std::chrono::system_clock::now().time_since_epoch().count());
+    std::filesystem::create_directories(dir);
+    backend = std::make_shared<backends::storage::PosixKVBackend>("posix");
+    mapper = std::make_unique<backends::storage::PosixPathMapper>(
+        dir, "test_model", /*tp_size=*/1, /*rank=*/0);
+  }
+  ~ScopedStorageTestEnv() {
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+  }
+  std::string dir;
+  std::shared_ptr<backends::storage::PosixKVBackend> backend;
+  std::unique_ptr<backends::storage::PosixPathMapper> mapper;
+};
+
+// ===========================================================================
+// Pipelined Storage Offload & Recall Engine
+// ===========================================================================
+
+TEST(KVCacheManagerTest, SingleShardOffloadAndRecall) {
+  ScopedStorageTestEnv env("single_shard_test");
+  const size_t kBlockSize = 128;
+  const int kNumBlocks = 4;
+  const size_t kNumLayers = 2;
+  const size_t kNumShards = 1;
+  TestPipelinedBackendKVCacheManager manager(kNumLayers, kNumShards, kBlockSize,
+                                             kNumBlocks);
+
+  const std::vector<uint8_t> layer_patterns = {0xA1, 0xB2};
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (int b = 0; b < kNumBlocks; ++b) {
+      std::memset(manager.GetDevicePointer(l, /*shard=*/0, b),
+                  layer_patterns[l], kBlockSize);
+    }
+  }
+
+  std::vector<backends::BlockKey> block_keys;
+  block_keys.reserve(kNumBlocks);
+  std::vector<int64_t> dev_block_ids;
+  std::vector<int64_t> host_block_ids;
+  for (int i = 0; i < kNumBlocks; ++i) {
+    block_keys.push_back(
+        env.mapper->MapKey(absl::StrCat("block_single_", i), {.rank = 0}));
+    dev_block_ids.push_back(i);
+    host_block_ids.push_back(i);
+  }
+
+  // 1. Offload via D2hWriteToBackend
+  auto d2h_or = manager.D2hWriteToBackend({env.backend}, block_keys,
+                                          dev_block_ids, host_block_ids);
+  ASSERT_TRUE(d2h_or.ok()) << d2h_or.status().ToString();
+  EXPECT_TRUE(d2h_or->Await().ok());
+  EXPECT_TRUE(manager.dispatch_d2h_called_);
+
+  // 2. Verify byte-for-byte fidelity on disk for each layer slice
+  const size_t total_block_bytes = kNumLayers * kNumShards * kBlockSize;
+  for (int i = 0; i < kNumBlocks; ++i) {
+    std::ifstream file(block_keys[i].resolved_key, std::ios::binary);
+    ASSERT_TRUE(file.is_open())
+        << "File not found: " << block_keys[i].resolved_key;
+    std::vector<uint8_t> file_data(total_block_bytes);
+    file.read(reinterpret_cast<char*>(file_data.data()), total_block_bytes);
+    EXPECT_EQ(file.gcount(), total_block_bytes);
+    for (size_t l = 0; l < kNumLayers; ++l) {
+      size_t offset = l * kBlockSize;
+      EXPECT_TRUE(std::all_of(
+          file_data.begin() + offset, file_data.begin() + offset + kBlockSize,
+          [&](uint8_t v) { return v == layer_patterns[l]; }))
+          << "Data mismatch for block " << i << ", layer " << l;
+    }
+  }
+
+  // 3. Clear device and host staging memory
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (int b = 0; b < kNumBlocks; ++b) {
+      std::memset(manager.GetDevicePointer(l, 0, b), 0, kBlockSize);
+      std::memset(manager.GetBlockHostPointer(l, 0, b), 0, kBlockSize);
+    }
+  }
+
+  // 4. Recall via H2dReadFromBackend
+  auto h2d_or = manager.H2dReadFromBackend({env.backend}, block_keys,
+                                           host_block_ids, dev_block_ids);
+  ASSERT_TRUE(h2d_or.ok()) << h2d_or.status().ToString();
+  EXPECT_TRUE(h2d_or->Await().ok());
+  EXPECT_TRUE(manager.h2d_called_);
+
+  // 5. Verify host staging and device memory match patterns bit-for-bit
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (int b = 0; b < kNumBlocks; ++b) {
+      uint8_t* host_ptr = manager.GetBlockHostPointer(l, 0, b);
+      uint8_t* dev_ptr = manager.GetDevicePointer(l, 0, b);
+      EXPECT_TRUE(
+          std::all_of(host_ptr, host_ptr + kBlockSize,
+                      [&](uint8_t v) { return v == layer_patterns[l]; }))
+          << "Host staging block " << b << " layer " << l << " mismatch";
+      EXPECT_TRUE(
+          std::all_of(dev_ptr, dev_ptr + kBlockSize,
+                      [&](uint8_t v) { return v == layer_patterns[l]; }))
+          << "Device block " << b << " layer " << l << " mismatch";
+    }
+  }
+}
+
+TEST(KVCacheManagerTest, MultiSliceOffloadAndRecallContentValidity) {
+  ScopedStorageTestEnv env("multi_slice_test");
+  const size_t kBlockSize = 128;
+  const int kNumBlocks = 2;
+  const size_t kNumLayers = 2;
+  const size_t kNumShards = 2;
+  TestPipelinedBackendKVCacheManager manager(kNumLayers, kNumShards, kBlockSize,
+                                             kNumBlocks);
+
+  auto get_pattern = [](size_t l, size_t s, int b) -> uint8_t {
+    return static_cast<uint8_t>(0x10 * l + 0x04 * s + b + 1);
+  };
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t s = 0; s < kNumShards; ++s) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        std::memset(manager.GetDevicePointer(l, s, b), get_pattern(l, s, b),
+                    kBlockSize);
+      }
+    }
+  }
+
+  std::vector<backends::BlockKey> block_keys;
+  block_keys.reserve(kNumBlocks);
+  std::vector<int64_t> dev_block_ids;
+  std::vector<int64_t> host_block_ids;
+  for (int i = 0; i < kNumBlocks; ++i) {
+    block_keys.push_back(
+        env.mapper->MapKey(absl::StrCat("block_multislice_", i), {.rank = 0}));
+    dev_block_ids.push_back(i);
+    host_block_ids.push_back(i);
+  }
+
+  // 1. Offload via D2hWriteToBackend
+  auto d2h_or = manager.D2hWriteToBackend({env.backend}, block_keys,
+                                          dev_block_ids, host_block_ids);
+  ASSERT_TRUE(d2h_or.ok()) << d2h_or.status().ToString();
+  EXPECT_TRUE(d2h_or->Await().ok());
+
+  // 2. Verify on-disk contiguous slice layout: layer-major, shard-minor
+  const size_t total_block_bytes = kNumLayers * kNumShards * kBlockSize;
+  for (int b = 0; b < kNumBlocks; ++b) {
+    std::ifstream file(block_keys[b].resolved_key, std::ios::binary);
+    ASSERT_TRUE(file.is_open())
+        << "File not found: " << block_keys[b].resolved_key;
+    std::vector<uint8_t> file_data(total_block_bytes);
+    file.read(reinterpret_cast<char*>(file_data.data()), total_block_bytes);
+    EXPECT_EQ(file.gcount(), total_block_bytes);
+    for (size_t l = 0; l < kNumLayers; ++l) {
+      for (size_t s = 0; s < kNumShards; ++s) {
+        size_t slice_idx = l * kNumShards + s;
+        size_t offset = slice_idx * kBlockSize;
+        uint8_t expected_val = get_pattern(l, s, b);
+        EXPECT_TRUE(std::all_of(file_data.begin() + offset,
+                                file_data.begin() + offset + kBlockSize,
+                                [&](uint8_t v) { return v == expected_val; }))
+            << "Data mismatch for block " << b << ", layer " << l << ", shard "
+            << s;
+      }
+    }
+  }
+
+  // 3. Clear device and host staging memory
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t s = 0; s < kNumShards; ++s) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        std::memset(manager.GetDevicePointer(l, s, b), 0, kBlockSize);
+        std::memset(manager.GetBlockHostPointer(l, s, b), 0, kBlockSize);
+      }
+    }
+  }
+
+  // 4. Recall via H2dReadFromBackend
+  auto h2d_or = manager.H2dReadFromBackend({env.backend}, block_keys,
+                                           host_block_ids, dev_block_ids);
+  ASSERT_TRUE(h2d_or.ok()) << h2d_or.status().ToString();
+  EXPECT_TRUE(h2d_or->Await().ok());
+
+  // 5. Verify post-recall content validity across all slices
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t s = 0; s < kNumShards; ++s) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        uint8_t* host_ptr = manager.GetBlockHostPointer(l, s, b);
+        uint8_t* dev_ptr = manager.GetDevicePointer(l, s, b);
+        uint8_t expected_val = get_pattern(l, s, b);
+        EXPECT_TRUE(std::all_of(host_ptr, host_ptr + kBlockSize,
+                                [&](uint8_t v) { return v == expected_val; }))
+            << "Host staging mismatch: block " << b << ", layer " << l
+            << ", shard " << s;
+        EXPECT_TRUE(std::all_of(dev_ptr, dev_ptr + kBlockSize,
+                                [&](uint8_t v) { return v == expected_val; }))
+            << "Device mismatch: block " << b << ", layer " << l << ", shard "
+            << s;
+      }
+    }
+  }
 }
 
 }  // namespace

@@ -38,6 +38,8 @@
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 #include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata_shm.h"
@@ -134,16 +136,22 @@ class KVCacheStore {
   // hosts a controller (num_shards > 0), Create() keeps the crash-persistent
   // KVCacheMetadata table in shared memory too.
 
-  // Safe factory method to create KVCacheStore from a single BackendConfig.
+  // Safe factory method to create KVCacheStore from a single BackendConfig
+  // with optional secondary backend configs.
   static absl::StatusOr<std::unique_ptr<KVCacheStore>> Create(
       const BackendConfig& config, size_t capacity = 0,
       absl::string_view global_registry_address = "", RaidenId raiden_id = {},
       int num_shards = 0, int64_t shard_size_bytes = 0,
       absl::string_view store_server_ip = "", int raiden_controller_port = 0,
       std::optional<KVCacheMetadata> metadata = std::nullopt,
-      int expected_worker_count = 0);
+      int expected_worker_count = 0,
+      absl::Span<const BackendConfig> secondary_backend_configs = {});
 
   // Safe factory method to create KVCacheStore from a list of BackendConfigs.
+  // backend_configs[0] specifies Tier 0 (Host DRAM). Any additional configs
+  // (backend_configs[1..]) specify secondary backends.
+  // If backend_configs has size 1, checks RAIDEN_SECONDARY_BACKENDS in the
+  // environment for secondary backends.
   static absl::StatusOr<std::unique_ptr<KVCacheStore>> Create(
       absl::Span<const BackendConfig> backend_configs, size_t capacity = 0,
       absl::string_view global_registry_address = "", RaidenId raiden_id = {},
@@ -390,6 +398,10 @@ class KVCacheStore {
     return backends_;
   }
 
+  const std::vector<BackendConfig>& backend_configs() const {
+    return backend_configs_;
+  }
+
   const std::shared_ptr<KVCacheStoreBackend>& backend() const {
     return backends_[0];
   }
@@ -514,6 +526,7 @@ class KVCacheStore {
 
 
 
+
   // Starts (if needed) the peer-facing store server, computes
   // store_server_address_, and publishes it to the global registry.
   // Idempotent: SetRaidenController may be called more than once, and Create
@@ -559,6 +572,7 @@ class KVCacheStore {
 
   mutable absl::Mutex mutex_;
   std::vector<std::shared_ptr<KVCacheStoreBackend>> backends_;
+  std::vector<BackendConfig> backend_configs_;
   std::shared_ptr<global_registry::GlobalRegistryClient> registry_client_;
   RaidenId raiden_id_;
   std::unique_ptr<tpu_raiden::controller::RaidenController> raiden_controller_;

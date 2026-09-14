@@ -82,6 +82,13 @@ struct StoreMonitorConfig {
 };
 
 struct BackendConfig {
+  BackendConfig() = default;
+  BackendConfig(std::string type, size_t capacity = 0,
+                absl::flat_hash_map<std::string, std::string> properties = {})
+      : type(std::move(type)),
+        capacity(capacity),
+        properties(std::move(properties)) {}
+
   std::string type;
   size_t capacity = 0;
   std::string global_registry_address;

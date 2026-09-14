@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -143,15 +144,19 @@ class RaidenController {
       absl::string_view worker_id, absl::Span<const Buffer> src_buffers,
       absl::Span<const Buffer> dst_buffers,
       absl::Span<const Buffer> staging_host_buffers = {},
-      absl::Span<const int64_t> copy_sizes = {});
+      absl::Span<const int64_t> copy_sizes = {},
+      absl::Span<const ::tpu_sync::proto::BackendTransferSpec> backend_specs =
+          {});
 
   // Broadcast transfer to all registered workers (staging_host_buffers as
-  // above).
+  // above). If backend_specs is empty, pure in-memory transfer is executed.
   tsl::Future<> TransferBuffers(
       absl::Span<const Buffer> src_buffers,
       absl::Span<const Buffer> dst_buffers,
       absl::Span<const Buffer> staging_host_buffers = {},
-      absl::Span<const int64_t> copy_sizes = {});
+      absl::Span<const int64_t> copy_sizes = {},
+      absl::Span<const ::tpu_sync::proto::BackendTransferSpec> backend_specs =
+          {});
 
   // Reads blocks from a remote source, receiver-initiated: this controller's
   // own workers pull the bytes, so the write window belongs to the destination
@@ -254,7 +259,9 @@ class RaidenController {
       absl::Span<const Buffer> src_buffers,
       absl::Span<const Buffer> dst_buffers,
       absl::Span<const Buffer> staging_host_buffers = {},
-      absl::Span<const int64_t> copy_sizes = {});
+      absl::Span<const int64_t> copy_sizes = {},
+      absl::Span<const ::tpu_sync::proto::BackendTransferSpec>
+          worker_backend_specs = {});
 
  private:
   RaidenController(const ::tpu_sync::rpc::RaidenIdProto& unit, int num_blocks,

@@ -16,6 +16,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -30,8 +32,10 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -44,6 +48,9 @@
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
@@ -1410,6 +1417,407 @@ TEST_F(RaidenControllerTest, TransferBuffersRemoteDramToLocalHbmSuccess) {
   EXPECT_EQ(mock_mgr.last_peer, "remote_host:9090");
   EXPECT_THAT(mock_mgr.last_src_offsets, ElementsAre(0));
   EXPECT_THAT(mock_mgr.last_dst_offsets, ElementsAre(1));
+}
+
+class MockBackendManager : public MockTransferManager {
+ public:
+  std::shared_ptr<kv_cache::backends::KVBackend> GetKVBackend(
+      absl::string_view backend_name) const {
+    auto it = backends.find(backend_name);
+    return it != backends.end() ? it->second : nullptr;
+  }
+
+  void InitializeSecondaryBackends(
+      absl::Span<const kv_cache::BackendConfig> secondary_backend_configs) {
+    for (const auto& cfg : secondary_backend_configs) {
+      if (!absl::EqualsIgnoreCase(cfg.type, "PosixKVCacheStoreBackend")) {
+        continue;
+      }
+      const std::string canonical_name = "PosixKVCacheStoreBackend";
+      if (GetKVBackend(canonical_name) != nullptr) continue;
+      auto merged_props = kv_cache::backends::ResolveBackendProperties(
+          canonical_name, cfg.properties);
+      auto backend =
+          std::make_shared<kv_cache::backends::storage::PosixKVBackend>(
+              canonical_name, merged_props);
+      RegisterKVBackend(canonical_name, std::move(backend));
+    }
+  }
+
+  void InitializeSecondaryBackendsFromEnvConfig() {
+    const char* env_backends = std::getenv("RAIDEN_SECONDARY_BACKENDS");
+    if (!env_backends || std::string_view(env_backends).empty()) {
+      return;
+    }
+    for (absl::string_view entry :
+         absl::StrSplit(env_backends, ',', absl::SkipEmpty())) {
+      std::string backend_name = std::string(absl::StripAsciiWhitespace(entry));
+      if (backend_name.empty()) continue;
+      if (GetKVBackend(backend_name) != nullptr) continue;
+
+      if (absl::EqualsIgnoreCase(backend_name, "posix") ||
+          absl::EqualsIgnoreCase(backend_name, "lustre")) {
+        auto backend =
+            std::make_shared<kv_cache::backends::storage::PosixKVBackend>(
+                backend_name,
+                kv_cache::backends::ResolveBackendProperties(backend_name));
+        RegisterKVBackend(backend_name, std::move(backend));
+      }
+    }
+  }
+
+  void InitializeSecondaryBackendsFromConfig() {
+    InitializeSecondaryBackendsFromEnvConfig();
+  }
+};
+
+// ===========================================================================
+// Secondary Backend Registration & Worker Transfer Dispatch
+// ===========================================================================
+
+TEST_F(RaidenControllerTest, WorkerBackendLookup) {
+  MockBackendManager mgr;
+  KVManagerHolder holder(&mgr);
+
+  EXPECT_EQ(holder.GetKVBackend("posix"), nullptr);
+  ::setenv("RAIDEN_SECONDARY_BACKENDS", "posix", 1);
+  holder.InitializeSecondaryBackendsFromEnvConfig();
+  ::unsetenv("RAIDEN_SECONDARY_BACKENDS");
+
+  EXPECT_NE(holder.GetKVBackend("posix"), nullptr);
+  EXPECT_EQ(holder.GetKVBackend("posix")->name(), "posix");
+  EXPECT_EQ(holder.GetKVBackend("nonexistent"), nullptr);
+}
+
+TEST_F(RaidenControllerTest, InitializeSecondaryBackendsProgrammaticConfig) {
+  ::setenv("RAIDEN_BACKEND_EXTRA_IO_THREADS", "8", 1);
+  ::setenv("RAIDEN_BACKEND_EXTRA_POSIX_IO_THREADS", "16", 1);
+  ::setenv("RAIDEN_BACKEND_EXTRA_SHARED_OPT", "from_env", 1);
+
+  std::vector<kv_cache::BackendConfig> configs;
+  kv_cache::BackendConfig cfg;
+  cfg.type = "PosixKVCacheStoreBackend";
+  cfg.SetProperty("io_threads", "32");
+
+  configs.push_back(cfg);
+
+  MockBackendManager mgr;
+  KVManagerHolder holder(&mgr);
+  holder.InitializeSecondaryBackends(configs);
+
+  auto posix = holder.GetKVBackend("PosixKVCacheStoreBackend");
+  ASSERT_NE(posix, nullptr);
+  EXPECT_EQ(posix->GetIntProperty("io_threads"), 32);
+  EXPECT_EQ(posix->GetProperty("shared_opt"), "from_env");
+
+  ::unsetenv("RAIDEN_BACKEND_EXTRA_IO_THREADS");
+  ::unsetenv("RAIDEN_BACKEND_EXTRA_POSIX_IO_THREADS");
+  ::unsetenv("RAIDEN_BACKEND_EXTRA_SHARED_OPT");
+}
+
+TEST_F(RaidenControllerTest,
+       ExecuteTransferBuffersWithBackendSpecWithoutRpcHandshake) {
+  ::setenv("RAIDEN_SECONDARY_BACKENDS", "posix", 1);
+  MockBackendManager mock_mgr;
+  mock_mgr.InitializeSecondaryBackendsFromEnvConfig();
+  ::unsetenv("RAIDEN_SECONDARY_BACKENDS");
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock_mgr));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/1,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto src_buffers, controller->AllocateBuffers(1));
+  src_buffers[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto dst_buffers, controller->AllocateBuffers(1));
+  dst_buffers[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+
+  ::tpu_sync::proto::BackendTransferSpec backend_spec;
+  backend_spec.set_direction(::tpu_sync::proto::TRANSFER_DIR_OFFLOAD);
+  backend_spec.set_name("posix");
+  backend_spec.add_block_hashes("block0");
+
+  // TransferBuffers accepts backend_spec directly; no RegisterBackends RPC
+  // handshake needed!
+  auto status = controller->TransferBuffers(src_buffers, dst_buffers,
+                                            /*staging_host_buffers=*/{},
+                                            /*copy_sizes=*/{}, {backend_spec});
+  auto transfer_status = status.Await();
+  EXPECT_TRUE(transfer_status.ok()) << transfer_status.message();
+  EXPECT_EQ(mock_mgr.d2h_write_to_backend_calls, 1);
+  ASSERT_EQ(mock_mgr.last_d2h_backend_keys.size(), 1);
+  EXPECT_EQ(mock_mgr.last_d2h_backend_keys[0].block_hash, "block0");
+  EXPECT_THAT(mock_mgr.last_d2h_backend_keys[0].resolved_key,
+              ::testing::HasSubstr("block0.bin"));
+}
+
+TEST_F(RaidenControllerTest, TransferBuffersBackendSpecRecallSuccess) {
+  ::setenv("RAIDEN_SECONDARY_BACKENDS", "posix", 1);
+  MockBackendManager mock_mgr;
+  mock_mgr.InitializeSecondaryBackendsFromEnvConfig();
+  ::unsetenv("RAIDEN_SECONDARY_BACKENDS");
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock_mgr));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/1,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  // RECALL: src = Host DRAM Staging, dst = Device HBM
+  TF_ASSERT_OK_AND_ASSIGN(auto src_buffers, controller->AllocateBuffers(1));
+  src_buffers[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto dst_buffers, controller->AllocateBuffers(1));
+  dst_buffers[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+
+  ::tpu_sync::proto::BackendTransferSpec backend_spec;
+  backend_spec.set_direction(::tpu_sync::proto::TRANSFER_DIR_RECALL);
+  backend_spec.set_name("posix");
+  backend_spec.add_block_hashes("recall_block0");
+
+  auto status = controller->TransferBuffers(src_buffers, dst_buffers,
+                                            /*staging_host_buffers=*/{},
+                                            /*copy_sizes=*/{}, {backend_spec});
+  auto transfer_status = status.Await();
+  EXPECT_TRUE(transfer_status.ok()) << transfer_status.message();
+  EXPECT_EQ(mock_mgr.h2d_read_from_backend_calls, 1);
+  ASSERT_EQ(mock_mgr.last_h2d_backend_keys.size(), 1);
+  EXPECT_EQ(mock_mgr.last_h2d_backend_keys[0].block_hash, "recall_block0");
+  EXPECT_THAT(mock_mgr.last_h2d_backend_keys[0].resolved_key,
+              ::testing::HasSubstr("recall_block0.bin"));
+}
+
+TEST_F(RaidenControllerTest, TransferBuffersBackendSpecValidationRejections) {
+  MockTransferManager mock_mgr;
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock_mgr));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/10, /*num_shards=*/1,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  // 1. Mismatch between transfer buffer count and block_hashes
+  TF_ASSERT_OK_AND_ASSIGN(auto src_buffers, controller->AllocateBuffers(2));
+  src_buffers[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  src_buffers[1].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto dst_buffers, controller->AllocateBuffers(2));
+  dst_buffers[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  dst_buffers[1].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+
+  ::tpu_sync::proto::BackendTransferSpec backend_spec;
+  backend_spec.set_direction(::tpu_sync::proto::TRANSFER_DIR_OFFLOAD);
+  backend_spec.set_name("posix");
+  backend_spec.add_block_hashes("block0");  // 1 hash for 2 buffers
+
+  auto status1 = controller
+                     ->TransferBuffers(src_buffers, dst_buffers,
+                                       /*staging_host_buffers=*/{},
+                                       /*copy_sizes=*/{}, {backend_spec})
+                     .Await();
+  EXPECT_FALSE(status1.ok());
+  EXPECT_THAT(status1.message(),
+              testing::HasSubstr("Mismatch between transfer buffer count"));
+
+  // 2. Source and destination buffer count mismatch
+  TF_ASSERT_OK_AND_ASSIGN(auto src_single, controller->AllocateBuffers(1));
+  src_single[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+
+  auto status2 = controller
+                     ->TransferBuffers(src_single, dst_buffers,
+                                       /*staging_host_buffers=*/{},
+                                       /*copy_sizes=*/{}, {backend_spec})
+                     .Await();
+  EXPECT_FALSE(status2.ok());
+  EXPECT_THAT(
+      status2.message(),
+      testing::HasSubstr(
+          "Source and destination buffers must have the same non-zero length"));
+
+  // 3. Empty block_hashes rejection
+  TF_ASSERT_OK_AND_ASSIGN(auto dst_single, controller->AllocateBuffers(1));
+  dst_single[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+
+  ::tpu_sync::proto::BackendTransferSpec empty_spec;
+  empty_spec.set_direction(::tpu_sync::proto::TRANSFER_DIR_OFFLOAD);
+  empty_spec.set_name("posix");
+
+  auto status3 = controller
+                     ->TransferBuffers(src_single, dst_single,
+                                       /*staging_host_buffers=*/{},
+                                       /*copy_sizes=*/{}, {empty_spec})
+                     .Await();
+  EXPECT_FALSE(status3.ok());
+  EXPECT_THAT(status3.message(),
+              testing::HasSubstr("must specify at least one block hash"));
+}
+
+TEST_F(RaidenControllerTest, TransferBuffersBackendSpecMissingMapperFails) {
+  MockTransferManager mock_mgr;
+  class BackendWithoutMapper : public kv_cache::backends::KVBackend {
+   public:
+    std::string name() const override { return "no_mapper"; }
+    void WriteAsync(
+        const kv_cache::backends::BlockKey&,
+        absl::Span<const kv_cache::backends::BackendBufferDescriptor>, size_t,
+        std::function<void(absl::Status)>) override {}
+    void ReadAsync(
+        const kv_cache::backends::BlockKey&,
+        absl::Span<const kv_cache::backends::BackendBufferDescriptor>, size_t,
+        std::function<void(absl::Status)>) override {}
+    void BatchExistsAsync(
+        absl::Span<const kv_cache::backends::BlockKey>,
+        std::function<void(std::vector<absl::StatusOr<bool>>)>) override {}
+  };
+  mock_mgr.RegisterKVBackend("no_mapper",
+                             std::make_shared<BackendWithoutMapper>());
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock_mgr));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/1,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto src_buffers, controller->AllocateBuffers(1));
+  TF_ASSERT_OK_AND_ASSIGN(auto dst_buffers, controller->AllocateBuffers(1));
+
+  ::tpu_sync::proto::BackendTransferSpec backend_spec;
+  backend_spec.set_direction(::tpu_sync::proto::TRANSFER_DIR_OFFLOAD);
+  backend_spec.set_name("no_mapper");
+  backend_spec.add_block_hashes("block0");
+
+  auto status = controller->TransferBuffers(src_buffers, dst_buffers,
+                                            /*staging_host_buffers=*/{},
+                                            /*copy_sizes=*/{}, {backend_spec});
+  auto transfer_status = status.Await();
+  EXPECT_FALSE(transfer_status.ok());
+  EXPECT_THAT(transfer_status.message(),
+              testing::HasSubstr("has no mapper configured"));
+}
+
+TEST_F(RaidenControllerTest,
+       TransferBuffersBackendSpecMultiWorkerOffloadAndRecall) {
+  ::setenv("RAIDEN_SECONDARY_BACKENDS", "posix", 1);
+  MockBackendManager mock_mgr_0;
+  mock_mgr_0.InitializeSecondaryBackendsFromEnvConfig();
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock_mgr_0));
+
+  auto test_server_1 = CreateTestWorkerServer();
+  MockBackendManager mock_mgr_1;
+  mock_mgr_1.InitializeSecondaryBackendsFromEnvConfig();
+  test_server_1->service->SetTransferManager(KVManagerHolder(&mock_mgr_1));
+  ::unsetenv("RAIDEN_SECONDARY_BACKENDS");
+
+  std::vector<std::string> addresses = {test_server_->server_address,
+                                        test_server_1->server_address};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, addresses, /*num_blocks=*/10,
+                               /*num_shards=*/2, /*shard_size_bytes=*/512, ""));
+
+  TF_ASSERT_OK_AND_ASSIGN(auto src_buffers, controller->AllocateBuffers(2));
+  src_buffers[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  src_buffers[1].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto dst_buffers, controller->AllocateBuffers(2));
+  dst_buffers[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  dst_buffers[1].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+
+  // 1. Multi-Worker Offload: broadcast a single BackendTransferSpec across all
+  // workers
+  ::tpu_sync::proto::BackendTransferSpec offload_spec;
+  offload_spec.set_direction(::tpu_sync::proto::TRANSFER_DIR_OFFLOAD);
+  offload_spec.set_name("posix");
+  offload_spec.add_block_hashes("block0");
+  offload_spec.add_block_hashes("block1");
+
+  auto offload_status = controller
+                            ->TransferBuffers(src_buffers, dst_buffers,
+                                              /*staging_host_buffers=*/{},
+                                              /*copy_sizes=*/{}, {offload_spec})
+                            .Await();
+  EXPECT_TRUE(offload_status.ok()) << offload_status.message();
+
+  // Assert both worker managers received the offload dispatch
+  EXPECT_EQ(mock_mgr_0.d2h_write_to_backend_calls, 1);
+  EXPECT_EQ(mock_mgr_1.d2h_write_to_backend_calls, 1);
+  ASSERT_EQ(mock_mgr_0.last_d2h_backend_keys.size(), 2);
+  ASSERT_EQ(mock_mgr_1.last_d2h_backend_keys.size(), 2);
+  EXPECT_EQ(mock_mgr_0.last_d2h_backend_keys[0].block_hash, "block0");
+  EXPECT_EQ(mock_mgr_0.last_d2h_backend_keys[1].block_hash, "block1");
+  EXPECT_EQ(mock_mgr_1.last_d2h_backend_keys[0].block_hash, "block0");
+  EXPECT_EQ(mock_mgr_1.last_d2h_backend_keys[1].block_hash, "block1");
+
+  // 2. Multi-Worker Recall: broadcast recall spec across all workers
+  TF_ASSERT_OK_AND_ASSIGN(auto recall_src, controller->AllocateBuffers(2));
+  recall_src[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  recall_src[1].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto recall_dst, controller->AllocateBuffers(2));
+  recall_dst[0].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  recall_dst[1].set_memory_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+
+  ::tpu_sync::proto::BackendTransferSpec recall_spec;
+  recall_spec.set_direction(::tpu_sync::proto::TRANSFER_DIR_RECALL);
+  recall_spec.set_name("posix");
+  recall_spec.add_block_hashes("block0");
+  recall_spec.add_block_hashes("block1");
+
+  auto recall_status = controller
+                           ->TransferBuffers(recall_src, recall_dst,
+                                             /*staging_host_buffers=*/{},
+                                             /*copy_sizes=*/{}, {recall_spec})
+                           .Await();
+  EXPECT_TRUE(recall_status.ok()) << recall_status.message();
+
+  // Assert both worker managers received the recall dispatch
+  EXPECT_EQ(mock_mgr_0.h2d_read_from_backend_calls, 1);
+  EXPECT_EQ(mock_mgr_1.h2d_read_from_backend_calls, 1);
+  ASSERT_EQ(mock_mgr_0.last_h2d_backend_keys.size(), 2);
+  ASSERT_EQ(mock_mgr_1.last_h2d_backend_keys.size(), 2);
+  EXPECT_EQ(mock_mgr_0.last_h2d_backend_keys[0].block_hash, "block0");
+  EXPECT_EQ(mock_mgr_0.last_h2d_backend_keys[1].block_hash, "block1");
+  EXPECT_EQ(mock_mgr_1.last_h2d_backend_keys[0].block_hash, "block0");
+  EXPECT_EQ(mock_mgr_1.last_h2d_backend_keys[1].block_hash, "block1");
+}
+
+TEST_F(RaidenControllerTest, TransferBuffersRejectsMoreThanOneBackendSpec) {
+  MockTransferManager mock_mgr;
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock_mgr));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/1,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto src_buffers, controller->AllocateBuffers(1));
+  TF_ASSERT_OK_AND_ASSIGN(auto dst_buffers, controller->AllocateBuffers(1));
+
+  ::tpu_sync::proto::BackendTransferSpec spec1;
+  spec1.set_direction(::tpu_sync::proto::TRANSFER_DIR_OFFLOAD);
+  spec1.set_name("posix");
+  spec1.add_block_hashes("block0");
+
+  ::tpu_sync::proto::BackendTransferSpec spec2;
+  spec2.set_direction(::tpu_sync::proto::TRANSFER_DIR_OFFLOAD);
+  spec2.set_name("lustre");
+  spec2.add_block_hashes("block0");
+
+  auto status = controller->TransferBuffers(src_buffers, dst_buffers,
+                                            /*staging_host_buffers=*/{},
+                                            /*copy_sizes=*/{}, {spec1, spec2});
+  auto transfer_status = status.Await();
+  EXPECT_FALSE(transfer_status.ok());
+  EXPECT_THAT(transfer_status.message(),
+              testing::HasSubstr("supports at most 1 secondary backend_spec"));
 }
 
 }  // namespace

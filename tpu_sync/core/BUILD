@@ -338,6 +338,7 @@ cc_library(
     deps = [
         ":raiden_transfer_endpoint",
         ":raw_transfer_core",
+        "//tpu_sync/kv_cache/backends:backend",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
@@ -391,6 +392,7 @@ cc_test(
         ":kv_manager_holder",
         ":raiden_transfer_endpoint",
         "//tpu_sync/core/controller:test_util",
+        "//tpu_sync/kv_cache/backends:backend",
         "@com_google_googletest//:gtest_main",
     ],
 )

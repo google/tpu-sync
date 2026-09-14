@@ -36,9 +36,11 @@
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/escaping.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
@@ -51,6 +53,7 @@
 #include "tpu_sync/core/buffer.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/host_memory_allocator.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/completion_executor.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
@@ -66,6 +69,17 @@ namespace tpu_raiden {
 namespace kv_cache {
 
 namespace {
+
+int DetermineClusterTpSize(const controller::RaidenController* controller) {
+  if (controller == nullptr) return 1;
+  if (controller->worker_registry() &&
+      !controller->worker_registry()->GetRegisteredWorkers().empty()) {
+    return static_cast<int>(
+        controller->worker_registry()->GetRegisteredWorkers().size());
+  }
+  if (controller->num_shards() > 0) return controller->num_shards();
+  return 1;
+}
 
 // Registration TTL, in heartbeat periods: the registration survives two
 // missed heartbeats and expires on the third. A lapse is cheap to recover
@@ -151,6 +165,19 @@ absl::Status ValidateBackends(
     return absl::InvalidArgumentError(
         "KVCacheStore's tier-0 backend must not be null.");
   }
+  // Enforce at most 1 secondary backend.
+  size_t num_secondary = 0;
+  for (size_t i = 1; i < backends.size(); ++i) {
+    if (backends[i] && !backends[i]->name().empty()) {
+      ++num_secondary;
+    }
+  }
+  if (num_secondary > 1) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "KVCacheStore currently supports at most 1 secondary backend, "
+        "but found ",
+        num_secondary, "."));
+  }
   return absl::OkStatus();
 }
 
@@ -172,7 +199,31 @@ MakeRaidenController(const RaidenId& raiden_id, size_t capacity, int num_shards,
       /*preprovision_worker_buffers=*/false, expected_worker_count);
 }
 
+// Resolves backend default properties and ensures that cluster dimensions
+// (e.g., tp_size) are explicitly configured on the secondary backend config.
+BackendConfig ResolveSecondaryBackendConfigDefaults(BackendConfig sec_cfg,
+                                                    int num_shards) {
+  sec_cfg.properties =
+      backends::ResolveBackendProperties(sec_cfg.type, sec_cfg.properties);
+
+  if (!sec_cfg.HasProperty("tp_size")) {
+    sec_cfg.SetProperty("tp_size",
+                        std::to_string(num_shards > 0 ? num_shards : 1));
+  }
+  if (!sec_cfg.HasProperty("model_name")) {
+    sec_cfg.SetProperty("model_name", "unknown");
+  }
+  if (!sec_cfg.HasProperty("root_dir")) {
+    std::string root = sec_cfg.GetProperty("storage_root");
+    sec_cfg.SetProperty("root_dir",
+                        root.empty() ? "/tmp/raiden_storage" : root);
+  }
+  return sec_cfg;
+}
+
 }  // namespace
+
+// --- KVCacheStore Implementation ---
 
 absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
     absl::Span<const BackendConfig> backend_configs, size_t capacity,
@@ -233,6 +284,38 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
   }
 
   RaidenId effective_raiden_id = effective_config0.raiden_id;
+
+  std::vector<BackendConfig> effective_configs(backend_configs.begin(),
+                                               backend_configs.end());
+
+  if (effective_configs.size() == 1) {
+    const char* env_backends = std::getenv("RAIDEN_SECONDARY_BACKENDS");
+    if (env_backends != nullptr && !std::string_view(env_backends).empty()) {
+      for (absl::string_view btype :
+           absl::StrSplit(env_backends, ',', absl::SkipEmpty())) {
+        std::string trimmed_type =
+            std::string(absl::StripAsciiWhitespace(btype));
+        if (trimmed_type.empty()) continue;
+        BackendConfig sec_cfg;
+        sec_cfg.type = trimmed_type;
+        effective_configs.push_back(ResolveSecondaryBackendConfigDefaults(
+            std::move(sec_cfg), num_shards));
+      }
+    }
+  } else {
+    for (size_t i = 1; i < effective_configs.size(); ++i) {
+      effective_configs[i] = ResolveSecondaryBackendConfigDefaults(
+          std::move(effective_configs[i]), num_shards);
+    }
+  }
+
+  if (effective_configs.size() > 2) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("TPU Raiden currently supports at most 1 secondary "
+                     "backend, but found ",
+                     effective_configs.size() - 1, "."));
+  }
+
   std::unique_ptr<::tpu_raiden::controller::RaidenController> raiden_controller;
   if (num_shards > 0) {
     ABSL_ASSIGN_OR_RETURN(
@@ -243,21 +326,24 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
   }
 
   std::vector<std::shared_ptr<KVCacheStoreBackend>> backends;
-  backends.reserve(backend_configs.size());
+  backends.reserve(effective_configs.size());
 
-  for (size_t i = 0; i < backend_configs.size(); ++i) {
-    const auto& config = backend_configs[i];
+  for (size_t i = 0; i < effective_configs.size(); ++i) {
+    const auto& config = effective_configs[i];
     BackendConfig effective_config = (i == 0) ? effective_config0 : config;
 
-    // Apply global registry address and raiden_id across all backend
-    // configurations
-    if (effective_config.global_registry_address.empty() &&
-        !global_registry_address.empty()) {
-      effective_config.global_registry_address =
-          std::string(global_registry_address);
-    }
-    if (effective_config.raiden_id.empty() && !raiden_id.empty()) {
-      effective_config.raiden_id = raiden_id;
+    // Apply global registry address and raiden_id to tier 0
+    // (HostOffloadBackend).
+    // TODO: Revisit secondary tier registration with global registry.
+    if (i == 0) {
+      if (effective_config.global_registry_address.empty() &&
+          !global_registry_address.empty()) {
+        effective_config.global_registry_address =
+            std::string(global_registry_address);
+      }
+      if (effective_config.raiden_id.empty() && !raiden_id.empty()) {
+        effective_config.raiden_id = raiden_id;
+      }
     }
 
     ABSL_ASSIGN_OR_RETURN(auto backend,
@@ -281,6 +367,8 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
   auto store = absl::WrapUnique(new KVCacheStore(
       std::move(backends), effective_raiden_id, std::move(raiden_controller),
       store_server_ip, global_registry_address));
+  store->backend_configs_.assign(backend_configs.begin(),
+                                 backend_configs.end());
 
   // Before SetRaidenController: the registration published there carries
   // these attributes.
@@ -409,6 +497,7 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
     store->store_monitor_->Start();
   }
 
+  store->backend_configs_ = std::move(effective_configs);
   return store;
 }
 
@@ -417,11 +506,23 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
     absl::string_view global_registry_address, RaidenId raiden_id,
     int num_shards, int64_t shard_size_bytes, absl::string_view store_server_ip,
     int raiden_controller_port, std::optional<KVCacheMetadata> metadata,
-    int expected_worker_count) {
-  return KVCacheStore::Create(
-      absl::MakeConstSpan(&config, 1), capacity, global_registry_address,
-      raiden_id, num_shards, shard_size_bytes, store_server_ip,
-      raiden_controller_port, std::move(metadata), expected_worker_count);
+    int expected_worker_count,
+    absl::Span<const BackendConfig> secondary_backend_configs) {
+  if (secondary_backend_configs.empty()) {
+    return KVCacheStore::Create(
+        absl::MakeConstSpan(&config, 1), capacity, global_registry_address,
+        raiden_id, num_shards, shard_size_bytes, store_server_ip,
+        raiden_controller_port, std::move(metadata), expected_worker_count);
+  }
+  std::vector<BackendConfig> all_configs;
+  all_configs.reserve(1 + secondary_backend_configs.size());
+  all_configs.push_back(config);
+  all_configs.insert(all_configs.end(), secondary_backend_configs.begin(),
+                     secondary_backend_configs.end());
+  return KVCacheStore::Create(all_configs, capacity, global_registry_address,
+                              raiden_id, num_shards, shard_size_bytes,
+                              store_server_ip, raiden_controller_port,
+                              std::move(metadata), expected_worker_count);
 }
 
 absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::CreateReshardStore(
@@ -900,6 +1001,29 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
                                             .pin_found = pin_found});
 }
 
+// ---------------------------------------------------------------------------
+// Hierarchical Multi-Tier Lookup Fallback Mechanism:
+//
+// In P/D disaggregated and hybrid serving modes, KVCacheStore enforces a
+// strict recall priority across memory and persistent storage tiers:
+//
+//   Tier 0A (Local Host DRAM) -> Tier 0B (Peer RAM) -> Tier 1 (Storage)
+//
+// 1. Tier 0 (`backends_[0]` - HostOffloadBackend):
+//    - Manages both Local Host DRAM (`BlockStatus::LOCAL`) and Peer RAM
+//      (`BlockStatus::REMOTE` discovered via GlobalRegistryClient).
+//    - Local DRAM has highest priority (PCIe / host memory latency).
+//    - Peer RAM has second priority.
+//    - Both are queried in tier 0. If a contiguous prefix matches in Local
+//      or Peer RAM, `accumulated_results` is populated and `start_idx`
+//      advances.
+//
+// 2. Tier 1 (`backends_[1]` - Secondary Storage Backend):
+//    - Generic secondary backend (e.g. file storage, block storage).
+//    - Only queried for remaining block hashes (`subspan(start_idx)`) that
+//      missed BOTH Local DRAM and Peer RAM.
+//    - Matched blocks are returned with `BlockStatus::SHARED_STORAGE`.
+// ---------------------------------------------------------------------------
 absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
     const std::vector<std::string>& block_hashes,
     const LookupOptions& options) {
@@ -1071,6 +1195,132 @@ absl::Status KVCacheStore::SaveLocal(
   }
   const auto& host_block_ids = *host_blocks;
 
+  std::shared_ptr<KVCacheStoreBackend> secondary_backend = nullptr;
+  std::string secondary_backend_name;
+  if (backends_.size() > 1 && backends_[1] != nullptr) {
+    secondary_backend = backends_[1];
+    secondary_backend_name = secondary_backend->name();
+  }
+
+  std::vector<::tpu_sync::proto::BackendTransferSpec> backend_specs;
+  if (secondary_backend != nullptr && !secondary_backend_name.empty()) {
+    ::tpu_sync::proto::BackendTransferSpec spec;
+    spec.set_direction(::tpu_sync::proto::TRANSFER_DIR_OFFLOAD);
+    spec.set_name(secondary_backend_name);
+    for (size_t i = 0; i < block_hashes.size(); ++i) {
+      spec.add_block_hashes(block_hashes[i]);
+    }
+    backend_specs.push_back(std::move(spec));
+  }
+
+  if (!backend_specs.empty()) {
+    std::vector<Buffer> src_buffers;
+    src_buffers.reserve(src_device_block_ids.size());
+    for (int64_t id : src_device_block_ids) {
+      src_buffers.emplace_back(id, std::vector<BufferShard>{}, std::nullopt,
+                               ::tpu_sync::rpc::MEMORY_TYPE_HBM);
+    }
+    std::vector<Buffer> dst_buffers;
+    dst_buffers.reserve(host_block_ids.size());
+    for (int id : host_block_ids) {
+      dst_buffers.emplace_back(id, std::vector<BufferShard>{}, std::nullopt,
+                               ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+    }
+    tsl::Future<> future = raiden_controller_->TransferBuffers(
+        src_buffers, dst_buffers, /*staging_host_buffers=*/{},
+        /*copy_sizes=*/{}, backend_specs);
+    future.OnReady([this, wt_state = wt_state_, host_ram_backend = backend(),
+                    registry_client = registry_client_, raiden_id = raiden_id_,
+                    block_hashes, host_block_ids,
+                    src_device_block_ids](absl::Status status) {
+      if (!status.ok()) {
+        DeallocateBlockIds(host_block_ids);
+        save_tracker_.MarkFailed(block_hashes);
+        if (host_ram_backend != nullptr)
+          host_ram_backend->Release(block_hashes);
+        return;
+      }
+      std::vector<std::string> update_hashes;
+      std::vector<RaidenBlockId> update_slices;
+      update_hashes.reserve(block_hashes.size());
+      update_slices.reserve(block_hashes.size());
+      for (size_t i = 0; i < block_hashes.size(); ++i) {
+        RaidenBlockId block(raiden_id, host_block_ids[i],
+                            src_device_block_ids[i],
+                            BlockStatus::HOST_AND_HBM);
+        update_hashes.push_back(block_hashes[i]);
+        update_slices.push_back(block);
+      }
+      if (!update_hashes.empty() && host_ram_backend != nullptr) {
+        host_ram_backend->Insert(update_hashes, update_slices,
+                                 /*on_host=*/true);
+      }
+      save_tracker_.MarkDone(block_hashes);
+      std::vector<global_registry::Registration> write_through_regs;
+      if (registry_client) {
+        write_through_regs.reserve(block_hashes.size());
+        for (size_t i = 0; i < block_hashes.size(); ++i) {
+          write_through_regs.push_back({
+              .prefix_hash = block_hashes[i],
+              .raiden_id = raiden_id,
+              .block_id = host_block_ids[i],
+          });
+        }
+      }
+      if (!write_through_regs.empty() && registry_client) {
+        const size_t num_blocks = write_through_regs.size();
+        bool admitted = false;
+        {
+          absl::MutexLock wt_lock(wt_state->mutex);
+          admitted = wt_state->in_flight_blocks + num_blocks <=
+                     wt_state->max_in_flight_blocks;
+          if (admitted) {
+            wt_state->in_flight_blocks += num_blocks;
+          } else {
+            LOG_EVERY_N_SEC(WARNING, 5)
+                << "Not advertising " << num_blocks
+                << " saved block(s) to the global registry: "
+                << wt_state->in_flight_blocks
+                << " blocks are already pinned by write-throughs waiting on "
+                   "it, at the bound of "
+                << wt_state->max_in_flight_blocks
+                << ". Peers will not find them; the alternative is pinning "
+                   "them out of reach of eviction until the registry answers, "
+                   "which drains the host block pool.";
+          }
+        }
+        if (!admitted) {
+          if (host_ram_backend != nullptr)
+            host_ram_backend->Release(block_hashes);
+        } else {
+          registry_client
+              ->RegisterAsync(write_through_regs,
+                              global_registry::kUnwaitedMutationTimeout)
+              .OnReady([wt_state, host_ram_backend, saved = block_hashes,
+                        num_blocks](absl::Status s) {
+                {
+                  absl::MutexLock wt_lock(wt_state->mutex);
+                  wt_state->in_flight_blocks -= num_blocks;
+                }
+                if (!s.ok()) {
+                  LOG(WARNING)
+                      << "Async write-through failed after Save: " << s.message();
+                } else {
+                  LOG(INFO) << "Async write-through succeeded after Save for "
+                            << num_blocks << " blocks";
+                }
+                if (host_ram_backend != nullptr)
+                  host_ram_backend->Release(saved);
+              });
+        }
+      } else {
+        if (host_ram_backend != nullptr)
+          host_ram_backend->Release(block_hashes);
+      }
+    });
+    return absl::OkStatus();
+  }
+
   tsl::Future<> future = backend()->Save(
       block_hashes, src_device_block_ids,
       absl::Span<const int32_t>(
@@ -1226,12 +1476,17 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
   }
 
   RaidenId remote_id;
+  bool from_secondary_backend = false;
+  std::string target_backend_name;
   {
     absl::MutexLock lock(mutex_);
 
     BlockStatus first_status = slices[0].status;
     if (first_status == BlockStatus::REMOTE) {
       remote_id = slices[0].raiden_id;
+    } else if (first_status == BlockStatus::SHARED_STORAGE) {
+      from_secondary_backend = true;
+      target_backend_name = slices[0].raiden_id.data_name;
     }
 
     for (size_t i = 0; i < slices.size(); ++i) {
@@ -1250,6 +1505,11 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
         if (existing.raiden_id != remote_id) {
           return absl::InvalidArgumentError(
               "Mixed remote node IDs in a single Load call");
+        }
+      } else if (first_status == BlockStatus::SHARED_STORAGE) {
+        if (existing.status != BlockStatus::SHARED_STORAGE) {
+          return absl::InvalidArgumentError(
+              "Mixed block statuses in a single Load call");
         }
       } else {
         // The caller's pin is what a successful local load consumes, so it has
@@ -1271,6 +1531,90 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
       }
     }
     load_tracker_.AddPending(block_hashes);
+  }
+
+  if (from_secondary_backend) {
+    std::shared_ptr<KVCacheStoreBackend> secondary_backend =
+        (backends_.size() > 1) ? backends_[1] : nullptr;
+    if (!secondary_backend) {
+      absl::MutexLock lock(mutex_);
+      load_tracker_.MarkFailed(block_hashes);
+      return absl::NotFoundError(absl::StrCat(
+          "No registered secondary backend found for: ", target_backend_name));
+    }
+
+    auto host_blocks_or = AllocateBlockIds(block_hashes.size());
+    if (!host_blocks_or.ok()) {
+      absl::MutexLock lock(mutex_);
+      load_tracker_.MarkFailed(block_hashes);
+      return host_blocks_or.status();
+    }
+    const auto& staging_host_block_ids = host_blocks_or.value();
+
+    std::vector<Buffer> src_buffers;
+    src_buffers.reserve(staging_host_block_ids.size());
+    for (int id : staging_host_block_ids) {
+      src_buffers.emplace_back(id, std::vector<BufferShard>{}, std::nullopt,
+                               ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+    }
+    std::vector<Buffer> dst_buffers;
+    dst_buffers.reserve(device_block_ids.size());
+    for (int id : device_block_ids) {
+      dst_buffers.emplace_back(id, std::vector<BufferShard>{}, std::nullopt,
+                               ::tpu_sync::rpc::MEMORY_TYPE_HBM);
+    }
+
+    std::vector<::tpu_sync::proto::BackendTransferSpec> backend_specs;
+    if (secondary_backend != nullptr) {
+      ::tpu_sync::proto::BackendTransferSpec spec;
+      spec.set_direction(::tpu_sync::proto::TRANSFER_DIR_RECALL);
+      spec.set_name(secondary_backend->name());
+      for (size_t i = 0; i < block_hashes.size(); ++i) {
+        spec.add_block_hashes(block_hashes[i]);
+      }
+      backend_specs.push_back(std::move(spec));
+    }
+
+    tsl::Future<> future = raiden_controller_->TransferBuffers(
+        src_buffers, dst_buffers, /*staging_host_buffers=*/{},
+        /*copy_sizes=*/{}, backend_specs);
+
+    future.OnReady([this, &load_tracker = load_tracker_,
+                    block_hashes = std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
+                    staging_host_block_ids,
+                    device_block_ids = std::vector<int>(device_block_ids.begin(), device_block_ids.end()),
+                    slices = std::vector<RaidenBlockId>(slices.begin(), slices.end())](absl::Status status) {
+      if (!status.ok()) {
+        DeallocateBlockIds(staging_host_block_ids);
+        load_tracker.MarkFailed(block_hashes);
+        return;
+      }
+      // Storage recall succeeded.
+      // Retain host DRAM staging blocks instead of deallocating them.
+      // Register them directly into backend() (tier 0 Host Memory) as
+      // HOST_AND_HBM so that Host Memory backend is fully aware of them and
+      // manages their LRU lifecycle. This avoids duplicate staging allocations
+      // and enables future cache hits directly from Host RAM.
+      // Reflect the secondary backend's corresponding RaidenBlockId (slices[i]).
+      std::vector<std::string> update_hashes;
+      std::vector<RaidenBlockId> update_slices;
+      update_hashes.reserve(block_hashes.size());
+      update_slices.reserve(block_hashes.size());
+      for (size_t i = 0; i < block_hashes.size(); ++i) {
+        RaidenBlockId block = (i < slices.size()) ? slices[i] : RaidenBlockId(raiden_id_);
+        block.host_block_id = staging_host_block_ids[i];
+        block.device_block_id = device_block_ids[i];
+        block.status = BlockStatus::HOST_AND_HBM;
+        update_hashes.push_back(block_hashes[i]);
+        update_slices.push_back(block);
+      }
+      if (!update_hashes.empty()) {
+        backend()->Insert(update_hashes, update_slices, /*on_host=*/true);
+      }
+      load_tracker.MarkDone(block_hashes);
+    });
+
+    return absl::OkStatus();
   }
 
   backend()->Load(remote_id, block_hashes,

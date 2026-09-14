@@ -17,6 +17,19 @@ bandwidth number**. This gate blocks a PR that regresses it.
 
 ## Setup
 
+```mermaid
+flowchart LR
+    J[("baselines.json")]
+    J -->|"read: configs, iters, warmup"| M["perf_core.measure()"]
+    M --> R["measured samples"]
+    R -->|"--record mode"| W["floor = median - 3.5*MADσ"]
+    W -->|"overwrite baseline_* and floor_*"| J
+    R -->|"gate mode (default)"| C{"median >= floor_*?"}
+    J -->|"read: floor_*"| C
+    C -->|yes| P["PASS"]
+    C -->|no| F["exit(1) — blocks the CL"]
+```
+
 The gate binary (`h2d_d2h_benchmark_gating.py`) measures, via `perf_core`, the
 aggregate d2h and h2d bandwidth over the node's 8 chips.
 
@@ -75,13 +88,19 @@ A perf-floor failure blocks the PR, unless the author adds `[skip-perf-gate]`
 ## Running it
 
 ```bash
+# Full gate across both JAX and PyTorch (default):
 bazel run -c opt --config=oss --config=ci \
   //tpu_sync/benchmarks:h2d_d2h_benchmark_gating
+
+# Select a single framework:
+bazel run -c opt --config=oss --config=ci \
+  //tpu_sync/benchmarks:h2d_d2h_benchmark_gating -- --framework=torch # or --framework=jax
 ```
 
-In CI it runs as the `h2d_d2h_gating` workload in `benchmark_registry.pbtxt` via
-the `run_benchmarks` workflow (on pull requests). Re-record baselines with the
-`--record` flag (or the record workflow).
+In CI it runs as the unified `h2d_d2h_gating` workload in `benchmark_registry.pbtxt`
+via the `run_benchmarks` workflow (on pull requests), evaluating both frameworks
+on the assigned Cloud TPU runner. Re-record baselines for all frameworks with
+the `--record` flag (or the `h2d_d2h_record` workflow).
 
 ## Scope
 

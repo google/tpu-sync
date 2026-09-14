@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -35,11 +35,16 @@ py_library(
     srcs = ["perf_core.py"],
     visibility = ["//visibility:public"],
     deps = [
+        "//pyglib/contrib/g3_multiprocessing",
+        "//tpu_sync/api/torch:torch_tpu_common_loader",
         "//tpu_sync/frameworks/jax:_tpu_raiden_jax",
         "//tpu_sync/frameworks/jax:jax_test_utils",
+        "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
         "@jax//jax",
         "@pypi//libtpu",
         "@pypi//numpy",
+        "@torch_tpu//shims/torch:pytorch",
+        "@torch_tpu//src/torch_tpu",
     ],
 )
 
@@ -60,6 +65,50 @@ py_binary(
     testonly = True,
     srcs = ["h2d_d2h_benchmark_gating.py"],
     data = ["h2d_d2h_gating_baselines.json"],
+    deps = [
+        ":bap_metrics",
+        ":perf_core",
+        "@com_google_absl_py//absl:app",
+        "@com_google_absl_py//absl/flags",
+        "@pypi//numpy",
+    ],
+)
+
+py_test(
+    name = "h2d_d2h_benchmark_gating_torch_gl",
+    timeout = "long",
+    srcs = ["h2d_d2h_benchmark_gating.py"],
+    args = ["--framework=torch"],
+    data = ["h2d_d2h_gating_baselines.json"],
+    main = "h2d_d2h_benchmark_gating.py",
+    tags = [
+        "cpu:8",
+        "requires-accel-hbm",
+        "requires-ghostlite:8",
+        "requires-net:external",
+    ],
+    deps = [
+        ":bap_metrics",
+        ":perf_core",
+        "@com_google_absl_py//absl:app",
+        "@com_google_absl_py//absl/flags",
+        "@pypi//numpy",
+    ],
+)
+
+py_test(
+    name = "h2d_d2h_benchmark_gating_gl",
+    timeout = "long",
+    srcs = ["h2d_d2h_benchmark_gating.py"],
+    args = ["--framework=jax"],
+    data = ["h2d_d2h_gating_baselines.json"],
+    main = "h2d_d2h_benchmark_gating.py",
+    tags = [
+        "cpu:8",
+        "requires-accel-hbm",
+        "requires-ghostlite:8",
+        "requires-net:external",
+    ],
     deps = [
         ":bap_metrics",
         ":perf_core",

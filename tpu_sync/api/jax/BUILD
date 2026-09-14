@@ -58,9 +58,13 @@ py_test(
     ],
 )
 
+# For remote execution on Forge, use the _gf or _gl targets below.
 py_test(
     name = "kv_cache_store_recovery_e2e_test",
     srcs = ["kv_cache_store_recovery_e2e_test.py"],
+    tags = [
+        "manual",
+    ],
     deps = [
         ":kv_cache_store",
         ":kv_cache_manager_jax_py",

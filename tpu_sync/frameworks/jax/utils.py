@@ -15,6 +15,7 @@
 """Utilities for JAX."""
 
 import contextlib
+import math
 from typing import Tuple
 
 from absl import flags
@@ -22,9 +23,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from tpu_sync.rpc import raiden_controller
-
 # JAX-native open-source profiler imports loaded dynamically on export
+
+from tpu_sync.rpc import raiden_controller
 
 
 flags.DEFINE_string(
@@ -212,9 +213,29 @@ def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
     # Use physical mesh mapping (matching raiden_controller.py use_spec_mapping)
     physical_mesh_shape = list(mesh.devices.shape)
     devices_per_host = num_shards
-    host_subgrid, host_grid = compute_host_subgrid(
-        physical_mesh_shape, devices_per_host
-    )
+    local_subgrid = None
+    try:
+      if (
+          hasattr(mesh, 'local_mesh')
+          and mesh.local_mesh is not None
+          and hasattr(mesh.local_mesh, 'devices')
+      ):
+        local_subgrid = list(mesh.local_mesh.devices.shape)
+    except (AttributeError, ValueError, TypeError):
+      local_subgrid = None
+
+    if (
+        local_subgrid is not None
+        and len(local_subgrid) == len(physical_mesh_shape)
+        and math.prod(local_subgrid) == devices_per_host
+        and all(p % s == 0 for p, s in zip(physical_mesh_shape, local_subgrid))
+    ):
+      host_subgrid = local_subgrid
+      host_grid = [p // s for p, s in zip(physical_mesh_shape, host_subgrid)]
+    else:
+      host_subgrid, host_grid = compute_host_subgrid(
+          physical_mesh_shape, devices_per_host
+      )
 
     host_coords = []
     temp_h = replica_id

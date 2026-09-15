@@ -212,6 +212,7 @@ def _get_global_indices(
     sharding_spec: Optional[list[str]] = None,
     mesh_axes: Optional[list[str]] = None,
     physical_mesh_shape: Optional[list[int]] = None,
+    host_subgrid: Optional[list[int]] = None,
 ) -> list[tuple[int, int]]:
   """Maps local shard indices to global slice indices, handling replication."""
   num_shards = len(shards)
@@ -242,9 +243,23 @@ def _get_global_indices(
 
   if use_spec_mapping:
     devices_per_host = num_shards
-    host_subgrid, host_grid = compute_host_subgrid(
-        physical_mesh_shape, devices_per_host
-    )
+    if (
+        host_subgrid is not None
+        and len(host_subgrid) == len(physical_mesh_shape)
+        and math.prod(host_subgrid) == devices_per_host
+        and all(p % s == 0 for p, s in zip(physical_mesh_shape, host_subgrid))
+    ):
+      subgrid = list(host_subgrid)
+      grid = [p // s for p, s in zip(physical_mesh_shape, subgrid)]
+    else:
+      logging.warning(
+          "host_subgrid not provided or invalid in _get_global_indices; falling"
+          " back to compute_host_subgrid. This fallback is deprecated."
+      )
+      subgrid, grid = compute_host_subgrid(
+          physical_mesh_shape, devices_per_host
+      )
+    host_subgrid, host_grid = subgrid, grid
 
     host_coords = []
     temp_h = replica_id
@@ -1426,6 +1441,7 @@ class RaidenController:
     self.worker_rpc_client = worker_rpc_client or WorkerRpcClient()
     self._registered_variables = {}
     self._registered_control_plane_endpoints: dict[RaidenId, list[str]] = {}
+    self._registered_host_subgrids: dict[RaidenId, list[int]] = {}
 
   def register_work_unit(
       self,
@@ -1443,6 +1459,7 @@ class RaidenController:
       transfer_rank: Optional[int] = None,
       variables: Optional[typing.Sequence[Any]] = None,
       mesh_axes: Optional[typing.Sequence[str]] = None,
+      host_subgrid: Optional[typing.Sequence[int]] = None,
   ) -> None:
     """Registers physical worker shard Data addresses and metadata.
 
@@ -1461,6 +1478,8 @@ class RaidenController:
       transfer_rank: Optional transfer rank.
       variables: Optional list of registered variables metadata.
       mesh_axes: Optional list of mesh axis names (e.g. ['fsdp', 'tp']).
+      host_subgrid: Optional ground-truth local host subgrid shape from JAX
+        (mesh.local_mesh).
     """
     has_metadata = (
         mesh_shape is not None or layout is not None or global_shape is not None
@@ -1554,6 +1573,7 @@ class RaidenController:
     )
     new_transfer_rank = transfer_rank if has_reshard_metadata else None
     new_variables = list(variables) if variables is not None else None
+    new_host_subgrid = list(host_subgrid) if host_subgrid is not None else None
 
     with self._lock:
       is_idempotent = False
@@ -1575,6 +1595,7 @@ class RaidenController:
             == new_transfer_parallelism
             and self._registered_transfer_ranks.get(unit) == new_transfer_rank
             and self._registered_variables.get(unit) == new_variables
+            and self._registered_host_subgrids.get(unit) == new_host_subgrid
         )
 
       if is_idempotent:
@@ -1610,6 +1631,7 @@ class RaidenController:
           self._registered_transfer_parallelism,
           self._registered_transfer_ranks,
           self._registered_variables,
+          self._registered_host_subgrids,
       ):
         registry.pop(unit, None)
       if new_mesh_shape is not None:
@@ -1630,6 +1652,8 @@ class RaidenController:
         self._registered_transfer_ranks[unit] = new_transfer_rank
       if new_variables is not None:
         self._registered_variables[unit] = new_variables
+      if new_host_subgrid is not None:
+        self._registered_host_subgrids[unit] = new_host_subgrid
       if hasattr(self.worker_rpc_client, "unregister_worker_endpoint"):
         self.worker_rpc_client.unregister_worker_endpoint(unit)
       if endpoints and hasattr(
@@ -1942,6 +1966,7 @@ class RaidenController:
           }
           s_phys_mesh = self._registered_mesh_shapes.get(s_unit)
           s_mesh_axes = self._registered_mesh_axes.get(s_unit)
+          s_host_subgrid = self._registered_host_subgrids.get(s_unit)
         num_src_hosts = max(1, len(s_job_reps))
         for s_var in s_vars:
           s_slices_list = computed_slices.get(s_unit, {}).get(s_var.name)
@@ -1956,6 +1981,7 @@ class RaidenController:
               sharding_spec=list(s_var.sharding_spec),
               mesh_axes=s_mesh_axes,
               physical_mesh_shape=s_phys_mesh,
+              host_subgrid=s_host_subgrid,
           )
           for l_s_idx, g_s_idx in s_indices_list:
             if g_s_idx < len(s_slices_list):
@@ -2010,6 +2036,7 @@ class RaidenController:
             }
             src_phys_mesh_shape = self._registered_mesh_shapes.get(src_unit)
             src_mesh_axes = self._registered_mesh_axes.get(src_unit)
+            src_host_subgrid = self._registered_host_subgrids.get(src_unit)
           num_src_physical_hosts = max(1, len(src_job_replicas))
           src_logical_mesh = list(src_var.mesh_shape)
           src_layout = list(src_var.layout)
@@ -2023,6 +2050,7 @@ class RaidenController:
               sharding_spec=list(src_var.sharding_spec),
               mesh_axes=src_mesh_axes,
               physical_mesh_shape=src_phys_mesh_shape,
+              host_subgrid=src_host_subgrid,
           )
 
           for local_src_idx, global_src_idx in src_indices:
@@ -2046,6 +2074,7 @@ class RaidenController:
               dst_shards = []
               dst_phys_mesh_shape = None
               dst_mesh_axes = None
+              dst_host_subgrid = None
               for meta in dst_metadata:
                 meta_unit = _raiden_id_from_proto(meta.unit)
                 if meta_unit == dst_unit:
@@ -2055,6 +2084,9 @@ class RaidenController:
                   )
                   dst_mesh_axes = (
                       list(meta.mesh_axes) if meta.mesh_axes else None
+                  )
+                  dst_host_subgrid = (
+                      list(meta.host_subgrid) if meta.host_subgrid else None
                   )
                   break
               if not dst_shards:
@@ -2080,6 +2112,7 @@ class RaidenController:
                   sharding_spec=list(dst_var.sharding_spec),
                   mesh_axes=dst_mesh_axes,
                   physical_mesh_shape=dst_phys_mesh_shape,
+                  host_subgrid=dst_host_subgrid,
               )
 
               for local_dst_idx, global_dst_idx in dst_indices:
@@ -2425,6 +2458,7 @@ class RaidenController:
     )
     reg_req.mesh_shape.extend(self._registered_mesh_shapes.get(unit, ()))
     reg_req.mesh_axes.extend(self._registered_mesh_axes.get(unit, ()))
+    reg_req.host_subgrid.extend(self._registered_host_subgrids.get(unit, ()))
     reg_req.layout.extend(self._registered_layouts.get(unit, ()))
     reg_req.global_shape.extend(self._registered_global_shapes.get(unit, ()))
     for pool in self._registered_pool_manifests.get(unit, ()):
@@ -3586,6 +3620,7 @@ class RaidenControllerServer:
                 reg.transfer_rank if pool_manifest is not None else None
             )
             variables = list(reg.variables) if reg.variables else None
+            host_subgrid = list(reg.host_subgrid) if reg.host_subgrid else None
 
             self._controller.register_work_unit(
                 unit,
@@ -3602,6 +3637,7 @@ class RaidenControllerServer:
                 transfer_rank=transfer_rank,
                 variables=variables,
                 mesh_axes=mesh_axes,
+                host_subgrid=host_subgrid,
             )
             raiden_resp.success = True
           elif (
@@ -3839,6 +3875,7 @@ class RaidenControllerClientFacade:
       transfer_rank: Optional[int] = None,
       variables: Optional[typing.Sequence[Any]] = None,
       mesh_axes: Optional[typing.Sequence[str]] = None,
+      host_subgrid: Optional[typing.Sequence[int]] = None,
   ) -> None:
     """Sends remote RPC to register a physical worker entity with the central RaidenControllerServer.
 
@@ -3858,6 +3895,8 @@ class RaidenControllerClientFacade:
       transfer_rank: Optional transfer rank.
       variables: Optional list of registered variables metadata.
       mesh_axes: Optional list of mesh axis names (e.g. ['fsdp', 'tp']).
+      host_subgrid: Optional ground-truth local host subgrid shape from JAX
+        (mesh.local_mesh).
     """
     reg_req = self._raiden_proto_module.RegisterWorkUnitRequest(
         unit=self._raiden_id_to_proto(unit),
@@ -3889,6 +3928,8 @@ class RaidenControllerClientFacade:
       reg_req.variables.extend(variables)
     if mesh_axes is not None:
       reg_req.mesh_axes.extend(mesh_axes)
+    if host_subgrid is not None:
+      reg_req.host_subgrid.extend(host_subgrid)
 
     req = self._raiden_proto_module.ControlRequest(
         command=self._raiden_proto_module.ControlRequest.COMMAND_REGISTER_WORK_UNIT,

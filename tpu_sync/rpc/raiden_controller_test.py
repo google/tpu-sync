@@ -1731,6 +1731,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["tp", "fsdp"],
         mesh_axes=["fsdp", "tp"],
         physical_mesh_shape=[2, 8],
+        host_subgrid=[1, 4],
     )
     self.assertEqual(indices, [(0, 8), (1, 10), (2, 12), (3, 14)])
 
@@ -1746,6 +1747,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["fsdp", "tp"],
         mesh_axes=["fsdp", "tp"],
         physical_mesh_shape=[2, 8],
+        host_subgrid=[1, 4],
     )
     self.assertEqual(indices, [(0, 4), (1, 5), (2, 6), (3, 7)])
 
@@ -1762,6 +1764,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["fsdp", "tp"],
         mesh_axes=["fsdp", "tp"],
         physical_mesh_shape=[2, 8],
+        host_subgrid=[1, 8],
     )
     self.assertEqual(indices0, [(i, i) for i in range(8)])
     indices1 = raiden_controller._get_global_indices(
@@ -1773,6 +1776,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["fsdp", "tp"],
         mesh_axes=["fsdp", "tp"],
         physical_mesh_shape=[2, 8],
+        host_subgrid=[1, 8],
     )
     self.assertEqual(indices1, [(i, i + 8) for i in range(8)])
 
@@ -1799,6 +1803,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
           sharding_spec=["fsdp", "tp"],
           mesh_axes=["fsdp", "tp"],
           physical_mesh_shape=[4, 4],
+          host_subgrid=[2, 2],
       )
       self.assertEqual(indices, expected_indices[unit])
 
@@ -1815,6 +1820,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["tp", "fsdp"],
         mesh_axes=["fsdp", "tp"],
         physical_mesh_shape=[2, 8],
+        host_subgrid=[1, 8],
     )
     self.assertEqual(indices0, [(i, i * 2) for i in range(8)])
     indices1 = raiden_controller._get_global_indices(
@@ -1826,6 +1832,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["tp", "fsdp"],
         mesh_axes=["fsdp", "tp"],
         physical_mesh_shape=[2, 8],
+        host_subgrid=[1, 8],
     )
     self.assertEqual(indices1, [(i, i * 2 + 1) for i in range(8)])
 
@@ -1842,6 +1849,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["fsdp"],
         mesh_axes=["fsdp", "tp"],
         physical_mesh_shape=[2, 8],
+        host_subgrid=[1, 8],
     )
     self.assertEqual(indices0, [(i, 0) for i in range(8)])
     indices1 = raiden_controller._get_global_indices(
@@ -1853,6 +1861,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["fsdp"],
         mesh_axes=["fsdp", "tp"],
         physical_mesh_shape=[2, 8],
+        host_subgrid=[1, 8],
     )
     self.assertEqual(indices1, [(i, 1) for i in range(8)])
 
@@ -1869,6 +1878,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["fsdp", "tp"],
         mesh_axes=["data", "fsdp", "tp"],
         physical_mesh_shape=[2, 2, 4],
+        host_subgrid=[1, 2, 4],
     )
     self.assertEqual(indices0, [(i, i) for i in range(8)])
     indices1 = raiden_controller._get_global_indices(
@@ -1880,6 +1890,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["fsdp", "tp"],
         mesh_axes=["data", "fsdp", "tp"],
         physical_mesh_shape=[2, 2, 4],
+        host_subgrid=[1, 2, 4],
     )
     self.assertEqual(indices1, [(i, i) for i in range(8)])
 
@@ -1896,6 +1907,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["fsdp"],
         mesh_axes=["data", "fsdp", "tp"],
         physical_mesh_shape=[2, 2, 4],
+        host_subgrid=[1, 2, 4],
     )
     self.assertEqual(
         indices0,
@@ -1910,6 +1922,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["fsdp"],
         mesh_axes=["data", "fsdp", "tp"],
         physical_mesh_shape=[2, 2, 4],
+        host_subgrid=[1, 2, 4],
     )
     self.assertEqual(
         indices1,
@@ -1933,6 +1946,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["x", "y", "z"],
         mesh_axes=["x", "y", "z"],
         physical_mesh_shape=[4, 4, 4],
+        host_subgrid=[1, 2, 2],
     )
     # Host 0 (0,0,0) -> chips (0,0,0)->0, (0,0,1)->1, (0,1,0)->4, (0,1,1)->5
     self.assertEqual(indices0, [(0, 0), (1, 1), (2, 4), (3, 5)])
@@ -1946,6 +1960,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["x", "y", "z"],
         mesh_axes=["x", "y", "z"],
         physical_mesh_shape=[4, 4, 4],
+        host_subgrid=[1, 2, 2],
     )
     # Host 1 (0,0,1) -> chips (0,0,2)->2, (0,0,3)->3, (0,1,2)->6, (0,1,3)->7
     self.assertEqual(indices1, [(0, 2), (1, 3), (2, 6), (3, 7)])
@@ -1959,6 +1974,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["x", "y", "z"],
         mesh_axes=["x", "y", "z"],
         physical_mesh_shape=[4, 4, 4],
+        host_subgrid=[1, 2, 2],
     )
     # Host 2 (0,1,0) -> chips (0,2,0)->8, (0,2,1)->9, (0,3,0)->12, (0,3,1)->13
     self.assertEqual(indices2, [(0, 8), (1, 9), (2, 12), (3, 13)])
@@ -1978,6 +1994,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["x", "y"],
         mesh_axes=["x", "y", "z"],
         physical_mesh_shape=[4, 4, 4],
+        host_subgrid=[1, 2, 2],
     )
     # Host 0 coords (0,0,0) -> (x,y)=(0,0), (0,0), (0,1), (0,1) -> global (0, 0, 1, 1)
     self.assertEqual(indices0, [(0, 0), (1, 0), (2, 1), (3, 1)])
@@ -1991,6 +2008,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["x", "y"],
         mesh_axes=["x", "y", "z"],
         physical_mesh_shape=[4, 4, 4],
+        host_subgrid=[1, 2, 2],
     )
     # Host 1 coords (0,0,1) -> (x,y)=(0,0), (0,0), (0,1), (0,1) -> global (0, 0, 1, 1)
     self.assertEqual(indices1, [(0, 0), (1, 0), (2, 1), (3, 1)])
@@ -2010,6 +2028,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["x"],
         mesh_axes=["x", "y", "z"],
         physical_mesh_shape=[4, 4, 4],
+        host_subgrid=[1, 2, 2],
     )
     # x=0 on (4, 2) mesh with trailing unpartitioned dim -> global_idx = 0*2 + 0 = 0
     self.assertEqual(indices0, [(0, 0), (1, 0), (2, 0), (3, 0)])
@@ -2025,6 +2044,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         sharding_spec=["x"],
         mesh_axes=["x", "y", "z"],
         physical_mesh_shape=[4, 4, 4],
+        host_subgrid=[1, 2, 2],
     )
     self.assertEqual(indices4, [(0, 2), (1, 2), (2, 2), (3, 2)])
 
@@ -3540,6 +3560,232 @@ class RaidenPlanWarmupTest(absltest.TestCase):
         loop.close()
     finally:
       client.close()
+
+  def test_host_subgrid_enumeration_all_meshes_and_devices_per_host(self):
+    """Verifies that _get_global_indices forms a strict disjoint bijection.
+
+    Enumerates real multi-host TPU configurations across 1D, 2D, and 3D meshes
+    (16 to 128 chips), physical TPU host device counts (4 chips/host on
+    v4/v5p/v6e
+    and 8 chips/host on v2/v3/v5e/v6e), and all valid host_subgrid
+    factorizations.
+    Ensures compute_host_subgrid is bypassed and all devices in the cluster are
+    covered without gaps or collisions.
+    """
+    mesh_shapes = [
+        # 1D meshes (pure data-parallel or tensor-parallel)
+        [16],
+        [32],
+        [64],
+        [128],
+        # 2D meshes (e.g. FSDP x TP, Data x Model on 16, 32, 64, 128 chips)
+        [2, 8],
+        [8, 2],
+        [4, 4],
+        [4, 8],
+        [8, 4],
+        [8, 8],
+        [16, 4],
+        [4, 16],
+        [16, 8],
+        [8, 16],
+        # 3D meshes (physical 3D torus topologies or Data x FSDP x TP)
+        [2, 2, 4],
+        [2, 4, 4],
+        [4, 4, 4],
+        [2, 4, 8],
+        [4, 4, 8],
+    ]
+    # Real TPU host VM architectures have strictly 4 or 8 chips per host.
+    devices_per_host_candidates = [4, 8]
+
+    def find_all_subgrids(
+        shape: list[int], target_prod: int
+    ) -> list[list[int]]:
+      results = []
+
+      def backtrack(dim: int, remaining: int, current: list[int]):
+        if dim == len(shape) - 1:
+          if remaining <= shape[dim] and shape[dim] % remaining == 0:
+            results.append(current + [remaining])
+          return
+        limit = min(remaining, shape[dim])
+        for s in range(1, limit + 1):
+          if remaining % s == 0 and shape[dim] % s == 0:
+            backtrack(dim + 1, remaining // s, current + [s])
+
+      backtrack(0, target_prod, [])
+      return results
+
+    evaluated_cases = 0
+    with mock.patch.object(
+        raiden_controller,
+        "compute_host_subgrid",
+        side_effect=AssertionError(
+            "compute_host_subgrid should not be called!"
+        ),
+    ):
+      for mesh_shape in mesh_shapes:
+        total_devices = math.prod(mesh_shape)
+        mesh_axes = [f"dim_{d}" for d in range(len(mesh_shape))]
+        layout = list(range(len(mesh_shape) - 1, -1, -1))
+
+        for devices_per_host in devices_per_host_candidates:
+          if (
+              devices_per_host > total_devices
+              or total_devices % devices_per_host != 0
+          ):
+            continue
+          total_hosts = total_devices // devices_per_host
+          if total_hosts < 2:
+            continue
+          subgrids = find_all_subgrids(mesh_shape, devices_per_host)
+
+          for subgrid in subgrids:
+            evaluated_cases += 1
+            all_global_indices = set()
+            for host_id in range(total_hosts):
+              unit = raiden_controller.RaidenId(
+                  "worker", str(host_id), "weights"
+              )
+              indices = raiden_controller._get_global_indices(
+                  unit=unit,
+                  shards=["10.0.0.1:8000"] * devices_per_host,
+                  logical_mesh_shape=mesh_shape,
+                  layout=layout,
+                  num_physical_hosts=total_hosts,
+                  sharding_spec=mesh_axes,
+                  mesh_axes=mesh_axes,
+                  physical_mesh_shape=mesh_shape,
+                  host_subgrid=subgrid,
+              )
+              self.assertLen(
+                  indices,
+                  devices_per_host,
+                  f"Wrong shard count for mesh={mesh_shape}, subgrid={subgrid}",
+              )
+              for shard_idx, global_idx in indices:
+                self.assertNotIn(
+                    global_idx,
+                    all_global_indices,
+                    f"Duplicate global index {global_idx} encountered for"
+                    f" mesh={mesh_shape}, dph={devices_per_host},"
+                    f" subgrid={subgrid}, host={host_id}, shard={shard_idx}",
+                )
+                all_global_indices.add(global_idx)
+
+            self.assertEqual(
+                all_global_indices,
+                set(range(total_devices)),
+                "Global indices do not form a complete bijection for"
+                f" mesh={mesh_shape}, dph={devices_per_host},"
+                f" subgrid={subgrid}",
+            )
+
+    self.assertGreater(evaluated_cases, 50)
+
+  def test_register_work_unit_stores_and_serializes_host_subgrid(self):
+    controller = raiden_controller.RaidenController(port=10099)
+    unit = raiden_controller.RaidenId("trainer", "0", "weights")
+    controller.register_work_unit(
+        unit=unit,
+        shards=["10.0.0.1:8000"] * 4,
+        mesh_shape=[4, 8],
+        layout=[1, 0],
+        global_shape=[128, 64],
+        itemsize=4,
+        mesh_axes=["fsdp", "tp"],
+        host_subgrid=[2, 2],
+    )
+    with controller._lock:
+      self.assertEqual(controller._registered_host_subgrids.get(unit), [2, 2])
+      proto = controller._metadata_proto_locked(unit)
+      self.assertEqual(list(proto.host_subgrid), [2, 2])
+
+  def test_qwen_norm_scale_schedule(self):
+    controller = raiden_controller.RaidenController(port=10100)
+    src_units = [
+        raiden_controller.RaidenId("pathways_trainer", str(i), "weights")
+        for i in range(16)
+    ]
+    dst_units = [
+        raiden_controller.RaidenId("mc_jax_sampler", str(i), "weights")
+        for i in range(16)
+    ]
+
+    for i, s_unit in enumerate(src_units):
+      controller.register_work_unit(
+          unit=s_unit,
+          shards=[f"10.0.0.{i}:8000", f"10.0.0.{i}:8001"],
+          mesh_shape=[16, 2],
+          variables=[
+              raiden_service_pb2.VariableMetadataProto(
+                  name="decoder.decoder_norm.scale",
+                  shape=[2048],
+                  mesh_shape=[16],
+                  layout=[0],
+                  item_size=2,
+                  layer_idx=0,
+                  sharding_spec=["fsdp"],
+              )
+          ],
+          mesh_axes=["fsdp", "tp"],
+      )
+
+    for i, d_unit in enumerate(dst_units):
+      controller.register_work_unit(
+          unit=d_unit,
+          shards=[
+              f"10.0.1.{i}:8000",
+              f"10.0.1.{i}:8001",
+              f"10.0.1.{i}:8002",
+              f"10.0.1.{i}:8003",
+          ],
+          mesh_shape=[32, 2],
+          variables=[
+              raiden_service_pb2.VariableMetadataProto(
+                  name="decoder.decoder_norm.scale",
+                  shape=[2048],
+                  mesh_shape=[1],
+                  layout=[0],
+                  item_size=2,
+                  layer_idx=0,
+                  sharding_spec=[""],
+              )
+          ],
+          mesh_axes=["fsdp", "tp"],
+      )
+
+    sched = asyncio.run(
+        controller._compute_transfer_schedule(src_units, dst_units)
+    )
+    # Check coverage for each destination unit and local shard
+    # Each dst shard must receive all 2048 elements (4096 bytes: 2048 * 2 bytes)
+    coverage_by_dst = {}
+    for d_unit in dst_units:
+      for s_idx in range(4):
+        coverage_by_dst[(d_unit, s_idx)] = set()
+    for unit_sched in sched.direct_schedules.values():
+      for entries in unit_sched.values():
+        for entry in entries:
+          dst_peer = entry[0]
+          local_dst_idx = entry[1]
+          dst_offset = entry[2]
+          size = entry[4]
+          d_unit = sched.data_address_to_unit.get(dst_peer)
+          if d_unit:
+            coverage_by_dst[(d_unit, local_dst_idx)].update(
+                range(dst_offset, dst_offset + size)
+            )
+
+    for (d_unit, local_dst_idx), covered_bytes in coverage_by_dst.items():
+      self.assertLen(
+          covered_bytes,
+          4096,
+          f"Dst {d_unit} shard {local_dst_idx} received {len(covered_bytes)}"
+          " bytes instead of 4096! Missing bytes:"
+          f" {set(range(4096)) - covered_bytes}",
+      )
 
 
 if __name__ == "__main__":

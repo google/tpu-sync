@@ -155,6 +155,7 @@ class WeightSynchronizerManager:
       transfer_rank: Optional[int] = None,
       variables: Optional[Sequence[Any]] = None,
       mesh_axes: Optional[Sequence[str]] = None,
+      host_subgrid: Optional[Sequence[int]] = None,
   ) -> None:
     """Registers physical worker shard Data addresses and metadata.
 
@@ -173,6 +174,7 @@ class WeightSynchronizerManager:
       transfer_rank: Optional transfer rank.
       variables: Optional list of registered variables metadata.
       mesh_axes: Optional list of mesh axis names (e.g. ['fsdp', 'tp']).
+      host_subgrid: Optional ground-truth local host subgrid shape from JAX.
     """
     return self._controller.register_work_unit(
         unit=unit,
@@ -189,6 +191,7 @@ class WeightSynchronizerManager:
         transfer_rank=transfer_rank,
         variables=variables,
         mesh_axes=mesh_axes,
+        host_subgrid=host_subgrid,
     )
 
   def clear_plan_cache(self) -> None:

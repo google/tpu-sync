@@ -686,12 +686,15 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   for (size_t i = 0; i < num_shards_; ++i) {
     int64_t global_shard = global_shard_index(i);
     int64_t local_shard = local_shard_index(i);
-    auto it = schedules.find(static_cast<int32_t>(local_shard));
-    if (it == schedules.end()) {
+    auto it = schedules.end();
+    if (global_shard >= 0) {
       it = schedules.find(static_cast<int32_t>(global_shard));
-      if (it == schedules.end()) {
-        continue;
-      }
+    }
+    if (it == schedules.end() && local_shard >= 0) {
+      it = schedules.find(static_cast<int32_t>(local_shard));
+    }
+    if (it == schedules.end()) {
+      continue;
     }
     const auto& schedule = it->second;
 
@@ -1101,14 +1104,45 @@ void WeightSynchronizerBase::DrainPendingH2d() {
     pending_h2d_states_.clear();
     active_h2d_uuids_.clear();
   }
+
+  if (pending_states.empty()) {
+    bool needs_h2d = false;
+    {
+      absl::MutexLock lock(completed_transfers_mu_);
+      needs_h2d = completed_transfers_.empty();
+    }
+    if (needs_h2d) {
+      auto status_or_future = H2d(0);
+      if (status_or_future.ok()) {
+        (void)status_or_future->Await();
+      }
+      absl::MutexLock lock(completed_transfers_mu_);
+      completed_transfers_.insert(0);
+    }
+    return;
+  }
+
   for (auto& [uuid, state] : pending_states) {
-    for (auto& [layer_idx, future] : state.layer_futures) {
-      if (future.valid()) {
-        auto status_or_future = future.get();
+    std::vector<raiden::PjRtCopyFuture> futures_to_await;
+    futures_to_await.reserve(num_layers_);
+    for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
+      auto it = state.layer_futures.find(layer_idx);
+      if (it != state.layer_futures.end() && it->second.valid()) {
+        auto status_or_future = it->second.get();
         if (status_or_future.ok()) {
-          (void)status_or_future->Await();
+          futures_to_await.push_back(std::move(*status_or_future));
+        }
+      } else {
+        auto status_or_future = H2dLayer(layer_idx, uuid);
+        if (status_or_future.ok()) {
+          futures_to_await.push_back(std::move(*status_or_future));
         }
       }
+    }
+    if (!futures_to_await.empty()) {
+      raiden::PjRtCopyFuture joined_future =
+          raiden::JoinPjRtCopyFutures(futures_to_await);
+      (void)joined_future.Await();
     }
     if (uuid > 0) {
       absl::MutexLock lock(completed_transfers_mu_);

@@ -14,6 +14,8 @@
 
 """JAX bindings for WeightSynchronizer FFI, enabling host/device weight synchronization."""
 
+import math
+
 import jax
 from jax.experimental import compute_on
 import jax.numpy as jnp
@@ -27,6 +29,7 @@ def _prepare_shard_info(
     shard_idx: jax.Array,
     mesh: jax.sharding.Mesh,
     num_shards: int,
+    host_subgrid: list[int] | None = None,
 ) -> jax.Array:
   """Packs [shard_idx, local_slot, host_idx] for FFI custom call.
 
@@ -34,15 +37,53 @@ def _prepare_shard_info(
   Otherwise, computes local_slot and host_idx based on the mesh physical layout
   and host subgrid decomposition, and returns a sharded array with shape
   `mesh.devices.shape + (3,)` and PartitionSpec(*mesh.axis_names, None).
+
+  Args:
+    shard_idx: Shard index array.
+    mesh: JAX device mesh.
+    num_shards: Number of local shards (devices per host).
+    host_subgrid: Optional host subgrid shape for shard decomposition.
+
+  Returns:
+    A sharded array containing packed shard information.
   """
   if shard_idx.ndim > len(mesh.axis_names) and shard_idx.shape[-1] >= 3:
     return shard_idx
 
   physical_mesh_shape = list(mesh.devices.shape)
   devices_per_host = num_shards
-  host_subgrid, host_grid = utils.compute_host_subgrid(
-      physical_mesh_shape, devices_per_host
-  )
+  local_subgrid = None
+  try:
+    if (
+        hasattr(mesh, "local_mesh")
+        and mesh.local_mesh is not None
+        and hasattr(mesh.local_mesh, "devices")
+    ):
+      local_subgrid = list(mesh.local_mesh.devices.shape)
+  except (AttributeError, ValueError, TypeError):
+    local_subgrid = None
+
+  if (
+      host_subgrid is not None
+      and len(host_subgrid) == len(physical_mesh_shape)
+      and math.prod(host_subgrid) == devices_per_host
+      and all(p % s == 0 for p, s in zip(physical_mesh_shape, host_subgrid))
+  ):
+    subgrid = list(host_subgrid)
+    grid = [p // s for p, s in zip(physical_mesh_shape, subgrid)]
+  elif (
+      local_subgrid is not None
+      and len(local_subgrid) == len(physical_mesh_shape)
+      and math.prod(local_subgrid) == devices_per_host
+      and all(p % s == 0 for p, s in zip(physical_mesh_shape, local_subgrid))
+  ):
+    subgrid = local_subgrid
+    grid = [p // s for p, s in zip(physical_mesh_shape, subgrid)]
+  else:
+    subgrid, grid = utils.compute_host_subgrid(
+        physical_mesh_shape, devices_per_host
+    )
+  host_subgrid, host_grid = subgrid, grid
 
   local_slots_np = np.zeros(mesh.devices.shape, dtype=np.int32)
   host_indices_np = np.zeros(mesh.devices.shape, dtype=np.int32)
@@ -85,6 +126,7 @@ def init_weight_synchronizer(
     num_layers: int = 1,
     listener_port: int = -1,
     num_shards: int | None = None,
+    host_subgrid: list[int] | None = None,
 ) -> jax.Array:
   """Registers and executes init_weight_synchronizer FFI custom call on each device rank.
 
@@ -102,6 +144,7 @@ def init_weight_synchronizer(
       (`-1` to initialize new).
     num_shards: Number of local shards (devices per host). If None, calculated
       from mesh.
+    host_subgrid: Optional host subgrid shape for shard decomposition.
 
   Returns:
     A sharded 1D int32 array containing synchronization metadata (`out_dim=6` if
@@ -111,7 +154,9 @@ def init_weight_synchronizer(
     num_processes = len(set(d.process_index for d in mesh.devices.flatten()))
     num_shards = mesh.devices.size // num_processes
 
-  shard_info = _prepare_shard_info(shard_idx, mesh, num_shards)
+  shard_info = _prepare_shard_info(
+      shard_idx, mesh, num_shards, host_subgrid=host_subgrid
+  )
 
   @compute_on.compute_on(
       compute_type="device_host", out_memory_spaces=jax.memory.Space.Device
@@ -159,6 +204,7 @@ def init_weight_synchronizer_and_d2h(
     num_layers: int = 1,
     listener_port: int = -1,
     num_shards: int | None = None,
+    host_subgrid: list[int] | None = None,
 ) -> jax.Array:
   """Registers and executes init_weight_synchronizer_and_d2h FFI custom call on each device rank.
 
@@ -176,6 +222,7 @@ def init_weight_synchronizer_and_d2h(
       (`-1` to initialize new).
     num_shards: Number of local shards (devices per host). If None, calculated
       from mesh.
+    host_subgrid: Optional host subgrid shape for shard decomposition.
 
   Returns:
     A sharded 1D int32 array containing synchronization metadata (`out_dim=6` if
@@ -185,7 +232,9 @@ def init_weight_synchronizer_and_d2h(
     num_processes = len(set(d.process_index for d in mesh.devices.flatten()))
     num_shards = mesh.devices.size // num_processes
 
-  shard_info = _prepare_shard_info(shard_idx, mesh, num_shards)
+  shard_info = _prepare_shard_info(
+      shard_idx, mesh, num_shards, host_subgrid=host_subgrid
+  )
 
   @compute_on.compute_on(
       compute_type="device_host", out_memory_spaces=jax.memory.Space.Device

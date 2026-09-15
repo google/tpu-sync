@@ -98,6 +98,8 @@ message RegisterWorkUnitRequest {
   repeated VariableMetadataProto variables = 14;
   // Optional list of logical mesh axis names (e.g. ['fsdp', 'tp']).
   repeated string mesh_axes = 15;
+  // Optional ground-truth local submesh shape from JAX (mesh.local_mesh).
+  repeated int64 host_subgrid = 16;
 }
 
 // Defines an explicit 1D linear memory push operation from a local source to a
@@ -233,10 +235,9 @@ message ControlResponse {
   GetMetadataResponse get_metadata_response = 4;
 }
 
-// Service providing a gRPC communication channel for Weight Synchronizer worker control plane.
+// Service providing a gRPC communication channel for Weight Synchronizer worker
+// control plane.
 service WeightSynchronizationWorkerService {
   // Handles generic ControlRequest commands (such as START_TRANSFER, SHUTDOWN).
   rpc HandleControl(ControlRequest) returns (ControlResponse) {  }
 }
-
-

@@ -169,9 +169,24 @@ class UtilsTest(absltest.TestCase):
     mock_arr0.sharding = sharding_3d
     mock_arr0.addressable_shards = host0_shards
 
+    mock_local_mesh = mock.MagicMock()
+    mock_local_mesh.devices.shape = (1, 2, 2)
     with mock.patch.object(
         jax, "process_index", return_value=0
-    ), mock.patch.object(jax, "process_count", return_value=16):
+    ), mock.patch.object(
+        jax, "process_count", return_value=16
+    ), mock.patch.object(
+        jax.sharding.Mesh,
+        "local_mesh",
+        new_callable=mock.PropertyMock,
+        return_value=mock_local_mesh,
+    ), mock.patch.object(
+        utils,
+        "compute_host_subgrid",
+        side_effect=AssertionError(
+            "compute_host_subgrid should not be called!"
+        ),
+    ):
       perm0 = utils.get_shard_sorting_permutation(mock_arr0)
       self.assertEqual(perm0, [])
 
@@ -185,7 +200,20 @@ class UtilsTest(absltest.TestCase):
     mock_arr0.addressable_shards = permuted_shards
     with mock.patch.object(
         jax, "process_index", return_value=0
-    ), mock.patch.object(jax, "process_count", return_value=16):
+    ), mock.patch.object(
+        jax, "process_count", return_value=16
+    ), mock.patch.object(
+        jax.sharding.Mesh,
+        "local_mesh",
+        new_callable=mock.PropertyMock,
+        return_value=mock_local_mesh,
+    ), mock.patch.object(
+        utils,
+        "compute_host_subgrid",
+        side_effect=AssertionError(
+            "compute_host_subgrid should not be called!"
+        ),
+    ):
       perm_reordered = utils.get_shard_sorting_permutation(mock_arr0)
       self.assertEqual(perm_reordered, [1, 0, 3, 2])
 
@@ -227,6 +255,8 @@ class UtilsTest(absltest.TestCase):
         ],
     }
 
+    mock_local_mesh = mock.MagicMock()
+    mock_local_mesh.devices.shape = (2, 2)
     for host_idx in range(4):
       host_devices = host_subgrid_devices[host_idx]
       host_shards = [mock.MagicMock(device=d) for d in host_devices]
@@ -238,7 +268,20 @@ class UtilsTest(absltest.TestCase):
 
       with mock.patch.object(
           jax, "process_index", return_value=host_idx
-      ), mock.patch.object(jax, "process_count", return_value=4):
+      ), mock.patch.object(
+          jax, "process_count", return_value=4
+      ), mock.patch.object(
+          jax.sharding.Mesh,
+          "local_mesh",
+          new_callable=mock.PropertyMock,
+          return_value=mock_local_mesh,
+      ), mock.patch.object(
+          utils,
+          "compute_host_subgrid",
+          side_effect=AssertionError(
+              "compute_host_subgrid should not be called!"
+          ),
+      ):
         perm = utils.get_shard_sorting_permutation(mock_arr)
         self.assertEqual(perm, [])
 

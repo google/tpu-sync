@@ -199,7 +199,6 @@ py_test(
         ":kv_cache_manager_torch_py",
         "@com_google_absl_py//absl/testing:absltest",
         "@com_google_absl_py//absl/testing:parameterized",
-        "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
         "@torch_tpu//src/torch_tpu",
     ],

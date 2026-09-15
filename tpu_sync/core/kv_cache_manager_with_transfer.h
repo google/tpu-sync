@@ -383,6 +383,8 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   // staging pool cannot seat the request.
   std::optional<std::vector<int64_t>> AcquireRecvStagingLocked(
       int64_t num_blocks, RecvEntry* entry);
+  absl::Status EmplaceRecvEntryLocked(uint64_t uuid, RecvEntry&& entry)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ReleaseRecvStagingLocked(RecvEntry* entry);
   // Same, for paths that have already taken the entry's staging out of it.
   void ReleaseStagingLocked(int64_t slot_idx,
@@ -431,6 +433,9 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     int32_t num_completed_layers = 0;
     bool network_completed = false;
     bool h2d_started = false;
+    int in_flight = 0;
+    bool draining = false;
+    bool failed = false;
     bool reshard_finalizing = false;
     std::vector<int> accumulated_host_block_ids;
     std::chrono::steady_clock::time_point deadline;
@@ -461,6 +466,18 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     std::map<size_t, std::vector<int64_t>> pool_dst_block_ids;
   };
   absl::flat_hash_map<uint64_t, RecvEntry> active_recv_entries_;
+
+  // Decides a legacy receive's outcome. Retirement waits until every issued
+  // handshake or H2D operation has ended, and failure is sticky while it
+  // drains. The optional value is a plan generation to unregister after mu_
+  // is released.
+  std::optional<uint64_t> FinishRecvLocked(uint64_t uuid, bool failed)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  std::optional<uint64_t> RetireRecvLocked(uint64_t uuid)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void BeginRecvOpLocked(RecvEntry* entry) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  std::optional<uint64_t> EndRecvOpLocked(uint64_t uuid)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   struct PoolReshardSendEntry {
     std::string req_id;

@@ -383,6 +383,8 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   // staging pool cannot seat the request.
   std::optional<std::vector<int64_t>> AcquireRecvStagingLocked(
       int64_t num_blocks, RecvEntry* entry);
+  absl::Status EmplaceRecvEntryLocked(uint64_t uuid, RecvEntry&& entry)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ReleaseRecvStagingLocked(RecvEntry* entry);
   // Same, for paths that have already taken the entry's staging out of it.
   void ReleaseStagingLocked(int64_t slot_idx,

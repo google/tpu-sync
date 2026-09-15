@@ -92,6 +92,10 @@ inline constexpr absl::string_view kD2hTransferTimeMs = "d2h_transfer_time_ms";
 inline constexpr absl::string_view kBufferAllocatedBytes =
     "buffer_allocated_bytes";
 
+inline constexpr absl::string_view kP2pTransferTimeMs = "p2p_transfer_time_ms";
+inline constexpr absl::string_view kH2dBytesTotal = "h2d_bytes_total";
+inline constexpr absl::string_view kD2hBytesTotal = "d2h_bytes_total";
+
 }  // namespace metric_names
 
 namespace metric_descriptions {
@@ -114,9 +118,39 @@ inline constexpr absl::string_view kH2dTransferTimeMs =
 inline constexpr absl::string_view kD2hTransferTimeMs =
     "Device-to-Host transfer latency in milliseconds.";
 
+inline constexpr absl::string_view kP2pTransferTimeMs =
+    "Peer-to-Peer batch transfer latency in milliseconds across network "
+    "endpoints.";
+inline constexpr absl::string_view kH2dBytesTotal =
+    "Total count of bytes transferred from host memory to device DRAM.";
+inline constexpr absl::string_view kD2hBytesTotal =
+    "Total count of bytes transferred from device DRAM to host memory.";
+
 }  // namespace metric_descriptions
 
+namespace metric_labels {
+
+inline constexpr absl::string_view kDirection = "direction";
+inline constexpr absl::string_view kDirectionPush = "push";
+inline constexpr absl::string_view kDirectionPull = "pull";
+inline constexpr absl::string_view kDirectionPullResponse = "pull_response";
+
+inline constexpr absl::string_view kErrorCode = "error_code";
+inline constexpr absl::string_view kLocalRank = "local_rank";
+
+inline constexpr absl::string_view kSrcIp = "src_ip";
+inline constexpr absl::string_view kDstIp = "dst_ip";
+inline constexpr absl::string_view kHostIp = "host_ip";
+
+}  // namespace metric_labels
+
 namespace metric_metadata {
+
+inline constexpr absl::string_view kP2pTransferTimeMsLabels[] = {
+    metric_labels::kSrcIp, metric_labels::kDstIp};
+
+inline constexpr absl::string_view kHostDeviceTransferLabels[] = {
+    metric_labels::kHostIp, metric_labels::kLocalRank};
 
 inline constexpr MetricMetadata kSentBytesTotal{
     .name = metric_names::kSentBytesTotal,
@@ -153,23 +187,31 @@ inline constexpr MetricMetadata kBufferAllocatedBytes{
     .description = metric_descriptions::kBufferAllocatedBytes,
     .type = MetricType::kGauge};
 
+inline constexpr MetricMetadata kP2pTransferTimeMs{
+    .name = metric_names::kP2pTransferTimeMs,
+    .description = metric_descriptions::kP2pTransferTimeMs,
+    .type = MetricType::kHistogram,
+    .label_names = kP2pTransferTimeMsLabels};
+
+inline constexpr MetricMetadata kH2dBytesTotal{
+    .name = metric_names::kH2dBytesTotal,
+    .description = metric_descriptions::kH2dBytesTotal,
+    .type = MetricType::kCounter,
+    .label_names = kHostDeviceTransferLabels};
+
+inline constexpr MetricMetadata kD2hBytesTotal{
+    .name = metric_names::kD2hBytesTotal,
+    .description = metric_descriptions::kD2hBytesTotal,
+    .type = MetricType::kCounter,
+    .label_names = kHostDeviceTransferLabels};
+
 inline constexpr MetricMetadata kAllMetrics[] = {
-    kSentBytesTotal,       kReceivedBytesTotal, kTransferFailuresTotal,
-    kTransferDurationMs,   kH2dTransferTimeMs,  kD2hTransferTimeMs,
-    kBufferAllocatedBytes,
+    kSentBytesTotal,       kReceivedBytesTotal,   kTransferFailuresTotal,
+    kTransferDurationMs,   kH2dTransferTimeMs,    kD2hTransferTimeMs,
+    kBufferAllocatedBytes, kP2pTransferTimeMs,    kH2dBytesTotal,
+    kD2hBytesTotal,
 };
 }  // namespace metric_metadata
-
-namespace metric_labels {
-
-inline constexpr absl::string_view kDirection = "direction";
-inline constexpr absl::string_view kDirectionPush = "push";
-inline constexpr absl::string_view kDirectionPull = "pull";
-inline constexpr absl::string_view kDirectionPullResponse = "pull_response";
-
-inline constexpr absl::string_view kErrorCode = "error_code";
-inline constexpr absl::string_view kLocalRank = "local_rank";
-}  // namespace metric_labels
 
 // Structure defining a metric key-value label pair.
 struct MetricLabel {

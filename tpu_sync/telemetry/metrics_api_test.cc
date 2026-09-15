@@ -43,6 +43,7 @@
 namespace tpu_raiden::telemetry {
 namespace {
 
+using ::absl_testing::IsOk;
 using ::absl_testing::StatusIs;
 using ::testing::_;
 using ::testing::ElementsAre;
@@ -197,6 +198,43 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kBufferAllocatedBytes.type, MetricType::kGauge);
   EXPECT_THAT(metric_metadata::kBufferAllocatedBytes.label_names, IsEmpty());
 
+  // P2pTransferTimeMs
+  EXPECT_EQ(metric_names::kP2pTransferTimeMs, "p2p_transfer_time_ms");
+  EXPECT_EQ(metric_descriptions::kP2pTransferTimeMs,
+            "Peer-to-Peer batch transfer latency in milliseconds across network "
+            "endpoints.");
+  EXPECT_EQ(metric_metadata::kP2pTransferTimeMs.name, "p2p_transfer_time_ms");
+  EXPECT_EQ(metric_metadata::kP2pTransferTimeMs.description,
+            "Peer-to-Peer batch transfer latency in milliseconds across network "
+            "endpoints.");
+  EXPECT_EQ(metric_metadata::kP2pTransferTimeMs.type, MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kP2pTransferTimeMs.label_names,
+              ElementsAre(metric_labels::kSrcIp, metric_labels::kDstIp));
+
+  // H2dBytesTotal
+  EXPECT_EQ(metric_names::kH2dBytesTotal, "h2d_bytes_total");
+  EXPECT_EQ(metric_descriptions::kH2dBytesTotal,
+            "Total count of bytes transferred from host memory to device DRAM.");
+  EXPECT_EQ(metric_metadata::kH2dBytesTotal.name, "h2d_bytes_total");
+  EXPECT_EQ(metric_metadata::kH2dBytesTotal.description,
+            "Total count of bytes transferred from host memory to device DRAM.");
+  EXPECT_EQ(metric_metadata::kH2dBytesTotal.type, MetricType::kCounter);
+  EXPECT_THAT(
+      metric_metadata::kH2dBytesTotal.label_names,
+      ElementsAre(metric_labels::kHostIp, metric_labels::kLocalRank));
+
+  // D2hBytesTotal
+  EXPECT_EQ(metric_names::kD2hBytesTotal, "d2h_bytes_total");
+  EXPECT_EQ(metric_descriptions::kD2hBytesTotal,
+            "Total count of bytes transferred from device DRAM to host memory.");
+  EXPECT_EQ(metric_metadata::kD2hBytesTotal.name, "d2h_bytes_total");
+  EXPECT_EQ(metric_metadata::kD2hBytesTotal.description,
+            "Total count of bytes transferred from device DRAM to host memory.");
+  EXPECT_EQ(metric_metadata::kD2hBytesTotal.type, MetricType::kCounter);
+  EXPECT_THAT(
+      metric_metadata::kD2hBytesTotal.label_names,
+      ElementsAre(metric_labels::kHostIp, metric_labels::kLocalRank));
+
   // Direction Labels
   EXPECT_EQ(metric_labels::kDirection, "direction");
   EXPECT_EQ(metric_labels::kDirectionPush, "push");
@@ -206,6 +244,12 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   // Error Code Labels
   EXPECT_EQ(metric_labels::kErrorCode, "error_code");
 
+  // New Labels
+  EXPECT_EQ(metric_labels::kLocalRank, "local_rank");
+  EXPECT_EQ(metric_labels::kSrcIp, "src_ip");
+  EXPECT_EQ(metric_labels::kDstIp, "dst_ip");
+  EXPECT_EQ(metric_labels::kHostIp, "host_ip");
+
   // All Metrics
   EXPECT_THAT(metric_metadata::kAllMetrics,
               ElementsAre(metric_metadata::kSentBytesTotal,
@@ -214,7 +258,10 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
                           metric_metadata::kTransferDurationMs,
                           metric_metadata::kH2dTransferTimeMs,
                           metric_metadata::kD2hTransferTimeMs,
-                          metric_metadata::kBufferAllocatedBytes));
+                          metric_metadata::kBufferAllocatedBytes,
+                          metric_metadata::kP2pTransferTimeMs,
+                          metric_metadata::kH2dBytesTotal,
+                          metric_metadata::kD2hBytesTotal));
 }
 
 TEST_F(MetricsApiTest, FastPathExitWhenNoBackends) {
@@ -351,7 +398,10 @@ TEST_F(MetricsApiTest, GetMetricMetadataReturnsAllMetricsWhenBackendsActive) {
                                   metric_metadata::kTransferDurationMs,
                                   metric_metadata::kH2dTransferTimeMs,
                                   metric_metadata::kD2hTransferTimeMs,
-                                  metric_metadata::kBufferAllocatedBytes));
+                                  metric_metadata::kBufferAllocatedBytes,
+                                  metric_metadata::kP2pTransferTimeMs,
+                                  metric_metadata::kH2dBytesTotal,
+                                  metric_metadata::kD2hBytesTotal));
 }
 
 TEST_F(MetricsApiTest, GetMetricMetadataEmptyWhenNoBackends) {

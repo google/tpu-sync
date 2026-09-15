@@ -44,6 +44,7 @@ cc_library(
     copts = RESHARD_COPTS,
     features = ["-use_header_modules"],
     deps = [
+        "//tpu_sync/common:accept_backoff",
         "//tpu_sync/common:detached_thread_group",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",

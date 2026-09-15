@@ -34,6 +34,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "tpu_sync/common/accept_backoff.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -252,15 +253,19 @@ void FramedServer::Stop() {
 }
 
 void FramedServer::AcceptLoop() {
+  AcceptBackoff backoff("FramedServer");
   while (!stopping_) {
     sockaddr_storage client_addr{};
     socklen_t client_len = sizeof(client_addr);
     int client_fd = accept(
         server_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
     if (client_fd < 0) {
+      const int err = errno;
       if (stopping_) break;
+      if (!backoff.OnError(err)) break;
       continue;
     }
+    backoff.OnSuccess();
     if (stopping_) {
       close(client_fd);
       break;

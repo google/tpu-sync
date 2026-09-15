@@ -176,6 +176,7 @@ cc_library(
         ":histogram",
         ":raw_buffer_transport_delegate",
         ":transport_adapter",
+        "//tpu_sync/common:accept_backoff",
         "//tpu_sync/common:detached_thread_group",
         "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/transport:buffer_push_task",

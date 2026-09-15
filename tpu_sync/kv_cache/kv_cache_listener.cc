@@ -30,6 +30,7 @@
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "tpu_sync/common/accept_backoff.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
@@ -137,15 +138,19 @@ KVCacheListener::~KVCacheListener() {
 }
 
 void KVCacheListener::ListenerLoop() {
+  AcceptBackoff backoff("KVCacheListener");
   while (!stopping_) {
     sockaddr_in6 client_addr{};
     socklen_t client_len = sizeof(client_addr);
     int client_fd = accept(
         server_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
     if (client_fd < 0) {
+      const int err = errno;
       if (stopping_) break;
+      if (!backoff.OnError(err)) break;
       continue;
     }
+    backoff.OnSuccess();
 
     connection_threads_.Spawn(
         [this, client_fd] { ConnectionWorker(client_fd); });

@@ -51,6 +51,7 @@
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "tpu_sync/common/accept_backoff.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
@@ -469,14 +470,20 @@ RawBufferTransport::RegisterPspPeer(uint32_t client_spi,
 }
 
 void RawBufferTransport::ListenerLoop() {
+  AcceptBackoff backoff("RawBufferTransport");
   while (!stopping_) {
     DCHECK(IsValidSocket(server_fd_));
     struct pollfd pfd;
     pfd.fd = server_fd_;
     pfd.events = POLLIN;
     int ret = poll(&pfd, 1, 50);
-    if (ret <= 0) {
+    if (ret == 0) continue;  // Idle tick: nothing waiting to be accepted.
+    if (ret < 0) {
+      const int err = errno;
       if (stopping_) break;
+      // poll() reports the same descriptor and resource errors as accept(),
+      // so the two share one policy.
+      if (!backoff.OnError(err)) break;
       continue;
     }
 
@@ -485,9 +492,12 @@ void RawBufferTransport::ListenerLoop() {
     int client_fd = accept(
         server_fd_, reinterpret_cast<struct sockaddr*>(&client_addr), &clilen);
     if (client_fd < 0) {
+      const int err = errno;
       if (stopping_) break;
+      if (!backoff.OnError(err)) break;
       continue;
     }
+    backoff.OnSuccess();
     if (require_psp_tcp_ && !PspEnabled(client_fd)) {
       close(client_fd);
       LOG_EVERY_N_SEC(ERROR, 1)

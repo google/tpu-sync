@@ -30,6 +30,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
+#include "tpu_sync/common/accept_backoff.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
@@ -100,6 +101,7 @@ WeightSynchronizerListener::~WeightSynchronizerListener() {
 }
 
 void WeightSynchronizerListener::ListenerLoop() {
+  AcceptBackoff backoff("WeightSynchronizerListener");
   while (!stopping_) {
     sockaddr_in6 client_addr{};
     socklen_t client_len = sizeof(client_addr);
@@ -107,9 +109,12 @@ void WeightSynchronizerListener::ListenerLoop() {
         accept(server_fd_.load(), reinterpret_cast<sockaddr*>(&client_addr),
                &client_len);
     if (client_fd < 0) {
+      const int err = errno;
       if (stopping_) break;
+      if (!backoff.OnError(err)) break;
       continue;
     }
+    backoff.OnSuccess();
 
     connection_threads_.Spawn(
         [this, client_fd] { ConnectionWorker(client_fd); });

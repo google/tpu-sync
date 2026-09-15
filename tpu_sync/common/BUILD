@@ -49,6 +49,28 @@ cc_test(
 )
 
 cc_library(
+    name = "accept_backoff",
+    srcs = ["accept_backoff.cc"],
+    hdrs = ["accept_backoff.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_test(
+    name = "accept_backoff_test",
+    srcs = ["accept_backoff_test.cc"],
+    deps = [
+        ":accept_backoff",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "detached_thread_group",
     srcs = ["detached_thread_group.cc"],
     hdrs = ["detached_thread_group.h"],

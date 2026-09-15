@@ -19,12 +19,12 @@
 #include <functional>
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
-#include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
+#include "tpu_sync/common/detached_thread_group.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -58,6 +58,9 @@ class SocketFramedTransport final : public FramedTransport {
 // connection, one request/response exchange per connection (the accept
 // model of RaidenControllerServer and KVCacheListener). The handler
 // receives the raw request body and returns the raw response body.
+//
+// Connection threads are detached; Stop() blocks until every in-flight
+// connection has returned instead of joining retained thread objects.
 class FramedServer final {
  public:
   using Handler = std::function<std::string(const std::string&)>;
@@ -88,7 +91,10 @@ class FramedServer final {
   Handler handler_;
   std::atomic<bool> stopping_{false};
   std::thread accept_thread_;
-  std::vector<std::thread> connection_threads_;
+
+  // Stop() drains this so |handler_| and `this` outlive every in-flight
+  // connection.
+  DetachedThreadGroup connection_threads_{"FramedServer connection"};
 };
 
 }  // namespace reshard

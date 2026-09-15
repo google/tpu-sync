@@ -34,7 +34,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <thread>  // NOLINT
+#include <system_error>  // NOLINT
+#include <thread>        // NOLINT
 #include <utility>
 #include <vector>
 
@@ -50,6 +51,8 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/transport/buffer_push_task.h"
@@ -212,18 +215,14 @@ RawBufferTransport::~RawBufferTransport() {
       shutdown(fd, SHUT_RDWR);
     }
   }
-  // 1.2 Join all threads.
+  // 1.2 Join the listener, then drain the detached connection workers.
   if (listener_thread_.joinable()) {
     listener_thread_.join();
   }
-  for (auto& t : worker_threads_) {
-    if (t.joinable()) {
-      t.join();
-    }
-  }
+  connection_threads_.AwaitAllDone();
   {
-    // Each worker thread should have closed its own client_fd.
     absl::MutexLock _(mu_);
+    // Each worker thread should have closed its own client_fd.
     DCHECK(active_client_fds_.empty());
   }
 
@@ -509,11 +508,19 @@ void RawBufferTransport::ListenerLoop() {
     LOG(INFO) << absl::StrCat("accepted tcp socket ", client_fd, ": ",
                               peregrine::GetAddrPortPair(client_fd));
     {
-      absl::MutexLock _( mu_ );
+      absl::MutexLock _(mu_);
       active_client_fds_.insert(client_fd);
     }
-    worker_threads_.push_back(
-        std::thread([this, client_fd]() { ConnectionWorker(client_fd); }));
+    if (!connection_threads_.Spawn(
+            [this, client_fd] { ConnectionWorker(client_fd); })) {
+      {
+        absl::MutexLock _(mu_);
+        active_client_fds_.erase(client_fd);
+      }
+      close(client_fd);
+      // Back off so a persistent spawn failure cannot spin the accept loop.
+      absl::SleepFor(absl::Milliseconds(10));
+    }
   }
 
   DCHECK(IsValidSocket(server_fd_));

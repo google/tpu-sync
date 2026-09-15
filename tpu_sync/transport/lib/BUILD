@@ -176,6 +176,7 @@ cc_library(
         ":histogram",
         ":raw_buffer_transport_delegate",
         ":transport_adapter",
+        "//tpu_sync/common:detached_thread_group",
         "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/transport:buffer_push_task",
         "//tpu_sync/transport/lib/conn:pool",
@@ -196,6 +197,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
     ],
 )

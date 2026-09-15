@@ -56,6 +56,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":tiling_utils",
+        "//tpu_sync/common:detached_thread_group",
         "//tpu_sync/common:trace",
         "//tpu_sync/core:host_memory_allocator",
         "//tpu_sync/core:numa_thread_pool",
@@ -66,6 +67,7 @@ cc_library(
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/transport:buffer_push_task",
         "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/flags:flag",

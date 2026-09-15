@@ -833,8 +833,12 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":kv_cache_manager_base",
+        "//tpu_sync/common:detached_thread_group",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
     ],
 )

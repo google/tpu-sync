@@ -44,10 +44,30 @@ cc_library(
     copts = RESHARD_COPTS,
     features = ["-use_header_modules"],
     deps = [
+        "//tpu_sync/common:detached_thread_group",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
+    ],
+)
+
+cc_test(
+    name = "framed_rpc_test",
+    srcs = ["framed_rpc_test.cc"],
+    copts = RESHARD_COPTS,
+    features = ["-use_header_modules"],
+    deps = [
+        ":framed_rpc",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 

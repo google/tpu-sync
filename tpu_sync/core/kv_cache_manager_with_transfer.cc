@@ -108,6 +108,9 @@ constexpr absl::Duration kPendingWorkTimeout = absl::Seconds(30);
 // acts on, so this only covers reordering between the two; a pull whose
 // registration expired, or never happened, is rejected once it lapses.
 constexpr absl::Duration kPullRegistrationGrace = absl::Seconds(5);
+// Control error text is diagnostic and should remain small. Bound it to 4 KiB
+// so an untrusted peer cannot trigger an arbitrarily large allocation.
+constexpr uint64_t kMaxControlErrorMessageBytes = 4 * 1024;
 
 [[noreturn]] void ThrowStatus(const std::string& context,
                               const absl::Status& status) {
@@ -2515,6 +2518,9 @@ void KVCacheManagerWithTransfer::HandleControlConnection(int fd) {
     response.magic = kResponseMagic;
     response.status = -1;
     std::string message = e.what();
+    if (message.size() > kMaxControlErrorMessageBytes) {
+      message.resize(kMaxControlErrorMessageBytes);
+    }
     response.message_len = message.size();
     if (absl::Status s = WriteExact(fd, &response, sizeof(response)); !s.ok()) {
       LOG(WARNING) << "Failed to send control response header: " << s;
@@ -2535,8 +2541,15 @@ void KVCacheManagerWithTransfer::ProcessPullStream(
   RAIDEN_TRACE_FN("KVTransfer::ProcessPullStream", [&]() {
     return absl::StrCat("uuid=", req.uuid, " blocks=", req.num_blocks);
   });
-  // The whole request is read before anything can reject it, so a
-  // rejection leaves no unread bytes behind on the connection.
+  const int64_t block_capacity =
+      dynamic_host_staging_ ? host_block_manager_->total_blocks() : max_blocks_;
+  // A control connection carries one request and is then closed, so rejecting
+  // an oversized header here safely discards any unread body with the socket.
+  if (req.num_blocks > static_cast<uint64_t>(block_capacity)) {
+    throw std::invalid_argument(
+        absl::StrCat("pull stream block count ", req.num_blocks,
+                     " exceeds configured maximum ", block_capacity));
+  }
   std::vector<int64_t> src_block_ids = ReadBlockIds(fd, req.num_blocks);
   std::vector<int64_t> dst_block_ids = ReadBlockIds(fd, req.num_blocks);
 
@@ -2975,10 +2988,17 @@ KVCacheManagerWithTransfer::ReadControlResponseHeader(int fd) {
     throw std::runtime_error("bad control response magic");
   }
   if (response.status != 0) {
-    std::string message(response.message_len, '\0');
-    if (response.message_len > 0) {
+    const bool truncated = response.message_len > kMaxControlErrorMessageBytes;
+    const size_t message_bytes = static_cast<size_t>(
+        std::min(response.message_len, kMaxControlErrorMessageBytes));
+    std::string message(message_bytes, '\0');
+    if (message_bytes > 0) {
       CheckStatus("control error body read",
                   ReadExact(fd, message.data(), message.size()));
+    }
+    if (truncated) {
+      absl::StrAppend(&message, " [truncated; peer advertised ",
+                      response.message_len, " bytes]");
     }
     throw std::runtime_error("remote Raiden control error: " + message);
   }

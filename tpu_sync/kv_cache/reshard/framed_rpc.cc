@@ -24,13 +24,17 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
-#include <thread>  // NOLINT(build/c++11)
+#include <system_error>  // NOLINT(build/c++11)
+#include <thread>        // NOLINT(build/c++11)
 #include <utility>
 
+#include "absl/cleanup/cleanup.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 
@@ -236,16 +240,18 @@ void FramedServer::Stop() {
   if (stopping_.exchange(true)) {
     return;
   }
+  // shutdown() is what breaks the blocking accept(); the descriptor must stay
+  // valid until the accept thread is joined, or accept() could be handed a
+  // recycled descriptor.
   if (server_fd_ >= 0) {
     shutdown(server_fd_, SHUT_RDWR);
+  }
+  if (accept_thread_.joinable()) accept_thread_.join();
+  if (server_fd_ >= 0) {
     close(server_fd_);
     server_fd_ = -1;
   }
-  if (accept_thread_.joinable()) accept_thread_.join();
-  for (std::thread& t : connection_threads_) {
-    if (t.joinable()) t.join();
-  }
-  connection_threads_.clear();
+  connection_threads_.AwaitAllDone();
 }
 
 void FramedServer::AcceptLoop() {
@@ -262,8 +268,12 @@ void FramedServer::AcceptLoop() {
       close(client_fd);
       break;
     }
-    connection_threads_.emplace_back(&FramedServer::ServeConnection, this,
-                                     client_fd);
+    if (!connection_threads_.Spawn(
+            [this, client_fd] { ServeConnection(client_fd); })) {
+      close(client_fd);
+      // Back off so a persistent spawn failure cannot spin the accept loop.
+      absl::SleepFor(absl::Milliseconds(10));
+    }
   }
 }
 

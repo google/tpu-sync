@@ -25,11 +25,16 @@
 #include <cstring>
 #include <limits>
 #include <string>
-#include <thread>  // NOLINT
+#include <system_error>  // NOLINT
+#include <thread>        // NOLINT
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
@@ -82,21 +87,25 @@ WeightSynchronizerListener::WeightSynchronizerListener(
 
 WeightSynchronizerListener::~WeightSynchronizerListener() {
   stopping_ = true;
-  int fd = server_fd_.exchange(-1);
+  // Claim the descriptor atomically: the COMMAND_SHUTDOWN handler races for it
+  // from a connection worker, and only one of the two may close it.
+  const int fd = server_fd_.exchange(-1);
   if (fd >= 0) {
+    // shutdown() is what breaks the blocking accept(); the descriptor must
+    // stay open until the listener thread is joined, or accept() could be
+    // handed a recycled descriptor.
     shutdown(fd, SHUT_RDWR);
-    close(fd);
   }
 
   if (listener_thread_.joinable()) {
     listener_thread_.join();
   }
 
-  for (auto& t : worker_threads_) {
-    if (t.joinable()) {
-      t.join();
-    }
+  if (fd >= 0) {
+    close(fd);
   }
+
+  connection_threads_.AwaitAllDone();
 }
 
 void WeightSynchronizerListener::ListenerLoop() {
@@ -111,8 +120,12 @@ void WeightSynchronizerListener::ListenerLoop() {
       continue;
     }
 
-    worker_threads_.push_back(std::thread(
-        &WeightSynchronizerListener::ConnectionWorker, this, client_fd));
+    if (!connection_threads_.Spawn(
+            [this, client_fd] { ConnectionWorker(client_fd); })) {
+      close(client_fd);
+      // Back off so a persistent spawn failure cannot spin the accept loop.
+      absl::SleepFor(absl::Milliseconds(10));
+    }
   }
 }
 

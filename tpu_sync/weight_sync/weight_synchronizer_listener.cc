@@ -82,21 +82,21 @@ WeightSynchronizerListener::WeightSynchronizerListener(
 
 WeightSynchronizerListener::~WeightSynchronizerListener() {
   stopping_ = true;
-  int fd = server_fd_.exchange(-1);
+  const int fd = server_fd_.exchange(-1);
   if (fd >= 0) {
+    // Unblocks accept(); the fd stays open until the listener is joined.
     shutdown(fd, SHUT_RDWR);
-    close(fd);
   }
 
   if (listener_thread_.joinable()) {
     listener_thread_.join();
   }
 
-  for (auto& t : worker_threads_) {
-    if (t.joinable()) {
-      t.join();
-    }
+  if (fd >= 0) {
+    close(fd);
   }
+
+  connection_threads_.AwaitAllDone();
 }
 
 void WeightSynchronizerListener::ListenerLoop() {
@@ -111,8 +111,8 @@ void WeightSynchronizerListener::ListenerLoop() {
       continue;
     }
 
-    worker_threads_.push_back(std::thread(
-        &WeightSynchronizerListener::ConnectionWorker, this, client_fd));
+    connection_threads_.Spawn(
+        [this, client_fd] { ConnectionWorker(client_fd); });
   }
 }
 
@@ -238,10 +238,11 @@ void WeightSynchronizerListener::ConnectionWorker(int client_fd) {
       }
     }
     stopping_ = true;
-    int fd = server_fd_.exchange(-1);
+    // Only unblock accept() here: this runs on a connection worker, and the
+    // destructor owns the fd and closes it after joining the listener.
+    const int fd = server_fd_.load();
     if (fd >= 0) {
       shutdown(fd, SHUT_RDWR);
-      close(fd);
     }
     resp.set_success(true);
   } else {

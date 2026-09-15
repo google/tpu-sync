@@ -36,6 +36,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "grpcpp/channel.h"
+#include "tpu_sync/common/detached_thread_group.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
@@ -181,10 +182,13 @@ class RawBufferTransport final {
   std::atomic<bool> stopping_;
 
   // The active_client_fds do not own the sockets it contains. It is only used
-  // to shutdown the sockets, thus unblocking worker_threads_. Each worker
-  // thread owns the client_fd passed to it.
+  // to shutdown the sockets, thus unblocking the connection workers. Each
+  // worker thread owns the client_fd passed to it.
   absl::Mutex mu_;
   absl::flat_hash_set<int> active_client_fds_ ABSL_GUARDED_BY(mu_);
+
+  // The destructor drains this so `this` outlives every in-flight connection.
+  DetachedThreadGroup connection_threads_{"RawBufferTransport connection"};
 
   // The conn_pool_ owns the sockets that connect to peers. In comparison, the
   // active_client_fds above are those sockets accepted from peers.
@@ -202,7 +206,6 @@ class RawBufferTransport final {
   absl::Mutex psp_mu_;
 
   std::thread listener_thread_;
-  std::vector<std::thread> worker_threads_;
 };
 
 }  // namespace tpu_raiden::transport::lib

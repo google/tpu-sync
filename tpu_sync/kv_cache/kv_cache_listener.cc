@@ -117,18 +117,23 @@ KVCacheListener::~KVCacheListener() {
       }
       close(sock);
     }
-    close(server_fd_);
+    // shutdown() is what breaks the blocking accept(); the descriptor must
+    // stay valid until the listener thread is joined, or accept() could be
+    // handed a recycled descriptor. It is issued after the loopback SHUTDOWN
+    // request above so that request can still be delivered.
+    shutdown(server_fd_, SHUT_RDWR);
   }
 
   if (listener_thread_.joinable()) {
     listener_thread_.join();
   }
 
-  for (auto& t : worker_threads_) {
-    if (t.joinable()) {
-      t.join();
-    }
+  if (server_fd_ >= 0) {
+    close(server_fd_);
+    server_fd_ = -1;
   }
+
+  connection_threads_.AwaitAllDone();
 }
 
 void KVCacheListener::ListenerLoop() {
@@ -142,8 +147,8 @@ void KVCacheListener::ListenerLoop() {
       continue;
     }
 
-    worker_threads_.push_back(
-        std::thread(&KVCacheListener::ConnectionWorker, this, client_fd));
+    connection_threads_.Spawn(
+        [this, client_fd] { ConnectionWorker(client_fd); });
   }
 }
 

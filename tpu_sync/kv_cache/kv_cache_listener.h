@@ -18,13 +18,16 @@
 #include <atomic>
 #include <string>
 #include <thread>  // NOLINT
-#include <vector>
+
+#include "tpu_sync/common/detached_thread_group.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
 
 class KVCacheManagerBase;
 
+// Connection threads are detached; the destructor blocks until every in-flight
+// connection has returned instead of joining retained thread objects.
 class KVCacheListener final {
  public:
   KVCacheListener(KVCacheManagerBase* engine, int listener_port);
@@ -46,7 +49,10 @@ class KVCacheListener final {
   std::atomic<bool> stopping_{false};
 
   std::thread listener_thread_;
-  std::vector<std::thread> worker_threads_;
+
+  // The destructor drains this so |engine_| and `this` outlive every in-flight
+  // connection.
+  DetachedThreadGroup connection_threads_{"KVCacheListener connection"};
 };
 
 }  // namespace kv_cache

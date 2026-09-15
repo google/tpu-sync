@@ -18,7 +18,8 @@
 #include <atomic>
 #include <string>
 #include <thread>  // NOLINT
-#include <vector>
+
+#include "tpu_sync/common/detached_thread_group.h"
 
 namespace tpu_raiden {
 namespace weight_sync {
@@ -28,6 +29,9 @@ class WeightSynchronizerBase;
 // TCP Socket Server Daemon that runs natively in C++ to accept Control-Plane
 // management RPC commands (like PushWeights and Shutdown) directly from the
 // RL Coordinator or Controller task, bypassing Python servicer overhead.
+//
+// Connection threads are detached; the destructor blocks until every in-flight
+// connection has returned instead of joining retained thread objects.
 class WeightSynchronizerListener final {
  public:
   WeightSynchronizerListener(WeightSynchronizerBase* engine, int listener_port);
@@ -50,7 +54,11 @@ class WeightSynchronizerListener final {
   std::atomic<bool> stopping_{false};
 
   std::thread listener_thread_;
-  std::vector<std::thread> worker_threads_;
+
+  // The destructor drains this so |engine_| and `this` outlive every in-flight
+  // connection.
+  DetachedThreadGroup connection_threads_{
+      "WeightSynchronizerListener connection"};
 };
 
 }  // namespace weight_sync

@@ -49,6 +49,35 @@ cc_test(
 )
 
 cc_library(
+    name = "detached_thread_group",
+    srcs = ["detached_thread_group.cc"],
+    hdrs = ["detached_thread_group.h"],
+    # std::thread's constructor reports pthread_create failures by throwing.
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+    ],
+)
+
+cc_test(
+    name = "detached_thread_group_test",
+    srcs = ["detached_thread_group_test.cc"],
+    deps = [
+        ":detached_thread_group",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "trace",
     srcs = ["trace.cc"],
     hdrs = ["trace.h"],

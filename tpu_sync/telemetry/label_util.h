@@ -15,6 +15,8 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TELEMETRY_LABEL_UTIL_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TELEMETRY_LABEL_UTIL_H_
 
+#include <array>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <utility>
@@ -68,6 +70,44 @@ std::optional<absl::string_view> FormatPrometheusLabelsToBuffer(
 // identification. Performs raw serialization without runtime key syntax
 // validation.
 std::string FormatPrometheusLabels(LabelSpan labels);
+
+// ============================================================================
+// Zero-Allocation Label Resolution for Fixed Schemas (Fixed-Arity)
+// ============================================================================
+
+inline constexpr absl::string_view kDefaultLabelValue = "unknown";
+
+// Resolves target label keys from LabelSpan in a single pass with zero heap
+// allocations for fixed-arity schemas known at compile time. Returns an array
+// of resolved values matching target_keys order. Missing keys default to
+// `default_val`. Preserves first-match semantics for duplicate keys, and
+// terminates early once all N keys are found.
+template <std::size_t N>
+constexpr std::array<absl::string_view, N> ResolveLabels(
+    LabelSpan labels, const std::array<absl::string_view, N>& target_keys,
+    absl::string_view default_val = kDefaultLabelValue) {
+  if constexpr (N == 0) {
+    return {};
+  }
+  std::array<absl::string_view, N> resolved;
+  resolved.fill(default_val);
+  std::array<bool, N> found{};
+  std::size_t found_count = 0;
+
+  for (const MetricLabel& label : labels) {
+    for (std::size_t i = 0; i < N; ++i) {
+      if (!found[i] && label.key == target_keys[i]) {
+        resolved[i] = label.value;
+        found[i] = true;
+        if (++found_count == N) {
+          return resolved;
+        }
+        break;
+      }
+    }
+  }
+  return resolved;
+}
 
 }  // namespace tpu_raiden::telemetry
 

@@ -14,6 +14,7 @@
 
 #include "tpu_sync/telemetry/label_util.h"
 
+#include <array>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -340,6 +341,133 @@ TEST(LabelUtilTest, FormatPrometheusLabelsToBufferOverflow) {
   EXPECT_FALSE(FormatPrometheusLabelsToBuffer(
                    multi_labels, absl::MakeSpan(tight_boundary_buffer))
                    .has_value());
+}
+
+// ============================================================================
+// Zero-Allocation Label Resolution for Fixed Schemas Tests
+// ============================================================================
+
+TEST(LabelUtilTest, ResolveLabelsZeroArity) {
+  constexpr std::array<absl::string_view, 0> kKeys{};
+  const std::array<absl::string_view, 0> resolved = ResolveLabels({}, kKeys);
+  EXPECT_TRUE(resolved.empty());
+
+  // Non-empty labels passed to 0-arity (fieldless) metric cleanly return an
+  // empty array without evaluating keys.
+  const MetricLabel dummy_label{.key = "direction", .value = "pull"};
+  const std::array<absl::string_view, 0> resolved_with_labels =
+      ResolveLabels({dummy_label}, kKeys);
+  EXPECT_TRUE(resolved_with_labels.empty());
+}
+
+TEST(LabelUtilTest, ResolveLabelsSingleArity) {
+  constexpr std::array<absl::string_view, 1> kKeys{"direction"};
+  {
+    const MetricLabel label{.key = "direction", .value = "pull"};
+    const std::array<absl::string_view, 1> resolved =
+        ResolveLabels({label}, kKeys);
+    EXPECT_THAT(resolved, ElementsAre("pull"));
+  }
+  {
+    // Missing key defaults to "unknown"
+    const MetricLabel label{.key = "other", .value = "val"};
+    const std::array<absl::string_view, 1> resolved =
+        ResolveLabels({label}, kKeys);
+    EXPECT_THAT(resolved, ElementsAre("unknown"));
+  }
+  {
+    // Empty string value is preserved and does not default to "unknown"
+    const MetricLabel label{.key = "direction", .value = ""};
+    const std::array<absl::string_view, 1> resolved =
+        ResolveLabels({label}, kKeys);
+    EXPECT_THAT(resolved, ElementsAre(""));
+  }
+  {
+    // Duplicate key preserves first-match semantics
+    const std::array<MetricLabel, 2> labels = {
+        MetricLabel{.key = "direction", .value = "first"},
+        MetricLabel{.key = "direction", .value = "second"},
+    };
+    const std::array<absl::string_view, 1> resolved =
+        ResolveLabels(labels, kKeys);
+    EXPECT_THAT(resolved, ElementsAre("first"));
+  }
+}
+
+TEST(LabelUtilTest, ResolveLabelsMultiArity) {
+  constexpr std::array<absl::string_view, 2> kKeys{"direction", "error_code"};
+  // In order match
+  {
+    const std::array<MetricLabel, 2> labels = {
+        MetricLabel{.key = "direction", .value = "push"},
+        MetricLabel{.key = "error_code", .value = "CANCELLED"},
+    };
+    const std::array<absl::string_view, 2> resolved =
+        ResolveLabels(labels, kKeys);
+    EXPECT_THAT(resolved, ElementsAre("push", "CANCELLED"));
+  }
+  // Reversed out-of-order match
+  {
+    const std::array<MetricLabel, 2> labels = {
+        MetricLabel{.key = "error_code", .value = "UNAVAILABLE"},
+        MetricLabel{.key = "direction", .value = "pull"},
+    };
+    const std::array<absl::string_view, 2> resolved =
+        ResolveLabels(labels, kKeys);
+    EXPECT_THAT(resolved, ElementsAre("pull", "UNAVAILABLE"));
+  }
+  // Partial match with fallback to default
+  {
+    const std::array<MetricLabel, 1> labels = {
+        MetricLabel{.key = "error_code", .value = "INTERNAL"},
+    };
+    const std::array<absl::string_view, 2> resolved =
+        ResolveLabels(labels, kKeys);
+    EXPECT_THAT(resolved, ElementsAre("unknown", "INTERNAL"));
+  }
+  // Custom default value fallback
+  {
+    const std::array<absl::string_view, 2> resolved =
+        ResolveLabels({}, kKeys, "none");
+    EXPECT_THAT(resolved, ElementsAre("none", "none"));
+  }
+}
+
+TEST(LabelUtilTest, ResolveLabelsEarlyExitOnAllFound) {
+  constexpr std::array<absl::string_view, 3> kKeys{"a", "b", "c"};
+  const std::array<MetricLabel, 5> labels = {
+      MetricLabel{.key = "b", .value = "2"},
+      MetricLabel{.key = "a", .value = "1"},
+      MetricLabel{.key = "c", .value = "3"},
+      MetricLabel{.key = "d", .value = "4"},
+      MetricLabel{.key = "e", .value = "5"},
+  };
+  const std::array<absl::string_view, 3> resolved =
+      ResolveLabels(labels, kKeys);
+  EXPECT_THAT(resolved, ElementsAre("1", "2", "3"));
+}
+
+TEST(LabelUtilTest, ResolveLabelsConstexprEvaluation) {
+  constexpr std::array<absl::string_view, 0> kZeroKeys{};
+  static_assert(ResolveLabels({}, kZeroKeys).empty());
+
+  constexpr std::array<absl::string_view, 2> kKeys{"a", "b"};
+  constexpr std::array<MetricLabel, 2> kLabels = {
+      MetricLabel{.key = "b", .value = "2"},
+      MetricLabel{.key = "a", .value = "1"},
+  };
+  constexpr auto kResolved = ResolveLabels(kLabels, kKeys);
+  static_assert(kResolved[0] == "1");
+  static_assert(kResolved[1] == "2");
+
+  // Missing label falls back to default value at compile time
+  constexpr std::array<MetricLabel, 1> kPartialLabels = {
+      MetricLabel{.key = "b", .value = "val_b"},
+  };
+  constexpr auto kPartialResolved =
+      ResolveLabels(kPartialLabels, kKeys, "default");
+  static_assert(kPartialResolved[0] == "default");
+  static_assert(kPartialResolved[1] == "val_b");
 }
 
 }  // namespace

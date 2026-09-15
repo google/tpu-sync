@@ -29,6 +29,7 @@
 
 #include "absl/cleanup/cleanup.h"
 #include "absl/log/check.h"
+#include "absl/status/status.h"
 #include "absl/strings/str_format.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
@@ -132,7 +133,6 @@ TEST(HostMemoryAllocatorTest, SharedMemoryColdAndWarmBoot) {
   schema1.version = 1;
   absl::SNPrintF(schema1.model_uid, sizeof(schema1.model_uid), "test_model_v1");
   schema1.num_blocks = 128;
-  schema1.block_size = 4096;
   schema1.num_heads = 32;
   schema1.head_dim = 128;
   schema1.itemsize = 2;
@@ -325,12 +325,16 @@ TEST(HostMemoryAllocatorTest, SharedMemoryBlockSizeChangeColdStarts) {
                             allocator->Allocate(8192));
     std::memset(alloc.ptr, 0x77, 8192);
   }
-  EXPECT_EQ(ReadSegmentHeader(shm_key).block_size, 8192 / 4);
+  {
+    SharedMemoryHeader header = ReadSegmentHeader(shm_key);
+    EXPECT_EQ(header.region_count, 1u);
+    EXPECT_EQ(header.region_sizes[0], 8192u);
+  }
 
   {
-    // Same block count and identity, but halved bytes per block: the halved
-    // request divides the recorded payload evenly, so only the recorded
-    // block size tells the layouts apart. The segment must cold-start.
+    // Same block count and identity, but halved bytes per block: only the
+    // recorded first region size tells the layouts apart. The segment must
+    // cold-start.
     TF_ASSERT_OK_AND_ASSIGN(
         auto allocator,
         SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
@@ -340,7 +344,8 @@ TEST(HostMemoryAllocatorTest, SharedMemoryBlockSizeChangeColdStarts) {
       ASSERT_EQ(alloc.ptr[i], 0);
     }
     SharedMemoryHeader header = ReadSegmentHeader(shm_key);
-    EXPECT_EQ(header.block_size, 4096 / 4);
+    EXPECT_EQ(header.region_count, 1u);
+    EXPECT_EQ(header.region_sizes[0], 4096u);
     EXPECT_EQ(header.total_payload_bytes, 4096);
   }
 
@@ -396,7 +401,7 @@ TEST(HostMemoryAllocatorTest, SharedMemoryVersionOneSegmentColdStarts) {
     ASSERT_EQ(alloc.ptr[i], 0);
   }
   SharedMemoryHeader header = ReadSegmentHeader(shm_key);
-  EXPECT_EQ(header.version, 2);
+  EXPECT_EQ(header.version, 3);
   EXPECT_EQ(header.reference_count, 1);
   EXPECT_EQ(header.total_payload_bytes, 4096);
 
@@ -420,8 +425,8 @@ TEST(HostMemoryAllocatorTest, SharedMemoryRequestSizeChangeColdStarts) {
   }
 
   {
-    // A different request size means a different region layout; the recorded
-    // payload no longer divides into it, so the segment cold-starts.
+    // A different first request size means a different region layout, so
+    // the segment cold-starts.
     TF_ASSERT_OK_AND_ASSIGN(
         auto allocator,
         SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
@@ -431,6 +436,88 @@ TEST(HostMemoryAllocatorTest, SharedMemoryRequestSizeChangeColdStarts) {
       ASSERT_EQ(alloc.ptr[i], 0);
     }
     EXPECT_EQ(ReadSegmentHeader(shm_key).total_payload_bytes, 8192);
+  }
+
+  shm_unlink(shm_key.c_str());
+}
+
+TEST(HostMemoryAllocatorTest, SharedMemoryHeterogeneousRegionsRecover) {
+  std::string shm_key = "/test_raiden_shm_hetero_" + std::to_string(getpid());
+  shm_unlink(shm_key.c_str());
+
+  // A hybrid model's block arrays: same block count, three different row
+  // widths, so the segment's regions differ in size.
+  SharedMemoryHeader schema = {};
+  absl::SNPrintF(schema.model_uid, sizeof(schema.model_uid), "hetero_model");
+  schema.num_blocks = 4;
+  const std::vector<size_t> region_bytes = {16384, 4096, 8192};
+
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    for (size_t i = 0; i < region_bytes.size(); ++i) {
+      TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
+                              allocator->Allocate(region_bytes[i]));
+      std::memset(alloc.ptr, 0x30 + static_cast<int>(i), region_bytes[i]);
+    }
+  }
+
+  SharedMemoryHeader header = ReadSegmentHeader(shm_key);
+  ASSERT_EQ(header.region_count, 3u);
+  EXPECT_EQ(header.region_sizes[0], 16384u);
+  EXPECT_EQ(header.region_sizes[1], 4096u);
+  EXPECT_EQ(header.region_sizes[2], 8192u);
+  EXPECT_EQ(header.total_payload_bytes, 16384u + 4096u + 8192u);
+
+  {
+    // A restart replays the same sequence and must get every region's own
+    // bytes back.
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    for (size_t i = 0; i < region_bytes.size(); ++i) {
+      TF_ASSERT_OK_AND_ASSIGN(HostBufferAllocation alloc,
+                              allocator->Allocate(region_bytes[i]));
+      for (size_t b = 0; b < region_bytes[i]; ++b) {
+        ASSERT_EQ(alloc.ptr[b], 0x30 + static_cast<int>(i))
+            << "region " << i << " byte " << b;
+      }
+    }
+  }
+
+  shm_unlink(shm_key.c_str());
+}
+
+TEST(HostMemoryAllocatorTest, SharedMemoryMidSequenceSizeChangeFails) {
+  std::string shm_key = "/test_raiden_shm_midseq_" + std::to_string(getpid());
+  shm_unlink(shm_key.c_str());
+
+  SharedMemoryHeader schema = {};
+  absl::SNPrintF(schema.model_uid, sizeof(schema.model_uid), "midseq_model");
+
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    ASSERT_TRUE(allocator->Allocate(4096).ok());
+    ASSERT_TRUE(allocator->Allocate(8192).ok());
+  }
+
+  {
+    // The first region still matches, so the segment warm-attaches; the
+    // second region's recovered bytes would sit at the wrong offset for a
+    // different size, and by now a cold restart is no longer possible, so
+    // the mismatch must fail instead.
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto allocator,
+        SharedMemoryHostMemoryAllocator::Create(nullptr, shm_key, schema));
+    ASSERT_TRUE(allocator->Allocate(4096).ok());
+    absl::StatusOr<HostBufferAllocation> mismatched =
+        allocator->Allocate(16384);
+    EXPECT_EQ(mismatched.status().code(),
+              absl::StatusCode::kFailedPrecondition)
+        << mismatched.status().ToString();
   }
 
   shm_unlink(shm_key.c_str());

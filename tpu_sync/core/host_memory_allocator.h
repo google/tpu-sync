@@ -125,35 +125,46 @@ class ScopedShmLock {
   int fd_ = -1;
 };
 
+// Capacity of SharedMemoryHeader's region table. Regions are one per block
+// array and shard served from the segment's device, so real layouts stay
+// far below this; the table must still fit the header page with room for
+// the fixed fields.
+inline constexpr size_t kMaxShmRegions = 256;
+
 struct alignas(64) SharedMemoryHeader {
   uint64_t magic = 0x52414944454E5348;  // "RAIDENSH"
-  // Segment layout revision; a mismatch cold-starts the segment. Version 2
-  // placed each allocation in its own page-aligned region after the header
-  // page (version 1 segments held a single payload right after the header).
-  uint32_t version = 2;
+  // Segment layout revision; a mismatch cold-starts the segment. Version 3
+  // records each region's size in the header table below (version 2 assumed
+  // one uniform region size; version 1 segments held a single payload right
+  // after the header).
+  uint32_t version = 3;
   char model_uid[256] = {0};
   uint32_t global_mesh_shape[5] = {0};
   uint32_t shard_layout[5] = {0};
   // Number of blocks in the host pool this segment backs;
   uint32_t num_blocks = 0;
-  // Bytes per block, derived by the allocator from its first allocation
-  // (0 when num_blocks is unknown).
-  uint32_t block_size = 0;
   uint32_t num_heads = 0;
   uint32_t head_dim = 0;
   uint32_t itemsize = 0;
-  // Cumulative payload bytes ever allocated from this segment. A warm boot
-  // replays its allocations in order against this bound.
+  // Cumulative payload bytes ever allocated from this segment; always the
+  // sum of the recorded region sizes.
   uint64_t total_payload_bytes = 0;
   uint32_t reference_count = 0;
+  // The recovery layout: the page-aligned size of every region ever
+  // allocated from this segment, in allocation order. Regions may differ in
+  // size -- a hybrid model's block arrays do -- and a warm boot replays its
+  // allocations against this table.
+  uint32_t region_count = 0;
+  uint64_t region_sizes[kMaxShmRegions] = {0};
 };
 
 // Persists host KV mirrors across process restarts in POSIX shared memory.
 // Each device gets one segment (ComposeSegmentName); within it, allocations
 // occupy consecutive page-aligned regions after the header page, in
-// allocation order. Whether a run is warm (re-attaching to a predecessor's
-// data) or cold is decided once, when the segment is first opened; every
-// later allocation follows that decision.
+// allocation order, each recorded in the header's region table so sizes may
+// differ. Whether a run is warm (re-attaching to a predecessor's data) or
+// cold is decided once, when the segment is first opened; every later
+// allocation follows that decision and must match the recorded layout.
 class SharedMemoryHostMemoryAllocator : public HostMemoryAllocator {
  public:
   // Payload regions start page-aligned after the header so that each can be
@@ -207,10 +218,11 @@ class SharedMemoryHostMemoryAllocator : public HostMemoryAllocator {
     bool warm = false;
     // Payload bytes handed out from this segment so far in this run.
     size_t payload_cursor = 0;
-    // The uniform page-aligned per-allocation size, set by the first
-    // allocation; the recovery layout assumes it, so later allocations must
-    // match it.
-    size_t region_size = 0;
+    // Position of the next allocation in the segment's region sequence.
+    uint32_t alloc_index = 0;
+    // The header's region_count at open time: allocations below it replay
+    // the recorded layout, allocations at or past it are fresh regions.
+    uint32_t recovered_region_count = 0;
     // The warm->degraded transition has been logged for this segment.
     bool degradation_warned = false;
     // The segment's first page, mapped for the allocator's lifetime.

@@ -48,6 +48,10 @@ from absl import app
 from absl import flags
 from absl.testing import absltest
 
+# Load order, not convenience: jaxlib must initialize XLA before
+# `_tpu_raiden_jax` is loaded, or the phase subprocesses die on SIGILL.
+import jax  # pylint: disable=unused-import
+
 _PHASE = flags.DEFINE_string(
     "phase", None, "The e2e test phase to run in this subprocess."
 )
@@ -56,6 +60,12 @@ _SIGKILL = 9
 
 _NUM_BLOCKS = 2
 _SHAPE = (_NUM_BLOCKS, 128, 8, 8, 128)  # float32
+# Mimic the compressed MLA cache a DeepSeek-V4/GLM rank registers next to a
+# cache shaped like _SHAPE: the same block count, but a quarter of the rows per
+# block (compress_ratio 4) and one packed 640-byte latent record per row
+# (kv_lora_rank + two-byte rope dims + scales, aligned to 128 bytes; 160
+# float32 lanes here) instead of eight 128-wide heads.
+_SHAPE_MLA_COMPRESSED = (_NUM_BLOCKS, 32, 1, 1, 160)  # float32
 _HASHES = [b"hash_0", b"hash_1"]
 
 # The phases run in subprocesses, so their detailed assertions are invisible
@@ -88,7 +98,6 @@ def _array_fill(shape, index):
 
 def _make_caches(host_arrays, num_devices=1):
   """Puts each host array on the mesh with the layout the manager expects."""
-  import jax
   import jax.numpy as jnp
   import numpy as np
 
@@ -366,6 +375,19 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
     self.assertIn(_PHASE_B_RECOVERED_MARKER, result.stdout)
     self.assertIn(_PHASE_B_BYTES_MARKER, result.stdout)
 
+  def test_recovers_heterogeneous_arrays_after_crash(self):
+    # A full-width cache and a compressed MLA cache (fewer rows per block,
+    # one packed latent head) allocate two differently sized regions in one
+    # segment; each must come back as its own bytes.
+    self._crash_phase_a(phase="a_hetero")
+
+    result = self._run_phase("b_hetero", "recovery_model")
+    self.assertEqual(
+        result.returncode, 0, f"phase B failed:\n{result.stderr[-4000:]}"
+    )
+    self.assertIn(_PHASE_B_RECOVERED_MARKER, result.stdout)
+    self.assertIn(_PHASE_B_BYTES_MARKER, result.stdout)
+
   def test_recovers_sharded_array_after_crash(self):
     # Two shards of one array allocate through the same allocator instance;
     # each shard's mirror must be its own memory.
@@ -413,6 +435,10 @@ def main(argv):
     _phase_a(shapes=(_SHAPE, _SHAPE))
   elif _PHASE.value == "b_hybrid":
     _phase_b(expect_recovery=True, shapes=(_SHAPE, _SHAPE))
+  elif _PHASE.value == "a_hetero":
+    _phase_a(shapes=(_SHAPE, _SHAPE_MLA_COMPRESSED))
+  elif _PHASE.value == "b_hetero":
+    _phase_b(expect_recovery=True, shapes=(_SHAPE, _SHAPE_MLA_COMPRESSED))
   elif _PHASE.value == "a_sharded":
     _phase_a(num_shards=2, num_devices=2)
   elif _PHASE.value == "b_sharded":

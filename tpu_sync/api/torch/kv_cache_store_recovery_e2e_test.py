@@ -57,6 +57,12 @@ _SIGKILL = 9
 
 _NUM_BLOCKS = 2
 _SHAPE = (_NUM_BLOCKS, 128, 8, 8, 128)  # float32
+# Mimic the compressed MLA cache a DeepSeek-V4/GLM rank registers next to a
+# cache shaped like _SHAPE: the same block count, but a quarter of the rows per
+# block (compress_ratio 4) and one packed 640-byte latent record per row
+# (kv_lora_rank + two-byte rope dims + scales, aligned to 128 bytes; 160
+# float32 lanes here) instead of eight 128-wide heads.
+_SHAPE_MLA_COMPRESSED = (_NUM_BLOCKS, 32, 1, 1, 160)  # float32
 _HASHES = [b"hash_0", b"hash_1"]
 
 # The phases run in subprocesses, so their detailed assertions are invisible
@@ -332,6 +338,19 @@ class KVCacheStoreRecoveryE2ETest(absltest.TestCase):
     )
     self.assertIn(_PHASE_B_COLD_MARKER, result.stdout)
 
+  def test_recovers_heterogeneous_arrays_after_crash(self):
+    # A full-width cache and a compressed MLA cache (fewer rows per block,
+    # one packed latent head) allocate two differently sized regions in one
+    # segment; each must come back as its own bytes.
+    self._crash_phase_a(phase="a_hetero")
+
+    result = self._run_phase("b_hetero", "recovery_model")
+    self.assertEqual(
+        result.returncode, 0, f"phase B failed:\n{result.stderr[-4000:]}"
+    )
+    self.assertIn(_PHASE_B_RECOVERED_MARKER, result.stdout)
+    self.assertIn(_PHASE_B_BYTES_MARKER, result.stdout)
+
   def test_recovers_hybrid_model_arrays_after_crash(self):
     # A hybrid model's KV pool reaches the manager as several backing arrays,
     # all reshaped to one uniform kernel geometry (the connectors pad every
@@ -377,6 +396,10 @@ def main(argv):
     _phase_b(expect_recovery=True)
   elif _PHASE.value == "b_cold":
     _phase_b(expect_recovery=False)
+  elif _PHASE.value == "a_hetero":
+    _phase_a(shapes=(_SHAPE, _SHAPE_MLA_COMPRESSED))
+  elif _PHASE.value == "b_hetero":
+    _phase_b(expect_recovery=True, shapes=(_SHAPE, _SHAPE_MLA_COMPRESSED))
   elif _PHASE.value == "a_hybrid":
     _phase_a(shapes=(_SHAPE, _SHAPE))
   elif _PHASE.value == "b_hybrid":

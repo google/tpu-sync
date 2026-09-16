@@ -167,7 +167,9 @@ class TelemetryBindingTest(absltest.TestCase):
     sent_bytes_meta = metrics[0]
     self.assertEqual(sent_bytes_meta.name, "sent_bytes_total")
     self.assertIn("sent", sent_bytes_meta.description.lower())
-    self.assertEqual(sent_bytes_meta.label_names, [])
+    self.assertEqual(
+        sent_bytes_meta.label_names, ["direction", "src_ip", "dst_ip"]
+    )
     self.assertEqual(
         sent_bytes_meta.buckets,
         [
@@ -198,7 +200,7 @@ class TelemetryBindingTest(absltest.TestCase):
     repr_str = repr(sent_bytes_meta)
     self.assertIn("sent_bytes_total", repr_str)
     self.assertIn("MetricType.COUNTER", repr_str)
-    self.assertIn("label_names=[]", repr_str)
+    self.assertIn("label_names=['direction', 'src_ip', 'dst_ip']", repr_str)
 
     # Test equality with same object / identical values
     self.assertEqual(sent_bytes_meta, metrics[0])
@@ -211,15 +213,37 @@ class TelemetryBindingTest(absltest.TestCase):
 
     # Verify label names for all standard metrics
     metrics_by_name = {m.name: m for m in metrics}
-    self.assertEqual(metrics_by_name["sent_bytes_total"].label_names, [])
-    self.assertEqual(metrics_by_name["received_bytes_total"].label_names, [])
     self.assertEqual(
-        metrics_by_name["transfer_failures_total"].label_names, []
+        metrics_by_name["sent_bytes_total"].label_names,
+        ["direction", "src_ip", "dst_ip"],
     )
+    self.assertEqual(
+        metrics_by_name["received_bytes_total"].label_names,
+        ["direction"],
+    )
+    self.assertEqual(metrics_by_name["transfer_failures_total"].label_names, [])
     self.assertEqual(metrics_by_name["transfer_duration_ms"].label_names, [])
+    self.assertEqual(
+        metrics_by_name["p2p_transfer_time_ms"].label_names,
+        ["src_ip", "dst_ip"],
+    )
+    self.assertEqual(
+        metrics_by_name["h2d_bytes_total"].label_names,
+        ["host_ip", "local_rank"],
+    )
+    self.assertEqual(
+        metrics_by_name["h2d_transfer_time_ms"].label_names,
+        ["host_ip", "local_rank"],
+    )
+    self.assertEqual(
+        metrics_by_name["d2h_bytes_total"].label_names,
+        ["host_ip", "local_rank"],
+    )
+    self.assertEqual(
+        metrics_by_name["d2h_transfer_time_ms"].label_names,
+        ["host_ip", "local_rank"],
+    )
     self.assertEqual(metrics_by_name["buffer_allocated_bytes"].label_names, [])
-    self.assertEqual(metrics_by_name["h2d_transfer_time_ms"].label_names, [])
-    self.assertEqual(metrics_by_name["d2h_transfer_time_ms"].label_names, [])
 
   def test_get_metric_metadata_empty_when_no_backends(self):
     telemetry_ext.configure_telemetry([])

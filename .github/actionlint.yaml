@@ -12,21 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-package(default_visibility = ["//visibility:public"])
-
-exports_files([
-    "LICENSE",
-    "README.md",
-])
-
-config_setting(
-    name = "jax_disabled",
-    values = {"define": "with_jax=false"},
-    visibility = ["//visibility:public"],
-)
-
-config_setting(
-    name = "torch_disabled",
-    values = {"define": "with_torch=false"},
-    visibility = ["//visibility:public"],
-)
+# Declares the self-hosted runner labels used by the workflows so actionlint
+# does not flag them as unknown. CPU jobs run on n2-32; TPU device tests on the
+# v5e scale-set (the v7/tpu7x scale-set is not available to this repo).
+self-hosted-runner:
+  labels:
+    - linux-x86-n2-32              # CPU
+    - linux-x86-ct5lp-224-8tpu     # TPU v5e, 8 chips

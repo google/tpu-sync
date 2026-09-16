@@ -178,6 +178,13 @@ fi
 # is unique per build and appears verbatim in the filename, so scope to it.
 WHEEL_GLOB="${WHEEL_DIST}-*${WHEEL_VERSION_EXTRAS}-*.whl"
 
+# The jax wheel's three extensions each carry a static copy of the runtime;
+# with default symbol visibility their export tables alone put the wheel
+# over PyPI's 100 MB file limit. Hidden visibility keeps only the module
+# entry points exported and shrinks the wheel to about a third.
+if [[ "${BUILD_MODE}" == "jax" ]]; then
+  EXTRA_BAZEL_FLAGS+=" --copt=-fvisibility=hidden --cxxopt=-fvisibility-inlines-hidden"
+fi
 ./build.sh "${BUILD_MODE}" "${WHEEL_TARGET}" \
   --repo_env=WHEEL_VERSION_EXTRAS="${WHEEL_VERSION_EXTRAS}" \
   ${EXTRA_BAZEL_FLAGS}

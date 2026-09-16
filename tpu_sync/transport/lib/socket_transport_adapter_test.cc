@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -31,8 +32,11 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/notification.h"
 #include "absl/types/span.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
+#include "tpu_sync/telemetry/mock_metrics_backend.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
@@ -44,6 +48,39 @@ namespace {
 
 using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
+using ::testing::AllOf;
+using ::testing::ElementsAre;
+using ::testing::Eq;
+using ::testing::Field;
+using ::testing::Ge;
+
+auto MatchP2pLabels(absl::string_view src_ip, absl::string_view dst_ip) {
+  return ElementsAre(AllOf(Field(&telemetry::MetricLabel::key,
+                                 telemetry::metric_labels::kSrcIp),
+                           Field(&telemetry::MetricLabel::value, src_ip)),
+                     AllOf(Field(&telemetry::MetricLabel::key,
+                                 telemetry::metric_labels::kDstIp),
+                           Field(&telemetry::MetricLabel::value, dst_ip)));
+}
+
+auto MatchBytesLabels(absl::string_view direction, absl::string_view src_ip,
+                      absl::string_view dst_ip) {
+  return ElementsAre(AllOf(Field(&telemetry::MetricLabel::key,
+                                 telemetry::metric_labels::kDirection),
+                           Field(&telemetry::MetricLabel::value, direction)),
+                     AllOf(Field(&telemetry::MetricLabel::key,
+                                 telemetry::metric_labels::kSrcIp),
+                           Field(&telemetry::MetricLabel::value, src_ip)),
+                     AllOf(Field(&telemetry::MetricLabel::key,
+                                 telemetry::metric_labels::kDstIp),
+                           Field(&telemetry::MetricLabel::value, dst_ip)));
+}
+
+auto MatchDirectionLabel(absl::string_view dir) {
+  return ElementsAre(AllOf(
+      Field(&telemetry::MetricLabel::key, telemetry::metric_labels::kDirection),
+      Field(&telemetry::MetricLabel::value, dir)));
+}
 
 std::string GetIpPort(const RawBufferTransport& transport) {
   return absl::StrCat("127.0.0.1:", transport.local_port());
@@ -58,6 +95,31 @@ TEST(SocketTransportAdapterTest, PostWithEmptyRequestsFails) {
       /*src_block_ids=*/{}, /*dst_block_ids=*/{}, /*on_complete=*/nullptr);
 
   EXPECT_THAT(result.status(), StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST(SocketTransportAdapterTest, PostWithEmptyPeersFails) {
+  RawBufferTransport raw_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  SocketTransportAdapter adapter(&raw_transport, /*parallelism=*/1);
+
+  Request push_req = {};
+  push_req.socket_opcode = 1;
+  push_req.parallelism = 1;
+
+  auto push_result = adapter.Post(
+      /*peers=*/{}, /*requests=*/absl::MakeConstSpan(&push_req, 1),
+      /*src_block_ids=*/{}, /*dst_block_ids=*/{}, /*on_complete=*/nullptr);
+  EXPECT_THAT(push_result.status(),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+
+  Request pull_req = {};
+  pull_req.socket_opcode = 2;
+  pull_req.parallelism = 1;
+
+  auto pull_result = adapter.Post(
+      /*peers=*/{}, /*requests=*/absl::MakeConstSpan(&pull_req, 1),
+      /*src_block_ids=*/{}, /*dst_block_ids=*/{}, /*on_complete=*/nullptr);
+  EXPECT_THAT(pull_result.status(),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST(SocketTransportAdapterTest, PostWithInvalidParallelismFails) {
@@ -297,6 +359,168 @@ TEST(SocketTransportAdapterTest, PostSocketPullOp2Success) {
 
   ASSERT_THAT(handle.status(), absl_testing::IsOk());
   EXPECT_THAT(recv_buf, ::testing::ElementsAre(1, 2, 3, 4));
+}
+
+TEST(SocketTransportAdapterTest,
+     PostSocketPushMultiStreamBatchBarrierTelemetry) {
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  auto* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset reset(std::move(mock_backend));
+
+  // Expect exactly 1 observation at the barrier for all streams in the pair.
+  EXPECT_CALL(*raw_mock, ObserveHistogram(
+                             Eq(telemetry::metric_names::kP2pTransferTimeMs),
+                             MatchP2pLabels("127.0.0.1", "127.0.0.1"), Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(
+                  Eq(telemetry::metric_names::kSentBytesTotal),
+                  MatchBytesLabels(telemetry::metric_labels::kDirectionPush,
+                                   "127.0.0.1", "127.0.0.1"),
+                  Eq(8)))
+      .Times(2);
+
+  auto server_handler = [](int client_fd,
+                           const ChunkHeader& header) -> absl::Status {
+    if (header.op != 1) {
+      return absl::InvalidArgumentError("Expected op 1");
+    }
+    std::vector<int> allocated_ids(header.count_or_size, 200);
+    const std::vector<uint8_t> s_ids = SerializeBlockIds(allocated_ids);
+    if (auto s = ::peregrine::WriteExact(client_fd, s_ids.data(), s_ids.size());
+        !s.ok()) {
+      return s;
+    }
+
+    for (size_t i = 0; i < header.count_or_size; ++i) {
+      uint8_t size_buf[kChunkSizeFieldSize];
+      if (auto s =
+              ::peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf));
+          !s.ok()) {
+        return s;
+      }
+      const uint32_t chunk_size = DeserializeChunkSize(size_buf);
+      std::vector<uint8_t> payload(chunk_size);
+      if (chunk_size > 0) {
+        if (auto s = ::peregrine::ReadExact(client_fd, payload.data(),
+                                            payload.size());
+            !s.ok()) {
+          return s;
+        }
+      }
+    }
+
+    uint8_t ack = 1;
+    return ::peregrine::WriteExact(client_fd, &ack, 1);
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{"127.0.0.1"});
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/2);
+
+  std::vector<uint8_t> test_data(8, 1);
+  std::vector<Request> reqs(2);
+  for (int i = 0; i < 2; ++i) {
+    reqs[i].socket_opcode = 1;
+    reqs[i].laddr = test_data.data();
+    reqs[i].len = test_data.size();
+    reqs[i].count_or_size = 1;
+    reqs[i].uuid = 500;
+    reqs[i].parallelism = 2;
+    reqs[i].request_id = i;
+    reqs[i].stream_idx = i;
+  }
+
+  absl::Notification done;
+  absl::StatusOr<std::vector<int>> push_result;
+  std::vector<int> src_bids = {10, 11};
+  auto handle = client_adapter.Post(
+      /*peers=*/{GetIpPort(server_transport)},
+      /*requests=*/reqs,
+      /*src_block_ids=*/src_bids,
+      /*dst_block_ids=*/{}, [&](absl::StatusOr<std::vector<int>> res) {
+        push_result = std::move(res);
+        done.Notify();
+      });
+
+  ASSERT_THAT(handle.status(), absl_testing::IsOk());
+  done.WaitForNotification();
+  ASSERT_THAT(push_result, IsOkAndHolds(ElementsAre(200, 200)));
+}
+
+TEST(SocketTransportAdapterTest,
+     PostSocketPullMultiStreamBatchBarrierTelemetry) {
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  auto* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset reset(std::move(mock_backend));
+
+  // Expect exactly 1 observation at the barrier for all streams in the pair.
+  EXPECT_CALL(*raw_mock, ObserveHistogram(
+                             Eq(telemetry::metric_names::kP2pTransferTimeMs),
+                             MatchP2pLabels("127.0.0.1", "127.0.0.1"), Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(
+          Eq(telemetry::metric_names::kReceivedBytesTotal),
+          MatchDirectionLabel(telemetry::metric_labels::kDirectionPullResponse),
+          Eq(4)))
+      .Times(2);
+
+  auto server_handler = [](int client_fd,
+                           const ChunkHeader& header) -> absl::Status {
+    if (header.op != 2) {
+      return absl::InvalidArgumentError("Expected op 2");
+    }
+    ChunkHeader resp = header;
+    const auto s_resp = SerializeChunkHeader(resp);
+    if (auto s =
+            ::peregrine::WriteExact(client_fd, s_resp.data(), s_resp.size());
+        !s.ok()) {
+      return s;
+    }
+
+    std::vector<uint8_t> payload = {1, 2, 3, 4};
+    const auto s_size = SerializeChunkSize(payload.size());
+    if (auto s =
+            ::peregrine::WriteExact(client_fd, s_size.data(), s_size.size());
+        !s.ok()) {
+      return s;
+    }
+    return ::peregrine::WriteExact(client_fd, payload.data(), payload.size());
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{"127.0.0.1"});
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/2);
+
+  std::vector<uint8_t> recv_buf0(4, 0);
+  std::vector<uint8_t> recv_buf1(4, 0);
+  std::vector<Request> reqs(2);
+  for (int i = 0; i < 2; ++i) {
+    reqs[i].socket_opcode = 2;
+    reqs[i].laddr = (i == 0) ? recv_buf0.data() : recv_buf1.data();
+    reqs[i].len = 4;
+    reqs[i].count_or_size = 1;
+    reqs[i].remote_id = 10 + i;
+    reqs[i].local_id = 20 + i;
+    reqs[i].uuid = 501;
+    reqs[i].parallelism = 2;
+    reqs[i].request_id = i;
+    reqs[i].stream_idx = i;
+  }
+
+  auto handle = client_adapter.Post(
+      /*peers=*/{GetIpPort(server_transport)},
+      /*requests=*/reqs);
+
+  ASSERT_THAT(handle.status(), absl_testing::IsOk());
+  EXPECT_THAT(recv_buf0, ElementsAre(1, 2, 3, 4));
+  EXPECT_THAT(recv_buf1, ElementsAre(1, 2, 3, 4));
 }
 
 std::string GetPeerIp(int client_fd) {

@@ -59,7 +59,7 @@ cc_library(
         ":metrics_api",
         ":metrics_backend",
         "@com_google_absl//absl/strings",
-        "@com_google_googletest//:gtest_for_library_testonly",
+        "@com_google_googletest//:gtest",
     ],
 )
 

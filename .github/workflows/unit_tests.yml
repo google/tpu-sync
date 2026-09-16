@@ -1,0 +1,65 @@
+# CPU unit tests for every pull request, so contributors (including those
+# outside Google) see the test signal on the PR itself rather than only in the
+# internal Kokoro/TAP runs.
+#
+# What runs: every cc_test under //tpu_sync/core and //tpu_sync/kv_cache that
+# is not tagged no_oss, notap, manual, or requires-<resource>. See
+# ci/run_unit_tests.sh -- the selection is a bazel query, so a test added in a
+# PR is picked up by that same PR. TPU-bound tests (requires-ghostfish) are
+# excluded: these runners have no TPU.
+#
+# Builds run in the ml-build container used by the wheel workflows. Runs from
+# a branch of this repo authenticate to the remote bazel cache (--config=ci);
+# fork PRs have no credentials for it and build cold, which is slower but
+# needs no secrets exposed to fork code.
+
+name: Unit Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      test_scope:
+        description: "Bazel package patterns to search for tests"
+        type: string
+        default: "//tpu_sync/core:all //tpu_sync/kv_cache:all"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: "Bazel CPU unit tests"
+    runs-on: linux-x86-n2-32
+    container:
+      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
+    timeout-minutes: 300
+    steps:
+      - name: Checkout tpu-sync
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+          path: tpu-sync
+      # Git security patch (CVE-2022-24765) blocks root from operating on
+      # runner-owned directories. Tell Git explicitly to trust the workspace
+      # inside this ephemeral container.
+      - name: Fix Git Workspace Ownership
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/tpu-sync"
+      - name: Run unit tests
+        working-directory: tpu-sync
+        env:
+          RAIDEN_TEST_SCOPE: ${{ inputs.test_scope || '//tpu_sync/core:all //tpu_sync/kv_cache:all' }}
+          # Fork PRs run without the ambient GCP service account, so the
+          # remote cache is only requested when the head branch lives in this
+          # repository.
+          EXTRA_BAZEL_FLAGS: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '--config=ci' || '' }}
+        run: |
+          export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          bash ci/run_unit_tests.sh

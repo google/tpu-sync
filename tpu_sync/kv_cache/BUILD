@@ -381,6 +381,7 @@ cc_library(
         ":kv_cache_metadata",
         ":kv_cache_store_backend",
         "//tpu_sync/common:raiden_id",
+        "//tpu_sync/kv_cache/backends:backend",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/base:no_destructor",
         "@com_google_absl//absl/container:flat_hash_map",

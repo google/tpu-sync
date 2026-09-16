@@ -41,6 +41,10 @@ service WorkerService {
   // major dimensions (such as layers or blocks).
   rpc TransferBuffers(TransferBuffersRequest) returns (TransferBuffersResponse);
 
+  // Transfers KV blocks between HBM and a storage backend.
+  rpc TransferBackendBuffers(TransferBackendBuffersRequest)
+      returns (TransferBackendBuffersResponse);
+
   // Submits a uniform TransferProgram execution plan to this worker for
   // asynchronous execution.
   rpc SubmitTransferProgram(TransferProgramRequest)
@@ -131,6 +135,52 @@ message DeleteBuffersRequest {
 
 // Response from deallocating sharded buffers.
 message DeleteBuffersResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Transfer direction enum for backend operations.
+enum TransferDirection {
+  TRANSFER_DIR_UNSPECIFIED = 0;
+  TRANSFER_DIR_OFFLOAD = 1;  // Host RAM -> Storage
+  TRANSFER_DIR_RECALL = 2;   // Storage -> Host RAM
+}
+
+// One destination (OFFLOAD) or source (RECALL) backend.
+// A message rather than a bare string so per-tier options (durability,
+// priority, policy) can be added later without a wire break.
+message BackendTransferSpec {
+  // Backend driver name (e.g. "posix", "lustre", "k5").
+  string name = 1;
+}
+
+// Transfers a set of KV blocks between HBM and one or more storage backends.
+//
+// Addressing is strictly BLOCK-GRANULAR: block_hashes, hbm_block_ids and
+// host_block_ids are parallel and of equal length, and entry i describes
+// exactly one block. There is deliberately no byte offset and no run-length
+// dimension on the wire -- one block maps to exactly one backend key, and the
+// worker derives the byte-level scatter/gather layout locally (see
+// KVCacheManagerBase::ResolveBlockSlices).
+message TransferBackendBuffersRequest {
+  TransferDirection direction = 1;
+
+  // Raw block digests. Bytes, not string: binary digests, no UTF-8 guarantee.
+  repeated bytes block_hashes = 2;
+
+  // HBM-side block slot indices (NOT byte offsets).
+  // Source for OFFLOAD, destination for RECALL. Parallel to block_hashes.
+  repeated int64 hbm_block_ids = 3;
+
+  // Host-DRAM staging block slot indices (NOT byte offsets).
+  // Destination for OFFLOAD, source for RECALL. Parallel to block_hashes.
+  repeated int64 host_block_ids = 4;
+
+  // Backends to write (OFFLOAD) or read (RECALL).
+  repeated BackendTransferSpec backend_specs = 5;
+}
+
+message TransferBackendBuffersResponse {
   bool success = 1;
   string message = 2;
 }

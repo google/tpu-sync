@@ -22,6 +22,7 @@
 #include "absl/log/log.h"
 #include "absl/strings/ascii.h"
 #include "absl/time/time.h"
+#include "tpu_sync/core/grpc_control_plane_backend.h"
 
 namespace tpu_raiden {
 
@@ -48,7 +49,13 @@ ControlPlaneBackendType ResolveControlPlaneBackendType(
 std::unique_ptr<ControlPlaneBackend> CreateControlPlaneBackend(
     ControlPlaneBackendType type, ControlPlaneBackend::TaskExecutor executor,
     absl::Duration default_timeout) {
-  LOG(ERROR) << "ControlPlaneBackend implementation not registered yet";
+  switch (type) {
+    case ControlPlaneBackendType::kGrpc:
+      return std::make_unique<GrpcControlPlaneBackend>();
+    case ControlPlaneBackendType::kTcp:
+      LOG(ERROR) << "TcpControlPlaneBackend not registered yet";
+      return nullptr;
+  }
   return nullptr;
 }
 

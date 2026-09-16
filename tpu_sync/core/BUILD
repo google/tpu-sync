@@ -447,6 +447,29 @@ cc_library(
 )
 
 cc_library(
+    name = "tcp_control_plane_backend",
+    srcs = ["tcp_control_plane_backend.cc"],
+    hdrs = ["tcp_control_plane_backend.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":control_plane_backend_hdrs",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_library(
     name = "grpc_control_plane_backend",
     srcs = ["grpc_control_plane_backend.cc"],
     hdrs = ["grpc_control_plane_backend.h"],
@@ -488,6 +511,7 @@ cc_library(
     deps = [
         ":control_plane_backend_hdrs",
         ":grpc_control_plane_backend",
+        ":tcp_control_plane_backend",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -509,6 +533,7 @@ cc_test(
     deps = [
         ":control_plane_backend",
         ":grpc_control_plane_backend",
+        ":tcp_control_plane_backend",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

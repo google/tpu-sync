@@ -18,11 +18,13 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "absl/log/log.h"
 #include "absl/strings/ascii.h"
 #include "absl/time/time.h"
 #include "tpu_sync/core/grpc_control_plane_backend.h"
+#include "tpu_sync/core/tcp_control_plane_backend.h"
 
 namespace tpu_raiden {
 
@@ -53,10 +55,11 @@ std::unique_ptr<ControlPlaneBackend> CreateControlPlaneBackend(
     case ControlPlaneBackendType::kGrpc:
       return std::make_unique<GrpcControlPlaneBackend>();
     case ControlPlaneBackendType::kTcp:
-      LOG(ERROR) << "TcpControlPlaneBackend not registered yet";
-      return nullptr;
+      return std::make_unique<TcpControlPlaneBackend>(std::move(executor),
+                                                      default_timeout);
   }
-  return nullptr;
+  return std::make_unique<TcpControlPlaneBackend>(std::move(executor),
+                                                  default_timeout);
 }
 
 }  // namespace tpu_raiden

@@ -15,6 +15,7 @@
 #include "tpu_sync/core/control_plane_backend.h"
 
 #include <stdlib.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cstdint>
@@ -36,6 +37,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "tpu_sync/core/grpc_control_plane_backend.h"
+#include "tpu_sync/core/tcp_control_plane_backend.h"
 
 namespace tpu_raiden {
 namespace {
@@ -97,6 +99,8 @@ class MockControlPlaneHandler : public ControlPlaneHandler {
   AckCallback ack_cb_ ABSL_GUARDED_BY(mu_);
 };
 
+// Simple thread-spawning executor for tests so TCP handlers can run
+// concurrently or sleep without blocking the accept loop.
 ControlPlaneBackend::TaskExecutor AsyncTestExecutor() {
   return
       [](std::function<void()> task) { std::thread(std::move(task)).detach(); };
@@ -250,6 +254,25 @@ TEST_P(ControlPlaneBackendTest, SendAckRoundTrip) {
   absl::Status status = client->SendAck(endpoint, 777888, absl::Seconds(5));
   ASSERT_TRUE(status.ok()) << status;
   EXPECT_EQ(acked_uuid.load(), 777888u);
+
+  if (GetParam() == ControlPlaneBackendType::kTcp) {
+    // Verify raw TCP kOpAck header routes to OnAck on TCP backend.
+    absl::StatusOr<int> fd = TcpControlPlaneBackend::ConnectTcp(endpoint, 5.0);
+    ASSERT_TRUE(fd.ok()) << fd.status();
+    TcpControlPlaneBackend::ControlRequestHeader req;
+    req.magic = TcpControlPlaneBackend::kControlMagic;
+    req.op = TcpControlPlaneBackend::kOpAck;
+    req.uuid = 999111;
+    req.num_blocks = 0;
+    ASSERT_TRUE(
+        TcpControlPlaneBackend::WriteExact(*fd, &req, sizeof(req)).ok());
+    TcpControlPlaneBackend::ControlResponseHeader resp;
+    ASSERT_TRUE(
+        TcpControlPlaneBackend::ReadExact(*fd, &resp, sizeof(resp)).ok());
+    close(*fd);
+    EXPECT_EQ(resp.status, 0);
+    EXPECT_EQ(acked_uuid.load(), 999111u);
+  }
   server->StopServer();
 }
 
@@ -346,8 +369,9 @@ TEST_P(ControlPlaneBackendTest, ConcurrentRequestsOverSharedBackend) {
   server->StopServer();
 }
 
-INSTANTIATE_TEST_SUITE_P(GrpcOnly, ControlPlaneBackendTest,
-                         ::testing::Values(ControlPlaneBackendType::kGrpc));
+INSTANTIATE_TEST_SUITE_P(TcpAndGrpc, ControlPlaneBackendTest,
+                         ::testing::Values(ControlPlaneBackendType::kTcp,
+                                           ControlPlaneBackendType::kGrpc));
 
 TEST(ExtractIpFromGrpcPeerTest, HandlesAllFormats) {
   EXPECT_EQ(ExtractIpFromGrpcPeer("ipv4:10.210.0.4:54321"), "10.210.0.4");

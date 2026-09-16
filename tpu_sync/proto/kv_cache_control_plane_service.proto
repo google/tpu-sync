@@ -1,0 +1,82 @@
+// Copyright 2026 Google LLC.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package tpu_raiden.control_plane.proto;
+
+option java_multiple_files = true;
+
+// Request sent by a KV cache consumer to initiate a pull stream (hybrid push)
+// from a remote producer holding the target KV cache blocks.
+// Maps 1:1 to KVCacheManagerWithTransfer::ControlRequestHeader + block IDs.
+message PullStreamRequest {
+  // Unique transfer identifier matching the producer's registered SendEntry.
+  uint64 uuid = 1;
+
+  // Endpoint index within the consumer transfer group.
+  uint32 ep_idx = 2;
+
+  // TCP/RDMA data plane port on which the consumer's BlockTransport server
+  // is listening for incoming pushes.
+  uint32 consumer_data_port = 3;
+
+  // Consumer IP addresses (IPv4 or IPv6 strings) across available NICs.
+  // If empty, the server falls back to extracting the peer IP from the RPC
+  // connection context.
+  repeated string consumer_ips = 4;
+
+  // Producer-side source block IDs to read from.
+  repeated int64 src_block_ids = 5 [packed = true];
+
+  // Consumer-side destination host block IDs to write into.
+  repeated int64 dst_block_ids = 6 [packed = true];
+}
+
+// Response returned by the producer acknowledging validation of the pull
+// request before launching asynchronous data plane push tasks.
+// Maps 1:1 to KVCacheManagerWithTransfer::ControlResponseHeader.
+message PullStreamResponse {
+  // 0 indicates success; non-zero indicates producer rejection.
+  int32 status = 1;
+
+  // Total number of layers * shards registered on the producer.
+  uint32 num_layers = 2;
+
+  // Producer's local data plane port.
+  uint32 data_port = 3;
+
+  // Optional human-readable diagnostic message on error.
+  string message = 4;
+}
+
+// Notification sent by a peer to acknowledge completion or empty stream.
+message AckRequest {
+  uint64 uuid = 1;
+}
+
+message AckResponse {
+  int32 status = 1;
+  string message = 2;
+}
+
+// gRPC service for KV Cache Manager peer-to-peer control plane handshakes.
+service KVCacheControlPlaneService {
+  // Validates a consumer pull stream request and triggers async producer
+  // pushes.
+  rpc PullStream(PullStreamRequest) returns (PullStreamResponse) {}
+
+  // Notifies the remote peer of transfer acknowledgment.
+  rpc Ack(AckRequest) returns (AckResponse) {}
+}

@@ -134,3 +134,21 @@ py_grpc_library(
     visibility = ["//visibility:public"],
     deps = [":kv_cache_store_service_py_pb2"],
 )
+
+proto_library(
+    name = "kv_cache_control_plane_service_proto",
+    srcs = ["kv_cache_control_plane_service.proto"],
+)
+
+cc_proto_library(
+    name = "kv_cache_control_plane_service_cc_proto",
+    visibility = ["//visibility:public"],
+    deps = [":kv_cache_control_plane_service_proto"],
+)
+
+cc_grpc_library(
+    name = "kv_cache_control_plane_service_cc_grpc",
+    srcs = [":kv_cache_control_plane_service_proto"],
+    visibility = ["//visibility:public"],
+    deps = [":kv_cache_control_plane_service_cc_proto"],
+)

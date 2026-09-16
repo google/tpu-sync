@@ -430,6 +430,59 @@ cc_test(
 )
 
 cc_library(
+    name = "control_plane_backend_hdrs",
+    hdrs = ["control_plane_backend.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_library(
+    name = "control_plane_backend",
+    srcs = ["control_plane_backend.cc"],
+    hdrs = ["control_plane_backend.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":control_plane_backend_hdrs",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_test(
+    name = "control_plane_backend_test",
+    size = "small",
+    srcs = ["control_plane_backend_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":control_plane_backend",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "kv_cache_manager_with_transfer",
     srcs = [
         "kv_cache_manager_with_transfer.cc",
@@ -821,6 +874,7 @@ cc_test(
         "-layering_check",
     ],
     deps = [
+        ":control_plane_backend_hdrs",
         ":kv_cache_manager_with_transfer",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/strings",

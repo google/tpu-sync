@@ -38,7 +38,9 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/common/trace.h"
@@ -264,6 +266,55 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
 
   virtual int local_control_port() const { return local_control_port_; }
   virtual int64_t node_id() const { return node_id_; }
+
+  struct CircuitBreakerState {
+    int consecutive_failures = 0;
+    absl::Duration current_backoff = absl::ZeroDuration();
+    absl::Time banned_until = absl::InfinitePast();
+  };
+
+  mutable absl::Mutex circuit_breaker_mu_;
+  absl::flat_hash_map<std::string, CircuitBreakerState> circuit_breakers_
+      ABSL_GUARDED_BY(circuit_breaker_mu_);
+  absl::Duration circuit_breaker_initial_backoff_
+      ABSL_GUARDED_BY(circuit_breaker_mu_) = absl::Minutes(2);
+  bool circuit_breaker_enabled_ ABSL_GUARDED_BY(circuit_breaker_mu_) = false;
+
+  static bool IsCircuitBreakerEnvEnabled();
+
+  void RecordCircuitBreakerSuccess(absl::string_view remote_endpoint);
+  void RecordCircuitBreakerFailure(absl::string_view remote_endpoint);
+  bool IsPeerBanned(absl::string_view remote_endpoint);
+
+  void set_circuit_breaker_enabled(bool enabled) {
+    absl::MutexLock lock(circuit_breaker_mu_);
+    circuit_breaker_enabled_ = enabled;
+  }
+  bool circuit_breaker_enabled() const {
+    absl::MutexLock lock(circuit_breaker_mu_);
+    return circuit_breaker_enabled_;
+  }
+
+  void set_circuit_breaker_initial_backoff(absl::Duration d) {
+    absl::MutexLock lock(circuit_breaker_mu_);
+    circuit_breaker_initial_backoff_ = d;
+  }
+  absl::Duration GetPeerCurrentBackoff(
+      absl::string_view remote_endpoint) const {
+    absl::MutexLock lock(circuit_breaker_mu_);
+    auto it = circuit_breakers_.find(remote_endpoint);
+    if (it != circuit_breakers_.end() &&
+        it->second.current_backoff != absl::ZeroDuration()) {
+      return it->second.current_backoff;
+    }
+    return circuit_breaker_initial_backoff_;
+  }
+  absl::Time GetPeerBannedUntil(absl::string_view remote_endpoint) {
+    absl::MutexLock lock(circuit_breaker_mu_);
+    auto it = circuit_breakers_.find(remote_endpoint);
+    if (it != circuit_breakers_.end()) return it->second.banned_until;
+    return absl::InfinitePast();
+  }
 
  protected:
   std::vector<RaidenTransferEndpoint> BuildEndpoints(int64_t port) const;

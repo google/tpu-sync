@@ -37,6 +37,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/lib/chunk.h"
@@ -217,8 +218,10 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
 
     const auto local_ips = raw_transport_->local_ips();
     const size_t n = local_ips.size();
-    const std::string local_ip = n >= 1 ? local_ips[i % n] : "";
     const std::string remote_peer = peers[i % peers.size()];
+    const std::string local_ip =
+        n >= 1 ? ::tpu_raiden::PickSourceIpForPeer(remote_peer, local_ips[i % n])
+               : "";
 
     absl::Span<const Request> stream_requests =
         absl::MakeConstSpan(*shared_requests)
@@ -428,8 +431,10 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPull(
 
     const auto local_ips = raw_transport_->local_ips();
     const size_t n = local_ips.size();
-    const std::string local_ip = n >= 1 ? local_ips[i % n] : "";
     const std::string remote_peer = peers[i % peers.size()];
+    const std::string local_ip =
+        n >= 1 ? ::tpu_raiden::PickSourceIpForPeer(remote_peer, local_ips[i % n])
+               : "";
 
     threads.emplace_back(
         [this, i, remote_peer, local_ip, stream_requests, &statuses]() {

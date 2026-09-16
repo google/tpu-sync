@@ -52,6 +52,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/numa_thread_pool.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
@@ -553,10 +554,11 @@ absl::Status RawBufferTransport::ProcessSocketBufferPull(
     return absl::InvalidArgumentError("Source peer address cannot be empty");
   }
 
-  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
+  const std::string src_ip = ::tpu_raiden::PickSourceIpForPeer(peer, bound_ip_);
+  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, src_ip));
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup(
-      [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
+      [&] { ReturnConnection(ok_to_pool, fd, peer, src_ip); });
 
   ChunkHeader header = {};
   header.version = 1;
@@ -646,10 +648,11 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
         "Destination peer address cannot be empty");
   }
 
-  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
+  const std::string src_ip = ::tpu_raiden::PickSourceIpForPeer(peer, bound_ip_);
+  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, src_ip));
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup(
-      [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
+      [&] { ReturnConnection(ok_to_pool, fd, peer, src_ip); });
 
   const uint8_t opcode = request.socket_opcode;
   const uint64_t uuid = request.uuid;
@@ -850,10 +853,11 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
     return absl::OkStatus();
   }
 
-  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
+  const std::string src_ip = ::tpu_raiden::PickSourceIpForPeer(peer, bound_ip_);
+  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, src_ip));
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup(
-      [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
+      [&] { ReturnConnection(ok_to_pool, fd, peer, src_ip); });
 
   const size_t batch_size = requests.size();
   const uint64_t uuid = requests.front().uuid;

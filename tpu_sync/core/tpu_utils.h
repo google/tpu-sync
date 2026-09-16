@@ -82,6 +82,7 @@ struct HostNicAddress {
   std::string ip_address;      // e.g. "10.128.0.10"
   int numa_node = -1;          // e.g. 0 from sysfs
   NicClassification classification = NicClassification::kUnknown;
+  int prefix_len = -1;         // prefix length of ip_address, -1 if unknown
 };
 
 // Returns non-loopback network interfaces on this host enriched with NUMA
@@ -112,6 +113,16 @@ int GetInterfaceNumaNode(const char* ifname,
 // corresponding interface's host NIC address. Returns std::nullopt on failure
 // or if not found.
 std::optional<HostNicAddress> GetSocketLocalNic(int fd);
+
+// Host NICs discovered once, at first use.
+const std::vector<HostNicAddress>& GetCachedLocalHostNicAddresses();
+
+// The local IP a connection to `peer_endpoint` ("ip:port" or "[v6]:port")
+// binds to: `preferred_ip` when the peer is reachable through that NIC,
+// otherwise the data-plane NIC whose subnet or route covers the peer,
+// otherwise `preferred_ip`.
+std::string PickSourceIpForPeer(absl::string_view peer_endpoint,
+                                absl::string_view preferred_ip);
 
 // Pins the thread to the local NUMA node if pin_thread is true.
 // Returns 0 on success or -1 on error.

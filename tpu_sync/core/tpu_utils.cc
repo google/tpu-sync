@@ -17,6 +17,9 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <ifaddrs.h>
+#include <iostream>
+#include <mutex>  // NOLINT
+#include <set>
 #include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -527,6 +530,116 @@ std::string ClassificationToString(NicClassification classification) {
   return "Unknown Interface";
 }
 
+
+int PrefixLenFromMask(const struct sockaddr* mask) {
+  if (mask == nullptr) return -1;
+  const unsigned char* bytes = nullptr;
+  int len = 0;
+  if (mask->sa_family == AF_INET) {
+    bytes = reinterpret_cast<const unsigned char*>(
+        &reinterpret_cast<const struct sockaddr_in*>(mask)->sin_addr);
+    len = 4;
+  } else if (mask->sa_family == AF_INET6) {
+    bytes = reinterpret_cast<const unsigned char*>(
+        &reinterpret_cast<const struct sockaddr_in6*>(mask)->sin6_addr);
+    len = 16;
+  } else {
+    return -1;
+  }
+  int prefix = 0;
+  for (int i = 0; i < len; ++i) {
+    unsigned char b = bytes[i];
+    if (b == 0xff) {
+      prefix += 8;
+      continue;
+    }
+    while (b & 0x80) {
+      ++prefix;
+      b = static_cast<unsigned char>(b << 1);
+    }
+    break;
+  }
+  return prefix;
+}
+
+bool IpInSubnet(absl::string_view ip, absl::string_view nic_ip, int prefix) {
+  if (prefix < 0) return false;
+  unsigned char a[16];
+  unsigned char b[16];
+  int len = 0;
+  const std::string ip_s(ip);
+  const std::string nic_s(nic_ip);
+  if (inet_pton(AF_INET, ip_s.c_str(), a) == 1 &&
+      inet_pton(AF_INET, nic_s.c_str(), b) == 1) {
+    len = 4;
+  } else if (inet_pton(AF_INET6, ip_s.c_str(), a) == 1 &&
+             inet_pton(AF_INET6, nic_s.c_str(), b) == 1) {
+    len = 16;
+  } else {
+    return false;
+  }
+  if (prefix > len * 8) return false;
+  const int full = prefix / 8;
+  const int rem = prefix % 8;
+  if (std::memcmp(a, b, full) != 0) return false;
+  if (rem == 0) return true;
+  const unsigned char m = static_cast<unsigned char>(0xff << (8 - rem));
+  return (a[full] & m) == (b[full] & m);
+}
+
+// The interface the main IPv4 routing table sends `ip` through, by longest
+// prefix among the non-default routes; empty when only the default route
+// matches or the table cannot be read. GCE guests carry every address with a
+// /32 prefix and express the subnet as a route, so the prefix alone says
+// nothing about reachability there.
+std::string RouteInterfaceForIp(absl::string_view ip) {
+  unsigned char a[4];
+  const std::string ip_s(ip);
+  if (inet_pton(AF_INET, ip_s.c_str(), a) != 1) return "";
+  const uint32_t addr = (uint32_t(a[0]) << 24) | (uint32_t(a[1]) << 16) |
+                        (uint32_t(a[2]) << 8) | uint32_t(a[3]);
+  std::ifstream route_file("/proc/net/route");
+  std::string line;
+  if (!route_file.is_open() || !std::getline(route_file, line)) return "";
+  std::string best;
+  int best_len = -1;
+  while (std::getline(route_file, line)) {
+    std::vector<std::string> f =
+        absl::StrSplit(line, absl::ByAnyChar(" \t"), absl::SkipEmpty());
+    if (f.size() < 8) continue;
+    // Destination and Mask are little-endian hex.
+    uint32_t dst = 0;
+    uint32_t mask = 0;
+    if (!absl::SimpleHexAtoi(f[1], &dst) || !absl::SimpleHexAtoi(f[7], &mask)) {
+      continue;
+    }
+    dst = __builtin_bswap32(dst);
+    mask = __builtin_bswap32(mask);
+    if (mask == 0) continue;
+    if ((addr & mask) != (dst & mask)) continue;
+    const int len = __builtin_popcount(mask);
+    if (len > best_len) {
+      best_len = len;
+      best = f[0];
+    }
+  }
+  return best;
+}
+
+// The host part of "ip:port", "[v6]:port", or a bare address.
+std::string PeerHost(absl::string_view endpoint) {
+  if (!endpoint.empty() && endpoint.front() == '[') {
+    const size_t close = endpoint.find(']');
+    return std::string(endpoint.substr(
+        1, close == absl::string_view::npos ? endpoint.size() - 1 : close - 1));
+  }
+  const size_t colon = endpoint.rfind(':');
+  if (colon != absl::string_view::npos && endpoint.find(':') == colon) {
+    return std::string(endpoint.substr(0, colon));
+  }
+  return std::string(endpoint);
+}
+
 }  // namespace
 
 namespace internal {
@@ -565,6 +678,7 @@ std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(
           NicClassification classification =
               ClassifyNic(ifa->ifa_name, bdf, mtu);
           nics.push_back({ifa->ifa_name, ip_str, node, classification});
+          nics.back().prefix_len = PrefixLenFromMask(ifa->ifa_netmask);
         }
       }
     } else if (ifa->ifa_addr->sa_family == AF_INET6) {
@@ -586,6 +700,7 @@ std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(
           NicClassification classification =
               ClassifyNic(ifa->ifa_name, bdf, mtu);
           nics.push_back({ifa->ifa_name, ip_str, node, classification});
+          nics.back().prefix_len = PrefixLenFromMask(ifa->ifa_netmask);
         }
       }
     }
@@ -660,6 +775,39 @@ const std::vector<HostNicAddress>& GetCachedLocalHostNicAddresses() {
   static const std::vector<HostNicAddress>* nics =
       new std::vector<HostNicAddress>(GetLocalHostNicAddresses());
   return *nics;
+}
+
+std::string PickSourceIpForPeer(absl::string_view peer_endpoint,
+                                absl::string_view preferred_ip) {
+  const std::string peer = PeerHost(peer_endpoint);
+  const auto& nics = GetCachedLocalHostNicAddresses();
+  const std::string route_if = RouteInterfaceForIp(peer);
+  for (const auto& nic : nics) {
+    if (nic.ip_address != preferred_ip) continue;
+    if (IpInSubnet(peer, nic.ip_address, nic.prefix_len) ||
+        (!route_if.empty() && nic.interface_name == route_if)) {
+      return std::string(preferred_ip);
+    }
+    break;
+  }
+  for (const auto& nic : nics) {
+    if (nic.classification == NicClassification::kDataPlane &&
+        nic.ip_address != preferred_ip &&
+        (IpInSubnet(peer, nic.ip_address, nic.prefix_len) ||
+         (!route_if.empty() && nic.interface_name == route_if))) {
+      static std::mutex mu;
+      static std::set<std::string>* logged = new std::set<std::string>();
+      const std::string key = absl::StrCat(peer, "|", nic.ip_address);
+      std::lock_guard<std::mutex> lock(mu);
+      if (logged->insert(key).second) {
+        std::cerr << "PickSourceIpForPeer: peer " << peer << " is not reachable "
+                  << "from " << preferred_ip << "; binding " << nic.ip_address
+                  << " (" << nic.interface_name << ")" << std::endl;
+      }
+      return nic.ip_address;
+    }
+  }
+  return std::string(preferred_ip);
 }
 
 std::optional<HostNicAddress> GetSocketLocalNic(int fd) {

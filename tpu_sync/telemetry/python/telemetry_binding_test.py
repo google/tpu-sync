@@ -213,13 +213,14 @@ class TelemetryBindingTest(absltest.TestCase):
     metrics_by_name = {m.name: m for m in metrics}
     self.assertEqual(metrics_by_name["sent_bytes_total"].label_names, [])
     self.assertEqual(metrics_by_name["received_bytes_total"].label_names, [])
-    self.assertEqual(
-        metrics_by_name["transfer_failures_total"].label_names, []
-    )
+    self.assertEqual(metrics_by_name["transfer_failures_total"].label_names, [])
     self.assertEqual(metrics_by_name["transfer_duration_ms"].label_names, [])
-    self.assertEqual(metrics_by_name["buffer_allocated_bytes"].label_names, [])
+    self.assertEqual(metrics_by_name["p2p_transfer_time_ms"].label_names, [])
+    self.assertEqual(metrics_by_name["h2d_bytes_total"].label_names, [])
     self.assertEqual(metrics_by_name["h2d_transfer_time_ms"].label_names, [])
+    self.assertEqual(metrics_by_name["d2h_bytes_total"].label_names, [])
     self.assertEqual(metrics_by_name["d2h_transfer_time_ms"].label_names, [])
+    self.assertEqual(metrics_by_name["buffer_allocated_bytes"].label_names, [])
 
   def test_get_metric_metadata_empty_when_no_backends(self):
     telemetry_ext.configure_telemetry([])

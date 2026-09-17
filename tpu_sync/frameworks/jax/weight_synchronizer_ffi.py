@@ -110,10 +110,19 @@ def _prepare_shard_info(
       jnp.array(host_indices_np, dtype=jnp.int32), sharding
   )
 
+  global_mesh_indices_np = np.arange(mesh.devices.size, dtype=np.int32).reshape(
+      mesh.devices.shape
+  )
+  global_mesh_indices = jax.device_put(
+      jnp.array(global_mesh_indices_np, dtype=jnp.int32), sharding
+  )
+
   if shard_idx.shape != tuple(physical_mesh_shape):
     shard_idx = shard_idx.reshape(tuple(physical_mesh_shape))
 
-  return jnp.stack([shard_idx, local_slots, host_indices], axis=-1)
+  return jnp.stack(
+      [shard_idx, local_slots, host_indices, global_mesh_indices], axis=-1
+  )
 
 
 def init_weight_synchronizer(

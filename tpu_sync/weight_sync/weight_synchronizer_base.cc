@@ -683,15 +683,43 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   std::vector<std::vector<transport::BufferPushTask>> tasks_by_layer(
       num_layers_);
   const auto& schedules = request.shard_push_schedules();
+  bool use_global_keys = false;
+  if (!global_shard_indices_.empty()) {
+    bool all_in_global = true;
+    bool any_outside_local = false;
+    for (const auto& [sched_key, _] : schedules) {
+      bool in_global =
+          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
+                    static_cast<int64_t>(sched_key)) !=
+          global_shard_indices_.end();
+      bool in_local =
+          std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
+                    static_cast<int>(sched_key)) != local_shard_indices_.end();
+      if (!in_global) {
+        all_in_global = false;
+      }
+      if (!in_local && in_global) {
+        any_outside_local = true;
+      }
+    }
+    use_global_keys =
+        all_in_global && (any_outside_local || local_shard_indices_.empty());
+  }
   for (size_t i = 0; i < num_shards_; ++i) {
     int64_t global_shard = global_shard_index(i);
     int64_t local_shard = local_shard_index(i);
     auto it = schedules.end();
-    if (global_shard >= 0) {
-      it = schedules.find(static_cast<int32_t>(global_shard));
-    }
-    if (it == schedules.end() && local_shard >= 0) {
-      it = schedules.find(static_cast<int32_t>(local_shard));
+    if (use_global_keys) {
+      if (global_shard >= 0) {
+        it = schedules.find(static_cast<int32_t>(global_shard));
+      }
+    } else {
+      if (local_shard >= 0) {
+        it = schedules.find(static_cast<int32_t>(local_shard));
+      }
+      if (it == schedules.end() && global_shard >= 0) {
+        it = schedules.find(static_cast<int32_t>(global_shard));
+      }
     }
     if (it == schedules.end()) {
       continue;

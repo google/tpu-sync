@@ -3788,5 +3788,262 @@ class RaidenPlanWarmupTest(absltest.TestCase):
       )
 
 
+class WeightSyncReceiverAndCacheLeakTest(absltest.TestCase):
+  """Tests for receiver push schedule omission and step-growth memory/cache fixes."""
+
+  def test_weight_sync_worker_rpc_client_skips_receiver_push_schedules(self):
+    src_unit = raiden_controller.RaidenId("src_job", "0", "weights", 0)
+    dst_unit = raiden_controller.RaidenId("dst_job", "0", "weights", 0)
+    schedule_entries = [
+        ("10.0.1.1:8000", 0, 0, 0, 1024, 0, 0, 1024, 1024, 1, 2, 0),
+        ("10.0.1.1:8000", 0, 1024, 1024, 1024, 0, 0, 1024, 1024, 1, 2, 0),
+    ]
+    plan = raiden_controller.TransferPlan(
+        src_units=[src_unit],
+        dst_units=[dst_unit],
+        plan=None,
+        shard_push_schedules={src_unit: {0: schedule_entries}},
+        worker_rpc_addresses={
+            src_unit: "10.0.0.1:9000",
+            dst_unit: "10.0.1.1:9000",
+        },
+        worker_data_addresses={
+            src_unit: ["10.0.0.1:8000"],
+            dst_unit: ["10.0.1.1:8000"],
+        },
+        uuid=42,
+        use_block_chunks=True,
+        is_sender=True,
+        expected_block_count=10,
+        dst_expected_block_counts={dst_unit: 8},
+        dst_expected_layer_chunk_counts={dst_unit: {2: 8}},
+        skip_tiling={2: True},
+        req_id="wsync_test",
+    )
+
+    ws_client = raiden_controller.WeightSyncWorkerRpcClient()
+    base_client = raiden_controller.WorkerRpcClient()
+    try:
+      # 1. WeightSyncWorkerRpcClient on receiver (dst_unit):
+      # shard_push_schedules MUST be empty, while expected counts & skip_tiling
+      # ARE populated.
+      dst_bytes = ws_client._encode_start_transfer(dst_unit, plan)
+      dst_req = raiden_service_pb2.ControlRequest()
+      dst_req.ParseFromString(dst_bytes)
+      start_dst = dst_req.start_transfer_request
+      self.assertFalse(start_dst.is_sender)
+      self.assertEmpty(start_dst.shard_push_schedules)
+      self.assertEqual(start_dst.expected_block_count, 8)
+      self.assertEqual(dict(start_dst.expected_layer_chunk_counts), {2: 8})
+      self.assertEqual(dict(start_dst.skip_tiling), {2: True})
+
+      # 2. WeightSyncWorkerRpcClient on sender (src_unit):
+      # shard_push_schedules MUST be populated with local schedule.
+      src_bytes = ws_client._encode_start_transfer(src_unit, plan)
+      src_req = raiden_service_pb2.ControlRequest()
+      src_req.ParseFromString(src_bytes)
+      start_src = src_req.start_transfer_request
+      self.assertTrue(start_src.is_sender)
+      self.assertLen(start_src.shard_push_schedules, 1)
+      self.assertLen(start_src.shard_push_schedules[0].entries, 2)
+
+      # 3. Base WorkerRpcClient on receiver (dst_unit) when is_weight_sync=False
+      # preserves legacy behavior (populates filtered receiver schedules).
+      legacy_dst_bytes = base_client._encode_start_transfer(dst_unit, plan)
+      legacy_dst_req = raiden_service_pb2.ControlRequest()
+      legacy_dst_req.ParseFromString(legacy_dst_bytes)
+      self.assertFalse(legacy_dst_req.start_transfer_request.is_sender)
+      self.assertLen(
+          legacy_dst_req.start_transfer_request.shard_push_schedules, 1
+      )
+
+      # 4. Base WorkerRpcClient on receiver (dst_unit) when is_weight_sync=True:
+      # automatically skips receiver shard_push_schedules even with default
+      # WorkerRpcClient!
+      plan.is_weight_sync = True
+      ws_auto_dst_bytes = base_client._encode_start_transfer(dst_unit, plan)
+      ws_auto_dst_req = raiden_service_pb2.ControlRequest()
+      ws_auto_dst_req.ParseFromString(ws_auto_dst_bytes)
+      self.assertFalse(ws_auto_dst_req.start_transfer_request.is_sender)
+      self.assertEmpty(
+          ws_auto_dst_req.start_transfer_request.shard_push_schedules
+      )
+
+      # 5. Sender path caches pre-built ShardPushScheduleProto in
+      # sender_push_schedule_protos (already populated by step 2 above).
+      self.assertIn(src_unit, plan.sender_push_schedule_protos)
+      cached_proto = plan.sender_push_schedule_protos[src_unit][0]
+      # Clear raw tuple schedule to prove subsequent calls reuse cached_proto
+      # without reading tuples.
+      plan.shard_push_schedules[src_unit][0] = []
+      src_bytes_2 = base_client._encode_start_transfer(src_unit, plan)
+      self.assertEqual(src_bytes, src_bytes_2)
+      self.assertIs(plan.sender_push_schedule_protos[src_unit][0], cached_proto)
+    finally:
+      ws_client.close()
+      base_client.close()
+
+  def test_raiden_id_has_slots_for_gc_untracking(self):
+    rid = raiden_controller.RaidenId("job", "0", "weights", 0)
+    self.assertFalse(hasattr(rid, "__dict__"))
+
+  def test_source_ephemeral_port_reregistration_preserves_plan_cache(self):
+    client = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=0, worker_rpc_client=client, enable_plan_cache=True
+    )
+    vars_metadata = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer0",
+            shape=[16, 16],
+            mesh_shape=[1, 1],
+            layout=[1, 0],
+            item_size=4,
+            layer_idx=0,
+        ),
+    ]
+    src_unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+    dst_unit = raiden_controller.RaidenId("rollout", "0", "weights", 0)
+
+    controller.register_work_unit(
+        src_unit,
+        ["10.0.0.1:8000"],
+        control_plane_rpc_address="10.0.0.1:9000",
+        mesh_shape=[1, 1],
+        variables=vars_metadata,
+    )
+    controller.register_work_unit(
+        dst_unit,
+        ["10.0.1.1:8000"],
+        control_plane_rpc_address="10.0.1.1:9000",
+        mesh_shape=[1, 1],
+        variables=vars_metadata,
+    )
+
+    fut1 = controller.start_transfer(
+        src_units=[src_unit],
+        dst_units=[dst_unit],
+        use_block_chunks=True,
+        req_id="wsync-1",
+    )
+    asyncio.run(fut1.wait())
+    self.assertIsNone(fut1._transfer_task)
+    self.assertEqual(controller.get_plan_cache_size(), 1)
+    self.assertIn("wsync-1", controller._active_transfers)
+    self.assertTrue(controller.get_plan("wsync-1").is_weight_sync)
+
+    # Simulate Tunix d2h() re-registering source trainer with new ephemeral TCP
+    # ports while keeping tensor/mesh topology identical.
+    controller.register_work_unit(
+        src_unit,
+        ["10.0.0.1:18543"],
+        control_plane_rpc_address="10.0.0.1:19543",
+        mesh_shape=[1, 1],
+        variables=vars_metadata,
+    )
+
+    # 1. Plan cache MUST be preserved (not invalidated by source ephemeral port
+    # change).
+    self.assertEqual(controller.get_plan_cache_size(), 1)
+    # 2. Previous transfer wsync-1 MUST be cleaned up from _active_transfers
+    # upon unit replacement.
+    self.assertNotIn("wsync-1", controller._active_transfers)
+
+    # 3. Next transfer reuses cached plan and updates worker_rpc_addresses to
+    # new port.
+    fut2 = controller.start_transfer(
+        src_units=[src_unit],
+        dst_units=[dst_unit],
+        use_block_chunks=True,
+        req_id="wsync-2",
+    )
+    asyncio.run(fut2.wait())
+    self.assertIsNone(fut2._transfer_task)
+    plan2 = controller.get_plan("wsync-2")
+    self.assertEqual(plan2.worker_rpc_addresses[src_unit], "10.0.0.1:19543")
+
+  def test_completed_transfers_pruned_across_many_steps(self):
+    client = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=0, worker_rpc_client=client, enable_plan_cache=True
+    )
+    src_unit = raiden_controller.RaidenId("src", "0", "weights", 0)
+    dst_unit = raiden_controller.RaidenId("dst", "0", "weights", 0)
+    controller.register_work_unit(
+        src_unit,
+        ["10.0.0.1:8000"],
+        mesh_shape=[1],
+        layout=[0],
+        global_shape=[16],
+        itemsize=4,
+    )
+    controller.register_work_unit(
+        dst_unit,
+        ["10.0.1.1:8000"],
+        mesh_shape=[1],
+        layout=[0],
+        global_shape=[16],
+        itemsize=4,
+    )
+
+    for step in range(60):
+      fut = controller.start_transfer(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          use_block_chunks=True,
+          req_id=f"wsync-{step}",
+      )
+      asyncio.run(fut.wait())
+      self.assertIsNone(fut._transfer_task)
+      self.assertEqual(fut.session_id, step)
+
+    # Completed transfers are bounded to <= 16 entries, preventing linear
+    # memory/GC growth.
+    self.assertLessEqual(len(controller._active_transfers), 16)
+    self.assertLessEqual(len(controller._active_tasks), 16)
+    self.assertLessEqual(len(controller._task_units), 16)
+
+  def test_group_size_must_be_positive(self):
+    controller = raiden_controller.RaidenController(
+        port=0, worker_rpc_client=RecordingWorkerRpcClient()
+    )
+    src_unit = raiden_controller.RaidenId("src", "0", "weights", 0)
+    dst_unit = raiden_controller.RaidenId("dst", "0", "weights", 0)
+
+    for invalid_group_size in [0, -1, -128]:
+      with self.assertRaisesRegex(ValueError, "group_size must be positive"):
+        controller.start_transfer(
+            src_units=[src_unit],
+            dst_units=[dst_unit],
+            use_block_chunks=True,
+            group_size=invalid_group_size,
+        )
+
+      with self.assertRaisesRegex(ValueError, "group_size must be positive"):
+        controller._make_plan_cache_key(
+            src_units=[src_unit],
+            dst_units=[dst_unit],
+            group_size=invalid_group_size,
+        )
+
+      with self.assertRaisesRegex(ValueError, "group_size must be positive"):
+        asyncio.run(
+            controller.warmup_transfer_plan(
+                src_units=[src_unit],
+                dst_units=[dst_unit],
+                group_size=invalid_group_size,
+            )
+        )
+
+      with self.assertRaisesRegex(ValueError, "group_size must be positive"):
+        asyncio.run(
+            controller._compute_transfer_schedule(
+                src_units=[src_unit],
+                dst_units=[dst_unit],
+                group_size=invalid_group_size,
+            )
+        )
+
+
 if __name__ == "__main__":
   absltest.main()

@@ -74,6 +74,10 @@ class _CachedTransferSchedule:
   rpc_addresses: dict[Any, str]
   data_addresses: dict[Any, list[str]]
   dst_unit_counts: dict[Any, int] = dataclasses.field(default_factory=dict)
+  is_weight_sync: bool = False
+  sender_push_schedule_protos: dict[Any, dict[int, Any]] = dataclasses.field(
+      default_factory=dict
+  )
 
 
 def to_physical(logical_shape, logical_mesh_shape, minor_to_major):
@@ -435,6 +439,10 @@ class TransferPlan:
   dst_expected_block_counts: dict[RaidenId, int] = dataclasses.field(
       default_factory=dict
   )
+  is_weight_sync: bool = False
+  sender_push_schedule_protos: dict[RaidenId, dict[int, Any]] = (
+      dataclasses.field(default_factory=dict, repr=False, compare=False)
+  )
 
 
 def _coerce_pool_spec_proto(pool: Any) -> Any:
@@ -737,7 +745,7 @@ class WorkerRpcClient:
     )
 
   async def _send_and_verify(self, addr: str, payload: bytes) -> None:
-    resp_bytes = await self._send_rpc(addr, payload)
+    resp_bytes = await self._send_rpc(addr, payload, timeout=1800.0)
     self._verify_response(resp_bytes)
 
   def _raiden_id_to_proto(self, unit: RaidenId) -> Any:
@@ -778,7 +786,7 @@ class WorkerRpcClient:
         peers=peers,
     )
 
-    is_sender = target_id in transfer_plan.src_units
+    is_sender = target_id in transfer_plan.src_units and transfer_plan.is_sender
     start_req = self._proto_module.StartTransferRequest(
         src_units=[
             self._raiden_id_to_proto(u) for u in transfer_plan.src_units
@@ -821,104 +829,136 @@ class WorkerRpcClient:
       group_proto.order_rank = int(group.get("order_rank", 0))
 
     if transfer_plan.shard_push_schedules:
-      if target_id in transfer_plan.dst_units:
-        # Receiver path: send FILTERED plan, only containing entries for this
-        # receiver
-        target_endpoints = transfer_plan.worker_data_addresses.get(
-            target_id, []
-        )
-        for (
-            src_unit,
-            push_schedules,
-        ) in transfer_plan.shard_push_schedules.items():
-          num_src_shards = len(push_schedules)
-          for shard_idx, schedule in push_schedules.items():
-            if num_src_shards == 1:
-              key_idx = transfer_plan.src_schedule_keys.get(src_unit)
-              if key_idx is None:
-                if src_unit in transfer_plan.src_units:
-                  key_idx = transfer_plan.src_units.index(src_unit)
-                else:
-                  key_idx = 0
-            else:
-              src_base = (
-                  transfer_plan.src_units.index(src_unit)
-                  if src_unit in transfer_plan.src_units
-                  else 0
-              )
-              key_idx = src_base * num_src_shards + shard_idx
-            schedule_proto = self._proto_module.ShardPushScheduleProto()
-            for entry_tuple in schedule:
-              (
-                  dst_peer,
-                  dst_shard_idx,
-                  dst_offset,
-                  src_offset,
-                  size,
-                  src_block_id,
-                  dst_block_id,
-                  src_stride,
-                  dst_stride,
-                  count,
-                  *extra,
-              ) = entry_tuple
-              layer_idx = extra[0] if extra else 0
-              pool_group = extra[1] if len(extra) > 1 else 0
-              if dst_peer in target_endpoints:
-                entry_proto = schedule_proto.entries.add()
-                entry_proto.dst_peer = dst_peer
-                entry_proto.dst_shard_idx = dst_shard_idx
-                entry_proto.dst_offset_bytes = dst_offset
-                entry_proto.src_offset_bytes = src_offset
-                entry_proto.size_bytes = size
-                entry_proto.src_block_id = src_block_id
-                entry_proto.dst_block_id = dst_block_id
-                entry_proto.src_stride_bytes = src_stride
-                entry_proto.dst_stride_bytes = dst_stride
-                entry_proto.count = count
-                entry_proto.layer_idx = layer_idx
-                entry_proto.pool_group = pool_group
-            if len(schedule_proto.entries) > 0:
-              start_req.shard_push_schedules[key_idx].CopyFrom(schedule_proto)
+      if not is_sender:
+        if self.include_receiver_push_schedules(transfer_plan):
+          # Receiver path: send FILTERED plan, only containing entries for this
+          # receiver
+          target_endpoints = transfer_plan.worker_data_addresses.get(
+              target_id, []
+          )
+          for (
+              src_unit,
+              push_schedules,
+          ) in transfer_plan.shard_push_schedules.items():
+            num_src_shards = len(push_schedules)
+            for shard_idx, schedule in push_schedules.items():
+              if num_src_shards == 1:
+                key_idx = transfer_plan.src_schedule_keys.get(src_unit)
+                if key_idx is None:
+                  if src_unit in transfer_plan.src_units:
+                    key_idx = transfer_plan.src_units.index(src_unit)
+                  else:
+                    key_idx = 0
+              else:
+                src_base = (
+                    transfer_plan.src_units.index(src_unit)
+                    if src_unit in transfer_plan.src_units
+                    else 0
+                )
+                key_idx = src_base * num_src_shards + shard_idx
+              schedule_proto = self._proto_module.ShardPushScheduleProto()
+              for entry_tuple in schedule:
+                (
+                    dst_peer,
+                    dst_shard_idx,
+                    dst_offset,
+                    src_offset,
+                    size,
+                    src_block_id,
+                    dst_block_id,
+                    src_stride,
+                    dst_stride,
+                    count,
+                    *extra,
+                ) = entry_tuple
+                layer_idx = extra[0] if extra else 0
+                pool_group = extra[1] if len(extra) > 1 else 0
+                if dst_peer in target_endpoints:
+                  entry_proto = schedule_proto.entries.add()
+                  entry_proto.dst_peer = dst_peer
+                  entry_proto.dst_shard_idx = dst_shard_idx
+                  entry_proto.dst_offset_bytes = dst_offset
+                  entry_proto.src_offset_bytes = src_offset
+                  entry_proto.size_bytes = size
+                  entry_proto.src_block_id = src_block_id
+                  entry_proto.dst_block_id = dst_block_id
+                  entry_proto.src_stride_bytes = src_stride
+                  entry_proto.dst_stride_bytes = dst_stride
+                  entry_proto.count = count
+                  entry_proto.layer_idx = layer_idx
+                  entry_proto.pool_group = pool_group
+              if len(schedule_proto.entries) > 0:
+                start_req.shard_push_schedules[key_idx].CopyFrom(schedule_proto)
       else:
-        # Sender path: only send local schedule
-        push_schedules = transfer_plan.shard_push_schedules.get(target_id)
-        if push_schedules:
-          for shard_idx, entries in push_schedules.items():
-            schedule_proto = self._proto_module.ShardPushScheduleProto()
-            for entry_tuple in entries:
-              (
-                  dst_peer,
-                  dst_shard_idx,
-                  dst_offset,
-                  src_offset,
-                  size,
-                  src_block_id,
-                  dst_block_id,
-                  src_stride,
-                  dst_stride,
-                  count,
-                  *extra,
-              ) = entry_tuple
-              layer_idx = extra[0] if extra else 0
-              pool_group = extra[1] if len(extra) > 1 else 0
-              entry_proto = schedule_proto.entries.add()
-              entry_proto.dst_peer = dst_peer
-              entry_proto.dst_shard_idx = dst_shard_idx
-              entry_proto.dst_offset_bytes = dst_offset
-              entry_proto.src_offset_bytes = src_offset
-              entry_proto.size_bytes = size
-              entry_proto.src_block_id = src_block_id
-              entry_proto.dst_block_id = dst_block_id
-              entry_proto.src_stride_bytes = src_stride
-              entry_proto.dst_stride_bytes = dst_stride
-              entry_proto.count = count
-              entry_proto.layer_idx = layer_idx
-              entry_proto.pool_group = pool_group
+        # Sender path: reuse cached pre-built ShardPushScheduleProto if present
+        cached_protos = getattr(
+            transfer_plan, "sender_push_schedule_protos", None
+        )
+        if cached_protos is not None and target_id in cached_protos:
+          for shard_idx, schedule_proto in cached_protos[target_id].items():
             start_req.shard_push_schedules[shard_idx].CopyFrom(schedule_proto)
+        else:
+          push_schedules = transfer_plan.shard_push_schedules.get(target_id)
+          if push_schedules:
+            target_protos = self.build_sender_push_schedule_protos(
+                push_schedules
+            )
+            for shard_idx, schedule_proto in target_protos.items():
+              start_req.shard_push_schedules[shard_idx].CopyFrom(schedule_proto)
+            if cached_protos is not None:
+              cached_protos[target_id] = target_protos
 
     req.start_transfer_request.CopyFrom(start_req)
     return req.SerializeToString()
+
+  def build_sender_push_schedule_protos(
+      self, push_schedules: dict[int, list[Any]]
+  ) -> dict[int, Any]:
+    """Builds ShardPushScheduleProto objects for each shard from raw schedule tuples."""
+    target_protos = {}
+    for shard_idx, entries in push_schedules.items():
+      schedule_proto = self._proto_module.ShardPushScheduleProto()
+      for entry_tuple in entries:
+        (
+            dst_peer,
+            dst_shard_idx,
+            dst_offset,
+            src_offset,
+            size,
+            src_block_id,
+            dst_block_id,
+            src_stride,
+            dst_stride,
+            count,
+            *extra,
+        ) = entry_tuple
+        layer_idx = extra[0] if extra else 0
+        pool_group = extra[1] if len(extra) > 1 else 0
+        entry_proto = schedule_proto.entries.add()
+        entry_proto.dst_peer = dst_peer
+        entry_proto.dst_shard_idx = dst_shard_idx
+        entry_proto.dst_offset_bytes = dst_offset
+        entry_proto.src_offset_bytes = src_offset
+        entry_proto.size_bytes = size
+        entry_proto.src_block_id = src_block_id
+        entry_proto.dst_block_id = dst_block_id
+        entry_proto.src_stride_bytes = src_stride
+        entry_proto.dst_stride_bytes = dst_stride
+        entry_proto.count = count
+        entry_proto.layer_idx = layer_idx
+        entry_proto.pool_group = pool_group
+      target_protos[shard_idx] = schedule_proto
+    return target_protos
+
+  def include_receiver_push_schedules(
+      self, transfer_plan: Optional[TransferPlan] = None
+  ) -> bool:
+    """Returns whether receiver StartTransferRequests need shard_push_schedules."""
+    if transfer_plan is not None and getattr(
+        transfer_plan, "is_weight_sync", False
+    ):
+      return False
+    return True
 
   def _verify_response(self, resp_bytes: bytes) -> None:
     """Validates demarshaled remote response bytes returned from C++ workers."""
@@ -978,15 +1018,27 @@ class WeightSyncWorkerRpcClient(WorkerRpcClient):
         max_workers=max_workers,
     )
 
+  def include_receiver_push_schedules(
+      self, transfer_plan: Optional[TransferPlan] = None
+  ) -> bool:
+    """Weight sync C++ receivers only consume expected block/layer counts."""
+    return False
+
 
 class RaidenFuture:
   """Future representing an asynchronous transfer execution."""
 
   session_id: int
 
-  def __init__(self, session_id: int = 0, transfer_task=None):
+  def __init__(
+      self,
+      session_id: int = 0,
+      transfer_task=None,
+      on_complete: Optional[typing.Callable[[], None]] = None,
+  ):
     self.session_id = session_id
     self._transfer_task = transfer_task
+    self._on_complete = on_complete
     self._completed_event = threading.Event()
     self._completed = False
     self._exception = None
@@ -1017,11 +1069,22 @@ class RaidenFuture:
         self._exception = e
         raise e
       finally:
+        self._transfer_task = None
         self._completed = True
         self._completed_event.set()
+        if self._on_complete is not None:
+          try:
+            self._on_complete()
+          except Exception:  # pylint: disable=broad-exception-caught
+            pass
     else:
       self._completed = True
       self._completed_event.set()
+      if self._on_complete is not None:
+        try:
+          self._on_complete()
+        except Exception:  # pylint: disable=broad-exception-caught
+          pass
 
   def wait_threadsafe(self, timeout=None) -> None:
     """Blocks the calling thread until the transfer is complete."""
@@ -1420,6 +1483,9 @@ class RaidenController:
     self._active_transfers: dict[str, TransferPlan] = {}
     self._active_tasks: dict[str, RaidenFuture] = {}
     self._task_units: dict[str, list[RaidenId]] = {}
+    self._src_replica_counts: dict[str, int] = {}
+    self._dst_replica_counts: dict[str, int] = {}
+    self._next_session_id: int = 0
     self._registered_shards: dict[RaidenId, list[str]] = {}
     self._registered_mesh_shapes: dict[RaidenId, list[int]] = {}
     self._registered_mesh_axes: dict[RaidenId, list[str]] = {}
@@ -1442,6 +1508,19 @@ class RaidenController:
     self._registered_variables = {}
     self._registered_control_plane_endpoints: dict[RaidenId, list[str]] = {}
     self._registered_host_subgrids: dict[RaidenId, list[int]] = {}
+
+  def _prune_completed_transfers_locked(self, max_completed: int = 16) -> None:
+    """Evicts oldest completed transfer records to prevent unbounded memory growth."""
+    completed_reqs = [
+        r
+        for r in self._active_transfers
+        if r not in self._active_tasks or self._active_tasks[r].done()
+    ]
+    if len(completed_reqs) > max_completed:
+      for r in completed_reqs[:-max_completed]:
+        self._active_transfers.pop(r, None)
+        self._active_tasks.pop(r, None)
+        self._task_units.pop(r, None)
 
   def register_work_unit(
       self,
@@ -1576,27 +1655,31 @@ class RaidenController:
     new_host_subgrid = list(host_subgrid) if host_subgrid is not None else None
 
     with self._lock:
-      is_idempotent = False
-      if unit in self._registered_shards:
-        is_idempotent = (
-            self._registered_shards[unit] == normalized_shards
-            and self._registered_control_plane_endpoints.get(unit, [])
-            == endpoints
-            and self._registered_mesh_shapes.get(unit) == new_mesh_shape
-            and self._registered_mesh_axes.get(unit) == new_mesh_axes
-            and self._registered_layouts.get(unit) == new_layout
-            and self._registered_global_shapes.get(unit) == new_global_shape
-            and self._registered_itemsizes.get(unit) == new_itemsize
-            and self._registered_pool_manifests.get(unit) == new_pools
-            and self._registered_layout_fingerprints.get(unit)
-            == new_layout_fingerprint
-            and self._registered_page_tokens.get(unit) == new_page_tokens
-            and self._registered_transfer_parallelism.get(unit)
-            == new_transfer_parallelism
-            and self._registered_transfer_ranks.get(unit) == new_transfer_rank
-            and self._registered_variables.get(unit) == new_variables
-            and self._registered_host_subgrids.get(unit) == new_host_subgrid
-        )
+      old_shards = self._registered_shards.get(unit)
+      old_endpoints = self._registered_control_plane_endpoints.get(unit, [])
+      is_topology_identical = (
+          old_shards is not None
+          and len(old_shards) == len(normalized_shards)
+          and self._registered_mesh_shapes.get(unit) == new_mesh_shape
+          and self._registered_mesh_axes.get(unit) == new_mesh_axes
+          and self._registered_layouts.get(unit) == new_layout
+          and self._registered_global_shapes.get(unit) == new_global_shape
+          and self._registered_itemsizes.get(unit) == new_itemsize
+          and self._registered_pool_manifests.get(unit) == new_pools
+          and self._registered_layout_fingerprints.get(unit)
+          == new_layout_fingerprint
+          and self._registered_page_tokens.get(unit) == new_page_tokens
+          and self._registered_transfer_parallelism.get(unit)
+          == new_transfer_parallelism
+          and self._registered_transfer_ranks.get(unit) == new_transfer_rank
+          and self._registered_variables.get(unit) == new_variables
+          and self._registered_host_subgrids.get(unit) == new_host_subgrid
+      )
+      is_idempotent = (
+          is_topology_identical
+          and old_shards == normalized_shards
+          and old_endpoints == endpoints
+      )
 
       if is_idempotent:
         # Idempotent keepalive/heartbeat re-registration.
@@ -1614,6 +1697,7 @@ class RaidenController:
         for req_id in tasks_to_clear:
           self._active_tasks.pop(req_id, None)
           self._task_units.pop(req_id, None)
+          self._active_transfers.pop(req_id, None)
 
       self._registered_shards[unit] = normalized_shards
       self._registered_control_plane_endpoints[unit] = endpoints
@@ -1662,14 +1746,27 @@ class RaidenController:
         for addr in endpoints:
           self.worker_rpc_client.register_worker_endpoint(unit, addr)
 
-      # Invalidate cached plans involving this unit whose metadata changed.
-      keys_to_clear = [
-          k
-          for k in self._plan_cache
-          if isinstance(k, tuple)
-          and len(k) >= 2
-          and (unit in k[0] or unit in k[1])
-      ]
+      # Invalidate cached plans involving this unit whose topology or
+      # destination data-plane shards changed. If topology is identical and only
+      # source shards or control-plane RPC endpoints changed, update cached
+      # addresses in place.
+      keys_to_clear = []
+      for k, cached_sched in self._plan_cache.items():
+        if not (isinstance(k, tuple) and len(k) >= 2):
+          continue
+        in_src = unit in k[0]
+        in_dst = unit in k[1]
+        if not (in_src or in_dst):
+          continue
+        if not is_topology_identical or (
+            in_dst and old_shards != normalized_shards
+        ):
+          keys_to_clear.append(k)
+        else:
+          if endpoints:
+            cached_sched.rpc_addresses[unit] = ",".join(endpoints)
+          if unit in cached_sched.data_addresses:
+            cached_sched.data_addresses[unit] = list(normalized_shards)
       for k in keys_to_clear:
         self._plan_cache.pop(k, None)
 
@@ -1694,6 +1791,8 @@ class RaidenController:
       src_controller_address: Optional[str] = None,
   ) -> tuple[Any, ...]:
     """Builds a hashable plan cache key from transfer arguments."""
+    if group_size <= 0:
+      raise ValueError("group_size must be positive")
     return (
         tuple(src_units),
         tuple(dst_units),
@@ -1717,7 +1816,7 @@ class RaidenController:
     Args:
       src_units: Source work units.
       dst_units: Destination work units.
-      group_size: Group size for tree broadcast.
+      group_size: Group size for tree broadcast (must be positive).
       skip_tiling: Skip tiling map.
       dst_controller_address: Optional remote destination controller address.
       src_controller_address: Optional remote source controller address.
@@ -1725,6 +1824,8 @@ class RaidenController:
     Returns:
       The precomputed _CachedTransferSchedule.
     """
+    if group_size <= 0:
+      raise ValueError("group_size must be positive")
     cache_key = self._make_plan_cache_key(
         src_units=src_units,
         dst_units=dst_units,
@@ -1746,6 +1847,16 @@ class RaidenController:
         req_id="warmup",
         uuid=str(random.randint(1, 2**63 - 1)),
     )
+    build_protos_fn = getattr(
+        self.worker_rpc_client, "build_sender_push_schedule_protos", None
+    )
+    raw_schedules = schedule.direct_schedules or schedule.computed_schedules
+    if callable(build_protos_fn) and raw_schedules:
+      for src_u, push_schedules in raw_schedules.items():
+        if src_u not in schedule.sender_push_schedule_protos and push_schedules:
+          schedule.sender_push_schedule_protos[src_u] = build_protos_fn(
+              push_schedules
+          )
     with self._lock:
       self._plan_cache[cache_key] = schedule
     return schedule
@@ -1764,6 +1875,8 @@ class RaidenController:
       uuid: Any = "",
   ) -> _CachedTransferSchedule:
     """Computes transfer schedule math and returns a _CachedTransferSchedule."""
+    if group_size <= 0:
+      raise ValueError("group_size must be positive")
     # 1. Retrieve destination metadata (either from remote dst_controller
     # or local)
     dst_metadata = []
@@ -2435,6 +2548,7 @@ class RaidenController:
         rpc_addresses=dict(rpc_addresses),
         data_addresses=data_addresses,
         dst_unit_counts=dst_unit_counts,
+        is_weight_sync=bool(num_vars > 0 or local_skip_tiling),
     )
 
   def _metadata_proto_locked(self, unit: RaidenId) -> Any:
@@ -2692,6 +2806,7 @@ class RaidenController:
               req_id=hop_req_id,
               skip_d2h=final_plan.skip_d2h or (s != src_unit),
               skip_tiling=final_plan.skip_tiling,
+              is_weight_sync=final_plan.is_weight_sync,
           )
 
           async def _run_single_transfer(s_node, d_node, plan):
@@ -2702,6 +2817,16 @@ class RaidenController:
               )
               loop = asyncio.get_running_loop()
               rpc_executor = getattr(self.worker_rpc_client, "executor", None)
+              remote_is_sender = s_node not in self._registered_shards
+              if (
+                  remote_is_sender
+                  or self.worker_rpc_client.include_receiver_push_schedules(
+                      plan
+                  )
+              ):
+                remote_schedules = plan.shard_push_schedules
+              else:
+                remote_schedules = None
               success = await loop.run_in_executor(
                   rpc_executor,
                   functools.partial(
@@ -2710,12 +2835,12 @@ class RaidenController:
                       [d_node],
                       plan.req_id,
                       True,
-                      s_node not in self._registered_shards,
+                      remote_is_sender,
                       plan.expected_block_count,
                       plan.uuid,
                       dst_controller_address,
                       src_controller_address,
-                      plan.shard_push_schedules,
+                      remote_schedules,
                       dst_mem_type,
                       skip_d2h=plan.skip_d2h,
                   ),
@@ -2845,7 +2970,7 @@ class RaidenController:
       skip_tiling: Optional dictionary specifying which layers to skip tiling
         for.
       group_size: Number of weights to group together for synchronization
-        (default 1).
+        (default 1). Must be positive.
       use_cached_plan: If True and enable_plan_cache is enabled on the
         controller, attempts to reuse pre-computed transfer schedules and slice
         partitioning across identical transfer configurations.
@@ -2853,6 +2978,8 @@ class RaidenController:
     Returns:
       A Future for the call site to wait for the transfer to complete.
     """
+    if group_size <= 0:
+      raise ValueError("group_size must be positive")
 
     # The block-granular reshard mode dispatches on exactly the arguments the
     # legacy body rejects with NotImplementedError below — provably disjoint
@@ -2903,33 +3030,32 @@ class RaidenController:
         )
         return self._active_tasks[req_id]
 
-    # Select only one source unit for now.
-    with self._lock:
-      active_src_counts = {}
-      active_dst_counts = {}
-      for existing_plan in self._active_transfers.values():
-        for s in existing_plan.src_units:
-          active_src_counts[s.job_replica_id] = (
-              active_src_counts.get(s.job_replica_id, 0) + 1
-          )
+      self._prune_completed_transfers_locked()
 
-        for t in existing_plan.dst_units:
-          active_dst_counts[t.job_replica_id] = (
-              active_dst_counts.get(t.job_replica_id, 0) + 1
-          )
+      # Select least-loaded source unit in O(1) via replica counters.
+      selected_src = min(
+          src_units,
+          key=lambda s: self._src_replica_counts.get(s.job_replica_id, 0),
+      )
 
-    selected_src = min(
-        src_units, key=lambda s: active_src_counts.get(s.job_replica_id, 0)
-    )
+      if uuid is None:
+        uuid = random.randint(1, 2**63 - 1)
 
-    if uuid is None:
-      uuid = random.randint(1, 2**63 - 1)
-
-    # Determine session_id and req_id synchronously
-    with self._lock:
-      session_id = len(self._active_transfers)
+      # Determine session_id and req_id synchronously
+      session_id = self._next_session_id
+      self._next_session_id += 1
       if not req_id:
         req_id = f"req_{session_id}"
+
+      recorded_srcs = [selected_src] if not use_block_chunks else src_units
+      for s in recorded_srcs:
+        self._src_replica_counts[s.job_replica_id] = (
+            self._src_replica_counts.get(s.job_replica_id, 0) + 1
+        )
+      for t in dst_units:
+        self._dst_replica_counts[t.job_replica_id] = (
+            self._dst_replica_counts.get(t.job_replica_id, 0) + 1
+        )
 
     if not use_block_chunks:
       # === OLD WORKFLOW: Fully build and store plan SYNCHRONOUSLY ===
@@ -3047,6 +3173,13 @@ class RaidenController:
               skip_d2h=skip_d2h,
               skip_tiling=skip_tiling or {},
               parallelism=parallelism or 1,
+              is_weight_sync=bool(
+                  skip_tiling
+                  or any(
+                      u in self._registered_variables
+                      for u in (*src_units, *dst_units)
+                  )
+              ),
           )
 
           # 4. Trigger COMMAND_START_TRANSFER (is_sender=False) on local workers
@@ -3136,8 +3269,8 @@ class RaidenController:
             expected_block_count = cached_schedule.expected_block_count
           dst_unit_layer_counts = cached_schedule.dst_unit_layer_counts
           direct_dsts = cached_schedule.direct_dsts
-          rpc_addresses = dict(self.worker_rpc_client.get_worker_endpoints())
-          rpc_addresses.update(cached_schedule.rpc_addresses)
+          rpc_addresses = dict(cached_schedule.rpc_addresses)
+          rpc_addresses.update(self.worker_rpc_client.get_worker_endpoints())
           data_addresses = cached_schedule.data_addresses
           dst_unit_counts = cached_schedule.dst_unit_counts
 
@@ -3162,6 +3295,10 @@ class RaidenController:
               skip_d2h=skip_d2h,
               skip_tiling=local_skip_tiling,
               parallelism=parallelism or 1,
+              is_weight_sync=cached_schedule.is_weight_sync,
+              sender_push_schedule_protos=(
+                  cached_schedule.sender_push_schedule_protos
+              ),
           )
           with self._lock:
             self._active_transfers[req_id] = final_plan
@@ -3190,6 +3327,10 @@ class RaidenController:
                 skip_d2h=skip_d2h,
                 skip_tiling=local_skip_tiling,
                 parallelism=final_plan.parallelism,
+                is_weight_sync=cached_schedule.is_weight_sync,
+                sender_push_schedule_protos=(
+                    cached_schedule.sender_push_schedule_protos
+                ),
             )
 
           # 1. Arm direct schedule receivers
@@ -3201,6 +3342,12 @@ class RaidenController:
               )
               loop = asyncio.get_running_loop()
               rpc_executor = getattr(self.worker_rpc_client, "executor", None)
+              if self.worker_rpc_client.include_receiver_push_schedules(
+                  direct_plan
+              ):
+                receiver_schedules = direct_schedules
+              else:
+                receiver_schedules = None
               success = await loop.run_in_executor(
                   rpc_executor,
                   dst_facade.register_transfer_schedule,
@@ -3213,7 +3360,7 @@ class RaidenController:
                   uuid,
                   dst_controller_address,
                   src_controller_address,
-                  direct_schedules,
+                  receiver_schedules,
                   dst_mem_type,
                   skip_d2h,
                   local_skip_tiling,
@@ -3285,17 +3432,30 @@ class RaidenController:
               )
 
           if broadcast_groups:
-            for keys_and_targets in broadcast_groups.values():
-              task = self._execute_slice_broadcast(
-                  keys_and_targets=keys_and_targets,
-                  final_plan=final_plan,
-                  fanout_k=self.broadcast_k,
-                  req_id=req_id,
-                  dst_mem_type=dst_mem_type,
-                  dst_controller_address=dst_controller_address,
-                  src_controller_address=src_controller_address,
-              )
-              push_tasks.append(task)
+            # Pipeline broadcast groups sequentially per source shard to avoid
+            # simultaneous socket connection storms on destination peers,
+            # while running different source shards concurrently.
+            shard_broadcast_groups = {}
+            for group_key, keys_and_targets in broadcast_groups.items():
+              src_unit, shard_idx = group_key[0], group_key[1]
+              shard_broadcast_groups.setdefault(
+                  (src_unit, shard_idx), []
+              ).append(keys_and_targets)
+
+            async def _execute_shard_broadcasts(groups_list):
+              for k_and_t in groups_list:
+                await self._execute_slice_broadcast(
+                    keys_and_targets=k_and_t,
+                    final_plan=final_plan,
+                    fanout_k=self.broadcast_k,
+                    req_id=req_id,
+                    dst_mem_type=dst_mem_type,
+                    dst_controller_address=dst_controller_address,
+                    src_controller_address=src_controller_address,
+                )
+
+            for groups_list in shard_broadcast_groups.values():
+              push_tasks.append(_execute_shard_broadcasts(groups_list))
 
           if push_tasks:
             await asyncio.gather(*push_tasks)
@@ -3319,8 +3479,16 @@ class RaidenController:
             for unit in old_plan.src_units
         ])
 
+    def _on_transfer_done():
+      with self._lock:
+        self._prune_completed_transfers_locked()
+
     transfer_task = _execute_transfer()
-    future = RaidenFuture(session_id=session_id, transfer_task=transfer_task)
+    future = RaidenFuture(
+        session_id=session_id,
+        transfer_task=transfer_task,
+        on_complete=_on_transfer_done,
+    )
     with self._lock:
       self._active_tasks[req_id] = future
       self._task_units[req_id] = list(src_units) + list(dst_units)

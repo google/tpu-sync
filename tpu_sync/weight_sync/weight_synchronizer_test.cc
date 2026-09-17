@@ -1416,6 +1416,75 @@ TEST_F(WeightSynchronizerTest,
   }
 }
 
+TEST_F(WeightSynchronizerTest,
+       PushWeightsReshardedLocalShardIndicesNotShadowedByGlobalIndices) {
+  const size_t num_layers = 1;
+  const size_t num_shards = 4;
+  const size_t slice_byte_size = 256;
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
+
+  // Host 1 of a 2x4 mesh with 2x2 host subgrid: global_shards = {2, 3, 6, 7}
+  // and local_shards = {0, 1, 2, 3}. Notice that global shards 2 and 3 overlap
+  // with local shard indices 2 and 3.
+  // When RaidenController sends a StartTransferRequest keyed by local_shard
+  // {0, 1, 2, 3}, slot 0 (global 2) must execute schedule[0] and NOT
+  // schedule[2].
+  ws_source->SetGlobalShardIndices({2, 3, 6, 7});
+  ws_source->SetLocalShardIndices({0, 1, 2, 3});
+  ws_dest->SetGlobalShardIndices({0, 1, 2, 3});
+  ws_dest->SetLocalShardIndices({0, 1, 2, 3});
+
+  const uint8_t fill_bytes[4] = {0x11, 0x22, 0x33, 0x44};
+  for (size_t s = 0; s < num_shards; ++s) {
+    uint8_t* src_ptr = const_cast<uint8_t*>(ws_source->GetHostBufferPtr(0, s));
+    uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostBufferPtr(0, s));
+    ASSERT_NE(src_ptr, nullptr);
+    ASSERT_NE(dst_ptr, nullptr);
+    std::memset(src_ptr, fill_bytes[s], slice_byte_size);
+    std::memset(dst_ptr, 0x00, slice_byte_size);
+  }
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  request.set_uuid(54323);
+
+  auto* schedules = request.mutable_shard_push_schedules();
+  for (size_t s = 0; s < num_shards; ++s) {
+    auto* entry = (*schedules)[s].add_entries();
+    entry->set_dst_peer(dest_peer);
+    entry->set_dst_shard_idx(s);
+    entry->set_src_offset_bytes(0);
+    entry->set_dst_offset_bytes(0);
+    entry->set_size_bytes(slice_byte_size);
+    entry->set_count(1);
+    entry->set_layer_idx(0);
+  }
+
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), num_shards));
+  absl::Status status = ws_source->PushWeightsResharded(request);
+  EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+  for (size_t s = 0; s < num_shards; ++s) {
+    const uint8_t* dst_ptr = ws_dest->GetHostBufferPtr(0, s);
+    ASSERT_NE(dst_ptr, nullptr);
+    for (size_t b = 0; b < slice_byte_size; ++b) {
+      EXPECT_EQ(dst_ptr[b], fill_bytes[s])
+          << "Mismatch at slot " << s << " byte " << b;
+    }
+  }
+}
+
 }  // namespace
 }  // namespace weight_sync
 }  // namespace tpu_raiden

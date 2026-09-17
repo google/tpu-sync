@@ -56,9 +56,15 @@ std::unique_ptr<stream_executor::Stream> g_streams[kMaxShards] = {nullptr};
 static absl::Mutex ws_mu;
 static auto* ws_map =
     new absl::flat_hash_map<int32_t, WeightSynchronizerBase*>();
+struct SlotAndGlobal {
+  size_t slot;
+  int64_t global_shard;
+  bool has_explicit_global;
+};
+
 static auto* ws_shard_to_slot_map =
     new absl::flat_hash_map<WeightSynchronizerBase*,
-                            absl::flat_hash_map<int32_t, size_t>>();
+                            absl::flat_hash_map<int32_t, SlotAndGlobal>>();
 
 void ClearSharedWsMap() {
   absl::MutexLock lock(ws_mu);
@@ -79,7 +85,7 @@ static WeightSynchronizerBase* GetSharedWs(
     int32_t shard_idx, int32_t listener_port, int32_t num_layers,
     int32_t parallelism, const std::vector<size_t>& slice_byte_sizes,
     int32_t local_port, int32_t num_shards, int32_t local_slot = -1,
-    int32_t submanager_idx = -1) {
+    int32_t submanager_idx = -1, int32_t global_shard_idx = -1) {
   absl::MutexLock lock(ws_mu);
   if (submanager_idx < 0) {
     submanager_idx = (num_shards > 0) ? (shard_idx / num_shards) : 0;
@@ -129,14 +135,37 @@ static WeightSynchronizerBase* GetSharedWs(
                         ? (slot_map.size() % ws->num_shards())
                         : slot_map.size();
   }
-  auto [it, inserted] = slot_map.try_emplace(shard_idx, assigned_slot);
+  bool has_explicit_global = (global_shard_idx >= 0);
+  int64_t effective_global = has_explicit_global
+                                 ? static_cast<int64_t>(global_shard_idx)
+                                 : static_cast<int64_t>(shard_idx);
+  auto [it, inserted] = slot_map.try_emplace(
+      shard_idx,
+      SlotAndGlobal{assigned_slot, effective_global, has_explicit_global});
   if (inserted) {
     std::vector<int64_t> indices(ws->num_shards(), -1);
     std::vector<int> local_indices(ws->num_shards(), -1);
-    for (const auto& [s_id, s_slot] : slot_map) {
-      if (s_slot < indices.size()) {
-        indices[s_slot] = s_id;
-        local_indices[s_slot] = static_cast<int>(s_slot);
+    int64_t host_base = static_cast<int64_t>(submanager_idx) *
+                        static_cast<int64_t>(ws->num_shards());
+    bool any_explicit_global = false;
+    bool all_in_host_range = (ws->num_shards() > 0);
+    for (const auto& [s_id, s_info] : slot_map) {
+      if (s_info.has_explicit_global) {
+        any_explicit_global = true;
+      }
+      if (s_info.global_shard < host_base ||
+          s_info.global_shard >=
+              host_base + static_cast<int64_t>(ws->num_shards())) {
+        all_in_host_range = false;
+      }
+    }
+    for (const auto& [s_id, s_info] : slot_map) {
+      if (s_info.slot < indices.size()) {
+        indices[s_info.slot] =
+            (!any_explicit_global && all_in_host_range)
+                ? (host_base + static_cast<int64_t>(s_info.slot))
+                : s_info.global_shard;
+        local_indices[s_info.slot] = static_cast<int>(s_info.slot);
       }
     }
     ws->SetGlobalShardIndices(std::move(indices));
@@ -158,7 +187,7 @@ static size_t GetLocalSlot(int32_t shard_idx) {
   if (it != ws_shard_to_slot_map->end()) {
     auto slot_it = it->second.find(shard_idx);
     if (slot_it != it->second.end()) {
-      return slot_it->second;
+      return slot_it->second.slot;
     }
   }
   return (ws->num_shards() > 0)
@@ -184,6 +213,8 @@ xla::ffi::Error TriggerWeightSynchronizerInitImpl(
   int32_t local_slot = (shard_idx_buf.element_count() >= 2) ? shard_ptr[1] : -1;
   int32_t submanager_idx =
       (shard_idx_buf.element_count() >= 3) ? shard_ptr[2] : -1;
+  int32_t global_shard_idx =
+      (shard_idx_buf.element_count() >= 4) ? shard_ptr[3] : -1;
 
   if (shard_idx < 0 || static_cast<size_t>(shard_idx) >= kMaxShards) {
     return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
@@ -207,11 +238,12 @@ xla::ffi::Error TriggerWeightSynchronizerInitImpl(
     VLOG(1)
         << "[TPU Worker FFI] >>> WS LAZY INITIALIZATION TRIGGERED <<< Shard: "
         << shard_idx << ", Local Slot: " << local_slot
-        << ", Submanager: " << submanager_idx;
+        << ", Submanager: " << submanager_idx
+        << ", Global Shard: " << global_shard_idx;
 
     g_weight_synchronizers[shard_idx] = GetSharedWs(
         shard_idx, listener_port, num_layers, parallelism, slice_byte_sizes,
-        local_port, num_shards, local_slot, submanager_idx);
+        local_port, num_shards, local_slot, submanager_idx, global_shard_idx);
 
     // Allocate the StreamExecutor Stream once per shard, and cache E2E!
     int64_t dev_id = static_cast<int64_t>(shard_idx);
@@ -301,6 +333,8 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
       (shard_idx_buf.element_count() >= 2) ? shard_ptr[1] : -1;
   int32_t submanager_idx =
       (shard_idx_buf.element_count() >= 3) ? shard_ptr[2] : -1;
+  int32_t global_shard_idx =
+      (shard_idx_buf.element_count() >= 4) ? shard_ptr[3] : -1;
 
   if (shard_idx < 0 || static_cast<size_t>(shard_idx) >= kMaxShards) {
     return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
@@ -324,11 +358,13 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
     VLOG(1)
         << "[TPU Worker FFI] >>> WS LAZY INITIALIZATION TRIGGERED <<< Shard: "
         << shard_idx << ", Local Slot: " << local_slot_in
-        << ", Submanager: " << submanager_idx;
+        << ", Submanager: " << submanager_idx
+        << ", Global Shard: " << global_shard_idx;
 
-    g_weight_synchronizers[shard_idx] = GetSharedWs(
-        shard_idx, listener_port, num_layers, parallelism, slice_byte_sizes,
-        local_port, num_shards, local_slot_in, submanager_idx);
+    g_weight_synchronizers[shard_idx] =
+        GetSharedWs(shard_idx, listener_port, num_layers, parallelism,
+                    slice_byte_sizes, local_port, num_shards, local_slot_in,
+                    submanager_idx, global_shard_idx);
 
     int64_t dev_id = static_cast<int64_t>(shard_idx);
     auto platform_or =

@@ -18,7 +18,7 @@ import dataclasses
 import enum
 
 
-@dataclasses.dataclass(unsafe_hash=True)
+@dataclasses.dataclass(unsafe_hash=True, slots=True)
 class RaidenId:
   """Identifier for the work unit in Raiden owning a sharded set of data."""
 

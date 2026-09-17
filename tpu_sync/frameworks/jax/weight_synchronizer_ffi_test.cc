@@ -729,6 +729,110 @@ TEST_F(WeightSynchronizerFfiTest, NonContiguousShardsInitAndD2hTest) {
   }
 }
 
+TEST_F(WeightSynchronizerFfiTest, TorusPermutedDeviceIdsInitAndD2hTest) {
+  constexpr int kNumLayers = 2;
+  constexpr int kSliceElements = 128;
+  constexpr int kShardsPerHost = 4;
+  constexpr int32_t kListenerPort = 61010;
+
+  // Simulates a 2x2x2 torus slice where physical device IDs (d.id) are ordered
+  // along a 4-chip ICI ring:
+  // Host 0: physical d.id = [0, 1, 3, 2], slots = [0, 1, 2, 3], global = [0..3]
+  // Host 1: physical d.id = [6, 7, 5, 4], slots = [0, 1, 2, 3], global = [4..7]
+  struct ShardAssignment {
+    int32_t device_id;
+    int32_t local_slot;
+    int32_t host_idx;
+    int32_t global_mesh_idx;
+  };
+  std::vector<ShardAssignment> assignments = {
+      {0, 0, 0, 0}, {1, 1, 0, 1}, {3, 2, 0, 2}, {2, 3, 0, 3},
+      {6, 0, 1, 4}, {7, 1, 1, 5}, {5, 2, 1, 6}, {4, 3, 1, 7},
+  };
+
+  std::vector<int32_t> slice_byte_sizes(kNumLayers,
+                                        kSliceElements * sizeof(int32_t));
+  FfiBufferFixture slice_sizes_fixture(XLA_FFI_DataType_S32,
+                                       slice_byte_sizes.data(), {kNumLayers});
+  xla::ffi::AnyBuffer slice_byte_sizes_buf = slice_sizes_fixture.AsAnyBuffer();
+
+  absl::flat_hash_map<int32_t, std::vector<std::vector<int32_t>>>
+      device_layer_data;
+  for (const auto& a : assignments) {
+    auto& layers = device_layer_data[a.device_id];
+    layers.resize(kNumLayers);
+    for (int l = 0; l < kNumLayers; ++l) {
+      layers[l].resize(kSliceElements);
+      for (int i = 0; i < kSliceElements; ++i) {
+        layers[l][i] = (a.global_mesh_idx + 1) * 100000 + (l + 1) * 1000 + i;
+      }
+    }
+  }
+
+  for (const auto& a : assignments) {
+    int32_t shard_info[4] = {a.device_id, a.local_slot, a.host_idx,
+                             a.global_mesh_idx};
+    FfiBufferFixture shard_fixture(XLA_FFI_DataType_S32, shard_info, {4});
+    xla::ffi::AnyBuffer shard_buf = shard_fixture.AsAnyBuffer();
+
+    std::vector<FfiBufferFixture> anchor_fixtures;
+    std::vector<xla::ffi::AnyBuffer> jax_arrays;
+    anchor_fixtures.reserve(kNumLayers);
+    jax_arrays.reserve(kNumLayers);
+    for (int l = 0; l < kNumLayers; ++l) {
+      anchor_fixtures.emplace_back(XLA_FFI_DataType_S32,
+                                   device_layer_data[a.device_id][l].data(),
+                                   std::vector<int64_t>{kSliceElements});
+      jax_arrays.push_back(anchor_fixtures.back().AsAnyBuffer());
+    }
+
+    std::vector<int32_t> out_data(6, 0);
+    FfiBufferFixture out_fixture(XLA_FFI_DataType_S32, out_data.data(), {6});
+    xla::ffi::Result<xla::ffi::AnyBuffer> out = out_fixture.AsAnyBuffer();
+
+    xla::ffi::Error err = TriggerWeightSynchronizerInitAndD2hHelper(
+        shard_buf, slice_byte_sizes_buf, jax_arrays,
+        /*local_port=*/0, /*parallelism=*/1, kNumLayers, kListenerPort,
+        kShardsPerHost, out);
+    ASSERT_TRUE(err.success()) << "InitAndD2h failed for device " << a.device_id
+                               << ": " << err.message();
+  }
+
+  WeightSynchronizerBase* ws_0 = g_weight_synchronizers[0];
+  WeightSynchronizerBase* ws_1 = g_weight_synchronizers[6];
+  ASSERT_NE(ws_0, nullptr);
+  ASSERT_NE(ws_1, nullptr);
+  EXPECT_NE(ws_0, ws_1);
+
+  // Verify global shard indices match logical mesh order [0, 1, 2, 3] and
+  // [4, 5, 6, 7], NOT physical device IDs [0, 1, 3, 2] or [6, 7, 5, 4].
+  EXPECT_EQ(ws_0->global_shard_index(0), 0);
+  EXPECT_EQ(ws_0->global_shard_index(1), 1);
+  EXPECT_EQ(ws_0->global_shard_index(2), 2);
+  EXPECT_EQ(ws_0->global_shard_index(3), 3);
+
+  EXPECT_EQ(ws_1->global_shard_index(0), 4);
+  EXPECT_EQ(ws_1->global_shard_index(1), 5);
+  EXPECT_EQ(ws_1->global_shard_index(2), 6);
+  EXPECT_EQ(ws_1->global_shard_index(3), 7);
+
+  // Verify slot 2 holds device 3's data (tp=2) and slot 3 holds device 2's
+  // data (tp=3).
+  for (const auto& a : assignments) {
+    WeightSynchronizerBase* ws = (a.host_idx == 0) ? ws_0 : ws_1;
+    for (int l = 0; l < kNumLayers; ++l) {
+      const uint8_t* host_ptr = ws->GetHostBufferPtr(l, a.local_slot);
+      ASSERT_NE(host_ptr, nullptr);
+      const int32_t* host_data = reinterpret_cast<const int32_t*>(host_ptr);
+      for (int i = 0; i < kSliceElements; ++i) {
+        EXPECT_EQ(host_data[i], device_layer_data[a.device_id][l][i])
+            << "Mismatch at device " << a.device_id << " (slot " << a.local_slot
+            << "), layer " << l << ", index " << i;
+      }
+    }
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(FfiTypeTests, WeightSynchronizerFfiParamTest,
                          ::testing::Values(FfiType::kInit, FfiType::kInitAndD2h));
 

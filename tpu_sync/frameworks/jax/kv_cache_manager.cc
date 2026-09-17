@@ -52,6 +52,7 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/core/utils.h"  // IWYU pragma: keep
+#include "tpu_sync/kv_cache/backends/backend.h"
 #ifndef WITHOUT_PYTHON
 #include "tpu_sync/frameworks/jax/utils.h"
 
@@ -941,6 +942,65 @@ std::string NumaAwareKVCacheManager::DumpMetricsToString() const {
     return metrics_collector_->DumpMetricsToString();
   }
   return "[]";
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture>
+NumaAwareKVCacheManager::D2hWriteToBackend(
+    absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+    const std::vector<kv_cache::backends::BlockKey>& block_keys,
+    const std::vector<int64_t>& src_device_block_ids,
+    const std::vector<int64_t>& dst_host_block_ids) {
+  if (sub_managers_.empty()) {
+    return absl::InternalError("No sub-managers available");
+  }
+  std::vector<raiden::PjRtCopyFuture> futures;
+  futures.reserve(sub_managers_.size());
+  for (auto& sub_mgr : sub_managers_) {
+    if (sub_mgr != nullptr) {
+      ABSL_ASSIGN_OR_RETURN(
+          auto fut,
+          sub_mgr->D2hWriteToBackend(backends, block_keys, src_device_block_ids,
+                                     dst_host_block_ids));
+      futures.push_back(std::move(fut));
+    }
+  }
+  return raiden::JoinPjRtCopyFutures(futures);
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture>
+NumaAwareKVCacheManager::H2dReadFromBackend(
+    absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+    const std::vector<kv_cache::backends::BlockKey>& block_keys,
+    const std::vector<int64_t>& src_host_block_ids,
+    const std::vector<int64_t>& dst_device_block_ids) {
+  if (sub_managers_.empty()) {
+    return absl::InternalError("No sub-managers available");
+  }
+  std::vector<raiden::PjRtCopyFuture> futures;
+  futures.reserve(sub_managers_.size());
+  for (auto& sub_mgr : sub_managers_) {
+    if (sub_mgr != nullptr) {
+      ABSL_ASSIGN_OR_RETURN(
+          auto fut,
+          sub_mgr->H2dReadFromBackend(backends, block_keys, src_host_block_ids,
+                                      dst_device_block_ids));
+      futures.push_back(std::move(fut));
+    }
+  }
+  return raiden::JoinPjRtCopyFutures(futures);
+}
+
+std::shared_ptr<kv_cache::backends::KVBackend>
+NumaAwareKVCacheManager::GetKVBackend(absl::string_view backend_name) const {
+  for (const auto& sub_mgr : sub_managers_) {
+    if (sub_mgr != nullptr) {
+      auto backend = sub_mgr->GetKVBackend(backend_name);
+      if (backend != nullptr) {
+        return backend;
+      }
+    }
+  }
+  return nullptr;
 }
 
 #ifndef WITHOUT_PYTHON

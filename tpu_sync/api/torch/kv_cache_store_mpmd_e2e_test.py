@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
 import os
 import pathlib
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -48,6 +51,14 @@ flags.DEFINE_boolean("run_worker", False, "")
 flags.DEFINE_string("worker_mode", "save_load", "")
 flags.DEFINE_boolean("use_slices", False, "")
 flags.DEFINE_boolean("enable_shm", False, "")
+flags.DEFINE_string(
+    "storage_root", "", "Path to storage directory for secondary storage"
+)
+flags.DEFINE_string(
+    "storage_phase",
+    "both",
+    "Phase of secondary storage test: 'write', 'read', or 'both'",
+)
 flags.DEFINE_integer("rank", 0, "")
 flags.DEFINE_integer("world_size", 0, "")
 flags.DEFINE_integer("master_port", 0, "")
@@ -790,6 +801,448 @@ def _worker_write_remote_main(argv):
     dist.destroy_process_group()
 
 
+def _worker_secondary_storage_main(argv):
+  rank = FLAGS.rank
+  world_size = FLAGS.world_size
+  master_port = FLAGS.master_port
+  controller_port = FLAGS.controller_port
+  storage_root = FLAGS.storage_root
+  phase = FLAGS.storage_phase
+
+  os.environ["MASTER_ADDR"] = "localhost"
+  os.environ["MASTER_PORT"] = str(master_port)
+  os.environ["RANK"] = str(rank)
+  os.environ["WORLD_SIZE"] = str(world_size)
+  os.environ["LOCAL_RANK"] = str(rank)
+  os.environ["PJRT_LOCAL_PROCESS_RANK"] = str(rank)
+  os.environ["GROUP_RANK"] = "0"
+  os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
+  os.environ["GLOG_alsologtostderr"] = "1"
+
+  dist.init_process_group(
+      backend="gloo",
+      init_method=f"tcp://127.0.0.1:{master_port}",
+      rank=rank,
+      world_size=world_size,
+  )
+  print(
+      f"[MPMD Storage][Rank {rank}][Phase={phase}] Process initialized"
+      f" (PID={os.getpid()}, master_port={master_port}). Gloo process group"
+      " ready.",
+      flush=True,
+  )
+
+  try:
+    cfg = kv_cache_store._impl.BackendConfig()
+    cfg.type = "posix"
+    cfg.parallelism.tp_rank = rank
+    cfg.parallelism.tp_size = world_size
+    cfg.set_property("root_dir", storage_root)
+    cfg.set_property("model_name", "test_model_mpmd")
+
+    device = torch.device("tpu")
+    num_blocks = 4
+    # Shape: (num_blocks, tokens_per_block, head_shards, heads_per_shard, head_dim)
+    # (4 blocks, 128 tokens/block, 8 head shards, 8 heads/shard, head_dim 128).
+    shape = (num_blocks, 128, 8, 8, 128)
+    host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) + (
+        rank * 1000.0
+    )
+    hashes = [b"hash_mpmd_sec_0", b"hash_mpmd_sec_1"]
+    block_elements = 128 * 8 * 8 * 128
+    shard_size_bytes = block_elements * 4
+
+    # =========================================================================
+    # Write Phase
+    # =========================================================================
+    if phase in ("write", "both"):
+      print(
+          f"[MPMD Storage][Step 1/11][Write Phase][Rank {rank}] Initializing"
+          " backend config and TPU cache buffer.",
+          flush=True,
+      )
+      tpu_cache = torch.tensor(host_data, device=device)
+      try:
+        torch.tpu.synchronize()
+      except (AttributeError, RuntimeError):
+        pass
+
+      print(
+          f"[MPMD Storage][Step 2/11][Write Phase][Rank {rank}] Initializing"
+          " store and manager, inserting initial HBM blocks hashes to"
+          " device_block_id=[0, 1], status=HBM.",
+          flush=True,
+      )
+      rid1 = kv_cache_store.RaidenId(
+          "mpmd_sec_job_writer", "0", "mpmd_cache_writer", 0
+      )
+      # Worker Discovery & Backend Registration:
+      # 1. KVCacheStore's RaidenController listens for gRPC RegisterWorker calls on controller_port.
+      # 2. Each worker KVCacheManager connects to the controller and registers its worker endpoint.
+      # 3. Both store and manager initialize secondary backends locally from BackendConfig.
+      store = None
+      if rank == 0:
+        store = kv_cache_store.KVCacheStore(
+            capacity=num_blocks,
+            raiden_id=rid1,
+            num_shards=world_size,
+            shard_size_bytes=shard_size_bytes,
+            store_server_ip="127.0.0.1",
+            raiden_controller_port=controller_port,
+            secondary_backend_configs=[cfg],
+        )
+        slices = [
+            kv_cache_store.RaidenBlockId(
+                rid1,
+                host_block_id=-1,
+                device_block_id=0,
+                status=kv_cache_store.BlockStatus.HBM,
+            ),
+            kv_cache_store.RaidenBlockId(
+                rid1,
+                host_block_id=-1,
+                device_block_id=1,
+                status=kv_cache_store.BlockStatus.HBM,
+            ),
+        ]
+        assert store.insert(
+            hashes, slices, on_host=False
+        ), "Failed to insert blocks to store on rank 0"
+
+      dist.barrier()
+
+      manager = None
+      for r in range(world_size):
+        if rank == r:
+          manager = kv_cache_manager.KVCacheManager(
+              kv_caches=[[tpu_cache]],
+              local_control_port=0,
+              max_blocks=num_blocks,
+              num_slots=2,
+              unsafe_skip_buffer_lock=True,
+              raiden_worker_port=0,
+              raiden_controller_address=f"localhost:{controller_port}",
+              worker_id=f"worker_{rank}",
+              host_blocks_to_allocate=4,
+              node_id=rank,
+              backend_configs=[cfg],
+          )
+        dist.barrier()
+
+      if rank == 0:
+        pre_lookup = store.lookup(hashes, pin_found=False)
+        assert len(pre_lookup) == len(
+            hashes
+        ), f"Expected {len(hashes)} blocks, got {len(pre_lookup)}"
+        for h, b in pre_lookup:
+          assert (
+              b.status == kv_cache_store.BlockStatus.HBM
+          ), f"Expected HBM, got {b.status.name}"
+        print(
+            "[MPMD Storage][Step 3/11][Write Phase][Rank 0] Pre-save lookup:"
+            f" verified status=HBM for all {len(hashes)} blocks.",
+            flush=True,
+        )
+
+      dist.barrier()
+
+      if rank == 0:
+        print(
+            "[MPMD Storage][Step 4/11][Write Phase][Rank 0] Triggering"
+            f" offload (store.save) for {hashes}...",
+            flush=True,
+        )
+        save_start = time.time()
+        assert store.save(hashes), "store.save failed on rank 0"
+        done = False
+        while not done:
+          save_done, save_failed, _, _, _ = store.poll_save_status()
+          if save_failed:
+            raise RuntimeError(f"Async Save failed: {save_failed}")
+          if save_done:
+            done = True
+          if not done:
+            time.sleep(0.01)
+        save_duration = time.time() - save_start
+        print(
+            "[MPMD Storage][Step 4/11][Write Phase][Rank 0] Offload completed"
+            f" in {save_duration:.3f}s. Blocks confirmed: {save_done}.",
+            flush=True,
+        )
+
+      dist.barrier()
+
+      if rank == 0:
+        post_lookup = store.lookup(hashes, pin_found=False)
+        assert len(post_lookup) == len(hashes)
+        for h, b in post_lookup:
+          assert (
+              b.status == kv_cache_store.BlockStatus.HOST_AND_HBM
+          ), f"Expected HOST_AND_HBM, got {b.status.name}"
+        print(
+            "[MPMD Storage][Step 5/11][Write Phase][Rank 0] Post-save lookup:"
+            " verified status=HOST_AND_HBM in tier 0 for all blocks.",
+            flush=True,
+        )
+
+      dist.barrier()
+
+      # Expected per-rank shard path:
+      #   {storage_root}/test_model_mpmd/tp{world_size}_r{rank}/{hash[:3]}/{hash[3:5]}/{hash}.bin
+      # Each rank discovers only its rank-local shard file matching its TP rank.
+      bin_files = glob.glob(
+          os.path.join(
+              storage_root,
+              "test_model_mpmd",
+              f"tp{world_size}_r{rank}",
+              "**",
+              "*.bin",
+          ),
+          recursive=True,
+      )
+      print(
+          f"[MPMD Storage][Step 6/11][Write Phase][Rank {rank}] Discovered"
+          f" {len(bin_files)} on-disk shard files:"
+          f" {[os.path.basename(f) for f in bin_files]} (paths: {bin_files})",
+          flush=True,
+      )
+      assert len(bin_files) == len(hashes), (
+          f"Rank {rank}: expected {len(hashes)} disk files, found"
+          f" {len(bin_files)}: {bin_files}"
+      )
+      file_by_name = {os.path.basename(f): f for f in bin_files}
+      for i, h in enumerate(hashes):
+        expected_filename = f"{h.hex()}.bin"
+        assert (
+            expected_filename in file_by_name
+        ), f"Rank {rank}: missing file {expected_filename} in {file_by_name}"
+        fpath = file_by_name[expected_filename]
+        fsize = os.path.getsize(fpath)
+        assert fsize == shard_size_bytes, (
+            f"Rank {rank}: file {expected_filename} size {fsize} != expected"
+            f" {shard_size_bytes}"
+        )
+        with open(fpath, "rb") as f:
+          disk_bytes = f.read()
+        disk_block_data = np.frombuffer(disk_bytes, dtype=np.float32).reshape(
+            shape[1:]
+        )
+        np.testing.assert_array_equal(disk_block_data, host_data[i])
+        print(
+            f"  [Rank {rank} Verified File] {expected_filename} ({fsize} B):"
+            f" bit-for-bit matched host_data[{i}]",
+            flush=True,
+        )
+
+      print(
+          f"[MPMD Storage][Step 6/11][Write Phase][Rank {rank}] Bit-for-bit"
+          f" disk files verified in tp{world_size}_r{rank} ({len(bin_files)}"
+          " files).",
+          flush=True,
+      )
+
+      dist.barrier()
+
+      print(
+          f"[MPMD Storage][Step 7/11][Write Phase][Rank {rank}] Erasing TPU HBM"
+          " memory and tearing down Instance 1...",
+          flush=True,
+      )
+      tpu_cache.zero_()
+      try:
+        torch.tpu.synchronize()
+      except (AttributeError, RuntimeError):
+        pass
+      del manager, store
+
+      dist.barrier()
+
+      if phase == "write":
+        print(
+            f"[MPMD Storage][Step 7/11][Write Phase][Rank {rank}] TPU memory"
+            " zeroed; Instance 1 torn down. Exiting write phase.",
+            flush=True,
+        )
+        return
+
+    # =========================================================================
+    # Read Phase
+    # =========================================================================
+    if phase in ("read", "both"):
+      tpu_cache = torch.zeros(shape, dtype=torch.float32, device=device)
+      try:
+        torch.tpu.synchronize()
+      except (AttributeError, RuntimeError):
+        pass
+
+      expected_ref = np.zeros_like(host_data)
+      expected_ref[2] = host_data[0]
+      expected_ref[3] = host_data[1]
+
+      print(
+          f"[MPMD Storage][Step 8/11][Read Phase][Rank {rank}] Spinning up cold"
+          " Instance 2 (Reader) with empty DRAM cache.",
+          flush=True,
+      )
+      rid2 = kv_cache_store.RaidenId(
+          "mpmd_sec_job_reader", "0", "mpmd_cache_reader", 0
+      )
+      # Worker Discovery & Backend Registration:
+      # 1. KVCacheStore's RaidenController listens for gRPC RegisterWorker calls on controller_port.
+      # 2. Each worker KVCacheManager connects to the controller and registers its worker endpoint.
+      # 3. Both store and manager initialize secondary backends locally from BackendConfig.
+      store = None
+      if rank == 0:
+        store = kv_cache_store.KVCacheStore(
+            capacity=num_blocks,
+            raiden_id=rid2,
+            num_shards=world_size,
+            shard_size_bytes=shard_size_bytes,
+            store_server_ip="127.0.0.1",
+            raiden_controller_port=controller_port,
+            secondary_backend_configs=[cfg],
+        )
+
+      dist.barrier()
+
+      manager = None
+      for r in range(world_size):
+        if rank == r:
+          manager = kv_cache_manager.KVCacheManager(
+              kv_caches=[[tpu_cache]],
+              local_control_port=0,
+              max_blocks=num_blocks,
+              num_slots=2,
+              unsafe_skip_buffer_lock=True,
+              raiden_worker_port=0,
+              raiden_controller_address=f"localhost:{controller_port}",
+              worker_id=f"worker_{rank}",
+              host_blocks_to_allocate=4,
+              node_id=rank,
+              backend_configs=[cfg],
+          )
+        dist.barrier()
+
+      storage_slices = None
+      if rank == 0:
+        print(
+            "[MPMD Storage][Step 9/11][Read Phase][Rank 0] Performing cold"
+            " lookup to verify SHARED_STORAGE discovery...",
+            flush=True,
+        )
+        storage_lookup = store.lookup(hashes, pin_found=False)
+        assert len(storage_lookup) == len(hashes), (
+            f"Expected {len(hashes)} blocks from cold lookup, got"
+            f" {len(storage_lookup)}"
+        )
+        for h, b in storage_lookup:
+          assert (
+              b.status == kv_cache_store.BlockStatus.SHARED_STORAGE
+          ), f"Expected SHARED_STORAGE, got {b.status.name}"
+          print(
+              f"  [Rank 0 Cold Lookup] hash={h!r} status={b.status.name}"
+              f" data_name={b.raiden_id.data_name}",
+              flush=True,
+          )
+        storage_slices = [s for _, s in storage_lookup]
+        print(
+            "[MPMD Storage][Step 9/11][Read Phase][Rank 0] Cold lookup"
+            " verified: discovered blocks with status=SHARED_STORAGE from"
+            " storage tier.",
+            flush=True,
+        )
+
+      dist.barrier()
+
+      if rank == 0:
+        print(
+            f"[MPMD Storage][Step 10/11][Read Phase][Rank 0] Triggering cold"
+            f" recall (store.load) into device_block_ids=[2, 3]...",
+            flush=True,
+        )
+        load_start = time.time()
+        assert store.load(
+            hashes, [2, 3], slices=storage_slices
+        ), "load failed on rank 0"
+        done = False
+        while not done:
+          load_done, load_failed, _ = store.poll_load_status()
+          if load_failed:
+            raise RuntimeError(f"Async Load failed: {load_failed}")
+          if load_done:
+            done = True
+          if not done:
+            time.sleep(0.01)
+        load_duration = time.time() - load_start
+        print(
+            "[MPMD Storage][Step 10/11][Read Phase][Rank 0] Async Load"
+            f" completed across all ranks in {load_duration:.3f}s.",
+            flush=True,
+        )
+
+      dist.barrier()
+
+      try:
+        torch.tpu.synchronize()
+      except (AttributeError, RuntimeError):
+        pass
+
+      print(
+          f"[MPMD Storage][Step 10/11][Read Phase][Rank {rank}] Verifying"
+          " restored TPU memory blocks [2, 3] match reference bit-for-bit...",
+          flush=True,
+      )
+      tpu_np = tpu_cache.cpu().numpy()
+      np.testing.assert_array_equal(tpu_np, expected_ref)
+      print(
+          f"[MPMD Storage][Step 10/11][Read Phase][Rank {rank}] SUCCESS:"
+          f" Bit-for-bit match verified on physical TPU rank {rank}! (blocks"
+          " [0,1]=zeros, blocks [2,3]=restored)",
+          flush=True,
+      )
+
+      dist.barrier()
+
+      if rank == 0:
+        repopulated = store.lookup(hashes, pin_found=False)
+        assert len(repopulated) == len(hashes)
+        for h, b in repopulated:
+          assert (
+              b.status == kv_cache_store.BlockStatus.HOST_AND_HBM
+          ), f"Expected HOST_AND_HBM, got {b.status.name}"
+          assert b.device_block_id in [
+              2,
+              3,
+          ], f"Expected device_block_id in [2, 3], got {b.device_block_id}"
+          assert (
+              b.host_block_id >= 0
+          ), f"Expected host_block_id >= 0, got {b.host_block_id}"
+          print(
+              f"  [Rank 0 Post-Recall Store Status] hash={h!r}"
+              f" device_block_id={b.device_block_id}"
+              f" host_block_id={b.host_block_id} status={b.status.name}",
+              flush=True,
+          )
+        print(
+            "[MPMD Storage][Step 11/11][Read Phase][Rank 0] Post-recall lookup"
+            " verified: status=HOST_AND_HBM (device_blocks=[2,3], host_blocks"
+            " confirmed >= 0; HBM and host RAM updated).",
+            flush=True,
+        )
+
+      del manager, store
+      dist.barrier()
+
+  finally:
+    dist.barrier()
+    print(
+        f"[MPMD Storage][Rank {rank}][Cleanup] Destroying Gloo process group"
+        " and exiting.",
+        flush=True,
+    )
+    dist.destroy_process_group()
+
+
 class KVCacheStoreMpmdE2ETest(absltest.TestCase):
 
   @classmethod
@@ -994,6 +1447,143 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
     # asserted the records-nothing contract, but no driver dispatched it.
     self._drive_read_remote(use_slices=True)
 
+  def test_mpmd_4rank_e2e_secondary_storage_offload_recall(self):
+    world_size = 4
+    prepare_tpu_environment(world_size)
+    master_port_w = pick_unused_ports(1)[0]
+    controller_port_w = pick_unused_ports(1)[0]
+    master_port_r = pick_unused_ports(1)[0]
+    controller_port_r = pick_unused_ports(1)[0]
+    temp_dir = tempfile.mkdtemp()
+
+    print(
+        "\n======================================================================\n"
+        "[MPMD Driver] STARTING 4-RANK MULTI-PROCESS SECONDARY STORAGE E2E"
+        " TEST\n"
+        f"  World Size: {world_size} ranks (processes)\n"
+        f"  Instance Group 1 (Writer): master={master_port_w},"
+        f" controller={controller_port_w}\n"
+        f"  Instance Group 2 (Reader): master={master_port_r},"
+        f" controller={controller_port_r}\n"
+        f"  Registry: {_registry_port}\n"
+        f"  Storage Root: {temp_dir}\n"
+        "======================================================================",
+        flush=True,
+    )
+
+    try:
+      # --- Instance Group 1: Writer ---
+      print(
+          "[MPMD Driver] Spawning Instance Group 1 (Writer)...",
+          flush=True,
+      )
+      procs_w = []
+      for rank in range(world_size):
+        env = os.environ.copy()
+        cmd = worker_launch_cmd() + [
+            "--run_worker",
+            "--worker_mode=secondary_storage",
+            "--storage_phase=write",
+            f"--storage_root={temp_dir}",
+            f"--rank={rank}",
+            f"--world_size={world_size}",
+            f"--master_port={master_port_w}",
+            f"--controller_port={controller_port_w}",
+            f"--registry_port={_registry_port}",
+        ]
+        p = subprocess.Popen(cmd, env=env)
+        print(
+            f"[MPMD Driver] Spawning Writer worker rank {rank}/{world_size}"
+            f" (PID={p.pid})...",
+            flush=True,
+        )
+        procs_w.append(p)
+
+      failed_w = False
+      for rank, p in enumerate(procs_w):
+        p.wait()
+        print(
+            f"[MPMD Driver] Writer worker rank {rank} (PID={p.pid}) finished"
+            f" with exit code {p.returncode}.",
+            flush=True,
+        )
+        if p.returncode != 0:
+          failed_w = True
+
+      if failed_w:
+        self.fail(
+            "One or more workers failed in Instance Group 1 (Writer)"
+            " secondary_storage MPMD test!"
+        )
+      print(
+          "[MPMD Driver] Instance Group 1 (Writer) completed successfully and"
+          " exited.",
+          flush=True,
+      )
+
+      # --- Instance Group 2: Reader ---
+      print(
+          "[MPMD Driver] Spawning Instance Group 2 (Reader)...",
+          flush=True,
+      )
+      procs_r = []
+      for rank in range(world_size):
+        env = os.environ.copy()
+        cmd = worker_launch_cmd() + [
+            "--run_worker",
+            "--worker_mode=secondary_storage",
+            "--storage_phase=read",
+            f"--storage_root={temp_dir}",
+            f"--rank={rank}",
+            f"--world_size={world_size}",
+            f"--master_port={master_port_r}",
+            f"--controller_port={controller_port_r}",
+            f"--registry_port={_registry_port}",
+        ]
+        p = subprocess.Popen(cmd, env=env)
+        print(
+            f"[MPMD Driver] Spawning Reader worker rank {rank}/{world_size}"
+            f" (PID={p.pid})...",
+            flush=True,
+        )
+        procs_r.append(p)
+
+      failed_r = False
+      for rank, p in enumerate(procs_r):
+        p.wait()
+        print(
+            f"[MPMD Driver] Reader worker rank {rank} (PID={p.pid}) finished"
+            f" with exit code {p.returncode}.",
+            flush=True,
+        )
+        if p.returncode != 0:
+          failed_r = True
+
+      if failed_r:
+        self.fail(
+            "One or more workers failed in Instance Group 2 (Reader)"
+            " secondary_storage MPMD test!"
+        )
+      print(
+          "[MPMD Driver] Instance Group 2 (Reader) completed successfully and"
+          " exited.",
+          flush=True,
+      )
+
+    finally:
+      shutil.rmtree(temp_dir, ignore_errors=True)
+      print(
+          f"[MPMD Driver] Cleaned up temporary directory {temp_dir}.",
+          flush=True,
+      )
+
+    print(
+        f"[MPMD Driver][SUCCESS] All {world_size} MPMD secondary storage"
+        " workers completed successfully across both instance groups!\n"
+        "======================================================================\n",
+        flush=True,
+    )
+
   # The expected_worker_count barrier tests live in kv_cache_store_test.py;
   # they spawn no MPMD workers, so duplicating them here added nothing.
 
@@ -1004,6 +1594,8 @@ def main(argv):
       _worker_read_remote_main(argv)
     elif FLAGS.worker_mode == "write_remote":
       _worker_write_remote_main(argv)
+    elif FLAGS.worker_mode == "secondary_storage":
+      _worker_secondary_storage_main(argv)
     else:
       _worker_save_load_main(argv)
   else:

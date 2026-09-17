@@ -41,7 +41,9 @@
 #include "tpu_sync/frameworks/torch/torch_nanobind_utils.h"
 #include "tpu_sync/frameworks/torch/torch_raw_transfer_bindings.h"
 #include "tpu_sync/frameworks/torch/weight_synchronizer.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
+#include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_wrapper.h"
 #include "tpu_sync/kv_cache/reshard/reshard_client.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -218,6 +220,22 @@ NB_MODULE(_tpu_raiden_torch, m) {
         absl::Status status = self.PollError();
         return status.ok() ? std::string() : std::string(status.message());
       });
+
+  nb::class_<tpu_raiden::kv_cache::backends::ParallelismConfig>(
+      m, "ParallelismConfig")
+      .def(nb::init<>())
+      .def_rw("tp_rank",
+              &tpu_raiden::kv_cache::backends::ParallelismConfig::tp_rank)
+      .def_rw("tp_size",
+              &tpu_raiden::kv_cache::backends::ParallelismConfig::tp_size);
+
+  nb::class_<tpu_raiden::kv_cache::BackendConfig>(m, "BackendConfig")
+      .def(nb::init<>())
+      .def_rw("type", &tpu_raiden::kv_cache::BackendConfig::type)
+      .def_rw("parallelism", &tpu_raiden::kv_cache::BackendConfig::parallelism)
+      .def("set_property", &tpu_raiden::kv_cache::BackendConfig::SetProperty)
+      .def("get_property", &tpu_raiden::kv_cache::BackendConfig::GetProperty,
+           nb::arg("key"), nb::arg("default_value") = "");
 
   // =========================================================================
   // 2. Bind KVCacheManager
@@ -512,11 +530,19 @@ NB_MODULE(_tpu_raiden_torch, m) {
           nb::arg("remote_block_ids"), nb::arg("local_block_ids"),
           nb::arg("parallelism") = 1,
           nb::arg("local_host_block_ids") = nb::none())
-      .def("complete_read", [](KVCacheManager& self) {
-        auto [done_sending, done_recving, failed_recving] =
-            self.CompleteReadRaw();
-        return nb::make_tuple(done_sending, done_recving, failed_recving);
-      });
+      .def("complete_read",
+           [](KVCacheManager& self) {
+             auto [done_sending, done_recving, failed_recving] =
+                 self.CompleteReadRaw();
+             return nb::make_tuple(done_sending, done_recving, failed_recving);
+           })
+      .def(
+          "register_kv_backends",
+          [](KVCacheManager& self,
+             const std::vector<tpu_raiden::kv_cache::BackendConfig>& configs) {
+            self.RegisterKVBackends(configs);
+          },
+          nb::arg("configs"), "Registers optional backends on this worker.");
   tpu_raiden::torch_bindings::BindPoolApi<tpu_raiden::RaidenFuture>(
       manager_cls);
 
@@ -745,7 +771,9 @@ NB_MODULE(_tpu_raiden_torch, m) {
       .value("REMOTE", tpu_raiden::kv_cache::BlockStatus::REMOTE)
       .value("HBM", tpu_raiden::kv_cache::BlockStatus::HBM)
       .value("HOST", tpu_raiden::kv_cache::BlockStatus::HOST)
-      .value("HOST_AND_HBM", tpu_raiden::kv_cache::BlockStatus::HOST_AND_HBM);
+      .value("HOST_AND_HBM", tpu_raiden::kv_cache::BlockStatus::HOST_AND_HBM)
+      .value("SHARED_STORAGE",
+             tpu_raiden::kv_cache::BlockStatus::SHARED_STORAGE);
 
   nb::class_<tpu_raiden::kv_cache::RaidenBlockId>(m, "RaidenBlockId")
       .def(nb::init<tpu_raiden::kv_cache::RaidenId, int,
@@ -767,7 +795,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
 
   nb::class_<tpu_raiden::kv_cache::KVCacheStoreWrapper>(m, "KVCacheStore")
       .def(nb::init<size_t, std::string, tpu_raiden::kv_cache::RaidenId, int,
-                    int64_t, std::string, int, int, std::string>(),
+                    int64_t, std::string, int, int, std::string,
+                    std::vector<tpu_raiden::kv_cache::BackendConfig>>(),
            nb::arg("capacity"), nb::arg("global_registry_address") = "",
            nb::arg("raiden_id") = tpu_raiden::kv_cache::RaidenId(),
            // No defaults: every KVCacheStore has a controller and a
@@ -783,6 +812,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
            // (see global_registry.proto); empty falls back to
            // raiden_id.job_name.
            nb::arg("kv_pool_group") = "",
+           nb::arg("secondary_backend_configs") =
+               std::vector<tpu_raiden::kv_cache::BackendConfig>{},
            // Release the GIL during construction so concurrent in-process
            // Python threads (e.g., worker registration threads) can run and
            // avoid deadlocking on the expected_worker_count barrier.
@@ -913,8 +944,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
           "save",
           [](tpu_raiden::kv_cache::KVCacheStoreWrapper& self,
              const std::vector<nb::bytes>& block_hashes,
-             const std::optional<tpu_raiden::kv_cache::RaidenId>&
-                 dst_raiden_id) -> bool {
+             const std::optional<tpu_raiden::kv_cache::RaidenId>& dst_raiden_id)
+              -> bool {
             auto hashes = ToStdStringVector(block_hashes);
             return self->Save(hashes, dst_raiden_id).ok();
           },
@@ -994,9 +1025,9 @@ NB_MODULE(_tpu_raiden_torch, m) {
              {
                nb::gil_scoped_release release;
                auto res = self->PollLoadStatus();
-                done = std::move(res.done);
-                failed = std::move(res.failed);
-                pending = std::move(res.pending);
+               done = std::move(res.done);
+               failed = std::move(res.failed);
+               pending = std::move(res.pending);
              }
              std::vector<nb::bytes> py_done, py_failed, py_pending;
              py_done.reserve(done.size());

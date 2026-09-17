@@ -13,10 +13,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# CPU-only unit test run for GitHub PR verification. Runs inside the ml-build
-# container (glibc 2.35, the same image the wheel builds use): either as a
-# GitHub Actions job step whose job declares that image as its container (see
-# .github/workflows/unit_tests.yml), or by hand:
+# CPU-only unit test and E2E JAX build verification for GitHub PRs and Copybara
+# presubmits. Runs inside the ml-build container (glibc 2.35, the same image
+# the wheel builds use): either as a GitHub Actions job step whose job declares
+# that image as its container (see .github/workflows/unit_tests.yml), or by hand:
 #
 #   docker run --rm -v "${PWD}:/src" -w /src \
 #     us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest \
@@ -25,33 +25,42 @@
 # Requires root (installs clang-18 and libstdc++-12 through apt), like
 # ci/build_wheel_impl.sh.
 #
-# Test selection: every cc_test under the package patterns in
-# RAIDEN_TEST_SCOPE that carries none of the exclusion tags (no_oss, notap,
-# manual, or any requires-<resource> tag). Tagging a target no_oss therefore
-# keeps it out of GitHub CI, and the TPU-bound tests (requires-ghostfish) stay
-# out on their own, since these runners have no TPU. New tests are picked up
-# automatically -- no list to update here. Naming targets as arguments
-# overrides the query entirely.
+# Execution phases (when invoked without explicit target arguments):
+#   Phase 1: Every cc_test under the package patterns in RAIDEN_TEST_SCOPE
+#            that carries none of the exclusion tags (no_oss, notap, manual,
+#            or any requires-<resource> tag).
+#   Phase 2: E2E JAX validation build via `./build.sh jax`, compiling
+#            _tpu_raiden_jax.so, C++ control-plane service binaries, and
+#            Python protobuf modules, reusing the warm Bazel server and
+#            Skyframe analysis cache from Phase 1.
+#   Phase 3: Python 3.12 dynamic module binding linkage check (`import
+#            kv_cache_manager` with JAX mocked on CPU) and pure-Python CPU
+#            unit tests (`nd_slice_math_test.py`).
+#
+# Naming targets as arguments (e.g. `ci/run_unit_tests.sh //tpu_sync/core:foo_test`)
+# overrides the query and skips Phases 2 & 3 unless RAIDEN_RUN_E2E_BUILD=true.
 #
 # Environment:
-#   RAIDEN_TEST_SCOPE   space-separated bazel package patterns to search
-#                       (default "//tpu_sync/core:all //tpu_sync/kv_cache:all")
-#   BAZEL_CACHE_DIR     bazel disk/repo cache root (default /cache)
-#   BAZEL_OUTPUT_BASE   bazel output base (default <cache>/output_base)
-#   EXTRA_BAZEL_FLAGS   extra bazel flags, space-separated (optional; the
-#                       workflow passes --config=ci for the remote cache when
-#                       the run has credentials for it)
+#   RAIDEN_TEST_SCOPE       space-separated bazel package patterns to search
+#                           (default "//tpu_sync/core:all //tpu_sync/kv_cache:all")
+#   RAIDEN_RUN_E2E_BUILD    true/false to run Phases 2 & 3 (default: true when
+#                           no target args are passed, false otherwise)
+#   BAZEL_CACHE_DIR         bazel disk/repo cache root (default /cache)
+#   BAZEL_OUTPUT_BASE       bazel output base (default <cache>/output_base)
+#   EXTRA_BAZEL_FLAGS       extra bazel flags, space-separated (optional; the
+#                           workflow passes --config=ci for the remote cache when
+#                           the run has credentials for it)
 set -exu -o pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-BAZEL_CACHE_DIR="${BAZEL_CACHE_DIR:-/cache}"
-BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE:-${BAZEL_CACHE_DIR}/output_base}"
+export BAZEL_CACHE_DIR="${BAZEL_CACHE_DIR:-/cache}"
+export BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE:-${BAZEL_CACHE_DIR}/output_base}"
 EXTRA_BAZEL_FLAGS="${EXTRA_BAZEL_FLAGS:-}"
-HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION:-3.12}"
+export HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION:-3.12}"
 RAIDEN_TEST_SCOPE="${RAIDEN_TEST_SCOPE:-//tpu_sync/core:all //tpu_sync/kv_cache:all}"
-mkdir -p "${BAZEL_CACHE_DIR}/disk_cache" "${BAZEL_CACHE_DIR}/repo_cache"
+mkdir -p "${BAZEL_CACHE_DIR}/disk_cache" "${BAZEL_CACHE_DIR}/repo_cache" "$(dirname "${BAZEL_OUTPUT_BASE}")"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -73,10 +82,15 @@ apt-get update -qq
 apt-get install -y -qq clang-18 libstdc++-12-dev >/dev/null
 ln -sf /usr/bin/clang-18 /usr/bin/clang
 ln -sf /usr/bin/clang++-18 /usr/bin/clang++
+export CC=clang-18
+export CXX=clang++-18
 clang --version | head -1
 
 BAZEL_VERSION="$(tr -d '\r\n ' < .bazelversion)"
-BAZEL_BIN="/tmp/bazel-${BAZEL_VERSION}"
+# Use the exact same binary path and startup options as build.sh so both
+# scripts share the downloaded binary and connect to the same running Bazel
+# server without triggering a JVM server restart.
+BAZEL_BIN="/tmp/bazel-bootstrap-${BAZEL_VERSION}"
 if [[ ! -x "${BAZEL_BIN}" ]]; then
   wget -qO "${BAZEL_BIN}" \
     "https://storage.googleapis.com/bazel/${BAZEL_VERSION}/release/bazel-${BAZEL_VERSION}-linux-x86_64"
@@ -85,38 +99,49 @@ fi
 "${BAZEL_BIN}" --version
 
 BAZEL_STARTUP_FLAGS=(
+  "--install_base=${BAZEL_OUTPUT_BASE}/install_base"
   "--output_base=${BAZEL_OUTPUT_BASE}"
+  "--host_jvm_args=-Xmx32g"
+  "--host_jvm_args=-Xms2g"
 )
+# Align repository environment flags across query, test, and build.sh (including
+# --repo_env=CC=clang-18 from .bazelrc build:oss) so Skyframe never invalidates
+# RepoEnvironmentFunction between commands.
+BAZEL_REPO_ENV_FLAGS=(
+  "--repo_env=CC=clang-18"
+  "--repo_env=HERMETIC_PYTHON_VERSION=${HERMETIC_PYTHON_VERSION}"
+  "--repo_env=PIP_INDEX_URL=https://pypi.org/simple"
+  "--repo_env=PIP_EXTRA_INDEX_URL="
+  "--repo_env=PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring"
+  "--repo_env=PIP_CONFIG_FILE=/dev/null"
+)
+# Include --define=raiden_wheel_build=true and --define=with_torch=false to
+# match `./build.sh jax` BuildOptions byte-for-byte, preventing Skyframe from
+# discarding its in-memory analysis cache between Phase 1 and Phase 2.
 BAZEL_COMMON_FLAGS=(
   "--config=oss"
-  "--repo_env=HERMETIC_PYTHON_VERSION=${HERMETIC_PYTHON_VERSION}"
+  "${BAZEL_REPO_ENV_FLAGS[@]}"
+  "--define=raiden_wheel_build=true"
+  "--define=with_torch=false"
   "--disk_cache=${BAZEL_CACHE_DIR}/disk_cache"
   "--repository_cache=${BAZEL_CACHE_DIR}/repo_cache"
 )
 # The target query takes its own flags: .bazelrc defines the oss config under
 # `build:`, and query inherits no build config, so `--config=oss` there is an
-# error ("Config value 'oss' is not defined in any .rc file"). A query runs no
-# action either, which leaves the disk cache and the compiler settings nothing
-# to do. What remains is what the loading phase needs: the torch_tpu override,
-# without which module resolution -- which precedes every command, query
-# included -- fails, as the root module depends on torch_tpu and no registry
-# carries it; it lives in shims/ (the oss config points there the same way).
+# error ("Config value 'oss' is not defined in any .rc file").
 BAZEL_QUERY_FLAGS=(
   "--experimental_repo_remote_exec"
   "--override_module=torch_tpu=${REPO_ROOT}/shims/torch_tpu"
-  "--repo_env=HERMETIC_PYTHON_VERSION=${HERMETIC_PYTHON_VERSION}"
+  "${BAZEL_REPO_ENV_FLAGS[@]}"
   "--repository_cache=${BAZEL_CACHE_DIR}/repo_cache"
 )
 
 TARGETS=("$@")
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
+  RUN_E2E_DEFAULT="true"
   read -r -a SCOPE_PATTERNS <<< "${RAIDEN_TEST_SCOPE}"
   UNIVERSE="$(IFS='+'; echo "${SCOPE_PATTERNS[*]}")"
   QUERY="kind('cc_test rule', ${UNIVERSE}) except attr(tags, 'no_oss|notap|manual|requires-', ${UNIVERSE})"
-  # Read the query into a variable rather than piping it straight into
-  # mapfile: a command substitution fails the script under `set -e`, whereas
-  # `mapfile < <(...)` reports mapfile's own status and a broken query would
-  # reach the emptiness check below disguised as "no tests match".
   QUERY_OUTPUT="$(
     "${BAZEL_BIN}" "${BAZEL_STARTUP_FLAGS[@]}" query "${QUERY}" \
       "${BAZEL_QUERY_FLAGS[@]}" --noshow_progress
@@ -124,18 +149,21 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
   if [[ -n "${QUERY_OUTPUT}" ]]; then
     mapfile -t TARGETS <<< "${QUERY_OUTPUT}"
   fi
+else
+  RUN_E2E_DEFAULT="false"
 fi
+RAIDEN_RUN_E2E_BUILD="${RAIDEN_RUN_E2E_BUILD:-${RUN_E2E_DEFAULT}}"
+
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
   echo "ERROR: no test targets selected from '${RAIDEN_TEST_SCOPE}'" >&2
   exit 1
 fi
 
-printf '===> testing %d target(s):\n' "${#TARGETS[@]}"
+echo "=== Phase 1: Running Bazel CPU cc_test Suite (${#TARGETS[@]} targets) ==="
 printf '  %s\n' "${TARGETS[@]}"
 
 # --keep_going: report every target that fails to build or test, rather than
-# stopping at the first one. A contributor reading the pull request gets the
-# whole list in one run instead of one failure per push.
+# stopping at the first one.
 "${BAZEL_BIN}" "${BAZEL_STARTUP_FLAGS[@]}" test -c opt \
   "${BAZEL_COMMON_FLAGS[@]}" \
   --keep_going \
@@ -144,3 +172,47 @@ printf '  %s\n' "${TARGETS[@]}"
   --test_summary=detailed \
   ${EXTRA_BAZEL_FLAGS} \
   "${TARGETS[@]}"
+
+if [[ "${RAIDEN_RUN_E2E_BUILD}" == "true" ]]; then
+  echo "=== Phase 2: E2E JAX Validation Build (./build.sh jax) ==="
+  ./build.sh jax --config=oss ${EXTRA_BAZEL_FLAGS}
+
+  echo "=== Verifying E2E Build Artifacts ==="
+  EXPECTED_ARTIFACTS=(
+    "${REPO_ROOT}/tpu_sync/frameworks/jax/_tpu_raiden_jax.so"
+    "${REPO_ROOT}/tpu_sync/kv_cache/global_registry/global_registry_server"
+    "${REPO_ROOT}/tpu_sync/store_node/kv_cache_host_store_node_main"
+    "${REPO_ROOT}/tpu_sync/rpc/raiden_service_pb2.py"
+    "${REPO_ROOT}/tpu_sync/rpc/coordination_pb2.py"
+    "${REPO_ROOT}/tpu_sync/rpc/coordination_pb2_grpc.py"
+    "${REPO_ROOT}/tpu_sync/rpc/controller_service_pb2.py"
+  )
+  for artifact in "${EXPECTED_ARTIFACTS[@]}"; do
+    if [[ ! -e "${artifact}" ]]; then
+      echo "ERROR: Expected build artifact missing: ${artifact}" >&2
+      exit 1
+    fi
+  done
+
+  echo "=== Phase 3: Verifying Dynamic Module Binding Linkage & CPU Python Tests ==="
+  export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/bazel-bin:${REPO_ROOT}/tpu_sync/api/jax:${REPO_ROOT}/tpu_sync/frameworks/jax:${PYTHONPATH:-}"
+  echo "Using Python interpreter: $(which python3) ($(python3 --version))"
+
+  python3 -c "
+import sys
+from unittest.mock import MagicMock
+sys.modules['jax'] = MagicMock()
+sys.modules['jax.core'] = MagicMock()
+sys.modules['jax.extend'] = MagicMock()
+sys.modules['jax.extend.ffi'] = MagicMock()
+
+import kv_cache_manager
+from tpu_sync.rpc import raiden_controller
+print('Dynamic linkage verified: kv_cache_manager and raiden_controller imported successfully!')
+"
+
+  echo "=== Running Framework-Neutral CPU Python Unit Tests ==="
+  python3 "${REPO_ROOT}/tpu_sync/kv_cache/nd_slice_math_test.py"
+fi
+
+echo "=== CI Verification Complete! ==="

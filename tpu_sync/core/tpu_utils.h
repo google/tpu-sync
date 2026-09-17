@@ -60,9 +60,12 @@ int PinCurrentThreadToNumaNode(int node, int mode = kMpolBind);
 // Scans the PCI bus and returns all detected TPU PCI devices, sorted by BDF.
 const std::vector<TpuPciDevice>& GetTpuPciDevices();
 
-// Returns the NUMA node for a given PjRtDevice.
-// Maps the device's local_hardware_id to the sorted PCI devices.
-// Returns -1 if the node cannot be determined.
+// Returns the NUMA node for a given PjRtDevice, read from the `numa_node`
+// attribute the device publishes. The plugin populates it from the chip the
+// device actually owns, after any TPU_VISIBLE_DEVICES / TPU_VISIBLE_CHIPS
+// filtering, so it is correct for partial-host and remapped layouts alike.
+// Returns -1 when the device is null or publishes no such attribute, which
+// the caller must treat as "skip NUMA pinning".
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((visibility("default")))
 #endif

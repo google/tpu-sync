@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <string>
@@ -33,6 +34,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
@@ -77,6 +79,34 @@ absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
 }
 
 }  // namespace
+
+// Whether to pin the client-side source address of outbound data connections.
+//
+// Binding a source IP only steers egress onto a particular NIC when the host
+// has a policy routing rule for that address (`ip rule from <src> ...`). That
+// setup exists on multi-NIC deployments where peer addresses are not covered
+// by specific routes and would otherwise all leave via the control-plane NIC.
+//
+// Without such a rule the kernel still routes by destination, so the bound
+// address disagrees with the interface the packet leaves on, and cloud
+// anti-spoofing filters drop it. bind() itself succeeds and only the data path
+// breaks, so the failure surfaces as a hang rather than an error. Since the
+// routing rule is a property of the host that this process cannot reliably
+// detect, source binding is opt-in rather than default-on.
+bool SourceBindEnabled() {
+  const char* v = std::getenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND");
+  if (v == nullptr) return false;
+  absl::string_view sv(v);
+  return sv == "1" || absl::EqualsIgnoreCase(sv, "true") ||
+         absl::EqualsIgnoreCase(sv, "yes") ||
+         absl::EqualsIgnoreCase(sv, "on");
+}
+
+// Source address for stream `i`, or "" to let the kernel choose by route.
+std::string SelectSourceIp(absl::Span<const std::string> local_ips, size_t i) {
+  if (!SourceBindEnabled() || local_ips.empty()) return "";
+  return local_ips[i % local_ips.size()];
+}
 
 SocketTransportAdapter::SocketTransportAdapter(
     RawBufferTransport* raw_transport, int parallelism)
@@ -215,9 +245,8 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
       ++req_end;
     }
 
-    const auto local_ips = raw_transport_->local_ips();
-    const size_t n = local_ips.size();
-    const std::string local_ip = n >= 1 ? local_ips[i % n] : "";
+    const std::string local_ip =
+        SelectSourceIp(raw_transport_->local_ips(), i);
     const std::string remote_peer = peers[i % peers.size()];
 
     absl::Span<const Request> stream_requests =
@@ -426,9 +455,8 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPull(
         requests.subspan(req_offset, req_end - req_offset);
     req_offset = req_end;
 
-    const auto local_ips = raw_transport_->local_ips();
-    const size_t n = local_ips.size();
-    const std::string local_ip = n >= 1 ? local_ips[i % n] : "";
+    const std::string local_ip =
+        SelectSourceIp(raw_transport_->local_ips(), i);
     const std::string remote_peer = peers[i % peers.size()];
 
     threads.emplace_back(

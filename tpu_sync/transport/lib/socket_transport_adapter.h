@@ -39,6 +39,13 @@ namespace tpu_raiden {
 namespace transport {
 namespace lib {
 
+// Returns true if source IP binding is enabled via environment variable
+// TPU_RAIDEN_ENABLE_SOURCE_IP_BIND.
+bool SourceBindEnabled();
+
+// Source address for stream `i`, or "" to let the kernel choose by route.
+std::string SelectSourceIp(absl::Span<const std::string> local_ips, size_t i);
+
 // TCP Socket implementation of TransportAdapter.
 class SocketTransportAdapter : public TransportAdapter {
  public:

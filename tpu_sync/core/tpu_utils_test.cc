@@ -62,6 +62,18 @@ TEST(TpuUtilsTest, GetPjRtDeviceNumaNodeTest) {
                  << all_devices.size() << " devices.";
   }
 
+  // The resolved node must be one the PCI scan actually reported for a TPU
+  // device. This is stronger and less host-specific than a hardcoded 0..1
+  // bound: it also catches a bus index that lands on the wrong entry.
+  std::vector<int> tpu_numa_nodes;
+  for (const auto& dev : GetTpuPciDevices()) {
+    if (std::find(tpu_numa_nodes.begin(), tpu_numa_nodes.end(),
+                  dev.numa_node) == tpu_numa_nodes.end()) {
+      tpu_numa_nodes.push_back(dev.numa_node);
+    }
+  }
+  ASSERT_FALSE(tpu_numa_nodes.empty());
+
   int resolved_nodes = 0;
   for (auto* device : all_devices) {
     int numa_node = GetPjRtDeviceNumaNode(device);
@@ -69,9 +81,12 @@ TEST(TpuUtilsTest, GetPjRtDeviceNumaNodeTest) {
               << " (local_hardware_id: " << device->local_hardware_id().value()
               << ") is mapped to NUMA Node: " << numa_node;
 
-    // NUMA node should be valid (0 or 1 on TPU v7x)
     EXPECT_GE(numa_node, 0);
-    EXPECT_LE(numa_node, 1);
+    EXPECT_NE(std::find(tpu_numa_nodes.begin(), tpu_numa_nodes.end(),
+                        numa_node),
+              tpu_numa_nodes.end())
+        << "Resolved NUMA node " << numa_node
+        << " is not one of the nodes reported by any TPU PCI device";
     resolved_nodes++;
   }
   EXPECT_GT(resolved_nodes, 0);
@@ -300,6 +315,181 @@ TEST(TpuUtilsTest, GetLocalHostNicAddresses_MultiNic_Classification) {
   EXPECT_EQ(it_eth2->numa_node, 1);
 
   // Clean up
+  fs::remove_all(sysfs);
+}
+
+TEST(TpuUtilsTest, GetLocalHostNicAddresses_AuthoritativeAllowlistAndDocker) {
+  namespace fs = std::filesystem;
+  std::string temp_dir_str = testing::TempDir();
+  fs::path sysfs = fs::path(temp_dir_str) / "mock_sysfs_allowlist";
+  fs::remove_all(sysfs);
+
+  // Setup sysfs
+  fs::create_directories(sysfs / "class/net/eth0");
+  fs::create_directories(sysfs / "class/net/eth1");
+  fs::create_directories(sysfs / "class/net/eth2");
+  fs::create_directories(sysfs / "class/net/docker0");
+  fs::create_directories(sysfs / "devices/system/node/node0");
+  fs::create_directories(sysfs / "devices/system/node/node1");
+  fs::create_directories(sysfs / "devices/pci0000:00/0000:00:01.0");
+  fs::create_directories(sysfs / "devices/pci0000:00/0000:00:02.0");
+
+  fs::create_directory_symlink("../../../devices/pci0000:00/0000:00:01.0",
+                               sysfs / "class/net/eth1/device");
+  fs::create_directory_symlink("../../../devices/pci0000:00/0000:00:02.0",
+                               sysfs / "class/net/eth2/device");
+
+  // Write MTUs
+  { std::ofstream(sysfs / "class/net/eth0/mtu") << "1500\n"; }
+  { std::ofstream(sysfs / "class/net/eth1/mtu") << "1460\n"; }
+  { std::ofstream(sysfs / "class/net/eth2/mtu") << "1460\n"; }
+  { std::ofstream(sysfs / "class/net/docker0/mtu") << "1500\n"; }
+
+  // ifaddrs: docker0, eth2, eth1, eth0, lo
+  sockaddr_in addr_docker0 = CreateSockAddr("172.17.0.1");
+  sockaddr_in addr_eth2 = CreateSockAddr("10.0.0.3");
+  sockaddr_in addr_eth1 = CreateSockAddr("10.0.0.2");
+  sockaddr_in addr_eth0 = CreateSockAddr("10.0.0.1");
+  sockaddr_in addr_lo = CreateSockAddr("127.0.0.1");
+
+  ifaddrs ifa_docker0 = {nullptr, const_cast<char*>("docker0"),
+                         0,       reinterpret_cast<sockaddr*>(&addr_docker0),
+                         nullptr, {nullptr},
+                         nullptr};
+  ifaddrs ifa_eth2 = {&ifa_docker0, const_cast<char*>("eth2"),
+                      0,            reinterpret_cast<sockaddr*>(&addr_eth2),
+                      nullptr,      {nullptr},
+                      nullptr};
+  ifaddrs ifa_eth1 = {&ifa_eth2, const_cast<char*>("eth1"),
+                      0,         reinterpret_cast<sockaddr*>(&addr_eth1),
+                      nullptr,   {nullptr},
+                      nullptr};
+  ifaddrs ifa_eth0 = {&ifa_eth1, const_cast<char*>("eth0"),
+                      0,         reinterpret_cast<sockaddr*>(&addr_eth0),
+                      nullptr,   {nullptr},
+                      nullptr};
+  ifaddrs ifa_lo = {&ifa_eth0, const_cast<char*>("lo"),
+                    0,         reinterpret_cast<sockaddr*>(&addr_lo),
+                    nullptr,   {nullptr},
+                    nullptr};
+
+  // Test 1: Without TPU_RAIDEN_DATA_NICS, auto-discovery relies solely on the
+  // BDF filter and the MTU > 1500 rule. docker0 has no BDF, and eth1/eth2 sit
+  // at MTU 1460, so nothing qualifies as a data rail.
+  unsetenv("TPU_RAIDEN_DATA_NICS");
+  auto nics1 =
+      internal::GetLocalHostNicAddressesInternal(&ifa_lo, sysfs.string());
+  auto it_dock = std::find_if(
+      nics1.begin(), nics1.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "docker0"; });
+  ASSERT_NE(it_dock, nics1.end());
+  // No PCI BDF -> control plane.
+  EXPECT_EQ(it_dock->classification, NicClassification::kControlPlane);
+
+  auto it1_eth1 = std::find_if(
+      nics1.begin(), nics1.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "eth1"; });
+  ASSERT_NE(it1_eth1, nics1.end());
+  // Has a BDF but MTU 1460 -> control plane. This NIC used to be misclassified
+  // as data plane purely because it holds no IPv4 default route.
+  EXPECT_EQ(it1_eth1->classification, NicClassification::kControlPlane);
+
+  auto it1_eth2 = std::find_if(
+      nics1.begin(), nics1.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "eth2"; });
+  ASSERT_NE(it1_eth2, nics1.end());
+  EXPECT_EQ(it1_eth2->classification, NicClassification::kControlPlane);
+
+  // Test 2: With TPU_RAIDEN_DATA_NICS="eth1", ONLY eth1 is data plane.
+  // eth2 must NOT fall through to data plane!
+  setenv("TPU_RAIDEN_DATA_NICS", "eth1", 1);
+  auto nics2 =
+      internal::GetLocalHostNicAddressesInternal(&ifa_lo, sysfs.string());
+  unsetenv("TPU_RAIDEN_DATA_NICS");
+
+  auto it2_eth1 = std::find_if(
+      nics2.begin(), nics2.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "eth1"; });
+  ASSERT_NE(it2_eth1, nics2.end());
+  // The allowlist overrides the MTU rule that would otherwise reject MTU 1460.
+  EXPECT_EQ(it2_eth1->classification, NicClassification::kDataPlane);
+
+  auto it2_eth2 = std::find_if(
+      nics2.begin(), nics2.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "eth2"; });
+  ASSERT_NE(it2_eth2, nics2.end());
+  // CRITICAL: eth2 was NOT in allowlist -> must be control plane!
+  EXPECT_EQ(it2_eth2->classification, NicClassification::kControlPlane);
+
+  // Test 3: Allowlist with leading/trailing whitespace and empty tokens.
+  setenv("TPU_RAIDEN_DATA_NICS", " eth1 , , eth2 ", 1);
+  auto nics3 =
+      internal::GetLocalHostNicAddressesInternal(&ifa_lo, sysfs.string());
+  unsetenv("TPU_RAIDEN_DATA_NICS");
+
+  auto it3_eth1 = std::find_if(
+      nics3.begin(), nics3.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "eth1"; });
+  ASSERT_NE(it3_eth1, nics3.end());
+  EXPECT_EQ(it3_eth1->classification, NicClassification::kDataPlane);
+
+  auto it3_eth2 = std::find_if(
+      nics3.begin(), nics3.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "eth2"; });
+  ASSERT_NE(it3_eth2, nics3.end());
+  EXPECT_EQ(it3_eth2->classification, NicClassification::kDataPlane);
+
+  auto it3_eth0 = std::find_if(
+      nics3.begin(), nics3.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "eth0"; });
+  ASSERT_NE(it3_eth0, nics3.end());
+  EXPECT_EQ(it3_eth0->classification, NicClassification::kControlPlane);
+
+  // Test 4: Whitespace-only TPU_RAIDEN_DATA_NICS falls back to heuristic
+  // discovery. With the default-route rule gone, the MTU-1460 eth1/eth2 and
+  // the BDF-less docker0 are all control plane.
+  setenv("TPU_RAIDEN_DATA_NICS", "   ", 1);
+  auto nics4 =
+      internal::GetLocalHostNicAddressesInternal(&ifa_lo, sysfs.string());
+  unsetenv("TPU_RAIDEN_DATA_NICS");
+
+  auto it4_eth1 = std::find_if(
+      nics4.begin(), nics4.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "eth1"; });
+  ASSERT_NE(it4_eth1, nics4.end());
+  EXPECT_EQ(it4_eth1->classification, NicClassification::kControlPlane);
+
+  auto it4_eth2 = std::find_if(
+      nics4.begin(), nics4.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "eth2"; });
+  ASSERT_NE(it4_eth2, nics4.end());
+  EXPECT_EQ(it4_eth2->classification, NicClassification::kControlPlane);
+
+  auto it4_dock = std::find_if(
+      nics4.begin(), nics4.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "docker0"; });
+  ASSERT_NE(it4_dock, nics4.end());
+  EXPECT_EQ(it4_dock->classification, NicClassification::kControlPlane);
+
+  // Test 5: The allowlist is authoritative even over the BDF filter, so an
+  // explicitly listed interface with no PCI BDF is still a data rail.
+  setenv("TPU_RAIDEN_DATA_NICS", "docker0", 1);
+  auto nics5 =
+      internal::GetLocalHostNicAddressesInternal(&ifa_lo, sysfs.string());
+  unsetenv("TPU_RAIDEN_DATA_NICS");
+
+  auto it5_dock = std::find_if(
+      nics5.begin(), nics5.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "docker0"; });
+  ASSERT_NE(it5_dock, nics5.end());
+  EXPECT_EQ(it5_dock->classification, NicClassification::kDataPlane);
+
+  auto it5_eth1 = std::find_if(
+      nics5.begin(), nics5.end(),
+      [](const HostNicAddress& n) { return n.interface_name == "eth1"; });
+  ASSERT_NE(it5_eth1, nics5.end());
+  EXPECT_EQ(it5_eth1->classification, NicClassification::kControlPlane);
+
   fs::remove_all(sysfs);
 }
 

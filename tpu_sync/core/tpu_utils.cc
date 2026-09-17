@@ -38,10 +38,13 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
+#include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/tsl/platform/logging.h"
@@ -297,58 +300,22 @@ __attribute__((visibility("default")))
 int GetPjRtDeviceNumaNode(const xla::PjRtDevice* device) {
   if (device == nullptr) return -1;
 
-  int chip_idx = device->local_hardware_id().value();
-  if (chip_idx < 0) {
-    VLOG(1) << "Negative chip_idx (" << chip_idx << "), returning NUMA node -1";
-    return -1;
-  }
-
-  const auto& pci_devices = GetTpuPciDevices();
-  if (pci_devices.empty()) {
-    return -1;
-  }
-
-  // Find unique buses (domain:bus) and their NUMA nodes
-  std::vector<std::pair<std::string, int>> unique_chips;
-  for (const auto& dev : pci_devices) {
-    size_t last_colon = dev.bdf.find_last_of(':');
-    if (last_colon == std::string::npos) continue;
-    std::string domain_bus = dev.bdf.substr(0, last_colon);
-
-    bool found = false;
-    for (const auto& chip : unique_chips) {
-      if (chip.first == domain_bus) {
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      unique_chips.push_back({domain_bus, dev.numa_node});
+  // The PJRT device publishes the NUMA node of the chip it actually owns.
+  // Reading it here avoids inferring the chip positionally from the host's
+  // PCI enumeration, which could not account for TPU_VISIBLE_DEVICES /
+  // TPU_VISIBLE_CHIPS remapping or for jobs occupying only part of a host.
+  const auto& attributes = device->Attributes();
+  if (auto it = attributes.find("numa_node"); it != attributes.end()) {
+    if (const int64_t* numa_node = std::get_if<int64_t>(&it->second)) {
+      return static_cast<int>(*numa_node);
     }
   }
 
-  if (unique_chips.empty()) return -1;
-
-  // Sort unique chips by BDF to ensure consistent mapping
-  std::sort(unique_chips.begin(), unique_chips.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
-
-  if (device->client() == nullptr) return -1;
-
-  int local_device_count = device->client()->addressable_devices().size();
-  int num_physical_chips = unique_chips.size();
-
-  if (local_device_count <= 0 || num_physical_chips <= 0) return -1;
-
-  int devices_per_chip = local_device_count / num_physical_chips;
-  if (devices_per_chip <= 0) devices_per_chip = 1;
-
-  int physical_chip_idx = chip_idx / devices_per_chip;
-  if (physical_chip_idx >= num_physical_chips) {
-    physical_chip_idx = num_physical_chips - 1;
-  }
-
-  return unique_chips[physical_chip_idx].second;
+  // No attribute: the plugin predates PJRT_Device_GetAttributes or does not
+  // publish the node. The caller must skip NUMA pinning.
+  VLOG(1) << "Device does not publish a numa_node attribute; "
+          << "skipping NUMA pinning.";
+  return -1;
 }
 
 void PrintTpuHardwareTopology() {
@@ -432,10 +399,35 @@ int GetTotalNumaNodes(absl::string_view sysfs_root) {
 }
 
 // Dedicated classifier for GKE / Cloud TPU VMs
-NicClassification ClassifyNicGke(absl::string_view bdf, int mtu) {
+NicClassification ClassifyNicGke(absl::string_view ifname,
+                                 absl::string_view bdf, int mtu) {
+  if (ifname == "lo") {
+    return NicClassification::kControlPlane;
+  }
+
+  // 1. Authoritative Override: If TPU_RAIDEN_DATA_NICS is set, it is the sole
+  // authority. Any interface not explicitly listed is strictly control plane.
+  const char* env_data_nics = std::getenv("TPU_RAIDEN_DATA_NICS");
+  if (env_data_nics != nullptr &&
+      !absl::StripAsciiWhitespace(env_data_nics).empty()) {
+    for (absl::string_view raw_nic :
+         absl::StrSplit(env_data_nics, ',', absl::SkipWhitespace())) {
+      absl::string_view nic = absl::StripAsciiWhitespace(raw_nic);
+      if (ifname == nic || (!bdf.empty() && bdf == nic)) {
+        return NicClassification::kDataPlane;
+      }
+    }
+    return NicClassification::kControlPlane;
+  }
+
+  // 2. Interfaces lacking physical PCI BDF are strictly control plane.
   if (bdf.empty()) {
     return NicClassification::kControlPlane;
   }
+
+  // 3. Heuristic discovery for GKE / Cloud TPU VMs when no allowlist is
+  // configured: only jumbo frame MTU > 1500 (GKE Net DRA / standard clusters)
+  // qualifies as data plane.
   if (mtu > 1500) {
     return NicClassification::kDataPlane;
   }
@@ -444,7 +436,7 @@ NicClassification ClassifyNicGke(absl::string_view bdf, int mtu) {
 
 NicClassification ClassifyNic(absl::string_view ifname, absl::string_view bdf,
                               int mtu) {
-  return ClassifyNicGke(bdf, mtu);
+  return ClassifyNicGke(ifname, bdf, mtu);
 }
 
 std::string ClassificationToString(NicClassification classification) {
@@ -462,6 +454,7 @@ std::string ClassificationToString(NicClassification classification) {
 }  // namespace
 
 namespace internal {
+
 std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(
     struct ifaddrs* ifaddr, absl::string_view sysfs_root) {
   std::vector<HostNicAddress> nics;
@@ -551,6 +544,20 @@ std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(
               << ", BDF: " << (bdf.empty() ? "None" : bdf) << ", MTU: " << mtu
               << ", NUMA: " << nic.numa_node << ", Classification: "
               << ClassificationToString(nic.classification);
+  }
+  // Warn once per discovery pass (not per interface) when nothing qualified as
+  // a data rail, so the operator gets an actionable message instead of a
+  // silent fallback to a single rail.
+  const bool has_data_plane_nic =
+      std::any_of(nics.begin(), nics.end(), [](const HostNicAddress& nic) {
+        return nic.classification == NicClassification::kDataPlane;
+      });
+  if (!has_data_plane_nic) {
+    LOG(WARNING) << "No data plane NIC was discovered; KV traffic will fall "
+                 << "back to a single rail. Set TPU_RAIDEN_DATA_NICS to an "
+                 << "explicit comma-separated interface allowlist (for "
+                 << "example \"ens6,enp192s4\"), or raise the MTU of the data "
+                 << "interfaces above 1500.";
   }
   return nics;
 }

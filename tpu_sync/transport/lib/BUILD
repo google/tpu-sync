@@ -87,6 +87,7 @@ cc_test(
         ":socket_transport_adapter",
         ":transport_adapter",
         "//tpu_sync/transport/peregrine/src/api:socket_util",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings",

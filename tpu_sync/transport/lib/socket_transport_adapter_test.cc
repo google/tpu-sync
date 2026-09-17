@@ -14,14 +14,20 @@
 
 #include "tpu_sync/transport/lib/socket_transport_adapter.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
@@ -291,6 +297,188 @@ TEST(SocketTransportAdapterTest, PostSocketPullOp2Success) {
 
   ASSERT_THAT(handle.status(), absl_testing::IsOk());
   EXPECT_THAT(recv_buf, ::testing::ElementsAre(1, 2, 3, 4));
+}
+
+std::string GetPeerIp(int client_fd) {
+  struct sockaddr_storage addr;
+  socklen_t addr_len = sizeof(addr);
+  if (getpeername(client_fd, reinterpret_cast<struct sockaddr*>(&addr),
+                  &addr_len) != 0) {
+    return "";
+  }
+  char ip_str[INET6_ADDRSTRLEN] = {0};
+  if (addr.ss_family == AF_INET) {
+    auto* sin = reinterpret_cast<struct sockaddr_in*>(&addr);
+    inet_ntop(AF_INET, &sin->sin_addr, ip_str, sizeof(ip_str));
+  } else if (addr.ss_family == AF_INET6) {
+    auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(&addr);
+    inet_ntop(AF_INET6, &sin6->sin6_addr, ip_str, sizeof(ip_str));
+  }
+  return std::string(ip_str);
+}
+
+TEST(SocketTransportAdapterTest, SourceBindDisabledWhenEnvUnsetOrZero) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND"); });
+
+  unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND");
+  EXPECT_FALSE(SourceBindEnabled());
+  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "");
+
+  setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "0", 1);
+  EXPECT_FALSE(SourceBindEnabled());
+  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "");
+
+  std::string observed_peer_ip;
+  auto server_handler = [&](int client_fd,
+                            const ChunkHeader& header) -> absl::Status {
+    observed_peer_ip = GetPeerIp(client_fd);
+    ChunkHeader resp = header;
+    const auto s_resp = SerializeChunkHeader(resp);
+    if (auto s =
+            ::peregrine::WriteExact(client_fd, s_resp.data(), s_resp.size());
+        !s.ok()) {
+      return s;
+    }
+    std::vector<uint8_t> payload = {9, 8, 7, 6};
+    const auto s_size = SerializeChunkSize(payload.size());
+    if (auto s =
+            ::peregrine::WriteExact(client_fd, s_size.data(), s_size.size());
+        !s.ok()) {
+      return s;
+    }
+    return ::peregrine::WriteExact(client_fd, payload.data(), payload.size());
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  // Provide "127.0.0.2" in local_ips. Since source IP binding is disabled
+  // ("0"), SelectSourceIp returns "", so ConnectToPeer does NOT bind to
+  // 127.0.0.2 and the kernel uses 127.0.0.1 instead.
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{"127.0.0.2"});
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+
+  std::vector<uint8_t> recv_buf(4, 0);
+  Request req = {};
+  req.socket_opcode = 2;
+  req.laddr = recv_buf.data();
+  req.len = recv_buf.size();
+  req.count_or_size = 1;
+  req.remote_id = 10;
+  req.local_id = 20;
+  req.uuid = 101;
+  req.parallelism = 1;
+  req.request_id = 0;
+  req.stream_idx = 0;
+
+  auto handle = client_adapter.Post(
+      /*peers=*/{GetIpPort(server_transport)},
+      /*requests=*/absl::MakeConstSpan(&req, 1));
+
+  ASSERT_THAT(handle.status(), absl_testing::IsOk());
+  EXPECT_THAT(recv_buf, ::testing::ElementsAre(9, 8, 7, 6));
+  EXPECT_THAT(observed_peer_ip, ::testing::HasSubstr("127.0.0.1"));
+}
+
+TEST(SocketTransportAdapterTest, SourceBindEnabledWithEnableSourceIpBindEnv) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND"); });
+
+  setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "1", 1);
+  EXPECT_TRUE(SourceBindEnabled());
+  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "10.0.0.1");
+  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 1), "10.0.0.2");
+
+  setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "true", 1);
+  EXPECT_TRUE(SourceBindEnabled());
+  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "10.0.0.1");
+
+  std::string observed_peer_ip;
+  auto server_handler = [&](int client_fd,
+                            const ChunkHeader& header) -> absl::Status {
+    observed_peer_ip = GetPeerIp(client_fd);
+    ChunkHeader resp = header;
+    const auto s_resp = SerializeChunkHeader(resp);
+    if (auto s =
+            ::peregrine::WriteExact(client_fd, s_resp.data(), s_resp.size());
+        !s.ok()) {
+      return s;
+    }
+    std::vector<uint8_t> payload = {5, 6, 7, 8};
+    const auto s_size = SerializeChunkSize(payload.size());
+    if (auto s =
+            ::peregrine::WriteExact(client_fd, s_size.data(), s_size.size());
+        !s.ok()) {
+      return s;
+    }
+    return ::peregrine::WriteExact(client_fd, payload.data(), payload.size());
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+
+  // 1. When local_ips contains "127.0.0.2" and
+  // TPU_RAIDEN_ENABLE_SOURCE_IP_BIND is "1", ConnectToPeer binds to
+  // "127.0.0.2" and the server sees peer IP "127.0.0.2".
+  {
+    setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "1", 1);
+    RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                        /*local_ips=*/{"127.0.0.2"});
+    SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+
+    std::vector<uint8_t> recv_buf(4, 0);
+    Request req = {};
+    req.socket_opcode = 2;
+    req.laddr = recv_buf.data();
+    req.len = recv_buf.size();
+    req.count_or_size = 1;
+    req.remote_id = 10;
+    req.local_id = 20;
+    req.uuid = 102;
+    req.parallelism = 1;
+    req.request_id = 0;
+    req.stream_idx = 0;
+
+    auto handle = client_adapter.Post(
+        /*peers=*/{GetIpPort(server_transport)},
+        /*requests=*/absl::MakeConstSpan(&req, 1));
+
+    ASSERT_THAT(handle.status(), absl_testing::IsOk());
+    EXPECT_THAT(recv_buf, ::testing::ElementsAre(5, 6, 7, 8));
+    EXPECT_THAT(observed_peer_ip, ::testing::HasSubstr("127.0.0.2"));
+  }
+
+  // 2. When local_ips contains "127.0.0.3" and TPU_RAIDEN_ENABLE_SOURCE_IP_BIND
+  // is "true", ConnectToPeer binds to "127.0.0.3" and the server sees
+  // "127.0.0.3".
+  {
+    setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "true", 1);
+    RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                        /*local_ips=*/{"127.0.0.3"});
+    SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+
+    std::vector<uint8_t> recv_buf(4, 0);
+    Request req = {};
+    req.socket_opcode = 2;
+    req.laddr = recv_buf.data();
+    req.len = recv_buf.size();
+    req.count_or_size = 1;
+    req.remote_id = 10;
+    req.local_id = 20;
+    req.uuid = 103;
+    req.parallelism = 1;
+    req.request_id = 0;
+    req.stream_idx = 0;
+
+    auto handle = client_adapter.Post(
+        /*peers=*/{GetIpPort(server_transport)},
+        /*requests=*/absl::MakeConstSpan(&req, 1));
+
+    ASSERT_THAT(handle.status(), absl_testing::IsOk());
+    EXPECT_THAT(recv_buf, ::testing::ElementsAre(5, 6, 7, 8));
+    EXPECT_THAT(observed_peer_ip, ::testing::HasSubstr("127.0.0.3"));
+  }
 }
 
 }  // namespace

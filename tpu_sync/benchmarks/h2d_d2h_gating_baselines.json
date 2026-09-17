@@ -1,7 +1,7 @@
 {
   "_comment": [
     "Regenerate with:  bazel run //tpu_sync/benchmarks:h2d_d2h_benchmark_gating --",
-    "                    --record --iters=<large>",
+    "                    --record --iters=<large> [--framework=jax|torch]",
     "Use a large --iters when recording: the floor depends on a MAD estimate, which",
     "needs many samples to be stable. Record mode rewrites this file in place and",
     "preserves this comment.",

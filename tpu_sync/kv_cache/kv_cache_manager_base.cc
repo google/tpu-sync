@@ -14,6 +14,8 @@
 
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -512,6 +514,12 @@ void KVCacheManagerBase::InitBackgroundWorker() {
 
 KVCacheManagerBase::~KVCacheManagerBase() {
   StopTransportServer();
+  if (is_shared_memory_mapped()) {
+    absl::Status status = UnmapSharedMemory();
+    if (!status.ok()) {
+      LOG(ERROR) << "KVCacheManagerBase unmap cleanup failed: " << status;
+    }
+  }
   if (worker_thread_.joinable()) {
     {
       absl::MutexLock lock(queue_mu_);
@@ -3427,6 +3435,255 @@ KVCacheManagerBase::ResolveBlockSlices(int staging_block_id) const {
     }
   }
   return slices;
+}
+
+xla::PjRtClient* KVCacheManagerBase::GetPjRtClient() const {
+  for (const auto& layer_device_info : buffer_holds_) {
+    for (const auto& hold : layer_device_info.holds) {
+      if (hold.device != nullptr && hold.device->client() != nullptr) {
+        return hold.device->client();
+      }
+      if (hold.buffer != nullptr && hold.buffer->client() != nullptr) {
+        return hold.buffer->client();
+      }
+    }
+  }
+  return nullptr;
+}
+
+absl::Status KVCacheManagerBase::MapSharedMemory(void* mapped_address,
+                                                 size_t pool_size_bytes) {
+  if (mapped_address == nullptr) {
+    return absl::InvalidArgumentError("mapped_address must be non-null");
+  }
+  if (pool_size_bytes == 0) {
+    return absl::InvalidArgumentError(
+        "pool_size_bytes must be greater than zero");
+  }
+
+  const int64_t page_size_val = sysconf(_SC_PAGESIZE);
+  if (page_size_val <= 0) {
+    return absl::InternalError("sysconf(_SC_PAGESIZE) failed");
+  }
+  const size_t page_size = static_cast<size_t>(page_size_val);
+  const uintptr_t address_value = reinterpret_cast<uintptr_t>(mapped_address);
+  if (address_value % page_size != 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("mapped_address=", address_value,
+                     " must be aligned to system page size ", page_size));
+  }
+  if (pool_size_bytes % page_size != 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("pool_size_bytes=", pool_size_bytes,
+                     " must be aligned to system page size ", page_size));
+  }
+  if (pool_size_bytes > std::numeric_limits<uintptr_t>::max() - address_value) {
+    return absl::InvalidArgumentError(
+        "mapped_address + pool_size_bytes overflows the process address space");
+  }
+
+  xla::PjRtClient* client = GetPjRtClient();
+  if (client == nullptr) {
+    return absl::FailedPreconditionError(
+        "KVCacheManagerBase has no active PJRT client for DMA mapping");
+  }
+
+  {
+    absl::MutexLock lock(external_mapping_mu_);
+    if (external_mapping_phase_ != MappingPhase::kUnmapped) {
+      return absl::FailedPreconditionError(
+          "shared memory is already mapped or registration is in progress");
+    }
+    external_mapping_phase_ = MappingPhase::kMapping;
+  }
+
+  const auto reset_mapping_reservation = [this]() {
+    absl::MutexLock lock(external_mapping_mu_);
+    external_mapping_phase_ = MappingPhase::kUnmapped;
+  };
+
+  const absl::Status status = client->DmaMap(mapped_address, pool_size_bytes);
+  if (!status.ok()) {
+    reset_mapping_reservation();
+    return status;
+  }
+
+  {
+    absl::MutexLock lock(external_mapping_mu_);
+    external_mapped_address_ = mapped_address;
+    external_mapped_size_ = pool_size_bytes;
+    external_mapping_phase_ = MappingPhase::kMapped;
+  }
+  return absl::OkStatus();
+}
+
+absl::Status KVCacheManagerBase::UnmapSharedMemory() {
+  void* mapped_address = nullptr;
+  std::vector<raiden::PjRtCopyFuture> copies_to_await;
+  absl::Status copy_status = absl::OkStatus();
+  {
+    absl::MutexLock lock(external_mapping_mu_);
+    if (external_mapping_phase_ == MappingPhase::kUnmapped) {
+      return absl::FailedPreconditionError("shared memory is not mapped");
+    }
+    if (external_mapping_phase_ == MappingPhase::kMapping) {
+      return absl::FailedPreconditionError(
+          "shared memory mapping is still in progress");
+    }
+    if (external_mapping_phase_ == MappingPhase::kUnmapping) {
+      return absl::FailedPreconditionError(
+          "shared memory is already being unmapped");
+    }
+    external_mapping_phase_ = MappingPhase::kUnmapping;
+
+    // Moving to kUnmapping stops new leases, but submissions that acquired a
+    // lease before that are still racing to register their futures.  Wait for
+    // them, otherwise the snapshot below would miss a live transfer and
+    // DmaUnmap would run underneath it.
+    external_mapping_mu_.Await(absl::Condition(
+        +[](int64_t* pending) { return *pending == 0; },
+        &pending_external_copies_));
+
+    mapped_address = external_mapped_address_;
+    copies_to_await = std::move(in_flight_external_copies_);
+    in_flight_external_copies_.clear();
+    external_copy_gc_watermark_ = kMinExternalCopyGcWatermark;
+    copy_status = std::move(deferred_external_copy_error_);
+    deferred_external_copy_error_ = absl::OkStatus();
+  }
+
+  auto first_error = [](absl::Status first, const absl::Status& next) {
+    return first.ok() ? next : first;
+  };
+
+  for (raiden::PjRtCopyFuture& future : copies_to_await) {
+    copy_status = first_error(std::move(copy_status), future.Await());
+  }
+
+  xla::PjRtClient* client = GetPjRtClient();
+  absl::Status status = absl::OkStatus();
+  if (client != nullptr) {
+    status = client->DmaUnmap(mapped_address);
+  } else {
+    status = absl::InternalError("PJRT client disappeared before DmaUnmap");
+  }
+
+  if (!status.ok()) {
+    absl::MutexLock lock(external_mapping_mu_);
+    deferred_external_copy_error_ =
+        first_error(std::move(deferred_external_copy_error_), copy_status);
+    external_mapping_phase_ = MappingPhase::kMapped;
+    return status;
+  }
+
+  {
+    absl::MutexLock lock(external_mapping_mu_);
+    external_mapped_address_ = nullptr;
+    external_mapped_size_ = 0;
+    deferred_external_copy_error_ = absl::OkStatus();
+    external_mapping_phase_ = MappingPhase::kUnmapped;
+  }
+  return copy_status;
+}
+
+bool KVCacheManagerBase::is_shared_memory_mapped() const {
+  absl::MutexLock lock(external_mapping_mu_);
+  return external_mapping_phase_ == MappingPhase::kMapped;
+}
+
+absl::StatusOr<KVCacheManagerBase::ExternalCopyLease>
+KVCacheManagerBase::AcquireExternalCopyLease() {
+  absl::MutexLock lock(external_mapping_mu_);
+  if (external_mapping_phase_ != MappingPhase::kMapped) {
+    return absl::FailedPreconditionError(
+        "shared memory must be mapped before submitting a copy");
+  }
+  ++pending_external_copies_;
+  return ExternalCopyLease(this);
+}
+
+void KVCacheManagerBase::ReleaseExternalCopyLease(
+    std::optional<raiden::PjRtCopyFuture> future) {
+  absl::MutexLock lock(external_mapping_mu_);
+  if (future.has_value()) {
+    AddExternalCopyLocked(*std::move(future));
+  }
+  --pending_external_copies_;
+}
+
+absl::Status KVCacheManagerBase::ValidateExternalRange(const void* address,
+                                                       size_t size) const {
+  absl::MutexLock lock(external_mapping_mu_);
+  return ValidateExternalRangeLocked(address, size);
+}
+
+absl::Status KVCacheManagerBase::ValidateExternalRangeLocked(
+    const void* address, size_t size) const {
+  if (external_mapping_phase_ != MappingPhase::kMapped) {
+    return absl::FailedPreconditionError(
+        "shared memory must be mapped before submitting a copy");
+  }
+  if (address == nullptr) {
+    return absl::InvalidArgumentError("transfer address must be non-null");
+  }
+  const uintptr_t begin = reinterpret_cast<uintptr_t>(address);
+  if (size > std::numeric_limits<uintptr_t>::max() - begin) {
+    return absl::InvalidArgumentError(
+        "transfer address + size overflows the process address space");
+  }
+  const uintptr_t pool_begin =
+      reinterpret_cast<uintptr_t>(external_mapped_address_);
+  const uintptr_t pool_end = pool_begin + external_mapped_size_;
+  if (begin < pool_begin || begin + size > pool_end) {
+    return absl::OutOfRangeError(absl::StrCat(
+        "transfer range [", begin, ", ", begin + size,
+        ") is outside the DMA mapped pool [", pool_begin, ", ", pool_end,
+        "); host memory must be allocated from the registered shared memory "
+        "pool"));
+  }
+  return absl::OkStatus();
+}
+
+void KVCacheManagerBase::AddExternalCopyLocked(
+    raiden::PjRtCopyFuture future) {
+  if (in_flight_external_copies_.size() >= external_copy_gc_watermark_) {
+    CollectFinishedExternalCopiesLocked();
+    // Next sweep once the list has doubled, so the amortized cost of tracking
+    // a copy stays constant even when nothing completes.
+    external_copy_gc_watermark_ = std::max(
+        kMinExternalCopyGcWatermark, 2 * in_flight_external_copies_.size());
+  }
+  in_flight_external_copies_.push_back(std::move(future));
+}
+
+void KVCacheManagerBase::CollectFinishedExternalCopiesLocked() {
+  size_t write_idx = 0;
+  for (size_t i = 0; i < in_flight_external_copies_.size(); ++i) {
+    if (in_flight_external_copies_[i].IsReady()) {
+      absl::Status err = in_flight_external_copies_[i].PollError();
+      if (deferred_external_copy_error_.ok() && !err.ok()) {
+        deferred_external_copy_error_ = std::move(err);
+      }
+    } else {
+      if (write_idx != i) {
+        in_flight_external_copies_[write_idx] =
+            std::move(in_flight_external_copies_[i]);
+      }
+      ++write_idx;
+    }
+  }
+  in_flight_external_copies_.resize(write_idx);
+}
+
+absl::Status KVCacheManagerBase::TrackExternalCopy(
+    raiden::PjRtCopyFuture future) {
+  absl::MutexLock lock(external_mapping_mu_);
+  if (external_mapping_phase_ != MappingPhase::kMapped) {
+    return absl::FailedPreconditionError(
+        "shared memory is not mapped; refusing to track the copy future");
+  }
+  AddExternalCopyLocked(std::move(future));
+  return absl::OkStatus();
 }
 
 }  // namespace kv_cache

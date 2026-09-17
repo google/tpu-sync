@@ -402,6 +402,138 @@ NB_MODULE(_tpu_raiden_torch, m) {
           nb::arg("copy_sizes_major_dim") = std::vector<int64_t>{},
           nb::call_guard<nb::gil_scoped_release>())
       .def(
+          "map_shared_memory",
+          [](KVCacheManager& self, uintptr_t mapped_address,
+             size_t pool_size_bytes) {
+            absl::Status status =
+                self.MapSharedMemory(mapped_address, pool_size_bytes);
+            if (!status.ok()) {
+              if (status.code() == absl::StatusCode::kInvalidArgument) {
+                throw std::invalid_argument(
+                    "KVCacheManager.map_shared_memory failed: " +
+                    std::string(status.message()));
+              }
+              throw std::runtime_error(
+                  "KVCacheManager.map_shared_memory failed: " +
+                  std::string(status.message()));
+            }
+          },
+          nb::arg("mapped_address"), nb::arg("pool_size_bytes"),
+          nb::call_guard<nb::gil_scoped_release>())
+      .def(
+          "unmap_shared_memory",
+          [](KVCacheManager& self) {
+            absl::Status status = self.UnmapSharedMemory();
+            if (!status.ok()) {
+              throw std::runtime_error(absl::StrCat(
+                  "KVCacheManager.unmap_shared_memory failed: ",
+                  status.message()));
+            }
+          },
+          nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_ro("is_shared_memory_mapped",
+                   &KVCacheManager::is_shared_memory_mapped)
+      .def(
+          "h2d",
+          [](KVCacheManager& self, const std::vector<int64_t>& block_ids,
+             const std::vector<at::Tensor>& object_tensors, int64_t rank_id) {
+            auto result = self.H2d(block_ids, object_tensors, rank_id);
+            if (!result.ok()) {
+              const auto code = result.status().code();
+              if (code == absl::StatusCode::kInvalidArgument) {
+                throw std::invalid_argument(
+                    "KVCacheManager.h2d failed: " +
+                    std::string(result.status().message()));
+              }
+              if (code == absl::StatusCode::kOutOfRange) {
+                throw std::out_of_range(
+                    "KVCacheManager.h2d failed: " +
+                    std::string(result.status().message()));
+              }
+              throw std::runtime_error(
+                  "KVCacheManager.h2d failed: " +
+                  std::string(result.status().message()));
+            }
+            return tpu_raiden::RaidenFuture{std::move(result.value())};
+          },
+          nb::arg("block_ids"), nb::arg("object_tensors"), nb::arg("rank_id"),
+          nb::call_guard<nb::gil_scoped_release>())
+      .def(
+          "H2d",
+          [](KVCacheManager& self, const std::vector<int64_t>& block_ids,
+             const std::vector<at::Tensor>& object_tensors, int64_t rank_id) {
+            auto result = self.H2d(block_ids, object_tensors, rank_id);
+            if (!result.ok()) {
+              const auto code = result.status().code();
+              if (code == absl::StatusCode::kInvalidArgument) {
+                throw std::invalid_argument(
+                    "KVCacheManager.H2d failed: " +
+                    std::string(result.status().message()));
+              }
+              if (code == absl::StatusCode::kOutOfRange) {
+                throw std::out_of_range(
+                    "KVCacheManager.H2d failed: " +
+                    std::string(result.status().message()));
+              }
+              throw std::runtime_error(
+                  "KVCacheManager.H2d failed: " +
+                  std::string(result.status().message()));
+            }
+            return tpu_raiden::RaidenFuture{std::move(result.value())};
+          },
+          nb::arg("block_ids"), nb::arg("object_tensors"), nb::arg("rank_id"),
+          nb::call_guard<nb::gil_scoped_release>())
+      .def(
+          "d2h",
+          [](KVCacheManager& self, const std::vector<int64_t>& block_ids,
+             const std::vector<at::Tensor>& object_tensors, int64_t rank_id) {
+            auto result = self.D2h(block_ids, object_tensors, rank_id);
+            if (!result.ok()) {
+              const auto code = result.status().code();
+              if (code == absl::StatusCode::kInvalidArgument) {
+                throw std::invalid_argument(
+                    "KVCacheManager.d2h failed: " +
+                    std::string(result.status().message()));
+              }
+              if (code == absl::StatusCode::kOutOfRange) {
+                throw std::out_of_range(
+                    "KVCacheManager.d2h failed: " +
+                    std::string(result.status().message()));
+              }
+              throw std::runtime_error(
+                  "KVCacheManager.d2h failed: " +
+                  std::string(result.status().message()));
+            }
+            return tpu_raiden::RaidenFuture{std::move(result.value())};
+          },
+          nb::arg("block_ids"), nb::arg("object_tensors"), nb::arg("rank_id"),
+          nb::call_guard<nb::gil_scoped_release>())
+      .def(
+          "D2h",
+          [](KVCacheManager& self, const std::vector<int64_t>& block_ids,
+             const std::vector<at::Tensor>& object_tensors, int64_t rank_id) {
+            auto result = self.D2h(block_ids, object_tensors, rank_id);
+            if (!result.ok()) {
+              const auto code = result.status().code();
+              if (code == absl::StatusCode::kInvalidArgument) {
+                throw std::invalid_argument(
+                    "KVCacheManager.D2h failed: " +
+                    std::string(result.status().message()));
+              }
+              if (code == absl::StatusCode::kOutOfRange) {
+                throw std::out_of_range(
+                    "KVCacheManager.D2h failed: " +
+                    std::string(result.status().message()));
+              }
+              throw std::runtime_error(
+                  "KVCacheManager.D2h failed: " +
+                  std::string(result.status().message()));
+            }
+            return tpu_raiden::RaidenFuture{std::move(result.value())};
+          },
+          nb::arg("block_ids"), nb::arg("object_tensors"), nb::arg("rank_id"),
+          nb::call_guard<nb::gil_scoped_release>())
+      .def(
           "D2hAutoAllocate",
           [](KVCacheManager& self,
              const std::vector<int64_t>& src_offsets_major_dim,

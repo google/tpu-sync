@@ -374,6 +374,106 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   void SetExternalHostBuffer(
       const std::vector<raiden::BufferHoldAndAlias>& buffer_holds);
 
+  // Registers an existing whole-pool host virtual memory mapping for TPU DMA.
+  // The caller owns the memory lifetime and must keep it page-locked until
+  // UnmapSharedMemory succeeds.
+  absl::Status MapSharedMemory(void* mapped_address, size_t pool_size_bytes);
+
+  // Drains in-flight copies and releases the shared-memory DMA registration.
+  // Blocks until every submission that already holds a lease has registered
+  // its future, then awaits all of them before calling DmaUnmap.
+  absl::Status UnmapSharedMemory();
+
+  // Returns true if an external shared memory pool is currently DMA mapped.
+  //
+  // This is a point-in-time observation only: a concurrent UnmapSharedMemory
+  // can invalidate it as soon as the lock is released, so it must NOT be used
+  // to guard a DMA submission.  Use AcquireExternalCopyLease for that.
+  bool is_shared_memory_mapped() const;
+
+  // Accessor for the PJRT client owning the device buffers.
+  xla::PjRtClient* GetPjRtClient() const;
+
+  // Keeps the shared-memory DMA registration alive for the duration of a copy
+  // submission.  UnmapSharedMemory will not call DmaUnmap while any lease is
+  // outstanding, which closes the window between "the pool is mapped" and
+  // "the resulting future has been registered as in-flight".
+  //
+  // Call Commit once the future exists.  Destroying an uncommitted lease (an
+  // early-return error path) simply releases the hold.
+  class ExternalCopyLease {
+   public:
+    ExternalCopyLease() = default;
+    ~ExternalCopyLease() { Release(std::nullopt); }
+
+    ExternalCopyLease(ExternalCopyLease&& other) noexcept
+        : manager_(std::exchange(other.manager_, nullptr)) {}
+    ExternalCopyLease& operator=(ExternalCopyLease&& other) noexcept {
+      if (this != &other) {
+        Release(std::nullopt);
+        manager_ = std::exchange(other.manager_, nullptr);
+      }
+      return *this;
+    }
+    ExternalCopyLease(const ExternalCopyLease&) = delete;
+    ExternalCopyLease& operator=(const ExternalCopyLease&) = delete;
+
+    // Registers `future` as in-flight and releases the lease.
+    void Commit(raiden::PjRtCopyFuture future) { Release(std::move(future)); }
+
+   private:
+    friend class KVCacheManagerBase;
+
+    explicit ExternalCopyLease(KVCacheManagerBase* manager)
+        : manager_(manager) {}
+
+    void Release(std::optional<raiden::PjRtCopyFuture> future) {
+      if (manager_ != nullptr) {
+        std::exchange(manager_, nullptr)
+            ->ReleaseExternalCopyLease(std::move(future));
+      }
+    }
+
+    KVCacheManagerBase* manager_ = nullptr;
+  };
+
+  // Acquires a lease on the shared-memory registration.  Fails unless a pool
+  // is mapped and no unmap is in progress.
+  absl::StatusOr<ExternalCopyLease> AcquireExternalCopyLease();
+
+  // Returns OK iff [address, address + size) lies entirely inside the pool
+  // that was handed to DmaMap.  DMA must never be issued against host memory
+  // outside the registered pool.
+  absl::Status ValidateExternalRange(const void* address, size_t size) const;
+
+  // Tracks an external in-flight copy future so it is drained before
+  // unmapping.  Fails if the pool is no longer mapped, in which case the
+  // future is dropped rather than silently queued against a dead mapping.
+  //
+  // Prefer AcquireExternalCopyLease + Commit, which additionally keeps the
+  // registration alive across the submission itself.
+  absl::Status TrackExternalCopy(raiden::PjRtCopyFuture future);
+
+  // Test helpers to simulate shared memory mapping state in unit tests without
+  // requiring hardware DMA support.
+  void SetSharedMemoryMappedForTest(void* mapped_address,
+                                    size_t pool_size_bytes) {
+    absl::MutexLock lock(external_mapping_mu_);
+    external_mapped_address_ = mapped_address;
+    external_mapped_size_ = pool_size_bytes;
+    external_mapping_phase_ = MappingPhase::kMapped;
+  }
+
+  void ResetSharedMemoryMappedForTest() {
+    absl::MutexLock lock(external_mapping_mu_);
+    external_mapped_address_ = nullptr;
+    external_mapped_size_ = 0;
+    in_flight_external_copies_.clear();
+    external_copy_gc_watermark_ = kMinExternalCopyGcWatermark;
+    deferred_external_copy_error_ = absl::OkStatus();
+    external_mapping_phase_ = MappingPhase::kUnmapped;
+  }
+
   // Returns the internal LogicalBlockManager.
   LogicalBlockManager* host_block_manager() const {
     return host_block_manager_.get();
@@ -819,6 +919,54 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       backends_ ABSL_GUARDED_BY(backends_mu_);
 
   bool InitializeSingleSecondaryBackend(const BackendConfig& config);
+  enum class MappingPhase {
+    kUnmapped,
+    kMapping,
+    kMapped,
+    kUnmapping,
+  };
+
+  mutable absl::Mutex external_mapping_mu_;
+  MappingPhase external_mapping_phase_ ABSL_GUARDED_BY(external_mapping_mu_) =
+      MappingPhase::kUnmapped;
+  void* external_mapped_address_
+      ABSL_GUARDED_BY(external_mapping_mu_) = nullptr;
+  size_t external_mapped_size_ ABSL_GUARDED_BY(external_mapping_mu_) = 0;
+  std::vector<raiden::PjRtCopyFuture> in_flight_external_copies_
+      ABSL_GUARDED_BY(external_mapping_mu_);
+  absl::Status deferred_external_copy_error_
+      ABSL_GUARDED_BY(external_mapping_mu_) = absl::OkStatus();
+
+  // Number of submissions holding a lease that have not yet registered their
+  // future.  UnmapSharedMemory waits for this to reach zero so that it cannot
+  // unmap underneath a copy that is still being issued.
+  int64_t pending_external_copies_ ABSL_GUARDED_BY(external_mapping_mu_) = 0;
+
+  // in_flight_external_copies_ is swept only once it reaches this size.  Each
+  // sweep polls every entry, so sweeping on every submission would make
+  // tracking quadratic in the number of concurrent copies; the watermark keeps
+  // it amortized constant.
+  static constexpr size_t kMinExternalCopyGcWatermark = 64;
+  size_t external_copy_gc_watermark_ ABSL_GUARDED_BY(external_mapping_mu_) =
+      kMinExternalCopyGcWatermark;
+
+  // Releases a lease taken by AcquireExternalCopyLease, registering `future`
+  // as in-flight when the submission succeeded.
+  void ReleaseExternalCopyLease(std::optional<raiden::PjRtCopyFuture> future);
+
+  absl::Status ValidateExternalRangeLocked(const void* address,
+                                           size_t size) const
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(external_mapping_mu_);
+
+  // Adds `future` to the in-flight list, sweeping completed entries first if
+  // the list has grown past the watermark.
+  void AddExternalCopyLocked(raiden::PjRtCopyFuture future)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(external_mapping_mu_);
+
+  // Drops completed futures from in_flight_external_copies_, latching the
+  // first error into deferred_external_copy_error_.
+  void CollectFinishedExternalCopiesLocked()
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(external_mapping_mu_);
 };
 
 }  // namespace kv_cache

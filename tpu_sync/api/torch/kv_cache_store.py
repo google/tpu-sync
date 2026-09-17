@@ -492,6 +492,16 @@ class KVCacheStore:
     """
     return self._impl.poll_load_status()
 
+  def poll_evicted_hashes(self) -> list[bytes]:
+    """Polls logical block hashes that have been evicted from the host LRU cache.
+
+    Results are drained on read.
+
+    Returns:
+      List of block hashes evicted since the previous poll.
+    """
+    return self._impl.poll_evicted_hashes()
+
   def read_remote(
       self,
       block_hashes: list[bytes],

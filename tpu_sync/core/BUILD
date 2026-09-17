@@ -560,6 +560,7 @@ cc_library(
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
+        ":control_plane_backend",
         ":host_memory_allocator",
         ":metrics_collector",
         ":pool_reshard_send_slots",
@@ -894,7 +895,7 @@ cc_test(
         "-layering_check",
     ],
     deps = [
-        ":kv_cache_manager_with_transfer",
+        ":tcp_control_plane_backend",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -937,8 +938,8 @@ cc_test(
         "-layering_check",
     ],
     deps = [
-        ":control_plane_backend_hdrs",
         ":kv_cache_manager_with_transfer",
+        ":tcp_control_plane_backend",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",

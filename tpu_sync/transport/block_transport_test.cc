@@ -35,6 +35,7 @@
 #include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/flags/flag.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
@@ -51,14 +52,14 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/prometheus_exporter.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
-#include "tpu_sync/transport/lib/socket/psp_syscall_mock.h" // NOLINT
+#include "tpu_sync/transport/lib/socket/psp_syscall_mock.h"  // NOLINT
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
-#include "absl/flags/flag.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -1023,14 +1024,14 @@ TEST_P(BlockTransportTest, SentBytesTelemetryIncrementedOnPushAndPull) {
       {absl::StrCat("localhost:", transport2.local_port())},
       /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
       /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0, /*layer_idx=*/-1);
-  ASSERT_OK(push_res);
+  ABSL_ASSERT_OK(push_res);
 
   constexpr absl::string_view kExpectedPushMetric =
       "tpu_raiden_sent_bytes_total{direction=\"push\"} 1024";
   const std::string snapshot1 = WaitForMetricSnapshot(kExpectedPushMetric);
   EXPECT_THAT(snapshot1, HasSubstr(kExpectedPushMetric));
 
-  ASSERT_OK_AND_ASSIGN(
+  TF_ASSERT_OK_AND_ASSIGN(
       auto pull_res,
       transport2.SyncPull({absl::StrCat("localhost:", transport1.local_port())},
                           /*src_block_ids=*/{0},
@@ -1063,7 +1064,7 @@ TEST_P(BlockTransportTest, ReceivedBytesTelemetryIncrementedOnPushAndPull) {
       {absl::StrCat("localhost:", transport2.local_port())},
       /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
       /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0, /*layer_idx=*/-1);
-  ASSERT_OK(push_res);
+  ABSL_ASSERT_OK(push_res);
 
   constexpr absl::string_view kExpectedPushMetric =
       "tpu_raiden_received_bytes_total{direction=\"push\"} 1024";
@@ -1077,7 +1078,7 @@ TEST_P(BlockTransportTest, ReceivedBytesTelemetryIncrementedOnPushAndPull) {
                           /*local_block_ids=*/{}, /*explicit_dst_ptrs=*/{},
                           /*parallelism=*/1, MajorOrder::kLayerMajor,
                           /*on_block_received=*/{}, /*uuid=*/0);
-  ASSERT_OK(pull_res);
+  ABSL_ASSERT_OK(pull_res);
 
   constexpr absl::string_view kExpectedPullResponseMetric =
       "tpu_raiden_received_bytes_total{direction=\"pull_response\"} 1024";
@@ -1313,14 +1314,14 @@ TEST_P(BlockTransportTest, NoTransferFailuresTelemetryOnSuccess) {
   BlockTransport transport2(&delegate2, 0);
   BindControlChannels(&transport1, &delegate1, &transport2, &delegate2);
 
-  ASSERT_OK(
+  ABSL_ASSERT_OK(
       transport1.SyncPush({absl::StrCat("localhost:", transport2.local_port())},
                           /*src_block_ids=*/{0},
                           /*dst_block_ids=*/{},
                           /*parallelism=*/1, MajorOrder::kLayerMajor,
                           /*uuid=*/0, /*layer_idx=*/-1));
 
-  ASSERT_OK(
+  ABSL_ASSERT_OK(
       transport2.SyncPull({absl::StrCat("localhost:", transport1.local_port())},
                           /*src_block_ids=*/{0},
                           /*local_block_ids=*/{},
@@ -1360,7 +1361,7 @@ TEST_P(BlockTransportTest, MultiShardPushBlockMajor) {
   BindControlChannels(&sender, &sender_delegate, &receiver,
                       &receiver_delegate);
 
-  ASSERT_OK(
+  ABSL_ASSERT_OK(
       sender.SyncPush({absl::StrCat("localhost:", receiver.local_port())},
                       /*src_block_ids=*/{0, 1, 2}, /*dst_block_ids=*/{0, 1, 2},
                       /*parallelism=*/1, MajorOrder::kBlockMajor, /*uuid=*/0,
@@ -1404,7 +1405,7 @@ TEST_P(BlockTransportTest, MultiShardPushLayerMajor) {
   BindControlChannels(&sender, &sender_delegate, &receiver,
                       &receiver_delegate);
 
-  ASSERT_OK(
+  ABSL_ASSERT_OK(
       sender.SyncPush({absl::StrCat("localhost:", receiver.local_port())},
                       /*src_block_ids=*/{0, 1, 2}, /*dst_block_ids=*/{0, 1, 2},
                       /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
@@ -1448,7 +1449,7 @@ TEST_P(BlockTransportTest, MultiShardPullBlockMajor) {
   BindControlChannels(&sender, &sender_delegate, &receiver,
                       &receiver_delegate);
 
-  ASSERT_OK(receiver.SyncPull(
+  ABSL_ASSERT_OK(receiver.SyncPull(
       {absl::StrCat("localhost:", sender.local_port())},
       /*src_block_ids=*/{0, 1, 2}, /*local_block_ids=*/{0, 1, 2},
       /*explicit_dst_ptrs=*/{}, /*parallelism=*/1, MajorOrder::kBlockMajor,
@@ -1492,7 +1493,7 @@ TEST_P(BlockTransportTest, MultiShardPullLayerMajor) {
   BindControlChannels(&sender, &sender_delegate, &receiver,
                       &receiver_delegate);
 
-  ASSERT_OK(receiver.SyncPull(
+  ABSL_ASSERT_OK(receiver.SyncPull(
       {absl::StrCat("localhost:", sender.local_port())},
       /*src_block_ids=*/{0, 1, 2}, /*local_block_ids=*/{0, 1, 2},
       /*explicit_dst_ptrs=*/{}, /*parallelism=*/1, MajorOrder::kLayerMajor,
@@ -1532,7 +1533,7 @@ TEST_P(BlockTransportTest, PushBufferCorrectness) {
       dst_addr, /*buffer_id=*/0, /*dst_shard_idx=*/0,
       /*dst_offset_bytes=*/kDstOffset, push_payload.data(), push_payload.size(),
       /*uuid=*/0);
-  EXPECT_OK(push_res) << push_res.message();
+  ABSL_EXPECT_OK(push_res) << push_res.message();
 
   const uint8_t* dst_buf = dst.GetHostPointer(0, 0);
   EXPECT_THAT(absl::MakeConstSpan(dst_buf, kDstOffset), Each(Eq(0)));
@@ -1569,7 +1570,7 @@ TEST_P(BlockTransportTest, PollEINTRIsBenign) {
       dst_addr, /*buffer_id=*/0, /*dst_shard_idx=*/0,
       /*dst_offset_bytes=*/kDstOffset, push_payload.data(), push_payload.size(),
       /*uuid=*/0);
-  EXPECT_OK(push_res) << push_res.message();
+  ABSL_EXPECT_OK(push_res) << push_res.message();
 }
 
 INSTANTIATE_TEST_SUITE_P(

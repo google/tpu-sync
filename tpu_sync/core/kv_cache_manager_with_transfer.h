@@ -42,6 +42,7 @@
 #include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/common/trace.h"
+#include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -192,7 +193,7 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     metrics_collector_ = std::move(collector);
   }
 
-  virtual ~KVCacheManagerWithTransfer();
+  ~KVCacheManagerWithTransfer() override;
 
   virtual int64_t NotifyForRead(const std::string& req_id, uint64_t uuid,
                                 const std::vector<int64_t>& block_ids);
@@ -252,8 +253,6 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   // at a control port hangs both sides silently.
   virtual std::vector<RaidenTransferEndpoint> get_local_data_endpoints()
       const;
-
-  static bool EncodeIpToIpv6Bytes(const std::string& ip, uint8_t out[16]);
 
   virtual void StartRead(
       const std::string& req_id, uint64_t uuid,
@@ -324,35 +323,7 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
     uint64_t num_blocks = 0;
   };
 
-  static constexpr int kMaxNics = 8;
-
-  struct alignas(8) ControlRequestHeader {
-    uint32_t magic = 0x52414944;  // "RAID"
-    uint32_t op = 0;
-    uint64_t uuid = 0;
-    uint32_t ep_idx = 0;
-    uint32_t consumer_data_port = 0;
-    uint64_t num_blocks = 0;
-    uint32_t num_ips = 0;
-    uint8_t consumer_ips[kMaxNics][16] = {{0}};
-    uint32_t padding = 0;
-  };
-
-  struct alignas(8) ControlResponseHeader {
-    uint32_t magic = 0x44494152;  // "DIAR"
-    int32_t status = 0;
-    uint32_t num_layers = 0;
-    uint32_t data_port = 0;
-    uint64_t message_len = 0;
-  };
-
-  static constexpr uint32_t kControlMagic = 0x52414944;
-  static constexpr uint32_t kResponseMagic = 0x44494152;
-  static constexpr uint32_t kOpAck = 2;
-  static constexpr uint32_t kOpPullStream = 3;
-
   std::string EndpointWithPort(const std::string& endpoint, int port) const;
-  ControlResponseHeader ReadControlResponseHeader(int fd);
   void AckSend(uint64_t uuid);
   void ConfigureDataPortFromKvTransfer();
 
@@ -393,9 +364,6 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
 
   void StartControlServer();
   void StopControlServer();
-  void ControlServerLoop();
-  void HandleControlConnection(int fd);
-  void ProcessPullStream(int fd, const ControlRequestHeader& req);
   void AckRemote(const std::string& remote_endpoint, uint64_t uuid);
   absl::Status OnLayerReceived(size_t layer_idx, uint64_t uuid) override;
   absl::Status OnPoolReceived(size_t pool_idx, uint64_t uuid) override;
@@ -582,11 +550,19 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
       active_producer_blocks_;
   absl::Mutex mu_;
   absl::CondVar cv_;
-  int control_fd_ = -1;
   std::atomic<bool> stopping_{false};
-  std::thread control_thread_;
+  std::unique_ptr<ControlPlaneHandler> control_handler_;
+  std::unique_ptr<ControlPlaneBackend> control_backend_;
 
  private:
+  class ControlPlaneHandlerImpl;
+
+  void InitializeControlPlane();
+  absl::StatusOr<PullStreamResponseSpec> HandlePullStream(
+      const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);
+  absl::Status HandleAck(uint64_t uuid);
+  uint64_t MaxPullStreamBlocks() const;
+
   std::optional<int> GetLocalTpuNumaNode(xla::PjRtBuffer* buf) const;
 
   StageResult IssueH2D(int64_t slot_idx, int64_t num_blocks,

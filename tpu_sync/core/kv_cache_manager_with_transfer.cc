@@ -28,7 +28,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -68,6 +67,7 @@
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/tsl/platform/errors.h"
 #include "tpu_sync/common/trace.h"
+#include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/metrics_collector.h"
 #include "tpu_sync/core/pool_reshard_send_slots.h"
@@ -86,21 +86,6 @@ namespace tpu_raiden {
 
 namespace {
 
-bool EncodeIp(const std::string& ip_str, uint8_t* dst) {
-  if (inet_pton(AF_INET6, ip_str.c_str(), dst) > 0) {
-    return true;
-  }
-  struct in_addr ipv4_addr;
-  if (inet_pton(AF_INET, ip_str.c_str(), &ipv4_addr) > 0) {
-    std::memset(dst, 0, 10);
-    dst[10] = 0xff;
-    dst[11] = 0xff;
-    std::memcpy(dst + 12, &ipv4_addr, 4);
-    return true;
-  }
-  return false;
-}
-
 constexpr absl::Duration kPendingWorkTimeout = absl::Seconds(30);
 
 // How long a pull request waits for the producer to register the read it
@@ -108,12 +93,12 @@ constexpr absl::Duration kPendingWorkTimeout = absl::Seconds(30);
 // acts on, so this only covers reordering between the two; a pull whose
 // registration expired, or never happened, is rejected once it lapses.
 constexpr absl::Duration kPullRegistrationGrace = absl::Seconds(5);
-// Control error text is diagnostic and should remain small. Bound it to 4 KiB
-// so an untrusted peer cannot trigger an arbitrarily large allocation.
-constexpr uint64_t kMaxControlErrorMessageBytes = 4 * 1024;
 
 [[noreturn]] void ThrowStatus(const std::string& context,
                               const absl::Status& status) {
+  if (status.code() == absl::StatusCode::kInvalidArgument) {
+    throw std::invalid_argument(context + ": " + std::string(status.message()));
+  }
   throw std::runtime_error(context + ": " + std::string(status.message()));
 }
 
@@ -160,175 +145,6 @@ T ValueOrThrow(const std::string& context, absl::StatusOr<T> value_or) {
     ThrowStatus(context, value_or.status());
   }
   return std::move(value_or).value();
-}
-
-absl::Status WriteExact(int fd, const void* buffer, size_t length) {
-  const uint8_t* ptr = static_cast<const uint8_t*>(buffer);
-  size_t remaining = length;
-  while (remaining > 0) {
-    ssize_t written = send(fd, ptr, remaining, MSG_NOSIGNAL);
-    if (written < 0) {
-      if (errno == EINTR) continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        return absl::DeadlineExceededError("socket write timed out");
-      }
-      return absl::InternalError("socket write failed: " +
-                                 std::string(std::strerror(errno)));
-    }
-    if (written == 0) {
-      return absl::InternalError("socket closed during write");
-    }
-    ptr += written;
-    remaining -= written;
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ReadExact(int fd, void* buffer, size_t length) {
-  uint8_t* ptr = static_cast<uint8_t*>(buffer);
-  size_t remaining = length;
-  while (remaining > 0) {
-    ssize_t bytes_read = read(fd, ptr, remaining);
-    if (bytes_read < 0) {
-      if (errno == EINTR) continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        return absl::DeadlineExceededError("socket read timed out");
-      }
-      return absl::InternalError("socket read failed: " +
-                                 std::string(std::strerror(errno)));
-    }
-    if (bytes_read == 0) {
-      return absl::InternalError("socket closed during read");
-    }
-    ptr += bytes_read;
-    remaining -= bytes_read;
-  }
-  return absl::OkStatus();
-}
-
-std::pair<std::string, int> SplitEndpoint(const std::string& endpoint) {
-  std::string host;
-  int port = 0;
-  if (endpoint.empty()) {
-    throw std::invalid_argument("endpoint is empty");
-  }
-  if (endpoint[0] == '[') {
-    size_t closing_bracket = endpoint.find(']');
-    if (closing_bracket == std::string::npos ||
-        closing_bracket + 2 >= endpoint.size() ||
-        endpoint[closing_bracket + 1] != ':') {
-      throw std::invalid_argument("invalid IPv6 endpoint: " + endpoint);
-    }
-    host = endpoint.substr(1, closing_bracket - 1);
-    port = std::stoi(endpoint.substr(closing_bracket + 2));
-  } else {
-    size_t colon = endpoint.rfind(':');
-    if (colon == std::string::npos) {
-      throw std::invalid_argument("endpoint must be host:port");
-    }
-    host = endpoint.substr(0, colon);
-    port = std::stoi(endpoint.substr(colon + 1));
-  }
-  return {host, port};
-}
-
-// Bounds every blocking call on `fd`: reads, writes, and for a socket that
-// is not yet connected, the connect itself. A non-positive timeout leaves
-// the socket blocking.
-absl::Status SetSocketTimeouts(int fd, double timeout_s) {
-  if (timeout_s <= 0) return absl::OkStatus();
-  timeval tv;
-  tv.tv_sec = static_cast<time_t>(timeout_s);
-  tv.tv_usec = static_cast<suseconds_t>((timeout_s - tv.tv_sec) * 1e6);
-  if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0 ||
-      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
-    return absl::InternalError("setsockopt(SO_RCVTIMEO/SO_SNDTIMEO) failed: " +
-                               std::string(std::strerror(errno)));
-  }
-  return absl::OkStatus();
-}
-
-int ConnectTcp(const std::string& endpoint, double timeout_s) {
-  auto [host, port] = SplitEndpoint(endpoint);
-  struct addrinfo hints;
-  struct addrinfo* res = nullptr;
-  std::memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-
-  std::string port_str = std::to_string(port);
-  int err = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res);
-  if (err != 0) {
-    throw std::runtime_error("Failed to resolve hostname '" + host +
-                             "': " + gai_strerror(err));
-  }
-
-  int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  if (fd < 0) {
-    freeaddrinfo(res);
-    throw std::runtime_error("socket() failed: " +
-                             std::string(std::strerror(errno)));
-  }
-  int opt = 1;
-  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-  if (absl::Status status = SetSocketTimeouts(fd, timeout_s); !status.ok()) {
-    close(fd);
-    freeaddrinfo(res);
-    throw std::runtime_error(std::string(status.message()));
-  }
-
-  if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
-    std::string err_str = std::strerror(errno);
-    close(fd);
-    freeaddrinfo(res);
-    throw std::runtime_error("connect(" + endpoint + ") failed: " + err_str);
-  }
-  freeaddrinfo(res);
-  return fd;
-}
-
-static std::string GetPeerIp(int fd) {
-  sockaddr_storage addr;
-  socklen_t len = sizeof(addr);
-  if (getpeername(fd, reinterpret_cast<sockaddr*>(&addr), &len) < 0) {
-    throw std::runtime_error("getpeername() failed: " +
-                             std::string(std::strerror(errno)));
-  }
-  char ip_buf[INET6_ADDRSTRLEN];
-  if (addr.ss_family == AF_INET) {
-    sockaddr_in* s = reinterpret_cast<sockaddr_in*>(&addr);
-    if (inet_ntop(AF_INET, &s->sin_addr, ip_buf, sizeof(ip_buf)) == nullptr) {
-      throw std::runtime_error("inet_ntop() failed: " +
-                               std::string(std::strerror(errno)));
-    }
-  } else if (addr.ss_family == AF_INET6) {
-    sockaddr_in6* s = reinterpret_cast<sockaddr_in6*>(&addr);
-    if (inet_ntop(AF_INET6, &s->sin6_addr, ip_buf, sizeof(ip_buf)) == nullptr) {
-      throw std::runtime_error("inet_ntop() failed: " +
-                               std::string(std::strerror(errno)));
-    }
-  } else {
-    throw std::runtime_error("unknown socket family");
-  }
-  return std::string(ip_buf);
-}
-static void WriteBlockIds(int fd, const std::vector<int64_t>& block_ids) {
-  if (block_ids.empty()) return;
-  CheckStatus(
-      "control block ids write",
-      WriteExact(fd, block_ids.data(), block_ids.size() * sizeof(int64_t)));
-}
-
-static std::vector<int64_t> ReadBlockIds(int fd, uint64_t num_blocks) {
-  if (num_blocks == 0) return {};
-  if (num_blocks > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-    throw std::invalid_argument("num_blocks is too large");
-  }
-  std::vector<int64_t> block_ids(static_cast<size_t>(num_blocks));
-  CheckStatus(
-      "control block ids read",
-      ReadExact(fd, block_ids.data(), block_ids.size() * sizeof(int64_t)));
-  return block_ids;
 }
 
 static CopySpec OffsetsImpl(const std::vector<int64_t>& block_ids,
@@ -525,6 +341,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
       metrics_collector_(std::move(metrics_collector)) {
+  InitializeControlPlane();
   if (local_control_port_ >= 0) {
     if (max_blocks_ <= 0) {
       throw std::invalid_argument("max_blocks must be positive");
@@ -580,6 +397,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
       metrics_collector_(std::move(metrics_collector)) {
+  InitializeControlPlane();
   if (num_layers() == 0 || num_shards() == 0) {
     return;
   }
@@ -641,6 +459,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(false),
       metrics_collector_(std::move(metrics_collector)) {
+  InitializeControlPlane();
   if (local_control_port_ >= 0) {
     if (max_blocks_ <= 0) {
       throw std::invalid_argument("max_blocks must be positive");
@@ -681,6 +500,8 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
   }
   push_pool_.reset();
   pull_pool_.reset();
+  control_backend_.reset();
+  control_handler_.reset();
   if (host_block_manager_ && !all_slots_.empty()) {
     std::vector<int> blocks_to_unlock;
     blocks_to_unlock.reserve(all_slots_.size() * max_blocks_);
@@ -1776,19 +1597,6 @@ std::vector<RaidenTransferEndpoint> KVCacheManagerWithTransfer::BuildEndpoints(
   return eps;
 }
 
-bool KVCacheManagerWithTransfer::EncodeIpToIpv6Bytes(const std::string& ip,
-                                                     uint8_t out[16]) {
-  // An IPv4 address must be sent as IPv4-mapped IPv6 ("::ffff:a.b.c.d") --
-  // inet_pton(AF_INET6, "<ipv4>") fails on a bare IPv4 string. If it still
-  // fails to parse, zero the field.
-  const std::string mapped = absl::StrContains(ip, ':') ? ip : "::ffff:" + ip;
-  if (inet_pton(AF_INET6, mapped.c_str(), out) <= 0) {
-    std::memset(out, 0, 16);
-    return false;
-  }
-  return true;
-}
-
 void KVCacheManagerWithTransfer::StartRead(
     const std::string& req_id, uint64_t uuid,
     const std::vector<std::string>& remote_endpoints,
@@ -1970,39 +1778,22 @@ void KVCacheManagerWithTransfer::StartRead(
       LOG(INFO) << "StartRead (connecting): req_id=" << req_id
                 << ", uuid=" << uuid
                 << ", numa=" << assigned_numa_node().value_or(-1);
-      int control_fd = ConnectTcp(remote_endpoint, timeout_s_);
-      auto control_cleanup =
-          std::unique_ptr<int, void (*)(int*)>(&control_fd, [](int* p) {
-            if (p && *p >= 0) close(*p);
-          });
+      PullStreamRequestSpec req_spec;
+      req_spec.uuid = uuid;
+      req_spec.ep_idx = 0;
+      req_spec.consumer_data_port = static_cast<uint32_t>(local_data_port_);
+      req_spec.consumer_ips = local_ips();
+      req_spec.src_block_ids = load_plan.producer_remote_block_ids;
+      req_spec.dst_block_ids = load_plan.transport_host_block_ids;
 
-      ControlRequestHeader stream_request;
-      stream_request.magic = kControlMagic;
-      stream_request.op = kOpPullStream;
-      stream_request.uuid = uuid;
-      stream_request.ep_idx = 0;
-      stream_request.num_blocks = static_cast<uint64_t>(load_plan.num_blocks);
-      stream_request.consumer_data_port =
-          static_cast<uint32_t>(local_data_port_);
-
-      std::vector<std::string> ips = local_ips();
-      stream_request.num_ips =
-          std::min(ips.size(), static_cast<size_t>(kMaxNics));
-      for (size_t i = 0; i < stream_request.num_ips; ++i) {
-        if (!EncodeIp(ips[i], stream_request.consumer_ips[i])) {
-          std::memset(stream_request.consumer_ips[i], 0, 16);
-        }
-      }
-      CheckStatus(
-          "control pull stream write",
-          WriteExact(control_fd, &stream_request, sizeof(stream_request)));
-      WriteBlockIds(control_fd, load_plan.producer_remote_block_ids);
-      WriteBlockIds(control_fd, load_plan.transport_host_block_ids);
-
-      ControlResponseHeader response = ReadControlResponseHeader(control_fd);
-      if (response.status != 0) {
-        throw std::runtime_error(
-            "Remote producer rejected Hybrid Bridge read request");
+      absl::StatusOr<PullStreamResponseSpec> response =
+          control_backend_->SendPullRequest(remote_endpoint, req_spec,
+                                            absl::Seconds(timeout_s_));
+      CheckStatus("control pull request", response.status());
+      if (response->status != 0) {
+        throw std::runtime_error(absl::StrCat(
+            "Remote producer rejected Hybrid Bridge read request: ",
+            response->message));
       }
       VLOG(1) << "StartRead (Hybrid Bridge) successfully registered pull "
                  "request with Producer. req_id: "
@@ -2496,281 +2287,189 @@ void KVCacheManagerWithTransfer::ScheduleAsyncTask(std::function<void()> task) {
   push_pool_->Schedule(std::move(task));
 }
 
+class KVCacheManagerWithTransfer::ControlPlaneHandlerImpl
+    : public ControlPlaneHandler {
+ public:
+  explicit ControlPlaneHandlerImpl(KVCacheManagerWithTransfer* manager)
+      : manager_(manager) {}
+
+  absl::StatusOr<PullStreamResponseSpec> OnPullStream(
+      const PullStreamRequestSpec& req,
+      absl::string_view fallback_peer_ip) override {
+    return manager_->HandlePullStream(req, fallback_peer_ip);
+  }
+
+  absl::Status OnAck(uint64_t uuid) override {
+    return manager_->HandleAck(uuid);
+  }
+
+  uint64_t MaxPullStreamBlocks() const override {
+    return manager_->MaxPullStreamBlocks();
+  }
+
+ private:
+  KVCacheManagerWithTransfer* manager_;
+};
+
+void KVCacheManagerWithTransfer::InitializeControlPlane() {
+  control_handler_ = std::make_unique<ControlPlaneHandlerImpl>(this);
+  auto executor = [this](std::function<void()> task) {
+    pull_pool_->Schedule(assigned_numa_node(), std::move(task));
+  };
+  control_backend_ =
+      CreateControlPlaneBackend(ResolveControlPlaneBackendType(),
+                                std::move(executor), absl::Seconds(timeout_s_));
+}
+
 void KVCacheManagerWithTransfer::StartControlServer() {
-  control_fd_ = socket(AF_INET6, SOCK_STREAM, 0);
-  if (control_fd_ < 0) {
-    throw std::runtime_error("control socket() failed: " +
-                             std::string(std::strerror(errno)));
+  {
+    absl::MutexLock lock(mu_);
+    stopping_ = false;
   }
-  int opt = 1;
-  setsockopt(control_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-  setsockopt(control_fd_, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-  int ipv6only = 0;
-  if (setsockopt(control_fd_, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6only,
-                 sizeof(ipv6only)) < 0) {
-    LOG(WARNING) << "setsockopt IPV6_V6ONLY=0 failed: " << std::strerror(errno);
-  }
-
-  sockaddr_in6 addr;
-  std::memset(&addr, 0, sizeof(addr));
-  addr.sin6_family = AF_INET6;
-  addr.sin6_addr = in6addr_any;
-  addr.sin6_port = htons(local_control_port_);
-
-  if (bind(control_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-    std::string err = std::strerror(errno);
-    close(control_fd_);
-    control_fd_ = -1;
-    throw std::runtime_error("control bind(" +
-                             std::to_string(local_control_port_) +
-                             ") failed: " + err);
-  }
-  socklen_t len = sizeof(addr);
-  if (getsockname(control_fd_, reinterpret_cast<sockaddr*>(&addr), &len) < 0) {
-    close(control_fd_);
-    control_fd_ = -1;
-    throw std::runtime_error("getsockname() failed: " +
-                             std::string(std::strerror(errno)));
-  }
-  local_control_port_ = ntohs(addr.sin6_port);
-  if (listen(control_fd_, 128) < 0) {
-    close(control_fd_);
-    control_fd_ = -1;
-    throw std::runtime_error("listen() failed: " +
-                             std::string(std::strerror(errno)));
-  }
-  stopping_ = false;
-  control_thread_ = std::thread([this]() { ControlServerLoop(); });
+  absl::StatusOr<int> bound_port = control_backend_->StartServer(
+      local_control_port_, control_handler_.get());
+  CheckStatus("StartControlServer", bound_port.status());
+  local_control_port_ = *bound_port;
 }
 
 void KVCacheManagerWithTransfer::StopControlServer() {
-  stopping_ = true;
   {
     absl::MutexLock lock(mu_);
+    stopping_ = true;
     while (!staging_readiness_.empty()) {
       RemoveStagingReadinessLocked(staging_readiness_.begin()->first);
     }
   }
-  // Wake workers parked in ProcessPullStream waiting for a send entry that
-  // will never arrive, so their loops observe stopping_ and the pools can
-  // join them.
+  // Wake workers parked in HandlePullStream waiting for a send entry that
+  // will never arrive, so their loops observe stopping_ and exit.
   cv_.SignalAll();
-  if (control_fd_ >= 0) {
-    shutdown(control_fd_, SHUT_RDWR);
-    close(control_fd_);
-  }
-  if (control_thread_.joinable()) {
-    control_thread_.join();
-  }
-  control_fd_ = -1;
-}
-
-void KVCacheManagerWithTransfer::ControlServerLoop() {
-  while (!stopping_) {
-    pollfd pfd;
-    pfd.fd = control_fd_;
-    pfd.events = POLLIN;
-    int r = poll(&pfd, 1, 200);
-    if (r < 0) {
-      if (errno == EINTR) continue;
-      break;
-    }
-    if (r == 0) continue;
-    int client_fd = accept(control_fd_, nullptr, nullptr);
-    if (client_fd < 0) {
-      if (errno == EINTR) continue;
-      break;
-    }
-    if (absl::Status status = SetSocketTimeouts(client_fd, timeout_s_);
-        !status.ok()) {
-      LOG(WARNING) << "control connection: " << status.message();
-    }
-    std::optional<int> source_node = assigned_numa_node();
-
-    pull_pool_->Schedule(source_node, [this, client_fd]() {
-      HandleControlConnection(client_fd);
-      shutdown(client_fd, SHUT_WR);
-      close(client_fd);
-    });
+  if (control_backend_) {
+    control_backend_->StopServer();
   }
 }
 
-void KVCacheManagerWithTransfer::HandleControlConnection(int fd) {
-  try {
-    ControlRequestHeader req;
-    CheckStatus("control request header read",
-                ReadExact(fd, &req, sizeof(req)));
-    if (req.magic != kControlMagic) {
-      throw std::runtime_error("bad control request magic");
-    }
-    if (req.op == kOpPullStream) {
-      ProcessPullStream(fd, req);
-    } else {
-      throw std::runtime_error("unknown control op code: " +
-                               std::to_string(req.op));
-    }
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "Raiden producer error in control connection handler: "
-               << e.what();
-    ControlResponseHeader response;
-    response.magic = kResponseMagic;
-    response.status = -1;
-    std::string message = e.what();
-    if (message.size() > kMaxControlErrorMessageBytes) {
-      message.resize(kMaxControlErrorMessageBytes);
-    }
-    response.message_len = message.size();
-    if (absl::Status s = WriteExact(fd, &response, sizeof(response)); !s.ok()) {
-      LOG(WARNING) << "Failed to send control response header: " << s;
-      return;
-    }
-    if (response.message_len > 0) {
-      if (absl::Status s = WriteExact(fd, message.data(), message.size());
-          !s.ok()) {
-        LOG(WARNING) << "Failed to send control response message: " << s;
-        return;
-      }
-    }
-  }
-}
-
-void KVCacheManagerWithTransfer::ProcessPullStream(
-    int fd, const ControlRequestHeader& req) {
-  RAIDEN_TRACE_FN("KVTransfer::ProcessPullStream", [&]() {
-    return absl::StrCat("uuid=", req.uuid, " blocks=", req.num_blocks);
+absl::StatusOr<PullStreamResponseSpec>
+KVCacheManagerWithTransfer::HandlePullStream(
+    const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip) {
+  RAIDEN_TRACE_FN("KVTransfer::HandlePullStream", [&]() {
+    return absl::StrCat("uuid=", req.uuid,
+                        " blocks=", req.src_block_ids.size());
   });
-  const int64_t block_capacity =
-      dynamic_host_staging_ ? host_block_manager_->total_blocks() : max_blocks_;
-  // A control connection carries one request and is then closed, so rejecting
-  // an oversized header here safely discards any unread body with the socket.
-  if (req.num_blocks > static_cast<uint64_t>(block_capacity)) {
-    throw std::invalid_argument(
-        absl::StrCat("pull stream block count ", req.num_blocks,
-                     " exceeds configured maximum ", block_capacity));
-  }
-  std::vector<int64_t> src_block_ids = ReadBlockIds(fd, req.num_blocks);
-  std::vector<int64_t> dst_block_ids = ReadBlockIds(fd, req.num_blocks);
+  try {
+    const uint64_t block_capacity = MaxPullStreamBlocks();
+    if (req.src_block_ids.size() > block_capacity) {
+      throw std::invalid_argument(
+          absl::StrCat("pull stream block count ", req.src_block_ids.size(),
+                       " exceeds configured maximum ", block_capacity));
+    }
 
-  const absl::Duration grace =
-      std::min(kPullRegistrationGrace, absl::Seconds(timeout_s_));
-  {
-    absl::MutexLock lock(mu_);
-    std::shared_ptr<SendEntry> entry;
-    const absl::Time give_up = absl::Now() + grace;
-    while (true) {
-      auto it = send_entries_.find(req.uuid);
-      if (it != send_entries_.end()) {
-        entry = it->second;
-        break;
-      }
-      const absl::Duration left = give_up - absl::Now();
-      if (stopping_.load() || left <= absl::ZeroDuration()) {
-        break;
-      }
-      cv_.WaitWithTimeout(&mu_, left);
-    }
-    if (stopping_) return;
-    if (!entry) {
-      throw std::runtime_error(
-          absl::StrCat("no read registered for uuid ", req.uuid, " within ",
-                       absl::FormatDuration(grace),
-                       ": the producer expired it or never registered it"));
-    }
-    // Registration guards prevent a live entry from being replaced, so an
-    // expired entry cannot become valid while this pull waits out the grace.
-    if (entry->deadline <= std::chrono::steady_clock::now()) {
-      throw std::runtime_error(
-          absl::StrCat("read registration for uuid ", req.uuid, " expired"));
-    }
-    ValidateRequestedBlocks(*entry, src_block_ids);
-    if (entry->pull_started) {
-      throw std::runtime_error(
-          absl::StrCat("pull already started for uuid ", req.uuid));
-    }
-    entry->pull_started = true;
-  }
-
-  // The claim remains consumed if this write fails. The deadline sweep will
-  // retire it; admitting a retry could otherwise start two pushes.
-  // Acknowledge acceptance to consumer immediately
-  ControlResponseHeader response;
-  response.magic = kResponseMagic;
-  response.status = 0;
-  response.num_layers = static_cast<uint32_t>(num_layers() * num_shards());
-  response.data_port = static_cast<uint32_t>(local_data_port_);
-  CheckStatus("control stream response header write",
-              WriteExact(fd, &response, sizeof(response)));
-
-  std::vector<std::string> peer_ips;
-  if (req.num_ips > 0) {
-    for (uint32_t i = 0;
-         i < std::min(req.num_ips, static_cast<uint32_t>(kMaxNics)); ++i) {
-      char ip_str[INET6_ADDRSTRLEN];
-      bool is_ipv4_mapped = true;
-      for (int j = 0; j < 10; ++j) {
-        if (req.consumer_ips[i][j] != 0) {
-          is_ipv4_mapped = false;
+    const absl::Duration grace =
+        std::min(kPullRegistrationGrace, absl::Seconds(timeout_s_));
+    {
+      absl::MutexLock lock(mu_);
+      std::shared_ptr<SendEntry> entry;
+      const absl::Time give_up = absl::Now() + grace;
+      while (true) {
+        auto it = send_entries_.find(req.uuid);
+        if (it != send_entries_.end()) {
+          entry = it->second;
           break;
         }
-      }
-      if (req.consumer_ips[i][10] != 0xff || req.consumer_ips[i][11] != 0xff) {
-        is_ipv4_mapped = false;
-      }
-
-      if (is_ipv4_mapped) {
-        struct in_addr ipv4_addr;
-        std::memcpy(&ipv4_addr, req.consumer_ips[i] + 12, 4);
-        if (inet_ntop(AF_INET, &ipv4_addr, ip_str, sizeof(ip_str)) != nullptr) {
-          peer_ips.push_back(ip_str);
+        const absl::Duration left = give_up - absl::Now();
+        if (stopping_.load() || left <= absl::ZeroDuration()) {
+          break;
         }
+        cv_.WaitWithTimeout(&mu_, left);
+      }
+      if (stopping_.load()) {
+        return PullStreamResponseSpec{
+            .status = -1, .message = "Producer control server is stopping"};
+      }
+      if (!entry) {
+        throw std::runtime_error(
+            absl::StrCat("no read registered for uuid ", req.uuid, " within ",
+                         absl::FormatDuration(grace),
+                         ": the producer expired it or never registered it"));
+      }
+      // Registration guards prevent a live entry from being replaced, so an
+      // expired entry cannot become valid while this pull waits out the grace.
+      if (entry->deadline <= std::chrono::steady_clock::now()) {
+        throw std::runtime_error(
+            absl::StrCat("read registration for uuid ", req.uuid, " expired"));
+      }
+      ValidateRequestedBlocks(*entry, req.src_block_ids);
+      if (entry->pull_started) {
+        throw std::runtime_error(
+            absl::StrCat("pull already started for uuid ", req.uuid));
+      }
+      entry->pull_started = true;
+    }
+
+    std::vector<std::string> peer_ips = req.consumer_ips;
+    if (peer_ips.empty()) {
+      if (control_backend_->Name() != "tcp") {
+        LOG(WARNING) << "No consumer IPs specified in PullStreamRequest.";
+      }
+      if (!fallback_peer_ip.empty()) {
+        peer_ips.push_back(std::string(fallback_peer_ip));
+      }
+    }
+
+    std::vector<std::string> remote_data_endpoints;
+    for (const auto& peer_ip : peer_ips) {
+      if (absl::StrContains(peer_ip, ':')) {
+        remote_data_endpoints.push_back(
+            absl::StrCat("[", peer_ip, "]:", req.consumer_data_port));
       } else {
-        if (inet_ntop(AF_INET6, req.consumer_ips[i], ip_str, sizeof(ip_str)) !=
-            nullptr) {
-          peer_ips.push_back(ip_str);
-        }
+        remote_data_endpoints.push_back(
+            absl::StrCat(peer_ip, ":", req.consumer_data_port));
       }
     }
-  }
 
-  if (peer_ips.empty() && req.num_ips == 0) {
-    LOG(WARNING) << "No consumer IPs specified in ControlRequestHeader.";
-  }
+    VLOG(1) << "HandlePullStream (Hybrid Bridge) successfully acknowledged "
+               "consumer. Intercepting and launching StartPushInternal to "
+            << (remote_data_endpoints.empty() ? "" : remote_data_endpoints[0])
+            << (remote_data_endpoints.size() > 1 ? " and others" : "");
 
-  if (peer_ips.empty()) {
-    std::string peer_ip = GetPeerIp(fd);
-    if (!peer_ip.empty()) {
-      peer_ips.push_back(peer_ip);
+    {
+      absl::MutexLock lock(pull_workers_mu_);
+      ++active_pull_workers_;
     }
-  }
+    std::thread([this, uuid = req.uuid, remote_data_endpoints,
+                 src_block_ids = req.src_block_ids,
+                 dst_block_ids = req.dst_block_ids]() {
+      StartPushInternal(uuid, remote_data_endpoints, src_block_ids,
+                        dst_block_ids);
+      absl::MutexLock lock(pull_workers_mu_);
+      --active_pull_workers_;
+    }).detach();
 
-  std::vector<std::string> remote_data_endpoints;
-  for (const auto& peer_ip : peer_ips) {
-    if (absl::StrContains(peer_ip, ':')) {
-      remote_data_endpoints.push_back(
-          absl::StrCat("[", peer_ip, "]:", req.consumer_data_port));
-    } else {
-      remote_data_endpoints.push_back(
-          absl::StrCat(peer_ip, ":", req.consumer_data_port));
-    }
+    return PullStreamResponseSpec{
+        .status = 0,
+        .num_layers = static_cast<uint32_t>(num_layers() * num_shards()),
+        .data_port = static_cast<uint32_t>(local_data_port_),
+        .message = "",
+    };
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Raiden producer rejected PullStream request: " << e.what();
+    return PullStreamResponseSpec{
+        .status = -1,
+        .num_layers = 0,
+        .data_port = 0,
+        .message = e.what(),
+    };
   }
+}
 
-  VLOG(1) << "ProcessPullStream (Hybrid Bridge) successfully acknowledged "
-             "consumer. Intercepting and launching StartPushInternal to "
-          << (remote_data_endpoints.empty() ? "" : remote_data_endpoints[0])
-          << (remote_data_endpoints.size() > 1 ? " and others" : "");
+absl::Status KVCacheManagerWithTransfer::HandleAck(uint64_t uuid) {
+  AckSend(uuid);
+  return absl::OkStatus();
+}
 
-  {
-    absl::MutexLock lock(pull_workers_mu_);
-    ++active_pull_workers_;
-  }
-  std::thread([this, uuid = req.uuid, remote_data_endpoints, src_block_ids,
-               dst_block_ids]() {
-    StartPushInternal(uuid, remote_data_endpoints, src_block_ids,
-                      dst_block_ids);
-    absl::MutexLock lock(pull_workers_mu_);
-    --active_pull_workers_;
-  }).detach();
+uint64_t KVCacheManagerWithTransfer::MaxPullStreamBlocks() const {
+  const int64_t block_capacity =
+      dynamic_host_staging_ ? host_block_manager_->total_blocks() : max_blocks_;
+  return static_cast<uint64_t>(std::max<int64_t>(0, block_capacity));
 }
 
 bool KVCacheManagerWithTransfer::AcquireSendStagingWithRetry(
@@ -3117,53 +2816,34 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
 
 std::string KVCacheManagerWithTransfer::EndpointWithPort(
     const std::string& endpoint, int port) const {
-  auto [host, ignored_port] = SplitEndpoint(endpoint);
-  (void)ignored_port;
-  return host + ":" + std::to_string(port);
+  if (endpoint.empty()) {
+    throw std::invalid_argument("endpoint is empty");
+  }
+  std::string host;
+  if (absl::StartsWith(endpoint, "[")) {
+    size_t closing = endpoint.find("]:");
+    if (closing == std::string::npos) {
+      throw std::invalid_argument("invalid IPv6 endpoint: " + endpoint);
+    }
+    host = endpoint.substr(1, closing - 1);
+  } else {
+    size_t colon = endpoint.rfind(':');
+    if (colon == std::string::npos) {
+      throw std::invalid_argument("endpoint must be host:port");
+    }
+    host = endpoint.substr(0, colon);
+  }
+  if (absl::StrContains(host, ':')) {
+    return absl::StrCat("[", host, "]:", port);
+  }
+  return absl::StrCat(host, ":", port);
 }
 
 void KVCacheManagerWithTransfer::AckRemote(const std::string& remote_endpoint,
                                            uint64_t uuid) {
-  int control_fd = ConnectTcp(remote_endpoint, timeout_s_);
-  auto control_cleanup =
-      std::unique_ptr<int, void (*)(int*)>(&control_fd, [](int* p) {
-        if (p && *p >= 0) close(*p);
-      });
-  ControlRequestHeader stream_request;
-  stream_request.magic = kControlMagic;
-  stream_request.op = kOpPullStream;
-  stream_request.uuid = uuid;
-  stream_request.ep_idx = 0;
-  stream_request.num_blocks = 0;
-  CheckStatus("control pull stream write (empty)",
-              WriteExact(control_fd, &stream_request, sizeof(stream_request)));
-  (void)ReadControlResponseHeader(control_fd);
-}
-
-KVCacheManagerWithTransfer::ControlResponseHeader
-KVCacheManagerWithTransfer::ReadControlResponseHeader(int fd) {
-  ControlResponseHeader response;
-  CheckStatus("control response read",
-              ReadExact(fd, &response, sizeof(response)));
-  if (response.magic != kResponseMagic) {
-    throw std::runtime_error("bad control response magic");
-  }
-  if (response.status != 0) {
-    const bool truncated = response.message_len > kMaxControlErrorMessageBytes;
-    const size_t message_bytes = static_cast<size_t>(
-        std::min(response.message_len, kMaxControlErrorMessageBytes));
-    std::string message(message_bytes, '\0');
-    if (message_bytes > 0) {
-      CheckStatus("control error body read",
-                  ReadExact(fd, message.data(), message.size()));
-    }
-    if (truncated) {
-      absl::StrAppend(&message, " [truncated; peer advertised ",
-                      response.message_len, " bytes]");
-    }
-    throw std::runtime_error("remote Raiden control error: " + message);
-  }
-  return response;
+  CheckStatus("AckRemote",
+              control_backend_->SendAck(remote_endpoint, uuid,
+                                        absl::Seconds(timeout_s_)));
 }
 
 void KVCacheManagerWithTransfer::AckSend(uint64_t uuid) {

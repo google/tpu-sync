@@ -1376,10 +1376,10 @@ TEST(HostOffloadBackendTest, LoadUpdatesTrackerOnSuccessAndFailure) {
   unit_proto.set_data_name(node_id.data_name);
   unit_proto.set_data_replica_idx(node_id.data_replica_idx);
 
-  ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
-                                            unit_proto, /*num_blocks=*/100,
-                                            /*num_shards=*/1,
-                                            /*shard_size_bytes=*/1024));
+  TF_ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
+                                               unit_proto, /*num_blocks=*/100,
+                                               /*num_shards=*/1,
+                                               /*shard_size_bytes=*/1024));
   auto test_worker_server = controller::CreateTestWorkerServer();
   auto transfer_mock =
       std::make_unique<controller::ShardAwareMockTransferManager>();
@@ -1397,8 +1397,8 @@ TEST(HostOffloadBackendTest, LoadUpdatesTrackerOnSuccessAndFailure) {
   config.capacity = 100;
   config.raiden_id = node_id;
 
-  ASSERT_OK_AND_ASSIGN(auto backend_base,
-                       HostOffloadBackend::Create(config, controller.get()));
+  TF_ASSERT_OK_AND_ASSIGN(auto backend_base,
+                          HostOffloadBackend::Create(config, controller.get()));
   auto backend = std::dynamic_pointer_cast<HostOffloadBackend>(backend_base);
   ASSERT_NE(backend, nullptr);
 
@@ -1442,10 +1442,10 @@ TEST(HostOffloadBackendTest, SaveUpdatesTrackerOnSuccessAndFailure) {
   unit_proto.set_data_name(node_id.data_name);
   unit_proto.set_data_replica_idx(node_id.data_replica_idx);
 
-  ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
-                                            unit_proto, /*num_blocks=*/100,
-                                            /*num_shards=*/1,
-                                            /*shard_size_bytes=*/1024));
+  TF_ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
+                                               unit_proto, /*num_blocks=*/100,
+                                               /*num_shards=*/1,
+                                               /*shard_size_bytes=*/1024));
   auto test_worker_server = controller::CreateTestWorkerServer();
   auto transfer_mock =
       std::make_unique<controller::ShardAwareMockTransferManager>();
@@ -1463,8 +1463,8 @@ TEST(HostOffloadBackendTest, SaveUpdatesTrackerOnSuccessAndFailure) {
   config.capacity = 100;
   config.raiden_id = node_id;
 
-  ASSERT_OK_AND_ASSIGN(auto backend_base,
-                       HostOffloadBackend::Create(config, controller.get()));
+  TF_ASSERT_OK_AND_ASSIGN(auto backend_base,
+                          HostOffloadBackend::Create(config, controller.get()));
   auto backend = std::dynamic_pointer_cast<HostOffloadBackend>(backend_base);
   ASSERT_NE(backend, nullptr);
 

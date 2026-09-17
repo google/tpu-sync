@@ -19,7 +19,7 @@
 #include <string>
 
 #include <gtest/gtest.h>
-#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/core/tcp_control_plane_backend.h"
 
 namespace tpu_raiden {
 namespace {
@@ -44,8 +44,7 @@ bool IsAllZero(const uint8_t b[16]) {
 // fallback (the control NIC, != the data NIC on a multi-NIC host).
 TEST(ConsumerIpEncodingTest, Ipv4IsMappedAndRoundTrips) {
   uint8_t buf[16];
-  EXPECT_TRUE(
-      KVCacheManagerWithTransfer::EncodeIpToIpv6Bytes("10.210.0.4", buf));
+  EXPECT_TRUE(TcpControlPlaneBackend::EncodeIpToIpv6Bytes("10.210.0.4", buf));
   EXPECT_FALSE(IsAllZero(buf));
   // The producer decodes it back as IPv4-mapped IPv6 -- not zeroed.
   EXPECT_EQ(DecodeIpv6Bytes(buf), "::ffff:10.210.0.4");
@@ -53,22 +52,21 @@ TEST(ConsumerIpEncodingTest, Ipv4IsMappedAndRoundTrips) {
 
 TEST(ConsumerIpEncodingTest, Ipv4MappedInputPassesThrough) {
   uint8_t buf[16];
-  EXPECT_TRUE(KVCacheManagerWithTransfer::EncodeIpToIpv6Bytes(
-      "::ffff:10.210.0.4", buf));
+  EXPECT_TRUE(
+      TcpControlPlaneBackend::EncodeIpToIpv6Bytes("::ffff:10.210.0.4", buf));
   EXPECT_EQ(DecodeIpv6Bytes(buf), "::ffff:10.210.0.4");
 }
 
 TEST(ConsumerIpEncodingTest, Ipv6PassesThrough) {
   uint8_t buf[16];
-  EXPECT_TRUE(KVCacheManagerWithTransfer::EncodeIpToIpv6Bytes("fd00::1", buf));
+  EXPECT_TRUE(TcpControlPlaneBackend::EncodeIpToIpv6Bytes("fd00::1", buf));
   EXPECT_EQ(DecodeIpv6Bytes(buf), "fd00::1");
 }
 
 TEST(ConsumerIpEncodingTest, UnparseableIsZeroedAndReturnsFalse) {
   uint8_t buf[16];
   std::memset(buf, 0xAB, sizeof(buf));  // poison, to prove it gets zeroed
-  EXPECT_FALSE(
-      KVCacheManagerWithTransfer::EncodeIpToIpv6Bytes("not-an-ip", buf));
+  EXPECT_FALSE(TcpControlPlaneBackend::EncodeIpToIpv6Bytes("not-an-ip", buf));
   EXPECT_TRUE(IsAllZero(buf));
 }
 

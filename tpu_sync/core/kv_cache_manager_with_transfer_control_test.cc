@@ -49,6 +49,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/core/tcp_control_plane_backend.h"
 
 namespace tpu_raiden {
 namespace {
@@ -74,17 +75,25 @@ class TestManager : public KVCacheManagerWithTransfer {
             /*max_blocks=*/8,
             /*num_slots=*/2 * kPoolSize, timeout_s) {}
 
-  using KVCacheManagerWithTransfer::ControlRequestHeader;
-  using KVCacheManagerWithTransfer::ControlResponseHeader;
-  using KVCacheManagerWithTransfer::kControlMagic;
-  using KVCacheManagerWithTransfer::kOpPullStream;
-  using KVCacheManagerWithTransfer::kResponseMagic;
+  using ControlRequestHeader = TcpControlPlaneBackend::ControlRequestHeader;
+  using ControlResponseHeader = TcpControlPlaneBackend::ControlResponseHeader;
+  static constexpr uint32_t kControlMagic =
+      TcpControlPlaneBackend::kControlMagic;
+  static constexpr uint32_t kOpPullStream =
+      TcpControlPlaneBackend::kOpPullStream;
+  static constexpr uint32_t kResponseMagic =
+      TcpControlPlaneBackend::kResponseMagic;
 
   ControlResponseHeader ReadResponseHeaderForTest(int fd) {
-    return ReadControlResponseHeader(fd);
+    return TcpControlPlaneBackend::ReadControlResponseHeader(fd);
   }
 
-  void HandleControlConnectionForTest(int fd) { HandleControlConnection(fd); }
+  void HandleControlConnectionForTest(int fd) {
+    if (auto* tcp_backend =
+            dynamic_cast<TcpControlPlaneBackend*>(control_backend_.get())) {
+      tcp_backend->HandleControlConnection(fd, control_handler_.get());
+    }
+  }
 
   void ExpireRecv(uint64_t uuid) {
     absl::MutexLock lock(mu_);

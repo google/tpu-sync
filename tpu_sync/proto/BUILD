@@ -149,6 +149,7 @@ cc_proto_library(
 cc_grpc_library(
     name = "kv_cache_control_plane_service_cc_grpc",
     srcs = [":kv_cache_control_plane_service_proto"],
+    grpc_only = True,
     visibility = ["//visibility:public"],
     deps = [":kv_cache_control_plane_service_cc_proto"],
 )

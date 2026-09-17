@@ -21,7 +21,6 @@
 #include <map>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
@@ -30,6 +29,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden::telemetry {
@@ -51,9 +51,8 @@ class QueueBuffer {
     if (samples_.size() < max_capacity_) {
       samples_.push_back(val);
     } else {
-      LOG_EVERY_N_SEC(WARNING, 5)
-          << "QueueBuffer capacity (" << max_capacity_
-          << ") exceeded; dropping metric sample.";
+      LOG_EVERY_N_SEC(WARNING, 5) << "QueueBuffer capacity (" << max_capacity_
+                                  << ") exceeded; dropping metric sample.";
     }
   }
 
@@ -90,10 +89,6 @@ class LockFreeCounterAccumulator {
 };
 
 inline constexpr size_t kMaxLabeledSeries = 512;
-// Formats canonical Prometheus label string for in-memory series
-// identification. Returns "{key1=\"val1\",key2=\"val2\"}" sorted by key, with
-// Prometheus character escaping. Returns "" if labels are empty.
-std::string FormatCanonicalLabels(LabelSpan labels);
 
 // Encapsulates all time-series buffers for a single metric family.
 template <typename AccumulatorType>
@@ -113,27 +108,33 @@ class MetricFamilyBuffer {
     if (labels.empty()) {
       return &unlabeled_;
     }
-    std::string canonical_labels = FormatCanonicalLabels(labels);
+    PrometheusLabelView formatted(labels);
+    const absl::string_view lookup_key = formatted.view();
+    if (lookup_key.empty()) {
+      LOG_EVERY_N_SEC(WARNING, 5)
+          << "Failed to format metric labels; dropping metric series.";
+      return nullptr;
+    }
+
     {
       absl::ReaderMutexLock lock(labeled_mu_);
-      if (auto it = labeled_.find(canonical_labels); it != labeled_.end()) {
+      if (auto it = labeled_.find(lookup_key); it != labeled_.end()) {
         return it->second.get();
       }
     }
+
     absl::MutexLock lock(labeled_mu_);
-    auto it = labeled_.find(canonical_labels);
-    if (it != labeled_.end()) {
+    if (auto it = labeled_.find(lookup_key); it != labeled_.end()) {
       return it->second.get();
     }
     if (labeled_.size() >= kMaxLabeledSeries) {
       LOG_EVERY_N_SEC(WARNING, 5)
           << "Max labeled series capacity (" << kMaxLabeledSeries
-          << ") exceeded; dropping metric series for labels: "
-          << canonical_labels;
+          << ") exceeded; dropping metric series for labels: " << lookup_key;
       return nullptr;
     }
     auto [insert_it, _] = labeled_.try_emplace(
-        std::move(canonical_labels), std::make_unique<AccumulatorType>());
+        formatted.ToOwned(), std::make_unique<AccumulatorType>());
     return insert_it->second.get();
   }
 
@@ -189,13 +190,11 @@ class BufferedMetricsExporter : public MetricsBackend {
       std::string,
       std::unique_ptr<MetricFamilyBuffer<LockFreeCounterAccumulator>>>
       counters_;
-  absl::flat_hash_map<
-      std::string,
-      std::unique_ptr<MetricFamilyBuffer<QueueBuffer<>>>>
+  absl::flat_hash_map<std::string,
+                      std::unique_ptr<MetricFamilyBuffer<QueueBuffer<>>>>
       gauges_;
-  absl::flat_hash_map<
-      std::string,
-      std::unique_ptr<MetricFamilyBuffer<QueueBuffer<>>>>
+  absl::flat_hash_map<std::string,
+                      std::unique_ptr<MetricFamilyBuffer<QueueBuffer<>>>>
       histograms_;
 };
 

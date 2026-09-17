@@ -30,8 +30,6 @@
 namespace tpu_raiden::telemetry {
 namespace {
 
-constexpr size_t kDefaultPrometheusStackBufferSize = 256;
-
 // Lightweight buffer writer that bounds-checks appends into a char span.
 class BufferWriter {
  public:
@@ -100,6 +98,28 @@ void SortLabels(
   absl::c_sort(out);
 }
 
+// Formats pre-sorted labels into Prometheus canonical format directly into
+// output_buffer without checking sort order.
+std::optional<absl::string_view> FormatSortedPrometheusLabelsToBuffer(
+    LabelSpan sorted_labels, absl::Span<char> output_buffer) {
+  if (sorted_labels.empty()) {
+    return absl::string_view(output_buffer.data(), 0);
+  }
+
+  BufferWriter writer(output_buffer);
+  if (!writer.Append('{')) return std::nullopt;
+  for (size_t i = 0; i < sorted_labels.size(); ++i) {
+    if (i > 0 && !writer.Append(',')) return std::nullopt;
+    const MetricLabel& label = sorted_labels[i];
+    if (!writer.Append(label.key) || !writer.Append("=\"") ||
+        !writer.AppendPrometheusEscaped(label.value) || !writer.Append('"')) {
+      return std::nullopt;
+    }
+  }
+  if (!writer.Append('}')) return std::nullopt;
+  return writer.view();
+}
+
 // Returns the byte length of Prometheus label value after escaping ('\', '"',
 // '\n').
 size_t EscapedPrometheusValueLength(absl::string_view s) {
@@ -121,30 +141,6 @@ size_t ComputePrometheusLabelsSize(LabelSpan labels) {
              EscapedPrometheusValueLength(labels[i].value) + 1 /* '"' */;
   }
   return total;
-}
-
-// Generic 2-stage stack-to-heap allocation fallback orchestrator.
-template <size_t StackBufferSize, typename SizeFn, typename BufferFormatFn>
-std::string FormatWithStackBufferFallback(LabelSpan labels, SizeFn size_fn,
-                                          BufferFormatFn format_fn) {
-  if (labels.empty()) return "";
-
-  char stack_buffer[StackBufferSize];
-  if (std::optional<absl::string_view> formatted =
-          format_fn(labels, absl::MakeSpan(stack_buffer));
-      formatted.has_value()) {
-    return std::string(*formatted);
-  }
-
-  // Exact-size dynamic fallback for label sets exceeding stack buffer.
-  std::string result(size_fn(labels), '\0');
-  std::optional<absl::string_view> formatted =
-      format_fn(labels, absl::MakeSpan(result));
-  if (!formatted.has_value()) {
-    return "";
-  }
-  result.resize(formatted->size());
-  return result;
 }
 
 }  // namespace
@@ -233,7 +229,16 @@ std::optional<absl::string_view> FormatPrometheusLabelsToBuffer(
     return absl::string_view(output_buffer.data(), 0);
   }
 
-  BufferWriter writer(output_buffer);
+  absl::InlinedVector<MetricLabel, kDefaultInlinedLabelCapacity> sorted;
+  if (!absl::c_is_sorted(labels)) {
+    SortLabels(labels, sorted);
+    labels = sorted;
+  }
+  return FormatSortedPrometheusLabelsToBuffer(labels, output_buffer);
+}
+
+PrometheusLabelView::PrometheusLabelView(LabelSpan labels) {
+  if (labels.empty()) return;
 
   absl::InlinedVector<MetricLabel, kDefaultInlinedLabelCapacity> sorted;
   if (!absl::c_is_sorted(labels)) {
@@ -241,22 +246,21 @@ std::optional<absl::string_view> FormatPrometheusLabelsToBuffer(
     labels = sorted;
   }
 
-  if (!writer.Append('{')) return std::nullopt;
-  for (size_t i = 0; i < labels.size(); ++i) {
-    if (i > 0 && !writer.Append(',')) return std::nullopt;
-    const MetricLabel& label = labels[i];
-    if (!writer.Append(label.key) || !writer.Append("=\"") ||
-        !writer.AppendPrometheusEscaped(label.value) || !writer.Append('"')) {
-      return std::nullopt;
+  auto formatted =
+      FormatSortedPrometheusLabelsToBuffer(labels, absl::MakeSpan(stack_buf_));
+  if (formatted.has_value()) {
+    view_ = *formatted;
+  } else {
+    heap_fallback_.resize(ComputePrometheusLabelsSize(labels));
+    auto heap_formatted = FormatSortedPrometheusLabelsToBuffer(
+        labels, absl::MakeSpan(heap_fallback_));
+    if (heap_formatted.has_value()) {
+      heap_fallback_.resize(heap_formatted->size());
+      view_ = heap_fallback_;
+    } else {
+      heap_fallback_.clear();
     }
   }
-  if (!writer.Append('}')) return std::nullopt;
-  return writer.view();
-}
-
-std::string FormatPrometheusLabels(LabelSpan labels) {
-  return FormatWithStackBufferFallback<kDefaultPrometheusStackBufferSize>(
-      labels, ComputePrometheusLabelsSize, FormatPrometheusLabelsToBuffer);
 }
 
 }  // namespace tpu_raiden::telemetry

@@ -35,8 +35,9 @@ class BroadcastEngine:
     self._worker_rpc_client = worker_rpc_client
     self._remote_client_factory = remote_controller_client_factory
 
-  @staticmethod
+  @classmethod
   def partition_direct_and_broadcast_groups(
+      cls,
       groups: dict[tuple[Any, ...], list[tuple[Any, ...]]],
       broadcast_k: int,
       group_size: int = 1,

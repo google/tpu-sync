@@ -19,6 +19,15 @@ load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "transport_metrics",
+    hdrs = ["transport_metrics.h"],
+    deps = [
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+cc_library(
     name = "transport_types",
     hdrs = ["transport_types.h"],
 )

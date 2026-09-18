@@ -38,6 +38,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
 #include "absl/types/span.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -62,14 +63,26 @@ using ::tpu_raiden::telemetry::RaidenMetricStore;
 namespace metric_labels = ::tpu_raiden::telemetry::metric_labels;
 namespace metric_names = ::tpu_raiden::telemetry::metric_names;
 
-constexpr MetricLabel kPushLabels[] = {
-    {.key = metric_labels::kDirection, .value = metric_labels::kDirectionPush},
-};
-
 constexpr MetricLabel kPullResponseLabels[] = {
     {.key = metric_labels::kDirection,
      .value = metric_labels::kDirectionPullResponse},
 };
+
+std::string ExtractIpFromEndpoint(absl::string_view endpoint) {
+  if (endpoint.empty()) return "unknown";
+  if (endpoint.front() == '[') {
+    size_t close_pos = endpoint.find(']');
+    if (close_pos != absl::string_view::npos && close_pos > 1) {
+      return std::string(endpoint.substr(1, close_pos - 1));
+    }
+  }
+  size_t colon_pos = endpoint.find(':');
+  if (colon_pos != absl::string_view::npos &&
+      endpoint.find(':', colon_pos + 1) == absl::string_view::npos) {
+    return std::string(endpoint.substr(0, colon_pos));
+  }
+  return std::string(endpoint);
+}
 
 absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
   if (on_complete) {
@@ -209,6 +222,10 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
     absl::Span<const std::string> peers, absl::Span<const Request> requests,
     absl::Span<const int> src_block_ids, absl::Span<const int> dst_block_ids,
     CompletionCallback on_complete) {
+  if (peers.empty()) {
+    return ReportError(
+        on_complete, absl::InvalidArgumentError("peers list cannot be empty"));
+  }
   const size_t num_blocks = src_block_ids.size();
   const auto& req = requests.front();
   const uint64_t uuid = req.uuid;
@@ -257,7 +274,8 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
     auto task_run = [this, i, remote_peer, local_ip, block_offset,
                      shared_requests, stream_requests, shared_src_block_ids,
                      shared_dst_block_ids, allocated_ids, statuses,
-                     remaining_workers, shared_on_complete]() {
+                     remaining_workers, shared_on_complete,
+                     push_start_ns = absl::GetCurrentTimeNanos()]() {
       (*statuses)[i] = PostSocketPushInternal(
           remote_peer, local_ip, stream_requests, *shared_src_block_ids,
           *shared_dst_block_ids, block_offset, *allocated_ids);
@@ -269,6 +287,21 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
             final_status = s;
             break;
           }
+        }
+        if (final_status.ok()) {
+          const double dur_ms = std::max(
+              0.0, (absl::GetCurrentTimeNanos() - push_start_ns) / 1e6);
+          const auto local_ips = raw_transport_->local_ips();
+          const std::string src_ip = ExtractIpFromEndpoint(
+              !local_ip.empty() ? local_ip
+                                : (local_ips.empty() ? "" : local_ips[0]));
+          const std::string dst_ip = ExtractIpFromEndpoint(remote_peer);
+          const MetricLabel p2p_labels[] = {
+              {metric_labels::kSrcIp, src_ip},
+              {metric_labels::kDstIp, dst_ip},
+          };
+          RaidenMetricStore::GetGlobalMetricStore().ObserveHistogram(
+              metric_names::kP2pTransferTimeMs, p2p_labels, dur_ms);
         }
         if (*shared_on_complete) {
           if (!final_status.ok()) {
@@ -406,15 +439,25 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
     }
   }
 
-  if (stream_bytes_sent > 0) {
-    RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
-        metric_names::kSentBytesTotal, kPushLabels, stream_bytes_sent);
-  }
-
   uint8_t ack = 0;
   s = ReadExact(fd, &ack, 1);
   if (!s.ok() || ack != 1) {
     return absl::InternalError("Push verification failed");
+  }
+
+  if (stream_bytes_sent > 0) {
+    const auto local_ips = raw_transport_->local_ips();
+    const std::string src_ip = ExtractIpFromEndpoint(
+        !local_ip.empty() ? local_ip
+                          : (local_ips.empty() ? "" : local_ips[0]));
+    const std::string dst_ip = ExtractIpFromEndpoint(peer);
+    const MetricLabel labels[] = {
+        {metric_labels::kDirection, metric_labels::kDirectionPush},
+        {metric_labels::kSrcIp, src_ip},
+        {metric_labels::kDstIp, dst_ip},
+    };
+    RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
+        metric_names::kSentBytesTotal, labels, stream_bytes_sent);
   }
 
   ok_to_pool = true;
@@ -438,6 +481,8 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPull(
     return ReportError(on_complete, absl::InvalidArgumentError(
                                         "parallelism must be positive"));
   }
+
+  const int64_t pull_start_ns = absl::GetCurrentTimeNanos();
 
   std::vector<std::thread> threads;
   std::vector<absl::Status> statuses(P, absl::OkStatus());
@@ -482,6 +527,19 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPull(
       return ReportError(on_complete, statuses[i]);
     }
   }
+
+  const double dur_ms =
+      std::max(0.0, (absl::GetCurrentTimeNanos() - pull_start_ns) / 1e6);
+  const auto local_ips = raw_transport_->local_ips();
+  const std::string src_ip = ExtractIpFromEndpoint(peers[0]);
+  const std::string dst_ip =
+      ExtractIpFromEndpoint(local_ips.empty() ? "" : local_ips[0]);
+  const MetricLabel p2p_labels[] = {
+      {metric_labels::kSrcIp, src_ip},
+      {metric_labels::kDstIp, dst_ip},
+  };
+  RaidenMetricStore::GetGlobalMetricStore().ObserveHistogram(
+      metric_names::kP2pTransferTimeMs, p2p_labels, dur_ms);
 
   if (on_complete) {
     on_complete(std::vector<int>{});

@@ -374,8 +374,7 @@ class BlockTransportTest : public ::testing::TestWithParam<bool> {
     servers_.clear();
   }
 
-  std::shared_ptr<grpc::Channel> StartControlServer(
-      BlockTransport* transport) {
+  std::shared_ptr<grpc::Channel> StartControlServer(BlockTransport* transport) {
     grpc::ServerBuilder builder;
     builder.RegisterService(transport->peregrine_control_service());
     std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
@@ -516,8 +515,7 @@ TEST_P(BlockTransportTest, PullNonContiguous) {
   EXPECT_EQ(delegate2.block_data(1)[size - 1], 0xCC);
 }
 
-TEST_P(BlockTransportTest,
-       PullExplicitDestPtrsMultiLayerUnevenParallelism) {
+TEST_P(BlockTransportTest, PullExplicitDestPtrsMultiLayerUnevenParallelism) {
   constexpr size_t kSliceSize = 16;
   constexpr int kNumBlocks = 3;
   constexpr size_t kNumLayers = 2;
@@ -614,13 +612,12 @@ TEST_P(BlockTransportTest, PullSupportsBlockMajorOrder) {
     EXPECT_EQ(receiver.block_data(block, 1)[0], 0x20 + block);
   }
 
-  EXPECT_EQ(source.wait_events(),
-            (std::vector<std::tuple<size_t, size_t, int>>{
-                std::make_tuple(0, 0, 0),
-                std::make_tuple(1, 0, 0),
-                std::make_tuple(0, 0, 1),
-                std::make_tuple(1, 0, 1),
-            }));
+  EXPECT_EQ(source.wait_events(), (std::vector<std::tuple<size_t, size_t, int>>{
+                                      std::make_tuple(0, 0, 0),
+                                      std::make_tuple(1, 0, 0),
+                                      std::make_tuple(0, 0, 1),
+                                      std::make_tuple(1, 0, 1),
+                                  }));
 }
 
 TEST_P(BlockTransportTest, SamePeerFanoutFiltersEachDestinationStream) {
@@ -1027,9 +1024,14 @@ TEST_P(BlockTransportTest, SentBytesTelemetryIncrementedOnPushAndPull) {
   ABSL_ASSERT_OK(push_res);
 
   constexpr absl::string_view kExpectedPushMetric =
-      "tpu_raiden_sent_bytes_total{direction=\"push\"} 1024";
+      "tpu_raiden_sent_bytes_total{direction=\"push\",dst_ip=\"localhost\","
+      "src_ip=\"unknown\"} 1024";
   const std::string snapshot1 = WaitForMetricSnapshot(kExpectedPushMetric);
   EXPECT_THAT(snapshot1, HasSubstr(kExpectedPushMetric));
+  EXPECT_THAT(
+      snapshot1,
+      HasSubstr("tpu_raiden_p2p_transfer_time_ms_count{dst_ip=\"localhost\","
+                "src_ip=\"unknown\"} 1"));
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto pull_res,
@@ -1040,10 +1042,15 @@ TEST_P(BlockTransportTest, SentBytesTelemetryIncrementedOnPushAndPull) {
                           /*on_block_received=*/{}, /*uuid=*/0));
 
   constexpr absl::string_view kExpectedPullResponseMetric =
-      "tpu_raiden_sent_bytes_total{direction=\"pull_response\"} 1024";
+      "tpu_raiden_sent_bytes_total{direction=\"pull_response\",dst_ip=\"::1\","
+      "src_ip=\"::1\"} 1024";
   const std::string snapshot2 =
       WaitForMetricSnapshot(kExpectedPullResponseMetric);
   EXPECT_THAT(snapshot2, HasSubstr(kExpectedPullResponseMetric));
+  EXPECT_THAT(
+      snapshot2,
+      HasSubstr("tpu_raiden_p2p_transfer_time_ms_count{dst_ip=\"unknown\","
+                "src_ip=\"localhost\"} 1"));
 }
 
 TEST_P(BlockTransportTest, ReceivedBytesTelemetryIncrementedOnPushAndPull) {
@@ -1084,9 +1091,7 @@ TEST_P(BlockTransportTest, ReceivedBytesTelemetryIncrementedOnPushAndPull) {
       "tpu_raiden_received_bytes_total{direction=\"pull_response\"} 1024";
   const std::string snapshot2 =
       WaitForMetricSnapshot(kExpectedPullResponseMetric);
-  EXPECT_THAT(
-      snapshot2,
-      HasSubstr("tpu_raiden_received_bytes_total{direction=\"push\"} 1024"));
+  EXPECT_THAT(snapshot2, HasSubstr(kExpectedPushMetric));
   EXPECT_THAT(snapshot2, HasSubstr(kExpectedPullResponseMetric));
 }
 
@@ -1155,8 +1160,7 @@ TEST_P(BlockTransportTest, TransferFailuresTelemetryPushTransferFailure) {
   EXPECT_THAT(WaitForMetricSnapshot(kExpectedError), HasSubstr(kExpectedError));
 }
 
-TEST_P(BlockTransportTest,
-       TransferFailuresTelemetryPushBufferAndPushBuffers) {
+TEST_P(BlockTransportTest, TransferFailuresTelemetryPushBufferAndPushBuffers) {
   ScopedPrometheusBackend scoped_telemetry;
 
   constexpr size_t kSize = 1024;
@@ -1358,8 +1362,7 @@ TEST_P(BlockTransportTest, MultiShardPushBlockMajor) {
 
   BlockTransport sender(&sender_delegate, 0);
   BlockTransport receiver(&receiver_delegate, 0);
-  BindControlChannels(&sender, &sender_delegate, &receiver,
-                      &receiver_delegate);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
 
   ABSL_ASSERT_OK(
       sender.SyncPush({absl::StrCat("localhost:", receiver.local_port())},
@@ -1402,8 +1405,7 @@ TEST_P(BlockTransportTest, MultiShardPushLayerMajor) {
 
   BlockTransport sender(&sender_delegate, 0);
   BlockTransport receiver(&receiver_delegate, 0);
-  BindControlChannels(&sender, &sender_delegate, &receiver,
-                      &receiver_delegate);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
 
   ABSL_ASSERT_OK(
       sender.SyncPush({absl::StrCat("localhost:", receiver.local_port())},
@@ -1446,8 +1448,7 @@ TEST_P(BlockTransportTest, MultiShardPullBlockMajor) {
 
   BlockTransport sender(&sender_delegate, 0);
   BlockTransport receiver(&receiver_delegate, 0);
-  BindControlChannels(&sender, &sender_delegate, &receiver,
-                      &receiver_delegate);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
 
   ABSL_ASSERT_OK(receiver.SyncPull(
       {absl::StrCat("localhost:", sender.local_port())},
@@ -1490,8 +1491,7 @@ TEST_P(BlockTransportTest, MultiShardPullLayerMajor) {
 
   BlockTransport sender(&sender_delegate, 0);
   BlockTransport receiver(&receiver_delegate, 0);
-  BindControlChannels(&sender, &sender_delegate, &receiver,
-                      &receiver_delegate);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
 
   ABSL_ASSERT_OK(receiver.SyncPull(
       {absl::StrCat("localhost:", sender.local_port())},
@@ -1573,11 +1573,10 @@ TEST_P(BlockTransportTest, PollEINTRIsBenign) {
   ABSL_EXPECT_OK(push_res) << push_res.message();
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    PspAndPlainTcp, BlockTransportTest, ::testing::Bool(),
-    [](const ::testing::TestParamInfo<bool>& info) {
-      return info.param ? "PSP" : "PlainTcp";
-    });
+INSTANTIATE_TEST_SUITE_P(PspAndPlainTcp, BlockTransportTest, ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                           return info.param ? "PSP" : "PlainTcp";
+                         });
 
 }  // namespace
 }  // namespace transport

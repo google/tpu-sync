@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -40,5 +40,60 @@ cc_library(
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
         "@xla//xla/tsl/concurrency:future",
+    ],
+)
+
+cc_library(
+    name = "tds_backend",
+    srcs = ["tds_backend.cc"],
+    hdrs = ["tds_backend.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_sync/core:numa_thread_pool",
+        "//tpu_sync/kv_cache/backends:backend",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+        "@xla//xla/tsl/platform:logging",
+    ],
+)
+
+cc_test(
+    name = "tds_backend_test",
+    srcs = ["tds_backend_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    deps = [
+        ":tds_backend",
+        "//tpu_sync/kv_cache/backends:backend",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
     ],
 )

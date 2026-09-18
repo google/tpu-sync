@@ -13,6 +13,7 @@
 # limitations under the License.
 
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -267,5 +268,31 @@ cc_test(
         "@com_google_absl//absl/strings",
         "@com_google_googletest//:gtest_main",
         "@xla//xla/tsl/platform:statusor",
+    ],
+)
+
+py_library(
+    name = "control_pipe_client",
+    srcs = ["control_pipe_client.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//net/proto2/python/public",
+        "//tpu_sync/proto:control_pipe_py_pb2",
+        "//tpu_sync/proto:control_pipe_py_pb2_grpc",
+        "@com_github_grpc_grpc//src/python/grpcio/grpc:grpcio",
+    ],
+)
+
+py_test(
+    name = "control_pipe_client_test",
+    srcs = ["control_pipe_client_test.py"],
+    deps = [
+        ":control_pipe_client",
+        "//net/grpc/python:use_insecure_channel_for_test",
+        "//tpu_sync/proto:control_pipe_py_pb2",
+        "//tpu_sync/proto:control_pipe_py_pb2_grpc",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
+        "@com_github_grpc_grpc//src/python/grpcio/grpc:grpcio",
+        "@com_google_absl_py//absl/testing:absltest",
     ],
 )

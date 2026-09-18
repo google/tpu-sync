@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/attributes.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -66,10 +67,44 @@ std::vector<std::pair<std::string, std::string>> ParseShmLabels(
 std::optional<absl::string_view> FormatPrometheusLabelsToBuffer(
     LabelSpan labels, absl::Span<char> output_buffer);
 
-// Owning std::string wrapper for non-critical paths, testing, and series
-// identification. Performs raw serialization without runtime key syntax
-// validation.
-std::string FormatPrometheusLabels(LabelSpan labels);
+// Default stack buffer capacity (in bytes) for formatted Prometheus labels,
+// sized to accommodate standard multi-label metric descriptors without heap
+// allocation.
+inline constexpr std::size_t kDefaultPrometheusStackBufferSize = 256;
+
+// Zero-allocation RAII stack buffer view for hot-path metric lookup.
+// Formats labels directly into an internal 256-byte stack buffer and provides
+// an absl::string_view for heterogeneous hash map lookup. Falls back to dynamic
+// heap allocation only if the formatted string exceeds 256 bytes.
+class PrometheusLabelView {
+ public:
+  explicit PrometheusLabelView(LabelSpan labels);
+
+  // Non-copyable and non-movable: holds internal pointers to stack_buf_ /
+  // heap_fallback_.
+  PrometheusLabelView(const PrometheusLabelView&) = delete;
+  PrometheusLabelView& operator=(const PrometheusLabelView&) = delete;
+  PrometheusLabelView(PrometheusLabelView&&) = delete;
+  PrometheusLabelView& operator=(PrometheusLabelView&&) = delete;
+
+  absl::string_view view() const ABSL_ATTRIBUTE_LIFETIME_BOUND { return view_; }
+
+  // Returns an owned string, moving the heap fallback if allocated or
+  // constructing from the stack buffer.
+  std::string ToOwned() && {
+    absl::string_view current_view = view_;
+    view_ = "";
+    if (!heap_fallback_.empty()) {
+      return std::move(heap_fallback_);
+    }
+    return std::string(current_view);
+  }
+
+ private:
+  char stack_buf_[kDefaultPrometheusStackBufferSize];
+  std::string heap_fallback_;
+  absl::string_view view_ = {};
+};
 
 // ============================================================================
 // Zero-Allocation Label Resolution for Fixed Schemas (Fixed-Arity)

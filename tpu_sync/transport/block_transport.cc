@@ -101,10 +101,22 @@ constexpr MetricLabel kPushLabels[] = {
     {.key = metric_labels::kDirection, .value = metric_labels::kDirectionPush},
 };
 
-constexpr MetricLabel kPullResponseLabels[] = {
-    {.key = metric_labels::kDirection,
-     .value = metric_labels::kDirectionPullResponse},
-};
+std::string ExtractHostIp(absl::string_view ip) {
+  if (ip.empty() || ip == "?" || ip == "*") return "unknown";
+  if (ip.front() == '[') {
+    const size_t close_bracket = ip.find(']');
+    if (close_bracket != absl::string_view::npos && close_bracket > 1) {
+      return std::string(ip.substr(1, close_bracket - 1));
+    }
+    return std::string(ip);
+  }
+  const size_t colon_pos = ip.find(':');
+  if (colon_pos != absl::string_view::npos &&
+      ip.find(':', colon_pos + 1) == absl::string_view::npos) {
+    return std::string(ip.substr(0, colon_pos));
+  }
+  return std::string(ip);
+}
 
 constexpr uint8_t kUseBlockChunksFlag = 0x80;
 
@@ -649,8 +661,29 @@ void BlockTransport::TriggerNextSendStep(
           if (total_size > 0) {
             // TODO: Add interface name (e.g. eth0, lo) using
             // GetSocketLocalNic(state->client_fd) as a label key.
+            const auto local_ips = raw_transport_.local_ips();
+            const std::string addr_pair =
+                peregrine::GetAddrPortPair(state->client_fd);
+            const size_t sep = addr_pair.find(" <> ");
+            const absl::string_view self_ep =
+                sep != std::string::npos
+                    ? absl::string_view(addr_pair).substr(0, sep)
+                    : absl::string_view();
+            const absl::string_view peer_ep =
+                sep != std::string::npos
+                    ? absl::string_view(addr_pair).substr(sep + 4)
+                    : absl::string_view();
+            const std::string local_ip_str =
+                ExtractHostIp(local_ips.empty() ? self_ep : local_ips[0]);
+            const std::string peer_ip = ExtractHostIp(peer_ep);
+            const MetricLabel pull_resp_labels[] = {
+                {metric_labels::kDirection,
+                 metric_labels::kDirectionPullResponse},
+                {metric_labels::kSrcIp, local_ip_str},
+                {metric_labels::kDstIp, peer_ip},
+            };
             RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
-                metric_names::kSentBytesTotal, kPullResponseLabels, total_size);
+                metric_names::kSentBytesTotal, pull_resp_labels, total_size);
           }
 
           state->current_step++;

@@ -87,24 +87,6 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
 
   ASSERT_THAT(buffer->GetReadyFuture().Await(), IsOk());
 
-  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
-  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
-  EXPECT_CALL(*raw_mock,
-              ObserveHistogram(telemetry::metric_names::kTransferDurationMs,
-                               IsEmpty(), Gt(0.0)))
-      .Times(1);
-  EXPECT_CALL(*raw_mock,
-              ObserveHistogram(telemetry::metric_names::kD2hTransferTimeMs,
-                               IsEmpty(), Gt(0.0)))
-      .Times(1);
-  EXPECT_CALL(*raw_mock,
-              ObserveHistogram(telemetry::metric_names::kH2dTransferTimeMs,
-                               IsEmpty(), Gt(0.0)))
-      .Times(1);
-  // Register mock backend
-  telemetry::ScopedMetricsBackendReset scoped_metrics_reset(
-      std::move(mock_backend));
-
   // Create KVCacheManagerWithTransfer
   auto handle_or = raiden::RaidenBufferHandle::Acquire(buffer.get());
   std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
@@ -121,6 +103,46 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
       /*max_blocks=*/2,
       /*num_slots=*/2,
       /*timeout_s=*/10.0);
+
+  const std::string expected_ip = engine->local_ip();
+  const telemetry::MetricLabel pcie_labels[] = {
+      {telemetry::metric_labels::kHostIp, expected_ip},
+      {telemetry::metric_labels::kLocalRank, "0"}};
+  const uint64_t expected_bytes =
+      static_cast<uint64_t>(engine->LayerBlockByteSize(0));
+
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  EXPECT_CALL(*raw_mock, IncrementCounter(testing::_, testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*raw_mock, ObserveHistogram(testing::_, testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*raw_mock,
+              ObserveHistogram(telemetry::metric_names::kTransferDurationMs,
+                               IsEmpty(), Gt(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
+              ObserveHistogram(telemetry::metric_names::kD2hTransferTimeMs,
+                               testing::ElementsAreArray(pcie_labels), Gt(0.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(telemetry::metric_names::kD2hBytesTotal,
+                       testing::ElementsAreArray(pcie_labels), expected_bytes))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
+              ObserveHistogram(telemetry::metric_names::kH2dTransferTimeMs,
+                               testing::ElementsAreArray(pcie_labels), Gt(0.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(telemetry::metric_names::kH2dBytesTotal,
+                       testing::ElementsAreArray(pcie_labels), expected_bytes))
+      .Times(1);
+  // Register mock backend
+  telemetry::ScopedMetricsBackendReset scoped_metrics_reset(
+      std::move(mock_backend));
 
   // Configure staging slots: 2 slots, max 2 blocks per slot
   ASSERT_THAT(engine->ConfigureHostStagingSlots(2, 2), IsOk());

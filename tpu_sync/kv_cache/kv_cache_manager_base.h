@@ -756,6 +756,14 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Initializes background worker thread if RAIDEN_ENABLE_ASYNC_DISPATCH is
   // enabled.
   void InitBackgroundWorker();
+
+  uint64_t ComputeBytesPerShard(
+      bool is_partial, absl::Span<const int64_t> sizes_c,
+      std::optional<size_t> target_layer_idx = std::nullopt) const;
+  raiden::PjRtCopyFuture JoinAndRecordTelemetry(
+      absl::Span<const raiden::PjRtCopyFuture> futures, absl::Time start_time,
+      bool is_h2d, uint64_t bytes_per_shard,
+      std::optional<size_t> single_shard_idx = std::nullopt) const;
 };
 
 }  // namespace kv_cache

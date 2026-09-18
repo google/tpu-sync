@@ -92,3 +92,81 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "control_pipe_interfaces",
+    hdrs = [
+        "control_pipe_client.h",
+        "control_pipe_server.h",
+    ],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":control_dispatcher",
+        ":control_pipe_types",
+        "//tpu_sync/proto:control_pipe_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_library(
+    name = "tcp_control_pipe",
+    srcs = ["tcp_control_pipe.cc"],
+    hdrs = ["tcp_control_pipe.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":control_dispatcher",
+        ":control_pipe_interfaces",
+        ":control_pipe_types",
+        "//tpu_sync/proto:control_pipe_cc_proto",
+        "//tpu_sync/proto:kv_cache_control_plane_service_cc_proto",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_test(
+    name = "tcp_control_pipe_test",
+    srcs = ["tcp_control_pipe_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":control_dispatcher",
+        ":control_pipe_types",
+        ":tcp_control_pipe",
+        "//tpu_sync/proto:kv_cache_control_plane_service_cc_proto",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/platform:statusor",
+    ],
+)

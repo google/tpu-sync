@@ -170,3 +170,102 @@ cc_test(
         "@xla//xla/tsl/platform:statusor",
     ],
 )
+
+cc_library(
+    name = "grpc_control_pipe",
+    srcs = ["grpc_control_pipe.cc"],
+    hdrs = ["grpc_control_pipe.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":control_dispatcher",
+        ":control_pipe_interfaces",
+        ":control_pipe_types",
+        "//tpu_sync/proto:control_pipe_cc_grpc",
+        "//tpu_sync/proto:control_pipe_cc_proto",
+        "//tpu_sync/proto:kv_cache_control_plane_service_cc_grpc",
+        "//tpu_sync/proto:kv_cache_control_plane_service_cc_proto",
+        "//tpu_sync/rpc:raiden_service_cc_grpc",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_library(
+    name = "control_pipe",
+    srcs = ["control_pipe_factory.cc"],
+    hdrs = [
+        "control_dispatcher.h",
+        "control_pipe_client.h",
+        "control_pipe_server.h",
+        "control_pipe_types.h",
+    ],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":control_dispatcher",
+        ":control_pipe_interfaces",
+        ":control_pipe_types",
+        ":grpc_control_pipe",
+        ":tcp_control_pipe",
+        "//tpu_sync/proto:control_pipe_cc_proto",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_test(
+    name = "control_pipe_test",
+    srcs = ["control_pipe_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    deps = [
+        ":control_dispatcher",
+        ":control_pipe",
+        ":control_pipe_types",
+        "//tpu_sync/proto:control_pipe_cc_grpc",
+        "//tpu_sync/proto:control_pipe_cc_proto",
+        "//tpu_sync/proto:kv_cache_control_plane_service_cc_grpc",
+        "//tpu_sync/proto:kv_cache_control_plane_service_cc_proto",
+        "//tpu_sync/rpc:raiden_service_cc_grpc",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/platform:statusor",
+    ],
+)

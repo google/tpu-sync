@@ -26,6 +26,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
+#include "tpu_sync/transport/peregrine/src/api/transport_metrics.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -84,6 +85,10 @@ class TransportAdapter {
       CompletionCallback on_complete = nullptr) = 0;
 
   virtual absl::StatusOr<Status> Poll(Handle handle) = 0;
+
+  virtual ::peregrine::TransportMetrics GetTransportMetrics() const {
+    return {};
+  }
 };
 
 }  // namespace lib

@@ -108,7 +108,11 @@ HostOffloadBackend::~HostOffloadBackend() { Shutdown(); }
 
 void HostOffloadBackend::Shutdown() {
   {
-    absl::MutexLock lock(lifetime_->mu);
+    // Completions hold lifetime_->mu in shared (ReaderMutexLock) mode so
+    // concurrent Save/Load continuations do not serialize against each other;
+    // taking the exclusive WriterMutexLock here waits for all in-flight
+    // completions to finish before KVCacheStore destroys its borrowed objects.
+    absl::WriterMutexLock lock(lifetime_->mu);
     lifetime_->is_alive = false;
   }
   if (KVCacheStoreServer* server = store_server(); server != nullptr) {
@@ -1157,7 +1161,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
               fetch_response) mutable {
         tsl::Future<> h2d_future;
         {
-          absl::MutexLock lock(lifetime->mu);
+          absl::ReaderMutexLock lock(lifetime->mu);
           if (!lifetime->is_alive) {
             load_promise.Set(absl::CancelledError("Backend destroyed"));
             return;
@@ -1207,7 +1211,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
                             hashes = std::move(hashes), load_tracker,
                             load_promise = std::move(load_promise)](
                                absl::Status status) mutable {
-          absl::MutexLock lock(lifetime->mu);
+          absl::ReaderMutexLock lock(lifetime->mu);
           if (!lifetime->is_alive) {
             load_promise.Set(absl::CancelledError("Backend destroyed"));
             return;
@@ -1302,7 +1306,7 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
                                                      device_block_ids.end()),
                       load_tracker, promise = std::move(promise)](
                          absl::Status status) mutable {
-    absl::MutexLock lifetime_lock(lifetime->mu);
+    absl::ReaderMutexLock lifetime_lock(lifetime->mu);
     if (!lifetime->is_alive) {
       promise.Set(absl::CancelledError("Backend destroyed"));
       return;
@@ -1389,7 +1393,7 @@ tsl::Future<> HostOffloadBackend::Save(
                                            dst_host_block_ids.end()),
        save_tracker,
        save_promise = std::move(save_promise)](absl::Status status) mutable {
-        absl::MutexLock lifetime_lock(lifetime->mu);
+        absl::ReaderMutexLock lifetime_lock(lifetime->mu);
         if (!lifetime->is_alive) {
           save_promise.Set(absl::CancelledError("Backend destroyed"));
           return;

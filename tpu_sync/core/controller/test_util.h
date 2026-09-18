@@ -44,6 +44,7 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache/backends/storage/tds_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 
 namespace tpu_raiden {
@@ -214,20 +215,29 @@ struct MockTransferManager {
   void RegisterKVBackends(
       absl::Span<const kv_cache::BackendConfig> backend_configs) {
     for (const auto& cfg : backend_configs) {
-      if (!absl::EqualsIgnoreCase(
-              cfg.type, kv_cache::backends::storage::kPosixBackendName)) {
+      const bool is_posix = absl::EqualsIgnoreCase(
+          cfg.type, kv_cache::backends::storage::kPosixBackendName);
+      const bool is_tds = absl::EqualsIgnoreCase(
+          cfg.type, kv_cache::backends::storage::kTdsBackendName);
+      if (!is_posix && !is_tds) {
         continue;
       }
       if (cfg.parallelism.tp_rank < 0) continue;
       const std::string canonical_name =
-          std::string(kv_cache::backends::storage::kPosixBackendName);
+          std::string(is_tds ? kv_cache::backends::storage::kTdsBackendName
+                             : kv_cache::backends::storage::kPosixBackendName);
       if (GetKVBackend(canonical_name) != nullptr) continue;
       auto props = cfg.properties;
       props["tp_rank"] = absl::StrCat(cfg.parallelism.tp_rank);
-      auto backend =
-          std::make_shared<kv_cache::backends::storage::PosixKVBackend>(
-              canonical_name, props);
-      backends[canonical_name] = std::move(backend);
+      if (is_tds) {
+        backends[canonical_name] =
+            std::make_shared<kv_cache::backends::storage::TdsKVBackend>(
+                canonical_name, props);
+      } else {
+        backends[canonical_name] =
+            std::make_shared<kv_cache::backends::storage::PosixKVBackend>(
+                canonical_name, props);
+      }
     }
   }
 

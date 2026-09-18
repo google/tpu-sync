@@ -64,6 +64,7 @@ fi
 if [ "$RUN_TORCH" = true ]; then
   echo "=== Running Torch Python Unit Tests ==="
   python "${WORKSPACE_DIR}/tpu_sync/frameworks/torch/kv_cache_manager_test.py"
+  python "${WORKSPACE_DIR}/tpu_sync/frameworks/torch/torch_raw_transfer_test.py"
   python "${WORKSPACE_DIR}/tpu_sync/api/torch/kv_cache_manager_host_test.py"
   python "${WORKSPACE_DIR}/tpu_sync/api/torch/kv_cache_manager_test.py"
   python "${WORKSPACE_DIR}/tpu_sync/api/torch/kv_cache_store_test.py"

@@ -22,6 +22,8 @@ import re
 
 import torch_tpu
 
+from tpu_sync.api.torch import torch_abi
+
 _torch_tpu_loader = importlib.import_module("torch_tpu._loader")
 
 
@@ -35,15 +37,29 @@ def load_torch_tpu_common() -> None:
     return
 
   _torch_tpu_loader.load()
-  common = pathlib.Path(torch_tpu.__file__).resolve().parent / "common"
-  lib = common / "libpywrap_torch_tpu_common.so"
-  if not lib.exists():
-    # Per-torch-version glue layout: common/glue_<v>/libpywrap_<v>_common.so.
+  # Wheel layout keeps the common library under torch_tpu/common/; a source
+  # checkout / bazel runfiles tree keeps it at its build location,
+  # torch_tpu/csrc/common/ (upstream source-layout consolidation). Probe the
+  # package path both as imported and fully resolved: bazel runfiles are
+  # symlink farms whose resolve() escapes to the source tree, where build
+  # outputs do not exist.
+  raw_pkg = pathlib.Path(torch_tpu.__file__).parent
+  pkgs = [raw_pkg]
+  if raw_pkg.resolve() != raw_pkg:
+    pkgs.append(raw_pkg.resolve())
+  commons = [p / "common" for p in pkgs]
+  commons += [p / "csrc" / "common" for p in pkgs]
+  lib = None
+  source_layout = False
+  for common in commons:
+    candidate = common / "libpywrap_torch_tpu_common.so"
+    if candidate.exists():
+      lib = candidate
+      source_layout = common.name == "common" and common.parent.name == "csrc"
+      break
+    # Per-torch-version glue layout: .../glue_<v>/libpywrap_<v>_common.so.
     # Load the glue matching the installed torch; its SONAME is what the
     # raiden extension's NEEDED entry names.
-    # pylint: disable=g-import-not-at-top
-    from tpu_sync.api.torch import torch_abi
-    # pylint: enable=g-import-not-at-top
     built = [
         m.group(1)
         for d in common.glob("glue_*")
@@ -52,6 +68,13 @@ def load_torch_tpu_common() -> None:
     if built:
       suffix = torch_abi.resolve_suffix(torch_abi.running_torch_suffix(), built)
       lib = common / f"glue_{suffix}" / f"libpywrap_{suffix}_common.so"
-  if lib.exists():
+      break
+  del source_layout  # Layouts differ only in where the library was found.
+  if lib is not None and lib.exists():
+    # RTLD_LOCAL on purpose: the extension reaches this library through its
+    # own NEEDED entry (ld.so reuses the already-loaded object by soname), so
+    # nothing here needs to enter the global scope. Loading it globally would
+    # let its gRPC/XLA copies preempt the extension's statically linked ones
+    # (shared registries, duplicate registrations, abort).
     ctypes.CDLL(str(lib), mode=os.RTLD_LOCAL | os.RTLD_NOW)
   _LOADED = True

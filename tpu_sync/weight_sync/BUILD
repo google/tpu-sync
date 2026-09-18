@@ -257,3 +257,24 @@ py_test(
         "@com_google_absl_py//absl/testing:absltest",
     ],
 )
+
+py_library(
+    name = "broadcast_engine",
+    srcs = ["broadcast_engine.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_sync/api:common",
+        "@com_google_absl_py//absl/logging",
+    ],
+)
+
+py_test(
+    name = "broadcast_engine_test",
+    srcs = ["broadcast_engine_test.py"],
+    deps = [
+        ":broadcast_engine",
+        "//tpu_sync/api:common",
+        "//tpu_sync/rpc:raiden_controller",
+        "@com_google_absl_py//absl/testing:absltest",
+    ],
+)

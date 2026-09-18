@@ -19,7 +19,6 @@ from collections import abc
 import concurrent.futures
 import dataclasses
 import enum
-import functools
 import math
 import os
 import random
@@ -35,6 +34,9 @@ from tpu_sync.api.common import RaidenId
 from tpu_sync.kv_cache import nd_slice_math
 from tpu_sync.rpc import controller_service_pb2
 from tpu_sync.rpc import raiden_service_pb2
+from tpu_sync.weight_sync.broadcast_engine import (
+    BroadcastEngine,
+)
 
 
 @dataclasses.dataclass
@@ -1505,6 +1507,10 @@ class RaidenController:
       raise ValueError("request_registry_ttl_s must be positive")
     self._request_registry_ttl_s = request_registry_ttl_s
     self.worker_rpc_client = worker_rpc_client or WorkerRpcClient()
+    self._broadcast_engine = BroadcastEngine(
+        self.worker_rpc_client,
+        remote_controller_client_factory=RaidenControllerClientFacade,
+    )
     self._registered_variables = {}
     self._registered_control_plane_endpoints: dict[RaidenId, list[str]] = {}
     self._registered_host_subgrids: dict[RaidenId, list[int]] = {}
@@ -2402,89 +2408,11 @@ class RaidenController:
           )
           groups.setdefault(key, []).append(val)
 
-    # Partition slices into direct transfers and tree-broadcast
-    # transfers.
-    direct_schedules = {}
-    broadcast_groups = {}
-
-    # Group broadcast tasks by routing compatibility and layer_group_idx
-    for key, targets in groups.items():
-      unique_dst_units = set(t[0] for t in targets)
-      is_tree_broadcast = (
-          len(unique_dst_units) > 1 and len(unique_dst_units) > self.broadcast_k
-      )
-      if not is_tree_broadcast:
-        # Re-assemble entry for flat schedule (direct transfer)
-        (
-            src_unit,
-            shard_idx,
-            src_block_id,
-            src_block_offset,
-            size,
-            src_stride,
-            count,
-            layer_idx,
-            pool_group,
-        ) = key
-        for (
-            dst_unit,
-            dst_peer,
-            dst_shard_idx,
-            dst_block_id,
-            dst_block_offset,
-            dst_stride,
-        ) in targets:
-          entry = (
-              dst_peer,
-              dst_shard_idx,
-              dst_block_offset,
-              src_block_offset,
-              size,
-              src_block_id,
-              dst_block_id,
-              src_stride,
-              dst_stride,
-              count,
-              layer_idx,
-              pool_group,
-          )
-          direct_schedules.setdefault(src_unit, {}).setdefault(
-              shard_idx, []
-          ).append(entry)
-      else:
-        (
-            src_unit,
-            shard_idx,
-            src_block_id,
-            src_block_offset,
-            size,
-            src_stride,
-            count,
-            layer_idx,
-            pool_group,
-        ) = key
-
-        layer_group_idx = (
-            layer_idx // group_size if group_size > 1 else layer_idx
+    direct_schedules, broadcast_groups = (
+        BroadcastEngine.partition_direct_and_broadcast_groups(
+            groups, self.broadcast_k, group_size
         )
-
-        # Routing key: same src_unit, shard_idx, pool_group,
-        # layer_group_idx and same set of destination units
-        # Sort targets by dst_peer to ensure consistent order.
-        # Compatibility key includes dst_unit, dst_peer, and
-        # dst_shard_idx to ensure identical routing and shard mapping
-        # at all hops.
-        sorted_targets = sorted(targets, key=lambda t: t[1])
-        targets_routing_key = tuple((t[0], t[1], t[2]) for t in sorted_targets)
-
-        group_key = (
-            src_unit,
-            shard_idx,
-            pool_group,
-            layer_group_idx,
-            targets_routing_key,
-        )
-        broadcast_groups.setdefault(group_key, []).append((key, targets))
+    )
 
     dst_unit_counts = {}
     dst_unit_layer_counts = {}
@@ -2655,257 +2583,17 @@ class RaidenController:
       dst_controller_address: Optional[str],
       src_controller_address: Optional[str] = None,
   ) -> None:
-    """Executes a pipelined tree broadcast for a group of variables.
-
-    This method builds and executes a broadcast tree to distribute a group of
-    variables (represented by keys_and_targets) from a single source unit to
-    multiple destination units. It uses a greedy tree-building algorithm where
-    nodes that have received the data (destination units) are promoted to act as
-    new source nodes (available_sources) for subsequent hops, limited by the
-    maximum fanout (fanout_k).
-
-    The broadcast is pipelined such that the transfer for all variables in the
-    group targeting a specific destination unit is bundled into a single
-    TransferPlan (sub-schedule) per hop, minimizing coordination overhead.
-
-    Args:
-      keys_and_targets: A list of tuples, where each tuple contains: - key: A
-        tuple describing the source slice metadata: (src_unit, shard_idx,
-        src_block_id, src_block_offset, size, src_stride, count, layer_idx,
-        pool_group) - targets: A list of tuples, where each tuple describes a
-        target device: (dst_unit, dst_peer, dst_shard_idx, dst_block_id,
-        dst_block_offset, dst_stride)
-      final_plan: The parent TransferPlan containing global configurations like
-        worker RPC/data addresses, skip_d2h, skip_tiling, etc.
-      fanout_k: The maximum number of simultaneous active pushes allowed per
-        source node (the fanout factor of the broadcast tree).
-      req_id: The base request ID for this transfer session.
-      dst_mem_type: The destination memory type (e.g. HBM, DRAM).
-      dst_controller_address: Optional BNS address of the destination-side
-        controller (used for remote coordination).
-      src_controller_address: Optional BNS address of the source-side
-        controller.
-    """
-    # Sort targets for each key to ensure consistent indexing
-    keys_and_sorted_targets = []
-    for key, targets in keys_and_targets:
-      sorted_t = sorted(targets, key=lambda t: (t[1], t[2]))
-      keys_and_sorted_targets.append((key, sorted_t))
-
-    ref_key, ref_targets = keys_and_sorted_targets[0]
-    (
-        src_unit,
-        shard_idx,
-        _,  # src_block_id
-        _,  # src_block_offset
-        _,  # size
-        _,  # src_stride
-        _,  # count
-        _,  # layer_idx
-        _,  # pool_group
-    ) = ref_key
-
-    available_sources = [src_unit]
-    node_slice_offsets = {
-        src_unit: {
-            key: (shard_idx, key[2], key[3], key[5])
-            for key, _ in keys_and_sorted_targets
-        }
-    }
-
-    pending_indices = list(range(len(ref_targets)))
-    active_pushes = {u: 0 for u in [src_unit] + [t[0] for t in ref_targets]}
-    transfers_in_progress = {}
-
-    while pending_indices or transfers_in_progress:
-      # 1. Greedy assignment step
-      scheduled_any = False
-      for s in list(available_sources):
-        while active_pushes[s] < fanout_k and pending_indices:
-          # Pick the first pending target index
-          first_idx = pending_indices[0]
-          first_target = ref_targets[first_idx]
-          dst_unit = first_target[0]
-
-          # Find all pending indices that target the same dst_unit
-          dst_indices = [
-              idx for idx in pending_indices if ref_targets[idx][0] == dst_unit
-          ]
-          # Remove them from pending_indices
-          pending_indices = [
-              idx for idx in pending_indices if idx not in dst_indices
-          ]
-
-          active_pushes[s] += 1
-          scheduled_any = True
-
-          ref_offset = node_slice_offsets[s][ref_key]
-          s_shard_idx = ref_offset[0]
-
-          # Build sub-schedule containing entries for all keys in the group
-          # and all target devices on dst_unit
-          sub_schedule = {s: {s_shard_idx: []}}
-          hop_expected_block_count = 0
-          for key, k_targets in keys_and_sorted_targets:
-            _, k_s_block_id, k_s_block_offset, k_s_stride = node_slice_offsets[
-                s
-            ][key]
-            k_size = key[4]
-            k_count = key[6]
-            k_layer_idx = key[7]
-            k_pool_group = key[8]
-
-            for idx in dst_indices:
-              k_target = k_targets[idx]
-              (
-                  _,
-                  k_dst_peer,
-                  k_dst_shard_idx,
-                  k_dst_block_id,
-                  k_dst_block_offset,
-                  k_dst_stride,
-              ) = k_target
-
-              entry = (
-                  k_dst_peer,
-                  k_dst_shard_idx,
-                  k_dst_block_offset,
-                  k_s_block_offset,
-                  k_size,
-                  k_s_block_id,
-                  k_dst_block_id,
-                  k_s_stride,
-                  k_dst_stride,
-                  k_count,
-                  k_layer_idx,
-                  k_pool_group,
-              )
-              sub_schedule[s][s_shard_idx].append(entry)
-
-              is_contiguous = (k_count == 1) or (
-                  k_s_stride == k_size and k_dst_stride == k_size
-              )
-              push_count = 1 if is_contiguous else k_count
-              hop_expected_block_count += push_count
-
-          hop_uuid = random.randint(1, 2**63 - 1)
-          hop_req_id = f"{req_id}_{hop_uuid}"
-
-          sub_plan = TransferPlan(
-              src_units=[s],
-              dst_units=[dst_unit],
-              plan=None,
-              shard_push_schedules=sub_schedule,
-              worker_rpc_addresses=dict(final_plan.worker_rpc_addresses),
-              worker_data_addresses=dict(final_plan.worker_data_addresses),
-              uuid=hop_uuid,
-              dst_mem_type=dst_mem_type,
-              use_block_chunks=True,
-              is_sender=True,
-              expected_block_count=hop_expected_block_count,
-              req_id=hop_req_id,
-              skip_d2h=final_plan.skip_d2h or (s != src_unit),
-              skip_tiling=final_plan.skip_tiling,
-              is_weight_sync=final_plan.is_weight_sync,
-          )
-
-          async def _run_single_transfer(s_node, d_node, plan):
-            if dst_controller_address:
-              dst_facade = RaidenControllerClientFacade(
-                  dst_controller_address,
-                  name_resolver=self.worker_rpc_client.name_resolver,
-              )
-              loop = asyncio.get_running_loop()
-              rpc_executor = getattr(self.worker_rpc_client, "executor", None)
-              remote_is_sender = s_node not in self._registered_shards
-              if (
-                  remote_is_sender
-                  or self.worker_rpc_client.include_receiver_push_schedules(
-                      plan
-                  )
-              ):
-                remote_schedules = plan.shard_push_schedules
-              else:
-                remote_schedules = None
-              success = await loop.run_in_executor(
-                  rpc_executor,
-                  functools.partial(
-                      dst_facade.register_transfer_schedule,
-                      [s_node],
-                      [d_node],
-                      plan.req_id,
-                      True,
-                      remote_is_sender,
-                      plan.expected_block_count,
-                      plan.uuid,
-                      dst_controller_address,
-                      src_controller_address,
-                      remote_schedules,
-                      dst_mem_type,
-                      skip_d2h=plan.skip_d2h,
-                  ),
-              )
-              if not success:
-                raise RuntimeError(
-                    "Failed remote prepare in slice tree broadcast"
-                )
-            else:
-              await self.worker_rpc_client.start_transfer(d_node, plan)
-
-            if s_node in self._registered_shards:
-              await self.worker_rpc_client.start_transfer(s_node, plan)
-
-          task = asyncio.create_task(
-              _run_single_transfer(s, dst_unit, sub_plan)
-          )
-          transfers_in_progress[dst_unit] = (s, dst_unit, dst_indices, task)
-
-      # 2. Wait step
-      if transfers_in_progress:
-        futures_to_dsts = {
-            info[3]: dst for dst, info in transfers_in_progress.items()
-        }
-        done, _ = await asyncio.wait(
-            futures_to_dsts.keys(), return_when=asyncio.FIRST_COMPLETED
-        )
-
-        # 3. Promotion step
-        for fut in done:
-          if fut.exception():
-            logging.error(
-                "Slice transfer failed in broadcast tree: %s", fut.exception()
-            )
-            for info in transfers_in_progress.values():
-              info[3].cancel()
-            raise fut.exception()
-          dst_unit = futures_to_dsts[fut]
-          s, _, dst_indices, _ = transfers_in_progress.pop(dst_unit)
-          active_pushes[s] -= 1
-          available_sources.append(dst_unit)
-
-          # Add to node_slice_offsets for the new source for all keys.
-          # We use the first dst_index to populate the offsets for dst_unit.
-          # Since all dst_indices received the same shard, any of them is fine.
-          ref_idx = dst_indices[0]
-          node_slice_offsets[dst_unit] = {}
-          for key, k_targets in keys_and_sorted_targets:
-            k_target = k_targets[ref_idx]
-            (
-                _,
-                _,
-                k_dst_shard_idx,
-                k_dst_block_id,
-                k_dst_block_offset,
-                k_dst_stride,
-            ) = k_target
-            node_slice_offsets[dst_unit][key] = (
-                k_dst_shard_idx,
-                k_dst_block_id,
-                k_dst_block_offset,
-                k_dst_stride,
-            )
-      elif not scheduled_any:
-        break
+    """Executes a pipelined tree broadcast for a group of variables."""
+    await self._broadcast_engine.execute_slice_broadcast(
+        keys_and_targets=keys_and_targets,
+        final_plan=final_plan,
+        fanout_k=fanout_k,
+        req_id=req_id,
+        dst_mem_type=dst_mem_type,
+        registered_shards=self._registered_shards,
+        dst_controller_address=dst_controller_address,
+        src_controller_address=src_controller_address,
+    )
 
   def _start_pool_reshard_transfer(self, *args, **kwargs):
     """REMOVED: the Python pool-reshard implementation is retired."""

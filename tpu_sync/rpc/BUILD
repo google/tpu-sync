@@ -118,6 +118,7 @@ py_library(
         ":raiden_service_py_pb2",
         "//tpu_sync/api:common",
         "//tpu_sync/kv_cache:nd_slice_math",
+        "//tpu_sync/weight_sync:broadcast_engine",
         "@com_google_absl_py//absl/logging",
     ],
 )

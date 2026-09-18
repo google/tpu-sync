@@ -129,6 +129,13 @@ KVCacheStoreClient::Fetch(
 // or error, then deletes the reactor. If `tracker_` is provided, OnDone
 // updates it with the streamed verdict. If the call fails before any ack, both
 // the ack and result futures report the error.
+//
+// Callers that hold pins (or any other resource) for the duration of the
+// transfer must NOT pass a tracker: OnDone publishes the verdict before
+// `result_promise_` is resolved, so a waiter woken by the verdict can run
+// before the caller's completion handler has released anything. Such callers
+// should record the verdict from the `result_promise_` continuation instead,
+// after releasing. See HostOffloadBackend::BeginWriteRemote.
 class WriteRemoteClientReactor
     : public ::grpc::ClientReadReactor<
           ::tpu_raiden::kv_cache::proto::WriteRemoteEvent> {

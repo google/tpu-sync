@@ -87,3 +87,90 @@ cc_test(
         "@xla//xla/tsl/platform:statusor",
     ],
 )
+
+cc_library(
+    name = "storage_backend_utils",
+    srcs = ["storage_backend_utils.cc"],
+    hdrs = ["storage_backend_utils.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_sync/kv_cache/backends:backend",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
+    name = "tds_backend",
+    srcs = ["tds_backend.cc"],
+    hdrs = ["tds_backend.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":storage_backend_utils",
+        "//tpu_sync/common:raiden_id",
+        "//tpu_sync/core:numa_thread_pool",
+        "//tpu_sync/core/controller:raiden_controller",
+        "//tpu_sync/kv_cache:kv_cache_store_backend",
+        "//tpu_sync/kv_cache:kv_cache_store_backend_factory",
+        "//tpu_sync/kv_cache/backends:backend",
+        "//tpu_sync/tpudirect_storage:tdsul",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/base:nullability",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@xla//xla/tsl/concurrency:future",
+        "@xla//xla/tsl/platform:logging",
+    ],
+    alwayslink = 1,
+)
+
+cc_test(
+    name = "tds_backend_test",
+    srcs = ["tds_backend_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    deps = [
+        ":storage_backend_utils",
+        ":tds_backend",
+        "//tpu_sync/kv_cache:kv_cache_store_backend",
+        "//tpu_sync/kv_cache:kv_cache_store_backend_factory",
+        "//tpu_sync/kv_cache/backends:backend",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

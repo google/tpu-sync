@@ -66,6 +66,7 @@
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache/backends/storage/tds_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
@@ -3600,8 +3601,11 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
     const BackendConfig& config) {
   if (config.type.empty()) return false;
 
-  if (!absl::EqualsIgnoreCase(config.type,
-                              backends::storage::kPosixBackendName)) {
+  const bool is_posix =
+      absl::EqualsIgnoreCase(config.type, backends::storage::kPosixBackendName);
+  const bool is_tds =
+      absl::EqualsIgnoreCase(config.type, backends::storage::kTdsBackendName);
+  if (!is_posix && !is_tds) {
     LOG(WARNING) << "[Worker] Unsupported secondary backend: " << config.type;
     return false;
   }
@@ -3613,7 +3617,8 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
   }
 
   const std::string canonical_name =
-      std::string(backends::storage::kPosixBackendName);
+      std::string(is_tds ? backends::storage::kTdsBackendName
+                         : backends::storage::kPosixBackendName);
   if (GetKVBackend(canonical_name) != nullptr) return false;
 
   // Storage topology comes only from BackendConfig::parallelism, resolved the
@@ -3624,17 +3629,26 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
           config.parallelism.tp_size > 0 ? config.parallelism.tp_size : 1,
       .tp_rank = config.parallelism.tp_rank};
   ApplyParallelismToProperties(effective, &resolved);
-  if (absl::Status status =
-          backends::storage::PosixBackendOptions::FromProperties(
-              resolved.properties)
-              .status();
-      !status.ok()) {
+  const absl::Status status =
+      is_tds ? backends::storage::TdsBackendOptions::FromProperties(
+                   resolved.properties)
+                   .status()
+             : backends::storage::PosixBackendOptions::FromProperties(
+                   resolved.properties)
+                   .status();
+  if (!status.ok()) {
     LOG(ERROR) << "[Worker] invalid " << config.type
                << " backend config; refusing to register: " << status;
     return false;
   }
-  auto backend = std::make_shared<backends::storage::PosixKVBackend>(
-      canonical_name, resolved.properties);
+  std::shared_ptr<backends::KVBackend> backend;
+  if (is_tds) {
+    backend = std::make_shared<backends::storage::TdsKVBackend>(
+        canonical_name, resolved.properties);
+  } else {
+    backend = std::make_shared<backends::storage::PosixKVBackend>(
+        canonical_name, resolved.properties);
+  }
   {
     absl::MutexLock lock(backends_mu_);
     backends_[canonical_name] = std::move(backend);

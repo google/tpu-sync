@@ -463,44 +463,109 @@ class KVCacheManager:
     """
     return self._impl.complete_read()
 
+  def map_shared_memory(
+      self, mapped_address: int, pool_size_bytes: int
+  ) -> None:
+    """Registers an existing whole-pool mapping for TPU DMA.
+
+    The external pool owner must keep this process-local virtual address
+    mapped and page-locked until ``unmap_shared_memory`` succeeds.
+
+    Args:
+      mapped_address: Process-local virtual address of the shared pool.
+      pool_size_bytes: Total byte length of the shared pool.
+    """
+    self._impl.map_shared_memory(mapped_address, pool_size_bytes)
+
+  def unmap_shared_memory(self) -> None:
+    """Drains submitted copies and releases the whole-pool registration."""
+    self._impl.unmap_shared_memory()
+
+  @property
+  def is_shared_memory_mapped(self) -> bool:
+    """Returns whether shared memory is currently DMA mapped."""
+    return self._impl.is_shared_memory_mapped
+
   def d2h(
       self,
-      src_offsets: List[int],
-      dst_offsets: List[int],
-      copy_sizes: List[int] | None = None,
+      src_offsets: Any,
+      dst_offsets: Any,
+      copy_sizes: Any = None,
+      rank_id: int | None = None,
   ) -> Any:
     """Device-to-Host (D2H) copy transfer.
 
+    Can be called either with legacy offset lists:
+      d2h(src_offsets, dst_offsets, copy_sizes)
+    or with object tensors:
+      d2h(block_ids, object_tensors, rank_id)
+
     Args:
-      src_offsets: Source block offsets.
-      dst_offsets: Destination block offsets.
-      copy_sizes: Optional number of contiguous blocks to copy per segment
-        (defaults to 1 block per segment).
+      src_offsets: Source block offsets or block_ids.
+      dst_offsets: Destination block offsets or list of object tensors.
+      copy_sizes: Optional copy size list or rank_id when using object tensors.
+      rank_id: Optional rank ID when using object tensors.
 
     Returns:
       A future representing the asynchronous copy transfer operation.
     """
+    if (
+        isinstance(dst_offsets, (list, tuple))
+        and dst_offsets
+        and hasattr(dst_offsets[0], "data_ptr")
+    ):
+      actual_rank = rank_id if rank_id is not None else copy_sizes
+      if actual_rank is None:
+        raise ValueError(
+            "rank_id is required when passing object tensors; call"
+            " d2h(block_ids, object_tensors, rank_id)"
+        )
+      return self._impl.d2h(
+          list(src_offsets), list(dst_offsets), int(actual_rank)
+      )
+
     if copy_sizes is None:
       copy_sizes = [1] * len(src_offsets)
     return self._impl.D2h(src_offsets, dst_offsets, copy_sizes)
 
   def h2d(
       self,
-      src_offsets: List[int],
-      dst_offsets: List[int],
-      copy_sizes: List[int] | None = None,
+      src_offsets: Any,
+      dst_offsets: Any,
+      copy_sizes: Any = None,
+      rank_id: int | None = None,
   ) -> Any:
     """Host-to-Device (H2D) copy transfer.
 
+    Can be called either with legacy offset lists:
+      h2d(src_offsets, dst_offsets, copy_sizes)
+    or with object tensors:
+      h2d(block_ids, object_tensors, rank_id)
+
     Args:
-      src_offsets: Source block offsets.
-      dst_offsets: Destination block offsets.
-      copy_sizes: Optional number of contiguous blocks to copy per segment
-        (defaults to 1 block per segment).
+      src_offsets: Source block offsets or block_ids.
+      dst_offsets: Destination block offsets or list of object tensors.
+      copy_sizes: Optional copy size list or rank_id when using object tensors.
+      rank_id: Optional rank ID when using object tensors.
 
     Returns:
       A future representing the asynchronous copy transfer operation.
     """
+    if (
+        isinstance(dst_offsets, (list, tuple))
+        and dst_offsets
+        and hasattr(dst_offsets[0], "data_ptr")
+    ):
+      actual_rank = rank_id if rank_id is not None else copy_sizes
+      if actual_rank is None:
+        raise ValueError(
+            "rank_id is required when passing object tensors; call"
+            " h2d(block_ids, object_tensors, rank_id)"
+        )
+      return self._impl.h2d(
+          list(src_offsets), list(dst_offsets), int(actual_rank)
+      )
+
     if copy_sizes is None:
       copy_sizes = [1] * len(src_offsets)
     return self._impl.H2d(src_offsets, dst_offsets, copy_sizes)

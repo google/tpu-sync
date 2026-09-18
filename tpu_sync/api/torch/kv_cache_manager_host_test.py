@@ -148,6 +148,31 @@ class KVCacheManagerHostTest(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, "host-only manager"):
       manager.h2d_pool_blocks(pool_idx=0, block_ids=[0])
 
+  def test_shared_memory_mapping_api(self):
+    manager = kv_cache_manager.KVCacheManager.create_host_only_for_testing(
+        num_layers=1,
+        num_shards=1,
+        slice_byte_size=128,
+        node_id=7,
+        host_blocks=2,
+        parallelism=1,
+    )
+    self.assertFalse(manager.is_shared_memory_mapped)
+
+    # Map with null address or 0 size raises RuntimeError
+    with self.assertRaises(RuntimeError):
+      manager.map_shared_memory(0, 4096)
+    with self.assertRaises(RuntimeError):
+      manager.map_shared_memory(4096, 0)
+
+    # Unmap when not mapped raises RuntimeError
+    with self.assertRaises(RuntimeError):
+      manager.unmap_shared_memory()
+
+    # Host-only manager has no active PJRT client for DMA mapping
+    with self.assertRaisesRegex(RuntimeError, "no active PJRT client"):
+      manager.map_shared_memory(4096, 4096)
+
 
 if __name__ == "__main__":
   unittest.main()

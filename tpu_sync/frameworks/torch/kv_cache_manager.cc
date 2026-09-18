@@ -25,6 +25,8 @@
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
+#include "c10/core/ScalarType.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -38,6 +40,7 @@
 #include "tpu_sync/core/controller/worker_service_server.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/kv_manager_holder.h"
+#include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/core/utils.h"
 #include "tpu_sync/frameworks/torch/torch_utils.h"
@@ -193,7 +196,19 @@ TorchKVCacheManager::TorchKVCacheManager(
           /*num_slots=*/0, /*timeout_s=*/120.0),
       kv_caches_({}) {}
 
-TorchKVCacheManager::~TorchKVCacheManager() = default;
+TorchKVCacheManager::~TorchKVCacheManager() {
+  // Drain external copies here rather than leaving it to ~KVCacheManagerBase.
+  // The base destructor runs after this subobject has already been destroyed,
+  // so any completion that reaches back into the derived manager would touch
+  // freed memory.
+  if (is_shared_memory_mapped()) {
+    const absl::Status status = UnmapSharedMemory();
+    if (!status.ok()) {
+      LOG(ERROR) << "TorchKVCacheManager shared memory unmap failed: "
+                 << status;
+    }
+  }
+}
 
 std::optional<int> TorchKVCacheManager::listener_port() const {
   if (listener_) {
@@ -451,6 +466,281 @@ int KVCacheManager::GetRaidenWorkerPort() const {
     return private_grpc_server_->GetRaidenWorkerPort();
   }
   return controller::WorkerServiceServer::GetInstance().GetRaidenWorkerPort();
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture> TorchKVCacheManager::H2d(
+    const std::vector<int64_t>& block_ids,
+    const std::vector<at::Tensor>& object_tensors, int64_t rank_id) {
+  return CopyObjectBlocks(block_ids, object_tensors, rank_id, /*is_h2d=*/true);
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture> TorchKVCacheManager::D2h(
+    const std::vector<int64_t>& block_ids,
+    const std::vector<at::Tensor>& object_tensors, int64_t rank_id) {
+  return CopyObjectBlocks(block_ids, object_tensors, rank_id, /*is_h2d=*/false);
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture> TorchKVCacheManager::CopyObjectBlocks(
+    const std::vector<int64_t>& block_ids,
+    const std::vector<at::Tensor>& object_tensors, int64_t rank_id,
+    bool is_h2d) {
+  if (buffer_holds_.empty()) {
+    return absl::FailedPreconditionError(
+        "KVCacheManager has no registered device KV cache");
+  }
+  if (block_ids.empty()) {
+    return absl::InvalidArgumentError("block_ids must not be empty");
+  }
+  if (block_ids.size() != object_tensors.size()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "block_ids and object_tensors must have the same length; got ",
+        block_ids.size(), " and ", object_tensors.size()));
+  }
+  if (rank_id < 0) {
+    return absl::InvalidArgumentError("rank_id must be non-negative");
+  }
+
+  const size_t num_layers = num_layers_;
+  // buffer_holds_ is only populated on the device-backed path, and nothing
+  // guarantees it has one entry per layer; the submit loop indexes it with
+  // layer_id, so check the length up front.
+  if (buffer_holds_.size() < num_layers) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "KVCacheManager has ", buffer_holds_.size(),
+        " registered layer buffers but num_layers=", num_layers));
+  }
+  if (object_tensors[0].dim() != 3 ||
+      object_tensors[0].scalar_type() != at::kChar) {
+    return absl::InvalidArgumentError(
+        "object_tensors must be rank-3 CPU int8 tensors with shape "
+        "[num_ranks, num_layers, page_nbytes]");
+  }
+
+  const int64_t page_nbytes_int = object_tensors[0].size(2);
+  if (page_nbytes_int <= 0) {
+    return absl::InvalidArgumentError("page_nbytes must be greater than zero");
+  }
+  const size_t page_nbytes = static_cast<size_t>(page_nbytes_int);
+  if (slice_byte_size() > 0 && page_nbytes != slice_byte_size()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("object_tensors page_nbytes=", page_nbytes,
+                     " does not match manager slice_byte_size=",
+                     slice_byte_size()));
+  }
+
+  const size_t dev_physical_size = buffer_holds_[0].physical_size;
+  if (dev_physical_size == 0 || dev_physical_size % page_nbytes != 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "device physical size ", dev_physical_size,
+        " is not divisible by page_nbytes ", page_nbytes));
+  }
+  const size_t num_blocks = dev_physical_size / page_nbytes;
+
+  // MapSharedMemory registered the pool against a single client, the one
+  // GetPjRtClient() resolves to.  DmaMap registration is per client, so a
+  // layer whose buffer belongs to a different client would hand the DMA
+  // engine host memory that client never registered.  Devices may still
+  // differ: the registration covers the client, not one device.
+  xla::PjRtClient* const dma_client = GetPjRtClient();
+  if (dma_client == nullptr) {
+    return absl::FailedPreconditionError(
+        "KVCacheManager has no active PJRT client for object tensor "
+        "transfers");
+  }
+
+  // The transfer loop below addresses every layer with the same page size and
+  // uses each layer's single shard.  Reject the geometries that would break
+  // that assumption rather than silently reading the wrong bytes.
+  for (size_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+    const auto& layer_info = buffer_holds_[layer_id];
+    if (layer_info.holds.size() != 1) {
+      return absl::UnimplementedError(absl::StrCat(
+          "object tensor transfers require exactly one shard per layer; layer ",
+          layer_id, " has ", layer_info.holds.size(), " shards"));
+    }
+    if (layer_info.physical_size != dev_physical_size) {
+      return absl::UnimplementedError(absl::StrCat(
+          "object tensor transfers require a uniform per-layer device size; "
+          "layer ",
+          layer_id, " is ", layer_info.physical_size, " bytes but layer 0 is ",
+          dev_physical_size, " bytes"));
+    }
+    // Resolve this layer's client the same way GetPjRtClient() does, so the
+    // comparison is against the client the mapping was actually made on.
+    const auto& hold = layer_info.holds[0];
+    xla::PjRtClient* layer_client =
+        hold.device != nullptr ? hold.device->client() : nullptr;
+    if (layer_client == nullptr && hold.buffer != nullptr) {
+      layer_client = hold.buffer->client();
+    }
+    if (layer_client == nullptr) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "layer ", layer_id, " has no resolvable PJRT client"));
+    }
+    if (layer_client != dma_client) {
+      return absl::UnimplementedError(absl::StrCat(
+          "object tensor transfers require every layer to share one PJRT "
+          "client; layer ",
+          layer_id, " belongs to a different client than the one the shared "
+          "memory pool is DMA mapped on"));
+    }
+  }
+
+  absl::flat_hash_set<int64_t> unique_blocks;
+  unique_blocks.reserve(block_ids.size());
+  std::vector<int64_t> device_offsets;
+  device_offsets.reserve(block_ids.size());
+  for (size_t i = 0; i < block_ids.size(); ++i) {
+    const int64_t b = block_ids[i];
+    if (b < 0 || static_cast<size_t>(b) >= num_blocks) {
+      return absl::OutOfRangeError(
+          absl::StrCat("block_ids[", i, "]=", b,
+                       " is outside block range [0, ", num_blocks, ")"));
+    }
+    if (!unique_blocks.insert(b).second) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "block_ids contains duplicate block ", b,
+          "; concurrent writes to one block have undefined ordering"));
+    }
+    device_offsets.push_back(b * static_cast<int64_t>(page_nbytes));
+  }
+
+  const size_t rank_bytes = num_layers * page_nbytes;
+  size_t expected_num_ranks = 0;
+  size_t expected_object_bytes = 0;
+  std::vector<uint8_t*> host_bases;
+  host_bases.reserve(object_tensors.size());
+
+  for (size_t obj_id = 0; obj_id < object_tensors.size(); ++obj_id) {
+    const at::Tensor& tensor = object_tensors[obj_id];
+    if (!tensor.device().is_cpu()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("object_tensors[", obj_id, "] must be a CPU tensor"));
+    }
+    if (!tensor.is_contiguous()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "object_tensors[", obj_id,
+          "] must be contiguous; a nonzero storage offset is allowed"));
+    }
+    if (tensor.dim() != 3 || tensor.scalar_type() != at::kChar) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "object_tensors[", obj_id,
+          "] must be a rank-3 CPU int8 tensor with shape [num_ranks, ",
+          num_layers, ", ", page_nbytes, "]"));
+    }
+    if (tensor.size(0) <= 0 ||
+        tensor.size(1) != static_cast<int64_t>(num_layers) ||
+        tensor.size(2) != static_cast<int64_t>(page_nbytes)) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "object_tensors[", obj_id, "] must have shape [num_ranks, ",
+          num_layers, ", ", page_nbytes, "] with num_ranks > 0"));
+    }
+
+    const size_t num_ranks = static_cast<size_t>(tensor.size(0));
+    if (obj_id == 0) {
+      expected_num_ranks = num_ranks;
+      expected_object_bytes = num_ranks * rank_bytes;
+    } else if (num_ranks != expected_num_ranks) {
+      return absl::InvalidArgumentError(
+          "all object_tensors must have the same num_ranks dimension");
+    }
+    if (static_cast<size_t>(rank_id) >= num_ranks) {
+      return absl::OutOfRangeError(
+          absl::StrCat("rank_id=", rank_id, " is outside object_tensors[",
+                       obj_id, "] first dimension [0, ", num_ranks, ")"));
+    }
+    if (static_cast<size_t>(tensor.nbytes()) != expected_object_bytes) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("object_tensors[", obj_id, "] has ", tensor.nbytes(),
+                       " bytes, expected ", expected_object_bytes));
+    }
+
+    host_bases.push_back(static_cast<uint8_t*>(tensor.data_ptr()));
+  }
+
+  const size_t host_rank_offset = static_cast<size_t>(rank_id) * rank_bytes;
+  std::vector<size_t> host_layer_offsets;
+  host_layer_offsets.reserve(num_layers);
+  for (size_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+    host_layer_offsets.push_back(host_rank_offset + layer_id * page_nbytes);
+  }
+
+  // Pin the DMA registration for the rest of this call.  Checking
+  // is_shared_memory_mapped() here instead would be racy: the pool could be
+  // unmapped between the check and IssueH2dShard below.
+  absl::StatusOr<ExternalCopyLease> lease = AcquireExternalCopyLease();
+  if (!lease.ok()) {
+    return lease.status();
+  }
+
+  // Every byte handed to the DMA engine must lie inside the pool that was
+  // registered with DmaMap.  Each tensor contributes one contiguous run: the
+  // `num_layers` pages belonging to `rank_id`.
+  for (size_t obj_id = 0; obj_id < host_bases.size(); ++obj_id) {
+    const absl::Status range_status =
+        ValidateExternalRange(host_bases[obj_id] + host_rank_offset,
+                              rank_bytes);
+    if (!range_status.ok()) {
+      return absl::Status(
+          range_status.code(),
+          absl::StrCat("object_tensors[", obj_id, "] is not DMA mappable: ",
+                       range_status.message()));
+    }
+  }
+
+  auto tensor_holds = std::make_shared<std::vector<at::Tensor>>(object_tensors);
+  std::vector<raiden::PjRtCopyFuture> layer_futures;
+  layer_futures.reserve(num_layers);
+
+  const int64_t transfer_size = static_cast<int64_t>(page_nbytes);
+  for (size_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+    const size_t host_offset = host_layer_offsets[layer_id];
+    const auto& shard_hold = buffer_holds_[layer_id].holds[0];
+
+    absl::StatusOr<raiden::PjRtCopyFuture> future;
+    if (is_h2d) {
+      std::vector<raiden::H2dCopy> copies;
+      copies.reserve(object_tensors.size());
+      for (size_t obj_id = 0; obj_id < object_tensors.size(); ++obj_id) {
+        copies.push_back(raiden::H2dCopy{
+            .src = host_bases[obj_id] + host_offset,
+            .dst_off = device_offsets[obj_id],
+            .size = transfer_size,
+        });
+      }
+      future = raiden::IssueH2dShard(shard_hold, copies);
+    } else {
+      std::vector<raiden::D2hCopy> copies;
+      copies.reserve(object_tensors.size());
+      for (size_t obj_id = 0; obj_id < object_tensors.size(); ++obj_id) {
+        copies.push_back(raiden::D2hCopy{
+            .dst = host_bases[obj_id] + host_offset,
+            .src_off = device_offsets[obj_id],
+            .size = transfer_size,
+        });
+      }
+      future = raiden::IssueD2hShard(shard_hold, copies);
+    }
+
+    if (!future.ok()) {
+      if (!layer_futures.empty()) {
+        // Layers [0, layer_id) are already in flight and still reference the
+        // caller's tensors; hand them to the lease so the mapping outlives
+        // them even though the overall transfer failed.
+        raiden::PjRtCopyFuture submitted =
+            raiden::JoinPjRtCopyFutures(layer_futures);
+        submitted.AddKeepAlive(tensor_holds);
+        lease->Commit(std::move(submitted));
+      }
+      return future.status();
+    }
+    layer_futures.push_back(std::move(future.value()));
+  }
+
+  raiden::PjRtCopyFuture joined = raiden::JoinPjRtCopyFutures(layer_futures);
+  joined.AddKeepAlive(std::move(tensor_holds));
+  lease->Commit(joined);
+  return joined;
 }
 
 }  // namespace torch

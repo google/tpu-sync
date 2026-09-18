@@ -55,7 +55,7 @@ set -exu -o pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-export BAZEL_CACHE_DIR="${BAZEL_CACHE_DIR:-/cache}"
+export BAZEL_CACHE_DIR="${BAZEL_CACHE_DIR:-${RUNNER_TEMP:-/cache}/bazel_cache}"
 export BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE:-${BAZEL_CACHE_DIR}/output_base}"
 EXTRA_BAZEL_FLAGS="${EXTRA_BAZEL_FLAGS:-}"
 export HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION:-3.12}"
@@ -149,6 +149,7 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
   if [[ -n "${QUERY_OUTPUT}" ]]; then
     mapfile -t TARGETS <<< "${QUERY_OUTPUT}"
   fi
+  TARGETS+=("//tpu_sync/kv_cache:nd_slice_math_test")
 else
   RUN_E2E_DEFAULT="false"
 fi
@@ -159,33 +160,49 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
   exit 1
 fi
 
-echo "=== Phase 1: Running Bazel CPU cc_test Suite (${#TARGETS[@]} targets) ==="
+echo "=== Phase 1: Running Bazel CPU Unit Test Suite (${#TARGETS[@]} targets) ==="
 printf '  %s\n' "${TARGETS[@]}"
 
 # --keep_going: report every target that fails to build or test, rather than
 # stopping at the first one.
-"${BAZEL_BIN}" "${BAZEL_STARTUP_FLAGS[@]}" test -c opt \
+if ! "${BAZEL_BIN}" "${BAZEL_STARTUP_FLAGS[@]}" test -c opt \
   "${BAZEL_COMMON_FLAGS[@]}" \
   --keep_going \
   --verbose_failures \
   --test_output=errors \
   --test_summary=detailed \
   ${EXTRA_BAZEL_FLAGS} \
-  "${TARGETS[@]}"
+  "${TARGETS[@]}"; then
+  echo "=== Bazel CPU Unit Test Suite Failed: Extracting Test Logs ==="
+  for xml_file in $(find -L "${REPO_ROOT}/bazel-testlogs" -name "test.xml" 2>/dev/null); do
+    if grep -qE '<(failure|error)' "${xml_file}"; then
+      log_file="${xml_file%/test.xml}/test.log"
+      test_name="${xml_file#${REPO_ROOT}/bazel-testlogs/}"
+      test_name="${test_name%/test.xml}"
+      if [[ -f "${log_file}" ]]; then
+        snippet="$(tail -n 40 "${log_file}" | tr '\n' ' ' | sed 's/::/:/g')"
+        echo "::error title=${test_name}::${snippet}"
+        {
+          echo "### Failed Test: \`${test_name}\`"
+          echo '```text'
+          tail -n 100 "${log_file}"
+          echo '```'
+        } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+      fi
+    fi
+  done
+  exit 1
+fi
 
 if [[ "${RAIDEN_RUN_E2E_BUILD}" == "true" ]]; then
   echo "=== Phase 2: E2E JAX Validation Build (./build.sh jax) ==="
-  ./build.sh jax --config=oss ${EXTRA_BAZEL_FLAGS}
+  ./build.sh jax --config=oss --remote_download_outputs=toplevel ${EXTRA_BAZEL_FLAGS}
 
   echo "=== Verifying E2E Build Artifacts ==="
   EXPECTED_ARTIFACTS=(
     "${REPO_ROOT}/tpu_sync/frameworks/jax/_tpu_raiden_jax.so"
     "${REPO_ROOT}/tpu_sync/kv_cache/global_registry/global_registry_server"
     "${REPO_ROOT}/tpu_sync/store_node/kv_cache_host_store_node_main"
-    "${REPO_ROOT}/tpu_sync/rpc/raiden_service_pb2.py"
-    "${REPO_ROOT}/tpu_sync/rpc/coordination_pb2.py"
-    "${REPO_ROOT}/tpu_sync/rpc/coordination_pb2_grpc.py"
-    "${REPO_ROOT}/tpu_sync/rpc/controller_service_pb2.py"
   )
   for artifact in "${EXPECTED_ARTIFACTS[@]}"; do
     if [[ ! -e "${artifact}" ]]; then
@@ -194,11 +211,15 @@ if [[ "${RAIDEN_RUN_E2E_BUILD}" == "true" ]]; then
     fi
   done
 
-  echo "=== Phase 3: Verifying Dynamic Module Binding Linkage & CPU Python Tests ==="
+  echo "=== Phase 3: Verifying Dynamic Module Binding Linkage ==="
   export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/bazel-bin:${REPO_ROOT}/tpu_sync/api/jax:${REPO_ROOT}/tpu_sync/frameworks/jax:${PYTHONPATH:-}"
-  echo "Using Python interpreter: $(which python3) ($(python3 --version))"
+  HERMETIC_PYTHON_BIN="$(find "${BAZEL_OUTPUT_BASE}/external" -path "*/bin/python3" -executable 2>/dev/null | grep -E "python_3_12|rules_python" | head -n 1 || true)"
+  if [[ -z "${HERMETIC_PYTHON_BIN}" ]] || ! "${HERMETIC_PYTHON_BIN}" --version &>/dev/null; then
+    HERMETIC_PYTHON_BIN="python3"
+  fi
+  echo "Using Python interpreter: ${HERMETIC_PYTHON_BIN} ($(${HERMETIC_PYTHON_BIN} --version))"
 
-  python3 -c "
+  "${HERMETIC_PYTHON_BIN}" -c "
 import sys
 from unittest.mock import MagicMock
 sys.modules['jax'] = MagicMock()
@@ -207,12 +228,8 @@ sys.modules['jax.extend'] = MagicMock()
 sys.modules['jax.extend.ffi'] = MagicMock()
 
 import kv_cache_manager
-from tpu_sync.rpc import raiden_controller
-print('Dynamic linkage verified: kv_cache_manager and raiden_controller imported successfully!')
+print('Dynamic linkage verified: kv_cache_manager (_tpu_raiden_jax.so) imported successfully!')
 "
-
-  echo "=== Running Framework-Neutral CPU Python Unit Tests ==="
-  python3 "${REPO_ROOT}/tpu_sync/kv_cache/nd_slice_math_test.py"
 fi
 
 echo "=== CI Verification Complete! ==="

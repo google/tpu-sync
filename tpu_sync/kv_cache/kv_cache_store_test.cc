@@ -3023,6 +3023,18 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteFailure) {
   ABSL_EXPECT_OK(store.ReadRemote(hashes, slices, {7}))
       << "a failed read must return its staging blocks";
 
+  bool retry_settled = false;
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    auto [done_hashes, failed_hashes, pending_hashes] =
+        store.PollRemoteReadStatus();
+    if (!failed_hashes.empty() || !done_hashes.empty()) {
+      retry_settled = true;
+      break;
+    }
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_TRUE(retry_settled);
+
   registry_server->Shutdown();
 }
 

@@ -44,10 +44,9 @@ jobs:
     runs-on: linux-x86-n2-32
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
+      options: --shm-size=16g
     timeout-minutes: 300
     env:
-      BAZEL_CACHE_DIR: ${{ runner.temp }}/bazel_cache
-      BAZEL_OUTPUT_BASE: ${{ runner.temp }}/bazel_cache/output_base
       RAIDEN_TEST_SCOPE: ${{ inputs.test_scope || '//tpu_sync/core:all //tpu_sync/kv_cache:all' }}
       # Fork PRs run without the ambient GCP service account, so the
       # remote cache is only requested when the head branch lives in this
@@ -66,4 +65,7 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE/tpu-sync"
       - name: Run CPU unit tests, E2E JAX build, and binding verification
         working-directory: tpu-sync
-        run: bash ci/run_unit_tests.sh
+        run: |
+          export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          export BAZEL_OUTPUT_BASE="${BAZEL_CACHE_DIR}/output_base"
+          bash ci/run_unit_tests.sh

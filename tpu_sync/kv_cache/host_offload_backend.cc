@@ -104,13 +104,15 @@ HostOffloadBackend::HostOffloadBackend(
       raiden_controller_(raiden_controller),
       registry_client_(std::move(registry_client)) {}
 
-HostOffloadBackend::~HostOffloadBackend() {
+HostOffloadBackend::~HostOffloadBackend() { Shutdown(); }
+
+void HostOffloadBackend::Shutdown() {
   {
     absl::MutexLock lock(lifetime_->mu);
     lifetime_->is_alive = false;
   }
-  if (server_) {
-    server_->Shutdown();
+  if (KVCacheStoreServer* server = store_server(); server != nullptr) {
+    server->Shutdown();
   }
 }
 
@@ -1108,7 +1110,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
                         client_raiden_id, client_worker_endpoints);
 
   fetch_future.OnReady(
-      [this, remote_id, dst_host_block_ids,
+      [this, lifetime = lifetime_, remote_id, dst_host_block_ids,
        hashes =
            std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
        dev_ids_vec = std::vector<int32_t>(device_block_ids.begin(),
@@ -1116,56 +1118,71 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
        load_tracker, load_promise = std::move(load_promise)](
           const absl::StatusOr<::tpu_raiden::kv_cache::proto::FetchResponse>&
               fetch_response) mutable {
-        if (!fetch_response.ok()) {
+        tsl::Future<> h2d_future;
+        {
+          absl::MutexLock lock(lifetime->mu);
+          if (!lifetime->is_alive) {
+            load_promise.Set(absl::CancelledError("Backend destroyed"));
+            return;
+          }
+          if (!fetch_response.ok()) {
+            (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
+            // The peer may have restarted on a new port; drop the cached client
+            // so the next attempt re-resolves instead of redialling a dead one.
+            InvalidateStoreClient(remote_id);
+            load_tracker->MarkFailed(hashes);
+            load_promise.Set(fetch_response.status());
+            return;
+          }
+
+          const auto& response = *fetch_response;
+          if (!response.failed_block_hashes().empty()) {
+            (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
+            std::string err_msg = response.error_message().empty()
+                                      ? "Fetch RPC returned failed blocks"
+                                      : response.error_message();
+            load_tracker->MarkFailed(hashes);
+            load_promise.Set(absl::InternalError(err_msg));
+            return;
+          }
+
+          std::vector<Buffer> src_buffers;
+          src_buffers.reserve(dst_host_block_ids.size());
+          for (int id : dst_host_block_ids) {
+            src_buffers.emplace_back(id, std::vector<BufferShard>{},
+                                     std::nullopt,
+                                     ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+          }
+
+          std::vector<Buffer> dst_buffers;
+          dst_buffers.reserve(dev_ids_vec.size());
+          for (int id : dev_ids_vec) {
+            dst_buffers.emplace_back(id, std::vector<BufferShard>{},
+                                     std::nullopt,
+                                     ::tpu_sync::rpc::MEMORY_TYPE_HBM);
+          }
+
+          h2d_future =
+              raiden_controller_->TransferBuffers(src_buffers, dst_buffers);
+        }
+
+        h2d_future.OnReady([this, lifetime, dst_host_block_ids,
+                            hashes = std::move(hashes), load_tracker,
+                            load_promise = std::move(load_promise)](
+                               absl::Status status) mutable {
+          absl::MutexLock lock(lifetime->mu);
+          if (!lifetime->is_alive) {
+            load_promise.Set(absl::CancelledError("Backend destroyed"));
+            return;
+          }
           (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
-          // The peer may have restarted on a new port; drop the cached client
-          // so the next attempt re-resolves instead of redialling a dead one.
-          InvalidateStoreClient(remote_id);
-          load_tracker->MarkFailed(hashes);
-          load_promise.Set(fetch_response.status());
-          return;
-        }
-
-        const auto& response = *fetch_response;
-        if (!response.failed_block_hashes().empty()) {
-          (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
-          std::string err_msg = response.error_message().empty()
-                                    ? "Fetch RPC returned failed blocks"
-                                    : response.error_message();
-          load_tracker->MarkFailed(hashes);
-          load_promise.Set(absl::InternalError(err_msg));
-          return;
-        }
-
-        std::vector<Buffer> src_buffers;
-        src_buffers.reserve(dst_host_block_ids.size());
-        for (int id : dst_host_block_ids) {
-          src_buffers.emplace_back(id, std::vector<BufferShard>{}, std::nullopt,
-                                   ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
-        }
-
-        std::vector<Buffer> dst_buffers;
-        dst_buffers.reserve(dev_ids_vec.size());
-        for (int id : dev_ids_vec) {
-          dst_buffers.emplace_back(id, std::vector<BufferShard>{}, std::nullopt,
-                                   ::tpu_sync::rpc::MEMORY_TYPE_HBM);
-        }
-
-        tsl::Future<> h2d_future =
-            raiden_controller_->TransferBuffers(src_buffers, dst_buffers);
-
-        h2d_future.OnReady(
-            [this, dst_host_block_ids, hashes = std::move(hashes), load_tracker,
-             load_promise =
-                 std::move(load_promise)](absl::Status status) mutable {
-              (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
-              if (status.ok()) {
-                load_tracker->MarkDone(hashes);
-              } else {
-                load_tracker->MarkFailed(hashes);
-              }
-              load_promise.Set(status);
-            });
+          if (status.ok()) {
+            load_tracker->MarkDone(hashes);
+          } else {
+            load_tracker->MarkFailed(hashes);
+          }
+          load_promise.Set(status);
+        });
       });
 
   return load_future;
@@ -1241,13 +1258,18 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
       raiden_controller_->TransferBuffers(src_buffers, dst_buffers);
 
   auto [promise, future] = tsl::MakePromise<>();
-  h2d_future.OnReady([this,
+  h2d_future.OnReady([this, lifetime = lifetime_,
                       hashes = std::vector<std::string>(block_hashes.begin(),
                                                         block_hashes.end()),
                       dev_ids = std::vector<int32_t>(device_block_ids.begin(),
                                                      device_block_ids.end()),
                       load_tracker, promise = std::move(promise)](
                          absl::Status status) mutable {
+    absl::MutexLock lifetime_lock(lifetime->mu);
+    if (!lifetime->is_alive) {
+      promise.Set(absl::CancelledError("Backend destroyed"));
+      return;
+    }
     if (status.ok()) {
       std::vector<std::string> update_hashes;
       std::vector<RaidenBlockId> update_slices;
@@ -1321,7 +1343,7 @@ tsl::Future<> HostOffloadBackend::Save(
 
   auto [save_promise, save_future] = tsl::MakePromise<>();
   transfer_future.OnReady(
-      [this,
+      [this, lifetime = lifetime_,
        hashes =
            std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
        src_device_ids = std::vector<int64_t>(src_device_block_ids.begin(),
@@ -1330,6 +1352,11 @@ tsl::Future<> HostOffloadBackend::Save(
                                            dst_host_block_ids.end()),
        save_tracker,
        save_promise = std::move(save_promise)](absl::Status status) mutable {
+        absl::MutexLock lifetime_lock(lifetime->mu);
+        if (!lifetime->is_alive) {
+          save_promise.Set(absl::CancelledError("Backend destroyed"));
+          return;
+        }
         if (status.ok()) {
           std::vector<std::string> update_hashes;
           std::vector<RaidenBlockId> update_slices;

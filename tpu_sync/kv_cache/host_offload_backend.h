@@ -62,6 +62,8 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   ~HostOffloadBackend() override;
 
+  void Shutdown() override;
+
   std::string name() const override { return "HostOffloadBackend"; }
 
   absl::StatusOr<BlockSliceList> Lookup(

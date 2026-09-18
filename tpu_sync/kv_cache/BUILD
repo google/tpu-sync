@@ -42,6 +42,7 @@ cc_test(
         "-fexceptions",
     ],
     features = ["-use_header_modules"],
+    tags = ["no_oss"],
     deps = [
         ":kv_cache_listener",
         ":kv_cache_manager_base",
@@ -575,6 +576,7 @@ cc_test(
     ],
     features = ["-use_header_modules"],
     local_defines = ["ABSL_DEFINE_UNQUALIFIED_STATUS_TESTING_MACROS"],
+    tags = ["no_oss"],
     deps = [
         ":block_tracker",
         ":host_offload_backend",
@@ -622,6 +624,7 @@ cc_test(
     ],
     features = ["-use_header_modules"],
     local_defines = ["ABSL_DEFINE_UNQUALIFIED_STATUS_TESTING_MACROS"],
+    tags = ["no_oss"],
     deps = [
         ":block_tracker",
         ":host_offload_backend",

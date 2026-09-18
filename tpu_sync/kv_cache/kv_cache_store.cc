@@ -853,6 +853,12 @@ KVCacheStore::~KVCacheStore() {
     ShutdownBackendStoreServers(/*already_shut=*/nullptr);
   }
 
+  for (const auto& backend : backends_) {
+    if (backend != nullptr) {
+      backend->Shutdown();
+    }
+  }
+
   // Abandon outstanding remote writes without waiting (waiting could block
   // ~30s on a dead peer). The internal pins must be released here: a backend
   // can outlive this store, and a leftover pin is never reclaimed.

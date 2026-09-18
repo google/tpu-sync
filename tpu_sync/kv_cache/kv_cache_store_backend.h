@@ -110,6 +110,11 @@ class KVCacheStoreBackend {
  public:
   virtual ~KVCacheStoreBackend() = default;
 
+  // Invalidates the backend's lifetime fence and stops any backend-owned
+  // background servers before the owning KVCacheStore destroys its
+  // controller and block trackers.
+  virtual void Shutdown() {}
+
   // Name identifying the backend type (e.g., "LruCacheBackend",
   // "GlobalMemoryPoolingBackend").
   virtual std::string name() const = 0;

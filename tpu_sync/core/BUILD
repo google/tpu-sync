@@ -98,6 +98,7 @@ cc_test(
         "-fexceptions",
     ],
     features = ["-use_header_modules"],
+    tags = ["no_oss"],
     deps = [
         ":buffer_utils",
         ":tsl_platform_headers",

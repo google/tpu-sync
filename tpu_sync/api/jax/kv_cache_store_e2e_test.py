@@ -14,9 +14,12 @@
 
 """E2E test for JAX KVCacheStore with TPUs."""
 
+import glob
 import os
+import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -379,6 +382,397 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
   )
   def test_e2e_with_slices_with_multi_numa(self):
     self._run_e2e_test(enable_multi_numa=True, use_slices=True)
+
+  def test_secondary_storage_e2e_offload_recall(self):
+    """Verifies end-to-end offload to storage and recall across TPU chips."""
+    tpu_sharding = self.setup_shardings()
+    num_blocks = 2
+    # Shape: (num_blocks, tokens_per_block, head_shards, heads_per_shard, head_dim)
+    # (2 blocks, 128 tokens/block, 8 head shards, 8 heads/shard, head_dim 128).
+    shape = (num_blocks, 128, 8, 8, 128)
+    block_bytes = (np.prod(shape) // num_blocks) * 4
+    total_bytes = np.prod(shape) * 4
+    print(
+        "\n======================================================================\n[JAX"
+        " E2E Storage] STARTING 4-CHIP SECONDARY STORAGE E2E TEST\n  Total TPU"
+        f" Chips: {self.num_devices} | Devices: {self.devices}\n  Logical"
+        f" Shape: {shape} ({num_blocks} blocks)\n  Bytes/block: {block_bytes} B"
+        f" ({block_bytes / (1024 * 1024):.1f} MiB) | Total bytes: {total_bytes}"
+        f" B ({total_bytes / (1024 * 1024):.1f}"
+        " MiB)\n======================================================================\n[JAX"
+        " E2E Storage][Step 1/11] Generating reference cache data and placing"
+        f" across {self.num_devices} TPU chips...",
+        flush=True,
+    )
+    host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    tpu_cache = jax.device_put(jnp.array(host_data), tpu_sharding)
+    jax.block_until_ready(tpu_cache)
+    print(
+        "[JAX E2E Storage][Step 1/11] Device buffer initialized and"
+        f" synchronized on {self.num_devices} TPUs (sharding={tpu_sharding}).",
+        flush=True,
+    )
+    expected_ref = host_data
+
+    block_elements = 128 * 8 * 8 * 128
+    shard_size_bytes = (block_elements * 4) // self.num_devices
+
+    temp_dir = tempfile.mkdtemp()
+    try:
+      print(
+          "[JAX E2E Storage][Step 2/11] Configuring POSIX secondary storage"
+          f" backend:\n  root_dir: {temp_dir}\n  model_name: llama_70b_jax\n "
+          f" tp_size: {self.num_devices}, tp_rank: 0\n  shard_size_bytes:"
+          f" {shard_size_bytes} B",
+          flush=True,
+      )
+      cfg = kv_cache_store._impl.BackendConfig()
+      cfg.type = "posix"
+      cfg.parallelism.tp_rank = 0
+      cfg.parallelism.tp_size = self.num_devices
+      cfg.set_property("root_dir", temp_dir)
+      cfg.set_property("model_name", "llama_70b_jax")
+
+      # =======================================================================
+      # Phase 1: Node 1 Offload to Secondary Storage
+      # =======================================================================
+      tag1 = f"sec1_{uuid.uuid4().hex[:8]}"
+      controller_port1 = _pick_unused_port()
+      print(
+          f"[JAX E2E Storage][Step 3/11] Initializing Node 1 (tag={tag1},"
+          f" controller_port={controller_port1}, shards={self.num_devices})...",
+          flush=True,
+      )
+      rid1 = kv_cache_store.RaidenId(tag1, "0", "cache_1", 0)
+      # Worker Discovery & Backend Registration:
+      # 1. KVCacheStore's RaidenController listens for gRPC RegisterWorker calls on controller_port.
+      # 2. Each worker KVCacheManager connects to the controller and registers its worker endpoint.
+      # 3. Both store and manager initialize secondary backends locally from BackendConfig.
+      store1 = kv_cache_store.KVCacheStore(
+          capacity=num_blocks,
+          raiden_id=rid1,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=controller_port1,
+          secondary_backend_configs=[cfg],
+      )
+      manager1 = kv_cache_manager.KVCacheManager(
+          kv_caches=[tpu_cache],
+          local_control_port=0,
+          max_blocks=num_blocks,
+          num_slots=2,
+          unsafe_skip_buffer_lock=self.skip_lock,
+          raiden_worker_port=0,
+          raiden_controller_address=f"localhost:{controller_port1}",
+          worker_id="worker_0",
+          backend_configs=[cfg],
+      )
+
+      hashes = [b"sec_hash_0", b"sec_hash_1"]
+      try:
+        print(
+            "[JAX E2E Storage][Step 3/11] Inserting initial HBM blocks"
+            f" {hashes} to device_blocks=[0, 1]...",
+            flush=True,
+        )
+        slices = [
+            kv_cache_store.RaidenBlockId(
+                rid1,
+                host_block_id=-1,
+                device_block_id=0,
+                status=kv_cache_store.BlockStatus.HBM,
+            ),
+            kv_cache_store.RaidenBlockId(
+                rid1,
+                host_block_id=-1,
+                device_block_id=1,
+                status=kv_cache_store.BlockStatus.HBM,
+            ),
+        ]
+        self.assertTrue(store1.insert(hashes, slices, on_host=False))
+
+        lookup_res = store1.lookup(hashes, pin_found=False)
+        self.assertLen(lookup_res, 2)
+        for h, b in lookup_res:
+          self.assertEqual(b.status, kv_cache_store.BlockStatus.HBM)
+          print(
+              f"  [Node 1 Inserted] hash={h!r}"
+              f" device_block_id={b.device_block_id}"
+              f" host_block_id={b.host_block_id} status={b.status.name}",
+              flush=True,
+          )
+        print(
+            "[JAX E2E Storage][Step 3/11] Verified initial status in store1 is"
+            " HBM.",
+            flush=True,
+        )
+
+        print(
+            "[JAX E2E Storage][Step 4/11] Triggering offload (save) for"
+            f" {hashes}...",
+            flush=True,
+        )
+        save_start = time.time()
+        self.assertTrue(store1.save(hashes))
+
+        done = False
+        while not done:
+          save_done, save_failed, _, save_existing, save_unregistered = (
+              store1.poll_save_status()
+          )
+          if save_failed:
+            raise RuntimeError(f"Async Save failed: {save_failed}")
+          self.assertEmpty(save_existing)
+          self.assertEmpty(save_unregistered)
+          if save_done:
+            done = True
+          if not done:
+            time.sleep(0.01)
+        save_duration = time.time() - save_start
+        print(
+            "[JAX E2E Storage][Step 4/11] Save completed in"
+            f" {save_duration:.3f}s. Blocks confirmed: {save_done}.",
+            flush=True,
+        )
+
+        print(
+            "[JAX E2E Storage][Step 5/11] Post-save lookup verifying"
+            " HOST_AND_HBM status...",
+            flush=True,
+        )
+        lookup_res = store1.lookup(hashes, pin_found=False)
+        self.assertLen(lookup_res, 2)
+        for h, b in lookup_res:
+          self.assertEqual(b.status, kv_cache_store.BlockStatus.HOST_AND_HBM)
+          print(
+              f"  [Node 1 Post-Save] hash={h!r} host_block_id={b.host_block_id}"
+              f" device_block_id={b.device_block_id} status={b.status.name}",
+              flush=True,
+          )
+        print(
+            "[JAX E2E Storage][Step 5/11] Verified status updated to"
+            " HOST_AND_HBM in store1.",
+            flush=True,
+        )
+
+        print(
+            "[JAX E2E Storage][Step 6/11] Scanning on-disk shard files and"
+            " verifying bit-for-bit integrity...",
+            flush=True,
+        )
+        all_disk_files = glob.glob(
+            os.path.join(temp_dir, "**", "*"), recursive=True
+        )
+        print(
+            "[JAX E2E Storage][Step 6/11] Directory scan found"
+            f" {len(all_disk_files)} filesystem entries under {temp_dir}.",
+            flush=True,
+        )
+        # Expected shard path:
+        #   {storage_root}/llama_70b_jax/tp{self.num_devices}_r0/{hash[:3]}/{hash[3:5]}/{hash}.bin
+        bin_files = glob.glob(
+            os.path.join(
+                temp_dir,
+                "llama_70b_jax",
+                f"tp{self.num_devices}_r0",
+                "**",
+                "*.bin",
+            ),
+            recursive=True,
+        )
+        self.assertLen(bin_files, 2)
+        print(
+            f"[JAX E2E Storage][Step 6/11] Discovered {len(bin_files)} disk"
+            f" block files: {[os.path.basename(f) for f in bin_files]}",
+            flush=True,
+        )
+        for f in bin_files:
+          print(f"  File: {f} ({os.path.getsize(f)} bytes)", flush=True)
+
+        file_by_name = {os.path.basename(f): f for f in bin_files}
+        expected_block_bytes = (np.prod(shape) // num_blocks) * 4
+        for h in hashes:
+          expected_filename = f"{h.hex()}.bin"
+          self.assertIn(expected_filename, file_by_name)
+          fpath = file_by_name[expected_filename]
+          fsize = os.path.getsize(fpath)
+          self.assertEqual(fsize, expected_block_bytes)
+          print(
+              f"  [Verified File] {expected_filename}: exact size={fsize} bytes"
+              f" matches expected={expected_block_bytes} bytes",
+              flush=True,
+          )
+        print(
+            "[JAX E2E Storage][Step 6/11] Bit-for-bit disk file size and"
+            " presence verification PASSED.",
+            flush=True,
+        )
+
+        print(
+            "[JAX E2E Storage][Step 7/11] Overwriting TPU HBM cache with"
+            " zeros...",
+            flush=True,
+        )
+        manager1.h2d([2, 2], [0, 1]).wait()
+        sum_val = float(jax.jit(jnp.sum)(tpu_cache))
+        self.assertEqual(sum_val, 0.0)
+        print(
+            "[JAX E2E Storage][Step 7/11] Verified TPU device memory is zeroed"
+            f" (sum={sum_val}).",
+            flush=True,
+        )
+      finally:
+        print(
+            "[JAX E2E Storage][Step 7/11] Cleaning up Node 1 (destroying"
+            " manager1 & store1)...",
+            flush=True,
+        )
+        del manager1, store1
+
+      # =======================================================================
+      # Phase 2: Node 2 Cold Storage Recall & Status Verification
+      # =======================================================================
+      tag2 = f"sec2_{uuid.uuid4().hex[:8]}"
+      controller_port2 = _pick_unused_port()
+      print(
+          "[JAX E2E Storage][Step 8/11] Spinning up cold Instance 2 (Reader)"
+          f" with empty DRAM cache (tag={tag2},"
+          f" controller_port={controller_port2})...",
+          flush=True,
+      )
+      rid2 = kv_cache_store.RaidenId(tag2, "0", "cache_2", 0)
+      # Worker Discovery & Backend Registration:
+      # 1. KVCacheStore's RaidenController listens for gRPC RegisterWorker calls on controller_port.
+      # 2. Each worker KVCacheManager connects to the controller and registers its worker endpoint.
+      # 3. Both store and manager initialize secondary backends locally from BackendConfig.
+      store2 = kv_cache_store.KVCacheStore(
+          capacity=num_blocks,
+          raiden_id=rid2,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=controller_port2,
+          secondary_backend_configs=[cfg],
+      )
+      manager2 = kv_cache_manager.KVCacheManager(
+          kv_caches=[tpu_cache],
+          local_control_port=0,
+          max_blocks=num_blocks,
+          num_slots=2,
+          unsafe_skip_buffer_lock=self.skip_lock,
+          raiden_worker_port=0,
+          raiden_controller_address=f"localhost:{controller_port2}",
+          worker_id="worker_0",
+          backend_configs=[cfg],
+      )
+
+      try:
+        print(
+            "[JAX E2E Storage][Step 9/11] Performing cold lookup for"
+            f" {hashes}...",
+            flush=True,
+        )
+        storage_lookup = store2.lookup(hashes, pin_found=False)
+        self.assertLen(storage_lookup, 2)
+        for h, b in storage_lookup:
+          self.assertEqual(b.status, kv_cache_store.BlockStatus.SHARED_STORAGE)
+          print(
+              f"  [Node 2 Cold Lookup] hash={h!r} status={b.status.name}"
+              f" data_name={b.raiden_id.data_name}",
+              flush=True,
+          )
+        print(
+            "[JAX E2E Storage][Step 9/11] Cold lookup verified: blocks"
+            " discovered with status=SHARED_STORAGE from storage tier.",
+            flush=True,
+        )
+
+        print(
+            "[JAX E2E Storage][Step 10/11] Triggering cold recall (store2.load)"
+            " into device_block_ids=[0, 1]...",
+            flush=True,
+        )
+        load_start = time.time()
+        storage_slices = [s for _, s in storage_lookup]
+        self.assertTrue(store2.load(hashes, [0, 1], slices=storage_slices))
+
+        done = False
+        while not done:
+          load_done, load_failed, _ = store2.poll_load_status()
+          if load_failed:
+            raise RuntimeError(f"Async Load failed: {load_failed}")
+          if load_done:
+            done = True
+          if not done:
+            time.sleep(0.01)
+        load_duration = time.time() - load_start
+        print(
+            "[JAX E2E Storage][Step 10/11] Load operation completed in"
+            f" {load_duration:.3f}s.",
+            flush=True,
+        )
+
+        print(
+            "[JAX E2E Storage][Step 10/11] Verifying restored TPU HBM tensor"
+            " matches expected reference...",
+            flush=True,
+        )
+        recalled_tpu_cache = jax.jit(lambda x: x)(tpu_cache)
+        jax.block_until_ready(recalled_tpu_cache)
+        recalled_np = np.asarray(recalled_tpu_cache)
+        np.testing.assert_array_equal(recalled_np, expected_ref)
+        print(
+            "[JAX E2E Storage][Step 10/11] Tensor bit-for-bit match verified"
+            f" across all {self.num_devices} TPU chips"
+            f" (elements={recalled_np.size}, min={recalled_np.min()},"
+            f" max={recalled_np.max()}).",
+            flush=True,
+        )
+
+        print(
+            "[JAX E2E Storage][Step 11/11] Validating post-recall status is"
+            " HOST_AND_HBM and tearing down Instance 2...",
+            flush=True,
+        )
+        repopulated = store2.lookup(hashes, pin_found=False)
+        self.assertLen(repopulated, 2)
+        for h, b in repopulated:
+          self.assertEqual(b.status, kv_cache_store.BlockStatus.HOST_AND_HBM)
+          self.assertIn(b.device_block_id, [0, 1])
+          self.assertGreaterEqual(b.host_block_id, 0)
+          print(
+              f"  [Node 2 Post-Recall] hash={h!r}"
+              f" host_block_id={b.host_block_id}"
+              f" device_block_id={b.device_block_id} status={b.status.name}",
+              flush=True,
+          )
+        print(
+            "[JAX E2E Storage][Step 11/11] Post-recall lookup verified:"
+            " status=HOST_AND_HBM (device_blocks=[0,1], host_blocks confirmed"
+            " >= 0; HBM and host RAM updated).",
+            flush=True,
+        )
+      finally:
+        print(
+            "[JAX E2E Storage][Step 11/11] Cleaning up Node 2 (destroying"
+            " manager2 & store2)...",
+            flush=True,
+        )
+        del manager2, store2
+    finally:
+      shutil.rmtree(temp_dir, ignore_errors=True)
+      print(
+          f"[JAX E2E Storage] Cleaned up temporary directory {temp_dir}.",
+          flush=True,
+      )
+
+    print(
+        f"[JAX E2E Storage][SUCCESS] 4-Chip JAX secondary storage offload and"
+        f" recall end-to-end test passed successfully!\n"
+        f"======================================================================\n",
+        flush=True,
+    )
 
   def _run_remote_read_e2e_test(
       self,

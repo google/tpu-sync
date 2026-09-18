@@ -14,7 +14,7 @@
 
 """Python wrapper for the compiled C++ KVCacheStore."""
 
-from typing import Any
+from typing import Any, Sequence
 
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _impl
 
@@ -137,6 +137,7 @@ class KVCacheStore:
       raiden_controller_port: int = 0,
       expected_worker_count: int = 0,
       kv_pool_group: str = "",
+      secondary_backend_configs: Sequence[Any] = (),
   ):
     """Creates a KVCacheStore.
 
@@ -199,6 +200,7 @@ class KVCacheStore:
         raiden_controller_port=raiden_controller_port,
         expected_worker_count=expected_worker_count,
         kv_pool_group=kv_pool_group,
+        secondary_backend_configs=list(secondary_backend_configs),
     )
 
   @property

@@ -36,6 +36,7 @@
 #include "tpu_sync/core/controller/worker_service_server.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/tpu_utils.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 
 namespace xla {
 class PjRtBuffer;
@@ -152,6 +153,14 @@ class NumaAwareKVCacheManager {
 
   absl::Status UnlockBlocks(const std::vector<int>& block_ids);
 
+  void RegisterKVBackends(absl::Span<const kv_cache::BackendConfig> configs) {
+    for (auto& sub_manager : sub_managers_) {
+      if (sub_manager != nullptr) {
+        sub_manager->RegisterKVBackends(configs);
+      }
+    }
+  }
+
   std::string DumpMetricsToString() const;
 
   absl::StatusOr<raiden::PjRtCopyFuture> H2d(
@@ -211,6 +220,21 @@ class NumaAwareKVCacheManager {
       const std::vector<int64_t>& dst_host_offsets,
       const std::vector<int64_t>& dst_device_offsets,
       const std::vector<int64_t>& copy_sizes);
+
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids,
+      const std::vector<int64_t>& dst_host_block_ids);
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_host_block_ids,
+      const std::vector<int64_t>& dst_device_block_ids);
+
+  std::shared_ptr<kv_cache::backends::KVBackend> GetKVBackend(
+      absl::string_view backend_name) const;
 
  private:
 #ifndef WITHOUT_PYTHON
@@ -336,6 +360,10 @@ class KVCacheManager {
   }
   size_t GetHostSize(size_t layer_idx, size_t shard_idx) {
     return numa_manager_->GetHostSize(layer_idx, shard_idx);
+  }
+
+  void RegisterKVBackends(absl::Span<const kv_cache::BackendConfig> configs) {
+    numa_manager_->RegisterKVBackends(configs);
   }
 
   int64_t NotifyForRead(const std::string& req_id, uint64_t uuid,
@@ -472,6 +500,29 @@ class KVCacheManager {
       const std::vector<int>& dst_block_ids) {
     return numa_manager_->H2hReadExplicit(remote_descriptors, src_block_ids,
                                           dst_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids,
+      const std::vector<int64_t>& dst_host_block_ids) {
+    return numa_manager_->D2hWriteToBackend(
+        backends, block_keys, src_device_block_ids, dst_host_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_host_block_ids,
+      const std::vector<int64_t>& dst_device_block_ids) {
+    return numa_manager_->H2dReadFromBackend(
+        backends, block_keys, src_host_block_ids, dst_device_block_ids);
+  }
+
+  std::shared_ptr<kv_cache::backends::KVBackend> GetKVBackend(
+      absl::string_view backend_name) const {
+    return numa_manager_->GetKVBackend(backend_name);
   }
 
  private:

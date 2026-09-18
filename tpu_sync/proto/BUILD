@@ -153,3 +153,35 @@ cc_grpc_library(
     visibility = ["//visibility:public"],
     deps = [":kv_cache_control_plane_service_cc_proto"],
 )
+
+proto_library(
+    name = "control_pipe_proto",
+    srcs = ["control_pipe.proto"],
+)
+
+cc_proto_library(
+    name = "control_pipe_cc_proto",
+    visibility = ["//visibility:public"],
+    deps = [":control_pipe_proto"],
+)
+
+cc_grpc_library(
+    name = "control_pipe_cc_grpc",
+    srcs = [":control_pipe_proto"],
+    grpc_only = True,
+    visibility = ["//visibility:public"],
+    deps = [":control_pipe_cc_proto"],
+)
+
+py_proto_library(
+    name = "control_pipe_py_pb2",
+    visibility = ["//visibility:public"],
+    deps = [":control_pipe_proto"],
+)
+
+py_grpc_library(
+    name = "control_pipe_py_pb2_grpc",
+    srcs = [":control_pipe_proto"],
+    visibility = ["//visibility:public"],
+    deps = [":control_pipe_py_pb2"],
+)

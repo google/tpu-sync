@@ -1,0 +1,66 @@
+// Copyright 2026 Google LLC.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package tpu_raiden.control_pipe.proto;
+
+option java_multiple_files = true;
+
+// Universal transport-agnostic request envelope for all Raiden control plane
+// messages (P2P KV Cache handshakes, Weight Sync commands, Controller RPCs).
+message ControlEnvelope {
+  // Fully-qualified protobuf message name or registered type tag
+  // (e.g., "tpu_raiden.control_plane.proto.PullStreamRequest",
+  //  "tpu_raiden.control_plane.proto.AckRequest",
+  //  "tpu_sync.rpc.ControlRequest").
+  string message_type = 1;
+
+  // Unique request correlation ID for tracing and stream multiplexing.
+  uint64 request_id = 2;
+
+  // Serialized request protobuf or binary payload bytes.
+  bytes payload = 3;
+
+  // Optional caller metadata (e.g., trace context, source worker ID).
+  map<string, string> metadata = 4;
+}
+
+// Universal transport-agnostic response envelope.
+message ControlResponseEnvelope {
+  // Echoed request_id matching the originating ControlEnvelope.
+  uint64 request_id = 1;
+
+  // Canonical status code (0 = OK, non-zero maps to absl::StatusCode /
+  // grpc::StatusCode).
+  int32 status_code = 2;
+
+  // Optional human-readable error diagnostic when status_code != 0.
+  string error_message = 3;
+
+  // Serialized response protobuf bytes (empty for one-way/ack handlers or
+  // errors).
+  bytes payload = 4;
+}
+
+// Unified gRPC service for all Raiden control-plane communication.
+service ControlPipeService {
+  // Unary request-response control RPC.
+  rpc SendControl(ControlEnvelope) returns (ControlResponseEnvelope) {}
+
+  // Persistent bidirectional streaming RPC for high-frequency P2P handshakes
+  // and multiplexed control streams.
+  rpc ControlStream(stream ControlEnvelope)
+      returns (stream ControlResponseEnvelope) {}
+}

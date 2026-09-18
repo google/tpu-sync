@@ -1,0 +1,57 @@
+// Copyright 2026 Google LLC.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "tpu_sync/common/control_pipe/control_pipe_types.h"
+
+#include <cstdlib>
+#include <optional>
+#include <string>
+
+#include "absl/log/log.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/string_view.h"
+
+namespace tpu_raiden {
+
+ControlPipeBackendType ResolveControlPipeBackendType(
+    std::optional<ControlPipeBackendType> override_type) {
+  if (override_type.has_value()) {
+    return *override_type;
+  }
+  if (const char* env_backend =
+          std::getenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND")) {
+    std::string val = absl::AsciiStrToLower(env_backend);
+    if (val == "grpc") return ControlPipeBackendType::kGrpc;
+    if (val == "tcp") return ControlPipeBackendType::kTcp;
+    LOG(WARNING) << "Unknown TPU_RAIDEN_CONTROL_PLANE_BACKEND='" << env_backend
+                 << "', falling back to TCP.";
+  }
+  if (const char* env_flag = std::getenv("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE")) {
+    std::string val = absl::AsciiStrToLower(env_flag);
+    if (val == "1" || val == "true") return ControlPipeBackendType::kGrpc;
+  }
+  return ControlPipeBackendType::kTcp;
+}
+
+absl::string_view ControlPipeBackendTypeName(ControlPipeBackendType type) {
+  switch (type) {
+    case ControlPipeBackendType::kGrpc:
+      return "grpc";
+    case ControlPipeBackendType::kTcp:
+      return "tcp";
+  }
+  return "tcp";
+}
+
+}  // namespace tpu_raiden

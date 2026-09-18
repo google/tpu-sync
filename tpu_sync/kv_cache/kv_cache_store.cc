@@ -151,6 +151,19 @@ absl::Status ValidateBackends(
     return absl::InvalidArgumentError(
         "KVCacheStore's tier-0 backend must not be null.");
   }
+  // Enforce at most 1 secondary backend.
+  size_t num_secondary = 0;
+  for (size_t i = 1; i < backends.size(); ++i) {
+    if (backends[i] && !backends[i]->name().empty()) {
+      ++num_secondary;
+    }
+  }
+  if (num_secondary > 1) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "KVCacheStore currently supports at most 1 secondary backend, "
+        "but found ",
+        num_secondary, "."));
+  }
   return absl::OkStatus();
 }
 
@@ -172,7 +185,26 @@ MakeRaidenController(const RaidenId& raiden_id, size_t capacity, int num_shards,
       /*preprovision_worker_buffers=*/false, expected_worker_count);
 }
 
+// Ensures cluster dimensions (e.g. tp_size) are explicitly configured on the
+// secondary backend config. Properties come from the caller only.
+BackendConfig ResolveSecondaryBackendConfigDefaults(BackendConfig sec_cfg,
+                                                    int num_shards) {
+  if (!sec_cfg.HasProperty("tp_size")) {
+    sec_cfg.SetProperty("tp_size",
+                        std::to_string(num_shards > 0 ? num_shards : 1));
+  }
+  if (!sec_cfg.HasProperty("model_name")) {
+    sec_cfg.SetProperty("model_name", "unknown");
+  }
+  if (!sec_cfg.HasProperty("root_dir")) {
+    sec_cfg.SetProperty("root_dir", "/tmp/raiden_storage");
+  }
+  return sec_cfg;
+}
+
 }  // namespace
+
+// --- KVCacheStore Implementation ---
 
 absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
     absl::Span<const BackendConfig> backend_configs, size_t capacity,
@@ -233,6 +265,22 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
   }
 
   RaidenId effective_raiden_id = effective_config0.raiden_id;
+
+  std::vector<BackendConfig> effective_configs(backend_configs.begin(),
+                                               backend_configs.end());
+
+  for (size_t i = 1; i < effective_configs.size(); ++i) {
+    effective_configs[i] = ResolveSecondaryBackendConfigDefaults(
+        std::move(effective_configs[i]), num_shards);
+  }
+
+  if (effective_configs.size() > 2) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("TPU Raiden currently supports at most 1 secondary "
+                     "backend, but found ",
+                     effective_configs.size() - 1, "."));
+  }
+
   std::unique_ptr<::tpu_raiden::controller::RaidenController> raiden_controller;
   if (num_shards > 0) {
     ABSL_ASSIGN_OR_RETURN(
@@ -243,21 +291,24 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
   }
 
   std::vector<std::shared_ptr<KVCacheStoreBackend>> backends;
-  backends.reserve(backend_configs.size());
+  backends.reserve(effective_configs.size());
 
-  for (size_t i = 0; i < backend_configs.size(); ++i) {
-    const auto& config = backend_configs[i];
+  for (size_t i = 0; i < effective_configs.size(); ++i) {
+    const auto& config = effective_configs[i];
     BackendConfig effective_config = (i == 0) ? effective_config0 : config;
 
-    // Apply global registry address and raiden_id across all backend
-    // configurations
-    if (effective_config.global_registry_address.empty() &&
-        !global_registry_address.empty()) {
-      effective_config.global_registry_address =
-          std::string(global_registry_address);
-    }
-    if (effective_config.raiden_id.empty() && !raiden_id.empty()) {
-      effective_config.raiden_id = raiden_id;
+    // Apply global registry address and raiden_id to tier 0
+    // (HostOffloadBackend).
+    // TODO: Revisit secondary tier registration with global registry.
+    if (i == 0) {
+      if (effective_config.global_registry_address.empty() &&
+          !global_registry_address.empty()) {
+        effective_config.global_registry_address =
+            std::string(global_registry_address);
+      }
+      if (effective_config.raiden_id.empty() && !raiden_id.empty()) {
+        effective_config.raiden_id = raiden_id;
+      }
     }
 
     ABSL_ASSIGN_OR_RETURN(auto backend,
@@ -409,6 +460,7 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
     store->store_monitor_->Start();
   }
 
+  store->backend_configs_ = std::move(effective_configs);
   return store;
 }
 
@@ -417,11 +469,23 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
     absl::string_view global_registry_address, RaidenId raiden_id,
     int num_shards, int64_t shard_size_bytes, absl::string_view store_server_ip,
     int raiden_controller_port, std::optional<KVCacheMetadata> metadata,
-    int expected_worker_count) {
-  return KVCacheStore::Create(
-      absl::MakeConstSpan(&config, 1), capacity, global_registry_address,
-      raiden_id, num_shards, shard_size_bytes, store_server_ip,
-      raiden_controller_port, std::move(metadata), expected_worker_count);
+    int expected_worker_count,
+    absl::Span<const BackendConfig> secondary_backend_configs) {
+  if (secondary_backend_configs.empty()) {
+    return KVCacheStore::Create(
+        absl::MakeConstSpan(&config, 1), capacity, global_registry_address,
+        raiden_id, num_shards, shard_size_bytes, store_server_ip,
+        raiden_controller_port, std::move(metadata), expected_worker_count);
+  }
+  std::vector<BackendConfig> all_configs;
+  all_configs.reserve(1 + secondary_backend_configs.size());
+  all_configs.push_back(config);
+  all_configs.insert(all_configs.end(), secondary_backend_configs.begin(),
+                     secondary_backend_configs.end());
+  return KVCacheStore::Create(all_configs, capacity, global_registry_address,
+                              raiden_id, num_shards, shard_size_bytes,
+                              store_server_ip, raiden_controller_port,
+                              std::move(metadata), expected_worker_count);
 }
 
 absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::CreateReshardStore(
@@ -906,6 +970,29 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
                                             .pin_found = pin_found});
 }
 
+// ---------------------------------------------------------------------------
+// Hierarchical Multi-Tier Lookup Fallback Mechanism:
+//
+// In P/D disaggregated and hybrid serving modes, KVCacheStore enforces a
+// strict recall priority across memory and persistent storage tiers:
+//
+//   Tier 0A (Local Host DRAM) -> Tier 0B (Peer RAM) -> Tier 1 (Storage)
+//
+// 1. Tier 0 (`backends_[0]` - HostOffloadBackend):
+//    - Manages both Local Host DRAM (`BlockStatus::LOCAL`) and Peer RAM
+//      (`BlockStatus::REMOTE` discovered via GlobalRegistryClient).
+//    - Local DRAM has highest priority (PCIe / host memory latency).
+//    - Peer RAM has second priority.
+//    - Both are queried in tier 0. If a contiguous prefix matches in Local
+//      or Peer RAM, `accumulated_results` is populated and `start_idx`
+//      advances.
+//
+// 2. Tier 1 (`backends_[1]` - Secondary Storage Backend):
+//    - Generic secondary backend (e.g. file storage, block storage).
+//    - Only queried for remaining block hashes (`subspan(start_idx)`) that
+//      missed BOTH Local DRAM and Peer RAM.
+//    - Matched blocks are returned with `BlockStatus::SHARED_STORAGE`.
+// ---------------------------------------------------------------------------
 absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
     const std::vector<std::string>& block_hashes,
     const LookupOptions& options) {
@@ -1077,6 +1164,133 @@ absl::Status KVCacheStore::SaveLocal(
   }
   const auto& host_block_ids = *host_blocks;
 
+  std::shared_ptr<KVCacheStoreBackend> secondary_backend = nullptr;
+  std::string secondary_backend_name;
+  if (backends_.size() > 1 && backends_[1] != nullptr) {
+    secondary_backend = backends_[1];
+    secondary_backend_name = secondary_backend->name();
+  }
+
+  if (secondary_backend != nullptr && !secondary_backend_name.empty()) {
+    ::tpu_sync::proto::BackendTransferSpec spec;
+    spec.set_name(secondary_backend_name);
+
+    // OFFLOAD: the HBM side is the source and the host-DRAM staging side is
+    // the destination. The staging blocks are deliberately retained on
+    // success -- they become the tier-0 host-resident copy below.
+    const std::vector<int64_t> host_ids(host_block_ids.begin(),
+                                        host_block_ids.end());
+    tsl::Future<> future = raiden_controller_->TransferBackendBuffers(
+        ::tpu_sync::proto::TRANSFER_DIR_OFFLOAD, block_hashes,
+        /*hbm_block_ids=*/src_device_block_ids,
+        /*host_block_ids=*/host_ids, {spec});
+    // Captures are copies only -- no `this`. The store can be destroyed while
+    // this transfer is in flight, so every touch of it goes through the
+    // lifetime fence. The fence is held only across the member accesses: the
+    // registry work further down runs on captured copies and must not block
+    // ~KVCacheStore behind a network round trip.
+    future.OnReady([lifetime = lifetime_, wt_state = wt_state_,
+                    host_ram_backend = backend(),
+                    registry_client = registry_client_, raiden_id = raiden_id_,
+                    block_hashes, host_block_ids,
+                    src_device_block_ids](absl::Status status) {
+      if (!status.ok()) {
+        {
+          absl::MutexLock lock(lifetime->mu);
+          if (KVCacheStore* self = lifetime->store; self != nullptr) {
+            self->DeallocateBlockIds(host_block_ids);
+            self->save_tracker_.MarkFailed(block_hashes);
+          }
+        }
+        if (host_ram_backend != nullptr)
+          host_ram_backend->Release(block_hashes);
+        return;
+      }
+      std::vector<std::string> update_hashes;
+      std::vector<RaidenBlockId> update_slices;
+      update_hashes.reserve(block_hashes.size());
+      update_slices.reserve(block_hashes.size());
+      for (size_t i = 0; i < block_hashes.size(); ++i) {
+        RaidenBlockId block(raiden_id, host_block_ids[i],
+                            src_device_block_ids[i], BlockStatus::HOST_AND_HBM);
+        update_hashes.push_back(block_hashes[i]);
+        update_slices.push_back(block);
+      }
+      if (!update_hashes.empty() && host_ram_backend != nullptr) {
+        host_ram_backend->Insert(update_hashes, update_slices,
+                                 /*on_host=*/true);
+      }
+      {
+        absl::MutexLock lock(lifetime->mu);
+        if (KVCacheStore* self = lifetime->store; self != nullptr) {
+          self->save_tracker_.MarkDone(block_hashes);
+        }
+      }
+      std::vector<global_registry::Registration> write_through_regs;
+      if (registry_client) {
+        write_through_regs.reserve(block_hashes.size());
+        for (size_t i = 0; i < block_hashes.size(); ++i) {
+          write_through_regs.push_back({
+              .prefix_hash = block_hashes[i],
+              .raiden_id = raiden_id,
+              .block_id = host_block_ids[i],
+          });
+        }
+      }
+      if (!write_through_regs.empty() && registry_client) {
+        const size_t num_blocks = write_through_regs.size();
+        bool admitted = false;
+        {
+          absl::MutexLock wt_lock(wt_state->mutex);
+          admitted = wt_state->in_flight_blocks + num_blocks <=
+                     wt_state->max_in_flight_blocks;
+          if (admitted) {
+            wt_state->in_flight_blocks += num_blocks;
+          } else {
+            LOG_EVERY_N_SEC(WARNING, 5)
+                << "Not advertising " << num_blocks
+                << " saved block(s) to the global registry: "
+                << wt_state->in_flight_blocks
+                << " blocks are already pinned by write-throughs waiting on "
+                   "it, at the bound of "
+                << wt_state->max_in_flight_blocks
+                << ". Peers will not find them; the alternative is pinning "
+                   "them out of reach of eviction until the registry answers, "
+                   "which drains the host block pool.";
+          }
+        }
+        if (!admitted) {
+          if (host_ram_backend != nullptr)
+            host_ram_backend->Release(block_hashes);
+        } else {
+          registry_client
+              ->RegisterAsync(write_through_regs,
+                              global_registry::kUnwaitedMutationTimeout)
+              .OnReady([wt_state, host_ram_backend, saved = block_hashes,
+                        num_blocks](absl::Status s) {
+                {
+                  absl::MutexLock wt_lock(wt_state->mutex);
+                  wt_state->in_flight_blocks -= num_blocks;
+                }
+                if (!s.ok()) {
+                  LOG(WARNING) << "Async write-through failed after Save: "
+                               << s.message();
+                } else {
+                  LOG(INFO) << "Async write-through succeeded after Save for "
+                            << num_blocks << " blocks";
+                }
+                if (host_ram_backend != nullptr)
+                  host_ram_backend->Release(saved);
+              });
+        }
+      } else {
+        if (host_ram_backend != nullptr)
+          host_ram_backend->Release(block_hashes);
+      }
+    });
+    return absl::OkStatus();
+  }
+
   tsl::Future<> future = backend()->Save(
       block_hashes, src_device_block_ids,
       absl::Span<const int32_t>(
@@ -1232,12 +1446,17 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
   }
 
   RaidenId remote_id;
+  bool from_secondary_backend = false;
+  std::string target_backend_name;
   {
     absl::MutexLock lock(mutex_);
 
     BlockStatus first_status = slices[0].status;
     if (first_status == BlockStatus::REMOTE) {
       remote_id = slices[0].raiden_id;
+    } else if (first_status == BlockStatus::SHARED_STORAGE) {
+      from_secondary_backend = true;
+      target_backend_name = slices[0].raiden_id.data_name;
     }
 
     for (size_t i = 0; i < slices.size(); ++i) {
@@ -1256,6 +1475,11 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
         if (existing.raiden_id != remote_id) {
           return absl::InvalidArgumentError(
               "Mixed remote node IDs in a single Load call");
+        }
+      } else if (first_status == BlockStatus::SHARED_STORAGE) {
+        if (existing.status != BlockStatus::SHARED_STORAGE) {
+          return absl::InvalidArgumentError(
+              "Mixed block statuses in a single Load call");
         }
       } else {
         // The caller's pin is what a successful local load consumes, so it has
@@ -1277,6 +1501,142 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
       }
     }
     load_tracker_.AddPending(block_hashes);
+  }
+
+  if (from_secondary_backend) {
+    std::shared_ptr<KVCacheStoreBackend> secondary_backend =
+        (backends_.size() > 1) ? backends_[1] : nullptr;
+    if (!secondary_backend) {
+      absl::MutexLock lock(mutex_);
+      load_tracker_.MarkFailed(block_hashes);
+      return absl::NotFoundError(absl::StrCat(
+          "No registered secondary backend found for: ", target_backend_name));
+    }
+
+    auto host_blocks_or = AllocateBlockIds(block_hashes.size());
+    if (!host_blocks_or.ok()) {
+      absl::MutexLock lock(mutex_);
+      load_tracker_.MarkFailed(block_hashes);
+      return host_blocks_or.status();
+    }
+    const auto& staging_host_block_ids = host_blocks_or.value();
+
+    ::tpu_sync::proto::BackendTransferSpec spec;
+    spec.set_name(secondary_backend->name());
+
+    // RECALL: the host-DRAM staging side is the SOURCE and the HBM side is the
+    // destination -- the reverse of OFFLOAD. Both lists are block slot indices
+    // of the same type, so the labels below are what keeps them straight.
+    const std::vector<int64_t> host_ids(staging_host_block_ids.begin(),
+                                        staging_host_block_ids.end());
+    const std::vector<int64_t> hbm_ids(device_block_ids.begin(),
+                                       device_block_ids.end());
+    tsl::Future<> future = raiden_controller_->TransferBackendBuffers(
+        ::tpu_sync::proto::TRANSFER_DIR_RECALL, block_hashes,
+        /*hbm_block_ids=*/hbm_ids, /*host_block_ids=*/host_ids, {spec});
+
+    // Captures are copies only -- no `this`, no reference to a member tracker.
+    // The store can be destroyed while this transfer is in flight, so every
+    // touch of it goes through the lifetime fence below.
+    future.OnReady([lifetime = lifetime_, host_ram_backend = backend(),
+                    raiden_id = raiden_id_,
+                    block_hashes = std::vector<std::string>(
+                        block_hashes.begin(), block_hashes.end()),
+                    staging_host_block_ids,
+                    device_block_ids = std::vector<int>(
+                        device_block_ids.begin(), device_block_ids.end())](
+                       absl::Status status) {
+      if (!status.ok()) {
+        absl::MutexLock lock(lifetime->mu);
+        if (KVCacheStore* self = lifetime->store; self != nullptr) {
+          self->DeallocateBlockIds(staging_host_block_ids);
+          self->load_tracker_.MarkFailed(block_hashes);
+        }
+        return;
+      }
+      // Storage recall succeeded: the transfer has already written every
+      // block into HBM. Publishing the staging copy into the host-RAM tier
+      // (tier 0) is a pure caching optimization layered on top of that, so it
+      // is allowed to fail without failing the Load.
+      if (host_ram_backend == nullptr) {
+        absl::MutexLock lock(lifetime->mu);
+        if (KVCacheStore* self = lifetime->store; self != nullptr) {
+          self->DeallocateBlockIds(staging_host_block_ids);
+          self->load_tracker_.MarkDone(block_hashes);
+        }
+        return;
+      }
+
+      std::vector<std::string> update_hashes;
+      std::vector<RaidenBlockId> update_slices;
+      update_hashes.reserve(block_hashes.size());
+      update_slices.reserve(block_hashes.size());
+      for (size_t i = 0; i < block_hashes.size(); ++i) {
+        // Once the bytes are resident here, this block is ours. The slice
+        // returned by the storage tier's Lookup still carries that backend's
+        // synthetic identity ({"shared", <backend name>}), which described
+        // where the block was FOUND, not where it now lives. Publish under
+        // this store's own id so the entry is truthful to anything that reads
+        // raiden_id -- registry publication, peer lookups, and the
+        // remote-vs-local decision in Load.
+        update_hashes.push_back(block_hashes[i]);
+        update_slices.emplace_back(raiden_id, staging_host_block_ids[i],
+                                   device_block_ids[i],
+                                   BlockStatus::HOST_AND_HBM);
+      }
+
+      // TODO: revisit whether recall-admitted entries should be pinned. Left
+      // unpinned because there is no natural unpin owner on this path --
+      // offload has Release, recall has nothing equivalent -- which means the
+      // very next AllocateBlockIds may evict what we just admitted. Decide
+      // alongside the recall reservation work.
+      //
+      // Admission is done ONE BLOCK AT A TIME rather than as a single batch,
+      // because refusal is per-block: a concurrent publisher can claim any
+      // subset of these hashes, and InsertAllOrNothing rejects a batch
+      // containing even one duplicate. These hashes form a prefix chain, and
+      // prefix lookups walk from the start and stop at the first miss, so
+      // discarding the whole chain over a single mid-chain collision would
+      // throw away exactly the blocks the next request probes for. Per-block
+      // admission keeps the usable prefix.
+      //
+      // Note that the OTHER refusal lever, space, is batch-invariant today:
+      // available_space() is capacity minus the PINNED count, and these
+      // entries are admitted unpinned, so it does not shrink as the loop
+      // proceeds and either every block fits or none does. Per-block admission
+      // only becomes load-bearing for space if recall-admitted entries are
+      // ever pinned -- see the TODO above.
+      //
+      // A single-element InsertAllOrNothing is used rather than Insert because
+      // Insert cannot report a refusal: its `all_inserted` flag is only cleared
+      // when a hash was ALREADY present, never when LRUCache::Put silently
+      // drops a new key for want of evictable space. InsertAllOrNothing
+      // validates, inserts and verifies under the backend's own mutex, so the
+      // answer cannot race.
+      std::vector<int> to_return;
+      for (size_t i = 0; i < update_hashes.size(); ++i) {
+        if (!host_ram_backend->InsertAllOrNothing({update_hashes[i]},
+                                                  {update_slices[i]})) {
+          // The host-RAM tier declined ownership of this block. Its physical
+          // block id must be returned HERE: block reclamation runs through
+          // KVCacheStore::Evict, which discovers victims by asking the tier
+          // for them, so a block with no LRU entry naming it is invisible to
+          // eviction and would stay allocated-and-locked for the life of the
+          // process.
+          to_return.push_back(staging_host_block_ids[i]);
+        }
+      }
+
+      absl::MutexLock lock(lifetime->mu);
+      if (KVCacheStore* self = lifetime->store; self != nullptr) {
+        if (!to_return.empty()) self->DeallocateBlockIds(to_return);
+        // MarkDone, not MarkFailed: the transfer landed all N blocks in HBM,
+        // so the Load succeeded even if the host-RAM tier refused a copy.
+        self->load_tracker_.MarkDone(block_hashes);
+      }
+    });
+
+    return absl::OkStatus();
   }
 
   backend()->Load(remote_id, block_hashes,

@@ -331,6 +331,32 @@ TEST_F(KVCacheStoreWrapperTest, ModelUidMismatchColdStarts) {
   EXPECT_THAT(lookup, IsEmpty());
 }
 
+// ===========================================================================
+// Python Store Wrapper Programmatic Configuration
+// ===========================================================================
+
+TEST_F(KVCacheStoreWrapperTest, StorageExtensionConfiguration) {
+  RaidenId rid{"wrapper_test_job", "0", "wrapper_test_cache", 0};
+  BackendConfig sec_cfg;
+  sec_cfg.type = "posix";
+  sec_cfg.SetProperty("root_dir", "/tmp/raiden_storage_test");
+
+  KVCacheStoreWrapper wrapper(
+      /*lru_capacity=*/4, /*global_registry_address=*/"", rid, /*num_shards=*/1,
+      /*shard_size_bytes=*/512, /*store_server_ip=*/"127.0.0.1",
+      /*raiden_controller_port=*/0, /*expected_worker_count=*/0,
+      /*kv_pool_group=*/"", /*secondary_backend_configs=*/{sec_cfg});
+
+  ASSERT_EQ(wrapper->backend_configs().size(), 2);
+  EXPECT_EQ(wrapper->backend_configs()[1].type, "posix");
+  EXPECT_EQ(wrapper->backend_configs()[1].GetProperty("root_dir"),
+            "/tmp/raiden_storage_test");
+
+  ASSERT_EQ(wrapper->backends().size(), 2);
+  EXPECT_EQ(wrapper->backends()[0]->name(), "HostOffloadBackend");
+  EXPECT_EQ(wrapper->backends()[1]->name(), "posix");
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

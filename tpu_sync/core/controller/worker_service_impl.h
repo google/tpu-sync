@@ -72,6 +72,15 @@ class WorkerServiceImpl final
       const ::tpu_sync::proto::TransferBuffersRequest* request,
       ::tpu_sync::proto::TransferBuffersResponse* response) override;
 
+  // Transfers KV blocks between device HBM and one storage backend, in either
+  // direction. Addressing is strictly block-granular: block_hashes,
+  // hbm_block_ids and host_block_ids are parallel and of equal length, and
+  // entry i describes exactly one block.
+  grpc::Status TransferBackendBuffers(
+      grpc::ServerContext* context,
+      const ::tpu_sync::proto::TransferBackendBuffersRequest* request,
+      ::tpu_sync::proto::TransferBackendBuffersResponse* response) override;
+
   // Normalizes a pool-reshard transfer program, lowers it to the
   // byte-identical StartTransferRequest the framed entry would deliver, and
   // drives the same pool executor operations. Unsupported completion

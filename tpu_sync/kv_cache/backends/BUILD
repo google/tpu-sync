@@ -48,5 +48,6 @@ cc_test(
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings",
         "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/platform:statusor",
     ],
 )

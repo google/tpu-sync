@@ -47,6 +47,12 @@ class WorkerServiceClient {
   tsl::Future<> TransferBuffers(
       const ::tpu_sync::proto::TransferBuffersRequest& request);
 
+  // Transfers KV blocks between device HBM and one storage backend on the
+  // remote transfer worker asynchronously. The request is block-granular and
+  // applies uniformly across the worker's shards.
+  tsl::Future<> TransferBackendBuffers(
+      const ::tpu_sync::proto::TransferBackendBuffersRequest& request);
+
   // Submits a transfer program and resolves with the full response. The
   // reshard coordinator needs success + message verbatim for its
   // abandon-claim contract, so admission verdicts are not collapsed into a

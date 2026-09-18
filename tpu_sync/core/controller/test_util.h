@@ -21,10 +21,13 @@
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "grpcpp/channel.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
@@ -37,6 +40,9 @@
 #include "tpu_sync/core/controller/worker_service_impl.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 
 namespace tpu_raiden {
 namespace controller {
@@ -161,6 +167,90 @@ struct MockTransferManager {
     last_src_offsets.assign(src_block_ids.begin(), src_block_ids.end());
     last_dst_offsets.assign(dst_block_ids.begin(), dst_block_ids.end());
     return std::make_pair(std::vector<int>{}, raiden::PjRtCopyFuture());
+  }
+
+  absl::flat_hash_map<std::string,
+                      std::shared_ptr<kv_cache::backends::KVBackend>>
+      backends;
+
+  std::shared_ptr<kv_cache::backends::KVBackend> GetKVBackend(
+      absl::string_view backend_name) {
+    auto it = backends.find(std::string(backend_name));
+    if (it != backends.end()) return it->second;
+    return nullptr;
+  }
+
+  void RegisterKVBackends(
+      absl::Span<const kv_cache::BackendConfig> backend_configs) {
+    for (const auto& cfg : backend_configs) {
+      if (!absl::EqualsIgnoreCase(
+              cfg.type, kv_cache::backends::storage::kPosixBackendName)) {
+        continue;
+      }
+      if (cfg.parallelism.tp_rank < 0) continue;
+      const std::string canonical_name =
+          std::string(kv_cache::backends::storage::kPosixBackendName);
+      if (GetKVBackend(canonical_name) != nullptr) continue;
+      auto props = cfg.properties;
+      props["tp_rank"] = absl::StrCat(cfg.parallelism.tp_rank);
+      auto backend =
+          std::make_shared<kv_cache::backends::storage::PosixKVBackend>(
+              canonical_name, props);
+      backends[canonical_name] = std::move(backend);
+    }
+  }
+
+  int h2d_read_from_backend_calls = 0;
+  int d2h_write_to_backend_calls = 0;
+  std::vector<kv_cache::backends::BlockKey> last_h2d_backend_keys;
+  std::vector<kv_cache::backends::BlockKey> last_d2h_backend_keys;
+  std::vector<int64_t> last_backend_src_block_ids;
+  std::vector<int64_t> last_backend_dst_block_ids;
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_host_block_ids,
+      const std::vector<int64_t>& dst_device_block_ids) {
+    ++h2d_read_from_backend_calls;
+    last_h2d_backend_keys = block_keys;
+    last_backend_src_block_ids = src_host_block_ids;
+    last_backend_dst_block_ids = dst_device_block_ids;
+    return H2d(src_host_block_ids, dst_device_block_ids, {1});
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+      std::shared_ptr<kv_cache::backends::KVBackend> backend,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_host_block_ids,
+      const std::vector<int64_t>& dst_device_block_ids) {
+    const std::shared_ptr<kv_cache::backends::KVBackend> b[] = {
+        std::move(backend)};
+    return H2dReadFromBackend(absl::MakeSpan(b), block_keys, src_host_block_ids,
+                              dst_device_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids,
+      const std::vector<int64_t>& dst_host_block_ids) {
+    ++d2h_write_to_backend_calls;
+    last_d2h_backend_keys = block_keys;
+    last_backend_src_block_ids = src_device_block_ids;
+    last_backend_dst_block_ids = dst_host_block_ids;
+    return D2h(src_device_block_ids, dst_host_block_ids, {1});
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+      std::shared_ptr<kv_cache::backends::KVBackend> backend,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids,
+      const std::vector<int64_t>& dst_host_block_ids) {
+    const std::shared_ptr<kv_cache::backends::KVBackend> b[] = {
+        std::move(backend)};
+    return D2hWriteToBackend(absl::MakeSpan(b), block_keys,
+                             src_device_block_ids, dst_host_block_ids);
   }
 };
 

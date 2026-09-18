@@ -21,6 +21,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/strings/string_view.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 
 namespace tpu_raiden {
@@ -39,11 +40,41 @@ TEST(HostBufferDescriptorTest, DefaultValues) {
   EXPECT_EQ(desc.offset, 0);
 }
 
-TEST(PosixPathMapperTest, MapKeyIsUnimplementedInPart1) {
+TEST(PosixPathMapperTest, MapKeyDefaultOptions) {
   PosixPathMapper mapper("/tmp/kv_cache", "llama_70b", /*tp_size=*/8,
                          /*tp_rank=*/2);
-  EXPECT_THAT(mapper.MapKey("abc123hash"),
-              StatusIs(absl::StatusCode::kUnimplemented));
+  EXPECT_EQ(mapper.tp_size(), 8);
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey key, mapper.MapKey("abc123hash"));
+  EXPECT_EQ(key.block_hash, "abc123hash");
+  EXPECT_EQ(key.resolved_key,
+            "/tmp/kv_cache/llama_70b/tp8_r2/616/26/61626331323368617368.bin");
+  EXPECT_EQ(key.offset, 0);
+  EXPECT_EQ(key.size, 0);
+}
+
+TEST(PosixPathMapperTest, MapKeyCustomOptions) {
+  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b", /*tp_size=*/8,
+                         /*tp_rank=*/2);
+
+  KeyMappingOptions options;
+  options.parallelism.tp_size = 16;
+  options.parallelism.tp_rank = 5;
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey key, mapper.MapKey("custom_hash", options));
+  EXPECT_EQ(key.block_hash, "custom_hash");
+  EXPECT_EQ(
+      key.resolved_key,
+      "/tmp/kv_cache/llama_70b/tp16_r5/637/57/637573746f6d5f68617368.bin");
+  EXPECT_EQ(key.offset, 0);
+  EXPECT_EQ(key.size, 0);
+}
+
+TEST(PosixPathMapperTest, MapKeyRejectsEmptyHash) {
+  PosixPathMapper mapper("/tmp/kv_cache", "llama_70b", /*tp_size=*/8,
+                         /*tp_rank=*/2);
+
+  EXPECT_THAT(mapper.MapKey(""), StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST(PosixPathMapperTest, GetParentDir) {

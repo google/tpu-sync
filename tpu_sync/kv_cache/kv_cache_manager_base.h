@@ -46,6 +46,7 @@
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -90,6 +91,10 @@ using RecvCallback =
     std::function<absl::Status(int block_id, size_t size_bytes)>;
 
 namespace kv_cache {
+
+// Defined in kv_cache_store_backend_factory.h. Forward-declared so that this
+// widely-included header does not also drag in the backend registration macro.
+struct BackendConfig;
 
 struct KVCacheCopySpec {
   std::vector<int64_t> src_offsets;
@@ -270,6 +275,57 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Blocks until all pending asynchronous transfers/copies are complete.
   virtual absl::Status WaitForPendingWork() { return absl::OkStatus(); }
 
+  virtual std::string worker_id() const {
+    if (!worker_id_.empty()) return worker_id_;
+    return "";
+  }
+  virtual void set_worker_id(std::string worker_id) {
+    worker_id_ = std::move(worker_id);
+  }
+  virtual int64_t node_id() const { return -1; }
+
+  // Returns the backend plugin registered for the specified backend name, or
+  // nullptr if none.
+  virtual std::shared_ptr<backends::KVBackend> GetKVBackend(
+      absl::string_view backend_name) const;
+
+  // Initializes and registers secondary backends eagerly during worker startup
+  // from caller-supplied BackendConfig values. This is the only route; there is
+  // no environment fallback.
+  virtual void RegisterKVBackends(
+      absl::Span<const BackendConfig> backend_configs);
+
+  // Offloads local TPU HBM blocks to a secondary backend (e.g. POSIX/Lustre)
+  // via host DRAM staging buffers.
+  virtual absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+      absl::Span<const std::shared_ptr<backends::KVBackend>> backends,
+      const std::vector<backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids,
+      const std::vector<int64_t>& dst_host_block_ids);
+
+  // Recalls blocks from a secondary backend (e.g. POSIX/Lustre) into local TPU
+  // HBM via host DRAM staging buffers.
+  virtual absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+      absl::Span<const std::shared_ptr<backends::KVBackend>> backends,
+      const std::vector<backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_host_block_ids,
+      const std::vector<int64_t>& dst_device_block_ids);
+
+  // Resolves the L * S disjoint memory slices for a given staging block slot.
+  // Symmetrically used for:
+  //   1. Offload: source slices to gather-write from host DRAM -> secondary
+  //   storage.
+  //   2. Recall: destination slices to scatter-read from secondary storage ->
+  //   host DRAM.
+  virtual std::vector<backends::HostBufferDescriptor> ResolveBlockSlices(
+      int staging_block_id) const;
+
+  absl::Status WriteSingleBlockToBackendSync(
+      std::shared_ptr<backends::KVBackend> backend,
+      const backends::BlockKey& key, int staging_block_id);
+  absl::Status ReadSingleBlockFromBackendSync(
+      std::shared_ptr<backends::KVBackend> backend,
+      const backends::BlockKey& key, int staging_block_id);
   virtual absl::StatusOr<raiden::PjRtCopyFuture> H2hReadExplicit(
       std::string peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& local_block_ids,
@@ -549,6 +605,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   std::unique_ptr<NumaThreadPool> dma_pool_;
   std::shared_ptr<NumaThreadPool> push_pool_;
   std::unique_ptr<NumaThreadPool> pull_pool_;
+  std::string worker_id_;
 
   struct CopyWork {
     size_t layer_idx;
@@ -756,6 +813,12 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Initializes background worker thread if RAIDEN_ENABLE_ASYNC_DISPATCH is
   // enabled.
   void InitBackgroundWorker();
+
+  mutable absl::Mutex backends_mu_;
+  absl::flat_hash_map<std::string, std::shared_ptr<backends::KVBackend>>
+      backends_ ABSL_GUARDED_BY(backends_mu_);
+
+  bool InitializeSingleSecondaryBackend(const BackendConfig& config);
 };
 
 }  // namespace kv_cache

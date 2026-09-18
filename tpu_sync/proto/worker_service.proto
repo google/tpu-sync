@@ -150,7 +150,7 @@ enum TransferDirection {
 // A message rather than a bare string so per-tier options (durability,
 // priority, policy) can be added later without a wire break.
 message BackendTransferSpec {
-  // Backend driver name (e.g. "posix", "lustre", "k5").
+  // Backend driver name (e.g. "posix").
   string name = 1;
 }
 

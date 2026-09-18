@@ -125,5 +125,29 @@ tsl::Future<> WorkerServiceClient::TransferBuffers(
   return future;
 }
 
+tsl::Future<> WorkerServiceClient::TransferBackendBuffers(
+    const ::tpu_sync::proto::TransferBackendBuffersRequest& request) {
+  RAIDEN_TRACE("WorkerClient::TransferBackendBuffers");
+  auto [promise, future] = tsl::MakePromise<>();
+  auto context = std::make_shared<grpc::ClientContext>();
+  auto response =
+      std::make_shared<::tpu_sync::proto::TransferBackendBuffersResponse>();
+
+  stub_->async()->TransferBackendBuffers(
+      context.get(), &request, response.get(),
+      [context, response,
+       promise = std::move(promise).ToShared()](grpc::Status status) {
+        if (!status.ok()) {
+          promise->Set(absl::InternalError(absl::StrCat(
+              "TransferBackendBuffers RPC failed: ", status.error_message())));
+        } else if (!response->success()) {
+          promise->Set(absl::InternalError(response->message()));
+        } else {
+          promise->Set(absl::OkStatus());
+        }
+      });
+  return future;
+}
+
 }  // namespace controller
 }  // namespace tpu_raiden

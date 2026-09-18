@@ -15,12 +15,16 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_STORAGE_POSIX_BACKEND_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_STORAGE_POSIX_BACKEND_H_
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
@@ -30,6 +34,7 @@
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
+#include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 
@@ -41,37 +46,18 @@ class BlockTracker;
 namespace backends {
 namespace storage {
 
-// PosixKVBackend implements KVBackend using standard POSIX file system APIs.
-// Simulates a POSIX mount directory on the worker nodes (e.g. Cloud Lustre
-// mount).
-class PosixKVBackend : public KVBackend {
- public:
-  explicit PosixKVBackend(
-      std::string name,
-      absl::flat_hash_map<std::string, std::string> properties = {})
-      : KVBackend(std::move(properties)), name_(std::move(name)) {}
-
-  std::string name() const override { return name_; }
-
-  void WriteAsync(const BlockKey& key,
-                  absl::Span<const HostBufferDescriptor> slices,
-                  size_t total_bytes,
-                  std::function<void(absl::Status)> callback) override;
-
-  void ReadAsync(const BlockKey& key,
-                 absl::Span<const HostBufferDescriptor> slices,
-                 size_t total_bytes,
-                 std::function<void(absl::Status)> callback) override;
-
-  void BatchExistsAsync(
-      absl::Span<const BlockKey> keys,
-      std::function<void(std::vector<absl::StatusOr<bool>>)> callback) override;
-
- private:
-  std::string name_;
-};
+// Canonical identifier for the POSIX storage tier.
+inline constexpr absl::string_view kPosixBackendName = "posix";
 
 inline constexpr size_t kDefaultLookupBatchSize = 32;
+
+// Prefix-directory widths, in hex characters, over the encoded block hash.
+// 3 + 2 yields 16^5 == 1,048,576 leaf directories per topology namespace.
+inline constexpr size_t kHashDirL1Width = 3;
+inline constexpr size_t kHashDirL2Width = 2;
+// Hex encoding doubles the length, and the ".bin" suffix costs 4 more
+// characters: 2*125 + 4 == 254 <= NAME_MAX (255).
+inline constexpr size_t kMaxBlockHashBytes = 125;
 
 // Typed, validated view of a POSIX backend's configuration. Every POSIX knob
 // lives here; `FromProperties` is the single parse-and-validate point.
@@ -96,18 +82,63 @@ struct PosixBackendOptions {
       const absl::flat_hash_map<std::string, std::string>& properties);
 };
 
+// PosixKVBackend implements KVBackend for POSIX filesystems (e.g., Lustre,
+// local disk).
+class PosixKVBackend : public KVBackend {
+ public:
+  // Both arguments are required: `properties` must carry the topology
+  // (`tp_rank`, and `tp_size` when sharded), which PosixBackendOptions
+  // validates. Defaulting them would turn a missing rank into a runtime
+  // LOG(FATAL) instead of a compile error.
+  PosixKVBackend(std::string name,
+                 absl::flat_hash_map<std::string, std::string> properties);
+
+  std::string name() const override { return name_; }
+
+  const PosixBackendOptions& options() const { return options_; }
+
+  void WriteAsync(const BlockKey& key,
+                  absl::Span<const HostBufferDescriptor> slices,
+                  size_t total_bytes,
+                  std::function<void(absl::Status)> callback) override;
+
+  void ReadAsync(const BlockKey& key,
+                 absl::Span<const HostBufferDescriptor> slices,
+                 size_t total_bytes,
+                 std::function<void(absl::Status)> callback) override;
+
+  void BatchExistsAsync(
+      absl::Span<const BlockKey> keys,
+      std::function<void(std::vector<absl::StatusOr<bool>>)> callback) override;
+
+ private:
+  absl::StatusOr<bool> Exists(const BlockKey& key);
+
+  std::string name_;
+  PosixBackendOptions options_;
+  // MUST be the last-declared member: destruction runs in reverse declaration
+  // order, and ~NumaThreadPool joins its workers after draining the queue, so
+  // declaring it last is what guarantees every in-flight task finishes before
+  // any member it might touch is destroyed. The scheduled lambdas capture raw
+  // `this` and rely on this.
+  std::unique_ptr<NumaThreadPool> thread_pool_;
+};
+
 // PosixPathMapper implements the filesystem path resolution policy.
 // Maps block hash identifiers and tensor-parallel rank to a rank-partitioned
 // hierarchical directory layout over the HEX-ENCODED block hash (see
 // BlockKeyMapper::MapKey):
 //   `<root_dir>/<model_name>/tp<tp_size>_r<tp_rank>/<l1>/<l2>/<hash_hex>.bin`
-// Path resolution is implemented in Part 2.
 class PosixPathMapper : public BlockKeyMapper {
  public:
+  static absl::string_view GetParentDir(absl::string_view path) {
+    size_t last_slash = path.find_last_of('/');
+    if (last_slash == absl::string_view::npos) return "";
+    return path.substr(0, last_slash);
+  }
+
   PosixPathMapper(absl::string_view root_dir, absl::string_view model_name,
                   int tp_size, int tp_rank);
-
-  static absl::string_view GetParentDir(absl::string_view path);
 
   absl::StatusOr<BlockKey> MapKey(
       const std::string& block_hash,
@@ -121,16 +152,18 @@ class PosixPathMapper : public BlockKeyMapper {
   int tp_rank_;
 };
 
+// PosixKVCacheStoreBackend probes persistent storage (e.g., Lustre, POSIX).
 class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
  public:
   PosixKVCacheStoreBackend(std::shared_ptr<KVBackend> storage_backend,
-                           std::string name = "PosixKVCacheStoreBackend",
+                           std::string name = std::string(kPosixBackendName),
                            size_t capacity_bytes = 0,
-                           size_t lookup_batch_size = 32)
+                           size_t lookup_batch_size = kDefaultLookupBatchSize)
       : storage_backend_(std::move(storage_backend)),
         name_(std::move(name)),
         capacity_bytes_(capacity_bytes),
-        lookup_batch_size_(lookup_batch_size > 0 ? lookup_batch_size : 32) {}
+        lookup_batch_size_(lookup_batch_size > 0 ? lookup_batch_size
+                                                 : kDefaultLookupBatchSize) {}
 
   std::string name() const override { return name_; }
 
@@ -138,9 +171,7 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
 
   absl::StatusOr<BlockSliceList> Lookup(
       absl::Span<const std::string> block_hashes,
-      const LookupOptions& options = {}) override {
-    return BlockSliceList{};
-  }
+      const LookupOptions& options = {}) override;
 
   tsl::Future<> Load(const RaidenId& remote_id,
                      absl::Span<const std::string> block_hashes,
@@ -180,7 +211,7 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
 
  private:
   std::shared_ptr<KVBackend> storage_backend_;
-  std::string name_ = "posix";
+  std::string name_ = std::string(kPosixBackendName);
   size_t capacity_bytes_ = 0;
   size_t lookup_batch_size_ = 32;
 };

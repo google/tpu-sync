@@ -792,6 +792,88 @@ tsl::Future<> RaidenController::TransferBuffers(
   return aggregate_future;
 }
 
+absl::StatusOr<::tpu_sync::proto::TransferBackendBuffersRequest>
+RaidenController::BuildTransferBackendBuffersRequest(
+    ::tpu_sync::proto::TransferDirection direction,
+    absl::Span<const std::string> block_hashes,
+    absl::Span<const int64_t> hbm_block_ids,
+    absl::Span<const int64_t> host_block_ids,
+    absl::Span<const ::tpu_sync::proto::BackendTransferSpec> backend_specs) {
+  if (block_hashes.empty()) {
+    return absl::InvalidArgumentError(
+        "block_hashes must specify at least one block hash");
+  }
+  if (hbm_block_ids.size() != block_hashes.size() ||
+      host_block_ids.size() != block_hashes.size()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "block_hashes (", block_hashes.size(), "), hbm_block_ids (",
+        hbm_block_ids.size(), ") and host_block_ids (", host_block_ids.size(),
+        ") must have the same non-zero length"));
+  }
+
+  ::tpu_sync::proto::TransferBackendBuffersRequest request;
+  request.set_direction(direction);
+  for (const auto& hash : block_hashes) {
+    request.add_block_hashes(hash);
+  }
+  for (int64_t id : hbm_block_ids) {
+    request.add_hbm_block_ids(id);
+  }
+  for (int64_t id : host_block_ids) {
+    request.add_host_block_ids(id);
+  }
+  for (const auto& spec : backend_specs) {
+    *request.add_backend_specs() = spec;
+  }
+  return request;
+}
+
+tsl::Future<> RaidenController::TransferBackendBuffers(
+    ::tpu_sync::proto::TransferDirection direction,
+    absl::Span<const std::string> block_hashes,
+    absl::Span<const int64_t> hbm_block_ids,
+    absl::Span<const int64_t> host_block_ids,
+    absl::Span<const ::tpu_sync::proto::BackendTransferSpec> backend_specs) {
+  RAIDEN_TRACE_FN("RaidenCtrl::TransferBackendBuffers", [&]() {
+    return absl::StrCat("blocks=", block_hashes.size(),
+                        " direction=", direction);
+  });
+  auto request_or = BuildTransferBackendBuffersRequest(
+      direction, block_hashes, hbm_block_ids, host_block_ids, backend_specs);
+  if (!request_or.ok()) {
+    return tsl::Future<>(request_or.status());
+  }
+
+  auto workers = worker_registry_->GetRegisteredWorkers();
+  if (workers.empty()) {
+    return tsl::Future<>(absl::FailedPreconditionError(
+        "No registered workers available for TransferBackendBuffers"));
+  }
+
+  std::sort(workers.begin(), workers.end(),
+            [](const core::controller::WorkerRegistration& a,
+               const core::controller::WorkerRegistration& b) {
+              return CompareWorkerIds(a.worker_id, b.worker_id);
+            });
+
+  // Every worker owns a shard of every block, so the request goes out
+  // unmodified to each of them; there is no per-worker partitioning here.
+  std::vector<tsl::Future<>> worker_futures;
+  worker_futures.reserve(workers.size());
+  for (const auto& worker : workers) {
+    if (!worker.worker_service_client) continue;
+    worker_futures.push_back(
+        worker.worker_service_client->TransferBackendBuffers(*request_or));
+  }
+
+  if (worker_futures.empty()) {
+    return tsl::Future<>(absl::FailedPreconditionError(
+        "No active WorkerServiceClient available for TransferBackendBuffers"));
+  }
+
+  return tsl::JoinFutures(absl::MakeSpan(worker_futures));
+}
+
 void RaidenController::SetReadRemoteHooks(
     core::controller::RaidenControllerServiceImpl::ValidateAndPinCallback
         validate_and_pin,

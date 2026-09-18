@@ -41,9 +41,11 @@
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
@@ -59,6 +61,9 @@
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_utils.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -3157,6 +3162,271 @@ void KVCacheManagerBase::UpdateAllocatedOccupancyMetric() const {
   telemetry::RaidenMetricStore::GetGlobalMetricStore().SetGauge(
       telemetry::metric_names::kBufferAllocatedBytes, {},
       static_cast<double>(total_host_dram));
+}
+
+std::shared_ptr<backends::KVBackend> KVCacheManagerBase::GetKVBackend(
+    absl::string_view backend_name) const {
+  absl::MutexLock lock(backends_mu_);
+  auto it = backends_.find(backend_name);
+  if (it != backends_.end()) {
+    return it->second;
+  }
+  return nullptr;
+}
+
+bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
+    const BackendConfig& config) {
+  if (config.type.empty()) return false;
+
+  if (!absl::EqualsIgnoreCase(config.type,
+                              backends::storage::kPosixBackendName)) {
+    LOG(WARNING) << "[Worker] Unsupported secondary backend: " << config.type;
+    return false;
+  }
+  if (config.parallelism.tp_rank < 0) {
+    LOG(ERROR) << "[Worker] secondary backend config for " << config.type
+               << " has no tp_rank; refusing to register. Every worker would "
+                  "otherwise share the rank-0 shard directory.";
+    return false;
+  }
+
+  const std::string canonical_name =
+      std::string(backends::storage::kPosixBackendName);
+  if (GetKVBackend(canonical_name) != nullptr) return false;
+
+  auto props = config.properties;
+  props["tp_size"] = absl::StrCat(config.parallelism.tp_size);
+  props["tp_rank"] = absl::StrCat(config.parallelism.tp_rank);
+  auto backend = std::make_shared<backends::storage::PosixKVBackend>(
+      canonical_name, props);
+  {
+    absl::MutexLock lock(backends_mu_);
+    backends_[canonical_name] = std::move(backend);
+  }
+  LOG(INFO) << "[Worker] Initialized secondary backend " << canonical_name
+            << " at tp_rank " << config.parallelism.tp_rank;
+  return true;
+}
+
+void KVCacheManagerBase::RegisterKVBackends(
+    absl::Span<const BackendConfig> backend_configs) {
+  for (const auto& cfg : backend_configs) {
+    InitializeSingleSecondaryBackend(cfg);
+  }
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
+    absl::Span<const std::shared_ptr<backends::KVBackend>> backends,
+    const std::vector<backends::BlockKey>& block_keys,
+    const std::vector<int64_t>& src_device_block_ids,
+    const std::vector<int64_t>& dst_host_block_ids) {
+  if (backends.size() > 1) {
+    return absl::InvalidArgumentError(
+        "Multiple secondary backends not supported yet");
+  }
+  auto backend = backends.empty() ? nullptr : backends.front();
+  if (backend == nullptr) {
+    return absl::InvalidArgumentError("Secondary backend is null");
+  }
+
+  size_t num_chunks = block_keys.size();
+  if (src_device_block_ids.size() != num_chunks ||
+      dst_host_block_ids.size() != num_chunks) {
+    return absl::InvalidArgumentError(
+        "Mismatch between block_keys, src_device_block_ids, and "
+        "dst_host_block_ids sizes");
+  }
+  if (num_chunks == 0) {
+    return raiden::PjRtCopyFuture(raiden::BufferHolders{});
+  }
+
+  auto [promise, aggregate_future] = xla::MakePromise();
+
+  struct ChunkD2h {
+    raiden::PjRtCopyFuture d2h_fut;
+    int staging_block_id;
+  };
+  std::vector<ChunkD2h> chunks;
+  chunks.reserve(num_chunks);
+  raiden::BufferHolders all_holds;
+
+  for (size_t i = 0; i < num_chunks; ++i) {
+    int64_t src_block_idx = src_device_block_ids[i];
+    int64_t dst_block_idx = dst_host_block_ids[i];
+
+    TF_ASSIGN_OR_RETURN(
+        auto chunk_futures,
+        DispatchD2hChunks({src_block_idx}, {dst_block_idx}, {1}));
+    raiden::PjRtCopyFuture d2h_fut =
+        raiden::JoinPjRtCopyFutures(absl::MakeSpan(chunk_futures));
+    for (const auto& h : d2h_fut.holds) {
+      all_holds.push_back(h);
+    }
+    chunks.push_back({std::move(d2h_fut), static_cast<int>(dst_block_idx)});
+  }
+
+  auto state = std::make_shared<TransferPipelinedState>(
+      num_chunks, std::move(promise), std::move(all_holds));
+
+  for (size_t i = 0; i < num_chunks; ++i) {
+    int staging_block_id = chunks[i].staging_block_id;
+    chunks[i].d2h_fut.OnReady(
+        [this, backend, state, staging_block_id,
+         key = block_keys[i]](absl::StatusOr<raiden::BufferHolders> status) {
+          if (!status.ok()) {
+            state->SetError(status.status());
+            state->MarkChunkComplete();
+            return;
+          }
+
+          auto slices = ResolveBlockSlices(staging_block_id);
+          size_t total_bytes = 0;
+          for (const auto& s : slices) {
+            total_bytes += s.size;
+          }
+          backend->WriteAsync(key, slices, total_bytes,
+                              [state](absl::Status s) {
+                                if (!s.ok()) state->SetError(s);
+                                state->MarkChunkComplete();
+                              });
+        });
+  }
+  return raiden::PjRtCopyFuture(std::move(aggregate_future),
+                                state->combined_holds);
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
+    absl::Span<const std::shared_ptr<backends::KVBackend>> backends,
+    const std::vector<backends::BlockKey>& block_keys,
+    const std::vector<int64_t>& src_host_block_ids,
+    const std::vector<int64_t>& dst_device_block_ids) {
+  if (backends.size() > 1) {
+    return absl::InvalidArgumentError(
+        "Multiple secondary backends not supported yet");
+  }
+  auto backend = backends.empty() ? nullptr : backends.front();
+  if (backend == nullptr) {
+    return absl::InvalidArgumentError("Secondary backend is null");
+  }
+
+  size_t num_chunks = block_keys.size();
+  if (src_host_block_ids.size() != num_chunks ||
+      dst_device_block_ids.size() != num_chunks) {
+    return absl::InvalidArgumentError(
+        "Mismatch between block_keys, src_host_block_ids, and "
+        "dst_device_block_ids sizes");
+  }
+  if (num_chunks == 0) {
+    return raiden::PjRtCopyFuture(raiden::BufferHolders{});
+  }
+
+  auto [promise, aggregate_future] = xla::MakePromise();
+  auto state = std::make_shared<TransferPipelinedState>(
+      num_chunks, std::move(promise), /*holds=*/raiden::BufferHolders{});
+
+  for (size_t i = 0; i < num_chunks; ++i) {
+    int64_t staging_block_idx = src_host_block_ids[i];
+    int staging_block_id = static_cast<int>(staging_block_idx);
+    int64_t device_block_idx = dst_device_block_ids[i];
+    backends::BlockKey key = block_keys[i];
+
+    auto slices = ResolveBlockSlices(staging_block_id);
+    size_t total_bytes = 0;
+    for (const auto& s : slices) {
+      total_bytes += s.size;
+    }
+
+    backend->ReadAsync(
+        key, slices, total_bytes,
+        [this, state, staging_block_idx,
+         device_block_idx](absl::Status read_status) {
+          if (!read_status.ok()) {
+            state->SetError(read_status);
+            state->MarkChunkComplete();
+            return;
+          }
+          auto h2d_fut_or = H2d({staging_block_idx}, {device_block_idx}, {1});
+          if (!h2d_fut_or.ok()) {
+            state->SetError(h2d_fut_or.status());
+            state->MarkChunkComplete();
+            return;
+          }
+          h2d_fut_or->OnReady(
+              [state](absl::StatusOr<raiden::BufferHolders> status) {
+                if (!status.ok()) state->SetError(status.status());
+                state->MarkChunkComplete();
+              });
+        });
+  }
+  return raiden::PjRtCopyFuture(std::move(aggregate_future), /*holds=*/{});
+}
+
+absl::Status KVCacheManagerBase::WriteSingleBlockToBackendSync(
+    std::shared_ptr<backends::KVBackend> backend, const backends::BlockKey& key,
+    int staging_block_id) {
+  if (backend == nullptr) {
+    return absl::InvalidArgumentError("Backend is null");
+  }
+  auto slices = ResolveBlockSlices(staging_block_id);
+  size_t total_bytes = 0;
+  for (const auto& s : slices) {
+    total_bytes += s.size;
+  }
+  absl::Notification done;
+  absl::Status status;
+  backend->WriteAsync(key, slices, total_bytes, [&](absl::Status s) {
+    status = std::move(s);
+    done.Notify();
+  });
+  done.WaitForNotification();
+  return status;
+}
+
+absl::Status KVCacheManagerBase::ReadSingleBlockFromBackendSync(
+    std::shared_ptr<backends::KVBackend> backend, const backends::BlockKey& key,
+    int staging_block_id) {
+  if (backend == nullptr) {
+    return absl::InvalidArgumentError("Backend is null");
+  }
+  auto slices = ResolveBlockSlices(staging_block_id);
+  size_t total_bytes = 0;
+  for (const auto& s : slices) {
+    total_bytes += s.size;
+  }
+  absl::Notification done;
+  absl::Status status;
+  backend->ReadAsync(key, slices, total_bytes, [&](absl::Status s) {
+    status = std::move(s);
+    done.Notify();
+  });
+  done.WaitForNotification();
+  return status;
+}
+
+std::vector<backends::HostBufferDescriptor>
+KVCacheManagerBase::ResolveBlockSlices(int staging_block_id) const {
+  std::vector<backends::HostBufferDescriptor> slices;
+  slices.reserve(num_layers_ * num_shards_);
+
+  // Deterministic Canonical Layer-Major Serialization Layout:
+  for (size_t l = 0; l < num_layers_; ++l) {
+    size_t slice_bytes = block_bytes(l);
+    for (size_t s = 0; s < num_shards_; ++s) {
+      uint8_t* ptr = const_cast<KVCacheManagerBase*>(this)->GetBlockHostPointer(
+          l, s, staging_block_id);
+      if (ptr == nullptr) {
+        LOG(ERROR) << "Null host pointer resolved for layer " << l << ", shard "
+                   << s << ", staging_block_id " << staging_block_id;
+      }
+      backends::HostBufferDescriptor desc;
+      desc.ptr = ptr;
+      desc.size = slice_bytes;
+      desc.fd = -1;
+      desc.offset = 0;
+      slices.push_back(desc);
+    }
+  }
+  return slices;
 }
 
 }  // namespace kv_cache

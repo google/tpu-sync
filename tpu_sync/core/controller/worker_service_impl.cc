@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -35,6 +36,7 @@
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/transfer_program_reshard.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/proto/transfer_program.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -344,6 +346,150 @@ grpc::Status WorkerServiceImpl::TransferBuffers(
   }
   response->set_success(true);
   response->set_message("Buffers transferred successfully");
+  return grpc::Status::OK;
+}
+
+grpc::Status WorkerServiceImpl::TransferBackendBuffers(
+    grpc::ServerContext* context,
+    const ::tpu_sync::proto::TransferBackendBuffersRequest* request,
+    ::tpu_sync::proto::TransferBackendBuffersResponse* response) {
+  absl::MutexLock lock(mutex_);
+
+  if (!transfer_manager_) {
+    response->set_success(false);
+    response->set_message(
+        "Transfer manager is not configured on WorkerService");
+    return grpc::Status::OK;
+  }
+
+  if (request->backend_specs_size() != 1) {
+    LOG(ERROR) << "[Worker] TransferBackendBuffers received "
+               << request->backend_specs_size() << " backend_specs";
+    response->set_success(false);
+    response->set_message(absl::StrCat(
+        "TransferBackendBuffers requires exactly 1 backend_spec, got ",
+        request->backend_specs_size()));
+    return grpc::Status::OK;
+  }
+  const ::tpu_sync::proto::BackendTransferSpec& spec =
+      request->backend_specs(0);
+
+  const int num_blocks = request->block_hashes_size();
+  if (num_blocks == 0) {
+    LOG(ERROR) << "[Worker] Backend transfer request contains 0 block hashes";
+    response->set_success(false);
+    response->set_message(
+        "Backend transfer request must specify at least one block hash");
+    return grpc::Status::OK;
+  }
+
+  // block_hashes, hbm_block_ids and host_block_ids are parallel by contract;
+  // entry i describes exactly one block. The equivalent check used to live in
+  // RaidenController::BuildTransferBuffersRequest, which this RPC bypasses
+  // entirely, so it is enforced server-side here instead.
+  if (request->hbm_block_ids_size() != num_blocks ||
+      request->host_block_ids_size() != num_blocks) {
+    LOG(ERROR) << "[Worker] Block id count mismatch: hbm_block_ids ("
+               << request->hbm_block_ids_size() << "), host_block_ids ("
+               << request->host_block_ids_size() << "), block_hashes ("
+               << num_blocks << ")";
+    response->set_success(false);
+    response->set_message(absl::StrCat(
+        "Mismatch between block id count (hbm: ", request->hbm_block_ids_size(),
+        ", host: ", request->host_block_ids_size(),
+        ") and block_hashes count (", num_blocks, ")"));
+    return grpc::Status::OK;
+  }
+
+  const std::string backend_name = spec.name();
+  std::shared_ptr<kv_cache::backends::KVBackend> driver =
+      transfer_manager_.GetKVBackend(backend_name);
+  if (!driver) {
+    LOG(ERROR) << "[Worker] No backend registered for backend_name: "
+               << backend_name;
+    response->set_success(false);
+    response->set_message(
+        absl::StrCat("No backend registered for backend_name: ", backend_name));
+    return grpc::Status::OK;
+  }
+
+  if (!driver->mapper()) {
+    LOG(ERROR) << "[Worker] Backend driver '" << backend_name
+               << "' has no mapper configured";
+    response->set_success(false);
+    response->set_message(absl::StrCat("Backend driver '", backend_name,
+                                       "' has no mapper configured"));
+    return grpc::Status::OK;
+  }
+
+  std::vector<kv_cache::backends::BlockKey> block_keys;
+  block_keys.reserve(num_blocks);
+  for (const auto& hash : request->block_hashes()) {
+    absl::StatusOr<kv_cache::backends::BlockKey> key =
+        driver->mapper()->MapKey(hash);
+    if (!key.ok()) {
+      LOG(ERROR) << "[Worker] Failed to map block hash for backend '"
+                 << backend_name << "': " << key.status();
+      response->set_success(false);
+      response->set_message(
+          absl::StrCat("Failed to map block hash: ", key.status().message()));
+      return grpc::Status::OK;
+    }
+    block_keys.push_back(*std::move(key));
+  }
+
+  std::vector<int64_t> hbm_ids(request->hbm_block_ids().begin(),
+                               request->hbm_block_ids().end());
+  std::vector<int64_t> host_ids(request->host_block_ids().begin(),
+                                request->host_block_ids().end());
+
+  // The id vectors FLIP ORDER between the two directions, and both parameters
+  // are std::vector<int64_t> -- passing (hbm_ids, host_ids) to both compiles
+  // cleanly and silently corrupts RECALL. The named-argument comments below
+  // are load-bearing; do not drop them.
+  absl::StatusOr<raiden::PjRtCopyFuture> copy_future;
+  switch (request->direction()) {
+    case ::tpu_sync::proto::TRANSFER_DIR_OFFLOAD: {
+      // OFFLOAD: src = Device HBM, dst = Host DRAM staging.
+      copy_future = transfer_manager_.D2hWriteToBackend(
+          driver, block_keys, /*src_device_block_ids=*/hbm_ids,
+          /*dst_host_block_ids=*/host_ids);
+      break;
+    }
+
+    case ::tpu_sync::proto::TRANSFER_DIR_RECALL: {
+      // RECALL: src = Host DRAM staging, dst = Device HBM.
+      copy_future = transfer_manager_.H2dReadFromBackend(
+          driver, block_keys, /*src_host_block_ids=*/host_ids,
+          /*dst_device_block_ids=*/hbm_ids);
+      break;
+    }
+
+    default:
+      response->set_success(false);
+      response->set_message(absl::StrCat("Unsupported transfer direction: ",
+                                         request->direction()));
+      return grpc::Status::OK;
+  }
+
+  if (!copy_future.ok()) {
+    LOG(ERROR) << "[Worker] Backend transfer dispatch failed: "
+               << copy_future.status();
+    response->set_success(false);
+    response->set_message(copy_future.status().message());
+    return grpc::Status::OK;
+  }
+
+  absl::Status status = copy_future.value().Await();
+  if (!status.ok()) {
+    LOG(ERROR) << "[Worker] Pipelined backend transfer failed: " << status;
+    response->set_success(false);
+    response->set_message(status.message());
+    return grpc::Status::OK;
+  }
+
+  response->set_success(true);
+  response->set_message("SUCCESS");
   return grpc::Status::OK;
 }
 

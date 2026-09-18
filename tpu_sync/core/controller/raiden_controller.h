@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -153,6 +154,16 @@ class RaidenController {
       absl::Span<const Buffer> staging_host_buffers = {},
       absl::Span<const int64_t> copy_sizes = {});
 
+  // Broadcast backend transfer to all registered workers. Every worker owns a
+  // shard of every block, so the identical request goes to each of them; there
+  // is no per-worker partitioning.
+  tsl::Future<> TransferBackendBuffers(
+      ::tpu_sync::proto::TransferDirection direction,
+      absl::Span<const std::string> block_hashes,
+      absl::Span<const int64_t> hbm_block_ids,
+      absl::Span<const int64_t> host_block_ids,
+      absl::Span<const ::tpu_sync::proto::BackendTransferSpec> backend_specs);
+
   // Reads blocks from a remote source, receiver-initiated: this controller's
   // own workers pull the bytes, so the write window belongs to the destination
   // and the H2D leg folds into the same transfer.
@@ -255,6 +266,16 @@ class RaidenController {
       absl::Span<const Buffer> dst_buffers,
       absl::Span<const Buffer> staging_host_buffers = {},
       absl::Span<const int64_t> copy_sizes = {});
+
+  // Validates the parallel-list contract and assembles the wire request. The
+  // same request is sent verbatim to every targeted worker.
+  static absl::StatusOr<::tpu_sync::proto::TransferBackendBuffersRequest>
+  BuildTransferBackendBuffersRequest(
+      ::tpu_sync::proto::TransferDirection direction,
+      absl::Span<const std::string> block_hashes,
+      absl::Span<const int64_t> hbm_block_ids,
+      absl::Span<const int64_t> host_block_ids,
+      absl::Span<const ::tpu_sync::proto::BackendTransferSpec> backend_specs);
 
  private:
   RaidenController(const ::tpu_sync::rpc::RaidenIdProto& unit, int num_blocks,

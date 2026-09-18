@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -31,14 +31,52 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//tpu_sync/common:raiden_id",
+        "//tpu_sync/core:numa_thread_pool",
+        "//tpu_sync/core/controller:raiden_controller",
         "//tpu_sync/kv_cache:kv_cache_store_backend",
+        "//tpu_sync/kv_cache:kv_cache_store_backend_factory",
         "//tpu_sync/kv_cache/backends:backend",
         "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
         "@xla//xla/tsl/concurrency:future",
+    ],
+    alwayslink = 1,
+)
+
+cc_test(
+    name = "posix_backend_test",
+    srcs = ["posix_backend_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    deps = [
+        ":posix_backend",
+        "//tpu_sync/core/controller:raiden_controller",
+        "//tpu_sync/core/controller:worker_registry",
+        "//tpu_sync/kv_cache:kv_cache_store_backend",
+        "//tpu_sync/kv_cache:kv_cache_store_backend_factory",
+        "//tpu_sync/kv_cache/backends:backend",
+        "//tpu_sync/proto:worker_service_cc_proto",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/platform:statusor",
     ],
 )

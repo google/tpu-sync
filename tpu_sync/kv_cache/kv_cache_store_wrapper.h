@@ -18,9 +18,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
+#include "absl/status/status.h"
 #include "tpu_sync/common/raiden_id.h"
+#include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 
@@ -51,7 +55,8 @@ class KVCacheStoreWrapper {
       size_t lru_capacity, std::string global_registry_address = "",
       RaidenId raiden_id = {}, int num_shards = 0, int64_t shard_size_bytes = 0,
       std::string store_server_ip = "", int raiden_controller_port = 0,
-      int expected_worker_count = 0, std::string kv_pool_group = "");
+      int expected_worker_count = 0, std::string kv_pool_group = "",
+      std::vector<BackendConfig> secondary_backend_configs = {});
 
   explicit KVCacheStoreWrapper(std::unique_ptr<KVCacheStore> store)
       : controller_(std::move(store)) {}
@@ -66,4 +71,4 @@ class KVCacheStoreWrapper {
 }  // namespace kv_cache
 }  // namespace tpu_raiden
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_KV_CACHE_KV_CACHE_STORE_WRAPPER_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_KV_CACHE_KV_CACHE_STORE_WRAPPER_H_

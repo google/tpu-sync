@@ -13,28 +13,42 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <chrono>  // NOLINT
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>  // NOLINT(build/c++17)
+#include <fstream>
+#include <ios>
 #include <memory>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
+#include "absl/cleanup/cleanup.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "xla/pjrt/pjrt_client.h"
+#include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -1380,6 +1394,295 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
                testing::IsEmpty(), testing::DoubleEq(3072.0)))
       .Times(1);
   manager.UpdateAllocatedOccupancyMetric();
+}
+
+// ===========================================================================
+// Pipelined Storage Offload & Recall Engine
+// ===========================================================================
+
+TEST(KVCacheManagerTest, MultiSliceOffloadAndRecallContentValidity) {
+  const std::string scratch_dir =
+      absl::StrCat(testing::TempDir(), "/multi_rank_e2e_", getpid(), "_",
+                   std::chrono::system_clock::now().time_since_epoch().count());
+  std::filesystem::create_directories(scratch_dir);
+
+  auto cleanup = absl::MakeCleanup([&scratch_dir]() {
+    std::error_code ec;
+    std::filesystem::remove_all(scratch_dir, ec);
+  });
+
+  const int kTpSize = 2;
+  const size_t kBlockSize = 128;
+  const int kNumBlocks = 4;
+  const size_t kNumLayers = 2;
+
+  LOG(INFO)
+      << "[E2E Test] Starting MultiSliceOffloadAndRecallContentValidity with "
+      << "kTpSize=" << kTpSize << ", kNumLayers=" << kNumLayers
+      << ", kNumBlocks=" << kNumBlocks << ", kBlockSize=" << kBlockSize
+      << ", scratch_dir=" << scratch_dir;
+
+  // Realistic 32-byte cryptographic token prefix hashes (SHA-256 digests).
+  const std::vector<std::string> kRealisticBlockHashes = {
+      absl::HexStringToBytes(
+          "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"),
+      absl::HexStringToBytes(
+          "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"),
+      absl::HexStringToBytes(
+          "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca7"),
+      absl::HexStringToBytes(
+          "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"),
+  };
+  ASSERT_EQ(kRealisticBlockHashes.size(), kNumBlocks);
+
+  // 1. Initialize real PJRT device memory environment.
+  TF_ASSERT_OK_AND_ASSIGN(auto client,
+                          xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client->addressable_devices()[0]->default_memory_space());
+
+  // Rank-specific resources for TP=2 (Rank 0 and Rank 1).
+  struct WorkerRankEnv {
+    int rank = 0;
+    std::shared_ptr<backends::storage::PosixKVBackend> backend;
+    std::unique_ptr<backends::storage::PosixPathMapper> mapper;
+    std::vector<std::vector<std::unique_ptr<xla::PjRtBuffer>>> pjrt_buffers;
+    std::vector<std::vector<raiden::RaidenBufferHandle>> layer_handles;
+    std::unique_ptr<KVCacheManagerBase> manager;
+    std::vector<backends::BlockKey> block_keys;
+    std::vector<int64_t> dev_block_ids;
+    std::vector<int64_t> host_block_ids;
+  };
+
+  std::vector<WorkerRankEnv> workers(kTpSize);
+  const int64_t total_shard_bytes = kNumBlocks * kBlockSize;
+
+  for (int r = 0; r < kTpSize; ++r) {
+    auto& w = workers[r];
+    w.rank = r;
+    w.backend = std::make_shared<backends::storage::PosixKVBackend>(
+        "posix",
+        absl::flat_hash_map<std::string, std::string>{
+            {"tp_rank", absl::StrCat(r)}, {"tp_size", absl::StrCat(kTpSize)}});
+    w.mapper = std::make_unique<backends::storage::PosixPathMapper>(
+        scratch_dir, "test_model", /*tp_size=*/kTpSize, /*tp_rank=*/r);
+
+    w.pjrt_buffers.resize(kNumLayers);
+    w.layer_handles.resize(kNumLayers);
+
+    for (size_t l = 0; l < kNumLayers; ++l) {
+      w.pjrt_buffers[l].resize(1);
+      w.layer_handles[l].resize(1);
+      std::vector<uint8_t> init_data(total_shard_bytes, 0);
+      TF_ASSERT_OK_AND_ASSIGN(
+          w.pjrt_buffers[l][0],
+          client->BufferFromHostBuffer(init_data.data(), xla::U8,
+                                       {static_cast<int64_t>(kNumBlocks),
+                                        static_cast<int64_t>(kBlockSize)},
+                                       /*byte_strides=*/std::nullopt,
+                                       xla::PjRtClient::HostBufferSemantics::
+                                           kImmutableUntilTransferCompletes,
+                                       /*on_done_with_host_buffer=*/nullptr,
+                                       memory_space,
+                                       /*device_layout=*/nullptr));
+
+      TF_ASSERT_OK_AND_ASSIGN(
+          w.layer_handles[l][0],
+          raiden::RaidenBufferHandle::Acquire(w.pjrt_buffers[l][0].get()));
+    }
+
+    w.manager = std::make_unique<KVCacheManagerBase>(
+        w.layer_handles, /*local_port=*/std::nullopt,
+        /*host_blocks_to_allocate=*/kNumBlocks,
+        /*unsafe_skip_buffer_lock=*/true, /*parallelism=*/1,
+        /*host_allocator=*/nullptr, /*bind_ip=*/std::nullopt,
+        /*logical_slice_byte_size=*/kBlockSize);
+
+    w.block_keys.reserve(kNumBlocks);
+    w.dev_block_ids.reserve(kNumBlocks);
+    w.host_block_ids.reserve(kNumBlocks);
+    for (int b = 0; b < kNumBlocks; ++b) {
+      TF_ASSERT_OK_AND_ASSIGN(
+          backends::BlockKey key,
+          w.mapper->MapKey(kRealisticBlockHashes[b],
+                           {.parallelism = {.tp_rank = r}}));
+      LOG(INFO)
+          << "[Setup] Rank " << r << " Block " << b << " (hash_hex="
+          << absl::BytesToHexString(kRealisticBlockHashes[b]).substr(0, 16)
+          << "...)"
+          << " mapped to path: " << key.resolved_key;
+      w.block_keys.push_back(std::move(key));
+      w.dev_block_ids.push_back(b);
+      w.host_block_ids.push_back(b);
+    }
+  }
+
+  // Unique data pattern function parameterized by (layer, rank/shard, block):
+  auto get_pattern = [](size_t l, int r, int b) -> uint8_t {
+    return static_cast<uint8_t>(0x40 * l + 0x10 * r + b * 2 + 1);
+  };
+
+  // Populate device buffers with known patterns for both ranks:
+  for (int r = 0; r < kTpSize; ++r) {
+    auto& w = workers[r];
+    for (size_t l = 0; l < kNumLayers; ++l) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        std::vector<uint8_t> block_data(kBlockSize, get_pattern(l, r, b));
+        auto fut = w.layer_handles[l][0].CopyRawHostToDevice(
+            block_data.data(), b * kBlockSize, kBlockSize);
+        ASSERT_OK(fut.Await());
+      }
+    }
+  }
+
+  // 2. OFFLOAD: Device HBM -> Host Staging DRAM -> Posix Storage File for ALL
+  // ranks.
+  for (int r = 0; r < kTpSize; ++r) {
+    auto& w = workers[r];
+    LOG(INFO) << "[Offload] Initiating D2hWriteToBackend for Rank " << r << " ("
+              << w.block_keys.size() << " blocks)...";
+    auto d2h_or = w.manager->D2hWriteToBackend(
+        {w.backend}, w.block_keys, w.dev_block_ids, w.host_block_ids);
+    ASSERT_TRUE(d2h_or.ok()) << d2h_or.status().ToString();
+    ASSERT_OK(d2h_or->Await());
+    LOG(INFO) << "[Offload] Completed D2hWriteToBackend for Rank " << r;
+  }
+
+  // 3. VERIFY ON DISK: Assert files exist under each rank's namespace and
+  // verify bytes.
+  const size_t bytes_per_rank_file = kNumLayers * kBlockSize;
+  for (int r = 0; r < kTpSize; ++r) {
+    auto& w = workers[r];
+    for (int b = 0; b < kNumBlocks; ++b) {
+      const std::string& filepath = w.block_keys[b].resolved_key;
+      // Explicitly verify path structure contains tp2_r<r>
+      EXPECT_THAT(filepath, testing::HasSubstr(absl::StrCat("tp2_r", r)));
+
+      std::ifstream file(filepath, std::ios::binary);
+      ASSERT_TRUE(file.is_open())
+          << "File not found for Rank " << r << ": " << filepath;
+      std::vector<uint8_t> file_data(bytes_per_rank_file);
+      file.read(reinterpret_cast<char*>(file_data.data()), bytes_per_rank_file);
+      EXPECT_EQ(file.gcount(), bytes_per_rank_file);
+
+      for (size_t l = 0; l < kNumLayers; ++l) {
+        size_t offset = l * kBlockSize;
+        uint8_t expected_val = get_pattern(l, r, b);
+        EXPECT_TRUE(std::all_of(file_data.begin() + offset,
+                                file_data.begin() + offset + kBlockSize,
+                                [&](uint8_t v) { return v == expected_val; }))
+            << "Disk mismatch: rank " << r << ", block " << b << ", layer "
+            << l;
+      }
+      LOG(INFO) << "[Disk Audit] Verified Rank " << r << " Block " << b
+                << " at " << filepath << " (bytes: " << file_data.size()
+                << ", pattern OK)";
+    }
+  }
+
+  // 4. ZERO OUT DEVICE & HOST MEMORY across ALL ranks:
+  for (int r = 0; r < kTpSize; ++r) {
+    auto& w = workers[r];
+    for (size_t l = 0; l < kNumLayers; ++l) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        std::vector<uint8_t> zeros(kBlockSize, 0x00);
+        auto fut = w.layer_handles[l][0].CopyRawHostToDevice(
+            zeros.data(), b * kBlockSize, kBlockSize);
+        ASSERT_OK(fut.Await());
+        // Rank r explicitly addresses Shard r in host memory
+        std::memset(w.manager->GetBlockHostPointer(l, /*shard_idx=*/r, b), 0x00,
+                    kBlockSize);
+      }
+      TF_ASSERT_OK_AND_ASSIGN(auto literal,
+                              w.pjrt_buffers[l][0]->ToLiteral().Await());
+      for (uint8_t val : literal->data<uint8_t>()) {
+        ASSERT_EQ(val, 0x00);
+      }
+    }
+    LOG(INFO) << "[Zero Memory] Zeroed device HBM and host DRAM for Rank " << r;
+  }
+
+  // 5. RECALL: Posix Storage File -> Host Staging DRAM -> Device HBM for ALL
+  // ranks.
+  for (int r = 0; r < kTpSize; ++r) {
+    auto& w = workers[r];
+    LOG(INFO) << "[Recall] Initiating H2dReadFromBackend for Rank " << r << " ("
+              << w.block_keys.size() << " blocks)...";
+    auto h2d_or = w.manager->H2dReadFromBackend(
+        {w.backend}, w.block_keys, w.host_block_ids, w.dev_block_ids);
+    ASSERT_TRUE(h2d_or.ok()) << h2d_or.status().ToString();
+    ASSERT_OK(h2d_or->Await());
+    LOG(INFO) << "[Recall] Completed H2dReadFromBackend for Rank " << r;
+  }
+
+  // 6. VERIFY RECALLED CONTENTS ON DEVICE & HOST for ALL ranks:
+  for (int r = 0; r < kTpSize; ++r) {
+    auto& w = workers[r];
+    for (size_t l = 0; l < kNumLayers; ++l) {
+      TF_ASSERT_OK_AND_ASSIGN(auto literal,
+                              w.pjrt_buffers[l][0]->ToLiteral().Await());
+      auto dev_data = literal->data<uint8_t>();
+      for (int b = 0; b < kNumBlocks; ++b) {
+        // Rank r explicitly addresses Shard r in host memory
+        uint8_t* host_ptr =
+            w.manager->GetBlockHostPointer(l, /*shard_idx=*/r, b);
+        uint8_t expected_val = get_pattern(l, r, b);
+        size_t block_offset = b * kBlockSize;
+
+        EXPECT_TRUE(std::all_of(host_ptr, host_ptr + kBlockSize,
+                                [&](uint8_t v) { return v == expected_val; }))
+            << "Host staging mismatch: rank " << r << ", block " << b
+            << ", layer " << l;
+
+        EXPECT_TRUE(std::all_of(dev_data.begin() + block_offset,
+                                dev_data.begin() + block_offset + kBlockSize,
+                                [&](uint8_t v) { return v == expected_val; }))
+            << "Device HBM mismatch: rank " << r << ", block " << b
+            << ", layer " << l;
+      }
+    }
+    LOG(INFO)
+        << "[Verification] Rank " << r
+        << " verified bit-for-bit in both Host DRAM and Device HBM across all "
+        << kNumLayers << " layers and " << kNumBlocks << " blocks.";
+  }
+}
+
+TEST(KVCacheManagerTest, RegisterKVBackendsPropagatesParallelismTpSize) {
+  std::string scratch_dir =
+      absl::StrCat(testing::TempDir(), "/test_manager_tp_size_reg_", getpid());
+  std::filesystem::create_directories(scratch_dir);
+  auto cleanup = absl::MakeCleanup([&scratch_dir]() {
+    std::error_code ec;
+    std::filesystem::remove_all(scratch_dir, ec);
+  });
+
+  KVCacheManagerBase manager(/*buffers=*/{}, /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/4,
+                             /*unsafe_skip_buffer_lock=*/true,
+                             /*parallelism=*/1, /*host_allocator=*/nullptr,
+                             /*bind_ip=*/std::nullopt,
+                             /*logical_slice_byte_size=*/512);
+
+  BackendConfig cfg;
+  cfg.type = "posix";
+  cfg.parallelism.tp_rank = 2;
+  cfg.parallelism.tp_size = 4;
+  cfg.SetProperty("root_dir", scratch_dir);
+  cfg.SetProperty("model_name", "test_model_tp");
+
+  manager.RegisterKVBackends({cfg});
+
+  auto backend = manager.GetKVBackend("posix");
+  ASSERT_NE(backend, nullptr);
+  auto mapper = backend->mapper();
+  ASSERT_NE(mapper, nullptr);
+  EXPECT_EQ(mapper->tp_size(), 4);
+
+  // Verify that MapKey resolves to tp4_r2 without options override
+  TF_ASSERT_OK_AND_ASSIGN(auto key, mapper->MapKey("block_hash_1"));
+  EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/tp4_r2/"));
 }
 
 }  // namespace

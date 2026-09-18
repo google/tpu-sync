@@ -56,12 +56,25 @@ TEST(ControlPipeTypesTest, DefaultBackendTypeIsTcp) {
   EXPECT_EQ(ResolveControlPipeBackendType(), ControlPipeBackendType::kTcp);
   EXPECT_EQ(ControlPipeBackendTypeName(ControlPipeBackendType::kTcp), "tcp");
   EXPECT_EQ(ControlPipeBackendTypeName(ControlPipeBackendType::kGrpc), "grpc");
+  EXPECT_EQ(ControlPipeBackendTypeName(ControlPipeBackendType::kZmq), "zmq");
+}
+
+TEST(ControlPipeTypesTest, ParseBackendType) {
+  EXPECT_EQ(ParseControlPipeBackendType("tcp"), ControlPipeBackendType::kTcp);
+  EXPECT_EQ(ParseControlPipeBackendType("TCP"), ControlPipeBackendType::kTcp);
+  EXPECT_EQ(ParseControlPipeBackendType("grpc"), ControlPipeBackendType::kGrpc);
+  EXPECT_EQ(ParseControlPipeBackendType("gRPC"), ControlPipeBackendType::kGrpc);
+  EXPECT_EQ(ParseControlPipeBackendType("zmq"), ControlPipeBackendType::kZmq);
+  EXPECT_EQ(ParseControlPipeBackendType("ZMQ"), ControlPipeBackendType::kZmq);
+  EXPECT_EQ(ParseControlPipeBackendType("unknown"), std::nullopt);
 }
 
 TEST(ControlPipeTypesTest, OverrideTakesPrecedence) {
   EnvVarScoper backend_env("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "tcp");
   EXPECT_EQ(ResolveControlPipeBackendType(ControlPipeBackendType::kGrpc),
             ControlPipeBackendType::kGrpc);
+  EXPECT_EQ(ResolveControlPipeBackendType(ControlPipeBackendType::kZmq),
+            ControlPipeBackendType::kZmq);
 
   EnvVarScoper backend_env_grpc("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "grpc");
   EXPECT_EQ(ResolveControlPipeBackendType(ControlPipeBackendType::kTcp),
@@ -73,6 +86,10 @@ TEST(ControlPipeTypesTest, ResolvesFromEnvVar) {
   {
     EnvVarScoper backend_env("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "GRPC");
     EXPECT_EQ(ResolveControlPipeBackendType(), ControlPipeBackendType::kGrpc);
+  }
+  {
+    EnvVarScoper backend_env("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "ZMQ");
+    EXPECT_EQ(ResolveControlPipeBackendType(), ControlPipeBackendType::kZmq);
   }
   {
     EnvVarScoper backend_env("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "TCP");

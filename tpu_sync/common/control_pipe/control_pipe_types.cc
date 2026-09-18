@@ -24,6 +24,15 @@
 
 namespace tpu_raiden {
 
+std::optional<ControlPipeBackendType> ParseControlPipeBackendType(
+    absl::string_view name) {
+  std::string val = absl::AsciiStrToLower(name);
+  if (val == "grpc") return ControlPipeBackendType::kGrpc;
+  if (val == "zmq") return ControlPipeBackendType::kZmq;
+  if (val == "tcp") return ControlPipeBackendType::kTcp;
+  return std::nullopt;
+}
+
 ControlPipeBackendType ResolveControlPipeBackendType(
     std::optional<ControlPipeBackendType> override_type) {
   if (override_type.has_value()) {
@@ -31,9 +40,10 @@ ControlPipeBackendType ResolveControlPipeBackendType(
   }
   if (const char* env_backend =
           std::getenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND")) {
-    std::string val = absl::AsciiStrToLower(env_backend);
-    if (val == "grpc") return ControlPipeBackendType::kGrpc;
-    if (val == "tcp") return ControlPipeBackendType::kTcp;
+    if (auto parsed = ParseControlPipeBackendType(env_backend);
+        parsed.has_value()) {
+      return *parsed;
+    }
     LOG(WARNING) << "Unknown TPU_RAIDEN_CONTROL_PLANE_BACKEND='" << env_backend
                  << "', falling back to TCP.";
   }
@@ -48,6 +58,8 @@ absl::string_view ControlPipeBackendTypeName(ControlPipeBackendType type) {
   switch (type) {
     case ControlPipeBackendType::kGrpc:
       return "grpc";
+    case ControlPipeBackendType::kZmq:
+      return "zmq";
     case ControlPipeBackendType::kTcp:
       return "tcp";
   }

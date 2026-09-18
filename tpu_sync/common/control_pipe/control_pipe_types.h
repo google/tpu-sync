@@ -30,6 +30,7 @@ namespace tpu_raiden {
 enum class ControlPipeBackendType {
   kTcp,
   kGrpc,
+  kZmq,
 };
 
 using TaskExecutor = std::function<void(std::function<void()>)>;
@@ -89,15 +90,21 @@ struct ControlPipeConfig {
   std::function<uint64_t()> max_legacy_pull_blocks_fn = nullptr;
 };
 
+// Parses a backend type name ("tcp", "grpc", "zmq", case-insensitive).
+// Returns std::nullopt if unknown.
+std::optional<ControlPipeBackendType> ParseControlPipeBackendType(
+    absl::string_view name);
+
 // Resolves the active backend type from:
 // 1. Explicit programmatic `override_type` if provided.
-// 2. `TPU_RAIDEN_CONTROL_PLANE_BACKEND` environment variable ("grpc" or "tcp").
+// 2. `TPU_RAIDEN_CONTROL_PLANE_BACKEND` environment variable ("grpc", "zmq",
+//    or "tcp").
 // 3. `TPU_RAIDEN_USE_GRPC_CONTROL_PLANE` environment variable ("1" or "true").
 // 4. Default: ControlPipeBackendType::kTcp.
 ControlPipeBackendType ResolveControlPipeBackendType(
     std::optional<ControlPipeBackendType> override_type = std::nullopt);
 
-// Returns a string representation of `type` ("tcp" or "grpc").
+// Returns a string representation of `type` ("tcp", "grpc", or "zmq").
 absl::string_view ControlPipeBackendTypeName(ControlPipeBackendType type);
 
 }  // namespace tpu_raiden

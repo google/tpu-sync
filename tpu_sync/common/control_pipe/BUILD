@@ -208,6 +208,58 @@ cc_library(
 )
 
 cc_library(
+    name = "zmq_control_pipe",
+    srcs = ["zmq_control_pipe.cc"],
+    hdrs = ["zmq_control_pipe.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":control_dispatcher",
+        ":control_pipe_interfaces",
+        ":control_pipe_types",
+        "//tpu_sync/proto:control_pipe_cc_proto",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@libzmq",
+    ],
+)
+
+cc_test(
+    name = "zmq_control_pipe_test",
+    srcs = ["zmq_control_pipe_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":control_dispatcher",
+        ":control_pipe_types",
+        ":zmq_control_pipe",
+        "//tpu_sync/proto:control_pipe_cc_proto",
+        "//tpu_sync/proto:kv_cache_control_plane_service_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest_main",
+        "@libzmq",
+        "@xla//xla/tsl/platform:statusor",
+    ],
+)
+
+cc_library(
     name = "control_pipe",
     srcs = ["control_pipe_factory.cc"],
     hdrs = [
@@ -228,6 +280,7 @@ cc_library(
         ":control_pipe_types",
         ":grpc_control_pipe",
         ":tcp_control_pipe",
+        ":zmq_control_pipe",
         "//tpu_sync/proto:control_pipe_cc_proto",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -280,6 +333,7 @@ py_library(
         "//tpu_sync/proto:control_pipe_py_pb2",
         "//tpu_sync/proto:control_pipe_py_pb2_grpc",
         "@com_github_grpc_grpc//src/python/grpcio/grpc:grpcio",
+        "@pypi//pyzmq",
     ],
 )
 
@@ -294,5 +348,6 @@ py_test(
         "//tpu_sync/rpc:raiden_service_py_pb2",
         "@com_github_grpc_grpc//src/python/grpcio/grpc:grpcio",
         "@com_google_absl_py//absl/testing:absltest",
+        "@pypi//pyzmq",
     ],
 )

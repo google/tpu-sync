@@ -129,7 +129,8 @@ TEST_P(ControlPipeBackendTest, RemoteErrorStatusPropagation) {
 INSTANTIATE_TEST_SUITE_P(
     AllBackends, ControlPipeBackendTest,
     ::testing::Values(ControlPipeBackendType::kTcp,
-                      ControlPipeBackendType::kGrpc),
+                      ControlPipeBackendType::kGrpc,
+                      ControlPipeBackendType::kZmq),
     [](const ::testing::TestParamInfo<ControlPipeBackendType>& info) {
       return std::string(ControlPipeBackendTypeName(info.param));
     });

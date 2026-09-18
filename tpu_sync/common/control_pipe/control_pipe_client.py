@@ -25,6 +25,8 @@ from typing import Any, Callable, Optional, Type, TypeVar
 
 from google.protobuf import message as proto_message
 import grpc
+import zmq
+import zmq.asyncio
 
 from tpu_sync.proto import control_pipe_pb2
 from tpu_sync.proto import control_pipe_pb2_grpc
@@ -47,6 +49,7 @@ class ControlPipeBackendType(enum.Enum):
 
   TCP = "tcp"
   GRPC = "grpc"
+  ZMQ = "zmq"
 
 
 def resolve_control_pipe_backend(
@@ -65,12 +68,25 @@ def resolve_control_pipe_backend(
   env_val = os.environ.get("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "").lower()
   if env_val == "grpc":
     return ControlPipeBackendType.GRPC
+  if env_val == "zmq":
+    return ControlPipeBackendType.ZMQ
   if env_val == "tcp":
     return ControlPipeBackendType.TCP
   env_flag = os.environ.get("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE", "").lower()
   if env_flag in ("1", "true"):
     return ControlPipeBackendType.GRPC
   return ControlPipeBackendType.TCP
+
+
+def _format_zmq_endpoint(endpoint: str) -> str:
+  """Formats an endpoint string as a valid ZeroMQ URI."""
+  if (
+      endpoint.startswith("tcp://")
+      or endpoint.startswith("inproc://")
+      or endpoint.startswith("ipc://")
+  ):
+    return endpoint
+  return f"tcp://{endpoint}"
 
 
 def _default_connect_socket(
@@ -119,7 +135,7 @@ def _recv_exact(sock: socket.socket, num_bytes: int) -> bytes:
 
 
 class ControlPipeClient:
-  """Asyncio-native ControlPipe client supporting TCP and gRPC."""
+  """Asyncio-native ControlPipe client supporting TCP, gRPC, and ZMQ."""
 
   def __init__(
       self,
@@ -153,6 +169,7 @@ class ControlPipeClient:
     self._aio_stubs: dict[str, control_pipe_pb2_grpc.ControlPipeServiceStub] = (
         {}
     )
+    self._zmq_aio_ctx: Optional[zmq.asyncio.Context] = None
 
   @property
   def backend(self) -> ControlPipeBackendType:
@@ -222,6 +239,11 @@ class ControlPipeClient:
           endpoint, payload, timeout, message_type
       )
 
+    if self.backend == ControlPipeBackendType.ZMQ:
+      return await self._send_raw_zmq_async(
+          endpoint, payload, timeout, message_type
+      )
+
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         self._executor,
@@ -255,6 +277,59 @@ class ControlPipeClient:
           f"gRPC ControlPipe call to {endpoint} failed: {err}"
       ) from err
 
+    if resp_env.status_code != 0:
+      raise RuntimeError(
+          f"Remote ControlPipe error (code={resp_env.status_code}): "
+          f"{resp_env.error_message}"
+      )
+    return resp_env.payload
+
+  async def _send_raw_zmq_async(
+      self,
+      endpoint: str,
+      payload: bytes,
+      timeout: float,
+      message_type: str,
+  ) -> bytes:
+    """Asynchronously dispatches raw request bytes over ZeroMQ."""
+    resolved = self._resolve_address(endpoint)
+    with self._lock:
+      if self._zmq_aio_ctx is None:
+        self._zmq_aio_ctx = zmq.asyncio.Context()
+      ctx = self._zmq_aio_ctx
+
+    max_bytes = self._max_frame_bytes
+    sock = ctx.socket(zmq.REQ)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt(zmq.MAXMSGSIZE, max_bytes)
+    timeout_ms = int(timeout * 1000) if timeout > 0 else -1
+    sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
+    sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
+    try:
+      sock.connect(_format_zmq_endpoint(resolved))
+      env = control_pipe_pb2.ControlEnvelope(
+          message_type=message_type,
+          request_id=self._allocate_req_id(),
+          payload=payload,
+      )
+      env_bytes = env.SerializeToString()
+      if len(env_bytes) > max_bytes:
+        raise RuntimeError(
+            f"ZMQ frame size ({len(env_bytes)}) exceeds max_frame_bytes "
+            f"({max_bytes})"
+        )
+      wait_timeout = timeout if timeout and timeout > 0 else None
+      await asyncio.wait_for(sock.send(env_bytes), timeout=wait_timeout)
+      resp_bytes = await asyncio.wait_for(sock.recv(), timeout=wait_timeout)
+    except (zmq.ZMQError, asyncio.TimeoutError) as err:
+      raise RuntimeError(
+          f"ZMQ ControlPipe call to {endpoint} failed: {err}"
+      ) from err
+    finally:
+      sock.close(linger=0)
+
+    resp_env = control_pipe_pb2.ControlResponseEnvelope()
+    resp_env.ParseFromString(resp_bytes)
     if resp_env.status_code != 0:
       raise RuntimeError(
           f"Remote ControlPipe error (code={resp_env.status_code}): "
@@ -309,16 +384,22 @@ class ControlPipeClient:
       sock.close()
 
   async def aclose(self) -> None:
-    """Asynchronously closes all cached grpc.aio channels."""
+    """Asynchronously closes all cached grpc.aio channels and ZMQ context."""
     with self._lock:
       channels = list(self._aio_channels.values())
       self._aio_channels.clear()
       self._aio_stubs.clear()
+      if self._zmq_aio_ctx is not None:
+        self._zmq_aio_ctx.term()
+        self._zmq_aio_ctx = None
     for channel in channels:
       await channel.close()
 
   def close(self) -> None:
-    """Clears cached client state synchronously."""
+    """Synchronously closes underlying ZMQ context and clears gRPC state."""
     with self._lock:
       self._aio_channels.clear()
       self._aio_stubs.clear()
+      if self._zmq_aio_ctx is not None:
+        self._zmq_aio_ctx.term()
+        self._zmq_aio_ctx = None

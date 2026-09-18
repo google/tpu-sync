@@ -19,6 +19,7 @@
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/common/control_pipe/grpc_control_pipe.h"
 #include "tpu_sync/common/control_pipe/tcp_control_pipe.h"
+#include "tpu_sync/common/control_pipe/zmq_control_pipe.h"
 
 namespace tpu_raiden {
 
@@ -27,6 +28,8 @@ std::unique_ptr<ControlPipeServer> CreateControlPipeServer(
   switch (config.backend_type) {
     case ControlPipeBackendType::kGrpc:
       return std::make_unique<GrpcControlPipeServer>(config);
+    case ControlPipeBackendType::kZmq:
+      return std::make_unique<ZmqControlPipeServer>(config);
     case ControlPipeBackendType::kTcp:
       return std::make_unique<TcpControlPipeServer>(config);
   }
@@ -38,6 +41,8 @@ std::unique_ptr<ControlPipeClient> CreateControlPipeClient(
   switch (config.backend_type) {
     case ControlPipeBackendType::kGrpc:
       return std::make_unique<GrpcControlPipeClient>(config);
+    case ControlPipeBackendType::kZmq:
+      return std::make_unique<ZmqControlPipeClient>(config);
     case ControlPipeBackendType::kTcp:
       return std::make_unique<TcpControlPipeClient>(config);
   }

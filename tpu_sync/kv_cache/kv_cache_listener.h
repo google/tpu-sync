@@ -16,21 +16,65 @@
 #define THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_KV_CACHE_KV_CACHE_LISTENER_H_
 
 #include <atomic>
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <thread>  // NOLINT
 
+#include "absl/status/status.h"
+#include "absl/types/span.h"
 #include "tpu_sync/common/detached_thread_group.h"
+
+namespace tpu_sync {
+namespace rpc {
+class StartTransferRequest;
+}  // namespace rpc
+}  // namespace tpu_sync
 
 namespace tpu_raiden {
 namespace kv_cache {
-
-class KVCacheManagerBase;
 
 // Connection threads are detached; the destructor blocks until every in-flight
 // connection has returned instead of joining retained thread objects.
 class KVCacheListener final {
  public:
-  KVCacheListener(KVCacheManagerBase* engine, int listener_port);
+  template <typename Engine>
+  KVCacheListener(Engine* engine, int listener_port)
+      : KVCacheListener(
+            EngineCallbacks{
+                .pool_reshard_push =
+                    [engine](const tpu_sync::rpc::StartTransferRequest& req,
+                             absl::Span<const int64_t> src_block_ids,
+                             int parallelism) {
+                      return engine->PoolReshardPush(req, src_block_ids,
+                                                     parallelism);
+                    },
+                .pool_reshard_register_recv =
+                    [engine](const tpu_sync::rpc::StartTransferRequest& req,
+                             absl::Span<const int64_t> chip_block_ids) {
+                      return engine->PoolReshardRegisterRecv(req,
+                                                             chip_block_ids);
+                    },
+                .push_kv_cache_resharded =
+                    [engine](const tpu_sync::rpc::StartTransferRequest& req) {
+                      if constexpr (requires {
+                                      engine->PushKVCacheResharded(req);
+                                    }) {
+                        return engine->PushKVCacheResharded(req);
+                      } else {
+                        return engine->base()->PushKVCacheResharded(req);
+                      }
+                    },
+                .register_active_plan =
+                    [engine](uint64_t uuid,
+                             const tpu_sync::rpc::StartTransferRequest& req,
+                             bool is_sender) {
+                      return engine->RegisterActivePlan(uuid, req, is_sender);
+                    },
+                .wait_for_pending_work =
+                    [engine]() { return engine->WaitForPendingWork(); },
+            },
+            listener_port) {}
   ~KVCacheListener();
 
   KVCacheListener(const KVCacheListener&) = delete;
@@ -40,18 +84,34 @@ class KVCacheListener final {
   bool is_active() const { return !stopping_; }
 
  private:
+  struct EngineCallbacks {
+    std::function<absl::Status(const tpu_sync::rpc::StartTransferRequest&,
+                               absl::Span<const int64_t>, int)>
+        pool_reshard_push;
+    std::function<absl::Status(const tpu_sync::rpc::StartTransferRequest&,
+                               absl::Span<const int64_t>)>
+        pool_reshard_register_recv;
+    std::function<absl::Status(const tpu_sync::rpc::StartTransferRequest&)>
+        push_kv_cache_resharded;
+    std::function<absl::Status(
+        uint64_t, const tpu_sync::rpc::StartTransferRequest&, bool)>
+        register_active_plan;
+    std::function<absl::Status()> wait_for_pending_work;
+  };
+
+  KVCacheListener(EngineCallbacks callbacks, int listener_port);
   void ListenerLoop();
   void ConnectionWorker(int client_fd);
 
-  KVCacheManagerBase* engine_;
+  EngineCallbacks callbacks_;
   int listener_port_;
   int server_fd_ = -1;
   std::atomic<bool> stopping_{false};
 
   std::thread listener_thread_;
 
-  // The destructor drains this so |engine_| and `this` outlive every in-flight
-  // connection.
+  // The destructor drains this so |callbacks_| and `this` outlive every
+  // in-flight connection.
   DetachedThreadGroup connection_threads_{"KVCacheListener connection"};
 };
 

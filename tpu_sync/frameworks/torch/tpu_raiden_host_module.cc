@@ -65,9 +65,9 @@ class HostKVCacheManager : public KVCacheManagerWithTransfer {
             /*num_slots=*/0, /*timeout_s=*/120.0) {}
 
   std::string transfer_address() const {
-    std::optional<int> port = local_port();
+    std::optional<int> port = base_->local_port();
     if (!port.has_value()) return "";
-    return FormatAddressWithPort(local_ip(), *port);
+    return FormatAddressWithPort(base_->local_ip(), *port);
   }
 
   absl::Status PushRegisteredPlan(uint64_t uuid, const std::string& peer,
@@ -84,15 +84,8 @@ class HostKVCacheManager : public KVCacheManagerWithTransfer {
       return absl::InvalidArgumentError(
           "src_block_ids and dst_block_ids must have the same length");
     }
-    InitTransportServer();
-    // Copy the transport pointer and release server_init_mu_ before the
-    // blocking Push: holding the lock across it serializes concurrent pushes
-    // from the same manager (one per destination peer).
-    tpu_raiden::transport::BlockTransport* transport = nullptr;
-    {
-      absl::MutexLock lock(server_init_mu_);
-      transport = server_.get();
-    }
+    tpu_raiden::transport::BlockTransport* transport =
+        base_->InitTransportServer();
     if (!transport) {
       return absl::FailedPreconditionError("Transport server is not running");
     }
@@ -110,9 +103,9 @@ class HostKVCacheManager : public KVCacheManagerWithTransfer {
     if (block_id < 0) {
       return absl::InvalidArgumentError("block_id must be non-negative");
     }
-    const size_t block_bytes = this->block_bytes(layer_idx);
-    const size_t host_size = GetHostSize(layer_idx, shard_idx);
-    const uint8_t* base = GetHostPointer(layer_idx, shard_idx);
+    const size_t block_bytes = base_->block_bytes(layer_idx);
+    const size_t host_size = base_->GetHostSize(layer_idx, shard_idx);
+    const uint8_t* base = base_->GetHostPointer(layer_idx, shard_idx);
     if (base == nullptr) {
       return absl::OutOfRangeError("layer or shard index out of range");
     }
@@ -131,14 +124,14 @@ class HostKVCacheManager : public KVCacheManagerWithTransfer {
     if (block_id < 0) {
       return absl::InvalidArgumentError("block_id must be non-negative");
     }
-    const size_t block_bytes = this->block_bytes(layer_idx);
+    const size_t block_bytes = base_->block_bytes(layer_idx);
     if (payload.size() != block_bytes) {
       return absl::InvalidArgumentError(
           absl::StrCat("payload size must equal block size: got ",
                        payload.size(), ", expected ", block_bytes));
     }
-    const size_t host_size = GetHostSize(layer_idx, shard_idx);
-    uint8_t* base = GetHostPointer(layer_idx, shard_idx);
+    const size_t host_size = base_->GetHostSize(layer_idx, shard_idx);
+    uint8_t* base = base_->GetHostPointer(layer_idx, shard_idx);
     if (base == nullptr) {
       return absl::OutOfRangeError("layer or shard index out of range");
     }
@@ -204,13 +197,32 @@ NB_MODULE(_tpu_raiden_host, m) {
            nb::arg("host_blocks_to_allocate") = nb::none(),
            nb::arg("parallelism") = 1)
       .def("node_id", &HostKVCacheManager::node_id)
-      .def_prop_ro("local_port", &HostKVCacheManager::local_port)
-      .def_prop_ro("num_layers", &HostKVCacheManager::num_layers)
-      .def_prop_ro("num_shards", &HostKVCacheManager::num_shards)
-      .def_prop_ro("slice_byte_size", &HostKVCacheManager::slice_byte_size)
-      .def_prop_ro("num_block_arrays", &HostKVCacheManager::num_block_arrays)
-      .def("block_bytes", &HostKVCacheManager::block_bytes,
-           nb::arg("block_array_idx"))
+      .def_prop_ro("local_port",
+                   [](const HostKVCacheManager& self) {
+                     return self.base()->local_port();
+                   })
+      .def_prop_ro("num_layers",
+                   [](const HostKVCacheManager& self) {
+                     return self.base()->num_layers();
+                   })
+      .def_prop_ro("num_shards",
+                   [](const HostKVCacheManager& self) {
+                     return self.base()->num_shards();
+                   })
+      .def_prop_ro("slice_byte_size",
+                   [](const HostKVCacheManager& self) {
+                     return self.base()->slice_byte_size();
+                   })
+      .def_prop_ro("num_block_arrays",
+                   [](const HostKVCacheManager& self) {
+                     return self.base()->num_block_arrays();
+                   })
+      .def(
+          "block_bytes",
+          [](const HostKVCacheManager& self, size_t block_array_idx) {
+            return self.base()->block_bytes(block_array_idx);
+          },
+          nb::arg("block_array_idx"))
       .def_prop_ro("transfer_address", &HostKVCacheManager::transfer_address)
       .def("get_local_endpoints",
            [](const HostKVCacheManager& self) {

@@ -46,6 +46,7 @@
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/transfer_send_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
@@ -99,12 +100,6 @@ class TransferFuture {
   std::vector<raiden::PjRtCopyFuture> futures_;
 };
 
-struct CopySpec {
-  std::vector<int64_t> src_offsets;
-  std::vector<int64_t> dst_offsets;
-  std::vector<int64_t> sizes;
-};
-
 struct CopyPlan {
   int64_t num_blocks = 0;
   std::vector<int64_t> requested_remote_block_ids;
@@ -142,8 +137,11 @@ struct PendingCopy {
   int64_t chip_block_id;
 };
 
-class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
+class KVCacheManagerWithTransfer {
  public:
+  using SendEntry = TransferSendSession;
+  friend class TransferSendSession;
+
   struct Slot {
     int64_t slot_idx;
     std::vector<int> block_ids;
@@ -189,11 +187,20 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
       int64_t max_blocks = 0, int64_t num_slots = 0, double timeout_s = 120.0,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
+  KVCacheManagerWithTransfer(
+      std::unique_ptr<kv_cache::KVCacheManagerBase> base, int64_t node_id = 0,
+      int64_t local_control_port = -1, int64_t max_blocks = 0,
+      int64_t num_slots = 0, double timeout_s = 120.0,
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+
   void SetMetricsCollector(std::shared_ptr<MetricsCollector> collector) {
     metrics_collector_ = std::move(collector);
   }
 
-  ~KVCacheManagerWithTransfer() override;
+  virtual ~KVCacheManagerWithTransfer();
+
+  kv_cache::KVCacheManagerBase* base() { return base_.get(); }
+  const kv_cache::KVCacheManagerBase* base() const { return base_.get(); }
 
   virtual int64_t NotifyForRead(const std::string& req_id, uint64_t uuid,
                                 const std::vector<int64_t>& block_ids);
@@ -216,43 +223,41 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
                      std::vector<std::string>>
   CompleteReadRaw();
 
-  absl::Status RegisterActivePlan(
+  virtual absl::Status RegisterActivePlan(
       uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
-      bool is_sender) override;
-  absl::Status UnregisterActivePlan(uint64_t uuid) override;
+      bool is_sender);
+  virtual absl::Status UnregisterActivePlan(uint64_t uuid);
   // Drops the plan of a receive that has settled; a plan already gone, or
   // a newer registration reusing the uuid, is left alone.
   void UnregisterSettledPlan(uint64_t uuid, uint64_t generation);
 
-  absl::Status RegisterRecv(uint64_t uuid, const std::string& req_id,
-                            int64_t expected_block_count) override;
+  virtual absl::Status RegisterRecv(uint64_t uuid, const std::string& req_id,
+                                    int64_t expected_block_count);
 
   // Pool reshard executor. The controller owns topology and entry math; this
   // boundary validates the declared pool contract before any staging or
   // network side effect. Both methods are device-only: a manager without
   // device attachments fails closed.
-  absl::Status PoolReshardPush(
+  virtual absl::Status PoolReshardPush(
       const ::tpu_sync::rpc::StartTransferRequest& plan,
-      absl::Span<const int64_t> src_block_ids, int parallelism = 8) override;
+      absl::Span<const int64_t> src_block_ids, int parallelism = 8);
 
-  absl::Status PoolReshardRegisterRecv(
+  virtual absl::Status PoolReshardRegisterRecv(
       const ::tpu_sync::rpc::StartTransferRequest& plan,
-      absl::Span<const int64_t> chip_block_ids) override;
+      absl::Span<const int64_t> chip_block_ids);
 
-  absl::Status OnBlocksReceived(const std::vector<int>& block_ids,
-                                uint64_t uuid = 0) override;
+  virtual absl::Status WaitForPendingWork();
+
+  virtual absl::Status OnBlocksReceived(const std::vector<int>& block_ids,
+                                        uint64_t uuid = 0);
 
   virtual std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
 
   // Endpoints for the block-transport DATA protocol (pulls and pushes),
   // always the transport server's own port -- unlike get_local_endpoints(),
   // which prefers the CONTROL port when a control server is running because
-  // StartRead speaks the control protocol. Use these anywhere a peer will
-  // open a data connection, notably worker registration: the registry's
-  // endpoints are what a remote ReadRemote pulls from, and pointing a pull
-  // at a control port hangs both sides silently.
-  virtual std::vector<RaidenTransferEndpoint> get_local_data_endpoints()
-      const;
+  // StartRead speaks the control protocol.
+  virtual std::vector<RaidenTransferEndpoint> get_local_data_endpoints() const;
 
   virtual void StartRead(
       const std::string& req_id, uint64_t uuid,
@@ -265,43 +270,9 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   virtual int64_t node_id() const { return node_id_; }
 
  protected:
-  std::vector<RaidenTransferEndpoint> BuildEndpoints(int64_t port) const;
+  std::unique_ptr<kv_cache::KVCacheManagerBase> base_;
 
-  struct SendEntry {
-    std::string req_id;
-    uint64_t uuid = 0;
-    int64_t slot_idx = -1;
-    // Host blocks held under demand staging, released on completion. Empty
-    // when the transfer holds a fixed slot instead.
-    std::vector<int> staged_host_blocks;
-    int64_t num_blocks = 0;
-    int64_t registered_num_blocks = 0;
-    int64_t total_bytes = 0;
-    int64_t copy_segments = 0;
-    std::vector<int64_t> registered_block_ids;
-    std::set<int64_t> registered_block_set;
-    std::chrono::steady_clock::time_point register_start;
-    std::chrono::steady_clock::time_point d2h_issue_start;
-    std::chrono::steady_clock::time_point d2h_issue_done;
-    std::chrono::steady_clock::time_point d2h_done;
-    bool stage_done = false;
-    bool failed = false;
-    bool pull_started = false;
-    bool slot_released = false;
-    // Copies and pushes issued for this send whose completion has not been
-    // observed. The staging they read and write is held until it is zero.
-    // Guarded by mu_.
-    int in_flight = 0;
-    // The outcome is decided (failed, or every push done) and the send
-    // waits for its in-flight work before it is reported. Guarded by mu_.
-    bool draining = false;
-    std::chrono::steady_clock::time_point deadline;
-    std::vector<raiden::PjRtCopyFuture> d2h_layer_futures;
-    std::vector<std::string> remote_data_endpoints;
-    std::vector<int> src_ints;
-    std::vector<int> dst_ints;
-    std::atomic<size_t> remaining_h2h_layers{0};
-  };
+  std::vector<RaidenTransferEndpoint> BuildEndpoints(int64_t port) const;
 
   struct StagingLayerReady {
     bool done = false;
@@ -328,8 +299,6 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   void ConfigureDataPortFromKvTransfer();
 
   std::vector<int> ContiguousBlockIds(uint64_t base, uint64_t count) const;
-  static void ValidateRequestedBlocks(
-      const SendEntry& entry, const std::vector<int64_t>& requested_block_ids);
 
   static bool DynamicHostStagingEnabled();
   absl::Status InitializeSlotPool(int64_t num_slots);
@@ -365,12 +334,12 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   void StartControlServer();
   void StopControlServer();
   void AckRemote(const std::string& remote_endpoint, uint64_t uuid);
-  absl::Status OnLayerReceived(size_t layer_idx, uint64_t uuid) override;
-  absl::Status OnPoolReceived(size_t pool_idx, uint64_t uuid) override;
-  void RegisterBlockReadinessCallback(
+  virtual absl::Status OnLayerReceived(size_t layer_idx, uint64_t uuid);
+  virtual absl::Status OnPoolReceived(size_t pool_idx, uint64_t uuid);
+  virtual void RegisterBlockReadinessCallback(
       size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
-      transport::BlockTransportDelegate::HostBlockReadyCallback cb) override;
-  void ScheduleAsyncTask(std::function<void()> task) override;
+      transport::BlockTransportDelegate::HostBlockReadyCallback cb);
+  virtual void ScheduleAsyncTask(std::function<void()> task);
   std::shared_ptr<StagingReadinessState> CreateStagingReadiness(
       int64_t slot_idx, int64_t num_blocks);
   void MarkStagingLayerReady(
@@ -380,8 +349,6 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
 
   using H2dIssueFuture =
       std::shared_future<absl::StatusOr<raiden::PjRtCopyFuture>>;
-
-  absl::Status WaitForPendingWork() override;
 
   struct RecvEntry {
     std::string req_id;
@@ -472,30 +439,11 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
                          const std::vector<std::string>& remote_data_endpoints,
                          const std::vector<int64_t>& src_block_ids,
                          const std::vector<int64_t>& dst_block_ids);
-  void SendNextLayer(const std::shared_ptr<SendEntry>& entry, size_t l);
-  // Decides a pull-serve send's outcome. The send is reported and its
-  // staging returned once nothing issued for it is still running: at once
-  // for a send nobody pulled, otherwise when its last copy or push ends.
-  // A failure outranks a completion decided later.
-  void FinishSendLocked(const std::shared_ptr<SendEntry>& entry, bool failed);
-  // Reports the send's outcome, returns its staging and drops the entry.
-  void RetireSendLocked(const std::shared_ptr<SendEntry>& entry);
-  // Counts one copy or push issued for the send.
-  void BeginSendOpLocked(const std::shared_ptr<SendEntry>& entry);
-  // Counts one finished copy or push; retires a send that waited for it.
-  void EndSendOpLocked(const std::shared_ptr<SendEntry>& entry);
-  void EndSendOp(const std::shared_ptr<SendEntry>& entry);
 
   absl::Status ValidatePoolReshardPlan(
       const ::tpu_sync::rpc::StartTransferRequest& plan,
       absl::Span<const int64_t> local_block_ids, bool is_sender);
-  // Receiver-only byte accounting over the plan's group structure: group
-  // pools must share one live-region map, declared extents must be
-  // prefix-shaped, every destination block's compact-live bytes must be
-  // covered exactly once up to its extent, and the group's expected push
-  // count must equal the recomputation from the received schedules. This
-  // is the trust boundary between a planner defect and silent decode
-  // corruption; the arming worker validates for itself.
+  // Receiver-only byte accounting over the plan's group structure.
   absl::Status ValidatePoolReshardReceiverCoverage(
       const ::tpu_sync::rpc::StartTransferRequest& plan);
   void StartPoolReshardPush(uint64_t uuid, size_t pool_idx);
@@ -541,10 +489,7 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
   std::set<std::string> done_recving_;
   std::set<std::string> failed_recving_;
   // StagingReadinessState is shared because it is captured by value in the
-  // async PjRt copy callbacks (e.g. OnReady). A shared_ptr is required here
-  // to ensure the state stays alive even if the entry is removed from this
-  // map (e.g. on timeout, cancellation, or slot release) before the async
-  // callback runs.
+  // async PjRt copy callbacks (e.g. OnReady).
   std::map<int64_t, std::shared_ptr<StagingReadinessState>> staging_readiness_;
   std::map<int64_t, std::shared_ptr<StagingReadinessState>>
       active_producer_blocks_;
@@ -556,7 +501,9 @@ class KVCacheManagerWithTransfer : public kv_cache::KVCacheManagerBase {
 
  private:
   class ControlPlaneHandlerImpl;
+  class SendDataPlaneImpl;
 
+  void InitializeBaseHooks();
   void InitializeControlPlane();
   absl::StatusOr<PullStreamResponseSpec> HandlePullStream(
       const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);

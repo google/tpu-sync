@@ -55,14 +55,12 @@ constexpr double kTimeoutS = 0.05;
 class TestManager : public KVCacheManagerWithTransfer {
  public:
   explicit TestManager(size_t num_layers)
-      : KVCacheManagerWithTransfer(num_layers, /*num_shards=*/1,
-                                   /*slice_byte_size=*/128,
-                                   /*local_port=*/std::nullopt,
-                                   /*host_blocks_to_allocate=*/std::nullopt,
-                                   /*parallelism=*/1, /*node_id=*/0,
+      : KVCacheManagerWithTransfer(std::make_unique<TestBase>(num_layers, this),
+                                   /*node_id=*/0,
                                    /*local_control_port=*/-1, /*max_blocks=*/1,
                                    /*num_slots=*/kSlots, kTimeoutS) {
-    CHECK_OK(ConfigureHostStagingSlots(kSlots, /*max_major_per_slot=*/1));
+    CHECK_OK(
+        base_->ConfigureHostStagingSlots(kSlots, /*max_major_per_slot=*/1));
     CHECK_OK(InitializeSlotPool(kSlots));
   }
 
@@ -72,7 +70,7 @@ class TestManager : public KVCacheManagerWithTransfer {
   void ServePull(uint64_t uuid) {
     {
       absl::MutexLock lock(mu_);
-      send_entries_.at(uuid)->pull_started = true;
+      send_entries_.at(uuid)->set_pull_started(true);
     }
     StartPushInternal(uuid, {"127.0.0.1:1"}, /*src_block_ids=*/{0},
                       /*dst_block_ids=*/{0});
@@ -96,7 +94,7 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   void ExpireSend(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    send_entries_.at(uuid)->deadline =
+    send_entries_.at(uuid)->set_deadline(
         std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
   }
 
@@ -105,23 +103,23 @@ class TestManager : public KVCacheManagerWithTransfer {
   std::shared_ptr<SendEntry> AddSyntheticSend(const std::string& req_id,
                                               uint64_t uuid, int in_flight) {
     absl::MutexLock lock(mu_);
-    auto entry = std::make_shared<SendEntry>();
-    entry->req_id = req_id;
-    entry->uuid = uuid;
-    entry->slot_idx = AcquireSlotLocked().slot_idx;
-    entry->in_flight = in_flight;
+    auto entry = std::make_shared<SendEntry>(base_.get(), req_id, uuid,
+                                             DeadlineFromNow(),
+                                             std::chrono::steady_clock::now());
+    entry->set_slot_idx(AcquireSlotLocked().slot_idx);
+    entry->set_in_flight(in_flight);
     send_entries_[uuid] = entry;
     return entry;
   }
 
   void Decide(const std::shared_ptr<SendEntry>& entry, bool failed) {
     absl::MutexLock lock(mu_);
-    FinishSendLocked(entry, failed);
+    entry->FinishSendLocked(*this, failed);
   }
 
   void End(const std::shared_ptr<SendEntry>& entry) {
     absl::MutexLock lock(mu_);
-    EndSendOpLocked(entry);
+    entry->EndSendOpLocked(*this);
   }
 
   bool has_send(uint64_t uuid) {
@@ -129,19 +127,33 @@ class TestManager : public KVCacheManagerWithTransfer {
     return send_entries_.contains(uuid);
   }
 
-  absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
-      const std::vector<int64_t>& src_offsets_major_dim,
-      const std::vector<int64_t>& dst_offsets_major_dim,
-      const std::vector<int64_t>& copy_sizes_major_dim,
-      std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
-      std::optional<size_t> shard_idx) override {
-    auto [promise, future] = xla::MakePromise<>();
-    absl::MutexLock lock(copies_mu_);
-    copies_.push_back(std::move(promise));
-    return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
-  }
-
  private:
+  class TestBase : public kv_cache::KVCacheManagerBase {
+   public:
+    TestBase(size_t num_layers, TestManager* owner)
+        : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
+                                       std::vector<size_t>(num_layers, 128),
+                                       /*local_port=*/std::nullopt,
+                                       /*host_blocks_to_allocate=*/kSlots,
+                                       /*parallelism=*/1, nullptr),
+          owner_(owner) {}
+
+    absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
+        const std::vector<int64_t>& src_offsets_major_dim,
+        const std::vector<int64_t>& dst_offsets_major_dim,
+        const std::vector<int64_t>& copy_sizes_major_dim,
+        std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
+        std::optional<size_t> shard_idx) override {
+      auto [promise, future] = xla::MakePromise<>();
+      absl::MutexLock lock(owner_->copies_mu_);
+      owner_->copies_.push_back(std::move(promise));
+      return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
+    }
+
+   private:
+    TestManager* owner_;
+  };
+
   absl::Mutex copies_mu_;
   std::vector<xla::Promise<>> copies_;
 };
@@ -150,14 +162,12 @@ class TestManager : public KVCacheManagerWithTransfer {
 class RecvTestManager : public KVCacheManagerWithTransfer {
  public:
   explicit RecvTestManager(size_t num_layers, double timeout_s = 5.0)
-      : KVCacheManagerWithTransfer(num_layers, /*num_shards=*/1,
-                                   /*slice_byte_size=*/128,
-                                   /*local_port=*/std::nullopt,
-                                   /*host_blocks_to_allocate=*/std::nullopt,
-                                   /*parallelism=*/1, /*node_id=*/0,
+      : KVCacheManagerWithTransfer(std::make_unique<RecvBase>(num_layers, this),
+                                   /*node_id=*/0,
                                    /*local_control_port=*/-1, /*max_blocks=*/1,
                                    /*num_slots=*/kSlots, timeout_s) {
-    CHECK_OK(ConfigureHostStagingSlots(kSlots, /*max_major_per_slot=*/1));
+    CHECK_OK(
+        base_->ConfigureHostStagingSlots(kSlots, /*max_major_per_slot=*/1));
     CHECK_OK(InitializeSlotPool(kSlots));
   }
 
@@ -217,23 +227,37 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     if (!release_dispatch_.HasBeenNotified()) release_dispatch_.Notify();
   }
 
-  absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
-      const std::vector<int64_t>& src_offsets_major_dim,
-      const std::vector<int64_t>& dst_offsets_major_dim,
-      const std::vector<int64_t>& copy_sizes_major_dim,
-      std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
-      std::optional<size_t> shard_idx) override {
-    if (block_dispatch_.load()) {
-      dispatch_entered_.Notify();
-      release_dispatch_.WaitForNotification();
-    }
-    auto [promise, future] = xla::MakePromise<>();
-    absl::MutexLock lock(copies_mu_);
-    copies_.push_back(std::move(promise));
-    return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
-  }
-
  private:
+  class RecvBase : public kv_cache::KVCacheManagerBase {
+   public:
+    RecvBase(size_t num_layers, RecvTestManager* owner)
+        : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
+                                       std::vector<size_t>(num_layers, 128),
+                                       /*local_port=*/std::nullopt,
+                                       /*host_blocks_to_allocate=*/kSlots,
+                                       /*parallelism=*/1, nullptr),
+          owner_(owner) {}
+
+    absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
+        const std::vector<int64_t>& src_offsets_major_dim,
+        const std::vector<int64_t>& dst_offsets_major_dim,
+        const std::vector<int64_t>& copy_sizes_major_dim,
+        std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
+        std::optional<size_t> shard_idx) override {
+      if (owner_->block_dispatch_.load()) {
+        owner_->dispatch_entered_.Notify();
+        owner_->release_dispatch_.WaitForNotification();
+      }
+      auto [promise, future] = xla::MakePromise<>();
+      absl::MutexLock lock(owner_->copies_mu_);
+      owner_->copies_.push_back(std::move(promise));
+      return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
+    }
+
+   private:
+    RecvTestManager* owner_;
+  };
+
   absl::Mutex copies_mu_;
   std::vector<xla::Promise<>> copies_;
   std::atomic<bool> block_dispatch_{false};

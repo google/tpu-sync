@@ -52,9 +52,8 @@ bool HasPoolReshardFields(const tpu_sync::rpc::StartTransferRequest& request) {
 
 }  // namespace
 
-KVCacheListener::KVCacheListener(KVCacheManagerBase* engine,
-                                 int listener_port)
-    : engine_(engine), listener_port_(listener_port) {
+KVCacheListener::KVCacheListener(EngineCallbacks callbacks, int listener_port)
+    : callbacks_(std::move(callbacks)), listener_port_(listener_port) {
   server_fd_ = socket(AF_INET6, SOCK_STREAM, 0);
   if (server_fd_ < 0) {
     LOG(FATAL) << "Failed to create C++ KVCacheListener socket: "
@@ -201,8 +200,8 @@ void KVCacheListener::ConnectionWorker(int client_fd) {
         }
         const std::vector<int64_t> src_block_ids(src_id_set.begin(),
                                                  src_id_set.end());
-        absl::Status status = engine_->PoolReshardPush(start_req, src_block_ids,
-                                                       start_req.parallelism());
+        absl::Status status = callbacks_.pool_reshard_push(
+            start_req, src_block_ids, start_req.parallelism());
         if (!status.ok()) {
           resp.set_success(false);
           resp.set_message(std::string(status.message()));
@@ -220,7 +219,7 @@ void KVCacheListener::ConnectionWorker(int client_fd) {
                                 group.dst_device_block_ids().end());
         }
         absl::Status status =
-            engine_->PoolReshardRegisterRecv(start_req, chip_block_ids);
+            callbacks_.pool_reshard_register_recv(start_req, chip_block_ids);
         if (!status.ok()) {
           resp.set_success(false);
           resp.set_message(std::string(status.message()));
@@ -231,7 +230,7 @@ void KVCacheListener::ConnectionWorker(int client_fd) {
         // Preserve the pre-pool controller protocol for existing callers.
         LOG(INFO) << "C++ KVCacheListener received legacy START_TRANSFER "
                      "(Sender)";
-        absl::Status status = engine_->PushKVCacheResharded(start_req);
+        absl::Status status = callbacks_.push_kv_cache_resharded(start_req);
         if (!status.ok()) {
           resp.set_success(false);
           resp.set_message(std::string(status.message()));
@@ -243,7 +242,7 @@ void KVCacheListener::ConnectionWorker(int client_fd) {
                      "registering expected buffers for uuid "
                   << start_req.uuid()
                   << ", expected blocks: " << start_req.expected_block_count();
-        absl::Status status = engine_->RegisterActivePlan(
+        absl::Status status = callbacks_.register_active_plan(
             start_req.uuid(), start_req, /*is_sender=*/false);
         if (!status.ok()) {
           resp.set_success(false);
@@ -259,7 +258,7 @@ void KVCacheListener::ConnectionWorker(int client_fd) {
     }
   } else if (req.command() == ControlRequest::COMMAND_SHUTDOWN) {
     LOG(INFO) << "C++ KVCacheListener received SHUTDOWN command. Initiating clean exit.";
-    absl::Status status = engine_->WaitForPendingWork();
+    absl::Status status = callbacks_.wait_for_pending_work();
     if (!status.ok()) {
       LOG(ERROR) << "WaitForPendingWork failed during shutdown: " << status;
     }

@@ -2555,7 +2555,44 @@ absl::Status KVCacheManagerBase::OnSingleBlockReceived(int block_id,
 void KVCacheManagerBase::RegisterBlockReadinessCallback(
     size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
     transport::BlockTransportDelegate::HostBlockReadyCallback cb) {
+  if (transfer_hooks_.register_block_readiness_callback) {
+    transfer_hooks_.register_block_readiness_callback(
+        layer_idx, shard_idx, block_id, uuid, std::move(cb));
+    return;
+  }
   cb(absl::OkStatus());
+}
+
+absl::Status KVCacheManagerBase::OnBlocksReceived(
+    const std::vector<int>& block_ids, uint64_t uuid) {
+  if (transfer_hooks_.on_blocks_received) {
+    return transfer_hooks_.on_blocks_received(block_ids, uuid);
+  }
+  return absl::OkStatus();
+}
+
+absl::Status KVCacheManagerBase::OnLayerReceived(size_t layer_idx,
+                                                 uint64_t uuid) {
+  if (transfer_hooks_.on_layer_received) {
+    return transfer_hooks_.on_layer_received(layer_idx, uuid);
+  }
+  return absl::OkStatus();
+}
+
+absl::Status KVCacheManagerBase::OnPoolReceived(size_t pool_idx,
+                                                uint64_t uuid) {
+  if (transfer_hooks_.on_pool_received) {
+    return transfer_hooks_.on_pool_received(pool_idx, uuid);
+  }
+  return absl::OkStatus();
+}
+
+void KVCacheManagerBase::ScheduleAsyncTask(std::function<void()> task) {
+  if (push_pool_) {
+    push_pool_->Schedule(std::move(task));
+    return;
+  }
+  std::thread(std::move(task)).detach();
 }
 
 absl::Status KVCacheManagerBase::PushKVCacheResharded(
@@ -2638,6 +2675,15 @@ absl::Status KVCacheManagerBase::PushKVCacheResharded(
 }
 
 absl::Status KVCacheManagerBase::RegisterActivePlan(
+    uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
+    bool is_sender) {
+  if (transfer_hooks_.register_active_plan) {
+    return transfer_hooks_.register_active_plan(uuid, request, is_sender);
+  }
+  return RegisterActivePlanDirect(uuid, request, is_sender);
+}
+
+absl::Status KVCacheManagerBase::RegisterActivePlanDirect(
     uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
     bool is_sender) {
   return RegisterActivePlan(uuid, request, is_sender, {});
@@ -2763,6 +2809,13 @@ absl::Status KVCacheManagerBase::RegisterActivePlan(
 }
 
 absl::Status KVCacheManagerBase::UnregisterActivePlan(uint64_t uuid) {
+  if (transfer_hooks_.unregister_active_plan) {
+    return transfer_hooks_.unregister_active_plan(uuid);
+  }
+  return UnregisterActivePlanDirect(uuid);
+}
+
+absl::Status KVCacheManagerBase::UnregisterActivePlanDirect(uint64_t uuid) {
   {
     absl::MutexLock l(plans_mu_);
     auto it = active_plans_.find(uuid);

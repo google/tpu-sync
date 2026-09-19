@@ -277,6 +277,27 @@ template <typename T>
 inline constexpr bool has_resolve_block_slices_v =
     has_resolve_block_slices<T>::value;
 
+template <typename T, typename = void>
+struct has_base : std::false_type {};
+template <typename T>
+struct has_base<T, std::void_t<decltype(std::declval<T&>().base())>>
+    : std::true_type {};
+template <typename T>
+inline constexpr bool has_base_v = has_base<T>::value;
+
+template <typename T>
+decltype(auto) BaseOrSelf(T& obj) {
+  if constexpr (has_base_v<std::remove_cv_t<T>>) {
+    return *obj.base();
+  } else {
+    return obj;
+  }
+}
+
+template <typename T>
+using BaseOrSelfT =
+    std::remove_reference_t<decltype(BaseOrSelf(std::declval<T&>()))>;
+
 }  // namespace internal
 
 // Type-erased wrapper for any KV Cache Manager or Transfer Manager
@@ -369,18 +390,19 @@ class KVManagerHolder {
   template <typename T>
   class Model final : public Concept {
    public:
+    using BaseT = internal::BaseOrSelfT<T>;
     explicit Model(T* impl) : impl_(impl) {}
     absl::StatusOr<raiden::PjRtCopyFuture> D2h(
         const std::vector<int64_t>& src_offsets,
         const std::vector<int64_t>& dst_offsets,
         const std::vector<int64_t>& copy_sizes) override {
-      return impl_->D2h(src_offsets, dst_offsets, copy_sizes);
+      return base().D2h(src_offsets, dst_offsets, copy_sizes);
     }
     absl::StatusOr<raiden::PjRtCopyFuture> H2d(
         const std::vector<int64_t>& src_offsets,
         const std::vector<int64_t>& dst_offsets,
         const std::vector<int64_t>& copy_sizes) override {
-      return impl_->H2d(src_offsets, dst_offsets, copy_sizes);
+      return base().H2d(src_offsets, dst_offsets, copy_sizes);
     }
     absl::StatusOr<raiden::PjRtCopyFuture> H2hRead(
         absl::string_view peer, const std::vector<int64_t>& src_offsets,
@@ -392,16 +414,16 @@ class KVManagerHolder {
       // own accounting, which neither matches the ids the caller reserved
       // and committed to its directory nor respects blocks the controller
       // already handed out.
-      if constexpr (internal::has_peer_h2h_read_explicit_v<T>) {
+      if constexpr (internal::has_peer_h2h_read_explicit_v<BaseT>) {
         if (!dst_offsets.empty()) {
           ABSL_ASSIGN_OR_RETURN(std::vector<int> dst_ids,
                                 SafeCastOffsets(dst_offsets));
-          return impl_->H2hReadExplicit(std::string(peer), src_ids, dst_ids,
+          return base().H2hReadExplicit(std::string(peer), src_ids, dst_ids,
                                         /*explicit_dst_ptrs=*/{});
         }
       }
       ABSL_ASSIGN_OR_RETURN(auto res,
-                            impl_->H2hRead(std::string(peer), src_ids));
+                            base().H2hRead(std::string(peer), src_ids));
       return res.second;
     }
     absl::StatusOr<raiden::PjRtCopyFuture> H2hWrite(
@@ -412,7 +434,7 @@ class KVManagerHolder {
       ABSL_ASSIGN_OR_RETURN(std::vector<int> dst_ids,
                             SafeCastOffsets(dst_offsets));
       ABSL_ASSIGN_OR_RETURN(
-          auto res, impl_->H2hWrite(std::string(peer), src_ids, dst_ids));
+          auto res, base().H2hWrite(std::string(peer), src_ids, dst_ids));
       return res.second;
     }
     absl::StatusOr<raiden::PjRtCopyFuture> H2hRead(
@@ -426,31 +448,31 @@ class KVManagerHolder {
       // but wrong for a store-level read: the store already reserved landing
       // blocks and commits those ids into its directory, so auto-allocated
       // blocks would leave the directory pointing at the wrong memory.
-      if constexpr (internal::has_vector_h2h_read_explicit_v<T>) {
+      if constexpr (internal::has_vector_h2h_read_explicit_v<BaseT>) {
         if (!dst_offsets.empty()) {
           ABSL_ASSIGN_OR_RETURN(std::vector<int> dst_ids,
                                 SafeCastOffsets(dst_offsets));
-          return impl_->H2hReadExplicit(remote_descriptors, src_ids, dst_ids);
+          return base().H2hReadExplicit(remote_descriptors, src_ids, dst_ids);
         }
-      } else if constexpr (internal::has_peer_h2h_read_explicit_v<T>) {
+      } else if constexpr (internal::has_peer_h2h_read_explicit_v<BaseT>) {
         // No descriptor-shaped explicit read; the peer-string one lands the
         // blocks just as precisely.
         if (!dst_offsets.empty() && !remote_descriptors.empty()) {
           ABSL_ASSIGN_OR_RETURN(std::vector<int> dst_ids,
                                 SafeCastOffsets(dst_offsets));
-          return impl_->H2hReadExplicit(remote_descriptors[0].endpoint,
-                                        src_ids, dst_ids,
+          return base().H2hReadExplicit(remote_descriptors[0].endpoint, src_ids,
+                                        dst_ids,
                                         /*explicit_dst_ptrs=*/{});
         }
       }
-      if constexpr (internal::has_vector_h2h_read_v<T>) {
+      if constexpr (internal::has_vector_h2h_read_v<BaseT>) {
         ABSL_ASSIGN_OR_RETURN(auto res,
-                              impl_->H2hRead(remote_descriptors, src_ids));
+                              base().H2hRead(remote_descriptors, src_ids));
         return res.second;
       } else {
         std::string peer =
             remote_descriptors.empty() ? "" : remote_descriptors[0].endpoint;
-        ABSL_ASSIGN_OR_RETURN(auto res, impl_->H2hRead(peer, src_ids));
+        ABSL_ASSIGN_OR_RETURN(auto res, base().H2hRead(peer, src_ids));
         return res.second;
       }
     }
@@ -462,15 +484,15 @@ class KVManagerHolder {
                             SafeCastOffsets(src_offsets));
       ABSL_ASSIGN_OR_RETURN(std::vector<int> dst_ids,
                             SafeCastOffsets(dst_offsets));
-      if constexpr (internal::has_vector_h2h_write_v<T>) {
+      if constexpr (internal::has_vector_h2h_write_v<BaseT>) {
         ABSL_ASSIGN_OR_RETURN(
-            auto res, impl_->H2hWrite(remote_descriptors, src_ids, dst_ids));
+            auto res, base().H2hWrite(remote_descriptors, src_ids, dst_ids));
         return res.second;
       } else {
         std::string peer =
             remote_descriptors.empty() ? "" : remote_descriptors[0].endpoint;
         ABSL_ASSIGN_OR_RETURN(auto res,
-                              impl_->H2hWrite(peer, src_ids, dst_ids));
+                              base().H2hWrite(peer, src_ids, dst_ids));
         return res.second;
       }
     }
@@ -481,6 +503,9 @@ class KVManagerHolder {
         const std::vector<int64_t>& copy_sizes) override {
       if constexpr (internal::has_h2d_write_v<T>) {
         return impl_->H2dWrite(peer, src_host_offsets, dst_host_offsets,
+                               dst_device_offsets, copy_sizes);
+      } else if constexpr (internal::has_h2d_write_v<BaseT>) {
+        return base().H2dWrite(peer, src_host_offsets, dst_host_offsets,
                                dst_device_offsets, copy_sizes);
       } else {
         return absl::UnimplementedError(
@@ -495,6 +520,9 @@ class KVManagerHolder {
       if constexpr (internal::has_h2d_read_v<T>) {
         return impl_->H2dRead(peer, src_host_offsets, dst_host_offsets,
                               dst_device_offsets, copy_sizes);
+      } else if constexpr (internal::has_h2d_read_v<BaseT>) {
+        return base().H2dRead(peer, src_host_offsets, dst_host_offsets,
+                              dst_device_offsets, copy_sizes);
       } else {
         return absl::UnimplementedError(
             "H2dRead is not implemented by the underlying transfer manager.");
@@ -508,6 +536,9 @@ class KVManagerHolder {
         const std::vector<int64_t>& copy_sizes) override {
       if constexpr (internal::has_vector_h2d_read_v<T>) {
         return impl_->H2dRead(remote_descriptors, src_host_offsets,
+                              dst_host_offsets, dst_device_offsets, copy_sizes);
+      } else if constexpr (internal::has_vector_h2d_read_v<BaseT>) {
+        return base().H2dRead(remote_descriptors, src_host_offsets,
                               dst_host_offsets, dst_device_offsets, copy_sizes);
       } else {
         // Fall back to the single-peer overload (which itself handles impls
@@ -526,6 +557,9 @@ class KVManagerHolder {
       if constexpr (internal::has_d2h_write_v<T>) {
         return impl_->D2hWrite(peer, src_device_offsets, src_host_offsets,
                                dst_host_offsets, copy_sizes);
+      } else if constexpr (internal::has_d2h_write_v<BaseT>) {
+        return base().D2hWrite(peer, src_device_offsets, src_host_offsets,
+                               dst_host_offsets, copy_sizes);
       } else {
         return absl::UnimplementedError(
             "D2hWrite is not implemented by the underlying transfer manager.");
@@ -537,6 +571,8 @@ class KVManagerHolder {
         const std::vector<int64_t>& copy_sizes) override {
       if constexpr (internal::has_d2h_read_v<T>) {
         return impl_->D2hRead(peer, src_offsets, dst_offsets, copy_sizes);
+      } else if constexpr (internal::has_d2h_read_v<BaseT>) {
+        return base().D2hRead(peer, src_offsets, dst_offsets, copy_sizes);
       } else {
         return absl::UnimplementedError(
             "D2hRead is not implemented by the underlying transfer manager.");
@@ -547,6 +583,8 @@ class KVManagerHolder {
         absl::Span<const int64_t> src_block_ids, int parallelism) override {
       if constexpr (internal::has_pool_reshard_push_v<T>) {
         return impl_->PoolReshardPush(request, src_block_ids, parallelism);
+      } else if constexpr (internal::has_pool_reshard_push_v<BaseT>) {
+        return base().PoolReshardPush(request, src_block_ids, parallelism);
       } else {
         return absl::UnimplementedError(
             "PoolReshardPush is not implemented by the underlying transfer "
@@ -558,6 +596,8 @@ class KVManagerHolder {
         absl::Span<const int64_t> chip_block_ids) override {
       if constexpr (internal::has_pool_reshard_register_recv_v<T>) {
         return impl_->PoolReshardRegisterRecv(request, chip_block_ids);
+      } else if constexpr (internal::has_pool_reshard_register_recv_v<BaseT>) {
+        return base().PoolReshardRegisterRecv(request, chip_block_ids);
       } else {
         return absl::UnimplementedError(
             "PoolReshardRegisterRecv is not implemented by the underlying "
@@ -572,6 +612,9 @@ class KVManagerHolder {
         const std::vector<int64_t>& dst_host_block_ids) override {
       if constexpr (internal::has_d2h_write_to_backend_v<T>) {
         return impl_->D2hWriteToBackend(
+            backends, block_keys, src_device_block_ids, dst_host_block_ids);
+      } else if constexpr (internal::has_d2h_write_to_backend_v<BaseT>) {
+        return base().D2hWriteToBackend(
             backends, block_keys, src_device_block_ids, dst_host_block_ids);
       } else {
         return absl::UnimplementedError(
@@ -588,6 +631,9 @@ class KVManagerHolder {
       if constexpr (internal::has_h2d_read_from_backend_v<T>) {
         return impl_->H2dReadFromBackend(
             backends, block_keys, src_host_block_ids, dst_device_block_ids);
+      } else if constexpr (internal::has_h2d_read_from_backend_v<BaseT>) {
+        return base().H2dReadFromBackend(
+            backends, block_keys, src_host_block_ids, dst_device_block_ids);
       } else {
         return absl::UnimplementedError(
             "H2dReadFromBackend is not implemented by the underlying transfer "
@@ -599,6 +645,8 @@ class KVManagerHolder {
         absl::string_view backend_name) const override {
       if constexpr (internal::has_get_kv_backend_v<T>) {
         return impl_->GetKVBackend(backend_name);
+      } else if constexpr (internal::has_get_kv_backend_v<BaseT>) {
+        return base().GetKVBackend(backend_name);
       } else {
         return nullptr;
       }
@@ -607,11 +655,15 @@ class KVManagerHolder {
         absl::Span<const kv_cache::BackendConfig> configs) override {
       if constexpr (internal::has_register_kv_backends_v<T>) {
         impl_->RegisterKVBackends(configs);
+      } else if constexpr (internal::has_register_kv_backends_v<BaseT>) {
+        base().RegisterKVBackends(configs);
       }
     }
     int64_t bytes_per_block() const override {
       if constexpr (internal::has_bytes_per_block_v<T>) {
         return impl_->bytes_per_block();
+      } else if constexpr (internal::has_bytes_per_block_v<BaseT>) {
+        return base().bytes_per_block();
       } else {
         return 0;
       }
@@ -620,12 +672,15 @@ class KVManagerHolder {
         int staging_block_id) const override {
       if constexpr (internal::has_resolve_block_slices_v<T>) {
         return impl_->ResolveBlockSlices(staging_block_id);
+      } else if constexpr (internal::has_resolve_block_slices_v<BaseT>) {
+        return base().ResolveBlockSlices(staging_block_id);
       } else {
         return {};
       }
     }
 
    private:
+    BaseT& base() const { return internal::BaseOrSelf(*impl_); }
     absl::StatusOr<std::vector<int>> SafeCastOffsets(
         const std::vector<int64_t>& offsets) {
       std::vector<int> ids;

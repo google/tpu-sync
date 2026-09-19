@@ -55,9 +55,66 @@ struct StartReadCall {
 
 class MockSubManager : public KVCacheManagerWithTransfer {
  public:
+  class MockBase : public kv_cache::KVCacheManagerBase {
+   public:
+    explicit MockBase(MockSubManager* parent)
+        : kv_cache::KVCacheManagerBase({}, std::nullopt, std::nullopt, false, 1,
+                                       nullptr),
+          parent_(parent) {}
+
+    absl::StatusOr<raiden::PjRtCopyFuture> D2h(
+        const std::vector<int64_t>& src_offsets_major_dim = {},
+        const std::vector<int64_t>& dst_offsets_major_dim = {},
+        const std::vector<int64_t>& copy_sizes_major_dim = {},
+        std::optional<int64_t> slot_idx = std::nullopt,
+        std::optional<size_t> layer_idx = std::nullopt,
+        std::optional<size_t> shard_idx = std::nullopt) override {
+      parent_->d2h_calls++;
+      parent_->last_d2h_src_offsets = src_offsets_major_dim;
+      parent_->last_d2h_dst_offsets = dst_offsets_major_dim;
+      parent_->last_d2h_copy_sizes = copy_sizes_major_dim;
+      return raiden::PjRtCopyFuture();
+    }
+
+    absl::StatusOr<raiden::PjRtCopyFuture> H2d(
+        const std::vector<int64_t>& src_offsets_major_dim = {},
+        const std::vector<int64_t>& dst_offsets_major_dim = {},
+        const std::vector<int64_t>& copy_sizes_major_dim = {},
+        std::optional<int64_t> slot_idx = std::nullopt,
+        std::optional<size_t> layer_idx = std::nullopt,
+        std::optional<size_t> shard_idx = std::nullopt) override {
+      parent_->h2d_calls++;
+      parent_->last_h2d_src_offsets = src_offsets_major_dim;
+      parent_->last_h2d_dst_offsets = dst_offsets_major_dim;
+      parent_->last_h2d_copy_sizes = copy_sizes_major_dim;
+      return raiden::PjRtCopyFuture();
+    }
+
+    absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
+    H2hWrite(std::string peer, const std::vector<int>& src_block_ids,
+             const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
+             int layer_idx = -1) override {
+      parent_->h2h_write_calls++;
+      parent_->last_h2h_write_peer = std::move(peer);
+      parent_->last_h2h_write_src_blocks = src_block_ids;
+      parent_->last_h2h_write_dst_blocks = dst_block_ids;
+      return std::make_pair(std::vector<int>(), raiden::PjRtCopyFuture());
+    }
+
+    absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hRead(
+        std::string peer, const std::vector<int>& src_block_ids) override {
+      parent_->h2h_read_calls++;
+      parent_->last_h2h_read_peer = std::move(peer);
+      parent_->last_h2h_read_src_blocks = src_block_ids;
+      return std::make_pair(std::vector<int>(), raiden::PjRtCopyFuture());
+    }
+
+   private:
+    MockSubManager* parent_;
+  };
+
   MockSubManager()
-      : KVCacheManagerWithTransfer({}, std::nullopt, std::nullopt, false, 1,
-                                   nullptr) {}
+      : KVCacheManagerWithTransfer(std::make_unique<MockBase>(this)) {}
 
   std::vector<std::string> sending, recving, failed;
   std::string started_ep;
@@ -97,34 +154,6 @@ class MockSubManager : public KVCacheManagerWithTransfer {
     return res;
   }
 
-  absl::StatusOr<raiden::PjRtCopyFuture> D2h(
-      const std::vector<int64_t>& src_offsets_major_dim = {},
-      const std::vector<int64_t>& dst_offsets_major_dim = {},
-      const std::vector<int64_t>& copy_sizes_major_dim = {},
-      std::optional<int64_t> slot_idx = std::nullopt,
-      std::optional<size_t> layer_idx = std::nullopt,
-      std::optional<size_t> shard_idx = std::nullopt) override {
-    d2h_calls++;
-    last_d2h_src_offsets = src_offsets_major_dim;
-    last_d2h_dst_offsets = dst_offsets_major_dim;
-    last_d2h_copy_sizes = copy_sizes_major_dim;
-    return raiden::PjRtCopyFuture();
-  }
-
-  absl::StatusOr<raiden::PjRtCopyFuture> H2d(
-      const std::vector<int64_t>& src_offsets_major_dim = {},
-      const std::vector<int64_t>& dst_offsets_major_dim = {},
-      const std::vector<int64_t>& copy_sizes_major_dim = {},
-      std::optional<int64_t> slot_idx = std::nullopt,
-      std::optional<size_t> layer_idx = std::nullopt,
-      std::optional<size_t> shard_idx = std::nullopt) override {
-    h2d_calls++;
-    last_h2d_src_offsets = src_offsets_major_dim;
-    last_h2d_dst_offsets = dst_offsets_major_dim;
-    last_h2d_copy_sizes = copy_sizes_major_dim;
-    return raiden::PjRtCopyFuture();
-  }
-
   // Records the single remote endpoint the wrapper's shard-matching selected for
   // this sub-manager (the wrapper narrows the full remote_descriptors list down
   // to one endpoint per sub-manager before calling the string overload).
@@ -135,25 +164,6 @@ class MockSubManager : public KVCacheManagerWithTransfer {
   std::vector<int> last_h2h_write_src_blocks;
   std::vector<int> last_h2h_write_dst_blocks;
   std::vector<int> last_h2h_read_src_blocks;
-
-  absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hWrite(
-      std::string peer, const std::vector<int>& src_block_ids,
-      const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
-      int layer_idx = -1) override {
-    h2h_write_calls++;
-    last_h2h_write_peer = std::move(peer);
-    last_h2h_write_src_blocks = src_block_ids;
-    last_h2h_write_dst_blocks = dst_block_ids;
-    return std::make_pair(std::vector<int>(), raiden::PjRtCopyFuture());
-  }
-
-  absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hRead(
-      std::string peer, const std::vector<int>& src_block_ids) override {
-    h2h_read_calls++;
-    last_h2h_read_peer = std::move(peer);
-    last_h2h_read_src_blocks = src_block_ids;
-    return std::make_pair(std::vector<int>(), raiden::PjRtCopyFuture());
-  }
 };
 
 TEST(KVCacheManagerWrapperTest,

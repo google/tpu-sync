@@ -128,8 +128,8 @@ TEST_F(KVCacheManagerFfiTest, TriggerRaidenH2dAndD2hDMAOrchestration) {
 
   // Populate Host block indices with test data to push
   // Host layer memory block 0 populated with sequence
-  uint8_t* h_base_layer0 =
-      const_cast<uint8_t*>(g_kv_cache_managers[0]->GetHostPointer(0, 0));
+  uint8_t* h_base_layer0 = const_cast<uint8_t*>(
+      g_kv_cache_managers[0]->base()->GetHostPointer(0, 0));
   for (size_t j = 0; j < 4096; ++j) {
     h_base_layer0[j] = static_cast<uint8_t>(j % 256);
   }

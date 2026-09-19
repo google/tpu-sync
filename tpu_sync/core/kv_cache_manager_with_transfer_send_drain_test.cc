@@ -55,14 +55,12 @@ constexpr double kTimeoutS = 0.05;
 class TestManager : public KVCacheManagerWithTransfer {
  public:
   explicit TestManager(size_t num_layers)
-      : KVCacheManagerWithTransfer(num_layers, /*num_shards=*/1,
-                                   /*slice_byte_size=*/128,
-                                   /*local_port=*/std::nullopt,
-                                   /*host_blocks_to_allocate=*/std::nullopt,
-                                   /*parallelism=*/1, /*node_id=*/0,
+      : KVCacheManagerWithTransfer(std::make_unique<TestBase>(num_layers, this),
+                                   /*node_id=*/0,
                                    /*local_control_port=*/-1, /*max_blocks=*/1,
                                    /*num_slots=*/kSlots, kTimeoutS) {
-    CHECK_OK(ConfigureHostStagingSlots(kSlots, /*max_major_per_slot=*/1));
+    CHECK_OK(
+        base_->ConfigureHostStagingSlots(kSlots, /*max_major_per_slot=*/1));
     CHECK_OK(InitializeSlotPool(kSlots));
   }
 
@@ -70,12 +68,13 @@ class TestManager : public KVCacheManagerWithTransfer {
   // consumer is acknowledged: the push runs on this thread and returns
   // with its copies issued.
   void ServePull(uint64_t uuid) {
+    std::shared_ptr<SendEntry> entry;
     {
       absl::MutexLock lock(mu_);
-      send_entries_.at(uuid)->pull_started = true;
+      entry = send_entries_.at(uuid);
     }
-    StartPushInternal(uuid, {"127.0.0.1:1"}, /*src_block_ids=*/{0},
-                      /*dst_block_ids=*/{0});
+    entry->StartPush(*this, {"127.0.0.1:1"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
   }
 
   size_t copies_issued() {
@@ -94,54 +93,57 @@ class TestManager : public KVCacheManagerWithTransfer {
     return free_slots_.size();
   }
 
-  void ExpireSend(uint64_t uuid) {
-    absl::MutexLock lock(mu_);
-    send_entries_.at(uuid)->deadline =
-        std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
-  }
-
   // White-box construction for the send retirement state machine. Tests that
   // need registration and dispatch use NotifyForRead and ServePull instead.
   std::shared_ptr<SendEntry> AddSyntheticSend(const std::string& req_id,
                                               uint64_t uuid, int in_flight) {
     absl::MutexLock lock(mu_);
-    auto entry = std::make_shared<SendEntry>();
-    entry->req_id = req_id;
-    entry->uuid = uuid;
-    entry->slot_idx = AcquireSlotLocked().slot_idx;
-    entry->in_flight = in_flight;
+    auto entry = std::make_shared<SendEntry>(
+        base_.get(), req_id, uuid, DeadlineFromNow(),
+        std::chrono::steady_clock::now(),
+        std::make_unique<Slot>(AcquireSlotLocked()), in_flight);
     send_entries_[uuid] = entry;
     return entry;
   }
 
   void Decide(const std::shared_ptr<SendEntry>& entry, bool failed) {
-    absl::MutexLock lock(mu_);
-    FinishSendLocked(entry, failed);
+    entry->FinishSend(failed);
   }
 
-  void End(const std::shared_ptr<SendEntry>& entry) {
-    absl::MutexLock lock(mu_);
-    EndSendOpLocked(entry);
-  }
+  void End(const std::shared_ptr<SendEntry>& entry) { entry->EndSendOp(); }
 
   bool has_send(uint64_t uuid) {
     absl::MutexLock lock(mu_);
     return send_entries_.contains(uuid);
   }
 
-  absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
-      const std::vector<int64_t>& src_offsets_major_dim,
-      const std::vector<int64_t>& dst_offsets_major_dim,
-      const std::vector<int64_t>& copy_sizes_major_dim,
-      std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
-      std::optional<size_t> shard_idx) override {
-    auto [promise, future] = xla::MakePromise<>();
-    absl::MutexLock lock(copies_mu_);
-    copies_.push_back(std::move(promise));
-    return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
-  }
-
  private:
+  class TestBase : public kv_cache::KVCacheManagerBase {
+   public:
+    TestBase(size_t num_layers, TestManager* owner)
+        : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
+                                       std::vector<size_t>(num_layers, 128),
+                                       /*local_port=*/std::nullopt,
+                                       /*host_blocks_to_allocate=*/kSlots,
+                                       /*parallelism=*/1, nullptr),
+          owner_(owner) {}
+
+    absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
+        const std::vector<int64_t>& src_offsets_major_dim,
+        const std::vector<int64_t>& dst_offsets_major_dim,
+        const std::vector<int64_t>& copy_sizes_major_dim,
+        std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
+        std::optional<size_t> shard_idx) override {
+      auto [promise, future] = xla::MakePromise<>();
+      absl::MutexLock lock(owner_->copies_mu_);
+      owner_->copies_.push_back(std::move(promise));
+      return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
+    }
+
+   private:
+    TestManager* owner_;
+  };
+
   absl::Mutex copies_mu_;
   std::vector<xla::Promise<>> copies_;
 };
@@ -150,14 +152,12 @@ class TestManager : public KVCacheManagerWithTransfer {
 class RecvTestManager : public KVCacheManagerWithTransfer {
  public:
   explicit RecvTestManager(size_t num_layers, double timeout_s = 5.0)
-      : KVCacheManagerWithTransfer(num_layers, /*num_shards=*/1,
-                                   /*slice_byte_size=*/128,
-                                   /*local_port=*/std::nullopt,
-                                   /*host_blocks_to_allocate=*/std::nullopt,
-                                   /*parallelism=*/1, /*node_id=*/0,
+      : KVCacheManagerWithTransfer(std::make_unique<RecvBase>(num_layers, this),
+                                   /*node_id=*/0,
                                    /*local_control_port=*/-1, /*max_blocks=*/1,
                                    /*num_slots=*/kSlots, timeout_s) {
-    CHECK_OK(ConfigureHostStagingSlots(kSlots, /*max_major_per_slot=*/1));
+    CHECK_OK(
+        base_->ConfigureHostStagingSlots(kSlots, /*max_major_per_slot=*/1));
     CHECK_OK(InitializeSlotPool(kSlots));
   }
 
@@ -166,15 +166,15 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     absl::MutexLock lock(mu_);
     RecvEntry entry;
     entry.req_id = req_id;
-    entry.slot_idx = AcquireSlotLocked().slot_idx;
+    entry.slot_idx = AcquireSlotLocked().Release();
     entry.total_blocks = blocks_per_layer;
     entry.deadline = DeadlineFromNow();
     entry.start_time = std::chrono::steady_clock::now();
-    active_recv_entries_[uuid] = std::move(entry);
+    active_recv_entries_.try_emplace(uuid, std::move(entry));
   }
 
   absl::Status ReceiveLayer(size_t layer, uint64_t uuid) {
-    return OnLayerReceived(layer, uuid);
+    return base()->OnLayerReceived(layer, uuid);
   }
 
   absl::Status ReceiveBlocks(const std::vector<int>& blocks, uint64_t uuid) {
@@ -217,23 +217,37 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     if (!release_dispatch_.HasBeenNotified()) release_dispatch_.Notify();
   }
 
-  absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
-      const std::vector<int64_t>& src_offsets_major_dim,
-      const std::vector<int64_t>& dst_offsets_major_dim,
-      const std::vector<int64_t>& copy_sizes_major_dim,
-      std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
-      std::optional<size_t> shard_idx) override {
-    if (block_dispatch_.load()) {
-      dispatch_entered_.Notify();
-      release_dispatch_.WaitForNotification();
-    }
-    auto [promise, future] = xla::MakePromise<>();
-    absl::MutexLock lock(copies_mu_);
-    copies_.push_back(std::move(promise));
-    return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
-  }
-
  private:
+  class RecvBase : public kv_cache::KVCacheManagerBase {
+   public:
+    RecvBase(size_t num_layers, RecvTestManager* owner)
+        : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
+                                       std::vector<size_t>(num_layers, 128),
+                                       /*local_port=*/std::nullopt,
+                                       /*host_blocks_to_allocate=*/kSlots,
+                                       /*parallelism=*/1, nullptr),
+          owner_(owner) {}
+
+    absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
+        const std::vector<int64_t>& src_offsets_major_dim,
+        const std::vector<int64_t>& dst_offsets_major_dim,
+        const std::vector<int64_t>& copy_sizes_major_dim,
+        std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
+        std::optional<size_t> shard_idx) override {
+      if (owner_->block_dispatch_.load()) {
+        owner_->dispatch_entered_.Notify();
+        owner_->release_dispatch_.WaitForNotification();
+      }
+      auto [promise, future] = xla::MakePromise<>();
+      absl::MutexLock lock(owner_->copies_mu_);
+      owner_->copies_.push_back(std::move(promise));
+      return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
+    }
+
+   private:
+    RecvTestManager* owner_;
+  };
+
   absl::Mutex copies_mu_;
   std::vector<xla::Promise<>> copies_;
   std::atomic<bool> block_dispatch_{false};
@@ -271,14 +285,16 @@ const std::vector<std::string>& FailedRecving(const Reports& r) {
 
 TEST(SendDrainTest, ExpiredSendKeepsItsStagingUntilTheCopyEnds) {
   TestManager producer(/*num_layers=*/1);
-  ASSERT_GT(producer.NotifyForRead("req", /*uuid=*/7, {0}), 0);
+  ASSERT_GT(producer.NotifyForRead("req", /*uuid=*/7, {0},
+                                   std::chrono::steady_clock::now() -
+                                       std::chrono::milliseconds(1)),
+            0);
   producer.ServePull(7);
   ASSERT_EQ(producer.copies_issued(), 1);
   EXPECT_EQ(producer.free_slots(), kSlots - 1);
 
   // The deadline passes while the copy runs: the send is not reported and
   // its slot stays out of the pool.
-  producer.ExpireSend(/*uuid=*/7);
   Reports during = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(during), IsEmpty());
   EXPECT_THAT(FailedRecving(during), IsEmpty());
@@ -315,8 +331,10 @@ TEST(SendDrainTest, FailedLayerWaitsForTheOtherLayersCopies) {
 
 TEST(SendDrainTest, SendNobodyPulledFailsAtItsDeadline) {
   TestManager producer(/*num_layers=*/1);
-  ASSERT_GT(producer.NotifyForRead("req", /*uuid=*/9, {0}), 0);
-  producer.ExpireSend(/*uuid=*/9);
+  ASSERT_GT(producer.NotifyForRead("req", /*uuid=*/9, {0},
+                                   std::chrono::steady_clock::now() -
+                                       std::chrono::milliseconds(1)),
+            0);
   Reports swept = producer.CompleteReadRaw();
   EXPECT_THAT(FailedRecving(swept), Contains("req"));
   EXPECT_EQ(producer.free_slots(), kSlots);
@@ -324,11 +342,13 @@ TEST(SendDrainTest, SendNobodyPulledFailsAtItsDeadline) {
 
 TEST(SendLifecycleTest, DuplicateRegistrationCannotReplaceLiveOffer) {
   TestManager producer(/*num_layers=*/1);
-  ASSERT_GT(producer.NotifyForRead("first", /*uuid=*/10, {0}), 0);
+  ASSERT_GT(producer.NotifyForRead("first", /*uuid=*/10, {0},
+                                   std::chrono::steady_clock::now() -
+                                       std::chrono::milliseconds(1)),
+            0);
   EXPECT_EQ(producer.NotifyForRead("replacement", /*uuid=*/10, {0}), 0);
   EXPECT_TRUE(producer.has_send(10));
 
-  producer.ExpireSend(/*uuid=*/10);
   Reports reports = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(reports), IsEmpty());
   EXPECT_THAT(DoneReceiving(reports), IsEmpty());

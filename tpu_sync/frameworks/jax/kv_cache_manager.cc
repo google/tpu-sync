@@ -391,10 +391,11 @@ void NumaAwareKVCacheManager::InitSubManagers(
         break;
       }
       if (local_port.has_value()) {
-        (void)sub_mgr->local_port();
+        (void)sub_mgr->base()->local_port();
       }
-      if (!bound_base_port.has_value() && sub_mgr->local_port().has_value()) {
-        bound_base_port = sub_mgr->local_port().value();
+      if (!bound_base_port.has_value() &&
+          sub_mgr->base()->local_port().has_value()) {
+        bound_base_port = sub_mgr->base()->local_port().value();
       }
 
       sub_managers_.push_back(std::move(sub_mgr));
@@ -404,26 +405,30 @@ void NumaAwareKVCacheManager::InitSubManagers(
 }
 
 size_t NumaAwareKVCacheManager::num_layers() const {
-  return sub_managers_.empty() ? 0 : sub_managers_[0]->num_layers();
+  return sub_managers_.empty() ? 0 : sub_managers_[0]->base()->num_layers();
 }
 
 size_t NumaAwareKVCacheManager::num_shards() const { return total_num_shards_; }
 
 size_t NumaAwareKVCacheManager::slice_byte_size() const {
-  return sub_managers_.empty() ? 0 : sub_managers_[0]->slice_byte_size();
+  return sub_managers_.empty() ? 0
+                               : sub_managers_[0]->base()->slice_byte_size();
 }
 
 size_t NumaAwareKVCacheManager::num_block_arrays() const {
-  return sub_managers_.empty() ? 0 : sub_managers_[0]->num_block_arrays();
+  return sub_managers_.empty() ? 0
+                               : sub_managers_[0]->base()->num_block_arrays();
 }
 
 size_t NumaAwareKVCacheManager::block_bytes(size_t block_array_idx) const {
-  return sub_managers_.empty() ? 0
-                               : sub_managers_[0]->block_bytes(block_array_idx);
+  return sub_managers_.empty()
+             ? 0
+             : sub_managers_[0]->base()->block_bytes(block_array_idx);
 }
 
 std::optional<int> NumaAwareKVCacheManager::local_port() const {
-  return sub_managers_.empty() ? std::nullopt : sub_managers_[0]->local_port();
+  return sub_managers_.empty() ? std::nullopt
+                               : sub_managers_[0]->base()->local_port();
 }
 
 int NumaAwareKVCacheManager::local_control_port() const {
@@ -438,21 +443,21 @@ uint8_t* NumaAwareKVCacheManager::GetHostPointer(size_t layer_idx,
                                                  size_t shard_idx) {
   if (shard_idx >= global_shard_to_submanager_.size()) return nullptr;
   auto [sub_idx, local_shard] = global_shard_to_submanager_[shard_idx];
-  return sub_managers_[sub_idx]->GetHostPointer(layer_idx, local_shard);
+  return sub_managers_[sub_idx]->base()->GetHostPointer(layer_idx, local_shard);
 }
 
 const uint8_t* NumaAwareKVCacheManager::GetHostPointer(size_t layer_idx,
                                                        size_t shard_idx) const {
   if (shard_idx >= global_shard_to_submanager_.size()) return nullptr;
   auto [sub_idx, local_shard] = global_shard_to_submanager_[shard_idx];
-  return sub_managers_[sub_idx]->GetHostPointer(layer_idx, local_shard);
+  return sub_managers_[sub_idx]->base()->GetHostPointer(layer_idx, local_shard);
 }
 
 size_t NumaAwareKVCacheManager::GetHostSize(size_t layer_idx,
                                             size_t shard_idx) {
   if (shard_idx >= global_shard_to_submanager_.size()) return 0;
   auto [sub_idx, local_shard] = global_shard_to_submanager_[shard_idx];
-  return sub_managers_[sub_idx]->GetHostSize(layer_idx, local_shard);
+  return sub_managers_[sub_idx]->base()->GetHostSize(layer_idx, local_shard);
 }
 
 int64_t NumaAwareKVCacheManager::NotifyForRead(
@@ -618,8 +623,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::H2d(
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   sub_copy_futures.reserve(sub_managers_.size());
   for (auto& sub : sub_managers_) {
-    ABSL_ASSIGN_OR_RETURN(auto f, sub->H2d(src_offsets, dst_offsets, copy_sizes,
-                                           slot_idx, layer_idx, shard_idx));
+    ABSL_ASSIGN_OR_RETURN(
+        auto f, sub->base()->H2d(src_offsets, dst_offsets, copy_sizes, slot_idx,
+                                 layer_idx, shard_idx));
     sub_copy_futures.push_back(std::move(f));
   }
   // Use the event-aware join. On TPU the per-shard copies complete via the
@@ -641,8 +647,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::D2h(
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   sub_copy_futures.reserve(sub_managers_.size());
   for (auto& sub : sub_managers_) {
-    ABSL_ASSIGN_OR_RETURN(auto f, sub->D2h(src_offsets, dst_offsets, copy_sizes,
-                                           slot_idx, layer_idx, shard_idx));
+    ABSL_ASSIGN_OR_RETURN(
+        auto f, sub->base()->D2h(src_offsets, dst_offsets, copy_sizes, slot_idx,
+                                 layer_idx, shard_idx));
     sub_copy_futures.push_back(std::move(f));
   }
   // Use the event-aware join (see H2d above): on TPU the per-shard copies
@@ -662,8 +669,8 @@ NumaAwareKVCacheManager::D2hAutoAllocate(
   std::vector<int> all_ids;
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
-    ABSL_ASSIGN_OR_RETURN(
-        auto res, sub_managers_[s]->D2hAutoAllocate(src_offsets, copy_sizes));
+    ABSL_ASSIGN_OR_RETURN(auto res, sub_managers_[s]->base()->D2hAutoAllocate(
+                                        src_offsets, copy_sizes));
     if (s == 0) {
       all_ids = res.first;
     }
@@ -703,8 +710,8 @@ NumaAwareKVCacheManager::H2hWrite(std::string peer,
     std::string sub_peer =
         (base_port >= 0) ? host_prefix + std::to_string(base_port + s) : peer;
     ABSL_ASSIGN_OR_RETURN(
-        auto res, sub_managers_[s]->H2hWrite(sub_peer, src_block_ids,
-                                             dst_block_ids, uuid, layer_idx));
+        auto res, sub_managers_[s]->base()->H2hWrite(
+                      sub_peer, src_block_ids, dst_block_ids, uuid, layer_idx));
     if (s == 0) {
       all_ids = res.first;
     }
@@ -741,8 +748,8 @@ NumaAwareKVCacheManager::H2hRead(std::string peer,
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
     std::string sub_peer =
         (base_port >= 0) ? host_prefix + std::to_string(base_port + s) : peer;
-    ABSL_ASSIGN_OR_RETURN(auto res,
-                          sub_managers_[s]->H2hRead(sub_peer, src_block_ids));
+    ABSL_ASSIGN_OR_RETURN(
+        auto res, sub_managers_[s]->base()->H2hRead(sub_peer, src_block_ids));
     if (s == 0) {
       all_ids = res.first;
     }
@@ -784,9 +791,9 @@ NumaAwareKVCacheManager::H2hWrite(
       matched_ep = remote_descriptors[0].endpoint;
     }
 
-    ABSL_ASSIGN_OR_RETURN(
-        auto res, sub_managers_[s]->H2hWrite(matched_ep, src_block_ids,
-                                             dst_block_ids, uuid, layer_idx));
+    ABSL_ASSIGN_OR_RETURN(auto res, sub_managers_[s]->base()->H2hWrite(
+                                        matched_ep, src_block_ids,
+                                        dst_block_ids, uuid, layer_idx));
     if (s == 0) {
       all_ids = res.first;
     }
@@ -827,8 +834,8 @@ NumaAwareKVCacheManager::H2hRead(
       matched_ep = remote_descriptors[0].endpoint;
     }
 
-    ABSL_ASSIGN_OR_RETURN(auto res,
-                          sub_managers_[s]->H2hRead(matched_ep, src_block_ids));
+    ABSL_ASSIGN_OR_RETURN(
+        auto res, sub_managers_[s]->base()->H2hRead(matched_ep, src_block_ids));
     if (s == 0) {
       all_ids = res.first;
     }
@@ -871,10 +878,10 @@ NumaAwareKVCacheManager::H2hReadExplicit(
       matched_ep = remote_descriptors[0].endpoint;
     }
 
-    ABSL_ASSIGN_OR_RETURN(
-        auto fut, sub_managers_[s]->H2hReadExplicit(matched_ep, src_block_ids,
-                                                    dst_block_ids,
-                                                    /*explicit_dst_ptrs=*/{}));
+    ABSL_ASSIGN_OR_RETURN(auto fut,
+                          sub_managers_[s]->base()->H2hReadExplicit(
+                              matched_ep, src_block_ids, dst_block_ids,
+                              /*explicit_dst_ptrs=*/{}));
     sub_copy_futures.push_back(std::move(fut));
   }
   return raiden::JoinPjRtCopyFutures(absl::MakeSpan(sub_copy_futures));
@@ -913,10 +920,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::H2dRead(
       matched_ep = remote_descriptors[0].endpoint;
     }
 
-    ABSL_ASSIGN_OR_RETURN(
-        auto fut, sub_managers_[s]->H2dRead(matched_ep, src_host_offsets,
-                                            dst_host_offsets,
-                                            dst_device_offsets, copy_sizes));
+    ABSL_ASSIGN_OR_RETURN(auto fut,
+                          sub_managers_[s]->base()->H2dRead(
+                              matched_ep, src_host_offsets, dst_host_offsets,
+                              dst_device_offsets, copy_sizes));
     sub_copy_futures.push_back(std::move(fut));
   }
   // Event-aware join (see D2h/H2d): on TPU the per-shard transfers complete via
@@ -928,8 +935,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::H2dRead(
 absl::Status NumaAwareKVCacheManager::UnlockBlocks(
     const std::vector<int>& block_ids) {
   for (auto& sub : sub_managers_) {
-    if (sub->host_block_manager() != nullptr) {
-      auto status = sub->host_block_manager()->Unlock(block_ids);
+    if (sub->base()->host_block_manager() != nullptr) {
+      auto status = sub->base()->host_block_manager()->Unlock(block_ids);
       if (!status.ok()) return status;
     }
   }

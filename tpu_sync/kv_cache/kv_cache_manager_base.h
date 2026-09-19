@@ -157,9 +157,49 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   ~KVCacheManagerBase() override;
 
+  // Hooks allowing a composing transfer manager (e.g.
+  // KVCacheManagerWithTransfer) to intercept transport delegate callbacks and
+  // pool-reshard / plan lifecycle events without inheriting from
+  // KVCacheManagerBase.
+  struct TransferEventHooks {
+    std::function<void(
+        size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
+        transport::BlockTransportDelegate::HostBlockReadyCallback cb)>
+        register_block_readiness_callback;
+    std::function<absl::Status(const std::vector<int>& block_ids,
+                               uint64_t uuid)>
+        on_blocks_received;
+    std::function<absl::Status(size_t layer_idx, uint64_t uuid)>
+        on_layer_received;
+    std::function<absl::Status(size_t pool_idx, uint64_t uuid)>
+        on_pool_received;
+    std::function<absl::Status(const ::tpu_sync::rpc::StartTransferRequest&,
+                               absl::Span<const int64_t>, int)>
+        pool_reshard_push;
+    std::function<absl::Status(const ::tpu_sync::rpc::StartTransferRequest&,
+                               absl::Span<const int64_t>)>
+        pool_reshard_register_recv;
+    std::function<absl::Status()> wait_for_pending_work;
+    std::function<absl::Status(uint64_t uuid,
+                               const ::tpu_sync::rpc::StartTransferRequest&,
+                               bool is_sender)>
+        register_active_plan;
+    std::function<absl::Status(uint64_t uuid)> unregister_active_plan;
+    std::function<int64_t()> get_node_id;
+  };
+
+  void SetTransferEventHooks(TransferEventHooks hooks) {
+    transfer_hooks_ = std::move(hooks);
+  }
+
   void RegisterBlockReadinessCallback(
       size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
       transport::BlockTransportDelegate::HostBlockReadyCallback cb) override;
+  absl::Status OnBlocksReceived(const std::vector<int>& block_ids,
+                                uint64_t uuid = 0) override;
+  absl::Status OnLayerReceived(size_t layer_idx, uint64_t uuid = 0) override;
+  absl::Status OnPoolReceived(size_t pool_idx, uint64_t uuid = 0) override;
+  void ScheduleAsyncTask(std::function<void()> task) override;
 
   // Async on-chip H2D offloads returning PJRT copy future E2E.
   // When RAIDEN_ENABLE_ASYNC_DISPATCH is enabled, work is enqueued to the
@@ -260,20 +300,34 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // plans; managers without transfer support fail closed instead of falling
   // back to the legacy whole-layer reshard path.
   virtual absl::Status PoolReshardPush(
-      const ::tpu_sync::rpc::StartTransferRequest&, absl::Span<const int64_t>,
-      int = 8) {
+      const ::tpu_sync::rpc::StartTransferRequest& request,
+      absl::Span<const int64_t> src_block_ids, int parallelism = 8) {
+    if (transfer_hooks_.pool_reshard_push) {
+      return transfer_hooks_.pool_reshard_push(request, src_block_ids,
+                                               parallelism);
+    }
     return absl::UnimplementedError(
         "pool reshard push is not supported by this manager");
   }
 
   virtual absl::Status PoolReshardRegisterRecv(
-      const ::tpu_sync::rpc::StartTransferRequest&, absl::Span<const int64_t>) {
+      const ::tpu_sync::rpc::StartTransferRequest& request,
+      absl::Span<const int64_t> chip_block_ids) {
+    if (transfer_hooks_.pool_reshard_register_recv) {
+      return transfer_hooks_.pool_reshard_register_recv(request,
+                                                        chip_block_ids);
+    }
     return absl::UnimplementedError(
         "pool reshard receive is not supported by this manager");
   }
 
   // Blocks until all pending asynchronous transfers/copies are complete.
-  virtual absl::Status WaitForPendingWork() { return absl::OkStatus(); }
+  virtual absl::Status WaitForPendingWork() {
+    if (transfer_hooks_.wait_for_pending_work) {
+      return transfer_hooks_.wait_for_pending_work();
+    }
+    return absl::OkStatus();
+  }
 
   virtual std::string worker_id() const {
     if (!worker_id_.empty()) return worker_id_;
@@ -282,7 +336,12 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   virtual void set_worker_id(std::string worker_id) {
     worker_id_ = std::move(worker_id);
   }
-  virtual int64_t node_id() const { return -1; }
+  virtual int64_t node_id() const {
+    if (transfer_hooks_.get_node_id) {
+      return transfer_hooks_.get_node_id();
+    }
+    return -1;
+  }
 
   // Returns the backend plugin registered for the specified backend name, or
   // nullptr if none.
@@ -485,6 +544,9 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   virtual absl::Status RegisterActivePlan(
       uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
       bool is_sender);
+  absl::Status RegisterActivePlanDirect(
+      uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
+      bool is_sender);
   // Same, with the plan's device blocks staged in explicitly chosen host
   // blocks instead of at their own ids: `host_block_of` maps each device
   // block id the plan names on this side to the host block staging it.
@@ -497,6 +559,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       uint64_t generation = 0);
 
   virtual absl::Status UnregisterActivePlan(uint64_t uuid);
+  absl::Status UnregisterActivePlanDirect(uint64_t uuid);
 
   // Whether a transfer plan is currently registered under `uuid`.
   bool HasActivePlan(uint64_t uuid) const {
@@ -547,6 +610,43 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   // Returns the total number of bytes allocated in host DRAM.
   size_t GetAllocatedHostDramBytes() const;
+
+  // Synchronous on-chip H2D offload (bypasses background worker thread queue).
+  virtual absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
+      const std::vector<int64_t>& src_offsets_major_dim = {},
+      const std::vector<int64_t>& dst_offsets_major_dim = {},
+      const std::vector<int64_t>& copy_sizes_major_dim = {},
+      std::optional<int64_t> slot_idx = std::nullopt,
+      std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> shard_idx = std::nullopt);
+
+  // Synchronous on-chip D2H offload (bypasses background worker thread queue).
+  virtual absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
+      const std::vector<int64_t>& src_offsets_major_dim = {},
+      const std::vector<int64_t>& dst_offsets_major_dim = {},
+      const std::vector<int64_t>& copy_sizes_major_dim = {},
+      std::optional<int64_t> slot_idx = std::nullopt,
+      std::optional<size_t> layer_idx = std::nullopt,
+      std::optional<size_t> shard_idx = std::nullopt);
+
+  bool has_device_buffers() const { return !buffer_holds_.empty(); }
+  void AttachPlaceholderDeviceHoldForTest() { buffer_holds_.emplace_back(); }
+  int parallelism() const { return parallelism_; }
+  const std::shared_ptr<NumaThreadPool>& push_pool() const {
+    return push_pool_;
+  }
+  NumaThreadPool* pull_pool() const { return pull_pool_.get(); }
+  void ShutdownTransferPools() {
+    push_pool_.reset();
+    pull_pool_.reset();
+  }
+  tpu_raiden::transport::BlockTransport* InitTransportServer() {
+    return RaidenManagerBase::InitTransportServer();
+  }
+  tpu_raiden::transport::BlockTransport* transport_server() const {
+    absl::MutexLock lock(server_init_mu_);
+    return server_.get();
+  }
 
  protected:
   const PJRT_Api* c_api_ = nullptr;
@@ -606,6 +706,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   std::shared_ptr<NumaThreadPool> push_pool_;
   std::unique_ptr<NumaThreadPool> pull_pool_;
   std::string worker_id_;
+  TransferEventHooks transfer_hooks_;
 
   struct CopyWork {
     size_t layer_idx;
@@ -639,24 +740,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt, int64_t device_id = -1);
-
-  // Synchronous on-chip H2D offload (bypasses background worker thread queue).
-  virtual absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
-      const std::vector<int64_t>& src_offsets_major_dim = {},
-      const std::vector<int64_t>& dst_offsets_major_dim = {},
-      const std::vector<int64_t>& copy_sizes_major_dim = {},
-      std::optional<int64_t> slot_idx = std::nullopt,
-      std::optional<size_t> layer_idx = std::nullopt,
-      std::optional<size_t> shard_idx = std::nullopt);
-
-  // Synchronous on-chip D2H offload (bypasses background worker thread queue).
-  virtual absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
-      const std::vector<int64_t>& src_offsets_major_dim = {},
-      const std::vector<int64_t>& dst_offsets_major_dim = {},
-      const std::vector<int64_t>& copy_sizes_major_dim = {},
-      std::optional<int64_t> slot_idx = std::nullopt,
-      std::optional<size_t> layer_idx = std::nullopt,
-      std::optional<size_t> shard_idx = std::nullopt);
 
   // Updates the allocated buffer occupancy metrics.
   void UpdateAllocatedOccupancyMetric() const;

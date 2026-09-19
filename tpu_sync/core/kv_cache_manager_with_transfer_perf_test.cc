@@ -189,7 +189,7 @@ void RunSlotBenchmark(TpuPjrtManager* manager,
       /*num_slots=*/1);
 
   // Configure staging slots manually (since local_control_port is -1)
-  ASSERT_OK(engine->ConfigureHostStagingSlots(
+  ASSERT_OK(engine->base()->ConfigureHostStagingSlots(
       /*num_slots=*/1, /*max_major_per_slot=*/kNumBlocks));
 
   // Build copy spec (compact to compact, as we copy all blocks)
@@ -209,15 +209,15 @@ void RunSlotBenchmark(TpuPjrtManager* manager,
   constexpr int kWarmupIterations = 3;
   for (int iter = 0; iter < kWarmupIterations; ++iter) {
     // D2H
-    auto d2h_futures_or =
-        engine->D2h(transfer_spec.src_offsets, transfer_spec.dst_offsets,
-                    transfer_spec.sizes, slot_idx);
+    auto d2h_futures_or = engine->base()->D2h(transfer_spec.src_offsets,
+                                              transfer_spec.dst_offsets,
+                                              transfer_spec.sizes, slot_idx);
     ASSERT_OK(AwaitAll(d2h_futures_or));
 
     // H2D
-    auto h2d_futures_or =
-        engine->H2d(transfer_spec.src_offsets, transfer_spec.dst_offsets,
-                    transfer_spec.sizes, slot_idx);
+    auto h2d_futures_or = engine->base()->H2d(transfer_spec.src_offsets,
+                                              transfer_spec.dst_offsets,
+                                              transfer_spec.sizes, slot_idx);
     ASSERT_OK(AwaitAll(h2d_futures_or));
   }
 
@@ -228,9 +228,9 @@ void RunSlotBenchmark(TpuPjrtManager* manager,
 
   for (int iter = 0; iter < kBenchmarkIterations; ++iter) {
     absl::Time start = absl::Now();
-    auto d2h_futures_or =
-        engine->D2h(transfer_spec.src_offsets, transfer_spec.dst_offsets,
-                    transfer_spec.sizes, slot_idx);
+    auto d2h_futures_or = engine->base()->D2h(transfer_spec.src_offsets,
+                                              transfer_spec.dst_offsets,
+                                              transfer_spec.sizes, slot_idx);
     ASSERT_OK(AwaitAll(d2h_futures_or));
     absl::Duration duration = absl::Now() - start;
     double seconds = absl::ToDoubleSeconds(duration);
@@ -248,9 +248,9 @@ void RunSlotBenchmark(TpuPjrtManager* manager,
 
   for (int iter = 0; iter < kBenchmarkIterations; ++iter) {
     absl::Time start = absl::Now();
-    auto h2d_futures_or =
-        engine->H2d(transfer_spec.src_offsets, transfer_spec.dst_offsets,
-                    transfer_spec.sizes, slot_idx);
+    auto h2d_futures_or = engine->base()->H2d(transfer_spec.src_offsets,
+                                              transfer_spec.dst_offsets,
+                                              transfer_spec.sizes, slot_idx);
     ASSERT_OK(AwaitAll(h2d_futures_or));
     absl::Duration duration = absl::Now() - start;
     double seconds = absl::ToDoubleSeconds(duration);
@@ -267,38 +267,40 @@ void RunSlotBenchmark(TpuPjrtManager* manager,
 
   // Step 1: Copy Device -> Host Slot
   auto d2h_futures_or =
-      engine->D2h(transfer_spec.src_offsets, transfer_spec.dst_offsets,
-                  transfer_spec.sizes, slot_idx);
+      engine->base()->D2h(transfer_spec.src_offsets, transfer_spec.dst_offsets,
+                          transfer_spec.sizes, slot_idx);
   ASSERT_OK(AwaitAll(d2h_futures_or));
 
   // Step 2: Clear Device Buffers (fill with zeros in-place via staging)
   // 2a. Overwrite the host staging slot with zeros
   for (int l = 0; l < kNumLayers; ++l) {
     for (size_t d = 0; d < devices.size(); ++d) {
-      TF_ASSERT_OK_AND_ASSIGN(kv_cache::KVCacheHostSpan span,
-                              engine->HostSpan(l, d, slot_idx, kNumBlocks));
+      TF_ASSERT_OK_AND_ASSIGN(
+          kv_cache::KVCacheHostSpan span,
+          engine->base()->HostSpan(l, d, slot_idx, kNumBlocks));
       std::memset(span.ptr, 0, span.nbytes);
     }
   }
   // 2b. Copy these zeros to the device
   auto clear_futures_or =
-      engine->H2d(transfer_spec.src_offsets, transfer_spec.dst_offsets,
-                  transfer_spec.sizes, slot_idx);
+      engine->base()->H2d(transfer_spec.src_offsets, transfer_spec.dst_offsets,
+                          transfer_spec.sizes, slot_idx);
   ASSERT_OK(AwaitAll(clear_futures_or));
 
   // Step 3: Restore original pattern to host slot and copy to device
   // 3a. Copy original pattern back to host staging slot
   for (int l = 0; l < kNumLayers; ++l) {
     for (size_t d = 0; d < devices.size(); ++d) {
-      TF_ASSERT_OK_AND_ASSIGN(kv_cache::KVCacheHostSpan span,
-                              engine->HostSpan(l, d, slot_idx, kNumBlocks));
+      TF_ASSERT_OK_AND_ASSIGN(
+          kv_cache::KVCacheHostSpan span,
+          engine->base()->HostSpan(l, d, slot_idx, kNumBlocks));
       std::memcpy(span.ptr, host_init_buffers[l][d].data(), span.nbytes);
     }
   }
   // 3b. Copy original pattern from host slot -> device
   auto h2d_futures_or =
-      engine->H2d(transfer_spec.src_offsets, transfer_spec.dst_offsets,
-                  transfer_spec.sizes, slot_idx);
+      engine->base()->H2d(transfer_spec.src_offsets, transfer_spec.dst_offsets,
+                          transfer_spec.sizes, slot_idx);
   ASSERT_OK(AwaitAll(h2d_futures_or));
 
   // Step 4: Verify Device Content matches original pattern

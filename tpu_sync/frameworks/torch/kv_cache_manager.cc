@@ -210,15 +210,15 @@ bool TorchKVCacheManager::is_listener_active() const {
 }
 
 std::string TorchKVCacheManager::transfer_address() const {
-  auto port = local_port();
+  auto port = base_->local_port();
   if (!port.has_value()) return "";
-  return FormatAddressWithPort(local_ip(), *port);
+  return FormatAddressWithPort(base_->local_ip(), *port);
 }
 
 std::string TorchKVCacheManager::listener_address() const {
   auto port = listener_port();
   if (!port.has_value()) return "";
-  return FormatAddressWithPort(local_ip(), *port);
+  return FormatAddressWithPort(base_->local_ip(), *port);
 }
 
 absl::Status TorchKVCacheManager::PushRegisteredPlan(
@@ -235,15 +235,7 @@ absl::Status TorchKVCacheManager::PushRegisteredPlan(
     return absl::InvalidArgumentError(
         "src_block_ids and dst_block_ids must have the same length");
   }
-  InitTransportServer();
-  // Copy the transport pointer and release server_init_mu_ before the blocking
-  // Push: holding the lock across it serializes concurrent pushes from the
-  // same manager (one per destination peer).
-  transport::BlockTransport* transport = nullptr;
-  {
-    absl::MutexLock lock(server_init_mu_);
-    transport = server_.get();
-  }
+  transport::BlockTransport* transport = base_->InitTransportServer();
   if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
   }
@@ -261,9 +253,9 @@ absl::StatusOr<std::string> TorchKVCacheManager::ReadBlockBytes(
   if (block_id < 0) {
     return absl::InvalidArgumentError("block_id must be non-negative");
   }
-  const size_t block_bytes = this->block_bytes(layer_idx);
-  const size_t host_size = GetHostSize(layer_idx, shard_idx);
-  const uint8_t* base = GetHostPointer(layer_idx, shard_idx);
+  const size_t block_bytes = this->base_->block_bytes(layer_idx);
+  const size_t host_size = base_->GetHostSize(layer_idx, shard_idx);
+  const uint8_t* base = base_->GetHostPointer(layer_idx, shard_idx);
   if (base == nullptr) {
     return absl::OutOfRangeError("layer or shard index out of range");
   }
@@ -283,14 +275,14 @@ absl::Status TorchKVCacheManager::WriteBlockBytes(size_t layer_idx,
   if (block_id < 0) {
     return absl::InvalidArgumentError("block_id must be non-negative");
   }
-  const size_t block_bytes = this->block_bytes(layer_idx);
+  const size_t block_bytes = this->base_->block_bytes(layer_idx);
   if (payload.size() != block_bytes) {
     return absl::InvalidArgumentError(
         absl::StrCat("payload size must equal block size: got ", payload.size(),
                      ", expected ", block_bytes));
   }
-  const size_t host_size = GetHostSize(layer_idx, shard_idx);
-  uint8_t* base = GetHostPointer(layer_idx, shard_idx);
+  const size_t host_size = base_->GetHostSize(layer_idx, shard_idx);
+  uint8_t* base = base_->GetHostPointer(layer_idx, shard_idx);
   if (base == nullptr) {
     return absl::OutOfRangeError("layer or shard index out of range");
   }
@@ -383,11 +375,11 @@ void KVCacheManager::StartGrpcServer(
   if (use_private_server) {
     private_grpc_server_ = controller::WorkerServiceServer::Create();
     status = private_grpc_server_->StartServer(
-        /*host_allocator=*/nullptr, KVManagerHolder(torch_manager_.get()),
+        /*host_allocator=*/nullptr, KVManagerHolder(torch_manager_->base()),
         raiden_worker_port);
   } else {
     status = controller::WorkerServiceServer::GetInstance().StartServer(
-        /*host_allocator=*/nullptr, KVManagerHolder(torch_manager_.get()),
+        /*host_allocator=*/nullptr, KVManagerHolder(torch_manager_->base()),
         raiden_worker_port);
   }
 
@@ -425,15 +417,16 @@ void KVCacheManager::StartGrpcServer(
     }
 
     std::vector<uint64_t> block_array_bytes;
-    block_array_bytes.reserve(torch_manager_->num_block_arrays());
-    for (size_t i = 0; i < torch_manager_->num_block_arrays(); ++i) {
-      block_array_bytes.push_back(torch_manager_->block_bytes(i));
+    block_array_bytes.reserve(torch_manager_->base()->num_block_arrays());
+    for (size_t i = 0; i < torch_manager_->base()->num_block_arrays(); ++i) {
+      block_array_bytes.push_back(torch_manager_->base()->block_bytes(i));
     }
 
     core::controller::RaidenControllerClient client(*raiden_controller_address);
     status = client.RegisterWorker(
         w_id, worker_endpoint, local_eps, torch_manager_->node_id(),
-        block_array_bytes, static_cast<int32_t>(torch_manager_->num_shards()));
+        block_array_bytes,
+        static_cast<int32_t>(torch_manager_->base()->num_shards()));
     if (!status.ok()) {
       LOG(ERROR) << "Failed to register worker with controller: "
                  << status.message();

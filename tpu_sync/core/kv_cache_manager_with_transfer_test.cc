@@ -44,9 +44,9 @@ using ::absl_testing::IsOk;
 using ::testing::Gt;
 using ::testing::IsEmpty;
 
-class TestKVCacheManagerWithTransfer : public KVCacheManagerWithTransfer {
+class TestBase : public kv_cache::KVCacheManagerBase {
  public:
-  using KVCacheManagerWithTransfer::KVCacheManagerWithTransfer;
+  using kv_cache::KVCacheManagerBase::KVCacheManagerBase;
 
   void SetMockLocalIps(const std::vector<std::string>& ips) {
     mock_local_ips_ = ips;
@@ -56,11 +56,33 @@ class TestKVCacheManagerWithTransfer : public KVCacheManagerWithTransfer {
     if (mock_local_ips_.has_value()) {
       return *mock_local_ips_;
     }
-    return KVCacheManagerWithTransfer::local_ips();
+    return kv_cache::KVCacheManagerBase::local_ips();
   }
 
  private:
   std::optional<std::vector<std::string>> mock_local_ips_;
+};
+
+class TestKVCacheManagerWithTransfer : public KVCacheManagerWithTransfer {
+ public:
+  TestKVCacheManagerWithTransfer(
+      std::vector<std::vector<raiden::RaidenBufferHandle>>
+          layer_buffer_handles_in,
+      std::optional<int> local_port_in,
+      std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
+      int parallelism, HostBufferAllocator host_allocator_in, int node_id,
+      int local_control_port, int64_t max_blocks, int64_t num_slots,
+      double timeout_s)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<TestBase>(std::move(layer_buffer_handles_in),
+                                       local_port_in, host_blocks_to_allocate,
+                                       unsafe_skip_buffer_lock, parallelism,
+                                       std::move(host_allocator_in)),
+            node_id, local_control_port, max_blocks, num_slots, timeout_s) {}
+
+  void SetMockLocalIps(const std::vector<std::string>& ips) {
+    static_cast<TestBase*>(base())->SetMockLocalIps(ips);
+  }
 };
 
 TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
@@ -123,7 +145,7 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
       /*timeout_s=*/10.0);
 
   // Configure staging slots: 2 slots, max 2 blocks per slot
-  ASSERT_THAT(engine->ConfigureHostStagingSlots(2, 2), IsOk());
+  ASSERT_THAT(engine->base()->ConfigureHostStagingSlots(2, 2), IsOk());
 
   // Register Block 0 as ready for read on ourselves (producer)
   uint64_t uuid = 12345;
@@ -199,7 +221,7 @@ TEST(KVCacheManagerWithTransferTest, StartReadAcceptsParallelism) {
       /*max_blocks=*/2,
       /*num_slots=*/2,
       /*timeout_s=*/10.0);
-  ASSERT_THAT(engine->ConfigureHostStagingSlots(2, 2), IsOk());
+  ASSERT_THAT(engine->base()->ConfigureHostStagingSlots(2, 2), IsOk());
 
   // Calling StartRead with a non-existent port throws or returns an op that
   // fails
@@ -249,7 +271,7 @@ TEST(KVCacheManagerWithTransferTest,
       /*timeout_s=*/10.0);
 
   // Configure staging slots: 2 slots, max 2 blocks per slot
-  ASSERT_THAT(engine->ConfigureHostStagingSlots(2, 2), IsOk());
+  ASSERT_THAT(engine->base()->ConfigureHostStagingSlots(2, 2), IsOk());
 
   // Register Block 0 as ready for read on ourselves (producer)
   uint64_t uuid = 12346;
@@ -298,8 +320,8 @@ TEST(KVCacheManagerWithTransferTest,
   }
 
   // Verify host buffer:
-  uint8_t* host_block_4 = engine->GetBlockHostPointer(0, 0, 4);
-  uint8_t* host_block_5 = engine->GetBlockHostPointer(0, 0, 5);
+  uint8_t* host_block_4 = engine->base()->GetBlockHostPointer(0, 0, 4);
+  uint8_t* host_block_5 = engine->base()->GetBlockHostPointer(0, 0, 5);
 
   float* host_block_4_float = reinterpret_cast<float*>(host_block_4);
   float* host_block_5_float = reinterpret_cast<float*>(host_block_5);
@@ -376,7 +398,7 @@ TEST(KVCacheManagerWithTransferTest, TreeBroadcastCorrectness8Nodes) {
         /*num_slots=*/2,
         /*timeout_s=*/10.0);
 
-    ASSERT_THAT(engines[i]->ConfigureHostStagingSlots(2, 2), IsOk());
+    ASSERT_THAT(engines[i]->base()->ConfigureHostStagingSlots(2, 2), IsOk());
     int port = engines[i]->local_control_port();
     ASSERT_GT(port, 0);
     endpoints[i] = "127.0.0.1:" + std::to_string(port);
@@ -516,7 +538,7 @@ TEST(KVCacheManagerWithTransferTest, MultiIpOrchestratedTransfer) {
 
   engine->SetMockLocalIps({"127.0.0.1", "127.0.0.2"});
 
-  ASSERT_THAT(engine->ConfigureHostStagingSlots(2, 2), IsOk());
+  ASSERT_THAT(engine->base()->ConfigureHostStagingSlots(2, 2), IsOk());
 
   uint64_t uuid = 12347;
   std::string req_id = "multi_ip_test_req";

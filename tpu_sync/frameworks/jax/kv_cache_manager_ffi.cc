@@ -172,8 +172,9 @@ xla::ffi::Error TriggerRaidenH2dImpl(
   const int32_t* h_copy_sizes =
       reinterpret_cast<const int32_t*>(copy_sizes.untyped_data());
 
-  const uint8_t* h_base = g_kv_cache_managers[shard_idx]->GetHostPointer(
-      static_cast<size_t>(layer_idx), 0);
+  const uint8_t* h_base =
+      g_kv_cache_managers[shard_idx]->base()->GetHostPointer(
+          static_cast<size_t>(layer_idx), 0);
 
   LOG(WARNING) << "[TPU Worker FFI] H2D pointers: cache_slice_buf="
                << cache_slice_buf.untyped_data()
@@ -288,8 +289,8 @@ xla::ffi::Error TriggerRaidenD2hImpl(
   const int32_t* h_copy_sizes =
       reinterpret_cast<const int32_t*>(copy_sizes.untyped_data());
 
-  uint8_t* h_base =
-      const_cast<uint8_t*>(g_kv_cache_managers[shard_idx]->GetHostPointer(
+  uint8_t* h_base = const_cast<uint8_t*>(
+      g_kv_cache_managers[shard_idx]->base()->GetHostPointer(
           static_cast<size_t>(layer_idx), 0));
 
   const uint8_t* d_base =

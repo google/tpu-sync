@@ -120,13 +120,13 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   void MarkPullStarted(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    send_entries_.at(uuid)->pull_started = true;
-  }
-
-  void ExpireSend(uint64_t uuid) {
-    absl::MutexLock lock(mu_);
-    send_entries_.at(uuid)->deadline =
-        std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+    auto old = send_entries_.at(uuid);
+    auto entry = std::make_shared<SendEntry>(
+        base_.get(), old->req_id(), uuid, old->deadline(),
+        old->register_start(), /*slot_in=*/nullptr, /*in_flight_in=*/0,
+        /*pull_started_in=*/true);
+    entry->PopulateRegisteredBlocks({0});
+    send_entries_[uuid] = entry;
   }
 };
 
@@ -281,8 +281,10 @@ TEST(ControlHandshakeTest, PullWithoutRegistrationIsRejected) {
 
 TEST(ControlHandshakeTest, PullAfterRegistrationDeadlineIsRejected) {
   TestManager producer(/*timeout_s=*/0.05);
-  ASSERT_GT(producer.NotifyForRead("expired", /*uuid=*/42, {0}), 0);
-  producer.ExpireSend(/*uuid=*/42);
+  ASSERT_GT(producer.NotifyForRead("expired", /*uuid=*/42, {0},
+                                   std::chrono::steady_clock::now() -
+                                       std::chrono::milliseconds(1)),
+            0);
 
   int fd = Connect(producer.local_control_port());
   const absl::Time start = absl::Now();

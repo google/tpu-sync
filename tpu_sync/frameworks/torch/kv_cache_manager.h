@@ -239,13 +239,19 @@ class KVCacheManager {
   int local_control_port() const {
     return torch_manager_->local_control_port();
   }
-  std::optional<int> local_port() const { return torch_manager_->local_port(); }
-  size_t num_layers() const { return torch_manager_->num_layers(); }
-  size_t num_shards() const { return torch_manager_->num_shards(); }
-  size_t slice_byte_size() const { return torch_manager_->slice_byte_size(); }
-  size_t num_block_arrays() const { return torch_manager_->num_block_arrays(); }
+  std::optional<int> local_port() const {
+    return torch_manager_->base()->local_port();
+  }
+  size_t num_layers() const { return torch_manager_->base()->num_layers(); }
+  size_t num_shards() const { return torch_manager_->base()->num_shards(); }
+  size_t slice_byte_size() const {
+    return torch_manager_->base()->slice_byte_size();
+  }
+  size_t num_block_arrays() const {
+    return torch_manager_->base()->num_block_arrays();
+  }
   size_t block_bytes(size_t block_array_idx) const {
-    return torch_manager_->block_bytes(block_array_idx);
+    return torch_manager_->base()->block_bytes(block_array_idx);
   }
 
   std::vector<RaidenTransferEndpoint> get_local_endpoints() const {
@@ -264,7 +270,7 @@ class KVCacheManager {
 
   absl::StatusOr<std::vector<int64_t>> PlanHostBlocks(
       uint64_t uuid, const std::vector<int64_t>& block_ids) {
-    return torch_manager_->PlanHostBlocks(uuid, block_ids);
+    return torch_manager_->base()->PlanHostBlocks(uuid, block_ids);
   }
 
   absl::Status RegisterRecv(uint64_t uuid, const std::string& req_id,
@@ -323,9 +329,9 @@ class KVCacheManager {
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt) {
-    return torch_manager_->H2d(src_offsets_major_dim, dst_offsets_major_dim,
-                               copy_sizes_major_dim, slot_idx, layer_idx,
-                               shard_idx);
+    return torch_manager_->base()->H2d(
+        src_offsets_major_dim, dst_offsets_major_dim, copy_sizes_major_dim,
+        slot_idx, layer_idx, shard_idx);
   }
 
   absl::StatusOr<raiden::PjRtCopyFuture> D2h(
@@ -335,16 +341,16 @@ class KVCacheManager {
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt) {
-    return torch_manager_->D2h(src_offsets_major_dim, dst_offsets_major_dim,
-                               copy_sizes_major_dim, slot_idx, layer_idx,
-                               shard_idx);
+    return torch_manager_->base()->D2h(
+        src_offsets_major_dim, dst_offsets_major_dim, copy_sizes_major_dim,
+        slot_idx, layer_idx, shard_idx);
   }
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
   D2hAutoAllocate(const std::vector<int64_t>& src_offsets_major_dim = {},
                   const std::vector<int64_t>& copy_sizes_major_dim = {}) {
-    return torch_manager_->D2hAutoAllocate(src_offsets_major_dim,
-                                           copy_sizes_major_dim);
+    return torch_manager_->base()->D2hAutoAllocate(src_offsets_major_dim,
+                                                   copy_sizes_major_dim);
   }
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hWrite(
@@ -352,94 +358,98 @@ class KVCacheManager {
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
       int layer_idx = -1) {
-    return torch_manager_->H2hWrite(peers, src_block_ids, dst_block_ids, uuid,
-                                    layer_idx);
+    return torch_manager_->base()->H2hWrite(peers, src_block_ids, dst_block_ids,
+                                            uuid, layer_idx);
   }
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hWrite(
       std::string peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
       int layer_idx = -1) {
-    return torch_manager_->H2hWrite(std::move(peer), src_block_ids,
-                                    dst_block_ids, uuid, layer_idx);
+    return torch_manager_->base()->H2hWrite(std::move(peer), src_block_ids,
+                                            dst_block_ids, uuid, layer_idx);
   }
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hRead(
       const std::vector<std::string>& peers,
       const std::vector<int>& src_block_ids) {
-    return torch_manager_->H2hRead(peers, src_block_ids);
+    return torch_manager_->base()->H2hRead(peers, src_block_ids);
   }
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hRead(
       std::string peer, const std::vector<int>& src_block_ids) {
-    return torch_manager_->H2hRead(std::move(peer), src_block_ids);
+    return torch_manager_->base()->H2hRead(std::move(peer), src_block_ids);
   }
 
   absl::Status RegisterPools(std::vector<kv_cache::PoolSpec> pools,
                              int64_t staging_leases = 0) {
-    return torch_manager_->RegisterPools(std::move(pools), staging_leases);
+    return torch_manager_->base()->RegisterPools(std::move(pools),
+                                                 staging_leases);
   }
 
   // Bounded host staging introspection.
   std::vector<kv_cache::KVCacheManagerBase::PoolStagingStorageSummary>
   PoolStagingSummary() const {
-    return torch_manager_->PoolStagingSummary();
+    return torch_manager_->base()->PoolStagingSummary();
   }
   int64_t pool_staging_leases() const {
-    return torch_manager_->pool_staging_leases();
+    return torch_manager_->base()->pool_staging_leases();
   }
   absl::Status AcquirePoolStagingLease(uint64_t uuid, size_t storage_idx,
                                        absl::Span<const int64_t> block_ids,
                                        absl::Duration timeout) {
-    return torch_manager_->AcquirePoolStagingLease(uuid, storage_idx, block_ids,
-                                                   timeout);
+    return torch_manager_->base()->AcquirePoolStagingLease(uuid, storage_idx,
+                                                           block_ids, timeout);
   }
   void ReleasePoolStagingLeases(uint64_t uuid) {
-    torch_manager_->ReleasePoolStagingLeases(uuid);
+    torch_manager_->base()->ReleasePoolStagingLeases(uuid);
   }
 
   absl::StatusOr<kv_cache::PoolBlockRef> GetPoolBlockRef(
       size_t pool_idx, size_t shard_idx, int64_t block_id) const {
-    return torch_manager_->GetPoolBlockRef(pool_idx, shard_idx, block_id);
+    return torch_manager_->base()->GetPoolBlockRef(pool_idx, shard_idx,
+                                                   block_id);
   }
 
-  size_t num_pools() const { return torch_manager_->num_pools(); }
+  size_t num_pools() const { return torch_manager_->base()->num_pools(); }
 
   bool has_explicit_pools() const {
-    return torch_manager_->has_explicit_pools();
+    return torch_manager_->base()->has_explicit_pools();
   }
 
   const kv_cache::PoolSpec* pool(size_t pool_idx) const {
-    return torch_manager_->pool(pool_idx);
+    return torch_manager_->base()->pool(pool_idx);
   }
 
   std::vector<size_t> PoolIndicesWithTag(absl::string_view tag) const {
-    return torch_manager_->PoolIndicesWithTag(tag);
+    return torch_manager_->base()->PoolIndicesWithTag(tag);
   }
 
   absl::StatusOr<uintptr_t> GetBlockHostPointerValue(size_t layer_idx,
                                                      size_t shard_idx,
                                                      int block_id) {
-    return torch_manager_->GetBlockHostPointerValue(layer_idx, shard_idx,
-                                                    block_id);
+    return torch_manager_->base()->GetBlockHostPointerValue(
+        layer_idx, shard_idx, block_id);
   }
 
   int64_t LayerBlockByteSize(size_t layer_idx) const {
-    return torch_manager_->LayerBlockByteSize(layer_idx);
+    return torch_manager_->base()->LayerBlockByteSize(layer_idx);
   }
 
   absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx = std::nullopt,
       std::optional<uint64_t> uuid = std::nullopt) {
-    return torch_manager_->D2hPoolBlocks(pool_idx, block_ids, shard_idx, uuid);
+    return torch_manager_->base()->D2hPoolBlocks(pool_idx, block_ids, shard_idx,
+                                                 uuid);
   }
 
   absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx = std::nullopt,
       std::optional<uint64_t> uuid = std::nullopt) {
-    return torch_manager_->H2dPoolBlocks(pool_idx, block_ids, shard_idx, uuid);
+    return torch_manager_->base()->H2dPoolBlocks(pool_idx, block_ids, shard_idx,
+                                                 uuid);
   }
 
  private:

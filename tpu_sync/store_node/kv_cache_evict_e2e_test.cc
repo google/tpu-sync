@@ -125,7 +125,7 @@ class EvictE2ETest : public ::testing::Test {
   static void FillBlock(KVCacheManagerWithTransfer& manager, int block_id,
                         int hash_idx) {
     for (size_t array = 0; array < kNumBlockArrays; ++array) {
-      uint8_t* base = manager.GetHostPointer(array, /*shard_idx=*/0);
+      uint8_t* base = manager.base()->GetHostPointer(array, /*shard_idx=*/0);
       ASSERT_NE(base, nullptr);
       for (size_t b = 0; b < kArrayBytes; ++b) {
         base[block_id * kArrayBytes + b] = PatternByte(hash_idx, array, b);
@@ -138,7 +138,8 @@ class EvictE2ETest : public ::testing::Test {
   static void ExpectBlockBytes(KVCacheManagerWithTransfer& manager,
                                int block_id, int hash_idx) {
     for (size_t array = 0; array < kNumBlockArrays; ++array) {
-      const uint8_t* base = manager.GetHostPointer(array, /*shard_idx=*/0);
+      const uint8_t* base =
+          manager.base()->GetHostPointer(array, /*shard_idx=*/0);
       ASSERT_NE(base, nullptr);
       for (size_t b = 0; b < kArrayBytes; ++b) {
         ASSERT_EQ(base[block_id * kArrayBytes + b],
@@ -211,8 +212,9 @@ TEST_F(EvictE2ETest, SweepDemotesToTheStoreNodeAndReadsBack) {
     }
     if (!resident) {
       for (size_t array = 0; array < kNumBlockArrays; ++array) {
-        std::memset(src.manager->GetHostPointer(array, 0) + blk * kArrayBytes,
-                    0xEE, kArrayBytes);
+        std::memset(
+            src.manager->base()->GetHostPointer(array, 0) + blk * kArrayBytes,
+            0xEE, kArrayBytes);
       }
     }
   }

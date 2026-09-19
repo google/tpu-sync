@@ -26,7 +26,6 @@
 
 #include "absl/base/no_destructor.h"
 #include "absl/status/status.h"
-#include "absl/synchronization/blocking_counter.h"
 #include "absl/types/span.h"
 #include "hwy/highway.h"
 #include "xla/index_util.h"
@@ -38,6 +37,49 @@
 #include "tpu_sync/core/numa_thread_pool.h"
 
 namespace tpu_raiden::weight_sync {
+
+bool IsStandardRowMajorTiled(const xla::Shape& shape,
+                             const xla::Layout& layout) {
+  const int R = shape.dimensions().size();
+  if (R < 1) return false;
+  if (layout.minor_to_major().size() != R) return false;
+
+  for (int i = 0; i < R; ++i) {
+    if (layout.minor_to_major(i) != R - 1 - i) {
+      return false;
+    }
+  }
+
+  if (layout.tiles().size() == 1) {
+    const auto& t0 = layout.tiles(0);
+    for (int64_t d : t0.dimensions()) {
+      if (d <= 0) return false;
+    }
+    if (t0.dimensions().size() == 2) return true;
+    if (R == 1 && t0.dimensions().size() == 1) return true;
+    return false;
+  }
+
+  if (layout.tiles().size() == 2) {
+    const auto& t0 = layout.tiles(0);
+    const auto& t1 = layout.tiles(1);
+    for (int64_t d : t0.dimensions()) {
+      if (d <= 0) return false;
+    }
+    for (int64_t d : t1.dimensions()) {
+      if (d <= 0) return false;
+    }
+    if (t0.dimensions().size() != 2 || t1.dimensions().size() != 2) {
+      return false;
+    }
+    int64_t tile_H = t0.dimension(0);
+    int64_t P = t1.dimension(0);
+    int64_t sub_W = t1.dimension(1);
+    return (sub_W == 1 && (P == 2 || P == 4) && tile_H % P == 0);
+  }
+
+  return false;
+}
 
 namespace {
 
@@ -57,36 +99,6 @@ tpu_raiden::NumaThreadPool* GetThreadPool() {
   static absl::NoDestructor<tpu_raiden::NumaThreadPool> global_pool(
       kMaxNumThreads);
   return global_pool.get();
-}
-
-bool IsStandardRowMajorTiled(const xla::Shape& shape,
-                             const xla::Layout& layout) {
-  const int R = shape.dimensions().size();
-  if (R < 1) return false;
-
-  for (int i = 0; i < R; ++i) {
-    if (layout.minor_to_major(i) != R - 1 - i) {
-      return false;
-    }
-  }
-
-  if (layout.tiles().size() == 1) {
-    return layout.tiles(0).dimensions().size() == 2;
-  }
-
-  if (layout.tiles().size() == 2) {
-    const auto& t0 = layout.tiles(0);
-    const auto& t1 = layout.tiles(1);
-    if (t0.dimensions().size() != 2 || t1.dimensions().size() != 2) {
-      return false;
-    }
-    int64_t tile_H = t0.dimension(0);
-    int64_t P = t1.dimension(0);
-    int64_t sub_W = t1.dimension(1);
-    return (sub_W == 1 && (P == 2 || P == 4) && tile_H % P == 0);
-  }
-
-  return false;
 }
 
 template <typename F>
@@ -564,8 +576,10 @@ absl::Status TileBufferNDOptimized(const uint8_t* src_linear,
       xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
 
   const xla::Tile& tile = layout.tiles(0);
-  int64_t tile_H = tile.dimension(0);
-  int64_t tile_W = tile.dimension(1);
+  int64_t tile_H = (tile.dimensions().size() <= 1) ? 1 : tile.dimension(0);
+  int64_t tile_W = (tile.dimensions().size() == 1)   ? tile.dimension(0)
+                   : (tile.dimensions().size() >= 2) ? tile.dimension(1)
+                                                     : 1;
   int64_t packing_factor = 1;
   if (layout.tiles().size() >= 2) {
     packing_factor = layout.tiles(1).dimension(0);
@@ -780,8 +794,10 @@ absl::Status DetileBufferNDOptimized(
       xla::ShapeUtil::ByteSizeOfPrimitiveType(shape.element_type());
 
   const xla::Tile& tile = layout.tiles(0);
-  int64_t tile_H = tile.dimension(0);
-  int64_t tile_W = tile.dimension(1);
+  int64_t tile_H = (tile.dimensions().size() <= 1) ? 1 : tile.dimension(0);
+  int64_t tile_W = (tile.dimensions().size() == 1)   ? tile.dimension(0)
+                   : (tile.dimensions().size() >= 2) ? tile.dimension(1)
+                                                     : 1;
   int64_t packing_factor = 1;
   if (layout.tiles().size() >= 2) {
     packing_factor = layout.tiles(1).dimension(0);
@@ -1017,6 +1033,10 @@ int64_t GetTiledBufferElements(const xla::Shape& shape) {
     for (int i = 0; i < tile_rank; ++i) {
       int64_t d = current_shape[suffix_start + i];
       int64_t t = tile.dimension(i);
+      if (t <= 0) {
+        return shape.dimensions().empty() ? 1
+                                          : xla::ShapeUtil::ElementsIn(shape);
+      }
       next_shape.push_back(xla::CeilOfRatio(d, t));
     }
 

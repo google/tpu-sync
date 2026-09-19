@@ -168,19 +168,12 @@ XlaHostMemoryAllocator::AllocateDmaMappedForDevice(
           << (device ? device->DebugString() : "nullptr")
           << ", resolved NUMA node: " << numa_node;
   if (numa_node >= 0) {
-    // Bind this thread's allocations to the TPU's local NUMA node
-    SetThreadMempolicy(2, numa_node);  // MPOL_BIND
+    // Prefer allocating on the TPU's local NUMA node for maximum PCIe/DMA
+    // bandwidth, while gracefully allowing fallback to other NUMA nodes if
+    // the local node is at capacity.
+    SetThreadMempolicy(1, numa_node);  // MPOL_PREFERRED
 
     auto alloc_or = AllocateDmaMapped(size_bytes);
-    if (alloc_or.ok()) {
-      // Touch one byte per page (4KB) using a volatile pointer to force
-      // physical page allocation (first-touch) on the bound NUMA node.
-      volatile uint8_t* p =
-          static_cast<volatile uint8_t*>(alloc_or.value().ptr);
-      for (size_t i = 0; i < size_bytes; i += 4096) {
-        p[i] = 0;
-      }
-    }
 
     // Restore default policy
     SetThreadMempolicy(0);  // MPOL_DEFAULT

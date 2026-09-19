@@ -112,13 +112,13 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     client = const_cast<xla::PjRtClient*>(first_handle.device->client());
   }
 
-  std::unique_ptr<HostMemoryAllocator> host_allocator;
   if (client) {
     auto alloc = HostMemoryAllocator::Create(client);
     if (alloc.ok()) {
-      host_allocator = *std::move(alloc);
+      host_allocator_ = *std::move(alloc);
     }
   }
+  HostMemoryAllocator* host_allocator = host_allocator_.get();
 
   size_t shard_idx = 0;
   layers_.reserve(num_layers_);
@@ -192,25 +192,6 @@ WeightSynchronizerBase::WeightSynchronizerBase(
             itemsize;
         if (physical_bytes > 0) {
           shard_info.tiled_size = physical_bytes;
-          if (host_allocator && dst_buffer.device) {
-            auto alloc = host_allocator->AllocateDmaMappedForDevice(
-                physical_bytes, dst_buffer.device);
-            if (alloc.ok()) {
-              shard_info.tiled_ptr = (*alloc).ptr;
-              shard_info.tiled_owner = (*alloc).owner;
-            }
-          }
-          if (shard_info.tiled_ptr == nullptr) {
-            void* ptr = nullptr;
-            if (posix_memalign(&ptr, 64, physical_bytes) != 0) {
-              throw std::runtime_error(
-                  "Failed to allocate host tiled scratch buffer");
-            }
-            shard_info.owned_tiled_buffer =
-                std::unique_ptr<uint8_t[], void (*)(void*)>(
-                    static_cast<uint8_t*>(ptr), [](void* p) { free(p); });
-            shard_info.tiled_ptr = shard_info.owned_tiled_buffer.get();
-          }
         }
       }
 
@@ -231,6 +212,11 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   }
   push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
       std::max(parallelism_, 4));
+
+  tiled_scratchpads_.reserve(num_shards_);
+  for (size_t i = 0; i < num_shards_; ++i) {
+    tiled_scratchpads_.push_back(std::make_unique<ShardScratchpad>());
+  }
 }
 
 WeightSynchronizerBase::WeightSynchronizerBase(
@@ -311,6 +297,11 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   }
   push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
       std::max(parallelism_, 4));
+
+  tiled_scratchpads_.reserve(num_shards_);
+  for (size_t i = 0; i < num_shards_; ++i) {
+    tiled_scratchpads_.push_back(std::make_unique<ShardScratchpad>());
+  }
 }
 
 std::optional<int> WeightSynchronizerBase::listener_port() const {
@@ -351,6 +342,14 @@ WeightSynchronizerBase::~WeightSynchronizerBase() {
   listener_.reset();
   h2d_pool_.reset();
   push_pool_.reset();
+  for (auto& sp : tiled_scratchpads_) {
+    if (sp) {
+      absl::MutexLock lock(sp->mu);
+      if (sp->in_flight_future.IsValid()) {
+        (void)sp->in_flight_future.Await();
+      }
+    }
+  }
 }
 
 size_t WeightSynchronizerBase::GetPipelineGroupSize() const {
@@ -365,6 +364,40 @@ size_t WeightSynchronizerBase::GetPipelineGroupSize() const {
     }
   }
   return 1;
+}
+
+absl::StatusOr<uint8_t*> WeightSynchronizerBase::AcquireTiledScratchpadLocked(
+    ShardScratchpad& sp, size_t required_bytes, const xla::PjRtDevice* device) {
+  if (sp.in_flight_future.IsValid()) {
+    TF_RETURN_IF_ERROR(sp.in_flight_future.Await());
+  }
+  if (sp.capacity < required_bytes) {
+    sp.ptr = nullptr;
+    sp.owner.reset();
+    sp.owned_buffer.reset();
+    if (host_allocator_ && device) {
+      auto alloc =
+          host_allocator_->AllocateDmaMappedForDevice(required_bytes, device);
+      if (alloc.ok()) {
+        sp.ptr = (*alloc).ptr;
+        sp.owner = (*alloc).owner;
+        sp.capacity = required_bytes;
+      }
+    }
+    if (sp.ptr == nullptr) {
+      void* raw_ptr = nullptr;
+      if (posix_memalign(&raw_ptr, 64, required_bytes) != 0) {
+        return absl::ResourceExhaustedError(
+            "Failed to allocate host tiled scratch buffer");
+      }
+      std::memset(raw_ptr, 0, required_bytes);
+      sp.owned_buffer = std::unique_ptr<uint8_t[], void (*)(void*)>(
+          static_cast<uint8_t*>(raw_ptr), [](void* p) { free(p); });
+      sp.ptr = sp.owned_buffer.get();
+      sp.capacity = required_bytes;
+    }
+  }
+  return sp.ptr;
 }
 
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
@@ -390,12 +423,12 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
     }
   }
 
-  const auto& layer_info = layers_[layer_idx];
+  auto& layer_info = layers_[layer_idx];
   const auto& layer_holds = buffer_holds_[layer_idx];
   std::vector<xla::Future<raiden::BufferHolder>> shard_futures_to_join;
 
   for (size_t i = 0; i < num_shards_; ++i) {
-    const auto& shard_info = layer_info.shards[i];
+    auto& shard_info = layer_info.shards[i];
     const auto& shard_hold = layer_holds[i];
 
     const xla::Layout* xla_layout = nullptr;
@@ -422,7 +455,15 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
       size_t physical_bytes =
           tpu_raiden::weight_sync::GetTiledBufferElements(shard_hold.shape) *
           itemsize;
-      uint8_t* tiled_buffer_ptr = shard_info.tiled_ptr;
+
+      if (i >= tiled_scratchpads_.size() || !tiled_scratchpads_[i]) {
+        return absl::InternalError("Shard index out of range for scratchpad");
+      }
+      auto& sp = *tiled_scratchpads_[i];
+      absl::MutexLock lock(sp.mu);
+      TF_ASSIGN_OR_RETURN(
+          uint8_t* tiled_buffer_ptr,
+          AcquireTiledScratchpadLocked(sp, physical_bytes, shard_hold.device));
       if (tiled_buffer_ptr == nullptr) {
         return absl::InternalError(
             "Tiled buffer pointer is null for tiled shape");
@@ -430,14 +471,14 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
       auto tile_start = absl::Now();
       auto status = tpu_raiden::weight_sync::TileBuffer(
           shard_info.host_ptr, tiled_buffer_ptr, shard_hold.shape, *xla_layout,
-          h2d_pool_.get());
+          /*pool=*/nullptr);
       if (!status.ok()) {
         return status;
       }
       double tile_time_ms =
           absl::ToDoubleMilliseconds(absl::Now() - tile_start);
       {
-        absl::MutexLock lock(metrics_mu_);
+        absl::MutexLock metrics_lock(metrics_mu_);
         metrics_.last_tiling_time_ms =
             std::max(metrics_.last_tiling_time_ms, tile_time_ms);
         metrics_.total_tiling_time_ms += tile_time_ms;
@@ -447,7 +488,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
 
       xla::Future<> future =
           shard_hold.CopyRawHostToDevice(tiled_buffer_ptr, 0, physical_bytes);
-      shard_futures.push_back(std::move(future));
+      sp.in_flight_future = future;
+      shard_futures.push_back(future);
     } else {
       xla::Future<> future = shard_hold.CopyRawHostToDevice(
           shard_info.host_ptr, 0, shard_info.device_size);
@@ -508,12 +550,12 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
     }
   }
 
-  const auto& layer_info = layers_[layer_idx];
+  auto& layer_info = layers_[layer_idx];
   const auto& layer_holds = buffer_holds_[layer_idx];
 
   std::vector<xla::Future<raiden::BufferHolder>> shard_futures_to_join;
   for (size_t i = 0; i < num_shards_; ++i) {
-    const auto& shard_info = layer_info.shards[i];
+    auto& shard_info = layer_info.shards[i];
     const auto& shard_hold = layer_holds[i];
     uint8_t* dst_host_ptr = const_cast<uint8_t*>(shard_info.host_ptr);
 
@@ -541,7 +583,15 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
       size_t physical_bytes =
           tpu_raiden::weight_sync::GetTiledBufferElements(shard_hold.shape) *
           itemsize;
-      uint8_t* tiled_buffer_ptr = shard_info.tiled_ptr;
+
+      if (i >= tiled_scratchpads_.size() || !tiled_scratchpads_[i]) {
+        return absl::InternalError("Shard index out of range for scratchpad");
+      }
+      auto& sp = *tiled_scratchpads_[i];
+      absl::MutexLock lock(sp.mu);
+      TF_ASSIGN_OR_RETURN(
+          uint8_t* tiled_buffer_ptr,
+          AcquireTiledScratchpadLocked(sp, physical_bytes, shard_hold.device));
       if (tiled_buffer_ptr == nullptr) {
         return absl::InternalError(
             "Tiled buffer pointer is null for tiled shape");
@@ -556,11 +606,11 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
             auto detile_start = absl::Now();
             absl::Status status = tpu_raiden::weight_sync::DetileBuffer(
                 tiled_buffer_ptr, dst_host_ptr, shape, layout,
-                push_pool_.get());
+                /*pool=*/nullptr);
             double detile_time_ms =
                 absl::ToDoubleMilliseconds(absl::Now() - detile_start);
             if (status.ok()) {
-              absl::MutexLock lock(metrics_mu_);
+              absl::MutexLock metrics_lock(metrics_mu_);
               metrics_.last_detiling_time_ms =
                   std::max(metrics_.last_detiling_time_ms, detile_time_ms);
               metrics_.total_detiling_time_ms += detile_time_ms;
@@ -570,6 +620,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
             return status;
           });
 
+      sp.in_flight_future = detile_future;
       shard_futures.push_back(std::move(detile_future));
     } else {
       xla::Future<> future = shard_hold.CopyRawDeviceToHost(
@@ -685,25 +736,20 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   const auto& schedules = request.shard_push_schedules();
   bool use_global_keys = false;
   if (!global_shard_indices_.empty()) {
-    bool all_in_global = true;
-    bool any_outside_local = false;
-    for (const auto& [sched_key, _] : schedules) {
-      bool in_global =
-          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                    static_cast<int64_t>(sched_key)) !=
-          global_shard_indices_.end();
-      bool in_local =
-          std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
-                    static_cast<int>(sched_key)) != local_shard_indices_.end();
-      if (!in_global) {
-        all_in_global = false;
-      }
-      if (!in_local && in_global) {
-        any_outside_local = true;
+    if (local_shard_indices_.empty()) {
+      use_global_keys = true;
+    } else {
+      for (const auto& [sched_key, _] : schedules) {
+        bool in_local =
+            std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
+                      static_cast<int>(sched_key)) !=
+            local_shard_indices_.end();
+        if (!in_local) {
+          use_global_keys = true;
+          break;
+        }
       }
     }
-    use_global_keys =
-        all_in_global && (any_outside_local || local_shard_indices_.empty());
   }
   for (size_t i = 0; i < num_shards_; ++i) {
     int64_t global_shard = global_shard_index(i);
@@ -937,11 +983,10 @@ absl::Status WeightSynchronizerBase::BindWeights(
     }
   }
 
-  std::unique_ptr<HostMemoryAllocator> host_allocator;
   if (client) {
     auto alloc = HostMemoryAllocator::Create(client);
     if (alloc.ok()) {
-      host_allocator = *std::move(alloc);
+      host_allocator_ = *std::move(alloc);
     }
   }
 
@@ -963,31 +1008,8 @@ absl::Status WeightSynchronizerBase::BindWeights(
         size_t physical_bytes =
             tpu_raiden::weight_sync::GetTiledBufferElements(new_buffer.shape) *
             itemsize;
-        if (physical_bytes > 0 && (shard_info.tiled_ptr == nullptr ||
-                                   shard_info.tiled_size < physical_bytes)) {
+        if (physical_bytes > 0) {
           shard_info.tiled_size = physical_bytes;
-          shard_info.tiled_ptr = nullptr;
-          shard_info.tiled_owner.reset();
-          shard_info.owned_tiled_buffer.reset();
-          if (host_allocator && new_buffer.device) {
-            auto alloc = host_allocator->AllocateDmaMappedForDevice(
-                physical_bytes, new_buffer.device);
-            if (alloc.ok()) {
-              shard_info.tiled_ptr = (*alloc).ptr;
-              shard_info.tiled_owner = (*alloc).owner;
-            }
-          }
-          if (shard_info.tiled_ptr == nullptr) {
-            void* ptr = nullptr;
-            if (posix_memalign(&ptr, 64, physical_bytes) != 0) {
-              return absl::InternalError(
-                  "Failed to allocate host tiled scratch buffer");
-            }
-            shard_info.owned_tiled_buffer =
-                std::unique_ptr<uint8_t[], void (*)(void*)>(
-                    static_cast<uint8_t*>(ptr), [](void* p) { free(p); });
-            shard_info.tiled_ptr = shard_info.owned_tiled_buffer.get();
-          }
         }
       }
       hold_info.push_back(new_buffer);

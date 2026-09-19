@@ -72,7 +72,24 @@ message VariableMetadataProto {
   repeated int32 layout = 4;
   int32 item_size = 5;
   int32 layer_idx = 6;
+  // Sharding specification (e.g. ['fsdp', 'tp']).
+  // No longer necessary when global_shard_indices is populated.
   repeated string sharding_spec = 7;
+
+  // When provided, specifies the exact global shard index (in the range
+  // [0, prod(mesh_shape))) that each local shard (in range [0, len(shards)))
+  // holds for this variable.
+  //
+  // When global_shard_indices is populated:
+  // - host_subgrid (in RegisterWorkUnitRequest) is no longer necessary.
+  // - mesh_axes (in RegisterWorkUnitRequest) is no longer necessary.
+  // - top-level mesh_shape (in RegisterWorkUnitRequest) is no longer necessary.
+  // - sharding_spec (in VariableMetadataProto) is no longer necessary.
+  //
+  // Note: var.shape and var.mesh_shape are still required to define the slice
+  // geometry (via nd_slice_math.compute_nd_shard_slices) that
+  // global_shard_indices indexes into.
+  repeated int64 global_shard_indices = 8;
 }
 
 message RegisterWorkUnitRequest {
@@ -97,8 +114,10 @@ message RegisterWorkUnitRequest {
   // Multi-variable manifest
   repeated VariableMetadataProto variables = 14;
   // Optional list of logical mesh axis names (e.g. ['fsdp', 'tp']).
+  // No longer necessary when variables specify global_shard_indices.
   repeated string mesh_axes = 15;
   // Optional ground-truth local submesh shape from JAX (mesh.local_mesh).
+  // No longer necessary when variables specify global_shard_indices.
   repeated int64 host_subgrid = 16;
 }
 

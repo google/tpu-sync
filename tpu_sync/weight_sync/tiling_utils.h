@@ -27,6 +27,11 @@ class NumaThreadPool;
 
 namespace tpu_raiden::weight_sync {
 
+// Returns true if the shape and layout qualify for the optimized row-major
+// tiling fast-path.
+bool IsStandardRowMajorTiled(const xla::Shape& shape,
+                             const xla::Layout& layout);
+
 // Calculates the total number of physical elements required for a tiled buffer.
 int64_t GetTiledBufferElements(const xla::Shape& shape);
 

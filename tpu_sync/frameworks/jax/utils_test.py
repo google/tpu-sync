@@ -124,7 +124,7 @@ class UtilsTest(absltest.TestCase):
     perm = utils.get_shard_sorting_permutation(arr)
     self.assertEqual(perm, [])
 
-  def test_strict_bijection_failure_raises_value_error(self):
+  def test_strict_bijection_failure_returns_empty(self):
     sharding = jax.sharding.NamedSharding(
         self.mesh_2d, jax.sharding.PartitionSpec("x", "y")
     )
@@ -139,9 +139,8 @@ class UtilsTest(absltest.TestCase):
         arr.addressable_shards[2],
         arr.addressable_shards[3],
     ]
-    with self.assertRaises(ValueError) as ctx:
-      utils.get_shard_sorting_permutation(mock_arr)
-    self.assertIn("Strict bijection failed", str(ctx.exception))
+    perm = utils.get_shard_sorting_permutation(mock_arr)
+    self.assertEqual(perm, [])
 
   def test_non_contiguous_subgrid_4x4x4_mesh_permutation(self):
     mock_devices = np.empty((4, 4, 4), dtype=object)

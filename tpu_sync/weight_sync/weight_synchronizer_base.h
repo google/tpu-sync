@@ -43,6 +43,8 @@ class StartTransferRequest;
 }  // namespace tpu_sync
 
 namespace tpu_raiden {
+class HostMemoryAllocator;
+
 namespace weight_sync {
 
 struct WeightSyncMetrics {
@@ -198,6 +200,21 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
                                 size_t shard_idx) const override;
   size_t GetHostSize(size_t layer_idx, size_t shard_idx) const override;
 
+  uint8_t* GetTiledPointer(size_t layer_idx, size_t shard_idx) {
+    if (shard_idx < tiled_scratchpads_.size() &&
+        tiled_scratchpads_[shard_idx]) {
+      return tiled_scratchpads_[shard_idx]->ptr;
+    }
+    return nullptr;
+  }
+  const uint8_t* GetTiledPointer(size_t layer_idx, size_t shard_idx) const {
+    if (shard_idx < tiled_scratchpads_.size() &&
+        tiled_scratchpads_[shard_idx]) {
+      return tiled_scratchpads_[shard_idx]->ptr;
+    }
+    return nullptr;
+  }
+
   // Returns the list of layer names associated with the weight synchronizer.
   const std::vector<std::string>& layer_names() const { return layer_names_; }
 
@@ -327,6 +344,24 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   std::unique_ptr<tpu_raiden::NumaThreadPool> h2d_pool_;
   std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_;
+  std::unique_ptr<HostMemoryAllocator> host_allocator_;
+
+  // Shared reusable scratchpad per shard (one per local device/chip) to avoid
+  // allocating redundant tiled staging buffers across all layers.
+  struct ShardScratchpad {
+    absl::Mutex mu;
+    uint8_t* ptr = nullptr;
+    size_t capacity = 0;
+    std::shared_ptr<void> owner;
+    std::unique_ptr<uint8_t[], void (*)(void*)> owned_buffer = {nullptr,
+                                                                [](void*) {}};
+    xla::Future<> in_flight_future;
+  };
+  std::vector<std::unique_ptr<ShardScratchpad>> tiled_scratchpads_;
+
+  absl::StatusOr<uint8_t*> AcquireTiledScratchpadLocked(
+      ShardScratchpad& sp, size_t required_bytes,
+      const xla::PjRtDevice* device);
 
   mutable absl::Mutex skip_tiling_mu_;
   absl::flat_hash_map<uint64_t, std::vector<bool>> uuid_to_skip_tiling_

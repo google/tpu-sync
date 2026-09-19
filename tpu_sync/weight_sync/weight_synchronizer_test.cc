@@ -1054,6 +1054,101 @@ TEST_F(WeightSynchronizerTest, TilingActiveByDefault) {
   }
 }
 
+TEST_F(WeightSynchronizerTest, LazyTiledBufferAllocationSavesMemory) {
+  auto client_status_or = xla::GetXlaPjrtCpuClient(xla::CpuClientOptions());
+  ASSERT_TRUE(client_status_or.ok()) << client_status_or.status().message();
+  auto client = std::move(client_status_or.value());
+
+  auto memory_space_status_or =
+      client->addressable_devices()[0]->default_memory_space();
+  ASSERT_TRUE(memory_space_status_or.ok())
+      << memory_space_status_or.status().message();
+  xla::PjRtMemorySpace* memory_space = memory_space_status_or.value();
+
+  struct TestCaseRunner {
+    xla::PjRtClient* client;
+    xla::PjRtMemorySpace* memory_space;
+
+    struct WSWrapper {
+      std::unique_ptr<xla::PjRtBuffer> pjrt_buffer;
+      std::unique_ptr<WeightSynchronizerBase> ws;
+    };
+
+    WSWrapper CreateWS(xla::PrimitiveType type, absl::Span<const int64_t> dims,
+                       const xla::Layout& layout,
+                       std::vector<uint8_t>& placeholder) {
+      xla::Shape default_shape = xla::ShapeUtil::MakeShape(type, dims);
+      size_t byte_size = xla::ShapeUtil::ByteSizeOf(default_shape);
+      placeholder.resize(byte_size, 0);
+
+      auto buffer_status_or =
+          client->BufferFromHostBuffer(placeholder.data(), type, dims,
+                                       /*byte_strides=*/std::nullopt,
+                                       xla::PjRtClient::HostBufferSemantics::
+                                           kImmutableUntilTransferCompletes,
+                                       /*on_done_with_host_buffer=*/nullptr,
+                                       memory_space, /*device_layout=*/nullptr);
+      EXPECT_TRUE(buffer_status_or.ok()) << buffer_status_or.status().message();
+      auto pjrt_buffer = std::move(buffer_status_or.value());
+
+      auto handle_or = raiden::RaidenBufferHandle::Acquire(pjrt_buffer.get());
+      EXPECT_TRUE(handle_or.ok()) << handle_or.status().message();
+
+      handle_or.value().shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+          type, dims, layout.minor_to_major(), layout.tiles());
+
+      std::vector<std::vector<raiden::RaidenBufferHandle>> buffers = {
+          {handle_or.value()}};
+
+      auto ws =
+          std::make_unique<WeightSynchronizerBase>(buffers, /*local_port=*/0);
+      return WSWrapper{std::move(pjrt_buffer), std::move(ws)};
+    }
+  } runner{client.get(), memory_space};
+
+  xla::Layout layout = xla::LayoutUtil::MakeLayout({1, 0}, {xla::Tile({4, 4})});
+  std::vector<uint8_t> src_device_placeholder;
+  auto src_ws = runner.CreateWS(xla::PrimitiveType::F32, {8, 8}, layout,
+                                src_device_placeholder);
+
+  // 1. Verify tiled_ptr is NOT pre-allocated during initialization (lazy
+  // allocation saves memory)
+  EXPECT_EQ(src_ws.ws->GetTiledPointer(0, 0), nullptr);
+
+  float* src_host = reinterpret_cast<float*>(
+      const_cast<uint8_t*>(src_ws.ws->GetHostPointer(0, 0)));
+  for (int i = 0; i < 64; ++i) {
+    src_host[i] = static_cast<float>(i);
+  }
+
+  // 2. When skip_tiling is true, H2d executes without allocating tiled_ptr
+  tpu_sync::rpc::StartTransferRequest req_true;
+  (*req_true.mutable_skip_tiling())[0] = true;
+  src_ws.ws->StoreSkipTiling(999, req_true);
+  auto h2d_skip = src_ws.ws->H2d(999);
+  ASSERT_TRUE(h2d_skip.ok());
+  ASSERT_TRUE(h2d_skip.value().Await().ok());
+
+  // tiled_ptr MUST remain nullptr when tiling is skipped (0 bytes wasted)
+  EXPECT_EQ(src_ws.ws->GetTiledPointer(0, 0), nullptr);
+
+  // 3. When skip_tiling is false, tiled_ptr is lazily allocated on demand
+  // during H2d
+  tpu_sync::rpc::StartTransferRequest req_false;
+  (*req_false.mutable_skip_tiling())[0] = false;
+  src_ws.ws->StoreSkipTiling(1000, req_false);
+  auto h2d_tile = src_ws.ws->H2d(1000);
+  ASSERT_TRUE(h2d_tile.ok());
+  ASSERT_TRUE(h2d_tile.value().Await().ok());
+
+  // Now tiled_ptr is non-null because tiling actually ran!
+  EXPECT_NE(src_ws.ws->GetTiledPointer(0, 0), nullptr);
+
+  // 4. Verify that layers on the same shard reuse the exact same shared
+  // scratchpad pointer
+  EXPECT_EQ(src_ws.ws->GetTiledPointer(0, 0), src_ws.ws->GetTiledPointer(1, 0));
+}
+
 TEST_F(WeightSynchronizerTest, OneDimensionalTiledTensorH2dAndD2hRoundtrip) {
   auto client_status_or = xla::GetXlaPjrtCpuClient(xla::CpuClientOptions());
   ASSERT_TRUE(client_status_or.ok()) << client_status_or.status().message();
@@ -1463,6 +1558,74 @@ TEST_F(WeightSynchronizerTest,
     auto* entry = (*schedules)[s].add_entries();
     entry->set_dst_peer(dest_peer);
     entry->set_dst_shard_idx(s);
+    entry->set_src_offset_bytes(0);
+    entry->set_dst_offset_bytes(0);
+    entry->set_size_bytes(slice_byte_size);
+    entry->set_count(1);
+    entry->set_layer_idx(0);
+  }
+
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), num_shards));
+  absl::Status status = ws_source->PushWeightsResharded(request);
+  EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+  for (size_t s = 0; s < num_shards; ++s) {
+    const uint8_t* dst_ptr = ws_dest->GetHostBufferPtr(0, s);
+    ASSERT_NE(dst_ptr, nullptr);
+    for (size_t b = 0; b < slice_byte_size; ++b) {
+      EXPECT_EQ(dst_ptr[b], fill_bytes[s])
+          << "Mismatch at slot " << s << " byte " << b;
+    }
+  }
+}
+
+TEST_F(WeightSynchronizerTest,
+       PushWeightsReshardedMultiHostGlobalScheduleKeys) {
+  const size_t num_layers = 1;
+  const size_t num_shards = 4;
+  const size_t slice_byte_size = 256;
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
+
+  // Multi-host cluster: Source host is host 1 out of 2, owning global shards
+  // {4, 5, 6, 7} with local shard slots {0, 1, 2, 3}.
+  // Controller sends the cluster-wide schedule containing keys 0..7.
+  ws_source->SetGlobalShardIndices({4, 5, 6, 7});
+  ws_source->SetLocalShardIndices({0, 1, 2, 3});
+  ws_dest->SetGlobalShardIndices({0, 1, 2, 3});
+  ws_dest->SetLocalShardIndices({0, 1, 2, 3});
+
+  const uint8_t fill_bytes[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+  for (size_t s = 0; s < num_shards; ++s) {
+    uint8_t* src_ptr = const_cast<uint8_t*>(ws_source->GetHostBufferPtr(0, s));
+    uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostBufferPtr(0, s));
+    ASSERT_NE(src_ptr, nullptr);
+    ASSERT_NE(dst_ptr, nullptr);
+    std::memset(src_ptr, fill_bytes[s], slice_byte_size);
+    std::memset(dst_ptr, 0x00, slice_byte_size);
+  }
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  request.set_uuid(54324);
+
+  auto* schedules = request.mutable_shard_push_schedules();
+  // Populate schedules for all 8 cluster shards (0..7).
+  // Global shards 0..3 belong to host 0; global shards 4..7 belong to host 1.
+  for (size_t g = 0; g < 8; ++g) {
+    auto* entry = (*schedules)[g].add_entries();
+    entry->set_dst_peer(dest_peer);
+    entry->set_dst_shard_idx(g % num_shards);
     entry->set_src_offset_bytes(0);
     entry->set_dst_offset_bytes(0);
     entry->set_size_bytes(slice_byte_size);

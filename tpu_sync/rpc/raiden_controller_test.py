@@ -183,6 +183,65 @@ class RaidenControllerTest(absltest.TestCase):
       server.stop()
       server._thread.join(timeout=2)
 
+  def test_global_shard_indices_registration_round_trip(self):
+    bind_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    bind_sock.bind(("127.0.0.1", 0))
+    port = bind_sock.getsockname()[1]
+    bind_sock.close()
+
+    controller = raiden_controller.RaidenController(port=port)
+    server = raiden_controller.RaidenControllerServer(controller)
+    server.start()
+    facade = raiden_controller.RaidenControllerClientFacade(f"127.0.0.1:{port}")
+    unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+
+    # Variables specify explicit global_shard_indices.
+    # Note: host_subgrid, mesh_axes, and top-level mesh_shape are no longer
+    # necessary.
+    v1 = raiden_service_pb2.VariableMetadataProto(
+        name="weights_0",
+        shape=[128, 1024],
+        mesh_shape=[2, 2],
+        layout=[0, 1],
+        item_size=4,
+        layer_idx=0,
+        global_shard_indices=[0, 2],
+    )
+    v2 = raiden_controller._VariableMetadata(
+        name="weights_1",
+        shape=[512],
+        mesh_shape=[2, 2],
+        layout=[0],
+        item_size=2,
+        layer_idx=1,
+        global_shard_indices=[1, 3],
+    )
+
+    try:
+      facade.register_work_unit(
+          unit,
+          ["127.0.0.1:8100", "127.0.0.1:8101"],
+          control_plane_rpc_address="127.0.0.1:9100",
+          variables=[v1, v2],
+      )
+      metadata = facade.get_metadata()
+      self.assertLen(metadata, 1)
+      self.assertEqual(
+          raiden_controller._raiden_id_from_proto(metadata[0].unit), unit
+      )
+      self.assertLen(metadata[0].variables, 2)
+      self.assertEqual(metadata[0].variables[0].name, "weights_0")
+      self.assertEqual(
+          list(metadata[0].variables[0].global_shard_indices), [0, 2]
+      )
+      self.assertEqual(metadata[0].variables[1].name, "weights_1")
+      self.assertEqual(
+          list(metadata[0].variables[1].global_shard_indices), [1, 3]
+      )
+    finally:
+      server.stop()
+      server._thread.join(timeout=2)
+
   def test_dynamic_balancing_and_overlap_planner(self):
     dummy_client = DummyWorkerRpcClient()
     controller = raiden_controller.RaidenController(
@@ -1682,6 +1741,64 @@ class RaidenControllerTest(absltest.TestCase):
 
 
 class GetGlobalIndicesTest(absltest.TestCase):
+
+  def test_global_shard_indices_bypasses_mesh_geometry(self):
+    unit = raiden_controller.RaidenId("trainer", "1", "weights")
+    shards = ["10.0.0.2:8000"] * 4
+    # Explicit global_shard_indices bypasses all geometry.
+    # Note that host_subgrid, mesh_axes, sharding_spec, and physical_mesh_shape
+    # are all omitted/None, demonstrating they are no longer necessary.
+    indices = raiden_controller._get_global_indices(
+        unit,
+        shards,
+        logical_mesh_shape=[8, 2],
+        layout=[1, 0],
+        num_physical_hosts=4,
+        global_shard_indices=[12, 13, 14, 15],
+    )
+    self.assertEqual(indices, [(0, 12), (1, 13), (2, 14), (3, 15)])
+
+  def test_global_shard_indices_strided_ep_mapping(self):
+    # Strided expert parallelism: host 0 gets shards [0, 2, 4, 6],
+    # host 1 gets shards [1, 3, 5, 7].
+    unit0 = raiden_controller.RaidenId("trainer", "0", "weights")
+    unit1 = raiden_controller.RaidenId("trainer", "1", "weights")
+    shards = ["10.0.0.1:8000"] * 4
+
+    indices0 = raiden_controller._get_global_indices(
+        unit0,
+        shards,
+        logical_mesh_shape=[8],
+        layout=[0],
+        num_physical_hosts=2,
+        global_shard_indices=[0, 2, 4, 6],
+    )
+    self.assertEqual(indices0, [(0, 0), (1, 2), (2, 4), (3, 6)])
+
+    indices1 = raiden_controller._get_global_indices(
+        unit1,
+        shards,
+        logical_mesh_shape=[8],
+        layout=[0],
+        num_physical_hosts=2,
+        global_shard_indices=[1, 3, 5, 7],
+    )
+    self.assertEqual(indices1, [(0, 1), (1, 3), (2, 5), (3, 7)])
+
+  def test_global_shard_indices_mismatched_length_fallback(self):
+    unit = raiden_controller.RaidenId("trainer", "0", "weights")
+    shards = ["10.0.0.1:8000"] * 4
+    # Length of global_shard_indices is 2, while num_shards is 4.
+    # Falls back to legacy geometry calculation without crashing.
+    indices = raiden_controller._get_global_indices(
+        unit,
+        shards,
+        logical_mesh_shape=[1, 4],
+        layout=[1, 0],
+        num_physical_hosts=1,
+        global_shard_indices=[0, 1],
+    )
+    self.assertEqual(indices, [(0, 0), (1, 1), (2, 2), (3, 3)])
 
   def test_single_host(self):
     unit = raiden_controller.RaidenId("trainer", "0", "weights")
@@ -3500,6 +3617,127 @@ class RaidenPlanWarmupTest(absltest.TestCase):
     self.assertEqual(controller.get_plan_cache_size(), 1)
     self.assertLen(client.calls, 8)
 
+  def test_transfer_schedule_with_global_shard_indices_expert_parallelism(
+      self,
+  ):
+    """Verifies routing of strided expert-parallelism shards across hosts.
+
+    Uses global_shard_indices without host_subgrid or mesh_axes.
+    """
+    client = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=0, worker_rpc_client=client, enable_plan_cache=False
+    )
+
+    # 4-way sharded tensor: shape [64, 64], mesh_shape [4, 1], layout [1, 0].
+    # Total 4 slices along dim 0: [0:16], [16:32], [32:48], [48:64].
+    #
+    # Source has 2 hosts, 2 shards each.
+    # Host 0 owns shards [0, 2] (strided EP layout across hosts).
+    # Host 1 owns shards [1, 3].
+    # Neither host specifies host_subgrid, mesh_axes, sharding_spec,
+    # or top-level mesh_shape (obsolete fields).
+    src_unit_0 = raiden_controller.RaidenId("src_ep", "0", "weights", 0)
+    src_var_0 = raiden_service_pb2.VariableMetadataProto(
+        name="experts",
+        shape=[64, 64],
+        mesh_shape=[4, 1],
+        layout=[1, 0],
+        item_size=4,
+        layer_idx=0,
+        global_shard_indices=[0, 2],
+    )
+    controller.register_work_unit(
+        src_unit_0,
+        ["10.0.0.1:8000", "10.0.0.1:8001"],
+        control_plane_rpc_address="10.0.0.1:9000",
+        variables=[src_var_0],
+    )
+
+    src_unit_1 = raiden_controller.RaidenId("src_ep", "1", "weights", 0)
+    src_var_1 = raiden_service_pb2.VariableMetadataProto(
+        name="experts",
+        shape=[64, 64],
+        mesh_shape=[4, 1],
+        layout=[1, 0],
+        item_size=4,
+        layer_idx=0,
+        global_shard_indices=[1, 3],
+    )
+    controller.register_work_unit(
+        src_unit_1,
+        ["10.0.0.2:8000", "10.0.0.2:8001"],
+        control_plane_rpc_address="10.0.0.2:9000",
+        variables=[src_var_1],
+    )
+
+    # Destination has 1 host with 4 shards owning global shards [0, 1, 2, 3].
+    dst_unit_0 = raiden_controller.RaidenId("dst_ep", "0", "weights", 0)
+    dst_var_0 = raiden_service_pb2.VariableMetadataProto(
+        name="experts",
+        shape=[64, 64],
+        mesh_shape=[4, 1],
+        layout=[1, 0],
+        item_size=4,
+        layer_idx=0,
+        global_shard_indices=[0, 1, 2, 3],
+    )
+    controller.register_work_unit(
+        dst_unit_0,
+        [
+            "10.0.1.1:8000",
+            "10.0.1.1:8001",
+            "10.0.1.1:8002",
+            "10.0.1.1:8003",
+        ],
+        control_plane_rpc_address="10.0.1.1:9000",
+        variables=[dst_var_0],
+    )
+
+    loop = asyncio.new_event_loop()
+    try:
+      cached = loop.run_until_complete(
+          controller._compute_transfer_schedule(
+              src_units=[src_unit_0, src_unit_1],
+              dst_units=[dst_unit_0],
+          )
+      )
+    finally:
+      loop.close()
+
+    self.assertIsNotNone(cached)
+    sched = cached.computed_schedules
+
+    # Host 0 local shard 0 (global shard 0) -> dst shard 0
+    self.assertIn(src_unit_0, sched)
+    self.assertIn(0, sched[src_unit_0])
+    push_0_0 = sched[src_unit_0][0]
+    self.assertLen(push_0_0, 1)
+    self.assertEqual(push_0_0[0][0], "10.0.1.1:8000")
+    self.assertEqual(push_0_0[0][1], 0)
+
+    # Host 0 local shard 1 (global shard 2) -> dst shard 2
+    self.assertIn(1, sched[src_unit_0])
+    push_0_1 = sched[src_unit_0][1]
+    self.assertLen(push_0_1, 1)
+    self.assertEqual(push_0_1[0][0], "10.0.1.1:8002")
+    self.assertEqual(push_0_1[0][1], 2)
+
+    # Host 1 local shard 0 (global shard 1) -> dst shard 1
+    self.assertIn(src_unit_1, sched)
+    self.assertIn(0, sched[src_unit_1])
+    push_1_0 = sched[src_unit_1][0]
+    self.assertLen(push_1_0, 1)
+    self.assertEqual(push_1_0[0][0], "10.0.1.1:8001")
+    self.assertEqual(push_1_0[0][1], 1)
+
+    # Host 1 local shard 1 (global shard 3) -> dst shard 3
+    self.assertIn(1, sched[src_unit_1])
+    push_1_1 = sched[src_unit_1][1]
+    self.assertLen(push_1_1, 1)
+    self.assertEqual(push_1_1[0][0], "10.0.1.1:8003")
+    self.assertEqual(push_1_1[0][1], 3)
+
   def test_worker_rpc_client_executor_concurrency_defaults_to_at_least_128(
       self,
   ):
@@ -3887,6 +4125,66 @@ class WeightSyncReceiverAndCacheLeakTest(absltest.TestCase):
     rid = raiden_controller.RaidenId("job", "0", "weights", 0)
     self.assertFalse(hasattr(rid, "__dict__"))
 
+  def test_multi_host_receiver_endpoint_counts_specialization(self):
+    ws_client = raiden_controller.WeightSyncWorkerRpcClient()
+    dst_unit = raiden_controller.RaidenId("rollout", "", "weights", 0)
+    src_unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+    plan = raiden_controller.TransferPlan(
+        src_units=[src_unit],
+        dst_units=[dst_unit],
+        plan=None,
+        worker_data_addresses={
+            dst_unit: ["10.0.1.2:8001", "10.0.1.3:8001"],
+            src_unit: ["10.0.1.1:8001"],
+        },
+        use_block_chunks=True,
+        is_sender=True,
+        expected_block_count=200,
+        dst_expected_block_counts={dst_unit: 200},
+        dst_endpoint_counts={
+            "10.0.1.2": 120,
+            "10.0.1.3": 80,
+        },
+        dst_endpoint_layer_counts={
+            "10.0.1.2": {0: 60, 1: 60},
+            "10.0.1.3": {0: 40, 1: 40},
+        },
+        is_weight_sync=True,
+    )
+    try:
+      dst_bytes_host2 = ws_client._encode_start_transfer(
+          dst_unit, plan, address="10.0.1.2:8000"
+      )
+      req2 = raiden_service_pb2.ControlRequest()
+      req2.ParseFromString(dst_bytes_host2)
+      start_dst2 = req2.start_transfer_request
+      self.assertFalse(start_dst2.is_sender)
+      self.assertEqual(start_dst2.expected_block_count, 120)
+      self.assertEqual(
+          dict(start_dst2.expected_layer_chunk_counts), {0: 60, 1: 60}
+      )
+
+      dst_bytes_host3 = ws_client._encode_start_transfer(
+          dst_unit, plan, address="10.0.1.3:8000"
+      )
+      req3 = raiden_service_pb2.ControlRequest()
+      req3.ParseFromString(dst_bytes_host3)
+      start_dst3 = req3.start_transfer_request
+      self.assertFalse(start_dst3.is_sender)
+      self.assertEqual(start_dst3.expected_block_count, 80)
+      self.assertEqual(
+          dict(start_dst3.expected_layer_chunk_counts), {0: 40, 1: 40}
+      )
+
+      dst_bytes_default = ws_client._encode_start_transfer(dst_unit, plan)
+      req_default = raiden_service_pb2.ControlRequest()
+      req_default.ParseFromString(dst_bytes_default)
+      self.assertEqual(
+          req_default.start_transfer_request.expected_block_count, 200
+      )
+    finally:
+      ws_client.close()
+
   def test_source_ephemeral_port_reregistration_preserves_plan_cache(self):
     client = RecordingWorkerRpcClient()
     controller = raiden_controller.RaidenController(
@@ -4043,6 +4341,167 @@ class WeightSyncReceiverAndCacheLeakTest(absltest.TestCase):
                 group_size=invalid_group_size,
             )
         )
+
+  def test_ep_multi_host_dst_endpoint_counts_matches_push_tasks(self):
+    """Verifies dst_endpoint_counts exactly matches tasks dispatched for EP and replicated tensors."""
+    client = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(
+        port=0, worker_rpc_client=client, enable_plan_cache=False
+    )
+
+    # Source has 1 unit with 4 shards:
+    # 1. Sharded EP tensor: [64, 64], mesh [4, 1], layout [1, 0]
+    # 2. Replicated tensor: [32, 32], mesh [1, 1], layout [1, 0]
+    src_unit = raiden_controller.RaidenId("src", "0", "weights", 0)
+    src_var_ep = raiden_service_pb2.VariableMetadataProto(
+        name="experts",
+        shape=[64, 64],
+        mesh_shape=[4, 1],
+        layout=[1, 0],
+        item_size=4,
+        layer_idx=0,
+        global_shard_indices=[0, 1, 2, 3],
+    )
+    src_var_rep = raiden_service_pb2.VariableMetadataProto(
+        name="attention",
+        shape=[32, 32],
+        mesh_shape=[1, 1],
+        layout=[1, 0],
+        item_size=4,
+        layer_idx=1,
+        global_shard_indices=[0, 0, 0, 0],
+    )
+    controller.register_work_unit(
+        src_unit,
+        ["10.0.0.1:8000", "10.0.0.1:8001", "10.0.0.1:8002", "10.0.0.1:8003"],
+        control_plane_rpc_address="10.0.0.1:9000",
+        variables=[src_var_ep, src_var_rep],
+    )
+
+    # Destination has 2 hosts, 2 shards each, with strided EP global_shard_indices:
+    # Host 0 (IP 10.0.1.1): global_shard_indices [0, 2]
+    # Host 1 (IP 10.0.1.2): global_shard_indices [1, 3]
+    dst_unit_0 = raiden_controller.RaidenId("dst", "0", "weights", 0)
+    dst_var_ep_0 = raiden_service_pb2.VariableMetadataProto(
+        name="experts",
+        shape=[64, 64],
+        mesh_shape=[4, 1],
+        layout=[1, 0],
+        item_size=4,
+        layer_idx=0,
+        global_shard_indices=[0, 2],
+    )
+    dst_var_rep_0 = raiden_service_pb2.VariableMetadataProto(
+        name="attention",
+        shape=[32, 32],
+        mesh_shape=[1, 1],
+        layout=[1, 0],
+        item_size=4,
+        layer_idx=1,
+        global_shard_indices=[0, 0],
+    )
+    controller.register_work_unit(
+        dst_unit_0,
+        ["10.0.1.1:8000", "10.0.1.1:8001"],
+        control_plane_rpc_address="10.0.1.1:9000",
+        variables=[dst_var_ep_0, dst_var_rep_0],
+    )
+
+    dst_unit_1 = raiden_controller.RaidenId("dst", "1", "weights", 0)
+    dst_var_ep_1 = raiden_service_pb2.VariableMetadataProto(
+        name="experts",
+        shape=[64, 64],
+        mesh_shape=[4, 1],
+        layout=[1, 0],
+        item_size=4,
+        layer_idx=0,
+        global_shard_indices=[1, 3],
+    )
+    dst_var_rep_1 = raiden_service_pb2.VariableMetadataProto(
+        name="attention",
+        shape=[32, 32],
+        mesh_shape=[1, 1],
+        layout=[1, 0],
+        item_size=4,
+        layer_idx=1,
+        global_shard_indices=[0, 0],
+    )
+    controller.register_work_unit(
+        dst_unit_1,
+        ["10.0.1.2:8000", "10.0.1.2:8001"],
+        control_plane_rpc_address="10.0.1.2:9000",
+        variables=[dst_var_ep_1, dst_var_rep_1],
+    )
+
+    loop = asyncio.new_event_loop()
+    try:
+      cached = loop.run_until_complete(
+          controller._compute_transfer_schedule(
+              src_units=[src_unit],
+              dst_units=[dst_unit_0, dst_unit_1],
+          )
+      )
+    finally:
+      loop.close()
+
+    self.assertIsNotNone(cached)
+    self.assertIn("10.0.1.1", cached.dst_endpoint_counts)
+    self.assertIn("10.0.1.2", cached.dst_endpoint_counts)
+
+    # Count tasks actually in direct_schedules targeting each host
+    host_tasks = {}
+    for s_unit, scheds in cached.direct_schedules.items():
+      for shard_idx, entries in scheds.items():
+        for entry in entries:
+          dst_peer = entry[0]
+          dst_host = raiden_controller._extract_host_ip(dst_peer)
+          size = entry[4]
+          src_stride = entry[7]
+          dst_stride = entry[8]
+          count = entry[9]
+          is_contiguous = (count == 1) or (
+              src_stride == size and dst_stride == size
+          )
+          tasks_count = 1 if is_contiguous else count
+          host_tasks[dst_host] = host_tasks.get(dst_host, 0) + tasks_count
+
+    for host, expected_count in cached.dst_endpoint_counts.items():
+      self.assertEqual(
+          expected_count,
+          host_tasks.get(host, 0),
+          f"Mismatch in expected tasks for host {host}",
+      )
+
+    # Also verify that when _encode_start_transfer is called with the host's control-plane address,
+    # the StartTransferRequest carries the customized expected_block_count.
+    ws_client = raiden_controller.WeightSyncWorkerRpcClient()
+    try:
+      plan = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit_0, dst_unit_1],
+          plan=None,
+          shard_push_schedules=cached.direct_schedules,
+          worker_data_addresses=cached.data_addresses,
+          use_block_chunks=True,
+          is_sender=False,
+          expected_block_count=cached.expected_block_count,
+          dst_expected_block_counts=cached.dst_unit_counts,
+          dst_endpoint_counts=cached.dst_endpoint_counts,
+          dst_endpoint_layer_counts=cached.dst_endpoint_layer_counts,
+          is_weight_sync=True,
+      )
+      for dst_unit, host in [(dst_unit_0, "10.0.1.1"), (dst_unit_1, "10.0.1.2")]:
+        encoded = ws_client._encode_start_transfer(
+            dst_unit, plan, address=f"{host}:9000"
+        )
+        req = raiden_service_pb2.ControlRequest()
+        req.ParseFromString(encoded)
+        self.assertEqual(
+            req.start_transfer_request.expected_block_count,
+            cached.dst_endpoint_counts[host],
+        )
+    finally:
+      ws_client.close()
 
 
 if __name__ == "__main__":

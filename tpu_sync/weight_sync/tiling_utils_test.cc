@@ -481,6 +481,182 @@ TEST(TilingUtilsTest, Standard1DContiguous) {
   }
 }
 
+TEST(TilingUtilsTest, IsStandardRowMajorTiled) {
+  // 1D shape with 1D tile.
+  xla::Shape shape_1d_1d = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {4096}, {0}, {xla::Tile({128})});
+  EXPECT_TRUE(IsStandardRowMajorTiled(shape_1d_1d, shape_1d_1d.layout()));
+
+  // 1D shape with 2D tile.
+  xla::Shape shape_1d_2d = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {4096}, {0}, {xla::Tile({8, 128})});
+  EXPECT_TRUE(IsStandardRowMajorTiled(shape_1d_2d, shape_1d_2d.layout()));
+
+  // 1D shape with 2-level 2D tile.
+  xla::Shape shape_1d_packed = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {4096}, {0},
+      {xla::Tile({8, 128}), xla::Tile({2, 1})});
+  EXPECT_TRUE(
+      IsStandardRowMajorTiled(shape_1d_packed, shape_1d_packed.layout()));
+
+  // 1D shape with degenerate tile dimensions (zero or negative).
+  xla::Shape shape_1d_zero = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {4096}, {0});
+  shape_1d_zero.mutable_layout()->clear_tiles();
+  shape_1d_zero.mutable_layout()->add_tiles()->add_dimensions(0);
+  EXPECT_FALSE(IsStandardRowMajorTiled(shape_1d_zero, shape_1d_zero.layout()));
+
+  xla::Shape shape_1d_neg = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {4096}, {0});
+  shape_1d_neg.mutable_layout()->clear_tiles();
+  shape_1d_neg.mutable_layout()->add_tiles()->add_dimensions(-1);
+  EXPECT_FALSE(IsStandardRowMajorTiled(shape_1d_neg, shape_1d_neg.layout()));
+
+  // 2D shape with 1D tile should NOT be standard row-major tiled (requires 2D
+  // tile).
+  xla::Shape shape_2d_1d = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {256, 512}, {1, 0}, {xla::Tile({128})});
+  EXPECT_FALSE(IsStandardRowMajorTiled(shape_2d_1d, shape_2d_1d.layout()));
+
+  // 2D shape with 2D tile.
+  xla::Shape shape_2d_2d = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {256, 512}, {1, 0}, {xla::Tile({8, 128})});
+  EXPECT_TRUE(IsStandardRowMajorTiled(shape_2d_2d, shape_2d_2d.layout()));
+
+  // Non-row-major 2D layout (column-major {0, 1}).
+  xla::Shape shape_2d_col = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {256, 512}, {0, 1}, {xla::Tile({8, 128})});
+  EXPECT_FALSE(IsStandardRowMajorTiled(shape_2d_col, shape_2d_col.layout()));
+}
+
+TEST(TilingUtilsTest, Standard1DSingleDimensionTile) {
+  const int64_t W = 4096;
+  xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {W}, {0}, {xla::Tile({128})});
+
+  EXPECT_TRUE(IsStandardRowMajorTiled(shape, shape.layout()));
+  EXPECT_EQ(GetTiledBufferElements(shape), W);
+
+  std::vector<uint16_t> src_linear(W);
+  for (int i = 0; i < W; ++i) {
+    src_linear[i] = static_cast<uint16_t>(i);
+  }
+
+  std::vector<uint8_t> dst_tiled(W * sizeof(uint16_t));
+  absl::Status tile_status =
+      TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
+                 dst_tiled.data(), shape, shape.layout());
+  EXPECT_TRUE(tile_status.ok()) << tile_status.ToString();
+
+  // Verify byte-for-byte equivalence against XLA nested tiling reference.
+  for (int64_t i = 0; i < W; ++i) {
+    int64_t ref_phys_idx =
+        xla::LayoutUtil::LinearIndexForNestedTiling(shape, {i});
+    uint16_t actual_val =
+        reinterpret_cast<const uint16_t*>(dst_tiled.data())[ref_phys_idx];
+    EXPECT_EQ(actual_val, src_linear[i])
+        << "Physical mismatch at element " << i;
+  }
+
+  std::vector<uint16_t> dst_linear(W, 0);
+  absl::Status detile_status = DetileBuffer(
+      dst_tiled.data(), reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
+      shape.layout());
+  EXPECT_TRUE(detile_status.ok()) << detile_status.ToString();
+
+  for (int i = 0; i < W; ++i) {
+    EXPECT_EQ(dst_linear[i], src_linear[i]) << "Mismatch at index " << i;
+  }
+}
+
+TEST(TilingUtilsTest, Standard1DSingleDimensionTileWithPadding) {
+  // 1D tensor shape 250 with 1D tile 128: Ceil(250 / 128) = 2 tiles -> 256
+  // physical elements.
+  const int64_t W = 250;
+  xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {W}, {0}, {xla::Tile({128})});
+
+  EXPECT_TRUE(IsStandardRowMajorTiled(shape, shape.layout()));
+  int64_t tiled_elements = GetTiledBufferElements(shape);
+  EXPECT_EQ(tiled_elements, 256);
+
+  std::vector<uint16_t> src_linear(W);
+  for (int i = 0; i < W; ++i) {
+    src_linear[i] = static_cast<uint16_t>(i + 7);
+  }
+
+  std::vector<uint8_t> dst_tiled(tiled_elements * sizeof(uint16_t));
+  absl::Status tile_status =
+      TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
+                 dst_tiled.data(), shape, shape.layout());
+  EXPECT_TRUE(tile_status.ok()) << tile_status.ToString();
+
+  // Verify elements 0..249 match XLA nested tiling reference.
+  const uint16_t* dst_tiled_bf16 =
+      reinterpret_cast<const uint16_t*>(dst_tiled.data());
+  for (int64_t i = 0; i < W; ++i) {
+    int64_t ref_phys_idx =
+        xla::LayoutUtil::LinearIndexForNestedTiling(shape, {i});
+    EXPECT_EQ(dst_tiled_bf16[ref_phys_idx], src_linear[i])
+        << "Physical mismatch at element " << i;
+  }
+
+  // Verify padding elements 250..255 are zeroed.
+  for (int64_t i = 250; i < 256; ++i) {
+    EXPECT_EQ(dst_tiled_bf16[i], 0) << "Padding not zeroed at " << i;
+  }
+
+  std::vector<uint16_t> dst_linear(W, 0);
+  absl::Status detile_status = DetileBuffer(
+      dst_tiled.data(), reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
+      shape.layout());
+  EXPECT_TRUE(detile_status.ok()) << detile_status.ToString();
+
+  for (int i = 0; i < W; ++i) {
+    EXPECT_EQ(dst_linear[i], src_linear[i]) << "Mismatch at index " << i;
+  }
+}
+
+TEST(TilingUtilsTest, Standard1DSingleDimensionTileSmall) {
+  // Shape 17 with tile 128: 1 tile -> 128 elements.
+  const int64_t W = 17;
+  xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::F32, {W}, {0}, {xla::Tile({128})});
+
+  EXPECT_TRUE(IsStandardRowMajorTiled(shape, shape.layout()));
+  int64_t tiled_elements = GetTiledBufferElements(shape);
+  EXPECT_EQ(tiled_elements, 128);
+
+  std::vector<float> src_linear(W);
+  for (int i = 0; i < W; ++i) {
+    src_linear[i] = static_cast<float>(i * 1.5f);
+  }
+
+  std::vector<uint8_t> dst_tiled(tiled_elements * sizeof(float));
+  absl::Status tile_status =
+      TileBuffer(reinterpret_cast<const uint8_t*>(src_linear.data()),
+                 dst_tiled.data(), shape, shape.layout());
+  EXPECT_TRUE(tile_status.ok()) << tile_status.ToString();
+
+  const float* dst_tiled_f32 = reinterpret_cast<const float*>(dst_tiled.data());
+  for (int64_t i = 0; i < W; ++i) {
+    EXPECT_EQ(dst_tiled_f32[i], src_linear[i]);
+  }
+  for (int64_t i = W; i < tiled_elements; ++i) {
+    EXPECT_EQ(dst_tiled_f32[i], 0.0f) << "Padding not zeroed at index " << i;
+  }
+
+  std::vector<float> dst_linear(W, 0.0f);
+  absl::Status detile_status = DetileBuffer(
+      dst_tiled.data(), reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
+      shape.layout());
+  EXPECT_TRUE(detile_status.ok()) << detile_status.ToString();
+
+  for (int i = 0; i < W; ++i) {
+    EXPECT_EQ(dst_linear[i], src_linear[i]) << "Mismatch at index " << i;
+  }
+}
+
 TEST(TilingUtilsTest, Standard1DWithTilePadding) {
   // 1D tensor with tile (8, 128) where W = 300 (has horizontal and vertical
   // tile padding).
@@ -488,6 +664,7 @@ TEST(TilingUtilsTest, Standard1DWithTilePadding) {
   xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
       xla::PrimitiveType::BF16, {W}, {0}, {xla::Tile({8, 128})});
 
+  EXPECT_TRUE(IsStandardRowMajorTiled(shape, shape.layout()));
   int64_t tiled_elements = GetTiledBufferElements(shape);
   // Ceil(1/8)=1, Ceil(300/128)=3 => 1 * 3 * 8 * 128 = 3072 elements.
   EXPECT_EQ(tiled_elements, 3072);
@@ -503,6 +680,16 @@ TEST(TilingUtilsTest, Standard1DWithTilePadding) {
                  dst_tiled.data(), shape, shape.layout());
   EXPECT_TRUE(tile_status.ok()) << tile_status.ToString();
 
+  // Verify byte-for-byte equivalence against XLA nested tiling reference.
+  const uint16_t* dst_tiled_bf16 =
+      reinterpret_cast<const uint16_t*>(dst_tiled.data());
+  for (int64_t i = 0; i < W; ++i) {
+    int64_t ref_phys_idx =
+        xla::LayoutUtil::LinearIndexForNestedTiling(shape, {i});
+    EXPECT_EQ(dst_tiled_bf16[ref_phys_idx], src_linear[i])
+        << "Physical mismatch at element " << i;
+  }
+
   std::vector<uint16_t> dst_linear(W, 0);
   absl::Status detile_status = DetileBuffer(
       dst_tiled.data(), reinterpret_cast<uint8_t*>(dst_linear.data()), shape,
@@ -512,6 +699,18 @@ TEST(TilingUtilsTest, Standard1DWithTilePadding) {
   for (int i = 0; i < W; ++i) {
     EXPECT_EQ(dst_linear[i], src_linear[i]) << "Mismatch at index " << i;
   }
+}
+
+TEST(TilingUtilsTest, DegenerateTileDimensionsSafe) {
+  // Shape 128 with tile {0} (degenerate tile dimension)
+  xla::Shape shape_zero = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {128}, {0});
+  shape_zero.mutable_layout()->clear_tiles();
+  shape_zero.mutable_layout()->add_tiles()->add_dimensions(0);
+
+  EXPECT_FALSE(IsStandardRowMajorTiled(shape_zero, shape_zero.layout()));
+  // GetTiledBufferElements must not divide by zero
+  EXPECT_EQ(GetTiledBufferElements(shape_zero), 128);
 }
 
 TEST(TilingUtilsTest, SingleColumn2DContiguous) {

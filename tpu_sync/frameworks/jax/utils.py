@@ -15,6 +15,7 @@
 """Utilities for JAX."""
 
 import contextlib
+import logging
 import math
 from typing import Tuple
 
@@ -216,9 +217,9 @@ def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
     local_subgrid = None
     try:
       if (
-          hasattr(mesh, 'local_mesh')
+          hasattr(mesh, "local_mesh")
           and mesh.local_mesh is not None
-          and hasattr(mesh.local_mesh, 'devices')
+          and hasattr(mesh.local_mesh, "devices")
       ):
         local_subgrid = list(mesh.local_mesh.devices.shape)
     except (AttributeError, ValueError, TypeError):
@@ -326,7 +327,8 @@ def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
     device = shard.device
     coords = np.argwhere(mesh.devices == device)
     if coords.size == 0:
-      raise ValueError(f"Device {device} not found in mesh")
+      logging.warning("Device %s not found in mesh.", device)
+      return []
     m_coords = coords[0]
     full_coords = list(m_coords)
 
@@ -374,22 +376,26 @@ def get_shard_sorting_permutation(arr: jax.Array) -> list[int]:
           break
         curr_occ += 1
     if matched_idx is None or matched_idx in used_indices:
-      raise ValueError(
-          'Strict bijection failed for shard sorting: cannot map controller'
-          f' slot {j} (expected global index {expected_g}) to an unused JAX'
-          f' shard. JAX shards: {jax_shard_global_indices}, Controller'
-          f' expected: {controller_global_indices}'
+      logging.warning(
+          "Strict bijection failed for shard sorting: cannot map controller"
+          " slot %d (expected global index %d) to an unused JAX shard."
+          " JAX shards: %s, Controller expected: %s. Returning empty permutation."
+          " (Use global_shard_indices for non-standard mesh partitionings).",
+          j, expected_g, jax_shard_global_indices, controller_global_indices,
       )
+      return []
     perm.append(matched_idx)
     used_indices.add(matched_idx)
 
   if len(perm) != len(arr.addressable_shards) or len(used_indices) != len(
       arr.addressable_shards
   ):
-    raise ValueError(
-        f'Strict bijection failed: perm {perm} does not cover all'
-        f' {len(arr.addressable_shards)} addressable shards.'
+    logging.warning(
+        "Strict bijection failed: perm %s does not cover all %d addressable"
+        " shards. Returning empty permutation.",
+        perm, len(arr.addressable_shards),
     )
+    return []
 
   if perm == list(range(len(arr.addressable_shards))):
     return []

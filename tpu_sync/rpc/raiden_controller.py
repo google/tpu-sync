@@ -41,6 +41,17 @@ from tpu_sync.weight_sync.broadcast_engine import (
 
 @dataclasses.dataclass
 class _VariableMetadata:
+  """Metadata for a variable registered on a worker.
+
+  When global_shard_indices is provided, each entry
+  corresponds to the global shard index owned by the local shard at that index.
+  In this mode:
+    - host_subgrid is no longer necessary.
+    - mesh_axes is no longer necessary.
+    - sharding_spec is no longer necessary.
+    - top-level mesh_shape is no longer necessary.
+  """
+
   name: str
   shape: list[int]
   mesh_shape: list[int]
@@ -48,6 +59,23 @@ class _VariableMetadata:
   item_size: int
   layer_idx: int
   sharding_spec: list[str] = dataclasses.field(default_factory=list)
+  global_shard_indices: list[int] = dataclasses.field(default_factory=list)
+
+
+def _coerce_variable_proto(var: Any, proto_module=raiden_service_pb2) -> Any:
+  """Coerces _VariableMetadata or proto into a VariableMetadataProto."""
+  if isinstance(var, proto_module.VariableMetadataProto):
+    return var
+  return proto_module.VariableMetadataProto(
+      name=var.name,
+      shape=var.shape,
+      mesh_shape=var.mesh_shape,
+      layout=var.layout,
+      item_size=var.item_size,
+      layer_idx=var.layer_idx,
+      sharding_spec=getattr(var, "sharding_spec", []),
+      global_shard_indices=getattr(var, "global_shard_indices", []),
+  )
 
 
 def _is_variable_spec_identical(
@@ -76,6 +104,10 @@ class _CachedTransferSchedule:
   rpc_addresses: dict[Any, str]
   data_addresses: dict[Any, list[str]]
   dst_unit_counts: dict[Any, int] = dataclasses.field(default_factory=dict)
+  dst_endpoint_counts: dict[str, int] = dataclasses.field(default_factory=dict)
+  dst_endpoint_layer_counts: dict[str, dict[int, int]] = dataclasses.field(
+      default_factory=dict
+  )
   is_weight_sync: bool = False
   sender_push_schedule_protos: dict[Any, dict[int, Any]] = dataclasses.field(
       default_factory=dict
@@ -98,6 +130,18 @@ def to_physical(logical_shape, logical_mesh_shape, minor_to_major):
     )
     physical_mesh_shape = tuple(logical_mesh_shape[d] for d in major_to_minor)
   return physical_shape, physical_mesh_shape
+
+
+def _extract_host_ip(addr: str) -> str:
+  """Extracts the IP address or host string from an endpoint (host:port)."""
+  if not addr:
+    return ""
+  addr = addr.strip()
+  if addr.startswith("[") and "]" in addr:
+    return addr[1 : addr.index("]")]
+  if ":" in addr:
+    return addr.rsplit(":", 1)[0]
+  return addr
 
 
 class NameResolver(typing.Protocol):
@@ -219,11 +263,52 @@ def _get_global_indices(
     mesh_axes: Optional[list[str]] = None,
     physical_mesh_shape: Optional[list[int]] = None,
     host_subgrid: Optional[list[int]] = None,
+    global_shard_indices: Optional[list[int]] = None,
 ) -> list[tuple[int, int]]:
-  """Maps local shard indices to global slice indices, handling replication."""
+  """Maps local shard indices to global slice indices, handling replication.
+
+  When global_shard_indices is provided, this function
+  bypasses all mesh geometry, subgrid calculation, and coordinate mapping,
+  directly returning the 1:1 mapping between local shards and their declared
+  global slice indices.
+
+  Note: When global_shard_indices is used:
+    - host_subgrid is no longer necessary.
+    - mesh_axes is no longer necessary.
+    - sharding_spec is no longer necessary.
+    - physical_mesh_shape is no longer necessary.
+    - num_physical_hosts, layout, and logical_mesh_shape are not used for index
+      calculation.
+
+  Args:
+    unit: The RaidenId of the work unit.
+    shards: List of data-plane shard endpoint strings.
+    logical_mesh_shape: Logical device mesh dimensions.
+    layout: Shard dimension permutation mapping.
+    num_physical_hosts: Total physical host count.
+    sharding_spec: Optional axis names for sharding dimensions.
+    mesh_axes: Optional named mesh axis labels.
+    physical_mesh_shape: Physical topology shape.
+    host_subgrid: Host device coordinate subgrid bounding box.
+    global_shard_indices: Explicit vector of global shard indices.
+
+  Returns:
+    List of (local_shard_idx, global_slice_idx) pairs.
+  """
   num_shards = len(shards)
   if num_shards == 0:
     return []
+
+  if global_shard_indices is not None:
+    if len(global_shard_indices) == num_shards:
+      return [(j, int(g_idx)) for j, g_idx in enumerate(global_shard_indices)]
+    logging.warning(
+        "global_shard_indices length (%d) does not match num_shards (%d) for"
+        " unit %s. Falling back to mesh geometry calculation.",
+        len(global_shard_indices),
+        num_shards,
+        unit,
+    )
 
   try:
     replica_id = int(unit.job_replica_id)
@@ -439,6 +524,10 @@ class TransferPlan:
       dataclasses.field(default_factory=dict)
   )
   dst_expected_block_counts: dict[RaidenId, int] = dataclasses.field(
+      default_factory=dict
+  )
+  dst_endpoint_counts: dict[str, int] = dataclasses.field(default_factory=dict)
+  dst_endpoint_layer_counts: dict[str, dict[int, int]] = dataclasses.field(
       default_factory=dict
   )
   is_weight_sync: bool = False
@@ -732,19 +821,28 @@ class WorkerRpcClient:
       RuntimeError: If remote servicer socket connection fails, or if remote
         native execution reports failure status.
     """
-    try:
-      payload = self._encode_start_transfer(target_id, transfer_plan)
-      if not payload:
-        return
-    except NotImplementedError:
-      return
     if address:
       addrs = [a.strip() for a in address.split(",") if a.strip()]
     else:
       addrs = await self._resolve_endpoints(target_id)
-    await asyncio.gather(
-        *[self._send_and_verify(addr, payload) for addr in addrs]
-    )
+
+    coros = []
+    for addr in addrs:
+      try:
+        try:
+          payload = self._encode_start_transfer(
+              target_id, transfer_plan, address=addr
+          )
+        except TypeError:
+          payload = self._encode_start_transfer(target_id, transfer_plan)
+        if not payload:
+          continue
+      except NotImplementedError:
+        continue
+      coros.append(self._send_and_verify(addr, payload))
+
+    if coros:
+      await asyncio.gather(*coros)
 
   async def _send_and_verify(self, addr: str, payload: bytes) -> None:
     resp_bytes = await self._send_rpc(addr, payload, timeout=1800.0)
@@ -759,13 +857,18 @@ class WorkerRpcClient:
     )
 
   def _encode_start_transfer(
-      self, target_id: RaidenId, transfer_plan: TransferPlan
+      self,
+      target_id: RaidenId,
+      transfer_plan: TransferPlan,
+      address: Optional[str] = None,
   ) -> Optional[bytes]:
     """Serializes domain-specific binary Protobuf command for collective transfer kickoff.
 
     Args:
       target_id: Target worker RaidenId coordinate.
       transfer_plan: Top-level distributed Collective Transfer execution plan.
+      address: Optional explicit worker control-plane address to specialize
+        expected block counts for multi-host destinations.
 
     Returns:
       Serialized binary bytes payload, or None for no-op execution.
@@ -789,6 +892,27 @@ class WorkerRpcClient:
     )
 
     is_sender = target_id in transfer_plan.src_units and transfer_plan.is_sender
+    expected_block_count = transfer_plan.dst_expected_block_counts.get(
+        target_id, transfer_plan.expected_block_count
+    )
+    layer_counts = transfer_plan.dst_expected_layer_chunk_counts.get(
+        target_id, transfer_plan.expected_layer_chunk_counts
+    )
+    if not is_sender and address:
+      host_ip = _extract_host_ip(address)
+      if host_ip in getattr(transfer_plan, "dst_endpoint_counts", {}):
+        expected_block_count = transfer_plan.dst_endpoint_counts[host_ip]
+        logging.info(
+            "Target %s: customized expected_block_count=%d for receiver"
+            " endpoint %s (host=%s)",
+            target_id,
+            expected_block_count,
+            address,
+            host_ip,
+        )
+      if host_ip in getattr(transfer_plan, "dst_endpoint_layer_counts", {}):
+        layer_counts = transfer_plan.dst_endpoint_layer_counts[host_ip]
+
     start_req = self._proto_module.StartTransferRequest(
         src_units=[
             self._raiden_id_to_proto(u) for u in transfer_plan.src_units
@@ -800,9 +924,7 @@ class WorkerRpcClient:
         is_sender=is_sender,
         dst_mem_type=int(transfer_plan.dst_mem_type),
         use_block_chunks=transfer_plan.use_block_chunks,
-        expected_block_count=transfer_plan.dst_expected_block_counts.get(
-            target_id, transfer_plan.expected_block_count
-        ),
+        expected_block_count=expected_block_count,
         req_id=transfer_plan.req_id,
         transfer_pool_indices=transfer_plan.transfer_pool_indices,
         pool_dtype_tags=transfer_plan.pool_dtype_tags,
@@ -812,9 +934,6 @@ class WorkerRpcClient:
     for layer_idx, skip in transfer_plan.skip_tiling.items():
       start_req.skip_tiling[layer_idx] = skip
 
-    layer_counts = transfer_plan.dst_expected_layer_chunk_counts.get(
-        target_id, transfer_plan.expected_layer_chunk_counts
-    )
     for layer_idx, count in layer_counts.items():
       start_req.expected_layer_chunk_counts[layer_idx] = count
 
@@ -1552,7 +1671,8 @@ class RaidenController:
       unit: Work unit identifier owning the data shards.
       shards: list of physical Data TCP addresses (e.g. 'IP:Port').
       control_plane_rpc_address: Optional worker Control-Plane RPC endpoint.
-      mesh_shape: Optional logical mesh shape for reshard planning.
+      mesh_shape: Optional logical mesh shape for reshard planning. (Obsolete
+        when variables specify global_shard_indices).
       layout: Optional minor-to-major mapping layout.
       global_shape: Optional global array shape.
       itemsize: Optional item size in bytes.
@@ -1563,8 +1683,10 @@ class RaidenController:
       transfer_rank: Optional transfer rank.
       variables: Optional list of registered variables metadata.
       mesh_axes: Optional list of mesh axis names (e.g. ['fsdp', 'tp']).
+        (Obsolete when variables specify global_shard_indices).
       host_subgrid: Optional ground-truth local host subgrid shape from JAX
-        (mesh.local_mesh).
+        (mesh.local_mesh). (Obsolete when variables specify
+        global_shard_indices).
     """
     has_metadata = (
         mesh_shape is not None or layout is not None or global_shape is not None
@@ -2052,7 +2174,7 @@ class RaidenController:
               d_slices = computed_slices.get(reference_dst_unit, {}).get(
                   dst_var.name, []
               )
-              all_aligned = True
+              all_aligned = bool(s_slices) and bool(d_slices)
               for s_proto in s_slices:
                 s_sl = _proto_to_nd_slice(s_proto)
                 for d_proto in d_slices:
@@ -2066,8 +2188,11 @@ class RaidenController:
                       break
                 if not all_aligned:
                   break
-              is_2d_identical = is_identical and len(src_var.shape) >= 2
-              local_skip_tiling[layer_idx] = is_2d_identical or all_aligned
+              is_2d_or_more = len(src_var.shape) >= 2
+              is_2d_identical = is_identical and is_2d_or_more
+              local_skip_tiling[layer_idx] = is_2d_or_more and (
+                  is_2d_identical or all_aligned
+              )
 
       # Pre-index source slice holders to deduplicate and load-balance
       # across replicated source shards.
@@ -2091,6 +2216,11 @@ class RaidenController:
           s_slices_list = computed_slices.get(s_unit, {}).get(s_var.name)
           if not s_slices_list:
             continue
+          s_global_shard_indices = (
+              list(s_var.global_shard_indices)
+              if getattr(s_var, "global_shard_indices", None)
+              else None
+          )
           s_indices_list = _get_global_indices(
               s_unit,
               s_shards,
@@ -2101,6 +2231,7 @@ class RaidenController:
               mesh_axes=s_mesh_axes,
               physical_mesh_shape=s_phys_mesh,
               host_subgrid=s_host_subgrid,
+              global_shard_indices=s_global_shard_indices,
           )
           for l_s_idx, g_s_idx in s_indices_list:
             if g_s_idx < len(s_slices_list):
@@ -2160,6 +2291,11 @@ class RaidenController:
           src_logical_mesh = list(src_var.mesh_shape)
           src_layout = list(src_var.layout)
 
+          src_global_shard_indices = (
+              list(src_var.global_shard_indices)
+              if getattr(src_var, "global_shard_indices", None)
+              else None
+          )
           src_indices = _get_global_indices(
               src_unit,
               src_shards,
@@ -2170,6 +2306,7 @@ class RaidenController:
               mesh_axes=src_mesh_axes,
               physical_mesh_shape=src_phys_mesh_shape,
               host_subgrid=src_host_subgrid,
+              global_shard_indices=src_global_shard_indices,
           )
 
           for local_src_idx, global_src_idx in src_indices:
@@ -2222,6 +2359,11 @@ class RaidenController:
               dst_logical_mesh = list(dst_var.mesh_shape)
               dst_layout = list(dst_var.layout)
 
+              dst_global_shard_indices = (
+                  list(dst_var.global_shard_indices)
+                  if getattr(dst_var, "global_shard_indices", None)
+                  else None
+              )
               dst_indices = _get_global_indices(
                   dst_unit,
                   dst_shards,
@@ -2232,6 +2374,7 @@ class RaidenController:
                   mesh_axes=dst_mesh_axes,
                   physical_mesh_shape=dst_phys_mesh_shape,
                   host_subgrid=dst_host_subgrid,
+                  global_shard_indices=dst_global_shard_indices,
               )
 
               for local_dst_idx, global_dst_idx in dst_indices:
@@ -2416,6 +2559,8 @@ class RaidenController:
 
     dst_unit_counts = {}
     dst_unit_layer_counts = {}
+    dst_endpoint_counts = {}
+    dst_endpoint_layer_counts = {}
     computed_expected_block_count = 0
     if direct_schedules:
       for src_unit, schedules in direct_schedules.items():
@@ -2441,6 +2586,16 @@ class RaidenController:
                   dst_unit_layer_counts[dst_unit].get(layer_idx, 0)
                   + tasks_count
               )
+              dst_host = _extract_host_ip(dst_peer)
+              if dst_host:
+                dst_endpoint_counts[dst_host] = (
+                    dst_endpoint_counts.get(dst_host, 0) + tasks_count
+                )
+                dst_endpoint_layer_counts.setdefault(dst_host, {})
+                dst_endpoint_layer_counts[dst_host][layer_idx] = (
+                    dst_endpoint_layer_counts[dst_host].get(layer_idx, 0)
+                    + tasks_count
+                )
       if dst_unit_counts:
         computed_expected_block_count = max(dst_unit_counts.values())
       vars_info = f"{num_vars} variable(s), " if num_vars > 0 else ""
@@ -2476,6 +2631,8 @@ class RaidenController:
         rpc_addresses=dict(rpc_addresses),
         data_addresses=data_addresses,
         dst_unit_counts=dst_unit_counts,
+        dst_endpoint_counts=dst_endpoint_counts,
+        dst_endpoint_layer_counts=dst_endpoint_layer_counts,
         is_weight_sync=bool(num_vars > 0 or local_skip_tiling),
     )
 
@@ -2506,7 +2663,10 @@ class RaidenController:
     for pool in self._registered_pool_manifests.get(unit, ()):
       reg_req.pools.add().CopyFrom(pool)
     if unit in self._registered_variables:
-      reg_req.variables.extend(self._registered_variables[unit])
+      for var in self._registered_variables[unit]:
+        reg_req.variables.add().CopyFrom(
+            _coerce_variable_proto(var, raiden_service_pb2)
+        )
     return reg_req
 
   def get_all_metadata(self) -> list[Any]:
@@ -2979,6 +3139,8 @@ class RaidenController:
               expected_block_count=expected_block_count,
               dst_expected_layer_chunk_counts=dst_unit_layer_counts,
               dst_expected_block_counts=dst_unit_counts,
+              dst_endpoint_counts=cached_schedule.dst_endpoint_counts,
+              dst_endpoint_layer_counts=cached_schedule.dst_endpoint_layer_counts,
               req_id=req_id,
               skip_d2h=skip_d2h,
               skip_tiling=local_skip_tiling,
@@ -3008,6 +3170,10 @@ class RaidenController:
                 expected_block_count=expected_block_count,
                 dst_expected_layer_chunk_counts=dst_unit_layer_counts,
                 dst_expected_block_counts=dst_unit_counts,
+                dst_endpoint_counts=cached_schedule.dst_endpoint_counts,
+                dst_endpoint_layer_counts=(
+                    cached_schedule.dst_endpoint_layer_counts
+                ),
                 src_schedule_keys={
                     u: i for i, u in enumerate(direct_schedules.keys())
                 },
@@ -3740,7 +3906,8 @@ class RaidenControllerClientFacade:
       shards: list of physical Data TCP addresses (e.g. 'IP:Port').
       control_plane_rpc_address: Optional worker Control-Plane RPC servicer
         endpoint coordinate.
-      mesh_shape: Optional logical mesh shape.
+      mesh_shape: Optional logical mesh shape. (Obsolete when variables specify
+        global_shard_indices).
       layout: Optional minor_to_major mapping layout.
       global_shape: Optional global array shape.
       itemsize: Optional item size in bytes.
@@ -3751,8 +3918,10 @@ class RaidenControllerClientFacade:
       transfer_rank: Optional transfer rank.
       variables: Optional list of registered variables metadata.
       mesh_axes: Optional list of mesh axis names (e.g. ['fsdp', 'tp']).
+        (Obsolete when variables specify global_shard_indices).
       host_subgrid: Optional ground-truth local host subgrid shape from JAX
-        (mesh.local_mesh).
+        (mesh.local_mesh). (Obsolete when variables specify
+        global_shard_indices).
     """
     reg_req = self._raiden_proto_module.RegisterWorkUnitRequest(
         unit=self._raiden_id_to_proto(unit),
@@ -3781,7 +3950,10 @@ class RaidenControllerClientFacade:
     if transfer_rank is not None:
       reg_req.transfer_rank = transfer_rank
     if variables is not None:
-      reg_req.variables.extend(variables)
+      for v in variables:
+        reg_req.variables.add().CopyFrom(
+            _coerce_variable_proto(v, self._raiden_proto_module)
+        )
     if mesh_axes is not None:
       reg_req.mesh_axes.extend(mesh_axes)
     if host_subgrid is not None:

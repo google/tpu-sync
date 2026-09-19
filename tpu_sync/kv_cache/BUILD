@@ -849,5 +849,6 @@ cc_library(
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/types:span",
     ],
 )

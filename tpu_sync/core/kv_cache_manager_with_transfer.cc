@@ -302,24 +302,49 @@ kv_cache::KVCacheCopySpec KVCacheManagerWithTransfer::ToKVCacheCopySpec(
   return ToKVCacheCopySpecImpl(spec);
 }
 
-void KVCacheManagerWithTransfer::ValidateRequestedBlocks(
-    const SendEntry& entry, const std::vector<int64_t>& requested_block_ids) {
-  if (requested_block_ids.empty()) {
-    throw std::invalid_argument(
-        "pull stream requested no blocks; use ack-only path");
-  }
-  absl::flat_hash_set<int64_t> seen;
-  for (int64_t block_id : requested_block_ids) {
-    if (entry.registered_block_set.find(block_id) ==
-        entry.registered_block_set.end()) {
-      throw std::invalid_argument(
-          "pull stream requested block not registered by producer");
-    }
-    if (!seen.insert(block_id).second) {
-      throw std::invalid_argument(
-          "pull stream requested duplicate producer block id");
-    }
-  }
+void KVCacheManagerWithTransfer::InitializeBaseHooks() {
+  kv_cache::KVCacheManagerBase::TransferEventHooks hooks;
+  hooks.register_block_readiness_callback =
+      [this](size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
+             transport::BlockTransportDelegate::HostBlockReadyCallback cb) {
+        RegisterBlockReadinessCallback(layer_idx, shard_idx, block_id, uuid,
+                                       std::move(cb));
+      };
+  hooks.on_blocks_received = [this](const std::vector<int>& block_ids,
+                                    uint64_t uuid) {
+    return OnBlocksReceived(block_ids, uuid);
+  };
+  hooks.on_layer_received = [this](size_t layer_idx, uint64_t uuid) {
+    return OnLayerReceived(layer_idx, uuid);
+  };
+  hooks.on_pool_received = [this](size_t pool_idx, uint64_t uuid) {
+    return OnPoolReceived(pool_idx, uuid);
+  };
+  hooks.schedule_async_task = [this](std::function<void()> task) {
+    ScheduleAsyncTask(std::move(task));
+  };
+  hooks.pool_reshard_push =
+      [this](const ::tpu_sync::rpc::StartTransferRequest& plan,
+             absl::Span<const int64_t> src_block_ids, int parallelism) {
+        return PoolReshardPush(plan, src_block_ids, parallelism);
+      };
+  hooks.pool_reshard_register_recv =
+      [this](const ::tpu_sync::rpc::StartTransferRequest& plan,
+             absl::Span<const int64_t> chip_block_ids) {
+        return PoolReshardRegisterRecv(plan, chip_block_ids);
+      };
+  hooks.wait_for_pending_work = [this]() { return WaitForPendingWork(); };
+  hooks.register_active_plan =
+      [this](uint64_t uuid,
+             const ::tpu_sync::rpc::StartTransferRequest& request,
+             bool is_sender) {
+        return RegisterActivePlan(uuid, request, is_sender);
+      };
+  hooks.unregister_active_plan = [this](uint64_t uuid) {
+    return UnregisterActivePlan(uuid);
+  };
+  hooks.get_node_id = [this]() { return node_id(); };
+  base_->SetTransferEventHooks(std::move(hooks));
 }
 
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
@@ -329,10 +354,10 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     HostBufferAllocator host_allocator, int64_t node_id,
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
     double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector)
-    : KVCacheManagerBase(
+    : base_(std::make_unique<kv_cache::KVCacheManagerBase>(
           layer_buffers, local_port,
           host_blocks_to_allocate.value_or(num_slots * max_blocks),
-          unsafe_skip_buffer_lock, parallelism, host_allocator),
+          unsafe_skip_buffer_lock, parallelism, host_allocator)),
       node_id_(node_id),
       local_control_port_(static_cast<int>(local_control_port)),
       local_data_port_(0),
@@ -341,6 +366,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
       metrics_collector_(std::move(metrics_collector)) {
+  InitializeBaseHooks();
   InitializeControlPlane();
   if (local_control_port_ >= 0) {
     if (max_blocks_ <= 0) {
@@ -350,12 +376,12 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       throw std::invalid_argument("num_slots must be positive");
     }
     dynamic_host_staging_ = DynamicHostStagingEnabled();
-    auto status = ConfigureHostStagingSlots(num_slots_, max_blocks_);
+    auto status = base_->ConfigureHostStagingSlots(num_slots_, max_blocks_);
     if (!status.ok()) {
       throw std::runtime_error(absl::StrCat(
           "Failed to configure host staging slots: ", status.message()));
     }
-    if (num_layers() > 0) {
+    if (base_->num_layers() > 0) {
       ConfigureDataPortFromKvTransfer();
     }
     // Demand staging allocates per request, so the pool stays whole rather
@@ -379,7 +405,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
     double timeout_s, std::optional<int> assigned_numa_node,
     std::shared_ptr<MetricsCollector> metrics_collector)
-    : KVCacheManagerBase(
+    : base_(std::make_unique<kv_cache::KVCacheManagerBase>(
           layer_buffers, local_port,
           host_blocks_to_allocate.value_or(num_slots * max_blocks),
           unsafe_skip_buffer_lock, parallelism, host_allocator,
@@ -388,7 +414,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
                               : std::nullopt,
           dimensions,
           physical_size > 0 ? std::make_optional(physical_size) : std::nullopt,
-          assigned_numa_node),
+          assigned_numa_node)),
       node_id_(node_id),
       local_control_port_(static_cast<int>(local_control_port)),
       local_data_port_(0),
@@ -397,8 +423,9 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
       metrics_collector_(std::move(metrics_collector)) {
+  InitializeBaseHooks();
   InitializeControlPlane();
-  if (num_layers() == 0 || num_shards() == 0) {
+  if (base_->num_layers() == 0 || base_->num_shards() == 0) {
     return;
   }
   if (local_control_port_ >= 0) {
@@ -409,12 +436,12 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       throw std::invalid_argument("num_slots must be positive");
     }
     dynamic_host_staging_ = DynamicHostStagingEnabled();
-    auto status = ConfigureHostStagingSlots(num_slots_, max_blocks_);
+    auto status = base_->ConfigureHostStagingSlots(num_slots_, max_blocks_);
     if (!status.ok()) {
       throw std::runtime_error(absl::StrCat(
           "Failed to configure host staging slots: ", status.message()));
     }
-    if (num_layers() > 0) {
+    if (base_->num_layers() > 0) {
       ConfigureDataPortFromKvTransfer();
     }
     // Demand staging allocates per request, so the pool stays whole rather
@@ -447,10 +474,10 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     int parallelism, int64_t node_id, int64_t local_control_port,
     int64_t max_blocks, int64_t num_slots, double timeout_s,
     std::shared_ptr<MetricsCollector> metrics_collector)
-    : KVCacheManagerBase(
+    : base_(std::make_unique<kv_cache::KVCacheManagerBase>(
           num_layers, num_shards, std::move(slice_byte_sizes), local_port,
           host_blocks_to_allocate.value_or(num_slots * max_blocks), parallelism,
-          nullptr),
+          nullptr)),
       node_id_(node_id),
       local_control_port_(static_cast<int>(local_control_port)),
       local_data_port_(0),
@@ -459,6 +486,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       unsafe_skip_buffer_lock_(false),
       metrics_collector_(std::move(metrics_collector)) {
+  InitializeBaseHooks();
   InitializeControlPlane();
   if (local_control_port_ >= 0) {
     if (max_blocks_ <= 0) {
@@ -468,7 +496,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       throw std::invalid_argument("num_slots must be positive");
     }
     dynamic_host_staging_ = DynamicHostStagingEnabled();
-    auto status = ConfigureHostStagingSlots(num_slots_, max_blocks_);
+    auto status = base_->ConfigureHostStagingSlots(num_slots_, max_blocks_);
     if (!status.ok()) {
       throw std::runtime_error(absl::StrCat(
           "Failed to configure host staging slots: ", status.message()));
@@ -498,11 +526,14 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
     pull_workers_mu_.Await(absl::Condition(
         +[](int* active) { return *active == 0; }, &active_pull_workers_));
   }
-  push_pool_.reset();
-  pull_pool_.reset();
+  if (base_) {
+    base_->StopTransportServer();
+    base_->ShutdownTransferPools();
+    base_->SetTransferEventHooks({});
+  }
   control_backend_.reset();
   control_handler_.reset();
-  if (host_block_manager_ && !all_slots_.empty()) {
+  if (base_->host_block_manager() && !all_slots_.empty()) {
     std::vector<int> blocks_to_unlock;
     blocks_to_unlock.reserve(all_slots_.size() * max_blocks_);
     for (const Slot& slot : all_slots_) {
@@ -510,7 +541,48 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
         blocks_to_unlock.push_back(block_id);
       }
     }
-    (void)host_block_manager_->Unlock(blocks_to_unlock);
+    (void)base_->host_block_manager()->Unlock(blocks_to_unlock);
+  }
+}
+
+KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
+    std::unique_ptr<kv_cache::KVCacheManagerBase> base, int64_t node_id,
+    int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
+    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector)
+    : base_(std::move(base)),
+      node_id_(node_id),
+      local_control_port_(static_cast<int>(local_control_port)),
+      local_data_port_(0),
+      max_blocks_(max_blocks),
+      num_slots_(num_slots),
+      timeout_s_(timeout_s),
+      unsafe_skip_buffer_lock_(false),
+      metrics_collector_(std::move(metrics_collector)) {
+  InitializeBaseHooks();
+  InitializeControlPlane();
+  if (local_control_port_ >= 0) {
+    if (max_blocks_ <= 0) {
+      throw std::invalid_argument("max_blocks must be positive");
+    }
+    if (num_slots_ <= 0) {
+      throw std::invalid_argument("num_slots must be positive");
+    }
+    dynamic_host_staging_ = DynamicHostStagingEnabled();
+    auto status = base_->ConfigureHostStagingSlots(num_slots_, max_blocks_);
+    if (!status.ok()) {
+      throw std::runtime_error(absl::StrCat(
+          "Failed to configure host staging slots: ", status.message()));
+    }
+    if (base_->num_layers() > 0) {
+      ConfigureDataPortFromKvTransfer();
+    }
+    status = dynamic_host_staging_ ? absl::OkStatus()
+                                   : InitializeSlotPool(num_slots_);
+    if (!status.ok()) {
+      throw std::runtime_error(
+          absl::StrCat("Failed to initialize slot pool: ", status.message()));
+    }
+    StartControlServer();
   }
 }
 
@@ -526,19 +598,10 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
     return 0;
   }
 
-  auto entry = std::make_shared<SendEntry>();
-  entry->req_id = req_id;
-  entry->uuid = uuid;
-  entry->registered_num_blocks = static_cast<int64_t>(block_ids.size());
-  entry->registered_block_ids = block_ids;
-  std::optional<int64_t> duplicate_block;
-  for (int64_t block_id : block_ids) {
-    if (!entry->registered_block_set.insert(block_id).second) {
-      duplicate_block = block_id;
-    }
-  }
-  entry->deadline = DeadlineFromNow();
-  entry->register_start = register_start;
+  auto entry = std::make_shared<SendSession>(base_.get(), req_id, uuid,
+                                             DeadlineFromNow(), register_start);
+  std::optional<int64_t> duplicate_block =
+      entry->PopulateRegisteredBlocks(block_ids);
 
   {
     absl::MutexLock lock(mu_);
@@ -588,7 +651,7 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
   // second registration of the same uuid waits for it, so a plan is never
   // visible without the staging and receive state that belong to it.
   absl::MutexLock lifecycle(plan_lifecycle_mu_);
-  if (kv_cache::KVCacheManagerBase::HasActivePlan(uuid)) {
+  if (base_->HasActivePlan(uuid)) {
     return absl::AlreadyExistsError(
         absl::StrCat("Plan with UUID ", uuid, " is already registered!"));
   }
@@ -610,7 +673,7 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
     }
     if (!device_blocks.empty()) {
       absl::MutexLock lock(mu_);
-      auto allocated = host_block_manager_->Allocate(
+      auto allocated = base_->host_block_manager()->Allocate(
           static_cast<int>(device_blocks.size()), /*lock=*/true);
       if (!allocated.ok()) {
         return absl::ResourceExhaustedError(absl::StrCat(
@@ -707,14 +770,14 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
 
   // Publish the plan last: pushes resolve through it, so everything they
   // may touch exists by the time it is visible.
-  absl::Status registered = kv_cache::KVCacheManagerBase::RegisterActivePlan(
+  absl::Status registered = base_->RegisterActivePlan(
       uuid, request, is_sender, host_block_of, generation);
   if (!registered.ok()) {
     absl::MutexLock lock(mu_);
     auto staged = plan_staging_.find(uuid);
     if (staged != plan_staging_.end()) {
-      (void)host_block_manager_->Unlock(staged->second);
-      (void)host_block_manager_->Deallocate(staged->second);
+      (void)base_->host_block_manager()->Unlock(staged->second);
+      (void)base_->host_block_manager()->Deallocate(staged->second);
       plan_staging_.erase(staged);
     }
     auto recv = active_recv_entries_.find(uuid);
@@ -775,10 +838,10 @@ absl::Status KVCacheManagerWithTransfer::ValidatePoolReshardPlan(
           "every pool group must expect a positive push count");
     }
   }
-  if (plan.pool_dtype_tags_size() != static_cast<int>(num_pools())) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("reshard plan must declare one dtype tag per pool: plan=",
-                     plan.pool_dtype_tags_size(), " local=", num_pools()));
+  if (plan.pool_dtype_tags_size() != static_cast<int>(base_->num_pools())) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "reshard plan must declare one dtype tag per pool: plan=",
+        plan.pool_dtype_tags_size(), " local=", base_->num_pools()));
   }
   if (local_block_ids.empty()) {
     return absl::InvalidArgumentError("local block ids must not be empty");
@@ -837,7 +900,7 @@ absl::Status KVCacheManagerWithTransfer::ValidatePoolReshardPlan(
       return absl::InvalidArgumentError(
           absl::StrCat("duplicate transfer pool index ", pool_idx));
     }
-    const kv_cache::PoolSpec* spec = pool(pool_idx);
+    const kv_cache::PoolSpec* spec = base_->pool(pool_idx);
     if (spec == nullptr) {
       return absl::InvalidArgumentError(
           absl::StrCat("transfer pool index out of range: ", pool_idx));
@@ -892,10 +955,10 @@ absl::Status KVCacheManagerWithTransfer::ValidatePoolReshardPlan(
             "multi-chunk reshard entries require positive strides");
       }
       if (!is_sender &&
-          static_cast<size_t>(entry.dst_shard_idx()) >= num_shards()) {
+          static_cast<size_t>(entry.dst_shard_idx()) >= base_->num_shards()) {
         return absl::InvalidArgumentError(absl::StrCat(
             "destination shard index ", entry.dst_shard_idx(),
-            " is out of range: receiver has ", num_shards(), " shards"));
+            " is out of range: receiver has ", base_->num_shards(), " shards"));
       }
       const int64_t local_id =
           is_sender ? entry.src_block_id() : entry.dst_block_id();
@@ -921,7 +984,7 @@ absl::Status KVCacheManagerWithTransfer::ValidatePoolReshardPlan(
         entry_pools.push_back(static_cast<size_t>(pool_idx));
       }
       for (size_t pool_idx : entry_pools) {
-        const kv_cache::PoolSpec* spec = pool(pool_idx);
+        const kv_cache::PoolSpec* spec = base_->pool(pool_idx);
         if (!StridedSpanFitsRegions(local_offset, local_stride,
                                     entry.size_bytes(), entry.count(),
                                     spec->block_stride_bytes, spec->regions)) {
@@ -1018,7 +1081,7 @@ absl::Status KVCacheManagerWithTransfer::ValidatePoolReshardReceiverCoverage(
           absl::StrCat("group ", group_idx, " declares no pools"));
     }
     for (size_t pool_idx : view.pool_indices) {
-      const kv_cache::PoolSpec* spec = pool(pool_idx);
+      const kv_cache::PoolSpec* spec = base_->pool(pool_idx);
       if (spec == nullptr) {
         return absl::InvalidArgumentError(
             absl::StrCat("group pool index out of range: ", pool_idx));
@@ -1169,7 +1232,7 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
   // Device-only executor: without device attachments there are no bytes this
   // path could legitimately move; host-only managers fail closed with no
   // host-mode branch to mask device bugs.
-  if (buffer_holds_.empty()) {
+  if (!base_->has_device_buffers()) {
     return absl::FailedPreconditionError(
         "pool reshard push requires a device-attached manager; host-only "
         "managers are not supported");
@@ -1194,9 +1257,9 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
     return absl::InvalidArgumentError("sender plan contains no peers");
   }
 
-  InitTransportServer();
-  TF_RETURN_IF_ERROR(kv_cache::KVCacheManagerBase::RegisterActivePlan(
-      plan.uuid(), plan, /*is_sender=*/true));
+  base_->InitTransportServer();
+  TF_RETURN_IF_ERROR(
+      base_->RegisterActivePlanDirect(plan.uuid(), plan, /*is_sender=*/true));
 
   auto state = std::make_shared<PoolReshardSendEntry>();
   state->req_id = plan.req_id();
@@ -1208,7 +1271,7 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
   state->remaining_pool_peer_pushes =
       static_cast<int>(CountPoolReshardSendSlots(plan, schedule_it->second));
   if (state->remaining_pool_peer_pushes <= 0) {
-    (void)kv_cache::KVCacheManagerBase::UnregisterActivePlan(plan.uuid());
+    (void)base_->UnregisterActivePlanDirect(plan.uuid());
     return absl::InvalidArgumentError("sender plan schedules no pushes");
   }
   state->plan = plan;
@@ -1216,7 +1279,7 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
   {
     absl::MutexLock lock(mu_);
     if (active_pool_reshard_sends_.contains(plan.uuid())) {
-      (void)kv_cache::KVCacheManagerBase::UnregisterActivePlan(plan.uuid());
+      (void)base_->UnregisterActivePlanDirect(plan.uuid());
       return absl::AlreadyExistsError(
           absl::StrCat("pool reshard send UUID already active: ", plan.uuid()));
     }
@@ -1267,19 +1330,19 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
     // Bounded host staging: lease one arena slot per source page of this
     // pool's storage for the transfer before staging its bytes (no-op on
     // full-mirror storages). Released in FinishPoolReshardSend.
-    if (const kv_cache::PoolSpec* pool_spec = pool(pool_idx);
+    if (const kv_cache::PoolSpec* pool_spec = base_->pool(pool_idx);
         pool_spec != nullptr) {
-      absl::Status lease_status = AcquirePoolStagingLease(
+      absl::Status lease_status = base_->AcquirePoolStagingLease(
           plan.uuid(), pool_spec->storage_index, pool_src_block_ids,
-          pool_staging_lease_timeout());
+          base_->pool_staging_lease_timeout());
       if (!lease_status.ok()) {
         FinishPoolReshardSend(plan.uuid(), lease_status);
         return lease_status;
       }
     }
-    auto future_or = D2hPoolBlocks(pool_idx, pool_src_block_ids,
-                                   /*shard_idx=*/std::nullopt,
-                                   static_cast<uint64_t>(plan.uuid()));
+    auto future_or = base_->D2hPoolBlocks(pool_idx, pool_src_block_ids,
+                                          /*shard_idx=*/std::nullopt,
+                                          static_cast<uint64_t>(plan.uuid()));
     if (!future_or.ok()) {
       FinishPoolReshardSend(plan.uuid(), future_or.status());
       return future_or.status();
@@ -1339,12 +1402,8 @@ void KVCacheManagerWithTransfer::StartPoolReshardPush(uint64_t uuid,
     }
   }
 
-  transport::BlockTransport* transport_server = nullptr;
-  {
-    absl::MutexLock lock(server_init_mu_);
-    transport_server = server_.get();
-  }
-  if (transport_server == nullptr) {
+  transport::BlockTransport* transport_srv = base_->transport_server();
+  if (transport_srv == nullptr) {
     FinishPoolReshardSend(
         uuid, absl::FailedPreconditionError("transport server is not running"));
     return;
@@ -1359,7 +1418,7 @@ void KVCacheManagerWithTransfer::StartPoolReshardPush(uint64_t uuid,
       src_ids.push_back(src_id);
       dst_ids.push_back(dst_id);
     }
-    transport_server->AsyncPush(
+    transport_srv->AsyncPush(
         {peer}, src_ids, dst_ids, state->parallelism,
         transport::MajorOrder::kLayerMajor, uuid, static_cast<int>(pool_idx),
         [this, uuid](absl::StatusOr<std::vector<int>> result) {
@@ -1400,15 +1459,15 @@ void KVCacheManagerWithTransfer::FinishPoolReshardSend(
     }
     // Every push of every pool has completed (or the send failed): the host
     // staging bytes are no longer read, so the arena slots go back.
-    ReleasePoolStagingLeases(uuid);
+    base_->ReleasePoolStagingLeases(uuid);
     absl::MutexLock lock(mu_);
     auto it = active_pool_reshard_sends_.find(uuid);
     if (it == active_pool_reshard_sends_.end()) return;
     if (it->second->failed ||
         (!unregister.ok() && !absl::IsNotFound(unregister))) {
-      failed_recving_.insert(it->second->req_id);
+      failed_recving_.insert(it->second->req_id());
     } else {
-      done_sending_.insert(it->second->req_id);
+      done_sending_.insert(it->second->req_id());
     }
     active_pool_reshard_sends_.erase(it);
   }
@@ -1425,7 +1484,7 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
       ValidatePoolReshardPlan(plan, chip_block_ids, /*is_sender=*/false));
   // Device-only executor (see PoolReshardPush): arming a receive on a
   // host-only manager is refused rather than silently landing in mirrors.
-  if (buffer_holds_.empty()) {
+  if (!base_->has_device_buffers()) {
     return absl::FailedPreconditionError(
         "pool reshard receive requires a device-attached manager; host-only "
         "managers are not supported");
@@ -1460,9 +1519,9 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
     }
     for (int32_t encoded_pool_idx : plan.transfer_pool_indices()) {
       const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
-      const kv_cache::PoolSpec* pool_spec = pool(pool_idx);
+      const kv_cache::PoolSpec* pool_spec = base_->pool(pool_idx);
       if (pool_spec == nullptr ||
-          !PoolStorageStagingBounded(pool_spec->storage_index)) {
+          !base_->PoolStorageStagingBounded(pool_spec->storage_index)) {
         continue;
       }
       auto ids_it = group_dst_by_pool.find(pool_idx);
@@ -1475,20 +1534,20 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
     }
     for (const auto& [storage_idx, ids] : dst_ids_by_storage) {
       std::vector<int64_t> id_list(ids.begin(), ids.end());
-      absl::Status lease_status = AcquirePoolStagingLease(
-          plan.uuid(), storage_idx, id_list, pool_staging_lease_timeout());
+      absl::Status lease_status =
+          base_->AcquirePoolStagingLease(plan.uuid(), storage_idx, id_list,
+                                         base_->pool_staging_lease_timeout());
       if (!lease_status.ok()) {
-        ReleasePoolStagingLeases(plan.uuid());
+        base_->ReleasePoolStagingLeases(plan.uuid());
         return lease_status;
       }
     }
   }
 
   absl::Status register_status =
-      kv_cache::KVCacheManagerBase::RegisterActivePlan(plan.uuid(), plan,
-                                                       /*is_sender=*/false);
+      base_->RegisterActivePlanDirect(plan.uuid(), plan, /*is_sender=*/false);
   if (!register_status.ok()) {
-    ReleasePoolStagingLeases(plan.uuid());
+    base_->ReleasePoolStagingLeases(plan.uuid());
     return register_status;
   }
   RecvEntry recv_entry;
@@ -1528,8 +1587,8 @@ absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {
     absl::MutexLock lock(mu_);
     auto it = plan_staging_.find(uuid);
     if (it != plan_staging_.end()) {
-      (void)host_block_manager_->Unlock(it->second);
-      (void)host_block_manager_->Deallocate(it->second);
+      (void)base_->host_block_manager()->Unlock(it->second);
+      (void)base_->host_block_manager()->Deallocate(it->second);
       plan_staging_.erase(it);
     }
     // A receive still in flight keeps its plan: pushes the transport has
@@ -1542,7 +1601,7 @@ absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {
     }
   }
   if (deferred) return absl::OkStatus();
-  return kv_cache::KVCacheManagerBase::UnregisterActivePlan(uuid);
+  return base_->UnregisterActivePlanDirect(uuid);
 }
 
 void KVCacheManagerWithTransfer::UnregisterSettledPlan(uint64_t uuid,
@@ -1551,13 +1610,12 @@ void KVCacheManagerWithTransfer::UnregisterSettledPlan(uint64_t uuid,
   // remove a newer one reusing the uuid, or race its progress counters.
   absl::MutexLock lifecycle(plan_lifecycle_mu_);
   if (generation != 0) {
-    std::optional<uint64_t> current = ActivePlanGeneration(uuid);
+    std::optional<uint64_t> current = base_->ActivePlanGeneration(uuid);
     if (!current.has_value() || *current != generation) {
       return;  // the plan is gone, or the uuid already belongs to a newer one
     }
   }
-  absl::Status status =
-      kv_cache::KVCacheManagerBase::UnregisterActivePlan(uuid);
+  absl::Status status = base_->UnregisterActivePlanDirect(uuid);
   if (!status.ok() && !absl::IsNotFound(status)) {
     LOG(ERROR) << "Failed to unregister settled transfer plan " << uuid << ": "
                << status;
@@ -1572,23 +1630,24 @@ KVCacheManagerWithTransfer::get_local_endpoints() const {
   // therefore worker registration) must use get_local_data_endpoints()
   // instead: aiming a data-protocol connection at the control port hangs both
   // sides with no error, since each waits for the other's framing.
-  return BuildEndpoints(local_control_port_ > 0 ? local_control_port_
-                                                : local_port().value_or(0));
+  return BuildEndpoints(local_control_port_ > 0
+                            ? local_control_port_
+                            : base_->local_port().value_or(0));
 }
 
 std::vector<RaidenTransferEndpoint>
 KVCacheManagerWithTransfer::get_local_data_endpoints() const {
-  return BuildEndpoints(local_port().value_or(0));
+  return BuildEndpoints(base_->local_port().value_or(0));
 }
 
 std::vector<RaidenTransferEndpoint> KVCacheManagerWithTransfer::BuildEndpoints(
     int64_t port) const {
-  std::vector<int64_t> all_shards(num_shards_);
-  for (size_t i = 0; i < num_shards_; ++i) {
+  std::vector<int64_t> all_shards(base_->num_shards());
+  for (size_t i = 0; i < base_->num_shards(); ++i) {
     all_shards[i] = static_cast<int64_t>(i);
   }
   std::vector<RaidenTransferEndpoint> eps;
-  for (const auto& ip : local_ips()) {
+  for (const auto& ip : base_->local_ips()) {
     std::string endpoint = absl::StrContains(ip, ':')
                                ? absl::StrCat("[", ip, "]:", port)
                                : absl::StrCat(ip, ":", port);
@@ -1648,7 +1707,7 @@ void KVCacheManagerWithTransfer::StartRead(
     const std::vector<int64_t>& local_block_ids, int parallelism,
     std::optional<std::vector<int64_t>> local_host_block_ids) {
   LOG(INFO) << "StartRead (initiate): req_id=" << req_id << ", uuid=" << uuid
-            << ", numa=" << assigned_numa_node().value_or(-1);
+            << ", numa=" << base_->assigned_numa_node().value_or(-1);
   VLOG(1) << "KVCacheManagerWithTransfer::StartRead (Hybrid Bridge) called. "
              "req_id: "
           << req_id << ", uuid: " << uuid << ", remote: " << remote_endpoint
@@ -1696,7 +1755,7 @@ void KVCacheManagerWithTransfer::StartRead(
                    << " blocks for req_id=" << req_id
                    << " (dynamic=" << dynamic_host_staging_
                    << ", free_host_blocks="
-                   << host_block_manager_->num_free_blocks()
+                   << base_->host_block_manager()->num_free_blocks()
                    << ", free_slots=" << free_slots_.size()
                    << ", max_blocks=" << max_blocks_ << ")";
         failed_recving_.insert(req_id);
@@ -1752,7 +1811,8 @@ void KVCacheManagerWithTransfer::StartRead(
 
   if (metrics_collector_) {
     uint64_t total_bytes = static_cast<uint64_t>(load_plan.num_blocks) *
-                           num_layers() * num_shards_ * slice_byte_size_;
+                           base_->num_layers() * base_->num_shards() *
+                           base_->slice_byte_size();
     metrics_collector_->RecordStart(uuid, req_id, load_plan.num_blocks,
                                     total_bytes);
   }
@@ -1769,20 +1829,22 @@ void KVCacheManagerWithTransfer::StartRead(
     return;
   }
 
-  std::optional<int> target_node = assigned_numa_node();
+  std::optional<int> target_node = base_->assigned_numa_node();
 
-  push_pool_->Schedule(target_node, [this, req_id, uuid, remote_endpoint,
-                                     load_plan = std::move(load_plan)]() {
+  base_->push_pool()->Schedule(target_node, [this, req_id, uuid,
+                                             remote_endpoint,
+                                             load_plan =
+                                                 std::move(load_plan)]() {
     bool failed = false;
     try {
       LOG(INFO) << "StartRead (connecting): req_id=" << req_id
                 << ", uuid=" << uuid
-                << ", numa=" << assigned_numa_node().value_or(-1);
+                << ", numa=" << base_->assigned_numa_node().value_or(-1);
       PullStreamRequestSpec req_spec;
       req_spec.uuid = uuid;
       req_spec.ep_idx = 0;
       req_spec.consumer_data_port = static_cast<uint32_t>(local_data_port_);
-      req_spec.consumer_ips = local_ips();
+      req_spec.consumer_ips = base_->local_ips();
       req_spec.src_block_ids = load_plan.producer_remote_block_ids;
       req_spec.dst_block_ids = load_plan.transport_host_block_ids;
 
@@ -1837,12 +1899,12 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
       const std::shared_ptr<SendEntry> entry = it->second;
       const uint64_t uuid = it->first;
       ++it;  // retiring the send erases its node
-      if (entry->draining || entry->deadline > now) continue;
+      if (entry->draining() || entry->deadline() > now) continue;
       // Past its deadline the transfer failed. One nobody pulled is
       // reported now; one whose copies or pushes still run keeps its
       // staging until they end, so the next transfer is never seated on
       // memory a copy still writes.
-      FinishSendLocked(entry, /*failed=*/true);
+      entry->FinishSendLocked(*this, /*has_failed=*/true);
       if (send_entries_.find(uuid) == send_entries_.end()) {
         settled_plans.emplace_back(uuid, 0);
       }
@@ -1851,7 +1913,7 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
          it != active_pool_reshard_sends_.end();) {
       const auto& entry = it->second;
       if (entry->deadline <= now) {
-        failed_recving_.insert(entry->req_id);
+        failed_recving_.insert(entry->req_id());
         settled_plans.emplace_back(it->first, 0);
         auto erase_it = it++;
         active_pool_reshard_sends_.erase(erase_it);
@@ -1869,7 +1931,7 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
       auto& entry = it->second;
       if (entry.is_pool_reshard) {
         if (entry.network_completed ||
-            entry.num_completed_layers == num_layers()) {
+            entry.num_completed_layers == base_->num_layers()) {
           bool all_h2d_done = true;
           for (auto& f : entry.h2d_futures) {
             if (!f.IsReady()) {
@@ -1903,7 +1965,7 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
       ++it;  // FinishRecvLocked may erase this entry.
       if (entry.draining) continue;
       if (entry.network_completed ||
-          entry.num_completed_layers == num_layers()) {
+          entry.num_completed_layers == base_->num_layers()) {
         bool all_h2d_done = true;
         for (auto& f : entry.h2d_futures) {
           if (!f.IsReady()) {
@@ -1948,7 +2010,7 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
     UnregisterSettledPlan(uuid, generation);
     // A settled (completed or timed-out) pool-reshard sender/receiver may
     // still hold bounded-staging arena slots.
-    ReleasePoolStagingLeases(uuid);
+    base_->ReleasePoolStagingLeases(uuid);
   }
   return {done_sending, done_recving, failed_recving};
 }
@@ -1959,7 +2021,7 @@ StageResult KVCacheManagerWithTransfer::IssueH2D(
   RAIDEN_TRACE_FN("KVTransfer::IssueH2D", [&]() {
     return absl::StrCat("slot=", slot_idx, " blocks=", num_blocks);
   });
-  if (num_layers() == 0) {
+  if (base_->num_layers() == 0) {
     throw std::runtime_error("KV cache manager is not registered");
   }
   if (slot_idx < 0 || slot_idx >= num_slots_) {
@@ -1997,9 +2059,9 @@ StageResult KVCacheManagerWithTransfer::IssueH2D(
 
   // Call H2dSyncDispatch with slot_idx = std::nullopt to use actual host block
   // IDs
-  auto fut_or = H2dSyncDispatch(transfer_spec.src_offsets,
-                                transfer_spec.dst_offsets, transfer_spec.sizes,
-                                /*slot_idx=*/std::nullopt);
+  auto fut_or = base_->H2dSyncDispatch(
+      transfer_spec.src_offsets, transfer_spec.dst_offsets, transfer_spec.sizes,
+      /*slot_idx=*/std::nullopt);
   if (!fut_or.ok()) {
     throw std::runtime_error("Failed to issue H2D transfer: " +
                              std::string(fut_or.status().message()));
@@ -2014,7 +2076,7 @@ StageResult KVCacheManagerWithTransfer::IssueH2D(
 
 std::vector<kv_cache::KVCacheHostSpan> KVCacheManagerWithTransfer::LayerSpans(
     int64_t slot_idx, int64_t num_blocks) {
-  if (num_layers() == 0) {
+  if (base_->num_layers() == 0) {
     throw std::runtime_error("KV cache manager is not registered");
   }
   if (num_blocks < 0 || num_blocks > max_blocks_) {
@@ -2039,25 +2101,25 @@ std::vector<kv_cache::KVCacheHostSpan> KVCacheManagerWithTransfer::LayerSpans(
     start = end;
   }
 
-  spans.reserve(num_layers() * num_shards() * runs.size());
-  for (size_t layer_idx = 0; layer_idx < num_layers(); ++layer_idx) {
-    const int64_t per_layer = LayerBlockByteSize(layer_idx);
-    const size_t layer_bytes =
-        per_layer > 0 ? static_cast<size_t>(per_layer) : slice_byte_size_;
-    for (size_t shard_idx = 0; shard_idx < num_shards(); ++shard_idx) {
-      const auto& shard_info = layers_[layer_idx].shards[shard_idx];
+  spans.reserve(base_->num_layers() * base_->num_shards() * runs.size());
+  for (size_t layer_idx = 0; layer_idx < base_->num_layers(); ++layer_idx) {
+    const int64_t per_layer = base_->LayerBlockByteSize(layer_idx);
+    const size_t layer_bytes = per_layer > 0 ? static_cast<size_t>(per_layer)
+                                             : base_->slice_byte_size();
+    for (size_t shard_idx = 0; shard_idx < base_->num_shards(); ++shard_idx) {
+      uint8_t* host_ptr = base_->GetHostPointer(layer_idx, shard_idx);
       for (const auto& run : runs) {
         const size_t byte_offset =
             static_cast<size_t>(run.start_block_id) * layer_bytes;
         const size_t nbytes = static_cast<size_t>(run.size) * layer_bytes;
-        spans.push_back(kv_cache::KVCacheHostSpan{
-            .ptr = const_cast<uint8_t*>(shard_info.host_ptr) + byte_offset,
-            .nbytes = nbytes,
-            .slot_idx = slot_idx,
-            .base_major = run.start_block_id,
-            .num_major = run.size,
-            .layer_idx = layer_idx,
-            .shard_idx = shard_idx});
+        spans.push_back(
+            kv_cache::KVCacheHostSpan{.ptr = host_ptr + byte_offset,
+                                      .nbytes = nbytes,
+                                      .slot_idx = slot_idx,
+                                      .base_major = run.start_block_id,
+                                      .num_major = run.size,
+                                      .layer_idx = layer_idx,
+                                      .shard_idx = shard_idx});
       }
     }
   }
@@ -2065,19 +2127,20 @@ std::vector<kv_cache::KVCacheHostSpan> KVCacheManagerWithTransfer::LayerSpans(
 }
 
 absl::Status KVCacheManagerWithTransfer::InitializeSlotPool(int64_t num_slots) {
-  if (host_block_manager_->num_free_blocks() < num_slots * max_blocks_) {
+  if (base_->host_block_manager()->num_free_blocks() <
+      num_slots * max_blocks_) {
     return absl::FailedPreconditionError(absl::StrCat(
         "Insufficient free host blocks to initialize slot pool. Required: ",
         num_slots * max_blocks_,
-        ", Available: ", host_block_manager_->num_free_blocks()));
+        ", Available: ", base_->host_block_manager()->num_free_blocks()));
   }
   free_slots_.clear();
   all_slots_.clear();
   all_slots_.reserve(num_slots);
   for (int64_t i = 0; i < num_slots; ++i) {
     ABSL_ASSIGN_OR_RETURN(std::vector<int> allocated_ids,
-                          host_block_manager_->Allocate(max_blocks_,
-                                                        /*lock=*/true));
+                          base_->host_block_manager()->Allocate(max_blocks_,
+                                                                /*lock=*/true));
     if (allocated_ids.size() != max_blocks_) {
       return absl::InternalError(absl::StrCat(
           "Slot pool allocation returned incorrect number of blocks: ",
@@ -2114,8 +2177,9 @@ KVCacheManagerWithTransfer::AcquireRecvStagingLocked(int64_t num_blocks,
   // An allocation miss is only reported back; this helper neither retries
   // nor logs. The producer retries it until its deadline, the consumer
   // fails it at once, and each logs its own verdict.
-  auto allocated = host_block_manager_->Allocate(static_cast<int>(num_blocks),
-                                                 /*lock=*/true);
+  auto allocated =
+      base_->host_block_manager()->Allocate(static_cast<int>(num_blocks),
+                                            /*lock=*/true);
   if (!allocated.ok()) {
     return std::nullopt;
   }
@@ -2134,8 +2198,8 @@ void KVCacheManagerWithTransfer::ReleaseRecvStagingLocked(RecvEntry* entry) {
 void KVCacheManagerWithTransfer::ReleaseStagingLocked(
     int64_t slot_idx, std::vector<int>* staged_host_blocks) {
   if (staged_host_blocks != nullptr && !staged_host_blocks->empty()) {
-    (void)host_block_manager_->Unlock(*staged_host_blocks);
-    (void)host_block_manager_->Deallocate(*staged_host_blocks);
+    (void)base_->host_block_manager()->Unlock(*staged_host_blocks);
+    (void)base_->host_block_manager()->Deallocate(*staged_host_blocks);
     staged_host_blocks->clear();
     return;
   }
@@ -2166,22 +2230,22 @@ void KVCacheManagerWithTransfer::ReleaseSlotLocked(int64_t slot_idx) {
 
 void KVCacheManagerWithTransfer::ReleaseEntrySlotLocked(
     const std::shared_ptr<SendEntry>& entry) {
-  if (!entry || entry->slot_released) return;
-  if (entry->slot_idx < 0 && entry->staged_host_blocks.empty()) return;
-  if (entry->slot_idx >= 0) {
-    RemoveStagingReadinessLocked(entry->slot_idx);
+  if (!entry || entry->slot_released()) return;
+  if (entry->slot_idx() < 0 && entry->staged_host_blocks().empty()) return;
+  if (entry->slot_idx() >= 0) {
+    RemoveStagingReadinessLocked(entry->slot_idx());
   }
-  for (int64_t block_id : entry->registered_block_ids) {
+  for (int64_t block_id : entry->registered_block_ids()) {
     active_producer_blocks_.erase(block_id);
   }
-  if (!entry->staged_host_blocks.empty()) {
-    (void)host_block_manager_->Unlock(entry->staged_host_blocks);
-    (void)host_block_manager_->Deallocate(entry->staged_host_blocks);
-    entry->staged_host_blocks.clear();
+  if (!entry->staged_host_blocks().empty()) {
+    (void)base_->host_block_manager()->Unlock(entry->staged_host_blocks());
+    (void)base_->host_block_manager()->Deallocate(entry->staged_host_blocks());
+    entry->ClearStagedHostBlocks();
   } else {
-    ReleaseSlotLocked(entry->slot_idx);
+    ReleaseSlotLocked(entry->slot_idx());
   }
-  entry->slot_released = true;
+  entry->set_slot_released(true);
 }
 
 std::shared_ptr<KVCacheManagerWithTransfer::StagingReadinessState>
@@ -2190,8 +2254,8 @@ KVCacheManagerWithTransfer::CreateStagingReadiness(int64_t slot_idx,
   auto state = std::make_shared<StagingReadinessState>();
   state->slot_idx = slot_idx;
   state->num_blocks = num_blocks;
-  state->num_layers = num_layers();
-  state->num_shards = num_shards();
+  state->num_layers = base_->num_layers();
+  state->num_shards = base_->num_shards();
   state->layers.resize(state->num_layers * state->num_shards);
   {
     absl::MutexLock lock(mu_);
@@ -2250,7 +2314,7 @@ void KVCacheManagerWithTransfer::RegisterBlockReadinessCallback(
     cb(absl::OkStatus());
     return;
   }
-  std::shared_ptr<SendEntry> entry;
+  std::shared_ptr<SendSession> entry;
   {
     absl::MutexLock lock(mu_);
     // Exact match: the transfer named itself, so gate on its own D2H. Reached
@@ -2266,25 +2330,22 @@ void KVCacheManagerWithTransfer::RegisterBlockReadinessCallback(
       // can gate this one, and a stale entry whose future never resolves would
       // stall it until the reader's own deadline fires.
       for (const auto& [u, e] : send_entries_) {
-        if (e->registered_block_set.find(block_id) !=
-                e->registered_block_set.end() &&
-            layer_idx < e->d2h_layer_futures.size()) {
+        if (e->OwnsBlockWithReadyFuture(block_id, layer_idx)) {
           entry = e;
           break;
         }
       }
     }
   }
-  if (!entry || layer_idx >= entry->d2h_layer_futures.size()) {
+  if (!entry) {
     cb(absl::OkStatus());
     return;
   }
-  entry->d2h_layer_futures[layer_idx].OnReady(
-      [cb = std::move(cb)](auto status_or) { cb(status_or.status()); });
+  entry->RegisterLayerReadinessCallback(layer_idx, std::move(cb));
 }
 
 void KVCacheManagerWithTransfer::ScheduleAsyncTask(std::function<void()> task) {
-  push_pool_->Schedule(std::move(task));
+  base_->push_pool()->Schedule(std::move(task));
 }
 
 class KVCacheManagerWithTransfer::ControlPlaneHandlerImpl
@@ -2314,7 +2375,7 @@ class KVCacheManagerWithTransfer::ControlPlaneHandlerImpl
 void KVCacheManagerWithTransfer::InitializeControlPlane() {
   control_handler_ = std::make_unique<ControlPlaneHandlerImpl>(this);
   auto executor = [this](std::function<void()> task) {
-    pull_pool_->Schedule(assigned_numa_node(), std::move(task));
+    base_->pull_pool()->Schedule(base_->assigned_numa_node(), std::move(task));
   };
   control_backend_ =
       CreateControlPlaneBackend(ResolveControlPlaneBackendType(),
@@ -2367,7 +2428,7 @@ KVCacheManagerWithTransfer::HandlePullStream(
         std::min(kPullRegistrationGrace, absl::Seconds(timeout_s_));
     {
       absl::MutexLock lock(mu_);
-      std::shared_ptr<SendEntry> entry;
+      std::shared_ptr<SendSession> entry;
       const absl::Time give_up = absl::Now() + grace;
       while (true) {
         auto it = send_entries_.find(req.uuid);
@@ -2393,16 +2454,8 @@ KVCacheManagerWithTransfer::HandlePullStream(
       }
       // Registration guards prevent a live entry from being replaced, so an
       // expired entry cannot become valid while this pull waits out the grace.
-      if (entry->deadline <= std::chrono::steady_clock::now()) {
-        throw std::runtime_error(
-            absl::StrCat("read registration for uuid ", req.uuid, " expired"));
-      }
-      ValidateRequestedBlocks(*entry, req.src_block_ids);
-      if (entry->pull_started) {
-        throw std::runtime_error(
-            absl::StrCat("pull already started for uuid ", req.uuid));
-      }
-      entry->pull_started = true;
+      entry->ValidateAndBeginPull(req.src_block_ids,
+                                  std::chrono::steady_clock::now());
     }
 
     std::vector<std::string> peer_ips = req.consumer_ips;
@@ -2446,7 +2499,8 @@ KVCacheManagerWithTransfer::HandlePullStream(
 
     return PullStreamResponseSpec{
         .status = 0,
-        .num_layers = static_cast<uint32_t>(num_layers() * num_shards()),
+        .num_layers =
+            static_cast<uint32_t>(base_->num_layers() * base_->num_shards()),
         .data_port = static_cast<uint32_t>(local_data_port_),
         .message = "",
     };
@@ -2468,7 +2522,8 @@ absl::Status KVCacheManagerWithTransfer::HandleAck(uint64_t uuid) {
 
 uint64_t KVCacheManagerWithTransfer::MaxPullStreamBlocks() const {
   const int64_t block_capacity =
-      dynamic_host_staging_ ? host_block_manager_->total_blocks() : max_blocks_;
+      dynamic_host_staging_ ? base_->host_block_manager()->total_blocks()
+                            : max_blocks_;
   return static_cast<uint64_t>(std::max<int64_t>(0, block_capacity));
 }
 
@@ -2489,28 +2544,29 @@ bool KVCacheManagerWithTransfer::AcquireSendStagingWithRetry(
       if (it == send_entries_.end()) {
         return false;  // request cancelled while waiting for staging
       }
-      stage_deadline = it->second->deadline;
+      stage_deadline = it->second->deadline();
       // Staging that can never seat this request fails it now rather than
       // after the deadline: a fixed slot holds max_blocks_ pages, the
       // per-transfer pool holds total_blocks() pages.
       const int64_t capacity = dynamic_host_staging_
-                                   ? host_block_manager_->total_blocks()
+                                   ? base_->host_block_manager()->total_blocks()
                                    : max_blocks_;
       if (static_cast<int64_t>(src_block_ids.size()) > capacity) {
-        LOG(ERROR) << "StartPushInternal: request " << it->second->req_id
+        LOG(ERROR) << "StartPushInternal: request " << it->second->req_id()
                    << " needs " << src_block_ids.size() << " blocks but "
                    << (dynamic_host_staging_ ? "the host staging pool holds "
                                              : "a staging slot holds ")
                    << capacity;
-        FinishSendLocked(it->second, /*failed=*/true);
+        it->second->FinishSendLocked(*this, /*has_failed=*/true);
         return false;
       }
       RecvEntry staging;
       auto staged = AcquireRecvStagingLocked(
           static_cast<int64_t>(src_block_ids.size()), &staging);
       if (staged.has_value()) {
-        it->second->slot_idx = staging.slot_idx;
-        it->second->staged_host_blocks = std::move(staging.staged_host_blocks);
+        it->second->set_slot_idx(staging.slot_idx);
+        it->second->set_staged_host_blocks(
+            std::move(staging.staged_host_blocks));
         *host_block_ids = std::move(*staged);
         return true;
       }
@@ -2523,14 +2579,14 @@ bool KVCacheManagerWithTransfer::AcquireSendStagingWithRetry(
       auto it = send_entries_.find(uuid);
       if (it != send_entries_.end()) {
         LOG(ERROR) << "StartPushInternal: staging exhausted serving "
-                   << it->second->req_id << " (" << src_block_ids.size()
+                   << it->second->req_id() << " (" << src_block_ids.size()
                    << " blocks; free_host_blocks="
-                   << host_block_manager_->num_free_blocks()
+                   << base_->host_block_manager()->num_free_blocks()
                    << ", total_host_blocks="
-                   << host_block_manager_->total_blocks()
+                   << base_->host_block_manager()->total_blocks()
                    << ", free_slots=" << free_slots_.size()
                    << "); reporting transfer failure";
-        FinishSendLocked(it->second, /*failed=*/true);
+        it->second->FinishSendLocked(*this, /*has_failed=*/true);
       }
       return false;
     }
@@ -2559,7 +2615,7 @@ void KVCacheManagerWithTransfer::StartPushInternal(
   // that flood the command queue with small ops and serialize against prefill
   // GEMMs on the shared TensorCore; coalescing collapses a contiguous range to
   // one copy, matching the pre-Hybrid-Push pull path.
-  std::shared_ptr<SendEntry> entry;
+  std::shared_ptr<SendSession> entry;
   {
     absl::MutexLock lock(mu_);
     auto it = send_entries_.find(uuid);
@@ -2574,207 +2630,8 @@ void KVCacheManagerWithTransfer::StartPushInternal(
   }
 
   CopySpec d2h_copy = BuildCoalescedCopySpec(src_block_ids, host_block_ids);
-  entry->d2h_layer_futures.reserve(num_layers());
-
-  // 1. Issue D2H copies layer-by-layer. Each copy is counted against the
-  // send before it starts and released by its own completion, so the
-  // staging it writes stays owned for as long as it runs.
-  for (size_t l = 0; l < num_layers(); ++l) {
-    {
-      absl::MutexLock lock(mu_);
-      // The send expired or failed while its copies were being issued:
-      // what was issued drains, nothing more starts.
-      if (entry->draining) return;
-      BeginSendOpLocked(entry);
-    }
-    LOG(INFO) << "StartPushInternal (D2H start) layer " << l
-              << ": uuid=" << uuid
-              << ", numa=" << assigned_numa_node().value_or(-1);
-    auto future_or = D2hSyncDispatch(d2h_copy.src_offsets, d2h_copy.dst_offsets,
-                                     d2h_copy.sizes, /*slot_idx=*/std::nullopt,
-                                     /*layer_idx=*/l);
-    if (!future_or.ok()) {
-      // A copy that cannot even be issued fails the transfer; the worker
-      // thread has no caller for an exception to reach.
-      LOG(ERROR) << "StartPushInternal: failed to issue D2H for layer " << l
-                 << ": " << future_or.status();
-      absl::MutexLock lock(mu_);
-      FinishSendLocked(entry, /*failed=*/true);
-      EndSendOpLocked(entry);  // this copy never started
-      return;
-    }
-    entry->d2h_layer_futures.push_back(std::move(future_or.value()));
-    entry->d2h_layer_futures.back().OnReady(
-        [this, entry](absl::StatusOr<raiden::BufferHolders>) {
-          EndSendOp(entry);
-        });
-  }
-
-  entry->remote_data_endpoints = remote_data_endpoints;
-  entry->src_ints.assign(host_block_ids.begin(), host_block_ids.end());
-  entry->dst_ints.assign(dst_block_ids.begin(), dst_block_ids.end());
-  entry->remaining_h2h_layers.store(num_layers());
-
-  SendNextLayer(entry, 0);
-}
-
-void KVCacheManagerWithTransfer::SendNextLayer(
-    const std::shared_ptr<SendEntry>& entry, size_t l) {
-  RAIDEN_TRACE_FN("KVTransfer::SendNextLayer", [&]() {
-    return absl::StrCat("uuid=", entry->uuid, " layer=", l);
-  });
-  if (l >= num_layers()) {
-    // Reached end of layer loop. Background asynchronous transfers will clean
-    // up when remaining_h2h_layers reaches 0.
-    return;
-  }
-  const uint64_t uuid = entry->uuid;
-
-  entry->d2h_layer_futures[l].OnReady([this, entry, uuid, l](auto status_or) {
-    if (!status_or.ok()) {
-      LOG(ERROR) << "StartPushInternal: D2H copy failed for layer " << l
-                 << ", status: " << status_or.status().ToString();
-      absl::MutexLock lock(mu_);
-      FinishSendLocked(entry, /*failed=*/true);
-      return;
-    }
-    {
-      absl::MutexLock lock(mu_);
-      // The send expired or failed while the copy ran: nothing is pushed.
-      if (entry->draining) return;
-      BeginSendOpLocked(entry);
-    }
-
-    push_pool_->Schedule([this, entry, uuid, l]() {
-      LOG(INFO) << "StartPushInternal (H2H start layer " << l
-                << "): uuid=" << uuid
-                << ", numa=" << assigned_numa_node().value_or(-1);
-      H2hWriteDirectAsync(
-          entry->remote_data_endpoints, entry->src_ints, entry->dst_ints, uuid,
-          l, [this, entry, uuid, l](absl::StatusOr<std::vector<int>> push_res) {
-            if (!push_res.ok()) {
-              LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
-                         << push_res.status().ToString();
-              absl::MutexLock lock(mu_);
-              FinishSendLocked(entry, /*failed=*/true);
-              EndSendOpLocked(entry);
-              return;
-            }
-
-            LOG(INFO) << "StartPushInternal (H2H complete layer " << l
-                      << "): uuid=" << uuid
-                      << ", numa=" << assigned_numa_node().value_or(-1);
-
-            const bool last = entry->remaining_h2h_layers.fetch_sub(1) == 1;
-            absl::MutexLock lock(mu_);
-            if (last) {
-              LOG(INFO) << "StartPushInternal (All H2H complete): uuid="
-                        << uuid;
-              FinishSendLocked(entry, /*failed=*/false);
-            }
-            EndSendOpLocked(entry);
-          });
-
-      // Immediately queue the next layer's push without waiting for this one to
-      // finish
-      SendNextLayer(entry, l + 1);
-    });
-  });
-}
-
-std::optional<uint64_t> KVCacheManagerWithTransfer::FinishRecvLocked(
-    uint64_t uuid, bool failed) {
-  auto it = active_recv_entries_.find(uuid);
-  if (it == active_recv_entries_.end() || it->second.is_pool_reshard) {
-    return std::nullopt;
-  }
-  RecvEntry& entry = it->second;
-  if (failed) entry.failed = true;
-  if (entry.draining) return std::nullopt;
-  entry.draining = true;
-  if (entry.in_flight == 0) return RetireRecvLocked(uuid);
-  return std::nullopt;
-}
-
-std::optional<uint64_t> KVCacheManagerWithTransfer::RetireRecvLocked(
-    uint64_t uuid) {
-  auto it = active_recv_entries_.find(uuid);
-  if (it == active_recv_entries_.end() || it->second.is_pool_reshard) {
-    return std::nullopt;
-  }
-  RecvEntry& entry = it->second;
-  if (entry.in_flight != 0) {
-    LOG(DFATAL) << "Attempted to retire receive " << uuid << " with "
-                << entry.in_flight << " operations still in flight";
-    return std::nullopt;
-  }
-  (entry.failed ? failed_recving_ : done_recving_).insert(entry.req_id);
-  ReleaseRecvStagingLocked(&entry);
-  std::optional<uint64_t> plan_generation;
-  if (entry.unregister_on_settle) {
-    plan_generation = entry.plan_generation;
-  }
-  active_recv_entries_.erase(it);
-  return plan_generation;
-}
-
-void KVCacheManagerWithTransfer::BeginRecvOpLocked(RecvEntry* entry) {
-  ++entry->in_flight;
-}
-
-std::optional<uint64_t> KVCacheManagerWithTransfer::EndRecvOpLocked(
-    uint64_t uuid) {
-  auto it = active_recv_entries_.find(uuid);
-  if (it == active_recv_entries_.end()) {
-    LOG(DFATAL) << "Receive operation ended after UUID " << uuid
-                << " was retired";
-    return std::nullopt;
-  }
-  RecvEntry& entry = it->second;
-  if (entry.in_flight <= 0) {
-    LOG(DFATAL) << "Receive operation count underflow for UUID " << uuid;
-    return std::nullopt;
-  }
-  --entry.in_flight;
-  if (entry.draining && entry.in_flight == 0) {
-    return RetireRecvLocked(uuid);
-  }
-  return std::nullopt;
-}
-
-void KVCacheManagerWithTransfer::FinishSendLocked(
-    const std::shared_ptr<SendEntry>& entry, bool failed) {
-  if (failed) entry->failed = true;
-  if (entry->draining) return;  // the pending work retires it
-  entry->draining = true;
-  if (entry->in_flight == 0) RetireSendLocked(entry);
-}
-
-void KVCacheManagerWithTransfer::RetireSendLocked(
-    const std::shared_ptr<SendEntry>& entry) {
-  (entry->failed ? failed_recving_ : done_sending_).insert(entry->req_id);
-  ReleaseEntrySlotLocked(entry);
-  auto it = send_entries_.find(entry->uuid);
-  if (it != send_entries_.end() && it->second == entry) {
-    send_entries_.erase(it);
-  }
-}
-
-void KVCacheManagerWithTransfer::BeginSendOpLocked(
-    const std::shared_ptr<SendEntry>& entry) {
-  ++entry->in_flight;
-}
-
-void KVCacheManagerWithTransfer::EndSendOpLocked(
-    const std::shared_ptr<SendEntry>& entry) {
-  --entry->in_flight;
-  if (entry->draining && entry->in_flight == 0) RetireSendLocked(entry);
-}
-
-void KVCacheManagerWithTransfer::EndSendOp(
-    const std::shared_ptr<SendEntry>& entry) {
-  absl::MutexLock lock(mu_);
-  EndSendOpLocked(entry);
+  entry->ExecutePush(*this, d2h_copy, remote_data_endpoints, host_block_ids,
+                     dst_block_ids);
 }
 
 absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
@@ -2856,18 +2713,18 @@ void KVCacheManagerWithTransfer::AckSend(uint64_t uuid) {
       return;
     }
     entry = it->second;
-    FinishSendLocked(entry, /*failed=*/false);
+    entry->FinishSendLocked(*this, /*has_failed=*/false);
   }
   const auto ack_done = std::chrono::steady_clock::now();
   std::ostringstream timing;
   timing << "RAIDEN_TIMING event=producer_ack"
-         << " req_id=" << entry->req_id << " uuid=" << entry->uuid
-         << " node_id=" << node_id_ << " blocks=" << entry->num_blocks
-         << " bytes=" << entry->total_bytes
-         << " stage_to_ack_ms=" << DurationMs(entry->d2h_done, ack_done)
+         << " req_id=" << entry->req_id() << " uuid=" << entry->uuid()
+         << " node_id=" << node_id_ << " blocks=" << entry->num_blocks()
+         << " bytes=" << entry->total_bytes()
+         << " stage_to_ack_ms=" << DurationMs(entry->d2h_done(), ack_done)
          << " register_to_ack_ms="
-         << DurationMs(entry->register_start, ack_done)
-         << " failed=" << (entry->failed ? 1 : 0);
+         << DurationMs(entry->register_start(), ack_done)
+         << " failed=" << (entry->failed() ? 1 : 0);
   EmitTimingLog(timing.str());
 }
 
@@ -2878,11 +2735,11 @@ KVCacheManagerWithTransfer::DeadlineFromNow() const {
 }
 
 void KVCacheManagerWithTransfer::ConfigureDataPortFromKvTransfer() {
-  if (num_layers() == 0) {
+  if (base_->num_layers() == 0) {
     local_data_port_ = 0;
     return;
   }
-  std::optional<int> data_port = local_port();
+  std::optional<int> data_port = base_->local_port();
   if (!data_port.has_value()) {
     throw std::runtime_error("KVCacheManager BlockTransport is not running");
   }
@@ -2951,13 +2808,13 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
           block_ids.end());
 
       if (it->second.num_completed_blocks >=
-          it->second.total_blocks * num_layers()) {
+          it->second.total_blocks * base_->num_layers()) {
         it->second.network_completed = true;
         req_id = it->second.req_id;
         if (metrics_collector_) {
           metrics_collector_->RecordLastPacket(uuid);
         }
-        if (it->second.num_completed_layers == num_layers()) {
+        if (it->second.num_completed_layers == base_->num_layers()) {
           start_time = it->second.start_time;
           should_record_duration = true;
 
@@ -2969,7 +2826,7 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
       } else {
         VLOG(1) << "OnBlocksReceived: Partial blocks received for uuid " << uuid
                 << ", completed: " << it->second.num_completed_blocks << " / "
-                << it->second.total_blocks * num_layers();
+                << it->second.total_blocks * base_->num_layers();
         return absl::OkStatus();
       }
     }
@@ -2981,8 +2838,7 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
   }
 
   if (!found) {
-    // Forward to base class for direct pull operations
-    return RaidenManagerBase::OnBlocksReceived(block_ids, uuid);
+    return absl::OkStatus();
   }
 
   if (plan_generation.has_value()) {
@@ -2992,7 +2848,7 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
   if (should_record_duration) {
     LOG(INFO) << "OnBlocksReceived (Network + H2D complete): req_id=" << req_id
               << ", uuid=" << uuid
-              << ", numa=" << assigned_numa_node().value_or(-1);
+              << ", numa=" << base_->assigned_numa_node().value_or(-1);
   }
   return absl::OkStatus();
 }
@@ -3069,8 +2925,8 @@ void KVCacheManagerWithTransfer::LaunchEligiblePoolH2ds(uint64_t uuid) {
     }
   }
   for (auto& [pool_idx, chip_block_ids] : to_launch) {
-    auto future_or = H2dPoolBlocks(pool_idx, chip_block_ids,
-                                   /*shard_idx=*/std::nullopt, uuid);
+    auto future_or = base_->H2dPoolBlocks(pool_idx, chip_block_ids,
+                                          /*shard_idx=*/std::nullopt, uuid);
     if (!future_or.ok()) {
       FinishPoolReshardRecvPool(uuid, pool_idx, future_or.status());
       continue;
@@ -3129,7 +2985,7 @@ void KVCacheManagerWithTransfer::FinishPoolReshardRecvPool(
     }
     // All pools uploaded (or the receive failed): the staging bytes have been
     // consumed by the H2D, so the arena slots go back to the pool.
-    ReleasePoolStagingLeases(uuid);
+    base_->ReleasePoolStagingLeases(uuid);
     absl::MutexLock lock(mu_);
     auto it = active_recv_entries_.find(uuid);
     if (it == active_recv_entries_.end()) return;
@@ -3182,11 +3038,12 @@ absl::Status KVCacheManagerWithTransfer::OnLayerReceived(size_t layer_idx,
 
   LOG(INFO) << "OnLayerReceived (H2D copy start) layer " << layer_idx
             << ": req_id=" << req_id << ", uuid=" << uuid
-            << ", numa=" << assigned_numa_node().value_or(-1);
+            << ", numa=" << base_->assigned_numa_node().value_or(-1);
 
-  auto future_or = H2dSyncDispatch(h2d_copy.src_offsets, h2d_copy.dst_offsets,
-                                   h2d_copy.sizes, /*slot_idx=*/std::nullopt,
-                                   /*layer_idx=*/layer_idx);
+  auto future_or =
+      base_->H2dSyncDispatch(h2d_copy.src_offsets, h2d_copy.dst_offsets,
+                             h2d_copy.sizes, /*slot_idx=*/std::nullopt,
+                             /*layer_idx=*/layer_idx);
   if (!future_or.ok()) {
     std::optional<uint64_t> plan_generation;
     {
@@ -3218,9 +3075,10 @@ absl::Status KVCacheManagerWithTransfer::OnLayerReceived(size_t layer_idx,
       if (status_or.ok()) {
         LOG(INFO) << "OnLayerReceived (H2D copy complete) layer " << layer_idx
                   << ": req_id=" << req_id
-                  << ", numa=" << assigned_numa_node().value_or(-1);
+                  << ", numa=" << base_->assigned_numa_node().value_or(-1);
         entry.num_completed_layers++;
-        if (entry.num_completed_layers == num_layers() && !entry.draining) {
+        if (entry.num_completed_layers == base_->num_layers() &&
+            !entry.draining) {
           // TODO: Find a way to optimize this by moving out of the mutex.
           RecordTransferDuration(
               DurationMs(entry.start_time, std::chrono::steady_clock::now()));

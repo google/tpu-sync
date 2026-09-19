@@ -805,6 +805,15 @@ NB_MODULE(_tpu_raiden_torch, m) {
                                 ? self->reshard_service()->port()
                                 : 0;
                    })
+      // 0.0 when this store does not host a reshard service; otherwise the
+      // registry TTL the reshard service was created with.
+      .def_prop_ro(
+          "request_registry_ttl_s",
+          [](tpu_raiden::kv_cache::KVCacheStoreWrapper& self) {
+            return self->reshard_service()
+                       ? self->reshard_service()->request_registry_ttl_s()
+                       : 0.0;
+          })
       .def_prop_ro("store_server_address",
                    [](tpu_raiden::kv_cache::KVCacheStoreWrapper& self) {
                      return self->store_server_address();
@@ -913,8 +922,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
           "save",
           [](tpu_raiden::kv_cache::KVCacheStoreWrapper& self,
              const std::vector<nb::bytes>& block_hashes,
-             const std::optional<tpu_raiden::kv_cache::RaidenId>&
-                 dst_raiden_id) -> bool {
+             const std::optional<tpu_raiden::kv_cache::RaidenId>& dst_raiden_id)
+              -> bool {
             auto hashes = ToStdStringVector(block_hashes);
             return self->Save(hashes, dst_raiden_id).ok();
           },
@@ -994,9 +1003,9 @@ NB_MODULE(_tpu_raiden_torch, m) {
              {
                nb::gil_scoped_release release;
                auto res = self->PollLoadStatus();
-                done = std::move(res.done);
-                failed = std::move(res.failed);
-                pending = std::move(res.pending);
+               done = std::move(res.done);
+               failed = std::move(res.failed);
+               pending = std::move(res.pending);
              }
              std::vector<nb::bytes> py_done, py_failed, py_pending;
              py_done.reserve(done.size());
@@ -1210,10 +1219,11 @@ NB_MODULE(_tpu_raiden_torch, m) {
   m.def(
       "create_reshard_store",
       [](tpu_raiden::kv_cache::RaidenId raiden_id, std::string store_server_ip,
-         int raiden_controller_port, int reshard_service_port) {
+         int raiden_controller_port, int reshard_service_port,
+         double request_registry_ttl_s) {
         auto store = tpu_raiden::kv_cache::KVCacheStore::CreateReshardStore(
             std::move(raiden_id), store_server_ip, raiden_controller_port,
-            reshard_service_port);
+            reshard_service_port, request_registry_ttl_s);
         if (!store.ok()) {
           throw std::runtime_error(
               absl::StrCat("ReshardStore initialization failed: ",
@@ -1224,7 +1234,11 @@ NB_MODULE(_tpu_raiden_torch, m) {
       nb::arg("raiden_id"), nb::arg("store_server_ip"),
       nb::arg("raiden_controller_port") = 0,
       nb::arg("reshard_service_port") = 0,
+      nb::arg("request_registry_ttl_s") = 600.0,
       nb::call_guard<nb::gil_scoped_release>());
+  // Capability marker for the library version supporting
+  // request_registry_ttl_s.
+  m.attr("reshard_store_supports_request_registry_ttl") = true;
 
   tpu_raiden::telemetry::BindTelemetryApi(m);
 

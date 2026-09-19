@@ -4182,6 +4182,18 @@ class WeightSyncReceiverAndCacheLeakTest(absltest.TestCase):
       self.assertEqual(
           req_default.start_transfer_request.expected_block_count, 200
       )
+
+      # When a single control listener manages multiple NUMA NICs on one host,
+      # _encode_start_transfer should preserve the full host expected counts.
+      ws_client._endpoints[dst_unit] = ["10.0.1.2:8000"]
+      dst_bytes_single_listener = ws_client._encode_start_transfer(
+          dst_unit, plan, address="10.0.1.2:8000"
+      )
+      req_single = raiden_service_pb2.ControlRequest()
+      req_single.ParseFromString(dst_bytes_single_listener)
+      self.assertEqual(
+          req_single.start_transfer_request.expected_block_count, 200
+      )
     finally:
       ws_client.close()
 

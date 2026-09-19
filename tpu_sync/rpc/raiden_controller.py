@@ -762,8 +762,9 @@ class WorkerRpcClient:
     for addr in addrs:
       try:
         try:
+          spec_addr = addr if len(addrs) > 1 else None
           payload = self._encode_start_transfer(
-              target_id, transfer_plan, address=addr
+              target_id, transfer_plan, address=spec_addr
           )
         except TypeError:
           payload = self._encode_start_transfer(target_id, transfer_plan)
@@ -830,7 +831,11 @@ class WorkerRpcClient:
     layer_counts = transfer_plan.dst_expected_layer_chunk_counts.get(
         target_id, transfer_plan.expected_layer_chunk_counts
     )
-    if not is_sender and address:
+    if (
+        not is_sender
+        and address
+        and len(self._endpoints.get(target_id, [])) != 1
+    ):
       host_ip = _extract_host_ip(address)
       if host_ip in getattr(transfer_plan, "dst_endpoint_counts", {}):
         expected_block_count = transfer_plan.dst_endpoint_counts[host_ip]

@@ -48,6 +48,7 @@ class WeightSynchronizer:
       auto_h2d: Automatically execute H2D ingestion upon data arrival.
       global_shard_indices: Explicit vector of global shard indices.
     """
+    self._has_explicit_global_shard_indices = global_shard_indices is not None
     if global_shard_indices is None:
       if jax_arrays and hasattr(jax_arrays[0], "addressable_shards"):
         arr = jax_arrays[0]
@@ -78,6 +79,10 @@ class WeightSynchronizer:
           else 0
       )
       global_shard_indices = [offset + i for i in range(num_shards)]
+
+    self._global_shard_indices = (
+        list(global_shard_indices) if global_shard_indices is not None else []
+    )
 
     self._impl = _weight_synchronizer.WeightSynchronizer(
         jax_arrays,
@@ -129,7 +134,23 @@ class WeightSynchronizer:
 
   def get_local_endpoints(self) -> List[Dict[str, Any]]:
     """Returns the list of transfer endpoints advertised by this instance."""
-    return self._impl.get_local_endpoints()
+    eps = self._impl.get_local_endpoints()
+    if (
+        not self._has_explicit_global_shard_indices
+        and self._global_shard_indices
+    ):
+      g_to_l = {int(g): idx for idx, g in enumerate(self._global_shard_indices)}
+      normalized = []
+      for ep in eps:
+        raw_shards = ep.get("shards", [])
+        local_shards = [g_to_l.get(int(s), int(s)) for s in raw_shards]
+        normalized.append({
+            **ep,
+            "shards": local_shards,
+            "global_shards": list(raw_shards),
+        })
+      return normalized
+    return eps
 
   @property
   def local_port(self) -> Optional[int]:

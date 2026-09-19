@@ -64,14 +64,26 @@ class TestManager : public KVCacheManagerWithTransfer {
             /*local_control_port=*/-1, /*max_blocks=*/0, /*num_slots=*/0,
             timeout_s) {}
 
-  using KVCacheManagerWithTransfer::FinishPoolReshardRecvPool;
+  void FinishPoolReshardRecvPool(uint64_t uuid, size_t pool_idx,
+                                 const absl::Status& status) {
+    std::shared_ptr<ReceiveSession> session;
+    {
+      absl::MutexLock lock(mu_);
+      auto it = active_recv_entries_.find(uuid);
+      if (it == active_recv_entries_.end()) return;
+      session = it->second;
+    }
+    session->FinishPoolH2d(*this, pool_idx, status);
+  }
   using KVCacheManagerWithTransfer::PoolReshardRegisterRecv;
   using KVCacheManagerWithTransfer::ValidatePoolReshardPlan;
 
   // Passes the device-attached gate with no real device state. Only paths
   // that never touch the holds (validation and the no-bytes-owned sender
   // completion) may rely on it.
-  void AttachPlaceholderDeviceHold() { buffer_holds_.emplace_back(); }
+  void AttachPlaceholderDeviceHold() {
+    base()->AttachPlaceholderDeviceHoldForTest();
+  }
   // Stages plans in per-transfer host blocks, as
   // TPU_RAIDEN_DYNAMIC_HOST_STAGING=1 does for device-attached managers.
   void EnableDemandStaging() { dynamic_host_staging_ = true; }
@@ -170,7 +182,7 @@ void ExpectInvalid(const absl::Status& status, const std::string& fragment) {
 
 TEST(ExpectedPushSendersTest, CountsReceiverPlanSchedules) {
   TestManager manager;
-  EXPECT_EQ(manager.ExpectedPushSenders(/*uuid=*/1), std::nullopt);
+  EXPECT_EQ(manager.base()->ExpectedPushSenders(/*uuid=*/1), std::nullopt);
 
   // A block-addressed receive plan assembled from two source ranks, each
   // writing its own head slice of the same destination block.
@@ -191,7 +203,7 @@ TEST(ExpectedPushSendersTest, CountsReceiverPlanSchedules) {
   }
   ASSERT_TRUE(
       manager.RegisterActivePlan(1, receive_plan, /*is_sender=*/false).ok());
-  EXPECT_EQ(manager.ExpectedPushSenders(1), std::optional<size_t>(2));
+  EXPECT_EQ(manager.base()->ExpectedPushSenders(1), std::optional<size_t>(2));
 
   // A sender's own plan never gates what it receives.
   StartTransferRequest send_plan;
@@ -205,21 +217,21 @@ TEST(ExpectedPushSendersTest, CountsReceiverPlanSchedules) {
   entry->set_size_bytes(16);
   entry->set_count(1);
   ASSERT_TRUE(manager.RegisterActivePlan(2, send_plan, /*is_sender=*/true).ok());
-  EXPECT_EQ(manager.ExpectedPushSenders(2), std::nullopt);
+  EXPECT_EQ(manager.base()->ExpectedPushSenders(2), std::nullopt);
 
   // A plan without schedules declares nothing about its senders.
   StartTransferRequest bare_plan;
   ASSERT_TRUE(
       manager.RegisterActivePlan(3, bare_plan, /*is_sender=*/false).ok());
-  EXPECT_EQ(manager.ExpectedPushSenders(3), std::nullopt);
+  EXPECT_EQ(manager.base()->ExpectedPushSenders(3), std::nullopt);
 
   ASSERT_TRUE(manager.UnregisterActivePlan(1).ok());
-  EXPECT_EQ(manager.ExpectedPushSenders(1), std::nullopt);
+  EXPECT_EQ(manager.base()->ExpectedPushSenders(1), std::nullopt);
 }
 
 TEST(PoolReshardValidationTest, AcceptsCanonicalPlanOnExplicitPools) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1001);
 
   EXPECT_TRUE(manager
@@ -250,7 +262,7 @@ TEST(PoolReshardValidationTest, HasNoTagPolicy) {
   // validates geometry and consistency for whatever pool set the plan
   // declares; no tag value is special-cased.
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("gdn.conv")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("gdn.conv")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1003);
 
   EXPECT_TRUE(manager
@@ -261,7 +273,7 @@ TEST(PoolReshardValidationTest, HasNoTagPolicy) {
 
 TEST(PoolReshardValidationTest, DeviceOnlyRejectionAtPublicEntryPoints) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1004);
 
   const absl::Status recv_status =
@@ -279,7 +291,7 @@ TEST(PoolReshardValidationTest, DeviceOnlyRejectionAtPublicEntryPoints) {
 
 TEST(PoolReshardValidationTest, RejectsMissingIdentityAndPoolFields) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
 
   StartTransferRequest plan = ValidPlan(/*uuid=*/1005);
   plan.clear_req_id();
@@ -313,7 +325,7 @@ TEST(PoolReshardValidationTest, RejectsMissingIdentityAndPoolFields) {
 
 TEST(PoolReshardValidationTest, RejectsOutOfRangeDuplicateAndDtypeMismatch) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
 
   StartTransferRequest plan = ValidPlan(/*uuid=*/1009, /*dtype_tags=*/{"bf16"},
                                         /*transferred_pools=*/{1});
@@ -340,8 +352,9 @@ TEST(PoolReshardValidationTest, RejectsOutOfRangeDuplicateAndDtypeMismatch) {
 
 TEST(PoolReshardValidationTest, ChecksEveryPoolSpanAndDestinationZeroCover) {
   TestManager manager;
-  ASSERT_TRUE(
-      manager.RegisterPools({DensePool("fa", 128), DensePool("fa", 64)}).ok());
+  ASSERT_TRUE(manager.base()
+                  ->RegisterPools({DensePool("fa", 128), DensePool("fa", 64)})
+                  .ok());
   StartTransferRequest plan =
       ValidPlan(/*uuid=*/1013, /*dtype_tags=*/{"bf16", "bf16"},
                 /*transferred_pools=*/{0, 1});
@@ -370,7 +383,7 @@ TEST(PoolReshardValidationTest, ChecksEveryPoolSpanAndDestinationZeroCover) {
 
 TEST(PoolReshardValidationTest, RejectsOverflowingSenderSpan) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1016);
   auto* entry = plan.mutable_shard_push_schedules()->at(0).mutable_entries(0);
   entry->set_src_offset_bytes(96);
@@ -406,7 +419,7 @@ TEST(PoolReshardValidationTest,
           .units_per_stride = 2,
       },
   };
-  ASSERT_TRUE(manager.RegisterPools({pool}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({pool}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1019);
   EXPECT_TRUE(manager
                   .ValidatePoolReshardPlan(plan, std::vector<int64_t>{0},
@@ -442,7 +455,7 @@ ShardPushEntryProto* AddEntry(StartTransferRequest& plan, int32_t schedule_key,
 
 TEST(PoolReshardReceiverCoverageTest, RejectsCoverageGap) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1101);
   plan.mutable_pool_groups(0)->clear_dst_expected_extent_bytes();
   plan.mutable_pool_groups(0)->add_dst_expected_extent_bytes(48);
@@ -459,7 +472,7 @@ TEST(PoolReshardReceiverCoverageTest, RejectsCoverageGap) {
 
 TEST(PoolReshardReceiverCoverageTest, RejectsCoverageOverlap) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1102);
   plan.mutable_pool_groups(0)->clear_dst_expected_extent_bytes();
   plan.mutable_pool_groups(0)->add_dst_expected_extent_bytes(24);
@@ -472,7 +485,7 @@ TEST(PoolReshardReceiverCoverageTest, RejectsCoverageOverlap) {
 
 TEST(PoolReshardReceiverCoverageTest, RejectsShortCoverage) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1103);
   plan.mutable_pool_groups(0)->clear_dst_expected_extent_bytes();
   plan.mutable_pool_groups(0)->add_dst_expected_extent_bytes(24);
@@ -484,7 +497,7 @@ TEST(PoolReshardReceiverCoverageTest, RejectsShortCoverage) {
 
 TEST(PoolReshardReceiverCoverageTest, RejectsNonPrefixExtents) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1104);
   auto* group = plan.mutable_pool_groups(0);
   group->add_dst_device_block_ids(1);
@@ -501,7 +514,7 @@ TEST(PoolReshardReceiverCoverageTest, RejectsNonPrefixExtents) {
 
 TEST(PoolReshardReceiverCoverageTest, RejectsMissingExtents) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1105);
   plan.mutable_pool_groups(0)->clear_dst_expected_extent_bytes();
 
@@ -512,7 +525,7 @@ TEST(PoolReshardReceiverCoverageTest, RejectsMissingExtents) {
 
 TEST(PoolReshardReceiverCoverageTest, RejectsMissingParallelism) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1106);
   plan.set_parallelism(0);
 
@@ -523,7 +536,7 @@ TEST(PoolReshardReceiverCoverageTest, RejectsMissingParallelism) {
 
 TEST(PoolReshardReceiverCoverageTest, RejectsExpectedPushMismatch) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1107);
   plan.mutable_pool_groups(0)->set_expected_pushes(2);
 
@@ -556,7 +569,7 @@ TEST(PoolReshardReceiverCoverageTest, RejectsWriteBeyondDeclaredLiveTail) {
           .units_per_stride = 1,
       },
   };
-  ASSERT_TRUE(manager.RegisterPools({pool}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({pool}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1108);
   plan.mutable_pool_groups(0)->clear_dst_expected_extent_bytes();
   plan.mutable_pool_groups(0)->add_dst_expected_extent_bytes(40);
@@ -580,8 +593,9 @@ TEST(PoolReshardReceiverCoverageTest, RejectsWriteBeyondDeclaredLiveTail) {
 
 TEST(PoolReshardReceiverCoverageTest, GroupScopesDestinationBlocks) {
   TestManager manager;
-  ASSERT_TRUE(
-      manager.RegisterPools({DensePool("fa", 128), DensePool("gdn", 64)}).ok());
+  ASSERT_TRUE(manager.base()
+                  ->RegisterPools({DensePool("fa", 128), DensePool("gdn", 64)})
+                  .ok());
   StartTransferRequest plan = ValidPlan(
       /*uuid=*/1109, /*dtype_tags=*/{"bf16", "bf16"},
       /*transferred_pools=*/{0, 1});
@@ -620,7 +634,7 @@ TEST(PoolReshardReceiverCoverageTest, GroupScopesDestinationBlocks) {
 
 TEST(PoolReshardValidationTest, RejectsBlockIdsOutsideDeclaredPool) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1017);
   plan.mutable_pool_groups(0)->set_dst_device_block_ids(0, 9);
   ExpectInvalid(manager.ValidatePoolReshardPlan(plan, std::vector<int64_t>{9},
@@ -656,8 +670,9 @@ StartTransferRequest TwoGroupPlan(int64_t uuid) {
 TEST(PoolReshardSendTest,
      SenderWithNoBytesForAnyTransferredPoolRefusedUpFront) {
   TestManager manager;
-  ASSERT_TRUE(
-      manager.RegisterPools({DensePool("fa"), DensePool("state")}).ok());
+  ASSERT_TRUE(manager.base()
+                  ->RegisterPools({DensePool("fa"), DensePool("state")})
+                  .ok());
   manager.AttachPlaceholderDeviceHold();
 
   // The sender's only schedule entry names group 1, while the transfer set
@@ -674,12 +689,12 @@ TEST(PoolReshardSendTest,
   EXPECT_EQ(push_status.code(), absl::StatusCode::kInvalidArgument);
   EXPECT_THAT(push_status.message(),
               ::testing::HasSubstr("sender plan schedules no pushes"));
-  EXPECT_FALSE(manager.HasActivePlan(plan.uuid()));
+  EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
 }
 
 TEST(PoolReshardRecvTest, FinishPoolReshardRecvRecordsDurationMetric) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
   manager.AttachPlaceholderDeviceHold();
 
   auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
@@ -701,7 +716,7 @@ TEST(PoolReshardRecvTest, FinishPoolReshardRecvRecordsDurationMetric) {
 
 TEST(PoolReshardRecvTest, FinishPoolReshardRecvDoesNotRecordMetricOnFailure) {
   TestManager manager;
-  ASSERT_TRUE(manager.RegisterPools({DensePool("fa")}).ok());
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
   manager.AttachPlaceholderDeviceHold();
 
   auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
@@ -734,7 +749,7 @@ TEST(SendDeadlineTest, ExpiredSendEntryFailsInsteadOfReportingDone) {
 TEST(DemandStagingTest, SenderPlanReturnsStagingOnUnregister) {
   TestManager manager;
   manager.EnableDemandStaging();
-  auto* pool = manager.host_block_manager();
+  auto* pool = manager.base()->host_block_manager();
   const int free_before = pool->num_free_blocks();
   ASSERT_TRUE(manager
                   .RegisterActivePlan(21, BlockPlan(21, {0, 1}, {2, 3},
@@ -751,7 +766,7 @@ TEST(DemandStagingTest, SenderPlanReturnsStagingOnUnregister) {
 TEST(DemandStagingTest, HostReceiverPlanReturnsStagingOnUnregister) {
   TestManager manager;
   manager.EnableDemandStaging();
-  auto* pool = manager.host_block_manager();
+  auto* pool = manager.base()->host_block_manager();
   const int free_before = pool->num_free_blocks();
   ASSERT_TRUE(manager
                   .RegisterActivePlan(22, BlockPlan(22, {0, 1}, {2, 3},
@@ -768,7 +783,7 @@ TEST(DemandStagingTest, HostReceiverPlanReturnsStagingOnUnregister) {
 TEST(DemandStagingTest, DuplicateSenderRegistrationKeepsOriginalStaging) {
   TestManager manager;
   manager.EnableDemandStaging();
-  auto* pool = manager.host_block_manager();
+  auto* pool = manager.base()->host_block_manager();
   const int free_before = pool->num_free_blocks();
   const StartTransferRequest plan =
       BlockPlan(23, {0, 1}, {2, 3}, MEMORY_TYPE_HBM);
@@ -795,7 +810,7 @@ TEST(DemandStagingTest, UnregisteringInFlightReceiverDefersUntilItSettles) {
   TestManager manager(/*timeout_s=*/0.05);
   manager.EnableDemandStaging();
   manager.AttachPlaceholderDeviceHold();
-  auto* pool = manager.host_block_manager();
+  auto* pool = manager.base()->host_block_manager();
   const int free_before = pool->num_free_blocks();
   ASSERT_TRUE(manager
                   .RegisterActivePlan(24, BlockPlan(24, {0, 1}, {2, 3},
@@ -803,14 +818,14 @@ TEST(DemandStagingTest, UnregisteringInFlightReceiverDefersUntilItSettles) {
                                       /*is_sender=*/false)
                   .ok());
   EXPECT_EQ(pool->num_free_blocks(), free_before - 2);
-  const auto staged = manager.PlanHostBlocks(24, {2, 3});
+  const auto staged = manager.base()->PlanHostBlocks(24, {2, 3});
   ASSERT_TRUE(staged.ok()) << staged.status();
 
   // Unregistering while the receive is in flight keeps the plan's mapping
   // and its staging, so pushes already accepted still land in the plan's
   // blocks ...
   ASSERT_TRUE(manager.UnregisterActivePlan(24).ok());
-  const auto still_staged = manager.PlanHostBlocks(24, {2, 3});
+  const auto still_staged = manager.base()->PlanHostBlocks(24, {2, 3});
   ASSERT_TRUE(still_staged.ok()) << still_staged.status();
   EXPECT_EQ(*still_staged, *staged);
   EXPECT_EQ(pool->num_free_blocks(), free_before - 2);
@@ -821,7 +836,7 @@ TEST(DemandStagingTest, UnregisteringInFlightReceiverDefersUntilItSettles) {
   const auto [done_sending, done_recving, failed_recving] =
       manager.CompleteReadRaw();
   EXPECT_THAT(failed_recving, Contains("block_plan_req_24"));
-  EXPECT_EQ(manager.PlanHostBlocks(24, {2, 3}).status().code(),
+  EXPECT_EQ(manager.base()->PlanHostBlocks(24, {2, 3}).status().code(),
             absl::StatusCode::kNotFound);
   EXPECT_EQ(pool->num_free_blocks(), free_before);
   EXPECT_EQ(pool->num_locked_blocks(), 0);
@@ -830,8 +845,8 @@ TEST(DemandStagingTest, UnregisteringInFlightReceiverDefersUntilItSettles) {
 TEST(DemandStagingTest, PlanHostBlocksFailsClosed) {
   TestManager manager;
   manager.EnableDemandStaging();
-  auto* pool = manager.host_block_manager();
-  EXPECT_EQ(manager.PlanHostBlocks(25, {0}).status().code(),
+  auto* pool = manager.base()->host_block_manager();
+  EXPECT_EQ(manager.base()->PlanHostBlocks(25, {0}).status().code(),
             absl::StatusCode::kNotFound);
 
   // Occupy the identity blocks first, so the plan's host blocks provably
@@ -843,18 +858,18 @@ TEST(DemandStagingTest, PlanHostBlocksFailsClosed) {
                                                     MEMORY_TYPE_HBM),
                                       /*is_sender=*/true)
                   .ok());
-  const auto staged = manager.PlanHostBlocks(25, {0, 1});
+  const auto staged = manager.base()->PlanHostBlocks(25, {0, 1});
   ASSERT_TRUE(staged.ok()) << staged.status();
   ASSERT_EQ(staged->size(), 2u);
   EXPECT_NE(*staged, (std::vector<int64_t>{0, 1}));
   EXPECT_TRUE(pool->IsLocked(static_cast<int>((*staged)[0])));
   EXPECT_TRUE(pool->IsLocked(static_cast<int>((*staged)[1])));
   // A block the plan does not stage is refused rather than passed through.
-  EXPECT_EQ(manager.PlanHostBlocks(25, {0, 7}).status().code(),
+  EXPECT_EQ(manager.base()->PlanHostBlocks(25, {0, 7}).status().code(),
             absl::StatusCode::kInvalidArgument);
 
   ASSERT_TRUE(manager.UnregisterActivePlan(25).ok());
-  EXPECT_EQ(manager.PlanHostBlocks(25, {0}).status().code(),
+  EXPECT_EQ(manager.base()->PlanHostBlocks(25, {0}).status().code(),
             absl::StatusCode::kNotFound);
 }
 
@@ -865,11 +880,11 @@ TEST(DemandStagingTest, PlanHostBlocksIsIdentityForFixedStaging) {
                                                     MEMORY_TYPE_HBM),
                                       /*is_sender=*/true)
                   .ok());
-  const auto staged = manager.PlanHostBlocks(26, {0, 1});
+  const auto staged = manager.base()->PlanHostBlocks(26, {0, 1});
   ASSERT_TRUE(staged.ok()) << staged.status();
   EXPECT_EQ(*staged, (std::vector<int64_t>{0, 1}));
   // Identity covers only the blocks the plan names.
-  EXPECT_EQ(manager.PlanHostBlocks(26, {7}).status().code(),
+  EXPECT_EQ(manager.base()->PlanHostBlocks(26, {7}).status().code(),
             absl::StatusCode::kInvalidArgument);
   ASSERT_TRUE(manager.UnregisterActivePlan(26).ok());
 }
@@ -882,7 +897,7 @@ TEST(DemandStagingTest, PlanHostBlocksRejectsBlocksOfAnEmptyPlan) {
                                                     MEMORY_TYPE_HBM),
                                       /*is_sender=*/true)
                   .ok());
-  EXPECT_EQ(manager.PlanHostBlocks(28, {0}).status().code(),
+  EXPECT_EQ(manager.base()->PlanHostBlocks(28, {0}).status().code(),
             absl::StatusCode::kInvalidArgument);
   ASSERT_TRUE(manager.UnregisterActivePlan(28).ok());
 }
@@ -891,14 +906,14 @@ TEST(DemandStagingTest, DemandStagedReceiverPlanUnregistersWhenItSettles) {
   TestManager manager(/*timeout_s=*/0.05);
   manager.EnableDemandStaging();
   manager.AttachPlaceholderDeviceHold();
-  auto* pool = manager.host_block_manager();
+  auto* pool = manager.base()->host_block_manager();
   const int free_before = pool->num_free_blocks();
   ASSERT_TRUE(manager
                   .RegisterActivePlan(27, BlockPlan(27, {0, 1}, {2, 3},
                                                     MEMORY_TYPE_HBM),
                                       /*is_sender=*/false)
                   .ok());
-  ASSERT_TRUE(manager.PlanHostBlocks(27, {2, 3}).ok());
+  ASSERT_TRUE(manager.base()->PlanHostBlocks(27, {2, 3}).ok());
 
   // Nobody unregisters; the plan still goes when the receive settles (here
   // by timeout), leaving neither a stale mapping nor held blocks behind.
@@ -906,7 +921,7 @@ TEST(DemandStagingTest, DemandStagedReceiverPlanUnregistersWhenItSettles) {
   const auto [done_sending, done_recving, failed_recving] =
       manager.CompleteReadRaw();
   EXPECT_THAT(failed_recving, Contains("block_plan_req_27"));
-  EXPECT_EQ(manager.PlanHostBlocks(27, {2, 3}).status().code(),
+  EXPECT_EQ(manager.base()->PlanHostBlocks(27, {2, 3}).status().code(),
             absl::StatusCode::kNotFound);
   EXPECT_EQ(pool->num_free_blocks(), free_before);
   EXPECT_EQ(pool->num_locked_blocks(), 0);

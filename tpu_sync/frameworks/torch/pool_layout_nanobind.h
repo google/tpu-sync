@@ -131,6 +131,15 @@ inline nb::dict PoolBlockRefToDict(const kv_cache::PoolBlockRef& ref) {
 // Binds the pool admission API onto a manager binding. Shared by the host and
 // torch modules so the surface never diverges. The bound class must derive
 // from kv_cache::KVCacheManagerBase.
+template <typename T>
+auto* BaseOf(T& self) {
+  if constexpr (requires { self.base(); }) {
+    return self.base();
+  } else {
+    return &self;
+  }
+}
+
 template <typename FutureT, typename ClassT>
 void BindPoolApi(ClassT& cls) {
   using ManagerT = typename ClassT::Type;
@@ -153,8 +162,9 @@ void BindPoolApi(ClassT& cls) {
                specs[i].staging_blocks_per_request = staging_blocks_per_pool[i];
              }
            }
-           ThrowIfNotOk(self.RegisterPools(std::move(specs), staging_leases),
-                        "KVCacheManager register_pools failed");
+           ThrowIfNotOk(
+               BaseOf(self)->RegisterPools(std::move(specs), staging_leases),
+               "KVCacheManager register_pools failed");
          },
          nb::arg("pools"), nb::arg("staging_leases") = 0,
          nb::arg("staging_blocks_per_pool") = std::vector<int64_t>{})
@@ -165,7 +175,7 @@ void BindPoolApi(ClassT& cls) {
              bool any_bounded = false;
              int64_t bounded_bytes = 0;
              int64_t full_bytes = 0;
-             for (const auto& s : self.PoolStagingSummary()) {
+             for (const auto& s : BaseOf(self)->PoolStagingSummary()) {
                nb::dict d;
                d["storage_index"] = s.storage_index;
                d["bounded"] = s.bounded;
@@ -180,7 +190,7 @@ void BindPoolApi(ClassT& cls) {
                    s.host_bytes_per_shard;
              }
              result["mode"] = any_bounded ? "bounded" : "full";
-             result["leases"] = self.pool_staging_leases();
+             result["leases"] = BaseOf(self)->pool_staging_leases();
              result["bounded_storage_bytes_per_shard"] = bounded_bytes;
              result["full_storage_bytes_per_shard"] = full_bytes;
              result["storages"] = storages;
@@ -191,7 +201,7 @@ void BindPoolApi(ClassT& cls) {
           [](ManagerT& self, size_t pool_idx, size_t shard_idx,
              int64_t block_id) {
             auto status_or =
-                self.GetPoolBlockRef(pool_idx, shard_idx, block_id);
+                BaseOf(self)->GetPoolBlockRef(pool_idx, shard_idx, block_id);
             if (!status_or.ok()) {
               throw std::runtime_error(
                   absl::StrCat("KVCacheManager get_pool_block_ref failed: ",
@@ -204,16 +214,17 @@ void BindPoolApi(ClassT& cls) {
       .def(
           "pool_indices_with_tag_native",
           [](ManagerT& self, const std::string& tag) {
-            return self.PoolIndicesWithTag(tag);
+            return BaseOf(self)->PoolIndicesWithTag(tag);
           },
           nb::arg("tag"))
-      .def("num_pools", [](ManagerT& self) { return self.num_pools(); })
+      .def("num_pools",
+           [](ManagerT& self) { return BaseOf(self)->num_pools(); })
       .def("has_explicit_pools",
-           [](ManagerT& self) { return self.has_explicit_pools(); })
+           [](ManagerT& self) { return BaseOf(self)->has_explicit_pools(); })
       .def(
           "pool_spec_native",
           [](ManagerT& self, size_t pool_idx) {
-            const kv_cache::PoolSpec* pool = self.pool(pool_idx);
+            const kv_cache::PoolSpec* pool = BaseOf(self)->pool(pool_idx);
             if (pool == nullptr) {
               throw std::out_of_range(
                   absl::StrCat("pool index out of range: ", pool_idx));
@@ -224,8 +235,8 @@ void BindPoolApi(ClassT& cls) {
       .def(
           "get_block_host_pointer",
           [](ManagerT& self, size_t layer_idx, size_t shard_idx, int block_id) {
-            auto status_or =
-                self.GetBlockHostPointerValue(layer_idx, shard_idx, block_id);
+            auto status_or = BaseOf(self)->GetBlockHostPointerValue(
+                layer_idx, shard_idx, block_id);
             if (!status_or.ok()) {
               throw std::runtime_error(
                   absl::StrCat("KVCacheManager get_block_host_pointer failed: ",
@@ -235,15 +246,19 @@ void BindPoolApi(ClassT& cls) {
           },
           nb::arg("layer_idx"), nb::arg("shard_idx") = 0,
           nb::arg("block_id") = 0)
-      .def("layer_block_byte_size", &ManagerT::LayerBlockByteSize,
-           nb::arg("layer_idx"))
+      .def(
+          "layer_block_byte_size",
+          [](ManagerT& self, size_t layer_idx) {
+            return BaseOf(self)->LayerBlockByteSize(layer_idx);
+          },
+          nb::arg("layer_idx"))
       .def(
           "d2h_pool_blocks",
           [](ManagerT& self, size_t pool_idx,
              const std::vector<int64_t>& block_ids,
              std::optional<size_t> shard_idx, std::optional<uint64_t> uuid) {
-            auto status_or =
-                self.D2hPoolBlocks(pool_idx, block_ids, shard_idx, uuid);
+            auto status_or = BaseOf(self)->D2hPoolBlocks(pool_idx, block_ids,
+                                                         shard_idx, uuid);
             if (!status_or.ok()) {
               throw std::runtime_error(
                   absl::StrCat("KVCacheManager d2h_pool_blocks failed: ",
@@ -259,8 +274,8 @@ void BindPoolApi(ClassT& cls) {
           [](ManagerT& self, size_t pool_idx,
              const std::vector<int64_t>& block_ids,
              std::optional<size_t> shard_idx, std::optional<uint64_t> uuid) {
-            auto status_or =
-                self.H2dPoolBlocks(pool_idx, block_ids, shard_idx, uuid);
+            auto status_or = BaseOf(self)->H2dPoolBlocks(pool_idx, block_ids,
+                                                         shard_idx, uuid);
             if (!status_or.ok()) {
               throw std::runtime_error(
                   absl::StrCat("KVCacheManager h2d_pool_blocks failed: ",

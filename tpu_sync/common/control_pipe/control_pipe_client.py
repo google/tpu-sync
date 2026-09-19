@@ -21,6 +21,7 @@ import os
 import socket
 import struct
 import threading
+import time
 from typing import Any, Callable, Optional, Type, TypeVar
 
 from google.protobuf import message as proto_message
@@ -389,11 +390,40 @@ class ControlPipeClient:
       )
     return resp_env.payload
 
+  def _connect_tcp(
+      self, endpoint: str, timeout: float
+  ) -> tuple[str, socket.socket]:
+    """Resolves endpoint and connects TCP socket, retrying until timeout."""
+    if self._socket_connector is not _default_connect_socket:
+      return endpoint, self._socket_connector(endpoint, timeout)
+
+    start_time = time.monotonic()
+    last_err: Optional[Exception] = None
+    target = endpoint
+    while True:
+      target = self._resolve_address(endpoint)
+      elapsed = time.monotonic() - start_time
+      remaining = timeout - elapsed if timeout > 0 else 10.0
+      attempt_timeout = min(10.0, max(0.5, remaining))
+      try:
+        sock = _default_connect_socket(target, timeout=attempt_timeout)
+        sock.settimeout(timeout if timeout > 0 else None)
+        return target, sock
+      except (OSError, ValueError, RuntimeError) as err:
+        last_err = err
+
+      if timeout <= 0 or (time.monotonic() - start_time) >= timeout:
+        raise RuntimeError(
+            f"Failed to connect to TCP endpoint {target}: {last_err}"
+        ) from last_err
+      sleep_s = min(1.0, max(0.05, timeout - (time.monotonic() - start_time)))
+      time.sleep(sleep_s)
+
   def _send_legacy_tcp_frame(
-      self, target: str, payload: bytes, timeout: float
+      self, endpoint: str, payload: bytes, timeout: float
   ) -> bytes:
     """Sends a raw 4B big-endian length-prefixed frame over TCP."""
-    sock = self._socket_connector(target, timeout)
+    _, sock = self._connect_tcp(endpoint, timeout)
     try:
       sock.sendall(len(payload).to_bytes(4, "big") + payload)
       resp_len_bytes = _recv_exact(sock, 4)
@@ -415,18 +445,13 @@ class ControlPipeClient:
       message_type: str,
   ) -> bytes:
     """Dispatches raw request bytes over TCP with CPIP or legacy framing."""
-    target = (
-        self._resolve_address(endpoint)
-        if self._socket_connector is _default_connect_socket
-        else endpoint
-    )
     with self._lock:
-      is_known_legacy = target in self._legacy_tcp_endpoints
+      is_known_legacy = endpoint in self._legacy_tcp_endpoints
 
     if self._use_legacy_tcp_framing or is_known_legacy:
-      return self._send_legacy_tcp_frame(target, payload, timeout)
+      return self._send_legacy_tcp_frame(endpoint, payload, timeout)
 
-    sock = self._socket_connector(target, timeout)
+    _, sock = self._connect_tcp(endpoint, timeout)
     try:
       env = control_pipe_pb2.ControlEnvelope(
           message_type=message_type,
@@ -453,8 +478,8 @@ class ControlPipeClient:
       sock.close()
       if message_type.startswith("tpu_sync.rpc."):
         with self._lock:
-          self._legacy_tcp_endpoints.add(target)
-        return self._send_legacy_tcp_frame(target, payload, timeout)
+          self._legacy_tcp_endpoints.add(endpoint)
+        return self._send_legacy_tcp_frame(endpoint, payload, timeout)
       raise err
     finally:
       sock.close()

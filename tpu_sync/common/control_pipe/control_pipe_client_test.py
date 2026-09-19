@@ -483,6 +483,43 @@ class ControlPipeClientTest(absltest.TestCase):
     finally:
       server.close()
 
+  def test_tcp_connect_retries_and_reresolves_until_server_ready(self) -> None:
+    server: _TcpTestServer | None = None
+    attempts = 0
+
+    class _DelayedResolver:
+
+      def resolve(self, endpoint: str) -> str:
+        nonlocal attempts, server
+        attempts += 1
+        if attempts < 3:
+          return endpoint  # Unresolvable BNS-like coordinate before startup
+        if server is None:
+          server = _TcpTestServer(use_legacy_framing=False)
+        return f"127.0.0.1:{server.port}"
+
+    try:
+      client = control_pipe_client.ControlPipeClient(
+          backend=control_pipe_client.ControlPipeBackendType.TCP,
+          name_resolver=_DelayedResolver(),
+      )
+      req = raiden_service_pb2.ControlRequest(
+          command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER
+      )
+      resp = client.call_sync(
+          "/bns/uj/borg/uj/bns/user/controller/0:10019",
+          req,
+          raiden_service_pb2.ControlResponse,
+          timeout=5.0,
+      )
+      self.assertTrue(resp.success)
+      self.assertEqual(resp.message, "CPIP_OK")
+      self.assertGreaterEqual(attempts, 3)
+      client.close()
+    finally:
+      if server is not None:
+        server.close()
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -12,10 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
+#include <thread>  // NOLINT(build/c++11)
 
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
@@ -34,7 +42,6 @@
 #include "tpu_sync/proto/control_pipe.pb.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.pb.h"
-#include "tpu_sync/rpc/raiden_service.grpc.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
@@ -45,6 +52,139 @@ using ::tpu_raiden::control_plane::proto::AckResponse;
 using ::tpu_raiden::control_plane::proto::KVCacheControlPlaneService;
 using ::tpu_raiden::control_plane::proto::PullStreamRequest;
 using ::tpu_raiden::control_plane::proto::PullStreamResponse;
+
+bool ReadAll(int fd, void* buf, size_t len) {
+  char* p = static_cast<char*>(buf);
+  size_t total = 0;
+  while (total < len) {
+    ssize_t n = recv(fd, p + total, len - total, 0);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return false;
+    total += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+bool WriteAll(int fd, const void* buf, size_t len) {
+  const char* p = static_cast<const char*>(buf);
+  size_t total = 0;
+  while (total < len) {
+    ssize_t n = send(fd, p + total, len - total, 0);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return false;
+    total += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+absl::StatusOr<::tpu_sync::rpc::ControlResponse> SendLegacyTcpControlRequest(
+    int port, const ::tpu_sync::rpc::ControlRequest& req) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return absl::InternalError("socket failed");
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(port));
+  inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    close(fd);
+    return absl::UnavailableError("connect failed");
+  }
+  std::string payload = req.SerializeAsString();
+  uint32_t net_len = htonl(static_cast<uint32_t>(payload.size()));
+  if (!WriteAll(fd, &net_len, sizeof(net_len)) ||
+      !WriteAll(fd, payload.data(), payload.size())) {
+    close(fd);
+    return absl::UnavailableError("write failed");
+  }
+  uint32_t resp_net_len = 0;
+  if (!ReadAll(fd, &resp_net_len, sizeof(resp_net_len))) {
+    close(fd);
+    return absl::UnavailableError("read length failed");
+  }
+  uint32_t resp_len = ntohl(resp_net_len);
+  std::string resp_bytes(resp_len, '\0');
+  if (resp_len > 0 && !ReadAll(fd, resp_bytes.data(), resp_len)) {
+    close(fd);
+    return absl::UnavailableError("read payload failed");
+  }
+  close(fd);
+  ::tpu_sync::rpc::ControlResponse resp;
+  if (!resp.ParseFromString(resp_bytes)) {
+    return absl::InternalError("parse response failed");
+  }
+  return resp;
+}
+
+class LegacyTcpWeightSyncServer {
+ public:
+  LegacyTcpWeightSyncServer() {
+    listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    socklen_t len = sizeof(addr);
+    getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+    port_ = ntohs(addr.sin_port);
+    listen(listen_fd_, 16);
+    thread_ = std::thread([this]() { ServeLoop(); });
+  }
+
+  ~LegacyTcpWeightSyncServer() { Stop(); }
+
+  int port() const { return port_; }
+
+  void Stop() {
+    if (!stopped_.exchange(true)) {
+      shutdown(listen_fd_, SHUT_RDWR);
+      close(listen_fd_);
+      if (thread_.joinable()) thread_.join();
+    }
+  }
+
+ private:
+  void ServeLoop() {
+    while (!stopped_.load()) {
+      sockaddr_in client_addr{};
+      socklen_t client_len = sizeof(client_addr);
+      int client_fd = accept(
+          listen_fd_, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+      if (client_fd < 0) {
+        if (errno == EINTR && !stopped_.load()) continue;
+        break;
+      }
+      uint32_t net_len = 0;
+      if (ReadAll(client_fd, &net_len, sizeof(net_len))) {
+        uint32_t msg_len = ntohl(net_len);
+        // Reject CPIP magic header to prove strict legacy-only framing.
+        if (std::memcmp(&net_len, "CPIP", 4) != 0 && msg_len <= 1024 * 1024) {
+          std::string buf(msg_len, '\0');
+          if (ReadAll(client_fd, buf.data(), msg_len)) {
+            ::tpu_sync::rpc::ControlRequest req;
+            if (req.ParseFromString(buf)) {
+              ::tpu_sync::rpc::ControlResponse resp;
+              resp.set_success(true);
+              resp.set_message("old_tcp_server_ok");
+              std::string out = resp.SerializeAsString();
+              uint32_t out_net_len = htonl(static_cast<uint32_t>(out.size()));
+              WriteAll(client_fd, &out_net_len, sizeof(out_net_len));
+              WriteAll(client_fd, out.data(), out.size());
+            }
+          }
+        }
+      }
+      close(client_fd);
+    }
+  }
+
+  int listen_fd_ = -1;
+  int port_ = 0;
+  std::atomic<bool> stopped_{false};
+  std::thread thread_;
+};
 
 class ControlPipeBackendTest
     : public ::testing::TestWithParam<ControlPipeBackendType> {};
@@ -153,17 +293,6 @@ TEST(GrpcMultiServiceAdapterTest, ServesLegacyKVCacheAndWeightSyncGrpcClients) {
       [](const ControlContext& ctx, const AckRequest& req) {
         return absl::OkStatus();
       });
-  server->dispatcher()
-      .RegisterHandler<::tpu_sync::rpc::ControlRequest,
-                       ::tpu_sync::rpc::ControlResponse>(
-          [](const ControlContext& ctx,
-             const ::tpu_sync::rpc::ControlRequest& req)
-              -> absl::StatusOr<::tpu_sync::rpc::ControlResponse> {
-            ::tpu_sync::rpc::ControlResponse resp;
-            resp.set_success(true);
-            resp.set_message("weight_sync_ok");
-            return resp;
-          });
 
   TF_ASSERT_OK_AND_ASSIGN(int port, server->Start(0));
   std::string endpoint = absl::StrCat("127.0.0.1:", port);
@@ -194,21 +323,7 @@ TEST(GrpcMultiServiceAdapterTest, ServesLegacyKVCacheAndWeightSyncGrpcClients) {
     EXPECT_EQ(resp.status(), 0);
   }
 
-  // 2. Call via legacy WeightSynchronizationWorkerService::Stub
-  auto ws_stub =
-      ::tpu_sync::rpc::WeightSynchronizationWorkerService::NewStub(channel);
-  {
-    grpc::ClientContext ctx;
-    ::tpu_sync::rpc::ControlRequest req;
-    req.set_command(::tpu_sync::rpc::ControlRequest::COMMAND_SHUTDOWN);
-    ::tpu_sync::rpc::ControlResponse resp;
-    grpc::Status status = ws_stub->HandleControl(&ctx, req, &resp);
-    ASSERT_TRUE(status.ok()) << status.error_message();
-    EXPECT_TRUE(resp.success());
-    EXPECT_EQ(resp.message(), "weight_sync_ok");
-  }
-
-  // 3. Call bidirectional ControlStream on ControlPipeService::Stub
+  // 2. Call bidirectional ControlStream on ControlPipeService::Stub
   auto pipe_stub = control_pipe::proto::ControlPipeService::NewStub(channel);
   {
     grpc::ClientContext ctx;
@@ -231,6 +346,67 @@ TEST(GrpcMultiServiceAdapterTest, ServesLegacyKVCacheAndWeightSyncGrpcClients) {
   }
 
   server->Stop();
+}
+
+TEST(WeightSyncFourWayInteropTest, TcpFourWayClientServerMatrix) {
+  LegacyTcpWeightSyncServer old_server;
+  std::string old_endpoint = absl::StrCat("127.0.0.1:", old_server.port());
+
+  ControlPipeConfig new_cfg;
+  new_cfg.backend_type = ControlPipeBackendType::kTcp;
+  new_cfg.allow_legacy_framing = true;
+  std::unique_ptr<ControlPipeServer> new_server =
+      CreateControlPipeServer(new_cfg);
+  new_server->dispatcher()
+      .RegisterHandler<::tpu_sync::rpc::ControlRequest,
+                       ::tpu_sync::rpc::ControlResponse>(
+          [](const ControlContext& ctx,
+             const ::tpu_sync::rpc::ControlRequest& req)
+              -> absl::StatusOr<::tpu_sync::rpc::ControlResponse> {
+            ::tpu_sync::rpc::ControlResponse resp;
+            resp.set_success(true);
+            resp.set_message("new_tcp_server_ok");
+            return resp;
+          });
+  TF_ASSERT_OK_AND_ASSIGN(int new_port, new_server->Start(0));
+  std::string new_endpoint = absl::StrCat("127.0.0.1:", new_port);
+
+  std::unique_ptr<ControlPipeClient> new_client =
+      CreateControlPipeClient(new_cfg);
+
+  ::tpu_sync::rpc::ControlRequest req;
+  req.set_command(::tpu_sync::rpc::ControlRequest::COMMAND_START_TRANSFER);
+
+  // 1. Old Client -> Old Server
+  TF_ASSERT_OK_AND_ASSIGN(::tpu_sync::rpc::ControlResponse resp_old_old,
+                          SendLegacyTcpControlRequest(old_server.port(), req));
+  EXPECT_TRUE(resp_old_old.success());
+  EXPECT_EQ(resp_old_old.message(), "old_tcp_server_ok");
+
+  // 2. Old Client -> New Server
+  TF_ASSERT_OK_AND_ASSIGN(::tpu_sync::rpc::ControlResponse resp_old_new,
+                          SendLegacyTcpControlRequest(new_port, req));
+  EXPECT_TRUE(resp_old_new.success());
+  EXPECT_EQ(resp_old_new.message(), "new_tcp_server_ok");
+
+  // 3. New Client -> Old Server
+  TF_ASSERT_OK_AND_ASSIGN(
+      ::tpu_sync::rpc::ControlResponse resp_new_old,
+      (new_client->Call<::tpu_sync::rpc::ControlRequest,
+                        ::tpu_sync::rpc::ControlResponse>(old_endpoint, req)));
+  EXPECT_TRUE(resp_new_old.success());
+  EXPECT_EQ(resp_new_old.message(), "old_tcp_server_ok");
+
+  // 4. New Client -> New Server
+  TF_ASSERT_OK_AND_ASSIGN(
+      ::tpu_sync::rpc::ControlResponse resp_new_new,
+      (new_client->Call<::tpu_sync::rpc::ControlRequest,
+                        ::tpu_sync::rpc::ControlResponse>(new_endpoint, req)));
+  EXPECT_TRUE(resp_new_new.success());
+  EXPECT_EQ(resp_new_new.message(), "new_tcp_server_ok");
+
+  new_server->Stop();
+  old_server.Stop();
 }
 
 }  // namespace

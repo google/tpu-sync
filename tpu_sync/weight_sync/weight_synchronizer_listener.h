@@ -16,25 +16,25 @@
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_WEIGHT_SYNC_WEIGHT_SYNCHRONIZER_LISTENER_H_
 
 #include <atomic>
-#include <string>
-#include <thread>  // NOLINT
+#include <functional>
+#include <memory>
 
-#include "tpu_sync/common/detached_thread_group.h"
+#include "tpu_sync/common/control_pipe/control_pipe_server.h"
+#include "tpu_sync/common/control_pipe/control_pipe_types.h"
+#include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
 namespace weight_sync {
 
 class WeightSynchronizerBase;
 
-// TCP Socket Server Daemon that runs natively in C++ to accept Control-Plane
-// management RPC commands (like PushWeights and Shutdown) directly from the
-// RL Coordinator or Controller task, bypassing Python servicer overhead.
-//
-// Connection threads are detached; the destructor blocks until every in-flight
-// connection has returned instead of joining retained thread objects.
+// Control-Plane Server Daemon that runs natively in C++ to accept management
+// RPC commands (like PushWeights and Shutdown) directly via ControlPipeServer.
 class WeightSynchronizerListener final {
  public:
-  WeightSynchronizerListener(WeightSynchronizerBase* engine, int listener_port);
+  WeightSynchronizerListener(
+      WeightSynchronizerBase* engine, int listener_port,
+      ControlPipeBackendType backend_type = ControlPipeBackendType::kTcp);
   ~WeightSynchronizerListener();
 
   WeightSynchronizerListener(const WeightSynchronizerListener&) = delete;
@@ -42,23 +42,24 @@ class WeightSynchronizerListener final {
       delete;
 
   int listener_port() const { return listener_port_; }
-  bool is_active() const { return !stopping_; }
+  bool is_active() const { return !stopping_.load(); }
+
+  void Shutdown();
+
+  // Executes a single ControlRequest against |engine| and populates |resp|.
+  // Invokes |shutdown_callback| if a COMMAND_SHUTDOWN request is processed.
+  static void ExecuteControlRequest(
+      WeightSynchronizerBase* engine,
+      const ::tpu_sync::rpc::ControlRequest& req,
+      ::tpu_sync::rpc::ControlResponse* resp,
+      std::function<void()> shutdown_callback = nullptr);
 
  private:
-  void ListenerLoop();
-  void ConnectionWorker(int client_fd);
-
   WeightSynchronizerBase* engine_;
-  int listener_port_;
-  std::atomic<int> server_fd_{-1};
+  int listener_port_ = 0;
   std::atomic<bool> stopping_{false};
 
-  std::thread listener_thread_;
-
-  // The destructor drains this so |engine_| and `this` outlive every in-flight
-  // connection.
-  DetachedThreadGroup connection_threads_{
-      "WeightSynchronizerListener connection"};
+  std::unique_ptr<ControlPipeServer> pipe_server_;
 };
 
 }  // namespace weight_sync

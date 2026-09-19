@@ -193,8 +193,6 @@ cc_library(
         "//tpu_sync/proto:control_pipe_cc_proto",
         "//tpu_sync/proto:kv_cache_control_plane_service_cc_grpc",
         "//tpu_sync/proto:kv_cache_control_plane_service_cc_proto",
-        "//tpu_sync/rpc:raiden_service_cc_grpc",
-        "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -313,7 +311,6 @@ cc_test(
         "//tpu_sync/proto:control_pipe_cc_proto",
         "//tpu_sync/proto:kv_cache_control_plane_service_cc_grpc",
         "//tpu_sync/proto:kv_cache_control_plane_service_cc_proto",
-        "//tpu_sync/rpc:raiden_service_cc_grpc",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status",
@@ -329,11 +326,9 @@ py_library(
     srcs = ["control_pipe_client.py"],
     visibility = ["//visibility:public"],
     deps = [
-        "//net/proto2/python/public",
         "//tpu_sync/proto:control_pipe_py_pb2",
         "//tpu_sync/proto:control_pipe_py_pb2_grpc",
         "@com_github_grpc_grpc//src/python/grpcio/grpc:grpcio",
-        "@pypi//pyzmq",
     ],
 )
 
@@ -342,12 +337,10 @@ py_test(
     srcs = ["control_pipe_client_test.py"],
     deps = [
         ":control_pipe_client",
-        "//net/grpc/python:use_insecure_channel_for_test",
         "//tpu_sync/proto:control_pipe_py_pb2",
         "//tpu_sync/proto:control_pipe_py_pb2_grpc",
         "//tpu_sync/rpc:raiden_service_py_pb2",
         "@com_github_grpc_grpc//src/python/grpcio/grpc:grpcio",
         "@com_google_absl_py//absl/testing:absltest",
-        "@pypi//pyzmq",
     ],
 )

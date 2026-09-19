@@ -24,12 +24,24 @@ import threading
 from typing import Any, Callable, Optional, Type, TypeVar
 
 from google.protobuf import message as proto_message
-import grpc
-import zmq
-import zmq.asyncio
 
 from tpu_sync.proto import control_pipe_pb2
-from tpu_sync.proto import control_pipe_pb2_grpc
+
+try:
+  import grpc  # pylint: disable=g-import-not-at-top
+except ImportError:
+  grpc = None  # type: ignore[assignment]
+
+try:
+  import zmq  # pylint: disable=g-import-not-at-top
+  import zmq.asyncio  # pylint: disable=g-import-not-at-top
+except ImportError:
+  zmq = None  # type: ignore[assignment]
+
+try:
+  from tpu_sync.proto import control_pipe_pb2_grpc  # pylint: disable=g-import-not-at-top
+except ImportError:
+  control_pipe_pb2_grpc = None  # type: ignore[assignment]
 
 ReqT = TypeVar("ReqT", bound=proto_message.Message)
 RespT = TypeVar("RespT", bound=proto_message.Message)
@@ -165,11 +177,10 @@ class ControlPipeClient:
     self._executor = executor
     self._lock = threading.Lock()
     self._next_req_id = 1
-    self._aio_channels: dict[str, grpc.aio.Channel] = {}
-    self._aio_stubs: dict[str, control_pipe_pb2_grpc.ControlPipeServiceStub] = (
-        {}
-    )
-    self._zmq_aio_ctx: Optional[zmq.asyncio.Context] = None
+    self._aio_channels: dict[str, Any] = {}
+    self._aio_stubs: dict[str, Any] = {}
+    self._legacy_tcp_endpoints: set[str] = set()
+    self._zmq_aio_ctx: Optional[Any] = None
 
   @property
   def backend(self) -> ControlPipeBackendType:
@@ -192,10 +203,10 @@ class ControlPipeClient:
         return endpoint
     return endpoint
 
-  def _get_or_create_aio_stub(
-      self, endpoint: str
-  ) -> control_pipe_pb2_grpc.ControlPipeServiceStub:
+  def _get_or_create_aio_stub(self, endpoint: str) -> Any:
     """Returns a cached or newly created async gRPC stub for endpoint."""
+    if grpc is None or control_pipe_pb2_grpc is None:
+      raise RuntimeError("gRPC is required for ControlPipeBackendType.GRPC")
     resolved = self._resolve_address(endpoint)
     with self._lock:
       stub = self._aio_stubs.get(resolved)
@@ -225,6 +236,43 @@ class ControlPipeClient:
     response = response_cls()
     response.ParseFromString(resp_bytes)
     return response
+
+  def call_sync(
+      self,
+      endpoint: str,
+      request: ReqT,
+      response_cls: Type[RespT],
+      timeout: float = 600.0,
+  ) -> RespT:
+    """Dispatches a typed request proto synchronously and returns response."""
+    resp_bytes = self.send_raw_bytes_sync(
+        endpoint,
+        request.SerializeToString(),
+        timeout=timeout,
+        message_type=request.DESCRIPTOR.full_name,
+    )
+    response = response_cls()
+    response.ParseFromString(resp_bytes)
+    return response
+
+  def send_raw_bytes_sync(
+      self,
+      endpoint: str,
+      payload: bytes,
+      timeout: float = 600.0,
+      message_type: str = "tpu_sync.rpc.ControlRequest",
+  ) -> bytes:
+    """Dispatches raw payload bytes synchronously and returns response bytes."""
+    if self.backend in (
+        ControlPipeBackendType.GRPC,
+        ControlPipeBackendType.ZMQ,
+    ):
+      return asyncio.run(
+          self.send_raw_bytes(
+              endpoint, payload, timeout=timeout, message_type=message_type
+          )
+      )
+    return self._send_raw_tcp_sync(endpoint, payload, timeout, message_type)
 
   async def send_raw_bytes(
       self,
@@ -262,6 +310,8 @@ class ControlPipeClient:
       message_type: str,
   ) -> bytes:
     """Asynchronously dispatches raw request bytes over gRPC ControlPipeService."""
+    if grpc is None or control_pipe_pb2_grpc is None:
+      raise RuntimeError("gRPC is required for ControlPipeBackendType.GRPC")
     try:
       stub = self._get_or_create_aio_stub(endpoint)
       env = control_pipe_pb2.ControlEnvelope(
@@ -292,6 +342,8 @@ class ControlPipeClient:
       message_type: str,
   ) -> bytes:
     """Asynchronously dispatches raw request bytes over ZeroMQ."""
+    if zmq is None:
+      raise RuntimeError("pyzmq is required for ControlPipeBackendType.ZMQ")
     resolved = self._resolve_address(endpoint)
     with self._lock:
       if self._zmq_aio_ctx is None:
@@ -337,6 +389,24 @@ class ControlPipeClient:
       )
     return resp_env.payload
 
+  def _send_legacy_tcp_frame(
+      self, target: str, payload: bytes, timeout: float
+  ) -> bytes:
+    """Sends a raw 4B big-endian length-prefixed frame over TCP."""
+    sock = self._socket_connector(target, timeout)
+    try:
+      sock.sendall(len(payload).to_bytes(4, "big") + payload)
+      resp_len_bytes = _recv_exact(sock, 4)
+      resp_len = int.from_bytes(resp_len_bytes, "big")
+      if resp_len > self._max_frame_bytes:
+        raise RuntimeError(
+            f"Response frame size ({resp_len}) exceeds max_frame_bytes "
+            f"({self._max_frame_bytes})"
+        )
+      return _recv_exact(sock, resp_len)
+    finally:
+      sock.close()
+
   def _send_raw_tcp_sync(
       self,
       endpoint: str,
@@ -350,14 +420,14 @@ class ControlPipeClient:
         if self._socket_connector is _default_connect_socket
         else endpoint
     )
+    with self._lock:
+      is_known_legacy = target in self._legacy_tcp_endpoints
+
+    if self._use_legacy_tcp_framing or is_known_legacy:
+      return self._send_legacy_tcp_frame(target, payload, timeout)
+
     sock = self._socket_connector(target, timeout)
     try:
-      if self._use_legacy_tcp_framing:
-        sock.sendall(len(payload).to_bytes(4, "big") + payload)
-        resp_len_bytes = _recv_exact(sock, 4)
-        resp_len = int.from_bytes(resp_len_bytes, "big")
-        return _recv_exact(sock, resp_len)
-
       env = control_pipe_pb2.ControlEnvelope(
           message_type=message_type,
           request_id=self._allocate_req_id(),
@@ -366,6 +436,11 @@ class ControlPipeClient:
       env_bytes = env.SerializeToString()
       header = _HEADER_STRUCT.pack(CPIP_MAGIC, len(env_bytes))
       sock.sendall(header + env_bytes)
+      if hasattr(sock, "shutdown"):
+        try:
+          sock.shutdown(socket.SHUT_WR)
+        except OSError:
+          pass
 
       resp_hdr = _recv_exact(sock, _HEADER_STRUCT.size)
       magic, resp_len = _HEADER_STRUCT.unpack(resp_hdr)
@@ -374,14 +449,22 @@ class ControlPipeClient:
       resp_env_bytes = _recv_exact(sock, resp_len)
       resp_env = control_pipe_pb2.ControlResponseEnvelope()
       resp_env.ParseFromString(resp_env_bytes)
-      if resp_env.status_code != 0:
-        raise RuntimeError(
-            f"Remote ControlPipe error (code={resp_env.status_code}): "
-            f"{resp_env.error_message}"
-        )
-      return resp_env.payload
+    except (OSError, RuntimeError) as err:
+      sock.close()
+      if message_type.startswith("tpu_sync.rpc."):
+        with self._lock:
+          self._legacy_tcp_endpoints.add(target)
+        return self._send_legacy_tcp_frame(target, payload, timeout)
+      raise err
     finally:
       sock.close()
+
+    if resp_env.status_code != 0:
+      raise RuntimeError(
+          f"Remote ControlPipe error (code={resp_env.status_code}): "
+          f"{resp_env.error_message}"
+      )
+    return resp_env.payload
 
   async def aclose(self) -> None:
     """Asynchronously closes all cached grpc.aio channels and ZMQ context."""
@@ -403,3 +486,119 @@ class ControlPipeClient:
       if self._zmq_aio_ctx is not None:
         self._zmq_aio_ctx.term()
         self._zmq_aio_ctx = None
+
+
+def _create_dual_stack_server_socket(port: int) -> socket.socket:
+  """Creates an IPv6 dual-stack or IPv4 listening TCP socket."""
+  try:
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("::", port))
+    sock.listen(128)
+    return sock
+  except OSError:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", port))
+    sock.listen(128)
+    return sock
+
+
+class ControlPipeServer:
+  """Python TCP ControlPipeServer supporting both CPIP envelope and 4B legacy framing."""
+
+  def __init__(
+      self,
+      port: int,
+      handler: Callable[[bytes], bytes],
+      max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
+  ) -> None:
+    self._handler = handler
+    self._max_frame_bytes = max_frame_bytes
+    self._sock = _create_dual_stack_server_socket(port)
+    self._port = int(self._sock.getsockname()[1]) if port == 0 else port
+    self._stopped = False
+    self._thread: Optional[threading.Thread] = None
+
+  @property
+  def port(self) -> int:
+    """Returns the bound TCP port."""
+    return self._port
+
+  @property
+  def thread(self) -> Optional[threading.Thread]:
+    """Returns the background accept loop thread."""
+    return self._thread
+
+  def start(self) -> int:
+    """Starts the background accept loop and returns the bound port."""
+    self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+    self._thread.start()
+    return self._port
+
+  def stop(self) -> None:
+    """Stops the accept loop and closes the listening socket."""
+    self._stopped = True
+    for host in ("[::1]", "127.0.0.1"):
+      try:
+        wake_sock = _default_connect_socket(f"{host}:{self._port}", timeout=0.5)
+        wake_sock.close()
+        break
+      except Exception:  # pylint: disable=broad-except
+        pass
+    try:
+      self._sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+      pass
+    try:
+      self._sock.close()
+    except OSError:
+      pass
+
+  def _accept_loop(self) -> None:
+    """Accepts incoming connections and spawns handler threads."""
+    while not self._stopped:
+      try:
+        conn, _ = self._sock.accept()
+        if self._stopped:
+          conn.close()
+          break
+        threading.Thread(
+            target=self._handle_conn, args=(conn,), daemon=True
+        ).start()
+      except OSError:
+        break
+
+  def _handle_conn(self, conn: socket.socket) -> None:
+    """Processes a single CPIP or 4B legacy-framed request on conn."""
+    try:
+      first_four = _recv_exact(conn, 4)
+      if first_four == CPIP_MAGIC:
+        len_bytes = _recv_exact(conn, 4)
+        env_len = int.from_bytes(len_bytes, "big")
+        if env_len > self._max_frame_bytes:
+          return
+        env_bytes = _recv_exact(conn, env_len)
+        env = control_pipe_pb2.ControlEnvelope()
+        env.ParseFromString(env_bytes)
+        resp_payload = self._handler(env.payload)
+        resp_env = control_pipe_pb2.ControlResponseEnvelope(
+            request_id=env.request_id,
+            status_code=0,
+            payload=resp_payload,
+        )
+        resp_env_bytes = resp_env.SerializeToString()
+        header = _HEADER_STRUCT.pack(PIPC_MAGIC, len(resp_env_bytes))
+        conn.sendall(header + resp_env_bytes)
+      else:
+        req_len = int.from_bytes(first_four, "big")
+        if req_len > self._max_frame_bytes:
+          return
+        req_bytes = _recv_exact(conn, req_len)
+        resp_bytes = self._handler(req_bytes)
+        conn.sendall(len(resp_bytes).to_bytes(4, "big") + resp_bytes)
+    except Exception:  # pylint: disable=broad-except
+      pass
+    finally:
+      conn.close()

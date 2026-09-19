@@ -75,8 +75,13 @@ class _MockControlPipeServicer(
 class _TcpTestServer:
   """Lightweight TCP test server supporting CPIP and legacy framing."""
 
-  def __init__(self, use_legacy_framing: bool = False) -> None:
+  def __init__(
+      self,
+      use_legacy_framing: bool = False,
+      allow_legacy_framing: bool = True,
+  ) -> None:
     self._use_legacy_framing = use_legacy_framing
+    self._allow_legacy_framing = allow_legacy_framing
     self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     self._sock.bind(("127.0.0.1", 0))
@@ -107,9 +112,11 @@ class _TcpTestServer:
 
   def _handle_client(self, conn: socket.socket) -> None:
     try:
+      first4 = self._recv_exact(conn, 4)
       if self._use_legacy_framing:
-        raw_len = self._recv_exact(conn, 4)
-        msg_len = int.from_bytes(raw_len, "big")
+        if first4 == control_pipe_client.CPIP_MAGIC:
+          return
+        msg_len = int.from_bytes(first4, "big")
         payload = self._recv_exact(conn, msg_len)
         req = raiden_service_pb2.ControlRequest()
         req.ParseFromString(payload)
@@ -120,10 +127,22 @@ class _TcpTestServer:
         conn.sendall(len(resp_bytes).to_bytes(4, "big") + resp_bytes)
         return
 
-      hdr = self._recv_exact(conn, 8)
-      magic, env_len = struct.unpack("!4sI", hdr)
-      if magic != control_pipe_client.CPIP_MAGIC:
+      if first4 != control_pipe_client.CPIP_MAGIC:
+        if not self._allow_legacy_framing:
+          return
+        msg_len = int.from_bytes(first4, "big")
+        payload = self._recv_exact(conn, msg_len)
+        req = raiden_service_pb2.ControlRequest()
+        req.ParseFromString(payload)
+        resp = raiden_service_pb2.ControlResponse(
+            success=True, message="NEW_SERVER_LEGACY_FRAME_OK"
+        )
+        resp_bytes = resp.SerializeToString()
+        conn.sendall(len(resp_bytes).to_bytes(4, "big") + resp_bytes)
         return
+
+      len_bytes = self._recv_exact(conn, 4)
+      env_len = int.from_bytes(len_bytes, "big")
       env_bytes = self._recv_exact(conn, env_len)
       env = control_pipe_pb2.ControlEnvelope()
       env.ParseFromString(env_bytes)
@@ -150,6 +169,21 @@ class _TcpTestServer:
     self._stopping = True
     self._sock.close()
     self._thread.join(timeout=2.0)
+
+
+def _send_legacy_tcp_request(
+    endpoint: str, req: raiden_service_pb2.ControlRequest
+) -> raiden_service_pb2.ControlResponse:
+  """Simulates a legacy TCP client sending [4B len][ControlRequest]."""
+  host, port_str = endpoint.split(":")
+  with socket.create_connection((host, int(port_str)), timeout=5.0) as sock:
+    payload = req.SerializeToString()
+    sock.sendall(len(payload).to_bytes(4, "big") + payload)
+    resp_len = int.from_bytes(control_pipe_client._recv_exact(sock, 4), "big")
+    resp_bytes = control_pipe_client._recv_exact(sock, resp_len)
+    resp = raiden_service_pb2.ControlResponse()
+    resp.ParseFromString(resp_bytes)
+    return resp
 
 
 class _ZmqTestServer:
@@ -257,7 +291,9 @@ class ControlPipeClientTest(absltest.TestCase):
       )
 
   def test_tcp_cpip_framing(self) -> None:
-    server = _TcpTestServer(use_legacy_framing=False)
+    server = _TcpTestServer(
+        use_legacy_framing=False, allow_legacy_framing=False
+    )
     endpoint = f"127.0.0.1:{server.port}"
     try:
 
@@ -268,9 +304,14 @@ class ControlPipeClientTest(absltest.TestCase):
         req = raiden_service_pb2.ControlRequest(
             command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER
         )
-        resp = await client.call(
-            endpoint, req, raiden_service_pb2.ControlResponse, timeout=5.0
+        resp_bytes = await client.send_raw_bytes(
+            endpoint,
+            req.SerializeToString(),
+            timeout=5.0,
+            message_type="tpu_raiden.control_plane.proto.PullStreamRequest",
         )
+        resp = raiden_service_pb2.ControlResponse()
+        resp.ParseFromString(resp_bytes)
         self.assertTrue(resp.success)
         self.assertEqual(resp.message, "CPIP_OK")
         await client.aclose()
@@ -302,6 +343,51 @@ class ControlPipeClientTest(absltest.TestCase):
       asyncio.run(_run())
     finally:
       server.close()
+
+  def test_tcp_four_way_interop(self) -> None:
+    old_server = _TcpTestServer(use_legacy_framing=True)
+    new_server = _TcpTestServer(
+        use_legacy_framing=False, allow_legacy_framing=True
+    )
+    old_endpoint = f"127.0.0.1:{old_server.port}"
+    new_endpoint = f"127.0.0.1:{new_server.port}"
+    try:
+      req = raiden_service_pb2.ControlRequest(
+          command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER
+      )
+      # 1. Old Client -> Old Server
+      resp_old_old = _send_legacy_tcp_request(old_endpoint, req)
+      self.assertTrue(resp_old_old.success)
+      self.assertEqual(resp_old_old.message, "LEGACY_OK")
+
+      # 2. Old Client -> New Server
+      resp_old_new = _send_legacy_tcp_request(new_endpoint, req)
+      self.assertTrue(resp_old_new.success)
+      self.assertEqual(resp_old_new.message, "NEW_SERVER_LEGACY_FRAME_OK")
+
+      async def _run_new_client() -> None:
+        new_client = control_pipe_client.ControlPipeClient(
+            backend=control_pipe_client.ControlPipeBackendType.TCP
+        )
+        # 3. New Client -> Old Server
+        resp_new_old = await new_client.call(
+            old_endpoint, req, raiden_service_pb2.ControlResponse, timeout=5.0
+        )
+        self.assertTrue(resp_new_old.success)
+        self.assertEqual(resp_new_old.message, "LEGACY_OK")
+
+        # 4. New Client -> New Server
+        resp_new_new = await new_client.call(
+            new_endpoint, req, raiden_service_pb2.ControlResponse, timeout=5.0
+        )
+        self.assertTrue(resp_new_new.success)
+        self.assertEqual(resp_new_new.message, "CPIP_OK")
+        await new_client.aclose()
+
+      asyncio.run(_run_new_client())
+    finally:
+      old_server.close()
+      new_server.close()
 
   def test_grpc_backend(self) -> None:
     servicer = _MockControlPipeServicer()

@@ -151,6 +151,8 @@ fi
 BAZEL_TARGETS=(
   "//tpu_sync/rpc:raiden_service_py_pb2"
   "//tpu_sync/rpc:coordination_py_pb2"
+  "//tpu_sync/proto:control_pipe_py_pb2"
+  "//tpu_sync/proto:control_pipe_py_pb2_grpc"
   "//tpu_sync/rpc:coordination_py_pb2_grpc"
   "//tpu_sync/rpc:controller_service_py_pb2"
   # C++ control-plane service binaries. These do not depend on JAX or Torch,
@@ -345,6 +347,8 @@ cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/rpc/raiden_service_pb2.py" "${WORKSPA
 cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/rpc/coordination_pb2.py" "${WORKSPACE_DIR}/tpu_sync/rpc/" 2>/dev/null || true
 cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/rpc/coordination_pb2_grpc.py" "${WORKSPACE_DIR}/tpu_sync/rpc/" 2>/dev/null || true
 cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/rpc/controller_service_pb2.py" "${WORKSPACE_DIR}/tpu_sync/rpc/" 2>/dev/null || true
+cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/proto/control_pipe_pb2.py" "${WORKSPACE_DIR}/tpu_sync/proto/" 2>/dev/null || true
+cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/proto/control_pipe_pb2_grpc.py" "${WORKSPACE_DIR}/tpu_sync/proto/" 2>/dev/null || true
 
 echo "=== Linking C++ control-plane service binaries into source tree ==="
 # The KVCacheStore tests (kv_cache_store_test.py / kv_cache_store_e2e_test.py)

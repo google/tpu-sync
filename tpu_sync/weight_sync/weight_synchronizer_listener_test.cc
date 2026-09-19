@@ -142,6 +142,7 @@ TEST(WeightSynchronizerListenerTest, ShutdownCommandStopsService) {
   EXPECT_TRUE(resp.success());
 
   close(sock);
+  EXPECT_LT(ConnectToListenerPort(listener.listener_port()), 0);
 }
 
 TEST(WeightSynchronizerListenerTest, PushWeightsReshardedSuccess) {

@@ -38,25 +38,10 @@ cc_proto_library(
     deps = [":raiden_service_proto"],
 )
 
-cc_grpc_library(
-    name = "raiden_service_cc_grpc",
-    srcs = [":raiden_service_proto"],
-    generate_mocks = True,
-    visibility = ["//visibility:public"],
-    deps = [":raiden_service_cc_proto"],
-)
-
 py_proto_library(
     name = "raiden_service_py_pb2",
     visibility = ["//visibility:public"],
     deps = [":raiden_service_proto"],
-)
-
-py_grpc_library(
-    name = "raiden_service_py_pb2_grpc",
-    srcs = [":raiden_service_proto"],
-    visibility = ["//visibility:public"],
-    deps = [":raiden_service_py_pb2"],
 )
 
 proto_library(
@@ -117,6 +102,7 @@ py_library(
         ":controller_service_py_pb2",
         ":raiden_service_py_pb2",
         "//tpu_sync/api:common",
+        "//tpu_sync/common/control_pipe:control_pipe_client",
         "//tpu_sync/kv_cache:nd_slice_math",
         "//tpu_sync/weight_sync:broadcast_engine",
         "@com_google_absl_py//absl/logging",

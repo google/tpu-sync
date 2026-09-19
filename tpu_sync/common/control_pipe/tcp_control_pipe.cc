@@ -442,6 +442,15 @@ void TcpControlPipeServer::Stop() {
   mu_.Await(absl::Condition(&all_handlers_done));
 }
 
+void TcpControlPipeServer::StopAccepting() {
+  absl::MutexLock lock(mu_);
+  if (server_fd_ >= 0) {
+    shutdown(server_fd_, SHUT_RDWR);
+    close(server_fd_);
+    server_fd_ = -1;
+  }
+}
+
 void TcpControlPipeServer::AcceptLoop() {
   while (true) {
     int current_server_fd = -1;
@@ -811,50 +820,135 @@ TcpControlPipeClient::SendRaw(
   absl::Duration effective_timeout =
       timeout > absl::ZeroDuration() ? timeout : config_.default_timeout;
 
-  ABSL_ASSIGN_OR_RETURN(int fd,
-                        conn_pool_->Acquire(endpoint, effective_timeout));
-  auto fd_closer = absl::MakeCleanup([fd]() { close(fd); });
+  const bool can_fallback_legacy =
+      config_.allow_legacy_framing &&
+      envelope.message_type() ==
+          ::tpu_sync::rpc::ControlRequest::descriptor()->full_name();
 
-  std::string env_bytes;
-  if (!envelope.SerializeToString(&env_bytes)) {
-    return absl::InternalError("Failed to serialize ControlEnvelope");
+  auto send_legacy_frame =
+      [&]() -> absl::StatusOr<control_pipe::proto::ControlResponseEnvelope> {
+    ABSL_ASSIGN_OR_RETURN(int fd, ConnectSocket(endpoint, effective_timeout));
+    auto fd_closer = absl::MakeCleanup([fd]() { close(fd); });
+
+    uint32_t net_len = htonl(static_cast<uint32_t>(envelope.payload().size()));
+    ABSL_RETURN_IF_ERROR(WriteExact(fd, &net_len, sizeof(net_len)));
+    if (!envelope.payload().empty()) {
+      ABSL_RETURN_IF_ERROR(
+          WriteExact(fd, envelope.payload().data(), envelope.payload().size()));
+    }
+    shutdown(fd, SHUT_WR);
+
+    uint32_t resp_net_len = 0;
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, &resp_net_len, sizeof(resp_net_len)));
+    uint32_t resp_len = ntohl(resp_net_len);
+    if (resp_len > config_.max_frame_bytes) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "Response frame size (", resp_len, ") exceeds max_frame_bytes (",
+          config_.max_frame_bytes, ")"));
+    }
+
+    control_pipe::proto::ControlResponseEnvelope resp_env;
+    resp_env.set_request_id(envelope.request_id());
+    resp_env.set_status_code(0);
+    std::string* resp_payload = resp_env.mutable_payload();
+    resp_payload->resize(resp_len);
+    if (resp_len > 0) {
+      ABSL_RETURN_IF_ERROR(ReadExact(fd, resp_payload->data(), resp_len));
+    }
+    return resp_env;
+  };
+
+  bool is_verified_cpip = false;
+  if (can_fallback_legacy) {
+    bool is_known_legacy = false;
+    {
+      absl::MutexLock lock(legacy_mu_);
+      is_known_legacy = legacy_endpoints_.contains(endpoint);
+      is_verified_cpip = verified_cpip_endpoints_.contains(endpoint);
+    }
+    if (is_known_legacy) {
+      return send_legacy_frame();
+    }
   }
 
-  uint32_t net_len = htonl(static_cast<uint32_t>(env_bytes.size()));
-  ABSL_RETURN_IF_ERROR(WriteExact(fd, kCpipMagic, 4));
-  ABSL_RETURN_IF_ERROR(WriteExact(fd, &net_len, sizeof(net_len)));
-  if (!env_bytes.empty()) {
-    ABSL_RETURN_IF_ERROR(WriteExact(fd, env_bytes.data(), env_bytes.size()));
-  }
+  const bool probe_with_shut_wr = can_fallback_legacy && !is_verified_cpip;
 
-  char resp_magic[4] = {0};
-  ABSL_RETURN_IF_ERROR(ReadExact(fd, resp_magic, 4));
-  if (std::memcmp(resp_magic, kPipcMagic, 4) != 0) {
-    return absl::InternalError("Invalid response magic header (expected PIPC)");
-  }
+  auto try_cpip =
+      [&]() -> absl::StatusOr<control_pipe::proto::ControlResponseEnvelope> {
+    int fd = -1;
+    if (probe_with_shut_wr) {
+      ABSL_ASSIGN_OR_RETURN(fd, ConnectSocket(endpoint, effective_timeout));
+    } else {
+      ABSL_ASSIGN_OR_RETURN(fd,
+                            conn_pool_->Acquire(endpoint, effective_timeout));
+    }
+    auto fd_closer = absl::MakeCleanup([fd]() { close(fd); });
 
-  uint32_t resp_net_len = 0;
-  ABSL_RETURN_IF_ERROR(ReadExact(fd, &resp_net_len, sizeof(resp_net_len)));
-  uint32_t resp_len = ntohl(resp_net_len);
-  if (resp_len > config_.max_frame_bytes) {
-    return absl::ResourceExhaustedError(absl::StrCat(
-        "Response frame size (", resp_len, ") exceeds max_frame_bytes (",
-        config_.max_frame_bytes, ")"));
-  }
+    std::string env_bytes;
+    if (!envelope.SerializeToString(&env_bytes)) {
+      return absl::InternalError("Failed to serialize ControlEnvelope");
+    }
 
-  std::string resp_bytes(resp_len, '\0');
-  if (resp_len > 0) {
-    ABSL_RETURN_IF_ERROR(ReadExact(fd, resp_bytes.data(), resp_len));
-  }
+    uint32_t net_len = htonl(static_cast<uint32_t>(env_bytes.size()));
+    ABSL_RETURN_IF_ERROR(WriteExact(fd, kCpipMagic, 4));
+    ABSL_RETURN_IF_ERROR(WriteExact(fd, &net_len, sizeof(net_len)));
+    if (!env_bytes.empty()) {
+      ABSL_RETURN_IF_ERROR(WriteExact(fd, env_bytes.data(), env_bytes.size()));
+    }
+    if (probe_with_shut_wr) {
+      shutdown(fd, SHUT_WR);
+    }
 
-  control_pipe::proto::ControlResponseEnvelope resp_env;
-  if (!resp_env.ParseFromString(resp_bytes)) {
-    return absl::InternalError("Failed to parse ControlResponseEnvelope");
-  }
+    char resp_magic[4] = {0};
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, resp_magic, 4));
+    if (std::memcmp(resp_magic, kPipcMagic, 4) != 0) {
+      return absl::InternalError(
+          "Invalid response magic header (expected PIPC)");
+    }
 
-  std::move(fd_closer).Cancel();
-  conn_pool_->Release(endpoint, fd);
-  return resp_env;
+    uint32_t resp_net_len = 0;
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, &resp_net_len, sizeof(resp_net_len)));
+    uint32_t resp_len = ntohl(resp_net_len);
+    if (resp_len > config_.max_frame_bytes) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "Response frame size (", resp_len, ") exceeds max_frame_bytes (",
+          config_.max_frame_bytes, ")"));
+    }
+
+    std::string resp_bytes(resp_len, '\0');
+    if (resp_len > 0) {
+      ABSL_RETURN_IF_ERROR(ReadExact(fd, resp_bytes.data(), resp_len));
+    }
+
+    control_pipe::proto::ControlResponseEnvelope resp_env;
+    if (!resp_env.ParseFromString(resp_bytes)) {
+      return absl::InternalError("Failed to parse ControlResponseEnvelope");
+    }
+
+    if (!probe_with_shut_wr) {
+      std::move(fd_closer).Cancel();
+      conn_pool_->Release(endpoint, fd);
+    }
+    return resp_env;
+  };
+
+  absl::StatusOr<control_pipe::proto::ControlResponseEnvelope> cpip_res =
+      try_cpip();
+  if (cpip_res.ok()) {
+    if (probe_with_shut_wr) {
+      absl::MutexLock lock(legacy_mu_);
+      verified_cpip_endpoints_.insert(std::string(endpoint));
+    }
+    return cpip_res;
+  }
+  if (can_fallback_legacy) {
+    {
+      absl::MutexLock lock(legacy_mu_);
+      legacy_endpoints_.insert(std::string(endpoint));
+    }
+    return send_legacy_frame();
+  }
+  return cpip_res;
 }
 
 }  // namespace tpu_raiden

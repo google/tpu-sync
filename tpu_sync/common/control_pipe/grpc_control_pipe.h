@@ -41,6 +41,7 @@ class GrpcControlPipeServer : public ControlPipeServer {
 
   absl::StatusOr<int> Start(int requested_port) override;
   void Stop() override;
+  void StopAccepting() override;
 
   int bound_port() const override { return bound_port_; }
   ControlDispatcher& dispatcher() override { return dispatcher_; }
@@ -51,7 +52,6 @@ class GrpcControlPipeServer : public ControlPipeServer {
  private:
   class ControlPipeServiceImpl;
   class LegacyKVCacheServiceImpl;
-  class LegacyWeightSyncServiceImpl;
 
   ControlPipeConfig config_;
   ControlDispatcher dispatcher_;
@@ -61,7 +61,6 @@ class GrpcControlPipeServer : public ControlPipeServer {
   std::unique_ptr<grpc::Server> grpc_server_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<ControlPipeServiceImpl> pipe_service_;
   std::unique_ptr<LegacyKVCacheServiceImpl> kv_cache_service_;
-  std::unique_ptr<LegacyWeightSyncServiceImpl> weight_sync_service_;
 };
 
 class GrpcControlPipeClient : public ControlPipeClient {

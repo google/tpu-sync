@@ -60,7 +60,10 @@ bool RecvMultipart(void* sock, std::vector<std::string>* frames,
   while (true) {
     zmq_msg_t msg;
     zmq_msg_init(&msg);
-    int rc = zmq_msg_recv(&msg, sock, flags);
+    int rc = -1;
+    do {
+      rc = zmq_msg_recv(&msg, sock, flags);
+    } while (rc < 0 && zmq_errno() == EINTR);
     if (rc < 0) {
       zmq_msg_close(&msg);
       return false;
@@ -80,7 +83,11 @@ bool RecvMultipart(void* sock, std::vector<std::string>* frames,
 bool SendMultipart(void* sock, const std::vector<std::string>& frames) {
   for (size_t i = 0; i < frames.size(); ++i) {
     int flags = (i + 1 < frames.size()) ? ZMQ_SNDMORE : 0;
-    if (zmq_send(sock, frames[i].data(), frames[i].size(), flags) < 0) {
+    int rc = -1;
+    do {
+      rc = zmq_send(sock, frames[i].data(), frames[i].size(), flags);
+    } while (rc < 0 && zmq_errno() == EINTR);
+    if (rc < 0) {
       return false;
     }
   }
@@ -425,7 +432,11 @@ ZmqControlPipeClient::SendRaw(
   ABSL_ASSIGN_OR_RETURN(void* sock,
                         pool_->Acquire(endpoint, effective_timeout));
 
-  if (zmq_send(sock, req_bytes.data(), req_bytes.size(), 0) < 0) {
+  int send_rc = -1;
+  do {
+    send_rc = zmq_send(sock, req_bytes.data(), req_bytes.size(), 0);
+  } while (send_rc < 0 && zmq_errno() == EINTR);
+  if (send_rc < 0) {
     int err = zmq_errno();
     pool_->Discard(sock);
     if (err == EAGAIN) {

@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 
 #include "absl/log/log.h"
@@ -47,8 +48,6 @@
 #include "tpu_sync/proto/control_pipe.pb.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.pb.h"
-#include "tpu_sync/rpc/raiden_service.grpc.pb.h"
-#include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
 namespace {
@@ -249,48 +248,6 @@ class GrpcControlPipeServer::LegacyKVCacheServiceImpl final
   ControlDispatcher* dispatcher_;
 };
 
-class GrpcControlPipeServer::LegacyWeightSyncServiceImpl final
-    : public ::tpu_sync::rpc::WeightSynchronizationWorkerService::Service {
- public:
-  explicit LegacyWeightSyncServiceImpl(ControlDispatcher* dispatcher)
-      : dispatcher_(dispatcher) {}
-
-  grpc::Status HandleControl(
-      grpc::ServerContext* context,
-      const ::tpu_sync::rpc::ControlRequest* request,
-      ::tpu_sync::rpc::ControlResponse* response) override {
-    control_pipe::proto::ControlEnvelope env;
-    env.set_message_type(
-        ::tpu_sync::rpc::ControlRequest::descriptor()->full_name());
-    if (!request->SerializeToString(env.mutable_payload())) {
-      response->set_success(false);
-      response->set_message("Failed to serialize ControlRequest");
-      return grpc::Status::OK;
-    }
-
-    ControlContext ctx;
-    ctx.peer_ip = ExtractIpFromGrpcPeer(context->peer());
-    ctx.backend_type = ControlPipeBackendType::kGrpc;
-    ctx.deadline = absl::FromChrono(context->deadline());
-
-    control_pipe::proto::ControlResponseEnvelope resp_env =
-        dispatcher_->Dispatch(ctx, env);
-    if (resp_env.status_code() == 0) {
-      if (!response->ParseFromString(resp_env.payload())) {
-        response->set_success(false);
-        response->set_message("Failed to parse ControlResponse");
-      }
-    } else {
-      response->set_success(false);
-      response->set_message(resp_env.error_message());
-    }
-    return grpc::Status::OK;
-  }
-
- private:
-  ControlDispatcher* dispatcher_;
-};
-
 // =============================================================================
 // GrpcControlPipeServer
 // =============================================================================
@@ -299,9 +256,7 @@ GrpcControlPipeServer::GrpcControlPipeServer(const ControlPipeConfig& config)
     : config_(config),
       pipe_service_(std::make_unique<ControlPipeServiceImpl>(&dispatcher_)),
       kv_cache_service_(
-          std::make_unique<LegacyKVCacheServiceImpl>(&dispatcher_)),
-      weight_sync_service_(
-          std::make_unique<LegacyWeightSyncServiceImpl>(&dispatcher_)) {}
+          std::make_unique<LegacyKVCacheServiceImpl>(&dispatcher_)) {}
 
 GrpcControlPipeServer::~GrpcControlPipeServer() { Stop(); }
 
@@ -323,7 +278,6 @@ absl::StatusOr<int> GrpcControlPipeServer::Start(int requested_port) {
                            &selected_port);
   builder.RegisterService(pipe_service_.get());
   builder.RegisterService(kv_cache_service_.get());
-  builder.RegisterService(weight_sync_service_.get());
 
   grpc_server_ = builder.BuildAndStart();
   if (!grpc_server_ || selected_port <= 0) {
@@ -333,6 +287,21 @@ absl::StatusOr<int> GrpcControlPipeServer::Start(int requested_port) {
   }
   bound_port_ = selected_port;
   return bound_port_;
+}
+
+void GrpcControlPipeServer::StopAccepting() {
+  std::unique_ptr<grpc::Server> server_to_stop;
+  {
+    absl::MutexLock lock(mu_);
+    server_to_stop = std::move(grpc_server_);
+  }
+  if (server_to_stop) {
+    std::thread([server = std::move(server_to_stop)]() mutable {
+      server->Shutdown(std::chrono::system_clock::now() +
+                       std::chrono::milliseconds(500));
+      server->Wait();
+    }).detach();
+  }
 }
 
 void GrpcControlPipeServer::Stop() {

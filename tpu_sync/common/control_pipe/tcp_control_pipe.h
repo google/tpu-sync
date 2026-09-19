@@ -95,6 +95,7 @@ class TcpControlPipeServer : public ControlPipeServer {
 
   absl::StatusOr<int> Start(int requested_port) override;
   void Stop() override;
+  void StopAccepting() override;
 
   int bound_port() const override { return bound_port_; }
   ControlDispatcher& dispatcher() override { return dispatcher_; }
@@ -142,6 +143,11 @@ class TcpControlPipeClient : public ControlPipeClient {
  private:
   ControlPipeConfig config_;
   std::unique_ptr<TcpConnectionPool> conn_pool_;
+  mutable absl::Mutex legacy_mu_;
+  absl::flat_hash_set<std::string> legacy_endpoints_
+      ABSL_GUARDED_BY(legacy_mu_);
+  absl::flat_hash_set<std::string> verified_cpip_endpoints_
+      ABSL_GUARDED_BY(legacy_mu_);
 };
 
 }  // namespace tpu_raiden

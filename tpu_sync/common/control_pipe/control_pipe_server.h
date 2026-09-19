@@ -35,6 +35,11 @@ class ControlPipeServer {
   // to complete. Safe to call multiple times.
   virtual void Stop() = 0;
 
+  // Immediately stops accepting new connections (closing the listening socket)
+  // while allowing currently executing handler tasks to finish sending their
+  // responses without deadlocking if called from inside a handler callback.
+  virtual void StopAccepting() {}
+
   virtual int bound_port() const = 0;
   virtual ControlDispatcher& dispatcher() = 0;
   virtual ControlPipeBackendType backend_type() const = 0;

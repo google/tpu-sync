@@ -22,15 +22,14 @@ import enum
 import math
 import os
 import random
-import socket
 import threading
-import time
 import typing
 from typing import Any, Optional
 
 from absl import logging
 
 from tpu_sync.api.common import RaidenId
+from tpu_sync.common.control_pipe import control_pipe_client
 from tpu_sync.kv_cache import nd_slice_math
 from tpu_sync.rpc import controller_service_pb2
 from tpu_sync.rpc import raiden_service_pb2
@@ -571,72 +570,6 @@ def _coerce_pool_spec_proto(pool: Any) -> Any:
   return result
 
 
-def create_server_socket(port: int) -> socket.socket:
-  """Creates an IPv6 socket (supporting IPv4 dual-stack on Linux) or falls back to IPv4."""
-  try:
-    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("::", port))
-    sock.listen(128)
-    return sock
-  except Exception:  # pylint: disable=broad-except
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("0.0.0.0", port))
-    sock.listen(128)
-    return sock
-
-
-def connect_socket(
-    address_str: str,
-    timeout: float = 60.0,
-    resolver: Optional[NameResolver] = None,
-) -> socket.socket:
-  """Connects to an IPv4 or IPv6 endpoint robustly with optional coordinate name resolution."""
-  start_time = time.time()
-
-  while True:
-    resolved_addr = address_str
-    if resolver:
-      try:
-        resolved_addr = resolver.resolve(address_str)
-      except Exception:  # pylint: disable=broad-except
-        pass
-
-    rindex = resolved_addr.rfind(":")
-    if rindex != -1:
-      host = resolved_addr[:rindex]
-      try:
-        port = int(resolved_addr[rindex + 1 :])
-        if host.startswith("[") and host.endswith("]"):
-          host = host[1:-1]
-
-        for res in socket.getaddrinfo(
-            host, port, socket.AF_UNSPEC, socket.SOCK_STREAM
-        ):
-          af, socktype, proto, _, sa = res
-          sock = None
-          try:
-            sock = socket.socket(af, socktype, proto)
-            sock.settimeout(min(10.0, timeout))
-            sock.connect(sa)
-            sock.settimeout(timeout)
-            return sock
-          except OSError:
-            if sock:
-              sock.close()
-      except (ValueError, OSError):
-        pass
-
-    if time.time() - start_time > timeout:
-      raise RuntimeError(
-          f"Timeout ({timeout}s) failed to connect to robust endpoint"
-          f" {address_str}"
-      )
-    time.sleep(2.0)
-
-
 class WorkerRpcClient:
   """Distributed RPC Client connecting to Native C++ Control Daemons with Event-Driven resolution.
 
@@ -652,6 +585,7 @@ class WorkerRpcClient:
       name_resolver: Optional[NameResolver] = None,
       proto_module: Optional[Any] = None,
       max_workers: Optional[int] = None,
+      use_legacy_tcp_framing: bool = False,
   ):
     """Instantiates RPC Client with an optional initial endpoint mapping.
 
@@ -664,6 +598,7 @@ class WorkerRpcClient:
       max_workers: Maximum number of worker threads for dispatching RPCs.
         Defaults to max(128, (os.cpu_count() or 1) * 16) or the value specified
         by the RAIDEN_RPC_CONCURRENCY environment variable.
+      use_legacy_tcp_framing: Whether to force 4B length-prefixed framing.
     """
     self._endpoints = {}
     if endpoint_addresses:
@@ -673,6 +608,10 @@ class WorkerRpcClient:
     self._resolve_timeout = resolve_timeout
     self._name_resolver = name_resolver
     self._proto_module = proto_module or raiden_service_pb2
+    self._control_pipe_client = control_pipe_client.ControlPipeClient(
+        name_resolver=name_resolver,
+        use_legacy_tcp_framing=use_legacy_tcp_framing,
+    )
     if max_workers is None:
       env_concurrency = os.environ.get("RAIDEN_RPC_CONCURRENCY")
       if env_concurrency:
@@ -692,7 +631,9 @@ class WorkerRpcClient:
     return self._executor
 
   def close(self) -> None:
-    """Shuts down the internal ThreadPoolExecutor."""
+    """Closes ControlPipeClient and shuts down the internal ThreadPoolExecutor."""
+    if hasattr(self, "_control_pipe_client") and self._control_pipe_client:
+      self._control_pipe_client.close()
     self._executor.shutdown(wait=False)
 
   def __del__(self) -> None:
@@ -764,6 +705,17 @@ class WorkerRpcClient:
       self, addr: str, payload: bytes, timeout: float = 600.0
   ) -> bytes:
     """Connects to remote address, sends payload, and returns the response bytes."""
+    if (
+        "_send_rpc_sync" not in self.__dict__
+        and self._control_pipe_client.backend
+        != control_pipe_client.ControlPipeBackendType.TCP
+    ):
+      return await self._control_pipe_client.send_raw_bytes(
+          addr,
+          payload,
+          timeout=timeout,
+          message_type=self._proto_module.ControlRequest.DESCRIPTOR.full_name,
+      )
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         self._executor, self._send_rpc_sync, addr, payload, timeout
@@ -772,33 +724,13 @@ class WorkerRpcClient:
   def _send_rpc_sync(
       self, addr: str, payload: bytes, timeout: float = 600.0
   ) -> bytes:
-    """Connects synchronously, sends payload, and returns response bytes."""
-    sock = connect_socket(addr, timeout=timeout, resolver=self._name_resolver)
-    try:
-      sock.sendall(len(payload).to_bytes(4, "big") + payload)
-
-      resp_len_bytes = b""
-      while len(resp_len_bytes) < 4:
-        chunk = sock.recv(4 - len(resp_len_bytes))
-        if not chunk:
-          raise RuntimeError(
-              "Remote servicer closed connection while reading response length"
-          )
-        resp_len_bytes += chunk
-      resp_len = int.from_bytes(resp_len_bytes, "big")
-
-      resp_bytes = b""
-      while len(resp_bytes) < resp_len:
-        chunk = sock.recv(resp_len - len(resp_bytes))
-        if not chunk:
-          raise RuntimeError(
-              "Remote servicer closed connection while reading response data"
-          )
-        resp_bytes += chunk
-
-      return resp_bytes
-    finally:
-      sock.close()
+    """Dispatches payload synchronously via ControlPipeClient and returns response bytes."""
+    return self._control_pipe_client.send_raw_bytes_sync(
+        addr,
+        payload,
+        timeout=timeout,
+        message_type=self._proto_module.ControlRequest.DESCRIPTOR.full_name,
+    )
 
   async def start_transfer(
       self,
@@ -1130,6 +1062,7 @@ class WeightSyncWorkerRpcClient(WorkerRpcClient):
       resolve_timeout: float = 300.0,
       name_resolver: Optional[NameResolver] = None,
       max_workers: Optional[int] = None,
+      use_legacy_tcp_framing: bool = False,
   ):
     super().__init__(
         endpoint_addresses=endpoint_addresses,
@@ -1137,6 +1070,7 @@ class WeightSyncWorkerRpcClient(WorkerRpcClient):
         name_resolver=name_resolver,
         proto_module=raiden_service_pb2,
         max_workers=max_workers,
+        use_legacy_tcp_framing=use_legacy_tcp_framing,
     )
 
   def include_receiver_push_schedules(
@@ -3363,7 +3297,7 @@ class RaidenController:
 
 
 class RaidenControllerServer:
-  """Centralized Control-Plane network servicer hosting a highly secure JSON/Pickle TCP Controller server."""
+  """Centralized Control-Plane network servicer backed by ControlPipeServer."""
 
   def __init__(
       self,
@@ -3383,18 +3317,20 @@ class RaidenControllerServer:
     self._controller = controller
     self._proto_module = proto_module or controller_service_pb2
     self._raiden_proto_module = raiden_proto_module or raiden_service_pb2
-    self._sock = create_server_socket(controller.port)
-    # Port 0 is useful for atomic ephemeral-port selection in tests and local
-    # harnesses. Publish the kernel-selected port before start()/stop() use it.
+    self._server = control_pipe_client.ControlPipeServer(
+        controller.port, self._handle_request
+    )
     if controller.port == 0:
-      controller.port = int(self._sock.getsockname()[1])
-    self._stopped = False
-    self._thread = None
+      controller.port = self._server.port
 
   @property
   def port(self) -> int:
     """Returns the bound listener port, including for a requested port 0."""
     return self._controller.port
+
+  @property
+  def _thread(self) -> Optional[threading.Thread]:
+    return self._server.thread
 
   def start(self) -> int:
     """Spawns background server acceptance thread listening for incoming Controller RPCs.
@@ -3402,67 +3338,17 @@ class RaidenControllerServer:
     Returns:
       Active TCP listener port coordinate.
     """
-    self._thread = threading.Thread(target=self._server_loop, daemon=True)
-    self._thread.start()
-    return self._controller.port
+    return self._server.start()
 
   def stop(self) -> None:
     """Signals servicer loop shutdown and unblocks pending accept state."""
-    self._stopped = True
-    for host in ("[::1]", "127.0.0.1"):
-      try:
-        wake_socket = connect_socket(
-            f"{host}:{self._controller.port}", timeout=0.5
-        )
-        wake_socket.close()
-        break
-      except Exception:  # pylint: disable=broad-except
-        pass
+    self._server.stop()
 
-    try:
-      self._sock.shutdown(socket.SHUT_RDWR)
-    except Exception:
-      pass
-    try:
-      self._sock.close()
-    except Exception:
-      pass
-
-  def _server_loop(self) -> None:
-    """Accepts connections; every handler owns its asyncio event loop."""
-    while not self._stopped:
-      try:
-        conn, _ = self._sock.accept()
-        if self._stopped:
-          conn.close()
-          break
-        threading.Thread(
-            target=self._handle_conn, args=(conn,), daemon=True
-        ).start()
-      except OSError:
-        break
-
-  def _handle_conn(self, conn: socket.socket) -> None:
-    """Internal connection processing handler executing deserialized ControllerRequest Protobuf RPC payloads.
-
-    Args:
-      conn: Accepted incoming TCP socket client handle.
-    """
+  def _handle_request(self, req_bytes: bytes) -> bytes:
+    """Executes deserialized ControllerRequest or ControlRequest Protobuf RPC payloads."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-
-      len_bytes = b""
-      while len(len_bytes) < 4:
-        chunk = conn.recv(4 - len(len_bytes))
-        if not chunk:
-          return
-        len_bytes += chunk
-      req_len = int.from_bytes(len_bytes, "big")
-
-      req_bytes = b""
-      while len(req_bytes) < req_len:
-        req_bytes += conn.recv(req_len - len(req_bytes))
 
       req = self._proto_module.ControllerRequest()
       try:
@@ -3537,8 +3423,7 @@ class RaidenControllerServer:
             resp.success = True
         except Exception as e:
           resp.message = str(e)
-        resp_bytes = resp.SerializeToString()
-        conn.sendall(len(resp_bytes).to_bytes(4, "big") + resp_bytes)
+        return resp.SerializeToString()
       elif (
           req.command
           == self._proto_module.ControllerRequest.COMMAND_GET_TRANSFER_STATUS
@@ -3553,8 +3438,7 @@ class RaidenControllerServer:
           resp.success = True
         except Exception as e:  # pylint: disable=broad-except
           resp.message = str(e)
-        resp_bytes = resp.SerializeToString()
-        conn.sendall(len(resp_bytes).to_bytes(4, "big") + resp_bytes)
+        return resp.SerializeToString()
       elif (
           req.command
           == self._proto_module.ControllerRequest.COMMAND_REGISTER_REQUEST_BLOCKS
@@ -3566,8 +3450,7 @@ class RaidenControllerServer:
             "the Python request-block registration surface is unavailable; "
             "use the C++ reshard store"
         )
-        resp_bytes = resp.SerializeToString()
-        conn.sendall(len(resp_bytes).to_bytes(4, "big") + resp_bytes)
+        return resp.SerializeToString()
       elif (
           req.command
           == self._proto_module.ControllerRequest.COMMAND_RELEASE_REQUEST_BLOCKS
@@ -3579,8 +3462,7 @@ class RaidenControllerServer:
             "the Python request-block release surface is unavailable; use "
             "the C++ reshard store"
         )
-        resp_bytes = resp.SerializeToString()
-        conn.sendall(len(resp_bytes).to_bytes(4, "big") + resp_bytes)
+        return resp.SerializeToString()
       elif (
           req.command
           == self._proto_module.ControllerRequest.COMMAND_COMPLETE_REQUEST_BLOCKS
@@ -3592,8 +3474,7 @@ class RaidenControllerServer:
             "the Python request-block completion surface is unavailable; "
             "use the C++ reshard store"
         )
-        resp_bytes = resp.SerializeToString()
-        conn.sendall(len(resp_bytes).to_bytes(4, "big") + resp_bytes)
+        return resp.SerializeToString()
       elif req.command == (
           self._proto_module.ControllerRequest.COMMAND_CANCEL_REQUEST_BLOCKS_IF_UNCLAIMED
       ) and req.HasField("cancel_request_blocks_if_unclaimed_request"):
@@ -3603,8 +3484,7 @@ class RaidenControllerServer:
             "the Python request-block cancellation surface is unavailable; "
             "use the C++ reshard store"
         )
-        resp_bytes = resp.SerializeToString()
-        conn.sendall(len(resp_bytes).to_bytes(4, "big") + resp_bytes)
+        return resp.SerializeToString()
       else:
         raiden_req = self._raiden_proto_module.ControlRequest()
         raiden_req.ParseFromString(req_bytes)
@@ -3770,14 +3650,11 @@ class RaidenControllerServer:
             raiden_resp.success = True
         except Exception as e:
           raiden_resp.message = str(e)
-        resp_bytes = raiden_resp.SerializeToString()
-        conn.sendall(len(resp_bytes).to_bytes(4, "big") + resp_bytes)
+        return raiden_resp.SerializeToString()
     except Exception:  # pylint: disable=broad-except
-      pass
-
+      return b""
     finally:
       loop.close()
-      conn.close()
 
 
 class RaidenControllerClientFacade:
@@ -3795,6 +3672,9 @@ class RaidenControllerClientFacade:
     self._name_resolver = name_resolver
     self._proto_module = proto_module or controller_service_pb2
     self._raiden_proto_module = raiden_proto_module or raiden_service_pb2
+    self._control_pipe_client = control_pipe_client.ControlPipeClient(
+        name_resolver=name_resolver
+    )
 
   def _raiden_id_to_proto(
       self,
@@ -3808,74 +3688,29 @@ class RaidenControllerClientFacade:
     )
 
   def _send_protobuf_rpc(self, req: Any) -> Any:
-    """Helper method to serialize and send an RPC Protobuf over robust persistent TCP sockets."""
-    sock = connect_socket(
-        self._address, timeout=300.0, resolver=self._name_resolver
+    """Helper method to serialize and send an RPC Protobuf via ControlPipeClient."""
+    resp = self._control_pipe_client.call_sync(
+        self._address, req, self._proto_module.ControllerResponse, timeout=300.0
     )
-
-    try:
-      payload = req.SerializeToString()
-      sock.sendall(len(payload).to_bytes(4, "big") + payload)
-
-      resp_len_bytes = b""
-      while len(resp_len_bytes) < 4:
-        chunk = sock.recv(4 - len(resp_len_bytes))
-        if not chunk:
-          raise RuntimeError("Connection closed while reading response length")
-        resp_len_bytes += chunk
-      resp_len = int.from_bytes(resp_len_bytes, "big")
-
-      resp_bytes = b""
-      while len(resp_bytes) < resp_len:
-        chunk = sock.recv(resp_len - len(resp_bytes))
-        if not chunk:
-          raise RuntimeError("Connection closed while reading response data")
-        resp_bytes += chunk
-
-      resp = self._proto_module.ControllerResponse()
-      resp.ParseFromString(resp_bytes)
-      if not resp.success:
-        raise RuntimeError(
-            f"Remote Controller Server execution failed: {resp.message}"
-        )
-      return resp
-    finally:
-      sock.close()
+    if not resp.success:
+      raise RuntimeError(
+          f"Remote Controller Server execution failed: {resp.message}"
+      )
+    return resp
 
   def _send_raiden_protobuf_rpc_response(self, req: Any) -> Any:
-    """Sends a Raiden protobuf RPC response."""
-    sock = connect_socket(
-        self._address, timeout=300.0, resolver=self._name_resolver
+    """Sends a Raiden protobuf RPC response via ControlPipeClient."""
+    resp = self._control_pipe_client.call_sync(
+        self._address,
+        req,
+        self._raiden_proto_module.ControlResponse,
+        timeout=300.0,
     )
-
-    try:
-      payload = req.SerializeToString()
-      sock.sendall(len(payload).to_bytes(4, "big") + payload)
-
-      resp_len_bytes = b""
-      while len(resp_len_bytes) < 4:
-        chunk = sock.recv(4 - len(resp_len_bytes))
-        if not chunk:
-          raise RuntimeError("Connection closed while reading response length")
-        resp_len_bytes += chunk
-      resp_len = int.from_bytes(resp_len_bytes, "big")
-
-      resp_bytes = b""
-      while len(resp_bytes) < resp_len:
-        chunk = sock.recv(resp_len - len(resp_bytes))
-        if not chunk:
-          raise RuntimeError("Connection closed while reading response data")
-        resp_bytes += chunk
-
-      resp = self._raiden_proto_module.ControlResponse()
-      resp.ParseFromString(resp_bytes)
-      if not resp.success:
-        raise RuntimeError(
-            f"Remote Controller Server execution failed: {resp.message}"
-        )
-      return resp
-    finally:
-      sock.close()
+    if not resp.success:
+      raise RuntimeError(
+          f"Remote Controller Server execution failed: {resp.message}"
+      )
+    return resp
 
   def _send_raiden_protobuf_rpc(self, req: Any) -> bool:
     self._send_raiden_protobuf_rpc_response(req)
@@ -4123,37 +3958,8 @@ class RaidenControllerClientFacade:
 
   def get_metadata(self) -> list[Any]:
     """Queries the controller for all registered work units' metadata."""
-    sock = connect_socket(
-        self._address, timeout=300.0, resolver=self._name_resolver
+    req = self._raiden_proto_module.ControlRequest(
+        command=self._raiden_proto_module.ControlRequest.COMMAND_GET_METADATA
     )
-    try:
-      req = self._raiden_proto_module.ControlRequest(
-          command=self._raiden_proto_module.ControlRequest.COMMAND_GET_METADATA
-      )
-      payload = req.SerializeToString()
-      sock.sendall(len(payload).to_bytes(4, "big") + payload)
-
-      resp_len_bytes = b""
-      while len(resp_len_bytes) < 4:
-        chunk = sock.recv(4 - len(resp_len_bytes))
-        if not chunk:
-          raise RuntimeError("Connection closed while reading response length")
-        resp_len_bytes += chunk
-      resp_len = int.from_bytes(resp_len_bytes, "big")
-
-      resp_bytes = b""
-      while len(resp_bytes) < resp_len:
-        chunk = sock.recv(resp_len - len(resp_bytes))
-        if not chunk:
-          raise RuntimeError("Connection closed while reading response data")
-        resp_bytes += chunk
-
-      resp = self._raiden_proto_module.ControlResponse()
-      resp.ParseFromString(resp_bytes)
-      if not resp.success:
-        raise RuntimeError(
-            f"Remote Controller Server execution failed: {resp.message}"
-        )
-      return list(resp.get_metadata_response.metadata)
-    finally:
-      sock.close()
+    resp = self._send_raiden_protobuf_rpc_response(req)
+    return list(resp.get_metadata_response.metadata)

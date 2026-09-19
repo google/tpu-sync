@@ -29,6 +29,12 @@ _impl = torch_abi.load_extension(
 
 RaidenId = getattr(_impl, "RaidenId", common.RaidenId)
 
+# True if the reshard store accepts request_registry_ttl_s; missing on older
+# extensions.
+SUPPORTS_REQUEST_REGISTRY_TTL = bool(
+    getattr(_impl, "reshard_store_supports_request_registry_ttl", False)
+)
+
 
 class ReshardStore:
   """Thin store hosting RaidenController and ReshardService in-engine.
@@ -44,7 +50,20 @@ class ReshardStore:
       store_server_ip: str,
       raiden_controller_port: int = 0,
       reshard_service_port: int = 0,
+      *,
+      request_registry_ttl_s: float = 600.0,
   ):
+    """Args: raiden_id: Identity of the hosting engine's reshard store.
+
+    store_server_ip: Routable address the store advertises.
+    raiden_controller_port: Dispatch controller port.
+    reshard_service_port: Reshard service port.
+    request_registry_ttl_s: Seconds an unclaimed request-block registration
+    stays in the registry.
+    """
+    request_registry_ttl_s = float(request_registry_ttl_s)
+    if request_registry_ttl_s <= 0:
+      raise ValueError("request_registry_ttl_s must be positive")
     # The extension exposes the reshard-store factory as a free function
     # (create_reshard_store) returning the KVCacheStore binding: a second
     # nb::class_ registration of the same wrapper type would be silently
@@ -54,6 +73,7 @@ class ReshardStore:
         store_server_ip,
         raiden_controller_port,
         reshard_service_port,
+        request_registry_ttl_s,
     )
 
   @property
@@ -67,3 +87,7 @@ class ReshardStore:
   @property
   def reshard_service_port(self) -> int:
     return self._impl.reshard_service_port
+
+  @property
+  def request_registry_ttl_s(self) -> float:
+    return float(self._impl.request_registry_ttl_s)

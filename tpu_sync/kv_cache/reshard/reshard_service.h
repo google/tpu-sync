@@ -64,6 +64,9 @@ class ReshardService {
   absl::Status StartServer();
   void StopServer();
   int port() const;
+  // TTL (seconds) of unclaimed request-block registrations, as configured
+  //  through Options.
+  double request_registry_ttl_s() const { return request_registry_ttl_s_; }
 
   // Set before StartServer(): invoked when a COMMAND_SHUTDOWN arrives (the
   // sidecar main uses it to exit its wait loop).
@@ -92,6 +95,7 @@ class ReshardService {
   std::unique_ptr<FramedServer> server_;
   std::function<void()> shutdown_callback_;
   int requested_port_ = 0;
+  double request_registry_ttl_s_ = 600.0;
 };
 
 }  // namespace reshard

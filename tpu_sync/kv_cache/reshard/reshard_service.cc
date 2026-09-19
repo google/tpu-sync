@@ -57,7 +57,9 @@ std::string StatusMessage(const absl::Status& status) {
 }  // namespace
 
 ReshardService::ReshardService(const Options& options)
-    : delivery_(options.delivery), requested_port_(options.port) {
+    : delivery_(options.delivery),
+      requested_port_(options.port),
+      request_registry_ttl_s_(options.request_registry_ttl_s) {
   FramedTransport* transport = options.transport;
   if (transport == nullptr) {
     default_transport_ = std::make_unique<SocketFramedTransport>();

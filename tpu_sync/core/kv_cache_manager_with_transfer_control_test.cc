@@ -97,8 +97,8 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   void ExpireRecv(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    active_recv_entries_.at(uuid).deadline =
-        std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    active_recv_entries_.at(uuid)->set_deadline(
+        std::chrono::steady_clock::now() - std::chrono::seconds(1));
   }
 
   size_t free_slots() {
@@ -110,7 +110,7 @@ class TestManager : public KVCacheManagerWithTransfer {
     absl::MutexLock lock(mu_);
     auto it = active_recv_entries_.find(uuid);
     if (it == active_recv_entries_.end()) return std::nullopt;
-    return it->second.req_id;
+    return it->second->req_id();
   }
 
   bool has_recv(uint64_t uuid) {
@@ -120,13 +120,13 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   void MarkPullStarted(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    send_entries_.at(uuid)->pull_started = true;
+    send_entries_.at(uuid)->set_pull_started(true);
   }
 
   void ExpireSend(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    send_entries_.at(uuid)->deadline =
-        std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+    send_entries_.at(uuid)->set_deadline(std::chrono::steady_clock::now() -
+                                         std::chrono::milliseconds(1));
   }
 };
 

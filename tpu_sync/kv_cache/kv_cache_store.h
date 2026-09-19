@@ -164,9 +164,13 @@ class KVCacheStore {
   // binary. Workers register their WorkerService endpoints with the
   // in-process controller; the coordinator dispatches reshard transfer
   // programs over persistent gRPC channels directly to them.
+  //
+  // `request_registry_ttl_s` bounds how long an unclaimed request-block
+  // registration stays in the reshard service's registry.
   static absl::StatusOr<std::unique_ptr<KVCacheStore>> CreateReshardStore(
       RaidenId raiden_id, absl::string_view store_server_ip,
-      int raiden_controller_port = 0, int reshard_service_port = 0);
+      int raiden_controller_port = 0, int reshard_service_port = 0,
+      double request_registry_ttl_s = 600.0);
 
   // Flexible constructor accepting a custom root backend
   explicit KVCacheStore(std::shared_ptr<KVCacheStoreBackend> backend,

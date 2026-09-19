@@ -139,6 +139,7 @@ py_test(
     srcs = ["reshard_store_test.py"],
     tags = ["nobuilder"],
     deps = [
+        ":reshard_client",
         ":reshard_store",
         "@com_google_absl_py//absl/testing:absltest",
     ],

@@ -490,11 +490,16 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
 
 absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::CreateReshardStore(
     RaidenId raiden_id, absl::string_view store_server_ip,
-    int raiden_controller_port, int reshard_service_port) {
+    int raiden_controller_port, int reshard_service_port,
+    double request_registry_ttl_s) {
   if (store_server_ip.empty() || store_server_ip == "0.0.0.0" ||
       store_server_ip == "::") {
     return absl::InvalidArgumentError(
         "store_server_ip must be a concrete IP (not empty or wildcard)");
+  }
+  if (request_registry_ttl_s <= 0) {
+    return absl::InvalidArgumentError(
+        "request_registry_ttl_s must be positive");
   }
   // Construct a minimal thin store with dummy backend (capacity=1) so the
   // store owns the RaidenController and can host ReshardService.
@@ -521,6 +526,7 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::CreateReshardStore(
   // Initialize ReshardService with WorkerDelivery::Mode::kController.
   reshard::ReshardService::Options reshard_opts;
   reshard_opts.port = reshard_service_port;
+  reshard_opts.request_registry_ttl_s = request_registry_ttl_s;
   reshard_opts.delivery.mode = reshard::WorkerDelivery::Mode::kController;
   reshard_opts.delivery.controller = store->raiden_controller_.get();
 

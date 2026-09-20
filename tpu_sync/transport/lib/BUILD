@@ -211,9 +211,11 @@ cc_test(
     ],
     features = ["-use_header_modules"],
     deps = [
+        ":chunk",
         ":peregrine_control_service",
         ":raw_buffer_transport",
         ":raw_buffer_transport_delegate",
+        ":transport_adapter",
         "//tpu_sync/transport:buffer_push_task",
         "//tpu_sync/transport/lib/conn:pool",
         "//tpu_sync/transport/lib/socket:psp_syscall_mock",

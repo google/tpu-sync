@@ -30,7 +30,7 @@
 namespace tpu_raiden::transport::lib {
 
 inline constexpr size_t kChunkHeaderSize = 64;
-inline constexpr size_t kMaxMetadataSize = 24;
+inline constexpr size_t kMaxMetadataSize = 40;
 inline constexpr size_t kChunkSizeFieldSize = sizeof(uint32_t);
 
 inline constexpr uint16_t kRaidenMagic =
@@ -38,12 +38,16 @@ inline constexpr uint16_t kRaidenMagic =
 static_assert(kRaidenMagic == 0x4452);
 
 static_assert(sizeof(flatbuf::ChunkHeader) == kChunkHeaderSize);
+static_assert(sizeof(flatbuf::ChunkMetadataV1) == 24);
+static_assert(sizeof(flatbuf::ChunkMetadataV2) == kMaxMetadataSize);
 
 // Returns the size of a chunk metadata for the given version.
 constexpr size_t GetChunkMetadataSize(uint16_t ver) {
   switch (ver) {
     case 1:
       return 24;
+    case 2:
+      return 40;
     default:
       return 0;
   }
@@ -59,7 +63,7 @@ absl::StatusOr<ChunkHeader> DeserializeChunkHeader(
 
 // Serializes the chunk metadata to an inlined byte vector.
 absl::InlinedVector<char, kMaxMetadataSize> SerializeChunkMetadata(
-    const ChunkMetadata& meta);
+    const ChunkMetadata& meta, uint16_t ver = 1);
 
 // Parses the chunk metadata from its serialized binary bytes.
 absl::StatusOr<ChunkMetadata> DeserializeChunkMetadata(

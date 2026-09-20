@@ -44,11 +44,13 @@
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_sync/transport/lib/socket/psp_syscall_mock.h" // NOLINT
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+#include "tpu_sync/transport/lib/transport_adapter.h"
 #include "tpu_sync/transport/peregrine/src/util/util.h"
 
 namespace tpu_raiden::transport::lib {
@@ -603,6 +605,128 @@ TEST_P(RawBufferTransportTest,
   EXPECT_THAT(dst.DataSpan(0, num_tasks),
               Pointwise(Eq(), absl::MakeConstSpan(payload)));
   EXPECT_TRUE(dst.WaitForDataReceived(kNotificationTimeout));
+}
+
+TEST_P(RawBufferTransportTest, PushBuffersStridedCorrectness) {
+  constexpr size_t slice_size = 128;
+  constexpr size_t count = 1050;  // Exceeds IOV_MAX (1024)
+  constexpr size_t dst_stride = 512;
+  constexpr size_t total_payload_bytes = count * slice_size;
+  constexpr size_t dst_buffer_size = (count - 1) * dst_stride + slice_size;
+
+  RawMockDelegate src(total_payload_bytes);
+  RawMockDelegate dst(dst_buffer_size);
+
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  BindControlChannels(&src_transport, &src, &dst_transport, &dst);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  std::vector<uint8_t> payload(total_payload_bytes);
+  RandomNonZero(absl::MakeSpan(payload));
+
+  uint64_t uuid = 88888;
+  ASSERT_OK(dst_transport.RegisterExpectedChunks(uuid, 1));
+
+  std::vector<BufferPushTask> tasks = {
+      BufferPushTask{
+          .peer = dst_addr,
+          .buffer_id = kBufferId,
+          .dst_shard_idx = kDstShardIdx,
+          .dst_offset_bytes = 0,
+          .data_ptr = payload.data(),
+          .size_bytes = slice_size,
+          .dst_stride_bytes = dst_stride,
+          .count = count,
+      },
+  };
+
+  const auto push_res =
+      src_transport.PushBuffers(tasks, /*parallelism=*/1, uuid);
+  EXPECT_OK(push_res) << push_res.message();
+
+  for (size_t c = 0; c < count; ++c) {
+    EXPECT_THAT(dst.DataSpan(c * dst_stride, slice_size),
+                Pointwise(Eq(), absl::MakeConstSpan(payload).subspan(
+                                    c * slice_size, slice_size)))
+        << "Mismatch at slice " << c;
+  }
+  EXPECT_TRUE(dst.WaitForDataReceived(kNotificationTimeout));
+}
+
+TEST(BufferPushTaskTest, DefaultInitializers) {
+  BufferPushTask task;
+  EXPECT_EQ(task.peer, "");
+  EXPECT_EQ(task.buffer_id, 0);
+  EXPECT_EQ(task.dst_shard_idx, 0);
+  EXPECT_EQ(task.dst_offset_bytes, 0);
+  EXPECT_EQ(task.data_ptr, nullptr);
+  EXPECT_EQ(task.size_bytes, 0);
+  EXPECT_EQ(task.dst_stride_bytes, 0);
+  EXPECT_EQ(task.count, 1);
+}
+
+TEST_P(RawBufferTransportTest, ProcessSocketBufferPushRejectsStridedRequest) {
+  RawMockDelegate src(1024);
+  RawMockDelegate dst(1024);
+
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  BindControlChannels(&src_transport, &src, &dst_transport, &dst);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  std::vector<uint8_t> payload(256);
+  TF_ASSERT_OK_AND_ASSIGN(
+      Request req,
+      BuildBufferRequest(kBufferId, kDstShardIdx, /*offset_bytes=*/0,
+                         payload.data(), /*size_bytes=*/128, /*uuid=*/1234,
+                         kOpBufferPush, /*dst_stride_bytes=*/512, /*count=*/2));
+
+  EXPECT_THAT(src_transport.ProcessSocketBufferPush(dst_addr, req),
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_P(RawBufferTransportTest, PushBuffersRejectsOverlappingStridedRequest) {
+  constexpr size_t slice_size = 128;
+  constexpr size_t count = 2;
+  constexpr size_t dst_stride = 64;  // Overlapping: dst_stride < slice_size
+  constexpr size_t total_payload_bytes = count * slice_size;
+  constexpr size_t dst_buffer_size = 1024;
+
+  RawMockDelegate src(total_payload_bytes);
+  RawMockDelegate dst(dst_buffer_size);
+
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  BindControlChannels(&src_transport, &src, &dst_transport, &dst);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const std::string dst_addr = GetIpPort(dst_transport);
+  std::vector<uint8_t> payload(total_payload_bytes);
+
+  uint64_t uuid = 77777;
+  ASSERT_OK(dst_transport.RegisterExpectedChunks(uuid, 1));
+
+  std::vector<BufferPushTask> tasks = {
+      BufferPushTask{
+          .peer = dst_addr,
+          .buffer_id = kBufferId,
+          .dst_shard_idx = kDstShardIdx,
+          .dst_offset_bytes = 0,
+          .data_ptr = payload.data(),
+          .size_bytes = slice_size,
+          .dst_stride_bytes = dst_stride,
+          .count = count,
+      },
+  };
+
+  const auto push_res =
+      src_transport.PushBuffers(tasks, /*parallelism=*/1, uuid);
+  EXPECT_FALSE(push_res.ok());
 }
 
 TEST_P(RawBufferTransportTest, RegisterExpectedChunksZeroCountOk) {

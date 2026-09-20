@@ -14,6 +14,7 @@
 
 #include "tpu_sync/core/transfer_send_session.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
@@ -179,7 +180,6 @@ void TransferSendSession::FinishLocked(const absl::Status& status) {
     ReleaseSlotLocked();
     done_ = true;
   }
-  staging_allocator_->Shutdown();
 }
 
 void TransferSendSession::Finish(const absl::Status& status) {
@@ -198,7 +198,6 @@ void TransferSendSession::EndSendOpLocked() {
   if (draining_ && in_flight_ == 0 && !done_) {
     ReleaseSlotLocked();
     done_ = true;
-    staging_allocator_->Shutdown();
   }
 }
 
@@ -238,6 +237,32 @@ CopySpec TransferSendSession::BuildCoalescedCopySpec(
   return spec;
 }
 
+absl::StatusOr<StagingAllocation> TransferSendSession::AcquireStagingWithRetry(
+    int64_t num_blocks) {
+  while (true) {
+    {
+      absl::MutexLock lock(mu_);
+      if (draining_ || done_) {
+        return !status_.ok()
+                   ? status_
+                   : absl::CancelledError(
+                         "Send session cancelled while waiting for staging");
+      }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto slice_deadline =
+        std::min(deadline_, now + std::chrono::milliseconds(1));
+    absl::StatusOr<StagingAllocation> acquired =
+        staging_allocator_->AcquireWithTimeout(num_blocks, slice_deadline);
+    if (acquired.ok() || !absl::IsResourceExhausted(acquired.status())) {
+      return acquired;
+    }
+    if (std::chrono::steady_clock::now() >= deadline_) {
+      return acquired;
+    }
+  }
+}
+
 void TransferSendSession::StartPush(
     const std::vector<std::string>& remote_data_endpoints,
     const std::vector<int64_t>& src_block_ids,
@@ -250,8 +275,7 @@ void TransferSendSession::StartPush(
   // pool. Writing D2H straight to host[src_block_id] overflows the host buffer
   // once a device block id exceeds num_host_blocks.
   absl::StatusOr<StagingAllocation> acquired =
-      staging_allocator_->AcquireWithTimeout(
-          static_cast<int64_t>(src_block_ids.size()), deadline_);
+      AcquireStagingWithRetry(static_cast<int64_t>(src_block_ids.size()));
   if (!acquired.ok()) {
     Finish(acquired.status());
     return;

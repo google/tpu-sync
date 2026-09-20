@@ -1057,6 +1057,17 @@ absl::StatusOr<StagingBlockAllocator::Allocation>
 StagingBlockAllocator::AcquireWithTimeout(
     int64_t num_blocks, std::chrono::steady_clock::time_point deadline) {
   absl::MutexLock lock(mu_);
+  if (shutting_down_) {
+    return absl::CancelledError("StagingBlockAllocator is shutting down");
+  }
+  absl::StatusOr<Allocation> acquired = AcquireLocked(num_blocks);
+  if (acquired.ok() || !absl::IsResourceExhausted(acquired.status())) {
+    return acquired;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) {
+    return acquired;
+  }
   auto can_proceed = [&]() ABSL_SHARED_LOCKS_REQUIRED(mu_) {
     if (shutting_down_) return true;
     if (!dynamic_host_staging_) return !free_slots_.empty();
@@ -1064,24 +1075,15 @@ StagingBlockAllocator::AcquireWithTimeout(
            base_->host_block_manager()->num_free_blocks() >=
                static_cast<size_t>(num_blocks);
   };
-  while (true) {
-    if (shutting_down_) {
-      return absl::CancelledError("StagingBlockAllocator is shutting down");
-    }
-    absl::StatusOr<Allocation> acquired = AcquireLocked(num_blocks);
-    if (acquired.ok() || !absl::IsResourceExhausted(acquired.status())) {
-      return acquired;
-    }
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) {
-      return acquired;
-    }
-    const auto remaining_ns = std::min<std::chrono::nanoseconds>(
-                                  deadline - now, std::chrono::milliseconds(1))
-                                  .count();
-    mu_.AwaitWithTimeout(absl::Condition(&can_proceed),
-                         absl::Nanoseconds(remaining_ns));
+  const auto remaining_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now)
+          .count();
+  mu_.AwaitWithTimeout(absl::Condition(&can_proceed),
+                       absl::Nanoseconds(remaining_ns));
+  if (shutting_down_) {
+    return absl::CancelledError("StagingBlockAllocator is shutting down");
   }
+  return AcquireLocked(num_blocks);
 }
 
 absl::Status StagingBlockAllocator::AcquirePoolStagingLease(

@@ -53,7 +53,7 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
       const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
       int layer_idx = -1);
 
-  void H2hWriteDirectAsync(
+  virtual void H2hWriteDirectAsync(
       const std::vector<std::string>& peers,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx,

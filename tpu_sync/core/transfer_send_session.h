@@ -79,6 +79,11 @@ class TransferSendSession : public TransferSession {
     return draining_;
   }
 
+  bool HasStaging() const {
+    absl::MutexLock lock(mu_);
+    return !staging_.empty();
+  }
+
   // Validates deadline, requested blocks, and single-pull invariant, then marks
   // |pull_started_| true. Throws std::runtime_error or std::invalid_argument on
   // violation.
@@ -152,6 +157,7 @@ class TransferSendSession : public TransferSession {
   void FinishLocked(const absl::Status& status = absl::OkStatus())
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndSendOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  absl::StatusOr<StagingAllocation> AcquireStagingWithRetry(int64_t num_blocks);
   void SendNextLayer(size_t l);
 
   mutable absl::Mutex mu_;

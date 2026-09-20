@@ -696,7 +696,7 @@ TEST_F(MetricsApiTest, InitializeFromEnvironmentCustomOptions) {
                                     test_dir.c_str());
   ScopedEnvironmentVariable rank_var("LOCAL_RANK", "0");
 
-  EXPECT_THAT(store_.InitializeFromEnvironment(), IsOk());
+  EXPECT_OK(store_.InitializeFromEnvironment());
   EXPECT_TRUE(store_.HasBackends());
 
   std::error_code ec;
@@ -741,7 +741,7 @@ TEST_F(MetricsApiTest, InitializeWithMultiprocDirSwitchesToShmExporter) {
   ScopedEnvironmentVariable multiproc_env(kTelemetryMultiprocDirEnvVar,
                                           test_dir.c_str());
   ScopedEnvironmentVariable rank_env("LOCAL_RANK", "1");
-  EXPECT_THAT(store_.InitializeFromBackendNames({"prometheus"}), IsOk());
+  EXPECT_OK(store_.InitializeFromBackendNames({"prometheus"}));
   EXPECT_TRUE(store_.HasBackends());
 
   const MetricLabel labels[] = {
@@ -763,7 +763,7 @@ TEST_F(MetricsApiTest, InitializePrometheusWithMultiprocDirAndRankEnvironment) {
                                     test_dir.c_str());
   ScopedEnvironmentVariable rank_var("LOCAL_RANK", "2");
 
-  EXPECT_THAT(store_.InitializeFromBackendNames({"prometheus"}), IsOk());
+  EXPECT_OK(store_.InitializeFromBackendNames({"prometheus"}));
   EXPECT_TRUE(store_.HasBackends());
 
   const MetricLabel labels[] = {

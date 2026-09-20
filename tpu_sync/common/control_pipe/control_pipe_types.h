@@ -65,9 +65,8 @@ struct ControlPipeConfig {
   // `absl::ZeroDuration()`.
   absl::Duration default_timeout = absl::Seconds(120);
 
-  // Maximum allowed inbound/outbound wire frame size in bytes (defaults to
-  // 64 MiB).
-  size_t max_frame_bytes = 64 * 1024 * 1024;
+  // Maximum allowed inbound/outbound wire frame size in bytes.
+  size_t max_frame_bytes = 2ULL * 1024 * 1024 * 1024 - 1;
 
   // Whether `TcpControlPipeClient` caches and reuses open sockets per peer
   // endpoint (`ip:port`).

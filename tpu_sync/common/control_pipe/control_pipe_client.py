@@ -49,7 +49,7 @@ RespT = TypeVar("RespT", bound=proto_message.Message)
 
 CPIP_MAGIC = b"CPIP"
 PIPC_MAGIC = b"PIPC"
-DEFAULT_MAX_FRAME_BYTES = 64 * 1024 * 1024  # 64 MiB
+DEFAULT_MAX_FRAME_BYTES = 2 * 1024 * 1024 * 1024 - 1  # 2 GiB - 1
 _HEADER_STRUCT = struct.Struct("!4sI")
 _GRPC_CHANNEL_OPTIONS = (
     ("grpc.max_send_message_length", DEFAULT_MAX_FRAME_BYTES),

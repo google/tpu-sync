@@ -62,7 +62,7 @@ WeightSynchronizerListener::WeightSynchronizerListener(
             return resp;
           },
           HandlerOptions<::tpu_sync::rpc::ControlRequest>().WithMaxPayloadBytes(
-              64 * 1024 * 1024));
+              cfg.max_frame_bytes));
 
   absl::StatusOr<int> port = pipe_server_->Start(listener_port);
   CHECK_OK(port.status())

@@ -94,6 +94,7 @@ cc_test(
     ],
     features = ["-use_header_modules"],
     linkopts = ["-Wl,--allow-shlib-undefined"],
+    tags = ["no_oss"],
     deps = [
         ":weight_synchronizer_base",
         "//tpu_sync/core:raw_transfer_core",
@@ -117,6 +118,7 @@ cc_test(
         "-fexceptions",
     ],
     features = ["-use_header_modules"],
+    tags = ["no_oss"],
     deps = [
         ":weight_synchronizer_base",
         "//tpu_sync/rpc:raiden_service_cc_proto",

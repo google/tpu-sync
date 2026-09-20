@@ -92,6 +92,7 @@ py_library(
         ":coordination_py_pb2",
         ":coordination_py_pb2_grpc",
         "@com_github_grpc_grpc//src/python/grpcio/grpc:grpcio",
+        "@pypi//typing_extensions",  # buildcleaner: keep
     ],
 )
 

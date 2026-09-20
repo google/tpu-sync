@@ -2,8 +2,9 @@
 # Copybara presubmit CL.
 #
 # What runs (see ci/run_unit_tests.sh):
-#   1. Bazel CPU cc_test suite: every cc_test under //tpu_sync/core and
-#      //tpu_sync/kv_cache that is not tagged no_oss, notap, manual, or
+#   1. Bazel CPU unit test suite: every cc_test and py_test under
+#      //tpu_sync/core, //tpu_sync/kv_cache, //tpu_sync/weight_sync, and
+#      //tpu_sync/rpc that is not tagged no_oss, notap, manual, or
 #      requires-<resource>.
 #   2. E2E JAX build (./build.sh jax): compiles _tpu_raiden_jax.so, C++
 #      control-plane service binaries (global_registry_server,
@@ -29,7 +30,7 @@ on:
       test_scope:
         description: "Bazel package patterns to search for tests"
         type: string
-        default: "//tpu_sync/core:all //tpu_sync/kv_cache:all"
+        default: "//tpu_sync/core:all //tpu_sync/kv_cache:all //tpu_sync/weight_sync:all //tpu_sync/rpc:all"
 
 permissions:
   contents: read
@@ -47,7 +48,7 @@ jobs:
       options: --shm-size=16g
     timeout-minutes: 300
     env:
-      RAIDEN_TEST_SCOPE: ${{ inputs.test_scope || '//tpu_sync/core:all //tpu_sync/kv_cache:all' }}
+      RAIDEN_TEST_SCOPE: ${{ inputs.test_scope || '//tpu_sync/core:all //tpu_sync/kv_cache:all //tpu_sync/weight_sync:all //tpu_sync/rpc:all' }}
       # Fork PRs run without the ambient GCP service account, so the
       # remote cache is only requested when the head branch lives in this
       # repository.

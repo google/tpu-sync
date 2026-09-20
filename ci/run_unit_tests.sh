@@ -26,9 +26,9 @@
 # ci/build_wheel_impl.sh.
 #
 # Execution phases (when invoked without explicit target arguments):
-#   Phase 1: Every cc_test under the package patterns in RAIDEN_TEST_SCOPE
-#            that carries none of the exclusion tags (no_oss, notap, manual,
-#            or any requires-<resource> tag).
+#   Phase 1: Every cc_test and py_test under the package patterns in
+#            RAIDEN_TEST_SCOPE that carries none of the exclusion tags (no_oss,
+#            notap, manual, or any requires-<resource> tag).
 #   Phase 2: E2E JAX validation build via `./build.sh jax`, compiling
 #            _tpu_raiden_jax.so, C++ control-plane service binaries, and
 #            Python protobuf modules, reusing the warm Bazel server and
@@ -42,7 +42,7 @@
 #
 # Environment:
 #   RAIDEN_TEST_SCOPE       space-separated bazel package patterns to search
-#                           (default "//tpu_sync/core:all //tpu_sync/kv_cache:all")
+#                           (default "//tpu_sync/core:all //tpu_sync/kv_cache:all //tpu_sync/weight_sync:all //tpu_sync/rpc:all")
 #   RAIDEN_RUN_E2E_BUILD    true/false to run Phases 2 & 3 (default: true when
 #                           no target args are passed, false otherwise)
 #   BAZEL_CACHE_DIR         bazel disk/repo cache root (default /cache)
@@ -59,7 +59,7 @@ export BAZEL_CACHE_DIR="${BAZEL_CACHE_DIR:-${RUNNER_TEMP:-/cache}/bazel_cache}"
 export BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE:-${BAZEL_CACHE_DIR}/output_base}"
 EXTRA_BAZEL_FLAGS="${EXTRA_BAZEL_FLAGS:-}"
 export HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION:-3.12}"
-RAIDEN_TEST_SCOPE="${RAIDEN_TEST_SCOPE:-//tpu_sync/core:all //tpu_sync/kv_cache:all}"
+RAIDEN_TEST_SCOPE="${RAIDEN_TEST_SCOPE:-//tpu_sync/core:all //tpu_sync/kv_cache:all //tpu_sync/weight_sync:all //tpu_sync/rpc:all}"
 mkdir -p "${BAZEL_CACHE_DIR}/disk_cache" "${BAZEL_CACHE_DIR}/repo_cache" "$(dirname "${BAZEL_OUTPUT_BASE}")"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -141,7 +141,7 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
   RUN_E2E_DEFAULT="true"
   read -r -a SCOPE_PATTERNS <<< "${RAIDEN_TEST_SCOPE}"
   UNIVERSE="$(IFS='+'; echo "${SCOPE_PATTERNS[*]}")"
-  QUERY="kind('cc_test rule', ${UNIVERSE}) except attr(tags, 'no_oss|notap|manual|requires-', ${UNIVERSE})"
+  QUERY="kind('(cc_test|py_test) rule', ${UNIVERSE}) except attr(tags, 'no_oss|notap|manual|requires-', ${UNIVERSE})"
   QUERY_OUTPUT="$(
     "${BAZEL_BIN}" "${BAZEL_STARTUP_FLAGS[@]}" query "${QUERY}" \
       "${BAZEL_QUERY_FLAGS[@]}" --noshow_progress
@@ -149,7 +149,6 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
   if [[ -n "${QUERY_OUTPUT}" ]]; then
     mapfile -t TARGETS <<< "${QUERY_OUTPUT}"
   fi
-  TARGETS+=("//tpu_sync/kv_cache:nd_slice_math_test")
 else
   RUN_E2E_DEFAULT="false"
 fi

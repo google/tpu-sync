@@ -105,12 +105,21 @@ class ReshardReceiveSession {
 
  private:
   friend struct PoolReshardRecvTestPeer;
+  friend struct ReshardReceiveSessionTestPeer;
 
   ReshardReceiveSession(kv_cache::KVCacheManagerBase* base,
                         StagingBlockAllocator* staging_allocator, uint64_t uuid,
                         const ::tpu_sync::rpc::StartTransferRequest& plan,
                         absl::Span<const int64_t> chip_blocks,
                         std::chrono::steady_clock::time_point deadline);
+
+  static absl::Status ValidatePlan(
+      const kv_cache::KVCacheManagerBase& base,
+      const ::tpu_sync::rpc::StartTransferRequest& plan,
+      absl::Span<const int64_t> chip_blocks);
+  static absl::Status ValidateReceiverCoverage(
+      const kv_cache::KVCacheManagerBase& base,
+      const ::tpu_sync::rpc::StartTransferRequest& plan);
 
   absl::Status AcquireStagingLeases(
       const ::tpu_sync::rpc::StartTransferRequest& plan);
@@ -146,7 +155,7 @@ class ReshardReceiveSession {
   const std::chrono::steady_clock::time_point deadline_;
   const std::chrono::steady_clock::time_point start_time_;
   std::vector<int64_t> chip_block_ids_ ABSL_GUARDED_BY(mu_);
-  bool staging_released_ ABSL_GUARDED_BY(mu_) = false;
+  bool staging_released_ ABSL_GUARDED_BY(mu_) = true;
   bool network_completed_ ABSL_GUARDED_BY(mu_) = false;
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
   bool draining_ ABSL_GUARDED_BY(mu_) = false;

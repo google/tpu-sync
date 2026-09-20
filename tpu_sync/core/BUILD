@@ -249,13 +249,18 @@ cc_library(
     deps = [
         ":host_memory_allocator",
         ":xla_raw_transfer_headers",
+        "//tpu_sync/kv_cache:kv_cache_manager_base",
+        "//tpu_sync/kv_cache:pool_layout",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -580,6 +585,7 @@ cc_library(
         ":raw_transfer_core",
         ":tpu_utils",
         ":tsl_platform_headers",
+        ":utils",
         ":xla_pjrt_headers",
         "//tpu_sync/common:trace",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
@@ -932,6 +938,52 @@ cc_test(
         "//tpu_sync/telemetry:mock_metrics_backend",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "reshard_receive_session_test",
+    size = "small",
+    srcs = ["reshard_receive_session_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    deps = [
+        ":kv_cache_manager_with_transfer",
+        "//tpu_sync/kv_cache:kv_cache_manager_base",
+        "//tpu_sync/kv_cache:pool_layout",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "reshard_send_session_test",
+    size = "small",
+    srcs = ["reshard_send_session_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    deps = [
+        ":kv_cache_manager_with_transfer",
+        "//tpu_sync/kv_cache:kv_cache_manager_base",
+        "//tpu_sync/kv_cache:pool_layout",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
     ],

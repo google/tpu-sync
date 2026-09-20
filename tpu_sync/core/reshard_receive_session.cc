@@ -24,9 +24,12 @@
 #include <ratio>  // NOLINT(build/c++11)
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -36,6 +39,7 @@
 #include "xla/tsl/platform/errors.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/utils.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -58,12 +62,308 @@ void RecordTransferDuration(double duration_ms) {
 
 }  // namespace
 
+absl::Status ReshardReceiveSession::ValidatePlan(
+    const kv_cache::KVCacheManagerBase& base,
+    const ::tpu_sync::rpc::StartTransferRequest& plan,
+    absl::Span<const int64_t> chip_blocks) {
+  TF_RETURN_IF_ERROR(ValidateCommonPoolReshardPlan(&base, plan, chip_blocks));
+
+  size_t cursor = 0;
+  for (const auto& group : plan.pool_groups()) {
+    absl::flat_hash_set<int64_t> group_ids;
+    for (int64_t block_id : group.dst_device_block_ids()) {
+      if (!group_ids.insert(block_id).second) {
+        return absl::InvalidArgumentError(
+            "group destination block ids must be unique");
+      }
+      if (cursor >= chip_blocks.size() || chip_blocks[cursor] != block_id) {
+        return absl::InvalidArgumentError(
+            "pool group block ids must concatenate to the plan's "
+            "local block ids");
+      }
+      ++cursor;
+    }
+  }
+  if (cursor != chip_blocks.size()) {
+    return absl::InvalidArgumentError(
+        "pool group block ids must cover the plan's local block ids");
+  }
+
+  TF_RETURN_IF_ERROR(ValidatePoolBlockBounds(&base, plan, chip_blocks));
+
+  absl::flat_hash_set<int64_t> local_ids(chip_blocks.begin(),
+                                         chip_blocks.end());
+  absl::flat_hash_set<int64_t> receiver_blocks_with_zero_start;
+  for (const auto& [source_rank, schedule] : plan.shard_push_schedules()) {
+    for (const auto& entry : schedule.entries()) {
+      if (static_cast<size_t>(entry.dst_shard_idx()) >= base.num_shards()) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "destination shard index ", entry.dst_shard_idx(),
+            " is out of range: receiver has ", base.num_shards(), " shards"));
+      }
+      const int64_t local_id = entry.dst_block_id();
+      if (local_ids.find(local_id) == local_ids.end()) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("destination block id ", local_id,
+                         " is absent from the local block-id list"));
+      }
+      const int64_t local_offset = entry.dst_offset_bytes();
+      const int64_t local_stride = entry.dst_stride_bytes();
+      if (entry.dst_offset_bytes() == 0) {
+        receiver_blocks_with_zero_start.insert(entry.dst_block_id());
+      }
+      const int32_t group_idx = entry.pool_group();
+      for (int32_t encoded_pool_idx :
+           plan.pool_groups(group_idx).pool_indices()) {
+        const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
+        const kv_cache::PoolSpec* spec = base.pool(pool_idx);
+        if (!StridedSpanFitsRegions(local_offset, local_stride,
+                                    entry.size_bytes(), entry.count(),
+                                    spec->block_stride_bytes, spec->regions)) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "destination span exceeds declared pool ", pool_idx,
+              " live regions in block ", local_id, ": offset=", local_offset,
+              " stride=", local_stride, " size=", entry.size_bytes(), " count=",
+              entry.count(), " block_stride_bytes=", spec->block_stride_bytes));
+        }
+      }
+    }
+  }
+  for (int64_t block_id : local_ids) {
+    if (receiver_blocks_with_zero_start.find(block_id) ==
+        receiver_blocks_with_zero_start.end()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "destination block ", block_id,
+          " has no transfer entry starting at offset 0; partial-page "
+          "destination preservation is not implemented"));
+    }
+  }
+  return ValidateReceiverCoverage(base, plan);
+}
+
+absl::Status ReshardReceiveSession::ValidateReceiverCoverage(
+    const kv_cache::KVCacheManagerBase& base,
+    const ::tpu_sync::rpc::StartTransferRequest& plan) {
+  constexpr int64_t kMaxExpandedRepeats = 1 << 20;
+
+  struct GroupView {
+    std::vector<size_t> pool_indices;
+    std::vector<int64_t> dst_ids;
+    std::vector<int64_t> extents;
+    int64_t expected_pushes = 0;
+  };
+  std::vector<GroupView> groups;
+  absl::flat_hash_set<size_t> grouped_pools;
+  for (const auto& group : plan.pool_groups()) {
+    GroupView view;
+    for (int32_t pool_idx : group.pool_indices()) {
+      if (pool_idx < 0 ||
+          !grouped_pools.insert(static_cast<size_t>(pool_idx)).second) {
+        return absl::InvalidArgumentError(
+            "group pool indices must be unique and non-negative");
+      }
+      view.pool_indices.push_back(static_cast<size_t>(pool_idx));
+    }
+    view.dst_ids.assign(group.dst_device_block_ids().begin(),
+                        group.dst_device_block_ids().end());
+    view.extents.assign(group.dst_expected_extent_bytes().begin(),
+                        group.dst_expected_extent_bytes().end());
+    view.expected_pushes = group.expected_pushes();
+    groups.push_back(std::move(view));
+  }
+  if (grouped_pools.size() !=
+      static_cast<size_t>(plan.transfer_pool_indices_size())) {
+    return absl::InvalidArgumentError(
+        "group pool indices do not partition the plan's transfer pools");
+  }
+  for (int32_t pool_idx : plan.transfer_pool_indices()) {
+    if (!grouped_pools.contains(static_cast<size_t>(pool_idx))) {
+      return absl::InvalidArgumentError(
+          "group pool indices do not partition the plan's transfer pools");
+    }
+  }
+
+  const int64_t parallelism = plan.parallelism();
+  if (parallelism <= 0) {
+    return absl::InvalidArgumentError(
+        "receiver plans require positive parallelism for push accounting");
+  }
+
+  struct GroupState {
+    std::vector<kv_cache::PoolLiveSegment> segments;
+    int64_t live_bytes = 0;
+    absl::flat_hash_map<int64_t, size_t> ordinals;
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> coverage;
+    absl::flat_hash_map<
+        int32_t, absl::flat_hash_set<std::tuple<std::string, int64_t, int64_t>>>
+        pairs_by_sender;
+  };
+  std::vector<GroupState> states(groups.size());
+  for (size_t group_idx = 0; group_idx < groups.size(); ++group_idx) {
+    const GroupView& view = groups[group_idx];
+    GroupState& state = states[group_idx];
+    if (view.pool_indices.empty()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("group ", group_idx, " declares no pools"));
+    }
+    for (size_t pool_idx : view.pool_indices) {
+      const kv_cache::PoolSpec* spec = base.pool(pool_idx);
+      if (spec == nullptr) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("group pool index out of range: ", pool_idx));
+      }
+      absl::StatusOr<std::vector<kv_cache::PoolLiveSegment>> segments =
+          kv_cache::ExpandPoolLiveSegments(*spec);
+      if (!segments.ok()) return segments.status();
+      if (state.segments.empty()) {
+        state.segments = *std::move(segments);
+      } else if (state.segments != *segments) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "group ", group_idx, " pools must share one live-region map; pool ",
+            pool_idx, " disagrees"));
+      }
+    }
+    for (const kv_cache::PoolLiveSegment& segment : state.segments) {
+      state.live_bytes += segment.size;
+    }
+    if (state.live_bytes <= 0) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("group ", group_idx, " has no live destination bytes"));
+    }
+    if (view.extents.empty()) {
+      return absl::InvalidArgumentError(
+          "receiver plans require dst_expected_extent_bytes");
+    }
+    if (view.extents.size() != view.dst_ids.size()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "group ", group_idx,
+          " extents do not match its destination block count: got ",
+          view.extents.size(), ", expected ", view.dst_ids.size()));
+    }
+    for (size_t ordinal = 0; ordinal < view.extents.size(); ++ordinal) {
+      const int64_t extent = view.extents[ordinal];
+      if (extent <= 0 || extent > state.live_bytes) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("extent ", extent, " for destination block ordinal ",
+                         ordinal, " of group ", group_idx, " is outside (0, ",
+                         state.live_bytes, "]"));
+      }
+      if (ordinal != view.extents.size() - 1 && extent != state.live_bytes) {
+        return absl::InvalidArgumentError(
+            "extents must cover every destination block fully except the "
+            "final one");
+      }
+    }
+    for (size_t ordinal = 0; ordinal < view.dst_ids.size(); ++ordinal) {
+      state.ordinals[view.dst_ids[ordinal]] = ordinal;
+    }
+    state.coverage.resize(view.dst_ids.size());
+  }
+
+  int64_t expanded_repeats = 0;
+  for (const auto& [source_rank, schedule] : plan.shard_push_schedules()) {
+    for (const auto& entry : schedule.entries()) {
+      const size_t group_idx = static_cast<size_t>(entry.pool_group());
+      if (group_idx >= states.size()) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "reshard entry declares an unknown pool group ", group_idx));
+      }
+      GroupState& state = states[group_idx];
+      const auto ordinal_it = state.ordinals.find(entry.dst_block_id());
+      if (ordinal_it == state.ordinals.end()) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "reshard entry targets destination block ", entry.dst_block_id(),
+            " outside its group ", group_idx, " destination set"));
+      }
+      const int64_t extent = groups[group_idx].extents[ordinal_it->second];
+      expanded_repeats += entry.count();
+      if (expanded_repeats > kMaxExpandedRepeats) {
+        return absl::InvalidArgumentError(
+            "receiver plan exceeds the repeat expansion bound");
+      }
+      for (int64_t repeat = 0; repeat < entry.count(); ++repeat) {
+        const int64_t physical =
+            entry.dst_offset_bytes() + repeat * entry.dst_stride_bytes();
+        absl::StatusOr<std::pair<int64_t, int64_t>> range =
+            kv_cache::PhysicalLiveRangeToLogical(state.segments, physical,
+                                                 entry.size_bytes());
+        if (!range.ok()) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "reshard entry for destination block ", entry.dst_block_id(),
+              " crosses padding or lies outside declared live regions: ",
+              range.status().message()));
+        }
+        if (range->second > extent) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "reshard entry exceeds destination block ", entry.dst_block_id(),
+              " declared live tail: end=", range->second, " extent=", extent));
+        }
+        state.coverage[ordinal_it->second].push_back(*range);
+      }
+      state.pairs_by_sender[source_rank].insert(std::make_tuple(
+          entry.dst_peer(), static_cast<int64_t>(entry.src_block_id()),
+          static_cast<int64_t>(entry.dst_block_id())));
+    }
+  }
+
+  for (size_t group_idx = 0; group_idx < groups.size(); ++group_idx) {
+    const GroupView& view = groups[group_idx];
+    GroupState& state = states[group_idx];
+    int64_t calculated_pushes = 0;
+    for (const auto& [source_rank, pairs] : state.pairs_by_sender) {
+      calculated_pushes +=
+          std::min(parallelism, static_cast<int64_t>(pairs.size()));
+    }
+    if (calculated_pushes != view.expected_pushes) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "expected pushes for group ", group_idx,
+          " do not match the received schedules: declared=",
+          view.expected_pushes, " recomputed=", calculated_pushes));
+    }
+    for (size_t ordinal = 0; ordinal < view.dst_ids.size(); ++ordinal) {
+      std::vector<std::pair<int64_t, int64_t>>& intervals =
+          state.coverage[ordinal];
+      std::sort(intervals.begin(), intervals.end());
+      int64_t covered_until = 0;
+      for (const auto& [start_bytes, end_bytes] : intervals) {
+        if (start_bytes != covered_until) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "receiver schedule has a destination coverage ",
+              start_bytes < covered_until ? "overlap" : "gap", " for block ",
+              view.dst_ids[ordinal], " at byte ", start_bytes));
+        }
+        covered_until = end_bytes;
+      }
+      if (covered_until != view.extents[ordinal]) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "receiver schedule does not cover the exact live bytes for "
+            "destination block ",
+            view.dst_ids[ordinal], ": covered=", covered_until,
+            " expected=", view.extents[ordinal]));
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<std::shared_ptr<ReshardReceiveSession>>
 ReshardReceiveSession::Create(kv_cache::KVCacheManagerBase* base,
                               StagingBlockAllocator* staging_allocator,
                               const ::tpu_sync::rpc::StartTransferRequest& plan,
                               absl::Span<const int64_t> chip_blocks,
                               std::chrono::steady_clock::time_point deadline) {
+  TF_RETURN_IF_ERROR(ValidatePlan(*base, plan, chip_blocks));
+  // Device-only executor (see PoolReshardPush): arming a receive on a
+  // host-only manager is refused rather than silently landing in mirrors.
+  if (!base->has_device_buffers()) {
+    return absl::FailedPreconditionError(
+        "pool reshard receive requires a device-attached manager; host-only "
+        "managers are not supported");
+  }
+  if (plan.dst_mem_type() != ::tpu_sync::rpc::MEMORY_TYPE_HBM) {
+    return absl::InvalidArgumentError(
+        "pool reshard receiver requires dst_mem_type=HBM");
+  }
   auto session =
       std::shared_ptr<ReshardReceiveSession>(new ReshardReceiveSession(
           base, staging_allocator, plan.uuid(), plan, chip_blocks, deadline));
@@ -111,6 +411,7 @@ absl::Status ReshardReceiveSession::AcquireStagingLeases(
   std::map<size_t, std::set<int64_t>> dst_ids_by_storage;
   {
     absl::MutexLock lock(mu_);
+    staging_released_ = false;
     for (int32_t encoded_pool_idx : plan.transfer_pool_indices()) {
       const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
       const kv_cache::PoolSpec* pool_spec = base_->pool(pool_idx);

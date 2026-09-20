@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -30,6 +31,7 @@
 #include <vector>
 
 #include "absl/cleanup/cleanup.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -37,11 +39,15 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
-#include "absl/strings/strip.h"
 #include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
+#include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/shape.h"
 #include "tpu_sync/core/host_memory_allocator.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/pool_layout.h"
+#include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
 
@@ -310,6 +316,168 @@ inline std::vector<RawCopyChunk> ComputeAndValidateChunks(
     }
   }
   return chunks;
+}
+
+inline bool StridedSpanFitsBlock(int64_t offset, int64_t stride, int64_t size,
+                                 int64_t count, int64_t block_size) {
+  if (offset < 0 || stride < 0 || size <= 0 || count <= 0 || block_size <= 0 ||
+      offset > block_size || size > block_size - offset) {
+    return false;
+  }
+  if (count == 1) return true;
+
+  // Division avoids overflowing (count - 1) * stride.
+  const int64_t remaining = block_size - offset - size;
+  return stride <= remaining / (count - 1);
+}
+
+inline bool StridedSpanFitsRegions(
+    int64_t offset, int64_t stride, int64_t size, int64_t count,
+    int64_t block_size, const std::vector<kv_cache::RegionSpec>& regions) {
+  if (!StridedSpanFitsBlock(offset, stride, size, count, block_size)) {
+    return false;
+  }
+  for (int64_t repeat = 0; repeat < count; ++repeat) {
+    const int64_t start = offset + repeat * stride;
+    if (!kv_cache::RegionsCoverRange(regions, static_cast<size_t>(start),
+                                     static_cast<size_t>(start + size))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Validates the common structure, pool table metadata, and schedule entry
+// bounds shared by both sender and receiver pool-reshard plans.
+inline absl::Status ValidateCommonPoolReshardPlan(
+    const kv_cache::KVCacheManagerBase* base,
+    const ::tpu_sync::rpc::StartTransferRequest& plan,
+    absl::Span<const int64_t> local_block_ids) {
+  if (plan.req_id().empty()) {
+    return absl::InvalidArgumentError("reshard plan req_id must be non-empty");
+  }
+  if (plan.uuid() <= 0) {
+    return absl::InvalidArgumentError("reshard plan uuid must be positive");
+  }
+  if (!plan.use_block_chunks()) {
+    return absl::InvalidArgumentError(
+        "pool reshard requires use_block_chunks=true");
+  }
+  if (plan.transfer_pool_indices().empty()) {
+    return absl::InvalidArgumentError(
+        "reshard plan must declare transfer_pool_indices");
+  }
+  if (plan.pool_groups().empty()) {
+    return absl::InvalidArgumentError(
+        "reshard plans must declare pool_groups (a plan is a list of "
+        "groups; entries name their group)");
+  }
+  for (const auto& group : plan.pool_groups()) {
+    if (group.expected_pushes() <= 0) {
+      return absl::InvalidArgumentError(
+          "every pool group must expect a positive push count");
+    }
+  }
+  if (plan.pool_dtype_tags_size() != static_cast<int>(base->num_pools())) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "reshard plan must declare one dtype tag per pool: plan=",
+        plan.pool_dtype_tags_size(), " local=", base->num_pools()));
+  }
+  if (local_block_ids.empty()) {
+    return absl::InvalidArgumentError("local block ids must not be empty");
+  }
+  for (int64_t block_id : local_block_ids) {
+    if (block_id < 0 || block_id > std::numeric_limits<int>::max()) {
+      return absl::InvalidArgumentError(
+          "local block ids must be non-negative and fit in int");
+    }
+  }
+  absl::flat_hash_set<size_t> declared_pools;
+  for (int32_t encoded_pool_idx : plan.transfer_pool_indices()) {
+    if (encoded_pool_idx < 0) {
+      return absl::InvalidArgumentError(
+          "transfer pool index must be non-negative");
+    }
+    const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
+    if (!declared_pools.insert(pool_idx).second) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("duplicate transfer pool index ", pool_idx));
+    }
+    const kv_cache::PoolSpec* spec = base->pool(pool_idx);
+    if (spec == nullptr) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("transfer pool index out of range: ", pool_idx));
+    }
+    if (plan.pool_dtype_tags(pool_idx) != spec->dtype_tag) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("plan dtype tag mismatch for pool ", pool_idx, " (",
+                       spec->tag, "): plan=", plan.pool_dtype_tags(pool_idx),
+                       " local=", spec->dtype_tag));
+    }
+  }
+  if (plan.shard_push_schedules().empty()) {
+    return absl::InvalidArgumentError(
+        "reshard plan must contain shard push schedules");
+  }
+  size_t entry_count = 0;
+  for (const auto& [source_rank, schedule] : plan.shard_push_schedules()) {
+    if (source_rank < 0) {
+      return absl::InvalidArgumentError(
+          "reshard schedule source rank must be non-negative");
+    }
+    for (const auto& entry : schedule.entries()) {
+      ++entry_count;
+      if (entry.dst_peer().empty()) {
+        return absl::InvalidArgumentError(
+            "reshard entry dst_peer must be non-empty");
+      }
+      if (entry.src_block_id() < 0 ||
+          entry.src_block_id() > std::numeric_limits<int>::max() ||
+          entry.dst_block_id() < 0 ||
+          entry.dst_block_id() > std::numeric_limits<int>::max() ||
+          entry.dst_shard_idx() < 0 || entry.src_offset_bytes() < 0 ||
+          entry.dst_offset_bytes() < 0 || entry.size_bytes() <= 0 ||
+          entry.src_stride_bytes() < 0 || entry.dst_stride_bytes() < 0 ||
+          entry.count() <= 0 || entry.count() > (1 << 20)) {
+        return absl::InvalidArgumentError(
+            "reshard entry contains invalid ids, offsets, sizes, or strides");
+      }
+      if (entry.count() > 1 &&
+          (entry.src_stride_bytes() == 0 || entry.dst_stride_bytes() == 0)) {
+        return absl::InvalidArgumentError(
+            "multi-chunk reshard entries require positive strides");
+      }
+      const int32_t group_idx = entry.pool_group();
+      if (group_idx < 0 || group_idx >= plan.pool_groups_size()) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "reshard entry declares an unknown pool group ", group_idx));
+      }
+    }
+  }
+  if (entry_count == 0) {
+    return absl::InvalidArgumentError("reshard plan contains no entries");
+  }
+  return absl::OkStatus();
+}
+
+// Validates that every block ID in |local_block_ids| fits within each
+// transferred pool's block capacity.
+inline absl::Status ValidatePoolBlockBounds(
+    const kv_cache::KVCacheManagerBase* base,
+    const ::tpu_sync::rpc::StartTransferRequest& plan,
+    absl::Span<const int64_t> local_block_ids) {
+  for (int32_t encoded_pool_idx : plan.transfer_pool_indices()) {
+    const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
+    const kv_cache::PoolSpec* spec = base->pool(pool_idx);
+    for (int64_t block_id : local_block_ids) {
+      if (block_id >= spec->num_blocks) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("local block id ", block_id,
+                         " is out of range for pool ", pool_idx));
+      }
+    }
+  }
+  return absl::OkStatus();
 }
 
 }  // namespace tpu_raiden

@@ -443,13 +443,6 @@ class KVCacheManagerWithTransfer {
   absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardSendSession>>
       active_pool_reshard_sends_;
 
-  absl::Status ValidatePoolReshardPlan(
-      const ::tpu_sync::rpc::StartTransferRequest& plan,
-      absl::Span<const int64_t> local_block_ids, bool is_sender);
-  // Receiver-only byte accounting over the plan's group structure.
-  absl::Status ValidatePoolReshardReceiverCoverage(
-      const ::tpu_sync::rpc::StartTransferRequest& plan);
-
   std::chrono::steady_clock::time_point DeadlineFromNow() const;
 
   static CopySpec Offsets(const std::vector<int64_t>& block_ids,

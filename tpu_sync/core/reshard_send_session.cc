@@ -26,16 +26,19 @@
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/errors.h"
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/pool_reshard_send_slots.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/utils.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -43,11 +46,60 @@
 
 namespace tpu_raiden {
 
+absl::Status ReshardSendSession::ValidatePlan(
+    const kv_cache::KVCacheManagerBase& base,
+    const ::tpu_sync::rpc::StartTransferRequest& plan,
+    absl::Span<const int64_t> src_block_ids) {
+  TF_RETURN_IF_ERROR(ValidateCommonPoolReshardPlan(&base, plan, src_block_ids));
+  TF_RETURN_IF_ERROR(ValidatePoolBlockBounds(&base, plan, src_block_ids));
+
+  absl::flat_hash_set<int64_t> local_ids(src_block_ids.begin(),
+                                         src_block_ids.end());
+  for (const auto& [source_rank, schedule] : plan.shard_push_schedules()) {
+    for (const auto& entry : schedule.entries()) {
+      const int64_t local_id = entry.src_block_id();
+      if (local_ids.find(local_id) == local_ids.end()) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("source block id ", local_id,
+                         " is absent from the local block-id list"));
+      }
+      const int64_t local_offset = entry.src_offset_bytes();
+      const int64_t local_stride = entry.src_stride_bytes();
+      const int32_t group_idx = entry.pool_group();
+      for (int32_t encoded_pool_idx :
+           plan.pool_groups(group_idx).pool_indices()) {
+        const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
+        const kv_cache::PoolSpec* spec = base.pool(pool_idx);
+        if (!StridedSpanFitsRegions(local_offset, local_stride,
+                                    entry.size_bytes(), entry.count(),
+                                    spec->block_stride_bytes, spec->regions)) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "source span exceeds declared pool ", pool_idx,
+              " live regions in block ", local_id, ": offset=", local_offset,
+              " stride=", local_stride, " size=", entry.size_bytes(), " count=",
+              entry.count(), " block_stride_bytes=", spec->block_stride_bytes));
+        }
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
     kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* staging_allocator, int parallelism,
+    StagingBlockAllocator* staging_allocator,
+    absl::Span<const int64_t> src_block_ids, int parallelism,
     std::chrono::steady_clock::time_point deadline,
     ::tpu_sync::rpc::StartTransferRequest plan) {
+  TF_RETURN_IF_ERROR(ValidatePlan(*base, plan, src_block_ids));
+  // Device-only executor: without device attachments there are no bytes this
+  // path could legitimately move; host-only managers fail closed with no
+  // host-mode branch to mask device bugs.
+  if (!base->has_device_buffers()) {
+    return absl::FailedPreconditionError(
+        "pool reshard push requires a device-attached manager; host-only "
+        "managers are not supported");
+  }
   if (parallelism <= 0) {
     return absl::InvalidArgumentError("parallelism must be positive");
   }
@@ -75,6 +127,7 @@ absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
   if (remaining_pool_peer_pushes <= 0) {
     return absl::InvalidArgumentError("sender plan schedules no pushes");
   }
+
   std::string req_id = plan.req_id();
   const uint64_t uuid = plan.uuid();
   return std::shared_ptr<ReshardSendSession>(new ReshardSendSession(

@@ -48,7 +48,8 @@ class ReshardSendSession {
   // send session.
   static absl::StatusOr<std::shared_ptr<ReshardSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,
-      StagingBlockAllocator* staging_allocator, int parallelism,
+      StagingBlockAllocator* staging_allocator,
+      absl::Span<const int64_t> src_block_ids, int parallelism,
       std::chrono::steady_clock::time_point deadline,
       ::tpu_sync::rpc::StartTransferRequest plan);
 
@@ -78,12 +79,20 @@ class ReshardSendSession {
   void FinishTimeout();
 
  private:
+  friend struct ReshardSendSessionTestPeer;
+
   ReshardSendSession(kv_cache::KVCacheManagerBase* base,
                      StagingBlockAllocator* staging_allocator,
                      std::string req_id, uint64_t uuid, int parallelism,
                      int remaining_pool_peer_pushes,
                      std::chrono::steady_clock::time_point deadline,
                      ::tpu_sync::rpc::StartTransferRequest plan);
+
+  // Validates |plan| against |base| and |src_block_ids|.
+  static absl::Status ValidatePlan(
+      const kv_cache::KVCacheManagerBase& base,
+      const ::tpu_sync::rpc::StartTransferRequest& plan,
+      absl::Span<const int64_t> src_block_ids);
 
   // Records completion or failure of one (pool, peer) push operation and
   // releases staging resources once all scheduled pushes settle.

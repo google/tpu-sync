@@ -4516,5 +4516,140 @@ class WeightSyncReceiverAndCacheLeakTest(absltest.TestCase):
       ws_client.close()
 
 
+class RaidenMultiPeerBroadcastDeduplicationTest(absltest.TestCase):
+  """Tests for multi-peer broadcast destination deduplication in ShardPushEntryProto."""
+
+  def test_build_sender_push_schedule_protos_deduplication(self):
+    client = raiden_controller.WorkerRpcClient()
+    try:
+      # 3 destination peers targeting the exact same slicing parameters
+      push_schedules = {
+          0: [
+              ("10.0.0.1:8000", 0, 100, 200, 1024, 1, 2, 64, 64, 16, 5, 0),
+              ("10.0.0.2:8000", 0, 100, 200, 1024, 1, 2, 64, 64, 16, 5, 0),
+              ("10.0.0.3:8000", 0, 100, 200, 1024, 1, 2, 64, 64, 16, 5, 0),
+              # A distinct entry with different slicing parameters
+              ("10.0.0.1:8000", 1, 300, 400, 2048, 3, 4, 128, 128, 8, 6, 0),
+          ]
+      }
+      protos = client.build_sender_push_schedule_protos(push_schedules)
+      self.assertIn(0, protos)
+      sched_proto = protos[0]
+      self.assertLen(sched_proto.entries, 2)
+
+      # Check deduplicated broadcast entry
+      e0 = sched_proto.entries[0]
+      self.assertEqual(e0.dst_peer, "10.0.0.1:8000")
+      self.assertEqual(
+          list(e0.dst_peers),
+          ["10.0.0.1:8000", "10.0.0.2:8000", "10.0.0.3:8000"],
+      )
+      self.assertEqual(e0.dst_shard_idx, 0)
+      self.assertEqual(e0.dst_offset_bytes, 100)
+      self.assertEqual(e0.src_offset_bytes, 200)
+      self.assertEqual(e0.size_bytes, 1024)
+      self.assertEqual(e0.src_block_id, 1)
+      self.assertEqual(e0.dst_block_id, 2)
+      self.assertEqual(e0.src_stride_bytes, 64)
+      self.assertEqual(e0.dst_stride_bytes, 64)
+      self.assertEqual(e0.count, 16)
+      self.assertEqual(e0.layer_idx, 5)
+
+      # Check distinct entry
+      e1 = sched_proto.entries[1]
+      self.assertEqual(e1.dst_peer, "10.0.0.1:8000")
+      self.assertEqual(list(e1.dst_peers), ["10.0.0.1:8000"])
+      self.assertEqual(e1.dst_shard_idx, 1)
+      self.assertEqual(e1.size_bytes, 2048)
+    finally:
+      client.close()
+
+  def test_build_sender_push_schedule_protos_duplicate_peers(self):
+    client = raiden_controller.WorkerRpcClient()
+    try:
+      # Duplicate destination peers should not produce duplicates in dst_peers
+      push_schedules = {
+          0: [
+              ("10.0.0.1:8000", 0, 0, 0, 512, 0, 0, 0, 0, 1, 0, 0),
+              ("10.0.0.1:8000", 0, 0, 0, 512, 0, 0, 0, 0, 1, 0, 0),
+              ("10.0.0.2:8000", 0, 0, 0, 512, 0, 0, 0, 0, 1, 0, 0),
+          ]
+      }
+      protos = client.build_sender_push_schedule_protos(push_schedules)
+      e = protos[0].entries[0]
+      self.assertEqual(list(e.dst_peers), ["10.0.0.1:8000", "10.0.0.2:8000"])
+      self.assertEqual(e.dst_peer, "10.0.0.1:8000")
+    finally:
+      client.close()
+
+  def test_encode_start_transfer_receiver_filtering_with_dst_peers(self):
+    client = raiden_controller.WorkerRpcClient()
+    try:
+      src_unit = raiden_controller.RaidenId("src_job", "0", "data", 0)
+      dst_unit_1 = raiden_controller.RaidenId("dst_job_1", "0", "data", 0)
+      dst_unit_2 = raiden_controller.RaidenId("dst_job_2", "0", "data", 0)
+      dst_unit_3 = raiden_controller.RaidenId("dst_job_3", "0", "data", 0)
+
+      # Create pre-grouped entry proto with multiple dst_peers
+      sched_proto = raiden_service_pb2.ShardPushScheduleProto()
+      entry = sched_proto.entries.add()
+      entry.dst_peer = "10.0.0.1:8000"
+      entry.dst_peers.extend(["10.0.0.1:8000", "10.0.0.2:8000"])
+      entry.dst_shard_idx = 0
+      entry.dst_offset_bytes = 0
+      entry.src_offset_bytes = 0
+      entry.size_bytes = 1024
+      entry.count = 1
+
+      plan = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit_1, dst_unit_2, dst_unit_3],
+          plan={},
+          shard_push_schedules={src_unit: {0: [entry]}},
+          worker_data_addresses={
+              dst_unit_1: ["10.0.0.1:8000"],
+              dst_unit_2: ["10.0.0.2:8000"],
+              dst_unit_3: ["10.0.0.3:8000"],
+          },
+          is_weight_sync=False,
+      )
+
+      # Test receiver 1 (matches 10.0.0.1:8000)
+      encoded1 = client._encode_start_transfer(
+          dst_unit_1, plan, address="10.0.0.1:9000"
+      )
+      req1 = raiden_service_pb2.ControlRequest()
+      req1.ParseFromString(encoded1)
+      self.assertLen(
+          req1.start_transfer_request.shard_push_schedules[0].entries, 1
+      )
+      e1 = req1.start_transfer_request.shard_push_schedules[0].entries[0]
+      self.assertEqual(e1.dst_peer, "10.0.0.1:8000")
+      self.assertEqual(list(e1.dst_peers), ["10.0.0.1:8000"])
+
+      # Test receiver 2 (matches 10.0.0.2:8000)
+      encoded2 = client._encode_start_transfer(
+          dst_unit_2, plan, address="10.0.0.2:9000"
+      )
+      req2 = raiden_service_pb2.ControlRequest()
+      req2.ParseFromString(encoded2)
+      self.assertLen(
+          req2.start_transfer_request.shard_push_schedules[0].entries, 1
+      )
+      e2 = req2.start_transfer_request.shard_push_schedules[0].entries[0]
+      self.assertEqual(e2.dst_peer, "10.0.0.2:8000")
+      self.assertEqual(list(e2.dst_peers), ["10.0.0.2:8000"])
+
+      # Test receiver 3 (no match, should be empty)
+      encoded3 = client._encode_start_transfer(
+          dst_unit_3, plan, address="10.0.0.3:9000"
+      )
+      req3 = raiden_service_pb2.ControlRequest()
+      req3.ParseFromString(encoded3)
+      self.assertEmpty(req3.start_transfer_request.shard_push_schedules)
+    finally:
+      client.close()
+
+
 if __name__ == "__main__":
   absltest.main()

@@ -791,7 +791,12 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       }
       size_t shard_host_size = layers_[layer_idx_to_use].shards[i].host_size;
 
-      const std::string& dst_peer = entry.dst_peer();
+      std::vector<std::string> peers;
+      if (!entry.dst_peers().empty()) {
+        peers.assign(entry.dst_peers().begin(), entry.dst_peers().end());
+      } else if (!entry.dst_peer().empty()) {
+        peers.push_back(entry.dst_peer());
+      }
       size_t dst_shard_idx = entry.dst_shard_idx();
       size_t count = entry.count() > 0 ? entry.count() : 1;
       size_t src_stride = entry.src_stride_bytes();
@@ -805,14 +810,16 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
         if (src_offset + total_payload_size > shard_host_size) {
           return absl::InvalidArgumentError("Push range out of bounds");
         }
-        tasks_by_layer[layer_idx_to_use].push_back({
-            .peer = dst_peer,
-            .buffer_id = static_cast<size_t>(layer_idx_to_use),
-            .dst_shard_idx = dst_shard_idx,
-            .dst_offset_bytes = dst_offset,
-            .data_ptr = base_host_ptr + src_offset,
-            .size_bytes = total_payload_size,
-        });
+        for (const auto& peer : peers) {
+          tasks_by_layer[layer_idx_to_use].push_back({
+              .peer = peer,
+              .buffer_id = static_cast<size_t>(layer_idx_to_use),
+              .dst_shard_idx = dst_shard_idx,
+              .dst_offset_bytes = dst_offset,
+              .data_ptr = base_host_ptr + src_offset,
+              .size_bytes = total_payload_size,
+          });
+        }
       } else {
         for (size_t c = 0; c < count; ++c) {
           size_t curr_src_offset = src_offset + c * src_stride;
@@ -823,14 +830,16 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
           }
 
           const uint8_t* data_ptr = base_host_ptr + curr_src_offset;
-          tasks_by_layer[layer_idx_to_use].push_back({
-              .peer = dst_peer,
-              .buffer_id = static_cast<size_t>(layer_idx_to_use),
-              .dst_shard_idx = dst_shard_idx,
-              .dst_offset_bytes = curr_dst_offset,
-              .data_ptr = data_ptr,
-              .size_bytes = size,
-          });
+          for (const auto& peer : peers) {
+            tasks_by_layer[layer_idx_to_use].push_back({
+                .peer = peer,
+                .buffer_id = static_cast<size_t>(layer_idx_to_use),
+                .dst_shard_idx = dst_shard_idx,
+                .dst_offset_bytes = curr_dst_offset,
+                .data_ptr = data_ptr,
+                .size_bytes = size,
+            });
+          }
         }
       }
     }

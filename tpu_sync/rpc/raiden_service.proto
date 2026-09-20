@@ -125,8 +125,8 @@ message RegisterWorkUnitRequest {
 // remote destination shard.
 message ShardPushEntryProto {
   // Network coordinate "ip:port" or BNS of the remote Destination Worker Data
-  // servicer.
-  string dst_peer = 1;
+  // servicer. Deprecated in favor of dst_peers for multi-peer broadcast deduplication.
+  string dst_peer = 1 [deprecated = true];
   // Logical shard partition index managed by the target Destination Worker
   // process.
   int32 dst_shard_idx = 2;
@@ -149,6 +149,8 @@ message ShardPushEntryProto {
   // (multi-tag transfers); single-tag plans leave it zero and scope every
   // entry to every transfer pool, preserving the legacy replay.
   optional int32 pool_group = 12;
+  // Deduplicated destination worker peers for multi-peer broadcast pushes.
+  repeated string dst_peers = 13;
 }
 
 // A collection of network push entries orchestrated by a specific source TPU

@@ -915,36 +915,70 @@ class WorkerRpcClient:
                 )
                 key_idx = src_base * num_src_shards + shard_idx
               schedule_proto = self._proto_module.ShardPushScheduleProto()
-              for entry_tuple in schedule:
-                (
-                    dst_peer,
-                    dst_shard_idx,
-                    dst_offset,
-                    src_offset,
-                    size,
-                    src_block_id,
-                    dst_block_id,
-                    src_stride,
-                    dst_stride,
-                    count,
-                    *extra,
-                ) = entry_tuple
-                layer_idx = extra[0] if extra else 0
-                pool_group = extra[1] if len(extra) > 1 else 0
-                if dst_peer in target_endpoints:
-                  entry_proto = schedule_proto.entries.add()
-                  entry_proto.dst_peer = dst_peer
-                  entry_proto.dst_shard_idx = dst_shard_idx
-                  entry_proto.dst_offset_bytes = dst_offset
-                  entry_proto.src_offset_bytes = src_offset
-                  entry_proto.size_bytes = size
-                  entry_proto.src_block_id = src_block_id
-                  entry_proto.dst_block_id = dst_block_id
-                  entry_proto.src_stride_bytes = src_stride
-                  entry_proto.dst_stride_bytes = dst_stride
-                  entry_proto.count = count
-                  entry_proto.layer_idx = layer_idx
-                  entry_proto.pool_group = pool_group
+              raw_entries = (
+                  schedule.entries
+                  if hasattr(schedule, "entries")
+                  else schedule
+              )
+              target_endpoints_set = set(target_endpoints)
+              for entry_item in raw_entries:
+                if hasattr(entry_item, "dst_peers") or hasattr(
+                    entry_item, "dst_peer"
+                ):
+                  if entry_item.dst_peers:
+                    item_peers = list(entry_item.dst_peers)
+                  elif entry_item.dst_peer:
+                    item_peers = [entry_item.dst_peer]
+                  else:
+                    item_peers = []
+                  matching_peers = [
+                      p for p in item_peers if p in target_endpoints_set
+                  ]
+                  if matching_peers:
+                    entry_proto = schedule_proto.entries.add()
+                    entry_proto.CopyFrom(entry_item)
+                    entry_proto.dst_peer = matching_peers[0]
+                    del entry_proto.dst_peers[:]
+                    entry_proto.dst_peers.extend(matching_peers)
+                else:
+                  (
+                      dst_peer,
+                      dst_shard_idx,
+                      dst_offset,
+                      src_offset,
+                      size,
+                      src_block_id,
+                      dst_block_id,
+                      src_stride,
+                      dst_stride,
+                      count,
+                      *extra,
+                  ) = entry_item
+                  layer_idx = extra[0] if extra else 0
+                  pool_group = extra[1] if len(extra) > 1 else 0
+                  item_peers = (
+                      list(dst_peer)
+                      if isinstance(dst_peer, (list, tuple, set))
+                      else ([dst_peer] if dst_peer else [])
+                  )
+                  matching_peers = [
+                      p for p in item_peers if p in target_endpoints_set
+                  ]
+                  if matching_peers:
+                    entry_proto = schedule_proto.entries.add()
+                    entry_proto.dst_peer = matching_peers[0]
+                    entry_proto.dst_peers.extend(matching_peers)
+                    entry_proto.dst_shard_idx = dst_shard_idx
+                    entry_proto.dst_offset_bytes = dst_offset
+                    entry_proto.src_offset_bytes = src_offset
+                    entry_proto.size_bytes = size
+                    entry_proto.src_block_id = src_block_id
+                    entry_proto.dst_block_id = dst_block_id
+                    entry_proto.src_stride_bytes = src_stride
+                    entry_proto.dst_stride_bytes = dst_stride
+                    entry_proto.count = count
+                    entry_proto.layer_idx = layer_idx
+                    entry_proto.pool_group = pool_group
               if len(schedule_proto.entries) > 0:
                 start_req.shard_push_schedules[key_idx].CopyFrom(schedule_proto)
       else:
@@ -976,9 +1010,54 @@ class WorkerRpcClient:
     target_protos = {}
     for shard_idx, entries in push_schedules.items():
       schedule_proto = self._proto_module.ShardPushScheduleProto()
-      for entry_tuple in entries:
-        (
-            dst_peer,
+      groups = {}
+      for entry_item in entries:
+        if hasattr(entry_item, "dst_peers") or hasattr(entry_item, "dst_peer"):
+          if entry_item.dst_peers:
+            raw_peers = list(entry_item.dst_peers)
+          elif entry_item.dst_peer:
+            raw_peers = [entry_item.dst_peer]
+          else:
+            raw_peers = []
+          dst_shard_idx = entry_item.dst_shard_idx
+          dst_offset = entry_item.dst_offset_bytes
+          src_offset = entry_item.src_offset_bytes
+          size = entry_item.size_bytes
+          src_block_id = entry_item.src_block_id
+          dst_block_id = entry_item.dst_block_id
+          src_stride = entry_item.src_stride_bytes
+          dst_stride = entry_item.dst_stride_bytes
+          count = entry_item.count
+          layer_idx = (
+              entry_item.layer_idx
+              if entry_item.HasField("layer_idx")
+              else 0
+          )
+          pool_group = (
+              entry_item.pool_group
+              if entry_item.HasField("pool_group")
+              else 0
+          )
+        else:
+          (
+              raw_peers,
+              dst_shard_idx,
+              dst_offset,
+              src_offset,
+              size,
+              src_block_id,
+              dst_block_id,
+              src_stride,
+              dst_stride,
+              count,
+              *extra,
+          ) = entry_item
+          layer_idx = extra[0] if extra else 0
+          pool_group = extra[1] if len(extra) > 1 else 0
+          if not isinstance(raw_peers, (list, tuple, set)):
+            raw_peers = [raw_peers]
+
+        key = (
             dst_shard_idx,
             dst_offset,
             src_offset,
@@ -988,12 +1067,33 @@ class WorkerRpcClient:
             src_stride,
             dst_stride,
             count,
-            *extra,
-        ) = entry_tuple
-        layer_idx = extra[0] if extra else 0
-        pool_group = extra[1] if len(extra) > 1 else 0
+            layer_idx,
+            pool_group,
+        )
+        if key not in groups:
+          groups[key] = []
+        for p in raw_peers:
+          if p and p not in groups[key]:
+            groups[key].append(p)
+
+      for key, peers in groups.items():
+        (
+            dst_shard_idx,
+            dst_offset,
+            src_offset,
+            size,
+            src_block_id,
+            dst_block_id,
+            src_stride,
+            dst_stride,
+            count,
+            layer_idx,
+            pool_group,
+        ) = key
         entry_proto = schedule_proto.entries.add()
-        entry_proto.dst_peer = dst_peer
+        if peers:
+          entry_proto.dst_peer = peers[0]
+          entry_proto.dst_peers.extend(peers)
         entry_proto.dst_shard_idx = dst_shard_idx
         entry_proto.dst_offset_bytes = dst_offset
         entry_proto.src_offset_bytes = src_offset
@@ -3569,9 +3669,17 @@ class RaidenControllerServer:
               dst_mem_type = RaidenMemoryType.HBM
 
             def decode_entries(schedule_proto):
-              return [
-                  (
-                      entry.dst_peer,
+              entries = []
+              for entry in schedule_proto.entries:
+                if entry.dst_peers:
+                  peers = list(entry.dst_peers)
+                elif entry.dst_peer:
+                  peers = [entry.dst_peer]
+                else:
+                  peers = []
+                for peer in peers:
+                  entries.append((
+                      peer,
                       entry.dst_shard_idx,
                       entry.dst_offset_bytes,
                       entry.src_offset_bytes,
@@ -3583,9 +3691,8 @@ class RaidenControllerServer:
                       entry.count,
                       entry.layer_idx,
                       entry.pool_group,
-                  )
-                  for entry in schedule_proto.entries
-              ]
+                  ))
+              return entries
 
             if start_req.transfer_pool_indices or start_req.pool_groups:
               # Fail closed for pre-P2 peers: the planning controller now
@@ -3930,6 +4037,7 @@ class RaidenControllerClientFacade:
             pool_group = extra[1] if len(extra) > 1 else 0
             entry_proto = schedule_proto.entries.add()
             entry_proto.dst_peer = dst_peer
+            entry_proto.dst_peers.append(dst_peer)
             entry_proto.dst_shard_idx = dst_shard_idx
             entry_proto.dst_offset_bytes = dst_offset
             entry_proto.src_offset_bytes = src_offset

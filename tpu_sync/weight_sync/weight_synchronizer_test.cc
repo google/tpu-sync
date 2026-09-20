@@ -229,6 +229,140 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedExactBoundary) {
   }
 }
 
+TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiPeerBroadcast) {
+  size_t num_layers = 1;
+  size_t num_shards = 1;
+  size_t slice_byte_size = 16384;
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest1 = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest2 = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest1->local_port().has_value());
+  ASSERT_TRUE(ws_dest2->local_port().has_value());
+  std::string dest_peer1 =
+      "localhost:" + std::to_string(*ws_dest1->local_port());
+  std::string dest_peer2 =
+      "localhost:" + std::to_string(*ws_dest2->local_port());
+
+  uint8_t* src_host_ptr =
+      const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
+  uint8_t* dest_host_ptr1 =
+      const_cast<uint8_t*>(ws_dest1->GetHostPointer(0, 0));
+  uint8_t* dest_host_ptr2 =
+      const_cast<uint8_t*>(ws_dest2->GetHostPointer(0, 0));
+  ASSERT_NE(src_host_ptr, nullptr);
+  ASSERT_NE(dest_host_ptr1, nullptr);
+  ASSERT_NE(dest_host_ptr2, nullptr);
+  std::memset(src_host_ptr, 0xCD, slice_byte_size);
+  std::memset(dest_host_ptr1, 0x00, slice_byte_size);
+  std::memset(dest_host_ptr2, 0x00, slice_byte_size);
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  request.set_uuid(67890);
+
+  auto* schedules = request.mutable_shard_push_schedules();
+  auto* entry = (*schedules)[0].add_entries();
+  entry->set_dst_peer(dest_peer1);
+  entry->add_dst_peers(dest_peer1);
+  entry->add_dst_peers(dest_peer2);
+  entry->set_dst_shard_idx(0);
+  entry->set_src_offset_bytes(0);
+  entry->set_dst_offset_bytes(0);
+  entry->set_size_bytes(slice_byte_size);
+  entry->set_count(1);
+  entry->set_layer_idx(0);
+
+  ASSERT_OK(ws_dest1->RegisterExpectedChunks(request.uuid(), 1));
+  ASSERT_OK(ws_dest2->RegisterExpectedChunks(request.uuid(), 1));
+  absl::Status status = ws_source->PushWeightsResharded(request);
+  EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest1->WaitForTransferCompletion(request.uuid()));
+  ASSERT_OK(ws_dest2->WaitForTransferCompletion(request.uuid()));
+
+  for (size_t i = 0; i < slice_byte_size; ++i) {
+    EXPECT_EQ(dest_host_ptr1[i], 0xCD) << "Mismatch dest1 at byte " << i;
+    EXPECT_EQ(dest_host_ptr2[i], 0xCD) << "Mismatch dest2 at byte " << i;
+  }
+}
+
+TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiPeerBroadcastStrided) {
+  size_t num_layers = 1;
+  size_t num_shards = 1;
+  size_t slice_byte_size = 16384;
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest1 = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest2 = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest1->local_port().has_value());
+  ASSERT_TRUE(ws_dest2->local_port().has_value());
+  std::string dest_peer1 =
+      "localhost:" + std::to_string(*ws_dest1->local_port());
+  std::string dest_peer2 =
+      "localhost:" + std::to_string(*ws_dest2->local_port());
+
+  uint8_t* src_host_ptr =
+      const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
+  uint8_t* dest_host_ptr1 =
+      const_cast<uint8_t*>(ws_dest1->GetHostPointer(0, 0));
+  uint8_t* dest_host_ptr2 =
+      const_cast<uint8_t*>(ws_dest2->GetHostPointer(0, 0));
+  ASSERT_NE(src_host_ptr, nullptr);
+  ASSERT_NE(dest_host_ptr1, nullptr);
+  ASSERT_NE(dest_host_ptr2, nullptr);
+  std::memset(src_host_ptr, 0xEF, slice_byte_size);
+  std::memset(dest_host_ptr1, 0x00, slice_byte_size);
+  std::memset(dest_host_ptr2, 0x00, slice_byte_size);
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  request.set_uuid(67891);
+
+  auto* schedules = request.mutable_shard_push_schedules();
+  auto* entry = (*schedules)[0].add_entries();
+  entry->add_dst_peers(dest_peer1);
+  entry->add_dst_peers(dest_peer2);
+  entry->set_dst_shard_idx(0);
+  entry->set_src_offset_bytes(0);
+  entry->set_dst_offset_bytes(0);
+  entry->set_size_bytes(256);
+  entry->set_src_stride_bytes(512);
+  entry->set_dst_stride_bytes(512);
+  entry->set_count(10);
+  entry->set_layer_idx(0);
+
+  // Each strided chunk pushes 1 task per count (10 chunks total)
+  ASSERT_OK(ws_dest1->RegisterExpectedChunks(request.uuid(), 10));
+  ASSERT_OK(ws_dest2->RegisterExpectedChunks(request.uuid(), 10));
+  absl::Status status = ws_source->PushWeightsResharded(request);
+  EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest1->WaitForTransferCompletion(request.uuid()));
+  ASSERT_OK(ws_dest2->WaitForTransferCompletion(request.uuid()));
+
+  for (size_t c = 0; c < 10; ++c) {
+    for (size_t b = 0; b < 256; ++b) {
+      EXPECT_EQ(dest_host_ptr1[c * 512 + b], 0xEF);
+      EXPECT_EQ(dest_host_ptr2[c * 512 + b], 0xEF);
+    }
+  }
+}
+
 TEST_F(WeightSynchronizerTest, PushWeightsReshardedZeroBytes) {
   size_t num_layers = 1;
   size_t num_shards = 1;

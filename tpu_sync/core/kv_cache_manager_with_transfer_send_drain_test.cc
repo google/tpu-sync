@@ -61,11 +61,7 @@ class TestManager : public KVCacheManagerWithTransfer {
       : KVCacheManagerWithTransfer(std::make_unique<TestBase>(num_layers, this),
                                    /*node_id=*/0,
                                    /*local_control_port=*/-1, /*max_blocks=*/1,
-                                   /*num_slots=*/kSlots, kTimeoutS) {
-    CHECK_OK(
-        base_->ConfigureHostStagingSlots(kSlots, /*max_major_per_slot=*/1));
-    CHECK_OK(InitializeSlotPool(kSlots));
-  }
+                                   /*num_slots=*/kSlots, kTimeoutS) {}
 
   // Serves a pull for `uuid` the way ProcessPullStream does once the
   // consumer is acknowledged: the push runs on this thread and returns
@@ -91,20 +87,18 @@ class TestManager : public KVCacheManagerWithTransfer {
     copies_.at(index).Set(std::move(status));
   }
 
-  size_t free_slots() {
-    absl::MutexLock lock(mu_);
-    return free_slots_.size();
-  }
+  size_t free_slots() { return staging_allocator_->num_free_slots(); }
 
   // White-box construction for the send retirement state machine. Tests that
   // need registration and dispatch use NotifyForRead and ServePull instead.
   std::shared_ptr<TransferSendSession> AddSyntheticSend(
       const std::string& req_id, uint64_t uuid, int in_flight) {
     absl::MutexLock lock(mu_);
+    std::optional<StagingAllocation> staging = staging_allocator_->Acquire(1);
+    CHECK(staging.has_value());
     auto entry = std::make_shared<TransferSendSession>(
         base_.get(), req_id, uuid, DeadlineFromNow(),
-        std::chrono::steady_clock::now(),
-        std::make_unique<Slot>(AcquireSlotLocked()), in_flight);
+        std::chrono::steady_clock::now(), *std::move(staging), in_flight);
     send_entries_[uuid] = entry;
     return entry;
   }
@@ -161,21 +155,18 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
       : KVCacheManagerWithTransfer(std::make_unique<RecvBase>(num_layers, this),
                                    /*node_id=*/0,
                                    /*local_control_port=*/-1, /*max_blocks=*/1,
-                                   /*num_slots=*/kSlots, timeout_s) {
-    CHECK_OK(
-        base_->ConfigureHostStagingSlots(kSlots, /*max_major_per_slot=*/1));
-    CHECK_OK(InitializeSlotPool(kSlots));
-  }
+                                   /*num_slots=*/kSlots, timeout_s) {}
 
   void AddRecv(const std::string& req_id, uint64_t uuid,
                int32_t blocks_per_layer = 1,
                std::optional<std::chrono::steady_clock::time_point> deadline =
                    std::nullopt) {
     absl::MutexLock lock(mu_);
+    std::optional<StagingAllocation> staging = staging_allocator_->Acquire(1);
+    CHECK(staging.has_value());
     active_recv_entries_[uuid] = std::make_shared<TransferReceiveSession>(
         base(), uuid, req_id, blocks_per_layer,
-        deadline.value_or(DeadlineFromNow()),
-        std::make_unique<Slot>(AcquireSlotLocked()));
+        deadline.value_or(DeadlineFromNow()), *std::move(staging));
   }
 
   absl::Status ReceiveLayer(size_t layer, uint64_t uuid) {
@@ -196,7 +187,7 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     return copies_.size();
   }
 
-  size_t free_slots() { return num_free_slots(); }
+  size_t free_slots() { return staging_allocator_->num_free_slots(); }
 
   bool has_recv(uint64_t uuid) {
     absl::MutexLock lock(mu_);

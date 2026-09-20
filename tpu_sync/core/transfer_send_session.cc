@@ -45,14 +45,13 @@ TransferSendSession::TransferSendSession(
     kv_cache::KVCacheManagerBase* base_in, std::string req_id_in,
     uint64_t uuid_in, std::chrono::steady_clock::time_point deadline_in,
     std::chrono::steady_clock::time_point register_start_in,
-    std::unique_ptr<KVCacheManagerWithTransfer::Slot> slot_in, int in_flight_in,
-    bool pull_started_in)
+    StagingAllocation staging_in, int in_flight_in, bool pull_started_in)
     : base_(base_in),
       req_id_(std::move(req_id_in)),
       uuid_(uuid_in),
       deadline_(deadline_in),
       register_start_(register_start_in),
-      slot_(std::move(slot_in)),
+      staging_(std::move(staging_in)),
       pull_started_(pull_started_in),
       in_flight_(in_flight_in) {}
 
@@ -131,17 +130,7 @@ void TransferSendSession::RegisterLayerReadinessCallback(
       [cb = std::move(cb)](auto status_or) { cb(status_or.status()); });
 }
 
-void TransferSendSession::ReleaseSlotLocked() {
-  if (slot_released_) return;
-  if (slot_ == nullptr && staged_host_blocks_.empty()) return;
-  if (!staged_host_blocks_.empty()) {
-    (void)base_->host_block_manager()->Unlock(staged_host_blocks_);
-    (void)base_->host_block_manager()->Deallocate(staged_host_blocks_);
-    staged_host_blocks_.clear();
-  }
-  slot_.reset();
-  slot_released_ = true;
-}
+void TransferSendSession::ReleaseSlotLocked() { staging_.Reset(); }
 
 void TransferSendSession::ReleaseSlot() {
   absl::MutexLock lock(mu_);
@@ -196,41 +185,33 @@ bool TransferSendSession::AcquireStagingWithRetry(
     // Staging that can never seat this request fails it now rather than
     // after the deadline: a fixed slot holds max_blocks_ pages, the
     // per-transfer pool holds total_blocks() pages.
-    const int64_t capacity = manager.dynamic_host_staging_
+    const bool dynamic_staging =
+        manager.staging_allocator_->dynamic_host_staging();
+    const int64_t capacity = dynamic_staging
                                  ? base_->host_block_manager()->total_blocks()
-                                 : manager.max_blocks_;
+                                 : manager.staging_allocator_->max_blocks();
     if (static_cast<int64_t>(src_block_ids.size()) > capacity) {
       LOG(ERROR) << "StartPush: request " << req_id_ << " needs "
                  << src_block_ids.size() << " blocks but "
-                 << (manager.dynamic_host_staging_
-                         ? "the host staging pool holds "
-                         : "a staging slot holds ")
+                 << (dynamic_staging ? "the host staging pool holds "
+                                     : "a staging slot holds ")
                  << capacity;
       FinishSend(/*has_failed=*/true);
       return false;
     }
-    if (!manager.dynamic_host_staging_) {
-      std::unique_ptr<KVCacheManagerWithTransfer::Slot> slot =
-          manager.TryAcquireSlot();
-      if (slot != nullptr) {
-        host_block_ids->clear();
-        host_block_ids->reserve(src_block_ids.size());
-        for (size_t i = 0; i < src_block_ids.size(); ++i) {
-          host_block_ids->push_back(slot->block_ids[i]);
-        }
-        absl::MutexLock session_lock(mu_);
-        slot_ = std::move(slot);
-        return true;
+    std::optional<StagingAllocation> acquired =
+        manager.staging_allocator_->Acquire(
+            static_cast<int64_t>(src_block_ids.size()));
+    if (acquired.has_value()) {
+      absl::Span<const int> blocks = acquired->block_ids();
+      host_block_ids->clear();
+      host_block_ids->reserve(src_block_ids.size());
+      for (size_t i = 0; i < src_block_ids.size(); ++i) {
+        host_block_ids->push_back(blocks[i]);
       }
-    } else {
-      auto allocated = base_->host_block_manager()->Allocate(
-          static_cast<int>(src_block_ids.size()), /*lock=*/true);
-      if (allocated.ok()) {
-        host_block_ids->assign(allocated->begin(), allocated->end());
-        absl::MutexLock session_lock(mu_);
-        staged_host_blocks_ = std::move(*allocated);
-        return true;
-      }
+      absl::MutexLock session_lock(mu_);
+      staging_ = *std::move(acquired);
+      return true;
     }
     // Staging exhausted: wait for in-flight sends to hand blocks back
     // instead of reporting a send that never happened. The consumer's own
@@ -247,7 +228,8 @@ bool TransferSendSession::AcquireStagingWithRetry(
                    << base_->host_block_manager()->num_free_blocks()
                    << ", total_host_blocks="
                    << base_->host_block_manager()->total_blocks()
-                   << ", free_slots=" << manager.num_free_slots()
+                   << ", free_slots="
+                   << manager.staging_allocator_->num_free_slots()
                    << "); reporting transfer failure";
         FinishSend(/*has_failed=*/true);
       }

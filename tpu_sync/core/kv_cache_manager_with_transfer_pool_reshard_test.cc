@@ -97,7 +97,11 @@ class TestManager : public KVCacheManagerWithTransfer {
   }
   // Stages plans in per-transfer host blocks, as
   // TPU_RAIDEN_DYNAMIC_HOST_STAGING=1 does for device-attached managers.
-  void EnableDemandStaging() { dynamic_host_staging_ = true; }
+  void EnableDemandStaging() {
+    staging_allocator_ = StagingBlockAllocator::Create(
+        base_.get(), staging_allocator_->num_slots(),
+        staging_allocator_->max_blocks(), /*dynamic_host_staging=*/true);
+  }
 };
 
 kv_cache::PoolSpec DensePool(std::string tag, int64_t block_stride = 128,

@@ -96,10 +96,7 @@ class TestManager : public KVCacheManagerWithTransfer {
     }
   }
 
-  size_t free_slots() {
-    absl::MutexLock lock(mu_);
-    return free_slots_.size();
-  }
+  size_t free_slots() { return staging_allocator_->num_free_slots(); }
 
   std::optional<std::string> recv_req_id(uint64_t uuid) {
     absl::MutexLock lock(mu_);

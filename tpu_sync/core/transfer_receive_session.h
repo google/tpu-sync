@@ -54,15 +54,15 @@ class TransferReceiveSession {
   explicit TransferReceiveSession(kv_cache::KVCacheManagerBase* base_in,
                                   uint64_t uuid_in = 0)
       : base_(base_in), uuid_(uuid_in) {}
-  TransferReceiveSession(
-      kv_cache::KVCacheManagerBase* base_in, uint64_t uuid_in,
-      std::string req_id_in, int32_t total_blocks_in,
-      std::chrono::steady_clock::time_point deadline_in,
-      std::unique_ptr<KVCacheManagerWithTransfer::Slot> slot_in = nullptr)
+  TransferReceiveSession(kv_cache::KVCacheManagerBase* base_in,
+                         uint64_t uuid_in, std::string req_id_in,
+                         int32_t total_blocks_in,
+                         std::chrono::steady_clock::time_point deadline_in,
+                         StagingAllocation staging_in = nullptr)
       : base_(base_in),
         uuid_(uuid_in),
         req_id_(std::move(req_id_in)),
-        slot_(std::move(slot_in)),
+        staging_(std::move(staging_in)),
         total_blocks_(total_blocks_in),
         deadline_(deadline_in),
         start_time_(std::chrono::steady_clock::now()) {}
@@ -73,7 +73,7 @@ class TransferReceiveSession {
       const ::tpu_sync::rpc::StartTransferRequest& request,
       const absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>&
           host_block_of,
-      std::vector<int> staged_blocks, uint64_t generation,
+      StagingAllocation staging_in, uint64_t generation,
       std::chrono::steady_clock::time_point deadline_in,
       const CopySpec& coalesced_h2d_copy);
 
@@ -84,11 +84,9 @@ class TransferReceiveSession {
       std::chrono::steady_clock::time_point deadline_in);
 
   // Initializes this receive session for a consumer StartRead load plan.
-  void InitFromLoadPlan(
-      const std::string& req_id_in, const CopyPlan& load_plan,
-      std::chrono::steady_clock::time_point deadline_in,
-      std::unique_ptr<KVCacheManagerWithTransfer::Slot> slot_in = nullptr,
-      std::vector<int> staged_blocks_in = {});
+  void InitFromLoadPlan(const std::string& req_id_in, const CopyPlan& load_plan,
+                        std::chrono::steady_clock::time_point deadline_in,
+                        StagingAllocation staging_in = nullptr);
 
   // Decides a receive's outcome; marks it done and releases its staging
   // resources once nothing issued for it is still running.
@@ -195,11 +193,7 @@ class TransferReceiveSession {
   kv_cache::KVCacheManagerBase* base_ = nullptr;
   uint64_t uuid_ = 0;
   std::string req_id_ ABSL_GUARDED_BY(mu_);
-  std::unique_ptr<KVCacheManagerWithTransfer::Slot> slot_ ABSL_GUARDED_BY(mu_);
-  // Host blocks held under demand staging, released on completion. Empty
-  // when the transfer holds a fixed slot instead.
-  std::vector<int> staged_host_blocks_ ABSL_GUARDED_BY(mu_);
-  bool staging_released_ ABSL_GUARDED_BY(mu_) = false;
+  StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
   CopySpec h2d_copy_ ABSL_GUARDED_BY(mu_);
   std::vector<int64_t> chip_block_ids_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_map<kv_cache::HostBlockId, kv_cache::DeviceBlockId>

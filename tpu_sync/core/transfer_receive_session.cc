@@ -79,12 +79,12 @@ void TransferReceiveSession::InitFromActivePlan(
     const ::tpu_sync::rpc::StartTransferRequest& request,
     const absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>&
         host_block_of,
-    std::vector<int> staged_blocks, uint64_t generation,
+    StagingAllocation staging_in, uint64_t generation,
     std::chrono::steady_clock::time_point deadline_in,
     const CopySpec& coalesced_h2d_copy) {
   absl::MutexLock lock(mu_);
-  staged_host_blocks_ = std::move(staged_blocks);
-  unregister_on_settle_ = !staged_host_blocks_.empty();
+  staging_ = std::move(staging_in);
+  unregister_on_settle_ = !staging_.empty();
   plan_generation_ = generation;
   req_id_ = request.req_id().empty()
                 ? absl::StrCat("resharded_transfer_", uuid_)
@@ -138,14 +138,12 @@ void TransferReceiveSession::InitFromPoolReshardPlan(
 void TransferReceiveSession::InitFromLoadPlan(
     const std::string& req_id_in, const CopyPlan& load_plan,
     std::chrono::steady_clock::time_point deadline_in,
-    std::unique_ptr<KVCacheManagerWithTransfer::Slot> slot_in,
-    std::vector<int> staged_blocks_in) {
+    StagingAllocation staging_in) {
   absl::MutexLock lock(mu_);
   req_id_ = req_id_in;
   deadline_ = deadline_in;
   start_time_ = std::chrono::steady_clock::now();
-  slot_ = std::move(slot_in);
-  staged_host_blocks_ = std::move(staged_blocks_in);
+  staging_ = std::move(staging_in);
   chip_block_ids_ = load_plan.h2d_local_block_ids;
   total_blocks_ = load_plan.num_blocks;
   num_completed_blocks_ = 0;
@@ -160,19 +158,9 @@ void TransferReceiveSession::InitFromLoadPlan(
 }
 
 void TransferReceiveSession::ReleaseStagingLocked() {
-  if (staging_released_) return;
-  staging_released_ = true;
-  slot_.reset();
-  if (base_ != nullptr) {
-    if (!staged_host_blocks_.empty() &&
-        base_->host_block_manager() != nullptr) {
-      (void)base_->host_block_manager()->Unlock(staged_host_blocks_);
-      (void)base_->host_block_manager()->Deallocate(staged_host_blocks_);
-      staged_host_blocks_.clear();
-    }
-    if (is_pool_reshard_) {
-      base_->ReleasePoolStagingLeases(uuid_);
-    }
+  staging_.Reset();
+  if (base_ != nullptr && is_pool_reshard_) {
+    base_->ReleasePoolStagingLeases(uuid_);
   }
 }
 

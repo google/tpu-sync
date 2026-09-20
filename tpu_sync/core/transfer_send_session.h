@@ -46,12 +46,12 @@ namespace tpu_raiden {
 // a leaf lock and is never held across callbacks or manager calls.
 class TransferSendSession {
  public:
-  TransferSendSession(
-      kv_cache::KVCacheManagerBase* base_in, std::string req_id_in,
-      uint64_t uuid_in, std::chrono::steady_clock::time_point deadline_in,
-      std::chrono::steady_clock::time_point register_start_in,
-      std::unique_ptr<KVCacheManagerWithTransfer::Slot> slot_in = nullptr,
-      int in_flight_in = 0, bool pull_started_in = false);
+  TransferSendSession(kv_cache::KVCacheManagerBase* base_in,
+                      std::string req_id_in, uint64_t uuid_in,
+                      std::chrono::steady_clock::time_point deadline_in,
+                      std::chrono::steady_clock::time_point register_start_in,
+                      StagingAllocation staging_in = nullptr,
+                      int in_flight_in = 0, bool pull_started_in = false);
   ~TransferSendSession() { ReleaseSlot(); }
 
   // Populates |registered_block_ids_| and |registered_block_set_| from
@@ -148,10 +148,7 @@ class TransferSendSession {
   const uint64_t uuid_ = 0;
   const std::chrono::steady_clock::time_point deadline_;
   const std::chrono::steady_clock::time_point register_start_;
-  std::unique_ptr<KVCacheManagerWithTransfer::Slot> slot_ ABSL_GUARDED_BY(mu_);
-  // Host blocks held under demand staging, released on completion. Empty
-  // when the transfer holds a fixed slot instead.
-  std::vector<int> staged_host_blocks_ ABSL_GUARDED_BY(mu_);
+  StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
   int64_t num_blocks_ ABSL_GUARDED_BY(mu_) = 0;
   int64_t registered_num_blocks_ ABSL_GUARDED_BY(mu_) = 0;
   int64_t total_bytes_ ABSL_GUARDED_BY(mu_) = 0;
@@ -160,7 +157,6 @@ class TransferSendSession {
   std::chrono::steady_clock::time_point d2h_done_ ABSL_GUARDED_BY(mu_);
   bool failed_ ABSL_GUARDED_BY(mu_) = false;
   bool pull_started_ ABSL_GUARDED_BY(mu_) = false;
-  bool slot_released_ ABSL_GUARDED_BY(mu_) = false;
   // Copies and pushes issued for this send whose completion has not been
   // observed. The staging they read and write is held until it is zero.
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;

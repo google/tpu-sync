@@ -145,6 +145,92 @@ struct CommitResult {
   int64_t total_bytes;
 };
 
+// Encapsulates host staging block allocation and release (both fixed slots
+// and on-demand dynamic host blocks) behind an RAII |Allocation| handle that
+// can be transferred into session classes.
+class StagingBlockAllocator {
+ public:
+  // RAII handle owning either a fixed staging slot or a set of dynamically
+  // allocated locked host blocks. Releases the resource automatically upon
+  // destruction or Reset().
+  class Allocation {
+   public:
+    Allocation() = default;
+    Allocation(std::nullptr_t) {}  // NOLINT(runtime/explicit)
+    Allocation(StagingBlockAllocator* allocator, int64_t slot_idx,
+               std::vector<int> block_ids);
+    Allocation(StagingBlockAllocator* allocator,
+               std::vector<int> dynamic_blocks);
+    Allocation(Allocation&& other) noexcept;
+    Allocation& operator=(Allocation&& other) noexcept;
+    Allocation(const Allocation&) = delete;
+    Allocation& operator=(const Allocation&) = delete;
+    ~Allocation();
+
+    // Releases any held slot or dynamic host blocks back to the allocator.
+    // Safe to call multiple times.
+    void Reset();
+
+    bool empty() const { return slot_idx_ < 0 && block_ids_.empty(); }
+    explicit operator bool() const { return !empty(); }
+    bool is_dynamic() const { return slot_idx_ < 0 && !block_ids_.empty(); }
+    int64_t slot_idx() const { return slot_idx_; }
+    absl::Span<const int> block_ids() const { return block_ids_; }
+
+   private:
+    StagingBlockAllocator* allocator_ = nullptr;
+    int64_t slot_idx_ = -1;
+    std::vector<int> block_ids_;
+  };
+
+  static std::unique_ptr<StagingBlockAllocator> Create(
+      kv_cache::KVCacheManagerBase* base, int64_t num_slots, int64_t max_blocks,
+      std::optional<bool> dynamic_host_staging = std::nullopt);
+  ~StagingBlockAllocator();
+  StagingBlockAllocator(const StagingBlockAllocator&) = delete;
+  StagingBlockAllocator& operator=(const StagingBlockAllocator&) = delete;
+
+  // Configures host staging slots in |base_| and pre-allocates |num_slots_|
+  // fixed slots of |max_blocks_| locked host blocks when
+  // !|dynamic_host_staging_|.
+  absl::Status Initialize();
+
+  // Unlocks all pre-allocated slot blocks in |base_->host_block_manager()|.
+  void Shutdown();
+
+  // Acquires staging for |num_blocks| blocks: a fixed slot when
+  // !dynamic_host_staging_, or |num_blocks| locked dynamic host blocks when
+  // dynamic_host_staging_ is enabled. Returns std::nullopt if staging
+  // capacity is currently unavailable.
+  std::optional<Allocation> Acquire(int64_t num_blocks);
+
+  // Allocates |num_blocks| locked dynamic host blocks directly from
+  // |base_->host_block_manager()|.
+  absl::StatusOr<Allocation> AcquireDynamicBlocks(int64_t num_blocks);
+
+  size_t num_free_slots() const;
+  absl::Span<const int> slot_blocks(int64_t slot_idx) const;
+  int64_t num_slots() const { return num_slots_; }
+  int64_t max_blocks() const { return max_blocks_; }
+  bool dynamic_host_staging() const { return dynamic_host_staging_; }
+
+ private:
+  StagingBlockAllocator(kv_cache::KVCacheManagerBase* base, int64_t num_slots,
+                        int64_t max_blocks, bool dynamic_host_staging);
+  absl::Status InitializeSlotPool(int64_t num_slots);
+  void ReleaseSlot(int64_t slot_idx);
+  void ReleaseDynamicBlocks(absl::Span<const int> blocks);
+
+  mutable absl::Mutex mu_;
+  kv_cache::KVCacheManagerBase* base_ = nullptr;
+  int64_t num_slots_ = 0;
+  int64_t max_blocks_ = 0;
+  bool dynamic_host_staging_ = false;
+  std::deque<int64_t> free_slots_ ABSL_GUARDED_BY(mu_);
+  std::vector<std::vector<int>> slot_blocks_;
+};
+using StagingAllocation = StagingBlockAllocator::Allocation;
+
 class KVCacheManagerWithTransfer {
  public:
   using SendEntry = TransferSendSession;
@@ -153,49 +239,6 @@ class KVCacheManagerWithTransfer {
   friend class TransferSendSession;
   friend class TransferReceiveSession;
   friend class ReshardSendSession;
-
-  struct Slot {
-    int64_t slot_idx = -1;
-    std::vector<int> block_ids;
-    KVCacheManagerWithTransfer* manager = nullptr;
-
-    Slot() = default;
-    Slot(int64_t slot_idx_in, std::vector<int> block_ids_in,
-         KVCacheManagerWithTransfer* manager_in = nullptr)
-        : slot_idx(slot_idx_in),
-          block_ids(std::move(block_ids_in)),
-          manager(manager_in) {}
-    ~Slot();
-    Slot(Slot&& other) noexcept
-        : slot_idx(other.slot_idx),
-          block_ids(std::move(other.block_ids)),
-          manager(other.manager) {
-      other.slot_idx = -1;
-      other.manager = nullptr;
-    }
-    Slot& operator=(Slot&& other) noexcept {
-      if (this != &other) {
-        Reset();
-        slot_idx = other.slot_idx;
-        block_ids = std::move(other.block_ids);
-        manager = other.manager;
-        other.slot_idx = -1;
-        other.manager = nullptr;
-      }
-      return *this;
-    }
-    Slot(const Slot&) = delete;
-    Slot& operator=(const Slot&) = delete;
-
-    int64_t Release() {
-      int64_t idx = slot_idx;
-      slot_idx = -1;
-      manager = nullptr;
-      return idx;
-    }
-
-    void Reset();
-  };
 
   KVCacheManagerWithTransfer(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -327,7 +370,8 @@ class KVCacheManagerWithTransfer {
       std::unique_ptr<kv_cache::KVCacheManagerBase> base, int64_t node_id = 0,
       int64_t local_control_port = -1, int64_t max_blocks = 0,
       int64_t num_slots = 0, double timeout_s = 120.0,
-      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr,
+      bool unsafe_skip_buffer_lock = false);
 
   std::unique_ptr<kv_cache::KVCacheManagerBase> base_;
 
@@ -359,13 +403,6 @@ class KVCacheManagerWithTransfer {
 
   std::vector<int> ContiguousBlockIds(uint64_t base, uint64_t count) const;
 
-  static bool DynamicHostStagingEnabled();
-  absl::Status InitializeSlotPool(int64_t num_slots);
-  Slot AcquireSlot();
-  Slot AcquireSlotLocked();
-  std::unique_ptr<Slot> TryAcquireSlot();
-  size_t num_free_slots() const;
-  void ReleaseSlotLocked(int64_t slot_idx);
   // Serializes plan registration and unregistration, so a plan is never
   // published without its staging owner or torn down against a half-built
   // registration.
@@ -376,14 +413,8 @@ class KVCacheManagerWithTransfer {
   uint64_t plan_generation_counter_ ABSL_GUARDED_BY(plan_lifecycle_mu_) = 0;
   // Host staging held by a plan: a sender's, or a receiver's whose
   // destination is host memory. Released when the plan is unregistered.
-  absl::flat_hash_map<uint64_t, std::vector<int>> plan_staging_
+  absl::flat_hash_map<uint64_t, StagingAllocation> plan_staging_
       ABSL_GUARDED_BY(mu_);
-  // Host staging for one incoming read: exactly `num_blocks` blocks under
-  // demand staging, a whole fixed slot otherwise. Returns nullopt when the
-  // staging pool cannot seat the request.
-  std::optional<std::vector<int64_t>> AcquireRecvStagingLocked(
-      int64_t num_blocks, std::unique_ptr<Slot>* slot_out,
-      std::vector<int>* staged_blocks_out);
   absl::Status EmplaceRecvEntryLocked(uint64_t uuid,
                                       const std::shared_ptr<RecvEntry>& entry)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -423,12 +454,6 @@ class KVCacheManagerWithTransfer {
   int64_t node_id_ = 0;
   int local_control_port_ = 0;
   int local_data_port_ = 0;
-  int64_t max_blocks_ = 0;
-  int64_t num_slots_ = 0;
-  // Allocate host staging per request instead of carving the pool into
-  // fixed slots. A short request then costs its own pages rather than a
-  // whole slot, so the same pool seats more transfers at once.
-  bool dynamic_host_staging_ = false;
 
   // Pull-serve workers launched by ProcessPullStream. The destructor waits
   // for them, and shutting_down_ ends a worker's staging wait early.
@@ -438,9 +463,7 @@ class KVCacheManagerWithTransfer {
   double timeout_s_ = 120.0;
   bool unsafe_skip_buffer_lock_ = true;
 
-  mutable absl::Mutex slot_mu_;
-  std::deque<Slot> free_slots_;
-  std::vector<Slot> all_slots_;
+  std::unique_ptr<StagingBlockAllocator> staging_allocator_;
   // SendEntry is shared across threads: created/timed-out/cleaned-up on the
   // main thread, but accessed asynchronously in control worker threads
   // handling pull connections.

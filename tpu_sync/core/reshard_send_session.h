@@ -44,7 +44,8 @@ class StagingBlockAllocator;
 // state is protected by internal |mu_|.
 class ReshardSendSession {
  public:
-  // Validates the sender schedule in |plan| and creates a producer pool-reshard
+  // Validates the sender schedule in |plan|, initializes the transport server,
+  // registers the active plan on |base|, and creates a producer pool-reshard
   // send session.
   static absl::StatusOr<std::shared_ptr<ReshardSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,

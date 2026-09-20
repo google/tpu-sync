@@ -477,15 +477,6 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
     return absl::StrCat("uuid=", plan.uuid(),
                         " src_blocks=", src_block_ids.size());
   });
-  ABSL_ASSIGN_OR_RETURN(
-      std::shared_ptr<ReshardSendSession> state,
-      ReshardSendSession::Create(base_.get(), staging_allocator_.get(),
-                                 src_block_ids, parallelism, DeadlineFromNow(),
-                                 plan));
-
-  base_->InitTransportServer();
-  ABSL_RETURN_IF_ERROR(
-      base_->RegisterActivePlanDirect(plan.uuid(), plan, /*is_sender=*/true));
   {
     absl::MutexLock lock(mu_);
     auto existing = active_pool_reshard_sends_.find(plan.uuid());
@@ -495,11 +486,19 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
             .insert(existing->second->req_id());
         active_pool_reshard_sends_.erase(existing);
       } else {
-        (void)base_->UnregisterActivePlanDirect(plan.uuid());
         return absl::AlreadyExistsError(absl::StrCat(
             "pool reshard send UUID already active: ", plan.uuid()));
       }
     }
+  }
+
+  ABSL_ASSIGN_OR_RETURN(
+      std::shared_ptr<ReshardSendSession> state,
+      ReshardSendSession::Create(base_.get(), staging_allocator_.get(),
+                                 src_block_ids, parallelism, DeadlineFromNow(),
+                                 plan));
+  {
+    absl::MutexLock lock(mu_);
     active_pool_reshard_sends_[plan.uuid()] = state;
   }
 

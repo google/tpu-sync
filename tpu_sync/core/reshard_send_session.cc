@@ -29,11 +29,11 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/errors.h"
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/pool_reshard_send_slots.h"
@@ -50,8 +50,9 @@ absl::Status ReshardSendSession::ValidatePlan(
     const kv_cache::KVCacheManagerBase& base,
     const ::tpu_sync::rpc::StartTransferRequest& plan,
     absl::Span<const int64_t> src_block_ids) {
-  TF_RETURN_IF_ERROR(ValidateCommonPoolReshardPlan(&base, plan, src_block_ids));
-  TF_RETURN_IF_ERROR(ValidatePoolBlockBounds(&base, plan, src_block_ids));
+  ABSL_RETURN_IF_ERROR(
+      ValidateCommonPoolReshardPlan(&base, plan, src_block_ids));
+  ABSL_RETURN_IF_ERROR(ValidatePoolBlockBounds(&base, plan, src_block_ids));
 
   absl::flat_hash_set<int64_t> local_ids(src_block_ids.begin(),
                                          src_block_ids.end());
@@ -91,7 +92,7 @@ absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
     absl::Span<const int64_t> src_block_ids, int parallelism,
     std::chrono::steady_clock::time_point deadline,
     ::tpu_sync::rpc::StartTransferRequest plan) {
-  TF_RETURN_IF_ERROR(ValidatePlan(*base, plan, src_block_ids));
+  ABSL_RETURN_IF_ERROR(ValidatePlan(*base, plan, src_block_ids));
   // Device-only executor: without device attachments there are no bytes this
   // path could legitimately move; host-only managers fail closed with no
   // host-mode branch to mask device bugs.
@@ -127,6 +128,10 @@ absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
   if (remaining_pool_peer_pushes <= 0) {
     return absl::InvalidArgumentError("sender plan schedules no pushes");
   }
+
+  base->InitTransportServer();
+  ABSL_RETURN_IF_ERROR(
+      base->RegisterActivePlanDirect(plan.uuid(), plan, /*is_sender=*/true));
 
   std::string req_id = plan.req_id();
   const uint64_t uuid = plan.uuid();

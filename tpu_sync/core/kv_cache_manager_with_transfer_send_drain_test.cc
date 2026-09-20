@@ -36,10 +36,13 @@
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "xla/future.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/transfer_receive_session.h"
+#include "tpu_sync/core/transfer_send_session.h"
 
 namespace tpu_raiden {
 namespace {
@@ -68,7 +71,7 @@ class TestManager : public KVCacheManagerWithTransfer {
   // consumer is acknowledged: the push runs on this thread and returns
   // with its copies issued.
   void ServePull(uint64_t uuid) {
-    std::shared_ptr<SendEntry> entry;
+    std::shared_ptr<TransferSendSession> entry;
     {
       absl::MutexLock lock(mu_);
       entry = send_entries_.at(uuid);
@@ -95,10 +98,10 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   // White-box construction for the send retirement state machine. Tests that
   // need registration and dispatch use NotifyForRead and ServePull instead.
-  std::shared_ptr<SendEntry> AddSyntheticSend(const std::string& req_id,
-                                              uint64_t uuid, int in_flight) {
+  std::shared_ptr<TransferSendSession> AddSyntheticSend(
+      const std::string& req_id, uint64_t uuid, int in_flight) {
     absl::MutexLock lock(mu_);
-    auto entry = std::make_shared<SendEntry>(
+    auto entry = std::make_shared<TransferSendSession>(
         base_.get(), req_id, uuid, DeadlineFromNow(),
         std::chrono::steady_clock::now(),
         std::make_unique<Slot>(AcquireSlotLocked()), in_flight);
@@ -106,15 +109,18 @@ class TestManager : public KVCacheManagerWithTransfer {
     return entry;
   }
 
-  void Decide(const std::shared_ptr<SendEntry>& entry, bool failed) {
+  void Decide(const std::shared_ptr<TransferSendSession>& entry, bool failed) {
     entry->FinishSend(failed);
   }
 
-  void End(const std::shared_ptr<SendEntry>& entry) { entry->EndSendOp(); }
+  void End(const std::shared_ptr<TransferSendSession>& entry) {
+    entry->EndSendOp();
+  }
 
   bool has_send(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    return send_entries_.contains(uuid);
+    auto it = send_entries_.find(uuid);
+    return it != send_entries_.end() && !it->second->done();
   }
 
  private:
@@ -162,15 +168,14 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   }
 
   void AddRecv(const std::string& req_id, uint64_t uuid,
-               int32_t blocks_per_layer = 1) {
+               int32_t blocks_per_layer = 1,
+               std::optional<std::chrono::steady_clock::time_point> deadline =
+                   std::nullopt) {
     absl::MutexLock lock(mu_);
-    RecvEntry entry;
-    entry.req_id = req_id;
-    entry.slot_idx = AcquireSlotLocked().Release();
-    entry.total_blocks = blocks_per_layer;
-    entry.deadline = DeadlineFromNow();
-    entry.start_time = std::chrono::steady_clock::now();
-    active_recv_entries_.try_emplace(uuid, std::move(entry));
+    active_recv_entries_[uuid] = std::make_shared<TransferReceiveSession>(
+        base(), uuid, req_id, blocks_per_layer,
+        deadline.value_or(DeadlineFromNow()),
+        std::make_unique<Slot>(AcquireSlotLocked()));
   }
 
   absl::Status ReceiveLayer(size_t layer, uint64_t uuid) {
@@ -191,20 +196,12 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     return copies_.size();
   }
 
-  size_t free_slots() {
-    absl::MutexLock lock(mu_);
-    return free_slots_.size();
-  }
+  size_t free_slots() { return num_free_slots(); }
 
   bool has_recv(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    return active_recv_entries_.contains(uuid);
-  }
-
-  void ExpireRecv(uint64_t uuid) {
-    absl::MutexLock lock(mu_);
-    active_recv_entries_.at(uuid).deadline =
-        std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+    auto it = active_recv_entries_.find(uuid);
+    return it != active_recv_entries_.end() && !it->second->done();
   }
 
   void BlockH2dDispatch() { block_dispatch_.store(true); }
@@ -535,8 +532,9 @@ TEST(RecvLifecycleTest, SingleFailedH2dReportsFailureAndReturnsStaging) {
 
 TEST(RecvLifecycleTest, ReceiveWithoutTrafficFailsAtItsDeadline) {
   RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/kTimeoutS);
-  consumer.AddRecv("req", /*uuid=*/24);
-  consumer.ExpireRecv(/*uuid=*/24);
+  consumer.AddRecv(
+      "req", /*uuid=*/24, /*blocks_per_layer=*/1,
+      std::chrono::steady_clock::now() - std::chrono::milliseconds(1));
 
   Reports reports = consumer.CompleteReadRaw();
   EXPECT_THAT(DoneReceiving(reports), IsEmpty());
@@ -547,11 +545,13 @@ TEST(RecvLifecycleTest, ReceiveWithoutTrafficFailsAtItsDeadline) {
 
 TEST(RecvDrainTest, ExpiredReceiveKeepsStagingUntilH2dEnds) {
   RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/kTimeoutS);
-  consumer.AddRecv("req", /*uuid=*/25);
+  consumer.AddRecv(
+      "req", /*uuid=*/25, /*blocks_per_layer=*/1,
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(10));
   ASSERT_TRUE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/25).ok());
   ASSERT_EQ(consumer.copies_issued(), 1);
 
-  consumer.ExpireRecv(/*uuid=*/25);
+  absl::SleepFor(absl::Milliseconds(15));
   Reports during = consumer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(during), IsEmpty());
   EXPECT_THAT(DoneReceiving(during), IsEmpty());
@@ -574,11 +574,13 @@ TEST(RecvDrainTest, ExpiredReceiveKeepsStagingUntilH2dEnds) {
 
 TEST(RecvDrainTest, DuplicateUuidIsRejectedUntilExpiredReceiveDrains) {
   RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/kTimeoutS);
-  consumer.AddRecv("old", /*uuid=*/28);
+  consumer.AddRecv(
+      "old", /*uuid=*/28, /*blocks_per_layer=*/1,
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(10));
   ASSERT_TRUE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/28).ok());
   ASSERT_EQ(consumer.copies_issued(), 1);
 
-  consumer.ExpireRecv(/*uuid=*/28);
+  absl::SleepFor(absl::Milliseconds(15));
   Reports during = consumer.CompleteReadRaw();
   ASSERT_THAT(DoneSending(during), IsEmpty());
   ASSERT_THAT(DoneReceiving(during), IsEmpty());
@@ -605,9 +607,10 @@ TEST(RecvDrainTest, DuplicateUuidIsRejectedUntilExpiredReceiveDrains) {
 
   EXPECT_TRUE(consumer
                   .RegisterRecv(/*uuid=*/28, "retry",
-                                /*expected_block_count=*/1)
+                                /*expected_block_count=*/1,
+                                std::chrono::steady_clock::now() -
+                                    std::chrono::milliseconds(1))
                   .ok());
-  consumer.ExpireRecv(/*uuid=*/28);
   Reports retry = consumer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(retry), IsEmpty());
   EXPECT_THAT(DoneReceiving(retry), IsEmpty());
@@ -650,7 +653,9 @@ TEST(RecvDrainTest, FailedLayerWaitsForOtherH2dCopies) {
 
 TEST(RecvDrainTest, TimeoutDuringH2dDispatchKeepsStaging) {
   RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/kTimeoutS);
-  consumer.AddRecv("req", /*uuid=*/27);
+  consumer.AddRecv(
+      "req", /*uuid=*/27, /*blocks_per_layer=*/1,
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(10));
   consumer.BlockH2dDispatch();
   auto receive = std::async(std::launch::async, [&consumer] {
     return consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/27);
@@ -658,7 +663,7 @@ TEST(RecvDrainTest, TimeoutDuringH2dDispatchKeepsStaging) {
   DispatchReleaseGuard release_dispatch(&consumer);
   ASSERT_TRUE(consumer.WaitForH2dDispatch(absl::Seconds(5)));
 
-  consumer.ExpireRecv(/*uuid=*/27);
+  absl::SleepFor(absl::Milliseconds(15));
   Reports during = consumer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(during), IsEmpty());
   EXPECT_THAT(DoneReceiving(during), IsEmpty());

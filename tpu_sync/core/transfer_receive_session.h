@@ -1,0 +1,252 @@
+// Copyright 2026 Google LLC.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_CORE_TRANSFER_RECEIVE_SESSION_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_CORE_TRANSFER_RECEIVE_SESSION_H_
+
+#include <chrono>  // NOLINT(build/c++11)
+#include <cstddef>
+#include <cstdint>
+#include <future>  // NOLINT(build/c++11)
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
+#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+
+namespace tpu_sync {
+namespace rpc {
+class StartTransferRequest;
+}  // namespace rpc
+}  // namespace tpu_sync
+
+namespace tpu_raiden {
+
+// Encapsulates the per-transfer state and execution lifecycle of a consumer
+// receive operation (both legacy pull/push H2D receives and multi-tag
+// pool-reshard receives), including host staging ownership, reference-counted
+// drain and sticky-failure tracking, block/layer/pool readiness accounting,
+// and order-ranked H2D copy execution.
+//
+// Thread-safe: all mutable session state is synchronized via internal |mu_|.
+class TransferReceiveSession {
+ public:
+  explicit TransferReceiveSession(kv_cache::KVCacheManagerBase* base_in,
+                                  uint64_t uuid_in = 0)
+      : base_(base_in), uuid_(uuid_in) {}
+  TransferReceiveSession(
+      kv_cache::KVCacheManagerBase* base_in, uint64_t uuid_in,
+      std::string req_id_in, int32_t total_blocks_in,
+      std::chrono::steady_clock::time_point deadline_in,
+      std::unique_ptr<KVCacheManagerWithTransfer::Slot> slot_in = nullptr)
+      : base_(base_in),
+        uuid_(uuid_in),
+        req_id_(std::move(req_id_in)),
+        slot_(std::move(slot_in)),
+        total_blocks_(total_blocks_in),
+        deadline_(deadline_in),
+        start_time_(std::chrono::steady_clock::now()) {}
+  ~TransferReceiveSession() { ReleaseStaging(); }
+
+  // Initializes this receive session for an HBM destination active plan.
+  void InitFromActivePlan(
+      const ::tpu_sync::rpc::StartTransferRequest& request,
+      const absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>&
+          host_block_of,
+      std::vector<int> staged_blocks, uint64_t generation,
+      std::chrono::steady_clock::time_point deadline_in,
+      const CopySpec& coalesced_h2d_copy);
+
+  // Initializes this receive session for a multi-tag pool-reshard plan.
+  void InitFromPoolReshardPlan(
+      const ::tpu_sync::rpc::StartTransferRequest& plan,
+      absl::Span<const int64_t> chip_blocks,
+      std::chrono::steady_clock::time_point deadline_in);
+
+  // Initializes this receive session for a consumer StartRead load plan.
+  void InitFromLoadPlan(
+      const std::string& req_id_in, const CopyPlan& load_plan,
+      std::chrono::steady_clock::time_point deadline_in,
+      std::unique_ptr<KVCacheManagerWithTransfer::Slot> slot_in = nullptr,
+      std::vector<int> staged_blocks_in = {});
+
+  // Decides a receive's outcome; marks it done and releases its staging
+  // resources once nothing issued for it is still running.
+  void FinishRecv(bool has_failed, bool unregister_on_settle = false);
+
+  // Releases any held staging slot, dynamic host blocks, or pool staging
+  // leases. Safe to call multiple times.
+  void ReleaseStaging();
+
+  // Marks the plan to be unregistered when the receive settles, returning true
+  // if the receive is still active and will unregister on settle, or false if
+  // it is a pool-reshard receive or already done.
+  bool DeferUnregisterOnSettle();
+
+  // Atomically claims any pending settle-unregister request and writes its
+  // plan generation to |generation|.
+  bool TakePendingUnregister(uint64_t* generation);
+
+  // Returns true if network/layer transfer is complete and all H2D futures are
+  // ready.
+  bool IsReadyToComplete() const;
+
+  // Returns true if this session still has pending network or H2D work.
+  bool HasPendingWork() const;
+
+  // Schedules the consumer pull handshake on |base_->push_pool()| and updates
+  // session state upon completion or error.
+  void ExecutePullRequest(KVCacheManagerWithTransfer& manager,
+                          const std::string& remote_endpoint,
+                          CopyPlan load_plan);
+
+  // Handles block completion notifications for this receive session.
+  absl::Status OnBlocksReceived(KVCacheManagerWithTransfer& manager,
+                                const std::vector<int>& block_ids);
+
+  // Issues H2D copy for |layer_idx| using |base_| and registers the completion
+  // callback.
+  absl::Status ExecuteLayerH2d(KVCacheManagerWithTransfer& manager,
+                               size_t layer_idx);
+
+  // Handles pool completion notifications for a pool-reshard receive session.
+  absl::Status OnPoolReceived(KVCacheManagerWithTransfer& manager,
+                              size_t pool_idx);
+
+  std::string req_id() const {
+    absl::MutexLock lock(mu_);
+    return req_id_;
+  }
+  int32_t total_blocks() const {
+    absl::MutexLock lock(mu_);
+    return total_blocks_;
+  }
+  bool draining() const {
+    absl::MutexLock lock(mu_);
+    return draining_;
+  }
+  bool failed() const {
+    absl::MutexLock lock(mu_);
+    return failed_;
+  }
+  bool done() const {
+    absl::MutexLock lock(mu_);
+    return done_;
+  }
+  std::chrono::steady_clock::time_point deadline() const {
+    absl::MutexLock lock(mu_);
+    return deadline_;
+  }
+
+ private:
+  friend struct PoolReshardRecvTestPeer;
+
+  using H2dIssueFuture =
+      std::shared_future<absl::StatusOr<raiden::PjRtCopyFuture>>;
+
+  void ReleaseStagingLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void FinishRecvLocked(bool has_failed, bool unregister_on_settle = false)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void EndRecvOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // Decrements the count of in-flight operations; marks the receive done and
+  // releases its staging resources if it was draining and waiting for this op.
+  void EndRecvOp();
+
+  // Handles completion of |pool_idx|'s H2D upload and finalizes the
+  // pool-reshard receive when all pools have completed or on error.
+  void FinishPoolH2d(KVCacheManagerWithTransfer& manager, size_t pool_idx,
+                     const absl::Status& status);
+
+  bool AllH2dDoneLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  bool RecordBlocksReceivedLocked(const std::vector<int>& block_ids,
+                                  bool* first_packet,
+                                  bool* network_just_completed)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  absl::Status RecordPoolReceivedLocked(size_t pool_idx)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  std::vector<std::pair<size_t, std::vector<int64_t>>>
+  CollectEligiblePoolH2dsLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  bool RecordPoolH2dResultLocked(size_t pool_idx, const absl::Status& status)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void ExecuteEligiblePoolH2ds(KVCacheManagerWithTransfer& manager);
+
+  mutable absl::Mutex mu_;
+  kv_cache::KVCacheManagerBase* base_ = nullptr;
+  uint64_t uuid_ = 0;
+  std::string req_id_ ABSL_GUARDED_BY(mu_);
+  std::unique_ptr<KVCacheManagerWithTransfer::Slot> slot_ ABSL_GUARDED_BY(mu_);
+  // Host blocks held under demand staging, released on completion. Empty
+  // when the transfer holds a fixed slot instead.
+  std::vector<int> staged_host_blocks_ ABSL_GUARDED_BY(mu_);
+  bool staging_released_ ABSL_GUARDED_BY(mu_) = false;
+  CopySpec h2d_copy_ ABSL_GUARDED_BY(mu_);
+  std::vector<int64_t> chip_block_ids_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<kv_cache::HostBlockId, kv_cache::DeviceBlockId>
+      host_to_chip_ ABSL_GUARDED_BY(mu_);
+  std::vector<H2dIssueFuture> h2d_dispatch_futures_ ABSL_GUARDED_BY(mu_);
+  int32_t total_blocks_ ABSL_GUARDED_BY(mu_) = 0;
+  int32_t num_completed_blocks_ ABSL_GUARDED_BY(mu_) = 0;
+  int32_t num_completed_layers_ ABSL_GUARDED_BY(mu_) = 0;
+  bool network_completed_ ABSL_GUARDED_BY(mu_) = false;
+  bool h2d_started_ ABSL_GUARDED_BY(mu_) = false;
+  int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
+  bool draining_ ABSL_GUARDED_BY(mu_) = false;
+  bool failed_ ABSL_GUARDED_BY(mu_) = false;
+  bool done_ ABSL_GUARDED_BY(mu_) = false;
+  bool reshard_finalizing_ ABSL_GUARDED_BY(mu_) = false;
+  std::vector<int> accumulated_host_block_ids_ ABSL_GUARDED_BY(mu_);
+  std::chrono::steady_clock::time_point deadline_ ABSL_GUARDED_BY(mu_);
+  std::chrono::steady_clock::time_point start_time_ ABSL_GUARDED_BY(mu_);
+  std::vector<raiden::PjRtCopyFuture> h2d_futures_ ABSL_GUARDED_BY(mu_);
+  bool is_pool_reshard_ ABSL_GUARDED_BY(mu_) = false;
+  // The plan is dropped when this receive settles: set for every
+  // demand-staged receiver plan (whose mapping would otherwise outlive its
+  // freed blocks) and when an unregister arrives while the receive is in
+  // flight (the plan stays mapped until then so late pushes resolve
+  // through its blocks).
+  bool unregister_on_settle_ ABSL_GUARDED_BY(mu_) = false;
+  // Generation of the plan this receive belongs to; settlement cleanup
+  // only touches that registration.
+  uint64_t plan_generation_ ABSL_GUARDED_BY(mu_) = 0;
+  absl::flat_hash_set<size_t> expected_pool_indices_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_set<size_t> started_pool_indices_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_set<size_t> completed_pool_indices_ ABSL_GUARDED_BY(mu_);
+  // Multi-tag plans: per-pool H2D upload ordering. A pool's mirror is
+  // uploaded only after every expected pool of a strictly lower order
+  // rank has completed its upload (FA at rank 0, state classes at rank
+  // 1, so state bytes land last on aliased arena pages). Single-tag
+  // plans leave every rank 0 (upload immediately on wire completion).
+  absl::flat_hash_map<size_t, int> pool_order_ranks_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_set<size_t> h2d_launched_pools_ ABSL_GUARDED_BY(mu_);
+  // Multi-tag plans: each pool uploads only its own group's destination
+  // block ids (the flat chip_block_ids list concatenates all groups).
+  absl::flat_hash_map<size_t, std::vector<int64_t>> pool_dst_block_ids_
+      ABSL_GUARDED_BY(mu_);
+};
+
+using ReceiveSession = TransferReceiveSession;
+
+}  // namespace tpu_raiden
+
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_CORE_TRANSFER_RECEIVE_SESSION_H_

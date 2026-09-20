@@ -22,25 +22,36 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
-#include <tuple>
 #include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/core/transfer_receive_session.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/mock_metrics_backend.h"
 
 namespace tpu_raiden {
+
+struct PoolReshardRecvTestPeer {
+  static void FinishPoolH2d(ReceiveSession& session,
+                            KVCacheManagerWithTransfer& manager,
+                            size_t pool_idx, const absl::Status& status) {
+    session.FinishPoolH2d(manager, pool_idx, status);
+  }
+};
+
 namespace {
 
 using ::testing::_;
@@ -64,7 +75,17 @@ class TestManager : public KVCacheManagerWithTransfer {
             /*local_control_port=*/-1, /*max_blocks=*/0, /*num_slots=*/0,
             timeout_s) {}
 
-  using KVCacheManagerWithTransfer::FinishPoolReshardRecvPool;
+  void FinishPoolReshardRecvPool(uint64_t uuid, size_t pool_idx,
+                                 const absl::Status& status) {
+    std::shared_ptr<ReceiveSession> session;
+    {
+      absl::MutexLock lock(mu_);
+      auto it = active_recv_entries_.find(uuid);
+      if (it == active_recv_entries_.end()) return;
+      session = it->second;
+    }
+    PoolReshardRecvTestPeer::FinishPoolH2d(*session, *this, pool_idx, status);
+  }
   using KVCacheManagerWithTransfer::PoolReshardRegisterRecv;
   using KVCacheManagerWithTransfer::ValidatePoolReshardPlan;
 

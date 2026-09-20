@@ -131,55 +131,49 @@ void TransferSendSession::RegisterLayerReadinessCallback(
       [cb = std::move(cb)](auto status_or) { cb(status_or.status()); });
 }
 
-void TransferSendSession::ReleaseSlot() {
-  std::unique_ptr<KVCacheManagerWithTransfer::Slot> slot;
-  std::vector<int> staged_blocks;
-  {
-    absl::MutexLock lock(mu_);
-    if (slot_released_) return;
-    if (slot_ == nullptr && staged_host_blocks_.empty()) return;
-    slot = std::move(slot_);
-    staged_blocks = std::move(staged_host_blocks_);
+void TransferSendSession::ReleaseSlotLocked() {
+  if (slot_released_) return;
+  if (slot_ == nullptr && staged_host_blocks_.empty()) return;
+  if (!staged_host_blocks_.empty()) {
+    (void)base_->host_block_manager()->Unlock(staged_host_blocks_);
+    (void)base_->host_block_manager()->Deallocate(staged_host_blocks_);
     staged_host_blocks_.clear();
-    slot_released_ = true;
   }
-  if (!staged_blocks.empty()) {
-    (void)base_->host_block_manager()->Unlock(staged_blocks);
-    (void)base_->host_block_manager()->Deallocate(staged_blocks);
+  slot_.reset();
+  slot_released_ = true;
+}
+
+void TransferSendSession::ReleaseSlot() {
+  absl::MutexLock lock(mu_);
+  ReleaseSlotLocked();
+}
+
+void TransferSendSession::FinishSendLocked(bool has_failed) {
+  if (has_failed) failed_ = true;
+  if (draining_) return;
+  draining_ = true;
+  if (in_flight_ == 0 && !done_) {
+    ReleaseSlotLocked();
+    done_ = true;
   }
-  slot.reset();
 }
 
 void TransferSendSession::FinishSend(bool has_failed) {
-  bool should_release = false;
-  {
-    absl::MutexLock lock(mu_);
-    if (has_failed) failed_ = true;
-    if (draining_) return;
-    draining_ = true;
-    if (in_flight_ == 0) {
-      done_ = true;
-      should_release = true;
-    }
-  }
-  if (should_release) {
-    ReleaseSlot();
+  absl::MutexLock lock(mu_);
+  FinishSendLocked(has_failed);
+}
+
+void TransferSendSession::EndSendOpLocked() {
+  --in_flight_;
+  if (draining_ && in_flight_ == 0 && !done_) {
+    ReleaseSlotLocked();
+    done_ = true;
   }
 }
 
 void TransferSendSession::EndSendOp() {
-  bool should_release = false;
-  {
-    absl::MutexLock lock(mu_);
-    --in_flight_;
-    if (draining_ && in_flight_ == 0) {
-      done_ = true;
-      should_release = true;
-    }
-  }
-  if (should_release) {
-    ReleaseSlot();
-  }
+  absl::MutexLock lock(mu_);
+  EndSendOpLocked();
 }
 
 bool TransferSendSession::AcquireStagingWithRetry(
@@ -349,8 +343,9 @@ void TransferSendSession::StartPush(
       // thread has no caller for an exception to reach.
       LOG(ERROR) << "StartPush: failed to issue D2H for layer " << l << ": "
                  << future.status();
-      FinishSend(/*has_failed=*/true);
-      EndSendOp();  // this copy never started
+      absl::MutexLock lock(mu_);
+      FinishSendLocked(/*has_failed=*/true);
+      EndSendOpLocked();  // this copy never started
       return;
     }
     raiden::PjRtCopyFuture layer_future = *std::move(future);
@@ -387,8 +382,9 @@ void TransferSendSession::SendNextLayer(size_t l) {
     if (!status_or.ok()) {
       LOG(ERROR) << "StartPush: D2H copy failed for layer " << l
                  << ", status: " << status_or.status().ToString();
-      FinishSend(/*has_failed=*/true);
-      EndSendOp();
+      absl::MutexLock lock(mu_);
+      FinishSendLocked(/*has_failed=*/true);
+      EndSendOpLocked();
       return;
     }
     bool is_draining = false;
@@ -396,9 +392,11 @@ void TransferSendSession::SendNextLayer(size_t l) {
       absl::MutexLock session_lock(mu_);
       // The send expired or failed while the copy ran: nothing is pushed.
       is_draining = draining_;
+      if (is_draining) {
+        EndSendOpLocked();
+      }
     }
     if (is_draining) {
-      EndSendOp();
       return;
     }
 
@@ -409,18 +407,13 @@ void TransferSendSession::SendNextLayer(size_t l) {
       {
         absl::MutexLock lock(mu_);
         if (draining_) {
-          remote_data_endpoints.clear();
-        } else {
-          remote_data_endpoints = remote_data_endpoints_;
-          src_ints = src_ints_;
-          dst_ints = dst_ints_;
-          ++in_flight_;
+          EndSendOpLocked();
+          return;
         }
-      }
-      if (remote_data_endpoints.empty() && src_ints.empty() &&
-          dst_ints.empty()) {
-        EndSendOp();
-        return;
+        remote_data_endpoints = remote_data_endpoints_;
+        src_ints = src_ints_;
+        dst_ints = dst_ints_;
+        ++in_flight_;
       }
       LOG(INFO) << "StartPush (H2H start layer " << l << "): uuid=" << uuid_
                 << ", numa=" << base_->assigned_numa_node().value_or(-1);
@@ -430,8 +423,9 @@ void TransferSendSession::SendNextLayer(size_t l) {
             if (!push_res.ok()) {
               LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
                          << push_res.status().ToString();
-              FinishSend(/*has_failed=*/true);
-              EndSendOp();
+              absl::MutexLock lock(mu_);
+              FinishSendLocked(/*has_failed=*/true);
+              EndSendOpLocked();
               return;
             }
 
@@ -442,9 +436,12 @@ void TransferSendSession::SendNextLayer(size_t l) {
             const bool last = remaining_h2h_layers_.fetch_sub(1) == 1;
             if (last) {
               LOG(INFO) << "StartPush (All H2H complete): uuid=" << uuid_;
-              FinishSend(/*has_failed=*/false);
             }
-            EndSendOp();
+            absl::MutexLock lock(mu_);
+            if (last) {
+              FinishSendLocked(/*has_failed=*/false);
+            }
+            EndSendOpLocked();
           });
 
       // Immediately queue the next layer's push without waiting for this one to

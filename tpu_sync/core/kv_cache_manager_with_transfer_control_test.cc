@@ -22,7 +22,6 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -50,6 +49,8 @@
 #include "absl/time/time.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/tcp_control_plane_backend.h"
+#include "tpu_sync/core/transfer_receive_session.h"
+#include "tpu_sync/core/transfer_send_session.h"
 
 namespace tpu_raiden {
 namespace {
@@ -95,12 +96,6 @@ class TestManager : public KVCacheManagerWithTransfer {
     }
   }
 
-  void ExpireRecv(uint64_t uuid) {
-    absl::MutexLock lock(mu_);
-    active_recv_entries_.at(uuid).deadline =
-        std::chrono::steady_clock::now() - std::chrono::seconds(1);
-  }
-
   size_t free_slots() {
     absl::MutexLock lock(mu_);
     return free_slots_.size();
@@ -109,19 +104,26 @@ class TestManager : public KVCacheManagerWithTransfer {
   std::optional<std::string> recv_req_id(uint64_t uuid) {
     absl::MutexLock lock(mu_);
     auto it = active_recv_entries_.find(uuid);
-    if (it == active_recv_entries_.end()) return std::nullopt;
-    return it->second.req_id;
+    if (it == active_recv_entries_.end()) {
+      return std::nullopt;
+    }
+    const std::shared_ptr<TransferReceiveSession>& session = it->second;
+    if (session->done()) {
+      return std::nullopt;
+    }
+    return session->req_id();
   }
 
   bool has_recv(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    return active_recv_entries_.contains(uuid);
+    auto it = active_recv_entries_.find(uuid);
+    return it != active_recv_entries_.end() && !it->second->done();
   }
 
   void MarkPullStarted(uint64_t uuid) {
     absl::MutexLock lock(mu_);
     auto old = send_entries_.at(uuid);
-    auto entry = std::make_shared<SendEntry>(
+    auto entry = std::make_shared<TransferSendSession>(
         base_.get(), old->req_id(), uuid, old->deadline(),
         old->register_start(), /*slot_in=*/nullptr, /*in_flight_in=*/0,
         /*pull_started_in=*/true);
@@ -767,13 +769,16 @@ TEST(ControlHandshakeTest, ExpiredReceiveKeepsStagingUntilHandshakeEnds) {
   SilentProducer producer(/*read_request=*/true);
   TestManager consumer(/*timeout_s=*/5.0, /*num_layers=*/1);
   const size_t free_before = consumer.free_slots();
-  consumer.StartRead("req", /*uuid=*/201, producer.endpoint(),
-                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+  consumer.StartRead(
+      "req", /*uuid=*/201, producer.endpoint(),
+      /*remote_block_ids=*/{0}, /*local_block_ids=*/{0},
+      /*parallelism=*/1, /*local_host_block_ids=*/std::nullopt,
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(20));
   ASSERT_TRUE(producer.WaitUntilRequestReceived(std::chrono::seconds(5)));
   ASSERT_TRUE(consumer.has_recv(201));
   ASSERT_EQ(consumer.free_slots(), free_before - 1);
 
-  consumer.ExpireRecv(201);
+  absl::SleepFor(absl::Milliseconds(25));
   auto [done_sending, done_recving, failed_during] = consumer.CompleteReadRaw();
   (void)done_sending;
   EXPECT_THAT(done_recving, ::testing::IsEmpty());

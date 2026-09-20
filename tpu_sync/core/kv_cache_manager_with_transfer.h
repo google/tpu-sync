@@ -59,11 +59,32 @@ namespace tpu_raiden {
 
 class MetricsCollector;
 class TransferSendSession;
+class TransferReceiveSession;
 
 struct CopySpec {
   std::vector<int64_t> src_offsets;
   std::vector<int64_t> dst_offsets;
   std::vector<int64_t> sizes;
+};
+
+struct CopyPlan {
+  int64_t num_blocks = 0;
+  std::vector<int64_t> requested_remote_block_ids;
+  std::vector<int64_t> requested_local_block_ids;
+  std::vector<int64_t> producer_remote_block_ids;
+  std::vector<int64_t> h2d_local_block_ids;
+  std::vector<int64_t> h2d_host_block_ids;
+  std::vector<int64_t> transport_host_block_ids;
+  std::vector<size_t> host_dst_to_src;
+  CopySpec d2h_copy;
+  CopySpec h2d_copy;
+
+  bool RequiresHostReorder() const { return !host_dst_to_src.empty(); }
+};
+
+struct PendingCopy {
+  int64_t host_block_id;
+  int64_t chip_block_id;
 };
 
 class TransferFuture {
@@ -106,21 +127,6 @@ class TransferFuture {
   std::vector<raiden::PjRtCopyFuture> futures_;
 };
 
-struct CopyPlan {
-  int64_t num_blocks = 0;
-  std::vector<int64_t> requested_remote_block_ids;
-  std::vector<int64_t> requested_local_block_ids;
-  std::vector<int64_t> producer_remote_block_ids;
-  std::vector<int64_t> h2d_local_block_ids;
-  std::vector<int64_t> h2d_host_block_ids;
-  std::vector<int64_t> transport_host_block_ids;
-  std::vector<size_t> host_dst_to_src;
-  CopySpec d2h_copy;
-  CopySpec h2d_copy;
-
-  bool RequiresHostReorder() const { return !host_dst_to_src.empty(); }
-};
-
 struct StageResult {
   // TransferFuture is shared because it is exported to Python via nanobind.
   // Python garbage collection and C++ pending operations list share ownership
@@ -138,15 +144,12 @@ struct CommitResult {
   int64_t total_bytes;
 };
 
-struct PendingCopy {
-  int64_t host_block_id;
-  int64_t chip_block_id;
-};
-
 class KVCacheManagerWithTransfer {
  public:
   using SendEntry = TransferSendSession;
+  using RecvEntry = TransferReceiveSession;
   friend class TransferSendSession;
+  friend class TransferReceiveSession;
 
   struct Slot {
     int64_t slot_idx = -1;
@@ -253,6 +256,13 @@ class KVCacheManagerWithTransfer {
       const std::vector<int64_t>& local_block_ids, int parallelism = 1,
       std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt);
 
+  void StartRead(const std::string& req_id, uint64_t uuid,
+                 const std::string& remote_endpoint,
+                 const std::vector<int64_t>& remote_block_ids,
+                 const std::vector<int64_t>& local_block_ids, int parallelism,
+                 std::optional<std::vector<int64_t>> local_host_block_ids,
+                 std::chrono::steady_clock::time_point deadline);
+
   virtual void StartRead(
       const std::string& req_id, uint64_t uuid,
       const std::vector<std::string>& remote_endpoints,
@@ -268,12 +278,11 @@ class KVCacheManagerWithTransfer {
       uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
       bool is_sender);
   virtual absl::Status UnregisterActivePlan(uint64_t uuid);
-  // Drops the plan of a receive that has settled; a plan already gone, or
-  // a newer registration reusing the uuid, is left alone.
-  void UnregisterSettledPlan(uint64_t uuid, uint64_t generation);
 
-  virtual absl::Status RegisterRecv(uint64_t uuid, const std::string& req_id,
-                                    int64_t expected_block_count);
+  virtual absl::Status RegisterRecv(
+      uint64_t uuid, const std::string& req_id, int64_t expected_block_count,
+      std::optional<std::chrono::steady_clock::time_point> deadline =
+          std::nullopt);
 
   // Pool reshard executor. The controller owns topology and entry math; this
   // boundary validates the declared pool contract before any staging or
@@ -354,7 +363,6 @@ class KVCacheManagerWithTransfer {
   std::unique_ptr<Slot> TryAcquireSlot();
   size_t num_free_slots() const;
   void ReleaseSlotLocked(int64_t slot_idx);
-  struct RecvEntry;  // defined below; staging helpers take it by pointer
   // Serializes plan registration and unregistration, so a plan is never
   // published without its staging owner or torn down against a half-built
   // registration.
@@ -371,19 +379,15 @@ class KVCacheManagerWithTransfer {
   // demand staging, a whole fixed slot otherwise. Returns nullopt when the
   // staging pool cannot seat the request.
   std::optional<std::vector<int64_t>> AcquireRecvStagingLocked(
-      int64_t num_blocks, RecvEntry* entry);
-  absl::Status EmplaceRecvEntryLocked(uint64_t uuid, RecvEntry&& entry)
+      int64_t num_blocks, std::unique_ptr<Slot>* slot_out,
+      std::vector<int>* staged_blocks_out);
+  absl::Status EmplaceRecvEntryLocked(uint64_t uuid,
+                                      const std::shared_ptr<RecvEntry>& entry)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void ReleaseRecvStagingLocked(RecvEntry* entry);
-  // Same, for paths that have already taken the entry's staging out of it.
-  void ReleaseStagingLocked(int64_t slot_idx,
-                            std::vector<int>* staged_host_blocks);
 
   void StartControlServer();
   void StopControlServer();
   void AckRemote(const std::string& remote_endpoint, uint64_t uuid);
-  virtual absl::Status OnLayerReceived(size_t layer_idx, uint64_t uuid);
-  virtual absl::Status OnPoolReceived(size_t pool_idx, uint64_t uuid);
   virtual void RegisterBlockReadinessCallback(
       size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
       transport::BlockTransportDelegate::HostBlockReadyCallback cb);
@@ -394,72 +398,8 @@ class KVCacheManagerWithTransfer {
       size_t shard_idx, absl::Status status);
   void RemoveStagingReadinessLocked(int64_t slot_idx);
 
-  using H2dIssueFuture =
-      std::shared_future<absl::StatusOr<raiden::PjRtCopyFuture>>;
-
-  struct RecvEntry {
-    std::string req_id;
-    int64_t slot_idx = -1;  // host staging slot to release on completion
-    // Host blocks held under demand staging, released on completion. Empty
-    // when the transfer holds a fixed slot instead.
-    std::vector<int> staged_host_blocks;
-    CopySpec h2d_copy;
-    std::vector<int64_t> chip_block_ids;
-    absl::flat_hash_map<kv_cache::HostBlockId, kv_cache::DeviceBlockId>
-        host_to_chip;
-    std::map<std::pair<size_t, size_t>, std::vector<PendingCopy>>
-        pending_h2d_copies;
-    std::vector<H2dIssueFuture> h2d_dispatch_futures;
-    int32_t total_blocks = 0;
-    int32_t num_completed_blocks = 0;
-    int32_t num_completed_layers = 0;
-    bool network_completed = false;
-    bool h2d_started = false;
-    int in_flight = 0;
-    bool draining = false;
-    bool failed = false;
-    bool reshard_finalizing = false;
-    std::vector<int> accumulated_host_block_ids;
-    std::chrono::steady_clock::time_point deadline;
-    std::chrono::steady_clock::time_point start_time;
-    std::vector<raiden::PjRtCopyFuture> h2d_futures;
-    bool is_pool_reshard = false;
-    // The plan is dropped when this receive settles: set for every
-    // demand-staged receiver plan (whose mapping would otherwise outlive its
-    // freed blocks) and when an unregister arrives while the receive is in
-    // flight (the plan stays mapped until then so late pushes resolve
-    // through its blocks).
-    bool unregister_on_settle = false;
-    // Generation of the plan this receive belongs to; settlement cleanup
-    // only touches that registration.
-    uint64_t plan_generation = 0;
-    std::set<size_t> expected_pool_indices;
-    std::set<size_t> started_pool_indices;
-    std::set<size_t> completed_pool_indices;
-    // Multi-tag plans: per-pool H2D upload ordering. A pool's mirror is
-    // uploaded only after every expected pool of a strictly lower order
-    // rank has completed its upload (FA at rank 0, state classes at rank
-    // 1, so state bytes land last on aliased arena pages). Single-tag
-    // plans leave every rank 0 (upload immediately on wire completion).
-    std::map<size_t, int> pool_order_ranks;
-    std::set<size_t> h2d_launched_pools;
-    // Multi-tag plans: each pool uploads only its own group's destination
-    // block ids (the flat chip_block_ids list concatenates all groups).
-    std::map<size_t, std::vector<int64_t>> pool_dst_block_ids;
-  };
-  absl::flat_hash_map<uint64_t, RecvEntry> active_recv_entries_;
-
-  // Decides a legacy receive's outcome. Retirement waits until every issued
-  // handshake or H2D operation has ended, and failure is sticky while it
-  // drains. The optional value is a plan generation to unregister after mu_
-  // is released.
-  std::optional<uint64_t> FinishRecvLocked(uint64_t uuid, bool failed)
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  std::optional<uint64_t> RetireRecvLocked(uint64_t uuid)
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void BeginRecvOpLocked(RecvEntry* entry) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  std::optional<uint64_t> EndRecvOpLocked(uint64_t uuid)
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  absl::flat_hash_map<uint64_t, std::shared_ptr<RecvEntry>>
+      active_recv_entries_;
 
   struct PoolReshardSendEntry {
     std::string req_id;
@@ -483,11 +423,6 @@ class KVCacheManagerWithTransfer {
       const ::tpu_sync::rpc::StartTransferRequest& plan);
   void StartPoolReshardPush(uint64_t uuid, size_t pool_idx);
   void FinishPoolReshardSend(uint64_t uuid, const absl::Status& status);
-  void FinishPoolReshardRecvPool(uint64_t uuid, size_t pool_idx,
-                                 const absl::Status& status);
-  // Launches H2D uploads for every wire-complete pool whose order-rank
-  // prerequisites (all lower-rank pools uploaded) are satisfied.
-  void LaunchEligiblePoolH2ds(uint64_t uuid);
 
   std::chrono::steady_clock::time_point DeadlineFromNow() const;
 
@@ -541,6 +476,10 @@ class KVCacheManagerWithTransfer {
 
   void InitializeBaseHooks();
   void InitializeControlPlane();
+  // Drops the plan of a receive that has settled; a plan already gone, or
+  // a newer registration reusing the uuid, is left alone.
+  void UnregisterSettledPlan(uint64_t uuid, uint64_t generation);
+  void MaybeUnregisterSettledRecv(uint64_t uuid, RecvEntry& session);
   absl::StatusOr<PullStreamResponseSpec> HandlePullStream(
       const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);
   absl::Status HandleAck(uint64_t uuid);
@@ -558,7 +497,5 @@ class KVCacheManagerWithTransfer {
 };
 
 }  // namespace tpu_raiden
-
-#include "tpu_sync/core/transfer_send_session.h"
 
 #endif  // THIRD_PARTY_TPU_RAIDEN_CORE_KV_CACHE_MANAGER_WITH_TRANSFER_H_

@@ -134,6 +134,9 @@ class TransferSendSession {
       const std::vector<int64_t>& requested_block_ids) const
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ReleaseSlot();
+  void ReleaseSlotLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void FinishSendLocked(bool has_failed) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void EndSendOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   bool AcquireStagingWithRetry(KVCacheManagerWithTransfer& manager,
                                const std::vector<int64_t>& src_block_ids,
                                std::vector<int64_t>* host_block_ids);

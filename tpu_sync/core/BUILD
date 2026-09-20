@@ -552,10 +552,12 @@ cc_library(
     name = "kv_cache_manager_with_transfer",
     srcs = [
         "kv_cache_manager_with_transfer.cc",
+        "transfer_receive_session.cc",
         "transfer_send_session.cc",
     ],
     hdrs = [
         "kv_cache_manager_with_transfer.h",
+        "transfer_receive_session.h",
         "transfer_send_session.h",
     ],
     copts = [

@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
@@ -347,11 +348,15 @@ absl::Status ReshardReceiveSession::ValidateReceiverCoverage(
 }
 
 absl::StatusOr<std::shared_ptr<ReshardReceiveSession>>
-ReshardReceiveSession::Create(kv_cache::KVCacheManagerBase* base,
-                              StagingBlockAllocator* staging_allocator,
-                              const ::tpu_sync::rpc::StartTransferRequest& plan,
-                              absl::Span<const int64_t> chip_blocks,
-                              std::chrono::steady_clock::time_point deadline) {
+ReshardReceiveSession::Create(
+    kv_cache::KVCacheManagerBase* base,
+    StagingBlockAllocator* absl_nullable staging_allocator,
+    const ::tpu_sync::rpc::StartTransferRequest& plan,
+    absl::Span<const int64_t> chip_blocks,
+    std::chrono::steady_clock::time_point deadline) {
+  if (staging_allocator == nullptr) {
+    return absl::InvalidArgumentError("staging_allocator must not be null");
+  }
   TF_RETURN_IF_ERROR(ValidatePlan(*base, plan, chip_blocks));
   // Device-only executor (see PoolReshardPush): arming a receive on a
   // host-only manager is refused rather than silently landing in mirrors.
@@ -441,9 +446,7 @@ absl::Status ReshardReceiveSession::AcquireStagingLeases(
 void ReshardReceiveSession::ReleaseStagingLocked() {
   if (staging_released_) return;
   staging_released_ = true;
-  if (staging_allocator_ != nullptr) {
-    staging_allocator_->ReleasePoolStagingLeases(uuid_);
-  }
+  staging_allocator_->ReleasePoolStagingLeases(uuid_);
 }
 
 void ReshardReceiveSession::ReleaseStaging() {

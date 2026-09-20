@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
@@ -48,8 +49,8 @@ class TransferSendSession {
  public:
   static absl::StatusOr<std::shared_ptr<TransferSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,
-      StagingBlockAllocator* staging_allocator, std::string req_id,
-      uint64_t uuid, absl::Span<const int64_t> block_ids,
+      StagingBlockAllocator* absl_nullable staging_allocator,
+      std::string req_id, uint64_t uuid, absl::Span<const int64_t> block_ids,
       std::chrono::steady_clock::time_point deadline,
       std::chrono::steady_clock::time_point register_start, int in_flight = 0,
       bool pull_started = false);
@@ -82,8 +83,7 @@ class TransferSendSession {
 
   // Stages producer device blocks into host staging and executes the
   // multi-layer D2H copy and pipelined H2H push.
-  void StartPush(KVCacheManagerWithTransfer& manager,
-                 const std::vector<std::string>& remote_data_endpoints,
+  void StartPush(const std::vector<std::string>& remote_data_endpoints,
                  const std::vector<int64_t>& src_block_ids,
                  const std::vector<int64_t>& dst_block_ids);
 
@@ -145,9 +145,6 @@ class TransferSendSession {
   void ReleaseSlotLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void FinishSendLocked(bool has_failed) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndSendOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  bool AcquireStagingWithRetry(KVCacheManagerWithTransfer& manager,
-                               const std::vector<int64_t>& src_block_ids,
-                               std::vector<int64_t>* host_block_ids);
   void SendNextLayer(size_t l);
 
   mutable absl::Mutex mu_;

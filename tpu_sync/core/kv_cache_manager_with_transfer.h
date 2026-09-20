@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
@@ -122,13 +123,18 @@ class StagingBlockAllocator {
 
   // Acquires staging for |num_blocks| blocks: a fixed slot when
   // !dynamic_host_staging_, or |num_blocks| locked dynamic host blocks when
-  // dynamic_host_staging_ is enabled. Returns std::nullopt if staging
-  // capacity is currently unavailable.
-  std::optional<Allocation> Acquire(int64_t num_blocks);
+  // dynamic_host_staging_ is enabled. Returns an error if staging capacity is
+  // currently unavailable.
+  absl::StatusOr<Allocation> Acquire(int64_t num_blocks);
 
-  // Allocates |num_blocks| locked dynamic host blocks directly from
-  // |base_->host_block_manager()|.
-  absl::StatusOr<Allocation> AcquireDynamicBlocks(int64_t num_blocks);
+  // Waits until |deadline| to acquire staging for |num_blocks| blocks. Returns
+  // an error if |num_blocks| exceeds capacity(), if Shutdown() is called, or if
+  // |deadline| expires before staging capacity becomes available.
+  absl::StatusOr<Allocation> AcquireWithTimeout(
+      int64_t num_blocks, std::chrono::steady_clock::time_point deadline);
+
+  // Signals shutdown to wake any threads waiting in AcquireWithTimeout().
+  void Shutdown();
 
   // Leases bounded pool staging arena slots for |uuid| on |storage_index| for
   // |device_block_ids| via |base_|.
@@ -150,13 +156,15 @@ class StagingBlockAllocator {
   StagingBlockAllocator(kv_cache::KVCacheManagerBase* base, int64_t num_slots,
                         int64_t max_blocks, bool dynamic_host_staging);
   absl::Status Initialize();
-  void Shutdown();
   absl::Status InitializeSlotPool();
+  absl::StatusOr<Allocation> AcquireLocked(int64_t num_blocks)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ReleaseSlot(int64_t slot_idx);
   void ReleaseDynamicBlocks(absl::Span<const int> blocks);
 
   mutable absl::Mutex mu_;
-  kv_cache::KVCacheManagerBase* base_ = nullptr;
+  kv_cache::KVCacheManagerBase* const base_ = nullptr;
+  bool shutting_down_ ABSL_GUARDED_BY(mu_) = false;
   const int64_t num_slots_ = 0;
   const int64_t max_blocks_ = 0;
   const bool dynamic_host_staging_ = false;
@@ -167,7 +175,6 @@ using StagingAllocation = StagingBlockAllocator::Allocation;
 
 class KVCacheManagerWithTransfer {
  public:
-  friend class TransferSendSession;
   friend class TransferReceiveSession;
 
   KVCacheManagerWithTransfer(

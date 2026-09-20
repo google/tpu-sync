@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -88,10 +89,13 @@ absl::Status ReshardSendSession::ValidatePlan(
 
 absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
     kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* staging_allocator,
+    StagingBlockAllocator* absl_nullable staging_allocator,
     absl::Span<const int64_t> src_block_ids, int parallelism,
     std::chrono::steady_clock::time_point deadline,
     ::tpu_sync::rpc::StartTransferRequest plan) {
+  if (staging_allocator == nullptr) {
+    return absl::InvalidArgumentError("staging_allocator must not be null");
+  }
   ABSL_RETURN_IF_ERROR(ValidatePlan(*base, plan, src_block_ids));
   // Device-only executor: without device attachments there are no bytes this
   // path could legitimately move; host-only managers fail closed with no
@@ -372,9 +376,7 @@ void ReshardSendSession::EndOp() {
 void ReshardSendSession::SettleLocked() {
   // Every push of every pool has completed (or the send failed): release the
   // host staging arena slots and mark done atomically under |mu_|.
-  if (staging_allocator_ != nullptr) {
-    staging_allocator_->ReleasePoolStagingLeases(uuid_);
-  }
+  staging_allocator_->ReleasePoolStagingLeases(uuid_);
   done_ = true;
 }
 

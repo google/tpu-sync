@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
@@ -77,11 +78,14 @@ void RecordTransferDuration(double duration_ms) {
 absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
 TransferReceiveSession::Create(
     kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* staging_allocator, uint64_t uuid,
+    StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
     const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids,
     const std::optional<std::vector<int64_t>>& local_host_block_ids,
     std::chrono::steady_clock::time_point deadline) {
+  if (staging_allocator == nullptr) {
+    return absl::InvalidArgumentError("staging_allocator must not be null");
+  }
   auto session = std::shared_ptr<TransferReceiveSession>(
       new TransferReceiveSession(base, staging_allocator, uuid));
   std::vector<int64_t> host_block_ids;
@@ -97,11 +101,15 @@ TransferReceiveSession::Create(
   return session;
 }
 
-std::shared_ptr<TransferReceiveSession> TransferReceiveSession::Create(
+absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
+TransferReceiveSession::Create(
     kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* staging_allocator, uint64_t uuid, std::string req_id,
-    int32_t total_blocks, std::chrono::steady_clock::time_point deadline,
-    bool acquire_staging) {
+    StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+    std::string req_id, int32_t total_blocks,
+    std::chrono::steady_clock::time_point deadline, bool acquire_staging) {
+  if (staging_allocator == nullptr) {
+    return absl::InvalidArgumentError("staging_allocator must not be null");
+  }
   return std::shared_ptr<TransferReceiveSession>(new TransferReceiveSession(
       base, staging_allocator, uuid, std::move(req_id), total_blocks, deadline,
       acquire_staging));
@@ -110,11 +118,14 @@ std::shared_ptr<TransferReceiveSession> TransferReceiveSession::Create(
 absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
 TransferReceiveSession::CreateFromActivePlan(
     kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* staging_allocator, uint64_t uuid,
+    StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
     const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
     std::chrono::steady_clock::time_point deadline,
     absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
         host_block_of) {
+  if (staging_allocator == nullptr) {
+    return absl::InvalidArgumentError("staging_allocator must not be null");
+  }
   auto session = std::shared_ptr<TransferReceiveSession>(
       new TransferReceiveSession(base, staging_allocator, uuid));
   ABSL_RETURN_IF_ERROR(session->InitFromActivePlan(request, generation,
@@ -128,8 +139,7 @@ absl::Status TransferReceiveSession::InitFromActivePlan(
     absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
         host_block_of) {
   absl::MutexLock lock(mu_);
-  if (staging_allocator_ != nullptr &&
-      staging_allocator_->dynamic_host_staging() &&
+  if (staging_allocator_->dynamic_host_staging() &&
       request.pool_groups_size() == 0) {
     std::vector<int64_t> device_blocks;
     absl::flat_hash_set<int64_t> seen;
@@ -140,9 +150,8 @@ absl::Status TransferReceiveSession::InitFromActivePlan(
       }
     }
     if (!device_blocks.empty()) {
-      absl::StatusOr<StagingAllocation> allocated =
-          staging_allocator_->AcquireDynamicBlocks(
-              static_cast<int64_t>(device_blocks.size()));
+      absl::StatusOr<StagingAllocation> allocated = staging_allocator_->Acquire(
+          static_cast<int64_t>(device_blocks.size()));
       if (!allocated.ok()) {
         return absl::ResourceExhaustedError(absl::StrCat(
             "cannot stage ", device_blocks.size(), " blocks for plan ", uuid_,
@@ -211,9 +220,9 @@ bool TransferReceiveSession::AllocateStagingForLoad(
   }
   absl::flat_hash_set<int64_t> unique_local_bids(local_block_ids.begin(),
                                                  local_block_ids.end());
-  std::optional<StagingAllocation> acquired = staging_allocator_->Acquire(
+  absl::StatusOr<StagingAllocation> acquired = staging_allocator_->Acquire(
       static_cast<int64_t>(unique_local_bids.size()));
-  if (!acquired.has_value()) {
+  if (!acquired.ok()) {
     LOG(ERROR) << "StartRead: cannot stage " << unique_local_bids.size()
                << " blocks for req_id=" << req_id
                << " (dynamic=" << staging_allocator_->dynamic_host_staging()

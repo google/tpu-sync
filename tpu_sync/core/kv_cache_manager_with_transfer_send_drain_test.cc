@@ -72,7 +72,7 @@ class TestManager : public KVCacheManagerWithTransfer {
       absl::MutexLock lock(mu_);
       session = send_sessions_.at(uuid);
     }
-    session->StartPush(*this, {"127.0.0.1:1"}, /*src_block_ids=*/{0},
+    session->StartPush({"127.0.0.1:1"}, /*src_block_ids=*/{0},
                        /*dst_block_ids=*/{0});
   }
 
@@ -161,7 +161,7 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
                std::optional<std::chrono::steady_clock::time_point> deadline =
                    std::nullopt) {
     absl::MutexLock lock(mu_);
-    active_recv_sessions_[uuid] = TransferReceiveSession::Create(
+    active_recv_sessions_[uuid] = *TransferReceiveSession::Create(
         base(), staging_allocator_.get(), uuid, req_id, blocks_per_layer,
         deadline.value_or(DeadlineFromNow()), /*acquire_staging=*/true);
   }

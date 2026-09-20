@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
@@ -55,7 +56,7 @@ class ReshardReceiveSession {
   // acquiring bounded pool staging leases per storage via |staging_allocator|.
   static absl::StatusOr<std::shared_ptr<ReshardReceiveSession>> Create(
       kv_cache::KVCacheManagerBase* base,
-      StagingBlockAllocator* staging_allocator,
+      StagingBlockAllocator* absl_nullable staging_allocator,
       const ::tpu_sync::rpc::StartTransferRequest& plan,
       absl::Span<const int64_t> chip_blocks,
       std::chrono::steady_clock::time_point deadline);

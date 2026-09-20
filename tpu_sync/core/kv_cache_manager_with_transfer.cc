@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
@@ -239,6 +240,16 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
   // while one is still running.
   shutting_down_.store(true, std::memory_order_relaxed);
   {
+    absl::MutexLock lock(mu_);
+    for (const auto& [uuid, session] : send_sessions_) {
+      (void)uuid;
+      session->FinishSend(/*has_failed=*/true);
+    }
+  }
+  if (staging_allocator_) {
+    staging_allocator_->Shutdown();
+  }
+  {
     absl::MutexLock lock(pull_workers_mu_);
     pull_workers_mu_.Await(absl::Condition(
         +[](int* active) { return *active == 0; }, &active_pull_workers_));
@@ -416,9 +427,8 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
     }
     if (!device_blocks.empty()) {
       absl::MutexLock lock(mu_);
-      absl::StatusOr<StagingAllocation> allocated =
-          staging_allocator_->AcquireDynamicBlocks(
-              static_cast<int64_t>(device_blocks.size()));
+      absl::StatusOr<StagingAllocation> allocated = staging_allocator_->Acquire(
+          static_cast<int64_t>(device_blocks.size()));
       if (!allocated.ok()) {
         return absl::ResourceExhaustedError(absl::StrCat(
             "cannot stage ", device_blocks.size(), " blocks for plan ", uuid,
@@ -454,10 +464,11 @@ absl::Status KVCacheManagerWithTransfer::RegisterRecv(
     uint64_t uuid, const std::string& req_id, int64_t expected_block_count,
     std::optional<std::chrono::steady_clock::time_point> deadline) {
   absl::MutexLock lock(mu_);
-  std::shared_ptr<TransferReceiveSession> recv_session =
+  ASSIGN_OR_RETURN(
+      std::shared_ptr<TransferReceiveSession> recv_session,
       TransferReceiveSession::Create(base_.get(), staging_allocator_.get(),
                                      uuid, req_id, expected_block_count,
-                                     deadline.value_or(DeadlineFromNow()));
+                                     deadline.value_or(DeadlineFromNow())));
   // host_to_chip is left empty -> defaults to 1-to-1 mapping in
   // OnBlocksReceived
   absl::Status inserted = EmplaceRecvSessionLocked(uuid, recv_session);
@@ -936,7 +947,22 @@ StagingBlockAllocator::StagingBlockAllocator(kv_cache::KVCacheManagerBase* base,
       max_blocks_(max_blocks),
       dynamic_host_staging_(dynamic_host_staging) {}
 
-StagingBlockAllocator::~StagingBlockAllocator() { Shutdown(); }
+StagingBlockAllocator::~StagingBlockAllocator() {
+  {
+    absl::MutexLock lock(mu_);
+    shutting_down_ = true;
+  }
+  if (base_ != nullptr && base_->host_block_manager() != nullptr &&
+      !slot_blocks_.empty()) {
+    std::vector<int> blocks_to_unlock;
+    blocks_to_unlock.reserve(slot_blocks_.size() * max_blocks_);
+    for (const std::vector<int>& blocks : slot_blocks_) {
+      blocks_to_unlock.insert(blocks_to_unlock.end(), blocks.begin(),
+                              blocks.end());
+    }
+    (void)base_->host_block_manager()->Unlock(blocks_to_unlock);
+  }
+}
 
 absl::Status StagingBlockAllocator::Initialize() {
   if (num_slots_ <= 0 || max_blocks_ <= 0) {
@@ -979,52 +1005,78 @@ absl::Status StagingBlockAllocator::InitializeSlotPool() {
 
 void StagingBlockAllocator::Shutdown() {
   absl::MutexLock lock(mu_);
-  if (base_ != nullptr && base_->host_block_manager() != nullptr &&
-      !slot_blocks_.empty()) {
-    std::vector<int> blocks_to_unlock;
-    blocks_to_unlock.reserve(slot_blocks_.size() * max_blocks_);
-    for (const std::vector<int>& blocks : slot_blocks_) {
-      blocks_to_unlock.insert(blocks_to_unlock.end(), blocks.begin(),
-                              blocks.end());
-    }
-    (void)base_->host_block_manager()->Unlock(blocks_to_unlock);
-  }
+  shutting_down_ = true;
 }
 
-std::optional<StagingBlockAllocator::Allocation> StagingBlockAllocator::Acquire(
-    int64_t num_blocks) {
+absl::StatusOr<StagingBlockAllocator::Allocation>
+StagingBlockAllocator::AcquireLocked(int64_t num_blocks) {
   if (num_blocks <= 0) {
     return Allocation();
   }
+  const int64_t cap = capacity();
+  if (num_blocks > cap) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Requested ", num_blocks, " blocks exceeds ",
+                     dynamic_host_staging_ ? "the host staging pool capacity ("
+                                           : "a staging slot capacity (",
+                     cap, ")"));
+  }
   if (!dynamic_host_staging_) {
-    absl::MutexLock lock(mu_);
-    if (num_blocks > max_blocks_ || free_slots_.empty()) {
-      return std::nullopt;
+    if (free_slots_.empty()) {
+      return absl::ResourceExhaustedError("No free staging slots available");
     }
     int64_t slot_idx = free_slots_.front();
     free_slots_.pop_front();
     return Allocation(this, slot_idx, slot_blocks_[slot_idx]);
   }
+  if (base_ == nullptr || base_->host_block_manager() == nullptr) {
+    return absl::FailedPreconditionError("Host block manager is null");
+  }
   // Lock the pages so the pool's LRU cannot evict staging that is mid-flight.
   // An allocation miss is only reported back; this helper neither retries
   // nor logs. The producer retries it until its deadline, the consumer
   // fails it at once, and each logs its own verdict.
-  absl::StatusOr<Allocation> allocated = AcquireDynamicBlocks(num_blocks);
-  if (!allocated.ok()) {
-    return std::nullopt;
-  }
-  return *std::move(allocated);
-}
-
-absl::StatusOr<StagingBlockAllocator::Allocation>
-StagingBlockAllocator::AcquireDynamicBlocks(int64_t num_blocks) {
-  if (num_blocks <= 0) {
-    return Allocation();
-  }
   ABSL_ASSIGN_OR_RETURN(std::vector<int> allocated,
                         base_->host_block_manager()->Allocate(
                             static_cast<int>(num_blocks), /*lock=*/true));
   return Allocation(this, std::move(allocated));
+}
+
+absl::StatusOr<StagingBlockAllocator::Allocation>
+StagingBlockAllocator::Acquire(int64_t num_blocks) {
+  absl::MutexLock lock(mu_);
+  return AcquireLocked(num_blocks);
+}
+
+absl::StatusOr<StagingBlockAllocator::Allocation>
+StagingBlockAllocator::AcquireWithTimeout(
+    int64_t num_blocks, std::chrono::steady_clock::time_point deadline) {
+  absl::MutexLock lock(mu_);
+  auto can_proceed = [&]() ABSL_SHARED_LOCKS_REQUIRED(mu_) {
+    if (shutting_down_) return true;
+    if (!dynamic_host_staging_) return !free_slots_.empty();
+    return base_ != nullptr && base_->host_block_manager() != nullptr &&
+           base_->host_block_manager()->num_free_blocks() >=
+               static_cast<size_t>(num_blocks);
+  };
+  while (true) {
+    if (shutting_down_) {
+      return absl::CancelledError("StagingBlockAllocator is shutting down");
+    }
+    absl::StatusOr<Allocation> acquired = AcquireLocked(num_blocks);
+    if (acquired.ok() || !absl::IsResourceExhausted(acquired.status())) {
+      return acquired;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return acquired;
+    }
+    const auto remaining_ns = std::min<std::chrono::nanoseconds>(
+                                  deadline - now, std::chrono::milliseconds(1))
+                                  .count();
+    mu_.AwaitWithTimeout(absl::Condition(&can_proceed),
+                         absl::Nanoseconds(remaining_ns));
+  }
 }
 
 absl::Status StagingBlockAllocator::AcquirePoolStagingLease(
@@ -1075,6 +1127,7 @@ void StagingBlockAllocator::ReleaseDynamicBlocks(absl::Span<const int> blocks) {
       base_->host_block_manager() == nullptr) {
     return;
   }
+  absl::MutexLock lock(mu_);
   std::vector<int> block_vec(blocks.begin(), blocks.end());
   (void)base_->host_block_manager()->Unlock(block_vec);
   (void)base_->host_block_manager()->Deallocate(block_vec);
@@ -1270,8 +1323,7 @@ KVCacheManagerWithTransfer::HandlePullStream(
     std::thread([this, session, remote_data_endpoints,
                  src_block_ids = req.src_block_ids,
                  dst_block_ids = req.dst_block_ids]() {
-      session->StartPush(*this, remote_data_endpoints, src_block_ids,
-                         dst_block_ids);
+      session->StartPush(remote_data_endpoints, src_block_ids, dst_block_ids);
       absl::MutexLock lock(pull_workers_mu_);
       --active_pull_workers_;
     }).detach();

@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
@@ -49,7 +50,7 @@ class ReshardSendSession {
   // send session.
   static absl::StatusOr<std::shared_ptr<ReshardSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,
-      StagingBlockAllocator* staging_allocator,
+      StagingBlockAllocator* absl_nullable staging_allocator,
       absl::Span<const int64_t> src_block_ids, int parallelism,
       std::chrono::steady_clock::time_point deadline,
       ::tpu_sync::rpc::StartTransferRequest plan);

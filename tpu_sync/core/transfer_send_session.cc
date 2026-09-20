@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -44,11 +45,14 @@ namespace tpu_raiden {
 absl::StatusOr<std::shared_ptr<TransferSendSession>>
 TransferSendSession::Create(
     kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
-    absl::Span<const int64_t> block_ids,
+    StagingBlockAllocator* absl_nullable staging_allocator, std::string req_id,
+    uint64_t uuid, absl::Span<const int64_t> block_ids,
     std::chrono::steady_clock::time_point deadline,
     std::chrono::steady_clock::time_point register_start, int in_flight,
     bool pull_started) {
+  if (staging_allocator == nullptr) {
+    return absl::InvalidArgumentError("staging_allocator must not be null");
+  }
   auto session = std::shared_ptr<TransferSendSession>(new TransferSendSession(
       base, staging_allocator, std::move(req_id), uuid, deadline,
       register_start, in_flight, pull_started));
@@ -76,9 +80,9 @@ TransferSendSession::TransferSendSession(
       register_start_(register_start),
       pull_started_(pull_started),
       in_flight_(in_flight) {
-  if (in_flight > 0 && staging_allocator_ != nullptr) {
-    std::optional<StagingAllocation> acquired = staging_allocator_->Acquire(1);
-    if (acquired.has_value()) {
+  if (in_flight > 0) {
+    absl::StatusOr<StagingAllocation> acquired = staging_allocator_->Acquire(1);
+    if (acquired.ok()) {
       staging_ = *std::move(acquired);
     }
   }
@@ -174,6 +178,7 @@ void TransferSendSession::FinishSendLocked(bool has_failed) {
     ReleaseSlotLocked();
     done_ = true;
   }
+  staging_allocator_->Shutdown();
 }
 
 void TransferSendSession::FinishSend(bool has_failed) {
@@ -186,82 +191,13 @@ void TransferSendSession::EndSendOpLocked() {
   if (draining_ && in_flight_ == 0 && !done_) {
     ReleaseSlotLocked();
     done_ = true;
+    staging_allocator_->Shutdown();
   }
 }
 
 void TransferSendSession::EndSendOp() {
   absl::MutexLock lock(mu_);
   EndSendOpLocked();
-}
-
-bool TransferSendSession::AcquireStagingWithRetry(
-    KVCacheManagerWithTransfer& manager,
-    const std::vector<int64_t>& src_block_ids,
-    std::vector<int64_t>* host_block_ids) {
-  // The session's deadline, set when the producer registered the request,
-  // bounds the whole transfer; the wait for staging shares it rather than
-  // starting a later one of its own.
-  while (true) {
-    if (manager.shutting_down_.load(std::memory_order_relaxed)) {
-      return false;  // the manager is being destroyed; its state goes with it
-    }
-    {
-      absl::MutexLock session_lock(mu_);
-      if (draining_) {
-        return false;  // request cancelled while waiting for staging
-      }
-    }
-    // Staging that can never seat this request fails it now rather than
-    // after the deadline: a fixed slot holds max_blocks_ pages, the
-    // per-transfer pool holds total_blocks() pages.
-    const int64_t capacity = staging_allocator_->capacity();
-    if (static_cast<int64_t>(src_block_ids.size()) > capacity) {
-      LOG(ERROR) << "StartPush: request " << req_id_ << " needs "
-                 << src_block_ids.size() << " blocks but "
-                 << (staging_allocator_->dynamic_host_staging()
-                         ? "the host staging pool holds "
-                         : "a staging slot holds ")
-                 << capacity;
-      FinishSend(/*has_failed=*/true);
-      return false;
-    }
-    std::optional<StagingAllocation> acquired =
-        staging_allocator_->Acquire(static_cast<int64_t>(src_block_ids.size()));
-    if (acquired.has_value()) {
-      absl::Span<const int> blocks = acquired->block_ids();
-      host_block_ids->clear();
-      host_block_ids->reserve(src_block_ids.size());
-      for (size_t i = 0; i < src_block_ids.size(); ++i) {
-        host_block_ids->push_back(blocks[i]);
-      }
-      absl::MutexLock session_lock(mu_);
-      staging_ = *std::move(acquired);
-      return true;
-    }
-    // Staging exhausted: wait for in-flight sends to hand blocks back
-    // instead of reporting a send that never happened. The consumer's own
-    // deadline still bounds the total wait.
-    if (std::chrono::steady_clock::now() >= deadline_) {
-      bool already_draining = false;
-      {
-        absl::MutexLock session_lock(mu_);
-        already_draining = draining_;
-      }
-      if (!already_draining) {
-        LOG(ERROR) << "StartPush: staging exhausted serving " << req_id_ << " ("
-                   << src_block_ids.size() << " blocks; free_host_blocks="
-                   << base_->host_block_manager()->num_free_blocks()
-                   << ", total_host_blocks="
-                   << base_->host_block_manager()->total_blocks()
-                   << ", free_slots="
-                   << manager.staging_allocator_->num_free_slots()
-                   << "); reporting transfer failure";
-        FinishSend(/*has_failed=*/true);
-      }
-      return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
 }
 
 CopySpec TransferSendSession::BuildCoalescedCopySpec(
@@ -296,7 +232,6 @@ CopySpec TransferSendSession::BuildCoalescedCopySpec(
 }
 
 void TransferSendSession::StartPush(
-    KVCacheManagerWithTransfer& manager,
     const std::vector<std::string>& remote_data_endpoints,
     const std::vector<int64_t>& src_block_ids,
     const std::vector<int64_t>& dst_block_ids) {
@@ -307,9 +242,19 @@ void TransferSendSession::StartPush(
   // those host blocks to the consumer, keeping host offsets within the staging
   // pool. Writing D2H straight to host[src_block_id] overflows the host buffer
   // once a device block id exceeds num_host_blocks.
-  std::vector<int64_t> host_block_ids;
-  if (!AcquireStagingWithRetry(manager, src_block_ids, &host_block_ids)) {
+  absl::StatusOr<StagingAllocation> acquired =
+      staging_allocator_->AcquireWithTimeout(
+          static_cast<int64_t>(src_block_ids.size()), deadline_);
+  if (!acquired.ok()) {
+    FinishSend(/*has_failed=*/true);
     return;
+  }
+  absl::Span<const int> blocks = acquired->block_ids();
+  std::vector<int64_t> host_block_ids(blocks.begin(),
+                                      blocks.begin() + src_block_ids.size());
+  {
+    absl::MutexLock session_lock(mu_);
+    staging_ = *std::move(acquired);
   }
 
   // Coalesce contiguous (device,host) block runs into a few large copies. With

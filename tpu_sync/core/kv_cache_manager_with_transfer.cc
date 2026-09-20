@@ -12,36 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Dummy change to force Kokoro retry.
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
-
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <stdio.h>
-#include <sys/poll.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
-#include <deque>
 #include <exception>
 #include <functional>
-#include <iostream>
-#include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <ratio>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -62,22 +44,17 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "xla/pjrt/pjrt_client.h"
-#include "xla/tsl/platform/errors.h"
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/metrics_collector.h"
-#include "tpu_sync/core/pool_reshard_send_slots.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/reshard_receive_session.h"
 #include "tpu_sync/core/reshard_send_session.h"
-#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/core/transfer_receive_session.h"
 #include "tpu_sync/core/transfer_send_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
-#include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {
@@ -108,62 +85,12 @@ void CheckStatus(const std::string& context, const absl::Status& status) {
 
 void EmitTimingLog(const std::string& message) { LOG(INFO) << message; }
 
-template <typename T>
-T ValueOrThrow(const std::string& context, absl::StatusOr<T> value_or) {
-  if (!value_or.ok()) {
-    ThrowStatus(context, value_or.status());
-  }
-  return std::move(value_or).value();
-}
-
-static CopySpec OffsetsImpl(const std::vector<int64_t>& block_ids,
-                            bool source_is_compact) {
-  const int64_t n = static_cast<int64_t>(block_ids.size());
-  CopySpec spec;
-  spec.src_offsets.reserve(block_ids.size());
-  spec.dst_offsets.reserve(block_ids.size());
-  spec.sizes.reserve(block_ids.size());
-  for (int64_t start = 0; start < n;) {
-    int64_t end = start + 1;
-    while (end < n && block_ids[end] == block_ids[end - 1] + 1) {
-      ++end;
-    }
-    const int64_t run_size = end - start;
-    if (source_is_compact) {
-      spec.src_offsets.push_back(start);
-      spec.dst_offsets.push_back(block_ids[start]);
-    } else {
-      spec.src_offsets.push_back(block_ids[start]);
-      spec.dst_offsets.push_back(start);
-    }
-    spec.sizes.push_back(run_size);
-    start = end;
-  }
-  return spec;
-}
-
-static kv_cache::KVCacheCopySpec ToKVCacheCopySpecImpl(const CopySpec& spec) {
-  return {.src_offsets = spec.src_offsets,
-          .dst_offsets = spec.dst_offsets,
-          .sizes = spec.sizes};
-}
-
 double DurationMs(std::chrono::steady_clock::time_point start,
                   std::chrono::steady_clock::time_point end) {
   return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
 }  // namespace
-
-CopySpec KVCacheManagerWithTransfer::Offsets(
-    const std::vector<int64_t>& block_ids, bool source_is_compact) {
-  return OffsetsImpl(block_ids, source_is_compact);
-}
-
-kv_cache::KVCacheCopySpec KVCacheManagerWithTransfer::ToKVCacheCopySpec(
-    const CopySpec& spec) {
-  return ToKVCacheCopySpecImpl(spec);
-}
 
 void KVCacheManagerWithTransfer::InitializeBaseHooks() {
   kv_cache::KVCacheManagerBase::TransferEventHooks hooks;
@@ -254,7 +181,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
               host_blocks_to_allocate.value_or(num_slots * max_blocks),
               unsafe_skip_buffer_lock, parallelism, host_allocator),
           node_id, local_control_port, max_blocks, num_slots, timeout_s,
-          std::move(metrics_collector), unsafe_skip_buffer_lock) {}
+          std::move(metrics_collector)) {}
 
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -278,7 +205,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
                                 : std::nullopt,
               assigned_numa_node),
           node_id, local_control_port, max_blocks, num_slots, timeout_s,
-          std::move(metrics_collector), unsafe_skip_buffer_lock) {}
+          std::move(metrics_collector)) {}
 
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,
@@ -304,7 +231,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
               host_blocks_to_allocate.value_or(num_slots * max_blocks),
               parallelism, nullptr),
           node_id, local_control_port, max_blocks, num_slots, timeout_s,
-          std::move(metrics_collector), /*unsafe_skip_buffer_lock=*/false) {}
+          std::move(metrics_collector)) {}
 
 KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
   StopControlServer();
@@ -336,14 +263,12 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     std::unique_ptr<kv_cache::KVCacheManagerBase> base, int64_t node_id,
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
-    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector,
-    bool unsafe_skip_buffer_lock)
+    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector)
     : base_(std::move(base)),
       node_id_(node_id),
       local_control_port_(static_cast<int>(local_control_port)),
       local_data_port_(0),
       timeout_s_(timeout_s),
-      unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
       metrics_collector_(std::move(metrics_collector)) {
   InitializeBaseHooks();
   InitializeControlPlane();
@@ -552,13 +477,14 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
     return absl::StrCat("uuid=", plan.uuid(),
                         " src_blocks=", src_block_ids.size());
   });
-  ASSIGN_OR_RETURN(std::shared_ptr<ReshardSendSession> state,
-                   ReshardSendSession::Create(
-                       base_.get(), staging_allocator_.get(), src_block_ids,
-                       parallelism, DeadlineFromNow(), plan));
+  ABSL_ASSIGN_OR_RETURN(
+      std::shared_ptr<ReshardSendSession> state,
+      ReshardSendSession::Create(base_.get(), staging_allocator_.get(),
+                                 src_block_ids, parallelism, DeadlineFromNow(),
+                                 plan));
 
   base_->InitTransportServer();
-  TF_RETURN_IF_ERROR(
+  ABSL_RETURN_IF_ERROR(
       base_->RegisterActivePlanDirect(plan.uuid(), plan, /*is_sender=*/true));
   {
     absl::MutexLock lock(mu_);
@@ -602,12 +528,12 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
     }
   }
 
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       std::shared_ptr<ReshardReceiveSession> recv_session,
       ReshardReceiveSession::Create(base_.get(), staging_allocator_.get(), plan,
                                     chip_block_ids, DeadlineFromNow()));
 
-  TF_RETURN_IF_ERROR(
+  ABSL_RETURN_IF_ERROR(
       base_->RegisterActivePlanDirect(plan.uuid(), plan, /*is_sender=*/false));
   {
     absl::MutexLock lock(mu_);
@@ -697,24 +623,6 @@ std::vector<RaidenTransferEndpoint> KVCacheManagerWithTransfer::BuildEndpoints(
 
 void KVCacheManagerWithTransfer::StartRead(
     const std::string& req_id, uint64_t uuid,
-    const std::vector<std::string>& remote_endpoints,
-    const std::vector<int64_t>& remote_block_ids,
-    const std::vector<int64_t>& local_block_ids, int parallelism,
-    std::optional<std::vector<int64_t>> local_host_block_ids) {
-  RAIDEN_TRACE_FN("KVTransfer::StartRead", [&]() {
-    return absl::StrCat("req=", req_id, " uuid=", uuid,
-                        " blocks=", remote_block_ids.size());
-  });
-  std::string target_ep;
-  if (!remote_endpoints.empty()) {
-    target_ep = remote_endpoints[0];
-  }
-  StartRead(req_id, uuid, target_ep, remote_block_ids, local_block_ids,
-            parallelism, local_host_block_ids);
-}
-
-void KVCacheManagerWithTransfer::StartRead(
-    const std::string& req_id, uint64_t uuid,
     const std::vector<RaidenTransferEndpoint>& remote_descriptors,
     const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids, int parallelism,
@@ -736,17 +644,7 @@ void KVCacheManagerWithTransfer::StartRead(
             << " descriptors, selecting first endpoint.";
   }
   StartRead(req_id, uuid, remote_descriptors[0].endpoint, remote_block_ids,
-            local_block_ids, parallelism, local_host_block_ids);
-}
-
-void KVCacheManagerWithTransfer::StartRead(
-    const std::string& req_id, uint64_t uuid,
-    const std::string& remote_endpoint,
-    const std::vector<int64_t>& remote_block_ids,
-    const std::vector<int64_t>& local_block_ids, int parallelism,
-    std::optional<std::vector<int64_t>> local_host_block_ids) {
-  StartRead(req_id, uuid, remote_endpoint, remote_block_ids, local_block_ids,
-            parallelism, std::move(local_host_block_ids), DeadlineFromNow());
+            local_block_ids, parallelism, std::move(local_host_block_ids));
 }
 
 void KVCacheManagerWithTransfer::StartRead(
@@ -755,7 +653,13 @@ void KVCacheManagerWithTransfer::StartRead(
     const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids, int parallelism,
     std::optional<std::vector<int64_t>> local_host_block_ids,
-    std::chrono::steady_clock::time_point deadline) {
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
+  RAIDEN_TRACE_FN("KVTransfer::StartRead", [&]() {
+    return absl::StrCat("req=", req_id, " uuid=", uuid,
+                        " blocks=", remote_block_ids.size());
+  });
+  const std::chrono::steady_clock::time_point effective_deadline =
+      deadline.value_or(DeadlineFromNow());
   LOG(INFO) << "StartRead (initiate): req_id=" << req_id << ", uuid=" << uuid
             << ", numa=" << base_->assigned_numa_node().value_or(-1);
   VLOG(1) << "KVCacheManagerWithTransfer::StartRead (Hybrid Bridge) called. "
@@ -796,9 +700,10 @@ void KVCacheManagerWithTransfer::StartRead(
     }
 
     absl::StatusOr<std::shared_ptr<TransferReceiveSession>> created =
-        TransferReceiveSession::Create(
-            base_.get(), staging_allocator_.get(), uuid, req_id,
-            remote_block_ids, local_block_ids, local_host_block_ids, deadline);
+        TransferReceiveSession::Create(base_.get(), staging_allocator_.get(),
+                                       uuid, req_id, remote_block_ids,
+                                       local_block_ids, local_host_block_ids,
+                                       effective_deadline);
     if (!created.ok()) {
       failed_recving_.insert(req_id);
       return;
@@ -957,117 +862,6 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
     base_->ReleasePoolStagingLeases(uuid);
   }
   return {done_sending, done_recving, failed_recving};
-}
-
-StageResult KVCacheManagerWithTransfer::IssueH2D(
-    int64_t slot_idx, int64_t num_blocks,
-    const std::vector<int64_t>& local_block_ids) {
-  RAIDEN_TRACE_FN("KVTransfer::IssueH2D", [&]() {
-    return absl::StrCat("slot=", slot_idx, " blocks=", num_blocks);
-  });
-  if (base_->num_layers() == 0) {
-    throw std::runtime_error("KV cache manager is not registered");
-  }
-  if (slot_idx < 0 || slot_idx >= staging_allocator_->num_slots()) {
-    throw std::out_of_range("slot_idx out of range");
-  }
-  if (num_blocks < 0 || num_blocks > staging_allocator_->max_blocks()) {
-    throw std::out_of_range("num_blocks out of range");
-  }
-  if (num_blocks != static_cast<int64_t>(local_block_ids.size())) {
-    throw std::invalid_argument("num_blocks must match len(local_block_ids)");
-  }
-
-  // Get the actual host block IDs for the first num_blocks in the slot
-  absl::Span<const int> slot_blocks = staging_allocator_->slot_blocks(slot_idx);
-  std::vector<int64_t> host_block_ids;
-  host_block_ids.reserve(num_blocks);
-  for (int64_t i = 0; i < num_blocks; ++i) {
-    host_block_ids.push_back(slot_blocks[i]);
-  }
-
-  // Coalesce contiguous (host, device) block runs
-  CopySpec copy_spec = TransferSendSession::BuildCoalescedCopySpec(
-      host_block_ids, local_block_ids);
-  kv_cache::KVCacheCopySpec transfer_spec = ToKVCacheCopySpec(copy_spec);
-
-  // We still calculate host_spans for the result, but we don't use slot_idx
-  // in H2d call to avoid slot-based double offsetting in the base class.
-  std::vector<kv_cache::KVCacheHostSpan> host_spans =
-      LayerSpans(slot_idx, num_blocks);
-
-  auto future = std::make_shared<TransferFuture>();
-  int64_t total_bytes = 0;
-  for (const kv_cache::KVCacheHostSpan& span : host_spans) {
-    total_bytes += static_cast<int64_t>(span.nbytes);
-  }
-
-  // Call H2dSyncDispatch with slot_idx = std::nullopt to use actual host block
-  // IDs
-  auto fut_or = base_->H2dSyncDispatch(
-      transfer_spec.src_offsets, transfer_spec.dst_offsets, transfer_spec.sizes,
-      /*slot_idx=*/std::nullopt);
-  if (!fut_or.ok()) {
-    throw std::runtime_error("Failed to issue H2D transfer: " +
-                             std::string(fut_or.status().message()));
-  }
-  future->Add(std::move(fut_or.value()));
-
-  return {.future = std::move(future),
-          .host_spans = std::move(host_spans),
-          .total_bytes = total_bytes,
-          .copy_segments = static_cast<int64_t>(copy_spec.sizes.size())};
-}
-
-std::vector<kv_cache::KVCacheHostSpan> KVCacheManagerWithTransfer::LayerSpans(
-    int64_t slot_idx, int64_t num_blocks) {
-  if (base_->num_layers() == 0) {
-    throw std::runtime_error("KV cache manager is not registered");
-  }
-  if (num_blocks < 0 || num_blocks > staging_allocator_->max_blocks()) {
-    throw std::out_of_range("num_blocks out of range");
-  }
-  std::vector<kv_cache::KVCacheHostSpan> spans;
-  absl::Span<const int> slot_blocks = staging_allocator_->slot_blocks(slot_idx);
-
-  // Coalesce contiguous runs of block IDs in the slot
-  struct Run {
-    int64_t start_block_id;
-    int64_t size;
-  };
-  std::vector<Run> runs;
-  for (int64_t start = 0; start < num_blocks;) {
-    int64_t end = start + 1;
-    while (end < num_blocks && slot_blocks[end] == slot_blocks[end - 1] + 1) {
-      ++end;
-    }
-    runs.push_back({slot_blocks[start], end - start});
-    start = end;
-  }
-
-  spans.reserve(base_->num_layers() * base_->num_shards() * runs.size());
-  for (size_t layer_idx = 0; layer_idx < base_->num_layers(); ++layer_idx) {
-    const int64_t per_layer = base_->LayerBlockByteSize(layer_idx);
-    const size_t layer_bytes = per_layer > 0 ? static_cast<size_t>(per_layer)
-                                             : base_->slice_byte_size();
-    for (size_t shard_idx = 0; shard_idx < base_->num_shards(); ++shard_idx) {
-      uint8_t* host_ptr = base_->GetHostPointer(layer_idx, shard_idx);
-      for (const auto& run : runs) {
-        const size_t byte_offset =
-            static_cast<size_t>(run.start_block_id) * layer_bytes;
-        const size_t nbytes = static_cast<size_t>(run.size) * layer_bytes;
-        spans.push_back(
-            kv_cache::KVCacheHostSpan{.ptr = host_ptr + byte_offset,
-                                      .nbytes = nbytes,
-                                      .slot_idx = slot_idx,
-                                      .base_major = run.start_block_id,
-                                      .num_major = run.size,
-                                      .layer_idx = layer_idx,
-                                      .shard_idx = shard_idx});
-      }
-    }
-  }
-  return spans;
 }
 
 StagingBlockAllocator::Allocation::Allocation(StagingBlockAllocator* allocator,
@@ -1287,54 +1081,6 @@ void StagingBlockAllocator::ReleaseDynamicBlocks(absl::Span<const int> blocks) {
   (void)base_->host_block_manager()->Deallocate(block_vec);
 }
 
-std::shared_ptr<KVCacheManagerWithTransfer::StagingReadinessState>
-KVCacheManagerWithTransfer::CreateStagingReadiness(int64_t slot_idx,
-                                                   int64_t num_blocks) {
-  auto state = std::make_shared<StagingReadinessState>();
-  state->slot_idx = slot_idx;
-  state->num_blocks = num_blocks;
-  state->num_layers = base_->num_layers();
-  state->num_shards = base_->num_shards();
-  state->layers.resize(state->num_layers * state->num_shards);
-  {
-    absl::MutexLock lock(mu_);
-    staging_readiness_[slot_idx] = state;
-  }
-  return state;
-}
-
-void KVCacheManagerWithTransfer::MarkStagingLayerReady(
-    const std::shared_ptr<StagingReadinessState>& state, size_t layer_idx,
-    size_t shard_idx, absl::Status status) {
-  if (!state) return;
-  const size_t layer_state_idx = layer_idx * state->num_shards + shard_idx;
-  if (layer_state_idx >= state->layers.size()) return;
-  {
-    std::lock_guard<std::mutex> lock(state->mu);
-    state->layers[layer_state_idx].done = true;
-    state->layers[layer_state_idx].status = std::move(status);
-  }
-  state->cv.notify_all();
-}
-
-void KVCacheManagerWithTransfer::RemoveStagingReadinessLocked(
-    int64_t slot_idx) {
-  auto it = staging_readiness_.find(slot_idx);
-  if (it == staging_readiness_.end()) return;
-  std::shared_ptr<StagingReadinessState> state = it->second;
-  staging_readiness_.erase(it);
-  {
-    std::lock_guard<std::mutex> state_lock(state->mu);
-    for (StagingLayerReady& layer : state->layers) {
-      if (!layer.done) {
-        layer.done = true;
-        layer.status = absl::CancelledError("staging slot was released");
-      }
-    }
-  }
-  state->cv.notify_all();
-}
-
 void KVCacheManagerWithTransfer::RegisterBlockReadinessCallback(
     size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
     transport::BlockTransportDelegate::HostBlockReadyCallback cb) {
@@ -1433,9 +1179,6 @@ void KVCacheManagerWithTransfer::StopControlServer() {
   {
     absl::MutexLock lock(mu_);
     stopping_ = true;
-    while (!staging_readiness_.empty()) {
-      RemoveStagingReadinessLocked(staging_readiness_.begin()->first);
-    }
   }
   // Wake workers parked in HandlePullStream waiting for a send session that
   // will never arrive, so their loops observe stopping_ and exit.
@@ -1609,38 +1352,6 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
   return absl::OkStatus();
 }
 
-std::string KVCacheManagerWithTransfer::EndpointWithPort(
-    const std::string& endpoint, int port) const {
-  if (endpoint.empty()) {
-    throw std::invalid_argument("endpoint is empty");
-  }
-  std::string host;
-  if (absl::StartsWith(endpoint, "[")) {
-    size_t closing = endpoint.find("]:");
-    if (closing == std::string::npos) {
-      throw std::invalid_argument("invalid IPv6 endpoint: " + endpoint);
-    }
-    host = endpoint.substr(1, closing - 1);
-  } else {
-    size_t colon = endpoint.rfind(':');
-    if (colon == std::string::npos) {
-      throw std::invalid_argument("endpoint must be host:port");
-    }
-    host = endpoint.substr(0, colon);
-  }
-  if (absl::StrContains(host, ':')) {
-    return absl::StrCat("[", host, "]:", port);
-  }
-  return absl::StrCat(host, ":", port);
-}
-
-void KVCacheManagerWithTransfer::AckRemote(const std::string& remote_endpoint,
-                                           uint64_t uuid) {
-  CheckStatus("AckRemote",
-              control_backend_->SendAck(remote_endpoint, uuid,
-                                        absl::Seconds(timeout_s_)));
-}
-
 void KVCacheManagerWithTransfer::AckSend(uint64_t uuid) {
   std::shared_ptr<TransferSendSession> session;
   {
@@ -1682,35 +1393,6 @@ void KVCacheManagerWithTransfer::ConfigureDataPortFromKvTransfer() {
     throw std::runtime_error("KVCacheManager BlockTransport is not running");
   }
   local_data_port_ = *data_port;
-}
-
-std::vector<int> KVCacheManagerWithTransfer::ContiguousBlockIds(
-    uint64_t base, uint64_t count) const {
-  if (count > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
-    throw std::out_of_range("block count exceeds int range");
-  }
-  if (base > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
-      count >
-          static_cast<uint64_t>(std::numeric_limits<int>::max()) - base + 1) {
-    throw std::out_of_range("block id range exceeds int range");
-  }
-  std::vector<int> ids;
-  ids.reserve(static_cast<size_t>(count));
-  for (uint64_t i = 0; i < count; ++i) {
-    ids.push_back(static_cast<int>(base + i));
-  }
-  return ids;
-}
-
-std::optional<int> KVCacheManagerWithTransfer::GetLocalTpuNumaNode(
-    xla::PjRtBuffer* buf) const {
-  if (buf && buf->device()) {
-    int node = GetPjRtDeviceNumaNode(buf->device());
-    if (node >= 0) {
-      return node;
-    }
-  }
-  return std::nullopt;
 }
 
 absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(

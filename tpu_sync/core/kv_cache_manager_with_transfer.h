@@ -17,18 +17,12 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <functional>
-#include <future>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <stdexcept>
 #include <string>
-#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -39,8 +33,6 @@
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
-#include "xla/pjrt/pjrt_client.h"
-#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
@@ -81,68 +73,6 @@ struct CopyPlan {
   CopySpec h2d_copy;
 
   bool RequiresHostReorder() const { return !host_dst_to_src.empty(); }
-};
-
-struct PendingCopy {
-  int64_t host_block_id;
-  int64_t chip_block_id;
-};
-
-class TransferFuture {
- public:
-  TransferFuture() = default;
-
-  void Add(raiden::PjRtCopyFuture future) {
-    futures_.push_back(std::move(future));
-  }
-
-  void AddAll(const std::shared_ptr<TransferFuture>& other) {
-    futures_.insert(futures_.end(), other->futures_.begin(),
-                    other->futures_.end());
-  }
-
-  void Await() {
-    RAIDEN_TRACE("KVTransfer::TransferFutureAwait");
-    for (auto& future : futures_) {
-      if (future.IsValid()) {
-        absl::Status status = future.Await();
-        if (!status.ok()) {
-          throw std::runtime_error("Async transfer failed: " +
-                                   std::string(status.message()));
-        }
-      }
-    }
-    futures_.clear();
-  }
-
-  bool IsReady() const {
-    for (const auto& future : futures_) {
-      if (future.IsValid() && !future.IsReady()) {
-        return false;
-      }
-    }
-    return true;
-  }
-
- private:
-  std::vector<raiden::PjRtCopyFuture> futures_;
-};
-
-struct StageResult {
-  // TransferFuture is shared because it is exported to Python via nanobind.
-  // Python garbage collection and C++ pending operations list share ownership
-  // of the future.
-  std::shared_ptr<TransferFuture> future;
-  std::vector<kv_cache::KVCacheHostSpan> host_spans;
-  int64_t total_bytes = 0;
-  int64_t copy_segments = 0;
-};
-
-struct CommitResult {
-  double duration_issue_ms;
-  double duration_wait_ms;
-  double duration_total_ms;
-  int64_t total_bytes;
 };
 
 // Encapsulates host staging block allocation and release (both fixed slots
@@ -239,8 +169,6 @@ class KVCacheManagerWithTransfer {
  public:
   friend class TransferSendSession;
   friend class TransferReceiveSession;
-  friend class ReshardSendSession;
-  friend class ReshardReceiveSession;
 
   KVCacheManagerWithTransfer(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -302,21 +230,9 @@ class KVCacheManagerWithTransfer {
       const std::string& remote_endpoint,
       const std::vector<int64_t>& remote_block_ids,
       const std::vector<int64_t>& local_block_ids, int parallelism = 1,
-      std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt);
-
-  void StartRead(const std::string& req_id, uint64_t uuid,
-                 const std::string& remote_endpoint,
-                 const std::vector<int64_t>& remote_block_ids,
-                 const std::vector<int64_t>& local_block_ids, int parallelism,
-                 std::optional<std::vector<int64_t>> local_host_block_ids,
-                 std::chrono::steady_clock::time_point deadline);
-
-  virtual void StartRead(
-      const std::string& req_id, uint64_t uuid,
-      const std::vector<std::string>& remote_endpoints,
-      const std::vector<int64_t>& remote_block_ids,
-      const std::vector<int64_t>& local_block_ids, int parallelism = 1,
-      std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt);
+      std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt,
+      std::optional<std::chrono::steady_clock::time_point> deadline =
+          std::nullopt);
 
   virtual std::tuple<std::vector<std::string>, std::vector<std::string>,
                      std::vector<std::string>>
@@ -372,38 +288,14 @@ class KVCacheManagerWithTransfer {
       std::unique_ptr<kv_cache::KVCacheManagerBase> base, int64_t node_id = 0,
       int64_t local_control_port = -1, int64_t max_blocks = 0,
       int64_t num_slots = 0, double timeout_s = 120.0,
-      std::shared_ptr<MetricsCollector> metrics_collector = nullptr,
-      bool unsafe_skip_buffer_lock = false);
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
   std::unique_ptr<kv_cache::KVCacheManagerBase> base_;
 
   std::vector<RaidenTransferEndpoint> BuildEndpoints(int64_t port) const;
 
-  struct StagingLayerReady {
-    bool done = false;
-    absl::Status status = absl::OkStatus();
-  };
-
-  struct StagingReadinessState {
-    int64_t slot_idx = -1;
-    int64_t num_blocks = 0;
-    size_t num_layers = 0;
-    size_t num_shards = 0;
-    std::mutex mu;
-    std::condition_variable cv;
-    std::vector<StagingLayerReady> layers;
-  };
-
-  struct PullBlockDescriptor {
-    uint64_t remote_block_base = 0;
-    uint64_t num_blocks = 0;
-  };
-
-  std::string EndpointWithPort(const std::string& endpoint, int port) const;
   void AckSend(uint64_t uuid);
   void ConfigureDataPortFromKvTransfer();
-
-  std::vector<int> ContiguousBlockIds(uint64_t base, uint64_t count) const;
 
   // Serializes plan registration and unregistration, so a plan is never
   // published without its staging owner or torn down against a half-built
@@ -423,16 +315,9 @@ class KVCacheManagerWithTransfer {
 
   void StartControlServer();
   void StopControlServer();
-  void AckRemote(const std::string& remote_endpoint, uint64_t uuid);
   virtual void RegisterBlockReadinessCallback(
       size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
       transport::BlockTransportDelegate::HostBlockReadyCallback cb);
-  std::shared_ptr<StagingReadinessState> CreateStagingReadiness(
-      int64_t slot_idx, int64_t num_blocks);
-  void MarkStagingLayerReady(
-      const std::shared_ptr<StagingReadinessState>& state, size_t layer_idx,
-      size_t shard_idx, absl::Status status);
-  void RemoveStagingReadinessLocked(int64_t slot_idx);
 
   absl::flat_hash_map<uint64_t, std::shared_ptr<TransferReceiveSession>>
       active_recv_sessions_;
@@ -445,10 +330,6 @@ class KVCacheManagerWithTransfer {
 
   std::chrono::steady_clock::time_point DeadlineFromNow() const;
 
-  static CopySpec Offsets(const std::vector<int64_t>& block_ids,
-                          bool source_is_compact);
-  static kv_cache::KVCacheCopySpec ToKVCacheCopySpec(const CopySpec& spec);
-
   int64_t node_id_ = 0;
   int local_control_port_ = 0;
   int local_data_port_ = 0;
@@ -459,7 +340,6 @@ class KVCacheManagerWithTransfer {
   absl::Mutex pull_workers_mu_;
   int active_pull_workers_ ABSL_GUARDED_BY(pull_workers_mu_) = 0;
   double timeout_s_ = 120.0;
-  bool unsafe_skip_buffer_lock_ = true;
 
   std::unique_ptr<StagingBlockAllocator> staging_allocator_;
   // TransferSendSession is shared across threads: created/timed-out/cleaned-up
@@ -471,12 +351,6 @@ class KVCacheManagerWithTransfer {
   absl::flat_hash_set<std::string> done_sending_;
   absl::flat_hash_set<std::string> done_recving_;
   absl::flat_hash_set<std::string> failed_recving_;
-  // StagingReadinessState is shared because it is captured by value in the
-  // async PjRt copy callbacks (e.g. OnReady).
-  absl::flat_hash_map<int64_t, std::shared_ptr<StagingReadinessState>>
-      staging_readiness_;
-  absl::flat_hash_map<int64_t, std::shared_ptr<StagingReadinessState>>
-      active_producer_blocks_;
   absl::Mutex mu_;
   absl::CondVar cv_;
   std::atomic<bool> stopping_{false};
@@ -485,7 +359,6 @@ class KVCacheManagerWithTransfer {
 
  private:
   class ControlPlaneHandlerImpl;
-  class SendDataPlaneImpl;
 
   void InitializeBaseHooks();
   void InitializeControlPlane();
@@ -498,14 +371,6 @@ class KVCacheManagerWithTransfer {
       const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);
   absl::Status HandleAck(uint64_t uuid);
   uint64_t MaxPullStreamBlocks() const;
-
-  std::optional<int> GetLocalTpuNumaNode(xla::PjRtBuffer* buf) const;
-
-  StageResult IssueH2D(int64_t slot_idx, int64_t num_blocks,
-                       const std::vector<int64_t>& local_block_ids);
-
-  std::vector<kv_cache::KVCacheHostSpan> LayerSpans(int64_t slot_idx,
-                                                    int64_t num_blocks);
 
   std::shared_ptr<MetricsCollector> metrics_collector_ = nullptr;
 };

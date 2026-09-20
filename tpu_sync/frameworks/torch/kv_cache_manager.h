@@ -296,17 +296,6 @@ class KVCacheManager {
 
   void StartRead(
       const std::string& req_id, uint64_t uuid,
-      const std::vector<std::string>& remote_endpoints,
-      const std::vector<int64_t>& remote_block_ids,
-      const std::vector<int64_t>& local_block_ids, int parallelism = 1,
-      std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt) {
-    torch_manager_->StartRead(req_id, uuid, remote_endpoints, remote_block_ids,
-                              local_block_ids, parallelism,
-                              local_host_block_ids);
-  }
-
-  void StartRead(
-      const std::string& req_id, uint64_t uuid,
       const std::vector<RaidenTransferEndpoint>& remote_descriptors,
       const std::vector<int64_t>& remote_block_ids,
       const std::vector<int64_t>& local_block_ids, int parallelism = 1,

@@ -14,6 +14,7 @@
 
 #include <unistd.h>
 
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -130,13 +131,14 @@ class MockSubManager : public KVCacheManagerWithTransfer {
   std::vector<int64_t> last_h2d_dst_offsets;
   std::vector<int64_t> last_h2d_copy_sizes;
 
-  void StartRead(const std::string& req_id, uint64_t uuid,
-                 const std::string& remote_endpoint,
-                 const std::vector<int64_t>& remote_block_ids,
-                 const std::vector<int64_t>& local_block_ids,
-                 int parallelism = 1,
-                 std::optional<std::vector<int64_t>> local_host_block_ids =
-                     std::nullopt) override {
+  void StartRead(
+      const std::string& req_id, uint64_t uuid,
+      const std::string& remote_endpoint,
+      const std::vector<int64_t>& remote_block_ids,
+      const std::vector<int64_t>& local_block_ids, int parallelism = 1,
+      std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt,
+      std::optional<std::chrono::steady_clock::time_point> deadline =
+          std::nullopt) override {
     started_ep = remote_endpoint;
     started_remote_blocks = remote_block_ids;
     started_local_blocks = local_block_ids;

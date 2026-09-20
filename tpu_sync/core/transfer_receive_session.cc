@@ -31,6 +31,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
@@ -41,6 +42,7 @@
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/metrics_collector.h"  // IWYU pragma: keep
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/transfer_send_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -75,50 +77,150 @@ void RecordTransferDuration(double duration_ms) {
 
 }  // namespace
 
-void TransferReceiveSession::InitFromActivePlan(
-    const ::tpu_sync::rpc::StartTransferRequest& request,
-    const absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>&
-        host_block_of,
-    StagingAllocation staging_in, uint64_t generation,
-    std::chrono::steady_clock::time_point deadline_in,
-    const CopySpec& coalesced_h2d_copy) {
+absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
+TransferReceiveSession::Create(
+    kv_cache::KVCacheManagerBase* base,
+    StagingBlockAllocator* staging_allocator, uint64_t uuid,
+    const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
+    const std::vector<int64_t>& local_block_ids,
+    const std::optional<std::vector<int64_t>>& local_host_block_ids,
+    std::chrono::steady_clock::time_point deadline) {
+  auto session = std::shared_ptr<TransferReceiveSession>(
+      new TransferReceiveSession(base, staging_allocator, uuid));
+  std::vector<int64_t> host_block_ids;
+  if (!session->AllocateStagingForLoad(req_id, local_block_ids,
+                                       local_host_block_ids, &host_block_ids)) {
+    return absl::ResourceExhaustedError(
+        absl::StrCat("Failed to allocate staging for load req_id=", req_id,
+                     ", uuid=", uuid));
+  }
+  CopyPlan load_plan =
+      BuildLoadCopyPlan(remote_block_ids, local_block_ids, host_block_ids);
+  session->InitFromLoadPlan(req_id, std::move(load_plan), deadline);
+  return session;
+}
+
+std::shared_ptr<TransferReceiveSession> TransferReceiveSession::Create(
+    kv_cache::KVCacheManagerBase* base,
+    StagingBlockAllocator* staging_allocator, uint64_t uuid, std::string req_id,
+    int32_t total_blocks, std::chrono::steady_clock::time_point deadline,
+    bool acquire_staging) {
+  return std::shared_ptr<TransferReceiveSession>(new TransferReceiveSession(
+      base, staging_allocator, uuid, std::move(req_id), total_blocks, deadline,
+      acquire_staging));
+}
+
+absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
+TransferReceiveSession::CreateFromActivePlan(
+    kv_cache::KVCacheManagerBase* base,
+    StagingBlockAllocator* staging_allocator, uint64_t uuid,
+    const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
+    std::chrono::steady_clock::time_point deadline,
+    absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
+        host_block_of) {
+  auto session = std::shared_ptr<TransferReceiveSession>(
+      new TransferReceiveSession(base, staging_allocator, uuid));
+  ABSL_RETURN_IF_ERROR(session->InitFromActivePlan(request, generation,
+                                                   deadline, host_block_of));
+  return session;
+}
+
+std::shared_ptr<TransferReceiveSession>
+TransferReceiveSession::CreateFromPoolReshardPlan(
+    kv_cache::KVCacheManagerBase* base,
+    StagingBlockAllocator* staging_allocator,
+    const ::tpu_sync::rpc::StartTransferRequest& plan,
+    absl::Span<const int64_t> chip_blocks,
+    std::chrono::steady_clock::time_point deadline) {
+  auto session = std::shared_ptr<TransferReceiveSession>(
+      new TransferReceiveSession(base, staging_allocator, plan.uuid()));
+  session->InitFromPoolReshardPlan(plan, chip_blocks, deadline);
+  return session;
+}
+
+absl::Status TransferReceiveSession::InitFromActivePlan(
+    const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
+    std::chrono::steady_clock::time_point deadline,
+    absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
+        host_block_of) {
   absl::MutexLock lock(mu_);
-  staging_ = std::move(staging_in);
+  if (staging_allocator_ != nullptr &&
+      staging_allocator_->dynamic_host_staging() &&
+      request.pool_groups_size() == 0) {
+    std::vector<int64_t> device_blocks;
+    absl::flat_hash_set<int64_t> seen;
+    for (const auto& [src_shard, schedule] : request.shard_push_schedules()) {
+      for (const auto& e : schedule.entries()) {
+        int64_t id = e.dst_block_id();
+        if (seen.insert(id).second) device_blocks.push_back(id);
+      }
+    }
+    if (!device_blocks.empty()) {
+      absl::StatusOr<StagingAllocation> allocated =
+          staging_allocator_->AcquireDynamicBlocks(
+              static_cast<int64_t>(device_blocks.size()));
+      if (!allocated.ok()) {
+        return absl::ResourceExhaustedError(absl::StrCat(
+            "cannot stage ", device_blocks.size(), " blocks for plan ", uuid_,
+            ": ", allocated.status().message()));
+      }
+      staging_ = *std::move(allocated);
+      absl::Span<const int> plan_blocks = staging_.block_ids();
+      for (size_t i = 0; i < device_blocks.size(); ++i) {
+        (*host_block_of)[device_blocks[i]] = plan_blocks[i];
+      }
+    }
+  }
   unregister_on_settle_ = !staging_.empty();
   plan_generation_ = generation;
   req_id_ = request.req_id().empty()
                 ? absl::StrCat("resharded_transfer_", uuid_)
                 : request.req_id();
 
+  absl::flat_hash_set<int> unique_dst_blocks;
   int64_t expected_blocks = 0;
   for (const auto& [src_replica_idx, schedule] :
        request.shard_push_schedules()) {
     absl::flat_hash_set<std::pair<int, int>> unique_transfers_from_this_source;
     for (const auto& push_entry : schedule.entries()) {
       const int64_t dst = push_entry.dst_block_id();
-      auto hb = host_block_of.find(dst);
-      host_to_chip_[hb == host_block_of.end() ? dst : hb->second] = dst;
+      unique_dst_blocks.insert(dst);
+      auto hb = host_block_of->find(dst);
+      host_to_chip_[hb == host_block_of->end() ? dst : hb->second] = dst;
       unique_transfers_from_this_source.insert(
           {push_entry.src_block_id(), push_entry.dst_block_id()});
     }
     expected_blocks += unique_transfers_from_this_source.size();
   }
+  std::vector<int64_t> h2d_local_block_ids(unique_dst_blocks.begin(),
+                                           unique_dst_blocks.end());
+  std::vector<int64_t> h2d_host_block_ids;
+  h2d_host_block_ids.reserve(h2d_local_block_ids.size());
+  for (int64_t dst : h2d_local_block_ids) {
+    auto hb = host_block_of->find(dst);
+    h2d_host_block_ids.push_back(hb == host_block_of->end() ? dst : hb->second);
+  }
   total_blocks_ = expected_blocks;
   num_completed_blocks_ = 0;
-  deadline_ = deadline_in;
+  deadline_ = deadline;
   start_time_ = std::chrono::steady_clock::now();
-  h2d_copy_ = coalesced_h2d_copy;
+  h2d_copy_ = TransferSendSession::BuildCoalescedCopySpec(h2d_host_block_ids,
+                                                          h2d_local_block_ids);
+  if (total_blocks_ == 0) {
+    ReleaseStagingLocked();
+  }
+  return absl::OkStatus();
 }
 
 void TransferReceiveSession::InitFromPoolReshardPlan(
     const ::tpu_sync::rpc::StartTransferRequest& plan,
     absl::Span<const int64_t> chip_blocks,
-    std::chrono::steady_clock::time_point deadline_in) {
+    std::chrono::steady_clock::time_point deadline) {
   absl::MutexLock lock(mu_);
   req_id_ = plan.req_id();
   is_pool_reshard_ = true;
   unregister_on_settle_ = true;
-  deadline_ = deadline_in;
+  deadline_ = deadline;
   start_time_ = std::chrono::steady_clock::now();
   chip_block_ids_.assign(chip_blocks.begin(), chip_blocks.end());
   for (int32_t pool_idx : plan.transfer_pool_indices()) {
@@ -135,15 +237,131 @@ void TransferReceiveSession::InitFromPoolReshardPlan(
   }
 }
 
-void TransferReceiveSession::InitFromLoadPlan(
-    const std::string& req_id_in, const CopyPlan& load_plan,
-    std::chrono::steady_clock::time_point deadline_in,
-    StagingAllocation staging_in) {
+bool TransferReceiveSession::AllocateStagingForLoad(
+    const std::string& req_id, const std::vector<int64_t>& local_block_ids,
+    const std::optional<std::vector<int64_t>>& local_host_block_ids,
+    std::vector<int64_t>* host_block_ids) {
   absl::MutexLock lock(mu_);
-  req_id_ = req_id_in;
-  deadline_ = deadline_in;
+  if (local_host_block_ids.has_value()) {
+    *host_block_ids = *local_host_block_ids;
+    return true;
+  }
+  if (local_block_ids.empty()) {
+    host_block_ids->clear();
+    return true;
+  }
+  absl::flat_hash_set<int64_t> unique_local_bids(local_block_ids.begin(),
+                                                 local_block_ids.end());
+  std::optional<StagingAllocation> acquired = staging_allocator_->Acquire(
+      static_cast<int64_t>(unique_local_bids.size()));
+  if (!acquired.has_value()) {
+    LOG(ERROR) << "StartRead: cannot stage " << unique_local_bids.size()
+               << " blocks for req_id=" << req_id
+               << " (dynamic=" << staging_allocator_->dynamic_host_staging()
+               << ", free_host_blocks="
+               << base_->host_block_manager()->num_free_blocks()
+               << ", free_slots=" << staging_allocator_->num_free_slots()
+               << ", max_blocks=" << staging_allocator_->max_blocks() << ")";
+    return false;
+  }
+  staging_ = *std::move(acquired);
+  absl::Span<const int> staged_blocks = staging_.block_ids();
+  absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>
+      local_to_host;
+  size_t host_block_idx = 0;
+  host_block_ids->clear();
+  host_block_ids->reserve(local_block_ids.size());
+  for (size_t k = 0; k < local_block_ids.size(); ++k) {
+    int64_t local_bid = local_block_ids[k];
+    auto it = local_to_host.find(local_bid);
+    if (it == local_to_host.end()) {
+      int64_t host_bid = staged_blocks[host_block_idx++];
+      local_to_host[local_bid] = host_bid;
+      host_block_ids->push_back(host_bid);
+    } else {
+      host_block_ids->push_back(it->second);
+    }
+  }
+  return true;
+}
+
+CopyPlan TransferReceiveSession::BuildLoadCopyPlan(
+    const std::vector<int64_t>& remote_block_ids,
+    const std::vector<int64_t>& local_block_ids,
+    const std::vector<int64_t>& local_host_block_ids) {
+  if (remote_block_ids.size() != local_block_ids.size() ||
+      local_block_ids.size() != local_host_block_ids.size()) {
+    throw std::invalid_argument(
+        "remote_block_ids, local_block_ids, and local_host_block_ids must have "
+        "same length");
+  }
+  CopyPlan plan;
+  plan.num_blocks = static_cast<int64_t>(remote_block_ids.size());
+  plan.requested_remote_block_ids = remote_block_ids;
+  plan.requested_local_block_ids = local_block_ids;
+  if (remote_block_ids.empty()) {
+    return plan;
+  }
+
+  // 1. Determine transport order (sorted by remote_block_ids)
+  std::vector<size_t> remote_order(remote_block_ids.size());
+  for (size_t i = 0; i < remote_order.size(); ++i) {
+    remote_order[i] = i;
+  }
+  std::stable_sort(remote_order.begin(), remote_order.end(),
+                   [&](size_t a, size_t b) {
+                     return remote_block_ids[a] < remote_block_ids[b];
+                   });
+
+  plan.producer_remote_block_ids.reserve(remote_order.size());
+  plan.transport_host_block_ids.reserve(remote_order.size());
+  for (size_t i = 0; i < remote_order.size(); ++i) {
+    const size_t original_idx = remote_order[i];
+    plan.producer_remote_block_ids.push_back(remote_block_ids[original_idx]);
+    plan.transport_host_block_ids.push_back(local_host_block_ids[original_idx]);
+  }
+
+  // 2. Determine H2D copy plan (sorted by local_block_ids for opt)
+  std::vector<size_t> local_order(local_block_ids.size());
+  for (size_t i = 0; i < local_order.size(); ++i) {
+    local_order[i] = i;
+  }
+  std::stable_sort(local_order.begin(), local_order.end(),
+                   [&](size_t a, size_t b) {
+                     return local_block_ids[a] < local_block_ids[b];
+                   });
+
+  plan.h2d_local_block_ids.reserve(local_order.size());
+  plan.h2d_host_block_ids.reserve(local_order.size());
+  for (size_t i = 0; i < local_order.size(); ++i) {
+    const size_t original_idx = local_order[i];
+    int64_t local_bid = local_block_ids[original_idx];
+    int64_t host_bid = local_host_block_ids[original_idx];
+    if (plan.h2d_local_block_ids.empty() ||
+        plan.h2d_local_block_ids.back() != local_bid) {
+      plan.h2d_local_block_ids.push_back(local_bid);
+      plan.h2d_host_block_ids.push_back(host_bid);
+    } else {
+      if (plan.h2d_host_block_ids.back() != host_bid) {
+        throw std::invalid_argument(
+            "Duplicate local block IDs must map to the same host block ID");
+      }
+    }
+  }
+
+  plan.h2d_copy = TransferSendSession::BuildCoalescedCopySpec(
+      plan.h2d_host_block_ids, plan.h2d_local_block_ids);
+  plan.host_dst_to_src.clear();
+  return plan;
+}
+
+void TransferReceiveSession::InitFromLoadPlan(
+    const std::string& req_id, CopyPlan load_plan,
+    std::chrono::steady_clock::time_point deadline) {
+  absl::MutexLock lock(mu_);
+  req_id_ = req_id;
+  deadline_ = deadline;
   start_time_ = std::chrono::steady_clock::now();
-  staging_ = std::move(staging_in);
   chip_block_ids_ = load_plan.h2d_local_block_ids;
   total_blocks_ = load_plan.num_blocks;
   num_completed_blocks_ = 0;
@@ -155,6 +373,7 @@ void TransferReceiveSession::InitFromLoadPlan(
         load_plan.h2d_local_block_ids[i];
   }
   h2d_dispatch_futures_.reserve(load_plan.h2d_local_block_ids.size());
+  load_plan_ = std::move(load_plan);
 }
 
 void TransferReceiveSession::ReleaseStagingLocked() {
@@ -331,10 +550,15 @@ bool TransferReceiveSession::RecordPoolH2dResultLocked(
 }
 
 void TransferReceiveSession::ExecutePullRequest(
-    KVCacheManagerWithTransfer& manager, const std::string& remote_endpoint,
-    CopyPlan load_plan) {
+    KVCacheManagerWithTransfer& manager, const std::string& remote_endpoint) {
   std::optional<int> target_node = base_->assigned_numa_node();
-  const std::string session_req_id = req_id();
+  std::string session_req_id;
+  CopyPlan load_plan;
+  {
+    absl::MutexLock lock(mu_);
+    session_req_id = req_id_;
+    load_plan = load_plan_;
+  }
 
   base_->push_pool()->Schedule(
       target_node, [this, &manager, remote_endpoint, session_req_id,

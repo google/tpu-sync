@@ -94,11 +94,9 @@ class TestManager : public KVCacheManagerWithTransfer {
   std::shared_ptr<TransferSendSession> AddSyntheticSend(
       const std::string& req_id, uint64_t uuid, int in_flight) {
     absl::MutexLock lock(mu_);
-    std::optional<StagingAllocation> staging = staging_allocator_->Acquire(1);
-    CHECK(staging.has_value());
-    auto entry = std::make_shared<TransferSendSession>(
-        base_.get(), req_id, uuid, DeadlineFromNow(),
-        std::chrono::steady_clock::now(), *std::move(staging), in_flight);
+    auto entry = *TransferSendSession::Create(
+        base_.get(), staging_allocator_.get(), req_id, uuid, {},
+        DeadlineFromNow(), std::chrono::steady_clock::now(), in_flight);
     send_entries_[uuid] = entry;
     return entry;
   }
@@ -162,11 +160,9 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
                std::optional<std::chrono::steady_clock::time_point> deadline =
                    std::nullopt) {
     absl::MutexLock lock(mu_);
-    std::optional<StagingAllocation> staging = staging_allocator_->Acquire(1);
-    CHECK(staging.has_value());
-    active_recv_entries_[uuid] = std::make_shared<TransferReceiveSession>(
-        base(), uuid, req_id, blocks_per_layer,
-        deadline.value_or(DeadlineFromNow()), *std::move(staging));
+    active_recv_entries_[uuid] = TransferReceiveSession::Create(
+        base(), staging_allocator_.get(), uuid, req_id, blocks_per_layer,
+        deadline.value_or(DeadlineFromNow()), /*acquire_staging=*/true);
   }
 
   absl::Status ReceiveLayer(size_t layer, uint64_t uuid) {

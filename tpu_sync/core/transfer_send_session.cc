@@ -41,19 +41,48 @@
 
 namespace tpu_raiden {
 
+absl::StatusOr<std::shared_ptr<TransferSendSession>>
+TransferSendSession::Create(
+    kv_cache::KVCacheManagerBase* base,
+    StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
+    absl::Span<const int64_t> block_ids,
+    std::chrono::steady_clock::time_point deadline,
+    std::chrono::steady_clock::time_point register_start, int in_flight,
+    bool pull_started) {
+  auto session = std::shared_ptr<TransferSendSession>(new TransferSendSession(
+      base, staging_allocator, std::move(req_id), uuid, deadline,
+      register_start, in_flight, pull_started));
+  std::optional<int64_t> duplicate_block =
+      session->PopulateRegisteredBlocks(block_ids);
+  if (duplicate_block.has_value()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "NotifyForRead rejected duplicate block ", *duplicate_block,
+        " for req_id=", session->req_id(), ", uuid=", uuid));
+  }
+  return session;
+}
+
 TransferSendSession::TransferSendSession(
-    kv_cache::KVCacheManagerBase* base_in, std::string req_id_in,
-    uint64_t uuid_in, std::chrono::steady_clock::time_point deadline_in,
-    std::chrono::steady_clock::time_point register_start_in,
-    StagingAllocation staging_in, int in_flight_in, bool pull_started_in)
-    : base_(base_in),
-      req_id_(std::move(req_id_in)),
-      uuid_(uuid_in),
-      deadline_(deadline_in),
-      register_start_(register_start_in),
-      staging_(std::move(staging_in)),
-      pull_started_(pull_started_in),
-      in_flight_(in_flight_in) {}
+    kv_cache::KVCacheManagerBase* base,
+    StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
+    std::chrono::steady_clock::time_point deadline,
+    std::chrono::steady_clock::time_point register_start, int in_flight,
+    bool pull_started)
+    : base_(base),
+      staging_allocator_(staging_allocator),
+      req_id_(std::move(req_id)),
+      uuid_(uuid),
+      deadline_(deadline),
+      register_start_(register_start),
+      pull_started_(pull_started),
+      in_flight_(in_flight) {
+  if (in_flight > 0 && staging_allocator_ != nullptr) {
+    std::optional<StagingAllocation> acquired = staging_allocator_->Acquire(1);
+    if (acquired.has_value()) {
+      staging_ = *std::move(acquired);
+    }
+  }
+}
 
 std::optional<int64_t> TransferSendSession::PopulateRegisteredBlocks(
     absl::Span<const int64_t> block_ids) {
@@ -185,23 +214,19 @@ bool TransferSendSession::AcquireStagingWithRetry(
     // Staging that can never seat this request fails it now rather than
     // after the deadline: a fixed slot holds max_blocks_ pages, the
     // per-transfer pool holds total_blocks() pages.
-    const bool dynamic_staging =
-        manager.staging_allocator_->dynamic_host_staging();
-    const int64_t capacity = dynamic_staging
-                                 ? base_->host_block_manager()->total_blocks()
-                                 : manager.staging_allocator_->max_blocks();
+    const int64_t capacity = staging_allocator_->capacity();
     if (static_cast<int64_t>(src_block_ids.size()) > capacity) {
       LOG(ERROR) << "StartPush: request " << req_id_ << " needs "
                  << src_block_ids.size() << " blocks but "
-                 << (dynamic_staging ? "the host staging pool holds "
-                                     : "a staging slot holds ")
+                 << (staging_allocator_->dynamic_host_staging()
+                         ? "the host staging pool holds "
+                         : "a staging slot holds ")
                  << capacity;
       FinishSend(/*has_failed=*/true);
       return false;
     }
     std::optional<StagingAllocation> acquired =
-        manager.staging_allocator_->Acquire(
-            static_cast<int64_t>(src_block_ids.size()));
+        staging_allocator_->Acquire(static_cast<int64_t>(src_block_ids.size()));
     if (acquired.has_value()) {
       absl::Span<const int> blocks = acquired->block_ids();
       host_block_ids->clear();

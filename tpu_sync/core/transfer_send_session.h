@@ -46,19 +46,15 @@ namespace tpu_raiden {
 // a leaf lock and is never held across callbacks or manager calls.
 class TransferSendSession {
  public:
-  TransferSendSession(kv_cache::KVCacheManagerBase* base_in,
-                      std::string req_id_in, uint64_t uuid_in,
-                      std::chrono::steady_clock::time_point deadline_in,
-                      std::chrono::steady_clock::time_point register_start_in,
-                      StagingAllocation staging_in = nullptr,
-                      int in_flight_in = 0, bool pull_started_in = false);
-  ~TransferSendSession() { ReleaseSlot(); }
+  static absl::StatusOr<std::shared_ptr<TransferSendSession>> Create(
+      kv_cache::KVCacheManagerBase* base,
+      StagingBlockAllocator* staging_allocator, std::string req_id,
+      uint64_t uuid, absl::Span<const int64_t> block_ids,
+      std::chrono::steady_clock::time_point deadline,
+      std::chrono::steady_clock::time_point register_start, int in_flight = 0,
+      bool pull_started = false);
 
-  // Populates |registered_block_ids_| and |registered_block_set_| from
-  // |block_ids|. Returns the first duplicate block ID if any duplicate is
-  // present, or std::nullopt when all IDs are unique.
-  std::optional<int64_t> PopulateRegisteredBlocks(
-      absl::Span<const int64_t> block_ids);
+  ~TransferSendSession() { ReleaseSlot(); }
 
   // Validates deadline, requested blocks, and single-pull invariant, then marks
   // |pull_started_| true. Throws std::runtime_error or std::invalid_argument on
@@ -130,6 +126,18 @@ class TransferSendSession {
   }
 
  private:
+  TransferSendSession(kv_cache::KVCacheManagerBase* base,
+                      StagingBlockAllocator* staging_allocator,
+                      std::string req_id, uint64_t uuid,
+                      std::chrono::steady_clock::time_point deadline,
+                      std::chrono::steady_clock::time_point register_start,
+                      int in_flight = 0, bool pull_started = false);
+
+  // Populates |registered_block_ids_| and |registered_block_set_| from
+  // |block_ids|. Returns the first duplicate block ID if any duplicate is
+  // present, or std::nullopt when all IDs are unique.
+  std::optional<int64_t> PopulateRegisteredBlocks(
+      absl::Span<const int64_t> block_ids);
   void ValidateRequestedBlocksLocked(
       const std::vector<int64_t>& requested_block_ids) const
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -144,6 +152,7 @@ class TransferSendSession {
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
+  StagingBlockAllocator* const staging_allocator_ = nullptr;
   const std::string req_id_;
   const uint64_t uuid_ = 0;
   const std::chrono::steady_clock::time_point deadline_;

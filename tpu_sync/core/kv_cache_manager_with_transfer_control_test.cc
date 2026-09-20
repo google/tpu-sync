@@ -120,11 +120,10 @@ class TestManager : public KVCacheManagerWithTransfer {
   void MarkPullStarted(uint64_t uuid) {
     absl::MutexLock lock(mu_);
     auto old = send_entries_.at(uuid);
-    auto entry = std::make_shared<TransferSendSession>(
-        base_.get(), old->req_id(), uuid, old->deadline(),
-        old->register_start(), /*slot_in=*/nullptr, /*in_flight_in=*/0,
-        /*pull_started_in=*/true);
-    entry->PopulateRegisteredBlocks({0});
+    auto entry = *TransferSendSession::Create(
+        base_.get(), staging_allocator_.get(), old->req_id(), uuid, {0},
+        old->deadline(), old->register_start(), /*in_flight=*/0,
+        /*pull_started=*/true);
     send_entries_[uuid] = entry;
   }
 };

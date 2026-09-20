@@ -51,42 +51,38 @@ namespace tpu_raiden {
 // Thread-safe: all mutable session state is synchronized via internal |mu_|.
 class TransferReceiveSession {
  public:
-  explicit TransferReceiveSession(kv_cache::KVCacheManagerBase* base_in,
-                                  uint64_t uuid_in = 0)
-      : base_(base_in), uuid_(uuid_in) {}
-  TransferReceiveSession(kv_cache::KVCacheManagerBase* base_in,
-                         uint64_t uuid_in, std::string req_id_in,
-                         int32_t total_blocks_in,
-                         std::chrono::steady_clock::time_point deadline_in,
-                         StagingAllocation staging_in = nullptr)
-      : base_(base_in),
-        uuid_(uuid_in),
-        req_id_(std::move(req_id_in)),
-        staging_(std::move(staging_in)),
-        total_blocks_(total_blocks_in),
-        deadline_(deadline_in),
-        start_time_(std::chrono::steady_clock::now()) {}
-  ~TransferReceiveSession() { ReleaseStaging(); }
+  static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
+      kv_cache::KVCacheManagerBase* base,
+      StagingBlockAllocator* staging_allocator, uint64_t uuid,
+      const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
+      const std::vector<int64_t>& local_block_ids,
+      const std::optional<std::vector<int64_t>>& local_host_block_ids,
+      std::chrono::steady_clock::time_point deadline);
 
-  // Initializes this receive session for an HBM destination active plan.
-  void InitFromActivePlan(
-      const ::tpu_sync::rpc::StartTransferRequest& request,
-      const absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>&
-          host_block_of,
-      StagingAllocation staging_in, uint64_t generation,
-      std::chrono::steady_clock::time_point deadline_in,
-      const CopySpec& coalesced_h2d_copy);
+  static std::shared_ptr<TransferReceiveSession> Create(
+      kv_cache::KVCacheManagerBase* base,
+      StagingBlockAllocator* staging_allocator, uint64_t uuid,
+      std::string req_id, int32_t total_blocks,
+      std::chrono::steady_clock::time_point deadline,
+      bool acquire_staging = false);
 
-  // Initializes this receive session for a multi-tag pool-reshard plan.
-  void InitFromPoolReshardPlan(
+  static absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
+  CreateFromActivePlan(
+      kv_cache::KVCacheManagerBase* base,
+      StagingBlockAllocator* staging_allocator, uint64_t uuid,
+      const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
+      std::chrono::steady_clock::time_point deadline,
+      absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
+          host_block_of);
+
+  static std::shared_ptr<TransferReceiveSession> CreateFromPoolReshardPlan(
+      kv_cache::KVCacheManagerBase* base,
+      StagingBlockAllocator* staging_allocator,
       const ::tpu_sync::rpc::StartTransferRequest& plan,
       absl::Span<const int64_t> chip_blocks,
-      std::chrono::steady_clock::time_point deadline_in);
+      std::chrono::steady_clock::time_point deadline);
 
-  // Initializes this receive session for a consumer StartRead load plan.
-  void InitFromLoadPlan(const std::string& req_id_in, const CopyPlan& load_plan,
-                        std::chrono::steady_clock::time_point deadline_in,
-                        StagingAllocation staging_in = nullptr);
+  ~TransferReceiveSession() { ReleaseStaging(); }
 
   // Decides a receive's outcome; marks it done and releases its staging
   // resources once nothing issued for it is still running.
@@ -115,8 +111,7 @@ class TransferReceiveSession {
   // Schedules the consumer pull handshake on |base_->push_pool()| and updates
   // session state upon completion or error.
   void ExecutePullRequest(KVCacheManagerWithTransfer& manager,
-                          const std::string& remote_endpoint,
-                          CopyPlan load_plan);
+                          const std::string& remote_endpoint);
 
   // Handles block completion notifications for this receive session.
   absl::Status OnBlocksReceived(KVCacheManagerWithTransfer& manager,
@@ -159,6 +154,65 @@ class TransferReceiveSession {
  private:
   friend struct PoolReshardRecvTestPeer;
 
+  explicit TransferReceiveSession(
+      kv_cache::KVCacheManagerBase* base,
+      StagingBlockAllocator* staging_allocator = nullptr, uint64_t uuid = 0)
+      : base_(base), staging_allocator_(staging_allocator), uuid_(uuid) {}
+  TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
+                         StagingBlockAllocator* staging_allocator,
+                         uint64_t uuid, std::string req_id,
+                         int32_t total_blocks,
+                         std::chrono::steady_clock::time_point deadline,
+                         bool acquire_staging = false)
+      : base_(base),
+        staging_allocator_(staging_allocator),
+        uuid_(uuid),
+        req_id_(std::move(req_id)),
+        total_blocks_(total_blocks),
+        deadline_(deadline),
+        start_time_(std::chrono::steady_clock::now()) {
+    if (acquire_staging && staging_allocator_ != nullptr) {
+      std::optional<StagingAllocation> acquired =
+          staging_allocator_->Acquire(1);
+      if (acquired.has_value()) {
+        staging_ = *std::move(acquired);
+      }
+    }
+  }
+
+  // Initializes this receive session for an HBM destination active plan,
+  // allocating dynamic host staging via |staging_allocator_| when enabled.
+  absl::Status InitFromActivePlan(
+      const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
+      std::chrono::steady_clock::time_point deadline,
+      absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
+          host_block_of);
+
+  // Initializes this receive session for a multi-tag pool-reshard plan.
+  void InitFromPoolReshardPlan(
+      const ::tpu_sync::rpc::StartTransferRequest& plan,
+      absl::Span<const int64_t> chip_blocks,
+      std::chrono::steady_clock::time_point deadline);
+
+  // Allocates host staging for a consumer StartRead load plan via
+  // |staging_allocator_| (unless |local_host_block_ids| is explicitly provided)
+  // and populates |*host_block_ids|. Returns false if staging capacity is
+  // unavailable.
+  bool AllocateStagingForLoad(
+      const std::string& req_id, const std::vector<int64_t>& local_block_ids,
+      const std::optional<std::vector<int64_t>>& local_host_block_ids,
+      std::vector<int64_t>* host_block_ids);
+
+  // Builds the transport and H2D copy plan for a consumer StartRead request.
+  static CopyPlan BuildLoadCopyPlan(
+      const std::vector<int64_t>& remote_block_ids,
+      const std::vector<int64_t>& local_block_ids,
+      const std::vector<int64_t>& local_host_block_ids);
+
+  // Initializes this receive session for a consumer StartRead load plan.
+  void InitFromLoadPlan(const std::string& req_id, CopyPlan load_plan,
+                        std::chrono::steady_clock::time_point deadline);
+
   using H2dIssueFuture =
       std::shared_future<absl::StatusOr<raiden::PjRtCopyFuture>>;
 
@@ -191,9 +245,11 @@ class TransferReceiveSession {
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* base_ = nullptr;
+  StagingBlockAllocator* staging_allocator_ = nullptr;
   uint64_t uuid_ = 0;
   std::string req_id_ ABSL_GUARDED_BY(mu_);
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
+  CopyPlan load_plan_ ABSL_GUARDED_BY(mu_);
   CopySpec h2d_copy_ ABSL_GUARDED_BY(mu_);
   std::vector<int64_t> chip_block_ids_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_map<kv_cache::HostBlockId, kv_cache::DeviceBlockId>

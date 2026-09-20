@@ -190,14 +190,6 @@ class StagingBlockAllocator {
   StagingBlockAllocator(const StagingBlockAllocator&) = delete;
   StagingBlockAllocator& operator=(const StagingBlockAllocator&) = delete;
 
-  // Configures host staging slots in |base_| and pre-allocates |num_slots_|
-  // fixed slots of |max_blocks_| locked host blocks when
-  // !|dynamic_host_staging_|.
-  absl::Status Initialize();
-
-  // Unlocks all pre-allocated slot blocks in |base_->host_block_manager()|.
-  void Shutdown();
-
   // Acquires staging for |num_blocks| blocks: a fixed slot when
   // !dynamic_host_staging_, or |num_blocks| locked dynamic host blocks when
   // dynamic_host_staging_ is enabled. Returns std::nullopt if staging
@@ -212,20 +204,23 @@ class StagingBlockAllocator {
   absl::Span<const int> slot_blocks(int64_t slot_idx) const;
   int64_t num_slots() const { return num_slots_; }
   int64_t max_blocks() const { return max_blocks_; }
+  int64_t capacity() const;
   bool dynamic_host_staging() const { return dynamic_host_staging_; }
 
  private:
   StagingBlockAllocator(kv_cache::KVCacheManagerBase* base, int64_t num_slots,
                         int64_t max_blocks, bool dynamic_host_staging);
-  absl::Status InitializeSlotPool(int64_t num_slots);
+  absl::Status Initialize();
+  void Shutdown();
+  absl::Status InitializeSlotPool();
   void ReleaseSlot(int64_t slot_idx);
   void ReleaseDynamicBlocks(absl::Span<const int> blocks);
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* base_ = nullptr;
-  int64_t num_slots_ = 0;
-  int64_t max_blocks_ = 0;
-  bool dynamic_host_staging_ = false;
+  const int64_t num_slots_ = 0;
+  const int64_t max_blocks_ = 0;
+  const bool dynamic_host_staging_ = false;
   std::deque<int64_t> free_slots_ ABSL_GUARDED_BY(mu_);
   std::vector<std::vector<int>> slot_blocks_;
 };

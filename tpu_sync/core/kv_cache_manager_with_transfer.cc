@@ -179,76 +179,6 @@ static kv_cache::KVCacheCopySpec ToKVCacheCopySpecImpl(const CopySpec& spec) {
           .sizes = spec.sizes};
 }
 
-static CopyPlan BuildLoadCopyPlan(
-    const std::vector<int64_t>& remote_block_ids,
-    const std::vector<int64_t>& local_block_ids,
-    const std::vector<int64_t>& local_host_block_ids) {
-  if (remote_block_ids.size() != local_block_ids.size() ||
-      local_block_ids.size() != local_host_block_ids.size()) {
-    throw std::invalid_argument(
-        "remote_block_ids, local_block_ids, and local_host_block_ids must have "
-        "same length");
-  }
-  CopyPlan plan;
-  plan.num_blocks = static_cast<int64_t>(remote_block_ids.size());
-  plan.requested_remote_block_ids = remote_block_ids;
-  plan.requested_local_block_ids = local_block_ids;
-  if (remote_block_ids.empty()) {
-    return plan;
-  }
-
-  // 1. Determine transport order (sorted by remote_block_ids)
-  std::vector<size_t> remote_order(remote_block_ids.size());
-  for (size_t i = 0; i < remote_order.size(); ++i) {
-    remote_order[i] = i;
-  }
-  std::stable_sort(remote_order.begin(), remote_order.end(),
-                   [&](size_t a, size_t b) {
-                     return remote_block_ids[a] < remote_block_ids[b];
-                   });
-
-  plan.producer_remote_block_ids.reserve(remote_order.size());
-  plan.transport_host_block_ids.reserve(remote_order.size());
-  for (size_t i = 0; i < remote_order.size(); ++i) {
-    const size_t original_idx = remote_order[i];
-    plan.producer_remote_block_ids.push_back(remote_block_ids[original_idx]);
-    plan.transport_host_block_ids.push_back(local_host_block_ids[original_idx]);
-  }
-
-  // 2. Determine H2D copy plan (sorted by local_block_ids for opt)
-  std::vector<size_t> local_order(local_block_ids.size());
-  for (size_t i = 0; i < local_order.size(); ++i) {
-    local_order[i] = i;
-  }
-  std::stable_sort(local_order.begin(), local_order.end(),
-                   [&](size_t a, size_t b) {
-                     return local_block_ids[a] < local_block_ids[b];
-                   });
-
-  plan.h2d_local_block_ids.reserve(local_order.size());
-  plan.h2d_host_block_ids.reserve(local_order.size());
-  for (size_t i = 0; i < local_order.size(); ++i) {
-    const size_t original_idx = local_order[i];
-    int64_t local_bid = local_block_ids[original_idx];
-    int64_t host_bid = local_host_block_ids[original_idx];
-    if (plan.h2d_local_block_ids.empty() ||
-        plan.h2d_local_block_ids.back() != local_bid) {
-      plan.h2d_local_block_ids.push_back(local_bid);
-      plan.h2d_host_block_ids.push_back(host_bid);
-    } else {
-      if (plan.h2d_host_block_ids.back() != host_bid) {
-        throw std::invalid_argument(
-            "Duplicate local block IDs must map to the same host block ID");
-      }
-    }
-  }
-
-  plan.h2d_copy = TransferSendSession::BuildCoalescedCopySpec(
-      plan.h2d_host_block_ids, plan.h2d_local_block_ids);
-  plan.host_dst_to_src.clear();  // No host reordering needed!
-  return plan;
-}
-
 double DurationMs(std::chrono::steady_clock::time_point start,
                   std::chrono::steady_clock::time_point end) {
   return std::chrono::duration<double, std::milli>(end - start).count();
@@ -476,20 +406,18 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
     return 0;
   }
 
-  auto entry = std::make_shared<TransferSendSession>(
-      base_.get(), req_id, uuid, deadline.value_or(DeadlineFromNow()),
-      register_start);
-  std::optional<int64_t> duplicate_block =
-      entry->PopulateRegisteredBlocks(block_ids);
+  absl::StatusOr<std::shared_ptr<TransferSendSession>> entry_or =
+      TransferSendSession::Create(
+          base_.get(), staging_allocator_.get(), req_id, uuid, block_ids,
+          deadline.value_or(DeadlineFromNow()), register_start);
+  if (!entry_or.ok()) {
+    LOG(ERROR) << entry_or.status().message();
+    return 0;
+  }
+  std::shared_ptr<TransferSendSession> entry = *std::move(entry_or);
 
   {
     absl::MutexLock lock(mu_);
-    if (duplicate_block.has_value()) {
-      LOG(ERROR) << "NotifyForRead rejected duplicate block "
-                 << *duplicate_block << " for req_id=" << req_id
-                 << ", uuid=" << uuid;
-      return 0;
-    }
     if (pending_acks_.erase(uuid) > 0) {
       done_sending_.insert(req_id);
       return 0;
@@ -546,9 +474,36 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
   // device block space. Pool-addressed plans keep their own addressing.
   absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>
       host_block_of;
-  StagingAllocation plan_staging;
-  if (staging_allocator_->dynamic_host_staging() &&
-      request.pool_groups_size() == 0) {
+  // Staging ownership is settled before the plan is published. An HBM
+  // receiver's blocks belong to its receive entry and return when the
+  // upload settles; a sender's blocks, and a host-memory receiver's,
+  // belong to the plan and return when it is unregistered.
+  const bool hbm_receiver =
+      !is_sender && request.dst_mem_type() == ::tpu_sync::rpc::MEMORY_TYPE_HBM;
+  // 2. If we are the receiver and the destination memory type is HBM,
+  //    populate active_recv_entries_ to enable automatic H2D copy!
+  if (hbm_receiver) {
+    absl::MutexLock lock(mu_);
+    ABSL_ASSIGN_OR_RETURN(
+        std::shared_ptr<ReceiveSession> recv_entry,
+        ReceiveSession::CreateFromActivePlan(
+            base_.get(), staging_allocator_.get(), uuid, request, generation,
+            DeadlineFromNow(), &host_block_of));
+
+    if (recv_entry->total_blocks() > 0) {
+      absl::Status inserted = EmplaceRecvEntryLocked(uuid, recv_entry);
+      if (!inserted.ok()) {
+        recv_entry->ReleaseStaging();
+        return inserted;
+      }
+      LOG(INFO) << "RegisterActivePlan (Receiver): Populated "
+                   "active_recv_entries_ for UUID "
+                << uuid << " with " << recv_entry->total_blocks()
+                << " total physical block-pushes (including duplicates across "
+                   "sources) for automatic H2D.";
+    }
+  } else if (staging_allocator_->dynamic_host_staging() &&
+             request.pool_groups_size() == 0) {
     std::vector<int64_t> device_blocks;
     absl::flat_hash_set<int64_t> seen;
     for (const auto& [src_shard, schedule] : request.shard_push_schedules()) {
@@ -567,65 +522,13 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
             "cannot stage ", device_blocks.size(), " blocks for plan ", uuid,
             ": ", allocated.status().message()));
       }
-      plan_staging = *std::move(allocated);
+      StagingAllocation plan_staging = *std::move(allocated);
       absl::Span<const int> plan_blocks = plan_staging.block_ids();
       for (size_t i = 0; i < device_blocks.size(); ++i) {
         host_block_of[device_blocks[i]] = plan_blocks[i];
       }
+      plan_staging_[uuid] = std::move(plan_staging);
     }
-  }
-
-  // Staging ownership is settled before the plan is published. An HBM
-  // receiver's blocks belong to its receive entry and return when the
-  // upload settles; a sender's blocks, and a host-memory receiver's,
-  // belong to the plan and return when it is unregistered.
-  const bool hbm_receiver =
-      !is_sender && request.dst_mem_type() == ::tpu_sync::rpc::MEMORY_TYPE_HBM;
-  // 2. If we are the receiver and the destination memory type is HBM,
-  //    populate active_recv_entries_ to enable automatic H2D copy!
-  if (hbm_receiver) {
-    absl::MutexLock lock(mu_);
-    absl::flat_hash_set<int> unique_dst_blocks;
-    for (const auto& [src_replica_idx, schedule] :
-         request.shard_push_schedules()) {
-      for (const auto& push_entry : schedule.entries()) {
-        unique_dst_blocks.insert(push_entry.dst_block_id());
-      }
-    }
-    std::vector<int64_t> h2d_local_block_ids(unique_dst_blocks.begin(),
-                                             unique_dst_blocks.end());
-    std::vector<int64_t> h2d_host_block_ids;
-    h2d_host_block_ids.reserve(h2d_local_block_ids.size());
-    for (int64_t dst : h2d_local_block_ids) {
-      auto hb = host_block_of.find(dst);
-      h2d_host_block_ids.push_back(hb == host_block_of.end() ? dst
-                                                             : hb->second);
-    }
-    auto recv_entry = std::make_shared<ReceiveSession>(base_.get(), uuid);
-    recv_entry->InitFromActivePlan(
-        request, host_block_of, std::move(plan_staging), generation,
-        DeadlineFromNow(),
-        TransferSendSession::BuildCoalescedCopySpec(h2d_host_block_ids,
-                                                    h2d_local_block_ids));
-
-    if (recv_entry->total_blocks() == 0) {
-      recv_entry->ReleaseStaging();
-    }
-    if (recv_entry->total_blocks() > 0) {
-      absl::Status inserted = EmplaceRecvEntryLocked(uuid, recv_entry);
-      if (!inserted.ok()) {
-        recv_entry->ReleaseStaging();
-        return inserted;
-      }
-      LOG(INFO) << "RegisterActivePlan (Receiver): Populated "
-                   "active_recv_entries_ for UUID "
-                << uuid << " with " << recv_entry->total_blocks()
-                << " total physical block-pushes (including duplicates across "
-                   "sources) for automatic H2D.";
-    }
-  } else if (!plan_staging.empty()) {
-    absl::MutexLock lock(mu_);
-    plan_staging_[uuid] = std::move(plan_staging);
   }
 
   // Publish the plan last: pushes resolve through it, so everything they
@@ -649,8 +552,8 @@ absl::Status KVCacheManagerWithTransfer::RegisterRecv(
     uint64_t uuid, const std::string& req_id, int64_t expected_block_count,
     std::optional<std::chrono::steady_clock::time_point> deadline) {
   absl::MutexLock lock(mu_);
-  auto recv_entry = std::make_shared<ReceiveSession>(
-      base_.get(), uuid, req_id, expected_block_count,
+  std::shared_ptr<ReceiveSession> recv_entry = ReceiveSession::Create(
+      base_.get(), staging_allocator_.get(), uuid, req_id, expected_block_count,
       deadline.value_or(DeadlineFromNow()));
   // host_to_chip is left empty -> defaults to 1-to-1 mapping in
   // OnBlocksReceived
@@ -1231,8 +1134,10 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
     base_->ReleasePoolStagingLeases(plan.uuid());
     return register_status;
   }
-  auto recv_entry = std::make_shared<ReceiveSession>(base_.get(), plan.uuid());
-  recv_entry->InitFromPoolReshardPlan(plan, chip_block_ids, DeadlineFromNow());
+  std::shared_ptr<ReceiveSession> recv_entry =
+      ReceiveSession::CreateFromPoolReshardPlan(
+          base_.get(), staging_allocator_.get(), plan, chip_block_ids,
+          DeadlineFromNow());
   {
     absl::MutexLock lock(mu_);
     active_recv_entries_[plan.uuid()] = std::move(recv_entry);
@@ -1398,8 +1303,7 @@ void KVCacheManagerWithTransfer::StartRead(
   // block id exceeds num_host_blocks. If the caller didn't supply explicit host
   // indices, borrow a staging slot and stage into its reserved host blocks
   // (slot.block_ids -- the real, possibly non-contiguous host blocks).
-  CopyPlan load_plan;
-  auto entry = std::make_shared<ReceiveSession>(base_.get(), uuid);
+  std::shared_ptr<ReceiveSession> entry;
   {
     absl::MutexLock lock(mu_);
     auto incumbent = active_recv_entries_.find(uuid);
@@ -1420,51 +1324,16 @@ void KVCacheManagerWithTransfer::StartRead(
       }
     }
 
-    StagingAllocation staging;
-    std::vector<int64_t> host_block_ids;
-    if (local_host_block_ids.has_value()) {
-      host_block_ids = *local_host_block_ids;
-    } else if (!local_block_ids.empty()) {
-      absl::flat_hash_set<int64_t> unique_local_bids(local_block_ids.begin(),
-                                                     local_block_ids.end());
-      std::optional<StagingAllocation> acquired = staging_allocator_->Acquire(
-          static_cast<int64_t>(unique_local_bids.size()));
-      if (!acquired.has_value()) {
-        // Request larger than the staging pool can seat: surface as a recv
-        // failure (the connector can recompute) rather than throwing.
-        LOG(ERROR) << "StartRead: cannot stage " << unique_local_bids.size()
-                   << " blocks for req_id=" << req_id
-                   << " (dynamic=" << staging_allocator_->dynamic_host_staging()
-                   << ", free_host_blocks="
-                   << base_->host_block_manager()->num_free_blocks()
-                   << ", free_slots=" << staging_allocator_->num_free_slots()
-                   << ", max_blocks=" << staging_allocator_->max_blocks()
-                   << ")";
-        failed_recving_.insert(req_id);
-        return;
-      }
-      staging = *std::move(acquired);
-      absl::Span<const int> staged_blocks = staging.block_ids();
-      absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>
-          local_to_host;
-      size_t host_block_idx = 0;
-      host_block_ids.reserve(local_block_ids.size());
-      for (size_t k = 0; k < local_block_ids.size(); ++k) {
-        int64_t local_bid = local_block_ids[k];
-        auto it = local_to_host.find(local_bid);
-        if (it == local_to_host.end()) {
-          int64_t host_bid = staged_blocks[host_block_idx++];
-          local_to_host[local_bid] = host_bid;
-          host_block_ids.push_back(host_bid);
-        } else {
-          host_block_ids.push_back(it->second);
-        }
-      }
+    absl::StatusOr<std::shared_ptr<ReceiveSession>> created =
+        ReceiveSession::Create(base_.get(), staging_allocator_.get(), uuid,
+                               req_id, remote_block_ids, local_block_ids,
+                               local_host_block_ids, deadline);
+    if (!created.ok()) {
+      failed_recving_.insert(req_id);
+      return;
     }
-    load_plan =
-        BuildLoadCopyPlan(remote_block_ids, local_block_ids, host_block_ids);
+    entry = *std::move(created);
 
-    entry->InitFromLoadPlan(req_id, load_plan, deadline, std::move(staging));
     absl::Status inserted = EmplaceRecvEntryLocked(uuid, entry);
     if (!inserted.ok()) {
       entry->ReleaseStaging();
@@ -1475,20 +1344,20 @@ void KVCacheManagerWithTransfer::StartRead(
     }
   }
 
+  const int64_t num_blocks = entry->total_blocks();
   if (metrics_collector_) {
-    uint64_t total_bytes = static_cast<uint64_t>(load_plan.num_blocks) *
+    uint64_t total_bytes = static_cast<uint64_t>(num_blocks) *
                            base_->num_layers() * base_->num_shards() *
                            base_->slice_byte_size();
-    metrics_collector_->RecordStart(uuid, req_id, load_plan.num_blocks,
-                                    total_bytes);
+    metrics_collector_->RecordStart(uuid, req_id, num_blocks, total_bytes);
   }
 
-  if (load_plan.num_blocks == 0) {
+  if (num_blocks == 0) {
     entry->FinishRecv(/*has_failed=*/false);
     return;
   }
 
-  entry->ExecutePullRequest(*this, remote_endpoint, std::move(load_plan));
+  entry->ExecutePullRequest(*this, remote_endpoint);
 }
 
 std::tuple<std::vector<std::string>, std::vector<std::string>,
@@ -1784,26 +1653,25 @@ absl::Status StagingBlockAllocator::Initialize() {
   }
   ABSL_RETURN_IF_ERROR(
       base_->ConfigureHostStagingSlots(num_slots_, max_blocks_));
-  return InitializeSlotPool(num_slots_);
+  return InitializeSlotPool();
 }
 
-absl::Status StagingBlockAllocator::InitializeSlotPool(int64_t num_slots) {
+absl::Status StagingBlockAllocator::InitializeSlotPool() {
   absl::MutexLock lock(mu_);
-  num_slots_ = num_slots;
   free_slots_.clear();
   slot_blocks_.clear();
-  if (dynamic_host_staging_ || num_slots <= 0) {
+  if (dynamic_host_staging_ || num_slots_ <= 0) {
     return absl::OkStatus();
   }
   if (base_->host_block_manager()->num_free_blocks() <
-      num_slots * max_blocks_) {
+      num_slots_ * max_blocks_) {
     return absl::FailedPreconditionError(absl::StrCat(
         "Insufficient free host blocks to initialize slot pool. Required: ",
-        num_slots * max_blocks_,
+        num_slots_ * max_blocks_,
         ", Available: ", base_->host_block_manager()->num_free_blocks()));
   }
-  slot_blocks_.reserve(num_slots);
-  for (int64_t i = 0; i < num_slots; ++i) {
+  slot_blocks_.reserve(num_slots_);
+  for (int64_t i = 0; i < num_slots_; ++i) {
     ABSL_ASSIGN_OR_RETURN(std::vector<int> allocated_ids,
                           base_->host_block_manager()->Allocate(max_blocks_,
                                                                 /*lock=*/true));
@@ -1876,6 +1744,15 @@ size_t StagingBlockAllocator::num_free_slots() const {
 absl::Span<const int> StagingBlockAllocator::slot_blocks(
     int64_t slot_idx) const {
   return slot_blocks_[slot_idx];
+}
+
+int64_t StagingBlockAllocator::capacity() const {
+  if (dynamic_host_staging_) {
+    return (base_ != nullptr && base_->host_block_manager() != nullptr)
+               ? base_->host_block_manager()->total_blocks()
+               : 0;
+  }
+  return max_blocks_;
 }
 
 void StagingBlockAllocator::ReleaseSlot(int64_t slot_idx) {
@@ -2166,11 +2043,8 @@ absl::Status KVCacheManagerWithTransfer::HandleAck(uint64_t uuid) {
 }
 
 uint64_t KVCacheManagerWithTransfer::MaxPullStreamBlocks() const {
-  const int64_t block_capacity =
-      staging_allocator_->dynamic_host_staging()
-          ? base_->host_block_manager()->total_blocks()
-          : staging_allocator_->max_blocks();
-  return static_cast<uint64_t>(std::max<int64_t>(0, block_capacity));
+  return static_cast<uint64_t>(
+      std::max<int64_t>(0, staging_allocator_->capacity()));
 }
 
 absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {

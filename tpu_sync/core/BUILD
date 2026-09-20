@@ -552,11 +552,13 @@ cc_library(
     name = "kv_cache_manager_with_transfer",
     srcs = [
         "kv_cache_manager_with_transfer.cc",
+        "reshard_send_session.cc",
         "transfer_receive_session.cc",
         "transfer_send_session.cc",
     ],
     hdrs = [
         "kv_cache_manager_with_transfer.h",
+        "reshard_send_session.h",
         "transfer_receive_session.h",
         "transfer_send_session.h",
     ],
@@ -580,6 +582,7 @@ cc_library(
         "//tpu_sync/common:trace",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
         "//tpu_sync/kv_cache:pool_layout",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport:block_transport",

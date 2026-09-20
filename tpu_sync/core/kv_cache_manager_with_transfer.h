@@ -58,6 +58,7 @@ class StartTransferRequest;
 namespace tpu_raiden {
 
 class MetricsCollector;
+class ReshardSendSession;
 class TransferSendSession;
 class TransferReceiveSession;
 
@@ -148,8 +149,10 @@ class KVCacheManagerWithTransfer {
  public:
   using SendEntry = TransferSendSession;
   using RecvEntry = TransferReceiveSession;
+  using PoolReshardSendEntry = ReshardSendSession;
   friend class TransferSendSession;
   friend class TransferReceiveSession;
+  friend class ReshardSendSession;
 
   struct Slot {
     int64_t slot_idx = -1;
@@ -401,18 +404,7 @@ class KVCacheManagerWithTransfer {
   absl::flat_hash_map<uint64_t, std::shared_ptr<RecvEntry>>
       active_recv_entries_;
 
-  struct PoolReshardSendEntry {
-    std::string req_id;
-    uint64_t uuid = 0;
-    int parallelism = 8;
-    int remaining_pool_peer_pushes = 0;
-    bool failed = false;
-    bool finalizing = false;
-    std::chrono::steady_clock::time_point deadline;
-    ::tpu_sync::rpc::StartTransferRequest plan;
-    std::vector<raiden::PjRtCopyFuture> d2h_futures;
-  };
-  absl::flat_hash_map<uint64_t, std::shared_ptr<PoolReshardSendEntry>>
+  absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardSendSession>>
       active_pool_reshard_sends_;
 
   absl::Status ValidatePoolReshardPlan(
@@ -421,8 +413,6 @@ class KVCacheManagerWithTransfer {
   // Receiver-only byte accounting over the plan's group structure.
   absl::Status ValidatePoolReshardReceiverCoverage(
       const ::tpu_sync::rpc::StartTransferRequest& plan);
-  void StartPoolReshardPush(uint64_t uuid, size_t pool_idx);
-  void FinishPoolReshardSend(uint64_t uuid, const absl::Status& status);
 
   std::chrono::steady_clock::time_point DeadlineFromNow() const;
 

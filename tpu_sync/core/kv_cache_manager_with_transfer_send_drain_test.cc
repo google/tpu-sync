@@ -43,6 +43,7 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/transfer_receive_session.h"
 #include "tpu_sync/core/transfer_send_session.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 
 namespace tpu_raiden {
 namespace {
@@ -103,7 +104,8 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   void Decide(const std::shared_ptr<TransferSendSession>& session,
               bool failed) {
-    session->FinishSend(failed);
+    session->Finish(failed ? absl::InternalError("send failed")
+                           : absl::OkStatus());
   }
 
   void End(const std::shared_ptr<TransferSendSession>& session) {
@@ -113,7 +115,7 @@ class TestManager : public KVCacheManagerWithTransfer {
   bool has_send(uint64_t uuid) {
     absl::MutexLock lock(mu_);
     auto it = send_sessions_.find(uuid);
-    return it != send_sessions_.end() && !it->second->done();
+    return it != send_sessions_.end() && !it->second->Done();
   }
 
  private:
@@ -189,7 +191,7 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   bool has_recv(uint64_t uuid) {
     absl::MutexLock lock(mu_);
     auto it = active_recv_sessions_.find(uuid);
-    return it != active_recv_sessions_.end() && !it->second->done();
+    return it != active_recv_sessions_.end() && !it->second->Done();
   }
 
   void BlockH2dDispatch() { block_dispatch_.store(true); }

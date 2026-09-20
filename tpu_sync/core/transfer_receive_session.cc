@@ -14,6 +14,7 @@
 
 #include "tpu_sync/core/transfer_receive_session.h"
 
+#include <algorithm>
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
@@ -36,6 +37,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/metrics_collector.h"  // IWYU pragma: keep
@@ -353,10 +355,10 @@ void TransferReceiveSession::ReleaseStaging() {
   ReleaseStagingLocked();
 }
 
-void TransferReceiveSession::FinishRecvLocked(bool has_failed,
-                                              bool unregister_on_settle) {
-  if (unregister_on_settle) unregister_on_settle_ = true;
-  if (has_failed) failed_ = true;
+void TransferReceiveSession::FinishLocked(const absl::Status& status) {
+  if (!status.ok() && status_.ok()) {
+    status_ = status;
+  }
   if (draining_) return;
   draining_ = true;
   if (in_flight_ == 0 && !done_) {
@@ -365,10 +367,15 @@ void TransferReceiveSession::FinishRecvLocked(bool has_failed,
   }
 }
 
-void TransferReceiveSession::FinishRecv(bool has_failed,
-                                        bool unregister_on_settle) {
+void TransferReceiveSession::Finish(const absl::Status& status) {
   absl::MutexLock lock(mu_);
-  FinishRecvLocked(has_failed, unregister_on_settle);
+  FinishLocked(status);
+}
+
+absl::Status TransferReceiveSession::AwaitForDone() {
+  absl::MutexLock lock(mu_);
+  mu_.Await(absl::Condition(&done_));
+  return status_;
 }
 
 void TransferReceiveSession::EndRecvOpLocked() {
@@ -422,11 +429,6 @@ bool TransferReceiveSession::IsReadyToComplete() const {
          AllH2dDoneLocked();
 }
 
-bool TransferReceiveSession::HasPendingWork() const {
-  absl::MutexLock lock(mu_);
-  return !done_;
-}
-
 bool TransferReceiveSession::RecordBlocksReceivedLocked(
     const std::vector<int>& block_ids, bool* first_packet,
     bool* network_just_completed) {
@@ -462,7 +464,7 @@ void TransferReceiveSession::ExecutePullRequest(
   base_->push_pool()->Schedule(
       target_node, [this, &manager, remote_endpoint, session_req_id,
                     load_plan = std::move(load_plan)]() {
-        bool pull_failed = false;
+        absl::Status pull_status = absl::OkStatus();
         try {
           LOG(INFO) << "StartRead (connecting): req_id=" << session_req_id
                     << ", uuid=" << uuid_
@@ -489,15 +491,15 @@ void TransferReceiveSession::ExecutePullRequest(
                      "request with Producer. req_id: "
                   << session_req_id;
         } catch (const std::exception& e) {
-          pull_failed = true;
+          pull_status = absl::InternalError(e.what());
           LOG(ERROR) << "Raiden consumer error during Hybrid Bridge StartRead "
                         "connect: "
                      << e.what();
         }
 
         absl::MutexLock lock(mu_);
-        if (pull_failed) {
-          FinishRecvLocked(/*has_failed=*/true);
+        if (!pull_status.ok()) {
+          FinishLocked(pull_status);
         }
         EndRecvOpLocked();
       });
@@ -540,7 +542,7 @@ absl::Status TransferReceiveSession::OnBlocksReceived(
       if (metrics != nullptr) {
         metrics->RecordEnd(uuid_);
       }
-      FinishRecvLocked(/*has_failed=*/false);
+      FinishLocked();
     }
   }
 
@@ -585,7 +587,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
                              /*layer_idx=*/layer_idx);
   if (!future_or.ok()) {
     absl::MutexLock lock(mu_);
-    FinishRecvLocked(/*has_failed=*/true);
+    FinishLocked(future_or.status());
     EndRecvOpLocked();
     return future_or.status();
   }
@@ -619,13 +621,13 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
             !draining_) {
           all_layers_done = true;
           session_start_time = start_time_;
-          FinishRecvLocked(/*has_failed=*/false);
+          FinishLocked();
         }
       } else {
         LOG(ERROR) << "OnLayerReceived (H2D copy failed) layer " << layer_idx
                    << " for req_id: " << session_req_id
                    << ", error: " << status_or.status().ToString();
-        FinishRecvLocked(/*has_failed=*/true);
+        FinishLocked(status_or.status());
       }
       EndRecvOpLocked();
       if (done_ && unregister_on_settle_) {

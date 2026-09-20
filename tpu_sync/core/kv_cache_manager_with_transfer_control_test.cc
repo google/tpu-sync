@@ -105,7 +105,7 @@ class TestManager : public KVCacheManagerWithTransfer {
       return std::nullopt;
     }
     const std::shared_ptr<TransferReceiveSession>& session = it->second;
-    if (session->done()) {
+    if (session->Done()) {
       return std::nullopt;
     }
     return session->req_id();
@@ -114,7 +114,7 @@ class TestManager : public KVCacheManagerWithTransfer {
   bool has_recv(uint64_t uuid) {
     absl::MutexLock lock(mu_);
     auto it = active_recv_sessions_.find(uuid);
-    return it != active_recv_sessions_.end() && !it->second->done();
+    return it != active_recv_sessions_.end() && !it->second->Done();
   }
 
   void MarkPullStarted(uint64_t uuid) {

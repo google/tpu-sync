@@ -28,6 +28,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/transfer_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
@@ -43,7 +44,7 @@ class StagingBlockAllocator;
 // |staging_allocator_|, |req_id_|, |uuid_|, |parallelism_|, |deadline_|,
 // |plan_|) are set at construction time and read without locking. Mutable
 // state is protected by internal |mu_|.
-class ReshardSendSession {
+class ReshardSendSession : public TransferSession {
  public:
   // Validates the sender schedule in |plan|, initializes the transport server,
   // registers the active plan on |base|, and creates a producer pool-reshard
@@ -55,30 +56,35 @@ class ReshardSendSession {
       std::chrono::steady_clock::time_point deadline,
       ::tpu_sync::rpc::StartTransferRequest plan);
 
-  const std::string& req_id() const { return req_id_; }
-  uint64_t uuid() const { return uuid_; }
-  std::chrono::steady_clock::time_point deadline() const { return deadline_; }
-  bool finalizing() const {
-    absl::MutexLock lock(mu_);
-    return finalizing_;
-  }
-  bool done() const {
+  ~ReshardSendSession() override = default;
+
+  bool Done() const override {
     absl::MutexLock lock(mu_);
     return done_;
   }
-  bool failed() const {
+
+  void Finish(const absl::Status& status = absl::OkStatus()) override;
+
+  absl::Status GetStatus() const override {
     absl::MutexLock lock(mu_);
-    return failed_;
+    return status_;
   }
+
+  absl::Status AwaitForDone() override;
+
+  bool IsDraining() const override {
+    absl::MutexLock lock(mu_);
+    return finalizing_;
+  }
+
+  const std::string& req_id() const { return req_id_; }
+  uint64_t uuid() const { return uuid_; }
+  std::chrono::steady_clock::time_point deadline() const { return deadline_; }
 
   // Leases host staging per pool, issues D2H copies for each pool in |plan_|,
   // and chains async H2H peer pushes upon D2H completion.
   absl::Status ExecutePush(KVCacheManagerWithTransfer& manager,
                            absl::Span<const int64_t> src_block_ids);
-
-  // Marks the session as timed out and settles once all in-flight operations
-  // finish.
-  void FinishTimeout();
 
  private:
   friend struct ReshardSendSessionTestPeer;
@@ -98,7 +104,8 @@ class ReshardSendSession {
 
   // Records completion or failure of one (pool, peer) push operation and
   // releases staging resources once all scheduled pushes settle.
-  void Finish(KVCacheManagerWithTransfer& manager, const absl::Status& status);
+  void RecordPushCompletion(KVCacheManagerWithTransfer& manager,
+                            const absl::Status& status);
   void StartPoolPush(KVCacheManagerWithTransfer& manager, size_t pool_idx);
   void EndOp();
   void SettleLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -114,7 +121,7 @@ class ReshardSendSession {
   mutable absl::Mutex mu_;
   int remaining_pool_peer_pushes_ ABSL_GUARDED_BY(mu_) = 0;
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
-  bool failed_ ABSL_GUARDED_BY(mu_) = false;
+  absl::Status status_ ABSL_GUARDED_BY(mu_);
   bool finalizing_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   std::vector<raiden::PjRtCopyFuture> d2h_futures_ ABSL_GUARDED_BY(mu_);

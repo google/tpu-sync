@@ -27,10 +27,13 @@
 
 #include "absl/base/nullability.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/transfer_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
@@ -45,7 +48,7 @@ namespace tpu_raiden {
 // Lock ordering: when both |KVCacheManagerWithTransfer::mu_| and |mu_| are
 // acquired, |KVCacheManagerWithTransfer::mu_| must be acquired first. |mu_| is
 // a leaf lock and is never held across callbacks or manager calls.
-class TransferSendSession {
+class TransferSendSession : public TransferSession {
  public:
   static absl::StatusOr<std::shared_ptr<TransferSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,
@@ -55,7 +58,26 @@ class TransferSendSession {
       std::chrono::steady_clock::time_point register_start, int in_flight = 0,
       bool pull_started = false);
 
-  ~TransferSendSession() { ReleaseSlot(); }
+  ~TransferSendSession() override { ReleaseSlot(); }
+
+  bool Done() const override {
+    absl::MutexLock lock(mu_);
+    return done_;
+  }
+
+  void Finish(const absl::Status& status = absl::OkStatus()) override;
+
+  absl::Status GetStatus() const override {
+    absl::MutexLock lock(mu_);
+    return status_;
+  }
+
+  absl::Status AwaitForDone() override;
+
+  bool IsDraining() const override {
+    absl::MutexLock lock(mu_);
+    return draining_;
+  }
 
   // Validates deadline, requested blocks, and single-pull invariant, then marks
   // |pull_started_| true. Throws std::runtime_error or std::invalid_argument on
@@ -76,10 +98,6 @@ class TransferSendSession {
   // Counts one finished copy or push; marks the send done and releases its
   // staging resources if it was draining and waiting for this operation.
   void EndSendOp();
-
-  // Decides a pull-serve send's outcome; marks it done and releases its
-  // staging resources once nothing issued for it is still running.
-  void FinishSend(bool has_failed);
 
   // Stages producer device blocks into host staging and executes the
   // multi-layer D2H copy and pipelined H2H push.
@@ -112,18 +130,6 @@ class TransferSendSession {
     absl::MutexLock lock(mu_);
     return d2h_done_;
   }
-  bool failed() const {
-    absl::MutexLock lock(mu_);
-    return failed_;
-  }
-  bool draining() const {
-    absl::MutexLock lock(mu_);
-    return draining_;
-  }
-  bool done() const {
-    absl::MutexLock lock(mu_);
-    return done_;
-  }
 
  private:
   TransferSendSession(kv_cache::KVCacheManagerBase* base,
@@ -143,7 +149,8 @@ class TransferSendSession {
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ReleaseSlot();
   void ReleaseSlotLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void FinishSendLocked(bool has_failed) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void FinishLocked(const absl::Status& status = absl::OkStatus())
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndSendOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void SendNextLayer(size_t l);
 
@@ -161,7 +168,7 @@ class TransferSendSession {
   std::vector<int64_t> registered_block_ids_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<int64_t> registered_block_set_ ABSL_GUARDED_BY(mu_);
   std::chrono::steady_clock::time_point d2h_done_ ABSL_GUARDED_BY(mu_);
-  bool failed_ ABSL_GUARDED_BY(mu_) = false;
+  absl::Status status_ ABSL_GUARDED_BY(mu_);
   bool pull_started_ ABSL_GUARDED_BY(mu_) = false;
   // Copies and pushes issued for this send whose completion has not been
   // observed. The staging they read and write is held until it is zero.

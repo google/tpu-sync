@@ -454,10 +454,10 @@ void ReshardReceiveSession::ReleaseStaging() {
   ReleaseStagingLocked();
 }
 
-void ReshardReceiveSession::FinishRecvLocked(bool has_failed,
-                                             bool unregister_on_settle) {
-  if (unregister_on_settle) unregister_on_settle_ = true;
-  if (has_failed) failed_ = true;
+void ReshardReceiveSession::FinishLocked(const absl::Status& status) {
+  if (!status.ok() && status_.ok()) {
+    status_ = status;
+  }
   if (draining_) return;
   draining_ = true;
   if (in_flight_ == 0 && !done_) {
@@ -466,10 +466,15 @@ void ReshardReceiveSession::FinishRecvLocked(bool has_failed,
   }
 }
 
-void ReshardReceiveSession::FinishRecv(bool has_failed,
-                                       bool unregister_on_settle) {
+void ReshardReceiveSession::Finish(const absl::Status& status) {
   absl::MutexLock lock(mu_);
-  FinishRecvLocked(has_failed, unregister_on_settle);
+  FinishLocked(status);
+}
+
+absl::Status ReshardReceiveSession::AwaitForDone() {
+  absl::MutexLock lock(mu_);
+  mu_.Await(absl::Condition(&done_));
+  return status_;
 }
 
 void ReshardReceiveSession::EndRecvOpLocked() {
@@ -645,19 +650,21 @@ void ReshardReceiveSession::FinishPoolH2d(KVCacheManagerWithTransfer& manager,
       LOG(ERROR) << "Failed to unregister pool reshard receiver plan " << uuid_
                  << ": " << unregister;
     }
-    bool has_failed = false;
+    absl::Status terminal_status = absl::OkStatus();
     {
       absl::MutexLock lock(mu_);
       unregister_on_settle_ = false;
-      if (!status.ok() || (!unregister.ok() && !absl::IsNotFound(unregister))) {
-        has_failed = true;
+      if (!status.ok()) {
+        terminal_status = status;
+      } else if (!unregister.ok() && !absl::IsNotFound(unregister)) {
+        terminal_status = unregister;
       } else {
         session_start_time = start_time_;
         should_record_duration = true;
         network_completed_ = true;
       }
     }
-    FinishRecv(has_failed);
+    Finish(terminal_status);
   }
   if (should_record_duration) {
     RecordTransferDuration(

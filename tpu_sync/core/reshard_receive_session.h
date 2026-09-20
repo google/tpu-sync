@@ -31,6 +31,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/transfer_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 
 namespace tpu_sync {
@@ -50,7 +51,7 @@ class StagingBlockAllocator;
 // readiness accounting, and order-ranked H2D copy execution.
 //
 // Thread-safe: all mutable session state is synchronized via internal |mu_|.
-class ReshardReceiveSession {
+class ReshardReceiveSession : public TransferSession {
  public:
   // Creates and initializes a consumer pool-reshard receive session for |plan|,
   // acquiring bounded pool staging leases per storage via |staging_allocator|.
@@ -61,28 +62,30 @@ class ReshardReceiveSession {
       absl::Span<const int64_t> chip_blocks,
       std::chrono::steady_clock::time_point deadline);
 
-  ~ReshardReceiveSession() { ReleaseStaging(); }
+  ~ReshardReceiveSession() override { ReleaseStaging(); }
 
-  const std::string& req_id() const { return req_id_; }
-  uint64_t uuid() const { return uuid_; }
-  std::chrono::steady_clock::time_point deadline() const { return deadline_; }
-
-  bool draining() const {
-    absl::MutexLock lock(mu_);
-    return draining_;
-  }
-  bool failed() const {
-    absl::MutexLock lock(mu_);
-    return failed_;
-  }
-  bool done() const {
+  bool Done() const override {
     absl::MutexLock lock(mu_);
     return done_;
   }
 
-  // Decides the receive's outcome; marks it done and releases its pool staging
-  // leases once nothing issued for it is still running.
-  void FinishRecv(bool has_failed, bool unregister_on_settle = false);
+  void Finish(const absl::Status& status = absl::OkStatus()) override;
+
+  absl::Status GetStatus() const override {
+    absl::MutexLock lock(mu_);
+    return status_;
+  }
+
+  absl::Status AwaitForDone() override;
+
+  bool IsDraining() const override {
+    absl::MutexLock lock(mu_);
+    return draining_;
+  }
+
+  const std::string& req_id() const { return req_id_; }
+  uint64_t uuid() const { return uuid_; }
+  std::chrono::steady_clock::time_point deadline() const { return deadline_; }
 
   // Releases any held pool staging leases for |uuid_|. Safe to call multiple
   // times.
@@ -126,7 +129,7 @@ class ReshardReceiveSession {
       const ::tpu_sync::rpc::StartTransferRequest& plan);
 
   void ReleaseStagingLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void FinishRecvLocked(bool has_failed, bool unregister_on_settle = false)
+  void FinishLocked(const absl::Status& status = absl::OkStatus())
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndRecvOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
@@ -159,8 +162,8 @@ class ReshardReceiveSession {
   bool staging_released_ ABSL_GUARDED_BY(mu_) = true;
   bool network_completed_ ABSL_GUARDED_BY(mu_) = false;
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
+  absl::Status status_ ABSL_GUARDED_BY(mu_);
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
-  bool failed_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   bool reshard_finalizing_ ABSL_GUARDED_BY(mu_) = false;
   bool unregister_on_settle_ ABSL_GUARDED_BY(mu_) = true;

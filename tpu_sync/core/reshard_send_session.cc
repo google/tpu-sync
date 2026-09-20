@@ -215,7 +215,7 @@ absl::Status ReshardSendSession::ExecutePush(
       absl::Status lease_status = staging_allocator_->AcquirePoolStagingLease(
           uuid_, pool_spec->storage_index, pool_src_block_ids);
       if (!lease_status.ok()) {
-        Finish(manager, lease_status);
+        RecordPushCompletion(manager, lease_status);
         EndOp();
         return lease_status;
       }
@@ -223,7 +223,7 @@ absl::Status ReshardSendSession::ExecutePush(
     absl::StatusOr<raiden::PjRtCopyFuture> future = base_->D2hPoolBlocks(
         pool_idx, pool_src_block_ids, /*shard_idx=*/std::nullopt, uuid_);
     if (!future.ok()) {
-      Finish(manager, future.status());
+      RecordPushCompletion(manager, future.status());
       EndOp();
       return future.status();
     }
@@ -235,7 +235,7 @@ absl::Status ReshardSendSession::ExecutePush(
     }
     pool_future.OnReady([this, &manager, pool_idx](auto status_or) {
       if (!status_or.ok()) {
-        Finish(manager, status_or.status());
+        RecordPushCompletion(manager, status_or.status());
         EndOp();
         return;
       }
@@ -288,8 +288,8 @@ void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
 
   transport::BlockTransport* transport_srv = base_->transport_server();
   if (transport_srv == nullptr) {
-    Finish(manager,
-           absl::FailedPreconditionError("transport server is not running"));
+    RecordPushCompletion(manager, absl::FailedPreconditionError(
+                                      "transport server is not running"));
     return;
   }
 
@@ -314,14 +314,15 @@ void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
         {peer}, src_ids, dst_ids, parallelism_,
         transport::MajorOrder::kLayerMajor, uuid_, static_cast<int>(pool_idx),
         [this, &manager](absl::StatusOr<std::vector<int>> result) {
-          Finish(manager, result.ok() ? absl::OkStatus() : result.status());
+          RecordPushCompletion(
+              manager, result.ok() ? absl::OkStatus() : result.status());
           EndOp();
         });
   }
 }
 
-void ReshardSendSession::Finish(KVCacheManagerWithTransfer& manager,
-                                const absl::Status& status) {
+void ReshardSendSession::RecordPushCompletion(
+    KVCacheManagerWithTransfer& manager, const absl::Status& status) {
   RAIDEN_TRACE_FN("KVTransfer::FinishPoolReshardSend", [&]() {
     return absl::StrCat("uuid=", uuid_, " status=", status.code());
   });
@@ -332,7 +333,9 @@ void ReshardSendSession::Finish(KVCacheManagerWithTransfer& manager,
     if (!status.ok()) {
       LOG(ERROR) << "Pool reshard send failed uuid=" << uuid_
                  << " req_id=" << req_id_ << ": " << status;
-      failed_ = true;
+      if (status_.ok()) {
+        status_ = status;
+      }
       finalizing_ = true;
       should_unregister = true;
     } else if (--remaining_pool_peer_pushes_ == 0) {
@@ -343,26 +346,36 @@ void ReshardSendSession::Finish(KVCacheManagerWithTransfer& manager,
   if (!should_unregister) {
     return;
   }
-  // All callers of Finish hold an active in_flight_ count and invoke EndOp()
-  // after Finish returns, so |this| remains live while UnregisterActivePlan
-  // runs outside |mu_|.
+  // All callers of RecordPushCompletion hold an active in_flight_ count and
+  // invoke EndOp() after RecordPushCompletion returns, so |this| remains live
+  // while UnregisterActivePlan runs outside |mu_|.
   absl::Status unregister = manager.UnregisterActivePlan(uuid_);
   if (!unregister.ok() && !absl::IsNotFound(unregister)) {
     LOG(ERROR) << "Failed to unregister pool reshard sender plan " << uuid_
                << ": " << unregister;
     absl::MutexLock lock(mu_);
-    failed_ = true;
+    if (status_.ok()) {
+      status_ = unregister;
+    }
   }
 }
 
-void ReshardSendSession::FinishTimeout() {
+void ReshardSendSession::Finish(const absl::Status& status) {
   absl::MutexLock lock(mu_);
+  if (!status.ok() && status_.ok()) {
+    status_ = status;
+  }
   if (done_ || finalizing_) return;
-  failed_ = true;
   finalizing_ = true;
   if (in_flight_ == 0) {
     SettleLocked();
   }
+}
+
+absl::Status ReshardSendSession::AwaitForDone() {
+  absl::MutexLock lock(mu_);
+  mu_.Await(absl::Condition(&done_));
+  return status_;
 }
 
 void ReshardSendSession::EndOp() {

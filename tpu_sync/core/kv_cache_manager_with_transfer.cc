@@ -24,6 +24,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <ratio>  // NOLINT(build/c++11)
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -133,7 +134,7 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
       if (it == active_pool_reshard_recvs_.end()) {
         auto legacy_it = active_recv_sessions_.find(uuid);
         if (legacy_it != active_recv_sessions_.end() &&
-            !legacy_it->second->done()) {
+            !legacy_it->second->Done()) {
           return absl::FailedPreconditionError(
               absl::StrCat("pool completion for UUID ", uuid,
                            " but the receiver was armed on the legacy path"));
@@ -243,7 +244,8 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
     absl::MutexLock lock(mu_);
     for (const auto& [uuid, session] : send_sessions_) {
       (void)uuid;
-      session->FinishSend(/*has_failed=*/true);
+      session->Finish(
+          absl::CancelledError("KVCacheManagerWithTransfer shutting down"));
     }
   }
   if (staging_allocator_) {
@@ -356,8 +358,8 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
 absl::Status KVCacheManagerWithTransfer::EmplaceRecvSessionLocked(
     uint64_t uuid, const std::shared_ptr<TransferReceiveSession>& session) {
   auto existing = active_recv_sessions_.find(uuid);
-  if (existing != active_recv_sessions_.end() && existing->second->done()) {
-    (existing->second->failed() ? failed_recving_ : done_recving_)
+  if (existing != active_recv_sessions_.end() && existing->second->Done()) {
+    (!existing->second->GetStatus().ok() ? failed_recving_ : done_recving_)
         .insert(existing->second->req_id());
     active_recv_sessions_.erase(existing);
   }
@@ -492,8 +494,8 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
     absl::MutexLock lock(mu_);
     auto existing = active_pool_reshard_sends_.find(plan.uuid());
     if (existing != active_pool_reshard_sends_.end()) {
-      if (existing->second->done()) {
-        (existing->second->failed() ? failed_recving_ : done_sending_)
+      if (existing->second->Done()) {
+        (!existing->second->GetStatus().ok() ? failed_recving_ : done_sending_)
             .insert(existing->second->req_id());
         active_pool_reshard_sends_.erase(existing);
       } else {
@@ -527,8 +529,9 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
     absl::MutexLock lock(mu_);
     auto existing_reshard = active_pool_reshard_recvs_.find(plan.uuid());
     if (existing_reshard != active_pool_reshard_recvs_.end()) {
-      if (existing_reshard->second->done()) {
-        (existing_reshard->second->failed() ? failed_recving_ : done_recving_)
+      if (existing_reshard->second->Done()) {
+        (!existing_reshard->second->GetStatus().ok() ? failed_recving_
+                                                     : done_recving_)
             .insert(existing_reshard->second->req_id());
         active_pool_reshard_recvs_.erase(existing_reshard);
       } else {
@@ -592,7 +595,7 @@ void KVCacheManagerWithTransfer::UnregisterSettledPlan(uint64_t uuid,
 void KVCacheManagerWithTransfer::MaybeUnregisterSettledRecv(
     uint64_t uuid, TransferReceiveSession& session) {
   uint64_t generation = 0;
-  if (session.done() && session.TakePendingUnregister(&generation)) {
+  if (session.Done() && session.TakePendingUnregister(&generation)) {
     UnregisterSettledPlan(uuid, generation);
   }
 }
@@ -693,8 +696,8 @@ void KVCacheManagerWithTransfer::StartRead(
     absl::MutexLock lock(mu_);
     auto incumbent = active_recv_sessions_.find(uuid);
     if (incumbent != active_recv_sessions_.end()) {
-      if (incumbent->second->done()) {
-        (incumbent->second->failed() ? failed_recving_ : done_recving_)
+      if (incumbent->second->Done()) {
+        (!incumbent->second->GetStatus().ok() ? failed_recving_ : done_recving_)
             .insert(incumbent->second->req_id());
         active_recv_sessions_.erase(incumbent);
       } else {
@@ -739,7 +742,7 @@ void KVCacheManagerWithTransfer::StartRead(
   }
 
   if (num_blocks == 0) {
-    session->FinishRecv(/*has_failed=*/false);
+    session->Finish();
     return;
   }
 
@@ -760,17 +763,17 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
     for (auto it = send_sessions_.begin(); it != send_sessions_.end();) {
       const std::shared_ptr<TransferSendSession> session = it->second;
       const uint64_t uuid = it->first;
-      if (!session->draining() && session->deadline() <= now) {
+      if (!session->IsDraining() && session->deadline() <= now) {
         // Past its deadline the transfer failed. One nobody pulled is
         // reported now; one whose copies or pushes still run keeps its
         // staging until they end, so the next transfer is never seated on
         // memory a copy still writes.
-        session->FinishSend(/*has_failed=*/true);
+        session->Finish(absl::DeadlineExceededError("Send session timed out"));
       }
-      if (session->done()) {
-        (session->failed() ? failed_recving_ : done_sending_)
-            .insert(session->req_id());
-        if (session->failed()) {
+      if (session->Done()) {
+        const bool failed = !session->GetStatus().ok();
+        (failed ? failed_recving_ : done_sending_).insert(session->req_id());
+        if (failed) {
           settled_plans.emplace_back(uuid, 0);
         }
         send_sessions_.erase(it++);
@@ -781,13 +784,14 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
     for (auto it = active_pool_reshard_sends_.begin();
          it != active_pool_reshard_sends_.end();) {
       const auto& session = it->second;
-      if (!session->finalizing() && session->deadline() <= now) {
-        session->FinishTimeout();
+      if (!session->IsDraining() && session->deadline() <= now) {
+        session->Finish(
+            absl::DeadlineExceededError("Pool reshard send timed out"));
       }
-      if (session->done()) {
-        (session->failed() ? failed_recving_ : done_sending_)
-            .insert(session->req_id());
-        if (session->failed()) {
+      if (session->Done()) {
+        const bool failed = !session->GetStatus().ok();
+        (failed ? failed_recving_ : done_sending_).insert(session->req_id());
+        if (failed) {
           settled_plans.emplace_back(it->first, 0);
         }
         active_pool_reshard_sends_.erase(it++);
@@ -803,22 +807,23 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
          it != active_recv_sessions_.end();) {
       const uint64_t uuid = it->first;
       const std::shared_ptr<TransferReceiveSession> session = it->second;
-      if (!session->draining()) {
+      if (!session->IsDraining()) {
         if (session->IsReadyToComplete()) {
           LOG(INFO) << "CompleteReadRaw (polling completion): req_id="
                     << session->req_id();
-          session->FinishRecv(/*has_failed=*/false);
+          session->Finish();
         } else if (session->deadline() <= now) {
           // Preserve the pre-existing timeout cleanup behavior even for
           // receives registered without a plan: UnregisterSettledPlan also
           // clears any transport-side progress associated with the UUID.
-          session->FinishRecv(/*has_failed=*/true,
-                              /*unregister_on_settle=*/true);
+          session->DeferUnregisterOnSettle();
+          session->Finish(
+              absl::DeadlineExceededError("Receive session timed out"));
         }
       }
 
-      if (session->done()) {
-        (session->failed() ? failed_recving_ : done_recving_)
+      if (session->Done()) {
+        (!session->GetStatus().ok() ? failed_recving_ : done_recving_)
             .insert(session->req_id());
         uint64_t generation = 0;
         if (session->TakePendingUnregister(&generation)) {
@@ -833,19 +838,19 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
          it != active_pool_reshard_recvs_.end();) {
       const uint64_t uuid = it->first;
       const std::shared_ptr<ReshardReceiveSession> session = it->second;
-      if (!session->draining()) {
+      if (!session->IsDraining()) {
         if (session->IsReadyToComplete()) {
           LOG(INFO) << "CompleteReadRaw (polling completion): req_id="
                     << session->req_id();
-          session->FinishRecv(/*has_failed=*/false);
+          session->Finish();
         } else if (session->deadline() <= now) {
-          session->FinishRecv(/*has_failed=*/true,
-                              /*unregister_on_settle=*/true);
+          session->Finish(
+              absl::DeadlineExceededError("Pool reshard receive timed out"));
         }
       }
 
-      if (session->done()) {
-        (session->failed() ? failed_recving_ : done_recving_)
+      if (session->Done()) {
+        (!session->GetStatus().ok() ? failed_recving_ : done_recving_)
             .insert(session->req_id());
         uint64_t generation = 0;
         if (session->TakePendingUnregister(&generation)) {
@@ -1159,7 +1164,7 @@ void KVCacheManagerWithTransfer::RegisterBlockReadinessCallback(
     // by uuid-carrying senders; a pull that did not identify itself falls
     // through to the scan below.
     auto it = send_sessions_.find(uuid);
-    if (it != send_sessions_.end() && !it->second->done()) {
+    if (it != send_sessions_.end() && !it->second->Done()) {
       session = it->second;
     } else {
       // Fallback: no session owns this uuid, so look for any live transfer that
@@ -1168,7 +1173,7 @@ void KVCacheManagerWithTransfer::RegisterBlockReadinessCallback(
       // can gate this one, and a stale session whose future never resolves
       // would stall it until the reader's own deadline fires.
       for (const auto& [u, s] : send_sessions_) {
-        if (!s->done() && s->OwnsBlockWithReadyFuture(block_id, layer_idx)) {
+        if (!s->Done() && s->OwnsBlockWithReadyFuture(block_id, layer_idx)) {
           session = s;
           break;
         }
@@ -1366,7 +1371,7 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
       bool recv_pending = false;
       for (const auto& [uuid, session] : active_recv_sessions_) {
         (void)uuid;
-        if (session->HasPendingWork()) {
+        if (!session->Done()) {
           recv_pending = true;
           break;
         }
@@ -1383,7 +1388,7 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
       bool send_pending = false;
       for (const auto& [uuid, session] : active_pool_reshard_sends_) {
         (void)uuid;
-        if (!session->done()) {
+        if (!session->Done()) {
           send_pending = true;
           break;
         }
@@ -1414,7 +1419,7 @@ void KVCacheManagerWithTransfer::AckSend(uint64_t uuid) {
     }
     session = it->second;
   }
-  session->FinishSend(/*has_failed=*/false);
+  session->Finish();
   const auto ack_done = std::chrono::steady_clock::now();
   std::ostringstream timing;
   timing << "RAIDEN_TIMING event=producer_ack"
@@ -1424,7 +1429,7 @@ void KVCacheManagerWithTransfer::AckSend(uint64_t uuid) {
          << " stage_to_ack_ms=" << DurationMs(session->d2h_done(), ack_done)
          << " register_to_ack_ms="
          << DurationMs(session->register_start(), ack_done)
-         << " failed=" << (session->failed() ? 1 : 0);
+         << " failed=" << (!session->GetStatus().ok() ? 1 : 0);
   EmitTimingLog(timing.str());
 }
 

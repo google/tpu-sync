@@ -22,7 +22,6 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
 
@@ -170,8 +169,10 @@ void TransferSendSession::ReleaseSlot() {
   ReleaseSlotLocked();
 }
 
-void TransferSendSession::FinishSendLocked(bool has_failed) {
-  if (has_failed) failed_ = true;
+void TransferSendSession::FinishLocked(const absl::Status& status) {
+  if (!status.ok() && status_.ok()) {
+    status_ = status;
+  }
   if (draining_) return;
   draining_ = true;
   if (in_flight_ == 0 && !done_) {
@@ -181,9 +182,15 @@ void TransferSendSession::FinishSendLocked(bool has_failed) {
   staging_allocator_->Shutdown();
 }
 
-void TransferSendSession::FinishSend(bool has_failed) {
+void TransferSendSession::Finish(const absl::Status& status) {
   absl::MutexLock lock(mu_);
-  FinishSendLocked(has_failed);
+  FinishLocked(status);
+}
+
+absl::Status TransferSendSession::AwaitForDone() {
+  absl::MutexLock lock(mu_);
+  mu_.Await(absl::Condition(&done_));
+  return status_;
 }
 
 void TransferSendSession::EndSendOpLocked() {
@@ -246,7 +253,7 @@ void TransferSendSession::StartPush(
       staging_allocator_->AcquireWithTimeout(
           static_cast<int64_t>(src_block_ids.size()), deadline_);
   if (!acquired.ok()) {
-    FinishSend(/*has_failed=*/true);
+    Finish(acquired.status());
     return;
   }
   absl::Span<const int> blocks = acquired->block_ids();
@@ -296,7 +303,7 @@ void TransferSendSession::StartPush(
       LOG(ERROR) << "StartPush: failed to issue D2H for layer " << l << ": "
                  << future.status();
       absl::MutexLock lock(mu_);
-      FinishSendLocked(/*has_failed=*/true);
+      FinishLocked(future.status());
       EndSendOpLocked();  // this copy never started
       return;
     }
@@ -335,7 +342,7 @@ void TransferSendSession::SendNextLayer(size_t l) {
       LOG(ERROR) << "StartPush: D2H copy failed for layer " << l
                  << ", status: " << status_or.status().ToString();
       absl::MutexLock lock(mu_);
-      FinishSendLocked(/*has_failed=*/true);
+      FinishLocked(status_or.status());
       EndSendOpLocked();
       return;
     }
@@ -376,7 +383,7 @@ void TransferSendSession::SendNextLayer(size_t l) {
               LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
                          << push_res.status().ToString();
               absl::MutexLock lock(mu_);
-              FinishSendLocked(/*has_failed=*/true);
+              FinishLocked(push_res.status());
               EndSendOpLocked();
               return;
             }
@@ -391,7 +398,7 @@ void TransferSendSession::SendNextLayer(size_t l) {
             }
             absl::MutexLock lock(mu_);
             if (last) {
-              FinishSendLocked(/*has_failed=*/false);
+              FinishLocked();
             }
             EndSendOpLocked();
           });

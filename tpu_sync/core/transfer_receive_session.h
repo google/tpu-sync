@@ -31,6 +31,7 @@
 #include "absl/synchronization/mutex.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/transfer_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 
 namespace tpu_sync {
@@ -47,7 +48,7 @@ namespace tpu_raiden {
 // readiness accounting, and H2D copy execution.
 //
 // Thread-safe: all mutable session state is synchronized via internal |mu_|.
-class TransferReceiveSession {
+class TransferReceiveSession : public TransferSession {
  public:
   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
       kv_cache::KVCacheManagerBase* base,
@@ -73,11 +74,26 @@ class TransferReceiveSession {
       absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
           host_block_of);
 
-  ~TransferReceiveSession() { ReleaseStaging(); }
+  ~TransferReceiveSession() override { ReleaseStaging(); }
 
-  // Decides a receive's outcome; marks it done and releases its staging
-  // resources once nothing issued for it is still running.
-  void FinishRecv(bool has_failed, bool unregister_on_settle = false);
+  bool Done() const override {
+    absl::MutexLock lock(mu_);
+    return done_;
+  }
+
+  void Finish(const absl::Status& status = absl::OkStatus()) override;
+
+  absl::Status GetStatus() const override {
+    absl::MutexLock lock(mu_);
+    return status_;
+  }
+
+  absl::Status AwaitForDone() override;
+
+  bool IsDraining() const override {
+    absl::MutexLock lock(mu_);
+    return draining_;
+  }
 
   // Releases any held staging slot or dynamic host blocks. Safe to call
   // multiple times.
@@ -95,9 +111,6 @@ class TransferReceiveSession {
   // Returns true if network/layer transfer is complete and all H2D futures are
   // ready.
   bool IsReadyToComplete() const;
-
-  // Returns true if this session still has pending network or H2D work.
-  bool HasPendingWork() const;
 
   // Schedules the consumer pull handshake on |base_->push_pool()| and updates
   // session state upon completion or error.
@@ -120,18 +133,6 @@ class TransferReceiveSession {
   int32_t total_blocks() const {
     absl::MutexLock lock(mu_);
     return total_blocks_;
-  }
-  bool draining() const {
-    absl::MutexLock lock(mu_);
-    return draining_;
-  }
-  bool failed() const {
-    absl::MutexLock lock(mu_);
-    return failed_;
-  }
-  bool done() const {
-    absl::MutexLock lock(mu_);
-    return done_;
   }
   std::chrono::steady_clock::time_point deadline() const {
     absl::MutexLock lock(mu_);
@@ -195,7 +196,7 @@ class TransferReceiveSession {
       std::shared_future<absl::StatusOr<raiden::PjRtCopyFuture>>;
 
   void ReleaseStagingLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void FinishRecvLocked(bool has_failed, bool unregister_on_settle = false)
+  void FinishLocked(const absl::Status& status = absl::OkStatus())
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndRecvOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
@@ -227,8 +228,8 @@ class TransferReceiveSession {
   bool network_completed_ ABSL_GUARDED_BY(mu_) = false;
   bool h2d_started_ ABSL_GUARDED_BY(mu_) = false;
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
+  absl::Status status_ ABSL_GUARDED_BY(mu_);
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
-  bool failed_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   std::vector<int> accumulated_host_block_ids_ ABSL_GUARDED_BY(mu_);
   std::chrono::steady_clock::time_point deadline_ ABSL_GUARDED_BY(mu_);

@@ -18,10 +18,12 @@
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -31,21 +33,24 @@
 namespace tpu_raiden {
 
 class KVCacheManagerWithTransfer;
+class StagingBlockAllocator;
 
 // Encapsulates the producer-side state and execution logic for a single
 // push-driven pool-reshard send transfer (identified by |uuid|).
 //
 // Thread-safety: This class is thread-safe. Immutable fields (|base_|,
-// |req_id_|, |uuid_|, |parallelism_|, |deadline_|, |plan_|) are set at
-// construction time and read without locking. Mutable state is protected by
-// internal |mu_|.
+// |staging_allocator_|, |req_id_|, |uuid_|, |parallelism_|, |deadline_|,
+// |plan_|) are set at construction time and read without locking. Mutable
+// state is protected by internal |mu_|.
 class ReshardSendSession {
  public:
-  ReshardSendSession(kv_cache::KVCacheManagerBase* base_in,
-                     std::string req_id_in, uint64_t uuid_in,
-                     int parallelism_in, int remaining_pool_peer_pushes_in,
-                     std::chrono::steady_clock::time_point deadline_in,
-                     ::tpu_sync::rpc::StartTransferRequest plan_in);
+  // Validates the sender schedule in |plan| and creates a producer pool-reshard
+  // send session.
+  static absl::StatusOr<std::shared_ptr<ReshardSendSession>> Create(
+      kv_cache::KVCacheManagerBase* base,
+      StagingBlockAllocator* staging_allocator, int parallelism,
+      std::chrono::steady_clock::time_point deadline,
+      ::tpu_sync::rpc::StartTransferRequest plan);
 
   const std::string& req_id() const { return req_id_; }
   uint64_t uuid() const { return uuid_; }
@@ -68,20 +73,27 @@ class ReshardSendSession {
   absl::Status ExecutePush(KVCacheManagerWithTransfer& manager,
                            absl::Span<const int64_t> src_block_ids);
 
-  // Records completion or failure of one (pool, peer) push operation and
-  // releases staging resources once all scheduled pushes settle.
-  void Finish(KVCacheManagerWithTransfer& manager, const absl::Status& status);
-
   // Marks the session as timed out and settles once all in-flight operations
   // finish.
   void FinishTimeout();
 
  private:
+  ReshardSendSession(kv_cache::KVCacheManagerBase* base,
+                     StagingBlockAllocator* staging_allocator,
+                     std::string req_id, uint64_t uuid, int parallelism,
+                     int remaining_pool_peer_pushes,
+                     std::chrono::steady_clock::time_point deadline,
+                     ::tpu_sync::rpc::StartTransferRequest plan);
+
+  // Records completion or failure of one (pool, peer) push operation and
+  // releases staging resources once all scheduled pushes settle.
+  void Finish(KVCacheManagerWithTransfer& manager, const absl::Status& status);
   void StartPoolPush(KVCacheManagerWithTransfer& manager, size_t pool_idx);
   void EndOp();
   void SettleLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
+  StagingBlockAllocator* const staging_allocator_ = nullptr;
   const std::string req_id_;
   const uint64_t uuid_ = 0;
   const int parallelism_ = 8;

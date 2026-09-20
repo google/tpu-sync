@@ -14,7 +14,6 @@
 
 #include "tpu_sync/core/transfer_receive_session.h"
 
-#include <algorithm>
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
@@ -36,8 +35,6 @@
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
-#include "absl/types/span.h"
-#include "xla/tsl/platform/errors.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/metrics_collector.h"  // IWYU pragma: keep
@@ -125,19 +122,6 @@ TransferReceiveSession::CreateFromActivePlan(
   return session;
 }
 
-std::shared_ptr<TransferReceiveSession>
-TransferReceiveSession::CreateFromPoolReshardPlan(
-    kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* staging_allocator,
-    const ::tpu_sync::rpc::StartTransferRequest& plan,
-    absl::Span<const int64_t> chip_blocks,
-    std::chrono::steady_clock::time_point deadline) {
-  auto session = std::shared_ptr<TransferReceiveSession>(
-      new TransferReceiveSession(base, staging_allocator, plan.uuid()));
-  session->InitFromPoolReshardPlan(plan, chip_blocks, deadline);
-  return session;
-}
-
 absl::Status TransferReceiveSession::InitFromActivePlan(
     const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
     std::chrono::steady_clock::time_point deadline,
@@ -210,31 +194,6 @@ absl::Status TransferReceiveSession::InitFromActivePlan(
     ReleaseStagingLocked();
   }
   return absl::OkStatus();
-}
-
-void TransferReceiveSession::InitFromPoolReshardPlan(
-    const ::tpu_sync::rpc::StartTransferRequest& plan,
-    absl::Span<const int64_t> chip_blocks,
-    std::chrono::steady_clock::time_point deadline) {
-  absl::MutexLock lock(mu_);
-  req_id_ = plan.req_id();
-  is_pool_reshard_ = true;
-  unregister_on_settle_ = true;
-  deadline_ = deadline;
-  start_time_ = std::chrono::steady_clock::now();
-  chip_block_ids_.assign(chip_blocks.begin(), chip_blocks.end());
-  for (int32_t pool_idx : plan.transfer_pool_indices()) {
-    expected_pool_indices_.insert(static_cast<size_t>(pool_idx));
-    pool_order_ranks_[static_cast<size_t>(pool_idx)] = 0;
-  }
-  for (const auto& group : plan.pool_groups()) {
-    std::vector<int64_t> group_dst_ids(group.dst_device_block_ids().begin(),
-                                       group.dst_device_block_ids().end());
-    for (int32_t pool_idx : group.pool_indices()) {
-      pool_order_ranks_[static_cast<size_t>(pool_idx)] = group.order_rank();
-      pool_dst_block_ids_[static_cast<size_t>(pool_idx)] = group_dst_ids;
-    }
-  }
 }
 
 bool TransferReceiveSession::AllocateStagingForLoad(
@@ -378,9 +337,6 @@ void TransferReceiveSession::InitFromLoadPlan(
 
 void TransferReceiveSession::ReleaseStagingLocked() {
   staging_.Reset();
-  if (base_ != nullptr && is_pool_reshard_) {
-    base_->ReleasePoolStagingLeases(uuid_);
-  }
 }
 
 void TransferReceiveSession::ReleaseStaging() {
@@ -425,7 +381,7 @@ void TransferReceiveSession::EndRecvOp() {
 
 bool TransferReceiveSession::DeferUnregisterOnSettle() {
   absl::MutexLock lock(mu_);
-  if (is_pool_reshard_ || done_) {
+  if (done_) {
     return false;
   }
   unregister_on_settle_ = true;
@@ -459,9 +415,7 @@ bool TransferReceiveSession::IsReadyToComplete() const {
 
 bool TransferReceiveSession::HasPendingWork() const {
   absl::MutexLock lock(mu_);
-  if (done_) return false;
-  if (!is_pool_reshard_ || !network_completed_) return true;
-  return !AllH2dDoneLocked();
+  return !done_;
 }
 
 bool TransferReceiveSession::RecordBlocksReceivedLocked(
@@ -481,70 +435,6 @@ bool TransferReceiveSession::RecordBlocksReceivedLocked(
     network_completed_ = true;
     *network_just_completed = true;
     return num_completed_layers_ == static_cast<int32_t>(total_layers);
-  }
-  return false;
-}
-
-absl::Status TransferReceiveSession::RecordPoolReceivedLocked(size_t pool_idx) {
-  if (!is_pool_reshard_) {
-    return absl::FailedPreconditionError(
-        absl::StrCat("pool completion for UUID ", uuid_,
-                     " but the receiver was armed on the legacy path"));
-  }
-  if (expected_pool_indices_.find(pool_idx) == expected_pool_indices_.end()) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "received undeclared pool ", pool_idx, " for UUID ", uuid_));
-  }
-  if (started_pool_indices_.find(pool_idx) != started_pool_indices_.end()) {
-    return absl::AlreadyExistsError(
-        absl::StrCat("pool completed more than once: ", pool_idx));
-  }
-  started_pool_indices_.insert(pool_idx);
-  return absl::OkStatus();
-}
-
-std::vector<std::pair<size_t, std::vector<int64_t>>>
-TransferReceiveSession::CollectEligiblePoolH2dsLocked() {
-  std::vector<std::pair<size_t, std::vector<int64_t>>> to_launch;
-  if (reshard_finalizing_) return to_launch;
-  for (size_t pool_idx : started_pool_indices_) {
-    if (h2d_launched_pools_.count(pool_idx)) continue;
-    const auto rank_it = pool_order_ranks_.find(pool_idx);
-    const int rank = rank_it == pool_order_ranks_.end() ? 0 : rank_it->second;
-    bool prerequisites_uploaded = true;
-    for (size_t other : expected_pool_indices_) {
-      const auto other_it = pool_order_ranks_.find(other);
-      const int other_rank =
-          other_it == pool_order_ranks_.end() ? 0 : other_it->second;
-      if (other_rank < rank && completed_pool_indices_.find(other) ==
-                                   completed_pool_indices_.end()) {
-        prerequisites_uploaded = false;
-        break;
-      }
-    }
-    if (!prerequisites_uploaded) continue;
-    h2d_launched_pools_.insert(pool_idx);
-    const auto ids_it = pool_dst_block_ids_.find(pool_idx);
-    to_launch.emplace_back(pool_idx, ids_it == pool_dst_block_ids_.end()
-                                         ? chip_block_ids_
-                                         : ids_it->second);
-  }
-  std::sort(to_launch.begin(), to_launch.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
-  return to_launch;
-}
-
-bool TransferReceiveSession::RecordPoolH2dResultLocked(
-    size_t pool_idx, const absl::Status& status) {
-  if (reshard_finalizing_) return false;
-  if (!status.ok()) {
-    reshard_finalizing_ = true;
-    return true;
-  }
-  completed_pool_indices_.insert(pool_idx);
-  if (completed_pool_indices_ == expected_pool_indices_) {
-    reshard_finalizing_ = true;
-    return true;
   }
   return false;
 }
@@ -616,7 +506,7 @@ absl::Status TransferReceiveSession::OnBlocksReceived(
   bool all_complete = false;
   {
     absl::MutexLock lock(mu_);
-    if (done_ || draining_ || is_pool_reshard_) {
+    if (done_ || draining_) {
       return absl::OkStatus();
     }
     all_complete = RecordBlocksReceivedLocked(block_ids, &first_packet,
@@ -661,7 +551,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
   bool trigger_enqueue = false;
   {
     absl::MutexLock lock(mu_);
-    if (done_ || is_pool_reshard_ || draining_) {
+    if (done_ || draining_) {
       return absl::OkStatus();
     }
     ++in_flight_;
@@ -752,94 +642,6 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
   });
 
   return absl::OkStatus();
-}
-
-absl::Status TransferReceiveSession::OnPoolReceived(
-    KVCacheManagerWithTransfer& manager, size_t pool_idx) {
-  {
-    absl::MutexLock lock(mu_);
-    if (done_) {
-      return absl::NotFoundError(
-          absl::StrCat("no active receiver for UUID ", uuid_));
-    }
-    TF_RETURN_IF_ERROR(RecordPoolReceivedLocked(pool_idx));
-  }
-  ExecuteEligiblePoolH2ds(manager);
-  return absl::OkStatus();
-}
-
-void TransferReceiveSession::ExecuteEligiblePoolH2ds(
-    KVCacheManagerWithTransfer& manager) {
-  std::vector<std::pair<size_t, std::vector<int64_t>>> to_launch;
-  {
-    absl::MutexLock lock(mu_);
-    if (done_ || draining_) {
-      return;
-    }
-    to_launch = CollectEligiblePoolH2dsLocked();
-    in_flight_ += static_cast<int32_t>(to_launch.size());
-  }
-  for (auto& [pool_idx, dst_chip_block_ids] : to_launch) {
-    auto future_or = base_->H2dPoolBlocks(pool_idx, dst_chip_block_ids,
-                                          /*shard_idx=*/std::nullopt, uuid_);
-    if (!future_or.ok()) {
-      FinishPoolH2d(manager, pool_idx, future_or.status());
-      EndRecvOp();
-      continue;
-    }
-    raiden::PjRtCopyFuture future = *std::move(future_or);
-    {
-      absl::MutexLock lock(mu_);
-      h2d_futures_.push_back(future);
-    }
-    future.OnReady([this, &manager, pool_idx = pool_idx](auto status_or) {
-      FinishPoolH2d(manager, pool_idx,
-                    status_or.ok() ? absl::OkStatus() : status_or.status());
-      EndRecvOp();
-    });
-  }
-}
-
-void TransferReceiveSession::FinishPoolH2d(KVCacheManagerWithTransfer& manager,
-                                           size_t pool_idx,
-                                           const absl::Status& status) {
-  bool finished = false;
-  {
-    absl::MutexLock lock(mu_);
-    if (done_) {
-      return;
-    }
-    finished = RecordPoolH2dResultLocked(pool_idx, status);
-  }
-  if (!finished && status.ok()) {
-    ExecuteEligiblePoolH2ds(manager);
-  }
-  std::chrono::steady_clock::time_point session_start_time;
-  bool should_record_duration = false;
-  if (finished) {
-    absl::Status unregister = manager.UnregisterActivePlan(uuid_);
-    if (!unregister.ok() && !absl::IsNotFound(unregister)) {
-      LOG(ERROR) << "Failed to unregister pool reshard receiver plan " << uuid_
-                 << ": " << unregister;
-    }
-    bool has_failed = false;
-    {
-      absl::MutexLock lock(mu_);
-      unregister_on_settle_ = false;
-      if (!status.ok() || (!unregister.ok() && !absl::IsNotFound(unregister))) {
-        has_failed = true;
-      } else {
-        session_start_time = start_time_;
-        should_record_duration = true;
-        network_completed_ = true;
-      }
-    }
-    FinishRecv(has_failed);
-  }
-  if (should_record_duration) {
-    RecordTransferDuration(
-        DurationMs(session_start_time, std::chrono::steady_clock::now()));
-  }
 }
 
 }  // namespace tpu_raiden

@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -33,6 +34,7 @@
 #include "absl/types/span.h"
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/core/pool_reshard_send_slots.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
@@ -41,18 +43,59 @@
 
 namespace tpu_raiden {
 
+absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
+    kv_cache::KVCacheManagerBase* base,
+    StagingBlockAllocator* staging_allocator, int parallelism,
+    std::chrono::steady_clock::time_point deadline,
+    ::tpu_sync::rpc::StartTransferRequest plan) {
+  if (parallelism <= 0) {
+    return absl::InvalidArgumentError("parallelism must be positive");
+  }
+  auto schedule_it = plan.shard_push_schedules().find(0);
+  if (schedule_it == plan.shard_push_schedules().end()) {
+    if (plan.shard_push_schedules().size() != 1) {
+      return absl::InvalidArgumentError(
+          "sender plan must use local schedule key 0");
+    }
+    schedule_it = plan.shard_push_schedules().begin();
+  }
+  std::set<std::string> peers;
+  for (const auto& entry : schedule_it->second.entries()) {
+    peers.insert(entry.dst_peer());
+  }
+  if (peers.empty()) {
+    return absl::InvalidArgumentError("sender plan contains no peers");
+  }
+
+  // One completion per (pool, peer-with-entries): with sharded destinations
+  // a group may push each of its pools to a single peer, so pools x peers
+  // would wait for completions that never come (tpu-sync follow-up on #744).
+  const int remaining_pool_peer_pushes =
+      static_cast<int>(CountPoolReshardSendSlots(plan, schedule_it->second));
+  if (remaining_pool_peer_pushes <= 0) {
+    return absl::InvalidArgumentError("sender plan schedules no pushes");
+  }
+  std::string req_id = plan.req_id();
+  const uint64_t uuid = plan.uuid();
+  return std::shared_ptr<ReshardSendSession>(new ReshardSendSession(
+      base, staging_allocator, std::move(req_id), uuid, parallelism,
+      remaining_pool_peer_pushes, deadline, std::move(plan)));
+}
+
 ReshardSendSession::ReshardSendSession(
-    kv_cache::KVCacheManagerBase* base_in, std::string req_id_in,
-    uint64_t uuid_in, int parallelism_in, int remaining_pool_peer_pushes_in,
-    std::chrono::steady_clock::time_point deadline_in,
-    ::tpu_sync::rpc::StartTransferRequest plan_in)
-    : base_(base_in),
-      req_id_(std::move(req_id_in)),
-      uuid_(uuid_in),
-      parallelism_(parallelism_in),
-      deadline_(deadline_in),
-      plan_(std::move(plan_in)),
-      remaining_pool_peer_pushes_(remaining_pool_peer_pushes_in) {}
+    kv_cache::KVCacheManagerBase* base,
+    StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
+    int parallelism, int remaining_pool_peer_pushes,
+    std::chrono::steady_clock::time_point deadline,
+    ::tpu_sync::rpc::StartTransferRequest plan)
+    : base_(base),
+      staging_allocator_(staging_allocator),
+      req_id_(std::move(req_id)),
+      uuid_(uuid),
+      parallelism_(parallelism),
+      deadline_(deadline),
+      plan_(std::move(plan)),
+      remaining_pool_peer_pushes_(remaining_pool_peer_pushes) {}
 
 absl::Status ReshardSendSession::ExecutePush(
     KVCacheManagerWithTransfer& manager,
@@ -107,9 +150,8 @@ absl::Status ReshardSendSession::ExecutePush(
     // full-mirror storages). Released in SettleLocked.
     if (const kv_cache::PoolSpec* pool_spec = base_->pool(pool_idx);
         pool_spec != nullptr) {
-      absl::Status lease_status = base_->AcquirePoolStagingLease(
-          uuid_, pool_spec->storage_index, pool_src_block_ids,
-          base_->pool_staging_lease_timeout());
+      absl::Status lease_status = staging_allocator_->AcquirePoolStagingLease(
+          uuid_, pool_spec->storage_index, pool_src_block_ids);
       if (!lease_status.ok()) {
         Finish(manager, lease_status);
         EndOp();
@@ -272,7 +314,9 @@ void ReshardSendSession::EndOp() {
 void ReshardSendSession::SettleLocked() {
   // Every push of every pool has completed (or the send failed): release the
   // host staging arena slots and mark done atomically under |mu_|.
-  base_->ReleasePoolStagingLeases(uuid_);
+  if (staging_allocator_ != nullptr) {
+    staging_allocator_->ReleasePoolStagingLeases(uuid_);
+  }
   done_ = true;
 }
 

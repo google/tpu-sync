@@ -58,6 +58,7 @@ class StartTransferRequest;
 namespace tpu_raiden {
 
 class MetricsCollector;
+class ReshardReceiveSession;
 class ReshardSendSession;
 class TransferSendSession;
 class TransferReceiveSession;
@@ -200,6 +201,15 @@ class StagingBlockAllocator {
   // |base_->host_block_manager()|.
   absl::StatusOr<Allocation> AcquireDynamicBlocks(int64_t num_blocks);
 
+  // Leases bounded pool staging arena slots for |uuid| on |storage_index| for
+  // |device_block_ids| via |base_|.
+  absl::Status AcquirePoolStagingLease(
+      uint64_t uuid, size_t storage_index,
+      absl::Span<const int64_t> device_block_ids);
+
+  // Releases all bounded pool staging leases held by |uuid|.
+  void ReleasePoolStagingLeases(uint64_t uuid);
+
   size_t num_free_slots() const;
   absl::Span<const int> slot_blocks(int64_t slot_idx) const;
   int64_t num_slots() const { return num_slots_; }
@@ -231,9 +241,11 @@ class KVCacheManagerWithTransfer {
   using SendEntry = TransferSendSession;
   using RecvEntry = TransferReceiveSession;
   using PoolReshardSendEntry = ReshardSendSession;
+  using PoolReshardRecvEntry = ReshardReceiveSession;
   friend class TransferSendSession;
   friend class TransferReceiveSession;
   friend class ReshardSendSession;
+  friend class ReshardReceiveSession;
 
   KVCacheManagerWithTransfer(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -429,6 +441,9 @@ class KVCacheManagerWithTransfer {
 
   absl::flat_hash_map<uint64_t, std::shared_ptr<RecvEntry>>
       active_recv_entries_;
+
+  absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardReceiveSession>>
+      active_pool_reshard_recvs_;
 
   absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardSendSession>>
       active_pool_reshard_sends_;

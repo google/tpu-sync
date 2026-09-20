@@ -36,7 +36,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
-#include "tpu_sync/core/transfer_receive_session.h"
+#include "tpu_sync/core/reshard_receive_session.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -45,7 +45,7 @@
 namespace tpu_raiden {
 
 struct PoolReshardRecvTestPeer {
-  static void FinishPoolH2d(ReceiveSession& session,
+  static void FinishPoolH2d(ReshardReceiveSession& session,
                             KVCacheManagerWithTransfer& manager,
                             size_t pool_idx, const absl::Status& status) {
     session.FinishPoolH2d(manager, pool_idx, status);
@@ -77,11 +77,11 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   void FinishPoolReshardRecvPool(uint64_t uuid, size_t pool_idx,
                                  const absl::Status& status) {
-    std::shared_ptr<ReceiveSession> session;
+    std::shared_ptr<ReshardReceiveSession> session;
     {
       absl::MutexLock lock(mu_);
-      auto it = active_recv_entries_.find(uuid);
-      if (it == active_recv_entries_.end()) return;
+      auto it = active_pool_reshard_recvs_.find(uuid);
+      if (it == active_pool_reshard_recvs_.end()) return;
       session = it->second;
     }
     PoolReshardRecvTestPeer::FinishPoolH2d(*session, *this, pool_idx, status);

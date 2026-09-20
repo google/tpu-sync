@@ -198,7 +198,7 @@ bool TransferSendSession::AcquireStagingWithRetry(
     KVCacheManagerWithTransfer& manager,
     const std::vector<int64_t>& src_block_ids,
     std::vector<int64_t>* host_block_ids) {
-  // The entry's deadline, set when the producer registered the request,
+  // The session's deadline, set when the producer registered the request,
   // bounds the whole transfer; the wait for staging shares it rather than
   // starting a later one of its own.
   while (true) {

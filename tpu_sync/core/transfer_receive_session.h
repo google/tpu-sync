@@ -244,8 +244,6 @@ class TransferReceiveSession {
   uint64_t plan_generation_ ABSL_GUARDED_BY(mu_) = 0;
 };
 
-using ReceiveSession = TransferReceiveSession;
-
 }  // namespace tpu_raiden
 
 #endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_CORE_TRANSFER_RECEIVE_SESSION_H_

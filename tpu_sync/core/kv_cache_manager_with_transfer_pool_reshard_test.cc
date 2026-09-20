@@ -749,8 +749,7 @@ TEST(PoolReshardRecvTest, FinishPoolReshardRecvDoesNotRecordMetricOnFailure) {
                                     absl::InternalError("simulated failure"));
 }
 
-
-TEST(SendDeadlineTest, ExpiredSendEntryFailsInsteadOfReportingDone) {
+TEST(SendDeadlineTest, ExpiredSendSessionFailsInsteadOfReportingDone) {
   TestManager manager(/*timeout_s=*/0.05);
   ASSERT_GT(manager.NotifyForRead("expired_send_req", 31, {0, 1}), 0);
 
@@ -846,7 +845,7 @@ TEST(DemandStagingTest, UnregisteringInFlightReceiverDefersUntilItSettles) {
   EXPECT_EQ(pool->num_free_blocks(), free_before - 2);
 
   // ... until the receive settles; here it times out. Then the plan, its
-  // staging and the receive entry go together.
+  // staging and the receive session go together.
   absl::SleepFor(absl::Milliseconds(120));
   const auto [done_sending, done_recving, failed_recving] =
       manager.CompleteReadRaw();

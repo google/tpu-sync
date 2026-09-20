@@ -67,13 +67,13 @@ class TestManager : public KVCacheManagerWithTransfer {
   // consumer is acknowledged: the push runs on this thread and returns
   // with its copies issued.
   void ServePull(uint64_t uuid) {
-    std::shared_ptr<TransferSendSession> entry;
+    std::shared_ptr<TransferSendSession> session;
     {
       absl::MutexLock lock(mu_);
-      entry = send_entries_.at(uuid);
+      session = send_sessions_.at(uuid);
     }
-    entry->StartPush(*this, {"127.0.0.1:1"}, /*src_block_ids=*/{0},
-                     /*dst_block_ids=*/{0});
+    session->StartPush(*this, {"127.0.0.1:1"}, /*src_block_ids=*/{0},
+                       /*dst_block_ids=*/{0});
   }
 
   size_t copies_issued() {
@@ -94,25 +94,26 @@ class TestManager : public KVCacheManagerWithTransfer {
   std::shared_ptr<TransferSendSession> AddSyntheticSend(
       const std::string& req_id, uint64_t uuid, int in_flight) {
     absl::MutexLock lock(mu_);
-    auto entry = *TransferSendSession::Create(
+    auto session = *TransferSendSession::Create(
         base_.get(), staging_allocator_.get(), req_id, uuid, {},
         DeadlineFromNow(), std::chrono::steady_clock::now(), in_flight);
-    send_entries_[uuid] = entry;
-    return entry;
+    send_sessions_[uuid] = session;
+    return session;
   }
 
-  void Decide(const std::shared_ptr<TransferSendSession>& entry, bool failed) {
-    entry->FinishSend(failed);
+  void Decide(const std::shared_ptr<TransferSendSession>& session,
+              bool failed) {
+    session->FinishSend(failed);
   }
 
-  void End(const std::shared_ptr<TransferSendSession>& entry) {
-    entry->EndSendOp();
+  void End(const std::shared_ptr<TransferSendSession>& session) {
+    session->EndSendOp();
   }
 
   bool has_send(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    auto it = send_entries_.find(uuid);
-    return it != send_entries_.end() && !it->second->done();
+    auto it = send_sessions_.find(uuid);
+    return it != send_sessions_.end() && !it->second->done();
   }
 
  private:
@@ -160,7 +161,7 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
                std::optional<std::chrono::steady_clock::time_point> deadline =
                    std::nullopt) {
     absl::MutexLock lock(mu_);
-    active_recv_entries_[uuid] = TransferReceiveSession::Create(
+    active_recv_sessions_[uuid] = TransferReceiveSession::Create(
         base(), staging_allocator_.get(), uuid, req_id, blocks_per_layer,
         deadline.value_or(DeadlineFromNow()), /*acquire_staging=*/true);
   }
@@ -187,8 +188,8 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
 
   bool has_recv(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    auto it = active_recv_entries_.find(uuid);
-    return it != active_recv_entries_.end() && !it->second->done();
+    auto it = active_recv_sessions_.find(uuid);
+    return it != active_recv_sessions_.end() && !it->second->done();
   }
 
   void BlockH2dDispatch() { block_dispatch_.store(true); }
@@ -356,9 +357,9 @@ TEST(SendLifecycleTest, DuplicateBlocksAreRejectedAtRegistration) {
 
 TEST(SendLifecycleTest, SuccessfulSendWithoutWorkSettlesImmediately) {
   TestManager producer(/*num_layers=*/1);
-  auto entry = producer.AddSyntheticSend("req", /*uuid=*/10, /*in_flight=*/0);
+  auto session = producer.AddSyntheticSend("req", /*uuid=*/10, /*in_flight=*/0);
 
-  producer.Decide(entry, /*failed=*/false);
+  producer.Decide(session, /*failed=*/false);
   Reports reports = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(reports), Contains("req"));
   EXPECT_THAT(FailedRecving(reports), IsEmpty());
@@ -368,9 +369,9 @@ TEST(SendLifecycleTest, SuccessfulSendWithoutWorkSettlesImmediately) {
 
 TEST(SendLifecycleTest, FailedSendWithoutWorkSettlesImmediately) {
   TestManager producer(/*num_layers=*/1);
-  auto entry = producer.AddSyntheticSend("req", /*uuid=*/11, /*in_flight=*/0);
+  auto session = producer.AddSyntheticSend("req", /*uuid=*/11, /*in_flight=*/0);
 
-  producer.Decide(entry, /*failed=*/true);
+  producer.Decide(session, /*failed=*/true);
   Reports reports = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(reports), IsEmpty());
   EXPECT_THAT(FailedRecving(reports), Contains("req"));
@@ -380,17 +381,17 @@ TEST(SendLifecycleTest, FailedSendWithoutWorkSettlesImmediately) {
 
 TEST(SendLifecycleTest, SuccessfulSendWaitsForEveryOperation) {
   TestManager producer(/*num_layers=*/1);
-  auto entry = producer.AddSyntheticSend("req", /*uuid=*/12, /*in_flight=*/2);
+  auto session = producer.AddSyntheticSend("req", /*uuid=*/12, /*in_flight=*/2);
 
-  producer.Decide(entry, /*failed=*/false);
-  producer.End(entry);
+  producer.Decide(session, /*failed=*/false);
+  producer.End(session);
   Reports during = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(during), IsEmpty());
   EXPECT_THAT(FailedRecving(during), IsEmpty());
   EXPECT_TRUE(producer.has_send(12));
   EXPECT_EQ(producer.free_slots(), kSlots - 1);
 
-  producer.End(entry);
+  producer.End(session);
   Reports after = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(after), Contains("req"));
   EXPECT_THAT(FailedRecving(after), IsEmpty());
@@ -400,11 +401,11 @@ TEST(SendLifecycleTest, SuccessfulSendWaitsForEveryOperation) {
 
 TEST(SendLifecycleTest, FailureWinsWhileSuccessfulSendIsDraining) {
   TestManager producer(/*num_layers=*/1);
-  auto entry = producer.AddSyntheticSend("req", /*uuid=*/13, /*in_flight=*/1);
+  auto session = producer.AddSyntheticSend("req", /*uuid=*/13, /*in_flight=*/1);
 
-  producer.Decide(entry, /*failed=*/false);
-  producer.Decide(entry, /*failed=*/true);
-  producer.End(entry);
+  producer.Decide(session, /*failed=*/false);
+  producer.Decide(session, /*failed=*/true);
+  producer.End(session);
   Reports reports = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(reports), IsEmpty());
   EXPECT_THAT(FailedRecving(reports), Contains("req"));
@@ -414,11 +415,11 @@ TEST(SendLifecycleTest, FailureWinsWhileSuccessfulSendIsDraining) {
 
 TEST(SendLifecycleTest, SuccessCannotOverrideAnEarlierFailure) {
   TestManager producer(/*num_layers=*/1);
-  auto entry = producer.AddSyntheticSend("req", /*uuid=*/14, /*in_flight=*/1);
+  auto session = producer.AddSyntheticSend("req", /*uuid=*/14, /*in_flight=*/1);
 
-  producer.Decide(entry, /*failed=*/true);
-  producer.Decide(entry, /*failed=*/false);
-  producer.End(entry);
+  producer.Decide(session, /*failed=*/true);
+  producer.Decide(session, /*failed=*/false);
+  producer.End(session);
   Reports reports = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(reports), IsEmpty());
   EXPECT_THAT(FailedRecving(reports), Contains("req"));
@@ -576,7 +577,7 @@ TEST(RecvDrainTest, DuplicateUuidIsRejectedUntilExpiredReceiveDrains) {
 
   // Reusing a UUID while callbacks can still arrive would let old traffic
   // mutate the replacement. The public registration API must keep the old
-  // entry authoritative until its issued work has drained.
+  // session authoritative until its issued work has drained.
   EXPECT_FALSE(consumer
                    .RegisterRecv(/*uuid=*/28, "retry",
                                  /*expected_block_count=*/1)

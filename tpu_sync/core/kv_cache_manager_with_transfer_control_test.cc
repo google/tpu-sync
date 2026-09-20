@@ -100,8 +100,8 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   std::optional<std::string> recv_req_id(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    auto it = active_recv_entries_.find(uuid);
-    if (it == active_recv_entries_.end()) {
+    auto it = active_recv_sessions_.find(uuid);
+    if (it == active_recv_sessions_.end()) {
       return std::nullopt;
     }
     const std::shared_ptr<TransferReceiveSession>& session = it->second;
@@ -113,18 +113,18 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   bool has_recv(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    auto it = active_recv_entries_.find(uuid);
-    return it != active_recv_entries_.end() && !it->second->done();
+    auto it = active_recv_sessions_.find(uuid);
+    return it != active_recv_sessions_.end() && !it->second->done();
   }
 
   void MarkPullStarted(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    auto old = send_entries_.at(uuid);
-    auto entry = *TransferSendSession::Create(
+    auto old = send_sessions_.at(uuid);
+    auto session = *TransferSendSession::Create(
         base_.get(), staging_allocator_.get(), old->req_id(), uuid, {0},
         old->deadline(), old->register_start(), /*in_flight=*/0,
         /*pull_started=*/true);
-    send_entries_[uuid] = entry;
+    send_sessions_[uuid] = session;
   }
 };
 
@@ -670,7 +670,7 @@ TEST(ControlHandshakeTest, ConsumerGivesUpOnProducerThatNeverAnswers) {
   EXPECT_TRUE(producer.WaitUntilAccepted(reads, std::chrono::seconds(10)));
   EXPECT_LT(SecondsSince(start), 2 * kTimeoutS + 5.0);
 
-  // Every read settles rather than leaking its receive entry. With no
+  // Every read settles rather than leaking its receive session. With no
   // layers to receive, the completion sweep can also count an abandoned
   // read as done, so either report settles it here.
   std::vector<std::string> settled;

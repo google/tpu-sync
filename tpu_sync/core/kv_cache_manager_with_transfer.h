@@ -23,11 +23,9 @@
 #include <deque>
 #include <functional>
 #include <future>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -36,6 +34,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
@@ -238,10 +237,6 @@ using StagingAllocation = StagingBlockAllocator::Allocation;
 
 class KVCacheManagerWithTransfer {
  public:
-  using SendEntry = TransferSendSession;
-  using RecvEntry = TransferReceiveSession;
-  using PoolReshardSendEntry = ReshardSendSession;
-  using PoolReshardRecvEntry = ReshardReceiveSession;
   friend class TransferSendSession;
   friend class TransferReceiveSession;
   friend class ReshardSendSession;
@@ -422,8 +417,8 @@ class KVCacheManagerWithTransfer {
   // destination is host memory. Released when the plan is unregistered.
   absl::flat_hash_map<uint64_t, StagingAllocation> plan_staging_
       ABSL_GUARDED_BY(mu_);
-  absl::Status EmplaceRecvEntryLocked(uint64_t uuid,
-                                      const std::shared_ptr<RecvEntry>& entry)
+  absl::Status EmplaceRecvSessionLocked(
+      uint64_t uuid, const std::shared_ptr<TransferReceiveSession>& session)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   void StartControlServer();
@@ -439,8 +434,8 @@ class KVCacheManagerWithTransfer {
       size_t shard_idx, absl::Status status);
   void RemoveStagingReadinessLocked(int64_t slot_idx);
 
-  absl::flat_hash_map<uint64_t, std::shared_ptr<RecvEntry>>
-      active_recv_entries_;
+  absl::flat_hash_map<uint64_t, std::shared_ptr<TransferReceiveSession>>
+      active_recv_sessions_;
 
   absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardReceiveSession>>
       active_pool_reshard_recvs_;
@@ -474,18 +469,20 @@ class KVCacheManagerWithTransfer {
   bool unsafe_skip_buffer_lock_ = true;
 
   std::unique_ptr<StagingBlockAllocator> staging_allocator_;
-  // SendEntry is shared across threads: created/timed-out/cleaned-up on the
-  // main thread, but accessed asynchronously in control worker threads
+  // TransferSendSession is shared across threads: created/timed-out/cleaned-up
+  // on the main thread, but accessed asynchronously in control worker threads
   // handling pull connections.
-  std::map<uint64_t, std::shared_ptr<SendEntry>> send_entries_;
-  std::set<uint64_t> pending_acks_;
-  std::set<std::string> done_sending_;
-  std::set<std::string> done_recving_;
-  std::set<std::string> failed_recving_;
+  absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSendSession>>
+      send_sessions_;
+  absl::flat_hash_set<uint64_t> pending_acks_;
+  absl::flat_hash_set<std::string> done_sending_;
+  absl::flat_hash_set<std::string> done_recving_;
+  absl::flat_hash_set<std::string> failed_recving_;
   // StagingReadinessState is shared because it is captured by value in the
   // async PjRt copy callbacks (e.g. OnReady).
-  std::map<int64_t, std::shared_ptr<StagingReadinessState>> staging_readiness_;
-  std::map<int64_t, std::shared_ptr<StagingReadinessState>>
+  absl::flat_hash_map<int64_t, std::shared_ptr<StagingReadinessState>>
+      staging_readiness_;
+  absl::flat_hash_map<int64_t, std::shared_ptr<StagingReadinessState>>
       active_producer_blocks_;
   absl::Mutex mu_;
   absl::CondVar cv_;
@@ -502,7 +499,8 @@ class KVCacheManagerWithTransfer {
   // Drops the plan of a receive that has settled; a plan already gone, or
   // a newer registration reusing the uuid, is left alone.
   void UnregisterSettledPlan(uint64_t uuid, uint64_t generation);
-  void MaybeUnregisterSettledRecv(uint64_t uuid, RecvEntry& session);
+  void MaybeUnregisterSettledRecv(uint64_t uuid,
+                                  TransferReceiveSession& session);
   absl::StatusOr<PullStreamResponseSpec> HandlePullStream(
       const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);
   absl::Status HandleAck(uint64_t uuid);

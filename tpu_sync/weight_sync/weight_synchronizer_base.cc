@@ -751,6 +751,31 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       }
     }
   }
+  std::vector<int32_t> sorted_sliced_keys;
+  if (schedules.size() == num_shards_ && num_shards_ > 0) {
+    bool is_default_zero_based = true;
+    bool any_direct_match = false;
+    for (size_t i = 0; i < num_shards_; ++i) {
+      int64_t g_sh = global_shard_index(i);
+      int64_t l_sh = local_shard_index(i);
+      if (g_sh != static_cast<int64_t>(i) || l_sh != static_cast<int64_t>(i)) {
+        is_default_zero_based = false;
+        break;
+      }
+      if (schedules.contains(static_cast<int32_t>(l_sh)) ||
+          schedules.contains(static_cast<int32_t>(g_sh))) {
+        any_direct_match = true;
+        break;
+      }
+    }
+    if (is_default_zero_based && !any_direct_match) {
+      sorted_sliced_keys.reserve(schedules.size());
+      for (const auto& [sched_key, _] : schedules) {
+        sorted_sliced_keys.push_back(sched_key);
+      }
+      std::sort(sorted_sliced_keys.begin(), sorted_sliced_keys.end());
+    }
+  }
   for (size_t i = 0; i < num_shards_; ++i) {
     int64_t global_shard = global_shard_index(i);
     int64_t local_shard = local_shard_index(i);
@@ -766,6 +791,9 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       if (it == schedules.end() && global_shard >= 0) {
         it = schedules.find(static_cast<int32_t>(global_shard));
       }
+    }
+    if (it == schedules.end() && i < sorted_sliced_keys.size()) {
+      it = schedules.find(sorted_sliced_keys[i]);
     }
     if (it == schedules.end()) {
       continue;

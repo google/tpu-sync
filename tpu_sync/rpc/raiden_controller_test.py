@@ -4502,7 +4502,10 @@ class WeightSyncReceiverAndCacheLeakTest(absltest.TestCase):
           dst_endpoint_layer_counts=cached.dst_endpoint_layer_counts,
           is_weight_sync=True,
       )
-      for dst_unit, host in [(dst_unit_0, "10.0.1.1"), (dst_unit_1, "10.0.1.2")]:
+      for dst_unit, host in [
+          (dst_unit_0, "10.0.1.1"),
+          (dst_unit_1, "10.0.1.2"),
+      ]:
         encoded = ws_client._encode_start_transfer(
             dst_unit, plan, address=f"{host}:9000"
         )
@@ -4647,6 +4650,566 @@ class RaidenMultiPeerBroadcastDeduplicationTest(absltest.TestCase):
       req3 = raiden_service_pb2.ControlRequest()
       req3.ParseFromString(encoded3)
       self.assertEmpty(req3.start_transfer_request.shard_push_schedules)
+    finally:
+      client.close()
+
+
+class SenderScheduleSlicingAndPayloadCachingTest(absltest.TestCase):
+
+  def test_per_worker_schedule_slicing_pathways_multinuma(self):
+    """Verifies that in Pathways multi-NUMA mode (2 workers per host, sharing IP with different ports),
+
+    each worker receives ONLY its own local shards in ShardPushScheduleProto.
+    """
+    client = raiden_controller.WorkerRpcClient()
+    try:
+      src_unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+      dst_unit = raiden_controller.RaidenId("rollout", "0", "weights", 0)
+
+      # 2 hosts, 2 workers per host = 4 endpoints, 8 shards (2 shards per worker).
+      endpoints = [
+          "10.0.0.1:9000",
+          "10.0.0.1:9001",
+          "10.0.0.2:9000",
+          "10.0.0.2:9001",
+      ]
+      shards = [
+          "10.0.0.1:8000",
+          "10.0.0.1:8001",
+          "10.0.0.1:8002",
+          "10.0.0.1:8003",
+          "10.0.0.2:8000",
+          "10.0.0.2:8001",
+          "10.0.0.2:8002",
+          "10.0.0.2:8003",
+      ]
+      for ep in endpoints:
+        client.register_worker_endpoint(src_unit, ep)
+
+      # Build 8 shard push schedules
+      shard_schedules = {}
+      for shard_idx in range(8):
+        sched_proto = raiden_service_pb2.ShardPushScheduleProto()
+        entry = sched_proto.entries.add()
+        entry.dst_peer = "10.0.1.1:8000"
+        entry.dst_shard_idx = shard_idx
+        entry.size_bytes = 4096
+        shard_schedules[shard_idx] = sched_proto
+
+      plan = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          plan={},
+          shard_push_schedules={src_unit: {}},
+          worker_data_addresses={
+              src_unit: shards,
+              dst_unit: ["10.0.1.1:8000"],
+          },
+          is_sender=True,
+          is_weight_sync=True,
+          sender_push_schedule_protos={src_unit: shard_schedules},
+      )
+
+      # Worker 0 (host 1 port 9000): should own shards [0, 1]
+      encoded0 = client._encode_start_transfer(
+          src_unit, plan, address="10.0.0.1:9000"
+      )
+      req0 = raiden_service_pb2.ControlRequest()
+      req0.ParseFromString(encoded0)
+      self.assertEqual(
+          set(req0.start_transfer_request.shard_push_schedules.keys()), {0, 1}
+      )
+
+      # Worker 1 (host 1 port 9001): should own shards [2, 3]
+      encoded1 = client._encode_start_transfer(
+          src_unit, plan, address="10.0.0.1:9001"
+      )
+      req1 = raiden_service_pb2.ControlRequest()
+      req1.ParseFromString(encoded1)
+      self.assertEqual(
+          set(req1.start_transfer_request.shard_push_schedules.keys()), {2, 3}
+      )
+
+      # Worker 2 (host 2 port 9000): should own shards [4, 5]
+      encoded2 = client._encode_start_transfer(
+          src_unit, plan, address="10.0.0.2:9000"
+      )
+      req2 = raiden_service_pb2.ControlRequest()
+      req2.ParseFromString(encoded2)
+      self.assertEqual(
+          set(req2.start_transfer_request.shard_push_schedules.keys()), {4, 5}
+      )
+
+      # Worker 3 (host 2 port 9001): should own shards [6, 7]
+      encoded3 = client._encode_start_transfer(
+          src_unit, plan, address="10.0.0.2:9001"
+      )
+      req3 = raiden_service_pb2.ControlRequest()
+      req3.ParseFromString(encoded3)
+      self.assertEqual(
+          set(req3.start_transfer_request.shard_push_schedules.keys()), {6, 7}
+      )
+    finally:
+      client.close()
+
+  def test_serialize_once_when_payload_invariant(self):
+    """Verifies that when payload is invariant across workers, _encode_start_transfer is called once."""
+
+    class CountingWorkerRpcClient(raiden_controller.WorkerRpcClient):
+
+      def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.encode_count = 0
+        self.dispatched = []
+
+      def _encode_start_transfer(self, target_id, transfer_plan, address=None):
+        self.encode_count += 1
+        return super()._encode_start_transfer(
+            target_id, transfer_plan, address=address
+        )
+
+      async def _send_rpc(self, addr, payload, timeout=600.0):
+        self.dispatched.append((addr, payload))
+        resp = raiden_service_pb2.ControlResponse(success=True)
+        return resp.SerializeToString()
+
+    client = CountingWorkerRpcClient()
+    try:
+      src_unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+      dst_unit = raiden_controller.RaidenId("rollout", "0", "weights", 0)
+
+      # 4 worker endpoints on receiver (no endpoint specialization)
+      for i in range(4):
+        client.register_worker_endpoint(dst_unit, f"10.0.0.{i+1}:9000")
+
+      plan = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          plan={},
+          worker_data_addresses={
+              dst_unit: ["10.0.0.1:8000"],
+          },
+          is_sender=False,
+          expected_block_count=10,
+          is_weight_sync=True,
+      )
+
+      asyncio.run(client.start_transfer(dst_unit, plan))
+      # Invariant across 4 workers: encode MUST be called only 1 time
+      self.assertEqual(client.encode_count, 1)
+      self.assertEqual(len(client.dispatched), 4)
+      # All 4 workers must receive the exact same payload bytes
+      for _, payload in client.dispatched:
+        self.assertEqual(payload, client.dispatched[0][1])
+    finally:
+      client.close()
+
+  def test_steady_state_payload_caching_step1_reuses_bytes(self):
+    """Verifies that steady-state step 1+ reuses cached serialized bytes without re-serializing."""
+    client = raiden_controller.WorkerRpcClient()
+    try:
+      src_unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+      dst_unit = raiden_controller.RaidenId("rollout", "0", "weights", 0)
+
+      client.register_worker_endpoint(src_unit, "10.0.0.1:9000")
+      client.register_worker_endpoint(src_unit, "10.0.0.1:9001")
+
+      sched0 = raiden_service_pb2.ShardPushScheduleProto()
+      sched0.entries.add(
+          dst_peer="10.0.1.1:8000", dst_shard_idx=0, size_bytes=1024
+      )
+      sched1 = raiden_service_pb2.ShardPushScheduleProto()
+      sched1.entries.add(
+          dst_peer="10.0.1.1:8000", dst_shard_idx=1, size_bytes=1024
+      )
+
+      plan = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          plan={},
+          worker_data_addresses={
+              src_unit: ["10.0.0.1:8000", "10.0.0.1:8001"],
+              dst_unit: ["10.0.1.1:8000"],
+          },
+          is_sender=True,
+          is_weight_sync=True,
+          uuid=42,
+          req_id="steady_step_0",
+          sender_push_schedule_protos={src_unit: {0: sched0, 1: sched1}},
+      )
+
+      # Step 0: Initial serialization populates plan.cached_serialized_payloads
+      bytes_w0 = client._encode_start_transfer(
+          src_unit, plan, address="10.0.0.1:9000"
+      )
+      bytes_w1 = client._encode_start_transfer(
+          src_unit, plan, address="10.0.0.1:9001"
+      )
+      self.assertTrue(len(plan.cached_serialized_payloads) > 0)
+
+      # Clear sender_push_schedule_protos to prove Step 1 reuses cached bytes
+      plan.sender_push_schedule_protos.clear()
+
+      bytes_w0_step1 = client._encode_start_transfer(
+          src_unit, plan, address="10.0.0.1:9000"
+      )
+      bytes_w1_step1 = client._encode_start_transfer(
+          src_unit, plan, address="10.0.0.1:9001"
+      )
+
+      self.assertEqual(bytes_w0, bytes_w0_step1)
+      self.assertEqual(bytes_w1, bytes_w1_step1)
+    finally:
+      client.close()
+
+  def test_serialize_once_when_payload_invariant_sender_full_schedule(self):
+    """Verifies that when sender sends full schedule, encode runs once."""
+
+    class CountingWorkerRpcClient(raiden_controller.WorkerRpcClient):
+
+      def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.encode_count = 0
+        self.dispatched = []
+
+      def _encode_start_transfer(self, target_id, transfer_plan, address=None):
+        self.encode_count += 1
+        return super()._encode_start_transfer(
+            target_id, transfer_plan, address=address
+        )
+
+      async def _send_rpc(self, addr, payload, timeout=600.0):
+        self.dispatched.append((addr, payload))
+        resp = raiden_service_pb2.ControlResponse(success=True)
+        return resp.SerializeToString()
+
+    client = CountingWorkerRpcClient()
+    try:
+      src_unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+      dst_unit = raiden_controller.RaidenId("rollout", "0", "weights", 0)
+
+      # 4 addresses, but only 1 endpoint registered on target_id (cannot slice,
+      # sends full schedule).
+      client.register_worker_endpoint(src_unit, "10.0.0.1:9000")
+
+      sched = raiden_service_pb2.ShardPushScheduleProto()
+      sched.entries.add(
+          dst_peer="10.0.1.1:8000", dst_shard_idx=0, size_bytes=1024
+      )
+
+      plan = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          plan={},
+          worker_data_addresses={
+              src_unit: ["10.0.0.1:8000"],
+              dst_unit: ["10.0.1.1:8000"],
+          },
+          is_sender=True,
+          is_weight_sync=True,
+          sender_push_schedule_protos={src_unit: {0: sched}},
+      )
+
+      # When address="10.0.0.1:9000, 10.0.0.2:9000" but slicing is inactive,
+      # payload is invariant.
+      asyncio.run(
+          client.start_transfer(
+              src_unit, plan, address="10.0.0.1:9000, 10.0.0.2:9000"
+          )
+      )
+      self.assertEqual(client.encode_count, 1)
+      self.assertEqual(len(client.dispatched), 2)
+      self.assertEqual(client.dispatched[0][1], client.dispatched[1][1])
+    finally:
+      client.close()
+
+  def test_steady_state_payload_caching_step1_reuses_bytes_across_plans(self):
+    """Verifies that across distinct plans, cached bytes are reused."""
+    client = raiden_controller.WorkerRpcClient()
+    try:
+      src_unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+      dst_unit = raiden_controller.RaidenId("rollout", "0", "weights", 0)
+
+      client.register_worker_endpoint(src_unit, "10.0.0.1:9000")
+      client.register_worker_endpoint(src_unit, "10.0.0.1:9001")
+
+      sched0 = raiden_service_pb2.ShardPushScheduleProto()
+      sched0.entries.add(
+          dst_peer="10.0.1.1:8000", dst_shard_idx=0, size_bytes=1024
+      )
+      sched1 = raiden_service_pb2.ShardPushScheduleProto()
+      sched1.entries.add(
+          dst_peer="10.0.1.1:8000", dst_shard_idx=1, size_bytes=1024
+      )
+
+      shared_payload_cache = {}
+      plan_step0 = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          plan={},
+          worker_data_addresses={
+              src_unit: ["10.0.0.1:8000", "10.0.0.1:8001"],
+              dst_unit: ["10.0.1.1:8000"],
+          },
+          is_sender=True,
+          is_weight_sync=True,
+          skip_d2h=True,
+          uuid=100,
+          req_id="step_0",
+          sender_push_schedule_protos={src_unit: {0: sched0, 1: sched1}},
+          cached_serialized_payloads=shared_payload_cache,
+      )
+
+      bytes_w0_step0 = client._encode_start_transfer(
+          src_unit, plan_step0, address="10.0.0.1:9000"
+      )
+      bytes_w1_step0 = client._encode_start_transfer(
+          src_unit, plan_step0, address="10.0.0.1:9001"
+      )
+      self.assertNotEmpty(shared_payload_cache)
+
+      # Step 1: Newly instantiated TransferPlan with different req_id and uuid
+      plan_step1 = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          plan={},
+          worker_data_addresses={
+              src_unit: ["10.0.0.1:8000", "10.0.0.1:8001"],
+              dst_unit: ["10.0.1.1:8000"],
+          },
+          is_sender=True,
+          is_weight_sync=True,
+          skip_d2h=True,
+          uuid=101,
+          req_id="step_1",
+          # Empty: would fail/empty if re-serialized
+          sender_push_schedule_protos={},
+          cached_serialized_payloads=shared_payload_cache,
+      )
+
+      bytes_w0_step1 = client._encode_start_transfer(
+          src_unit, plan_step1, address="10.0.0.1:9000"
+      )
+      bytes_w1_step1 = client._encode_start_transfer(
+          src_unit, plan_step1, address="10.0.0.1:9001"
+      )
+
+      req_w0_step0 = raiden_service_pb2.ControlRequest()
+      req_w0_step0.ParseFromString(bytes_w0_step0)
+      req_w0_step1 = raiden_service_pb2.ControlRequest()
+      req_w0_step1.ParseFromString(bytes_w0_step1)
+      self.assertEqual(req_w0_step1.start_transfer_request.uuid, 101)
+      self.assertEqual(req_w0_step1.start_transfer_request.req_id, "step_1")
+      self.assertEqual(
+          req_w0_step1.start_transfer_request.shard_push_schedules,
+          req_w0_step0.start_transfer_request.shard_push_schedules,
+      )
+
+      req_w1_step0 = raiden_service_pb2.ControlRequest()
+      req_w1_step0.ParseFromString(bytes_w1_step0)
+      req_w1_step1 = raiden_service_pb2.ControlRequest()
+      req_w1_step1.ParseFromString(bytes_w1_step1)
+      self.assertEqual(req_w1_step1.start_transfer_request.uuid, 101)
+      self.assertEqual(
+          req_w1_step1.start_transfer_request.shard_push_schedules,
+          req_w1_step0.start_transfer_request.shard_push_schedules,
+      )
+
+      # Step 2: When uuid and skip_d2h match Step 0 (only req_id differs),
+      # exact serialized bytes are returned without re-encoding.
+      plan_step2 = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          plan={},
+          worker_data_addresses={
+              src_unit: ["10.0.0.1:8000", "10.0.0.1:8001"],
+              dst_unit: ["10.0.1.1:8000"],
+          },
+          is_sender=True,
+          is_weight_sync=True,
+          skip_d2h=True,
+          uuid=100,
+          req_id="step_2",
+          sender_push_schedule_protos={},
+          cached_serialized_payloads=shared_payload_cache,
+      )
+      bytes_w0_step2 = client._encode_start_transfer(
+          src_unit, plan_step2, address="10.0.0.1:9000"
+      )
+      bytes_w1_step2 = client._encode_start_transfer(
+          src_unit, plan_step2, address="10.0.0.1:9001"
+      )
+      self.assertEqual(bytes_w0_step0, bytes_w0_step2)
+      self.assertEqual(bytes_w1_step0, bytes_w1_step2)
+    finally:
+      client.close()
+
+  def test_per_worker_schedule_slicing_uneven_shards(self):
+    """Verifies that uneven shard-to-worker division accounts for all shards."""
+    client = raiden_controller.WorkerRpcClient()
+    try:
+      src_unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+      dst_unit = raiden_controller.RaidenId("rollout", "0", "weights", 0)
+
+      # 2 workers, 5 shards
+      client.register_worker_endpoint(src_unit, "10.0.0.1:9000")
+      client.register_worker_endpoint(src_unit, "10.0.0.1:9001")
+
+      schedules = {}
+      for s in range(5):
+        sched = raiden_service_pb2.ShardPushScheduleProto()
+        sched.entries.add(
+            dst_peer="10.0.1.1:8000", dst_shard_idx=s, size_bytes=1024
+        )
+        schedules[s] = sched
+
+      plan = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          plan={},
+          worker_data_addresses={
+              src_unit: [f"10.0.0.1:800{s}" for s in range(5)],
+              dst_unit: ["10.0.1.1:8000"],
+          },
+          is_sender=True,
+          is_weight_sync=True,
+          sender_push_schedule_protos={src_unit: schedules},
+      )
+
+      owned0 = client._get_worker_owned_shards(
+          src_unit, plan, address="10.0.0.1:9000"
+      )
+      owned1 = client._get_worker_owned_shards(
+          src_unit, plan, address="10.0.0.1:9001"
+      )
+
+      self.assertEqual(owned0, {0, 1})
+      self.assertEqual(owned1, {2, 3, 4})
+      self.assertEqual(owned0 | owned1, set(range(5)))
+      self.assertEqual(len(owned0 & owned1), 0)
+    finally:
+      client.close()
+
+  def test_per_worker_schedule_slicing_more_workers_than_shards(self):
+    """Verifies slicing when there are more workers than shards."""
+    client = raiden_controller.WorkerRpcClient()
+    try:
+      src_unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+      dst_unit = raiden_controller.RaidenId("rollout", "0", "weights", 0)
+
+      # 4 workers, 2 shards
+      for i in range(4):
+        client.register_worker_endpoint(src_unit, f"10.0.0.1:900{i}")
+
+      plan = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          plan={},
+          worker_data_addresses={
+              src_unit: ["10.0.0.1:8000", "10.0.0.1:8001"],
+              dst_unit: ["10.0.1.1:8000"],
+          },
+          is_sender=True,
+          is_weight_sync=True,
+      )
+
+      owned0 = client._get_worker_owned_shards(
+          src_unit, plan, address="10.0.0.1:9000"
+      )
+      owned1 = client._get_worker_owned_shards(
+          src_unit, plan, address="10.0.0.1:9001"
+      )
+      owned2 = client._get_worker_owned_shards(
+          src_unit, plan, address="10.0.0.1:9002"
+      )
+      owned3 = client._get_worker_owned_shards(
+          src_unit, plan, address="10.0.0.1:9003"
+      )
+
+      self.assertEqual(owned0, {0})
+      self.assertEqual(owned1, {1})
+      self.assertEqual(owned2, set())
+      self.assertEqual(owned3, set())
+    finally:
+      client.close()
+
+  def test_single_address_dispatch_preserves_slicing(self):
+    """Verifies that start_transfer with a single address preserves slicing."""
+
+    class SingleAddrClient(raiden_controller.WorkerRpcClient):
+
+      def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dispatched_reqs = []
+
+      async def _send_rpc(self, addr, payload, timeout=600.0):
+        req = raiden_service_pb2.ControlRequest()
+        req.ParseFromString(payload)
+        self.dispatched_reqs.append((addr, req))
+        resp = raiden_service_pb2.ControlResponse(success=True)
+        return resp.SerializeToString()
+
+    client = SingleAddrClient()
+    try:
+      src_unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+      dst_unit = raiden_controller.RaidenId("rollout", "0", "weights", 0)
+
+      # 2 workers registered on src_unit
+      client.register_worker_endpoint(src_unit, "10.0.0.1:9000")
+      client.register_worker_endpoint(src_unit, "10.0.0.1:9001")
+
+      s0 = raiden_service_pb2.ShardPushScheduleProto()
+      s0.entries.add(dst_peer="10.0.1.1:8000", dst_shard_idx=0, size_bytes=1024)
+      s1 = raiden_service_pb2.ShardPushScheduleProto()
+      s1.entries.add(dst_peer="10.0.1.1:8000", dst_shard_idx=1, size_bytes=1024)
+
+      plan = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          plan={},
+          worker_data_addresses={
+              src_unit: ["10.0.0.1:8000", "10.0.0.1:8001"],
+              dst_unit: ["10.0.1.1:8000"],
+          },
+          is_sender=True,
+          is_weight_sync=True,
+          sender_push_schedule_protos={src_unit: {0: s0, 1: s1}},
+      )
+
+      # Dispatch to single address directly
+      asyncio.run(
+          client.start_transfer(src_unit, plan, address="10.0.0.1:9001")
+      )
+      self.assertEqual(len(client.dispatched_reqs), 1)
+      addr, req = client.dispatched_reqs[0]
+      self.assertEqual(addr, "10.0.0.1:9001")
+      # Worker 1 must only receive shard 1, not shard 0
+      self.assertEqual(
+          set(req.start_transfer_request.shard_push_schedules.keys()), {1}
+      )
+    finally:
+      client.close()
+
+  def test_endpoint_to_shards_direct_address_key(self):
+    """Verifies endpoint_to_shards when keyed directly by address string."""
+    client = raiden_controller.WorkerRpcClient()
+    try:
+      src_unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+      dst_unit = raiden_controller.RaidenId("rollout", "0", "weights", 0)
+
+      plan = raiden_controller.TransferPlan(
+          src_units=[src_unit],
+          dst_units=[dst_unit],
+          plan={},
+          is_sender=True,
+          is_weight_sync=True,
+          endpoint_to_shards={"10.0.0.1:9000": [3, 7]},
+      )
+
+      owned = client._get_worker_owned_shards(
+          src_unit, plan, address="10.0.0.1:9000"
+      )
+      self.assertEqual(owned, {3, 7})
     finally:
       client.close()
 

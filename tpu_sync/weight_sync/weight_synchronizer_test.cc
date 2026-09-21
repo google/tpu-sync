@@ -1782,6 +1782,80 @@ TEST_F(WeightSynchronizerTest,
   }
 }
 
+TEST_F(WeightSynchronizerTest,
+       PreSlicedWorkerScheduleWithDefaultZeroBasedIndicesAndMultiStepUuid) {
+  const size_t num_layers = 1;
+  const size_t num_shards = 4;
+  const size_t slice_byte_size = 256;
+
+  // Source host is Worker 1 (owning cluster shards 4..7), but initialized with
+  // default 0-based local/global shard indices {0, 1, 2, 3} (e.g. PyTorch or
+  // default JAX WeightSynchronizer).
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+
+  // Controller sends ONLY the pre-sliced schedule keys {4, 5, 6, 7} owned by
+  // Worker 1.
+  auto* schedules = request.mutable_shard_push_schedules();
+  for (size_t s = 0; s < num_shards; ++s) {
+    size_t sliced_key = 4 + s;
+    auto* entry = (*schedules)[sliced_key].add_entries();
+    entry->set_dst_peer(dest_peer);
+    entry->set_dst_shard_idx(s);
+    entry->set_src_offset_bytes(0);
+    entry->set_dst_offset_bytes(0);
+    entry->set_size_bytes(slice_byte_size);
+    entry->set_count(1);
+    entry->set_layer_idx(0);
+  }
+
+  // Execute two consecutive steady-state steps (uuid=60001, then uuid=60002)
+  // to verify both pre-sliced key mapping and multi-step uuid synchronization.
+  const uint8_t step_patterns[2][4] = {
+      {0x11, 0x22, 0x33, 0x44},
+      {0x55, 0x66, 0x77, 0x88},
+  };
+  const uint64_t step_uuids[2] = {60001, 60002};
+
+  for (int step = 0; step < 2; ++step) {
+    for (size_t s = 0; s < num_shards; ++s) {
+      uint8_t* src_ptr =
+          const_cast<uint8_t*>(ws_source->GetHostBufferPtr(0, s));
+      uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostBufferPtr(0, s));
+      ASSERT_NE(src_ptr, nullptr);
+      ASSERT_NE(dst_ptr, nullptr);
+      std::memset(src_ptr, step_patterns[step][s], slice_byte_size);
+      std::memset(dst_ptr, 0x00, slice_byte_size);
+    }
+
+    request.set_uuid(step_uuids[step]);
+    ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), num_shards));
+    absl::Status status = ws_source->PushWeightsResharded(request);
+    EXPECT_TRUE(status.ok()) << status.message();
+    ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+    for (size_t s = 0; s < num_shards; ++s) {
+      const uint8_t* dst_ptr = ws_dest->GetHostBufferPtr(0, s);
+      ASSERT_NE(dst_ptr, nullptr);
+      for (size_t b = 0; b < slice_byte_size; ++b) {
+        EXPECT_EQ(dst_ptr[b], step_patterns[step][s])
+            << "Step " << step << " mismatch at slot " << s << " byte " << b;
+      }
+    }
+  }
+}
+
 }  // namespace
 }  // namespace weight_sync
 }  // namespace tpu_raiden

@@ -111,6 +111,9 @@ class _CachedTransferSchedule:
   sender_push_schedule_protos: dict[Any, dict[int, Any]] = dataclasses.field(
       default_factory=dict
   )
+  cached_serialized_payloads: dict[Any, bytes] = dataclasses.field(
+      default_factory=dict
+  )
 
 
 def to_physical(logical_shape, logical_mesh_shape, minor_to_major):
@@ -533,6 +536,12 @@ class TransferPlan:
   sender_push_schedule_protos: dict[RaidenId, dict[int, Any]] = (
       dataclasses.field(default_factory=dict, repr=False, compare=False)
   )
+  cached_serialized_payloads: dict[Any, bytes] = dataclasses.field(
+      default_factory=dict, repr=False, compare=False
+  )
+  endpoint_to_shards: dict[Any, Any] = dataclasses.field(
+      default_factory=dict, repr=False, compare=False
+  )
 
 
 def _coerce_pool_spec_proto(pool: Any) -> Any:
@@ -732,6 +741,138 @@ class WorkerRpcClient:
         message_type=self._proto_module.ControlRequest.DESCRIPTOR.full_name,
     )
 
+  def _get_worker_owned_shards(
+      self,
+      target_id: RaidenId,
+      transfer_plan: TransferPlan,
+      address: Optional[str],
+  ) -> Optional[set[int]]:
+    """Determines shard indices owned by a sender worker endpoint."""
+    if not address:
+      return None
+
+    addr_clean = address.strip()
+    if (
+        hasattr(transfer_plan, "endpoint_to_shards")
+        and transfer_plan.endpoint_to_shards
+    ):
+      if (target_id, addr_clean) in transfer_plan.endpoint_to_shards:
+        return set(transfer_plan.endpoint_to_shards[(target_id, addr_clean)])
+      if addr_clean in transfer_plan.endpoint_to_shards:
+        return set(transfer_plan.endpoint_to_shards[addr_clean])
+
+    endpoints = self._endpoints.get(target_id, [])
+    if not endpoints and hasattr(transfer_plan, "worker_rpc_addresses"):
+      rpc_addr = transfer_plan.worker_rpc_addresses.get(target_id, "")
+      if rpc_addr:
+        if isinstance(rpc_addr, (list, tuple)):
+          endpoints = [str(a).strip() for a in rpc_addr if str(a).strip()]
+        else:
+          endpoints = [a.strip() for a in str(rpc_addr).split(",") if a.strip()]
+
+    if not endpoints or len(endpoints) <= 1:
+      return None
+
+    norm_endpoints = []
+    for e in endpoints:
+      clean_e = e.strip()
+      if clean_e and clean_e not in norm_endpoints:
+        norm_endpoints.append(clean_e)
+
+    if addr_clean not in norm_endpoints:
+      return None
+    worker_idx = norm_endpoints.index(addr_clean)
+    num_workers = len(norm_endpoints)
+
+    # Determine total number of shards for target_id
+    num_shards = 0
+    data_shards = getattr(transfer_plan, "worker_data_addresses", {}).get(
+        target_id, []
+    )
+    if data_shards:
+      num_shards = len(data_shards)
+    if num_shards == 0:
+      cached_protos = getattr(
+          transfer_plan, "sender_push_schedule_protos", None
+      )
+      if (
+          cached_protos
+          and target_id in cached_protos
+          and cached_protos[target_id]
+      ):
+        num_shards = max(
+            len(cached_protos[target_id]),
+            max(cached_protos[target_id].keys()) + 1,
+        )
+    if num_shards == 0:
+      push_schedules = getattr(transfer_plan, "shard_push_schedules", {}).get(
+          target_id, {}
+      )
+      if push_schedules:
+        num_shards = max(
+            len(push_schedules),
+            max(push_schedules.keys()) + 1,
+        )
+
+    if num_shards <= 1:
+      return None
+
+    if num_shards < num_workers:
+      return {worker_idx} if worker_idx < num_shards else set()
+
+    start_shard = (worker_idx * num_shards) // num_workers
+    end_shard = ((worker_idx + 1) * num_shards) // num_workers
+    return set(range(start_shard, end_shard))
+
+  def _is_payload_invariant_across_addrs(
+      self,
+      target_id: RaidenId,
+      transfer_plan: TransferPlan,
+      addrs: list[str],
+  ) -> bool:
+    """Returns True if payload is identical across all worker addresses."""
+    if len(addrs) <= 1:
+      return True
+
+    is_sender = target_id in getattr(
+        transfer_plan, "src_units", []
+    ) and getattr(transfer_plan, "is_sender", False)
+    if is_sender:
+      cached_protos = getattr(
+          transfer_plan, "sender_push_schedule_protos", None
+      )
+      has_protos = bool(cached_protos and target_id in cached_protos)
+      push_schedules = getattr(transfer_plan, "shard_push_schedules", {}).get(
+          target_id
+      )
+      if not has_protos and not push_schedules:
+        return True
+
+      # Check if schedule slicing actually differentiates the addresses.
+      # When sending the full schedule (e.g. slicing returns None) or
+      # when all addresses share identical owned shards, payload is invariant.
+      first_owned = self._get_worker_owned_shards(
+          target_id, transfer_plan, addrs[0]
+      )
+      for addr in addrs[1:]:
+        if (
+            self._get_worker_owned_shards(target_id, transfer_plan, addr)
+            != first_owned
+        ):
+          return False
+      return True
+
+    # Receiver: check if endpoint specialization is active
+    dst_counts = getattr(transfer_plan, "dst_endpoint_counts", None)
+    dst_layer_counts = getattr(transfer_plan, "dst_endpoint_layer_counts", None)
+    if dst_counts or dst_layer_counts:
+      return False
+    if self.include_receiver_push_schedules(transfer_plan) and getattr(
+        transfer_plan, "shard_push_schedules", None
+    ):
+      return False
+    return True
+
   async def start_transfer(
       self,
       target_id: RaidenId,
@@ -759,20 +900,34 @@ class WorkerRpcClient:
       addrs = await self._resolve_endpoints(target_id)
 
     coros = []
-    for addr in addrs:
+    if self._is_payload_invariant_across_addrs(target_id, transfer_plan, addrs):
       try:
+        spec_addr = addrs[0] if addrs else None
         try:
-          spec_addr = addr if len(addrs) > 1 else None
           payload = self._encode_start_transfer(
               target_id, transfer_plan, address=spec_addr
           )
         except TypeError:
           payload = self._encode_start_transfer(target_id, transfer_plan)
-        if not payload:
-          continue
       except NotImplementedError:
-        continue
-      coros.append(self._send_and_verify(addr, payload))
+        payload = None
+      if payload:
+        for addr in addrs:
+          coros.append(self._send_and_verify(addr, payload))
+    else:
+      for addr in addrs:
+        try:
+          try:
+            payload = self._encode_start_transfer(
+                target_id, transfer_plan, address=addr
+            )
+          except TypeError:
+            payload = self._encode_start_transfer(target_id, transfer_plan)
+          if not payload:
+            continue
+        except NotImplementedError:
+          continue
+        coros.append(self._send_and_verify(addr, payload))
 
     if coros:
       await asyncio.gather(*coros)
@@ -811,6 +966,69 @@ class WorkerRpcClient:
         and target_id not in transfer_plan.dst_units
     ):
       return None
+
+    payload_cache = getattr(transfer_plan, "cached_serialized_payloads", None)
+    uuid_val = getattr(transfer_plan, "uuid", None)
+    req_id_val = getattr(transfer_plan, "req_id", None)
+    skip_d2h_val = bool(getattr(transfer_plan, "skip_d2h", False))
+    is_sender = target_id in transfer_plan.src_units and transfer_plan.is_sender
+    is_ws = getattr(transfer_plan, "is_weight_sync", False)
+    ep_count = len(self._endpoints.get(target_id, []))
+    include_recv_sched = self.include_receiver_push_schedules(transfer_plan)
+    cache_key = (
+        target_id,
+        address,
+        uuid_val,
+        req_id_val,
+        skip_d2h_val,
+        is_sender,
+        is_ws,
+        ep_count,
+        include_recv_sched,
+    )
+    steady_key = (
+        target_id,
+        address,
+        uuid_val,
+        skip_d2h_val,
+        is_sender,
+        is_ws,
+        ep_count,
+        include_recv_sched,
+    )
+    template_key = (
+        "__template__",
+        target_id,
+        address,
+        is_sender,
+        is_ws,
+        int(transfer_plan.dst_mem_type),
+        bool(transfer_plan.use_block_chunks),
+        int(transfer_plan.parallelism or 0),
+        ep_count,
+        include_recv_sched,
+    )
+
+    if payload_cache is not None:
+      if cache_key in payload_cache:
+        return payload_cache[cache_key]
+      # When uuid and skip_d2h are invariant across steps (e.g. uuid == 0 or
+      # repeated uuid), req_id is unused by C++ WeightSynchronizer so the exact
+      # serialized payload bytes can be returned directly.
+      if is_sender and is_ws and steady_key in payload_cache:
+        return payload_cache[steady_key]
+      # When uuid or skip_d2h changed across steps, reuse the pre-populated
+      # ControlRequest proto template and update only scalar step fields (uuid,
+      # req_id, skip_d2h) without rebuilding or copying push schedules.
+      if is_sender and is_ws and template_key in payload_cache:
+        cached_req = payload_cache[template_key]
+        cached_req.start_transfer_request.uuid = int(uuid_val or 0)
+        cached_req.start_transfer_request.req_id = str(req_id_val or "")
+        cached_req.start_transfer_request.skip_d2h = skip_d2h_val
+        serialized_bytes = cached_req.SerializeToString()
+        payload_cache[cache_key] = serialized_bytes
+        payload_cache[steady_key] = serialized_bytes
+        return serialized_bytes
 
     peers = []
     for dst in transfer_plan.dst_units:
@@ -857,16 +1075,13 @@ class WorkerRpcClient:
         dst_units=[
             self._raiden_id_to_proto(u) for u in transfer_plan.dst_units
         ],
-        uuid=transfer_plan.uuid,
         is_sender=is_sender,
         dst_mem_type=int(transfer_plan.dst_mem_type),
         use_block_chunks=transfer_plan.use_block_chunks,
         expected_block_count=expected_block_count,
-        req_id=transfer_plan.req_id,
         transfer_pool_indices=transfer_plan.transfer_pool_indices,
         pool_dtype_tags=transfer_plan.pool_dtype_tags,
         parallelism=transfer_plan.parallelism,
-        skip_d2h=transfer_plan.skip_d2h,
     )
     for layer_idx, skip in transfer_plan.skip_tiling.items():
       start_req.skip_tiling[layer_idx] = skip
@@ -886,9 +1101,15 @@ class WorkerRpcClient:
       )
       group_proto.order_rank = int(group.get("order_rank", 0))
 
-    if transfer_plan.shard_push_schedules:
+    cached_protos = getattr(
+        transfer_plan, "sender_push_schedule_protos", None
+    )
+    if transfer_plan.shard_push_schedules or cached_protos:
       if not is_sender:
-        if self.include_receiver_push_schedules(transfer_plan):
+        if (
+            transfer_plan.shard_push_schedules
+            and self.include_receiver_push_schedules(transfer_plan)
+        ):
           # Receiver path: send FILTERED plan, only containing entries for this
           # receiver
           target_endpoints = transfer_plan.worker_data_addresses.get(
@@ -916,9 +1137,7 @@ class WorkerRpcClient:
                 key_idx = src_base * num_src_shards + shard_idx
               schedule_proto = self._proto_module.ShardPushScheduleProto()
               raw_entries = (
-                  schedule.entries
-                  if hasattr(schedule, "entries")
-                  else schedule
+                  schedule.entries if hasattr(schedule, "entries") else schedule
               )
               target_endpoints_set = set(target_endpoints)
               for entry_item in raw_entries:
@@ -983,12 +1202,19 @@ class WorkerRpcClient:
                 start_req.shard_push_schedules[key_idx].CopyFrom(schedule_proto)
       else:
         # Sender path: reuse cached pre-built ShardPushScheduleProto if present
+        owned_shards = None
+        if address:
+          owned_shards = self._get_worker_owned_shards(
+              target_id, transfer_plan, address
+          )
+
         cached_protos = getattr(
             transfer_plan, "sender_push_schedule_protos", None
         )
         if cached_protos is not None and target_id in cached_protos:
           for shard_idx, schedule_proto in cached_protos[target_id].items():
-            start_req.shard_push_schedules[shard_idx].CopyFrom(schedule_proto)
+            if owned_shards is None or shard_idx in owned_shards:
+              start_req.shard_push_schedules[shard_idx].CopyFrom(schedule_proto)
         else:
           push_schedules = transfer_plan.shard_push_schedules.get(target_id)
           if push_schedules:
@@ -996,17 +1222,29 @@ class WorkerRpcClient:
                 push_schedules
             )
             for shard_idx, schedule_proto in target_protos.items():
-              start_req.shard_push_schedules[shard_idx].CopyFrom(schedule_proto)
+              if owned_shards is None or shard_idx in owned_shards:
+                start_req.shard_push_schedules[shard_idx].CopyFrom(
+                    schedule_proto
+                )
             if cached_protos is not None:
               cached_protos[target_id] = target_protos
 
+    start_req.uuid = int(uuid_val or 0)
+    start_req.req_id = str(req_id_val or "")
+    start_req.skip_d2h = skip_d2h_val
     req.start_transfer_request.CopyFrom(start_req)
-    return req.SerializeToString()
+    serialized_bytes = req.SerializeToString()
+    if payload_cache is not None:
+      payload_cache[cache_key] = serialized_bytes
+      if is_sender and is_ws:
+        payload_cache[steady_key] = serialized_bytes
+        payload_cache[template_key] = req
+    return serialized_bytes
 
   def build_sender_push_schedule_protos(
       self, push_schedules: dict[int, list[Any]]
   ) -> dict[int, Any]:
-    """Builds ShardPushScheduleProto objects for each shard from raw schedule tuples."""
+    """Builds ShardPushScheduleProto objects for shards from schedule tuples."""
     target_protos = {}
     for shard_idx, entries in push_schedules.items():
       schedule_proto = self._proto_module.ShardPushScheduleProto()
@@ -1029,14 +1267,10 @@ class WorkerRpcClient:
           dst_stride = entry_item.dst_stride_bytes
           count = entry_item.count
           layer_idx = (
-              entry_item.layer_idx
-              if entry_item.HasField("layer_idx")
-              else 0
+              entry_item.layer_idx if entry_item.HasField("layer_idx") else 0
           )
           pool_group = (
-              entry_item.pool_group
-              if entry_item.HasField("pool_group")
-              else 0
+              entry_item.pool_group if entry_item.HasField("pool_group") else 0
           )
         else:
           (
@@ -1932,8 +2166,12 @@ class RaidenController:
         else:
           if endpoints:
             cached_sched.rpc_addresses[unit] = ",".join(endpoints)
+            cached_sched.cached_serialized_payloads.clear()
+            cached_sched.sender_push_schedule_protos.clear()
           if unit in cached_sched.data_addresses:
             cached_sched.data_addresses[unit] = list(normalized_shards)
+            cached_sched.cached_serialized_payloads.clear()
+            cached_sched.sender_push_schedule_protos.clear()
       for k in keys_to_clear:
         self._plan_cache.pop(k, None)
 
@@ -2546,6 +2784,10 @@ class RaidenController:
       unit = _raiden_id_from_proto(meta.unit)
       if unit in data_addresses:
         data_addresses[unit] = list(meta.shards)
+    for unit in src_units:
+      with self._lock:
+        if unit in self._registered_shards:
+          data_addresses[unit] = list(self._registered_shards[unit])
 
     # Group flat entries into slices for broadcast
     groups = {}
@@ -2749,8 +2991,7 @@ class RaidenController:
 
   @classmethod
   def _metadata_by_unit(
-      cls,
-      metadata: typing.Sequence[Any], units: typing.Sequence[RaidenId]
+      cls, metadata: typing.Sequence[Any], units: typing.Sequence[RaidenId]
   ) -> dict[RaidenId, Any]:
     """Selects exact requested metadata and rejects duplicate identities."""
     requested = set(units)
@@ -3187,6 +3428,13 @@ class RaidenController:
               is_weight_sync=cached_schedule.is_weight_sync,
               sender_push_schedule_protos=(
                   cached_schedule.sender_push_schedule_protos
+                  if not broadcast_groups
+                  else {}
+              ),
+              cached_serialized_payloads=(
+                  cached_schedule.cached_serialized_payloads
+                  if not broadcast_groups
+                  else {}
               ),
           )
           with self._lock:
@@ -3223,6 +3471,9 @@ class RaidenController:
                 is_weight_sync=cached_schedule.is_weight_sync,
                 sender_push_schedule_protos=(
                     cached_schedule.sender_push_schedule_protos
+                ),
+                cached_serialized_payloads=(
+                    cached_schedule.cached_serialized_payloads
                 ),
             )
 

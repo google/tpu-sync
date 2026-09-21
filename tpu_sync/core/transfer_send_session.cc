@@ -161,12 +161,10 @@ void TransferSendSession::ReleaseSlot() {
 }
 
 void TransferSendSession::FinishLocked(const absl::Status& status) {
-  if (!status.ok() && status_.ok()) {
-    status_ = status;
-  }
-  if (draining_) return;
+  if (draining_ || done_) return;
+  status_ = status;
   draining_ = true;
-  if (in_flight_ == 0 && !done_) {
+  if (in_flight_ == 0) {
     ReleaseSlotLocked();
     done_ = true;
   }

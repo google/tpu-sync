@@ -430,5 +430,37 @@ TEST(TransferSendSessionTest,
   EXPECT_EQ(allocator->num_free_slots(), 2);
 }
 
+TEST(TransferSendSessionTest, StatusIsFrozenOnceSessionIsDrainingOrDone) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  base.SetManualD2h(true);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/1);
+  const auto now = std::chrono::steady_clock::now();
+
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_freeze", /*uuid=*/305, /*block_ids=*/{0},
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
+
+  session->Finish(absl::OkStatus());
+  EXPECT_TRUE(session->IsDraining());
+  EXPECT_FALSE(session->Done());
+  ABSL_EXPECT_OK(session->GetStatus());
+
+  // Subsequent error while draining must not overwrite the frozen status_.
+  session->Finish(absl::CancelledError("manager shutdown"));
+  ABSL_EXPECT_OK(session->GetStatus());
+
+  base.CompleteD2h(0, absl::OkStatus());
+  ABSL_EXPECT_OK(session->AwaitForDone());
+  EXPECT_TRUE(session->Done());
+
+  // Subsequent error after done must not overwrite the frozen status_.
+  session->Finish(absl::InternalError("late error"));
+  ABSL_EXPECT_OK(session->GetStatus());
+}
+
 }  // namespace
 }  // namespace tpu_raiden

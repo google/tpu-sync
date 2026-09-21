@@ -240,12 +240,15 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
   // Pull-serve workers read this object's state; nothing may be torn down
   // while one is still running.
   shutting_down_.store(true, std::memory_order_relaxed);
+  std::vector<std::shared_ptr<TransferSendSession>> sessions_to_wait;
   {
     absl::MutexLock lock(mu_);
+    sessions_to_wait.reserve(send_sessions_.size());
     for (const auto& [uuid, session] : send_sessions_) {
       (void)uuid;
       session->Finish(
           absl::CancelledError("KVCacheManagerWithTransfer shutting down"));
+      sessions_to_wait.push_back(session);
     }
   }
   if (staging_allocator_) {
@@ -255,6 +258,9 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
     absl::MutexLock lock(pull_workers_mu_);
     pull_workers_mu_.Await(absl::Condition(
         +[](int* active) { return *active == 0; }, &active_pull_workers_));
+  }
+  for (const auto& session : sessions_to_wait) {
+    session->AwaitForDone().IgnoreError();
   }
   if (base_) {
     base_->StopTransportServer();
@@ -1393,6 +1399,15 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
         if (!session->Done()) {
           send_pending = true;
           break;
+        }
+      }
+      if (!send_pending) {
+        for (const auto& [uuid, session] : send_sessions_) {
+          (void)uuid;
+          if (!session->Done()) {
+            send_pending = true;
+            break;
+          }
         }
       }
       if (!recv_pending && !send_pending) {

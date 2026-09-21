@@ -25,6 +25,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -33,6 +34,7 @@
 #include <gtest/gtest.h>
 #include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
@@ -58,11 +60,11 @@ constexpr double kTimeoutS = 0.05;
 // A producer whose device-to-host copies complete when the test says so.
 class TestManager : public KVCacheManagerWithTransfer {
  public:
-  explicit TestManager(size_t num_layers)
+  explicit TestManager(size_t num_layers, double timeout_s = kTimeoutS)
       : KVCacheManagerWithTransfer(std::make_unique<TestBase>(num_layers, this),
                                    /*node_id=*/0,
                                    /*local_control_port=*/-1, /*max_blocks=*/1,
-                                   /*num_slots=*/kSlots, kTimeoutS) {}
+                                   /*num_slots=*/kSlots, timeout_s) {}
 
   // Serves a pull for `uuid` the way ProcessPullStream does once the
   // consumer is acknowledged: the push runs on this thread and returns
@@ -405,7 +407,7 @@ TEST(SendLifecycleTest, SuccessfulSendWaitsForEveryOperation) {
   EXPECT_EQ(producer.free_slots(), kSlots);
 }
 
-TEST(SendLifecycleTest, FailureWinsWhileSuccessfulSendIsDraining) {
+TEST(SendLifecycleTest, FailureCannotOverrideAnEarlierSuccess) {
   TestManager producer(/*num_layers=*/1);
   auto session = producer.AddSyntheticSend("req", /*uuid=*/13, /*in_flight=*/1);
 
@@ -413,8 +415,8 @@ TEST(SendLifecycleTest, FailureWinsWhileSuccessfulSendIsDraining) {
   producer.Decide(session, /*failed=*/true);
   producer.FinishCopy(0, absl::OkStatus());
   Reports reports = producer.CompleteReadRaw();
-  EXPECT_THAT(DoneSending(reports), IsEmpty());
-  EXPECT_THAT(FailedRecving(reports), Contains("req"));
+  EXPECT_THAT(DoneSending(reports), Contains("req"));
+  EXPECT_THAT(FailedRecving(reports), IsEmpty());
   EXPECT_FALSE(producer.has_send(13));
   EXPECT_EQ(producer.free_slots(), kSlots);
 }
@@ -681,6 +683,28 @@ TEST(RecvDrainTest, TimeoutDuringH2dDispatchKeepsStaging) {
   EXPECT_THAT(DoneSending(repeated), IsEmpty());
   EXPECT_THAT(DoneReceiving(repeated), IsEmpty());
   EXPECT_THAT(FailedRecving(repeated), IsEmpty());
+}
+
+TEST(SendDrainTest, WaitForPendingWorkWaitsForActiveSendSession) {
+  TestManager producer(/*num_layers=*/1, /*timeout_s=*/5.0);
+  auto session = producer.AddSyntheticSend("req", /*uuid=*/77, /*in_flight=*/1);
+  producer.Decide(session, /*failed=*/false);
+  ASSERT_EQ(producer.copies_issued(), 1);
+
+  absl::Notification wait_finished;
+  absl::Status wait_status;
+  std::thread waiter([&]() {
+    wait_status = producer.WaitForPendingWork();
+    wait_finished.Notify();
+  });
+
+  EXPECT_FALSE(
+      wait_finished.WaitForNotificationWithTimeout(absl::Milliseconds(150)));
+
+  producer.FinishCopy(0, absl::OkStatus());
+  EXPECT_TRUE(wait_finished.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_THAT(wait_status, ::absl_testing::IsOk());
+  waiter.join();
 }
 
 }  // namespace

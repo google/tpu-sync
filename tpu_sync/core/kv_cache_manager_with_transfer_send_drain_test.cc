@@ -742,5 +742,37 @@ TEST(RecvLifecycleTest,
   EXPECT_EQ(consumer.free_slots(), kSlots);
 }
 
+TEST(RecvLifecycleTest,
+     WaitForPendingWorkSettlesReadyZeroLayerReceiveWithoutHanging) {
+  RecvTestManager consumer(/*num_layers=*/0, /*timeout_s=*/1.0);
+  consumer.AddRecv("req_zero_layers", /*uuid=*/89, /*blocks_per_layer=*/1);
+  EXPECT_TRUE(consumer.has_recv(89));
+
+  EXPECT_THAT(consumer.WaitForPendingWork(), ::absl_testing::IsOk());
+  EXPECT_FALSE(consumer.has_recv(89));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+
+  Reports reports = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneReceiving(reports), Contains("req_zero_layers"));
+  EXPECT_THAT(FailedRecving(reports), IsEmpty());
+}
+
+TEST(RecvLifecycleTest, ZeroBlockActivePlanSettlesImmediately) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/1.0);
+  ::tpu_sync::rpc::StartTransferRequest request;
+  request.set_uuid(90);
+  request.set_req_id("req_zero_blocks");
+  absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>
+      host_block_of;
+  auto session_or = TransferReceiveSession::CreateFromActivePlan(
+      consumer.base(), consumer.staging_allocator(), /*uuid=*/90, request,
+      /*generation=*/1,
+      std::chrono::steady_clock::now() + std::chrono::seconds(10),
+      &host_block_of);
+  ASSERT_THAT(session_or, ::absl_testing::IsOk());
+  EXPECT_TRUE((*session_or)->Done());
+  EXPECT_THAT((*session_or)->GetStatus(), ::absl_testing::IsOk());
+}
+
 }  // namespace
 }  // namespace tpu_raiden

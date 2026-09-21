@@ -51,7 +51,9 @@ class StagingBlockAllocator;
 // readiness accounting, and order-ranked H2D copy execution.
 //
 // Thread-safe: all mutable session state is synchronized via internal |mu_|.
-class ReshardReceiveSession : public TransferSession {
+class ReshardReceiveSession
+    : public TransferSession,
+      public std::enable_shared_from_this<ReshardReceiveSession> {
  public:
   // Creates and initializes a consumer pool-reshard receive session for |plan|,
   // acquiring bounded pool staging leases per storage via |staging_allocator|.

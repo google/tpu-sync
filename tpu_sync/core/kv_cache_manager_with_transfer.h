@@ -269,6 +269,10 @@ class KVCacheManagerWithTransfer {
 
   virtual absl::Status WaitForPendingWork();
 
+  bool IsShuttingDown() const {
+    return shutting_down_.load(std::memory_order_relaxed);
+  }
+
   virtual absl::Status OnBlocksReceived(const std::vector<int>& block_ids,
                                         uint64_t uuid = 0);
 

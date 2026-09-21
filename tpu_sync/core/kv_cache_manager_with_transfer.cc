@@ -56,6 +56,7 @@
 #include "tpu_sync/core/reshard_send_session.h"
 #include "tpu_sync/core/transfer_receive_session.h"
 #include "tpu_sync/core/transfer_send_session.h"
+#include "tpu_sync/core/transfer_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
@@ -240,14 +241,32 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
   // Pull-serve workers read this object's state; nothing may be torn down
   // while one is still running.
   shutting_down_.store(true, std::memory_order_relaxed);
-  std::vector<std::shared_ptr<TransferSendSession>> sessions_to_wait;
+  std::vector<std::shared_ptr<TransferSession>> sessions_to_wait;
   {
     absl::MutexLock lock(mu_);
-    sessions_to_wait.reserve(send_sessions_.size());
+    sessions_to_wait.reserve(
+        send_sessions_.size() + active_recv_sessions_.size() +
+        active_pool_reshard_sends_.size() + active_pool_reshard_recvs_.size());
+    const absl::Status cancel_status =
+        absl::CancelledError("KVCacheManagerWithTransfer shutting down");
     for (const auto& [uuid, session] : send_sessions_) {
       (void)uuid;
-      session->Finish(
-          absl::CancelledError("KVCacheManagerWithTransfer shutting down"));
+      session->Finish(cancel_status);
+      sessions_to_wait.push_back(session);
+    }
+    for (const auto& [uuid, session] : active_recv_sessions_) {
+      (void)uuid;
+      session->Finish(cancel_status);
+      sessions_to_wait.push_back(session);
+    }
+    for (const auto& [uuid, session] : active_pool_reshard_sends_) {
+      (void)uuid;
+      session->Finish(cancel_status);
+      sessions_to_wait.push_back(session);
+    }
+    for (const auto& [uuid, session] : active_pool_reshard_recvs_) {
+      (void)uuid;
+      session->Finish(cancel_status);
       sessions_to_wait.push_back(session);
     }
   }
@@ -273,6 +292,7 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
     absl::MutexLock lock(mu_);
     send_sessions_.clear();
     active_recv_sessions_.clear();
+    active_pool_reshard_sends_.clear();
     active_pool_reshard_recvs_.clear();
     plan_staging_.clear();
   }

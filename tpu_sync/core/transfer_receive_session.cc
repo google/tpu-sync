@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "absl/base/nullability.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
@@ -462,19 +463,20 @@ void TransferReceiveSession::ExecutePullRequest(
   }
 
   base_->push_pool()->Schedule(
-      target_node, [this, &manager, remote_endpoint, session_req_id,
-                    load_plan = std::move(load_plan)]() {
+      target_node, [self = shared_from_this(), &manager, remote_endpoint,
+                    session_req_id, load_plan = std::move(load_plan)]() {
+        absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
         absl::Status pull_status = absl::OkStatus();
         try {
           LOG(INFO) << "StartRead (connecting): req_id=" << session_req_id
-                    << ", uuid=" << uuid_
-                    << ", numa=" << base_->assigned_numa_node().value_or(-1);
+                    << ", uuid=" << self->uuid_ << ", numa="
+                    << self->base_->assigned_numa_node().value_or(-1);
           PullStreamRequestSpec req_spec;
-          req_spec.uuid = uuid_;
+          req_spec.uuid = self->uuid_;
           req_spec.ep_idx = 0;
           req_spec.consumer_data_port =
               static_cast<uint32_t>(manager.local_data_port_);
-          req_spec.consumer_ips = base_->local_ips();
+          req_spec.consumer_ips = self->base_->local_ips();
           req_spec.src_block_ids = load_plan.producer_remote_block_ids;
           req_spec.dst_block_ids = load_plan.transport_host_block_ids;
 
@@ -497,11 +499,9 @@ void TransferReceiveSession::ExecutePullRequest(
                      << e.what();
         }
 
-        absl::MutexLock lock(mu_);
         if (!pull_status.ok()) {
-          FinishLocked(pull_status);
+          self->Finish(pull_status);
         }
-        EndRecvOpLocked();
       });
 }
 
@@ -599,40 +599,42 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
   }
   const uint64_t uuid = uuid_;
   const int numa_node = base_->assigned_numa_node().value_or(-1);
-  future.OnReady([this, &manager, uuid, numa_node, layer_idx, session_req_id,
+  future.OnReady([self = shared_from_this(), &manager, uuid, numa_node,
+                  layer_idx, session_req_id,
                   metrics_collector =
                       manager.metrics_collector_](auto status_or) {
+    absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
     bool all_layers_done = false;
     std::chrono::steady_clock::time_point session_start_time;
     bool should_unregister = false;
     uint64_t generation = 0;
     {
-      absl::MutexLock lock(mu_);
-      if (done_) {
+      absl::MutexLock lock(self->mu_);
+      if (self->done_) {
         LOG(DFATAL) << "H2D callback for retired receive UUID " << uuid;
         return;
       }
       if (status_or.ok()) {
         LOG(INFO) << "OnLayerReceived (H2D copy complete) layer " << layer_idx
                   << ": req_id=" << session_req_id << ", numa=" << numa_node;
-        num_completed_layers_++;
-        if (num_completed_layers_ ==
-                static_cast<int32_t>(base_->num_layers()) &&
-            !draining_) {
+        self->num_completed_layers_++;
+        if (self->num_completed_layers_ ==
+                static_cast<int32_t>(self->base_->num_layers()) &&
+            !self->draining_) {
           all_layers_done = true;
-          session_start_time = start_time_;
-          FinishLocked();
+          session_start_time = self->start_time_;
+          self->FinishLocked();
         }
       } else {
         LOG(ERROR) << "OnLayerReceived (H2D copy failed) layer " << layer_idx
                    << " for req_id: " << session_req_id
                    << ", error: " << status_or.status().ToString();
-        FinishLocked(status_or.status());
+        self->FinishLocked(status_or.status());
       }
-      EndRecvOpLocked();
-      if (done_ && unregister_on_settle_) {
-        unregister_on_settle_ = false;
-        generation = plan_generation_;
+      if (self->draining_ && self->in_flight_ == 1 &&
+          self->unregister_on_settle_) {
+        self->unregister_on_settle_ = false;
+        generation = self->plan_generation_;
         should_unregister = true;
       }
     }
@@ -647,7 +649,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
         metrics_collector->RecordEnd(uuid);
       }
     }
-    if (should_unregister) {
+    if (should_unregister && !manager.IsShuttingDown()) {
       manager.UnregisterSettledPlan(uuid, generation);
     }
   });

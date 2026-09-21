@@ -48,7 +48,9 @@ namespace tpu_raiden {
 // readiness accounting, and H2D copy execution.
 //
 // Thread-safe: all mutable session state is synchronized via internal |mu_|.
-class TransferReceiveSession : public TransferSession {
+class TransferReceiveSession
+    : public TransferSession,
+      public std::enable_shared_from_this<TransferReceiveSession> {
  public:
   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
       kv_cache::KVCacheManagerBase* base,
@@ -97,6 +99,11 @@ class TransferReceiveSession : public TransferSession {
 
   // Releases any held staging slot or dynamic host blocks. Safe to call
   // multiple times.
+  bool HasStaging() const {
+    absl::MutexLock lock(mu_);
+    return !staging_.empty();
+  }
+
   void ReleaseStaging();
 
   // Marks the plan to be unregistered when the receive settles, returning true

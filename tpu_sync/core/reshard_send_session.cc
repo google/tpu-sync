@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "absl/base/nullability.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -233,15 +234,15 @@ absl::Status ReshardSendSession::ExecutePush(
       d2h_futures_.push_back(pool_future);
       ++in_flight_;
     }
-    pool_future.OnReady([this, &manager, pool_idx](auto status_or) {
-      if (!status_or.ok()) {
-        RecordPushCompletion(manager, status_or.status());
-        EndOp();
-        return;
-      }
-      StartPoolPush(manager, pool_idx);
-      EndOp();
-    });
+    pool_future.OnReady(
+        [self = shared_from_this(), &manager, pool_idx](auto status_or) {
+          absl::Cleanup end_op = [self]() { self->EndOp(); };
+          if (!status_or.ok()) {
+            self->RecordPushCompletion(manager, status_or.status());
+            return;
+          }
+          self->StartPoolPush(manager, pool_idx);
+        });
   }
   EndOp();
   return absl::OkStatus();
@@ -313,10 +314,11 @@ void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
     transport_srv->AsyncPush(
         {peer}, src_ids, dst_ids, parallelism_,
         transport::MajorOrder::kLayerMajor, uuid_, static_cast<int>(pool_idx),
-        [this, &manager](absl::StatusOr<std::vector<int>> result) {
-          RecordPushCompletion(
+        [self = shared_from_this(),
+         &manager](absl::StatusOr<std::vector<int>> result) {
+          absl::Cleanup end_op = [self]() { self->EndOp(); };
+          self->RecordPushCompletion(
               manager, result.ok() ? absl::OkStatus() : result.status());
-          EndOp();
         });
   }
 }
@@ -349,6 +351,9 @@ void ReshardSendSession::RecordPushCompletion(
   // All callers of RecordPushCompletion hold an active in_flight_ count and
   // invoke EndOp() after RecordPushCompletion returns, so |this| remains live
   // while UnregisterActivePlan runs outside |mu_|.
+  if (manager.IsShuttingDown()) {
+    return;
+  }
   absl::Status unregister = manager.UnregisterActivePlan(uuid_);
   if (!unregister.ok() && !absl::IsNotFound(unregister)) {
     LOG(ERROR) << "Failed to unregister pool reshard sender plan " << uuid_

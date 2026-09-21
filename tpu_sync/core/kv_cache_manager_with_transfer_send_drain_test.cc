@@ -91,6 +91,9 @@ class TestManager : public KVCacheManagerWithTransfer {
   }
 
   size_t free_slots() { return staging_allocator_->num_free_slots(); }
+  StagingBlockAllocator* staging_allocator() {
+    return staging_allocator_.get();
+  }
 
   // White-box construction for the send retirement state machine. Tests that
   // need registration and dispatch use NotifyForRead and ServePull instead.
@@ -193,6 +196,9 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   }
 
   size_t free_slots() { return staging_allocator_->num_free_slots(); }
+  StagingBlockAllocator* staging_allocator() {
+    return staging_allocator_.get();
+  }
 
   bool has_recv(uint64_t uuid) {
     absl::MutexLock lock(mu_);
@@ -705,6 +711,35 @@ TEST(SendDrainTest, WaitForPendingWorkWaitsForActiveSendSession) {
   EXPECT_TRUE(wait_finished.WaitForNotificationWithTimeout(absl::Seconds(2)));
   EXPECT_THAT(wait_status, ::absl_testing::IsOk());
   waiter.join();
+}
+
+TEST(RecvLifecycleTest,
+     SessionRemainsValidAcrossAsyncH2dCallbacksAfterCallerDropsPtr) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  std::weak_ptr<TransferReceiveSession> weak_session;
+  {
+    std::shared_ptr<TransferReceiveSession> session =
+        *TransferReceiveSession::Create(
+            consumer.base(), consumer.staging_allocator(),
+            /*uuid=*/88, "req_lifetime",
+            /*total_blocks=*/1,
+            std::chrono::steady_clock::now() + std::chrono::seconds(10),
+            /*acquire_staging=*/true);
+    weak_session = session;
+    EXPECT_TRUE(session->HasStaging());
+    EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+    ASSERT_THAT(session->ExecuteLayerH2d(consumer, /*layer_idx=*/0),
+                ::absl_testing::IsOk());
+    ASSERT_EQ(consumer.copies_issued(), 1);
+  }
+  // Caller dropped its std::shared_ptr; the pending H2D callback retains the
+  // session and its staging slot until the copy completes.
+  EXPECT_FALSE(weak_session.expired());
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  consumer.FinishCopy(0, absl::OkStatus());
+  EXPECT_TRUE(weak_session.expired());
+  EXPECT_EQ(consumer.free_slots(), kSlots);
 }
 
 }  // namespace

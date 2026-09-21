@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "absl/base/nullability.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
@@ -620,10 +621,12 @@ void ReshardReceiveSession::ExecuteEligiblePoolH2ds(
       absl::MutexLock lock(mu_);
       h2d_futures_.push_back(future);
     }
-    future.OnReady([this, &manager, pool_idx = pool_idx](auto status_or) {
-      FinishPoolH2d(manager, pool_idx,
-                    status_or.ok() ? absl::OkStatus() : status_or.status());
-      EndRecvOp();
+    future.OnReady([self = shared_from_this(), &manager,
+                    pool_idx = pool_idx](auto status_or) {
+      absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
+      self->FinishPoolH2d(
+          manager, pool_idx,
+          status_or.ok() ? absl::OkStatus() : status_or.status());
     });
   }
 }
@@ -645,7 +648,9 @@ void ReshardReceiveSession::FinishPoolH2d(KVCacheManagerWithTransfer& manager,
   std::chrono::steady_clock::time_point session_start_time;
   bool should_record_duration = false;
   if (finished) {
-    absl::Status unregister = manager.UnregisterActivePlan(uuid_);
+    absl::Status unregister = manager.IsShuttingDown()
+                                  ? absl::OkStatus()
+                                  : manager.UnregisterActivePlan(uuid_);
     if (!unregister.ok() && !absl::IsNotFound(unregister)) {
       LOG(ERROR) << "Failed to unregister pool reshard receiver plan " << uuid_
                  << ": " << unregister;

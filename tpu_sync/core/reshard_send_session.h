@@ -44,7 +44,9 @@ class StagingBlockAllocator;
 // |staging_allocator_|, |req_id_|, |uuid_|, |parallelism_|, |deadline_|,
 // |plan_|) are set at construction time and read without locking. Mutable
 // state is protected by internal |mu_|.
-class ReshardSendSession : public TransferSession {
+class ReshardSendSession
+    : public TransferSession,
+      public std::enable_shared_from_this<ReshardSendSession> {
  public:
   // Validates the sender schedule in |plan|, initializes the transport server,
   // registers the active plan on |base|, and creates a producer pool-reshard

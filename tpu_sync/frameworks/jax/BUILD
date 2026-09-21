@@ -679,15 +679,15 @@ py_test(
 )
 
 py_test(
-    name = "raw_transfer_perf_gl",
+    name = "raw_transfer_perf_vl",
     timeout = "long",
     srcs = ["raw_transfer_perf_test.py"],
     main = "raw_transfer_perf_test.py",
     tags = [
         "cpu:8",
         "requires-accel-hbm",
-        "requires-ghostlite:8",
         "requires-net:external",
+        "requires-viperlite:8",
     ],
     deps = [
         ":_raw_transfer",
@@ -723,15 +723,15 @@ py_test(
 )
 
 py_test(
-    name = "raw_transfer_test_gl",
+    name = "raw_transfer_test_vl",
     timeout = "long",
     srcs = ["raw_transfer_test.py"],
     main = "raw_transfer_test.py",
     tags = [
         "cpu:8",
         "requires-accel-hbm",
-        "requires-ghostlite:8",
         "requires-net:external",
+        "requires-viperlite:8",
     ],
     deps = [
         ":_raw_transfer",

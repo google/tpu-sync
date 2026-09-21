@@ -36,6 +36,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -310,6 +311,14 @@ absl::Status BlockTransport::HandleIncomingPush(
   std::vector<int> allocated_ids;
 
   std::vector<int> src_block_ids;
+  ABSL_RETURN_IF_ERROR(block_delegate_->BeginIncomingPush(header.uuid));
+  bool incoming_push_lease_held = true;
+  absl::Cleanup end_incoming_push = [&]() {
+    if (incoming_push_lease_held) {
+      block_delegate_->EndIncomingPush(header.uuid).IgnoreError();
+    }
+  };
+
   if (header.op == 1) {
     ABSL_ASSIGN_OR_RETURN(
         allocated_ids,
@@ -378,6 +387,8 @@ absl::Status BlockTransport::HandleIncomingPush(
         }
         return absl::OkStatus();
       }));
+  incoming_push_lease_held = false;
+  ABSL_RETURN_IF_ERROR(block_delegate_->EndIncomingPush(header.uuid));
 
   if (total_received_bytes > 0) {
     // TODO: Add interface name (e.g. eth0, lo) using

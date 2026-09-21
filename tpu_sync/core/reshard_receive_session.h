@@ -93,6 +93,14 @@ class ReshardReceiveSession
   // times.
   void ReleaseStaging();
 
+  bool TryBeginRecvOp() {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) return false;
+    ++in_flight_;
+    return true;
+  }
+  void EndRecvOp();
+
   // Atomically claims any pending settle-unregister request and writes its
   // plan generation (0 for pool-reshard plans) to |generation|.
   bool TakePendingUnregister(uint64_t* generation);
@@ -134,10 +142,6 @@ class ReshardReceiveSession
   void FinishLocked(const absl::Status& status = absl::OkStatus())
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndRecvOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-
-  // Decrements the count of in-flight operations; marks the receive done and
-  // releases its staging resources if it was draining and waiting for this op.
-  void EndRecvOp();
 
   // Handles completion of |pool_idx|'s H2D upload and finalizes the
   // pool-reshard receive when all pools have completed or on error.

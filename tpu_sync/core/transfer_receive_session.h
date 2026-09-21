@@ -106,6 +106,14 @@ class TransferReceiveSession
 
   void ReleaseStaging();
 
+  bool TryBeginRecvOp() {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) return false;
+    ++in_flight_;
+    return true;
+  }
+  void EndRecvOp();
+
   // Marks the plan to be unregistered when the receive settles, returning true
   // if the receive is still active and will unregister on settle, or false if
   // it is already done.
@@ -206,10 +214,6 @@ class TransferReceiveSession
   void FinishLocked(const absl::Status& status = absl::OkStatus())
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndRecvOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-
-  // Decrements the count of in-flight operations; marks the receive done and
-  // releases its staging resources if it was draining and waiting for this op.
-  void EndRecvOp();
 
   bool AllH2dDoneLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   bool RecordBlocksReceivedLocked(const std::vector<int>& block_ids,

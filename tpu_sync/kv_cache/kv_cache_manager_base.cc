@@ -2289,6 +2289,18 @@ bool KVCacheManagerBase::AcceptsPlanlessExplicitPush(uint64_t uuid) const {
   return active_plans_.contains(uuid);
 }
 
+absl::Status KVCacheManagerBase::BeginIncomingPush(uint64_t uuid) {
+  return transfer_hooks_.begin_incoming_push
+             ? transfer_hooks_.begin_incoming_push(uuid)
+             : absl::OkStatus();
+}
+
+absl::Status KVCacheManagerBase::EndIncomingPush(uint64_t uuid) {
+  return transfer_hooks_.end_incoming_push
+             ? transfer_hooks_.end_incoming_push(uuid)
+             : absl::OkStatus();
+}
+
 absl::StatusOr<std::optional<tpu_raiden::transport::PoolPushProgressSpec>>
 KVCacheManagerBase::GetPoolPushProgressSpec(size_t pool_idx,
                                             uint64_t uuid) const {

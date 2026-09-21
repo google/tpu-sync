@@ -62,6 +62,7 @@ cc_library(
         "//tpu_sync/transport/peregrine/src/api:socket_util",
         "//tpu_sync/transport/peregrine/src/internal/control:service_cc_grpc",
         "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:absl_check",

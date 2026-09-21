@@ -64,6 +64,13 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
   // host mirror.
   virtual bool AcceptsPlanlessExplicitPush(uint64_t uuid) const { return true; }
 
+  virtual absl::Status BeginIncomingPush(uint64_t uuid) {
+    return absl::OkStatus();
+  }
+  virtual absl::Status EndIncomingPush(uint64_t uuid) {
+    return absl::OkStatus();
+  }
+
   // The transport address space is historically one block array per manager
   // layer. Explicit pool tables widen that address space to one block array
   // per pool without changing the wire's integer index.

@@ -206,6 +206,17 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     return it != active_recv_sessions_.end() && !it->second->Done();
   }
 
+  void FailRecv(uint64_t uuid, absl::Status status) {
+    std::shared_ptr<TransferReceiveSession> session;
+    {
+      absl::MutexLock lock(mu_);
+      auto it = active_recv_sessions_.find(uuid);
+      if (it == active_recv_sessions_.end()) return;
+      session = it->second;
+    }
+    session->Finish(status);
+  }
+
   void BlockH2dDispatch() { block_dispatch_.store(true); }
 
   bool WaitForH2dDispatch(absl::Duration timeout) {
@@ -742,5 +753,93 @@ TEST(RecvLifecycleTest,
   EXPECT_EQ(consumer.free_slots(), kSlots);
 }
 
+TEST(RecvLifecycleTest,
+     IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  consumer.AddRecv("req_ingress_lease", /*uuid=*/91, /*blocks_per_layer=*/1);
+  ASSERT_EQ(consumer.free_slots(), kSlots - 1);
+
+  EXPECT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/999),
+              ::absl_testing::StatusIs(absl::StatusCode::kNotFound));
+
+  ASSERT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/91),
+              ::absl_testing::IsOk());
+
+  // Failing/timing out mid-write marks the session draining and keeps staging
+  // pinned until EndIncomingPush finishes.
+  consumer.FailRecv(/*uuid=*/91, absl::InternalError("simulated failure"));
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  EXPECT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/91),
+              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+
+  EXPECT_THAT(consumer.base()->EndIncomingPush(/*uuid=*/91),
+              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+}
+
+TEST(RecvLifecycleTest,
+     NonSessionTransfersSucceedOverBlockTransportWhileStaleUuidIsRejected) {
+  constexpr size_t kSliceBytes = 128;
+  KVCacheManagerWithTransfer sender(
+      /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/4,
+      /*parallelism=*/1, /*node_id=*/0, /*local_control_port=*/-1,
+      /*max_blocks=*/1, /*num_slots=*/1, /*timeout_s=*/10.0);
+  KVCacheManagerWithTransfer receiver(
+      /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/4,
+      /*parallelism=*/1, /*node_id=*/1, /*local_control_port=*/-1,
+      /*max_blocks=*/1, /*num_slots=*/1, /*timeout_s=*/10.0);
+
+  const std::string peer =
+      absl::StrCat("127.0.0.1:", *receiver.base()->local_port());
+
+  // 1. Raw H2H push with dynamic block allocation (op = 1, uuid = 0).
+  std::memset(sender.base()->GetBlockHostPointer(0, 0, 0), 0x5A, kSliceBytes);
+  absl::StatusOr<std::vector<int>> dyn_ids =
+      sender.base()->H2hWriteDirect(peer, /*src_block_ids=*/{0});
+  ASSERT_THAT(dyn_ids, ::absl_testing::IsOk());
+  ASSERT_EQ(dyn_ids->size(), 1);
+  EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, (*dyn_ids)[0])[0], 0x5A);
+
+  // 2. Raw H2H push with explicit destination block (op = 6, uuid = 0).
+  std::memset(sender.base()->GetBlockHostPointer(0, 0, 0), 0xA5, kSliceBytes);
+  absl::StatusOr<std::vector<int>> exp_ids = sender.base()->H2hWriteDirect(
+      peer, /*src_block_ids=*/{0}, /*dst_block_ids=*/{2}, /*uuid=*/0);
+  ASSERT_THAT(exp_ids, ::absl_testing::IsOk());
+  EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 2)[0], 0xA5);
+
+  // 3. Host-only (MEMORY_TYPE_DRAM) active plan push (op = 6, uuid = 42,
+  //    no TransferReceiveSession in active_recv_sessions_).
+  ::tpu_sync::rpc::StartTransferRequest dram_plan;
+  dram_plan.set_uuid(42);
+  dram_plan.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  dram_plan.set_use_block_chunks(true);
+  auto* entry = (*dram_plan.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer(peer);
+  entry->set_dst_shard_idx(0);
+  entry->set_src_block_id(0);
+  entry->set_dst_block_id(3);
+  entry->set_size_bytes(kSliceBytes);
+  entry->set_count(1);
+  ASSERT_THAT(receiver.RegisterActivePlan(42, dram_plan, /*is_sender=*/false),
+              ::absl_testing::IsOk());
+
+  std::memset(sender.base()->GetBlockHostPointer(0, 0, 0), 0x3C, kSliceBytes);
+  absl::StatusOr<std::vector<int>> plan_ids = sender.base()->H2hWriteDirect(
+      peer, /*src_block_ids=*/{0}, /*dst_block_ids=*/{3}, /*uuid=*/42);
+  ASSERT_THAT(plan_ids, ::absl_testing::IsOk());
+  EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 3)[0], 0x3C);
+
+  // 4. Once the DRAM plan is unregistered, pushes for uuid = 42 are rejected
+  //    before writing to host memory, preserving the existing bytes at block 3.
+  ASSERT_THAT(receiver.UnregisterActivePlan(42), ::absl_testing::IsOk());
+  std::memset(sender.base()->GetBlockHostPointer(0, 0, 0), 0xFF, kSliceBytes);
+  absl::StatusOr<std::vector<int>> rejected = sender.base()->H2hWriteDirect(
+      peer, /*src_block_ids=*/{0}, /*dst_block_ids=*/{3}, /*uuid=*/42);
+  EXPECT_FALSE(rejected.ok());
+  EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 3)[0], 0x3C);
+}
 }  // namespace
 }  // namespace tpu_raiden

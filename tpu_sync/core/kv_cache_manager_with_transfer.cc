@@ -168,6 +168,65 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
     return UnregisterActivePlan(uuid);
   };
   hooks.get_node_id = [this]() { return node_id(); };
+  hooks.begin_incoming_push = [this](uint64_t uuid) -> absl::Status {
+    std::shared_ptr<TransferReceiveSession> recv_session;
+    std::shared_ptr<ReshardReceiveSession> reshard_session;
+    {
+      absl::MutexLock lock(mu_);
+      if (auto it = active_recv_sessions_.find(uuid);
+          it != active_recv_sessions_.end()) {
+        recv_session = it->second;
+      } else if (auto reshard_it = active_pool_reshard_recvs_.find(uuid);
+                 reshard_it != active_pool_reshard_recvs_.end()) {
+        reshard_session = reshard_it->second;
+      } else if (uuid == 0 || base_->HasActivePlan(uuid)) {
+        return absl::OkStatus();
+      } else {
+        return absl::NotFoundError(
+            absl::StrCat("No active receive session for uuid=", uuid));
+      }
+    }
+    const bool started = recv_session != nullptr
+                             ? recv_session->TryBeginRecvOp()
+                             : reshard_session->TryBeginRecvOp();
+    return started ? absl::OkStatus()
+                   : absl::CancelledError(absl::StrCat(
+                         "Receive session for uuid=", uuid, " is draining"));
+  };
+  hooks.end_incoming_push = [this](uint64_t uuid) -> absl::Status {
+    std::shared_ptr<TransferReceiveSession> recv_session;
+    std::shared_ptr<ReshardReceiveSession> reshard_session;
+    {
+      absl::MutexLock lock(mu_);
+      if (auto it = active_recv_sessions_.find(uuid);
+          it != active_recv_sessions_.end()) {
+        recv_session = it->second;
+      } else if (auto reshard_it = active_pool_reshard_recvs_.find(uuid);
+                 reshard_it != active_pool_reshard_recvs_.end()) {
+        reshard_session = reshard_it->second;
+      } else {
+        return absl::OkStatus();
+      }
+    }
+    if (recv_session != nullptr) {
+      recv_session->EndRecvOp();
+      MaybeUnregisterSettledRecv(uuid, *recv_session);
+      return recv_session->IsDraining()
+                 ? absl::CancelledError(absl::StrCat(
+                       "Receive session for uuid=", uuid, " is draining"))
+                 : absl::OkStatus();
+    }
+    reshard_session->EndRecvOp();
+    uint64_t generation = 0;
+    if (reshard_session->Done() &&
+        reshard_session->TakePendingUnregister(&generation)) {
+      UnregisterSettledPlan(uuid, generation);
+    }
+    return reshard_session->IsDraining()
+               ? absl::CancelledError(absl::StrCat(
+                     "ReshardReceiveSession for uuid=", uuid, " is draining"))
+               : absl::OkStatus();
+  };
   base_->SetTransferEventHooks(std::move(hooks));
 }
 

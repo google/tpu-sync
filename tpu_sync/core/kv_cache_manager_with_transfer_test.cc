@@ -41,8 +41,20 @@ namespace tpu_raiden {
 namespace {
 
 using ::absl_testing::IsOk;
+using ::testing::AllOf;
+using ::testing::ElementsAre;
+using ::testing::Field;
 using ::testing::Gt;
 using ::testing::IsEmpty;
+using ::testing::Ne;
+using ::testing::Not;
+
+auto HasResolvedIpLabel(absl::string_view key) {
+  return AllOf(
+      Field(&telemetry::MetricLabel::key, key),
+      Field(&telemetry::MetricLabel::value,
+            AllOf(Not(IsEmpty()), Ne(telemetry::metric_labels::kUnknownIp))));
+}
 
 class TestBase : public kv_cache::KVCacheManagerBase {
  public:
@@ -109,26 +121,8 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
 
   ASSERT_THAT(buffer->GetReadyFuture().Await(), IsOk());
 
-  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
-  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
-  EXPECT_CALL(*raw_mock,
-              ObserveHistogram(telemetry::metric_names::kTransferDurationMs,
-                               IsEmpty(), Gt(0.0)))
-      .Times(1);
-  EXPECT_CALL(*raw_mock,
-              ObserveHistogram(telemetry::metric_names::kD2hTransferTimeMs,
-                               IsEmpty(), Gt(0.0)))
-      .Times(1);
-  EXPECT_CALL(*raw_mock,
-              ObserveHistogram(telemetry::metric_names::kH2dTransferTimeMs,
-                               IsEmpty(), Gt(0.0)))
-      .Times(1);
-  // Register mock backend
-  telemetry::ScopedMetricsBackendReset scoped_metrics_reset(
-      std::move(mock_backend));
-
-  // Create KVCacheManagerWithTransfer
   auto handle_or = raiden::RaidenBufferHandle::Acquire(buffer.get());
+  ASSERT_THAT(handle_or, IsOk());
   std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
       {handle_or.value()}};
   auto engine = std::make_unique<KVCacheManagerWithTransfer>(
@@ -143,6 +137,56 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
       /*max_blocks=*/2,
       /*num_slots=*/2,
       /*timeout_s=*/10.0);
+  const uint64_t expected_slice_bytes = engine->base()->slice_byte_size();
+
+  const auto pcie_labels_matcher = ElementsAre(
+      HasResolvedIpLabel(telemetry::metric_labels::kHostIp),
+      telemetry::MetricLabel{.key = telemetry::metric_labels::kLocalRank,
+                             .value = "0"});
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(telemetry::metric_names::kSentBytesTotal,
+                               testing::_, Gt(0)))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(telemetry::metric_names::kReceivedBytesTotal,
+                               testing::_, Gt(0)))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
+              ObserveHistogram(telemetry::metric_names::kTransferDurationMs,
+                               IsEmpty(), Gt(0.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(
+          telemetry::metric_names::kP2pTransferTimeMs,
+          ElementsAre(
+              telemetry::MetricLabel{.key = telemetry::metric_labels::kSrcIp,
+                                     .value = "127.0.0.1"},
+              HasResolvedIpLabel(telemetry::metric_labels::kDstIp)),
+          Gt(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
+              ObserveHistogram(telemetry::metric_names::kD2hTransferTimeMs,
+                               IsEmpty(), Gt(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(telemetry::metric_names::kD2hBytesTotal,
+                               pcie_labels_matcher, expected_slice_bytes))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
+              ObserveHistogram(telemetry::metric_names::kH2dTransferTimeMs,
+                               IsEmpty(), Gt(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(telemetry::metric_names::kH2dBytesTotal,
+                               pcie_labels_matcher, expected_slice_bytes))
+      .Times(1);
+  // Register mock backend
+  telemetry::ScopedMetricsBackendReset scoped_metrics_reset(
+      std::move(mock_backend));
 
   // Configure staging slots: 2 slots, max 2 blocks per slot
   ASSERT_THAT(engine->base()->ConfigureHostStagingSlots(2, 2), IsOk());

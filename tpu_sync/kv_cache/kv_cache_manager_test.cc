@@ -737,7 +737,8 @@ class TestD2hKVCacheManager : public TestKVCacheManager {
     last_src_offsets_ = src_offsets_major_dim;
     last_dst_offsets_ = dst_offsets_major_dim;
     last_copy_sizes_ = copy_sizes_major_dim;
-    return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
+    return raiden::PjRtCopyFuture(
+        std::vector<raiden::BufferHolder>{raiden::BufferHolder{}});
   }
 
   absl::StatusOr<std::vector<raiden::PjRtCopyFuture>> DispatchD2hChunks(
@@ -753,8 +754,8 @@ class TestD2hKVCacheManager : public TestKVCacheManager {
     dispatched_dst_offsets_.push_back(dst_offsets);
     dispatched_copy_sizes_.push_back(copy_sizes);
     std::vector<raiden::PjRtCopyFuture> futures;
-    futures.push_back(
-        raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{}));
+    futures.push_back(raiden::PjRtCopyFuture(
+        std::vector<raiden::BufferHolder>{raiden::BufferHolder{}}));
     return futures;
   }
 
@@ -1247,24 +1248,59 @@ TEST(KVCacheManagerTest, BackgroundWorkerThreadDisabledByDefault) {
 }
 
 TEST(KVCacheManagerTest, TelemetryMetricsObservedWhenEnabled) {
+  const char* prev_rank = std::getenv("LOCAL_RANK");
+  const std::optional<std::string> saved_rank =
+      prev_rank ? std::optional<std::string>(prev_rank) : std::nullopt;
+  auto cleanup = absl::MakeCleanup([&]() {
+    if (saved_rank.has_value()) {
+      setenv("LOCAL_RANK", saved_rank->c_str(), 1);
+    } else {
+      unsetenv("LOCAL_RANK");
+    }
+  });
+  unsetenv("LOCAL_RANK");
+
   auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
   auto* raw_backend = mock_backend.get();
 
-  EXPECT_CALL(
-      *raw_backend,
-      ObserveHistogram(testing::Eq(telemetry::metric_names::kH2dTransferTimeMs),
-                       testing::_, testing::Ge(0.0)))
-      .Times(testing::AtLeast(1));
-  EXPECT_CALL(
-      *raw_backend,
-      ObserveHistogram(testing::Eq(telemetry::metric_names::kD2hTransferTimeMs),
-                       testing::_, testing::Ge(0.0)))
-      .Times(testing::AtLeast(1));
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/2,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  const std::string expected_ip = manager.local_ip();
+  const telemetry::MetricLabel shard0_labels[] = {
+      {telemetry::metric_labels::kHostIp, expected_ip},
+      {telemetry::metric_labels::kLocalRank, "0"}};
+  const telemetry::MetricLabel shard1_labels[] = {
+      {telemetry::metric_labels::kHostIp, expected_ip},
+      {telemetry::metric_labels::kLocalRank, "1"}};
+
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kH2dTransferTimeMs,
+                               testing::IsEmpty(), testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
+              IncrementCounter(telemetry::metric_names::kH2dBytesTotal,
+                               testing::ElementsAreArray(shard0_labels), 256))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
+              IncrementCounter(telemetry::metric_names::kH2dBytesTotal,
+                               testing::ElementsAreArray(shard1_labels), 256))
+      .Times(1);
+
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kD2hTransferTimeMs,
+                               testing::IsEmpty(), testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
+              IncrementCounter(telemetry::metric_names::kD2hBytesTotal,
+                               testing::ElementsAreArray(shard0_labels), 256))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
+              IncrementCounter(telemetry::metric_names::kD2hBytesTotal,
+                               testing::ElementsAreArray(shard1_labels), 256))
+      .Times(1);
 
   telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
 
-  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/128, /*host_blocks=*/2);
   std::vector<int64_t> offsets = {0};
   std::vector<int64_t> sizes = {1};
 
@@ -1274,6 +1310,77 @@ TEST(KVCacheManagerTest, TelemetryMetricsObservedWhenEnabled) {
 
   TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture d2h_res,
                           manager.D2h(offsets, offsets, sizes));
+  ABSL_EXPECT_OK(d2h_res.Await());
+}
+
+TEST(KVCacheManagerTest, SingleShardTransferEmitsTelemetryOnlyForActiveShard) {
+  const char* prev_rank = std::getenv("LOCAL_RANK");
+  const std::optional<std::string> saved_rank =
+      prev_rank ? std::optional<std::string>(prev_rank) : std::nullopt;
+  auto cleanup = absl::MakeCleanup([&]() {
+    if (saved_rank.has_value()) {
+      setenv("LOCAL_RANK", saved_rank->c_str(), 1);
+    } else {
+      unsetenv("LOCAL_RANK");
+    }
+  });
+  unsetenv("LOCAL_RANK");
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  auto* raw_backend = mock_backend.get();
+
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/2,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  ABSL_ASSERT_OK(manager.ConfigureHostStagingSlots(/*num_slots=*/2,
+                                                   /*max_major_per_slot=*/1));
+  const std::string expected_ip = manager.local_ip();
+  const telemetry::MetricLabel shard0_labels[] = {
+      {telemetry::metric_labels::kHostIp, expected_ip},
+      {telemetry::metric_labels::kLocalRank, "0"}};
+  const telemetry::MetricLabel shard1_labels[] = {
+      {telemetry::metric_labels::kHostIp, expected_ip},
+      {telemetry::metric_labels::kLocalRank, "1"}};
+
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kH2dTransferTimeMs,
+                               testing::IsEmpty(), testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
+              IncrementCounter(telemetry::metric_names::kH2dBytesTotal,
+                               testing::ElementsAreArray(shard1_labels), 256))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kD2hTransferTimeMs,
+                               testing::IsEmpty(), testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
+              IncrementCounter(telemetry::metric_names::kD2hBytesTotal,
+                               testing::ElementsAreArray(shard1_labels), 128))
+      .Times(1);
+
+  EXPECT_CALL(
+      *raw_backend,
+      IncrementCounter(telemetry::metric_names::kH2dBytesTotal,
+                       testing::ElementsAreArray(shard0_labels), testing::_))
+      .Times(0);
+  EXPECT_CALL(
+      *raw_backend,
+      IncrementCounter(telemetry::metric_names::kD2hBytesTotal,
+                       testing::ElementsAreArray(shard0_labels), testing::_))
+      .Times(0);
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture h2d_res,
+      manager.H2d({0}, {0}, {1}, /*slot_idx=*/0, /*layer_idx=*/std::nullopt,
+                  /*shard_idx=*/1));
+  ABSL_EXPECT_OK(h2d_res.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture d2h_res,
+      manager.D2h({0}, {0}, {1}, /*slot_idx=*/0, /*layer_idx=*/0,
+                  /*shard_idx=*/1));
   ABSL_EXPECT_OK(d2h_res.Await());
 }
 
@@ -1298,22 +1405,54 @@ TEST(KVCacheManagerTest, TelemetryMetricsSkippedWhenDisabled) {
 }
 
 TEST(KVCacheManagerTest, D2hWritePipelinedTelemetryBatchObservation) {
-  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
-  auto* raw_backend = mock_backend.get();
-
-  // Exactly 1 observation for the entire batch of chunks, not 1 per chunk.
-  EXPECT_CALL(
-      *raw_backend,
-      ObserveHistogram(testing::Eq(telemetry::metric_names::kD2hTransferTimeMs),
-                       testing::_, testing::Ge(0.0)))
-      .Times(1);
-
-  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+  const char* prev_rank = std::getenv("LOCAL_RANK");
+  const std::optional<std::string> saved_rank =
+      prev_rank ? std::optional<std::string>(prev_rank) : std::nullopt;
+  auto cleanup = absl::MakeCleanup([&]() {
+    if (saved_rank.has_value()) {
+      setenv("LOCAL_RANK", saved_rank->c_str(), 1);
+    } else {
+      unsetenv("LOCAL_RANK");
+    }
+  });
+  unsetenv("LOCAL_RANK");
 
   TestD2hKVCacheManager sender(/*num_layers=*/1, /*num_shards=*/1,
                                /*slice_byte_size=*/128, /*host_blocks=*/2);
   TestKVCacheManager receiver(/*num_layers=*/1, /*num_shards=*/1,
                               /*slice_byte_size=*/128, /*host_blocks=*/2);
+  const std::string expected_ip = sender.local_ip();
+  const telemetry::MetricLabel sender_labels[] = {
+      {telemetry::metric_labels::kHostIp, expected_ip},
+      {telemetry::metric_labels::kLocalRank, "0"}};
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  auto* raw_backend = mock_backend.get();
+
+  EXPECT_CALL(
+      *raw_backend,
+      IncrementCounter(
+          testing::Not(testing::Eq(telemetry::metric_names::kD2hBytesTotal)),
+          testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(
+      *raw_backend,
+      ObserveHistogram(testing::Not(testing::Eq(
+                           telemetry::metric_names::kD2hTransferTimeMs)),
+                       testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  // Exactly 1 observation for the entire batch of chunks, not 1 per chunk.
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(telemetry::metric_names::kD2hTransferTimeMs,
+                               testing::IsEmpty(), testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(*raw_backend,
+              IncrementCounter(telemetry::metric_names::kD2hBytesTotal,
+                               testing::ElementsAreArray(sender_labels), 256))
+      .Times(1);
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
 
   const std::optional<int> receiver_port = receiver.local_port();
   ASSERT_TRUE(receiver_port.has_value());

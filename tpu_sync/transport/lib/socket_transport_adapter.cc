@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -38,6 +39,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -70,6 +72,54 @@ constexpr MetricLabel kPullResponseLabels[] = {
     {.key = metric_labels::kDirection,
      .value = metric_labels::kDirectionPullResponse},
 };
+
+// Extracts the host or IP address from an endpoint string ("host:port",
+// "[ipv6]:port", or bare IP), returning kUnknownIp if empty or malformed.
+absl::string_view ExtractIpFromEndpoint(absl::string_view endpoint) {
+  if (endpoint.empty()) return metric_labels::kUnknownIp;
+  if (endpoint.front() == '[') {
+    const size_t close_pos = endpoint.find(']');
+    if (close_pos == absl::string_view::npos || close_pos <= 1) {
+      return metric_labels::kUnknownIp;
+    }
+    if (close_pos + 1 == endpoint.size() ||
+        (endpoint[close_pos + 1] == ':' && close_pos + 2 < endpoint.size())) {
+      return endpoint.substr(1, close_pos - 1);
+    }
+    return metric_labels::kUnknownIp;
+  }
+  const size_t colon_pos = endpoint.find(':');
+  if (colon_pos == absl::string_view::npos) {
+    return endpoint;
+  }
+  if (endpoint.find(':', colon_pos + 1) == absl::string_view::npos) {
+    return (colon_pos > 0 && colon_pos + 1 < endpoint.size())
+               ? endpoint.substr(0, colon_pos)
+               : metric_labels::kUnknownIp;
+  }
+  return endpoint.back() != ':' ? endpoint : metric_labels::kUnknownIp;
+}
+
+absl::string_view ExtractFirstEndpointIp(
+    absl::Span<const std::string> endpoints) {
+  return ExtractIpFromEndpoint(endpoints.empty()
+                                   ? absl::string_view()
+                                   : absl::string_view(endpoints[0]));
+}
+
+void RecordP2pTransferTime(std::chrono::steady_clock::time_point start_time,
+                           std::chrono::steady_clock::time_point end_time,
+                           absl::string_view src_ip, absl::string_view dst_ip) {
+  const absl::Duration duration = absl::FromChrono(end_time - start_time);
+  const double duration_ms =
+      std::max(0.0, absl::ToDoubleMilliseconds(duration));
+  const MetricLabel p2p_labels[] = {
+      {.key = metric_labels::kSrcIp, .value = src_ip},
+      {.key = metric_labels::kDstIp, .value = dst_ip},
+  };
+  RaidenMetricStore::GetGlobalMetricStore().ObserveHistogram(
+      metric_names::kP2pTransferTimeMs, p2p_labels, duration_ms);
+}
 
 absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
   if (on_complete) {
@@ -232,6 +282,9 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
   auto shared_on_complete =
       std::make_shared<CompletionCallback>(std::move(on_complete));
 
+  const absl::Span<const std::string> local_ips = raw_transport_->local_ips();
+  const std::chrono::steady_clock::time_point push_start =
+      std::chrono::steady_clock::now();
   const size_t base_blocks_per_stream = num_blocks / P;
   const size_t remainder = num_blocks % P;
   size_t req_offset = 0;
@@ -245,8 +298,7 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
       ++req_end;
     }
 
-    const std::string local_ip =
-        SelectSourceIp(raw_transport_->local_ips(), i);
+    const std::string local_ip = SelectSourceIp(local_ips, i);
     const std::string remote_peer = peers[i % peers.size()];
 
     absl::Span<const Request> stream_requests =
@@ -257,7 +309,7 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
     auto task_run = [this, i, remote_peer, local_ip, block_offset,
                      shared_requests, stream_requests, shared_src_block_ids,
                      shared_dst_block_ids, allocated_ids, statuses,
-                     remaining_workers, shared_on_complete]() {
+                     remaining_workers, shared_on_complete, push_start]() {
       (*statuses)[i] = PostSocketPushInternal(
           remote_peer, local_ip, stream_requests, *shared_src_block_ids,
           *shared_dst_block_ids, block_offset, *allocated_ids);
@@ -269,6 +321,12 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
             final_status = s;
             break;
           }
+        }
+        if (final_status.ok()) {
+          RecordP2pTransferTime(
+              push_start, std::chrono::steady_clock::now(),
+              ExtractFirstEndpointIp(raw_transport_->local_ips()),
+              ExtractIpFromEndpoint(remote_peer));
         }
         if (*shared_on_complete) {
           if (!final_status.ok()) {
@@ -439,6 +497,10 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPull(
                                         "parallelism must be positive"));
   }
 
+  const std::chrono::steady_clock::time_point pull_start =
+      std::chrono::steady_clock::now();
+  const absl::Span<const std::string> local_ips = raw_transport_->local_ips();
+
   std::vector<std::thread> threads;
   std::vector<absl::Status> statuses(P, absl::OkStatus());
 
@@ -455,8 +517,7 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPull(
         requests.subspan(req_offset, req_end - req_offset);
     req_offset = req_end;
 
-    const std::string local_ip =
-        SelectSourceIp(raw_transport_->local_ips(), i);
+    const std::string local_ip = SelectSourceIp(local_ips, i);
     const std::string remote_peer = peers[i % peers.size()];
 
     threads.emplace_back(
@@ -469,6 +530,8 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPull(
   for (auto& t : threads) {
     if (t.joinable()) t.join();
   }
+  const std::chrono::steady_clock::time_point pull_end =
+      std::chrono::steady_clock::now();
 
   if (req_offset != requests.size()) {
     return ReportError(
@@ -482,6 +545,9 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPull(
       return ReportError(on_complete, statuses[i]);
     }
   }
+
+  RecordP2pTransferTime(pull_start, pull_end, ExtractIpFromEndpoint(peers[0]),
+                        ExtractFirstEndpointIp(local_ips));
 
   if (on_complete) {
     on_complete(std::vector<int>{});

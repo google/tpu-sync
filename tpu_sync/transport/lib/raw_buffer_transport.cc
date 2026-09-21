@@ -528,6 +528,11 @@ absl::Status RawBufferTransport::PullBuffer(
     return absl::InvalidArgumentError("Source peer address cannot be empty");
   }
 
+  uint8_t* const base_host_ptr =
+      raw_delegate_->GetHostPointer(buffer_id, dst_shard_idx);
+  if (base_host_ptr == nullptr && size_bytes > 0) {
+    return absl::InvalidArgumentError("Destination host pointer is null");
+  }
   const size_t host_size = raw_delegate_->GetHostSize(buffer_id, dst_shard_idx);
   if (size_bytes > host_size || dst_offset_bytes > host_size - size_bytes) {
     return absl::InvalidArgumentError(absl::StrCat(
@@ -535,8 +540,7 @@ absl::Status RawBufferTransport::PullBuffer(
         ", Size: ", size_bytes, ", Shard Host Size: ", host_size));
   }
 
-  uint8_t* dest_ptr = raw_delegate_->GetHostPointer(buffer_id, dst_shard_idx) +
-                      dst_offset_bytes;
+  uint8_t* dest_ptr = base_host_ptr + dst_offset_bytes;
   ABSL_ASSIGN_OR_RETURN(
       const Request req,
       BuildBufferRequest(buffer_id, src_shard_idx, src_offset_bytes, dest_ptr,

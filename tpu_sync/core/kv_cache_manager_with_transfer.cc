@@ -1082,7 +1082,7 @@ absl::Status KVCacheManagerWithTransfer::ValidatePoolReshardPlan(
 
 absl::Status KVCacheManagerWithTransfer::ValidatePoolReshardReceiverCoverage(
     const ::tpu_sync::rpc::StartTransferRequest& plan) {
-  constexpr int64_t kMaxExpandedRepeats = 1 << 20;
+  constexpr int64_t kMaxExpandedRepeats = 1 << 24;
 
   struct GroupView {
     std::vector<size_t> pool_indices;

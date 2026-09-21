@@ -287,6 +287,67 @@ class ReshardStackTest : public ::testing::Test {
     return HandleController(req.SerializeAsString());
   }
 
+  // One rank's request-global (v1) declaration of strided spans over one
+  // source block: a head slice of `size` bytes repeated `count` times per
+  // page, routed per destination unit.
+  struct StridedSpan {
+    int64_t src_offset;
+    int64_t dst_global_offset;
+    int64_t size;
+    int64_t src_stride;
+    int64_t dst_stride;
+    int32_t count;
+    int32_t dst_unit_ordinal;
+  };
+  tpu_sync::rpc::ControllerResponse RegisterStridedGlobalSpans(
+      int rank, const std::string& req_id, int64_t uuid, int64_t src_block,
+      const std::vector<StridedSpan>& spans) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_REGISTER_REQUEST_BLOCKS);
+    auto* block_req = req.mutable_register_request_blocks_request();
+    block_req->set_req_id(req_id);
+    block_req->set_uuid(uuid);
+    *block_req->mutable_unit() = RaidenIdToProto(Unit(rank));
+    block_req->add_block_ids(src_block);
+    auto* entry = block_req->add_pool_spans();
+    entry->set_tag("fa");
+    entry->add_block_ids(src_block);
+    int64_t declared = 0;
+    for (const StridedSpan& span : spans) {
+      auto* out = entry->add_spans();
+      out->set_src_block_ordinal(0);
+      out->set_src_offset_bytes(span.src_offset);
+      out->set_dst_block_index(0);
+      out->set_dst_offset_bytes(span.dst_global_offset);
+      out->set_size_bytes(span.size);
+      out->set_src_stride_bytes(span.src_stride);
+      out->set_dst_stride_bytes(span.dst_stride);
+      out->set_count(span.count);
+      if (span.dst_unit_ordinal != -1) {
+        out->set_dst_unit_ordinal(span.dst_unit_ordinal);
+      }
+      declared += span.size * span.count;
+    }
+    entry->set_declared_bytes(declared);
+    entry->set_dst_space_version(1);
+    return HandleController(req.SerializeAsString());
+  }
+
+  // Head-split declarations for RegisterShardedPair(): a source page holds
+  // four tokens of two 128-byte heads; destination unit d takes head d of
+  // every token as one strided span per page.
+  void RegisterHeadSplitPages(const std::string& req_id, int64_t uuid) {
+    ASSERT_TRUE(RegisterStridedGlobalSpans(0, req_id, uuid, 3,
+                                           {{0, 0, 128, 256, 128, 4, 0},
+                                            {128, 0, 128, 256, 128, 4, 1}})
+                    .success());
+    ASSERT_TRUE(RegisterStridedGlobalSpans(1, req_id, uuid, 5,
+                                           {{0, 512, 128, 256, 128, 4, 0},
+                                            {128, 512, 128, 256, 128, 4, 1}})
+                    .success());
+  }
+
   // Two sources (live 1024) feeding two head-shard destinations (live 512):
   // the TP2 shape where each destination receives a different half of
   // every source block.
@@ -836,6 +897,108 @@ TEST_F(ReshardStackTest, TwoDestinationsShardedSpansRouteBytesPerReceiver) {
     ASSERT_EQ(start_req.pool_groups_size(), 1);
     EXPECT_EQ(start_req.pool_groups(0).expected_pushes(), 2);
   }
+}
+
+TEST_F(ReshardStackTest, StridedGlobalSpansStayOneEntryPerDestination) {
+  RegisterShardedPair();
+  RegisterHeadSplitPages("req-st", 71);
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-st", 71, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_TRUE(resp.success()) << resp.message();
+
+  // 2 concurrent arms, then 2 sender dispatches.
+  ASSERT_EQ(transport_.calls_.size(), 4u);
+  for (int i = 0; i < 2; ++i) {
+    tpu_sync::rpc::ControlRequest arm;
+    ASSERT_TRUE(arm.ParseFromString(transport_.calls_[i].second));
+    const auto& start_req = arm.start_transfer_request();
+    EXPECT_FALSE(start_req.is_sender());
+    const bool is_dst0 = transport_.calls_[i].first == "10.0.0.2:9600";
+    const std::string own_peer = is_dst0 ? "10.0.0.2:9400" : "10.0.0.2:9401";
+    const int64_t own_src_offset = is_dst0 ? 0 : 128;
+    // Each sender contributes one strided entry: four tokens of this
+    // destination's head, not four entries.
+    ASSERT_EQ(start_req.shard_push_schedules_size(), 2);
+    for (const auto& keyed_schedule : start_req.shard_push_schedules()) {
+      ASSERT_EQ(keyed_schedule.second.entries_size(), 1);
+      const auto& entry = keyed_schedule.second.entries(0);
+      EXPECT_EQ(entry.dst_peer(), own_peer);
+      EXPECT_EQ(entry.src_offset_bytes(), own_src_offset);
+      EXPECT_EQ(entry.dst_offset_bytes(), 0);
+      EXPECT_EQ(entry.size_bytes(), 128);
+      EXPECT_EQ(entry.src_stride_bytes(), 256);
+      EXPECT_EQ(entry.dst_stride_bytes(), 128);
+      EXPECT_EQ(entry.count(), 4);
+    }
+    ASSERT_EQ(start_req.pool_groups_size(), 1);
+    EXPECT_EQ(start_req.pool_groups(0).expected_pushes(), 2);
+    ASSERT_EQ(start_req.pool_groups(0).dst_expected_extent_bytes_size(), 2);
+    EXPECT_EQ(start_req.pool_groups(0).dst_expected_extent_bytes(0), 512);
+    EXPECT_EQ(start_req.pool_groups(0).dst_expected_extent_bytes(1), 512);
+  }
+  for (int i = 2; i < 4; ++i) {
+    tpu_sync::rpc::ControlRequest dispatch;
+    ASSERT_TRUE(dispatch.ParseFromString(transport_.calls_[i].second));
+    const auto& start_req = dispatch.start_transfer_request();
+    EXPECT_TRUE(start_req.is_sender());
+    ASSERT_EQ(start_req.shard_push_schedules_size(), 1);
+    const auto& schedule = start_req.shard_push_schedules().at(0);
+    ASSERT_EQ(schedule.entries_size(), 2);
+    for (const auto& entry : schedule.entries()) {
+      const int64_t expected_src =
+          entry.dst_peer() == "10.0.0.2:9400" ? 0 : 128;
+      EXPECT_EQ(entry.src_offset_bytes(), expected_src);
+      EXPECT_EQ(entry.src_stride_bytes(), 256);
+      EXPECT_EQ(entry.dst_stride_bytes(), 128);
+      EXPECT_EQ(entry.count(), 4);
+    }
+    EXPECT_NE(schedule.entries(0).dst_peer(), schedule.entries(1).dst_peer());
+  }
+}
+
+TEST_F(ReshardStackTest, StridedGlobalSpansClipByWholePages) {
+  RegisterShardedPair();
+  RegisterHeadSplitPages("req-sc", 72);
+  // Skipping the first destination page drops rank 0's page whole and
+  // re-bases rank 1's page to destination index 0.
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-sc", 72, 2, {9}, /*dst_skip=*/{512}, /*num_dst=*/2);
+  ASSERT_TRUE(resp.success()) << resp.message();
+  // 2 arms, then the one sender with surviving spans.
+  ASSERT_EQ(transport_.calls_.size(), 3u);
+  tpu_sync::rpc::ControlRequest dispatch;
+  ASSERT_TRUE(dispatch.ParseFromString(transport_.calls_[2].second));
+  const auto& start_req = dispatch.start_transfer_request();
+  EXPECT_TRUE(start_req.is_sender());
+  EXPECT_EQ(transport_.calls_[2].first, "10.0.0.1:9102");
+  const auto& schedule = start_req.shard_push_schedules().at(0);
+  ASSERT_EQ(schedule.entries_size(), 2);
+  for (const auto& entry : schedule.entries()) {
+    EXPECT_EQ(entry.src_block_id(), 5);
+    EXPECT_EQ(entry.dst_block_id(), 9);
+    EXPECT_EQ(entry.dst_offset_bytes(), 0);
+    EXPECT_EQ(entry.count(), 4);
+  }
+  for (int i = 0; i < 2; ++i) {
+    tpu_sync::rpc::ControlRequest arm;
+    ASSERT_TRUE(arm.ParseFromString(transport_.calls_[i].second));
+    const auto& group = arm.start_transfer_request().pool_groups(0);
+    EXPECT_EQ(group.expected_pushes(), 1);
+    ASSERT_EQ(group.dst_expected_extent_bytes_size(), 1);
+    EXPECT_EQ(group.dst_expected_extent_bytes(0), 512);
+  }
+}
+
+TEST_F(ReshardStackTest, StridedGlobalSpansMustStayInsideOnePage) {
+  RegisterShardedPair();
+  // Eight repeats of 128 bytes at stride 128 span 1024 bytes: two
+  // destination pages.
+  tpu_sync::rpc::ControllerResponse resp = RegisterStridedGlobalSpans(
+      0, "req-sx", 73, 3, {{0, 0, 128, 128, 128, 8, -1}});
+  ASSERT_TRUE(resp.success()) << resp.message();
+  resp = Coordinate("req-sx", 73, 1, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  EXPECT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("inside one destination page"));
 }
 
 TEST_F(ReshardStackTest, ShardedSpanOrdinalOutOfRangeFailsClosed) {

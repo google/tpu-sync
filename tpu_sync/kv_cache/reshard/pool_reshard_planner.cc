@@ -131,7 +131,18 @@ struct TagPrecheck {
   int64_t dst_live = 0;
   std::vector<PoolLiveSegment> src_segments;
   std::vector<PoolLiveSegment> dst_segments;
+  // Both live maps are one region at physical offset zero, so logical and
+  // physical block offsets coincide and a strided span needs no translation.
+  bool identity_maps = false;
 };
+
+// True when a pool's live bytes are one contiguous region at physical
+// offset zero.
+bool IdentityLiveMap(const std::vector<PoolLiveSegment>& segments,
+                     int64_t live) {
+  return segments.size() == 1 && segments[0].logical_offset == 0 &&
+         segments[0].physical_offset == 0 && segments[0].size == live;
+}
 
 }  // namespace
 
@@ -553,6 +564,9 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
     }
     precheck.src_segments = std::move(src_segment_maps[0]);
     precheck.dst_segments = std::move(dst_segment_maps[0]);
+    precheck.identity_maps =
+        IdentityLiveMap(precheck.src_segments, precheck.src_live) &&
+        IdentityLiveMap(precheck.dst_segments, precheck.dst_live);
     tag_precheck.push_back(std::move(precheck));
   }
 
@@ -647,16 +661,47 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
       split_entry.spans.clear();
       split_entry.dst_space_version = 0;
       for (const PoolByteSpan& span : entry->spans) {
-        if (span.count > 1 || span.src_stride_bytes != 0 ||
-            span.dst_stride_bytes != 0) {
-          return absl::InvalidArgumentError(absl::StrCat(
-              "Global-space byte spans must be plain contiguous ranges "
-              "(declared by ",
-              PythonRepr(unit), ")"));
-        }
         if (span.dst_block_index != 0) {
           return absl::InvalidArgumentError(absl::StrCat(
               "Global-space byte spans must leave dst_block_index zero "
+              "(declared by ",
+              PythonRepr(unit), ")"));
+        }
+        if (span.count > 1) {
+          // A strided span (one head slice repeated per token) stays one
+          // span. It must lie inside one destination page, so a page-aligned
+          // clip drops it whole or keeps it whole.
+          if (span.src_stride_bytes <= 0 || span.dst_stride_bytes <= 0) {
+            return absl::InvalidArgumentError(absl::StrCat(
+                "Strided global-space byte spans require positive strides "
+                "(declared by ",
+                PythonRepr(unit), ")"));
+          }
+          const int64_t in_page = span.dst_offset_bytes % dst_live;
+          const int64_t extent =
+              (span.count - 1) * span.dst_stride_bytes + span.size_bytes;
+          if (in_page + extent > dst_live) {
+            return absl::InvalidArgumentError(absl::StrCat(
+                "Strided global-space byte spans must lie inside one "
+                "destination page (declared by ",
+                PythonRepr(unit), ")"));
+          }
+          tag_global_end =
+              std::max(tag_global_end, span.dst_offset_bytes + extent);
+          if (span.dst_offset_bytes < tag_skip) {
+            tag_clipped_bytes += span.size_bytes * span.count;
+            continue;
+          }
+          PoolByteSpan strided_span = span;
+          strided_span.dst_block_index =
+              (span.dst_offset_bytes - tag_skip) / dst_live;
+          strided_span.dst_offset_bytes = in_page;
+          split_entry.spans.push_back(strided_span);
+          continue;
+        }
+        if (span.src_stride_bytes != 0 || span.dst_stride_bytes != 0) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "Global-space byte spans must be plain contiguous ranges "
               "(declared by ",
               PythonRepr(unit), ")"));
         }
@@ -911,37 +956,64 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
       } else {
         targets.push_back(request.dst_units[span.dst_unit_ordinal]);
       }
-      for (int32_t repeat = 0; repeat < span.count; ++repeat) {
-        const int64_t src_offset =
-            span.src_offset_bytes + repeat * span.src_stride_bytes;
-        const int64_t dst_offset =
-            span.dst_offset_bytes + repeat * span.dst_stride_bytes;
-        auto translated =
-            TranslateLiveCopy(precheck.src_segments, precheck.dst_segments,
-                              src_offset, dst_offset, span.size_bytes);
-        if (!translated.ok()) return translated.status();
-        emitted_chunks += static_cast<int64_t>(translated->size()) *
-                          static_cast<int64_t>(targets.size());
+      if (span.count > 1 && precheck.identity_maps) {
+        // Logical and physical offsets coincide, so a strided span (one head
+        // slice per token) travels as one strided entry per destination
+        // instead of one entry per token. Its bounds were checked above.
+        emitted_chunks += static_cast<int64_t>(targets.size());
         if (emitted_chunks > kMaxLiveSegments) {
           return absl::InvalidArgumentError(
               "Byte-span plan exceeds the live-region expansion bound");
         }
-        for (const LiveCopyChunk& chunk : *translated) {
-          for (const RaidenId& dst_unit_id : targets) {
-            ScheduleEntry schedule_entry;
-            schedule_entry.dst_peer = dst_peers.at(dst_unit_id);
-            schedule_entry.dst_shard_idx = 0;
-            schedule_entry.dst_offset_bytes = chunk.dst_physical;
-            schedule_entry.src_offset_bytes = chunk.src_physical;
-            schedule_entry.size_bytes = chunk.size;
-            schedule_entry.src_block_id = src_block_id;
-            schedule_entry.dst_block_id = dst_block_id;
-            schedule_entry.src_stride_bytes = 0;
-            schedule_entry.dst_stride_bytes = 0;
-            schedule_entry.count = 1;
-            schedule_entry.layer_idx = 0;
-            schedule_entry.pool_group = static_cast<int32_t>(group_idx);
-            schedules[src_unit].push_back(std::move(schedule_entry));
+        for (const RaidenId& dst_unit_id : targets) {
+          ScheduleEntry schedule_entry;
+          schedule_entry.dst_peer = dst_peers.at(dst_unit_id);
+          schedule_entry.dst_shard_idx = 0;
+          schedule_entry.dst_offset_bytes = span.dst_offset_bytes;
+          schedule_entry.src_offset_bytes = span.src_offset_bytes;
+          schedule_entry.size_bytes = span.size_bytes;
+          schedule_entry.src_block_id = src_block_id;
+          schedule_entry.dst_block_id = dst_block_id;
+          schedule_entry.src_stride_bytes = span.src_stride_bytes;
+          schedule_entry.dst_stride_bytes = span.dst_stride_bytes;
+          schedule_entry.count = span.count;
+          schedule_entry.layer_idx = 0;
+          schedule_entry.pool_group = static_cast<int32_t>(group_idx);
+          schedules[src_unit].push_back(std::move(schedule_entry));
+        }
+      } else {
+        for (int32_t repeat = 0; repeat < span.count; ++repeat) {
+          const int64_t src_offset =
+              span.src_offset_bytes + repeat * span.src_stride_bytes;
+          const int64_t dst_offset =
+              span.dst_offset_bytes + repeat * span.dst_stride_bytes;
+          auto translated =
+              TranslateLiveCopy(precheck.src_segments, precheck.dst_segments,
+                                src_offset, dst_offset, span.size_bytes);
+          if (!translated.ok()) return translated.status();
+          emitted_chunks += static_cast<int64_t>(translated->size()) *
+                            static_cast<int64_t>(targets.size());
+          if (emitted_chunks > kMaxLiveSegments) {
+            return absl::InvalidArgumentError(
+                "Byte-span plan exceeds the live-region expansion bound");
+          }
+          for (const LiveCopyChunk& chunk : *translated) {
+            for (const RaidenId& dst_unit_id : targets) {
+              ScheduleEntry schedule_entry;
+              schedule_entry.dst_peer = dst_peers.at(dst_unit_id);
+              schedule_entry.dst_shard_idx = 0;
+              schedule_entry.dst_offset_bytes = chunk.dst_physical;
+              schedule_entry.src_offset_bytes = chunk.src_physical;
+              schedule_entry.size_bytes = chunk.size;
+              schedule_entry.src_block_id = src_block_id;
+              schedule_entry.dst_block_id = dst_block_id;
+              schedule_entry.src_stride_bytes = 0;
+              schedule_entry.dst_stride_bytes = 0;
+              schedule_entry.count = 1;
+              schedule_entry.layer_idx = 0;
+              schedule_entry.pool_group = static_cast<int32_t>(group_idx);
+              schedules[src_unit].push_back(std::move(schedule_entry));
+            }
           }
         }
       }

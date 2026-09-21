@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <string>
 #include <utility>
@@ -31,6 +32,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
+#include "grpc/impl/channel_arg_names.h"
 #include "grpcpp/client_context.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/grpcpp.h"
@@ -173,7 +175,21 @@ grpc::Status KVCacheControlPlaneServiceImpl::Ack(
   return grpc::Status::OK;
 }
 
+GrpcControlPlaneBackend::GrpcControlPlaneBackend(size_t max_cached_stubs)
+    : max_cached_stubs_(max_cached_stubs) {}
+
 GrpcControlPlaneBackend::~GrpcControlPlaneBackend() { StopServer(); }
+
+size_t GrpcControlPlaneBackend::TEST_CachedStubCount() const {
+  absl::MutexLock lock(stub_mu_);
+  return stubs_.size();
+}
+
+bool GrpcControlPlaneBackend::TEST_HasCachedStub(
+    absl::string_view endpoint) const {
+  absl::MutexLock lock(stub_mu_);
+  return stubs_.contains(endpoint);
+}
 
 absl::StatusOr<int> GrpcControlPlaneBackend::StartServer(
     int requested_port, ControlPlaneHandler* handler) {
@@ -218,15 +234,15 @@ void GrpcControlPlaneBackend::StopServer() {
 
 std::shared_ptr<control_plane::proto::KVCacheControlPlaneService::Stub>
 GrpcControlPlaneBackend::GetOrCreateStub(absl::string_view endpoint) {
-  std::string ep_str(endpoint);
   {
     absl::MutexLock lock(stub_mu_);
-    auto it = stubs_.find(ep_str);
-    if (it != stubs_.end()) {
-      return it->second;
+    if (auto it = stubs_.find(endpoint); it != stubs_.end()) {
+      lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
+      return it->second.stub;
     }
   }
 
+  std::string ep_str(endpoint);
   grpc::ChannelArguments args;
   args.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
   args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 10000);
@@ -238,12 +254,24 @@ GrpcControlPlaneBackend::GetOrCreateStub(absl::string_view endpoint) {
 
   auto channel = grpc::CreateCustomChannel(
       ep_str, grpc::InsecureChannelCredentials(), args);
-  auto stub =
+  std::shared_ptr<control_plane::proto::KVCacheControlPlaneService::Stub> stub =
       control_plane::proto::KVCacheControlPlaneService::NewStub(channel);
 
   absl::MutexLock lock(stub_mu_);
-  auto [it, inserted] = stubs_.try_emplace(ep_str, std::move(stub));
-  return it->second;
+  if (auto it = stubs_.find(ep_str); it != stubs_.end()) {
+    lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
+    return it->second.stub;
+  }
+  if (max_cached_stubs_ == 0) {
+    return stub;
+  }
+  while (stubs_.size() >= max_cached_stubs_ && !lru_order_.empty()) {
+    stubs_.erase(lru_order_.back());
+    lru_order_.pop_back();
+  }
+  lru_order_.push_front(ep_str);
+  stubs_.emplace(std::move(ep_str), StubCacheEntry{stub, lru_order_.begin()});
+  return stub;
 }
 
 absl::StatusOr<PullStreamResponseSpec> GrpcControlPlaneBackend::SendPullRequest(

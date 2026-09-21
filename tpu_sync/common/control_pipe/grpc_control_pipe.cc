@@ -16,6 +16,7 @@
 
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
+#include <list>
 #include <memory>
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
@@ -324,14 +325,28 @@ void GrpcControlPipeServer::Stop() {
 GrpcControlPipeClient::GrpcControlPipeClient(const ControlPipeConfig& config)
     : config_(config) {}
 
+size_t GrpcControlPipeClient::TEST_CachedStubCount() const {
+  absl::MutexLock lock(stub_mu_);
+  return stubs_.size();
+}
+
+bool GrpcControlPipeClient::TEST_HasCachedStub(
+    absl::string_view endpoint) const {
+  absl::MutexLock lock(stub_mu_);
+  return stubs_.contains(endpoint);
+}
+
 std::shared_ptr<control_pipe::proto::ControlPipeService::Stub>
 GrpcControlPipeClient::GetOrCreateStub(absl::string_view endpoint) {
-  absl::MutexLock lock(stub_mu_);
-  auto it = stubs_.find(endpoint);
-  if (it != stubs_.end()) {
-    return it->second;
+  {
+    absl::MutexLock lock(stub_mu_);
+    if (auto it = stubs_.find(endpoint); it != stubs_.end()) {
+      lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
+      return it->second.stub;
+    }
   }
 
+  std::string ep_str(endpoint);
   grpc::ChannelArguments args;
   int max_msg_bytes = static_cast<int>(config_.max_frame_bytes);
   args.SetMaxReceiveMessageSize(max_msg_bytes);
@@ -341,10 +356,25 @@ GrpcControlPipeClient::GetOrCreateStub(absl::string_view endpoint) {
   args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
 
   std::shared_ptr<grpc::Channel> channel = grpc::CreateCustomChannel(
-      std::string(endpoint), grpc::InsecureChannelCredentials(), args);
+      ep_str, grpc::InsecureChannelCredentials(), args);
   std::shared_ptr<control_pipe::proto::ControlPipeService::Stub> stub =
       control_pipe::proto::ControlPipeService::NewStub(channel);
-  stubs_[std::string(endpoint)] = stub;
+
+  absl::MutexLock lock(stub_mu_);
+  if (auto it = stubs_.find(ep_str); it != stubs_.end()) {
+    lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
+    return it->second.stub;
+  }
+  if (config_.max_cached_grpc_stubs == 0) {
+    return stub;
+  }
+  while (stubs_.size() >= config_.max_cached_grpc_stubs &&
+         !lru_order_.empty()) {
+    stubs_.erase(lru_order_.back());
+    lru_order_.pop_back();
+  }
+  lru_order_.push_front(ep_str);
+  stubs_.emplace(std::move(ep_str), StubCacheEntry{stub, lru_order_.begin()});
   return stub;
 }
 

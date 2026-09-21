@@ -418,5 +418,68 @@ TEST(ResolveControlPlaneBackendTypeTest, EnvVarAndOverridePrecedence) {
   unsetenv("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE");
 }
 
+TEST(GrpcControlPlaneBackendLruTest,
+     EvictsLeastRecentlyUsedStubWhenCapacityExceeded) {
+  MockControlPlaneHandler handler;
+  GrpcControlPlaneBackend server1;
+  GrpcControlPlaneBackend server2;
+  GrpcControlPlaneBackend server3;
+
+  absl::StatusOr<int> port1 = server1.StartServer(0, &handler);
+  absl::StatusOr<int> port2 = server2.StartServer(0, &handler);
+  absl::StatusOr<int> port3 = server3.StartServer(0, &handler);
+  ASSERT_TRUE(port1.ok()) << port1.status();
+  ASSERT_TRUE(port2.ok()) << port2.status();
+  ASSERT_TRUE(port3.ok()) << port3.status();
+
+  std::string ep1 = absl::StrCat("127.0.0.1:", *port1);
+  std::string ep2 = absl::StrCat("127.0.0.1:", *port2);
+  std::string ep3 = absl::StrCat("127.0.0.1:", *port3);
+
+  GrpcControlPlaneBackend client(/*max_cached_stubs=*/2);
+  EXPECT_EQ(client.TEST_CachedStubCount(), 0u);
+
+  // 1. Send request to ep1, then ep2 -> both cached.
+  ASSERT_TRUE(client.SendAck(ep1, 1, absl::Seconds(5)).ok());
+  EXPECT_EQ(client.TEST_CachedStubCount(), 1u);
+  EXPECT_TRUE(client.TEST_HasCachedStub(ep1));
+
+  ASSERT_TRUE(client.SendAck(ep2, 2, absl::Seconds(5)).ok());
+  EXPECT_EQ(client.TEST_CachedStubCount(), 2u);
+  EXPECT_TRUE(client.TEST_HasCachedStub(ep1));
+  EXPECT_TRUE(client.TEST_HasCachedStub(ep2));
+
+  // 2. Access ep1 again (promotes ep1 to MRU, making ep2 LRU).
+  ASSERT_TRUE(client.SendAck(ep1, 3, absl::Seconds(5)).ok());
+  EXPECT_EQ(client.TEST_CachedStubCount(), 2u);
+
+  // 3. Send request to ep3 -> ep2 is evicted, ep1 and ep3 remain cached.
+  ASSERT_TRUE(client.SendAck(ep3, 4, absl::Seconds(5)).ok());
+  EXPECT_EQ(client.TEST_CachedStubCount(), 2u);
+  EXPECT_FALSE(client.TEST_HasCachedStub(ep2));
+  EXPECT_TRUE(client.TEST_HasCachedStub(ep1));
+  EXPECT_TRUE(client.TEST_HasCachedStub(ep3));
+
+  server1.StopServer();
+  server2.StopServer();
+  server3.StopServer();
+}
+
+TEST(GrpcControlPlaneBackendLruTest, ZeroCapacityBypassesCache) {
+  MockControlPlaneHandler handler;
+  GrpcControlPlaneBackend server;
+  absl::StatusOr<int> port = server.StartServer(0, &handler);
+  ASSERT_TRUE(port.ok()) << port.status();
+
+  std::string ep = absl::StrCat("127.0.0.1:", *port);
+  GrpcControlPlaneBackend client(/*max_cached_stubs=*/0);
+
+  ASSERT_TRUE(client.SendAck(ep, 100, absl::Seconds(5)).ok());
+  EXPECT_EQ(client.TEST_CachedStubCount(), 0u);
+  EXPECT_FALSE(client.TEST_HasCachedStub(ep));
+
+  server.StopServer();
+}
+
 }  // namespace
 }  // namespace tpu_raiden

@@ -520,6 +520,70 @@ class ControlPipeClientTest(absltest.TestCase):
       if server is not None:
         server.close()
 
+  def test_grpc_stub_lru_eviction(self) -> None:
+    servicer = _MockControlPipeServicer()
+    grpc_server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+    control_pipe_pb2_grpc.add_ControlPipeServiceServicer_to_server(
+        servicer, grpc_server
+    )
+    port1 = grpc_server.add_insecure_port("[::]:0")
+    port2 = grpc_server.add_insecure_port("[::]:0")
+    port3 = grpc_server.add_insecure_port("[::]:0")
+    grpc_server.start()
+    ep1 = f"localhost:{port1}"
+    ep2 = f"localhost:{port2}"
+    ep3 = f"localhost:{port3}"
+
+    try:
+
+      async def _run() -> None:
+        client = control_pipe_client.ControlPipeClient(
+            backend=control_pipe_client.ControlPipeBackendType.GRPC,
+            max_cached_grpc_stubs=2,
+        )
+        req = raiden_service_pb2.ControlRequest(
+            command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER
+        )
+
+        # 1. Access ep1 and ep2 -> both cached
+        await client.call(
+            ep1, req, raiden_service_pb2.ControlResponse, timeout=5.0
+        )
+        await client.call(
+            ep2, req, raiden_service_pb2.ControlResponse, timeout=5.0
+        )
+        self.assertEqual(list(client._aio_stubs.keys()), [ep1, ep2])
+
+        # 2. Access ep1 again -> ep1 promoted to MRU, ep2 becomes LRU
+        await client.call(
+            ep1, req, raiden_service_pb2.ControlResponse, timeout=5.0
+        )
+        self.assertEqual(list(client._aio_stubs.keys()), [ep2, ep1])
+
+        # 3. Access ep3 -> ep2 evicted, [ep1, ep3] retained
+        await client.call(
+            ep3, req, raiden_service_pb2.ControlResponse, timeout=5.0
+        )
+        self.assertEqual(list(client._aio_stubs.keys()), [ep1, ep3])
+        self.assertEqual(list(client._aio_channels.keys()), [ep1, ep3])
+        await client.aclose()
+
+        # 4. Zero capacity bypasses cache
+        zero_client = control_pipe_client.ControlPipeClient(
+            backend=control_pipe_client.ControlPipeBackendType.GRPC,
+            max_cached_grpc_stubs=0,
+        )
+        await zero_client.call(
+            ep1, req, raiden_service_pb2.ControlResponse, timeout=5.0
+        )
+        self.assertEmpty(zero_client._aio_stubs)
+        self.assertEmpty(zero_client._aio_channels)
+        await zero_client.aclose()
+
+      asyncio.run(_run())
+    finally:
+      grpc_server.stop(grace=None)
+
 
 if __name__ == "__main__":
   absltest.main()

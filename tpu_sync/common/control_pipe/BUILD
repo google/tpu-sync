@@ -307,6 +307,7 @@ cc_test(
         ":control_dispatcher",
         ":control_pipe",
         ":control_pipe_types",
+        ":grpc_control_pipe",
         "//tpu_sync/proto:control_pipe_cc_grpc",
         "//tpu_sync/proto:control_pipe_cc_proto",
         "//tpu_sync/proto:kv_cache_control_plane_service_cc_grpc",

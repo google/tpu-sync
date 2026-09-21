@@ -15,7 +15,9 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_CORE_GRPC_CONTROL_PLANE_BACKEND_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_CORE_GRPC_CONTROL_PLANE_BACKEND_H_
 
+#include <cstddef>
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <string>
 
@@ -61,7 +63,10 @@ class KVCacheControlPlaneServiceImpl final
 
 class GrpcControlPlaneBackend : public ControlPlaneBackend {
  public:
-  GrpcControlPlaneBackend() = default;
+  static constexpr size_t kDefaultMaxCachedStubs = 100000;
+
+  explicit GrpcControlPlaneBackend(
+      size_t max_cached_stubs = kDefaultMaxCachedStubs);
   ~GrpcControlPlaneBackend() override;
 
   absl::StatusOr<int> StartServer(int requested_port,
@@ -77,18 +82,30 @@ class GrpcControlPlaneBackend : public ControlPlaneBackend {
 
   absl::string_view Name() const override { return "grpc"; }
 
+  // Returns the current number of cached gRPC stubs.
+  size_t TEST_CachedStubCount() const;
+
+  // Returns true if a stub for |endpoint| is currently in the LRU cache.
+  bool TEST_HasCachedStub(absl::string_view endpoint) const;
+
  private:
+  struct StubCacheEntry {
+    std::shared_ptr<control_plane::proto::KVCacheControlPlaneService::Stub>
+        stub;
+    std::list<std::string>::iterator lru_it;
+  };
+
   std::shared_ptr<control_plane::proto::KVCacheControlPlaneService::Stub>
   GetOrCreateStub(absl::string_view endpoint);
 
   std::unique_ptr<KVCacheControlPlaneServiceImpl> service_impl_;
   std::unique_ptr<grpc::Server> server_;
 
-  absl::Mutex stub_mu_;
-  absl::flat_hash_map<
-      std::string,
-      std::shared_ptr<control_plane::proto::KVCacheControlPlaneService::Stub>>
-      stubs_ ABSL_GUARDED_BY(stub_mu_);
+  size_t max_cached_stubs_ = kDefaultMaxCachedStubs;
+  mutable absl::Mutex stub_mu_;
+  std::list<std::string> lru_order_ ABSL_GUARDED_BY(stub_mu_);
+  absl::flat_hash_map<std::string, StubCacheEntry> stubs_
+      ABSL_GUARDED_BY(stub_mu_);
 };
 
 }  // namespace tpu_raiden

@@ -87,6 +87,10 @@ struct ControlPipeConfig {
   // Optional callback returning the maximum allowed block count in legacy
   // `"RAID"` pull-stream headers before vector allocation.
   std::function<uint64_t()> max_legacy_pull_blocks_fn = nullptr;
+
+  // Maximum number of gRPC client stubs retained in the LRU cache by
+  // `GrpcControlPipeClient`.
+  size_t max_cached_grpc_stubs = 100000;
 };
 
 // Parses a backend type name ("tcp", "grpc", "zmq", case-insensitive).

@@ -15,6 +15,7 @@
 """Unified asyncio-native ControlPipeClient for Python controller and worker RPCs."""
 
 import asyncio
+import collections
 from concurrent import futures
 import enum
 import os
@@ -50,6 +51,7 @@ RespT = TypeVar("RespT", bound=proto_message.Message)
 CPIP_MAGIC = b"CPIP"
 PIPC_MAGIC = b"PIPC"
 DEFAULT_MAX_FRAME_BYTES = 2 * 1024 * 1024 * 1024 - 1  # 2 GiB - 1
+DEFAULT_MAX_CACHED_GRPC_STUBS = 100000
 _HEADER_STRUCT = struct.Struct("!4sI")
 _GRPC_CHANNEL_OPTIONS = (
     ("grpc.max_send_message_length", DEFAULT_MAX_FRAME_BYTES),
@@ -158,6 +160,7 @@ class ControlPipeClient:
       name_resolver: Optional[Any] = None,
       socket_connector: Optional[Callable[[str, float], socket.socket]] = None,
       executor: Optional[futures.Executor] = None,
+      max_cached_grpc_stubs: int = DEFAULT_MAX_CACHED_GRPC_STUBS,
   ) -> None:
     """Initializes ControlPipeClient.
 
@@ -169,6 +172,7 @@ class ControlPipeClient:
       name_resolver: Optional coordinate name resolver.
       socket_connector: Optional custom socket connection factory.
       executor: Optional thread pool executor for asynchronous TCP I/O.
+      max_cached_grpc_stubs: Maximum number of gRPC stubs retained in LRU cache.
     """
     self._backend_override = backend
     self._use_legacy_tcp_framing = use_legacy_tcp_framing
@@ -176,10 +180,15 @@ class ControlPipeClient:
     self._name_resolver = name_resolver
     self._socket_connector = socket_connector or _default_connect_socket
     self._executor = executor
+    self._max_cached_grpc_stubs = max_cached_grpc_stubs
     self._lock = threading.Lock()
     self._next_req_id = 1
-    self._aio_channels: dict[str, Any] = {}
-    self._aio_stubs: dict[str, Any] = {}
+    self._aio_channels: collections.OrderedDict[str, Any] = (
+        collections.OrderedDict()
+    )
+    self._aio_stubs: collections.OrderedDict[str, Any] = (
+        collections.OrderedDict()
+    )
     self._legacy_tcp_endpoints: set[str] = set()
     self._zmq_aio_ctx: Optional[Any] = None
 
@@ -211,11 +220,18 @@ class ControlPipeClient:
     resolved = self._resolve_address(endpoint)
     with self._lock:
       stub = self._aio_stubs.get(resolved)
-      if stub is None:
-        channel = grpc.aio.insecure_channel(
-            resolved, options=_GRPC_CHANNEL_OPTIONS
-        )
-        stub = control_pipe_pb2_grpc.ControlPipeServiceStub(channel)
+      if stub is not None:
+        self._aio_stubs.move_to_end(resolved)
+        self._aio_channels.move_to_end(resolved)
+        return stub
+      channel = grpc.aio.insecure_channel(
+          resolved, options=_GRPC_CHANNEL_OPTIONS
+      )
+      stub = control_pipe_pb2_grpc.ControlPipeServiceStub(channel)
+      if self._max_cached_grpc_stubs > 0:
+        while len(self._aio_stubs) >= self._max_cached_grpc_stubs:
+          self._aio_stubs.popitem(last=False)
+          self._aio_channels.popitem(last=False)
         self._aio_channels[resolved] = channel
         self._aio_stubs[resolved] = stub
       return stub

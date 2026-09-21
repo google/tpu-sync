@@ -38,6 +38,7 @@
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
 #include "tpu_sync/common/control_pipe/control_pipe_server.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
+#include "tpu_sync/common/control_pipe/grpc_control_pipe.h"
 #include "tpu_sync/proto/control_pipe.grpc.pb.h"
 #include "tpu_sync/proto/control_pipe.pb.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
@@ -407,6 +408,94 @@ TEST(WeightSyncFourWayInteropTest, TcpFourWayClientServerMatrix) {
 
   new_server->Stop();
   old_server.Stop();
+}
+
+TEST(GrpcControlPipeClientLruTest,
+     EvictsLeastRecentlyUsedStubWhenCapacityExceeded) {
+  ControlPipeConfig server_cfg;
+  server_cfg.backend_type = ControlPipeBackendType::kGrpc;
+
+  std::unique_ptr<ControlPipeServer> server1 =
+      CreateControlPipeServer(server_cfg);
+  std::unique_ptr<ControlPipeServer> server2 =
+      CreateControlPipeServer(server_cfg);
+  std::unique_ptr<ControlPipeServer> server3 =
+      CreateControlPipeServer(server_cfg);
+
+  for (ControlPipeServer* srv : {server1.get(), server2.get(), server3.get()}) {
+    srv->dispatcher().RegisterOneWayHandler<AckRequest>(
+        [](const ControlContext& ctx, const AckRequest& req) {
+          return absl::OkStatus();
+        });
+  }
+
+  TF_ASSERT_OK_AND_ASSIGN(int port1, server1->Start(0));
+  TF_ASSERT_OK_AND_ASSIGN(int port2, server2->Start(0));
+  TF_ASSERT_OK_AND_ASSIGN(int port3, server3->Start(0));
+
+  std::string ep1 = absl::StrCat("127.0.0.1:", port1);
+  std::string ep2 = absl::StrCat("127.0.0.1:", port2);
+  std::string ep3 = absl::StrCat("127.0.0.1:", port3);
+
+  ControlPipeConfig client_cfg;
+  client_cfg.backend_type = ControlPipeBackendType::kGrpc;
+  client_cfg.max_cached_grpc_stubs = 2;
+  GrpcControlPipeClient client(client_cfg);
+  EXPECT_EQ(client.TEST_CachedStubCount(), 0u);
+
+  AckRequest ack_req;
+  ack_req.set_uuid(1);
+
+  // 1. Send request to ep1, then ep2 -> both cached.
+  ASSERT_TRUE(client.SendOneWay(ep1, ack_req).ok());
+  EXPECT_EQ(client.TEST_CachedStubCount(), 1u);
+  EXPECT_TRUE(client.TEST_HasCachedStub(ep1));
+
+  ASSERT_TRUE(client.SendOneWay(ep2, ack_req).ok());
+  EXPECT_EQ(client.TEST_CachedStubCount(), 2u);
+  EXPECT_TRUE(client.TEST_HasCachedStub(ep1));
+  EXPECT_TRUE(client.TEST_HasCachedStub(ep2));
+
+  // 2. Access ep1 again (promotes ep1 to MRU, making ep2 LRU).
+  ASSERT_TRUE(client.SendOneWay(ep1, ack_req).ok());
+  EXPECT_EQ(client.TEST_CachedStubCount(), 2u);
+
+  // 3. Send request to ep3 -> ep2 is evicted, ep1 and ep3 remain cached.
+  ASSERT_TRUE(client.SendOneWay(ep3, ack_req).ok());
+  EXPECT_EQ(client.TEST_CachedStubCount(), 2u);
+  EXPECT_FALSE(client.TEST_HasCachedStub(ep2));
+  EXPECT_TRUE(client.TEST_HasCachedStub(ep1));
+  EXPECT_TRUE(client.TEST_HasCachedStub(ep3));
+
+  server1->Stop();
+  server2->Stop();
+  server3->Stop();
+}
+
+TEST(GrpcControlPipeClientLruTest, ZeroCapacityBypassesCache) {
+  ControlPipeConfig server_cfg;
+  server_cfg.backend_type = ControlPipeBackendType::kGrpc;
+  std::unique_ptr<ControlPipeServer> server =
+      CreateControlPipeServer(server_cfg);
+  server->dispatcher().RegisterOneWayHandler<AckRequest>(
+      [](const ControlContext& ctx, const AckRequest& req) {
+        return absl::OkStatus();
+      });
+  TF_ASSERT_OK_AND_ASSIGN(int port, server->Start(0));
+  std::string ep = absl::StrCat("127.0.0.1:", port);
+
+  ControlPipeConfig client_cfg;
+  client_cfg.backend_type = ControlPipeBackendType::kGrpc;
+  client_cfg.max_cached_grpc_stubs = 0;
+  GrpcControlPipeClient client(client_cfg);
+
+  AckRequest ack_req;
+  ack_req.set_uuid(100);
+  ASSERT_TRUE(client.SendOneWay(ep, ack_req).ok());
+  EXPECT_EQ(client.TEST_CachedStubCount(), 0u);
+  EXPECT_FALSE(client.TEST_HasCachedStub(ep));
+
+  server->Stop();
 }
 
 }  // namespace

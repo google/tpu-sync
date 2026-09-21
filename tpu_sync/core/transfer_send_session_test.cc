@@ -27,9 +27,11 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "xla/future.h"
@@ -45,7 +47,7 @@ using ::absl_testing::StatusIs;
 
 kv_cache::KVCacheManagerBase MakeTestBase(size_t num_layers = 1) {
   return kv_cache::KVCacheManagerBase(
-      num_layers, /*num_shards=*/1,
+      /*num_layers=*/num_layers, /*num_shards=*/1,
       /*slice_byte_size=*/128,
       /*local_port=*/std::nullopt,
       /*host_blocks_to_allocate=*/std::make_optional(4));
@@ -60,14 +62,66 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
                                      /*host_blocks_to_allocate=*/host_blocks,
                                      /*parallelism=*/1, nullptr) {}
 
+  void SetManualD2h(bool manual) {
+    absl::MutexLock lock(mu_);
+    manual_d2h_ = manual;
+  }
+
+  void SetManualH2h(bool manual) {
+    absl::MutexLock lock(mu_);
+    manual_h2h_ = manual;
+  }
+
+  void CompleteD2h(size_t index, absl::Status status = absl::OkStatus()) {
+    xla::Promise<> promise;
+    {
+      absl::MutexLock lock(mu_);
+      promise = std::move(d2h_promises_.at(index));
+    }
+    promise.Set(status);
+  }
+
+  void CompleteH2h(size_t index, absl::StatusOr<std::vector<int>> res) {
+    std::function<void(absl::StatusOr<std::vector<int>>)> cb;
+    {
+      absl::MutexLock lock(mu_);
+      cb = std::move(h2h_callbacks_.at(index));
+    }
+    cb(std::move(res));
+  }
+
+  int d2h_calls() const {
+    absl::MutexLock lock(mu_);
+    return d2h_calls_;
+  }
+
+  int h2h_calls() const {
+    absl::MutexLock lock(mu_);
+    return h2h_calls_;
+  }
+
+  bool WaitForH2hCalls(int expected, absl::Duration timeout) const {
+    absl::MutexLock lock(mu_);
+    auto cond = [this, expected]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+      return h2h_calls_ >= expected;
+    };
+    return mu_.AwaitWithTimeout(absl::Condition(&cond), timeout);
+  }
+
   absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
       const std::vector<int64_t>& src_offsets_major_dim,
       const std::vector<int64_t>& dst_offsets_major_dim,
       const std::vector<int64_t>& copy_sizes_major_dim,
       std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
       std::optional<size_t> shard_idx) override {
+    absl::MutexLock lock(mu_);
+    ++d2h_calls_;
     auto [promise, future] = xla::MakePromise<>();
-    promise.Set(absl::OkStatus());
+    if (manual_d2h_) {
+      d2h_promises_.push_back(std::move(promise));
+    } else {
+      promise.Set(absl::OkStatus());
+    }
     return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
   }
 
@@ -77,19 +131,37 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
                            int layer_idx,
                            std::function<void(absl::StatusOr<std::vector<int>>)>
                                on_complete) override {
+    {
+      absl::MutexLock lock(mu_);
+      ++h2h_calls_;
+      if (manual_h2h_) {
+        h2h_callbacks_.push_back(std::move(on_complete));
+        return;
+      }
+    }
     on_complete(src_block_ids);
   }
+
+ private:
+  mutable absl::Mutex mu_;
+  bool manual_d2h_ ABSL_GUARDED_BY(mu_) = false;
+  bool manual_h2h_ ABSL_GUARDED_BY(mu_) = false;
+  int d2h_calls_ ABSL_GUARDED_BY(mu_) = 0;
+  int h2h_calls_ ABSL_GUARDED_BY(mu_) = 0;
+  std::vector<xla::Promise<>> d2h_promises_ ABSL_GUARDED_BY(mu_);
+  std::vector<std::function<void(absl::StatusOr<std::vector<int>>)>>
+      h2h_callbacks_ ABSL_GUARDED_BY(mu_);
 };
 
 TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
   kv_cache::KVCacheManagerBase base = MakeTestBase();
   std::unique_ptr<StagingBlockAllocator> allocator =
-      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/1);
-  auto now = std::chrono::steady_clock::now();
+      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/2);
+  const auto now = std::chrono::steady_clock::now();
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
-      &base, allocator.get(), "req", /*uuid=*/30, /*block_ids=*/{},
-      /*deadline=*/now + std::chrono::seconds(5),
-      /*register_start=*/now, /*in_flight=*/1);
+      &base, allocator.get(), "req1", /*uuid=*/42, /*block_ids=*/{0, 1},
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now,
+      /*in_flight=*/1);
   TransferSession* base_session = session.get();
 
   EXPECT_FALSE(base_session->Done());
@@ -185,6 +257,94 @@ TEST(TransferSendSessionTest,
   absl::StatusOr<StagingAllocation> reacquired =
       allocator->AcquireWithTimeout(1, now + std::chrono::seconds(1));
   ABSL_EXPECT_OK(reacquired);
+}
+
+TEST(TransferSendSessionTest,
+     FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/1);
+  const auto now = std::chrono::steady_clock::now();
+
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_race", /*uuid=*/103, /*block_ids=*/{0},
+      /*deadline=*/now + std::chrono::seconds(5), /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  EXPECT_FALSE(session->Done());
+
+  // Finish occurs after ValidateAndBeginPull but before StartPush executes on
+  // the detached worker thread. AcquireStagingWithRetry checks draining_/done_
+  // and must not assign staging_ or issue any D2H/H2H operations.
+  session->Finish(absl::CancelledError("peer disconnected before StartPush"));
+  EXPECT_TRUE(session->IsDraining());
+  EXPECT_TRUE(session->Done());
+
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(base.d2h_calls(), 0);
+  EXPECT_EQ(base.h2h_calls(), 0);
+  EXPECT_EQ(allocator->num_free_slots(), 2);
+}
+
+TEST(TransferSendSessionTest,
+     DoneGuaranteesAllResourcesReleasedAndNoHbmOrTransportAccessAfterDone) {
+  FakeSendBase base(/*num_layers=*/2, /*host_blocks=*/4);
+  base.SetManualD2h(true);
+  base.SetManualH2h(true);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(&base, /*num_slots=*/1, /*max_blocks=*/1);
+  const auto now = std::chrono::steady_clock::now();
+
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_drain", /*uuid=*/105, /*block_ids=*/{0},
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
+
+  // Both D2H copies (layers 0 and 1) have been issued; slot is held.
+  ASSERT_EQ(base.d2h_calls(), 2);
+  EXPECT_TRUE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 0);
+  EXPECT_FALSE(session->Done());
+
+  // Complete Layer 0 D2H so Layer 0 H2H starts on push_pool.
+  base.CompleteD2h(0, absl::OkStatus());
+  ASSERT_TRUE(base.WaitForH2hCalls(1, absl::Seconds(2)));
+  EXPECT_FALSE(session->Done());
+
+  // Fail/timeout the session while Layer 0 H2H and Layer 1 D2H are in flight.
+  session->Finish(absl::DeadlineExceededError("send deadline exceeded"));
+  EXPECT_TRUE(session->IsDraining());
+  EXPECT_FALSE(session->Done());
+  EXPECT_TRUE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 0);
+
+  // Layer 0 H2H finishes first: Done() MUST remain false and staging MUST
+  // remain pinned because Layer 1 D2H is still accessing HBM & host staging.
+  base.CompleteH2h(0, std::vector<int>{0});
+  EXPECT_FALSE(session->Done());
+  EXPECT_TRUE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 0);
+
+  // Layer 1 D2H finishes: because the session is draining, Layer 1 H2H is NOT
+  // started, staging is immediately released, and Done() becomes true.
+  base.CompleteD2h(1, absl::OkStatus());
+  EXPECT_THAT(session->AwaitForDone(),
+              StatusIs(absl::StatusCode::kDeadlineExceeded));
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 1);
+  EXPECT_EQ(base.h2h_calls(), 1);
+
+  // Any subsequent StartPush call after Done() is a strict no-op.
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
+  EXPECT_EQ(base.d2h_calls(), 2);
+  EXPECT_EQ(base.h2h_calls(), 1);
+  EXPECT_EQ(allocator->num_free_slots(), 1);
 }
 
 }  // namespace

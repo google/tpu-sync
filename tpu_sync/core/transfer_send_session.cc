@@ -237,8 +237,7 @@ CopySpec TransferSendSession::BuildCoalescedCopySpec(
   return spec;
 }
 
-absl::StatusOr<StagingAllocation> TransferSendSession::AcquireStagingWithRetry(
-    int64_t num_blocks) {
+absl::Status TransferSendSession::AcquireStagingWithRetry(int64_t num_blocks) {
   while (true) {
     {
       absl::MutexLock lock(mu_);
@@ -254,11 +253,22 @@ absl::StatusOr<StagingAllocation> TransferSendSession::AcquireStagingWithRetry(
         std::min(deadline_, now + std::chrono::milliseconds(1));
     absl::StatusOr<StagingAllocation> acquired =
         staging_allocator_->AcquireWithTimeout(num_blocks, slice_deadline);
-    if (acquired.ok() || !absl::IsResourceExhausted(acquired.status())) {
-      return acquired;
+    if (acquired.ok()) {
+      absl::MutexLock lock(mu_);
+      if (draining_ || done_) {
+        return !status_.ok()
+                   ? status_
+                   : absl::CancelledError(
+                         "Send session cancelled while waiting for staging");
+      }
+      staging_ = *std::move(acquired);
+      return absl::OkStatus();
+    }
+    if (!absl::IsResourceExhausted(acquired.status())) {
+      return acquired.status();
     }
     if (std::chrono::steady_clock::now() >= deadline_) {
-      return acquired;
+      return acquired.status();
     }
   }
 }
@@ -274,18 +284,38 @@ void TransferSendSession::StartPush(
   // those host blocks to the consumer, keeping host offsets within the staging
   // pool. Writing D2H straight to host[src_block_id] overflows the host buffer
   // once a device block id exceeds num_host_blocks.
-  absl::StatusOr<StagingAllocation> acquired =
-      AcquireStagingWithRetry(static_cast<int64_t>(src_block_ids.size()));
-  if (!acquired.ok()) {
-    Finish(acquired.status());
+  if (src_block_ids.empty() || src_block_ids.size() != dst_block_ids.size() ||
+      remote_data_endpoints.empty()) {
+    Finish(absl::InvalidArgumentError(
+        absl::StrCat("Invalid StartPush arguments for uuid=", uuid_)));
     return;
   }
-  absl::Span<const int> blocks = acquired->block_ids();
-  std::vector<int64_t> host_block_ids(blocks.begin(),
-                                      blocks.begin() + src_block_ids.size());
+
+  absl::Status acquire_status =
+      AcquireStagingWithRetry(static_cast<int64_t>(src_block_ids.size()));
+  if (!acquire_status.ok()) {
+    Finish(acquire_status);
+    return;
+  }
+
+  const size_t total_layers = base_->num_layers();
+  std::vector<int64_t> host_block_ids;
   {
-    absl::MutexLock session_lock(mu_);
-    staging_ = *std::move(acquired);
+    absl::MutexLock lock(mu_);
+    if (draining_ || done_) {
+      return;
+    }
+    if (total_layers == 0) {
+      FinishLocked(absl::OkStatus());
+      return;
+    }
+    absl::Span<const int> blocks = staging_.block_ids();
+    host_block_ids.assign(blocks.begin(),
+                          blocks.begin() + src_block_ids.size());
+    d2h_layer_futures_.reserve(total_layers);
+    remote_data_endpoints_ = remote_data_endpoints;
+    src_ints_.assign(host_block_ids.begin(), host_block_ids.end());
+    dst_ints_.assign(dst_block_ids.begin(), dst_block_ids.end());
   }
 
   // Coalesce contiguous (device,host) block runs into a few large copies. With
@@ -294,14 +324,6 @@ void TransferSendSession::StartPush(
   // GEMMs on the shared TensorCore; coalescing collapses a contiguous range to
   // one copy, matching the pre-Hybrid-Push pull path.
   CopySpec d2h_copy = BuildCoalescedCopySpec(src_block_ids, host_block_ids);
-  const size_t total_layers = base_->num_layers();
-  {
-    absl::MutexLock lock(mu_);
-    d2h_layer_futures_.reserve(total_layers);
-    remote_data_endpoints_ = remote_data_endpoints;
-    src_ints_.assign(host_block_ids.begin(), host_block_ids.end());
-    dst_ints_.assign(dst_block_ids.begin(), dst_block_ids.end());
-  }
   remaining_h2h_layers_.store(total_layers, std::memory_order_relaxed);
 
   // 1. Issue D2H copies layer-by-layer. Each copy is counted against the

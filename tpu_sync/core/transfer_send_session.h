@@ -157,7 +157,7 @@ class TransferSendSession : public TransferSession {
   void FinishLocked(const absl::Status& status = absl::OkStatus())
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndSendOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  absl::StatusOr<StagingAllocation> AcquireStagingWithRetry(int64_t num_blocks);
+  absl::Status AcquireStagingWithRetry(int64_t num_blocks);
   void SendNextLayer(size_t l);
 
   mutable absl::Mutex mu_;

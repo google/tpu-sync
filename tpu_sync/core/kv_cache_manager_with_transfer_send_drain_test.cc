@@ -94,11 +94,15 @@ class TestManager : public KVCacheManagerWithTransfer {
   // need registration and dispatch use NotifyForRead and ServePull instead.
   std::shared_ptr<TransferSendSession> AddSyntheticSend(
       const std::string& req_id, uint64_t uuid, int in_flight) {
-    absl::MutexLock lock(mu_);
-    auto session = *TransferSendSession::Create(
-        base_.get(), staging_allocator_.get(), req_id, uuid, {},
-        DeadlineFromNow(), std::chrono::steady_clock::now(), in_flight);
-    send_sessions_[uuid] = session;
+    CHECK_GT(NotifyForRead(req_id, uuid, {0}), 0);
+    std::shared_ptr<TransferSendSession> session;
+    {
+      absl::MutexLock lock(mu_);
+      session = send_sessions_.at(uuid);
+    }
+    if (in_flight > 0) {
+      ServePull(uuid);
+    }
     return session;
   }
 
@@ -382,18 +386,18 @@ TEST(SendLifecycleTest, FailedSendWithoutWorkSettlesImmediately) {
 }
 
 TEST(SendLifecycleTest, SuccessfulSendWaitsForEveryOperation) {
-  TestManager producer(/*num_layers=*/1);
+  TestManager producer(/*num_layers=*/2);
   auto session = producer.AddSyntheticSend("req", /*uuid=*/12, /*in_flight=*/2);
 
   producer.Decide(session, /*failed=*/false);
-  producer.End(session);
+  producer.FinishCopy(0, absl::OkStatus());
   Reports during = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(during), IsEmpty());
   EXPECT_THAT(FailedRecving(during), IsEmpty());
   EXPECT_TRUE(producer.has_send(12));
   EXPECT_EQ(producer.free_slots(), kSlots - 1);
 
-  producer.End(session);
+  producer.FinishCopy(1, absl::OkStatus());
   Reports after = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(after), Contains("req"));
   EXPECT_THAT(FailedRecving(after), IsEmpty());
@@ -407,7 +411,7 @@ TEST(SendLifecycleTest, FailureWinsWhileSuccessfulSendIsDraining) {
 
   producer.Decide(session, /*failed=*/false);
   producer.Decide(session, /*failed=*/true);
-  producer.End(session);
+  producer.FinishCopy(0, absl::OkStatus());
   Reports reports = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(reports), IsEmpty());
   EXPECT_THAT(FailedRecving(reports), Contains("req"));
@@ -421,7 +425,7 @@ TEST(SendLifecycleTest, SuccessCannotOverrideAnEarlierFailure) {
 
   producer.Decide(session, /*failed=*/true);
   producer.Decide(session, /*failed=*/false);
-  producer.End(session);
+  producer.FinishCopy(0, absl::OkStatus());
   Reports reports = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(reports), IsEmpty());
   EXPECT_THAT(FailedRecving(reports), Contains("req"));

@@ -57,8 +57,7 @@ class TransferSendSession
       StagingBlockAllocator* absl_nullable staging_allocator,
       std::string req_id, uint64_t uuid, absl::Span<const int64_t> block_ids,
       std::chrono::steady_clock::time_point deadline,
-      std::chrono::steady_clock::time_point register_start, int in_flight = 0,
-      bool pull_started = false);
+      std::chrono::steady_clock::time_point register_start);
 
   ~TransferSendSession() override { ReleaseSlot(); }
 
@@ -143,8 +142,7 @@ class TransferSendSession
                       StagingBlockAllocator* staging_allocator,
                       std::string req_id, uint64_t uuid,
                       std::chrono::steady_clock::time_point deadline,
-                      std::chrono::steady_clock::time_point register_start,
-                      int in_flight = 0, bool pull_started = false);
+                      std::chrono::steady_clock::time_point register_start);
 
   // Populates |registered_block_ids_| and |registered_block_set_| from
   // |block_ids|. Returns the first duplicate block ID if any duplicate is

@@ -49,14 +49,13 @@ TransferSendSession::Create(
     StagingBlockAllocator* absl_nullable staging_allocator, std::string req_id,
     uint64_t uuid, absl::Span<const int64_t> block_ids,
     std::chrono::steady_clock::time_point deadline,
-    std::chrono::steady_clock::time_point register_start, int in_flight,
-    bool pull_started) {
+    std::chrono::steady_clock::time_point register_start) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
-  auto session = std::shared_ptr<TransferSendSession>(new TransferSendSession(
-      base, staging_allocator, std::move(req_id), uuid, deadline,
-      register_start, in_flight, pull_started));
+  auto session = std::shared_ptr<TransferSendSession>(
+      new TransferSendSession(base, staging_allocator, std::move(req_id), uuid,
+                              deadline, register_start));
   std::optional<int64_t> duplicate_block =
       session->PopulateRegisteredBlocks(block_ids);
   if (duplicate_block.has_value()) {
@@ -71,23 +70,13 @@ TransferSendSession::TransferSendSession(
     kv_cache::KVCacheManagerBase* base,
     StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
     std::chrono::steady_clock::time_point deadline,
-    std::chrono::steady_clock::time_point register_start, int in_flight,
-    bool pull_started)
+    std::chrono::steady_clock::time_point register_start)
     : base_(base),
       staging_allocator_(staging_allocator),
       req_id_(std::move(req_id)),
       uuid_(uuid),
       deadline_(deadline),
-      register_start_(register_start),
-      pull_started_(pull_started),
-      in_flight_(in_flight) {
-  if (in_flight > 0) {
-    absl::StatusOr<StagingAllocation> acquired = staging_allocator_->Acquire(1);
-    if (acquired.ok()) {
-      staging_ = *std::move(acquired);
-    }
-  }
-}
+      register_start_(register_start) {}
 
 std::optional<int64_t> TransferSendSession::PopulateRegisteredBlocks(
     absl::Span<const int64_t> block_ids) {

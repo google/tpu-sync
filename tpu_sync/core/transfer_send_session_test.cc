@@ -154,16 +154,20 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
 };
 
 TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
-  kv_cache::KVCacheManagerBase base = MakeTestBase();
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  base.SetManualD2h(true);
   std::unique_ptr<StagingBlockAllocator> allocator =
       StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/2);
   const auto now = std::chrono::steady_clock::now();
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
       &base, allocator.get(), "req1", /*uuid=*/42, /*block_ids=*/{0, 1},
-      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now,
-      /*in_flight=*/1);
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
   TransferSession* base_session = session.get();
 
+  session->ValidateAndBeginPull({0, 1}, now);
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0, 1},
+                     /*dst_block_ids=*/{0, 1});
+  EXPECT_TRUE(session->HasStaging());
   EXPECT_FALSE(base_session->Done());
   EXPECT_FALSE(base_session->IsDraining());
   ABSL_EXPECT_OK(base_session->GetStatus());
@@ -174,7 +178,7 @@ TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
   EXPECT_THAT(base_session->GetStatus(),
               StatusIs(absl::StatusCode::kUnavailable));
 
-  session->EndSendOp();
+  base.CompleteD2h(0, absl::OkStatus());
   EXPECT_TRUE(base_session->Done());
   EXPECT_FALSE(session->HasStaging());
   EXPECT_THAT(base_session->AwaitForDone(),

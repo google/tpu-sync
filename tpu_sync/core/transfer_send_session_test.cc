@@ -462,5 +462,31 @@ TEST(TransferSendSessionTest, StatusIsFrozenOnceSessionIsDrainingOrDone) {
   ABSL_EXPECT_OK(session->GetStatus());
 }
 
+TEST(TransferSendSessionTest, ReleaseStagingBlocksClearsD2hLayerFuturesOnDone) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  base.SetManualD2h(true);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/1);
+  const auto now = std::chrono::steady_clock::now();
+
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_futures", /*uuid=*/306, /*block_ids=*/{0},
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
+
+  EXPECT_TRUE(
+      session->OwnsBlockWithReadyFuture(/*block_id=*/0, /*layer_idx=*/0));
+  EXPECT_TRUE(session->HasStaging());
+
+  base.CompleteD2h(0, absl::OkStatus());
+  ABSL_EXPECT_OK(session->AwaitForDone());
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(session->HasStaging());
+  EXPECT_FALSE(
+      session->OwnsBlockWithReadyFuture(/*block_id=*/0, /*layer_idx=*/0));
+}
+
 }  // namespace
 }  // namespace tpu_raiden

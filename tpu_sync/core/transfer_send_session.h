@@ -59,7 +59,7 @@ class TransferSendSession
       std::chrono::steady_clock::time_point deadline,
       std::chrono::steady_clock::time_point register_start);
 
-  ~TransferSendSession() override { ReleaseSlot(); }
+  ~TransferSendSession() override { ReleaseStagingBlocks(); }
 
   bool Done() const override {
     absl::MutexLock lock(mu_);
@@ -152,8 +152,8 @@ class TransferSendSession
   void ValidateRequestedBlocksLocked(
       const std::vector<int64_t>& requested_block_ids) const
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void ReleaseSlot();
-  void ReleaseSlotLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void ReleaseStagingBlocks();
+  void ReleaseStagingBlocksLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void FinishLocked(const absl::Status& status = absl::OkStatus())
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndSendOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);

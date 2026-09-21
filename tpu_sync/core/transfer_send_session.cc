@@ -153,11 +153,14 @@ void TransferSendSession::RegisterLayerReadinessCallback(
       [cb = std::move(cb)](auto status_or) { cb(status_or.status()); });
 }
 
-void TransferSendSession::ReleaseSlotLocked() { staging_.Reset(); }
+void TransferSendSession::ReleaseStagingBlocksLocked() {
+  staging_.Reset();
+  d2h_layer_futures_.clear();
+}
 
-void TransferSendSession::ReleaseSlot() {
+void TransferSendSession::ReleaseStagingBlocks() {
   absl::MutexLock lock(mu_);
-  ReleaseSlotLocked();
+  ReleaseStagingBlocksLocked();
 }
 
 void TransferSendSession::FinishLocked(const absl::Status& status) {
@@ -165,7 +168,7 @@ void TransferSendSession::FinishLocked(const absl::Status& status) {
   status_ = status;
   draining_ = true;
   if (in_flight_ == 0) {
-    ReleaseSlotLocked();
+    ReleaseStagingBlocksLocked();
     done_ = true;
   }
 }
@@ -184,7 +187,7 @@ absl::Status TransferSendSession::AwaitForDone() {
 void TransferSendSession::EndSendOpLocked() {
   --in_flight_;
   if (draining_ && in_flight_ == 0 && !done_) {
-    ReleaseSlotLocked();
+    ReleaseStagingBlocksLocked();
     done_ = true;
   }
 }

@@ -243,7 +243,8 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     uint8_t* const base_host_ptr =
         raw_delegate_->GetHostPointer(buf_id, src_shard_idx);
     const size_t host_size = raw_delegate_->GetHostSize(buf_id, src_shard_idx);
-    if (base_host_ptr == nullptr || src_offset + size_bytes > host_size) {
+    if (base_host_ptr == nullptr || size_bytes > host_size ||
+        src_offset > host_size - size_bytes) {
       return absl::InvalidArgumentError("Source out of bounds");
     }
     uint8_t* const src_ptr = base_host_ptr + src_offset;
@@ -259,7 +260,8 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     uint8_t* const base_host_ptr =
         raw_delegate_->GetHostPointer(buf_id, dst_shard_idx);
     const size_t host_size = raw_delegate_->GetHostSize(buf_id, dst_shard_idx);
-    if (base_host_ptr == nullptr || dst_offset + size_bytes > host_size) {
+    if (base_host_ptr == nullptr || size_bytes > host_size ||
+        dst_offset > host_size - size_bytes) {
       return absl::InvalidArgumentError("Destination out of bounds");
     }
     uint8_t* const dest_ptr = base_host_ptr + dst_offset;
@@ -339,8 +341,8 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
           raw_delegate_->GetHostPointer(meta.layer_idx, meta.dst_shard_idx);
       const size_t host_size =
           raw_delegate_->GetHostSize(meta.layer_idx, meta.dst_shard_idx);
-      if (base_host_ptr == nullptr ||
-          meta.dst_offset_bytes + meta.size_bytes > host_size) {
+      if (base_host_ptr == nullptr || meta.size_bytes > host_size ||
+          meta.dst_offset_bytes > host_size - meta.size_bytes) {
         return absl::InvalidArgumentError(
             "Destination out of bounds in batched push");
       }
@@ -527,7 +529,7 @@ absl::Status RawBufferTransport::PullBuffer(
   }
 
   const size_t host_size = raw_delegate_->GetHostSize(buffer_id, dst_shard_idx);
-  if (dst_offset_bytes + size_bytes > host_size) {
+  if (size_bytes > host_size || dst_offset_bytes > host_size - size_bytes) {
     return absl::InvalidArgumentError(absl::StrCat(
         "Destination offset out of bounds. Offset: ", dst_offset_bytes,
         ", Size: ", size_bytes, ", Shard Host Size: ", host_size));
@@ -547,6 +549,15 @@ absl::Status RawBufferTransport::ProcessSocketBufferPull(
     absl::string_view peer, const Request& request) {
   if (peer.empty()) {
     return absl::InvalidArgumentError("Source peer address cannot be empty");
+  }
+  // ChunkHeader wire protocol uses 32-bit fields for remote_id and
+  // count_or_size; validate against uint32 max to prevent silent truncation on
+  // the wire.
+  if (request.remote_id > std::numeric_limits<uint32_t>::max()) {
+    return absl::InvalidArgumentError("Source offset exceeds uint32 max");
+  }
+  if (request.len > std::numeric_limits<uint32_t>::max()) {
+    return absl::InvalidArgumentError("Pull size exceeds uint32 max");
   }
 
   ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
@@ -642,11 +653,6 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
         "Destination peer address cannot be empty");
   }
 
-  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
-  bool ok_to_pool = false;
-  auto fd_cleaner = absl::MakeCleanup(
-      [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
-
   const uint8_t opcode = request.socket_opcode;
   const uint64_t uuid = request.uuid;
 
@@ -655,9 +661,20 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
         absl::StrCat("Unsupported buffer push opcode: ", opcode));
   }
 
+  // ChunkHeader wire protocol uses 32-bit fields for remote_id and
+  // count_or_size; validate against uint32 max to prevent silent truncation on
+  // the wire.
   if (request.remote_id > std::numeric_limits<uint32_t>::max()) {
     return absl::InvalidArgumentError("Destination offset exceeds uint32 max");
   }
+  if (request.len > std::numeric_limits<uint32_t>::max()) {
+    return absl::InvalidArgumentError("Push size exceeds uint32 max");
+  }
+
+  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
+  bool ok_to_pool = false;
+  auto fd_cleaner = absl::MakeCleanup(
+      [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
 
   ChunkHeader header = {};
   header.version = 1;

@@ -15,6 +15,7 @@
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 
 #include <signal.h>
+#include <unistd.h>
 
 #include <chrono>  // NOLINT
 #include <cstddef>
@@ -44,11 +45,15 @@
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/lib/chunk.h"
+#include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_sync/transport/lib/socket/psp_syscall_mock.h" // NOLINT
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+#include "tpu_sync/transport/lib/socket/util.h"
+#include "tpu_sync/transport/peregrine/src/api/socket_util.h"
 #include "tpu_sync/transport/peregrine/src/util/util.h"
 
 namespace tpu_raiden::transport::lib {
@@ -380,6 +385,90 @@ TEST_P(RawBufferTransportTest, RejectsOutOfBounds) {
       dst_transport.PullBuffer(src_addr, kBufferId, kSrcShardIdx, kSrcOffset,
                                kDstShardIdx, kDstOffset, kLen);
   EXPECT_FALSE(pull_res.ok()) << pull_res.message();
+}
+
+TEST_P(RawBufferTransportTest, RejectsWrappingAndOutOfBoundsPushAndPull) {
+  // Set up src/dst buffers.
+  constexpr size_t size = 1024;
+  RawMockDelegate src(size);
+  RawMockDelegate dst(size);
+
+  // Create two transports.
+  RawBufferTransport src_transport(&src, 0);
+  RawBufferTransport dst_transport(&dst, 0);
+  BindControlChannels(&src_transport, &src, &dst_transport, &dst);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const std::string dst_addr = GetIpPort(dst_transport);
+  const std::string src_addr = GetIpPort(src_transport);
+
+  // Test wrapping offset:
+  // 0xFFFFF000 (about 4 GiB, 8 KiB size): wraps around 32 bits if checked
+  // with 32-bit addition (0xFFFFF000 + 0x2000 = 0x1000 <= host_size).
+  constexpr uint32_t wrap_offset = 0xFFFFF000;
+  constexpr uint32_t kWrapSize = 0x2000;
+
+  // 1. Verify push with wrapping offset + size is rejected on the wire.
+  {
+    auto client_fd_or = ConnectToPeer(dst_addr);
+    ASSERT_OK(client_fd_or);
+    const int client_fd = *client_fd_or;
+
+    ChunkHeader header = {};
+    header.version = 1;
+    header.op = kOpBufferPush;
+    header.buffer_id = 0;
+    header.remote_id = wrap_offset;
+    header.local_id = 0;
+    header.count_or_size = kWrapSize;
+    header.uuid = 42;
+
+    const auto s_header = SerializeChunkHeader(header);
+    ASSERT_OK(
+        ::peregrine::WriteExact(client_fd, s_header.data(), s_header.size()));
+
+    // Server should reject destination out of bounds and close socket without
+    // reading/writing payload or sending ACK=1.
+    uint8_t ack = 0;
+    const auto read_res = ::peregrine::ReadExact(client_fd, &ack, 1);
+    EXPECT_FALSE(read_res.ok());
+    close(client_fd);
+  }
+
+  // 2. Verify pull with wrapping offset + size is rejected on the wire.
+  {
+    auto client_fd_or = ConnectToPeer(src_addr);
+    ASSERT_OK(client_fd_or);
+    const int client_fd = *client_fd_or;
+
+    ChunkHeader header = {};
+    header.version = 1;
+    header.op = kOpBufferPull;
+    header.buffer_id = 0;
+    header.remote_id = wrap_offset;
+    header.local_id = 0;
+    header.count_or_size = kWrapSize;
+    header.uuid = 43;
+
+    const auto s_header = SerializeChunkHeader(header);
+    ASSERT_OK(
+        ::peregrine::WriteExact(client_fd, s_header.data(), s_header.size()));
+
+    // Server should reject source out of bounds and close socket without
+    // sending data.
+    std::vector<uint8_t> dummy(kWrapSize);
+    const auto read_res =
+        ::peregrine::ReadExact(client_fd, dummy.data(), dummy.size());
+    EXPECT_FALSE(read_res.ok());
+    close(client_fd);
+  }
+
+  // 3. Verify PullBuffer with wrapping destination offset is rejected.
+  const auto pull_res = dst_transport.PullBuffer(
+      src_addr, kBufferId, kSrcShardIdx, /*src_offset_bytes=*/0, kDstShardIdx,
+      /*dst_offset_bytes=*/wrap_offset, /*size_bytes=*/kWrapSize);
+  EXPECT_FALSE(pull_res.ok());
+  EXPECT_THAT(pull_res.message(), ::testing::HasSubstr("out of bounds"));
 }
 
 TEST_P(ConnPoolTest, MultiIpPoolingIsolation) {

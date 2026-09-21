@@ -211,6 +211,8 @@ cc_test(
     ],
     features = ["-use_header_modules"],
     deps = [
+        ":chunk",
+        ":chunk_serializer",
         ":peregrine_control_service",
         ":raw_buffer_transport",
         ":raw_buffer_transport_delegate",
@@ -218,6 +220,8 @@ cc_test(
         "//tpu_sync/transport/lib/conn:pool",
         "//tpu_sync/transport/lib/socket:psp_syscall_mock",
         "//tpu_sync/transport/lib/socket:tcp_psp_helper",
+        "//tpu_sync/transport/lib/socket:util",
+        "//tpu_sync/transport/peregrine/src/api:socket_util",
         "//tpu_sync/transport/peregrine/src/util",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",

@@ -1399,6 +1399,9 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
       bool recv_pending = false;
       for (const auto& [uuid, session] : active_recv_sessions_) {
         (void)uuid;
+        if (!session->IsDraining() && session->IsReadyToComplete()) {
+          session->Finish();
+        }
         if (!session->Done()) {
           recv_pending = true;
           break;
@@ -1407,6 +1410,9 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
       if (!recv_pending) {
         for (const auto& [uuid, session] : active_pool_reshard_recvs_) {
           (void)uuid;
+          if (!session->IsDraining() && session->IsReadyToComplete()) {
+            session->Finish();
+          }
           if (session->HasPendingWork()) {
             recv_pending = true;
             break;

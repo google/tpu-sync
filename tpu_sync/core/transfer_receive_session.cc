@@ -203,7 +203,7 @@ absl::Status TransferReceiveSession::InitFromActivePlan(
   h2d_copy_ = TransferSendSession::BuildCoalescedCopySpec(h2d_host_block_ids,
                                                           h2d_local_block_ids);
   if (total_blocks_ == 0) {
-    ReleaseStagingLocked();
+    FinishLocked();
   }
   return absl::OkStatus();
 }
@@ -425,7 +425,8 @@ bool TransferReceiveSession::AllH2dDoneLocked() const {
 bool TransferReceiveSession::IsReadyToComplete() const {
   absl::MutexLock lock(mu_);
   const size_t total_layers = base_ != nullptr ? base_->num_layers() : 0;
-  return (network_completed_ ||
+  return in_flight_ == 0 &&
+         (network_completed_ ||
           num_completed_layers_ == static_cast<int32_t>(total_layers)) &&
          AllH2dDoneLocked();
 }
@@ -501,6 +502,8 @@ void TransferReceiveSession::ExecutePullRequest(
 
         if (!pull_status.ok()) {
           self->Finish(pull_status);
+        } else if (self->base_ != nullptr && self->base_->num_layers() == 0) {
+          self->Finish();
         }
       });
 }

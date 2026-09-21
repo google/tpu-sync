@@ -3168,11 +3168,15 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteDuplicateFails) {
   register_src_worker("worker_0", "src_worker_0_addr", "src_worker_0_transfer");
 
   // Every read is now validated at the source by construction -- there is no
-  // longer any RPC that transfers without verifying and pinning first. Grant
-  // the lease and echo back authoritative ids.
+  // longer any RPC that transfers without verifying and pinning first. Hold the
+  // source's AcquireReadLease hook open until after the second ReadRemote call
+  // so the first read cannot complete and clear load_tracker_ before the
+  // duplicate check runs.
+  absl::Notification release_lease;
   src_controller_server->service->SetReadRemoteHooks(
       [&](absl::Span<const std::string> h)
           -> absl::StatusOr<std::vector<int32_t>> {
+        release_lease.WaitForNotification();
         return std::vector<int32_t>(h.size(), 42);
       },
       [&](absl::Span<const std::string> /*h*/) {});
@@ -3202,6 +3206,19 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteDuplicateFails) {
   EXPECT_FALSE(status2.ok());
   EXPECT_EQ(status2.code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_THAT(status2.message(), ::testing::HasSubstr("already loading"));
+
+  release_lease.Notify();
+  bool first_read_settled = false;
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    auto [done_hashes, failed_hashes, pending_hashes] =
+        store.PollRemoteReadStatus();
+    if (!done_hashes.empty() || !failed_hashes.empty()) {
+      first_read_settled = true;
+      break;
+    }
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_TRUE(first_read_settled);
 }
 
 

@@ -48,7 +48,9 @@ namespace tpu_raiden {
 // Lock ordering: when both |KVCacheManagerWithTransfer::mu_| and |mu_| are
 // acquired, |KVCacheManagerWithTransfer::mu_| must be acquired first. |mu_| is
 // a leaf lock and is never held across callbacks or manager calls.
-class TransferSendSession : public TransferSession {
+class TransferSendSession
+    : public TransferSession,
+      public std::enable_shared_from_this<TransferSendSession> {
  public:
   static absl::StatusOr<std::shared_ptr<TransferSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,

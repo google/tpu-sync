@@ -347,5 +347,84 @@ TEST(TransferSendSessionTest,
   EXPECT_EQ(allocator->num_free_slots(), 1);
 }
 
+TEST(TransferSendSessionTest,
+     AsyncCallbacksKeepSessionAliveAfterCallerDropsSharedPtr) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/2);
+  base.SetManualD2h(true);
+  base.SetManualH2h(true);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(&base, /*num_slots=*/1, /*max_blocks=*/1);
+  const auto now = std::chrono::steady_clock::now();
+
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_lifetime", /*uuid=*/106, /*block_ids=*/{0},
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
+
+  ASSERT_EQ(base.d2h_calls(), 1);
+  EXPECT_EQ(allocator->num_free_slots(), 0);
+
+  // Drop the caller's shared_ptr while async D2H and H2H callbacks are pending.
+  std::weak_ptr<TransferSendSession> weak_session = session;
+  session.reset();
+  EXPECT_FALSE(weak_session.expired());
+
+  // Complete D2H: H2H starts and continues holding the session alive.
+  base.CompleteD2h(0, absl::OkStatus());
+  ASSERT_TRUE(base.WaitForH2hCalls(1, absl::Seconds(2)));
+  EXPECT_FALSE(weak_session.expired());
+  EXPECT_EQ(allocator->num_free_slots(), 0);
+
+  // Complete H2H: the session finishes, releases its staging slot, and then
+  // destroys itself cleanly once the last callback unwinds.
+  base.CompleteH2h(0, std::vector<int>{0});
+  EXPECT_EQ(allocator->num_free_slots(), 1);
+  EXPECT_TRUE(weak_session.expired());
+}
+
+TEST(TransferSendSessionTest,
+     ZeroLayerSessionCompletesAndReleasesStagingWithoutHang) {
+  FakeSendBase base(/*num_layers=*/0, /*host_blocks=*/4);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/1);
+  const auto now = std::chrono::steady_clock::now();
+
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_zero_layers", /*uuid=*/107,
+      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(5),
+      /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
+
+  ABSL_EXPECT_OK(session->AwaitForDone());
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 2);
+}
+
+TEST(TransferSendSessionTest,
+     InvalidStartPushArgumentsFailSessionImmediatelyWithoutHang) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/1);
+  const auto now = std::chrono::steady_clock::now();
+
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_bad_args", /*uuid=*/108, /*block_ids=*/{0},
+      /*deadline=*/now + std::chrono::seconds(5), /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush(/*remote_data_endpoints=*/{}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
+
+  EXPECT_THAT(session->AwaitForDone(),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 2);
+}
+
 }  // namespace
 }  // namespace tpu_raiden

@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "absl/base/nullability.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -359,7 +360,9 @@ void TransferSendSession::StartPush(
       d2h_layer_futures_.push_back(layer_future);
     }
     layer_future.OnReady(
-        [this](absl::StatusOr<raiden::BufferHolders>) { EndSendOp(); });
+        [self = shared_from_this()](absl::StatusOr<raiden::BufferHolders>) {
+          self->EndSendOp();
+        });
   }
 
   SendNextLayer(0);
@@ -383,76 +386,67 @@ void TransferSendSession::SendNextLayer(size_t l) {
     ++in_flight_;
   }
 
-  layer_future->OnReady([this, l](auto status_or) {
+  layer_future->OnReady([self = shared_from_this(), l](auto status_or) {
+    absl::Cleanup end_op = [self]() { self->EndSendOp(); };
     if (!status_or.ok()) {
       LOG(ERROR) << "StartPush: D2H copy failed for layer " << l
                  << ", status: " << status_or.status().ToString();
-      absl::MutexLock lock(mu_);
-      FinishLocked(status_or.status());
-      EndSendOpLocked();
+      self->Finish(status_or.status());
       return;
     }
-    bool is_draining = false;
     {
-      absl::MutexLock session_lock(mu_);
+      absl::MutexLock session_lock(self->mu_);
       // The send expired or failed while the copy ran: nothing is pushed.
-      is_draining = draining_;
-      if (is_draining) {
-        EndSendOpLocked();
+      if (self->draining_) {
+        return;
       }
     }
-    if (is_draining) {
-      return;
-    }
 
-    base_->push_pool()->Schedule([this, l]() {
+    std::move(end_op).Cancel();
+    self->base_->push_pool()->Schedule([self, l]() {
+      absl::Cleanup end_op = [self]() { self->EndSendOp(); };
       std::vector<std::string> remote_data_endpoints;
       std::vector<int> src_ints;
       std::vector<int> dst_ints;
       {
-        absl::MutexLock lock(mu_);
-        if (draining_) {
-          EndSendOpLocked();
+        absl::MutexLock lock(self->mu_);
+        if (self->draining_) {
           return;
         }
-        remote_data_endpoints = remote_data_endpoints_;
-        src_ints = src_ints_;
-        dst_ints = dst_ints_;
-        ++in_flight_;
+        remote_data_endpoints = self->remote_data_endpoints_;
+        src_ints = self->src_ints_;
+        dst_ints = self->dst_ints_;
+        ++self->in_flight_;
       }
-      LOG(INFO) << "StartPush (H2H start layer " << l << "): uuid=" << uuid_
-                << ", numa=" << base_->assigned_numa_node().value_or(-1);
-      base_->H2hWriteDirectAsync(
-          remote_data_endpoints, src_ints, dst_ints, uuid_, static_cast<int>(l),
-          [this, l](absl::StatusOr<std::vector<int>> push_res) {
+      LOG(INFO) << "StartPush (H2H start layer " << l
+                << "): uuid=" << self->uuid_
+                << ", numa=" << self->base_->assigned_numa_node().value_or(-1);
+      self->base_->H2hWriteDirectAsync(
+          remote_data_endpoints, src_ints, dst_ints, self->uuid_,
+          static_cast<int>(l),
+          [self, l](absl::StatusOr<std::vector<int>> push_res) {
+            absl::Cleanup end_op = [self]() { self->EndSendOp(); };
             if (!push_res.ok()) {
               LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
                          << push_res.status().ToString();
-              absl::MutexLock lock(mu_);
-              FinishLocked(push_res.status());
-              EndSendOpLocked();
+              self->Finish(push_res.status());
               return;
             }
 
             LOG(INFO) << "StartPush (H2H complete layer " << l
-                      << "): uuid=" << uuid_
-                      << ", numa=" << base_->assigned_numa_node().value_or(-1);
+                      << "): uuid=" << self->uuid_ << ", numa="
+                      << self->base_->assigned_numa_node().value_or(-1);
 
-            const bool last = remaining_h2h_layers_.fetch_sub(1) == 1;
+            const bool last = self->remaining_h2h_layers_.fetch_sub(1) == 1;
             if (last) {
-              LOG(INFO) << "StartPush (All H2H complete): uuid=" << uuid_;
+              LOG(INFO) << "StartPush (All H2H complete): uuid=" << self->uuid_;
+              self->Finish();
             }
-            absl::MutexLock lock(mu_);
-            if (last) {
-              FinishLocked();
-            }
-            EndSendOpLocked();
           });
 
       // Immediately queue the next layer's push without waiting for this one to
       // finish.
-      SendNextLayer(l + 1);
-      EndSendOp();
+      self->SendNextLayer(l + 1);
     });
   });
 }

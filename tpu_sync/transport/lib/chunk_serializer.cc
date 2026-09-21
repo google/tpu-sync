@@ -33,13 +33,14 @@ namespace tpu_raiden::transport::lib {
 
 namespace {
 
-absl::InlinedVector<char, kChunkHeaderSize> SerializeHeaderV1(
+
+absl::InlinedVector<char, kChunkHeaderSize> SerializeHeaderV2(
     const ChunkHeader& header) {
-  constexpr uint16_t kVer = 1;
+  constexpr uint16_t kVer = 2;
   const flatbuf::ChunkHeader h(
       kRaidenMagic, kVer, header.op, header.flags, header.buffer_id,
-      header.reserved, header.metadata_size, header.remote_id, header.local_id,
-      header.count_or_size, header.uuid, /*padding0=*/0, /*padding1=*/0,
+      header.reserved, header.metadata_size, /*padding0=*/0, header.remote_id,
+      header.local_id, /*padding1=*/0, header.count_or_size, header.uuid,
       /*padding2=*/0, /*padding3=*/0);
 
   absl::InlinedVector<char, kChunkHeaderSize> bytes(sizeof(h));
@@ -47,7 +48,7 @@ absl::InlinedVector<char, kChunkHeaderSize> SerializeHeaderV1(
   return bytes;
 }
 
-void DeserializeHeaderV1(const flatbuf::ChunkHeader& h, ChunkHeader& header) {
+void DeserializeHeaderV1(const flatbuf::ChunkHeaderV1& h, ChunkHeader& header) {
   DCHECK_EQ(h.ver(), 1);
   header.version = h.ver();
   header.op = h.op();
@@ -61,7 +62,21 @@ void DeserializeHeaderV1(const flatbuf::ChunkHeader& h, ChunkHeader& header) {
   header.uuid = h.uuid();
 }
 
-absl::InlinedVector<char, kMaxMetadataSize> SerializeMetadataV1(
+void DeserializeHeaderV2(const flatbuf::ChunkHeader& h, ChunkHeader& header) {
+  DCHECK_EQ(h.ver(), 2);
+  header.version = h.ver();
+  header.op = h.op();
+  header.flags = h.flags();
+  header.buffer_id = h.buffer_id();
+  header.reserved = h.reserved();
+  header.metadata_size = h.metadata_size();
+  header.remote_id = h.remote_id();
+  header.local_id = h.local_id();
+  header.count_or_size = h.count_or_size();
+  header.uuid = h.uuid();
+}
+
+absl::InlinedVector<char, kMaxMetadataSize> SerializeMetadata(
     const ChunkMetadata& meta) {
   const flatbuf::ChunkMetadata m(meta.layer_idx, meta.dst_shard_idx,
                                  meta.dst_offset_bytes, meta.size_bytes);
@@ -70,8 +85,8 @@ absl::InlinedVector<char, kMaxMetadataSize> SerializeMetadataV1(
   return bytes;
 }
 
-void DeserializeMetadataV1(const flatbuf::ChunkMetadata& m,
-                           ChunkMetadata& meta) {
+void DeserializeMetadata(const flatbuf::ChunkMetadata& m,
+                         ChunkMetadata& meta) {
   meta.layer_idx = m.layer_idx();
   meta.dst_shard_idx = m.dst_shard_idx();
   meta.dst_offset_bytes = m.dst_offset_bytes();
@@ -82,18 +97,17 @@ void DeserializeMetadataV1(const flatbuf::ChunkMetadata& m,
 
 absl::InlinedVector<char, kChunkHeaderSize> SerializeChunkHeader(
     const ChunkHeader& header) {
-  const auto bytes = SerializeHeaderV1(header);
-  DCHECK_EQ(bytes.size(), kChunkHeaderSize);
-  return bytes;
+  DCHECK_EQ(header.version, kChunkHeaderCurrentVersion);
+  return SerializeHeaderV2(header);
 }
 
 absl::StatusOr<ChunkHeader> DeserializeChunkHeader(absl::Span<const char> s) {
-  flatbuf::ChunkHeader h;
-  DCHECK_EQ(sizeof(h), kChunkHeaderSize);
   if (s.size() != kChunkHeaderSize) {
     return absl::InvalidArgumentError("Invalid chunk header size");
   }
 
+  flatbuf::ChunkHeader h;
+  DCHECK_EQ(sizeof(h), kChunkHeaderSize);
   std::memcpy(&h, s.data(), sizeof(h));
 
   if (h.magic() != kRaidenMagic) {
@@ -103,25 +117,40 @@ absl::StatusOr<ChunkHeader> DeserializeChunkHeader(absl::Span<const char> s) {
   }
 
   const uint16_t ver = h.ver();
+  if (auto status = ValidateChunkHeaderVersion(ver); !status.ok()) {
+    return status;
+  }
+
+  // Support at most 1 version backwards compatible; fail if version diff by 2.
   switch (ver) {
     case 1: {
+      flatbuf::ChunkHeaderV1 h1;
+      std::memcpy(&h1, s.data(), sizeof(h1));
       ChunkHeader header = {};
-      DeserializeHeaderV1(h, header);
+      DeserializeHeaderV1(h1, header);
+      return header;
+    }
+    case 2: {
+      ChunkHeader header = {};
+      DeserializeHeaderV2(h, header);
       return header;
     }
     default:
       return absl::FailedPreconditionError(
-          absl::StrCat("Unsupported chunk header flatbuf version: ", ver));
+          absl::StrCat("Unhandled supported chunk header version: ", ver));
   }
 }
 
 absl::InlinedVector<char, kMaxMetadataSize> SerializeChunkMetadata(
     const ChunkMetadata& meta) {
-  return SerializeMetadataV1(meta);
+  return SerializeMetadata(meta);
 }
 
 absl::StatusOr<ChunkMetadata> DeserializeChunkMetadata(absl::Span<const char> s,
                                                        uint16_t ver) {
+  if (auto status = ValidateChunkHeaderVersion(ver); !status.ok()) {
+    return status;
+  }
   const size_t meta_size = GetChunkMetadataSize(ver);
   if (s.size() != meta_size) {
     return absl::InvalidArgumentError("Invalid chunk metadata size");
@@ -129,15 +158,16 @@ absl::StatusOr<ChunkMetadata> DeserializeChunkMetadata(absl::Span<const char> s,
 
   ChunkMetadata metadata = {};
   switch (ver) {
-    case 1: {
+    case 1:
+    case 2: {
       flatbuf::ChunkMetadata m = {};
       std::memcpy(&m, s.data(), meta_size);
-      DeserializeMetadataV1(m, metadata);
+      DeserializeMetadata(m, metadata);
       break;
     }
     default:
       return absl::FailedPreconditionError(
-          absl::StrCat("Unsupported chunk metadata flatbuf version: ", ver));
+          absl::StrCat("Unhandled supported chunk metadata version: ", ver));
   }
   return metadata;
 }

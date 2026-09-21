@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_TRANSPORT_LIB_CHUNK_H_
-#define THIRD_PARTY_TPU_RAIDEN_TRANSPORT_LIB_CHUNK_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TRANSPORT_LIB_CHUNK_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TRANSPORT_LIB_CHUNK_H_
 
 #include <cstdint>
 
@@ -23,7 +23,8 @@ inline constexpr uint8_t kOpBufferPull = 3;
 inline constexpr uint8_t kOpBufferPush = 5;
 inline constexpr uint8_t kOpBufferPushBatched = 7;
 
-// Compact 32-byte binary chunk header layout.
+// Current and latest chunk header layout being used.
+// Compact 48-byte binary chunk header layout.
 struct alignas(8) ChunkHeader {
   // LINT.IfChange
   uint16_t version;  // Header version
@@ -33,15 +34,17 @@ struct alignas(8) ChunkHeader {
   uint16_t reserved;       // Holds parallelism/expected chunks count
   uint16_t metadata_size;  // Size of metadata item in bytes for batch push
   uint16_t padding;        // Unused padding to align fields
-  uint32_t remote_id;      // Remote block ID or linear memory offset
+  uint32_t padding2;       // Explicit padding for 8-byte alignment of remote_id
+  uint64_t remote_id;      // Remote block ID or linear memory offset
   uint32_t local_id;       // Local block ID or target shard index
-  uint32_t count_or_size;  // Number of blocks or continuous payload bytes
+  uint32_t padding3;  // Explicit padding for 8-byte alignment of count_or_size
+  uint64_t count_or_size;  // Number of blocks or continuous payload bytes
   uint64_t uuid;           // Globally unique transaction routing ID
   // LINT.ThenChange(chunk.fbs)
 
   bool operator==(const ChunkHeader&) const = default;
 };
-static_assert(sizeof(ChunkHeader) == 32);
+static_assert(sizeof(ChunkHeader) == 48);
 
 struct ChunkMetadata {
   // LINT.IfChange
@@ -53,7 +56,8 @@ struct ChunkMetadata {
 
   bool operator==(const ChunkMetadata&) const = default;
 };
+static_assert(sizeof(ChunkMetadata) == 24);
 
 }  // namespace tpu_raiden::transport::lib
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_TRANSPORT_LIB_CHUNK_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TRANSPORT_LIB_CHUNK_H_

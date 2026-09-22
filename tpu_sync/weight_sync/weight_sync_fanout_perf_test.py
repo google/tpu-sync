@@ -453,17 +453,63 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
         f"Expected >95% tasks with size <= 512 bytes, got {pct_le_512:.2f}%",
     )
 
+  def _fill_position_unique_source_pattern(self, seed_byte: int) -> None:
+    """Fills source buffers with a position-unique 32-bit word pattern encoding (seed, layer, offset)."""
+    seed_u32 = np.uint32(seed_byte & 0xFF) << np.uint32(24)
+    for l in range(self.num_layers):
+      buf = self.ws_src.get_host_buffer(layer_idx=l, shard_idx=0)
+      words = buf.view(np.uint32)
+      layer_tag = np.uint32((l + 1) & 0x3F) << np.uint32(18)
+      word_offsets = np.arange(1, len(words) + 1, dtype=np.uint32) & np.uint32(
+          0x3FFFF
+      )
+      words[:] = seed_u32 | layer_tag | word_offsets
+
+  def _verify_position_unique_destinations(
+      self, seed_byte: int, mode_label: str
+  ) -> List[np.ndarray]:
+    """Verifies all destinations received the exact position-unique pattern and returns seed-masked fingerprints."""
+    expected_seed = np.uint32(seed_byte & 0xFF)
+    fingerprints: List[np.ndarray] = []
+    for l in range(self.num_layers):
+      valid_bytes = self.layer_max_bytes[l]
+      expected_layer_tag = np.uint32((l + 1) & 0x3F)
+      ref_buf = self.ws_dsts[0].get_host_buffer(layer_idx=l, shard_idx=0)[
+          :valid_bytes
+      ]
+      ref_words = ref_buf.view(np.uint32)
+      self.assertTrue(
+          np.all((ref_words >> np.uint32(24)) == expected_seed),
+          f"{mode_label} seed tag mismatch in layer {l} on destination 0",
+      )
+      self.assertTrue(
+          np.all(
+              ((ref_words >> np.uint32(18)) & np.uint32(0x3F))
+              == expected_layer_tag
+          ),
+          f"{mode_label} layer tag mismatch in layer {l} on destination 0",
+      )
+      for dst_idx in range(1, self.num_destinations):
+        dst_buf = self.ws_dsts[dst_idx].get_host_buffer(
+            layer_idx=l, shard_idx=0
+        )[:valid_bytes]
+        self.assertTrue(
+            np.array_equal(dst_buf, ref_buf),
+            f"{mode_label} destination {dst_idx} mismatch against destination 0"
+            f" in layer {l}",
+        )
+      fingerprints.append((ref_words & np.uint32(0x00FFFFFF)).copy())
+    return fingerprints
+
   def _run_flat_direct_push_perf(self) -> PerfRunResult:
-    """Executes 1-to-4 Flat Direct Push (broadcast_k=64) with byte parity check."""
+    """Executes 1-to-4 Flat Direct Push (broadcast_k=64) with position-unique parity check."""
     # 0. Reset metrics on source and all destination workers
     self.ws_src.reset_metrics()
     for ws_dst in self.ws_dsts:
       ws_dst.reset_metrics()
 
-    # 1. Fill source buffers with 0xAB
-    for l in range(self.num_layers):
-      buf = self.ws_src.get_host_buffer(layer_idx=l, shard_idx=0)
-      buf[:] = 0xAB
+    # 1. Fill source buffers with position-unique 32-bit pattern (seed=0xAB)
+    self._fill_position_unique_source_pattern(0xAB)
 
     # 2. Clear destination buffers to 0x00
     for ws_dst in self.ws_dsts:
@@ -498,15 +544,10 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
 
     elapsed = time.perf_counter() - t0
 
-    # 4. Verify byte parity across all 4 destinations
-    for ws_dst in self.ws_dsts:
-      for l in range(self.num_layers):
-        dst_buf = ws_dst.get_host_buffer(layer_idx=l, shard_idx=0)
-        valid_bytes = self.layer_max_bytes[l]
-        self.assertTrue(
-            np.all(dst_buf[:valid_bytes] == 0xAB),
-            f"Flat push byte parity mismatch in layer {l}",
-        )
+    # 4. Verify position-unique pattern across all 4 destinations
+    self._last_flat_fingerprints = self._verify_position_unique_destinations(
+        0xAB, "Flat push"
+    )
 
     # 5. Query and verify metrics
     src_metrics = self.ws_src.get_metrics()
@@ -554,10 +595,8 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     for ws_dst in self.ws_dsts:
       ws_dst.reset_metrics()
 
-    # 1. Fill source buffers with 0xCD
-    for l in range(self.num_layers):
-      buf = self.ws_src.get_host_buffer(layer_idx=l, shard_idx=0)
-      buf[:] = 0xCD
+    # 1. Fill source buffers with position-unique 32-bit pattern (seed=0xCD)
+    self._fill_position_unique_source_pattern(0xCD)
 
     # 2. Re-zero destination buffers to 0x00
     for ws_dst in self.ws_dsts:
@@ -590,14 +629,19 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
 
     elapsed = time.perf_counter() - t0
 
-    # 4. Verify byte parity across all 4 destinations
-    for ws_dst in self.ws_dsts:
+    # 4. Verify position-unique pattern across all 4 destinations (relays + leaves)
+    self._last_tree_fingerprints = self._verify_position_unique_destinations(
+        0xCD, "Tree broadcast"
+    )
+    if hasattr(self, "_last_flat_fingerprints"):
       for l in range(self.num_layers):
-        dst_buf = ws_dst.get_host_buffer(layer_idx=l, shard_idx=0)
-        valid_bytes = self.layer_max_bytes[l]
         self.assertTrue(
-            np.all(dst_buf[:valid_bytes] == 0xCD),
-            f"Tree broadcast byte parity mismatch in layer {l}",
+            np.array_equal(
+                self._last_tree_fingerprints[l],
+                self._last_flat_fingerprints[l],
+            ),
+            f"Tree broadcast resharded word offsets in layer {l} do not match"
+            " Flat direct push ground truth!",
         )
 
     # 5. Query and verify metrics
@@ -751,21 +795,19 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     )
     print("=" * 110 + "\n")
 
-    if self.num_destinations >= 16:
-      self.assertLess(
-          tree_res.elapsed,
-          flat_res.elapsed,
-          f"Tree Broadcast ({tree_res.elapsed:.3f}s) must outperform Flat"
-          f" Direct Push ({flat_res.elapsed:.3f}s) under constrained NIC line"
-          f" rate at N={self.num_destinations}.",
-      )
-    else:
-      # At small fan-out (N < 16, e.g. N=4), Tree broadcast only saves 1 serialized
-      # copy (from 4 to 3), which is outweighed by multi-hop store-and-forward
-      # Python scheduling latency. Verify that both modes executed cleanly and
-      # satisfied byte-exact parity.
-      self.assertGreater(flat_res.elapsed, 0.0)
-      self.assertGreater(tree_res.elapsed, 0.0)
+    self.assertEqual(
+        tree_res.src_metrics["total_h2h_bytes"],
+        self.total_model_bytes * 2,
+        "Barrier-free Tree Broadcast (k=2) must send strictly 2 copies from"
+        " source.",
+    )
+    self.assertLess(
+        tree_res.elapsed,
+        flat_res.elapsed,
+        f"Tree Broadcast ({tree_res.elapsed:.3f}s) must outperform Flat"
+        f" Direct Push ({flat_res.elapsed:.3f}s) under constrained NIC line"
+        f" rate at N={self.num_destinations}.",
+    )
 
 
 if __name__ == "__main__":

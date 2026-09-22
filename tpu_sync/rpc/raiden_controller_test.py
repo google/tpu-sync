@@ -2277,8 +2277,11 @@ class GetGlobalIndicesTest(absltest.TestCase):
         if call[0] == target_1 and "_d2h_" not in call[1].req_id
     ]
 
-    self.assertLen(src_calls, 8)
-    self.assertLen(target_0_calls, 4)
+    # Under tree broadcast with broadcast_k=1, src sends only to target_0 (4 calls),
+    # target_0 relays to target_1 (4 calls as receiver + 4 calls as sender = 8 calls),
+    # and target_1 receives from target_0 (4 calls).
+    self.assertLen(src_calls, 4)
+    self.assertLen(target_0_calls, 8)
     self.assertLen(target_1_calls, 4)
 
     for _, plan in src_calls:

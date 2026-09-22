@@ -3035,6 +3035,39 @@ class RaidenController:
         src_controller_address=src_controller_address,
     )
 
+  async def _execute_slice_broadcast_pipeline(
+      self,
+      groups_list: list[list[tuple[tuple[Any, ...], list[tuple[Any, ...]]]]],
+      final_plan: TransferPlan,
+      fanout_k: int,
+      req_id: str,
+      dst_mem_type: int,
+      dst_controller_address: Optional[str],
+      src_controller_address: Optional[str] = None,
+  ) -> None:
+    """Executes a pipelined multi-group tree broadcast across groups.
+
+    Args:
+      groups_list: List of transfer groups, where each group is a list of (key,
+        targets) slice tuples.
+      final_plan: TransferPlan containing metadata and worker addresses.
+      fanout_k: Maximum fan-out factor for the broadcast tree.
+      req_id: Identifier for the transfer request.
+      dst_mem_type: Destination memory type enum or integer.
+      dst_controller_address: Optional address of remote destination controller.
+      src_controller_address: Optional address of source controller.
+    """
+    await self._broadcast_engine.execute_slice_broadcast_pipeline(
+        groups_list=groups_list,
+        final_plan=final_plan,
+        fanout_k=fanout_k,
+        req_id=req_id,
+        dst_mem_type=dst_mem_type,
+        registered_shards=self._registered_shards,
+        dst_controller_address=dst_controller_address,
+        src_controller_address=src_controller_address,
+    )
+
   def _start_pool_reshard_transfer(self, *args, **kwargs):
     """REMOVED: the Python pool-reshard implementation is retired."""
     raise RuntimeError(
@@ -3587,16 +3620,15 @@ class RaidenController:
               ).append(keys_and_targets)
 
             async def _execute_shard_broadcasts(groups_list):
-              for k_and_t in groups_list:
-                await self._execute_slice_broadcast(
-                    keys_and_targets=k_and_t,
-                    final_plan=final_plan,
-                    fanout_k=self.broadcast_k,
-                    req_id=req_id,
-                    dst_mem_type=dst_mem_type,
-                    dst_controller_address=dst_controller_address,
-                    src_controller_address=src_controller_address,
-                )
+              await self._execute_slice_broadcast_pipeline(
+                  groups_list=groups_list,
+                  final_plan=final_plan,
+                  fanout_k=self.broadcast_k,
+                  req_id=req_id,
+                  dst_mem_type=dst_mem_type,
+                  dst_controller_address=dst_controller_address,
+                  src_controller_address=src_controller_address,
+              )
 
             for groups_list in shard_broadcast_groups.values():
               push_tasks.append(_execute_shard_broadcasts(groups_list))

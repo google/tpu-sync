@@ -15,6 +15,7 @@
 #include "tpu_sync/weight_sync/tiling_utils.h"
 
 #include <cstdint>
+#include <thread>  // NOLINT
 #include <vector>
 
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -1375,6 +1376,80 @@ TEST(TilingUtilsTest, ThresholdGatedTiling_LargeTensorWithPadding) {
                   .ok());
 
   EXPECT_EQ(dst_linear, src_linear);
+}
+
+TEST(TilingUtilsTest, ByteProportionalChunking_And_4ShardConcurrentParity) {
+  // 1. 4.59 MB tensor ([1792, 1280] BF16 -> 4,587,520 bytes, desired_chunks=1)
+  {
+    const int64_t H = 1792;
+    const int64_t W = 1280;
+    xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+        xla::PrimitiveType::BF16, {H, W}, {1, 0},
+        {xla::Tile({8, 128}), xla::Tile({2, 1})});
+    const int64_t num_elements = H * W;
+    std::vector<uint16_t> src(num_elements);
+    for (int64_t i = 0; i < num_elements; ++i) {
+      src[i] = static_cast<uint16_t>(i % 32749);
+    }
+    std::vector<uint8_t> tiled(GetTiledBufferElements(shape) * sizeof(uint16_t),
+                               0);
+    std::vector<uint16_t> dst(num_elements, 0);
+    ASSERT_TRUE(TileBuffer(reinterpret_cast<const uint8_t*>(src.data()),
+                           tiled.data(), shape, shape.layout(), nullptr)
+                    .ok());
+    ASSERT_TRUE(DetileBuffer(tiled.data(),
+                             reinterpret_cast<uint8_t*>(dst.data()), shape,
+                             shape.layout(), nullptr)
+                    .ok());
+    EXPECT_EQ(dst, src);
+  }
+
+  // 2. 4 concurrent shards of 33.55 MB MoE tensor ([2, 4096, 2048] BF16 ->
+  // 33,554,432 bytes = 8 * 4 MiB, desired_chunks=8) sharing GetThreadPool()
+  const int64_t E = 2;
+  const int64_t H = 4096;
+  const int64_t W = 2048;
+  xla::Shape shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::BF16, {E, H, W}, {2, 1, 0},
+      {xla::Tile({8, 128}), xla::Tile({2, 1})});
+  const int64_t num_elements = E * H * W;
+  const int64_t tiled_bytes = GetTiledBufferElements(shape) * sizeof(uint16_t);
+
+  constexpr int kNumShards = 4;
+  std::vector<std::vector<uint16_t>> shard_srcs(kNumShards);
+  std::vector<std::vector<uint8_t>> shard_tiled(kNumShards);
+  std::vector<std::vector<uint16_t>> shard_dsts(kNumShards);
+  for (int s = 0; s < kNumShards; ++s) {
+    shard_srcs[s].resize(num_elements);
+    for (int64_t i = 0; i < num_elements; ++i) {
+      shard_srcs[s][i] = static_cast<uint16_t>((i + s * 101) % 32749);
+    }
+    shard_tiled[s].assign(tiled_bytes, 0);
+    shard_dsts[s].assign(num_elements, 0);
+  }
+
+  std::vector<std::thread> threads;
+  threads.reserve(kNumShards);
+  for (int s = 0; s < kNumShards; ++s) {
+    threads.emplace_back([&, s]() {
+      ASSERT_TRUE(
+          TileBuffer(reinterpret_cast<const uint8_t*>(shard_srcs[s].data()),
+                     shard_tiled[s].data(), shape, shape.layout(),
+                     /*pool=*/nullptr)
+              .ok());
+      ASSERT_TRUE(
+          DetileBuffer(shard_tiled[s].data(),
+                       reinterpret_cast<uint8_t*>(shard_dsts[s].data()), shape,
+                       shape.layout(), /*pool=*/nullptr)
+              .ok());
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  for (int s = 0; s < kNumShards; ++s) {
+    EXPECT_EQ(shard_dsts[s], shard_srcs[s]);
+  }
 }
 
 }  // namespace

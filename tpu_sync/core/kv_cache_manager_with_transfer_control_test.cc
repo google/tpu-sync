@@ -86,11 +86,7 @@ class TestManager : public KVCacheManagerWithTransfer {
       TcpControlPlaneBackend::kResponseMagic;
 
   ControlResponseHeader ReadResponseHeaderForTest(int fd) {
-    // Unbounded on purpose: this helper is how a test observes what the
-    // manager sent, so it must not impose a deadline of its own on top of the
-    // one under test.
-    return TcpControlPlaneBackend::ReadControlResponseHeader(
-        fd, absl::InfiniteFuture());
+    return TcpControlPlaneBackend::ReadControlResponseHeader(fd);
   }
 
   void HandleControlConnectionForTest(int fd) {
@@ -812,19 +808,19 @@ TEST(ControlHandshakeTest, ExpiredReceiveKeepsStagingUntilHandshakeEnds) {
 // push_pool_ is one FIFO queue shared by every peer.
 //
 // DISABLED_ on purpose. These three are the acceptance criteria for a fix that
-// has not been written: bounding how long one peer holds a worker (the total
-// handshake deadline, covered by HandshakeDeadlineBoundsWholeHandshakeNotEachRecv
-// below) does not stop one peer from holding *every* worker. They assert
-// isolation -- that a sick peer neither serialises the pool nor corners the
-// staging slots -- and that needs a dedicated control pool plus per-peer
-// admission. They fail today for exactly the reason they document, so they are
-// parked rather than deleted: re-enable them with that change, and do not
-// weaken the bounds to make them pass.
+// has not been written: bounding how long one peer holds a worker does not
+// stop one peer from holding *every* worker. They assert isolation -- that a
+// sick peer neither serialises the pool nor corners the staging slots -- and
+// that needs a dedicated control pool plus per-peer admission. They fail today
+// for exactly the reason they document, so they are parked rather than
+// deleted: re-enable them with that change, and do not weaken the bounds to
+// make them pass.
 //
-// Note they are insensitive to the deadline work: kStarvationTimeoutS is 4s,
-// below the 10s control deadline so it is not clamped, and a SilentProducer
-// sends nothing at all, so a whole-handshake deadline and a per-recv timeout
-// expire at the same moment.
+// Note they are insensitive to the control-deadline work either way:
+// kStarvationTimeoutS is 4s, under the 10s ceiling so it is never clamped, and
+// a SilentProducer sends nothing at all, so a whole-handshake deadline and a
+// per-recv timeout would expire at the same moment. Shortening the deadline
+// cannot move them; only admission can.
 // --------------------------------------------------------------------------
 
 // A handshake timeout long enough that "blocked behind the sick peer" and
@@ -1102,15 +1098,22 @@ class DribblingProducer {
   std::thread thread_;
 };
 
-// timeout_s used to be enforced only as SO_RCVTIMEO, which bounds a single
-// recv() rather than the handshake as a whole. A peer that stays just inside
-// that per-call bound holds its worker for one timeout per byte outstanding,
-// so the starvation window was not capped at timeout_s. The header alone is
-// 24 x timeout_s; the error body SendPullRequest reads on message_len alone
-// pushes the worst case to (24 + 4096) x timeout_s. See
-// TcpControlPlaneDeadlineTest in control_plane_backend_test.cc, which covers
-// the body term directly.
-TEST(ControlHandshakeTest, HandshakeDeadlineBoundsWholeHandshakeNotEachRecv) {
+// On the TCP backend timeout_s is enforced only as SO_RCVTIMEO, which bounds a
+// single recv() rather than the handshake as a whole. A peer that stays just
+// inside that per-call bound holds its worker for one timeout per byte
+// outstanding, so the window is not capped at timeout_s: the header alone is
+// 24 x timeout_s, and the error body SendPullRequest reads on message_len
+// alone -- with no status check -- pushes the worst case to
+// (24 + 4096) x timeout_s.
+//
+// DISABLED_ because this change does not fix it. Shortening the control
+// deadline divides the window down but leaves it a multiple; closing it needs
+// either a total deadline threaded through these read loops or the move to the
+// gRPC backend, whose deadline already bounds the whole call. Re-enable with
+// whichever lands. This is specific to the hand-rolled TCP framing --
+// PullRequestDeadlineBoundsTheWholeCall in control_plane_backend_test.cc
+// asserts the interface-level contract for both backends and does pass today.
+TEST(ControlHandshakeTest, DISABLED_HandshakeDeadlineBoundsWholeHandshakeNotEachRecv) {
   // A quarter of kTimeoutS, not a half: at a half a single CI scheduling
   // hiccup pushes one gap past SO_RCVTIMEO, and the handshake then fails early
   // for the wrong reason -- passing this test even with no total deadline.

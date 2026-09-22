@@ -87,27 +87,14 @@ class TcpControlPlaneBackend : public ControlPlaneBackend {
   static absl::Status SetSocketTimeouts(int fd, double timeout_s);
   static absl::StatusOr<int> ConnectTcp(absl::string_view endpoint,
                                         double timeout_s);
-  // SO_RCVTIMEO and SO_SNDTIMEO bound one syscall, not a message: every byte
-  // that arrives restarts them, so a peer feeding a 24-byte header one byte at
-  // a time holds the caller for 24 timeouts rather than one. These loops
-  // therefore take an absolute `deadline` and re-arm the socket to what is
-  // left of it before each syscall, which is what actually bounds a message.
-  //
-  // `deadline` is mandatory rather than defaulted because an unbounded loop
-  // here is the whole defect: a caller that has no bound in mind has to say so
-  // by passing absl::InfiniteFuture(), not by leaving an argument off.
-  static absl::Status WriteExact(int fd, const void* buffer, size_t length,
-                                 absl::Time deadline);
-  static absl::Status ReadExact(int fd, void* buffer, size_t length,
-                                absl::Time deadline);
-  static ControlResponseHeader ReadControlResponseHeader(int fd,
-                                                         absl::Time deadline);
+  static absl::Status WriteExact(int fd, const void* buffer, size_t length);
+  static absl::Status ReadExact(int fd, void* buffer, size_t length);
+  static ControlResponseHeader ReadControlResponseHeader(int fd);
   static absl::StatusOr<std::string> GetPeerIp(int fd);
   static absl::Status WriteBlockIds(int fd,
-                                    const std::vector<int64_t>& block_ids,
-                                    absl::Time deadline);
-  static absl::StatusOr<std::vector<int64_t>> ReadBlockIds(
-      int fd, uint64_t num_blocks, absl::Time deadline);
+                                    const std::vector<int64_t>& block_ids);
+  static absl::StatusOr<std::vector<int64_t>> ReadBlockIds(int fd,
+                                                           uint64_t num_blocks);
 
   void HandleControlConnection(int fd, ControlPlaneHandler* handler = nullptr);
 

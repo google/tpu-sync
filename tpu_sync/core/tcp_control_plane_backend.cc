@@ -162,32 +162,11 @@ absl::StatusOr<int> TcpControlPlaneBackend::ConnectTcp(
   return fd;
 }
 
-// Smallest budget worth arming the socket with. SetSocketTimeouts splits a
-// double into {tv_sec, tv_usec}, and a timeval of {0, 0} means "block forever"
-// on Linux, not "give up now" -- so a budget that has all but run out has to
-// fail here rather than be rounded down into no bound at all.
-constexpr absl::Duration kMinArmableBudget = absl::Milliseconds(1);
-
-// Re-arms the socket to what is left of `deadline` before the next syscall.
-// Returns DeadlineExceeded once nothing is left, which is the only thing that
-// stops a peer from restarting the socket timeout with every byte it sends.
-static absl::Status ArmForRemaining(int fd, absl::Time deadline) {
-  if (deadline == absl::InfiniteFuture()) return absl::OkStatus();
-  const absl::Duration remaining = deadline - absl::Now();
-  if (remaining < kMinArmableBudget) {
-    return absl::DeadlineExceededError("control message deadline exceeded");
-  }
-  return TcpControlPlaneBackend::SetSocketTimeouts(
-      fd, absl::ToDoubleSeconds(remaining));
-}
-
 absl::Status TcpControlPlaneBackend::WriteExact(int fd, const void* buffer,
-                                                size_t length,
-                                                absl::Time deadline) {
+                                                size_t length) {
   const uint8_t* ptr = static_cast<const uint8_t*>(buffer);
   size_t remaining = length;
   while (remaining > 0) {
-    if (absl::Status s = ArmForRemaining(fd, deadline); !s.ok()) return s;
     ssize_t written = send(fd, ptr, remaining, MSG_NOSIGNAL);
     if (written < 0) {
       if (errno == EINTR) continue;
@@ -207,12 +186,10 @@ absl::Status TcpControlPlaneBackend::WriteExact(int fd, const void* buffer,
 }
 
 absl::Status TcpControlPlaneBackend::ReadExact(int fd, void* buffer,
-                                               size_t length,
-                                               absl::Time deadline) {
+                                               size_t length) {
   uint8_t* ptr = static_cast<uint8_t*>(buffer);
   size_t remaining = length;
   while (remaining > 0) {
-    if (absl::Status s = ArmForRemaining(fd, deadline); !s.ok()) return s;
     ssize_t bytes_read = read(fd, ptr, remaining);
     if (bytes_read < 0) {
       if (errno == EINTR) continue;
@@ -262,21 +239,20 @@ absl::StatusOr<std::string> TcpControlPlaneBackend::GetPeerIp(int fd) {
 }
 
 absl::Status TcpControlPlaneBackend::WriteBlockIds(
-    int fd, const std::vector<int64_t>& block_ids, absl::Time deadline) {
+    int fd, const std::vector<int64_t>& block_ids) {
   if (block_ids.empty()) return absl::OkStatus();
-  return WriteExact(fd, block_ids.data(), block_ids.size() * sizeof(int64_t),
-                    deadline);
+  return WriteExact(fd, block_ids.data(), block_ids.size() * sizeof(int64_t));
 }
 
 absl::StatusOr<std::vector<int64_t>> TcpControlPlaneBackend::ReadBlockIds(
-    int fd, uint64_t num_blocks, absl::Time deadline) {
+    int fd, uint64_t num_blocks) {
   if (num_blocks == 0) return std::vector<int64_t>{};
   if (num_blocks > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
     return absl::InvalidArgumentError("num_blocks is too large");
   }
   std::vector<int64_t> block_ids(static_cast<size_t>(num_blocks));
-  if (absl::Status s = ReadExact(
-          fd, block_ids.data(), block_ids.size() * sizeof(int64_t), deadline);
+  if (absl::Status s =
+          ReadExact(fd, block_ids.data(), block_ids.size() * sizeof(int64_t));
       !s.ok()) {
     return s;
   }
@@ -284,11 +260,9 @@ absl::StatusOr<std::vector<int64_t>> TcpControlPlaneBackend::ReadBlockIds(
 }
 
 TcpControlPlaneBackend::ControlResponseHeader
-TcpControlPlaneBackend::ReadControlResponseHeader(int fd,
-                                                  absl::Time deadline) {
+TcpControlPlaneBackend::ReadControlResponseHeader(int fd) {
   ControlResponseHeader response;
-  if (absl::Status s = ReadExact(fd, &response, sizeof(response), deadline);
-      !s.ok()) {
+  if (absl::Status s = ReadExact(fd, &response, sizeof(response)); !s.ok()) {
     throw std::runtime_error(
         absl::StrCat("control response read failed: ", s.message()));
   }
@@ -301,8 +275,7 @@ TcpControlPlaneBackend::ReadControlResponseHeader(int fd,
         std::min(response.message_len, kMaxControlErrorMessageBytes));
     std::string message(message_bytes, '\0');
     if (message_bytes > 0) {
-      if (absl::Status s =
-              ReadExact(fd, message.data(), message.size(), deadline);
+      if (absl::Status s = ReadExact(fd, message.data(), message.size());
           !s.ok()) {
         throw std::runtime_error(
             absl::StrCat("control error body read failed: ", s.message()));
@@ -461,20 +434,12 @@ void TcpControlPlaneBackend::SendErrorResponse(int fd,
     msg.resize(kMaxControlErrorMessageBytes);
   }
   response.message_len = msg.size();
-  // A consumer that has stopped reading backs this write up in the kernel, and
-  // the handler holds one of a small pool of workers until it drains. Budgeted
-  // from now rather than from a deadline shared with the request read, so that
-  // whatever the handler spent deciding on an answer does not leave us unable
-  // to send it.
-  const absl::Time deadline = absl::Now() + default_timeout_;
-  if (absl::Status s = WriteExact(fd, &response, sizeof(response), deadline);
-      !s.ok()) {
+  if (absl::Status s = WriteExact(fd, &response, sizeof(response)); !s.ok()) {
     LOG(WARNING) << "Failed to send control response header: " << s;
     return;
   }
   if (response.message_len > 0) {
-    if (absl::Status s = WriteExact(fd, msg.data(), msg.size(), deadline);
-        !s.ok()) {
+    if (absl::Status s = WriteExact(fd, msg.data(), msg.size()); !s.ok()) {
       LOG(WARNING) << "Failed to send control response message: " << s;
       return;
     }
@@ -486,16 +451,8 @@ void TcpControlPlaneBackend::HandleControlConnection(
   if (!handler) {
     handler = handler_;
   }
-  // The mirror of the client-side bound. This handler occupies one of a small
-  // pool of workers and the consumer on the other end decides how fast the
-  // request arrives, so a consumer that stalls mid-request would otherwise
-  // hold the worker indefinitely and delay every other consumer's requests.
-  // Covers the request only; the response is budgeted separately, because the
-  // handler between them may legitimately wait out the registration grace.
-  const absl::Time request_deadline = absl::Now() + default_timeout_;
   ControlRequestHeader req;
-  if (absl::Status s = ReadExact(fd, &req, sizeof(req), request_deadline);
-      !s.ok()) {
+  if (absl::Status s = ReadExact(fd, &req, sizeof(req)); !s.ok()) {
     SendErrorResponse(fd, s.message());
     return;
   }
@@ -517,8 +474,7 @@ void TcpControlPlaneBackend::HandleControlConnection(
     ControlResponseHeader response;
     response.magic = kResponseMagic;
     response.status = 0;
-    (void)WriteExact(fd, &response, sizeof(response),
-                     absl::Now() + default_timeout_);
+    (void)WriteExact(fd, &response, sizeof(response));
     return;
   }
 
@@ -532,13 +488,13 @@ void TcpControlPlaneBackend::HandleControlConnection(
     }
 
     absl::StatusOr<std::vector<int64_t>> src_blocks =
-        ReadBlockIds(fd, req.num_blocks, request_deadline);
+        ReadBlockIds(fd, req.num_blocks);
     if (!src_blocks.ok()) {
       SendErrorResponse(fd, src_blocks.status().message());
       return;
     }
     absl::StatusOr<std::vector<int64_t>> dst_blocks =
-        ReadBlockIds(fd, req.num_blocks, request_deadline);
+        ReadBlockIds(fd, req.num_blocks);
     if (!dst_blocks.ok()) {
       SendErrorResponse(fd, dst_blocks.status().message());
       return;
@@ -611,8 +567,7 @@ void TcpControlPlaneBackend::HandleControlConnection(
     response.num_layers = result->num_layers;
     response.data_port = result->data_port;
     response.message_len = 0;
-    (void)WriteExact(fd, &response, sizeof(response),
-                     absl::Now() + default_timeout_);
+    (void)WriteExact(fd, &response, sizeof(response));
     return;
   }
 
@@ -622,11 +577,6 @@ void TcpControlPlaneBackend::HandleControlConnection(
 absl::StatusOr<PullStreamResponseSpec> TcpControlPlaneBackend::SendPullRequest(
     absl::string_view remote_endpoint, const PullStreamRequestSpec& req,
     absl::Duration timeout) {
-  // `timeout` bounds the handshake as a whole, not each syscall in it: the
-  // caller is holding a worker for exactly this long, whether the peer is
-  // silent, slow to accept, or answering one byte at a time. Taken before
-  // connect() so the SYN phase spends the same budget as the exchange.
-  const absl::Time deadline = absl::Now() + timeout;
   double timeout_s = absl::ToDoubleSeconds(timeout);
   absl::StatusOr<int> fd = ConnectTcp(remote_endpoint, timeout_s);
   if (!fd.ok()) return fd.status();
@@ -649,23 +599,19 @@ absl::StatusOr<PullStreamResponseSpec> TcpControlPlaneBackend::SendPullRequest(
     }
   }
 
-  if (absl::Status s =
-          WriteExact(*fd, &stream_request, sizeof(stream_request), deadline);
+  if (absl::Status s = WriteExact(*fd, &stream_request, sizeof(stream_request));
       !s.ok()) {
     return s;
   }
-  if (absl::Status s = WriteBlockIds(*fd, req.src_block_ids, deadline);
-      !s.ok()) {
+  if (absl::Status s = WriteBlockIds(*fd, req.src_block_ids); !s.ok()) {
     return s;
   }
-  if (absl::Status s = WriteBlockIds(*fd, req.dst_block_ids, deadline);
-      !s.ok()) {
+  if (absl::Status s = WriteBlockIds(*fd, req.dst_block_ids); !s.ok()) {
     return s;
   }
 
   ControlResponseHeader resp_hdr;
-  if (absl::Status s = ReadExact(*fd, &resp_hdr, sizeof(resp_hdr), deadline);
-      !s.ok()) {
+  if (absl::Status s = ReadExact(*fd, &resp_hdr, sizeof(resp_hdr)); !s.ok()) {
     return s;
   }
   if (resp_hdr.magic != kResponseMagic) {
@@ -679,8 +625,7 @@ absl::StatusOr<PullStreamResponseSpec> TcpControlPlaneBackend::SendPullRequest(
     const size_t message_bytes = static_cast<size_t>(
         std::min(resp_hdr.message_len, kMaxControlErrorMessageBytes));
     message.resize(message_bytes);
-    if (absl::Status s =
-            ReadExact(*fd, message.data(), message.size(), deadline);
+    if (absl::Status s = ReadExact(*fd, message.data(), message.size());
         !s.ok()) {
       return s;
     }
@@ -701,7 +646,6 @@ absl::StatusOr<PullStreamResponseSpec> TcpControlPlaneBackend::SendPullRequest(
 absl::Status TcpControlPlaneBackend::SendAck(absl::string_view remote_endpoint,
                                              uint64_t uuid,
                                              absl::Duration timeout) {
-  const absl::Time deadline = absl::Now() + timeout;
   double timeout_s = absl::ToDoubleSeconds(timeout);
   absl::StatusOr<int> fd = ConnectTcp(remote_endpoint, timeout_s);
   if (!fd.ok()) return fd.status();
@@ -714,15 +658,13 @@ absl::Status TcpControlPlaneBackend::SendAck(absl::string_view remote_endpoint,
   stream_request.ep_idx = 0;
   stream_request.num_blocks = 0;
 
-  if (absl::Status s =
-          WriteExact(*fd, &stream_request, sizeof(stream_request), deadline);
+  if (absl::Status s = WriteExact(*fd, &stream_request, sizeof(stream_request));
       !s.ok()) {
     return s;
   }
 
   ControlResponseHeader resp_hdr;
-  if (absl::Status s = ReadExact(*fd, &resp_hdr, sizeof(resp_hdr), deadline);
-      !s.ok()) {
+  if (absl::Status s = ReadExact(*fd, &resp_hdr, sizeof(resp_hdr)); !s.ok()) {
     return s;
   }
   if (resp_hdr.magic != kResponseMagic) {
@@ -736,8 +678,7 @@ absl::Status TcpControlPlaneBackend::SendAck(absl::string_view remote_endpoint,
     const size_t message_bytes = static_cast<size_t>(
         std::min(resp_hdr.message_len, kMaxControlErrorMessageBytes));
     message.resize(message_bytes);
-    if (absl::Status s =
-            ReadExact(*fd, message.data(), message.size(), deadline);
+    if (absl::Status s = ReadExact(*fd, message.data(), message.size());
         !s.ok()) {
       return s;
     }

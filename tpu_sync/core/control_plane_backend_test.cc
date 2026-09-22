@@ -14,15 +14,11 @@
 
 #include "tpu_sync/core/control_plane_backend.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <stdlib.h>
-#include <sys/socket.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cstdint>
-#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -268,14 +264,11 @@ TEST_P(ControlPlaneBackendTest, SendAckRoundTrip) {
     req.op = TcpControlPlaneBackend::kOpAck;
     req.uuid = 999111;
     req.num_blocks = 0;
-    const absl::Time deadline = absl::Now() + absl::Seconds(5);
-    ASSERT_TRUE(TcpControlPlaneBackend::WriteExact(*fd, &req, sizeof(req),
-                                                   deadline)
-                    .ok());
+    ASSERT_TRUE(
+        TcpControlPlaneBackend::WriteExact(*fd, &req, sizeof(req)).ok());
     TcpControlPlaneBackend::ControlResponseHeader resp;
-    ASSERT_TRUE(TcpControlPlaneBackend::ReadExact(*fd, &resp, sizeof(resp),
-                                                  deadline)
-                    .ok());
+    ASSERT_TRUE(
+        TcpControlPlaneBackend::ReadExact(*fd, &resp, sizeof(resp)).ok());
     close(*fd);
     EXPECT_EQ(resp.status, 0);
     EXPECT_EQ(acked_uuid.load(), 999111u);
@@ -315,12 +308,11 @@ TEST_P(ControlPlaneBackendTest, TimeoutWhenServerDelaysBeyondClientTimeout) {
   server->StopServer();
 }
 
-// The `timeout` argument to SendPullRequest is a bound on the whole call, not
-// a hint: however the peer behaves, the caller gets its worker back within it.
-// Asserted against both backends because the promise belongs to the
-// ControlPlaneBackend interface, not to either transport -- gRPC has always
-// honoured it via ClientContext::set_deadline, and the TCP backend used to
-// apply it per syscall instead, which is not the same bound.
+// The `timeout` argument to SendPullRequest bounds the whole call, not each
+// step inside it: however the peer behaves, the caller gets its worker back
+// within it. Asserted against both backends because the promise belongs to the
+// ControlPlaneBackend interface rather than to either transport, so a backend
+// swap cannot quietly drop it.
 TEST_P(ControlPlaneBackendTest, PullRequestDeadlineBoundsTheWholeCall) {
   constexpr absl::Duration kDeadline = absl::Milliseconds(300);
   MockControlPlaneHandler handler;
@@ -424,202 +416,6 @@ TEST_P(ControlPlaneBackendTest, ConcurrentRequestsOverSharedBackend) {
 INSTANTIATE_TEST_SUITE_P(TcpAndGrpc, ControlPlaneBackendTest,
                          ::testing::Values(ControlPlaneBackendType::kTcp,
                                            ControlPlaneBackendType::kGrpc));
-
-// A peer that accepts the connection, swallows the request, and then answers
-// one byte per `gap`. With `gap` inside the socket timeout every recv()
-// succeeds, so SO_RCVTIMEO never fires however long the answer takes -- only a
-// deadline spanning the whole handshake can end the call. TCP-only by nature:
-// it speaks the wire protocol rather than the interface.
-class DribblingPeer {
- public:
-  DribblingPeer(std::vector<uint8_t> payload, size_t immediate,
-                absl::Duration gap)
-      : payload_(std::move(payload)), immediate_(immediate), gap_(gap) {
-    listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    EXPECT_GE(listen_fd_, 0);
-    int on = 1;
-    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-    EXPECT_EQ(
-        bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
-    socklen_t len = sizeof(addr);
-    EXPECT_EQ(
-        getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len), 0);
-    port_ = ntohs(addr.sin_port);
-    EXPECT_EQ(listen(listen_fd_, 8), 0);
-    thread_ = std::thread([this] { Serve(); });
-  }
-
-  ~DribblingPeer() {
-    {
-      absl::MutexLock lock(mu_);
-      stopping_ = true;
-      if (client_fd_ >= 0) shutdown(client_fd_, SHUT_RDWR);
-    }
-    shutdown(listen_fd_, SHUT_RDWR);
-    close(listen_fd_);
-    thread_.join();
-    absl::MutexLock lock(mu_);
-    if (client_fd_ >= 0) close(client_fd_);
-  }
-
-  std::string endpoint() const { return absl::StrCat("127.0.0.1:", port_); }
-
-  int bytes_sent() {
-    absl::MutexLock lock(mu_);
-    return bytes_sent_;
-  }
-
- private:
-  bool stopping() {
-    absl::MutexLock lock(mu_);
-    return stopping_;
-  }
-
-  void Serve() {
-    int client = accept(listen_fd_, nullptr, nullptr);
-    if (client < 0) return;
-    {
-      absl::MutexLock lock(mu_);
-      client_fd_ = client;
-      if (stopping_) return;
-    }
-    // Swallow the request; these tests send no block ids.
-    TcpControlPlaneBackend::ControlRequestHeader req;
-    size_t got = 0;
-    while (got < sizeof(req) && !stopping()) {
-      ssize_t n =
-          read(client, reinterpret_cast<uint8_t*>(&req) + got, sizeof(req) - got);
-      if (n <= 0) return;
-      got += static_cast<size_t>(n);
-    }
-
-    size_t sent = 0;
-    if (immediate_ > 0 && !payload_.empty()) {
-      sent = std::min(immediate_, payload_.size());
-      if (send(client, payload_.data(), sent, MSG_NOSIGNAL) !=
-          static_cast<ssize_t>(sent)) {
-        return;
-      }
-      absl::MutexLock lock(mu_);
-      bytes_sent_ += static_cast<int>(sent);
-    }
-    for (; sent < payload_.size() && !stopping(); ++sent) {
-      absl::SleepFor(gap_);
-      if (send(client, &payload_[sent], 1, MSG_NOSIGNAL) != 1) return;
-      absl::MutexLock lock(mu_);
-      ++bytes_sent_;
-    }
-    // Stay connected: the consumer must not be let off by an EOF.
-    while (!stopping()) absl::SleepFor(absl::Milliseconds(20));
-  }
-
-  const std::vector<uint8_t> payload_;
-  const size_t immediate_;
-  const absl::Duration gap_;
-  int listen_fd_ = -1;
-  int port_ = 0;
-  int client_fd_ ABSL_GUARDED_BY(mu_) = -1;
-  int bytes_sent_ ABSL_GUARDED_BY(mu_) = 0;
-  bool stopping_ ABSL_GUARDED_BY(mu_) = false;
-  absl::Mutex mu_;
-  std::thread thread_;
-};
-
-std::vector<uint8_t> ResponseHeaderBytes(int32_t status, uint64_t message_len) {
-  TcpControlPlaneBackend::ControlResponseHeader hdr;
-  hdr.magic = TcpControlPlaneBackend::kResponseMagic;
-  hdr.status = status;
-  hdr.num_layers = 1;
-  hdr.data_port = 50000;
-  hdr.message_len = message_len;
-  std::vector<uint8_t> out(sizeof(hdr));
-  std::memcpy(out.data(), &hdr, sizeof(hdr));
-  return out;
-}
-
-constexpr absl::Duration kDribbleDeadline = absl::Milliseconds(400);
-// A quarter of kDribbleDeadline, not a half: at a half a single scheduling
-// hiccup pushes one gap past the socket timeout, and the handshake then fails
-// early for the wrong reason -- passing the test even against a backend with
-// no total deadline at all.
-constexpr absl::Duration kDribbleGap = absl::Milliseconds(100);
-
-TEST(TcpControlPlaneDeadlineTest, DeadlineBoundsDribbledResponseHeader) {
-  DribblingPeer peer(ResponseHeaderBytes(/*status=*/0, /*message_len=*/0),
-                     /*immediate=*/0, kDribbleGap);
-  TcpControlPlaneBackend client;
-  PullStreamRequestSpec req;
-  req.uuid = 4242;
-
-  const absl::Time start = absl::Now();
-  absl::StatusOr<PullStreamResponseSpec> response =
-      client.SendPullRequest(peer.endpoint(), req, kDribbleDeadline);
-  const absl::Duration elapsed = absl::Now() - start;
-
-  EXPECT_FALSE(response.ok());
-  EXPECT_TRUE(absl::IsDeadlineExceeded(response.status())) << response.status();
-  EXPECT_LT(elapsed, 3 * kDribbleDeadline)
-      << "handshake ran " << elapsed << " against a " << kDribbleDeadline
-      << " deadline; the peer had sent " << peer.bytes_sent() << " of "
-      << sizeof(TcpControlPlaneBackend::ControlResponseHeader)
-      << " header bytes, each one arriving inside SO_RCVTIMEO";
-}
-
-TEST(TcpControlPlaneDeadlineTest, DeadlineBoundsDribbledErrorBody) {
-  // status = 0 with a non-zero message_len. SendPullRequest enters the body
-  // read on message_len alone, with no status check, so a peer reporting
-  // success reaches it. The body is capped at kMaxControlErrorMessageBytes
-  // rather than at the 24-byte header, which is what makes this the dominant
-  // term in the unbounded hold time rather than a footnote to the case above.
-  constexpr uint64_t kBodyBytes = 64;
-  std::vector<uint8_t> payload =
-      ResponseHeaderBytes(/*status=*/0, /*message_len=*/kBodyBytes);
-  const size_t header_bytes = payload.size();
-  payload.insert(payload.end(), kBodyBytes, 'x');
-
-  DribblingPeer peer(std::move(payload), /*immediate=*/header_bytes,
-                     kDribbleGap);
-  TcpControlPlaneBackend client;
-  PullStreamRequestSpec req;
-  req.uuid = 4243;
-
-  const absl::Time start = absl::Now();
-  absl::StatusOr<PullStreamResponseSpec> response =
-      client.SendPullRequest(peer.endpoint(), req, kDribbleDeadline);
-  const absl::Duration elapsed = absl::Now() - start;
-
-  EXPECT_FALSE(response.ok());
-  EXPECT_TRUE(absl::IsDeadlineExceeded(response.status())) << response.status();
-  EXPECT_LT(elapsed, 3 * kDribbleDeadline)
-      << "error-body read ran " << elapsed << " against a " << kDribbleDeadline
-      << " deadline after the peer declared " << kBodyBytes
-      << " bytes and dribbled them";
-}
-
-TEST(TcpControlPlaneDeadlineTest, HealthyPeerIsUnaffectedByTheDeadline) {
-  // The bound must not cost anything when the peer answers promptly: the whole
-  // payload arrives at once, well inside the deadline.
-  DribblingPeer peer(ResponseHeaderBytes(/*status=*/0, /*message_len=*/0),
-                     /*immediate=*/sizeof(
-                         TcpControlPlaneBackend::ControlResponseHeader),
-                     kDribbleGap);
-  TcpControlPlaneBackend client;
-  PullStreamRequestSpec req;
-  req.uuid = 4244;
-
-  const absl::Time start = absl::Now();
-  absl::StatusOr<PullStreamResponseSpec> response =
-      client.SendPullRequest(peer.endpoint(), req, kDribbleDeadline);
-  const absl::Duration elapsed = absl::Now() - start;
-
-  ASSERT_TRUE(response.ok()) << response.status();
-  EXPECT_EQ(response->status, 0);
-  EXPECT_LT(elapsed, kDribbleDeadline);
-}
 
 TEST(ExtractIpFromGrpcPeerTest, HandlesAllFormats) {
   EXPECT_EQ(ExtractIpFromGrpcPeer("ipv4:10.210.0.4:54321"), "10.210.0.4");

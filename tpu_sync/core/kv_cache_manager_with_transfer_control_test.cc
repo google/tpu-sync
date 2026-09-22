@@ -86,7 +86,11 @@ class TestManager : public KVCacheManagerWithTransfer {
       TcpControlPlaneBackend::kResponseMagic;
 
   ControlResponseHeader ReadResponseHeaderForTest(int fd) {
-    return TcpControlPlaneBackend::ReadControlResponseHeader(fd);
+    // Unbounded on purpose: this helper is how a test observes what the
+    // manager sent, so it must not impose a deadline of its own on top of the
+    // one under test.
+    return TcpControlPlaneBackend::ReadControlResponseHeader(
+        fd, absl::InfiniteFuture());
   }
 
   void HandleControlConnectionForTest(int fd) {
@@ -1083,14 +1087,19 @@ class DribblingProducer {
   std::thread thread_;
 };
 
-// timeout_s is enforced as SO_RCVTIMEO, which bounds a single recv() rather
-// than the handshake as a whole. A peer that stays just inside that per-call
-// bound holds its worker for sizeof(ControlResponseHeader) timeouts, so the
-// starvation window above is not capped at timeout_s -- it is capped at
-// 24 x timeout_s (48 minutes at the 120s default).
+// timeout_s used to be enforced only as SO_RCVTIMEO, which bounds a single
+// recv() rather than the handshake as a whole. A peer that stays just inside
+// that per-call bound holds its worker for one timeout per byte outstanding,
+// so the starvation window was not capped at timeout_s. The header alone is
+// 24 x timeout_s; the error body SendPullRequest reads on message_len alone
+// pushes the worst case to (24 + 4096) x timeout_s. See
+// TcpControlPlaneDeadlineTest in control_plane_backend_test.cc, which covers
+// the body term directly.
 TEST(ControlHandshakeTest, HandshakeDeadlineBoundsWholeHandshakeNotEachRecv) {
-  // Comfortably inside kTimeoutS, so no individual recv() ever times out.
-  DribblingProducer producer(absl::Seconds(kTimeoutS / 2));
+  // A quarter of kTimeoutS, not a half: at a half a single CI scheduling
+  // hiccup pushes one gap past SO_RCVTIMEO, and the handshake then fails early
+  // for the wrong reason -- passing this test even with no total deadline.
+  DribblingProducer producer(absl::Seconds(kTimeoutS / 4));
   TestManager consumer(/*timeout_s=*/kTimeoutS);
   const absl::Time start = absl::Now();
   consumer.StartRead("dribble", /*uuid=*/700, producer.endpoint(),

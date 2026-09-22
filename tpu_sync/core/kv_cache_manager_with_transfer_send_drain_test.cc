@@ -779,6 +779,34 @@ TEST(RecvLifecycleTest,
 }
 
 TEST(RecvLifecycleTest,
+     IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  consumer.AddRecv("req_handoff", /*uuid=*/92, /*blocks_per_layer=*/1);
+  ASSERT_EQ(consumer.free_slots(), kSlots - 1);
+
+  // Simulate BlockTransport::HandleIncomingPush holding the incoming push lease
+  // across OnLayerReceived, synchronous H2D completion, and OnBlocksReceived.
+  ASSERT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/92),
+              ::absl_testing::IsOk());
+  ASSERT_THAT(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/92),
+              ::absl_testing::IsOk());
+  consumer.FinishCopy(0, absl::OkStatus());
+  // Even though the H2D copy finished, staging must remain pinned until
+  // OnBlocksReceived and EndIncomingPush complete.
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  ASSERT_THAT(consumer.ReceiveBlocks({0}, /*uuid=*/92), ::absl_testing::IsOk());
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  EXPECT_THAT(consumer.base()->EndIncomingPush(/*uuid=*/92),
+              ::absl_testing::IsOk());
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+  Reports reports = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneReceiving(reports), Contains("req_handoff"));
+  EXPECT_THAT(FailedRecving(reports), IsEmpty());
+}
+
+TEST(RecvLifecycleTest,
      NonSessionTransfersSucceedOverBlockTransportWhileStaleUuidIsRejected) {
   constexpr size_t kSliceBytes = 128;
   KVCacheManagerWithTransfer sender(

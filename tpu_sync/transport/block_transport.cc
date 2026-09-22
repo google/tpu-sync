@@ -387,8 +387,6 @@ absl::Status BlockTransport::HandleIncomingPush(
         }
         return absl::OkStatus();
       }));
-  incoming_push_lease_held = false;
-  ABSL_RETURN_IF_ERROR(block_delegate_->EndIncomingPush(header.uuid));
 
   if (total_received_bytes > 0) {
     // TODO: Add interface name (e.g. eth0, lo) using
@@ -533,6 +531,8 @@ absl::Status BlockTransport::HandleIncomingPush(
             << ", numa=" << block_delegate_->node_id();
   ABSL_RETURN_IF_ERROR(
       block_delegate_->OnBlocksReceived(allocated_ids, header.uuid));
+  incoming_push_lease_held = false;
+  ABSL_RETURN_IF_ERROR(block_delegate_->EndIncomingPush(header.uuid));
   uint8_t ack = 1;
   ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
   return absl::OkStatus();

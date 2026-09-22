@@ -1301,6 +1301,12 @@ TEST(KVCacheManagerTest, D2hWritePipelinedTelemetryBatchObservation) {
   auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
   auto* raw_backend = mock_backend.get();
 
+  EXPECT_CALL(
+      *raw_backend,
+      ObserveHistogram(testing::Ne(telemetry::metric_names::kD2hTransferTimeMs),
+                       testing::_, testing::_))
+      .Times(2);
+
   // Exactly 1 observation for the entire batch of chunks, not 1 per chunk.
   EXPECT_CALL(
       *raw_backend,

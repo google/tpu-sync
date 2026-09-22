@@ -14,8 +14,13 @@
 
 #include "tpu_sync/telemetry/label_util.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <utility>
@@ -24,6 +29,7 @@
 #include "absl/algorithm/container.h"
 #include "absl/base/attributes.h"
 #include "absl/container/inlined_vector.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -150,6 +156,40 @@ size_t ComputePrometheusLabelsSize(LabelSpan labels) {
   return total;
 }
 
+bool IsValidIp(absl::string_view ip) {
+  if (ip.empty() || ip.size() >= INET6_ADDRSTRLEN) {
+    return false;
+  }
+  char buf[INET6_ADDRSTRLEN];
+  std::memcpy(buf, ip.data(), ip.size());
+  buf[ip.size()] = '\0';
+  unsigned char addr[sizeof(struct in6_addr)];
+  return inet_pton(AF_INET, buf, addr) == 1 ||
+         inet_pton(AF_INET6, buf, addr) == 1;
+}
+
+absl::string_view ExtractIpFromEndpoint(absl::string_view endpoint) {
+  if (endpoint.empty()) {
+    return metric_labels::kUnknownIp;
+  }
+  absl::string_view host = endpoint;
+  if (const size_t colon = host.rfind(':');
+      colon != absl::string_view::npos &&
+      (host.find(':') == colon ||
+       (host.starts_with('[') && colon > 0 && host[colon - 1] == ']'))) {
+    int port = -1;
+    if (!absl::SimpleAtoi(host.substr(colon + 1), &port) || port < 0 ||
+        port > 65535) {
+      return metric_labels::kUnknownIp;
+    }
+    host = host.substr(0, colon);
+  }
+  if (host.starts_with('[') && host.ends_with(']')) {
+    host = host.substr(1, host.size() - 2);
+  }
+  return IsValidIp(host) ? host : metric_labels::kUnknownIp;
+}
+
 }  // namespace
 
 std::optional<absl::string_view> FormatShmLabelsToBuffer(
@@ -269,6 +309,13 @@ std::string PrometheusLabelView::ToOwned() {
     return std::exchange(heap_fallback_, std::string());
   }
   return std::string(current_view);
+}
+
+absl::string_view ExtractFirstEndpointIp(
+    absl::Span<const std::string> endpoints) {
+  return ExtractIpFromEndpoint(endpoints.empty()
+                                   ? absl::string_view()
+                                   : absl::string_view(endpoints[0]));
 }
 
 }  // namespace tpu_raiden::telemetry

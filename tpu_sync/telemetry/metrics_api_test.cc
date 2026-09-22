@@ -148,6 +148,18 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kTransferFailuresTotal.type, MetricType::kCounter);
   EXPECT_THAT(metric_metadata::kTransferFailuresTotal.label_names, IsEmpty());
 
+  // P2pTransferTimeMs
+  EXPECT_EQ(metric_labels::kSrcIp, "src_ip");
+  EXPECT_EQ(metric_labels::kDstIp, "dst_ip");
+  EXPECT_EQ(metric_names::kP2pTransferTimeMs, "p2p_transfer_time_ms");
+  EXPECT_EQ(metric_descriptions::kP2pTransferTimeMs,
+            "Peer-to-Peer network batch transfer latency in milliseconds.");
+  EXPECT_EQ(metric_metadata::kP2pTransferTimeMs.name, "p2p_transfer_time_ms");
+  EXPECT_EQ(metric_metadata::kP2pTransferTimeMs.description,
+            "Peer-to-Peer network batch transfer latency in milliseconds.");
+  EXPECT_EQ(metric_metadata::kP2pTransferTimeMs.type, MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kP2pTransferTimeMs.label_names, IsEmpty());
+
   // H2dTransferTimeMs
   EXPECT_EQ(metric_names::kH2dTransferTimeMs, "h2d_transfer_time_ms");
   EXPECT_EQ(metric_descriptions::kH2dTransferTimeMs,
@@ -212,6 +224,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
                           metric_metadata::kReceivedBytesTotal,
                           metric_metadata::kTransferFailuresTotal,
                           metric_metadata::kTransferDurationMs,
+                          metric_metadata::kP2pTransferTimeMs,
                           metric_metadata::kH2dTransferTimeMs,
                           metric_metadata::kD2hTransferTimeMs,
                           metric_metadata::kBufferAllocatedBytes));
@@ -349,6 +362,7 @@ TEST_F(MetricsApiTest, GetMetricMetadataReturnsAllMetricsWhenBackendsActive) {
                                   metric_metadata::kReceivedBytesTotal,
                                   metric_metadata::kTransferFailuresTotal,
                                   metric_metadata::kTransferDurationMs,
+                                  metric_metadata::kP2pTransferTimeMs,
                                   metric_metadata::kH2dTransferTimeMs,
                                   metric_metadata::kD2hTransferTimeMs,
                                   metric_metadata::kBufferAllocatedBytes));

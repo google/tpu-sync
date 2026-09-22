@@ -144,6 +144,17 @@ constexpr std::array<absl::string_view, N> ResolveLabels(
   return resolved;
 }
 
+// ============================================================================
+// Endpoint IP Extraction for Telemetry Labels
+// ============================================================================
+
+// Extracts the host or IP address from the first endpoint in `endpoints`
+// ("host:port", "[ipv6]:port", or bare IP), or returns
+// metric_labels::kUnknownIp ("unknown") if `endpoints` is empty, placeholder
+// ("?" / "*"), or malformed.
+absl::string_view ExtractFirstEndpointIp(
+    absl::Span<const std::string> endpoints);
+
 }  // namespace tpu_raiden::telemetry
 
 #endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TELEMETRY_LABEL_UTIL_H_

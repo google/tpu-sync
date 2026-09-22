@@ -41,8 +41,27 @@ namespace tpu_raiden {
 namespace {
 
 using ::absl_testing::IsOk;
+using ::testing::AllOf;
+using ::testing::ElementsAre;
+using ::testing::ExplainMatchResult;
+using ::testing::Field;
 using ::testing::Gt;
 using ::testing::IsEmpty;
+using ::testing::Ne;
+using ::testing::Not;
+
+// Verifies that a MetricLabel has key `key` and a non-empty IP value that
+// resolved to a known address (i.e. not kUnknownIp).
+MATCHER_P(HasResolvedIpLabel, key,
+          absl::StrCat(negation ? "does not have" : "has", " label key '", key,
+                       "' with a resolved non-empty IP value")) {
+  return ExplainMatchResult(
+      AllOf(Field("key", &telemetry::MetricLabel::key, key),
+            Field("value", &telemetry::MetricLabel::value,
+                  AllOf(Not(IsEmpty()),
+                        Ne(telemetry::metric_labels::kUnknownIp)))),
+      arg, result_listener);
+}
 
 class TestBase : public kv_cache::KVCacheManagerBase {
  public:
@@ -114,6 +133,16 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
   EXPECT_CALL(*raw_mock,
               ObserveHistogram(telemetry::metric_names::kTransferDurationMs,
                                IsEmpty(), Gt(0.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(
+          telemetry::metric_names::kP2pTransferTimeMs,
+          ElementsAre(
+              telemetry::MetricLabel{.key = telemetry::metric_labels::kSrcIp,
+                                     .value = "127.0.0.1"},
+              HasResolvedIpLabel(telemetry::metric_labels::kDstIp)),
+          Gt(0.0)))
       .Times(1);
   EXPECT_CALL(*raw_mock,
               ObserveHistogram(telemetry::metric_names::kD2hTransferTimeMs,

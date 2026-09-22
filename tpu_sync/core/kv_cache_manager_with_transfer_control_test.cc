@@ -799,5 +799,324 @@ TEST(ControlHandshakeTest, ExpiredReceiveKeepsStagingUntilHandshakeEnds) {
   EXPECT_THAT(failed_again, ::testing::IsEmpty());
 }
 
+// --------------------------------------------------------------------------
+// Cross-peer fault isolation on the consumer handshake path (issue #888).
+//
+// The tests above establish that a silent producer costs its own reads one
+// transfer timeout. These establish the part that is a fault-isolation bug:
+// the cost is paid by reads aimed at *other*, healthy producers, because
+// push_pool_ is one FIFO queue shared by every peer.
+// --------------------------------------------------------------------------
+
+// A handshake timeout long enough that "blocked behind the sick peer" and
+// "scheduled promptly" cannot be confused for one another. Reads to the
+// healthy peer are expected to start in milliseconds; a worker stuck on the
+// sick peer holds on for kStarvationTimeoutS.
+constexpr double kStarvationTimeoutS = 4.0;
+
+TEST(ControlHandshakeTest, SickPeerDoesNotDelayHandshakeToHealthyPeer) {
+  SilentProducer sick;
+  SilentProducer healthy;
+  TestManager consumer(/*timeout_s=*/kStarvationTimeoutS);
+
+  // Saturate every handshake worker with reads aimed at the sick peer. It
+  // accepts the connections, so these are not connect() failures: each worker
+  // is parked in ReadExact waiting for a response that never comes.
+  for (int i = 0; i < kPoolSize; ++i) {
+    consumer.StartRead(absl::StrCat("sick", i), /*uuid=*/300 + i,
+                       sick.endpoint(), /*remote_block_ids=*/{0},
+                       /*local_block_ids=*/{0});
+  }
+  ASSERT_TRUE(sick.WaitUntilAccepted(kPoolSize, std::chrono::seconds(10)))
+      << "precondition: all " << kPoolSize
+      << " handshake workers are occupied by the sick peer";
+
+  // A read to a peer that is answering normally. Nothing about this request
+  // depends on the sick peer; only the shared pool couples them.
+  const absl::Time start = absl::Now();
+  consumer.StartRead("healthy0", /*uuid=*/400, healthy.endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+
+  // The healthy peer should see the connection promptly. Wait well past the
+  // sick peer's timeout so the failure message can report how long it
+  // actually took: a delay that tracks kStarvationTimeoutS is the signature
+  // of head-of-line blocking in the shared pool, as opposed to mere jitter.
+  const bool contacted =
+      healthy.WaitUntilAccepted(1, std::chrono::seconds(20));
+  const double waited = SecondsSince(start);
+  ASSERT_TRUE(contacted) << "healthy peer was never contacted at all";
+  EXPECT_LT(waited, 0.5)
+      << "reaching the healthy peer took " << waited
+      << "s, against a sick-peer handshake timeout of " << kStarvationTimeoutS
+      << "s; a single unresponsive producer is serialising the handshake "
+         "path for every other peer";
+
+  // Let the stuck workers unwind so teardown does not race them.
+  sick.DropClients();
+  healthy.DropClients();
+  const absl::Time drain_deadline = absl::Now() + absl::Seconds(20);
+  size_t settled = 0;
+  while (settled < static_cast<size_t>(kPoolSize) + 1 &&
+         absl::Now() < drain_deadline) {
+    auto [sent, received, failed] = consumer.CompleteReadRaw();
+    (void)sent;
+    settled += received.size() + failed.size();
+    absl::SleepFor(absl::Milliseconds(20));
+  }
+}
+
+// The same coupling, stated as a throughput property rather than a latency
+// one: reads to a healthy peer should keep completing while a sick peer is
+// being waited on. Uses more sick reads than there are workers so the queue
+// stays backed up, which is the production shape -- traffic to the dead peer
+// keeps arriving and the pool never drains.
+TEST(ControlHandshakeTest, HealthyPeerProgressesWhileSickPeerBacklogDrains) {
+  SilentProducer sick;
+  SilentProducer healthy;
+  TestManager consumer(/*timeout_s=*/kStarvationTimeoutS);
+
+  // A backlog deeper than the pool, but sized with the healthy reads to stay
+  // inside the consumer's staging slots. Overrunning them would make reads
+  // fail allocation and never reach the pool at all, which is a different
+  // defect (see SickPeerStarvesStagingSlotsForHealthyPeer) and would mask
+  // this one.
+  constexpr int kHealthyReads = 3;
+  constexpr int kSickReads = 5;
+  static_assert(kSickReads > kPoolSize, "backlog must exceed the pool");
+  static_assert(kSickReads + kHealthyReads <= 2 * kPoolSize,
+                "must fit in TestManager's staging slots");
+
+  for (int i = 0; i < kSickReads; ++i) {
+    consumer.StartRead(absl::StrCat("sick", i), /*uuid=*/500 + i,
+                       sick.endpoint(), /*remote_block_ids=*/{0},
+                       /*local_block_ids=*/{0});
+  }
+  ASSERT_TRUE(sick.WaitUntilAccepted(kPoolSize, std::chrono::seconds(10)));
+
+  // Interleave healthy reads behind the backlog, as a scheduler would.
+  const absl::Time start = absl::Now();
+  for (int i = 0; i < kHealthyReads; ++i) {
+    consumer.StartRead(absl::StrCat("healthy", i), /*uuid=*/600 + i,
+                       healthy.endpoint(), /*remote_block_ids=*/{0},
+                       /*local_block_ids=*/{0});
+  }
+  // Guards the precondition: these reads exist as sessions and are waiting on
+  // the pool, rather than having been rejected before they got there.
+  for (int i = 0; i < kHealthyReads; ++i) {
+    ASSERT_TRUE(consumer.has_recv(600 + i))
+        << "healthy read " << i << " was dropped before reaching the pool";
+  }
+
+  // With per-peer fairness the healthy reads share the pool with the sick
+  // backlog and are contacted quickly. With one FIFO queue they are strictly
+  // behind kSickReads handshakes, so the first contact costs a full timeout
+  // and draining the backlog costs two.
+  const bool all_contacted =
+      healthy.WaitUntilAccepted(kHealthyReads, std::chrono::seconds(30));
+  const double waited = SecondsSince(start);
+  ASSERT_TRUE(all_contacted)
+      << "only " << healthy.accepted() << " of " << kHealthyReads
+      << " healthy handshakes ever started";
+  EXPECT_LT(waited, 0.5)
+      << "draining " << kHealthyReads << " healthy handshakes took " << waited
+      << "s while " << kSickReads
+      << " reads to an unresponsive peer were outstanding; healthy traffic is "
+         "queued strictly behind the sick backlog rather than sharing the pool";
+
+  sick.DropClients();
+  healthy.DropClients();
+  const absl::Time drain_deadline = absl::Now() + absl::Seconds(30);
+  size_t settled = 0;
+  while (settled < static_cast<size_t>(kSickReads + kHealthyReads) &&
+         absl::Now() < drain_deadline) {
+    auto [sent, received, failed] = consumer.CompleteReadRaw();
+    (void)sent;
+    settled += received.size() + failed.size();
+    absl::SleepFor(absl::Milliseconds(20));
+  }
+}
+
+// A receive session holds its staging slot for the whole handshake
+// (TransferReceiveSession::Create -> AllocateStagingForLoad, called from
+// StartRead before the handshake is scheduled). Sessions stuck on an
+// unresponsive peer therefore pin the staging pool as well as the thread
+// pool, and once it is empty StartRead fails allocation and drops the read
+// outright -- a read to a healthy peer is not merely delayed, it is rejected
+// and never attempted.
+TEST(ControlHandshakeTest, SickPeerStarvesStagingSlotsForHealthyPeer) {
+  SilentProducer sick;
+  SilentProducer healthy;
+  TestManager consumer(/*timeout_s=*/kStarvationTimeoutS);
+
+  // TestManager is built with num_slots = 2 * kPoolSize.
+  constexpr int kSlots = 2 * kPoolSize;
+  const size_t free_before = consumer.free_slots();
+  ASSERT_GE(free_before, static_cast<size_t>(kSlots));
+
+  for (int i = 0; i < kSlots; ++i) {
+    consumer.StartRead(absl::StrCat("sick", i), /*uuid=*/800 + i,
+                       sick.endpoint(), /*remote_block_ids=*/{0},
+                       /*local_block_ids=*/{0});
+  }
+  ASSERT_TRUE(sick.WaitUntilAccepted(kPoolSize, std::chrono::seconds(10)));
+  ASSERT_EQ(consumer.free_slots(), 0u)
+      << "precondition: the sick peer is holding every staging slot";
+
+  // A read to a peer that is answering normally.
+  consumer.StartRead("healthy0", /*uuid=*/900, healthy.endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+
+  EXPECT_TRUE(consumer.has_recv(900))
+      << "the read to the healthy peer was rejected outright because an "
+         "unresponsive peer holds all "
+      << kSlots
+      << " staging slots; no request to a healthy producer can even be "
+         "attempted while another producer is wedged";
+
+  auto [done_sending, done_recving, failed_recving] = consumer.CompleteReadRaw();
+  (void)done_sending;
+  (void)done_recving;
+  EXPECT_THAT(failed_recving, ::testing::Not(Contains("healthy0")))
+      << "the healthy read failed immediately rather than being served";
+
+  sick.DropClients();
+  healthy.DropClients();
+  const absl::Time drain_deadline = absl::Now() + absl::Seconds(30);
+  size_t settled = 0;
+  while (settled < static_cast<size_t>(kSlots) &&
+         absl::Now() < drain_deadline) {
+    auto [sent, received, failed] = consumer.CompleteReadRaw();
+    (void)sent;
+    settled += received.size() + failed.size();
+    absl::SleepFor(absl::Milliseconds(20));
+  }
+}
+
+// A producer that accepts, reads the request, then answers one byte at a
+// time. Every byte arrives inside SO_RCVTIMEO, so the socket timeout never
+// fires and ReadExact's loop restarts the clock on each partial read.
+class DribblingProducer {
+ public:
+  explicit DribblingProducer(absl::Duration gap) : gap_(gap) {
+    fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    EXPECT_EQ(bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    socklen_t len = sizeof(addr);
+    EXPECT_EQ(getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len), 0);
+    port_ = ntohs(addr.sin_port);
+    EXPECT_EQ(listen(fd_, 64), 0);
+    thread_ = std::thread([this] { Serve(); });
+  }
+
+  ~DribblingProducer() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      stopping_ = true;
+      if (client_ >= 0) shutdown(client_, SHUT_RDWR);
+    }
+    shutdown(fd_, SHUT_RDWR);
+    close(fd_);
+    fd_ = -1;
+    thread_.join();
+    if (client_ >= 0) close(client_);
+  }
+
+  std::string endpoint() const { return absl::StrCat("127.0.0.1:", port_); }
+
+  int bytes_sent() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return bytes_sent_;
+  }
+
+ private:
+  bool stopping() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return stopping_;
+  }
+
+  void Serve() {
+    int client = accept(fd_, nullptr, nullptr);
+    if (client < 0) return;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      client_ = client;
+      if (stopping_) return;
+    }
+
+    TestManager::ControlRequestHeader request;
+    if (!ReadAll(client, &request, sizeof(request))) return;
+    constexpr uint64_t kMaxTestBlocks = 64;
+    if (request.num_blocks > kMaxTestBlocks) return;
+    std::vector<int64_t> block_ids(2 * request.num_blocks);
+    if (!block_ids.empty() &&
+        !ReadAll(client, block_ids.data(),
+                 block_ids.size() * sizeof(block_ids[0]))) {
+      return;
+    }
+
+    // A well-formed success header, delivered one byte per gap_.
+    TestManager::ControlResponseHeader response{};
+    response.magic = TestManager::kResponseMagic;
+    response.status = 0;
+    response.message_len = 0;
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&response);
+    for (size_t i = 0; i < sizeof(response) && !stopping(); ++i) {
+      if (send(client, bytes + i, 1, MSG_NOSIGNAL) != 1) return;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        ++bytes_sent_;
+      }
+      absl::SleepFor(gap_);
+    }
+  }
+
+  const absl::Duration gap_;
+  int fd_ = -1;
+  int port_ = 0;
+  int client_ = -1;
+  int bytes_sent_ = 0;
+  bool stopping_ = false;
+  std::mutex mu_;
+  std::thread thread_;
+};
+
+// timeout_s is enforced as SO_RCVTIMEO, which bounds a single recv() rather
+// than the handshake as a whole. A peer that stays just inside that per-call
+// bound holds its worker for sizeof(ControlResponseHeader) timeouts, so the
+// starvation window above is not capped at timeout_s -- it is capped at
+// 24 x timeout_s (48 minutes at the 120s default).
+TEST(ControlHandshakeTest, HandshakeDeadlineBoundsWholeHandshakeNotEachRecv) {
+  // Comfortably inside kTimeoutS, so no individual recv() ever times out.
+  DribblingProducer producer(absl::Seconds(kTimeoutS / 2));
+  TestManager consumer(/*timeout_s=*/kTimeoutS);
+  const absl::Time start = absl::Now();
+  consumer.StartRead("dribble", /*uuid=*/700, producer.endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+
+  // The handshake should be abandoned within a small multiple of the
+  // configured timeout. Today it runs until the last of the 24 header bytes
+  // arrives, because each successful recv() restarts the clock.
+  const absl::Time give_up_by = start + absl::Seconds(3 * kTimeoutS);
+  bool settled = false;
+  while (absl::Now() < give_up_by) {
+    auto [sent, received, failed] = consumer.CompleteReadRaw();
+    (void)sent;
+    if (!received.empty() || !failed.empty()) {
+      settled = true;
+      break;
+    }
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_TRUE(settled)
+      << "handshake still held a worker after " << SecondsSince(start)
+      << "s with timeout_s=" << kTimeoutS << "; the peer had sent only "
+      << producer.bytes_sent() << " of "
+      << sizeof(TestManager::ControlResponseHeader)
+      << " header bytes, each inside SO_RCVTIMEO";
+}
+
 }  // namespace
 }  // namespace tpu_raiden

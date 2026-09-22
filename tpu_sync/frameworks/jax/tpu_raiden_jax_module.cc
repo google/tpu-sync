@@ -494,7 +494,8 @@ NB_MODULE(_tpu_raiden_jax, m) {
       .def_prop_ro("num_layers", &WeightSynchronizer::num_layers)
       .def_prop_ro("num_shards", &WeightSynchronizer::num_shards)
       .def_prop_ro("slice_byte_size", &WeightSynchronizer::slice_byte_size)
-      .def("get_metrics", &WeightSynchronizer::GetMetrics);
+      .def("get_metrics", &WeightSynchronizer::GetMetrics)
+      .def("reset_metrics", &WeightSynchronizer::ResetMetrics);
 
   nb::class_<tpu_raiden::weight_sync::WeightSyncMetrics>(m, "WeightSyncMetrics")
       .def_ro("last_d2h_time_ms",

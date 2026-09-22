@@ -29,6 +29,8 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -263,6 +265,9 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   virtual void ResetMetrics() {
     absl::MutexLock lock(metrics_mu_);
     metrics_ = WeightSyncMetrics{};
+    if (active_h2h_pushes_ > 0) {
+      h2h_active_window_start_ = absl::Now();
+    }
   }
 
   void SetMetricsForTesting(const WeightSyncMetrics& m) {
@@ -384,6 +389,9 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   mutable absl::Mutex metrics_mu_;
   WeightSyncMetrics metrics_ ABSL_GUARDED_BY(metrics_mu_);
+  size_t active_h2h_pushes_ ABSL_GUARDED_BY(metrics_mu_) = 0;
+  absl::Time h2h_active_window_start_ ABSL_GUARDED_BY(metrics_mu_) =
+      absl::InfinitePast();
 
   mutable absl::Mutex completed_transfers_mu_;
   absl::flat_hash_set<uint64_t> completed_transfers_

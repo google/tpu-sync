@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/flags/flag.h"
@@ -909,6 +910,22 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   }
 
   auto h2h_start = absl::Now();
+  {
+    absl::MutexLock lock(metrics_mu_);
+    if (active_h2h_pushes_ == 0) {
+      h2h_active_window_start_ = h2h_start;
+    }
+    active_h2h_pushes_++;
+  }
+  auto h2h_window_cleanup = absl::MakeCleanup([this]() {
+    absl::MutexLock lock(metrics_mu_);
+    absl::Time now = absl::Now();
+    metrics_.total_h2h_time_ms +=
+        absl::ToDoubleMilliseconds(now - h2h_active_window_start_);
+    h2h_active_window_start_ = now;
+    active_h2h_pushes_--;
+  });
+
   size_t total_h2h_bytes = 0;
   size_t total_d2h_bytes = 0;
   double first_d2h_time_ms = 0.0;
@@ -963,15 +980,26 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   for (auto& fut : push_futures) {
     TF_RETURN_IF_ERROR(fut.get());
   }
-  double h2h_time_ms = absl::ToDoubleMilliseconds(absl::Now() - h2h_start);
+  auto h2h_end = absl::Now();
+  double h2h_time_ms = absl::ToDoubleMilliseconds(h2h_end - h2h_start);
 
   double total_push_time_ms =
       absl::ToDoubleMilliseconds(absl::Now() - push_start);
   {
     absl::MutexLock lock(metrics_mu_);
+    std::move(h2h_window_cleanup).Cancel();
+    metrics_.total_h2h_time_ms +=
+        absl::ToDoubleMilliseconds(h2h_end - h2h_active_window_start_);
+    h2h_active_window_start_ = h2h_end;
+    active_h2h_pushes_--;
+    metrics_.total_h2h_bytes += total_h2h_bytes;
+    metrics_.total_push_resharded_time_ms += total_push_time_ms;
+
     if (!request.skip_d2h() && !already_completed) {
       metrics_.last_d2h_time_ms = first_d2h_time_ms;
       metrics_.last_d2h_bytes = total_d2h_bytes;
+      metrics_.total_d2h_time_ms += first_d2h_time_ms;
+      metrics_.total_d2h_bytes += total_d2h_bytes;
       metrics_.d2h_call_count++;
     }
     metrics_.last_staging_time_ms = staging_time_ms;

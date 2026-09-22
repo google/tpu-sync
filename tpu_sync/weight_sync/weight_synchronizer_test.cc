@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -27,10 +28,20 @@
 #include "absl/flags/flag.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "absl/synchronization/notification.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
+#include "absl/types/span.h"
+#include "xla/layout.h"
+#include "xla/layout_util.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
+#include "xla/shape.h"
+#include "xla/shape_util.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 ABSL_DECLARE_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size);
@@ -1854,6 +1865,151 @@ TEST_F(WeightSynchronizerTest,
       }
     }
   }
+}
+
+TEST_F(WeightSynchronizerTest, PushWeightsReshardedMetricsAccumulateAndReset) {
+  size_t num_layers = 1;
+  size_t num_shards = 1;
+  size_t slice_byte_size = 4096;
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = absl::StrCat("127.0.0.1:", *ws_dest->local_port());
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  auto* schedules = request.mutable_shard_push_schedules();
+  auto* entry = (*schedules)[0].add_entries();
+  entry->set_dst_peer(dest_peer);
+  entry->set_dst_shard_idx(0);
+  entry->set_src_offset_bytes(0);
+  entry->set_dst_offset_bytes(0);
+  entry->set_size_bytes(slice_byte_size);
+  entry->set_count(1);
+  entry->set_layer_idx(0);
+
+  // Initial metrics should be zero.
+  WeightSyncMetrics m0 = ws_source->GetMetrics();
+  EXPECT_EQ(m0.total_h2h_bytes, 0);
+  EXPECT_DOUBLE_EQ(m0.total_h2h_time_ms, 0.0);
+  EXPECT_EQ(m0.push_resharded_call_count, 0);
+
+  // Step 1: execute first push.
+  request.set_uuid(70001);
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 1));
+  ASSERT_OK(ws_source->PushWeightsResharded(request));
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+  WeightSyncMetrics m1 = ws_source->GetMetrics();
+  EXPECT_EQ(m1.total_h2h_bytes, slice_byte_size);
+  EXPECT_GT(m1.total_h2h_time_ms, 0.0);
+  EXPECT_EQ(m1.last_h2h_bytes, slice_byte_size);
+  EXPECT_EQ(m1.push_resharded_call_count, 1);
+
+  // Step 2: execute second push to verify accumulation.
+  request.set_uuid(70002);
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 1));
+  ASSERT_OK(ws_source->PushWeightsResharded(request));
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+  WeightSyncMetrics m2 = ws_source->GetMetrics();
+  EXPECT_EQ(m2.total_h2h_bytes, 2 * slice_byte_size);
+  EXPECT_GE(m2.total_h2h_time_ms, m1.total_h2h_time_ms);
+  EXPECT_EQ(m2.last_h2h_bytes, slice_byte_size);
+  EXPECT_EQ(m2.push_resharded_call_count, 2);
+
+  // Step 3: verify reset.
+  ws_source->ResetMetrics();
+  WeightSyncMetrics m_reset = ws_source->GetMetrics();
+  EXPECT_EQ(m_reset.total_h2h_bytes, 0);
+  EXPECT_DOUBLE_EQ(m_reset.total_h2h_time_ms, 0.0);
+  EXPECT_DOUBLE_EQ(m_reset.total_push_resharded_time_ms, 0.0);
+  EXPECT_EQ(m_reset.push_resharded_call_count, 0);
+}
+
+TEST_F(WeightSynchronizerTest,
+       PushWeightsReshardedConcurrentOverlappingPushesDoNotDoubleCountTime) {
+  size_t num_layers = 1;
+  size_t num_shards = 1;
+  size_t slice_byte_size = 500000;  // 500 KB
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = absl::StrCat("127.0.0.1:", *ws_dest->local_port());
+
+  // Configure a simulated rate limiter of 10 MB/s (~50 ms per 500KB push)
+  // to guarantee substantial concurrency overlap.
+  auto egress_limiter =
+      std::make_shared<transport::lib::TestOnlyRateLimiter>(10000000);
+  ws_source->SetTestOnlyRateLimiters(egress_limiter, /*ingress=*/nullptr);
+
+  auto make_request = [&](uint64_t uuid) {
+    tpu_sync::rpc::StartTransferRequest req;
+    req.set_skip_d2h(true);
+    req.set_uuid(uuid);
+    auto* schedules = req.mutable_shard_push_schedules();
+    auto* entry = (*schedules)[0].add_entries();
+    entry->set_dst_peer(dest_peer);
+    entry->set_dst_shard_idx(0);
+    entry->set_src_offset_bytes(0);
+    entry->set_dst_offset_bytes(0);
+    entry->set_size_bytes(slice_byte_size);
+    entry->set_count(1);
+    entry->set_layer_idx(0);
+    return req;
+  };
+
+  uint64_t uuid1 = 80001;
+  uint64_t uuid2 = 80002;
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(uuid1, 1));
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(uuid2, 1));
+
+  absl::Notification start_notification;
+  double elapsed1_ms = 0.0;
+  double elapsed2_ms = 0.0;
+
+  auto fut1 = std::async(std::launch::async, [&]() -> absl::Status {
+    start_notification.WaitForNotification();
+    auto t0 = absl::Now();
+    auto s = ws_source->PushWeightsResharded(make_request(uuid1));
+    elapsed1_ms = absl::ToDoubleMilliseconds(absl::Now() - t0);
+    return s;
+  });
+
+  auto fut2 = std::async(std::launch::async, [&]() -> absl::Status {
+    start_notification.WaitForNotification();
+    auto t0 = absl::Now();
+    auto s = ws_source->PushWeightsResharded(make_request(uuid2));
+    elapsed2_ms = absl::ToDoubleMilliseconds(absl::Now() - t0);
+    return s;
+  });
+
+  start_notification.Notify();
+
+  ASSERT_OK(fut1.get());
+  ASSERT_OK(fut2.get());
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(uuid1));
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(uuid2));
+
+  WeightSyncMetrics m = ws_source->GetMetrics();
+  EXPECT_EQ(m.total_h2h_bytes, 2 * slice_byte_size);
+  EXPECT_EQ(m.push_resharded_call_count, 2);
+  EXPECT_GT(m.total_h2h_time_ms, 0.0);
+  EXPECT_GT(elapsed1_ms, 0.0);
+  EXPECT_GT(elapsed2_ms, 0.0);
+  EXPECT_LT(m.total_h2h_time_ms, elapsed1_ms + elapsed2_ms);
 }
 
 }  // namespace

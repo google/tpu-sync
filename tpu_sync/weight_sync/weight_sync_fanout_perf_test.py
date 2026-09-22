@@ -21,7 +21,7 @@ Qwen-35B model specs, verifying micro-block fragmentation realism and parity.
 
 import asyncio
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from absl import flags
 from absl.testing import absltest
@@ -48,6 +48,46 @@ _TEST_ONLY_SIMULATED_NIC_GBPS = flags.DEFINE_float(
     "Simulated NIC line rate in Gbps (0.0 = unlimited). When 0.0, "
     "test_rate_limited_flat_vs_tree_comparison benchmarks at 10.0 Gbps.",
 )
+
+
+class PerfRunResult:
+  """Container for weight sync fan-out benchmark run results."""
+
+  def __init__(
+      self,
+      elapsed: float,
+      throughput_gb_s: float,
+      src_metrics: Dict[str, Any],
+      dst_metrics: List[Dict[str, Any]],
+  ) -> None:
+    self.elapsed = elapsed
+    self.throughput_gb_s = throughput_gb_s
+    self.src_metrics = src_metrics
+    self.dst_metrics = dst_metrics
+
+  def __iter__(self) -> Iterator[float]:
+    return iter((self.elapsed, self.throughput_gb_s))
+
+
+def _format_h2h_stats(
+    src_m: Dict[str, Any], dst_m: List[Dict[str, Any]]
+) -> Tuple[str, str]:
+  """Formats source and relay H2H performance metrics for summary logging."""
+  src_mb = src_m["total_h2h_bytes"] / 1e6
+  src_ms = src_m["total_h2h_time_ms"]
+  src_bw = src_m["total_h2h_bandwidth_gbps"]
+  src_str = f"{src_mb:.1f} MB / {src_ms:.1f} ms ({src_bw:.2f} GB/s)"
+  relay_bws = [
+      m["total_h2h_bandwidth_gbps"] for m in dst_m if m["total_h2h_bytes"] > 0
+  ]
+  if not relay_bws:
+    relay_str = "N/A (flat)"
+  else:
+    relay_str = (
+        f"max {max(relay_bws):.2f} / avg {sum(relay_bws)/len(relay_bws):.2f}"
+        " GB/s"
+    )
+  return src_str, relay_str
 
 
 def _make_scaled_qwen_specs(
@@ -413,8 +453,13 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
         f"Expected >95% tasks with size <= 512 bytes, got {pct_le_512:.2f}%",
     )
 
-  def _run_flat_direct_push_perf(self) -> Tuple[float, float]:
+  def _run_flat_direct_push_perf(self) -> PerfRunResult:
     """Executes 1-to-4 Flat Direct Push (broadcast_k=64) with byte parity check."""
+    # 0. Reset metrics on source and all destination workers
+    self.ws_src.reset_metrics()
+    for ws_dst in self.ws_dsts:
+      ws_dst.reset_metrics()
+
     # 1. Fill source buffers with 0xAB
     for l in range(self.num_layers):
       buf = self.ws_src.get_host_buffer(layer_idx=l, shard_idx=0)
@@ -463,21 +508,52 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
             f"Flat push byte parity mismatch in layer {l}",
         )
 
+    # 5. Query and verify metrics
+    src_metrics = self.ws_src.get_metrics()
+    dst_metrics = [ws_dst.get_metrics() for ws_dst in self.ws_dsts]
+
+    self.assertGreater(src_metrics["total_h2h_bytes"], 0)
+    self.assertGreater(src_metrics["total_h2h_time_ms"], 0.0)
+    self.assertGreater(src_metrics["total_h2h_bandwidth_gbps"], 0.0)
+
+    total_cluster_h2h_bytes = src_metrics["total_h2h_bytes"] + sum(
+        m["total_h2h_bytes"] for m in dst_metrics
+    )
+    expected_total_h2h_bytes = self.total_model_bytes * self.num_destinations
+    self.assertEqual(
+        total_cluster_h2h_bytes,
+        expected_total_h2h_bytes,
+        "Sum of total_h2h_bytes across src + all dsts"
+        f" ({total_cluster_h2h_bytes}) must equal total_model_bytes *"
+        f" num_destinations ({expected_total_h2h_bytes}).",
+    )
+
     throughput_gb_s = (
         (self.total_model_bytes * self.num_destinations) / 1e9
     ) / max(elapsed, 1e-9)
+
+    src_h2h_mb = src_metrics["total_h2h_bytes"] / 1e6
+    src_h2h_ms = src_metrics["total_h2h_time_ms"]
+    src_h2h_bw = src_metrics["total_h2h_bandwidth_gbps"]
     print(
         f"\n[Flat Push (k=64)] Elapsed: {elapsed:.3f}s, Throughput:"
-        f" {throughput_gb_s:.2f} GB/s, Parity: PASS"
+        f" {throughput_gb_s:.2f} GB/s, Src H2H: {src_h2h_mb:.1f} MB in"
+        f" {src_h2h_ms:.1f} ms ({src_h2h_bw:.2f} GB/s), Relays: None, Parity:"
+        " PASS"
     )
-    return elapsed, throughput_gb_s
+    return PerfRunResult(elapsed, throughput_gb_s, src_metrics, dst_metrics)
 
   def test_flat_direct_push_perf(self):
     """Benchmarks 1-to-4 Flat Direct Push (broadcast_k=64) with byte parity check."""
     self._run_flat_direct_push_perf()
 
-  def _run_tree_broadcast_perf(self) -> Tuple[float, float]:
+  def _run_tree_broadcast_perf(self) -> PerfRunResult:
     """Executes 1-to-4 Tree Broadcast (broadcast_k=2) awaiting controller future."""
+    # 0. Reset metrics on source and all destination workers
+    self.ws_src.reset_metrics()
+    for ws_dst in self.ws_dsts:
+      ws_dst.reset_metrics()
+
     # 1. Fill source buffers with 0xCD
     for l in range(self.num_layers):
       buf = self.ws_src.get_host_buffer(layer_idx=l, shard_idx=0)
@@ -524,14 +600,56 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
             f"Tree broadcast byte parity mismatch in layer {l}",
         )
 
+    # 5. Query and verify metrics
+    src_metrics = self.ws_src.get_metrics()
+    dst_metrics = [ws_dst.get_metrics() for ws_dst in self.ws_dsts]
+
+    self.assertGreater(src_metrics["total_h2h_bytes"], 0)
+    self.assertGreater(src_metrics["total_h2h_time_ms"], 0.0)
+    self.assertGreater(src_metrics["total_h2h_bandwidth_gbps"], 0.0)
+
+    relay_metrics = [m for m in dst_metrics if m["total_h2h_bytes"] > 0]
+    self.assertNotEmpty(
+        relay_metrics,
+        "Tree Broadcast (broadcast_k=2) must have active relay destinations"
+        " forwarding chunks.",
+    )
+    for m in relay_metrics:
+      self.assertGreater(m["total_h2h_bytes"], 0)
+      self.assertGreater(m["total_h2h_time_ms"], 0.0)
+      self.assertGreater(m["total_h2h_bandwidth_gbps"], 0.0)
+
+    total_cluster_h2h_bytes = src_metrics["total_h2h_bytes"] + sum(
+        m["total_h2h_bytes"] for m in dst_metrics
+    )
+    expected_total_h2h_bytes = self.total_model_bytes * self.num_destinations
+    self.assertEqual(
+        total_cluster_h2h_bytes,
+        expected_total_h2h_bytes,
+        "Sum of total_h2h_bytes across src + all dsts"
+        f" ({total_cluster_h2h_bytes}) must equal total_model_bytes *"
+        f" num_destinations ({expected_total_h2h_bytes}).",
+    )
+
     throughput_gb_s = (
         (self.total_model_bytes * self.num_destinations) / 1e9
     ) / max(elapsed, 1e-9)
+
+    src_h2h_mb = src_metrics["total_h2h_bytes"] / 1e6
+    src_h2h_ms = src_metrics["total_h2h_time_ms"]
+    src_h2h_bw = src_metrics["total_h2h_bandwidth_gbps"]
+    relay_bws = [m["total_h2h_bandwidth_gbps"] for m in relay_metrics]
+    max_relay_bw = max(relay_bws) if relay_bws else 0.0
+    avg_relay_bw = sum(relay_bws) / len(relay_bws) if relay_bws else 0.0
+
     print(
         f"\n[Tree Broadcast (k=2)] Elapsed: {elapsed:.3f}s, Throughput:"
-        f" {throughput_gb_s:.2f} GB/s, Parity: PASS"
+        f" {throughput_gb_s:.2f} GB/s, Src H2H: {src_h2h_mb:.1f} MB in"
+        f" {src_h2h_ms:.1f} ms ({src_h2h_bw:.2f} GB/s), Relays"
+        f" ({len(relay_metrics)} active): max {max_relay_bw:.2f} GB/s, avg"
+        f" {avg_relay_bw:.2f} GB/s, Parity: PASS"
     )
-    return elapsed, throughput_gb_s
+    return PerfRunResult(elapsed, throughput_gb_s, src_metrics, dst_metrics)
 
   def test_tree_broadcast_perf(self):
     """Benchmarks 1-to-4 Tree Broadcast (broadcast_k=2) awaiting controller future."""
@@ -539,8 +657,8 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
 
   def test_sxs_flat_vs_tree_performance_comparison(self):
     """Executes flat vs tree modes side-by-side and prints comparative summary table."""
-    t_flat, bw_flat = self._run_flat_direct_push_perf()
-    t_tree, bw_tree = self._run_tree_broadcast_perf()
+    flat_res = self._run_flat_direct_push_perf()
+    tree_res = self._run_tree_broadcast_perf()
 
     total_tasks, _ = self._get_schedule_and_task_counts()
     if total_tasks >= 1_000_000:
@@ -551,26 +669,36 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
       task_str = str(total_tasks)
     model_mb = self.total_model_bytes / 1e6
 
-    print("\n" + "=" * 70)
+    flat_src_str, flat_relay_str = _format_h2h_stats(
+        flat_res.src_metrics, flat_res.dst_metrics
+    )
+    tree_src_str, tree_relay_str = _format_h2h_stats(
+        tree_res.src_metrics, tree_res.dst_metrics
+    )
+
+    print("\n" + "=" * 115)
     print(
         f"Weight Sync Fan-out Benchmark Results (Model: ~{model_mb:.1f} MB,"
         f" N={self.num_destinations})"
     )
-    print("=" * 70)
+    print("=" * 115)
     print(
-        f"{'Mode':<18} {'Time (s)':<12} {'Throughput (GB/s)':<19} {'Tasks':<10}"
-        f" {'Parity':<6}"
+        f"{'Mode':<14} {'Time':<10} {'Throughput':<14}"
+        f" {'Src H2H (Bytes / Time / BW)':<36} {'Relay H2H BW (max/avg)':<26}"
+        f" {'Tasks':<8} {'Parity':<6}"
     )
-    print("-" * 70)
+    print("-" * 115)
     print(
-        f"{'Flat (k=64)':<18} {t_flat:.2f} s       {bw_flat:.2f} GB/s          "
-        f" {task_str:<10} PASS"
+        f"{'Flat (k=64)':<14} {flat_res.elapsed:.2f} s    "
+        f" {flat_res.throughput_gb_s:.2f} GB/s      {flat_src_str:<36}"
+        f" {flat_relay_str:<26} {task_str:<8} PASS"
     )
     print(
-        f"{'Tree (k=2)':<18} {t_tree:.2f} s       {bw_tree:.2f} GB/s          "
-        f" {task_str:<10} PASS"
+        f"{'Tree (k=2)':<14} {tree_res.elapsed:.2f} s    "
+        f" {tree_res.throughput_gb_s:.2f} GB/s      {tree_src_str:<36}"
+        f" {tree_relay_str:<26} {task_str:<8} PASS"
     )
-    print("=" * 70 + "\n")
+    print("=" * 115 + "\n")
 
   def test_rate_limited_flat_vs_tree_comparison(self):
     """Benchmarks Flat Direct Push vs Tree Broadcast under simulated NIC bandwidth cap."""
@@ -589,44 +717,55 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
           test_only_simulated_ingress_gbps=0.0,
       )
 
-    t_flat, bw_flat = self._run_flat_direct_push_perf()
-    t_tree, bw_tree = self._run_tree_broadcast_perf()
+    flat_res = self._run_flat_direct_push_perf()
+    tree_res = self._run_tree_broadcast_perf()
 
-    print("\n" + "=" * 70)
+    flat_src_str, flat_relay_str = _format_h2h_stats(
+        flat_res.src_metrics, flat_res.dst_metrics
+    )
+    tree_src_str, tree_relay_str = _format_h2h_stats(
+        tree_res.src_metrics, tree_res.dst_metrics
+    )
+
+    print("\n" + "=" * 110)
     print(
         f"Rate-Limited Weight Sync Fan-out Benchmark ({rate_gbps:.1f} Gbps NIC,"
         f" N={self.num_destinations})"
     )
-    print("=" * 70)
+    print("=" * 110)
     print(
-        f"{'Mode':<18} {'Time (s)':<12} {'Throughput (GB/s)':<19} {'Parity':<6}"
+        f"{'Mode':<14} {'Time':<10} {'Throughput':<14}"
+        f" {'Src H2H (Bytes / Time / BW)':<36} {'Relay H2H BW (max/avg)':<26}"
+        f" {'Parity':<6}"
     )
-    print("-" * 70)
+    print("-" * 110)
     print(
-        f"{'Flat (k=64)':<18} {t_flat:.2f} s       {bw_flat:.2f} GB/s          "
-        " PASS"
+        f"{'Flat (k=64)':<14} {flat_res.elapsed:.2f} s    "
+        f" {flat_res.throughput_gb_s:.2f} GB/s      {flat_src_str:<36}"
+        f" {flat_relay_str:<26} PASS"
     )
     print(
-        f"{'Tree (k=2)':<18} {t_tree:.2f} s       {bw_tree:.2f} GB/s          "
-        " PASS"
+        f"{'Tree (k=2)':<14} {tree_res.elapsed:.2f} s    "
+        f" {tree_res.throughput_gb_s:.2f} GB/s      {tree_src_str:<36}"
+        f" {tree_relay_str:<26} PASS"
     )
-    print("=" * 70 + "\n")
+    print("=" * 110 + "\n")
 
     if self.num_destinations >= 16:
       self.assertLess(
-          t_tree,
-          t_flat,
-          f"Tree Broadcast ({t_tree:.3f}s) must outperform Flat Direct Push"
-          f" ({t_flat:.3f}s) under constrained NIC line rate at"
-          f" N={self.num_destinations}.",
+          tree_res.elapsed,
+          flat_res.elapsed,
+          f"Tree Broadcast ({tree_res.elapsed:.3f}s) must outperform Flat"
+          f" Direct Push ({flat_res.elapsed:.3f}s) under constrained NIC line"
+          f" rate at N={self.num_destinations}.",
       )
     else:
       # At small fan-out (N < 16, e.g. N=4), Tree broadcast only saves 1 serialized
       # copy (from 4 to 3), which is outweighed by multi-hop store-and-forward
       # Python scheduling latency. Verify that both modes executed cleanly and
       # satisfied byte-exact parity.
-      self.assertGreater(t_flat, 0.0)
-      self.assertGreater(t_tree, 0.0)
+      self.assertGreater(flat_res.elapsed, 0.0)
+      self.assertGreater(tree_res.elapsed, 0.0)
 
 
 if __name__ == "__main__":

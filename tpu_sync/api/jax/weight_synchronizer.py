@@ -250,6 +250,9 @@ class WeightSynchronizer:
     tiled_bytes_gb = m.last_tiled_bytes / 1e9
     detiled_bytes_gb = m.last_detiled_bytes / 1e9
 
+    total_h2h_time_s = max(m.total_h2h_time_ms / 1000.0, 1e-9)
+    total_h2h_bytes_gb = m.total_h2h_bytes / 1e9
+
     return {
         "last_d2h_time_ms": m.last_d2h_time_ms,
         "last_h2h_time_ms": m.last_h2h_time_ms,
@@ -280,6 +283,11 @@ class WeightSynchronizer:
         ),
         "h2h_bandwidth_gbps": (
             h2h_bytes_gb / h2h_time_s if m.last_h2h_bytes > 0 else 0.0
+        ),
+        "total_h2h_bandwidth_gbps": (
+            total_h2h_bytes_gb / total_h2h_time_s
+            if m.total_h2h_bytes > 0
+            else 0.0
         ),
         "tiling_bandwidth_gbps": (
             tiled_bytes_gb / tiling_time_s if m.last_tiled_bytes > 0 else 0.0

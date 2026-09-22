@@ -558,6 +558,90 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
         np.asarray(dst_arrs[0]), np.asarray(src_arrs[0])
     )
 
+  def test_metrics_accumulation_bandwidth_and_reset(self):
+    ws_source = WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=1,
+        num_shards=1,
+        slice_byte_size=1024,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    ws_dest = WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=1,
+        num_shards=1,
+        slice_byte_size=1024,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_source.shutdown)
+    self.addCleanup(ws_dest.shutdown)
+
+    m0 = ws_source.get_metrics()
+    self.assertEqual(m0["total_h2h_bytes"], 0)
+    self.assertEqual(m0["total_h2h_time_ms"], 0.0)
+    self.assertEqual(m0["total_h2h_bandwidth_gbps"], 0.0)
+
+    def _send_ctrl_req(port: int, req: raiden_service_pb2.ControlRequest):
+      payload = req.SerializeToString()
+      sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+      sock.connect(("::1", port))
+      sock.sendall(len(payload).to_bytes(4, "big") + payload)
+      resp_len = int.from_bytes(sock.recv(4), "big")
+      resp_bytes = sock.recv(resp_len)
+      resp = raiden_service_pb2.ControlResponse()
+      resp.ParseFromString(resp_bytes)
+      self.assertTrue(resp.success, resp.message)
+      sock.close()
+
+    for step in range(2):
+      uuid = 70001 + step
+      dst_req = raiden_service_pb2.ControlRequest(
+          command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+          start_transfer_request=raiden_service_pb2.StartTransferRequest(
+              is_sender=False,
+              uuid=uuid,
+              expected_block_count=1,
+          ),
+      )
+      _send_ctrl_req(ws_dest.listener_port, dst_req)
+
+      src_transfer_req = raiden_service_pb2.StartTransferRequest(
+          is_sender=True,
+          uuid=uuid,
+          skip_d2h=True,
+      )
+      sched = src_transfer_req.shard_push_schedules[0]
+      entry = sched.entries.add()
+      entry.dst_peer = f"127.0.0.1:{ws_dest.local_port}"
+      entry.dst_shard_idx = 0
+      entry.src_offset_bytes = 0
+      entry.dst_offset_bytes = 0
+      entry.size_bytes = 1024
+      entry.count = 1
+      entry.layer_idx = 0
+
+      src_req = raiden_service_pb2.ControlRequest(
+          command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+          start_transfer_request=src_transfer_req,
+      )
+      _send_ctrl_req(ws_source.listener_port, src_req)
+      ws_dest.wait_for_transfer_completion(uuid)
+
+    m2 = ws_source.get_metrics()
+    self.assertEqual(m2["total_h2h_bytes"], 2048)
+    self.assertGreater(m2["total_h2h_time_ms"], 0.0)
+    self.assertGreater(m2["total_h2h_bandwidth_gbps"], 0.0)
+    self.assertEqual(m2["push_resharded_call_count"], 2)
+
+    ws_source.reset_metrics()
+    m_reset = ws_source.get_metrics()
+    self.assertEqual(m_reset["total_h2h_bytes"], 0)
+    self.assertEqual(m_reset["total_h2h_time_ms"], 0.0)
+    self.assertEqual(m_reset["total_h2h_bandwidth_gbps"], 0.0)
+    self.assertEqual(m_reset["push_resharded_call_count"], 0)
+
 
 class ShardSortingUtilTest(absltest.TestCase):
 

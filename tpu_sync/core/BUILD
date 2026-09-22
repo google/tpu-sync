@@ -127,6 +127,7 @@ cc_library(
         ":tpu_utils",
         ":xla_raw_transfer_headers",
         "//tpu_sync/common:trace",
+        "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/transport:block_transport",
         "//tpu_sync/transport:block_transport_delegate",
         "//tpu_sync/transport:buffer_push_task",

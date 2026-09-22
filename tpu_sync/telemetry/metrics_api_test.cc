@@ -209,6 +209,67 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kBufferAllocatedBytes.type, MetricType::kGauge);
   EXPECT_THAT(metric_metadata::kBufferAllocatedBytes.label_names, IsEmpty());
 
+  // Weight Sync Metrics
+  EXPECT_EQ(metric_names::kWeightSyncSentBytesTotal,
+            "weight_sync_sent_bytes_total");
+  EXPECT_EQ(metric_metadata::kWeightSyncSentBytesTotal.type,
+            MetricType::kCounter);
+
+  EXPECT_EQ(metric_names::kWeightSyncReceivedBytesTotal,
+            "weight_sync_received_bytes_total");
+  EXPECT_EQ(metric_metadata::kWeightSyncReceivedBytesTotal.type,
+            MetricType::kCounter);
+
+  EXPECT_EQ(metric_names::kWeightSyncTransferFailuresTotal,
+            "weight_sync_transfer_failures_total");
+  EXPECT_EQ(metric_metadata::kWeightSyncTransferFailuresTotal.type,
+            MetricType::kCounter);
+
+  EXPECT_EQ(metric_names::kWeightSyncP2pTransferTimeMs,
+            "weight_sync_p2p_transfer_time_ms");
+  EXPECT_EQ(metric_metadata::kWeightSyncP2pTransferTimeMs.type,
+            MetricType::kHistogram);
+
+  EXPECT_EQ(metric_names::kWeightSyncH2dTransferTimeMs,
+            "weight_sync_h2d_transfer_time_ms");
+  EXPECT_EQ(metric_metadata::kWeightSyncH2dTransferTimeMs.type,
+            MetricType::kHistogram);
+
+  EXPECT_EQ(metric_names::kWeightSyncD2hTransferTimeMs,
+            "weight_sync_d2h_transfer_time_ms");
+  EXPECT_EQ(metric_metadata::kWeightSyncD2hTransferTimeMs.type,
+            MetricType::kHistogram);
+
+  EXPECT_EQ(metric_names::kWeightSyncTilingTimeMs,
+            "weight_sync_tiling_time_ms");
+  EXPECT_EQ(metric_metadata::kWeightSyncTilingTimeMs.type,
+            MetricType::kHistogram);
+
+  EXPECT_EQ(metric_names::kWeightSyncDetilingTimeMs,
+            "weight_sync_detiling_time_ms");
+  EXPECT_EQ(metric_metadata::kWeightSyncDetilingTimeMs.type,
+            MetricType::kHistogram);
+
+  EXPECT_EQ(metric_names::kWeightSyncPushDurationMs,
+            "weight_sync_push_duration_ms");
+  EXPECT_EQ(metric_metadata::kWeightSyncPushDurationMs.type,
+            MetricType::kHistogram);
+
+  EXPECT_EQ(metric_names::kWeightSyncScheduleGenerationTimeMs,
+            "weight_sync_schedule_generation_time_ms");
+  EXPECT_EQ(metric_metadata::kWeightSyncScheduleGenerationTimeMs.type,
+            MetricType::kHistogram);
+
+  EXPECT_EQ(metric_names::kWeightSyncE2eBroadcastDurationMs,
+            "weight_sync_e2e_broadcast_duration_ms");
+  EXPECT_EQ(metric_metadata::kWeightSyncE2eBroadcastDurationMs.type,
+            MetricType::kHistogram);
+
+  EXPECT_EQ(metric_names::kWeightSyncBufferAllocatedBytes,
+            "weight_sync_buffer_allocated_bytes");
+  EXPECT_EQ(metric_metadata::kWeightSyncBufferAllocatedBytes.type,
+            MetricType::kGauge);
+
   // Direction Labels
   EXPECT_EQ(metric_labels::kDirection, "direction");
   EXPECT_EQ(metric_labels::kDirectionPush, "push");
@@ -219,15 +280,28 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_labels::kErrorCode, "error_code");
 
   // All Metrics
-  EXPECT_THAT(metric_metadata::kAllMetrics,
-              ElementsAre(metric_metadata::kSentBytesTotal,
-                          metric_metadata::kReceivedBytesTotal,
-                          metric_metadata::kTransferFailuresTotal,
-                          metric_metadata::kTransferDurationMs,
-                          metric_metadata::kP2pTransferTimeMs,
-                          metric_metadata::kH2dTransferTimeMs,
-                          metric_metadata::kD2hTransferTimeMs,
-                          metric_metadata::kBufferAllocatedBytes));
+  EXPECT_THAT(
+      metric_metadata::kAllMetrics,
+      ElementsAre(metric_metadata::kSentBytesTotal,
+                  metric_metadata::kReceivedBytesTotal,
+                  metric_metadata::kTransferFailuresTotal,
+                  metric_metadata::kTransferDurationMs,
+                  metric_metadata::kP2pTransferTimeMs,
+                  metric_metadata::kH2dTransferTimeMs,
+                  metric_metadata::kD2hTransferTimeMs,
+                  metric_metadata::kBufferAllocatedBytes,
+                  metric_metadata::kWeightSyncSentBytesTotal,
+                  metric_metadata::kWeightSyncReceivedBytesTotal,
+                  metric_metadata::kWeightSyncTransferFailuresTotal,
+                  metric_metadata::kWeightSyncP2pTransferTimeMs,
+                  metric_metadata::kWeightSyncD2hTransferTimeMs,
+                  metric_metadata::kWeightSyncH2dTransferTimeMs,
+                  metric_metadata::kWeightSyncPushDurationMs,
+                  metric_metadata::kWeightSyncE2eBroadcastDurationMs,
+                  metric_metadata::kWeightSyncBufferAllocatedBytes,
+                  metric_metadata::kWeightSyncTilingTimeMs,
+                  metric_metadata::kWeightSyncDetilingTimeMs,
+                  metric_metadata::kWeightSyncScheduleGenerationTimeMs));
 }
 
 TEST_F(MetricsApiTest, FastPathExitWhenNoBackends) {
@@ -358,14 +432,8 @@ TEST_F(MetricsApiTest, GetMetricMetadataReturnsAllMetricsWhenBackendsActive) {
   store_.SetBackends(std::move(backends));
 
   std::vector<MetricMetadata> result = store_.GetMetricMetadata();
-  EXPECT_THAT(result, ElementsAre(metric_metadata::kSentBytesTotal,
-                                  metric_metadata::kReceivedBytesTotal,
-                                  metric_metadata::kTransferFailuresTotal,
-                                  metric_metadata::kTransferDurationMs,
-                                  metric_metadata::kP2pTransferTimeMs,
-                                  metric_metadata::kH2dTransferTimeMs,
-                                  metric_metadata::kD2hTransferTimeMs,
-                                  metric_metadata::kBufferAllocatedBytes));
+  EXPECT_THAT(result,
+              ::testing::ElementsAreArray(metric_metadata::kAllMetrics));
 }
 
 TEST_F(MetricsApiTest, GetMetricMetadataEmptyWhenNoBackends) {

@@ -18,8 +18,22 @@ from typing import Any, Dict, List, Optional, Union
 
 import jax
 
+from tpu_sync.api import common
+
 # Import Nanobind binary library directly E2E!
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _weight_synchronizer
+
+common.register_telemetry_callbacks(
+    increment_counter=_weight_synchronizer.increment_counter,
+    set_gauge=_weight_synchronizer.set_gauge,
+    observe_histogram=_weight_synchronizer.observe_histogram,
+)
+
+configure_telemetry = _weight_synchronizer.configure_telemetry
+get_and_reset_metric_samples = _weight_synchronizer.get_and_reset_metric_samples
+get_raiden_metrics_prometheus_text = (
+    _weight_synchronizer.get_raiden_metrics_prometheus_text
+)
 
 
 class WeightSynchronizer:
@@ -302,6 +316,21 @@ class WeightSynchronizer:
   def reset_metrics(self) -> None:
     """Resets all recorded internal metrics."""
     self._impl.reset_metrics()
+
+  @classmethod
+  def configure_telemetry(cls, backends: Optional[List[str]] = None) -> None:
+    """Configures active C++ telemetry backends."""
+    _weight_synchronizer.configure_telemetry(backends)
+
+  @classmethod
+  def get_and_reset_metric_samples(cls) -> Dict[str, List[float]]:
+    """Extracts and resets buffered telemetry metric samples across all backends."""
+    return _weight_synchronizer.get_and_reset_metric_samples()
+
+  @classmethod
+  def get_raiden_metrics_prometheus_text(cls) -> str:
+    """Exports Prometheus text snapshot of TPU Raiden metrics."""
+    return _weight_synchronizer.get_raiden_metrics_prometheus_text()
 
   def shutdown(self) -> None:
     """Releases and shuts down the underlying C++ synchronizer instance."""

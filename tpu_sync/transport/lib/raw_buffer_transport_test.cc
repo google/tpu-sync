@@ -44,6 +44,8 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
+#include "tpu_sync/telemetry/metrics_api.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
@@ -1032,6 +1034,48 @@ TEST_P(RawBufferTransportTest, ConcurrentBatchesTriggerEachLayerExactlyOnce) {
               UnorderedElementsAreArray(expected_triggers));
   EXPECT_THAT(dst.DataSpan(0, kNumChunks),
               Pointwise(Eq(), absl::MakeConstSpan(payload)));
+}
+
+TEST_P(RawBufferTransportTest, TelemetryRecordsSentReceivedAndP2pMetrics) {
+  ASSERT_OK(telemetry::RaidenMetricStore::GetGlobalMetricStore()
+                .InitializeFromBackendNames({"buffered"}));
+
+  constexpr size_t kNumChunks = 10;
+  RawMockDelegate src(kNumChunks);
+  RawMockDelegate dst(kNumChunks);
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  BindControlChannels(&src_transport, &src, &dst_transport, &dst);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const std::string dst_addr = GetIpPort(dst_transport);
+  std::vector<uint8_t> payload(kNumChunks);
+  RandomNonZero(absl::MakeSpan(payload));
+  std::vector<size_t> layer_ids(kNumChunks, 0);
+
+  constexpr uint64_t kUuid = 777888;
+  ASSERT_OK(dst_transport.RegisterExpectedChunks(kUuid, kNumChunks));
+
+  const auto push_res = src_transport.PushBuffers(
+      MakeSingleBytePushTasks(dst_addr, layer_ids, payload),
+      /*parallelism=*/1, kUuid);
+  ASSERT_OK(push_res) << push_res.message();
+
+  ASSERT_TRUE(dst.WaitForDataReceived(kNotificationTimeout));
+
+  auto samples = telemetry::RaidenMetricStore::GetGlobalMetricStore()
+                     .GetAndResetMetricSamples();
+  EXPECT_FALSE(
+      samples[std::string("tpu_raiden_") +
+              std::string(telemetry::metric_names::kWeightSyncSentBytesTotal)]
+          .empty());
+  EXPECT_FALSE(
+      samples[std::string("tpu_raiden_") +
+              std::string(
+                  telemetry::metric_names::kWeightSyncReceivedBytesTotal)]
+          .empty());
+
+  telemetry::RaidenMetricStore::GetGlobalMetricStore().SetBackends({});
 }
 
 INSTANTIATE_TEST_SUITE_P(

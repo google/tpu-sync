@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_WEIGHT_SYNC_WEIGHT_SYNCHRONIZER_BASE_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_WEIGHT_SYNC_WEIGHT_SYNCHRONIZER_BASE_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -225,8 +226,9 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   absl::StatusOr<raiden::PjRtCopyFuture> H2dLayer(size_t layer_idx,
                                                   uint64_t uuid = 0);
   virtual absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
-  absl::StatusOr<raiden::PjRtCopyFuture> D2hLayer(size_t layer_idx,
-                                                  uint64_t uuid = 0);
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hLayer(
+      size_t layer_idx, uint64_t uuid = 0,
+      std::shared_ptr<std::atomic<double>> max_detile_ms = nullptr);
 
   // Binds new device buffers to the weight synchronizer in-place.
   //
@@ -398,6 +400,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       ABSL_GUARDED_BY(completed_transfers_mu_);
 
   std::optional<size_t> pipeline_group_size_override_;
+  void UpdateAllocatedOccupancyMetric(size_t delta = 0);
+  std::atomic<size_t> allocated_host_dram_bytes_{0};
 };
 
 }  // namespace weight_sync

@@ -37,6 +37,7 @@
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_utils.h"
+#include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/test_only_rate_limiter.h"
@@ -92,6 +93,7 @@ RaidenManagerBase::RaidenManagerBase(size_t num_layers, size_t num_shards,
       local_port_cfg_(local_port.value_or(0)),
       bind_ip_cfg_(bind_ip) {
   shard_factor_ = 1;
+  (void)telemetry::RaidenMetricStore::GetGlobalMetricStore();
 }
 
 RaidenManagerBase::~RaidenManagerBase() {

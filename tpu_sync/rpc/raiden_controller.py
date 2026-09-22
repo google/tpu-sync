@@ -23,11 +23,13 @@ import math
 import os
 import random
 import threading
+import time
 import typing
 from typing import Any, Optional
 
 from absl import logging
 
+from tpu_sync.api import common
 from tpu_sync.api.common import RaidenId
 from tpu_sync.common.control_pipe import control_pipe_client
 from tpu_sync.kv_cache import nd_slice_math
@@ -2280,6 +2282,7 @@ class RaidenController:
       uuid: Any = "",
   ) -> _CachedTransferSchedule:
     """Computes transfer schedule math and returns a _CachedTransferSchedule."""
+    t_start = time.perf_counter()
     if group_size <= 0:
       raise ValueError("group_size must be positive")
     # 1. Retrieve destination metadata (either from remote dst_controller
@@ -2900,6 +2903,11 @@ class RaidenController:
           if d_node and d_node not in direct_dsts:
             direct_dsts.append(d_node)
 
+    common.record_histogram(
+        "weight_sync_schedule_generation_time_ms",
+        (time.perf_counter() - t_start) * 1000.0,
+    )
+
     return _CachedTransferSchedule(
         computed_schedules=computed_schedules,
         direct_schedules=direct_schedules,
@@ -3287,7 +3295,9 @@ class RaidenController:
       with self._lock:
         self._active_transfers[req_id] = plan
 
-    async def _execute_transfer() -> None:
+    t_transfer_start = time.perf_counter()
+
+    async def _execute_transfer_inner() -> None:
       nonlocal skip_d2h, expected_block_count
       if use_block_chunks:
         # === NEW SYMMETRIC DECENTRALIZED WORKFLOW ===
@@ -3654,6 +3664,22 @@ class RaidenController:
             self.worker_rpc_client.start_transfer(unit, old_plan)
             for unit in old_plan.src_units
         ])
+
+    async def _execute_transfer() -> None:
+      try:
+        await _execute_transfer_inner()
+        if is_sender:
+          common.record_histogram(
+              "weight_sync_e2e_broadcast_duration_ms",
+              (time.perf_counter() - t_transfer_start) * 1000.0,
+          )
+      except Exception:
+        common.record_counter(
+            "weight_sync_transfer_failures_total",
+            1,
+            {"error_code": "INTERNAL", "direction": "push"},
+        )
+        raise
 
     def _on_transfer_done():
       with self._lock:

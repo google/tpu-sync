@@ -112,6 +112,41 @@ class CommonApiTest(absltest.TestCase):
     self.assertEqual(BlockStatus.HOST_AND_HBM.value, 4)
     self.assertEqual(BlockStatus.SHARED_STORAGE.value, 5)
 
+  def test_telemetry_callbacks_registration_and_recording(self):
+    from tpu_sync.api import common  # pylint: disable=g-import-not-at-top
+
+    recorded_counters = []
+    recorded_gauges = []
+    recorded_histograms = []
+
+    def mock_inc(name, val, labels):
+      recorded_counters.append((name, val, labels))
+
+    def mock_gauge(name, val, labels):
+      recorded_gauges.append((name, val, labels))
+
+    def mock_hist(name, val, labels):
+      recorded_histograms.append((name, val, labels))
+
+    common.register_telemetry_callbacks(
+        increment_counter=mock_inc,
+        set_gauge=mock_gauge,
+        observe_histogram=mock_hist,
+    )
+
+    self.assertIsNotNone(common.get_telemetry_callbacks())
+
+    common.record_counter("test_counter", 5, {"tag": "foo"})
+    self.assertEqual(recorded_counters, [("test_counter", 5, {"tag": "foo"})])
+
+    common.record_gauge("test_gauge", 42.5)
+    self.assertEqual(recorded_gauges, [("test_gauge", 42.5, {})])
+
+    common.record_histogram("test_hist", 123.4, {"layer": "0"})
+    self.assertEqual(
+        recorded_histograms, [("test_hist", 123.4, {"layer": "0"})]
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

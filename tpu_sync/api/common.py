@@ -16,6 +16,7 @@
 
 import dataclasses
 import enum
+from typing import Callable, Mapping, NamedTuple, Optional
 
 
 @dataclasses.dataclass(unsafe_hash=True, slots=True)
@@ -52,3 +53,67 @@ class BlockStatus(enum.Enum):
       4  # Resident in both local Host DRAM and TPU HBM device memory.
   )
   SHARED_STORAGE = 5  # Resident in shared persistent secondary storage.
+
+
+class TelemetryCallbacks(NamedTuple):
+  """Container for registered telemetry hooks."""
+
+  increment_counter: Callable[..., None]
+  set_gauge: Callable[..., None]
+  observe_histogram: Callable[..., None]
+
+
+_telemetry_callbacks: Optional[TelemetryCallbacks] = None
+
+
+def register_telemetry_callbacks(
+    increment_counter: Callable[..., None],
+    set_gauge: Callable[..., None],
+    observe_histogram: Callable[..., None],
+) -> None:
+  """Registers global telemetry callbacks for Python instrumentation."""
+  global _telemetry_callbacks
+  _telemetry_callbacks = TelemetryCallbacks(
+      increment_counter=increment_counter,
+      set_gauge=set_gauge,
+      observe_histogram=observe_histogram,
+  )
+
+
+def get_telemetry_callbacks() -> Optional[TelemetryCallbacks]:
+  """Returns the currently registered telemetry callbacks, if any."""
+  return _telemetry_callbacks
+
+
+def record_counter(
+    name: str,
+    val: int = 1,
+    labels: Optional[Mapping[str, str]] = None,
+) -> None:
+  """Records a counter metric via registered telemetry callbacks if available."""
+  if _telemetry_callbacks is not None:
+    _telemetry_callbacks.increment_counter(
+        name, val, dict(labels) if labels else {}
+    )
+
+
+def record_gauge(
+    name: str,
+    val: float,
+    labels: Optional[Mapping[str, str]] = None,
+) -> None:
+  """Records a gauge metric via registered telemetry callbacks if available."""
+  if _telemetry_callbacks is not None:
+    _telemetry_callbacks.set_gauge(name, val, dict(labels) if labels else {})
+
+
+def record_histogram(
+    name: str,
+    val: float,
+    labels: Optional[Mapping[str, str]] = None,
+) -> None:
+  """Records a histogram metric via registered telemetry callbacks if available."""
+  if _telemetry_callbacks is not None:
+    _telemetry_callbacks.observe_histogram(
+        name, val, dict(labels) if labels else {}
+    )

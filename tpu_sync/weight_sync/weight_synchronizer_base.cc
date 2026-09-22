@@ -15,6 +15,7 @@
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -56,6 +57,8 @@
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/telemetry/metrics_api.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/weight_sync/tiling_utils.h"
@@ -67,6 +70,10 @@ ABSL_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size, 256 * 1024,
 
 namespace tpu_raiden {
 namespace weight_sync {
+
+namespace {
+static std::atomic<size_t> global_allocated_host_dram_bytes_{0};
+}  // namespace
 
 WeightSynchronizerBase::WeightSynchronizerBase(
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -219,6 +226,16 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   for (size_t i = 0; i < num_shards_; ++i) {
     tiled_scratchpads_.push_back(std::make_unique<ShardScratchpad>());
   }
+
+  size_t init_host_bytes = 0;
+  for (const auto& layer : layers_) {
+    for (const auto& shard : layer.shards) {
+      init_host_bytes += shard.host_size;
+    }
+  }
+  if (init_host_bytes > 0) {
+    UpdateAllocatedOccupancyMetric(init_host_bytes);
+  }
 }
 
 WeightSynchronizerBase::WeightSynchronizerBase(
@@ -304,6 +321,16 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   for (size_t i = 0; i < num_shards_; ++i) {
     tiled_scratchpads_.push_back(std::make_unique<ShardScratchpad>());
   }
+
+  size_t init_host_bytes = 0;
+  for (const auto& layer : layers_) {
+    for (const auto& shard : layer.shards) {
+      init_host_bytes += shard.host_size;
+    }
+  }
+  if (init_host_bytes > 0) {
+    UpdateAllocatedOccupancyMetric(init_host_bytes);
+  }
 }
 
 std::optional<int> WeightSynchronizerBase::listener_port() const {
@@ -352,6 +379,17 @@ WeightSynchronizerBase::~WeightSynchronizerBase() {
       }
     }
   }
+  size_t instance_bytes =
+      allocated_host_dram_bytes_.exchange(0, std::memory_order_relaxed);
+  if (instance_bytes > 0) {
+    size_t prev_total = global_allocated_host_dram_bytes_.fetch_sub(
+        instance_bytes, std::memory_order_relaxed);
+    size_t total =
+        (prev_total >= instance_bytes) ? (prev_total - instance_bytes) : 0;
+    telemetry::RaidenMetricStore::GetGlobalMetricStore().SetGauge(
+        telemetry::metric_names::kWeightSyncBufferAllocatedBytes, {},
+        static_cast<double>(total));
+  }
 }
 
 size_t WeightSynchronizerBase::GetPipelineGroupSize() const {
@@ -374,6 +412,7 @@ absl::StatusOr<uint8_t*> WeightSynchronizerBase::AcquireTiledScratchpadLocked(
     TF_RETURN_IF_ERROR(sp.in_flight_future.Await());
   }
   if (sp.capacity < required_bytes) {
+    const size_t old_capacity = sp.capacity;
     sp.ptr = nullptr;
     sp.owner.reset();
     sp.owned_buffer.reset();
@@ -398,8 +437,21 @@ absl::StatusOr<uint8_t*> WeightSynchronizerBase::AcquireTiledScratchpadLocked(
       sp.ptr = sp.owned_buffer.get();
       sp.capacity = required_bytes;
     }
+    if (required_bytes > old_capacity) {
+      UpdateAllocatedOccupancyMetric(required_bytes - old_capacity);
+    }
   }
   return sp.ptr;
+}
+
+void WeightSynchronizerBase::UpdateAllocatedOccupancyMetric(size_t delta) {
+  allocated_host_dram_bytes_ += delta;
+  size_t total = global_allocated_host_dram_bytes_.fetch_add(
+                     delta, std::memory_order_relaxed) +
+                 delta;
+  telemetry::RaidenMetricStore::GetGlobalMetricStore().SetGauge(
+      telemetry::metric_names::kWeightSyncBufferAllocatedBytes, {},
+      static_cast<double>(total));
 }
 
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
@@ -510,6 +562,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
   if (buffer_holds_.empty()) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
+  const auto start_time = absl::Now();
   VLOG(1) << "Starting H2d across " << num_layers_ << " layers (uuid=" << uuid
           << ")...";
   {
@@ -526,11 +579,34 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
   }
   VLOG(1) << "Done with scheduling H2d across " << num_layers_
           << " layers (uuid=" << uuid << ").";
-  return raiden::JoinPjRtCopyFutures(layer_futures);
+  raiden::PjRtCopyFuture joined = raiden::JoinPjRtCopyFutures(layer_futures);
+  auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (store.HasBackends()) {
+    double tiling_time_ms = 0.0;
+    {
+      absl::MutexLock lock(metrics_mu_);
+      tiling_time_ms = metrics_.last_tiling_time_ms;
+    }
+    joined.OnReady([start_time, tiling_time_ms](const auto& result) {
+      if (result.ok()) {
+        auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+        store.ObserveHistogram(
+            telemetry::metric_names::kWeightSyncH2dTransferTimeMs, {},
+            absl::ToDoubleMilliseconds(absl::Now() - start_time));
+        if (tiling_time_ms > 0.0) {
+          store.ObserveHistogram(
+              telemetry::metric_names::kWeightSyncTilingTimeMs, {},
+              tiling_time_ms);
+        }
+      }
+    });
+  }
+  return joined;
 }
 
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
-    size_t layer_idx, uint64_t uuid) {
+    size_t layer_idx, uint64_t uuid,
+    std::shared_ptr<std::atomic<double>> max_detile_ms) {
   if (buffer_holds_.empty() || layer_idx >= num_layers_) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
@@ -602,9 +678,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
       xla::Future<> copy_future =
           shard_hold.CopyRawDeviceToHost(tiled_buffer_ptr, 0, physical_bytes);
 
-      xla::Future<> detile_future = copy_future.Map(
-          [this, tiled_buffer_ptr, dst_host_ptr, shape = shard_hold.shape,
-           layout = *xla_layout, physical_bytes]() -> absl::Status {
+      xla::Future<> detile_future =
+          copy_future.Map([this, tiled_buffer_ptr, dst_host_ptr,
+                           shape = shard_hold.shape, layout = *xla_layout,
+                           physical_bytes, max_detile_ms]() -> absl::Status {
             auto detile_start = absl::Now();
             absl::Status status = tpu_raiden::weight_sync::DetileBuffer(
                 tiled_buffer_ptr, dst_host_ptr, shape, layout,
@@ -612,6 +689,14 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
             double detile_time_ms =
                 absl::ToDoubleMilliseconds(absl::Now() - detile_start);
             if (status.ok()) {
+              if (max_detile_ms != nullptr) {
+                double current = max_detile_ms->load(std::memory_order_relaxed);
+                while (
+                    detile_time_ms > current &&
+                    !max_detile_ms->compare_exchange_weak(
+                        current, detile_time_ms, std::memory_order_relaxed)) {
+                }
+              }
               absl::MutexLock metrics_lock(metrics_mu_);
               metrics_.last_detiling_time_ms =
                   std::max(metrics_.last_detiling_time_ms, detile_time_ms);
@@ -642,6 +727,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2h(
   if (buffer_holds_.empty()) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
+  const auto start_time = absl::Now();
   VLOG(1) << "Starting D2h across " << num_layers_ << " layers (uuid=" << uuid
           << ")...";
   {
@@ -649,15 +735,36 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2h(
     metrics_.last_detiling_time_ms = 0.0;
     metrics_.last_detiled_bytes = 0;
   }
+  auto max_detile_ms = std::make_shared<std::atomic<double>>(0.0);
   std::vector<raiden::PjRtCopyFuture> layer_futures;
   layer_futures.reserve(num_layers_);
   for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
-    TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture f, D2hLayer(layer_idx, uuid));
+    TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture f,
+                        D2hLayer(layer_idx, uuid, max_detile_ms));
     layer_futures.push_back(std::move(f));
   }
   VLOG(1) << "Done with scheduling D2h across " << num_layers_
           << " layers (uuid=" << uuid << ").";
-  return raiden::JoinPjRtCopyFutures(layer_futures);
+  raiden::PjRtCopyFuture joined = raiden::JoinPjRtCopyFutures(layer_futures);
+  auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (store.HasBackends()) {
+    joined.OnReady([start_time, max_detile_ms](const auto& result) {
+      if (result.ok()) {
+        auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+        store.ObserveHistogram(
+            telemetry::metric_names::kWeightSyncD2hTransferTimeMs, {},
+            absl::ToDoubleMilliseconds(absl::Now() - start_time));
+        double detiling_time_ms =
+            max_detile_ms->load(std::memory_order_relaxed);
+        if (detiling_time_ms > 0.0) {
+          store.ObserveHistogram(
+              telemetry::metric_names::kWeightSyncDetilingTimeMs, {},
+              detiling_time_ms);
+        }
+      }
+    });
+  }
+  return joined;
 }
 
 absl::Status WeightSynchronizerBase::PushWeights(
@@ -929,6 +1036,7 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   size_t total_h2h_bytes = 0;
   size_t total_d2h_bytes = 0;
   double first_d2h_time_ms = 0.0;
+  absl::Time last_d2h_done_time = d2h_start;
 
   size_t pipeline_group_size = GetPipelineGroupSize();
   size_t group_size =
@@ -951,9 +1059,10 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       }
       if (!request.skip_d2h() && !already_completed) {
         TF_RETURN_IF_ERROR(d2h_layer_futures[l].Await());
+        last_d2h_done_time = absl::Now();
         if (l == 0) {
           first_d2h_time_ms =
-              absl::ToDoubleMilliseconds(absl::Now() - d2h_start);
+              absl::ToDoubleMilliseconds(last_d2h_done_time - d2h_start);
         }
       }
       const auto& layer_tasks = tasks_by_layer[l];
@@ -985,6 +1094,7 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
 
   double total_push_time_ms =
       absl::ToDoubleMilliseconds(absl::Now() - push_start);
+  double last_detiling_time_ms = 0.0;
   {
     absl::MutexLock lock(metrics_mu_);
     std::move(h2h_window_cleanup).Cancel();
@@ -1008,6 +1118,24 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     metrics_.last_h2h_bytes = total_h2h_bytes;
     metrics_.last_total_push_resharded_time_ms = total_push_time_ms;
     metrics_.push_resharded_call_count++;
+    last_detiling_time_ms = metrics_.last_detiling_time_ms;
+  }
+  auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (store.HasBackends()) {
+    if (!request.skip_d2h() && !already_completed) {
+      double total_d2h_time_ms =
+          absl::ToDoubleMilliseconds(last_d2h_done_time - d2h_start);
+      store.ObserveHistogram(
+          telemetry::metric_names::kWeightSyncD2hTransferTimeMs, {},
+          total_d2h_time_ms);
+      if (last_detiling_time_ms > 0.0) {
+        store.ObserveHistogram(
+            telemetry::metric_names::kWeightSyncDetilingTimeMs, {},
+            last_detiling_time_ms);
+      }
+    }
+    store.ObserveHistogram(telemetry::metric_names::kWeightSyncPushDurationMs,
+                           {}, total_push_time_ms);
   }
   VLOG(1) << "Done with PushWeightsResharded (uuid=" << request.uuid()
           << ", total_push_time=" << total_push_time_ms
@@ -1195,10 +1323,21 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
   }
 
   double h2d_time_ms = absl::ToDoubleMilliseconds(absl::Now() - h2d_start);
+  double last_tiling_time_ms = 0.0;
   {
     absl::MutexLock lock(metrics_mu_);
     metrics_.last_h2d_time_ms = h2d_time_ms;
     metrics_.total_h2d_time_ms += h2d_time_ms;
+    last_tiling_time_ms = metrics_.last_tiling_time_ms;
+  }
+  auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (store.HasBackends()) {
+    store.ObserveHistogram(
+        telemetry::metric_names::kWeightSyncH2dTransferTimeMs, {}, h2d_time_ms);
+    if (last_tiling_time_ms > 0.0) {
+      store.ObserveHistogram(telemetry::metric_names::kWeightSyncTilingTimeMs,
+                             {}, last_tiling_time_ms);
+    }
   }
   record_completion();
   {

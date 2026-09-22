@@ -27,6 +27,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>  // NOLINT
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -50,6 +51,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/transport/buffer_push_task.h"
@@ -59,6 +61,9 @@
 #define IOV_MAX 1024
 #endif
 #include "absl/status/status_macros.h"
+#include "tpu_sync/telemetry/label_util.h"
+#include "tpu_sync/telemetry/metrics_api.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
@@ -74,8 +79,50 @@ using ::peregrine::ReadExact;
 using ::peregrine::ReadVExact;
 using ::peregrine::WriteExact;
 using ::peregrine::WriteVExact;
+using ::tpu_raiden::telemetry::ExtractFirstEndpointIp;
+using ::tpu_raiden::telemetry::MetricLabel;
+using ::tpu_raiden::telemetry::RaidenMetricStore;
+namespace metric_labels = ::tpu_raiden::telemetry::metric_labels;
+namespace metric_names = ::tpu_raiden::telemetry::metric_names;
 
 namespace {
+
+constexpr MetricLabel kPullResponseLabels[] = {
+    {.key = metric_labels::kDirection,
+     .value = metric_labels::kDirectionPullResponse},
+};
+
+void RecordWeightSyncP2pTransferTime(
+    RaidenMetricStore* store, std::chrono::steady_clock::time_point start_ts,
+    std::chrono::steady_clock::time_point end_ts, absl::string_view src_ip,
+    absl::string_view dst_ip) {
+  if (store == nullptr) return;
+  const absl::Duration duration = absl::FromChrono(end_ts - start_ts);
+  if (duration < absl::ZeroDuration()) return;
+  const double duration_ms = absl::ToDoubleMilliseconds(duration);
+  const MetricLabel p2p_labels[] = {
+      {.key = metric_labels::kSrcIp,
+       .value = src_ip.empty() ? metric_labels::kUnknownIp : src_ip},
+      {.key = metric_labels::kDstIp,
+       .value = dst_ip.empty() ? metric_labels::kUnknownIp : dst_ip},
+  };
+  store->ObserveHistogram(metric_names::kWeightSyncP2pTransferTimeMs,
+                          p2p_labels, duration_ms);
+}
+
+void RecordWeightSyncFailure(RaidenMetricStore* store,
+                             const absl::Status& status,
+                             absl::string_view direction) {
+  if (store == nullptr || status.ok()) return;
+  const absl::string_view error_code =
+      absl::StatusCodeToStringView(status.code());
+  const MetricLabel labels[] = {
+      {.key = metric_labels::kErrorCode, .value = error_code},
+      {.key = metric_labels::kDirection, .value = direction},
+  };
+  store->IncrementCounter(metric_names::kWeightSyncTransferFailuresTotal,
+                          labels, 1);
+}
 
 constexpr int kMaxPushThreads = 16;
 
@@ -171,7 +218,10 @@ RawBufferTransport::RawBufferTransport(
       local_port_(local_port),
       require_psp_tcp_(absl::GetFlag(FLAGS_require_psp_tcp)),
       server_fd_(-1),
-      stopping_(false) {
+      stopping_(false),
+      store_(RaidenMetricStore::GetGlobalMetricStore().HasBackends()
+                 ? &RaidenMetricStore::GetGlobalMetricStore()
+                 : nullptr) {
   // 1. Setup server listening socket.
   const absl::StatusOr<std::pair<int, int>> fd_port = CreateSocket(local_port_);
   if (!fd_port.ok()) {
@@ -250,6 +300,10 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     }
     uint8_t* const src_ptr = base_host_ptr + src_offset;
     ABSL_RETURN_IF_ERROR(WriteExact(client_fd, src_ptr, size_bytes));
+    if (size_bytes > 0 && store_ != nullptr) {
+      store_->IncrementCounter(metric_names::kWeightSyncSentBytesTotal, {},
+                               size_bytes);
+    }
     return absl::OkStatus();
 
   } else if (header.op == kOpBufferPush) {  // peer push request
@@ -267,6 +321,10 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     }
     uint8_t* const dest_ptr = base_host_ptr + dst_offset;
     ABSL_RETURN_IF_ERROR(ReadExact(client_fd, dest_ptr, size_bytes));
+    if (size_bytes > 0 && store_ != nullptr) {
+      store_->IncrementCounter(metric_names::kWeightSyncReceivedBytesTotal, {},
+                               size_bytes);
+    }
 
     TestOnlyRateLimiter* const limiter =
         test_only_ingress_rate_limiter_raw_.load(std::memory_order_relaxed);
@@ -364,6 +422,10 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
 
     if (total_bytes > 0) {
       ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, iovs));
+      if (store_ != nullptr) {
+        store_->IncrementCounter(metric_names::kWeightSyncReceivedBytesTotal,
+                                 {}, total_bytes);
+      }
     }
 
     TestOnlyRateLimiter* const limiter =
@@ -565,19 +627,34 @@ absl::Status RawBufferTransport::PullBuffer(
 absl::Status RawBufferTransport::ProcessSocketBufferPull(
     absl::string_view peer, const Request& request) {
   if (peer.empty()) {
-    return absl::InvalidArgumentError("Source peer address cannot be empty");
+    absl::Status status =
+        absl::InvalidArgumentError("Source peer address cannot be empty");
+    RecordWeightSyncFailure(store_, status, metric_labels::kDirectionPull);
+    return status;
   }
   // ChunkHeader wire protocol uses 32-bit fields for remote_id and
   // count_or_size; validate against uint32 max to prevent silent truncation on
   // the wire.
   if (request.remote_id > std::numeric_limits<uint32_t>::max()) {
-    return absl::InvalidArgumentError("Source offset exceeds uint32 max");
+    absl::Status status =
+        absl::InvalidArgumentError("Source offset exceeds uint32 max");
+    RecordWeightSyncFailure(store_, status, metric_labels::kDirectionPull);
+    return status;
   }
   if (request.len > std::numeric_limits<uint32_t>::max()) {
-    return absl::InvalidArgumentError("Pull size exceeds uint32 max");
+    absl::Status status =
+        absl::InvalidArgumentError("Pull size exceeds uint32 max");
+    RecordWeightSyncFailure(store_, status, metric_labels::kDirectionPull);
+    return status;
   }
 
-  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
+  auto conn_or = BorrowConnection(peer, bound_ip_);
+  if (!conn_or.ok()) {
+    RecordWeightSyncFailure(store_, conn_or.status(),
+                            metric_labels::kDirectionPull);
+    return conn_or.status();
+  }
+  const int fd = *conn_or;
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup(
       [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
@@ -591,13 +668,33 @@ absl::Status RawBufferTransport::ProcessSocketBufferPull(
   header.count_or_size = static_cast<uint32_t>(request.len);
 
   const auto s_header = SerializeChunkHeader(header);
-  ABSL_RETURN_IF_ERROR(WriteExact(fd, s_header.data(), s_header.size()));
+  const auto start_ts = std::chrono::steady_clock::now();
 
-  if (request.len > 0) {
-    if (request.laddr == nullptr) {
-      return absl::InvalidArgumentError("Destination host pointer is null");
+  auto pull_body = [&]() -> absl::Status {
+    ABSL_RETURN_IF_ERROR(WriteExact(fd, s_header.data(), s_header.size()));
+
+    if (request.len > 0) {
+      if (request.laddr == nullptr) {
+        return absl::InvalidArgumentError("Destination host pointer is null");
+      }
+      ABSL_RETURN_IF_ERROR(ReadExact(fd, request.laddr, request.len));
     }
-    ABSL_RETURN_IF_ERROR(ReadExact(fd, request.laddr, request.len));
+    return absl::OkStatus();
+  };
+
+  absl::Status status = pull_body();
+  if (!status.ok()) {
+    RecordWeightSyncFailure(store_, status, metric_labels::kDirectionPull);
+    return status;
+  }
+  const auto end_ts = std::chrono::steady_clock::now();
+
+  if (request.len > 0 && store_ != nullptr) {
+    store_->IncrementCounter(metric_names::kWeightSyncReceivedBytesTotal,
+                             kPullResponseLabels, request.len);
+    RecordWeightSyncP2pTransferTime(store_, start_ts, end_ts,
+                                    ExtractFirstEndpointIp({std::string(peer)}),
+                                    bound_ip_);
   }
 
   ok_to_pool = true;
@@ -666,29 +763,45 @@ absl::Status RawBufferTransport::RegisterExpectedLayerChunks(
 absl::Status RawBufferTransport::ProcessSocketBufferPush(
     absl::string_view peer, const Request& request) {
   if (peer.empty()) {
-    return absl::InvalidArgumentError(
-        "Destination peer address cannot be empty");
+    absl::Status status =
+        absl::InvalidArgumentError("Destination peer address cannot be empty");
+    RecordWeightSyncFailure(store_, status, metric_labels::kDirectionPush);
+    return status;
   }
 
   const uint8_t opcode = request.socket_opcode;
   const uint64_t uuid = request.uuid;
 
   if (opcode != kOpBufferPush) {
-    return absl::InvalidArgumentError(
+    absl::Status status = absl::InvalidArgumentError(
         absl::StrCat("Unsupported buffer push opcode: ", opcode));
+    RecordWeightSyncFailure(store_, status, metric_labels::kDirectionPush);
+    return status;
   }
 
   // ChunkHeader wire protocol uses 32-bit fields for remote_id and
   // count_or_size; validate against uint32 max to prevent silent truncation on
   // the wire.
   if (request.remote_id > std::numeric_limits<uint32_t>::max()) {
-    return absl::InvalidArgumentError("Destination offset exceeds uint32 max");
+    absl::Status status =
+        absl::InvalidArgumentError("Destination offset exceeds uint32 max");
+    RecordWeightSyncFailure(store_, status, metric_labels::kDirectionPush);
+    return status;
   }
   if (request.len > std::numeric_limits<uint32_t>::max()) {
-    return absl::InvalidArgumentError("Push size exceeds uint32 max");
+    absl::Status status =
+        absl::InvalidArgumentError("Push size exceeds uint32 max");
+    RecordWeightSyncFailure(store_, status, metric_labels::kDirectionPush);
+    return status;
   }
 
-  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
+  auto conn_or = BorrowConnection(peer, bound_ip_);
+  if (!conn_or.ok()) {
+    RecordWeightSyncFailure(store_, conn_or.status(),
+                            metric_labels::kDirectionPush);
+    return conn_or.status();
+  }
+  const int fd = *conn_or;
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup(
       [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
@@ -711,12 +824,32 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
       iovec(const_cast<char*>(s_header.data()), s_header.size()),
       iovec(request.laddr, request.len),
   };
-  ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
 
-  uint8_t ack = 0;
-  ABSL_RETURN_IF_ERROR(ReadExact(fd, &ack, 1));
-  if (ack != 1) {
-    return absl::InternalError("PushBuffer verification failed");
+  const auto start_ts = std::chrono::steady_clock::now();
+  auto send_body = [&]() -> absl::Status {
+    ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
+
+    uint8_t ack = 0;
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, &ack, 1));
+    if (ack != 1) {
+      return absl::InternalError("PushBuffer verification failed");
+    }
+    return absl::OkStatus();
+  };
+
+  absl::Status status = send_body();
+  if (!status.ok()) {
+    RecordWeightSyncFailure(store_, status, metric_labels::kDirectionPush);
+    return status;
+  }
+  const auto end_ts = std::chrono::steady_clock::now();
+
+  if (request.len > 0 && store_ != nullptr) {
+    store_->IncrementCounter(metric_names::kWeightSyncSentBytesTotal, {},
+                             request.len);
+    RecordWeightSyncP2pTransferTime(
+        store_, start_ts, end_ts, bound_ip_,
+        ExtractFirstEndpointIp({std::string(peer)}));
   }
 
   TestOnlyRateLimiter* const limiter =
@@ -879,14 +1012,22 @@ absl::Status RawBufferTransport::PushBuffers(
 absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
     absl::string_view peer, absl::Span<const Request> requests) {
   if (peer.empty()) {
-    return absl::InvalidArgumentError(
-        "Destination peer address cannot be empty");
+    absl::Status status =
+        absl::InvalidArgumentError("Destination peer address cannot be empty");
+    RecordWeightSyncFailure(store_, status, metric_labels::kDirectionPush);
+    return status;
   }
   if (requests.empty()) {
     return absl::OkStatus();
   }
 
-  ABSL_ASSIGN_OR_RETURN(const int fd, BorrowConnection(peer, bound_ip_));
+  auto conn_or = BorrowConnection(peer, bound_ip_);
+  if (!conn_or.ok()) {
+    RecordWeightSyncFailure(store_, conn_or.status(),
+                            metric_labels::kDirectionPush);
+    return conn_or.status();
+  }
+  const int fd = *conn_or;
   bool ok_to_pool = false;
   auto fd_cleaner = absl::MakeCleanup(
       [&] { ReturnConnection(ok_to_pool, fd, peer, bound_ip_); });
@@ -925,51 +1066,71 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
       iovec(const_cast<char*>(s_header.data()), s_header.size()),
       iovec(s_metadata_buf.data(), s_metadata_buf.size()),
   };
-  ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
 
-  if (coalesce_window_bytes_ > 0) {
-    // Coalesced path: pack and write
-    std::vector<uint8_t> pack_buf(total_bytes);
-    size_t pack_offset = 0;
-    for (size_t i = 0; i < batch_size; ++i) {
-      const auto& req = requests[i];
-      if (req.len > 0) {
-        if (req.laddr == nullptr) {
-          return absl::InvalidArgumentError(
-              "Null data pointer in batch push request");
+  const auto start_ts = std::chrono::steady_clock::now();
+  auto send_body = [&]() -> absl::Status {
+    ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
+
+    if (coalesce_window_bytes_ > 0) {
+      // Coalesced path: pack and write
+      std::vector<uint8_t> pack_buf(total_bytes);
+      size_t pack_offset = 0;
+      for (size_t i = 0; i < batch_size; ++i) {
+        const auto& req = requests[i];
+        if (req.len > 0) {
+          if (req.laddr == nullptr) {
+            return absl::InvalidArgumentError(
+                "Null data pointer in batch push request");
+          }
+          std::memcpy(pack_buf.data() + pack_offset, req.laddr, req.len);
+          pack_offset += req.len;
         }
-        std::memcpy(pack_buf.data() + pack_offset, req.laddr, req.len);
-        pack_offset += req.len;
+      }
+      ABSL_RETURN_IF_ERROR(WriteExact(fd, pack_buf.data(), total_bytes));
+    } else {
+      // Uncoalesced path: gather write (writev) directly from requests.
+      std::vector<struct iovec> iovs;
+      iovs.reserve(batch_size);
+      for (size_t i = 0; i < batch_size; ++i) {
+        const auto& req = requests[i];
+        if (req.len > 0) {
+          if (req.laddr == nullptr) {
+            return absl::InvalidArgumentError(
+                "Null data pointer in batch push request");
+          }
+          struct iovec iov;
+          iov.iov_base = req.laddr;
+          iov.iov_len = req.len;
+          iovs.push_back(iov);
+        }
+      }
+      if (!iovs.empty()) {
+        ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
       }
     }
-    ABSL_RETURN_IF_ERROR(WriteExact(fd, pack_buf.data(), total_bytes));
-  } else {
-    // Uncoalesced path: gather write (writev) directly from requests.
-    std::vector<struct iovec> iovs;
-    iovs.reserve(batch_size);
-    for (size_t i = 0; i < batch_size; ++i) {
-      const auto& req = requests[i];
-      if (req.len > 0) {
-        if (req.laddr == nullptr) {
-          return absl::InvalidArgumentError(
-              "Null data pointer in batch push request");
-        }
-        struct iovec iov;
-        iov.iov_base = req.laddr;
-        iov.iov_len = req.len;
-        iovs.push_back(iov);
-      }
+
+    uint8_t ack = 0;
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, &ack, 1));
+    if (ack != 1) {
+      return absl::InternalError(
+          "ProcessSocketBufferBatchPush verification failed");
     }
-    if (!iovs.empty()) {
-      ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
-    }
+    return absl::OkStatus();
+  };
+
+  absl::Status status = send_body();
+  if (!status.ok()) {
+    RecordWeightSyncFailure(store_, status, metric_labels::kDirectionPush);
+    return status;
   }
+  const auto end_ts = std::chrono::steady_clock::now();
 
-  uint8_t ack = 0;
-  ABSL_RETURN_IF_ERROR(ReadExact(fd, &ack, 1));
-  if (ack != 1) {
-    return absl::InternalError(
-        "ProcessSocketBufferBatchPush verification failed");
+  if (total_bytes > 0 && store_ != nullptr) {
+    store_->IncrementCounter(metric_names::kWeightSyncSentBytesTotal, {},
+                             total_bytes);
+    RecordWeightSyncP2pTransferTime(
+        store_, start_ts, end_ts, bound_ip_,
+        ExtractFirstEndpointIp({std::string(peer)}));
   }
 
   TestOnlyRateLimiter* const limiter =

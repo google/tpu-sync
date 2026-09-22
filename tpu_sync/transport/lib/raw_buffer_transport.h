@@ -38,6 +38,7 @@
 #include "grpcpp/channel.h"
 #include "tpu_sync/common/detached_thread_group.h"
 #include "tpu_sync/core/numa_thread_pool.h"
+#include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
@@ -220,6 +221,7 @@ class RawBufferTransport final {
       nullptr};
 
   std::thread listener_thread_;
+  telemetry::RaidenMetricStore* store_ = nullptr;
 };
 
 }  // namespace tpu_raiden::transport::lib

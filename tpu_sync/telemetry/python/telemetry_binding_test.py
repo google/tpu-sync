@@ -220,6 +220,78 @@ class TelemetryBindingTest(absltest.TestCase):
     self.assertEqual(metrics_by_name["d2h_transfer_time_ms"].label_names, [])
     self.assertEqual(metrics_by_name["buffer_allocated_bytes"].label_names, [])
 
+    # Verify weight sync metrics
+    self.assertEqual(len(metrics), 20)
+    self.assertEqual(
+        metrics_by_name["weight_sync_sent_bytes_total"].label_names, []
+    )
+    self.assertEqual(
+        metrics_by_name["weight_sync_received_bytes_total"].label_names, []
+    )
+    self.assertEqual(
+        metrics_by_name["weight_sync_transfer_failures_total"].label_names, []
+    )
+    self.assertEqual(
+        metrics_by_name["weight_sync_p2p_transfer_time_ms"].label_names, []
+    )
+    self.assertEqual(
+        metrics_by_name["weight_sync_h2d_transfer_time_ms"].label_names, []
+    )
+    self.assertEqual(
+        metrics_by_name["weight_sync_d2h_transfer_time_ms"].label_names, []
+    )
+    self.assertEqual(
+        metrics_by_name["weight_sync_tiling_time_ms"].label_names, []
+    )
+    self.assertEqual(
+        metrics_by_name["weight_sync_detiling_time_ms"].label_names, []
+    )
+    self.assertEqual(
+        metrics_by_name["weight_sync_push_duration_ms"].label_names, []
+    )
+    self.assertEqual(
+        metrics_by_name["weight_sync_schedule_generation_time_ms"].label_names,
+        [],
+    )
+    self.assertEqual(
+        metrics_by_name["weight_sync_e2e_broadcast_duration_ms"].label_names,
+        [],
+    )
+    self.assertEqual(
+        metrics_by_name["weight_sync_buffer_allocated_bytes"].label_names, []
+    )
+
+  def test_increment_counter_and_observe_in_buffered_backend(self):
+    telemetry_ext.configure_telemetry(["buffered"])
+    telemetry_ext.increment_counter("weight_sync_sent_bytes_total", 4096)
+    telemetry_ext.increment_counter("weight_sync_sent_bytes_total", 2048)
+    telemetry_ext.set_gauge("weight_sync_buffer_allocated_bytes", 1048576.0)
+    telemetry_ext.observe_histogram(
+        "weight_sync_p2p_transfer_time_ms", 12.5, {"direction": "push"}
+    )
+
+    samples = telemetry_ext.get_and_reset_metric_samples()
+    self.assertIn("tpu_raiden_weight_sync_sent_bytes_total", samples)
+    self.assertEqual(
+        sum(samples["tpu_raiden_weight_sync_sent_bytes_total"]), 6144
+    )
+    self.assertIn("tpu_raiden_weight_sync_buffer_allocated_bytes", samples)
+    self.assertEqual(
+        samples["tpu_raiden_weight_sync_buffer_allocated_bytes"][-1], 1048576.0
+    )
+    self.assertIn(
+        'tpu_raiden_weight_sync_p2p_transfer_time_ms{direction="push"}', samples
+    )
+    self.assertEqual(
+        samples[
+            'tpu_raiden_weight_sync_p2p_transfer_time_ms{direction="push"}'
+        ],
+        [12.5],
+    )
+
+    samples_after = telemetry_ext.get_and_reset_metric_samples()
+    self.assertEqual(samples_after, {})
+
   def test_get_metric_metadata_empty_when_no_backends(self):
     telemetry_ext.configure_telemetry([])
     metadata = telemetry_ext.get_metric_metadata()

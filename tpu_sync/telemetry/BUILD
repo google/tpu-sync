@@ -118,10 +118,10 @@ cc_library(
     hdrs = ["buffered_metrics_exporter.h"],
     deps = [
         ":exporter_util",
+        ":label_util",
         ":metrics_backend",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/container:inlined_vector",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
@@ -134,6 +134,7 @@ cc_test(
     srcs = ["buffered_metrics_exporter_test.cc"],
     deps = [
         ":buffered_metrics_exporter",
+        ":label_util",
         ":metrics_backend",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",

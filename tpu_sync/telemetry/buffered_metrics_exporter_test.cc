@@ -14,12 +14,14 @@
 
 #include "tpu_sync/telemetry/buffered_metrics_exporter.h"
 
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <string>
 #include <thread>  // NOLINT(build/c++11)
 #include <vector>
 
@@ -28,13 +30,17 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden::telemetry {
 namespace {
 
 using ::testing::ElementsAre;
+using ::testing::HasSubstr;
 using ::testing::IsEmpty;
+using ::testing::Not;
+using ::testing::Pair;
 
 // -----------------------------------------------------------------------------
 // QueueBuffer Tests
@@ -291,8 +297,7 @@ TEST(MetricFamilyBufferTest, ForEachAccumulatorTraversesUnlabeledAndLabeled) {
 
   std::map<std::string, uint64_t> visited;
   family_buffer.ForEachAccumulator(
-      [&](absl::string_view canonical_labels,
-          LockFreeCounterAccumulator* acc) {
+      [&](absl::string_view canonical_labels, LockFreeCounterAccumulator* acc) {
         visited[std::string(canonical_labels)] = acc->ExchangeAndReset();
       });
 
@@ -341,85 +346,63 @@ TEST(MetricFamilyBufferTest, ConcurrentGetOrCreateThreadSafe) {
   EXPECT_EQ(total, kExpectedTotal);
 }
 
-// -----------------------------------------------------------------------------
-// FormatCanonicalLabels Tests
-// -----------------------------------------------------------------------------
+TEST(MetricFamilyBufferTest, LargeLabelSetExceedingStackBuffer) {
+  MetricFamilyBuffer<LockFreeCounterAccumulator> family_buffer;
+  const std::string long_value(kDefaultPrometheusStackBufferSize + 64, 'x');
+  const MetricLabel label[] = {{"huge_key", long_value}};
+  LockFreeCounterAccumulator* first_accumulator =
+      family_buffer.GetOrCreate(label);
+  ASSERT_NE(first_accumulator, nullptr);
+  first_accumulator->Add(99);
 
-TEST(FormatCanonicalLabelsTest, EmptyLabelsReturnsEmptyString) {
-  EXPECT_EQ(FormatCanonicalLabels({}), "");
+  // Subsequent call finds existing accumulator via heap fallback path.
+  LockFreeCounterAccumulator* second_accumulator =
+      family_buffer.GetOrCreate(label);
+  EXPECT_EQ(first_accumulator, second_accumulator);
+  EXPECT_EQ(second_accumulator->ExchangeAndReset(), 99);
 }
 
-TEST(FormatCanonicalLabelsTest, SingleLabelFormattedCorrectly) {
-  MetricLabel label{"direction", "push"};
-  EXPECT_EQ(FormatCanonicalLabels(absl::MakeConstSpan(&label, 1)),
-            "{direction=\"push\"}");
+TEST(MetricFamilyBufferTest, ExactStackBufferCapacityBoundaries) {
+  MetricFamilyBuffer<LockFreeCounterAccumulator> family_buffer;
+  // 255 bytes (kDefaultPrometheusStackBufferSize - 1)
+  const std::string val_255(kDefaultPrometheusStackBufferSize - 7, 'a');
+  const MetricLabel label_255[] = {{"k", val_255}};
+  // 256 bytes (kDefaultPrometheusStackBufferSize, exact stack fit)
+  const std::string val_256(kDefaultPrometheusStackBufferSize - 6, 'b');
+  const MetricLabel label_256[] = {{"k", val_256}};
+  // 257 bytes (kDefaultPrometheusStackBufferSize + 1, minimal heap fallback)
+  const std::string val_257(kDefaultPrometheusStackBufferSize - 5, 'c');
+  const MetricLabel label_257[] = {{"k", val_257}};
+
+  LockFreeCounterAccumulator* acc_255 = family_buffer.GetOrCreate(label_255);
+  LockFreeCounterAccumulator* acc_256 = family_buffer.GetOrCreate(label_256);
+  LockFreeCounterAccumulator* acc_257 = family_buffer.GetOrCreate(label_257);
+
+  ASSERT_NE(acc_255, nullptr);
+  ASSERT_NE(acc_256, nullptr);
+  ASSERT_NE(acc_257, nullptr);
+  EXPECT_NE(acc_255, acc_256);
+  EXPECT_NE(acc_256, acc_257);
+  EXPECT_NE(acc_255, acc_257);
+
+  EXPECT_EQ(family_buffer.GetOrCreate(label_255), acc_255);
+  EXPECT_EQ(family_buffer.GetOrCreate(label_256), acc_256);
+  EXPECT_EQ(family_buffer.GetOrCreate(label_257), acc_257);
 }
 
-TEST(FormatCanonicalLabelsTest, MultipleLabelsSortedLexicographically) {
-  MetricLabel labels_order1[] = {
-      {"mode", "direct"},
-      {"direction", "pull"},
-  };
-  MetricLabel labels_order2[] = {
-      {"direction", "pull"},
-      {"mode", "direct"},
-  };
-  EXPECT_EQ(FormatCanonicalLabels(labels_order1),
-            "{direction=\"pull\",mode=\"direct\"}");
-  EXPECT_EQ(FormatCanonicalLabels(labels_order2),
-            "{direction=\"pull\",mode=\"direct\"}");
-}
+TEST(MetricFamilyBufferTest,
+     UnsortedMultiLabelSetExceedingStackBufferReturnsSameAccumulator) {
+  MetricFamilyBuffer<LockFreeCounterAccumulator> family_buffer;
+  const std::string long_value(kDefaultPrometheusStackBufferSize + 64, 'x');
+  const MetricLabel first_order[] = {{"z_key", long_value}, {"a_key", "val"}};
+  const MetricLabel second_order[] = {{"a_key", "val"}, {"z_key", long_value}};
 
-TEST(FormatCanonicalLabelsTest, EscapesSpecialCharactersInValues) {
-  MetricLabel label1{"msg", "hello \"world\""};
-  MetricLabel label2{"path", "C:\\new\\folder"};
-  MetricLabel label3{"multiline", "line1\nline2"};
-
-  EXPECT_EQ(FormatCanonicalLabels(absl::MakeConstSpan(&label1, 1)),
-            "{msg=\"hello \\\"world\\\"\"}");
-  EXPECT_EQ(FormatCanonicalLabels(absl::MakeConstSpan(&label2, 1)),
-            "{path=\"C:\\\\new\\\\folder\"}");
-  EXPECT_EQ(FormatCanonicalLabels(absl::MakeConstSpan(&label3, 1)),
-            "{multiline=\"line1\\nline2\"}");
-}
-
-TEST(FormatCanonicalLabelsTest, ExactInlinedCapacityBoundary) {
-  MetricLabel labels[] = {
-      {"d_label", "4"},
-      {"b_label", "2"},
-      {"a_label", "1"},
-      {"c_label", "3"},
-  };
-  EXPECT_EQ(FormatCanonicalLabels(labels),
-            "{a_label=\"1\",b_label=\"2\",c_label=\"3\",d_label=\"4\"}");
-}
-
-TEST(FormatCanonicalLabelsTest, EmptyValueFormattedCorrectly) {
-  MetricLabel label{"empty_key", ""};
-  EXPECT_EQ(FormatCanonicalLabels(absl::MakeConstSpan(&label, 1)),
-            "{empty_key=\"\"}");
-}
-
-TEST(FormatCanonicalLabelsTest, ExceedsInlinedCapacityCorrectly) {
-  MetricLabel labels[] = {
-      {"z_label", "6"}, {"e_label", "5"}, {"d_label", "4"},
-      {"c_label", "3"}, {"b_label", "2"}, {"a_label", "1"},
-  };
-  EXPECT_EQ(FormatCanonicalLabels(labels),
-            "{a_label=\"1\",b_label=\"2\",c_label=\"3\",d_label=\"4\",e_label=\"5\",z_label=\"6\"}");
-}
-
-TEST(FormatCanonicalLabelsTest, LongLabelsFormattedCorrectly) {
-  MetricLabel long_labels[] = {
-      {"extremely_long_label_key_number_one",
-       "extremely_long_label_value_number_one_exceeding_standard_sso"},
-      {"extremely_long_label_key_number_two",
-       "extremely_long_label_value_number_two_exceeding_standard_sso"},
-  };
-  EXPECT_EQ(
-      FormatCanonicalLabels(long_labels),
-      "{extremely_long_label_key_number_one=\"extremely_long_label_value_number_one_exceeding_standard_sso\","
-      "extremely_long_label_key_number_two=\"extremely_long_label_value_number_two_exceeding_standard_sso\"}");
+  LockFreeCounterAccumulator* first_accumulator =
+      family_buffer.GetOrCreate(first_order);
+  LockFreeCounterAccumulator* second_accumulator =
+      family_buffer.GetOrCreate(second_order);
+  ASSERT_NE(first_accumulator, nullptr);
+  EXPECT_EQ(first_accumulator, second_accumulator);
 }
 
 // -----------------------------------------------------------------------------
@@ -524,9 +507,9 @@ TEST(BufferedMetricsExporterTest, MultiDimensionalLabelsSortingInvariance) {
   exporter.IncrementCounter(metric_names::kTransferFailuresTotal, labels2, 2);
 
   auto samples = exporter.GetAndResetMetricSamples();
-  EXPECT_EQ(
-      samples["tpu_raiden_transfer_failures_total{direction=\"pull\",error_code=\"DEADLINE_EXCEEDED\"}"],
-      (std::vector<double>{3.0}));
+  EXPECT_EQ(samples["tpu_raiden_transfer_failures_total{direction=\"pull\","
+                    "error_code=\"DEADLINE_EXCEEDED\"}"],
+            (std::vector<double>{3.0}));
 }
 
 TEST(BufferedMetricsExporterTest, UnlabeledGaugesAndHistograms) {
@@ -580,10 +563,12 @@ TEST(BufferedMetricsExporterTest, LabeledGaugesAndHistograms) {
   EXPECT_EQ(samples["tpu_raiden_custom_gauge{type=\"b\"}"],
             (std::vector<double>{2048.0 * 1024.0}));
   EXPECT_EQ(
-      samples["tpu_raiden_custom_histogram{direction=\"pull\",mode=\"direct\"}"],
+      samples
+          ["tpu_raiden_custom_histogram{direction=\"pull\",mode=\"direct\"}"],
       (std::vector<double>{15.5}));
   EXPECT_EQ(
-      samples["tpu_raiden_custom_histogram{direction=\"pull\",mode=\"reshard\"}"],
+      samples
+          ["tpu_raiden_custom_histogram{direction=\"pull\",mode=\"reshard\"}"],
       (std::vector<double>{42.0}));
 }
 
@@ -688,6 +673,141 @@ TEST(BufferedMetricsExporterTest, ConcurrentLabeledEmissions) {
             (std::vector<double>{20000.0}));
   EXPECT_EQ(samples["tpu_raiden_sent_bytes_total{direction=\"pull\"}"],
             (std::vector<double>{20000.0}));
+}
+
+TEST(BufferedMetricsExporterTest, LargeLabelsExceedingStackBufferExport) {
+  BufferedMetricsExporter exporter;
+  const std::string long_value(kDefaultPrometheusStackBufferSize + 64, 'a');
+  const std::array<MetricLabel, 1> label = {
+      MetricLabel{.key = "long_param", .value = long_value},
+  };
+  exporter.IncrementCounter(metric_names::kSentBytesTotal, label, 500);
+
+  EXPECT_THAT(
+      exporter.GetAndResetMetricSamples(),
+      ElementsAre(Pair(absl::StrCat("tpu_raiden_sent_bytes_total{long_param=\"",
+                                    long_value, "\"}"),
+                       ElementsAre(500.0))));
+}
+
+TEST(BufferedMetricsExporterTest, SpecialCharactersEscapedInExportedLabels) {
+  BufferedMetricsExporter exporter;
+  const std::array<MetricLabel, 1> label = {
+      MetricLabel{.key = "query", .value = "line1\nline2\"quoted\"with\\slash"},
+  };
+  exporter.IncrementCounter(metric_names::kSentBytesTotal, label, 1);
+
+  EXPECT_THAT(
+      exporter.GetAndResetMetricSamples(),
+      ElementsAre(Pair("tpu_raiden_sent_bytes_total{"
+                       "query=\"line1\\nline2\\\"quoted\\\"with\\\\slash\"}",
+                       ElementsAre(1.0))));
+}
+
+// Valid empty label values ({key=""}) format as "{key=\"\"}" and must not be
+// dropped by the lookup_key.empty() guard.
+TEST(BufferedMetricsExporterTest, EmptyLabelValueExport) {
+  BufferedMetricsExporter exporter;
+  const std::array<MetricLabel, 1> label = {
+      MetricLabel{.key = "empty_key", .value = ""},
+  };
+  exporter.IncrementCounter(metric_names::kSentBytesTotal, label, 10);
+
+  EXPECT_THAT(exporter.GetAndResetMetricSamples(),
+              ElementsAre(Pair("tpu_raiden_sent_bytes_total{empty_key=\"\"}",
+                               ElementsAre(10.0))));
+}
+
+TEST(BufferedMetricsExporterTest,
+     UnsortedMultiLabelOverflowAggregatesIntoSingleSeries) {
+  BufferedMetricsExporter exporter;
+  const std::string long_value(kDefaultPrometheusStackBufferSize + 64, 'x');
+  const std::array<MetricLabel, 2> first_order = {
+      MetricLabel{.key = "z_key", .value = long_value},
+      MetricLabel{.key = "a_key", .value = "val"},
+  };
+  const std::array<MetricLabel, 2> second_order = {
+      MetricLabel{.key = "a_key", .value = "val"},
+      MetricLabel{.key = "z_key", .value = long_value},
+  };
+
+  exporter.IncrementCounter(metric_names::kSentBytesTotal, first_order, 100);
+  exporter.IncrementCounter(metric_names::kSentBytesTotal, second_order, 200);
+
+  EXPECT_THAT(
+      exporter.GetAndResetMetricSamples(),
+      ElementsAre(Pair(
+          absl::StrCat("tpu_raiden_sent_bytes_total{a_key=\"val\",z_key=\"",
+                       long_value, "\"}"),
+          ElementsAre(300.0))));
+}
+
+TEST(BufferedMetricsExporterTest,
+     UnsortedLabelsExceedingInlinedCapacitySortedAndAggregated) {
+  BufferedMetricsExporter exporter;
+  const std::array<MetricLabel, 10> descending = {{
+      {"k09", "v9"},
+      {"k08", "v8"},
+      {"k07", "v7"},
+      {"k06", "v6"},
+      {"k05", "v5"},
+      {"k04", "v4"},
+      {"k03", "v3"},
+      {"k02", "v2"},
+      {"k01", "v1"},
+      {"k00", "v0"},
+  }};
+  const std::array<MetricLabel, 10> ascending = {{
+      {"k00", "v0"},
+      {"k01", "v1"},
+      {"k02", "v2"},
+      {"k03", "v3"},
+      {"k04", "v4"},
+      {"k05", "v5"},
+      {"k06", "v6"},
+      {"k07", "v7"},
+      {"k08", "v8"},
+      {"k09", "v9"},
+  }};
+
+  exporter.IncrementCounter(metric_names::kSentBytesTotal, descending, 40);
+  exporter.IncrementCounter(metric_names::kSentBytesTotal, ascending, 60);
+
+  EXPECT_THAT(
+      exporter.GetAndResetMetricSamples(),
+      ElementsAre(Pair(
+          "tpu_raiden_sent_bytes_total{k00=\"v0\",k01=\"v1\",k02=\"v2\","
+          "k03=\"v3\",k04=\"v4\",k05=\"v5\",k06=\"v6\",k07=\"v7\",k08=\"v8\","
+          "k09=\"v9\"}",
+          ElementsAre(100.0))));
+}
+
+TEST(BufferedMetricsExporterTest, ExceededCapacityDropsMetricsWithoutCrashing) {
+  BufferedMetricsExporter exporter;
+  // Fill counter, gauge, and histogram families to kMaxLabeledSeries (512).
+  for (size_t i = 0; i < kMaxLabeledSeries; ++i) {
+    const std::string val = absl::StrCat(i);
+    const std::array<MetricLabel, 1> label = {
+        MetricLabel{.key = "k", .value = val},
+    };
+    exporter.IncrementCounter(metric_names::kSentBytesTotal, label, 1);
+    exporter.SetGauge(metric_names::kBufferAllocatedBytes, label, 1.0);
+    exporter.ObserveHistogram(metric_names::kTransferDurationMs, label, 1.0);
+  }
+
+  // The (kMaxLabeledSeries + 1)-th series forces GetOrCreate to return nullptr.
+  const std::array<MetricLabel, 1> overflow_label = {
+      MetricLabel{.key = "k", .value = "overflow"},
+  };
+  exporter.IncrementCounter(metric_names::kSentBytesTotal, overflow_label, 100);
+  exporter.SetGauge(metric_names::kBufferAllocatedBytes, overflow_label, 50.0);
+  exporter.ObserveHistogram(metric_names::kTransferDurationMs, overflow_label,
+                            99.0);
+
+  const auto samples = exporter.GetAndResetMetricSamples();
+  for (const auto& [metric_name, _] : samples) {
+    EXPECT_THAT(metric_name, Not(HasSubstr("overflow")));
+  }
 }
 
 }  // namespace

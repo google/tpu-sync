@@ -148,6 +148,7 @@ class KVCacheStore:
       raiden_controller_port: int = 0,
       expected_worker_count: int = 0,
       kv_pool_group: str = "",
+      secondary_backend_configs: Sequence[Any] = (),
   ):
     """Creates a KVCacheStore.
 
@@ -194,6 +195,9 @@ class KVCacheStore:
         RAIDEN_EXPECTED_WORKERS_TIMEOUT_S, default 120s).
       kv_pool_group: KV pool group this store's KVTransferSpec is published
         under in global registry; empty falls back to raiden_id.job_name.
+      secondary_backend_configs: Optional sequence of BackendConfig instances
+        (e.g. persistent storage) to register with this store coordinator at
+        initialization for offload and recall operations.
     """
     raw_raiden_id = RaidenId()
     if raiden_id is not None:
@@ -210,6 +214,7 @@ class KVCacheStore:
         raiden_controller_port=raiden_controller_port,
         expected_worker_count=expected_worker_count,
         kv_pool_group=kv_pool_group,
+        secondary_backend_configs=list(secondary_backend_configs),
     )
 
   @property

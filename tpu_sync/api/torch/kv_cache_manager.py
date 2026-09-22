@@ -75,6 +75,7 @@ class KVCacheManager:
       raiden_controller_address: Optional[str] = None,
       worker_id: Optional[str] = None,
       enable_shm: bool = False,
+      backend_configs: Optional[Sequence[Any]] = None,
   ):
     """Instantiates the TransferEngine-based KVCacheManager.
 
@@ -100,6 +101,7 @@ class KVCacheManager:
         segments named by RAIDEN_SHM_KEY. The env var supplies the segment
         namespace; this flag supplies the per-manager decision. Managers whose
         host buffers are transient staging must leave it off.
+      backend_configs: Optional backend configurations (e.g persistent storage).
     """
     self._admission_summary = None
     impl = _torch_impl()
@@ -139,6 +141,8 @@ class KVCacheManager:
           worker_id=worker_id,
           enable_shm=enable_shm,
       )
+    if backend_configs:
+      self._impl.register_kv_backends(list(backend_configs))
 
   @classmethod
   def create_host_only_for_testing(

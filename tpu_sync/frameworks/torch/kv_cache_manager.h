@@ -26,6 +26,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "csrc/api/tensor_buffer.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
@@ -368,6 +369,10 @@ class KVCacheManager {
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hRead(
       std::string peer, const std::vector<int>& src_block_ids) {
     return torch_manager_->base()->H2hRead(std::move(peer), src_block_ids);
+  }
+
+  void RegisterKVBackends(absl::Span<const kv_cache::BackendConfig> configs) {
+    torch_manager_->base()->RegisterKVBackends(configs);
   }
 
   absl::Status RegisterPools(std::vector<kv_cache::PoolSpec> pools,

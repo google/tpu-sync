@@ -182,6 +182,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
         "@torch_tpu//shims/torch:aten_headers",
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
@@ -220,7 +221,9 @@ nanobind_extension(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
         "//tpu_sync/kv_cache:kv_cache_store",
+        "//tpu_sync/kv_cache:kv_cache_store_backend_factory",
         "//tpu_sync/kv_cache:kv_cache_store_wrapper",
+        "//tpu_sync/kv_cache/backends:backend",
         "//tpu_sync/kv_cache/reshard:reshard_client",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/telemetry/python:telemetry_binding",
@@ -416,6 +419,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
         # buildcleaner: keep

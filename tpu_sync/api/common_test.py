@@ -110,6 +110,7 @@ class CommonApiTest(absltest.TestCase):
     self.assertEqual(BlockStatus.HBM.value, 2)
     self.assertEqual(BlockStatus.HOST.value, 3)
     self.assertEqual(BlockStatus.HOST_AND_HBM.value, 4)
+    self.assertEqual(BlockStatus.SHARED_STORAGE.value, 5)
 
 
 if __name__ == "__main__":

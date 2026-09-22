@@ -56,6 +56,7 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/weight_sync/tiling_utils.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_listener.h"
 
@@ -1427,6 +1428,13 @@ size_t WeightSynchronizerBase::GetHostSize(size_t layer_idx,
     }
   }
   return layers_[layer_idx].shards[local_idx].host_size;
+}
+
+void WeightSynchronizerBase::SetTestOnlyRateLimiters(
+    std::shared_ptr<transport::lib::TestOnlyRateLimiter> egress,
+    std::shared_ptr<transport::lib::TestOnlyRateLimiter> ingress) {
+  RaidenManagerBase::SetTestOnlyRateLimiters(std::move(egress),
+                                             std::move(ingress));
 }
 
 }  // namespace weight_sync

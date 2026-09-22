@@ -39,6 +39,7 @@
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 
 namespace tpu_raiden {
 
@@ -101,6 +102,18 @@ void RaidenManagerBase::StopTransportServer() {
   absl::MutexLock lock(server_init_mu_);
   if (server_) {
     server_.reset();
+  }
+}
+
+void RaidenManagerBase::SetTestOnlyRateLimiters(
+    std::shared_ptr<transport::lib::TestOnlyRateLimiter> egress,
+    std::shared_ptr<transport::lib::TestOnlyRateLimiter> ingress) {
+  absl::MutexLock lock(server_init_mu_);
+  test_only_egress_rate_limiter_ = std::move(egress);
+  test_only_ingress_rate_limiter_ = std::move(ingress);
+  if (server_ != nullptr) {
+    server_->SetTestOnlyRateLimiters(test_only_egress_rate_limiter_,
+                                     test_only_ingress_rate_limiter_);
   }
 }
 
@@ -176,6 +189,11 @@ RaidenManagerBase::InitTransportServer() {
 
   server_ = std::make_unique<tpu_raiden::transport::BlockTransport>(
       this, local_port_cfg_, local_ips_, parallelism_);
+  if (test_only_egress_rate_limiter_ != nullptr ||
+      test_only_ingress_rate_limiter_ != nullptr) {
+    server_->SetTestOnlyRateLimiters(test_only_egress_rate_limiter_,
+                                     test_only_ingress_rate_limiter_);
+  }
   return server_.get();
 }
 

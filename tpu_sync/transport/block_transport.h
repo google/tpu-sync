@@ -133,6 +133,13 @@ class BlockTransport final {
                                                       expected_layer_chunks);
   }
 
+  void SetTestOnlyRateLimiters(
+      std::shared_ptr<lib::TestOnlyRateLimiter> egress,
+      std::shared_ptr<lib::TestOnlyRateLimiter> ingress) {
+    raw_transport_.SetTestOnlyRateLimiters(std::move(egress),
+                                           std::move(ingress));
+  }
+
  private:
   lib::Request BuildBlockRequest(
       uint8_t socket_opcode, uint8_t* laddr, size_t len, uint32_t count_or_size,

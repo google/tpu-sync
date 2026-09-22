@@ -130,6 +130,7 @@ cc_library(
         "//tpu_sync/transport:block_transport",
         "//tpu_sync/transport:block_transport_delegate",
         "//tpu_sync/transport:buffer_push_task",
+        "//tpu_sync/transport/lib:test_only_rate_limiter",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",

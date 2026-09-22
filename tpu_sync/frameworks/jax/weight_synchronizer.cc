@@ -42,6 +42,7 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 #ifndef WITHOUT_PYTHON
@@ -130,6 +131,39 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
           global_shard_indices.value_or(std::vector<int64_t>{})) {
   auto sub = std::make_unique<weight_sync::WeightSynchronizerBase>(
       num_layers, num_shards, slice_byte_size, local_port,
+      /*host_blocks_to_allocate=*/std::nullopt, parallelism, listener_port,
+      bind_ip, /*layer_names=*/std::vector<std::string>{}, auto_h2d);
+  sub_synchronizers_.push_back(std::move(sub));
+  global_shard_to_submanager_.resize(total_num_shards_);
+  submanager_to_global_shards_.resize(1);
+  submanager_to_local_shards_.resize(1);
+  for (size_t i = 0; i < total_num_shards_; ++i) {
+    global_shard_to_submanager_[i] = {0, static_cast<int>(i)};
+    int64_t gidx = (i < global_shard_indices_.size()) ? global_shard_indices_[i]
+                                                      : static_cast<int64_t>(i);
+    submanager_to_global_shards_[0].push_back(gidx);
+    submanager_to_local_shards_[0].push_back(static_cast<int>(i));
+  }
+  if (!sub_synchronizers_.empty() && sub_synchronizers_[0]) {
+    sub_synchronizers_[0]->SetGlobalShardIndices(
+        submanager_to_global_shards_[0]);
+    sub_synchronizers_[0]->SetLocalShardIndices(submanager_to_local_shards_[0]);
+    sub_synchronizers_[0]->SetControlDelegate(this);
+  }
+}
+
+NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
+    size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
+    std::optional<int> local_port, int parallelism,
+    std::optional<int> listener_port, std::optional<std::string> bind_ip,
+    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices)
+    : total_num_shards_(num_shards),
+      num_layers_(num_layers),
+      slice_byte_size_(slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0]),
+      global_shard_indices_(
+          global_shard_indices.value_or(std::vector<int64_t>{})) {
+  auto sub = std::make_unique<weight_sync::WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_sizes, local_port,
       /*host_blocks_to_allocate=*/std::nullopt, parallelism, listener_port,
       bind_ip, /*layer_names=*/std::vector<std::string>{}, auto_h2d);
   sub_synchronizers_.push_back(std::move(sub));
@@ -423,6 +457,17 @@ const uint8_t* NumaAwareWeightSynchronizer::GetHostBufferPtr(
     return nullptr;
   }
   return sub_synchronizers_[sub_idx]->GetHostBufferPtr(layer_idx, local_shard);
+}
+
+size_t NumaAwareWeightSynchronizer::GetHostBufferSize(size_t layer_idx,
+                                                      size_t shard_idx) const {
+  if (shard_idx >= global_shard_to_submanager_.size()) return 0;
+  auto [sub_idx, local_shard] = global_shard_to_submanager_[shard_idx];
+  if (sub_idx < 0 || sub_idx >= static_cast<int>(sub_synchronizers_.size()) ||
+      !sub_synchronizers_[sub_idx]) {
+    return 0;
+  }
+  return sub_synchronizers_[sub_idx]->GetHostSize(layer_idx, local_shard);
 }
 
 absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareWeightSynchronizer::D2h(
@@ -833,6 +878,33 @@ void NumaAwareWeightSynchronizer::SetSubmanagerShardsForTesting(
   }
 }
 
+void NumaAwareWeightSynchronizer::SetTestOnlyRateLimiters(
+    double test_only_simulated_egress_gbps,
+    double test_only_simulated_ingress_gbps) {
+  std::shared_ptr<transport::lib::TestOnlyRateLimiter> egress_limiter = nullptr;
+  if (test_only_simulated_egress_gbps > 0.0) {
+    const uint64_t egress_bytes_per_sec =
+        static_cast<uint64_t>(test_only_simulated_egress_gbps * 1e9 / 8.0);
+    egress_limiter = std::make_shared<transport::lib::TestOnlyRateLimiter>(
+        egress_bytes_per_sec);
+  }
+
+  std::shared_ptr<transport::lib::TestOnlyRateLimiter> ingress_limiter =
+      nullptr;
+  if (test_only_simulated_ingress_gbps > 0.0) {
+    const uint64_t ingress_bytes_per_sec =
+        static_cast<uint64_t>(test_only_simulated_ingress_gbps * 1e9 / 8.0);
+    ingress_limiter = std::make_shared<transport::lib::TestOnlyRateLimiter>(
+        ingress_bytes_per_sec);
+  }
+
+  for (auto& sub : sub_synchronizers_) {
+    if (sub) {
+      sub->SetTestOnlyRateLimiters(egress_limiter, ingress_limiter);
+    }
+  }
+}
+
 // ============================================================================
 // WeightSynchronizer (Top-Level Facade) Implementation
 // ============================================================================
@@ -861,6 +933,16 @@ WeightSynchronizer::WeightSynchronizer(
   numa_manager_ = std::make_unique<NumaAwareWeightSynchronizer>(
       num_layers, num_shards, slice_byte_size, local_port, parallelism,
       listener_port, bind_ip, auto_h2d, global_shard_indices);
+}
+
+WeightSynchronizer::WeightSynchronizer(
+    size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
+    std::optional<int> local_port, int parallelism,
+    std::optional<int> listener_port, std::optional<std::string> bind_ip,
+    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices) {
+  numa_manager_ = std::make_unique<NumaAwareWeightSynchronizer>(
+      num_layers, num_shards, std::move(slice_byte_sizes), local_port,
+      parallelism, listener_port, bind_ip, auto_h2d, global_shard_indices);
 }
 
 WeightSynchronizer::WeightSynchronizer(
@@ -903,6 +985,11 @@ const uint8_t* WeightSynchronizer::GetHostBufferPtr(size_t layer_idx,
   return numa_manager_->GetHostBufferPtr(layer_idx, shard_idx);
 }
 
+size_t WeightSynchronizer::GetHostBufferSize(size_t layer_idx,
+                                             size_t shard_idx) const {
+  return numa_manager_->GetHostBufferSize(layer_idx, shard_idx);
+}
+
 std::optional<int> WeightSynchronizer::local_port() const {
   return numa_manager_->local_port();
 }
@@ -934,6 +1021,53 @@ size_t WeightSynchronizer::num_shards() const {
 
 size_t WeightSynchronizer::slice_byte_size() const {
   return numa_manager_->slice_byte_size();
+}
+
+void WeightSynchronizer::test_only_set_bandwidth_limit(
+    double test_only_simulated_egress_gbps,
+    double test_only_simulated_ingress_gbps) {
+  if (numa_manager_) {
+    numa_manager_->SetTestOnlyRateLimiters(test_only_simulated_egress_gbps,
+                                           test_only_simulated_ingress_gbps);
+  }
+}
+
+std::unique_ptr<WeightSynchronizer>
+WeightSynchronizer::test_only_create_cpu_instance(
+    size_t num_layers, size_t num_shards, size_t slice_byte_size,
+    std::optional<int> local_port, int parallelism,
+    std::optional<int> listener_port, std::optional<std::string> bind_ip,
+    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices,
+    double test_only_simulated_egress_gbps,
+    double test_only_simulated_ingress_gbps) {
+  auto ws = std::make_unique<WeightSynchronizer>(
+      num_layers, num_shards, slice_byte_size, local_port, parallelism,
+      listener_port, bind_ip, auto_h2d, global_shard_indices);
+  if (test_only_simulated_egress_gbps > 0.0 ||
+      test_only_simulated_ingress_gbps > 0.0) {
+    ws->test_only_set_bandwidth_limit(test_only_simulated_egress_gbps,
+                                      test_only_simulated_ingress_gbps);
+  }
+  return ws;
+}
+
+std::unique_ptr<WeightSynchronizer>
+WeightSynchronizer::test_only_create_cpu_instance(
+    size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
+    std::optional<int> local_port, int parallelism,
+    std::optional<int> listener_port, std::optional<std::string> bind_ip,
+    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices,
+    double test_only_simulated_egress_gbps,
+    double test_only_simulated_ingress_gbps) {
+  auto ws = std::make_unique<WeightSynchronizer>(
+      num_layers, num_shards, std::move(slice_byte_sizes), local_port,
+      parallelism, listener_port, bind_ip, auto_h2d, global_shard_indices);
+  if (test_only_simulated_egress_gbps > 0.0 ||
+      test_only_simulated_ingress_gbps > 0.0) {
+    ws->test_only_set_bandwidth_limit(test_only_simulated_egress_gbps,
+                                      test_only_simulated_ingress_gbps);
+  }
+  return ws;
 }
 
 }  // namespace jax

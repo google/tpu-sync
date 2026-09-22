@@ -117,6 +117,55 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     for arr in dst2_arrs:
       np.testing.assert_array_equal(np.asarray(arr), 5.0)
 
+  def test_create_cpu_instance(self):
+    ws = WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=2,
+        num_shards=1,
+        slice_byte_size=1024,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    self.assertIsNotNone(ws.local_port)
+    self.assertIsNotNone(ws.listener_port)
+    self.assertEqual(ws.num_layers, 2)
+    self.assertEqual(ws.num_shards, 1)
+    self.assertEqual(ws.slice_byte_size, 1024)
+
+    buf = ws.get_host_buffer(layer_idx=0, shard_idx=0)
+    self.assertGreaterEqual(len(buf), 1024)
+    buf[:10] = 42
+    self.assertEqual(buf[0], 42)
+
+    ws.shutdown()
+    self.assertIsNone(ws.local_port)
+
+  def test_create_cpu_instance_heterogeneous(self):
+    ws = WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=2,
+        num_shards=1,
+        slice_byte_size=[512, 2048],
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    self.assertIsNotNone(ws.local_port)
+    self.assertIsNotNone(ws.listener_port)
+    self.assertEqual(ws.num_layers, 2)
+    self.assertEqual(ws.num_shards, 1)
+
+    buf0 = ws.get_host_buffer(layer_idx=0, shard_idx=0)
+    buf1 = ws.get_host_buffer(layer_idx=1, shard_idx=0)
+    self.assertGreaterEqual(len(buf0), 512)
+    self.assertGreaterEqual(len(buf1), 2048)
+    buf0[:4] = 11
+    buf1[:4] = 22
+    self.assertEqual(buf0[0], 11)
+    self.assertEqual(buf1[0], 22)
+
+    ws.shutdown()
+    self.assertIsNone(ws.local_port)
+
   def test_wait_for_transfer_completion_api_exists(self):
     arrs = [
         jax.device_put(jnp.zeros(self.shape, dtype=self.dtype), self.sharding)

@@ -65,6 +65,7 @@
 #include "tpu_sync/transport/lib/histogram.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/transport/peregrine/src/api/socket_util.h"
 
 namespace tpu_raiden::transport::lib {
@@ -267,6 +268,12 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     uint8_t* const dest_ptr = base_host_ptr + dst_offset;
     ABSL_RETURN_IF_ERROR(ReadExact(client_fd, dest_ptr, size_bytes));
 
+    TestOnlyRateLimiter* const limiter =
+        test_only_ingress_rate_limiter_raw_.load(std::memory_order_relaxed);
+    if (ABSL_PREDICT_FALSE(limiter != nullptr)) {
+      limiter->Consume(size_bytes);
+    }
+
     const uint8_t ack = 1;
     ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
 
@@ -357,6 +364,12 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
 
     if (total_bytes > 0) {
       ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, iovs));
+    }
+
+    TestOnlyRateLimiter* const limiter =
+        test_only_ingress_rate_limiter_raw_.load(std::memory_order_relaxed);
+    if (ABSL_PREDICT_FALSE(limiter != nullptr)) {
+      limiter->Consume(total_bytes);
     }
 
     const uint8_t ack = 1;
@@ -706,6 +719,12 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
     return absl::InternalError("PushBuffer verification failed");
   }
 
+  TestOnlyRateLimiter* const limiter =
+      test_only_egress_rate_limiter_raw_.load(std::memory_order_relaxed);
+  if (ABSL_PREDICT_FALSE(limiter != nullptr)) {
+    limiter->Consume(request.len);
+  }
+
   ok_to_pool = true;
   return absl::OkStatus();
 }
@@ -953,8 +972,25 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
         "ProcessSocketBufferBatchPush verification failed");
   }
 
+  TestOnlyRateLimiter* const limiter =
+      test_only_egress_rate_limiter_raw_.load(std::memory_order_relaxed);
+  if (ABSL_PREDICT_FALSE(limiter != nullptr)) {
+    limiter->Consume(total_bytes);
+  }
+
   ok_to_pool = true;
   return absl::OkStatus();
+}
+
+void RawBufferTransport::SetTestOnlyRateLimiters(
+    std::shared_ptr<TestOnlyRateLimiter> egress,
+    std::shared_ptr<TestOnlyRateLimiter> ingress) {
+  test_only_egress_rate_limiter_ = std::move(egress);
+  test_only_ingress_rate_limiter_ = std::move(ingress);
+  test_only_egress_rate_limiter_raw_.store(test_only_egress_rate_limiter_.get(),
+                                           std::memory_order_relaxed);
+  test_only_ingress_rate_limiter_raw_.store(
+      test_only_ingress_rate_limiter_.get(), std::memory_order_relaxed);
 }
 
 void RawBufferTransport::ForgetPushProgress(uint64_t uuid) {

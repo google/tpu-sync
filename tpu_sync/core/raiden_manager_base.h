@@ -33,6 +33,7 @@
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 
 namespace tpu_raiden {
 
@@ -95,6 +96,10 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
       const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks);
 
   virtual void ForgetPushProgress(uint64_t uuid);
+
+  void SetTestOnlyRateLimiters(
+      std::shared_ptr<transport::lib::TestOnlyRateLimiter> egress,
+      std::shared_ptr<transport::lib::TestOnlyRateLimiter> ingress);
 
   // Stops and joins the underlying raw transport server if active.
   void StopTransportServer();
@@ -163,6 +168,10 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   mutable absl::Mutex server_init_mu_;
   std::unique_ptr<tpu_raiden::transport::BlockTransport> server_
       ABSL_GUARDED_BY(server_init_mu_);
+  std::shared_ptr<transport::lib::TestOnlyRateLimiter>
+      test_only_egress_rate_limiter_ ABSL_GUARDED_BY(server_init_mu_);
+  std::shared_ptr<transport::lib::TestOnlyRateLimiter>
+      test_only_ingress_rate_limiter_ ABSL_GUARDED_BY(server_init_mu_);
 
   std::vector<LayerInfoBase> layers_;
 

@@ -35,6 +35,7 @@
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 
 namespace tpu_sync {
 namespace rpc {
@@ -268,6 +269,10 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
     absl::MutexLock lock(metrics_mu_);
     metrics_ = m;
   }
+
+  void SetTestOnlyRateLimiters(
+      std::shared_ptr<transport::lib::TestOnlyRateLimiter> egress,
+      std::shared_ptr<transport::lib::TestOnlyRateLimiter> ingress);
 
   void SetPipelineGroupSize(std::optional<size_t> group_size) {
     pipeline_group_size_override_ = group_size;

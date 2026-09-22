@@ -43,6 +43,7 @@
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden::transport::lib {
@@ -150,6 +151,9 @@ class RawBufferTransport final {
   absl::StatusOr<PspPeerKey> RegisterPspPeer(uint32_t client_spi,
                                              absl::string_view client_key);
 
+  void SetTestOnlyRateLimiters(std::shared_ptr<TestOnlyRateLimiter> egress,
+                               std::shared_ptr<TestOnlyRateLimiter> ingress);
+
  private:
   // Pulls a buffer request from `peer` over a borrowed TCP connection.
   absl::Status ProcessSocketBufferPull(absl::string_view peer,
@@ -204,6 +208,16 @@ class RawBufferTransport final {
 
   // To protect multiple gRPC threads can call RegisterPspPeer concurrently
   absl::Mutex psp_mu_;
+
+  // Note: Google3's libc++ does not implement the C++20
+  // std::atomic<std::shared_ptr<T>> specialization, and atomic raw pointers
+  // allow lock-free relaxed loads on the socket hot path.
+  std::shared_ptr<TestOnlyRateLimiter> test_only_egress_rate_limiter_ = nullptr;
+  std::shared_ptr<TestOnlyRateLimiter> test_only_ingress_rate_limiter_ =
+      nullptr;
+  std::atomic<TestOnlyRateLimiter*> test_only_egress_rate_limiter_raw_{nullptr};
+  std::atomic<TestOnlyRateLimiter*> test_only_ingress_rate_limiter_raw_{
+      nullptr};
 
   std::thread listener_thread_;
 };

@@ -66,6 +66,7 @@ cc_library(
         "//tpu_sync/core:xla_raw_transfer_headers",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/transport:buffer_push_task",
+        "//tpu_sync/transport/lib:test_only_rate_limiter",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
@@ -163,5 +164,22 @@ py_test(
         "//tpu_sync/api:common",
         "//tpu_sync/rpc:raiden_controller",
         "@com_google_absl_py//absl/testing:absltest",
+    ],
+)
+
+py_test(
+    name = "weight_sync_fanout_perf_test",
+    size = "large",
+    srcs = ["weight_sync_fanout_perf_test.py"],
+    tags = ["requires-mem:28g"],
+    deps = [
+        "//tpu_sync/api:common",
+        "//tpu_sync/api/jax:weight_synchronizer_jax_py",
+        "//tpu_sync/rpc:raiden_controller",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
+        "@com_google_absl_py//absl/flags",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@com_google_absl_py//absl/testing:parameterized",
+        "@pypi//numpy",
     ],
 )

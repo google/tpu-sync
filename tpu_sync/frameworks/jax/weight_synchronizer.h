@@ -33,6 +33,7 @@
 #include <nanobind/nanobind.h>
 #include "tpu_sync/frameworks/jax/jax_utils.h"
 #endif
+#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace tpu_sync {
@@ -74,6 +75,13 @@ class NumaAwareWeightSynchronizer
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
       std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
+  NumaAwareWeightSynchronizer(
+      size_t num_layers, size_t num_shards,
+      std::vector<size_t> slice_byte_sizes,
+      std::optional<int> local_port = std::nullopt, int parallelism = 1,
+      std::optional<int> listener_port = std::nullopt,
+      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
 
   // Test-only constructor for injecting mock sub-synchronizers
   explicit NumaAwareWeightSynchronizer(
@@ -94,6 +102,7 @@ class NumaAwareWeightSynchronizer
   std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
 
   const uint8_t* GetHostBufferPtr(size_t layer_idx, size_t shard_idx) const;
+  size_t GetHostBufferSize(size_t layer_idx, size_t shard_idx) const;
 
   absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
   absl::StatusOr<raiden::PjRtCopyFuture> H2d(uint64_t uuid = 0);
@@ -127,6 +136,9 @@ class NumaAwareWeightSynchronizer
 
   void SetSubmanagerShardsForTesting(
       const std::vector<std::vector<int64_t>>& assignment);
+
+  void SetTestOnlyRateLimiters(double test_only_simulated_egress_gbps,
+                               double test_only_simulated_ingress_gbps);
 
  private:
   void InitSubManagers(
@@ -180,6 +192,13 @@ class WeightSynchronizer {
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
       std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
+  WeightSynchronizer(
+      size_t num_layers, size_t num_shards,
+      std::vector<size_t> slice_byte_sizes,
+      std::optional<int> local_port = std::nullopt, int parallelism = 1,
+      std::optional<int> listener_port = std::nullopt,
+      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
 
   // Test-only constructor for injecting mock sub-synchronizers
   explicit WeightSynchronizer(
@@ -202,6 +221,7 @@ class WeightSynchronizer {
   void ResetMetrics();
 
   const uint8_t* GetHostBufferPtr(size_t layer_idx, size_t shard_idx) const;
+  size_t GetHostBufferSize(size_t layer_idx, size_t shard_idx) const;
   std::optional<int> local_port() const;
   std::optional<int> listener_port() const;
   bool is_listener_active() const;
@@ -212,6 +232,28 @@ class WeightSynchronizer {
   size_t num_layers() const;
   size_t num_shards() const;
   size_t slice_byte_size() const;
+
+  void test_only_set_bandwidth_limit(double test_only_simulated_egress_gbps,
+                                     double test_only_simulated_ingress_gbps);
+
+  static std::unique_ptr<WeightSynchronizer> test_only_create_cpu_instance(
+      size_t num_layers, size_t num_shards, size_t slice_byte_size,
+      std::optional<int> local_port = std::nullopt, int parallelism = 1,
+      std::optional<int> listener_port = std::nullopt,
+      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt,
+      double test_only_simulated_egress_gbps = 0.0,
+      double test_only_simulated_ingress_gbps = 0.0);
+
+  static std::unique_ptr<WeightSynchronizer> test_only_create_cpu_instance(
+      size_t num_layers, size_t num_shards,
+      std::vector<size_t> slice_byte_sizes,
+      std::optional<int> local_port = std::nullopt, int parallelism = 1,
+      std::optional<int> listener_port = std::nullopt,
+      std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt,
+      double test_only_simulated_egress_gbps = 0.0,
+      double test_only_simulated_ingress_gbps = 0.0);
 
  private:
   std::unique_ptr<NumaAwareWeightSynchronizer> numa_manager_;

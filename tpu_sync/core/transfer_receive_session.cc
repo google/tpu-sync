@@ -52,6 +52,20 @@ namespace tpu_raiden {
 
 namespace {
 
+[[noreturn]] void ThrowStatus(const std::string& context,
+                              const absl::Status& status) {
+  if (status.code() == absl::StatusCode::kInvalidArgument) {
+    throw std::invalid_argument(context + ": " + std::string(status.message()));
+  }
+  throw std::runtime_error(context + ": " + std::string(status.message()));
+}
+
+void CheckStatus(const std::string& context, const absl::Status& status) {
+  if (!status.ok()) {
+    ThrowStatus(context, status);
+  }
+}
+
 double DurationMs(std::chrono::steady_clock::time_point start,
                   std::chrono::steady_clock::time_point end) {
   return std::chrono::duration<double, std::milli>(end - start).count();
@@ -468,24 +482,8 @@ void TransferReceiveSession::ExecutePullRequest(
 
           absl::StatusOr<PullStreamResponseSpec> response =
               manager.control_backend_->SendPullRequest(
-                  remote_endpoint, req_spec,
-                  absl::Seconds(manager.control_timeout_s_));
-          if (!response.ok()) {
-            // Propagated with its code intact rather than thrown: the control
-            // backend reports a handshake that outran its budget as
-            // DeadlineExceeded, and the catch below would relabel it Internal,
-            // discarding the one signal that distinguishes an unresponsive
-            // peer from a rejected request.
-            pull_status = absl::Status(
-                response.status().code(),
-                absl::StrCat("control pull request: ",
-                             response.status().message()));
-            LOG(ERROR) << "Raiden consumer error during Hybrid Bridge "
-                          "StartRead connect: "
-                       << pull_status;
-            self->Finish(pull_status);
-            return;
-          }
+                  remote_endpoint, req_spec, absl::Seconds(manager.timeout_s_));
+          CheckStatus("control pull request", response.status());
           if (response->status != 0) {
             throw std::runtime_error(absl::StrCat(
                 "Remote producer rejected Hybrid Bridge read request: ",

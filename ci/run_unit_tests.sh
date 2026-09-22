@@ -59,7 +59,7 @@ export BAZEL_CACHE_DIR="${BAZEL_CACHE_DIR:-${RUNNER_TEMP:-/cache}/bazel_cache}"
 export BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE:-${BAZEL_CACHE_DIR}/output_base}"
 EXTRA_BAZEL_FLAGS="${EXTRA_BAZEL_FLAGS:-}"
 export HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION:-3.12}"
-RAIDEN_TEST_SCOPE="${RAIDEN_TEST_SCOPE:-//tpu_sync/core:all //tpu_sync/kv_cache:all //tpu_sync/weight_sync:all //tpu_sync/rpc:all}"
+RAIDEN_TEST_SCOPE="${RAIDEN_TEST_SCOPE:-//tpu_sync/core:all //tpu_sync/kv_cache:all //tpu_sync/kv_cache/backends:all //tpu_sync/kv_cache/backends/storage:all //tpu_sync/weight_sync:all //tpu_sync/rpc:all}"
 mkdir -p "${BAZEL_CACHE_DIR}/disk_cache" "${BAZEL_CACHE_DIR}/repo_cache" "$(dirname "${BAZEL_OUTPUT_BASE}")"
 
 export DEBIAN_FRONTEND=noninteractive

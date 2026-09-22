@@ -30,7 +30,7 @@ on:
       test_scope:
         description: "Bazel package patterns to search for tests"
         type: string
-        default: "//tpu_sync/core:all //tpu_sync/kv_cache:all //tpu_sync/weight_sync:all //tpu_sync/rpc:all"
+        default: "//tpu_sync/core:all //tpu_sync/kv_cache:all //tpu_sync/kv_cache/backends:all //tpu_sync/kv_cache/backends/storage:all //tpu_sync/weight_sync:all //tpu_sync/rpc:all"
 
 permissions:
   contents: read
@@ -48,7 +48,7 @@ jobs:
       options: --shm-size=16g
     timeout-minutes: 300
     env:
-      RAIDEN_TEST_SCOPE: ${{ inputs.test_scope || '//tpu_sync/core:all //tpu_sync/kv_cache:all //tpu_sync/weight_sync:all //tpu_sync/rpc:all' }}
+      RAIDEN_TEST_SCOPE: ${{ inputs.test_scope || '//tpu_sync/core:all //tpu_sync/kv_cache:all //tpu_sync/kv_cache/backends:all //tpu_sync/kv_cache/backends/storage:all //tpu_sync/weight_sync:all //tpu_sync/rpc:all' }}
       # Fork PRs run without the ambient GCP service account, so the
       # remote cache is only requested when the head branch lives in this
       # repository.

@@ -250,13 +250,12 @@ RawBufferTransport::RawBufferTransport(
 
 RawBufferTransport::~RawBufferTransport() {
   stopping_ = true;
+  if (server_fd_ < 0) return;
 
   // 1. Listener side:
   // 1.1 Shutdown on all active sockets to unblock the threads.
-  if (server_fd_ >= 0) {
-    DCHECK(IsValidSocket(server_fd_));
-    shutdown(server_fd_, SHUT_RDWR);
-  }
+  DCHECK(IsValidSocket(server_fd_));
+  shutdown(server_fd_, SHUT_RDWR);
   {
     absl::MutexLock _(mu_);
     for (int fd : active_client_fds_) {
@@ -273,6 +272,9 @@ RawBufferTransport::~RawBufferTransport() {
     // Each worker thread should have closed its own client_fd.
     DCHECK(active_client_fds_.empty());
   }
+  // 1.3 Close the listening socket after listener_thread_ has joined.
+  close(server_fd_);
+  server_fd_ = -1;
 
   // 2. Connector side:
   // Close all pooled file descriptors _after_ all the threads are joined.
@@ -546,10 +548,11 @@ RawBufferTransport::RegisterPspPeer(uint32_t client_spi,
 }
 
 void RawBufferTransport::ListenerLoop() {
+  const int server_fd = server_fd_.load();
+  DCHECK(IsValidSocket(server_fd));
   while (!stopping_) {
-    DCHECK(IsValidSocket(server_fd_));
     struct pollfd pfd;
-    pfd.fd = server_fd_;
+    pfd.fd = server_fd;
     pfd.events = POLLIN;
     int ret = poll(&pfd, 1, 50);
     if (ret <= 0) {
@@ -560,7 +563,7 @@ void RawBufferTransport::ListenerLoop() {
     struct sockaddr_in6 client_addr;
     socklen_t clilen = sizeof(client_addr);
     int client_fd = accept(
-        server_fd_, reinterpret_cast<struct sockaddr*>(&client_addr), &clilen);
+        server_fd, reinterpret_cast<struct sockaddr*>(&client_addr), &clilen);
     if (client_fd < 0) {
       if (stopping_) break;
       continue;
@@ -588,11 +591,6 @@ void RawBufferTransport::ListenerLoop() {
     connection_threads_.Spawn(
         [this, client_fd] { ConnectionWorker(client_fd); });
   }
-
-  DCHECK(IsValidSocket(server_fd_));
-  close(server_fd_);
-  server_fd_ = -1;
-  DCHECK(!IsValidSocket(server_fd_));
 }
 
 absl::Status RawBufferTransport::PullBuffer(

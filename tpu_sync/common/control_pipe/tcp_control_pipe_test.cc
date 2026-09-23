@@ -22,16 +22,20 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <thread>  // NOLINT(build/c++11)
 
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
+#include "tpu_sync/proto/control_pipe.pb.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
@@ -252,6 +256,48 @@ TEST(TcpControlPipeTest, OversizedFrameRejectedPriorToAllocation) {
   }
   close(fd);
   server.Stop();
+}
+
+TEST(TcpControlPipeTest, StopAllowsInFlightHandlerToWriteResponse) {
+  ControlPipeConfig cfg;
+  TcpControlPipeServer server(cfg);
+  absl::Mutex mu;
+  bool handler_entered = false;
+
+  server.dispatcher().RegisterRawHandler(
+      "test.SlowEcho",
+      [&](const ControlContext& /*ctx*/,
+          absl::string_view req_bytes) -> absl::StatusOr<std::string> {
+        {
+          absl::MutexLock lock(mu);
+          handler_entered = true;
+        }
+        absl::SleepFor(absl::Milliseconds(300));
+        return std::string(req_bytes);
+      },
+      cfg.max_frame_bytes);
+
+  TF_ASSERT_OK_AND_ASSIGN(int port, server.Start(0));
+  const std::string endpoint = absl::StrCat("127.0.0.1:", port);
+
+  std::thread client_thread([&]() {
+    TcpControlPipeClient client(cfg);
+    control_pipe::proto::ControlEnvelope env;
+    env.set_message_type("test.SlowEcho");
+    env.set_request_id(1);
+    env.set_payload("in-flight-ok");
+    auto resp = client.SendRaw(endpoint, env, absl::Seconds(10));
+    ASSERT_TRUE(resp.ok()) << resp.status();
+    EXPECT_EQ(resp->status_code(), 0);
+    EXPECT_EQ(resp->payload(), "in-flight-ok");
+  });
+
+  {
+    absl::MutexLock lock(mu);
+    mu.Await(absl::Condition(&handler_entered));
+  }
+  server.Stop();
+  client_thread.join();
 }
 
 }  // namespace

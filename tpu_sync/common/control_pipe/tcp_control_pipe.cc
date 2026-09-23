@@ -419,7 +419,7 @@ void TcpControlPipeServer::Stop() {
       server_fd_to_close = server_fd_;
     }
     for (int client_fd : active_client_fds_) {
-      shutdown(client_fd, SHUT_RDWR);
+      shutdown(client_fd, SHUT_RD);
     }
   }
 
@@ -872,6 +872,7 @@ TcpControlPipeClient::SendRaw(
   }
 
   const bool probe_with_shut_wr = can_fallback_legacy && !is_verified_cpip;
+  bool connected = false;
 
   auto try_cpip =
       [&]() -> absl::StatusOr<control_pipe::proto::ControlResponseEnvelope> {
@@ -882,6 +883,7 @@ TcpControlPipeClient::SendRaw(
       ABSL_ASSIGN_OR_RETURN(fd,
                             conn_pool_->Acquire(endpoint, effective_timeout));
     }
+    connected = true;
     auto fd_closer = absl::MakeCleanup([fd]() { close(fd); });
 
     std::string env_bytes;
@@ -941,7 +943,9 @@ TcpControlPipeClient::SendRaw(
     }
     return cpip_res;
   }
-  if (can_fallback_legacy) {
+  // Only mark as legacy if TCP connect succeeded; otherwise a transient startup
+  // ECONNREFUSED would permanently force legacy framing for this endpoint.
+  if (can_fallback_legacy && connected) {
     {
       absl::MutexLock lock(legacy_mu_);
       legacy_endpoints_.insert(std::string(endpoint));

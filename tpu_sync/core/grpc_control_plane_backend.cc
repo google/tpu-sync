@@ -21,6 +21,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -45,6 +46,7 @@
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.pb.h"
+#include "xla/tsl/concurrency/future.h"
 
 namespace tpu_raiden {
 
@@ -82,6 +84,38 @@ absl::Status GrpcStatusToAbsl(const grpc::Status& status) {
     default:
       return absl::InternalError(status.error_message());
   }
+}
+
+control_plane::proto::PullStreamRequest ToProto(
+    const PullStreamRequestSpec& req) {
+  control_plane::proto::PullStreamRequest proto_req;
+  proto_req.set_uuid(req.uuid);
+  proto_req.set_ep_idx(req.ep_idx);
+  proto_req.set_consumer_data_port(req.consumer_data_port);
+  for (const auto& ip : req.consumer_ips) {
+    proto_req.add_consumer_ips(ip);
+  }
+  for (int64_t id : req.src_block_ids) {
+    proto_req.add_src_block_ids(id);
+  }
+  for (int64_t id : req.dst_block_ids) {
+    proto_req.add_dst_block_ids(id);
+  }
+  return proto_req;
+}
+
+absl::StatusOr<PullStreamResponseSpec> FromProto(
+    const grpc::Status& rpc_status,
+    const control_plane::proto::PullStreamResponse& proto_resp) {
+  if (!rpc_status.ok()) {
+    return GrpcStatusToAbsl(rpc_status);
+  }
+  return PullStreamResponseSpec{
+      .status = proto_resp.status(),
+      .num_layers = proto_resp.num_layers(),
+      .data_port = proto_resp.data_port(),
+      .message = proto_resp.message(),
+  };
 }
 
 }  // namespace
@@ -183,7 +217,10 @@ grpc::Status KVCacheControlPlaneServiceImpl::Ack(
 GrpcControlPlaneBackend::GrpcControlPlaneBackend(size_t max_cached_stubs)
     : max_cached_stubs_(max_cached_stubs) {}
 
-GrpcControlPlaneBackend::~GrpcControlPlaneBackend() { StopServer(); }
+GrpcControlPlaneBackend::~GrpcControlPlaneBackend() {
+  StopServer();
+  CancelPendingPulls();
+}
 
 size_t GrpcControlPlaneBackend::TEST_CachedStubCount() const {
   absl::MutexLock lock(stub_mu_);
@@ -279,42 +316,64 @@ GrpcControlPlaneBackend::GetOrCreateStub(absl::string_view endpoint) {
   return stub;
 }
 
-absl::StatusOr<PullStreamResponseSpec> GrpcControlPlaneBackend::SendPullRequest(
+tsl::Future<PullStreamResponseSpec> GrpcControlPlaneBackend::SendPullRequest(
     absl::string_view remote_endpoint, const PullStreamRequestSpec& req,
     absl::Duration timeout) {
-  auto stub = GetOrCreateStub(remote_endpoint);
-  grpc::ClientContext context;
+  auto [promise, future] = tsl::MakePromise<PullStreamResponseSpec>();
+  auto owned = std::make_shared<PendingPull>();
+  PendingPull* call = owned.get();
+  call->stub = GetOrCreateStub(remote_endpoint);
   if (timeout > absl::ZeroDuration()) {
-    context.set_deadline(std::chrono::system_clock::now() +
-                         absl::ToChronoMilliseconds(timeout));
+    call->context.set_deadline(std::chrono::system_clock::now() +
+                               absl::ToChronoMilliseconds(timeout));
   }
+  call->request = ToProto(req);
+  call->promise = std::move(promise);
+  {
+    absl::MutexLock lock(pending_mu_);
+    pending_pulls_.emplace(call, std::move(owned));
+  }
+  call->stub->async()->PullStream(
+      &call->context, &call->request, &call->response,
+      [this, call](grpc::Status status) { CompletePendingPull(call, status); });
+  return future;
+}
 
-  control_plane::proto::PullStreamRequest proto_req;
-  proto_req.set_uuid(req.uuid);
-  proto_req.set_ep_idx(req.ep_idx);
-  proto_req.set_consumer_data_port(req.consumer_data_port);
-  for (const auto& ip : req.consumer_ips) {
-    proto_req.add_consumer_ips(ip);
+void GrpcControlPlaneBackend::CompletePendingPull(PendingPull* call,
+                                                  const grpc::Status& status) {
+  // Set runs the future's OnReady callbacks on this thread. The entry stays
+  // registered until they return, so CancelPendingPulls cannot let the
+  // destructor finish while one is still running.
+  call->promise.Set(FromProto(status, call->response));
+  std::shared_ptr<PendingPull> finished;
+  {
+    absl::MutexLock lock(pending_mu_);
+    auto node = pending_pulls_.extract(call);
+    finished = std::move(node.mapped());
   }
-  for (int64_t id : req.src_block_ids) {
-    proto_req.add_src_block_ids(id);
-  }
-  for (int64_t id : req.dst_block_ids) {
-    proto_req.add_dst_block_ids(id);
-  }
+}
 
-  control_plane::proto::PullStreamResponse proto_resp;
-  grpc::Status rpc_status = stub->PullStream(&context, proto_req, &proto_resp);
-  if (!rpc_status.ok()) {
-    return GrpcStatusToAbsl(rpc_status);
+void GrpcControlPlaneBackend::CancelPendingPulls() {
+  // TryCancel may run the completion callback on this thread, and that takes
+  // pending_mu_, so cancel outside the lock; the copies keep each context
+  // alive until its TryCancel returns.
+  std::vector<std::shared_ptr<PendingPull>> to_cancel;
+  {
+    absl::MutexLock lock(pending_mu_);
+    to_cancel.reserve(pending_pulls_.size());
+    for (const auto& [call, owned] : pending_pulls_) {
+      to_cancel.push_back(owned);
+    }
   }
-
-  return PullStreamResponseSpec{
-      .status = proto_resp.status(),
-      .num_layers = proto_resp.num_layers(),
-      .data_port = proto_resp.data_port(),
-      .message = proto_resp.message(),
-  };
+  for (const auto& call : to_cancel) {
+    call->context.TryCancel();
+  }
+  to_cancel.clear();
+  absl::MutexLock lock(pending_mu_);
+  pending_mu_.Await(absl::Condition(
+      +[](absl::flat_hash_map<PendingPull*, std::shared_ptr<PendingPull>>*
+              pulls) { return pulls->empty(); },
+      &pending_pulls_));
 }
 
 absl::Status GrpcControlPlaneBackend::SendAck(absl::string_view remote_endpoint,

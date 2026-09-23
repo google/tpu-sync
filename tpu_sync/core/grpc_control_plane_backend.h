@@ -28,12 +28,14 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
+#include "grpcpp/client_context.h"
 #include "grpcpp/server.h"
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.pb.h"
+#include "xla/tsl/concurrency/future.h"
 
 namespace tpu_raiden {
 
@@ -73,7 +75,9 @@ class GrpcControlPlaneBackend : public ControlPlaneBackend {
                                   ControlPlaneHandler* handler) override;
   void StopServer() override;
 
-  absl::StatusOr<PullStreamResponseSpec> SendPullRequest(
+  // Issues the handshake on the gRPC async stub and returns without waiting;
+  // the future resolves on a gRPC callback thread.
+  tsl::Future<PullStreamResponseSpec> SendPullRequest(
       absl::string_view remote_endpoint, const PullStreamRequestSpec& req,
       absl::Duration timeout) override;
 
@@ -95,8 +99,23 @@ class GrpcControlPlaneBackend : public ControlPlaneBackend {
     std::list<std::string>::iterator lru_it;
   };
 
+  // One outstanding SendPullRequest call.
+  struct PendingPull {
+    grpc::ClientContext context;
+    control_plane::proto::PullStreamRequest request;
+    control_plane::proto::PullStreamResponse response;
+    std::shared_ptr<control_plane::proto::KVCacheControlPlaneService::Stub>
+        stub;
+    tsl::Promise<PullStreamResponseSpec> promise;
+  };
+
   std::shared_ptr<control_plane::proto::KVCacheControlPlaneService::Stub>
   GetOrCreateStub(absl::string_view endpoint);
+
+  void CompletePendingPull(PendingPull* call, const grpc::Status& status);
+
+  // Cancels every outstanding async pull and waits for its callback to return.
+  void CancelPendingPulls();
 
   std::unique_ptr<KVCacheControlPlaneServiceImpl> service_impl_;
   std::unique_ptr<grpc::Server> server_;
@@ -106,6 +125,10 @@ class GrpcControlPlaneBackend : public ControlPlaneBackend {
   std::list<std::string> lru_order_ ABSL_GUARDED_BY(stub_mu_);
   absl::flat_hash_map<std::string, StubCacheEntry> stubs_
       ABSL_GUARDED_BY(stub_mu_);
+
+  absl::Mutex pending_mu_;
+  absl::flat_hash_map<PendingPull*, std::shared_ptr<PendingPull>>
+      pending_pulls_ ABSL_GUARDED_BY(pending_mu_);
 };
 
 }  // namespace tpu_raiden

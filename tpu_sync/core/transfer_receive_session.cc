@@ -48,6 +48,7 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
+#include "xla/tsl/concurrency/future.h"
 
 namespace tpu_raiden {
 
@@ -456,59 +457,68 @@ void TransferReceiveSession::ExecutePullRequest(
     KVCacheManagerWithTransfer& manager, const std::string& remote_endpoint) {
   std::optional<int> target_node = base_->assigned_numa_node();
   std::string session_req_id;
-  CopyPlan load_plan;
+  PullStreamRequestSpec req_spec;
   {
     absl::MutexLock lock(mu_);
     session_req_id = req_id_;
-    load_plan = load_plan_;
+    req_spec.src_block_ids = load_plan_.producer_remote_block_ids;
+    req_spec.dst_block_ids = load_plan_.transport_host_block_ids;
   }
+  req_spec.uuid = uuid_;
+  req_spec.ep_idx = 0;
+  req_spec.consumer_data_port = static_cast<uint32_t>(manager.local_data_port_);
+  req_spec.consumer_ips = base_->local_ips();
 
+  LOG(INFO) << "StartRead (connecting): req_id=" << session_req_id
+            << ", uuid=" << uuid_ << ", numa=" << target_node.value_or(-1);
+
+  // May run on a transport thread, so it must not block.
+  auto on_response = [self = shared_from_this(), session_req_id](
+                         absl::StatusOr<PullStreamResponseSpec> response) {
+    absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
+    absl::Status pull_status = absl::OkStatus();
+    try {
+      absl::Status injected =
+          FaultInjectStatus(hooks::kTransferRecvSessionPullReply);
+      if (response.ok() && !injected.ok()) {
+        response = injected;
+      }
+      CheckStatus("control pull request", response.status());
+      if (response->status != 0) {
+        throw std::runtime_error(absl::StrCat(
+            "Remote producer rejected Hybrid Bridge read request: ",
+            response->message));
+      }
+      VLOG(1) << "StartRead (Hybrid Bridge) successfully registered pull "
+                 "request with Producer. req_id: "
+              << session_req_id;
+    } catch (const std::exception& e) {
+      pull_status = absl::InternalError(e.what());
+      LOG(ERROR) << "Raiden consumer error during Hybrid Bridge StartRead "
+                    "connect: "
+                 << e.what();
+    }
+
+    if (!pull_status.ok()) {
+      self->Finish(pull_status);
+    }
+  };
+  // Issued from push_pool_ so a backend that blocks (TCP) does not block the
+  // StartRead caller. An async backend (gRPC) returns as soon as the RPC is
+  // issued, so the worker is not held while the handshake waits.
   base_->push_pool()->Schedule(
-      target_node, [self = shared_from_this(), &manager, remote_endpoint,
-                    session_req_id, load_plan = std::move(load_plan)]() {
-        absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
-        absl::Status pull_status = absl::OkStatus();
+      target_node, [&manager, remote_endpoint, req_spec = std::move(req_spec),
+                    on_response = std::move(on_response)]() mutable {
         try {
-          LOG(INFO) << "StartRead (connecting): req_id=" << session_req_id
-                    << ", uuid=" << self->uuid_ << ", numa="
-                    << self->base_->assigned_numa_node().value_or(-1);
-          PullStreamRequestSpec req_spec;
-          req_spec.uuid = self->uuid_;
-          req_spec.ep_idx = 0;
-          req_spec.consumer_data_port =
-              static_cast<uint32_t>(manager.local_data_port_);
-          req_spec.consumer_ips = self->base_->local_ips();
-          req_spec.src_block_ids = load_plan.producer_remote_block_ids;
-          req_spec.dst_block_ids = load_plan.transport_host_block_ids;
-
           FaultInjectThrow(hooks::kTransferRecvSessionPullRequest);
-          absl::StatusOr<PullStreamResponseSpec> response =
-              manager.control_backend_->SendPullRequest(
-                  remote_endpoint, req_spec, absl::Seconds(manager.timeout_s_));
-          absl::Status injected =
-              FaultInjectStatus(hooks::kTransferRecvSessionPullReply);
-          if (response.ok() && !injected.ok()) {
-            response = injected;
-          }
-          CheckStatus("control pull request", response.status());
-          if (response->status != 0) {
-            throw std::runtime_error(absl::StrCat(
-                "Remote producer rejected Hybrid Bridge read request: ",
-                response->message));
-          }
-          VLOG(1) << "StartRead (Hybrid Bridge) successfully registered pull "
-                     "request with Producer. req_id: "
-                  << session_req_id;
         } catch (const std::exception& e) {
-          pull_status = absl::InternalError(e.what());
-          LOG(ERROR) << "Raiden consumer error during Hybrid Bridge StartRead "
-                        "connect: "
-                     << e.what();
+          on_response(absl::InternalError(e.what()));
+          return;
         }
-
-        if (!pull_status.ok()) {
-          self->Finish(pull_status);
-        }
+        manager.control_backend_
+            ->SendPullRequest(remote_endpoint, req_spec,
+                              absl::Seconds(manager.control_timeout_s_))
+            .OnReady(std::move(on_response));
       });
 }
 

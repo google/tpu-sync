@@ -453,6 +453,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/time",
+        "@xla//xla/tsl/concurrency:future",
     ],
 )
 
@@ -477,6 +478,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
+        "@xla//xla/tsl/concurrency:future",
     ],
 )
 
@@ -507,6 +509,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
+        "@xla//xla/tsl/concurrency:future",
     ],
 )
 
@@ -530,6 +533,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/time",
+        "@xla//xla/tsl/concurrency:future",
     ],
 )
 
@@ -554,6 +558,7 @@ cc_test(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/concurrency:future",
     ],
 )
 
@@ -614,6 +619,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
+        "@xla//xla/tsl/concurrency:future",
     ],
 )
 
@@ -1037,10 +1043,16 @@ cc_test(
         "-layering_check",
     ],
     deps = [
+        ":control_plane_backend",
+        ":grpc_control_plane_backend",
         ":kv_cache_manager_with_transfer",
         ":tcp_control_plane_backend",
+        "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest_main",

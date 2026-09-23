@@ -34,10 +34,12 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "tpu_sync/core/grpc_control_plane_backend.h"
 #include "tpu_sync/core/tcp_control_plane_backend.h"
+#include "xla/tsl/concurrency/future.h"
 
 namespace tpu_raiden {
 namespace {
@@ -150,7 +152,7 @@ TEST_P(ControlPlaneBackendTest, SendPullRequestWithExplicitConsumerIps) {
   req.dst_block_ids = {100, 200, 300};
 
   absl::StatusOr<PullStreamResponseSpec> response =
-      client->SendPullRequest(endpoint, req, absl::Seconds(5));
+      client->SendPullRequest(endpoint, req, absl::Seconds(5)).Await();
   ASSERT_TRUE(response.ok()) << response.status();
   EXPECT_EQ(response->status, 0);
   EXPECT_EQ(response->num_layers, 16u);
@@ -194,7 +196,7 @@ TEST_P(ControlPlaneBackendTest, FallbackPeerIpExtractionWhenConsumerIpsEmpty) {
   req.dst_block_ids = {2};
 
   absl::StatusOr<PullStreamResponseSpec> response =
-      client->SendPullRequest(endpoint, req, absl::Seconds(5));
+      client->SendPullRequest(endpoint, req, absl::Seconds(5)).Await();
   ASSERT_TRUE(response.ok()) << response.status();
   EXPECT_EQ(response->status, 0);
   EXPECT_FALSE(received_fallback_ip.empty());
@@ -229,7 +231,7 @@ TEST_P(ControlPlaneBackendTest, ApplicationErrorPropagation) {
   req.dst_block_ids = {1};
 
   absl::StatusOr<PullStreamResponseSpec> response =
-      client->SendPullRequest(endpoint, req, absl::Seconds(5));
+      client->SendPullRequest(endpoint, req, absl::Seconds(5)).Await();
   ASSERT_TRUE(response.ok()) << response.status();
   EXPECT_EQ(response->status, -1);
   EXPECT_THAT(response->message, HasSubstr("no read registered for uuid 999"));
@@ -302,9 +304,53 @@ TEST_P(ControlPlaneBackendTest, TimeoutWhenServerDelaysBeyondClientTimeout) {
   req.dst_block_ids = {1};
 
   absl::StatusOr<PullStreamResponseSpec> response =
-      client->SendPullRequest(endpoint, req, absl::Milliseconds(80));
+      client->SendPullRequest(endpoint, req, absl::Milliseconds(80)).Await();
   EXPECT_FALSE(response.ok());
   EXPECT_TRUE(absl::IsDeadlineExceeded(response.status())) << response.status();
+  server->StopServer();
+}
+
+// The `timeout` argument to SendPullRequest bounds the whole call, not each
+// step inside it: however the peer behaves, the caller gets its worker back
+// within it. Asserted against both backends because the promise belongs to the
+// ControlPlaneBackend interface rather than to either transport, so a backend
+// swap cannot quietly drop it.
+TEST_P(ControlPlaneBackendTest, PullRequestDeadlineBoundsTheWholeCall) {
+  constexpr absl::Duration kDeadline = absl::Milliseconds(300);
+  MockControlPlaneHandler handler;
+  handler.SetPullStreamCallback(
+      [](const PullStreamRequestSpec& req, absl::string_view fallback_ip) {
+        absl::SleepFor(absl::Seconds(3));
+        return PullStreamResponseSpec{
+            .status = 0,
+            .num_layers = 4,
+            .data_port = 50000,
+            .message = "",
+        };
+      });
+
+  auto server = CreateControlPlaneBackend(GetParam(), AsyncTestExecutor());
+  absl::StatusOr<int> bound_port = server->StartServer(0, &handler);
+  ASSERT_TRUE(bound_port.ok()) << bound_port.status();
+
+  auto client = CreateControlPlaneBackend(GetParam());
+  std::string endpoint = absl::StrCat("127.0.0.1:", *bound_port);
+
+  PullStreamRequestSpec req;
+  req.uuid = 222;
+  req.src_block_ids = {1};
+  req.dst_block_ids = {1};
+
+  const absl::Time start = absl::Now();
+  absl::StatusOr<PullStreamResponseSpec> response =
+      client->SendPullRequest(endpoint, req, kDeadline).Await();
+  const absl::Duration elapsed = absl::Now() - start;
+
+  EXPECT_FALSE(response.ok());
+  EXPECT_TRUE(absl::IsDeadlineExceeded(response.status())) << response.status();
+  EXPECT_LT(elapsed, 5 * kDeadline)
+      << "SendPullRequest held its caller for " << elapsed
+      << " against a deadline of " << kDeadline;
   server->StopServer();
 }
 
@@ -347,7 +393,7 @@ TEST_P(ControlPlaneBackendTest, ConcurrentRequestsOverSharedBackend) {
         req.src_block_ids = {static_cast<int64_t>(i)};
         req.dst_block_ids = {static_cast<int64_t>(i)};
         absl::StatusOr<PullStreamResponseSpec> resp =
-            client->SendPullRequest(endpoint, req, absl::Seconds(5));
+            client->SendPullRequest(endpoint, req, absl::Seconds(5)).Await();
         EXPECT_TRUE(resp.ok()) << resp.status();
         if (resp.ok()) {
           EXPECT_EQ(resp->status, 0);
@@ -478,6 +524,73 @@ TEST(GrpcControlPlaneBackendLruTest, ZeroCapacityBypassesCache) {
   EXPECT_EQ(client.TEST_CachedStubCount(), 0u);
   EXPECT_FALSE(client.TEST_HasCachedStub(ep));
 
+  server.StopServer();
+}
+
+// The point of the async path: SendPullRequest returns while the peer is
+// still sitting on the handshake, so the caller's thread is not held.
+TEST(GrpcControlPlaneBackendAsyncTest, SendPullRequestReturnsBeforeResponse) {
+  absl::Notification release;
+  MockControlPlaneHandler handler;
+  handler.SetPullStreamCallback(
+      [&](const PullStreamRequestSpec& req, absl::string_view fallback_ip) {
+        release.WaitForNotificationWithTimeout(absl::Seconds(10));
+        return PullStreamResponseSpec{};
+      });
+  GrpcControlPlaneBackend server;
+  absl::StatusOr<int> bound_port = server.StartServer(0, &handler);
+  ASSERT_TRUE(bound_port.ok()) << bound_port.status();
+
+  GrpcControlPlaneBackend client;
+  PullStreamRequestSpec req;
+  req.uuid = 9;
+  const absl::Time start = absl::Now();
+  tsl::Future<PullStreamResponseSpec> response = client.SendPullRequest(
+      absl::StrCat("127.0.0.1:", *bound_port), req, absl::Seconds(10));
+  EXPECT_LT(absl::Now() - start, absl::Seconds(1))
+      << "SendPullRequest blocked its caller";
+  absl::SleepFor(absl::Milliseconds(200));
+  EXPECT_FALSE(response.IsReady());
+
+  release.Notify();
+  EXPECT_TRUE(response.Await().ok()) << response.Await().status();
+  server.StopServer();
+}
+
+// Destroying the backend must not leave a callback to run against freed
+// state: it cancels outstanding pulls and waits for their callbacks.
+TEST(GrpcControlPlaneBackendAsyncTest, DestructionCancelsPendingPull) {
+  absl::Notification release;
+  MockControlPlaneHandler handler;
+  handler.SetPullStreamCallback(
+      [&](const PullStreamRequestSpec& req, absl::string_view fallback_ip) {
+        release.WaitForNotificationWithTimeout(absl::Seconds(10));
+        return PullStreamResponseSpec{};
+      });
+  GrpcControlPlaneBackend server;
+  absl::StatusOr<int> bound_port = server.StartServer(0, &handler);
+  ASSERT_TRUE(bound_port.ok()) << bound_port.status();
+
+  auto client = std::make_unique<GrpcControlPlaneBackend>();
+  PullStreamRequestSpec req;
+  req.uuid = 10;
+  tsl::Future<PullStreamResponseSpec> response = client->SendPullRequest(
+      absl::StrCat("127.0.0.1:", *bound_port), req, absl::Seconds(10));
+  std::atomic<bool> callback_ran{false};
+  response.OnReady([&](const absl::StatusOr<PullStreamResponseSpec>&) {
+    callback_ran = true;
+  });
+  absl::SleepFor(absl::Milliseconds(100));
+
+  const absl::Time start = absl::Now();
+  client.reset();
+  EXPECT_LT(absl::Now() - start, absl::Seconds(2));
+  EXPECT_TRUE(callback_ran) << "destructor returned before the callback ran";
+  ASSERT_TRUE(response.IsReady());
+  EXPECT_TRUE(absl::IsCancelled(response.Await().status()))
+      << response.Await().status();
+
+  release.Notify();
   server.StopServer();
 }
 

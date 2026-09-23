@@ -127,8 +127,8 @@ class TransferReceiveSession
   // ready.
   bool IsReadyToComplete() const;
 
-  // Schedules the consumer pull handshake on |base_->push_pool()| and updates
-  // session state upon completion or error.
+  // Starts the consumer pull handshake through the control backend without
+  // blocking, and updates session state upon completion or error.
   void ExecutePullRequest(KVCacheManagerWithTransfer& manager,
                           const std::string& remote_endpoint);
 

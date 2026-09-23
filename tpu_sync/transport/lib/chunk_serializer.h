@@ -23,6 +23,7 @@
 #include "absl/container/inlined_vector.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_generated.h"
@@ -37,12 +38,40 @@ inline constexpr uint16_t kRaidenMagic =
     static_cast<uint16_t>(flatbuf::Constant_MAGIC);
 static_assert(kRaidenMagic == 0x4452);
 
+inline constexpr uint16_t kChunkHeaderCurrentVersion = 2;
+inline constexpr uint16_t kChunkHeaderMinSupportedVersion = 1;
+inline constexpr uint16_t kChunkHeaderMaxSupportedVersion = 2;
+
+// Returns true if `ver` is within the supported version range
+// [kChunkHeaderMinSupportedVersion, kChunkHeaderMaxSupportedVersion].
+inline constexpr bool IsSupportedChunkHeaderVersion(uint16_t ver) {
+  return ver >= kChunkHeaderMinSupportedVersion &&
+         ver <= kChunkHeaderMaxSupportedVersion;
+}
+
+// Validates the incoming chunk header version against the supported range.
+// Returns absl::FailedPreconditionError if the version is unsupported (e.g.
+// diff >= 2).
+inline absl::Status ValidateChunkHeaderVersion(uint16_t ver) {
+  if (ver < kChunkHeaderMinSupportedVersion ||
+      ver > kChunkHeaderMaxSupportedVersion) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("Unsupported chunk header flatbuf version: ", ver,
+                     " (current version: ", kChunkHeaderCurrentVersion,
+                     ", supported: ", kChunkHeaderMinSupportedVersion, " to ",
+                     kChunkHeaderMaxSupportedVersion, ")"));
+  }
+  return absl::OkStatus();
+}
+
+static_assert(sizeof(flatbuf::ChunkHeaderV1) == kChunkHeaderSize);
 static_assert(sizeof(flatbuf::ChunkHeader) == kChunkHeaderSize);
 
 // Returns the size of a chunk metadata for the given version.
 constexpr size_t GetChunkMetadataSize(uint16_t ver) {
   switch (ver) {
     case 1:
+    case 2:
       return 24;
     default:
       return 0;

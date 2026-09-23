@@ -1,10 +1,29 @@
 namespace tpu_raiden.transport.lib.flatbuf;
 
-// Do not change.
 enum Constant:uint16 {
   MAGIC = 0x4452,  // 'RD' in little endian.
 }
 
+// v1 header layout for backwards compatibility (ver = 1).
+struct ChunkHeaderV1 {
+  magic:uint16;
+  ver:uint16;
+  op:uint8;
+  flags:uint8;
+  buffer_id:uint16;
+  reserved:uint16;
+  metadata_size:uint16;
+  remote_id:uint32;
+  local_id:uint32;
+  count_or_size:uint32;
+  uuid:uint64;
+  padding:uint64;
+  padding1:uint64;
+  padding2:uint64;
+  padding3:uint64;
+}
+
+// Latest header layout corresponding to the latest version (ver = 2).
 struct ChunkHeader {
   // Two fixed fields. Do not change.
   magic:uint16;
@@ -18,14 +37,14 @@ struct ChunkHeader {
   buffer_id:uint16;
   reserved:uint16;
   metadata_size:uint16;
-  remote_id:uint32;
+  padding0:uint32;  // Explicit padding for 8-byte alignment of remote_id.
+  remote_id:uint64;
   local_id:uint32;
-  count_or_size:uint32;
+  padding1:uint32;  // Explicit padding for 8-byte alignment of count_or_size.
+  count_or_size:uint64;
   uuid:uint64;
 
   // Paddings to keep the header size always 64 bytes.
-  padding0:uint64;
-  padding1:uint64;
   padding2:uint64;
   padding3:uint64;
 // LINT.ThenChange(chunk.h)

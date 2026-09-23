@@ -168,6 +168,7 @@ if [ "$BUILD_JAX" = true ]; then
   echo "Configuring build for JAX..."
   BAZEL_TARGETS+=(
     "//tpu_sync/frameworks/jax:_tpu_raiden_jax"
+    "//tpu_sync/frameworks/jax:_weight_synchronizer_ffi"
   )
 else
   DEFINE_FLAGS+=" --define with_jax=false"
@@ -370,6 +371,7 @@ echo "=== Copying compiled shared libraries to source directory ==="
 if [ "$BUILD_JAX" = true ]; then
   echo "Copying JAX artifacts..."
   cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/jax/_tpu_raiden_jax.so" "${WORKSPACE_DIR}/tpu_sync/frameworks/jax/"
+  cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/jax/_weight_synchronizer_ffi.so" "${WORKSPACE_DIR}/tpu_sync/frameworks/jax/"
 fi
 
 if [ "${BUILD_TORCH}" = true ]; then

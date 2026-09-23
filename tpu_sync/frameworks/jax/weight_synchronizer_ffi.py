@@ -24,6 +24,22 @@ import numpy as np
 from tpu_sync.frameworks.jax import _weight_synchronizer_ffi
 from tpu_sync.frameworks.jax import utils
 
+_orig_compute_on = compute_on.compute_on
+
+
+def _compat_compute_on(f=None, *, compute_type="device_host", **kwargs):
+  """Compatibility wrapper around compute_on.compute_on for Google3 and OSS JAX."""
+  try:
+    if f is not None:
+      return _orig_compute_on(f, compute_type=compute_type, **kwargs)
+    return _orig_compute_on(compute_type=compute_type, **kwargs)
+  except TypeError:
+    cm = _orig_compute_on(compute_type=compute_type)
+    return cm(f) if f is not None else cm
+
+
+compute_on.compute_on = _compat_compute_on
+
 
 def _prepare_shard_info(
     shard_idx: jax.Array,

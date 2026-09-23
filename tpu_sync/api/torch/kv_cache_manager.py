@@ -518,3 +518,122 @@ class KVCacheManager:
   def is_listener_active(self) -> bool:
     """Returns whether the native C++ KVCacheListener is actively running."""
     return self._impl.is_listener_active
+
+  # =========================================================================
+  # EXPERIMENTAL SHARED-MEMORY DMA APIs
+  # The following APIs register a caller-owned host memory pool for TPU DMA
+  # and transfer directly to and from tensors inside that pool, bypassing the
+  # manager's own host staging blocks. They are experimental and subject to
+  # change in future releases.
+  # =========================================================================
+
+  def experimental_map_shared_memory(
+      self, mapped_address: int, pool_size_bytes: int
+  ) -> None:
+    """[EXPERIMENTAL] Registers an existing whole-pool mapping for TPU DMA.
+
+    WARNING: This API is experimental and subject to change in future releases.
+
+    The external pool owner must keep this process-local virtual address
+    mapped and page-locked until ``experimental_unmap_shared_memory``
+    succeeds.
+
+    At most one pool may be mapped at a time; mapping a different pool
+    requires unmapping the current one first.
+
+    Args:
+      mapped_address: Process-local virtual address of the shared pool.
+      pool_size_bytes: Total byte length of the shared pool.
+    """
+    self._impl.map_shared_memory(mapped_address, pool_size_bytes)
+
+  def experimental_unmap_shared_memory(self) -> None:
+    """[EXPERIMENTAL] Drains submitted copies and releases the registration.
+
+    WARNING: This API is experimental and subject to change in future releases.
+    """
+    self._impl.unmap_shared_memory()
+
+  @property
+  def experimental_is_shared_memory_mapped(self) -> bool:
+    """[EXPERIMENTAL] Returns whether shared memory is currently DMA mapped.
+
+    WARNING: This API is experimental and subject to change in future releases.
+    """
+    return self._impl.is_shared_memory_mapped
+
+  def experimental_d2h(
+      self,
+      block_ids: List[int],
+      object_tensors: List[Any],
+      rank_id: int,
+  ) -> Any:
+    """[EXPERIMENTAL] Copies device KV cache blocks into mapped host tensors.
+
+    WARNING: This API is experimental and subject to change in future releases.
+
+    This is not the same addressing scheme as ``d2h``. ``d2h`` takes block
+    offsets into the manager's own host staging buffers; this transfers
+    directly into caller-owned CPU tensors that live inside the shared memory
+    pool registered by ``experimental_map_shared_memory``. DMA is issued
+    against those tensors' memory, so the pool must still be mapped and every
+    tensor must lie entirely inside it.
+
+    Each object tensor is contiguous with a 1-byte dtype (e.g. ``uint8`` or
+    ``int8``) and shape ``[num_ranks, num_layers, page_nbytes]``. Only the
+    ``rank_id`` slice takes part: for layer ``l``, the ``page_nbytes`` bytes at
+    ``tensor[rank_id, l]`` are filled from block ``block_ids[i]`` of layer
+    ``l``'s device buffer, where ``i`` is that tensor's index.
+
+    Args:
+      block_ids: Device block ids, one per object tensor. These are block
+        indices, not byte offsets. Must be unique and within
+        ``[0, num_blocks)``.
+      object_tensors: Caller-owned contiguous CPU tensors with a 1-byte dtype
+        and shape ``[num_ranks, num_layers, page_nbytes]``, residing inside the
+        mapped pool. One per entry of ``block_ids``.
+      rank_id: Index into each tensor's first dimension, selecting which
+        rank's slice to transfer.
+
+    Returns:
+      A future representing the asynchronous copy transfer operation.
+    """
+    return self._impl.d2h(list(block_ids), list(object_tensors), int(rank_id))
+
+  def experimental_h2d(
+      self,
+      block_ids: List[int],
+      object_tensors: List[Any],
+      rank_id: int,
+  ) -> Any:
+    """[EXPERIMENTAL] Copies mapped host tensors into device KV cache blocks.
+
+    WARNING: This API is experimental and subject to change in future releases.
+
+    This is not the same addressing scheme as ``h2d``. ``h2d`` takes block
+    offsets into the manager's own host staging buffers; this transfers
+    directly from caller-owned CPU tensors that live inside the shared memory
+    pool registered by ``experimental_map_shared_memory``. DMA is issued
+    against those tensors' memory, so the pool must still be mapped and every
+    tensor must lie entirely inside it.
+
+    Each object tensor is contiguous with a 1-byte dtype (e.g. ``uint8`` or
+    ``int8``) and shape ``[num_ranks, num_layers, page_nbytes]``. Only the
+    ``rank_id`` slice takes part: for layer ``l``, the ``page_nbytes`` bytes at
+    ``tensor[rank_id, l]`` are written to block ``block_ids[i]`` of layer
+    ``l``'s device buffer, where ``i`` is that tensor's index.
+
+    Args:
+      block_ids: Device block ids, one per object tensor. These are block
+        indices, not byte offsets. Must be unique and within
+        ``[0, num_blocks)``.
+      object_tensors: Caller-owned contiguous CPU tensors with a 1-byte dtype
+        and shape ``[num_ranks, num_layers, page_nbytes]``, residing inside the
+        mapped pool. One per entry of ``block_ids``.
+      rank_id: Index into each tensor's first dimension, selecting which
+        rank's slice to transfer.
+
+    Returns:
+      A future representing the asynchronous copy transfer operation.
+    """
+    return self._impl.h2d(list(block_ids), list(object_tensors), int(rank_id))

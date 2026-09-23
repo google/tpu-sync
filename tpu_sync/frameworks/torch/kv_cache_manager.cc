@@ -38,6 +38,7 @@
 #include "tpu_sync/core/controller/worker_service_server.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/kv_manager_holder.h"
+#include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/core/utils.h"
 #include "tpu_sync/frameworks/torch/torch_utils.h"
@@ -193,7 +194,19 @@ TorchKVCacheManager::TorchKVCacheManager(
           /*num_slots=*/0, /*timeout_s=*/120.0),
       kv_caches_({}) {}
 
-TorchKVCacheManager::~TorchKVCacheManager() = default;
+TorchKVCacheManager::~TorchKVCacheManager() {
+  // Drain external copies here rather than leaving it to ~KVCacheManagerBase.
+  // base_ is owned by KVCacheManagerWithTransfer and so is torn down after
+  // this subobject; any completion that reaches back into the derived manager
+  // at that point would touch freed memory.
+  if (base()->is_shared_memory_mapped()) {
+    const absl::Status status = base()->UnmapSharedMemory();
+    if (!status.ok()) {
+      LOG(ERROR) << "TorchKVCacheManager shared memory unmap failed: "
+                 << status;
+    }
+  }
+}
 
 std::optional<int> TorchKVCacheManager::listener_port() const {
   if (listener_) {
@@ -444,6 +457,101 @@ int KVCacheManager::GetRaidenWorkerPort() const {
     return private_grpc_server_->GetRaidenWorkerPort();
   }
   return controller::WorkerServiceServer::GetInstance().GetRaidenWorkerPort();
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture> TorchKVCacheManager::H2d(
+    const std::vector<int64_t>& block_ids,
+    const std::vector<at::Tensor>& object_tensors, int64_t rank_id) {
+  return CopyObjectBlocks(block_ids, object_tensors, rank_id, /*is_h2d=*/true);
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture> TorchKVCacheManager::D2h(
+    const std::vector<int64_t>& block_ids,
+    const std::vector<at::Tensor>& object_tensors, int64_t rank_id) {
+  return CopyObjectBlocks(block_ids, object_tensors, rank_id, /*is_h2d=*/false);
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture> TorchKVCacheManager::CopyObjectBlocks(
+    const std::vector<int64_t>& block_ids,
+    const std::vector<at::Tensor>& object_tensors, int64_t rank_id,
+    bool is_h2d) {
+  // Only at::Tensor-shaped validation belongs here.  The transfer itself is
+  // framework agnostic and lives on KVCacheManagerBase so the JAX frontend can
+  // reuse it; this function reduces the tensors to raw host pointers plus the
+  // [num_ranks, num_layers, page_nbytes] geometry the base needs.
+  //
+  // Check the request against the manager before the tensors: num_layers is
+  // meaningless without registered device buffers, so validating shapes first
+  // would report a layer-count mismatch for a manager that simply has no
+  // device KV cache.  CopyExternalObjectBlocks repeats this check.
+  absl::Status request_status = base()->ValidateExternalObjectRequest(
+      block_ids, object_tensors.size(), rank_id);
+  if (!request_status.ok()) {
+    return request_status;
+  }
+
+  const size_t num_layers = base()->num_layers();
+
+  size_t page_nbytes = 0;
+  size_t num_ranks = 0;
+  std::vector<uint8_t*> host_bases;
+  host_bases.reserve(object_tensors.size());
+
+  for (size_t obj_id = 0; obj_id < object_tensors.size(); ++obj_id) {
+    const at::Tensor& tensor = object_tensors[obj_id];
+    if (!tensor.device().is_cpu()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("object_tensors[", obj_id, "] must be a CPU tensor"));
+    }
+    if (!tensor.is_contiguous()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "object_tensors[", obj_id,
+          "] must be contiguous; a nonzero storage offset is allowed"));
+    }
+    if (tensor.dim() != 3 || tensor.element_size() != 1) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "object_tensors[", obj_id,
+          "] must be a rank-3 CPU tensor with a 1-byte dtype and shape "
+          "[num_ranks, ",
+          num_layers, ", page_nbytes]"));
+    }
+    if (tensor.size(0) <= 0 ||
+        tensor.size(1) != static_cast<int64_t>(num_layers) ||
+        tensor.size(2) <= 0) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "object_tensors[", obj_id, "] must have shape [num_ranks, ",
+          num_layers,
+          ", page_nbytes] with num_ranks > 0 and page_nbytes > 0"));
+    }
+
+    if (obj_id == 0) {
+      num_ranks = static_cast<size_t>(tensor.size(0));
+      page_nbytes = static_cast<size_t>(tensor.size(2));
+    } else if (static_cast<size_t>(tensor.size(0)) != num_ranks) {
+      return absl::InvalidArgumentError(
+          "all object_tensors must have the same num_ranks dimension");
+    } else if (static_cast<size_t>(tensor.size(2)) != page_nbytes) {
+      return absl::InvalidArgumentError(
+          "all object_tensors must have the same page_nbytes dimension");
+    }
+
+    const size_t expected_object_bytes = num_ranks * num_layers * page_nbytes;
+    if (static_cast<size_t>(tensor.nbytes()) != expected_object_bytes) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("object_tensors[", obj_id, "] has ", tensor.nbytes(),
+                       " bytes, expected ", expected_object_bytes));
+    }
+
+    host_bases.push_back(static_cast<uint8_t*>(tensor.data_ptr()));
+  }
+
+  // Keeps the caller's storage alive for as long as any issued copy still
+  // references it, including on a partial submit failure.
+  auto tensor_holds = std::make_shared<std::vector<at::Tensor>>(object_tensors);
+
+  return base()->CopyExternalObjectBlocks(block_ids, host_bases, num_ranks,
+                                          page_nbytes, rank_id, is_h2d,
+                                          std::move(tensor_holds));
 }
 
 }  // namespace torch

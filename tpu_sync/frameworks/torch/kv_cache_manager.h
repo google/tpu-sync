@@ -105,7 +105,22 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
   absl::Status WriteBlockBytes(size_t layer_idx, int block_id,
                                absl::string_view payload, size_t shard_idx = 0);
 
+  // The legacy offset-based H2d/D2h live on KVCacheManagerBase, reached via
+  // base(); they are not hidden by the object-tensor overloads below.
+  // Overloaded H2D and D2H operating on external PyTorch object tensor views
+  absl::StatusOr<raiden::PjRtCopyFuture> H2d(
+      const std::vector<int64_t>& block_ids,
+      const std::vector<at::Tensor>& object_tensors, int64_t rank_id);
+
+  absl::StatusOr<raiden::PjRtCopyFuture> D2h(
+      const std::vector<int64_t>& block_ids,
+      const std::vector<at::Tensor>& object_tensors, int64_t rank_id);
+
  private:
+  absl::StatusOr<raiden::PjRtCopyFuture> CopyObjectBlocks(
+      const std::vector<int64_t>& block_ids,
+      const std::vector<at::Tensor>& object_tensors, int64_t rank_id,
+      bool is_h2d);
   // Buffers unpacked from a 2D tensor list, together with the owning
   // TensorBufferHandles that must outlive their use (see UnpackTorchTensor).
   struct UnpackedLayers {
@@ -334,6 +349,42 @@ class KVCacheManager {
     return torch_manager_->base()->D2h(
         src_offsets_major_dim, dst_offsets_major_dim, copy_sizes_major_dim,
         slot_idx, layer_idx, shard_idx);
+  }
+
+  absl::Status MapSharedMemory(uintptr_t mapped_address,
+                               size_t pool_size_bytes) {
+    return torch_manager_->base()->MapSharedMemory(
+        reinterpret_cast<void*>(mapped_address), pool_size_bytes);
+  }
+
+  absl::Status UnmapSharedMemory() {
+    return torch_manager_->base()->UnmapSharedMemory();
+  }
+
+  bool is_shared_memory_mapped() const {
+    return torch_manager_->base()->is_shared_memory_mapped();
+  }
+
+  void SetSharedMemoryMappedForTest(uintptr_t mapped_address,
+                                    size_t pool_size_bytes) {
+    torch_manager_->base()->SetSharedMemoryMappedForTest(
+        reinterpret_cast<void*>(mapped_address), pool_size_bytes);
+  }
+
+  void ResetSharedMemoryMappedForTest() {
+    torch_manager_->base()->ResetSharedMemoryMappedForTest();
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2d(
+      const std::vector<int64_t>& block_ids,
+      const std::vector<at::Tensor>& object_tensors, int64_t rank_id) {
+    return torch_manager_->H2d(block_ids, object_tensors, rank_id);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> D2h(
+      const std::vector<int64_t>& block_ids,
+      const std::vector<at::Tensor>& object_tensors, int64_t rank_id) {
+    return torch_manager_->D2h(block_ids, object_tensors, rank_id);
   }
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>

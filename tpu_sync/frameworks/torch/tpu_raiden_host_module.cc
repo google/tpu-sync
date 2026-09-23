@@ -224,6 +224,26 @@ NB_MODULE(_tpu_raiden_host, m) {
           },
           nb::arg("block_array_idx"))
       .def_prop_ro("transfer_address", &HostKVCacheManager::transfer_address)
+      .def(
+          "map_shared_memory",
+          [](HostKVCacheManager& self, uintptr_t mapped_address,
+             size_t pool_size_bytes) {
+            ThrowIfError(self.base()->MapSharedMemory(
+                             reinterpret_cast<void*>(mapped_address),
+                             pool_size_bytes),
+                         "KVCacheManager map_shared_memory failed");
+          },
+          nb::arg("mapped_address"), nb::arg("pool_size_bytes"))
+      .def(
+          "unmap_shared_memory",
+          [](HostKVCacheManager& self) {
+            ThrowIfError(self.base()->UnmapSharedMemory(),
+                         "KVCacheManager unmap_shared_memory failed");
+          })
+      .def_prop_ro("is_shared_memory_mapped",
+                   [](const HostKVCacheManager& self) {
+                     return self.base()->is_shared_memory_mapped();
+                   })
       .def("get_local_endpoints",
            [](const HostKVCacheManager& self) {
              auto eps = self.get_local_endpoints();

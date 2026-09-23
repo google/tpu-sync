@@ -529,6 +529,29 @@ TEST(KVCacheManagerTest, PoolBlockCopiesRejectHostOnlyManager) {
   EXPECT_THAT(h2d.status().message(), testing::HasSubstr("host-only"));
 }
 
+// The torch frontend cannot produce a null base, but this entry point is
+// shared with JAX, so the base must reject one itself: the offset arithmetic
+// downstream is undefined behaviour on a null pointer, and a nonzero rank
+// offset would carry it past the null check in ValidateExternalRangeLocked.
+TEST(KVCacheManagerTest, CopyExternalObjectBlocksRejectsNullHostBase) {
+  KVCacheManagerBase manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/64,
+                             /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/2);
+  manager.AttachPlaceholderDeviceHoldForTest();
+
+  const absl::Status status = manager
+                                  .CopyExternalObjectBlocks(
+                                      /*block_ids=*/{0},
+                                      /*host_block_bases=*/{nullptr},
+                                      /*num_ranks=*/1, /*page_nbytes=*/64,
+                                      /*rank_id=*/0, /*is_h2d=*/true,
+                                      /*keep_alive=*/nullptr)
+                                  .status();
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(status.message(), testing::HasSubstr("is null"));
+}
+
 // Without RegisterPools the manager exposes one implicit Opaque pool per
 // storage and reports no explicit pools.
 TEST(KVCacheManagerTest, ImplicitPoolsMirrorStorages) {

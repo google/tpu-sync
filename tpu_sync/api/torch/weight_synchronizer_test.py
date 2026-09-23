@@ -134,6 +134,34 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
     self.assertTrue(hasattr(ws, "wait_for_transfer_completion"))
     self.assertTrue(callable(ws.wait_for_transfer_completion))
 
+  def test_init_without_bind_ip_and_empty_data_nics(self):
+    """Verifies that WeightSynchronizer initialization does not crash (SIGFPE)
+
+    when bind_ip is None and data_nics is empty (e.g. on standard GKE pods).
+    """
+    old_data_nics = os.environ.get("TPU_RAIDEN_DATA_NICS")
+    borg_keys = ["BORG_TASK_HANDLE", "BORG_ALLOC_DIR", "BORG_CELL"]
+    saved_borg = {k: os.environ.pop(k, None) for k in borg_keys}
+    os.environ["TPU_RAIDEN_DATA_NICS"] = "nonexistent_nic_test"
+    try:
+      shape = (self.block_size, 128, 8)
+      tensors = [
+          [torch.zeros(shape, dtype=torch.float32, device=self.device)]
+          for _ in range(self.num_layers)
+      ]
+      ws = WeightSynchronizer(
+          tensors, local_port=0, parallelism=1, bind_ip=None
+      )
+      self.assertIsNotNone(ws.local_port)
+    finally:
+      for k, v in saved_borg.items():
+        if v is not None:
+          os.environ[k] = v
+      if old_data_nics is not None:
+        os.environ["TPU_RAIDEN_DATA_NICS"] = old_data_nics
+      else:
+        os.environ.pop("TPU_RAIDEN_DATA_NICS", None)
+
   @parameterized.named_parameters(
       ("fp32", torch.float32),
       ("bf16", torch.bfloat16),

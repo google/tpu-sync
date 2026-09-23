@@ -393,22 +393,13 @@ void NumaAwareWeightSynchronizer::InitSubManagers(
 
       std::optional<std::string> sub_bind_ip = bind_ip;
       if (!sub_bind_ip.has_value() || sub_bind_ip->empty()) {
-        bool found_nic = false;
-        for (const auto& nic : data_nics) {
-          if (nic.numa_node == numa) {
-            sub_bind_ip = nic.ip_address;
-            found_nic = true;
-            break;
-          }
-        }
-        if (!found_nic) {
-          int fallback_idx =
-              (numa >= 0 && numa < static_cast<int>(data_nics.size()))
-                  ? numa
-                  : (sub_idx % data_nics.size());
-          if (!data_nics.empty()) {
-            sub_bind_ip = data_nics[fallback_idx].ip_address;
-          }
+        auto it = std::find_if(
+            data_nics.begin(), data_nics.end(),
+            [numa](const auto& nic) { return nic.numa_node == numa; });
+        if (it != data_nics.end()) {
+          sub_bind_ip = it->ip_address;
+        } else if (!data_nics.empty()) {
+          sub_bind_ip = data_nics[sub_idx % data_nics.size()].ip_address;
         }
       }
       LOG(INFO) << "[NumaAwareWeightSynchronizer] Submanager " << sub_idx

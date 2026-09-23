@@ -1174,7 +1174,7 @@ TEST_P(BlockTransportTest,
   EXPECT_THAT(status1, StatusIs(absl::StatusCode::kUnavailable));
 
   constexpr absl::string_view kExpectedError1 =
-      "tpu_raiden_transfer_failures_total{direction=\"push\","
+      "tpu_raiden_weight_sync_transfer_failures_total{direction=\"push\","
       "error_code=\"UNAVAILABLE\"} 1";
   EXPECT_THAT(WaitForMetricSnapshot(kExpectedError1),
               HasSubstr(kExpectedError1));
@@ -1192,7 +1192,7 @@ TEST_P(BlockTransportTest,
   EXPECT_THAT(status2, StatusIs(absl::StatusCode::kUnavailable));
 
   constexpr absl::string_view kExpectedError2 =
-      "tpu_raiden_transfer_failures_total{direction=\"push\","
+      "tpu_raiden_weight_sync_transfer_failures_total{direction=\"push\","
       "error_code=\"UNAVAILABLE\"} 2";
   EXPECT_THAT(WaitForMetricSnapshot(kExpectedError2),
               HasSubstr(kExpectedError2));

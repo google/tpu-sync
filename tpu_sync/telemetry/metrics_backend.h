@@ -93,6 +93,31 @@ inline constexpr absl::string_view kD2hTransferTimeMs = "d2h_transfer_time_ms";
 inline constexpr absl::string_view kBufferAllocatedBytes =
     "buffer_allocated_bytes";
 
+inline constexpr absl::string_view kWeightSyncSentBytesTotal =
+    "weight_sync_sent_bytes_total";
+inline constexpr absl::string_view kWeightSyncReceivedBytesTotal =
+    "weight_sync_received_bytes_total";
+inline constexpr absl::string_view kWeightSyncTransferFailuresTotal =
+    "weight_sync_transfer_failures_total";
+inline constexpr absl::string_view kWeightSyncP2pTransferTimeMs =
+    "weight_sync_p2p_transfer_time_ms";
+inline constexpr absl::string_view kWeightSyncD2hTransferTimeMs =
+    "weight_sync_d2h_transfer_time_ms";
+inline constexpr absl::string_view kWeightSyncH2dTransferTimeMs =
+    "weight_sync_h2d_transfer_time_ms";
+inline constexpr absl::string_view kWeightSyncPushDurationMs =
+    "weight_sync_push_duration_ms";
+inline constexpr absl::string_view kWeightSyncE2eBroadcastDurationMs =
+    "weight_sync_e2e_broadcast_duration_ms";
+inline constexpr absl::string_view kWeightSyncBufferAllocatedBytes =
+    "weight_sync_buffer_allocated_bytes";
+inline constexpr absl::string_view kWeightSyncTilingTimeMs =
+    "weight_sync_tiling_time_ms";
+inline constexpr absl::string_view kWeightSyncDetilingTimeMs =
+    "weight_sync_detiling_time_ms";
+inline constexpr absl::string_view kWeightSyncScheduleGenerationTimeMs =
+    "weight_sync_schedule_generation_time_ms";
+
 }  // namespace metric_names
 
 namespace metric_descriptions {
@@ -116,6 +141,33 @@ inline constexpr absl::string_view kH2dTransferTimeMs =
     "Host-to-Device transfer latency in milliseconds.";
 inline constexpr absl::string_view kD2hTransferTimeMs =
     "Device-to-Host transfer latency in milliseconds.";
+
+inline constexpr absl::string_view kWeightSyncSentBytesTotal =
+    "Total count of bytes sent over TPU Raiden weight sync interfaces.";
+inline constexpr absl::string_view kWeightSyncReceivedBytesTotal =
+    "Total count of bytes received over TPU Raiden weight sync interfaces.";
+inline constexpr absl::string_view kWeightSyncTransferFailuresTotal =
+    "Cumulative total count of transfer failures during weight "
+    "synchronization.";
+inline constexpr absl::string_view kWeightSyncP2pTransferTimeMs =
+    "Peer-to-Peer network transfer latency for weight sync in milliseconds.";
+inline constexpr absl::string_view kWeightSyncD2hTransferTimeMs =
+    "Device-to-Host transfer latency for weight sync in milliseconds.";
+inline constexpr absl::string_view kWeightSyncH2dTransferTimeMs =
+    "Host-to-Device transfer latency for weight sync in milliseconds.";
+inline constexpr absl::string_view kWeightSyncPushDurationMs =
+    "Duration of weight sync push operations in milliseconds.";
+inline constexpr absl::string_view kWeightSyncE2eBroadcastDurationMs =
+    "End-to-end broadcast transfer duration for weight sync in milliseconds.";
+inline constexpr absl::string_view kWeightSyncBufferAllocatedBytes =
+    "Current host DRAM buffer capacity allocated in bytes for weight sync "
+    "staging across all layers and shards.";
+inline constexpr absl::string_view kWeightSyncTilingTimeMs =
+    "Time spent tiling weight buffers in milliseconds.";
+inline constexpr absl::string_view kWeightSyncDetilingTimeMs =
+    "Time spent detiling weight buffers in milliseconds.";
+inline constexpr absl::string_view kWeightSyncScheduleGenerationTimeMs =
+    "Time spent generating weight sync transfer schedule in milliseconds.";
 
 }  // namespace metric_descriptions
 
@@ -175,10 +227,87 @@ inline constexpr MetricMetadata kBufferAllocatedBytes{
     .description = metric_descriptions::kBufferAllocatedBytes,
     .type = MetricType::kGauge};
 
+inline constexpr MetricMetadata kWeightSyncSentBytesTotal{
+    .name = metric_names::kWeightSyncSentBytesTotal,
+    .description = metric_descriptions::kWeightSyncSentBytesTotal,
+    .type = MetricType::kCounter};
+
+inline constexpr MetricMetadata kWeightSyncReceivedBytesTotal{
+    .name = metric_names::kWeightSyncReceivedBytesTotal,
+    .description = metric_descriptions::kWeightSyncReceivedBytesTotal,
+    .type = MetricType::kCounter};
+
+inline constexpr MetricMetadata kWeightSyncTransferFailuresTotal{
+    .name = metric_names::kWeightSyncTransferFailuresTotal,
+    .description = metric_descriptions::kWeightSyncTransferFailuresTotal,
+    .type = MetricType::kCounter};
+
+inline constexpr MetricMetadata kWeightSyncP2pTransferTimeMs{
+    .name = metric_names::kWeightSyncP2pTransferTimeMs,
+    .description = metric_descriptions::kWeightSyncP2pTransferTimeMs,
+    .type = MetricType::kHistogram};
+
+inline constexpr MetricMetadata kWeightSyncD2hTransferTimeMs{
+    .name = metric_names::kWeightSyncD2hTransferTimeMs,
+    .description = metric_descriptions::kWeightSyncD2hTransferTimeMs,
+    .type = MetricType::kHistogram};
+
+inline constexpr MetricMetadata kWeightSyncH2dTransferTimeMs{
+    .name = metric_names::kWeightSyncH2dTransferTimeMs,
+    .description = metric_descriptions::kWeightSyncH2dTransferTimeMs,
+    .type = MetricType::kHistogram};
+
+inline constexpr MetricMetadata kWeightSyncPushDurationMs{
+    .name = metric_names::kWeightSyncPushDurationMs,
+    .description = metric_descriptions::kWeightSyncPushDurationMs,
+    .type = MetricType::kHistogram};
+
+inline constexpr MetricMetadata kWeightSyncE2eBroadcastDurationMs{
+    .name = metric_names::kWeightSyncE2eBroadcastDurationMs,
+    .description = metric_descriptions::kWeightSyncE2eBroadcastDurationMs,
+    .type = MetricType::kHistogram};
+
+inline constexpr MetricMetadata kWeightSyncBufferAllocatedBytes{
+    .name = metric_names::kWeightSyncBufferAllocatedBytes,
+    .description = metric_descriptions::kWeightSyncBufferAllocatedBytes,
+    .type = MetricType::kGauge};
+
+inline constexpr MetricMetadata kWeightSyncTilingTimeMs{
+    .name = metric_names::kWeightSyncTilingTimeMs,
+    .description = metric_descriptions::kWeightSyncTilingTimeMs,
+    .type = MetricType::kHistogram};
+
+inline constexpr MetricMetadata kWeightSyncDetilingTimeMs{
+    .name = metric_names::kWeightSyncDetilingTimeMs,
+    .description = metric_descriptions::kWeightSyncDetilingTimeMs,
+    .type = MetricType::kHistogram};
+
+inline constexpr MetricMetadata kWeightSyncScheduleGenerationTimeMs{
+    .name = metric_names::kWeightSyncScheduleGenerationTimeMs,
+    .description = metric_descriptions::kWeightSyncScheduleGenerationTimeMs,
+    .type = MetricType::kHistogram};
+
 inline constexpr MetricMetadata kAllMetrics[] = {
-    kSentBytesTotal,     kReceivedBytesTotal,   kTransferFailuresTotal,
-    kTransferDurationMs, kP2pTransferTimeMs,    kH2dTransferTimeMs,
-    kD2hTransferTimeMs,  kBufferAllocatedBytes,
+    kSentBytesTotal,
+    kReceivedBytesTotal,
+    kTransferFailuresTotal,
+    kTransferDurationMs,
+    kP2pTransferTimeMs,
+    kH2dTransferTimeMs,
+    kD2hTransferTimeMs,
+    kBufferAllocatedBytes,
+    kWeightSyncSentBytesTotal,
+    kWeightSyncReceivedBytesTotal,
+    kWeightSyncTransferFailuresTotal,
+    kWeightSyncP2pTransferTimeMs,
+    kWeightSyncD2hTransferTimeMs,
+    kWeightSyncH2dTransferTimeMs,
+    kWeightSyncPushDurationMs,
+    kWeightSyncE2eBroadcastDurationMs,
+    kWeightSyncBufferAllocatedBytes,
+    kWeightSyncTilingTimeMs,
+    kWeightSyncDetilingTimeMs,
+    kWeightSyncScheduleGenerationTimeMs,
 };
 }  // namespace metric_metadata
 

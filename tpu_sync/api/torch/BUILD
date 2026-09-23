@@ -92,6 +92,7 @@ py_library(
         "@torch_tpu//shims/torch:pytorch",
         # buildcleaner: keep
         "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
+        "//tpu_sync/api:common",
     ],
 )
 

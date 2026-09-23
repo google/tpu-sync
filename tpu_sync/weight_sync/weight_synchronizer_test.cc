@@ -41,6 +41,8 @@
 #include "xla/shape_util.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/telemetry/metrics_api.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
@@ -2010,6 +2012,73 @@ TEST_F(WeightSynchronizerTest,
   EXPECT_GT(elapsed1_ms, 0.0);
   EXPECT_GT(elapsed2_ms, 0.0);
   EXPECT_LT(m.total_h2h_time_ms, elapsed1_ms + elapsed2_ms);
+}
+
+TEST_F(WeightSynchronizerTest, TelemetryRecordsOccupancyAndPushMetrics) {
+  ASSERT_OK(telemetry::RaidenMetricStore::GetGlobalMetricStore()
+                .InitializeFromBackendNames({"buffered"}));
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers_, num_shards_, slice_byte_size_,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers_, num_shards_, slice_byte_size_,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  // Buffer allocation gauge should be recorded
+  auto samples = telemetry::RaidenMetricStore::GetGlobalMetricStore()
+                     .GetAndResetMetricSamples();
+  EXPECT_FALSE(
+      samples[std::string("tpu_raiden_") +
+              std::string(
+                  telemetry::metric_names::kWeightSyncBufferAllocatedBytes)]
+          .empty());
+  EXPECT_GT(
+      samples[std::string("tpu_raiden_") +
+              std::string(
+                  telemetry::metric_names::kWeightSyncBufferAllocatedBytes)]
+          .back(),
+      0.0);
+
+  // Setup simple transfer
+  std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
+  uint64_t uuid = 1234567;
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  request.set_uuid(uuid);
+
+  auto* schedules = request.mutable_shard_push_schedules();
+  auto* entry = (*schedules)[0].add_entries();
+  entry->set_dst_peer(dest_peer);
+  entry->set_dst_shard_idx(0);
+  entry->set_src_offset_bytes(0);
+  entry->set_dst_offset_bytes(0);
+  entry->set_size_bytes(slice_byte_size_);
+  entry->set_count(1);
+  entry->set_layer_idx(0);
+
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(uuid, 1));
+  ASSERT_OK(ws_source->PushWeightsResharded(request));
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(uuid));
+
+  samples = telemetry::RaidenMetricStore::GetGlobalMetricStore()
+                .GetAndResetMetricSamples();
+  EXPECT_FALSE(
+      samples[std::string("tpu_raiden_") +
+              std::string(telemetry::metric_names::kWeightSyncPushDurationMs)]
+          .empty());
+  EXPECT_FALSE(
+      samples[std::string("tpu_raiden_") +
+              std::string(telemetry::metric_names::kWeightSyncSentBytesTotal)]
+          .empty());
+  EXPECT_FALSE(
+      samples[std::string("tpu_raiden_") +
+              std::string(
+                  telemetry::metric_names::kWeightSyncReceivedBytesTotal)]
+          .empty());
+
+  telemetry::RaidenMetricStore::GetGlobalMetricStore().SetBackends({});
 }
 
 }  // namespace

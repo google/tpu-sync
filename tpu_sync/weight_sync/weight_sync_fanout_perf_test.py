@@ -335,6 +335,9 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     ):
       self.addCleanup(self.ctrl_client._control_pipe_client.close)
 
+    weight_synchronizer.configure_telemetry(["buffered"])
+    self.addCleanup(lambda: weight_synchronizer.configure_telemetry([]))
+
     # 3. Instantiate 1 source worker + 4 destination workers
     self.ws_src = (
         weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
@@ -451,6 +454,69 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
         pct_le_512,
         95.0,
         f"Expected >95% tasks with size <= 512 bytes, got {pct_le_512:.2f}%",
+    )
+
+  def test_end_to_end_telemetry_metrics(self):
+    """Verifies RaidenMetricStore end-to-end telemetry across controller and workers."""
+    weight_synchronizer.configure_telemetry(["buffered"])
+    _ = weight_synchronizer.get_and_reset_metric_samples()
+
+    self._fill_position_unique_source_pattern(0x5A)
+    for ws_dst in self.ws_dsts:
+      for l in range(self.num_layers):
+        buf = ws_dst.get_host_buffer(layer_idx=l, shard_idx=0)
+        buf[:] = 0x00
+
+    uuid = 9999
+    future = self.controller.start_transfer(
+        src_units=[self.src_unit],
+        dst_units=self.dst_units,
+        dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+        use_block_chunks=True,
+        is_sender=True,
+        uuid=uuid,
+        req_id="telemetry_test",
+        skip_d2h=True,
+        skip_tiling={l: False for l in range(self.num_layers)},
+    )
+    loop = asyncio.new_event_loop()
+    try:
+      loop.run_until_complete(future.wait())
+    finally:
+      loop.close()
+
+    for ws_dst in self.ws_dsts:
+      ws_dst.wait_for_transfer_completion(uuid=uuid)
+
+    samples = weight_synchronizer.get_and_reset_metric_samples()
+
+    def _has_metric(name: str) -> bool:
+      return any(name in k and len(v) > 0 for k, v in samples.items())
+
+    self.assertTrue(
+        _has_metric("weight_sync_schedule_generation_time_ms"),
+        "weight_sync_schedule_generation_time_ms missing from"
+        f" {samples.keys()}",
+    )
+    self.assertTrue(
+        _has_metric("weight_sync_e2e_broadcast_duration_ms"),
+        f"weight_sync_e2e_broadcast_duration_ms missing from {samples.keys()}",
+    )
+    self.assertTrue(
+        _has_metric("weight_sync_sent_bytes_total"),
+        f"weight_sync_sent_bytes_total missing from {samples.keys()}",
+    )
+    self.assertTrue(
+        _has_metric("weight_sync_received_bytes_total"),
+        f"weight_sync_received_bytes_total missing from {samples.keys()}",
+    )
+    self.assertTrue(
+        _has_metric("weight_sync_p2p_transfer_time_ms"),
+        f"weight_sync_p2p_transfer_time_ms missing from {samples.keys()}",
+    )
+    self.assertTrue(
+        _has_metric("weight_sync_push_duration_ms"),
+        f"weight_sync_push_duration_ms missing from {samples.keys()}",
     )
 
   def _fill_position_unique_source_pattern(self, seed_byte: int) -> None:

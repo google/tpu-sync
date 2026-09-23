@@ -14,6 +14,7 @@
 
 #include "tpu_sync/telemetry/python/telemetry_binding.h"
 
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <string>
@@ -149,6 +150,60 @@ void BindTelemetryApi(nb::module_& m) {
       },
       nb::call_guard<nb::gil_scoped_release>(),
       "Extracts and resets buffered metric samples across all backends.");
+
+  m.def(
+      "increment_counter",
+      [](const std::string& name, uint64_t val,
+         const std::optional<std::map<std::string, std::string>>& labels) {
+        std::vector<MetricLabel> metric_labels;
+        if (labels.has_value()) {
+          metric_labels.reserve(labels->size());
+          for (const auto& [k, v] : *labels) {
+            metric_labels.push_back({k, v});
+          }
+        }
+        RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
+            name, metric_labels, val);
+      },
+      nb::arg("name"), nb::arg("val") = 1, nb::arg("labels") = nb::none(),
+      nb::call_guard<nb::gil_scoped_release>(),
+      "Increments a telemetry counter metric.");
+
+  m.def(
+      "set_gauge",
+      [](const std::string& name, double val,
+         const std::optional<std::map<std::string, std::string>>& labels) {
+        std::vector<MetricLabel> metric_labels;
+        if (labels.has_value()) {
+          metric_labels.reserve(labels->size());
+          for (const auto& [k, v] : *labels) {
+            metric_labels.push_back({k, v});
+          }
+        }
+        RaidenMetricStore::GetGlobalMetricStore().SetGauge(name, metric_labels,
+                                                           val);
+      },
+      nb::arg("name"), nb::arg("val"), nb::arg("labels") = nb::none(),
+      nb::call_guard<nb::gil_scoped_release>(),
+      "Sets the value of a telemetry gauge metric.");
+
+  m.def(
+      "observe_histogram",
+      [](const std::string& name, double val,
+         const std::optional<std::map<std::string, std::string>>& labels) {
+        std::vector<MetricLabel> metric_labels;
+        if (labels.has_value()) {
+          metric_labels.reserve(labels->size());
+          for (const auto& [k, v] : *labels) {
+            metric_labels.push_back({k, v});
+          }
+        }
+        RaidenMetricStore::GetGlobalMetricStore().ObserveHistogram(
+            name, metric_labels, val);
+      },
+      nb::arg("name"), nb::arg("val"), nb::arg("labels") = nb::none(),
+      nb::call_guard<nb::gil_scoped_release>(),
+      "Records an observation for a telemetry histogram metric.");
 }
 
 }  // namespace tpu_raiden::telemetry

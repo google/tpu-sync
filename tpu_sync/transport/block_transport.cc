@@ -1104,20 +1104,12 @@ absl::Status BlockTransport::PushBuffer(absl::string_view peer,
       const lib::Request req,
       lib::BuildBufferRequest(buffer_id, dst_shard_idx, dst_offset_bytes,
                               data_ptr, size_bytes, uuid, lib::kOpBufferPush));
-  absl::Status status = raw_transport_.ProcessSocketBufferPush(peer, req);
-  if (!status.ok()) {
-    RecordTransferFailure(status, metric_labels::kDirectionPush);
-  }
-  return status;
+  return raw_transport_.ProcessSocketBufferPush(peer, req);
 }
 
 absl::Status BlockTransport::PushBuffers(
     const std::vector<BufferPushTask>& tasks, int parallelism, uint64_t uuid) {
-  absl::Status status = raw_transport_.PushBuffers(tasks, parallelism, uuid);
-  if (!status.ok()) {
-    RecordTransferFailure(status, metric_labels::kDirectionPush);
-  }
-  return status;
+  return raw_transport_.PushBuffers(tasks, parallelism, uuid);
 }
 
 }  // namespace transport

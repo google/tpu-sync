@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-# Import Pybind11 dynamic binary extension E2E!
+from tpu_sync.api import common
 from tpu_sync.api.torch import torch_abi
 from tpu_sync.api.torch import torch_tpu_common_loader
 
@@ -28,6 +28,27 @@ _weight_synchronizer = torch_abi.load_extension(
     "tpu_sync.frameworks.torch",
     "_tpu_raiden_torch",
 )
+
+common.register_telemetry_callbacks(
+    increment_counter=_weight_synchronizer.increment_counter,
+    set_gauge=_weight_synchronizer.set_gauge,
+    observe_histogram=_weight_synchronizer.observe_histogram,
+)
+
+
+def configure_telemetry(exporter_types: list[str]) -> None:
+  """Configures the telemetry backend exporters in RaidenMetricStore."""
+  _weight_synchronizer.configure_telemetry(exporter_types)
+
+
+def get_and_reset_metric_samples() -> dict[str, Any]:
+  """Retrieves and clears buffered metric samples from RaidenMetricStore."""
+  return _weight_synchronizer.get_and_reset_metric_samples()
+
+
+def get_raiden_metrics_prometheus_text() -> str:
+  """Returns current Prometheus metric exposition text from RaidenMetricStore."""
+  return _weight_synchronizer.get_raiden_metrics_prometheus_text()
 
 
 class WeightSynchronizer:
@@ -195,3 +216,18 @@ class WeightSynchronizer:
   def reset_metrics(self) -> None:
     """Resets all recorded internal metrics."""
     self._impl.reset_metrics()
+
+  @classmethod
+  def configure_telemetry(cls, exporter_types: list[str]) -> None:
+    """Configures the telemetry backend exporters in RaidenMetricStore."""
+    configure_telemetry(exporter_types)
+
+  @classmethod
+  def get_and_reset_metric_samples(cls) -> dict[str, Any]:
+    """Retrieves and clears buffered metric samples from RaidenMetricStore."""
+    return get_and_reset_metric_samples()
+
+  @classmethod
+  def get_raiden_metrics_prometheus_text(cls) -> str:
+    """Returns current Prometheus metric exposition text from RaidenMetricStore."""
+    return get_raiden_metrics_prometheus_text()

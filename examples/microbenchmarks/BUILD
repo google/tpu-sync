@@ -44,3 +44,20 @@ py_binary(
         "@pypi//numpy",
     ],
 )
+
+py_binary(
+    name = "jax_pathways_mcjax_weight_sync_benchmark_runner",
+    srcs = ["jax_pathways_mcjax_weight_sync_benchmark_runner.py"],
+    deps = [
+        "//tpu_sync/api/jax:weight_synchronizer_jax_py",
+        "//tpu_sync/frameworks/jax:weight_synchronizer_ffi_py",
+        "//tpu_sync/rpc:raiden_controller",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
+        "@com_google_absl_py//absl:app",
+        "@com_google_absl_py//absl/flags",
+        "@com_google_absl_py//absl/logging",
+        "@jax//jax",
+        "@jax//jax/experimental:mesh_utils",
+        "@pypi//numpy",
+    ],
+)

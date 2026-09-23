@@ -193,27 +193,6 @@ cc_binary(
     ],
 )
 
-cc_binary(
-    name = "replay_differential",
-    srcs = ["replay_differential_main.cc"],
-    copts = RESHARD_COPTS,
-    features = ["-use_header_modules"],
-    deps = [
-        ":framed_rpc",
-        ":reshard_service",
-        "//tpu_sync/core:transfer_program_reshard",
-        "//tpu_sync/rpc:raiden_service_cc_proto",
-        "@com_google_absl//absl/flags:flag",
-        "@com_google_absl//absl/flags:parse",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/time",
-        "@com_google_protobuf//:differencer",
-        "@com_google_protobuf//src/google/protobuf/io",
-    ],
-)
-
 cc_test(
     name = "reshard_service_test",
     srcs = ["reshard_service_test.cc"],

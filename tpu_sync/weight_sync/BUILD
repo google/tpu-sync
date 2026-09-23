@@ -160,6 +160,7 @@ py_test(
     name = "weight_sync_fanout_perf_test",
     size = "large",
     srcs = ["weight_sync_fanout_perf_test.py"],
+    shard_count = 6,
     tags = ["requires-mem:28g"],
     deps = [
         "//tpu_sync/api:common",

@@ -250,6 +250,7 @@ cc_test(
         ":peregrine_control_service",
         ":raw_buffer_transport",
         ":raw_buffer_transport_delegate",
+        ":transport_adapter",
         "//tpu_sync/telemetry:buffered_metrics_exporter",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",

@@ -204,6 +204,18 @@ absl::StatusOr<std::pair<int, int>> CreateSocket(const int port) {
 }
 
 inline bool IsValidSocket(int fd) { return fcntl(fd, F_GETFD) >= 0; }
+
+inline void AppendOrMergeIov(std::vector<struct iovec>& iovs, uint8_t* ptr,
+                             size_t len) {
+  if (len == 0) return;
+  if (!iovs.empty() &&
+      static_cast<uint8_t*>(iovs.back().iov_base) + iovs.back().iov_len ==
+          ptr) {
+    iovs.back().iov_len += len;
+  } else {
+    iovs.push_back({.iov_base = ptr, .iov_len = len});
+  }
+}
 }  // namespace
 
 RawBufferTransport::RawBufferTransport(
@@ -398,8 +410,17 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
           metadata[i], DeserializeChunkMetadata(item_bytes, header.version));
     }
 
+    size_t total_iovs = 0;
+    for (uint32_t i = 0; i < batch_size; ++i) {
+      const auto& meta = metadata[i];
+      const uint32_t count = meta.count > 0 ? meta.count : 1;
+      const size_t dst_stride =
+          meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
+      total_iovs += (count == 1 || dst_stride == meta.size_bytes) ? 1 : count;
+    }
+
     std::vector<struct iovec> iovs;
-    iovs.reserve(batch_size);
+    iovs.reserve(total_iovs);
     size_t total_bytes = 0;
 
     for (uint32_t i = 0; i < batch_size; ++i) {
@@ -408,22 +429,57 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
           raw_delegate_->GetHostPointer(meta.layer_idx, meta.dst_shard_idx);
       const size_t host_size =
           raw_delegate_->GetHostSize(meta.layer_idx, meta.dst_shard_idx);
-      if (base_host_ptr == nullptr || meta.size_bytes > host_size ||
-          meta.dst_offset_bytes > host_size - meta.size_bytes) {
+      if (base_host_ptr == nullptr) {
         return absl::InvalidArgumentError(
-            "Destination out of bounds in batched push");
+            "Destination host pointer is null in batched push");
       }
-      if (meta.size_bytes > 0) {
-        struct iovec iov;
-        iov.iov_base = base_host_ptr + meta.dst_offset_bytes;
-        iov.iov_len = meta.size_bytes;
-        iovs.push_back(iov);
-        total_bytes += meta.size_bytes;
+      const uint32_t count = meta.count > 0 ? meta.count : 1;
+      const size_t dst_stride =
+          meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
+
+      if (count == 1 || dst_stride == meta.size_bytes) {
+        const size_t task_bytes = count * meta.size_bytes;
+        if (meta.size_bytes > host_size ||
+            meta.dst_offset_bytes > host_size - task_bytes) {
+          return absl::InvalidArgumentError(
+              "Destination out of bounds in batched push");
+        }
+        if (task_bytes > 0) {
+          AppendOrMergeIov(iovs, base_host_ptr + meta.dst_offset_bytes,
+                           task_bytes);
+          total_bytes += task_bytes;
+        }
+      } else {
+        if (dst_stride < meta.size_bytes) {
+          return absl::InvalidArgumentError(
+              absl::StrCat("Destination stride (", dst_stride,
+                           ") cannot be smaller than slice size (",
+                           meta.size_bytes, ") in strided push"));
+        }
+        const size_t max_span =
+            meta.dst_offset_bytes + (count - 1) * dst_stride + meta.size_bytes;
+        if (max_span > host_size) {
+          return absl::InvalidArgumentError(
+              "Destination out of bounds in strided push");
+        }
+        for (uint32_t c = 0; c < count; ++c) {
+          AppendOrMergeIov(
+              iovs, base_host_ptr + meta.dst_offset_bytes + c * dst_stride,
+              meta.size_bytes);
+        }
+        total_bytes += count * meta.size_bytes;
       }
     }
 
     if (total_bytes > 0) {
-      ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, iovs));
+      absl::Span<const struct iovec> remaining_iovs = iovs;
+      while (!remaining_iovs.empty()) {
+        size_t chunk =
+            std::min(remaining_iovs.size(), static_cast<size_t>(IOV_MAX));
+        ABSL_RETURN_IF_ERROR(
+            ReadVExact(client_fd, remaining_iovs.subspan(0, chunk)));
+        remaining_iovs = remaining_iovs.subspan(chunk);
+      }
       if (store_ != nullptr) {
         store_->IncrementCounter(metric_names::kWeightSyncReceivedBytesTotal,
                                  {}, total_bytes);
@@ -777,6 +833,12 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
     return status;
   }
 
+  if (request.stride_count > 1) {
+    return absl::InvalidArgumentError(
+        "Strided push (count > 1) is not supported in single PushBuffer; use "
+        "PushBuffers instead.");
+  }
+
   // ChunkHeader wire protocol uses 32-bit fields for remote_id and
   // count_or_size; validate against uint32 max to prevent silent truncation on
   // the wire.
@@ -860,11 +922,11 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
   return absl::OkStatus();
 }
 
-absl::StatusOr<Request> BuildBufferRequest(size_t buffer_id, size_t shard_idx,
-                                           size_t offset_bytes,
-                                           const uint8_t* data_ptr,
-                                           size_t size_bytes, uint64_t uuid,
-                                           uint8_t socket_opcode) {
+absl::StatusOr<Request> BuildBufferRequest(
+    size_t buffer_id, size_t shard_idx, size_t offset_bytes,
+    const uint8_t* data_ptr, size_t size_bytes, uint64_t uuid,
+    uint8_t socket_opcode, size_t dst_stride_bytes, size_t stride_count,
+    size_t src_stride_bytes) {
   return Request{
       .socket_opcode = socket_opcode,
       .laddr = const_cast<uint8_t*>(data_ptr),
@@ -878,6 +940,9 @@ absl::StatusOr<Request> BuildBufferRequest(size_t buffer_id, size_t shard_idx,
       .count_or_size = static_cast<uint32_t>(size_bytes),
       .uuid = uuid,
       .request_id = 0,
+      .dst_stride_bytes = dst_stride_bytes,
+      .stride_count = stride_count > 0 ? stride_count : 1,
+      .src_stride_bytes = src_stride_bytes,
   };
 }
 
@@ -890,7 +955,9 @@ absl::StatusOr<std::vector<Request>> BuildBufferRequests(
     ABSL_ASSIGN_OR_RETURN(
         auto req, BuildBufferRequest(task.buffer_id, task.dst_shard_idx,
                                      task.dst_offset_bytes, task.data_ptr,
-                                     task.size_bytes, uuid, socket_opcode));
+                                     task.size_bytes, uuid, socket_opcode,
+                                     task.dst_stride_bytes, task.count,
+                                     task.src_stride_bytes));
     requests.push_back(std::move(req));
   }
   return requests;
@@ -939,7 +1006,8 @@ absl::Status RawBufferTransport::PushBuffers(
           size_t sub_batch_bytes = 0;
           size_t sub_batch_count = 0;
           for (size_t j = sub_tasks_added; j < chunk_size; ++j) {
-            const size_t task_size = grouped_tasks[chunk_start + j].size_bytes;
+            const auto& t = grouped_tasks[chunk_start + j];
+            const size_t task_size = (t.count > 0 ? t.count : 1) * t.size_bytes;
             if (sub_batch_count > 0 &&
                 sub_batch_bytes + task_size > coalesce_window_bytes_) {
               break;
@@ -1033,11 +1101,21 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
   const size_t batch_size = requests.size();
   const uint64_t uuid = requests.front().uuid;
 
+  bool is_v2 = false;
+  for (const auto& req : requests) {
+    const uint32_t count = req.stride_count > 0 ? req.stride_count : 1;
+    if (count > 1) {
+      is_v2 = true;
+      break;
+    }
+  }
+  const uint16_t version = is_v2 ? 2 : 1;
+
   ChunkHeader header = {};
-  header.version = 1;
+  header.version = version;
   header.op = kOpBufferPushBatched;
   header.buffer_id = 0;
-  header.metadata_size = GetChunkMetadataSize(header.version);
+  header.metadata_size = GetChunkMetadataSize(version);
   header.remote_id = 0;
   header.local_id = 0;
   header.count_or_size = static_cast<uint32_t>(batch_size);
@@ -1045,26 +1123,38 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
 
   std::vector<char> s_metadata_buf(batch_size * header.metadata_size);
   size_t total_bytes = 0;
+  size_t total_sender_iovs = 0;
   for (size_t i = 0; i < batch_size; ++i) {
     const auto& req = requests[i];
+    const uint32_t count = req.stride_count > 0 ? req.stride_count : 1;
+    const size_t src_stride =
+        req.src_stride_bytes > 0 ? req.src_stride_bytes : req.len;
+    if (count > 1 && src_stride < req.len) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Source stride (", src_stride,
+                       ") cannot be smaller than slice size (", req.len,
+                       ") in strided push"));
+    }
+    total_sender_iovs += (count == 1 || src_stride == req.len) ? 1 : count;
     ChunkMetadata meta = {
         .layer_idx = static_cast<uint32_t>(req.layer_idx),
         .dst_shard_idx = req.local_id,
         .dst_offset_bytes = req.remote_id,
         .size_bytes = req.len,
+        .dst_stride_bytes = req.dst_stride_bytes,
+        .count = count,
     };
-    const auto s_meta = SerializeChunkMetadata(meta);
+    const auto s_meta = SerializeChunkMetadata(meta, version);
     DCHECK_EQ(s_meta.size(), header.metadata_size);
     std::memcpy(s_metadata_buf.data() + i * header.metadata_size, s_meta.data(),
                 s_meta.size());
-    total_bytes += req.len;
+    total_bytes += count * req.len;
   }
   const auto s_header = SerializeChunkHeader(header);
   const std::array<struct iovec, 2> iovs = {
       iovec(const_cast<char*>(s_header.data()), s_header.size()),
       iovec(s_metadata_buf.data(), s_metadata_buf.size()),
   };
-
   const auto start_ts = std::chrono::steady_clock::now();
   auto send_body = [&]() -> absl::Status {
     ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
@@ -1075,35 +1165,61 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
       size_t pack_offset = 0;
       for (size_t i = 0; i < batch_size; ++i) {
         const auto& req = requests[i];
-        if (req.len > 0) {
+        const uint32_t count = req.stride_count > 0 ? req.stride_count : 1;
+        const size_t src_stride =
+            req.src_stride_bytes > 0 ? req.src_stride_bytes : req.len;
+        const size_t task_bytes = count * req.len;
+        if (task_bytes > 0) {
           if (req.laddr == nullptr) {
             return absl::InvalidArgumentError(
                 "Null data pointer in batch push request");
           }
-          std::memcpy(pack_buf.data() + pack_offset, req.laddr, req.len);
-          pack_offset += req.len;
+          if (count == 1 || src_stride == req.len) {
+            std::memcpy(pack_buf.data() + pack_offset, req.laddr, task_bytes);
+            pack_offset += task_bytes;
+          } else {
+            for (uint32_t c = 0; c < count; ++c) {
+              std::memcpy(pack_buf.data() + pack_offset,
+                          req.laddr + c * src_stride, req.len);
+              pack_offset += req.len;
+            }
+          }
         }
       }
       ABSL_RETURN_IF_ERROR(WriteExact(fd, pack_buf.data(), total_bytes));
     } else {
       // Uncoalesced path: gather write (writev) directly from requests.
       std::vector<struct iovec> iovs;
-      iovs.reserve(batch_size);
+      iovs.reserve(total_sender_iovs);
       for (size_t i = 0; i < batch_size; ++i) {
         const auto& req = requests[i];
-        if (req.len > 0) {
+        const uint32_t count = req.stride_count > 0 ? req.stride_count : 1;
+        const size_t src_stride =
+            req.src_stride_bytes > 0 ? req.src_stride_bytes : req.len;
+        const size_t task_bytes = count * req.len;
+        if (task_bytes > 0) {
           if (req.laddr == nullptr) {
             return absl::InvalidArgumentError(
                 "Null data pointer in batch push request");
           }
-          struct iovec iov;
-          iov.iov_base = req.laddr;
-          iov.iov_len = req.len;
-          iovs.push_back(iov);
+          if (count == 1 || src_stride == req.len) {
+            AppendOrMergeIov(iovs, req.laddr, task_bytes);
+          } else {
+            for (uint32_t c = 0; c < count; ++c) {
+              AppendOrMergeIov(iovs, req.laddr + c * src_stride, req.len);
+            }
+          }
         }
       }
       if (!iovs.empty()) {
-        ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
+        absl::Span<const struct iovec> remaining_iovs = iovs;
+        while (!remaining_iovs.empty()) {
+          size_t chunk =
+              std::min(remaining_iovs.size(), static_cast<size_t>(IOV_MAX));
+          ABSL_RETURN_IF_ERROR(
+              WriteVExact(fd, remaining_iovs.subspan(0, chunk)));
+          remaining_iovs = remaining_iovs.subspan(chunk);
+        }
       }
     }
 

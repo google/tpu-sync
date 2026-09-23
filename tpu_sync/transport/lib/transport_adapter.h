@@ -18,7 +18,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -56,6 +55,9 @@ struct Request {
   uint32_t request_id;
   int shard_idx;
   int stream_idx;
+  size_t dst_stride_bytes = 0;
+  size_t stride_count = 1;
+  size_t src_stride_bytes = 0;
 
   BlockReceivedCallback on_block_received = nullptr;
 };

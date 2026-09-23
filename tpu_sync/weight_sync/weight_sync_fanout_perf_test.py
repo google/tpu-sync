@@ -573,6 +573,7 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     self.ws_src.reset_metrics()
     for ws_dst in self.ws_dsts:
       ws_dst.reset_metrics()
+    _ = weight_synchronizer.get_and_reset_metric_samples()
 
     # 1. Fill source buffers with position-unique 32-bit pattern (seed=0xAB)
     self._fill_position_unique_source_pattern(0xAB)
@@ -587,6 +588,17 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     uuid = 1001
     self.controller.broadcast_k = 64
     self.controller._plan_cache.clear()
+    warmup_loop = asyncio.new_event_loop()
+    try:
+      warmup_loop.run_until_complete(
+          self.controller._compute_transfer_schedule(
+              src_units=[self.src_unit],
+              dst_units=self.dst_units,
+              skip_tiling={l: False for l in range(self.num_layers)},
+          )
+      )
+    finally:
+      warmup_loop.close()
     t0 = time.perf_counter()
     future = self.controller.start_transfer(
         src_units=[self.src_unit],
@@ -660,6 +672,7 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     self.ws_src.reset_metrics()
     for ws_dst in self.ws_dsts:
       ws_dst.reset_metrics()
+    _ = weight_synchronizer.get_and_reset_metric_samples()
 
     # 1. Fill source buffers with position-unique 32-bit pattern (seed=0xCD)
     self._fill_position_unique_source_pattern(0xCD)
@@ -674,6 +687,17 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     uuid = 1002
     self.controller.broadcast_k = 2
     self.controller._plan_cache.clear()
+    warmup_loop = asyncio.new_event_loop()
+    try:
+      warmup_loop.run_until_complete(
+          self.controller._compute_transfer_schedule(
+              src_units=[self.src_unit],
+              dst_units=self.dst_units,
+              skip_tiling={l: False for l in range(self.num_layers)},
+          )
+      )
+    finally:
+      warmup_loop.close()
     t0 = time.perf_counter()
     future = self.controller.start_transfer(
         src_units=[self.src_unit],

@@ -1372,12 +1372,27 @@ class RaidenController:
               )
 
           if broadcast_groups:
-            shard_broadcast_groups = {}
-            for group_key, keys_and_targets in broadcast_groups.items():
-              src_unit, shard_idx = group_key[0], group_key[1]
-              shard_broadcast_groups.setdefault(
-                  (src_unit, shard_idx), []
-              ).append(keys_and_targets)
+            # Pipeline broadcast groups sequentially per source shard to avoid
+            # simultaneous socket connection storms on destination peers,
+            # while running different source shards concurrently.
+            if (
+                cached_schedule is not None
+                and cached_schedule.cached_broadcast_groups_by_shard is not None
+            ):
+              shard_broadcast_groups = (
+                  cached_schedule.cached_broadcast_groups_by_shard
+              )
+            else:
+              shard_broadcast_groups = {}
+              for group_key, keys_and_targets in broadcast_groups.items():
+                src_unit, shard_idx = group_key[0], group_key[1]
+                shard_broadcast_groups.setdefault(
+                    (src_unit, shard_idx), []
+                ).append(keys_and_targets)
+              if cached_schedule is not None:
+                cached_schedule.cached_broadcast_groups_by_shard = (
+                    shard_broadcast_groups
+                )
 
             async def _execute_shard_broadcasts(groups_list):
               await self._execute_slice_broadcast_pipeline(

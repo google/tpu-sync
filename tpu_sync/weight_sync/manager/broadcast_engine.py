@@ -28,7 +28,7 @@ from tpu_sync.api.common import RaidenId
 # TODO(fhzhang): Make max_chunk_bytes and target_stages configurable via RaidenController options.
 def _coalesce_contiguous_relay_entries(
     entries: list[tuple[Any, ...]],
-    max_chunk_bytes: int = 4 * 1024 * 1024,
+    max_chunk_bytes: int = 64 * 1024 * 1024,
     is_weight_sync: bool = False,
 ) -> list[tuple[Any, ...]]:
   """Coalesces adjacent contiguous relay entries into larger multi-MB blocks.
@@ -37,7 +37,7 @@ def _coalesce_contiguous_relay_entries(
     entries: List of 12-tuples: (dst_peer, dst_shard_idx, dst_block_offset,
       src_block_offset, size, src_block_id, dst_block_id, src_stride,
       dst_stride, count, layer_idx, pool_group).
-    max_chunk_bytes: Maximum size in bytes of a coalesced chunk (default 4MB).
+    max_chunk_bytes: Maximum size in bytes of a coalesced chunk (default 64MB).
     is_weight_sync: Whether this transfer is weight synchronization, where block
       IDs are normalized to 0 because flat layer offsets are used.
 
@@ -195,6 +195,129 @@ class _HopTask:
     self.receiver = receiver
     self.dst_indices = dst_indices
     self.children: list[_HopTask] = []
+    self.sub_plan: Any = None
+
+
+def _populate_receiver_offsets(hop: _HopTask) -> None:
+  """Populates node_slice_offsets for the hop's receiver."""
+  ref_idx = hop.dst_indices[0]
+  hop.group.node_slice_offsets[hop.receiver] = {}
+  for key, k_targets in hop.group.keys_and_sorted_targets:
+    k_target = k_targets[ref_idx]
+    (
+        _,
+        _,
+        k_dst_shard_idx,
+        k_dst_block_id,
+        k_dst_block_offset,
+        k_dst_stride,
+    ) = k_target
+    hop.group.node_slice_offsets[hop.receiver][key] = (
+        k_dst_shard_idx,
+        k_dst_block_id,
+        k_dst_block_offset,
+        k_dst_stride,
+    )
+
+
+def _build_hop_sub_plan(
+    hop: _HopTask,
+    final_plan: Any,
+    dst_mem_type: int,
+) -> None:
+  """Pre-computes and caches the sub_plan for a single tree hop."""
+  group = hop.group
+  s = hop.sender
+  dst_unit = hop.receiver
+  dst_indices = hop.dst_indices
+
+  ref_offset = group.node_slice_offsets[s][group.ref_key]
+  s_shard_idx = ref_offset[0]
+
+  sub_schedule: dict[RaidenId, dict[int, list[Any]]] = {s: {s_shard_idx: []}}
+  for key, k_targets in group.keys_and_sorted_targets:
+    _, k_s_block_id, k_s_block_offset, k_s_stride = group.node_slice_offsets[s][
+        key
+    ]
+    k_size = key[4]
+    k_count = key[6]
+    k_layer_idx = key[7]
+    k_pool_group = key[8]
+
+    for idx in dst_indices:
+      k_target = k_targets[idx]
+      (
+          _,
+          k_dst_peer,
+          k_dst_shard_idx,
+          k_dst_block_id,
+          k_dst_block_offset,
+          k_dst_stride,
+      ) = k_target
+
+      entry = (
+          k_dst_peer,
+          k_dst_shard_idx,
+          k_dst_block_offset,
+          k_s_block_offset,
+          k_size,
+          k_s_block_id,
+          k_dst_block_id,
+          k_s_stride,
+          k_dst_stride,
+          k_count,
+          k_layer_idx,
+          k_pool_group,
+      )
+      sub_schedule[s][s_shard_idx].append(entry)
+
+  if s != group.src_unit:
+    sub_schedule[s][s_shard_idx] = _coalesce_contiguous_relay_entries(
+        sub_schedule[s][s_shard_idx],
+        is_weight_sync=bool(final_plan.is_weight_sync),
+    )
+
+  hop_expected_layer_chunk_counts: dict[int, int] = {}
+  for e in sub_schedule[s][s_shard_idx]:
+    layer_idx = e[10]
+    push_count = 1 if (e[9] == 1 or (e[7] == e[4] and e[8] == e[4])) else e[9]
+    hop_expected_layer_chunk_counts[layer_idx] = (
+        hop_expected_layer_chunk_counts.get(layer_idx, 0) + push_count
+    )
+
+  hop_expected_block_count = sum(hop_expected_layer_chunk_counts.values())
+
+  sub_plan = type(final_plan)(
+      src_units=[s],
+      dst_units=[dst_unit],
+      plan=None,
+      shard_push_schedules=sub_schedule,
+      worker_rpc_addresses=(
+          dict(final_plan.worker_rpc_addresses)
+          if final_plan.worker_rpc_addresses is not None
+          else {}
+      ),
+      worker_data_addresses=(
+          dict(final_plan.worker_data_addresses)
+          if final_plan.worker_data_addresses is not None
+          else {}
+      ),
+      uuid=0,
+      dst_mem_type=dst_mem_type,
+      use_block_chunks=True,
+      is_sender=True,
+      expected_block_count=hop_expected_block_count,
+      expected_layer_chunk_counts=hop_expected_layer_chunk_counts,
+      dst_expected_layer_chunk_counts={
+          dst_unit: hop_expected_layer_chunk_counts
+      },
+      req_id="",
+      skip_d2h=final_plan.skip_d2h or (s != group.src_unit),
+      skip_tiling=final_plan.skip_tiling,
+      is_weight_sync=final_plan.is_weight_sync,
+      cached_serialized_payloads={},
+  )
+  hop.sub_plan = sub_plan
 
 
 class _GroupBroadcastState:
@@ -253,6 +376,7 @@ class BroadcastEngine:
   ) -> None:
     self._worker_rpc_client = worker_rpc_client
     self._remote_client_factory = remote_controller_client_factory
+    self._pipeline_cache: dict[tuple[Any, ...], Any] = {}
 
   @classmethod
   def partition_direct_and_broadcast_groups(
@@ -358,41 +482,98 @@ class BroadcastEngine:
     if fanout_k <= 0:
       raise ValueError(f"fanout_k must be >= 1, got {fanout_k}")
 
-    coalesced_groups_list = _coalesce_pipeline_groups(
-        groups_list, target_stages=8
+    pipeline_cache_key = (
+        id(groups_list),
+        fanout_k,
+        dst_mem_type,
+        bool(final_plan.is_weight_sync),
+        bool(final_plan.skip_d2h),
     )
-
-    groups: list[_GroupBroadcastState] = []
-    all_workers: list[RaidenId] = []
-
-    def _add_worker(u: RaidenId) -> None:
-      if u not in all_workers:
-        all_workers.append(u)
-
-    for g_idx, keys_and_targets in enumerate(coalesced_groups_list):
-      if not keys_and_targets:
-        continue
-      keys_and_sorted_targets = []
-      for key, targets in keys_and_targets:
-        sorted_t = sorted(targets, key=lambda t: (t[1], t[2]))
-        keys_and_sorted_targets.append((key, sorted_t))
-
-      ref_key, ref_targets = keys_and_sorted_targets[0]
-      src_unit = ref_key[0]
-      shard_idx = ref_key[1]
-
-      _add_worker(src_unit)
-      for t in ref_targets:
-        _add_worker(t[0])
-
-      groups.append(
-          _GroupBroadcastState(
-              group_idx=g_idx,
-              keys_and_sorted_targets=keys_and_sorted_targets,
-              src_unit=src_unit,
-              shard_idx=shard_idx,
-          )
+    cached_entry = self._pipeline_cache.get(pipeline_cache_key)
+    if cached_entry is not None and cached_entry[0] is groups_list:
+      _, groups, all_workers, hop_trees = cached_entry
+    else:
+      coalesced_groups_list = _coalesce_pipeline_groups(
+          groups_list, target_stages=8
       )
+
+      groups = []
+      all_workers = []
+
+      def _add_worker(u: RaidenId) -> None:
+        if u not in all_workers:
+          all_workers.append(u)
+
+      for g_idx, keys_and_targets in enumerate(coalesced_groups_list):
+        if not keys_and_targets:
+          continue
+        keys_and_sorted_targets = []
+        for key, targets in keys_and_targets:
+          sorted_t = sorted(targets, key=lambda t: (t[1], t[2]))
+          keys_and_sorted_targets.append((key, sorted_t))
+
+        ref_key, ref_targets = keys_and_sorted_targets[0]
+        src_unit = ref_key[0]
+        shard_idx = ref_key[1]
+
+        _add_worker(src_unit)
+        for t in ref_targets:
+          _add_worker(t[0])
+
+        groups.append(
+            _GroupBroadcastState(
+                group_idx=g_idx,
+                keys_and_sorted_targets=keys_and_sorted_targets,
+                src_unit=src_unit,
+                shard_idx=shard_idx,
+            )
+        )
+
+      hop_trees: list[list[_HopTask]] = []
+      # Build deterministic balanced k-ary trees for each group
+      for g in groups:
+        dst_units = g.pending_dst_units
+        n = len(dst_units)
+        if n == 0:
+          continue
+
+        k_seed = min(fanout_k, n)
+        level_1_hops: list[_HopTask] = []
+        for i in range(k_seed):
+          d = dst_units[i]
+          hop = _HopTask(g, g.src_unit, d, g.dst_unit_to_indices[d])
+          _populate_receiver_offsets(hop)
+          _build_hop_sub_plan(hop, final_plan, dst_mem_type)
+          level_1_hops.append(hop)
+
+        prev_level_hops = level_1_hops
+        next_idx = k_seed
+        while next_idx < n:
+          curr_level_hops: list[_HopTask] = []
+          max_level_targets = min(len(prev_level_hops) * fanout_k, n - next_idx)
+          for j in range(max_level_targets):
+            parent_hop = prev_level_hops[j % len(prev_level_hops)]
+            d = dst_units[next_idx]
+            child_hop = _HopTask(
+                g, parent_hop.receiver, d, g.dst_unit_to_indices[d]
+            )
+            _populate_receiver_offsets(child_hop)
+            _build_hop_sub_plan(child_hop, final_plan, dst_mem_type)
+            parent_hop.children.append(child_hop)
+            curr_level_hops.append(child_hop)
+            next_idx += 1
+          prev_level_hops = curr_level_hops
+        hop_trees.append(level_1_hops)
+
+      if groups:
+        if len(self._pipeline_cache) >= 64:
+          self._pipeline_cache.pop(next(iter(self._pipeline_cache)))
+        self._pipeline_cache[pipeline_cache_key] = (
+            groups_list,
+            groups,
+            all_workers,
+            hop_trees,
+        )
 
     if not groups:
       return
@@ -403,36 +584,9 @@ class BroadcastEngine:
     }
     transfers_in_progress: dict[asyncio.Task[None], _HopTask] = {}
 
-    # Build deterministic balanced k-ary trees for each group
-    for g in groups:
-      dst_units = g.pending_dst_units
-      n = len(dst_units)
-      if n == 0:
-        continue
-
-      k_seed = min(fanout_k, n)
-      level_1_hops: list[_HopTask] = []
-      for i in range(k_seed):
-        d = dst_units[i]
-        hop = _HopTask(g, g.src_unit, d, g.dst_unit_to_indices[d])
-        ready_queue[g.src_unit].append(hop)
-        level_1_hops.append(hop)
-
-      prev_level_hops = level_1_hops
-      next_idx = k_seed
-      while next_idx < n:
-        curr_level_hops: list[_HopTask] = []
-        max_level_targets = min(len(prev_level_hops) * fanout_k, n - next_idx)
-        for j in range(max_level_targets):
-          parent_hop = prev_level_hops[j % len(prev_level_hops)]
-          d = dst_units[next_idx]
-          child_hop = _HopTask(
-              g, parent_hop.receiver, d, g.dst_unit_to_indices[d]
-          )
-          parent_hop.children.append(child_hop)
-          curr_level_hops.append(child_hop)
-          next_idx += 1
-        prev_level_hops = curr_level_hops
+    for level_1_hops in hop_trees:
+      for hop in level_1_hops:
+        ready_queue[hop.sender].append(hop)
 
     async def _run_single_transfer(
         s_node: RaidenId, d_node: RaidenId, plan: Any
@@ -491,102 +645,18 @@ class BroadcastEngine:
             await self._worker_rpc_client.start_transfer(s_node, plan)
 
     def _dispatch_hop(hop: _HopTask) -> None:
-      group = hop.group
-      s = hop.sender
-      dst_unit = hop.receiver
-      dst_indices = hop.dst_indices
-
-      active_pushes[s] += 1
-
-      ref_offset = group.node_slice_offsets[s][group.ref_key]
-      s_shard_idx = ref_offset[0]
-
-      sub_schedule: dict[RaidenId, dict[int, list[Any]]] = {
-          s: {s_shard_idx: []}
-      }
-      hop_expected_block_count = 0
-      for key, k_targets in group.keys_and_sorted_targets:
-        _, k_s_block_id, k_s_block_offset, k_s_stride = (
-            group.node_slice_offsets[s][key]
-        )
-        k_size = key[4]
-        k_count = key[6]
-        k_layer_idx = key[7]
-        k_pool_group = key[8]
-
-        for idx in dst_indices:
-          k_target = k_targets[idx]
-          (
-              _,
-              k_dst_peer,
-              k_dst_shard_idx,
-              k_dst_block_id,
-              k_dst_block_offset,
-              k_dst_stride,
-          ) = k_target
-
-          entry = (
-              k_dst_peer,
-              k_dst_shard_idx,
-              k_dst_block_offset,
-              k_s_block_offset,
-              k_size,
-              k_s_block_id,
-              k_dst_block_id,
-              k_s_stride,
-              k_dst_stride,
-              k_count,
-              k_layer_idx,
-              k_pool_group,
-          )
-          sub_schedule[s][s_shard_idx].append(entry)
-
-          is_contiguous = (k_count == 1) or (
-              k_s_stride == k_size and k_dst_stride == k_size
-          )
-          push_count = 1 if is_contiguous else k_count
-          hop_expected_block_count += push_count
-
-      if s != group.src_unit:
-        sub_schedule[s][s_shard_idx] = _coalesce_contiguous_relay_entries(
-            sub_schedule[s][s_shard_idx],
-            is_weight_sync=bool(final_plan.is_weight_sync),
-        )
-        hop_expected_block_count = sum(
-            1 if (e[9] == 1 or (e[7] == e[4] and e[8] == e[4])) else e[9]
-            for e in sub_schedule[s][s_shard_idx]
-        )
-
+      active_pushes[hop.sender] += 1
       hop_uuid = random.randint(1, 2**63 - 1)
-      hop_req_id = f"{req_id}_{group.group_idx}_{hop_uuid}"
-
-      sub_plan = type(final_plan)(
-          src_units=[s],
-          dst_units=[dst_unit],
-          plan=None,
-          shard_push_schedules=sub_schedule,
-          worker_rpc_addresses=(
-              dict(final_plan.worker_rpc_addresses)
-              if final_plan.worker_rpc_addresses is not None
-              else {}
-          ),
-          worker_data_addresses=(
-              dict(final_plan.worker_data_addresses)
-              if final_plan.worker_data_addresses is not None
-              else {}
-          ),
-          uuid=hop_uuid,
-          dst_mem_type=dst_mem_type,
-          use_block_chunks=True,
-          is_sender=True,
-          expected_block_count=hop_expected_block_count,
-          req_id=hop_req_id,
-          skip_d2h=final_plan.skip_d2h or (s != group.src_unit),
-          skip_tiling=final_plan.skip_tiling,
-          is_weight_sync=final_plan.is_weight_sync,
+      hop.sub_plan.uuid = hop_uuid
+      hop.sub_plan.req_id = f"{req_id}__stage_{hop.group.group_idx}__{hop_uuid}"
+      hop.sub_plan.skip_d2h = final_plan.skip_d2h or (
+          hop.sender != hop.group.src_unit
       )
+      hop.sub_plan.skip_tiling = final_plan.skip_tiling
 
-      task = asyncio.create_task(_run_single_transfer(s, dst_unit, sub_plan))
+      task = asyncio.create_task(
+          _run_single_transfer(hop.sender, hop.receiver, hop.sub_plan)
+      )
       transfers_in_progress[task] = hop
 
     try:
@@ -614,25 +684,6 @@ class BroadcastEngine:
               raise exc
             hop = transfers_in_progress.pop(fut)
             active_pushes[hop.sender] -= 1
-
-            ref_idx = hop.dst_indices[0]
-            hop.group.node_slice_offsets[hop.receiver] = {}
-            for key, k_targets in hop.group.keys_and_sorted_targets:
-              k_target = k_targets[ref_idx]
-              (
-                  _,
-                  _,
-                  k_dst_shard_idx,
-                  k_dst_block_id,
-                  k_dst_block_offset,
-                  k_dst_stride,
-              ) = k_target
-              hop.group.node_slice_offsets[hop.receiver][key] = (
-                  k_dst_shard_idx,
-                  k_dst_block_id,
-                  k_dst_block_offset,
-                  k_dst_stride,
-              )
 
             for child_hop in hop.children:
               ready_queue[hop.receiver].append(child_hop)

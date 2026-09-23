@@ -349,6 +349,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   struct PendingH2dState {
     size_t expected_layers = 0;
+    std::vector<size_t> expected_layer_indices;
     absl::flat_hash_map<size_t,
                         std::future<absl::StatusOr<raiden::PjRtCopyFuture>>>
         layer_futures;
@@ -382,6 +383,12 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   mutable absl::Mutex d2h_mu_;
   absl::flat_hash_set<uint64_t> completed_d2h_uuids_ ABSL_GUARDED_BY(d2h_mu_);
+  absl::flat_hash_set<std::pair<std::string, size_t>> in_progress_d2h_layers_
+      ABSL_GUARDED_BY(d2h_mu_);
+  absl::flat_hash_set<std::pair<std::string, size_t>> completed_d2h_layers_
+      ABSL_GUARDED_BY(d2h_mu_);
+  absl::flat_hash_map<uint64_t, std::string> uuid_to_sync_key_
+      ABSL_GUARDED_BY(d2h_mu_);
 
   mutable absl::Mutex pending_h2d_mu_;
   absl::flat_hash_map<uint64_t, PendingH2dState> pending_h2d_states_

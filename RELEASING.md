@@ -60,40 +60,37 @@ repository if they get in the way.
 ### Nightly pre-releases on PyPI
 
 The scheduled `Nightly Wheels` run also publishes its `.dev` wheels to PyPI
-through the exit gate (see `.github/workflows/publish_pypi.yml`), so
-`pip install --pre tpu-sync-torch` tracks main. A nightly skips any wheel
-above the PyPI file limit instead of failing; the registry still gets every
-wheel. Until the limit is raised, the repository variable
-`RAIDEN_NIGHTLY_TORCH_ABIS` (for example `2.11.0`) keeps the scheduled torch
-wheel single-ABI and under the limit. PyPI's 10 GB project quota holds a
-few months of daily wheels; request more once the project exists.
+through the exit gate (see `.github/workflows/publish_pypi.yml`), so `pip
+install --pre tpu-sync-torch` tracks main. A nightly skips any wheel above the
+PyPI file limit instead of failing; the registry still gets every wheel. PyPI's
+10 GB project quota holds a few months of daily wheels; request more once the
+project exists.
 
 ## The PyPI file-size limit
 
-PyPI accepts files up to 100 MB per file unless the project has been granted
-a higher limit, and the exit gate uploads a release file by file, so a file
-over the limit fails the release after the smaller files are already on PyPI
-(and PyPI releases cannot be replaced). The workflow therefore refuses to
-stage any wheel above the limit it knows about. Every build job prints the
-wheel sizes in its summary; the torch wheel bundles one extension per
-supported torch release and exceeds 100 MB when it carries more than one.
+PyPI accepts files up to 100 MB per file unless the project has been granted a
+higher limit, and the exit gate uploads a release file by file, so a file over
+the limit fails the release after the smaller files are already on PyPI (and
+PyPI releases cannot be replaced). The workflow therefore refuses to stage any
+wheel above the limit it knows about. Every build job prints the wheel sizes in
+its summary. Both wheels are compiled with hidden symbol visibility (see
+[ci/build_wheel_impl.sh](ci/build_wheel_impl.sh)), which keeps the jax wheel and
+the torch wheel with one extension per supported torch release under the limit;
+with default visibility either wheel exceeds it.
 
-PyPI only raises a project's limit once the project exists with at least one
-release under the current limit, so the first publication is:
+Should a wheel outgrow the limit, PyPI raises a project's limit on request once
+the project has at least one release under the current limit:
 
-1. Run `Release Wheels` by hand with `publish=no` and `torch_abis` set to a
-   single release (`2.11.0`) and read the wheel sizes off the job summary;
-   a wheel must be under the limit to be published (a single-ABI torch
-   wheel is the smallest torch wheel the build makes). The `frameworks`
-   input narrows the run to the wheels that fit.
-2. Run it again with `publish=yes` and the same inputs. This publishes a
-   `.dev` pre-release of each selected package, which creates its PyPI
-   project.
-3. File a file-size limit increase with PyPI for each project, following
-   https://docs.pypi.org/project-management/storage-limits/. Approval can take
-   weeks.
-4. Once granted, record the new limit in the `PYPI_FILE_LIMIT_MB` repository
-   variable. Tag-driven releases then publish the full multi-ABI torch wheel.
+1.  Run `Release Wheels` by hand with `publish=no` and read the wheel sizes off
+    the job summary; a wheel must be under the limit to be published. The
+    `frameworks` input narrows the run to the wheels that fit, and `torch_abis`
+    set to a single release (`2.11.0`) builds the smallest torch wheel the build
+    makes.
+2.  File a file-size limit increase with PyPI for each project, following
+    https://docs.pypi.org/project-management/storage-limits/. Approval can take
+    weeks.
+3.  Once granted, record the new limit in the `PYPI_FILE_LIMIT_MB` repository
+    variable.
 
 ## The torch_tpu pairing
 

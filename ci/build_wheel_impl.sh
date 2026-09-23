@@ -178,13 +178,12 @@ fi
 # is unique per build and appears verbatim in the filename, so scope to it.
 WHEEL_GLOB="${WHEEL_DIST}-*${WHEEL_VERSION_EXTRAS}-*.whl"
 
-# The jax wheel's three extensions each carry a static copy of the runtime;
-# with default symbol visibility their export tables alone put the wheel
-# over PyPI's 100 MB file limit. Hidden visibility keeps only the module
-# entry points exported and shrinks the wheel to about a third.
-if [[ "${BUILD_MODE}" == "jax" ]]; then
-  EXTRA_BAZEL_FLAGS+=" --copt=-fvisibility=hidden --cxxopt=-fvisibility-inlines-hidden"
-fi
+# Every extension carries a static copy of the runtime (the jax wheel ships
+# three, the torch wheel one per torch release); with default symbol
+# visibility their export tables alone put a wheel over PyPI's 100 MB file
+# limit. Hidden visibility keeps only the module entry points exported and
+# shrinks each extension to about a third.
+EXTRA_BAZEL_FLAGS+=" --copt=-fvisibility=hidden --cxxopt=-fvisibility-inlines-hidden"
 ./build.sh "${BUILD_MODE}" "${WHEEL_TARGET}" \
   --repo_env=WHEEL_VERSION_EXTRAS="${WHEEL_VERSION_EXTRAS}" \
   ${EXTRA_BAZEL_FLAGS}
@@ -211,12 +210,22 @@ if [[ "${BUILD_MODE}" == "torch" ]]; then
   PKG_DIR="$(ls -d "${UNPACK_DIR}"/*/)"
   EXT_DIR="${PKG_DIR}tpu_sync/frameworks/torch"
 
+  # Each variant NEEDs the glue of the torch release it was compiled against,
+  # which ld.so binds to the library torch_tpu_common_loader preloaded under
+  # that soname. build.sh's in-tree copy instead carries a NEEDED on the
+  # unversioned source-tree name, which no torch_tpu wheel ships.
+  set_glue_needed() {
+    if patchelf --print-needed "$1" | grep -qx libpywrap_torch_tpu_common.so; then
+      patchelf --remove-needed libpywrap_torch_tpu_common.so "$1"
+    fi
+    patchelf --add-needed "libpywrap_$2_common.so" "$1"
+    echo "wheel variant: $(basename "$1") (NEEDED libpywrap_$2_common.so)"
+  }
+
   # Primary variant: the torch this wheel build compiled against.
   SUFFIX="$(torch_suffix python3)"
   mv "${EXT_DIR}/_tpu_raiden_torch.so" "${EXT_DIR}/_tpu_raiden_torch_${SUFFIX}.so"
-  patchelf --add-needed "libpywrap_${SUFFIX}_common.so" \
-    "${EXT_DIR}/_tpu_raiden_torch_${SUFFIX}.so"
-  echo "wheel variant: _tpu_raiden_torch_${SUFFIX}.so (NEEDED libpywrap_${SUFFIX}_common.so)"
+  set_glue_needed "${EXT_DIR}/_tpu_raiden_torch_${SUFFIX}.so" "${SUFFIX}"
 
   # Extra variants: rebuild the extension against each additional torch in an
   # isolated venv (a fresh TORCH_SOURCE path forces the bazel torch repo to
@@ -228,14 +237,10 @@ if [[ "${BUILD_MODE}" == "torch" ]]; then
     TORCH_SOURCE="$("/tmp/torch-abi-${V}/bin/python3" -c 'import torch, pathlib; print(pathlib.Path(torch.__file__).resolve().parent.parent)')"
     export TORCH_SOURCE
     SUFFIX="$(torch_suffix "/tmp/torch-abi-${V}/bin/python3")"
-    # build.sh derives the glue suffix from the system python's torch, which
-    # is still the primary variant's -- pin the override to this variant.
-    export RAIDEN_PYWRAP_SONAME="libpywrap_${SUFFIX}_common.so"
     ./build.sh torch ${EXTRA_BAZEL_FLAGS}
-    unset RAIDEN_PYWRAP_SONAME
     cp "${REPO_ROOT}/tpu_sync/frameworks/torch/_tpu_raiden_torch.so" \
       "${EXT_DIR}/_tpu_raiden_torch_${SUFFIX}.so"
-    echo "wheel variant: _tpu_raiden_torch_${SUFFIX}.so"
+    set_glue_needed "${EXT_DIR}/_tpu_raiden_torch_${SUFFIX}.so" "${SUFFIX}"
   done
 
   rm -f "${WHL}"

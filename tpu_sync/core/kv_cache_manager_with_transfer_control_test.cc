@@ -33,7 +33,6 @@
 #include <fstream>
 #include <future>
 #include <limits>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -45,6 +44,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -53,12 +53,18 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "grpcpp/client_context.h"
+#include "grpcpp/create_channel.h"
+#include "grpcpp/security/credentials.h"
+#include "grpcpp/support/status.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/grpc_control_plane_backend.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/tcp_control_plane_backend.h"
 #include "tpu_sync/core/transfer_receive_session.h"
 #include "tpu_sync/core/transfer_send_session.h"
+#include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
+#include "tpu_sync/proto/kv_cache_control_plane_service.pb.h"
 
 namespace tpu_raiden {
 namespace {
@@ -853,21 +859,61 @@ class ScopedControlPlaneBackend {
 };
 
 // The consumer end of the gRPC control plane, reduced to PullStream: issues
-// pulls to one producer and records each answer by uuid.
+// pulls to one producer on the raw stub, so a test can cancel them, and
+// records each answer by uuid. Answers the RPC itself fails are recorded as
+// the gRPC status.
 class GrpcPuller {
  public:
   GrpcPuller(absl::string_view host, int port)
-      : endpoint_(absl::StrCat(host, ":", port)) {}
+      : stub_(control_plane::proto::KVCacheControlPlaneService::NewStub(
+            grpc::CreateChannel(absl::StrCat(host, ":", port),
+                                grpc::InsecureChannelCredentials()))) {}
+
+  // Cancels every pull still outstanding and waits for its callback.
+  ~GrpcPuller() {
+    CancelAll();
+    absl::MutexLock lock(mu_);
+    mu_.Await(absl::Condition(
+        +[](absl::flat_hash_map<uint64_t, std::unique_ptr<Call>>* calls) {
+          return calls->empty();
+        },
+        &calls_));
+  }
 
   void Pull(uint64_t uuid, absl::Duration timeout = absl::Seconds(30)) {
-    PullStreamRequestSpec req{
-        .uuid = uuid, .src_block_ids = {0}, .dst_block_ids = {0}};
-    backend_.SendPullRequestAsync(
-        endpoint_, req, timeout, ControlPlaneBackend::TaskExecutor(),
-        [this, uuid](absl::StatusOr<PullStreamResponseSpec> answer) {
+    auto call = std::make_unique<Call>();
+    call->context.set_deadline(absl::ToChronoTime(absl::Now() + timeout));
+    call->request.set_uuid(uuid);
+    call->request.add_src_block_ids(0);
+    call->request.add_dst_block_ids(0);
+    Call* raw = call.get();
+    {
+      absl::MutexLock lock(mu_);
+      calls_.insert_or_assign(uuid, std::move(call));
+    }
+    stub_->async()->PullStream(
+        &raw->context, &raw->request, &raw->response,
+        [this, uuid, raw](grpc::Status status) {
+          absl::StatusOr<PullStreamResponseSpec> answer =
+              status.ok()
+                  ? absl::StatusOr<PullStreamResponseSpec>(
+                        PullStreamResponseSpec{
+                            .status = raw->response.status(),
+                            .num_layers = raw->response.num_layers(),
+                            .data_port = raw->response.data_port(),
+                            .message = raw->response.message()})
+                  : absl::Status(
+                        static_cast<absl::StatusCode>(status.error_code()),
+                        status.error_message());
           absl::MutexLock lock(mu_);
           answers_.insert_or_assign(uuid, std::move(answer));
+          calls_.erase(uuid);
         });
+  }
+
+  void CancelAll() {
+    absl::MutexLock lock(mu_);
+    for (auto& [uuid, call] : calls_) call->context.TryCancel();
   }
 
   std::optional<absl::StatusOr<PullStreamResponseSpec>> WaitForAnswer(
@@ -883,13 +929,19 @@ class GrpcPuller {
   }
 
  private:
-  const std::string endpoint_;
+  struct Call {
+    grpc::ClientContext context;
+    control_plane::proto::PullStreamRequest request;
+    control_plane::proto::PullStreamResponse response;
+  };
+
+  std::unique_ptr<control_plane::proto::KVCacheControlPlaneService::Stub>
+      stub_;
   absl::Mutex mu_;
-  std::map<uint64_t, absl::StatusOr<PullStreamResponseSpec>> answers_
+  absl::flat_hash_map<uint64_t, std::unique_ptr<Call>> calls_
       ABSL_GUARDED_BY(mu_);
-  // Last, so it is destroyed first: destruction cancels outstanding pulls and
-  // waits for their callbacks, which use mu_ and answers_.
-  GrpcControlPlaneBackend backend_;
+  absl::flat_hash_map<uint64_t, absl::StatusOr<PullStreamResponseSpec>>
+      answers_ ABSL_GUARDED_BY(mu_);
 };
 
 int ThreadCount() {
@@ -1042,10 +1094,18 @@ TEST(ControlHandshakeTest, GrpcParkedPullIsReleasedAtConsumerDeadline) {
   consumer.Pull(/*uuid=*/1100, /*timeout=*/absl::Seconds(1));
   ASSERT_TRUE(producer.WaitForParkedPulls(1, absl::Milliseconds(900)));
 
+  // The producer gives up at the consumer's deadline, so its rejection and the
+  // consumer's own DEADLINE_EXCEEDED race; either is a prompt release.
   auto answer = consumer.WaitForAnswer(1100, absl::Seconds(5));
   ASSERT_TRUE(answer.has_value());
-  EXPECT_EQ(answer->status().code(), absl::StatusCode::kDeadlineExceeded)
-      << answer->status();
+  if (answer->ok()) {
+    EXPECT_NE((*answer)->status, 0);
+    EXPECT_THAT((*answer)->message,
+                HasSubstr("no read registered for uuid 1100"));
+  } else {
+    EXPECT_EQ(answer->status().code(), absl::StatusCode::kDeadlineExceeded)
+        << answer->status();
+  }
   EXPECT_TRUE(producer.WaitForParkedPulls(0, absl::Seconds(1)))
       << "the producer still holds a pull its consumer gave up on";
   EXPECT_LT(SecondsSince(start), 2.5);

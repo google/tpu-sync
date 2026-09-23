@@ -139,6 +139,11 @@ class KVCacheStoreTest {
                          std::shared_ptr<KVCacheStoreBackend> backend) {
     store.backends_.push_back(std::move(backend));
   }
+
+  static absl::StatusOr<std::vector<int>> AllocateBlockIds(KVCacheStore& store,
+                                                           int needed) {
+    return store.AllocateBlockIds(needed);
+  }
 };
 
 class HostOffloadBackendTest {
@@ -285,6 +290,116 @@ TEST(KVCacheStoreTest, SetEvictionCallback) {
 
   // Passing an empty callback unregisters whatever was registered before.
   controller.SetEvictionCallback(nullptr);
+}
+
+TEST(KVCacheStoreTest, SetEvictionCallbackInvokedOnDirectEvict) {
+  KVCacheStore store(2, "", {}, /*num_shards=*/1,
+                     /*shard_size_bytes=*/512,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  std::vector<std::string> evicted_seen;
+  store.SetEvictionCallback([&](absl::Span<const std::string> hashes) {
+    evicted_seen.insert(evicted_seen.end(), hashes.begin(), hashes.end());
+  });
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  std::vector<std::string> hashes = {"hash_1", "hash_2"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(rid, 10, 20, BlockStatus::HOST),
+      RaidenBlockId(rid, 11, 21, BlockStatus::HOST)};
+
+  ASSERT_TRUE(InsertResident(store, hashes, slices, /*on_host=*/true));
+
+  // Evict hash_1.
+  size_t count = KVCacheStoreTest::Evict(store, {"hash_1"});
+  EXPECT_EQ(count, 1);
+  EXPECT_THAT(evicted_seen, ::testing::ElementsAre("hash_1"));
+
+  // Evict hash_2.
+  count = KVCacheStoreTest::Evict(store, {"hash_2"});
+  EXPECT_EQ(count, 1);
+  EXPECT_THAT(evicted_seen, ::testing::ElementsAre("hash_1", "hash_2"));
+}
+
+TEST(KVCacheStoreTest, SetEvictionCallbackSkipsPinnedBlocks) {
+  KVCacheStore store(2, "", {}, /*num_shards=*/1,
+                     /*shard_size_bytes=*/512,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  std::vector<std::string> evicted_seen;
+  store.SetEvictionCallback([&](absl::Span<const std::string> hashes) {
+    evicted_seen.insert(evicted_seen.end(), hashes.begin(), hashes.end());
+  });
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  std::vector<std::string> hashes = {"pinned_1"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(rid, 10, 20, BlockStatus::HOST)};
+
+  // Insert without Release -> entry remains PINNED.
+  ABSL_ASSERT_OK(store.Insert(hashes, slices, /*on_host=*/true));
+
+  // Attempt to evict pinned_1 -> refuses to evict.
+  size_t count = KVCacheStoreTest::Evict(store, {"pinned_1"});
+  EXPECT_EQ(count, 0);
+  EXPECT_TRUE(evicted_seen.empty());
+
+  // Release pin, then evict -> succeeds and triggers callback.
+  store.Release(hashes);
+  count = KVCacheStoreTest::Evict(store, {"pinned_1"});
+  EXPECT_EQ(count, 1);
+  EXPECT_THAT(evicted_seen, ::testing::ElementsAre("pinned_1"));
+}
+
+TEST(KVCacheStoreTest, SetEvictionCallbackUnregister) {
+  KVCacheStore store(2, "", {}, /*num_shards=*/1,
+                     /*shard_size_bytes=*/512,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  std::vector<std::string> evicted_seen;
+  store.SetEvictionCallback([&](absl::Span<const std::string> hashes) {
+    evicted_seen.insert(evicted_seen.end(), hashes.begin(), hashes.end());
+  });
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  std::vector<std::string> hashes = {"h1", "h2"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(rid, 10, 20, BlockStatus::HOST),
+      RaidenBlockId(rid, 11, 21, BlockStatus::HOST)};
+
+  ASSERT_TRUE(InsertResident(store, hashes, slices, /*on_host=*/true));
+
+  // Unregister callback.
+  store.SetEvictionCallback(nullptr);
+
+  size_t count = KVCacheStoreTest::Evict(store, {"h1"});
+  EXPECT_EQ(count, 1);
+  EXPECT_TRUE(evicted_seen.empty());
+}
+
+TEST(KVCacheStoreTest, SetEvictionCallbackAcceptsMoveOnlyCallable) {
+  KVCacheStore store(2, "", {}, /*num_shards=*/1,
+                     /*shard_size_bytes=*/512,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  // The callback owns its state outright rather than sharing it, which only
+  // a move-only callback type allows.
+  auto evicted_seen = std::make_unique<std::vector<std::string>>();
+  std::vector<std::string>* observed = evicted_seen.get();
+  store.SetEvictionCallback(
+      [owned = std::move(evicted_seen)](absl::Span<const std::string> hashes) {
+        owned->insert(owned->end(), hashes.begin(), hashes.end());
+      });
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  std::vector<std::string> hashes = {"move_only_hash"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(rid, 10, 20, BlockStatus::HOST)};
+
+  ASSERT_TRUE(InsertResident(store, hashes, slices, /*on_host=*/true));
+
+  EXPECT_EQ(KVCacheStoreTest::Evict(store, {"move_only_hash"}), 1);
+  EXPECT_THAT(*observed, ::testing::ElementsAre("move_only_hash"));
 }
 
 TEST(KVCacheStoreTest, GlobalLookupFallback) {
@@ -1119,6 +1234,46 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, SaveReusesFreedBlocksAfterEvict) {
   absl::Status status = save_and_wait(second);
   ABSL_EXPECT_OK(status);
   EXPECT_EQ(controller_ptr->block_manager()->num_locked_blocks(), 1);
+}
+
+TEST_F(KVCacheStoreEmbeddedControllerTest,
+       AllocateBlockIdsInvokesEvictionCallback) {
+  // When allocating blocks requires evicting unpinned host blocks to make room,
+  // the eviction callback should be invoked with the evicted block hashes.
+  auto controller = MakeController(/*num_blocks=*/2);
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  KVCacheStore store(2, std::move(controller), "", rid, std::nullopt,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  std::vector<std::string> evicted_seen;
+  store.SetEvictionCallback([&](absl::Span<const std::string> hashes) {
+    evicted_seen.insert(evicted_seen.end(), hashes.begin(), hashes.end());
+  });
+
+  // Populate store with two host blocks (host_block_id 0 and 1).
+  auto* ctrl = KVCacheStoreTest::GetController(store);
+  ASSERT_NE(ctrl, nullptr);
+  auto alloc_res = ctrl->AllocateBlockIds(2);
+  ABSL_ASSERT_OK(alloc_res);
+  std::vector<int> host_ids = *alloc_res;
+  ASSERT_EQ(host_ids.size(), 2);
+
+  std::vector<std::string> hashes = {"h1", "h2"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(rid, host_ids[0], 0, BlockStatus::HOST),
+      RaidenBlockId(rid, host_ids[1], 1, BlockStatus::HOST)};
+  ASSERT_TRUE(InsertResident(store, hashes, slices, /*on_host=*/true));
+
+  // Now free block count is 0. Requesting 1 block via AllocateBlockIds
+  // will force eviction of 1 evictable block (the LRU entry "h2").
+  auto alloc_one = KVCacheStoreTest::AllocateBlockIds(store, 1);
+  ABSL_ASSERT_OK(alloc_one);
+  EXPECT_EQ(alloc_one->size(), 1);
+
+  // Eviction callback was notified of "h2".
+  EXPECT_THAT(evicted_seen, ::testing::ElementsAre("h2"));
 }
 
 TEST_F(KVCacheStoreEmbeddedControllerTest, SaveSuccess) {

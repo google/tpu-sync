@@ -231,7 +231,11 @@ class KVCacheStoreBackend {
   virtual std::vector<std::string> GetEvictableKeys(size_t count) { return {}; }
 
   // Evicts keys from the backend and returns deallocated host block IDs.
-  virtual std::vector<int> Evict(const std::vector<std::string>& block_hashes) {
+  // If `evicted_hashes` is non-null, it is populated with the block hashes that
+  // were actually evicted.
+  virtual std::vector<int> Evict(
+      const std::vector<std::string>& block_hashes,
+      std::vector<std::string>* evicted_hashes = nullptr) {
     Delete(block_hashes, {});
     return {};
   }

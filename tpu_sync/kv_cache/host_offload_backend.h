@@ -101,7 +101,9 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   std::vector<std::string> GetEvictableKeys(size_t count) override;
 
-  std::vector<int> Evict(const std::vector<std::string>& block_hashes) override;
+  std::vector<int> Evict(
+      const std::vector<std::string>& block_hashes,
+      std::vector<std::string>* evicted_hashes = nullptr) override;
 
   std::vector<std::string> GetEvictCandidateKeys() const override;
 

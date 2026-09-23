@@ -1761,14 +1761,28 @@ size_t KVCacheStore::Evict(const std::vector<std::string>& block_hashes) {
   // The backend handles thread-safe eviction and unregisters erased blocks
   // from the global registry outside its lock. We do not hold store mutex_
   // across this call to avoid blocking concurrent operations on network I/O.
+  std::vector<std::string> evicted_hashes;
   const std::vector<int> host_ids_to_deallocate =
-      backend()->Evict(block_hashes);
+      backend()->Evict(block_hashes, &evicted_hashes);
 
   if (host_ids_to_deallocate.empty()) {
     return 0;
   }
 
   DeallocateBlockIds(host_ids_to_deallocate);
+
+  // Snapshot the registered callback and invoke it after unlocking: it runs
+  // arbitrary user code (possibly re-entering this store, and in the Python
+  // binding acquiring the GIL), so it must not hold mutex_. Copying the
+  // pointer rather than the callback itself keeps this a refcount bump.
+  std::shared_ptr<const EvictionCallback> callback;
+  {
+    absl::MutexLock lock(mutex_);
+    callback = eviction_callback_;
+  }
+  if (callback != nullptr && !evicted_hashes.empty()) {
+    (*callback)(evicted_hashes);
+  }
 
   return host_ids_to_deallocate.size();
 }

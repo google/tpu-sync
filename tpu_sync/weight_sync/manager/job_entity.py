@@ -88,8 +88,6 @@ class JobEntity:
       control_pipe: Optional[control_pipe_client.ControlPipeClient] = None,
       executor: Optional[concurrent.futures.ThreadPoolExecutor] = None,
       weight_sync_mode: bool = False,
-      rpc_delegate: Optional["WorkerRpcClient"] = None,
-      worker_rpc_client: Optional["WorkerRpcClient"] = None,
       on_update: Optional[Callable[["JobEntity"], None]] = None,
   ):
     self.unit = controller_types.entity_key_from_unit(unit)
@@ -114,13 +112,9 @@ class JobEntity:
     self._name_resolver = name_resolver
     self._proto_module = proto_module or raiden_service_pb2
     self._weight_sync_mode = weight_sync_mode
-    self._rpc_delegate = worker_rpc_client or rpc_delegate
     self._on_update = on_update
 
-    # Each JobEntity owns its own WorkerRpcClient, which owns its
-    # ControlPipeClient.
-    self._owns_control_pipe = control_pipe is None
-    self._owns_executor = executor is None
+    self._owns_rpc_client = True
     client_cls = (
         WeightSyncWorkerRpcClient if weight_sync_mode else WorkerRpcClient
     )
@@ -133,8 +127,6 @@ class JobEntity:
         executor=executor,
         bind_entity=self,
     )
-    self._control_pipe_client = self._worker_rpc_client.control_pipe_client
-    self._executor = self._worker_rpc_client.executor
 
     # Registration metadata owned by this entity.
     self.mesh_shape: Optional[list[int]] = None
@@ -167,7 +159,7 @@ class JobEntity:
 
   @property
   def worker_rpc_client(self) -> "WorkerRpcClient":
-    """Returns the WorkerRpcClient owned by this JobEntity."""
+    """Returns the WorkerRpcClient used by this JobEntity."""
     return self._worker_rpc_client
 
   @property
@@ -178,7 +170,7 @@ class JobEntity:
   @property
   def executor(self) -> concurrent.futures.ThreadPoolExecutor:
     """Returns the ThreadPoolExecutor used for dispatching host RPCs."""
-    return self._executor
+    return self._worker_rpc_client.executor
 
   @property
   def name_resolver(self) -> Optional[NameResolver]:
@@ -599,15 +591,9 @@ class JobEntity:
       self, transfer_plan: Optional[TransferPlan] = None
   ) -> bool:
     """Returns whether receiver StartTransferRequests need shard_push_schedules."""
-    if self._rpc_delegate is not None:
-      return self._rpc_delegate.include_receiver_push_schedules(transfer_plan)
-    if self._weight_sync_mode:
-      return False
-    if transfer_plan is not None and getattr(
-        transfer_plan, "is_weight_sync", False
-    ):
-      return False
-    return True
+    return self._worker_rpc_client.include_receiver_push_schedules(
+        transfer_plan
+    )
 
   def _resolve_target_unit(
       self,
@@ -1161,78 +1147,14 @@ class JobEntity:
   async def _send_rpc(
       self, addr: str, payload: bytes, timeout: float = 600.0
   ) -> bytes:
-    """Connects to attached host address via owned ControlPipeClient and returns response bytes."""
-    if self._rpc_delegate is not None and (
-        type(self._rpc_delegate)._send_rpc is not WorkerRpcClient._send_rpc
-        or "_send_rpc" in self._rpc_delegate.__dict__
-        or type(self._rpc_delegate)._send_rpc_sync
-        is not WorkerRpcClient._send_rpc_sync
-        or "_send_rpc_sync" in self._rpc_delegate.__dict__
-        or (
-            "send_raw_bytes_sync"
-            not in getattr(self._control_pipe_client, "__dict__", {})
-            and (
-                "send_raw_bytes_sync"
-                in getattr(
-                    self._rpc_delegate._control_pipe_client, "__dict__", {}
-                )
-                or "send_raw_bytes"
-                in getattr(
-                    self._rpc_delegate._control_pipe_client, "__dict__", {}
-                )
-            )
-        )
-    ):
-      return await self._rpc_delegate._send_rpc(addr, payload, timeout=timeout)
-    if (
-        "_send_rpc_sync" not in self.__dict__
-        and "send_raw_bytes_sync"
-        not in getattr(self._control_pipe_client, "__dict__", {})
-        and self._control_pipe_client.backend
-        != control_pipe_client.ControlPipeBackendType.TCP
-    ):
-      return await self._control_pipe_client.send_raw_bytes(
-          addr,
-          payload,
-          timeout=timeout,
-          message_type=self._proto_module.ControlRequest.DESCRIPTOR.full_name,
-      )
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        self._executor, self._send_rpc_sync, addr, payload, timeout
+    """Dispatches RPC payload via this entity's WorkerRpcClient."""
+    return await self._worker_rpc_client._send_rpc(
+        addr, payload, timeout=timeout
     )
-
-  def _send_rpc_sync(
-      self, addr: str, payload: bytes, timeout: float = 600.0
-  ) -> bytes:
-    """Dispatches payload synchronously via owned ControlPipeClient."""
-    return self._control_pipe_client.send_raw_bytes_sync(
-        addr,
-        payload,
-        timeout=timeout,
-        message_type=self._proto_module.ControlRequest.DESCRIPTOR.full_name,
-    )
-
-  def _verify_response(self, resp_bytes: bytes) -> None:
-    """Validates demarshaled remote response bytes returned from C++ host workers."""
-    resp = self._proto_module.ControlResponse()
-    resp.ParseFromString(resp_bytes)
-    if not resp.success:
-      raise RuntimeError(
-          f"Raiden remote native execution failed: {resp.message}"
-      )
 
   async def _send_and_verify(self, addr: str, payload: bytes) -> None:
-    """Sends RPC payload to `addr` and verifies the response status."""
-    if self._rpc_delegate is not None and (
-        type(self._rpc_delegate)._send_and_verify
-        is not WorkerRpcClient._send_and_verify
-        or "_send_and_verify" in self._rpc_delegate.__dict__
-    ):
-      await self._rpc_delegate._send_and_verify(addr, payload)
-      return
-    resp_bytes = await self._send_rpc(addr, payload, timeout=1800.0)
-    self._verify_response(resp_bytes)
+    """Sends RPC payload to `addr` and verifies the response status via WorkerRpcClient."""
+    await self._worker_rpc_client._send_and_verify(addr, payload)
 
   def _encode_for_host(
       self,
@@ -1240,55 +1162,37 @@ class JobEntity:
       address: Optional[str] = None,
       unit: Optional[RaidenId] = None,
   ) -> Optional[bytes]:
-    """Encodes StartTransferRequest for `address` via delegate override or entity."""
+    """Encodes StartTransferRequest for `address` via WorkerRpcClient override or entity."""
     target_id = self._resolve_target_unit(
         transfer_plan, address=address, unit=unit
     )
-    if self._rpc_delegate is not None and (
-        type(self._rpc_delegate)._encode_start_transfer
+    if (
+        type(self._worker_rpc_client)._encode_start_transfer
         is not WorkerRpcClient._encode_start_transfer
-        or "_encode_start_transfer" in self._rpc_delegate.__dict__
+        or "_encode_start_transfer" in self._worker_rpc_client.__dict__
     ):
       try:
-        return self._rpc_delegate._encode_start_transfer(
+        return self._worker_rpc_client._encode_start_transfer(
             target_id, transfer_plan, address=address
         )
       except TypeError:
-        return self._rpc_delegate._encode_start_transfer(
+        return self._worker_rpc_client._encode_start_transfer(
             target_id, transfer_plan
         )
     return self.encode_start_transfer(
         transfer_plan, address=address, unit=target_id
     )
 
-  # pylint: enable=protected-access
-
-  async def start_transfer(
+  async def _execute_start_transfer(
       self,
       transfer_plan: TransferPlan,
       address: Optional[str] = None,
-      from_delegate: bool = False,
       unit: Optional[RaidenId] = None,
   ) -> None:
-    """Dispatches transfer commands to hosts attached to this JobEntity."""
+    """Encodes and dispatches StartTransferRequests to hosts attached to this JobEntity."""
     target_id = self._resolve_target_unit(
         transfer_plan, address=address, unit=unit
     )
-    if (
-        not from_delegate
-        and self._rpc_delegate is not None
-        and (
-            type(self._rpc_delegate).start_transfer
-            not in (
-                WorkerRpcClient.start_transfer,
-                WeightSyncWorkerRpcClient.start_transfer,
-            )
-            or "start_transfer" in self._rpc_delegate.__dict__
-        )
-    ):
-      await self._rpc_delegate.start_transfer(target_id, transfer_plan)
-      return
-
     rep_id = getattr(target_id, "job_replica_id", "") or ""
     if address:
       addrs = [a.strip() for a in address.split(",") if a.strip()]
@@ -1324,6 +1228,32 @@ class JobEntity:
     if coros:
       await asyncio.gather(*coros)
 
+  async def start_transfer(
+      self,
+      transfer_plan: TransferPlan,
+      address: Optional[str] = None,
+      unit: Optional[RaidenId] = None,
+  ) -> None:
+    """Dispatches transfer commands to hosts attached to this JobEntity."""
+    target_id = self._resolve_target_unit(
+        transfer_plan, address=address, unit=unit
+    )
+    if (
+        type(self._worker_rpc_client).start_transfer
+        not in (
+            WorkerRpcClient.start_transfer,
+            WeightSyncWorkerRpcClient.start_transfer,
+        )
+        or "start_transfer" in self._worker_rpc_client.__dict__
+    ):
+      await self._worker_rpc_client.start_transfer(target_id, transfer_plan)
+      return
+    await self._execute_start_transfer(
+        transfer_plan, address=address, unit=target_id
+    )
+
+  # pylint: enable=protected-access
+
   def _encode_shutdown(self) -> bytes:
     req = self._proto_module.ControlRequest(
         command=self._proto_module.ControlRequest.COMMAND_SHUTDOWN
@@ -1343,11 +1273,9 @@ class JobEntity:
       )
 
   def close(self) -> None:
-    """Closes the owned ControlPipeClient and executor."""
-    if self._owns_control_pipe and self._control_pipe_client is not None:
-      self._control_pipe_client.close()
-    if self._owns_executor and self._executor is not None:
-      self._executor.shutdown(wait=False)
+    """Closes the owned WorkerRpcClient when created by this entity."""
+    if self._owns_rpc_client and self._worker_rpc_client is not None:
+      self._worker_rpc_client.close()
 
 
 # Alias for callers referencing HostGroup
@@ -1413,7 +1341,7 @@ class _EndpointsView(abc.MutableMapping):
 
 
 class WorkerRpcClient:
-  """Distributed RPC Client facade delegating host management and RPCs to JobEntity instances."""
+  """Distributed RPC Client handling ControlPipeClient transport and worker RPCs."""
 
   def __init__(
       self,
@@ -1431,6 +1359,8 @@ class WorkerRpcClient:
     self._name_resolver = name_resolver
     self._proto_module = proto_module or raiden_service_pb2
     self._use_legacy_tcp_framing = use_legacy_tcp_framing
+    self._owns_control_pipe = control_pipe is None
+    self._owns_executor = executor is None
     if control_pipe is not None:
       self._control_pipe_client = control_pipe
     else:
@@ -1480,11 +1410,12 @@ class WorkerRpcClient:
           name_resolver=self._name_resolver,
           proto_module=self._proto_module,
           use_legacy_tcp_framing=self._use_legacy_tcp_framing,
-          control_pipe=None,
+          control_pipe=self._control_pipe_client,
           executor=self._executor,
           weight_sync_mode=isinstance(self, WeightSyncWorkerRpcClient),
-          rpc_delegate=self,
       )
+      entity._worker_rpc_client = self  # pylint: disable=protected-access
+      entity._owns_rpc_client = False  # pylint: disable=protected-access
       self._entities[key] = entity
     if getattr(unit, "data_name", "") and not entity._default_data_name:  # pylint: disable=protected-access
       entity._default_data_name = unit.data_name  # pylint: disable=protected-access
@@ -1500,12 +1431,18 @@ class WorkerRpcClient:
         rep_units.append(unit)
     return entity
 
-  def bind_entities(self, entities: dict[RaidenId, JobEntity]) -> None:
+  def bind_entities(
+      self,
+      entities: dict[RaidenId, JobEntity],
+      override_entity_client: bool = True,
+  ) -> None:
     """Shares the controller's JobEntity registry with this client."""
     for unit, existing in self._entities.items():
       key = controller_types.entity_key_from_unit(unit)
       if key not in entities:
-        existing._rpc_delegate = self  # pylint: disable=protected-access
+        if override_entity_client:
+          existing._worker_rpc_client = self  # pylint: disable=protected-access
+          existing._owns_rpc_client = False  # pylint: disable=protected-access
         entities[key] = existing
       else:
         for rep_id, eps in existing._endpoints_by_replica.items():  # pylint: disable=protected-access
@@ -1514,8 +1451,10 @@ class WorkerRpcClient:
         for ep in existing.get_registered_endpoints():
           entities[key].register_host_endpoint(ep)
     self._entities = entities
-    for entity in self._entities.values():
-      entity._rpc_delegate = self  # pylint: disable=protected-access
+    if override_entity_client:
+      for entity in self._entities.values():
+        entity._worker_rpc_client = self  # pylint: disable=protected-access
+        entity._owns_rpc_client = False  # pylint: disable=protected-access
 
   @property
   def executor(self) -> concurrent.futures.ThreadPoolExecutor:
@@ -1524,10 +1463,16 @@ class WorkerRpcClient:
   def close(self) -> None:
     """Closes ControlPipeClient and shuts down the internal ThreadPoolExecutor."""
     for entity in list(self._entities.values()):
-      entity.close()
-    if hasattr(self, "_control_pipe_client") and self._control_pipe_client:
+      if entity.worker_rpc_client is not self:
+        entity.close()
+    if (
+        self._owns_control_pipe
+        and hasattr(self, "_control_pipe_client")
+        and self._control_pipe_client
+    ):
       self._control_pipe_client.close()
-    self._executor.shutdown(wait=False)
+    if self._owns_executor and hasattr(self, "_executor") and self._executor:
+      self._executor.shutdown(wait=False)
 
   def __del__(self) -> None:
     try:
@@ -1572,6 +1517,8 @@ class WorkerRpcClient:
     """Connects to remote address, sends payload, and returns the response bytes."""
     if (
         "_send_rpc_sync" not in self.__dict__
+        and "send_raw_bytes_sync"
+        not in getattr(self._control_pipe_client, "__dict__", {})
         and self._control_pipe_client.backend
         != control_pipe_client.ControlPipeBackendType.TCP
     ):
@@ -1627,8 +1574,8 @@ class WorkerRpcClient:
   ) -> None:
     """Delegates transfer kickoff to the JobEntity for `target_id`."""
     entity = self.get_or_create_entity(target_id)
-    await entity.start_transfer(
-        transfer_plan, address=address, from_delegate=True, unit=target_id
+    await entity._execute_start_transfer(  # pylint: disable=protected-access
+        transfer_plan, address=address, unit=target_id
     )
 
   async def _send_and_verify(self, addr: str, payload: bytes) -> None:

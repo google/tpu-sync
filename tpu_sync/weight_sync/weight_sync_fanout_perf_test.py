@@ -310,15 +310,8 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
       self.layer_max_bytes[proto.layer_idx] = var_bytes
 
     # 2. Start centralized Controller Server on loopback
-    self.controller_network_client = (
-        raiden_controller.WeightSyncWorkerRpcClient(name_resolver=None)
-    )
-    self.addCleanup(self.controller_network_client.close)
-
-    self.controller = raiden_controller.RaidenController(
-        port=0,
-        worker_rpc_client=self.controller_network_client,
-    )
+    self.controller = raiden_controller.RaidenController(port=0)
+    self.addCleanup(self.controller.close)
     self.controller_server = raiden_controller.RaidenControllerServer(
         self.controller
     )

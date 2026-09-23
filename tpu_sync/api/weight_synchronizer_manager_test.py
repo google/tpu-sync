@@ -20,19 +20,11 @@ from tpu_sync.api import weight_synchronizer_manager
 from tpu_sync.rpc import raiden_controller
 
 
-class DummyWorkerRpcClient(raiden_controller.WorkerRpcClient):
-
-  async def start_transfer(self, target_id, transfer_plan, address=None) -> None:
-    pass
-
-
 class WeightSynchronizerManagerTest(absltest.TestCase):
 
   def test_instantiation_and_methods(self):
-    dummy_client = DummyWorkerRpcClient()
     manager = weight_synchronizer_manager.WeightSynchronizerManager(
         port=0,
-        worker_rpc_client=dummy_client,
         broadcast_k=32,
         enable_plan_cache=True,
     )
@@ -54,7 +46,6 @@ class WeightSynchronizerManagerTest(absltest.TestCase):
   def test_server_lifecycle_and_context_manager(self):
     with weight_synchronizer_manager.WeightSynchronizerManager(
         port=0,
-        worker_rpc_client=DummyWorkerRpcClient(),
         auto_start_server=True,
     ) as mgr:
       self.assertGreater(mgr.port, 0)

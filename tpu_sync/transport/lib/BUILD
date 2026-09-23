@@ -34,6 +34,7 @@ cc_library(
     name = "transport_adapter",
     hdrs = ["transport_adapter.h"],
     deps = [
+        "//tpu_sync/transport/peregrine/src/api:transport_metrics",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

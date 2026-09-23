@@ -111,7 +111,6 @@ class RaidenController:
   def __init__(
       self,
       port: int,
-      worker_rpc_client: Optional[WorkerRpcClient] = None,
       request_registry_ttl_s: float = 600.0,
       broadcast_k: Optional[int] = None,
       enable_plan_cache: bool = True,
@@ -120,8 +119,6 @@ class RaidenController:
 
     Args:
       port: Port number the controller service runs on.
-      worker_rpc_client: Optional legacy worker RPC client override wrapped into
-        managed JobEntity instances for backward compatibility.
       request_registry_ttl_s: TTL in seconds for request registry entries.
       broadcast_k: Fan-out factor K for tree-based broadcast transfers.
       enable_plan_cache: Whether to cache transfer planning and resharding
@@ -158,12 +155,6 @@ class RaidenController:
     if request_registry_ttl_s <= 0:
       raise ValueError("request_registry_ttl_s must be positive")
     self._request_registry_ttl_s = request_registry_ttl_s
-    self._legacy_rpc_client = worker_rpc_client or WorkerRpcClient()
-    if hasattr(self._legacy_rpc_client, "bind_entities"):
-      self._legacy_rpc_client.bind_entities(self._entities)
-      for ent in self._entities.values():
-        ent.set_on_update(self._sync_from_entity)
-        self._sync_from_entity(ent)
     self._broadcast_engine = BroadcastEngine(
         _EntityBroadcastDispatcher(self),
         remote_controller_client_factory=RaidenControllerClientFacade,
@@ -174,34 +165,22 @@ class RaidenController:
     self._planner = ReshardPlanner()
 
   @property
-  def worker_rpc_client(self) -> WorkerRpcClient:
-    """Compatibility property returning the entity-bound WorkerRpcClient view."""
-    return self._legacy_rpc_client
-
-  @worker_rpc_client.setter
-  def worker_rpc_client(self, client: WorkerRpcClient) -> None:
-    self._legacy_rpc_client = client
-    if hasattr(client, "bind_entities"):
-      client.bind_entities(self._entities)
-
-  @property
   def name_resolver(self) -> Optional[NameResolver]:
     """Returns the NameResolver configured across managed JobEntities."""
-    return getattr(self._legacy_rpc_client, "name_resolver", None)
+    return None
 
   @property
   def executor(self) -> Any:
     """Returns the RPC executor configured across managed JobEntities."""
-    return getattr(self._legacy_rpc_client, "executor", None)
+    with self._lock:
+      for ent in self._entities.values():
+        return ent.executor
+    return None
 
   def include_receiver_push_schedules(
       self, transfer_plan: Optional[TransferPlan] = None
   ) -> bool:
     """Returns whether receiver StartTransferRequests need shard_push_schedules."""
-    if hasattr(self._legacy_rpc_client, "include_receiver_push_schedules"):
-      return self._legacy_rpc_client.include_receiver_push_schedules(
-          transfer_plan
-      )
     if transfer_plan is not None and getattr(
         transfer_plan, "is_weight_sync", False
     ):
@@ -296,11 +275,10 @@ class RaidenController:
     with self._lock:
       ent = self._entities.get(key)
       if ent is None:
-        if hasattr(self._legacy_rpc_client, "get_or_create_entity"):
-          ent = self._legacy_rpc_client.get_or_create_entity(unit)
-        else:
-          ent = JobEntity(unit=key)
-        ent.set_on_update(self._sync_from_entity)
+        ent = JobEntity(
+            unit=key,
+            on_update=self._sync_from_entity,
+        )
         self._entities[key] = ent
       if getattr(unit, "data_name", "") and not ent._default_data_name:  # pylint: disable=protected-access
         ent._default_data_name = unit.data_name  # pylint: disable=protected-access
@@ -355,16 +333,6 @@ class RaidenController:
 
   async def shutdown_entities(self, timeout: float = 10.0) -> None:
     """Dispatches remote shutdown commands across all managed JobEntities."""
-    if self._legacy_rpc_client is not None and (
-        "shutdown_workers" in getattr(self._legacy_rpc_client, "__dict__", {})
-        or type(self._legacy_rpc_client).shutdown_workers
-        not in (
-            WorkerRpcClient.shutdown_workers,
-            WeightSyncWorkerRpcClient.shutdown_workers,
-        )
-    ):
-      await self._legacy_rpc_client.shutdown_workers()
-      return
     with self._lock:
       entities = list(self._entities.values())
     if entities:
@@ -372,6 +340,13 @@ class RaidenController:
           *[ent.shutdown_hosts(timeout=timeout) for ent in entities],
           return_exceptions=True,
       )
+
+  def close(self) -> None:
+    """Closes all managed JobEntities and their owned WorkerRpcClients."""
+    with self._lock:
+      entities = list(self._entities.values())
+    for ent in entities:
+      ent.close()
 
   def _prune_completed_transfers_locked(self, max_completed: int = 16) -> None:
     """Evicts oldest completed transfer records to prevent unbounded memory growth."""

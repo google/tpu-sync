@@ -105,7 +105,11 @@ py_library(
         "//tpu_sync/api:common",
         "//tpu_sync/common/control_pipe:control_pipe_client",
         "//tpu_sync/kv_cache:nd_slice_math",
-        "//tpu_sync/weight_sync:broadcast_engine",
+        "//tpu_sync/weight_sync/manager:broadcast_engine",
+        "//tpu_sync/weight_sync/manager:controller_rpc_service",
+        "//tpu_sync/weight_sync/manager:controller_types",
+        "//tpu_sync/weight_sync/manager:job_entity",
+        "//tpu_sync/weight_sync/manager:reshard_planner",
         "@com_google_absl_py//absl/logging",
     ],
 )

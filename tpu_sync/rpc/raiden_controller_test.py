@@ -5217,5 +5217,177 @@ class SenderScheduleSlicingAndPayloadCachingTest(absltest.TestCase):
       client.close()
 
 
+class JobEntityTest(absltest.TestCase):
+  """Tests for multi-host JobEntity / HostGroup abstraction and ControlPipeClient ownership."""
+
+  def test_eleven_entities_multi_host_delegation(self):
+    """Verifies 1 trainer (10 hosts) + 10 samplers (4 hosts each) = 11 entities in RaidenController."""
+    controller = raiden_controller.RaidenController(port=0)
+    try:
+      # 1 Trainer job (data_replica_idx=0) with 10 hosts
+      # (job_replica_id="0".."9").
+      trainer_host_units = [
+          raiden_controller.RaidenId(
+              job_name="trainer",
+              job_replica_id=str(h),
+              data_name="weights",
+              data_replica_idx=0,
+          )
+          for h in range(10)
+      ]
+      trainer_hosts = [f"10.0.0.{h}:9000" for h in range(10)]
+      trainer_shards: list[str] = []
+      for h, host_unit in enumerate(trainer_host_units):
+        host_shards = [f"10.0.0.{h}:{8000 + local_i}" for local_i in range(4)]
+        trainer_shards.extend(host_shards)
+        controller.register_work_unit(
+            host_unit,
+            shards=host_shards,
+            control_plane_rpc_address=trainer_hosts[h],
+            mesh_shape=[40],
+            layout=[0],
+            global_shape=[400],
+            itemsize=4,
+        )
+
+      # 10 Sampler jobs (job_name="sampler_0".."sampler_9"), each with 4
+      # attached hosts (job_replica_id="0".."3", 4 shards/host = 16 shards/job).
+      sampler_representative_units = []
+      for s_idx in range(10):
+        sampler_host_units = [
+            raiden_controller.RaidenId(
+                job_name=f"sampler_{s_idx}",
+                job_replica_id=str(h),
+                data_name="weights",
+                data_replica_idx=0,
+            )
+            for h in range(4)
+        ]
+        sampler_representative_units.append(sampler_host_units[0])
+        for h, host_unit in enumerate(sampler_host_units):
+          host_shards = [
+              f"10.1.{s_idx}.{h}:{8000 + local_i}" for local_i in range(4)
+          ]
+          controller.register_work_unit(
+              host_unit,
+              shards=host_shards,
+              control_plane_rpc_address=f"10.1.{s_idx}.{h}:9000",
+              mesh_shape=[16],
+              layout=[0],
+              global_shape=[400],
+              itemsize=4,
+          )
+
+      # RaidenController manages 11 entities (1 trainer + 10 samplers),
+      # indexed by RaidenId(job_name=...).
+      entities = controller.entities
+      self.assertLen(entities, 11)
+      self.assertIn(raiden_controller.RaidenId(job_name="trainer"), entities)
+      self.assertIn(raiden_controller.RaidenId(job_name="sampler_1"), entities)
+
+      trainer_entity = controller.get_entity(
+          raiden_controller.RaidenId(job_name="trainer")
+      )
+      self.assertIsNotNone(trainer_entity)
+      self.assertIsInstance(trainer_entity, raiden_controller.JobEntity)
+      self.assertEqual(trainer_entity.num_hosts, 10)
+      self.assertLen(trainer_entity.hosts, 10)
+      self.assertEqual(trainer_entity.host_endpoints, trainer_hosts)
+      self.assertIsNotNone(trainer_entity.worker_rpc_client)
+      self.assertIsNotNone(trainer_entity.control_pipe_client)
+      self.assertIs(
+          trainer_entity.control_pipe_client,
+          trainer_entity.worker_rpc_client.control_pipe_client,
+      )
+
+      # Verify each trainer host owns 4 distinct shards (40 shards / 10 hosts)
+      for host_idx, host_desc in enumerate(trainer_entity.hosts):
+        self.assertEqual(host_desc.job_replica_id, str(host_idx))
+        self.assertEqual(host_desc.control_address, trainer_hosts[host_idx])
+        self.assertLen(host_desc.shards, 4)
+
+      for s_idx, sampler_unit in enumerate(sampler_representative_units):
+        sampler_entity = controller.get_entity(
+            raiden_controller.RaidenId(job_name=f"sampler_{s_idx}")
+        )
+        self.assertIs(sampler_entity, controller.get_entity(sampler_unit))
+        self.assertIsNotNone(sampler_entity)
+        self.assertEqual(sampler_entity.num_hosts, 4)
+        self.assertLen(sampler_entity.hosts, 4)
+        self.assertIsNotNone(sampler_entity.worker_rpc_client)
+        self.assertIsNotNone(sampler_entity.control_pipe_client)
+        self.assertIs(
+            sampler_entity.control_pipe_client,
+            sampler_entity.worker_rpc_client.control_pipe_client,
+        )
+        for host_idx, host_desc in enumerate(sampler_entity.hosts):
+          self.assertEqual(host_desc.job_replica_id, str(host_idx))
+          self.assertLen(host_desc.shards, 4)
+
+      # Verify transfer command dispatch via JobEntity's owned ControlPipeClient
+      dispatched_by_entity: dict[raiden_controller.RaidenId, list[str]] = {}
+      ok_resp = raiden_service_pb2.ControlResponse(
+          success=True
+      ).SerializeToString()
+
+      for unit_id, ent in entities.items():
+        dispatched_by_entity[unit_id] = []
+
+        def make_fake_sync(u):
+          def fake_send_sync(addr, payload, timeout=600.0, message_type=""):
+            del payload, timeout, message_type
+            dispatched_by_entity[u].append(addr)
+            return ok_resp
+
+          return fake_send_sync
+
+        ent.control_pipe_client.send_raw_bytes_sync = make_fake_sync(unit_id)
+
+      # Dispatch transfer across all 10 hosts of trainer_entity via entity key
+      trainer_key = trainer_entity.unit
+      sampler0_key = controller.get_entity(sampler_representative_units[0]).unit
+      s0_plan = raiden_controller.TransferPlan(
+          src_units=[trainer_key],
+          dst_units=[sampler0_key],
+          plan={},
+          worker_data_addresses={
+              trainer_key: trainer_shards,
+              sampler0_key: controller.get_entity(sampler0_key).shards,
+          },
+          is_sender=True,
+          is_weight_sync=True,
+      )
+      asyncio.run(trainer_entity.start_transfer(s0_plan))
+      self.assertCountEqual(dispatched_by_entity[trainer_key], trainer_hosts)
+    finally:
+      controller.worker_rpc_client.close()
+
+  def test_incremental_attach_host_on_entity(self):
+    """Verifies incremental host attachment via controller.attach_host."""
+    controller = raiden_controller.RaidenController(port=0)
+    try:
+      for h in range(4):
+        host_unit = raiden_controller.RaidenId(
+            job_name="sampler",
+            job_replica_id=str(h),
+            data_name="weights",
+            data_replica_idx=0,
+        )
+        controller.attach_host(
+            host_unit,
+            control_address=f"10.2.0.{h}:9000",
+            shards=[f"10.2.0.{h}:8000", f"10.2.0.{h}:8001"],
+        )
+
+      sampler_key = raiden_controller.RaidenId("sampler", "", "weights", 0)
+      entity = controller.get_entity(sampler_key)
+      self.assertIsNotNone(entity)
+      self.assertLen(controller.entities, 1)
+      self.assertEqual(entity.num_hosts, 4)
+      self.assertLen(entity.shards, 8)
+    finally:
+      controller.worker_rpc_client.close()
+
+
 if __name__ == "__main__":
   absltest.main()

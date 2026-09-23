@@ -13,7 +13,7 @@
 # limitations under the License.
 
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
-load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("@rules_python//python:defs.bzl", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -153,27 +153,6 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
         "@xla//xla:shape_util",
-    ],
-)
-
-py_library(
-    name = "broadcast_engine",
-    srcs = ["broadcast_engine.py"],
-    visibility = ["//visibility:public"],
-    deps = [
-        "//tpu_sync/api:common",
-        "@com_google_absl_py//absl/logging",
-    ],
-)
-
-py_test(
-    name = "broadcast_engine_test",
-    srcs = ["broadcast_engine_test.py"],
-    deps = [
-        ":broadcast_engine",
-        "//tpu_sync/api:common",
-        "//tpu_sync/rpc:raiden_controller",
-        "@com_google_absl_py//absl/testing:absltest",
     ],
 )
 

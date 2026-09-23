@@ -21,7 +21,7 @@ from absl.testing import absltest
 
 from tpu_sync.api.common import RaidenId
 from tpu_sync.rpc import raiden_controller
-from tpu_sync.weight_sync import broadcast_engine
+from tpu_sync.weight_sync.manager import broadcast_engine
 
 
 class RecordingWorkerRpcClient(raiden_controller.WeightSyncWorkerRpcClient):

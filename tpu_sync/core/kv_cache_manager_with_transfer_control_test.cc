@@ -881,11 +881,17 @@ class GrpcPuller {
   }
 
   void Pull(uint64_t uuid, absl::Duration timeout = absl::Seconds(30)) {
+    Pull(uuid, /*src_blocks=*/{0}, /*dst_blocks=*/{0}, timeout);
+  }
+
+  void Pull(uint64_t uuid, const std::vector<int64_t>& src_blocks,
+            const std::vector<int64_t>& dst_blocks,
+            absl::Duration timeout = absl::Seconds(30)) {
     auto call = std::make_unique<Call>();
     call->context.set_deadline(absl::ToChronoTime(absl::Now() + timeout));
     call->request.set_uuid(uuid);
-    call->request.add_src_block_ids(0);
-    call->request.add_dst_block_ids(0);
+    for (int64_t block : src_blocks) call->request.add_src_block_ids(block);
+    for (int64_t block : dst_blocks) call->request.add_dst_block_ids(block);
     Call* raw = call.get();
     {
       absl::MutexLock lock(mu_);
@@ -1149,6 +1155,149 @@ TEST(ControlHandshakeTest, GrpcShutdownAnswersParkedPulls) {
     EXPECT_NE((*answer)->status, 0);
     EXPECT_THAT((*answer)->message, HasSubstr("stopping"));
   }
+}
+
+// The TCP backend refuses an oversized pull from its header, before the
+// handler sees it; on gRPC the handler's own check is the only one.
+TEST(ControlHandshakeTest, GrpcOversizedPullIsRejectedWithoutParking) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+
+  // TestManager is configured for at most 8 blocks. The read is not
+  // registered, so a pull that got past the check would be parked.
+  const std::vector<int64_t> blocks = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+  const absl::Time start = absl::Now();
+  consumer.Pull(/*uuid=*/1400, blocks, blocks);
+  auto answer = consumer.WaitForAnswer(1400, absl::Seconds(5));
+  ASSERT_TRUE(answer.has_value());
+  ASSERT_TRUE(answer->ok()) << answer->status();
+  EXPECT_NE((*answer)->status, 0);
+  EXPECT_THAT((*answer)->message,
+              HasSubstr("pull stream block count 9 exceeds configured "
+                        "maximum 8"));
+  EXPECT_LT(SecondsSince(start), 1.0);
+  EXPECT_EQ(producer.parked_pulls(), 0u);
+}
+
+struct InvalidPullCase {
+  const char* name;
+  std::vector<int64_t> src_blocks;
+  std::vector<int64_t> dst_blocks;
+  const char* message;
+};
+
+// Each registers blocks {0, 1}.
+std::vector<InvalidPullCase> InvalidPullCases() {
+  return {
+      {"unregistered block", {0, 2}, {6, 7}, "block not registered"},
+      {"duplicate block", {0, 0}, {6, 7}, "duplicate producer block"},
+      {"no blocks", {}, {}, "requested no blocks"},
+  };
+}
+
+TEST(ControlHandshakeTest, GrpcInvalidPullOfRegisteredReadIsRejected) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+
+  uint64_t uuid = 1500;
+  for (const InvalidPullCase& c : InvalidPullCases()) {
+    SCOPED_TRACE(c.name);
+    ++uuid;
+    ASSERT_GT(producer.NotifyForRead(absl::StrCat("req", uuid), uuid, {0, 1}),
+              0);
+    consumer.Pull(uuid, c.src_blocks, c.dst_blocks);
+    auto answer = consumer.WaitForAnswer(uuid, absl::Seconds(5));
+    ASSERT_TRUE(answer.has_value());
+    ASSERT_TRUE(answer->ok()) << answer->status();
+    EXPECT_NE((*answer)->status, 0);
+    EXPECT_THAT((*answer)->message, HasSubstr(c.message));
+  }
+  EXPECT_EQ(producer.parked_pulls(), 0u);
+}
+
+// A parked pull is validated only once its read is registered, from
+// NotifyForRead rather than the handler, and must still be answered.
+TEST(ControlHandshakeTest, GrpcInvalidParkedPullIsRejectedOnRegistration) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+
+  const std::vector<InvalidPullCase> cases = InvalidPullCases();
+  for (size_t i = 0; i < cases.size(); ++i) {
+    consumer.Pull(/*uuid=*/1600 + i, cases[i].src_blocks,
+                  cases[i].dst_blocks);
+  }
+  ASSERT_TRUE(producer.WaitForParkedPulls(cases.size(), absl::Seconds(5)));
+
+  for (size_t i = 0; i < cases.size(); ++i) {
+    SCOPED_TRACE(cases[i].name);
+    const uint64_t uuid = 1600 + i;
+    ASSERT_GT(producer.NotifyForRead(absl::StrCat("req", uuid), uuid, {0, 1}),
+              0);
+    auto answer = consumer.WaitForAnswer(uuid, absl::Seconds(1));
+    ASSERT_TRUE(answer.has_value()) << "registration did not answer the pull";
+    ASSERT_TRUE(answer->ok()) << answer->status();
+    EXPECT_NE((*answer)->status, 0);
+    EXPECT_THAT((*answer)->message, HasSubstr(cases[i].message));
+  }
+  EXPECT_EQ(producer.parked_pulls(), 0u);
+}
+
+TEST(ControlHandshakeTest, GrpcPullAfterRegistrationDeadlineIsRejected) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+  ASSERT_GT(producer.NotifyForRead("expired", /*uuid=*/1700, {0},
+                                   std::chrono::steady_clock::now() -
+                                       std::chrono::milliseconds(1)),
+            0);
+
+  const absl::Time start = absl::Now();
+  consumer.Pull(/*uuid=*/1700);
+  auto answer = consumer.WaitForAnswer(1700, absl::Seconds(5));
+  ASSERT_TRUE(answer.has_value());
+  ASSERT_TRUE(answer->ok()) << answer->status();
+  EXPECT_NE((*answer)->status, 0);
+  EXPECT_THAT((*answer)->message, HasSubstr("expired"));
+  EXPECT_LT(SecondsSince(start), 1.0);
+  EXPECT_EQ(producer.parked_pulls(), 0u);
+}
+
+TEST(ControlHandshakeTest, GrpcParkedPullIsRejectedWhenRegisteredExpired) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+
+  consumer.Pull(/*uuid=*/1701);
+  ASSERT_TRUE(producer.WaitForParkedPulls(1, absl::Seconds(5)));
+  ASSERT_GT(producer.NotifyForRead("expired", /*uuid=*/1701, {0},
+                                   std::chrono::steady_clock::now() -
+                                       std::chrono::milliseconds(1)),
+            0);
+
+  auto answer = consumer.WaitForAnswer(1701, absl::Seconds(1));
+  ASSERT_TRUE(answer.has_value()) << "registration did not answer the pull";
+  ASSERT_TRUE(answer->ok()) << answer->status();
+  EXPECT_NE((*answer)->status, 0);
+  EXPECT_THAT((*answer)->message, HasSubstr("expired"));
+  EXPECT_EQ(producer.parked_pulls(), 0u);
+}
+
+TEST(ControlHandshakeTest, GrpcDuplicatePullIsRejected) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+  ASSERT_GT(producer.NotifyForRead("req1800", /*uuid=*/1800, {0}), 0);
+  producer.MarkPullStarted(/*uuid=*/1800);
+
+  consumer.Pull(/*uuid=*/1800);
+  auto answer = consumer.WaitForAnswer(1800, absl::Seconds(5));
+  ASSERT_TRUE(answer.has_value());
+  ASSERT_TRUE(answer->ok()) << answer->status();
+  EXPECT_NE((*answer)->status, 0);
+  EXPECT_THAT((*answer)->message, HasSubstr("already"));
 }
 
 }  // namespace

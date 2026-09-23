@@ -96,7 +96,7 @@ void RecordWeightSyncP2pTransferTime(
     RaidenMetricStore* store, std::chrono::steady_clock::time_point start_ts,
     std::chrono::steady_clock::time_point end_ts, absl::string_view src_ip,
     absl::string_view dst_ip) {
-  if (store == nullptr) return;
+  if (store == nullptr || !store->HasBackends()) return;
   const absl::Duration duration = absl::FromChrono(end_ts - start_ts);
   if (duration < absl::ZeroDuration()) return;
   const double duration_ms = absl::ToDoubleMilliseconds(duration);
@@ -113,7 +113,7 @@ void RecordWeightSyncP2pTransferTime(
 void RecordWeightSyncFailure(RaidenMetricStore* store,
                              const absl::Status& status,
                              absl::string_view direction) {
-  if (store == nullptr || status.ok()) return;
+  if (store == nullptr || !store->HasBackends() || status.ok()) return;
   const absl::string_view error_code =
       absl::StatusCodeToStringView(status.code());
   const MetricLabel labels[] = {
@@ -219,9 +219,7 @@ RawBufferTransport::RawBufferTransport(
       require_psp_tcp_(absl::GetFlag(FLAGS_require_psp_tcp)),
       server_fd_(-1),
       stopping_(false),
-      store_(RaidenMetricStore::GetGlobalMetricStore().HasBackends()
-                 ? &RaidenMetricStore::GetGlobalMetricStore()
-                 : nullptr) {
+      store_(&RaidenMetricStore::GetGlobalMetricStore()) {
   // 1. Setup server listening socket.
   const absl::StatusOr<std::pair<int, int>> fd_port = CreateSocket(local_port_);
   if (!fd_port.ok()) {
@@ -300,7 +298,7 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     }
     uint8_t* const src_ptr = base_host_ptr + src_offset;
     ABSL_RETURN_IF_ERROR(WriteExact(client_fd, src_ptr, size_bytes));
-    if (size_bytes > 0 && store_ != nullptr) {
+    if (size_bytes > 0 && store_ != nullptr && store_->HasBackends()) {
       store_->IncrementCounter(metric_names::kWeightSyncSentBytesTotal, {},
                                size_bytes);
     }
@@ -321,7 +319,7 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     }
     uint8_t* const dest_ptr = base_host_ptr + dst_offset;
     ABSL_RETURN_IF_ERROR(ReadExact(client_fd, dest_ptr, size_bytes));
-    if (size_bytes > 0 && store_ != nullptr) {
+    if (size_bytes > 0 && store_ != nullptr && store_->HasBackends()) {
       store_->IncrementCounter(metric_names::kWeightSyncReceivedBytesTotal, {},
                                size_bytes);
     }
@@ -422,7 +420,7 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
 
     if (total_bytes > 0) {
       ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, iovs));
-      if (store_ != nullptr) {
+      if (store_ != nullptr && store_->HasBackends()) {
         store_->IncrementCounter(metric_names::kWeightSyncReceivedBytesTotal,
                                  {}, total_bytes);
       }
@@ -689,7 +687,7 @@ absl::Status RawBufferTransport::ProcessSocketBufferPull(
   }
   const auto end_ts = std::chrono::steady_clock::now();
 
-  if (request.len > 0 && store_ != nullptr) {
+  if (request.len > 0 && store_ != nullptr && store_->HasBackends()) {
     store_->IncrementCounter(metric_names::kWeightSyncReceivedBytesTotal,
                              kPullResponseLabels, request.len);
     RecordWeightSyncP2pTransferTime(store_, start_ts, end_ts,
@@ -844,7 +842,7 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
   }
   const auto end_ts = std::chrono::steady_clock::now();
 
-  if (request.len > 0 && store_ != nullptr) {
+  if (request.len > 0 && store_ != nullptr && store_->HasBackends()) {
     store_->IncrementCounter(metric_names::kWeightSyncSentBytesTotal, {},
                              request.len);
     RecordWeightSyncP2pTransferTime(
@@ -900,11 +898,26 @@ absl::StatusOr<std::vector<Request>> BuildBufferRequests(
 
 absl::Status RawBufferTransport::PushBuffers(
     const std::vector<BufferPushTask>& tasks, int parallelism, uint64_t uuid) {
-  std::vector<BufferPushTask> grouped_tasks = tasks;
-  std::stable_sort(grouped_tasks.begin(), grouped_tasks.end(),
-                   [](const BufferPushTask& a, const BufferPushTask& b) {
-                     return a.peer < b.peer;
-                   });
+  if (tasks.empty()) {
+    return absl::OkStatus();
+  }
+  bool single_peer = true;
+  for (size_t i = 1; i < tasks.size(); ++i) {
+    if (tasks[i].peer != tasks[0].peer) {
+      single_peer = false;
+      break;
+    }
+  }
+  std::vector<BufferPushTask> sorted_storage;
+  absl::Span<const BufferPushTask> grouped_tasks = tasks;
+  if (!single_peer) {
+    sorted_storage = tasks;
+    std::stable_sort(sorted_storage.begin(), sorted_storage.end(),
+                     [](const BufferPushTask& a, const BufferPushTask& b) {
+                       return a.peer < b.peer;
+                     });
+    grouped_tasks = sorted_storage;
+  }
 
   struct BatchInfo {
     std::string peer;
@@ -968,8 +981,7 @@ absl::Status RawBufferTransport::PushBuffers(
   auto push_batch = [&](const BatchInfo& batch) -> absl::Status {
     ABSL_ASSIGN_OR_RETURN(
         std::vector<Request> requests,
-        BuildBufferRequests(absl::MakeConstSpan(grouped_tasks)
-                                .subspan(batch.start_idx, batch.count),
+        BuildBufferRequests(grouped_tasks.subspan(batch.start_idx, batch.count),
                             uuid, kOpBufferPushBatched));
     return ProcessSocketBufferBatchPush(batch.peer, requests);
   };
@@ -1125,7 +1137,7 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
   }
   const auto end_ts = std::chrono::steady_clock::now();
 
-  if (total_bytes > 0 && store_ != nullptr) {
+  if (total_bytes > 0 && store_ != nullptr && store_->HasBackends()) {
     store_->IncrementCounter(metric_names::kWeightSyncSentBytesTotal, {},
                              total_bytes);
     RecordWeightSyncP2pTransferTime(

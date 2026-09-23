@@ -944,9 +944,9 @@ class JobEntity:
     if payload_cache is not None:
       if cache_key in payload_cache:
         return payload_cache[cache_key]
-      if is_sender and is_ws and steady_key in payload_cache:
+      if is_ws and steady_key in payload_cache:
         return payload_cache[steady_key]
-      if is_sender and is_ws and template_key in payload_cache:
+      if is_ws and template_key in payload_cache:
         cached_req = payload_cache[template_key]
         cached_req.start_transfer_request.uuid = int(uuid_val or 0)
         cached_req.start_transfer_request.req_id = str(req_id_val or "")
@@ -1152,7 +1152,7 @@ class JobEntity:
     serialized_bytes = req.SerializeToString()
     if payload_cache is not None:
       payload_cache[cache_key] = serialized_bytes
-      if is_sender and is_ws:
+      if is_ws:
         payload_cache[steady_key] = serialized_bytes
         payload_cache[template_key] = req
     return serialized_bytes

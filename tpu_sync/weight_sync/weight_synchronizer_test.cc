@@ -2081,6 +2081,90 @@ TEST_F(WeightSynchronizerTest, TelemetryRecordsOccupancyAndPushMetrics) {
   telemetry::RaidenMetricStore::GetGlobalMetricStore().SetBackends({});
 }
 
+TEST_F(WeightSynchronizerTest, PushWeightsReshardedD2hDeduplicationAndCleanup) {
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      /*num_layers=*/2, num_shards_, slice_byte_size_,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      /*num_layers=*/2, num_shards_, slice_byte_size_,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
+  uint64_t uuid1 = 101;
+  uint64_t uuid2 = 102;
+
+  // Request 1: step_1__stage_0__101, pushes only layer 0 (layer 1 has no tasks)
+  tpu_sync::rpc::StartTransferRequest req1;
+  req1.set_skip_d2h(false);
+  req1.set_uuid(uuid1);
+  req1.set_req_id("step_1__stage_0__101");
+  auto* sched1 = req1.mutable_shard_push_schedules();
+  auto* e1 = (*sched1)[0].add_entries();
+  e1->set_dst_peer(dest_peer);
+  e1->set_dst_shard_idx(0);
+  e1->set_src_offset_bytes(0);
+  e1->set_dst_offset_bytes(0);
+  e1->set_size_bytes(slice_byte_size_);
+  e1->set_count(1);
+  e1->set_layer_idx(0);
+
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(uuid1, 1));
+  ASSERT_OK(ws_source->PushWeightsResharded(req1));
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(uuid1));
+
+  auto metrics1 = ws_source->GetMetrics();
+  EXPECT_EQ(metrics1.d2h_call_count, 1);
+
+  // Request 2: step_1__stage_0__102 sharing same sync_key prefix "step_1"
+  tpu_sync::rpc::StartTransferRequest req2;
+  req2.set_skip_d2h(false);
+  req2.set_uuid(uuid2);
+  req2.set_req_id("step_1__stage_0__102");
+  auto* sched2 = req2.mutable_shard_push_schedules();
+  auto* e2 = (*sched2)[0].add_entries();
+  e2->set_dst_peer(dest_peer);
+  e2->set_dst_shard_idx(0);
+  e2->set_src_offset_bytes(0);
+  e2->set_dst_offset_bytes(0);
+  e2->set_size_bytes(slice_byte_size_);
+  e2->set_count(1);
+  e2->set_layer_idx(0);
+
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(uuid2, 1));
+  ASSERT_OK(ws_source->PushWeightsResharded(req2));
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(uuid2));
+
+  // D2H should be deduplicated (call count remains 1)
+  auto metrics2 = ws_source->GetMetrics();
+  EXPECT_EQ(metrics2.d2h_call_count, 1);
+
+  // ForgetPushProgress cleans up uuid1 and its associated sync_key "step_1"
+  ws_source->ForgetPushProgress(uuid1);
+
+  // Request 3: runs step_1 again after forget -> D2H runs again!
+  uint64_t uuid3 = 103;
+  tpu_sync::rpc::StartTransferRequest req3;
+  req3.set_skip_d2h(false);
+  req3.set_uuid(uuid3);
+  req3.set_req_id("step_1__stage_0__103");
+  auto* sched3 = req3.mutable_shard_push_schedules();
+  auto* e3 = (*sched3)[0].add_entries();
+  e3->set_dst_peer(dest_peer);
+  e3->set_dst_shard_idx(0);
+  e3->set_src_offset_bytes(0);
+  e3->set_dst_offset_bytes(0);
+  e3->set_size_bytes(slice_byte_size_);
+  e3->set_count(1);
+  e3->set_layer_idx(0);
+
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(uuid3, 1));
+  ASSERT_OK(ws_source->PushWeightsResharded(req3));
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(uuid3));
+
+  auto metrics3 = ws_source->GetMetrics();
+  EXPECT_EQ(metrics3.d2h_call_count, 2);
+}
+
 }  // namespace
 }  // namespace weight_sync
 }  // namespace tpu_raiden

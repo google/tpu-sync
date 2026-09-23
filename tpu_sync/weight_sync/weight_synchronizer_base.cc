@@ -215,10 +215,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     listener_ =
         std::make_unique<WeightSynchronizerListener>(this, *listener_port);
   }
-  if (auto_h2d_) {
-    h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-        std::max(parallelism_, 4));
-  }
+  h2d_pool_ =
+      std::make_unique<tpu_raiden::NumaThreadPool>(std::max(parallelism_, 4));
   push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
       std::max(parallelism_, 4));
 
@@ -310,10 +308,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     listener_ =
         std::make_unique<WeightSynchronizerListener>(this, *listener_port);
   }
-  if (auto_h2d_) {
-    h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-        std::max(parallelism_, 4));
-  }
+  h2d_pool_ =
+      std::make_unique<tpu_raiden::NumaThreadPool>(std::max(parallelism_, 4));
   push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
       std::max(parallelism_, 4));
 
@@ -984,36 +980,70 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   double staging_time_ms =
       absl::ToDoubleMilliseconds(absl::Now() - staging_start);
 
-  bool already_completed = false;
-  uint64_t uuid = request.uuid();
-  std::vector<raiden::PjRtCopyFuture> d2h_layer_futures;
-  d2h_layer_futures.reserve(num_layers_);
-  auto d2h_start = absl::Now();
-  if (!request.skip_d2h()) {
-    if (uuid != 0) {
-      absl::MutexLock lock(d2h_mu_);
-      already_completed = !completed_d2h_uuids_.insert(uuid).second;
+  bool all_layers_empty = true;
+  for (size_t l = 0; l < num_layers_; ++l) {
+    if (!tasks_by_layer[l].empty()) {
+      all_layers_empty = false;
+      break;
     }
-    if (!already_completed) {
-      VLOG(1)
-          << "PushWeightsResharded: Executing pipelined D2H copies for uuid "
-          << uuid;
-      for (size_t l = 0; l < num_layers_; ++l) {
-        TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture f, D2hLayer(l, uuid));
-        d2h_layer_futures.push_back(std::move(f));
+  }
+
+  std::string sync_key;
+  if (!request.req_id().empty()) {
+    size_t pos = request.req_id().find("__stage_");
+    sync_key = (pos != std::string::npos) ? request.req_id().substr(0, pos)
+                                          : request.req_id();
+  } else if (request.uuid() != 0) {
+    sync_key = absl::StrCat("uuid_", request.uuid());
+  }
+  if (!sync_key.empty() && request.uuid() != 0) {
+    absl::MutexLock lock(d2h_mu_);
+    uuid_to_sync_key_[request.uuid()] = sync_key;
+  }
+
+  uint64_t uuid = request.uuid();
+  std::vector<std::optional<raiden::PjRtCopyFuture>> d2h_layer_futures(
+      num_layers_);
+  std::vector<bool> wait_for_other_thread(num_layers_, false);
+  std::vector<bool> launched_by_this_thread(num_layers_, false);
+  auto d2h_start = absl::Now();
+
+  auto cleanup_in_progress =
+      absl::MakeCleanup([this, &sync_key, &launched_by_this_thread]() {
+        if (sync_key.empty()) return;
+        absl::MutexLock lock(d2h_mu_);
+        for (size_t l = 0; l < launched_by_this_thread.size(); ++l) {
+          if (launched_by_this_thread[l]) {
+            in_progress_d2h_layers_.erase(std::make_pair(sync_key, l));
+          }
+        }
+      });
+
+  if (!request.skip_d2h()) {
+    VLOG(1) << "PushWeightsResharded: Processing D2H copies for sync_key "
+            << sync_key << " (uuid=" << uuid << ")";
+    for (size_t l = 0; l < num_layers_; ++l) {
+      if (!all_layers_empty && tasks_by_layer[l].empty()) {
+        continue;
       }
-    } else {
-      VLOG(1) << "PushWeightsResharded: Coalescing D2H copy (already completed "
-                 "for uuid "
-              << uuid << ")";
+      if (!sync_key.empty()) {
+        absl::MutexLock lock(d2h_mu_);
+        auto key = std::make_pair(sync_key, l);
+        if (completed_d2h_layers_.contains(key)) {
+          continue;
+        }
+        if (in_progress_d2h_layers_.contains(key)) {
+          wait_for_other_thread[l] = true;
+          continue;
+        }
+        in_progress_d2h_layers_.insert(key);
+      }
+      launched_by_this_thread[l] = true;
+      TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture f, D2hLayer(l, uuid));
+      d2h_layer_futures[l] = std::move(f);
     }
   } else {
     VLOG(1) << "PushWeightsResharded: Skipping D2H copy.";
-  }
-
-  if (!push_pool_) {
-    push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-        std::max(parallelism_, 4));
   }
 
   auto h2h_start = absl::Now();
@@ -1054,15 +1084,46 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     std::vector<transport::BufferPushTask> group_tasks;
 
     for (size_t l = group_start; l < group_end; ++l) {
-      for (size_t s = 0; s < num_shards_; ++s) {
-        total_d2h_bytes += GetHostSize(l, s);
+      if (!all_layers_empty && tasks_by_layer[l].empty()) {
+        continue;
       }
-      if (!request.skip_d2h() && !already_completed) {
-        TF_RETURN_IF_ERROR(d2h_layer_futures[l].Await());
+      if (launched_by_this_thread[l]) {
+        for (size_t s = 0; s < num_shards_; ++s) {
+          total_d2h_bytes += GetHostSize(l, s);
+        }
+        TF_RETURN_IF_ERROR(d2h_layer_futures[l]->Await());
         last_d2h_done_time = absl::Now();
         if (l == 0) {
           first_d2h_time_ms =
               absl::ToDoubleMilliseconds(last_d2h_done_time - d2h_start);
+        }
+        if (!sync_key.empty()) {
+          absl::MutexLock lock(d2h_mu_);
+          auto key = std::make_pair(sync_key, l);
+          in_progress_d2h_layers_.erase(key);
+          completed_d2h_layers_.insert(key);
+          launched_by_this_thread[l] = false;
+        }
+      } else if (wait_for_other_thread[l]) {
+        if (!sync_key.empty()) {
+          auto key = std::make_pair(sync_key, l);
+          absl::MutexLock lock(d2h_mu_);
+          struct D2hWaitContext {
+            const absl::flat_hash_set<std::pair<std::string, size_t>>*
+                in_progress;
+            std::pair<std::string, size_t> key;
+          };
+          auto d2h_done_fn =
+              +[](D2hWaitContext* ctx) ABSL_NO_THREAD_SAFETY_ANALYSIS {
+                return !ctx->in_progress->contains(ctx->key);
+              };
+          D2hWaitContext ctx{&in_progress_d2h_layers_, key};
+          d2h_mu_.Await(absl::Condition(d2h_done_fn, &ctx));
+          if (!completed_d2h_layers_.contains(key)) {
+            return absl::InternalError(
+                absl::StrCat("D2H transfer for sync_key '", sync_key,
+                             "' layer ", l, " failed in another thread"));
+          }
         }
       }
       const auto& layer_tasks = tasks_by_layer[l];
@@ -1105,7 +1166,7 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     metrics_.total_h2h_bytes += total_h2h_bytes;
     metrics_.total_push_resharded_time_ms += total_push_time_ms;
 
-    if (!request.skip_d2h() && !already_completed) {
+    if (!request.skip_d2h() && total_d2h_bytes > 0) {
       metrics_.last_d2h_time_ms = first_d2h_time_ms;
       metrics_.last_d2h_bytes = total_d2h_bytes;
       metrics_.total_d2h_time_ms += first_d2h_time_ms;
@@ -1122,7 +1183,7 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   }
   auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
   if (store.HasBackends()) {
-    if (!request.skip_d2h() && !already_completed) {
+    if (!request.skip_d2h() && total_d2h_bytes > 0) {
       double total_d2h_time_ms =
           absl::ToDoubleMilliseconds(last_d2h_done_time - d2h_start);
       store.ObserveHistogram(
@@ -1245,9 +1306,21 @@ absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunks(
 absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunksLocal(
     uint64_t uuid,
     const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) {
+  if (!auto_h2d_) {
+    return absl::OkStatus();
+  }
   {
     absl::MutexLock lock(pending_h2d_mu_);
-    pending_h2d_states_[uuid].expected_layers = expected_layer_chunks.size();
+    auto& state = pending_h2d_states_[uuid];
+    state.expected_layers = expected_layer_chunks.size();
+    state.expected_layer_indices.clear();
+    for (const auto& [layer_idx, count] : expected_layer_chunks) {
+      if (count > 0) {
+        state.expected_layer_indices.push_back(layer_idx);
+      }
+    }
+    std::sort(state.expected_layer_indices.begin(),
+              state.expected_layer_indices.end());
   }
   return RaidenManagerBase::RegisterExpectedLayerChunks(uuid,
                                                         expected_layer_chunks);
@@ -1257,10 +1330,6 @@ absl::Status WeightSynchronizerBase::OnLayerDataReceived(size_t layer_idx,
                                                          uint64_t uuid) {
   if (!auto_h2d_) {
     return absl::OkStatus();
-  }
-  if (!h2d_pool_) {
-    h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-        std::max(parallelism_, 4));
   }
   {
     absl::MutexLock lock(pending_h2d_mu_);
@@ -1293,27 +1362,45 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
   absl::flat_hash_map<size_t,
                       std::future<absl::StatusOr<raiden::PjRtCopyFuture>>>
       layer_futures_map;
+  std::vector<size_t> expected_layer_indices;
   {
     absl::MutexLock lock(pending_h2d_mu_);
     auto it = pending_h2d_states_.find(uuid);
     if (it != pending_h2d_states_.end()) {
       layer_futures_map = std::move(it->second.layer_futures);
+      expected_layer_indices = std::move(it->second.expected_layer_indices);
       pending_h2d_states_.erase(it);
     }
   }
 
   std::vector<raiden::PjRtCopyFuture> futures_to_await;
-  futures_to_await.reserve(num_layers_);
-  for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
-    auto it = layer_futures_map.find(layer_idx);
-    if (it != layer_futures_map.end() && it->second.valid()) {
-      TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
-                          it->second.get());
-      futures_to_await.push_back(std::move(layer_future));
-    } else {
-      TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
-                          H2dLayer(layer_idx, uuid));
-      futures_to_await.push_back(std::move(layer_future));
+  if (!expected_layer_indices.empty()) {
+    futures_to_await.reserve(expected_layer_indices.size());
+    for (size_t layer_idx : expected_layer_indices) {
+      auto it = layer_futures_map.find(layer_idx);
+      if (it != layer_futures_map.end() && it->second.valid()) {
+        TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
+                            it->second.get());
+        futures_to_await.push_back(std::move(layer_future));
+      } else {
+        TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
+                            H2dLayer(layer_idx, uuid));
+        futures_to_await.push_back(std::move(layer_future));
+      }
+    }
+  } else {
+    futures_to_await.reserve(num_layers_);
+    for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
+      auto it = layer_futures_map.find(layer_idx);
+      if (it != layer_futures_map.end() && it->second.valid()) {
+        TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
+                            it->second.get());
+        futures_to_await.push_back(std::move(layer_future));
+      } else {
+        TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture layer_future,
+                            H2dLayer(layer_idx, uuid));
+        futures_to_await.push_back(std::move(layer_future));
+      }
     }
   }
   if (!futures_to_await.empty()) {
@@ -1379,18 +1466,36 @@ void WeightSynchronizerBase::DrainPendingH2d() {
 
   for (auto& [uuid, state] : pending_states) {
     std::vector<raiden::PjRtCopyFuture> futures_to_await;
-    futures_to_await.reserve(num_layers_);
-    for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
-      auto it = state.layer_futures.find(layer_idx);
-      if (it != state.layer_futures.end() && it->second.valid()) {
-        auto status_or_future = it->second.get();
-        if (status_or_future.ok()) {
-          futures_to_await.push_back(std::move(*status_or_future));
+    if (!state.expected_layer_indices.empty()) {
+      futures_to_await.reserve(state.expected_layer_indices.size());
+      for (size_t layer_idx : state.expected_layer_indices) {
+        auto it = state.layer_futures.find(layer_idx);
+        if (it != state.layer_futures.end() && it->second.valid()) {
+          auto status_or_future = it->second.get();
+          if (status_or_future.ok()) {
+            futures_to_await.push_back(std::move(*status_or_future));
+          }
+        } else {
+          auto status_or_future = H2dLayer(layer_idx, uuid);
+          if (status_or_future.ok()) {
+            futures_to_await.push_back(std::move(*status_or_future));
+          }
         }
-      } else {
-        auto status_or_future = H2dLayer(layer_idx, uuid);
-        if (status_or_future.ok()) {
-          futures_to_await.push_back(std::move(*status_or_future));
+      }
+    } else {
+      futures_to_await.reserve(num_layers_);
+      for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
+        auto it = state.layer_futures.find(layer_idx);
+        if (it != state.layer_futures.end() && it->second.valid()) {
+          auto status_or_future = it->second.get();
+          if (status_or_future.ok()) {
+            futures_to_await.push_back(std::move(*status_or_future));
+          }
+        } else {
+          auto status_or_future = H2dLayer(layer_idx, uuid);
+          if (status_or_future.ok()) {
+            futures_to_await.push_back(std::move(*status_or_future));
+          }
         }
       }
     }
@@ -1467,6 +1572,28 @@ void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
   {
     absl::MutexLock lock(d2h_mu_);
     completed_d2h_uuids_.erase(uuid);
+    if (uuid == 0) {
+      in_progress_d2h_layers_.clear();
+      completed_d2h_layers_.clear();
+      uuid_to_sync_key_.clear();
+    } else {
+      auto it = uuid_to_sync_key_.find(uuid);
+      std::string target_sync_key =
+          (it != uuid_to_sync_key_.end()) ? it->second : "";
+      if (it != uuid_to_sync_key_.end()) {
+        uuid_to_sync_key_.erase(it);
+      }
+      std::string uuid_prefix = absl::StrCat("uuid_", uuid);
+      std::string uuid_str = absl::StrCat(uuid);
+      absl::erase_if(in_progress_d2h_layers_, [&](const auto& p) {
+        return (!target_sync_key.empty() && p.first == target_sync_key) ||
+               p.first == uuid_prefix || absl::StrContains(p.first, uuid_str);
+      });
+      absl::erase_if(completed_d2h_layers_, [&](const auto& p) {
+        return (!target_sync_key.empty() && p.first == target_sync_key) ||
+               p.first == uuid_prefix || absl::StrContains(p.first, uuid_str);
+      });
+    }
   }
   {
     absl::MutexLock lock(pending_h2d_mu_);

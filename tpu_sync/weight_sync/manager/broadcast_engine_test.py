@@ -475,6 +475,100 @@ class BroadcastEngineTest(absltest.TestCase):
             )
         )
 
+  def test_coalesce_contiguous_relay_entries_64mb(self) -> None:
+    """Verifies _coalesce_contiguous_relay_entries coalesces up to 64MB."""
+    two_mb = 2 * 1024 * 1024
+    num_entries = 35  # 70 MB total
+    entries = []
+    for i in range(num_entries):
+      entry = (
+          "127.0.0.1:8001",
+          0,
+          i * two_mb,  # dst_block_offset
+          i * two_mb,  # src_block_offset
+          two_mb,  # size
+          0,  # src_block_id
+          0,  # dst_block_id
+          two_mb,  # src_stride
+          two_mb,  # dst_stride
+          1,  # count
+          0,  # layer_idx
+          0,  # pool_group
+      )
+      entries.append(entry)
+
+    coalesced = broadcast_engine._coalesce_contiguous_relay_entries(
+        entries, is_weight_sync=True
+    )
+    # 70 MB with 64 MB max should coalesce into 2 entries: 64 MB (32 blocks) and 6 MB (3 blocks)
+    self.assertLen(coalesced, 2)
+    self.assertEqual(coalesced[0][4], 64 * 1024 * 1024)
+    self.assertEqual(coalesced[1][4], 6 * 1024 * 1024)
+
+  def test_execute_slice_broadcast_pipeline_caches_and_reuses_hop_trees(
+      self,
+  ) -> None:
+    """Verifies execute_slice_broadcast_pipeline caches hop_trees across calls."""
+    src = RaidenId(job_name="src", job_replica_id="0", data_name="w")
+    dst0 = RaidenId(job_name="dst", job_replica_id="0", data_name="w")
+    dst1 = RaidenId(job_name="dst", job_replica_id="1", data_name="w")
+    rpc_client = RecordingWorkerRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(rpc_client)
+
+    key0 = (src, 0, 0, 0, 1024, 0, 1, 0, 0)
+    targets0 = [
+        (dst0, "127.0.0.1:8001", 0, 0, 0, 0),
+        (dst1, "127.0.0.1:8002", 0, 0, 0, 0),
+    ]
+    groups_list = [[(key0, targets0)]]
+    final_plan = raiden_controller.TransferPlan(
+        src_units=[src],
+        dst_units=[dst0, dst1],
+        plan=None,
+        worker_data_addresses={
+            src: ["127.0.0.1:8000"],
+            dst0: ["127.0.0.1:8001"],
+            dst1: ["127.0.0.1:8002"],
+        },
+        is_weight_sync=True,
+    )
+    registered_shards = {src: ["s0"], dst0: ["s0"], dst1: ["s0"]}
+
+    self.assertEmpty(engine._pipeline_cache)
+
+    asyncio.run(
+        engine.execute_slice_broadcast_pipeline(
+            groups_list=groups_list,
+            final_plan=final_plan,
+            fanout_k=2,
+            req_id="req_run1",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards=registered_shards,
+        )
+    )
+
+    self.assertLen(engine._pipeline_cache, 1)
+    cache_key = next(iter(engine._pipeline_cache))
+    cached_entry = engine._pipeline_cache[cache_key]
+    self.assertIs(cached_entry[0], groups_list)
+    first_hop_trees = cached_entry[3]
+
+    # Second invocation with same groups_list should reuse first_hop_trees
+    asyncio.run(
+        engine.execute_slice_broadcast_pipeline(
+            groups_list=groups_list,
+            final_plan=final_plan,
+            fanout_k=2,
+            req_id="req_run2",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards=registered_shards,
+        )
+    )
+
+    self.assertLen(engine._pipeline_cache, 1)
+    self.assertIs(engine._pipeline_cache[cache_key][3], first_hop_trees)
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -119,6 +119,7 @@ class _CachedTransferSchedule:
   cached_serialized_payloads: dict[Any, bytes] = dataclasses.field(
       default_factory=dict
   )
+  cached_broadcast_groups_by_shard: Optional[dict[Any, list[Any]]] = None
 
 
 @dataclasses.dataclass

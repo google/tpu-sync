@@ -3158,52 +3158,60 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteSizeMismatchFails) {
 }
 
 TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteDuplicateFails) {
-  auto src_controller_server = core::controller::CreateTestControllerServer();
+  struct BlockingTransferManager
+      : public ::tpu_raiden::controller::ShardAwareMockTransferManager {
+    absl::Notification started;
+    absl::Notification release;
+    absl::Notification done;
 
-  ::tpu_sync::rpc::RaidenIdProto src_unit;
-  src_unit.set_job_name("src_job");
-  src_unit.set_job_replica_id("0");
-  src_unit.set_data_name("src_data");
-  src_unit.set_data_replica_idx(0);
-
-  kv_cache::RaidenId src_raiden_id;
-  src_raiden_id.job_name = "src_job";
-  src_raiden_id.job_replica_id = "0";
-  src_raiden_id.data_name = "src_data";
-  src_raiden_id.data_replica_idx = 0;
-
-  ABSL_ASSERT_OK(PublishPeerController(registry_address_, src_raiden_id,
-                                       src_controller_server->server_address));
-
-  auto register_src_worker = [&](const std::string& worker_id,
-                                 const std::string& worker_address,
-                                 const std::string& transfer_endpoint) {
-    auto status = src_controller_server->client->RegisterWorker(
-        worker_id, worker_address, {{transfer_endpoint, {}}});
-    ABSL_ASSERT_OK(status);
+    auto H2d(const std::vector<int64_t>& src_offsets,
+             const std::vector<int64_t>& dst_offsets,
+             const std::vector<int64_t>& copy_sizes) {
+      started.Notify();
+      release.WaitForNotification();
+      auto res = ShardAwareMockTransferManager::H2d(src_offsets, dst_offsets,
+                                                    copy_sizes);
+      done.Notify();
+      return res;
+    }
   };
-  register_src_worker("worker_0", "src_worker_0_addr", "src_worker_0_transfer");
 
-  // Every read is now validated at the source by construction -- there is no
-  // longer any RPC that transfers without verifying and pinning first. Hold the
-  // source's AcquireReadLease hook open until after the second ReadRemote call
-  // so the first read cannot complete and clear load_tracker_ before the
-  // duplicate check runs.
-  absl::Notification release_lease;
-  src_controller_server->service->SetReadRemoteHooks(
-      [&](absl::Span<const std::string> h)
-          -> absl::StatusOr<std::vector<int32_t>> {
-        release_lease.WaitForNotification();
-        return std::vector<int32_t>(h.size(), 42);
-      },
-      [&](absl::Span<const std::string> /*h*/) {});
-  // NOTE: the source no longer transfers anything. Under the pull design
-  // the DESTINATION's own worker (test_server_, backed by a mock transfer
-  // manager) executes the copy; the source only leases.
+  BlockingTransferManager blocking_mgr;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&blocking_mgr));
 
-  auto dst_controller = MakeController();
+  kv_cache::RaidenId src_raiden_id{"src_job", "0", "src_data", 0};
+
+  auto dst_controller = MakeController(/*num_blocks=*/20);
   RegisterAndInitWorker(*dst_controller, "worker_0",
                         test_server_->server_address);
+  auto* controller_ptr = dst_controller.get();
+
+  BackendConfig src_config;
+  src_config.type = "HostOffloadBackend";
+  src_config.capacity = 100;
+  src_config.global_registry_address = registry_address_;
+  src_config.raiden_id = src_raiden_id;
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto src_backend_raw,
+      HostOffloadBackend::Create(src_config, controller_ptr));
+  auto src_backend =
+      std::dynamic_pointer_cast<HostOffloadBackend>(src_backend_raw);
+  ASSERT_NE(src_backend, nullptr);
+  src_backend->Insert({"hash_0"},
+                      {RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST)},
+                      /*on_host=*/true);
+
+  auto src_server = KVCacheStoreServer::Create();
+  ABSL_ASSERT_OK(
+      src_server->StartServer(src_backend.get(), controller_ptr, "127.0.0.1"));
+
+  global_registry::GlobalRegistryClient reg_client(grpc::CreateChannel(
+      registry_address_, grpc::InsecureChannelCredentials()));
+  ABSL_ASSERT_OK(
+      reg_client.RegisterStore(src_raiden_id, src_server->GetServerAddress(),
+                               controller_ptr->controller_address()));
 
   RaidenId rid{"dst_job", "0", "dst_cache", 0};
   KVCacheStore store(10, std::move(dst_controller), registry_address_, rid,
@@ -3214,28 +3222,35 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteDuplicateFails) {
   std::vector<RaidenBlockId> slices = {
       RaidenBlockId(src_raiden_id, 42, BlockStatus::REMOTE)};
 
-  // First call succeeds
+  // First call succeeds and blocks in H2d while holding "hash_0" in
+  // load_tracker_.
   absl::Status status1 = store.ReadRemote(hashes, slices, {7});
   ABSL_ASSERT_OK(status1);
+  blocking_mgr.started.WaitForNotification();
 
-  // Second call fails with FailedPreconditionError
+  // Second call fails with FailedPreconditionError while the first is in flight
   absl::Status status2 = store.ReadRemote(hashes, slices, {8});
   EXPECT_FALSE(status2.ok());
   EXPECT_EQ(status2.code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_THAT(status2.message(), ::testing::HasSubstr("already loading"));
 
-  release_lease.Notify();
+  blocking_mgr.release.Notify();
+  blocking_mgr.done.WaitForNotification();
   bool first_read_settled = false;
   for (int attempt = 0; attempt < 100; ++attempt) {
     auto [done_hashes, failed_hashes, pending_hashes] =
         store.PollRemoteReadStatus();
-    if (!done_hashes.empty() || !failed_hashes.empty()) {
+    if (!done_hashes.empty()) {
+      EXPECT_THAT(done_hashes, ::testing::ElementsAre("hash_0"));
       first_read_settled = true;
       break;
     }
     absl::SleepFor(absl::Milliseconds(10));
   }
   EXPECT_TRUE(first_read_settled);
+  src_server->Shutdown();
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(dst_transfer_mock_.get()));
 }
 
 

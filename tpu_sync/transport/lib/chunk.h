@@ -49,6 +49,8 @@ struct ChunkMetadata {
   uint32_t dst_shard_idx;
   uint64_t dst_offset_bytes;
   uint64_t size_bytes;
+  uint64_t dst_stride_bytes = 0;
+  uint32_t count = 1;
   // LINT.ThenChange(chunk.fbs)
 
   bool operator==(const ChunkMetadata&) const = default;

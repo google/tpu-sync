@@ -653,11 +653,12 @@ std::vector<std::string> HostOffloadBackend::GetEvictableKeys(size_t count) {
 }
 
 std::vector<int> HostOffloadBackend::Evict(
-    const std::vector<std::string>& block_hashes) {
+    const std::vector<std::string>& block_hashes,
+    std::vector<std::string>* evicted_hashes) {
   std::vector<int> host_ids_to_deallocate;
   std::shared_ptr<global_registry::GlobalRegistryClient> client;
   RaidenId local_id;
-  std::vector<std::string> evicted_hashes;
+  std::vector<std::string> local_evicted_hashes;
 
   {
     absl::MutexLock lock(mutex_);
@@ -669,16 +670,16 @@ std::vector<int> HostOffloadBackend::Evict(
         host_ids_to_deallocate.push_back(block->host_block_id);
         ClearMetadataEntry(*block);
         lru_cache_.Erase(hash);
-        evicted_hashes.push_back(hash);
+        local_evicted_hashes.push_back(hash);
       }
     }
     client = registry_client_;
     local_id = raiden_id_;
   }
 
-  if (client != nullptr && !evicted_hashes.empty()) {
+  if (client != nullptr && !local_evicted_hashes.empty()) {
     client
-        ->UnregisterAsync(evicted_hashes, local_id,
+        ->UnregisterAsync(local_evicted_hashes, local_id,
                           global_registry::kUnwaitedMutationTimeout)
         .OnReady([](absl::Status status) {
           if (!status.ok()) {
@@ -686,6 +687,10 @@ std::vector<int> HostOffloadBackend::Evict(
                          << status.message();
           }
         });
+  }
+
+  if (evicted_hashes != nullptr) {
+    *evicted_hashes = std::move(local_evicted_hashes);
   }
 
   return host_ids_to_deallocate;

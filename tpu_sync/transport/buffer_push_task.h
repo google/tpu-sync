@@ -25,11 +25,14 @@ namespace transport {
 // TODO(yongx): add a description.
 struct BufferPushTask {
   std::string peer;
-  size_t buffer_id;
-  size_t dst_shard_idx;
-  size_t dst_offset_bytes;
-  const uint8_t* data_ptr;
-  size_t size_bytes;
+  size_t buffer_id = 0;
+  size_t dst_shard_idx = 0;
+  size_t dst_offset_bytes = 0;
+  const uint8_t* data_ptr = nullptr;
+  size_t size_bytes = 0;
+  size_t dst_stride_bytes = 0;
+  size_t count = 1;
+  size_t src_stride_bytes = 0;
 };
 
 }  // namespace transport

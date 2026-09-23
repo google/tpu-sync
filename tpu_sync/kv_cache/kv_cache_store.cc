@@ -23,7 +23,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <thread>  // NOLINT(build/c++11)
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -48,10 +47,8 @@
 #include "grpcpp/security/credentials.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
-#include "tpu_sync/core/buffer.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/host_memory_allocator.h"
-#include "tpu_sync/kv_cache/completion_executor.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
@@ -1723,6 +1720,22 @@ KVCacheStore::PollRemoteReadStatus() {
                          std::move(res.pending));
 }
 
+void KVCacheStore::SetEvictionCallback(EvictionCallback callback) {
+  std::shared_ptr<const EvictionCallback> next;
+  if (callback != nullptr) {
+    next = std::make_shared<const EvictionCallback>(std::move(callback));
+  }
+  // Keeps the outgoing callback alive past the unlock. Destroying it here
+  // rather than under mutex_ matters for language bindings: the previous
+  // target may own a Python handle whose release needs the GIL, and this
+  // thread is the one that owns it.
+  std::shared_ptr<const EvictionCallback> previous;
+  {
+    absl::MutexLock lock(mutex_);
+    previous = std::exchange(eviction_callback_, std::move(next));
+  }
+}
+
 absl::StatusOr<size_t> KVCacheStore::RecoverFromLocalManifest() {
   if (!raiden_controller_) {
     return absl::FailedPreconditionError(
@@ -1748,14 +1761,28 @@ size_t KVCacheStore::Evict(const std::vector<std::string>& block_hashes) {
   // The backend handles thread-safe eviction and unregisters erased blocks
   // from the global registry outside its lock. We do not hold store mutex_
   // across this call to avoid blocking concurrent operations on network I/O.
+  std::vector<std::string> evicted_hashes;
   const std::vector<int> host_ids_to_deallocate =
-      backend()->Evict(block_hashes);
+      backend()->Evict(block_hashes, &evicted_hashes);
 
   if (host_ids_to_deallocate.empty()) {
     return 0;
   }
 
   DeallocateBlockIds(host_ids_to_deallocate);
+
+  // Snapshot the registered callback and invoke it after unlocking: it runs
+  // arbitrary user code (possibly re-entering this store, and in the Python
+  // binding acquiring the GIL), so it must not hold mutex_. Copying the
+  // pointer rather than the callback itself keeps this a refcount bump.
+  std::shared_ptr<const EvictionCallback> callback;
+  {
+    absl::MutexLock lock(mutex_);
+    callback = eviction_callback_;
+  }
+  if (callback != nullptr && !evicted_hashes.empty()) {
+    (*callback)(evicted_hashes);
+  }
 
   return host_ids_to_deallocate.size();
 }

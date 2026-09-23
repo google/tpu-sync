@@ -57,6 +57,7 @@
 #include "tpu_sync/core/transfer_receive_session.h"
 #include "tpu_sync/core/transfer_send_session.h"
 #include "tpu_sync/core/transfer_session.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
@@ -792,6 +793,7 @@ void KVCacheManagerWithTransfer::StartRead(
              "req_id: "
           << req_id << ", uuid: " << uuid << ", remote: " << remote_endpoint
           << ", Thread: " << std::this_thread::get_id();
+  FaultInjectThrow(hooks::kKvCacheManagerApiStartRead);
   if (remote_block_ids.size() != local_block_ids.size() ||
       (local_host_block_ids.has_value() &&
        local_host_block_ids->size() != local_block_ids.size())) {
@@ -859,6 +861,8 @@ void KVCacheManagerWithTransfer::StartRead(
     return;
   }
 
+  FaultInjectThrow(hooks::kKvCacheManagerApiStartReadBeforeSubmit);
+
   session->ExecutePullRequest(*this, remote_endpoint);
 }
 
@@ -866,6 +870,7 @@ std::tuple<std::vector<std::string>, std::vector<std::string>,
            std::vector<std::string>>
 KVCacheManagerWithTransfer::CompleteReadRaw() {
   RAIDEN_TRACE("KVTransfer::CompleteReadRaw");
+  FaultInjectThrow(hooks::kKvCacheManagerApiCompleteRead);
   std::vector<std::string> done_sending;
   std::vector<std::string> done_recving;
   std::vector<std::string> failed_recving;
@@ -1131,6 +1136,9 @@ StagingBlockAllocator::AcquireLocked(int64_t num_blocks) {
   if (num_blocks <= 0) {
     return Allocation();
   }
+  // The injected status is kInternal, which callers treat as non-retryable, so
+  // this exercises the fail-fast abort path rather than the staging retry loop.
+  ABSL_RETURN_IF_ERROR(FaultInjectStatus(hooks::kStagingAllocatorAcquire));
   const int64_t cap = capacity();
   if (num_blocks > cap) {
     return absl::InvalidArgumentError(
@@ -1428,6 +1436,10 @@ uint64_t KVCacheManagerWithTransfer::BeginPullStream(
     return 0;
   }
 
+  // Delays the control thread ahead of the lookup for the producer's
+  // NotifyForRead registration.
+  FaultInjectDelay(hooks::kKvCacheManagerPullRegisterWait);
+
   std::shared_ptr<TransferSendSession> session;
   PullStreamResponseSpec response;
   {
@@ -1548,10 +1560,12 @@ PullStreamResponseSpec KVCacheManagerWithTransfer::LaunchPull(
             << (remote_data_endpoints.empty() ? "" : remote_data_endpoints[0])
             << (remote_data_endpoints.size() > 1 ? " and others" : "");
 
+    FaultInjectThrow(hooks::kKvCacheManagerPullAccepted);
     {
       absl::MutexLock lock(pull_workers_mu_);
       ++active_pull_workers_;
     }
+    FaultInjectThrow(hooks::kKvCacheManagerPullSpawn);
     std::thread([this, session, remote_data_endpoints,
                  src_block_ids = req.src_block_ids,
                  dst_block_ids = req.dst_block_ids]() {

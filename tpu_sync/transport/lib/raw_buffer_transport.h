@@ -58,11 +58,11 @@ struct RawProgress {
 };
 
 // Builds a single Request struct for buffer push/ pull operations.
-absl::StatusOr<Request> BuildBufferRequest(size_t buffer_id, size_t shard_idx,
-                                           size_t offset_bytes,
-                                           const uint8_t* data_ptr,
-                                           size_t size_bytes, uint64_t uuid,
-                                           uint8_t socket_opcode);
+absl::StatusOr<Request> BuildBufferRequest(
+    size_t buffer_id, size_t shard_idx, size_t offset_bytes,
+    const uint8_t* data_ptr, size_t size_bytes, uint64_t uuid,
+    uint8_t socket_opcode, size_t dst_stride_bytes = 0, size_t stride_count = 1,
+    size_t src_stride_bytes = 0);
 
 // Builds a batch of Requests for a span of BufferPushTasks.
 absl::StatusOr<std::vector<Request>> BuildBufferRequests(

@@ -42,6 +42,7 @@
 #include "grpcpp/support/channel_arguments.h"
 #include "grpcpp/support/status.h"
 #include "tpu_sync/core/control_plane_backend.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.pb.h"
 
@@ -186,6 +187,11 @@ class PullStreamReactor final : public grpc::ServerUnaryReactor {
       absl::MutexLock lock(mu_);
       if (responded_) return;
       responded_ = true;
+    }
+    absl::Status injected =
+        FaultInjectStatus(hooks::kGrpcControlPlanePullReply);
+    if (result.ok() && !injected.ok()) {
+      result = injected;
     }
     if (!result.ok()) {
       response_->set_status(-1);

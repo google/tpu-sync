@@ -19,13 +19,17 @@ load("@rules_python//python:defs.bzl", "py_test")
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
-    name = "probe",
+    name = "hooks",
     srcs = ["fault_injector.cc"],
-    hdrs = ["fault_injector.h"],
+    hdrs = [
+        "fault_injector.h",
+        "hooks.h",
+    ],
     copts = ["-fexceptions"],
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
+        "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/base:no_destructor",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -43,7 +47,7 @@ cc_test(
     copts = ["-fexceptions"],
     features = ["-use_header_modules"],
     deps = [
-        ":probe",
+        ":hooks",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
@@ -58,7 +62,7 @@ nanobind_extension(
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
-        ":probe",
+        ":hooks",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
     ],

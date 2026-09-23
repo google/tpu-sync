@@ -28,6 +28,7 @@
 #include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
+#include "tpu_sync/fault_injection/hooks.h"  // IWYU pragma: export
 
 namespace tpu_raiden {
 
@@ -122,7 +123,8 @@ inline void FaultInjectThrow(std::string_view hook) {
   }
 }
 
-// Evaluates the hook and returns an error status if a failure is triggered.
+// Evaluates the hook and returns an internal error status if a failure is
+// triggered.
 inline absl::Status FaultInjectStatus(std::string_view hook) {
   if (ABSL_PREDICT_FALSE(FaultInjector::HasActiveInjections())) {
     return GetFaultInjector().ExecuteStatus(hook);

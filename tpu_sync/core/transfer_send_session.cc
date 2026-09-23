@@ -38,6 +38,7 @@
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
@@ -330,10 +331,14 @@ void TransferSendSession::StartPush(
     }
     LOG(INFO) << "StartPush (D2H start) layer " << l << ": uuid=" << uuid_
               << ", numa=" << base_->assigned_numa_node().value_or(-1);
+    absl::Status injected =
+        FaultInjectStatus(hooks::kTransferSendSessionD2hDispatch);
     absl::StatusOr<raiden::PjRtCopyFuture> future =
-        base_->D2hSyncDispatch(d2h_copy.src_offsets, d2h_copy.dst_offsets,
-                               d2h_copy.sizes, /*slot_idx=*/std::nullopt,
-                               /*layer_idx=*/l);
+        injected.ok()
+            ? base_->D2hSyncDispatch(d2h_copy.src_offsets, d2h_copy.dst_offsets,
+                                     d2h_copy.sizes, /*slot_idx=*/std::nullopt,
+                                     /*layer_idx=*/l)
+            : absl::StatusOr<raiden::PjRtCopyFuture>(injected);
     if (!future.ok()) {
       // A copy that cannot even be issued fails the transfer; the worker
       // thread has no caller for an exception to reach.
@@ -377,6 +382,11 @@ void TransferSendSession::SendNextLayer(size_t l) {
   }
 
   layer_future->OnReady([self = shared_from_this(), l](auto status_or) {
+    absl::Status injected =
+        FaultInjectStatus(hooks::kTransferSendSessionD2hComplete);
+    if (status_or.ok() && !injected.ok()) {
+      status_or = injected;
+    }
     absl::Cleanup end_op = [self]() { self->EndSendOp(); };
     if (!status_or.ok()) {
       LOG(ERROR) << "StartPush: D2H copy failed for layer " << l
@@ -394,6 +404,7 @@ void TransferSendSession::SendNextLayer(size_t l) {
 
     std::move(end_op).Cancel();
     self->base_->push_pool()->Schedule([self, l]() {
+      FaultInjectThrow(hooks::kTransferSendSessionPushTask);
       absl::Cleanup end_op = [self]() { self->EndSendOp(); };
       std::vector<std::string> remote_data_endpoints;
       std::vector<int> src_ints;

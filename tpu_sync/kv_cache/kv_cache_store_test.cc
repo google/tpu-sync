@@ -139,6 +139,11 @@ class KVCacheStoreTest {
                          std::shared_ptr<KVCacheStoreBackend> backend) {
     store.backends_.push_back(std::move(backend));
   }
+
+  static absl::StatusOr<std::vector<int>> AllocateBlockIds(KVCacheStore& store,
+                                                           int needed) {
+    return store.AllocateBlockIds(needed);
+  }
 };
 
 class HostOffloadBackendTest {
@@ -268,6 +273,133 @@ TEST(KVCacheStoreTest, EvictionTracking) {
 
   EXPECT_EQ(PeekLookup(controller, {"101"})->size(), 1);
   EXPECT_EQ(PeekLookup(controller, {"103"})->size(), 1);
+}
+
+TEST(KVCacheStoreTest, SetEvictionCallback) {
+  KVCacheStore controller(2, "", {}, /*num_shards=*/1,
+                          /*shard_size_bytes=*/512,
+                          /*store_server_ip=*/"127.0.0.1");
+
+  controller.SetEvictionCallback([](absl::Span<const std::string>) {});
+
+  // The callback is move-only, so it can own its state outright instead of
+  // being forced into a copyable capture.
+  auto owned_state = std::make_unique<int>(0);
+  controller.SetEvictionCallback(
+      [state = std::move(owned_state)](absl::Span<const std::string>) {});
+
+  // Passing an empty callback unregisters whatever was registered before.
+  controller.SetEvictionCallback(nullptr);
+}
+
+TEST(KVCacheStoreTest, SetEvictionCallbackInvokedOnDirectEvict) {
+  KVCacheStore store(2, "", {}, /*num_shards=*/1,
+                     /*shard_size_bytes=*/512,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  std::vector<std::string> evicted_seen;
+  store.SetEvictionCallback([&](absl::Span<const std::string> hashes) {
+    evicted_seen.insert(evicted_seen.end(), hashes.begin(), hashes.end());
+  });
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  std::vector<std::string> hashes = {"hash_1", "hash_2"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(rid, 10, 20, BlockStatus::HOST),
+      RaidenBlockId(rid, 11, 21, BlockStatus::HOST)};
+
+  ASSERT_TRUE(InsertResident(store, hashes, slices, /*on_host=*/true));
+
+  // Evict hash_1.
+  size_t count = KVCacheStoreTest::Evict(store, {"hash_1"});
+  EXPECT_EQ(count, 1);
+  EXPECT_THAT(evicted_seen, ::testing::ElementsAre("hash_1"));
+
+  // Evict hash_2.
+  count = KVCacheStoreTest::Evict(store, {"hash_2"});
+  EXPECT_EQ(count, 1);
+  EXPECT_THAT(evicted_seen, ::testing::ElementsAre("hash_1", "hash_2"));
+}
+
+TEST(KVCacheStoreTest, SetEvictionCallbackSkipsPinnedBlocks) {
+  KVCacheStore store(2, "", {}, /*num_shards=*/1,
+                     /*shard_size_bytes=*/512,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  std::vector<std::string> evicted_seen;
+  store.SetEvictionCallback([&](absl::Span<const std::string> hashes) {
+    evicted_seen.insert(evicted_seen.end(), hashes.begin(), hashes.end());
+  });
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  std::vector<std::string> hashes = {"pinned_1"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(rid, 10, 20, BlockStatus::HOST)};
+
+  // Insert without Release -> entry remains PINNED.
+  ABSL_ASSERT_OK(store.Insert(hashes, slices, /*on_host=*/true));
+
+  // Attempt to evict pinned_1 -> refuses to evict.
+  size_t count = KVCacheStoreTest::Evict(store, {"pinned_1"});
+  EXPECT_EQ(count, 0);
+  EXPECT_TRUE(evicted_seen.empty());
+
+  // Release pin, then evict -> succeeds and triggers callback.
+  store.Release(hashes);
+  count = KVCacheStoreTest::Evict(store, {"pinned_1"});
+  EXPECT_EQ(count, 1);
+  EXPECT_THAT(evicted_seen, ::testing::ElementsAre("pinned_1"));
+}
+
+TEST(KVCacheStoreTest, SetEvictionCallbackUnregister) {
+  KVCacheStore store(2, "", {}, /*num_shards=*/1,
+                     /*shard_size_bytes=*/512,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  std::vector<std::string> evicted_seen;
+  store.SetEvictionCallback([&](absl::Span<const std::string> hashes) {
+    evicted_seen.insert(evicted_seen.end(), hashes.begin(), hashes.end());
+  });
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  std::vector<std::string> hashes = {"h1", "h2"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(rid, 10, 20, BlockStatus::HOST),
+      RaidenBlockId(rid, 11, 21, BlockStatus::HOST)};
+
+  ASSERT_TRUE(InsertResident(store, hashes, slices, /*on_host=*/true));
+
+  // Unregister callback.
+  store.SetEvictionCallback(nullptr);
+
+  size_t count = KVCacheStoreTest::Evict(store, {"h1"});
+  EXPECT_EQ(count, 1);
+  EXPECT_TRUE(evicted_seen.empty());
+}
+
+TEST(KVCacheStoreTest, SetEvictionCallbackAcceptsMoveOnlyCallable) {
+  KVCacheStore store(2, "", {}, /*num_shards=*/1,
+                     /*shard_size_bytes=*/512,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  // The callback owns its state outright rather than sharing it, which only
+  // a move-only callback type allows.
+  auto evicted_seen = std::make_unique<std::vector<std::string>>();
+  std::vector<std::string>* observed = evicted_seen.get();
+  store.SetEvictionCallback(
+      [owned = std::move(evicted_seen)](absl::Span<const std::string> hashes) {
+        owned->insert(owned->end(), hashes.begin(), hashes.end());
+      });
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  std::vector<std::string> hashes = {"move_only_hash"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(rid, 10, 20, BlockStatus::HOST)};
+
+  ASSERT_TRUE(InsertResident(store, hashes, slices, /*on_host=*/true));
+
+  EXPECT_EQ(KVCacheStoreTest::Evict(store, {"move_only_hash"}), 1);
+  EXPECT_THAT(*observed, ::testing::ElementsAre("move_only_hash"));
 }
 
 TEST(KVCacheStoreTest, GlobalLookupFallback) {
@@ -1102,6 +1234,46 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, SaveReusesFreedBlocksAfterEvict) {
   absl::Status status = save_and_wait(second);
   ABSL_EXPECT_OK(status);
   EXPECT_EQ(controller_ptr->block_manager()->num_locked_blocks(), 1);
+}
+
+TEST_F(KVCacheStoreEmbeddedControllerTest,
+       AllocateBlockIdsInvokesEvictionCallback) {
+  // When allocating blocks requires evicting unpinned host blocks to make room,
+  // the eviction callback should be invoked with the evicted block hashes.
+  auto controller = MakeController(/*num_blocks=*/2);
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  KVCacheStore store(2, std::move(controller), "", rid, std::nullopt,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  std::vector<std::string> evicted_seen;
+  store.SetEvictionCallback([&](absl::Span<const std::string> hashes) {
+    evicted_seen.insert(evicted_seen.end(), hashes.begin(), hashes.end());
+  });
+
+  // Populate store with two host blocks (host_block_id 0 and 1).
+  auto* ctrl = KVCacheStoreTest::GetController(store);
+  ASSERT_NE(ctrl, nullptr);
+  auto alloc_res = ctrl->AllocateBlockIds(2);
+  ABSL_ASSERT_OK(alloc_res);
+  std::vector<int> host_ids = *alloc_res;
+  ASSERT_EQ(host_ids.size(), 2);
+
+  std::vector<std::string> hashes = {"h1", "h2"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(rid, host_ids[0], 0, BlockStatus::HOST),
+      RaidenBlockId(rid, host_ids[1], 1, BlockStatus::HOST)};
+  ASSERT_TRUE(InsertResident(store, hashes, slices, /*on_host=*/true));
+
+  // Now free block count is 0. Requesting 1 block via AllocateBlockIds
+  // will force eviction of 1 evictable block (the LRU entry "h2").
+  auto alloc_one = KVCacheStoreTest::AllocateBlockIds(store, 1);
+  ABSL_ASSERT_OK(alloc_one);
+  EXPECT_EQ(alloc_one->size(), 1);
+
+  // Eviction callback was notified of "h2".
+  EXPECT_THAT(evicted_seen, ::testing::ElementsAre("h2"));
 }
 
 TEST_F(KVCacheStoreEmbeddedControllerTest, SaveSuccess) {
@@ -3141,52 +3313,60 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteSizeMismatchFails) {
 }
 
 TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteDuplicateFails) {
-  auto src_controller_server = core::controller::CreateTestControllerServer();
+  struct BlockingTransferManager
+      : public ::tpu_raiden::controller::ShardAwareMockTransferManager {
+    absl::Notification started;
+    absl::Notification release;
+    absl::Notification done;
 
-  ::tpu_sync::rpc::RaidenIdProto src_unit;
-  src_unit.set_job_name("src_job");
-  src_unit.set_job_replica_id("0");
-  src_unit.set_data_name("src_data");
-  src_unit.set_data_replica_idx(0);
-
-  kv_cache::RaidenId src_raiden_id;
-  src_raiden_id.job_name = "src_job";
-  src_raiden_id.job_replica_id = "0";
-  src_raiden_id.data_name = "src_data";
-  src_raiden_id.data_replica_idx = 0;
-
-  ABSL_ASSERT_OK(PublishPeerController(registry_address_, src_raiden_id,
-                                       src_controller_server->server_address));
-
-  auto register_src_worker = [&](const std::string& worker_id,
-                                 const std::string& worker_address,
-                                 const std::string& transfer_endpoint) {
-    auto status = src_controller_server->client->RegisterWorker(
-        worker_id, worker_address, {{transfer_endpoint, {}}});
-    ABSL_ASSERT_OK(status);
+    auto H2d(const std::vector<int64_t>& src_offsets,
+             const std::vector<int64_t>& dst_offsets,
+             const std::vector<int64_t>& copy_sizes) {
+      started.Notify();
+      release.WaitForNotification();
+      auto res = ShardAwareMockTransferManager::H2d(src_offsets, dst_offsets,
+                                                    copy_sizes);
+      done.Notify();
+      return res;
+    }
   };
-  register_src_worker("worker_0", "src_worker_0_addr", "src_worker_0_transfer");
 
-  // Every read is now validated at the source by construction -- there is no
-  // longer any RPC that transfers without verifying and pinning first. Hold the
-  // source's AcquireReadLease hook open until after the second ReadRemote call
-  // so the first read cannot complete and clear load_tracker_ before the
-  // duplicate check runs.
-  absl::Notification release_lease;
-  src_controller_server->service->SetReadRemoteHooks(
-      [&](absl::Span<const std::string> h)
-          -> absl::StatusOr<std::vector<int32_t>> {
-        release_lease.WaitForNotification();
-        return std::vector<int32_t>(h.size(), 42);
-      },
-      [&](absl::Span<const std::string> /*h*/) {});
-  // NOTE: the source no longer transfers anything. Under the pull design
-  // the DESTINATION's own worker (test_server_, backed by a mock transfer
-  // manager) executes the copy; the source only leases.
+  BlockingTransferManager blocking_mgr;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&blocking_mgr));
 
-  auto dst_controller = MakeController();
+  kv_cache::RaidenId src_raiden_id{"src_job", "0", "src_data", 0};
+
+  auto dst_controller = MakeController(/*num_blocks=*/20);
   RegisterAndInitWorker(*dst_controller, "worker_0",
                         test_server_->server_address);
+  auto* controller_ptr = dst_controller.get();
+
+  BackendConfig src_config;
+  src_config.type = "HostOffloadBackend";
+  src_config.capacity = 100;
+  src_config.global_registry_address = registry_address_;
+  src_config.raiden_id = src_raiden_id;
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto src_backend_raw,
+      HostOffloadBackend::Create(src_config, controller_ptr));
+  auto src_backend =
+      std::dynamic_pointer_cast<HostOffloadBackend>(src_backend_raw);
+  ASSERT_NE(src_backend, nullptr);
+  src_backend->Insert({"hash_0"},
+                      {RaidenBlockId(src_raiden_id, 42, BlockStatus::HOST)},
+                      /*on_host=*/true);
+
+  auto src_server = KVCacheStoreServer::Create();
+  ABSL_ASSERT_OK(
+      src_server->StartServer(src_backend.get(), controller_ptr, "127.0.0.1"));
+
+  global_registry::GlobalRegistryClient reg_client(grpc::CreateChannel(
+      registry_address_, grpc::InsecureChannelCredentials()));
+  ABSL_ASSERT_OK(
+      reg_client.RegisterStore(src_raiden_id, src_server->GetServerAddress(),
+                               controller_ptr->controller_address()));
 
   RaidenId rid{"dst_job", "0", "dst_cache", 0};
   KVCacheStore store(10, std::move(dst_controller), registry_address_, rid,
@@ -3197,28 +3377,35 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteDuplicateFails) {
   std::vector<RaidenBlockId> slices = {
       RaidenBlockId(src_raiden_id, 42, BlockStatus::REMOTE)};
 
-  // First call succeeds
+  // First call succeeds and blocks in H2d while holding "hash_0" in
+  // load_tracker_.
   absl::Status status1 = store.ReadRemote(hashes, slices, {7});
   ABSL_ASSERT_OK(status1);
+  blocking_mgr.started.WaitForNotification();
 
-  // Second call fails with FailedPreconditionError
+  // Second call fails with FailedPreconditionError while the first is in flight
   absl::Status status2 = store.ReadRemote(hashes, slices, {8});
   EXPECT_FALSE(status2.ok());
   EXPECT_EQ(status2.code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_THAT(status2.message(), ::testing::HasSubstr("already loading"));
 
-  release_lease.Notify();
+  blocking_mgr.release.Notify();
+  blocking_mgr.done.WaitForNotification();
   bool first_read_settled = false;
   for (int attempt = 0; attempt < 100; ++attempt) {
     auto [done_hashes, failed_hashes, pending_hashes] =
         store.PollRemoteReadStatus();
-    if (!done_hashes.empty() || !failed_hashes.empty()) {
+    if (!done_hashes.empty()) {
+      EXPECT_THAT(done_hashes, ::testing::ElementsAre("hash_0"));
       first_read_settled = true;
       break;
     }
     absl::SleepFor(absl::Milliseconds(10));
   }
   EXPECT_TRUE(first_read_settled);
+  src_server->Shutdown();
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(dst_transfer_mock_.get()));
 }
 
 

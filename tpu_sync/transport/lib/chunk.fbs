@@ -31,7 +31,14 @@ struct ChunkHeader {
 // LINT.ThenChange(chunk.h)
 }
 
-struct ChunkMetadata {
+struct ChunkMetadataV1 {
+  layer_idx:uint32;
+  dst_shard_idx:uint32;
+  dst_offset_bytes:uint64;
+  size_bytes:uint64;
+}
+
+struct ChunkMetadataV2 {
   // The following fields can change.
   // When they do, the `ver` field in ChunkHeader must be incremented.
   // LINT.IfChange
@@ -39,5 +46,8 @@ struct ChunkMetadata {
   dst_shard_idx:uint32;
   dst_offset_bytes:uint64;
   size_bytes:uint64;
+  dst_stride_bytes:uint64;
+  count:uint32;
+  padding:uint32;
 // LINT.ThenChange(chunk.h)
 }

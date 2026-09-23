@@ -47,6 +47,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "tpu_sync/core/control_plane_backend.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
 
 namespace tpu_raiden {
 
@@ -388,7 +389,9 @@ void TcpControlPlaneBackend::ControlServerLoop() {
       break;
     }
     if (r == 0) continue;
-    int client_fd = accept(control_fd_, nullptr, nullptr);
+    int client_fd = FaultInjectErrno(hooks::kTcpControlPlaneAccept, EMFILE)
+                        ? -1
+                        : accept(control_fd_, nullptr, nullptr);
     if (client_fd < 0) {
       if (errno == EINTR) continue;
       break;
@@ -552,6 +555,10 @@ void TcpControlPlaneBackend::HandleControlConnection(
 
     absl::StatusOr<PullStreamResponseSpec> result =
         handler->OnPullStream(spec, fallback_peer_ip);
+    absl::Status injected = FaultInjectStatus(hooks::kTcpControlPlanePullReply);
+    if (result.ok() && !injected.ok()) {
+      result = injected;
+    }
     if (!result.ok()) {
       SendErrorResponse(fd, result.status().message());
       return;

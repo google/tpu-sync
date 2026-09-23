@@ -1,4 +1,5 @@
 import enum
+from collections.abc import Callable
 from typing import Any, overload
 
 class BlockStatus(enum.Enum):
@@ -168,6 +169,11 @@ class KVCacheStore:
     ...
   def poll_load_status(self) -> tuple[list[bytes], list[bytes], list[bytes]]:
     """Polls status of asynchronous Load operations."""
+    ...
+  def set_eviction_callback(
+      self, callback: Callable[[list[bytes]], None] | None
+  ) -> None:
+    """Registers a callback invoked upon host LRU cache eviction."""
     ...
   def read_remote(
       self,

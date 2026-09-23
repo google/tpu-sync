@@ -18,7 +18,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -26,6 +25,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
+#include "tpu_sync/transport/peregrine/src/api/transport_metrics.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -56,6 +56,9 @@ struct Request {
   uint32_t request_id;
   int shard_idx;
   int stream_idx;
+  size_t dst_stride_bytes = 0;
+  size_t stride_count = 1;
+  size_t src_stride_bytes = 0;
 
   BlockReceivedCallback on_block_received = nullptr;
 };
@@ -84,6 +87,10 @@ class TransportAdapter {
       CompletionCallback on_complete = nullptr) = 0;
 
   virtual absl::StatusOr<Status> Poll(Handle handle) = 0;
+
+  virtual ::peregrine::TransportMetrics GetTransportMetrics() const {
+    return {};
+  }
 };
 
 }  // namespace lib

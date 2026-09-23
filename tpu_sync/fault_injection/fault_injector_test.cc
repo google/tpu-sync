@@ -76,6 +76,28 @@ TEST_F(FaultInjectorTest, EmptyHookNameInstallsForAllHooks) {
   EXPECT_EQ(GetFaultInjector().GetHitCount(), 2);
 }
 
+TEST_F(FaultInjectorTest, DelayEligibilityRejectsEmptyAndFailOnlyHooks) {
+  EXPECT_THAT(
+      GetFaultInjector().Install({FaultInjectionRule{
+          .hook = "",
+          .action = FaultInjectionType::kDelay,
+          .probability = 1.0,
+          .max_delay_ms = 10,
+      }}),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("delay is not permitted at hook ''")));
+
+  EXPECT_THAT(GetFaultInjector().Install({FaultInjectionRule{
+                  .hook = std::string(hooks::kTransferRecvSessionH2dComplete),
+                  .action = FaultInjectionType::kDelay,
+                  .probability = 1.0,
+                  .max_delay_ms = 10,
+              }}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("delay is not permitted at hook "
+                                 "'transfer_recv_session.h2d.complete'")));
+}
+
 TEST_F(FaultInjectorTest, DefaultProbabilityZeroDoesNotTrigger) {
   ABSL_ASSERT_OK(GetFaultInjector().Install({
       FaultInjectionRule{

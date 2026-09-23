@@ -22,11 +22,13 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/strings/string_view.h"
 #include "grpcpp/client_context.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
 #include "grpcpp/support/status.h"
+#include "tpu_sync/common/grpc_util.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/proto/controller_service.grpc.pb.h"
 #include "tpu_sync/proto/controller_service.pb.h"
@@ -69,10 +71,7 @@ absl::Status RaidenControllerClient::RegisterWorker(
   ::tpu_sync::proto::RegisterWorkerResponse response;
   grpc::ClientContext context;
   grpc::Status status = stub_->RegisterWorker(&context, request, &response);
-
-  if (!status.ok()) {
-    return absl::InternalError(status.error_message());
-  }
+  ABSL_RETURN_IF_ERROR(FromGrpcStatus(status));
   if (!response.success()) {
     return absl::FailedPreconditionError(response.error_message());
   }

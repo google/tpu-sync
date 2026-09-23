@@ -49,6 +49,27 @@ cc_test(
 )
 
 cc_library(
+    name = "grpc_util",
+    hdrs = ["grpc_util.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/status",
+    ],
+)
+
+cc_test(
+    name = "grpc_util_test",
+    srcs = ["grpc_util_test.cc"],
+    deps = [
+        ":grpc_util",
+        "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "detached_thread_group",
     srcs = ["detached_thread_group.cc"],
     hdrs = ["detached_thread_group.h"],

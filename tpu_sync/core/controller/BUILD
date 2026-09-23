@@ -123,11 +123,13 @@ cc_library(
     hdrs = ["controller_client.h"],
     visibility = ["//visibility:public"],
     deps = [
+        "//tpu_sync/common:grpc_util",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/proto:controller_service_cc_grpc",
         "//tpu_sync/proto:controller_service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/strings",
     ],
 )

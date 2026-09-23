@@ -41,6 +41,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -353,6 +354,7 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
   const uint8_t major_order = first.major_order;
   const size_t block_count = static_cast<size_t>(count_or_size);
 
+  ABSL_RETURN_IF_ERROR(FaultInjectStatus(hooks::kSocketTransportSendConnect));
   auto borrowed_fd = raw_transport_->BorrowConnection(peer, local_ip);
   if (!borrowed_fd.ok()) {
     return borrowed_fd.status();
@@ -427,6 +429,8 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
           SerializeChunkSize(total_size);
       ABSL_RETURN_IF_ERROR(WriteExact(fd, s_size.data(), s_size.size()));
       if (total_size > 0) {
+        ABSL_RETURN_IF_ERROR(
+            FaultInjectStatus(hooks::kSocketTransportSendProgress));
         ABSL_RETURN_IF_ERROR(WriteVExact(fd, absl::MakeSpan(iov)));
         stream_bytes_sent += total_size;
       }

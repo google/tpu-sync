@@ -48,6 +48,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
@@ -326,6 +327,7 @@ absl::Status BlockTransport::HandleIncomingPush(
     const std::vector<uint8_t> s_ids = lib::SerializeBlockIds(allocated_ids);
     ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s_ids.data(), s_ids.size()));
   } else {
+    FaultInjectThrow(hooks::kBlockTransportRecvIdsAlloc);
     std::vector<uint8_t> ids_buf(header.count_or_size * sizeof(uint32_t));
     ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
     allocated_ids = lib::DeserializeBlockIds(ids_buf);
@@ -382,6 +384,8 @@ absl::Status BlockTransport::HandleIncomingPush(
         }
 
         if (expected_size > 0) {
+          ABSL_RETURN_IF_ERROR(
+              FaultInjectStatus(hooks::kBlockTransportRecvProgress));
           ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, ToIovec(chunks)));
           total_received_bytes += expected_size;
         }
@@ -519,6 +523,8 @@ absl::Status BlockTransport::HandleIncomingPush(
   }
 
   if (trigger_completion) {
+    ABSL_RETURN_IF_ERROR(
+        FaultInjectStatus(hooks::kBlockTransportRecvLayerDone));
     if (plan_declared) {
       ABSL_RETURN_IF_ERROR(block_delegate_->OnPoolReceived(l, header.uuid));
     } else {
@@ -533,6 +539,7 @@ absl::Status BlockTransport::HandleIncomingPush(
       block_delegate_->OnBlocksReceived(allocated_ids, header.uuid));
   incoming_push_lease_held = false;
   ABSL_RETURN_IF_ERROR(block_delegate_->EndIncomingPush(header.uuid));
+  ABSL_RETURN_IF_ERROR(FaultInjectStatus(hooks::kBlockTransportRecvBeforeAck));
   uint8_t ack = 1;
   ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
   return absl::OkStatus();

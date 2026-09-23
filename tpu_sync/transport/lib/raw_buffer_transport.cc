@@ -54,6 +54,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/numa_thread_pool.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
@@ -618,8 +619,11 @@ void RawBufferTransport::ListenerLoop() {
 
     struct sockaddr_in6 client_addr;
     socklen_t clilen = sizeof(client_addr);
-    int client_fd = accept(
-        server_fd, reinterpret_cast<struct sockaddr*>(&client_addr), &clilen);
+    int client_fd =
+        FaultInjectErrno(hooks::kRawBufferTransportAccept, EMFILE)
+            ? -1
+            : accept(server_fd,
+                     reinterpret_cast<struct sockaddr*>(&client_addr), &clilen);
     if (client_fd < 0) {
       if (stopping_) break;
       continue;

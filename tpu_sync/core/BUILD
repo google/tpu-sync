@@ -468,6 +468,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":control_plane_backend_hdrs",
+        "//tpu_sync/fault_injection:hooks",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/log",
@@ -494,6 +495,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":control_plane_backend_hdrs",
+        "//tpu_sync/fault_injection:hooks",
         "//tpu_sync/proto:kv_cache_control_plane_service_cc_grpc",
         "//tpu_sync/proto:kv_cache_control_plane_service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
@@ -591,6 +593,7 @@ cc_library(
         ":utils",
         ":xla_pjrt_headers",
         "//tpu_sync/common:trace",
+        "//tpu_sync/fault_injection:hooks",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
         "//tpu_sync/kv_cache:pool_layout",
         "//tpu_sync/rpc:raiden_service_cc_proto",

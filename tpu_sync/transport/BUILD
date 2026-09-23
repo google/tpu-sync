@@ -51,6 +51,7 @@ cc_library(
         ":block_transport_delegate",
         ":buffer_push_task",
         "//tpu_sync/core:tsl_platform_headers",
+        "//tpu_sync/fault_injection:hooks",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport/lib:chunk",

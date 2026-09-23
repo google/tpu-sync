@@ -28,20 +28,24 @@ class FaultInjectionBindingTest(absltest.TestCase):
 
   def test_initial_and_reset_state(self):
     self.assertFalse(fault_injection.has_active_injections())
-    self.assertFalse(fault_injection.is_hook_active("control.client.send"))
+    self.assertFalse(
+        fault_injection.is_hook_active("transfer_recv_session.pull.request")
+    )
     self.assertEqual(fault_injection.get_hit_count(), 0)
-    self.assertEqual(fault_injection.get_hit_count("control.client.send"), 0)
+    self.assertEqual(
+        fault_injection.get_hit_count("transfer_recv_session.pull.request"), 0
+    )
     self.assertEqual(fault_injection.get_fault_status(), {})
 
   def test_inject_and_reset_rules(self):
     fault_injection.inject_faults([
         {
-            "hook": "control.client.send",
+            "hook": "transfer_recv_session.pull.request",
             "action": "fail",
             "probability": 1.0,
         },
         {
-            "hook": "data.send.chunk",
+            "hook": "socket_transport.send.progress",
             "action": "delay",
             "probability": 0.5,
             "min_delay_ms": 5,
@@ -49,37 +53,59 @@ class FaultInjectionBindingTest(absltest.TestCase):
         },
     ])
     self.assertTrue(fault_injection.has_active_injections())
-    self.assertTrue(fault_injection.is_hook_active("control.client.send"))
-    self.assertTrue(fault_injection.is_hook_active("data.send.chunk"))
-    self.assertFalse(fault_injection.is_hook_active("data.recv.chunk"))
+    self.assertTrue(
+        fault_injection.is_hook_active("transfer_recv_session.pull.request")
+    )
+    self.assertTrue(
+        fault_injection.is_hook_active("socket_transport.send.progress")
+    )
+    self.assertFalse(
+        fault_injection.is_hook_active("block_transport.recv.progress")
+    )
 
     fault_injection.reset_faults()
     self.assertFalse(fault_injection.has_active_injections())
-    self.assertFalse(fault_injection.is_hook_active("control.client.send"))
+    self.assertFalse(
+        fault_injection.is_hook_active("transfer_recv_session.pull.request")
+    )
 
   def test_empty_hook_installs_for_all_hooks(self):
-    fault_injection.inject_faults([{"hook": "", "action": "fail", "probability": 1.0}])
+    fault_injection.inject_faults(
+        [{"hook": "", "action": "fail", "probability": 1.0}]
+    )
     self.assertTrue(fault_injection.has_active_injections())
-    self.assertTrue(fault_injection.is_hook_active("control.client.send"))
-    self.assertTrue(fault_injection.is_hook_active("data.send.chunk"))
+    self.assertTrue(
+        fault_injection.is_hook_active("transfer_recv_session.pull.request")
+    )
+    self.assertTrue(
+        fault_injection.is_hook_active("socket_transport.send.progress")
+    )
 
   def test_rejects_unknown_action_and_invalid_delay_range(self):
     with self.assertRaisesRegex(ValueError, "unknown action: bogus"):
       fault_injection.inject_faults(
-          [{"hook": "control.client.send", "action": "bogus"}]
+          [{"hook": "transfer_recv_session.pull.request", "action": "bogus"}]
       )
 
     with self.assertRaisesRegex(
         ValueError, "min_delay_ms cannot be greater than max_delay_ms"
     ):
-      fault_injection.inject_faults([
-          {
-              "hook": "data.send.chunk",
-              "action": "delay",
-              "min_delay_ms": 50,
-              "max_delay_ms": 10,
-          }
-      ])
+      fault_injection.inject_faults([{
+          "hook": "socket_transport.send.progress",
+          "action": "delay",
+          "min_delay_ms": 50,
+          "max_delay_ms": 10,
+      }])
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "delay is not permitted at hook 'transfer_recv_session.h2d.complete'",
+    ):
+      fault_injection.inject_faults([{
+          "hook": "transfer_recv_session.h2d.complete",
+          "action": "delay",
+          "max_delay_ms": 10,
+      }])
 
 
 if __name__ == "__main__":

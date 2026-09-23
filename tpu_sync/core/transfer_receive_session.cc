@@ -44,6 +44,7 @@
 #include "tpu_sync/core/metrics_collector.h"  // IWYU pragma: keep
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/transfer_send_session.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -480,9 +481,15 @@ void TransferReceiveSession::ExecutePullRequest(
           req_spec.src_block_ids = load_plan.producer_remote_block_ids;
           req_spec.dst_block_ids = load_plan.transport_host_block_ids;
 
+          FaultInjectThrow(hooks::kTransferRecvSessionPullRequest);
           absl::StatusOr<PullStreamResponseSpec> response =
               manager.control_backend_->SendPullRequest(
                   remote_endpoint, req_spec, absl::Seconds(manager.timeout_s_));
+          absl::Status injected =
+              FaultInjectStatus(hooks::kTransferRecvSessionPullReply);
+          if (response.ok() && !injected.ok()) {
+            response = injected;
+          }
           CheckStatus("control pull request", response.status());
           if (response->status != 0) {
             throw std::runtime_error(absl::StrCat(
@@ -581,10 +588,14 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
             << ": req_id=" << session_req_id << ", uuid=" << uuid_
             << ", numa=" << base_->assigned_numa_node().value_or(-1);
 
+  absl::Status injected =
+      FaultInjectStatus(hooks::kTransferRecvSessionH2dDispatch);
   auto future_or =
-      base_->H2dSyncDispatch(copy_spec.src_offsets, copy_spec.dst_offsets,
-                             copy_spec.sizes, /*slot_idx=*/std::nullopt,
-                             /*layer_idx=*/layer_idx);
+      injected.ok()
+          ? base_->H2dSyncDispatch(copy_spec.src_offsets, copy_spec.dst_offsets,
+                                   copy_spec.sizes, /*slot_idx=*/std::nullopt,
+                                   /*layer_idx=*/layer_idx)
+          : absl::StatusOr<raiden::PjRtCopyFuture>(injected);
   if (!future_or.ok()) {
     absl::MutexLock lock(mu_);
     FinishLocked(future_or.status());
@@ -603,6 +614,11 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
                   layer_idx, session_req_id,
                   metrics_collector =
                       manager.metrics_collector_](auto status_or) {
+    absl::Status injected =
+        FaultInjectStatus(hooks::kTransferRecvSessionH2dComplete);
+    if (status_or.ok() && !injected.ok()) {
+      status_or = injected;
+    }
     absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
     bool all_layers_done = false;
     std::chrono::steady_clock::time_point session_start_time;

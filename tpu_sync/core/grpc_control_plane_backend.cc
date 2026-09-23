@@ -42,6 +42,7 @@
 #include "grpcpp/support/channel_arguments.h"
 #include "grpcpp/support/status.h"
 #include "tpu_sync/core/control_plane_backend.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.pb.h"
 
@@ -144,6 +145,10 @@ grpc::Status KVCacheControlPlaneServiceImpl::PullStream(
 
   absl::StatusOr<PullStreamResponseSpec> result =
       handler_->OnPullStream(spec, fallback_peer_ip);
+  absl::Status injected = FaultInjectStatus(hooks::kGrpcControlPlanePullReply);
+  if (result.ok() && !injected.ok()) {
+    result = injected;
+  }
   if (!result.ok()) {
     response->set_status(-1);
     response->set_message(std::string(result.status().message()));

@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/base/no_destructor.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/random/random.h"
@@ -76,6 +77,11 @@ absl::Status FaultInjector::Install(const FaultInjectionRules& rules) {
     if (r.min_delay_ms > r.max_delay_ms) {
       return absl::InvalidArgumentError(
           "min_delay_ms cannot be greater than max_delay_ms");
+    }
+    if (r.action == FaultInjectionType::kDelay &&
+        (r.hook.empty() || absl::c_linear_search(hooks::kFailOnly, r.hook))) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("delay is not permitted at hook '", r.hook, "'"));
     }
     new_rules[r.hook].push_back(r);
   }

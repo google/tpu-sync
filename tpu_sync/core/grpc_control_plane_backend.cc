@@ -117,62 +117,133 @@ std::string ExtractIpFromGrpcPeer(absl::string_view peer) {
   return std::string(ip);
 }
 
-grpc::Status KVCacheControlPlaneServiceImpl::PullStream(
-    grpc::ServerContext* context,
+namespace {
+
+absl::Time DeadlineFromContext(const grpc::CallbackServerContext& context) {
+  const std::chrono::system_clock::time_point deadline = context.deadline();
+  if (deadline == std::chrono::system_clock::time_point::max()) {
+    return absl::InfiniteFuture();
+  }
+  return absl::FromChrono(deadline);
+}
+
+// One inbound PullStream. The handler may answer after PullStream returns,
+// so the reactor owns the call until gRPC reports it done.
+class PullStreamReactor final : public grpc::ServerUnaryReactor {
+ public:
+  PullStreamReactor(ControlPlaneHandler* handler,
+                    control_plane::proto::PullStreamResponse* response)
+      : handler_(handler), response_(response) {}
+
+  // Runs inside the PullStream method. The handler may answer inline, which
+  // calls Finish before this returns; that is safe because gRPC does not run
+  // OnDone until the method has returned the reactor.
+  void Start(const grpc::CallbackServerContext& context,
+             const control_plane::proto::PullStreamRequest& request) {
+    PullStreamRequestSpec spec;
+    spec.uuid = request.uuid();
+    spec.ep_idx = request.ep_idx();
+    spec.consumer_data_port = request.consumer_data_port();
+    spec.consumer_ips.assign(request.consumer_ips().begin(),
+                             request.consumer_ips().end());
+    spec.src_block_ids.assign(request.src_block_ids().begin(),
+                              request.src_block_ids().end());
+    spec.dst_block_ids.assign(request.dst_block_ids().begin(),
+                              request.dst_block_ids().end());
+
+    const uint64_t id = handler_->OnPullStreamAsync(
+        spec, ExtractIpFromGrpcPeer(context.peer()),
+        DeadlineFromContext(context),
+        [this](absl::StatusOr<PullStreamResponseSpec> result) {
+          Respond(std::move(result));
+        });
+    bool cancel_now = false;
+    {
+      absl::MutexLock lock(mu_);
+      pending_id_ = id;
+      cancel_now = cancelled_ && !responded_ && id != 0;
+    }
+    // OnCancel ran before the handler handed back an id to cancel.
+    if (cancel_now) handler_->CancelPullStream(id);
+  }
+
+  void OnCancel() override {
+    uint64_t id = 0;
+    {
+      absl::MutexLock lock(mu_);
+      cancelled_ = true;
+      if (responded_) return;
+      id = pending_id_;
+    }
+    if (id != 0) handler_->CancelPullStream(id);
+  }
+
+  void OnDone() override { delete this; }
+
+ private:
+  void Respond(absl::StatusOr<PullStreamResponseSpec> result) {
+    {
+      absl::MutexLock lock(mu_);
+      if (responded_) return;
+      responded_ = true;
+    }
+    if (!result.ok()) {
+      response_->set_status(-1);
+      response_->set_message(std::string(result.status().message()));
+    } else {
+      response_->set_status(result->status);
+      response_->set_num_layers(result->num_layers);
+      response_->set_data_port(result->data_port);
+      response_->set_message(result->message);
+    }
+    // Last use of `this`: OnDone may delete the reactor once Finish is called.
+    Finish(grpc::Status::OK);
+  }
+
+  ControlPlaneHandler* const handler_;
+  control_plane::proto::PullStreamResponse* const response_;
+  absl::Mutex mu_;
+  uint64_t pending_id_ ABSL_GUARDED_BY(mu_) = 0;
+  bool cancelled_ ABSL_GUARDED_BY(mu_) = false;
+  bool responded_ ABSL_GUARDED_BY(mu_) = false;
+};
+
+}  // namespace
+
+grpc::ServerUnaryReactor* KVCacheControlPlaneServiceImpl::PullStream(
+    grpc::CallbackServerContext* context,
     const control_plane::proto::PullStreamRequest* request,
     control_plane::proto::PullStreamResponse* response) {
   if (!handler_) {
-    return grpc::Status(grpc::StatusCode::UNAVAILABLE,
-                        "ControlPlaneHandler not initialized");
+    grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
+    reactor->Finish(grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                                 "ControlPlaneHandler not initialized"));
+    return reactor;
   }
-
-  PullStreamRequestSpec spec;
-  spec.uuid = request->uuid();
-  spec.ep_idx = request->ep_idx();
-  spec.consumer_data_port = request->consumer_data_port();
-  spec.consumer_ips.assign(request->consumer_ips().begin(),
-                           request->consumer_ips().end());
-  spec.src_block_ids.assign(request->src_block_ids().begin(),
-                            request->src_block_ids().end());
-  spec.dst_block_ids.assign(request->dst_block_ids().begin(),
-                            request->dst_block_ids().end());
-
-  std::string fallback_peer_ip;
-  if (spec.consumer_ips.empty()) {
-    fallback_peer_ip = ExtractIpFromGrpcPeer(context->peer());
-  }
-
-  absl::StatusOr<PullStreamResponseSpec> result =
-      handler_->OnPullStream(spec, fallback_peer_ip);
-  if (!result.ok()) {
-    response->set_status(-1);
-    response->set_message(std::string(result.status().message()));
-    return grpc::Status::OK;
-  }
-
-  response->set_status(result->status);
-  response->set_num_layers(result->num_layers);
-  response->set_data_port(result->data_port);
-  response->set_message(result->message);
-  return grpc::Status::OK;
+  auto* reactor = new PullStreamReactor(handler_, response);
+  reactor->Start(*context, *request);
+  return reactor;
 }
 
-grpc::Status KVCacheControlPlaneServiceImpl::Ack(
-    grpc::ServerContext* context,
+grpc::ServerUnaryReactor* KVCacheControlPlaneServiceImpl::Ack(
+    grpc::CallbackServerContext* context,
     const control_plane::proto::AckRequest* request,
     control_plane::proto::AckResponse* response) {
+  grpc::ServerUnaryReactor* reactor = context->DefaultReactor();
   if (!handler_) {
-    return grpc::Status(grpc::StatusCode::UNAVAILABLE,
-                        "ControlPlaneHandler not initialized");
+    reactor->Finish(grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                                 "ControlPlaneHandler not initialized"));
+    return reactor;
   }
   absl::Status status = handler_->OnAck(request->uuid());
   if (!status.ok()) {
     response->set_status(-1);
     response->set_message(std::string(status.message()));
-    return grpc::Status::OK;
+  } else {
+    response->set_status(0);
   }
-  response->set_status(0);
-  return grpc::Status::OK;
+  reactor->Finish(grpc::Status::OK);
+  return reactor;
 }
 
 GrpcControlPlaneBackend::GrpcControlPlaneBackend(size_t max_cached_stubs)

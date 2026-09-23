@@ -23,6 +23,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -32,7 +33,9 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/host_memory_allocator.h"
@@ -176,6 +179,13 @@ using StagingAllocation = StagingBlockAllocator::Allocation;
 class KVCacheManagerWithTransfer {
  public:
   friend class TransferReceiveSession;
+
+  // Caps on pulls parked waiting for their read to be registered. A parked
+  // pull holds no thread, only an entry, so these bound memory and keep one
+  // consumer's early or bogus pulls from using up the room every other
+  // consumer's pulls need. Over a cap, a pull is rejected at once.
+  static constexpr size_t kMaxPullWaitersPerPeer = 64;
+  static constexpr size_t kMaxPullWaiters = 4096;
 
   KVCacheManagerWithTransfer(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -363,13 +373,68 @@ class KVCacheManagerWithTransfer {
   absl::flat_hash_set<std::string> done_recving_;
   absl::flat_hash_set<std::string> failed_recving_;
   absl::Mutex mu_;
-  absl::CondVar cv_;
   std::atomic<bool> stopping_{false};
   std::unique_ptr<ControlPlaneHandler> control_handler_;
   std::unique_ptr<ControlPlaneBackend> control_backend_;
 
+  // A pull that arrived before its read was registered. NotifyForRead
+  // completes it; the expiry thread rejects it at `give_up`.
+  struct PullWaiter {
+    PullStreamRequestSpec req;
+    std::string peer_ip;
+    absl::Time give_up;
+    // give_up less arrival time: the grace, or less if the consumer's
+    // deadline was sooner.
+    absl::Duration wait;
+    ControlPlaneHandler::PullStreamDone done;
+  };
+  // Keyed by the id BeginPullStream hands back for CancelPullStream.
+  absl::flat_hash_map<uint64_t, PullWaiter> pull_waiters_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<uint64_t, std::vector<uint64_t>> pull_waiters_by_uuid_
+      ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<std::string, size_t> pull_waiters_per_peer_
+      ABSL_GUARDED_BY(mu_);
+  uint64_t next_pull_waiter_id_ ABSL_GUARDED_BY(mu_) = 1;
+  // Signalled when a waiter's give_up precedes pull_waiter_wake_at_, the
+  // time the expiry thread is sleeping until, or on stop.
+  absl::CondVar pull_waiter_cv_;
+  absl::Time pull_waiter_wake_at_ ABSL_GUARDED_BY(mu_) = absl::InfiniteFuture();
+  bool pull_waiter_expiry_stop_ ABSL_GUARDED_BY(mu_) = false;
+  std::thread pull_waiter_expiry_thread_;
+
  private:
   class ControlPlaneHandlerImpl;
+  // A waiter taken out of the registry, with the answer to give it.
+  struct CompletedPull;
+
+  // Starts serving `req`: at once if its read is registered, otherwise once
+  // NotifyForRead registers it or the grace runs out, whichever is first.
+  // Never blocks. Returns an id for CancelPullStream if the pull was parked,
+  // or 0 if `done` has already run.
+  uint64_t BeginPullStream(const PullStreamRequestSpec& req,
+                           absl::string_view peer_ip, absl::Time deadline,
+                           ControlPlaneHandler::PullStreamDone done);
+  void CancelPullStream(uint64_t waiter_id);
+  // Validates `req` against `session` and claims its blocks. Returns the
+  // rejection message if the pull cannot be served.
+  std::optional<std::string> BeginPullLocked(
+      const PullStreamRequestSpec& req,
+      const std::shared_ptr<TransferSendSession>& session)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Launches the push for a pull BeginPullLocked accepted and returns the
+  // acknowledgement.
+  PullStreamResponseSpec LaunchPull(
+      const PullStreamRequestSpec& req, absl::string_view peer_ip,
+      const std::shared_ptr<TransferSendSession>& session);
+  // Removes a waiter from the registry; the caller completes it.
+  PullWaiter TakePullWaiterLocked(uint64_t waiter_id)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Takes every waiter for `uuid` and resolves it against `session`.
+  std::vector<CompletedPull> ResolvePullWaitersLocked(
+      uint64_t uuid, const std::shared_ptr<TransferSendSession>& session)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void FinishCompletedPulls(std::vector<CompletedPull> completed);
+  void PullWaiterExpiryLoop();
 
   void InitializeBaseHooks();
   void InitializeControlPlane();

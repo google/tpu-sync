@@ -93,7 +93,31 @@ double DurationMs(std::chrono::steady_clock::time_point start,
   return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+PullStreamResponseSpec RejectPull(std::string message) {
+  LOG(ERROR) << "Raiden producer rejected PullStream request: " << message;
+  return PullStreamResponseSpec{.status = -1, .message = std::move(message)};
+}
+
+PullStreamResponseSpec StoppingResponse() {
+  return PullStreamResponseSpec{
+      .status = -1, .message = "Producer control server is stopping"};
+}
+
+std::string NoRegistrationMessage(uint64_t uuid, absl::Duration waited) {
+  return absl::StrCat("no read registered for uuid ", uuid, " within ",
+                      absl::FormatDuration(waited),
+                      ": the producer expired it or never registered it");
+}
+
 }  // namespace
+
+struct KVCacheManagerWithTransfer::CompletedPull {
+  PullWaiter waiter;
+  // Set if the pull was accepted: LaunchPull, which must not run under mu_,
+  // produces the answer. Otherwise `response` is the answer.
+  std::shared_ptr<TransferSendSession> session;
+  PullStreamResponseSpec response;
+};
 
 void KVCacheManagerWithTransfer::InitializeBaseHooks() {
   kv_cache::KVCacheManagerBase::TransferEventHooks hooks;
@@ -418,6 +442,7 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
   }
   std::shared_ptr<TransferSendSession> session = *std::move(created);
 
+  std::vector<CompletedPull> resolved_pulls;
   {
     absl::MutexLock lock(mu_);
     if (pending_acks_.erase(uuid) > 0) {
@@ -429,8 +454,9 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
                  << " for req_id=" << req_id;
       return 0;
     }
+    resolved_pulls = ResolvePullWaitersLocked(uuid, session);
   }
-  cv_.SignalAll();
+  FinishCompletedPulls(std::move(resolved_pulls));
 
   std::ostringstream timing;
   timing << "RAIDEN_TIMING event=producer_register"
@@ -1288,6 +1314,16 @@ class KVCacheManagerWithTransfer::ControlPlaneHandlerImpl
     return manager_->HandlePullStream(req, fallback_peer_ip);
   }
 
+  uint64_t OnPullStreamAsync(const PullStreamRequestSpec& req,
+                             absl::string_view peer_ip, absl::Time deadline,
+                             PullStreamDone done) override {
+    return manager_->BeginPullStream(req, peer_ip, deadline, std::move(done));
+  }
+
+  void CancelPullStream(uint64_t id) override {
+    manager_->CancelPullStream(id);
+  }
+
   absl::Status OnAck(uint64_t uuid) override {
     return manager_->HandleAck(uuid);
   }
@@ -1314,6 +1350,10 @@ void KVCacheManagerWithTransfer::StartControlServer() {
   {
     absl::MutexLock lock(mu_);
     stopping_ = false;
+    pull_waiter_expiry_stop_ = false;
+  }
+  if (!pull_waiter_expiry_thread_.joinable()) {
+    pull_waiter_expiry_thread_ = std::thread([this] { PullWaiterExpiryLoop(); });
   }
   absl::StatusOr<int> bound_port = control_backend_->StartServer(
       local_control_port_, control_handler_.get());
@@ -1322,13 +1362,26 @@ void KVCacheManagerWithTransfer::StartControlServer() {
 }
 
 void KVCacheManagerWithTransfer::StopControlServer() {
+  std::vector<PullWaiter> abandoned;
   {
     absl::MutexLock lock(mu_);
     stopping_ = true;
+    pull_waiter_expiry_stop_ = true;
+    abandoned.reserve(pull_waiters_.size());
+    while (!pull_waiters_.empty()) {
+      abandoned.push_back(TakePullWaiterLocked(pull_waiters_.begin()->first));
+    }
   }
-  // Wake workers parked in HandlePullStream waiting for a send session that
-  // will never arrive, so their loops observe stopping_ and exit.
-  cv_.SignalAll();
+  pull_waiter_cv_.Signal();
+  if (pull_waiter_expiry_thread_.joinable()) {
+    pull_waiter_expiry_thread_.join();
+  }
+  // Answer parked pulls before stopping the server: a callback server's
+  // shutdown waits for every outstanding call to finish, and nothing else
+  // would finish these.
+  for (PullWaiter& waiter : abandoned) {
+    waiter.done(StoppingResponse());
+  }
   if (control_backend_) {
     control_backend_->StopServer();
   }
@@ -1337,71 +1390,156 @@ void KVCacheManagerWithTransfer::StopControlServer() {
 absl::StatusOr<PullStreamResponseSpec>
 KVCacheManagerWithTransfer::HandlePullStream(
     const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip) {
-  RAIDEN_TRACE_FN("KVTransfer::HandlePullStream", [&]() {
+  // For backends without an async server (TCP): holds the calling worker
+  // until the pull is answered, which BeginPullStream bounds by the grace.
+  struct Result {
+    absl::Mutex mu;
+    std::optional<absl::StatusOr<PullStreamResponseSpec>> value
+        ABSL_GUARDED_BY(mu);
+  };
+  auto result = std::make_shared<Result>();
+  BeginPullStream(req, fallback_peer_ip, absl::InfiniteFuture(),
+                  [result](absl::StatusOr<PullStreamResponseSpec> answer) {
+                    absl::MutexLock lock(result->mu);
+                    result->value = std::move(answer);
+                  });
+  absl::MutexLock lock(result->mu);
+  result->mu.Await(absl::Condition(
+      +[](std::optional<absl::StatusOr<PullStreamResponseSpec>>* value) {
+        return value->has_value();
+      },
+      &result->value));
+  return *std::move(result->value);
+}
+
+uint64_t KVCacheManagerWithTransfer::BeginPullStream(
+    const PullStreamRequestSpec& req, absl::string_view peer_ip,
+    absl::Time deadline, ControlPlaneHandler::PullStreamDone done) {
+  RAIDEN_TRACE_FN("KVTransfer::BeginPullStream", [&]() {
     return absl::StrCat("uuid=", req.uuid,
                         " blocks=", req.src_block_ids.size());
   });
+  const uint64_t block_capacity = MaxPullStreamBlocks();
+  if (req.src_block_ids.size() > block_capacity) {
+    done(RejectPull(absl::StrCat("pull stream block count ",
+                                 req.src_block_ids.size(),
+                                 " exceeds configured maximum ",
+                                 block_capacity)));
+    return 0;
+  }
+
+  std::shared_ptr<TransferSendSession> session;
+  PullStreamResponseSpec response;
+  {
+    absl::MutexLock lock(mu_);
+    if (stopping_.load()) {
+      response = StoppingResponse();
+    } else if (auto it = send_sessions_.find(req.uuid);
+               it != send_sessions_.end()) {
+      std::optional<std::string> rejection = BeginPullLocked(req, it->second);
+      if (rejection.has_value()) {
+        response = RejectPull(*std::move(rejection));
+      } else {
+        session = it->second;
+      }
+    } else {
+      // The read is not registered yet. Park the pull as an entry rather
+      // than waiting here, so it holds no thread while the producer catches
+      // up with the announcement the consumer acted on.
+      const absl::Time now = absl::Now();
+      const absl::Time give_up = std::min(
+          now + std::min(kPullRegistrationGrace, absl::Seconds(timeout_s_)),
+          deadline);
+      const std::string peer(peer_ip);
+      auto from_peer = pull_waiters_per_peer_.find(peer);
+      const size_t parked_from_peer =
+          from_peer == pull_waiters_per_peer_.end() ? 0 : from_peer->second;
+      if (give_up <= now) {
+        response = RejectPull(NoRegistrationMessage(req.uuid, give_up - now));
+      } else if (parked_from_peer >= kMaxPullWaitersPerPeer) {
+        response = RejectPull(absl::StrCat(
+            "too many pulls from ", peer, " waiting for their reads to be "
+            "registered (limit ", kMaxPullWaitersPerPeer, ")"));
+      } else if (pull_waiters_.size() >= kMaxPullWaiters) {
+        response = RejectPull(absl::StrCat(
+            "too many pulls waiting for their reads to be registered (limit ",
+            kMaxPullWaiters, ")"));
+      } else {
+        const uint64_t id = next_pull_waiter_id_++;
+        pull_waiters_.emplace(id, PullWaiter{.req = req,
+                                             .peer_ip = peer,
+                                             .give_up = give_up,
+                                             .wait = give_up - now,
+                                             .done = std::move(done)});
+        pull_waiters_by_uuid_[req.uuid].push_back(id);
+        ++pull_waiters_per_peer_[peer];
+        if (give_up < pull_waiter_wake_at_) {
+          pull_waiter_cv_.Signal();
+        }
+        return id;
+      }
+    }
+  }
+  if (session) {
+    response = LaunchPull(req, peer_ip, session);
+  }
+  done(std::move(response));
+  return 0;
+}
+
+void KVCacheManagerWithTransfer::CancelPullStream(uint64_t waiter_id) {
+  PullWaiter waiter;
+  {
+    absl::MutexLock lock(mu_);
+    if (!pull_waiters_.contains(waiter_id)) {
+      return;
+    }
+    waiter = TakePullWaiterLocked(waiter_id);
+  }
+  VLOG(1) << "Consumer abandoned PullStream for uuid=" << waiter.req.uuid
+          << " while it waited for registration";
+  waiter.done(PullStreamResponseSpec{
+      .status = -1,
+      .message = absl::StrCat("pull for uuid ", waiter.req.uuid,
+                              " was cancelled by the consumer")});
+}
+
+std::optional<std::string> KVCacheManagerWithTransfer::BeginPullLocked(
+    const PullStreamRequestSpec& req,
+    const std::shared_ptr<TransferSendSession>& session) {
   try {
-    const uint64_t block_capacity = MaxPullStreamBlocks();
-    if (req.src_block_ids.size() > block_capacity) {
-      throw std::invalid_argument(
-          absl::StrCat("pull stream block count ", req.src_block_ids.size(),
-                       " exceeds configured maximum ", block_capacity));
-    }
+    // Registration guards prevent a live session from being replaced, so an
+    // expired session cannot become valid while a pull waits out the grace.
+    session->ValidateAndBeginPull(req.src_block_ids,
+                                  std::chrono::steady_clock::now());
+  } catch (const std::exception& e) {
+    return std::string(e.what());
+  }
+  return std::nullopt;
+}
 
-    const absl::Duration grace =
-        std::min(kPullRegistrationGrace, absl::Seconds(timeout_s_));
-    std::shared_ptr<TransferSendSession> session;
-    {
-      absl::MutexLock lock(mu_);
-      const absl::Time give_up = absl::Now() + grace;
-      while (true) {
-        auto it = send_sessions_.find(req.uuid);
-        if (it != send_sessions_.end()) {
-          session = it->second;
-          break;
-        }
-        const absl::Duration left = give_up - absl::Now();
-        if (stopping_.load() || left <= absl::ZeroDuration()) {
-          break;
-        }
-        cv_.WaitWithTimeout(&mu_, left);
-      }
-      if (stopping_.load()) {
-        return PullStreamResponseSpec{
-            .status = -1, .message = "Producer control server is stopping"};
-      }
-      if (!session) {
-        throw std::runtime_error(
-            absl::StrCat("no read registered for uuid ", req.uuid, " within ",
-                         absl::FormatDuration(grace),
-                         ": the producer expired it or never registered it"));
-      }
-      // Registration guards prevent a live session from being replaced, so an
-      // expired session cannot become valid while this pull waits out the
-      // grace.
-      session->ValidateAndBeginPull(req.src_block_ids,
-                                    std::chrono::steady_clock::now());
-    }
-
+PullStreamResponseSpec KVCacheManagerWithTransfer::LaunchPull(
+    const PullStreamRequestSpec& req, absl::string_view peer_ip,
+    const std::shared_ptr<TransferSendSession>& session) {
+  try {
     std::vector<std::string> peer_ips = req.consumer_ips;
     if (peer_ips.empty()) {
       if (control_backend_->Name() != "tcp") {
         LOG(WARNING) << "No consumer IPs specified in PullStreamRequest.";
       }
-      if (!fallback_peer_ip.empty()) {
-        peer_ips.push_back(std::string(fallback_peer_ip));
+      if (!peer_ip.empty()) {
+        peer_ips.push_back(std::string(peer_ip));
       }
     }
 
     std::vector<std::string> remote_data_endpoints;
-    for (const auto& peer_ip : peer_ips) {
-      if (absl::StrContains(peer_ip, ':')) {
+    for (const auto& ip : peer_ips) {
+      if (absl::StrContains(ip, ':')) {
         remote_data_endpoints.push_back(
-            absl::StrCat("[", peer_ip, "]:", req.consumer_data_port));
+            absl::StrCat("[", ip, "]:", req.consumer_data_port));
       } else {
         remote_data_endpoints.push_back(
-            absl::StrCat(peer_ip, ":", req.consumer_data_port));
+            absl::StrCat(ip, ":", req.consumer_data_port));
       }
     }
 
@@ -1430,13 +1568,97 @@ KVCacheManagerWithTransfer::HandlePullStream(
         .message = "",
     };
   } catch (const std::exception& e) {
-    LOG(ERROR) << "Raiden producer rejected PullStream request: " << e.what();
-    return PullStreamResponseSpec{
-        .status = -1,
-        .num_layers = 0,
-        .data_port = 0,
-        .message = e.what(),
-    };
+    return RejectPull(e.what());
+  }
+}
+
+KVCacheManagerWithTransfer::PullWaiter
+KVCacheManagerWithTransfer::TakePullWaiterLocked(uint64_t waiter_id) {
+  auto node = pull_waiters_.extract(waiter_id);
+  PullWaiter waiter = std::move(node.mapped());
+  auto by_uuid = pull_waiters_by_uuid_.find(waiter.req.uuid);
+  if (by_uuid != pull_waiters_by_uuid_.end()) {
+    std::erase(by_uuid->second, waiter_id);
+    if (by_uuid->second.empty()) {
+      pull_waiters_by_uuid_.erase(by_uuid);
+    }
+  }
+  auto from_peer = pull_waiters_per_peer_.find(waiter.peer_ip);
+  if (from_peer != pull_waiters_per_peer_.end() && --from_peer->second == 0) {
+    pull_waiters_per_peer_.erase(from_peer);
+  }
+  return waiter;
+}
+
+std::vector<KVCacheManagerWithTransfer::CompletedPull>
+KVCacheManagerWithTransfer::ResolvePullWaitersLocked(
+    uint64_t uuid, const std::shared_ptr<TransferSendSession>& session) {
+  std::vector<CompletedPull> completed;
+  auto by_uuid = pull_waiters_by_uuid_.find(uuid);
+  if (by_uuid == pull_waiters_by_uuid_.end()) {
+    return completed;
+  }
+  const std::vector<uint64_t> ids = by_uuid->second;
+  completed.reserve(ids.size());
+  for (uint64_t id : ids) {
+    CompletedPull pull{.waiter = TakePullWaiterLocked(id)};
+    std::optional<std::string> rejection =
+        BeginPullLocked(pull.waiter.req, session);
+    if (rejection.has_value()) {
+      pull.response = RejectPull(*std::move(rejection));
+    } else {
+      pull.session = session;
+    }
+    completed.push_back(std::move(pull));
+  }
+  return completed;
+}
+
+void KVCacheManagerWithTransfer::FinishCompletedPulls(
+    std::vector<CompletedPull> completed) {
+  for (CompletedPull& pull : completed) {
+    if (pull.session) {
+      pull.response =
+          LaunchPull(pull.waiter.req, pull.waiter.peer_ip, pull.session);
+    }
+    pull.waiter.done(std::move(pull.response));
+  }
+}
+
+void KVCacheManagerWithTransfer::PullWaiterExpiryLoop() {
+  while (true) {
+    std::vector<PullWaiter> expired;
+    {
+      absl::MutexLock lock(mu_);
+      while (!pull_waiter_expiry_stop_) {
+        const absl::Time now = absl::Now();
+        absl::Time next = absl::InfiniteFuture();
+        std::vector<uint64_t> expired_ids;
+        for (const auto& [id, waiter] : pull_waiters_) {
+          if (waiter.give_up <= now) {
+            expired_ids.push_back(id);
+          } else {
+            next = std::min(next, waiter.give_up);
+          }
+        }
+        for (uint64_t id : expired_ids) {
+          expired.push_back(TakePullWaiterLocked(id));
+        }
+        if (!expired.empty()) {
+          break;
+        }
+        pull_waiter_wake_at_ = next;
+        pull_waiter_cv_.WaitWithDeadline(&mu_, next);
+        pull_waiter_wake_at_ = absl::InfiniteFuture();
+      }
+      if (expired.empty()) {
+        return;
+      }
+    }
+    for (PullWaiter& waiter : expired) {
+      waiter.done(RejectPull(NoRegistrationMessage(waiter.req.uuid,
+                                                   waiter.wait)));
+    }
   }
 }
 

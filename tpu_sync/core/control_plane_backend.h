@@ -55,6 +55,9 @@ struct PullStreamResponseSpec {
 // incoming control plane requests from remote consumers.
 class ControlPlaneHandler {
  public:
+  using PullStreamDone =
+      std::function<void(absl::StatusOr<PullStreamResponseSpec>)>;
+
   virtual ~ControlPlaneHandler() = default;
 
   // Handles an incoming PullStream request. Application/validation rejections
@@ -63,6 +66,29 @@ class ControlPlaneHandler {
   // Non-OK absl::Status is reserved for unrecoverable internal handler faults.
   virtual absl::StatusOr<PullStreamResponseSpec> OnPullStream(
       const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip) = 0;
+
+  // Handles a PullStream request without blocking the calling thread, and
+  // invokes `done` exactly once with what OnPullStream would have returned.
+  // `done` may run inline or later on another thread. `peer_ip` is the
+  // address the request arrived from; `deadline` is when the caller stops
+  // waiting for an answer.
+  //
+  // Returns an id for CancelPullStream, or 0 if there is nothing to cancel
+  // (for instance because `done` has already run). The default runs
+  // OnPullStream inline, so a handler whose OnPullStream can wait must
+  // override this.
+  virtual uint64_t OnPullStreamAsync(const PullStreamRequestSpec& req,
+                                     absl::string_view peer_ip,
+                                     absl::Time deadline,
+                                     PullStreamDone done) {
+    done(OnPullStream(req, peer_ip));
+    return 0;
+  }
+
+  // Abandons a request OnPullStreamAsync left pending: its `done` runs with
+  // a rejection if it has not run yet. Ids that are unknown or already
+  // completed are ignored.
+  virtual void CancelPullStream(uint64_t id) {}
 
   // Handles an incoming empty pull stream / Ack notification (calls AckSend).
   virtual absl::Status OnAck(uint64_t uuid) = 0;

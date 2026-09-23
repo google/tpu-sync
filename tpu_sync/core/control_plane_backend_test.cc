@@ -308,6 +308,50 @@ TEST_P(ControlPlaneBackendTest, TimeoutWhenServerDelaysBeyondClientTimeout) {
   server->StopServer();
 }
 
+// The `timeout` argument to SendPullRequest bounds the whole call, not each
+// step inside it: however the peer behaves, the caller gets its worker back
+// within it. Asserted against both backends because the promise belongs to the
+// ControlPlaneBackend interface rather than to either transport, so a backend
+// swap cannot quietly drop it.
+TEST_P(ControlPlaneBackendTest, PullRequestDeadlineBoundsTheWholeCall) {
+  constexpr absl::Duration kDeadline = absl::Milliseconds(300);
+  MockControlPlaneHandler handler;
+  handler.SetPullStreamCallback(
+      [](const PullStreamRequestSpec& req, absl::string_view fallback_ip) {
+        absl::SleepFor(absl::Seconds(3));
+        return PullStreamResponseSpec{
+            .status = 0,
+            .num_layers = 4,
+            .data_port = 50000,
+            .message = "",
+        };
+      });
+
+  auto server = CreateControlPlaneBackend(GetParam(), AsyncTestExecutor());
+  absl::StatusOr<int> bound_port = server->StartServer(0, &handler);
+  ASSERT_TRUE(bound_port.ok()) << bound_port.status();
+
+  auto client = CreateControlPlaneBackend(GetParam());
+  std::string endpoint = absl::StrCat("127.0.0.1:", *bound_port);
+
+  PullStreamRequestSpec req;
+  req.uuid = 222;
+  req.src_block_ids = {1};
+  req.dst_block_ids = {1};
+
+  const absl::Time start = absl::Now();
+  absl::StatusOr<PullStreamResponseSpec> response =
+      client->SendPullRequest(endpoint, req, kDeadline);
+  const absl::Duration elapsed = absl::Now() - start;
+
+  EXPECT_FALSE(response.ok());
+  EXPECT_TRUE(absl::IsDeadlineExceeded(response.status())) << response.status();
+  EXPECT_LT(elapsed, 5 * kDeadline)
+      << "SendPullRequest held its caller for " << elapsed
+      << " against a deadline of " << kDeadline;
+  server->StopServer();
+}
+
 TEST_P(ControlPlaneBackendTest, ConcurrentRequestsOverSharedBackend) {
   MockControlPlaneHandler handler;
   std::atomic<int> total_pulls{0};

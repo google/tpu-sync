@@ -1134,7 +1134,45 @@ NB_MODULE(_tpu_raiden_torch, m) {
                py_pending.push_back(nb::bytes(h.data(), h.size()));
              }
              return std::make_tuple(py_done, py_failed, py_pending);
-           });
+           })
+      .def(
+          "set_eviction_callback",
+          [](tpu_raiden::kv_cache::KVCacheStoreWrapper& self,
+             nb::object py_cb) {
+            if (py_cb.is_none()) {
+              self->SetEvictionCallback(nullptr);
+              return;
+            }
+            nb::callable cb_callable = nb::cast<nb::callable>(py_cb);
+            // The callback outlives this call and is released by whichever
+            // thread drops it last -- possibly the background eviction
+            // thread, which holds no GIL. Own the handle through a deleter
+            // that takes the GIL, so its refcount is only touched with the
+            // GIL held; copying the shared_ptr itself is GIL-free.
+            auto callable = std::shared_ptr<nb::callable>(
+                new nb::callable(std::move(cb_callable)),
+                [](nb::callable* held) {
+                  nb::gil_scoped_acquire acquire;
+                  delete held;
+                });
+            self->SetEvictionCallback(
+                [callable = std::move(callable)](
+                    absl::Span<const std::string> evicted) {
+                  nb::gil_scoped_acquire acquire;
+                  std::vector<nb::bytes> py_evicted;
+                  py_evicted.reserve(evicted.size());
+                  for (const auto& h : evicted) {
+                    py_evicted.push_back(nb::bytes(h.data(), h.size()));
+                  }
+                  try {
+                    (*callable)(py_evicted);
+                  } catch (...) {
+                    // Ignore Python exceptions to avoid terminating host
+                    // process.
+                  }
+                });
+          },
+          nb::arg("callback"));
 
   // C++-owned reshard client. The facade-compatible surface is provided by
   // tpu_raiden/api/torch/reshard_client.py on top of this binding.

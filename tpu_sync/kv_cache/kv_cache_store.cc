@@ -23,7 +23,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <thread>  // NOLINT(build/c++11)
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -48,10 +47,8 @@
 #include "grpcpp/security/credentials.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
-#include "tpu_sync/core/buffer.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/host_memory_allocator.h"
-#include "tpu_sync/kv_cache/completion_executor.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
@@ -1721,6 +1718,22 @@ KVCacheStore::PollRemoteReadStatus() {
   PollLoadStatusResult res = PollLoadStatus();
   return std::make_tuple(std::move(res.done), std::move(res.failed),
                          std::move(res.pending));
+}
+
+void KVCacheStore::SetEvictionCallback(EvictionCallback callback) {
+  std::shared_ptr<const EvictionCallback> next;
+  if (callback != nullptr) {
+    next = std::make_shared<const EvictionCallback>(std::move(callback));
+  }
+  // Keeps the outgoing callback alive past the unlock. Destroying it here
+  // rather than under mutex_ matters for language bindings: the previous
+  // target may own a Python handle whose release needs the GIL, and this
+  // thread is the one that owns it.
+  std::shared_ptr<const EvictionCallback> previous;
+  {
+    absl::MutexLock lock(mutex_);
+    previous = std::exchange(eviction_callback_, std::move(next));
+  }
 }
 
 absl::StatusOr<size_t> KVCacheStore::RecoverFromLocalManifest() {

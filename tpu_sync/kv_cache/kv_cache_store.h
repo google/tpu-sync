@@ -29,6 +29,7 @@
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -441,6 +442,24 @@ class KVCacheStore {
   using PollLoadStatusResult = BlockTracker::StatusResult;
   PollLoadStatusResult PollLoadStatus();
 
+  // Registers a callback invoked whenever blocks are evicted from the host
+  // LRU cache, or clears it when `callback` is empty.
+  //
+  // The callback is move-only, so it may own its state outright (e.g. capture
+  // a std::unique_ptr) rather than being forced into shared or copyable
+  // captures.
+  //
+  // Threading contract:
+  //   - It runs on whichever thread performed the eviction, which includes the
+  //     background sweep thread, not just the caller of Evict().
+  //   - It is invoked with no KVCacheStore lock held, so it may call back into
+  //     the store, including SetEvictionCallback to unregister itself.
+  //   - Registration and invocation may race: a callback replaced concurrently
+  //     with an eviction can still see one final notification.
+  using EvictionCallback =
+      absl::AnyInvocable<void(absl::Span<const std::string>) const>;
+  void SetEvictionCallback(EvictionCallback callback);
+
   // Launches an async receiver-initiated read of REMOTE blocks from their
   // owning peers straight into local HBM. Returns as soon as the reads are
   // issued; poll with PollRemoteReadStatus().
@@ -569,6 +588,10 @@ class KVCacheStore {
       const std::vector<std::string>& batch);
 
   mutable absl::Mutex mutex_;
+  // Held by pointer so an eviction can snapshot it under mutex_ and invoke it
+  // after unlocking: the callback must never run while a store lock is held.
+  std::shared_ptr<const EvictionCallback> eviction_callback_
+      ABSL_GUARDED_BY(mutex_);
   std::vector<std::shared_ptr<KVCacheStoreBackend>> backends_;
   std::vector<BackendConfig> backend_configs_;
   std::shared_ptr<global_registry::GlobalRegistryClient> registry_client_;

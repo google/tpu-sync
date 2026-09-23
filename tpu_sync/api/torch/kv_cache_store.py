@@ -14,7 +14,7 @@
 
 """Raiden KV Cache Store API for PyTorch."""
 
-from typing import Any
+from typing import Any, Callable
 
 from tpu_sync.api.torch import torch_tpu_common_loader
 
@@ -496,6 +496,17 @@ class KVCacheStore:
         pending: List of block hashes whose Load transfer is still in progress.
     """
     return self._impl.poll_load_status()
+
+  def set_eviction_callback(
+      self, callback: Callable[[list[bytes]], None] | None
+  ) -> None:
+    """Registers a callback invoked upon host LRU cache eviction.
+
+    Args:
+      callback: Function called with the list of evicted block hashes, or None
+        to unregister.
+    """
+    self._impl.set_eviction_callback(callback)
 
   def read_remote(
       self,

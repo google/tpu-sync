@@ -270,6 +270,23 @@ TEST(KVCacheStoreTest, EvictionTracking) {
   EXPECT_EQ(PeekLookup(controller, {"103"})->size(), 1);
 }
 
+TEST(KVCacheStoreTest, SetEvictionCallback) {
+  KVCacheStore controller(2, "", {}, /*num_shards=*/1,
+                          /*shard_size_bytes=*/512,
+                          /*store_server_ip=*/"127.0.0.1");
+
+  controller.SetEvictionCallback([](absl::Span<const std::string>) {});
+
+  // The callback is move-only, so it can own its state outright instead of
+  // being forced into a copyable capture.
+  auto owned_state = std::make_unique<int>(0);
+  controller.SetEvictionCallback(
+      [state = std::move(owned_state)](absl::Span<const std::string>) {});
+
+  // Passing an empty callback unregisters whatever was registered before.
+  controller.SetEvictionCallback(nullptr);
+}
+
 TEST(KVCacheStoreTest, GlobalLookupFallback) {
   // 1. Start a local registry server
   auto reg_server = global_registry::CreateTestGlobalRegistryServer();

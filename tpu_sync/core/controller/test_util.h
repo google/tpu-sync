@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
@@ -34,6 +35,7 @@
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
+#include "xla/tsl/platform/test.h"
 #include "tpu_sync/core/controller/controller_client.h"
 #include "tpu_sync/core/controller/controller_service.h"
 #include "tpu_sync/core/controller/worker_service_client.h"
@@ -43,6 +45,35 @@
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
+
+namespace tpu_raiden {
+namespace test_util_internal {
+
+// Starts `service` on an unused port allocated via
+// `tsl::testing::PickUnusedPortOrDie()`, retrying up to 5 times if the port is
+// claimed before `BuildAndStart()` binds it.
+inline std::unique_ptr<grpc::Server> StartOnPrivateEphemeralPort(
+    grpc::Service* service, int* selected_port) {
+  constexpr int kMaxBindAttempts = 5;
+  for (int attempt = 0; attempt < kMaxBindAttempts; ++attempt) {
+    const int port = tsl::testing::PickUnusedPortOrDie();
+    grpc::ServerBuilder builder;
+    int bound_port = 0;
+    builder.AddListeningPort(absl::StrCat("localhost:", port),
+                             grpc::InsecureServerCredentials(), &bound_port);
+    builder.RegisterService(service);
+    std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+    if (server != nullptr && bound_port == port) {
+      *selected_port = bound_port;
+      return server;
+    }
+  }
+  *selected_port = 0;
+  return nullptr;
+}
+
+}  // namespace test_util_internal
+}  // namespace tpu_raiden
 
 namespace tpu_raiden {
 namespace controller {
@@ -345,17 +376,15 @@ struct TestWorkerServer {
 };
 
 // Creates and starts an in-process gRPC TestWorkerServer hosting
-// WorkerServiceImpl on an ephemeral port.
+// WorkerServiceImpl on an unused port.
 inline std::unique_ptr<TestWorkerServer> CreateTestWorkerServer() {
   auto test_server = std::make_unique<TestWorkerServer>();
   test_server->service = std::make_unique<WorkerServiceImpl>();
 
-  grpc::ServerBuilder builder;
   int selected_port = 0;
-  builder.AddListeningPort("localhost:0", grpc::InsecureServerCredentials(),
-                           &selected_port);
-  builder.RegisterService(test_server->service.get());
-  test_server->server = builder.BuildAndStart();
+  test_server->server = test_util_internal::StartOnPrivateEphemeralPort(
+      test_server->service.get(), &selected_port);
+  CHECK(test_server->server != nullptr) << "Failed to bind a TestWorkerServer";
 
   test_server->server_address = absl::StrCat("localhost:", selected_port);
   test_server->channel = grpc::CreateChannel(
@@ -389,18 +418,17 @@ struct TestControllerServer {
 };
 
 // Creates and starts an in-process gRPC TestControllerServer hosting
-// RaidenControllerServiceImpl on an ephemeral port.
+// RaidenControllerServiceImpl on an unused port.
 inline std::unique_ptr<TestControllerServer> CreateTestControllerServer() {
   auto test_server = std::make_unique<TestControllerServer>();
   test_server->service =
       std::make_unique<RaidenControllerServiceImpl>();
 
-  grpc::ServerBuilder builder;
   int selected_port = 0;
-  builder.AddListeningPort("localhost:0", grpc::InsecureServerCredentials(),
-                           &selected_port);
-  builder.RegisterService(test_server->service.get());
-  test_server->server = builder.BuildAndStart();
+  test_server->server = test_util_internal::StartOnPrivateEphemeralPort(
+      test_server->service.get(), &selected_port);
+  CHECK(test_server->server != nullptr)
+      << "Failed to bind a TestControllerServer";
 
   test_server->server_address = absl::StrCat("localhost:", selected_port);
   test_server->channel = grpc::CreateChannel(

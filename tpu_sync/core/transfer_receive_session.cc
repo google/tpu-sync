@@ -482,8 +482,7 @@ void TransferReceiveSession::ExecutePullRequest(
 
           absl::StatusOr<PullStreamResponseSpec> response =
               manager.control_backend_->SendPullRequest(
-                  remote_endpoint, req_spec,
-                  absl::Seconds(manager.control_timeout_s_));
+                  remote_endpoint, req_spec, absl::Seconds(manager.timeout_s_));
           CheckStatus("control pull request", response.status());
           if (response->status != 0) {
             throw std::runtime_error(absl::StrCat(

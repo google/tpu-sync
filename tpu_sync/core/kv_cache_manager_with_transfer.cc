@@ -72,23 +72,6 @@ constexpr absl::Duration kPendingWorkTimeout = absl::Seconds(30);
 // registration expired, or never happened, is rejected once it lapses.
 constexpr absl::Duration kPullRegistrationGrace = absl::Seconds(5);
 
-// Room above kPullRegistrationGrace for the rest of a handshake once the
-// producer has registered. Deriving the control deadline from the grace
-// rather than picking a number keeps the two from drifting apart: a deadline
-// at or below the grace would be a dead heat with the producer's own
-// legitimate wait, turning ordinary reordering between the announcement and
-// the registration into a hard failure instead of something waited through.
-constexpr absl::Duration kControlDeadlineSlack = absl::Seconds(5);
-
-// Bound on one control handshake, end to end, unless the caller's transfer
-// budget is tighter. A handshake is a few hundred bytes and a round trip; it
-// has no business inheriting the bulk-transfer timeout, because until it
-// returns it is holding one of a small number of workers.
-double DeriveControlTimeoutS(double timeout_s) {
-  return absl::ToDoubleSeconds(std::min(
-      absl::Seconds(timeout_s), kPullRegistrationGrace + kControlDeadlineSlack));
-}
-
 [[noreturn]] void ThrowStatus(const std::string& context,
                               const absl::Status& status) {
   if (status.code() == absl::StatusCode::kInvalidArgument) {
@@ -386,7 +369,6 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       local_control_port_(static_cast<int>(local_control_port)),
       local_data_port_(0),
       timeout_s_(timeout_s),
-      control_timeout_s_(DeriveControlTimeoutS(timeout_s)),
       metrics_collector_(std::move(metrics_collector)) {
   InitializeBaseHooks();
   InitializeControlPlane();
@@ -1323,12 +1305,9 @@ void KVCacheManagerWithTransfer::InitializeControlPlane() {
   auto executor = [this](std::function<void()> task) {
     base_->pull_pool()->Schedule(base_->assigned_numa_node(), std::move(task));
   };
-  // The inbound side gets the same short bound as the outbound one: a handler
-  // reading a request off a stalled consumer is holding a pull-pool worker for
-  // as long as it blocks, which is the same defect seen from the other end.
-  control_backend_ = CreateControlPlaneBackend(
-      ResolveControlPlaneBackendType(), std::move(executor),
-      absl::Seconds(control_timeout_s_));
+  control_backend_ =
+      CreateControlPlaneBackend(ResolveControlPlaneBackendType(),
+                                std::move(executor), absl::Seconds(timeout_s_));
 }
 
 void KVCacheManagerWithTransfer::StartControlServer() {

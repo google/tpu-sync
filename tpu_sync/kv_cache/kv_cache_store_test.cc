@@ -5197,6 +5197,40 @@ TEST_F(RemoteWriteSourceTest, StreamBrokenMidFlightRecoversViaWaitingPoll) {
       << "Recovery must issue exactly one PollWriteRemote call";
 }
 
+TEST_F(RemoteWriteSourceTest,
+       RecoveryPollSettlesWhenDestinationIsUnresolvable) {
+  RaidenId src{"rw_src_inline_poll", "0", "kv", 0};
+  RaidenId dst{"rw_dst_inline_poll", "0", "kv", 0};
+  auto src_store = MakeStore(src);
+  Populate(*src_store, src, {"a"});
+  StartFakeDestination(dst);
+
+  proto::PollWriteRemoteResponse pending_verdict;
+  pending_verdict.set_state(proto::PollWriteRemoteResponse::PENDING);
+  fake_destination_.SetPollResponse(pending_verdict);
+
+  ABSL_ASSERT_OK(src_store->Save({"a"}, dst));
+  ASSERT_EQ(fake_destination_.open_streams(), 1);
+  ASSERT_EQ(src_store->GetPinCount("a"), 2);
+
+  // Force PollWriteRemoteAsync to return an already-resolved future
+  // deterministically so poll_future.OnReady runs inline on the caller thread.
+  auto backend =
+      std::dynamic_pointer_cast<HostOffloadBackend>(src_store->backend());
+  ASSERT_NE(backend, nullptr);
+  backend->InvalidateStoreClient(dst);
+  ABSL_ASSERT_OK(client_->UnregisterStore(dst));
+
+  fake_destination_.BreakActiveStreams(::grpc::Status(
+      ::grpc::StatusCode::UNAVAILABLE, "Stream broken mid-flight"));
+
+  auto [done, failed, existing, unregistered] = AwaitWriteSettled(*src_store);
+  EXPECT_TRUE(done.empty());
+  EXPECT_THAT(failed, ::testing::UnorderedElementsAre("a"));
+  EXPECT_EQ(fake_destination_.poll_calls(), 0);
+  EXPECT_EQ(src_store->GetPinCount("a"), 1);
+}
+
 // A stream that breaks during teardown issues no recovery ask: the
 // destructor's take wins the operation, so the break finds nothing to act on.
 TEST_F(RemoteWriteSourceTest,

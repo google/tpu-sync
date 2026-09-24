@@ -870,75 +870,33 @@ HostOffloadBackend::BeginWriteRemote(
                        hashes = std::move(hashes), hold_expiry,
                        op_id = ack.operation_id](
                           absl::StatusOr<proto::WriteRemoteResult> result_or) {
-    absl::MutexLock lock(lifetime->mu);
-    if (!lifetime->is_alive) {
-      return;
-    }
-    if (!result_or.ok() &&
-        result_or.status().code() == absl::StatusCode::kCancelled) {
-      return;
-    }
-    // Release, then publish the verdict -- never the other way round. A
-    // waiter is woken by the verdict, and the evict sweep's eviction skips
-    // pinned blocks, so a verdict that outran the release would leave the
-    // sweep freeing nothing and abandoning its episode.
-    if (result_or.ok()) {
-      const auto& result = *result_or;
-      const bool succeeded =
-          (result.state() == proto::PollWriteRemoteResponse::COMMITTED ||
-           result.state() == proto::PollWriteRemoteResponse::ALL_EXIST);
-      Release(hashes);
-      if (succeeded) {
-        // A successful save also consumes the caller's pin.
-        Release(hashes);
+    // Register OnReady after releasing lifetime->mu in case poll_future is
+    // already resolved.
+    tsl::Future<proto::PollWriteRemoteResponse> poll_future;
+    {
+      absl::ReaderMutexLock lock(lifetime->mu);
+      if (!lifetime->is_alive) {
+        return;
       }
-      switch (result.state()) {
-        case proto::PollWriteRemoteResponse::COMMITTED:
-        case proto::PollWriteRemoteResponse::ALL_EXIST:
-          save_tracker->MarkDone(hashes);
-          break;
-        case proto::PollWriteRemoteResponse::PARTIAL_EXIST:
-          save_tracker->MarkFailedWithExisting(
-              hashes,
-              std::vector<std::string>(result.existing_hashes().begin(),
-                                       result.existing_hashes().end()));
-          break;
-        case proto::PollWriteRemoteResponse::STORED_UNREGISTERED:
-          save_tracker->MarkFailedWithUnregistered(
-              hashes,
-              std::vector<std::string>(result.unregistered_hashes().begin(),
-                                       result.unregistered_hashes().end()));
-          break;
-        default:
-          save_tracker->MarkFailed(hashes);
-          break;
+      if (!result_or.ok() &&
+          result_or.status().code() == absl::StatusCode::kCancelled) {
+        return;
       }
-      return;
-    }
-
-    const absl::Duration remaining_hold = *hold_expiry - absl::Now();
-    if (op_id != 0 && remaining_hold > absl::ZeroDuration()) {
-      auto fut = PollWriteRemoteAsync(
-          dst_raiden_id, op_id, absl::ToInt64Milliseconds(remaining_hold));
-      fut.OnReady([this, lifetime, save_tracker, hashes](
-                      absl::StatusOr<proto::PollWriteRemoteResponse> resp) {
-        absl::MutexLock lock(lifetime->mu);
-        if (!lifetime->is_alive) {
-          return;
-        }
-        const bool poll_succeeded =
-            resp.ok() &&
-            (resp->state() == proto::PollWriteRemoteResponse::COMMITTED ||
-             resp->state() == proto::PollWriteRemoteResponse::ALL_EXIST);
+      // Release, then publish the verdict -- never the other way round. A
+      // waiter is woken by the verdict, and the evict sweep's eviction skips
+      // pinned blocks, so a verdict that outran the release would leave the
+      // sweep freeing nothing and abandoning its episode.
+      if (result_or.ok()) {
+        const auto& result = *result_or;
+        const bool succeeded =
+            (result.state() == proto::PollWriteRemoteResponse::COMMITTED ||
+             result.state() == proto::PollWriteRemoteResponse::ALL_EXIST);
         Release(hashes);
-        if (poll_succeeded) {
+        if (succeeded) {
+          // A successful save also consumes the caller's pin.
           Release(hashes);
         }
-        if (!resp.ok()) {
-          save_tracker->MarkFailed(hashes);
-          return;
-        }
-        switch (resp->state()) {
+        switch (result.state()) {
           case proto::PollWriteRemoteResponse::COMMITTED:
           case proto::PollWriteRemoteResponse::ALL_EXIST:
             save_tracker->MarkDone(hashes);
@@ -946,24 +904,75 @@ HostOffloadBackend::BeginWriteRemote(
           case proto::PollWriteRemoteResponse::PARTIAL_EXIST:
             save_tracker->MarkFailedWithExisting(
                 hashes,
-                std::vector<std::string>(resp->existing_hashes().begin(),
-                                         resp->existing_hashes().end()));
+                std::vector<std::string>(result.existing_hashes().begin(),
+                                         result.existing_hashes().end()));
             break;
           case proto::PollWriteRemoteResponse::STORED_UNREGISTERED:
             save_tracker->MarkFailedWithUnregistered(
                 hashes,
-                std::vector<std::string>(resp->unregistered_hashes().begin(),
-                                         resp->unregistered_hashes().end()));
+                std::vector<std::string>(result.unregistered_hashes().begin(),
+                                         result.unregistered_hashes().end()));
             break;
           default:
             save_tracker->MarkFailed(hashes);
             break;
         }
-      });
-      return;
+        return;
+      }
+
+      const absl::Duration remaining_hold = *hold_expiry - absl::Now();
+      if (op_id == 0 || remaining_hold <= absl::ZeroDuration()) {
+        // No operation to chase, or the destination's hold has lapsed.
+        Release(hashes);
+        save_tracker->MarkFailed(hashes);
+        return;
+      }
+      // Started while holding the lock, so `this` cannot be destroyed under us.
+      poll_future = PollWriteRemoteAsync(
+          dst_raiden_id, op_id, absl::ToInt64Milliseconds(remaining_hold));
     }
-    Release(hashes);
-    save_tracker->MarkFailed(hashes);
+
+    poll_future.OnReady(
+        [this, lifetime, save_tracker,
+         hashes](absl::StatusOr<proto::PollWriteRemoteResponse> resp) {
+          absl::ReaderMutexLock lock(lifetime->mu);
+          if (!lifetime->is_alive) {
+            return;
+          }
+          const bool poll_succeeded =
+              resp.ok() &&
+              (resp->state() == proto::PollWriteRemoteResponse::COMMITTED ||
+               resp->state() == proto::PollWriteRemoteResponse::ALL_EXIST);
+          Release(hashes);
+          if (poll_succeeded) {
+            Release(hashes);
+          }
+          if (!resp.ok()) {
+            save_tracker->MarkFailed(hashes);
+            return;
+          }
+          switch (resp->state()) {
+            case proto::PollWriteRemoteResponse::COMMITTED:
+            case proto::PollWriteRemoteResponse::ALL_EXIST:
+              save_tracker->MarkDone(hashes);
+              break;
+            case proto::PollWriteRemoteResponse::PARTIAL_EXIST:
+              save_tracker->MarkFailedWithExisting(
+                  hashes,
+                  std::vector<std::string>(resp->existing_hashes().begin(),
+                                           resp->existing_hashes().end()));
+              break;
+            case proto::PollWriteRemoteResponse::STORED_UNREGISTERED:
+              save_tracker->MarkFailedWithUnregistered(
+                  hashes,
+                  std::vector<std::string>(resp->unregistered_hashes().begin(),
+                                           resp->unregistered_hashes().end()));
+              break;
+            default:
+              save_tracker->MarkFailed(hashes);
+              break;
+          }
+        });
   });
   return ack;
 }

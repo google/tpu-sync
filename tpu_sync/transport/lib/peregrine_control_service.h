@@ -20,24 +20,21 @@
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
-#include "tpu_sync/transport/peregrine/src/internal/control/service.grpc.pb.h"
-#include "tpu_sync/transport/peregrine/src/internal/control/service.pb.h"
+#include "tpu_sync/transport/lib/service.grpc.pb.h"
+#include "tpu_sync/transport/lib/service.pb.h"
 
 namespace tpu_raiden::transport::lib {
 
 // Server-side gRPC implementation for PeregrineService.
 // Handles incoming RPCs from connecting peers
-class PeregrineControlServiceImpl final
-    : public ::peregrine::internal::control::PeregrineService::Service {
+class PeregrineControlServiceImpl final : public PeregrineService::Service {
  public:
   explicit PeregrineControlServiceImpl(RawBufferTransport* transport)
       : transport_(transport) {}
 
-  grpc::Status ExchangePspKey(
-      grpc::ServerContext* context,
-      const ::peregrine::internal::control::PspKeyExchangeRequest* request,
-      ::peregrine::internal::control::PspKeyExchangeResponse* response)
-      override {
+  grpc::Status ExchangePspKey(grpc::ServerContext* context,
+                              const PspKeyExchangeRequest* request,
+                              PspKeyExchangeResponse* response) override {
     if (transport_ == nullptr) {
       return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                           "RawBufferTransport is not initialized");

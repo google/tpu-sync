@@ -16,9 +16,29 @@
 # It is only visible to the BlockTransport package.
 
 load("@com_github_google_flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")
+load("@com_github_grpc_grpc//bazel:cc_grpc_library.bzl", "cc_grpc_library")
+load("@com_google_protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
+load("@com_google_protobuf//bazel:proto_library.bzl", "proto_library")
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
+
+proto_library(
+    name = "service_proto",
+    srcs = ["service.proto"],
+)
+
+cc_proto_library(
+    name = "service_cc_proto",
+    deps = [":service_proto"],
+)
+
+cc_grpc_library(
+    name = "service_cc_grpc",
+    srcs = [":service_proto"],
+    grpc_only = True,
+    deps = [":service_cc_proto"],
+)
 
 flatbuffer_cc_library(
     name = "chunk_cc_fbs",
@@ -34,11 +54,11 @@ cc_library(
     name = "transport_adapter",
     hdrs = ["transport_adapter.h"],
     deps = [
-        "//tpu_sync/transport/peregrine/src/api:transport_metrics",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api:transport_metrics",
     ],
 )
 
@@ -60,7 +80,6 @@ cc_library(
         "//tpu_sync/telemetry:label_util",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
-        "//tpu_sync/transport/peregrine/src/api:socket_util",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -73,6 +92,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api:socket_util",
     ],
 )
 
@@ -92,7 +112,6 @@ cc_test(
         ":transport_adapter",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/telemetry:mock_metrics_backend",
-        "//tpu_sync/transport/peregrine/src/api:socket_util",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:inlined_vector",
         "@com_google_absl//absl/status",
@@ -103,6 +122,7 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@peregrine//peregrine/src/api:socket_util",
     ],
 )
 
@@ -218,7 +238,7 @@ cc_library(
         "//tpu_sync/transport:buffer_push_task",
         "//tpu_sync/transport/lib/conn:pool",
         "//tpu_sync/transport/lib/socket:tcp_psp_helper",
-        "//tpu_sync/transport/peregrine/src/api:socket_util",
+        "//tpu_sync/transport/lib/socket:util",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
@@ -236,6 +256,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api:socket_util",
     ],
 )
 
@@ -262,8 +283,6 @@ cc_test(
         "//tpu_sync/transport/lib/socket:psp_syscall_mock",
         "//tpu_sync/transport/lib/socket:tcp_psp_helper",
         "//tpu_sync/transport/lib/socket:util",
-        "//tpu_sync/transport/peregrine/src/api:socket_util",
-        "//tpu_sync/transport/peregrine/src/util",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -276,6 +295,7 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@peregrine//peregrine/src/api:socket_util",
     ],
 )
 
@@ -285,8 +305,8 @@ cc_library(
     deps = [
         ":raw_buffer_transport",
         ":raw_buffer_transport_delegate",
-        "//tpu_sync/transport/peregrine/src/internal/control:service_cc_grpc",
-        "//tpu_sync/transport/peregrine/src/internal/control:service_cc_proto",
+        "//tpu_sync/transport/lib:service_cc_grpc",
+        "//tpu_sync/transport/lib:service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
@@ -305,8 +325,8 @@ cc_test(
         ":peregrine_control_service",
         ":raw_buffer_transport",
         ":raw_buffer_transport_delegate",
-        "//tpu_sync/transport/peregrine/src/internal/control:service_cc_grpc",
-        "//tpu_sync/transport/peregrine/src/internal/control:service_cc_proto",
+        "//tpu_sync/transport/lib:service_cc_grpc",
+        "//tpu_sync/transport/lib:service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",

@@ -25,7 +25,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "tpu_sync/transport/peregrine/src/api/transport_metrics.h"
+#include "peregrine/src/api/transport_metrics.h"
 
 namespace tpu_raiden {
 namespace transport {

@@ -35,8 +35,8 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
+#include "tpu_sync/transport/lib/service.grpc.pb.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
-#include "tpu_sync/transport/peregrine/src/internal/control/service.grpc.pb.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -68,8 +68,7 @@ class BlockTransport final {
   const std::string& bound_ip() const { return raw_transport_.bound_ip(); }
 
   // Returns PeregrineService to register onto the host gRPC server.
-  ::peregrine::internal::control::PeregrineService::Service*
-  peregrine_control_service() {
+  lib::PeregrineService::Service* peregrine_control_service() {
     return peregrine_control_.get();
   }
 

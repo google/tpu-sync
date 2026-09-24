@@ -48,8 +48,8 @@ cc_test(
     deps = [
         ":psp_syscall_mock",
         ":tcp_psp_helper",
-        "//tpu_sync/transport/peregrine/src/internal/control:service_cc_grpc",
-        "//tpu_sync/transport/peregrine/src/internal/control:service_cc_proto",
+        "//tpu_sync/transport/lib:service_cc_grpc",
+        "//tpu_sync/transport/lib:service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
@@ -89,7 +89,6 @@ cc_library(
     features = ["-use_header_modules"],
     deps = [
         ":tcp_psp_helper",
-        "//tpu_sync/transport/peregrine/src/api:socket_util",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",

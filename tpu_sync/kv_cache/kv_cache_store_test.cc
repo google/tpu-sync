@@ -65,6 +65,7 @@
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
+#include "tpu_sync/kv_cache/backends/storage/tds_backend.h"
 #include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
@@ -6531,11 +6532,16 @@ TEST(KVCacheStoreTest, MultiBackendConstructionValidation) {
   // Accepts 1 tier-0 backend (0 secondary).
   EXPECT_TRUE(CreateStore(std::vector<BackendConfig>{tier0}).ok());
 
-  // Accepts 1 tier-0 backend + 1 secondary backend.
+  // Accepts 1 tier-0 backend + 1 secondary backend ("posix" or "tds").
   BackendConfig sec1;
   sec1.type = "posix";
   sec1.SetProperty("storage_root", "/tmp/raiden_test_sec1");
   EXPECT_TRUE(CreateStore(std::vector<BackendConfig>{tier0, sec1}).ok());
+
+  BackendConfig tds_sec;
+  tds_sec.type = "tds";
+  tds_sec.SetProperty("root_dir", "/tmp/raiden_test_tds");
+  EXPECT_TRUE(CreateStore(std::vector<BackendConfig>{tier0, tds_sec}).ok());
 
   // Rejects 1 tier-0 backend + 2 secondary backends.
   BackendConfig sec2;
@@ -6612,6 +6618,82 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
   EXPECT_EQ((*backend_lookup)[0].second.status, BlockStatus::HOST_AND_HBM);
   EXPECT_EQ((*backend_lookup)[0].second.device_block_id, 4);
   EXPECT_GE((*backend_lookup)[0].second.host_block_id, 0);
+}
+
+// -----------------------------------------------------------------------------
+// Verifies the RECALL path (`KVCacheStore::Load`) for a block held by the
+// `"tds"` secondary backend (storage -> [dram: User host_buf] -> [hbm]):
+//   1. `KVCacheStore` allocates a staging block in [dram: User host_buf] and
+//      dispatches the recall to the worker's `MockTransferManager`, which
+//      records one H2D (`h2d_calls`); no storage I/O is performed.
+//   2. After `PollLoadStatus()` reports the hash in `load_done`, the store's
+//      lookup reports `BlockStatus::HOST_AND_HBM` with `device_block_id == 4`
+//      and a valid `host_block_id`, i.e. the staging block is kept.
+// -----------------------------------------------------------------------------
+TEST_F(KVCacheStoreEmbeddedControllerTest,
+       TdsStorageRecallRetainsStagingHostBlocksAsHostAndHbm) {
+  ::tpu_raiden::controller::MockTransferManager mock_mgr;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&mock_mgr));
+
+  auto controller = MakeController();
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  KVCacheStore store(10, std::move(controller), "", rid, std::nullopt,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  // Step 1: Attach a `"tds"` (`PosixKVCacheStoreBackend` + `TdsKVBackend`)
+  // secondary backend to both the Coordinator store and the Worker manager.
+  std::string scratch_dir =
+      std::string(testing::TempDir()) + "/" +
+      ::testing::UnitTest::GetInstance()->current_test_info()->name();
+  auto worker_backend = std::make_shared<backends::storage::TdsKVBackend>(
+      "tds", absl::flat_hash_map<std::string, std::string>{
+                 {"root_dir", scratch_dir},
+                 {"model_name", "model_test"},
+                 {"tp_size", "1"},
+                 {"tp_rank", "0"}});
+  KVCacheStoreTest::AddBackend(
+      store, std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
+                 worker_backend, "tds"));
+  mock_mgr.backends["tds"] = worker_backend;
+
+  // Step 2: Request `store.Load()` for a `BlockStatus::SHARED_STORAGE` slice
+  // residing in `"tds"` into `[hbm]` block 4.
+  RaidenBlockId slice(RaidenId{"test_job", "0", "tds", 0}, -1, -1,
+                      BlockStatus::SHARED_STORAGE);
+
+  absl::Status status = store.Load({"tds_storage_hash"}, {slice}, {4});
+  ABSL_ASSERT_OK(status);
+
+  // Step 3: Poll until the async recall finishes and verify the block is now
+  // tracked as `BlockStatus::HOST_AND_HBM` (`device_block_id == 4` and a valid
+  // `host_block_id >= 0` in `[dram: User host_buf]`).
+  bool done = false;
+  while (!done) {
+    auto [load_done, load_failed, load_pending, load_existing,
+          load_unregistered] = store.PollLoadStatus();
+    if (!load_failed.empty()) {
+      FAIL() << "Async Load failed during polling: " << load_failed[0];
+    }
+    if (!load_done.empty()) {
+      EXPECT_THAT(load_done, ::testing::ElementsAre("tds_storage_hash"));
+      done = true;
+    }
+    if (!done) {
+      absl::SleepFor(absl::Milliseconds(10));
+    }
+  }
+
+  EXPECT_EQ(mock_mgr.h2d_calls, 1);
+
+  auto lookup_res = PeekLookup(store, {"tds_storage_hash"});
+  ABSL_ASSERT_OK(lookup_res);
+  ASSERT_EQ(lookup_res->size(), 1);
+  EXPECT_EQ((*lookup_res)[0].second.status, BlockStatus::HOST_AND_HBM);
+  EXPECT_EQ((*lookup_res)[0].second.device_block_id, 4);
+  EXPECT_GE((*lookup_res)[0].second.host_block_id, 0);
 }
 
 TEST_F(KVCacheStoreEmbeddedControllerTest,
@@ -6990,29 +7072,110 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
   EXPECT_EQ((*lookup_res)[0].second.status, BlockStatus::HOST_AND_HBM);
 }
 
+// -----------------------------------------------------------------------------
+// Verifies the OFFLOAD path (`KVCacheStore::Save`) for a block resident only in
+// [hbm] (`BlockStatus::HBM`) with the `"tds"` secondary backend attached
+// ([hbm] -> [dram: User host_buf] -> storage):
+//   1. `KVCacheStore::Save` allocates a staging block in [dram: User host_buf]
+//      and dispatches the transfer to the worker's `MockTransferManager`,
+//      which records one D2H (`d2h_calls`); no storage I/O is performed.
+//   2. After `PollSaveStatus()` reports the hash in `save_done` (with nothing
+//      in `save_existing` / `save_unregistered`), `d2h_calls == 1` and the
+//      store's lookup reports `BlockStatus::HOST_AND_HBM`.
+// -----------------------------------------------------------------------------
+TEST_F(KVCacheStoreEmbeddedControllerTest,
+       TdsSaveLocalDispatchesOffloadToSecondaryBackend) {
+  ::tpu_raiden::controller::MockTransferManager mock_mgr;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&mock_mgr));
+
+  auto controller = MakeController();
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  KVCacheStore store(10, std::move(controller), "", rid, std::nullopt,
+                     /*store_server_ip=*/"127.0.0.1");
+
+  // Step 1: Attach the `"tds"` secondary backend to the store and worker.
+  std::string scratch_dir =
+      std::string(testing::TempDir()) + "/" +
+      ::testing::UnitTest::GetInstance()->current_test_info()->name();
+  auto worker_backend = std::make_shared<backends::storage::TdsKVBackend>(
+      "tds", absl::flat_hash_map<std::string, std::string>{
+                 {"root_dir", scratch_dir},
+                 {"model_name", "model_test"},
+                 {"tp_size", "1"},
+                 {"tp_rank", "0"}});
+  KVCacheStoreTest::AddBackend(
+      store, std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
+                 worker_backend, "tds"));
+  mock_mgr.backends["tds"] = worker_backend;
+
+  // Step 2: Seed `"tds_save_hash"` as resident in `[hbm]` (`device_block_id ==
+  // 0`, `BlockStatus::HBM`) and invoke `store.Save()`.
+  std::vector<std::string> hashes = {"tds_save_hash"};
+  std::vector<RaidenBlockId> slices = {
+      RaidenBlockId(rid, -1, 0, BlockStatus::HBM)};
+
+  ASSERT_TRUE(InsertResident(store, hashes, slices, /*on_host=*/false));
+  ABSL_ASSERT_OK(store.Lookup(hashes));
+
+  absl::Status status = store.Save(hashes);
+  ABSL_ASSERT_OK(status);
+
+  // Step 3: Poll until `PollSaveStatus()` completes and verify the block is
+  // now `BlockStatus::HOST_AND_HBM` with `d2h_calls == 1`.
+  bool done = false;
+  while (!done) {
+    auto [save_done, save_failed, save_pending, save_existing,
+          save_unregistered] = store.PollSaveStatus();
+    if (!save_failed.empty()) {
+      FAIL() << "Async Save failed during polling: " << save_failed[0];
+    }
+    EXPECT_TRUE(save_existing.empty());
+    EXPECT_TRUE(save_unregistered.empty());
+    if (!save_done.empty()) {
+      EXPECT_THAT(save_done, ::testing::ElementsAre("tds_save_hash"));
+      done = true;
+    }
+    if (!done) {
+      absl::SleepFor(absl::Milliseconds(10));
+    }
+  }
+
+  EXPECT_EQ(mock_mgr.d2h_calls, 1);
+
+  auto lookup_res = PeekLookup(store, hashes);
+  ABSL_ASSERT_OK(lookup_res);
+  ASSERT_EQ(lookup_res->size(), 1);
+  EXPECT_EQ((*lookup_res)[0].second.status, BlockStatus::HOST_AND_HBM);
+}
+
 TEST(KVCacheStoreTest, CreateWithProgrammaticSecondaryConfigs) {
   BackendConfig host_cfg;
   host_cfg.type = "HostOffloadBackend";
   host_cfg.capacity = 4;
 
-  BackendConfig sec_cfg;
-  sec_cfg.type = "posix";
-  sec_cfg.properties["root_dir"] = "/tmp/test";
+  for (absl::string_view backend_type : {"posix", "tds"}) {
+    BackendConfig sec_cfg;
+    sec_cfg.type = std::string(backend_type);
+    sec_cfg.properties["root_dir"] = "/tmp/test";
 
-  std::vector<BackendConfig> sec_cfgs = {sec_cfg};
-  auto store_or = KVCacheStore::Create(
-      host_cfg, /*capacity=*/4, /*global_registry_address=*/"", RaidenId{},
-      /*num_shards=*/1, /*shard_size_bytes=*/512,
-      /*store_server_ip=*/"127.0.0.1", /*raiden_controller_port=*/0,
-      /*metadata=*/std::nullopt, /*expected_worker_count=*/0,
-      std::move(sec_cfgs));
-  ASSERT_TRUE(store_or.ok()) << store_or.status();
-  auto& store = *store_or;
-  ASSERT_EQ(store->backends().size(), 2);
-  EXPECT_EQ(store->backends()[0]->name(), "HostOffloadBackend");
-  EXPECT_EQ(store->backends()[1]->name(), "posix");
-  ASSERT_EQ(store->backend_configs().size(), 2);
-  EXPECT_EQ(store->backend_configs()[1].GetProperty("root_dir"), "/tmp/test");
+    std::vector<BackendConfig> sec_cfgs = {sec_cfg};
+    auto store_or = KVCacheStore::Create(
+        host_cfg, /*capacity=*/4, /*global_registry_address=*/"", RaidenId{},
+        /*num_shards=*/1, /*shard_size_bytes=*/512,
+        /*store_server_ip=*/"127.0.0.1", /*raiden_controller_port=*/0,
+        /*metadata=*/std::nullopt, /*expected_worker_count=*/0,
+        std::move(sec_cfgs));
+    ASSERT_TRUE(store_or.ok()) << store_or.status();
+    auto& store = *store_or;
+    ASSERT_EQ(store->backends().size(), 2);
+    EXPECT_EQ(store->backends()[0]->name(), "HostOffloadBackend");
+    EXPECT_EQ(store->backends()[1]->name(), backend_type);
+    ASSERT_EQ(store->backend_configs().size(), 2);
+    EXPECT_EQ(store->backend_configs()[1].GetProperty("root_dir"), "/tmp/test");
+  }
 }
 
 TEST(KVCacheStoreTest, PeerLookupPriorityOverStorageFallback) {

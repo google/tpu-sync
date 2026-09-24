@@ -65,6 +65,7 @@
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache/backends/storage/tds_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
@@ -3251,8 +3252,11 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
     const BackendConfig& config) {
   if (config.type.empty()) return false;
 
-  if (!absl::EqualsIgnoreCase(config.type,
-                              backends::storage::kPosixBackendName)) {
+  const bool is_posix =
+      absl::EqualsIgnoreCase(config.type, backends::storage::kPosixBackendName);
+  const bool is_tds =
+      absl::EqualsIgnoreCase(config.type, backends::storage::kTdsBackendName);
+  if (!is_posix && !is_tds) {
     LOG(WARNING) << "[Worker] Unsupported secondary backend: " << config.type;
     return false;
   }
@@ -3264,14 +3268,43 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
   }
 
   const std::string canonical_name =
-      std::string(backends::storage::kPosixBackendName);
+      std::string(is_tds ? backends::storage::kTdsBackendName
+                         : backends::storage::kPosixBackendName);
   if (GetKVBackend(canonical_name) != nullptr) return false;
 
   auto props = config.properties;
   props["tp_size"] = absl::StrCat(config.parallelism.tp_size);
   props["tp_rank"] = absl::StrCat(config.parallelism.tp_rank);
-  auto backend = std::make_shared<backends::storage::PosixKVBackend>(
-      canonical_name, props);
+  std::shared_ptr<backends::KVBackend> backend;
+  if (is_tds) {
+    auto tds_backend = std::make_shared<backends::storage::TdsKVBackend>(
+        canonical_name, props);
+    // Pre-register all [dram: User host_buf] block arrays with `libtdsul`
+    // (`tds_buffer_register_vaddr(..., TDS_MEM_HOST)`) using the same
+    // `num_block_arrays()` / `GetBlockArrayHostPointer()` /
+    // `GetBlockArrayHostSize()` contract used by `BlockTransport`. This covers
+    // legacy per-layer host buffers, `explicit_pools_`, and bounded staging
+    // arenas.
+    const size_t num_arrays = num_block_arrays();
+    for (size_t i = 0; i < num_arrays; ++i) {
+      for (size_t s = 0; s < num_shards_; ++s) {
+        uint8_t* base = GetBlockArrayHostPointer(i, s);
+        const size_t size = GetBlockArrayHostSize(i, s);
+        if (base != nullptr && size > 0) {
+          if (absl::Status reg_status = tds_backend->RegisterBuffer(base, size);
+              !reg_status.ok() && !absl::IsAlreadyExists(reg_status)) {
+            LOG(WARNING)
+                << "Failed to register KV cache buffer with TdsKVBackend (base="
+                << base << ", size=" << size << "): " << reg_status;
+          }
+        }
+      }
+    }
+    backend = std::move(tds_backend);
+  } else {
+    backend = std::make_shared<backends::storage::PosixKVBackend>(
+        canonical_name, props);
+  }
   {
     absl::MutexLock lock(backends_mu_);
     backends_[canonical_name] = std::move(backend);

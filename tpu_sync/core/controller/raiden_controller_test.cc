@@ -20,7 +20,6 @@
 #include <functional>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1515,6 +1514,73 @@ TEST_F(RaidenControllerTest, TransferBackendBuffersDispatchesOffloadAndRecall) {
       HasSubstr("726563616c6c5f626c6f636b30.bin"));  // hex("recall_block0")
   EXPECT_THAT(mock_mgr.last_backend_src_block_ids, ElementsAre(1));
   EXPECT_THAT(mock_mgr.last_backend_dst_block_ids, ElementsAre(4));
+}
+
+// -----------------------------------------------------------------------------
+// Verifies that `RaidenController::TransferBackendBuffers` dispatches both
+// OFFLOAD ([hbm] -> [dram: User host_buf] -> storage) and RECALL
+// (storage -> [dram: User host_buf] -> [hbm]) to the worker when the secondary
+// backend is `"tds"` (`TdsKVBackend`).
+//
+// Specifically checks that:
+//   1. `MockTransferManager::RegisterKVBackends` (test_util.h) creates a
+//      `TdsKVBackend` for backend type `"tds"`.
+//   2. For `TRANSFER_DIR_OFFLOAD`, the worker maps `"tds_block0"` through the
+//      backend's `mapper()->MapKey()` to a path ending in the hex encoding
+//      (`7464735f626c6f636b30.bin`) and calls `D2hWriteToBackend` once.
+//   3. For `TRANSFER_DIR_RECALL`, the worker maps `"tds_recall0"` to
+//      `7464735f726563616c6c30.bin` and calls `H2dReadFromBackend` once.
+//
+// The mock only records the calls; no storage I/O is performed.
+// -----------------------------------------------------------------------------
+TEST_F(RaidenControllerTest,
+       TransferBackendBuffersDispatchesOffloadAndRecallWithTdsBackend) {
+  // Step 1: Register the `"tds"` secondary storage backend on the worker's
+  // transfer manager so `GetKVBackend("tds")` returns a `TdsKVBackend`.
+  kv_cache::BackendConfig tds_cfg;
+  tds_cfg.type = "tds";
+  tds_cfg.parallelism.tp_rank = 0;
+  tds_cfg.parallelism.tp_size = 1;
+  tds_cfg.SetProperty("tp_size", "1");
+
+  MockTransferManager mock_mgr;
+  mock_mgr.RegisterKVBackends({tds_cfg});
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock_mgr));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/1,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  ::tpu_sync::proto::BackendTransferSpec backend_spec;
+  backend_spec.set_name("tds");
+
+  // Step 2: Dispatch TRANSFER_DIR_OFFLOAD (`[hbm]` block 2 -> `[dram: User
+  // host_buf]` staging block 3 -> `"tds"` storage backend) and verify the
+  // resolved hex storage path passed to `D2HAndWriteToBackend`.
+  auto offload_status = controller->TransferBackendBuffers(
+      ::tpu_sync::proto::TRANSFER_DIR_OFFLOAD, {"tds_block0"},
+      /*hbm_block_ids=*/{2}, /*host_block_ids=*/{3}, {backend_spec});
+  ABSL_EXPECT_OK(offload_status.Await());
+  EXPECT_EQ(mock_mgr.d2h_write_to_backend_calls, 1);
+  ASSERT_EQ(mock_mgr.last_d2h_backend_keys.size(), 1);
+  EXPECT_EQ(mock_mgr.last_d2h_backend_keys[0].block_hash, "tds_block0");
+  EXPECT_THAT(mock_mgr.last_d2h_backend_keys[0].resolved_key,
+              HasSubstr("7464735f626c6f636b30.bin"));  // hex("tds_block0")
+
+  // Step 3: Dispatch TRANSFER_DIR_RECALL (`"tds"` storage backend -> `[dram:
+  // User host_buf]` staging block 1 -> `[hbm]` block 4) and verify the
+  // resolved hex storage path passed to `ReadFromBackendAndH2D`.
+  auto recall_status = controller->TransferBackendBuffers(
+      ::tpu_sync::proto::TRANSFER_DIR_RECALL, {"tds_recall0"},
+      /*hbm_block_ids=*/{4}, /*host_block_ids=*/{1}, {backend_spec});
+  ABSL_EXPECT_OK(recall_status.Await());
+  EXPECT_EQ(mock_mgr.h2d_read_from_backend_calls, 1);
+  ASSERT_EQ(mock_mgr.last_h2d_backend_keys.size(), 1);
+  EXPECT_EQ(mock_mgr.last_h2d_backend_keys[0].block_hash, "tds_recall0");
+  EXPECT_THAT(mock_mgr.last_h2d_backend_keys[0].resolved_key,
+              HasSubstr("7464735f726563616c6c30.bin"));  // hex("tds_recall0")
 }
 
 TEST_F(RaidenControllerTest, TransferBuffersBackendSpecValidationRejections) {

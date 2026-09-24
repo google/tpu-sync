@@ -1,10 +1,14 @@
 {
   "_comment": [
-    "Regenerate with:  bazel run //tpu_sync/benchmarks:h2d_d2h_benchmark_gating --",
-    "                    --record --iters=<large>",
+    "Recorded on 8 ghostlite chips, --iters=1000.",
+    "http://sponge2/2d116850-0a4d-421d-bcf5-25b74434b9c6",
+    "",
+    "Re-record with:  bazel run //tpu_sync/benchmarks:h2d_d2h_benchmark_gating --",
+    "                   --record --framework=torch --iters=<large>",
     "Use a large --iters when recording: the floor depends on a MAD estimate, which",
-    "needs many samples to be stable. Record mode rewrites this file in place and",
-    "preserves this comment.",
+    "needs many samples to be stable. At --iters=20 these same floors came out up to",
+    "30% different run to run. Record mode rewrites this file in place and preserves",
+    "this comment.",
     "",
     "Top level",
     "  sigma_k : robust sigmas below the median used to derive each floor (see below).",
@@ -27,31 +31,37 @@
     "            where MAD is the median absolute deviation of the recorded samples --",
     "            i.e. the lower edge of the normal run-to-run spread. MAD is used rather",
     "            than a plain stddev because it is outlier-resistant: one slow sample",
-    "            cannot drag the floor down and quietly weaken the gate."
+    "            cannot drag the floor down and quietly weaken the gate.",
+    "",
+    "            These floors sit ~30% below their baselines because ghostlite is",
+    "            shared, noisy hardware: one robust sigma is ~9% of the median. So this",
+    "            gate catches gross breakage, not a 5% regression. Tightening it needs",
+    "            quieter hardware, not a smaller sigma_k."
   ],
   "sigma_k": 3.5,
   "iters": 20,
   "warmup": 3,
+  "enforce": true,
   "configs": [
     {
       "dtype": "int32",
       "num_layers": 1,
       "shape": [8, 128, 1024, 128],
       "shard_axis": 2,
-      "baseline_d2h": 835.4,
-      "baseline_h2d": 800.1,
-      "floor_d2h": 813.8,
-      "floor_h2d": 750.7
+      "baseline_d2h": 1519.7,
+      "baseline_h2d": 1416.9,
+      "floor_d2h": 1028.3,
+      "floor_h2d": 1013.3
     },
     {
       "dtype": "float32",
       "num_layers": 1,
       "shape": [8, 128, 1024, 128],
       "shard_axis": 2,
-      "baseline_d2h": 849.0,
-      "baseline_h2d": 810.9,
-      "floor_d2h": 815.7,
-      "floor_h2d": 789.9
+      "baseline_d2h": 1528.6,
+      "baseline_h2d": 1414.5,
+      "floor_d2h": 1079.4,
+      "floor_h2d": 994.7
     }
   ]
 }

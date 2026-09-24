@@ -22,6 +22,14 @@ filegroup(
     visibility = ["//:internal"],
 )
 
+filegroup(
+    name = "gating_baselines",
+    srcs = [
+        "h2d_d2h_gating_jax_baselines.json",
+        "h2d_d2h_gating_torch_baselines.json",
+    ],
+)
+
 py_library(
     name = "bap_metrics",
     testonly = True,
@@ -59,7 +67,7 @@ py_binary(
     name = "h2d_d2h_benchmark_gating",
     testonly = True,
     srcs = ["h2d_d2h_benchmark_gating.py"],
-    data = ["h2d_d2h_gating_baselines.json"],
+    data = [":gating_baselines"],
     deps = [
         ":bap_metrics",
         ":perf_core",

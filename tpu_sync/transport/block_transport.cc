@@ -327,7 +327,7 @@ absl::Status BlockTransport::HandleIncomingPush(
     const std::vector<uint8_t> s_ids = lib::SerializeBlockIds(allocated_ids);
     ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s_ids.data(), s_ids.size()));
   } else {
-    FaultInjectThrow(hooks::kBlockTransportRecvIdsAlloc);
+    ABSL_RETURN_IF_ERROR(FaultInjectStatus(hooks::kBlockTransportRecvIdsAlloc));
     std::vector<uint8_t> ids_buf(header.count_or_size * sizeof(uint32_t));
     ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
     allocated_ids = lib::DeserializeBlockIds(ids_buf);

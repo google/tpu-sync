@@ -841,7 +841,11 @@ class JobEntity:
           if p and p not in groups[key]:
             groups[key].append(p)
 
-      for key, peers in groups.items():
+      grouped_items = list(groups.items())
+      idx = 0
+      n_items = len(grouped_items)
+      while idx < n_items:
+        key, peers = grouped_items[idx]
         (
             dst_shard_idx,
             dst_offset,
@@ -870,6 +874,87 @@ class JobEntity:
         entry_proto.count = count
         entry_proto.layer_idx = layer_idx
         entry_proto.pool_group = pool_group
+
+        run_len = 1
+        step_dst = 0
+        step_src = 0
+        if idx + 1 < n_items:
+          next_key, next_peers = grouped_items[idx + 1]
+          (
+              n_dst_shard_idx,
+              n_dst_offset,
+              n_src_offset,
+              n_size,
+              n_src_block_id,
+              n_dst_block_id,
+              n_src_stride,
+              n_dst_stride,
+              n_count,
+              n_layer_idx,
+              n_pool_group,
+          ) = next_key
+          # Only fold non-legacy linear byte offset progressions (where offsets
+          # advance rather than wrapping modulo block_bytes with changing block IDs).
+          same_shape = (
+              count > 1
+              and next_peers == peers
+              and n_dst_shard_idx == dst_shard_idx
+              and n_size == size
+              and n_src_stride == src_stride
+              and n_dst_stride == dst_stride
+              and n_count == count
+              and n_layer_idx == layer_idx
+              and n_pool_group == pool_group
+          )
+          is_linear_offset = (
+              (n_src_block_id == src_block_id or n_src_offset > src_offset)
+              and (n_dst_block_id == dst_block_id or n_dst_offset > dst_offset)
+              and n_src_offset >= src_offset
+              and n_dst_offset >= dst_offset
+              and (n_src_offset > src_offset or n_dst_offset > dst_offset)
+          )
+          if same_shape and is_linear_offset:
+            step_dst = n_dst_offset - dst_offset
+            step_src = n_src_offset - src_offset
+            run_len = 2
+            while idx + run_len < n_items:
+              cand_key, cand_peers = grouped_items[idx + run_len]
+              (
+                  c_dst_shard_idx,
+                  c_dst_offset,
+                  c_src_offset,
+                  c_size,
+                  c_src_block_id,
+                  c_dst_block_id,
+                  c_src_stride,
+                  c_dst_stride,
+                  c_count,
+                  c_layer_idx,
+                  c_pool_group,
+              ) = cand_key
+              if (
+                  cand_peers == peers
+                  and c_dst_shard_idx == dst_shard_idx
+                  and c_size == size
+                  and c_src_stride == src_stride
+                  and c_dst_stride == dst_stride
+                  and c_count == count
+                  and c_layer_idx == layer_idx
+                  and c_pool_group == pool_group
+                  and c_dst_offset == dst_offset + run_len * step_dst
+                  and c_src_offset == src_offset + run_len * step_src
+                  and (c_src_block_id == src_block_id or step_src > 0)
+                  and (c_dst_block_id == dst_block_id or step_dst > 0)
+              ):
+                run_len += 1
+              else:
+                break
+
+        if run_len > 1:
+          entry_proto.outer_counts.append(run_len)
+          entry_proto.outer_src_strides_bytes.append(step_src)
+          entry_proto.outer_dst_strides_bytes.append(step_dst)
+        idx += run_len
       target_protos[shard_idx] = schedule_proto
     return target_protos
 

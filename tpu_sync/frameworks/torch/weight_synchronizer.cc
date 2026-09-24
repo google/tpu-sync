@@ -715,12 +715,12 @@ void NumaAwareWeightSynchronizer::StoreSkipTiling(
         }
         if (target_sub >= 0 &&
             static_cast<size_t>(target_sub) < sub_synchronizers_.size()) {
-          bool is_contiguous =
-              (entry.count() == 1) ||
-              (entry.src_stride_bytes() == entry.size_bytes() &&
-               entry.dst_stride_bytes() == entry.size_bytes());
-          uint32_t tasks_count =
-              is_contiguous ? 1 : (entry.count() > 0 ? entry.count() : 1);
+          uint32_t tasks_count = 1;
+          for (int d = 0; d < entry.outer_counts_size(); ++d) {
+            if (entry.outer_counts(d) > 0) {
+              tasks_count *= static_cast<uint32_t>(entry.outer_counts(d));
+            }
+          }
           size_t layer_idx = entry.has_layer_idx()
                                  ? static_cast<size_t>(entry.layer_idx())
                                  : 0;

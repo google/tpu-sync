@@ -360,9 +360,9 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiPeerBroadcastStrided) {
   entry->set_count(10);
   entry->set_layer_idx(0);
 
-  // Each strided chunk pushes 1 task per count (10 chunks total)
-  ASSERT_OK(ws_dest1->RegisterExpectedChunks(request.uuid(), 10));
-  ASSERT_OK(ws_dest2->RegisterExpectedChunks(request.uuid(), 10));
+  // Source-and-destination strided chunk now pushes as a single task (1 chunk)
+  ASSERT_OK(ws_dest1->RegisterExpectedChunks(request.uuid(), 1));
+  ASSERT_OK(ws_dest2->RegisterExpectedChunks(request.uuid(), 1));
   absl::Status status = ws_source->PushWeightsResharded(request);
   EXPECT_TRUE(status.ok()) << status.message();
   ASSERT_OK(ws_dest1->WaitForTransferCompletion(request.uuid()));
@@ -372,6 +372,150 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiPeerBroadcastStrided) {
     for (size_t b = 0; b < 256; ++b) {
       EXPECT_EQ(dest_host_ptr1[c * 512 + b], 0xEF);
       EXPECT_EQ(dest_host_ptr2[c * 512 + b], 0xEF);
+    }
+  }
+}
+
+TEST_F(WeightSynchronizerTest, PushWeightsResharded3DStridedSuccess) {
+  size_t num_layers = 1;
+  size_t num_shards = 1;
+  // 3D strided layout: outer_counts = [2, 3], inner count = 4, size = 16
+  constexpr size_t slice_byte_size = 8192;
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, slice_byte_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
+
+  uint8_t* src_host_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
+  uint8_t* dest_host_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, 0));
+  ASSERT_NE(src_host_ptr, nullptr);
+  ASSERT_NE(dest_host_ptr, nullptr);
+  std::memset(src_host_ptr, 0x00, slice_byte_size);
+  std::memset(dest_host_ptr, 0x00, slice_byte_size);
+
+  // Populate 3D strided source pattern
+  for (size_t d0 = 0; d0 < 2; ++d0) {
+    for (size_t d1 = 0; d1 < 3; ++d1) {
+      for (size_t c = 0; c < 4; ++c) {
+        uint8_t val = static_cast<uint8_t>(1 + d0 * 12 + d1 * 4 + c);
+        size_t s_off = d0 * 1024 + d1 * 256 + c * 32;
+        std::memset(src_host_ptr + s_off, val, 16);
+      }
+    }
+  }
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  request.set_uuid(67892);
+
+  auto* schedules = request.mutable_shard_push_schedules();
+  auto* entry = (*schedules)[0].add_entries();
+  entry->add_dst_peers(dest_peer);
+  entry->set_dst_shard_idx(0);
+  entry->set_src_offset_bytes(0);
+  entry->set_dst_offset_bytes(0);
+  entry->set_size_bytes(16);
+  entry->set_src_stride_bytes(32);
+  entry->set_dst_stride_bytes(48);
+  entry->set_count(4);
+  entry->add_outer_counts(2);
+  entry->add_outer_counts(3);
+  entry->add_outer_src_strides_bytes(1024);
+  entry->add_outer_src_strides_bytes(256);
+  entry->add_outer_dst_strides_bytes(2048);
+  entry->add_outer_dst_strides_bytes(512);
+  entry->set_layer_idx(0);
+
+  // 2 * 3 = 6 outer coordinates, each pushed as 1 strided BufferPushTask
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 6));
+  absl::Status status = ws_source->PushWeightsResharded(request);
+  EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+  for (size_t d0 = 0; d0 < 2; ++d0) {
+    for (size_t d1 = 0; d1 < 3; ++d1) {
+      for (size_t c = 0; c < 4; ++c) {
+        uint8_t expected = static_cast<uint8_t>(1 + d0 * 12 + d1 * 4 + c);
+        size_t d_off = d0 * 2048 + d1 * 512 + c * 48;
+        for (size_t b = 0; b < 16; ++b) {
+          EXPECT_EQ(dest_host_ptr[d_off + b], expected);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(WeightSynchronizerTest, PushWeightsReshardedStridedSuccess) {
+  size_t num_layers = 1;
+  size_t num_shards = 1;
+  constexpr size_t count = 1100;  // Exceeds IOV_MAX (1024)
+  constexpr size_t slice_size = 32;
+  constexpr size_t dst_stride = 128;
+  constexpr size_t total_payload = count * slice_size;
+  constexpr size_t dst_buffer_size = (count - 1) * dst_stride + slice_size;
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, total_payload,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers, num_shards, dst_buffer_size,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
+
+  uint8_t* src_host_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
+  uint8_t* dest_host_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, 0));
+  ASSERT_NE(src_host_ptr, nullptr);
+  ASSERT_NE(dest_host_ptr, nullptr);
+
+  for (size_t i = 0; i < total_payload; ++i) {
+    src_host_ptr[i] = static_cast<uint8_t>((i * 7 + 1) & 0xFF);
+  }
+  std::memset(dest_host_ptr, 0x00, dst_buffer_size);
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  request.set_uuid(54321);
+
+  auto* schedules = request.mutable_shard_push_schedules();
+  auto* entry = (*schedules)[0].add_entries();
+  entry->set_dst_peer(dest_peer);
+  entry->set_dst_shard_idx(0);
+  entry->set_src_offset_bytes(0);
+  entry->set_dst_offset_bytes(0);
+  entry->set_size_bytes(slice_size);
+  entry->set_src_stride_bytes(slice_size);
+  entry->set_dst_stride_bytes(dst_stride);
+  entry->set_count(count);
+  entry->set_layer_idx(0);
+
+  // Approach 1: 1 task is emitted for contiguous source to strided dest
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 1));
+  absl::Status status = ws_source->PushWeightsResharded(request);
+  EXPECT_TRUE(status.ok()) << status.message();
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+  // Verify strided destination contents and unwritten stride gaps
+  for (size_t c = 0; c < count; ++c) {
+    for (size_t b = 0; b < slice_size; ++b) {
+      EXPECT_EQ(dest_host_ptr[c * dst_stride + b],
+                src_host_ptr[c * slice_size + b])
+          << "Mismatch at slice " << c << ", byte " << b;
+    }
+    if (c + 1 < count) {
+      for (size_t g = slice_size; g < dst_stride; ++g) {
+        EXPECT_EQ(dest_host_ptr[c * dst_stride + g], 0x00)
+            << "Stride gap corrupted at slice " << c << ", byte " << g;
+      }
     }
   }
 }

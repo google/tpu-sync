@@ -125,7 +125,8 @@ message RegisterWorkUnitRequest {
 // remote destination shard.
 message ShardPushEntryProto {
   // Network coordinate "ip:port" or BNS of the remote Destination Worker Data
-  // servicer. Deprecated in favor of dst_peers for multi-peer broadcast deduplication.
+  // servicer. Deprecated in favor of dst_peers for multi-peer broadcast
+  // deduplication.
   string dst_peer = 1 [deprecated = true];
   // Logical shard partition index managed by the target Destination Worker
   // process.
@@ -151,6 +152,13 @@ message ShardPushEntryProto {
   optional int32 pool_group = 12;
   // Deduplicated destination worker peers for multi-peer broadcast pushes.
   repeated string dst_peers = 13;
+  // Optional outer strided dimensions (from outermost to innermost outer dim)
+  // for N-D strided pushes. Each outer dimension repeats the inner (or
+  // subsequent outer) slice `outer_counts[d]` times with byte steps
+  // `outer_src_strides_bytes[d]` and `outer_dst_strides_bytes[d]`.
+  repeated int64 outer_src_strides_bytes = 14;
+  repeated int64 outer_dst_strides_bytes = 15;
+  repeated int32 outer_counts = 16;
 }
 
 // A collection of network push entries orchestrated by a specific source TPU

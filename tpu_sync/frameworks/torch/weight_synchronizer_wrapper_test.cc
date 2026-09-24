@@ -339,6 +339,56 @@ TEST(WeightSynchronizerWrapperTest,
 }
 
 TEST(WeightSynchronizerWrapperTest,
+     RegisterExpectedCountsWithStridedSingleTaskPushSchedules) {
+  auto sub0_raw = new MockSubWeightSynchronizer(2, 4, 1024);
+  auto sub1_raw = new MockSubWeightSynchronizer(2, 2, 1024);
+
+  std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>> subs;
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub0_raw));
+  subs.push_back(
+      std::unique_ptr<weight_sync::WeightSynchronizerBase>(sub1_raw));
+
+  NumaAwareWeightSynchronizer numa_ws(std::move(subs));
+
+  tpu_sync::rpc::StartTransferRequest req;
+  auto* sched_proto = req.mutable_shard_push_schedules();
+  auto& s0 = (*sched_proto)[0];
+
+  // Strided transfer with count=512, src_stride=32, dst_stride=64, size=32.
+  // Because src_stride == size, this is a single task emitted by the sender.
+  auto* entry0 = s0.add_entries();
+  entry0->set_dst_shard_idx(0);
+  entry0->set_layer_idx(0);
+  entry0->set_count(512);
+  entry0->set_size_bytes(32);
+  entry0->set_src_stride_bytes(32);
+  entry0->set_dst_stride_bytes(64);
+
+  auto* entry1 = s0.add_entries();
+  entry1->set_dst_shard_idx(4);
+  entry1->set_layer_idx(1);
+  entry1->set_count(1024);
+  entry1->set_size_bytes(16);
+  entry1->set_src_stride_bytes(16);
+  entry1->set_dst_stride_bytes(32);
+
+  numa_ws.StoreSkipTiling(99, req);
+
+  absl::flat_hash_map<size_t, uint32_t> layer_counts = {{0, 1}, {1, 1}};
+  EXPECT_TRUE(numa_ws.RegisterExpectedLayerChunks(99, layer_counts).ok());
+  EXPECT_TRUE(numa_ws.RegisterExpectedChunks(99, 2).ok());
+
+  // sub0 expects 1 chunk for layer 0 (not 512)
+  EXPECT_EQ(sub0_raw->last_registered_chunks, 1);
+  EXPECT_EQ(sub0_raw->last_registered_layer_chunks[0], 1);
+
+  // sub1 expects 1 chunk for layer 1 (not 1024)
+  EXPECT_EQ(sub1_raw->last_registered_chunks, 1);
+  EXPECT_EQ(sub1_raw->last_registered_layer_chunks[1], 1);
+}
+
+TEST(WeightSynchronizerWrapperTest,
      RegisterExpectedCountsProportionalFallback) {
   auto sub0_raw = new MockSubWeightSynchronizer(2, 4, 1024);
   auto sub1_raw = new MockSubWeightSynchronizer(2, 4, 1024);

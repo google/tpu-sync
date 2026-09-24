@@ -942,39 +942,81 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       size_t src_offset = entry.src_offset_bytes();
       size_t size = entry.size_bytes();
 
-      if (count == 1 || (src_stride == size && dst_stride == size)) {
-        size_t total_payload_size = count * size;
-        if (src_offset + total_payload_size > shard_host_size) {
+      const size_t effective_src_stride = src_stride > 0 ? src_stride : size;
+      const size_t effective_dst_stride = dst_stride > 0 ? dst_stride : size;
+      const bool is_inner_contiguous =
+          (count == 1) ||
+          (effective_src_stride == size && effective_dst_stride == size);
+
+      if (!is_inner_contiguous && effective_src_stride < size) {
+        return absl::InvalidArgumentError(
+            "Source stride cannot be smaller than slice size");
+      }
+
+      const int num_outer_dims = entry.outer_counts_size();
+      if (entry.outer_src_strides_bytes_size() != num_outer_dims ||
+          entry.outer_dst_strides_bytes_size() != num_outer_dims) {
+        return absl::InvalidArgumentError(
+            "Mismatched outer_counts, outer_src_strides_bytes, and "
+            "outer_dst_strides_bytes sizes in ShardPushEntryProto");
+      }
+
+      size_t num_outer = 1;
+      for (int d = 0; d < num_outer_dims; ++d) {
+        if (entry.outer_counts(d) <= 0) {
+          return absl::InvalidArgumentError(
+              "outer_counts entries must be positive");
+        }
+        num_outer *= static_cast<size_t>(entry.outer_counts(d));
+      }
+
+      const size_t inner_src_span =
+          is_inner_contiguous ? (count * size)
+                              : ((count - 1) * effective_src_stride + size);
+
+      for (size_t outer_idx = 0; outer_idx < num_outer; ++outer_idx) {
+        size_t curr_src_offset = src_offset;
+        size_t curr_dst_offset = dst_offset;
+        size_t temp = outer_idx;
+        for (int d = num_outer_dims - 1; d >= 0; --d) {
+          const size_t dim_size = static_cast<size_t>(entry.outer_counts(d));
+          const size_t coord = temp % dim_size;
+          temp /= dim_size;
+          curr_src_offset +=
+              coord * static_cast<size_t>(entry.outer_src_strides_bytes(d));
+          curr_dst_offset +=
+              coord * static_cast<size_t>(entry.outer_dst_strides_bytes(d));
+        }
+
+        if (curr_src_offset > shard_host_size ||
+            inner_src_span > shard_host_size - curr_src_offset) {
           return absl::InvalidArgumentError("Push range out of bounds");
         }
+
         for (const auto& peer : peers) {
-          tasks_by_layer[layer_idx_to_use].push_back({
-              .peer = peer,
-              .buffer_id = static_cast<size_t>(layer_idx_to_use),
-              .dst_shard_idx = dst_shard_idx,
-              .dst_offset_bytes = dst_offset,
-              .data_ptr = base_host_ptr + src_offset,
-              .size_bytes = total_payload_size,
-          });
-        }
-      } else {
-        for (size_t c = 0; c < count; ++c) {
-          size_t curr_src_offset = src_offset + c * src_stride;
-          size_t curr_dst_offset = dst_offset + c * dst_stride;
-
-          if (curr_src_offset + size > shard_host_size) {
-            return absl::InvalidArgumentError("Push range out of bounds");
-          }
-
-          const uint8_t* data_ptr = base_host_ptr + curr_src_offset;
-          for (const auto& peer : peers) {
+          if (is_inner_contiguous) {
             tasks_by_layer[layer_idx_to_use].push_back({
                 .peer = peer,
                 .buffer_id = static_cast<size_t>(layer_idx_to_use),
                 .dst_shard_idx = dst_shard_idx,
                 .dst_offset_bytes = curr_dst_offset,
-                .data_ptr = data_ptr,
+                .data_ptr = base_host_ptr + curr_src_offset,
+                .size_bytes = count * size,
+                .dst_stride_bytes = 0,
+                .count = 1,
+                .src_stride_bytes = 0,
+            });
+          } else {
+            tasks_by_layer[layer_idx_to_use].push_back({
+                .peer = peer,
+                .buffer_id = static_cast<size_t>(layer_idx_to_use),
+                .dst_shard_idx = dst_shard_idx,
+                .dst_offset_bytes = curr_dst_offset,
+                .data_ptr = base_host_ptr + curr_src_offset,
                 .size_bytes = size,
+                .dst_stride_bytes = effective_dst_stride,
+                .count = count,
+                .src_stride_bytes = effective_src_stride,
             });
           }
         }
@@ -1068,7 +1110,7 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       const auto& layer_tasks = tasks_by_layer[l];
       if (!layer_tasks.empty()) {
         for (const auto& t : layer_tasks) {
-          total_h2h_bytes += t.size_bytes;
+          total_h2h_bytes += (t.count > 0 ? t.count : 1) * t.size_bytes;
         }
         group_tasks.insert(group_tasks.end(), layer_tasks.begin(),
                            layer_tasks.end());

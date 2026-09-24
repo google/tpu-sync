@@ -594,7 +594,7 @@ def generate_strided_copy_chunks_tile_aware(
       base_dst = dst_offset + dst_local_outer_start[0] * d_stride_outer
       if inner_size == s_stride_outer and inner_size == d_stride_outer:
         return [(base_src, base_dst, inner_size * num_outer, 0, 0, 1)]
-      elif inner_size == d_stride_outer:
+      else:
         return [(
             base_src,
             base_dst,
@@ -957,7 +957,30 @@ class ReshardPlanner:
               k = (s_var.name, sl)
               src_slice_holders.setdefault(k, []).append((s_unit, l_s_idx))
 
+      # Pre-index destination metadata and variables for O(1) lookups.
+      dst_meta_info = {}
+      dst_job_replicas_by_job = {}
+      for meta in dst_metadata:
+        m_unit = _raiden_id_from_proto(meta.unit)
+        if m_unit not in dst_meta_info:
+          dst_meta_info[m_unit] = (
+              list(meta.shards) if meta.shards else ["127.0.0.1:8000"],
+              list(meta.mesh_shape) if meta.mesh_shape else None,
+              list(meta.mesh_axes) if meta.mesh_axes else None,
+              list(meta.host_subgrid) if meta.host_subgrid else None,
+          )
+        dst_job_replicas_by_job.setdefault(meta.unit.job_name, set()).add(
+            meta.unit.job_replica_id
+        )
+
+      dst_vars_by_unit_and_name = {
+          u: {v.name: v for v in vars} for u, vars in dst_vars_by_unit.items()
+      }
+      dst_units_index = {u: i for i, u in enumerate(dst_units)}
+
       # 3. Generate plan (Intersection)
+      dst_indices_cache = {}
+      dst_targets_cache = {}
       for src_unit in src_units:
         with lock:
           variables = registered_variables.get(src_unit)
@@ -1026,6 +1049,96 @@ class ReshardPlanner:
               global_shard_indices=src_global_shard_indices,
           )
 
+          # Resolve dst_indices and destination metadata for var_name once
+          # per var across dst_units and cache per var_name across src_units.
+          dst_targets = dst_targets_cache.get(var_name)
+          if dst_targets is None:
+            dst_targets = []
+            for dst_unit in dst_units:
+              dst_var = dst_vars_by_unit_and_name.get(dst_unit, {}).get(
+                  var_name
+              )
+              if not dst_var:
+                continue
+
+              d_slices = computed_slices.get(dst_unit, {}).get(var_name)
+              if not d_slices:
+                continue
+
+              meta_tuple = dst_meta_info.get(dst_unit)
+              if meta_tuple:
+                (
+                    dst_shards,
+                    dst_phys_mesh_shape,
+                    dst_mesh_axes,
+                    dst_host_subgrid,
+                ) = meta_tuple
+              else:
+                dst_shards = ["127.0.0.1:8000"]
+                dst_phys_mesh_shape = None
+                dst_mesh_axes = None
+                dst_host_subgrid = None
+
+              cache_key = (dst_unit, var_name)
+              if cache_key in dst_indices_cache:
+                dst_indices = dst_indices_cache[cache_key]
+              else:
+                with lock:
+                  dst_job_replicas = dst_job_replicas_by_job.get(
+                      dst_unit.job_name, set()
+                  )
+                num_dst_physical_hosts = max(1, len(dst_job_replicas))
+
+                dst_logical_mesh = list(dst_var.mesh_shape)
+                dst_layout = list(dst_var.layout)
+
+                dst_global_shard_indices = (
+                    list(dst_var.global_shard_indices)
+                    if getattr(dst_var, "global_shard_indices", None)
+                    else None
+                )
+                dst_indices = _get_global_indices(
+                    dst_unit,
+                    dst_shards,
+                    dst_logical_mesh,
+                    dst_layout,
+                    num_dst_physical_hosts,
+                    sharding_spec=list(dst_var.sharding_spec),
+                    mesh_axes=dst_mesh_axes,
+                    physical_mesh_shape=dst_phys_mesh_shape,
+                    host_subgrid=dst_host_subgrid,
+                    global_shard_indices=dst_global_shard_indices,
+                )
+                dst_indices_cache[cache_key] = dst_indices
+
+              dst_unit_idx = dst_units_index.get(dst_unit, 0)
+              is_dst_legacy = is_legacy_by_unit.get(dst_unit, True)
+              num_dst_shards = max(1, len(dst_shards))
+
+              # Pre-convert destination slice protos to coordinate intervals
+              # and pre-resolve destination peer endpoints.
+              dst_shard_items = []
+              for local_dst_idx, global_dst_idx in dst_indices:
+                if global_dst_idx >= len(d_slices):
+                  continue
+                dst_slice_proto = d_slices[global_dst_idx]
+                dst_slice = _proto_to_nd_slice(dst_slice_proto)
+                dst_peer = (
+                    dst_shards[local_dst_idx]
+                    if local_dst_idx < len(dst_shards)
+                    else dst_shards[0]
+                )
+                dst_shard_items.append((local_dst_idx, dst_slice, dst_peer))
+
+              dst_targets.append((
+                  dst_unit,
+                  dst_unit_idx,
+                  is_dst_legacy,
+                  num_dst_shards,
+                  dst_shard_items,
+              ))
+            dst_targets_cache[var_name] = dst_targets
+
           for local_src_idx, global_src_idx in src_indices:
             if global_src_idx >= len(src_slices):
               continue
@@ -1034,79 +1147,15 @@ class ReshardPlanner:
             src_slice = _proto_to_nd_slice(src_slice_proto)
             shard_entries = unit_schedules.setdefault(local_src_idx, [])
 
-            for dst_unit in dst_units:
-              dst_vars = dst_vars_by_unit.get(dst_unit, [])
-              dst_var = next((v for v in dst_vars if v.name == var_name), None)
-              if not dst_var:
-                continue
-
-              d_slices = computed_slices.get(dst_unit, {}).get(var_name)
-              if not d_slices:
-                continue
-
-              dst_shards = []
-              dst_phys_mesh_shape = None
-              dst_mesh_axes = None
-              dst_host_subgrid = None
-              for meta in dst_metadata:
-                meta_unit = _raiden_id_from_proto(meta.unit)
-                if meta_unit == dst_unit:
-                  dst_shards = list(meta.shards)
-                  dst_phys_mesh_shape = (
-                      list(meta.mesh_shape) if meta.mesh_shape else None
-                  )
-                  dst_mesh_axes = (
-                      list(meta.mesh_axes) if meta.mesh_axes else None
-                  )
-                  dst_host_subgrid = (
-                      list(meta.host_subgrid) if meta.host_subgrid else None
-                  )
-                  break
-              if not dst_shards:
-                dst_shards = ["127.0.0.1:8000"]
-
-              with lock:
-                dst_job_replicas = {
-                    m.unit.job_replica_id
-                    for m in dst_metadata
-                    if m.unit.job_name == dst_unit.job_name
-                }
-              num_dst_physical_hosts = max(1, len(dst_job_replicas))
-
-              dst_logical_mesh = list(dst_var.mesh_shape)
-              dst_layout = list(dst_var.layout)
-
-              dst_global_shard_indices = (
-                  list(dst_var.global_shard_indices)
-                  if getattr(dst_var, "global_shard_indices", None)
-                  else None
-              )
-              dst_indices = _get_global_indices(
-                  dst_unit,
-                  dst_shards,
-                  dst_logical_mesh,
-                  dst_layout,
-                  num_dst_physical_hosts,
-                  sharding_spec=list(dst_var.sharding_spec),
-                  mesh_axes=dst_mesh_axes,
-                  physical_mesh_shape=dst_phys_mesh_shape,
-                  host_subgrid=dst_host_subgrid,
-                  global_shard_indices=dst_global_shard_indices,
-              )
-
-              for local_dst_idx, global_dst_idx in dst_indices:
-                if global_dst_idx >= len(d_slices):
-                  continue
-
-                dst_slice_proto = d_slices[global_dst_idx]
-                dst_slice = _proto_to_nd_slice(dst_slice_proto)
-
-                dst_peer = (
-                    dst_shards[local_dst_idx]
-                    if local_dst_idx < len(dst_shards)
-                    else dst_shards[0]
-                )
-
+            for (
+                dst_unit,
+                dst_unit_idx,
+                is_dst_legacy,
+                num_dst_shards,
+                dst_shard_items,
+            ) in dst_targets:
+              is_legacy = is_legacy_by_unit.get(src_unit, True) or is_dst_legacy
+              for local_dst_idx, dst_slice, dst_peer in dst_shard_items:
                 intersection = intersect_nd_slices(src_slice, dst_slice)
                 if intersection:
                   s_key = (var_name, tuple(src_slice))
@@ -1115,10 +1164,8 @@ class ReshardPlanner:
                   )
                   if len(candidates) > 1:
                     dst_global_idx = (
-                        dst_units.index(dst_unit)
-                        if dst_unit in dst_units
-                        else 0
-                    ) * max(1, len(dst_shards)) + local_dst_idx
+                        dst_unit_idx * num_dst_shards + local_dst_idx
+                    )
                     chosen_src = candidates[dst_global_idx % len(candidates)]
                     if (src_unit, local_src_idx) != chosen_src:
                       continue
@@ -1153,9 +1200,6 @@ class ReshardPlanner:
                       dst_stride,
                       count,
                   ) in chunks:
-                    is_legacy = is_legacy_by_unit.get(
-                        src_unit, True
-                    ) or is_legacy_by_unit.get(dst_unit, True)
 
                     if len(src_slice) > 1:
                       src_block_bytes = (
@@ -1290,15 +1334,8 @@ class ReshardPlanner:
             dst_peer = entry[0]
             dst_unit = data_address_to_unit.get(dst_peer)
             if dst_unit:
-              size = entry[4]
-              src_stride = entry[7]
-              dst_stride = entry[8]
-              count = entry[9]
               layer_idx = entry[10] if len(entry) > 10 else 0
-              is_contiguous = (count == 1) or (
-                  src_stride == size and dst_stride == size
-              )
-              tasks_count = 1 if is_contiguous else count
+              tasks_count = 1
               dst_unit_counts[dst_unit] = (
                   dst_unit_counts.get(dst_unit, 0) + tasks_count
               )

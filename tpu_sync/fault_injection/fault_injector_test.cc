@@ -19,6 +19,10 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
+#include <fstream>
+#include <functional>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -27,6 +31,8 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -63,8 +69,14 @@ void WaitForHit(std::string_view hook) {
 
 class FaultInjectorTest : public ::testing::Test {
  protected:
-  void SetUp() override { GetFaultInjector().Reset(); }
-  void TearDown() override { GetFaultInjector().Reset(); }
+  void SetUp() override {
+    GetFaultInjector().StopFileWatcher();
+    GetFaultInjector().Reset();
+  }
+  void TearDown() override {
+    GetFaultInjector().StopFileWatcher();
+    GetFaultInjector().Reset();
+  }
 };
 
 TEST_F(FaultInjectorTest, DefaultStateIsInactive) {
@@ -560,6 +572,87 @@ TEST_F(FaultInjectorTest, FastPathOverheadIsSubNanosecond) {
   double ns_per_check =
       absl::ToDoubleNanoseconds(elapsed) / (4.0 * kIterations);
   EXPECT_LT(ns_per_check, 5.0) << "ns_per_check=" << ns_per_check;
+}
+
+bool WaitUntil(const std::function<bool()>& predicate) {
+  absl::Time deadline = absl::Now() + absl::Seconds(5);
+  while (absl::Now() < deadline) {
+    if (predicate()) return true;
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  return predicate();
+}
+
+std::string ReadTextFile(const std::string& path) {
+  std::ifstream in(path);
+  if (!in) return "";
+  return std::string((std::istreambuf_iterator<char>(in)), {});
+}
+
+TEST_F(FaultInjectorTest, FileWatcherArmsDisarmsAndPreservesStatusMetrics) {
+  const std::string rules_path =
+      absl::StrCat(::testing::TempDir(), "/raiden_test_faults.txt");
+  const std::string status_path =
+      absl::StrCat(rules_path, ".status.", getpid());
+  (void)std::remove(rules_path.c_str());
+  (void)std::remove(status_path.c_str());
+
+  GetFaultInjector().StartFileWatcher(rules_path, absl::Milliseconds(20));
+
+  // Create rules file to arm kTestHookAlpha.
+  {
+    std::ofstream out(rules_path);
+    out << "transfer_recv_session.pull.request fail 1.0\n";
+  }
+  ASSERT_TRUE(WaitUntil([]() { return FaultInjector::HasActiveInjections(); }));
+  EXPECT_THAT(FaultInjectStatus(kTestHookAlpha),
+              StatusIs(absl::StatusCode::kInternal));
+  EXPECT_THAT(FaultInjectStatus(kTestHookAlpha),
+              StatusIs(absl::StatusCode::kInternal));
+
+  ASSERT_TRUE(WaitUntil([&]() {
+    std::string s = ReadTextFile(status_path);
+    return absl::StrContains(s, "armed=1\n") &&
+           absl::StrContains(s, "total_hits=2\n");
+  }));
+  EXPECT_THAT(ReadTextFile(status_path),
+              HasSubstr("transfer_recv_session.pull.request=2\n"));
+
+  // Delete rules file to disarm and verify cumulative metrics survive.
+  ASSERT_EQ(std::remove(rules_path.c_str()), 0);
+  ASSERT_TRUE(
+      WaitUntil([]() { return !FaultInjector::HasActiveInjections(); }));
+  ABSL_EXPECT_OK(FaultInjectStatus(kTestHookAlpha));
+
+  ASSERT_TRUE(WaitUntil([&]() {
+    return absl::StrContains(ReadTextFile(status_path), "armed=0\n");
+  }));
+  std::string status_disarmed = ReadTextFile(status_path);
+  EXPECT_THAT(status_disarmed, HasSubstr("total_hits=2\n"));
+  EXPECT_THAT(status_disarmed,
+              HasSubstr("transfer_recv_session.pull.request=2\n"));
+
+  // Recreate rules file and verify metrics accumulate across disarm -> re-arm.
+  {
+    std::ofstream out(rules_path);
+    out << absl::StrCat(kTestHookBeta, " delay 1.0 1 1\n");
+  }
+  ASSERT_TRUE(WaitUntil(
+      []() { return GetFaultInjector().IsHookActive(kTestHookBeta); }));
+  FaultInjectDelay(kTestHookBeta);
+
+  ASSERT_TRUE(WaitUntil([&]() {
+    std::string s = ReadTextFile(status_path);
+    return absl::StrContains(s, "armed=1\n") &&
+           absl::StrContains(s, "total_hits=3\n");
+  }));
+  std::string status_rearmed = ReadTextFile(status_path);
+  EXPECT_THAT(status_rearmed, HasSubstr(absl::StrCat(kTestHookAlpha, "=2\n")));
+  EXPECT_THAT(status_rearmed, HasSubstr(absl::StrCat(kTestHookBeta, "=1\n")));
+
+  GetFaultInjector().StopFileWatcher();
+  (void)std::remove(rules_path.c_str());
+  (void)std::remove(status_path.c_str());
 }
 
 }  // namespace

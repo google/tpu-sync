@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "absl/base/optimization.h"
@@ -28,6 +29,7 @@
 #include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "tpu_sync/fault_injection/hooks.h"  // IWYU pragma: export
 
 namespace tpu_raiden {
@@ -55,10 +57,10 @@ using FaultInjectionRules = std::vector<FaultInjectionRule>;
 
 class FaultInjector final {
  public:
-  FaultInjector() = default;
+  FaultInjector();
   FaultInjector(const FaultInjector&) = delete;
   FaultInjector& operator=(const FaultInjector&) = delete;
-  ~FaultInjector() = default;
+  ~FaultInjector();
 
   // Returns true if any fault injection rules are currently
   // active.
@@ -92,6 +94,13 @@ class FaultInjector final {
   absl::flat_hash_map<std::string, uint64_t> GetHitCounts() const
       ABSL_LOCKS_EXCLUDED(mu_);
 
+  // Polls `file_path` every `poll_interval`, arming rules when the file exists,
+  // disarming when deleted, and writing status to `<file_path>.status.<pid>`.
+  void StartFileWatcher(std::string_view file_path,
+                        absl::Duration poll_interval = absl::Milliseconds(200))
+      ABSL_LOCKS_EXCLUDED(watcher_mu_, mu_);
+  void StopFileWatcher() ABSL_LOCKS_EXCLUDED(watcher_mu_);
+
   // Slow-path execution helpers invoked only when HasActiveInjections() is
   // true. A delay always runs to completion.
   void ExecuteDelay(std::string_view hook) ABSL_LOCKS_EXCLUDED(mu_);
@@ -112,7 +121,14 @@ class FaultInjector final {
   void ExecuteSocket(std::string_view hook, int fd) ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
+  void WatcherLoop(std::string file_path, absl::Duration poll_interval)
+      ABSL_LOCKS_EXCLUDED(watcher_mu_, mu_);
+
   static inline std::atomic<bool> has_active_injections_{false};
+
+  std::thread watcher_thread_;
+  absl::Mutex watcher_mu_;
+  bool watcher_stopping_ ABSL_GUARDED_BY(watcher_mu_) = false;
 
   // Evaluates the hook and sleeps for the delay if a delay action is chosen.
   FaultInjectionAction EvaluateAndSleep(std::string_view hook)

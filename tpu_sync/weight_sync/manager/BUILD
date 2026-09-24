@@ -71,6 +71,21 @@ py_library(
     ],
 )
 
+py_test(
+    name = "reshard_planner_test",
+    timeout = "long",
+    srcs = ["reshard_planner_test.py"],
+    deps = [
+        ":controller_types",
+        ":job_entity",
+        ":reshard_planner",
+        "//tpu_sync/api:common",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
+        "@com_google_absl_py//absl/logging",
+        "@com_google_absl_py//absl/testing:absltest",
+    ],
+)
+
 py_library(
     name = "controller_rpc_service",
     srcs = ["controller_rpc_service.py"],

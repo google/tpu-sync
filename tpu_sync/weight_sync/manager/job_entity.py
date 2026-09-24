@@ -772,189 +772,220 @@ class JobEntity:
       return False
     return True
 
+  def _populate_schedule_proto_entries(
+      self, schedule_proto: Any, entries: Sequence[Any]
+  ) -> None:
+    """Groups and folds schedule entries into `schedule_proto.entries`."""
+    groups = {}
+    for entry_item in entries:
+      if hasattr(entry_item, "dst_peers") or hasattr(entry_item, "dst_peer"):
+        if entry_item.dst_peers:
+          raw_peers = list(entry_item.dst_peers)
+        elif entry_item.dst_peer:
+          raw_peers = [entry_item.dst_peer]
+        else:
+          raw_peers = []
+        dst_shard_idx = entry_item.dst_shard_idx
+        dst_offset = entry_item.dst_offset_bytes
+        src_offset = entry_item.src_offset_bytes
+        size = entry_item.size_bytes
+        src_block_id = entry_item.src_block_id
+        dst_block_id = entry_item.dst_block_id
+        src_stride = entry_item.src_stride_bytes
+        dst_stride = entry_item.dst_stride_bytes
+        count = entry_item.count
+        layer_idx = (
+            entry_item.layer_idx if entry_item.HasField("layer_idx") else 0
+        )
+        pool_group = (
+            entry_item.pool_group if entry_item.HasField("pool_group") else 0
+        )
+      else:
+        (
+            raw_peers,
+            dst_shard_idx,
+            dst_offset,
+            src_offset,
+            size,
+            src_block_id,
+            dst_block_id,
+            src_stride,
+            dst_stride,
+            count,
+            *extra,
+        ) = entry_item
+        layer_idx = extra[0] if extra else 0
+        pool_group = extra[1] if len(extra) > 1 else 0
+        if not isinstance(raw_peers, (list, tuple, set)):
+          raw_peers = [raw_peers]
+
+      key = (
+          dst_shard_idx,
+          dst_offset,
+          src_offset,
+          size,
+          src_block_id,
+          dst_block_id,
+          src_stride,
+          dst_stride,
+          count,
+          layer_idx,
+          pool_group,
+      )
+      if key not in groups:
+        groups[key] = []
+      for p in raw_peers:
+        if p and p not in groups[key]:
+          groups[key].append(p)
+
+    grouped_items = list(groups.items())
+    idx = 0
+    n_items = len(grouped_items)
+    while idx < n_items:
+      key, peers = grouped_items[idx]
+      (
+          dst_shard_idx,
+          dst_offset,
+          src_offset,
+          size,
+          src_block_id,
+          dst_block_id,
+          src_stride,
+          dst_stride,
+          count,
+          layer_idx,
+          pool_group,
+      ) = key
+      entry_proto = schedule_proto.entries.add()
+      if peers:
+        entry_proto.dst_peer = peers[0]
+        entry_proto.dst_peers.extend(peers)
+      entry_proto.dst_shard_idx = dst_shard_idx
+      entry_proto.dst_offset_bytes = dst_offset
+      entry_proto.src_offset_bytes = src_offset
+      entry_proto.size_bytes = size
+      entry_proto.src_block_id = src_block_id
+      entry_proto.dst_block_id = dst_block_id
+      entry_proto.src_stride_bytes = src_stride
+      entry_proto.dst_stride_bytes = dst_stride
+      entry_proto.count = count
+      entry_proto.layer_idx = layer_idx
+      entry_proto.pool_group = pool_group
+
+      run_len = 1
+      step_dst = 0
+      step_src = 0
+      if idx + 1 < n_items:
+        next_key, next_peers = grouped_items[idx + 1]
+        (
+            n_dst_shard_idx,
+            n_dst_offset,
+            n_src_offset,
+            n_size,
+            n_src_block_id,
+            n_dst_block_id,
+            n_src_stride,
+            n_dst_stride,
+            n_count,
+            n_layer_idx,
+            n_pool_group,
+        ) = next_key
+        # Only fold non-legacy linear byte offset progressions (where offsets
+        # advance rather than wrapping modulo block_bytes with changing IDs).
+        same_shape = (
+            count > 1
+            and next_peers == peers
+            and n_dst_shard_idx == dst_shard_idx
+            and n_size == size
+            and n_src_stride == src_stride
+            and n_dst_stride == dst_stride
+            and n_count == count
+            and n_layer_idx == layer_idx
+            and n_pool_group == pool_group
+        )
+        is_linear_offset = (
+            (n_src_block_id == src_block_id or n_src_offset > src_offset)
+            and (n_dst_block_id == dst_block_id or n_dst_offset > dst_offset)
+            and n_src_offset >= src_offset
+            and n_dst_offset >= dst_offset
+            and (n_src_offset > src_offset or n_dst_offset > dst_offset)
+        )
+        if same_shape and is_linear_offset:
+          step_dst = n_dst_offset - dst_offset
+          step_src = n_src_offset - src_offset
+          run_len = 2
+          while idx + run_len < n_items:
+            cand_key, cand_peers = grouped_items[idx + run_len]
+            (
+                c_dst_shard_idx,
+                c_dst_offset,
+                c_src_offset,
+                c_size,
+                c_src_block_id,
+                c_dst_block_id,
+                c_src_stride,
+                c_dst_stride,
+                c_count,
+                c_layer_idx,
+                c_pool_group,
+            ) = cand_key
+            if (
+                cand_peers == peers
+                and c_dst_shard_idx == dst_shard_idx
+                and c_size == size
+                and c_src_stride == src_stride
+                and c_dst_stride == dst_stride
+                and c_count == count
+                and c_layer_idx == layer_idx
+                and c_pool_group == pool_group
+                and c_dst_offset == dst_offset + run_len * step_dst
+                and c_src_offset == src_offset + run_len * step_src
+                and (c_src_block_id == src_block_id or step_src > 0)
+                and (c_dst_block_id == dst_block_id or step_dst > 0)
+            ):
+              run_len += 1
+            else:
+              break
+
+      if run_len > 1:
+        entry_proto.outer_counts.append(run_len)
+        entry_proto.outer_src_strides_bytes.append(step_src)
+        entry_proto.outer_dst_strides_bytes.append(step_dst)
+      idx += run_len
+
   def build_sender_push_schedule_protos(
-      self, push_schedules: dict[int, list[Any]]
+      self, push_schedules: dict[int, Any]
   ) -> dict[int, Any]:
-    """Builds ShardPushScheduleProto objects for shards from schedule tuples."""
+    """Builds ShardPushScheduleProto objects for shards from schedule tuples or plan_id dictionaries."""
     target_protos = {}
     for shard_idx, entries in push_schedules.items():
       schedule_proto = self._proto_module.ShardPushScheduleProto()
-      groups = {}
-      for entry_item in entries:
-        if hasattr(entry_item, "dst_peers") or hasattr(entry_item, "dst_peer"):
-          if entry_item.dst_peers:
-            raw_peers = list(entry_item.dst_peers)
-          elif entry_item.dst_peer:
-            raw_peers = [entry_item.dst_peer]
-          else:
-            raw_peers = []
-          dst_shard_idx = entry_item.dst_shard_idx
-          dst_offset = entry_item.dst_offset_bytes
-          src_offset = entry_item.src_offset_bytes
-          size = entry_item.size_bytes
-          src_block_id = entry_item.src_block_id
-          dst_block_id = entry_item.dst_block_id
-          src_stride = entry_item.src_stride_bytes
-          dst_stride = entry_item.dst_stride_bytes
-          count = entry_item.count
-          layer_idx = (
-              entry_item.layer_idx if entry_item.HasField("layer_idx") else 0
-          )
-          pool_group = (
-              entry_item.pool_group if entry_item.HasField("pool_group") else 0
-          )
-        else:
-          (
-              raw_peers,
-              dst_shard_idx,
-              dst_offset,
-              src_offset,
-              size,
-              src_block_id,
-              dst_block_id,
-              src_stride,
-              dst_stride,
-              count,
-              *extra,
-          ) = entry_item
-          layer_idx = extra[0] if extra else 0
-          pool_group = extra[1] if len(extra) > 1 else 0
-          if not isinstance(raw_peers, (list, tuple, set)):
-            raw_peers = [raw_peers]
-
-        key = (
-            dst_shard_idx,
-            dst_offset,
-            src_offset,
-            size,
-            src_block_id,
-            dst_block_id,
-            src_stride,
-            dst_stride,
-            count,
-            layer_idx,
-            pool_group,
+      if hasattr(entries, "plans_by_id") and hasattr(
+          entries, "variable_to_plan_id"
+      ):
+        plans_by_id = entries.plans_by_id
+        var_to_pid = entries.variable_to_plan_id
+        ordered_vars = getattr(entries, "_ordered_vars", None) or list(
+            var_to_pid.items()
         )
-        if key not in groups:
-          groups[key] = []
-        for p in raw_peers:
-          if p and p not in groups[key]:
-            groups[key].append(p)
-
-      grouped_items = list(groups.items())
-      idx = 0
-      n_items = len(grouped_items)
-      while idx < n_items:
-        key, peers = grouped_items[idx]
-        (
-            dst_shard_idx,
-            dst_offset,
-            src_offset,
-            size,
-            src_block_id,
-            dst_block_id,
-            src_stride,
-            dst_stride,
-            count,
-            layer_idx,
-            pool_group,
-        ) = key
-        entry_proto = schedule_proto.entries.add()
-        if peers:
-          entry_proto.dst_peer = peers[0]
-          entry_proto.dst_peers.extend(peers)
-        entry_proto.dst_shard_idx = dst_shard_idx
-        entry_proto.dst_offset_bytes = dst_offset
-        entry_proto.src_offset_bytes = src_offset
-        entry_proto.size_bytes = size
-        entry_proto.src_block_id = src_block_id
-        entry_proto.dst_block_id = dst_block_id
-        entry_proto.src_stride_bytes = src_stride
-        entry_proto.dst_stride_bytes = dst_stride
-        entry_proto.count = count
-        entry_proto.layer_idx = layer_idx
-        entry_proto.pool_group = pool_group
-
-        run_len = 1
-        step_dst = 0
-        step_src = 0
-        if idx + 1 < n_items:
-          next_key, next_peers = grouped_items[idx + 1]
-          (
-              n_dst_shard_idx,
-              n_dst_offset,
-              n_src_offset,
-              n_size,
-              n_src_block_id,
-              n_dst_block_id,
-              n_src_stride,
-              n_dst_stride,
-              n_count,
-              n_layer_idx,
-              n_pool_group,
-          ) = next_key
-          # Only fold non-legacy linear byte offset progressions (where offsets
-          # advance rather than wrapping modulo block_bytes with changing block IDs).
-          same_shape = (
-              count > 1
-              and next_peers == peers
-              and n_dst_shard_idx == dst_shard_idx
-              and n_size == size
-              and n_src_stride == src_stride
-              and n_dst_stride == dst_stride
-              and n_count == count
-              and n_layer_idx == layer_idx
-              and n_pool_group == pool_group
-          )
-          is_linear_offset = (
-              (n_src_block_id == src_block_id or n_src_offset > src_offset)
-              and (n_dst_block_id == dst_block_id or n_dst_offset > dst_offset)
-              and n_src_offset >= src_offset
-              and n_dst_offset >= dst_offset
-              and (n_src_offset > src_offset or n_dst_offset > dst_offset)
-          )
-          if same_shape and is_linear_offset:
-            step_dst = n_dst_offset - dst_offset
-            step_src = n_src_offset - src_offset
-            run_len = 2
-            while idx + run_len < n_items:
-              cand_key, cand_peers = grouped_items[idx + run_len]
-              (
-                  c_dst_shard_idx,
-                  c_dst_offset,
-                  c_src_offset,
-                  c_size,
-                  c_src_block_id,
-                  c_dst_block_id,
-                  c_src_stride,
-                  c_dst_stride,
-                  c_count,
-                  c_layer_idx,
-                  c_pool_group,
-              ) = cand_key
-              if (
-                  cand_peers == peers
-                  and c_dst_shard_idx == dst_shard_idx
-                  and c_size == size
-                  and c_src_stride == src_stride
-                  and c_dst_stride == dst_stride
-                  and c_count == count
-                  and c_layer_idx == layer_idx
-                  and c_pool_group == pool_group
-                  and c_dst_offset == dst_offset + run_len * step_dst
-                  and c_src_offset == src_offset + run_len * step_src
-                  and (c_src_block_id == src_block_id or step_src > 0)
-                  and (c_dst_block_id == dst_block_id or step_dst > 0)
-              ):
-                run_len += 1
-              else:
-                break
-
-        if run_len > 1:
-          entry_proto.outer_counts.append(run_len)
-          entry_proto.outer_src_strides_bytes.append(step_src)
-          entry_proto.outer_dst_strides_bytes.append(step_dst)
-        idx += run_len
+        if len(var_to_pid) == len(ordered_vars):
+          folded_plans_by_id = {}
+          for plan_id, plan_entries in plans_by_id.items():
+            if plan_entries:
+              plan_proto = self._proto_module.ShardPushScheduleProto()
+              self._populate_schedule_proto_entries(plan_proto, plan_entries)
+              folded_plans_by_id[plan_id] = plan_proto.entries
+          for layer_idx, plan_id in ordered_vars:
+            tmpl_entries = folded_plans_by_id.get(plan_id)
+            if tmpl_entries:
+              for tmpl_entry in tmpl_entries:
+                entry_copy = schedule_proto.entries.add()
+                entry_copy.CopyFrom(tmpl_entry)
+                entry_copy.layer_idx = layer_idx
+        else:
+          self._populate_schedule_proto_entries(schedule_proto, entries)
+      else:
+        self._populate_schedule_proto_entries(schedule_proto, entries)
       target_protos[shard_idx] = schedule_proto
     return target_protos
 

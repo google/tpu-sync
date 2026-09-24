@@ -93,6 +93,106 @@ def _is_variable_spec_identical(
   )
 
 
+class _PlanReferencedShardSchedule(abc.Sequence):
+  """Shard push schedule backed by a plan_id dictionary and variable->plan_id map.
+
+  Instead of duplicating schedule entry tuples for every variable that shares
+  identical shape, source sharding, destination sharding, and layout, each
+  unique variable plan is stored once in `plans_by_id[plan_id]`, and each
+  variable (`layer_idx`) references its `plan_id` via `variable_to_plan_id`.
+  """
+
+  def __init__(
+      self,
+      plans_by_id: dict[int, list[tuple[Any, ...]]],
+      variable_to_plan_id: dict[int, int],
+      ordered_vars_and_plans: Optional[list[tuple[int, int]]] = None,
+  ) -> None:
+    self.plans_by_id = plans_by_id
+    self.variable_to_plan_id = variable_to_plan_id
+    self._ordered_vars = (
+        ordered_vars_and_plans
+        if ordered_vars_and_plans is not None
+        else list(variable_to_plan_id.items())
+    )
+    self._total_len: Optional[int] = None
+    self._materialized: Optional[list[tuple[Any, ...]]] = None
+
+  def get_plan_id(self, layer_idx: int) -> Optional[int]:
+    """Returns the unique plan_id referenced by `layer_idx`."""
+    return self.variable_to_plan_id.get(layer_idx)
+
+  def get_plan(self, layer_idx: int) -> list[tuple[Any, ...]]:
+    """Returns the stored template entries for `layer_idx` via its `plan_id`."""
+    plan_id = self.variable_to_plan_id.get(layer_idx)
+    if plan_id is None:
+      return []
+    return self.plans_by_id.get(plan_id, [])
+
+  @property
+  def unique_entry_count(self) -> int:
+    """Returns the number of unique schedule entries stored across all plan_ids."""
+    return sum(len(entries) for entries in self.plans_by_id.values())
+
+  def __len__(self) -> int:
+    if self._total_len is None:
+      plans = self.plans_by_id
+      self._total_len = sum(
+          len(plans.get(pid, ())) for _, pid in self._ordered_vars
+      )
+    return self._total_len
+
+  def __bool__(self) -> bool:
+    return any(bool(entries) for entries in self.plans_by_id.values())
+
+  def __iter__(self):
+    plans = self.plans_by_id
+    for layer_idx, pid in self._ordered_vars:
+      entries = plans.get(pid)
+      if entries:
+        for p0, p1, p2, p3, p4, p5, p6, p7, p8, p9 in entries:
+          yield (p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, layer_idx, 0)
+
+  def _ensure_materialized(self) -> list[tuple[Any, ...]]:
+    if self._materialized is None:
+      self._materialized = list(iter(self))
+    return self._materialized
+
+  def __getitem__(self, index):
+    if isinstance(index, slice):
+      return self._ensure_materialized()[index]
+    n = len(self)
+    if index < 0:
+      index += n
+    if index < 0 or index >= n:
+      raise IndexError("schedule index out of range")
+    plans = self.plans_by_id
+    offset = 0
+    for layer_idx, pid in self._ordered_vars:
+      entries = plans.get(pid)
+      if not entries:
+        continue
+      elen = len(entries)
+      if index < offset + elen:
+        p0, p1, p2, p3, p4, p5, p6, p7, p8, p9 = entries[index - offset]
+        return (p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, layer_idx, 0)
+      offset += elen
+    raise IndexError("schedule index out of range")
+
+  def __eq__(self, other: Any) -> bool:
+    if isinstance(other, _PlanReferencedShardSchedule):
+      if (
+          self.plans_by_id == other.plans_by_id
+          and self._ordered_vars == other._ordered_vars
+      ):
+        return True
+    if isinstance(other, abc.Sequence):
+      return len(self) == len(other) and self._ensure_materialized() == list(
+          other
+      )
+    return False
+
+
 @dataclasses.dataclass
 class _CachedTransferSchedule:
   """Cached pre-computed transfer schedules and metadata for resharding plans."""
@@ -119,6 +219,16 @@ class _CachedTransferSchedule:
   cached_serialized_payloads: dict[Any, bytes] = dataclasses.field(
       default_factory=dict
   )
+  # Dictionary of unique calculated variable plans per source unit:
+  # {src_unit: {plan_id: {shard_idx: [entry_tuples]}}}
+  variable_plans: dict[Any, dict[int, dict[int, list[Any]]]] = (
+      dataclasses.field(default_factory=dict)
+  )
+  # Mapping from each variable/layer index to its deduplicated plan_id:
+  # {src_unit: {layer_idx: plan_id}}
+  variable_to_plan_id: dict[Any, dict[int, int]] = dataclasses.field(
+      default_factory=dict
+  )
 
 
 @dataclasses.dataclass
@@ -133,9 +243,9 @@ class TransferPlan:
   # index, and the n-dimensional slice offsets for the shard index.
   plan: dict[RaidenId, list[list[tuple[RaidenId, int, list[NDSlice]]]]]
 
-  shard_push_schedules: dict[
-      RaidenId, dict[int, list[tuple[str, int, int, int, int, int, int]]]
-  ] = dataclasses.field(default_factory=dict)
+  shard_push_schedules: dict[RaidenId, dict[int, Any]] = dataclasses.field(
+      default_factory=dict
+  )
 
   # Maps every RaidenId in the plan to its physical Control-Plane RPC
   # address
@@ -195,6 +305,12 @@ class TransferPlan:
       default_factory=dict, repr=False, compare=False
   )
   endpoint_to_shards: dict[Any, Any] = dataclasses.field(
+      default_factory=dict, repr=False, compare=False
+  )
+  variable_plans: dict[RaidenId, dict[int, dict[int, list[Any]]]] = (
+      dataclasses.field(default_factory=dict, repr=False, compare=False)
+  )
+  variable_to_plan_id: dict[RaidenId, dict[int, int]] = dataclasses.field(
       default_factory=dict, repr=False, compare=False
   )
 
@@ -393,6 +509,7 @@ def _entity_key_from_unit(unit: RaidenId) -> RaidenId:
 
 VariableMetadata = _VariableMetadata
 CachedTransferSchedule = _CachedTransferSchedule
+PlanReferencedShardSchedule = _PlanReferencedShardSchedule
 coerce_variable_proto = _coerce_variable_proto
 is_variable_spec_identical = _is_variable_spec_identical
 extract_host_ip = _extract_host_ip

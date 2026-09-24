@@ -5716,6 +5716,104 @@ class JobEntityTest(absltest.TestCase):
     finally:
       controller.worker_rpc_client.close()
 
+  def test_variable_signature_deduplication_across_layers(self):
+    """Verifies identical-shape variables across layers reuse schedule templates."""
+    controller = raiden_controller.RaidenController(
+        port=0, enable_plan_cache=False
+    )
+    try:
+      num_src_shards = 8
+      num_layers = 10
+      src_unit = raiden_controller.RaidenId("src", "0", "weights", 0)
+      dst_unit = raiden_controller.RaidenId("dst", "0", "weights", 0)
+
+      src_vars = [
+          raiden_service_pb2.VariableMetadataProto(
+              name=f"layer_{l}_weight",
+              shape=[64, 64],
+              mesh_shape=[8, 1],
+              layout=[1, 0],
+              item_size=4,
+              layer_idx=l,
+              global_shard_indices=list(range(num_src_shards)),
+          )
+          for l in range(num_layers)
+      ]
+      dst_vars = [
+          raiden_service_pb2.VariableMetadataProto(
+              name=f"layer_{l}_weight",
+              shape=[64, 64],
+              mesh_shape=[4, 1],
+              layout=[1, 0],
+              item_size=4,
+              layer_idx=l,
+              global_shard_indices=[0, 1, 2, 3],
+          )
+          for l in range(num_layers)
+      ]
+
+      controller.register_work_unit(
+          src_unit,
+          [f"10.0.0.1:{8000 + i}" for i in range(num_src_shards)],
+          control_plane_rpc_address="10.0.0.1:9000",
+          variables=src_vars,
+      )
+      controller.register_work_unit(
+          dst_unit,
+          [f"10.0.1.1:{8000 + i}" for i in range(4)],
+          control_plane_rpc_address="10.0.1.1:9000",
+          variables=dst_vars,
+      )
+
+      original_get_global_indices = (
+          raiden_controller.reshard_planner._get_global_indices
+      )
+      call_units = []
+
+      def counting_get_global_indices(unit, *args, **kwargs):
+        call_units.append(unit)
+        return original_get_global_indices(unit, *args, **kwargs)
+
+      with mock.patch.object(
+          raiden_controller.reshard_planner,
+          "_get_global_indices",
+          side_effect=counting_get_global_indices,
+      ):
+        loop = asyncio.new_event_loop()
+        try:
+          schedule = loop.run_until_complete(
+              controller._compute_transfer_schedule(
+                  src_units=[src_unit],
+                  dst_units=[dst_unit],
+              )
+          )
+        finally:
+          loop.close()
+
+      # Despite 10 layers, _get_global_indices is called only once for src_unit
+      # and once for dst_unit because all 10 layers share the same variable
+      # signature, and only 1 unique plan_id is stored in variable_plans.
+      self.assertEqual(call_units, [src_unit, dst_unit])
+      self.assertLen(schedule.variable_plans[src_unit], 1)
+      self.assertEqual(
+          schedule.variable_to_plan_id[src_unit],
+          {i: 0 for i in range(num_layers)},
+      )
+      src_ent = controller.get_or_create_entity(src_unit)
+      protos = src_ent.build_sender_push_schedule_protos(
+          schedule.computed_schedules[src_unit]
+      )
+      self.assertEqual(
+          sorted({e.layer_idx for e in protos[0].entries}),
+          list(range(num_layers)),
+      )
+      for local_idx in range(num_src_shards):
+        entries = schedule.computed_schedules[src_unit][local_idx]
+        layers_seen = sorted({e[10] for e in entries})
+        self.assertEqual(layers_seen, list(range(num_layers)))
+    finally:
+      controller.worker_rpc_client.close()
+
 
 if __name__ == "__main__":
   absltest.main()

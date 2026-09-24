@@ -1235,6 +1235,8 @@ class RaidenController:
                   if not broadcast_groups
                   else {}
               ),
+              variable_plans=cached_schedule.variable_plans,
+              variable_to_plan_id=cached_schedule.variable_to_plan_id,
           )
           with self._lock:
             self._active_transfers[req_id] = final_plan
@@ -1273,6 +1275,8 @@ class RaidenController:
                 cached_serialized_payloads=(
                     cached_schedule.cached_serialized_payloads
                 ),
+                variable_plans=cached_schedule.variable_plans,
+                variable_to_plan_id=cached_schedule.variable_to_plan_id,
             )
 
           # 1. Arm direct schedule receivers

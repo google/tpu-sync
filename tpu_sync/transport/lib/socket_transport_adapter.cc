@@ -242,7 +242,6 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
   const size_t num_blocks = src_block_ids.size();
   const auto& req = requests.front();
   const uint64_t uuid = req.uuid;
-  const int layer_idx = req.layer_idx;
   const int P = req.parallelism;
   if (P <= 0) {
     return ReportError(on_complete, absl::InvalidArgumentError(
@@ -322,7 +321,6 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
 
     auto task = std::make_unique<WriteTask>();
     task->uuid = uuid;
-    task->layer_idx = layer_idx;
     task->stream_idx = i;
     task->peer = remote_peer;
     task->run = std::move(task_run);
@@ -596,8 +594,8 @@ absl::Status SocketTransportAdapter::PostSocketPullInternal(
            requests[i].remote_id == remote_read_block_id &&
            requests[i].count_or_size == remote_count) {
       const uint32_t cur_req_id = requests[i].request_id;
-      const size_t l = static_cast<size_t>(requests[i].layer_idx);
-      const size_t sh = static_cast<size_t>(requests[i].shard_idx);
+      const uint32_t l = static_cast<uint32_t>(requests[i].buffer_id >> 32);
+      const uint32_t sh = static_cast<uint32_t>(requests[i].buffer_id);
       const int dst_id = static_cast<int>(requests[i].local_id);
 
       size_t j = i;

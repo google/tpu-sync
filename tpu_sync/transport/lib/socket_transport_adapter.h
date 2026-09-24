@@ -64,7 +64,6 @@ class SocketTransportAdapter : public TransportAdapter {
  private:
   struct WriteTask {
     uint64_t uuid;
-    int layer_idx;
     int stream_idx;
     std::string peer;
     std::function<void()> run;

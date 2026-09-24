@@ -862,23 +862,22 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
 
 lib::Request BlockTransport::BuildBlockRequest(
     uint8_t socket_opcode, uint8_t* laddr, size_t len, uint32_t count_or_size,
-    int layer_idx, uint32_t request_id, uint64_t uuid, int parallelism,
+    uint32_t request_id, uint64_t uuid, uint64_t buffer_id, int parallelism,
     MajorOrder major_order, uint32_t remote_id, uint32_t local_id,
-    int shard_idx, int stream_idx, BlockReceivedCallback on_block_received) {
+    int stream_idx, BlockReceivedCallback on_block_received) {
   return lib::Request{
       .socket_opcode = socket_opcode,
       .laddr = laddr,
       .raddr = nullptr,
       .len = len,
+      .buffer_id = buffer_id,
       .major_order = static_cast<uint8_t>(major_order),
-      .layer_idx = layer_idx,
       .parallelism = parallelism,
       .remote_id = remote_id,
       .local_id = local_id,
       .count_or_size = count_or_size,
       .uuid = uuid,
       .request_id = request_id,
-      .shard_idx = shard_idx,
       .stream_idx = stream_idx,
       .on_block_received = std::move(on_block_received),
   };
@@ -897,8 +896,8 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
   if (num_blocks == 0) {
     return std::vector<lib::Request>{BuildBlockRequest(
         socket_opcode, /*laddr=*/nullptr, /*len=*/0, /*count_or_size=*/0,
-        layer_idx, /*request_id=*/0, uuid, parallelism, major_order, remote_id,
-        local_id, /*shard_idx=*/0, /*stream_idx=*/0)};
+        /*request_id=*/0, uuid, /*buffer_id=*/0, parallelism, major_order,
+        remote_id, local_id, /*stream_idx=*/0)};
   }
 
   std::vector<int> target_layers;
@@ -946,12 +945,15 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
           }
           ABSL_RETURN_IF_ERROR(ValidateChunks(block_delegate_, l, sh, chunks));
 
-          const int shard_idx = static_cast<int>(sh);
+          // What the receiver needs to handle these chunks. Uses the iterated
+          // layer `l`, not `layer_idx` (which is -1 for all-layer pushes).
+          const uint64_t buffer_id = (static_cast<uint64_t>(l) << 32) |
+                                     static_cast<uint32_t>(sh);
           for (const auto& chunk : chunks) {
             requests.push_back(BuildBlockRequest(
-                socket_opcode, chunk.ptr, chunk.size, count_or_size, layer_idx,
-                request_id, uuid, parallelism, major_order, remote_id, local_id,
-                shard_idx, /*stream_idx=*/i));
+                socket_opcode, chunk.ptr, chunk.size, count_or_size, request_id,
+                uuid, buffer_id, parallelism, major_order, remote_id, local_id,
+                /*stream_idx=*/i));
           }
           ++request_id;
           return absl::OkStatus();
@@ -1084,9 +1086,11 @@ BlockTransport::BuildBlockPullRequests(
                 explicit_dst_ptrs[l * block_delegate_->num_shards() + sh];
           }
 
-          const int layer_id = static_cast<int>(l);
-          const int shard_idx = static_cast<int>(sh);
           const uint32_t local_id = static_cast<uint32_t>(dst_id);
+          // What the source serving this pull needs to locate and bounds-check
+          // the data.
+          const uint64_t buffer_id = (static_cast<uint64_t>(l) << 32) |
+                                     static_cast<uint32_t>(sh);
 
           for (auto& bc : block_chunks) {
             if (!explicit_dst_ptrs.empty()) {
@@ -1095,9 +1099,9 @@ BlockTransport::BuildBlockPullRequests(
                            : nullptr;
             }
             requests.push_back(BuildBlockRequest(
-                /*socket_opcode=*/2, bc.ptr, bc.size, count_or_size, layer_id,
-                request_id, uuid, parallelism, major_order, remote_id, local_id,
-                shard_idx, /*stream_idx=*/i, on_block_received));
+                /*socket_opcode=*/2, bc.ptr, bc.size, count_or_size, request_id,
+                uuid, buffer_id, parallelism, major_order, remote_id, local_id,
+                /*stream_idx=*/i, on_block_received));
           }
           ++request_id;
           return absl::OkStatus();

@@ -143,10 +143,9 @@ class BlockTransport final {
  private:
   lib::Request BuildBlockRequest(
       uint8_t socket_opcode, uint8_t* laddr, size_t len, uint32_t count_or_size,
-      int layer_idx, uint32_t request_id, uint64_t uuid, int parallelism,
+      uint32_t request_id, uint64_t uuid, uint64_t buffer_id, int parallelism,
       MajorOrder major_order, uint32_t remote_id, uint32_t local_id,
-      int shard_idx, int stream_idx = 0,
-      BlockReceivedCallback on_block_received = nullptr);
+      int stream_idx = 0, BlockReceivedCallback on_block_received = nullptr);
 
   // Builds a batch of Requests for block transfer.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockRequests(

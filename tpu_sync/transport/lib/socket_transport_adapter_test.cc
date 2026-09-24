@@ -319,9 +319,20 @@ TEST(SocketTransportAdapterTest, PostSocketPullOp2Success) {
   req.remote_id = 10;
   req.local_id = 20;
   req.uuid = 99;
+  req.buffer_id = (uint64_t{3} << 32) | 5;  // layer 3, shard 5.
   req.parallelism = 1;
   req.request_id = 0;
   req.stream_idx = 0;
+  size_t got_layer = 0, got_shard = 0, got_size = 0;
+  int got_block = -1;
+  req.on_block_received = [&](size_t layer, size_t shard, int block_id,
+                              size_t size) {
+    got_layer = layer;
+    got_shard = shard;
+    got_block = block_id;
+    got_size = size;
+    return absl::OkStatus();
+  };
 
   auto handle = client_adapter.Post(
       /*peers=*/{GetIpPort(server_transport)},
@@ -329,6 +340,10 @@ TEST(SocketTransportAdapterTest, PostSocketPullOp2Success) {
 
   ASSERT_THAT(handle.status(), absl_testing::IsOk());
   EXPECT_THAT(recv_buf, ::testing::ElementsAre(1, 2, 3, 4));
+  EXPECT_EQ(got_layer, 3);
+  EXPECT_EQ(got_shard, 5);
+  EXPECT_EQ(got_block, 20);
+  EXPECT_EQ(got_size, 4);
 }
 
 TEST(SocketTransportAdapterTest,

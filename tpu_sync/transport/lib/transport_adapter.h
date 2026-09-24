@@ -43,7 +43,13 @@ struct Request {
   uint8_t* laddr;
   uint8_t* raddr;
   size_t len;
-
+  // Opaque to the transport; carries what the peer handling the request needs.
+  // Layout:
+  //    63                   32 31                    0
+  //   +-----------------------+-----------------------+
+  //   |   layer_idx (32 bits) |   shard_idx (32 bits) |
+  //   +-----------------------+-----------------------+
+  uint64_t buffer_id;
   uint8_t major_order;
   int layer_idx;
   int parallelism;
@@ -54,7 +60,6 @@ struct Request {
   uint32_t count_or_size;
   uint64_t uuid;
   uint32_t request_id;
-  int shard_idx;
   int stream_idx;
   size_t dst_stride_bytes = 0;
   size_t stride_count = 1;

@@ -168,28 +168,6 @@ bool IsValidIp(absl::string_view ip) {
          inet_pton(AF_INET6, buf, addr) == 1;
 }
 
-absl::string_view ExtractIpFromEndpoint(absl::string_view endpoint) {
-  if (endpoint.empty()) {
-    return metric_labels::kUnknownIp;
-  }
-  absl::string_view host = endpoint;
-  if (const size_t colon = host.rfind(':');
-      colon != absl::string_view::npos &&
-      (host.find(':') == colon ||
-       (host.starts_with('[') && colon > 0 && host[colon - 1] == ']'))) {
-    int port = -1;
-    if (!absl::SimpleAtoi(host.substr(colon + 1), &port) || port < 0 ||
-        port > 65535) {
-      return metric_labels::kUnknownIp;
-    }
-    host = host.substr(0, colon);
-  }
-  if (host.starts_with('[') && host.ends_with(']')) {
-    host = host.substr(1, host.size() - 2);
-  }
-  return IsValidIp(host) ? host : metric_labels::kUnknownIp;
-}
-
 }  // namespace
 
 std::optional<absl::string_view> FormatShmLabelsToBuffer(
@@ -309,6 +287,29 @@ std::string PrometheusLabelView::ToOwned() {
     return std::exchange(heap_fallback_, std::string());
   }
   return std::string(current_view);
+}
+
+absl::string_view ExtractIpFromEndpoint(
+    absl::string_view endpoint ABSL_ATTRIBUTE_LIFETIME_BOUND) {
+  if (endpoint.empty()) {
+    return metric_labels::kUnknownIp;
+  }
+  absl::string_view host = endpoint;
+  if (const size_t colon = host.rfind(':');
+      colon != absl::string_view::npos &&
+      (host.find(':') == colon ||
+       (host.starts_with('[') && colon > 0 && host[colon - 1] == ']'))) {
+    int port = -1;
+    if (!absl::SimpleAtoi(host.substr(colon + 1), &port) || port < 0 ||
+        port > kMaxPort) {
+      return metric_labels::kUnknownIp;
+    }
+    host = host.substr(0, colon);
+  }
+  if (host.starts_with('[') && host.ends_with(']')) {
+    host = host.substr(1, host.size() - 2);
+  }
+  return IsValidIp(host) ? host : metric_labels::kUnknownIp;
 }
 
 absl::string_view ExtractFirstEndpointIp(

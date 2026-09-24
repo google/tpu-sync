@@ -45,10 +45,12 @@
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
+#include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
@@ -81,6 +83,8 @@ using ::peregrine::ReadExact;
 using ::peregrine::ReadVExact;
 using ::peregrine::WriteExact;
 using ::peregrine::WriteVExact;
+using ::tpu_raiden::telemetry::ExtractFirstEndpointIp;
+using ::tpu_raiden::telemetry::ExtractIpFromEndpoint;
 using ::tpu_raiden::telemetry::MetricLabel;
 using ::tpu_raiden::telemetry::RaidenMetricStore;
 namespace metric_labels = ::tpu_raiden::telemetry::metric_labels;
@@ -103,10 +107,26 @@ constexpr MetricLabel kPushLabels[] = {
     {.key = metric_labels::kDirection, .value = metric_labels::kDirectionPush},
 };
 
-constexpr MetricLabel kPullResponseLabels[] = {
-    {.key = metric_labels::kDirection,
-     .value = metric_labels::kDirectionPullResponse},
-};
+void RecordPullResponseSentBytes(int client_fd,
+                                 absl::Span<const std::string> local_ips,
+                                 uint64_t total_size) {
+  RaidenMetricStore& store = RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) return;
+  const std::string addr_pair = peregrine::GetAddrPortPair(client_fd);
+  const std::pair<absl::string_view, absl::string_view> endpoints =
+      absl::StrSplit(addr_pair, absl::MaxSplits(" <> ", 1));
+  const absl::string_view peer_endpoint = endpoints.second;
+  const MetricLabel pull_response_labels[] = {
+      {.key = metric_labels::kDirection,
+       .value = metric_labels::kDirectionPullResponse},
+      {.key = metric_labels::kSrcIp,
+       .value = ExtractFirstEndpointIp(local_ips)},
+      {.key = metric_labels::kDstIp,
+       .value = ExtractIpFromEndpoint(peer_endpoint)},
+  };
+  store.IncrementCounter(metric_names::kSentBytesTotal, pull_response_labels,
+                         total_size);
+}
 
 constexpr uint8_t kUseBlockChunksFlag = 0x80;
 
@@ -667,8 +687,8 @@ void BlockTransport::TriggerNextSendStep(
           if (total_size > 0) {
             // TODO: Add interface name (e.g. eth0, lo) using
             // GetSocketLocalNic(state->client_fd) as a label key.
-            RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
-                metric_names::kSentBytesTotal, kPullResponseLabels, total_size);
+            RecordPullResponseSentBytes(state->client_fd,
+                                        raw_transport_.local_ips(), total_size);
           }
 
           state->current_step++;

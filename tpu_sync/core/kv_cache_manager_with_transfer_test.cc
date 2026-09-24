@@ -131,6 +131,25 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
   auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
   telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
   EXPECT_CALL(*raw_mock,
+              IncrementCounter(
+                  telemetry::metric_names::kSentBytesTotal,
+                  ElementsAre(
+                      telemetry::MetricLabel{
+                          .key = telemetry::metric_labels::kDirection,
+                          .value = telemetry::metric_labels::kDirectionPush},
+                      HasResolvedIpLabel(telemetry::metric_labels::kSrcIp),
+                      HasResolvedIpLabel(telemetry::metric_labels::kDstIp)),
+                  Gt(0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(telemetry::metric_names::kReceivedBytesTotal,
+                       ElementsAre(telemetry::MetricLabel{
+                           .key = telemetry::metric_labels::kDirection,
+                           .value = telemetry::metric_labels::kDirectionPush}),
+                       Gt(0)))
+      .Times(1);
+  EXPECT_CALL(*raw_mock,
               ObserveHistogram(telemetry::metric_names::kTransferDurationMs,
                                IsEmpty(), Gt(0.0)))
       .Times(1);

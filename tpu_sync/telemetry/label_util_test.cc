@@ -720,5 +720,24 @@ TEST(LabelUtilTest, ExtractFirstEndpointIp) {
   const std::vector<std::string> endpoints = {"10.0.0.1:9100", "10.0.0.2:9100"};
   EXPECT_EQ(ExtractFirstEndpointIp(endpoints), "10.0.0.1");
 }
+
+TEST(LabelUtilTest, ExtractIpFromEndpoint) {
+  EXPECT_EQ(ExtractIpFromEndpoint("10.0.0.1:9100"), "10.0.0.1");
+  EXPECT_EQ(ExtractIpFromEndpoint("10.0.0.1:0"), "10.0.0.1");
+  EXPECT_EQ(ExtractIpFromEndpoint("10.0.0.1:65535"), "10.0.0.1");
+  EXPECT_EQ(ExtractIpFromEndpoint("10.0.0.1"), "10.0.0.1");
+  EXPECT_EQ(ExtractIpFromEndpoint("[2001:db8::1]:9100"), "2001:db8::1");
+  EXPECT_EQ(ExtractIpFromEndpoint("[::1]:65535"), "::1");
+  EXPECT_EQ(ExtractIpFromEndpoint("[::1]"), "::1");
+  EXPECT_EQ(ExtractIpFromEndpoint("2001:db8::1"), "2001:db8::1");
+
+  EXPECT_EQ(ExtractIpFromEndpoint(""), metric_labels::kUnknownIp);
+  EXPECT_EQ(ExtractIpFromEndpoint("?"), metric_labels::kUnknownIp);
+  EXPECT_EQ(ExtractIpFromEndpoint("*"), metric_labels::kUnknownIp);
+  EXPECT_EQ(ExtractIpFromEndpoint("localhost:9100"), metric_labels::kUnknownIp);
+  EXPECT_EQ(ExtractIpFromEndpoint("10.0.0.1:65536"), metric_labels::kUnknownIp);
+  EXPECT_EQ(ExtractIpFromEndpoint("10.0.0.1:-1"), metric_labels::kUnknownIp);
+  EXPECT_EQ(ExtractIpFromEndpoint("[::1]:65536"), metric_labels::kUnknownIp);
+}
 }  // namespace
 }  // namespace tpu_raiden::telemetry

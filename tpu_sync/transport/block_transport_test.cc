@@ -1027,7 +1027,8 @@ TEST_P(BlockTransportTest, SentBytesTelemetryIncrementedOnPushAndPull) {
   ABSL_ASSERT_OK(push_res);
 
   constexpr absl::string_view kExpectedPushMetric =
-      "tpu_raiden_sent_bytes_total{direction=\"push\"} 1024";
+      "tpu_raiden_sent_bytes_total{direction=\"push\",dst_ip=\"unknown\","
+      "src_ip=\"unknown\"} 1024";
   const std::string snapshot1 = WaitForMetricSnapshot(kExpectedPushMetric);
   EXPECT_THAT(snapshot1, HasSubstr(kExpectedPushMetric));
 
@@ -1039,11 +1040,16 @@ TEST_P(BlockTransportTest, SentBytesTelemetryIncrementedOnPushAndPull) {
                           /*parallelism=*/1, MajorOrder::kLayerMajor,
                           /*on_block_received=*/{}, /*uuid=*/0));
 
-  constexpr absl::string_view kExpectedPullResponseMetric =
-      "tpu_raiden_sent_bytes_total{direction=\"pull_response\"} 1024";
+  constexpr absl::string_view kExpectedPullResponsePrefix =
+      "tpu_raiden_sent_bytes_total{direction=\"pull_response\",";
   const std::string snapshot2 =
-      WaitForMetricSnapshot(kExpectedPullResponseMetric);
-  EXPECT_THAT(snapshot2, HasSubstr(kExpectedPullResponseMetric));
+      WaitForMetricSnapshot(kExpectedPullResponsePrefix);
+  EXPECT_THAT(
+      snapshot2,
+      AnyOf(HasSubstr("tpu_raiden_sent_bytes_total{direction=\"pull_response\","
+                      "dst_ip=\"::1\",src_ip=\"unknown\"} 1024"),
+            HasSubstr("tpu_raiden_sent_bytes_total{direction=\"pull_response\","
+                      "dst_ip=\"127.0.0.1\",src_ip=\"unknown\"} 1024")));
 }
 
 TEST_P(BlockTransportTest, ReceivedBytesTelemetryIncrementedOnPushAndPull) {

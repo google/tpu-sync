@@ -67,14 +67,25 @@ using ::tpu_raiden::telemetry::RaidenMetricStore;
 namespace metric_labels = ::tpu_raiden::telemetry::metric_labels;
 namespace metric_names = ::tpu_raiden::telemetry::metric_names;
 
-constexpr MetricLabel kPushLabels[] = {
-    {.key = metric_labels::kDirection, .value = metric_labels::kDirectionPush},
-};
-
 constexpr MetricLabel kPullResponseLabels[] = {
     {.key = metric_labels::kDirection,
      .value = metric_labels::kDirectionPullResponse},
 };
+
+void RecordPushSentBytes(absl::Span<const std::string> local_ips,
+                         absl::string_view dst_ip, uint64_t bytes_sent) {
+  RaidenMetricStore& store = RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) return;
+  const MetricLabel push_labels[] = {
+      {.key = metric_labels::kDirection,
+       .value = metric_labels::kDirectionPush},
+      {.key = metric_labels::kSrcIp,
+       .value = ExtractFirstEndpointIp(local_ips)},
+      {.key = metric_labels::kDstIp, .value = dst_ip},
+  };
+  store.IncrementCounter(metric_names::kSentBytesTotal, push_labels,
+                         bytes_sent);
+}
 
 void RecordP2pTransferTime(std::chrono::steady_clock::time_point start_ts,
                            std::chrono::steady_clock::time_point end_ts,
@@ -282,7 +293,7 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
                      statuses, remaining_workers, shared_on_complete,
                      push_start_ts]() {
       (*statuses)[i] = PostSocketPushInternal(
-          remote_peer, local_ip, stream_requests, *shared_src_block_ids,
+          remote_peer, local_ip, dst_ip, stream_requests, *shared_src_block_ids,
           *shared_dst_block_ids, block_offset, *allocated_ids);
 
       if (remaining_workers->fetch_sub(1) == 1) {
@@ -337,9 +348,9 @@ absl::StatusOr<Status> SocketTransportAdapter::Poll(Handle handle) {
 
 absl::Status SocketTransportAdapter::PostSocketPushInternal(
     absl::string_view peer, absl::string_view local_ip,
-    absl::Span<const Request> requests, absl::Span<const int> src_block_ids,
-    absl::Span<const int> dst_block_ids, size_t block_offset,
-    std::vector<int>& allocated_ids) {
+    absl::string_view dst_ip, absl::Span<const Request> requests,
+    absl::Span<const int> src_block_ids, absl::Span<const int> dst_block_ids,
+    size_t block_offset, std::vector<int>& allocated_ids) {
   if (requests.empty()) {
     return absl::OkStatus();
   }
@@ -439,8 +450,7 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
   }
 
   if (stream_bytes_sent > 0) {
-    RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
-        metric_names::kSentBytesTotal, kPushLabels, stream_bytes_sent);
+    RecordPushSentBytes(raw_transport_->local_ips(), dst_ip, stream_bytes_sent);
   }
 
   uint8_t ack = 0;

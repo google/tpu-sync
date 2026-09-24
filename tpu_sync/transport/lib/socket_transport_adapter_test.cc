@@ -58,6 +58,17 @@ auto MatchDirectionLabel(absl::string_view dir) {
       .key = telemetry::metric_labels::kDirection, .value = dir});
 }
 
+auto MatchBytesLabels(absl::string_view direction, absl::string_view src_ip,
+                      absl::string_view dst_ip) {
+  return ElementsAre(
+      telemetry::MetricLabel{.key = telemetry::metric_labels::kDirection,
+                             .value = direction},
+      telemetry::MetricLabel{.key = telemetry::metric_labels::kSrcIp,
+                             .value = src_ip},
+      telemetry::MetricLabel{.key = telemetry::metric_labels::kDstIp,
+                             .value = dst_ip});
+}
+
 auto MatchP2pTimeLabels(absl::string_view src_ip, absl::string_view dst_ip) {
   return ElementsAre(
       telemetry::MetricLabel{.key = telemetry::metric_labels::kSrcIp,
@@ -332,11 +343,12 @@ TEST(SocketTransportAdapterTest,
       ObserveHistogram(telemetry::metric_names::kP2pTransferTimeMs,
                        MatchP2pTimeLabels("127.0.0.2", "127.0.0.1"), Gt(0.0)))
       .Times(1);
-  EXPECT_CALL(
-      *raw_mock,
-      IncrementCounter(
-          telemetry::metric_names::kSentBytesTotal,
-          MatchDirectionLabel(telemetry::metric_labels::kDirectionPush), 8))
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(
+                  telemetry::metric_names::kSentBytesTotal,
+                  MatchBytesLabels(telemetry::metric_labels::kDirectionPush,
+                                   "127.0.0.2", "127.0.0.1"),
+                  8))
       .Times(2);
 
   auto server_handler = [](int client_fd,

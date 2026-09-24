@@ -86,13 +86,11 @@ class SocketTransportAdapter : public TransportAdapter {
                                         absl::Span<const int> dst_block_ids,
                                         CompletionCallback on_complete);
 
-  absl::Status PostSocketPushInternal(absl::string_view peer,
-                                      absl::string_view local_ip,
-                                      absl::Span<const Request> requests,
-                                      absl::Span<const int> src_block_ids,
-                                      absl::Span<const int> dst_block_ids,
-                                      size_t block_offset,
-                                      std::vector<int>& allocated_ids);
+  absl::Status PostSocketPushInternal(
+      absl::string_view peer, absl::string_view local_ip,
+      absl::string_view dst_ip, absl::Span<const Request> requests,
+      absl::Span<const int> src_block_ids, absl::Span<const int> dst_block_ids,
+      size_t block_offset, std::vector<int>& allocated_ids);
 
   // Block-level Socket Pull (Op 2).
   absl::StatusOr<Handle> PostSocketPull(absl::Span<const std::string> peers,

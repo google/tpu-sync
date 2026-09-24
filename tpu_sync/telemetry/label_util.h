@@ -148,6 +148,12 @@ constexpr std::array<absl::string_view, N> ResolveLabels(
 // Endpoint IP Extraction for Telemetry Labels
 // ============================================================================
 
+// Extracts the IP address from `endpoint` ("host:port", "[ipv6]:port", or bare
+// IP), or returns metric_labels::kUnknownIp ("unknown") if `endpoint` is empty,
+// placeholder ("?" / "*"), or not a valid numeric IP literal.
+absl::string_view ExtractIpFromEndpoint(
+    absl::string_view endpoint ABSL_ATTRIBUTE_LIFETIME_BOUND);
+
 // Extracts the host or IP address from the first endpoint in `endpoints`
 // ("host:port", "[ipv6]:port", or bare IP), or returns
 // metric_labels::kUnknownIp ("unknown") if `endpoints` is empty, placeholder

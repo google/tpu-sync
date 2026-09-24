@@ -79,8 +79,9 @@ inline constexpr std::string_view kTransferSendSessionD2hDispatch =
     "transfer_send_session.d2h.dispatch";
 inline constexpr std::string_view kTransferSendSessionD2hComplete =
     "transfer_send_session.d2h.complete";
-inline constexpr std::string_view kTransferSendSessionPushTask =
-    "transfer_send_session.push.task";
+// Raiden manager base.
+inline constexpr std::string_view kRaidenManagerBaseH2hWrite =
+    "raiden_manager_base.h2h.write";
 
 // Socket transport, send path.
 inline constexpr std::string_view kSocketTransportSendConnect =

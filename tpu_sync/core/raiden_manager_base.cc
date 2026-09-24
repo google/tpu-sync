@@ -37,6 +37,8 @@
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_utils.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
+#include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/buffer_push_task.h"
@@ -309,6 +311,11 @@ void RaidenManagerBase::H2hWriteDirectAsync(
   if (!transport) {
     on_complete(
         absl::FailedPreconditionError("Transport server is not running"));
+    return;
+  }
+  absl::Status status = FaultInjectStatus(hooks::kRaidenManagerBaseH2hWrite);
+  if (!status.ok()) {
+    on_complete(status);
     return;
   }
   transport->AsyncPush(peers, src_block_ids, dst_block_ids, parallelism_,

@@ -404,7 +404,6 @@ void TransferSendSession::SendNextLayer(size_t l) {
 
     std::move(end_op).Cancel();
     self->base_->push_pool()->Schedule([self, l]() {
-      FaultInjectThrow(hooks::kTransferSendSessionPushTask);
       absl::Cleanup end_op = [self]() { self->EndSendOp(); };
       std::vector<std::string> remote_data_endpoints;
       std::vector<int> src_ints;

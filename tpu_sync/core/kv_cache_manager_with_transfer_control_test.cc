@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <memory>
@@ -42,15 +43,28 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "grpcpp/client_context.h"
+#include "grpcpp/create_channel.h"
+#include "grpcpp/security/credentials.h"
+#include "grpcpp/support/status.h"
+#include "tpu_sync/core/control_plane_backend.h"
+#include "tpu_sync/core/grpc_control_plane_backend.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/tcp_control_plane_backend.h"
 #include "tpu_sync/core/transfer_receive_session.h"
 #include "tpu_sync/core/transfer_send_session.h"
+#include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
+#include "tpu_sync/proto/kv_cache_control_plane_service.pb.h"
 
 namespace tpu_raiden {
 namespace {
@@ -115,6 +129,21 @@ class TestManager : public KVCacheManagerWithTransfer {
     absl::MutexLock lock(mu_);
     auto it = active_recv_sessions_.find(uuid);
     return it != active_recv_sessions_.end() && !it->second->Done();
+  }
+
+  // Pulls waiting for their read to be registered.
+  size_t parked_pulls() {
+    absl::MutexLock lock(mu_);
+    return pull_waiters_.size();
+  }
+
+  bool WaitForParkedPulls(size_t count, absl::Duration timeout) {
+    const absl::Time give_up = absl::Now() + timeout;
+    while (parked_pulls() != count) {
+      if (absl::Now() >= give_up) return false;
+      absl::SleepFor(absl::Milliseconds(5));
+    }
+    return true;
   }
 
   void MarkPullStarted(uint64_t uuid) {
@@ -797,6 +826,478 @@ TEST(ControlHandshakeTest, ExpiredReceiveKeepsStagingUntilHandshakeEnds) {
   EXPECT_THAT(sent_again, ::testing::IsEmpty());
   EXPECT_THAT(received_again, ::testing::IsEmpty());
   EXPECT_THAT(failed_again, ::testing::IsEmpty());
+}
+
+// --------------------------------------------------------------------------
+// Producer-side pulls on the gRPC control plane (issue #888).
+//
+// A pull whose read the producer has not registered yet used to wait out the
+// registration grace on a server thread, so a burst of early, expired or
+// bogus pulls from one consumer could tie up the threads every other consumer
+// needs. It is now parked without a thread, capped per peer, and released at
+// the consumer's deadline or on cancellation.
+// --------------------------------------------------------------------------
+
+// Selects the control-plane backend for managers built while it is in scope.
+class ScopedControlPlaneBackend {
+ public:
+  explicit ScopedControlPlaneBackend(const char* backend) {
+    if (const char* old = std::getenv(kVar)) old_ = old;
+    setenv(kVar, backend, /*overwrite=*/1);
+  }
+  ~ScopedControlPlaneBackend() {
+    if (old_.has_value()) {
+      setenv(kVar, old_->c_str(), /*overwrite=*/1);
+    } else {
+      unsetenv(kVar);
+    }
+  }
+
+ private:
+  static constexpr char kVar[] = "TPU_RAIDEN_CONTROL_PLANE_BACKEND";
+  std::optional<std::string> old_;
+};
+
+// The consumer end of the gRPC control plane, reduced to PullStream: issues
+// pulls to one producer on the raw stub, so a test can cancel them, and
+// records each answer by uuid. Answers the RPC itself fails are recorded as
+// the gRPC status.
+class GrpcPuller {
+ public:
+  GrpcPuller(absl::string_view host, int port)
+      : stub_(control_plane::proto::KVCacheControlPlaneService::NewStub(
+            grpc::CreateChannel(absl::StrCat(host, ":", port),
+                                grpc::InsecureChannelCredentials()))) {}
+
+  // Cancels every pull still outstanding and waits for its callback.
+  ~GrpcPuller() {
+    CancelAll();
+    absl::MutexLock lock(mu_);
+    mu_.Await(absl::Condition(
+        +[](absl::flat_hash_map<uint64_t, std::unique_ptr<Call>>* calls) {
+          return calls->empty();
+        },
+        &calls_));
+  }
+
+  void Pull(uint64_t uuid, absl::Duration timeout = absl::Seconds(30)) {
+    Pull(uuid, /*src_blocks=*/{0}, /*dst_blocks=*/{0}, timeout);
+  }
+
+  void Pull(uint64_t uuid, const std::vector<int64_t>& src_blocks,
+            const std::vector<int64_t>& dst_blocks,
+            absl::Duration timeout = absl::Seconds(30)) {
+    auto call = std::make_unique<Call>();
+    call->context.set_deadline(absl::ToChronoTime(absl::Now() + timeout));
+    call->request.set_uuid(uuid);
+    for (int64_t block : src_blocks) call->request.add_src_block_ids(block);
+    for (int64_t block : dst_blocks) call->request.add_dst_block_ids(block);
+    Call* raw = call.get();
+    {
+      absl::MutexLock lock(mu_);
+      calls_.insert_or_assign(uuid, std::move(call));
+    }
+    stub_->async()->PullStream(
+        &raw->context, &raw->request, &raw->response,
+        [this, uuid, raw](grpc::Status status) {
+          absl::StatusOr<PullStreamResponseSpec> answer =
+              status.ok()
+                  ? absl::StatusOr<PullStreamResponseSpec>(
+                        PullStreamResponseSpec{
+                            .status = raw->response.status(),
+                            .num_layers = raw->response.num_layers(),
+                            .data_port = raw->response.data_port(),
+                            .message = raw->response.message()})
+                  : absl::Status(
+                        static_cast<absl::StatusCode>(status.error_code()),
+                        status.error_message());
+          absl::MutexLock lock(mu_);
+          answers_.insert_or_assign(uuid, std::move(answer));
+          calls_.erase(uuid);
+        });
+  }
+
+  void CancelAll() {
+    absl::MutexLock lock(mu_);
+    for (auto& [uuid, call] : calls_) call->context.TryCancel();
+  }
+
+  std::optional<absl::StatusOr<PullStreamResponseSpec>> WaitForAnswer(
+      uint64_t uuid, absl::Duration timeout) {
+    absl::MutexLock lock(mu_);
+    auto answered = [this, uuid]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+      return answers_.contains(uuid);
+    };
+    if (!mu_.AwaitWithTimeout(absl::Condition(&answered), timeout)) {
+      return std::nullopt;
+    }
+    return answers_.at(uuid);
+  }
+
+ private:
+  struct Call {
+    grpc::ClientContext context;
+    control_plane::proto::PullStreamRequest request;
+    control_plane::proto::PullStreamResponse response;
+  };
+
+  std::unique_ptr<control_plane::proto::KVCacheControlPlaneService::Stub>
+      stub_;
+  absl::Mutex mu_;
+  absl::flat_hash_map<uint64_t, std::unique_ptr<Call>> calls_
+      ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<uint64_t, absl::StatusOr<PullStreamResponseSpec>>
+      answers_ ABSL_GUARDED_BY(mu_);
+};
+
+int ThreadCount() {
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    if (line.rfind("Threads:", 0) == 0) {
+      return std::stoi(line.substr(8));
+    }
+  }
+  return -1;
+}
+
+bool HasIpv6Loopback() {
+  int fd = socket(AF_INET6, SOCK_STREAM, 0);
+  if (fd < 0) return false;
+  sockaddr_in6 addr{};
+  addr.sin6_family = AF_INET6;
+  addr.sin6_addr = in6addr_loopback;
+  const bool bound =
+      bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+  close(fd);
+  return bound;
+}
+
+TEST(ControlHandshakeTest,
+     GrpcPullAheadOfRegistrationIsAcknowledgedOnceRegistered) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/10.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+
+  consumer.Pull(/*uuid=*/700);
+  ASSERT_TRUE(producer.WaitForParkedPulls(1, absl::Seconds(5)));
+  ASSERT_GT(producer.NotifyForRead("req700", /*uuid=*/700, {0}), 0);
+
+  auto answer = consumer.WaitForAnswer(700, absl::Seconds(1));
+  ASSERT_TRUE(answer.has_value()) << "registration did not answer the pull";
+  ASSERT_TRUE(answer->ok()) << answer->status();
+  EXPECT_EQ((*answer)->status, 0) << (*answer)->message;
+  EXPECT_EQ(producer.parked_pulls(), 0u);
+}
+
+TEST(ControlHandshakeTest, GrpcPullWithoutRegistrationIsRejectedAfterGrace) {
+  ScopedControlPlaneBackend grpc("grpc");
+  // The grace is min(5 s, timeout_s), so kTimeoutS here.
+  TestManager producer;
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+
+  const absl::Time start = absl::Now();
+  consumer.Pull(/*uuid=*/701);
+  auto answer = consumer.WaitForAnswer(701, absl::Seconds(5));
+  ASSERT_TRUE(answer.has_value());
+  ASSERT_TRUE(answer->ok()) << answer->status();
+  EXPECT_NE((*answer)->status, 0);
+  EXPECT_THAT((*answer)->message, HasSubstr("no read registered for uuid 701"));
+  EXPECT_LT(SecondsSince(start), 4 * kTimeoutS);
+  EXPECT_EQ(producer.parked_pulls(), 0u);
+}
+
+// Pulls for reads the producer has not registered, whether early, expired or
+// bogus, used to wait out the registration grace on a server thread each. A
+// burst of them tied up one thread apiece, and on a bounded pool they locked
+// out every other consumer. Parked, each is an entry: the thread count does not
+// track them, and a pull the producer can answer is answered at once.
+TEST(ControlHandshakeTest, GrpcParkedPullsHoldNoThreadsAndDoNotDelayOthers) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller early("127.0.0.1", producer.local_control_port());
+  GrpcPuller prompt("127.0.0.1", producer.local_control_port());
+
+  // Warm both channels and the server so lazily started gRPC threads exist
+  // before the count is taken.
+  ASSERT_GT(producer.NotifyForRead("warm0", /*uuid=*/710, {0}), 0);
+  ASSERT_GT(producer.NotifyForRead("warm1", /*uuid=*/711, {0}), 0);
+  early.Pull(710);
+  prompt.Pull(711);
+  ASSERT_TRUE(early.WaitForAnswer(710, absl::Seconds(5)).has_value());
+  ASSERT_TRUE(prompt.WaitForAnswer(711, absl::Seconds(5)).has_value());
+  const int threads_before = ThreadCount();
+  ASSERT_GT(threads_before, 0);
+
+  constexpr size_t kParked = KVCacheManagerWithTransfer::kMaxPullWaitersPerPeer;
+  for (size_t i = 0; i < kParked; ++i) {
+    early.Pull(/*uuid=*/800 + i);
+  }
+  ASSERT_TRUE(producer.WaitForParkedPulls(kParked, absl::Seconds(10)))
+      << "only " << producer.parked_pulls() << " of " << kParked
+      << " unregistered pulls were parked";
+  const int grown = ThreadCount() - threads_before;
+  EXPECT_LT(grown, static_cast<int>(kParked / 2))
+      << kParked << " parked pulls added " << grown
+      << " threads; a pull waiting for registration is holding a thread";
+
+  ASSERT_GT(producer.NotifyForRead("req712", /*uuid=*/712, {0}), 0);
+  const absl::Time start = absl::Now();
+  prompt.Pull(712);
+  auto answer = prompt.WaitForAnswer(712, absl::Seconds(10));
+  const double waited = SecondsSince(start);
+  ASSERT_TRUE(answer.has_value());
+  ASSERT_TRUE(answer->ok()) << answer->status();
+  EXPECT_EQ((*answer)->status, 0) << (*answer)->message;
+  EXPECT_LT(waited, 0.5) << "a registered pull took " << waited << "s behind "
+                         << kParked << " parked ones";
+  EXPECT_EQ(producer.parked_pulls(), kParked);
+}
+
+TEST(ControlHandshakeTest, GrpcPerPeerCapRejectsOnlyTheFloodingPeer) {
+  if (!HasIpv6Loopback()) {
+    GTEST_SKIP() << "needs ::1 to connect as a second peer";
+  }
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller flooder("127.0.0.1", producer.local_control_port());
+  GrpcPuller other("[::1]", producer.local_control_port());
+
+  constexpr size_t kCap = KVCacheManagerWithTransfer::kMaxPullWaitersPerPeer;
+  for (size_t i = 0; i < kCap; ++i) {
+    flooder.Pull(/*uuid=*/900 + i);
+  }
+  ASSERT_TRUE(producer.WaitForParkedPulls(kCap, absl::Seconds(10)));
+
+  // One more from the same peer is refused at once rather than parked.
+  const absl::Time start = absl::Now();
+  flooder.Pull(/*uuid=*/900 + kCap);
+  auto refused = flooder.WaitForAnswer(900 + kCap, absl::Seconds(5));
+  ASSERT_TRUE(refused.has_value());
+  ASSERT_TRUE(refused->ok()) << refused->status();
+  EXPECT_NE((*refused)->status, 0);
+  EXPECT_THAT((*refused)->message, HasSubstr("too many pulls from 127.0.0.1"));
+  EXPECT_LT(SecondsSince(start), 1.0);
+
+  // Another peer's early pull is still parked, and served on registration.
+  other.Pull(/*uuid=*/1000);
+  ASSERT_TRUE(producer.WaitForParkedPulls(kCap + 1, absl::Seconds(5)))
+      << "the other peer's pull was not parked";
+  ASSERT_GT(producer.NotifyForRead("req1000", /*uuid=*/1000, {0}), 0);
+  auto served = other.WaitForAnswer(1000, absl::Seconds(1));
+  ASSERT_TRUE(served.has_value());
+  ASSERT_TRUE(served->ok()) << served->status();
+  EXPECT_EQ((*served)->status, 0) << (*served)->message;
+}
+
+TEST(ControlHandshakeTest, GrpcParkedPullIsReleasedAtConsumerDeadline) {
+  ScopedControlPlaneBackend grpc("grpc");
+  // A 5 s grace, so a release well before it can only be the deadline.
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+
+  const absl::Time start = absl::Now();
+  consumer.Pull(/*uuid=*/1100, /*timeout=*/absl::Seconds(1));
+  ASSERT_TRUE(producer.WaitForParkedPulls(1, absl::Milliseconds(900)));
+
+  // The producer gives up at the consumer's deadline, so its rejection and the
+  // consumer's own DEADLINE_EXCEEDED race; either is a prompt release.
+  auto answer = consumer.WaitForAnswer(1100, absl::Seconds(5));
+  ASSERT_TRUE(answer.has_value());
+  if (answer->ok()) {
+    EXPECT_NE((*answer)->status, 0);
+    EXPECT_THAT((*answer)->message,
+                HasSubstr("no read registered for uuid 1100"));
+  } else {
+    EXPECT_EQ(answer->status().code(), absl::StatusCode::kDeadlineExceeded)
+        << answer->status();
+  }
+  EXPECT_TRUE(producer.WaitForParkedPulls(0, absl::Seconds(1)))
+      << "the producer still holds a pull its consumer gave up on";
+  EXPECT_LT(SecondsSince(start), 2.5);
+}
+
+TEST(ControlHandshakeTest, GrpcCancelledPullIsUnparked) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  auto consumer =
+      std::make_unique<GrpcPuller>("127.0.0.1", producer.local_control_port());
+
+  consumer->Pull(/*uuid=*/1200, /*timeout=*/absl::Seconds(30));
+  ASSERT_TRUE(producer.WaitForParkedPulls(1, absl::Seconds(5)));
+
+  // Destroying the client cancels its outstanding calls.
+  const absl::Time start = absl::Now();
+  consumer.reset();
+  EXPECT_TRUE(producer.WaitForParkedPulls(0, absl::Seconds(2)))
+      << "the producer still holds a pull its consumer cancelled";
+  EXPECT_LT(SecondsSince(start), 2.0);
+}
+
+TEST(ControlHandshakeTest, GrpcShutdownAnswersParkedPulls) {
+  ScopedControlPlaneBackend grpc("grpc");
+  auto producer = std::make_unique<TestManager>(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer->local_control_port());
+
+  constexpr int kParked = 8;
+  for (int i = 0; i < kParked; ++i) {
+    consumer.Pull(/*uuid=*/1300 + i);
+  }
+  ASSERT_TRUE(producer->WaitForParkedPulls(kParked, absl::Seconds(5)));
+
+  const absl::Time start = absl::Now();
+  producer.reset();
+  EXPECT_LT(SecondsSince(start), 2.0);
+  for (int i = 0; i < kParked; ++i) {
+    auto answer = consumer.WaitForAnswer(1300 + i, absl::Seconds(2));
+    ASSERT_TRUE(answer.has_value()) << "parked pull " << i << " never answered";
+    ASSERT_TRUE(answer->ok()) << answer->status();
+    EXPECT_NE((*answer)->status, 0);
+    EXPECT_THAT((*answer)->message, HasSubstr("stopping"));
+  }
+}
+
+// The TCP backend refuses an oversized pull from its header, before the
+// handler sees it; on gRPC the handler's own check is the only one.
+TEST(ControlHandshakeTest, GrpcOversizedPullIsRejectedWithoutParking) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+
+  // TestManager is configured for at most 8 blocks. The read is not
+  // registered, so a pull that got past the check would be parked.
+  const std::vector<int64_t> blocks = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+  const absl::Time start = absl::Now();
+  consumer.Pull(/*uuid=*/1400, blocks, blocks);
+  auto answer = consumer.WaitForAnswer(1400, absl::Seconds(5));
+  ASSERT_TRUE(answer.has_value());
+  ASSERT_TRUE(answer->ok()) << answer->status();
+  EXPECT_NE((*answer)->status, 0);
+  EXPECT_THAT((*answer)->message,
+              HasSubstr("pull stream block count 9 exceeds configured "
+                        "maximum 8"));
+  EXPECT_LT(SecondsSince(start), 1.0);
+  EXPECT_EQ(producer.parked_pulls(), 0u);
+}
+
+struct InvalidPullCase {
+  const char* name;
+  std::vector<int64_t> src_blocks;
+  std::vector<int64_t> dst_blocks;
+  const char* message;
+};
+
+// Each registers blocks {0, 1}.
+std::vector<InvalidPullCase> InvalidPullCases() {
+  return {
+      {"unregistered block", {0, 2}, {6, 7}, "block not registered"},
+      {"duplicate block", {0, 0}, {6, 7}, "duplicate producer block"},
+      {"no blocks", {}, {}, "requested no blocks"},
+  };
+}
+
+TEST(ControlHandshakeTest, GrpcInvalidPullOfRegisteredReadIsRejected) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+
+  uint64_t uuid = 1500;
+  for (const InvalidPullCase& c : InvalidPullCases()) {
+    SCOPED_TRACE(c.name);
+    ++uuid;
+    ASSERT_GT(producer.NotifyForRead(absl::StrCat("req", uuid), uuid, {0, 1}),
+              0);
+    consumer.Pull(uuid, c.src_blocks, c.dst_blocks);
+    auto answer = consumer.WaitForAnswer(uuid, absl::Seconds(5));
+    ASSERT_TRUE(answer.has_value());
+    ASSERT_TRUE(answer->ok()) << answer->status();
+    EXPECT_NE((*answer)->status, 0);
+    EXPECT_THAT((*answer)->message, HasSubstr(c.message));
+  }
+  EXPECT_EQ(producer.parked_pulls(), 0u);
+}
+
+// A parked pull is validated only once its read is registered, from
+// NotifyForRead rather than the handler, and must still be answered.
+TEST(ControlHandshakeTest, GrpcInvalidParkedPullIsRejectedOnRegistration) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+
+  const std::vector<InvalidPullCase> cases = InvalidPullCases();
+  for (size_t i = 0; i < cases.size(); ++i) {
+    consumer.Pull(/*uuid=*/1600 + i, cases[i].src_blocks,
+                  cases[i].dst_blocks);
+  }
+  ASSERT_TRUE(producer.WaitForParkedPulls(cases.size(), absl::Seconds(5)));
+
+  for (size_t i = 0; i < cases.size(); ++i) {
+    SCOPED_TRACE(cases[i].name);
+    const uint64_t uuid = 1600 + i;
+    ASSERT_GT(producer.NotifyForRead(absl::StrCat("req", uuid), uuid, {0, 1}),
+              0);
+    auto answer = consumer.WaitForAnswer(uuid, absl::Seconds(1));
+    ASSERT_TRUE(answer.has_value()) << "registration did not answer the pull";
+    ASSERT_TRUE(answer->ok()) << answer->status();
+    EXPECT_NE((*answer)->status, 0);
+    EXPECT_THAT((*answer)->message, HasSubstr(cases[i].message));
+  }
+  EXPECT_EQ(producer.parked_pulls(), 0u);
+}
+
+TEST(ControlHandshakeTest, GrpcPullAfterRegistrationDeadlineIsRejected) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+  ASSERT_GT(producer.NotifyForRead("expired", /*uuid=*/1700, {0},
+                                   std::chrono::steady_clock::now() -
+                                       std::chrono::milliseconds(1)),
+            0);
+
+  const absl::Time start = absl::Now();
+  consumer.Pull(/*uuid=*/1700);
+  auto answer = consumer.WaitForAnswer(1700, absl::Seconds(5));
+  ASSERT_TRUE(answer.has_value());
+  ASSERT_TRUE(answer->ok()) << answer->status();
+  EXPECT_NE((*answer)->status, 0);
+  EXPECT_THAT((*answer)->message, HasSubstr("expired"));
+  EXPECT_LT(SecondsSince(start), 1.0);
+  EXPECT_EQ(producer.parked_pulls(), 0u);
+}
+
+TEST(ControlHandshakeTest, GrpcParkedPullIsRejectedWhenRegisteredExpired) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+
+  consumer.Pull(/*uuid=*/1701);
+  ASSERT_TRUE(producer.WaitForParkedPulls(1, absl::Seconds(5)));
+  ASSERT_GT(producer.NotifyForRead("expired", /*uuid=*/1701, {0},
+                                   std::chrono::steady_clock::now() -
+                                       std::chrono::milliseconds(1)),
+            0);
+
+  auto answer = consumer.WaitForAnswer(1701, absl::Seconds(1));
+  ASSERT_TRUE(answer.has_value()) << "registration did not answer the pull";
+  ASSERT_TRUE(answer->ok()) << answer->status();
+  EXPECT_NE((*answer)->status, 0);
+  EXPECT_THAT((*answer)->message, HasSubstr("expired"));
+  EXPECT_EQ(producer.parked_pulls(), 0u);
+}
+
+TEST(ControlHandshakeTest, GrpcDuplicatePullIsRejected) {
+  ScopedControlPlaneBackend grpc("grpc");
+  TestManager producer(/*timeout_s=*/30.0);
+  GrpcPuller consumer("127.0.0.1", producer.local_control_port());
+  ASSERT_GT(producer.NotifyForRead("req1800", /*uuid=*/1800, {0}), 0);
+  producer.MarkPullStarted(/*uuid=*/1800);
+
+  consumer.Pull(/*uuid=*/1800);
+  auto answer = consumer.WaitForAnswer(1800, absl::Seconds(5));
+  ASSERT_TRUE(answer.has_value());
+  ASSERT_TRUE(answer->ok()) << answer->status();
+  EXPECT_NE((*answer)->status, 0);
+  EXPECT_THAT((*answer)->message, HasSubstr("already"));
 }
 
 }  // namespace

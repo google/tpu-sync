@@ -30,6 +30,7 @@
 #include "absl/time/time.h"
 #include "grpcpp/server.h"
 #include "grpcpp/server_context.h"
+#include "grpcpp/support/server_callback.h"
 #include "grpcpp/support/status.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
@@ -42,20 +43,24 @@ namespace tpu_raiden {
 // or "ipv6:[::ffff:10.0.0.1]:54321").
 std::string ExtractIpFromGrpcPeer(absl::string_view peer);
 
+// Callback service: a PullStream waiting on the handler holds a reactor, not a
+// server thread, so requests the producer cannot answer yet do not starve
+// the ones it can.
 class KVCacheControlPlaneServiceImpl final
-    : public control_plane::proto::KVCacheControlPlaneService::Service {
+    : public control_plane::proto::KVCacheControlPlaneService::CallbackService {
  public:
   explicit KVCacheControlPlaneServiceImpl(ControlPlaneHandler* handler)
       : handler_(handler) {}
 
-  grpc::Status PullStream(
-      grpc::ServerContext* context,
+  grpc::ServerUnaryReactor* PullStream(
+      grpc::CallbackServerContext* context,
       const control_plane::proto::PullStreamRequest* request,
       control_plane::proto::PullStreamResponse* response) override;
 
-  grpc::Status Ack(grpc::ServerContext* context,
-                   const control_plane::proto::AckRequest* request,
-                   control_plane::proto::AckResponse* response) override;
+  grpc::ServerUnaryReactor* Ack(
+      grpc::CallbackServerContext* context,
+      const control_plane::proto::AckRequest* request,
+      control_plane::proto::AckResponse* response) override;
 
  private:
   ControlPlaneHandler* handler_ = nullptr;

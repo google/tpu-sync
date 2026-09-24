@@ -27,6 +27,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
+#include "xla/tsl/concurrency/future.h"
 
 namespace tpu_raiden {
 
@@ -92,10 +93,14 @@ class ControlPlaneBackend {
   virtual void StopServer() = 0;
 
   // Sends a PullStream handshake request to `remote_endpoint` ("host:port").
-  // Non-OK Status indicates a transport/RPC error (e.g. connection refused or
-  // deadline exceeded). Application rejections return OkStatus with status !=
-  // 0.
-  virtual absl::StatusOr<PullStreamResponseSpec> SendPullRequest(
+  // The returned future resolves with a non-OK Status on a transport/RPC error
+  // (e.g. connection refused or deadline exceeded). Application rejections
+  // resolve OK with status != 0.
+  //
+  // Backends with an async client return without waiting for the response,
+  // and the future may then resolve on a transport thread, so callbacks passed
+  // to OnReady must not block. Backends without one return a ready future.
+  virtual tsl::Future<PullStreamResponseSpec> SendPullRequest(
       absl::string_view remote_endpoint, const PullStreamRequestSpec& req,
       absl::Duration timeout) = 0;
 

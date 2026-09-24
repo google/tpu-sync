@@ -29,6 +29,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/core/control_plane_backend.h"
 
 namespace tpu_raiden {
@@ -72,7 +73,8 @@ class TcpControlPlaneBackend : public ControlPlaneBackend {
                                   ControlPlaneHandler* handler) override;
   void StopServer() override;
 
-  absl::StatusOr<PullStreamResponseSpec> SendPullRequest(
+  // Runs the whole exchange on the calling thread and returns a ready future.
+  tsl::Future<PullStreamResponseSpec> SendPullRequest(
       absl::string_view remote_endpoint, const PullStreamRequestSpec& req,
       absl::Duration timeout) override;
 
@@ -99,6 +101,9 @@ class TcpControlPlaneBackend : public ControlPlaneBackend {
   void HandleControlConnection(int fd, ControlPlaneHandler* handler = nullptr);
 
  private:
+  absl::StatusOr<PullStreamResponseSpec> SendPullRequestBlocking(
+      absl::string_view remote_endpoint, const PullStreamRequestSpec& req,
+      absl::Duration timeout);
   void ControlServerLoop();
   void SendErrorResponse(int fd, absl::string_view message);
 

@@ -46,6 +46,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 
@@ -581,7 +582,15 @@ void TcpControlPlaneBackend::HandleControlConnection(
   SendErrorResponse(fd, absl::StrCat("unknown control op code: ", req.op));
 }
 
-absl::StatusOr<PullStreamResponseSpec> TcpControlPlaneBackend::SendPullRequest(
+tsl::Future<PullStreamResponseSpec> TcpControlPlaneBackend::SendPullRequest(
+    absl::string_view remote_endpoint, const PullStreamRequestSpec& req,
+    absl::Duration timeout) {
+  return tsl::Future<PullStreamResponseSpec>(
+      SendPullRequestBlocking(remote_endpoint, req, timeout));
+}
+
+absl::StatusOr<PullStreamResponseSpec>
+TcpControlPlaneBackend::SendPullRequestBlocking(
     absl::string_view remote_endpoint, const PullStreamRequestSpec& req,
     absl::Duration timeout) {
   double timeout_s = absl::ToDoubleSeconds(timeout);

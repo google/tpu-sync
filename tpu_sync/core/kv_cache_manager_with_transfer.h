@@ -294,6 +294,9 @@ class KVCacheManagerWithTransfer {
   virtual int local_control_port() const { return local_control_port_; }
   virtual int64_t node_id() const { return node_id_; }
 
+  // Bound on one control handshake, end to end, in seconds.
+  double control_timeout_s() const { return control_timeout_s_; }
+
  protected:
   KVCacheManagerWithTransfer(
       std::unique_ptr<kv_cache::KVCacheManagerBase> base, int64_t node_id = 0,
@@ -351,6 +354,10 @@ class KVCacheManagerWithTransfer {
   absl::Mutex pull_workers_mu_;
   int active_pull_workers_ ABSL_GUARDED_BY(pull_workers_mu_) = 0;
   double timeout_s_ = 120.0;
+  // Bound on one control handshake, end to end. Separate from timeout_s_,
+  // which sizes a bulk KV transfer. Derived in the delegated-to constructor;
+  // see DeriveControlTimeoutS.
+  double control_timeout_s_ = 10.0;
 
   std::unique_ptr<StagingBlockAllocator> staging_allocator_;
   // TransferSendSession is shared across threads: created/timed-out/cleaned-up

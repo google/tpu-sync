@@ -28,6 +28,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <future>
@@ -42,11 +43,17 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/thread_annotations.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "tpu_sync/core/control_plane_backend.h"
+#include "tpu_sync/core/grpc_control_plane_backend.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/tcp_control_plane_backend.h"
 #include "tpu_sync/core/transfer_receive_session.h"
@@ -797,6 +804,283 @@ TEST(ControlHandshakeTest, ExpiredReceiveKeepsStagingUntilHandshakeEnds) {
   EXPECT_THAT(sent_again, ::testing::IsEmpty());
   EXPECT_THAT(received_again, ::testing::IsEmpty());
   EXPECT_THAT(failed_again, ::testing::IsEmpty());
+}
+
+// --------------------------------------------------------------------------
+// Cross-peer fault isolation on the consumer handshake path (issue #888).
+//
+// The tests above establish that a silent producer costs its own reads one
+// transfer timeout. These establish the part that is a fault-isolation bug:
+// the cost must not be paid by reads aimed at *other*, healthy producers.
+//
+// The handshake used to run as a blocking call on push_pool_, one FIFO queue
+// shared by every peer, so kPoolSize handshakes to one unresponsive producer
+// held every worker and every other peer queued behind them. On the gRPC
+// backend the handshake is now an async RPC that holds no worker while it
+// waits. These run on gRPC only: the TCP backend still runs the blocking call
+// on push_pool_ and is being retired rather than fixed.
+// --------------------------------------------------------------------------
+
+// A handshake timeout long enough that "blocked behind the sick peer" and
+// "scheduled promptly" cannot be confused for one another. Reads to the
+// healthy peer are expected to start in milliseconds; a worker stuck on the
+// sick peer holds on for kStarvationTimeoutS.
+constexpr double kStarvationTimeoutS = 4.0;
+
+// Selects the control-plane backend for managers built while it is in scope.
+class ScopedControlPlaneBackend {
+ public:
+  explicit ScopedControlPlaneBackend(const char* backend) {
+    if (const char* old = std::getenv(kVar)) old_ = old;
+    setenv(kVar, backend, /*overwrite=*/1);
+  }
+  ~ScopedControlPlaneBackend() {
+    if (old_.has_value()) {
+      setenv(kVar, old_->c_str(), /*overwrite=*/1);
+    } else {
+      unsetenv(kVar);
+    }
+  }
+
+ private:
+  static constexpr char kVar[] = "TPU_RAIDEN_CONTROL_PLANE_BACKEND";
+  std::optional<std::string> old_;
+};
+
+// The gRPC counterpart of SilentProducer: a real gRPC control server whose
+// PullStream handler holds every call until DropClients(), then rejects it.
+// accepted() counts calls that reached the handler.
+class StalledGrpcProducer : public ControlPlaneHandler {
+ public:
+  StalledGrpcProducer() {
+    absl::StatusOr<int> port = server_.StartServer(0, this);
+    EXPECT_TRUE(port.ok()) << port.status();
+    port_ = port.value_or(0);
+  }
+
+  ~StalledGrpcProducer() override {
+    DropClients();
+    server_.StopServer();
+  }
+
+  std::string endpoint() const { return absl::StrCat("127.0.0.1:", port_); }
+
+  size_t accepted() {
+    absl::MutexLock lock(mu_);
+    return received_;
+  }
+
+  bool WaitUntilAccepted(size_t count, std::chrono::milliseconds timeout) {
+    absl::MutexLock lock(mu_);
+    auto reached = [this, count]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+      return received_ >= count;
+    };
+    return mu_.AwaitWithTimeout(absl::Condition(&reached),
+                                absl::FromChrono(timeout));
+  }
+
+  void DropClients() {
+    absl::MutexLock lock(mu_);
+    released_ = true;
+  }
+
+  absl::StatusOr<PullStreamResponseSpec> OnPullStream(
+      const PullStreamRequestSpec& req,
+      absl::string_view fallback_peer_ip) override {
+    absl::MutexLock lock(mu_);
+    ++received_;
+    mu_.Await(absl::Condition(&released_));
+    return PullStreamResponseSpec{.status = -1,
+                                  .message = "stalled producer released"};
+  }
+
+  absl::Status OnAck(uint64_t uuid) override { return absl::OkStatus(); }
+
+ private:
+  absl::Mutex mu_;
+  size_t received_ ABSL_GUARDED_BY(mu_) = 0;
+  bool released_ ABSL_GUARDED_BY(mu_) = false;
+  int port_ = 0;
+  GrpcControlPlaneBackend server_;
+};
+
+// Waits for `count` reads to settle so teardown does not race them.
+void DrainReads(TestManager& consumer, size_t count, absl::Duration timeout) {
+  const absl::Time drain_deadline = absl::Now() + timeout;
+  size_t settled = 0;
+  while (settled < count && absl::Now() < drain_deadline) {
+    auto [sent, received, failed] = consumer.CompleteReadRaw();
+    (void)sent;
+    settled += received.size() + failed.size();
+    absl::SleepFor(absl::Milliseconds(20));
+  }
+}
+
+TEST(ControlHandshakeTest, GrpcSickPeerDoesNotDelayHandshakeToHealthyPeer) {
+  ScopedControlPlaneBackend grpc("grpc");
+  StalledGrpcProducer sick;
+  StalledGrpcProducer healthy;
+  TestManager consumer(/*timeout_s=*/kStarvationTimeoutS);
+
+  // Put as many handshakes in flight to the sick peer as the consumer has
+  // push-pool workers. The sick peer accepts them, so these are not connect()
+  // failures: each one is waiting on a response that never comes.
+  for (int i = 0; i < kPoolSize; ++i) {
+    consumer.StartRead(absl::StrCat("sick", i), /*uuid=*/300 + i,
+                       sick.endpoint(), /*remote_block_ids=*/{0},
+                       /*local_block_ids=*/{0});
+  }
+  ASSERT_TRUE(sick.WaitUntilAccepted(kPoolSize, std::chrono::seconds(10)))
+      << "precondition: " << kPoolSize
+      << " handshakes are outstanding against the sick peer";
+
+  // A read to a peer that is answering normally. Nothing about this request
+  // depends on the sick peer; only shared consumer resources couple them.
+  const absl::Time start = absl::Now();
+  consumer.StartRead("healthy0", /*uuid=*/400, healthy.endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+
+  // The healthy peer should see the request promptly. Wait well past the
+  // sick peer's timeout so the failure message can report how long it
+  // actually took: a delay that tracks kStarvationTimeoutS is the signature
+  // of head-of-line blocking in the shared pool, as opposed to mere jitter.
+  const bool contacted = healthy.WaitUntilAccepted(1, std::chrono::seconds(20));
+  const double waited = SecondsSince(start);
+  ASSERT_TRUE(contacted) << "healthy peer was never contacted at all";
+  EXPECT_LT(waited, 0.5)
+      << "reaching the healthy peer took " << waited
+      << "s, against a sick-peer handshake timeout of " << kStarvationTimeoutS
+      << "s; a single unresponsive producer is serialising the handshake "
+         "path for every other peer";
+
+  sick.DropClients();
+  healthy.DropClients();
+  DrainReads(consumer, kPoolSize + 1, absl::Seconds(20));
+}
+
+// The same coupling, stated as a throughput property rather than a latency
+// one: reads to a healthy peer should keep completing while a sick peer is
+// being waited on. Uses more sick reads than there are workers so the queue
+// stays backed up, which is the production shape -- traffic to the dead peer
+// keeps arriving and the pool never drains.
+TEST(ControlHandshakeTest,
+     GrpcHealthyPeerProgressesWhileSickPeerBacklogDrains) {
+  ScopedControlPlaneBackend grpc("grpc");
+  StalledGrpcProducer sick;
+  StalledGrpcProducer healthy;
+  TestManager consumer(/*timeout_s=*/kStarvationTimeoutS);
+
+  // A backlog deeper than the pool, but sized with the healthy reads to stay
+  // inside the consumer's staging slots. Overrunning them would make reads
+  // fail allocation and never reach the pool at all, which is a different
+  // defect (see SickPeerStarvesStagingSlotsForHealthyPeer) and would mask
+  // this one.
+  constexpr int kHealthyReads = 3;
+  constexpr int kSickReads = 5;
+  static_assert(kSickReads > kPoolSize, "backlog must exceed the pool");
+  static_assert(kSickReads + kHealthyReads <= 2 * kPoolSize,
+                "must fit in TestManager's staging slots");
+
+  for (int i = 0; i < kSickReads; ++i) {
+    consumer.StartRead(absl::StrCat("sick", i), /*uuid=*/500 + i,
+                       sick.endpoint(), /*remote_block_ids=*/{0},
+                       /*local_block_ids=*/{0});
+  }
+  ASSERT_TRUE(sick.WaitUntilAccepted(kPoolSize, std::chrono::seconds(10)));
+
+  // Interleave healthy reads behind the backlog, as a scheduler would.
+  const absl::Time start = absl::Now();
+  for (int i = 0; i < kHealthyReads; ++i) {
+    consumer.StartRead(absl::StrCat("healthy", i), /*uuid=*/600 + i,
+                       healthy.endpoint(), /*remote_block_ids=*/{0},
+                       /*local_block_ids=*/{0});
+  }
+  // Guards the precondition: these reads exist as sessions and are waiting on
+  // the pool, rather than having been rejected before they got there.
+  for (int i = 0; i < kHealthyReads; ++i) {
+    ASSERT_TRUE(consumer.has_recv(600 + i))
+        << "healthy read " << i << " was dropped before reaching the pool";
+  }
+
+  // With isolation the healthy reads are contacted quickly. With one FIFO
+  // queue they are strictly behind kSickReads handshakes, so the first contact
+  // costs a full timeout and draining the backlog costs two.
+  const bool all_contacted =
+      healthy.WaitUntilAccepted(kHealthyReads, std::chrono::seconds(30));
+  const double waited = SecondsSince(start);
+  ASSERT_TRUE(all_contacted)
+      << "only " << healthy.accepted() << " of " << kHealthyReads
+      << " healthy handshakes ever started";
+  EXPECT_LT(waited, 0.5)
+      << "draining " << kHealthyReads << " healthy handshakes took " << waited
+      << "s while " << kSickReads
+      << " reads to an unresponsive peer were outstanding; healthy traffic is "
+         "queued strictly behind the sick backlog rather than sharing the pool";
+
+  sick.DropClients();
+  healthy.DropClients();
+  DrainReads(consumer, kSickReads + kHealthyReads, absl::Seconds(30));
+}
+
+// A receive session holds its staging slot for the whole handshake
+// (TransferReceiveSession::Create -> AllocateStagingForLoad, called from
+// StartRead before the handshake is scheduled). Sessions stuck on an
+// unresponsive peer therefore pin the staging pool as well as the thread
+// pool, and once it is empty StartRead fails allocation and drops the read
+// outright -- a read to a healthy peer is not merely delayed, it is rejected
+// and never attempted.
+//
+// Still DISABLED_ on both backends: not holding a worker does not stop one
+// peer from holding every staging slot. That needs per-peer admission at
+// StartRead, which is a separate change.
+TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
+  SilentProducer sick;
+  SilentProducer healthy;
+  TestManager consumer(/*timeout_s=*/kStarvationTimeoutS);
+
+  // TestManager is built with num_slots = 2 * kPoolSize.
+  constexpr int kSlots = 2 * kPoolSize;
+  const size_t free_before = consumer.free_slots();
+  ASSERT_GE(free_before, static_cast<size_t>(kSlots));
+
+  for (int i = 0; i < kSlots; ++i) {
+    consumer.StartRead(absl::StrCat("sick", i), /*uuid=*/800 + i,
+                       sick.endpoint(), /*remote_block_ids=*/{0},
+                       /*local_block_ids=*/{0});
+  }
+  ASSERT_TRUE(sick.WaitUntilAccepted(kPoolSize, std::chrono::seconds(10)));
+  ASSERT_EQ(consumer.free_slots(), 0u)
+      << "precondition: the sick peer is holding every staging slot";
+
+  // A read to a peer that is answering normally.
+  consumer.StartRead("healthy0", /*uuid=*/900, healthy.endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+
+  EXPECT_TRUE(consumer.has_recv(900))
+      << "the read to the healthy peer was rejected outright because an "
+         "unresponsive peer holds all "
+      << kSlots
+      << " staging slots; no request to a healthy producer can even be "
+         "attempted while another producer is wedged";
+
+  auto [done_sending, done_recving, failed_recving] =
+      consumer.CompleteReadRaw();
+  (void)done_sending;
+  (void)done_recving;
+  EXPECT_THAT(failed_recving, ::testing::Not(Contains("healthy0")))
+      << "the healthy read failed immediately rather than being served";
+
+  sick.DropClients();
+  healthy.DropClients();
+  const absl::Time drain_deadline = absl::Now() + absl::Seconds(30);
+  size_t settled = 0;
+  while (settled < static_cast<size_t>(kSlots) &&
+         absl::Now() < drain_deadline) {
+    auto [sent, received, failed] = consumer.CompleteReadRaw();
+    (void)sent;
+    settled += received.size() + failed.size();
+    absl::SleepFor(absl::Milliseconds(20));
+  }
 }
 
 }  // namespace

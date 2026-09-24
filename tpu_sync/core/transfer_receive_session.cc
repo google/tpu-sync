@@ -598,6 +598,18 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
             << ": req_id=" << session_req_id << ", uuid=" << uuid_
             << ", numa=" << base_->assigned_numa_node().value_or(-1);
 
+  {
+    // The receive may have been finished (deadline, cancellation) between
+    // the check above and here. Re-check immediately before issuing so a
+    // finished receive starts no copy it does not need. A copy already
+    // handed to the device cannot be revoked; its in-flight count keeps the
+    // receive -- and its blocks -- owned until the copy ends.
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) {
+      EndRecvOpLocked();
+      return absl::OkStatus();
+    }
+  }
   absl::Status injected =
       FaultInjectStatus(hooks::kTransferRecvSessionH2dDispatch);
   auto future_or =

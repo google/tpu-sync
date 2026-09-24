@@ -609,11 +609,27 @@ void ReshardReceiveSession::ExecuteEligiblePoolH2ds(
     in_flight_ += static_cast<int32_t>(to_launch.size());
   }
   for (auto& [pool_idx, dst_chip_block_ids] : to_launch) {
+    {
+      // The decision to upload was taken under |mu_| above; the receive may
+      // have been finished (deadline, cancellation) since. Re-check
+      // immediately before issuing so a finished receive starts no upload
+      // it does not need. A copy already handed to the device cannot be
+      // revoked; its in-flight count keeps the receive -- and its blocks --
+      // owned until the copy ends.
+      absl::MutexLock lock(mu_);
+      if (done_ || draining_) {
+        EndRecvOpLocked();
+        continue;
+      }
+    }
     auto future_or = base_->H2dPoolBlocks(pool_idx, dst_chip_block_ids,
                                           /*shard_idx=*/std::nullopt, uuid_);
     if (!future_or.ok()) {
       FinishPoolH2d(manager, pool_idx, future_or.status());
       EndRecvOp();
+      if (!manager.IsShuttingDown()) {
+        manager.MaybeUnregisterSettledReshardRecv(uuid_, *this);
+      }
       continue;
     }
     raiden::PjRtCopyFuture future = *std::move(future_or);
@@ -623,10 +639,14 @@ void ReshardReceiveSession::ExecuteEligiblePoolH2ds(
     }
     future.OnReady([self = shared_from_this(), &manager,
                     pool_idx = pool_idx](auto status_or) {
-      absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
       self->FinishPoolH2d(
           manager, pool_idx,
           status_or.ok() ? absl::OkStatus() : status_or.status());
+      self->EndRecvOp();
+      // The upload that settles the receive also retires its plan.
+      if (!manager.IsShuttingDown()) {
+        manager.MaybeUnregisterSettledReshardRecv(self->uuid_, *self);
+      }
     });
   }
 }
@@ -648,21 +668,15 @@ void ReshardReceiveSession::FinishPoolH2d(KVCacheManagerWithTransfer& manager,
   std::chrono::steady_clock::time_point session_start_time;
   bool should_record_duration = false;
   if (finished) {
-    absl::Status unregister = manager.IsShuttingDown()
-                                  ? absl::OkStatus()
-                                  : manager.UnregisterActivePlan(uuid_);
-    if (!unregister.ok() && !absl::IsNotFound(unregister)) {
-      LOG(ERROR) << "Failed to unregister pool reshard receiver plan " << uuid_
-                 << ": " << unregister;
-    }
+    // The plan stays registered until the receive settles (every upload and
+    // every admitted push ended); the settle path drops it through
+    // unregister_on_settle_, so a plan never outlives its staging or gets
+    // torn down under a push still resolving through it.
     absl::Status terminal_status = absl::OkStatus();
     {
       absl::MutexLock lock(mu_);
-      unregister_on_settle_ = false;
       if (!status.ok()) {
         terminal_status = status;
-      } else if (!unregister.ok() && !absl::IsNotFound(unregister)) {
-        terminal_status = unregister;
       } else {
         session_start_time = start_time_;
         should_record_duration = true;

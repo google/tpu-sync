@@ -58,7 +58,9 @@ class ReshardSendSession
       std::chrono::steady_clock::time_point deadline,
       ::tpu_sync::rpc::StartTransferRequest plan);
 
-  ~ReshardSendSession() override = default;
+  // Releases any pool staging leases still held (a session dropped before it
+  // settled); a settled session has already released them.
+  ~ReshardSendSession() override;
 
   bool Done() const override {
     absl::MutexLock lock(mu_);
@@ -111,6 +113,7 @@ class ReshardSendSession
   void StartPoolPush(KVCacheManagerWithTransfer& manager, size_t pool_idx);
   void EndOp();
   void SettleLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void ReleaseLeasesLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
   StagingBlockAllocator* const staging_allocator_ = nullptr;
@@ -127,6 +130,12 @@ class ReshardSendSession
   bool finalizing_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   std::vector<raiden::PjRtCopyFuture> d2h_futures_ ABSL_GUARDED_BY(mu_);
+  // The manager this send executes on, set by ExecutePush; a send finished
+  // from outside (deadline, cancellation) drops its plan on it once its
+  // last push ends.
+  KVCacheManagerWithTransfer* manager_ ABSL_GUARDED_BY(mu_) = nullptr;
+  bool leases_released_ ABSL_GUARDED_BY(mu_) = false;
+  bool plan_unregistered_ ABSL_GUARDED_BY(mu_) = false;
 };
 
 }  // namespace tpu_raiden

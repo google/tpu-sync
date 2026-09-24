@@ -176,6 +176,8 @@ using StagingAllocation = StagingBlockAllocator::Allocation;
 class KVCacheManagerWithTransfer {
  public:
   friend class TransferReceiveSession;
+  friend class ReshardReceiveSession;
+  friend class ReshardSendSession;
 
   KVCacheManagerWithTransfer(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -385,6 +387,10 @@ class KVCacheManagerWithTransfer {
   void UnregisterSettledPlan(uint64_t uuid, uint64_t generation);
   void MaybeUnregisterSettledRecv(uint64_t uuid,
                                   TransferReceiveSession& session);
+  // Drops the plan of a pool-reshard receive that has settled (its H2D
+  // uploads and every push it admitted have ended); a no-op before then.
+  void MaybeUnregisterSettledReshardRecv(uint64_t uuid,
+                                         ReshardReceiveSession& session);
   absl::StatusOr<PullStreamResponseSpec> HandlePullStream(
       const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);
   absl::Status HandleAck(uint64_t uuid);

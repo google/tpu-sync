@@ -160,12 +160,18 @@ ReshardSendSession::ReshardSendSession(
       plan_(std::move(plan)),
       remaining_pool_peer_pushes_(remaining_pool_peer_pushes) {}
 
+ReshardSendSession::~ReshardSendSession() {
+  absl::MutexLock lock(mu_);
+  ReleaseLeasesLocked();
+}
+
 absl::Status ReshardSendSession::ExecutePush(
     KVCacheManagerWithTransfer& manager,
     absl::Span<const int64_t> src_block_ids) {
   {
     absl::MutexLock lock(mu_);
     ++in_flight_;
+    manager_ = &manager;
   }
   // Multi-tag plans scope each pool's staging and pushes to its group's
   // entries; the flat src_block_ids argument is the legacy single-tag
@@ -339,11 +345,12 @@ void ReshardSendSession::RecordPushCompletion(
         status_ = status;
       }
       finalizing_ = true;
-      should_unregister = true;
+      should_unregister = !plan_unregistered_;
     } else if (--remaining_pool_peer_pushes_ == 0) {
       finalizing_ = true;
-      should_unregister = true;
+      should_unregister = !plan_unregistered_;
     }
+    if (should_unregister) plan_unregistered_ = true;
   }
   if (!should_unregister) {
     return;
@@ -384,6 +391,28 @@ absl::Status ReshardSendSession::AwaitForDone() {
 }
 
 void ReshardSendSession::EndOp() {
+  // A send that was finished from outside (deadline sweep or cancellation)
+  // while its pushes ran never reached RecordPushCompletion's unregister:
+  // drop the plan here, on the last push's completion, rather than leaving
+  // it to the next poll's sweep. The plan is dropped before this op is
+  // counted out, so the session cannot settle -- and its manager cannot be
+  // torn down -- while the unregister runs.
+  KVCacheManagerWithTransfer* settle_manager = nullptr;
+  {
+    absl::MutexLock lock(mu_);
+    if (in_flight_ == 1 && finalizing_ && !done_ && !plan_unregistered_ &&
+        manager_ != nullptr && !manager_->IsShuttingDown()) {
+      plan_unregistered_ = true;
+      settle_manager = manager_;
+    }
+  }
+  if (settle_manager != nullptr) {
+    absl::Status unregister = settle_manager->UnregisterActivePlan(uuid_);
+    if (!unregister.ok() && !absl::IsNotFound(unregister)) {
+      LOG(ERROR) << "Failed to unregister pool reshard sender plan " << uuid_
+                 << " on settle: " << unregister;
+    }
+  }
   absl::MutexLock lock(mu_);
   --in_flight_;
   if (finalizing_ && in_flight_ == 0 && !done_) {
@@ -391,10 +420,16 @@ void ReshardSendSession::EndOp() {
   }
 }
 
+void ReshardSendSession::ReleaseLeasesLocked() {
+  if (leases_released_) return;
+  leases_released_ = true;
+  staging_allocator_->ReleasePoolStagingLeases(uuid_);
+}
+
 void ReshardSendSession::SettleLocked() {
   // Every push of every pool has completed (or the send failed): release the
   // host staging arena slots and mark done atomically under |mu_|.
-  staging_allocator_->ReleasePoolStagingLeases(uuid_);
+  ReleaseLeasesLocked();
   done_ = true;
 }
 

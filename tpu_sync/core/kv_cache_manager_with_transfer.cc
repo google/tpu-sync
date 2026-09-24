@@ -665,20 +665,40 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
 
 absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {
   absl::MutexLock lifecycle(plan_lifecycle_mu_);
-  bool deferred = false;
+  std::shared_ptr<TransferReceiveSession> recv;
+  std::shared_ptr<ReshardReceiveSession> reshard_recv;
   {
     absl::MutexLock lock(mu_);
     plan_staging_.erase(uuid);
-    // A receive still in flight keeps its plan: pushes the transport has
-    // already accepted must keep resolving into the plan's staging blocks.
-    // The plan is dropped when the receive completes, fails, or times out.
-    auto recv = active_recv_sessions_.find(uuid);
-    if (recv != active_recv_sessions_.end() &&
-        recv->second->DeferUnregisterOnSettle()) {
-      deferred = true;
+    if (auto it = active_recv_sessions_.find(uuid);
+        it != active_recv_sessions_.end() && !it->second->Done()) {
+      recv = it->second;
+    } else if (auto reshard_it = active_pool_reshard_recvs_.find(uuid);
+               reshard_it != active_pool_reshard_recvs_.end() &&
+               !reshard_it->second->Done()) {
+      reshard_recv = reshard_it->second;
     }
   }
-  if (deferred) return absl::OkStatus();
+  // Unregistering a live receive, on either the block-addressed or the
+  // pool-reshard path, cancels it: no further push is admitted
+  // (TryBeginRecvOp) and no further H2D starts. Work the transport already
+  // accepted keeps the plan -- its writes resolve through the plan's staging
+  // -- until it ends; the plan then goes with the session, together with
+  // the staging it leased, instead of outliving the receive until the
+  // deadline sweep. An idle receive settles here and its plan is dropped
+  // at once.
+  if (recv != nullptr) {
+    recv->DeferUnregisterOnSettle();
+    recv->Finish(absl::CancelledError("receive plan unregistered"));
+    if (!recv->Done()) return absl::OkStatus();
+    uint64_t generation = 0;
+    recv->TakePendingUnregister(&generation);
+  } else if (reshard_recv != nullptr) {
+    reshard_recv->Finish(absl::CancelledError("receive plan unregistered"));
+    if (!reshard_recv->Done()) return absl::OkStatus();
+    uint64_t generation = 0;
+    reshard_recv->TakePendingUnregister(&generation);
+  }
   return base_->UnregisterActivePlanDirect(uuid);
 }
 
@@ -702,6 +722,14 @@ void KVCacheManagerWithTransfer::UnregisterSettledPlan(uint64_t uuid,
 
 void KVCacheManagerWithTransfer::MaybeUnregisterSettledRecv(
     uint64_t uuid, TransferReceiveSession& session) {
+  uint64_t generation = 0;
+  if (session.Done() && session.TakePendingUnregister(&generation)) {
+    UnregisterSettledPlan(uuid, generation);
+  }
+}
+
+void KVCacheManagerWithTransfer::MaybeUnregisterSettledReshardRecv(
+    uint64_t uuid, ReshardReceiveSession& session) {
   uint64_t generation = 0;
   if (session.Done() && session.TakePendingUnregister(&generation)) {
     UnregisterSettledPlan(uuid, generation);

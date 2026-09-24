@@ -406,8 +406,8 @@ TEST(DemandStagingTest, DuplicateSenderRegistrationKeepsOriginalStaging) {
 }
 
 
-TEST(DemandStagingTest, UnregisteringInFlightReceiverDefersUntilItSettles) {
-  TestManager manager(/*timeout_s=*/0.05);
+TEST(DemandStagingTest, UnregisteringIdleReceiverReleasesPlanAtOnce) {
+  TestManager manager;
   manager.EnableDemandStaging();
   manager.AttachPlaceholderDeviceHold();
   auto* pool = manager.base()->host_block_manager();
@@ -418,28 +418,61 @@ TEST(DemandStagingTest, UnregisteringInFlightReceiverDefersUntilItSettles) {
                                       /*is_sender=*/false)
                   .ok());
   EXPECT_EQ(pool->num_free_blocks(), free_before - 2);
-  const auto staged = manager.base()->PlanHostBlocks(24, {2, 3});
-  ASSERT_TRUE(staged.ok()) << staged.status();
 
-  // Unregistering while the receive is in flight keeps the plan's mapping
-  // and its staging, so pushes already accepted still land in the plan's
-  // blocks ...
+  // No push was ever admitted, so unregistering cancels the receive and it
+  // settles at once: the plan and its staging go immediately instead of
+  // waiting for the deadline sweep.
   ASSERT_TRUE(manager.UnregisterActivePlan(24).ok());
-  const auto still_staged = manager.base()->PlanHostBlocks(24, {2, 3});
-  ASSERT_TRUE(still_staged.ok()) << still_staged.status();
-  EXPECT_EQ(*still_staged, *staged);
-  EXPECT_EQ(pool->num_free_blocks(), free_before - 2);
-
-  // ... until the receive settles; here it times out. Then the plan, its
-  // staging and the receive session go together.
-  absl::SleepFor(absl::Milliseconds(120));
-  const auto [done_sending, done_recving, failed_recving] =
-      manager.CompleteReadRaw();
-  EXPECT_THAT(failed_recving, Contains("block_plan_req_24"));
   EXPECT_EQ(manager.base()->PlanHostBlocks(24, {2, 3}).status().code(),
             absl::StatusCode::kNotFound);
   EXPECT_EQ(pool->num_free_blocks(), free_before);
   EXPECT_EQ(pool->num_locked_blocks(), 0);
+
+  const auto [done_sending, done_recving, failed_recving] =
+      manager.CompleteReadRaw();
+  EXPECT_THAT(failed_recving, Contains("block_plan_req_24"));
+}
+
+TEST(DemandStagingTest, UnregisteringInFlightReceiverDefersUntilItSettles) {
+  TestManager manager;
+  manager.EnableDemandStaging();
+  manager.AttachPlaceholderDeviceHold();
+  auto* pool = manager.base()->host_block_manager();
+  const int free_before = pool->num_free_blocks();
+  ASSERT_TRUE(manager
+                  .RegisterActivePlan(26, BlockPlan(26, {0, 1}, {2, 3},
+                                                    MEMORY_TYPE_HBM),
+                                      /*is_sender=*/false)
+                  .ok());
+  const auto staged = manager.base()->PlanHostBlocks(26, {2, 3});
+  ASSERT_TRUE(staged.ok()) << staged.status();
+  // The transport has admitted a push that is still writing.
+  ASSERT_TRUE(manager.base()->BeginIncomingPush(26).ok());
+
+  // Unregistering cancels the receive, but the admitted push keeps the
+  // plan's mapping and its staging, so its writes still land in the plan's
+  // blocks ...
+  ASSERT_TRUE(manager.UnregisterActivePlan(26).ok());
+  const auto still_staged = manager.base()->PlanHostBlocks(26, {2, 3});
+  ASSERT_TRUE(still_staged.ok()) << still_staged.status();
+  EXPECT_EQ(*still_staged, *staged);
+  EXPECT_EQ(pool->num_free_blocks(), free_before - 2);
+  // ... while no further push is admitted.
+  EXPECT_EQ(manager.base()->BeginIncomingPush(26).code(),
+            absl::StatusCode::kCancelled);
+
+  // When the admitted push ends the receive settles, and the plan, its
+  // staging and the receive session go together.
+  EXPECT_EQ(manager.base()->EndIncomingPush(26).code(),
+            absl::StatusCode::kCancelled);
+  EXPECT_EQ(manager.base()->PlanHostBlocks(26, {2, 3}).status().code(),
+            absl::StatusCode::kNotFound);
+  EXPECT_EQ(pool->num_free_blocks(), free_before);
+  EXPECT_EQ(pool->num_locked_blocks(), 0);
+
+  const auto [done_sending, done_recving, failed_recving] =
+      manager.CompleteReadRaw();
+  EXPECT_THAT(failed_recving, Contains("block_plan_req_26"));
 }
 
 TEST(DemandStagingTest, PlanHostBlocksFailsClosed) {

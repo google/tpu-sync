@@ -36,6 +36,7 @@
 #include "absl/strings/string_view.h"
 #include "tpu_sync/core/raiden_future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/fault_injection/fault_injection_bindings.h"
 #include "tpu_sync/frameworks/torch/kv_cache_manager.h"
 #include "tpu_sync/frameworks/torch/pool_layout_nanobind.h"
 #include "tpu_sync/frameworks/torch/torch_nanobind_utils.h"
@@ -1399,4 +1400,9 @@ NB_MODULE(_tpu_raiden_torch, m) {
   nb::module_ raw_transfer = m.def_submodule(
       "raw_transfer", "Raw device<->host DMA transfers for torch tensors.");
   ::raiden::BindTorchRawTransfer(raw_transfer);
+
+  // Mounted inside this extension so it shares the hooks' FaultInjector.
+  nb::module_ fault_injection = m.def_submodule(
+      "fault_injection", "Fault and latency injection control for raiden.");
+  tpu_raiden::BindFaultInjection(fault_injection);
 }

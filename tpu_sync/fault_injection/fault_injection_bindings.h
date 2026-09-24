@@ -12,12 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_FAULT_INJECTION_FAULT_INJECTION_BINDINGS_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_FAULT_INJECTION_FAULT_INJECTION_BINDINGS_H_
+
 #include <nanobind/nanobind.h>
-#include "tpu_sync/fault_injection/fault_injection_bindings.h"
 
-namespace nb = nanobind;
+namespace tpu_raiden {
 
-NB_MODULE(fault_injection, m) {
-  nb::set_leak_warnings(false);
-  tpu_raiden::BindFaultInjection(m);
-}
+// Registers the fault injection control surface on `m`.
+//
+// Each extension has its own FaultInjector singleton, so the bindings must be
+// registered inside the extension whose hooks they drive.
+void BindFaultInjection(nanobind::module_& m);
+
+}  // namespace tpu_raiden
+
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_FAULT_INJECTION_FAULT_INJECTION_BINDINGS_H_

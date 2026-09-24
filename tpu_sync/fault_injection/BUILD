@@ -56,16 +56,28 @@ cc_test(
     ],
 )
 
-nanobind_extension(
-    name = "fault_injection",
-    srcs = ["binding.cc"],
+# Link and mount inside every extension that also links :hooks.
+cc_library(
+    name = "fault_injection_bindings",
+    srcs = ["fault_injection_bindings.cc"],
+    hdrs = ["fault_injection_bindings.h"],
+    copts = ["-fexceptions"],
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
         ":hooks",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
+        "@nanobind",
     ],
+)
+
+nanobind_extension(
+    name = "fault_injection",
+    srcs = ["binding.cc"],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [":fault_injection_bindings"],
 )
 
 py_test(

@@ -62,6 +62,19 @@ py_library(
     ],
 )
 
+# Shim for _tpu_raiden_torch.fault_injection (no extra .so).
+py_library(
+    name = "fault_injection",
+    srcs = ["fault_injection.py"],
+    tags = ["nobuilder"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":torch_abi",
+        ":torch_tpu_common_loader",
+        "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
+    ],
+)
+
 py_library(
     name = "kv_cache_manager_host_py",
     srcs = ["kv_cache_manager.py"],
@@ -213,6 +226,27 @@ py_test(
         ":kv_cache_manager_torch_py",
         "@com_google_absl_py//absl/testing:absltest",
         "@com_google_absl_py//absl/testing:parameterized",
+        "@torch_tpu//shims/torch:pytorch",
+        "@torch_tpu//src/torch_tpu",
+    ],
+)
+
+# Note: blaze shares one FaultInjector across extensions, so only
+# test_wrapper_resolves_to_torch_extension guards the wheel's wiring bug.
+py_test(
+    name = "kv_cache_manager_fault_injection_test",
+    srcs = ["kv_cache_manager_fault_injection_test.py"],
+    tags = [
+        "cpu:8",
+        "notap",
+        "requires-accel-hbm",
+        "requires-ghostlite:8",
+        "requires-net:external",
+    ],
+    deps = [
+        ":fault_injection",
+        ":kv_cache_manager_torch_py",
+        "@com_google_absl_py//absl/testing:absltest",
         "@torch_tpu//shims/torch:pytorch",
         "@torch_tpu//src/torch_tpu",
     ],

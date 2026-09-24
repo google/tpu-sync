@@ -101,6 +101,8 @@ TORCH_DEPS = [
     # Raw d2h/h2d DMA shim; the bindings themselves ride inside
     # _tpu_raiden_torch as its raw_transfer submodule (no extra .so).
     "//tpu_sync/api/torch:raw_transfer",
+    # Fault/latency injection shim; submodule of _tpu_raiden_torch (no extra .so).
+    "//tpu_sync/api/torch:fault_injection",
     "//tpu_sync/api/torch:reshard_client",
     "//tpu_sync/api/torch:reshard_store",
     "//tpu_sync/api/torch:weight_synchronizer_torch_py",

@@ -220,6 +220,7 @@ nanobind_extension(
         ":torch_raw_transfer_bindings",
         ":weight_synchronizer_torch",
         "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/fault_injection:fault_injection_bindings",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
         "//tpu_sync/kv_cache:kv_cache_store",
         "//tpu_sync/kv_cache:kv_cache_store_backend_factory",

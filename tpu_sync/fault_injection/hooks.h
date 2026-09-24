@@ -47,8 +47,8 @@ inline constexpr std::string_view kTransferRecvSessionPullReply =
 // KV cache manager, scheduler API.
 inline constexpr std::string_view kKvCacheManagerApiStartRead =
     "kv_cache_manager.api.start_read";
-inline constexpr std::string_view kKvCacheManagerApiStartReadBeforeSubmit =
-    "kv_cache_manager.api.start_read.before_submit";
+inline constexpr std::string_view kKvCacheManagerApiStartReadSubmitPull =
+    "kv_cache_manager.api.start_read.submit_pull";
 inline constexpr std::string_view kKvCacheManagerApiCompleteRead =
     "kv_cache_manager.api.complete_read";
 
@@ -97,7 +97,7 @@ inline constexpr std::string_view kRawBufferTransportAccept =
 inline constexpr std::string_view kFailOnly[] = {
     kBlockTransportRecvIdsAlloc,     kTransferRecvSessionH2dDispatch,
     kTransferRecvSessionH2dComplete, kTransferRecvSessionPullReply,
-    kKvCacheManagerApiStartRead,     kKvCacheManagerApiStartReadBeforeSubmit,
+    kKvCacheManagerApiStartRead,     kKvCacheManagerApiStartReadSubmitPull,
     kKvCacheManagerApiCompleteRead,  kKvCacheManagerPullSpawn,
     kStagingAllocatorAcquire,        kTransferSendSessionD2hDispatch,
     kTransferSendSessionD2hComplete, kRawBufferTransportAccept,

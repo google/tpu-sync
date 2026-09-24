@@ -855,7 +855,13 @@ void KVCacheManagerWithTransfer::StartRead(
     return;
   }
 
-  FaultInjectThrow(hooks::kKvCacheManagerApiStartReadBeforeSubmit);
+  if (absl::Status status =
+          FaultInjectStatus(hooks::kKvCacheManagerApiStartReadSubmitPull);
+      !status.ok()) {
+    session->Finish(status);
+    session->EndRecvOp();
+    return;
+  }
 
   session->ExecutePullRequest(*this, remote_endpoint);
 }

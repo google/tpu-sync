@@ -55,8 +55,6 @@ inline constexpr std::string_view kKvCacheManagerApiCompleteRead =
 // KV cache manager, pull stream handler.
 inline constexpr std::string_view kKvCacheManagerPullRegisterWait =
     "kv_cache_manager.pull.register_wait";
-inline constexpr std::string_view kKvCacheManagerPullAccepted =
-    "kv_cache_manager.pull.accepted";
 inline constexpr std::string_view kKvCacheManagerPullSpawn =
     "kv_cache_manager.pull.spawn";
 
@@ -100,10 +98,10 @@ inline constexpr std::string_view kFailOnly[] = {
     kBlockTransportRecvIdsAlloc,     kTransferRecvSessionH2dDispatch,
     kTransferRecvSessionH2dComplete, kTransferRecvSessionPullReply,
     kKvCacheManagerApiStartRead,     kKvCacheManagerApiStartReadBeforeSubmit,
-    kKvCacheManagerApiCompleteRead,  kKvCacheManagerPullAccepted,
-    kKvCacheManagerPullSpawn,        kStagingAllocatorAcquire,
-    kTransferSendSessionD2hDispatch, kTransferSendSessionD2hComplete,
-    kRawBufferTransportAccept,       kTcpControlPlaneAccept,
+    kKvCacheManagerApiCompleteRead,  kKvCacheManagerPullSpawn,
+    kStagingAllocatorAcquire,        kTransferSendSessionD2hDispatch,
+    kTransferSendSessionD2hComplete, kRawBufferTransportAccept,
+    kTcpControlPlaneAccept,
 };
 
 }  // namespace hooks

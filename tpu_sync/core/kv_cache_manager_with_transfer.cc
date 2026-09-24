@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
@@ -1444,19 +1445,34 @@ KVCacheManagerWithTransfer::HandlePullStream(
             << (remote_data_endpoints.empty() ? "" : remote_data_endpoints[0])
             << (remote_data_endpoints.size() > 1 ? " and others" : "");
 
-    FaultInjectThrow(hooks::kKvCacheManagerPullAccepted);
     {
       absl::MutexLock lock(pull_workers_mu_);
       ++active_pull_workers_;
     }
+    absl::Cleanup counter_cleanup = [this, &session]() {
+      {
+        absl::MutexLock lock(pull_workers_mu_);
+        --active_pull_workers_;
+      }
+      session->Finish(
+          absl::InternalError("PullStream worker failed to launch"));
+    };
     FaultInjectThrow(hooks::kKvCacheManagerPullSpawn);
     std::thread([this, session, remote_data_endpoints,
                  src_block_ids = req.src_block_ids,
                  dst_block_ids = req.dst_block_ids]() {
-      session->StartPush(remote_data_endpoints, src_block_ids, dst_block_ids);
+      try {
+        session->StartPush(remote_data_endpoints, src_block_ids, dst_block_ids);
+      } catch (const std::exception& e) {
+        session->Finish(absl::InternalError(e.what()));
+      } catch (...) {
+        session->Finish(
+            absl::InternalError("Unknown exception in pull worker"));
+      }
       absl::MutexLock lock(pull_workers_mu_);
       --active_pull_workers_;
     }).detach();
+    std::move(counter_cleanup).Cancel();
 
     return PullStreamResponseSpec{
         .status = 0,

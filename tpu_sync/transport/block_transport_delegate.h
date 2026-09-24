@@ -165,6 +165,9 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
     return OnDataReceived();
   }
 
+  // Notification triggered when an inbound receive stream fails or disconnects.
+  void OnReceiveFailed(uint64_t uuid, const absl::Status& status) override {}
+
   using HostBlockReadyCallback = std::function<void(absl::Status)>;
   virtual void RegisterBlockReadinessCallback(size_t layer_idx,
                                               size_t shard_idx, int block_id,

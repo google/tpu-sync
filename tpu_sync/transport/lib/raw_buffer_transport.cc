@@ -394,161 +394,170 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     return absl::OkStatus();
 
   } else if (header.op == kOpBufferPushBatched) {  // peer batched push request
-    const uint32_t batch_size = header.count_or_size;
-    if (batch_size > IOV_MAX) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "Batch size ", batch_size, " exceeds IOV_MAX (", IOV_MAX, ")"));
-    }
-    const size_t m_size = GetChunkMetadataSize(header.version);
-    std::vector<char> meta_buf(m_size * batch_size);
-    ABSL_RETURN_IF_ERROR(
-        ReadExact(client_fd, meta_buf.data(), meta_buf.size()));
-
-    std::vector<ChunkMetadata> metadata(batch_size);
-    for (uint32_t i = 0; i < batch_size; ++i) {
-      absl::Span<const char> item_bytes(meta_buf.data() + i * m_size, m_size);
-      ABSL_ASSIGN_OR_RETURN(
-          metadata[i], DeserializeChunkMetadata(item_bytes, header.version));
-    }
-
-    size_t total_iovs = 0;
-    for (uint32_t i = 0; i < batch_size; ++i) {
-      const auto& meta = metadata[i];
-      const uint32_t count = meta.count > 0 ? meta.count : 1;
-      const size_t dst_stride =
-          meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
-      total_iovs += (count == 1 || dst_stride == meta.size_bytes) ? 1 : count;
-    }
-
-    std::vector<struct iovec> iovs;
-    iovs.reserve(total_iovs);
-    size_t total_bytes = 0;
-
-    for (uint32_t i = 0; i < batch_size; ++i) {
-      const auto& meta = metadata[i];
-      uint8_t* const base_host_ptr =
-          raw_delegate_->GetHostPointer(meta.layer_idx, meta.dst_shard_idx);
-      const size_t host_size =
-          raw_delegate_->GetHostSize(meta.layer_idx, meta.dst_shard_idx);
-      if (base_host_ptr == nullptr) {
-        return absl::InvalidArgumentError(
-            "Destination host pointer is null in batched push");
+    auto handle_batched_push = [&]() -> absl::Status {
+      const uint32_t batch_size = header.count_or_size;
+      if (batch_size > IOV_MAX) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Batch size ", batch_size, " exceeds IOV_MAX (", IOV_MAX, ")"));
       }
-      const uint32_t count = meta.count > 0 ? meta.count : 1;
-      const size_t dst_stride =
-          meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
+      const size_t m_size = GetChunkMetadataSize(header.version);
+      std::vector<char> meta_buf(m_size * batch_size);
+      ABSL_RETURN_IF_ERROR(
+          ReadExact(client_fd, meta_buf.data(), meta_buf.size()));
 
-      if (count == 1 || dst_stride == meta.size_bytes) {
-        const size_t task_bytes = count * meta.size_bytes;
-        if (meta.size_bytes > host_size ||
-            meta.dst_offset_bytes > host_size - task_bytes) {
-          return absl::InvalidArgumentError(
-              "Destination out of bounds in batched push");
-        }
-        if (task_bytes > 0) {
-          AppendOrMergeIov(iovs, base_host_ptr + meta.dst_offset_bytes,
-                           task_bytes);
-          total_bytes += task_bytes;
-        }
-      } else {
-        if (dst_stride < meta.size_bytes) {
-          return absl::InvalidArgumentError(
-              absl::StrCat("Destination stride (", dst_stride,
-                           ") cannot be smaller than slice size (",
-                           meta.size_bytes, ") in strided push"));
-        }
-        const size_t max_span =
-            meta.dst_offset_bytes + (count - 1) * dst_stride + meta.size_bytes;
-        if (max_span > host_size) {
-          return absl::InvalidArgumentError(
-              "Destination out of bounds in strided push");
-        }
-        for (uint32_t c = 0; c < count; ++c) {
-          AppendOrMergeIov(
-              iovs, base_host_ptr + meta.dst_offset_bytes + c * dst_stride,
-              meta.size_bytes);
-        }
-        total_bytes += count * meta.size_bytes;
-      }
-    }
-
-    if (total_bytes > 0) {
-      absl::Span<const struct iovec> remaining_iovs = iovs;
-      while (!remaining_iovs.empty()) {
-        size_t chunk =
-            std::min(remaining_iovs.size(), static_cast<size_t>(IOV_MAX));
-        ABSL_RETURN_IF_ERROR(
-            ReadVExact(client_fd, remaining_iovs.subspan(0, chunk)));
-        remaining_iovs = remaining_iovs.subspan(chunk);
-      }
-      if (store_ != nullptr) {
-        store_->IncrementCounter(metric_names::kWeightSyncReceivedBytesTotal,
-                                 {}, total_bytes);
-      }
-    }
-
-    TestOnlyRateLimiter* const limiter =
-        test_only_ingress_rate_limiter_raw_.load(std::memory_order_relaxed);
-    if (ABSL_PREDICT_FALSE(limiter != nullptr)) {
-      limiter->Consume(total_bytes);
-    }
-
-    const uint8_t ack = 1;
-    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
-
-    bool trigger_h2d = false;
-    std::vector<size_t> layers_to_trigger;
-    if (header.uuid > 0) {
-      // Collapse the batch into a per-layer histogram *before* taking the
-      // lock. `metadata` is thread-local to this connection worker, so this
-      // needs no synchronization. Chunks of a batch normally all belong to the
-      // same layer, so the histogram usually holds a single entry: this turns
-      // ~3 hash operations per chunk under `raw_progress_mu_` into ~3 per
-      // distinct layer.
-      Histogram<size_t> layer_histogram;
+      std::vector<ChunkMetadata> metadata(batch_size);
       for (uint32_t i = 0; i < batch_size; ++i) {
-        layer_histogram.Add(metadata[i].layer_idx, 1);
+        absl::Span<const char> item_bytes(meta_buf.data() + i * m_size, m_size);
+        ABSL_ASSIGN_OR_RETURN(
+            metadata[i], DeserializeChunkMetadata(item_bytes, header.version));
       }
 
-      absl::MutexLock lock(raw_progress_mu_);
-      auto& prog = raw_progress_[header.uuid];
-      prog.completed_chunks += batch_size;
-      for (const auto& [l, count] : layer_histogram) {
-        // Adding the whole run at once crosses the per-layer threshold exactly
-        // when the equivalent sequence of single increments would, because the
-        // counter only ever grows.
-        uint32_t& completed = prog.completed_chunks_per_layer[l];
-        completed += count;
-        auto it = prog.expected_chunks_per_layer.find(l);
-        if (it != prog.expected_chunks_per_layer.end() && it->second > 0 &&
-            completed >= it->second && !prog.triggered_layers.contains(l)) {
-          prog.triggered_layers.insert(l);
-          layers_to_trigger.push_back(l);
+      size_t total_iovs = 0;
+      for (uint32_t i = 0; i < batch_size; ++i) {
+        const auto& meta = metadata[i];
+        const uint32_t count = meta.count > 0 ? meta.count : 1;
+        const size_t dst_stride =
+            meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
+        total_iovs += (count == 1 || dst_stride == meta.size_bytes) ? 1 : count;
+      }
+
+      std::vector<struct iovec> iovs;
+      iovs.reserve(total_iovs);
+      size_t total_bytes = 0;
+
+      for (uint32_t i = 0; i < batch_size; ++i) {
+        const auto& meta = metadata[i];
+        uint8_t* const base_host_ptr =
+            raw_delegate_->GetHostPointer(meta.layer_idx, meta.dst_shard_idx);
+        const size_t host_size =
+            raw_delegate_->GetHostSize(meta.layer_idx, meta.dst_shard_idx);
+        if (base_host_ptr == nullptr) {
+          return absl::InvalidArgumentError(
+              "Destination host pointer is null in batched push");
+        }
+        const uint32_t count = meta.count > 0 ? meta.count : 1;
+        const size_t dst_stride =
+            meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
+
+        if (count == 1 || dst_stride == meta.size_bytes) {
+          const size_t task_bytes = count * meta.size_bytes;
+          if (meta.size_bytes > host_size ||
+              meta.dst_offset_bytes > host_size - task_bytes) {
+            return absl::InvalidArgumentError(
+                "Destination out of bounds in batched push");
+          }
+          if (task_bytes > 0) {
+            AppendOrMergeIov(iovs, base_host_ptr + meta.dst_offset_bytes,
+                             task_bytes);
+            total_bytes += task_bytes;
+          }
+        } else {
+          if (dst_stride < meta.size_bytes) {
+            return absl::InvalidArgumentError(
+                absl::StrCat("Destination stride (", dst_stride,
+                             ") cannot be smaller than slice size (",
+                             meta.size_bytes, ") in strided push"));
+          }
+          const size_t max_span = meta.dst_offset_bytes +
+                                  (count - 1) * dst_stride + meta.size_bytes;
+          if (max_span > host_size) {
+            return absl::InvalidArgumentError(
+                "Destination out of bounds in strided push");
+          }
+          for (uint32_t c = 0; c < count; ++c) {
+            AppendOrMergeIov(
+                iovs, base_host_ptr + meta.dst_offset_bytes + c * dst_stride,
+                meta.size_bytes);
+          }
+          total_bytes += count * meta.size_bytes;
         }
       }
-      VLOG(1) << "Received batched chunks for uuid=" << header.uuid
-              << " batch_size=" << batch_size
-              << " distinct_layers=" << layer_histogram.size()
-              << " progress=" << prog.completed_chunks << "/"
-              << (prog.expected_chunks.has_value()
-                      ? std::to_string(*prog.expected_chunks)
-                      : "unknown");
-      if (prog.expected_chunks.has_value() &&
-          prog.completed_chunks >= *prog.expected_chunks) {
-        raw_progress_.erase(header.uuid);
-        trigger_h2d = true;
-        VLOG(1) << "Triggering H2D for uuid=" << header.uuid;
+
+      if (total_bytes > 0) {
+        absl::Span<const struct iovec> remaining_iovs = iovs;
+        while (!remaining_iovs.empty()) {
+          size_t chunk =
+              std::min(remaining_iovs.size(), static_cast<size_t>(IOV_MAX));
+          ABSL_RETURN_IF_ERROR(
+              ReadVExact(client_fd, remaining_iovs.subspan(0, chunk)));
+          remaining_iovs = remaining_iovs.subspan(chunk);
+        }
+        if (store_ != nullptr) {
+          store_->IncrementCounter(metric_names::kWeightSyncReceivedBytesTotal,
+                                   {}, total_bytes);
+        }
       }
-    }
 
-    for (size_t l : layers_to_trigger) {
-      ABSL_RETURN_IF_ERROR(raw_delegate_->OnLayerDataReceived(l, header.uuid));
-    }
-    if (trigger_h2d) {
-      ABSL_RETURN_IF_ERROR(raw_delegate_->OnDataReceived(header.uuid));
-    }
+      TestOnlyRateLimiter* const limiter =
+          test_only_ingress_rate_limiter_raw_.load(std::memory_order_relaxed);
+      if (ABSL_PREDICT_FALSE(limiter != nullptr)) {
+        limiter->Consume(total_bytes);
+      }
 
-    return absl::OkStatus();
+      const uint8_t ack = 1;
+      ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
+
+      bool trigger_h2d = false;
+      std::vector<size_t> layers_to_trigger;
+      if (header.uuid > 0) {
+        // Collapse the batch into a per-layer histogram *before* taking the
+        // lock. `metadata` is thread-local to this connection worker, so this
+        // needs no synchronization. Chunks of a batch normally all belong to
+        // the same layer, so the histogram usually holds a single entry: this
+        // turns ~3 hash operations per chunk under `raw_progress_mu_` into ~3
+        // per distinct layer.
+        Histogram<size_t> layer_histogram;
+        for (uint32_t i = 0; i < batch_size; ++i) {
+          layer_histogram.Add(metadata[i].layer_idx, 1);
+        }
+
+        absl::MutexLock lock(raw_progress_mu_);
+        auto& prog = raw_progress_[header.uuid];
+        prog.completed_chunks += batch_size;
+        for (const auto& [l, count] : layer_histogram) {
+          // Adding the whole run at once crosses the per-layer threshold
+          // exactly when the equivalent sequence of single increments would,
+          // because the counter only ever grows.
+          uint32_t& completed = prog.completed_chunks_per_layer[l];
+          completed += count;
+          auto it = prog.expected_chunks_per_layer.find(l);
+          if (it != prog.expected_chunks_per_layer.end() && it->second > 0 &&
+              completed >= it->second &&
+              prog.triggered_layers.insert(l).second) {
+            layers_to_trigger.push_back(l);
+          }
+        }
+        VLOG(1) << "Received batched chunks for uuid=" << header.uuid
+                << " batch_size=" << batch_size
+                << " distinct_layers=" << layer_histogram.size()
+                << " progress=" << prog.completed_chunks << "/"
+                << (prog.expected_chunks.has_value()
+                        ? std::to_string(*prog.expected_chunks)
+                        : "unknown");
+        if (prog.expected_chunks.has_value() &&
+            prog.completed_chunks >= *prog.expected_chunks) {
+          raw_progress_.erase(header.uuid);
+          trigger_h2d = true;
+          VLOG(1) << "Triggering H2D for uuid=" << header.uuid;
+        }
+      }
+
+      for (size_t l : layers_to_trigger) {
+        ABSL_RETURN_IF_ERROR(
+            raw_delegate_->OnLayerDataReceived(l, header.uuid));
+      }
+      if (trigger_h2d) {
+        ABSL_RETURN_IF_ERROR(raw_delegate_->OnDataReceived(header.uuid));
+      }
+
+      return absl::OkStatus();
+    };
+
+    absl::Status status = handle_batched_push();
+    if (!status.ok() && header.uuid > 0) {
+      raw_delegate_->OnReceiveFailed(header.uuid, status);
+    }
+    return status;
   } else {
     if (custom_request_handler_) {
       return custom_request_handler_(client_fd, header);

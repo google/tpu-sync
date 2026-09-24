@@ -268,6 +268,9 @@ absl::Status BlockTransport::HandleCustomRequest(
       LOG(ERROR) << "Incoming push rejected: uuid=" << header.uuid
                  << " op=" << static_cast<int>(header.op)
                  << " local_id=" << header.local_id << ": " << push_status;
+      if (header.uuid > 0) {
+        block_delegate_->OnReceiveFailed(header.uuid, push_status);
+      }
     }
     return push_status;
   } else if (header.op == 2) {

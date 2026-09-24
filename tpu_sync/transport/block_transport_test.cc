@@ -251,6 +251,16 @@ class MockDelegate : public BlockTransportDelegate {
                       size_t shard_idx = 0) {
     return data(layer_idx, shard_idx) + block_id * slice_size_;
   }
+  void OnReceiveFailed(uint64_t uuid, const absl::Status& status) override {
+    absl::MutexLock lock(failed_uuids_mu_);
+    failed_uuids_.push_back(uuid);
+  }
+
+  std::vector<uint64_t> failed_uuids() {
+    absl::MutexLock lock(failed_uuids_mu_);
+    return failed_uuids_;
+  }
+
   std::vector<std::tuple<size_t, size_t, int>> wait_events() {
     absl::MutexLock lock(wait_events_mu_);
     return wait_events_;
@@ -282,6 +292,8 @@ class MockDelegate : public BlockTransportDelegate {
       ABSL_GUARDED_BY(peer_channels_mu_);
   absl::flat_hash_map<std::string, std::shared_ptr<grpc::Channel>>
       peer_channels_ ABSL_GUARDED_BY(peer_channels_mu_);
+  absl::Mutex failed_uuids_mu_;
+  std::vector<uint64_t> failed_uuids_ ABSL_GUARDED_BY(failed_uuids_mu_);
 };
 
 class SamePeerFanoutDelegate : public MockDelegate {
@@ -431,6 +443,28 @@ TEST_P(BlockTransportTest, PoolModeReceiverRejectsPlanlessExplicitPush) {
                       /*layer_idx=*/-1);
   ASSERT_TRUE(legacy.ok()) << legacy.status().message();
   EXPECT_EQ(receiver_delegate.data()[0], 0xAB);
+}
+
+TEST_P(BlockTransportTest, FailedPushNotifiesDelegateOnReceiveFailed) {
+  size_t size = 1024;
+  MockDelegate sender_delegate(size);
+  PlanRequiringDelegate receiver_delegate(size);
+  std::memset(sender_delegate.data(), 0xAB, size);
+  std::memset(receiver_delegate.data(), 0x00, size);
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  uint64_t uuid = 8888;
+  auto rejected =
+      sender.SyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                      /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+                      /*parallelism=*/1, MajorOrder::kLayerMajor, uuid,
+                      /*layer_idx=*/-1);
+  EXPECT_FALSE(rejected.ok());
+  EXPECT_THAT(receiver_delegate.failed_uuids(), testing::ElementsAre(uuid));
 }
 
 TEST_P(BlockTransportTest, PushAndPullCorrectness) {

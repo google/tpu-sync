@@ -278,6 +278,8 @@ class KVCacheManagerWithTransfer {
   virtual absl::Status OnBlocksReceived(const std::vector<int>& block_ids,
                                         uint64_t uuid = 0);
 
+  virtual void OnReceiveFailed(uint64_t uuid, const absl::Status& status);
+
   virtual std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
 
   // Endpoints for the block-transport DATA protocol (pulls and pushes),

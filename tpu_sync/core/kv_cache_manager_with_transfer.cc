@@ -1445,11 +1445,11 @@ KVCacheManagerWithTransfer::HandlePullStream(
             << (remote_data_endpoints.size() > 1 ? " and others" : "");
 
     FaultInjectThrow(hooks::kKvCacheManagerPullAccepted);
+    FaultInjectThrow(hooks::kKvCacheManagerPullSpawn);
     {
       absl::MutexLock lock(pull_workers_mu_);
       ++active_pull_workers_;
     }
-    FaultInjectThrow(hooks::kKvCacheManagerPullSpawn);
     std::thread([this, session, remote_data_endpoints,
                  src_block_ids = req.src_block_ids,
                  dst_block_ids = req.dst_block_ids]() {

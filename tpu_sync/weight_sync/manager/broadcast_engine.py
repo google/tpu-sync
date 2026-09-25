@@ -38,8 +38,8 @@ def _coalesce_contiguous_relay_entries(
       src_block_offset, size, src_block_id, dst_block_id, src_stride,
       dst_stride, count, layer_idx, pool_group).
     max_chunk_bytes: Maximum size in bytes of a coalesced chunk (default 4MB).
-    is_weight_sync: Whether this transfer is weight synchronization, where block
-      IDs are normalized to 0 because flat layer offsets are used.
+    is_weight_sync: Whether this transfer is weight synchronization. Block IDs
+      are preserved to prevent block size mismatch in BlockTransport.
 
   Returns:
     Coalesced list of 12-tuples.
@@ -65,8 +65,8 @@ def _coalesce_contiguous_relay_entries(
     ) = e
     if count == 1 or (src_stride == size and dst_stride == size):
       total_size = count * size
-      norm_src_block_id = 0 if is_weight_sync else src_block_id
-      norm_dst_block_id = 0 if is_weight_sync else dst_block_id
+      norm_src_block_id = src_block_id
+      norm_dst_block_id = dst_block_id
       normalized.append((
           dst_peer,
           dst_shard_idx,

@@ -314,7 +314,7 @@ class BroadcastEngineTest(absltest.TestCase):
     self.assertLen(coalesced_diff, 2)
 
     # 2. Weight sync (is_weight_sync=True):
-    # 64 entries with varying block IDs (0..63) coalesce into 1 4MB entry with block_id = 0
+    # 64 entries with varying block IDs (0..63) do not merge across block boundaries.
     varying_block_entries = [
         (
             "127.0.0.1:8001",
@@ -337,20 +337,85 @@ class BroadcastEngineTest(absltest.TestCase):
         max_chunk_bytes=4 * 1024 * 1024,
         is_weight_sync=True,
     )
-    self.assertLen(coalesced_ws, 1)
-    entry = coalesced_ws[0]
-    self.assertEqual(entry[4], 4 * 1024 * 1024)
-    self.assertEqual(entry[5], 0)
-    self.assertEqual(entry[6], 0)
-    self.assertEqual(entry[7], 4 * 1024 * 1024)
-    self.assertEqual(entry[8], 4 * 1024 * 1024)
-    self.assertEqual(entry[9], 1)
+    self.assertLen(coalesced_ws, 64)
+    for i, entry in enumerate(coalesced_ws):
+      self.assertEqual(entry[4], chunk_size)
+      self.assertEqual(entry[5], i)
+      self.assertEqual(entry[6], i)
 
     hop_expected_block_count = sum(
         1 if (e[9] == 1 or (e[7] == e[4] and e[8] == e[4])) else e[9]
         for e in coalesced_ws
     )
-    self.assertEqual(hop_expected_block_count, 1)
+    self.assertEqual(hop_expected_block_count, 64)
+
+  def test_coalesce_contiguous_relay_entries_preserves_block_ids_in_weight_sync(
+      self,
+  ) -> None:
+    """Verifies that distinct block IDs are preserved in weight sync coalescing."""
+    entries = [
+        (
+            "127.0.0.1:8001",
+            0,
+            i * 512,
+            i * 512,
+            512,
+            i,
+            i,
+            512,
+            512,
+            1,
+            0,
+            0,
+        )
+        for i in range(16)
+    ]
+    coalesced = broadcast_engine._coalesce_contiguous_relay_entries(
+        entries, is_weight_sync=True
+    )
+    self.assertLen(coalesced, 16)
+    for i, entry in enumerate(coalesced):
+      self.assertEqual(entry[4], 512)
+      self.assertEqual(entry[5], i)
+      self.assertEqual(entry[6], i)
+
+    within_block_entries = [
+        (
+            "127.0.0.1:8001",
+            0,
+            0,
+            0,
+            256,
+            0,
+            0,
+            256,
+            256,
+            1,
+            0,
+            0,
+        ),
+        (
+            "127.0.0.1:8001",
+            0,
+            256,
+            256,
+            256,
+            0,
+            0,
+            256,
+            256,
+            1,
+            0,
+            0,
+        ),
+    ]
+    coalesced_within = broadcast_engine._coalesce_contiguous_relay_entries(
+        within_block_entries, is_weight_sync=True
+    )
+    self.assertLen(coalesced_within, 1)
+    self.assertEqual(coalesced_within[0][4], 512)
+    self.assertEqual(coalesced_within[0][5], 0)
+    self.assertEqual(coalesced_within[0][6], 0)
 
   def test_coalesce_pipeline_groups(self) -> None:
     """Verifies 40 single-group stages coalesce into 8 stages of 5 groups."""

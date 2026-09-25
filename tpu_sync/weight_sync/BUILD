@@ -167,6 +167,7 @@ py_test(
         "//tpu_sync/api/jax:weight_synchronizer_jax_py",
         "//tpu_sync/rpc:raiden_controller",
         "//tpu_sync/rpc:raiden_service_py_pb2",
+        "//tpu_sync/weight_sync/manager:broadcast_engine",
         "@com_google_absl_py//absl/flags",
         "@com_google_absl_py//absl/testing:absltest",
         "@com_google_absl_py//absl/testing:parameterized",

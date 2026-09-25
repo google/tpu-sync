@@ -20,6 +20,8 @@ Qwen-35B model specs, verifying micro-block fragmentation realism and parity.
 """
 
 import asyncio
+import socket
+import struct
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -32,6 +34,7 @@ from tpu_sync.api.common import RaidenId
 from tpu_sync.api.jax import weight_synchronizer
 from tpu_sync.rpc import raiden_controller
 from tpu_sync.rpc import raiden_service_pb2
+from tpu_sync.weight_sync.manager import broadcast_engine
 
 _NUM_LAYERS = flags.DEFINE_integer(
     "num_layers", 40, "Number of layers to simulate."
@@ -874,6 +877,156 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
         f" Direct Push ({flat_res.elapsed:.3f}s) under constrained NIC line"
         f" rate at N={self.num_destinations}.",
     )
+
+  def _push_block_transport_entries(
+      self,
+      port: int,
+      coalesced: List[Tuple[Any, ...]],
+      uuid: int = 9999,
+  ) -> None:
+    """Pushes coalesced entries to BlockTransport server over TCP.
+
+    Args:
+      port: Local port of the destination BlockTransport server.
+      coalesced: Coalesced relay entries to push.
+      uuid: Unique transaction ID.
+
+    Raises:
+      ConnectionError: If handshake or completion ack fails.
+      ConnectionResetError: If the receiver closes connection due to rejection.
+      OSError: If a network socket error occurs.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+      s.settimeout(5.0)
+      s.connect(("127.0.0.1", port))
+      header = struct.pack(
+          "<HHBBHHHIIIQQQQQ",
+          0x4452,
+          1,
+          6,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          len(coalesced),
+          uuid,
+          0,
+          0,
+          0,
+          0,
+      )
+      dst_ids = struct.pack(f"<{len(coalesced)}I", *[e[6] for e in coalesced])
+      src_ids = struct.pack(f"<{len(coalesced)}I", *[e[5] for e in coalesced])
+      s.sendall(header)
+      s.sendall(dst_ids)
+      s.sendall(src_ids)
+
+      ack = s.recv(1)
+      if ack != b"\x01":
+        raise ConnectionError(f"Expected ack b'\\x01', got {ack!r}")
+
+      for e in coalesced:
+        s.sendall(struct.pack("<I", e[4]))
+        s.sendall(bytes([0x5A] * e[4]))
+
+      completion_ack = s.recv(1)
+      if completion_ack != b"\x01":
+        raise ConnectionResetError(
+            f"Block transfer rejected by receiver: {completion_ack!r}"
+        )
+
+  def test_tree_broadcast_relay_coalesced_entries_block_transport_contract(
+      self,
+  ):
+    """Verifies that coalesced relay entries respect BlockTransport contract.
+
+    Directly reproduces the production failure mode:
+    INTERNAL: Block transfer size mismatch! Sender offered: 8192 bytes,
+    but Receiver expected: 512 bytes for Block ID: 0
+    when entries across block boundaries are mistakenly coalesced into a single
+    block, and verifies that under our fix, entries preserve distinct block IDs
+    and are accepted by the BlockTransport server.
+    """
+    ws_mb = (
+        weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
+            num_layers=1,
+            num_shards=1,
+            slice_byte_size=512,
+            local_port=0,
+            listener_port=0,
+            bind_ip="127.0.0.1",
+        )
+    )
+    self.addCleanup(ws_mb.shutdown)
+
+    # Construct 16 micro-block entries of 512 bytes representing contiguous
+    # routed MLP / linear attention slices.
+    entries = [
+        (
+            f"127.0.0.1:{ws_mb.local_port}",
+            0,
+            i * 512,
+            i * 512,
+            512,
+            i,
+            i,
+            512,
+            512,
+            1,
+            0,
+            0,
+        )
+        for i in range(16)
+    ]
+
+    # Verification 1 (Buggy output rejection):
+    # Pre-fix implementation normalized block IDs to 0 when is_weight_sync=True,
+    # merging all 16 micro-blocks into a single 8192-byte block with block_id=0.
+    buggy_entries = [
+        (e[0], e[1], e[2], e[3], e[4], 0, 0, e[7], e[8], e[9], e[10], e[11])
+        for e in entries
+    ]
+    buggy_coalesced = broadcast_engine._coalesce_contiguous_relay_entries(
+        buggy_entries, is_weight_sync=False
+    )
+    self.assertLen(buggy_coalesced, 1)
+    self.assertEqual(buggy_coalesced[0][4], 8192)
+    self.assertEqual(buggy_coalesced[0][6], 0)
+
+    # Attempting to push this 8192-byte block to ws_mb.local_port MUST fail
+    # (socket error or connection closed by receiver) because the receiver
+    # expects 512 bytes for Block ID 0, matching the production failure mode:
+    # INTERNAL: Block transfer size mismatch! Sender offered: 8192 bytes,
+    # but Receiver expected: 512 bytes for Block ID: 0.
+    with self.assertRaises((socket.error, ConnectionError, OSError)):
+      self._push_block_transport_entries(
+          ws_mb.local_port, buggy_coalesced, uuid=9998
+      )
+
+    # Verification 2 (Fixed output acceptance):
+    # Under our fix,
+    # _coalesce_contiguous_relay_entries(entries, is_weight_sync=True)
+    # returns 16 separate 512-byte entries with distinct dst_block_id = 0..15.
+    fixed_coalesced = broadcast_engine._coalesce_contiguous_relay_entries(
+        entries, is_weight_sync=True
+    )
+    self.assertLen(fixed_coalesced, 16)
+    for i, e in enumerate(fixed_coalesced):
+      self.assertEqual(e[4], 512)
+      self.assertEqual(e[5], i)
+      self.assertEqual(e[6], i)
+
+    # Pushing these 16 blocks to ws_mb.local_port succeeds completely
+    # (handshake ack, all 16 payloads, and completion ack received).
+    self._push_block_transport_entries(
+        ws_mb.local_port, fixed_coalesced, uuid=9999
+    )
+
+    # Verify that the destination host buffer contains the sent bytes.
+    dst_buf = ws_mb.get_host_buffer(layer_idx=0, shard_idx=0)
+    self.assertEqual(bytes(dst_buf[:8192]), bytes([0x5A] * 8192))
 
 
 if __name__ == "__main__":

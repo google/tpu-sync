@@ -58,13 +58,25 @@
 #include "tpu_sync/transport/lib/socket/util.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 #include "tpu_sync/transport/peregrine/src/api/socket_util.h"
-#include "tpu_sync/transport/peregrine/src/util/util.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {
 
-using ::peregrine::util::AllZero;
-using ::peregrine::util::RandomNonZero;
+bool AllZero(absl::Span<const uint8_t> data) {
+  for (uint8_t b : data) {
+    if (b != 0) return false;
+  }
+  return true;
+}
+
+void RandomNonZero(absl::Span<uint8_t> data) {
+  thread_local std::mt19937 gen(std::random_device{}());
+  std::uniform_int_distribution<int> dist(1, 255);
+  for (uint8_t& b : data) {
+    b = static_cast<uint8_t>(dist(gen));
+  }
+}
+
 using ::testing::Each;
 using ::testing::ElementsAre;
 using ::testing::Eq;

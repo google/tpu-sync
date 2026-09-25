@@ -37,7 +37,6 @@
 #include "absl/strings/string_view.h"
 #include "grpcpp/channel.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
-#include "tpu_sync/transport/peregrine/src/api/socket_util.h"
 
 namespace tpu_raiden::transport::lib {
 
@@ -169,8 +168,32 @@ absl::StatusOr<int> ConnectToPeer(
   }
 
   LOG(INFO) << absl::StrCat("connected tcp socket ", sock_fd, ": ",
-                            peregrine::GetAddrPortPair(sock_fd));
+                            GetAddrPortPair(sock_fd));
   return sock_fd;
+}
+
+namespace {
+std::string SockAddrToEndpoint(int fd, int (*get_fn)(int, struct sockaddr*,
+                                                     socklen_t*)) {
+  struct sockaddr_storage ss{};
+  socklen_t len = sizeof(ss);
+  if (get_fn(fd, reinterpret_cast<struct sockaddr*>(&ss), &len) != 0) {
+    return "";
+  }
+  char host[NI_MAXHOST] = "", serv[NI_MAXSERV] = "";
+  if (getnameinfo(reinterpret_cast<const struct sockaddr*>(&ss), len, host,
+                  sizeof(host), serv, sizeof(serv),
+                  NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+    return "";
+  }
+  return ss.ss_family == AF_INET6 ? absl::StrCat("[", host, "]:", serv)
+                                  : absl::StrCat(host, ":", serv);
+}
+}  // namespace
+
+std::string GetAddrPortPair(int fd) {
+  return absl::StrCat(SockAddrToEndpoint(fd, ::getsockname), " <> ",
+                      SockAddrToEndpoint(fd, ::getpeername));
 }
 
 }  // namespace tpu_raiden::transport::lib

@@ -30,8 +30,8 @@
 #include "grpcpp/support/status.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
-#include "tpu_sync/transport/peregrine/src/internal/control/service.grpc.pb.h"
-#include "tpu_sync/transport/peregrine/src/internal/control/service.pb.h"
+#include "tpu_sync/transport/lib/service.grpc.pb.h"
+#include "tpu_sync/transport/lib/service.pb.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {

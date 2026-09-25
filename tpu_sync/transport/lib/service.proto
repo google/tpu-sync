@@ -16,7 +16,7 @@ edition = "2024";
 
 package peregrine.internal.control;
 
-// Service for Peregrine control plane communication.
+// Service for transport PSP control plane communication.
 service PeregrineService {
   // Client sends its local RX SPI and key; server returns its RX SPI and key.
   rpc ExchangePspKey(PspKeyExchangeRequest) returns (PspKeyExchangeResponse) {  }

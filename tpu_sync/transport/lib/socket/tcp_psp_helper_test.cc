@@ -32,9 +32,9 @@
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/channel_arguments.h"
 #include "grpcpp/support/status.h"
+#include "tpu_sync/transport/lib/service.grpc.pb.h"
+#include "tpu_sync/transport/lib/service.pb.h"
 #include "tpu_sync/transport/lib/socket/psp_syscall_mock.h"  // NOLINT
-#include "tpu_sync/transport/peregrine/src/internal/control/service.grpc.pb.h"
-#include "tpu_sync/transport/peregrine/src/internal/control/service.pb.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {

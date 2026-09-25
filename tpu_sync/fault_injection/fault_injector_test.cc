@@ -37,8 +37,9 @@ using ::testing::Pair;
 using ::testing::UnorderedElementsAre;
 using ::testing::status::StatusIs;
 
-constexpr std::string_view kTestHookAlpha = "test.hook.alpha";
-constexpr std::string_view kTestHookBeta = "test.hook.beta";
+constexpr std::string_view kTestHookAlpha =
+    hooks::kTransferRecvSessionPullRequest;
+constexpr std::string_view kTestHookBeta = hooks::kSocketTransportSendProgress;
 
 class FaultInjectorTest : public ::testing::Test {
  protected:
@@ -96,6 +97,31 @@ TEST_F(FaultInjectorTest, DelayEligibilityRejectsEmptyAndFailOnlyHooks) {
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("delay is not permitted at hook "
                                  "'transfer_recv_session.h2d.complete'")));
+
+  EXPECT_THAT(GetFaultInjector().Install({FaultInjectionRule{
+                  .hook = "unknown.hook",
+                  .action = FaultInjectionType::kFail,
+                  .probability = 1.0,
+              }}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("unknown hook 'unknown.hook'")));
+
+  EXPECT_THAT(GetFaultInjector().Install({FaultInjectionRule{
+                  .hook = std::string(hooks::kKvCacheManagerPullRegisterWait),
+                  .action = FaultInjectionType::kFail,
+                  .probability = 1.0,
+              }}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("fail is not permitted at hook "
+                                 "'kv_cache_manager.pull.register_wait'")));
+
+  EXPECT_THAT(GetFaultInjector().Install({FaultInjectionRule{
+                  .hook = std::string(kTestHookAlpha),
+                  .action = FaultInjectionType::kFail,
+                  .probability = -0.1,
+              }}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("probability must be in [0, 1]")));
 }
 
 TEST_F(FaultInjectorTest, DefaultProbabilityZeroDoesNotTrigger) {

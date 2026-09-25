@@ -91,17 +91,28 @@ inline constexpr std::string_view kSocketTransportSendProgress =
 inline constexpr std::string_view kRawBufferTransportAccept =
     "raw_buffer_transport.accept";
 
-// Hooks that execute on PJRT callbacks, under mutexes, or at non-blocking
-// boundaries where sleeping is disallowed; FaultInjector::Install rejects
-// kDelay rules targeting any hook in this list.
-inline constexpr std::string_view kFailOnly[] = {
-    kBlockTransportRecvIdsAlloc,     kTransferRecvSessionH2dDispatch,
-    kTransferRecvSessionH2dComplete, kTransferRecvSessionPullReply,
+// Hooks that support `action = "fail"`
+inline constexpr std::string_view kFailHooks[] = {
+    kBlockTransportRecvIdsAlloc,     kBlockTransportRecvProgress,
+    kBlockTransportRecvLayerDone,    kBlockTransportRecvBeforeAck,
+    kTransferRecvSessionH2dDispatch, kTransferRecvSessionH2dComplete,
+    kTransferRecvSessionPullRequest, kTransferRecvSessionPullReply,
     kKvCacheManagerApiStartRead,     kKvCacheManagerApiStartReadSubmitPull,
     kKvCacheManagerApiCompleteRead,  kKvCacheManagerPullSpawn,
-    kStagingAllocatorAcquire,        kTransferSendSessionD2hDispatch,
-    kTransferSendSessionD2hComplete, kRawBufferTransportAccept,
-    kTcpControlPlaneAccept,
+    kGrpcControlPlanePullReply,      kTcpControlPlanePullReply,
+    kTcpControlPlaneAccept,          kStagingAllocatorAcquire,
+    kTransferSendSessionD2hDispatch, kTransferSendSessionD2hComplete,
+    kRaidenManagerBaseH2hWrite,      kSocketTransportSendConnect,
+    kSocketTransportSendProgress,    kRawBufferTransportAccept,
+};
+
+// Hooks that support `action = "delay"`.
+inline constexpr std::string_view kDelayHooks[] = {
+    kBlockTransportRecvProgress,     kBlockTransportRecvLayerDone,
+    kBlockTransportRecvBeforeAck,    kTransferRecvSessionPullRequest,
+    kKvCacheManagerPullRegisterWait, kGrpcControlPlanePullReply,
+    kTcpControlPlanePullReply,       kRaidenManagerBaseH2hWrite,
+    kSocketTransportSendConnect,     kSocketTransportSendProgress,
 };
 
 }  // namespace hooks

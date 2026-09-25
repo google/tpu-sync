@@ -107,6 +107,36 @@ class FaultInjectionBindingTest(absltest.TestCase):
           "max_delay_ms": 10,
       }])
 
+    with self.assertRaisesRegex(
+        ValueError,
+        "unknown hook 'nonexistent.hook'",
+    ):
+      fault_injection.inject_faults([{
+          "hook": "nonexistent.hook",
+          "action": "fail",
+          "probability": 1.0,
+      }])
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "fail is not permitted at hook 'kv_cache_manager.pull.register_wait'",
+    ):
+      fault_injection.inject_faults([{
+          "hook": "kv_cache_manager.pull.register_wait",
+          "action": "fail",
+          "probability": 1.0,
+      }])
+
+    with self.assertRaisesRegex(
+        ValueError,
+        r"probability must be in \[0, 1\]",
+    ):
+      fault_injection.inject_faults([{
+          "hook": "transfer_recv_session.pull.request",
+          "action": "fail",
+          "probability": 1.5,
+      }])
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -15,6 +15,7 @@
 #include "tpu_sync/fault_injection/fault_injector.h"
 
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -74,14 +75,29 @@ FaultInjectionAction FaultInjector::Evaluate(std::string_view hook) {
 absl::Status FaultInjector::Install(const FaultInjectionRules& rules) {
   absl::flat_hash_map<std::string, std::vector<FaultInjectionRule>> new_rules;
   for (const auto& r : rules) {
+    if (!r.hook.empty() && !absl::c_linear_search(hooks::kFailHooks, r.hook) &&
+        !absl::c_linear_search(hooks::kDelayHooks, r.hook)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("unknown hook '", r.hook, "'"));
+    }
+    if (std::isnan(r.probability) || r.probability < 0.0 ||
+        r.probability > 1.0) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("probability must be in [0, 1], got ", r.probability));
+    }
     if (r.min_delay_ms > r.max_delay_ms) {
       return absl::InvalidArgumentError(
           "min_delay_ms cannot be greater than max_delay_ms");
     }
     if (r.action == FaultInjectionType::kDelay &&
-        (r.hook.empty() || absl::c_linear_search(hooks::kFailOnly, r.hook))) {
+        !absl::c_linear_search(hooks::kDelayHooks, r.hook)) {
       return absl::InvalidArgumentError(
           absl::StrCat("delay is not permitted at hook '", r.hook, "'"));
+    }
+    if (r.action == FaultInjectionType::kFail && !r.hook.empty() &&
+        !absl::c_linear_search(hooks::kFailHooks, r.hook)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("fail is not permitted at hook '", r.hook, "'"));
     }
     new_rules[r.hook].push_back(r);
   }

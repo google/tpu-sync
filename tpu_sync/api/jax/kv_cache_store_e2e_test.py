@@ -805,6 +805,399 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
         flush=True,
     )
 
+  # ---------------------------------------------------------------------------
+  # Helpers for the mixed-backend Load() tests. Completion waits reuse
+  # _await_terminal, which accumulates drained poll results across polls: a
+  # mixed Load() finishes in independent halves (prefix and storage suffix)
+  # that may be reported by different polls.
+  # ---------------------------------------------------------------------------
+
+  def _assert_block_statuses(self, lookup_result, hashes, expected_statuses):
+    """Asserts lookup_result covers hashes in order with expected statuses.
+
+    expected_statuses[i] is a BlockStatus or a tuple of acceptable statuses.
+    """
+    self.assertEqual([h for h, _ in lookup_result], list(hashes))
+    got = [s.status for _, s in lookup_result]
+    for i, want in enumerate(expected_statuses):
+      allowed = want if isinstance(want, tuple) else (want,)
+      self.assertIn(got[i], allowed,
+                    f"block {hashes[i]!r}: statuses={got}")
+
+  def _await_lookup_statuses(self, store, hashes, expected_statuses,
+                             timeout_s=120.0, **lookup_kwargs):
+    """Polls lookup() until it returns exactly expected_statuses.
+
+    Replaces fixed sleeps where visibility is eventually consistent (global
+    registry publication). lookup_kwargs must not pin, since lookups repeat.
+    """
+    deadline = time.time() + timeout_s
+    while True:
+      result = store.lookup(hashes, **lookup_kwargs)
+      try:
+        self._assert_block_statuses(result, hashes, expected_statuses)
+        return result
+      except AssertionError:
+        if time.time() > deadline:
+          raise
+      time.sleep(0.1)
+
+  def _assert_and_print_shard_files(self, tag, root, model_name, expected):
+    bin_files = sorted(glob.glob(os.path.join(root, model_name, "**", "*.bin"),
+                                 recursive=True))
+    self.assertLen(bin_files, expected, f"shard files: {bin_files}")
+    print(f"[{tag}][Phase 1/5] {len(bin_files)} on-disk shard files"
+          " (exact count verified):", flush=True)
+    for f in bin_files:
+      print(f"  [Shard File] {f}"
+            f" ({os.path.getsize(f)} bytes)", flush=True)
+
+  def _make_storage_dir(self, prefix):
+    if _SECONDARY_STORAGE_ROOT.value:
+      temp_dir = os.path.join(_SECONDARY_STORAGE_ROOT.value,
+                              f"{prefix}_{uuid.uuid4().hex[:8]}")
+      os.makedirs(temp_dir, exist_ok=True)
+      return temp_dir, True
+    return tempfile.mkdtemp(), False
+
+  def _posix_cfg(self, root, model_name):
+    cfg = kv_cache_store._impl.BackendConfig()
+    cfg.type = "posix"
+    cfg.parallelism.tp_rank = 0
+    cfg.parallelism.tp_size = self.num_devices
+    cfg.set_property("root_dir", root)
+    cfg.set_property("model_name", model_name)
+    return cfg
+
+  def _hbm_slices(self, raiden_id, num_blocks):
+    return [
+        kv_cache_store.RaidenBlockId(
+            raiden_id,
+            host_block_id=-1,
+            device_block_id=i,
+            status=kv_cache_store.BlockStatus.HBM,
+        )
+        for i in range(num_blocks)
+    ]
+
+  def test_secondary_storage_e2e_mixed_backend_load(self):
+    """Mixed Load(): HOST prefix + SHARED_STORAGE suffix, real TPU H2D/D2H.
+
+    Blocks: prefix [mixed_h0, mixed_h1] -> HOST (recalled into reader host RAM
+            first), suffix [mixed_s0, mixed_s1] -> SHARED_STORAGE.
+      1. Seed storage: writer saves all 4 blocks to POSIX storage.
+      2. Stage prefix: reader recalls the prefix into its host RAM; HBM zeroed.
+      3. Lookup:       exactly [HOST, HOST, SHARED_STORAGE, SHARED_STORAGE].
+      4. Mixed load:   one Load() for all 4 blocks; wait for all 4.
+      5. Verify:       HBM bit-exact; all 4 blocks HOST_AND_HBM.
+    """
+    tag = "JAX Mixed HOST+STORAGE"
+    status = kv_cache_store.BlockStatus
+    tpu_sharding = self.setup_shardings()
+    num_blocks = 4
+    # Shape: (4 blocks, 128 tokens/block, 8 head shards, 8 heads/shard,
+    # head_dim 128).
+    shape = (num_blocks, 128, 8, 8, 128)
+    host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    shard_size_bytes = (128 * 8 * 8 * 128 * 4) // self.num_devices
+    hashes = [b"mixed_h0", b"mixed_h1", b"mixed_s0", b"mixed_s1"]
+    prefix_hashes = hashes[:2]  # -> HOST (reader host RAM)
+    suffix_hashes = hashes[2:]  # -> SHARED_STORAGE
+    model_name = "llama_70b_jax_mixed"
+
+    tpu_cache = jax.device_put(jnp.array(host_data), tpu_sharding)
+    jax.block_until_ready(tpu_cache)
+    temp_dir, is_custom_root = self._make_storage_dir("jax_mixed_host_storage")
+    cfg = self._posix_cfg(temp_dir, model_name)
+    print(f"[{tag}] {self.num_devices} chips, shape={shape}, storage={temp_dir}",
+          flush=True)
+    try:
+      # ---- Phase 1/5: seed storage with all 4 blocks. ----
+      port_w = _pick_unused_port()
+      rid_w = kv_cache_store.RaidenId(f"mixed1_{uuid.uuid4().hex[:8]}", "0",
+                                      "cache_1", 0)
+      store_w = kv_cache_store.KVCacheStore(
+          capacity=num_blocks,
+          raiden_id=rid_w,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=port_w,
+          secondary_backend_configs=[cfg],
+      )
+      manager_w = kv_cache_manager.KVCacheManager(
+          kv_caches=[tpu_cache],
+          local_control_port=0,
+          max_blocks=num_blocks,
+          num_slots=2,
+          unsafe_skip_buffer_lock=self.skip_lock,
+          raiden_worker_port=0,
+          raiden_controller_address=f"localhost:{port_w}",
+          worker_id="worker_0",
+          backend_configs=[cfg],
+      )
+      try:
+        print(f"[{tag}][Phase 1/5] Saving {hashes} -> SHARED_STORAGE.",
+              flush=True)
+        self.assertTrue(store_w.insert(hashes,
+                                       self._hbm_slices(rid_w, num_blocks),
+                                       on_host=False))
+        self.assertTrue(store_w.save(hashes))
+        self._await_terminal(store_w.poll_save_status, len(hashes),
+                             "storage save")
+        self._assert_and_print_shard_files(tag, temp_dir, model_name,
+                                           len(hashes))
+      finally:
+        del manager_w, store_w
+
+      port_r = _pick_unused_port()
+      rid_r = kv_cache_store.RaidenId(f"mixed2_{uuid.uuid4().hex[:8]}", "0",
+                                      "cache_2", 0)
+      store_r = kv_cache_store.KVCacheStore(
+          capacity=num_blocks,
+          raiden_id=rid_r,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=port_r,
+          secondary_backend_configs=[cfg],
+      )
+      manager_r = kv_cache_manager.KVCacheManager(
+          kv_caches=[tpu_cache],
+          local_control_port=0,
+          max_blocks=num_blocks,
+          num_slots=2,
+          unsafe_skip_buffer_lock=self.skip_lock,
+          raiden_worker_port=0,
+          raiden_controller_address=f"localhost:{port_r}",
+          worker_id="worker_0",
+          backend_configs=[cfg],
+      )
+      try:
+        # ---- Phase 2/5: stage the prefix into reader host RAM. ----
+        print(f"[{tag}][Phase 2/5] Recalling prefix {prefix_hashes}"
+              " SHARED_STORAGE -> HOST.", flush=True)
+        pre = store_r.lookup(prefix_hashes, pin_found=False)
+        self._assert_block_statuses(pre, prefix_hashes,
+                                    [status.SHARED_STORAGE] * 2)
+        self.assertTrue(store_r.load(prefix_hashes, [0, 1],
+                                     slices=[s for _, s in pre]))
+        self._await_terminal(store_r.poll_load_status, len(prefix_hashes),
+                             "prefix recall")
+        # Clear HBM (host block 4 is all zeros) so Phase 5 only passes if the
+        # mixed load rewrites every block.
+        manager_r.h2d([4, 4, 4, 4], [0, 1, 2, 3]).wait()
+        self.assertEqual(float(jax.jit(jnp.sum)(tpu_cache)), 0.0)
+
+        # ---- Phase 3/5: lookup sees exactly [HOST, HOST, STORAGE, STORAGE].
+        host = (status.HOST, status.HOST_AND_HBM)
+        mixed = store_r.lookup(hashes, pin_found=True)
+        self._assert_block_statuses(
+            mixed, hashes,
+            [host, host, status.SHARED_STORAGE, status.SHARED_STORAGE])
+        print(f"[{tag}][Phase 3/5] Lookup: prefix {prefix_hashes} HOST,"
+              f" suffix {suffix_hashes} SHARED_STORAGE.", flush=True)
+
+        # ---- Phase 4/5: one mixed Load() for all 4 blocks. ----
+        print(f"[{tag}][Phase 4/5] Load({hashes}) -> device [0, 1, 2, 3].",
+              flush=True)
+        self.assertTrue(store_r.load(hashes, [0, 1, 2, 3],
+                                     slices=[s for _, s in mixed]))
+        self._await_terminal(store_r.poll_load_status, len(hashes),
+                             "mixed load")
+
+        # ---- Phase 5/5: verify HBM and final metadata. ----
+        recalled = jax.jit(lambda x: x)(tpu_cache)
+        jax.block_until_ready(recalled)
+        np.testing.assert_array_equal(np.asarray(recalled), host_data)
+        post = store_r.lookup(hashes, pin_found=False)
+        self._assert_block_statuses(post, hashes, [status.HOST_AND_HBM] * 4)
+        for _, b in post:
+          self.assertIn(b.device_block_id, [0, 1, 2, 3])
+          self.assertGreaterEqual(b.host_block_id, 0)
+        print(f"[{tag}][Phase 5/5] HBM bit-exact; all 4 blocks HOST_AND_HBM.",
+              flush=True)
+      finally:
+        del manager_r, store_r
+    finally:
+      if not is_custom_root:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+  def test_secondary_storage_e2e_mixed_remote_and_storage_load(self):
+    """Mixed Load(): REMOTE peer prefix + SHARED_STORAGE suffix, real TPU.
+
+    Blocks: prefix [mixed_r0, mixed_r1] -> REMOTE (held in Peer A host RAM),
+            suffix [mixed_s0, mixed_s1] -> SHARED_STORAGE.
+      1. Seed storage: writer saves the suffix to POSIX storage.
+      2. Stage prefix: Peer A saves the prefix to its host RAM (published to
+                       the global registry).
+      3. Lookup:       Consumer B waits until lookup returns exactly
+                       [REMOTE(A), REMOTE(A), SHARED_STORAGE, SHARED_STORAGE].
+      4. Mixed load:   one Load() for all 4 blocks; wait for all 4.
+      5. Verify:       HBM bit-exact; suffix HOST_AND_HBM in B.
+    """
+    tag = "JAX Mixed REMOTE+STORAGE"
+    status = kv_cache_store.BlockStatus
+    tpu_sharding = self.setup_shardings()
+    num_blocks = 4
+    shape = (num_blocks, 128, 8, 8, 128)
+    host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    shard_size_bytes = (128 * 8 * 8 * 128 * 4) // self.num_devices
+    prefix_hashes = [b"mixed_r0", b"mixed_r1"]  # -> REMOTE (Peer A)
+    suffix_hashes = [b"mixed_s0", b"mixed_s1"]  # -> SHARED_STORAGE
+    all_hashes = prefix_hashes + suffix_hashes
+    model_name = "llama_70b_jax_remote_mixed"
+
+    temp_dir, is_custom_root = self._make_storage_dir(
+        "jax_mixed_remote_storage")
+    cfg = self._posix_cfg(temp_dir, model_name)
+    print(f"[{tag}] {self.num_devices} chips, shape={shape}, storage={temp_dir}",
+          flush=True)
+    try:
+      # ---- Phase 1/5: seed storage with the suffix. ----
+      port_s = _pick_unused_port()
+      rid_s = kv_cache_store.RaidenId(f"writer_{uuid.uuid4().hex[:8]}", "0",
+                                      "cache_s", 0)
+      store_s = kv_cache_store.KVCacheStore(
+          capacity=2,
+          raiden_id=rid_s,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=port_s,
+          secondary_backend_configs=[cfg],
+      )
+      tpu_cache_s = jax.device_put(jnp.array(host_data[2:]), tpu_sharding)
+      jax.block_until_ready(tpu_cache_s)
+      manager_s = kv_cache_manager.KVCacheManager(
+          kv_caches=[tpu_cache_s],
+          local_control_port=0,
+          max_blocks=2,
+          num_slots=2,
+          unsafe_skip_buffer_lock=self.skip_lock,
+          raiden_worker_port=0,
+          raiden_controller_address=f"localhost:{port_s}",
+          worker_id="worker_s",
+          backend_configs=[cfg],
+      )
+      try:
+        print(f"[{tag}][Phase 1/5] Saving suffix {suffix_hashes} ->"
+              " SHARED_STORAGE.", flush=True)
+        self.assertTrue(store_s.insert(suffix_hashes,
+                                       self._hbm_slices(rid_s, 2),
+                                       on_host=False))
+        self.assertTrue(store_s.save(suffix_hashes))
+        self._await_terminal(store_s.poll_save_status, len(suffix_hashes),
+                             "storage save")
+        self._assert_and_print_shard_files(tag, temp_dir, model_name,
+                                           len(suffix_hashes))
+      finally:
+        del manager_s, store_s, tpu_cache_s
+
+      # ---- Phase 2/5: Peer A stages the prefix in its host RAM. ----
+      port_a = _pick_unused_port()
+      rid_a = kv_cache_store.RaidenId(f"job_a_{uuid.uuid4().hex[:8]}", "0",
+                                      "cache_a", 0)
+      store_a = kv_cache_store.KVCacheStore(
+          capacity=4,
+          global_registry_address=f"localhost:{_registry_port}",
+          raiden_id=rid_a,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=port_a,
+      )
+      tpu_cache_a = jax.device_put(jnp.array(host_data[:2]), tpu_sharding)
+      jax.block_until_ready(tpu_cache_a)
+      manager_a = kv_cache_manager.KVCacheManager(
+          kv_caches=[tpu_cache_a],
+          local_control_port=0,
+          max_blocks=2,
+          num_slots=2,
+          unsafe_skip_buffer_lock=self.skip_lock,
+          raiden_worker_port=_pick_unused_port(),
+          raiden_controller_address=f"localhost:{port_a}",
+          worker_id="worker_a",
+          node_id=0,
+      )
+      print(f"[{tag}][Phase 2/5] Peer A saving prefix {prefix_hashes} -> HOST"
+            " (published to global registry).", flush=True)
+      self.assertTrue(store_a.insert(prefix_hashes,
+                                     self._hbm_slices(rid_a, 2),
+                                     on_host=False))
+      self.assertTrue(store_a.save(prefix_hashes))
+      self._await_terminal(store_a.poll_save_status, len(prefix_hashes),
+                           "peer A save")
+
+      port_b = _pick_unused_port()
+      rid_b = kv_cache_store.RaidenId(f"job_b_{uuid.uuid4().hex[:8]}", "0",
+                                      "cache_b", 0)
+      store_b = kv_cache_store.KVCacheStore(
+          capacity=num_blocks,
+          global_registry_address=f"localhost:{_registry_port}",
+          raiden_id=rid_b,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=port_b,
+          secondary_backend_configs=[cfg],
+      )
+      tpu_cache_b = jax.device_put(
+          jnp.array(np.zeros(shape, dtype=np.float32)), tpu_sharding)
+      jax.block_until_ready(tpu_cache_b)
+      manager_b = kv_cache_manager.KVCacheManager(
+          kv_caches=[tpu_cache_b],
+          local_control_port=0,
+          max_blocks=num_blocks,
+          num_slots=2,
+          unsafe_skip_buffer_lock=self.skip_lock,
+          raiden_worker_port=_pick_unused_port(),
+          raiden_controller_address=f"localhost:{port_b}",
+          worker_id="worker_b",
+          node_id=0,
+          backend_configs=[cfg],
+      )
+      try:
+        # ---- Phase 3/5: wait for [REMOTE(A), REMOTE(A), STORAGE, STORAGE].
+        mixed = self._await_lookup_statuses(
+            store_b, all_hashes,
+            [status.REMOTE, status.REMOTE, status.SHARED_STORAGE,
+             status.SHARED_STORAGE],
+            enable_global=True, pin_found=False)
+        for _, s in mixed[:2]:
+          self.assertEqual(s.raiden_id, rid_a)
+        print(f"[{tag}][Phase 3/5] Lookup: prefix {prefix_hashes}"
+              f" REMOTE(peer A), suffix {suffix_hashes} SHARED_STORAGE.",
+              flush=True)
+
+        # ---- Phase 4/5: one mixed Load() for all 4 blocks. ----
+        print(f"[{tag}][Phase 4/5] Load({all_hashes}) -> device"
+              " [0, 1, 2, 3].", flush=True)
+        self.assertTrue(store_b.load(all_hashes, [0, 1, 2, 3],
+                                     slices=[s for _, s in mixed]))
+        self._await_terminal(store_b.poll_load_status, len(all_hashes),
+                             "mixed load")
+
+        # ---- Phase 5/5: verify HBM and final metadata. ----
+        recalled = jax.jit(lambda x: x)(tpu_cache_b)
+        jax.block_until_ready(recalled)
+        np.testing.assert_array_equal(np.asarray(recalled), host_data)
+        post = store_b.lookup(suffix_hashes, enable_global=False,
+                              pin_found=False)
+        self._assert_block_statuses(post, suffix_hashes,
+                                    [status.HOST_AND_HBM] * 2)
+        for _, b in post:
+          self.assertIn(b.device_block_id, [2, 3])
+          self.assertGreaterEqual(b.host_block_id, 0)
+        print(f"[{tag}][Phase 5/5] HBM bit-exact; suffix HOST_AND_HBM.",
+              flush=True)
+      finally:
+        del manager_b, store_b, tpu_cache_b
+        del manager_a, store_a, tpu_cache_a
+    finally:
+      if not is_custom_root:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
   def _run_remote_read_e2e_test(
       self,
       enable_multi_numa: bool,

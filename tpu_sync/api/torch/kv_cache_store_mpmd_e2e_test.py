@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import glob
 import os
 import pathlib
@@ -70,6 +71,7 @@ flags.DEFINE_integer("world_size", 0, "")
 flags.DEFINE_integer("master_port", 0, "")
 flags.DEFINE_integer("controller_port", 0, "")
 flags.DEFINE_integer("controller_port_b", 0, "")
+flags.DEFINE_integer("controller_port_s", 0, "")
 flags.DEFINE_integer("registry_port", 0, "")
 
 _GOOGLE_PCI_VENDOR_ID = "0x1ae0"
@@ -1255,6 +1257,601 @@ def _worker_secondary_storage_main(argv):
     dist.destroy_process_group()
 
 
+# -----------------------------------------------------------------------------
+# Helpers shared by the mixed-backend Load() workers.
+#
+# poll_save_status() / poll_load_status() DRAIN their results: each block hash
+# is reported exactly once, in whichever poll observes it. A mixed Load()
+# completes in independent halves (prefix and storage suffix), so completions
+# must be accumulated across polls rather than expected in a single poll.
+# -----------------------------------------------------------------------------
+_MIXED_WAIT_TIMEOUT_S = 120.0
+_MIXED_BARRIER_TIMEOUT = datetime.timedelta(minutes=5)
+_MIXED_WORKER_TIMEOUT_S = 600
+
+
+def _mixed_log(tag, phase, rank, msg):
+  print(f"[{tag}][Phase {phase}][Rank {rank}] {msg}", flush=True)
+
+
+def _tpu_sync():
+  try:
+    torch.tpu.synchronize()
+  except (AttributeError, RuntimeError):
+    pass
+
+
+def _wait_for_workers(procs, timeout_s=_MIXED_WORKER_TIMEOUT_S):
+  """Waits for worker subprocesses; kills all of them on timeout.
+
+  Returns:
+    A list of (rank, returncode) for workers that did not exit cleanly.
+  """
+  deadline = time.time() + timeout_s
+  failures = []
+  for rank, p in enumerate(procs):
+    try:
+      p.wait(timeout=max(0.0, deadline - time.time()))
+    except subprocess.TimeoutExpired:
+      for q in procs:
+        if q.poll() is None:
+          q.kill()
+      for q in procs:
+        q.wait()
+      return [(r, "timeout") for r in range(len(procs))]
+    if p.returncode != 0:
+      failures.append((rank, p.returncode))
+  return failures
+
+
+def _wait_for_all(poll_fn, expected_hashes, what,
+                  timeout_s=_MIXED_WAIT_TIMEOUT_S):
+  """Blocks until every hash in expected_hashes is reported done by poll_fn.
+
+  Args:
+    poll_fn: store.poll_save_status or store.poll_load_status. Returns a tuple
+      whose first two entries are (done, failed); results are drained.
+    expected_hashes: the exact set of block hashes that must complete.
+    what: label used in error messages.
+    timeout_s: fails with the missing hashes after this many seconds.
+
+  Returns:
+    Seconds elapsed until all hashes completed.
+  """
+  expected = set(expected_hashes)
+  completed = set()
+  start = time.time()
+  while True:
+    done, failed = poll_fn()[:2]
+    if failed:
+      raise RuntimeError(f"{what} failed for {failed}")
+    completed.update(done)
+    if completed == expected:
+      return time.time() - start
+    if time.time() - start > timeout_s:
+      raise TimeoutError(
+          f"{what} incomplete after {timeout_s}s:"
+          f" missing={sorted(expected - completed)}"
+      )
+    time.sleep(0.01)
+
+
+def _assert_statuses(lookup_result, hashes, expected_statuses):
+  """Asserts lookup_result covers hashes, in order, with expected statuses.
+
+  expected_statuses[i] is a BlockStatus or a tuple of acceptable statuses.
+  """
+  got_hashes = [h for h, _ in lookup_result]
+  got_statuses = [s.status for _, s in lookup_result]
+  assert got_hashes == list(hashes), f"lookup hashes {got_hashes} != {hashes}"
+  for i, (got, want) in enumerate(zip(got_statuses, expected_statuses)):
+    allowed = want if isinstance(want, tuple) else (want,)
+    assert got in allowed, (
+        f"block {hashes[i]}: status {got}, want one of {allowed};"
+        f" all statuses={got_statuses}"
+    )
+
+
+def _wait_for_lookup(store, hashes, expected_statuses,
+                     timeout_s=_MIXED_WAIT_TIMEOUT_S, **lookup_kwargs):
+  """Polls store.lookup() until it returns exactly expected_statuses.
+
+  Used where visibility is eventually consistent (global registry publication),
+  replacing fixed sleeps. lookup_kwargs must not pin (pin_found=False), since
+  the lookup may be repeated.
+  """
+  start = time.time()
+  while True:
+    result = store.lookup(hashes, **lookup_kwargs)
+    try:
+      _assert_statuses(result, hashes, expected_statuses)
+      return result
+    except AssertionError:
+      if time.time() - start > timeout_s:
+        raise
+    time.sleep(0.1)
+
+
+def _list_shard_files(storage_root, model_name, world_size, rank):
+  return sorted(
+      glob.glob(
+          os.path.join(
+              storage_root,
+              model_name,
+              f"tp{world_size}_r{rank}",
+              "**",
+              "*.bin",
+          ),
+          recursive=True,
+      )
+  )
+
+
+def _verify_and_print_shard_files(tag, phase, storage_root, model_name,
+                                  world_size, rank, expected_count):
+  bin_files = _list_shard_files(storage_root, model_name, world_size, rank)
+  assert len(bin_files) == expected_count, (
+      f"Rank {rank}: expected {expected_count} shard files, got"
+      f" {len(bin_files)}: {bin_files}"
+  )
+  _mixed_log(tag, phase, rank,
+             f"{len(bin_files)} on-disk shard files (exact count verified):")
+  for f in bin_files:
+    print(f"  [Shard File][Rank {rank}] {f}"
+          f" ({os.path.getsize(f)} bytes)", flush=True)
+
+
+def _init_mixed_worker_process_group(tag, rank, world_size, master_port, phase):
+  os.environ["MASTER_ADDR"] = "localhost"
+  os.environ["MASTER_PORT"] = str(master_port)
+  os.environ["RANK"] = str(rank)
+  os.environ["WORLD_SIZE"] = str(world_size)
+  os.environ["LOCAL_RANK"] = str(rank)
+  os.environ["PJRT_LOCAL_PROCESS_RANK"] = str(rank)
+  os.environ["GROUP_RANK"] = "0"
+  os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
+  os.environ["GLOG_alsologtostderr"] = "1"
+  # A bounded barrier timeout turns a stuck rank into a fast, attributable
+  # failure instead of a silent hang until the Forge test timeout.
+  dist.init_process_group(
+      backend="gloo",
+      init_method=f"tcp://127.0.0.1:{master_port}",
+      rank=rank,
+      world_size=world_size,
+      timeout=_MIXED_BARRIER_TIMEOUT,
+  )
+  print(
+      f"[{tag}][Rank {rank}][storage_phase={phase}] Process group ready"
+      f" (PID={os.getpid()}, master_port={master_port}).",
+      flush=True,
+  )
+
+
+def _create_managers(rank, world_size, **manager_kwargs):
+  """Creates one KVCacheManager per rank, one rank at a time."""
+  manager = None
+  for r in range(world_size):
+    if rank == r:
+      manager = kv_cache_manager.KVCacheManager(
+          local_control_port=0,
+          num_slots=2,
+          unsafe_skip_buffer_lock=True,
+          raiden_worker_port=0,
+          host_blocks_to_allocate=4,
+          node_id=rank,
+          **manager_kwargs,
+      )
+    dist.barrier()
+  return manager
+
+
+def _hbm_slices(raiden_id, num_blocks):
+  return [
+      kv_cache_store.RaidenBlockId(
+          raiden_id,
+          host_block_id=-1,
+          device_block_id=i,
+          status=kv_cache_store.BlockStatus.HBM,
+      )
+      for i in range(num_blocks)
+  ]
+
+
+def _worker_mixed_storage_main(argv):
+  """4-rank MPMD mixed Load(): HOST prefix + SHARED_STORAGE suffix.
+
+  Blocks: prefix [mix_0, mix_1] -> HOST (recalled into reader host RAM first),
+          suffix [mix_2, mix_3] -> SHARED_STORAGE.
+
+  storage_phase=write runs Phase 1 in writer instance group 1.
+  storage_phase=read runs Phases 2-5 in a cold reader instance group 2:
+    1. Seed storage: writer saves all 4 blocks to POSIX storage.
+    2. Stage prefix: reader recalls the prefix into its host RAM; HBM zeroed.
+    3. Lookup:       exactly [HOST, HOST, SHARED_STORAGE, SHARED_STORAGE].
+    4. Mixed load:   one Load() for all 4 blocks; wait for all 4 to complete.
+    5. Verify:       HBM bit-exact on every rank; all 4 now HOST_AND_HBM.
+  Rank 0 drives each action; every phase ends with one dist.barrier().
+  """
+  del argv
+  tag = "MPMD Mixed HOST+STORAGE"
+  rank = FLAGS.rank
+  world_size = FLAGS.world_size
+  controller_port = FLAGS.controller_port
+  storage_root = _STORAGE_ROOT.value
+  phase = _STORAGE_PHASE.value
+  model_name = "test_model_mpmd_mixed"
+  status = kv_cache_store.BlockStatus
+
+  _init_mixed_worker_process_group(tag, rank, world_size, FLAGS.master_port,
+                                   phase)
+  try:
+    cfg = kv_cache_store._impl.BackendConfig()
+    cfg.type = "posix"
+    cfg.parallelism.tp_rank = rank
+    cfg.parallelism.tp_size = world_size
+    cfg.set_property("root_dir", storage_root)
+    cfg.set_property("model_name", model_name)
+
+    device = torch.device("tpu")
+    num_blocks = 4
+    # Shape: (4 blocks, 128 tokens/block, 8 head shards, 8 heads/shard,
+    # head_dim 128).
+    shape = (num_blocks, 128, 8, 8, 128)
+    host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) + (
+        rank * 1000.0
+    )
+    shard_size_bytes = 128 * 8 * 8 * 128 * 4
+    hashes = [
+        b"hash_mpmd_mix_0",
+        b"hash_mpmd_mix_1",
+        b"hash_mpmd_mix_2",
+        b"hash_mpmd_mix_3",
+    ]
+    prefix_hashes = hashes[:2]  # -> HOST (reader host RAM)
+    suffix_hashes = hashes[2:]  # -> SHARED_STORAGE
+
+    if phase in ("write", "both"):
+      # ---- Phase 1/5: seed storage with all 4 blocks. ----
+      tpu_cache = torch.tensor(host_data, device=device)
+      _tpu_sync()
+      rid_w = kv_cache_store.RaidenId(
+          "mpmd_mix_job_writer", "0", "mpmd_cache_writer", 0
+      )
+      store = None
+      if rank == 0:
+        store = kv_cache_store.KVCacheStore(
+            capacity=num_blocks,
+            raiden_id=rid_w,
+            num_shards=world_size,
+            shard_size_bytes=shard_size_bytes,
+            store_server_ip="127.0.0.1",
+            raiden_controller_port=controller_port,
+            secondary_backend_configs=[cfg],
+        )
+        assert store.insert(
+            hashes, _hbm_slices(rid_w, num_blocks), on_host=False
+        ), "writer insert failed"
+      dist.barrier()
+      manager = _create_managers(
+          rank,
+          world_size,
+          kv_caches=[[tpu_cache]],
+          max_blocks=num_blocks,
+          raiden_controller_address=f"localhost:{controller_port}",
+          worker_id=f"worker_{rank}",
+          backend_configs=[cfg],
+      )
+      if rank == 0:
+        _mixed_log(tag, "1/5", rank,
+                   f"Saving {hashes} -> SHARED_STORAGE (POSIX).")
+        assert store.save(hashes), "writer save failed"
+        secs = _wait_for_all(store.poll_save_status, hashes, "storage save")
+        _mixed_log(tag, "1/5", rank, f"All 4 blocks saved in {secs:.3f}s.")
+      dist.barrier()
+      _verify_and_print_shard_files(tag, "1/5", storage_root, model_name,
+                                    world_size, rank, len(hashes))
+      del manager, store, tpu_cache
+      dist.barrier()
+      if phase == "write":
+        return
+
+    if phase in ("read", "both"):
+      tpu_cache = torch.zeros(shape, dtype=torch.float32, device=device)
+      _tpu_sync()
+      rid_r = kv_cache_store.RaidenId(
+          "mpmd_mix_job_reader", "0", "mpmd_cache_reader", 0
+      )
+      store = None
+      if rank == 0:
+        store = kv_cache_store.KVCacheStore(
+            capacity=num_blocks,
+            raiden_id=rid_r,
+            num_shards=world_size,
+            shard_size_bytes=shard_size_bytes,
+            store_server_ip="127.0.0.1",
+            raiden_controller_port=controller_port,
+            secondary_backend_configs=[cfg],
+        )
+      dist.barrier()
+      manager = _create_managers(
+          rank,
+          world_size,
+          kv_caches=[[tpu_cache]],
+          max_blocks=num_blocks,
+          raiden_controller_address=f"localhost:{controller_port}",
+          worker_id=f"worker_{rank}",
+          backend_configs=[cfg],
+      )
+
+      # ---- Phase 2/5: stage the prefix into reader host RAM. ----
+      if rank == 0:
+        _mixed_log(tag, "2/5", rank,
+                   f"Recalling prefix {prefix_hashes} SHARED_STORAGE -> HOST.")
+        pre = store.lookup(prefix_hashes, pin_found=False)
+        _assert_statuses(pre, prefix_hashes, [status.SHARED_STORAGE] * 2)
+        assert store.load(
+            prefix_hashes, [0, 1], slices=[s for _, s in pre]
+        ), "prefix recall dispatch failed"
+        _wait_for_all(store.poll_load_status, prefix_hashes, "prefix recall")
+      dist.barrier()
+      # Clear HBM so Phase 5 only passes if the mixed load rewrites it.
+      tpu_cache.zero_()
+      _tpu_sync()
+      dist.barrier()
+
+      # ---- Phase 3/5: lookup sees exactly [HOST, HOST, STORAGE, STORAGE]. ----
+      host = (status.HOST, status.HOST_AND_HBM)
+      if rank == 0:
+        mixed = store.lookup(hashes, pin_found=True)
+        _assert_statuses(
+            mixed, hashes,
+            [host, host, status.SHARED_STORAGE, status.SHARED_STORAGE],
+        )
+        _mixed_log(tag, "3/5", rank,
+                   f"Lookup: prefix {prefix_hashes} HOST, suffix"
+                   f" {suffix_hashes} SHARED_STORAGE.")
+
+        # ---- Phase 4/5: one mixed Load() for all 4 blocks. ----
+        _mixed_log(tag, "4/5", rank, f"Load({hashes}) -> device [0, 1, 2, 3].")
+        assert store.load(
+            hashes, [0, 1, 2, 3], slices=[s for _, s in mixed]
+        ), "mixed load dispatch failed"
+        secs = _wait_for_all(store.poll_load_status, hashes, "mixed load")
+        _mixed_log(tag, "4/5", rank, f"All 4 blocks loaded in {secs:.3f}s.")
+      dist.barrier()
+
+      # ---- Phase 5/5: verify HBM and final metadata. ----
+      _tpu_sync()
+      np.testing.assert_array_equal(tpu_cache.cpu().numpy(), host_data)
+      _mixed_log(tag, "5/5", rank, "HBM bit-exact for all 4 blocks.")
+      dist.barrier()
+      if rank == 0:
+        post = store.lookup(hashes, pin_found=False)
+        _assert_statuses(post, hashes, [status.HOST_AND_HBM] * 4)
+        for _, b in post:
+          assert b.device_block_id in (0, 1, 2, 3), b.device_block_id
+          assert b.host_block_id >= 0, b.host_block_id
+        _mixed_log(tag, "5/5", rank, "All 4 blocks HOST_AND_HBM.")
+      del manager, store
+      dist.barrier()
+  finally:
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def _worker_mixed_remote_and_storage_main(argv):
+  """4-rank MPMD mixed Load(): REMOTE peer prefix + SHARED_STORAGE suffix.
+
+  Blocks: prefix [mrs_0, mrs_1] -> REMOTE (held in Peer A host RAM),
+          suffix [mrs_2, mrs_3] -> SHARED_STORAGE.
+
+    1. Seed storage: writer saves the suffix to POSIX storage.
+    2. Stage prefix: Peer A saves the prefix to its host RAM (published to the
+                     global registry).
+    3. Lookup:       Consumer B waits until lookup returns exactly
+                     [REMOTE(A), REMOTE(A), SHARED_STORAGE, SHARED_STORAGE].
+    4. Mixed load:   one Load() for all 4 blocks; wait for all 4 to complete.
+    5. Verify:       HBM bit-exact on every rank; the remote prefix records
+                     nothing in B; the suffix is HOST_AND_HBM in B.
+  Rank 0 drives each action; every phase ends with one dist.barrier().
+  """
+  del argv
+  tag = "MPMD Mixed REMOTE+STORAGE"
+  rank = FLAGS.rank
+  world_size = FLAGS.world_size
+  controller_port_a = FLAGS.controller_port
+  controller_port_b = FLAGS.controller_port_b
+  controller_port_s = FLAGS.controller_port_s or FLAGS.controller_port
+  registry_port = FLAGS.registry_port
+  storage_root = _STORAGE_ROOT.value
+  phase = _STORAGE_PHASE.value
+  model_name = "test_model_mpmd_mrs"
+  status = kv_cache_store.BlockStatus
+
+  _init_mixed_worker_process_group(tag, rank, world_size, FLAGS.master_port,
+                                   phase)
+  try:
+    cfg = kv_cache_store._impl.BackendConfig()
+    cfg.type = "posix"
+    cfg.parallelism.tp_rank = rank
+    cfg.parallelism.tp_size = world_size
+    cfg.set_property("root_dir", storage_root)
+    cfg.set_property("model_name", model_name)
+    if _STORAGE_DIRECT_IO.value:
+      cfg.set_property("direct_io", "true")
+
+    device = torch.device("tpu")
+    num_blocks = 4
+    shape = (num_blocks, 128, 8, 8, 128)
+    host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) + (
+        rank * 1000.0
+    )
+    shard_size_bytes = 128 * 8 * 8 * 128 * 4
+    prefix_hashes = [b"hash_mpmd_mrs_0", b"hash_mpmd_mrs_1"]  # -> REMOTE
+    suffix_hashes = [b"hash_mpmd_mrs_2", b"hash_mpmd_mrs_3"]  # -> STORAGE
+    all_hashes = prefix_hashes + suffix_hashes
+
+    if phase in ("write", "both"):
+      # ---- Phase 1/5: seed storage with the suffix. ----
+      tpu_cache_s = torch.tensor(host_data[2:], device=device)
+      _tpu_sync()
+      rid_s = kv_cache_store.RaidenId(
+          "mpmd_mrs_job_writer", "0", "mpmd_cache_writer", 0
+      )
+      store_s = None
+      if rank == 0:
+        store_s = kv_cache_store.KVCacheStore(
+            capacity=2,
+            raiden_id=rid_s,
+            num_shards=world_size,
+            shard_size_bytes=shard_size_bytes,
+            store_server_ip="127.0.0.1",
+            raiden_controller_port=controller_port_s,
+            secondary_backend_configs=[cfg],
+        )
+        assert store_s.insert(
+            suffix_hashes, _hbm_slices(rid_s, 2), on_host=False
+        ), "writer insert failed"
+      dist.barrier()
+      manager_s = _create_managers(
+          rank,
+          world_size,
+          kv_caches=[[tpu_cache_s]],
+          max_blocks=2,
+          raiden_controller_address=f"localhost:{controller_port_s}",
+          worker_id=f"worker_s_{rank}",
+          backend_configs=[cfg],
+      )
+      if rank == 0:
+        _mixed_log(tag, "1/5", rank,
+                   f"Saving suffix {suffix_hashes} -> SHARED_STORAGE (POSIX).")
+        assert store_s.save(suffix_hashes), "writer save failed"
+        secs = _wait_for_all(store_s.poll_save_status, suffix_hashes,
+                             "storage save")
+        _mixed_log(tag, "1/5", rank, f"Suffix saved in {secs:.3f}s.")
+      dist.barrier()
+      _verify_and_print_shard_files(tag, "1/5", storage_root, model_name,
+                                    world_size, rank, len(suffix_hashes))
+      del manager_s, store_s, tpu_cache_s
+      dist.barrier()
+      if phase == "write":
+        return
+
+    if phase in ("read", "both"):
+      tpu_cache_a = torch.tensor(host_data[:2], device=device)
+      tpu_cache_b = torch.zeros(shape, dtype=torch.float32, device=device)
+      _tpu_sync()
+      rid_a = kv_cache_store.RaidenId(
+          "mpmd_mrs_job_peer_a", "0", "mpmd_cache_peer_a", 0
+      )
+      rid_b = kv_cache_store.RaidenId(
+          "mpmd_mrs_job_consumer_b", "0", "mpmd_cache_consumer_b", 0
+      )
+      store_a = None
+      store_b = None
+      if rank == 0:
+        store_a = kv_cache_store.KVCacheStore(
+            capacity=2,
+            global_registry_address=f"localhost:{registry_port}",
+            raiden_id=rid_a,
+            num_shards=world_size,
+            shard_size_bytes=shard_size_bytes,
+            store_server_ip="127.0.0.1",
+            raiden_controller_port=controller_port_a,
+        )
+        store_b = kv_cache_store.KVCacheStore(
+            capacity=num_blocks,
+            global_registry_address=f"localhost:{registry_port}",
+            raiden_id=rid_b,
+            num_shards=world_size,
+            shard_size_bytes=shard_size_bytes,
+            store_server_ip="127.0.0.1",
+            raiden_controller_port=controller_port_b,
+            secondary_backend_configs=[cfg],
+        )
+        assert store_a.insert(
+            prefix_hashes, _hbm_slices(rid_a, 2), on_host=False
+        ), "peer A insert failed"
+      dist.barrier()
+      manager_a = _create_managers(
+          rank,
+          world_size,
+          kv_caches=[[tpu_cache_a]],
+          max_blocks=2,
+          raiden_controller_address=f"localhost:{controller_port_a}",
+          worker_id=f"worker_a_{rank}",
+      )
+      manager_b = _create_managers(
+          rank,
+          world_size,
+          kv_caches=[[tpu_cache_b]],
+          max_blocks=num_blocks,
+          raiden_controller_address=f"localhost:{controller_port_b}",
+          worker_id=f"worker_b_{rank}",
+          backend_configs=[cfg],
+      )
+
+      # ---- Phase 2/5: Peer A stages the prefix in its host RAM. ----
+      if rank == 0:
+        _mixed_log(tag, "2/5", rank,
+                   f"Peer A saving prefix {prefix_hashes} -> HOST (published"
+                   " to global registry).")
+        assert store_a.save(prefix_hashes), "peer A save failed"
+        _wait_for_all(store_a.poll_save_status, prefix_hashes, "peer A save")
+      dist.barrier()
+
+      if rank == 0:
+        # ---- Phase 3/5: wait for [REMOTE(A), REMOTE(A), STORAGE, STORAGE]. --
+        mixed = _wait_for_lookup(
+            store_b, all_hashes,
+            [status.REMOTE, status.REMOTE, status.SHARED_STORAGE,
+             status.SHARED_STORAGE],
+            enable_global=True, pin_found=False,
+        )
+        for _, s in mixed[:2]:
+          assert s.raiden_id == rid_a, f"prefix owner {s.raiden_id} != peer A"
+        _mixed_log(tag, "3/5", rank,
+                   f"Lookup: prefix {prefix_hashes} REMOTE(peer A), suffix"
+                   f" {suffix_hashes} SHARED_STORAGE.")
+
+        # ---- Phase 4/5: one mixed Load() for all 4 blocks. ----
+        _mixed_log(tag, "4/5", rank,
+                   f"Load({all_hashes}) -> device [0, 1, 2, 3].")
+        assert store_b.load(
+            all_hashes, [0, 1, 2, 3], slices=[s for _, s in mixed]
+        ), "mixed load dispatch failed"
+        secs = _wait_for_all(store_b.poll_load_status, all_hashes,
+                             "mixed load")
+        _mixed_log(tag, "4/5", rank, f"All 4 blocks loaded in {secs:.3f}s.")
+      dist.barrier()
+
+      # ---- Phase 5/5: verify HBM and final metadata. ----
+      _tpu_sync()
+      np.testing.assert_array_equal(tpu_cache_b.cpu().numpy(), host_data)
+      _mixed_log(tag, "5/5", rank, "HBM bit-exact for all 4 blocks.")
+      dist.barrier()
+      if rank == 0:
+        post_remote = store_b.lookup(prefix_hashes, enable_global=False,
+                                     pin_found=False)
+        assert not post_remote, (
+            f"remote prefix must record nothing locally, got {post_remote}"
+        )
+        post_storage = store_b.lookup(suffix_hashes, enable_global=False,
+                                      pin_found=False)
+        _assert_statuses(post_storage, suffix_hashes,
+                         [status.HOST_AND_HBM] * 2)
+        for _, b in post_storage:
+          assert b.device_block_id in (2, 3), b.device_block_id
+          assert b.host_block_id >= 0, b.host_block_id
+        _mixed_log(tag, "5/5", rank,
+                   "Remote prefix not recorded locally; suffix HOST_AND_HBM.")
+      del manager_b, store_b, manager_a, store_a
+      dist.barrier()
+  finally:
+    dist.barrier()
+    dist.destroy_process_group()
+
+
 class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
 
   @classmethod
@@ -1630,6 +2227,186 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
   # they spawn no MPMD workers, so duplicating them here added nothing.
 
 
+  def test_mpmd_4rank_e2e_mixed_backend_load(self):
+    """Verifies 4-rank MPMD multi-process mixed Load() (HOST prefix + SHARED_STORAGE suffix)."""
+    world_size = 4
+    prepare_tpu_environment(world_size)
+    master_port_w = pick_unused_ports(1)[0]
+    controller_port_w = pick_unused_ports(1)[0]
+    master_port_r = pick_unused_ports(1)[0]
+    controller_port_r = pick_unused_ports(1)[0]
+
+    direct_io = False
+    if _STORAGE_ROOT.value:
+      temp_dir = os.path.join(
+          _STORAGE_ROOT.value,
+          f"torch_mpmd_mixed_{int(time.time())}",
+      )
+      os.makedirs(temp_dir, exist_ok=True)
+      is_custom_root = True
+    else:
+      temp_dir = tempfile.mkdtemp()
+      is_custom_root = False
+
+    print(
+        "\n======================================================================\n"
+        "[MPMD Driver] STARTING 4-RANK MIXED-BACKEND LOAD E2E TEST\n"
+        f"  World Size: {world_size} ranks (processes)\n"
+        f"  Instance Group 1 (Writer): master={master_port_w},"
+        f" controller={controller_port_w}\n"
+        f"  Instance Group 2 (Reader): master={master_port_r},"
+        f" controller={controller_port_r}\n"
+        f"  Storage Root: {temp_dir}\n"
+        "======================================================================",
+        flush=True,
+    )
+
+    try:
+      # --- Instance Group 1: Writer ---
+      print(
+          "[MPMD Driver][Step 1/4] Spawning Instance Group 1 (Writer) across"
+          f" {world_size} ranks...",
+          flush=True,
+      )
+      procs_w = []
+      for rank in range(world_size):
+        env = os.environ.copy()
+        env["GLOG_alsologtostderr"] = "1"
+        cmd = worker_launch_cmd() + [
+            "--run_worker",
+            "--alsologtostderr",
+            "--worker_mode=mixed_storage",
+            "--storage_phase=write",
+            f"--storage_root={temp_dir}",
+            f"--storage_direct_io={direct_io}",
+            f"--rank={rank}",
+            f"--world_size={world_size}",
+            f"--master_port={master_port_w}",
+            f"--controller_port={controller_port_w}",
+            f"--registry_port={_registry_port}",
+        ]
+        p = subprocess.Popen(cmd, env=env)
+        procs_w.append(p)
+
+      failures_w = _wait_for_workers(procs_w)
+      if failures_w:
+        self.fail(f"Writer group (mixed_storage) workers failed: {failures_w}")
+      print(
+          "[MPMD Driver][Step 2/4] Instance Group 1 (Writer) completed successfully.",
+          flush=True,
+      )
+
+      # --- Instance Group 2: Reader ---
+      print(
+          "[MPMD Driver][Step 3/4] Spawning Instance Group 2 (Reader) across"
+          f" {world_size} ranks...",
+          flush=True,
+      )
+      procs_r = []
+      for rank in range(world_size):
+        env = os.environ.copy()
+        env["GLOG_alsologtostderr"] = "1"
+        cmd = worker_launch_cmd() + [
+            "--run_worker",
+            "--alsologtostderr",
+            "--worker_mode=mixed_storage",
+            "--storage_phase=read",
+            f"--storage_root={temp_dir}",
+            f"--storage_direct_io={direct_io}",
+            f"--rank={rank}",
+            f"--world_size={world_size}",
+            f"--master_port={master_port_r}",
+            f"--controller_port={controller_port_r}",
+            f"--registry_port={_registry_port}",
+        ]
+        p = subprocess.Popen(cmd, env=env)
+        procs_r.append(p)
+
+      failures_r = _wait_for_workers(procs_r)
+      if failures_r:
+        self.fail(f"Reader group (mixed_storage) workers failed: {failures_r}")
+      print(
+          "[MPMD Driver][Step 4/4] Instance Group 2 (Reader) completed successfully.",
+          flush=True,
+      )
+    finally:
+      if not is_custom_root:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    print(
+        f"[MPMD Driver][SUCCESS] All {world_size} MPMD mixed storage workers completed successfully!\n"
+        "======================================================================\n",
+        flush=True,
+    )
+
+  def test_mpmd_4rank_e2e_mixed_remote_and_storage_load(self):
+    """Verifies 4-rank MPMD mixed Load() with REMOTE peer prefix + SHARED_STORAGE suffix."""
+    world_size = 4
+    prepare_tpu_environment(world_size)
+    master_port = pick_unused_ports(1)[0]
+    controller_port_a = pick_unused_ports(1)[0]
+    controller_port_b = pick_unused_ports(1)[0]
+    controller_port_s = pick_unused_ports(1)[0]
+
+    direct_io = False
+    if _STORAGE_ROOT.value:
+      temp_dir = os.path.join(
+          _STORAGE_ROOT.value,
+          f"torch_mpmd_mrs_{int(time.time())}",
+      )
+      os.makedirs(temp_dir, exist_ok=True)
+      is_custom_root = True
+    else:
+      temp_dir = tempfile.mkdtemp()
+      is_custom_root = False
+
+    print(
+        "\n======================================================================\n"
+        "[MPMD Driver] STARTING 4-RANK MIXED REMOTE + STORAGE E2E TEST\n"
+        f"  World Size: {world_size} ranks (processes)\n"
+        f"  Master Port: {master_port}\n"
+        f"  Writer Controller: {controller_port_s} | Peer A Controller: {controller_port_a} | Consumer B Controller: {controller_port_b}\n"
+        f"  Storage Root: {temp_dir}\n"
+        "======================================================================",
+        flush=True,
+    )
+
+    try:
+      procs = []
+      for rank in range(world_size):
+        env = os.environ.copy()
+        env["GLOG_alsologtostderr"] = "1"
+        cmd = worker_launch_cmd() + [
+            "--run_worker",
+            "--alsologtostderr",
+            "--worker_mode=mixed_remote_and_storage",
+            "--storage_phase=both",
+            f"--storage_root={temp_dir}",
+            f"--storage_direct_io={direct_io}",
+            f"--rank={rank}",
+            f"--world_size={world_size}",
+            f"--master_port={master_port}",
+            f"--controller_port={controller_port_a}",
+            f"--controller_port_b={controller_port_b}",
+            f"--controller_port_s={controller_port_s}",
+            f"--registry_port={_registry_port}",
+        ]
+        p = subprocess.Popen(cmd, env=env)
+        procs.append(p)
+
+      failures = _wait_for_workers(procs)
+      if failures:
+        self.fail(f"mixed_remote_and_storage workers failed: {failures}")
+      print(
+          f"[MPMD Driver][SUCCESS] All {world_size} MPMD mixed remote+storage workers completed successfully!\n"
+          "======================================================================\n",
+          flush=True,
+      )
+    finally:
+      if not is_custom_root:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def main(argv):
   if FLAGS.run_worker:
     if FLAGS.worker_mode == "read_remote":
@@ -1638,6 +2415,10 @@ def main(argv):
       _worker_write_remote_main(argv)
     elif FLAGS.worker_mode == "secondary_storage":
       _worker_secondary_storage_main(argv)
+    elif FLAGS.worker_mode == "mixed_storage":
+      _worker_mixed_storage_main(argv)
+    elif FLAGS.worker_mode == "mixed_remote_and_storage":
+      _worker_mixed_remote_and_storage_main(argv)
     else:
       _worker_save_load_main(argv)
   else:

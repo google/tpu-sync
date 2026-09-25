@@ -599,6 +599,7 @@ cc_test(
         "//tpu_sync/core/controller:controller_client",
         "//tpu_sync/core/controller:raiden_controller",
         "//tpu_sync/core/controller:test_util",
+        "//tpu_sync/kv_cache/backends:backend",
         "//tpu_sync/kv_cache/backends/storage:posix_backend",
         "//tpu_sync/kv_cache/global_registry:global_registry_cc_grpc",
         "//tpu_sync/kv_cache/global_registry:global_registry_client_cc",

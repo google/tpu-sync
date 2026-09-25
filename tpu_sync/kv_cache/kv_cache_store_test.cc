@@ -72,6 +72,7 @@
 #include "tpu_sync/kv_cache/global_registry/test_util.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
@@ -7073,6 +7074,615 @@ TEST(KVCacheStoreTest, PeerLookupPriorityOverStorageFallback) {
   ASSERT_EQ(storage_lookup->size(), 1);
   EXPECT_EQ((*storage_lookup)[0].second.status, BlockStatus::SHARED_STORAGE);
 }
+
+
+// ===========================================================================
+// Mixed-tier Load from backends which includes shared storage
+// ===========================================================================
+
+struct MixedBackendTransferManager
+    : public ::tpu_raiden::controller::ShardAwareMockTransferManager {
+  using Base = ::tpu_raiden::controller::ShardAwareMockTransferManager;
+  using Result = decltype(std::declval<Base&>().H2d({}, {}, {}));
+
+  absl::Mutex mu;
+  bool fail_recall = false;
+  std::vector<std::vector<int64_t>> h2d_dst_batches ABSL_GUARDED_BY(mu);
+
+  Result H2d(const std::vector<int64_t>& src_offsets,
+             const std::vector<int64_t>& dst_offsets,
+             const std::vector<int64_t>& copy_sizes) {
+    {
+      absl::MutexLock lock(mu);
+      h2d_dst_batches.push_back(dst_offsets);
+    }
+    return Base::H2d(src_offsets, dst_offsets, copy_sizes);
+  }
+
+  Result H2dReadFromBackend(
+      absl::Span<const std::shared_ptr<backends::KVBackend>> kv_backends,
+      const std::vector<backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_host_block_ids,
+      const std::vector<int64_t>& dst_device_block_ids) {
+    if (fail_recall) {
+      ++h2d_read_from_backend_calls;
+      return Result(absl::InternalError("scripted recall failure"));
+    }
+    return Base::H2dReadFromBackend(kv_backends, block_keys, src_host_block_ids,
+                                    dst_device_block_ids);
+  }
+
+  Result H2dReadFromBackend(std::shared_ptr<backends::KVBackend> backend,
+                            const std::vector<backends::BlockKey>& block_keys,
+                            const std::vector<int64_t>& src_host_block_ids,
+                            const std::vector<int64_t>& dst_device_block_ids) {
+    const std::shared_ptr<backends::KVBackend> b[] = {std::move(backend)};
+    return H2dReadFromBackend(absl::MakeSpan(b), block_keys,
+                              src_host_block_ids, dst_device_block_ids);
+  }
+
+  std::vector<int64_t> H2dDestinations() {
+    absl::MutexLock lock(mu);
+    std::vector<int64_t> out;
+    for (const auto& batch : h2d_dst_batches) {
+      out.insert(out.end(), batch.begin(), batch.end());
+    }
+    return out;
+  }
+};
+
+class MixedBackendLoadTest : public KVCacheStoreEmbeddedControllerTest {
+ protected:
+  static constexpr int kPeerHostBlockBase = 40;
+  static constexpr int kLocalHostBlockBase = 100;
+
+  void SetUp() override {
+    KVCacheStoreEmbeddedControllerTest::SetUp();
+    test_server_->service->SetTransferManager(
+        ::tpu_raiden::KVManagerHolder(&mgr_));
+  }
+
+  void TearDown() override {
+    store_.reset();
+    peer_server_.reset();
+    test_server_->service->SetTransferManager(
+        ::tpu_raiden::KVManagerHolder(dst_transfer_mock_.get()));
+    KVCacheStoreEmbeddedControllerTest::TearDown();
+  }
+
+  struct StoreOptions {
+    int num_host_blocks = 10;
+    std::vector<std::string> peer_hashes;
+    bool register_peer_blocks = false;
+    bool with_empty_registry = false;
+    bool with_storage = true;
+  };
+
+  void MakeStore(const StoreOptions& opts) {
+    auto controller = MakeController(opts.num_host_blocks);
+    RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+    std::string registry_address;
+    if (!opts.peer_hashes.empty()) {
+      registry_ = global_registry::CreateTestGlobalRegistryServer();
+      registry_address = registry_->server_address;
+
+      BackendConfig peer_config;
+      peer_config.type = "HostOffloadBackend";
+      peer_config.capacity = 100;
+      peer_config.global_registry_address = registry_address;
+      peer_config.raiden_id = peer_a_;
+      auto peer_raw = HostOffloadBackend::Create(peer_config, controller.get());
+      ASSERT_TRUE(peer_raw.ok()) << peer_raw.status();
+      peer_backend_ = std::dynamic_pointer_cast<HostOffloadBackend>(*peer_raw);
+      ASSERT_NE(peer_backend_, nullptr);
+
+      std::vector<RaidenBlockId> peer_slices;
+      std::vector<global_registry::Registration> entries;
+      for (size_t i = 0; i < opts.peer_hashes.size(); ++i) {
+        peer_slices.emplace_back(peer_a_, kPeerHostBlockBase + i,
+                                 BlockStatus::HOST);
+        entries.push_back({opts.peer_hashes[i], peer_a_,
+                           static_cast<int>(kPeerHostBlockBase + i)});
+      }
+      peer_backend_->Insert(opts.peer_hashes, peer_slices, /*on_host=*/true);
+
+      peer_server_ = KVCacheStoreServer::Create();
+      ABSL_ASSERT_OK(peer_server_->StartServer(peer_backend_.get(),
+                                               controller.get(), "127.0.0.1"));
+      ABSL_ASSERT_OK(registry_->client->RegisterStore(
+          peer_a_, peer_server_->GetServerAddress(),
+          controller->controller_address()));
+      if (opts.register_peer_blocks) {
+        ABSL_ASSERT_OK(registry_->client->Register(entries));
+      }
+    } else if (opts.with_empty_registry) {
+      registry_address = registry_address_;
+    }
+
+    store_ = std::make_unique<KVCacheStore>(
+        10, std::move(controller), registry_address, local_id_, std::nullopt,
+        /*store_server_ip=*/"127.0.0.1");
+
+    if (opts.with_storage) {
+      const std::string scratch_dir =
+          absl::StrCat(testing::TempDir(), "/",
+                       ::testing::UnitTest::GetInstance()
+                           ->current_test_info()->name());
+      posix_ = std::make_shared<backends::storage::PosixKVBackend>(
+          "posix",
+          absl::flat_hash_map<std::string, std::string>{{"tp_rank", "0"}});
+      mapper_ = std::make_shared<backends::storage::PosixPathMapper>(
+          scratch_dir, "model_test", 1, 0);
+      posix_->set_mapper(mapper_);
+      KVCacheStoreTest::AddBackend(
+          *store_, std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
+                       posix_, "posix"));
+      mgr_.backends["posix"] = posix_;
+    }
+    initial_free_ = FreeBlocks();
+  }
+
+  void AddPinnedLocal(const std::vector<std::string>& hashes) {
+    std::vector<RaidenBlockId> slices;
+    for (size_t i = 0; i < hashes.size(); ++i) {
+      slices.emplace_back(local_id_, kLocalHostBlockBase + i,
+                          /*device_block_id=*/-1, BlockStatus::HOST);
+    }
+    ASSERT_TRUE(InsertResident(*store_, hashes, slices, /*on_host=*/true));
+    ABSL_ASSERT_OK(store_->Lookup(hashes));
+    for (const auto& h : hashes) ASSERT_EQ(store_->GetPinCount(h), 1) << h;
+  }
+
+  void WriteStorageFile(const std::string& hash) {
+    auto key = mapper_->MapKey(hash, {.parallelism = {.tp_rank = 0}});
+    ASSERT_TRUE(key.ok()) << key.status();
+    std::filesystem::create_directories(
+        std::filesystem::path(key->resolved_key).parent_path());
+    std::ofstream(key->resolved_key) << "storage bytes";
+  }
+
+  RaidenBlockId LocalSlice(int i) const {
+    return RaidenBlockId(local_id_, kLocalHostBlockBase + i, -1,
+                         BlockStatus::HOST);
+  }
+  RaidenBlockId PeerSlice(const RaidenId& peer, int i) const {
+    return RaidenBlockId(peer, kPeerHostBlockBase + i, BlockStatus::REMOTE);
+  }
+  static RaidenBlockId StorageSlice() {
+    return RaidenBlockId(RaidenId{"local_job", "0", "posix", 0}, -1, -1,
+                         BlockStatus::SHARED_STORAGE);
+  }
+
+  std::optional<RaidenBlockId> EntryOf(const std::string& hash) {
+    auto res = PeekLookup(*store_, {hash});
+    if (!res.ok() || res->empty()) return std::nullopt;
+    if ((*res)[0].second.status == BlockStatus::SHARED_STORAGE) {
+      return std::nullopt;
+    }
+    return (*res)[0].second;
+  }
+
+  int FreeBlocks() const {
+    return KVCacheStoreTest::GetController(*store_)
+        ->block_manager()
+        ->num_free_blocks();
+  }
+
+  void ExpectNoSideEffects(const std::vector<std::string>& pinned_local) {
+    auto poll = store_->PollLoadStatus();
+    EXPECT_THAT(poll.pending, ::testing::IsEmpty());
+    EXPECT_THAT(poll.done, ::testing::IsEmpty());
+    EXPECT_THAT(poll.failed, ::testing::IsEmpty());
+    EXPECT_EQ(FreeBlocks(), initial_free_);
+    EXPECT_EQ(mgr_.h2d_calls, 0);
+    EXPECT_EQ(mgr_.h2d_read_from_backend_calls, 0);
+    for (const auto& h : pinned_local) EXPECT_EQ(store_->GetPinCount(h), 1) << h;
+  }
+
+  MixedBackendTransferManager mgr_;
+  RaidenId local_id_{"local_job", "0", "local_cache", 0};
+  RaidenId peer_a_{"peer_a", "0", "peer_cache", 0};
+  RaidenId peer_b_{"peer_b", "0", "peer_cache", 0};
+  std::unique_ptr<global_registry::TestGlobalRegistryServer> registry_;
+  std::shared_ptr<HostOffloadBackend> peer_backend_;
+  std::unique_ptr<KVCacheStoreServer> peer_server_;
+  std::shared_ptr<backends::storage::PosixKVBackend> posix_;
+  std::shared_ptr<backends::storage::PosixPathMapper> mapper_;
+  std::unique_ptr<KVCacheStore> store_;
+  int initial_free_ = 0;
+};
+
+// Verifies that a mixed load request containing a local Host prefix followed
+// by a secondary Shared Storage suffix succeeds end-to-end.
+// Invariants checked:
+// 1. Host prefix blocks are transferred directly from local host RAM to HBM (H2D).
+// 2. Storage suffix blocks are recalled from secondary backend via staging host blocks into HBM.
+// 3. Pinned local blocks have their pin consumed and transition to HOST_AND_HBM.
+// 4. Recalled storage blocks are admitted to host LRU with HOST_AND_HBM status.
+// 5. Total free host blocks decrease by exactly the number of admitted storage blocks.
+TEST_F(MixedBackendLoadTest, HostThenStorageSucceeds) {
+  MakeStore({});
+  AddPinnedLocal({"l0", "l1"});
+
+  ABSL_ASSERT_OK(store_->Load(
+      {"l0", "l1", "s0", "s1"},
+      {LocalSlice(0), LocalSlice(1), StorageSlice(), StorageSlice()},
+      {2, 3, 4, 5}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 4);
+  EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.done, ::testing::UnorderedElementsAre("l0", "l1", "s0", "s1"));
+
+  EXPECT_THAT(mgr_.H2dDestinations(), ::testing::UnorderedElementsAre(2, 3));
+  for (auto [hash, dev] : {std::pair{"l0", 2}, std::pair{"l1", 3}}) {
+    EXPECT_EQ(store_->GetPinCount(hash), 0) << hash;
+    auto e = EntryOf(hash);
+    ASSERT_TRUE(e.has_value()) << hash;
+    EXPECT_EQ(e->status, BlockStatus::HOST_AND_HBM);
+    EXPECT_EQ(e->device_block_id, dev);
+  }
+
+  EXPECT_EQ(mgr_.h2d_read_from_backend_calls, 1);
+  EXPECT_THAT(mgr_.last_backend_dst_block_ids, ::testing::ElementsAre(4, 5));
+  for (auto [hash, dev] : {std::pair{"s0", 4}, std::pair{"s1", 5}}) {
+    auto e = EntryOf(hash);
+    ASSERT_TRUE(e.has_value()) << hash;
+    EXPECT_EQ(e->status, BlockStatus::HOST_AND_HBM);
+    EXPECT_EQ(e->device_block_id, dev);
+    EXPECT_EQ(e->raiden_id, local_id_);
+    EXPECT_EQ(store_->GetPinCount(hash), 0) << hash;
+  }
+  EXPECT_EQ(FreeBlocks(), initial_free_ - 2);
+}
+
+// Tests the serving pipeline where Lookup() returns a mixed sequence of
+// [HOST..., SHARED_STORAGE...] blocks (tested for both flat and interleaved lookup),
+// and the returned BlockSliceList is passed directly into Load().
+// Verifies that both prefix and suffix blocks settle to DONE and pins are cleaned up.
+TEST_F(MixedBackendLoadTest, LookupThenLoadSingleServing) {
+  for (bool interleaved : {true, false}) {
+    SCOPED_TRACE(absl::StrCat("interleaved=", interleaved));
+    TearDown();
+    SetUp();
+    MakeStore({});
+    ASSERT_TRUE(InsertResident(*store_, {"l0", "l1"},
+                               {LocalSlice(0), LocalSlice(1)},
+                               /*on_host=*/true));
+    WriteStorageFile("s0");
+    WriteStorageFile("s1");
+
+    const std::vector<std::string> request = {"l0", "l1", "s0", "s1"};
+    LookupOptions opts;
+    opts.enable_global = false;
+    opts.enable_interleaved_lookup = interleaved;
+    opts.pin_found = true;
+    TF_ASSERT_OK_AND_ASSIGN(BlockSliceList answer, store_->Lookup(request, opts));
+    ASSERT_EQ(answer.size(), 4);
+    std::vector<std::string> hashes;
+    std::vector<RaidenBlockId> slices;
+    for (const auto& [hash, slice] : answer) {
+      hashes.push_back(hash);
+      slices.push_back(slice);
+    }
+    EXPECT_EQ(slices[0].status, BlockStatus::HOST);
+    EXPECT_EQ(slices[1].status, BlockStatus::HOST);
+    EXPECT_EQ(slices[2].status, BlockStatus::SHARED_STORAGE);
+    EXPECT_EQ(slices[3].status, BlockStatus::SHARED_STORAGE);
+
+    ABSL_ASSERT_OK(store_->Load(hashes, slices, {2, 3, 4, 5}));
+    LoadOutcome outcome = WaitForLoadSettled(*store_, 4);
+    EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+    EXPECT_THAT(outcome.done, ::testing::UnorderedElementsAreArray(request));
+    EXPECT_EQ(store_->GetPinCount("l0"), 0);
+    EXPECT_EQ(store_->GetPinCount("l1"), 0);
+  }
+}
+
+// Verifies that a mixed load request containing a peer Remote prefix followed
+// by a secondary Shared Storage suffix succeeds end-to-end.
+// Invariants checked:
+// 1. Remote peer blocks are transferred via P2P H2D into HBM.
+// 2. Remote blocks are not cached in local host RAM (remain absent from local lookup).
+// 3. Storage suffix blocks are recalled, transferred to HBM, and admitted into local host LRU.
+TEST_F(MixedBackendLoadTest, RemoteThenStorageSucceeds) {
+  MakeStore({.peer_hashes = {"r0", "r1"}});
+
+  ABSL_ASSERT_OK(store_->Load(
+      {"r0", "r1", "s0", "s1"},
+      {PeerSlice(peer_a_, 0), PeerSlice(peer_a_, 1), StorageSlice(),
+       StorageSlice()},
+      {2, 3, 4, 5}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 4);
+  EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.done,
+              ::testing::UnorderedElementsAre("r0", "r1", "s0", "s1"));
+
+  EXPECT_THAT(mgr_.H2dDestinations(), ::testing::UnorderedElementsAre(2, 3));
+  EXPECT_FALSE(EntryOf("r0").has_value());
+  EXPECT_FALSE(EntryOf("r1").has_value());
+  EXPECT_THAT(mgr_.last_backend_dst_block_ids, ::testing::ElementsAre(4, 5));
+  EXPECT_EQ(EntryOf("s0")->status, BlockStatus::HOST_AND_HBM);
+  EXPECT_EQ(EntryOf("s1")->status, BlockStatus::HOST_AND_HBM);
+  EXPECT_EQ(FreeBlocks(), initial_free_ - 2);
+}
+
+// Verifies that attempting to mix HOST and REMOTE blocks alongside a STORAGE suffix
+// is rejected upfront with FailedPreconditionError ("Block is not pinned"), preserving
+// the invariant that prefix blocks must come from a single source.
+TEST_F(MixedBackendLoadTest, HostRemoteStorageStillRejected) {
+  MakeStore({.peer_hashes = {"r0"}});
+  AddPinnedLocal({"l0"});
+
+  absl::Status status = store_->Load(
+      {"l0", "r0", "s0"},
+      {LocalSlice(0), PeerSlice(peer_a_, 0), StorageSlice()}, {2, 3, 4});
+  EXPECT_TRUE(absl::IsFailedPrecondition(status)) << status;
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("Block is not pinned: r0"));
+  ExpectNoSideEffects({"l0"});
+  store_->Release({"l0"});
+}
+
+// Verifies that attempting to mix REMOTE and HOST blocks before a STORAGE suffix
+// is rejected upfront with InvalidArgumentError ("Mixed block statuses in a single Load call").
+TEST_F(MixedBackendLoadTest, RemoteHostStorageStillRejected) {
+  MakeStore({.peer_hashes = {"r0"}});
+  AddPinnedLocal({"l0"});
+
+  absl::Status status = store_->Load(
+      {"r0", "l0", "s0"},
+      {PeerSlice(peer_a_, 0), LocalSlice(0), StorageSlice()}, {2, 3, 4});
+  EXPECT_TRUE(absl::IsInvalidArgument(status)) << status;
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("Mixed block statuses in a single Load call"));
+  ExpectNoSideEffects({"l0"});
+  store_->Release({"l0"});
+}
+
+// Verifies that attempting to mix blocks from multiple distinct remote peers
+// before a STORAGE suffix is rejected upfront ("Mixed remote node IDs in a single Load call").
+TEST_F(MixedBackendLoadTest, TwoPeersPlusStorageStillRejected) {
+  MakeStore({.peer_hashes = {"r0"}});
+
+  absl::Status status = store_->Load(
+      {"r0", "rb", "s0"},
+      {PeerSlice(peer_a_, 0), PeerSlice(peer_b_, 0), StorageSlice()},
+      {2, 3, 4});
+  EXPECT_TRUE(absl::IsInvalidArgument(status)) << status;
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("Mixed remote node IDs in a single Load call"));
+  ExpectNoSideEffects({});
+}
+
+// Verifies that if any block in the local HOST prefix is not pinned by the caller,
+// the entire Load call is rejected upfront with FailedPreconditionError, without
+// allocating staging blocks or dispatching transfers.
+TEST_F(MixedBackendLoadTest, UnpinnedHostWithStorageRejected) {
+  MakeStore({});
+  ASSERT_TRUE(InsertResident(*store_, {"l0"}, {LocalSlice(0)},
+                             /*on_host=*/true));
+
+  absl::Status status =
+      store_->Load({"l0", "s0"}, {LocalSlice(0), StorageSlice()}, {2, 4});
+  EXPECT_TRUE(absl::IsFailedPrecondition(status)) << status;
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("Block is not pinned: l0"));
+  ExpectNoSideEffects({});
+  EXPECT_EQ(store_->GetPinCount("l0"), 0);
+}
+
+// Verifies that if any storage suffix block is already in flight (pending in LoadTracker),
+// a subsequent Load call containing that block is rejected upfront with FailedPreconditionError.
+TEST_F(MixedBackendLoadTest, SuffixAlreadyLoadingRejected) {
+  struct BlockingManager : public MixedBackendTransferManager {
+    absl::Notification started, release;
+    Result H2dReadFromBackend(
+        absl::Span<const std::shared_ptr<backends::KVBackend>> kv_backends,
+        const std::vector<backends::BlockKey>& block_keys,
+        const std::vector<int64_t>& src_host_block_ids,
+        const std::vector<int64_t>& dst_device_block_ids) {
+      started.Notify();
+      release.WaitForNotification();
+      return MixedBackendTransferManager::H2dReadFromBackend(
+          kv_backends, block_keys, src_host_block_ids,
+          dst_device_block_ids);
+    }
+  };
+  BlockingManager blocking;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&blocking));
+  MakeStore({});
+  blocking.backends["posix"] = posix_;
+  AddPinnedLocal({"l0"});
+
+  ABSL_ASSERT_OK(store_->Load({"s0"}, {StorageSlice()}, {2}));
+  blocking.started.WaitForNotification();
+
+  absl::Status status =
+      store_->Load({"l0", "s0"}, {LocalSlice(0), StorageSlice()}, {3, 4});
+  EXPECT_TRUE(absl::IsFailedPrecondition(status)) << status;
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("Block is already loading: s0"));
+
+  blocking.release.Notify();
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 1);
+  EXPECT_THAT(outcome.done, ::testing::ElementsAre("s0"));
+  store_->Release({"l0"});
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&mgr_));
+}
+
+// Verifies that ReadRemote() strictly rejects slices containing SHARED_STORAGE blocks,
+// ensuring mixed-tier loads can only be invoked through the unified Load() API.
+TEST_F(MixedBackendLoadTest, ReadRemoteWithStorageStillRejected) {
+  MakeStore({.peer_hashes = {"r0"}});
+
+  absl::Status status = store_->ReadRemote(
+      {"r0", "s0"}, {PeerSlice(peer_a_, 0), StorageSlice()}, {2, 3});
+  EXPECT_TRUE(absl::IsInvalidArgument(status)) << status;
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("Mixed block statuses in a single Load call"));
+  ExpectNoSideEffects({});
+}
+
+// Verifies that if no secondary storage backend is registered in KVCacheStore,
+// a Load call containing a storage suffix fails immediately with NotFoundError,
+// preserving local pin counts without marking any blocks failed.
+TEST_F(MixedBackendLoadTest, StorageSuffixWithoutSecondaryBackendRejected) {
+  MakeStore({.with_storage = false});
+  AddPinnedLocal({"l0"});
+
+  absl::Status status =
+      store_->Load({"l0", "s0"}, {LocalSlice(0), StorageSlice()}, {2, 4});
+  EXPECT_TRUE(absl::IsNotFound(status)) << status;
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("No registered secondary backend found for: "
+                                   "posix"));
+  ExpectNoSideEffects({"l0"});
+  store_->Release({"l0"});
+}
+
+// Verifies that mixed HOST + REMOTE blocks without a storage suffix remain rejected
+// under standard single-source validation rules.
+TEST_F(MixedBackendLoadTest, HostThenRemoteWithoutStorageStillRejected) {
+  MakeStore({.peer_hashes = {"r0"}});
+  AddPinnedLocal({"l0"});
+
+  absl::Status status =
+      store_->Load({"l0", "r0"}, {LocalSlice(0), PeerSlice(peer_a_, 0)}, {2, 3});
+  EXPECT_TRUE(absl::IsFailedPrecondition(status)) << status;
+  EXPECT_THAT(std::string(status.message()),
+              ::testing::HasSubstr("Block is not pinned: r0"));
+  ExpectNoSideEffects({"l0"});
+  store_->Release({"l0"});
+}
+
+// Race/Isolation Test: When host memory is constrained, allocating staging blocks
+// for the storage suffix must only evict unpinned resident blocks, and must NEVER
+// evict the pinned local blocks that comprise the prefix of the current Load call.
+TEST_F(MixedBackendLoadTest, StagingEvictsOnlyUnpinnedNotPrefix) {
+  constexpr int kHostBlocks = 3;
+  MakeStore({.num_host_blocks = kHostBlocks});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> alloc_ids,
+      KVCacheStoreTest::GetController(*store_)->AllocateBlockIds(2));
+  // Insert an unpinned entry "unpinned0" into host RAM.
+  ASSERT_TRUE(InsertResident(
+      *store_, {"unpinned0"},
+      {RaidenBlockId(local_id_, alloc_ids[0], -1, BlockStatus::HOST)},
+      /*on_host=*/true));
+  // Insert and pin "l0".
+  ASSERT_TRUE(InsertResident(
+      *store_, {"l0"},
+      {RaidenBlockId(local_id_, alloc_ids[1], -1, BlockStatus::HOST)},
+      /*on_host=*/true));
+  ABSL_ASSERT_OK(store_->Lookup({"l0"}));
+  ASSERT_EQ(store_->GetPinCount("l0"), 1);
+  ASSERT_EQ(store_->GetPinCount("unpinned0"), 0);
+
+  // Allocate remaining free blocks so FreeBlocks() becomes 0.
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held,
+      KVCacheStoreTest::AllocateBlockIds(*store_, FreeBlocks()));
+  ASSERT_EQ(FreeBlocks(), 0);
+
+  // Now Load {"l0", "s0"}. Staging needs 1 block; it must evict "unpinned0",
+  // NOT "l0" which is pinned!
+  ABSL_ASSERT_OK(store_->Load(
+      {"l0", "s0"},
+      {RaidenBlockId(local_id_, alloc_ids[1], -1, BlockStatus::HOST),
+       StorageSlice()},
+      {2, 3}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 2);
+  EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.done, ::testing::UnorderedElementsAre("l0", "s0"));
+
+  // "l0" loaded and pin was consumed.
+  EXPECT_EQ(store_->GetPinCount("l0"), 0);
+  EXPECT_EQ(EntryOf("l0")->status, BlockStatus::HOST_AND_HBM);
+  // "unpinned0" was evicted to make staging space.
+  EXPECT_FALSE(EntryOf("unpinned0").has_value());
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
+}
+
+// Partial Failure Test: If staging block allocation fails due to host memory exhaustion,
+// only the secondary storage suffix blocks fail; the host prefix blocks still successfully
+// transfer to HBM and complete without errors.
+TEST_F(MixedBackendLoadTest, StagingExhaustionFailsOnlySuffix) {
+  constexpr int kHostBlocks = 4;
+  MakeStore({.num_host_blocks = kHostBlocks});
+  AddPinnedLocal({"l0", "l1"});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held,
+      KVCacheStoreTest::AllocateBlockIds(*store_, kHostBlocks));
+  ASSERT_EQ(FreeBlocks(), 0);
+
+  ABSL_ASSERT_OK(store_->Load(
+      {"l0", "l1", "s0", "s1"},
+      {LocalSlice(0), LocalSlice(1), StorageSlice(), StorageSlice()},
+      {2, 3, 4, 5}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 4);
+  EXPECT_THAT(outcome.done, ::testing::UnorderedElementsAre("l0", "l1"));
+  EXPECT_THAT(outcome.failed, ::testing::UnorderedElementsAre("s0", "s1"));
+  EXPECT_EQ(mgr_.h2d_read_from_backend_calls, 0);
+  EXPECT_THAT(mgr_.H2dDestinations(), ::testing::UnorderedElementsAre(2, 3));
+  EXPECT_EQ(store_->GetPinCount("l0"), 0);
+  EXPECT_EQ(store_->GetPinCount("l1"), 0);
+  EXPECT_FALSE(EntryOf("s0").has_value());
+  EXPECT_FALSE(EntryOf("s1").has_value());
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
+}
+
+// Concurrency / Dedup Test: If a storage block is admitted into host RAM by a concurrent
+// operation between Lookup and recall completion, InsertAllOrNothing declines the duplicate,
+// and the temporary staging block is safely returned to the controller pool without leaking.
+TEST_F(MixedBackendLoadTest, SuffixAlreadyInHostReturnsStaging) {
+  MakeStore({});
+  // Insert s0 as already resident in host RAM (simulating concurrent insert or lookup gap).
+  ASSERT_TRUE(InsertResident(*store_, {"s0"}, {LocalSlice(0)}, /*on_host=*/true));
+  AddPinnedLocal({"l0"});
+
+  int free_before = FreeBlocks();
+
+  ABSL_ASSERT_OK(store_->Load(
+      {"l0", "s0"}, {LocalSlice(1), StorageSlice()}, {2, 3}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 2);
+  EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.done, ::testing::UnorderedElementsAre("l0", "s0"));
+
+  // s0 was already in host RAM, so InsertAllOrNothing declined duplicate,
+  // and staging host block was returned to the controller pool!
+  EXPECT_EQ(FreeBlocks(), free_before);
+}
+
+// Failure Isolation Test: If the secondary backend transfer fails during recall,
+// only the storage suffix blocks are marked failed; the host prefix blocks still complete
+// successfully, staging blocks are returned, and host LRU remains consistent.
+TEST_F(MixedBackendLoadTest, RecallFailureFailsOnlySuffix) {
+  MakeStore({});
+  mgr_.fail_recall = true;
+  AddPinnedLocal({"l0"});
+
+  ABSL_ASSERT_OK(
+      store_->Load({"l0", "s0"}, {LocalSlice(0), StorageSlice()}, {2, 4}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 2);
+  EXPECT_THAT(outcome.done, ::testing::ElementsAre("l0"));
+  EXPECT_THAT(outcome.failed, ::testing::ElementsAre("s0"));
+  EXPECT_EQ(mgr_.h2d_read_from_backend_calls, 1);
+  EXPECT_EQ(store_->GetPinCount("l0"), 0);
+  EXPECT_EQ(EntryOf("l0")->status, BlockStatus::HOST_AND_HBM);
+  EXPECT_FALSE(EntryOf("s0").has_value());
+  EXPECT_EQ(FreeBlocks(), initial_free_);
+}
+
 
 }  // namespace
 }  // namespace kv_cache

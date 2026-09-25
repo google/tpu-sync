@@ -31,6 +31,7 @@
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
@@ -226,6 +227,22 @@ void KVCacheListener::ConnectionWorker(int client_fd) {
           resp.set_message(std::string(status.message()));
           LOG(ERROR) << "PoolReshardRegisterRecv native execution failed: "
                      << status;
+        } else {
+          // Report this receiver's pool base addresses so the sender can
+          // compute raddr.
+          for (int32_t pool_idx : start_req.transfer_pool_indices()) {
+            absl::StatusOr<std::vector<uint64_t>> addrs =
+                callbacks_.pool_host_base_addrs(static_cast<size_t>(pool_idx));
+            if (!addrs.ok()) {
+              LOG(WARNING) << "No host base address for pool " << pool_idx
+                           << ": " << addrs.status();
+              continue;
+            }
+            if (addrs->empty()) continue;
+            (*resp.mutable_receiver_pool_addrs())[pool_idx]
+                .mutable_host_base_addrs()
+                ->Add(addrs->begin(), addrs->end());
+          }
         }
       } else if (start_req.is_sender()) {
         // Preserve the pre-pool controller protocol for existing callers.

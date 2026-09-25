@@ -16,12 +16,15 @@
 #define THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_KV_CACHE_KV_CACHE_LISTENER_H_
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <thread>  // NOLINT
+#include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "tpu_sync/common/detached_thread_group.h"
 
@@ -73,6 +76,16 @@ class KVCacheListener final {
                     },
                 .wait_for_pending_work =
                     [engine]() { return engine->WaitForPendingWork(); },
+                .pool_host_base_addrs = [engine](size_t pool_idx)
+                    -> absl::StatusOr<std::vector<uint64_t>> {
+                  if constexpr (requires {
+                                  engine->PoolHostBaseAddrs(pool_idx);
+                                }) {
+                    return engine->PoolHostBaseAddrs(pool_idx);
+                  } else {
+                    return engine->base()->PoolHostBaseAddrs(pool_idx);
+                  }
+                },
             },
             listener_port) {}
   ~KVCacheListener();
@@ -97,6 +110,10 @@ class KVCacheListener final {
         uint64_t, const tpu_sync::rpc::StartTransferRequest&, bool)>
         register_active_plan;
     std::function<absl::Status()> wait_for_pending_work;
+    // Pool base address per local shard (KVCacheManagerBase::
+    // PoolHostBaseAddrs), reported in the pool-reshard receiver arm reply.
+    std::function<absl::StatusOr<std::vector<uint64_t>>(size_t)>
+        pool_host_base_addrs;
   };
 
   KVCacheListener(EngineCallbacks callbacks, int listener_port);

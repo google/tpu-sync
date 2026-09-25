@@ -63,6 +63,10 @@ message PoolSpecProto {
   int64 num_blocks = 5;
   repeated RegionSpecProto regions = 6;
   string dtype_tag = 7;
+  // Pool base address per local shard of the receiving worker:
+  // host_base_addrs[i] = GetHostPointer(storage_index, i) + base_offset_bytes.
+  // Either one entry per local shard, or empty.
+  repeated uint64 host_base_addrs = 8;
 }
 
 message VariableMetadataProto {
@@ -257,9 +261,15 @@ message ControlRequest {
   RegisterWorkUnitRequest register_work_unit_request = 4;
 }
 
+// Pool base address per local shard of the receiving worker:
+message PoolHostAddrsProto {
+  repeated uint64 host_base_addrs = 1;
+}
+
 message ControlResponse {
   bool success = 1;
   string message = 2;
   string response_data = 3;
   GetMetadataResponse get_metadata_response = 4;
+  map<int32, PoolHostAddrsProto> receiver_pool_addrs = 5;
 }

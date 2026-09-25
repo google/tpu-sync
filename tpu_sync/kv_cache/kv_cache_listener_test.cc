@@ -28,6 +28,7 @@
 
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -49,11 +50,12 @@ enum class Route {
 
 class RoutingKVCacheManager final : public KVCacheManagerBase {
  public:
-  RoutingKVCacheManager()
+  explicit RoutingKVCacheManager(
+      std::optional<int> host_blocks_to_allocate = std::nullopt)
       : KVCacheManagerBase(/*num_layers=*/1, /*num_shards=*/1,
                            /*slice_byte_size=*/64,
                            /*local_port=*/std::nullopt,
-                           /*host_blocks_to_allocate=*/std::nullopt) {}
+                           host_blocks_to_allocate) {}
 
   absl::Status PoolReshardPush(const StartTransferRequest& request,
                                absl::Span<const int64_t> src_block_ids,
@@ -209,6 +211,27 @@ TEST(KVCacheListenerTest, PoolReceiverRoutesToPoolReshardRegisterRecv) {
   EXPECT_EQ(manager.route(), Route::kPoolReshardRegisterRecv);
   EXPECT_EQ(manager.request().uuid(), 1234);
   EXPECT_EQ(manager.local_block_ids(), (std::vector<int64_t>{5, 3}));
+}
+
+TEST(KVCacheListenerTest, PoolReceiverArmReplyCarriesHostBaseAddrs) {
+  RoutingKVCacheManager manager(/*host_blocks_to_allocate=*/1);
+  KVCacheListener listener(&manager, /*listener_port=*/0);
+  absl::StatusOr<std::vector<uint64_t>> expected = manager.PoolHostBaseAddrs(0);
+  ASSERT_TRUE(expected.ok()) << expected.status();
+  ASSERT_EQ(expected->size(), 1u);
+
+  ControlRequest request;
+  StartTransferRequest* plan = AddPoolPlan(&request, /*is_sender=*/false);
+  plan->add_transfer_pool_indices(7);  // Unknown pool: left out of the reply.
+  plan->mutable_pool_groups(0)->add_dst_device_block_ids(5);
+
+  ControlResponse response = SendRequest(listener.listener_port(), request);
+
+  EXPECT_TRUE(response.success()) << response.message();
+  ASSERT_TRUE(response.receiver_pool_addrs().contains(0));
+  const auto& addrs = response.receiver_pool_addrs().at(0).host_base_addrs();
+  EXPECT_EQ(std::vector<uint64_t>(addrs.begin(), addrs.end()), *expected);
+  EXPECT_FALSE(response.receiver_pool_addrs().contains(7));
 }
 
 TEST(KVCacheListenerTest, PartiallyPopulatedPoolPlanStillRoutesToPoolPath) {

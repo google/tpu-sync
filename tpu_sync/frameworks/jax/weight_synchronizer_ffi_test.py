@@ -106,7 +106,7 @@ class WeightSynchronizerFfiTest(parameterized.TestCase):
     )
 
     meta = weight_synchronizer_ffi.init_weight_synchronizer(
-        device_array=src_w0,
+        device_arrays=[src_w0, src_w1],
         shard_idx=self.shard_idx,
         mesh=self.mesh,
         slice_byte_sizes=slice_byte_sizes,
@@ -193,6 +193,45 @@ class WeightSynchronizerFfiTest(parameterized.TestCase):
     for orig, rest in zip(src_arrays, restored):
       jax.block_until_ready(rest)
       np.testing.assert_array_equal(np.asarray(rest), np.asarray(orig))
+
+  @parameterized.named_parameters(
+      ("legacy", "0"),
+      ("direct_device_buffer", "1"),
+  )
+  def test_init_weight_synchronizer_multi_layer_bind(self, direct_buffer_env):
+    os.environ["RAIDEN_FFI_USE_DIRECT_DEVICE_BUFFER"] = direct_buffer_env
+    src_w0 = jax.device_put(
+        jnp.arange(self.num_devices * 16, dtype=jnp.bfloat16).reshape(
+            self.num_devices, 16
+        ),
+        self.weight_sharding,
+    )
+    src_w1 = jax.device_put(
+        jnp.full((self.num_devices, 32), 3.5, dtype=jnp.bfloat16),
+        self.weight_sharding,
+    )
+    src_arrays = [src_w0, src_w1]
+    slice_byte_sizes = jax.device_put(
+        jnp.array([16 * 2, 32 * 2], dtype=jnp.int32),
+        jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec(None)),
+    )
+
+    meta = weight_synchronizer_ffi.init_weight_synchronizer(
+        device_arrays=src_arrays,
+        shard_idx=self.shard_idx,
+        mesh=self.mesh,
+        slice_byte_sizes=slice_byte_sizes,
+        local_port=0,
+        parallelism=1,
+        num_layers=len(src_arrays),
+        listener_port=0,
+        num_shards=self.num_devices,
+    )
+    meta_np = np.asarray(meta).reshape(-1, 6)
+    self.assertEqual(meta_np.shape, (self.num_devices, 6))
+    for row in meta_np:
+      self.assertGreater(int(row[4]), 0)
+      self.assertGreater(int(row[5]), 0)
 
 
 if __name__ == "__main__":

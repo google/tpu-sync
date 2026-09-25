@@ -152,7 +152,7 @@ def _prepare_shard_info(
 
 
 def init_weight_synchronizer(
-    device_array,
+    device_arrays,  # List of sharded arrays
     shard_idx,
     mesh,
     slice_byte_sizes,  # JAX array of int32
@@ -166,7 +166,8 @@ def init_weight_synchronizer(
   """Registers and executes init_weight_synchronizer FFI custom call on each device rank.
 
   Args:
-    device_array: Sharded input device array serving as the FFI target anchor.
+    device_arrays: List of sharded input device arrays (or a single sharded
+      device array) serving as the FFI target anchor(s).
     shard_idx: Sharding index array representing shard IDs on each local rank.
     mesh: JAX device mesh across all participating physical devices/hosts.
     slice_byte_sizes: Sharded 1D int32 array of physical weight slice sizes per
@@ -185,6 +186,11 @@ def init_weight_synchronizer(
     A sharded 1D int32 array containing synchronization metadata (`out_dim=6` if
     `listener_port >= 0`).
   """
+  if isinstance(device_arrays, (list, tuple)):
+    anchors_list = list(device_arrays)
+  else:
+    anchors_list = [device_arrays]
+
   if num_shards is None:
     num_processes = len(set(d.process_index for d in mesh.devices.flatten()))
     num_shards = mesh.devices.size // num_processes
@@ -192,27 +198,31 @@ def init_weight_synchronizer(
   shard_info = _prepare_shard_info(
       shard_idx, mesh, num_shards, host_subgrid=host_subgrid
   )
+  use_direct = _use_direct_device_buffer()
   ffi_name = (
       "raiden_weight_synchronizer_create"
-      if _use_direct_device_buffer()
+      if use_direct
       else "init_weight_synchronizer"
   )
 
   @compute_on.compute_on(
       compute_type="device_host", out_memory_spaces=jax.memory.Space.Device
   )
-  def _local_init(anchor, s_idx, sizes):
+  def _local_init(s_idx, sizes, *anchors):
     axis_names = mesh.axis_names
     out_dim = 6 if listener_port >= 0 else 5
     out_shape = tuple([1] * len(axis_names)) + (out_dim,)
+    ffi_args = (
+        (anchors[0], s_idx, sizes, *anchors[1:])
+        if use_direct
+        else (anchors[0], s_idx, sizes)
+    )
     return jax.ffi.ffi_call(
         ffi_name,
         jax.ShapeDtypeStruct(out_shape, jnp.int32),
         has_side_effect=True,
     )(
-        anchor,
-        s_idx,
-        sizes,
+        *ffi_args,
         local_port=np.int32(local_port),
         parallelism=np.int32(parallelism),
         num_layers=np.int32(num_layers),
@@ -220,16 +230,20 @@ def init_weight_synchronizer(
         num_shards=np.int32(num_shards),
     )
 
-  def _shard_init(anchor, s_idx, sizes):
-    if _use_direct_device_buffer():
-      anchor = anchor.reshape(-1).view(jnp.uint32)
-      one = jax.lax.optimization_barrier(jnp.ones_like(anchor))
-      with xla_metadata.set_xla_metadata(_xla_device_buffer="true"):
-        anchor = jax.lax.mul(anchor, one)
-    return _local_init(anchor, s_idx, sizes)
+  def _shard_init(s_idx, sizes, *anchors):
+    if use_direct:
+      new_anchors = []
+      for a in anchors:
+        a = a.reshape(-1).view(jnp.uint32)
+        one = jax.lax.optimization_barrier(jnp.ones_like(a))
+        with xla_metadata.set_xla_metadata(_xla_device_buffer="true"):
+          a = jax.lax.mul(a, one)
+        new_anchors.append(a)
+      anchors = tuple(new_anchors)
+    return _local_init(s_idx, sizes, *anchors)
 
   axis_names = mesh.axis_names
-  anchor_spec = device_array.sharding.spec
+  anchor_specs = tuple(a.sharding.spec for a in anchors_list)
   index_spec = jax.sharding.PartitionSpec(*axis_names, None)
   sizes_spec = jax.sharding.PartitionSpec(None)
   out_spec = jax.sharding.PartitionSpec(*axis_names, None)
@@ -238,10 +252,10 @@ def init_weight_synchronizer(
       jax.shard_map(
           _shard_init,
           mesh=mesh,
-          in_specs=(anchor_spec, index_spec, sizes_spec),
+          in_specs=(index_spec, sizes_spec) + anchor_specs,
           out_specs=out_spec,
       )
-  )(device_array, shard_info, slice_byte_sizes)
+  )(shard_info, slice_byte_sizes, *anchors_list)
 
 
 def init_weight_synchronizer_and_d2h(

@@ -2121,6 +2121,26 @@ absl::StatusOr<PoolBlockRef> KVCacheManagerBase::GetPoolBlockRef(
   };
 }
 
+absl::StatusOr<std::vector<uint64_t>> KVCacheManagerBase::PoolHostBaseAddrs(
+    size_t pool_idx) const {
+  EnsureImplicitPools();
+  if (pool_idx >= pools_.size()) {
+    return absl::OutOfRangeError(absl::StrCat(
+        "pool index ", pool_idx, " out of range: ", pools_.size(), " pools"));
+  }
+  std::vector<uint64_t> addrs;
+  if (PoolStorageStagingBounded(pools_[pool_idx].storage_index)) {
+    return addrs;
+  }
+  addrs.reserve(num_shards_);
+  for (size_t sh = 0; sh < num_shards_; ++sh) {
+    ABSL_ASSIGN_OR_RETURN(PoolBlockRef ref,
+                          GetPoolBlockRef(pool_idx, sh, /*block_id=*/0));
+    addrs.push_back(reinterpret_cast<uintptr_t>(ref.ptr));
+  }
+  return addrs;
+}
+
 const PoolSpec* KVCacheManagerBase::pool(size_t pool_idx) const {
   EnsureImplicitPools();
   if (pool_idx >= pools_.size()) {

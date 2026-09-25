@@ -300,6 +300,43 @@ TEST(PoolStagingTest, SmallPoolIdentitySharedStorageAndStrideMismatch) {
   EXPECT_FALSE(mixed.PoolStorageStagingBounded(0));
 }
 
+// PoolHostBaseAddrs reports, per local shard, each pool's base address
+// (storage host pointer + base offset), is empty for bounded staging, and
+// rejects unknown pools.
+TEST(PoolStagingTest, PoolHostBaseAddrs) {
+  constexpr int64_t kStride = 64;
+  StagingTestManager full(/*num_layers=*/1, /*num_shards=*/2,
+                          /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  full.SetDeviceBacked(0, 32 + kStride * 8);
+  ABSL_ASSERT_OK(full.RegisterPools(
+      {DensePool("a", 0, /*base_offset=*/0, kStride, 8, 0),
+       StridedPool("b", 0, /*base_offset=*/32, kStride, 8, 0)},
+      /*staging_leases=*/0));
+  for (size_t pool_idx = 0; pool_idx < 2; ++pool_idx) {
+    TF_ASSERT_OK_AND_ASSIGN(std::vector<uint64_t> addrs,
+                            full.PoolHostBaseAddrs(pool_idx));
+    ASSERT_EQ(addrs.size(), 2u);
+    for (size_t sh = 0; sh < 2; ++sh) {
+      EXPECT_EQ(addrs[sh],
+                reinterpret_cast<uint64_t>(full.GetHostPointer(0, sh)) +
+                    full.pool(pool_idx)->base_offset_bytes);
+    }
+  }
+  EXPECT_THAT(full.PoolHostBaseAddrs(2),
+              StatusIs(absl::StatusCode::kOutOfRange));
+
+  StagingTestManager bounded(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  bounded.SetDeviceBacked(0, kStride * 32);
+  ABSL_ASSERT_OK(bounded.RegisterPools(
+      {DensePool("fa", 0, 0, kStride, 32, /*staging_blocks_per_request=*/2)},
+      /*staging_leases=*/2));
+  ASSERT_TRUE(bounded.PoolStorageStagingBounded(0));
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<uint64_t> addrs,
+                          bounded.PoolHostBaseAddrs(0));
+  EXPECT_TRUE(addrs.empty());
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

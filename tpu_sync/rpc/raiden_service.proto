@@ -63,6 +63,10 @@ message PoolSpecProto {
   int64 num_blocks = 5;
   repeated RegionSpecProto regions = 6;
   string dtype_tag = 7;
+  // Pool base address per local shard of the registering worker:
+  // host_base_addrs[i] = GetHostPointer(storage_index, i) + base_offset_bytes.
+  // Either one entry per local shard, or empty.
+  repeated uint64 host_base_addrs = 8;
 }
 
 message VariableMetadataProto {

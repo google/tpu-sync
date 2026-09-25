@@ -651,6 +651,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
                                                size_t shard_idx,
                                                int64_t block_id) const;
 
+  // Pool base address of `pool_idx` on each local shard (storage host
+  // pointer + base_offset_bytes), for PoolSpecProto.host_base_addrs.
+  absl::StatusOr<std::vector<uint64_t>> PoolHostBaseAddrs(
+      size_t pool_idx) const;
+
   const PoolSpec* pool(size_t pool_idx) const;
 
   size_t num_pools() const;

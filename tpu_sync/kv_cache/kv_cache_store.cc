@@ -1433,6 +1433,169 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
   return absl::OkStatus();
 }
 
+absl::StatusOr<KVCacheStore::SingleSourceValidationResult>
+KVCacheStore::ValidateSingleSourceSlicesLocked(
+    absl::Span<const std::string> block_hashes,
+    absl::Span<const RaidenBlockId> slices) {
+  if (slices.empty()) {
+    return SingleSourceValidationResult{};
+  }
+  SingleSourceValidationResult result;
+  result.status = slices[0].status;
+  if (result.status == BlockStatus::REMOTE) {
+    result.remote_id = slices[0].raiden_id;
+  } else if (result.status == BlockStatus::SHARED_STORAGE) {
+    // For SHARED_STORAGE, RaidenId::data_name holds the actual backend name
+    // (e.g., "posix", "gcs").
+    result.target_backend_name = slices[0].raiden_id.data_name;
+  }
+
+  for (size_t i = 0; i < slices.size(); ++i) {
+    const auto& hash = block_hashes[i];
+    const auto& existing = slices[i];
+    if (load_tracker_.IsPending(hash)) {
+      return absl::FailedPreconditionError(
+          absl::StrCat("Block is already loading: ", hash));
+    }
+
+    if (result.status == BlockStatus::REMOTE) {
+      if (existing.status != BlockStatus::REMOTE) {
+        return absl::InvalidArgumentError(
+            "Mixed block statuses in a single Load call");
+      }
+      if (existing.raiden_id != result.remote_id) {
+        return absl::InvalidArgumentError(
+            "Mixed remote node IDs in a single Load call");
+      }
+    } else if (result.status == BlockStatus::SHARED_STORAGE) {
+      if (existing.status != BlockStatus::SHARED_STORAGE) {
+        return absl::InvalidArgumentError(
+            "Mixed block statuses in a single Load call");
+      }
+    } else {
+      // The caller's pin is what a successful local load consumes, so it has
+      // to exist. The no-slices form has always required it; this form did
+      // not, which left one signature hiding two different pin contracts.
+      if (backend()->GetPinCount(hash) <= 0) {
+        return absl::FailedPreconditionError(
+            absl::StrCat("Block is not pinned: ", hash));
+      }
+      if (existing.status != BlockStatus::HOST &&
+          existing.status != BlockStatus::HOST_AND_HBM) {
+        return absl::FailedPreconditionError(
+            absl::StrCat("Block is not on host: ", hash));
+      }
+      if (existing.host_block_id == -1) {
+        return absl::FailedPreconditionError(
+            absl::StrCat("Block host_block_id is -1: ", hash));
+      }
+    }
+  }
+  return result;
+}
+
+void KVCacheStore::DispatchSecondaryBackendRecall(
+    std::shared_ptr<KVCacheStoreBackend> secondary_backend,
+    absl::Span<const std::string> block_hashes,
+    absl::Span<const int> staging_host_block_ids,
+    absl::Span<const int> device_block_ids) {
+  ::tpu_sync::proto::BackendTransferSpec spec;
+  spec.set_name(secondary_backend->name());
+
+  // RECALL: the host-DRAM staging side is the SOURCE and the HBM side is the
+  // destination -- the reverse of OFFLOAD. Both lists are block slot indices
+  // of the same type, so the labels below are what keeps them straight.
+  const std::vector<int64_t> host_ids(staging_host_block_ids.begin(),
+                                      staging_host_block_ids.end());
+  const std::vector<int64_t> hbm_ids(device_block_ids.begin(),
+                                     device_block_ids.end());
+  tsl::Future<> future = raiden_controller_->TransferBackendBuffers(
+      ::tpu_sync::proto::TRANSFER_DIR_RECALL, block_hashes,
+      /*hbm_block_ids=*/hbm_ids, /*host_block_ids=*/host_ids, {spec});
+
+  // Captures are copies only -- no `this`, no reference to a member tracker.
+  // The store can be destroyed while this transfer is in flight, so every
+  // touch of it goes through the lifetime fence below.
+  future.OnReady(
+      [lifetime = lifetime_, host_ram_backend = backend(),
+       raiden_id = raiden_id_,
+       block_hashes =
+           std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
+       staging_host_block_ids = std::vector<int>(staging_host_block_ids.begin(),
+                                                 staging_host_block_ids.end()),
+       device_block_ids =
+           std::vector<int>(device_block_ids.begin(), device_block_ids.end())](
+          absl::Status status) {
+        if (!status.ok()) {
+          absl::MutexLock lock(lifetime->mu);
+          if (KVCacheStore* self = lifetime->store; self != nullptr) {
+            self->DeallocateBlockIds(staging_host_block_ids);
+            self->load_tracker_.MarkFailed(block_hashes);
+          }
+          return;
+        }
+        // Storage recall succeeded: the transfer has already written every
+        // block into HBM. Publishing the staging copy into the host-RAM tier
+        // (tier 0) is a pure caching optimization layered on top of that, so it
+        // is allowed to fail without failing the Load. host_ram_backend is
+        // never null: ValidateBackends requires a tier-0 backend.
+
+        std::vector<std::string> update_hashes;
+        std::vector<RaidenBlockId> update_slices;
+        update_hashes.reserve(block_hashes.size());
+        update_slices.reserve(block_hashes.size());
+        for (size_t i = 0; i < block_hashes.size(); ++i) {
+          // Publish recalled blocks under this store's own ID so subsequent
+          // lookups recognize them as local host/device resident.
+          update_hashes.push_back(block_hashes[i]);
+          update_slices.emplace_back(raiden_id, staging_host_block_ids[i],
+                                     device_block_ids[i],
+                                     BlockStatus::HOST_AND_HBM);
+        }
+
+        // Admission is done per-block rather than as a single batch because
+        // refusal is per-block (e.g. duplicate hashes from a concurrent
+        // publisher). Admitting one-by-one preserves the usable prefix chain
+        // even if later blocks collide. Single-element InsertAllOrNothing
+        // validates, inserts, and verifies under the backend's own mutex.
+        std::vector<int> to_return;
+        for (size_t i = 0; i < update_hashes.size(); ++i) {
+          if (!host_ram_backend->InsertAllOrNothing({update_hashes[i]},
+                                                    {update_slices[i]})) {
+            // The host-RAM tier declined ownership of this block. Its physical
+            // block id must be returned HERE: block reclamation runs through
+            // KVCacheStore::Evict, which discovers victims by asking the tier
+            // for them, so a block with no LRU entry naming it is invisible to
+            // eviction and would stay allocated-and-locked for the life of the
+            // process.
+            to_return.push_back(staging_host_block_ids[i]);
+          }
+        }
+
+        absl::MutexLock lock(lifetime->mu);
+        if (KVCacheStore* self = lifetime->store; self != nullptr) {
+          if (!to_return.empty()) self->DeallocateBlockIds(to_return);
+          // MarkDone, not MarkFailed: the transfer landed all N blocks in HBM,
+          // so the Load succeeded even if the host-RAM tier refused a copy.
+          self->load_tracker_.MarkDone(block_hashes);
+        }
+      });
+}
+
+namespace {
+
+// Returns the index where a trailing SHARED_STORAGE suffix starts in slices.
+// Returns slices.size() if there are no SHARED_STORAGE blocks at the end.
+size_t FindSharedStorageSuffixSplit(absl::Span<const RaidenBlockId> slices) {
+  size_t split = slices.size();
+  while (split > 0 && slices[split - 1].status == BlockStatus::SHARED_STORAGE) {
+    --split;
+  }
+  return split;
+}
+
+}  // namespace
+
 absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
                                 absl::Span<const RaidenBlockId> slices,
                                 absl::Span<const int> device_block_ids) {
@@ -1448,72 +1611,29 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
     return absl::OkStatus();
   }
 
-  RaidenId remote_id;
-  bool from_secondary_backend = false;
-  std::string target_backend_name;
+  // Detect a trailing SHARED_STORAGE suffix preceded by non-storage blocks.
+  size_t split = FindSharedStorageSuffixSplit(slices);
+  if (split > 0 && split < slices.size()) {
+    return LoadFromMixedBackends(block_hashes, slices, device_block_ids, split);
+  }
+
+  SingleSourceValidationResult validation;
   {
     absl::MutexLock lock(mutex_);
-
-    BlockStatus first_status = slices[0].status;
-    if (first_status == BlockStatus::REMOTE) {
-      remote_id = slices[0].raiden_id;
-    } else if (first_status == BlockStatus::SHARED_STORAGE) {
-      from_secondary_backend = true;
-      target_backend_name = slices[0].raiden_id.data_name;
-    }
-
-    for (size_t i = 0; i < slices.size(); ++i) {
-      const auto& hash = block_hashes[i];
-      const auto& existing = slices[i];
-      if (load_tracker_.IsPending(hash)) {
-        return absl::FailedPreconditionError(
-            absl::StrCat("Block is already loading: ", hash));
-      }
-
-      if (first_status == BlockStatus::REMOTE) {
-        if (existing.status != BlockStatus::REMOTE) {
-          return absl::InvalidArgumentError(
-              "Mixed block statuses in a single Load call");
-        }
-        if (existing.raiden_id != remote_id) {
-          return absl::InvalidArgumentError(
-              "Mixed remote node IDs in a single Load call");
-        }
-      } else if (first_status == BlockStatus::SHARED_STORAGE) {
-        if (existing.status != BlockStatus::SHARED_STORAGE) {
-          return absl::InvalidArgumentError(
-              "Mixed block statuses in a single Load call");
-        }
-      } else {
-        // The caller's pin is what a successful local load consumes, so it has
-        // to exist. The no-slices form has always required it; this form did
-        // not, which left one signature hiding two different pin contracts.
-        if (backend()->GetPinCount(hash) <= 0) {
-          return absl::FailedPreconditionError(
-              absl::StrCat("Block is not pinned: ", hash));
-        }
-        if (existing.status != BlockStatus::HOST &&
-            existing.status != BlockStatus::HOST_AND_HBM) {
-          return absl::FailedPreconditionError(
-              absl::StrCat("Block is not on host: ", hash));
-        }
-        if (existing.host_block_id == -1) {
-          return absl::FailedPreconditionError(
-              absl::StrCat("Block host_block_id is -1: ", hash));
-        }
-      }
-    }
+    ABSL_ASSIGN_OR_RETURN(
+        validation, ValidateSingleSourceSlicesLocked(block_hashes, slices));
     load_tracker_.AddPending(block_hashes);
   }
 
-  if (from_secondary_backend) {
+  if (validation.status == BlockStatus::SHARED_STORAGE) {
     std::shared_ptr<KVCacheStoreBackend> secondary_backend =
         (backends_.size() > 1) ? backends_[1] : nullptr;
     if (!secondary_backend) {
       absl::MutexLock lock(mutex_);
       load_tracker_.MarkFailed(block_hashes);
-      return absl::NotFoundError(absl::StrCat(
-          "No registered secondary backend found for: ", target_backend_name));
+      return absl::NotFoundError(
+          absl::StrCat("No registered secondary backend found for: ",
+                       validation.target_backend_name));
     }
 
     auto host_blocks_or = AllocateBlockIds(block_hashes.size());
@@ -1522,131 +1642,97 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
       load_tracker_.MarkFailed(block_hashes);
       return host_blocks_or.status();
     }
-    const auto& staging_host_block_ids = host_blocks_or.value();
 
-    ::tpu_sync::proto::BackendTransferSpec spec;
-    spec.set_name(secondary_backend->name());
-
-    // RECALL: the host-DRAM staging side is the SOURCE and the HBM side is the
-    // destination -- the reverse of OFFLOAD. Both lists are block slot indices
-    // of the same type, so the labels below are what keeps them straight.
-    const std::vector<int64_t> host_ids(staging_host_block_ids.begin(),
-                                        staging_host_block_ids.end());
-    const std::vector<int64_t> hbm_ids(device_block_ids.begin(),
-                                       device_block_ids.end());
-    tsl::Future<> future = raiden_controller_->TransferBackendBuffers(
-        ::tpu_sync::proto::TRANSFER_DIR_RECALL, block_hashes,
-        /*hbm_block_ids=*/hbm_ids, /*host_block_ids=*/host_ids, {spec});
-
-    // Captures are copies only -- no `this`, no reference to a member tracker.
-    // The store can be destroyed while this transfer is in flight, so every
-    // touch of it goes through the lifetime fence below.
-    future.OnReady([lifetime = lifetime_, host_ram_backend = backend(),
-                    raiden_id = raiden_id_,
-                    block_hashes = std::vector<std::string>(
-                        block_hashes.begin(), block_hashes.end()),
-                    staging_host_block_ids,
-                    device_block_ids = std::vector<int>(
-                        device_block_ids.begin(), device_block_ids.end())](
-                       absl::Status status) {
-      if (!status.ok()) {
-        absl::MutexLock lock(lifetime->mu);
-        if (KVCacheStore* self = lifetime->store; self != nullptr) {
-          self->DeallocateBlockIds(staging_host_block_ids);
-          self->load_tracker_.MarkFailed(block_hashes);
-        }
-        return;
-      }
-      // Storage recall succeeded: the transfer has already written every
-      // block into HBM. Publishing the staging copy into the host-RAM tier
-      // (tier 0) is a pure caching optimization layered on top of that, so it
-      // is allowed to fail without failing the Load.
-      if (host_ram_backend == nullptr) {
-        absl::MutexLock lock(lifetime->mu);
-        if (KVCacheStore* self = lifetime->store; self != nullptr) {
-          self->DeallocateBlockIds(staging_host_block_ids);
-          self->load_tracker_.MarkDone(block_hashes);
-        }
-        return;
-      }
-
-      std::vector<std::string> update_hashes;
-      std::vector<RaidenBlockId> update_slices;
-      update_hashes.reserve(block_hashes.size());
-      update_slices.reserve(block_hashes.size());
-      for (size_t i = 0; i < block_hashes.size(); ++i) {
-        // Once the bytes are resident here, this block is ours. The slice
-        // returned by the storage tier's Lookup still carries that backend's
-        // synthetic identity ({"shared", <backend name>}), which described
-        // where the block was FOUND, not where it now lives. Publish under
-        // this store's own id so the entry is truthful to anything that reads
-        // raiden_id -- registry publication, peer lookups, and the
-        // remote-vs-local decision in Load.
-        update_hashes.push_back(block_hashes[i]);
-        update_slices.emplace_back(raiden_id, staging_host_block_ids[i],
-                                   device_block_ids[i],
-                                   BlockStatus::HOST_AND_HBM);
-      }
-
-      // TODO: revisit whether recall-admitted entries should be pinned. Left
-      // unpinned because there is no natural unpin owner on this path --
-      // offload has Release, recall has nothing equivalent -- which means the
-      // very next AllocateBlockIds may evict what we just admitted. Decide
-      // alongside the recall reservation work.
-      //
-      // Admission is done ONE BLOCK AT A TIME rather than as a single batch,
-      // because refusal is per-block: a concurrent publisher can claim any
-      // subset of these hashes, and InsertAllOrNothing rejects a batch
-      // containing even one duplicate. These hashes form a prefix chain, and
-      // prefix lookups walk from the start and stop at the first miss, so
-      // discarding the whole chain over a single mid-chain collision would
-      // throw away exactly the blocks the next request probes for. Per-block
-      // admission keeps the usable prefix.
-      //
-      // Note that the OTHER refusal lever, space, is batch-invariant today:
-      // available_space() is capacity minus the PINNED count, and these
-      // entries are admitted unpinned, so it does not shrink as the loop
-      // proceeds and either every block fits or none does. Per-block admission
-      // only becomes load-bearing for space if recall-admitted entries are
-      // ever pinned -- see the TODO above.
-      //
-      // A single-element InsertAllOrNothing is used rather than Insert because
-      // Insert cannot report a refusal: its `all_inserted` flag is only cleared
-      // when a hash was ALREADY present, never when LRUCache::Put silently
-      // drops a new key for want of evictable space. InsertAllOrNothing
-      // validates, inserts and verifies under the backend's own mutex, so the
-      // answer cannot race.
-      std::vector<int> to_return;
-      for (size_t i = 0; i < update_hashes.size(); ++i) {
-        if (!host_ram_backend->InsertAllOrNothing({update_hashes[i]},
-                                                  {update_slices[i]})) {
-          // The host-RAM tier declined ownership of this block. Its physical
-          // block id must be returned HERE: block reclamation runs through
-          // KVCacheStore::Evict, which discovers victims by asking the tier
-          // for them, so a block with no LRU entry naming it is invisible to
-          // eviction and would stay allocated-and-locked for the life of the
-          // process.
-          to_return.push_back(staging_host_block_ids[i]);
-        }
-      }
-
-      absl::MutexLock lock(lifetime->mu);
-      if (KVCacheStore* self = lifetime->store; self != nullptr) {
-        if (!to_return.empty()) self->DeallocateBlockIds(to_return);
-        // MarkDone, not MarkFailed: the transfer landed all N blocks in HBM,
-        // so the Load succeeded even if the host-RAM tier refused a copy.
-        self->load_tracker_.MarkDone(block_hashes);
-      }
-    });
-
+    DispatchSecondaryBackendRecall(secondary_backend, block_hashes,
+                                   host_blocks_or.value(), device_block_ids);
     return absl::OkStatus();
   }
 
-  backend()->Load(remote_id, block_hashes,
+  backend()->Load(validation.remote_id, block_hashes,
                   absl::Span<const int32_t>(
                       reinterpret_cast<const int32_t*>(device_block_ids.data()),
                       device_block_ids.size()),
                   slices, &load_tracker_);
+
+  return absl::OkStatus();
+}
+
+absl::Status KVCacheStore::LoadFromMixedBackends(
+    absl::Span<const std::string> block_hashes,
+    absl::Span<const RaidenBlockId> slices,
+    absl::Span<const int> device_block_ids, size_t split) {
+  auto prefix_hashes = block_hashes.subspan(0, split);
+  auto prefix_slices = slices.subspan(0, split);
+  auto prefix_device_ids = device_block_ids.subspan(0, split);
+
+  auto suffix_hashes = block_hashes.subspan(split);
+  auto suffix_slices = slices.subspan(split);
+  auto suffix_device_ids = device_block_ids.subspan(split);
+
+  // Check suffix slice 0 is SHARED_STORAGE before parsing raiden_id.data_name.
+  if (suffix_slices.empty() ||
+      suffix_slices[0].status != BlockStatus::SHARED_STORAGE) {
+    return absl::InvalidArgumentError("Expected SHARED_STORAGE suffix");
+  }
+  const std::string target_backend_name = suffix_slices[0].raiden_id.data_name;
+
+  // Only a single secondary storage tier is supported today: every
+  // SHARED_STORAGE block is recalled from backends_[1], regardless of the
+  // backend name carried in its slice.
+  std::shared_ptr<KVCacheStoreBackend> secondary_backend =
+      (backends_.size() > 1) ? backends_[1] : nullptr;
+
+  RaidenId remote_id;
+  {
+    absl::MutexLock lock(mutex_);
+
+    // 1. Validate prefix slices using common helper.
+    SingleSourceValidationResult prefix_validation;
+    ABSL_ASSIGN_OR_RETURN(prefix_validation, ValidateSingleSourceSlicesLocked(
+                                                 prefix_hashes, prefix_slices));
+    if (prefix_validation.status == BlockStatus::SHARED_STORAGE) {
+      return absl::InvalidArgumentError(
+          "Prefix slices in mixed load must be HOST or REMOTE, not "
+          "SHARED_STORAGE");
+    }
+    remote_id = prefix_validation.remote_id;
+
+    // 2. Validate suffix slices are SHARED_STORAGE and not already loading.
+    ABSL_RETURN_IF_ERROR(
+        ValidateSingleSourceSlicesLocked(suffix_hashes, suffix_slices)
+            .status());
+
+    // 3. Check secondary storage backend is registered BEFORE AddPending,
+    // so on failure nothing is marked pending or failed and pins are
+    // preserved.
+    if (!secondary_backend) {
+      return absl::NotFoundError(absl::StrCat(
+          "No registered secondary backend found for: ", target_backend_name));
+    }
+
+    // 4. Mark all blocks pending.
+    load_tracker_.AddPending(block_hashes);
+  }
+
+  // 5. Allocate staging blocks for the storage suffix BEFORE dispatching the
+  // prefix. If staging allocation fails, fail only the suffix block loads
+  // from secondary storage; the prefix is still dispatched.
+  absl::StatusOr<std::vector<int>> staging_blocks =
+      AllocateBlockIds(suffix_hashes.size());
+  if (!staging_blocks.ok()) {
+    absl::MutexLock lock(mutex_);
+    load_tracker_.MarkFailed(suffix_hashes);
+  } else {
+    DispatchSecondaryBackendRecall(secondary_backend, suffix_hashes,
+                                   *staging_blocks, suffix_device_ids);
+  }
+
+  // 6. Dispatch prefix to HostOffloadBackend::Load.
+  backend()->Load(remote_id, prefix_hashes,
+                  absl::Span<const int32_t>(reinterpret_cast<const int32_t*>(
+                                                prefix_device_ids.data()),
+                                            prefix_device_ids.size()),
+                  prefix_slices, &load_tracker_);
 
   return absl::OkStatus();
 }
@@ -1701,6 +1787,12 @@ absl::Status KVCacheStore::ReadRemote(
     const std::vector<std::string>& block_hashes,
     const std::vector<RaidenBlockId>& slices,
     const std::vector<int32_t>& device_block_ids) {
+  for (const auto& slice : slices) {
+    if (slice.status != BlockStatus::REMOTE) {
+      return absl::InvalidArgumentError(
+          "Mixed block statuses in a single Load call");
+    }
+  }
   return Load(block_hashes, slices, device_block_ids);
 }
 

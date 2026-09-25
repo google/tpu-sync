@@ -711,6 +711,41 @@ class KVCacheStore {
   absl::StatusOr<std::vector<int>> AllocateBlockIds(int needed);
   void DeallocateBlockIds(absl::Span<const int> block_ids);
 
+  struct SingleSourceValidationResult {
+    BlockStatus status = BlockStatus::HOST;
+    RaidenId remote_id;
+    std::string target_backend_name;
+  };
+
+  // Validates a single-source slice batch (all HOST, all REMOTE from one peer,
+  // or all SHARED_STORAGE) and verifies no block is already pending in
+  // load_tracker_.
+  // Precondition: mutex_ must be held by caller.
+  absl::StatusOr<SingleSourceValidationResult> ValidateSingleSourceSlicesLocked(
+      absl::Span<const std::string> block_hashes,
+      absl::Span<const RaidenBlockId> slices)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  // Issues an asynchronous RECALL transfer through the RaidenController that
+  // reads `block_hashes` from `secondary_backend` via the host staging blocks
+  // `staging_host_block_ids` into HBM at `device_block_ids`. The controller
+  // transfer performs the copy into HBM. On completion, the callback admits
+  // the recalled blocks into the host-RAM tier's LRU (returning any staging
+  // block the tier refuses), frees the staging blocks on failure, and marks
+  // the blocks done or failed in load_tracker_. The caller must have already
+  // marked `block_hashes` pending and allocated the staging blocks.
+  void DispatchSecondaryBackendRecall(
+      std::shared_ptr<KVCacheStoreBackend> secondary_backend,
+      absl::Span<const std::string> block_hashes,
+      absl::Span<const int> staging_host_block_ids,
+      absl::Span<const int> device_block_ids);
+
+  // Dispatches a mixed Load batch having slices from multiple backend types.
+  absl::Status LoadFromMixedBackends(absl::Span<const std::string> block_hashes,
+                                     absl::Span<const RaidenBlockId> slices,
+                                     absl::Span<const int> device_block_ids,
+                                     size_t split);
+
  public:
   // Lowers the outstanding-write-through bound so a test can reach it without
   // saving thousands of blocks.

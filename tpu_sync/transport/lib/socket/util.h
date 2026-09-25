@@ -16,6 +16,7 @@
 #define TPU_SYNC_TRANSPORT_LIB_SOCKET_UTIL_H_
 
 #include <memory>
+#include <string>
 
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -29,6 +30,10 @@ absl::StatusOr<int> ConnectToPeer(
     absl::string_view peer, absl::string_view local_ip = "",
     bool require_psp = false,
     std::shared_ptr<grpc::Channel> channel = nullptr);
+
+// Returns a string of self/peer ip:port pair ("self_ip:port <> peer_ip:port")
+// for the socket `fd`.
+std::string GetAddrPortPair(int fd);
 
 }  // namespace tpu_raiden::transport::lib
 

@@ -49,6 +49,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "peregrine/src/api/socket_util.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -59,9 +60,9 @@
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
+#include "tpu_sync/transport/lib/socket/util.h"
 #include "tpu_sync/transport/lib/socket_transport_adapter.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
-#include "tpu_sync/transport/peregrine/src/api/socket_util.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -112,7 +113,7 @@ void RecordPullResponseSentBytes(int client_fd,
                                  uint64_t total_size) {
   RaidenMetricStore& store = RaidenMetricStore::GetGlobalMetricStore();
   if (!store.HasBackends()) return;
-  const std::string addr_pair = peregrine::GetAddrPortPair(client_fd);
+  const std::string addr_pair = lib::GetAddrPortPair(client_fd);
   const std::pair<absl::string_view, absl::string_view> endpoints =
       absl::StrSplit(addr_pair, absl::MaxSplits(" <> ", 1));
   const absl::string_view peer_endpoint = endpoints.second;

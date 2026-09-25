@@ -30,8 +30,8 @@
 #include "grpcpp/support/status.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
-#include "tpu_sync/transport/peregrine/src/internal/control/service.grpc.pb.h"
-#include "tpu_sync/transport/peregrine/src/internal/control/service.pb.h"
+#include "tpu_sync/transport/lib/service.grpc.pb.h"
+#include "tpu_sync/transport/lib/service.pb.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {
@@ -58,13 +58,12 @@ TEST(PeregrineControlServiceTest, InProcessGrpcExchangePspKey) {
 
   std::shared_ptr<grpc::Channel> channel =
       server->InProcessChannel(grpc::ChannelArguments());
-  auto stub =
-      ::peregrine::internal::control::PeregrineService::NewStub(channel);
+  auto stub = PeregrineService::NewStub(channel);
 
-  ::peregrine::internal::control::PspKeyExchangeRequest req;
+  PspKeyExchangeRequest req;
   req.set_client_spi(0x12345678);
   req.set_client_key(std::string(16, 'z'));
-  ::peregrine::internal::control::PspKeyExchangeResponse resp;
+  PspKeyExchangeResponse resp;
   grpc::ClientContext ctx;
 
   grpc::Status status = stub->ExchangePspKey(&ctx, req, &resp);
@@ -89,13 +88,12 @@ TEST(PeregrineControlServiceTest, RejectsInvalidClientKey) {
 
   std::shared_ptr<grpc::Channel> channel =
       server->InProcessChannel(grpc::ChannelArguments());
-  auto stub =
-      ::peregrine::internal::control::PeregrineService::NewStub(channel);
+  auto stub = PeregrineService::NewStub(channel);
 
-  ::peregrine::internal::control::PspKeyExchangeRequest req;
+  PspKeyExchangeRequest req;
   req.set_client_spi(0x12345678);
   req.set_client_key("short_key");  // Not 16 bytes
-  ::peregrine::internal::control::PspKeyExchangeResponse resp;
+  PspKeyExchangeResponse resp;
   grpc::ClientContext ctx;
 
   grpc::Status status = stub->ExchangePspKey(&ctx, req, &resp);
@@ -116,13 +114,12 @@ TEST(PeregrineControlServiceTest, RejectsZeroClientSpi) {
 
   std::shared_ptr<grpc::Channel> channel =
       server->InProcessChannel(grpc::ChannelArguments());
-  auto stub =
-      ::peregrine::internal::control::PeregrineService::NewStub(channel);
+  auto stub = PeregrineService::NewStub(channel);
 
-  ::peregrine::internal::control::PspKeyExchangeRequest req;
+  PspKeyExchangeRequest req;
   req.set_client_spi(0);  // Invalid SPI
   req.set_client_key(std::string(16, 'x'));
-  ::peregrine::internal::control::PspKeyExchangeResponse resp;
+  PspKeyExchangeResponse resp;
   grpc::ClientContext ctx;
 
   grpc::Status status = stub->ExchangePspKey(&ctx, req, &resp);

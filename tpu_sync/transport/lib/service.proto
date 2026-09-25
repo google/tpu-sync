@@ -12,16 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_PEREGRINE_SRC_API_TRANSPORT_TYPES_H_
-#define THIRD_PARTY_PEREGRINE_SRC_API_TRANSPORT_TYPES_H_
+edition = "2024";
 
-#include <cstdint>
+package tpu_raiden.transport.lib;
 
-namespace peregrine {
+// Service for transport PSP control plane communication.
+service PeregrineService {
+  // Client sends its local RX SPI and key; server returns its RX SPI and key.
+  rpc ExchangePspKey(PspKeyExchangeRequest) returns (PspKeyExchangeResponse) {  }
+}
 
-// `Byte` is an 8-bit unit of data.
-using Byte = uint8_t;
+message PspKeyExchangeRequest {
+  uint32 client_spi = 1;
+  bytes client_key = 2;  // 16-byte raw AES session key
+}
 
-}  // namespace peregrine
-
-#endif  // THIRD_PARTY_PEREGRINE_SRC_API_TRANSPORT_TYPES_H_
+message PspKeyExchangeResponse {
+  uint32 server_spi = 1;
+  bytes server_key = 2;  // 16-byte raw AES session key
+}

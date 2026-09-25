@@ -32,9 +32,9 @@
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/channel_arguments.h"
 #include "grpcpp/support/status.h"
+#include "tpu_sync/transport/lib/service.grpc.pb.h"
+#include "tpu_sync/transport/lib/service.pb.h"
 #include "tpu_sync/transport/lib/socket/psp_syscall_mock.h"  // NOLINT
-#include "tpu_sync/transport/peregrine/src/internal/control/service.grpc.pb.h"
-#include "tpu_sync/transport/peregrine/src/internal/control/service.pb.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {
@@ -47,16 +47,13 @@ using ::testing::NotNull;
 
 constexpr absl::string_view kValidKey("0123456789\0\0\0\0\0", 16);  // NOLINT
 
-class FakePeregrineService final
-    : public ::peregrine::internal::control::PeregrineService::Service {
+class FakePeregrineService final : public PeregrineService::Service {
  public:
   explicit FakePeregrineService(int server_fd) : server_fd_(server_fd) {}
 
-  grpc::Status ExchangePspKey(
-      grpc::ServerContext* context,
-      const ::peregrine::internal::control::PspKeyExchangeRequest* request,
-      ::peregrine::internal::control::PspKeyExchangeResponse* response)
-      override {
+  grpc::Status ExchangePspKey(grpc::ServerContext* context,
+                              const PspKeyExchangeRequest* request,
+                              PspKeyExchangeResponse* response) override {
     auto rx_key = RegisterPspPeerKey(server_fd_, request->client_spi(),
                                      request->client_key());
     if (!rx_key.ok()) {

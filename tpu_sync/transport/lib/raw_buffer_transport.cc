@@ -62,6 +62,7 @@
 #define IOV_MAX 1024
 #endif
 #include "absl/status/status_macros.h"
+#include "peregrine/src/api/socket_util.h"
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -71,8 +72,8 @@
 #include "tpu_sync/transport/lib/histogram.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
+#include "tpu_sync/transport/lib/socket/util.h"
 #include "tpu_sync/transport/lib/test_only_rate_limiter.h"
-#include "tpu_sync/transport/peregrine/src/api/socket_util.h"
 
 namespace tpu_raiden::transport::lib {
 
@@ -255,7 +256,7 @@ RawBufferTransport::RawBufferTransport(
   LOG(INFO) << "bound_ip_: " << bound_ip_
             << ", local_ips_: " << absl::StrJoin(local_ips_, ",")
             << ", local_port_: " << local_port_ << ", listening tcp socket "
-            << server_fd_ << ": " << peregrine::GetAddrPortPair(server_fd_);
+            << server_fd_ << ": " << GetAddrPortPair(server_fd_);
 
   // 2. Start listener
   listener_thread_ = std::thread(&RawBufferTransport::ListenerLoop, this);
@@ -643,7 +644,7 @@ void RawBufferTransport::ListenerLoop() {
 
     DCHECK_GE(client_fd, 0);
     LOG(INFO) << absl::StrCat("accepted tcp socket ", client_fd, ": ",
-                              peregrine::GetAddrPortPair(client_fd));
+                              GetAddrPortPair(client_fd));
     {
       absl::MutexLock _(mu_);
       active_client_fds_.insert(client_fd);

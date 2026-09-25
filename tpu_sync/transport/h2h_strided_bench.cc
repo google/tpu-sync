@@ -66,9 +66,9 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "peregrine/src/api/socket_util.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
-#include "tpu_sync/transport/peregrine/src/api/socket_util.h"
 
 namespace {
 

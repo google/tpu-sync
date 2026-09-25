@@ -861,14 +861,15 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
 }
 
 lib::Request BlockTransport::BuildBlockRequest(
-    uint8_t socket_opcode, uint8_t* laddr, size_t len, uint32_t count_or_size,
-    uint32_t request_id, uint64_t uuid, uint64_t buffer_id, int parallelism,
-    MajorOrder major_order, uint32_t remote_id, uint32_t local_id,
-    int stream_idx, BlockReceivedCallback on_block_received) {
+    uint8_t socket_opcode, uint8_t* laddr, uint8_t* raddr, size_t len,
+    uint32_t count_or_size, uint32_t request_id, uint64_t uuid,
+    uint64_t buffer_id, int parallelism, MajorOrder major_order,
+    uint32_t remote_id, uint32_t local_id, int stream_idx,
+    BlockReceivedCallback on_block_received) {
   return lib::Request{
       .socket_opcode = socket_opcode,
       .laddr = laddr,
-      .raddr = nullptr,
+      .raddr = raddr,
       .len = len,
       .buffer_id = buffer_id,
       .major_order = static_cast<uint8_t>(major_order),
@@ -895,9 +896,9 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
       layer_idx == -1 ? 0xFFFF'FFFF : static_cast<uint32_t>(layer_idx);
   if (num_blocks == 0) {
     return std::vector<lib::Request>{BuildBlockRequest(
-        socket_opcode, /*laddr=*/nullptr, /*len=*/0, /*count_or_size=*/0,
-        /*request_id=*/0, uuid, /*buffer_id=*/0, parallelism, major_order,
-        remote_id, local_id, /*stream_idx=*/0)};
+        socket_opcode, /*laddr=*/nullptr, /*raddr=*/nullptr, /*len=*/0,
+        /*count_or_size=*/0, /*request_id=*/0, uuid, /*buffer_id=*/0,
+        parallelism, major_order, remote_id, local_id, /*stream_idx=*/0)};
   }
 
   std::vector<int> target_layers;
@@ -951,9 +952,9 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
                                      static_cast<uint32_t>(sh);
           for (const auto& chunk : chunks) {
             requests.push_back(BuildBlockRequest(
-                socket_opcode, chunk.ptr, chunk.size, count_or_size, request_id,
-                uuid, buffer_id, parallelism, major_order, remote_id, local_id,
-                /*stream_idx=*/i));
+                socket_opcode, chunk.ptr, chunk.raddr, chunk.size,
+                count_or_size, request_id, uuid, buffer_id, parallelism,
+                major_order, remote_id, local_id, /*stream_idx=*/i));
           }
           ++request_id;
           return absl::OkStatus();
@@ -1099,9 +1100,10 @@ BlockTransport::BuildBlockPullRequests(
                            : nullptr;
             }
             requests.push_back(BuildBlockRequest(
-                /*socket_opcode=*/2, bc.ptr, bc.size, count_or_size, request_id,
-                uuid, buffer_id, parallelism, major_order, remote_id, local_id,
-                /*stream_idx=*/i, on_block_received));
+                /*socket_opcode=*/2, bc.ptr, /*raddr=*/nullptr, bc.size,
+                count_or_size, request_id, uuid, buffer_id, parallelism,
+                major_order, remote_id, local_id, /*stream_idx=*/i,
+                on_block_received));
           }
           ++request_id;
           return absl::OkStatus();

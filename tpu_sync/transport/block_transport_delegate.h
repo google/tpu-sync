@@ -39,6 +39,9 @@ struct BlockChunk {
   uint8_t* ptr;
   // Length of this memory chunk in bytes.
   size_t size;
+  // Remote address of this chunk when the receiver's layout is known;
+  // nullptr otherwise.
+  uint8_t* raddr = nullptr;
 };
 
 // Receiver-side expectation contract for one plan-declared (pool-keyed)

@@ -24,8 +24,8 @@
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
+#include "tpu_sync/common/control_pipe/control_pipe_client.h"
 #include "tpu_sync/common/raiden_id.h"
-#include "tpu_sync/kv_cache/reshard/framed_rpc.h"
 #include "tpu_sync/kv_cache/reshard/pool_reshard_planner.h"
 #include "tpu_sync/kv_cache/reshard/request_block_registry.h"
 #include "tpu_sync/kv_cache/reshard/work_unit_directory.h"
@@ -41,15 +41,13 @@ namespace reshard {
 
 // The per-target StartTransferRequest (sender gets its own schedule under
 // key 0; the receiver gets every source's schedule keyed by source
-// ordinal). Split out of EncodeStartTransfer so controller delivery compiles
-// the same proto object the framed wire would carry.
+// ordinal).
 tpu_sync::rpc::StartTransferRequest BuildStartTransferForTarget(
     const PoolReshardPlan& plan, const RaidenId& target);
 
-// Wire encoder: the pool-path port of WorkerRpcClient._encode_start_transfer.
-// Builds the framed ControlRequest payload for one target unit.
-std::string EncodeStartTransfer(const PoolReshardPlan& plan,
-                                const RaidenId& target);
+// Builds the ControlRequest proto for one target unit.
+tpu_sync::rpc::ControlRequest BuildStartTransferControlRequest(
+    const PoolReshardPlan& plan, const RaidenId& target);
 
 // Selects worker delivery. kFramed sends framed TCP requests directly to each
 // worker. kController routes sender programs through the local
@@ -93,8 +91,7 @@ struct PoolReshardArgs {
 class ReshardCoordinator {
  public:
   ReshardCoordinator(WorkUnitDirectory* directory,
-                     RequestBlockRegistry* registry,
-                     FramedTransport* transport,
+                     RequestBlockRegistry* registry, ControlPipeClient* client,
                      WorkerDelivery delivery = WorkerDelivery{});
 
   // GetTransferStatusResponse::Status values.
@@ -117,9 +114,14 @@ class ReshardCoordinator {
   absl::StatusOr<std::vector<tpu_sync::rpc::RegisterWorkUnitRequest>>
   QueryRemoteMetadata(const std::string& address);
 
+  // Sends one worker RPC via client_ and applies
+  // WorkerRpcClient._verify_response.
+  absl::Status SendWorkerRpc(const std::string& address,
+                             const tpu_sync::rpc::ControlRequest& request);
+
   WorkUnitDirectory* directory_;
   RequestBlockRegistry* registry_;
-  FramedTransport* transport_;
+  ControlPipeClient* client_;
   WorkerDelivery delivery_;
 
   mutable absl::Mutex status_mu_;

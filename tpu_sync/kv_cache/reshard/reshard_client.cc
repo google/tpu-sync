@@ -25,8 +25,9 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
+#include "tpu_sync/common/control_pipe/control_pipe_client.h"
 #include "tpu_sync/common/raiden_id.h"
-#include "tpu_sync/kv_cache/reshard/framed_rpc.h"
+#include "tpu_sync/kv_cache/reshard/reshard_control_pipe.h"
 #include "tpu_sync/rpc/controller_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
@@ -50,13 +51,13 @@ tpu_sync::rpc::RaidenIdProto RaidenIdProtoOf(const RaidenId& unit) {
 
 }  // namespace
 
-ReshardClient::ReshardClient(std::string address, FramedTransport* transport)
+ReshardClient::ReshardClient(std::string address, ControlPipeClient* client)
     : address_(std::move(address)) {
-  if (transport == nullptr) {
-    owned_transport_ = std::make_unique<SocketFramedTransport>();
-    transport_ = owned_transport_.get();
+  if (client == nullptr) {
+    owned_client_ = CreateReshardControlPipeClient();
+    client_ = owned_client_.get();
   } else {
-    transport_ = transport;
+    client_ = client;
   }
 }
 
@@ -277,34 +278,30 @@ tpu_sync::rpc::ControlRequest ReshardClient::BuildShutdown() {
 
 absl::StatusOr<tpu_sync::rpc::ControllerResponse> ReshardClient::CallController(
     const tpu_sync::rpc::ControllerRequest& request) {
-  absl::StatusOr<std::string> body =
-      transport_->Call(address_, request.SerializeAsString(), kCallTimeout);
-  if (!body.ok()) return body.status();
-  tpu_sync::rpc::ControllerResponse response;
-  if (!response.ParseFromString(*body)) {
-    return absl::InternalError("Failed to parse ControllerResponse");
-  }
-  if (!response.success()) {
+  absl::StatusOr<tpu_sync::rpc::ControllerResponse> response =
+      CallReshardControlPipe<tpu_sync::rpc::ControllerRequest,
+                             tpu_sync::rpc::ControllerResponse>(
+          client_, address_, request, kCallTimeout);
+  if (!response.ok()) return response.status();
+  if (!response->success()) {
     // Verbatim facade text: the connector's bounded retry substring-matches
     // the embedded server message.
     return absl::InternalError(absl::StrCat(
-        "Remote Controller Server execution failed: ", response.message()));
+        "Remote Controller Server execution failed: ", response->message()));
   }
   return response;
 }
 
 absl::StatusOr<tpu_sync::rpc::ControlResponse> ReshardClient::CallRaiden(
     const tpu_sync::rpc::ControlRequest& request) {
-  absl::StatusOr<std::string> body =
-      transport_->Call(address_, request.SerializeAsString(), kCallTimeout);
-  if (!body.ok()) return body.status();
-  tpu_sync::rpc::ControlResponse response;
-  if (!response.ParseFromString(*body)) {
-    return absl::InternalError("Failed to parse ControlResponse");
-  }
-  if (!response.success()) {
+  absl::StatusOr<tpu_sync::rpc::ControlResponse> response =
+      CallReshardControlPipe<tpu_sync::rpc::ControlRequest,
+                             tpu_sync::rpc::ControlResponse>(
+          client_, address_, request, kCallTimeout);
+  if (!response.ok()) return response.status();
+  if (!response->success()) {
     return absl::InternalError(absl::StrCat(
-        "Remote Controller Server execution failed: ", response.message()));
+        "Remote Controller Server execution failed: ", response->message()));
   }
   return response;
 }

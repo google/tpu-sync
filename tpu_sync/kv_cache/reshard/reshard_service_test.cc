@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -24,15 +25,20 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
+#include "tpu_sync/common/control_pipe/control_pipe_client.h"
+#include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/reshard/declaration_types.h"
-#include "tpu_sync/kv_cache/reshard/framed_rpc.h"
 #include "tpu_sync/kv_cache/reshard/request_block_registry.h"
+#include "tpu_sync/kv_cache/reshard/reshard_client.h"
+#include "tpu_sync/kv_cache/reshard/reshard_control_pipe.h"
+#include "tpu_sync/proto/control_pipe.pb.h"
 #include "tpu_sync/rpc/controller_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
@@ -82,24 +88,34 @@ tpu_sync::rpc::PoolSpecProto MakePool(const std::string& tag, int64_t live,
 }
 
 // Captures worker payloads instead of dialing sockets.
-class FakeTransport final : public FramedTransport {
+class FakeTransport final : public ControlPipeClient {
  public:
-  absl::StatusOr<std::string> Call(absl::string_view address,
-                                   absl::string_view payload,
-                                   absl::Duration /*timeout*/) override {
+  absl::StatusOr<control_pipe::proto::ControlResponseEnvelope> SendRaw(
+      absl::string_view endpoint,
+      const control_pipe::proto::ControlEnvelope& envelope,
+      absl::Duration /*timeout*/) override {
     {
       absl::MutexLock lock(mu_);
-      calls_.emplace_back(std::string(address), std::string(payload));
+      calls_.emplace_back(std::string(endpoint), envelope.payload());
     }
-    if (fail_addr_ == address) {
+    control_pipe::proto::ControlResponseEnvelope resp_env;
+    resp_env.set_request_id(envelope.request_id());
+    resp_env.set_status_code(0);
+    if (fail_addr_ == endpoint) {
       tpu_sync::rpc::ControlResponse failed;
       failed.set_success(false);
       failed.set_message("injected arm refusal");
-      return failed.SerializeAsString();
+      resp_env.set_payload(failed.SerializeAsString());
+      return resp_env;
     }
     tpu_sync::rpc::ControlResponse ok;
     ok.set_success(true);
-    return ok.SerializeAsString();
+    resp_env.set_payload(ok.SerializeAsString());
+    return resp_env;
+  }
+
+  ControlPipeBackendType backend_type() const override {
+    return ControlPipeBackendType::kTcp;
   }
 
   void FailFor(const std::string& addr) { fail_addr_ = addr; }
@@ -114,7 +130,7 @@ class ReshardStackTest : public ::testing::Test {
   ReshardStackTest() {
     ReshardService::Options options;
     options.port = 0;
-    options.transport = &transport_;
+    options.client = &transport_;
     options.clock = [this]() { return now_; };
     service_ = std::make_unique<ReshardService>(options);
   }
@@ -194,8 +210,8 @@ class ReshardStackTest : public ::testing::Test {
     span->set_count(1);
     entry->set_declared_bytes(size);
     entry->set_dst_space_version(dst_space_version);
-    tpu_sync::rpc::ControllerResponse resp;
-    resp.ParseFromString(service_->HandleFrame(req.SerializeAsString()));
+    tpu_sync::rpc::ControllerResponse resp =
+        service_->HandleControllerCommand(req);
     ASSERT_TRUE(resp.success()) << resp.message();
   }
 
@@ -238,8 +254,8 @@ class ReshardStackTest : public ::testing::Test {
     }
     entry->set_declared_bytes(declared);
     entry->set_dst_space_version(1);
-    tpu_sync::rpc::ControllerResponse resp;
-    resp.ParseFromString(service_->HandleFrame(req.SerializeAsString()));
+    tpu_sync::rpc::ControllerResponse resp =
+        service_->HandleControllerCommand(req);
     ASSERT_TRUE(resp.success()) << resp.message();
   }
 
@@ -345,18 +361,75 @@ class ReshardStackTest : public ::testing::Test {
   std::unique_ptr<ReshardService> service_;
 };
 
-TEST(FramedRpcTest, LoopbackRoundTrip) {
-  FramedServer server(0, [](const std::string& request) {
-    return absl::StrCat("echo:", request);
-  });
-  ASSERT_TRUE(server.Bind().ok());
-  server.Start();
-  SocketFramedTransport transport;
-  auto response = transport.Call(absl::StrCat("127.0.0.1:", server.port()),
-                                 "hello", absl::Seconds(5));
-  ASSERT_TRUE(response.ok()) << response.status();
-  EXPECT_EQ(*response, "echo:hello");
-  server.Stop();
+TEST(ReshardControlPipeTest, TcpBackendRoundTrip) {
+  ReshardService::Options options;
+  options.port = 0;
+  options.backend_type = ControlPipeBackendType::kTcp;
+  ReshardService service(options);
+  ASSERT_TRUE(service.StartServer().ok());
+
+  const std::string addr = absl::StrCat("127.0.0.1:", service.port());
+  std::unique_ptr<ControlPipeClient> client =
+      CreateReshardControlPipeClient(ControlPipeBackendType::kTcp);
+  ReshardClient reshard_client(addr, client.get());
+
+  RegisterWorkUnitArgs args;
+  args.unit = Unit(0);
+  args.shards = {"10.0.0.1:9000"};
+  args.control_plane_rpc_address = "10.0.0.1:9100";
+  ASSERT_TRUE(reshard_client.RegisterWorkUnit(args).ok());
+
+  auto metadata = reshard_client.GetMetadata();
+  ASSERT_TRUE(metadata.ok()) << metadata.status();
+  EXPECT_EQ(metadata->size(), 1u);
+
+  service.StopServer();
+}
+
+TEST(ReshardControlPipeTest, GrpcBackendEnvVarRoundTrip) {
+  setenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "grpc", 1);
+  auto env_cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND"); });
+  ReshardService::Options options;
+  options.port = 0;
+  ReshardService service(options);
+  ASSERT_TRUE(service.StartServer().ok());
+
+  const std::string addr = absl::StrCat("127.0.0.1:", service.port());
+  ReshardClient reshard_client(addr);
+
+  RegisterWorkUnitArgs args;
+  args.unit = Unit(0);
+  args.shards = {"10.0.0.1:9000"};
+  args.control_plane_rpc_address = "10.0.0.1:9100";
+  ASSERT_TRUE(reshard_client.RegisterWorkUnit(args).ok());
+
+  auto metadata = reshard_client.GetMetadata();
+  ASSERT_TRUE(metadata.ok()) << metadata.status();
+  EXPECT_EQ(metadata->size(), 1u);
+
+  service.StopServer();
+}
+
+TEST(ReshardControlPipeTest, ZmqBackendRoundTrip) {
+  ReshardService::Options options;
+  options.port = 0;
+  options.backend_type = ControlPipeBackendType::kZmq;
+  ReshardService service(options);
+  ASSERT_TRUE(service.StartServer().ok());
+
+  const std::string addr = absl::StrCat("127.0.0.1:", service.port());
+  std::unique_ptr<ControlPipeClient> client =
+      CreateReshardControlPipeClient(ControlPipeBackendType::kZmq);
+  ReshardClient reshard_client(addr, client.get());
+
+  RegisterWorkUnitArgs args;
+  args.unit = Unit(0);
+  args.shards = {"10.0.0.1:9000"};
+  args.control_plane_rpc_address = "10.0.0.1:9100";
+  ASSERT_TRUE(reshard_client.RegisterWorkUnit(args).ok());
+
+  service.StopServer();
 }
 
 TEST_F(ReshardStackTest, FullPoolReshardFlowEmitsArmThenDispatch) {

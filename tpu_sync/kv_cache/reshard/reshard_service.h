@@ -17,12 +17,15 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
 #include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
-#include "tpu_sync/kv_cache/reshard/framed_rpc.h"
+#include "tpu_sync/common/control_pipe/control_pipe_client.h"
+#include "tpu_sync/common/control_pipe/control_pipe_server.h"
+#include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/kv_cache/reshard/request_block_registry.h"
 #include "tpu_sync/kv_cache/reshard/reshard_coordinator.h"
 #include "tpu_sync/kv_cache/reshard/work_unit_directory.h"
@@ -34,17 +37,18 @@ namespace reshard {
 
 // The aggregate reshard control plane: owns the work-unit
 // directory, request-block registry, planner (stateless), and coordinator,
-// and speaks RaidenControllerServer's framed ControllerRequest /
-// ControlRequest surface verbatim. Owned by KVCacheStore (thin-store
-// sidecar mode or co-hosted with a full store); constructible standalone
-// for tests and replay.
+// and serves RaidenControllerServer's ControllerRequest / ControlRequest
+// surface over ControlPipeServer (supporting TCP, gRPC, and ZMQ via
+// `TPU_RAIDEN_CONTROL_PLANE_BACKEND`).
 class ReshardService {
  public:
   struct Options {
     int port = 0;
     double request_registry_ttl_s = 600.0;
-    // Injectable for replay/tests; defaults to the socket transport.
-    FramedTransport* transport = nullptr;
+    // Injectable for unit tests; defaults to a ControlPipeClient resolved from
+    // `backend_type` / `TPU_RAIDEN_CONTROL_PLANE_BACKEND`.
+    ControlPipeClient* client = nullptr;
+    std::optional<ControlPipeBackendType> backend_type = std::nullopt;
     RequestBlockRegistry::Clock clock;  // defaults to steady_clock seconds
     WorkerDelivery delivery = WorkerDelivery{};
   };
@@ -55,17 +59,21 @@ class ReshardService {
   ReshardService(const ReshardService&) = delete;
   ReshardService& operator=(const ReshardService&) = delete;
 
-  // One framed exchange: raw request body in, raw response body out. The
-  // socket server and the replay harness both drive this entry point
-  // (RaidenControllerServer._handle_conn's dual-parse dispatch).
+  // Strongly-typed control-plane handlers used by ControlPipeServer.
+  tpu_sync::rpc::ControllerResponse HandleControllerCommand(
+      const tpu_sync::rpc::ControllerRequest& req);
+  tpu_sync::rpc::ControlResponse HandleRaidenCommand(
+      const tpu_sync::rpc::ControlRequest& req);
+
+  // Legacy raw frame fallback (raw request body in, raw response body out).
   std::string HandleFrame(const std::string& request_bytes);
 
-  // Framed-TCP hosting (sidecar mode).
+  // ControlPipeServer hosting (sidecar mode).
   absl::Status StartServer();
   void StopServer();
   int port() const;
   // TTL (seconds) of unclaimed request-block registrations, as configured
-  //  through Options.
+  // through Options.
   double request_registry_ttl_s() const { return request_registry_ttl_s_; }
 
   // Set before StartServer(): invoked when a COMMAND_SHUTDOWN arrives (the
@@ -79,20 +87,18 @@ class ReshardService {
   ReshardCoordinator* coordinator() { return coordinator_.get(); }
 
  private:
-  std::string HandleControllerCommand(
-      const tpu_sync::rpc::ControllerRequest& req);
-  std::string HandleRaidenCommand(const std::string& request_bytes);
-  std::string HandleRaidenStartTransfer(
+  tpu_sync::rpc::ControlResponse HandleRaidenStartTransfer(
       const tpu_sync::rpc::ControlRequest& req);
 
   absl::Mutex state_mu_;  // the controller-wide lock (Python self._lock)
-  std::unique_ptr<SocketFramedTransport> default_transport_;
-  FramedTransport* transport_ = nullptr;  // injected or default
+  std::unique_ptr<ControlPipeClient> default_client_;
+  ControlPipeClient* client_ = nullptr;  // injected or default
+  std::optional<ControlPipeBackendType> backend_type_;
   WorkerDelivery delivery_;
   std::unique_ptr<WorkUnitDirectory> directory_;
   std::unique_ptr<RequestBlockRegistry> registry_;
   std::unique_ptr<ReshardCoordinator> coordinator_;
-  std::unique_ptr<FramedServer> server_;
+  std::unique_ptr<ControlPipeServer> server_;
   std::function<void()> shutdown_callback_;
   int requested_port_ = 0;
   double request_registry_ttl_s_ = 600.0;

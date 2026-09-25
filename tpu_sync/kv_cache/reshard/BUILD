@@ -38,34 +38,18 @@ cc_library(
 )
 
 cc_library(
-    name = "framed_rpc",
-    srcs = ["framed_rpc.cc"],
-    hdrs = ["framed_rpc.h"],
+    name = "reshard_control_pipe",
+    hdrs = ["reshard_control_pipe.h"],
     copts = RESHARD_COPTS,
     features = ["-use_header_modules"],
     deps = [
-        "//tpu_sync/common:detached_thread_group",
-        "@com_google_absl//absl/log",
+        "//tpu_sync/common/control_pipe",
+        "//tpu_sync/common/control_pipe:control_pipe_interfaces",
+        "//tpu_sync/common/control_pipe:control_pipe_types",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
-    ],
-)
-
-cc_test(
-    name = "framed_rpc_test",
-    srcs = ["framed_rpc_test.cc"],
-    copts = RESHARD_COPTS,
-    features = ["-use_header_modules"],
-    deps = [
-        ":framed_rpc",
-        "@com_google_absl//absl/status:status_matchers",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
     ],
 )
 
@@ -133,11 +117,12 @@ cc_library(
     features = ["-use_header_modules"],
     deps = [
         ":declaration_types",
-        ":framed_rpc",
         ":pool_reshard_planner",
         ":request_block_registry",
+        ":reshard_control_pipe",
         ":work_unit_directory",
         "//tpu_sync/common:raiden_id",
+        "//tpu_sync/common/control_pipe:control_pipe_interfaces",
         "//tpu_sync/core:transfer_program_reshard",
         "//tpu_sync/core/controller:raiden_controller",
         "//tpu_sync/proto:transfer_program_cc_proto",
@@ -161,10 +146,14 @@ cc_library(
     features = ["-use_header_modules"],
     deps = [
         ":declaration_types",
-        ":framed_rpc",
         ":request_block_registry",
+        ":reshard_control_pipe",
         ":reshard_coordinator",
         ":work_unit_directory",
+        "//tpu_sync/common/control_pipe",
+        "//tpu_sync/common/control_pipe:control_dispatcher",
+        "//tpu_sync/common/control_pipe:control_pipe_interfaces",
+        "//tpu_sync/common/control_pipe:control_pipe_types",
         "//tpu_sync/core:transfer_program_reshard",
         "//tpu_sync/core/controller:raiden_controller",
         "//tpu_sync/proto:transfer_program_cc_proto",
@@ -172,8 +161,10 @@ cc_library(
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
     ],
 )
 
@@ -203,12 +194,17 @@ cc_test(
     linkstatic = True,
     deps = [
         ":declaration_types",
-        ":framed_rpc",
         ":request_block_registry",
+        ":reshard_client",
+        ":reshard_control_pipe",
         ":reshard_service",
         "//tpu_sync/common:raiden_id",
+        "//tpu_sync/common/control_pipe:control_pipe_interfaces",
+        "//tpu_sync/common/control_pipe:control_pipe_types",
+        "//tpu_sync/proto:control_pipe_cc_proto",
         "//tpu_sync/rpc:controller_service_cc_proto",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
@@ -226,9 +222,9 @@ cc_library(
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
-        ":declaration_types",
-        ":framed_rpc",
+        ":reshard_control_pipe",
         "//tpu_sync/common:raiden_id",
+        "//tpu_sync/common/control_pipe:control_pipe_interfaces",
         "//tpu_sync/rpc:controller_service_cc_proto",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/status",

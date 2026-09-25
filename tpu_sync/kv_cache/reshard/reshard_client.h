@@ -36,9 +36,8 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "tpu_sync/common/control_pipe/control_pipe_client.h"
 #include "tpu_sync/common/raiden_id.h"
-#include "tpu_sync/kv_cache/reshard/declaration_types.h"
-#include "tpu_sync/kv_cache/reshard/framed_rpc.h"
 #include "tpu_sync/rpc/controller_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
@@ -140,11 +139,11 @@ struct StartTransferArgs {
 
 class ReshardClient {
  public:
-  // `transport` is borrowed when non-null (tests); otherwise the client
-  // owns a SocketFramedTransport. Timeout matches the facade's
+  // `client` is borrowed when non-null (tests); otherwise the client
+  // owns a ControlPipeClient. Timeout matches the facade's
   // connect_socket(timeout=300.0) per call.
   explicit ReshardClient(std::string address,
-                         FramedTransport* transport = nullptr);
+                         ControlPipeClient* client = nullptr);
 
   // --- request builders (encoding ownership) ----------------------------
   static tpu_sync::rpc::ControlRequest BuildRegisterWorkUnit(
@@ -199,8 +198,8 @@ class ReshardClient {
       const tpu_sync::rpc::ControlRequest& request);
 
   std::string address_;
-  std::unique_ptr<SocketFramedTransport> owned_transport_;
-  FramedTransport* transport_;
+  std::unique_ptr<ControlPipeClient> owned_client_;
+  ControlPipeClient* client_;
 };
 
 }  // namespace reshard

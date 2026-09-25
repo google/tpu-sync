@@ -24,13 +24,20 @@
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
+#include "tpu_sync/common/control_pipe/control_dispatcher.h"
+#include "tpu_sync/common/control_pipe/control_pipe_client.h"
+#include "tpu_sync/common/control_pipe/control_pipe_server.h"
+#include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/transfer_program_reshard.h"
 #include "tpu_sync/kv_cache/reshard/declaration_types.h"
-#include "tpu_sync/kv_cache/reshard/framed_rpc.h"
 #include "tpu_sync/kv_cache/reshard/request_block_registry.h"
+#include "tpu_sync/kv_cache/reshard/reshard_control_pipe.h"
 #include "tpu_sync/kv_cache/reshard/reshard_coordinator.h"
 #include "tpu_sync/kv_cache/reshard/work_unit_directory.h"
 #include "tpu_sync/proto/transfer_program.pb.h"
@@ -57,34 +64,55 @@ std::string StatusMessage(const absl::Status& status) {
 }  // namespace
 
 ReshardService::ReshardService(const Options& options)
-    : delivery_(options.delivery),
+    : backend_type_(options.backend_type),
+      delivery_(options.delivery),
       requested_port_(options.port),
       request_registry_ttl_s_(options.request_registry_ttl_s) {
-  FramedTransport* transport = options.transport;
-  if (transport == nullptr) {
-    default_transport_ = std::make_unique<SocketFramedTransport>();
-    transport = default_transport_.get();
+  ControlPipeClient* client = options.client;
+  if (client == nullptr) {
+    default_client_ = CreateReshardControlPipeClient(backend_type_);
+    client = default_client_.get();
   }
-  transport_ = transport;
+  client_ = client;
   directory_ = std::make_unique<WorkUnitDirectory>(&state_mu_);
   RequestBlockRegistry::Clock clock = options.clock;
   if (!clock) clock = SteadyClockSeconds;
   registry_ = std::make_unique<RequestBlockRegistry>(
       directory_.get(), options.request_registry_ttl_s, std::move(clock));
   coordinator_ = std::make_unique<ReshardCoordinator>(
-      directory_.get(), registry_.get(), transport, delivery_);
+      directory_.get(), registry_.get(), client_, delivery_);
 }
 
 ReshardService::~ReshardService() { StopServer(); }
 
 absl::Status ReshardService::StartServer() {
-  server_ = std::make_unique<FramedServer>(
-      requested_port_,
-      [this](const std::string& request) { return HandleFrame(request); });
-  absl::Status bound = server_->Bind();
-  if (!bound.ok()) return bound;
-  server_->Start();
-  return absl::OkStatus();
+  ControlPipeConfig cfg;
+  cfg.backend_type = ResolveControlPipeBackendType(backend_type_);
+  cfg.requested_port = requested_port_;
+
+  server_ = CreateControlPipeServer(cfg);
+  server_->dispatcher()
+      .RegisterHandler<tpu_sync::rpc::ControllerRequest,
+                       tpu_sync::rpc::ControllerResponse>(
+          [this](const ControlContext& /*ctx*/,
+                 const tpu_sync::rpc::ControllerRequest& req)
+              -> absl::StatusOr<tpu_sync::rpc::ControllerResponse> {
+            return HandleControllerCommand(req);
+          },
+          HandlerOptions<tpu_sync::rpc::ControllerRequest>()
+              .WithMaxPayloadBytes(cfg.max_frame_bytes));
+  // ControlRequest is registered via HandleFrame so both typed ControlRequest
+  // envelopes and Mode 3 legacy 4B raw frames (which TcpControlPipeServer
+  // routes under ControlRequest's type tag) work seamlessly.
+  server_->dispatcher().RegisterRawHandler(
+      ::tpu_sync::rpc::ControlRequest::descriptor()->full_name(),
+      [this](const ControlContext& /*ctx*/,
+             absl::string_view req_bytes) -> absl::StatusOr<std::string> {
+        return HandleFrame(std::string(req_bytes));
+      },
+      cfg.max_frame_bytes);
+
+  return server_->Start(requested_port_).status();
 }
 
 void ReshardService::StopServer() {
@@ -92,7 +120,7 @@ void ReshardService::StopServer() {
 }
 
 int ReshardService::port() const {
-  return server_ != nullptr ? server_->port() : requested_port_;
+  return server_ != nullptr ? server_->bound_port() : requested_port_;
 }
 
 std::string ReshardService::HandleFrame(const std::string& request_bytes) {
@@ -124,12 +152,19 @@ std::string ReshardService::HandleFrame(const std::string& request_bytes) {
            tpu_sync::rpc::ControllerRequest::COMMAND_GET_REQUEST_BLOCK_STATUS &&
        req.has_get_request_block_status_request());
   if (is_controller_command) {
-    return HandleControllerCommand(req);
+    return HandleControllerCommand(req).SerializeAsString();
   }
-  return HandleRaidenCommand(request_bytes);
+  tpu_sync::rpc::ControlRequest raiden_req;
+  if (!raiden_req.ParseFromString(request_bytes)) {
+    tpu_sync::rpc::ControlResponse raiden_resp;
+    raiden_resp.set_success(false);
+    raiden_resp.set_message("Failed to parse ControlRequest");
+    return raiden_resp.SerializeAsString();
+  }
+  return HandleRaidenCommand(raiden_req).SerializeAsString();
 }
 
-std::string ReshardService::HandleControllerCommand(
+tpu_sync::rpc::ControllerResponse ReshardService::HandleControllerCommand(
     const tpu_sync::rpc::ControllerRequest& req) {
   tpu_sync::rpc::ControllerResponse resp;
   resp.set_success(false);
@@ -312,18 +347,13 @@ std::string ReshardService::HandleControllerCommand(
       resp.set_message("COMMAND_UNSPECIFIED");
       break;
   }
-  return resp.SerializeAsString();
+  return resp;
 }
 
-std::string ReshardService::HandleRaidenCommand(
-    const std::string& request_bytes) {
-  tpu_sync::rpc::ControlRequest raiden_req;
+tpu_sync::rpc::ControlResponse ReshardService::HandleRaidenCommand(
+    const tpu_sync::rpc::ControlRequest& raiden_req) {
   tpu_sync::rpc::ControlResponse raiden_resp;
   raiden_resp.set_success(false);
-  if (!raiden_req.ParseFromString(request_bytes)) {
-    raiden_resp.set_message("Failed to parse ControlRequest");
-    return raiden_resp.SerializeAsString();
-  }
 
   switch (raiden_req.command()) {
     case tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT: {
@@ -422,9 +452,10 @@ std::string ReshardService::HandleRaidenCommand(
       }
       tpu_sync::rpc::ControlRequest shutdown_req;
       shutdown_req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_SHUTDOWN);
-      const std::string payload = shutdown_req.SerializeAsString();
       for (const std::string& address : addresses) {
-        transport_->Call(address, payload, absl::Seconds(5))
+        CallReshardControlPipe<tpu_sync::rpc::ControlRequest,
+                               tpu_sync::rpc::ControlResponse>(
+            client_, address, shutdown_req, absl::Seconds(5))
             .status()
             .IgnoreError();
       }
@@ -436,10 +467,10 @@ std::string ReshardService::HandleRaidenCommand(
       raiden_resp.set_message("COMMAND_UNSPECIFIED");
       break;
   }
-  return raiden_resp.SerializeAsString();
+  return raiden_resp;
 }
 
-std::string ReshardService::HandleRaidenStartTransfer(
+tpu_sync::rpc::ControlResponse ReshardService::HandleRaidenStartTransfer(
     const tpu_sync::rpc::ControlRequest& req) {
   tpu_sync::rpc::ControlResponse resp;
   resp.set_success(false);
@@ -448,17 +479,17 @@ std::string ReshardService::HandleRaidenStartTransfer(
     // controller is not the destination for it.
     resp.set_message(
         "START_TRANSFER is handled by worker listeners in framed mode");
-    return resp.SerializeAsString();
+    return resp;
   }
   if (delivery_.controller == nullptr) {
     resp.set_message("ReshardService has no RaidenController configured");
-    return resp.SerializeAsString();
+    return resp;
   }
   const auto& start_req = req.start_transfer_request();
   auto compiled = core::CompileStartTransfer(start_req);
   if (!compiled.ok()) {
     resp.set_message(StatusMessage(compiled.status()));
-    return resp.SerializeAsString();
+    return resp;
   }
   // The receiver arm's destination unit names the worker to target.
   // In single-host deployments this is worker_<transfer_rank> (defaulting
@@ -475,11 +506,11 @@ std::string ReshardService::HandleRaidenStartTransfer(
       delivery_.controller->SubmitTransferProgram(worker_id, *compiled).Await();
   if (!submit_resp.ok()) {
     resp.set_message(StatusMessage(submit_resp.status()));
-    return resp.SerializeAsString();
+    return resp;
   }
   resp.set_success(submit_resp->success());
   resp.set_message(submit_resp->message());
-  return resp.SerializeAsString();
+  return resp;
 }
 
 }  // namespace reshard

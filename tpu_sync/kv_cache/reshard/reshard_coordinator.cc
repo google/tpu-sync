@@ -32,13 +32,14 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/common/control_pipe/control_pipe_client.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/transfer_program_reshard.h"
 #include "tpu_sync/kv_cache/reshard/declaration_types.h"
-#include "tpu_sync/kv_cache/reshard/framed_rpc.h"
 #include "tpu_sync/kv_cache/reshard/pool_reshard_planner.h"
 #include "tpu_sync/kv_cache/reshard/request_block_registry.h"
+#include "tpu_sync/kv_cache/reshard/reshard_control_pipe.h"
 #include "tpu_sync/kv_cache/reshard/work_unit_directory.h"
 #include "tpu_sync/proto/transfer_program.pb.h"
 
@@ -84,24 +85,6 @@ std::string JsonFloat(double value) {
   char buf[64];
   std::snprintf(buf, sizeof(buf), "%.6f", value);
   return buf;
-}
-
-// Sends one framed worker RPC and applies WorkerRpcClient._verify_response.
-absl::Status SendWorkerRpc(FramedTransport* transport,
-                           const std::string& address,
-                           const std::string& payload) {
-  auto response = transport->Call(address, payload, kWorkerRpcTimeout);
-  if (!response.ok()) return response.status();
-  tpu_sync::rpc::ControlResponse resp;
-  if (!resp.ParseFromString(*response)) {
-    return absl::InternalError(
-        "Failed to parse worker ControlResponse payload");
-  }
-  if (!resp.success()) {
-    return absl::InternalError(absl::StrCat(
-        "Raiden remote native execution failed: ", resp.message()));
-  }
-  return absl::OkStatus();
 }
 
 }  // namespace
@@ -224,8 +207,8 @@ tpu_sync::rpc::StartTransferRequest BuildStartTransferForTarget(
   return start_req;
 }
 
-std::string EncodeStartTransfer(const PoolReshardPlan& plan,
-                                const RaidenId& target) {
+tpu_sync::rpc::ControlRequest BuildStartTransferControlRequest(
+    const PoolReshardPlan& plan, const RaidenId& target) {
   tpu_sync::rpc::ControlRequest req;
   req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_START_TRANSFER);
   // peers: the destination units' data endpoints (one dst, one endpoint).
@@ -234,38 +217,47 @@ std::string EncodeStartTransfer(const PoolReshardPlan& plan,
   }
   *req.mutable_start_transfer_request() =
       BuildStartTransferForTarget(plan, target);
-  return req.SerializeAsString();
+  return req;
 }
 
 ReshardCoordinator::ReshardCoordinator(WorkUnitDirectory* directory,
                                        RequestBlockRegistry* registry,
-                                       FramedTransport* transport,
+                                       ControlPipeClient* client,
                                        WorkerDelivery delivery)
     : directory_(directory),
       registry_(registry),
-      transport_(transport),
+      client_(client),
       delivery_(delivery) {}
 
 absl::StatusOr<std::vector<tpu_sync::rpc::RegisterWorkUnitRequest>>
 ReshardCoordinator::QueryRemoteMetadata(const std::string& address) {
   tpu_sync::rpc::ControlRequest req;
   req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_GET_METADATA);
-  auto response =
-      transport_->Call(address, req.SerializeAsString(), kWorkerRpcTimeout);
-  if (!response.ok()) return response.status();
-  tpu_sync::rpc::ControlResponse resp;
-  if (!resp.ParseFromString(*response)) {
+  auto resp = CallReshardControlPipe<tpu_sync::rpc::ControlRequest,
+                                     tpu_sync::rpc::ControlResponse>(
+      client_, address, req, kWorkerRpcTimeout);
+  if (!resp.ok()) return resp.status();
+  if (!resp->success()) {
     return absl::InternalError(
-        "Failed to parse remote metadata ControlResponse");
-  }
-  if (!resp.success()) {
-    return absl::InternalError(
-        absl::StrCat("Failed to query remote metadata: ", resp.message()));
+        absl::StrCat("Failed to query remote metadata: ", resp->message()));
   }
   std::vector<tpu_sync::rpc::RegisterWorkUnitRequest> metadata(
-      resp.get_metadata_response().metadata().begin(),
-      resp.get_metadata_response().metadata().end());
+      resp->get_metadata_response().metadata().begin(),
+      resp->get_metadata_response().metadata().end());
   return metadata;
+}
+
+absl::Status ReshardCoordinator::SendWorkerRpc(
+    const std::string& address, const tpu_sync::rpc::ControlRequest& request) {
+  auto resp = CallReshardControlPipe<tpu_sync::rpc::ControlRequest,
+                                     tpu_sync::rpc::ControlResponse>(
+      client_, address, request, kWorkerRpcTimeout);
+  if (!resp.ok()) return resp.status();
+  if (!resp->success()) {
+    return absl::InternalError(absl::StrCat(
+        "Raiden remote native execution failed: ", resp->message()));
+  }
+  return absl::OkStatus();
 }
 
 absl::Status ReshardCoordinator::StartPoolReshard(const PoolReshardArgs& args) {
@@ -396,8 +388,8 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
               "No control endpoint recorded for ", PythonRepr(unit)));
           return;
         }
-        const std::string arm_payload = EncodeStartTransfer(plan, unit);
-        arm_status[i] = SendWorkerRpc(transport_, addr_it->second, arm_payload);
+        arm_status[i] = SendWorkerRpc(
+            addr_it->second, BuildStartTransferControlRequest(plan, unit));
       });
     }
     for (std::thread& t : armers) t.join();
@@ -465,8 +457,8 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
               "No control endpoint recorded for ", PythonRepr(unit)));
           return;
         }
-        const std::string payload = EncodeStartTransfer(plan, unit);
-        sender_status[i] = SendWorkerRpc(transport_, addr_it->second, payload);
+        sender_status[i] = SendWorkerRpc(
+            addr_it->second, BuildStartTransferControlRequest(plan, unit));
       });
     }
     for (std::thread& t : senders) t.join();

@@ -282,7 +282,10 @@ nanobind_extension(
     features = [
         "-use_header_modules",
     ],
-    tags = ["manual"],
+    tags = [
+        "manual",
+        "nobuilder",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         ":weight_synchronizer_ffi",
@@ -629,12 +632,17 @@ py_test(
 py_library(
     name = "weight_synchronizer_ffi_py",
     srcs = ["weight_synchronizer_ffi.py"],
+    tags = [
+        "manual",
+        "nobuilder",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         ":_weight_synchronizer_ffi",
         ":jax_test_utils",
         "@jax//jax",
         "@jax//jax/experimental:compute_on",
+        "@jax//jax/experimental:xla_metadata",
         "@pypi//numpy",
     ],
 )
@@ -781,6 +789,7 @@ py_test(
     ],
     deps = [
         ":resharding_planner",
+        ":weight_synchronizer_ffi_py",
         "//tpu_sync/api/jax:weight_synchronizer_jax_py",
         "//tpu_sync/rpc:raiden_controller",
         "//tpu_sync/rpc:raiden_service_py_pb2",

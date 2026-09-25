@@ -15,14 +15,18 @@
 """JAX bindings for WeightSynchronizer FFI, enabling host/device weight synchronization."""
 
 import math
+import os
 
 import jax
 from jax.experimental import compute_on
+from jax.experimental import xla_metadata
 import jax.numpy as jnp
 import numpy as np
 
 from tpu_sync.frameworks.jax import _weight_synchronizer_ffi
 from tpu_sync.frameworks.jax import utils
+
+_DIRECT_DEVICE_BUFFER_ENV = "RAIDEN_FFI_USE_DIRECT_DEVICE_BUFFER"
 
 _orig_compute_on = compute_on.compute_on
 
@@ -39,6 +43,12 @@ def _compat_compute_on(f=None, *, compute_type="device_host", **kwargs):
 
 
 compute_on.compute_on = _compat_compute_on
+
+
+def _use_direct_device_buffer() -> bool:
+  """Returns whether zero-copy direct device buffer mode is enabled."""
+  val = os.environ.get(_DIRECT_DEVICE_BUFFER_ENV, "0").strip().lower()
+  return val in ("1", "true", "yes", "on")
 
 
 def _prepare_shard_info(
@@ -182,6 +192,11 @@ def init_weight_synchronizer(
   shard_info = _prepare_shard_info(
       shard_idx, mesh, num_shards, host_subgrid=host_subgrid
   )
+  ffi_name = (
+      "raiden_weight_synchronizer_create"
+      if _use_direct_device_buffer()
+      else "init_weight_synchronizer"
+  )
 
   @compute_on.compute_on(
       compute_type="device_host", out_memory_spaces=jax.memory.Space.Device
@@ -191,7 +206,7 @@ def init_weight_synchronizer(
     out_dim = 6 if listener_port >= 0 else 5
     out_shape = tuple([1] * len(axis_names)) + (out_dim,)
     return jax.ffi.ffi_call(
-        "init_weight_synchronizer",
+        ffi_name,
         jax.ShapeDtypeStruct(out_shape, jnp.int32),
         has_side_effect=True,
     )(
@@ -205,17 +220,27 @@ def init_weight_synchronizer(
         num_shards=np.int32(num_shards),
     )
 
+  def _shard_init(anchor, s_idx, sizes):
+    if _use_direct_device_buffer():
+      anchor = anchor.reshape(-1).view(jnp.uint32)
+      one = jax.lax.optimization_barrier(jnp.ones_like(anchor))
+      with xla_metadata.set_xla_metadata(_xla_device_buffer="true"):
+        anchor = jax.lax.mul(anchor, one)
+    return _local_init(anchor, s_idx, sizes)
+
   axis_names = mesh.axis_names
   anchor_spec = device_array.sharding.spec
   index_spec = jax.sharding.PartitionSpec(*axis_names, None)
   sizes_spec = jax.sharding.PartitionSpec(None)
   out_spec = jax.sharding.PartitionSpec(*axis_names, None)
 
-  return jax.shard_map(
-      _local_init,
-      mesh=mesh,
-      in_specs=(anchor_spec, index_spec, sizes_spec),
-      out_specs=out_spec,
+  return jax.jit(
+      jax.shard_map(
+          _shard_init,
+          mesh=mesh,
+          in_specs=(anchor_spec, index_spec, sizes_spec),
+          out_specs=out_spec,
+      )
   )(device_array, shard_info, slice_byte_sizes)
 
 
@@ -260,6 +285,11 @@ def init_weight_synchronizer_and_d2h(
   shard_info = _prepare_shard_info(
       shard_idx, mesh, num_shards, host_subgrid=host_subgrid
   )
+  ffi_name = (
+      "raiden_weight_synchronizer_create_and_d2h"
+      if _use_direct_device_buffer()
+      else "init_weight_synchronizer_and_d2h"
+  )
 
   @compute_on.compute_on(
       compute_type="device_host", out_memory_spaces=jax.memory.Space.Device
@@ -269,7 +299,7 @@ def init_weight_synchronizer_and_d2h(
     out_dim = 6 if listener_port >= 0 else 5
     out_shape = tuple([1] * len(axis_names)) + (out_dim,)
     return jax.ffi.ffi_call(
-        "init_weight_synchronizer_and_d2h",
+        ffi_name,
         jax.ShapeDtypeStruct(out_shape, jnp.int32),
         has_side_effect=True,
     )(
@@ -283,6 +313,18 @@ def init_weight_synchronizer_and_d2h(
         num_shards=np.int32(num_shards),
     )
 
+  def _shard_init_and_d2h(s_idx, sizes, *anchors):
+    if _use_direct_device_buffer():
+      tagged_anchors = []
+      for a in anchors:
+        a = a.reshape(-1).view(jnp.uint32)
+        one = jax.lax.optimization_barrier(jnp.ones_like(a))
+        with xla_metadata.set_xla_metadata(_xla_device_buffer="true"):
+          a = jax.lax.mul(a, one)
+        tagged_anchors.append(a)
+      anchors = tagged_anchors
+    return _local_init_and_d2h(s_idx, sizes, *anchors)
+
   axis_names = mesh.axis_names
   index_spec = jax.sharding.PartitionSpec(*axis_names, None)
   sizes_spec = jax.sharding.PartitionSpec(None)
@@ -292,11 +334,13 @@ def init_weight_synchronizer_and_d2h(
       arr.sharding.spec for arr in device_arrays
   )
 
-  return jax.shard_map(
-      _local_init_and_d2h,
-      mesh=mesh,
-      in_specs=in_specs,
-      out_specs=out_spec,
+  return jax.jit(
+      jax.shard_map(
+          _shard_init_and_d2h,
+          mesh=mesh,
+          in_specs=in_specs,
+          out_specs=out_spec,
+      )
   )(shard_info, slice_byte_sizes, *device_arrays)
 
 
@@ -333,7 +377,11 @@ def h2d(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
     The updated sharded device array with data copied from the local host
     buffer.
   """
-
+  ffi_name = (
+      "raiden_weight_synchronizer_h2d"
+      if _use_direct_device_buffer()
+      else "ws_h2d"
+  )
   sharding = device_array.sharding
   local_shape = sharding.shard_shape(device_array.shape)
   dtype = device_array.dtype
@@ -343,7 +391,7 @@ def h2d(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
   )
   def _local_h2d(s_idx):
     return jax.ffi.ffi_call(
-        "ws_h2d",
+        ffi_name,
         jax.ShapeDtypeStruct(local_shape, dtype),
         has_side_effect=True,
     )(s_idx, layer_idx=np.int32(layer_idx))
@@ -356,11 +404,13 @@ def h2d(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
   )
   out_spec = sharding.spec
 
-  return jax.shard_map(
-      _local_h2d,
-      mesh=mesh,
-      in_specs=(index_spec,),
-      out_specs=out_spec,
+  return jax.jit(
+      jax.shard_map(
+          _local_h2d,
+          mesh=mesh,
+          in_specs=(index_spec,),
+          out_specs=out_spec,
+      )
   )(shard_idx)
 
 
@@ -377,6 +427,11 @@ def multi_h2d(device_arrays, shard_idx, mesh) -> list[jax.Array]:
     A list of updated sharded device arrays with data copied from the local host
     buffers.
   """
+  ffi_name = (
+      "raiden_weight_synchronizer_multi_h2d"
+      if _use_direct_device_buffer()
+      else "ws_multi_h2d"
+  )
   out_types = []
   out_specs = []
   for arr in device_arrays:
@@ -393,7 +448,7 @@ def multi_h2d(device_arrays, shard_idx, mesh) -> list[jax.Array]:
   )
   def _local_multi_h2d(s_idx):
     return jax.ffi.ffi_call(
-        "ws_multi_h2d",
+        ffi_name,
         out_types,
         has_side_effect=True,
     )(s_idx)
@@ -405,11 +460,13 @@ def multi_h2d(device_arrays, shard_idx, mesh) -> list[jax.Array]:
       else jax.sharding.PartitionSpec(*axis_names)
   )
 
-  return jax.shard_map(
-      _local_multi_h2d,
-      mesh=mesh,
-      in_specs=(index_spec,),
-      out_specs=out_specs,
+  return jax.jit(
+      jax.shard_map(
+          _local_multi_h2d,
+          mesh=mesh,
+          in_specs=(index_spec,),
+          out_specs=out_specs,
+      )
   )(shard_idx)
 
 
@@ -425,16 +482,30 @@ def d2h(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
   Returns:
     The same sharded device array (serving as an execution anchor).
   """
+  ffi_name = (
+      "raiden_weight_synchronizer_d2h"
+      if _use_direct_device_buffer()
+      else "ws_d2h"
+  )
 
   @compute_on.compute_on(
       compute_type="device_host", out_memory_spaces=jax.memory.Space.Device
   )
   def _local_d2h(anchor, s_idx):
     return jax.ffi.ffi_call(
-        "ws_d2h",
+        ffi_name,
         jax.ShapeDtypeStruct(anchor.shape, anchor.dtype),
         has_side_effect=True,
     )(anchor, s_idx, layer_idx=np.int32(layer_idx))
+
+  def _shard_d2h(anchor, s_idx):
+    orig_shape, orig_dtype = anchor.shape, anchor.dtype
+    if _use_direct_device_buffer():
+      anchor = anchor.reshape(-1).view(jnp.uint32)
+      one = jax.lax.optimization_barrier(jnp.ones_like(anchor))
+      with xla_metadata.set_xla_metadata(_xla_device_buffer="true"):
+        anchor = jax.lax.mul(anchor, one)
+    return _local_d2h(anchor, s_idx).view(orig_dtype).reshape(orig_shape)
 
   axis_names = mesh.axis_names
   anchor_spec = device_array.sharding.spec
@@ -444,9 +515,11 @@ def d2h(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
       else jax.sharding.PartitionSpec(*axis_names)
   )
 
-  return jax.shard_map(
-      _local_d2h,
-      mesh=mesh,
-      in_specs=(anchor_spec, index_spec),
-      out_specs=anchor_spec,
+  return jax.jit(
+      jax.shard_map(
+          _shard_d2h,
+          mesh=mesh,
+          in_specs=(anchor_spec, index_spec),
+          out_specs=anchor_spec,
+      )
   )(device_array, shard_idx)

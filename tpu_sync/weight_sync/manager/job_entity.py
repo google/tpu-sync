@@ -1073,11 +1073,16 @@ class JobEntity:
         return serialized_bytes
 
     peers = []
-    for dst in transfer_plan.dst_units:
-      dst_coords = transfer_plan.worker_data_addresses.get(dst)
-      if not dst_coords:
-        raise ValueError(f"No data-plane endpoint registered for {dst}")
-      peers.extend(dst_coords)
+    # Only populate peers for legacy plan-less transfers; block-addressed
+    # transfers use shard_push_schedules.
+    if not getattr(transfer_plan, "use_block_chunks", False) and not getattr(
+        transfer_plan, "shard_push_schedules", None
+    ):
+      for dst in transfer_plan.dst_units:
+        dst_coords = transfer_plan.worker_data_addresses.get(dst)
+        if not dst_coords:
+          raise ValueError(f"No data-plane endpoint registered for {dst}")
+        peers.extend(dst_coords)
 
     req = self._proto_module.ControlRequest(
         command=self._proto_module.ControlRequest.COMMAND_START_TRANSFER,
@@ -1260,6 +1265,16 @@ class JobEntity:
                 )
             if cached_protos is not None:
               cached_protos[target_id] = target_protos
+
+    # If this host is a sender in a block-chunk plan but owns no shards with
+    # push schedules, there is nothing for it to push; do not send an empty
+    # command that could trigger legacy fallback.
+    if (
+        is_sender
+        and getattr(transfer_plan, "use_block_chunks", False)
+        and not start_req.shard_push_schedules
+    ):
+      return None
 
     start_req.uuid = int(uuid_val or 0)
     start_req.req_id = str(req_id_val or "")

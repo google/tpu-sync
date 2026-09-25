@@ -58,6 +58,19 @@ py_library(
     ],
 )
 
+py_test(
+    name = "job_entity_test",
+    srcs = ["job_entity_test.py"],
+    deps = [
+        ":controller_types",
+        ":job_entity",
+        "//tpu_sync/api:common",
+        "//tpu_sync/common/control_pipe:control_pipe_client",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
+        "@com_google_absl_py//absl/testing:absltest",
+    ],
+)
+
 py_library(
     name = "reshard_planner",
     srcs = ["reshard_planner.py"],

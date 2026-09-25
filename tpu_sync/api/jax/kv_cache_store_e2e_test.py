@@ -25,11 +25,19 @@ import time
 import unittest
 import uuid
 
+from absl import flags
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+_SECONDARY_STORAGE_ROOT = flags.DEFINE_string(
+    "secondary_storage_root",
+    "",
+    "Root directory for secondary storage. If empty, a temporary directory is"
+    " created.",
+)
 
 resources = None
 from tpu_sync.api.jax import kv_cache_manager
@@ -383,7 +391,11 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
   def test_e2e_with_slices_with_multi_numa(self):
     self._run_e2e_test(enable_multi_numa=True, use_slices=True)
 
-  def test_secondary_storage_e2e_offload_recall(self):
+  @parameterized.named_parameters(
+      ("buffered", False),
+      ("direct_io", True),
+  )
+  def test_secondary_storage_e2e_offload_recall(self, direct_io: bool = False):
     """Verifies end-to-end offload to storage and recall across TPU chips."""
     tpu_sharding = self.setup_shardings()
     num_blocks = 2
@@ -392,9 +404,10 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     shape = (num_blocks, 128, 8, 8, 128)
     block_bytes = (np.prod(shape) // num_blocks) * 4
     total_bytes = np.prod(shape) * 4
+    mode_str = "direct_io" if direct_io else "buffered"
     print(
         "\n======================================================================\n[JAX"
-        " E2E Storage] STARTING 4-CHIP SECONDARY STORAGE E2E TEST\n  Total TPU"
+        f" E2E Storage] STARTING 4-CHIP SECONDARY STORAGE E2E TEST (mode={mode_str})\n  Total TPU"
         f" Chips: {self.num_devices} | Devices: {self.devices}\n  Logical"
         f" Shape: {shape} ({num_blocks} blocks)\n  Bytes/block: {block_bytes} B"
         f" ({block_bytes / (1024 * 1024):.1f} MiB) | Total bytes: {total_bytes}"
@@ -417,11 +430,21 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     block_elements = 128 * 8 * 8 * 128
     shard_size_bytes = (block_elements * 4) // self.num_devices
 
-    temp_dir = tempfile.mkdtemp()
+    if _SECONDARY_STORAGE_ROOT.value:
+      temp_dir = os.path.join(
+          _SECONDARY_STORAGE_ROOT.value,
+          f"jax_e2e_{mode_str}_{uuid.uuid4().hex[:8]}",
+      )
+      os.makedirs(temp_dir, exist_ok=True)
+      is_custom_root = True
+    else:
+      temp_dir = tempfile.mkdtemp()
+      is_custom_root = False
     try:
       print(
           "[JAX E2E Storage][Step 2/11] Configuring POSIX secondary storage"
-          f" backend:\n  root_dir: {temp_dir}\n  model_name: llama_70b_jax\n "
+          f" backend (direct_io={direct_io}):\n  root_dir: {temp_dir}\n "
+          " model_name: llama_70b_jax\n "
           f" tp_size: {self.num_devices}, tp_rank: 0\n  shard_size_bytes:"
           f" {shard_size_bytes} B",
           flush=True,
@@ -432,6 +455,8 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       cfg.parallelism.tp_size = self.num_devices
       cfg.set_property("root_dir", temp_dir)
       cfg.set_property("model_name", "llama_70b_jax")
+      if direct_io:
+        cfg.set_property("direct_io", "true")
 
       # =======================================================================
       # Phase 1: Node 1 Offload to Secondary Storage
@@ -761,11 +786,17 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
         )
         del manager2, store2
     finally:
-      shutil.rmtree(temp_dir, ignore_errors=True)
-      print(
-          f"[JAX E2E Storage] Cleaned up temporary directory {temp_dir}.",
-          flush=True,
-      )
+      if not is_custom_root:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        print(
+            f"[JAX E2E Storage] Cleaned up temporary directory {temp_dir}.",
+            flush=True,
+        )
+      else:
+        print(
+            f"[JAX E2E Storage] Preserved custom storage directory {temp_dir}.",
+            flush=True,
+        )
 
     print(
         f"[JAX E2E Storage][SUCCESS] 4-Chip JAX secondary storage offload and"

@@ -76,11 +76,28 @@ struct PosixBackendOptions {
   // by this backend. Not per-NUMA-node, not per-file-descriptor.
   int storage_io_thread_pool_size = 16;
 
+  // When true, the backend opens block files with O_DIRECT to bypass the
+  // Linux page cache. Defaults to false if omitted. Probed once at
+  // construction; if the filesystem under `root_dir` does not accept O_DIRECT,
+  // construction fails. Every buffer pointer, buffer length and file offset
+  // must then be a multiple of DirectIOAlignment(); otherwise the operation
+  // fails with InvalidArgument. There is no buffered fallback.
+  bool direct_io = false;
+
   // Parses and validates `properties`. Returns InvalidArgumentError for an
   // unparseable value, a negative thread-pool size, or a missing tp_rank.
   static absl::StatusOr<PosixBackendOptions> FromProperties(
       const absl::flat_hash_map<std::string, std::string>& properties);
 };
+
+// Alignment required for O_DIRECT buffers, lengths and file offsets: the
+// runtime page size (4 KiB on x86_64, commonly 16 KiB or 64 KiB on arm64).
+// Queried once and cached.
+size_t DirectIOAlignment();
+
+// True when every slice's address and length are multiples of
+// DirectIOAlignment().
+bool SlicesAreDirectIOAligned(absl::Span<const HostBufferDescriptor> slices);
 
 // PosixKVBackend implements KVBackend for POSIX filesystems (e.g., Lustre,
 // local disk).
@@ -96,6 +113,10 @@ class PosixKVBackend : public KVBackend {
   std::string name() const override { return name_; }
 
   const PosixBackendOptions& options() const { return options_; }
+
+  bool is_direct_io_supported() const { return direct_io_supported_; }
+
+  static bool ProbeDirectIO(absl::string_view dir);
 
   void WriteAsync(const BlockKey& key,
                   absl::Span<const HostBufferDescriptor> slices,
@@ -116,6 +137,7 @@ class PosixKVBackend : public KVBackend {
 
   std::string name_;
   PosixBackendOptions options_;
+  bool direct_io_supported_ = false;
   // MUST be the last-declared member: destruction runs in reverse declaration
   // order, and ~NumaThreadPool joins its workers after draining the queue, so
   // declaring it last is what guarantees every in-flight task finishes before

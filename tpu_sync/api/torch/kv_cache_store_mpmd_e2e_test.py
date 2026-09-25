@@ -32,6 +32,7 @@ os.environ.setdefault("TMPDIR", _LOG_DIR)
 from absl import app
 from absl import flags
 from absl.testing import absltest
+from absl.testing import parameterized
 import numpy as np
 
 import torch
@@ -53,6 +54,11 @@ flags.DEFINE_boolean("use_slices", False, "")
 flags.DEFINE_boolean("enable_shm", False, "")
 _STORAGE_ROOT = flags.DEFINE_string(
     "storage_root", "", "Path to storage directory for secondary storage"
+)
+_STORAGE_DIRECT_IO = flags.DEFINE_boolean(
+    "storage_direct_io",
+    False,
+    "Whether to enable Direct I/O (O_DIRECT) in POSIX secondary storage.",
 )
 _STORAGE_PHASE = flags.DEFINE_string(
     "storage_phase",
@@ -839,6 +845,12 @@ def _worker_secondary_storage_main(argv):
     cfg.parallelism.tp_size = world_size
     cfg.set_property("root_dir", storage_root)
     cfg.set_property("model_name", "test_model_mpmd")
+    if _STORAGE_DIRECT_IO.value:
+      cfg.set_property("direct_io", "true")
+      print(
+          f"[MPMD Storage][Rank {rank}] Enabled direct_io in BackendConfig.",
+          flush=True,
+      )
 
     device = torch.device("tpu")
     num_blocks = 4
@@ -1243,7 +1255,7 @@ def _worker_secondary_storage_main(argv):
     dist.destroy_process_group()
 
 
-class KVCacheStoreMpmdE2ETest(absltest.TestCase):
+class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
 
   @classmethod
   def setUpClass(cls):
@@ -1447,19 +1459,36 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
     # asserted the records-nothing contract, but no driver dispatched it.
     self._drive_read_remote(use_slices=True)
 
-  def test_mpmd_4rank_e2e_secondary_storage_offload_recall(self):
+  @parameterized.named_parameters(
+      ("buffered", False),
+      ("direct_io", True),
+  )
+  def test_mpmd_4rank_e2e_secondary_storage_offload_recall(
+      self, direct_io: bool = False
+  ):
     world_size = 4
     prepare_tpu_environment(world_size)
     master_port_w = pick_unused_ports(1)[0]
     controller_port_w = pick_unused_ports(1)[0]
     master_port_r = pick_unused_ports(1)[0]
     controller_port_r = pick_unused_ports(1)[0]
-    temp_dir = tempfile.mkdtemp()
+
+    mode_str = "direct_io" if direct_io else "buffered"
+    if _STORAGE_ROOT.value:
+      temp_dir = os.path.join(
+          _STORAGE_ROOT.value,
+          f"torch_mpmd_{mode_str}_{int(time.time())}",
+      )
+      os.makedirs(temp_dir, exist_ok=True)
+      is_custom_root = True
+    else:
+      temp_dir = tempfile.mkdtemp()
+      is_custom_root = False
 
     print(
         "\n======================================================================\n"
         "[MPMD Driver] STARTING 4-RANK MULTI-PROCESS SECONDARY STORAGE E2E"
-        " TEST\n"
+        f" TEST (mode={mode_str})\n"
         f"  World Size: {world_size} ranks (processes)\n"
         f"  Instance Group 1 (Writer): master={master_port_w},"
         f" controller={controller_port_w}\n"
@@ -1467,6 +1496,7 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
         f" controller={controller_port_r}\n"
         f"  Registry: {_registry_port}\n"
         f"  Storage Root: {temp_dir}\n"
+        f"  Direct I/O: {direct_io}\n"
         "======================================================================",
         flush=True,
     )
@@ -1480,11 +1510,14 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
       procs_w = []
       for rank in range(world_size):
         env = os.environ.copy()
+        env["GLOG_alsologtostderr"] = "1"
         cmd = worker_launch_cmd() + [
             "--run_worker",
+            "--alsologtostderr",
             "--worker_mode=secondary_storage",
             "--storage_phase=write",
             f"--storage_root={temp_dir}",
+            f"--storage_direct_io={direct_io}",
             f"--rank={rank}",
             f"--world_size={world_size}",
             f"--master_port={master_port_w}",
@@ -1529,11 +1562,14 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
       procs_r = []
       for rank in range(world_size):
         env = os.environ.copy()
+        env["GLOG_alsologtostderr"] = "1"
         cmd = worker_launch_cmd() + [
             "--run_worker",
+            "--alsologtostderr",
             "--worker_mode=secondary_storage",
             "--storage_phase=read",
             f"--storage_root={temp_dir}",
+            f"--storage_direct_io={direct_io}",
             f"--rank={rank}",
             f"--world_size={world_size}",
             f"--master_port={master_port_r}",
@@ -1571,11 +1607,17 @@ class KVCacheStoreMpmdE2ETest(absltest.TestCase):
       )
 
     finally:
-      shutil.rmtree(temp_dir, ignore_errors=True)
-      print(
-          f"[MPMD Driver] Cleaned up temporary directory {temp_dir}.",
-          flush=True,
-      )
+      if not is_custom_root:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        print(
+            f"[MPMD Driver] Cleaned up temporary directory {temp_dir}.",
+            flush=True,
+        )
+      else:
+        print(
+            f"[MPMD Driver] Preserved custom storage directory {temp_dir}.",
+            flush=True,
+        )
 
     print(
         f"[MPMD Driver][SUCCESS] All {world_size} MPMD secondary storage"

@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
@@ -60,6 +61,33 @@ namespace storage {
 
 namespace fs = std::filesystem;
 
+// --- Direct I/O alignment ---
+
+size_t DirectIOAlignment() {
+  static const size_t kAlign = [] {
+    const long page = sysconf(_SC_PAGESIZE);
+    CHECK_GT(page, 0) << "sysconf(_SC_PAGESIZE) failed";
+    CHECK_EQ(page & (page - 1), 0)
+        << "page size is not a power of two: " << page;
+    LOG(INFO) << "PosixKVBackend: O_DIRECT alignment = " << page
+              << " bytes (sysconf(_SC_PAGESIZE))";
+    return static_cast<size_t>(page);
+  }();
+  return kAlign;
+}
+
+bool SlicesAreDirectIOAligned(absl::Span<const HostBufferDescriptor> slices) {
+  // The alignment is a power of two, so OR-ing address and size lets one mask
+  // test cover both.
+  const uintptr_t mask = DirectIOAlignment() - 1;
+  for (const auto& slice : slices) {
+    if (((reinterpret_cast<uintptr_t>(slice.ptr) | slice.size) & mask) != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // --- PosixKVBackend Implementation ---
 
 PosixKVBackend::PosixKVBackend(
@@ -72,6 +100,15 @@ PosixKVBackend::PosixKVBackend(
                << options.status();
   }
   options_ = *std::move(options);
+  if (options_.direct_io) {
+    direct_io_supported_ = ProbeDirectIO(options_.root_dir);
+    if (!direct_io_supported_) {
+      LOG(FATAL) << "[PosixKVBackend] " << name_
+                 << ": direct_io=true but O_DIRECT is not supported on '"
+                 << options_.root_dir
+                 << "'. Unset direct_io or use a filesystem that supports it.";
+    }
+  }
   mapper_ =
       std::make_shared<PosixPathMapper>(options_.root_dir, options_.model_name,
                                         options_.tp_size, options_.tp_rank);
@@ -79,11 +116,59 @@ PosixKVBackend::PosixKVBackend(
       std::make_unique<NumaThreadPool>(options_.storage_io_thread_pool_size);
 }
 
+bool PosixKVBackend::ProbeDirectIO(absl::string_view dir) {
+  static std::atomic<uint64_t> probe_seq{0};
+  std::string probe_path =
+      absl::StrCat(dir, "/.o_direct_probe_", getpid(), "_",
+                   probe_seq.fetch_add(1, std::memory_order_relaxed));
+  std::error_code ec;
+  fs::create_directories(std::string(dir), ec);
+
+  int fd = open(probe_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+  if (fd < 0) {
+    LOG(WARNING) << "PosixKVBackend: O_DIRECT probe open failed on '" << dir
+                 << "' (errno: " << errno << " - " << strerror(errno) << ")";
+    return false;
+  }
+
+  // Write one page, aligned to the page size, to verify whether the underlying
+  // filesystem accepts O_DIRECT I/O without failing with EINVAL (as happens on
+  // overlayfs or older tmpfs).
+  const size_t align = DirectIOAlignment();
+  void* page = nullptr;
+  if (posix_memalign(&page, align, align) != 0) {
+    close(fd);
+    unlink(probe_path.c_str());
+    LOG(WARNING) << "PosixKVBackend: O_DIRECT probe posix_memalign failed on '"
+                 << dir << "'";
+    return false;
+  }
+  std::memset(page, 0, align);
+  ssize_t written = write(fd, page, align);
+  const int write_errno = errno;
+  free(page);
+  close(fd);
+  unlink(probe_path.c_str());
+
+  bool success = (written == static_cast<ssize_t>(align));
+  if (success) {
+    LOG(INFO) << "PosixKVBackend: O_DIRECT probe on '" << dir
+              << "' succeeded with " << align
+              << "-byte alignment; direct I/O is supported.";
+  } else {
+    LOG(WARNING) << "PosixKVBackend: O_DIRECT probe write failed on '" << dir
+                 << "' (written: " << written << ", errno: " << write_errno
+                 << " - " << strerror(write_errno) << ")";
+  }
+  return success;
+}
+
 void PosixKVBackend::WriteAsync(const BlockKey& key,
                                 absl::Span<const HostBufferDescriptor> slices,
                                 size_t /*total_bytes*/,
                                 std::function<void(absl::Status)> callback) {
-  thread_pool_->Schedule(std::nullopt, [key,
+  thread_pool_->Schedule(std::nullopt, [direct_io_supported = direct_io_supported_,
+                                        key,
                                         slices =
                                             std::vector<HostBufferDescriptor>(
                                                 slices.begin(), slices.end()),
@@ -119,7 +204,20 @@ void PosixKVBackend::WriteAsync(const BlockKey& key,
         absl::StrCat(key.resolved_key, ".tmp_", getpid(), "_",
                      tmp_seq.fetch_add(1, std::memory_order_relaxed));
 
-    int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    // With direct_io there is no buffered fallback: a misaligned buffer fails
+    // the operation before any file is created.
+    if (direct_io_supported && !SlicesAreDirectIOAligned(slices)) {
+      if (callback)
+        callback(absl::InvalidArgumentError(absl::StrCat(
+            "PosixKVBackend::WriteAsync: direct_io=true but a slice pointer "
+            "or size is not aligned to ",
+            DirectIOAlignment(), " bytes for O_DIRECT")));
+      return;
+    }
+    const int open_flags =
+        O_WRONLY | O_CREAT | O_TRUNC | (direct_io_supported ? O_DIRECT : 0);
+
+    int fd = open(tmp_path.c_str(), open_flags, 0644);
     if (fd < 0 && errno == ENOENT) {
       // Optimistic open failed because parent directory does not exist yet.
       // Create directory hierarchy and retry open once.
@@ -136,7 +234,7 @@ void PosixKVBackend::WriteAsync(const BlockKey& key,
           }
           return;
         }
-        fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        fd = open(tmp_path.c_str(), open_flags, 0644);
       }
     }
 
@@ -247,12 +345,27 @@ void PosixKVBackend::ReadAsync(const BlockKey& key,
                                absl::Span<const HostBufferDescriptor> slices,
                                size_t /*total_bytes*/,
                                std::function<void(absl::Status)> callback) {
-  thread_pool_->Schedule(std::nullopt, [key,
+  thread_pool_->Schedule(std::nullopt, [direct_io_supported = direct_io_supported_,
+                                        key,
                                         slices =
                                             std::vector<HostBufferDescriptor>(
                                                 slices.begin(), slices.end()),
                                         callback = std::move(callback)]() {
-    int fd = open(key.resolved_key.c_str(), O_RDONLY);
+    // With direct_io there is no buffered fallback: a misaligned file offset
+    // or buffer fails the operation before the file is opened.
+    if (direct_io_supported &&
+        ((key.offset & (DirectIOAlignment() - 1)) != 0 ||
+         !SlicesAreDirectIOAligned(slices))) {
+      if (callback)
+        callback(absl::InvalidArgumentError(absl::StrCat(
+            "PosixKVBackend::ReadAsync: direct_io=true but the file offset, a "
+            "slice pointer or a slice size is not aligned to ",
+            DirectIOAlignment(), " bytes for O_DIRECT")));
+      return;
+    }
+    const int open_flags = O_RDONLY | (direct_io_supported ? O_DIRECT : 0);
+
+    int fd = open(key.resolved_key.c_str(), open_flags);
     if (fd < 0) {
       if (callback) {
         if (errno == ENOENT) {
@@ -469,6 +582,20 @@ absl::StatusOr<PosixBackendOptions> PosixBackendOptions::FromProperties(
   options.lookup_batch_size =
       batch > 0 ? static_cast<size_t>(batch) : kDefaultLookupBatchSize;
   options.storage_io_thread_pool_size = static_cast<int>(threads);
+
+  if (auto it = properties.find("direct_io"); it != properties.end()) {
+    std::string val = absl::AsciiStrToLower(it->second);
+    if (val == "true") {
+      options.direct_io = true;
+    } else if (val == "false") {
+      options.direct_io = false;
+    } else {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Invalid boolean value for direct_io: '", it->second,
+                       "'; expected 'true' or 'false'"));
+    }
+  }
+
   return options;
 }
 

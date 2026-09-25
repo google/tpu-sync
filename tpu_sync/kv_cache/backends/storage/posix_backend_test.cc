@@ -26,6 +26,8 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
@@ -36,6 +38,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
@@ -1067,6 +1070,268 @@ TEST_F(StorageDriverTest, VectoredIovMaxChunkingOver1024Slices) {
   // 2048 slices > UIO_MAXIOV (1024). Verifies loop chunking behavior.
   VerifyScatterGatherFidelity(backend, key, /*num_slices=*/2048,
                               /*slice_bytes=*/256);
+}
+
+// ===========================================================================
+// Theme: Direct I/O (O_DIRECT) Tests
+// ===========================================================================
+
+// Helper function to read current Dirty memory in kB from /proc/meminfo.
+static int64_t ReadDirtyPageCacheKb() {
+  std::ifstream meminfo("/proc/meminfo");
+  std::string line;
+  while (std::getline(meminfo, line)) {
+    if (absl::StartsWith(line, "Dirty:")) {
+      std::vector<std::string> parts =
+          absl::StrSplit(line, ' ', absl::SkipWhitespace());
+      int64_t val = 0;
+      if (parts.size() >= 2 && absl::SimpleAtoi(parts[1], &val)) {
+        return val;
+      }
+    }
+  }
+  return -1;
+}
+
+TEST_F(PosixBackendTest, PosixBackendOptions_DirectIOPropertyParsing) {
+  // 1. Defaults to false when omitted
+  {
+    TF_ASSERT_OK_AND_ASSIGN(
+        PosixBackendOptions opts,
+        PosixBackendOptions::FromProperties({{"tp_rank", "0"}}));
+    EXPECT_FALSE(opts.direct_io);
+  }
+
+  // 2. Strict true: "true", "TRUE", "True"
+  for (const char* true_val : {"true", "TRUE", "True"}) {
+    TF_ASSERT_OK_AND_ASSIGN(
+        PosixBackendOptions opts,
+        PosixBackendOptions::FromProperties(
+            {{"tp_rank", "0"}, {"direct_io", true_val}}));
+    EXPECT_TRUE(opts.direct_io) << "Failed for: " << true_val;
+  }
+
+  // 3. Strict false: "false", "FALSE", "False"
+  for (const char* false_val : {"false", "FALSE", "False"}) {
+    TF_ASSERT_OK_AND_ASSIGN(
+        PosixBackendOptions opts,
+        PosixBackendOptions::FromProperties(
+            {{"tp_rank", "0"}, {"direct_io", false_val}}));
+    EXPECT_FALSE(opts.direct_io) << "Failed for: " << false_val;
+  }
+
+  // 4. Invalid strings return InvalidArgument
+  for (const char* invalid_val : {"1", "yes", "0", "no", "invalid"}) {
+    EXPECT_THAT(PosixBackendOptions::FromProperties(
+                    {{"tp_rank", "0"}, {"direct_io", invalid_val}}),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("expected 'true' or 'false'")));
+  }
+}
+
+TEST_F(PosixBackendTest, PosixKVBackend_ProbeDirectIOLifecycleAndCleanup) {
+  bool supported = PosixKVBackend::ProbeDirectIO(scratch_dir_);
+  (void)supported;
+  for (const auto& entry : fs::directory_iterator(scratch_dir_)) {
+    EXPECT_THAT(entry.path().filename().string(),
+                testing::Not(HasSubstr(".o_direct_probe_")));
+  }
+}
+
+// Owns one mmap'd, page-aligned region (the XlaHostMemoryAllocator pattern).
+class AlignedRegion {
+ public:
+  explicit AlignedRegion(size_t bytes) : bytes_(bytes) {
+    void* p = mmap(nullptr, bytes_, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ptr_ = (p == MAP_FAILED) ? nullptr : static_cast<uint8_t*>(p);
+  }
+  ~AlignedRegion() {
+    if (ptr_ != nullptr) munmap(ptr_, bytes_);
+  }
+  AlignedRegion(const AlignedRegion&) = delete;
+  AlignedRegion& operator=(const AlignedRegion&) = delete;
+  uint8_t* data() const { return ptr_; }
+
+ private:
+  size_t bytes_;
+  uint8_t* ptr_ = nullptr;
+};
+
+absl::Status RunWrite(PosixKVBackend& backend, const BlockKey& key,
+                      absl::Span<const HostBufferDescriptor> slices,
+                      size_t total_bytes) {
+  absl::Notification done;
+  absl::Status status;
+  backend.WriteAsync(key, slices, total_bytes, [&](absl::Status s) {
+    status = std::move(s);
+    done.Notify();
+  });
+  done.WaitForNotification();
+  return status;
+}
+
+absl::Status RunRead(PosixKVBackend& backend, const BlockKey& key,
+                     absl::Span<const HostBufferDescriptor> slices,
+                     size_t total_bytes) {
+  absl::Notification done;
+  absl::Status status;
+  backend.ReadAsync(key, slices, total_bytes, [&](absl::Status s) {
+    status = std::move(s);
+    done.Notify();
+  });
+  done.WaitForNotification();
+  return status;
+}
+
+TEST(DirectIOAlignmentTest, MatchesPageSizeAndIsPowerOfTwo) {
+  const size_t align = DirectIOAlignment();
+  EXPECT_EQ(align, static_cast<size_t>(sysconf(_SC_PAGESIZE)));
+  EXPECT_GT(align, 0u);
+  EXPECT_EQ(align & (align - 1), 0u);
+}
+
+TEST(DirectIOAlignmentTest, SlicesAreDirectIOAligned) {
+  const size_t align = DirectIOAlignment();
+  AlignedRegion region(2 * align);
+  ASSERT_NE(region.data(), nullptr);
+  uint8_t* base = region.data();
+
+  EXPECT_TRUE(SlicesAreDirectIOAligned({}));
+  EXPECT_TRUE(SlicesAreDirectIOAligned(
+      {HostBufferDescriptor{.ptr = base, .size = align},
+       HostBufferDescriptor{.ptr = base + align, .size = align}}));
+  // Misaligned pointer.
+  EXPECT_FALSE(SlicesAreDirectIOAligned(
+      {HostBufferDescriptor{.ptr = base + 1, .size = align}}));
+  // Misaligned size.
+  EXPECT_FALSE(SlicesAreDirectIOAligned(
+      {HostBufferDescriptor{.ptr = base, .size = align - 1}}));
+  // One bad slice among good ones.
+  EXPECT_FALSE(SlicesAreDirectIOAligned(
+      {HostBufferDescriptor{.ptr = base, .size = align},
+       HostBufferDescriptor{.ptr = base + align, .size = 1234}}));
+}
+
+TEST_F(PosixBackendTest, PosixKVBackend_DirectIO_AlignedWriteAndReadFidelity) {
+  if (!PosixKVBackend::ProbeDirectIO(scratch_dir_)) {
+    GTEST_SKIP() << "O_DIRECT is not supported on " << scratch_dir_;
+  }
+  auto backend = std::make_shared<PosixKVBackend>(
+      "posix_directio",
+      absl::flat_hash_map<std::string, std::string>{
+          {"tp_rank", "0"},
+          {"root_dir", scratch_dir_},
+          {"direct_io", "true"}});
+  ASSERT_TRUE(backend->is_direct_io_supported());
+
+  auto mapper =
+      std::make_shared<PosixPathMapper>(scratch_dir_, "model_test", 1, 0);
+  backend->set_mapper(mapper);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      BlockKey key,
+      mapper->MapKey("directio_hash", {.parallelism = {.tp_rank = 0}}));
+
+  const size_t align = DirectIOAlignment();
+  AlignedRegion src(align);
+  AlignedRegion dst(align);
+  ASSERT_NE(src.data(), nullptr);
+  ASSERT_NE(dst.data(), nullptr);
+  for (size_t i = 0; i < align; ++i) {
+    src.data()[i] = static_cast<uint8_t>(i % 251);
+  }
+  std::memset(dst.data(), 0, align);
+
+  std::vector<HostBufferDescriptor> write_slices = {
+      HostBufferDescriptor{.ptr = src.data(), .size = align}};
+
+  int64_t dirty_before = ReadDirtyPageCacheKb();
+  ASSERT_OK(RunWrite(*backend, key, write_slices, align));
+
+  // Direct I/O verification via Linux page cache dirty page tracking:
+  // Standard buffered I/O writes data into the kernel page cache first, which
+  // immediately increments the OS-wide 'Dirty:' counter in /proc/meminfo by
+  // the number of newly dirtied pages until flushed by writeback threads.
+  // In contrast, O_DIRECT writes bypass the page cache entirely and transfer
+  // directly between user-space buffers and disk, so 'Dirty:' must not increase
+  // (delta <= 0) as a result of this write.
+  int64_t dirty_after = ReadDirtyPageCacheKb();
+  if (dirty_before >= 0 && dirty_after >= 0) {
+    EXPECT_LE(dirty_after - dirty_before, 0);
+  }
+
+  std::vector<HostBufferDescriptor> read_slices = {
+      HostBufferDescriptor{.ptr = dst.data(), .size = align}};
+  ASSERT_OK(RunRead(*backend, key, read_slices, align));
+
+  EXPECT_EQ(std::memcmp(src.data(), dst.data(), align), 0);
+}
+
+TEST_F(PosixBackendTest, PosixKVBackend_DirectIO_UnsupportedFilesystemIsFatal) {
+  // The probe's open(2) cannot succeed under /proc, so construction with
+  // direct_io=true must fail explicitly instead of falling back.
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(
+      {
+        PosixKVBackend backend(
+            "posix_unsupported",
+            absl::flat_hash_map<std::string, std::string>{
+                {"tp_rank", "0"},
+                {"root_dir", "/proc/raiden_no_o_direct"},
+                {"direct_io", "true"}});
+      },
+      "O_DIRECT is not supported");
+}
+
+TEST_F(PosixBackendTest, PosixKVBackend_DirectIO_UnalignedBufferRejected) {
+  if (!PosixKVBackend::ProbeDirectIO(scratch_dir_)) {
+    GTEST_SKIP() << "O_DIRECT is not supported on " << scratch_dir_;
+  }
+  auto backend = std::make_shared<PosixKVBackend>(
+      "posix_unaligned",
+      absl::flat_hash_map<std::string, std::string>{
+          {"tp_rank", "0"},
+          {"root_dir", scratch_dir_},
+          {"direct_io", "true"}});
+  auto mapper =
+      std::make_shared<PosixPathMapper>(scratch_dir_, "model_test", 1, 0);
+  backend->set_mapper(mapper);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      BlockKey key,
+      mapper->MapKey("unaligned_hash", {.parallelism = {.tp_rank = 0}}));
+
+  const size_t align = DirectIOAlignment();
+  AlignedRegion region(2 * align);
+  ASSERT_NE(region.data(), nullptr);
+  uint8_t* base = region.data();
+
+  const std::vector<HostBufferDescriptor> misaligned_ptr = {
+      HostBufferDescriptor{.ptr = base + 1, .size = align}};
+  const std::vector<HostBufferDescriptor> misaligned_size = {
+      HostBufferDescriptor{.ptr = base, .size = 1234}};
+  const auto kNotAligned = StatusIs(absl::StatusCode::kInvalidArgument,
+                                    HasSubstr("not aligned to"));
+
+  // Writes are rejected before any file (temp or final) is created.
+  EXPECT_THAT(RunWrite(*backend, key, misaligned_ptr, align), kNotAligned);
+  EXPECT_THAT(RunWrite(*backend, key, misaligned_size, 1234), kNotAligned);
+  const fs::path model_dir = fs::path(scratch_dir_) / "model_test";
+  if (fs::exists(model_dir)) {
+    for (const auto& entry : fs::recursive_directory_iterator(model_dir)) {
+      EXPECT_FALSE(entry.is_regular_file()) << entry.path();
+    }
+  }
+
+  // Reads: misaligned pointer, size, or file offset.
+  EXPECT_THAT(RunRead(*backend, key, misaligned_ptr, align), kNotAligned);
+  EXPECT_THAT(RunRead(*backend, key, misaligned_size, 1234), kNotAligned);
+  BlockKey offset_key = key;
+  offset_key.offset = 512;
+  const std::vector<HostBufferDescriptor> aligned = {
+      HostBufferDescriptor{.ptr = base, .size = align}};
+  EXPECT_THAT(RunRead(*backend, offset_key, aligned, align), kNotAligned);
 }
 
 }  // namespace

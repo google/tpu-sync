@@ -459,6 +459,65 @@ class ReshardPlannerTest(absltest.TestCase):
         self.assertLen(sched.variable_plans[src_units[0]], 6)
         self.assertLen(sched.variable_to_plan_id[src_units[0]], 948)
 
+  def test_deterministic_circular_shift_latin_square_scheduling(self):
+    """Verifies that direct push schedules have rotated destination peer sequences across src_units."""
+    src_units = [RaidenId("trainer", str(i), "weights", 0) for i in range(4)]
+    dst_units = [
+        RaidenId("rollout_0", "0", "weights", 0),
+        RaidenId("rollout_1", "0", "weights", 0),
+        RaidenId("rollout_2", "0", "weights", 0),
+        RaidenId("rollout_3", "0", "weights", 0),
+    ]
+    src_vars = _build_qwen3_397b_variables(
+        num_layers=1, src_fsdp=4, is_src=True
+    )
+    dst_vars = _build_qwen3_397b_variables(
+        num_layers=1, src_fsdp=4, is_src=False
+    )
+
+    sched = self._run_planner(
+        src_vars_by_unit={u: src_vars for u in src_units},
+        dst_vars_by_unit={u: dst_vars for u in dst_units},
+        src_phys_mesh=[1, 1, 4, 4, 2],
+        src_mesh_axes=["data", "stage", "fsdp", "context", "expert"],
+        src_host_subgrid=[1, 1, 1, 4, 2],
+        dst_phys_mesh=[2, 8],
+        dst_mesh_axes=["x", "y"],
+        dst_host_subgrid=[1, 8],
+    )
+
+    # Latin Square property: across multiple src_units, each trainer has a destination
+    # sequence circularly shifted by its index, so Trainer 0 starts with Dest 0, Trainer 1 with Dest 1.
+    # We verify this on all variables where each trainer targets multiple destination peers.
+    all_var_indices = sorted(
+        list(set(e[-2] for e in sched.direct_schedules[src_units[0]][0]))
+    )
+    self.assertNotEmpty(all_var_indices)
+
+    multi_dest_vars_tested = 0
+    for var_idx in all_var_indices:
+      peers_by_src = []
+      for src_u in src_units:
+        entries = sched.direct_schedules[src_u][0]
+        var_entries = [e for e in entries if e[-2] == var_idx]
+        peers = [e[0] for e in var_entries]
+        peers_by_src.append(peers)
+
+      # For multi-destination variables, verify that each trainer starts with a distinct peer
+      # (balanced scheduling: Trainer 0 starts with Dest 0, Trainer 1 with Dest 1, etc.)
+      num_dest_peers = len(set(peers_by_src[0]))
+      if num_dest_peers > 1:
+        multi_dest_vars_tested += 1
+        first_dest_peers = [peers[0] for peers in peers_by_src]
+        self.assertEqual(
+            len(set(first_dest_peers)),
+            min(len(src_units), num_dest_peers),
+            f"Var {var_idx} trainers should start with distinct destination"
+            " peers",
+        )
+
+    self.assertGreater(multi_dest_vars_tested, 0)
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -161,7 +161,10 @@ py_test(
     size = "large",
     srcs = ["weight_sync_fanout_perf_test.py"],
     shard_count = 6,
-    tags = ["requires-mem:28g"],
+    tags = [
+        "cpu:4",
+        "requires-mem:28g",
+    ],
     deps = [
         "//tpu_sync/api:common",
         "//tpu_sync/api/jax:weight_synchronizer_jax_py",

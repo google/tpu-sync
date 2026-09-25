@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <random>
 #include <string>
@@ -103,9 +104,21 @@ class RawMockDelegate : public RawBufferTransportDelegate {
   }
 
   absl::Status OnDataReceived(uint64_t uuid = 0) override {
-    absl::MutexLock lock(mu_);
-    on_data_received_called_ = true;
+    std::function<void(uint64_t)> cb;
+    {
+      absl::MutexLock lock(mu_);
+      on_data_received_called_ = true;
+      cb = on_data_received_callback_;
+    }
+    if (cb) {
+      cb(uuid);
+    }
     return absl::OkStatus();
+  }
+
+  void SetOnDataReceivedCallback(std::function<void(uint64_t)> cb) {
+    absl::MutexLock lock(mu_);
+    on_data_received_callback_ = std::move(cb);
   }
 
   absl::Status OnLayerDataReceived(size_t layer_idx,
@@ -171,6 +184,7 @@ class RawMockDelegate : public RawBufferTransportDelegate {
   std::vector<uint8_t> buffer_;
   mutable absl::Mutex mu_;
   bool on_data_received_called_ ABSL_GUARDED_BY(mu_) = false;
+  std::function<void(uint64_t)> on_data_received_callback_ ABSL_GUARDED_BY(mu_);
   std::vector<size_t> layer_triggers_ ABSL_GUARDED_BY(mu_);
   std::shared_ptr<grpc::Channel> default_channel_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_map<std::string, std::shared_ptr<grpc::Channel>>
@@ -364,6 +378,100 @@ TEST_P(RawBufferTransportTest, PushBuffersCorrectness) {
   EXPECT_THAT(dst2.DataSpan(8192, payload4.size()),
               Pointwise(Eq(), absl::MakeConstSpan(payload4)));
   EXPECT_TRUE(dst2.WaitForDataReceived(kNotificationTimeout));
+}
+
+TEST_P(RawBufferTransportTest, PushBuffersPreservesFirstSeenPeerOrder) {
+  constexpr size_t size = 16 * 1024;
+  RawMockDelegate src(size);
+  RawMockDelegate dst1(size);
+  RawMockDelegate dst2(size);
+
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport1(&dst1, kLocalPort);
+  RawBufferTransport dst_transport2(&dst2, kLocalPort);
+  auto ch1 = StartControlServer(&dst_transport1);
+  auto ch2 = StartControlServer(&dst_transport2);
+  const std::string dst1_addr = GetIpPort(dst_transport1);
+  const std::string dst2_addr = GetIpPort(dst_transport2);
+  src.SetPeerChannel(dst1_addr, ch1);
+  src.SetPeerChannel(dst2_addr, ch2);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  std::vector<uint8_t> payload1(1024);
+  std::vector<uint8_t> payload2(1024);
+  RandomNonZero(absl::MakeSpan(payload1));
+  RandomNonZero(absl::MakeSpan(payload2));
+
+  // Determine which peer address is lexicographically larger.
+  // We place the lexicographically LARGER peer first in `tasks`.
+  // Alphabetical sorting would schedule the smaller peer first.
+  // First-seen ordering must schedule the larger peer first.
+  const bool dst1_is_larger = dst1_addr > dst2_addr;
+  const std::string& first_peer = dst1_is_larger ? dst1_addr : dst2_addr;
+  const std::string& second_peer = dst1_is_larger ? dst2_addr : dst1_addr;
+  RawMockDelegate& first_delegate = dst1_is_larger ? dst1 : dst2;
+  RawMockDelegate& second_delegate = dst1_is_larger ? dst2 : dst1;
+  RawBufferTransport& first_transport =
+      dst1_is_larger ? dst_transport1 : dst_transport2;
+  RawBufferTransport& second_transport =
+      dst1_is_larger ? dst_transport2 : dst_transport1;
+
+  constexpr uint64_t uuid = 998877;
+  ASSERT_OK(first_transport.RegisterExpectedChunks(uuid, 2));
+  ASSERT_OK(second_transport.RegisterExpectedChunks(uuid, 2));
+
+  absl::Mutex log_mu;
+  std::vector<std::string> received_order;
+  first_delegate.SetOnDataReceivedCallback([&](uint64_t) {
+    absl::MutexLock lock(log_mu);
+    received_order.push_back(first_peer);
+  });
+  second_delegate.SetOnDataReceivedCallback([&](uint64_t) {
+    absl::MutexLock lock(log_mu);
+    received_order.push_back(second_peer);
+  });
+
+  // Interleave tasks starting with `first_peer`.
+  std::vector<BufferPushTask> tasks = {
+      {.peer = first_peer,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 0,
+       .data_ptr = payload1.data(),
+       .size_bytes = payload1.size()},
+      {.peer = second_peer,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 0,
+       .data_ptr = payload2.data(),
+       .size_bytes = payload2.size()},
+      {.peer = first_peer,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 2048,
+       .data_ptr = payload1.data(),
+       .size_bytes = payload1.size()},
+      {.peer = second_peer,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 2048,
+       .data_ptr = payload2.data(),
+       .size_bytes = payload2.size()},
+  };
+
+  const auto push_res =
+      src_transport.PushBuffers(tasks, /*parallelism=*/1, uuid);
+  ASSERT_OK(push_res) << push_res.message();
+
+  ASSERT_TRUE(first_delegate.WaitForDataReceived(kNotificationTimeout));
+  ASSERT_TRUE(second_delegate.WaitForDataReceived(kNotificationTimeout));
+
+  // Verify that `first_peer` (lexicographically greater) received its batch
+  // and triggered OnDataReceived before `second_peer`.
+  {
+    absl::MutexLock lock(log_mu);
+    EXPECT_THAT(received_order, ElementsAre(first_peer, second_peer));
+  }
 }
 
 TEST_P(RawBufferTransportTest, RejectsOutOfBounds) {

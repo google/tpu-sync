@@ -20,6 +20,7 @@ Qwen-35B model specs, verifying micro-block fragmentation realism and parity.
 """
 
 import asyncio
+import os
 import socket
 import struct
 import time
@@ -49,7 +50,11 @@ _TEST_ONLY_SIMULATED_NIC_GBPS = flags.DEFINE_float(
     "test_only_simulated_nic_gbps",
     0.0,
     "Simulated NIC line rate in Gbps (0.0 = unlimited). When 0.0, "
-    "test_rate_limited_flat_vs_tree_comparison benchmarks at 10.0 Gbps.",
+    "rate-limited benchmarks use test-specific defaults (e.g. 10.0 Gbps for"
+    " flat vs tree, 20.0 Gbps for FSDP-8).",
+)
+_NUM_FSDP_TRAINERS = flags.DEFINE_integer(
+    "num_fsdp_trainers", 8, "Number of FSDP trainer source shards."
 )
 
 
@@ -98,7 +103,17 @@ def _make_scaled_qwen_specs(
     num_routed_experts: Optional[int] = None,
     role: str = "source",
 ) -> List[Tuple[Tuple[int, ...], List[str], str, int]]:
-  """Generates parameter specs for scaled Qwen 3.5 35B."""
+  """Generates parameter specs for scaled Qwen 3.5 35B.
+
+  Args:
+    num_layers: Number of layers to generate. Defaults to _NUM_LAYERS flag.
+    num_routed_experts: Number of routed experts per layer. Defaults to
+      _NUM_ROUTED_EXPERTS flag.
+    role: "source", "destination", or "fsdp_source".
+
+  Returns:
+    List of tuples of (shape, sharding_spec, name, layer_idx).
+  """
   if num_layers is None:
     num_layers = _NUM_LAYERS.value
   if num_routed_experts is None:
@@ -112,32 +127,38 @@ def _make_scaled_qwen_specs(
   linear_conv_dim = 256
 
   is_dest = role == "destination"
+  is_fsdp = role == "fsdp_source"
   specs = []
+
+  def _axes(shape: Tuple[int, ...], dest_axes: List[str]) -> List[str]:
+    if is_fsdp:
+      return ["fsdp"] + [""] * (len(shape) - 1)
+    return dest_axes if is_dest else [""] * len(shape)
 
   for l in range(num_layers):
     if l % 2 == 0:
       # Even layer: Full Attention (GQA) + MoE Block
       specs.append((
           (dim, 2, 256),
-          ["", "", ""] if is_dest else ["", "", ""],
+          _axes((dim, 2, 256), ["", "", ""]),
           f"decoder.layers.{l}.attention.attention.key.kernel",
           l,
       ))
       specs.append((
           (dim, attn_dim),
-          ["", "tp_out"] if is_dest else ["", ""],
+          _axes((dim, attn_dim), ["", "tp_out"]),
           f"decoder.layers.{l}.attention.attention.out.kernel",
           l,
       ))
       specs.append((
           (dim, attn_dim),
-          ["", "tp_out"] if is_dest else ["", ""],
+          _axes((dim, attn_dim), ["", "tp_out"]),
           f"decoder.layers.{l}.attention.attention.query.kernel",
           l,
       ))
       specs.append((
           (dim, 2, 256),
-          ["", "", ""] if is_dest else ["", "", ""],
+          _axes((dim, 2, 256), ["", "", ""]),
           f"decoder.layers.{l}.attention.attention.value.kernel",
           l,
       ))
@@ -145,37 +166,37 @@ def _make_scaled_qwen_specs(
       # Odd layer: GDN Linear Attention + MoE Block
       specs.append((
           (linear_ba_dim, linear_conv_dim),
-          ["", ""] if is_dest else ["", ""],
+          _axes((linear_ba_dim, linear_conv_dim), ["", ""]),
           f"decoder.layers.{l}.attention.linear_attn.b_kernel",
           l,
       ))
       specs.append((
           (dim, linear_ba_dim),
-          ["", ""] if is_dest else ["", ""],
+          _axes((dim, linear_ba_dim), ["", ""]),
           f"decoder.layers.{l}.attention.linear_attn.ba_kernel",
           l,
       ))
       specs.append((
           (4, 1, linear_conv_dim),
-          ["", "", ""] if is_dest else ["", "", ""],
+          _axes((4, 1, linear_conv_dim), ["", "", ""]),
           f"decoder.layers.{l}.attention.linear_attn.conv1d.kernel",
           l,
       ))
       specs.append((
           (dim, attn_dim),
-          ["", "tp_out"] if is_dest else ["", ""],
+          _axes((dim, attn_dim), ["", "tp_out"]),
           f"decoder.layers.{l}.attention.linear_attn.g_kernel",
           l,
       ))
       specs.append((
           (attn_dim, dim),
-          ["", "tp_out"] if is_dest else ["", ""],
+          _axes((attn_dim, dim), ["", "tp_out"]),
           f"decoder.layers.{l}.attention.linear_attn.out_kernel",
           l,
       ))
       specs.append((
           (dim, attn_dim),
-          ["", "tp_out"] if is_dest else ["", ""],
+          _axes((dim, attn_dim), ["", "tp_out"]),
           f"decoder.layers.{l}.attention.linear_attn.qkvz_kernel",
           l,
       ))
@@ -183,37 +204,37 @@ def _make_scaled_qwen_specs(
     # Shared MoE block across both even and odd layers
     specs.append((
         (num_routed_experts, routed_mlp_dim, dim),
-        ["", "", "tp_wo"] if is_dest else ["", "", ""],
+        _axes((num_routed_experts, routed_mlp_dim, dim), ["", "", "tp_wo"]),
         f"decoder.layers.{l}.mlp.experts.down_proj.kernel",
         l,
     ))
     specs.append((
         (num_routed_experts, dim, routed_mlp_dim),
-        ["", "", "tp"] if is_dest else ["", "", ""],
+        _axes((num_routed_experts, dim, routed_mlp_dim), ["", "", "tp"]),
         f"decoder.layers.{l}.mlp.experts.gate_proj.kernel",
         l,
     ))
     specs.append((
         (num_routed_experts, dim, routed_mlp_dim),
-        ["", "", "tp"] if is_dest else ["", "", ""],
+        _axes((num_routed_experts, dim, routed_mlp_dim), ["", "", "tp"]),
         f"decoder.layers.{l}.mlp.experts.up_proj.kernel",
         l,
     ))
     specs.append((
         (shared_mlp_dim, dim),
-        ["", "tp_wo"] if is_dest else ["", ""],
+        _axes((shared_mlp_dim, dim), ["", "tp_wo"]),
         f"decoder.layers.{l}.mlp.shared_expert.down_proj.kernel",
         l,
     ))
     specs.append((
         (dim, shared_mlp_dim),
-        ["", "tp"] if is_dest else ["", ""],
+        _axes((dim, shared_mlp_dim), ["", "tp"]),
         f"decoder.layers.{l}.mlp.shared_expert.gate_proj.kernel",
         l,
     ))
     specs.append((
         (dim, shared_mlp_dim),
-        ["", "tp"] if is_dest else ["", ""],
+        _axes((dim, shared_mlp_dim), ["", "tp"]),
         f"decoder.layers.{l}.mlp.shared_expert.up_proj.kernel",
         l,
     ))
@@ -225,8 +246,20 @@ def build_variable_protos(
     specs: List[Tuple[Tuple[int, ...], List[str], str, int]],
     mesh_shape_dict: Dict[str, int],
     item_size: int = 2,
+    global_shard_idx: int = 0,
 ) -> List[raiden_service_pb2.VariableMetadataProto]:
-  """Constructs VariableMetadataProtos with explicit sharding specs and layouts."""
+  """Constructs VariableMetadataProtos with explicit sharding specs and layouts.
+
+  Args:
+    specs: List of tuples specifying variable shape, sharding spec, name, and
+      layer index.
+    mesh_shape_dict: Mapping of mesh dimension name to mesh size.
+    item_size: Byte size of each element (default 2 for bfloat16/float16).
+    global_shard_idx: Global shard index for this worker (default 0).
+
+  Returns:
+    List of VariableMetadataProto descriptors.
+  """
   protos = []
   for idx, (global_shape, spec_axes, name, _) in enumerate(specs):
     sharding_shape = [mesh_shape_dict.get(axis, 1) for axis in spec_axes]
@@ -240,7 +273,7 @@ def build_variable_protos(
             item_size=item_size,
             layer_idx=idx,
             sharding_spec=spec_axes,
-            global_shard_indices=[0],
+            global_shard_indices=[global_shard_idx],
         )
     )
   return protos
@@ -876,6 +909,327 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
         f"Tree Broadcast ({tree_res.elapsed:.3f}s) must outperform Flat"
         f" Direct Push ({flat_res.elapsed:.3f}s) under constrained NIC line"
         f" rate at N={self.num_destinations}.",
+    )
+
+  def test_fsdp8_sampler_ingress_bottleneck_latin_square_benchmark(
+      self,
+  ) -> None:
+    """Benchmarks 8-way FSDP trainer to 4 samplers bottlenecked on ingress NIC bandwidth.
+
+    Evaluates performance before our fix (synchronized alphabetical incast)
+    and after our fix (deterministic Latin Square circular shift).
+    """
+    num_fsdp = _NUM_FSDP_TRAINERS.value
+    num_dst = self.num_destinations
+
+    src_fsdp_mesh_dict = {"fsdp": num_fsdp}
+    src_fsdp_specs = _make_scaled_qwen_specs(
+        num_layers=self.num_layers_flag,
+        num_routed_experts=self.num_routed_experts_flag,
+        role="fsdp_source",
+    )
+    src_fsdp_slice_byte_sizes = [
+        int(np.prod(p.shape) // num_fsdp) * p.item_size
+        for p in build_variable_protos(
+            src_fsdp_specs, src_fsdp_mesh_dict, global_shard_idx=0
+        )
+    ]
+
+    ws_srcs: List[weight_synchronizer.WeightSynchronizer] = []
+    for i in range(num_fsdp):
+      ws = weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
+          num_layers=self.num_layers,
+          num_shards=1,
+          slice_byte_size=src_fsdp_slice_byte_sizes,
+          local_port=0,
+          listener_port=0,
+          bind_ip="127.0.0.1",
+          global_shard_indices=[i],
+      )
+      self.addCleanup(ws.shutdown)
+      ws_srcs.append(ws)
+
+    ws_dsts: List[weight_synchronizer.WeightSynchronizer] = []
+    for _ in range(num_dst):
+      ws = weight_synchronizer.WeightSynchronizer.test_only_create_cpu_instance(
+          num_layers=self.num_layers,
+          num_shards=1,
+          slice_byte_size=self.dst_slice_byte_sizes,
+          local_port=0,
+          listener_port=0,
+          bind_ip="127.0.0.1",
+      )
+      self.addCleanup(ws.shutdown)
+      ws_dsts.append(ws)
+
+    src_units = [
+        RaidenId("fsdp_trainer", str(i), "weights") for i in range(num_fsdp)
+    ]
+    dst_units = [
+        RaidenId("fsdp_sampler", str(i), "weights") for i in range(num_dst)
+    ]
+
+    mesh_axes = ["tp", "tp_wo", "tp_out"]
+    mesh_shape = [1] * len(mesh_axes)
+
+    for i, ws_src in enumerate(ws_srcs):
+      protos = build_variable_protos(
+          src_fsdp_specs, src_fsdp_mesh_dict, global_shard_idx=i
+      )
+      self.ctrl_client.register_work_unit(
+          src_units[i],
+          [f"127.0.0.1:{ws_src.local_port}"],
+          f"127.0.0.1:{ws_src.listener_port}",
+          mesh_shape=mesh_shape,
+          variables=protos,
+          mesh_axes=mesh_axes,
+      )
+
+    for j, ws_dst in enumerate(ws_dsts):
+      protos = build_variable_protos(
+          self.dst_specs, self.dst_mesh_dict, global_shard_idx=0
+      )
+      self.ctrl_client.register_work_unit(
+          dst_units[j],
+          [f"127.0.0.1:{ws_dst.local_port}"],
+          f"127.0.0.1:{ws_dst.listener_port}",
+          mesh_shape=mesh_shape,
+          variables=protos,
+          mesh_axes=mesh_axes,
+      )
+
+    nic_gbps = (
+        _TEST_ONLY_SIMULATED_NIC_GBPS.value
+        if _TEST_ONLY_SIMULATED_NIC_GBPS.value > 0.0
+        else 20.0
+    )
+
+    for ws in ws_dsts:
+      ws.test_only_set_bandwidth_limit(
+          test_only_simulated_egress_gbps=nic_gbps,
+          test_only_simulated_ingress_gbps=nic_gbps,
+      )
+    for ws in ws_srcs:
+      ws.test_only_set_bandwidth_limit(
+          test_only_simulated_egress_gbps=nic_gbps,
+          test_only_simulated_ingress_gbps=nic_gbps,
+      )
+
+    def _fill_fsdp_pattern(seed: int) -> None:
+      for i, ws in enumerate(ws_srcs):
+        for l in range(self.num_layers):
+          buf = ws.get_host_buffer(layer_idx=l, shard_idx=0)
+          words = buf.view(np.uint32)
+          words[:] = (
+              (np.uint32(seed & 0xFF) << np.uint32(24))
+              | (np.uint32(i & 0x07) << np.uint32(20))
+              | (np.uint32((l + 1) & 0x3F) << np.uint32(14))
+              | (
+                  np.arange(1, len(words) + 1, dtype=np.uint32)
+                  & np.uint32(0x3FFF)
+              )
+          )
+
+    def _verify_fsdp_destinations(seed: int, label: str) -> None:
+      expected_seed = np.uint32(seed & 0xFF)
+      for l in range(self.num_layers):
+        valid_bytes = self.layer_max_bytes[l]
+        ref_buf = ws_dsts[0].get_host_buffer(layer_idx=l, shard_idx=0)[
+            :valid_bytes
+        ]
+        ref_words = ref_buf.view(np.uint32)
+        self.assertTrue(
+            np.all((ref_words >> np.uint32(24)) == expected_seed),
+            f"{label} seed tag mismatch in layer {l} on sampler 0",
+        )
+        for j in range(1, num_dst):
+          dst_buf = ws_dsts[j].get_host_buffer(layer_idx=l, shard_idx=0)[
+              :valid_bytes
+          ]
+          dst_words = dst_buf.view(np.uint32)
+          self.assertTrue(
+              np.all((dst_words >> np.uint32(24)) == expected_seed),
+              f"{label} seed tag mismatch in layer {l} on sampler {j}",
+          )
+          self.assertTrue(
+              np.array_equal(dst_buf, ref_buf),
+              f"{label} sampler {j} mismatch against sampler 0 in layer {l}",
+          )
+
+    prev_pipeline_group_size = os.environ.get(
+        "RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE"
+    )
+    os.environ["RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE"] = "0"
+    old_broadcast_k = self.controller.broadcast_k
+    self.controller.broadcast_k = 64
+    loop = asyncio.new_event_loop()
+    try:
+      # Warmup transfer to initialize connection pools and threads across all 8x4 pairs
+      future_warmup = self.controller.start_transfer(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+          use_block_chunks=True,
+          is_sender=True,
+          uuid=2000,
+          req_id="fsdp8_warmup",
+          skip_d2h=True,
+          skip_tiling={l: False for l in range(self.num_layers)},
+      )
+      loop.run_until_complete(future_warmup.wait())
+      for ws in ws_dsts:
+        ws.wait_for_transfer_completion(uuid=2000)
+
+      # Run 1: Post-Fix (Latin Square Balanced Circular Shift)
+      for ws in ws_srcs:
+        ws.reset_metrics()
+      for ws in ws_dsts:
+        ws.reset_metrics()
+
+      _fill_fsdp_pattern(0x5A)
+
+      for ws in ws_dsts:
+        for l in range(self.num_layers):
+          buf = ws.get_host_buffer(layer_idx=l, shard_idx=0)
+          buf[:] = 0x00
+
+      uuid_post = 2001
+      t0 = time.perf_counter()
+      future = self.controller.start_transfer(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+          use_block_chunks=True,
+          is_sender=True,
+          uuid=uuid_post,
+          req_id="fsdp8_postfix",
+          skip_d2h=True,
+          skip_tiling={l: False for l in range(self.num_layers)},
+      )
+      loop.run_until_complete(future.wait())
+
+      for ws in ws_dsts:
+        ws.wait_for_transfer_completion(uuid=uuid_post)
+
+      t_postfix = time.perf_counter() - t0
+      _verify_fsdp_destinations(0x5A, "Post-fix Latin Square")
+      self.assertEqual(
+          sum(ws.get_metrics()["total_h2h_bytes"] for ws in ws_srcs),
+          self.total_model_bytes * num_dst,
+      )
+
+      # Run 2: Pre-Fix (Synchronized Alphabetical Incast)
+      for ws in ws_srcs:
+        ws.reset_metrics()
+      for ws in ws_dsts:
+        ws.reset_metrics()
+
+      _fill_fsdp_pattern(0xA5)
+
+      for ws in ws_dsts:
+        for l in range(self.num_layers):
+          buf = ws.get_host_buffer(layer_idx=l, shard_idx=0)
+          buf[:] = 0x00
+
+      self.controller._plan_cache.clear()
+      sched = loop.run_until_complete(
+          self.controller._compute_transfer_schedule(
+              src_units=src_units,
+              dst_units=dst_units,
+              skip_tiling={l: False for l in range(self.num_layers)},
+          )
+      )
+
+      unshifted_schedules = {
+          u: {
+              s_idx: sorted(entries, key=lambda e: e[0])
+              for s_idx, entries in s_map.items()
+          }
+          for u, s_map in sched.direct_schedules.items()
+      }
+
+      uuid_pre = 2002
+      t0 = time.perf_counter()
+      future = self.controller.start_transfer(
+          src_units=src_units,
+          dst_units=dst_units,
+          shard_push_schedules=unshifted_schedules,
+          dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+          use_block_chunks=True,
+          is_sender=True,
+          uuid=uuid_pre,
+          req_id="fsdp8_prefix",
+          skip_d2h=True,
+          skip_tiling={l: False for l in range(self.num_layers)},
+      )
+      loop.run_until_complete(future.wait())
+
+      for ws in ws_dsts:
+        ws.wait_for_transfer_completion(uuid=uuid_pre)
+
+      t_prefix = time.perf_counter() - t0
+      _verify_fsdp_destinations(0xA5, "Pre-fix Incast")
+      self.assertEqual(
+          sum(ws.get_metrics()["total_h2h_bytes"] for ws in ws_srcs),
+          self.total_model_bytes * num_dst,
+      )
+    finally:
+      self.controller.broadcast_k = old_broadcast_k
+      loop.close()
+      if prev_pipeline_group_size is not None:
+        os.environ["RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE"] = (
+            prev_pipeline_group_size
+        )
+      else:
+        os.environ.pop("RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE", None)
+
+    total_model_mb = self.total_model_bytes / 1e6
+    total_transferred_gb = (self.total_model_bytes * num_dst) / 1e9
+    total_transferred_gbit = (self.total_model_bytes * num_dst * 8) / 1e9
+
+    post_throughput = total_transferred_gb / max(t_postfix, 1e-9)
+    post_ingress_gbps = total_transferred_gbit / max(t_postfix, 1e-9)
+
+    pre_throughput = total_transferred_gb / max(t_prefix, 1e-9)
+    pre_ingress_gbps = total_transferred_gbit / max(t_prefix, 1e-9)
+
+    speedup = t_prefix / max(t_postfix, 1e-9)
+
+    print("\n" + "=" * 115)
+    print(
+        "FSDP-8 Sampler Ingress Bottleneck Benchmark (Line Rate:"
+        f" {nic_gbps:.1f} Gbps/host, Model Volume: ~{total_model_mb:.1f}"
+        f" MB, N={num_dst} Samplers)"
+    )
+    print("=" * 115)
+    print(
+        f"{'Schedule Mode':<35} {'Time':<12} {'Throughput':<16} "
+        f"{'Agg Ingress BW':<18} {'Speedup':<12} {'Parity':<8}"
+    )
+    print("-" * 115)
+    print(
+        f"{'Pre-Fix (Alphabetical Incast)':<35} {t_prefix:.3f} s     "
+        f"{pre_throughput:.2f} GB/s       {pre_ingress_gbps:.2f} Gbps         "
+        f"{'1.00x':<12} {'PASS':<8}"
+    )
+    print(
+        f"{'Post-Fix (Latin Square Shift)':<35} {t_postfix:.3f} s    "
+        f" {post_throughput:.2f} GB/s       {post_ingress_gbps:.2f} Gbps       "
+        f"  {f'{speedup:.2f}x':<12} {'PASS':<8}"
+    )
+    print("=" * 115 + "\n")
+
+    self.assertLess(t_postfix, t_prefix)
+    # In a flow shop of N=8 trainers across M=4 samplers, the makespan of the
+    # unbarriered incast schedule has a theoretical lower bound of (N + M - 1)tau
+    # = 11tau, yielding a theoretical baseline speedup of 11/8 = 1.375x over ideal
+    # unbarriered incast (increasing towards M=4x under real-world queuing).
+    self.assertGreater(
+        speedup,
+        1.30,
+        f"Post-fix Latin Square shift ({t_postfix:.3f}s) must outperform"
+        f" pre-fix incast ({t_prefix:.3f}s) by >=1.30x (measured:"
+        f" {speedup:.2f}x).",
     )
 
   def _push_block_transport_entries(

@@ -970,10 +970,20 @@ absl::StatusOr<std::vector<Request>> BuildBufferRequests(
 absl::Status RawBufferTransport::PushBuffers(
     const std::vector<BufferPushTask>& tasks, int parallelism, uint64_t uuid) {
   std::vector<BufferPushTask> grouped_tasks = tasks;
-  std::stable_sort(grouped_tasks.begin(), grouped_tasks.end(),
-                   [](const BufferPushTask& a, const BufferPushTask& b) {
-                     return a.peer < b.peer;
-                   });
+  absl::flat_hash_map<std::string, size_t> peer_first_seen;
+  for (const auto& task : tasks) {
+    peer_first_seen.try_emplace(task.peer, peer_first_seen.size());
+  }
+  if (peer_first_seen.size() > 1) {
+    const auto& const_peer_first_seen = peer_first_seen;
+    std::stable_sort(grouped_tasks.begin(), grouped_tasks.end(),
+                     [&const_peer_first_seen](const BufferPushTask& a,
+                                              const BufferPushTask& b) {
+                       if (a.peer == b.peer) return false;
+                       return const_peer_first_seen.at(a.peer) <
+                              const_peer_first_seen.at(b.peer);
+                     });
+  }
 
   struct BatchInfo {
     std::string peer;

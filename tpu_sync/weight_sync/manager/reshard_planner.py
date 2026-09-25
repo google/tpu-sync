@@ -747,6 +747,7 @@ class ReshardPlanner:
 
     variable_plans = {}
     variable_to_plan_id = {}
+    local_skip_tiling = dict(skip_tiling) if skip_tiling else {}
     if shard_push_schedules:
       logging.info("Using pre-computed shard_push_schedules")
       computed_schedules = shard_push_schedules
@@ -1106,7 +1107,7 @@ class ReshardPlanner:
       plan_unit_counts_by_pid = {}
       plan_host_counts_by_pid = {}
 
-      for src_unit in src_units:
+      for src_unit_idx, src_unit in enumerate(src_units):
         src_vars = src_vars_by_unit.get(src_unit, [])
         src_shards = resolve_shards_locked(src_unit)
         unit_plans_by_id = {}
@@ -1494,6 +1495,14 @@ class ReshardPlanner:
               if not matched_items:
                 continue
 
+              if len(matched_items) > 1:
+                shift = src_unit_idx % len(matched_items)
+                shifted_matched_items = (
+                    matched_items[shift:] + matched_items[:shift]
+                )
+              else:
+                shifted_matched_items = matched_items
+
               num_c = len(converted_chunks)
               first_chunk = converted_chunks[0]
               for (
@@ -1503,7 +1512,7 @@ class ReshardPlanner:
                   dst_peer,
                   d_u,
                   d_h,
-              ) in matched_items:
+              ) in shifted_matched_items:
                 if d_u is not None:
                   tmpl_unit_counts[d_u] = tmpl_unit_counts.get(d_u, 0) + num_c
                   if d_u not in shard_dst_units_seen:
@@ -1521,13 +1530,18 @@ class ReshardPlanner:
                       for chunk_desc in converted_chunks
                   )
             else:
+              if len(dst_targets) > 1:
+                shift = src_unit_idx % len(dst_targets)
+                shifted_dst_targets = dst_targets[shift:] + dst_targets[:shift]
+              else:
+                shifted_dst_targets = dst_targets
               for (
                   dst_unit,
                   dst_unit_idx,
                   is_dst_legacy,
                   num_dst_shards,
                   dst_shard_items,
-              ) in dst_targets:
+              ) in shifted_dst_targets:
                 for local_dst_idx, dst_slice, dst_peer in dst_shard_items:
                   converted_chunks = active_slice_chunks.get(
                       (dst_slice, is_dst_legacy)

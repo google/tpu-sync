@@ -16,14 +16,20 @@
 
 #include <poll.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -33,8 +39,11 @@
 #include "absl/log/absl_check.h"
 #include "absl/random/random.h"
 #include "absl/status/status.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/strip.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
@@ -59,7 +68,84 @@ absl::Span<const std::string_view> HooksFor(FaultInjectionType action) {
   return {};
 }
 
+constexpr std::string_view kFaultInjectionFileEnvVar =
+    "RAIDEN_FAULT_INJECTION_FILE";
+
+__attribute__((constructor)) void InitFaultInjectorFromEnvAtLoad() {
+  if (const char* p = std::getenv(kFaultInjectionFileEnvVar.data());
+      p != nullptr && p[0] != '\0') {
+    (void)GetFaultInjector();
+  }
+}
+
+// Plain-text format: one rule per line (`#` comments and blank lines ignored):
+//   <hook|pattern*> <fail|delay> <probability> [min_delay_ms [max_delay_ms]]
+absl::Status LoadRulesFromText(std::string_view content,
+                               FaultInjector& injector) {
+  FaultInjectionRules rules;
+  for (std::string_view line :
+       absl::StrSplit(content, '\n', absl::SkipEmpty())) {
+    line = absl::StripAsciiWhitespace(line);
+    if (line.empty() || line[0] == '#') continue;
+    std::vector<std::string_view> cols =
+        absl::StrSplit(line, absl::ByAnyChar(" \t,"), absl::SkipEmpty());
+    if (cols.size() < 3 || cols.size() > 5) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("invalid rule line: ", line));
+    }
+    FaultInjectionRule r;
+    r.hook = std::string(cols[0]);
+    if (cols[1] == "delay") {
+      r.action = FaultInjectionType::kDelay;
+    } else if (cols[1] == "fail") {
+      r.action = FaultInjectionType::kFail;
+    } else {
+      return absl::InvalidArgumentError(
+          absl::StrCat("unknown action: ", cols[1]));
+    }
+    if (!absl::SimpleAtod(cols[2], &r.probability)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("invalid probability: ", cols[2]));
+    }
+    if (cols.size() >= 4 && !absl::SimpleAtoi(cols[3], &r.min_delay_ms)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("invalid min_delay_ms: ", cols[3]));
+    }
+    if (cols.size() == 5 && !absl::SimpleAtoi(cols[4], &r.max_delay_ms)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("invalid max_delay_ms: ", cols[4]));
+    }
+    rules.push_back(std::move(r));
+  }
+  return injector.Install(rules);
+}
+
+void WriteStatusFile(std::string_view status_path, bool armed,
+                     uint64_t total_hits,
+                     const absl::flat_hash_map<std::string, uint64_t>& hits) {
+  std::string out_str =
+      absl::StrCat("armed=", armed ? 1 : 0, "\ntotal_hits=", total_hits, "\n");
+  for (const auto& [hook, count] : hits) {
+    absl::StrAppend(&out_str, hook, "=", count, "\n");
+  }
+  std::string tmp_path = absl::StrCat(status_path, ".tmp");
+  if (std::ofstream out(tmp_path); out) {
+    out << out_str;
+    out.close();
+    (void)std::rename(tmp_path.c_str(), std::string(status_path).c_str());
+  }
+}
+
 }  // namespace
+
+FaultInjector::FaultInjector() {
+  if (const char* p = std::getenv(kFaultInjectionFileEnvVar.data());
+      p != nullptr && p[0] != '\0') {
+    StartFileWatcher(p);
+  }
+}
+
+FaultInjector::~FaultInjector() { StopFileWatcher(); }
 
 bool FaultInjector::IsHookActive(std::string_view hook) const noexcept {
   if (!HasActiveInjections()) return false;
@@ -179,6 +265,64 @@ uint64_t FaultInjector::GetHitCount(std::string_view hook) const {
 absl::flat_hash_map<std::string, uint64_t> FaultInjector::GetHitCounts() const {
   absl::ReaderMutexLock lock(mu_);
   return rule_hits_;
+}
+
+void FaultInjector::StartFileWatcher(std::string_view file_path,
+                                     absl::Duration poll_interval) {
+  StopFileWatcher();
+  if (file_path.empty()) return;
+  {
+    absl::MutexLock lock(watcher_mu_);
+    watcher_stopping_ = false;
+  }
+  watcher_thread_ = std::thread(&FaultInjector::WatcherLoop, this,
+                                std::string(file_path), poll_interval);
+}
+
+void FaultInjector::StopFileWatcher() {
+  if (!watcher_thread_.joinable()) return;
+  {
+    absl::MutexLock lock(watcher_mu_);
+    watcher_stopping_ = true;
+  }
+  watcher_thread_.join();
+}
+
+void FaultInjector::WatcherLoop(std::string file_path,
+                                absl::Duration poll_interval) {
+  const std::string status_path = absl::StrCat(file_path, ".status.", getpid());
+  std::string last_content;
+  bool status_written = false;
+  bool last_armed = false;
+  uint64_t last_hits = 0;
+
+  while (true) {
+    if (std::ifstream in(file_path); in) {
+      std::string content((std::istreambuf_iterator<char>(in)), {});
+      if (content != last_content) {
+        last_content = std::move(content);
+        LoadRulesFromText(last_content, *this).IgnoreError();
+      }
+    } else if (!last_content.empty()) {
+      Install({}).IgnoreError();
+      last_content.clear();
+    }
+
+    bool armed = HasActiveInjections();
+    uint64_t total_hits = GetHitCount();
+    if (!status_written || armed != last_armed || total_hits != last_hits) {
+      WriteStatusFile(status_path, armed, total_hits, GetHitCounts());
+      status_written = true;
+      last_armed = armed;
+      last_hits = total_hits;
+    }
+
+    absl::MutexLock lock(watcher_mu_);
+    if (watcher_mu_.AwaitWithTimeout(absl::Condition(&watcher_stopping_),
+                                     poll_interval)) {
+      break;
+    }
+  }
 }
 
 void FaultInjector::ExecuteDelay(std::string_view hook) {

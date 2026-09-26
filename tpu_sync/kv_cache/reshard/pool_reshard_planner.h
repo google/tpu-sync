@@ -84,7 +84,20 @@ struct PoolReshardPlan {
   int32_t expected_pushes_per_pool = 0;
   std::vector<int32_t> transfer_pool_indices;
   std::vector<std::string> pool_dtype_tags;
+  // Pools pair up by tag, and a source unit may register only a subset of
+  // the destination's tags. Per source unit: destination pool index ->
+  // that unit's own pool index for every transferred pool it registers,
+  // and its complete per-pool dtype tag list. The coordinator rewrites a
+  // sender's request into the sender's pool index space with these.
+  std::map<RaidenId, std::map<int32_t, int32_t>,
+           RequestBlockRegistry::RaidenIdLess>
+      src_pool_indices;
+  std::map<RaidenId, std::vector<std::string>,
+           RequestBlockRegistry::RaidenIdLess>
+      src_pool_dtype_tags;
   std::vector<int64_t> dst_device_block_ids;
+  // A source's schedule key is its registered transfer rank: the worker id
+  // it dispatches under and the node id a receiver resolves its pushes by.
   std::map<RaidenId, int32_t, RequestBlockRegistry::RaidenIdLess>
       src_schedule_keys;
   int32_t parallelism = 1;

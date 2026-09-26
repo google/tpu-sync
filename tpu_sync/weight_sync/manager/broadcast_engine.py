@@ -498,15 +498,10 @@ class BroadcastEngine:
 
       active_pushes[s] += 1
 
-      ref_offset = group.node_slice_offsets[s][group.ref_key]
-      s_shard_idx = ref_offset[0]
-
-      sub_schedule: dict[RaidenId, dict[int, list[Any]]] = {
-          s: {s_shard_idx: []}
-      }
+      sub_schedule: dict[RaidenId, dict[int, list[Any]]] = {s: {}}
       hop_expected_block_count = 0
       for key, k_targets in group.keys_and_sorted_targets:
-        _, k_s_block_id, k_s_block_offset, k_s_stride = (
+        k_s_shard_idx, k_s_block_id, k_s_block_offset, k_s_stride = (
             group.node_slice_offsets[s][key]
         )
         k_size = key[4]
@@ -539,7 +534,7 @@ class BroadcastEngine:
               k_layer_idx,
               k_pool_group,
           )
-          sub_schedule[s][s_shard_idx].append(entry)
+          sub_schedule[s].setdefault(k_s_shard_idx, []).append(entry)
 
           is_contiguous = (k_count == 1) or (
               k_s_stride == k_size and k_dst_stride == k_size
@@ -548,17 +543,23 @@ class BroadcastEngine:
           hop_expected_block_count += push_count
 
       if s != group.src_unit:
-        sub_schedule[s][s_shard_idx] = _coalesce_contiguous_relay_entries(
-            sub_schedule[s][s_shard_idx],
-            is_weight_sync=bool(final_plan.is_weight_sync),
-        )
-        hop_expected_block_count = sum(
-            1 if (e[9] == 1 or (e[7] == e[4] and e[8] == e[4])) else e[9]
-            for e in sub_schedule[s][s_shard_idx]
-        )
+        hop_expected_block_count = 0
+        for shard_idx, entries in list(sub_schedule[s].items()):
+          sub_schedule[s][shard_idx] = _coalesce_contiguous_relay_entries(
+              entries,
+              is_weight_sync=bool(final_plan.is_weight_sync),
+          )
+          hop_expected_block_count += sum(
+              1 if (e[9] == 1 or (e[7] == e[4] and e[8] == e[4])) else e[9]
+              for e in sub_schedule[s][shard_idx]
+          )
 
-      hop_uuid = random.randint(1, 2**63 - 1)
-      hop_req_id = f"{req_id}_{group.group_idx}_{hop_uuid}"
+      hop_uuid = (
+          final_plan.uuid
+          if (final_plan.uuid is not None and final_plan.uuid > 0)
+          else random.randint(1, 2**63 - 1)
+      )
+      hop_req_id = f"{req_id}_{group.group_idx}_{dst_unit}_{hop_uuid}"
 
       sub_plan = type(final_plan)(
           src_units=[s],

@@ -540,6 +540,185 @@ class BroadcastEngineTest(absltest.TestCase):
             )
         )
 
+  def test_execute_slice_broadcast_multishard_relay(self) -> None:
+    """Verifies relay nodes dispatch push schedules partitioned by actual shard index."""
+    rpc_client = RecordingWorkerRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(rpc_client)
+
+    src = RaidenId(job_name="src", job_replica_id="0", data_name="w")
+    relay = RaidenId(job_name="relay", job_replica_id="0", data_name="w")
+    dst = RaidenId(job_name="dst", job_replica_id="0", data_name="w")
+
+    # key0 maps to relay shard 0 (e.g. Host 0)
+    key0 = (src, 0, 0, 0, 1024, 0, 1, 0, 0)
+    # key1 maps to relay shard 1 (e.g. Host 1)
+    key1 = (src, 0, 1, 0, 1024, 0, 1, 0, 0)
+
+    targets0: list[tuple[Any, ...]] = [
+        (relay, "127.0.0.1:8001", 0, 0, 0, 0),
+        (dst, "127.0.0.1:8002", 0, 0, 0, 0),
+    ]
+    targets1: list[tuple[Any, ...]] = [
+        (relay, "127.0.0.1:8001", 1, 1, 0, 0),
+        (dst, "127.0.0.1:8002", 1, 1, 0, 0),
+    ]
+
+    final_plan = raiden_controller.TransferPlan(
+        src_units=[src],
+        dst_units=[relay, dst],
+        plan=None,
+        worker_data_addresses={
+            src: ["127.0.0.1:8000"],
+            relay: ["127.0.0.1:8001"],
+            dst: ["127.0.0.1:8002"],
+        },
+        is_weight_sync=True,
+        uuid=42,
+    )
+    registered_shards = {src: ["s0"], relay: ["s0", "s1"], dst: ["s0", "s1"]}
+
+    asyncio.run(
+        engine.execute_slice_broadcast(
+            keys_and_targets=[(key0, targets0), (key1, targets1)],
+            final_plan=final_plan,
+            fanout_k=1,
+            req_id="req_multishard_test",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards=registered_shards,
+        )
+    )
+
+    # Find the relay's forward transfer plan 
+    # (where relay is sender, dst is receiver)
+    relay_forward_plans = [
+        plan
+        for target_id, plan in rpc_client.invocations
+        if target_id == relay
+        and plan.src_units[0] == relay
+        and plan.dst_units[0] == dst
+    ]
+    self.assertLen(relay_forward_plans, 1)
+    relay_plan = relay_forward_plans[0]
+    self.assertEqual(relay_plan.uuid, 42, "Relay plan must preserve final_plan.uuid")
+
+    # Verify both shard 0 and shard 1 are present in the relay's push schedule
+    self.assertIn(relay, relay_plan.shard_push_schedules)
+    relay_schedules = relay_plan.shard_push_schedules[relay]
+    self.assertIn(
+        0, relay_schedules, "Relay must include push schedules for shard 0"
+    )
+    self.assertIn(
+        1, relay_schedules, "Relay must include push schedules for shard 1"
+    )
+
+    # Verify key0 is under shard 0 and key1 is under shard 1
+    self.assertLen(relay_schedules[0], 1)
+    entry0 = relay_schedules[0][0]
+    self.assertEqual(
+        entry0[1], 0, "Destination shard index for key0 should be 0"
+    )
+    self.assertEqual(entry0[5], 0, "Source block ID for key0 should be 0")
+    self.assertEqual(entry0[6], 0, "Destination block ID for key0 should be 0")
+
+    self.assertLen(relay_schedules[1], 1)
+    entry1 = relay_schedules[1][0]
+    self.assertEqual(
+        entry1[1], 1, "Destination shard index for key1 should be 1"
+    )
+    self.assertEqual(entry1[5], 1, "Source block ID for key1 should be 1")
+    self.assertEqual(entry1[6], 1, "Destination block ID for key1 should be 1")
+
+    self.assertEqual(relay_plan.expected_block_count, 2)
+
+  def test_execute_slice_broadcast_multishard_relay_coalescing(self) -> None:
+    """Verifies contiguous slices on multiple shards coalesce independently on relay."""
+    rpc_client = RecordingWorkerRpcClient()
+    self.addCleanup(rpc_client.close)
+    engine = broadcast_engine.BroadcastEngine(rpc_client)
+
+    src = RaidenId(job_name="src", job_replica_id="0", data_name="w")
+    relay = RaidenId(job_name="relay", job_replica_id="0", data_name="w")
+    dst = RaidenId(job_name="dst", job_replica_id="0", data_name="w")
+
+    # Two contiguous slices for shard 0
+    # (block_id 0, offsets 0 and 512, size 512)
+    key0_a = (src, 0, 0, 0, 512, 0, 1, 0, 0)
+    key0_b = (src, 0, 0, 512, 512, 0, 1, 0, 0)
+    # Two contiguous slices for shard 1
+    # (block_id 1, offsets 0 and 512, size 512)
+    key1_a = (src, 0, 1, 0, 512, 0, 1, 0, 0)
+    key1_b = (src, 0, 1, 512, 512, 0, 1, 0, 0)
+
+    targets0_a: list[tuple[Any, ...]] = [
+        (relay, "127.0.0.1:8001", 0, 0, 0, 0),
+        (dst, "127.0.0.1:8002", 0, 0, 0, 0),
+    ]
+    targets0_b: list[tuple[Any, ...]] = [
+        (relay, "127.0.0.1:8001", 0, 0, 512, 0),
+        (dst, "127.0.0.1:8002", 0, 0, 512, 0),
+    ]
+    targets1_a: list[tuple[Any, ...]] = [
+        (relay, "127.0.0.1:8001", 1, 1, 0, 0),
+        (dst, "127.0.0.1:8002", 1, 1, 0, 0),
+    ]
+    targets1_b: list[tuple[Any, ...]] = [
+        (relay, "127.0.0.1:8001", 1, 1, 512, 0),
+        (dst, "127.0.0.1:8002", 1, 1, 512, 0),
+    ]
+
+    final_plan = raiden_controller.TransferPlan(
+        src_units=[src],
+        dst_units=[relay, dst],
+        plan=None,
+        worker_data_addresses={
+            src: ["127.0.0.1:8000"],
+            relay: ["127.0.0.1:8001"],
+            dst: ["127.0.0.1:8002"],
+        },
+        is_weight_sync=True,
+    )
+    registered_shards = {src: ["s0"], relay: ["s0", "s1"], dst: ["s0", "s1"]}
+
+    asyncio.run(
+        engine.execute_slice_broadcast(
+            keys_and_targets=[
+                (key0_a, targets0_a),
+                (key0_b, targets0_b),
+                (key1_a, targets1_a),
+                (key1_b, targets1_b),
+            ],
+            final_plan=final_plan,
+            fanout_k=1,
+            req_id="req_coalesce_test",
+            dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+            registered_shards=registered_shards,
+        )
+    )
+
+    relay_forward_plans = [
+        plan
+        for target_id, plan in rpc_client.invocations
+        if target_id == relay
+        and plan.src_units[0] == relay
+        and plan.dst_units[0] == dst
+    ]
+    self.assertLen(relay_forward_plans, 1)
+    relay_plan = relay_forward_plans[0]
+    relay_schedules = relay_plan.shard_push_schedules[relay]
+
+    # Both shards must have their 2 slices coalesced into 1 contiguous transfer
+    # of 1024 bytes
+    self.assertLen(relay_schedules[0], 1)
+    self.assertEqual(relay_schedules[0][0][4], 1024)
+    self.assertEqual(relay_schedules[0][0][5], 0)
+
+    self.assertLen(relay_schedules[1], 1)
+    self.assertEqual(relay_schedules[1][0][4], 1024)
+    self.assertEqual(relay_schedules[1][0][5], 1)
+
+    self.assertEqual(relay_plan.expected_block_count, 2)
+
 
 if __name__ == "__main__":
   absltest.main()

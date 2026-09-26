@@ -39,6 +39,7 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/strip.h"
 #include "absl/types/span.h"
@@ -409,10 +410,17 @@ inline absl::Status ValidateCommonPoolReshardPlan(
           absl::StrCat("transfer pool index out of range: ", pool_idx));
     }
     if (plan.pool_dtype_tags(pool_idx) != spec->dtype_tag) {
+      std::string local_pools;
+      for (size_t i = 0; i < base->num_pools(); ++i) {
+        absl::StrAppend(&local_pools, i ? "," : "", base->pool(i)->tag, ":",
+                        base->pool(i)->dtype_tag);
+      }
       return absl::InvalidArgumentError(
           absl::StrCat("plan dtype tag mismatch for pool ", pool_idx, " (",
                        spec->tag, "): plan=", plan.pool_dtype_tags(pool_idx),
-                       " local=", spec->dtype_tag));
+                       " local=", spec->dtype_tag, "; plan dtype tags=[",
+                       absl::StrJoin(plan.pool_dtype_tags(), ","),
+                       "] local pools=[", local_pools, "]"));
     }
   }
   if (plan.shard_push_schedules().empty()) {

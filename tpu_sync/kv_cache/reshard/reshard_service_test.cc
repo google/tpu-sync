@@ -315,6 +315,136 @@ class ReshardStackTest : public ::testing::Test {
                     /*num_blocks=*/16);
   }
 
+  // Pipeline-parallel on both sides: source rank r and destination stage r
+  // each register only layer r's pool. Stage r's control address is
+  // 10.0.0.2:<9600 + r>.
+  static RaidenId PipelineStage(int stage) {
+    RaidenId unit = DstUnit();
+    unit.job_replica_id = absl::StrCat(unit.job_replica_id, "-rank", stage);
+    return unit;
+  }
+
+  void RegisterPipelinedUnits(int num_stages) {
+    for (int rank = 0; rank < num_stages; ++rank) {
+      tpu_sync::rpc::ControlRequest req;
+      req.set_command(
+          tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+      auto* reg = req.mutable_register_work_unit_request();
+      *reg->mutable_unit() = RaidenIdToProto(Unit(rank));
+      reg->add_shards(absl::StrCat("10.0.0.1:", 9000 + rank));
+      reg->set_control_plane_rpc_address(
+          absl::StrCat("10.0.0.1:", 9100 + rank));
+      *reg->add_pools() = MakePool(absl::StrCat("fa.l", rank), 1024, 1024, 16);
+      reg->set_layout_fingerprint("fp1");
+      reg->set_page_tokens(512);
+      reg->set_transfer_parallelism(num_stages);
+      reg->set_transfer_rank(rank);
+      tpu_sync::rpc::ControlResponse resp = Handle(req.SerializeAsString());
+      ASSERT_TRUE(resp.success()) << resp.message();
+    }
+    for (int stage = 0; stage < num_stages; ++stage) {
+      tpu_sync::rpc::ControlRequest req;
+      req.set_command(
+          tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+      auto* reg = req.mutable_register_work_unit_request();
+      *reg->mutable_unit() = RaidenIdToProto(PipelineStage(stage));
+      reg->add_shards(absl::StrCat("10.0.0.2:", 9400 + stage));
+      reg->set_control_plane_rpc_address(
+          absl::StrCat("10.0.0.2:", 9600 + stage));
+      *reg->add_pools() = MakePool(absl::StrCat("fa.l", stage), 1024, 1024, 16);
+      reg->set_layout_fingerprint("fp1");
+      reg->set_page_tokens(512);
+      reg->set_transfer_parallelism(num_stages);
+      reg->set_transfer_rank(stage);
+      tpu_sync::rpc::ControlResponse resp = Handle(req.SerializeAsString());
+      ASSERT_TRUE(resp.success()) << resp.message();
+    }
+  }
+
+  // Every source rank registers one block of its layer's pool for the
+  // request.
+  void RegisterPipelinedSpans(const std::string& req_id, int64_t uuid,
+                              int num_stages) {
+    for (int rank = 0; rank < num_stages; ++rank) {
+      tpu_sync::rpc::ControllerRequest req;
+      req.set_command(
+          tpu_sync::rpc::ControllerRequest::COMMAND_REGISTER_REQUEST_BLOCKS);
+      auto* block_req = req.mutable_register_request_blocks_request();
+      block_req->set_req_id(req_id);
+      block_req->set_uuid(uuid);
+      *block_req->mutable_unit() = RaidenIdToProto(Unit(rank));
+      block_req->add_block_ids(3 + rank);
+      auto* entry = block_req->add_pool_spans();
+      entry->set_tag(absl::StrCat("fa.l", rank));
+      entry->add_block_ids(3 + rank);
+      auto* span = entry->add_spans();
+      span->set_src_block_ordinal(0);
+      span->set_src_offset_bytes(0);
+      span->set_dst_block_index(0);
+      span->set_dst_offset_bytes(0);
+      span->set_size_bytes(1024);
+      span->set_count(1);
+      entry->set_declared_bytes(1024);
+      entry->set_dst_space_version(1);
+      tpu_sync::rpc::ControllerResponse resp =
+          HandleController(req.SerializeAsString());
+      ASSERT_TRUE(resp.success()) << resp.message();
+    }
+  }
+
+  // One destination stage plans the request against every source rank,
+  // pulling its own layer into block 7.
+  tpu_sync::rpc::ControllerResponse CoordinateStage(const std::string& req_id,
+                                                    int64_t uuid,
+                                                    int num_stages, int stage) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_COORDINATE_TRANSFER);
+    auto* coord = req.mutable_coordinate_transfer_request();
+    for (int rank = 0; rank < num_stages; ++rank) {
+      *coord->add_src_units() = RaidenIdToProto(Unit(rank));
+    }
+    *coord->add_dst_units() = RaidenIdToProto(PipelineStage(stage));
+    coord->set_uuid(uuid);
+    coord->set_is_sender(true);
+    coord->set_dst_mem_type(tpu_sync::rpc::MEMORY_TYPE_HBM);
+    coord->set_use_block_chunks(true);
+    coord->set_req_id(req_id);
+    coord->add_dst_device_block_ids(7);
+    coord->add_transfer_pool_tags(absl::StrCat("fa.l", stage));
+    coord->add_dst_block_counts(1);
+    return HandleController(req.SerializeAsString());
+  }
+
+  tpu_sync::rpc::ControllerResponse CancelIfUnclaimed(const std::string& req_id,
+                                                      int64_t uuid) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(tpu_sync::rpc::ControllerRequest::
+                        COMMAND_CANCEL_REQUEST_BLOCKS_IF_UNCLAIMED);
+    req.mutable_cancel_request_blocks_if_unclaimed_request()->set_req_id(
+        req_id);
+    req.mutable_cancel_request_blocks_if_unclaimed_request()->set_uuid(uuid);
+    return HandleController(req.SerializeAsString());
+  }
+
+  std::vector<int> RequestBlockStatuses(const std::string& req_id,
+                                        int64_t uuid) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_GET_REQUEST_BLOCK_STATUS);
+    auto* key = req.mutable_get_request_block_status_request()->add_keys();
+    key->set_req_id(req_id);
+    key->set_uuid(uuid);
+    tpu_sync::rpc::ControllerResponse resp =
+        HandleController(req.SerializeAsString());
+    EXPECT_TRUE(resp.success()) << resp.message();
+    std::vector<int> statuses;
+    for (int status : resp.get_request_block_status_response().statuses()) {
+      statuses.push_back(status);
+    }
+    return statuses;
+  }
+
   tpu_sync::rpc::ControlResponse Handle(const std::string& bytes) {
     tpu_sync::rpc::ControlResponse resp;
     resp.ParseFromString(service_->HandleFrame(bytes));
@@ -865,6 +995,342 @@ TEST_F(ReshardStackTest, TwoDestinationsArmEachThenDispatchSendersOnce) {
     EXPECT_EQ(schedule.entries(0).size_bytes(),
               schedule.entries(1).size_bytes());
   }
+}
+
+TEST_F(ReshardStackTest, SubsetSourceManifestsPairPoolsByTag) {
+  // Pipeline-parallel source: rank r registers only its own layer's pool
+  // (tag fa.l<r>), and the destination registers both layers. Each rank
+  // covers the whole request for its layer; the plan pairs pools by tag,
+  // hands the receiver destination-canonical pool indices, and rewrites
+  // every sender's request into that sender's own pool index space.
+  for (int rank = 0; rank < 2; ++rank) {
+    tpu_sync::rpc::ControlRequest req;
+    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+    auto* reg = req.mutable_register_work_unit_request();
+    *reg->mutable_unit() = RaidenIdToProto(Unit(rank));
+    reg->add_shards(absl::StrCat("10.0.0.1:", 9000 + rank));
+    reg->set_control_plane_rpc_address(absl::StrCat("10.0.0.1:", 9100 + rank));
+    *reg->add_pools() = MakePool(absl::StrCat("fa.l", rank), 1024, 1024, 16);
+    reg->set_layout_fingerprint("fp1");
+    reg->set_page_tokens(512);
+    reg->set_transfer_parallelism(2);
+    reg->set_transfer_rank(rank);
+    tpu_sync::rpc::ControlResponse resp = Handle(req.SerializeAsString());
+    ASSERT_TRUE(resp.success()) << resp.message();
+  }
+  {
+    tpu_sync::rpc::ControlRequest req;
+    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+    auto* reg = req.mutable_register_work_unit_request();
+    *reg->mutable_unit() = RaidenIdToProto(DstUnit(0));
+    reg->add_shards("10.0.0.2:9400");
+    reg->set_control_plane_rpc_address("10.0.0.2:9600");
+    *reg->add_pools() = MakePool("fa.l0", 1024, 1024, 16);
+    *reg->add_pools() = MakePool("fa.l1", 1024, 1024, 16);
+    reg->set_layout_fingerprint("fp1");
+    reg->set_page_tokens(512);
+    reg->set_transfer_parallelism(2);
+    reg->set_transfer_rank(0);
+    tpu_sync::rpc::ControlResponse resp = Handle(req.SerializeAsString());
+    ASSERT_TRUE(resp.success()) << resp.message();
+  }
+  for (int rank = 0; rank < 2; ++rank) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_REGISTER_REQUEST_BLOCKS);
+    auto* block_req = req.mutable_register_request_blocks_request();
+    block_req->set_req_id("req-pp");
+    block_req->set_uuid(77);
+    *block_req->mutable_unit() = RaidenIdToProto(Unit(rank));
+    block_req->add_block_ids(3 + rank);
+    auto* entry = block_req->add_pool_spans();
+    entry->set_tag(absl::StrCat("fa.l", rank));
+    entry->add_block_ids(3 + rank);
+    auto* span = entry->add_spans();
+    span->set_src_block_ordinal(0);
+    span->set_src_offset_bytes(0);
+    span->set_dst_block_index(0);
+    span->set_dst_offset_bytes(0);
+    span->set_size_bytes(1024);
+    span->set_count(1);
+    entry->set_declared_bytes(1024);
+    entry->set_dst_space_version(1);
+    tpu_sync::rpc::ControllerResponse resp =
+        HandleController(req.SerializeAsString());
+    ASSERT_TRUE(resp.success()) << resp.message();
+  }
+
+  tpu_sync::rpc::ControllerRequest req;
+  req.set_command(
+      tpu_sync::rpc::ControllerRequest::COMMAND_COORDINATE_TRANSFER);
+  auto* coord = req.mutable_coordinate_transfer_request();
+  *coord->add_src_units() = RaidenIdToProto(Unit(0));
+  *coord->add_src_units() = RaidenIdToProto(Unit(1));
+  *coord->add_dst_units() = RaidenIdToProto(DstUnit(0));
+  coord->set_uuid(77);
+  coord->set_is_sender(true);
+  coord->set_dst_mem_type(tpu_sync::rpc::MEMORY_TYPE_HBM);
+  coord->set_use_block_chunks(true);
+  coord->set_req_id("req-pp");
+  // Both tags land on the same destination page (one page per layer pool).
+  coord->add_dst_device_block_ids(7);
+  coord->add_dst_device_block_ids(7);
+  coord->add_transfer_pool_tags("fa.l0");
+  coord->add_transfer_pool_tags("fa.l1");
+  coord->add_dst_block_counts(1);
+  coord->add_dst_block_counts(1);
+  tpu_sync::rpc::ControllerResponse resp =
+      HandleController(req.SerializeAsString());
+  ASSERT_TRUE(resp.success()) << resp.message();
+
+  // One arm, two sender dispatches.
+  ASSERT_EQ(transport_.calls_.size(), 3u);
+  tpu_sync::rpc::ControlRequest arm;
+  ASSERT_TRUE(arm.ParseFromString(transport_.calls_[0].second));
+  const auto& arm_req = arm.start_transfer_request();
+  EXPECT_FALSE(arm_req.is_sender());
+  // Receiver: destination-canonical pools 0 and 1, one group per tag, each
+  // fed by exactly one sender.
+  ASSERT_EQ(arm_req.transfer_pool_indices_size(), 2);
+  EXPECT_EQ(arm_req.transfer_pool_indices(0), 0);
+  EXPECT_EQ(arm_req.transfer_pool_indices(1), 1);
+  ASSERT_EQ(arm_req.pool_dtype_tags_size(), 2);
+  ASSERT_EQ(arm_req.pool_groups_size(), 2);
+  for (int g = 0; g < 2; ++g) {
+    ASSERT_EQ(arm_req.pool_groups(g).pool_indices_size(), 1);
+    EXPECT_EQ(arm_req.pool_groups(g).pool_indices(0), g);
+    EXPECT_EQ(arm_req.pool_groups(g).expected_pushes(), 1);
+  }
+  EXPECT_EQ(arm_req.shard_push_schedules_size(), 2);
+  EXPECT_EQ(arm_req.wire_pool_indices_size(), 0);
+
+  // Senders: each request is rewritten into the sender's own single-pool
+  // index space; the group it does not feed is kept (positionally) but
+  // names no local pool.
+  for (int i = 1; i <= 2; ++i) {
+    tpu_sync::rpc::ControlRequest dispatch;
+    ASSERT_TRUE(dispatch.ParseFromString(transport_.calls_[i].second));
+    const auto& send_req = dispatch.start_transfer_request();
+    EXPECT_TRUE(send_req.is_sender());
+    ASSERT_EQ(send_req.transfer_pool_indices_size(), 1);
+    EXPECT_EQ(send_req.transfer_pool_indices(0), 0);
+    ASSERT_EQ(send_req.pool_dtype_tags_size(), 1);
+    ASSERT_EQ(send_req.pool_groups_size(), 2);
+    const int rank = transport_.calls_[i].first == "10.0.0.1:9100" ? 0 : 1;
+    for (int g = 0; g < 2; ++g) {
+      if (g == rank) {
+        ASSERT_EQ(send_req.pool_groups(g).pool_indices_size(), 1);
+        EXPECT_EQ(send_req.pool_groups(g).pool_indices(0), 0);
+      } else {
+        EXPECT_EQ(send_req.pool_groups(g).pool_indices_size(), 0);
+      }
+    }
+    ASSERT_EQ(send_req.shard_push_schedules_size(), 1);
+    const auto& schedule = send_req.shard_push_schedules().at(0);
+    ASSERT_EQ(schedule.entries_size(), 1);
+    EXPECT_EQ(schedule.entries(0).pool_group(), rank);
+    EXPECT_EQ(schedule.entries(0).src_block_id(), 3 + rank);
+    EXPECT_EQ(schedule.entries(0).dst_block_id(), 7);
+    // The sender's single local pool is named on the wire by the
+    // destination index it feeds.
+    ASSERT_EQ(send_req.wire_pool_indices_size(), 1);
+    EXPECT_EQ(send_req.wire_pool_indices().at(0), rank);
+  }
+}
+
+TEST_F(ReshardStackTest, PipelinedDestinationStagesShareOneRequestClaim) {
+  // Every destination stage plans the same request against the whole source
+  // rank set; the planner keeps the source with its layer, and the request
+  // claim is shared by the stages.
+  RegisterPipelinedUnits(/*num_stages=*/2);
+  RegisterPipelinedSpans("req-pp2", 78, /*num_stages=*/2);
+  for (int stage = 0; stage < 2; ++stage) {
+    tpu_sync::rpc::ControllerResponse resp =
+        CoordinateStage("req-pp2", 78, /*num_stages=*/2, stage);
+    ASSERT_TRUE(resp.success()) << "stage " << stage << ": " << resp.message();
+  }
+
+  // Per stage: one arm on that stage, one sender on the rank with its layer.
+  ASSERT_EQ(transport_.calls_.size(), 4u);
+  EXPECT_EQ(transport_.calls_[0].first, "10.0.0.2:9600");
+  EXPECT_EQ(transport_.calls_[1].first, "10.0.0.1:9100");
+  EXPECT_EQ(transport_.calls_[2].first, "10.0.0.2:9601");
+  EXPECT_EQ(transport_.calls_[3].first, "10.0.0.1:9101");
+  // Stage 1's arm carries its single source under that source's transfer
+  // rank, which is the node id the receiver resolves the pushes by.
+  tpu_sync::rpc::ControlRequest arm;
+  ASSERT_TRUE(arm.ParseFromString(transport_.calls_[2].second));
+  const auto& arm_req = arm.start_transfer_request();
+  ASSERT_EQ(arm_req.shard_push_schedules_size(), 1);
+  EXPECT_EQ(arm_req.shard_push_schedules().count(1), 1u);
+}
+
+TEST_F(ReshardStackTest, AbandonedStageLeavesTheSiblingClaimInPlace) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterPipelinedUnits(/*num_stages=*/2);
+  RegisterPipelinedSpans("req-pp3", 79, /*num_stages=*/2);
+
+  // Stage 1's receiver refuses its arm, so stage 1's planning attempt
+  // abandons the claim it shares with stage 0.
+  transport_.FailFor("10.0.0.2:9601");
+  tpu_sync::rpc::ControllerResponse first =
+      CoordinateStage("req-pp3", 79, /*num_stages=*/2, /*stage=*/0);
+  ASSERT_TRUE(first.success()) << first.message();
+  tpu_sync::rpc::ControllerResponse refused =
+      CoordinateStage("req-pp3", 79, /*num_stages=*/2, /*stage=*/1);
+  ASSERT_FALSE(refused.success());
+  EXPECT_THAT(refused.message(), HasSubstr("injected arm refusal"));
+
+  // Stage 0 still holds the claim: the request cannot be cancelled and reads
+  // as claimed.
+  EXPECT_EQ(CancelIfUnclaimed("req-pp3", 79).response_data(), "false");
+  EXPECT_EQ(RequestBlockStatuses("req-pp3", 79),
+            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
+
+  // Stage 1 rejoins the claim once its receiver accepts the arm.
+  transport_.FailFor("");
+  tpu_sync::rpc::ControllerResponse retry =
+      CoordinateStage("req-pp3", 79, /*num_stages=*/2, /*stage=*/1);
+  ASSERT_TRUE(retry.success()) << retry.message();
+}
+
+TEST_F(ReshardStackTest, AbandoningTheLastStageFreesTheClaim) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterPipelinedUnits(/*num_stages=*/2);
+  RegisterPipelinedSpans("req-pp4", 80, /*num_stages=*/2);
+
+  // Both stages' receivers refuse their arms: every planning attempt
+  // abandons the claim, and the last one leaving frees it.
+  for (int stage = 0; stage < 2; ++stage) {
+    transport_.FailFor(absl::StrCat("10.0.0.2:", 9600 + stage));
+    tpu_sync::rpc::ControllerResponse resp =
+        CoordinateStage("req-pp4", 80, /*num_stages=*/2, stage);
+    ASSERT_FALSE(resp.success()) << "stage " << stage;
+    EXPECT_THAT(resp.message(), HasSubstr("injected arm refusal"));
+  }
+  EXPECT_EQ(RequestBlockStatuses("req-pp4", 80),
+            std::vector<int>{ProtoStatus::STATUS_REGISTERED});
+
+  // Nothing holds the claim: the request can be cancelled, and a stage that
+  // plans afterwards is refused.
+  EXPECT_EQ(CancelIfUnclaimed("req-pp4", 80).response_data(), "true");
+  EXPECT_EQ(RequestBlockStatuses("req-pp4", 80),
+            std::vector<int>{ProtoStatus::STATUS_CANCELLED});
+  transport_.FailFor("");
+  tpu_sync::rpc::ControllerResponse late =
+      CoordinateStage("req-pp4", 80, /*num_stages=*/2, /*stage=*/0);
+  ASSERT_FALSE(late.success());
+  EXPECT_THAT(late.message(), HasSubstr("was cancelled"));
+}
+
+TEST_F(ReshardStackTest, SpansForAnUnregisteredTagAreRefusedAtRegistration) {
+  // A rank that registers no pool for a tag cannot declare spans for it:
+  // the registry refuses the declaration before it can reach planning.
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  tpu_sync::rpc::ControllerRequest req;
+  req.set_command(
+      tpu_sync::rpc::ControllerRequest::COMMAND_REGISTER_REQUEST_BLOCKS);
+  auto* block_req = req.mutable_register_request_blocks_request();
+  block_req->set_req_id("req-x");
+  block_req->set_uuid(43);
+  *block_req->mutable_unit() = RaidenIdToProto(Unit(1));
+  block_req->add_block_ids(5);
+  auto* entry = block_req->add_pool_spans();
+  entry->set_tag("fa.other");
+  entry->add_block_ids(5);
+  auto* span = entry->add_spans();
+  span->set_dst_block_index(1);
+  span->set_size_bytes(1024);
+  span->set_count(1);
+  entry->set_declared_bytes(1024);
+  tpu_sync::rpc::ControllerResponse resp =
+      HandleController(req.SerializeAsString());
+  ASSERT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("does not match any registered pool"));
+}
+
+TEST_F(ReshardStackTest, SourceTagsAbsentOnTheDestinationAreIgnored) {
+  // Pipeline-parallel on both sides: prefill stage 0 registers layers 0
+  // and 1, decode stage 0 registers layer 0 only. Planning layer 0 pairs
+  // the shared tag and ignores the source's extra layer.
+  {
+    tpu_sync::rpc::ControlRequest req;
+    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+    auto* reg = req.mutable_register_work_unit_request();
+    *reg->mutable_unit() = RaidenIdToProto(Unit(0));
+    reg->add_shards("10.0.0.1:9000");
+    reg->set_control_plane_rpc_address("10.0.0.1:9100");
+    *reg->add_pools() = MakePool("fa.l0", 1024, 1024, 16);
+    *reg->add_pools() = MakePool("fa.l1", 1024, 1024, 16);
+    reg->set_layout_fingerprint("fp1");
+    reg->set_page_tokens(512);
+    reg->set_transfer_parallelism(1);
+    reg->set_transfer_rank(0);
+    tpu_sync::rpc::ControlResponse resp = Handle(req.SerializeAsString());
+    ASSERT_TRUE(resp.success()) << resp.message();
+  }
+  {
+    tpu_sync::rpc::ControlRequest req;
+    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+    auto* reg = req.mutable_register_work_unit_request();
+    *reg->mutable_unit() = RaidenIdToProto(DstUnit());
+    reg->add_shards("10.0.0.2:9400");
+    reg->set_control_plane_rpc_address("10.0.0.2:9600");
+    *reg->add_pools() = MakePool("fa.l0", 1024, 1024, 16);
+    reg->set_layout_fingerprint("fp1");
+    reg->set_page_tokens(512);
+    reg->set_transfer_parallelism(1);
+    reg->set_transfer_rank(0);
+    tpu_sync::rpc::ControlResponse resp = Handle(req.SerializeAsString());
+    ASSERT_TRUE(resp.success()) << resp.message();
+  }
+  {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_REGISTER_REQUEST_BLOCKS);
+    auto* block_req = req.mutable_register_request_blocks_request();
+    block_req->set_req_id("req-pp2pp");
+    block_req->set_uuid(78);
+    *block_req->mutable_unit() = RaidenIdToProto(Unit(0));
+    block_req->add_block_ids(3);
+    for (const char* tag : {"fa.l0", "fa.l1"}) {
+      auto* entry = block_req->add_pool_spans();
+      entry->set_tag(tag);
+      entry->add_block_ids(3);
+      auto* span = entry->add_spans();
+      span->set_size_bytes(1024);
+      span->set_count(1);
+      entry->set_declared_bytes(1024);
+      entry->set_dst_space_version(1);
+    }
+    tpu_sync::rpc::ControllerResponse resp =
+        HandleController(req.SerializeAsString());
+    ASSERT_TRUE(resp.success()) << resp.message();
+  }
+  tpu_sync::rpc::ControllerRequest req;
+  req.set_command(
+      tpu_sync::rpc::ControllerRequest::COMMAND_COORDINATE_TRANSFER);
+  auto* coord = req.mutable_coordinate_transfer_request();
+  *coord->add_src_units() = RaidenIdToProto(Unit(0));
+  *coord->add_dst_units() = RaidenIdToProto(DstUnit());
+  coord->set_uuid(78);
+  coord->set_is_sender(true);
+  coord->set_dst_mem_type(tpu_sync::rpc::MEMORY_TYPE_HBM);
+  coord->set_use_block_chunks(true);
+  coord->set_req_id("req-pp2pp");
+  coord->add_dst_device_block_ids(7);
+  coord->add_transfer_pool_tags("fa.l0");
+  tpu_sync::rpc::ControllerResponse resp =
+      HandleController(req.SerializeAsString());
+  ASSERT_TRUE(resp.success()) << resp.message();
+  ASSERT_EQ(transport_.calls_.size(), 2u);
+  tpu_sync::rpc::ControlRequest dispatch;
+  ASSERT_TRUE(dispatch.ParseFromString(transport_.calls_[1].second));
+  const auto& send_req = dispatch.start_transfer_request();
+  ASSERT_EQ(send_req.transfer_pool_indices_size(), 1);
+  EXPECT_EQ(send_req.transfer_pool_indices(0), 0);
+  ASSERT_EQ(send_req.pool_dtype_tags_size(), 2);
 }
 
 TEST_F(ReshardStackTest, MismatchedDestinationsFailClosed) {

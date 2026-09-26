@@ -308,6 +308,14 @@ void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
     in_flight_ += static_cast<int>(transfers_by_peer.size());
   }
 
+  // The plan names this pool in the sender's own index space; the receiver
+  // resolves the wire index against the destination's pool table.
+  std::optional<int> wire_pool_idx;
+  auto wire_it = plan_.wire_pool_indices().find(static_cast<int32_t>(pool_idx));
+  if (wire_it != plan_.wire_pool_indices().end()) {
+    wire_pool_idx = wire_it->second;
+  }
+
   for (const auto& [peer, transfers] : transfers_by_peer) {
     std::vector<int> src_ids;
     std::vector<int> dst_ids;
@@ -325,7 +333,8 @@ void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
           absl::Cleanup end_op = [self]() { self->EndOp(); };
           self->RecordPushCompletion(
               manager, result.ok() ? absl::OkStatus() : result.status());
-        });
+        },
+        wire_pool_idx);
   }
 }
 

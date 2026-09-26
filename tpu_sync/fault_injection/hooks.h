@@ -109,6 +109,10 @@ inline constexpr std::string_view kRawBufferTransportAccept =
 inline constexpr std::string_view kRawBufferTransportRecvHeader =
     "raw_buffer_transport.recv.header";
 
+// Raw buffer transport, data-plane send path.
+inline constexpr std::string_view kRawBufferTransportSendJitter =
+    "raw_buffer_transport.send.jitter";
+
 // Hooks that support `action = "fail"`
 inline constexpr std::string_view kFailHooks[] = {
     kBlockTransportRecvBlockIds,
@@ -162,6 +166,7 @@ inline constexpr std::string_view kDelayHooks[] = {
     kSocketTransportPushSendPayload,
     kSocketTransportPushRecvAck,
     kRawBufferTransportRecvHeader,
+    kRawBufferTransportSendJitter,
 };
 
 }  // namespace hooks

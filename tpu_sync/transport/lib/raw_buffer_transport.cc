@@ -55,6 +55,7 @@
 #include "absl/types/span.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
+#include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
@@ -893,6 +894,7 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
 
   const auto start_ts = std::chrono::steady_clock::now();
   auto send_body = [&]() -> absl::Status {
+    FaultInjectDelay(hooks::kRawBufferTransportSendJitter);
     ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
 
     uint8_t ack = 0;
@@ -1174,6 +1176,8 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
   const auto start_ts = std::chrono::steady_clock::now();
   auto send_body = [&]() -> absl::Status {
     ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
+
+    FaultInjectDelay(hooks::kRawBufferTransportSendJitter);
 
     if (coalesce_window_bytes_ > 0) {
       // Coalesced path: pack and write

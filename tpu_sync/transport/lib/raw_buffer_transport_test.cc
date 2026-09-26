@@ -32,6 +32,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/flags/flag.h"
 #include "absl/log/check.h"
@@ -45,6 +46,8 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
+#include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/buffer_push_task.h"
@@ -1471,6 +1474,56 @@ TEST_P(RawBufferTransportTest, TelemetryRecordsSentReceivedAndP2pMetrics) {
           .empty());
 
   telemetry::RaidenMetricStore::GetGlobalMetricStore().SetBackends({});
+}
+
+TEST_P(RawBufferTransportTest, SendJitterInjection) {
+  GetFaultInjector().Reset();
+  auto cleanup = absl::MakeCleanup([] { GetFaultInjector().Reset(); });
+
+  FaultInjectionRule rule;
+  rule.hook = std::string(hooks::kRawBufferTransportSendJitter);
+  rule.action = FaultInjectionType::kDelay;
+  rule.probability = 1.0;
+  rule.min_delay_ms = 50;
+  rule.max_delay_ms = 50;
+  ASSERT_OK(GetFaultInjector().Install({rule}));
+
+  constexpr size_t size = 1024;
+  RawMockDelegate src(size);
+  RawMockDelegate dst(size);
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  BindControlChannels(&src_transport, &src, &dst_transport, &dst);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const std::string dst_addr = GetIpPort(dst_transport);
+  std::vector<uint8_t> payload(size);
+  RandomNonZero(absl::MakeSpan(payload));
+
+  constexpr uint64_t kUuid = 12345;
+  ASSERT_OK(dst_transport.RegisterExpectedChunks(kUuid, 1));
+
+  std::vector<BufferPushTask> tasks = {{
+      .peer = dst_addr,
+      .buffer_id = kBufferId,
+      .dst_shard_idx = kDstShardIdx,
+      .dst_offset_bytes = 0,
+      .data_ptr = payload.data(),
+      .size_bytes = payload.size(),
+  }};
+
+  const absl::Time start_time = absl::Now();
+  const auto push_res =
+      src_transport.PushBuffers(tasks, /*parallelism=*/1, kUuid);
+  ASSERT_OK(push_res);
+  const absl::Duration elapsed = absl::Now() - start_time;
+
+  EXPECT_GE(elapsed, absl::Milliseconds(45));
+  EXPECT_GE(
+      GetFaultInjector().GetHitCount(hooks::kRawBufferTransportSendJitter), 1);
+  ASSERT_TRUE(dst.WaitForDataReceived(kNotificationTimeout));
+  EXPECT_THAT(dst.DataSpan(0, payload.size()),
+              Pointwise(Eq(), absl::MakeConstSpan(payload)));
 }
 
 INSTANTIATE_TEST_SUITE_P(

@@ -14,12 +14,14 @@
 
 """High-performance JAX Weight Synchronizer for RL Trainer-Inference Pipelines."""
 
-from typing import Any, Dict, List, Optional, Union
+import functools
+import math
+import os
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import jax
 
 from tpu_sync.api import common
-
 # Import Nanobind binary library directly E2E!
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _weight_synchronizer
 
@@ -36,6 +38,150 @@ get_raiden_metrics_prometheus_text = (
 )
 
 
+def find_dp_subshard_split_dim(
+    local_shape: Sequence[int],
+    k: int,
+    tile_rows: int = 8,
+) -> Optional[int]:
+  """Returns the dimension `d` to split a local shard into `k` contiguous sub-shards."""
+  if k <= 1 or not local_shape:
+    return None
+  rank = len(local_shape)
+  max_dim = 0 if rank == 1 else rank - 2
+  for d in range(max_dim + 1):
+    dim_len = int(local_shape[d])
+    if dim_len == 1:
+      continue
+    if dim_len % k != 0:
+      return None
+    sub_dim = dim_len // k
+    if (
+        rank >= 2
+        and d == rank - 2
+        and tile_rows > 1
+        and sub_dim % tile_rows != 0
+    ):
+      return None
+    return d
+  return None
+
+
+def _resolve_enable_ici_all_gather(
+    ici_all_gather: Optional[bool],
+) -> bool:
+  """Resolves `ici_all_gather` from explicit bool or environment variables."""
+  if ici_all_gather is not None:
+    return bool(ici_all_gather)
+  for env_name in (
+      "RAIDEN_ENABLE_DP_SUBSHARDING",
+      "RAIDEN_ENABLE_ICI_ALL_GATHER",
+  ):
+    val = os.environ.get(env_name, "").strip().lower()
+    if val in ("1", "true", "yes"):
+      return True
+    if val in ("0", "false", "no"):
+      return False
+  return False
+
+
+def _get_replicated_mesh_axes(
+    mesh: jax.sharding.Mesh,
+    spec: jax.sharding.PartitionSpec,
+) -> tuple[str, ...]:
+  """Returns mesh axes with size > 1 that are not referenced in `spec`."""
+  used_axes = set()
+  for entry in spec:
+    if entry is None:
+      continue
+    if isinstance(entry, (tuple, list)):
+      for sub in entry:
+        if sub:
+          used_axes.update(s.strip() for s in str(sub).split(",") if s.strip())
+    else:
+      used_axes.update(s.strip() for s in str(entry).split(",") if s.strip())
+  return tuple(
+      ax for ax in mesh.axis_names if ax not in used_axes and mesh.shape[ax] > 1
+  )
+
+
+@functools.lru_cache(maxsize=64)
+def _get_compiled_shard_all_gather(
+    mesh: jax.sharding.Mesh,
+    specs: tuple[jax.sharding.PartitionSpec, ...],
+    split_meta: tuple[tuple[int, int, Any], ...],
+):
+  """Returns a cached JIT-compiled shard_map collective for `split_meta`."""
+
+  def _shard_all_gather(*xs):
+    outs = []
+    for x, (d_split, sub_dim, axis_arg) in zip(xs, split_meta):
+      sub_x = jax.lax.slice_in_dim(x, 0, sub_dim, axis=d_split)
+      outs.append(
+          jax.lax.all_gather(
+              sub_x, axis_name=axis_arg, axis=d_split, tiled=True
+          )
+      )
+    return tuple(outs)
+
+  return jax.jit(
+      jax.shard_map(
+          _shard_all_gather,
+          mesh=mesh,
+          in_specs=specs,
+          out_specs=specs,
+          check_vma=False,
+      )
+  )
+
+
+def ici_all_gather_weights(
+    jax_arrays: Sequence[jax.Array],
+    tile_rows: int = 8,
+) -> List[jax.Array]:
+  """Reconstructs full shards from DP sub-shards using direct ICI all_gather."""
+  if not jax_arrays:
+    return []
+  result = list(jax_arrays)
+
+  # Group arrays by mesh so all layers on the same mesh run in one compiled
+  # shard_map collective.
+  indices_by_mesh: dict[Any, list[tuple[int, int, int, Any]]] = {}
+  for idx, arr in enumerate(result):
+    sharding = getattr(arr, "sharding", None)
+    mesh = getattr(sharding, "mesh", None)
+    spec = getattr(sharding, "spec", None)
+    if mesh is None or spec is None:
+      continue
+    replicated_axes = _get_replicated_mesh_axes(mesh, spec)
+    if not replicated_axes:
+      continue
+    k = math.prod(mesh.shape[ax] for ax in replicated_axes)
+    if k <= 1:
+      continue
+    local_shape = sharding.shard_shape(arr.shape)
+    d_split = find_dp_subshard_split_dim(local_shape, k, tile_rows=tile_rows)
+    if d_split is None:
+      continue
+    sub_dim = local_shape[d_split] // k
+    axis_arg = (
+        replicated_axes[0] if len(replicated_axes) == 1 else replicated_axes
+    )
+    indices_by_mesh.setdefault(mesh, []).append(
+        (idx, d_split, sub_dim, axis_arg)
+    )
+
+  for mesh, items in indices_by_mesh.items():
+    group_arrays = tuple(result[item[0]] for item in items)
+    specs = tuple(arr.sharding.spec for arr in group_arrays)
+    split_meta = tuple((item[1], item[2], item[3]) for item in items)
+    compiled_fn = _get_compiled_shard_all_gather(mesh, specs, split_meta)
+    gathered = compiled_fn(*group_arrays)
+    for (idx, _, _, _), g_arr in zip(items, gathered):
+      result[idx] = g_arr
+
+  return result
+
+
 class WeightSynchronizer:
   """Zero-copy distributed Weight Synchronizer for JAX."""
 
@@ -49,6 +195,7 @@ class WeightSynchronizer:
       bind_ip: Optional[str] = None,
       auto_h2d: bool = False,
       global_shard_indices: Optional[List[int]] = None,
+      ring_buffer_size: Optional[int] = None,
   ):
     """Instantiates the Weight Synchronizer on a JAX weights list.
 
@@ -61,7 +208,12 @@ class WeightSynchronizer:
       bind_ip: Sockets server bind IP address.
       auto_h2d: Automatically execute H2D ingestion upon data arrival.
       global_shard_indices: Explicit vector of global shard indices.
+      ring_buffer_size: Optional bounded number of host staging buffers per
+        shard (`0` or `None` uses all layers unless
+        `RAIDEN_WEIGHT_SYNC_RING_BUFFER_SIZE` is set).
     """
+    self._jax_arrays = list(jax_arrays) if jax_arrays is not None else []
+    self._unsafe_skip_buffer_lock = unsafe_skip_buffer_lock
     self._has_explicit_global_shard_indices = global_shard_indices is not None
     if global_shard_indices is None:
       if jax_arrays and hasattr(jax_arrays[0], "addressable_shards"):
@@ -107,6 +259,7 @@ class WeightSynchronizer:
         bind_ip,
         auto_h2d,
         global_shard_indices,
+        ring_buffer_size,
     )
 
   @classmethod
@@ -123,6 +276,7 @@ class WeightSynchronizer:
       global_shard_indices: Optional[List[int]] = None,
       test_only_simulated_egress_gbps: float = 0.0,
       test_only_simulated_ingress_gbps: float = 0.0,
+      ring_buffer_size: Optional[int] = None,
   ) -> "WeightSynchronizer":
     """Instantiates a CPU-only WeightSynchronizer allocating host DRAM without TPU devices."""
     instance = cls.__new__(cls)
@@ -139,8 +293,11 @@ class WeightSynchronizer:
             global_shard_indices,
             test_only_simulated_egress_gbps,
             test_only_simulated_ingress_gbps,
+            ring_buffer_size,
         )
     )
+    instance._jax_arrays = []
+    instance._unsafe_skip_buffer_lock = False
     instance._global_shard_indices = list(global_shard_indices or [])
     instance._has_explicit_global_shard_indices = (
         global_shard_indices is not None
@@ -162,9 +319,28 @@ class WeightSynchronizer:
     """Triggers asynchronous Device-to-Host (D2H) copy of current weights to Host buffer."""
     self._impl.D2h()
 
-  def h2d(self) -> None:
-    """Triggers asynchronous Host-to-Device (H2D) copy of staged host buffer back to Device memory E2E."""
+  def h2d(
+      self, ici_all_gather: Optional[bool] = None
+  ) -> Optional[List[jax.Array]]:
+    """Triggers Host-to-Device (H2D) copy and optional post-H2D ICI all-gather."""
     self._impl.H2d()
+    if _resolve_enable_ici_all_gather(ici_all_gather) and self._jax_arrays:
+      return self.ici_all_gather()
+    return None
+
+  def ici_all_gather(
+      self,
+      jax_arrays: Optional[Sequence[jax.Array]] = None,
+      rebind: bool = False,
+  ) -> List[jax.Array]:
+    """Runs direct ICI all-gather across replicated mesh axes on sub-sharded weights."""
+    target_arrays = (
+        list(jax_arrays) if jax_arrays is not None else self._jax_arrays
+    )
+    updated = ici_all_gather_weights(target_arrays)
+    if rebind and updated:
+      self.bind_weights(updated)
+    return updated
 
   def wait_for_transfer_completion(self, uuid: Optional[int] = None) -> None:
     """Blocks until the transfer with the given UUID (or any transfer if None) has finished ingestion."""
@@ -184,6 +360,7 @@ class WeightSynchronizer:
       jax_arrays: A list of JAX arrays representing the updated sharded model
         weights.
     """
+    self._jax_arrays = list(jax_arrays) if jax_arrays is not None else []
     self._impl.bind_weights(jax_arrays)
 
   def get_host_buffer(self, layer_idx: int = 0, shard_idx: int = 0) -> any:
@@ -250,6 +427,16 @@ class WeightSynchronizer:
   def slice_byte_size(self) -> int:
     """Returns the slice capacity per device block."""
     return self._impl.slice_byte_size
+
+  @property
+  def ring_buffer_size(self) -> int:
+    """Returns the configured host staging ring-buffer pool size (0 if disabled)."""
+    return self._impl.ring_buffer_size
+
+  @property
+  def allocated_host_dram_bytes(self) -> int:
+    """Returns the total host DRAM bytes allocated by this synchronizer."""
+    return self._impl.allocated_host_dram_bytes
 
   def get_metrics(self) -> dict[str, float | int]:
     """Returns a dictionary of internal performance metrics."""

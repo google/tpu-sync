@@ -63,7 +63,8 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
     nanobind::list jax_arrays, std::optional<int> local_port, int parallelism,
     bool unsafe_skip_buffer_lock, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, bool auto_h2d,
-    std::optional<std::vector<int64_t>> global_shard_indices)
+    std::optional<std::vector<int64_t>> global_shard_indices,
+    std::optional<size_t> ring_buffer_size)
     : unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
       global_shard_indices_(
           global_shard_indices.value_or(std::vector<int64_t>{})) {
@@ -71,7 +72,7 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
       tpu_raiden::jax::UnpackJaxArrays(jax_arrays, unsafe_skip_buffer_lock);
   InitSubManagers(layer_buffers, local_port, unsafe_skip_buffer_lock,
                   parallelism, listener_port, bind_ip, auto_h2d,
-                  global_shard_indices);
+                  global_shard_indices, ring_buffer_size);
 }
 
 absl::Status NumaAwareWeightSynchronizer::BindWeights(
@@ -123,7 +124,8 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,
     std::optional<int> local_port, int parallelism,
     std::optional<int> listener_port, std::optional<std::string> bind_ip,
-    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices)
+    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices,
+    std::optional<size_t> ring_buffer_size)
     : total_num_shards_(num_shards),
       num_layers_(num_layers),
       slice_byte_size_(slice_byte_size),
@@ -132,7 +134,8 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
   auto sub = std::make_unique<weight_sync::WeightSynchronizerBase>(
       num_layers, num_shards, slice_byte_size, local_port,
       /*host_blocks_to_allocate=*/std::nullopt, parallelism, listener_port,
-      bind_ip, /*layer_names=*/std::vector<std::string>{}, auto_h2d);
+      bind_ip, /*layer_names=*/std::vector<std::string>{}, auto_h2d,
+      ring_buffer_size);
   sub_synchronizers_.push_back(std::move(sub));
   global_shard_to_submanager_.resize(total_num_shards_);
   submanager_to_global_shards_.resize(1);
@@ -156,7 +159,8 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
     size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
     std::optional<int> local_port, int parallelism,
     std::optional<int> listener_port, std::optional<std::string> bind_ip,
-    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices)
+    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices,
+    std::optional<size_t> ring_buffer_size)
     : total_num_shards_(num_shards),
       num_layers_(num_layers),
       slice_byte_size_(slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0]),
@@ -165,7 +169,8 @@ NumaAwareWeightSynchronizer::NumaAwareWeightSynchronizer(
   auto sub = std::make_unique<weight_sync::WeightSynchronizerBase>(
       num_layers, num_shards, slice_byte_sizes, local_port,
       /*host_blocks_to_allocate=*/std::nullopt, parallelism, listener_port,
-      bind_ip, /*layer_names=*/std::vector<std::string>{}, auto_h2d);
+      bind_ip, /*layer_names=*/std::vector<std::string>{}, auto_h2d,
+      ring_buffer_size);
   sub_synchronizers_.push_back(std::move(sub));
   global_shard_to_submanager_.resize(total_num_shards_);
   submanager_to_global_shards_.resize(1);
@@ -236,7 +241,8 @@ void NumaAwareWeightSynchronizer::InitSubManagers(
     std::optional<int> local_port, bool unsafe_skip_buffer_lock,
     int parallelism, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, bool auto_h2d,
-    std::optional<std::vector<int64_t>> global_shard_indices) {
+    std::optional<std::vector<int64_t>> global_shard_indices,
+    std::optional<size_t> ring_buffer_size) {
   if (layer_buffers.empty()) return;
   num_layers_ = layer_buffers.size();
   total_num_shards_ = layer_buffers[0].size();
@@ -367,7 +373,8 @@ void NumaAwareWeightSynchronizer::InitSubManagers(
         sub_sync = std::make_unique<weight_sync::WeightSynchronizerBase>(
             sub_buffers, sub_port, /*external_host_ptrs=*/std::nullopt,
             unsafe_skip_buffer_lock, parallelism, sub_listener_port,
-            sub_bind_ip, /*layer_names=*/std::vector<std::string>{}, auto_h2d);
+            sub_bind_ip, /*layer_names=*/std::vector<std::string>{}, auto_h2d,
+            ring_buffer_size);
       } catch (const std::exception& e) {
         if (!ephemeral_data_port || attempt + 1 >= kMaxPortAttempts) throw;
         bind_conflict = true;
@@ -398,6 +405,22 @@ void NumaAwareWeightSynchronizer::InitSubManagers(
     }
     if (!bind_conflict) break;
   }
+}
+
+size_t NumaAwareWeightSynchronizer::ring_buffer_size() const {
+  return sub_synchronizers_.empty() || !sub_synchronizers_[0]
+             ? 0
+             : sub_synchronizers_[0]->ring_buffer_size();
+}
+
+size_t NumaAwareWeightSynchronizer::allocated_host_dram_bytes() const {
+  size_t total = 0;
+  for (const auto& sub : sub_synchronizers_) {
+    if (sub) {
+      total += sub->allocated_host_dram_bytes();
+    }
+  }
+  return total;
 }
 
 std::optional<int> NumaAwareWeightSynchronizer::local_port() const {
@@ -914,10 +937,11 @@ WeightSynchronizer::WeightSynchronizer(
     nanobind::list jax_arrays, std::optional<int> local_port, int parallelism,
     bool unsafe_skip_buffer_lock, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, bool auto_h2d,
-    std::optional<std::vector<int64_t>> global_shard_indices) {
+    std::optional<std::vector<int64_t>> global_shard_indices,
+    std::optional<size_t> ring_buffer_size) {
   numa_manager_ = std::make_unique<NumaAwareWeightSynchronizer>(
       jax_arrays, local_port, parallelism, unsafe_skip_buffer_lock,
-      listener_port, bind_ip, auto_h2d, global_shard_indices);
+      listener_port, bind_ip, auto_h2d, global_shard_indices, ring_buffer_size);
 }
 
 absl::Status WeightSynchronizer::BindWeights(nanobind::list jax_arrays) {
@@ -929,20 +953,23 @@ WeightSynchronizer::WeightSynchronizer(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,
     std::optional<int> local_port, int parallelism,
     std::optional<int> listener_port, std::optional<std::string> bind_ip,
-    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices) {
+    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices,
+    std::optional<size_t> ring_buffer_size) {
   numa_manager_ = std::make_unique<NumaAwareWeightSynchronizer>(
       num_layers, num_shards, slice_byte_size, local_port, parallelism,
-      listener_port, bind_ip, auto_h2d, global_shard_indices);
+      listener_port, bind_ip, auto_h2d, global_shard_indices, ring_buffer_size);
 }
 
 WeightSynchronizer::WeightSynchronizer(
     size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
     std::optional<int> local_port, int parallelism,
     std::optional<int> listener_port, std::optional<std::string> bind_ip,
-    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices) {
+    bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices,
+    std::optional<size_t> ring_buffer_size) {
   numa_manager_ = std::make_unique<NumaAwareWeightSynchronizer>(
       num_layers, num_shards, std::move(slice_byte_sizes), local_port,
-      parallelism, listener_port, bind_ip, auto_h2d, global_shard_indices);
+      parallelism, listener_port, bind_ip, auto_h2d, global_shard_indices,
+      ring_buffer_size);
 }
 
 WeightSynchronizer::WeightSynchronizer(
@@ -1023,6 +1050,14 @@ size_t WeightSynchronizer::slice_byte_size() const {
   return numa_manager_->slice_byte_size();
 }
 
+size_t WeightSynchronizer::ring_buffer_size() const {
+  return numa_manager_->ring_buffer_size();
+}
+
+size_t WeightSynchronizer::allocated_host_dram_bytes() const {
+  return numa_manager_->allocated_host_dram_bytes();
+}
+
 void WeightSynchronizer::test_only_set_bandwidth_limit(
     double test_only_simulated_egress_gbps,
     double test_only_simulated_ingress_gbps) {
@@ -1039,10 +1074,11 @@ WeightSynchronizer::test_only_create_cpu_instance(
     std::optional<int> listener_port, std::optional<std::string> bind_ip,
     bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices,
     double test_only_simulated_egress_gbps,
-    double test_only_simulated_ingress_gbps) {
+    double test_only_simulated_ingress_gbps,
+    std::optional<size_t> ring_buffer_size) {
   auto ws = std::make_unique<WeightSynchronizer>(
       num_layers, num_shards, slice_byte_size, local_port, parallelism,
-      listener_port, bind_ip, auto_h2d, global_shard_indices);
+      listener_port, bind_ip, auto_h2d, global_shard_indices, ring_buffer_size);
   if (test_only_simulated_egress_gbps > 0.0 ||
       test_only_simulated_ingress_gbps > 0.0) {
     ws->test_only_set_bandwidth_limit(test_only_simulated_egress_gbps,
@@ -1058,10 +1094,12 @@ WeightSynchronizer::test_only_create_cpu_instance(
     std::optional<int> listener_port, std::optional<std::string> bind_ip,
     bool auto_h2d, std::optional<std::vector<int64_t>> global_shard_indices,
     double test_only_simulated_egress_gbps,
-    double test_only_simulated_ingress_gbps) {
+    double test_only_simulated_ingress_gbps,
+    std::optional<size_t> ring_buffer_size) {
   auto ws = std::make_unique<WeightSynchronizer>(
       num_layers, num_shards, std::move(slice_byte_sizes), local_port,
-      parallelism, listener_port, bind_ip, auto_h2d, global_shard_indices);
+      parallelism, listener_port, bind_ip, auto_h2d, global_shard_indices,
+      ring_buffer_size);
   if (test_only_simulated_egress_gbps > 0.0 ||
       test_only_simulated_ingress_gbps > 0.0) {
     ws->test_only_set_bandwidth_limit(test_only_simulated_egress_gbps,

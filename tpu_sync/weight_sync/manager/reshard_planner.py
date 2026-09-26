@@ -15,6 +15,7 @@
 """Resharding plan and N-D slice math for RaidenController."""
 
 import math
+import os
 import sys
 import threading
 from typing import Any, Mapping, Optional, Sequence
@@ -645,6 +646,142 @@ def generate_strided_copy_chunks_tile_aware(
   return [(src_offset, dst_offset, size_bytes, src_stride, dst_stride, count)]
 
 
+def find_dp_subshard_split_dim(
+    local_shape: Sequence[int],
+    k: int,
+    tile_rows: int = 8,
+) -> Optional[int]:
+  """Returns the dimension `d` to split a local shard into `k` contiguous sub-shards.
+
+  To ensure each `1/k` sub-shard occupies a contiguous byte prefix `[0, S / k)`
+  in both linear row-major memory and `(8, 128)`-tiled TPU HBM memory:
+  - All outer dimensions `0 <= j < d` must have size 1 (`local_shape[j] == 1`).
+  - `local_shape[d]` must be divisible by `k`.
+  - For rank >= 2, we never split the minor-most (column) dimension `rank - 1`,
+    and if `d == rank - 2`, `(local_shape[d] // k)` must be a multiple of
+    `tile_rows` (8).
+
+  Args:
+    local_shape: Per-device shard shape of the destination tensor.
+    k: Replication factor across data-parallel / replicated mesh axes.
+    tile_rows: TPU tile row alignment requirement (default 8).
+  """
+  if k <= 1 or not local_shape:
+    return None
+  rank = len(local_shape)
+  max_dim = 0 if rank == 1 else rank - 2
+  for d in range(max_dim + 1):
+    dim_len = int(local_shape[d])
+    if dim_len == 1:
+      continue
+    if dim_len % k != 0:
+      return None
+    sub_dim = dim_len // k
+    if (
+        rank >= 2
+        and d == rank - 2
+        and tile_rows > 1
+        and sub_dim % tile_rows != 0
+    ):
+      return None
+    return d
+  return None
+
+
+def _resolve_enable_dp_subsharding(
+    enable_dp_subsharding: Optional[bool],
+) -> bool:
+  """Resolves `enable_dp_subsharding` from explicit bool or environment variables."""
+  if enable_dp_subsharding is not None:
+    return bool(enable_dp_subsharding)
+  for env_name in (
+      "RAIDEN_ENABLE_DP_SUBSHARDING",
+      "RAIDEN_ENABLE_ICI_ALL_GATHER",
+  ):
+    val = os.environ.get(env_name, "").strip().lower()
+    if val in ("1", "true", "yes"):
+      return True
+    if val in ("0", "false", "no"):
+      return False
+  return False
+
+
+def _get_dst_replica_and_phys_coords(
+    dst_unit: RaidenId,
+    local_dst_idx: int,
+    num_dst_shards: int,
+    dst_phys_mesh_shape: Optional[Sequence[int]],
+    dst_host_subgrid: Optional[Sequence[int]],
+    logical_mesh_shape: Optional[Sequence[int]] = None,
+) -> tuple[tuple[Any, ...], tuple[int, ...]]:
+  """Returns `(replica_key, phys_coords)` for a destination shard."""
+  try:
+    raw_rep_id = int(dst_unit.job_replica_id)
+    has_int_rep_id = True
+  except ValueError:
+    raw_rep_id = 0
+    has_int_rep_id = False
+
+  mesh_for_hosts = dst_phys_mesh_shape or logical_mesh_shape
+  total_mesh_devices = (
+      math.prod(mesh_for_hosts) if mesh_for_hosts else num_dst_shards
+  )
+  hosts_per_replica = max(1, total_mesh_devices // max(1, num_dst_shards))
+  if has_int_rep_id:
+    replica_group_id: Any = raw_rep_id // hosts_per_replica
+    host_idx_in_replica = raw_rep_id % hosts_per_replica
+  else:
+    replica_group_id = dst_unit.job_replica_id
+    host_idx_in_replica = 0
+
+  replica_key = (
+      dst_unit.job_name,
+      dst_unit.data_replica_idx,
+      replica_group_id,
+  )
+
+  if dst_phys_mesh_shape and math.prod(dst_phys_mesh_shape) > 0:
+    if (
+        dst_host_subgrid is not None
+        and len(dst_host_subgrid) == len(dst_phys_mesh_shape)
+        and math.prod(dst_host_subgrid) == num_dst_shards
+        and all(
+            p % s == 0 for p, s in zip(dst_phys_mesh_shape, dst_host_subgrid)
+        )
+    ):
+      subgrid = list(dst_host_subgrid)
+      grid = [p // s for p, s in zip(dst_phys_mesh_shape, subgrid)]
+    elif (
+        hosts_per_replica == 1
+        and math.prod(dst_phys_mesh_shape) == num_dst_shards
+    ):
+      subgrid = list(dst_phys_mesh_shape)
+      grid = [1] * len(dst_phys_mesh_shape)
+    else:
+      subgrid, grid = compute_host_subgrid(dst_phys_mesh_shape, num_dst_shards)
+
+    host_coords = []
+    temp_h = host_idx_in_replica
+    for size in reversed(grid):
+      host_coords.append(temp_h % size if size > 0 else 0)
+      temp_h //= size if size > 0 else 1
+    host_coords.reverse()
+
+    local_coords = []
+    temp_l = local_dst_idx
+    for size in reversed(subgrid):
+      local_coords.append(temp_l % size if size > 0 else 0)
+      temp_l //= size if size > 0 else 1
+    local_coords.reverse()
+
+    phys_coords = tuple(
+        h * s + l for h, s, l in zip(host_coords, subgrid, local_coords)
+    )
+    return replica_key, phys_coords
+
+  return replica_key, (host_idx_in_replica, local_dst_idx)
+
+
 class ReshardPlanner:
   """Computes resharding schedules across registered source and destination JobEntities."""
 
@@ -657,12 +794,14 @@ class ReshardPlanner:
       skip_tiling: Optional[dict[int, bool]] = None,
       dst_controller_address: Optional[str] = None,
       src_controller_address: Optional[str] = None,
+      enable_dp_subsharding: Optional[bool] = None,
   ) -> tuple[Any, ...]:
     """Builds a hashable plan cache key from transfer arguments."""
     del cls
     if group_size <= 0:
       raise ValueError("group_size must be positive")
-    return (
+    resolved_dp = _resolve_enable_dp_subsharding(enable_dp_subsharding)
+    base_key = (
         tuple(src_units),
         tuple(dst_units),
         group_size,
@@ -670,6 +809,9 @@ class ReshardPlanner:
         dst_controller_address,
         src_controller_address,
     )
+    if resolved_dp:
+      return base_key + (True,)
+    return base_key
 
   @classmethod
   def build_default_1d_plan(
@@ -725,10 +867,15 @@ class ReshardPlanner:
       ] = None,
       req_id: str = "warmup",
       uuid: Any = "",
+      enable_dp_subsharding: Optional[bool] = None,
   ) -> _CachedTransferSchedule:
     """Computes transfer schedule math and returns a _CachedTransferSchedule."""
     if group_size <= 0:
       raise ValueError("group_size must be positive")
+
+    enable_dp_subsharding = _resolve_enable_dp_subsharding(
+        enable_dp_subsharding
+    )
 
     computed_schedules = {}
     computed_slices = {}
@@ -976,7 +1123,10 @@ class ReshardPlanner:
               )
               aligned_decision = skip_tiling_by_geom.get(geom_key)
               if aligned_decision is None:
-                is_identical = _is_variable_spec_identical(src_var, dst_var)
+                is_identical = (
+                    _is_variable_spec_identical(src_var, dst_var)
+                    and not enable_dp_subsharding
+                )
                 s_nd_slices = computed_nd_slices.get(
                     reference_src_unit, {}
                 ).get(src_var.name, [])
@@ -1244,6 +1394,7 @@ class ReshardPlanner:
           if dst_target_bundle is None:
             dst_targets = []
             dst_targets_by_slice = {}
+            dp_replica_groups: dict[tuple[Any, int], list[Any]] = {}
             for dst_unit in dst_units:
               dst_var = dst_vars_by_unit_and_name.get(dst_unit, {}).get(
                   var_name
@@ -1302,6 +1453,7 @@ class ReshardPlanner:
               dst_unit_idx = dst_units_index.get(dst_unit, 0)
               is_dst_legacy = is_legacy_by_unit.get(dst_unit, True)
               num_dst_shards = max(1, len(dst_shards))
+              entry_idx = len(dst_targets)
 
               dst_shard_items = []
               for local_dst_idx, global_dst_idx in dst_indices:
@@ -1313,7 +1465,76 @@ class ReshardPlanner:
                     if local_dst_idx < len(dst_shards)
                     else dst_shards[0]
                 )
-                dst_shard_items.append((local_dst_idx, dst_slice, dst_peer))
+                item_idx = len(dst_shard_items)
+                dst_shard_items.append([local_dst_idx, dst_slice, dst_peer])
+                if enable_dp_subsharding:
+                  rep_key, phys_coords = _get_dst_replica_and_phys_coords(
+                      dst_unit,
+                      local_dst_idx,
+                      num_dst_shards,
+                      dst_phys_mesh_shape,
+                      dst_host_subgrid,
+                      list(dst_var.mesh_shape),
+                  )
+                  dp_replica_groups.setdefault(
+                      (rep_key, global_dst_idx), []
+                  ).append((
+                      phys_coords,
+                      dst_unit_idx,
+                      local_dst_idx,
+                      entry_idx,
+                      item_idx,
+                  ))
+
+              dst_targets.append((
+                  dst_unit,
+                  dst_unit_idx,
+                  is_dst_legacy,
+                  num_dst_shards,
+                  dst_shard_items,
+              ))
+
+            if enable_dp_subsharding and dp_replica_groups:
+              for (_, _), group in dp_replica_groups.items():
+                if len(group) <= 1:
+                  continue
+                k = len(group)
+                first_entry_idx = group[0][3]
+                first_item_idx = group[0][4]
+                full_slice = dst_targets[first_entry_idx][4][first_item_idx][1]
+                local_shape = tuple(e - s for s, e in full_slice)
+                d_split = find_dp_subshard_split_dim(
+                    local_shape, k, tile_rows=8
+                )
+                if d_split is None:
+                  continue
+                group.sort(key=lambda x: (x[0], x[1], x[2]))
+                dim_start, dim_end = full_slice[d_split]
+                sub_dim = (dim_end - dim_start) // k
+                for rank_r, (_, _, _, e_idx, i_idx) in enumerate(group):
+                  sub_slice = (
+                      full_slice[:d_split]
+                      + (
+                          (
+                              dim_start + rank_r * sub_dim,
+                              dim_start + (rank_r + 1) * sub_dim,
+                          ),
+                      )
+                      + full_slice[d_split + 1 :]
+                  )
+                  dst_targets[e_idx][4][i_idx][1] = sub_slice
+
+            finalized_dst_targets = []
+            for (
+                dst_unit,
+                dst_unit_idx,
+                is_dst_legacy,
+                num_dst_shards,
+                dst_shard_items,
+            ) in dst_targets:
+              tuple_items = []
+              for local_dst_idx, dst_slice, dst_peer in dst_shard_items:
+                tuple_items.append((local_dst_idx, dst_slice, dst_peer))
                 dst_global_idx = dst_unit_idx * num_dst_shards + local_dst_idx
                 dst_targets_by_slice.setdefault(
                     (dst_slice, is_dst_legacy), []
@@ -1325,14 +1546,14 @@ class ReshardPlanner:
                     data_address_to_unit.get(dst_peer),
                     data_address_to_host.get(dst_peer),
                 ))
-
-              dst_targets.append((
+              finalized_dst_targets.append((
                   dst_unit,
                   dst_unit_idx,
                   is_dst_legacy,
                   num_dst_shards,
-                  dst_shard_items,
+                  tuple_items,
               ))
+            dst_targets = finalized_dst_targets
             dst_target_bundle = (dst_targets, dst_targets_by_slice)
             dst_targets_cache[dst_group_sig] = dst_target_bundle
           else:

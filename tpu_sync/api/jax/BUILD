@@ -100,6 +100,7 @@ py_test(
         ":weight_synchronizer_jax_py",
         "//tpu_sync/frameworks/jax:jax_test_utils",
         "//tpu_sync/rpc:raiden_service_py_pb2",
+        "//tpu_sync/weight_sync/manager:reshard_planner",
         "@com_google_absl_py//absl/testing:absltest",
         "@jax//jax",
         "@pypi//numpy",

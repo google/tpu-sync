@@ -330,9 +330,9 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     const uint32_t size_bytes = header.count_or_size;
     const uint16_t buf_id = header.buffer_id;
 
-    uint8_t* const base_host_ptr =
-        raw_delegate_->GetHostPointer(buf_id, dst_shard_idx);
     const size_t host_size = raw_delegate_->GetHostSize(buf_id, dst_shard_idx);
+    uint8_t* const base_host_ptr = raw_delegate_->AcquireHostPointerForPush(
+        buf_id, dst_shard_idx, dst_offset, size_bytes, header.uuid);
     if (base_host_ptr == nullptr || size_bytes > host_size ||
         dst_offset > host_size - size_bytes) {
       return absl::InvalidArgumentError("Destination out of bounds");
@@ -429,17 +429,22 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
 
     for (uint32_t i = 0; i < batch_size; ++i) {
       const auto& meta = metadata[i];
-      uint8_t* const base_host_ptr =
-          raw_delegate_->GetHostPointer(meta.layer_idx, meta.dst_shard_idx);
+      const uint32_t count = meta.count > 0 ? meta.count : 1;
+      const size_t dst_stride =
+          meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
+      const size_t span_bytes =
+          (count == 1 || dst_stride == meta.size_bytes)
+              ? (count * meta.size_bytes)
+              : ((count - 1) * dst_stride + meta.size_bytes);
       const size_t host_size =
           raw_delegate_->GetHostSize(meta.layer_idx, meta.dst_shard_idx);
+      uint8_t* const base_host_ptr = raw_delegate_->AcquireHostPointerForPush(
+          meta.layer_idx, meta.dst_shard_idx, meta.dst_offset_bytes, span_bytes,
+          header.uuid);
       if (base_host_ptr == nullptr) {
         return absl::InvalidArgumentError(
             "Destination host pointer is null in batched push");
       }
-      const uint32_t count = meta.count > 0 ? meta.count : 1;
-      const size_t dst_stride =
-          meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
 
       if (count == 1 || dst_stride == meta.size_bytes) {
         const size_t task_bytes = count * meta.size_bytes;

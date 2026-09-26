@@ -67,12 +67,37 @@
 ABSL_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size, 256 * 1024,
           "Amount of scratchpad to allocate to host buffers for resharding "
           "pulls.");
+ABSL_FLAG(size_t, raiden_weight_sync_ring_buffer_size, 0,
+          "Bounded host DRAM ring-buffer pool size (number of layer slots per "
+          "shard). 0 disables ring buffering and allocates per layer.");
 
 namespace tpu_raiden {
 namespace weight_sync {
 
 namespace {
 static std::atomic<size_t> global_allocated_host_dram_bytes_{0};
+
+size_t ResolveRingBufferSize(std::optional<size_t> explicit_ring_size,
+                             size_t num_layers) {
+  if (num_layers == 0) {
+    return 0;
+  }
+  if (explicit_ring_size.has_value() && *explicit_ring_size > 0) {
+    return std::min(*explicit_ring_size, num_layers);
+  }
+  const char* env_val = std::getenv("RAIDEN_WEIGHT_SYNC_RING_BUFFER_SIZE");
+  if (env_val != nullptr) {
+    size_t parsed_val = 0;
+    if (absl::SimpleAtoi(env_val, &parsed_val) && parsed_val > 0) {
+      return std::min(parsed_val, num_layers);
+    }
+  }
+  size_t flag_val = absl::GetFlag(FLAGS_raiden_weight_sync_ring_buffer_size);
+  if (flag_val > 0) {
+    return std::min(flag_val, num_layers);
+  }
+  return 0;
+}
 }  // namespace
 
 WeightSynchronizerBase::WeightSynchronizerBase(
@@ -81,14 +106,16 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     std::optional<std::vector<const uint8_t*>> external_host_ptrs,
     bool unsafe_skip_buffer_lock, int parallelism,
     std::optional<int> listener_port, std::optional<std::string> bind_ip,
-    std::vector<std::string> layer_names, bool auto_h2d)
+    std::vector<std::string> layer_names, bool auto_h2d,
+    std::optional<size_t> ring_buffer_size)
     : tpu_raiden::RaidenManagerBase(
           layer_buffers.size(),
           layer_buffers.empty() ? 0 : layer_buffers[0].size(),
           layer_buffers.empty() ? 0
                                 : layer_buffers[0][0].GetOnDeviceSizeInBytes(),
           local_port, parallelism, bind_ip),
-      auto_h2d_(auto_h2d) {
+      auto_h2d_(auto_h2d),
+      ring_buffer_size_(ResolveRingBufferSize(ring_buffer_size, num_layers_)) {
   if (layer_names.empty()) {
     layer_names_.reserve(num_layers_);
     for (size_t i = 0; i < num_layers_; ++i) {
@@ -129,9 +156,35 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   }
   HostMemoryAllocator* host_allocator = host_allocator_.get();
 
+  const size_t scratchpad_size =
+      absl::GetFlag(FLAGS_raiden_weight_sync_host_buffer_scratchpad_size);
+  const bool use_ring_pool = !external_host_ptrs.has_value() &&
+                             ring_buffer_size_ > 0 &&
+                             ring_buffer_size_ < num_layers_;
+  std::vector<std::vector<size_t>> slot_max_alloc_sizes;
+  if (use_ring_pool) {
+    slot_max_alloc_sizes.assign(ring_buffer_size_,
+                                std::vector<size_t>(num_shards_, 0));
+    for (size_t l = 0; l < num_layers_; ++l) {
+      if (layer_buffers[l].size() != num_shards_) {
+        throw std::runtime_error(
+            "Number of shards mismatch across layers during weight sync init");
+      }
+      const size_t slot = l % ring_buffer_size_;
+      for (size_t i = 0; i < num_shards_; ++i) {
+        const size_t req =
+            layer_buffers[l][i].GetOnDeviceSizeInBytes() + scratchpad_size;
+        slot_max_alloc_sizes[slot][i] =
+            std::max(slot_max_alloc_sizes[slot][i], req);
+      }
+    }
+  }
+
   size_t shard_idx = 0;
+  size_t init_host_bytes = 0;
   layers_.reserve(num_layers_);
   buffer_holds_.reserve(num_layers_);
+  received_extents_.reserve(num_layers_);
 
   for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
     const auto& dst_buffers = layer_buffers[layer_idx];
@@ -144,48 +197,57 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     layer_info.shards.reserve(num_shards_);
     std::vector<raiden::BufferHoldAndAlias> hold_info;
     hold_info.reserve(num_shards_);
+    auto layer_extents = std::make_unique<std::atomic<size_t>[]>(num_shards_);
 
     for (size_t i = 0; i < num_shards_; ++i) {
+      layer_extents[i].store(0, std::memory_order_relaxed);
       const auto& dst_buffer = dst_buffers[i];
       ShardBufferInfoBase shard_info;
 
       shard_info.device_size = dst_buffer.GetOnDeviceSizeInBytes();
+      size_t logical_alloc_size = shard_info.device_size + scratchpad_size;
 
-      size_t alloc_size =
-          shard_info.device_size +
-          absl::GetFlag(FLAGS_raiden_weight_sync_host_buffer_scratchpad_size);
       if (external_host_ptrs.has_value()) {
         if (shard_idx < external_host_ptrs->size()) {
           shard_info.host_ptr = (*external_host_ptrs)[shard_idx];
         } else {
           throw std::invalid_argument("External host pointers size mismatch");
         }
-        shard_info.host_size = alloc_size;
+        shard_info.host_size = logical_alloc_size;
+        init_host_bytes += logical_alloc_size;
         shard_idx++;
+      } else if (use_ring_pool && layer_idx >= ring_buffer_size_) {
+        const size_t slot = layer_idx % ring_buffer_size_;
+        shard_info.host_ptr = layers_[slot].shards[i].host_ptr;
+        shard_info.host_size = logical_alloc_size;
       } else {
-        if (alloc_size > 0) {
+        size_t phys_alloc_size = use_ring_pool
+                                     ? slot_max_alloc_sizes[layer_idx][i]
+                                     : logical_alloc_size;
+        if (phys_alloc_size > 0) {
           if (host_allocator && dst_buffer.device) {
             auto alloc = host_allocator->AllocateDmaMappedForDevice(
-                alloc_size, dst_buffer.device);
+                phys_alloc_size, dst_buffer.device);
             if (alloc.ok()) {
               shard_info.host_ptr = (*alloc).ptr;
-              shard_info.host_size = alloc_size;
+              shard_info.host_size = logical_alloc_size;
               shard_info.host_owner = (*alloc).owner;
             }
           }
           if (shard_info.host_ptr == nullptr) {
             void* ptr = nullptr;
-            if (posix_memalign(&ptr, 64, alloc_size) != 0) {
+            if (posix_memalign(&ptr, 64, phys_alloc_size) != 0) {
               throw std::runtime_error(
                   "Failed to allocate host weights buffer");
             }
-            std::memset(ptr, 0, alloc_size);
+            std::memset(ptr, 0, phys_alloc_size);
             shard_info.owned_host_buffer =
                 std::unique_ptr<uint8_t[], void (*)(void*)>(
                     static_cast<uint8_t*>(ptr), [](void* p) { free(p); });
             shard_info.host_ptr = shard_info.owned_host_buffer.get();
-            shard_info.host_size = alloc_size;
+            shard_info.host_size = logical_alloc_size;
           }
+          init_host_bytes += phys_alloc_size;
         }
       }
 
@@ -209,15 +271,24 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     }
     layers_.push_back(std::move(layer_info));
     buffer_holds_.push_back(std::move(hold_info));
+    received_extents_.push_back(std::move(layer_extents));
+  }
+
+  if (use_ring_pool) {
+    ring_slot_states_.reserve(ring_buffer_size_);
+    for (size_t s = 0; s < ring_buffer_size_; ++s) {
+      ring_slot_states_.push_back(std::make_unique<RingSlotState>());
+    }
   }
 
   if (listener_port) {
     listener_ =
         std::make_unique<WeightSynchronizerListener>(this, *listener_port);
   }
-  if (auto_h2d_) {
+  if (auto_h2d_ || use_ring_pool) {
     h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-        std::max(parallelism_, 4));
+        std::max<size_t>({static_cast<size_t>(parallelism_), 4,
+                          use_ring_pool ? ring_buffer_size_ : 0}));
   }
   push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
       std::max(parallelism_, 4));
@@ -227,12 +298,6 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     tiled_scratchpads_.push_back(std::make_unique<ShardScratchpad>());
   }
 
-  size_t init_host_bytes = 0;
-  for (const auto& layer : layers_) {
-    for (const auto& shard : layer.shards) {
-      init_host_bytes += shard.host_size;
-    }
-  }
   if (init_host_bytes > 0) {
     UpdateAllocatedOccupancyMetric(init_host_bytes);
   }
@@ -243,24 +308,25 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, std::vector<std::string> layer_names,
-    bool auto_h2d)
+    bool auto_h2d, std::optional<size_t> ring_buffer_size)
     : WeightSynchronizerBase(num_layers, num_shards,
                              std::vector<size_t>(num_layers, slice_byte_size),
                              local_port, host_blocks_to_allocate, parallelism,
                              listener_port, bind_ip, std::move(layer_names),
-                             auto_h2d) {}
+                             auto_h2d, ring_buffer_size) {}
 
 WeightSynchronizerBase::WeightSynchronizerBase(
     size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, std::optional<int> listener_port,
     std::optional<std::string> bind_ip, std::vector<std::string> layer_names,
-    bool auto_h2d)
+    bool auto_h2d, std::optional<size_t> ring_buffer_size)
     : tpu_raiden::RaidenManagerBase(
           num_layers, num_shards,
           slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0], local_port,
           parallelism, bind_ip),
-      auto_h2d_(auto_h2d) {
+      auto_h2d_(auto_h2d),
+      ring_buffer_size_(ResolveRingBufferSize(ring_buffer_size, num_layers_)) {
   if (layer_names.empty()) {
     layer_names_.reserve(num_layers_);
     for (size_t i = 0; i < num_layers_; ++i) {
@@ -273,46 +339,81 @@ WeightSynchronizerBase::WeightSynchronizerBase(
   shard_factor_ = 1;
   major_dim_size_ = 1;
 
+  const size_t scratchpad_size =
+      absl::GetFlag(FLAGS_raiden_weight_sync_host_buffer_scratchpad_size);
+  const bool use_ring_pool =
+      ring_buffer_size_ > 0 && ring_buffer_size_ < num_layers_;
+  std::vector<size_t> slot_max_alloc_sizes;
+  if (use_ring_pool) {
+    slot_max_alloc_sizes.assign(ring_buffer_size_, 0);
+    for (size_t l = 0; l < num_layers_; ++l) {
+      size_t sz = (l < slice_byte_sizes.size()) ? slice_byte_sizes[l]
+                                                : slice_byte_size_;
+      slot_max_alloc_sizes[l % ring_buffer_size_] = std::max(
+          slot_max_alloc_sizes[l % ring_buffer_size_], sz + scratchpad_size);
+    }
+  }
+
+  size_t init_host_bytes = 0;
   layers_.reserve(num_layers_);
+  received_extents_.reserve(num_layers_);
   for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
     size_t current_slice_byte_size = (layer_idx < slice_byte_sizes.size())
                                          ? slice_byte_sizes[layer_idx]
                                          : slice_byte_size_;
     LayerInfoBase layer_info;
     layer_info.shards.reserve(num_shards_);
+    auto layer_extents = std::make_unique<std::atomic<size_t>[]>(num_shards_);
 
     for (size_t i = 0; i < num_shards_; ++i) {
+      layer_extents[i].store(0, std::memory_order_relaxed);
       ShardBufferInfoBase shard_info;
       shard_info.device_size = current_slice_byte_size;
+      size_t logical_alloc_size = current_slice_byte_size + scratchpad_size;
 
-      size_t alloc_size =
-          current_slice_byte_size +
-          absl::GetFlag(FLAGS_raiden_weight_sync_host_buffer_scratchpad_size);
-      void* ptr = nullptr;
-      if (alloc_size > 0) {
-        if (posix_memalign(&ptr, 64, alloc_size) != 0) {
-          throw std::runtime_error("Failed to allocate host weights buffer");
+      if (use_ring_pool && layer_idx >= ring_buffer_size_) {
+        const size_t slot = layer_idx % ring_buffer_size_;
+        shard_info.host_ptr = layers_[slot].shards[i].host_ptr;
+        shard_info.host_size = logical_alloc_size;
+      } else {
+        size_t phys_alloc_size = use_ring_pool ? slot_max_alloc_sizes[layer_idx]
+                                               : logical_alloc_size;
+        void* ptr = nullptr;
+        if (phys_alloc_size > 0) {
+          if (posix_memalign(&ptr, 64, phys_alloc_size) != 0) {
+            throw std::runtime_error("Failed to allocate host weights buffer");
+          }
+          std::memset(ptr, 0, phys_alloc_size);
         }
-        std::memset(ptr, 0, alloc_size);
+        shard_info.owned_host_buffer =
+            std::unique_ptr<uint8_t[], void (*)(void*)>(
+                static_cast<uint8_t*>(ptr), [](void* p) { free(p); });
+        shard_info.host_ptr = shard_info.owned_host_buffer.get();
+        shard_info.host_size = logical_alloc_size;
+        init_host_bytes += phys_alloc_size;
       }
-      shard_info.owned_host_buffer =
-          std::unique_ptr<uint8_t[], void (*)(void*)>(
-              static_cast<uint8_t*>(ptr), [](void* p) { free(p); });
-      shard_info.host_ptr = shard_info.owned_host_buffer.get();
-      shard_info.host_size = alloc_size;
 
       layer_info.shards.push_back(std::move(shard_info));
     }
     layers_.push_back(std::move(layer_info));
+    received_extents_.push_back(std::move(layer_extents));
+  }
+
+  if (use_ring_pool) {
+    ring_slot_states_.reserve(ring_buffer_size_);
+    for (size_t s = 0; s < ring_buffer_size_; ++s) {
+      ring_slot_states_.push_back(std::make_unique<RingSlotState>());
+    }
   }
 
   if (listener_port) {
     listener_ =
         std::make_unique<WeightSynchronizerListener>(this, *listener_port);
   }
-  if (auto_h2d_) {
+  if (auto_h2d_ || use_ring_pool) {
     h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-        std::max(parallelism_, 4));
+        std::max<size_t>({static_cast<size_t>(parallelism_), 4,
+                          use_ring_pool ? ring_buffer_size_ : 0}));
   }
   push_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
       std::max(parallelism_, 4));
@@ -322,12 +423,6 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     tiled_scratchpads_.push_back(std::make_unique<ShardScratchpad>());
   }
 
-  size_t init_host_bytes = 0;
-  for (const auto& layer : layers_) {
-    for (const auto& shard : layer.shards) {
-      init_host_bytes += shard.host_size;
-    }
-  }
   if (init_host_bytes > 0) {
     UpdateAllocatedOccupancyMetric(init_host_bytes);
   }
@@ -494,13 +589,15 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
     if (skip_flag) {
       is_tiled = false;
     }
+    const size_t extent = GetReceivedExtent(layer_idx, i);
     VLOG(1) << "[WeightSynchronizerBase] H2dLayer " << layer_idx << " shard "
             << i << " (layer: "
             << (layer_idx < layer_names_.size() ? layer_names_[layer_idx]
                                                 : "unknown")
             << ", is_tiled=" << is_tiled << ", skip_flag=" << skip_flag
             << ", shape=" << shard_hold.shape.ToString()
-            << ", size=" << shard_info.device_size << " bytes)";
+            << ", size=" << shard_info.device_size
+            << " bytes, received_extent=" << extent << ")";
 
     std::vector<xla::Future<>> shard_futures;
     if (is_tiled) {
@@ -531,6 +628,13 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
       }
       double tile_time_ms =
           absl::ToDoubleMilliseconds(absl::Now() - tile_start);
+      size_t logical_bytes =
+          xla::ShapeUtil::ByteSizeOfElements(shard_hold.shape);
+      size_t h2d_bytes = physical_bytes;
+      if (extent > 0 && extent < logical_bytes && logical_bytes > 0 &&
+          (extent * physical_bytes) % logical_bytes == 0) {
+        h2d_bytes = (extent * physical_bytes) / logical_bytes;
+      }
       {
         absl::MutexLock metrics_lock(metrics_mu_);
         metrics_.last_tiling_time_ms =
@@ -538,15 +642,25 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
         metrics_.total_tiling_time_ms += tile_time_ms;
         metrics_.last_tiled_bytes += physical_bytes;
         metrics_.total_tiled_bytes += physical_bytes;
+        metrics_.last_h2d_bytes += h2d_bytes;
+        metrics_.total_h2d_bytes += h2d_bytes;
       }
 
       xla::Future<> future =
-          shard_hold.CopyRawHostToDevice(tiled_buffer_ptr, 0, physical_bytes);
+          shard_hold.CopyRawHostToDevice(tiled_buffer_ptr, 0, h2d_bytes);
       sp.in_flight_future = future;
       shard_futures.push_back(future);
     } else {
-      xla::Future<> future = shard_hold.CopyRawHostToDevice(
-          shard_info.host_ptr, 0, shard_info.device_size);
+      size_t h2d_bytes = (extent > 0 && extent < shard_info.device_size)
+                             ? extent
+                             : shard_info.device_size;
+      {
+        absl::MutexLock metrics_lock(metrics_mu_);
+        metrics_.last_h2d_bytes += h2d_bytes;
+        metrics_.total_h2d_bytes += h2d_bytes;
+      }
+      xla::Future<> future =
+          shard_hold.CopyRawHostToDevice(shard_info.host_ptr, 0, h2d_bytes);
       shard_futures.push_back(std::move(future));
     }
     shard_futures_to_join.push_back(raiden::CreateBufferFuture(
@@ -562,6 +676,21 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
   if (buffer_holds_.empty()) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
+  if (!ring_slot_states_.empty() && ring_buffer_size_ > 0 &&
+      ring_buffer_size_ < num_layers_) {
+    bool already_flushed = false;
+    bool has_pending = false;
+    {
+      absl::MutexLock lock(pending_h2d_mu_);
+      has_pending = !pending_h2d_states_.empty();
+      already_flushed = (uuid == 0) ? !ring_flushed_h2d_uuids_.empty()
+                                    : ring_flushed_h2d_uuids_.contains(uuid);
+    }
+    if (has_pending || already_flushed) {
+      DrainPendingH2d();
+      return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
+    }
+  }
   const auto start_time = absl::Now();
   VLOG(1) << "Starting H2d across " << num_layers_ << " layers (uuid=" << uuid
           << ")...";
@@ -569,6 +698,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
     absl::MutexLock lock(metrics_mu_);
     metrics_.last_tiling_time_ms = 0.0;
     metrics_.last_tiled_bytes = 0;
+    metrics_.last_h2d_bytes = 0;
   }
   std::vector<raiden::PjRtCopyFuture> layer_futures;
   layer_futures.reserve(num_layers_);
@@ -1026,23 +1156,30 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   double staging_time_ms =
       absl::ToDoubleMilliseconds(absl::Now() - staging_start);
 
+  const bool use_ring_pool = !ring_slot_states_.empty() &&
+                             ring_buffer_size_ > 0 &&
+                             ring_buffer_size_ < num_layers_;
   bool already_completed = false;
   uint64_t uuid = request.uuid();
-  std::vector<raiden::PjRtCopyFuture> d2h_layer_futures;
-  d2h_layer_futures.reserve(num_layers_);
+  std::vector<std::optional<raiden::PjRtCopyFuture>> d2h_layer_futures(
+      num_layers_);
   auto d2h_start = absl::Now();
   if (!request.skip_d2h()) {
-    if (uuid != 0) {
+    if (uuid != 0 && !use_ring_pool) {
       absl::MutexLock lock(d2h_mu_);
       already_completed = !completed_d2h_uuids_.insert(uuid).second;
     }
     if (!already_completed) {
+      const size_t initial_d2h_layers =
+          use_ring_pool ? std::min(num_layers_, ring_buffer_size_)
+                        : num_layers_;
       VLOG(1)
           << "PushWeightsResharded: Executing pipelined D2H copies for uuid "
-          << uuid;
-      for (size_t l = 0; l < num_layers_; ++l) {
+          << uuid << " (initial_d2h_layers=" << initial_d2h_layers
+          << ", ring_buffer_size=" << ring_buffer_size_ << ")";
+      for (size_t l = 0; l < initial_d2h_layers; ++l) {
         TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture f, D2hLayer(l, uuid));
-        d2h_layer_futures.push_back(std::move(f));
+        d2h_layer_futures[l] = std::move(f);
       }
     } else {
       VLOG(1) << "PushWeightsResharded: Coalescing D2H copy (already completed "
@@ -1086,9 +1223,48 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   if (group_size == 0) {
     group_size = 1;
   }
+  if (use_ring_pool) {
+    const size_t max_ring_group = std::max<size_t>(1, ring_buffer_size_ / 2);
+    if (pipeline_group_size_override_.has_value() &&
+        *pipeline_group_size_override_ > 0) {
+      group_size = std::min(*pipeline_group_size_override_, ring_buffer_size_);
+    } else {
+      group_size = std::min(group_size, max_ring_group);
+    }
+  }
 
   std::vector<std::future<absl::Status>> push_futures;
-  push_futures.reserve((num_layers_ + group_size - 1) / group_size);
+  std::vector<bool> push_future_awaited;
+  const size_t num_groups = (num_layers_ + group_size - 1) / group_size;
+  push_futures.reserve(num_groups);
+  push_future_awaited.reserve(num_groups);
+  std::vector<std::optional<size_t>> slot_last_push_idx(
+      use_ring_pool ? ring_buffer_size_ : 0, std::nullopt);
+
+  auto await_push_future = [&](size_t idx) -> absl::Status {
+    if (idx < push_futures.size() && !push_future_awaited[idx]) {
+      push_future_awaited[idx] = true;
+      return push_futures[idx].get();
+    }
+    return absl::OkStatus();
+  };
+
+  auto ensure_d2h_started = [&](size_t l) -> absl::Status {
+    if (request.skip_d2h() || already_completed ||
+        d2h_layer_futures[l].has_value()) {
+      return absl::OkStatus();
+    }
+    if (use_ring_pool) {
+      const size_t slot = l % ring_buffer_size_;
+      if (slot_last_push_idx[slot].has_value()) {
+        TF_RETURN_IF_ERROR(await_push_future(*slot_last_push_idx[slot]));
+        slot_last_push_idx[slot] = std::nullopt;
+      }
+    }
+    TF_ASSIGN_OR_RETURN(raiden::PjRtCopyFuture f, D2hLayer(l, uuid));
+    d2h_layer_futures[l] = std::move(f);
+    return absl::OkStatus();
+  };
 
   for (size_t group_start = 0; group_start < num_layers_;
        group_start += group_size) {
@@ -1100,7 +1276,8 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
         total_d2h_bytes += GetHostSize(l, s);
       }
       if (!request.skip_d2h() && !already_completed) {
-        TF_RETURN_IF_ERROR(d2h_layer_futures[l].Await());
+        TF_RETURN_IF_ERROR(ensure_d2h_started(l));
+        TF_RETURN_IF_ERROR(d2h_layer_futures[l]->Await());
         last_d2h_done_time = absl::Now();
         if (l == 0) {
           first_d2h_time_ms =
@@ -1117,6 +1294,7 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       }
     }
 
+    std::optional<size_t> current_push_idx = std::nullopt;
     if (!group_tasks.empty()) {
       int push_parallelism =
           request.parallelism() > 0 ? request.parallelism() : parallelism_;
@@ -1125,11 +1303,32 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
                                 push_parallelism, uuid = request.uuid()]() {
             return PushWeightsChunks(group_tasks, push_parallelism, uuid);
           }));
+      push_future_awaited.push_back(false);
+      current_push_idx = push_futures.size() - 1;
+      if (use_ring_pool) {
+        for (size_t l = group_start; l < group_end; ++l) {
+          slot_last_push_idx[l % ring_buffer_size_] = *current_push_idx;
+        }
+      }
+    }
+
+    // Overlap D2H of the next window with the current window's asynchronous
+    // TCP push when using bounded ring buffers.
+    if (use_ring_pool && !request.skip_d2h() && !already_completed &&
+        group_end < num_layers_) {
+      const size_t next_end = std::min(num_layers_, group_end + group_size);
+      for (size_t next_l = group_end; next_l < next_end; ++next_l) {
+        const size_t next_slot = next_l % ring_buffer_size_;
+        if (!current_push_idx.has_value() ||
+            slot_last_push_idx[next_slot] != *current_push_idx) {
+          TF_RETURN_IF_ERROR(ensure_d2h_started(next_l));
+        }
+      }
     }
   }
 
-  for (auto& fut : push_futures) {
-    TF_RETURN_IF_ERROR(fut.get());
+  for (size_t idx = 0; idx < push_futures.size(); ++idx) {
+    TF_RETURN_IF_ERROR(await_push_future(idx));
   }
   auto h2h_end = absl::Now();
   double h2h_time_ms = absl::ToDoubleMilliseconds(h2h_end - h2h_start);
@@ -1265,6 +1464,9 @@ absl::Status WeightSynchronizerBase::RegisterExpectedChunks(
 
 absl::Status WeightSynchronizerBase::RegisterExpectedChunksLocal(
     uint64_t uuid, uint32_t expected_chunks) {
+  for (size_t l = 0; l < num_layers_; ++l) {
+    ResetReceivedExtentsForLayer(l);
+  }
   {
     absl::MutexLock lock(pending_h2d_mu_);
     if (pending_h2d_states_[uuid].expected_layers == 0) {
@@ -1287,46 +1489,129 @@ absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunks(
 absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunksLocal(
     uint64_t uuid,
     const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) {
+  for (const auto& [layer_idx, _] : expected_layer_chunks) {
+    ResetReceivedExtentsForLayer(layer_idx);
+  }
   {
     absl::MutexLock lock(pending_h2d_mu_);
-    pending_h2d_states_[uuid].expected_layers = expected_layer_chunks.size();
+    auto& state = pending_h2d_states_[uuid];
+    state.expected_layers = expected_layer_chunks.size();
+    state.has_layer_chunk_tracking = !expected_layer_chunks.empty();
   }
   return RaidenManagerBase::RegisterExpectedLayerChunks(uuid,
                                                         expected_layer_chunks);
 }
 
+void WeightSynchronizerBase::ReleaseRingSlot(size_t layer_idx) {
+  if (ring_slot_states_.empty() || ring_buffer_size_ == 0) {
+    return;
+  }
+  const size_t slot = layer_idx % ring_buffer_size_;
+  if (slot < ring_slot_states_.size() && ring_slot_states_[slot]) {
+    absl::MutexLock lock(ring_slot_states_[slot]->mu);
+    if (ring_slot_states_[slot]->active_layer == layer_idx) {
+      ring_slot_states_[slot]->active_layer = std::nullopt;
+      ring_slot_states_[slot]->h2d_in_flight = false;
+    }
+  }
+}
+
+size_t WeightSynchronizerBase::GetReceivedExtent(size_t layer_idx,
+                                                 size_t local_shard_idx) const {
+  if (layer_idx >= received_extents_.size() || local_shard_idx >= num_shards_ ||
+      !received_extents_[layer_idx]) {
+    return 0;
+  }
+  return received_extents_[layer_idx][local_shard_idx].load(
+      std::memory_order_relaxed);
+}
+
+void WeightSynchronizerBase::ResetReceivedExtentsForLayer(size_t layer_idx) {
+  if (layer_idx >= received_extents_.size() || !received_extents_[layer_idx]) {
+    return;
+  }
+  for (size_t i = 0; i < num_shards_; ++i) {
+    received_extents_[layer_idx][i].store(0, std::memory_order_relaxed);
+  }
+}
+
 absl::Status WeightSynchronizerBase::OnLayerDataReceived(size_t layer_idx,
                                                          uint64_t uuid) {
-  if (!auto_h2d_) {
+  const bool use_ring_pool = !ring_slot_states_.empty() &&
+                             ring_buffer_size_ > 0 &&
+                             ring_buffer_size_ < num_layers_;
+  if (!auto_h2d_ && (!use_ring_pool || buffer_holds_.empty())) {
+    if (use_ring_pool) {
+      ReleaseRingSlot(layer_idx);
+    }
     return absl::OkStatus();
   }
   if (!h2d_pool_) {
     h2d_pool_ = std::make_unique<tpu_raiden::NumaThreadPool>(
-        std::max(parallelism_, 4));
+        std::max<size_t>({static_cast<size_t>(parallelism_), 4,
+                          use_ring_pool ? ring_buffer_size_ : 0}));
+  }
+  if (use_ring_pool) {
+    const size_t slot = layer_idx % ring_buffer_size_;
+    if (slot < ring_slot_states_.size() && ring_slot_states_[slot]) {
+      absl::MutexLock slot_lock(ring_slot_states_[slot]->mu);
+      ring_slot_states_[slot]->active_layer = layer_idx;
+      ring_slot_states_[slot]->active_uuid = uuid;
+      ring_slot_states_[slot]->h2d_in_flight = true;
+    }
   }
   {
     absl::MutexLock lock(pending_h2d_mu_);
     active_h2d_uuids_.insert(uuid);
+    if (use_ring_pool) {
+      ring_flushed_h2d_uuids_.insert(uuid);
+    }
     auto& state = pending_h2d_states_[uuid];
     if (state.expected_layers == 0) {
       state.expected_layers = num_layers_;
     }
     state.layer_futures[layer_idx] = h2d_pool_->Schedule(
         assigned_numa_node_,
-        [this, layer_idx, uuid]() { return H2dLayer(layer_idx, uuid); });
+        [this, layer_idx, uuid,
+         use_ring_pool]() -> absl::StatusOr<raiden::PjRtCopyFuture> {
+          auto res = H2dLayer(layer_idx, uuid);
+          if (use_ring_pool) {
+            if (res.ok()) {
+              absl::Status st = res->Await();
+              if (!st.ok()) {
+                ReleaseRingSlot(layer_idx);
+                return st;
+              }
+            }
+            ReleaseRingSlot(layer_idx);
+          }
+          return res;
+        });
   }
   return absl::OkStatus();
 }
 
 absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
-  auto record_completion = [this, uuid]() {
+  const bool use_ring_pool = !ring_slot_states_.empty() &&
+                             ring_buffer_size_ > 0 &&
+                             ring_buffer_size_ < num_layers_;
+  auto record_completion = [this, uuid, use_ring_pool]() {
+    if (use_ring_pool) {
+      for (size_t s = 0; s < ring_slot_states_.size(); ++s) {
+        if (ring_slot_states_[s]) {
+          absl::MutexLock slot_lock(ring_slot_states_[s]->mu);
+          ring_slot_states_[s]->active_layer = std::nullopt;
+          ring_slot_states_[s]->h2d_in_flight = false;
+        }
+      }
+    }
     if (uuid > 0) {
       absl::MutexLock lock(completed_transfers_mu_);
       completed_transfers_.insert(uuid);
     }
   };
 
-  if (!auto_h2d_) {
+  if (!auto_h2d_ && (!use_ring_pool || buffer_holds_.empty())) {
     record_completion();
     return absl::OkStatus();
   }
@@ -1337,6 +1622,9 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
       layer_futures_map;
   {
     absl::MutexLock lock(pending_h2d_mu_);
+    if (use_ring_pool) {
+      ring_flushed_h2d_uuids_.insert(uuid);
+    }
     auto it = pending_h2d_states_.find(uuid);
     if (it != pending_h2d_states_.end()) {
       layer_futures_map = std::move(it->second.layer_futures);
@@ -1392,7 +1680,10 @@ absl::Status WeightSynchronizerBase::OnDataReceived(uint64_t uuid) {
 }
 
 void WeightSynchronizerBase::DrainPendingH2d() {
-  if (!auto_h2d_) return;
+  const bool use_ring_pool = !ring_slot_states_.empty() &&
+                             ring_buffer_size_ > 0 &&
+                             ring_buffer_size_ < num_layers_;
+  if (!auto_h2d_ && !use_ring_pool) return;
 
   absl::flat_hash_map<uint64_t, PendingH2dState> pending_states;
   {
@@ -1498,6 +1789,15 @@ absl::Status WeightSynchronizerBase::OnBlocksReceived(
 
 void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
   RaidenManagerBase::ForgetPushProgress(uuid);
+  for (size_t s = 0; s < ring_slot_states_.size(); ++s) {
+    if (ring_slot_states_[s]) {
+      absl::MutexLock slot_lock(ring_slot_states_[s]->mu);
+      if (uuid == 0 || ring_slot_states_[s]->active_uuid == uuid) {
+        ring_slot_states_[s]->active_layer = std::nullopt;
+        ring_slot_states_[s]->h2d_in_flight = false;
+      }
+    }
+  }
   {
     absl::MutexLock lock(completed_transfers_mu_);
     completed_transfers_.erase(uuid);
@@ -1513,7 +1813,110 @@ void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
   {
     absl::MutexLock lock(pending_h2d_mu_);
     pending_h2d_states_.erase(uuid);
+    ring_flushed_h2d_uuids_.erase(uuid);
   }
+}
+
+size_t WeightSynchronizerBase::ResolveLocalShardIndex(size_t layer_idx,
+                                                      size_t shard_idx) const {
+  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
+  if (!local_shard_indices_.empty()) {
+    auto it =
+        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
+                  static_cast<int>(shard_idx));
+    if (it != local_shard_indices_.end()) {
+      local_idx = std::distance(local_shard_indices_.begin(), it);
+    } else if (!global_shard_indices_.empty()) {
+      auto git =
+          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
+                    static_cast<int64_t>(shard_idx));
+      if (git != global_shard_indices_.end()) {
+        local_idx = std::distance(global_shard_indices_.begin(), git);
+      }
+    }
+  } else if (!global_shard_indices_.empty()) {
+    auto it =
+        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
+                  static_cast<int64_t>(shard_idx));
+    if (it != global_shard_indices_.end()) {
+      local_idx = std::distance(global_shard_indices_.begin(), it);
+    }
+  }
+  return local_idx;
+}
+
+uint8_t* WeightSynchronizerBase::AcquireHostPointerForPush(
+    size_t buffer_id, size_t shard_idx, size_t dst_offset_bytes,
+    size_t span_bytes, uint64_t uuid) {
+  if (buffer_id >= layers_.size() || layers_[buffer_id].shards.empty()) {
+    return nullptr;
+  }
+  const size_t local_idx = ResolveLocalShardIndex(buffer_id, shard_idx);
+  const bool use_ring_pool = !ring_slot_states_.empty() &&
+                             ring_buffer_size_ > 0 &&
+                             ring_buffer_size_ < num_layers_;
+  if (use_ring_pool && uuid > 0) {
+    bool has_layer_tracking = false;
+    {
+      absl::MutexLock lock(pending_h2d_mu_);
+      auto it = pending_h2d_states_.find(uuid);
+      if (it != pending_h2d_states_.end()) {
+        has_layer_tracking = it->second.has_layer_chunk_tracking;
+      }
+    }
+    const size_t slot = buffer_id % ring_buffer_size_;
+    if (slot < ring_slot_states_.size() && ring_slot_states_[slot]) {
+      auto& slot_state = *ring_slot_states_[slot];
+      std::optional<size_t> layer_to_flush_sync = std::nullopt;
+      {
+        absl::MutexLock slot_lock(slot_state.mu);
+        if (has_layer_tracking) {
+          struct WaitCtx {
+            RingSlotState* state;
+            size_t target_layer;
+            uint64_t target_uuid;
+          } ctx{&slot_state, buffer_id, uuid};
+          auto can_acquire = +[](WaitCtx* c) ABSL_NO_THREAD_SAFETY_ANALYSIS {
+            return !c->state->active_layer.has_value() ||
+                   *c->state->active_layer == c->target_layer ||
+                   c->state->active_uuid != c->target_uuid;
+          };
+          slot_state.mu.Await(absl::Condition(can_acquire, &ctx));
+        } else if (slot_state.active_layer.has_value() &&
+                   *slot_state.active_layer != buffer_id &&
+                   slot_state.active_uuid == uuid && !buffer_holds_.empty()) {
+          layer_to_flush_sync = *slot_state.active_layer;
+        }
+        if (slot_state.active_layer != buffer_id ||
+            slot_state.active_uuid != uuid) {
+          ResetReceivedExtentsForLayer(buffer_id);
+          slot_state.active_layer = buffer_id;
+          slot_state.active_uuid = uuid;
+          slot_state.h2d_in_flight = false;
+        }
+      }
+      if (layer_to_flush_sync.has_value()) {
+        auto fut_or = H2dLayer(*layer_to_flush_sync, uuid);
+        if (fut_or.ok()) {
+          (void)fut_or->Await();
+        }
+        absl::MutexLock lock(pending_h2d_mu_);
+        ring_flushed_h2d_uuids_.insert(uuid);
+      }
+    }
+  }
+
+  if (buffer_id < received_extents_.size() && received_extents_[buffer_id] &&
+      local_idx < num_shards_ && span_bytes > 0) {
+    const size_t end_offset = dst_offset_bytes + span_bytes;
+    size_t prev =
+        received_extents_[buffer_id][local_idx].load(std::memory_order_relaxed);
+    while (end_offset > prev &&
+           !received_extents_[buffer_id][local_idx].compare_exchange_weak(
+               prev, end_offset, std::memory_order_relaxed)) {
+    }
+  }
+  return const_cast<uint8_t*>(layers_[buffer_id].shards[local_idx].host_ptr);
 }
 
 uint8_t* WeightSynchronizerBase::GetHostPointer(size_t layer_idx,
@@ -1521,29 +1924,7 @@ uint8_t* WeightSynchronizerBase::GetHostPointer(size_t layer_idx,
   if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
     return nullptr;
   }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  if (!local_shard_indices_.empty()) {
-    auto it =
-        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
-                  static_cast<int>(shard_idx));
-    if (it != local_shard_indices_.end()) {
-      local_idx = std::distance(local_shard_indices_.begin(), it);
-    } else if (!global_shard_indices_.empty()) {
-      auto git =
-          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                    static_cast<int64_t>(shard_idx));
-      if (git != global_shard_indices_.end()) {
-        local_idx = std::distance(global_shard_indices_.begin(), git);
-      }
-    }
-  } else if (!global_shard_indices_.empty()) {
-    auto it =
-        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                  static_cast<int64_t>(shard_idx));
-    if (it != global_shard_indices_.end()) {
-      local_idx = std::distance(global_shard_indices_.begin(), it);
-    }
-  }
+  const size_t local_idx = ResolveLocalShardIndex(layer_idx, shard_idx);
   return const_cast<uint8_t*>(layers_[layer_idx].shards[local_idx].host_ptr);
 }
 
@@ -1551,29 +1932,7 @@ size_t WeightSynchronizerBase::GetHostSize(size_t layer_idx, size_t shard_idx) {
   if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
     return 0;
   }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  if (!local_shard_indices_.empty()) {
-    auto it =
-        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
-                  static_cast<int>(shard_idx));
-    if (it != local_shard_indices_.end()) {
-      local_idx = std::distance(local_shard_indices_.begin(), it);
-    } else if (!global_shard_indices_.empty()) {
-      auto git =
-          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                    static_cast<int64_t>(shard_idx));
-      if (git != global_shard_indices_.end()) {
-        local_idx = std::distance(global_shard_indices_.begin(), git);
-      }
-    }
-  } else if (!global_shard_indices_.empty()) {
-    auto it =
-        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                  static_cast<int64_t>(shard_idx));
-    if (it != global_shard_indices_.end()) {
-      local_idx = std::distance(global_shard_indices_.begin(), it);
-    }
-  }
+  const size_t local_idx = ResolveLocalShardIndex(layer_idx, shard_idx);
   return layers_[layer_idx].shards[local_idx].host_size;
 }
 
@@ -1582,29 +1941,7 @@ const uint8_t* WeightSynchronizerBase::GetHostPointer(size_t layer_idx,
   if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
     return nullptr;
   }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  if (!local_shard_indices_.empty()) {
-    auto it =
-        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
-                  static_cast<int>(shard_idx));
-    if (it != local_shard_indices_.end()) {
-      local_idx = std::distance(local_shard_indices_.begin(), it);
-    } else if (!global_shard_indices_.empty()) {
-      auto git =
-          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                    static_cast<int64_t>(shard_idx));
-      if (git != global_shard_indices_.end()) {
-        local_idx = std::distance(global_shard_indices_.begin(), git);
-      }
-    }
-  } else if (!global_shard_indices_.empty()) {
-    auto it =
-        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                  static_cast<int64_t>(shard_idx));
-    if (it != global_shard_indices_.end()) {
-      local_idx = std::distance(global_shard_indices_.begin(), it);
-    }
-  }
+  const size_t local_idx = ResolveLocalShardIndex(layer_idx, shard_idx);
   return layers_[layer_idx].shards[local_idx].host_ptr;
 }
 
@@ -1613,29 +1950,7 @@ size_t WeightSynchronizerBase::GetHostSize(size_t layer_idx,
   if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
     return 0;
   }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  if (!local_shard_indices_.empty()) {
-    auto it =
-        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
-                  static_cast<int>(shard_idx));
-    if (it != local_shard_indices_.end()) {
-      local_idx = std::distance(local_shard_indices_.begin(), it);
-    } else if (!global_shard_indices_.empty()) {
-      auto git =
-          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                    static_cast<int64_t>(shard_idx));
-      if (git != global_shard_indices_.end()) {
-        local_idx = std::distance(global_shard_indices_.begin(), git);
-      }
-    }
-  } else if (!global_shard_indices_.empty()) {
-    auto it =
-        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                  static_cast<int64_t>(shard_idx));
-    if (it != global_shard_indices_.end()) {
-      local_idx = std::distance(global_shard_indices_.begin(), it);
-    }
-  }
+  const size_t local_idx = ResolveLocalShardIndex(layer_idx, shard_idx);
   return layers_[layer_idx].shards[local_idx].host_size;
 }
 

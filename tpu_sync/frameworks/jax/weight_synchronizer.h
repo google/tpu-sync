@@ -63,7 +63,8 @@ class NumaAwareWeightSynchronizer
       int parallelism = 1, bool unsafe_skip_buffer_lock = false,
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt,
+      std::optional<size_t> ring_buffer_size = std::nullopt);
 
   absl::Status BindWeights(nanobind::list jax_arrays);
 #endif
@@ -74,14 +75,16 @@ class NumaAwareWeightSynchronizer
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt,
+      std::optional<size_t> ring_buffer_size = std::nullopt);
   NumaAwareWeightSynchronizer(
       size_t num_layers, size_t num_shards,
       std::vector<size_t> slice_byte_sizes,
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt,
+      std::optional<size_t> ring_buffer_size = std::nullopt);
 
   // Test-only constructor for injecting mock sub-synchronizers
   explicit NumaAwareWeightSynchronizer(
@@ -93,6 +96,8 @@ class NumaAwareWeightSynchronizer
   size_t num_layers() const { return num_layers_; }
   size_t num_shards() const { return total_num_shards_; }
   size_t slice_byte_size() const { return slice_byte_size_; }
+  size_t ring_buffer_size() const;
+  size_t allocated_host_dram_bytes() const;
 
   std::optional<int> local_port() const;
   std::optional<int> listener_port() const;
@@ -146,7 +151,8 @@ class NumaAwareWeightSynchronizer
       std::optional<int> local_port, bool unsafe_skip_buffer_lock,
       int parallelism, std::optional<int> listener_port,
       std::optional<std::string> bind_ip, bool auto_h2d,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt,
+      std::optional<size_t> ring_buffer_size = std::nullopt);
 
   std::vector<std::unique_ptr<weight_sync::WeightSynchronizerBase>>
       sub_synchronizers_;
@@ -181,7 +187,8 @@ class WeightSynchronizer {
       int parallelism = 1, bool unsafe_skip_buffer_lock = false,
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt,
+      std::optional<size_t> ring_buffer_size = std::nullopt);
   absl::Status BindWeights(nanobind::list jax_arrays);
 #endif
 
@@ -191,14 +198,16 @@ class WeightSynchronizer {
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt,
+      std::optional<size_t> ring_buffer_size = std::nullopt);
   WeightSynchronizer(
       size_t num_layers, size_t num_shards,
       std::vector<size_t> slice_byte_sizes,
       std::optional<int> local_port = std::nullopt, int parallelism = 1,
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
-      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt);
+      std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt,
+      std::optional<size_t> ring_buffer_size = std::nullopt);
 
   // Test-only constructor for injecting mock sub-synchronizers
   explicit WeightSynchronizer(
@@ -232,6 +241,8 @@ class WeightSynchronizer {
   size_t num_layers() const;
   size_t num_shards() const;
   size_t slice_byte_size() const;
+  size_t ring_buffer_size() const;
+  size_t allocated_host_dram_bytes() const;
 
   void test_only_set_bandwidth_limit(double test_only_simulated_egress_gbps,
                                      double test_only_simulated_ingress_gbps);
@@ -243,7 +254,8 @@ class WeightSynchronizer {
       std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
       std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt,
       double test_only_simulated_egress_gbps = 0.0,
-      double test_only_simulated_ingress_gbps = 0.0);
+      double test_only_simulated_ingress_gbps = 0.0,
+      std::optional<size_t> ring_buffer_size = std::nullopt);
 
   static std::unique_ptr<WeightSynchronizer> test_only_create_cpu_instance(
       size_t num_layers, size_t num_shards,
@@ -253,7 +265,8 @@ class WeightSynchronizer {
       std::optional<std::string> bind_ip = std::nullopt, bool auto_h2d = false,
       std::optional<std::vector<int64_t>> global_shard_indices = std::nullopt,
       double test_only_simulated_egress_gbps = 0.0,
-      double test_only_simulated_ingress_gbps = 0.0);
+      double test_only_simulated_ingress_gbps = 0.0,
+      std::optional<size_t> ring_buffer_size = std::nullopt);
 
  private:
   std::unique_ptr<NumaAwareWeightSynchronizer> numa_manager_;

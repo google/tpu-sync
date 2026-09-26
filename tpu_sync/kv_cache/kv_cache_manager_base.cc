@@ -2607,6 +2607,13 @@ absl::Status KVCacheManagerBase::OnPoolReceived(size_t pool_idx,
   return absl::OkStatus();
 }
 
+void KVCacheManagerBase::OnReceiveFailed(uint64_t uuid,
+                                         const absl::Status& status) {
+  if (transfer_hooks_.on_receive_failed) {
+    transfer_hooks_.on_receive_failed(uuid, status);
+  }
+}
+
 void KVCacheManagerBase::ScheduleAsyncTask(std::function<void()> task) {
   if (push_pool_) {
     push_pool_->Schedule(std::move(task));

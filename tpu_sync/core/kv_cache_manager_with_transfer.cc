@@ -249,6 +249,9 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
                      " failed: ", reshard_session->GetStatus().message()))
                : absl::OkStatus();
   };
+  hooks.on_receive_failed = [this](uint64_t uuid, const absl::Status& status) {
+    OnReceiveFailed(uuid, status);
+  };
   base_->SetTransferEventHooks(std::move(hooks));
 }
 
@@ -1655,6 +1658,33 @@ absl::Status KVCacheManagerWithTransfer::OnBlocksReceived(
   absl::Status status = session->OnBlocksReceived(*this, block_ids);
   MaybeUnregisterSettledRecv(uuid, *session);
   return status;
+}
+
+void KVCacheManagerWithTransfer::OnReceiveFailed(uint64_t uuid,
+                                                 const absl::Status& status) {
+  std::shared_ptr<TransferReceiveSession> recv_session;
+  std::shared_ptr<ReshardReceiveSession> reshard_session;
+  {
+    absl::MutexLock lock(mu_);
+    if (auto it = active_recv_sessions_.find(uuid);
+        it != active_recv_sessions_.end()) {
+      recv_session = it->second;
+    } else if (auto reshard_it = active_pool_reshard_recvs_.find(uuid);
+               reshard_it != active_pool_reshard_recvs_.end()) {
+      reshard_session = reshard_it->second;
+    }
+  }
+  if (recv_session != nullptr) {
+    LOG(ERROR) << "Inbound connection failed for uuid=" << uuid
+               << ", failing receive session req_id=" << recv_session->req_id()
+               << ": " << status;
+    recv_session->Finish(status);
+  } else if (reshard_session != nullptr) {
+    LOG(ERROR) << "Inbound connection failed for uuid=" << uuid
+               << ", failing reshard receive session req_id="
+               << reshard_session->req_id() << ": " << status;
+    reshard_session->Finish(status);
+  }
 }
 
 }  // namespace tpu_raiden

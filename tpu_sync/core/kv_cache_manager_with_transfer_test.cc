@@ -25,6 +25,7 @@
 #include <vector>
 
 #include <gmock/gmock.h>
+#include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
@@ -628,6 +629,50 @@ TEST(KVCacheManagerWithTransferTest, MultiIpOrchestratedTransfer) {
   for (int i = 0; i < elements_per_slice; ++i) {
     EXPECT_EQ(read_back[elements_per_slice + i], static_cast<float>(i));
   }
+}
+
+TEST(KVCacheManagerWithTransferTest, OnReceiveFailedImmediatelySettlesRecv) {
+  TF_ASSERT_OK_AND_ASSIGN(TpuPjrtManager * pjrt_manager,
+                          TpuPjrtManager::GetDefault());
+  std::vector<int64_t> shape_dims = {2, 32, 32};
+  std::vector<float> host_data(2 * 32 * 32, 0.0f);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<xla::PjRtBuffer> buffer,
+      pjrt_manager->BufferFromHost(host_data.data(), xla::F32, shape_dims));
+  ASSERT_THAT(buffer->GetReadyFuture().Await(), IsOk());
+
+  auto handle_or = raiden::RaidenBufferHandle::Acquire(buffer.get());
+  std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
+      {handle_or.value()}};
+
+  auto engine = std::make_unique<TestKVCacheManagerWithTransfer>(
+      layer_buffers,
+      /*local_port_in=*/std::nullopt,
+      /*host_blocks_to_allocate=*/std::nullopt,
+      /*unsafe_skip_buffer_lock=*/true,
+      /*parallelism=*/1,
+      /*host_allocator_in=*/nullptr,
+      /*node_id=*/0,
+      /*local_control_port=*/0,
+      /*max_blocks=*/2,
+      /*num_slots=*/2,
+      /*timeout_s=*/60.0);
+
+  uint64_t uuid = 42424;
+  std::string req_id = "test_req";
+  auto now = std::chrono::steady_clock::now();
+  ASSERT_THAT(engine->RegisterRecv(uuid, req_id, /*expected_block_count=*/1,
+                                   /*deadline=*/now + std::chrono::seconds(60)),
+              IsOk());
+
+  auto [done_sending, done_recving, failed_recving] = engine->CompleteReadRaw();
+  EXPECT_THAT(failed_recving, IsEmpty());
+
+  engine->OnReceiveFailed(uuid, absl::UnavailableError("connection closed"));
+
+  auto [done_sending_after, done_recving_after, failed_recving_after] =
+      engine->CompleteReadRaw();
+  EXPECT_THAT(failed_recving_after, ElementsAre(req_id));
 }
 
 }  // namespace

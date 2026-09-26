@@ -88,6 +88,7 @@ void RequestBlockRegistry::PurgeExpiredLifecycleLocked(double now) {
   for (auto it = claimed_units_.begin(); it != claimed_units_.end();) {
     if (claimed_.find(it->first) == claimed_.end()) {
       claimed_owners_.erase(it->first);
+      owner_plans_.erase(it->first);
       it = claimed_units_.erase(it);
     } else {
       ++it;
@@ -110,9 +111,37 @@ int RequestBlockRegistry::RetireLocked(const LifecycleKey& key) {
   claimed_.erase(key);
   claimed_units_.erase(key);
   claimed_owners_.erase(key);
+  owner_plans_.erase(key);
   completed_units_.erase(key);
   cancelled_.erase(key);
   return static_cast<int>(keys.size());
+}
+
+bool RequestBlockRegistry::RemainingOwnersSettledLocked(
+    const LifecycleKey& key) {
+  auto plans_it = owner_plans_.find(key);
+  auto owners_it = claimed_owners_.find(key);
+  auto completion_it = completed_units_.find(key);
+  if (plans_it == owner_plans_.end() || !plans_it->second.owner_abandoned ||
+      owners_it == claimed_owners_.end() ||
+      completion_it == completed_units_.end()) {
+    return false;
+  }
+  std::set<RaidenId, RaidenIdLess> planned;
+  for (const void* owner : owners_it->second) {
+    auto owner_it = plans_it->second.planned_units.find(owner);
+    if (owner_it == plans_it->second.planned_units.end()) {
+      return false;  // Still planning.
+    }
+    for (const RaidenId& unit : owner_it->second) {
+      // One vote cannot settle two owners' transfers of a shared unit.
+      if (!planned.insert(unit).second ||
+          completion_it->second.units.count(unit) == 0) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 absl::Status RequestBlockRegistry::Register(
@@ -363,7 +392,7 @@ absl::StatusOr<int> RequestBlockRegistry::Complete(const std::string& req_id,
         break;
       }
     }
-    if (all_voted) {
+    if (all_voted || RemainingOwnersSettledLocked(lifecycle_key)) {
       return RetireLocked(lifecycle_key);
     }
   }
@@ -392,6 +421,7 @@ absl::StatusOr<bool> RequestBlockRegistry::CancelIfUnclaimed(
   completed_units_.erase(lifecycle_key);
   claimed_units_.erase(lifecycle_key);
   claimed_owners_.erase(lifecycle_key);
+  owner_plans_.erase(lifecycle_key);
   std::vector<BlockKey> keys;
   for (const auto& [block_key, registration] : request_blocks_) {
     if (block_key.first == req_id && registration.uuid == uuid) {
@@ -452,20 +482,11 @@ RequestBlockRegistry::LookupAndClaim(const std::string& req_id, int64_t uuid,
   }
   std::set<RaidenId, RaidenIdLess> claimed_units(units.begin(), units.end());
   auto existing_units_it = claimed_units_.find(lifecycle_key);
-  if (existing_units_it != claimed_units_.end()) {
-    auto owner_it = claimed_owners_.find(lifecycle_key);
-    const void* existing_owner =
-        owner_it == claimed_owners_.end() ? nullptr : owner_it->second;
-    if (existing_owner != claim_owner) {
-      return absl::InvalidArgumentError(
-          "Request block snapshot is already claimed by another planning "
-          "attempt");
-    }
-    if (existing_units_it->second != claimed_units) {
-      return absl::InvalidArgumentError(
-          "Request block snapshot was already claimed for a different "
-          "source unit set");
-    }
+  if (existing_units_it != claimed_units_.end() &&
+      existing_units_it->second != claimed_units) {
+    return absl::InvalidArgumentError(
+        "Request block snapshot was already claimed for a different "
+        "source unit set");
   }
   std::map<RaidenId, RequestBlockRegistration, RaidenIdLess> result;
   for (const RaidenId& unit : units) {
@@ -481,7 +502,7 @@ RequestBlockRegistry::LookupAndClaim(const std::string& req_id, int64_t uuid,
   // validated and copied while cancellation is excluded by the shared lock.
   claimed_[lifecycle_key] = now + ttl_s_;
   claimed_units_[lifecycle_key] = claimed_units;
-  claimed_owners_[lifecycle_key] = claim_owner;
+  claimed_owners_[lifecycle_key].insert(claim_owner);
   auto completion_it = completed_units_.find(lifecycle_key);
   if (completion_it != completed_units_.end()) {
     completion_it->second.expires_at = now + ttl_s_;
@@ -499,20 +520,43 @@ RequestBlockRegistry::LookupAndClaim(const std::string& req_id, int64_t uuid,
   return result;
 }
 
+void RequestBlockRegistry::RecordPlannedUnits(
+    const std::string& req_id, int64_t uuid, const void* claim_owner,
+    const std::vector<RaidenId>& units) {
+  const LifecycleKey lifecycle_key{req_id, uuid};
+  absl::MutexLock lock(*mu_);
+  auto owner_it = claimed_owners_.find(lifecycle_key);
+  if (owner_it == claimed_owners_.end() ||
+      owner_it->second.count(claim_owner) == 0) {
+    return;
+  }
+  owner_plans_[lifecycle_key].planned_units[claim_owner] =
+      std::set<RaidenId, RaidenIdLess>(units.begin(), units.end());
+}
+
 bool RequestBlockRegistry::AbandonClaim(const std::string& req_id, int64_t uuid,
                                         const void* claim_owner) {
   const LifecycleKey lifecycle_key{req_id, uuid};
   absl::MutexLock lock(*mu_);
   auto claimed_it = claimed_.find(lifecycle_key);
   auto owner_it = claimed_owners_.find(lifecycle_key);
-  const void* existing_owner =
-      owner_it == claimed_owners_.end() ? nullptr : owner_it->second;
-  if (claimed_it == claimed_.end() || existing_owner != claim_owner) {
+  if (claimed_it == claimed_.end() || owner_it == claimed_owners_.end() ||
+      owner_it->second.erase(claim_owner) == 0) {
     return false;
   }
-  claimed_.erase(lifecycle_key);
-  claimed_units_.erase(lifecycle_key);
-  claimed_owners_.erase(lifecycle_key);
+  if (owner_it->second.empty()) {
+    claimed_.erase(lifecycle_key);
+    claimed_units_.erase(lifecycle_key);
+    claimed_owners_.erase(lifecycle_key);
+    owner_plans_.erase(lifecycle_key);
+    return true;
+  }
+  OwnerPlans& plans = owner_plans_[lifecycle_key];
+  plans.planned_units.erase(claim_owner);
+  plans.owner_abandoned = true;
+  if (RemainingOwnersSettledLocked(lifecycle_key)) {
+    RetireLocked(lifecycle_key);
+  }
   return true;
 }
 

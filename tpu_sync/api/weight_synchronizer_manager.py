@@ -104,6 +104,8 @@ class WeightSynchronizerManager:
       broadcast_k: Optional[int] = None,
       enable_plan_cache: bool = True,
       auto_start_server: bool = False,
+      parallel_worker_planning: Optional[bool] = None,
+      offline_plan_path: Optional[str] = None,
   ):
     """Initializes the WeightSynchronizerManager.
 
@@ -118,6 +120,13 @@ class WeightSynchronizerManager:
         schedules across transfer invocations with identical topologies.
       auto_start_server: Whether to automatically spawn the background TCP
         servicer loop on initialization.
+      parallel_worker_planning: If True, computes each source worker's slice of
+        the transfer schedule independently in parallel across worker units.
+        Defaults to RAIDEN_PARALLEL_WORKER_PLANNING or RAIDEN_PLANNING_MODE env
+        vars when None.
+      offline_plan_path: Optional path to a precomputed offline symbolic plan
+        directory or file. Defaults to RAIDEN_OFFLINE_PLAN_PATH env var when
+        None.
     """
     self._controller = raiden_controller.RaidenController(
         port=port,
@@ -125,6 +134,8 @@ class WeightSynchronizerManager:
         request_registry_ttl_s=request_registry_ttl_s,
         broadcast_k=broadcast_k,
         enable_plan_cache=enable_plan_cache,
+        parallel_worker_planning=parallel_worker_planning,
+        offline_plan_path=offline_plan_path,
     )
     self._server: Optional[raiden_controller.RaidenControllerServer] = None
     if auto_start_server:
@@ -210,6 +221,70 @@ class WeightSynchronizerManager:
     """Returns the generated TransferPlan for a given transfer request ID."""
     return self._controller.get_plan(req_id)
 
+  def save_offline_plan(
+      self,
+      path: str,
+      src_units: list[raiden_controller.RaidenId],
+      dst_units: list[raiden_controller.RaidenId],
+      group_size: int = 1,
+      skip_tiling: Optional[dict[int, bool]] = None,
+  ) -> Any:
+    """Computes an offline symbolic resharding plan and saves it to `path`."""
+    return self._controller.save_offline_plan(
+        path=path,
+        src_units=src_units,
+        dst_units=dst_units,
+        group_size=group_size,
+        skip_tiling=skip_tiling,
+    )
+
+  def load_offline_schedule(
+      self,
+      path: str,
+      bind_registered_endpoints: bool = True,
+  ) -> Any:
+    """Loads an offline schedule from `path` and optionally binds registered endpoints."""
+    return self._controller.load_offline_schedule(
+        path=path,
+        bind_registered_endpoints=bind_registered_endpoints,
+    )
+
+  def load_offline_worker_plan(
+      self,
+      path: str,
+      unit: raiden_controller.RaidenId,
+      bind_registered_endpoints: bool = True,
+      req_id: Optional[str] = None,
+      uuid: Optional[int] = None,
+  ) -> Any:
+    """Loads a single worker's offline `ControlRequest` plan and binds live endpoints."""
+    return self._controller.load_offline_worker_plan(
+        path=path,
+        unit=unit,
+        bind_registered_endpoints=bind_registered_endpoints,
+        req_id=req_id,
+        uuid=uuid,
+    )
+
+  def load_offline_worker_plans_parallel(
+      self,
+      path: str,
+      units: Sequence[raiden_controller.RaidenId],
+      bind_registered_endpoints: bool = True,
+      req_id: Optional[str] = None,
+      uuid: Optional[int] = None,
+      max_workers: Optional[int] = None,
+  ) -> dict[raiden_controller.RaidenId, Any]:
+    """Loads per-worker offline `ControlRequest` plans in parallel and binds endpoints."""
+    return self._controller.load_offline_worker_plans_parallel(
+        path=path,
+        units=units,
+        bind_registered_endpoints=bind_registered_endpoints,
+        req_id=req_id,
+        uuid=uuid,
+        max_workers=max_workers,
+    )
+
   def start_transfer(
       self,
       src_units: list[raiden_controller.RaidenId],
@@ -233,6 +308,8 @@ class WeightSynchronizerManager:
       skip_tiling: Optional[dict[int, bool]] = None,
       group_size: int = 1,
       use_cached_plan: bool = False,
+      parallel_worker_planning: Optional[bool] = None,
+      offline_plan_path: Optional[str] = None,
   ) -> str:
     """Initiates an asynchronous distributed transfer.
 
@@ -258,6 +335,9 @@ class WeightSynchronizerManager:
       skip_tiling: Optional per-device tiling bypass settings.
       group_size: Variable group size for broadcast pipeline.
       use_cached_plan: Whether to reuse precomputed plans.
+      parallel_worker_planning: Optional override to compute per-worker schedule
+        slices in parallel across source workers.
+      offline_plan_path: Optional path to a precomputed offline symbolic plan.
 
     Returns:
       Request ID string of the started transfer task.
@@ -284,6 +364,8 @@ class WeightSynchronizerManager:
         skip_tiling=skip_tiling,
         group_size=group_size,
         use_cached_plan=use_cached_plan,
+        parallel_worker_planning=parallel_worker_planning,
+        offline_plan_path=offline_plan_path,
     )
 
   def get_transfer_status(self, req_id: str) -> int:

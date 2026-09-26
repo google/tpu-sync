@@ -606,19 +606,12 @@ cc_test(
     ],
 )
 
-# kv_cache_manager_test.py imports torch_tpu-internal Python modules
-# (torch_tpu._internal.{execution_mode,sync}) that are not visible outside
-# torch_tpu: "manual" keeps the target out of wildcard builds and "nobuilder"
-# out of automated builders until torch_tpu publishes equivalents.
 py_test(
     name = "kv_cache_manager_test_py",
     srcs = ["kv_cache_manager_test.py"],
     main = "kv_cache_manager_test.py",
     tags = [
         "cpu:8",
-        "manual",
-        "nobuilder",
-        "notap",
         "requires-accel-hbm",
         "requires-ghostlite:8",
         "requires-net:external",
@@ -630,8 +623,6 @@ py_test(
         "@pypi//numpy",
         "@torch_tpu//shims/torch:pytorch",
         "@torch_tpu//src/torch_tpu",
-        "@torch_tpu//src/torch_tpu/_internal/execution_mode",
-        "@torch_tpu//src/torch_tpu/_internal/sync",
     ],
 )
 
@@ -642,7 +633,6 @@ py_test(
     main = "torch_raw_transfer_perf_test.py",
     tags = [
         "cpu:8",
-        "notap",
         "requires-accel-hbm",
         "requires-ghostlite:8",
         "requires-net:external",
@@ -666,7 +656,6 @@ py_test(
     main = "torch_raw_transfer_perf_test.py",
     tags = [
         "cpu:8",
-        "notap",
         "requires-accel-hbm",
         "requires-ghostfish:4",
         "requires-net:external",
@@ -725,7 +714,6 @@ py_test(
     main = "torch_raw_transfer_test.py",
     tags = [
         "cpu:8",
-        "notap",
         "requires-accel-hbm",
         "requires-ghostlite:8",
         "requires-net:external",
@@ -749,7 +737,6 @@ py_test(
     main = "torch_raw_transfer_test.py",
     tags = [
         "cpu:8",
-        "notap",
         "requires-accel-hbm",
         "requires-ghostfish:4",
         "requires-net:external",

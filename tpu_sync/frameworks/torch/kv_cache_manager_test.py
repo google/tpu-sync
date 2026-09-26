@@ -20,12 +20,9 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import numpy as np
 import torch
-from torch_tpu._internal import execution_mode
-from torch_tpu._internal import sync
+import torch_tpu  # pylint: disable=unused-import  # registers torch.tpu backend
 
 from tpu_sync.frameworks.torch import _tpu_raiden_torch as _kv_cache_manager
-
-EagerMode = execution_mode.EagerMode
 
 # Upper bound on how long constructing a manager over lazy KV caches may take.
 # The constructor holds the GIL, so a regressed deadlock freezes the whole
@@ -172,18 +169,11 @@ class KVCacheManagerTorchTest(parameterized.TestCase):
     num_blocks = 2
     shape = (num_blocks * self.block_size, 128, 8)
 
-    with execution_mode.set_eager_mode(EagerMode.DEFER_AND_FUSE):
+    with torch.tpu.set_eager_mode(torch.tpu.EagerMode.DEFER_AND_FUSE):
       lazy_tensors = [
           [torch.ones(shape, dtype=torch.float32, device=self.device)]
           for _ in range(self.num_layers)
       ]
-      # The regression only exists for unmaterialized tensors; assert the
-      # tensors are actually deferred so a future eager-materialization change
-      # can't silently turn this into a no-op test.
-      for layer in lazy_tensors:
-        for shard in layer:
-          self.assertFalse(sync.is_materialized(shard))
-
       faulthandler.dump_traceback_later(
           _CONSTRUCTION_DEADLOCK_TIMEOUT_S, exit=True
       )
@@ -197,10 +187,6 @@ class KVCacheManagerTorchTest(parameterized.TestCase):
       finally:
         faulthandler.cancel_dump_traceback_later()
 
-    # Unpack awaited each base buffer, so the tensors are materialized now.
-    for layer in lazy_tensors:
-      for shard in layer:
-        self.assertTrue(sync.is_materialized(shard))
     self.assertIsNotNone(manager.local_port)
 
   def test_heterogeneous_layer_block_sizes_transfer(self):

@@ -177,7 +177,6 @@ py_test(
     srcs = ["weight_synchronizer_test.py"],
     tags = [
         "cpu:8",
-        "notap",
         "requires-accel-hbm",
         "requires-ghostlite:8",
         "requires-net:external",
@@ -217,7 +216,6 @@ py_test(
     srcs = ["kv_cache_manager_transfer_test.py"],
     tags = [
         "cpu:8",
-        "notap",
         "requires-accel-hbm",
         "requires-ghostlite:8",
         "requires-net:external",

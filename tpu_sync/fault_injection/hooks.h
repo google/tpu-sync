@@ -25,14 +25,16 @@ namespace hooks {
 // channel is the path it runs on (e.g. recv, send, pull, api, h2d, d2h).
 
 // Block transport, receive path.
-inline constexpr std::string_view kBlockTransportRecvIdsAlloc =
-    "block_transport.recv.ids_alloc";
-inline constexpr std::string_view kBlockTransportRecvProgress =
-    "block_transport.recv.progress";
+inline constexpr std::string_view kBlockTransportRecvBlockIds =
+    "block_transport.recv.block_ids";
+inline constexpr std::string_view kBlockTransportRecvSendHandshakeAck =
+    "block_transport.recv.send_handshake_ack";
+inline constexpr std::string_view kBlockTransportRecvPayload =
+    "block_transport.recv.payload";
 inline constexpr std::string_view kBlockTransportRecvLayerDone =
     "block_transport.recv.layer_done";
-inline constexpr std::string_view kBlockTransportRecvBeforeAck =
-    "block_transport.recv.before_ack";
+inline constexpr std::string_view kBlockTransportRecvSendAck =
+    "block_transport.recv.send_ack";
 
 // Transfer receive session.
 inline constexpr std::string_view kTransferRecvSessionH2dDispatch =
@@ -59,8 +61,12 @@ inline constexpr std::string_view kKvCacheManagerPullSpawn =
     "kv_cache_manager.pull.spawn";
 
 // gRPC control plane.
-inline constexpr std::string_view kGrpcControlPlanePullReply =
-    "grpc_control_plane.pull.reply";
+inline constexpr std::string_view kGrpcControlPlanePullStreamSendRequest =
+    "grpc_control_plane.pull_stream.send_request";
+inline constexpr std::string_view kGrpcControlPlanePullStreamRecvRequest =
+    "grpc_control_plane.pull_stream.recv_request";
+inline constexpr std::string_view kGrpcControlPlanePullStreamSendReply =
+    "grpc_control_plane.pull_stream.send_reply";
 
 // TCP control plane.
 inline constexpr std::string_view kTcpControlPlanePullReply =
@@ -81,38 +87,81 @@ inline constexpr std::string_view kTransferSendSessionD2hComplete =
 inline constexpr std::string_view kRaidenManagerBaseH2hWrite =
     "raiden_manager_base.h2h.write";
 
-// Socket transport, send path.
-inline constexpr std::string_view kSocketTransportSendConnect =
-    "socket_transport.send.connect";
-inline constexpr std::string_view kSocketTransportSendProgress =
-    "socket_transport.send.progress";
+// Connection pool, borrow path.
+inline constexpr std::string_view kConnPoolBorrowConnect =
+    "conn_pool.borrow.connect";
+inline constexpr std::string_view kConnPoolBorrowReuse =
+    "conn_pool.borrow.reuse";
+
+// Socket transport, push path.
+inline constexpr std::string_view kSocketTransportPushSendHeader =
+    "socket_transport.push.send_header";
+inline constexpr std::string_view kSocketTransportPushRecvHandshakeAck =
+    "socket_transport.push.recv_handshake_ack";
+inline constexpr std::string_view kSocketTransportPushSendPayload =
+    "socket_transport.push.send_payload";
+inline constexpr std::string_view kSocketTransportPushRecvAck =
+    "socket_transport.push.recv_ack";
 
 // Raw buffer transport listener.
 inline constexpr std::string_view kRawBufferTransportAccept =
     "raw_buffer_transport.accept";
+inline constexpr std::string_view kRawBufferTransportRecvHeader =
+    "raw_buffer_transport.recv.header";
 
 // Hooks that support `action = "fail"`
 inline constexpr std::string_view kFailHooks[] = {
-    kBlockTransportRecvIdsAlloc,     kBlockTransportRecvProgress,
-    kBlockTransportRecvLayerDone,    kBlockTransportRecvBeforeAck,
-    kTransferRecvSessionH2dDispatch, kTransferRecvSessionH2dComplete,
-    kTransferRecvSessionPullRequest, kTransferRecvSessionPullReply,
-    kKvCacheManagerApiStartRead,     kKvCacheManagerApiStartReadSubmitPull,
-    kKvCacheManagerApiCompleteRead,  kKvCacheManagerPullSpawn,
-    kGrpcControlPlanePullReply,      kTcpControlPlanePullReply,
-    kTcpControlPlaneAccept,          kStagingAllocatorAcquire,
-    kTransferSendSessionD2hDispatch, kTransferSendSessionD2hComplete,
-    kRaidenManagerBaseH2hWrite,      kSocketTransportSendConnect,
-    kSocketTransportSendProgress,    kRawBufferTransportAccept,
+    kBlockTransportRecvBlockIds,
+    kBlockTransportRecvSendHandshakeAck,
+    kBlockTransportRecvPayload,
+    kBlockTransportRecvLayerDone,
+    kBlockTransportRecvSendAck,
+    kTransferRecvSessionH2dDispatch,
+    kTransferRecvSessionH2dComplete,
+    kTransferRecvSessionPullRequest,
+    kTransferRecvSessionPullReply,
+    kKvCacheManagerApiStartRead,
+    kKvCacheManagerApiStartReadSubmitPull,
+    kKvCacheManagerApiCompleteRead,
+    kKvCacheManagerPullSpawn,
+    kGrpcControlPlanePullStreamSendRequest,
+    kGrpcControlPlanePullStreamRecvRequest,
+    kGrpcControlPlanePullStreamSendReply,
+    kTcpControlPlanePullReply,
+    kTcpControlPlaneAccept,
+    kStagingAllocatorAcquire,
+    kTransferSendSessionD2hDispatch,
+    kTransferSendSessionD2hComplete,
+    kRaidenManagerBaseH2hWrite,
+    kConnPoolBorrowConnect,
+    kConnPoolBorrowReuse,
+    kSocketTransportPushSendHeader,
+    kSocketTransportPushRecvHandshakeAck,
+    kSocketTransportPushSendPayload,
+    kSocketTransportPushRecvAck,
+    kRawBufferTransportAccept,
+    kRawBufferTransportRecvHeader,
 };
 
 // Hooks that support `action = "delay"`.
 inline constexpr std::string_view kDelayHooks[] = {
-    kBlockTransportRecvProgress,     kBlockTransportRecvLayerDone,
-    kBlockTransportRecvBeforeAck,    kTransferRecvSessionPullRequest,
-    kKvCacheManagerPullRegisterWait, kGrpcControlPlanePullReply,
-    kTcpControlPlanePullReply,       kRaidenManagerBaseH2hWrite,
-    kSocketTransportSendConnect,     kSocketTransportSendProgress,
+    kBlockTransportRecvBlockIds,
+    kBlockTransportRecvSendHandshakeAck,
+    kBlockTransportRecvPayload,
+    kBlockTransportRecvLayerDone,
+    kBlockTransportRecvSendAck,
+    kTransferRecvSessionPullRequest,
+    kKvCacheManagerPullRegisterWait,
+    kGrpcControlPlanePullStreamRecvRequest,
+    kGrpcControlPlanePullStreamSendReply,
+    kTcpControlPlanePullReply,
+    kRaidenManagerBaseH2hWrite,
+    kConnPoolBorrowConnect,
+    kSocketTransportPushSendHeader,
+    kSocketTransportPushRecvHandshakeAck,
+    kSocketTransportPushSendPayload,
+    kSocketTransportPushRecvAck,
+    kRawBufferTransportRecvHeader,
 };
 
 }  // namespace hooks

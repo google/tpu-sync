@@ -498,6 +498,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":control_plane_backend_hdrs",
+        "//tpu_sync/common:grpc_util",
         "//tpu_sync/fault_injection:hooks",
         "//tpu_sync/proto:kv_cache_control_plane_service_cc_grpc",
         "//tpu_sync/proto:kv_cache_control_plane_service_cc_proto",

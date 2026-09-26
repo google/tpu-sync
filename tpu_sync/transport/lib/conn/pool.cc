@@ -24,10 +24,12 @@
 #include "absl/base/optimization.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "grpcpp/channel.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/transport/lib/socket/util.h"
 
 namespace tpu_raiden::transport::lib {
@@ -49,6 +51,7 @@ absl::StatusOr<int> ConnPool::Borrow(
     absl::string_view peer, absl::string_view local_ip, bool require_psp,
     std::shared_ptr<grpc::Channel> channel) {
   const Key key = GenPoolKey(peer, local_ip);
+  int reused_fd = -1;
   {
     absl::MutexLock lock(mu_);
     if (stop_) {
@@ -65,10 +68,17 @@ absl::StatusOr<int> ConnPool::Borrow(
           CloseSocket(fd);
           continue;
         }
-        return fd;
+        reused_fd = fd;
+        break;
       }
     }
   }
+  if (reused_fd >= 0) {
+    FaultInjectSocket(hooks::kConnPoolBorrowReuse, reused_fd);
+    return reused_fd;
+  }
+  ABSL_RETURN_IF_ERROR(FaultInjectStatus(hooks::kConnPoolBorrowConnect,
+                                         absl::StatusCode::kUnavailable));
   return ConnectToPeer(peer, local_ip, require_psp, channel);
 }
 

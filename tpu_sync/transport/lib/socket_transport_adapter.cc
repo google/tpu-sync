@@ -363,7 +363,6 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
   const uint8_t major_order = first.major_order;
   const size_t block_count = static_cast<size_t>(count_or_size);
 
-  ABSL_RETURN_IF_ERROR(FaultInjectStatus(hooks::kSocketTransportSendConnect));
   auto borrowed_fd = raw_transport_->BorrowConnection(peer, local_ip);
   if (!borrowed_fd.ok()) {
     return borrowed_fd.status();
@@ -386,6 +385,7 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
   header.count_or_size = count_or_size;
   header.uuid = uuid;
   const auto s_header = SerializeChunkHeader(header);
+  FaultInjectSocket(hooks::kSocketTransportPushSendHeader, fd);
   absl::Status s = WriteExact(fd, s_header.data(), s_header.size());
   if (!s.ok()) {
     return s;
@@ -400,6 +400,7 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
         SerializeBlockIds({src_block_ids.data() + block_offset, block_count});
     ABSL_RETURN_IF_ERROR(WriteExact(fd, s_src_ids.data(), s_src_ids.size()));
     uint8_t ack = 0;
+    FaultInjectSocket(hooks::kSocketTransportPushRecvHandshakeAck, fd);
     s = ReadExact(fd, &ack, 1);
     if (!s.ok() || ack != 1) {
       return absl::InternalError("Explicit push destination handshake failed");
@@ -420,6 +421,11 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
   }
   uint64_t stream_bytes_sent = 0;
   if (block_count > 0) {
+    // Requests sharing a request_id are sent as one chunk. The payload fault
+    // injection hook fires once per push, right before the chunk holding the
+    // middle request, so an injected failure or latency hits mid-transfer:
+    // half of the payload has already been sent and the rest is still queued.
+    const size_t fault_injection_payload_index = requests.size() / 2;
     for (size_t i = 0; i < requests.size();) {
       size_t j = i;
       uint32_t total_size = 0;
@@ -434,12 +440,14 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
         ++j;
       }
 
+      if (i <= fault_injection_payload_index &&
+          fault_injection_payload_index < j) {
+        FaultInjectSocket(hooks::kSocketTransportPushSendPayload, fd);
+      }
       const std::array<uint8_t, kChunkSizeFieldSize> s_size =
           SerializeChunkSize(total_size);
       ABSL_RETURN_IF_ERROR(WriteExact(fd, s_size.data(), s_size.size()));
       if (total_size > 0) {
-        ABSL_RETURN_IF_ERROR(
-            FaultInjectStatus(hooks::kSocketTransportSendProgress));
         ABSL_RETURN_IF_ERROR(WriteVExact(fd, absl::MakeSpan(iov)));
         stream_bytes_sent += total_size;
       }
@@ -452,6 +460,7 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
   }
 
   uint8_t ack = 0;
+  FaultInjectSocket(hooks::kSocketTransportPushRecvAck, fd);
   s = ReadExact(fd, &ack, 1);
   if (!s.ok() || ack != 1) {
     return absl::InternalError("Push verification failed");

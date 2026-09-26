@@ -348,23 +348,35 @@ absl::Status BlockTransport::HandleIncomingPush(
     const std::vector<uint8_t> s_ids = lib::SerializeBlockIds(allocated_ids);
     ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s_ids.data(), s_ids.size()));
   } else {
-    ABSL_RETURN_IF_ERROR(FaultInjectStatus(hooks::kBlockTransportRecvIdsAlloc));
     std::vector<uint8_t> ids_buf(header.count_or_size * sizeof(uint32_t));
+    FaultInjectSocket(hooks::kBlockTransportRecvBlockIds, client_fd);
     ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
     allocated_ids = lib::DeserializeBlockIds(ids_buf);
 
     ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
     src_block_ids = lib::DeserializeBlockIds(ids_buf);
     uint8_t ack = 1;
+    FaultInjectSocket(hooks::kBlockTransportRecvSendHandshakeAck, client_fd);
     ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
   }
 
   uint64_t total_received_bytes = 0;
+  // The payload arrives as one chunk per (layer, shard, block). The payload
+  // fault injection hook fires once per push, right before the middle chunk,
+  // so an injected failure or latency hits mid-transfer: half of the payload
+  // has already been received and the rest is still in flight.
+  const size_t fault_injection_payload_index = target_layers.size() *
+                                               block_delegate_->num_shards() *
+                                               header.count_or_size / 2;
+  size_t payload_index = 0;
   ABSL_RETURN_IF_ERROR(ForEachPayload(
       major_order, target_layers, block_delegate_->num_shards(),
       header.count_or_size, [&](size_t l, size_t sh, size_t k) -> absl::Status {
         ABSL_DCHECK_LT(k, allocated_ids.size());
         const int dst_id = allocated_ids[k];
+        if (payload_index++ == fault_injection_payload_index) {
+          FaultInjectSocket(hooks::kBlockTransportRecvPayload, client_fd);
+        }
         uint8_t size_buf[lib::kChunkSizeFieldSize];
         ABSL_RETURN_IF_ERROR(ReadExact(client_fd, size_buf, sizeof(size_buf)));
         const uint32_t sender_size = lib::DeserializeChunkSize(size_buf);
@@ -405,8 +417,6 @@ absl::Status BlockTransport::HandleIncomingPush(
         }
 
         if (expected_size > 0) {
-          ABSL_RETURN_IF_ERROR(
-              FaultInjectStatus(hooks::kBlockTransportRecvProgress));
           ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, ToIovec(chunks)));
           total_received_bytes += expected_size;
         }
@@ -560,8 +570,8 @@ absl::Status BlockTransport::HandleIncomingPush(
       block_delegate_->OnBlocksReceived(allocated_ids, header.uuid));
   incoming_push_lease_held = false;
   ABSL_RETURN_IF_ERROR(block_delegate_->EndIncomingPush(header.uuid));
-  ABSL_RETURN_IF_ERROR(FaultInjectStatus(hooks::kBlockTransportRecvBeforeAck));
   uint8_t ack = 1;
+  FaultInjectSocket(hooks::kBlockTransportRecvSendAck, client_fd);
   ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
   return absl::OkStatus();
 }

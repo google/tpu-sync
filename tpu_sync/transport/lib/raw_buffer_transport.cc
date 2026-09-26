@@ -297,6 +297,7 @@ RawBufferTransport::~RawBufferTransport() {
 
 absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
   char header_buf[kChunkHeaderSize];
+  FaultInjectSocket(hooks::kRawBufferTransportRecvHeader, client_fd);
   ABSL_RETURN_IF_ERROR(ReadExact(client_fd, header_buf, sizeof(header_buf)));
   ABSL_ASSIGN_OR_RETURN(const ChunkHeader header,
                         DeserializeChunkHeader(header_buf));

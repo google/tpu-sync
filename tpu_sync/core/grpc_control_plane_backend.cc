@@ -43,6 +43,7 @@
 #include "grpcpp/support/channel_arguments.h"
 #include "grpcpp/support/status.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/common/grpc_util.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
@@ -51,40 +52,6 @@
 namespace tpu_raiden {
 
 namespace {
-
-absl::Status GrpcStatusToAbsl(const grpc::Status& status) {
-  if (status.ok()) return absl::OkStatus();
-  switch (status.error_code()) {
-    case grpc::StatusCode::DEADLINE_EXCEEDED:
-      return absl::DeadlineExceededError(status.error_message());
-    case grpc::StatusCode::UNAVAILABLE:
-      return absl::UnavailableError(status.error_message());
-    case grpc::StatusCode::CANCELLED:
-      return absl::CancelledError(status.error_message());
-    case grpc::StatusCode::INVALID_ARGUMENT:
-      return absl::InvalidArgumentError(status.error_message());
-    case grpc::StatusCode::NOT_FOUND:
-      return absl::NotFoundError(status.error_message());
-    case grpc::StatusCode::ALREADY_EXISTS:
-      return absl::AlreadyExistsError(status.error_message());
-    case grpc::StatusCode::PERMISSION_DENIED:
-      return absl::PermissionDeniedError(status.error_message());
-    case grpc::StatusCode::UNAUTHENTICATED:
-      return absl::UnauthenticatedError(status.error_message());
-    case grpc::StatusCode::RESOURCE_EXHAUSTED:
-      return absl::ResourceExhaustedError(status.error_message());
-    case grpc::StatusCode::FAILED_PRECONDITION:
-      return absl::FailedPreconditionError(status.error_message());
-    case grpc::StatusCode::ABORTED:
-      return absl::AbortedError(status.error_message());
-    case grpc::StatusCode::OUT_OF_RANGE:
-      return absl::OutOfRangeError(status.error_message());
-    case grpc::StatusCode::UNIMPLEMENTED:
-      return absl::UnimplementedError(status.error_message());
-    default:
-      return absl::InternalError(status.error_message());
-  }
-}
 
 control_plane::proto::PullStreamRequest ToProto(
     const PullStreamRequestSpec& req) {
@@ -108,7 +75,7 @@ absl::StatusOr<PullStreamResponseSpec> FromProto(
     const grpc::Status& rpc_status,
     const control_plane::proto::PullStreamResponse& proto_resp) {
   if (!rpc_status.ok()) {
-    return GrpcStatusToAbsl(rpc_status);
+    return FromGrpcStatus(rpc_status);
   }
   return PullStreamResponseSpec{
       .status = proto_resp.status(),
@@ -160,6 +127,12 @@ grpc::Status KVCacheControlPlaneServiceImpl::PullStream(
     return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                         "ControlPlaneHandler not initialized");
   }
+  if (absl::Status injected =
+          FaultInjectStatus(hooks::kGrpcControlPlanePullStreamRecvRequest,
+                            absl::StatusCode::kUnavailable);
+      !injected.ok()) {
+    return ToGrpcStatus(injected);
+  }
 
   PullStreamRequestSpec spec;
   spec.uuid = request->uuid();
@@ -179,9 +152,11 @@ grpc::Status KVCacheControlPlaneServiceImpl::PullStream(
 
   absl::StatusOr<PullStreamResponseSpec> result =
       handler_->OnPullStream(spec, fallback_peer_ip);
-  absl::Status injected = FaultInjectStatus(hooks::kGrpcControlPlanePullReply);
-  if (result.ok() && !injected.ok()) {
-    result = injected;
+  if (absl::Status injected =
+          FaultInjectStatus(hooks::kGrpcControlPlanePullStreamSendReply,
+                            absl::StatusCode::kUnavailable);
+      !injected.ok()) {
+    return ToGrpcStatus(injected);
   }
   if (!result.ok()) {
     response->set_status(-1);
@@ -320,6 +295,13 @@ tsl::Future<PullStreamResponseSpec> GrpcControlPlaneBackend::SendPullRequest(
     absl::string_view remote_endpoint, const PullStreamRequestSpec& req,
     absl::Duration timeout) {
   auto [promise, future] = tsl::MakePromise<PullStreamResponseSpec>();
+  if (absl::Status injected =
+          FaultInjectStatus(hooks::kGrpcControlPlanePullStreamSendRequest,
+                            absl::StatusCode::kUnavailable);
+      !injected.ok()) {
+    promise.Set(std::move(injected));
+    return future;
+  }
   auto owned = std::make_shared<PendingPull>();
   PendingPull* call = owned.get();
   call->stub = GetOrCreateStub(remote_endpoint);
@@ -392,7 +374,7 @@ absl::Status GrpcControlPlaneBackend::SendAck(absl::string_view remote_endpoint,
   control_plane::proto::AckResponse proto_resp;
   grpc::Status rpc_status = stub->Ack(&context, proto_req, &proto_resp);
   if (!rpc_status.ok()) {
-    return GrpcStatusToAbsl(rpc_status);
+    return FromGrpcStatus(rpc_status);
   }
   if (proto_resp.status() != 0) {
     return absl::InternalError(

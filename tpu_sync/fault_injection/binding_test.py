@@ -45,7 +45,7 @@ class FaultInjectionBindingTest(absltest.TestCase):
             "probability": 1.0,
         },
         {
-            "hook": "socket_transport.send.progress",
+            "hook": "socket_transport.push.send_payload",
             "action": "delay",
             "probability": 0.5,
             "min_delay_ms": 5,
@@ -57,10 +57,10 @@ class FaultInjectionBindingTest(absltest.TestCase):
         fault_injection.is_hook_active("transfer_recv_session.pull.request")
     )
     self.assertTrue(
-        fault_injection.is_hook_active("socket_transport.send.progress")
+        fault_injection.is_hook_active("socket_transport.push.send_payload")
     )
     self.assertFalse(
-        fault_injection.is_hook_active("block_transport.recv.progress")
+        fault_injection.is_hook_active("block_transport.recv.payload")
     )
 
     fault_injection.reset_faults()
@@ -69,16 +69,46 @@ class FaultInjectionBindingTest(absltest.TestCase):
         fault_injection.is_hook_active("transfer_recv_session.pull.request")
     )
 
-  def test_empty_hook_installs_for_all_hooks(self):
+  def test_star_pattern_installs_for_all_hooks(self):
     fault_injection.inject_faults(
-        [{"hook": "", "action": "fail", "probability": 1.0}]
+        [{"hook": "*", "action": "fail", "probability": 1.0}]
     )
     self.assertTrue(fault_injection.has_active_injections())
     self.assertTrue(
         fault_injection.is_hook_active("transfer_recv_session.pull.request")
     )
     self.assertTrue(
-        fault_injection.is_hook_active("socket_transport.send.progress")
+        fault_injection.is_hook_active("socket_transport.push.send_payload")
+    )
+
+  def test_prefix_pattern_installs_for_prefixed_hooks(self):
+    fault_injection.inject_faults(
+        [{"hook": "socket_transport.*", "action": "fail", "probability": 1.0}]
+    )
+    self.assertTrue(
+        fault_injection.is_hook_active("socket_transport.push.send_payload")
+    )
+    self.assertFalse(
+        fault_injection.is_hook_active("transfer_recv_session.pull.request")
+    )
+
+  def test_star_pattern_delay_installs_for_all_hooks(self):
+    fault_injection.inject_faults([
+        {"hook": "*", "action": "fail", "probability": 0.05},
+        {
+            "hook": "*",
+            "action": "delay",
+            "probability": 0.05,
+            "min_delay_ms": 0,
+            "max_delay_ms": 60_000,
+        },
+    ])
+    self.assertTrue(fault_injection.has_active_injections())
+    self.assertTrue(
+        fault_injection.is_hook_active("block_transport.recv.payload")
+    )
+    self.assertTrue(
+        fault_injection.is_hook_active("kv_cache_manager.pull.register_wait")
     )
 
   def test_rejects_unknown_action_and_invalid_delay_range(self):
@@ -91,7 +121,7 @@ class FaultInjectionBindingTest(absltest.TestCase):
         ValueError, "min_delay_ms cannot be greater than max_delay_ms"
     ):
       fault_injection.inject_faults([{
-          "hook": "socket_transport.send.progress",
+          "hook": "socket_transport.push.send_payload",
           "action": "delay",
           "min_delay_ms": 50,
           "max_delay_ms": 10,

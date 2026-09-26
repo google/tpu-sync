@@ -74,6 +74,9 @@ class FaultInjector final {
   FaultInjectionAction Evaluate(std::string_view hook) ABSL_LOCKS_EXCLUDED(mu_);
 
   // Installs fault injection rules. Returns an error if any rule is invalid.
+  // A hook ending in '*' is a prefix pattern ("*" matches all hooks,
+  // "grpc_control_plane.*" matches hooks with that prefix); it installs the
+  // rule at every matching hook that supports the rule's action.
   absl::Status Install(const FaultInjectionRules& rules)
       ABSL_LOCKS_EXCLUDED(mu_);
 
@@ -90,14 +93,30 @@ class FaultInjector final {
       ABSL_LOCKS_EXCLUDED(mu_);
 
   // Slow-path execution helpers invoked only when HasActiveInjections() is
-  // true.
+  // true. A delay always runs to completion.
   void ExecuteDelay(std::string_view hook) ABSL_LOCKS_EXCLUDED(mu_);
   void ExecuteThrow(std::string_view hook) ABSL_LOCKS_EXCLUDED(mu_);
-  absl::Status ExecuteStatus(std::string_view hook) ABSL_LOCKS_EXCLUDED(mu_);
+  absl::Status ExecuteStatus(std::string_view hook, absl::StatusCode code)
+      ABSL_LOCKS_EXCLUDED(mu_);
   bool ExecuteErrno(std::string_view hook, int err) ABSL_LOCKS_EXCLUDED(mu_);
+
+  // Socket-aware execution, called right before the real I/O on `fd`: the
+  // file descriptor of the connected TCP socket the caller is about to read
+  // or write (a pooled/connected fd on the sender, the accept()ed fd on the
+  // receiver). It identifies one connection, so the fault affects only it:
+  //  - kFail: shuts `fd` down (SHUT_RDWR) and returns. The caller's real I/O
+  //    then fails with the real error (EPIPE/EOF), and the peer sees FIN.
+  //  - kDelay: holds the connection open and silent until the delay expires,
+  //    the peer closes, or `fd` is shut down locally. Readable payload data
+  //    does not end the delay.
+  void ExecuteSocket(std::string_view hook, int fd) ABSL_LOCKS_EXCLUDED(mu_);
 
  private:
   static inline std::atomic<bool> has_active_injections_{false};
+
+  // Evaluates the hook and sleeps for the delay if a delay action is chosen.
+  FaultInjectionAction EvaluateAndSleep(std::string_view hook)
+      ABSL_LOCKS_EXCLUDED(mu_);
 
   mutable absl::Mutex mu_;
   absl::BitGen bitgen_ ABSL_GUARDED_BY(mu_);
@@ -123,11 +142,14 @@ inline void FaultInjectThrow(std::string_view hook) {
   }
 }
 
-// Evaluates the hook and returns an internal error status if a failure is
-// triggered.
-inline absl::Status FaultInjectStatus(std::string_view hook) {
+// Evaluates the hook and returns an error with status `code` if a failure is
+// triggered, OK otherwise. `code` must not be kOk, so callers can propagate
+// the result directly (e.g. with ABSL_RETURN_IF_ERROR).
+inline absl::Status FaultInjectStatus(
+    std::string_view hook,
+    absl::StatusCode code = absl::StatusCode::kInternal) {
   if (ABSL_PREDICT_FALSE(FaultInjector::HasActiveInjections())) {
-    return GetFaultInjector().ExecuteStatus(hook);
+    return GetFaultInjector().ExecuteStatus(hook, code);
   }
   return absl::OkStatus();
 }
@@ -138,6 +160,15 @@ inline bool FaultInjectErrno(std::string_view hook, int err = EIO) {
     return GetFaultInjector().ExecuteErrno(hook, err);
   }
   return false;
+}
+
+// Call right before the real I/O on `fd`, the file descriptor of the
+// connected TCP socket the caller is about to read or write. See
+// FaultInjector::ExecuteSocket for the fail and delay semantics.
+inline void FaultInjectSocket(std::string_view hook, int fd) {
+  if (ABSL_PREDICT_FALSE(FaultInjector::HasActiveInjections())) {
+    GetFaultInjector().ExecuteSocket(hook, fd);
+  }
 }
 
 }  // namespace tpu_raiden

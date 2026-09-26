@@ -14,15 +14,20 @@
 
 #include "tpu_sync/fault_injection/fault_injector.h"
 
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <cerrno>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>  // NOLINT(build/c++11)
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 
@@ -39,7 +44,22 @@ using ::testing::status::StatusIs;
 
 constexpr std::string_view kTestHookAlpha =
     hooks::kTransferRecvSessionPullRequest;
-constexpr std::string_view kTestHookBeta = hooks::kSocketTransportSendProgress;
+constexpr std::string_view kTestHookBeta =
+    hooks::kSocketTransportPushSendPayload;
+
+// Long enough that only an interruption can end it within the test budget.
+constexpr uint32_t kLongDelayMs = 60'000;
+// Upper bound for an interrupted delay to return.
+constexpr absl::Duration kPromptWake = absl::Seconds(1);
+
+// Waits until `hook` has been hit once, i.e. a caller has entered its delay.
+void WaitForHit(std::string_view hook) {
+  const absl::Time deadline = absl::Now() + absl::Seconds(2);
+  while (GetFaultInjector().GetHitCount(hook) == 0) {
+    ASSERT_LT(absl::Now(), deadline) << "hook never hit: " << hook;
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+}
 
 class FaultInjectorTest : public ::testing::Test {
  protected:
@@ -59,11 +79,9 @@ TEST_F(FaultInjectorTest, DefaultStateIsInactive) {
   EXPECT_EQ(action.delay_ms, 0);
 }
 
-TEST_F(FaultInjectorTest, EmptyHookNameInstallsForAllHooks) {
-  ABSL_ASSERT_OK(GetFaultInjector().Install(
-      {FaultInjectionRule{.hook = "",
-                          .action = FaultInjectionType::kFail,
-                          .probability = 1.0}}));
+TEST_F(FaultInjectorTest, StarPatternInstallsForAllHooks) {
+  ABSL_ASSERT_OK(GetFaultInjector().Install({FaultInjectionRule{
+      .hook = "*", .action = FaultInjectionType::kFail, .probability = 1.0}}));
   EXPECT_TRUE(FaultInjector::HasActiveInjections());
   EXPECT_TRUE(GetFaultInjector().IsHookActive(kTestHookAlpha));
   EXPECT_TRUE(GetFaultInjector().IsHookActive(kTestHookBeta));
@@ -77,17 +95,110 @@ TEST_F(FaultInjectorTest, EmptyHookNameInstallsForAllHooks) {
   EXPECT_EQ(GetFaultInjector().GetHitCount(), 2);
 }
 
-TEST_F(FaultInjectorTest, DelayEligibilityRejectsEmptyAndFailOnlyHooks) {
-  EXPECT_THAT(
-      GetFaultInjector().Install({FaultInjectionRule{
-          .hook = "",
+TEST_F(FaultInjectorTest, PrefixPatternMatchesOnlyPrefixedHooks) {
+  ABSL_ASSERT_OK(GetFaultInjector().Install({FaultInjectionRule{
+      .hook = "grpc_control_plane.*",
+      .action = FaultInjectionType::kFail,
+      .probability = 1.0,
+  }}));
+
+  EXPECT_EQ(GetFaultInjector()
+                .Evaluate(hooks::kGrpcControlPlanePullStreamSendRequest)
+                .type,
+            FaultInjectionType::kFail);
+  EXPECT_EQ(GetFaultInjector()
+                .Evaluate(hooks::kGrpcControlPlanePullStreamSendReply)
+                .type,
+            FaultInjectionType::kFail);
+  EXPECT_EQ(GetFaultInjector().Evaluate(hooks::kConnPoolBorrowConnect).type,
+            FaultInjectionType::kNone);
+}
+
+TEST_F(FaultInjectorTest, PatternWithoutCapableHookIsRejected) {
+  EXPECT_THAT(GetFaultInjector().Install({FaultInjectionRule{
+                  .hook = "nonexistent.*",
+                  .action = FaultInjectionType::kFail,
+                  .probability = 1.0,
+              }}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("pattern 'nonexistent.*' matches no hook")));
+  // A delay pattern over fail-only hooks matches nothing.
+  EXPECT_THAT(GetFaultInjector().Install({FaultInjectionRule{
+                  .hook = "staging_allocator.*",
+                  .action = FaultInjectionType::kDelay,
+                  .probability = 1.0,
+              }}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(GetFaultInjector().Install({FaultInjectionRule{
+                  .hook = "",
+                  .action = FaultInjectionType::kFail,
+                  .probability = 1.0,
+              }}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("unknown hook ''")));
+}
+
+TEST_F(FaultInjectorTest, WildcardDelayFiresOnlyAtDelayCapableHooks) {
+  ABSL_ASSERT_OK(GetFaultInjector().Install({FaultInjectionRule{
+      .hook = "*",
+      .action = FaultInjectionType::kDelay,
+      .probability = 1.0,
+      .min_delay_ms = 20,
+      .max_delay_ms = 20,
+  }}));
+
+  FaultInjectionAction action = GetFaultInjector().Evaluate(kTestHookBeta);
+  EXPECT_EQ(action.type, FaultInjectionType::kDelay);
+  EXPECT_EQ(action.delay_ms, 20);
+
+  // Fail-only hook: the wildcard delay does not apply and is not counted.
+  action = GetFaultInjector().Evaluate(hooks::kTransferRecvSessionH2dComplete);
+  EXPECT_EQ(action.type, FaultInjectionType::kNone);
+  EXPECT_EQ(
+      GetFaultInjector().GetHitCount(hooks::kTransferRecvSessionH2dComplete),
+      0);
+  EXPECT_EQ(GetFaultInjector().GetHitCount(kTestHookBeta), 1);
+  EXPECT_EQ(GetFaultInjector().GetHitCount(), 1);
+}
+
+TEST_F(FaultInjectorTest, WildcardFailSkipsDelayOnlyHook) {
+  ABSL_ASSERT_OK(GetFaultInjector().Install({FaultInjectionRule{
+      .hook = "*",
+      .action = FaultInjectionType::kFail,
+      .probability = 1.0,
+  }}));
+
+  FaultInjectionAction action =
+      GetFaultInjector().Evaluate(hooks::kKvCacheManagerPullRegisterWait);
+  EXPECT_EQ(action.type, FaultInjectionType::kNone);
+  EXPECT_EQ(GetFaultInjector().GetHitCount(), 0);
+}
+
+TEST_F(FaultInjectorTest, WildcardFallsThroughToCapableRule) {
+  ABSL_ASSERT_OK(GetFaultInjector().Install({
+      FaultInjectionRule{
+          .hook = "*",
+          .action = FaultInjectionType::kFail,
+          .probability = 1.0,
+      },
+      FaultInjectionRule{
+          .hook = "*",
           .action = FaultInjectionType::kDelay,
           .probability = 1.0,
-          .max_delay_ms = 10,
-      }}),
-      StatusIs(absl::StatusCode::kInvalidArgument,
-               HasSubstr("delay is not permitted at hook ''")));
+          .min_delay_ms = 5,
+          .max_delay_ms = 5,
+      },
+  }));
 
+  EXPECT_EQ(
+      GetFaultInjector().Evaluate(hooks::kKvCacheManagerPullRegisterWait).type,
+      FaultInjectionType::kDelay);
+  EXPECT_EQ(GetFaultInjector().Evaluate(hooks::kConnPoolBorrowReuse).type,
+            FaultInjectionType::kFail);
+  EXPECT_EQ(GetFaultInjector().GetHitCount(), 2);
+}
+
+TEST_F(FaultInjectorTest, DelayEligibilityRejectsFailOnlyHooks) {
   EXPECT_THAT(GetFaultInjector().Install({FaultInjectionRule{
                   .hook = std::string(hooks::kTransferRecvSessionH2dComplete),
                   .action = FaultInjectionType::kDelay,
@@ -299,6 +410,34 @@ TEST_F(FaultInjectorTest, FaultInjectStatusReturnsInternalErrorOnFailRule) {
   EXPECT_EQ(GetFaultInjector().GetHitCount(kTestHookAlpha), 1);
 }
 
+TEST_F(FaultInjectorTest, FaultInjectStatusUsesCallerStatusCode) {
+  ABSL_ASSERT_OK(GetFaultInjector().Install({
+      FaultInjectionRule{
+          .hook = std::string(kTestHookAlpha),
+          .action = FaultInjectionType::kFail,
+          .probability = 1.0,
+      },
+  }));
+
+  EXPECT_THAT(
+      FaultInjectStatus(kTestHookAlpha, absl::StatusCode::kUnavailable),
+      StatusIs(absl::StatusCode::kUnavailable, HasSubstr(kTestHookAlpha)));
+}
+
+TEST_F(FaultInjectorTest, FaultInjectStatusRejectsOkCode) {
+  ABSL_ASSERT_OK(GetFaultInjector().Install({
+      FaultInjectionRule{
+          .hook = std::string(kTestHookAlpha),
+          .action = FaultInjectionType::kFail,
+          .probability = 1.0,
+      },
+  }));
+
+  EXPECT_DEATH(
+      FaultInjectStatus(kTestHookAlpha, absl::StatusCode::kOk).IgnoreError(),
+      "must be an error");
+}
+
 TEST_F(FaultInjectorTest, FaultInjectErrnoSetsCustomErrnoOnFailRule) {
   errno = 0;
   EXPECT_FALSE(FaultInjectErrno(kTestHookAlpha, ENOMEM));
@@ -319,6 +458,89 @@ TEST_F(FaultInjectorTest, FaultInjectErrnoSetsCustomErrnoOnFailRule) {
   errno = 0;
   EXPECT_TRUE(FaultInjectErrno(kTestHookAlpha, ENOMEM));
   EXPECT_EQ(errno, ENOMEM);
+}
+
+class FaultInjectSocketTest : public FaultInjectorTest {
+ protected:
+  void SetUp() override {
+    FaultInjectorTest::SetUp();
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds_), 0);
+  }
+  void TearDown() override {
+    FaultInjectorTest::TearDown();
+    for (int fd : fds_) {
+      if (fd >= 0) ::close(fd);
+    }
+  }
+
+  void InstallSocketRule(FaultInjectionType action, uint32_t delay_ms = 0) {
+    ABSL_ASSERT_OK(GetFaultInjector().Install({FaultInjectionRule{
+        .hook = std::string(kTestHookBeta),
+        .action = action,
+        .probability = 1.0,
+        .min_delay_ms = delay_ms,
+        .max_delay_ms = delay_ms,
+    }}));
+  }
+
+  // fds_[0] is the injected side; fds_[1] is the peer.
+  int fds_[2] = {-1, -1};
+};
+
+TEST_F(FaultInjectSocketTest, FailShutsDownConnection) {
+  InstallSocketRule(FaultInjectionType::kFail);
+
+  FaultInjectSocket(kTestHookBeta, fds_[0]);
+
+  char c = 0;
+  EXPECT_EQ(::read(fds_[1], &c, 1), 0);
+  errno = 0;
+  EXPECT_EQ(::send(fds_[0], "x", 1, MSG_NOSIGNAL), -1);
+  EXPECT_EQ(errno, EPIPE);
+  EXPECT_EQ(GetFaultInjector().GetHitCount(kTestHookBeta), 1);
+}
+
+TEST_F(FaultInjectSocketTest, DelayEndsOnPeerClose) {
+  InstallSocketRule(FaultInjectionType::kDelay, kLongDelayMs);
+
+  absl::Notification done;
+  std::thread waiter([this, &done] {
+    FaultInjectSocket(kTestHookBeta, fds_[0]);
+    done.Notify();
+  });
+  WaitForHit(kTestHookBeta);
+
+  ::close(fds_[1]);
+  fds_[1] = -1;
+  EXPECT_TRUE(done.WaitForNotificationWithTimeout(kPromptWake));
+  GetFaultInjector().Reset();
+  waiter.join();
+}
+
+TEST_F(FaultInjectSocketTest, DelayEndsOnLocalShutdown) {
+  InstallSocketRule(FaultInjectionType::kDelay, kLongDelayMs);
+
+  absl::Notification done;
+  std::thread waiter([this, &done] {
+    FaultInjectSocket(kTestHookBeta, fds_[0]);
+    done.Notify();
+  });
+  WaitForHit(kTestHookBeta);
+
+  ::shutdown(fds_[0], SHUT_RDWR);
+  EXPECT_TRUE(done.WaitForNotificationWithTimeout(kPromptWake));
+  GetFaultInjector().Reset();
+  waiter.join();
+}
+
+TEST_F(FaultInjectSocketTest, DelayIgnoresReadableData) {
+  constexpr uint32_t kDelayMs = 200;
+  InstallSocketRule(FaultInjectionType::kDelay, kDelayMs);
+  ASSERT_EQ(::send(fds_[1], "x", 1, MSG_NOSIGNAL), 1);
+
+  const absl::Time start = absl::Now();
+  FaultInjectSocket(kTestHookBeta, fds_[0]);
+  EXPECT_GE(absl::Now() - start, absl::Milliseconds(kDelayMs - 20));
 }
 
 TEST_F(FaultInjectorTest, FastPathOverheadIsSubNanosecond) {

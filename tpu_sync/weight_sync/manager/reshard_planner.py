@@ -14,7 +14,11 @@
 
 """Resharding plan and N-D slice math for RaidenController."""
 
+import concurrent.futures
+import dataclasses
+import json
 import math
+import os
 import sys
 import threading
 from typing import Any, Mapping, Optional, Sequence
@@ -23,6 +27,7 @@ from absl import logging
 
 from tpu_sync.api.common import RaidenId
 from tpu_sync.kv_cache import nd_slice_math
+from tpu_sync.rpc import raiden_service_pb2
 from tpu_sync.weight_sync.manager import broadcast_engine
 from tpu_sync.weight_sync.manager import controller_types
 from tpu_sync.weight_sync.manager import job_entity
@@ -32,11 +37,20 @@ JobEntity = job_entity.JobEntity
 _CachedTransferSchedule = controller_types.CachedTransferSchedule
 _PlanReferencedShardSchedule = controller_types.PlanReferencedShardSchedule
 _VariableMetadata = controller_types.VariableMetadata
+_bind_symbolic_endpoints_in_proto = (
+    controller_types.bind_symbolic_endpoints_in_proto
+)
 _extract_host_ip = controller_types.extract_host_ip
 _format_units = controller_types.format_units
+_is_symbolic_endpoint = controller_types.is_symbolic_endpoint
 _is_variable_spec_identical = controller_types.is_variable_spec_identical
+_make_symbolic_endpoint = controller_types.make_symbolic_endpoint
+_make_symbolic_shards = controller_types.make_symbolic_shards
+_parse_symbolic_endpoint = controller_types.parse_symbolic_endpoint
 _proto_to_nd_slice = controller_types.proto_to_nd_slice
 _raiden_id_from_proto = controller_types.raiden_id_from_proto
+_resolve_symbolic_endpoint = controller_types.resolve_symbolic_endpoint
+_unit_filename_stem = controller_types.unit_filename_stem
 
 
 def to_physical(logical_shape, logical_mesh_shape, minor_to_major):
@@ -725,10 +739,56 @@ class ReshardPlanner:
       ] = None,
       req_id: str = "warmup",
       uuid: Any = "",
+      target_src_units: Optional[Sequence[RaidenId]] = None,
+      parallel_worker_planning: Optional[bool] = None,
   ) -> _CachedTransferSchedule:
     """Computes transfer schedule math and returns a _CachedTransferSchedule."""
     if group_size <= 0:
       raise ValueError("group_size must be positive")
+
+    if parallel_worker_planning is None:
+      env_parallel = (
+          os.environ.get("RAIDEN_PARALLEL_WORKER_PLANNING", "").strip().lower()
+      )
+      env_mode = os.environ.get("RAIDEN_PLANNING_MODE", "").strip().lower()
+      parallel_worker_planning = env_parallel in (
+          "1",
+          "true",
+          "yes",
+      ) or env_mode in ("parallel", "parallel_worker")
+
+    if (
+        parallel_worker_planning
+        and target_src_units is None
+        and not shard_push_schedules
+        and len(src_units) > 1
+    ):
+      return cls.compute_schedules_in_parallel_workers(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_metadata=dst_metadata,
+          entities=entities,
+          registered_variables=registered_variables,
+          registered_global_shapes=registered_global_shapes,
+          registered_mesh_shapes=registered_mesh_shapes,
+          registered_mesh_axes=registered_mesh_axes,
+          registered_host_subgrids=registered_host_subgrids,
+          registered_layouts=registered_layouts,
+          registered_itemsizes=registered_itemsizes,
+          registered_shards=registered_shards,
+          computed_phys_meshes=computed_phys_meshes,
+          worker_endpoints=worker_endpoints,
+          broadcast_k=broadcast_k,
+          lock=lock,
+          group_size=group_size,
+          skip_tiling=skip_tiling,
+          req_id=req_id,
+          uuid=uuid,
+      )
+
+    target_src_set = (
+        set(target_src_units) if target_src_units is not None else None
+    )
 
     computed_schedules = {}
     computed_slices = {}
@@ -1194,6 +1254,9 @@ class ReshardPlanner:
               unique_vars_to_compute,
               unit_layers_tuple_by_pid,
           ) = classified
+
+        if target_src_set is not None and src_unit not in target_src_set:
+          continue
 
         # Calculate the plan ONLY ONCE per unique `plan_id` on this src_unit.
         # Any subsequent variable sharing the same `plan_id` already points to
@@ -1809,3 +1872,901 @@ class ReshardPlanner:
         variable_plans=variable_plans,
         variable_to_plan_id=variable_to_plan_id,
     )
+
+  @classmethod
+  def merge_worker_schedules(
+      cls,
+      worker_schedules: Sequence[_CachedTransferSchedule],
+      src_units: Sequence[RaidenId],
+      dst_units: Sequence[RaidenId],
+      broadcast_k: int = 64,
+      group_size: int = 1,
+  ) -> _CachedTransferSchedule:
+    """Merges independently computed per-worker schedules into a unified schedule."""
+    del cls
+    if not worker_schedules:
+      return _CachedTransferSchedule(
+          computed_schedules={},
+          direct_schedules={},
+          broadcast_groups={},
+          local_skip_tiling={},
+          expected_block_count=0,
+          dst_unit_layer_counts={},
+          data_address_to_unit={},
+          direct_dsts=[],
+          rpc_addresses={},
+          data_addresses={u: [] for u in dst_units},
+      )
+
+    computed_schedules: dict[Any, Any] = {}
+    variable_plans: dict[Any, Any] = {}
+    variable_to_plan_id: dict[Any, Any] = {}
+    local_skip_tiling: dict[int, bool] = {}
+    data_address_to_unit: dict[str, Any] = {}
+    rpc_addresses: dict[Any, str] = {}
+    data_addresses: dict[Any, list[str]] = {u: [] for u in dst_units}
+    is_weight_sync = False
+
+    can_fast_path_direct = len(set(dst_units)) <= max(1, broadcast_k)
+    direct_schedules: dict[Any, Any] = {}
+    direct_dsts: list[Any] = []
+    direct_dsts_set: set[Any] = set()
+    dst_unit_counts: dict[Any, int] = {}
+    dst_unit_layer_counts: dict[Any, dict[int, int]] = {}
+    dst_endpoint_counts: dict[str, int] = {}
+    dst_endpoint_layer_counts: dict[str, dict[int, int]] = {}
+
+    sched_by_src: dict[RaidenId, _CachedTransferSchedule] = {}
+    for w_sched in worker_schedules:
+      for u in w_sched.computed_schedules:
+        sched_by_src[u] = w_sched
+      for u in w_sched.variable_plans:
+        if u not in sched_by_src:
+          sched_by_src[u] = w_sched
+
+    ordered_scheds = [
+        sched_by_src[u] for u in src_units if u in sched_by_src
+    ] or list(worker_schedules)
+
+    for w_sched in ordered_scheds:
+      computed_schedules.update(w_sched.computed_schedules)
+      variable_plans.update(w_sched.variable_plans)
+      variable_to_plan_id.update(w_sched.variable_to_plan_id)
+      local_skip_tiling.update(w_sched.local_skip_tiling)
+      data_address_to_unit.update(w_sched.data_address_to_unit)
+      rpc_addresses.update(w_sched.rpc_addresses)
+      for k, v in w_sched.data_addresses.items():
+        if v:
+          data_addresses[k] = list(v)
+      if w_sched.is_weight_sync:
+        is_weight_sync = True
+
+      if can_fast_path_direct and not w_sched.broadcast_groups:
+        direct_schedules.update(w_sched.direct_schedules)
+        for d_u in w_sched.direct_dsts:
+          if d_u not in direct_dsts_set:
+            direct_dsts_set.add(d_u)
+            direct_dsts.append(d_u)
+        for d_u, cnt in w_sched.dst_unit_counts.items():
+          dst_unit_counts[d_u] = dst_unit_counts.get(d_u, 0) + cnt
+        for d_u, l_map in w_sched.dst_unit_layer_counts.items():
+          target_l_map = dst_unit_layer_counts.setdefault(d_u, {})
+          for l_idx, cnt in l_map.items():
+            target_l_map[l_idx] = target_l_map.get(l_idx, 0) + cnt
+        for d_h, cnt in w_sched.dst_endpoint_counts.items():
+          dst_endpoint_counts[d_h] = dst_endpoint_counts.get(d_h, 0) + cnt
+        for d_h, l_map in w_sched.dst_endpoint_layer_counts.items():
+          target_h_map = dst_endpoint_layer_counts.setdefault(d_h, {})
+          for l_idx, cnt in l_map.items():
+            target_h_map[l_idx] = target_h_map.get(l_idx, 0) + cnt
+
+    if can_fast_path_direct and all(
+        not w.broadcast_groups for w in ordered_scheds
+    ):
+      broadcast_groups = {}
+      expected_block_count = (
+          max(dst_unit_counts.values()) if dst_unit_counts else 0
+      )
+    else:
+      groups = {}
+      for src_unit in src_units:
+        schedules = computed_schedules.get(src_unit, {})
+        for shard_idx, entries in schedules.items():
+          for entry in entries:
+            (
+                dst_peer,
+                dst_shard_idx,
+                dst_block_offset,
+                src_block_offset,
+                size,
+                src_block_id,
+                dst_block_id,
+                src_stride,
+                dst_stride,
+                count,
+                layer_idx,
+                pool_group,
+            ) = entry
+            dst_unit = data_address_to_unit.get(dst_peer)
+            if not dst_unit:
+              continue
+            key = (
+                src_unit,
+                shard_idx,
+                src_block_id,
+                src_block_offset,
+                size,
+                src_stride,
+                count,
+                layer_idx,
+                pool_group,
+            )
+            val = (
+                dst_unit,
+                dst_peer,
+                dst_shard_idx,
+                dst_block_id,
+                dst_block_offset,
+                dst_stride,
+            )
+            groups.setdefault(key, []).append(val)
+
+      direct_schedules, broadcast_groups = (
+          BroadcastEngine.partition_direct_and_broadcast_groups(
+              groups, broadcast_k, group_size
+          )
+      )
+      dst_unit_counts = {}
+      dst_unit_layer_counts = {}
+      dst_endpoint_counts = {}
+      dst_endpoint_layer_counts = {}
+      expected_block_count = 0
+      direct_dsts = []
+      if direct_schedules:
+        for _, schedules in direct_schedules.items():
+          for _, entries in schedules.items():
+            for entry in entries:
+              dst_peer = entry[0]
+              dst_unit = data_address_to_unit.get(dst_peer)
+              if dst_unit:
+                if dst_unit not in direct_dsts:
+                  direct_dsts.append(dst_unit)
+                layer_idx = entry[10] if len(entry) > 10 else 0
+                dst_unit_counts[dst_unit] = dst_unit_counts.get(dst_unit, 0) + 1
+                dst_unit_layer_counts.setdefault(dst_unit, {})[layer_idx] = (
+                    dst_unit_layer_counts.get(dst_unit, {}).get(layer_idx, 0)
+                    + 1
+                )
+                dst_host = _extract_host_ip(dst_peer)
+                if dst_host:
+                  dst_endpoint_counts[dst_host] = (
+                      dst_endpoint_counts.get(dst_host, 0) + 1
+                  )
+                  dst_endpoint_layer_counts.setdefault(dst_host, {})[
+                      layer_idx
+                  ] = (
+                      dst_endpoint_layer_counts.get(dst_host, {}).get(
+                          layer_idx, 0
+                      )
+                      + 1
+                  )
+        if dst_unit_counts:
+          expected_block_count = max(dst_unit_counts.values())
+
+    return _CachedTransferSchedule(
+        computed_schedules=computed_schedules,
+        direct_schedules=direct_schedules,
+        broadcast_groups=broadcast_groups,
+        local_skip_tiling=local_skip_tiling,
+        expected_block_count=expected_block_count,
+        dst_unit_layer_counts=dst_unit_layer_counts,
+        data_address_to_unit=data_address_to_unit,
+        direct_dsts=direct_dsts,
+        rpc_addresses=rpc_addresses,
+        data_addresses=data_addresses,
+        dst_unit_counts=dst_unit_counts,
+        dst_endpoint_counts=dst_endpoint_counts,
+        dst_endpoint_layer_counts=dst_endpoint_layer_counts,
+        is_weight_sync=is_weight_sync,
+        variable_plans=variable_plans,
+        variable_to_plan_id=variable_to_plan_id,
+    )
+
+  @classmethod
+  def compute_schedules_in_parallel_workers(
+      cls,
+      src_units: list[RaidenId],
+      dst_units: list[RaidenId],
+      dst_metadata: list[Any],
+      entities: Mapping[RaidenId, JobEntity],
+      registered_variables: Mapping[RaidenId, list[Any]],
+      registered_global_shapes: Mapping[RaidenId, list[int]],
+      registered_mesh_shapes: Mapping[RaidenId, list[int]],
+      registered_mesh_axes: Mapping[RaidenId, list[str]],
+      registered_host_subgrids: Mapping[RaidenId, list[int]],
+      registered_layouts: Mapping[RaidenId, list[int]],
+      registered_itemsizes: Mapping[RaidenId, int],
+      registered_shards: Mapping[RaidenId, list[str]],
+      computed_phys_meshes: dict[RaidenId, list[int]],
+      worker_endpoints: dict[RaidenId, str],
+      broadcast_k: int,
+      lock: threading.Lock,
+      group_size: int = 1,
+      skip_tiling: Optional[dict[int, bool]] = None,
+      req_id: str = "warmup",
+      uuid: Any = "",
+      max_workers: Optional[int] = None,
+  ) -> _CachedTransferSchedule:
+    """Computes each source worker's schedule in parallel and merges the results."""
+
+    def _compute_for_unit(unit: RaidenId) -> _CachedTransferSchedule:
+      local_phys_meshes: dict[RaidenId, list[int]] = {}
+      sched = cls.compute_transfer_schedule_from_metadata(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_metadata=dst_metadata,
+          entities=entities,
+          registered_variables=registered_variables,
+          registered_global_shapes=registered_global_shapes,
+          registered_mesh_shapes=registered_mesh_shapes,
+          registered_mesh_axes=registered_mesh_axes,
+          registered_host_subgrids=registered_host_subgrids,
+          registered_layouts=registered_layouts,
+          registered_itemsizes=registered_itemsizes,
+          registered_shards=registered_shards,
+          computed_phys_meshes=local_phys_meshes,
+          worker_endpoints=worker_endpoints,
+          broadcast_k=broadcast_k,
+          lock=lock,
+          group_size=group_size,
+          skip_tiling=skip_tiling,
+          req_id=req_id,
+          uuid=uuid,
+          target_src_units=[unit],
+          parallel_worker_planning=False,
+      )
+      with lock:
+        computed_phys_meshes.update(local_phys_meshes)
+      return sched
+
+    num_threads = max_workers or min(32, max(1, len(src_units)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
+      worker_schedules = list(pool.map(_compute_for_unit, src_units))
+
+    return cls.merge_worker_schedules(
+        worker_schedules=worker_schedules,
+        src_units=src_units,
+        dst_units=dst_units,
+        broadcast_k=broadcast_k,
+        group_size=group_size,
+    )
+
+  @classmethod
+  def compute_offline_schedule(
+      cls,
+      src_units: list[RaidenId],
+      dst_units: list[RaidenId],
+      src_variables: Optional[Mapping[RaidenId, list[Any]]] = None,
+      dst_variables: Optional[Mapping[RaidenId, list[Any]]] = None,
+      num_src_shards_per_unit: int = 8,
+      num_dst_shards_per_unit: int = 8,
+      src_mesh_shapes: Optional[Mapping[RaidenId, Sequence[int]]] = None,
+      src_mesh_axes: Optional[Mapping[RaidenId, Sequence[str]]] = None,
+      src_host_subgrids: Optional[Mapping[RaidenId, Sequence[int]]] = None,
+      dst_mesh_shapes: Optional[Mapping[RaidenId, Sequence[int]]] = None,
+      dst_mesh_axes: Optional[Mapping[RaidenId, Sequence[str]]] = None,
+      dst_host_subgrids: Optional[Mapping[RaidenId, Sequence[int]]] = None,
+      num_shards_by_unit: Optional[Mapping[RaidenId, int]] = None,
+      broadcast_k: int = 64,
+      group_size: int = 1,
+      skip_tiling: Optional[dict[int, bool]] = None,
+      target_src_units: Optional[Sequence[RaidenId]] = None,
+      parallel_worker_planning: bool = False,
+      **legacy_kwargs: Any,
+  ) -> _CachedTransferSchedule:
+    """Computes a symbolic transfer schedule offline without live worker IP:ports."""
+    lock = legacy_kwargs.get("lock") or threading.Lock()
+    if src_variables is None:
+      src_variables = legacy_kwargs.get("registered_variables", {})
+    if src_mesh_shapes is None:
+      src_mesh_shapes = legacy_kwargs.get("registered_mesh_shapes")
+    if src_mesh_axes is None:
+      src_mesh_axes = legacy_kwargs.get("registered_mesh_axes")
+    if src_host_subgrids is None:
+      src_host_subgrids = legacy_kwargs.get("registered_host_subgrids")
+    legacy_shards = legacy_kwargs.get("registered_shards", {})
+    legacy_dst_metadata = legacy_kwargs.get("dst_metadata")
+
+    entities = {}
+    registered_shards = {}
+    registered_mesh_shapes = {}
+    registered_mesh_axes = {}
+    registered_host_subgrids = {}
+    worker_endpoints = {}
+
+    for u in src_units:
+      if num_shards_by_unit and u in num_shards_by_unit:
+        n_shards = num_shards_by_unit[u]
+      elif u in legacy_shards and legacy_shards[u]:
+        n_shards = len(legacy_shards[u])
+      else:
+        n_shards = num_src_shards_per_unit
+      shards = _make_symbolic_shards(u, n_shards)
+      registered_shards[u] = shards
+      entities[u] = JobEntity(unit=u, shards=shards)
+      if src_mesh_shapes and u in src_mesh_shapes:
+        registered_mesh_shapes[u] = list(src_mesh_shapes[u])
+      if src_mesh_axes and u in src_mesh_axes:
+        registered_mesh_axes[u] = list(src_mesh_axes[u])
+      if src_host_subgrids and u in src_host_subgrids:
+        registered_host_subgrids[u] = list(src_host_subgrids[u])
+      worker_endpoints[u] = _make_symbolic_endpoint(u, 0)
+
+    dst_metadata = []
+    if legacy_dst_metadata is not None and dst_variables is None:
+      for item in legacy_dst_metadata:
+        u = controller_types.raiden_id_from_proto(item.unit)
+        if num_shards_by_unit and u in num_shards_by_unit:
+          n_shards = num_shards_by_unit[u]
+        elif item.shards:
+          n_shards = len(item.shards)
+        else:
+          n_shards = num_dst_shards_per_unit
+        sym_shards = _make_symbolic_shards(u, n_shards)
+        registered_shards[u] = sym_shards
+        meta = raiden_service_pb2.RegisterWorkUnitRequest()
+        meta.CopyFrom(item)
+        del meta.shards[:]
+        meta.shards.extend(sym_shards)
+        meta.control_plane_rpc_address = _make_symbolic_endpoint(u, 0)
+        dst_metadata.append(meta)
+    else:
+      dst_vars_map = dst_variables or {}
+      proto_vars_cache = {}
+      for u in dst_units:
+        if num_shards_by_unit and u in num_shards_by_unit:
+          n_shards = num_shards_by_unit[u]
+        elif u in legacy_shards and legacy_shards[u]:
+          n_shards = len(legacy_shards[u])
+        else:
+          n_shards = num_dst_shards_per_unit
+        shards = _make_symbolic_shards(u, n_shards)
+        registered_shards[u] = shards
+        meta = raiden_service_pb2.RegisterWorkUnitRequest(
+            unit=raiden_service_pb2.RaidenIdProto(
+                job_name=u.job_name,
+                job_replica_id=str(u.job_replica_id),
+                data_name=u.data_name,
+                data_replica_idx=u.data_replica_idx,
+            ),
+            control_plane_rpc_address=_make_symbolic_endpoint(u, 0),
+        )
+        meta.shards.extend(shards)
+        if dst_mesh_shapes and u in dst_mesh_shapes:
+          meta.mesh_shape.extend(dst_mesh_shapes[u])
+        if dst_mesh_axes and u in dst_mesh_axes:
+          meta.mesh_axes.extend(dst_mesh_axes[u])
+        if dst_host_subgrids and u in dst_host_subgrids:
+          meta.host_subgrid.extend(dst_host_subgrids[u])
+        u_vars = dst_vars_map.get(u, [])
+        proto_vars = proto_vars_cache.get(id(u_vars))
+        if proto_vars is None:
+          tmpl = raiden_service_pb2.RegisterWorkUnitRequest()
+          for v in u_vars:
+            vp = tmpl.variables.add()
+            vp.CopyFrom(
+                controller_types.coerce_variable_proto(v, raiden_service_pb2)
+            )
+          proto_vars = list(tmpl.variables)
+          proto_vars_cache[id(u_vars)] = proto_vars
+        meta.variables.extend(proto_vars)
+        dst_metadata.append(meta)
+
+    return cls.compute_transfer_schedule_from_metadata(
+        src_units=src_units,
+        dst_units=dst_units,
+        dst_metadata=dst_metadata,
+        entities=entities,
+        registered_variables=src_variables,
+        registered_global_shapes=legacy_kwargs.get(
+            "registered_global_shapes", {}
+        ),
+        registered_mesh_shapes=registered_mesh_shapes,
+        registered_mesh_axes=registered_mesh_axes,
+        registered_host_subgrids=registered_host_subgrids,
+        registered_layouts=legacy_kwargs.get("registered_layouts", {}),
+        registered_itemsizes=legacy_kwargs.get("registered_itemsizes", {}),
+        registered_shards=registered_shards,
+        computed_phys_meshes={},
+        worker_endpoints=worker_endpoints,
+        broadcast_k=broadcast_k,
+        lock=lock,
+        group_size=group_size,
+        skip_tiling=skip_tiling,
+        req_id="offline",
+        uuid=0,
+        target_src_units=target_src_units,
+        parallel_worker_planning=parallel_worker_planning,
+    )
+
+  @classmethod
+  def bind_symbolic_schedule(
+      cls,
+      schedule: _CachedTransferSchedule,
+      live_data_addresses: Mapping[RaidenId, Sequence[str]],
+      live_rpc_addresses: Optional[Mapping[RaidenId, str]] = None,
+  ) -> _CachedTransferSchedule:
+    """Binds symbolic endpoints in an offline _CachedTransferSchedule to live IP:ports."""
+    del cls
+    if not live_data_addresses:
+      return schedule
+
+    bound_variable_plans: dict[Any, dict[int, dict[int, list[Any]]]] = {}
+    bound_computed_schedules: dict[Any, Any] = {}
+
+    for src_unit, unit_plans_by_id in schedule.variable_plans.items():
+      new_unit_plans_by_id: dict[int, dict[int, list[Any]]] = {}
+      new_unit_shard_plans_by_id: dict[int, dict[int, list[Any]]] = {}
+      for pid, tmpl_for_var in unit_plans_by_id.items():
+        new_tmpl_for_var: dict[int, list[Any]] = {}
+        for local_src_idx, entries in tmpl_for_var.items():
+          bound_entries = [
+              (_resolve_symbolic_endpoint(e[0], live_data_addresses), *e[1:])
+              for e in entries
+          ]
+          new_tmpl_for_var[local_src_idx] = bound_entries
+          new_unit_shard_plans_by_id.setdefault(local_src_idx, {})[
+              pid
+          ] = bound_entries
+        new_unit_plans_by_id[pid] = new_tmpl_for_var
+      bound_variable_plans[src_unit] = new_unit_plans_by_id
+
+      orig_unit_scheds = schedule.computed_schedules.get(src_unit, {})
+      unit_var_to_pid = schedule.variable_to_plan_id.get(src_unit, {})
+      new_unit_scheds = {}
+      for local_src_idx, orig_sched in orig_unit_scheds.items():
+        ordered_vars = getattr(orig_sched, "_ordered_vars", None)
+        if local_src_idx in new_unit_shard_plans_by_id:
+          new_unit_scheds[local_src_idx] = _PlanReferencedShardSchedule(
+              new_unit_shard_plans_by_id[local_src_idx],
+              unit_var_to_pid,
+              ordered_vars,
+          )
+        elif isinstance(orig_sched, (list, tuple)):
+          new_unit_scheds[local_src_idx] = [
+              (_resolve_symbolic_endpoint(e[0], live_data_addresses), *e[1:])
+              for e in orig_sched
+          ]
+      if new_unit_scheds:
+        bound_computed_schedules[src_unit] = new_unit_scheds
+
+    for src_unit, orig_unit_scheds in schedule.computed_schedules.items():
+      if src_unit not in bound_computed_schedules:
+        new_unit_scheds = {}
+        for local_src_idx, orig_sched in orig_unit_scheds.items():
+          new_unit_scheds[local_src_idx] = [
+              (_resolve_symbolic_endpoint(e[0], live_data_addresses), *e[1:])
+              for e in orig_sched
+          ]
+        bound_computed_schedules[src_unit] = new_unit_scheds
+
+    if not schedule.broadcast_groups:
+      bound_direct_schedules = {
+          u: {s_idx: entries for s_idx, entries in scheds.items() if entries}
+          for u, scheds in bound_computed_schedules.items()
+          if any(scheds.values())
+      }
+      bound_broadcast_groups = {}
+    else:
+      bound_direct_schedules = {}
+      for src_unit, scheds in schedule.direct_schedules.items():
+        if (
+            src_unit in bound_computed_schedules
+            and scheds == schedule.computed_schedules.get(src_unit)
+        ):
+          bound_direct_schedules[src_unit] = bound_computed_schedules[src_unit]
+        else:
+          bound_direct_schedules[src_unit] = {
+              s_idx: [
+                  (
+                      _resolve_symbolic_endpoint(e[0], live_data_addresses),
+                      *e[1:],
+                  )
+                  for e in entries
+              ]
+              for s_idx, entries in scheds.items()
+          }
+      bound_broadcast_groups = {}
+      for group_key, k_and_t_list in schedule.broadcast_groups.items():
+        bound_list = []
+        for k, targets in k_and_t_list:
+          bound_targets = [
+              (
+                  t[0],
+                  _resolve_symbolic_endpoint(t[1], live_data_addresses),
+                  *t[2:],
+              )
+              for t in targets
+          ]
+          bound_list.append((k, bound_targets))
+        bound_broadcast_groups[group_key] = bound_list
+
+    bound_data_addresses = dict(schedule.data_addresses)
+    bound_data_address_to_unit = {}
+    for u, shards in bound_data_addresses.items():
+      if u in live_data_addresses and live_data_addresses[u]:
+        bound_shards = list(live_data_addresses[u])
+      else:
+        bound_shards = [
+            _resolve_symbolic_endpoint(s, live_data_addresses) for s in shards
+        ]
+      bound_data_addresses[u] = bound_shards
+      for s in bound_shards:
+        bound_data_address_to_unit[s] = u
+    for u, shards in live_data_addresses.items():
+      if u not in bound_data_addresses and shards:
+        bound_data_addresses[u] = list(shards)
+      for s in shards:
+        bound_data_address_to_unit[s] = u
+
+    bound_dst_endpoint_counts: dict[str, int] = {}
+    for sym_host, cnt in schedule.dst_endpoint_counts.items():
+      parsed = _parse_symbolic_endpoint(f"{sym_host}:0")
+      if parsed is not None and parsed[0] in live_data_addresses:
+        live_shards = live_data_addresses[parsed[0]]
+        live_host = (
+            _extract_host_ip(live_shards[0]) if live_shards else sym_host
+        )
+      else:
+        live_host = sym_host
+      bound_dst_endpoint_counts[live_host] = (
+          bound_dst_endpoint_counts.get(live_host, 0) + cnt
+      )
+
+    bound_dst_endpoint_layer_counts: dict[str, dict[int, int]] = {}
+    for sym_host, l_map in schedule.dst_endpoint_layer_counts.items():
+      parsed = _parse_symbolic_endpoint(f"{sym_host}:0")
+      if parsed is not None and parsed[0] in live_data_addresses:
+        live_shards = live_data_addresses[parsed[0]]
+        live_host = (
+            _extract_host_ip(live_shards[0]) if live_shards else sym_host
+        )
+      else:
+        live_host = sym_host
+      target_map = bound_dst_endpoint_layer_counts.setdefault(live_host, {})
+      for l_idx, cnt in l_map.items():
+        target_map[l_idx] = target_map.get(l_idx, 0) + cnt
+
+    bound_rpc_addresses = dict(schedule.rpc_addresses)
+    if live_rpc_addresses:
+      bound_rpc_addresses.update(live_rpc_addresses)
+
+    return _CachedTransferSchedule(
+        computed_schedules=bound_computed_schedules,
+        direct_schedules=bound_direct_schedules,
+        broadcast_groups=bound_broadcast_groups,
+        local_skip_tiling=dict(schedule.local_skip_tiling),
+        expected_block_count=schedule.expected_block_count,
+        dst_unit_layer_counts={
+            u: dict(m) for u, m in schedule.dst_unit_layer_counts.items()
+        },
+        data_address_to_unit=bound_data_address_to_unit,
+        direct_dsts=list(schedule.direct_dsts),
+        rpc_addresses=bound_rpc_addresses,
+        data_addresses=bound_data_addresses,
+        dst_unit_counts=dict(schedule.dst_unit_counts),
+        dst_endpoint_counts=bound_dst_endpoint_counts,
+        dst_endpoint_layer_counts=bound_dst_endpoint_layer_counts,
+        is_weight_sync=schedule.is_weight_sync,
+        variable_plans=bound_variable_plans,
+        variable_to_plan_id={
+            u: dict(m) for u, m in schedule.variable_to_plan_id.items()
+        },
+    )
+
+  @classmethod
+  def _to_json_serializable(cls, obj: Any) -> Any:
+    """Recursively converts a schedule structure to JSON-compatible primitives."""
+    if isinstance(obj, RaidenId):
+      return {
+          "__raiden_id__": [
+              obj.job_name,
+              str(obj.job_replica_id),
+              obj.data_name,
+              int(obj.data_replica_idx),
+          ]
+      }
+    if isinstance(obj, _PlanReferencedShardSchedule):
+      ordered_vars = getattr(obj, "_ordered_vars", [])
+      return {
+          "__plan_ref__": [
+              [int(l_idx), int(pid)] for l_idx, pid in ordered_vars
+          ]
+      }
+    if isinstance(obj, _CachedTransferSchedule):
+      skip_fields = {
+          "sender_push_schedule_protos",
+          "cached_serialized_payloads",
+      }
+      return {
+          "__cached_schedule__": {
+              f.name: cls._to_json_serializable(getattr(obj, f.name))
+              for f in dataclasses.fields(obj)
+              if f.name not in skip_fields
+          }
+      }
+    if isinstance(obj, tuple):
+      return {"__tuple__": [cls._to_json_serializable(x) for x in obj]}
+    if isinstance(obj, list):
+      return [cls._to_json_serializable(x) for x in obj]
+    if isinstance(obj, dict):
+      if all(isinstance(k, str) for k in obj.keys()):
+        return {k: cls._to_json_serializable(v) for k, v in obj.items()}
+      return {
+          "__dict__": [
+              [
+                  cls._to_json_serializable(k),
+                  cls._to_json_serializable(v),
+              ]
+              for k, v in obj.items()
+          ]
+      }
+    return obj
+
+  @classmethod
+  def _from_json_serializable(cls, obj: Any) -> Any:
+    """Recursively reconstructs a schedule structure from JSON primitives."""
+    if isinstance(obj, list):
+      return [cls._from_json_serializable(x) for x in obj]
+    if isinstance(obj, dict):
+      if "__raiden_id__" in obj:
+        parts = obj["__raiden_id__"]
+        return RaidenId(
+            str(parts[0]), str(parts[1]), str(parts[2]), int(parts[3])
+        )
+      if "__tuple__" in obj:
+        return tuple(cls._from_json_serializable(x) for x in obj["__tuple__"])
+      if "__dict__" in obj:
+        return {
+            cls._from_json_serializable(k): cls._from_json_serializable(v)
+            for k, v in obj["__dict__"]
+        }
+      if "__plan_ref__" in obj:
+        return {"__plan_ref__": [tuple(pair) for pair in obj["__plan_ref__"]]}
+      if "__cached_schedule__" in obj:
+        fields_dict = {
+            k: cls._from_json_serializable(v)
+            for k, v in obj["__cached_schedule__"].items()
+        }
+        var_plans = fields_dict.get("variable_plans", {})
+        var_to_pid = fields_dict.get("variable_to_plan_id", {})
+        for src_unit, unit_plans_by_id in var_plans.items():
+          shard_plans_by_id: dict[int, dict[int, list[Any]]] = {}
+          for pid, tmpl_for_var in unit_plans_by_id.items():
+            for local_src_idx, entries in tmpl_for_var.items():
+              shard_plans_by_id.setdefault(local_src_idx, {})[pid] = entries
+          unit_var_to_pid = var_to_pid.get(src_unit, {})
+          for sched_key in ("computed_schedules", "direct_schedules"):
+            unit_scheds = fields_dict.get(sched_key, {}).get(src_unit)
+            if not unit_scheds:
+              continue
+            for local_src_idx, val in list(unit_scheds.items()):
+              if isinstance(val, dict) and "__plan_ref__" in val:
+                unit_scheds[local_src_idx] = _PlanReferencedShardSchedule(
+                    shard_plans_by_id.get(local_src_idx, {}),
+                    unit_var_to_pid,
+                    val["__plan_ref__"],
+                )
+        return _CachedTransferSchedule(**fields_dict)
+      return {k: cls._from_json_serializable(v) for k, v in obj.items()}
+    return obj
+
+  @classmethod
+  def save_offline_plan(
+      cls,
+      schedule: _CachedTransferSchedule,
+      path: str,
+      src_units: Optional[Sequence[RaidenId]] = None,
+      dst_units: Optional[Sequence[RaidenId]] = None,
+      dst_mem_type: int = controller_types.RaidenMemoryType.DRAM,
+      parallelism: int = 1,
+  ) -> dict[Any, str]:
+    """Saves per-worker ControlRequest protobufs and schedule bundle to `path`."""
+    os.makedirs(path, exist_ok=True)
+    if src_units is not None:
+      src_list = list(src_units)
+    else:
+      src_keys = (
+          schedule.computed_schedules.keys() or schedule.direct_schedules.keys()
+      )
+      src_list = list(src_keys)
+    src_set = set(src_list)
+    if dst_units is not None:
+      dst_list = list(dst_units)
+    else:
+      inferred_dsts = [u for u in schedule.data_addresses if u not in src_set]
+      dst_list = inferred_dsts or list(schedule.dst_unit_counts.keys())
+
+    raw_schedules = schedule.direct_schedules or schedule.computed_schedules
+    transfer_plan = controller_types.TransferPlan(
+        src_units=src_list,
+        dst_units=dst_list,
+        plan=None,
+        shard_push_schedules=raw_schedules,
+        worker_rpc_addresses=dict(schedule.rpc_addresses),
+        worker_data_addresses=dict(schedule.data_addresses),
+        uuid=0,
+        dst_mem_type=dst_mem_type,
+        use_block_chunks=True,
+        is_sender=True,
+        expected_block_count=schedule.expected_block_count,
+        dst_expected_layer_chunk_counts=schedule.dst_unit_layer_counts,
+        dst_expected_block_counts=schedule.dst_unit_counts,
+        dst_endpoint_counts=schedule.dst_endpoint_counts,
+        dst_endpoint_layer_counts=schedule.dst_endpoint_layer_counts,
+        src_schedule_keys={u: i for i, u in enumerate(src_list)},
+        req_id="offline",
+        skip_d2h=False,
+        skip_tiling=schedule.local_skip_tiling,
+        parallelism=parallelism,
+        is_weight_sync=schedule.is_weight_sync,
+        variable_plans=schedule.variable_plans,
+        variable_to_plan_id=schedule.variable_to_plan_id,
+    )
+
+    written_files: dict[Any, str] = {}
+    for u in src_list:
+      ent = JobEntity(
+          unit=u,
+          shards=schedule.data_addresses.get(u) or _make_symbolic_shards(u, 1),
+          weight_sync_mode=schedule.is_weight_sync,
+      )
+      payload = ent.encode_start_transfer(transfer_plan, unit=u)
+      if payload:
+        file_path = os.path.join(path, f"{_unit_filename_stem(u)}.pb")
+        with open(file_path, "wb") as f:
+          f.write(payload)
+        written_files[u] = file_path
+        written_files[controller_types.format_unit(u)] = file_path
+
+    for u in dst_list:
+      ent = JobEntity(
+          unit=u,
+          shards=schedule.data_addresses.get(u) or _make_symbolic_shards(u, 1),
+          weight_sync_mode=schedule.is_weight_sync,
+      )
+      payload = ent.encode_start_transfer(transfer_plan, unit=u)
+      if payload:
+        file_path = os.path.join(path, f"{_unit_filename_stem(u)}.pb")
+        with open(file_path, "wb") as f:
+          f.write(payload)
+        written_files[u] = file_path
+        written_files[controller_types.format_unit(u)] = file_path
+
+    bundle_path = os.path.join(path, "offline_schedule.json")
+    payload_dict = cls._to_json_serializable({
+        "schedule": schedule,
+        "src_units": src_list,
+        "dst_units": dst_list,
+    })
+    with open(bundle_path, "w", encoding="utf-8") as f:
+      json.dump(payload_dict, f)
+    written_files["__schedule_bundle__"] = bundle_path
+    return written_files
+
+  @classmethod
+  def load_offline_schedule(
+      cls,
+      path: str,
+      live_data_addresses: Optional[Mapping[RaidenId, Sequence[str]]] = None,
+      live_rpc_addresses: Optional[Mapping[RaidenId, str]] = None,
+      registered_shards: Optional[Mapping[RaidenId, Sequence[str]]] = None,
+      worker_endpoints: Optional[Mapping[RaidenId, str]] = None,
+      entities: Optional[Mapping[RaidenId, Any]] = None,
+  ) -> _CachedTransferSchedule:
+    """Loads an offline _CachedTransferSchedule from `path` and binds live endpoints."""
+    del entities
+    bundle_path = (
+        os.path.join(path, "offline_schedule.json")
+        if os.path.isdir(path)
+        else path
+    )
+    with open(bundle_path, "r", encoding="utf-8") as f:
+      raw_bundle = json.load(f)
+    bundle = cls._from_json_serializable(raw_bundle)
+    schedule = bundle["schedule"] if isinstance(bundle, dict) else bundle
+    effective_data = (
+        live_data_addresses
+        if live_data_addresses is not None
+        else registered_shards
+    )
+    effective_rpc = (
+        live_rpc_addresses
+        if live_rpc_addresses is not None
+        else worker_endpoints
+    )
+    if effective_data:
+      return cls.bind_symbolic_schedule(
+          schedule,
+          live_data_addresses=effective_data,
+          live_rpc_addresses=effective_rpc,
+      )
+    return schedule
+
+  @classmethod
+  def load_offline_worker_plan(
+      cls,
+      path: str,
+      unit: RaidenId,
+      live_data_addresses: Optional[Mapping[RaidenId, Sequence[str]]] = None,
+      registered_shards: Optional[Mapping[RaidenId, Sequence[str]]] = None,
+      uuid: Optional[int] = None,
+      req_id: Optional[str] = None,
+      skip_d2h: Optional[bool] = None,
+  ) -> raiden_service_pb2.ControlRequest:
+    """Loads a single worker's precomputed ControlRequest proto and binds live endpoints."""
+    del cls
+    file_path = (
+        os.path.join(path, f"{_unit_filename_stem(unit)}.pb")
+        if os.path.isdir(path)
+        else path
+    )
+    with open(file_path, "rb") as f:
+      raw_bytes = f.read()
+    req = raiden_service_pb2.ControlRequest()
+    req.ParseFromString(raw_bytes)
+    effective_data = (
+        live_data_addresses
+        if live_data_addresses is not None
+        else registered_shards
+    )
+    if effective_data:
+      _bind_symbolic_endpoints_in_proto(req, effective_data)
+    if uuid is not None:
+      req.start_transfer_request.uuid = int(uuid)
+    if req_id is not None:
+      req.start_transfer_request.req_id = str(req_id)
+    if skip_d2h is not None:
+      req.start_transfer_request.skip_d2h = bool(skip_d2h)
+    return req
+
+  @classmethod
+  def load_offline_worker_plans_parallel(
+      cls,
+      path: str,
+      units: Sequence[RaidenId],
+      live_data_addresses: Optional[Mapping[RaidenId, Sequence[str]]] = None,
+      registered_shards: Optional[Mapping[RaidenId, Sequence[str]]] = None,
+      uuid: Optional[int] = None,
+      req_id: Optional[str] = None,
+      skip_d2h: Optional[bool] = None,
+      max_workers: Optional[int] = None,
+  ) -> dict[RaidenId, raiden_service_pb2.ControlRequest]:
+    """Loads and binds precomputed ControlRequest plans for `units` in parallel."""
+    unit_list = list(units)
+    if not unit_list:
+      return {}
+    effective_data = (
+        live_data_addresses
+        if live_data_addresses is not None
+        else registered_shards
+    )
+
+    def _load_one(
+        u: RaidenId,
+    ) -> tuple[RaidenId, raiden_service_pb2.ControlRequest]:
+      return (
+          u,
+          cls.load_offline_worker_plan(
+              path=path,
+              unit=u,
+              live_data_addresses=effective_data,
+              uuid=uuid,
+              req_id=req_id,
+              skip_d2h=skip_d2h,
+          ),
+      )
+
+    num_threads = max_workers or min(32, max(1, len(unit_list)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
+      return dict(pool.map(_load_one, unit_list))

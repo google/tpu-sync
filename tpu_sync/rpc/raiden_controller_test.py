@@ -5814,6 +5814,237 @@ class JobEntityTest(absltest.TestCase):
     finally:
       controller.worker_rpc_client.close()
 
+  def test_controller_offline_plan_save_and_load_transfer(self):
+    """Verifies offline plan generation, parallel worker plan loading, and step-0 transfer without online reshard math."""
+    offline_controller = raiden_controller.RaidenController(
+        port=0, enable_plan_cache=False
+    )
+    src_units = [
+        raiden_controller.RaidenId("trainer", str(i), "weights", 0)
+        for i in range(2)
+    ]
+    dst_units = [
+        raiden_controller.RaidenId("sampler", str(j), "weights", 0)
+        for j in range(2)
+    ]
+    src_vars = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0_w",
+            shape=[64, 64],
+            mesh_shape=[2, 4],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=0,
+            sharding_spec=["fsdp", "tp"],
+        ),
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_1_w",
+            shape=[64, 64],
+            mesh_shape=[2, 4],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=1,
+            sharding_spec=["fsdp", "tp"],
+        ),
+    ]
+    dst_vars = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0_w",
+            shape=[64, 64],
+            mesh_shape=[1, 4],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=0,
+            sharding_spec=["fsdp", "tp"],
+        ),
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_1_w",
+            shape=[64, 64],
+            mesh_shape=[1, 4],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=1,
+            sharding_spec=["fsdp", "tp"],
+        ),
+    ]
+    try:
+      # Register with placeholder offline addresses
+      for i, u in enumerate(src_units):
+        offline_controller.register_work_unit(
+            u,
+            [f"0.0.0.{i + 1}:{8000 + d}" for d in range(4)],
+            control_plane_rpc_address=f"0.0.0.{i + 1}:9000",
+            variables=src_vars,
+            mesh_shape=[2, 4],
+            mesh_axes=["fsdp", "tp"],
+        )
+      for j, u in enumerate(dst_units):
+        offline_controller.register_work_unit(
+            u,
+            [f"0.0.1.{j + 1}:{8000 + d}" for d in range(4)],
+            control_plane_rpc_address=f"0.0.1.{j + 1}:9000",
+            variables=dst_vars,
+            mesh_shape=[1, 4],
+            mesh_axes=["fsdp", "tp"],
+        )
+
+      plan_dir = self.create_tempdir().full_path
+      offline_controller.save_offline_plan(plan_dir, src_units, dst_units)
+    finally:
+      offline_controller.worker_rpc_client.close()
+
+    # Start a runtime controller configured with offline_plan_path and live IPs.
+    client = RecordingWorkerRpcClient()
+    runtime_controller = raiden_controller.RaidenController(
+        port=0,
+        worker_rpc_client=client,
+        offline_plan_path=plan_dir,
+    )
+    try:
+      for i, u in enumerate(src_units):
+        runtime_controller.register_work_unit(
+            u,
+            [f"10.20.0.{i + 1}:{18000 + d}" for d in range(4)],
+            control_plane_rpc_address=f"10.20.0.{i + 1}:19000",
+            variables=src_vars,
+            mesh_shape=[2, 4],
+            mesh_axes=["fsdp", "tp"],
+        )
+      for j, u in enumerate(dst_units):
+        runtime_controller.register_work_unit(
+            u,
+            [f"10.30.0.{j + 1}:{28000 + d}" for d in range(4)],
+            control_plane_rpc_address=f"10.30.0.{j + 1}:29000",
+            variables=dst_vars,
+            mesh_shape=[1, 4],
+            mesh_axes=["fsdp", "tp"],
+        )
+
+      # Verify parallel worker loading binds the new live 10.30.0.x endpoints
+      worker_plans = runtime_controller.load_offline_worker_plans_parallel(
+          plan_dir, src_units, req_id="offline_req", uuid=999
+      )
+      self.assertLen(worker_plans, 2)
+      for u in src_units:
+        for (
+            _,
+            sched_proto,
+        ) in worker_plans[
+            u
+        ].start_transfer_request.shard_push_schedules.items():
+          for entry in sched_proto.entries:
+            self.assertTrue(entry.dst_peer.startswith("10.30.0."))
+
+      # Verify start_transfer uses the offline plan without calling
+      # compute_transfer_schedule_from_metadata.
+      with mock.patch.object(
+          runtime_controller._planner,
+          "compute_transfer_schedule_from_metadata",
+          side_effect=AssertionError("Should not run online planning math!"),
+      ):
+        fut = runtime_controller.start_transfer(
+            src_units=src_units,
+            dst_units=dst_units,
+            use_block_chunks=True,
+            req_id="step0_offline",
+        )
+        asyncio.run(fut.wait())
+
+      plan = runtime_controller.get_plan("step0_offline")
+      self.assertIsNotNone(plan)
+      for u in src_units:
+        for _, entries in plan.shard_push_schedules[u].items():
+          for entry in entries:
+            self.assertTrue(entry[0].startswith("10.30.0."))
+    finally:
+      runtime_controller.worker_rpc_client.close()
+
+  def test_controller_parallel_worker_planning_transfer(self):
+    """Verifies RaidenController with parallel_worker_planning=True produces identical plans to sequential planning."""
+    src_units = [
+        raiden_controller.RaidenId("trainer", str(i), "weights", 0)
+        for i in range(2)
+    ]
+    dst_units = [
+        raiden_controller.RaidenId("sampler", str(j), "weights", 0)
+        for j in range(2)
+    ]
+    src_vars = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0_w",
+            shape=[64, 64],
+            mesh_shape=[2, 4],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=0,
+            sharding_spec=["fsdp", "tp"],
+        ),
+    ]
+    dst_vars = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0_w",
+            shape=[64, 64],
+            mesh_shape=[1, 4],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=0,
+            sharding_spec=["fsdp", "tp"],
+        ),
+    ]
+
+    plans = []
+    for parallel_flag in (False, True):
+      client = RecordingWorkerRpcClient()
+      ctrl = raiden_controller.RaidenController(
+          port=0,
+          worker_rpc_client=client,
+          enable_plan_cache=False,
+          parallel_worker_planning=parallel_flag,
+      )
+      try:
+        for i, u in enumerate(src_units):
+          ctrl.register_work_unit(
+              u,
+              [f"10.0.0.{i + 1}:{8000 + d}" for d in range(4)],
+              control_plane_rpc_address=f"10.0.0.{i + 1}:9000",
+              variables=src_vars,
+              mesh_shape=[2, 4],
+              mesh_axes=["fsdp", "tp"],
+          )
+        for j, u in enumerate(dst_units):
+          ctrl.register_work_unit(
+              u,
+              [f"10.0.1.{j + 1}:{8000 + d}" for d in range(4)],
+              control_plane_rpc_address=f"10.0.1.{j + 1}:9000",
+              variables=dst_vars,
+              mesh_shape=[1, 4],
+              mesh_axes=["fsdp", "tp"],
+          )
+        fut = ctrl.start_transfer(
+            src_units=src_units,
+            dst_units=dst_units,
+            use_block_chunks=True,
+            req_id="req_cmp",
+            uuid=12345,
+        )
+        asyncio.run(fut.wait())
+        plans.append(ctrl.get_plan("req_cmp"))
+      finally:
+        ctrl.worker_rpc_client.close()
+
+    self.assertLen(plans, 2)
+    seq_plan = plans[0]
+    par_plan = plans[1]
+    self.assertEqual(
+        seq_plan.expected_block_count, par_plan.expected_block_count
+    )
+    self.assertEqual(seq_plan.dst_endpoint_counts, par_plan.dst_endpoint_counts)
+    for u in src_units:
+      self.assertEqual(
+          {k: list(v) for k, v in seq_plan.shard_push_schedules[u].items()},
+          {k: list(v) for k, v in par_plan.shard_push_schedules[u].items()},
+      )
+
 
 if __name__ == "__main__":
   absltest.main()

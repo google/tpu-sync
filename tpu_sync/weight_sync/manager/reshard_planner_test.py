@@ -14,9 +14,11 @@
 
 """Tests and benchmarks for ReshardPlanner schedule computation and deduplication."""
 
+import os
 import threading
 import timeit
 from typing import Any
+from unittest import mock
 
 from absl import logging
 from absl.testing import absltest
@@ -517,6 +519,354 @@ class ReshardPlannerTest(absltest.TestCase):
         )
 
     self.assertGreater(multi_dest_vars_tested, 0)
+
+  def test_parallel_worker_planning_exact_equivalence(self):
+    """Verifies Approach 2 (parallel per-worker planning) matches centralized planning bit-for-bit."""
+    src_units = [RaidenId("trainer", str(i), "weights", 0) for i in range(4)]
+    dst_units = [
+        RaidenId("rollout_0", "0", "weights", 0),
+        RaidenId("rollout_0", "1", "weights", 0),
+        RaidenId("rollout_1", "0", "weights", 0),
+        RaidenId("rollout_1", "1", "weights", 0),
+    ]
+    src_vars = _build_qwen3_397b_variables(
+        num_layers=4, src_fsdp=4, is_src=True
+    )
+    dst_vars = _build_qwen3_397b_variables(
+        num_layers=4, src_fsdp=4, is_src=False
+    )
+
+    central_kwargs = self._build_planner_inputs(
+        src_vars_by_unit={u: src_vars for u in src_units},
+        dst_vars_by_unit={u: dst_vars for u in dst_units},
+        src_phys_mesh=[1, 1, 4, 4, 2],
+        src_mesh_axes=["data", "stage", "fsdp", "context", "expert"],
+        src_host_subgrid=[1, 1, 1, 4, 2],
+        dst_phys_mesh=[2, 8],
+        dst_mesh_axes=["x", "y"],
+        dst_host_subgrid=[1, 8],
+    )
+    central_sched = (
+        reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+            **central_kwargs,
+            parallel_worker_planning=False,
+        )
+    )
+
+    # 1. Test independent single-worker slice computation
+    # (`target_src_units=[u]`)
+    worker_slices = []
+    for u in src_units:
+      worker_kwargs = self._build_planner_inputs(
+          src_vars_by_unit={su: src_vars for su in src_units},
+          dst_vars_by_unit={du: dst_vars for du in dst_units},
+          src_phys_mesh=[1, 1, 4, 4, 2],
+          src_mesh_axes=["data", "stage", "fsdp", "context", "expert"],
+          src_host_subgrid=[1, 1, 1, 4, 2],
+          dst_phys_mesh=[2, 8],
+          dst_mesh_axes=["x", "y"],
+          dst_host_subgrid=[1, 8],
+      )
+      w_sched = reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+          **worker_kwargs,
+          target_src_units=[u],
+          parallel_worker_planning=False,
+      )
+      self.assertEqual(list(w_sched.computed_schedules.keys()), [u])
+      self.assertEqual(
+          w_sched.variable_to_plan_id[u],
+          central_sched.variable_to_plan_id[u],
+      )
+      self.assertEqual(
+          w_sched.variable_plans[u],
+          central_sched.variable_plans[u],
+      )
+      ent = central_kwargs["entities"][u]
+      w_protos = ent.build_sender_push_schedule_protos(
+          w_sched.direct_schedules[u]
+      )
+      c_protos = ent.build_sender_push_schedule_protos(
+          central_sched.direct_schedules[u]
+      )
+      self.assertEqual(
+          {
+              k: p.SerializeToString(deterministic=True)
+              for k, p in w_protos.items()
+          },
+          {
+              k: p.SerializeToString(deterministic=True)
+              for k, p in c_protos.items()
+          },
+      )
+      worker_slices.append(w_sched)
+
+    # 2. Test merging independent worker slices + parallel worker execution
+    parallel_kwargs = self._build_planner_inputs(
+        src_vars_by_unit={u: src_vars for u in src_units},
+        dst_vars_by_unit={u: dst_vars for u in dst_units},
+        src_phys_mesh=[1, 1, 4, 4, 2],
+        src_mesh_axes=["data", "stage", "fsdp", "context", "expert"],
+        src_host_subgrid=[1, 1, 1, 4, 2],
+        dst_phys_mesh=[2, 8],
+        dst_mesh_axes=["x", "y"],
+        dst_host_subgrid=[1, 8],
+    )
+    parallel_sched = (
+        reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+            **parallel_kwargs,
+            parallel_worker_planning=True,
+        )
+    )
+
+    self.assertEqual(
+        parallel_sched.expected_block_count,
+        central_sched.expected_block_count,
+    )
+    self.assertEqual(
+        parallel_sched.dst_unit_counts, central_sched.dst_unit_counts
+    )
+    self.assertEqual(
+        parallel_sched.dst_unit_layer_counts,
+        central_sched.dst_unit_layer_counts,
+    )
+    self.assertEqual(
+        parallel_sched.dst_endpoint_counts,
+        central_sched.dst_endpoint_counts,
+    )
+    self.assertEqual(
+        parallel_sched.dst_endpoint_layer_counts,
+        central_sched.dst_endpoint_layer_counts,
+    )
+    for u in src_units:
+      ent = central_kwargs["entities"][u]
+      p_protos = ent.build_sender_push_schedule_protos(
+          parallel_sched.direct_schedules[u]
+      )
+      c_protos = ent.build_sender_push_schedule_protos(
+          central_sched.direct_schedules[u]
+      )
+      self.assertEqual(
+          {
+              k: p.SerializeToString(deterministic=True)
+              for k, p in p_protos.items()
+          },
+          {
+              k: p.SerializeToString(deterministic=True)
+              for k, p in c_protos.items()
+          },
+      )
+      for shard_idx in range(8):
+        self.assertEqual(
+            list(parallel_sched.computed_schedules[u][shard_idx]),
+            list(central_sched.computed_schedules[u][shard_idx]),
+        )
+
+  def test_parallel_worker_planning_via_env_vars(self):
+    """Verifies RAIDEN_PARALLEL_WORKER_PLANNING and RAIDEN_PLANNING_MODE env vars trigger parallel worker planning."""
+    src_units = [RaidenId("trainer", str(i), "weights", 0) for i in range(2)]
+    dst_units = [RaidenId("rollout_0", "0", "weights", 0)]
+    src_vars = _build_qwen3_397b_variables(
+        num_layers=1, src_fsdp=2, is_src=True
+    )
+    dst_vars = _build_qwen3_397b_variables(
+        num_layers=1, src_fsdp=2, is_src=False
+    )
+
+    for env_dict in (
+        {"RAIDEN_PARALLEL_WORKER_PLANNING": "1"},
+        {"RAIDEN_PLANNING_MODE": "parallel_worker"},
+    ):
+      with mock.patch.dict(os.environ, env_dict, clear=False):
+        with mock.patch.object(
+            reshard_planner.ReshardPlanner,
+            "compute_schedules_in_parallel_workers",
+            wraps=reshard_planner.ReshardPlanner.compute_schedules_in_parallel_workers,
+        ) as spy_parallel:
+          kwargs = self._build_planner_inputs(
+              src_vars_by_unit={u: src_vars for u in src_units},
+              dst_vars_by_unit={u: dst_vars for u in dst_units},
+              src_phys_mesh=[1, 1, 2, 4, 2],
+              src_mesh_axes=["data", "stage", "fsdp", "context", "expert"],
+              src_host_subgrid=[1, 1, 1, 4, 2],
+              dst_phys_mesh=[1, 8],
+              dst_mesh_axes=["x", "y"],
+              dst_host_subgrid=[1, 8],
+          )
+          sched = reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+              **kwargs
+          )
+          self.assertEqual(spy_parallel.call_count, 1)
+          self.assertLen(sched.computed_schedules, 2)
+
+  def test_offline_symbolic_plan_save_and_parallel_worker_load(self):
+    """Verifies Approach 1: offline symbolic schedule computation, serialization, parallel worker load, and late endpoint binding."""
+    src_units = [RaidenId("trainer", str(i), "weights", 0) for i in range(4)]
+    dst_units = [
+        RaidenId("rollout_0", "0", "weights", 0),
+        RaidenId("rollout_0", "1", "weights", 0),
+        RaidenId("rollout_1", "0", "weights", 0),
+        RaidenId("rollout_1", "1", "weights", 0),
+    ]
+    src_vars = _build_qwen3_397b_variables(
+        num_layers=4, src_fsdp=4, is_src=True
+    )
+    dst_vars = _build_qwen3_397b_variables(
+        num_layers=4, src_fsdp=4, is_src=False
+    )
+
+    online_kwargs = self._build_planner_inputs(
+        src_vars_by_unit={u: src_vars for u in src_units},
+        dst_vars_by_unit={u: dst_vars for u in dst_units},
+        src_phys_mesh=[1, 1, 4, 4, 2],
+        src_mesh_axes=["data", "stage", "fsdp", "context", "expert"],
+        src_host_subgrid=[1, 1, 1, 4, 2],
+        dst_phys_mesh=[2, 8],
+        dst_mesh_axes=["x", "y"],
+        dst_host_subgrid=[1, 8],
+    )
+    online_sched = (
+        reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+            **online_kwargs
+        )
+    )
+
+    # Compute offline symbolic schedule without any real IPs/ports
+    offline_kwargs = self._build_planner_inputs(
+        src_vars_by_unit={u: src_vars for u in src_units},
+        dst_vars_by_unit={u: dst_vars for u in dst_units},
+        src_phys_mesh=[1, 1, 4, 4, 2],
+        src_mesh_axes=["data", "stage", "fsdp", "context", "expert"],
+        src_host_subgrid=[1, 1, 1, 4, 2],
+        dst_phys_mesh=[2, 8],
+        dst_mesh_axes=["x", "y"],
+        dst_host_subgrid=[1, 8],
+    )
+    live_registered_shards = dict(offline_kwargs["registered_shards"])
+    for item in offline_kwargs["dst_metadata"]:
+      u = controller_types.raiden_id_from_proto(item.unit)
+      live_registered_shards[u] = list(item.shards)
+    live_worker_endpoints = dict(offline_kwargs["worker_endpoints"])
+    live_entities = dict(offline_kwargs["entities"])
+
+    # Strip live endpoints from offline_kwargs to prove offline computation
+    # needs no live IPs.
+    offline_kwargs["registered_shards"] = {
+        u: [f"0.0.0.0:{d}" for d in range(8)] for u in [*src_units, *dst_units]
+    }
+    offline_kwargs["worker_endpoints"] = {}
+    offline_kwargs["entities"] = {}
+
+    symbolic_sched = reshard_planner.ReshardPlanner.compute_offline_schedule(
+        **offline_kwargs
+    )
+    # Verify symbolic endpoints are present before binding
+    first_entry = symbolic_sched.direct_schedules[src_units[0]][0][0]
+    self.assertTrue(controller_types.is_symbolic_endpoint(first_entry[0]))
+
+    plan_dir = self.create_tempdir().full_path
+    saved_files = reshard_planner.ReshardPlanner.save_offline_plan(
+        symbolic_sched, plan_dir, src_units=src_units, dst_units=dst_units
+    )
+    self.assertIn("__schedule_bundle__", saved_files)
+    for u in src_units:
+      self.assertIn(controller_types.format_unit(u), saved_files)
+      self.assertTrue(
+          os.path.exists(saved_files[controller_types.format_unit(u)])
+      )
+
+    # 1. Parallel worker load + late endpoint binding of per-worker
+    # ControlRequest protobufs.
+    worker_reqs = (
+        reshard_planner.ReshardPlanner.load_offline_worker_plans_parallel(
+            plan_dir,
+            units=src_units,
+            registered_shards=live_registered_shards,
+            req_id="step_0_sync",
+            uuid=424242,
+        )
+    )
+    self.assertLen(worker_reqs, len(src_units))
+    for u in src_units:
+      req = worker_reqs[u]
+      self.assertEqual(req.start_transfer_request.req_id, "step_0_sync")
+      self.assertEqual(req.start_transfer_request.uuid, 424242)
+      ent = live_entities[u]
+      online_protos = ent.build_sender_push_schedule_protos(
+          online_sched.direct_schedules[u]
+      )
+      self.assertEqual(
+          {
+              k: p.SerializeToString(deterministic=True)
+              for k, p in (
+                  req.start_transfer_request.shard_push_schedules.items()
+              )
+          },
+          {
+              k: p.SerializeToString(deterministic=True)
+              for k, p in online_protos.items()
+          },
+      )
+
+    # 2. Full schedule load + late endpoint binding for controller
+    bound_sched = reshard_planner.ReshardPlanner.load_offline_schedule(
+        plan_dir,
+        registered_shards=live_registered_shards,
+        worker_endpoints=live_worker_endpoints,
+        entities=live_entities,
+    )
+    self.assertEqual(
+        bound_sched.expected_block_count, online_sched.expected_block_count
+    )
+    self.assertEqual(bound_sched.dst_unit_counts, online_sched.dst_unit_counts)
+    self.assertEqual(
+        bound_sched.dst_endpoint_counts, online_sched.dst_endpoint_counts
+    )
+    self.assertEqual(
+        bound_sched.dst_endpoint_layer_counts,
+        online_sched.dst_endpoint_layer_counts,
+    )
+    for u in src_units:
+      ent = live_entities[u]
+      bound_protos = ent.build_sender_push_schedule_protos(
+          bound_sched.direct_schedules[u]
+      )
+      online_protos = ent.build_sender_push_schedule_protos(
+          online_sched.direct_schedules[u]
+      )
+      self.assertEqual(
+          {
+              k: p.SerializeToString(deterministic=True)
+              for k, p in bound_protos.items()
+          },
+          {
+              k: p.SerializeToString(deterministic=True)
+              for k, p in online_protos.items()
+          },
+      )
+
+    # 3. Re-bind the exact same offline plan to a brand new set of runtime
+    # IPs/ports.
+    new_runtime_shards = {
+        u: [f"192.168.50.{idx + 1}:{15000 + d}" for d in range(8)]
+        for idx, u in enumerate([*src_units, *dst_units])
+    }
+    rebound_reqs = (
+        reshard_planner.ReshardPlanner.load_offline_worker_plans_parallel(
+            plan_dir,
+            units=src_units,
+            registered_shards=new_runtime_shards,
+        )
+    )
+    for u in src_units:
+      for (
+          _,
+          sched_proto,
+      ) in rebound_reqs[u].start_transfer_request.shard_push_schedules.items():
+        for entry in sched_proto.entries:
+          self.assertFalse(
+              controller_types.is_symbolic_endpoint(entry.dst_peer)
+          )
+          self.assertTrue(entry.dst_peer.startswith("192.168.50."))
 
 
 if __name__ == "__main__":

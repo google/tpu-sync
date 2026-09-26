@@ -54,6 +54,16 @@ _is_variable_spec_identical = controller_types.is_variable_spec_identical
 _proto_to_nd_slice = controller_types.proto_to_nd_slice
 _raiden_id_from_proto = controller_types.raiden_id_from_proto
 _raiden_id_to_proto = controller_types.raiden_id_to_proto
+SYMBOLIC_ENDPOINT_PREFIX = controller_types.SYMBOLIC_ENDPOINT_PREFIX
+make_symbolic_endpoint = controller_types.make_symbolic_endpoint
+make_symbolic_shards = controller_types.make_symbolic_shards
+is_symbolic_endpoint = controller_types.is_symbolic_endpoint
+parse_symbolic_endpoint = controller_types.parse_symbolic_endpoint
+resolve_symbolic_endpoint = controller_types.resolve_symbolic_endpoint
+bind_symbolic_endpoints_in_proto = (
+    controller_types.bind_symbolic_endpoints_in_proto
+)
+unit_filename_stem = controller_types.unit_filename_stem
 
 HostDescriptor = job_entity.HostDescriptor
 HostGroup = job_entity.HostGroup
@@ -115,6 +125,8 @@ class RaidenController:
       request_registry_ttl_s: float = 600.0,
       broadcast_k: Optional[int] = None,
       enable_plan_cache: bool = True,
+      parallel_worker_planning: Optional[bool] = None,
+      offline_plan_path: Optional[str] = None,
   ):
     """Initializes the RaidenController.
 
@@ -126,6 +138,13 @@ class RaidenController:
       broadcast_k: Fan-out factor K for tree-based broadcast transfers.
       enable_plan_cache: Whether to cache transfer planning and resharding
         schedules across transfer invocations with identical topologies.
+      parallel_worker_planning: If True, computes each source worker's slice of
+        the transfer schedule independently in parallel across worker units.
+        Defaults to RAIDEN_PARALLEL_WORKER_PLANNING or RAIDEN_PLANNING_MODE env
+        vars when None.
+      offline_plan_path: Optional path to a precomputed offline symbolic plan
+        directory or file. Defaults to RAIDEN_OFFLINE_PLAN_PATH env var when
+        None.
     """
     self.port = port
     self.broadcast_k = (
@@ -134,6 +153,22 @@ class RaidenController:
         else int(os.environ.get("RAIDEN_BROADCAST_K", "64"))
     )
     self.enable_plan_cache = enable_plan_cache
+    if parallel_worker_planning is None:
+      env_val = (
+          os.environ.get("RAIDEN_PARALLEL_WORKER_PLANNING", "").strip().lower()
+      )
+      mode_val = os.environ.get("RAIDEN_PLANNING_MODE", "").strip().lower()
+      parallel_worker_planning = env_val in (
+          "1",
+          "true",
+          "yes",
+      ) or mode_val in ("parallel_worker", "parallel_workers", "decentralized")
+    self.parallel_worker_planning = bool(parallel_worker_planning)
+    self.offline_plan_path = (
+        offline_plan_path
+        if offline_plan_path is not None
+        else (os.environ.get("RAIDEN_OFFLINE_PLAN_PATH", "").strip() or None)
+    )
     self._plan_cache: dict[Any, _CachedTransferSchedule] = {}
     self._active_transfers: dict[str, TransferPlan] = {}
     self._active_tasks: dict[str, RaidenFuture] = {}
@@ -657,6 +692,8 @@ class RaidenController:
       skip_tiling: Optional[dict[int, bool]] = None,
       dst_controller_address: Optional[str] = None,
       src_controller_address: Optional[str] = None,
+      parallel_worker_planning: Optional[bool] = None,
+      offline_plan_path: Optional[str] = None,
   ) -> _CachedTransferSchedule:
     """Precomputes and caches transfer schedule outside of the critical path."""
     if group_size <= 0:
@@ -681,6 +718,8 @@ class RaidenController:
         skip_tiling=skip_tiling,
         req_id="warmup",
         uuid=str(random.randint(1, 2**63 - 1)),
+        parallel_worker_planning=parallel_worker_planning,
+        offline_plan_path=offline_plan_path,
     )
     raw_schedules = schedule.direct_schedules or schedule.computed_schedules
     if raw_schedules:
@@ -706,6 +745,9 @@ class RaidenController:
       ] = None,
       req_id: str = "warmup",
       uuid: Any = "",
+      target_src_units: Optional[Sequence[RaidenId]] = None,
+      parallel_worker_planning: Optional[bool] = None,
+      offline_plan_path: Optional[str] = None,
   ) -> _CachedTransferSchedule:
     """Computes transfer schedule math via ReshardPlanner."""
     t_start = time.perf_counter()
@@ -722,12 +764,95 @@ class RaidenController:
       dst_metadata = self._get_local_metadata(dst_units)
 
     worker_endpoints = self.get_entity_rpc_addresses()
+    effective_offline_path = (
+        offline_plan_path
+        if offline_plan_path is not None
+        else self.offline_plan_path
+    )
+    effective_parallel = (
+        parallel_worker_planning
+        if parallel_worker_planning is not None
+        else self.parallel_worker_planning
+    )
 
-    schedule = self._planner.compute_transfer_schedule_from_metadata(
+    if effective_offline_path and not shard_push_schedules:
+      live_shards = dict(self._registered_shards)
+      for item in dst_metadata:
+        live_shards[_raiden_id_from_proto(item.unit)] = list(item.shards)
+      schedule = self._planner.load_offline_schedule(
+          effective_offline_path,
+          registered_shards=live_shards,
+          worker_endpoints=worker_endpoints,
+          entities=self._entities,
+      )
+    else:
+      schedule = self._planner.compute_transfer_schedule_from_metadata(
+          src_units=src_units,
+          dst_units=dst_units,
+          dst_metadata=dst_metadata,
+          entities=self._entities,
+          registered_variables=self._registered_variables,
+          registered_global_shapes=self._registered_global_shapes,
+          registered_mesh_shapes=self._registered_mesh_shapes,
+          registered_mesh_axes=self._registered_mesh_axes,
+          registered_host_subgrids=self._registered_host_subgrids,
+          registered_layouts=self._registered_layouts,
+          registered_itemsizes=self._registered_itemsizes,
+          registered_shards=self._registered_shards,
+          computed_phys_meshes=self._computed_phys_meshes,
+          worker_endpoints=worker_endpoints,
+          broadcast_k=self.broadcast_k,
+          lock=self._lock,
+          group_size=group_size,
+          skip_tiling=skip_tiling,
+          shard_push_schedules=shard_push_schedules,
+          req_id=req_id,
+          uuid=uuid,
+          target_src_units=target_src_units,
+          parallel_worker_planning=effective_parallel,
+      )
+    common.record_histogram(
+        "weight_sync_schedule_generation_time_ms",
+        (time.perf_counter() - t_start) * 1000.0,
+    )
+    return schedule
+
+  def save_offline_plan(
+      self,
+      path: str,
+      src_units: list[RaidenId],
+      dst_units: list[RaidenId],
+      group_size: int = 1,
+      skip_tiling: Optional[dict[int, bool]] = None,
+  ) -> _CachedTransferSchedule:
+    """Computes an offline symbolic resharding plan and saves it to `path`."""
+    all_units = list(dict.fromkeys([*src_units, *dst_units]))
+    symbolic_shards: dict[RaidenId, list[str]] = {}
+    with self._lock:
+      for u in all_units:
+        num_shards = len(self._registered_shards.get(u, ()))
+        if num_shards <= 0:
+          subgrid = self._registered_host_subgrids.get(
+              u
+          ) or self._registered_mesh_shapes.get(u)
+          if subgrid:
+            num_shards = 1
+            for d in subgrid:
+              num_shards *= d
+          else:
+            num_shards = 1
+        symbolic_shards[u] = make_symbolic_shards(u, num_shards)
+      dst_metadata = []
+      for u in dst_units:
+        meta = self._metadata_proto_locked(u)
+        del meta.shards[:]
+        meta.shards.extend(symbolic_shards[u])
+        dst_metadata.append(meta)
+
+    schedule = self._planner.compute_offline_schedule(
         src_units=src_units,
         dst_units=dst_units,
         dst_metadata=dst_metadata,
-        entities=self._entities,
         registered_variables=self._registered_variables,
         registered_global_shapes=self._registered_global_shapes,
         registered_mesh_shapes=self._registered_mesh_shapes,
@@ -735,22 +860,74 @@ class RaidenController:
         registered_host_subgrids=self._registered_host_subgrids,
         registered_layouts=self._registered_layouts,
         registered_itemsizes=self._registered_itemsizes,
-        registered_shards=self._registered_shards,
+        registered_shards=symbolic_shards,
         computed_phys_meshes=self._computed_phys_meshes,
-        worker_endpoints=worker_endpoints,
         broadcast_k=self.broadcast_k,
         lock=self._lock,
         group_size=group_size,
         skip_tiling=skip_tiling,
-        shard_push_schedules=shard_push_schedules,
+    )
+    self._planner.save_offline_plan(schedule, path)
+    return schedule
+
+  def load_offline_schedule(
+      self,
+      path: str,
+      bind_registered_endpoints: bool = True,
+  ) -> _CachedTransferSchedule:
+    """Loads an offline schedule from `path` and optionally binds registered endpoints."""
+    return self._planner.load_offline_schedule(
+        path=path,
+        registered_shards=(
+            self._registered_shards if bind_registered_endpoints else None
+        ),
+        worker_endpoints=(
+            self.get_entity_rpc_addresses()
+            if bind_registered_endpoints
+            else None
+        ),
+        entities=self._entities if bind_registered_endpoints else None,
+    )
+
+  def load_offline_worker_plan(
+      self,
+      path: str,
+      unit: RaidenId,
+      bind_registered_endpoints: bool = True,
+      req_id: Optional[str] = None,
+      uuid: Optional[int] = None,
+  ) -> Any:
+    """Loads a single worker's offline `ControlRequest` plan and binds live endpoints."""
+    return self._planner.load_offline_worker_plan(
+        path=path,
+        unit=unit,
+        registered_shards=(
+            self._registered_shards if bind_registered_endpoints else None
+        ),
         req_id=req_id,
         uuid=uuid,
     )
-    common.record_histogram(
-        "weight_sync_schedule_generation_time_ms",
-        (time.perf_counter() - t_start) * 1000.0,
+
+  def load_offline_worker_plans_parallel(
+      self,
+      path: str,
+      units: Sequence[RaidenId],
+      bind_registered_endpoints: bool = True,
+      req_id: Optional[str] = None,
+      uuid: Optional[int] = None,
+      max_workers: Optional[int] = None,
+  ) -> dict[RaidenId, Any]:
+    """Loads per-worker offline `ControlRequest` plans in parallel and binds endpoints."""
+    return self._planner.load_offline_worker_plans_parallel(
+        path=path,
+        units=units,
+        registered_shards=(
+            self._registered_shards if bind_registered_endpoints else None
+        ),
+        req_id=req_id,
+        uuid=uuid,
+        max_workers=max_workers,
     )
-    return schedule
 
   def _metadata_proto_locked(self, unit: RaidenId) -> Any:
     """Builds an owned registration proto while `_lock` is held."""
@@ -938,6 +1115,8 @@ class RaidenController:
       skip_tiling: Optional[dict[int, bool]] = None,
       group_size: int = 1,
       use_cached_plan: bool = True,
+      parallel_worker_planning: Optional[bool] = None,
+      offline_plan_path: Optional[str] = None,
   ) -> RaidenFuture:
     """Generates a transfer plan for the requested entities and dispatches it."""
     if group_size <= 0:
@@ -1170,6 +1349,8 @@ class RaidenController:
                 shard_push_schedules=shard_push_schedules,
                 req_id=req_id,
                 uuid=uuid,
+                parallel_worker_planning=parallel_worker_planning,
+                offline_plan_path=offline_plan_path,
             )
             if (
                 self.enable_plan_cache

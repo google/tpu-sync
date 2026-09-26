@@ -18,7 +18,7 @@ from collections import abc
 import dataclasses
 import enum
 import threading
-from typing import Any, Callable, Mapping, Optional, Protocol
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from tpu_sync.api.common import RaidenId
 from tpu_sync.rpc import raiden_service_pb2
@@ -507,6 +507,130 @@ def _entity_key_from_unit(unit: RaidenId) -> RaidenId:
   return RaidenId(job_name=job_name)
 
 
+SYMBOLIC_ENDPOINT_PREFIX = "raiden_symbolic://"
+
+
+def _make_symbolic_endpoint(unit: RaidenId, shard_idx: int) -> str:
+  """Builds a deterministic symbolic endpoint string for an offline shard."""
+  return (
+      f"{SYMBOLIC_ENDPOINT_PREFIX}{unit.job_name}/{unit.job_replica_id}/"
+      f"{unit.data_name}/{unit.data_replica_idx}:{int(shard_idx)}"
+  )
+
+
+def _make_symbolic_shards(unit: RaidenId, num_shards: int) -> list[str]:
+  """Builds a list of symbolic shard endpoints for `unit`."""
+  return [_make_symbolic_endpoint(unit, i) for i in range(max(1, num_shards))]
+
+
+def _is_symbolic_endpoint(endpoint: str) -> bool:
+  """Returns True if `endpoint` is an offline symbolic shard placeholder."""
+  return isinstance(endpoint, str) and endpoint.startswith(
+      SYMBOLIC_ENDPOINT_PREFIX
+  )
+
+
+def _parse_symbolic_endpoint(endpoint: str) -> Optional[tuple[RaidenId, int]]:
+  """Parses a symbolic endpoint into (RaidenId, shard_idx), or None if not symbolic."""
+  if not _is_symbolic_endpoint(endpoint):
+    return None
+  body = endpoint[len(SYMBOLIC_ENDPOINT_PREFIX) :]
+  if ":" not in body:
+    return None
+  unit_part, shard_str = body.rsplit(":", 1)
+  parts = unit_part.split("/")
+  if len(parts) != 4:
+    return None
+  try:
+    shard_idx = int(shard_str)
+    data_rep_idx = int(parts[3])
+  except ValueError:
+    return None
+  return (
+      RaidenId(
+          job_name=parts[0],
+          job_replica_id=parts[1],
+          data_name=parts[2],
+          data_replica_idx=data_rep_idx,
+      ),
+      shard_idx,
+  )
+
+
+def _resolve_symbolic_endpoint(
+    endpoint: str,
+    live_data_addresses: Mapping[RaidenId, Sequence[str]],
+) -> str:
+  """Resolves a symbolic endpoint string against `live_data_addresses`."""
+  parsed = _parse_symbolic_endpoint(endpoint)
+  if parsed is None:
+    return endpoint
+  unit, shard_idx = parsed
+  shards = live_data_addresses.get(unit)
+  if not shards:
+    return endpoint
+  if 0 <= shard_idx < len(shards):
+    return shards[shard_idx]
+  return shards[0]
+
+
+def _bind_symbolic_endpoints_in_proto(
+    req: Any,
+    live_data_addresses: Mapping[RaidenId, Sequence[str]],
+) -> Any:
+  """Binds symbolic endpoints in a ControlRequest or StartTransferRequest proto in-place."""
+  if not live_data_addresses:
+    return req
+  if hasattr(req, "peers") and req.peers:
+    resolved_peers = [
+        _resolve_symbolic_endpoint(p, live_data_addresses) for p in req.peers
+    ]
+    del req.peers[:]
+    req.peers.extend(resolved_peers)
+
+  start_req = (
+      req.start_transfer_request
+      if hasattr(req, "start_transfer_request")
+      else req
+  )
+  if hasattr(start_req, "shard_push_schedules"):
+    for _, schedule_proto in start_req.shard_push_schedules.items():
+      for entry in schedule_proto.entries:
+        if entry.dst_peers:
+          resolved_list = []
+          for p in entry.dst_peers:
+            rp = _resolve_symbolic_endpoint(p, live_data_addresses)
+            if rp not in resolved_list:
+              resolved_list.append(rp)
+          del entry.dst_peers[:]
+          entry.dst_peers.extend(resolved_list)
+          if resolved_list:
+            entry.dst_peer = resolved_list[0]
+        elif entry.dst_peer:
+          entry.dst_peer = _resolve_symbolic_endpoint(
+              entry.dst_peer, live_data_addresses
+          )
+  return req
+
+
+def _unit_filename_stem(unit: RaidenId) -> str:
+  """Returns a filesystem-safe filename stem for a work unit's offline plan."""
+
+  def _clean(s: str) -> str:
+    return (
+        str(s)
+        .replace("/", "_")
+        .replace(":", "_")
+        .replace("\\", "_")
+        .replace(" ", "_")
+    )
+
+  return (
+      f"plan_{_clean(unit.job_name)}_{_clean(unit.job_replica_id)}_"
+      f"{_clean(unit.data_name)}_{int(unit.data_replica_idx)}"
+  )
+
+
 VariableMetadata = _VariableMetadata
 CachedTransferSchedule = _CachedTransferSchedule
 PlanReferencedShardSchedule = _PlanReferencedShardSchedule
@@ -520,3 +644,10 @@ proto_to_nd_slice = _proto_to_nd_slice
 coerce_pool_spec_proto = _coerce_pool_spec_proto
 format_unit = _format_unit
 format_units = _format_units
+make_symbolic_endpoint = _make_symbolic_endpoint
+make_symbolic_shards = _make_symbolic_shards
+is_symbolic_endpoint = _is_symbolic_endpoint
+parse_symbolic_endpoint = _parse_symbolic_endpoint
+resolve_symbolic_endpoint = _resolve_symbolic_endpoint
+bind_symbolic_endpoints_in_proto = _bind_symbolic_endpoints_in_proto
+unit_filename_stem = _unit_filename_stem

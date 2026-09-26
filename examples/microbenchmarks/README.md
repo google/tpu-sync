@@ -11,6 +11,7 @@ part of the transfer path they isolate:
 | `torch_dma_kv_cache_benchmark.py` | Raw DMA on ONE host: D2H and H2D, against PyTorch baselines | yes | PyTorch |
 | `jax_d2d_read_benchmark_runner.py` | Cross-node device-to-device pull: D2H + H2H + H2D end to end | yes, on both nodes | JAX |
 | `h2h_benchmark_runner.cc` | The middle hop only: host memory to host memory across the NIC | no | None (C++) |
+| `torch_d2d_read_benchmark_runner.py` | Cross-node device-to-device pull: D2H + H2H + H2D end to end | yes, on both nodes | PyTorch |
 
 Pick by what you are trying to localise. The C++ H2H runner gives the wire
 ceiling; the D2D read runner shows what the device path delivers against that

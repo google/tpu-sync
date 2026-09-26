@@ -71,11 +71,36 @@ using ::testing::UnorderedElementsAre;
 constexpr int kPoolSize = 4;
 constexpr double kTimeoutS = 0.5;
 
-class TestManager : public KVCacheManagerWithTransfer {
+// Selects the control-plane backend for managers built while it is in scope.
+class ScopedControlPlaneBackend {
+ public:
+  explicit ScopedControlPlaneBackend(const char* backend,
+                                     bool overwrite = true) {
+    if (const char* old = std::getenv(kVar)) old_ = old;
+    if (overwrite || !old_.has_value()) {
+      setenv(kVar, backend, /*overwrite=*/1);
+    }
+  }
+  ~ScopedControlPlaneBackend() {
+    if (old_.has_value()) {
+      setenv(kVar, old_->c_str(), /*overwrite=*/1);
+    } else {
+      unsetenv(kVar);
+    }
+  }
+
+ private:
+  static constexpr char kVar[] = "TPU_RAIDEN_CONTROL_PLANE_BACKEND";
+  std::optional<std::string> old_;
+};
+
+class TestManager : private ScopedControlPlaneBackend,
+                    public KVCacheManagerWithTransfer {
  public:
   explicit TestManager(double timeout_s = kTimeoutS, size_t num_layers = 0,
                        int local_control_port = 0)
-      : KVCacheManagerWithTransfer(
+      : ScopedControlPlaneBackend("tcp", /*overwrite=*/false),
+        KVCacheManagerWithTransfer(
             num_layers, /*num_shards=*/1, /*slice_byte_size=*/128,
             /*local_port=*/std::nullopt,
             /*host_blocks_to_allocate=*/std::nullopt,
@@ -826,26 +851,6 @@ TEST(ControlHandshakeTest, ExpiredReceiveKeepsStagingUntilHandshakeEnds) {
 // healthy peer are expected to start in milliseconds; a worker stuck on the
 // sick peer holds on for kStarvationTimeoutS.
 constexpr double kStarvationTimeoutS = 4.0;
-
-// Selects the control-plane backend for managers built while it is in scope.
-class ScopedControlPlaneBackend {
- public:
-  explicit ScopedControlPlaneBackend(const char* backend) {
-    if (const char* old = std::getenv(kVar)) old_ = old;
-    setenv(kVar, backend, /*overwrite=*/1);
-  }
-  ~ScopedControlPlaneBackend() {
-    if (old_.has_value()) {
-      setenv(kVar, old_->c_str(), /*overwrite=*/1);
-    } else {
-      unsetenv(kVar);
-    }
-  }
-
- private:
-  static constexpr char kVar[] = "TPU_RAIDEN_CONTROL_PLANE_BACKEND";
-  std::optional<std::string> old_;
-};
 
 // The gRPC counterpart of SilentProducer: a real gRPC control server whose
 // PullStream handler holds every call until DropClients(), then rejects it.

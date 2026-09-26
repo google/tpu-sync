@@ -435,12 +435,12 @@ TEST(ResolveControlPlaneBackendTypeTest, EnvVarAndOverridePrecedence) {
   unsetenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND");
   unsetenv("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE");
 
-  // Default is kTcp
-  EXPECT_EQ(ResolveControlPlaneBackendType(), ControlPlaneBackendType::kTcp);
+  // Default is kGrpc
+  EXPECT_EQ(ResolveControlPlaneBackendType(), ControlPlaneBackendType::kGrpc);
 
   // Explicit override takes precedence
-  EXPECT_EQ(ResolveControlPlaneBackendType(ControlPlaneBackendType::kGrpc),
-            ControlPlaneBackendType::kGrpc);
+  EXPECT_EQ(ResolveControlPlaneBackendType(ControlPlaneBackendType::kTcp),
+            ControlPlaneBackendType::kTcp);
 
   // TPU_RAIDEN_CONTROL_PLANE_BACKEND=grpc
   setenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "grpc", 1);

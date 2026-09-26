@@ -39,13 +39,13 @@ ControlPlaneBackendType ResolveControlPlaneBackendType(
     if (val == "grpc") return ControlPlaneBackendType::kGrpc;
     if (val == "tcp") return ControlPlaneBackendType::kTcp;
     LOG(WARNING) << "Unknown TPU_RAIDEN_CONTROL_PLANE_BACKEND='" << env_backend
-                 << "', falling back to TCP.";
+                 << "', falling back to gRPC.";
   }
   if (const char* env_flag = std::getenv("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE")) {
     std::string val = absl::AsciiStrToLower(env_flag);
     if (val == "1" || val == "true") return ControlPlaneBackendType::kGrpc;
   }
-  return ControlPlaneBackendType::kTcp;
+  return ControlPlaneBackendType::kGrpc;
 }
 
 std::unique_ptr<ControlPlaneBackend> CreateControlPlaneBackend(

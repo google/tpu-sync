@@ -373,9 +373,15 @@ WeightSynchronizerBase::~WeightSynchronizerBase() {
   push_pool_.reset();
   for (auto& sp : tiled_scratchpads_) {
     if (sp) {
-      absl::MutexLock lock(sp->mu);
-      if (sp->in_flight_future.IsValid()) {
-        (void)sp->in_flight_future.Await();
+      for (auto& slot : sp->slots) {
+        xla::Future<> in_flight;
+        {
+          absl::MutexLock state_lock(sp->state_mu);
+          in_flight = slot.in_flight_future;
+        }
+        if (in_flight.IsValid()) {
+          (void)in_flight.Await();
+        }
       }
     }
   }
@@ -406,42 +412,93 @@ size_t WeightSynchronizerBase::GetPipelineGroupSize() const {
   return 1;
 }
 
-absl::StatusOr<uint8_t*> WeightSynchronizerBase::AcquireTiledScratchpadLocked(
-    ShardScratchpad& sp, size_t required_bytes, const xla::PjRtDevice* device) {
-  if (sp.in_flight_future.IsValid()) {
-    TF_RETURN_IF_ERROR(sp.in_flight_future.Await());
+size_t WeightSynchronizerBase::SelectScratchpadSlotIndex(ShardScratchpad& sp) {
+  absl::MutexLock state_lock(sp.state_mu);
+  const size_t start = sp.next_slot % kNumScratchpadSlots;
+  // 1. Prefer a completely idle slot (no active CPU users and no pending DMA).
+  for (size_t s = 0; s < kNumScratchpadSlots; ++s) {
+    ScratchpadSlot& slot = sp.slots[s];
+    if (slot.active_users == 0 &&
+        (!slot.in_flight_future.IsValid() || slot.in_flight_future.IsReady())) {
+      slot.active_users++;
+      sp.next_slot = (s + 1) % kNumScratchpadSlots;
+      return s;
+    }
   }
-  if (sp.capacity < required_bytes) {
-    const size_t old_capacity = sp.capacity;
-    sp.ptr = nullptr;
-    sp.owner.reset();
-    sp.owned_buffer.reset();
+  // 2. Prefer a slot with no active CPU users (only an in-flight DMA),
+  // rotating via `next_slot` so the caller awaits the oldest in-flight DMA
+  // while the newer DMA continues running in parallel on the other slot.
+  for (size_t s = 0; s < kNumScratchpadSlots; ++s) {
+    size_t idx = (start + s) % kNumScratchpadSlots;
+    ScratchpadSlot& slot = sp.slots[idx];
+    if (slot.active_users == 0) {
+      slot.active_users++;
+      sp.next_slot = (idx + 1) % kNumScratchpadSlots;
+      return idx;
+    }
+  }
+  // 3. All slots have active CPU users; pick the slot with the fewest queued
+  // CPU users (breaking ties via `next_slot`).
+  size_t best_idx = start;
+  for (size_t s = 1; s < kNumScratchpadSlots; ++s) {
+    size_t idx = (start + s) % kNumScratchpadSlots;
+    if (sp.slots[idx].active_users < sp.slots[best_idx].active_users) {
+      best_idx = idx;
+    }
+  }
+  sp.slots[best_idx].active_users++;
+  sp.next_slot = (best_idx + 1) % kNumScratchpadSlots;
+  return best_idx;
+}
+
+size_t WeightSynchronizerBase::MaxActiveTiledBytesForShard(
+    size_t shard_idx, const std::vector<bool>& active_skip,
+    size_t fallback_bytes) const {
+  size_t max_bytes = fallback_bytes;
+  for (size_t l = 0; l < layers_.size(); ++l) {
+    bool l_skip = l < active_skip.size() && active_skip[l];
+    if (!l_skip && shard_idx < layers_[l].shards.size()) {
+      max_bytes = std::max(max_bytes, layers_[l].shards[shard_idx].tiled_size);
+    }
+  }
+  return max_bytes;
+}
+
+absl::StatusOr<uint8_t*> WeightSynchronizerBase::AcquireTiledScratchpadLocked(
+    ScratchpadSlot& slot, size_t required_bytes, size_t target_capacity,
+    const xla::PjRtDevice* device) {
+  if (slot.capacity < required_bytes) {
+    const size_t alloc_bytes = std::max(required_bytes, target_capacity);
+    const size_t old_capacity = slot.capacity;
+    slot.ptr = nullptr;
+    slot.owner.reset();
+    slot.owned_buffer.reset();
     if (host_allocator_ && device) {
       auto alloc =
-          host_allocator_->AllocateDmaMappedForDevice(required_bytes, device);
+          host_allocator_->AllocateDmaMappedForDevice(alloc_bytes, device);
       if (alloc.ok()) {
-        sp.ptr = (*alloc).ptr;
-        sp.owner = (*alloc).owner;
-        sp.capacity = required_bytes;
+        slot.ptr = alloc->ptr;
+        slot.owner = alloc->owner;
+        slot.capacity = alloc_bytes;
       }
     }
-    if (sp.ptr == nullptr) {
+    if (slot.ptr == nullptr) {
       void* raw_ptr = nullptr;
-      if (posix_memalign(&raw_ptr, 64, required_bytes) != 0) {
+      if (posix_memalign(&raw_ptr, 64, alloc_bytes) != 0) {
         return absl::ResourceExhaustedError(
             "Failed to allocate host tiled scratch buffer");
       }
-      std::memset(raw_ptr, 0, required_bytes);
-      sp.owned_buffer = std::unique_ptr<uint8_t[], void (*)(void*)>(
+      std::memset(raw_ptr, 0, alloc_bytes);
+      slot.owned_buffer = std::unique_ptr<uint8_t[], void (*)(void*)>(
           static_cast<uint8_t*>(raw_ptr), [](void* p) { free(p); });
-      sp.ptr = sp.owned_buffer.get();
-      sp.capacity = required_bytes;
+      slot.ptr = slot.owned_buffer.get();
+      slot.capacity = alloc_bytes;
     }
-    if (required_bytes > old_capacity) {
-      UpdateAllocatedOccupancyMetric(required_bytes - old_capacity);
+    if (alloc_bytes > old_capacity) {
+      UpdateAllocatedOccupancyMetric(alloc_bytes - old_capacity);
     }
   }
-  return sp.ptr;
+  return slot.ptr;
 }
 
 void WeightSynchronizerBase::UpdateAllocatedOccupancyMetric(size_t delta) {
@@ -513,11 +570,32 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
       if (i >= tiled_scratchpads_.size() || !tiled_scratchpads_[i]) {
         return absl::InternalError("Shard index out of range for scratchpad");
       }
-      auto& sp = *tiled_scratchpads_[i];
-      absl::MutexLock lock(sp.mu);
+      ShardScratchpad& sp = *tiled_scratchpads_[i];
+      const size_t slot_idx = SelectScratchpadSlotIndex(sp);
+      ScratchpadSlot& slot = sp.slots[slot_idx];
+      absl::Cleanup release_slot = [&sp, &slot]() {
+        absl::MutexLock state_lock(sp.state_mu);
+        slot.active_users--;
+      };
+      absl::MutexLock lock(slot.mu);
+      xla::Future<> prev_in_flight;
+      {
+        absl::MutexLock state_lock(sp.state_mu);
+        prev_in_flight = slot.in_flight_future;
+      }
+      if (prev_in_flight.IsValid()) {
+        if (absl::Status s = prev_in_flight.Await(); !s.ok()) {
+          return s;
+        }
+      }
+      const size_t target_capacity =
+          (slot.capacity < physical_bytes)
+              ? MaxActiveTiledBytesForShard(i, active_skip, physical_bytes)
+              : physical_bytes;
       TF_ASSIGN_OR_RETURN(
           uint8_t* tiled_buffer_ptr,
-          AcquireTiledScratchpadLocked(sp, physical_bytes, shard_hold.device));
+          AcquireTiledScratchpadLocked(slot, physical_bytes, target_capacity,
+                                       shard_hold.device));
       if (tiled_buffer_ptr == nullptr) {
         return absl::InternalError(
             "Tiled buffer pointer is null for tiled shape");
@@ -542,7 +620,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2dLayer(
 
       xla::Future<> future =
           shard_hold.CopyRawHostToDevice(tiled_buffer_ptr, 0, physical_bytes);
-      sp.in_flight_future = future;
+      {
+        absl::MutexLock state_lock(sp.state_mu);
+        slot.in_flight_future = future;
+      }
       shard_futures.push_back(future);
     } else {
       xla::Future<> future = shard_hold.CopyRawHostToDevice(
@@ -665,11 +746,32 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
       if (i >= tiled_scratchpads_.size() || !tiled_scratchpads_[i]) {
         return absl::InternalError("Shard index out of range for scratchpad");
       }
-      auto& sp = *tiled_scratchpads_[i];
-      absl::MutexLock lock(sp.mu);
+      ShardScratchpad& sp = *tiled_scratchpads_[i];
+      const size_t slot_idx = SelectScratchpadSlotIndex(sp);
+      ScratchpadSlot& slot = sp.slots[slot_idx];
+      absl::Cleanup release_slot = [&sp, &slot]() {
+        absl::MutexLock state_lock(sp.state_mu);
+        slot.active_users--;
+      };
+      absl::MutexLock lock(slot.mu);
+      xla::Future<> prev_in_flight;
+      {
+        absl::MutexLock state_lock(sp.state_mu);
+        prev_in_flight = slot.in_flight_future;
+      }
+      if (prev_in_flight.IsValid()) {
+        if (absl::Status s = prev_in_flight.Await(); !s.ok()) {
+          return s;
+        }
+      }
+      const size_t target_capacity =
+          (slot.capacity < physical_bytes)
+              ? MaxActiveTiledBytesForShard(i, active_skip, physical_bytes)
+              : physical_bytes;
       TF_ASSIGN_OR_RETURN(
           uint8_t* tiled_buffer_ptr,
-          AcquireTiledScratchpadLocked(sp, physical_bytes, shard_hold.device));
+          AcquireTiledScratchpadLocked(slot, physical_bytes, target_capacity,
+                                       shard_hold.device));
       if (tiled_buffer_ptr == nullptr) {
         return absl::InternalError(
             "Tiled buffer pointer is null for tiled shape");
@@ -707,7 +809,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2hLayer(
             return status;
           });
 
-      sp.in_flight_future = detile_future;
+      {
+        absl::MutexLock state_lock(sp.state_mu);
+        slot.in_flight_future = detile_future;
+      }
       shard_futures.push_back(std::move(detile_future));
     } else {
       xla::Future<> future = shard_hold.CopyRawDeviceToHost(

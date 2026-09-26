@@ -1440,6 +1440,188 @@ TEST_F(WeightSynchronizerTest, LazyTiledBufferAllocationSavesMemory) {
   EXPECT_EQ(src_ws.ws->GetTiledPointer(0, 0), src_ws.ws->GetTiledPointer(1, 0));
 }
 
+TEST_F(WeightSynchronizerTest,
+       MaxActiveTiledBytesPreSizesScratchpadSlotWithoutReallocating) {
+  auto client_res = xla::GetXlaPjrtCpuClient(xla::CpuClientOptions());
+  ASSERT_OK(client_res);
+  auto client = *std::move(client_res);
+
+  auto memory_space_res =
+      client->addressable_devices()[0]->default_memory_space();
+  ASSERT_OK(memory_space_res);
+  xla::PjRtMemorySpace* memory_space = *memory_space_res;
+
+  xla::Layout layout = xla::LayoutUtil::MakeLayout({1, 0}, {xla::Tile({4, 4})});
+
+  auto create_multi_layer_ws = [&]() {
+    struct MultiLayerWS {
+      std::vector<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffers;
+      std::vector<std::vector<uint8_t>> placeholders;
+      std::unique_ptr<WeightSynchronizerBase> ws;
+    } result;
+
+    const std::vector<std::vector<int64_t>> layer_dims = {{8, 8}, {16, 16}};
+    result.placeholders.resize(layer_dims.size());
+    std::vector<std::vector<raiden::RaidenBufferHandle>> handles;
+
+    for (size_t l = 0; l < layer_dims.size(); ++l) {
+      xla::Shape shape =
+          xla::ShapeUtil::MakeShape(xla::PrimitiveType::F32, layer_dims[l]);
+      size_t byte_size = xla::ShapeUtil::ByteSizeOf(shape);
+      result.placeholders[l].resize(byte_size, 0);
+      auto buf = client->BufferFromHostBuffer(
+          result.placeholders[l].data(), xla::PrimitiveType::F32, layer_dims[l],
+          /*byte_strides=*/std::nullopt,
+          xla::PjRtClient::HostBufferSemantics::
+              kImmutableUntilTransferCompletes,
+          /*on_done_with_host_buffer=*/nullptr, memory_space,
+          /*device_layout=*/nullptr);
+      EXPECT_OK(buf);
+      auto handle = raiden::RaidenBufferHandle::Acquire(buf->get());
+      EXPECT_OK(handle);
+      handle->shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+          xla::PrimitiveType::F32, layer_dims[l], layout.minor_to_major(),
+          layout.tiles());
+      handles.push_back({*handle});
+      result.pjrt_buffers.push_back(*std::move(buf));
+    }
+    result.ws =
+        std::make_unique<WeightSynchronizerBase>(handles, /*local_port=*/0);
+    return result;
+  };
+
+  // Case 1: When the larger layer (layer 1, 1024B) has skip_tiling=true,
+  // H2dLayer(0) only allocates the smaller layer's size (256B).
+  {
+    auto multi_ws = create_multi_layer_ws();
+    tpu_sync::rpc::StartTransferRequest req;
+    (*req.mutable_skip_tiling())[0] = false;
+    (*req.mutable_skip_tiling())[1] = true;
+    multi_ws.ws->StoreSkipTiling(2001, req);
+
+    auto h2d_l0 = multi_ws.ws->H2dLayer(0, 2001);
+    ASSERT_OK(h2d_l0);
+    ASSERT_OK(h2d_l0->Await());
+    EXPECT_EQ(multi_ws.ws->GetTiledScratchpadCapacity(0, 0), 256);
+  }
+
+  // Case 2: When both layers require tiling, H2dLayer(0) pre-sizes slot 0 to
+  // the maximum active tiled size across the shard (1024B), so H2dLayer(1)
+  // reuses the same allocation without reallocating.
+  {
+    auto multi_ws = create_multi_layer_ws();
+    auto h2d_l0 = multi_ws.ws->H2dLayer(0, 2002);
+    ASSERT_OK(h2d_l0);
+    ASSERT_OK(h2d_l0->Await());
+
+    const uint8_t* ptr_after_l0 = multi_ws.ws->GetTiledPointer(0, 0, 0);
+    ASSERT_NE(ptr_after_l0, nullptr);
+    EXPECT_EQ(multi_ws.ws->GetTiledScratchpadCapacity(0, 0), 1024);
+
+    auto h2d_l1 = multi_ws.ws->H2dLayer(1, 2002);
+    ASSERT_OK(h2d_l1);
+    ASSERT_OK(h2d_l1->Await());
+
+    EXPECT_EQ(multi_ws.ws->GetTiledPointer(0, 0, 0), ptr_after_l0);
+    EXPECT_EQ(multi_ws.ws->GetTiledScratchpadCapacity(0, 0), 1024);
+  }
+}
+
+TEST_F(WeightSynchronizerTest,
+       ConcurrentTiledH2dUsesDoubleBufferedScratchpadSlots) {
+  auto client_res = xla::GetXlaPjrtCpuClient(xla::CpuClientOptions());
+  ASSERT_OK(client_res);
+  auto client = *std::move(client_res);
+
+  auto memory_space_res =
+      client->addressable_devices()[0]->default_memory_space();
+  ASSERT_OK(memory_space_res);
+  xla::PjRtMemorySpace* memory_space = *memory_space_res;
+
+  constexpr size_t kNumLayers = 4;
+  constexpr int64_t kDim = 256;
+  constexpr size_t kElements = kDim * kDim;
+  xla::Layout layout =
+      xla::LayoutUtil::MakeLayout({1, 0}, {xla::Tile({8, 128})});
+
+  std::vector<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffers;
+  std::vector<std::vector<uint8_t>> placeholders(kNumLayers);
+  std::vector<std::vector<raiden::RaidenBufferHandle>> handles;
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    placeholders[l].resize(kElements * sizeof(float), 0);
+    auto buf = client->BufferFromHostBuffer(
+        placeholders[l].data(), xla::PrimitiveType::F32, {kDim, kDim},
+        /*byte_strides=*/std::nullopt,
+        xla::PjRtClient::HostBufferSemantics::kImmutableUntilTransferCompletes,
+        /*on_done_with_host_buffer=*/nullptr, memory_space,
+        /*device_layout=*/nullptr);
+    ASSERT_OK(buf);
+    auto handle = raiden::RaidenBufferHandle::Acquire(buf->get());
+    ASSERT_OK(handle);
+    handle->shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+        xla::PrimitiveType::F32, {kDim, kDim}, layout.minor_to_major(),
+        layout.tiles());
+    handles.push_back({*handle});
+    pjrt_buffers.push_back(*std::move(buf));
+  }
+
+  auto ws = std::make_unique<WeightSynchronizerBase>(handles, /*local_port=*/0);
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    float* host_ptr = reinterpret_cast<float*>(ws->GetHostPointer(l, 0));
+    ASSERT_NE(host_ptr, nullptr);
+    for (size_t i = 0; i < kElements; ++i) {
+      host_ptr[i] = static_cast<float>((l + 1) * 100000 + i);
+    }
+  }
+
+  absl::Notification start;
+  std::vector<std::future<absl::Status>> workers;
+  workers.reserve(kNumLayers);
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    workers.push_back(
+        std::async(std::launch::async, [&ws, &start, l]() -> absl::Status {
+          start.WaitForNotification();
+          auto fut = ws->H2dLayer(l, 3001);
+          if (!fut.ok()) {
+            return fut.status();
+          }
+          return fut->Await();
+        }));
+  }
+  start.Notify();
+  for (auto& w : workers) {
+    ASSERT_OK(w.get());
+  }
+
+  // Verify both double-buffer slots on shard 0 were allocated and have distinct
+  // buffers.
+  const uint8_t* slot0_ptr = ws->GetTiledPointer(0, 0, 0);
+  const uint8_t* slot1_ptr = ws->GetTiledPointer(0, 0, 1);
+  EXPECT_NE(slot0_ptr, nullptr);
+  EXPECT_NE(slot1_ptr, nullptr);
+  EXPECT_NE(slot0_ptr, slot1_ptr);
+
+  // Zero out host buffers and run D2h to verify all layers transferred
+  // accurately without scratchpad corruption.
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    std::memset(ws->GetHostPointer(l, 0), 0, kElements * sizeof(float));
+  }
+  auto d2h_fut = ws->D2h(3001);
+  ASSERT_OK(d2h_fut);
+  ASSERT_OK(d2h_fut->Await());
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    const float* host_ptr =
+        reinterpret_cast<const float*>(ws->GetHostPointer(l, 0));
+    for (size_t i = 0; i < kElements; i += 4093) {
+      EXPECT_EQ(host_ptr[i], static_cast<float>((l + 1) * 100000 + i))
+          << "Layer " << l << " mismatch at element " << i;
+    }
+  }
+}
+
 TEST_F(WeightSynchronizerTest, OneDimensionalTiledTensorH2dAndD2hRoundtrip) {
   auto client_status_or = xla::GetXlaPjrtCpuClient(xla::CpuClientOptions());
   ASSERT_TRUE(client_status_or.ok()) << client_status_or.status().message();

@@ -160,6 +160,17 @@ TEST(TransferProgramReshard, SkipTilingMapRoundTrips) {
   EXPECT_EQ(Canonical(original), Canonical(*lowered));
 }
 
+TEST(TransferProgramReshard, WirePoolIndexMapRoundTrips) {
+  ::tpu_sync::rpc::StartTransferRequest original = MakePoolRequest(true);
+  (*original.mutable_wire_pool_indices())[0] = 9;
+  (*original.mutable_wire_pool_indices())[1] = 10;
+  auto program = CompileStartTransfer(original);
+  ASSERT_TRUE(program.ok()) << program.status();
+  auto lowered = LowerToStartTransfer(*program);
+  ASSERT_TRUE(lowered.ok()) << lowered.status();
+  EXPECT_EQ(Canonical(original), Canonical(*lowered));
+}
+
 TEST(TransferProgramReshard, LegacyDensePlanRefusesToCompile) {
   ::tpu_sync::rpc::StartTransferRequest legacy;
   legacy.set_uuid(1);

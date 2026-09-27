@@ -168,6 +168,9 @@ absl::StatusOr<::tpu_sync::proto::TransferProgramRequest> CompileStartTransfer(
   *binding->mutable_transfer_pool_indices() =
       request.transfer_pool_indices();
   *binding->mutable_pool_dtype_tags() = request.pool_dtype_tags();
+  for (const auto& [local, wire] : request.wire_pool_indices()) {
+    (*binding->mutable_wire_pool_indices())[local] = wire;
+  }
 
   ::tpu_sync::proto::FanIn* fan_in =
       program->mutable_completion()->mutable_fan_in();
@@ -241,6 +244,9 @@ absl::StatusOr<::tpu_sync::rpc::StartTransferRequest> LowerToStartTransfer(
   *out.mutable_dst_units() = binding.dst_units();
   *out.mutable_transfer_pool_indices() = binding.transfer_pool_indices();
   *out.mutable_pool_dtype_tags() = binding.pool_dtype_tags();
+  for (const auto& [local, wire] : binding.wire_pool_indices()) {
+    (*out.mutable_wire_pool_indices())[local] = wire;
+  }
 
   const ::tpu_sync::proto::ExecutionPolicy& policy = program.policy();
   out.set_parallelism(policy.parallelism());

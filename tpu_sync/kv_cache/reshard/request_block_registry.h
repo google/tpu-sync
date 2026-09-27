@@ -99,6 +99,13 @@ class RequestBlockRegistry {
   LookupAndClaim(const std::string& req_id, int64_t uuid,
                  const std::vector<RaidenId>& units, const void* claim_owner);
 
+  // Records the source units `claim_owner`'s plan dispatches to. Once a
+  // sibling has abandoned the claim, the generation retires when every
+  // remaining owner's recorded units have voted.
+  void RecordPlannedUnits(const std::string& req_id, int64_t uuid,
+                          const void* claim_owner,
+                          const std::vector<RaidenId>& units);
+
   // _abandon_request_blocks_claim: claim rollback before dispatch.
   bool AbandonClaim(const std::string& req_id, int64_t uuid,
                     const void* claim_owner);
@@ -125,11 +132,20 @@ class RequestBlockRegistry {
     double expires_at = 0.0;
   };
 
+  struct OwnerPlans {
+    std::map<const void*, std::set<RaidenId, RaidenIdLess>> planned_units;
+    bool owner_abandoned = false;
+  };
+
   void PurgeExpiredRequestBlocksLocked(double now)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void PurgeExpiredLifecycleLocked(double now)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   int RetireLocked(const LifecycleKey& key) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // True once an owner has abandoned the claim and every remaining owner's
+  // planned units have voted; those units belong to one owner each.
+  bool RemainingOwnersSettledLocked(const LifecycleKey& key)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   WorkUnitDirectory* directory_;
   absl::Mutex* mu_;
@@ -141,7 +157,14 @@ class RequestBlockRegistry {
   std::map<LifecycleKey, double> claimed_ ABSL_GUARDED_BY(mu_);
   std::map<LifecycleKey, std::set<RaidenId, RaidenIdLess>> claimed_units_
       ABSL_GUARDED_BY(mu_);
-  std::map<LifecycleKey, const void*> claimed_owners_ ABSL_GUARDED_BY(mu_);
+  // Every planning attempt holding the claim; a pipelined consumer plans
+  // one request once per destination stage, all against the same source
+  // unit set, and the claim outlives the last of them.
+  std::map<LifecycleKey, std::set<const void*>> claimed_owners_
+      ABSL_GUARDED_BY(mu_);
+  // Source units each claim owner dispatches to; an abandoned owner's units
+  // never vote, so they drop out of the retirement condition.
+  std::map<LifecycleKey, OwnerPlans> owner_plans_ ABSL_GUARDED_BY(mu_);
   std::map<LifecycleKey, Completions> completed_units_ ABSL_GUARDED_BY(mu_);
   std::map<LifecycleKey, double> cancelled_ ABSL_GUARDED_BY(mu_);
 };

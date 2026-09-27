@@ -290,6 +290,7 @@ cc_library(
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
         "//tpu_sync/core:host_memory_allocator",
+        "//tpu_sync/core:raw_dma_pacer",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:utils",
         "//tpu_sync/core:xla_raw_transfer_headers",
@@ -311,7 +312,9 @@ cc_library(
     deps = [
         ":torch_nanobind_utils",
         ":torch_raw_transfer_torch",
+        "//tpu_sync/core:raw_dma_pacer",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@nanobind",
         "@torch_tpu//shims/torch:aten_headers",
     ],
@@ -354,6 +357,7 @@ cc_library(
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
         "//tpu_sync/core:host_memory_allocator",
+        "//tpu_sync/core:raw_dma_pacer",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:utils",
         "//tpu_sync/core:xla_raw_transfer_headers",
@@ -596,6 +600,8 @@ cc_test(
     deps = [
         ":torch_raw_transfer_torch_mock",
         ":torch_tpu_utils_mock",
+        "//tpu_sync/core:raw_dma_pacer",
+        "@com_google_absl//absl/status:status_matchers",
         "@torch_tpu//shims/torch",
         "@torch_tpu//shims/torch:torch_headers",
         "@xla//xla/pjrt:pjrt_client",

@@ -32,6 +32,15 @@ Semantics:
     makes it an error).
   * Async variants return a ``PjRtCopyFuture`` (``wait()`` / ``is_ready()``);
     ``await_all`` / ``is_ready`` accept a future or a list of futures.
+  * Copies are paced: they are split into pieces of at most 16 MiB and at
+    most 64 MiB of raw DMA is kept outstanding per process (FIFO across
+    calls). The TPU runs a core's DMAs and program launches through one
+    in-order queue, so queueing a whole large copy at once parks every kernel
+    launched after it until the copy lands (the "kernel bubble"). Tune with
+    ``set_dma_pacing`` or TPU_RAIDEN_RAW_DMA_MAX_INFLIGHT_BYTES /
+    TPU_RAIDEN_RAW_DMA_CHUNK_BYTES; a limit <= 0 restores unpaced copies. If
+    either variable is set to a value that is not an integer (e.g. ``16M``),
+    raw transfers and the pacing calls raise RuntimeError.
 
 The bindings live inside the ABI-dispatched ``_tpu_raiden_torch`` extension as
 its ``raw_transfer`` submodule; this shim selects the variant matching the
@@ -219,6 +228,25 @@ def transfer_h2d_batch(
       copy_sizes_major_dim=list(copy_sizes_major_dim),
       unsafe_skip_buffer_lock=unsafe_skip_buffer_lock,
   )
+
+
+def set_dma_pacing(
+    max_inflight_bytes: int, chunk_bytes: int = 16 << 20
+) -> None:
+  """Bounds raw DMA bytes outstanding in this process.
+
+  Args:
+    max_inflight_bytes: most raw copy bytes kept queued on the TPU at once; <= 0
+      disables pacing (each copy is issued whole, immediately).
+    chunk_bytes: copies are split into pieces of at most this size (rounded down
+      to a multiple of 4 KiB).
+  """
+  _impl().set_dma_pacing(int(max_inflight_bytes), int(chunk_bytes))
+
+
+def get_dma_pacing() -> dict[str, int]:
+  """Returns the pacing limits and in-flight / peak byte counters."""
+  return dict(_impl().get_dma_pacing())
 
 
 def await_all(futures: Any) -> None:

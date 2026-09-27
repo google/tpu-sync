@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -38,6 +39,7 @@
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "tpu_sync/core/host_memory_allocator.h"
+#include "tpu_sync/core/raw_dma_pacer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/utils.h"
 #include "tpu_sync/frameworks/torch/torch_tpu_utils.h"
@@ -249,6 +251,25 @@ void ValidateMajorDimLayout(const RaidenBufferHandle& buffer,
   }
 }
 
+// Everything a copy must keep alive until its last DMA piece completes: the
+// pacer may issue pieces after the caller has dropped the returned future.
+struct CopyKeepAlive {
+  std::vector<at::Tensor> tensors;
+  std::shared_ptr<torch_tpu::TensorBufferHandle> buffer_ref;
+};
+
+std::shared_ptr<CopyKeepAlive> MakeCopyKeepAlive(
+    const at::Tensor& a, const at::Tensor& b,
+    std::optional<torch_tpu::TensorBufferHandle>& ref) {
+  auto keep_alive = std::make_shared<CopyKeepAlive>();
+  keep_alive->tensors = {a, b};
+  if (ref) {
+    keep_alive->buffer_ref =
+        std::make_shared<torch_tpu::TensorBufferHandle>(std::move(*ref));
+  }
+  return keep_alive;
+}
+
 PjRtCopyFuture IssueD2HCopy(const RaidenBufferHandle& src_buffer,
                             uint8_t* dst_data, size_t dst_size,
                             const std::vector<int64_t>& src_offsets_major_dim,
@@ -276,14 +297,26 @@ PjRtCopyFuture IssueD2HCopy(const RaidenBufferHandle& src_buffer,
           src_offsets_major_dim, dst_offsets_major_dim, copy_sizes_major_dim,
           /*is_d2h=*/true);
 
-  std::vector<xla::Future<>> futures;
-  futures.reserve(chunks.size());
+  // Raw DMA is paced so it cannot park ahead of the TensorCore's program
+  // launches for long; see raw_dma_pacer.h.
+  auto handle = std::make_shared<const RaidenBufferHandle>(src_buffer);
+  std::vector<RawDmaCopy> copies;
+  copies.reserve(chunks.size());
   for (const auto& chunk : chunks) {
-    futures.push_back(src_buffer.CopyRawDeviceToHost(
-        dst_data + chunk.dst_offset, chunk.src_offset, chunk.size_bytes));
+    uint8_t* dst = dst_data + chunk.dst_offset;
+    const int64_t src_offset = chunk.src_offset;
+    copies.push_back(
+        RawDmaCopy{[handle, dst, src_offset](int64_t offset, int64_t size) {
+                     return handle->CopyRawDeviceToHost(
+                         dst + offset, src_offset + offset, size);
+                   },
+                   chunk.size_bytes});
   }
+  RawDmaPacer* const pacer = ValueOrThrow(
+      "Invalid raw DMA pacing configuration", RawDmaPacer::Global());
+  xla::Future<> done = pacer->Submit(std::move(copies), user_hold);
   return PjRtCopyFuture(
-      xla::JoinFutures(absl::MakeSpan(futures)),
+      std::move(done),
       {BufferHolder{src_buffer.c_hold, src_buffer.common_hold,
                     /*ext_hold=*/nullptr, std::move(user_hold)}});
 }
@@ -315,14 +348,25 @@ PjRtCopyFuture IssueH2DCopy(const uint8_t* src_data, size_t src_size,
           src_offsets_major_dim, dst_offsets_major_dim, copy_sizes_major_dim,
           /*is_d2h=*/false);
 
-  std::vector<xla::Future<>> futures;
-  futures.reserve(chunks.size());
+  // See IssueD2HCopy: raw DMA goes through the process-wide pacer.
+  auto handle = std::make_shared<const RaidenBufferHandle>(dst_buffer);
+  std::vector<RawDmaCopy> copies;
+  copies.reserve(chunks.size());
   for (const auto& chunk : chunks) {
-    futures.push_back(dst_buffer.CopyRawHostToDevice(
-        src_data + chunk.src_offset, chunk.dst_offset, chunk.size_bytes));
+    const uint8_t* src = src_data + chunk.src_offset;
+    const int64_t dst_offset = chunk.dst_offset;
+    copies.push_back(
+        RawDmaCopy{[handle, src, dst_offset](int64_t offset, int64_t size) {
+                     return handle->CopyRawHostToDevice(
+                         src + offset, dst_offset + offset, size);
+                   },
+                   chunk.size_bytes});
   }
+  RawDmaPacer* const pacer = ValueOrThrow(
+      "Invalid raw DMA pacing configuration", RawDmaPacer::Global());
+  xla::Future<> done = pacer->Submit(std::move(copies), user_hold);
   return PjRtCopyFuture(
-      xla::JoinFutures(absl::MakeSpan(futures)),
+      std::move(done),
       {BufferHolder{dst_buffer.c_hold, dst_buffer.common_hold,
                     /*ext_hold=*/nullptr, std::move(user_hold)}});
 }
@@ -347,20 +391,13 @@ PjRtCopyFuture TransferD2HBatchAsync(
     AwaitReady(unpacked.buffer.buffer, "Source");
     const RaidenBufferHandle& src_buffer = unpacked.buffer;
 
-    auto torch_holds = std::make_shared<std::vector<at::Tensor>>();
-    torch_holds->push_back(src_arrs[i]);
-    torch_holds->push_back(dst_arrs[i]);
-
-    auto fut = IssueD2HCopy(
+    // Keeps both tensors and the base storage buffer alive until the copy is
+    // done.
+    auto keep_alive = MakeCopyKeepAlive(src_arrs[i], dst_arrs[i], unpacked.ref);
+    futures.push_back(IssueD2HCopy(
         src_buffer, reinterpret_cast<uint8_t*>(dst_arrs[i].data_ptr()),
         dst_arrs[i].nbytes(), src_offsets_major_dim, dst_offsets_major_dim,
-        copy_sizes_major_dim, std::move(torch_holds));
-    // Keep the base storage buffer alive until the copy is done.
-    if (unpacked.ref) {
-      fut.AddKeepAlive(std::make_shared<torch_tpu::TensorBufferHandle>(
-          std::move(*unpacked.ref)));
-    }
-    futures.push_back(std::move(fut));
+        copy_sizes_major_dim, std::move(keep_alive)));
   }
   return JoinPjRtCopyFutures(absl::MakeSpan(futures));
 }
@@ -386,20 +423,13 @@ PjRtCopyFuture TransferH2DBatchAsync(
     AwaitReady(unpacked.buffer.buffer, "Destination");
     const RaidenBufferHandle& dst_buffer = unpacked.buffer;
 
-    auto torch_holds = std::make_shared<std::vector<at::Tensor>>();
-    torch_holds->push_back(src_arrs[i]);
-    torch_holds->push_back(dst_arrs[i]);
-
-    auto fut = IssueH2DCopy(
+    // Keeps both tensors and the base storage buffer alive until the copy is
+    // done.
+    auto keep_alive = MakeCopyKeepAlive(src_arrs[i], dst_arrs[i], unpacked.ref);
+    futures.push_back(IssueH2DCopy(
         reinterpret_cast<const uint8_t*>(src_arrs[i].data_ptr()),
         src_arrs[i].nbytes(), dst_buffer, src_offsets_major_dim,
-        dst_offsets_major_dim, copy_sizes_major_dim, std::move(torch_holds));
-    // Keep the base storage buffer alive until the copy is done.
-    if (unpacked.ref) {
-      fut.AddKeepAlive(std::make_shared<torch_tpu::TensorBufferHandle>(
-          std::move(*unpacked.ref)));
-    }
-    futures.push_back(std::move(fut));
+        dst_offsets_major_dim, copy_sizes_major_dim, std::move(keep_alive)));
   }
   return JoinPjRtCopyFutures(absl::MakeSpan(futures));
 }
@@ -457,21 +487,41 @@ std::shared_ptr<RawHostBuffer> PreparedTorchRawTransfer::HostBuffer() const {
 }
 
 PjRtCopyFuture PreparedTorchRawTransfer::D2HAsync() {
-  xla::Future<> copy_future = buffer_.CopyRawDeviceToHost(
-      host_buffer_->MutableData(), 0, physical_size_);
-  return PjRtCopyFuture(
-      std::move(copy_future),
-      {BufferHolder{buffer_.c_hold, buffer_.common_hold, /*ext_hold=*/nullptr,
-                    shared_from_this()}});
+  auto self = shared_from_this();
+  RawDmaPacer* const pacer = ValueOrThrow(
+      "Invalid raw DMA pacing configuration", RawDmaPacer::Global());
+  xla::Future<> copy_future =
+      pacer->Submit({RawDmaCopy{[self](int64_t offset, int64_t size) {
+                                  return self->buffer_.CopyRawDeviceToHost(
+                                      static_cast<uint8_t*>(
+                                          self->host_buffer_->MutableData()) +
+                                          offset,
+                                      offset, size);
+                                },
+                                static_cast<int64_t>(physical_size_)}},
+                    self);
+  return PjRtCopyFuture(std::move(copy_future),
+                        {BufferHolder{buffer_.c_hold, buffer_.common_hold,
+                                      /*ext_hold=*/nullptr, std::move(self)}});
 }
 
 PjRtCopyFuture PreparedTorchRawTransfer::H2DAsync() {
+  auto self = shared_from_this();
+  RawDmaPacer* const pacer = ValueOrThrow(
+      "Invalid raw DMA pacing configuration", RawDmaPacer::Global());
   xla::Future<> copy_future =
-      buffer_.CopyRawHostToDevice(host_buffer_->Data(), 0, physical_size_);
-  return PjRtCopyFuture(
-      std::move(copy_future),
-      {BufferHolder{buffer_.c_hold, buffer_.common_hold, /*ext_hold=*/nullptr,
-                    shared_from_this()}});
+      pacer->Submit({RawDmaCopy{[self](int64_t offset, int64_t size) {
+                                  return self->buffer_.CopyRawHostToDevice(
+                                      static_cast<const uint8_t*>(
+                                          self->host_buffer_->Data()) +
+                                          offset,
+                                      offset, size);
+                                },
+                                static_cast<int64_t>(physical_size_)}},
+                    self);
+  return PjRtCopyFuture(std::move(copy_future),
+                        {BufferHolder{buffer_.c_hold, buffer_.common_hold,
+                                      /*ext_hold=*/nullptr, std::move(self)}});
 }
 
 void PreparedTorchRawTransfer::D2H() {

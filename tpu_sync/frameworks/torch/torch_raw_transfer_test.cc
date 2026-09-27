@@ -14,13 +14,16 @@
 
 #include "tpu_sync/frameworks/torch/torch_raw_transfer.h"
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
+#include "absl/status/status_matchers.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
+#include "tpu_sync/core/raw_dma_pacer.h"
 #include "tpu_sync/frameworks/torch/torch_tpu_utils_mock.h"
 #include "torch/torch.h"
 
@@ -153,6 +156,108 @@ TEST_F(TorchRawTransferTest, BatchTransferD2HAndH2D) {
   for (int i = 0; i < 256; ++i) {
     EXPECT_EQ(readback_data[i], 24.0f);
   }
+}
+
+// Shrinks the process-wide DMA window so a small CPU buffer is split into
+// many pieces, and restores the previous limits afterwards.
+class ScopedTinyDmaWindow {
+ public:
+  explicit ScopedTinyDmaWindow(RawDmaPacer& pacer)
+      : pacer_(pacer), saved_(pacer.options()) {
+    pacer_.SetOptions(RawDmaPacerOptions{kWindowBytes, kChunkBytes});
+    pacer_.ResetPeak();
+  }
+  ~ScopedTinyDmaWindow() { pacer_.SetOptions(saved_); }
+
+  static constexpr int64_t kChunkBytes = 4096;
+  static constexpr int64_t kWindowBytes = 4 * kChunkBytes;
+
+ private:
+  RawDmaPacer& pacer_;
+  RawDmaPacerOptions saved_;
+};
+
+TEST_F(TorchRawTransferTest, PacedBatchTransferIsByteExact) {
+  TF_ASSERT_OK_AND_ASSIGN(RawDmaPacer * pacer, RawDmaPacer::Global());
+  ScopedTinyDmaWindow window(*pacer);
+  // 1 MiB + 3 KiB: many full pieces plus an unaligned tail.
+  constexpr int64_t kCount = (1 << 18) + 768;
+  TF_ASSERT_OK_AND_ASSIGN(xla::PjRtMemorySpace * memory_space,
+                          device_->default_memory_space());
+  std::vector<float> zeros(kCount, 0.0f);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pjrt_buffer, client_->BufferFromHostBuffer(
+                            zeros.data(), xla::F32, {kCount},
+                            /*byte_strides=*/std::nullopt,
+                            xla::PjRtClient::HostBufferSemantics::
+                                kImmutableUntilTransferCompletes,
+                            /*on_done_with_host_buffer=*/nullptr, memory_space,
+                            /*device_layout=*/nullptr));
+  at::Tensor tpu_tensor = ::torch::zeros({kCount}, ::torch::kFloat32);
+  RegisterMockTensor(tpu_tensor, pjrt_buffer.get());
+
+  at::Tensor source = ::torch::arange(kCount, ::torch::kFloat32);
+  ABSL_ASSERT_OK(
+      TransferH2DBatchAsync({source}, {tpu_tensor}, {}, {}, {}).Await());
+  std::vector<float> readback(kCount);
+  ABSL_ASSERT_OK(
+      pjrt_buffer->CopyRawToHost(readback.data(), 0, kCount * sizeof(float))
+          .Await());
+  for (int64_t i = 0; i < kCount; ++i) {
+    ASSERT_EQ(readback[i], static_cast<float>(i)) << "at element " << i;
+  }
+
+  at::Tensor sink = ::torch::zeros({kCount}, ::torch::kFloat32);
+  ABSL_ASSERT_OK(
+      TransferD2HBatchAsync({tpu_tensor}, {sink}, {}, {}, {}).Await());
+  EXPECT_TRUE(::torch::equal(sink, source));
+
+  const RawDmaPacerStats stats = pacer->stats();
+  EXPECT_LE(stats.peak_inflight_bytes, ScopedTinyDmaWindow::kWindowBytes);
+  EXPECT_EQ(stats.inflight_bytes, 0);
+}
+
+TEST_F(TorchRawTransferTest, PacedPreparedTransferIsByteExact) {
+  TF_ASSERT_OK_AND_ASSIGN(RawDmaPacer * pacer, RawDmaPacer::Global());
+  ScopedTinyDmaWindow window(*pacer);
+  constexpr int64_t kCount = 3 * 4096 + 5;  // Three full pieces plus a tail.
+  TF_ASSERT_OK_AND_ASSIGN(xla::PjRtMemorySpace * memory_space,
+                          device_->default_memory_space());
+  std::vector<float> initial(kCount);
+  for (int64_t i = 0; i < kCount; ++i) {
+    initial[i] = static_cast<float>(i) * 0.5f;
+  }
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pjrt_buffer, client_->BufferFromHostBuffer(
+                            initial.data(), xla::F32, {kCount},
+                            /*byte_strides=*/std::nullopt,
+                            xla::PjRtClient::HostBufferSemantics::
+                                kImmutableUntilTransferCompletes,
+                            /*on_done_with_host_buffer=*/nullptr, memory_space,
+                            /*device_layout=*/nullptr));
+  at::Tensor tpu_tensor = ::torch::zeros({kCount}, ::torch::kFloat32);
+  RegisterMockTensor(tpu_tensor, pjrt_buffer.get());
+  auto host_buffer = std::make_shared<RawHostBuffer>(kCount * sizeof(float));
+  host_buffer->EnsureBoundToDevice(device_);
+  auto transfer = std::make_shared<PreparedTorchRawTransfer>(
+      tpu_tensor, host_buffer, /*unsafe_skip_buffer_lock=*/true);
+
+  transfer->D2H();
+  float* host = reinterpret_cast<float*>(host_buffer->MutableData());
+  for (int64_t i = 0; i < kCount; ++i) {
+    ASSERT_EQ(host[i], initial[i]) << "at element " << i;
+    host[i] = -host[i];
+  }
+  transfer->H2D();
+  std::vector<float> readback(kCount);
+  ABSL_ASSERT_OK(
+      pjrt_buffer->CopyRawToHost(readback.data(), 0, kCount * sizeof(float))
+          .Await());
+  for (int64_t i = 0; i < kCount; ++i) {
+    ASSERT_EQ(readback[i], -initial[i]) << "at element " << i;
+  }
+  EXPECT_LE(pacer->stats().peak_inflight_bytes,
+            ScopedTinyDmaWindow::kWindowBytes);
 }
 
 }  // namespace

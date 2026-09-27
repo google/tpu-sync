@@ -150,6 +150,38 @@ memory.
 4. **Asynchronous DMA**: It calls `CopyRawToHost` or `PjRtCApiRawBuffer_CopyRawDeviceToHost` to trigger direct DMA transfers between TPU HBM and host memory.
 5. **Multi-Device Parallelism**: The library iterates over all addressable shards of a distributed JAX array and issues concurrent transfer commands for each shard. It returns a list of custom `PjRtCopyFuture` objects wrapping the underlying XLA futures, which are then awaited in Python.
 
+### DMA Pacing (torch bindings)
+
+The TPU runtime executes a TensorCore's DMAs and program launches through one
+in-order queue, and a PJRT raw-buffer copy reaches it as a single request for
+the whole range. Issuing a large raw copy therefore holds every kernel launched
+after it until the copy has crossed the host link: on TPU7x a kernel launched
+behind N MiB of queued raw H2D starts only when the DMA finishes (16 MiB →
+0.5 ms, 1 GiB → 19 ms), and the sibling core of the same chip is delayed by
+about half of that. With compute issued first, libtpu's completion reads
+(`ReadSyncFlag`) wait behind the same DMA, its launch semaphore stays held, and
+the TensorCore idles between kernels ("kernel bubbles"; 5–22 ms stalls with
+eight ranks copying 1.4 GB each). Tensors copied with `.to()`
+(`BufferFromHostBuffer`) are also queued as one whole-buffer DMA each and delay
+kernels the same way.
+
+`RawDmaPacer` (`raw_dma_pacer.h`) covers only tpu_raiden's torch raw transfers,
+not `.to()`: every torch raw transfer (`transfer_*`, `transfer_*_batch*`,
+`PreparedTorchRawTransfer`) is split into pieces of at most `chunk_bytes`
+(default 16 MiB) and at most `max_inflight_bytes` (default 64 MiB) are kept
+outstanding per process, first-in first-out across callers. A piece is issued
+on the calling thread when it fits; otherwise a pacer thread issues it as
+earlier pieces complete. The copy's future completes after its last piece and
+the pacer keeps the tensors and buffers alive until then.
+
+Configure with `raw_transfer.set_dma_pacing(max_inflight_bytes, chunk_bytes)`
+or the `TPU_RAIDEN_RAW_DMA_MAX_INFLIGHT_BYTES` /
+`TPU_RAIDEN_RAW_DMA_CHUNK_BYTES` environment variables; a limit <= 0 restores
+the unpaced behaviour. If either variable is set to a value that is not an
+integer (e.g. `16M`), raw transfers and the pacing calls raise `RuntimeError`.
+`raw_transfer.get_dma_pacing()` reports the limits and the in-flight and peak
+byte counts.
+
 
 ## TODO
 

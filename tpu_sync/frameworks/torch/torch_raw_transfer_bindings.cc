@@ -20,12 +20,14 @@
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
-#include "absl/status/status.h"
 #include "nanobind/nanobind.h"
 #include "nanobind/stl/optional.h"
 #include "nanobind/stl/shared_ptr.h"
 #include "nanobind/stl/string.h"
 #include "nanobind/stl/vector.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "tpu_sync/core/raw_dma_pacer.h"
 #include "tpu_sync/frameworks/torch/torch_nanobind_utils.h"
 #include "tpu_sync/frameworks/torch/torch_raw_transfer.h"
 
@@ -68,6 +70,18 @@ bool IsReady(nb::object futures) {
     }
   }
   return true;
+}
+
+// Returns the process-wide raw DMA pacer; throws std::runtime_error (Python
+// RuntimeError) if its environment configuration is invalid.
+RawDmaPacer& GlobalRawDmaPacer() {
+  absl::StatusOr<RawDmaPacer*> pacer = RawDmaPacer::Global();
+  if (!pacer.ok()) {
+    throw std::runtime_error(
+        std::string("Invalid raw DMA pacing configuration: ") +
+        std::string(pacer.status().message()));
+  }
+  return **pacer;
 }
 
 }  // namespace
@@ -126,6 +140,29 @@ void BindTorchRawTransfer(nb::module_& m) {
 
   m.def("await_all", &AwaitAll, nb::arg("futures"));
   m.def("is_ready", &IsReady, nb::arg("futures"));
+
+  // Raw DMA pacing (see tpu_sync/core/raw_dma_pacer.h).
+  m.def(
+      "set_dma_pacing",
+      [](int64_t max_inflight_bytes, int64_t chunk_bytes) {
+        GlobalRawDmaPacer().SetOptions(
+            RawDmaPacerOptions{max_inflight_bytes, chunk_bytes});
+      },
+      nb::arg("max_inflight_bytes"), nb::arg("chunk_bytes"));
+  m.def("get_dma_pacing", []() {
+    RawDmaPacer& pacer = GlobalRawDmaPacer();
+    const RawDmaPacerOptions options = pacer.options();
+    const RawDmaPacerStats stats = pacer.stats();
+    nb::dict out;
+    out["max_inflight_bytes"] = options.max_inflight_bytes;
+    out["chunk_bytes"] = options.chunk_bytes;
+    out["inflight_bytes"] = stats.inflight_bytes;
+    out["peak_inflight_bytes"] = stats.peak_inflight_bytes;
+    out["pending_pieces"] = stats.pending_pieces;
+    out["issued_pieces"] = stats.issued_pieces;
+    return out;
+  });
+  m.def("reset_dma_pacing_peak", []() { GlobalRawDmaPacer().ResetPeak(); });
 
   m.def("transfer_d2h_async", &TransferD2HAsync, nb::arg("src_arr"),
         nb::arg("dst_arr"), nb::kw_only(),

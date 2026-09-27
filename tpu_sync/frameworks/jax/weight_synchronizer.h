@@ -68,6 +68,12 @@ class NumaAwareWeightSynchronizer
   absl::Status BindWeights(nanobind::list jax_arrays);
 #endif
 
+  // Binds C++ device buffer handles in |layer_buffers| (indexed as
+  // [layer][shard]) to the underlying weight synchronizer sub-managers.
+  absl::Status BindWeights(
+      const std::vector<std::vector<raiden::RaidenBufferHandle>>&
+          layer_buffers);
+
   // CPU / Mock metadata constructor for tests without PJRT TPU devices
   NumaAwareWeightSynchronizer(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
@@ -91,21 +97,43 @@ class NumaAwareWeightSynchronizer
   virtual ~NumaAwareWeightSynchronizer();
 
   size_t num_layers() const { return num_layers_; }
+  size_t num_block_arrays() const { return num_layers_; }
   size_t num_shards() const { return total_num_shards_; }
   size_t slice_byte_size() const { return slice_byte_size_; }
+  // Returns the byte size of layer |layer_idx|.
+  size_t block_bytes(size_t layer_idx) const;
 
   std::optional<int> local_port() const;
   std::optional<int> listener_port() const;
   bool is_listener_active() const;
 
+  // Returns the primary local IP address of the weight synchronizer.
+  std::string local_ip() const;
   std::vector<std::string> local_ips() const;
   std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
+
+  // Updates the global shard indices |indices| mapped to local shard slots.
+  void SetGlobalShardIndices(std::vector<int64_t> indices);
+  // Returns the global shard index for |local_shard_idx|.
+  int64_t global_shard_index(size_t local_shard_idx) const;
+  // Updates the local shard indices |indices| on the underlying sub-manager.
+  void SetLocalShardIndices(std::vector<int> indices);
+  // Returns the local shard index for |local_shard_idx|.
+  int64_t local_shard_index(size_t local_shard_idx) const;
 
   const uint8_t* GetHostBufferPtr(size_t layer_idx, size_t shard_idx) const;
   size_t GetHostBufferSize(size_t layer_idx, size_t shard_idx) const;
 
   absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
+  // Copies layer |layer_idx| from device HBM to host staging memory for
+  // transfer |uuid|.
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hLayer(size_t layer_idx,
+                                                  uint64_t uuid = 0);
   absl::StatusOr<raiden::PjRtCopyFuture> H2d(uint64_t uuid = 0);
+  // Copies layer |layer_idx| from host staging memory to device HBM for
+  // transfer |uuid|.
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dLayer(size_t layer_idx,
+                                                  uint64_t uuid = 0);
 
   void SetSkipTiling(const std::vector<bool>& skip_tiling);
   void SetSkipTiling(bool skip_all);
@@ -185,6 +213,12 @@ class WeightSynchronizer {
   absl::Status BindWeights(nanobind::list jax_arrays);
 #endif
 
+  // Binds C++ device buffer handles in |layer_buffers| (indexed as
+  // [layer][shard]) to the weight synchronizer.
+  absl::Status BindWeights(
+      const std::vector<std::vector<raiden::RaidenBufferHandle>>&
+          layer_buffers);
+
   // CPU / Mock metadata constructor for tests without PJRT TPU devices
   WeightSynchronizer(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
@@ -212,7 +246,15 @@ class WeightSynchronizer {
   }
 
   absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
+  // Copies layer |layer_idx| from device HBM to host staging memory for
+  // transfer |uuid|.
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hLayer(size_t layer_idx,
+                                                  uint64_t uuid = 0);
   absl::StatusOr<raiden::PjRtCopyFuture> H2d(uint64_t uuid = 0);
+  // Copies layer |layer_idx| from host staging memory to device HBM for
+  // transfer |uuid|.
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dLayer(size_t layer_idx,
+                                                  uint64_t uuid = 0);
   absl::Status WaitForTransferCompletion(uint64_t uuid = 0);
   void SetSkipTiling(const std::vector<bool>& skip_tiling);
   void SetSkipTiling(bool skip_all);
@@ -226,12 +268,26 @@ class WeightSynchronizer {
   std::optional<int> listener_port() const;
   bool is_listener_active() const;
 
+  // Returns the primary local IP address of the weight synchronizer.
+  std::string local_ip() const;
   std::vector<std::string> local_ips() const;
   std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
 
+  // Updates the global shard indices |indices| mapped to local shard slots.
+  void SetGlobalShardIndices(std::vector<int64_t> indices);
+  // Returns the global shard index for |local_shard_idx|.
+  int64_t global_shard_index(size_t local_shard_idx) const;
+  // Updates the local shard indices |indices| on the underlying sub-manager.
+  void SetLocalShardIndices(std::vector<int> indices);
+  // Returns the local shard index for |local_shard_idx|.
+  int64_t local_shard_index(size_t local_shard_idx) const;
+
   size_t num_layers() const;
+  size_t num_block_arrays() const;
   size_t num_shards() const;
   size_t slice_byte_size() const;
+  // Returns the byte size of layer |layer_idx|.
+  size_t block_bytes(size_t layer_idx) const;
 
   void test_only_set_bandwidth_limit(double test_only_simulated_egress_gbps,
                                      double test_only_simulated_ingress_gbps);

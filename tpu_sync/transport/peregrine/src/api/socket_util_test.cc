@@ -32,21 +32,16 @@
 #include "absl/types/span.h"
 #include "tpu_sync/transport/peregrine/src/api/transport_types.h"
 #include "tpu_sync/transport/peregrine/src/internal/base/endpoint.h"
+#include "tpu_sync/transport/peregrine/src/internal/base/ipaddr.h"
 #include "tpu_sync/transport/peregrine/src/internal/base/types.h"
 #include "tpu_sync/transport/peregrine/src/internal/socket/socket_tcp.h"
-#include "tpu_sync/transport/peregrine/src/internal/util/test_util.h"
-#include "tpu_sync/transport/peregrine/src/util/util.h"
+#include "tpu_sync/transport/peregrine/src/internal/socket/socket_util.h"
 
 namespace peregrine::testing {
 namespace {
 
 using ::peregrine::internal::Endpoint;
 using ::peregrine::internal::TcpSocket;
-using ::peregrine::internal::testing::IPv4Localhost;
-using ::peregrine::internal::testing::IPv6Localhost;
-using ::peregrine::internal::testing::TestOnly_CreateTcpSocket;
-using ::peregrine::internal::testing::TestOnly_FindFreeTcpPort;
-using ::peregrine::util::RandomNonZero;
 using ::testing::Combine;
 using ::testing::Eq;
 using ::testing::Ne;
@@ -71,11 +66,13 @@ class SocketUtilTest : public ::testing::TestWithParam<Param> {
       : family_(std::get<0>(GetParam())),
         read_iovec_(std::get<1>(GetParam())),
         write_iovec_(std::get<2>(GetParam())),
-        local_(family_ == AF_INET ? IPv4Localhost() : IPv6Localhost(),
-               TestOnly_FindFreeTcpPort(family_)),
-        peer_(local_),
-        listener_(TestOnly_CreateTcpSocket(family_)),
-        connector_(TestOnly_CreateTcpSocket(family_)) {
+        local_(internal::IpAddr::Create(family_ == AF_INET ? "127.0.0.1" : "::1")
+                   .value(),
+               0),
+        listener_(TcpSocket::Create(family_)),
+        connector_(TcpSocket::Create(family_)) {
+    CHECK_NE(listener_, nullptr);
+    CHECK_NE(connector_, nullptr);
     DCHECK(listener_->IsValid());
     DCHECK(connector_->IsValid());
     DCHECK(!listener_->IsConnected());
@@ -84,11 +81,12 @@ class SocketUtilTest : public ::testing::TestWithParam<Param> {
   }
 
  protected:
+  void CheckReadWrite(size_t read_iov_count, size_t write_iov_count);
+
   const int family_;
   const bool read_iovec_;
   const bool write_iovec_;
   const Endpoint local_;
-  const Endpoint peer_;
   const std::unique_ptr<TcpSocket> listener_;
   const std::unique_ptr<TcpSocket> connector_;
 };
@@ -99,12 +97,15 @@ INSTANTIATE_TEST_SUITE_P(, SocketUtilTest,
                                  /*wiov=*/Values(false, true)),
                          ToString);
 
-TEST_P(SocketUtilTest, ReadWrite) {
-  // Create a big chunk of send/recv buffers with random data.
+void SocketUtilTest::CheckReadWrite(size_t read_iov_count,
+                                  size_t write_iov_count) {
+  // Non-uniform, non-zero data detects reordering without test RNG dependencies.
   constexpr size_t kSize = 64UL << 20;
   std::vector<Byte> send_buf(kSize, 0x01);
   std::vector<Byte> recv_buf(kSize, 0x00);
-  RandomNonZero(absl::MakeSpan(send_buf));
+  for (size_t i = 0; i < send_buf.size(); ++i) {
+    send_buf[i] = static_cast<Byte>(1 + i % 251);
+  }
   ASSERT_THAT(recv_buf, Pointwise(Ne(), send_buf));
 
   // First, create a server thread.
@@ -122,10 +123,12 @@ TEST_P(SocketUtilTest, ReadWrite) {
 
     if (read_iovec_) {
       std::vector<struct iovec> iovs;
-      constexpr size_t kPartial = kSize / 3;
-      iovs.push_back({recv_buf.data(), kPartial});
-      iovs.push_back({recv_buf.data() + kPartial, kPartial});
-      iovs.push_back({recv_buf.data() + kPartial * 2, kSize - kPartial * 2});
+      const size_t partial = kSize / read_iov_count;
+      for (size_t i = 0; i < read_iov_count; ++i) {
+        const size_t offset = i * partial;
+        const size_t size = i + 1 == read_iov_count ? kSize - offset : partial;
+        iovs.push_back({recv_buf.data() + offset, size});
+      }
       CHECK_OK(ReadVExact(new_socket->fd().value(), iovs));
     } else {
       CHECK_OK(ReadExact(new_socket->fd().value(), recv_buf.data(), kSize));
@@ -135,15 +138,21 @@ TEST_P(SocketUtilTest, ReadWrite) {
   // Second, create a client thread.
   std::thread client([&]() {
     server_ready.WaitForNotification();
-    CHECK(connector_->Connect(peer_));
+    // Port zero reserves an ephemeral port, without a free-port race or
+    // dependencies on the optional test utility library.
+    const Endpoint peer = Endpoint::Create(internal::SelfAddrPort(listener_->fd()));
+    CHECK(connector_->Connect(peer));
     DCHECK(connector_->IsBlocking());
     DCHECK(connector_->IsConnected());
 
     if (write_iovec_) {
       std::vector<struct iovec> iovs;
-      constexpr size_t kPartial = kSize / 2;
-      iovs.push_back({send_buf.data(), kPartial});
-      iovs.push_back({send_buf.data() + kPartial, kSize - kPartial});
+      const size_t partial = kSize / write_iov_count;
+      for (size_t i = 0; i < write_iov_count; ++i) {
+        const size_t offset = i * partial;
+        const size_t size = i + 1 == write_iov_count ? kSize - offset : partial;
+        iovs.push_back({send_buf.data() + offset, size});
+      }
       CHECK_OK(WriteVExact(connector_->fd().value(), iovs));
     } else {
       CHECK_OK(WriteExact(connector_->fd().value(), send_buf.data(), kSize));
@@ -156,6 +165,22 @@ TEST_P(SocketUtilTest, ReadWrite) {
 
   // Check that the recv buffer has the same data as the send.
   ASSERT_THAT(recv_buf, Pointwise(Eq(), send_buf));
+}
+
+TEST_P(SocketUtilTest, ReadWrite) { CheckReadWrite(3, 2); }
+
+TEST_P(SocketUtilTest, ReadWriteAtIovMax) {
+  CheckReadWrite(IOV_MAX, IOV_MAX);
+}
+
+TEST_P(SocketUtilTest, ReadWriteAboveIovMax) {
+  CheckReadWrite(IOV_MAX + 1, 2 * IOV_MAX + 3);
+}
+
+TEST_P(SocketUtilTest, ReadWriteManyIovs) {
+  // Different sender/receiver batch boundaries must preserve the stream.
+  // This exceeds the 14,337 entries observed in hybrid-state resharding.
+  CheckReadWrite(16 * IOV_MAX + 3, 14 * IOV_MAX + 1);
 }
 
 }  // namespace

@@ -115,7 +115,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
       std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt,
-      std::vector<std::string> layer_names = {}, bool auto_h2d = false);
+      std::vector<std::string> layer_names = {}, bool auto_h2d = false,
+      std::optional<size_t> ring_buffer_size = std::nullopt);
 
   // CPU-only constructor for remote workers and mock E2E testing
   WeightSynchronizerBase(
@@ -124,7 +125,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       int parallelism = 1, std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt,
-      std::vector<std::string> layer_names = {}, bool auto_h2d = false);
+      std::vector<std::string> layer_names = {}, bool auto_h2d = false,
+      std::optional<size_t> ring_buffer_size = std::nullopt);
 
   // CPU-only constructor for remote workers and mock E2E testing supporting
   // heterogeneous slice sizes and custom layer names.
@@ -135,7 +137,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       int parallelism = 1, std::optional<int> listener_port = std::nullopt,
       std::optional<std::string> bind_ip = std::nullopt,
-      std::vector<std::string> layer_names = {}, bool auto_h2d = false);
+      std::vector<std::string> layer_names = {}, bool auto_h2d = false,
+      std::optional<size_t> ring_buffer_size = std::nullopt);
 
   std::optional<int> listener_port() const;
   bool is_listener_active() const;
@@ -203,6 +206,14 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   const uint8_t* GetHostPointer(size_t layer_idx,
                                 size_t shard_idx) const override;
   size_t GetHostSize(size_t layer_idx, size_t shard_idx) const override;
+  uint8_t* AcquireHostPointerForPush(size_t buffer_id, size_t shard_idx,
+                                     size_t dst_offset_bytes, size_t span_bytes,
+                                     uint64_t uuid) override;
+
+  size_t ring_buffer_size() const { return ring_buffer_size_; }
+  size_t allocated_host_dram_bytes() const {
+    return allocated_host_dram_bytes_.load(std::memory_order_relaxed);
+  }
 
   uint8_t* GetTiledPointer(size_t layer_idx, size_t shard_idx) {
     if (shard_idx < tiled_scratchpads_.size() &&
@@ -349,10 +360,27 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   struct PendingH2dState {
     size_t expected_layers = 0;
+    bool has_layer_chunk_tracking = false;
     absl::flat_hash_map<size_t,
                         std::future<absl::StatusOr<raiden::PjRtCopyFuture>>>
         layer_futures;
   };
+
+  struct RingSlotState {
+    absl::Mutex mu;
+    std::optional<size_t> active_layer ABSL_GUARDED_BY(mu) = std::nullopt;
+    uint64_t active_uuid ABSL_GUARDED_BY(mu) = 0;
+    bool h2d_in_flight ABSL_GUARDED_BY(mu) = false;
+  };
+
+  size_t ring_buffer_size_ = 0;
+  std::vector<std::unique_ptr<RingSlotState>> ring_slot_states_;
+  std::vector<std::unique_ptr<std::atomic<size_t>[]>> received_extents_;
+
+  size_t ResolveLocalShardIndex(size_t layer_idx, size_t shard_idx) const;
+  void ReleaseRingSlot(size_t layer_idx);
+  size_t GetReceivedExtent(size_t layer_idx, size_t local_shard_idx) const;
+  void ResetReceivedExtentsForLayer(size_t layer_idx);
 
   std::unique_ptr<tpu_raiden::NumaThreadPool> h2d_pool_;
   std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_;
@@ -387,6 +415,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   absl::flat_hash_map<uint64_t, PendingH2dState> pending_h2d_states_
       ABSL_GUARDED_BY(pending_h2d_mu_);
   absl::flat_hash_set<uint64_t> active_h2d_uuids_
+      ABSL_GUARDED_BY(pending_h2d_mu_);
+  absl::flat_hash_set<uint64_t> ring_flushed_h2d_uuids_
       ABSL_GUARDED_BY(pending_h2d_mu_);
 
   mutable absl::Mutex metrics_mu_;

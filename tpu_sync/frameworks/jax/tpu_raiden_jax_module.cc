@@ -332,13 +332,15 @@ NB_MODULE(_tpu_raiden_jax, m) {
   nb::class_<WeightSynchronizer>(m, "WeightSynchronizer")
       .def(nb::init<nb::list, std::optional<int>, int, bool, std::optional<int>,
                     std::optional<std::string>, bool,
-                    std::optional<std::vector<int64_t>>>(),
+                    std::optional<std::vector<int64_t>>,
+                    std::optional<size_t>>(),
            nb::arg("jax_arrays"), nb::arg("local_port") = nb::none(),
            nb::arg("parallelism") = 1,
            nb::arg("unsafe_skip_buffer_lock") = false,
            nb::arg("listener_port") = nb::none(),
            nb::arg("bind_ip") = nb::none(), nb::arg("auto_h2d") = false,
-           nb::arg("global_shard_indices") = nb::none())
+           nb::arg("global_shard_indices") = nb::none(),
+           nb::arg("ring_buffer_size") = nb::none())
 
       .def("test_only_set_bandwidth_limit",
            &WeightSynchronizer::test_only_set_bandwidth_limit,
@@ -353,12 +355,13 @@ NB_MODULE(_tpu_raiden_jax, m) {
              std::optional<std::string> bind_ip, bool auto_h2d,
              std::optional<std::vector<int64_t>> global_shard_indices,
              double test_only_simulated_egress_gbps,
-             double test_only_simulated_ingress_gbps) {
+             double test_only_simulated_ingress_gbps,
+             std::optional<size_t> ring_buffer_size) {
             return WeightSynchronizer::test_only_create_cpu_instance(
                 num_layers, num_shards, slice_byte_size, local_port,
                 parallelism, listener_port, bind_ip, auto_h2d,
                 global_shard_indices, test_only_simulated_egress_gbps,
-                test_only_simulated_ingress_gbps);
+                test_only_simulated_ingress_gbps, ring_buffer_size);
           },
           nb::arg("num_layers"), nb::arg("num_shards"),
           nb::arg("slice_byte_size"), nb::arg("local_port") = nb::none(),
@@ -366,7 +369,8 @@ NB_MODULE(_tpu_raiden_jax, m) {
           nb::arg("bind_ip") = nb::none(), nb::arg("auto_h2d") = false,
           nb::arg("global_shard_indices") = nb::none(),
           nb::arg("test_only_simulated_egress_gbps") = 0.0,
-          nb::arg("test_only_simulated_ingress_gbps") = 0.0)
+          nb::arg("test_only_simulated_ingress_gbps") = 0.0,
+          nb::arg("ring_buffer_size") = nb::none())
 
       .def_static(
           "test_only_create_cpu_instance",
@@ -377,12 +381,13 @@ NB_MODULE(_tpu_raiden_jax, m) {
              std::optional<std::string> bind_ip, bool auto_h2d,
              std::optional<std::vector<int64_t>> global_shard_indices,
              double test_only_simulated_egress_gbps,
-             double test_only_simulated_ingress_gbps) {
+             double test_only_simulated_ingress_gbps,
+             std::optional<size_t> ring_buffer_size) {
             return WeightSynchronizer::test_only_create_cpu_instance(
                 num_layers, num_shards, std::move(slice_byte_sizes), local_port,
                 parallelism, listener_port, bind_ip, auto_h2d,
                 global_shard_indices, test_only_simulated_egress_gbps,
-                test_only_simulated_ingress_gbps);
+                test_only_simulated_ingress_gbps, ring_buffer_size);
           },
           nb::arg("num_layers"), nb::arg("num_shards"),
           nb::arg("slice_byte_size"), nb::arg("local_port") = nb::none(),
@@ -390,7 +395,8 @@ NB_MODULE(_tpu_raiden_jax, m) {
           nb::arg("bind_ip") = nb::none(), nb::arg("auto_h2d") = false,
           nb::arg("global_shard_indices") = nb::none(),
           nb::arg("test_only_simulated_egress_gbps") = 0.0,
-          nb::arg("test_only_simulated_ingress_gbps") = 0.0)
+          nb::arg("test_only_simulated_ingress_gbps") = 0.0,
+          nb::arg("ring_buffer_size") = nb::none())
 
       .def(
           "D2h",
@@ -494,6 +500,9 @@ NB_MODULE(_tpu_raiden_jax, m) {
       .def_prop_ro("num_layers", &WeightSynchronizer::num_layers)
       .def_prop_ro("num_shards", &WeightSynchronizer::num_shards)
       .def_prop_ro("slice_byte_size", &WeightSynchronizer::slice_byte_size)
+      .def_prop_ro("ring_buffer_size", &WeightSynchronizer::ring_buffer_size)
+      .def_prop_ro("allocated_host_dram_bytes",
+                   &WeightSynchronizer::allocated_host_dram_bytes)
       .def("get_metrics", &WeightSynchronizer::GetMetrics)
       .def("reset_metrics", &WeightSynchronizer::ResetMetrics);
 

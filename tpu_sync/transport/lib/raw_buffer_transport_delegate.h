@@ -39,6 +39,16 @@ class RawBufferTransportDelegate {
   // Authoritative total byte capacity of the target shard staging buffer.
   virtual size_t GetHostSize(size_t buffer_id, size_t shard_idx) = 0;
 
+  // Acquires the writable host pointer for an incoming push write of
+  // [dst_offset_bytes, dst_offset_bytes + span_bytes) on (buffer_id, shard_idx)
+  // for transfer `uuid`. Allows bounded ring-buffer delegates to synchronize
+  // slot reuse and record received byte extents for partial-buffer H2D.
+  virtual uint8_t* AcquireHostPointerForPush(size_t buffer_id, size_t shard_idx,
+                                             size_t dst_offset_bytes,
+                                             size_t span_bytes, uint64_t uuid) {
+    return GetHostPointer(buffer_id, shard_idx);
+  }
+
   // Notification triggered upon verified data chunk arrival for a specific
   // layer/tensor.
   virtual absl::Status OnLayerDataReceived(size_t layer_idx,

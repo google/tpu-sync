@@ -5899,6 +5899,128 @@ class JobEntityTest(absltest.TestCase):
     finally:
       controller.worker_rpc_client.close()
 
+  def test_dp_subsharding_reduces_dcn_bytes_by_dp_factor_v7x_topology(self):
+    """Verifies DP sub-sharding cuts DCN transfer bytes by K=DP (e.g.
+
+    2x for DP=2 on v7x).
+    """
+    # Model a tpuv7x:4x4x8 trainer source (32 hosts x 8 devices = 256 devices,
+    # mesh [32, 8] along ["fsdp", "tp"]) transferring to a tpuv7x:2x2x4
+    # rollout replica (4 hosts x 8 devices = 32 devices, mesh [2, 4, 4] along
+    # ["dp", "fsdp", "tp"] with DP=2 replication across "dp").
+    src_units = [
+        raiden_controller.RaidenId("trainer", str(i), "weights", 0)
+        for i in range(32)
+    ]
+    dst_units = [
+        raiden_controller.RaidenId("sampler_r0", str(j), "weights", 0)
+        for j in range(4)
+    ]
+    # 2D weight [512, 256] bf16 (item_size=2) -> total logical size = 256 KB.
+    # Sharded only on ["fsdp", "tp"], so replicated across "dp" (DP=2) on dst.
+    src_vars = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0_w",
+            shape=[512, 256],
+            mesh_shape=[32, 8],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=0,
+            sharding_spec=["fsdp", "tp"],
+        ),
+    ]
+    dst_vars = [
+        raiden_service_pb2.VariableMetadataProto(
+            name="layer_0_w",
+            shape=[512, 256],
+            mesh_shape=[4, 4],
+            layout=[1, 0],
+            item_size=2,
+            layer_idx=0,
+            sharding_spec=["fsdp", "tp"],
+        ),
+    ]
+
+    total_dcn_bytes_by_mode = {}
+    plans_by_mode = {}
+    for dp_subshard in (False, True):
+      client = RecordingWorkerRpcClient()
+      ctrl = raiden_controller.RaidenController(
+          port=0,
+          worker_rpc_client=client,
+          enable_plan_cache=False,
+          enable_dp_subsharding=dp_subshard,
+      )
+      try:
+        for i, u in enumerate(src_units):
+          ctrl.register_work_unit(
+              u,
+              [f"10.0.0.{i + 1}:{8000 + d}" for d in range(8)],
+              control_plane_rpc_address=f"10.0.0.{i + 1}:9000",
+              variables=src_vars,
+              mesh_shape=[32, 8],
+              mesh_axes=["fsdp", "tp"],
+          )
+        for j, u in enumerate(dst_units):
+          ctrl.register_work_unit(
+              u,
+              [f"10.0.1.{j + 1}:{8000 + d}" for d in range(8)],
+              control_plane_rpc_address=f"10.0.1.{j + 1}:9000",
+              variables=dst_vars,
+              mesh_shape=[2, 4, 4],
+              mesh_axes=["dp", "fsdp", "tp"],
+          )
+        fut = ctrl.start_transfer(
+            src_units=src_units,
+            dst_units=dst_units,
+            use_block_chunks=True,
+            req_id=f"req_dp_{dp_subshard}",
+            uuid=31001 if dp_subshard else 31000,
+        )
+        asyncio.run(fut.wait())
+        plan = ctrl.get_plan(f"req_dp_{dp_subshard}")
+        plans_by_mode[dp_subshard] = plan
+
+        total_bytes = 0
+        for u in src_units:
+          for _, entries in plan.shard_push_schedules[u].items():
+            for entry in entries:
+              size_b = entry[4]
+              count = entry[9]
+              total_bytes += size_b * count
+        total_dcn_bytes_by_mode[dp_subshard] = total_bytes
+      finally:
+        ctrl.worker_rpc_client.close()
+
+    model_bytes = 512 * 256 * 2  # 262,144 bytes
+    # Without DP sub-sharding, DP=2 transfers 2x model_bytes over DCN.
+    self.assertEqual(total_dcn_bytes_by_mode[False], 2 * model_bytes)
+    # With DP sub-sharding, DP=2 transfers 1x model_bytes over DCN (50% savings,
+    # 1/32 of the weights to each of the 32 devices in the replica).
+    self.assertEqual(total_dcn_bytes_by_mode[True], model_bytes)
+
+    # Verify each of the 32 destination devices receives model_bytes / 32
+    # starting at dst_offset_bytes = 0 (first half of its 1/16 shard buffer).
+    per_dst_bytes = {}
+    for u in src_units:
+      for _, entries in plans_by_mode[True].shard_push_schedules[u].items():
+        for entry in entries:
+          key = (entry[0], entry[1])
+          dst_off = entry[2]
+          size_b = entry[4]
+          dst_stride = entry[8]
+          count = entry[9]
+          # All writes to the sub-sharded destination buffer must land in the
+          # first half [0, (model_bytes / 16) / 2) so post-H2D ICI all_gather
+          # can reconstruct the full 1/16 shard in-place.
+          max_dst_end = dst_off + (count - 1) * dst_stride + size_b
+          self.assertLessEqual(max_dst_end, model_bytes // 32)
+          per_dst_bytes[key] = per_dst_bytes.get(key, 0) + size_b * count
+
+    self.assertLen(per_dst_bytes, 32)
+    for _, recv_bytes in per_dst_bytes.items():
+      self.assertEqual(recv_bytes, model_bytes // 32)
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -24,6 +24,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/container/flat_hash_map.h"
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
 #include "absl/log/log.h"
@@ -2275,6 +2276,256 @@ TEST_F(WeightSynchronizerTest, TelemetryRecordsOccupancyAndPushMetrics) {
           .empty());
 
   telemetry::RaidenMetricStore::GetGlobalMetricStore().SetBackends({});
+}
+
+TEST_F(WeightSynchronizerTest,
+       BoundedRingBufferPoolSavesHostMemoryAndTransfersMultiLayerCorrectly) {
+  auto client_status_or = xla::GetXlaPjrtCpuClient(xla::CpuClientOptions());
+  ASSERT_TRUE(client_status_or.ok()) << client_status_or.status().message();
+  auto client = std::move(client_status_or.value());
+
+  auto memory_space_status_or =
+      client->addressable_devices()[0]->default_memory_space();
+  ASSERT_TRUE(memory_space_status_or.ok())
+      << memory_space_status_or.status().message();
+  xla::PjRtMemorySpace* memory_space = memory_space_status_or.value();
+
+  constexpr size_t kNumLayers = 6;
+  constexpr size_t kNumShards = 2;
+  constexpr size_t kSliceByteSize = 4096;
+  constexpr size_t kRingBufferSize = 2;
+
+  std::vector<std::vector<std::unique_ptr<xla::PjRtBuffer>>> src_pjrt_buffers(
+      kNumLayers);
+  std::vector<std::vector<std::unique_ptr<xla::PjRtBuffer>>> dest_pjrt_buffers(
+      kNumLayers);
+  std::vector<std::vector<raiden::RaidenBufferHandle>> src_handles(kNumLayers);
+  std::vector<std::vector<raiden::RaidenBufferHandle>> dest_handles(kNumLayers);
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t s = 0; s < kNumShards; ++s) {
+      uint8_t val = static_cast<uint8_t>((l + 1) * 16 + s + 1);
+      std::vector<uint8_t> src_data(kSliceByteSize, val);
+      auto src_buf_or = client->BufferFromHostBuffer(
+          src_data.data(), xla::U8, {static_cast<int64_t>(kSliceByteSize)},
+          /*byte_strides=*/std::nullopt,
+          xla::PjRtClient::HostBufferSemantics::
+              kImmutableUntilTransferCompletes,
+          /*on_done_with_host_buffer=*/nullptr, memory_space,
+          /*device_layout=*/nullptr);
+      ASSERT_TRUE(src_buf_or.ok()) << src_buf_or.status().message();
+      auto src_h_or = raiden::RaidenBufferHandle::Acquire(src_buf_or->get());
+      ASSERT_TRUE(src_h_or.ok()) << src_h_or.status().message();
+      src_pjrt_buffers[l].push_back(std::move(*src_buf_or));
+      src_handles[l].push_back(*src_h_or);
+
+      std::vector<uint8_t> dst_data(kSliceByteSize, 0x00);
+      auto dst_buf_or = client->BufferFromHostBuffer(
+          dst_data.data(), xla::U8, {static_cast<int64_t>(kSliceByteSize)},
+          /*byte_strides=*/std::nullopt,
+          xla::PjRtClient::HostBufferSemantics::
+              kImmutableUntilTransferCompletes,
+          /*on_done_with_host_buffer=*/nullptr, memory_space,
+          /*device_layout=*/nullptr);
+      ASSERT_TRUE(dst_buf_or.ok()) << dst_buf_or.status().message();
+      auto dst_h_or = raiden::RaidenBufferHandle::Acquire(dst_buf_or->get());
+      ASSERT_TRUE(dst_h_or.ok()) << dst_h_or.status().message();
+      dest_pjrt_buffers[l].push_back(std::move(*dst_buf_or));
+      dest_handles[l].push_back(*dst_h_or);
+    }
+  }
+
+  auto ws_unbounded =
+      std::make_unique<WeightSynchronizerBase>(src_handles, /*local_port=*/0);
+  EXPECT_EQ(ws_unbounded->ring_buffer_size(), 0);
+  EXPECT_EQ(ws_unbounded->allocated_host_dram_bytes(),
+            kNumLayers * kNumShards * kSliceByteSize);
+
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      src_handles, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+      /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/2,
+      /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+      /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/false,
+      /*ring_buffer_size=*/kRingBufferSize);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      dest_handles, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+      /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/2,
+      /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+      /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/false,
+      /*ring_buffer_size=*/kRingBufferSize);
+
+  EXPECT_EQ(ws_source->ring_buffer_size(), kRingBufferSize);
+  EXPECT_EQ(ws_dest->ring_buffer_size(), kRingBufferSize);
+  // Bounded ring pool of size 2 for 6 layers reduces host DRAM by 3x!
+  EXPECT_EQ(ws_source->allocated_host_dram_bytes(),
+            kRingBufferSize * kNumShards * kSliceByteSize);
+  EXPECT_EQ(ws_dest->allocated_host_dram_bytes(),
+            kRingBufferSize * kNumShards * kSliceByteSize);
+
+  // Verify ring-slot pointer aliasing across layers l and l % kRingBufferSize.
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t s = 0; s < kNumShards; ++s) {
+      EXPECT_EQ(ws_source->GetHostPointer(l, s),
+                ws_source->GetHostPointer(l % kRingBufferSize, s));
+      EXPECT_EQ(ws_dest->GetHostPointer(l, s),
+                ws_dest->GetHostPointer(l % kRingBufferSize, s));
+    }
+  }
+
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = absl::StrCat("127.0.0.1:", *ws_dest->local_port());
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(false);
+  auto* schedules = request.mutable_shard_push_schedules();
+  absl::flat_hash_map<size_t, uint32_t> expected_layer_chunks;
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    expected_layer_chunks[l] = kNumShards;
+    for (size_t s = 0; s < kNumShards; ++s) {
+      auto* entry = (*schedules)[static_cast<int32_t>(s)].add_entries();
+      entry->set_dst_peer(dest_peer);
+      entry->set_dst_shard_idx(s);
+      entry->set_src_offset_bytes(0);
+      entry->set_dst_offset_bytes(0);
+      entry->set_size_bytes(kSliceByteSize);
+      entry->set_count(1);
+      entry->set_layer_idx(static_cast<int32_t>(l));
+    }
+  }
+
+  for (int step = 0; step < 2; ++step) {
+    uint64_t uuid = 91001 + step;
+    if (step == 1) {
+      // Update source device buffers for step 2 to verify multi-step ring reuse
+      for (size_t l = 0; l < kNumLayers; ++l) {
+        for (size_t s = 0; s < kNumShards; ++s) {
+          uint8_t val = static_cast<uint8_t>(0x80 + (l + 1) * 8 + s);
+          std::vector<uint8_t> src_data(kSliceByteSize, val);
+          ASSERT_OK(dest_handles[l][s]
+                        .CopyRawHostToDevice(src_data.data(), 0, 0)
+                        .Await());
+          ASSERT_OK(src_handles[l][s]
+                        .CopyRawHostToDevice(src_data.data(), 0, kSliceByteSize)
+                        .Await());
+        }
+      }
+    }
+
+    request.set_uuid(uuid);
+    ASSERT_OK(ws_dest->RegisterExpectedChunks(uuid, kNumLayers * kNumShards));
+    ASSERT_OK(
+        ws_dest->RegisterExpectedLayerChunks(uuid, expected_layer_chunks));
+    ASSERT_OK(ws_source->PushWeightsResharded(request));
+    ASSERT_OK(ws_dest->WaitForTransferCompletion(uuid));
+
+    auto h2d_fut_or = ws_dest->H2d(uuid);
+    ASSERT_TRUE(h2d_fut_or.ok()) << h2d_fut_or.status().message();
+    ASSERT_OK(h2d_fut_or->Await());
+
+    for (size_t l = 0; l < kNumLayers; ++l) {
+      for (size_t s = 0; s < kNumShards; ++s) {
+        uint8_t expected = (step == 0)
+                               ? static_cast<uint8_t>((l + 1) * 16 + s + 1)
+                               : static_cast<uint8_t>(0x80 + (l + 1) * 8 + s);
+        std::vector<uint8_t> readback(kSliceByteSize, 0);
+        ASSERT_OK(dest_pjrt_buffers[l][s]
+                      ->CopyRawToHost(readback.data(), 0, kSliceByteSize)
+                      .Await());
+        for (size_t b = 0; b < kSliceByteSize; ++b) {
+          EXPECT_EQ(readback[b], expected)
+              << "Step " << step << " mismatch at layer " << l << " shard " << s
+              << " byte " << b;
+        }
+      }
+    }
+  }
+}
+
+TEST_F(WeightSynchronizerTest,
+       SubShardedPartialExtentH2dPreservesDeviceBufferSuffix) {
+  auto client_status_or = xla::GetXlaPjrtCpuClient(xla::CpuClientOptions());
+  ASSERT_TRUE(client_status_or.ok()) << client_status_or.status().message();
+  auto client = std::move(client_status_or.value());
+
+  auto memory_space_status_or =
+      client->addressable_devices()[0]->default_memory_space();
+  ASSERT_TRUE(memory_space_status_or.ok())
+      << memory_space_status_or.status().message();
+  xla::PjRtMemorySpace* memory_space = memory_space_status_or.value();
+
+  constexpr size_t kSliceByteSize = 2048;
+  constexpr size_t kSubShardByteSize = kSliceByteSize / 2;
+
+  std::vector<uint8_t> src_data(kSliceByteSize, 0x5A);
+  std::vector<uint8_t> dst_data(kSliceByteSize, 0xEE);
+
+  auto src_buf_or = client->BufferFromHostBuffer(
+      src_data.data(), xla::U8, {static_cast<int64_t>(kSliceByteSize)},
+      std::nullopt,
+      xla::PjRtClient::HostBufferSemantics::kImmutableUntilTransferCompletes,
+      nullptr, memory_space, nullptr);
+  ASSERT_TRUE(src_buf_or.ok());
+  auto src_pjrt_buffer = std::move(*src_buf_or);
+
+  auto dst_buf_or = client->BufferFromHostBuffer(
+      dst_data.data(), xla::U8, {static_cast<int64_t>(kSliceByteSize)},
+      std::nullopt,
+      xla::PjRtClient::HostBufferSemantics::kImmutableUntilTransferCompletes,
+      nullptr, memory_space, nullptr);
+  ASSERT_TRUE(dst_buf_or.ok());
+  auto dst_pjrt_buffer = std::move(*dst_buf_or);
+
+  auto src_h_or = raiden::RaidenBufferHandle::Acquire(src_pjrt_buffer.get());
+  auto dst_h_or = raiden::RaidenBufferHandle::Acquire(dst_pjrt_buffer.get());
+  ASSERT_TRUE(src_h_or.ok());
+  ASSERT_TRUE(dst_h_or.ok());
+
+  std::vector<std::vector<raiden::RaidenBufferHandle>> src_buffers = {
+      {*src_h_or}};
+  std::vector<std::vector<raiden::RaidenBufferHandle>> dst_buffers = {
+      {*dst_h_or}};
+
+  auto ws_source =
+      std::make_unique<WeightSynchronizerBase>(src_buffers, /*local_port=*/0);
+  auto ws_dest =
+      std::make_unique<WeightSynchronizerBase>(dst_buffers, /*local_port=*/0);
+
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  std::string dest_peer = absl::StrCat("127.0.0.1:", *ws_dest->local_port());
+
+  // Push only the DP=2 sub-shard (first half of the buffer) to dst_offset=0.
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(false);
+  request.set_uuid(92001);
+  auto* entry = (*request.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer(dest_peer);
+  entry->set_dst_shard_idx(0);
+  entry->set_src_offset_bytes(0);
+  entry->set_dst_offset_bytes(0);
+  entry->set_size_bytes(kSubShardByteSize);
+  entry->set_count(1);
+  entry->set_layer_idx(0);
+
+  ASSERT_OK(ws_dest->RegisterExpectedChunks(request.uuid(), 1));
+  ASSERT_OK(ws_source->PushWeightsResharded(request));
+  ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
+
+  auto h2d_fut_or = ws_dest->H2d(request.uuid());
+  ASSERT_TRUE(h2d_fut_or.ok());
+  ASSERT_OK(h2d_fut_or->Await());
+
+  WeightSyncMetrics dst_metrics = ws_dest->GetMetrics();
+  EXPECT_EQ(dst_metrics.last_h2d_bytes, kSubShardByteSize);
+
+  std::vector<uint8_t> readback(kSliceByteSize, 0);
+  ASSERT_OK(dst_pjrt_buffer->CopyRawToHost(readback.data(), 0, kSliceByteSize)
+                .Await());
+  for (size_t b = 0; b < kSubShardByteSize; ++b) {
+    EXPECT_EQ(readback[b], 0x5A) << "Prefix mismatch at byte " << b;
+  }
+  for (size_t b = kSubShardByteSize; b < kSliceByteSize; ++b) {
+    EXPECT_EQ(readback[b], 0xEE) << "Suffix overwritten at byte " << b;
+  }
 }
 
 }  // namespace

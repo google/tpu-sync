@@ -16,6 +16,7 @@
 
 import os
 import socket
+import threading
 
 from absl.testing import absltest  # pylint: disable=g-import-not-at-top
 import jax
@@ -25,6 +26,7 @@ import numpy as np
 from tpu_sync.api.jax import weight_synchronizer
 from tpu_sync.frameworks.jax import utils
 from tpu_sync.rpc import raiden_service_pb2
+from tpu_sync.weight_sync.manager import reshard_planner
 
 
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
@@ -641,6 +643,325 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     self.assertEqual(m_reset["total_h2h_time_ms"], 0.0)
     self.assertEqual(m_reset["total_h2h_bandwidth_gbps"], 0.0)
     self.assertEqual(m_reset["push_resharded_call_count"], 0)
+
+  def test_bounded_ring_buffer_pool_jax_e2e(self):
+    num_layers = 6
+    ring_size = 2
+    src_arrs = [
+        jax.device_put(
+            jnp.ones(self.shape, dtype=self.dtype) * float(i + 1),
+            self.sharding,
+        )
+        for i in range(num_layers)
+    ]
+    dst_arrs = [
+        jax.device_put(jnp.zeros(self.shape, dtype=self.dtype), self.sharding)
+        for _ in range(num_layers)
+    ]
+    for arr in src_arrs + dst_arrs:
+      arr.block_until_ready()
+
+    ws_unbounded = WeightSynchronizer(
+        jax_arrays=src_arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+        bind_ip="127.0.0.1",
+    )
+    ws_source = WeightSynchronizer(
+        jax_arrays=src_arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+        ring_buffer_size=ring_size,
+    )
+    ws_dest = WeightSynchronizer(
+        jax_arrays=dst_arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+        ring_buffer_size=ring_size,
+    )
+    self.addCleanup(ws_unbounded.shutdown)
+    self.addCleanup(ws_source.shutdown)
+    self.addCleanup(ws_dest.shutdown)
+
+    self.assertEqual(ws_source.ring_buffer_size, ring_size)
+    self.assertEqual(ws_dest.ring_buffer_size, ring_size)
+    self.assertEqual(
+        ws_source.allocated_host_dram_bytes * (num_layers // ring_size),
+        ws_unbounded.allocated_host_dram_bytes,
+    )
+
+    def _send_ctrl_req(port: int, req: raiden_service_pb2.ControlRequest):
+      payload = req.SerializeToString()
+      sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+      sock.connect(("::1", port))
+      sock.sendall(len(payload).to_bytes(4, "big") + payload)
+      resp_len = int.from_bytes(sock.recv(4), "big")
+      resp_bytes = sock.recv(resp_len)
+      resp = raiden_service_pb2.ControlResponse()
+      resp.ParseFromString(resp_bytes)
+      self.assertTrue(resp.success, resp.message)
+      sock.close()
+
+    uuid = 75001
+    num_shards = ws_source.num_shards
+    slice_bytes = ws_source.slice_byte_size
+    dst_start_req = raiden_service_pb2.StartTransferRequest(
+        is_sender=False,
+        uuid=uuid,
+        expected_block_count=num_layers * num_shards,
+    )
+    for l in range(num_layers):
+      dst_start_req.expected_layer_chunk_counts[l] = num_shards
+    _send_ctrl_req(
+        ws_dest.listener_port,
+        raiden_service_pb2.ControlRequest(
+            command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+            start_transfer_request=dst_start_req,
+        ),
+    )
+
+    src_start_req = raiden_service_pb2.StartTransferRequest(
+        is_sender=True,
+        uuid=uuid,
+        skip_d2h=False,
+    )
+    for s in range(num_shards):
+      sched = src_start_req.shard_push_schedules[s]
+      for l in range(num_layers):
+        entry = sched.entries.add()
+        entry.dst_peer = f"127.0.0.1:{ws_dest.local_port}"
+        entry.dst_shard_idx = s
+        entry.src_offset_bytes = 0
+        entry.dst_offset_bytes = 0
+        entry.size_bytes = slice_bytes
+        entry.count = 1
+        entry.layer_idx = l
+    _send_ctrl_req(
+        ws_source.listener_port,
+        raiden_service_pb2.ControlRequest(
+            command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+            start_transfer_request=src_start_req,
+        ),
+    )
+    ws_dest.wait_for_transfer_completion(uuid)
+    ws_dest.h2d()
+
+    for i in range(num_layers):
+      np.testing.assert_array_equal(
+          np.asarray(dst_arrs[i]), np.asarray(src_arrs[i])
+      )
+
+  def test_dp_subsharding_and_post_h2d_ici_all_gather_e2e(self):
+    # Source mesh: (4, 2) along ("fsdp", "tp")
+    # Destination mesh: (2, 2, 2) along ("dp", "fsdp", "tp") -> DP=2 replicated!
+    src_mesh = jax.sharding.Mesh(
+        np.array(self.devices[:8]).reshape(4, 2), ("fsdp", "tp")
+    )
+    dst_mesh = jax.sharding.Mesh(
+        np.array(self.devices[:8]).reshape(2, 2, 2), ("dp", "fsdp", "tp")
+    )
+    src_sharding = jax.sharding.NamedSharding(
+        src_mesh, jax.sharding.PartitionSpec("fsdp", "tp")
+    )
+    dst_sharding = jax.sharding.NamedSharding(
+        dst_mesh, jax.sharding.PartitionSpec("fsdp", "tp")
+    )
+    shape = (64, 32)
+    src_arrs = [
+        jax.device_put(
+            jnp.arange(np.prod(shape), dtype=self.dtype).reshape(shape),
+            src_sharding,
+        )
+    ]
+    dst_arrs = [
+        jax.device_put(jnp.zeros(shape, dtype=self.dtype), dst_sharding)
+    ]
+    for arr in src_arrs + dst_arrs:
+      arr.block_until_ready()
+
+    ws_source = WeightSynchronizer(
+        jax_arrays=src_arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    ws_dest = WeightSynchronizer(
+        jax_arrays=dst_arrs,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_source.shutdown)
+    self.addCleanup(ws_dest.shutdown)
+
+    # Disable CPU tiling on CPU devices since XLA CPU arrays are untiled.
+    ws_source.test_only_set_skip_tiling(True)
+    ws_dest.test_only_set_skip_tiling(True)
+
+    src_id = reshard_planner.RaidenId("trainer", "0", "weights", 0)
+    dst_id = reshard_planner.RaidenId("sampler", "0", "weights", 0)
+    var_src = raiden_service_pb2.VariableMetadataProto(
+        name="w0",
+        shape=list(shape),
+        mesh_shape=[4, 2],
+        layout=[1, 0],
+        item_size=4,
+        layer_idx=0,
+        sharding_spec=["fsdp", "tp"],
+    )
+    var_dst = raiden_service_pb2.VariableMetadataProto(
+        name="w0",
+        shape=list(shape),
+        mesh_shape=[2, 2],
+        layout=[1, 0],
+        item_size=4,
+        layer_idx=0,
+        sharding_spec=["fsdp", "tp"],
+    )
+    src_shards = [f"127.0.0.1:{ws_source.local_port}"] * 8
+    dst_shards = [f"127.0.0.1:{ws_dest.local_port}"] * 8
+    dst_meta_proto = raiden_service_pb2.RegisterWorkUnitRequest(
+        unit=raiden_service_pb2.RaidenIdProto(
+            job_name=dst_id.job_name,
+            job_replica_id=str(dst_id.job_replica_id),
+            data_name=dst_id.data_name,
+            data_replica_idx=dst_id.data_replica_idx,
+        ),
+        shards=dst_shards,
+        control_plane_rpc_address=f"127.0.0.1:{ws_dest.listener_port}",
+        variables=[var_dst],
+        mesh_shape=[2, 2, 2],
+        mesh_axes=["dp", "fsdp", "tp"],
+    )
+    common_kwargs = dict(
+        src_units=[src_id],
+        dst_units=[dst_id],
+        dst_metadata=[dst_meta_proto],
+        entities={
+            src_id: reshard_planner.JobEntity(unit=src_id, shards=src_shards)
+        },
+        registered_variables={src_id: [var_src]},
+        registered_global_shapes={},
+        registered_mesh_shapes={src_id: [4, 2], dst_id: [2, 2, 2]},
+        registered_mesh_axes={
+            src_id: ["fsdp", "tp"],
+            dst_id: ["dp", "fsdp", "tp"],
+        },
+        registered_host_subgrids={},
+        registered_layouts={},
+        registered_itemsizes={},
+        registered_shards={src_id: src_shards, dst_id: dst_shards},
+        computed_phys_meshes={},
+        worker_endpoints={
+            src_id: f"127.0.0.1:{ws_source.listener_port}",
+            dst_id: f"127.0.0.1:{ws_dest.listener_port}",
+        },
+        broadcast_k=64,
+        lock=threading.Lock(),
+        skip_tiling={0: True},
+    )
+    sched_full = (
+        reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+            **common_kwargs,
+            enable_dp_subsharding=False,
+        )
+    )
+    sched_sub = (
+        reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata(
+            **common_kwargs,
+            enable_dp_subsharding=True,
+        )
+    )
+
+    full_bytes = 0
+    for s_entries in sched_full.direct_schedules[src_id].values():
+      for e in s_entries:
+        full_bytes += e[4] * e[9]
+    sub_bytes = 0
+    for s_entries in sched_sub.direct_schedules[src_id].values():
+      for e in s_entries:
+        sub_bytes += e[4] * e[9]
+    tensor_bytes = int(np.prod(shape)) * 4
+    self.assertEqual(full_bytes, 2 * tensor_bytes)
+    self.assertEqual(sub_bytes, tensor_bytes)
+
+    def _send_ctrl_req(port: int, req: raiden_service_pb2.ControlRequest):
+      payload = req.SerializeToString()
+      sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+      sock.connect(("::1", port))
+      sock.sendall(len(payload).to_bytes(4, "big") + payload)
+      resp_len = int.from_bytes(sock.recv(4), "big")
+      resp_bytes = sock.recv(resp_len)
+      resp = raiden_service_pb2.ControlResponse()
+      resp.ParseFromString(resp_bytes)
+      self.assertTrue(resp.success, resp.message)
+      sock.close()
+
+    uuid = 76001
+    dst_start_req = raiden_service_pb2.StartTransferRequest(
+        is_sender=False,
+        uuid=uuid,
+        expected_block_count=sched_sub.dst_unit_counts[dst_id],
+    )
+    dst_start_req.skip_tiling[0] = True
+    for l_idx, cnt in sched_sub.dst_unit_layer_counts.get(dst_id, {}).items():
+      dst_start_req.expected_layer_chunk_counts[l_idx] = cnt
+    _send_ctrl_req(
+        ws_dest.listener_port,
+        raiden_service_pb2.ControlRequest(
+            command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+            start_transfer_request=dst_start_req,
+        ),
+    )
+
+    src_start_req = raiden_service_pb2.StartTransferRequest(
+        is_sender=True,
+        uuid=uuid,
+        skip_d2h=False,
+    )
+    src_start_req.skip_tiling[0] = True
+    for src_s, entries in sched_sub.direct_schedules[src_id].items():
+      sched_proto = src_start_req.shard_push_schedules[src_s]
+      for e in entries:
+        entry = sched_proto.entries.add()
+        entry.dst_peer = e[0]
+        entry.dst_shard_idx = e[1]
+        entry.dst_offset_bytes = e[2]
+        entry.src_offset_bytes = e[3]
+        entry.size_bytes = e[4]
+        entry.src_block_id = e[5]
+        entry.dst_block_id = e[6]
+        entry.src_stride_bytes = e[7]
+        entry.dst_stride_bytes = e[8]
+        entry.count = e[9]
+        entry.layer_idx = e[10]
+    _send_ctrl_req(
+        ws_source.listener_port,
+        raiden_service_pb2.ControlRequest(
+            command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+            start_transfer_request=src_start_req,
+        ),
+    )
+
+    ws_dest.wait_for_transfer_completion(uuid)
+    gathered_arrs = ws_dest.h2d(ici_all_gather=True)
+    self.assertIsNotNone(gathered_arrs)
+    self.assertLen(gathered_arrs, 1)
+    gathered_arrs[0].block_until_ready()
+
+    # Verify the full tensor and every DP=2 replica shard matches src_arrs[0]
+    np.testing.assert_array_equal(
+        np.asarray(gathered_arrs[0]), np.asarray(src_arrs[0])
+    )
+    for shard in gathered_arrs[0].addressable_shards:
+      expected_slice = np.asarray(src_arrs[0])[shard.index]
+      np.testing.assert_array_equal(np.asarray(shard.data), expected_slice)
 
 
 class ShardSortingUtilTest(absltest.TestCase):

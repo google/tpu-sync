@@ -64,6 +64,7 @@ WorkerRpcClient = job_entity.WorkerRpcClient
 ReshardPlanner = reshard_planner.ReshardPlanner
 _get_global_indices = reshard_planner.get_global_indices
 compute_host_subgrid = reshard_planner.compute_host_subgrid
+find_dp_subshard_split_dim = reshard_planner.find_dp_subshard_split_dim
 generate_strided_copy_chunks = reshard_planner.generate_strided_copy_chunks
 generate_strided_copy_chunks_tile_aware = (
     reshard_planner.generate_strided_copy_chunks_tile_aware
@@ -115,6 +116,7 @@ class RaidenController:
       request_registry_ttl_s: float = 600.0,
       broadcast_k: Optional[int] = None,
       enable_plan_cache: bool = True,
+      enable_dp_subsharding: Optional[bool] = None,
   ):
     """Initializes the RaidenController.
 
@@ -126,6 +128,8 @@ class RaidenController:
       broadcast_k: Fan-out factor K for tree-based broadcast transfers.
       enable_plan_cache: Whether to cache transfer planning and resharding
         schedules across transfer invocations with identical topologies.
+      enable_dp_subsharding: Optional flag to sub-shard DCN transfers across
+        replicated destination axes (for post-H2D ICI all-gather).
     """
     self.port = port
     self.broadcast_k = (
@@ -134,6 +138,7 @@ class RaidenController:
         else int(os.environ.get("RAIDEN_BROADCAST_K", "64"))
     )
     self.enable_plan_cache = enable_plan_cache
+    self.enable_dp_subsharding = enable_dp_subsharding
     self._plan_cache: dict[Any, _CachedTransferSchedule] = {}
     self._active_transfers: dict[str, TransferPlan] = {}
     self._active_tasks: dict[str, RaidenFuture] = {}
@@ -638,6 +643,7 @@ class RaidenController:
       skip_tiling: Optional[dict[int, bool]] = None,
       dst_controller_address: Optional[str] = None,
       src_controller_address: Optional[str] = None,
+      enable_dp_subsharding: Optional[bool] = None,
   ) -> tuple[Any, ...]:
     """Builds a hashable plan cache key from transfer arguments."""
     return ReshardPlanner.make_plan_cache_key(
@@ -647,6 +653,7 @@ class RaidenController:
         skip_tiling=skip_tiling,
         dst_controller_address=dst_controller_address,
         src_controller_address=src_controller_address,
+        enable_dp_subsharding=enable_dp_subsharding,
     )
 
   async def warmup_transfer_plan(
@@ -657,10 +664,16 @@ class RaidenController:
       skip_tiling: Optional[dict[int, bool]] = None,
       dst_controller_address: Optional[str] = None,
       src_controller_address: Optional[str] = None,
+      enable_dp_subsharding: Optional[bool] = None,
   ) -> _CachedTransferSchedule:
     """Precomputes and caches transfer schedule outside of the critical path."""
     if group_size <= 0:
       raise ValueError("group_size must be positive")
+    effective_dp = (
+        enable_dp_subsharding
+        if enable_dp_subsharding is not None
+        else self.enable_dp_subsharding
+    )
     cache_key = self._make_plan_cache_key(
         src_units=src_units,
         dst_units=dst_units,
@@ -668,6 +681,7 @@ class RaidenController:
         skip_tiling=skip_tiling,
         dst_controller_address=dst_controller_address,
         src_controller_address=src_controller_address,
+        enable_dp_subsharding=effective_dp,
     )
     with self._lock:
       if cache_key in self._plan_cache:
@@ -681,6 +695,7 @@ class RaidenController:
         skip_tiling=skip_tiling,
         req_id="warmup",
         uuid=str(random.randint(1, 2**63 - 1)),
+        enable_dp_subsharding=effective_dp,
     )
     raw_schedules = schedule.direct_schedules or schedule.computed_schedules
     if raw_schedules:
@@ -706,6 +721,7 @@ class RaidenController:
       ] = None,
       req_id: str = "warmup",
       uuid: Any = "",
+      enable_dp_subsharding: Optional[bool] = None,
   ) -> _CachedTransferSchedule:
     """Computes transfer schedule math via ReshardPlanner."""
     t_start = time.perf_counter()
@@ -722,6 +738,11 @@ class RaidenController:
       dst_metadata = self._get_local_metadata(dst_units)
 
     worker_endpoints = self.get_entity_rpc_addresses()
+    effective_dp = (
+        enable_dp_subsharding
+        if enable_dp_subsharding is not None
+        else self.enable_dp_subsharding
+    )
 
     schedule = self._planner.compute_transfer_schedule_from_metadata(
         src_units=src_units,
@@ -745,6 +766,7 @@ class RaidenController:
         shard_push_schedules=shard_push_schedules,
         req_id=req_id,
         uuid=uuid,
+        enable_dp_subsharding=effective_dp,
     )
     common.record_histogram(
         "weight_sync_schedule_generation_time_ms",
@@ -938,6 +960,7 @@ class RaidenController:
       skip_tiling: Optional[dict[int, bool]] = None,
       group_size: int = 1,
       use_cached_plan: bool = True,
+      enable_dp_subsharding: Optional[bool] = None,
   ) -> RaidenFuture:
     """Generates a transfer plan for the requested entities and dispatches it."""
     if group_size <= 0:
@@ -1142,6 +1165,11 @@ class RaidenController:
               _format_units(dst_units),
           )
 
+          effective_dp = (
+              enable_dp_subsharding
+              if enable_dp_subsharding is not None
+              else self.enable_dp_subsharding
+          )
           cache_key = self._make_plan_cache_key(
               src_units=src_units,
               dst_units=dst_units,
@@ -1149,6 +1177,7 @@ class RaidenController:
               skip_tiling=skip_tiling,
               dst_controller_address=dst_controller_address,
               src_controller_address=src_controller_address,
+              enable_dp_subsharding=effective_dp,
           )
 
           cached_schedule = None
@@ -1170,6 +1199,7 @@ class RaidenController:
                 shard_push_schedules=shard_push_schedules,
                 req_id=req_id,
                 uuid=uuid,
+                enable_dp_subsharding=effective_dp,
             )
             if (
                 self.enable_plan_cache

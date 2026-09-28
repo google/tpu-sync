@@ -49,6 +49,53 @@ class RecordingWorkerRpcClient(raiden_controller.WorkerRpcClient):
       self.event_log.append((self.label, target_id))
 
 
+_pending_test_rpc_client = None
+_orig_worker_rpc_client_init = raiden_controller.WorkerRpcClient.__init__
+_orig_controller_init = raiden_controller.RaidenController.__init__
+_orig_get_or_create_entity = (
+    raiden_controller.RaidenController.get_or_create_entity
+)
+
+
+def _tracking_worker_rpc_client_init(self, *args, **kwargs):
+  global _pending_test_rpc_client
+  _orig_worker_rpc_client_init(self, *args, **kwargs)
+  if type(self) not in (
+      raiden_controller.WorkerRpcClient,
+      raiden_controller.WeightSyncWorkerRpcClient,
+  ):
+    _pending_test_rpc_client = self
+
+
+def _tracking_controller_init(self, *args, **kwargs):
+  global _pending_test_rpc_client
+  _orig_controller_init(self, *args, **kwargs)
+  self._test_rpc_client = _pending_test_rpc_client
+  _pending_test_rpc_client = None
+  if self._test_rpc_client is not None and hasattr(
+      self._test_rpc_client, "bind_entities"
+  ):
+    self._test_rpc_client.bind_entities(
+        self._entities, override_entity_client=True
+    )
+
+
+def _tracking_get_or_create_entity(self, unit):
+  ent = _orig_get_or_create_entity(self, unit)
+  test_client = getattr(self, "_test_rpc_client", None)
+  if test_client is not None:
+    ent._worker_rpc_client = test_client  # pylint: disable=protected-access
+    ent._owns_rpc_client = False  # pylint: disable=protected-access
+  return ent
+
+
+raiden_controller.WorkerRpcClient.__init__ = _tracking_worker_rpc_client_init
+raiden_controller.RaidenController.__init__ = _tracking_controller_init
+raiden_controller.RaidenController.get_or_create_entity = (
+    _tracking_get_or_create_entity
+)
+
+
 class RaidenControllerTest(absltest.TestCase):
 
   def test_register_work_unit_accepts_duplicate_endpoints_for_shared_port(
@@ -57,10 +104,8 @@ class RaidenControllerTest(absltest.TestCase):
     # JAX/Pathways: one process serves several local devices behind a single
     # transfer port, so a unit's shards legitimately register identical
     # endpoints. The list length is the shard count; the addresses coincide.
-    client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10000, worker_rpc_client=client
-    )
+    _ = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(port=10000)
     unit = raiden_controller.RaidenId(
         job_name="pathways",
         job_replica_id="host0",
@@ -244,9 +289,7 @@ class RaidenControllerTest(absltest.TestCase):
 
   def test_dynamic_balancing_and_overlap_planner(self):
     dummy_client = DummyWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10000, worker_rpc_client=dummy_client
-    )
+    controller = raiden_controller.RaidenController(port=10000)
 
     src_unit_0 = raiden_controller.RaidenId(
         job_name="sampler",
@@ -306,9 +349,8 @@ class RaidenControllerTest(absltest.TestCase):
     asyncio.run(future_2.wait())
 
   def test_fan_out_multiple_targets(self):
-    controller = raiden_controller.RaidenController(
-        port=10001, worker_rpc_client=DummyWorkerRpcClient()
-    )
+    _ = DummyWorkerRpcClient()
+    controller = raiden_controller.RaidenController(port=10001)
 
     src = raiden_controller.RaidenId(
         job_name="trainer",
@@ -350,10 +392,8 @@ class RaidenControllerTest(absltest.TestCase):
       ) -> None:
         recorded_actions.append(("start", [target_id]))
 
-    mock_client = MockWorkerClient()
-    controller = raiden_controller.RaidenController(
-        port=10002, worker_rpc_client=mock_client
-    )
+    _ = MockWorkerClient()
+    controller = raiden_controller.RaidenController(port=10002)
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -421,9 +461,7 @@ class RaidenControllerTest(absltest.TestCase):
 
   def test_multi_shard_worker_resharding(self):
     dummy_client = DummyWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10004, worker_rpc_client=dummy_client
-    )
+    controller = raiden_controller.RaidenController(port=10004)
     src = raiden_controller.RaidenId("trainer", "0", "weights")
     dst = raiden_controller.RaidenId("sampler", "0", "weights")
 
@@ -457,9 +495,7 @@ class RaidenControllerTest(absltest.TestCase):
 
   def test_resharding_with_layout_permutation_different_meshes(self):
     dummy_client = DummyWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10004, worker_rpc_client=dummy_client
-    )
+    controller = raiden_controller.RaidenController(port=10004)
 
     # Mesh [2, 3, 4], layout [0, 2, 1], num_hosts=3.
     # Host axis is dim 1 (size 3).
@@ -547,10 +583,8 @@ class RaidenControllerTest(absltest.TestCase):
         is_sender = transfer_plan.is_sender
         recorded_calls.append((target_id, is_sender))
 
-    mock_client = MockBroadcastWorkerClient()
-    controller = raiden_controller.RaidenController(
-        port=10004, worker_rpc_client=mock_client
-    )
+    _ = MockBroadcastWorkerClient()
+    controller = raiden_controller.RaidenController(port=10004)
     controller.broadcast_k = 2
 
     src = raiden_controller.RaidenId(
@@ -622,10 +656,8 @@ class RaidenControllerTest(absltest.TestCase):
         if target_id.job_replica_id == "1":
           raise RuntimeError("Simulated start_transfer failure")
 
-    mock_client = MockFailureWorkerClient()
-    controller = raiden_controller.RaidenController(
-        port=10005, worker_rpc_client=mock_client
-    )
+    _ = MockFailureWorkerClient()
+    controller = raiden_controller.RaidenController(port=10005)
     controller.broadcast_k = 2
 
     src = raiden_controller.RaidenId(
@@ -734,7 +766,6 @@ class RaidenControllerTest(absltest.TestCase):
 
     facade = raiden_controller.RaidenControllerClientFacade(
         f"127.0.0.1:{server.port}",
-        name_resolver=controller.worker_rpc_client.name_resolver,
     )
 
     calls = []
@@ -777,9 +808,7 @@ class RaidenControllerTest(absltest.TestCase):
   def test_multi_variable_resharding_planning(self):
     """Verifies resharding planning for multiple variables using absolute offsets."""
     client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10000, worker_rpc_client=client
-    )
+    controller = raiden_controller.RaidenController(port=10000)
 
     src_unit = raiden_controller.RaidenId(
         "prefill", "engine-rank0", "weights", 0
@@ -885,9 +914,7 @@ class RaidenControllerTest(absltest.TestCase):
 
   def test_upfront_d2h_optimization_legacy_path(self):
     client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10004, worker_rpc_client=client
-    )
+    controller = raiden_controller.RaidenController(port=10004)
     controller.broadcast_k = 2
 
     src = raiden_controller.RaidenId(
@@ -954,9 +981,7 @@ class RaidenControllerTest(absltest.TestCase):
 
   def test_skip_d2h_true_no_upfront_copy_legacy_path(self):
     client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10004, worker_rpc_client=client
-    )
+    controller = raiden_controller.RaidenController(port=10004)
     controller.broadcast_k = 2
 
     src = raiden_controller.RaidenId(
@@ -1024,9 +1049,7 @@ class RaidenControllerTest(absltest.TestCase):
 
   def test_auto_calculate_expected_block_count(self):
     client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10004, worker_rpc_client=client
-    )
+    controller = raiden_controller.RaidenController(port=10004)
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -1069,9 +1092,7 @@ class RaidenControllerTest(absltest.TestCase):
 
   def test_auto_calculate_expected_block_count_strided(self):
     client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10004, worker_rpc_client=client
-    )
+    controller = raiden_controller.RaidenController(port=10004)
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -1115,9 +1136,7 @@ class RaidenControllerTest(absltest.TestCase):
 
   def test_auto_calculate_expected_block_count_strided_skip_tiling(self):
     client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10004, worker_rpc_client=client
-    )
+    controller = raiden_controller.RaidenController(port=10004)
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -1212,9 +1231,7 @@ class RaidenControllerTest(absltest.TestCase):
 
   def test_auto_calculate_expected_block_count_mixed(self):
     client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10004, worker_rpc_client=client
-    )
+    controller = raiden_controller.RaidenController(port=10004)
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -1299,9 +1316,9 @@ class RaidenControllerTest(absltest.TestCase):
     self.assertEqual(plan.expected_block_count, 2)
 
   def test_plan_caching_hit_and_reuse(self):
-    client = RecordingWorkerRpcClient()
+    _ = RecordingWorkerRpcClient()
     controller = raiden_controller.RaidenController(
-        port=10005, worker_rpc_client=client, enable_plan_cache=True
+        port=10005, enable_plan_cache=True
     )
 
     src = raiden_controller.RaidenId(
@@ -1362,10 +1379,8 @@ class RaidenControllerTest(absltest.TestCase):
     self.assertEqual(plan_1.shard_push_schedules, plan_2.shard_push_schedules)
 
   def test_plan_caching_invalidation_on_reregistration(self):
-    client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10006, worker_rpc_client=client
-    )
+    _ = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(port=10006)
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -1442,9 +1457,9 @@ class RaidenControllerTest(absltest.TestCase):
     port = bind_sock.getsockname()[1]
     bind_sock.close()
 
-    client = RecordingWorkerRpcClient()
+    _ = RecordingWorkerRpcClient()
     controller = raiden_controller.RaidenController(
-        port=port, worker_rpc_client=client, enable_plan_cache=True
+        port=port, enable_plan_cache=True
     )
     server = raiden_controller.RaidenControllerServer(controller)
     server.start()
@@ -1534,9 +1549,9 @@ class RaidenControllerTest(absltest.TestCase):
       server._thread.join(timeout=2)
 
   def test_plan_caching_unrelated_unit_registration_does_not_invalidate(self):
-    client = RecordingWorkerRpcClient()
+    _ = RecordingWorkerRpcClient()
     controller = raiden_controller.RaidenController(
-        port=10009, worker_rpc_client=client, enable_plan_cache=True
+        port=10009, enable_plan_cache=True
     )
 
     src = raiden_controller.RaidenId(
@@ -1586,10 +1601,8 @@ class RaidenControllerTest(absltest.TestCase):
     self.assertEqual(controller.get_plan_cache_size(), 1)
 
   def test_plan_caching_clear_cache(self):
-    client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10007, worker_rpc_client=client
-    )
+    _ = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(port=10007)
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -1629,9 +1642,9 @@ class RaidenControllerTest(absltest.TestCase):
     self.assertEqual(controller.get_plan_cache_size(), 0)
 
   def test_plan_caching_disabled(self):
-    client = RecordingWorkerRpcClient()
+    _ = RecordingWorkerRpcClient()
     controller = raiden_controller.RaidenController(
-        port=10008, worker_rpc_client=client, enable_plan_cache=False
+        port=10008, enable_plan_cache=False
     )
 
     src = raiden_controller.RaidenId(
@@ -1669,10 +1682,8 @@ class RaidenControllerTest(absltest.TestCase):
     self.assertEqual(controller.get_plan_cache_size(), 0)
 
   def test_plan_caching_multi_target_distinct_keys(self):
-    client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10009, worker_rpc_client=client
-    )
+    _ = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(port=10009)
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -1741,9 +1752,7 @@ class RaidenControllerTest(absltest.TestCase):
 
   def test_pipelined_d2h_and_push_execution(self):
     client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10010, worker_rpc_client=client
-    )
+    controller = raiden_controller.RaidenController(port=10010)
 
     src = raiden_controller.RaidenId(
         job_name="trainer", job_replica_id="0", data_name="weights"
@@ -2230,9 +2239,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
 
   def test_variable_resharding_with_grouping(self):
     client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10005, worker_rpc_client=client
-    )
+    controller = raiden_controller.RaidenController(port=10005)
     controller.broadcast_k = 1
 
     src = raiden_controller.RaidenId(
@@ -2533,9 +2540,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
   def test_replicated_source_resharding_deduplication(self):
     """Tests that when source ranks replicate a tensor, only one source pushes to each destination."""
     dummy_client = DummyWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10010, worker_rpc_client=dummy_client
-    )
+    controller = raiden_controller.RaidenController(port=10010)
 
     # 4 Source units with mesh_shape=[1, 4] (fsdp=1, tp=4)
     # 1D layernorm tensor (2304,) has sharding_spec=['fsdp'] -> mesh_shape=[1]
@@ -2628,7 +2633,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
     """Tests parallel resharding schedule generation across multiple variables and ranks."""
     dummy_client = DummyWorkerRpcClient()
     controller = raiden_controller.RaidenController(
-        port=10011, worker_rpc_client=dummy_client, enable_plan_cache=True
+        port=10011, enable_plan_cache=True
     )
 
     num_vars = 60
@@ -2763,7 +2768,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
   def test_zero_copy_plan_cache_immutability_and_reuse(self):
     dummy_client = DummyWorkerRpcClient()
     controller = raiden_controller.RaidenController(
-        port=10012, worker_rpc_client=dummy_client, enable_plan_cache=True
+        port=10012, enable_plan_cache=True
     )
     src_unit = raiden_controller.RaidenId(
         job_name="trainer",
@@ -2837,9 +2842,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
 
   def test_1d_rank1_tensor_resharding_offsets(self):
     client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10000, worker_rpc_client=client
-    )
+    controller = raiden_controller.RaidenController(port=10000)
     num_hosts = 2
     num_shards_per_host = 8
     src_units = [
@@ -2968,7 +2971,6 @@ class GetGlobalIndicesTest(absltest.TestCase):
     client = RecordingWorkerRpcClient()
     controller = raiden_controller.RaidenController(
         port=10000,
-        worker_rpc_client=client,
     )
 
     src_units = [
@@ -3065,7 +3067,6 @@ class GetGlobalIndicesTest(absltest.TestCase):
     client = RecordingWorkerRpcClient()
     controller = raiden_controller.RaidenController(
         port=10000,
-        worker_rpc_client=client,
     )
 
     src_units = [
@@ -3147,12 +3148,14 @@ class GetGlobalIndicesTest(absltest.TestCase):
         ["10.0.0.1:8000", "10.0.0.2:8000"],
         control_plane_rpc_address="10.0.0.1:9001,10.0.0.2:9002",
     )
+    entity = controller.get_entity(unit)
+    self.assertIsNotNone(entity)
     self.assertEqual(
-        controller.worker_rpc_client.get_registered_endpoints(unit),
+        entity.worker_rpc_client.get_registered_endpoints(unit),
         ["10.0.0.1:9001", "10.0.0.2:9002"],
     )
     self.assertEqual(
-        controller.worker_rpc_client.get_worker_endpoints()[unit],
+        entity.worker_rpc_client.get_worker_endpoints()[unit],
         "10.0.0.1:9001,10.0.0.2:9002",
     )
     # Re-registration replaces endpoints
@@ -3162,7 +3165,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
         control_plane_rpc_address="10.0.0.3:9003",
     )
     self.assertEqual(
-        controller.worker_rpc_client.get_registered_endpoints(unit),
+        entity.worker_rpc_client.get_registered_endpoints(unit),
         ["10.0.0.3:9003"],
     )
 
@@ -3207,9 +3210,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
 
   def test_resharding_plan3_fsdp16_tp4_to_fsdp2_tp4(self):
     dummy_client = DummyWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10042, worker_rpc_client=dummy_client
-    )
+    controller = raiden_controller.RaidenController(port=10042)
 
     src_unit = raiden_controller.RaidenId("trainer", "0", "gemma2_2b_weights")
     dst_unit = raiden_controller.RaidenId("sampler", "0", "gemma2_2b_weights")
@@ -3273,9 +3274,7 @@ class GetGlobalIndicesTest(absltest.TestCase):
 
   def test_resharding_plan3_multi_source_tasks_to_single_dst_task(self):
     dummy_client = DummyWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10043, worker_rpc_client=dummy_client
-    )
+    controller = raiden_controller.RaidenController(port=10043)
 
     src_units = [
         raiden_controller.RaidenId(
@@ -3493,9 +3492,7 @@ class FormatUnitHelpersTest(absltest.TestCase):
 
   def test_heterogeneous_host_mesh_weight_transfer(self):
     client = RecordingWorkerRpcClient()
-    controller = raiden_controller.RaidenController(
-        port=10000, worker_rpc_client=client
-    )
+    controller = raiden_controller.RaidenController(port=10000)
     vars_metadata = [
         raiden_service_pb2.VariableMetadataProto(
             name="w_in",
@@ -3577,9 +3574,7 @@ class FormatUnitHelpersTest(absltest.TestCase):
 
     # Check start_transfer_request proto formatting for both src and dst
     for unit, plan in client.calls:
-      req_bytes = controller.worker_rpc_client._encode_start_transfer(
-          unit, plan
-      )
+      req_bytes = client._encode_start_transfer(unit, plan)
       req = raiden_service_pb2.ControlRequest()
       req.ParseFromString(req_bytes)
       start_req = req.start_transfer_request
@@ -3601,7 +3596,7 @@ class RaidenPlanWarmupTest(absltest.TestCase):
   def test_warmup_transfer_plan_explicit(self):
     client = RecordingWorkerRpcClient()
     controller = raiden_controller.RaidenController(
-        port=0, worker_rpc_client=client, enable_plan_cache=True
+        port=0, enable_plan_cache=True
     )
     vars_metadata = [
         raiden_service_pb2.VariableMetadataProto(
@@ -3690,9 +3685,9 @@ class RaidenPlanWarmupTest(absltest.TestCase):
 
     Uses global_shard_indices without host_subgrid or mesh_axes.
     """
-    client = RecordingWorkerRpcClient()
+    _ = RecordingWorkerRpcClient()
     controller = raiden_controller.RaidenController(
-        port=0, worker_rpc_client=client, enable_plan_cache=False
+        port=0, enable_plan_cache=False
     )
 
     # 4-way sharded tensor: shape [64, 64], mesh_shape [4, 1], layout [1, 0].
@@ -4264,9 +4259,9 @@ class WeightSyncReceiverAndCacheLeakTest(absltest.TestCase):
       ws_client.close()
 
   def test_source_ephemeral_port_reregistration_preserves_plan_cache(self):
-    client = RecordingWorkerRpcClient()
+    _ = RecordingWorkerRpcClient()
     controller = raiden_controller.RaidenController(
-        port=0, worker_rpc_client=client, enable_plan_cache=True
+        port=0, enable_plan_cache=True
     )
     vars_metadata = [
         raiden_service_pb2.VariableMetadataProto(
@@ -4339,9 +4334,9 @@ class WeightSyncReceiverAndCacheLeakTest(absltest.TestCase):
     self.assertEqual(plan2.worker_rpc_addresses[src_unit], "10.0.0.1:19543")
 
   def test_completed_transfers_pruned_across_many_steps(self):
-    client = RecordingWorkerRpcClient()
+    _ = RecordingWorkerRpcClient()
     controller = raiden_controller.RaidenController(
-        port=0, worker_rpc_client=client, enable_plan_cache=True
+        port=0, enable_plan_cache=True
     )
     src_unit = raiden_controller.RaidenId("src", "0", "weights", 0)
     dst_unit = raiden_controller.RaidenId("dst", "0", "weights", 0)
@@ -4380,9 +4375,8 @@ class WeightSyncReceiverAndCacheLeakTest(absltest.TestCase):
     self.assertLessEqual(len(controller._task_units), 16)
 
   def test_group_size_must_be_positive(self):
-    controller = raiden_controller.RaidenController(
-        port=0, worker_rpc_client=RecordingWorkerRpcClient()
-    )
+    _ = RecordingWorkerRpcClient()
+    controller = raiden_controller.RaidenController(port=0)
     src_unit = raiden_controller.RaidenId("src", "0", "weights", 0)
     dst_unit = raiden_controller.RaidenId("dst", "0", "weights", 0)
 
@@ -4422,9 +4416,9 @@ class WeightSyncReceiverAndCacheLeakTest(absltest.TestCase):
 
   def test_ep_multi_host_dst_endpoint_counts_matches_push_tasks(self):
     """Verifies dst_endpoint_counts exactly matches tasks dispatched for EP and replicated tensors."""
-    client = RecordingWorkerRpcClient()
+    _ = RecordingWorkerRpcClient()
     controller = raiden_controller.RaidenController(
-        port=0, worker_rpc_client=client, enable_plan_cache=False
+        port=0, enable_plan_cache=False
     )
 
     # Source has 1 unit with 4 shards:
@@ -5538,7 +5532,7 @@ class JobEntityTest(absltest.TestCase):
       asyncio.run(trainer_entity.start_transfer(s0_plan))
       self.assertCountEqual(dispatched_by_entity[trainer_key], trainer_hosts)
     finally:
-      controller.worker_rpc_client.close()
+      controller.close()
 
   def test_incremental_attach_host_on_entity(self):
     """Verifies incremental host attachment via controller.attach_host."""
@@ -5564,7 +5558,32 @@ class JobEntityTest(absltest.TestCase):
       self.assertEqual(entity.num_hosts, 4)
       self.assertLen(entity.shards, 8)
     finally:
-      controller.worker_rpc_client.close()
+      controller.close()
+
+  def test_worker_rpc_client_single_ownership_no_legacy_delegate(self):
+    """Verifies WorkerRpcClient is constructed inside JobEntity and absent from RaidenController."""
+    controller = raiden_controller.RaidenController(port=0)
+    try:
+      self.assertFalse(hasattr(controller, "worker_rpc_client"))
+      self.assertFalse(hasattr(controller, "_legacy_rpc_client"))
+      self.assertFalse(hasattr(controller, "_injected_rpc_client"))
+
+      unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+      entity = controller.attach_host(
+          unit,
+          control_address="10.0.0.1:9000",
+          shards=["10.0.0.1:8000"],
+      )
+      self.assertFalse(hasattr(entity, "_rpc_delegate"))
+      self.assertTrue(entity._owns_rpc_client)
+      self.assertIsNotNone(entity.worker_rpc_client)
+      self.assertIs(
+          entity.control_pipe_client,
+          entity.worker_rpc_client.control_pipe_client,
+      )
+      self.assertIs(entity.executor, entity.worker_rpc_client.executor)
+    finally:
+      controller.close()
 
   def test_dst_indices_hoisted_and_computed_once_per_variable(self):
     """Verifies dst_indices is computed once per (dst_unit, var_name) instead of per source shard."""

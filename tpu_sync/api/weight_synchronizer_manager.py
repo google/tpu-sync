@@ -99,7 +99,6 @@ class WeightSynchronizerManager:
   def __init__(
       self,
       port: int = 0,
-      worker_rpc_client: Optional[raiden_controller.WorkerRpcClient] = None,
       request_registry_ttl_s: float = 600.0,
       broadcast_k: Optional[int] = None,
       enable_plan_cache: bool = True,
@@ -110,7 +109,6 @@ class WeightSynchronizerManager:
     Args:
       port: Port number the manager / controller service runs on. A port of 0
         selects an ephemeral available port upon starting the server.
-      worker_rpc_client: Optional worker RPC client facade for dispatching RPCs.
       request_registry_ttl_s: TTL in seconds for request registry entries.
       broadcast_k: Fan-out factor K for tree-based broadcast transfers across
         multiple sampler nodes.
@@ -121,7 +119,6 @@ class WeightSynchronizerManager:
     """
     self._controller = raiden_controller.RaidenController(
         port=port,
-        worker_rpc_client=worker_rpc_client,
         request_registry_ttl_s=request_registry_ttl_s,
         broadcast_k=broadcast_k,
         enable_plan_cache=enable_plan_cache,

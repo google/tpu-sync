@@ -14,6 +14,8 @@
 
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi.h"
 
+#include <stdlib.h>
+
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -25,6 +27,7 @@
 #include "xla/ffi/api/ffi.h"
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/tsl/platform/test.h"
+#include "tpu_sync/frameworks/jax/weight_synchronizer.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi_internal.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
@@ -62,7 +65,7 @@ class WeightSynchronizerFfiTest : public ::testing::Test {
 
   void TearDown() override {
     // Clean up global registry between tests
-    absl::flat_hash_set<WeightSynchronizerBase*> deleted;
+    absl::flat_hash_set<jax::WeightSynchronizer*> deleted;
     for (size_t i = 0; i < kMaxShards; ++i) {
       if (g_weight_synchronizers[i] != nullptr) {
         if (deleted.insert(g_weight_synchronizers[i]).second) {
@@ -169,7 +172,7 @@ TEST_F(WeightSynchronizerFfiTest, TriggerMultiH2DSucceeds) {
       /*listener_port=*/0, /*num_shards=*/1, out);
   ASSERT_TRUE(err.success()) << "Init failed: " << err.message();
 
-  WeightSynchronizerBase* ws = g_weight_synchronizers[shard_idx];
+  jax::WeightSynchronizer* ws = g_weight_synchronizers[shard_idx];
   ASSERT_NE(ws, nullptr);
 
   // 2. Populate Host Staging Buffers with dummy data
@@ -270,8 +273,8 @@ TEST_F(WeightSynchronizerFfiTest, MultiShardGetLocalSlotAndGlobalShardIndices) {
 
   // Both shards should share the exact same underlying WeightSynchronizerBase
   // instance
-  WeightSynchronizerBase* ws8 = g_weight_synchronizers[8];
-  WeightSynchronizerBase* ws9 = g_weight_synchronizers[9];
+  jax::WeightSynchronizer* ws8 = g_weight_synchronizers[8];
+  jax::WeightSynchronizer* ws9 = g_weight_synchronizers[9];
   ASSERT_NE(ws8, nullptr);
   ASSERT_EQ(ws8, ws9);
 
@@ -346,7 +349,7 @@ TEST_F(WeightSynchronizerFfiTest, MultiNumaFourShardsInitAndD2hTest) {
   }
 
   // Verify all 4 global shards share the same synchronizer instance
-  WeightSynchronizerBase* ws = g_weight_synchronizers[kBaseShard];
+  jax::WeightSynchronizer* ws = g_weight_synchronizers[kBaseShard];
   ASSERT_NE(ws, nullptr);
   for (int s = 1; s < kNumShards; ++s) {
     EXPECT_EQ(g_weight_synchronizers[kBaseShard + s], ws);
@@ -419,6 +422,7 @@ TEST_F(WeightSynchronizerFfiTest, MultiNumaFourShardsInitAndD2hTest) {
 
 TEST_F(WeightSynchronizerFfiTest,
        TriggerMultiNumaSubmanagersDistinctAndNoCollision) {
+  setenv("ENABLE_MULTI_NUMA", "1", 1);
   constexpr int kTotalShards = 8;
   constexpr int kShardsPerNuma = 4;
   constexpr int kNumLayers = 2;
@@ -444,7 +448,8 @@ TEST_F(WeightSynchronizerFfiTest,
     }
   }
 
-  // Execute InitAndD2h for all 8 shards with num_shards = 4
+  // Execute InitAndD2h for all 8 shards with num_shards = 8;
+  // WeightSynchronizer internally partitions across NUMA sub-managers.
   for (int s = 0; s < kTotalShards; ++s) {
     int32_t global_shard = s;
     FfiBufferFixture shard_fixture(XLA_FFI_DataType_S32, &global_shard, {1});
@@ -468,61 +473,67 @@ TEST_F(WeightSynchronizerFfiTest,
     xla::ffi::Error err = TriggerWeightSynchronizerInitAndD2hHelper(
         shard_buf, slice_byte_sizes_buf, jax_arrays,
         /*local_port=*/0, /*parallelism=*/1, kNumLayers, kListenerPort,
-        kShardsPerNuma, out);
+        kTotalShards, out);
     ASSERT_TRUE(err.success()) << "InitAndD2h failed for shard " << global_shard
                                << ": " << err.message();
   }
+  unsetenv("ENABLE_MULTI_NUMA");
 
-  // Submanager 0 (shards 0..3)
-  WeightSynchronizerBase* ws_0 = g_weight_synchronizers[0];
-  ASSERT_NE(ws_0, nullptr);
-  for (int s = 1; s < 4; ++s) {
-    EXPECT_EQ(g_weight_synchronizers[s], ws_0)
-        << "Shard " << s << " should share submanager 0";
+  // All 8 shards share the host-level WeightSynchronizer wrapper
+  jax::WeightSynchronizer* ws = g_weight_synchronizers[0];
+  ASSERT_NE(ws, nullptr);
+  for (int s = 1; s < kTotalShards; ++s) {
+    EXPECT_EQ(g_weight_synchronizers[s], ws)
+        << "Shard " << s << " should share the host WeightSynchronizer";
   }
 
-  // Submanager 1 (shards 4..7)
-  WeightSynchronizerBase* ws_1 = g_weight_synchronizers[4];
-  ASSERT_NE(ws_1, nullptr);
-  for (int s = 5; s < 8; ++s) {
-    EXPECT_EQ(g_weight_synchronizers[s], ws_1)
-        << "Shard " << s << " should share submanager 1";
-  }
-
-  // Verify that ws_0 and ws_1 are distinct submanager instances
-  EXPECT_NE(ws_0, ws_1)
+  // Verify that WeightSynchronizer internally created distinct NUMA
+  // submanagers
+  ASSERT_NE(ws->numa_manager(), nullptr);
+  const auto& subs = ws->numa_manager()->sub_synchronizers();
+  ASSERT_GE(subs.size(), 2u);
+  WeightSynchronizerBase* sub_0 = subs[0].get();
+  WeightSynchronizerBase* sub_1 = subs[1].get();
+  ASSERT_NE(sub_0, nullptr);
+  ASSERT_NE(sub_1, nullptr);
+  EXPECT_NE(sub_0, sub_1)
       << "NUMA submanager 0 and submanager 1 must be distinct instances";
+  EXPECT_NE(sub_0->local_port(), sub_1->local_port());
 
-  // Verify global shard indices for each submanager
+  // Verify global shard indices for each submanager and through the wrapper
   for (int s = 0; s < kShardsPerNuma; ++s) {
-    EXPECT_EQ(ws_0->global_shard_index(s), s);
-    EXPECT_EQ(ws_1->global_shard_index(s), s + kShardsPerNuma);
+    EXPECT_EQ(sub_0->global_shard_index(s), s);
+    EXPECT_EQ(sub_1->global_shard_index(s), s + kShardsPerNuma);
+  }
+  for (int s = 0; s < kTotalShards; ++s) {
+    EXPECT_EQ(ws->global_shard_index(s), s);
   }
 
-  // Verify host buffer data in ws_0 (shards 0..3)
+  // Verify host buffer data across all 8 shards and within each submanager
   for (int s = 0; s < 4; ++s) {
     for (int l = 0; l < kNumLayers; ++l) {
-      const uint8_t* host_ptr = ws_0->GetHostBufferPtr(l, s);
+      const uint8_t* host_ptr = ws->GetHostBufferPtr(l, s);
       ASSERT_NE(host_ptr, nullptr);
+      EXPECT_EQ(host_ptr, sub_0->GetHostBufferPtr(l, s));
       const int32_t* host_data = reinterpret_cast<const int32_t*>(host_ptr);
       for (int i = 0; i < kSliceElements; ++i) {
         EXPECT_EQ(host_data[i], shard_layer_data[s][l][i])
-            << "Mismatch in ws_0 at shard " << s << ", layer " << l
+            << "Mismatch in sub_0 at shard " << s << ", layer " << l
             << ", index " << i;
       }
     }
   }
 
-  // Verify host buffer data in ws_1 (shards 4..7)
   for (int s = 4; s < 8; ++s) {
     int slot = s - 4;
     for (int l = 0; l < kNumLayers; ++l) {
-      const uint8_t* host_ptr = ws_1->GetHostBufferPtr(l, slot);
+      const uint8_t* host_ptr = ws->GetHostBufferPtr(l, s);
       ASSERT_NE(host_ptr, nullptr);
+      EXPECT_EQ(host_ptr, sub_1->GetHostBufferPtr(l, slot));
       const int32_t* host_data = reinterpret_cast<const int32_t*>(host_ptr);
       for (int i = 0; i < kSliceElements; ++i) {
         EXPECT_EQ(host_data[i], shard_layer_data[s][l][i])
-            << "Mismatch in ws_1 at shard " << s << " (slot " << slot
+            << "Mismatch in sub_1 at shard " << s << " (slot " << slot
             << "), layer " << l << ", index " << i;
       }
     }
@@ -614,8 +625,8 @@ TEST_F(WeightSynchronizerFfiTest, NonContiguousShardsInitAndD2hTest) {
   }
 
   for (const auto& a : assignments) {
-    int32_t shard_info[3] = {a.global_shard, a.local_slot, a.host_idx};
-    FfiBufferFixture shard_fixture(XLA_FFI_DataType_S32, shard_info, {3});
+    int32_t shard_info[2] = {a.global_shard, a.local_slot};
+    FfiBufferFixture shard_fixture(XLA_FFI_DataType_S32, shard_info, {2});
     xla::ffi::AnyBuffer shard_buf = shard_fixture.AsAnyBuffer();
 
     std::vector<FfiBufferFixture> anchor_fixtures;
@@ -635,21 +646,21 @@ TEST_F(WeightSynchronizerFfiTest, NonContiguousShardsInitAndD2hTest) {
 
     xla::ffi::Error err = TriggerWeightSynchronizerInitAndD2hHelper(
         shard_buf, slice_byte_sizes_buf, jax_arrays,
-        /*local_port=*/0, /*parallelism=*/1, kNumLayers, kListenerPort,
-        kShardsPerHost, out);
+        /*local_port=*/0, /*parallelism=*/1, kNumLayers,
+        kListenerPort + a.host_idx, kShardsPerHost, out);
     ASSERT_TRUE(err.success()) << "InitAndD2h failed for shard "
                                << a.global_shard << ": " << err.message();
   }
 
   // Host 0: shards 0, 1, 4, 5
-  WeightSynchronizerBase* ws_0 = g_weight_synchronizers[0];
+  jax::WeightSynchronizer* ws_0 = g_weight_synchronizers[0];
   ASSERT_NE(ws_0, nullptr);
   EXPECT_EQ(g_weight_synchronizers[1], ws_0);
   EXPECT_EQ(g_weight_synchronizers[4], ws_0);
   EXPECT_EQ(g_weight_synchronizers[5], ws_0);
 
   // Host 1: shards 2, 3, 6, 7
-  WeightSynchronizerBase* ws_1 = g_weight_synchronizers[2];
+  jax::WeightSynchronizer* ws_1 = g_weight_synchronizers[2];
   ASSERT_NE(ws_1, nullptr);
   EXPECT_EQ(g_weight_synchronizers[3], ws_1);
   EXPECT_EQ(g_weight_synchronizers[6], ws_1);
@@ -670,7 +681,7 @@ TEST_F(WeightSynchronizerFfiTest, NonContiguousShardsInitAndD2hTest) {
 
   // Verify host buffer data in ws_0 and ws_1
   for (const auto& a : assignments) {
-    WeightSynchronizerBase* ws = (a.host_idx == 0) ? ws_0 : ws_1;
+    jax::WeightSynchronizer* ws = (a.host_idx == 0) ? ws_0 : ws_1;
     for (int l = 0; l < kNumLayers; ++l) {
       const uint8_t* host_ptr = ws->GetHostBufferPtr(l, a.local_slot);
       ASSERT_NE(host_ptr, nullptr);
@@ -685,8 +696,8 @@ TEST_F(WeightSynchronizerFfiTest, NonContiguousShardsInitAndD2hTest) {
 
   // Verify H2D roundtrip for all shards
   for (const auto& a : assignments) {
-    int32_t shard_info[3] = {a.global_shard, a.local_slot, a.host_idx};
-    FfiBufferFixture shard_fixture(XLA_FFI_DataType_S32, shard_info, {3});
+    int32_t shard_info[2] = {a.global_shard, a.local_slot};
+    FfiBufferFixture shard_fixture(XLA_FFI_DataType_S32, shard_info, {2});
     xla::ffi::AnyBuffer shard_buf = shard_fixture.AsAnyBuffer();
 
     std::vector<std::vector<int32_t>> dst_data(
@@ -770,9 +781,8 @@ TEST_F(WeightSynchronizerFfiTest, TorusPermutedDeviceIdsInitAndD2hTest) {
   }
 
   for (const auto& a : assignments) {
-    int32_t shard_info[4] = {a.device_id, a.local_slot, a.host_idx,
-                             a.global_mesh_idx};
-    FfiBufferFixture shard_fixture(XLA_FFI_DataType_S32, shard_info, {4});
+    int32_t shard_info[3] = {a.device_id, a.local_slot, a.global_mesh_idx};
+    FfiBufferFixture shard_fixture(XLA_FFI_DataType_S32, shard_info, {3});
     xla::ffi::AnyBuffer shard_buf = shard_fixture.AsAnyBuffer();
 
     std::vector<FfiBufferFixture> anchor_fixtures;
@@ -792,14 +802,14 @@ TEST_F(WeightSynchronizerFfiTest, TorusPermutedDeviceIdsInitAndD2hTest) {
 
     xla::ffi::Error err = TriggerWeightSynchronizerInitAndD2hHelper(
         shard_buf, slice_byte_sizes_buf, jax_arrays,
-        /*local_port=*/0, /*parallelism=*/1, kNumLayers, kListenerPort,
-        kShardsPerHost, out);
+        /*local_port=*/0, /*parallelism=*/1, kNumLayers,
+        kListenerPort + a.host_idx, kShardsPerHost, out);
     ASSERT_TRUE(err.success()) << "InitAndD2h failed for device " << a.device_id
                                << ": " << err.message();
   }
 
-  WeightSynchronizerBase* ws_0 = g_weight_synchronizers[0];
-  WeightSynchronizerBase* ws_1 = g_weight_synchronizers[6];
+  jax::WeightSynchronizer* ws_0 = g_weight_synchronizers[0];
+  jax::WeightSynchronizer* ws_1 = g_weight_synchronizers[6];
   ASSERT_NE(ws_0, nullptr);
   ASSERT_NE(ws_1, nullptr);
   EXPECT_NE(ws_0, ws_1);
@@ -819,7 +829,7 @@ TEST_F(WeightSynchronizerFfiTest, TorusPermutedDeviceIdsInitAndD2hTest) {
   // Verify slot 2 holds device 3's data (tp=2) and slot 3 holds device 2's
   // data (tp=3).
   for (const auto& a : assignments) {
-    WeightSynchronizerBase* ws = (a.host_idx == 0) ? ws_0 : ws_1;
+    jax::WeightSynchronizer* ws = (a.host_idx == 0) ? ws_0 : ws_1;
     for (int l = 0; l < kNumLayers; ++l) {
       const uint8_t* host_ptr = ws->GetHostBufferPtr(l, a.local_slot);
       ASSERT_NE(host_ptr, nullptr);

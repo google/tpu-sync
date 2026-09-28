@@ -43,27 +43,25 @@
 #include "xla/stream_executor/platform_manager.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
-#include "tpu_sync/core/tpu_utils.h"
+#include "tpu_sync/frameworks/jax/weight_synchronizer.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi_internal.h"
-#include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace tpu_raiden {
 namespace weight_sync {
 
-WeightSynchronizerBase* g_weight_synchronizers[kMaxShards] = {nullptr};
+jax::WeightSynchronizer* g_weight_synchronizers[kMaxShards] = {nullptr};
 std::unique_ptr<stream_executor::Stream> g_streams[kMaxShards] = {nullptr};
 
 static absl::Mutex ws_mu;
 static auto* ws_map =
-    new absl::flat_hash_map<int32_t, WeightSynchronizerBase*>();
+    new absl::flat_hash_map<int32_t, jax::WeightSynchronizer*>();
 struct SlotAndGlobal {
   size_t slot;
   int64_t global_shard;
-  bool has_explicit_global;
 };
 
 static auto* ws_shard_to_slot_map =
-    new absl::flat_hash_map<WeightSynchronizerBase*,
+    new absl::flat_hash_map<jax::WeightSynchronizer*,
                             absl::flat_hash_map<int32_t, SlotAndGlobal>>();
 
 void ClearSharedWsMap() {
@@ -77,53 +75,27 @@ void ClearSharedWsMap() {
 }
 
 // Retains and returns a thread-safe singleton instance of
-// `WeightSynchronizerBase` for a given listener port across multiple devices on
-// the same physical host. In multi-device/multi-host JAX topologies (`pjit`),
-// multiple local ranks initialize FFI targets independently. Sharing the
-// instance avoids re-binding the same socket (`Address already in use`).
-static WeightSynchronizerBase* GetSharedWs(
+// `jax::WeightSynchronizer` for a given listener port across multiple devices
+// on the same physical host. In multi-device/multi-host JAX topologies
+// (`pjit`), multiple local ranks initialize FFI targets independently. Sharing
+// the instance avoids re-binding the same socket (`Address already in use`).
+static jax::WeightSynchronizer* GetSharedWs(
     int32_t shard_idx, int32_t listener_port, int32_t num_layers,
     int32_t parallelism, const std::vector<size_t>& slice_byte_sizes,
     int32_t local_port, int32_t num_shards, int32_t local_slot = -1,
-    int32_t submanager_idx = -1, int32_t global_shard_idx = -1) {
+    int32_t global_shard_idx = -1) {
   absl::MutexLock lock(ws_mu);
-  if (submanager_idx < 0) {
-    submanager_idx = (num_shards > 0) ? (shard_idx / num_shards) : 0;
-  }
-  int32_t key = (listener_port > 0)
-                    ? (listener_port + submanager_idx)
-                    : (listener_port == 0 ? -(submanager_idx + 1)
-                                          : -(submanager_idx + 1000));
+  int32_t key = (listener_port >= 0) ? listener_port : -(shard_idx + 1);
   auto& ws = (*ws_map)[key];
   if (ws == nullptr) {
     std::optional<int> opt_listener_port =
-        (listener_port >= 0)
-            ? std::make_optional(
-                  listener_port > 0 ? (listener_port + submanager_idx) : 0)
-            : std::nullopt;
+        (listener_port >= 0) ? std::make_optional(listener_port) : std::nullopt;
     std::optional<int> opt_local_port =
-        (local_port > 0)
-            ? std::make_optional(local_port + submanager_idx)
-            : (local_port == 0 ? std::make_optional(0) : std::nullopt);
+        (local_port >= 0) ? std::make_optional(local_port) : std::nullopt;
 
-    std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses();
-    std::vector<HostNicAddress> data_nics;
-    for (const auto& nic : host_nics) {
-      if (nic.classification == NicClassification::kDataPlane) {
-        data_nics.push_back(nic);
-      }
-    }
-    std::optional<std::string> sub_bind_ip = std::nullopt;
-    if (submanager_idx < static_cast<int>(data_nics.size())) {
-      sub_bind_ip = data_nics[submanager_idx].ip_address;
-    } else if (!data_nics.empty()) {
-      sub_bind_ip = data_nics[submanager_idx % data_nics.size()].ip_address;
-    }
-
-    ws = new WeightSynchronizerBase(
+    ws = new jax::WeightSynchronizer(
         static_cast<size_t>(num_layers), static_cast<size_t>(num_shards),
-        slice_byte_sizes, opt_local_port, std::nullopt, parallelism,
-        opt_listener_port, sub_bind_ip);
+        slice_byte_sizes, opt_local_port, parallelism, opt_listener_port);
   }
   auto& slot_map = (*ws_shard_to_slot_map)[ws];
   size_t assigned_slot;
@@ -135,36 +107,17 @@ static WeightSynchronizerBase* GetSharedWs(
                         ? (slot_map.size() % ws->num_shards())
                         : slot_map.size();
   }
-  bool has_explicit_global = (global_shard_idx >= 0);
-  int64_t effective_global = has_explicit_global
+  int64_t effective_global = (global_shard_idx >= 0)
                                  ? static_cast<int64_t>(global_shard_idx)
                                  : static_cast<int64_t>(shard_idx);
   auto [it, inserted] = slot_map.try_emplace(
-      shard_idx,
-      SlotAndGlobal{assigned_slot, effective_global, has_explicit_global});
+      shard_idx, SlotAndGlobal{assigned_slot, effective_global});
   if (inserted) {
     std::vector<int64_t> indices(ws->num_shards(), -1);
     std::vector<int> local_indices(ws->num_shards(), -1);
-    int64_t host_base = static_cast<int64_t>(submanager_idx) *
-                        static_cast<int64_t>(ws->num_shards());
-    bool any_explicit_global = false;
-    bool all_in_host_range = (ws->num_shards() > 0);
-    for (const auto& [s_id, s_info] : slot_map) {
-      if (s_info.has_explicit_global) {
-        any_explicit_global = true;
-      }
-      if (s_info.global_shard < host_base ||
-          s_info.global_shard >=
-              host_base + static_cast<int64_t>(ws->num_shards())) {
-        all_in_host_range = false;
-      }
-    }
     for (const auto& [s_id, s_info] : slot_map) {
       if (s_info.slot < indices.size()) {
-        indices[s_info.slot] =
-            (!any_explicit_global && all_in_host_range)
-                ? (host_base + static_cast<int64_t>(s_info.slot))
-                : s_info.global_shard;
+        indices[s_info.slot] = s_info.global_shard;
         local_indices[s_info.slot] = static_cast<int>(s_info.slot);
       }
     }
@@ -178,7 +131,7 @@ static size_t GetLocalSlot(int32_t shard_idx) {
   if (shard_idx < 0 || static_cast<size_t>(shard_idx) >= kMaxShards) {
     return 0;
   }
-  WeightSynchronizerBase* ws = g_weight_synchronizers[shard_idx];
+  jax::WeightSynchronizer* ws = g_weight_synchronizers[shard_idx];
   if (ws == nullptr) {
     return 0;
   }
@@ -211,10 +164,8 @@ xla::ffi::Error TriggerWeightSynchronizerInitImpl(
       reinterpret_cast<const int32_t*>(shard_idx_buf.untyped_data());
   int32_t shard_idx = shard_ptr[0];
   int32_t local_slot = (shard_idx_buf.element_count() >= 2) ? shard_ptr[1] : -1;
-  int32_t submanager_idx =
-      (shard_idx_buf.element_count() >= 3) ? shard_ptr[2] : -1;
   int32_t global_shard_idx =
-      (shard_idx_buf.element_count() >= 4) ? shard_ptr[3] : -1;
+      (shard_idx_buf.element_count() >= 3) ? shard_ptr[2] : -1;
 
   if (shard_idx < 0 || static_cast<size_t>(shard_idx) >= kMaxShards) {
     return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
@@ -238,12 +189,11 @@ xla::ffi::Error TriggerWeightSynchronizerInitImpl(
     VLOG(1)
         << "[TPU Worker FFI] >>> WS LAZY INITIALIZATION TRIGGERED <<< Shard: "
         << shard_idx << ", Local Slot: " << local_slot
-        << ", Submanager: " << submanager_idx
         << ", Global Shard: " << global_shard_idx;
 
     g_weight_synchronizers[shard_idx] = GetSharedWs(
         shard_idx, listener_port, num_layers, parallelism, slice_byte_sizes,
-        local_port, num_shards, local_slot, submanager_idx, global_shard_idx);
+        local_port, num_shards, local_slot, global_shard_idx);
 
     // Allocate the StreamExecutor Stream once per shard, and cache E2E!
     int64_t dev_id = static_cast<int64_t>(shard_idx);
@@ -331,10 +281,8 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
   int32_t shard_idx = shard_ptr[0];
   int32_t local_slot_in =
       (shard_idx_buf.element_count() >= 2) ? shard_ptr[1] : -1;
-  int32_t submanager_idx =
-      (shard_idx_buf.element_count() >= 3) ? shard_ptr[2] : -1;
   int32_t global_shard_idx =
-      (shard_idx_buf.element_count() >= 4) ? shard_ptr[3] : -1;
+      (shard_idx_buf.element_count() >= 3) ? shard_ptr[2] : -1;
 
   if (shard_idx < 0 || static_cast<size_t>(shard_idx) >= kMaxShards) {
     return xla::ffi::Error(xla::ffi::ErrorCode::kInvalidArgument,
@@ -358,13 +306,11 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
     VLOG(1)
         << "[TPU Worker FFI] >>> WS LAZY INITIALIZATION TRIGGERED <<< Shard: "
         << shard_idx << ", Local Slot: " << local_slot_in
-        << ", Submanager: " << submanager_idx
         << ", Global Shard: " << global_shard_idx;
 
-    g_weight_synchronizers[shard_idx] =
-        GetSharedWs(shard_idx, listener_port, num_layers, parallelism,
-                    slice_byte_sizes, local_port, num_shards, local_slot_in,
-                    submanager_idx, global_shard_idx);
+    g_weight_synchronizers[shard_idx] = GetSharedWs(
+        shard_idx, listener_port, num_layers, parallelism, slice_byte_sizes,
+        local_port, num_shards, local_slot_in, global_shard_idx);
 
     int64_t dev_id = static_cast<int64_t>(shard_idx);
     auto platform_or =

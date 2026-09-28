@@ -47,8 +47,7 @@ nb::list prepare_extended_info(nb::list gathered_info_list, nb::list device_ids,
 
 NB_MODULE(_weight_synchronizer_ffi, m) {
   m.def("destroy_weight_synchronizer", []() {
-    std::unordered_set<tpu_raiden::weight_sync::WeightSynchronizerBase*>
-        deleted;
+    std::unordered_set<tpu_raiden::jax::WeightSynchronizer*> deleted;
     for (size_t i = 0; i < tpu_raiden::weight_sync::kMaxShards; ++i) {
       if (tpu_raiden::weight_sync::g_weight_synchronizers[i] != nullptr) {
         if (deleted.insert(tpu_raiden::weight_sync::g_weight_synchronizers[i])

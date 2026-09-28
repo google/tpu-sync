@@ -252,8 +252,7 @@ cc_library(
     tags = ["manual"],
     visibility = ["//visibility:public"],
     deps = [
-        "//tpu_sync/core:tpu_utils",
-        "//tpu_sync/weight_sync:weight_synchronizer_base",
+        ":weight_synchronizer_core_lib",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
@@ -288,8 +287,8 @@ nanobind_extension(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":weight_synchronizer_core_lib",
         ":weight_synchronizer_ffi",
-        ":weight_synchronizer_jax",
         "@nanobind",
     ],
 )
@@ -331,7 +330,6 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
         "@nanobind",
-        "@xla//xla/tsl/platform:errors",
     ],
     alwayslink = 1,
 )
@@ -430,8 +428,7 @@ cc_library(
     ] + _X86_MARCH_COPTS,
     features = ["-use_header_modules"],
     deps = [
-        "//tpu_sync/core:tpu_utils",
-        "//tpu_sync/weight_sync:weight_synchronizer_base",
+        ":weight_synchronizer_core_lib",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
@@ -453,6 +450,7 @@ cc_test(
     copts = ["-fexceptions"],
     features = ["-use_header_modules"],
     deps = [
+        ":weight_synchronizer_core_lib",
         ":weight_synchronizer_ffi_mock",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/container:flat_hash_set",
@@ -482,6 +480,7 @@ cc_library(
     features = [
         "-use_header_modules",
     ],
+    visibility = ["//visibility:public"],
     deps = [
         "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:raiden_transfer_endpoint",
@@ -499,8 +498,6 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
-        "@xla//xla/tsl/platform:errors",
-        "@xla//xla/tsl/platform:statusor",
     ],
 )
 

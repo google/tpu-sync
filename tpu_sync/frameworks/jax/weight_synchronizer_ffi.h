@@ -18,14 +18,16 @@
 #include <cstddef>
 
 namespace tpu_raiden {
-namespace weight_sync {
+namespace jax {
+class WeightSynchronizer;
+}  // namespace jax
 
-class WeightSynchronizerBase;
+namespace weight_sync {
 
 inline constexpr size_t kMaxShards = 4096;
 
 // Global registry map for distributed JAX meshes multi-device support
-extern WeightSynchronizerBase* g_weight_synchronizers[kMaxShards];
+extern jax::WeightSynchronizer* g_weight_synchronizers[kMaxShards];
 
 }  // namespace weight_sync
 }  // namespace tpu_raiden

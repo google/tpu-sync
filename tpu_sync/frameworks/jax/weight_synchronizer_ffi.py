@@ -57,11 +57,11 @@ def _prepare_shard_info(
     num_shards: int,
     host_subgrid: list[int] | None = None,
 ) -> jax.Array:
-  """Packs [shard_idx, local_slot, host_idx] for FFI custom call.
+  """Packs [shard_idx, local_slot, global_mesh_idx] for FFI custom call.
 
-  If shard_idx is already packed (trailing dimension >= 3), returns shard_idx.
-  Otherwise, computes local_slot and host_idx based on the mesh physical layout
-  and host subgrid decomposition, and returns a sharded array with shape
+  If shard_idx is already packed (trailing dimension >= 2), returns shard_idx.
+  Otherwise, computes local_slot and global_mesh_idx based on the mesh physical
+  layout and host subgrid decomposition, and returns a sharded array with shape
   `mesh.devices.shape + (3,)` and PartitionSpec(*mesh.axis_names, None).
 
   Args:
@@ -73,7 +73,7 @@ def _prepare_shard_info(
   Returns:
     A sharded array containing packed shard information.
   """
-  if shard_idx.ndim > len(mesh.axis_names) and shard_idx.shape[-1] >= 3:
+  if shard_idx.ndim > len(mesh.axis_names) and shard_idx.shape[-1] >= 2:
     return shard_idx
 
   physical_mesh_shape = list(mesh.devices.shape)
@@ -96,7 +96,6 @@ def _prepare_shard_info(
       and all(p % s == 0 for p, s in zip(physical_mesh_shape, host_subgrid))
   ):
     subgrid = list(host_subgrid)
-    grid = [p // s for p, s in zip(physical_mesh_shape, subgrid)]
   elif (
       local_subgrid is not None
       and len(local_subgrid) == len(physical_mesh_shape)
@@ -104,36 +103,26 @@ def _prepare_shard_info(
       and all(p % s == 0 for p, s in zip(physical_mesh_shape, local_subgrid))
   ):
     subgrid = local_subgrid
-    grid = [p // s for p, s in zip(physical_mesh_shape, subgrid)]
   else:
-    subgrid, grid = utils.compute_host_subgrid(
+    subgrid, _ = utils.compute_host_subgrid(
         physical_mesh_shape, devices_per_host
     )
-  host_subgrid, host_grid = subgrid, grid
+  host_subgrid = subgrid
 
   local_slots_np = np.zeros(mesh.devices.shape, dtype=np.int32)
-  host_indices_np = np.zeros(mesh.devices.shape, dtype=np.int32)
 
   for coord in np.ndindex(*mesh.devices.shape):
-    h_idx = 0
-    for c, s, g in zip(coord, host_subgrid, host_grid):
-      h = c // s if s > 0 else 0
-      h_idx = h_idx * g + h
     l_slot = 0
     for c, s in zip(coord, host_subgrid):
       l = c % s if s > 0 else 0
       l_slot = l_slot * s + l
     local_slots_np[coord] = l_slot
-    host_indices_np[coord] = h_idx
 
   spec = jax.sharding.PartitionSpec(*mesh.axis_names)
   sharding = jax.sharding.NamedSharding(mesh, spec)
 
   local_slots = jax.device_put(
       jnp.array(local_slots_np, dtype=jnp.int32), sharding
-  )
-  host_indices = jax.device_put(
-      jnp.array(host_indices_np, dtype=jnp.int32), sharding
   )
 
   global_mesh_indices_np = np.arange(mesh.devices.size, dtype=np.int32).reshape(
@@ -146,9 +135,7 @@ def _prepare_shard_info(
   if shard_idx.shape != tuple(physical_mesh_shape):
     shard_idx = shard_idx.reshape(tuple(physical_mesh_shape))
 
-  return jnp.stack(
-      [shard_idx, local_slots, host_indices, global_mesh_indices], axis=-1
-  )
+  return jnp.stack([shard_idx, local_slots, global_mesh_indices], axis=-1)
 
 
 def init_weight_synchronizer(

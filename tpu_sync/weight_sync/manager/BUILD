@@ -80,6 +80,7 @@ py_library(
         ":job_entity",
         "//tpu_sync/api:common",
         "//tpu_sync/kv_cache:nd_slice_math",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
         "@com_google_absl_py//absl/logging",
     ],
 )

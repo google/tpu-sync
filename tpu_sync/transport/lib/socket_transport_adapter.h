@@ -31,6 +31,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
@@ -60,6 +61,27 @@ class SocketTransportAdapter : public TransportAdapter {
       CompletionCallback on_complete = nullptr) override;
 
   absl::StatusOr<Status> Poll(Handle handle) override;
+
+  struct Config {
+    absl::Duration handshake_ack_read_timeout = absl::Seconds(5);
+    absl::Duration final_ack_read_timeout = absl::Seconds(60);
+    int max_socket_workers = 64;
+  };
+
+  const Config& config() const { return config_; }
+
+  absl::Duration handshake_ack_read_timeout() const {
+    return config_.handshake_ack_read_timeout;
+  }
+  absl::Duration final_ack_read_timeout() const {
+    return config_.final_ack_read_timeout;
+  }
+  int max_socket_workers() const { return config_.max_socket_workers; }
+
+  size_t worker_count() const {
+    absl::MutexLock lock(scheduler_mu_);
+    return socket_workers_.size();
+  }
 
  private:
   struct WriteTask {
@@ -103,13 +125,19 @@ class SocketTransportAdapter : public TransportAdapter {
  private:
   RawBufferTransport* const raw_transport_;
   const int parallelism_;
+  const Config config_;
 
-  absl::Mutex scheduler_mu_;
+  mutable absl::Mutex scheduler_mu_;
   absl::CondVar scheduler_cv_;
   absl::flat_hash_map<std::string, PeerQueue> peer_queues_
       ABSL_GUARDED_BY(scheduler_mu_);
   std::vector<std::string> active_peers_ ABSL_GUARDED_BY(scheduler_mu_);
   size_t rr_index_ ABSL_GUARDED_BY(scheduler_mu_);
+  absl::flat_hash_map<uint64_t, std::shared_ptr<std::atomic<bool>>> uuid_flags_
+      ABSL_GUARDED_BY(scheduler_mu_);
+  std::deque<uint64_t> uuid_order_ ABSL_GUARDED_BY(scheduler_mu_);
+  static constexpr size_t kMaxTrackedUuids = 1024;
+
   // TODO(swasthi): Guard scheduler_stopping_ with scheduler_mu_ instead of
   // atomic.
   std::atomic<bool> scheduler_stopping_;

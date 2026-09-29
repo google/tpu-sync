@@ -14,12 +14,16 @@
 
 #include <memory>
 
+#include "absl/log/log.h"
+
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
 #include "tpu_sync/common/control_pipe/control_pipe_server.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/common/control_pipe/grpc_control_pipe.h"
 #include "tpu_sync/common/control_pipe/tcp_control_pipe.h"
+#ifndef TPU_RAIDEN_NO_ZMQ_CONTROL_PIPE
 #include "tpu_sync/common/control_pipe/zmq_control_pipe.h"
+#endif
 
 namespace tpu_raiden {
 
@@ -29,7 +33,12 @@ std::unique_ptr<ControlPipeServer> CreateControlPipeServer(
     case ControlPipeBackendType::kGrpc:
       return std::make_unique<GrpcControlPipeServer>(config);
     case ControlPipeBackendType::kZmq:
+#ifndef TPU_RAIDEN_NO_ZMQ_CONTROL_PIPE
       return std::make_unique<ZmqControlPipeServer>(config);
+#else
+      LOG(WARNING) << "ZMQ control pipe backend not linked in; using TCP.";
+      return std::make_unique<TcpControlPipeServer>(config);
+#endif
     case ControlPipeBackendType::kTcp:
       return std::make_unique<TcpControlPipeServer>(config);
   }
@@ -42,7 +51,12 @@ std::unique_ptr<ControlPipeClient> CreateControlPipeClient(
     case ControlPipeBackendType::kGrpc:
       return std::make_unique<GrpcControlPipeClient>(config);
     case ControlPipeBackendType::kZmq:
+#ifndef TPU_RAIDEN_NO_ZMQ_CONTROL_PIPE
       return std::make_unique<ZmqControlPipeClient>(config);
+#else
+      LOG(WARNING) << "ZMQ control pipe backend not linked in; using TCP.";
+      return std::make_unique<TcpControlPipeClient>(config);
+#endif
     case ControlPipeBackendType::kTcp:
       return std::make_unique<TcpControlPipeClient>(config);
   }

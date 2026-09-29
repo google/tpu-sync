@@ -43,6 +43,7 @@
 #include "absl/types/span.h"
 #include "peregrine/src/api/socket_util.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
+#include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -443,6 +444,8 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
       if (i <= fault_injection_payload_index &&
           fault_injection_payload_index < j) {
         FaultInjectSocket(hooks::kSocketTransportPushSendPayload, fd);
+        ABSL_RETURN_IF_ERROR(
+            FaultInjectStatus(hooks::kRawBufferTransportPushAbort));
       }
       const std::array<uint8_t, kChunkSizeFieldSize> s_size =
           SerializeChunkSize(total_size);

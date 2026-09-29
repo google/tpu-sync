@@ -825,6 +825,14 @@ absl::Status RawBufferTransport::RegisterExpectedChunks(
   {
     absl::MutexLock lock(raw_progress_mu_);
     auto& prog = raw_progress_[uuid];
+    if (prog.expected_chunks.has_value()) {
+      VLOG(1) << "RegisterExpectedChunks: resetting previous incomplete "
+                 "registration for uuid="
+              << uuid;
+      prog.completed_chunks = 0;
+      prog.completed_chunks_per_layer.clear();
+      prog.triggered_layers.clear();
+    }
     prog.expected_chunks = expected_chunks;
     VLOG(1) << "RegisterExpectedChunks: uuid=" << uuid
             << " expected_chunks=" << expected_chunks
@@ -854,6 +862,14 @@ absl::Status RawBufferTransport::RegisterExpectedLayerChunks(
   {
     absl::MutexLock lock(raw_progress_mu_);
     auto& prog = raw_progress_[uuid];
+    if (prog.expected_chunks.has_value()) {
+      VLOG(1) << "RegisterExpectedLayerChunks: resetting previous incomplete "
+                 "registration for uuid="
+              << uuid;
+      prog.completed_chunks = 0;
+      prog.completed_chunks_per_layer.clear();
+      prog.triggered_layers.clear();
+    }
     prog.expected_chunks_per_layer = expected_layer_chunks;
     for (const auto& [layer_idx, expected_count] : expected_layer_chunks) {
       if (expected_count == 0) continue;
@@ -948,6 +964,8 @@ absl::Status RawBufferTransport::ProcessSocketBufferPush(
   const auto start_ts = std::chrono::steady_clock::now();
   auto send_body = [&]() -> absl::Status {
     FaultInjectDelay(hooks::kRawBufferTransportSendJitter);
+    ABSL_RETURN_IF_ERROR(
+        FaultInjectStatus(hooks::kRawBufferTransportPushAbort));
     ABSL_RETURN_IF_ERROR(WriteVExact(fd, iovs));
 
     uint8_t ack = 0;
@@ -1259,6 +1277,8 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
           }
         }
       }
+      ABSL_RETURN_IF_ERROR(
+          FaultInjectStatus(hooks::kRawBufferTransportPushAbort));
       ABSL_RETURN_IF_ERROR(WriteExact(fd, pack_buf.data(), total_bytes));
     } else {
       // Uncoalesced path: gather write (writev) directly from requests.
@@ -1289,6 +1309,8 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
         while (!remaining_iovs.empty()) {
           size_t chunk =
               std::min(remaining_iovs.size(), static_cast<size_t>(IOV_MAX));
+          ABSL_RETURN_IF_ERROR(
+              FaultInjectStatus(hooks::kRawBufferTransportPushAbort));
           ABSL_RETURN_IF_ERROR(
               WriteVExact(fd, remaining_iovs.subspan(0, chunk)));
           remaining_iovs = remaining_iovs.subspan(chunk);

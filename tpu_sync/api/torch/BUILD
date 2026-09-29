@@ -244,6 +244,7 @@ py_test(
     deps = [
         ":fault_injection",
         ":kv_cache_manager_torch_py",
+        ":torch_abi",
         "@com_google_absl_py//absl/testing:absltest",
         "@torch_tpu//shims/torch:pytorch",
         "@torch_tpu//src/torch_tpu",

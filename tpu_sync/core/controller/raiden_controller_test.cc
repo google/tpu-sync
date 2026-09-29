@@ -1056,9 +1056,6 @@ TEST_F(RaidenControllerTest, TransferBuffersMatchesSrcEndpointGroupsByNodeId) {
 
 // Strict matching on the src side too: a local worker whose node_id has no
 // source group is a hard error, never a broadcast to some other node's shards.
-// (Asserted with a SINGLE registered worker: the per-worker loop dispatches
-// each RPC before validating the next, so with >1 worker an earlier RPC would
-// already be in flight when the mismatch is detected.)
 TEST_F(RaidenControllerTest, TransferBuffersUnmatchedSrcNodeIdFails) {
   ShardAwareMockTransferManager mock;
   test_server_->service->SetTransferManager(KVManagerHolder(&mock));
@@ -1086,6 +1083,102 @@ TEST_F(RaidenControllerTest, TransferBuffersUnmatchedSrcNodeIdFails) {
   // Never broadcast: no worker RPC was issued at all.
   EXPECT_EQ(mock.vector_h2h_read_calls, 0);
   EXPECT_EQ(mock.h2h_read_calls, 0);
+}
+
+// With >1 worker, a node_id mismatch on a later worker must still fail before
+// any worker RPC is issued; otherwise the earlier worker's copy is left running
+// after the caller has seen the error. worker_0 sorts before worker_1, and only
+// node 0 has a destination group.
+TEST_F(RaidenControllerTest, TransferBuffersUnmatchedNodeIdDispatchesNoWorker) {
+  auto test_server2 = CreateTestWorkerServer();
+  ShardAwareMockTransferManager mock0;  // node_id 0
+  ShardAwareMockTransferManager mock1;  // node_id 1
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock0));
+  test_server2->service->SetTransferManager(KVManagerHolder(&mock1));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/2,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address,
+                        /*node_id=*/0);
+  RegisterAndInitWorker(*controller, "worker_1", test_server2->server_address,
+                        /*node_id=*/1);
+
+  std::vector<Buffer> src_buffers;
+  src_buffers.emplace_back(/*index=*/1, std::vector<BufferShard>{},
+                           std::nullopt, ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  Buffer dst_buf(/*index=*/2, std::vector<BufferShard>{}, std::nullopt,
+                 ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  dst_buf.set_remote_worker_endpoints(
+      {::tpu_raiden::RaidenWorkerEndpoints{0, "peer_0", {{"ep:1", {0, 1}}}}});
+  std::vector<Buffer> dst_buffers;
+  dst_buffers.push_back(std::move(dst_buf));
+
+  EXPECT_THAT(
+      controller->TransferBuffers(src_buffers, dst_buffers).Await(),
+      StatusIs(absl::StatusCode::kFailedPrecondition, HasSubstr("node_id 1")));
+  // Worker RPCs are asynchronous: give a wrongly issued one time to arrive.
+  absl::SleepFor(absl::Milliseconds(100));
+  EXPECT_EQ(mock0.vector_h2h_write_calls, 0);
+  EXPECT_EQ(mock1.vector_h2h_write_calls, 0);
+}
+
+// Local HBM -> remote with no staging supplied auto-allocates local staging
+// blocks; a node_id mismatch must not leave them allocated.
+TEST_F(RaidenControllerTest,
+       TransferBuffersUnmatchedNodeIdDoesNotLeakAutoStaging) {
+  ShardAwareMockTransferManager mock;
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/2,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address,
+                        /*node_id=*/0);
+
+  std::vector<Buffer> src_buffers;
+  src_buffers.emplace_back(/*index=*/1, std::vector<BufferShard>{},
+                           std::nullopt, ::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  Buffer dst_buf(/*index=*/2, std::vector<BufferShard>{}, std::nullopt,
+                 ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  dst_buf.set_remote_worker_endpoints(
+      {::tpu_raiden::RaidenWorkerEndpoints{7, "peer_7", {{"ep:1", {0, 1}}}}});
+  std::vector<Buffer> dst_buffers;
+  dst_buffers.push_back(std::move(dst_buf));
+
+  EXPECT_THAT(controller->TransferBuffers(src_buffers, dst_buffers).Await(),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+  EXPECT_EQ(controller->block_manager()->num_locked_blocks(), 0);
+}
+
+// Same as above, but the failure comes from building the worker request
+// (negative buffer index), which happens after staging is auto-allocated.
+TEST_F(RaidenControllerTest,
+       TransferBuffersRequestBuildFailureReleasesAutoStaging) {
+  ShardAwareMockTransferManager mock;
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto controller,
+      RaidenController::Create(unit_, /*num_blocks=*/5, /*num_shards=*/2,
+                               /*shard_size_bytes=*/512, ""));
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address,
+                        /*node_id=*/0);
+
+  std::vector<Buffer> src_buffers;
+  src_buffers.emplace_back(/*index=*/-1, std::vector<BufferShard>{},
+                           std::nullopt, ::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  Buffer dst_buf(/*index=*/2, std::vector<BufferShard>{}, std::nullopt,
+                 ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  dst_buf.set_remote_worker_endpoints(
+      {::tpu_raiden::RaidenWorkerEndpoints{0, "peer_0", {{"ep:1", {0, 1}}}}});
+  std::vector<Buffer> dst_buffers;
+  dst_buffers.push_back(std::move(dst_buf));
+
+  EXPECT_THAT(controller->TransferBuffers(src_buffers, dst_buffers).Await(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("negative index")));
+  EXPECT_EQ(controller->block_manager()->num_locked_blocks(), 0);
 }
 
 // The controller rejects a second worker that registers a duplicate non-zero

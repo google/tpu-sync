@@ -610,9 +610,7 @@ tsl::Future<> RaidenController::TransferBuffers(
   }
   bool is_remote = is_src_remote || is_dst_remote;
 
-  std::optional<std::vector<int>> auto_allocated_staging_ids;
-  std::vector<Buffer> local_staging_buffers;
-  absl::Span<const Buffer> request_staging = staging_host_buffers;
+  bool needs_auto_staging = false;
 
   if (is_remote) {
     bool src_is_hbm =
@@ -636,26 +634,17 @@ tsl::Future<> RaidenController::TransferBuffers(
     bool remote_host_staging_required =
         (is_src_remote && src_is_hbm) || (is_dst_remote && dst_is_hbm);
 
-    if (local_host_staging_required && request_staging.empty()) {
-      // 3a. Safeguard logic: Auto-allocating local staging blocks.
-      //     If local staging blocks are required but none were explicitly
-      //     provided, we can safely auto-allocate them from the controller's
-      //     pool because this controller manages the local resources.
-      auto host_blocks_or = this->AllocateBlockIds(src_buffers.size());
-      if (!host_blocks_or.ok()) {
-        return tsl::Future<>(host_blocks_or.status());
-      }
-      auto_allocated_staging_ids = *host_blocks_or;
-      local_staging_buffers.reserve(auto_allocated_staging_ids->size());
-      for (int id : *auto_allocated_staging_ids) {
-        local_staging_buffers.emplace_back(id, std::vector<BufferShard>{},
-                                           std::nullopt,
-                                           ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
-      }
-      request_staging = local_staging_buffers;
-    }
+    // 3a. Safeguard logic: Auto-allocating local staging blocks.
+    //     If local staging blocks are required but none were explicitly
+    //     provided, we can safely auto-allocate them from the controller's
+    //     pool because this controller manages the local resources. The
+    //     allocation itself is deferred until every worker has been matched
+    //     (step 5), so that no validation failure below can leak the blocks.
+    needs_auto_staging =
+        local_host_staging_required && staging_host_buffers.empty();
 
-    if (remote_host_staging_required && request_staging.empty()) {
+    if (remote_host_staging_required && staging_host_buffers.empty() &&
+        !needs_auto_staging) {
       // 3b. Safeguard logic: Returning error for missing remote blocks.
       //     If remote staging blocks are required but none were provided, we
       //     must return an error. We cannot auto-allocate them from here
@@ -697,17 +686,26 @@ tsl::Future<> RaidenController::TransferBuffers(
     }
   }
 
-  std::vector<tsl::Future<>> worker_futures;
-  worker_futures.reserve(workers.size());
+  // 4. Match every worker to its peer and resolve its buffers before
+  //    allocating staging or dispatching anything. Returning an error after
+  //    some workers were dispatched would leave their copies running while
+  //    the caller, having seen the error, releases the blocks they use.
+  struct WorkerPlan {
+    size_t worker_index;
+    std::vector<Buffer> src;
+    std::vector<Buffer> dst;
+    std::vector<int64_t> copy_sizes;
+  };
+  std::vector<WorkerPlan> plans;
+  plans.reserve(workers.size());
 
   for (size_t w = 0; w < workers.size(); ++w) {
     if (!workers[w].worker_service_client) continue;
 
-    std::vector<Buffer> worker_src;
-    std::vector<Buffer> worker_dst;
-    std::vector<int64_t> worker_copy_sizes;
-    worker_src.reserve(src_buffers.size());
-    worker_dst.reserve(dst_buffers.size());
+    WorkerPlan plan;
+    plan.worker_index = w;
+    plan.src.reserve(src_buffers.size());
+    plan.dst.reserve(dst_buffers.size());
 
     // Every buffer/block is transferred by every worker (each worker owns a
     // shard of every block), so there is no per-block partitioning here.
@@ -728,7 +726,7 @@ tsl::Future<> RaidenController::TransferBuffers(
         src_buf.set_remote_descriptors(it->second->endpoints);
         src_buf.set_remote_worker_endpoints({});
       }
-      worker_src.push_back(std::move(src_buf));
+      plan.src.push_back(std::move(src_buf));
 
       Buffer dst_buf = dst_buffers[i];
       if (!dst_buf.remote_worker_endpoints().empty()) {
@@ -751,30 +749,67 @@ tsl::Future<> RaidenController::TransferBuffers(
         // remote_descriptors.
         dst_buf.set_remote_descriptors(workers[w].raiden_transfer_endpoints);
       }
-      worker_dst.push_back(std::move(dst_buf));
+      plan.dst.push_back(std::move(dst_buf));
 
       if (!copy_sizes.empty()) {
-        worker_copy_sizes.push_back(copy_sizes[i]);
+        plan.copy_sizes.push_back(copy_sizes[i]);
       }
     }
 
-    if (worker_src.empty()) continue;
-
-    // Every worker owns a shard of every block, so the (host) staging offsets
-    // are identical across workers.
-    auto req_or = BuildTransferBuffersRequest(
-        worker_src, worker_dst, request_staging, worker_copy_sizes);
-    if (!req_or.ok()) {
-      return tsl::Future<>(req_or.status());
-    }
-
-    worker_futures.push_back(
-        workers[w].worker_service_client->TransferBuffers(*req_or));
+    if (plan.src.empty()) continue;
+    plans.push_back(std::move(plan));
   }
 
-  if (worker_futures.empty()) {
+  if (plans.empty()) {
     return tsl::Future<>(absl::FailedPreconditionError(
         "No active WorkerServiceClient available for TransferBuffers"));
+  }
+
+  // 5. All workers are matched: now auto-allocate local staging if needed.
+  std::optional<std::vector<int>> auto_allocated_staging_ids;
+  std::vector<Buffer> local_staging_buffers;
+  absl::Span<const Buffer> request_staging = staging_host_buffers;
+  if (needs_auto_staging) {
+    auto host_blocks_or = this->AllocateBlockIds(src_buffers.size());
+    if (!host_blocks_or.ok()) {
+      return tsl::Future<>(host_blocks_or.status());
+    }
+    auto_allocated_staging_ids = *host_blocks_or;
+    local_staging_buffers.reserve(auto_allocated_staging_ids->size());
+    for (int id : *auto_allocated_staging_ids) {
+      local_staging_buffers.emplace_back(id, std::vector<BufferShard>{},
+                                         std::nullopt,
+                                         ::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+    }
+    request_staging = local_staging_buffers;
+  }
+
+  // 6. Build every worker's request. Nothing has been dispatched yet, so on
+  //    failure the auto-allocated staging can be released immediately.
+  //    Every worker owns a shard of every block, so the (host) staging offsets
+  //    are identical across workers.
+  std::vector<::tpu_sync::proto::TransferBuffersRequest> requests;
+  requests.reserve(plans.size());
+  for (const WorkerPlan& plan : plans) {
+    auto req_or = BuildTransferBuffersRequest(plan.src, plan.dst,
+                                              request_staging, plan.copy_sizes);
+    if (!req_or.ok()) {
+      if (auto_allocated_staging_ids.has_value()) {
+        (void)this->DeallocateBlockIds(*auto_allocated_staging_ids);
+      }
+      return tsl::Future<>(req_or.status());
+    }
+    requests.push_back(std::move(req_or).value());
+  }
+
+  // 7. Dispatch. No early return is possible from here on, so the returned
+  //    future covers every dispatched job.
+  std::vector<tsl::Future<>> worker_futures;
+  worker_futures.reserve(plans.size());
+  for (size_t p = 0; p < plans.size(); ++p) {
+    worker_futures.push_back(
+        workers[plans[p].worker_index].worker_service_client->TransferBuffers(
+            requests[p]));
   }
 
   auto aggregate_future = tsl::JoinFutures(absl::MakeSpan(worker_futures));

@@ -1,0 +1,57 @@
+{
+  "_comment": [
+    "Regenerate with:  bazel run //tpu_sync/benchmarks:h2d_d2h_benchmark_gating --",
+    "                    --record --iters=<large> [--framework=jax|torch]",
+    "Use a large --iters when recording: the floor depends on a MAD estimate, which",
+    "needs many samples to be stable. Record mode rewrites this file in place and",
+    "preserves this comment.",
+    "",
+    "Top level",
+    "  sigma_k : robust sigmas below the median used to derive each floor (see below).",
+    "  iters   : timed iterations the GATE runs per config; their median is what is",
+    "            compared against the floor. Smaller than the value used to record.",
+    "  warmup  : untimed iterations run before the timed ones.",
+    "  enforce : optional, defaults to true. Set false to report regressions without",
+    "            blocking the build.",
+    "",
+    "Per config",
+    "  dtype / num_layers / shape / shard_axis : the KV-cache arrays being transferred.",
+    "            shape is per layer; shape[shard_axis] must be divisible by the chip",
+    "            count (8 on v5e) or the sharded shape silently mismatches.",
+    "  baseline_d2h / baseline_h2d : median throughput in Gbps observed when this file",
+    "            was recorded. REFERENCE ONLY -- the gate never compares against it; it",
+    "            is here so a drop can be read as a percentage.",
+    "  floor_d2h / floor_h2d : THE GATE THRESHOLD, in Gbps. The build FAILS if the",
+    "            measured median falls below it. Computed at record time as",
+    "                floor = median - sigma_k * (1.4826 * MAD)",
+    "            where MAD is the median absolute deviation of the recorded samples --",
+    "            i.e. the lower edge of the normal run-to-run spread. MAD is used rather",
+    "            than a plain stddev because it is outlier-resistant: one slow sample",
+    "            cannot drag the floor down and quietly weaken the gate."
+  ],
+  "sigma_k": 3.5,
+  "iters": 20,
+  "warmup": 3,
+  "configs": [
+    {
+      "dtype": "int32",
+      "num_layers": 1,
+      "shape": [8, 128, 1024, 128],
+      "shard_axis": 2,
+      "baseline_d2h": 835.4,
+      "baseline_h2d": 800.1,
+      "floor_d2h": 813.8,
+      "floor_h2d": 750.7
+    },
+    {
+      "dtype": "float32",
+      "num_layers": 1,
+      "shape": [8, 128, 1024, 128],
+      "shard_axis": 2,
+      "baseline_d2h": 849.0,
+      "baseline_h2d": 810.9,
+      "floor_d2h": 815.7,
+      "floor_h2d": 789.9
+    }
+  ]
+}

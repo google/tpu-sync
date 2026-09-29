@@ -14,15 +14,19 @@
 
 #include "tpu_sync/transport/lib/socket_transport_adapter.h"
 
+#include <poll.h>
+#include <sys/socket.h>
 #include <sys/uio.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -36,9 +40,11 @@
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/socket_util.h"
@@ -66,6 +72,61 @@ using ::tpu_raiden::telemetry::MetricLabel;
 using ::tpu_raiden::telemetry::RaidenMetricStore;
 namespace metric_labels = ::tpu_raiden::telemetry::metric_labels;
 namespace metric_names = ::tpu_raiden::telemetry::metric_names;
+
+SocketTransportAdapter::Config ReadConfigFromEnv() {
+  SocketTransportAdapter::Config config;
+  if (const char* val =
+          std::getenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S")) {
+    double s = 0.0;
+    if (absl::SimpleAtod(val, &s) && s > 0) {
+      config.handshake_ack_read_timeout = absl::Seconds(s);
+    }
+  }
+  if (const char* val =
+          std::getenv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S")) {
+    double s = 0.0;
+    if (absl::SimpleAtod(val, &s) && s > 0) {
+      config.final_ack_read_timeout = absl::Seconds(s);
+    }
+  }
+  return config;
+}
+
+absl::Status ReadExactWithTimeout(int fd, void* buf, size_t len,
+                                  absl::Duration timeout) {
+  const absl::Time deadline = absl::Now() + timeout;
+  uint8_t* ptr = static_cast<uint8_t*>(buf);
+  size_t remaining = len;
+  while (remaining > 0) {
+    const int64_t wait_ms =
+        std::max<int64_t>(0, absl::ToInt64Milliseconds(deadline - absl::Now()));
+    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+    const int p = ::poll(&pfd, 1, static_cast<int>(wait_ms));
+    if (p == 0) {
+      return absl::DeadlineExceededError(absl::StrCat(
+          "Socket read timed out after ", absl::FormatDuration(timeout)));
+    }
+    if (p < 0) {
+      if (errno == EINTR) continue;
+      return absl::InternalError(
+          absl::StrCat("poll failed: ", std::strerror(errno)));
+    }
+    const ssize_t n = ::recv(fd, ptr, remaining, MSG_DONTWAIT);
+    if (n > 0) {
+      ptr += n;
+      remaining -= static_cast<size_t>(n);
+    } else if (n == 0) {
+      return absl::InternalError("recv eof");
+    } else {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        continue;
+      }
+      return absl::InternalError(
+          absl::StrCat("recv failed: ", std::strerror(errno)));
+    }
+  }
+  return absl::OkStatus();
+}
 
 constexpr MetricLabel kPullResponseLabels[] = {
     {.key = metric_labels::kDirection,
@@ -158,6 +219,7 @@ SocketTransportAdapter::SocketTransportAdapter(
     RawBufferTransport* raw_transport, int parallelism)
     : raw_transport_(raw_transport),
       parallelism_(parallelism),
+      config_(ReadConfigFromEnv()),
       rr_index_(0),
       scheduler_stopping_(false) {
   ABSL_DCHECK(raw_transport_ != nullptr);
@@ -417,8 +479,11 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
     ABSL_RETURN_IF_ERROR(WriteExact(fd, s_src_ids.data(), s_src_ids.size()));
     uint8_t ack = 0;
     FaultInjectSocket(hooks::kSocketTransportPushRecvHandshakeAck, fd);
-    s = ReadExact(fd, &ack, 1);
-    if (!s.ok() || ack != 1) {
+    s = ReadExactWithTimeout(fd, &ack, 1, config_.handshake_ack_read_timeout);
+    if (!s.ok()) {
+      return s;
+    }
+    if (ack != 1) {
       return absl::InternalError("Explicit push destination handshake failed");
     }
     for (size_t k = 0; k < block_count; ++k) {
@@ -426,7 +491,9 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
     }
   } else {
     std::vector<uint8_t> ids_buf(block_count * sizeof(uint32_t));
-    ABSL_RETURN_IF_ERROR(ReadExact(fd, ids_buf.data(), ids_buf.size()));
+    ABSL_RETURN_IF_ERROR(
+        ReadExactWithTimeout(fd, ids_buf.data(), ids_buf.size(),
+                             config_.handshake_ack_read_timeout));
     const std::vector<int> stream_allocated_ids = DeserializeBlockIds(ids_buf);
 
     for (size_t k = 0; k < block_count; ++k) {
@@ -477,8 +544,11 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
 
   uint8_t ack = 0;
   FaultInjectSocket(hooks::kSocketTransportPushRecvAck, fd);
-  s = ReadExact(fd, &ack, 1);
-  if (!s.ok() || ack != 1) {
+  s = ReadExactWithTimeout(fd, &ack, 1, config_.final_ack_read_timeout);
+  if (!s.ok()) {
+    return s;
+  }
+  if (ack != 1) {
     return absl::InternalError("Push verification failed");
   }
 

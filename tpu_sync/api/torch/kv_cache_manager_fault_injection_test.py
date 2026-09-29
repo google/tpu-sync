@@ -52,6 +52,7 @@ class KVCacheManagerFaultInjectionTest(absltest.TestCase):
       self,
       num_blocks: int,
       seed: int = 123,
+      timeout_s: float = 5.0,
   ) -> tuple[
       kv_cache_manager.KVCacheManager,
       kv_cache_manager.KVCacheManager,
@@ -78,6 +79,7 @@ class KVCacheManagerFaultInjectionTest(absltest.TestCase):
         local_control_port=0,
         max_blocks=num_blocks,
         num_slots=2,
+        timeout_s=timeout_s,
         unsafe_skip_buffer_lock=True,
     )
     consumer = KVCacheManager(
@@ -86,6 +88,7 @@ class KVCacheManagerFaultInjectionTest(absltest.TestCase):
         local_control_port=0,
         max_blocks=num_blocks,
         num_slots=2,
+        timeout_s=timeout_s,
         unsafe_skip_buffer_lock=True,
     )
     self.assertGreater(producer.local_control_port, 0)
@@ -223,6 +226,68 @@ class KVCacheManagerFaultInjectionTest(absltest.TestCase):
     for idx, t in enumerate(dst_caches):
       self.assertTrue(torch.equal(t.cpu(), src_refs[idx]))
     self.assertEqual(fault_injection.get_hit_count(), 0)
+
+  def test_partial_abort_retry_invariant_tpu_hbm_parity(self):
+    """Invariant 2: TPU HBM Numerical Parity (Zero Silent Data Corruption).
+
+    Tests that when an in-flight transfer is aborted mid-stream (half the
+    payload chunks delivered), retrying the transfer with the same UUID
+    (reproducing SGLang's deterministic Blake2b UUID hash behavior) does not
+    cause premature completion or silent data corruption on TPU HBM.
+    """
+    producer, consumer, src_refs, dst_caches = self._setup_test_pair(
+        num_blocks=4, seed=300, timeout_s=5.0
+    )
+    uuid = 99042
+    block_ids = [0, 1, 2, 3]
+
+    # Phase 1: Inject mid-stream abort on data plane push.
+    fault_injection.inject_faults([{
+        "hook": "raw_buffer_transport.push.abort",
+        "action": "fail",
+        "probability": 1.0,
+    }])
+    self.assertTrue(fault_injection.has_active_injections())
+
+    self._start_read(producer, consumer, "req_abort_1", uuid, block_ids)
+    outcome = self._await_recv_outcome(consumer, "req_abort_1", timeout_s=10.0)
+    self.assertEqual(
+        outcome,
+        "failed",
+        "Transfer 1 should have failed due to mid-stream push abort",
+    )
+    self.assertGreater(
+        fault_injection.get_hit_count("raw_buffer_transport.push.abort"), 0
+    )
+
+    # Phase 2: Clear fault injection rules.
+    fault_injection.reset_faults()
+    self.assertFalse(fault_injection.has_active_injections())
+
+    # Drain settled sessions on producer.
+    producer.poll_stats()
+
+    # Phase 3: Retry the transfer with the EXACT SAME UUID (reproducing SGLang's
+    # deterministic Blake2b UUID hash behavior).
+    self._start_read(producer, consumer, "req_retry_99042", uuid, block_ids)
+    outcome = self._await_recv_outcome(
+        consumer, "req_retry_99042", timeout_s=15.0
+    )
+
+    self.assertEqual(
+        outcome,
+        "done",
+        "Retried transfer with same UUID failed to complete successfully",
+    )
+
+    # Invariant 2 Check: All layers on TPU HBM must strictly match source reference!
+    for idx, t in enumerate(dst_caches):
+      self.assertTrue(
+          torch.equal(t.cpu(), src_refs[idx]),
+          "Invariant 2 Violation: Silent data corruption in TPU HBM on layer"
+          f" {idx}! Stale progress from the aborted transfer caused premature"
+          " trigger before all chunks of the retry were received.",
+      )
 
 
 if __name__ == "__main__":

@@ -113,6 +113,10 @@ inline constexpr std::string_view kRawBufferTransportRecvHeader =
 inline constexpr std::string_view kRawBufferTransportSendJitter =
     "raw_buffer_transport.send.jitter";
 
+// Raw buffer transport, mid-transfer push abort hook.
+inline constexpr std::string_view kRawBufferTransportPushAbort =
+    "raw_buffer_transport.push.abort";
+
 // Hooks that support `action = "fail"`
 inline constexpr std::string_view kFailHooks[] = {
     kBlockTransportRecvBlockIds,
@@ -145,6 +149,7 @@ inline constexpr std::string_view kFailHooks[] = {
     kSocketTransportPushRecvAck,
     kRawBufferTransportAccept,
     kRawBufferTransportRecvHeader,
+    kRawBufferTransportPushAbort,
 };
 
 // Hooks that support `action = "delay"`.

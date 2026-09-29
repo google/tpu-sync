@@ -895,6 +895,14 @@ absl::Status RawBufferTransport::RegisterExpectedChunks(
   {
     absl::MutexLock lock(raw_progress_mu_);
     auto& prog = raw_progress_[uuid];
+    if (prog.expected_chunks.has_value()) {
+      VLOG(1) << "RegisterExpectedChunks: resetting previous incomplete "
+                 "registration for uuid="
+              << uuid;
+      prog.completed_chunks = 0;
+      prog.completed_chunks_per_layer.clear();
+      prog.triggered_layers.clear();
+    }
     prog.expected_chunks = expected_chunks;
     if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
       if (prog.arm_time == absl::InfinitePast()) {
@@ -947,6 +955,14 @@ absl::Status RawBufferTransport::RegisterExpectedLayerChunks(
   {
     absl::MutexLock lock(raw_progress_mu_);
     auto& prog = raw_progress_[uuid];
+    if (prog.expected_chunks.has_value()) {
+      VLOG(1) << "RegisterExpectedLayerChunks: resetting previous incomplete "
+                 "registration for uuid="
+              << uuid;
+      prog.completed_chunks = 0;
+      prog.completed_chunks_per_layer.clear();
+      prog.triggered_layers.clear();
+    }
     prog.expected_chunks_per_layer = expected_layer_chunks;
     for (const auto& [layer_idx, expected_count] : expected_layer_chunks) {
       if (expected_count == 0) continue;

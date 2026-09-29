@@ -21,6 +21,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>  // NOLINT
 #include <vector>
@@ -31,6 +32,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
@@ -61,12 +63,24 @@ class SocketTransportAdapter : public TransportAdapter {
 
   absl::StatusOr<Status> Poll(Handle handle) override;
 
+  absl::Duration handshake_ack_read_timeout() const {
+    return handshake_ack_read_timeout_;
+  }
+  absl::Duration final_ack_read_timeout() const {
+    return final_ack_read_timeout_;
+  }
+  absl::Duration initial_peer_backoff() const { return initial_peer_backoff_; }
+  absl::Duration max_peer_backoff() const { return max_peer_backoff_; }
+
+  int GetConsecutiveHandshakeTimeoutsForPeer(absl::string_view peer);
+  bool IsPeerInBackoff(absl::string_view peer);
+
  private:
   struct WriteTask {
     uint64_t uuid;
-    int stream_idx;
     std::string peer;
     std::function<void()> run;
+    std::function<void(absl::Status)> cancel;
   };
 
   struct PeerQueue {
@@ -74,9 +88,24 @@ class SocketTransportAdapter : public TransportAdapter {
     int active_streams = 0;
   };
 
+  struct PeerHealthState {
+    int consecutive_handshake_timeouts = 0;
+    std::optional<uint64_t> last_timeout_uuid;
+    int backoff_count = 0;
+    absl::Time backoff_until = absl::InfinitePast();
+  };
+
   void SocketWorkerLoop();
-  std::unique_ptr<WriteTask> SelectNextTask()
+  std::unique_ptr<WriteTask> SelectNextTask(
+      absl::Time* next_wake_time = nullptr)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(scheduler_mu_);
+
+  void CancelPendingTasksForRequestLocked(uint64_t uuid, absl::Status error)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(scheduler_mu_);
+  void DrainPeerLocked(absl::string_view peer)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(scheduler_mu_);
+  void RecordHandshakeTimeout(absl::string_view peer, uint64_t uuid);
+  void RecordHandshakeSuccess(absl::string_view peer);
 
   // Block-level Socket Operations (Op 1, 6).
   absl::StatusOr<Handle> PostSocketPush(absl::Span<const std::string> peers,
@@ -103,10 +132,16 @@ class SocketTransportAdapter : public TransportAdapter {
  private:
   RawBufferTransport* const raw_transport_;
   const int parallelism_;
+  const absl::Duration handshake_ack_read_timeout_;
+  const absl::Duration final_ack_read_timeout_;
+  const absl::Duration initial_peer_backoff_;
+  const absl::Duration max_peer_backoff_;
 
   absl::Mutex scheduler_mu_;
   absl::CondVar scheduler_cv_;
   absl::flat_hash_map<std::string, PeerQueue> peer_queues_
+      ABSL_GUARDED_BY(scheduler_mu_);
+  absl::flat_hash_map<std::string, PeerHealthState> peer_health_
       ABSL_GUARDED_BY(scheduler_mu_);
   std::vector<std::string> active_peers_ ABSL_GUARDED_BY(scheduler_mu_);
   size_t rr_index_ ABSL_GUARDED_BY(scheduler_mu_);

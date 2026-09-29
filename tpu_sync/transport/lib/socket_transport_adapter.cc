@@ -14,15 +14,19 @@
 
 #include "tpu_sync/transport/lib/socket_transport_adapter.h"
 
+#include <poll.h>
+#include <sys/socket.h>
 #include <sys/uio.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -36,9 +40,11 @@
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/socket_util.h"
@@ -66,6 +72,91 @@ using ::tpu_raiden::telemetry::MetricLabel;
 using ::tpu_raiden::telemetry::RaidenMetricStore;
 namespace metric_labels = ::tpu_raiden::telemetry::metric_labels;
 namespace metric_names = ::tpu_raiden::telemetry::metric_names;
+
+constexpr absl::Duration kDefaultHandshakeAckReadTimeout = absl::Seconds(5);
+constexpr absl::Duration kDefaultFinalAckReadTimeout = absl::Seconds(60);
+
+absl::Duration ParseTimeoutEnv(const char* env_var, absl::Duration fallback) {
+  const char* val = std::getenv(env_var);
+  if (val != nullptr) {
+    double s = 0.0;
+    if (absl::SimpleAtod(val, &s) && s > 0) {
+      return absl::Seconds(s);
+    }
+  }
+  return fallback;
+}
+
+absl::Duration InitHandshakeAckReadTimeout() {
+  return ParseTimeoutEnv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S",
+                         kDefaultHandshakeAckReadTimeout);
+}
+
+absl::Duration InitFinalAckReadTimeout() {
+  return ParseTimeoutEnv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S",
+                         kDefaultFinalAckReadTimeout);
+}
+
+constexpr absl::Duration kDefaultInitialPeerBackoff = absl::Milliseconds(500);
+constexpr absl::Duration kDefaultMaxPeerBackoff = absl::Seconds(30);
+
+absl::Duration InitInitialPeerBackoff() {
+  const char* val = std::getenv("TPU_RAIDEN_PREFILL_PEER_INITIAL_BACKOFF_MS");
+  if (val != nullptr) {
+    int64_t ms = 0;
+    if (absl::SimpleAtoi(val, &ms) && ms > 0) {
+      return absl::Milliseconds(ms);
+    }
+  }
+  return kDefaultInitialPeerBackoff;
+}
+
+absl::Duration InitMaxPeerBackoff() {
+  const char* val = std::getenv("TPU_RAIDEN_PREFILL_PEER_MAX_BACKOFF_MS");
+  if (val != nullptr) {
+    int64_t ms = 0;
+    if (absl::SimpleAtoi(val, &ms) && ms > 0) {
+      return absl::Milliseconds(ms);
+    }
+  }
+  return kDefaultMaxPeerBackoff;
+}
+
+absl::Status ReadExactWithTimeout(int fd, void* buf, size_t len,
+                                  absl::Duration timeout) {
+  const absl::Time deadline = absl::Now() + timeout;
+  uint8_t* ptr = static_cast<uint8_t*>(buf);
+  size_t remaining = len;
+  while (remaining > 0) {
+    const int64_t wait_ms =
+        std::max<int64_t>(0, absl::ToInt64Milliseconds(deadline - absl::Now()));
+    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+    const int p = ::poll(&pfd, 1, static_cast<int>(wait_ms));
+    if (p == 0) {
+      return absl::DeadlineExceededError(absl::StrCat(
+          "Socket read timed out after ", absl::FormatDuration(timeout)));
+    }
+    if (p < 0) {
+      if (errno == EINTR) continue;
+      return absl::InternalError(
+          absl::StrCat("poll failed: ", std::strerror(errno)));
+    }
+    const ssize_t n = ::recv(fd, ptr, remaining, MSG_DONTWAIT);
+    if (n > 0) {
+      ptr += n;
+      remaining -= static_cast<size_t>(n);
+    } else if (n == 0) {
+      return absl::InternalError("recv eof");
+    } else {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        continue;
+      }
+      return absl::InternalError(
+          absl::StrCat("recv failed: ", std::strerror(errno)));
+    }
+  }
+  return absl::OkStatus();
+}
 
 constexpr MetricLabel kPullResponseLabels[] = {
     {.key = metric_labels::kDirection,
@@ -108,6 +199,54 @@ absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
   return status;
 }
 
+struct PushContext {
+  const uint64_t uuid;
+  const int parallelism;
+  std::vector<Request> requests;
+  std::vector<int> src_block_ids;
+  std::vector<int> dst_block_ids;
+  std::vector<int> allocated_ids;
+  std::vector<absl::Status> statuses;
+  std::atomic<int> remaining_workers;
+  std::atomic<bool> failed{false};
+  CompletionCallback on_complete;
+  std::chrono::steady_clock::time_point start_ts;
+  std::string src_ip;
+  std::string dst_ip;
+
+  PushContext(uint64_t u, int p, size_t num_blocks, CompletionCallback cb,
+              std::string s_ip, std::string d_ip)
+      : uuid(u),
+        parallelism(p),
+        allocated_ids(num_blocks, 0),
+        statuses(p, absl::OkStatus()),
+        remaining_workers(p),
+        on_complete(std::move(cb)),
+        start_ts(std::chrono::steady_clock::now()),
+        src_ip(std::move(s_ip)),
+        dst_ip(std::move(d_ip)) {}
+
+  void FinishStream(int stream_idx, absl::Status s) {
+    statuses[stream_idx] = s;
+    if (remaining_workers.fetch_sub(1) == 1) {
+      absl::Status final_status = absl::OkStatus();
+      for (const auto& st : statuses) {
+        if (!st.ok()) {
+          final_status = st;
+          break;
+        }
+      }
+      if (final_status.ok()) {
+        RecordP2pTransferTime(start_ts, std::chrono::steady_clock::now(),
+                              src_ip, dst_ip);
+        if (on_complete) on_complete(allocated_ids);
+      } else if (on_complete) {
+        on_complete(final_status);
+      }
+    }
+  }
+};
+
 }  // namespace
 
 // Whether to pin the client-side source address of outbound data connections.
@@ -142,6 +281,10 @@ SocketTransportAdapter::SocketTransportAdapter(
     RawBufferTransport* raw_transport, int parallelism)
     : raw_transport_(raw_transport),
       parallelism_(parallelism),
+      handshake_ack_read_timeout_(InitHandshakeAckReadTimeout()),
+      final_ack_read_timeout_(InitFinalAckReadTimeout()),
+      initial_peer_backoff_(InitInitialPeerBackoff()),
+      max_peer_backoff_(InitMaxPeerBackoff()),
       rr_index_(0),
       scheduler_stopping_(false) {
   ABSL_DCHECK(raw_transport_ != nullptr);
@@ -154,7 +297,7 @@ SocketTransportAdapter::SocketTransportAdapter(
 
 SocketTransportAdapter::~SocketTransportAdapter() {
   {
-    absl::MutexLock lock(scheduler_mu_);
+    absl::MutexLock lock(&scheduler_mu_);
     scheduler_stopping_ = true;
   }
   scheduler_cv_.SignalAll();
@@ -163,41 +306,142 @@ SocketTransportAdapter::~SocketTransportAdapter() {
   }
 }
 
+int SocketTransportAdapter::GetConsecutiveHandshakeTimeoutsForPeer(
+    absl::string_view peer) {
+  absl::MutexLock lock(&scheduler_mu_);
+  auto it = peer_health_.find(peer);
+  if (it != peer_health_.end()) {
+    return it->second.consecutive_handshake_timeouts;
+  }
+  return 0;
+}
+
+bool SocketTransportAdapter::IsPeerInBackoff(absl::string_view peer) {
+  absl::MutexLock lock(&scheduler_mu_);
+  auto it = peer_health_.find(peer);
+  if (it != peer_health_.end()) {
+    return absl::Now() < it->second.backoff_until;
+  }
+  return false;
+}
+
+void SocketTransportAdapter::CancelPendingTasksForRequestLocked(
+    uint64_t uuid, absl::Status error) {
+  for (auto& [peer, pq] : peer_queues_) {
+    for (auto it = pq.tasks.begin(); it != pq.tasks.end();) {
+      if ((*it)->uuid == uuid) {
+        auto task = std::move(*it);
+        it = pq.tasks.erase(it);
+        if (task->cancel) {
+          task->cancel(error);
+        }
+      } else {
+        ++it;
+      }
+    }
+  }
+}
+
+void SocketTransportAdapter::DrainPeerLocked(absl::string_view peer) {
+  auto& health = peer_health_[peer];
+  const int exponent = std::min(health.backoff_count, 16);
+  absl::Duration backoff = initial_peer_backoff_ * (1 << exponent);
+  if (backoff > max_peer_backoff_) {
+    backoff = max_peer_backoff_;
+  }
+  health.backoff_until = absl::Now() + backoff;
+  health.backoff_count++;
+
+  auto it = peer_queues_.find(peer);
+  if (it == peer_queues_.end()) return;
+
+  const absl::Status drained_status = absl::UnavailableError(absl::StrCat(
+      "Peer ", peer,
+      " is sick (drained after 3 consecutive handshake timeouts)"));
+
+  while (!it->second.tasks.empty()) {
+    const uint64_t uuid = it->second.tasks.front()->uuid;
+    CancelPendingTasksForRequestLocked(uuid, drained_status);
+  }
+}
+
+void SocketTransportAdapter::RecordHandshakeTimeout(absl::string_view peer,
+                                                    uint64_t uuid) {
+  absl::MutexLock lock(&scheduler_mu_);
+  auto& health = peer_health_[peer];
+  if (!health.last_timeout_uuid.has_value() ||
+      *health.last_timeout_uuid != uuid) {
+    health.last_timeout_uuid = uuid;
+    health.consecutive_handshake_timeouts++;
+  }
+  if (health.consecutive_handshake_timeouts >= 3) {
+    DrainPeerLocked(peer);
+  }
+}
+
+void SocketTransportAdapter::RecordHandshakeSuccess(absl::string_view peer) {
+  absl::MutexLock lock(&scheduler_mu_);
+  auto it = peer_health_.find(peer);
+  if (it != peer_health_.end()) {
+    it->second.consecutive_handshake_timeouts = 0;
+    it->second.last_timeout_uuid.reset();
+    it->second.backoff_count = 0;
+    it->second.backoff_until = absl::InfinitePast();
+  }
+}
+
 void SocketTransportAdapter::SocketWorkerLoop() {
   while (!scheduler_stopping_) {
     std::unique_ptr<WriteTask> task;
     {
-      absl::MutexLock lock(scheduler_mu_);
+      absl::MutexLock lock(&scheduler_mu_);
       while (true) {
         if (scheduler_stopping_) return;
-        task = SelectNextTask();
+        absl::Time next_wake = absl::InfiniteFuture();
+        task = SelectNextTask(&next_wake);
         if (task) break;
-        scheduler_cv_.Wait(&scheduler_mu_);
+
+        if (next_wake < absl::InfiniteFuture()) {
+          scheduler_cv_.WaitWithDeadline(&scheduler_mu_, next_wake);
+        } else {
+          scheduler_cv_.Wait(&scheduler_mu_);
+        }
       }
     }
 
     if (task) {
       task->run();
       {
-        absl::MutexLock lock(scheduler_mu_);
+        absl::MutexLock lock(&scheduler_mu_);
         auto it = peer_queues_.find(task->peer);
         if (it != peer_queues_.end()) {
           it->second.active_streams--;
         }
+        scheduler_cv_.SignalAll();
       }
-      scheduler_cv_.SignalAll();
     }
   }
 }
 
 std::unique_ptr<SocketTransportAdapter::WriteTask>
-SocketTransportAdapter::SelectNextTask() {
+SocketTransportAdapter::SelectNextTask(absl::Time* next_wake_time) {
   if (active_peers_.empty()) return nullptr;
 
+  const absl::Time now = absl::Now();
   size_t start_idx = rr_index_;
   do {
     const std::string& peer = active_peers_[rr_index_];
     rr_index_ = (rr_index_ + 1) % active_peers_.size();
+
+    auto health_it = peer_health_.find(peer);
+    if (health_it != peer_health_.end() &&
+        now < health_it->second.backoff_until) {
+      if (next_wake_time != nullptr &&
+          health_it->second.backoff_until < *next_wake_time) {
+        *next_wake_time = health_it->second.backoff_until;
+      }
+      continue;
+    }
 
     auto& q = peer_queues_[peer];
     if (!q.tasks.empty() && q.active_streams < parallelism_) {
@@ -248,23 +492,15 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
                                         "parallelism must be positive"));
   }
 
-  auto shared_requests =
-      std::make_shared<std::vector<Request>>(requests.begin(), requests.end());
-  auto shared_src_block_ids = std::make_shared<std::vector<int>>(
-      src_block_ids.begin(), src_block_ids.end());
-  auto shared_dst_block_ids = std::make_shared<std::vector<int>>(
-      dst_block_ids.begin(), dst_block_ids.end());
-  auto allocated_ids = std::make_shared<std::vector<int>>(num_blocks, 0);
-  auto statuses =
-      std::make_shared<std::vector<absl::Status>>(P, absl::OkStatus());
-  auto remaining_workers = std::make_shared<std::atomic<int>>(P);
-  auto shared_on_complete =
-      std::make_shared<CompletionCallback>(std::move(on_complete));
-
   const absl::Span<const std::string> local_ips = raw_transport_->local_ips();
-  const std::string dst_ip(ExtractFirstEndpointIp(peers));
-  const std::chrono::steady_clock::time_point push_start_ts =
-      std::chrono::steady_clock::now();
+  auto ctx = std::make_shared<PushContext>(
+      uuid, P, num_blocks, std::move(on_complete),
+      std::string(ExtractFirstEndpointIp(local_ips)),
+      std::string(ExtractFirstEndpointIp(peers)));
+  ctx->requests.assign(requests.begin(), requests.end());
+  ctx->src_block_ids.assign(src_block_ids.begin(), src_block_ids.end());
+  ctx->dst_block_ids.assign(dst_block_ids.begin(), dst_block_ids.end());
+
   const size_t base_blocks_per_stream = num_blocks / P;
   const size_t remainder = num_blocks % P;
   size_t req_offset = 0;
@@ -273,62 +509,48 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
         i * base_blocks_per_stream + std::min<size_t>(i, remainder);
 
     size_t req_end = req_offset;
-    while (req_end < shared_requests->size() &&
-           (*shared_requests)[req_end].stream_idx == i) {
+    while (req_end < ctx->requests.size() &&
+           ctx->requests[req_end].stream_idx == i) {
       ++req_end;
     }
 
     const std::string local_ip = SelectSourceIp(local_ips, i);
     const std::string remote_peer = peers[i % peers.size()];
-
     absl::Span<const Request> stream_requests =
-        absl::MakeConstSpan(*shared_requests)
+        absl::MakeConstSpan(ctx->requests)
             .subspan(req_offset, req_end - req_offset);
     req_offset = req_end;
 
-    auto task_run = [this, i, remote_peer, local_ip, local_ips, dst_ip,
-                     block_offset, shared_requests, stream_requests,
-                     shared_src_block_ids, shared_dst_block_ids, allocated_ids,
-                     statuses, remaining_workers, shared_on_complete,
-                     push_start_ts]() {
-      (*statuses)[i] = PostSocketPushInternal(
-          remote_peer, local_ip, dst_ip, stream_requests, *shared_src_block_ids,
-          *shared_dst_block_ids, block_offset, *allocated_ids);
-
-      if (remaining_workers->fetch_sub(1) == 1) {
-        absl::Status final_status = absl::OkStatus();
-        for (const auto& s : *statuses) {
-          if (!s.ok()) {
-            final_status = s;
-            break;
-          }
-        }
-        if (final_status.ok()) {
-          const std::chrono::steady_clock::time_point push_end_ts =
-              std::chrono::steady_clock::now();
-          RecordP2pTransferTime(push_start_ts, push_end_ts,
-                                ExtractFirstEndpointIp(local_ips), dst_ip);
-        }
-        if (*shared_on_complete) {
-          if (!final_status.ok()) {
-            (*shared_on_complete)(final_status);
-          } else {
-            (*shared_on_complete)(*allocated_ids);
-          }
-        }
-      }
-    };
-
     auto task = std::make_unique<WriteTask>();
     task->uuid = uuid;
-    task->stream_idx = i;
     task->peer = remote_peer;
-    task->run = std::move(task_run);
+    task->cancel = [ctx, i](absl::Status cancel_err) {
+      ctx->FinishStream(i, cancel_err);
+    };
+    task->run = [this, ctx, i, remote_peer, local_ip, stream_requests,
+                 block_offset]() {
+      if (ctx->failed.load(std::memory_order_relaxed)) {
+        ctx->FinishStream(
+            i, absl::CancelledError("Request cancelled due to stream failure"));
+        return;
+      }
+
+      absl::Status s = PostSocketPushInternal(
+          remote_peer, local_ip, ctx->dst_ip, stream_requests,
+          ctx->src_block_ids, ctx->dst_block_ids, block_offset,
+          ctx->allocated_ids);
+
+      if (!s.ok()) {
+        ctx->failed.store(true, std::memory_order_relaxed);
+        absl::MutexLock lock(&scheduler_mu_);
+        CancelPendingTasksForRequestLocked(ctx->uuid, s);
+      }
+      ctx->FinishStream(i, s);
+    };
 
     {
-      absl::MutexLock lock(scheduler_mu_);
-      auto& pq = peer_queues_[task->peer];
-      pq.tasks.push_back(std::move(task));
+      absl::MutexLock lock(&scheduler_mu_);
+      peer_queues_[task->peer].tasks.push_back(std::move(task));
       if (std::find(active_peers_.begin(), active_peers_.end(), remote_peer) ==
           active_peers_.end()) {
         active_peers_.push_back(remote_peer);
@@ -365,6 +587,9 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
 
   auto borrowed_fd = raw_transport_->BorrowConnection(peer, local_ip);
   if (!borrowed_fd.ok()) {
+    if (borrowed_fd.status().code() == absl::StatusCode::kDeadlineExceeded) {
+      RecordHandshakeTimeout(peer, uuid);
+    }
     return borrowed_fd.status();
   }
 
@@ -391,6 +616,15 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
     return s;
   }
 
+  auto read_handshake = [&](void* buf, size_t len) -> absl::Status {
+    absl::Status status =
+        ReadExactWithTimeout(fd, buf, len, handshake_ack_read_timeout_);
+    if (status.code() == absl::StatusCode::kDeadlineExceeded) {
+      RecordHandshakeTimeout(peer, uuid);
+    }
+    return status;
+  };
+
   if (socket_opcode == 6) {
     ABSL_DCHECK_LE(block_offset + block_count, dst_block_ids.size());
     const auto s_dst_ids =
@@ -401,16 +635,20 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
     ABSL_RETURN_IF_ERROR(WriteExact(fd, s_src_ids.data(), s_src_ids.size()));
     uint8_t ack = 0;
     FaultInjectSocket(hooks::kSocketTransportPushRecvHandshakeAck, fd);
-    s = ReadExact(fd, &ack, 1);
-    if (!s.ok() || ack != 1) {
+    s = read_handshake(&ack, 1);
+    if (!s.ok()) return s;
+    if (ack != 1) {
       return absl::InternalError("Explicit push destination handshake failed");
     }
+    RecordHandshakeSuccess(peer);
     for (size_t k = 0; k < block_count; ++k) {
       allocated_ids[block_offset + k] = dst_block_ids[block_offset + k];
     }
   } else {
     std::vector<uint8_t> ids_buf(block_count * sizeof(uint32_t));
-    ABSL_RETURN_IF_ERROR(ReadExact(fd, ids_buf.data(), ids_buf.size()));
+    s = read_handshake(ids_buf.data(), ids_buf.size());
+    if (!s.ok()) return s;
+    RecordHandshakeSuccess(peer);
     const std::vector<int> stream_allocated_ids = DeserializeBlockIds(ids_buf);
 
     for (size_t k = 0; k < block_count; ++k) {
@@ -461,8 +699,11 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
 
   uint8_t ack = 0;
   FaultInjectSocket(hooks::kSocketTransportPushRecvAck, fd);
-  s = ReadExact(fd, &ack, 1);
-  if (!s.ok() || ack != 1) {
+  s = ReadExactWithTimeout(fd, &ack, 1, final_ack_read_timeout_);
+  if (!s.ok()) {
+    return s;
+  }
+  if (ack != 1) {
     return absl::InternalError("Push verification failed");
   }
 

@@ -21,6 +21,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>  // NOLINT
 #include <utility>
 #include <vector>
 
@@ -30,6 +31,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
@@ -37,6 +39,7 @@
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/service.grpc.pb.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
+#include "tpu_sync/transport/lib/transport_metrics_exporter.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -231,6 +234,10 @@ class BlockTransport final {
 
   absl::Mutex progress_mu_;
   ProgressMap layer_progress_ ABSL_GUARDED_BY(progress_mu_);
+
+  lib::TransportMetricsExporter metrics_exporter_;
+  absl::Notification stop_metrics_thread_;
+  std::thread metrics_thread_;
 
   lib::RawBufferTransport raw_transport_;
   std::unique_ptr<lib::PeregrineControlServiceImpl> peregrine_control_;

@@ -33,6 +33,7 @@
 #include <numeric>
 #include <optional>
 #include <string>
+#include <thread>  // NOLINT
 #include <utility>
 #include <vector>
 
@@ -48,6 +49,7 @@
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/socket_util.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
@@ -68,6 +70,8 @@ namespace tpu_raiden {
 namespace transport {
 
 namespace {
+
+constexpr absl::Duration kTransportMetricsPollInterval = absl::Seconds(1);
 
 size_t GetCoalesceWindowBytes() {
   const char* env = std::getenv("RAIDEN_TRANSPORT_COALESCE_WINDOW_BYTES");
@@ -239,9 +243,19 @@ BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
   LOG(INFO) << "local_port=" << local_port
             << ", local_ips=" << absl::StrJoin(local_ips, ",")
             << ", parallelism=" << parallelism_;
+  metrics_thread_ = std::thread([this]() {
+    while (!stop_metrics_thread_.WaitForNotificationWithTimeout(
+        kTransportMetricsPollInterval)) {
+      metrics_exporter_.Export(transport_adapter_->GetTransportMetrics());
+    }
+  });
 }
 
 BlockTransport::~BlockTransport() {
+  stop_metrics_thread_.Notify();
+  if (metrics_thread_.joinable()) {
+    metrics_thread_.join();
+  }
   {
     absl::MutexLock lock(active_sends_mu_);
     for (const auto& [uuid, state] : active_sends_) {

@@ -32,8 +32,10 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "xla/future.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
+#include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
@@ -204,19 +206,41 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
                                 size_t shard_idx) const override;
   size_t GetHostSize(size_t layer_idx, size_t shard_idx) const override;
 
-  uint8_t* GetTiledPointer(size_t layer_idx, size_t shard_idx) {
+  static constexpr size_t kNumScratchpadSlots = 2;
+
+  // Returns the tiled scratchpad pointer for |shard_idx| and |slot_idx|.
+  uint8_t* GetTiledPointer(size_t layer_idx, size_t shard_idx,
+                           size_t slot_idx = 0) {
     if (shard_idx < tiled_scratchpads_.size() &&
-        tiled_scratchpads_[shard_idx]) {
-      return tiled_scratchpads_[shard_idx]->ptr;
+        tiled_scratchpads_[shard_idx] && slot_idx < kNumScratchpadSlots) {
+      auto& slot = tiled_scratchpads_[shard_idx]->slots[slot_idx];
+      absl::MutexLock lock(slot.mu);
+      return slot.ptr;
     }
     return nullptr;
   }
-  const uint8_t* GetTiledPointer(size_t layer_idx, size_t shard_idx) const {
+  const uint8_t* GetTiledPointer(size_t layer_idx, size_t shard_idx,
+                                 size_t slot_idx = 0) const {
     if (shard_idx < tiled_scratchpads_.size() &&
-        tiled_scratchpads_[shard_idx]) {
-      return tiled_scratchpads_[shard_idx]->ptr;
+        tiled_scratchpads_[shard_idx] && slot_idx < kNumScratchpadSlots) {
+      const auto& slot = tiled_scratchpads_[shard_idx]->slots[slot_idx];
+      absl::MutexLock lock(slot.mu);
+      return slot.ptr;
     }
     return nullptr;
+  }
+
+  // Returns the allocated capacity in bytes of the tiled scratchpad for
+  // |shard_idx| and |slot_idx|.
+  size_t GetTiledScratchpadCapacity(size_t shard_idx,
+                                    size_t slot_idx = 0) const {
+    if (shard_idx < tiled_scratchpads_.size() &&
+        tiled_scratchpads_[shard_idx] && slot_idx < kNumScratchpadSlots) {
+      const auto& slot = tiled_scratchpads_[shard_idx]->slots[slot_idx];
+      absl::MutexLock lock(slot.mu);
+      return slot.capacity;
+    }
+    return 0;
   }
 
   // Returns the list of layer names associated with the weight synchronizer.
@@ -358,22 +382,41 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_;
   std::unique_ptr<HostMemoryAllocator> host_allocator_;
 
-  // Shared reusable scratchpad per shard (one per local device/chip) to avoid
-  // allocating redundant tiled staging buffers across all layers.
-  struct ShardScratchpad {
-    absl::Mutex mu;
-    uint8_t* ptr = nullptr;
-    size_t capacity = 0;
-    std::shared_ptr<void> owner;
-    std::unique_ptr<uint8_t[], void (*)(void*)> owned_buffer = {nullptr,
-                                                                [](void*) {}};
+  // Double-buffered reusable scratchpad slots per shard (one pair per local
+  // device/chip) so CPU tiling/detiling on one slot overlaps with in-flight
+  // PCIe H2D/D2H DMA on the other slot without allocating per-layer buffers.
+  struct ScratchpadSlot {
+    mutable absl::Mutex mu;
+    uint8_t* ptr ABSL_GUARDED_BY(mu) = nullptr;
+    size_t capacity ABSL_GUARDED_BY(mu) = 0;
+    std::shared_ptr<void> owner ABSL_GUARDED_BY(mu);
+    std::unique_ptr<uint8_t[], void (*)(void*)> owned_buffer
+        ABSL_GUARDED_BY(mu) = {nullptr, [](void*) {}};
     xla::Future<> in_flight_future;
+    int active_users = 0;
+  };
+
+  struct ShardScratchpad {
+    absl::Mutex state_mu;
+    size_t next_slot ABSL_GUARDED_BY(state_mu) = 0;
+    ScratchpadSlot slots[kNumScratchpadSlots];
   };
   std::vector<std::unique_ptr<ShardScratchpad>> tiled_scratchpads_;
 
+  // Selects a scratchpad slot for |sp| and increments its `active_users` count.
+  size_t SelectScratchpadSlotIndex(ShardScratchpad& sp);
+
+  // Computes the maximum physical tiled byte size across non-skipped layers on
+  // |shard_idx|, returning at least |fallback_bytes|.
+  size_t MaxActiveTiledBytesForShard(size_t shard_idx,
+                                     const std::vector<bool>& active_skip,
+                                     size_t fallback_bytes) const;
+
+  // Ensures |slot| has at least |required_bytes| allocated, sizing any new
+  // allocation to `std::max(required_bytes, target_capacity)`.
   absl::StatusOr<uint8_t*> AcquireTiledScratchpadLocked(
-      ShardScratchpad& sp, size_t required_bytes,
-      const xla::PjRtDevice* device);
+      ScratchpadSlot& slot, size_t required_bytes, size_t target_capacity,
+      const xla::PjRtDevice* device) ABSL_EXCLUSIVE_LOCKS_REQUIRED(slot.mu);
 
   mutable absl::Mutex skip_tiling_mu_;
   absl::flat_hash_map<uint64_t, std::vector<bool>> uuid_to_skip_tiling_

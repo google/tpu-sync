@@ -299,11 +299,58 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kWeightSyncBufferAllocatedBytes.type,
             MetricType::kGauge);
 
+  // Peregrine Metrics
+  EXPECT_EQ(metric_names::kPeregrineE2eLatencyUs, "peregrine_e2e_latency_us");
+  EXPECT_EQ(metric_descriptions::kPeregrineE2eLatencyUs,
+            "Peregrine end-to-end transfer duration in microseconds.");
+  EXPECT_EQ(metric_metadata::kPeregrineE2eLatencyUs.name,
+            "peregrine_e2e_latency_us");
+  EXPECT_EQ(metric_metadata::kPeregrineE2eLatencyUs.description,
+            "Peregrine end-to-end transfer duration in microseconds.");
+  EXPECT_EQ(metric_metadata::kPeregrineE2eLatencyUs.type,
+            MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kPeregrineE2eLatencyUs.label_names, IsEmpty());
+
+  EXPECT_EQ(metric_names::kPeregrineRequestSizeBytes,
+            "peregrine_request_size_bytes");
+  EXPECT_EQ(metric_descriptions::kPeregrineRequestSizeBytes,
+            "Peregrine per-operation transfer request size in bytes.");
+  EXPECT_EQ(metric_metadata::kPeregrineRequestSizeBytes.name,
+            "peregrine_request_size_bytes");
+  EXPECT_EQ(metric_metadata::kPeregrineRequestSizeBytes.description,
+            "Peregrine per-operation transfer request size in bytes.");
+  EXPECT_EQ(metric_metadata::kPeregrineRequestSizeBytes.type,
+            MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kPeregrineRequestSizeBytes.label_names,
+              IsEmpty());
+
+  EXPECT_EQ(metric_names::kPeregrineBytesTotal, "peregrine_bytes_total");
+  EXPECT_EQ(metric_descriptions::kPeregrineBytesTotal,
+            "Total payload bytes transferred across Peregrine data channels.");
+  EXPECT_EQ(metric_metadata::kPeregrineBytesTotal.name,
+            "peregrine_bytes_total");
+  EXPECT_EQ(metric_metadata::kPeregrineBytesTotal.description,
+            "Total payload bytes transferred across Peregrine data channels.");
+  EXPECT_EQ(metric_metadata::kPeregrineBytesTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kPeregrineBytesTotal.label_names, IsEmpty());
+
+  EXPECT_EQ(metric_names::kPeregrineErrorsTotal, "peregrine_errors_total");
+  EXPECT_EQ(metric_descriptions::kPeregrineErrorsTotal,
+            "Cumulative total count of Peregrine transfer failures.");
+  EXPECT_EQ(metric_metadata::kPeregrineErrorsTotal.name,
+            "peregrine_errors_total");
+  EXPECT_EQ(metric_metadata::kPeregrineErrorsTotal.description,
+            "Cumulative total count of Peregrine transfer failures.");
+  EXPECT_EQ(metric_metadata::kPeregrineErrorsTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kPeregrineErrorsTotal.label_names, IsEmpty());
+
   // Direction Labels
   EXPECT_EQ(metric_labels::kDirection, "direction");
   EXPECT_EQ(metric_labels::kDirectionPush, "push");
   EXPECT_EQ(metric_labels::kDirectionPull, "pull");
   EXPECT_EQ(metric_labels::kDirectionPullResponse, "pull_response");
+  EXPECT_EQ(metric_labels::kDirectionWrite, "write");
+  EXPECT_EQ(metric_labels::kDirectionRead, "read");
 
   // Error Code Labels
   EXPECT_EQ(metric_labels::kErrorCode, "error_code");
@@ -334,7 +381,11 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kWeightSyncBufferAllocatedBytes,
           metric_metadata::kWeightSyncTilingTimeMs,
           metric_metadata::kWeightSyncDetilingTimeMs,
-          metric_metadata::kWeightSyncScheduleGenerationTimeMs));
+          metric_metadata::kWeightSyncScheduleGenerationTimeMs,
+          metric_metadata::kPeregrineE2eLatencyUs,
+          metric_metadata::kPeregrineRequestSizeBytes,
+          metric_metadata::kPeregrineBytesTotal,
+          metric_metadata::kPeregrineErrorsTotal));
   // clang-format on
 }
 

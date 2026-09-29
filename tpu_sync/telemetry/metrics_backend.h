@@ -120,6 +120,15 @@ inline constexpr absl::string_view kWeightSyncDetilingTimeMs =
 inline constexpr absl::string_view kWeightSyncScheduleGenerationTimeMs =
     "weight_sync_schedule_generation_time_ms";
 
+inline constexpr absl::string_view kPeregrineE2eLatencyUs =
+    "peregrine_e2e_latency_us";
+inline constexpr absl::string_view kPeregrineRequestSizeBytes =
+    "peregrine_request_size_bytes";
+inline constexpr absl::string_view kPeregrineBytesTotal =
+    "peregrine_bytes_total";
+inline constexpr absl::string_view kPeregrineErrorsTotal =
+    "peregrine_errors_total";
+
 }  // namespace metric_names
 
 namespace metric_descriptions {
@@ -177,6 +186,15 @@ inline constexpr absl::string_view kWeightSyncDetilingTimeMs =
 inline constexpr absl::string_view kWeightSyncScheduleGenerationTimeMs =
     "Time spent generating weight sync transfer schedule in milliseconds.";
 
+inline constexpr absl::string_view kPeregrineE2eLatencyUs =
+    "Peregrine end-to-end transfer duration in microseconds.";
+inline constexpr absl::string_view kPeregrineRequestSizeBytes =
+    "Peregrine per-operation transfer request size in bytes.";
+inline constexpr absl::string_view kPeregrineBytesTotal =
+    "Total payload bytes transferred across Peregrine data channels.";
+inline constexpr absl::string_view kPeregrineErrorsTotal =
+    "Cumulative total count of Peregrine transfer failures.";
+
 }  // namespace metric_descriptions
 
 namespace metric_labels {
@@ -185,6 +203,8 @@ inline constexpr absl::string_view kDirection = "direction";
 inline constexpr absl::string_view kDirectionPush = "push";
 inline constexpr absl::string_view kDirectionPull = "pull";
 inline constexpr absl::string_view kDirectionPullResponse = "pull_response";
+inline constexpr absl::string_view kDirectionWrite = "write";
+inline constexpr absl::string_view kDirectionRead = "read";
 
 inline constexpr absl::string_view kErrorCode = "error_code";
 inline constexpr absl::string_view kLocalRank = "local_rank";
@@ -306,6 +326,26 @@ inline constexpr MetricMetadata kWeightSyncScheduleGenerationTimeMs{
     .description = metric_descriptions::kWeightSyncScheduleGenerationTimeMs,
     .type = MetricType::kHistogram};
 
+inline constexpr MetricMetadata kPeregrineE2eLatencyUs{
+    .name = metric_names::kPeregrineE2eLatencyUs,
+    .description = metric_descriptions::kPeregrineE2eLatencyUs,
+    .type = MetricType::kHistogram};
+
+inline constexpr MetricMetadata kPeregrineRequestSizeBytes{
+    .name = metric_names::kPeregrineRequestSizeBytes,
+    .description = metric_descriptions::kPeregrineRequestSizeBytes,
+    .type = MetricType::kHistogram};
+
+inline constexpr MetricMetadata kPeregrineBytesTotal{
+    .name = metric_names::kPeregrineBytesTotal,
+    .description = metric_descriptions::kPeregrineBytesTotal,
+    .type = MetricType::kCounter};
+
+inline constexpr MetricMetadata kPeregrineErrorsTotal{
+    .name = metric_names::kPeregrineErrorsTotal,
+    .description = metric_descriptions::kPeregrineErrorsTotal,
+    .type = MetricType::kCounter};
+
 inline constexpr MetricMetadata kAllMetrics[] = {
     kSentBytesTotal,
     kReceivedBytesTotal,
@@ -329,6 +369,10 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kWeightSyncTilingTimeMs,
     kWeightSyncDetilingTimeMs,
     kWeightSyncScheduleGenerationTimeMs,
+    kPeregrineE2eLatencyUs,
+    kPeregrineRequestSizeBytes,
+    kPeregrineBytesTotal,
+    kPeregrineErrorsTotal,
 };
 }  // namespace metric_metadata
 

@@ -198,6 +198,7 @@ py_test(
     srcs = ["kv_cache_store_recovery_e2e_test.py"],
     tags = [
         "manual",
+        "notap",
     ],
     deps = [
         ":kv_cache_manager_torch_py",
@@ -259,6 +260,7 @@ py_test(
     ],
     tags = [
         "manual",
+        "notap",
     ],
     deps = [
         ":kv_cache_manager_torch_py",
@@ -281,6 +283,7 @@ py_test(
     ],
     tags = [
         "manual",
+        "notap",
     ],
     deps = [
         ":kv_cache_manager_torch_py",

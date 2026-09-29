@@ -188,6 +188,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     std::function<int64_t()> get_node_id;
     std::function<absl::Status(uint64_t uuid)> begin_incoming_push;
     std::function<absl::Status(uint64_t uuid)> end_incoming_push;
+    std::function<void(uint64_t uuid, const absl::Status& status)>
+        on_receive_failed;
   };
 
   void SetTransferEventHooks(TransferEventHooks hooks) {
@@ -201,6 +203,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
                                 uint64_t uuid = 0) override;
   absl::Status OnLayerReceived(size_t layer_idx, uint64_t uuid = 0) override;
   absl::Status OnPoolReceived(size_t pool_idx, uint64_t uuid = 0) override;
+  void OnReceiveFailed(uint64_t uuid, const absl::Status& status) override;
   void ScheduleAsyncTask(std::function<void()> task) override;
 
   // Async on-chip H2D offloads returning PJRT copy future E2E.

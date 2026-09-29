@@ -52,6 +52,9 @@ class RawBufferTransportDelegate {
     return absl::OkStatus();
   }
 
+  // Notification triggered when an inbound receive stream fails or disconnects.
+  virtual void OnReceiveFailed(uint64_t uuid, const absl::Status& status) {}
+
   // Returns the gRPC channel for PeregrineControlService for the given peer.
   // Required when FLAGS_require_psp_tcp is true.
   // Note the peer string is the same as the peer passed to BlockTransport

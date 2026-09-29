@@ -74,9 +74,14 @@ cc_library(
         "-frtti",
     ],
     features = ["-use_header_modules"],
+    tags = [
+        "manual",
+        "nobuilder",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/types:span",
         "@jax//jaxlib:py_client",
         "@rules_python//python/cc:current_py_cc_headers",
         "@xla//xla/pjrt:pjrt_client",

@@ -41,6 +41,22 @@ RawBuffer* ToRawBuffer(T* buffer) {
   return buffer;
 }
 
+// In JAX 0.11.0, CommonPjRtBuffer::ScopedHold is 40 bytes (a raw
+// AbstractTrackedDeviceBuffer* at offset 24 plus a unique_ptr at offset 32,
+// which is nullptr for kUsage holds). In JAX 0.11.1+, those two fields were
+// merged into an 8-byte tsl::MaybeOwning pointer at offset 24, shrinking
+// ScopedHold to 32 bytes. Constructing in-place inside PaddedScopedHold via
+// C++17 guaranteed copy elision provides 8 bytes of trailing padding for 0.11.0
+// RVO and avoids calling ScopedHold's move constructor across ABI boundaries.
+struct PaddedScopedHold {
+  xla::CommonPjRtBuffer::ScopedHold hold;
+  void* abi_pad_0_11_0 = nullptr;
+
+  explicit PaddedScopedHold(xla::CommonPjRtBuffer* common_buffer)
+      : hold(common_buffer->GetBufferWithHold(
+            xla::CommonPjRtBuffer::ScopedHold::kUsage)) {}
+};
+
 }  // namespace
 
 BufferKind ClassifyBuffer(const xla::PjRtBuffer* buffer) {
@@ -60,18 +76,16 @@ absl::StatusOr<CommonBufferAcquisition> AcquireCommonRawBuffer(
     return absl::InvalidArgumentError("Not a CommonPjRtBuffer");
   }
 
-  auto hold = common_buffer->GetBufferWithHold(
-      xla::CommonPjRtBuffer::ScopedHold::kUsage);
-  if (!hold.ok()) {
-    return hold.status();
+  auto hold_wrapper = std::make_shared<PaddedScopedHold>(common_buffer);
+  if (!hold_wrapper->hold.ok()) {
+    return hold_wrapper->hold.status();
   }
 
   CommonBufferAcquisition result;
-  result.raw_buffer =
-      tsl::FormRef(ToRawBuffer(hold.buffer()->raw_buffer().get()));
+  result.raw_buffer = tsl::FormRef(
+      ToRawBuffer(hold_wrapper->hold.buffer()->raw_buffer().get()));
   if (!unsafe_skip_buffer_lock) {
-    result.hold = ScopedHold(
-        std::make_shared<xla::CommonPjRtBuffer::ScopedHold>(std::move(hold)));
+    result.hold = ScopedHold(std::move(hold_wrapper));
   }
   return result;
 }

@@ -10,7 +10,7 @@ bazel_dep(name = "rules_go", version = "0.60.0", repo_name = "io_bazel_rules_go"
 bazel_dep(name = "rules_ml_toolchain")
 archive_override(
     module_name = "rules_ml_toolchain",
-    integrity = "sha256-axspTL7LmKCLz+WWQUYfcuET2zD6kbRPzEnZgJm1umU=",
+    integrity = "sha256-AD+fcA+AoQ9wvsdh0AUpI30WpuIMBjEkyf/6mKjArzU=",
     patch_strip = 1,
     patches = [
         # Keep tpu-raiden on the host C++ toolchain: rules_ml_toolchain's
@@ -18,21 +18,23 @@ archive_override(
         # which would otherwise win toolchain resolution for the extension.
         "//:third_party/rules_ml_toolchain/no_register_toolchains.patch",
     ],
-    strip_prefix = "rules_ml_toolchain-b11745590f513ec55b32e2d126073576fde18c71",
-    urls = ["https://github.com/google-ml-infra/rules_ml_toolchain/archive/b11745590f513ec55b32e2d126073576fde18c71.tar.gz"],
+    strip_prefix = "rules_ml_toolchain-c0eb2743b7b12b2bbcf0e1888e26d36ba6b093de",
+    urls = ["https://github.com/google-ml-infra/rules_ml_toolchain/archive/c0eb2743b7b12b2bbcf0e1888e26d36ba6b093de.tar.gz"],
 )
 
 bazel_dep(name = "jax")
 git_override(
     module_name = "jax",
-    commit = "a1521744c6dc074443fe549f19f48d7197abf759",
+    commit = "32544801e26115ac1794926d027148abf3baf009",
     patch_strip = 1,
     patches = [
-        # This patch makes two jax MODULE.bazel fixups: (1) drop
-        # `dev_dependency = True` on the pip use_extension so the `jax_pypi` hub is
-        # created when jax is a dependency (tpu-raiden imports it via use_repo);
-        # (2) remove the local_wheels attribute (CI libtpu nightly) that pinned
-        # rules_python (1.8.5) doesn't support, so libtpu resolves from the index.
+        # This patch makes three jax MODULE.bazel fixups: (1) drop
+        # `python.override(add_runtime_manifest_files=...)` which pinned
+        # rules_python (1.8.5) doesn't support; (2) drop `dev_dependency = True`
+        # on the pip use_extension so the `jax_pypi` hub is created when jax is
+        # a dependency (tpu-raiden imports it via use_repo); (3) remove the
+        # local_wheels attribute that rules_python (1.8.5) doesn't support, so
+        # wheels resolve from the index.
         "//:third_party/py/jax_remove_local_wheels.patch",
     ],
     remote = "https://github.com/jax-ml/jax.git",
@@ -41,7 +43,7 @@ git_override(
 bazel_dep(name = "xla")
 git_override(
     module_name = "xla",
-    commit = "131bf41acb4650e4391a640c3f1859c1c86ad74b",
+    commit = "f60be94c9c5d1e1340a6259433ead57824c37293",
     patch_strip = 1,
     patches = [
         "//:third_party/xla/future_sfinae.patch",
@@ -64,14 +66,14 @@ single_version_override(
     version = "1.8.5",
 )
 
-bazel_dep(name = "grpc", version = "1.78.0", repo_name = "com_github_grpc_grpc")
+bazel_dep(name = "grpc", version = "1.81.0", repo_name = "com_github_grpc_grpc")
 single_version_override(
     module_name = "grpc",
     patch_strip = 1,
     patches = [
         "//:third_party/grpc/grpc.patch",
     ],
-    version = "1.78.0",
+    version = "1.81.0",
 )
 
 third_party = use_extension("@xla//third_party/extensions:third_party.bzl", "third_party_ext")

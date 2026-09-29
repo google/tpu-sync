@@ -1,8 +1,11 @@
 --- a/MODULE.bazel
 +++ b/MODULE.bazel
-@@ -185,5 +185,3 @@
- 
+@@ -189,8 +189,3 @@
  local_sysroot = use_extension("//extensions:local_sysroot_configure.bzl", "local_sysroot_ext")
  use_repo(local_sysroot, "local_sysroot_config")
--
--register_toolchains("//cc/...")
+ 
+-# Projects that use rules_ml_toolchain should register toolchains on their end
+-register_toolchains(
+-    "//cc/...",
+-    dev_dependency = True,
+-)

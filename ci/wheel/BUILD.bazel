@@ -40,8 +40,9 @@ TORCH_REQ = select({
 # wheels (pyproject.toml declares none). torch_tpu is intentionally omitted: it
 # is published only to a private Artifact Registry, and it is a documented
 # prerequisite for the torch extensions that has to match the torch_tpu build
-# raiden was compiled against. Each wheel states its own libtpu requirement --
-# the JAX wheel pins it in jax/jaxlib lockstep, the Torch wheel sets a floor.
+# raiden was compiled against. Both wheels state a minimum floor for libtpu/jax
+# rather than an exact pin so the environment stays free to move across
+# compatible 0.11.x releases.
 COMMON_REQUIRES = [
     "tpu-info==0.7.1",
     "numpy",
@@ -54,9 +55,9 @@ COMMON_REQUIRES = [
 # it can be installed alongside torch_tpu/torch without dragging jax/jaxlib
 # (e.g. sglang / vLLM). torch itself is provided by the environment (TORCH_REQ).
 JAX_REQUIRES = COMMON_REQUIRES + [
-    "jax==0.11.0",
-    "jaxlib==0.11.0",
-    "libtpu==0.0.47",
+    "jax>=0.11.0",
+    "jaxlib>=0.11.0",
+    "libtpu>=0.0.47",
 ]
 
 # The torch extension reaches the TPU through torch_tpu. Multi-process TPU v7 needs

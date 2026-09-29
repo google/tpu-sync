@@ -4,9 +4,9 @@ pytest
 pytest-mock
 absl-py
 numpy
-jax==0.11.0
-jaxlib==0.11.0
-libtpu==0.0.47
+jax>=0.11.0
+jaxlib>=0.11.0
+libtpu>=0.0.47
 grpcio-tools
 protobuf
 pyzmq

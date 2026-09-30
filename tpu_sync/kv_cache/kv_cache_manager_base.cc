@@ -302,18 +302,24 @@ uint64_t ComputeBytesPerShard(
 // transfer duration on the PCIe bus without lock contention.
 double ComputeDmaTransferTimeMs(absl::string_view dma_metric,
                                 absl::Time start_time, absl::Time end_time) {
-  static std::atomic<absl::Time> h2d_busy_until{absl::InfinitePast()};
-  static std::atomic<absl::Time> d2h_busy_until{absl::InfinitePast()};
-  std::atomic<absl::Time>& busy_until =
+  // The watermarks hold Unix nanoseconds so they stay lock-free 64-bit
+  // atomics; a 16-byte std::atomic<absl::Time> calls into libatomic.
+  static std::atomic<int64_t> h2d_busy_until_ns{
+      std::numeric_limits<int64_t>::min()};
+  static std::atomic<int64_t> d2h_busy_until_ns{
+      std::numeric_limits<int64_t>::min()};
+  std::atomic<int64_t>& busy_until_ns =
       (dma_metric == telemetry::metric_names::kH2dDmaTimeMs)
-          ? h2d_busy_until
-          : d2h_busy_until;
-  absl::Time prev_busy = busy_until.load(std::memory_order_relaxed);
-  while (end_time > prev_busy &&
-         !busy_until.compare_exchange_weak(prev_busy, end_time,
-                                           std::memory_order_relaxed)) {
+          ? h2d_busy_until_ns
+          : d2h_busy_until_ns;
+  const int64_t end_ns = absl::ToUnixNanos(end_time);
+  int64_t prev_busy_ns = busy_until_ns.load(std::memory_order_relaxed);
+  while (end_ns > prev_busy_ns &&
+         !busy_until_ns.compare_exchange_weak(prev_busy_ns, end_ns,
+                                              std::memory_order_relaxed)) {
   }
-  const absl::Time effective_start = std::max(start_time, prev_busy);
+  const absl::Time effective_start =
+      std::max(start_time, absl::FromUnixNanos(prev_busy_ns));
   return std::max(0.0, absl::ToDoubleMilliseconds(end_time - effective_start));
 }
 

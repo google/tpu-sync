@@ -92,6 +92,14 @@ use_repo(
 )
 
 bazel_dep(name = "abseil-cpp", version = "20260526.0", repo_name = "com_google_absl")
+# The torch extension hands absl objects (Status, StatusOr, the PJRT device
+# attribute map) across the torch_tpu boundary, so both binaries must be built
+# from the same abseil release: the one XLA pins. peregrine declares a newer
+# release, which bzlmod would otherwise select for the whole build.
+single_version_override(
+    module_name = "abseil-cpp",
+    version = "20260526.0",
+)
 
 # OSS crypto for global_registry_client.cc SHA256.
 bazel_dep(name = "boringssl", version = "0.20240913.0")

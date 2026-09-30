@@ -49,11 +49,20 @@ if [[ ! -x "${BAZEL_BIN}" ]]; then
 fi
 
 # The C++ gate for the JAX version being tested, so the compat layer compiles
-# the same branch the .so was built with.
-DEFAULT_JAX_VERSION="$(tr -d '[:space:]' < third_party/jax/DEFAULT)"
-# shellcheck source=tools/pins.sh
-source "${SCRIPT_DIR}/pins.sh"
-eval "$(raiden_read_pins "${WORKSPACE_DIR}" "${RAIDEN_JAX_VERSION:-${DEFAULT_JAX_VERSION}}")"
+# the same branch the .so was built with. Passed only for a non-default entry,
+# for the reason build.sh states: a --define renames the exec configuration's
+# output directory and costs a full host-tool rebuild, and the select's default
+# arm already produces the default entry's macro.
+# shellcheck source=tools/jax/jax_deps.sh
+source "${SCRIPT_DIR}/jax/jax_deps.sh"
+DEFAULT_JAX_VERSION="$(raiden_jax_default_version "${WORKSPACE_DIR}")"
+JAX_VERSION="${RAIDEN_JAX_VERSION:-${DEFAULT_JAX_VERSION}}"
+raiden_jax_validate_version "${WORKSPACE_DIR}" "${JAX_VERSION}"
+eval "$(raiden_jax_read_deps "${WORKSPACE_DIR}" "${JAX_VERSION}")"
+VERSION_DEFINE=()
+if [[ "${JAX_VERSION}" != "${DEFAULT_JAX_VERSION}" ]]; then
+  VERSION_DEFINE=(--define "raiden_jax=${RAIDEN_JAX_DEP_RAIDEN_JAX}")
+fi
 
 # --config=oss compiles with the host clang, which finds libstdc++ by guessing
 # the newest gcc directory under /usr/lib/gcc. On a machine where that guess
@@ -121,7 +130,7 @@ exec "${BAZEL_BIN}" \
   --host_jvm_args="-Xmx32g" --host_jvm_args="-Xms2g" \
   test -c opt --config=oss \
   --define with_torch=false \
-  --define "raiden_jax=${RAIDEN_PIN_RAIDEN_JAX}" \
+  "${VERSION_DEFINE[@]+"${VERSION_DEFINE[@]}"}" \
   --repo_env=HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION:-3.12}" \
   --disk_cache="${BAZEL_CACHE_BASE}/disk_cache" \
   --repository_cache="${BAZEL_CACHE_BASE}/repo_cache" \

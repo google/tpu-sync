@@ -12,19 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Encapsulates jaxlib private PyArray layout for TPU Raiden.
-//
-// jaxlib's PyArrayObject is private, so Raiden mirrors its layout to access
-// the underlying PjRtBuffer and IFRT array. This compatibility layer isolates
-// jaxlib layout definitions so that jaxlib/py_array.h is included only in
-// jax_compat.cc.
-//
-// Python-only: omitted from WITHOUT_PYTHON mock builds.
+// Isolates jaxlib PyArray layout mirroring for PjRtBuffer and IFRT array
+// access.
 
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_FRAMEWORKS_JAX_JAX_COMPAT_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_FRAMEWORKS_JAX_JAX_COMPAT_H_
 
 #include <Python.h>
+
+// Which JAX this is being built against; see xla_compat.h for encoding.
+#ifndef RAIDEN_JAX
+#define RAIDEN_JAX 1102
+#endif
 
 namespace xla {
 class PjRtBuffer;

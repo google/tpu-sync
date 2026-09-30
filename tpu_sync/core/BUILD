@@ -326,6 +326,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         # buildcleaner: keep
         "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_external",
+        "//third_party/jax:raiden_jax_version",
     ],
 )
 

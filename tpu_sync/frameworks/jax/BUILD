@@ -80,6 +80,7 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//third_party/jax:raiden_jax_version",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/types:span",
         "@jax//jaxlib:py_client",

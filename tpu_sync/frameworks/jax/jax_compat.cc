@@ -67,14 +67,13 @@ int GetRuntimeJaxVersion() {
   return version;
 }
 
-// Mirrors jaxlib's private PyArrayObject layout. Fields must match jaxlib
-// exactly across Python versions: Python < 3.12 includes weakrefs and dict.
+// Mirrors jaxlib's private PyArrayObject from py_array.cc.
 struct PyArrayObject {
   PyObject_HEAD;
-#if PY_VERSION_HEX < 0x030C0000
+#if RAIDEN_JAX < 1100 && PY_VERSION_HEX < 0x030C0000
   PyObject* weakrefs;
   PyObject* dict;
-#endif  // PY_VERSION_HEX < 0x030C0000
+#endif
   bool initialized;
   alignas(
       jax::PyArray::Storage) char array_storage[sizeof(jax::PyArray::Storage)];

@@ -31,15 +31,21 @@
 namespace raiden {
 namespace {
 
-// Converts the raw buffer pointer from the tracked device buffer hold into
-// a RawBuffer*. The static_assert ensures compile-time type safety.
+// Converts the raw buffer pointer from a tracked device buffer hold to
+// RawBuffer*.
+#if RAIDEN_JAX >= 1002 && RAIDEN_JAX < 1100
+template <typename T>
+RawBuffer* ToRawBuffer(T* buffer) {
+  return reinterpret_cast<RawBuffer*>(buffer);
+}
+#else
 template <typename T>
 RawBuffer* ToRawBuffer(T* buffer) {
   static_assert(std::is_convertible_v<T*, RawBuffer*>,
-                "Tracked device buffer hold return type is not convertible to "
-                "RawBuffer*; a compatibility specialization is required.");
+                "Buffer type is not convertible to RawBuffer*");
   return buffer;
 }
+#endif
 
 // In JAX 0.11.0, CommonPjRtBuffer::ScopedHold is 40 bytes (a raw
 // AbstractTrackedDeviceBuffer* at offset 24 plus a unique_ptr at offset 32,

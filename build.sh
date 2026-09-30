@@ -73,6 +73,43 @@ check_disk_space "${BAZEL_CACHE_BASE}" "Bazel Cache Base"
 check_disk_space "${BAZEL_OUTPUT_BASE}" "Bazel Output Base"
 check_disk_space "/tmp" "Temporary Directory (/tmp)"
 
+# Downloads <repo>/archive/<ref>.tar.gz into the bazel cache and applies every
+# patch it is given; a path override bypasses bzlmod's own patching, so a tree
+# reached through --override_module has to be patched here. The cache key
+# carries the patches' contents as well as the ref, so editing a patch
+# re-materializes rather than silently reusing the old tree. Sets
+# MATERIALIZED_DIR to the result.
+#
+#   materialize_module <repo_url> <ref> [patch_file...]
+materialize_module() {
+  local repo="$1" ref="$2"
+  shift 2
+  local name; name="$(basename "${repo}")"
+  local patch_key="nopatch"
+  if [[ "$#" -gt 0 ]]; then
+    patch_key="$(cat "$@" | sha256sum | cut -c1-16)"
+  fi
+  MATERIALIZED_DIR="${BAZEL_CACHE_BASE}/pinned_modules/${name}/${ref}-${patch_key}"
+  if [[ ! -f "${MATERIALIZED_DIR}/MODULE.bazel" ]]; then
+    echo "Materializing ${name} @ ${ref} ($# patch(es))..."
+    mkdir -p "${BAZEL_CACHE_BASE}"
+    local stage; stage="$(mktemp -d "${BAZEL_CACHE_BASE}/${name}_stage.XXXXXX")"
+    download_file "${repo}/archive/${ref}.tar.gz" "${stage}/src.tar.gz"
+    tar -xzf "${stage}/src.tar.gz" -C "${stage}"
+    local p
+    for p in "$@"; do
+      # An entry may legitimately list no patches for a module; do not let the
+      # loop trip `set -e` on an empty expansion.
+      [[ -f "$p" ]] || continue
+      patch -p1 -s -d "${stage}/${name}-${ref}" < "$p"
+    done
+    mkdir -p "$(dirname "${MATERIALIZED_DIR}")"
+    rm -rf "${MATERIALIZED_DIR}"
+    mv "${stage}/${name}-${ref}" "${MATERIALIZED_DIR}"
+    rm -rf "${stage}"
+  fi
+}
+
 echo "=== Navigating to workspace directory ==="
 cd "${WORKSPACE_DIR}"
 # The torch_tpu Bazel module. By default this is the wheel-backed module under
@@ -174,6 +211,92 @@ else
   DEFINE_FLAGS+=" --define with_jax=false"
 fi
 
+# === JAX version selection ===================================================
+# Everything here belongs to the JAX leg, and runs only for it. A torch-only
+# build takes its xla and rules_ml_toolchain revisions from the torch_tpu
+# checkout, so it must not read third_party/jax at all -- not even to resolve a
+# default. Otherwise a half-edited version directory would fail a build that
+# does not use one.
+if [ "$BUILD_JAX" = true ]; then
+  # RAIDEN_JAX_VERSION names one directory under third_party/jax/. That version's
+  # deps.bzl supplies jax, xla, rules_ml_toolchain and abseil -- all four, because
+  # they move together upstream and because raiden's extension and the installed
+  # jaxlib end up in one process: an abseil or XLA that does not match jaxlib's
+  # does not fail to compile, it crashes at runtime. Everything else follows on
+  # its own, since MODULE.bazel routes @pypi to jax's own pip hub, so @pypi//numpy
+  # and @pypi//libtpu track whichever jax module is in effect.
+  # shellcheck source=tools/jax/jax_deps.sh
+  source "${WORKSPACE_DIR}/tools/jax/jax_deps.sh"
+  DEFAULT_JAX_VERSION="$(raiden_jax_default_version "${WORKSPACE_DIR}")"
+  RAIDEN_JAX_VERSION="${RAIDEN_JAX_VERSION:-${DEFAULT_JAX_VERSION}}"
+  raiden_jax_validate_version "${WORKSPACE_DIR}" "${RAIDEN_JAX_VERSION}"
+  eval "$(raiden_jax_read_deps "${WORKSPACE_DIR}" "${RAIDEN_JAX_VERSION}")"
+
+  # Selects the C++ gate in the compat layer. A --define rather than a --copt:
+  # a copt would land on the command line of every XLA and gRPC compile, whereas
+  # //third_party/jax:raiden_jax_version turns this into a `defines` on the one
+  # library the compat headers hang off.
+  #
+  # Passed only for a non-default version. Any --define also lands in the exec
+  # configuration, which renames the bazel-out directory host tools build into --
+  # so adding one would miss the cache on every LLVM tblgen and rebuild them from
+  # scratch, for a value the select's default arm already produces. A non-default
+  # version compiles against a different XLA anyway, so it pays that cost
+  # regardless.
+  if [[ "${RAIDEN_JAX_VERSION}" != "${DEFAULT_JAX_VERSION}" ]]; then
+    DEFINE_FLAGS+=" --define raiden_jax=${RAIDEN_JAX_DEP_RAIDEN_JAX}"
+  fi
+
+  echo "=== JAX ${RAIDEN_JAX_VERSION}: xla ${RAIDEN_JAX_DEP_XLA_COMMIT:0:12}," \
+       "rules_ml_toolchain ${RAIDEN_JAX_DEP_RULES_ML_TOOLCHAIN_COMMIT:0:12}," \
+       "abseil ${RAIDEN_JAX_DEP_ABSL_VERSION}, libtpu ${RAIDEN_JAX_DEP_LIBTPU_VERSION} ==="
+
+  # --override_module takes a local directory, never a revision, so each pinned
+  # module is materialized into the cache first. A path override also bypasses
+  # bzlmod's own patching, which is why the patches travel with the pins.
+  workspace_paths() {
+    local p
+    for p in $1; do echo "${WORKSPACE_DIR}/${p}"; done
+  }
+  # shellcheck disable=SC2046  # word splitting is how the patch list is passed
+  materialize_module "${RAIDEN_JAX_DEP_JAX_REPO}" "${RAIDEN_JAX_DEP_JAX_COMMIT}" \
+    $(workspace_paths "${RAIDEN_JAX_DEP_JAX_PATCHES}")
+  BAZEL_MODULE_FLAGS+=("--override_module=jax=${MATERIALIZED_DIR}")
+
+  # shellcheck disable=SC2046
+  materialize_module "${RAIDEN_JAX_DEP_XLA_REPO}" "${RAIDEN_JAX_DEP_XLA_COMMIT}" \
+    $(workspace_paths "${RAIDEN_JAX_DEP_XLA_PATCHES}")
+  BAZEL_MODULE_FLAGS+=("--override_module=xla=${MATERIALIZED_DIR}")
+
+  # shellcheck disable=SC2046
+  materialize_module "${RAIDEN_JAX_DEP_RULES_ML_TOOLCHAIN_REPO}" \
+    "${RAIDEN_JAX_DEP_RULES_ML_TOOLCHAIN_COMMIT}" \
+    $(workspace_paths "${RAIDEN_JAX_DEP_RULES_ML_TOOLCHAIN_PATCHES}")
+  BAZEL_MODULE_FLAGS+=("--override_module=rules_ml_toolchain=${MATERIALIZED_DIR}")
+
+  # shellcheck disable=SC2046
+  materialize_module "${RAIDEN_JAX_DEP_ABSL_REPO}" "${RAIDEN_JAX_DEP_ABSL_VERSION}" \
+    $(workspace_paths "${RAIDEN_JAX_DEP_ABSL_PATCHES}")
+  BAZEL_MODULE_FLAGS+=("--override_module=abseil-cpp=${MATERIALIZED_DIR}")
+
+  # A version directory that disagrees with the files repeating its values does
+  # not fail the build. It compiles against one jax and then installs another,
+  # which appears later as a crash and not as a version error. That makes it a
+  # condition for this build being correct, so it is checked here and not left to
+  # CI. It is Python and grep, and costs about a second.
+  echo "=== Checking JAX deps ==="
+  "${WORKSPACE_DIR}/tools/jax/check_jax_deps.sh"
+elif [[ -n "${RAIDEN_JAX_VERSION:-}" ]]; then
+  # Set, and there is no JAX leg to apply it to. Refusing beats ignoring: the
+  # variable's whole purpose is to decide which jaxlib the extension is
+  # compiled against, and this build produces no such extension.
+  echo "Error: RAIDEN_JAX_VERSION selects the JAX stack, but this is a" \
+       "torch-only build, which takes its xla and rules_ml_toolchain revisions" \
+       "from the torch_tpu checkout. Unset RAIDEN_JAX_VERSION or build" \
+       "'jax'/'both'." >&2
+  exit 1
+fi
+
 if [ "$BUILD_TORCH" = true ]; then
   echo "Configuring build for Torch..."
   if [[ ! -f "${TORCH_TPU_MODULE_PATH}/MODULE.bazel" ]]; then
@@ -218,32 +341,6 @@ PY2
   elif [[ "${RAIDEN_TORCH_XLA:-}" == "module" ]]; then
     echo "RAIDEN_TORCH_XLA=module: torch leg uses MODULE.bazel's xla pin."
   else
-    # Downloads <repo>/archive/<commit>.tar.gz into the bazel cache (keyed by
-    # commit, reused across builds) and applies every patch in <patches_dir>;
-    # a path override bypasses bzlmod's own patching, so the tree must be
-    # patched here. Sets MATERIALIZED_DIR to the result.
-    materialize_pinned_module() {
-      local repo="$1" commit="$2" patches_dir="$3"
-      local name; name="$(basename "${repo}")"
-      MATERIALIZED_DIR="${BAZEL_CACHE_BASE}/torch_leg_deps/${name}/${commit}"
-      if [[ ! -f "${MATERIALIZED_DIR}/MODULE.bazel" ]]; then
-        echo "Materializing ${name} @ ${commit} with patches..."
-        mkdir -p "${BAZEL_CACHE_BASE}"
-        local stage; stage="$(mktemp -d "${BAZEL_CACHE_BASE}/${name}_stage.XXXXXX")"
-        download_file "${repo}/archive/${commit}.tar.gz" "${stage}/src.tar.gz"
-        tar -xzf "${stage}/src.tar.gz" -C "${stage}"
-        if [[ -n "${patches_dir}" ]]; then
-          local p
-          for p in "${patches_dir}"/*.patch; do
-            patch -p1 -s -d "${stage}/${name}-${commit}" < "$p"
-          done
-        fi
-        mkdir -p "$(dirname "${MATERIALIZED_DIR}")"
-        mv "${stage}/${name}-${commit}" "${MATERIALIZED_DIR}"
-        rm -rf "${stage}"
-      fi
-    }
-
     if [[ -n "${RAIDEN_TORCH_XLA:-}" ]]; then
       TORCH_XLA_DIR="$(cd "${RAIDEN_TORCH_XLA}" && pwd)"
     else
@@ -260,7 +357,7 @@ PY2
         echo "Error: could not read a 40-hex XLA commit from ${XLA_REVISION_FILE}." >&2
         exit 1
       fi
-      materialize_pinned_module "https://github.com/openxla/xla" \
+      materialize_module "https://github.com/openxla/xla" \
         "${XLA_COMMIT}" "${WORKSPACE_DIR}/third_party/xla"
       TORCH_XLA_DIR="${MATERIALIZED_DIR}"
     fi
@@ -279,7 +376,7 @@ PY2
       echo "Error: could not read the rules_ml_toolchain pin from ${TORCH_XLA_DIR}/MODULE.bazel." >&2
       exit 1
     fi
-    materialize_pinned_module "https://github.com/google-ml-infra/rules_ml_toolchain" \
+    materialize_module "https://github.com/google-ml-infra/rules_ml_toolchain" \
       "${RMT_COMMIT}" ""
     echo "torch leg rules_ml_toolchain override: ${MATERIALIZED_DIR}"
     BAZEL_MODULE_FLAGS+=("--override_module=rules_ml_toolchain=${MATERIALIZED_DIR}")
@@ -328,6 +425,9 @@ fi
 mkdir -p "${BAZEL_DISK_CACHE}" "${BAZEL_REPO_CACHE}" "$(dirname "${BAZEL_OUTPUT_BASE}")"
 
 echo "=== Building targets with Bazel ==="
+# Which modules this build is actually reading, so a build that silently used
+# the wrong pins is visible in the log rather than only in a crash later.
+printf 'module override: %s\n' "${BAZEL_MODULE_FLAGS[@]#--override_module=}"
 "${BAZEL_BIN}" --install_base="${BAZEL_OUTPUT_BASE}/install_base" --output_base="${BAZEL_OUTPUT_BASE}" --host_jvm_args="-Xmx32g" --host_jvm_args="-Xms2g" build -c opt --check_visibility=false --verbose_failures --experimental_repo_remote_exec --incompatible_disallow_empty_glob=false \
   --repo_env=HERMETIC_PYTHON_VERSION=${HERMETIC_PYTHON_VERSION:-3.12} \
   --repo_env=PIP_INDEX_URL="https://pypi.org/simple" \
@@ -416,6 +516,26 @@ fi
 
 echo "=== Install Python Dependencies! ==="
 echo "Using Python interpreter: $(which python3) ($(python3 --version))"
-python3 -m pip install --index-url=https://pypi.org/simple -r requirements.txt || echo "Warning: pip installation returned a non-zero status. Proceeding anyway."
+REQUIREMENTS_FILE="${WORKSPACE_DIR}/requirements.txt"
+if [ "$BUILD_JAX" = true ]; then
+  # The built version's requirements, not the top-level file as written. A
+  # 0.10.x build that installed the default version's jax would leave a .so
+  # compiled against one jaxlib's headers and loaded against another's ABI.
+  # That does not fail; it corrupts. The version supplies only the three specs
+  # that move with jax. Everything else comes from the top-level file, so a
+  # dependency added there reaches every version.
+  #
+  # For the default version this renders the top-level file unchanged, which
+  # check_jax_deps.sh is what guarantees. A torch-only build installs that file
+  # directly, exactly as it did before versions were selectable.
+  RENDERED_REQUIREMENTS="$(mktemp "${TMPDIR:-/tmp}/raiden_requirements.XXXXXX")"
+  trap 'rm -f "${RENDERED_REQUIREMENTS}"' EXIT
+  raiden_jax_render_requirements "${WORKSPACE_DIR}" "${RAIDEN_JAX_VERSION}" \
+    "${RENDERED_REQUIREMENTS}"
+  REQUIREMENTS_FILE="${RENDERED_REQUIREMENTS}"
+  echo "Installing requirements for JAX ${RAIDEN_JAX_VERSION}:"
+  grep -E '^(jax|jaxlib|libtpu)==' "${REQUIREMENTS_FILE}" | sed 's/^/  /'
+fi
+python3 -m pip install --index-url=https://pypi.org/simple -r "${REQUIREMENTS_FILE}" || echo "Warning: pip installation returned a non-zero status. Proceeding anyway."
 
 echo "=== Installation Complete! ==="

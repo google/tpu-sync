@@ -38,6 +38,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/notification.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/socket_util.h"
@@ -851,6 +852,323 @@ TEST(SocketTransportAdapterTest, SourceBindEnabledWithEnableSourceIpBindEnv) {
     EXPECT_THAT(recv_buf, ::testing::ElementsAre(5, 6, 7, 8));
     EXPECT_THAT(observed_peer_ip, ::testing::HasSubstr("127.0.0.3"));
   }
+}
+
+TEST(SocketTransportAdapterTest, DefaultTimeoutsWhenEnvUnset) {
+  auto cleanup = absl::MakeCleanup([] {
+    unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S");
+  });
+  unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S");
+  unsetenv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S");
+
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+  EXPECT_EQ(client_adapter.handshake_ack_read_timeout(), absl::Seconds(5));
+  EXPECT_EQ(client_adapter.final_ack_read_timeout(), absl::Seconds(60));
+}
+
+TEST(SocketTransportAdapterTest, InvalidEnvFallsBackToDefault) {
+  auto cleanup = absl::MakeCleanup([] {
+    unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S");
+  });
+  setenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S", "invalid_number",
+         1);
+  setenv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S", "-10.0", 1);
+
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+  EXPECT_EQ(client_adapter.handshake_ack_read_timeout(), absl::Seconds(5));
+  EXPECT_EQ(client_adapter.final_ack_read_timeout(), absl::Seconds(60));
+}
+
+TEST(SocketTransportAdapterTest, PushTimesOutWhenHandshakeNeverResponds) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S", "0.1", 1);
+
+  auto server_handler = [](int client_fd,
+                           const ChunkHeader& header) -> absl::Status {
+    absl::SleepFor(absl::Milliseconds(500));
+    return absl::OkStatus();
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+
+  std::vector<uint8_t> test_data = {1, 2, 3, 4};
+  Request req = {};
+  req.socket_opcode = 6;
+  req.laddr = test_data.data();
+  req.len = test_data.size();
+  req.count_or_size = 1;
+  req.uuid = 42;
+  req.parallelism = 1;
+  req.request_id = 0;
+  req.stream_idx = 0;
+
+  absl::Notification done;
+  absl::StatusOr<std::vector<int>> push_result;
+  const int src_bid = 10;
+  const int dst_bid = 20;
+  const absl::Time start = absl::Now();
+  auto handle = client_adapter.Post(
+      /*peers=*/{GetIpPort(server_transport)},
+      /*requests=*/absl::MakeConstSpan(&req, 1),
+      /*src_block_ids=*/absl::MakeConstSpan(&src_bid, 1),
+      /*dst_block_ids=*/absl::MakeConstSpan(&dst_bid, 1),
+      [&](absl::StatusOr<std::vector<int>> res) {
+        push_result = std::move(res);
+        done.Notify();
+      });
+
+  ASSERT_THAT(handle.status(), absl_testing::IsOk());
+  EXPECT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_FALSE(push_result.ok());
+  EXPECT_THAT(push_result.status(),
+              StatusIs(absl::StatusCode::kDeadlineExceeded,
+                       ::testing::HasSubstr("timed out")));
+  EXPECT_LT(absl::Now() - start, absl::Seconds(1));
+}
+
+TEST(SocketTransportAdapterTest, PushTimesOutWhenFinalAckNeverResponds) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S", "0.1", 1);
+
+  // Server receives handshake and payload properly, but never sends final ack.
+  auto server_handler = [](int client_fd,
+                           const ChunkHeader& header) -> absl::Status {
+    const size_t count = header.count_or_size;
+    std::vector<uint8_t> ids_buf(count * sizeof(uint32_t));
+    ABSL_RETURN_IF_ERROR(
+        ::peregrine::ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
+    ABSL_RETURN_IF_ERROR(
+        ::peregrine::ReadExact(client_fd, ids_buf.data(), ids_buf.size()));
+    uint8_t ack = 1;
+    ABSL_RETURN_IF_ERROR(::peregrine::WriteExact(client_fd, &ack, 1));
+
+    uint8_t size_buf[kChunkSizeFieldSize];
+    ABSL_RETURN_IF_ERROR(
+        ::peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf)));
+    const uint32_t chunk_size = DeserializeChunkSize(size_buf);
+    std::vector<uint8_t> payload(chunk_size);
+    if (chunk_size > 0) {
+      ABSL_RETURN_IF_ERROR(
+          ::peregrine::ReadExact(client_fd, payload.data(), payload.size()));
+    }
+
+    // Hang before sending final ack.
+    absl::SleepFor(absl::Milliseconds(500));
+    return absl::OkStatus();
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+
+  std::vector<uint8_t> test_data = {1, 2, 3, 4};
+  Request req = {};
+  req.socket_opcode = 6;
+  req.laddr = test_data.data();
+  req.len = test_data.size();
+  req.count_or_size = 1;
+  req.uuid = 43;
+  req.parallelism = 1;
+  req.request_id = 0;
+  req.stream_idx = 0;
+
+  absl::Notification done;
+  absl::StatusOr<std::vector<int>> push_result;
+  const int src_bid = 10;
+  const int dst_bid = 20;
+  const absl::Time start = absl::Now();
+  auto handle = client_adapter.Post(
+      /*peers=*/{GetIpPort(server_transport)},
+      /*requests=*/absl::MakeConstSpan(&req, 1),
+      /*src_block_ids=*/absl::MakeConstSpan(&src_bid, 1),
+      /*dst_block_ids=*/absl::MakeConstSpan(&dst_bid, 1),
+      [&](absl::StatusOr<std::vector<int>> res) {
+        push_result = std::move(res);
+        done.Notify();
+      });
+
+  ASSERT_THAT(handle.status(), absl_testing::IsOk());
+  EXPECT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_FALSE(push_result.ok());
+  EXPECT_THAT(push_result.status(),
+              StatusIs(absl::StatusCode::kDeadlineExceeded,
+                       ::testing::HasSubstr("timed out")));
+  EXPECT_LT(absl::Now() - start, absl::Seconds(1));
+}
+
+TEST(SocketTransportAdapterTest, PushTimesOutOnPartialBlockIdsStall) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S", "0.1", 1);
+
+  // Server sends partial block IDs (e.g. 2 bytes out of 4) and then stalls.
+  auto server_handler = [](int client_fd,
+                           const ChunkHeader& header) -> absl::Status {
+    uint16_t partial_id = 100;
+    ABSL_RETURN_IF_ERROR(
+        ::peregrine::WriteExact(client_fd, &partial_id, sizeof(partial_id)));
+    absl::SleepFor(absl::Milliseconds(500));
+    return absl::OkStatus();
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+
+  std::vector<uint8_t> test_data = {1, 2, 3, 4};
+  Request req = {};
+  req.socket_opcode = 1;
+  req.laddr = test_data.data();
+  req.len = test_data.size();
+  req.count_or_size = 1;
+  req.uuid = 44;
+  req.parallelism = 1;
+  req.request_id = 0;
+  req.stream_idx = 0;
+
+  absl::Notification done;
+  absl::StatusOr<std::vector<int>> push_result;
+  const int src_bid = 10;
+  const absl::Time start = absl::Now();
+  auto handle = client_adapter.Post(
+      /*peers=*/{GetIpPort(server_transport)},
+      /*requests=*/absl::MakeConstSpan(&req, 1),
+      /*src_block_ids=*/absl::MakeConstSpan(&src_bid, 1),
+      /*dst_block_ids=*/{}, [&](absl::StatusOr<std::vector<int>> res) {
+        push_result = std::move(res);
+        done.Notify();
+      });
+
+  ASSERT_THAT(handle.status(), absl_testing::IsOk());
+  EXPECT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_FALSE(push_result.ok());
+  EXPECT_THAT(push_result.status(),
+              StatusIs(absl::StatusCode::kDeadlineExceeded,
+                       ::testing::HasSubstr("timed out")));
+  EXPECT_LT(absl::Now() - start, absl::Seconds(1));
+}
+
+TEST(SocketTransportAdapterTest,
+     SickDecodeDoesNotFreezePrefillWorkersForHealthyDecode) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S", "0.2", 1);
+
+  // Sick server that hangs without responding.
+  auto sick_server_handler = [](int client_fd,
+                                const ChunkHeader& header) -> absl::Status {
+    absl::SleepFor(absl::Milliseconds(500));
+    return absl::OkStatus();
+  };
+  RawBufferTransport sick_server(/*delegate=*/nullptr, /*local_port=*/0,
+                                 /*local_ips=*/{}, sick_server_handler);
+
+  // Healthy server that responds to op 1.
+  auto healthy_server_handler = [](int client_fd,
+                                   const ChunkHeader& header) -> absl::Status {
+    std::vector<int> allocated_ids = {100};
+    const std::vector<uint8_t> s_ids = SerializeBlockIds(allocated_ids);
+    ABSL_RETURN_IF_ERROR(
+        ::peregrine::WriteExact(client_fd, s_ids.data(), s_ids.size()));
+
+    uint8_t size_buf[kChunkSizeFieldSize];
+    ABSL_RETURN_IF_ERROR(
+        ::peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf)));
+    const uint32_t chunk_size = DeserializeChunkSize(size_buf);
+    std::vector<uint8_t> payload(chunk_size);
+    if (chunk_size > 0) {
+      ABSL_RETURN_IF_ERROR(
+          ::peregrine::ReadExact(client_fd, payload.data(), payload.size()));
+    }
+    uint8_t ack = 1;
+    return ::peregrine::WriteExact(client_fd, &ack, 1);
+  };
+  RawBufferTransport healthy_server(/*delegate=*/nullptr, /*local_port=*/0,
+                                    /*local_ips=*/{}, healthy_server_handler);
+
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  // Prefill has 4 socket workers.
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/4);
+
+  // 1. Post to sick server using 4 streams (exhausting all 4 workers if it
+  // hung).
+  std::vector<uint8_t> test_data = {1, 2, 3, 4};
+  std::vector<Request> sick_reqs(4);
+  std::vector<int> sick_src_bids = {1, 2, 3, 4};
+  for (int i = 0; i < 4; ++i) {
+    sick_reqs[i].socket_opcode = 1;
+    sick_reqs[i].laddr = test_data.data();
+    sick_reqs[i].len = test_data.size();
+    sick_reqs[i].count_or_size = 1;
+    sick_reqs[i].uuid = 10;
+    sick_reqs[i].parallelism = 4;
+    sick_reqs[i].stream_idx = i;
+    sick_reqs[i].request_id = i;
+  }
+
+  const absl::Time start = absl::Now();
+  absl::Notification sick_done;
+  absl::StatusOr<std::vector<int>> sick_result;
+  std::vector<std::string> sick_peers(4, GetIpPort(sick_server));
+  ASSERT_THAT(
+      client_adapter
+          .Post(sick_peers, absl::MakeConstSpan(sick_reqs),
+                absl::MakeConstSpan(sick_src_bids), /*dst_block_ids=*/{},
+                [&](absl::StatusOr<std::vector<int>> res) {
+                  sick_result = std::move(res);
+                  sick_done.Notify();
+                })
+          .status(),
+      absl_testing::IsOk());
+
+  // 2. Post to healthy server.
+  Request healthy_req = {};
+  healthy_req.socket_opcode = 1;
+  healthy_req.laddr = test_data.data();
+  healthy_req.len = test_data.size();
+  healthy_req.count_or_size = 1;
+  healthy_req.uuid = 20;
+  healthy_req.parallelism = 1;
+  healthy_req.stream_idx = 0;
+  healthy_req.request_id = 0;
+  const int healthy_src_bid = 99;
+
+  absl::Notification healthy_done;
+  absl::StatusOr<std::vector<int>> healthy_result;
+  ASSERT_THAT(client_adapter
+                  .Post({GetIpPort(healthy_server)},
+                        absl::MakeConstSpan(&healthy_req, 1),
+                        absl::MakeConstSpan(&healthy_src_bid, 1),
+                        /*dst_block_ids=*/{},
+                        [&](absl::StatusOr<std::vector<int>> res) {
+                          healthy_result = std::move(res);
+                          healthy_done.Notify();
+                        })
+                  .status(),
+              absl_testing::IsOk());
+
+  // Healthy push must succeed quickly and not be starved by the sick decode.
+  EXPECT_TRUE(healthy_done.WaitForNotificationWithTimeout(absl::Seconds(3)));
+  EXPECT_THAT(healthy_result, IsOkAndHolds(::testing::ElementsAre(100)));
+
+  // Sick push must fail due to timeout.
+  EXPECT_TRUE(sick_done.WaitForNotificationWithTimeout(absl::Seconds(3)));
+  EXPECT_FALSE(sick_result.ok());
+  EXPECT_THAT(sick_result.status(),
+              StatusIs(absl::StatusCode::kDeadlineExceeded,
+                       ::testing::HasSubstr("timed out")));
+  EXPECT_LT(absl::Now() - start, absl::Seconds(2));
 }
 
 }  // namespace

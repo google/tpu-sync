@@ -17,6 +17,7 @@ load("@raiden_version//:version.bzl", "WHEEL_VERSION")
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("@rules_python//python:packaging.bzl", "py_package")
+load("//third_party/tpu_raiden/third_party/jax:requires.bzl", "jax_stack_requires")
 load(":wheel.bzl", "raiden_framework_wheel")
 
 package(default_visibility = ["//visibility:public"])
@@ -51,14 +52,9 @@ COMMON_REQUIRES = [
     "requests",
 ]
 
-# The JAX wheel pulls the JAX stack; the Torch wheel deliberately does NOT, so
-# it can be installed alongside torch_tpu/torch without dragging jax/jaxlib
-# (e.g. sglang / vLLM). torch itself is provided by the environment (TORCH_REQ).
-JAX_REQUIRES = COMMON_REQUIRES + [
-    "jax>=0.11.0",
-    "jaxlib>=0.11.0",
-    "libtpu>=0.0.47",
-]
+# The JAX wheel requirements come from the selected version pins, not literals,
+# ensuring wheels declare the JAX version they were compiled against.
+JAX_REQUIRES = COMMON_REQUIRES + jax_stack_requires()
 
 # The torch extension reaches the TPU through torch_tpu. Multi-process TPU v7 needs
 # the DmaMap fix that shipped in 0.0.47, and an older libtpu aborts inside the

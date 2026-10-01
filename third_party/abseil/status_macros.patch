@@ -1,0 +1,104 @@
+diff -Naur a/absl/status/BUILD.bazel b/absl/status/BUILD.bazel
+--- a/absl/status/BUILD.bazel
++++ b/absl/status/BUILD.bazel
+@@ -209,3 +209,19 @@
+         "@googletest//:gtest_main",
+     ],
+ )
++
++# Added by tpu-raiden: ABSL_RETURN_IF_ERROR and ABSL_ASSIGN_OR_RETURN.
++cc_library(
++    name = "status_macros",
++    hdrs = ["status_macros.h"],
++    copts = ABSL_DEFAULT_COPTS,
++    linkopts = ABSL_DEFAULT_LINKOPTS,
++    visibility = ["//visibility:public"],
++    deps = [
++        ":status",
++        ":statusor",
++        "//absl/base:core_headers",
++    ],
++)
+diff -Naur a/absl/status/status_macros.h b/absl/status/status_macros.h
+--- a/absl/status/status_macros.h
++++ b/absl/status/status_macros.h
+@@ -0,0 +1,98 @@
++// Backport of ABSL_RETURN_IF_ERROR and ABSL_ASSIGN_OR_RETURN for Abseil releases
++// predating them. Added by tpu-raiden for JAX 0.10.x compatibility.
++
++#ifndef ABSL_STATUS_STATUS_MACROS_H_
++#define ABSL_STATUS_STATUS_MACROS_H_
++
++#include <type_traits>
++#include <utility>
++
++#include "absl/base/optimization.h"
++#include "absl/status/status.h"
++#include "absl/status/statusor.h"
++
++namespace absl {
++namespace status_macros_backport_internal {
++
++class StatusBuilder {
++ public:
++  explicit StatusBuilder(absl::Status status) : status_(std::move(status)) {}
++
++  operator absl::Status() const { return status_; }
++
++  template <typename T, typename = std::enable_if_t<
++                            !std::is_same_v<std::decay_t<T>, absl::Status> &&
++                            std::is_constructible_v<T, const absl::Status&>>>
++  operator T() const {
++    return T(status_);
++  }
++
+ private:
++  absl::Status status_;
++};
++
++}  // namespace status_macros_backport_internal
++}  // namespace absl
++
++#define ABSL_STATUS_MACROS_CONCAT_INNER_(x, y) x##y
++#define ABSL_STATUS_MACROS_CONCAT_(x, y) ABSL_STATUS_MACROS_CONCAT_INNER_(x, y)
++
++#define ABSL_RETURN_IF_ERROR(expr)                                          \
++  ABSL_RETURN_IF_ERROR_IMPL_(ABSL_STATUS_MACROS_CONCAT_(_status, __COUNTER__), \
++                             expr)
++
++#define ABSL_RETURN_IF_ERROR_IMPL_(status, expr)  \
++  auto status = (expr);                           \
++  if (ABSL_PREDICT_FALSE(!status.ok())) {         \
++    return status;                                \
++  }
++
++#define ABSL_ASSIGN_OR_RETURN(...)                                     \
++  ABSL_STATUS_MACROS_VARIADIC_(__VA_ARGS__, ABSL_ASSIGN_OR_RETURN_3_,  \
++                               ABSL_ASSIGN_OR_RETURN_2_)(__VA_ARGS__)
++
++#define ABSL_STATUS_MACROS_VARIADIC_(_1, _2, _3, NAME, ...) NAME
++
++#define ABSL_ASSIGN_OR_RETURN_2_(lhs, rexpr) \
++  ABSL_ASSIGN_OR_RETURN_3_(lhs, rexpr, _)
++
++#define ABSL_ASSIGN_OR_RETURN_3_(lhs, rexpr, error_expr)                     \
++  ABSL_ASSIGN_OR_RETURN_IMPL_(                                               \
++      ABSL_STATUS_MACROS_CONCAT_(_status_or, __COUNTER__), lhs, rexpr,          \
++      error_expr)
++
++#define ABSL_ASSIGN_OR_RETURN_IMPL_(statusor, lhs, rexpr, error_expr)         \
++  auto statusor = (rexpr);                                                    \
++  if (ABSL_PREDICT_FALSE(!statusor.ok())) {                                   \
++    [[maybe_unused]] ::absl::status_macros_backport_internal::StatusBuilder _( \
++        statusor.status());                                                   \
++    return (error_expr);                                                      \
++  }                                                                           \
++  lhs = std::move(statusor).value()
++
++#ifdef ABSL_DEFINE_UNQUALIFIED_STATUS_MACROS
++#define ASSIGN_OR_RETURN(...) ABSL_ASSIGN_OR_RETURN(__VA_ARGS__)
++#define RETURN_IF_ERROR(...) ABSL_RETURN_IF_ERROR(__VA_ARGS__)
++#endif  // ABSL_DEFINE_UNQUALIFIED_STATUS_MACROS
++
++#endif  // ABSL_STATUS_STATUS_MACROS_H_
++

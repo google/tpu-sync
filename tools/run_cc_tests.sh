@@ -53,15 +53,18 @@ fi
 # for the reason build.sh states: a --define renames the exec configuration's
 # output directory and costs a full host-tool rebuild, and the select's default
 # arm already produces the default entry's macro.
-# shellcheck source=tools/jax/jax_deps.sh
-source "${SCRIPT_DIR}/jax/jax_deps.sh"
+# shellcheck source=tools/jax/module_overrides.sh
+source "${SCRIPT_DIR}/jax/module_overrides.sh"
 DEFAULT_JAX_VERSION="$(raiden_jax_default_version "${WORKSPACE_DIR}")"
 JAX_VERSION="${RAIDEN_JAX_VERSION:-${DEFAULT_JAX_VERSION}}"
 raiden_jax_validate_version "${WORKSPACE_DIR}" "${JAX_VERSION}"
 eval "$(raiden_jax_read_deps "${WORKSPACE_DIR}" "${JAX_VERSION}")"
-VERSION_DEFINE=()
+VERSION_FLAGS=()
 if [[ "${JAX_VERSION}" != "${DEFAULT_JAX_VERSION}" ]]; then
-  VERSION_DEFINE=(--define "raiden_jax=${RAIDEN_JAX_DEP_RAIDEN_JAX}")
+  VERSION_FLAGS=(--define "raiden_jax=${RAIDEN_JAX_DEP_RAIDEN_JAX}")
+  mapfile -t VERSION_MODULE_FLAGS < <(
+    raiden_jax_module_overrides "${WORKSPACE_DIR}" "${JAX_VERSION}" "${BAZEL_CACHE_BASE}")
+  VERSION_FLAGS+=("${VERSION_MODULE_FLAGS[@]}")
 fi
 
 # --config=oss compiles with the host clang, which finds libstdc++ by guessing
@@ -130,7 +133,7 @@ exec "${BAZEL_BIN}" \
   --host_jvm_args="-Xmx32g" --host_jvm_args="-Xms2g" \
   test -c opt --config=oss \
   --define with_torch=false \
-  "${VERSION_DEFINE[@]+"${VERSION_DEFINE[@]}"}" \
+  "${VERSION_FLAGS[@]+"${VERSION_FLAGS[@]}"}" \
   --repo_env=HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION:-3.12}" \
   --disk_cache="${BAZEL_CACHE_BASE}/disk_cache" \
   --repository_cache="${BAZEL_CACHE_BASE}/repo_cache" \

@@ -36,7 +36,14 @@ namespace {
 #if RAIDEN_JAX >= 1002 && RAIDEN_JAX < 1100
 template <typename T>
 RawBuffer* ToRawBuffer(T* buffer) {
-  return reinterpret_cast<RawBuffer*>(buffer);
+  // jax 0.10.2 only: PjRtRawBufferInterface and PjRtRawBuffer are siblings
+  // deriving from PJRT_RawBuffer. Cast through the shared base with
+  // static_assert.
+  static_assert(sizeof(RawBuffer) == sizeof(PJRT_RawBuffer),
+                "PjRtRawBufferInterface adds state to PJRT_RawBuffer at this "
+                "revision, so it can no longer be reached by reinterpreting "
+                "the shared base.");
+  return reinterpret_cast<RawBuffer*>(static_cast<PJRT_RawBuffer*>(buffer));
 }
 #else
 template <typename T>

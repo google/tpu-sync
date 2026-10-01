@@ -14,9 +14,19 @@
 
 """JAX stack requirements for TPU Raiden wheels based on selected JAX version."""
 
+load(":0.10.0/deps.bzl", _deps_0_10_0 = "DEPS")
+load(":0.10.1/deps.bzl", _deps_0_10_1 = "DEPS")
+load(":0.10.2/deps.bzl", _deps_0_10_2 = "DEPS")
+load(":0.11.0/deps.bzl", _deps_0_11_0 = "DEPS")
+load(":0.11.1/deps.bzl", _deps_0_11_1 = "DEPS")
 load(":0.11.2/deps.bzl", _deps_0_11_2 = "DEPS")
 
 _DEPS_BY_SETTING = {
+    "//third_party/jax:jax_1000": _deps_0_10_0,
+    "//third_party/jax:jax_1001": _deps_0_10_1,
+    "//third_party/jax:jax_1002": _deps_0_10_2,
+    "//third_party/jax:jax_1100": _deps_0_11_0,
+    "//third_party/jax:jax_1101": _deps_0_11_1,
     "//third_party/jax:jax_1102": _deps_0_11_2,
 }
 
@@ -31,7 +41,12 @@ def _specs(deps):
     ]
 
 def jax_stack_requires():
-    """Returns select() branches for JAX requirements based on --define raiden_jax."""
+    """Selects the JAX wheel requirements for the configured `--define raiden_jax`.
+
+    Returns:
+      A select() mapping each JAX version setting to its jax, jaxlib, and
+      libtpu requirement specs, defaulting to the default version's specs.
+    """
     branches = {}
     for setting, deps in _DEPS_BY_SETTING.items():
         branches[setting] = _specs(deps)

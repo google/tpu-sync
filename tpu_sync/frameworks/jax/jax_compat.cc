@@ -89,7 +89,11 @@ struct PyArrayStorage_0_11_0 {
   xla::ifrt::ArrayRef ifrt_array;
 };
 static_assert(offsetof(PyArrayStorage_0_11_0, ifrt_array) == 80);
+#if RAIDEN_JAX >= 1102
 static_assert(offsetof(jax::PyArray::Storage, ifrt_array) == 88);
+#else
+static_assert(offsetof(jax::PyArray::Storage, ifrt_array) == 80);
+#endif
 
 // Vtable layout of xla::ifrt::PjRtCompatibleArray in JAX 0.11.0, where
 // xla::ifrt::Value inherited from llvm::RTTIRoot (+3 virtual slots:

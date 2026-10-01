@@ -1,0 +1,29 @@
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -145,19 +145,7 @@
+ python.toolchain(python_version = "3.15")
+ 
+ ### Pypi
+-pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip", dev_dependency = True)
++pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+ 
+ [pip.parse(
+     download_only = True,
+     experimental_index_url = "https://us-python.pkg.dev/ml-oss-artifacts-published/pypi-mirror/simple",
+     extra_hub_aliases = {
+         "numpy": ["numpy_headers"],
+     },
+     hub_name = "jax_pypi",
+-    local_wheels = {
+-        "jax": "dist/jax-*.whl",
+-        "jaxlib": "dist/jaxlib-*.whl",
+-        "jax-cuda12-pjrt": "dist/jax_cuda12_pjrt-*.whl",
+-        "jax-cuda12-plugin": "dist/jax_cuda12_plugin-*.whl",
+-        "jax-cuda13-pjrt": "dist/jax_cuda13_pjrt-*.whl",
+-        "jax-cuda13-plugin": "dist/jax_cuda13_plugin-*.whl",
+-        "libtpu": "dist/libtpu-*.whl",  # On CI, we use the downloaded nightly version of libtpu.
+-        "ml_dtypes": "dist/ml_dtypes-*.whl",
+-        "numpy": "dist/numpy-*.whl",  # On TSAN CI, we use a custom TSAN-instrumented NumPy wheel.
+-        "scipy": "dist/scipy-*.whl",
+-    },
+     python_version = python_version,

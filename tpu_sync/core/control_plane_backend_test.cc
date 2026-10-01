@@ -40,6 +40,7 @@
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/core/grpc_control_plane_backend.h"
 #include "tpu_sync/core/tcp_control_plane_backend.h"
+#include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
 namespace {
@@ -164,6 +165,57 @@ TEST_P(ControlPlaneBackendTest, SendPullRequestWithExplicitConsumerIps) {
   EXPECT_THAT(received_req.consumer_ips, ElementsAre("10.0.0.1", "10.0.0.2"));
   EXPECT_THAT(received_req.src_block_ids, ElementsAre(10, 20, 30));
   EXPECT_THAT(received_req.dst_block_ids, ElementsAre(100, 200, 300));
+  server->StopServer();
+}
+
+TEST_P(ControlPlaneBackendTest, SendPullRequestCarriesConsumerHostLayout) {
+  MockControlPlaneHandler handler;
+  PullStreamRequestSpec received_req;
+  handler.SetPullStreamCallback(
+      [&](const PullStreamRequestSpec& req, absl::string_view fallback_ip) {
+        received_req = req;
+        return PullStreamResponseSpec{.status = 0};
+      });
+
+  auto server = CreateControlPlaneBackend(GetParam(), AsyncTestExecutor());
+  absl::StatusOr<int> bound_port = server->StartServer(0, &handler);
+  ASSERT_TRUE(bound_port.ok()) << bound_port.status();
+
+  auto client = CreateControlPlaneBackend(GetParam());
+  PullStreamRequestSpec req;
+  req.uuid = 7;
+  req.consumer_ips = {"10.0.0.1"};
+  req.src_block_ids = {1};
+  req.dst_block_ids = {2};
+  req.layer_host_addrs.resize(2);
+  req.layer_host_addrs[0].add_host_base_addrs(0x1000);
+  req.layer_host_addrs[0].add_host_base_addrs(0x2000);
+  req.layer_host_addrs[0].set_block_stride_bytes(128);
+  req.layer_host_addrs[0].set_num_blocks(4);
+  req.layer_host_addrs[1].add_host_base_addrs(0x3000);
+  req.layer_host_addrs[1].set_block_stride_bytes(256);
+  (*req.layer_host_addrs[1].mutable_host_slot_by_block())[5] = 1;
+
+  absl::StatusOr<PullStreamResponseSpec> response =
+      client
+          ->SendPullRequest(absl::StrCat("127.0.0.1:", *bound_port), req,
+                            absl::Seconds(5))
+          .Await();
+  ASSERT_TRUE(response.ok()) << response.status();
+  if (GetParam() == ControlPlaneBackendType::kTcp) {
+    EXPECT_TRUE(received_req.layer_host_addrs.empty());
+    server->StopServer();
+    return;
+  }
+  ASSERT_EQ(received_req.layer_host_addrs.size(), 2u);
+  EXPECT_THAT(received_req.layer_host_addrs[0].host_base_addrs(),
+              ElementsAre(0x1000, 0x2000));
+  EXPECT_EQ(received_req.layer_host_addrs[0].block_stride_bytes(), 128);
+  EXPECT_EQ(received_req.layer_host_addrs[0].num_blocks(), 4);
+  EXPECT_THAT(received_req.layer_host_addrs[1].host_base_addrs(),
+              ElementsAre(0x3000));
+  EXPECT_EQ(received_req.layer_host_addrs[1].block_stride_bytes(), 256);
+  EXPECT_EQ(received_req.layer_host_addrs[1].host_slot_by_block().at(5), 1);
   server->StopServer();
 }
 

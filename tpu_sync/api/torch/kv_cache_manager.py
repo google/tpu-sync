@@ -265,6 +265,17 @@ class KVCacheManager:
     """
     return [int(b) for b in self._impl.plan_host_blocks(uuid, list(block_ids))]
 
+  def receiver_addrs(self, uuid: int) -> bytes:
+    """Host addresses a sender uses to address this receiver's blocks.
+
+    Args:
+      uuid: The plan's identifier, as passed to ``register_active_plan``.
+
+    Returns:
+      A serialized ``ReceiverAddrsProto``;
+    """
+    return bytes(self._impl.receiver_addrs(uuid))
+
   def push_registered_plan(
       self,
       uuid: int,

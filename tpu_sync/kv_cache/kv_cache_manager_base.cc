@@ -111,49 +111,61 @@ absl::Status ValidateOffsetsAndSizes(const std::vector<int64_t>& src_offsets,
   return absl::OkStatus();
 }
 
-// Returns the receiver's host addresses for the sender's local pool
-// `pool_idx`, or nullptr if the sender cannot compute remote addresses.
-const ::tpu_sync::rpc::PoolHostAddrsProto* GetReceiverPoolAddrs(
+const ::tpu_sync::rpc::PoolHostAddrsProto* FindReceiverAddrs(
     const ::tpu_sync::rpc::StartTransferRequest& request,
-    absl::string_view peer, size_t pool_idx) {
-  if (request.pool_groups_size() == 0 || peer.empty()) return nullptr;
+    absl::string_view peer, int32_t idx) {
+  if (peer.empty()) return nullptr;
   auto receiver_it = request.receiver_addrs().find(std::string(peer));
   if (receiver_it == request.receiver_addrs().end()) return nullptr;
-  // Receivers report addresses under their own (wire) pool index; a sender
-  // rewritten into its own index space maps local -> wire.
-  int32_t wire_pool_idx = static_cast<int32_t>(pool_idx);
-  if (auto wire_it = request.wire_pool_indices().find(wire_pool_idx);
-      wire_it != request.wire_pool_indices().end()) {
-    wire_pool_idx = wire_it->second;
-  }
   const auto& pools = receiver_it->second.pools();
-  auto pool_it = pools.find(wire_pool_idx);
+  auto pool_it = pools.find(idx);
   if (pool_it == pools.end() || pool_it->second.host_base_addrs().empty()) {
     return nullptr;
   }
   return &pool_it->second;
 }
 
+// Returns the receiver's host addresses for the sender's local pool
+// `pool_idx`, or nullptr if the sender cannot compute remote addresses.
+const ::tpu_sync::rpc::PoolHostAddrsProto* GetReceiverPoolAddrs(
+    const ::tpu_sync::rpc::StartTransferRequest& request,
+    absl::string_view peer, size_t pool_idx) {
+  if (request.pool_groups_size() == 0) return nullptr;
+  int32_t wire_pool_idx = static_cast<int32_t>(pool_idx);
+  if (auto wire_it = request.wire_pool_indices().find(wire_pool_idx);
+      wire_it != request.wire_pool_indices().end()) {
+    wire_pool_idx = wire_it->second;
+  }
+  return FindReceiverAddrs(request, peer, wire_pool_idx);
+}
+
+// Returns the receiver's host addresses for layer `layer_idx` of a block plan.
+const ::tpu_sync::rpc::PoolHostAddrsProto* GetReceiverLayerAddrs(
+    const ::tpu_sync::rpc::StartTransferRequest& request,
+    absl::string_view peer, size_t layer_idx) {
+  if (request.pool_groups_size() > 0) return nullptr;
+  return FindReceiverAddrs(request, peer, static_cast<int32_t>(layer_idx));
+}
+
 // Returns the chunk's address in the receiver's host memory, or nullptr if
 // unknown or out of bounds.
 uint8_t* RemoteAddress(const ::tpu_sync::rpc::PoolHostAddrsProto* pool,
-                       const ::tpu_sync::rpc::ShardPushEntryProto& entry,
+                       int64_t dst_shard_idx, int64_t dst_block_id,
                        int64_t dst_offset, int64_t size) {
   if (pool == nullptr) return nullptr;
-  int64_t host_block = entry.dst_block_id();
+  int64_t host_block = dst_block_id;
   if (!pool->host_slot_by_block().empty()) {
     auto it = pool->host_slot_by_block().find(host_block);
     if (it == pool->host_slot_by_block().end()) return nullptr;
     host_block = it->second;
   }
-  if (entry.dst_shard_idx() < 0 ||
-      entry.dst_shard_idx() >= pool->host_base_addrs_size() || host_block < 0 ||
-      host_block >= pool->num_blocks() || pool->block_stride_bytes() <= 0 ||
-      dst_offset < 0 || size < 0 ||
+  if (dst_shard_idx < 0 || dst_shard_idx >= pool->host_base_addrs_size() ||
+      host_block < 0 || host_block >= pool->num_blocks() ||
+      pool->block_stride_bytes() <= 0 || dst_offset < 0 || size < 0 ||
       dst_offset > pool->block_stride_bytes() - size) {
     return nullptr;
   }
-  const uint64_t addr = pool->host_base_addrs(entry.dst_shard_idx()) +
+  const uint64_t addr = pool->host_base_addrs(dst_shard_idx) +
                         static_cast<uint64_t>(host_block) *
                             static_cast<uint64_t>(pool->block_stride_bytes()) +
                         static_cast<uint64_t>(dst_offset);
@@ -2389,6 +2401,31 @@ KVCacheManagerBase::PoolHostBaseAddrs(uint64_t uuid, size_t pool_idx) const {
   return proto;
 }
 
+std::vector<::tpu_sync::rpc::PoolHostAddrsProto>
+KVCacheManagerBase::LayerHostAddrs(uint64_t uuid) const {
+  if (explicit_pools_) return {};
+  {
+    absl::MutexLock l(plans_mu_);
+    auto it = active_plans_.find(uuid);
+    if (it != active_plans_.end() && !it->second->host_block_of.empty()) {
+      return {};
+    }
+  }
+  std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs;
+  layer_host_addrs.reserve(num_layers_);
+  for (size_t l = 0; l < num_layers_; ++l) {
+    // Only when every layer has its own pool.
+    const PoolSpec* layer_pool = pool(l);
+    absl::StatusOr<::tpu_sync::rpc::PoolHostAddrsProto> addrs =
+        layer_pool != nullptr && layer_pool->storage_index == l
+            ? PoolHostBaseAddrs(uuid, l)
+            : absl::NotFoundError("layer has no pool");
+    if (!addrs.ok()) return {};
+    layer_host_addrs.push_back(*std::move(addrs));
+  }
+  return layer_host_addrs;
+}
+
 const PoolSpec* KVCacheManagerBase::pool(size_t pool_idx) const {
   EnsureImplicitPools();
   if (pool_idx >= pools_.size()) {
@@ -3143,6 +3180,26 @@ absl::Status KVCacheManagerBase::UnregisterActivePlanDirect(uint64_t uuid) {
   return absl::OkStatus();
 }
 
+void KVCacheManagerBase::SetRemoteLayerAddrs(
+    uint64_t uuid,
+    std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs) {
+  if (layer_host_addrs.empty()) {
+    absl::MutexLock l(plans_mu_);
+    remote_layer_addrs_.erase(uuid);
+    return;
+  }
+  auto addrs =
+      std::make_shared<const std::vector<::tpu_sync::rpc::PoolHostAddrsProto>>(
+          std::move(layer_host_addrs));
+  absl::MutexLock l(plans_mu_);
+  remote_layer_addrs_[uuid] = std::move(addrs);
+}
+
+void KVCacheManagerBase::ClearRemoteLayerAddrs(uint64_t uuid) {
+  absl::MutexLock l(plans_mu_);
+  remote_layer_addrs_.erase(uuid);
+}
+
 std::vector<tpu_raiden::transport::BlockChunk>
 KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
                                    absl::Span<const int64_t> block_ids,
@@ -3151,11 +3208,17 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
                                    absl::string_view peer, int64_t src_block_id,
                                    int64_t dst_block_id) {
   std::shared_ptr<const RegisteredPlan> plan_snapshot;
+  std::shared_ptr<const std::vector<::tpu_sync::rpc::PoolHostAddrsProto>>
+      remote;
   {
     absl::MutexLock l(plans_mu_);
     auto it = active_plans_.find(uuid);
     if (it != active_plans_.end()) {
       plan_snapshot = it->second;
+    }
+    auto remote_it = remote_layer_addrs_.find(uuid);
+    if (remote_it != remote_layer_addrs_.end()) {
+      remote = remote_it->second;
     }
   }
   const bool has_plan = plan_snapshot != nullptr;
@@ -3241,11 +3304,21 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
       }
       return chunks;
     }
+
+    // Address chunks with the peer's reported layer addresses.
+    const ::tpu_sync::rpc::PoolHostAddrsProto* dst_addrs = nullptr;
+    if (remote != nullptr && block_ids.size() == 1 &&
+        layer_idx < remote->size()) {
+      dst_addrs = &remote->at(layer_idx);
+    }
     for (int64_t block_id : block_ids) {
       if (accumulated_bytes >= total_bytes) break;
       size_t size = std::min(block_size_bytes, total_bytes - accumulated_bytes);
       chunks.push_back(
-          {GetBlockHostPointer(layer_idx, shard_idx, block_id), size});
+          {GetBlockHostPointer(layer_idx, shard_idx, block_id), size,
+           RemoteAddress(dst_addrs, static_cast<int64_t>(shard_idx),
+                         dst_block_id, /*dst_offset=*/0,
+                         static_cast<int64_t>(size))});
       accumulated_bytes += size;
     }
     return chunks;
@@ -3273,10 +3346,13 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
     return std::find(indices.begin(), indices.end(),
                      static_cast<int32_t>(layer_idx)) != indices.end();
   };
-  const ::tpu_sync::rpc::PoolHostAddrsProto* dst_pool =
-      is_sender && explicit_pools_
-          ? GetReceiverPoolAddrs(request, peer, layer_idx)
-          : nullptr;
+
+  const ::tpu_sync::rpc::PoolHostAddrsProto* dst_addrs = nullptr;
+  if (is_sender) {
+    dst_addrs = explicit_pools_
+                    ? GetReceiverPoolAddrs(request, peer, layer_idx)
+                    : GetReceiverLayerAddrs(request, peer, layer_idx);
+  }
 
   std::vector<tpu_raiden::transport::BlockChunk> chunks;
   size_t accumulated_bytes = 0;
@@ -3329,7 +3405,8 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
               block_resolved_chunks.push_back(
                   {.ptr = block_base + src_offset,
                    .size = size,
-                   .raddr = RemoteAddress(dst_pool, entry, dst_offset,
+                   .raddr = RemoteAddress(dst_addrs, entry.dst_shard_idx(),
+                                          entry.dst_block_id(), dst_offset,
                                           entry.size_bytes())});
             }
           }

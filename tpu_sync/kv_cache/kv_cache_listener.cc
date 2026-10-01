@@ -193,6 +193,15 @@ void KVCacheListener::HandleControlRequest(const ControlRequest& req,
           resp->set_message(std::string(status.message()));
           LOG(ERROR) << "RegisterActivePlan native execution failed: "
                      << status;
+        } else {
+          // Report this receiver's layer addresses so the sender can compute
+          // raddr.
+          std::vector<tpu_sync::rpc::PoolHostAddrsProto> addrs =
+              callbacks_.layer_host_addrs(start_req.uuid());
+          for (size_t l = 0; l < addrs.size(); ++l) {
+            (*resp->mutable_receiver_pool_addrs())[static_cast<int32_t>(l)] =
+                std::move(addrs[l]);
+          }
         }
       }
     } else {

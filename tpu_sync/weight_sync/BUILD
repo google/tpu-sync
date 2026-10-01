@@ -55,7 +55,6 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":tiling_utils",
-        "//tpu_sync/common:detached_thread_group",
         "//tpu_sync/common:trace",
         "//tpu_sync/common/control_pipe",
         "//tpu_sync/core:host_memory_allocator",

@@ -25,6 +25,8 @@ namespace hooks {
 // channel is the path it runs on (e.g. recv, send, pull, api, h2d, d2h).
 
 // Block transport, receive path.
+inline constexpr std::string_view kBlockTransportRecvBeginPush =
+    "block_transport.recv.begin_push";
 inline constexpr std::string_view kBlockTransportRecvBlockIds =
     "block_transport.recv.block_ids";
 inline constexpr std::string_view kBlockTransportRecvSendHandshakeAck =
@@ -90,6 +92,8 @@ inline constexpr std::string_view kRaidenManagerBaseH2hWrite =
 // Connection pool, borrow path.
 inline constexpr std::string_view kConnPoolBorrowConnect =
     "conn_pool.borrow.connect";
+inline constexpr std::string_view kConnPoolBorrowConnectBlackhole =
+    "conn_pool.borrow.connect_blackhole";
 inline constexpr std::string_view kConnPoolBorrowReuse =
     "conn_pool.borrow.reuse";
 
@@ -100,6 +104,8 @@ inline constexpr std::string_view kSocketTransportPushRecvHandshakeAck =
     "socket_transport.push.recv_handshake_ack";
 inline constexpr std::string_view kSocketTransportPushSendPayload =
     "socket_transport.push.send_payload";
+inline constexpr std::string_view kSocketTransportPushWriteChunk =
+    "socket_transport.push.write_chunk";
 inline constexpr std::string_view kSocketTransportPushRecvAck =
     "socket_transport.push.recv_ack";
 
@@ -138,6 +144,7 @@ inline constexpr std::string_view kFailHooks[] = {
     kTransferSendSessionD2hComplete,
     kRaidenManagerBaseH2hWrite,
     kConnPoolBorrowConnect,
+    kConnPoolBorrowConnectBlackhole,
     kConnPoolBorrowReuse,
     kSocketTransportPushSendHeader,
     kSocketTransportPushRecvHandshakeAck,
@@ -149,6 +156,7 @@ inline constexpr std::string_view kFailHooks[] = {
 
 // Hooks that support `action = "delay"`.
 inline constexpr std::string_view kDelayHooks[] = {
+    kBlockTransportRecvBeginPush,
     kBlockTransportRecvBlockIds,
     kBlockTransportRecvSendHandshakeAck,
     kBlockTransportRecvPayload,
@@ -164,6 +172,7 @@ inline constexpr std::string_view kDelayHooks[] = {
     kSocketTransportPushSendHeader,
     kSocketTransportPushRecvHandshakeAck,
     kSocketTransportPushSendPayload,
+    kSocketTransportPushWriteChunk,
     kSocketTransportPushRecvAck,
     kRawBufferTransportRecvHeader,
     kRawBufferTransportSendJitter,

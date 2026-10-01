@@ -206,6 +206,7 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
             absl::StrCat("No active receive session for uuid=", uuid));
       }
     }
+    FaultInjectDelay(hooks::kBlockTransportRecvBeginPush);
     const bool started = recv_session != nullptr
                              ? recv_session->TryBeginRecvOp()
                              : reshard_session->TryBeginRecvOp();

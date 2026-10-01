@@ -98,6 +98,14 @@ absl::StatusOr<int> ConnPool::Borrow(
   }
   ABSL_RETURN_IF_ERROR(FaultInjectStatus(hooks::kConnPoolBorrowConnect,
                                          absl::StatusCode::kUnavailable));
+  std::string blackhole_peer;
+  if (!FaultInjectStatus(hooks::kConnPoolBorrowConnectBlackhole).ok()) {
+    const size_t colon = peer.rfind(':');
+    blackhole_peer = absl::StrCat("192.0.2.1", colon == absl::string_view::npos
+                                                   ? ":80"
+                                                   : peer.substr(colon));
+    peer = blackhole_peer;
+  }
   ConnectTiming timing;
   ABSL_ASSIGN_OR_RETURN(int sock_fd,
                         ConnectToPeer(peer, local_ip, require_psp, channel,

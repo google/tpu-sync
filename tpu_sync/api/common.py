@@ -18,7 +18,10 @@ import dataclasses
 import enum
 from typing import Callable, Mapping, NamedTuple, Optional
 
-from tpu_sync.telemetry.python import _telemetry_binding_test_ext as _default_telemetry_ext
+try:
+  from tpu_sync.telemetry.python import _telemetry_binding_test_ext as _default_telemetry_ext  # pylint: disable=g-import-not-at-top
+except ImportError:
+  _default_telemetry_ext = None
 
 
 @dataclasses.dataclass(unsafe_hash=True, slots=True)
@@ -66,12 +69,15 @@ class TelemetryCallbacks(NamedTuple):
   flush_cloud_logging: Optional[Callable[..., str]] = None
 
 
-_telemetry_callbacks: Optional[TelemetryCallbacks] = TelemetryCallbacks(
-    increment_counter=_default_telemetry_ext.increment_counter,
-    set_gauge=_default_telemetry_ext.set_gauge,
-    observe_histogram=_default_telemetry_ext.observe_histogram,
-    flush_cloud_logging=_default_telemetry_ext.flush_cloud_logging,
-)
+if _default_telemetry_ext is not None:
+  _telemetry_callbacks: Optional[TelemetryCallbacks] = TelemetryCallbacks(
+      increment_counter=_default_telemetry_ext.increment_counter,
+      set_gauge=_default_telemetry_ext.set_gauge,
+      observe_histogram=_default_telemetry_ext.observe_histogram,
+      flush_cloud_logging=_default_telemetry_ext.flush_cloud_logging,
+  )
+else:
+  _telemetry_callbacks = None
 
 
 def register_telemetry_callbacks(

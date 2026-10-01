@@ -15,22 +15,6 @@
 # limitations under the License.
 set -e
 
-download_file() {
-  local url="$1"
-  local dest="$2"
-  if command -v curl > /dev/null; then
-    curl -Lo "$dest" "$url"
-  elif command -v wget > /dev/null; then
-    wget -O "$dest" "$url"
-  elif command -v python3 > /dev/null; then
-    python3 -c "import urllib.request; urllib.request.urlretrieve('$url', '$dest')"
-  elif command -v python > /dev/null; then
-    python -c "import urllib; urllib.urlretrieve('$url', '$dest')"
-  else
-    echo "Error: No download tool found (curl, wget, python3, python)." >&2
-    return 1
-  fi
-}
 
 check_disk_space() {
   local dir="$1"
@@ -73,43 +57,10 @@ check_disk_space "${BAZEL_CACHE_BASE}" "Bazel Cache Base"
 check_disk_space "${BAZEL_OUTPUT_BASE}" "Bazel Output Base"
 check_disk_space "/tmp" "Temporary Directory (/tmp)"
 
-# Downloads <repo>/archive/<ref>.tar.gz into the bazel cache and applies every
-# patch it is given; a path override bypasses bzlmod's own patching, so a tree
-# reached through --override_module has to be patched here. The cache key
-# carries the patches' contents as well as the ref, so editing a patch
-# re-materializes rather than silently reusing the old tree. Sets
-# MATERIALIZED_DIR to the result.
-#
-#   materialize_module <repo_url> <ref> [patch_file...]
-materialize_module() {
-  local repo="$1" ref="$2"
-  shift 2
-  local name; name="$(basename "${repo}")"
-  local patch_key="nopatch"
-  if [[ "$#" -gt 0 ]]; then
-    patch_key="$(cat "$@" | sha256sum | cut -c1-16)"
-  fi
-  MATERIALIZED_DIR="${BAZEL_CACHE_BASE}/pinned_modules/${name}/${ref}-${patch_key}"
-  if [[ ! -f "${MATERIALIZED_DIR}/MODULE.bazel" ]]; then
-    echo "Materializing ${name} @ ${ref} ($# patch(es))..."
-    mkdir -p "${BAZEL_CACHE_BASE}"
-    local stage; stage="$(mktemp -d "${BAZEL_CACHE_BASE}/${name}_stage.XXXXXX")"
-    download_file "${repo}/archive/${ref}.tar.gz" "${stage}/src.tar.gz"
-    tar -xzf "${stage}/src.tar.gz" -C "${stage}"
-    local p
-    for p in "$@"; do
-      if [[ ! -f "$p" ]]; then
-        echo "Error: materialize_module: patch file not found: '${p}'" >&2
-        exit 1
-      fi
-      patch -p1 -s -d "${stage}/${name}-${ref}" < "$p"
-    done
-    mkdir -p "$(dirname "${MATERIALIZED_DIR}")"
-    rm -rf "${MATERIALIZED_DIR}"
-    mv "${stage}/${name}-${ref}" "${MATERIALIZED_DIR}"
-    rm -rf "${stage}"
-  fi
-}
+# Turns the selected JAX version into materialized, patched module trees and
+# the --override_module flags that name them.
+# shellcheck source=tools/jax/module_overrides.sh
+source "${WORKSPACE_DIR}/tools/jax/module_overrides.sh"
 
 echo "=== Navigating to workspace directory ==="
 cd "${WORKSPACE_DIR}"
@@ -252,33 +203,17 @@ if [ "$BUILD_JAX" = true ]; then
        "rules_ml_toolchain ${RAIDEN_JAX_DEP_RULES_ML_TOOLCHAIN_COMMIT:0:12}," \
        "abseil ${RAIDEN_JAX_DEP_ABSL_VERSION}, libtpu ${RAIDEN_JAX_DEP_LIBTPU_VERSION} ==="
 
-  # --override_module takes a local directory, never a revision, so each pinned
-  # module is materialized into the cache first. A path override also bypasses
-  # bzlmod's own patching, which is why the patches travel with the pins.
-  workspace_paths() {
-    local p
-    for p in $1; do echo "${WORKSPACE_DIR}/${p}"; done
+  # Not `mapfile < <(...)`: process substitution hides a failure from set -e,
+  # which would silently build against the default modules.
+  VERSION_MODULE_OVERRIDES="$(raiden_jax_module_overrides "${WORKSPACE_DIR}" \
+    "${RAIDEN_JAX_VERSION}" "${BAZEL_CACHE_BASE}")" || {
+    echo "Error: failed to compute module overrides for JAX ${RAIDEN_JAX_VERSION}." >&2
+    exit 1
   }
-  # shellcheck disable=SC2046  # word splitting is how the patch list is passed
-  materialize_module "${RAIDEN_JAX_DEP_JAX_REPO}" "${RAIDEN_JAX_DEP_JAX_COMMIT}" \
-    $(workspace_paths "${RAIDEN_JAX_DEP_JAX_PATCHES}")
-  BAZEL_MODULE_FLAGS+=("--override_module=jax=${MATERIALIZED_DIR}")
-
-  # shellcheck disable=SC2046
-  materialize_module "${RAIDEN_JAX_DEP_XLA_REPO}" "${RAIDEN_JAX_DEP_XLA_COMMIT}" \
-    $(workspace_paths "${RAIDEN_JAX_DEP_XLA_PATCHES}")
-  BAZEL_MODULE_FLAGS+=("--override_module=xla=${MATERIALIZED_DIR}")
-
-  # shellcheck disable=SC2046
-  materialize_module "${RAIDEN_JAX_DEP_RULES_ML_TOOLCHAIN_REPO}" \
-    "${RAIDEN_JAX_DEP_RULES_ML_TOOLCHAIN_COMMIT}" \
-    $(workspace_paths "${RAIDEN_JAX_DEP_RULES_ML_TOOLCHAIN_PATCHES}")
-  BAZEL_MODULE_FLAGS+=("--override_module=rules_ml_toolchain=${MATERIALIZED_DIR}")
-
-  # shellcheck disable=SC2046
-  materialize_module "${RAIDEN_JAX_DEP_ABSL_REPO}" "${RAIDEN_JAX_DEP_ABSL_VERSION}" \
-    $(workspace_paths "${RAIDEN_JAX_DEP_ABSL_PATCHES}")
-  BAZEL_MODULE_FLAGS+=("--override_module=abseil-cpp=${MATERIALIZED_DIR}")
+  if [[ -n "${VERSION_MODULE_OVERRIDES}" ]]; then
+    mapfile -t VERSION_MODULE_FLAGS <<< "${VERSION_MODULE_OVERRIDES}"
+    BAZEL_MODULE_FLAGS+=("${VERSION_MODULE_FLAGS[@]}")
+  fi
 
   # A version directory that disagrees with the files repeating its values does
   # not fail the build. It compiles against one jax and then installs another,
@@ -358,8 +293,9 @@ PY2
         echo "Error: could not read a 40-hex XLA commit from ${XLA_REVISION_FILE}." >&2
         exit 1
       fi
-      materialize_module "https://github.com/openxla/xla" \
-        "${XLA_COMMIT}" "${WORKSPACE_DIR}"/third_party/xla/*.patch
+      materialize_module "${BAZEL_CACHE_BASE}" \
+        "https://github.com/openxla/xla" "${XLA_COMMIT}" \
+        "${WORKSPACE_DIR}"/third_party/xla/*.patch
       TORCH_XLA_DIR="${MATERIALIZED_DIR}"
     fi
     echo "torch leg xla override: ${TORCH_XLA_DIR}"
@@ -377,8 +313,8 @@ PY2
       echo "Error: could not read the rules_ml_toolchain pin from ${TORCH_XLA_DIR}/MODULE.bazel." >&2
       exit 1
     fi
-    materialize_module "https://github.com/google-ml-infra/rules_ml_toolchain" \
-      "${RMT_COMMIT}"
+    materialize_module "${BAZEL_CACHE_BASE}" \
+      "https://github.com/google-ml-infra/rules_ml_toolchain" "${RMT_COMMIT}"
     echo "torch leg rules_ml_toolchain override: ${MATERIALIZED_DIR}"
     BAZEL_MODULE_FLAGS+=("--override_module=rules_ml_toolchain=${MATERIALIZED_DIR}")
   fi

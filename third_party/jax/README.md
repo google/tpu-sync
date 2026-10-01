@@ -15,7 +15,7 @@ Each subdirectory corresponds to a supported version containing its dependency p
 | `patches/` | Version-specific patches (optional). |
 
 Root directory files:
-- `versions.bzl`: Defines `DEFAULT_VERSION` and `SUPPORTED_VERSIONS`.
+- `versions.bzl`: Defines `DEFAULT_VERSION` (0.11.2) and `SUPPORTED_VERSIONS`.
 - `BUILD`: Defines `:raiden_jax_version` setting the C++ `-DRAIDEN_JAX` flag.
 - `requires.bzl`: Defines `jax_stack_requires()` for wheel dependencies.
 
@@ -28,6 +28,14 @@ Root directory files:
 
 `tools/jax/jax_deps.sh` renders these substitutions into a temporary file for `pip install -r`. The root `requirements.txt` remains unchanged.
 
+`pip` installs into whatever `python3` resolves to when `build.sh` runs, so
+build and test have to happen in one environment. Activate the environment you
+intend to test in *before* you build. Build in one and test in another and the
+extension is loaded against a jaxlib it was not compiled against, which is the
+failure the whole mechanism exists to prevent. `run_tests.sh` takes no version
+argument for this reason: the build already decided, and a second opinion could
+only disagree with it.
+
 ## Dependency Co-evolution
 
 Pinned revisions must match upstream JAX's `MODULE.bazel` exactly:
@@ -36,6 +44,17 @@ Pinned revisions must match upstream JAX's `MODULE.bazel` exactly:
 - **rules_ml_toolchain**: C++ toolchain for XLA rules.
 - **abseil**: Must match `jaxlib`'s Abseil version to prevent runtime ABI mismatches.
 - **libtpu**: Runtime PJRT plugin wheel.
+
+## When a revision is older than raiden's code
+
+When raiden code requires functionality not present in an older pinned revision,
+the revision is patched rather than bumped to preserve ABI lockstep with `jaxlib`.
+
+For example, all three 0.10.x versions pin Abseil `20260107.1`, which predates
+`absl/status/status_macros.h`. Bumping Abseil would break binary compatibility with
+`jaxlib` loaded in the same process. Instead, `third_party/abseil/status_macros.patch`
+backports `ABSL_RETURN_IF_ERROR`, `ABSL_ASSIGN_OR_RETURN`, and unqualified variants.
+The default version (0.11.2, defined in `versions.bzl`) includes these macros upstream and requires no patch.
 
 ## Adding a Version
 

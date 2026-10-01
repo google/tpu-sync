@@ -89,41 +89,11 @@ struct PyArrayStorage_0_11_0 {
   xla::ifrt::ArrayRef ifrt_array;
 };
 static_assert(offsetof(PyArrayStorage_0_11_0, ifrt_array) == 80);
+#if RAIDEN_JAX >= 1102
 static_assert(offsetof(jax::PyArray::Storage, ifrt_array) == 88);
-
-// Vtable layout of xla::ifrt::PjRtCompatibleArray in JAX 0.11.0, where
-// xla::ifrt::Value inherited from llvm::RTTIRoot (+3 virtual slots:
-// dynamicClassID, isA, anchor) and xla::ifrt::Array did not yet declare
-// array_spec() (-1 virtual slot), placing pjrt_buffers() at vtable slot 21
-// instead of slot 19 (JAX 0.11.1+).
-class PjRtCompatibleArray_0_11_0 {
- public:
-  virtual ~PjRtCompatibleArray_0_11_0() = default;
-  // llvm::RTTIRoot (3 slots)
-  virtual void vslot_02() = 0;
-  virtual void vslot_03() = 0;
-  virtual void vslot_04() = 0;
-  // xla::ifrt::Value (6 slots)
-  virtual void vslot_05() = 0;
-  virtual void vslot_06() = 0;
-  virtual void vslot_07() = 0;
-  virtual void vslot_08() = 0;
-  virtual void vslot_09() = 0;
-  virtual void vslot_10() = 0;
-  // xla::ifrt::Array (10 slots in 0.11.0)
-  virtual void vslot_11() = 0;
-  virtual void vslot_12() = 0;
-  virtual void vslot_13() = 0;
-  virtual void vslot_14() = 0;
-  virtual void vslot_15() = 0;
-  virtual void vslot_16() = 0;
-  virtual void vslot_17() = 0;
-  virtual void vslot_18() = 0;
-  virtual void vslot_19() = 0;
-  virtual void vslot_20() = 0;
-  // xla::ifrt::PjRtCompatibleArray::pjrt_buffers() (slot 21)
-  virtual absl::Span<const std::shared_ptr<xla::PjRtBuffer>> pjrt_buffers() = 0;
-};
+#else
+static_assert(offsetof(jax::PyArray::Storage, ifrt_array) == 80);
+#endif
 
 xla::ifrt::Array* GetIfrtArray(PyObject* obj) ABSL_NO_THREAD_SAFETY_ANALYSIS {
   auto* py_array_object = reinterpret_cast<PyArrayObject*>(obj);
@@ -162,12 +132,8 @@ xla::PjRtBuffer* PjRtBufferFromPyArray(PyObject* obj)
   if (arr == nullptr) {
     throw std::runtime_error("Not a PjRt compatible array");
   }
-  if (GetRuntimeJaxVersion() < 1101) {
-    return reinterpret_cast<PjRtCompatibleArray_0_11_0*>(arr)
-        ->pjrt_buffers()
-        .front()
-        .get();
-  }
+  // The extension is built against the selected JAX's own headers, so the
+  // direct virtual call uses the correct vtable slot.
   return arr->pjrt_buffers().front().get();
 }
 

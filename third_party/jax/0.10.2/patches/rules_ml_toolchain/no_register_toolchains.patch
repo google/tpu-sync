@@ -1,0 +1,7 @@
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -178,4 +178,3 @@
+ local_sysroot = use_extension("//extensions:local_sysroot_configure.bzl", "local_sysroot_ext")
+ use_repo(local_sysroot, "local_sysroot_config")
+ 
+-register_toolchains("//cc/...")

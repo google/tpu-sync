@@ -872,16 +872,9 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
     return absl::InvalidArgumentError(
         "Source transfer_rank values must be unique");
   }
-  {
-    int64_t expected_rank = 0;
-    for (const auto& [rank, unit] : ranks) {
-      if (rank != expected_rank) {
-        return absl::InvalidArgumentError(
-            "Source transfer_rank values must be contiguous from zero");
-      }
-      ++expected_rank;
-    }
-  }
+  // A transfer may name any subset of a pipeline's source ranks: one stage can
+  // move the layers it owns by itself. Schedules are keyed by each source's
+  // own transfer_rank, so the ranks need not start at zero or be contiguous.
   const int64_t requested_parallelism =
       request.parallelism.has_value()
           ? static_cast<int64_t>(*request.parallelism)

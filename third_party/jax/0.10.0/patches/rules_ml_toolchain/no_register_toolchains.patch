@@ -1,0 +1,7 @@
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -103,4 +103,3 @@
+     "xz",
+ )
+ 
+-register_toolchains("//cc/...")

@@ -67,14 +67,13 @@ int GetRuntimeJaxVersion() {
   return version;
 }
 
-// Mirrors jaxlib's private PyArrayObject layout. Fields must match jaxlib
-// exactly across Python versions: Python < 3.12 includes weakrefs and dict.
+// Mirrors jaxlib's private PyArrayObject from py_array.cc.
 struct PyArrayObject {
   PyObject_HEAD;
-#if PY_VERSION_HEX < 0x030C0000
+#if RAIDEN_JAX < 1100 && PY_VERSION_HEX < 0x030C0000
   PyObject* weakrefs;
   PyObject* dict;
-#endif  // PY_VERSION_HEX < 0x030C0000
+#endif
   bool initialized;
   alignas(
       jax::PyArray::Storage) char array_storage[sizeof(jax::PyArray::Storage)];
@@ -90,7 +89,11 @@ struct PyArrayStorage_0_11_0 {
   xla::ifrt::ArrayRef ifrt_array;
 };
 static_assert(offsetof(PyArrayStorage_0_11_0, ifrt_array) == 80);
+#if RAIDEN_JAX >= 1102
 static_assert(offsetof(jax::PyArray::Storage, ifrt_array) == 88);
+#else
+static_assert(offsetof(jax::PyArray::Storage, ifrt_array) == 80);
+#endif
 
 // Vtable layout of xla::ifrt::PjRtCompatibleArray in JAX 0.11.0, where
 // xla::ifrt::Value inherited from llvm::RTTIRoot (+3 virtual slots:

@@ -1,0 +1,21 @@
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -140,7 +140,7 @@
+ python.toolchain(python_version = "3.14")
+ 
+ ### Pypi
+-pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip", dev_dependency = True)
++pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+ 
+ [pip.parse(
+     download_only = True,
+@@ -149,9 +149,6 @@
+         "numpy": ["numpy_headers"],
+     },
+     hub_name = "jax_pypi",
+-    local_wheels = {
+-        "libtpu": "dist/libtpu-*.whl",  # On CI, we use the downloaded nightly version of libtpu.
+-    },
+     python_version = python_version,
+     requirements_by_platform = {} if python_version in [
+         "3.11",

@@ -80,6 +80,7 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//third_party/jax:raiden_jax_version",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/types:span",
         "@jax//jaxlib:py_client",
@@ -107,6 +108,7 @@ cc_library(
         ":jax_compat",
         ":mock_nanobind",
         "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:xla_compat",
         "@jax//jaxlib:py_client",
         "@nanobind",
         "@rules_python//python/cc:current_py_cc_headers",
@@ -588,6 +590,7 @@ cc_library(
     deps = [
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:raw_transfer_impl",
+        "//tpu_sync/core:xla_compat",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",

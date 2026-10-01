@@ -12,17 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Encapsulates version-fragile XLA PJRT types for TPU Raiden.
-//
-// XLA's raw-buffer hierarchy, tracked-device-buffer holds, and C-API client
-// classes evolve across JAX/XLA releases. To prevent leaking these fragile
-// headers across the codebase, all access is confined to this compatibility
-// layer.
-//
-// Only xla_compat.{h,cc} may include:
-//   - xla/pjrt/raw_buffer.h
-//   - xla/pjrt/abstract_tracked_device_buffer.h
-//   - xla/pjrt/c_api_client/pjrt_c_api_client.h
+// Isolates version-fragile XLA PJRT types (raw buffers, holds, and C-API
+// client) to this compatibility layer to prevent header leakage across callers.
 
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_CORE_XLA_COMPAT_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_CORE_XLA_COMPAT_H_
@@ -36,30 +27,29 @@
 #include "xla/pjrt/raw_buffer.h"
 #include "xla/tsl/concurrency/ref_count.h"
 
+// Which JAX this is being built against, as major*10000 + minor*100 + patch.
+#ifndef RAIDEN_JAX
+#define RAIDEN_JAX 1102
+#endif
+
 namespace xla {
 class PjRtBuffer;
 }  // namespace xla
 
 namespace raiden {
 
-// The stable raw-buffer type for Raiden transfers.
-//
-// XLA's internal PjRtRawBufferRef alias varies across revisions (resolving to
-// RCReference<CommonPjRtRawBuffer> vs. RCReference<PjRtRawBufferInterface>).
-// Raiden uses RawBuffer to provide a uniform alias across supported versions.
-// The transfer methods (memory_space, GetHostPointer, GetOnDeviceSizeInBytes,
-// CopyRawHostToDevice, CopyRawDeviceToHost) share identical names and
-// signatures.
+// Uniform RawBuffer alias across supported JAX versions.
+#if RAIDEN_JAX < 1002
+// jax 0.10.0 and 0.10.1: PjRtRawBuffer is the root.
+using RawBuffer = xla::PjRtRawBuffer;
+#else
+// jax 0.10.2 introduced PjRtRawBufferInterface; 0.11.0 reparented PjRtRawBuffer
+// under it.
 using RawBuffer = xla::PjRtRawBufferInterface;
+#endif
 using RawBufferRef = tsl::RCReference<RawBuffer>;
 
-// Type-erased wrapper for CommonPjRtBuffer::ScopedHold.
-//
-// CommonPjRtBuffer::ScopedHold is a nested class and cannot be forward-declared
-// in C++. Holding it directly would force abstract_tracked_device_buffer.h into
-// all headers including raw_transfer_core.h. Because callers only need to
-// manage the hold's lifetime during transfer execution, ScopedHold wraps an
-// opaque shared pointer to preserve RAII semantics without header leakage.
+// Type-erased wrapper for CommonPjRtBuffer::ScopedHold to avoid header leakage.
 class ScopedHold {
  public:
   ScopedHold() = default;

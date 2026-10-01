@@ -1,0 +1,12 @@
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -149,9 +149,6 @@
+         "numpy": ["numpy_headers"],
+     },
+     hub_name = "jax_pypi",
+-    local_wheels = {
+-        "libtpu": "dist/libtpu-*.whl",  # On CI, we use the downloaded nightly version of libtpu.
+-    },
+     python_version = python_version,
+     requirements_by_platform = {} if python_version in [
+         "3.11",

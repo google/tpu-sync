@@ -460,6 +460,7 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
           fault_injection_payload_index < j) {
         FaultInjectSocket(hooks::kSocketTransportPushSendPayload, fd);
       }
+      FaultInjectSocket(hooks::kSocketTransportPushWriteChunk, fd);
       const std::array<uint8_t, kChunkSizeFieldSize> s_size =
           SerializeChunkSize(total_size);
       ABSL_RETURN_IF_ERROR(WriteExact(fd, s_size.data(), s_size.size()));

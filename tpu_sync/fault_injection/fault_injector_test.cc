@@ -194,9 +194,18 @@ TEST_F(FaultInjectorTest, WildcardFallsThroughToCapableRule) {
   EXPECT_EQ(
       GetFaultInjector().Evaluate(hooks::kKvCacheManagerPullRegisterWait).type,
       FaultInjectionType::kDelay);
+  EXPECT_EQ(
+      GetFaultInjector().Evaluate(hooks::kBlockTransportRecvBeginPush).type,
+      FaultInjectionType::kDelay);
+  EXPECT_EQ(
+      GetFaultInjector().Evaluate(hooks::kSocketTransportPushWriteChunk).type,
+      FaultInjectionType::kDelay);
   EXPECT_EQ(GetFaultInjector().Evaluate(hooks::kConnPoolBorrowReuse).type,
             FaultInjectionType::kFail);
-  EXPECT_EQ(GetFaultInjector().GetHitCount(), 2);
+  EXPECT_EQ(
+      GetFaultInjector().Evaluate(hooks::kConnPoolBorrowConnectBlackhole).type,
+      FaultInjectionType::kFail);
+  EXPECT_EQ(GetFaultInjector().GetHitCount(), 5);
 }
 
 TEST_F(FaultInjectorTest, DelayEligibilityRejectsFailOnlyHooks) {

@@ -146,7 +146,7 @@ absl::Status ReshardReceiveSession::ValidatePlan(
 absl::Status ReshardReceiveSession::ValidateReceiverCoverage(
     const kv_cache::KVCacheManagerBase& base,
     const ::tpu_sync::rpc::StartTransferRequest& plan) {
-  constexpr int64_t kMaxExpandedRepeats = 1 << 20;
+  constexpr int64_t kMaxExpandedRepeats = 1 << 24;
 
   struct GroupView {
     std::vector<size_t> pool_indices;

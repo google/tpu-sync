@@ -12,21 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Nightly Benchmarks
+# Step 3 of analyze -> record -> gate: nightly integrity + throughput gate over the real
+# NIC, floors from tpu_sync/benchmarks/h2h_multihost_baselines.json (NO FLOOR until recorded).
+name: H2H Multi-Host Gate
 
 on:
   schedule:
-    - cron: "0 0 * * *"  # Runs at 00:00 UTC every day
+    - cron: "0 2 * * *"  # 02:00 UTC daily
+  workflow_dispatch:
 
 permissions:
   contents: read
   pull-requests: write
 
-jobs: 
-  run_benchmarks:
-    name: Run Single Host Benchmarks
+jobs:
+  gate:
+    name: Run H2H Multi-Host Gate
     uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@82682aceae058a272d67c5e8bb4e8eba2da7b7c2 # main
     with:
-      registry_file: "tpu_sync/benchmarks/benchmark_registry.pbtxt"
+      registry_file: "tpu_sync/benchmarks/benchmark_registry_h2h_multihost_gate.pbtxt"
       bap_ref: "82682aceae058a272d67c5e8bb4e8eba2da7b7c2"
       runner: "linux-x86-n2-8"

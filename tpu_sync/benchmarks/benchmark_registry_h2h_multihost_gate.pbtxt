@@ -1,0 +1,29 @@
+# runtime_flags: --mode=spmd (never fall back to loopback on BAP), --num_workers=4 (the
+# x4 label; the sender waits for the other hosts' done markers so BAP's primary cleanup
+# cannot delete the shared job dir under them), --data_interface=eth0 (pin the data
+# plane: runner auto-discovery includes eth0 and IPv6-only NICs, so record and gate
+# could otherwise measure different NIC sets). bazel_run_flags: no MODULE.bazel.lock /
+# bazel-* symlink writes into the shared user_repo that all four hosts build in.
+benchmarks {
+  name: "h2h_multihost_gate"
+  description: "Cross-host H2H gate over the real NIC. Fails on DATA CORRUPTION (receiver byte check), NO MEASUREMENT, or median GB/s below the floor recorded in h2h_multihost_baselines.json; a label with no floor prints NO FLOOR and does not fail. Starts on the correctness suite; once the analyze stage has picked the stable configs, narrow the set here with --configs=bs:nb:p,... (that flag overrides --suite) and trim the metrics list to match."
+  owner: "raiden-dev"
+
+  workload {
+    action: "./ml_actions/actions/workload_executors/bazel"
+    action_inputs { key: "target" value: "//tpu_sync/benchmarks:h2h_multihost_bench" }
+    action_inputs { key: "runtime_flags" value: "--mode=spmd --num_workers=4 --data_interface=eth0 --stage=gate --suite=correctness --iters=50" }
+  }
+
+  environment_configs {
+    id: "tpu-v5e-multi-node"
+    runner_label: "linux-x86-ct5lp-4tpu-x4"
+    container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers"
+    workload_action_inputs { key: "bazel_run_flags" value: "-c opt --config=oss --config=ci --lockfile_mode=off --experimental_convenience_symlinks=ignore" }
+  }
+
+  # In gate stage the driver emits one scalar per label (the median), so MEAN == MEDIAN == that value.
+  metrics { name: "1048576B_x64_P1/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "1048576B_x64_P8/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "1048573B_x64_P4/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+}

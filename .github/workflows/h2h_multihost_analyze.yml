@@ -1,0 +1,52 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Step 1 of analyze -> record -> gate: survey the cross-host throughput distribution.
+# iters/runs_per_config live in the registry pbtxt (BAP has no per-run runtime_flags override).
+name: H2H Multi-Host Analyze
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_branch:
+        description: "Branch that receives the bundled artifacts (CSV/SVG/report/baselines) under h2h_multihost/."
+        required: false
+        type: string
+        default: "benchmark-data"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  analyze:
+    name: Run H2H Multi-Host Analyze
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@82682aceae058a272d67c5e8bb4e8eba2da7b7c2 # main
+    with:
+      registry_file: "tpu_sync/benchmarks/benchmark_registry_h2h_multihost_analyze.pbtxt"
+      bap_ref: "82682aceae058a272d67c5e8bb4e8eba2da7b7c2"
+      runner: "linux-x86-n2-8"
+
+  # Optional: cache the bundle on a branch. Delete this job if you only want the
+  # downloadable Actions artifact.
+  publish:
+    needs: analyze
+    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && needs.analyze.outputs.job_id != '' }}
+    uses: ./.github/workflows/h2h_publish_results.yml
+    permissions:
+      contents: write
+    with:
+      job_id: ${{ needs.analyze.outputs.job_id }}
+      stage: analyze
+      publish_branch: ${{ inputs.publish_branch }}

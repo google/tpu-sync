@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "Cross-host H2H gate floors. Regenerate on the multi-host runner with the",
+    "h2h_multihost_record workflow (bazel target //tpu_sync/benchmarks:h2h_multihost_bench",
+    "--stage=record --iters=<large> --runs_per_config=<several>), download",
+    "h2h_multihost_baselines.json from the run's artifacts and commit it here.",
+    "",
+    "  sigma_k / max_margin : floor = max(median - sigma_k * MAD_sigma, median * (1 - max_margin))",
+    "  configs[label]       : baseline_gbs (median when recorded, reference only),",
+    "                         floor_gbs (THE GATE THRESHOLD), integrity, n_samples",
+    "",
+    "Empty configs => the gate checks byte-integrity only and prints NO FLOOR."
+  ],
+  "sigma_k": 3.5,
+  "max_margin": 0.05,
+  "iters": 0,
+  "runs_per_config": 0,
+  "configs": {}
+}

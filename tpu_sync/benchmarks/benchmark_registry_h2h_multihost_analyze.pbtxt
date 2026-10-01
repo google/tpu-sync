@@ -1,0 +1,35 @@
+# runtime_flags: --mode=spmd (never fall back to loopback on BAP), --num_workers=4 (the
+# x4 label; the sender waits for the other hosts' done markers so BAP's primary cleanup
+# cannot delete the shared job dir under them), --data_interface=eth0 (pin the data
+# plane: runner auto-discovery includes eth0 and IPv6-only NICs, so record and gate
+# could otherwise measure different NIC sets). bazel_run_flags: no MODULE.bazel.lock /
+# bazel-* symlink writes into the shared user_repo that all four hosts build in.
+benchmarks {
+  name: "h2h_multihost_analyze"
+  description: "Cross-host H2H distribution survey, no gate and no baseline (exits 0 unless zero samples). On the BAP multi-host runner worker 0 (sender, BAP primary) pushes KV blocks over the real NIC to worker 1 (receiver) via the C++ h2h_benchmark_runner; workers 2-3 idle. Every timed iteration is dumped to WORKLOAD_ARTIFACTS_DIR (samples CSV, summary JSON with cv_robust/low_tail_frac/floor candidates/suitable, markdown report, histogram SVG) so gate configs and sigma_k are chosen from data, not guessed. iters/runs_per_config are fixed here: BAP has no per-run runtime_flags override."
+  owner: "raiden-dev"
+
+  workload {
+    action: "./ml_actions/actions/workload_executors/bazel"
+    action_inputs { key: "target" value: "//tpu_sync/benchmarks:h2h_multihost_bench" }
+    action_inputs { key: "runtime_flags" value: "--mode=spmd --num_workers=4 --data_interface=eth0 --stage=analyze --suite=both --iters=200 --runs_per_config=3 --gate_iters=50 --timeout_s=5400" }
+  }
+
+  environment_configs {
+    id: "tpu-v5e-multi-node"
+    runner_label: "linux-x86-ct5lp-4tpu-x4"
+    container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers"
+    workload_action_inputs { key: "bazel_run_flags" value: "-c opt --config=oss --config=ci --lockfile_mode=off --experimental_convenience_symlinks=ignore" }
+  }
+
+  # correctness suite
+  metrics { name: "1048576B_x64_P1/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "1048576B_x64_P8/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "1048573B_x64_P4/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  # perf suite (2 MiB blocks, parallelism sweep)
+  metrics { name: "2097152B_x64_P1/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "2097152B_x64_P2/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "2097152B_x64_P4/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "2097152B_x64_P8/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "2097152B_x64_P16/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+}

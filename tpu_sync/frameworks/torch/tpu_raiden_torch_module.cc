@@ -324,6 +324,19 @@ NB_MODULE(_tpu_raiden_torch, m) {
           },
           nb::arg("uuid"), nb::arg("block_ids"))
       .def(
+          "receiver_addrs",
+          [](const KVCacheManager& self, uint64_t uuid) {
+            tpu_sync::rpc::ReceiverAddrsProto addrs;
+            std::vector<tpu_sync::rpc::PoolHostAddrsProto> layers =
+                self.LayerHostAddrs(uuid);
+            for (size_t l = 0; l < layers.size(); ++l) {
+              (*addrs.mutable_pools())[l] = std::move(layers[l]);
+            }
+            std::string bytes = addrs.SerializeAsString();
+            return nb::bytes(bytes.data(), bytes.size());
+          },
+          nb::arg("uuid"))
+      .def(
           "push_registered_plan",
           [](KVCacheManager& self, uint64_t uuid, const std::string& peer,
              const std::vector<int>& src_block_ids,

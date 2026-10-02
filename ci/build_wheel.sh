@@ -36,7 +36,9 @@
 # RAIDEN_TORCH_ABIS lists the torch releases the torch wheel ships an
 # extension variant for (see ci/build_wheel_impl.sh).
 # RAIDEN_JAX_VERSION selects the JAX version the jax wheel builds against
-# (see third_party/jax/versions.bzl); unset means the default version.
+# (see third_party/jax/versions.bzl); unset means the default version. The jax
+# wheel's build tag is that JAX version without dots, e.g.
+# tpu_sync_jax-0.0.1.dev<ts>-0112-cp312-...whl for 0.11.2.
 
 set -exu -o pipefail
 

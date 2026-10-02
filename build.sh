@@ -365,7 +365,7 @@ echo "=== Building targets with Bazel ==="
 # Which modules this build is actually reading, so a build that silently used
 # the wrong pins is visible in the log rather than only in a crash later.
 printf 'module override: %s\n' "${BAZEL_MODULE_FLAGS[@]#--override_module=}"
-"${BAZEL_BIN}" --install_base="${BAZEL_OUTPUT_BASE}/install_base" --output_base="${BAZEL_OUTPUT_BASE}" --host_jvm_args="-Xmx32g" --host_jvm_args="-Xms2g" build -c opt --check_visibility=false --verbose_failures --experimental_repo_remote_exec --incompatible_disallow_empty_glob=false \
+"${BAZEL_BIN}" --install_base="${BAZEL_OUTPUT_BASE}/install_base" --output_base="${BAZEL_OUTPUT_BASE}" --host_jvm_args="-Xmx32g" --host_jvm_args="-Xms2g" build -c opt --verbose_failures --experimental_repo_remote_exec --incompatible_disallow_empty_glob=false \
   --repo_env=HERMETIC_PYTHON_VERSION=${HERMETIC_PYTHON_VERSION:-3.12} \
   --repo_env=PIP_INDEX_URL="https://pypi.org/simple" \
   --repo_env=PIP_EXTRA_INDEX_URL="" \

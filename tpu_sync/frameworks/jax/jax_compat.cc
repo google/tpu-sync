@@ -22,9 +22,7 @@
 #include <new>
 #include <stdexcept>
 
-#include "absl/base/thread_annotations.h"
 #include "absl/types/span.h"
-#include "jaxlib/py_array.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/python/ifrt/array.h"
 #include "xla/python/ifrt/client.h"
@@ -69,7 +67,33 @@ int GetRuntimeJaxVersion() {
 }
 #endif  // RAIDEN_JAX >= 1100
 
-// Mirrors jaxlib's private PyArrayObject from py_array.cc.
+// Mirrors jaxlib's private PyArrayObject (py_array.cc) and PyArray::Storage
+// (py_array.h) without including them: jaxlib's py_client target is private.
+// Only the members read here are named; the rest is padding sized from the
+// real headers of every supported jaxlib. `aval` doubles as a runtime layout
+// check (see ReadIfrtArray).
+
+// PyArray::Storage in jaxlib 0.10.0 through 0.11.1.
+struct PyArrayStorage_0_10_0 {
+  PyObject* aval;
+  char skipped[72];  // weak_type, dtype, shape, sharding, npy_value, committed,
+                     // py_client
+  xla::ifrt::ArrayRef ifrt_array;
+};
+static_assert(offsetof(PyArrayStorage_0_10_0, ifrt_array) == 80);
+
+// PyArray::Storage in jaxlib 0.11.2 and later, which reordered the members and
+// added ft_mutex mu.
+struct PyArrayStorage_0_11_2 {
+  char skipped[32];  // py_client, next, prev, thread_id_bucket, committed,
+                     // weak_type, mu
+  PyObject* aval;
+  char skipped2[48];  // dtype, shape, sharding, npy_value
+  xla::ifrt::ArrayRef ifrt_array;
+};
+static_assert(offsetof(PyArrayStorage_0_11_2, ifrt_array) == 88);
+
+template <typename Storage>
 struct PyArrayObject {
   PyObject_HEAD;
 #if RAIDEN_JAX < 1100 && PY_VERSION_HEX < 0x030C0000
@@ -77,45 +101,36 @@ struct PyArrayObject {
   PyObject* dict;
 #endif
   bool initialized;
-  alignas(
-      jax::PyArray::Storage) char array_storage[sizeof(jax::PyArray::Storage)];
+  Storage storage;
 };
 
-// Runtime dispatch across 0.11.x jaxlibs. 0.10.x builds use their own headers'
-// layout directly.
-#if RAIDEN_JAX >= 1100
-// In JAX 0.11.0 and 0.11.1, PyArray_Storage placed ifrt_array at byte offset 80
-// (aval [8B], weak_type + pad [8B], dtype [8B], shape [24B], sharding [8B],
-// npy_value [8B], committed + pad [8B], py_client [8B]). In JAX 0.11.2+,
-// PyArray_Storage reordered fields and added ft_mutex mu, moving ifrt_array to
-// byte offset 88.
-struct PyArrayStorage_0_11_0 {
-  alignas(void*) char prefix[80];
-  xla::ifrt::ArrayRef ifrt_array;
-};
-static_assert(offsetof(PyArrayStorage_0_11_0, ifrt_array) == 80);
-#if RAIDEN_JAX >= 1102
-static_assert(offsetof(jax::PyArray::Storage, ifrt_array) == 88);
-#else
-static_assert(offsetof(jax::PyArray::Storage, ifrt_array) == 80);
-#endif
-#endif  // RAIDEN_JAX >= 1100
-
-xla::ifrt::Array* GetIfrtArray(PyObject* obj) ABSL_NO_THREAD_SAFETY_ANALYSIS {
-  auto* py_array_object = reinterpret_cast<PyArrayObject*>(obj);
-  if (!py_array_object->initialized) {
+template <typename Storage>
+xla::ifrt::Array* ReadIfrtArray(PyObject* obj) {
+  auto* py_array = std::launder(reinterpret_cast<PyArrayObject<Storage>*>(obj));
+  if (!py_array->initialized) {
     throw std::runtime_error("PyArrayObject not initialized");
   }
+  // Layout self-check: jaxlib serves the public `aval` attribute from this
+  // same Storage, so a different object means the mirror does not match the
+  // running jaxlib. Compares pointers only; nothing is dereferenced.
+  PyObject* aval = PyObject_GetAttrString(obj, "aval");
+  const bool layout_matches = aval != nullptr && aval == py_array->storage.aval;
+  Py_XDECREF(aval);  // Storage keeps its own reference.
+  if (!layout_matches) {
+    PyErr_Clear();
+    throw std::runtime_error("PyArray layout mismatch with the running jaxlib");
+  }
+  return py_array->storage.ifrt_array.get();
+}
+
+xla::ifrt::Array* GetIfrtArray(PyObject* obj) {
 #if RAIDEN_JAX >= 1100
-  if (GetRuntimeJaxVersion() < 1102) {
-    return std::launder(reinterpret_cast<PyArrayStorage_0_11_0*>(
-                            py_array_object->array_storage))
-        ->ifrt_array.get();
+  // Runtime dispatch across 0.11.x jaxlibs; 0.10.x builds run only on 0.10.x.
+  if (GetRuntimeJaxVersion() >= 1102) {
+    return ReadIfrtArray<PyArrayStorage_0_11_2>(obj);
   }
 #endif
-  return std::launder(reinterpret_cast<jax::PyArray::Storage*>(
-                          py_array_object->array_storage))
-      ->ifrt_array.get();
+  return ReadIfrtArray<PyArrayStorage_0_10_0>(obj);
 }
 
 xla::ifrt::PjRtCompatibleArray* CastToPjRtCompatibleArray(
@@ -138,8 +153,7 @@ xla::ifrt::PjRtCompatibleArray* CastToPjRtCompatibleArray(
 
 }  // namespace
 
-xla::PjRtBuffer* PjRtBufferFromPyArray(PyObject* obj)
-    ABSL_NO_THREAD_SAFETY_ANALYSIS {
+xla::PjRtBuffer* PjRtBufferFromPyArray(PyObject* obj) {
   auto* arr = CastToPjRtCompatibleArray(GetIfrtArray(obj));
   if (arr == nullptr) {
     throw std::runtime_error("Not a PjRt compatible array");
@@ -149,8 +163,7 @@ xla::PjRtBuffer* PjRtBufferFromPyArray(PyObject* obj)
   return arr->pjrt_buffers().front().get();
 }
 
-xla::ifrt::Array* IfrtArrayFromPyArray(PyObject* obj)
-    ABSL_NO_THREAD_SAFETY_ANALYSIS {
+xla::ifrt::Array* IfrtArrayFromPyArray(PyObject* obj) {
   return GetIfrtArray(obj);
 }
 

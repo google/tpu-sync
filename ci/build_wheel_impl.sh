@@ -44,7 +44,9 @@
 #                            builds a single-ABI wheel)
 #   RAIDEN_JAX_VERSION       JAX version the jax wheel builds against, read by
 #                            build.sh (default: DEFAULT_VERSION in
-#                            third_party/jax/versions.bzl)
+#                            third_party/jax/versions.bzl); the jax wheel's
+#                            build tag is that JAX version without dots
+#                            (e.g. 0112)
 #   TORCH_TPU_INDEX_URL      pip index the torch_tpu wheel named by
 #                            torch_tpu.version is installed from (default:
 #                            the torch_tpu virtual registry)
@@ -69,6 +71,16 @@ fi
 # wheel with the bare pyproject version.
 WHEEL_VERSION_EXTRAS="${WHEEL_VERSION_EXTRAS-.dev$(date -u +%Y%m%d%H%M%S)}"
 export WHEEL_VERSION_EXTRAS
+# The jax wheel carries the JAX version it was built against as its wheel build
+# tag, dots removed (0.11.2 -> tpu_sync_jax-<version>-0112-cp312-...whl). The
+# version itself is unchanged. Unset RAIDEN_JAX_VERSION means DEFAULT_VERSION in
+# third_party/jax/versions.bzl.
+if [[ "${BUILD_MODE}" == "jax" ]]; then
+  # shellcheck source=tools/jax/jax_deps.sh
+  source "${REPO_ROOT}/tools/jax/jax_deps.sh"
+  WHEEL_JAX_VERSION="${RAIDEN_JAX_VERSION:-$(raiden_jax_default_version "${REPO_ROOT}")}"
+  WHEEL_BUILD_TAG="${WHEEL_JAX_VERSION//./}"
+fi
 read -r -a TORCH_ABIS <<< "${RAIDEN_TORCH_ABIS:-2.11.0 2.12.0 2.13.0}"
 export BAZEL_CACHE_DIR="${BAZEL_CACHE_DIR:-/cache}"
 export BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE:-${BAZEL_CACHE_DIR}/output_base}"
@@ -201,6 +213,12 @@ mkdir -p "${REPO_ROOT}/dist"
 # bazel-bin is the convenience symlink build.sh leaves in the workspace; it
 # points at the output directory of whatever configuration the build used.
 cp "${REPO_ROOT}"/bazel-bin/ci/wheel/${WHEEL_GLOB} "${REPO_ROOT}/dist/"
+# py_wheel cannot set a build tag, so retag the jax wheel here. `wheel tags`
+# rewrites the file name and the WHEEL metadata's Build field together.
+if [[ "${BUILD_MODE}" == "jax" ]]; then
+  pip install -q wheel
+  wheel tags --remove --build "${WHEEL_BUILD_TAG}" "${REPO_ROOT}"/dist/${WHEEL_GLOB}
+fi
 
 # The bazel-built _tpu_raiden_torch.so does not link libpywrap; the torch
 # extension loader (tpu_sync/api/torch/torch_abi.py) requires a NEEDED on

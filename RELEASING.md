@@ -16,6 +16,10 @@ Two wheels are built per version, one per framework: `tpu_sync_jax` and
 `tpu_sync_torch`. On PyPI they are the projects `tpu-sync-jax` and
 `tpu-sync-torch`.
 
+The jax wheel's build tag is the JAX version it was built against, dots removed
+(`tpu_sync_jax-X.Y.Z-0112-cp312-...whl` for jax 0.11.2); see
+[ci/build_wheel_impl.sh](ci/build_wheel_impl.sh).
+
 ```bash
 # JAX: self-contained, pulls the pinned jax/jaxlib/libtpu stack.
 pip install tpu-sync-jax

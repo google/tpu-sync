@@ -92,6 +92,14 @@ class KVCacheListener final {
                     return engine->base()->PoolHostBaseAddrs(uuid, pool_idx);
                   }
                 },
+                .layer_host_addrs = [engine](uint64_t uuid)
+                    -> std::vector<tpu_sync::rpc::PoolHostAddrsProto> {
+                  if constexpr (requires { engine->LayerHostAddrs(uuid); }) {
+                    return engine->LayerHostAddrs(uuid);
+                  } else {
+                    return engine->base()->LayerHostAddrs(uuid);
+                  }
+                },
             },
             listener_port, backend_type) {}
   ~KVCacheListener();
@@ -123,6 +131,10 @@ class KVCacheListener final {
     std::function<absl::StatusOr<tpu_sync::rpc::PoolHostAddrsProto>(uint64_t,
                                                                     size_t)>
         pool_host_addrs;
+    // Host addresses of every layer (KVCacheManagerBase::LayerHostAddrs),
+    // reported in the planned-transfer receiver arm reply.
+    std::function<std::vector<tpu_sync::rpc::PoolHostAddrsProto>(uint64_t)>
+        layer_host_addrs;
   };
 
   KVCacheListener(EngineCallbacks callbacks, int listener_port,

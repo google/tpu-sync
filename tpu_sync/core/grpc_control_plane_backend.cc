@@ -68,6 +68,8 @@ control_plane::proto::PullStreamRequest ToProto(
   for (int64_t id : req.dst_block_ids) {
     proto_req.add_dst_block_ids(id);
   }
+  proto_req.mutable_layer_host_addrs()->Add(req.layer_host_addrs.begin(),
+                                            req.layer_host_addrs.end());
   return proto_req;
 }
 
@@ -144,6 +146,8 @@ grpc::Status KVCacheControlPlaneServiceImpl::PullStream(
                             request->src_block_ids().end());
   spec.dst_block_ids.assign(request->dst_block_ids().begin(),
                             request->dst_block_ids().end());
+  spec.layer_host_addrs.assign(request->layer_host_addrs().begin(),
+                               request->layer_host_addrs().end());
 
   std::string fallback_peer_ip;
   if (spec.consumer_ips.empty()) {

@@ -292,6 +292,33 @@ TEST(KVCacheListenerTest, PoollessReceiverPreservesRegisterActivePlan) {
   EXPECT_FALSE(manager.registered_is_sender());
 }
 
+TEST(KVCacheListenerTest, PlannedReceiverArmReplyCarriesLayerHostAddrs) {
+  RoutingKVCacheManager manager(/*host_blocks_to_allocate=*/1);
+  KVCacheListener listener(&manager, /*listener_port=*/0);
+  std::vector<tpu_sync::rpc::PoolHostAddrsProto> expected =
+      manager.LayerHostAddrs(/*uuid=*/5678);
+  ASSERT_EQ(expected.size(), 1u);
+
+  ControlRequest request;
+  request.set_command(ControlRequest::COMMAND_START_TRANSFER);
+  StartTransferRequest* plan = request.mutable_start_transfer_request();
+  plan->set_uuid(5678);
+  plan->set_is_sender(false);
+
+  ControlResponse response = SendRequest(listener.listener_port(), request);
+
+  EXPECT_TRUE(response.success()) << response.message();
+  EXPECT_EQ(manager.route(), Route::kRegisterActivePlan);
+  ASSERT_EQ(response.receiver_pool_addrs().size(), 1);
+  const auto& addrs = response.receiver_pool_addrs().at(0);
+  EXPECT_EQ(std::vector<uint64_t>(addrs.host_base_addrs().begin(),
+                                  addrs.host_base_addrs().end()),
+            std::vector<uint64_t>(expected[0].host_base_addrs().begin(),
+                                  expected[0].host_base_addrs().end()));
+  EXPECT_EQ(addrs.block_stride_bytes(), expected[0].block_stride_bytes());
+  EXPECT_EQ(addrs.num_blocks(), expected[0].num_blocks());
+}
+
 TEST(KVCacheListenerTest, GrpcBackendRoutesPoolSenderAndShutdown) {
   setenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "grpc", 1);
   auto env_cleanup =

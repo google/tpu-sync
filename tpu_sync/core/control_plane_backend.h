@@ -28,6 +28,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
 
@@ -43,6 +44,8 @@ struct PullStreamRequestSpec {
   std::vector<std::string> consumer_ips;
   std::vector<int64_t> src_block_ids;
   std::vector<int64_t> dst_block_ids;
+  // Consumer host addresses, one per layer. Empty if not reported.
+  std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs;
 };
 
 struct PullStreamResponseSpec {

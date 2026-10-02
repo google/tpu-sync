@@ -234,12 +234,11 @@ NB_MODULE(_tpu_raiden_host, m) {
                          "KVCacheManager map_shared_memory failed");
           },
           nb::arg("mapped_address"), nb::arg("pool_size_bytes"))
-      .def(
-          "unmap_shared_memory",
-          [](HostKVCacheManager& self) {
-            ThrowIfError(self.base()->UnmapSharedMemory(),
-                         "KVCacheManager unmap_shared_memory failed");
-          })
+      .def("unmap_shared_memory",
+           [](HostKVCacheManager& self) {
+             ThrowIfError(self.base()->UnmapSharedMemory(),
+                          "KVCacheManager unmap_shared_memory failed");
+           })
       .def_prop_ro("is_shared_memory_mapped",
                    [](const HostKVCacheManager& self) {
                      return self.base()->is_shared_memory_mapped();
@@ -271,6 +270,19 @@ NB_MODULE(_tpu_raiden_host, m) {
                          "KVCacheManager register_active_plan failed");
           },
           nb::arg("uuid"), nb::arg("request_bytes"), nb::arg("is_sender"))
+      .def(
+          "receiver_addrs",
+          [](const HostKVCacheManager& self, uint64_t uuid) {
+            tpu_sync::rpc::ReceiverAddrsProto addrs;
+            std::vector<tpu_sync::rpc::PoolHostAddrsProto> layers =
+                self.base()->LayerHostAddrs(uuid);
+            for (size_t l = 0; l < layers.size(); ++l) {
+              (*addrs.mutable_pools())[l] = std::move(layers[l]);
+            }
+            std::string bytes = addrs.SerializeAsString();
+            return nb::bytes(bytes.data(), bytes.size());
+          },
+          nb::arg("uuid"))
       .def(
           "unregister_active_plan",
           [](HostKVCacheManager& self, uint64_t uuid) {

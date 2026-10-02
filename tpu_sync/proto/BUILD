@@ -138,6 +138,7 @@ py_grpc_library(
 proto_library(
     name = "kv_cache_control_plane_service_proto",
     srcs = ["kv_cache_control_plane_service.proto"],
+    deps = ["//tpu_sync/rpc:raiden_service_proto"],
 )
 
 cc_proto_library(

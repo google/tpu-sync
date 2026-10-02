@@ -16,6 +16,8 @@ syntax = "proto3";
 
 package tpu_raiden.control_plane.proto;
 
+import "tpu_sync/rpc/raiden_service.proto";
+
 option java_multiple_files = true;
 
 // Request sent by a KV cache consumer to initiate a pull stream (hybrid push)
@@ -42,6 +44,9 @@ message PullStreamRequest {
 
   // Consumer-side destination host block IDs to write into.
   repeated int64 dst_block_ids = 6 [packed = true];
+
+  // Consumer host addresses, one per layer. Empty if not reported.
+  repeated tpu_sync.rpc.PoolHostAddrsProto layer_host_addrs = 7;
 }
 
 // Response returned by the producer acknowledging validation of the pull

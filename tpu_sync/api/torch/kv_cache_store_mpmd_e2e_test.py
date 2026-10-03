@@ -373,7 +373,7 @@ def _worker_save_load_main(argv):
 
     dist.barrier()
     try:
-      torch.tpu.synchronize()
+      torch.accelerator.synchronize()
     except (AttributeError, RuntimeError):
       pass
     print(
@@ -593,7 +593,7 @@ def _worker_read_remote_main(argv):
 
     dist.barrier()
     try:
-      torch.tpu.synchronize()
+      torch.accelerator.synchronize()
     except (AttributeError, RuntimeError):
       pass
     print(
@@ -795,7 +795,7 @@ def _worker_write_remote_main(argv):
 
     dist.barrier()
     try:
-      torch.tpu.synchronize()
+      torch.accelerator.synchronize()
     except (AttributeError, RuntimeError):
       pass
     print(
@@ -883,7 +883,7 @@ def _worker_secondary_storage_main(argv):
       )
       tpu_cache = torch.tensor(host_data, device=device)
       try:
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
       except (AttributeError, RuntimeError):
         pass
 
@@ -1070,7 +1070,7 @@ def _worker_secondary_storage_main(argv):
       )
       tpu_cache.zero_()
       try:
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
       except (AttributeError, RuntimeError):
         pass
       del manager, store
@@ -1091,7 +1091,7 @@ def _worker_secondary_storage_main(argv):
     if phase in ("read", "both"):
       tpu_cache = torch.zeros(shape, dtype=torch.float32, device=device)
       try:
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
       except (AttributeError, RuntimeError):
         pass
 
@@ -1203,7 +1203,7 @@ def _worker_secondary_storage_main(argv):
       dist.barrier()
 
       try:
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
       except (AttributeError, RuntimeError):
         pass
 
@@ -1282,7 +1282,7 @@ def _log(tag, phase, rank, msg):
 
 def _tpu_sync():
   try:
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
   except (AttributeError, RuntimeError):
     pass
 

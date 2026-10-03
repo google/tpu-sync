@@ -633,7 +633,7 @@ def _run_distributed_worker(
         device=device,
         dtype=torch_dtype,
     )
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
 
     # Wrap in PyTorch WeightSynchronizer (each rank manages 1 local shard)
     device_tensors = [[t] for t in local_tensors]
@@ -732,7 +732,7 @@ def _run_distributed_worker(
     if not is_source:
       ws.wait_for_transfer_completion(uuid_warmup)
       ws.h2d()
-      torch.tpu.synchronize()
+      torch.accelerator.synchronize()
 
     dist.barrier()
 
@@ -815,7 +815,7 @@ def _run_distributed_worker(
       t2 = time.perf_counter()
       if not is_source:
         ws.h2d()
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
       dist.barrier()
       h2d_ms = (time.perf_counter() - t2) * 1000.0
 

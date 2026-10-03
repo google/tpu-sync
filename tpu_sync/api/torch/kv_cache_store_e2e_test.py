@@ -423,7 +423,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
 
     # 6. Verify restored TPU device memory matches expected array [a, b, a, b]
     try:
-      torch.tpu.synchronize()
+      torch.accelerator.synchronize()
     except (AttributeError, RuntimeError):
       pass
 
@@ -549,7 +549,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
 
       # 9. Verify byte-exact match on Job B TPU device, sentinels stay as created.
       try:
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
       except (AttributeError, RuntimeError):
         pass
       actual_b = tpu_cache_b.cpu().numpy()
@@ -660,7 +660,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       self.assertEmpty(store_b.lookup(hashes))
 
       try:
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
       except (AttributeError, RuntimeError):
         pass
       actual_b = tpu_cache_b.cpu().numpy()
@@ -802,7 +802,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       self._wait_for_load(store_b)
 
       try:
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
       except (AttributeError, RuntimeError):
         pass
       actual_b = tpu_cache_b.cpu().numpy()
@@ -1099,7 +1099,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       self.assertNotEmpty(read_done, "read_remote never completed")
 
       try:
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
       except (AttributeError, RuntimeError):
         pass
       got = tpu_cache.cpu().numpy()[dst_device_block]

@@ -250,7 +250,7 @@ class SharedMemoryDmaTest(absltest.TestCase):
         torch.zeros(block_shape, dtype=torch.float32, device=self.device)
         for _ in range(num_layers)
     ]
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     manager = KVCacheManager(
         kv_caches=kv_caches,
         node_id=0,

@@ -109,7 +109,7 @@ def populate_deterministic_cache(
         shape
     ) + float(layer_idx * 1000.0)
     tensors.append(base.to(device))
-  torch.tpu.synchronize()
+  torch.accelerator.synchronize()
   return tensors
 
 
@@ -281,7 +281,7 @@ def main(_):
         torch.empty(cache_shape, dtype=torch.float32, device='tpu')
         for _ in range(_NUM_LAYERS.value)
     ]
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     print(
         f'Allocated {_NUM_LAYERS.value} destination layers on device in '
         f'{time.perf_counter() - t0:.2f}s'

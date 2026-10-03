@@ -185,7 +185,7 @@ def create_tpu_tensors(
   tensors = [
       torch.zeros(shape, dtype=dtype, device=device) for _ in range(num_layers)
   ]
-  torch.tpu.synchronize()
+  torch.accelerator.synchronize()
   return tensors
 
 
@@ -219,7 +219,7 @@ def _benchmark_raiden(
   for _ in range(benchmark_runs):
     for arr in src_tensors:
       mutate_tpu_tensor(arr)
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
     # D2H: Transfer TPU -> Host DMA pool
@@ -231,7 +231,7 @@ def _benchmark_raiden(
         copy_sizes=sizes,
     )
     future.Await()
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     local_time = time.perf_counter() - start
     gc.enable()
     gc.collect()
@@ -246,7 +246,7 @@ def _benchmark_raiden(
         copy_sizes=sizes,
     )
     future.Await()
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     local_time = time.perf_counter() - start
     gc.enable()
     gc.collect()
@@ -273,7 +273,7 @@ def _benchmark_torch_copy(
       torch.zeros(shard_shape, dtype=dtype, device=device)
       for _ in range(num_layers)
   ]
-  torch.tpu.synchronize()
+  torch.accelerator.synchronize()
 
   d2h_times = []
   h2d_times = []
@@ -281,7 +281,7 @@ def _benchmark_torch_copy(
   for _ in range(benchmark_runs):
     for arr in src_tensors:
       mutate_tpu_tensor(arr)
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
     # D2H: Copy TPU -> Host
@@ -289,7 +289,7 @@ def _benchmark_torch_copy(
     start = time.perf_counter()
     for j in range(num_layers):
       host_tensors[j].copy_(src_tensors[j], non_blocking=pinned)
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     local_time = time.perf_counter() - start
     gc.enable()
     gc.collect()
@@ -300,7 +300,7 @@ def _benchmark_torch_copy(
     start = time.perf_counter()
     for j in range(num_layers):
       tpu_dst_tensor[j].copy_(host_tensors[j], non_blocking=pinned)
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     local_time = time.perf_counter() - start
     gc.enable()
     gc.collect()

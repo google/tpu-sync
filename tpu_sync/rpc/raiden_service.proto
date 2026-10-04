@@ -226,6 +226,106 @@ message StartTransferRequest {
   // endpoint (ControlRequest.peers), used by the sender to compute
   // remote addresses (raddr).
   map<string, ReceiverAddrsProto> receiver_addrs = 25;
+  // Logical variable bundles of this transfer. Every receiver gets the full
+  // list; bundles are the unit of pull scheduling and source registration.
+  repeated VariableBundleSpecProto variable_bundles = 30;
+  // Bundle pull / registration settings for this receiver. Set only on V3
+  // dynamic pull receivers.
+  PullExecutionConfigProto pull_config = 31;
+  // All work units in this receiver's isolation group (the seed sampler and
+  // its pullers). When non-empty, the receiver initializes a local swarm
+  // session over these units; pullers reach the seed's session through
+  // `pull_config.controller_address`.
+  repeated RegisterWorkUnitRequest isolation_group_entities = 32;
+}
+
+// Metadata describing a logical bundle of variables grouped for dynamic pull
+// and source promotion.
+message VariableBundleSpecProto {
+  // 0-based, contiguous index of the bundle. Receivers pull bundles in
+  // ascending index order.
+  int32 bundle_index = 1;
+  // Optional human-readable name of the bundle (e.g. "bundle_0").
+  string bundle_name = 2;
+  // Bytes of one destination shard's slice of this bundle, i.e. the sum of the
+  // per-layer destination shard bytes over the bundle's layers.
+  int64 total_bytes = 3;
+  // Variables grouped within this bundle. Each entry's `layer_idx` identifies
+  // a layer that belongs to this bundle.
+  repeated VariableMetadataProto variables = 4;
+}
+
+// Configuration for V3 dynamic pull execution and bundle source promotion.
+message PullExecutionConfigProto {
+  // True for pullers, which fetch bundles from other samplers using pull
+  // tokens. False for seed samplers, which receive the trainer's push and only
+  // register the bundles they complete.
+  bool enable_bundle_pull = 1;
+  // "ip:port" of the bundle coordinator that serves RegisterBundleAvailability
+  // and AcquireBundlePullToken: the seed sampler of this receiver's isolation
+  // group when isolation groups are used, otherwise the V3 Raiden controller.
+  string controller_address = 2;
+  // Work unit of this receiver; sent as the requesting unit in bundle RPCs.
+  RaidenIdProto target_unit = 3;
+  // Host index [0, num_hosts) of this receiver within `target_unit`. Bundle
+  // availability and pull tokens are tracked per (unit, host_idx).
+  int32 host_idx = 4;
+}
+
+// Registers that a receiver host now holds a complete bundle and can serve it
+// to other pullers.
+message RegisterBundleAvailabilityRequest {
+  string req_id = 1;
+  int64 uuid = 2;
+  // Unit that now holds the bundle.
+  RaidenIdProto unit = 3;
+  int32 host_idx = 4;
+  // Bundle now held by `unit`. If this host pulled it, the pull token for this
+  // (unit, host_idx, bundle_index) is released.
+  int32 bundle_index = 5;
+  // When true (or when `needed_bundle_indices` is non-empty) and this host
+  // still lacks bundles, the coordinator also tries to grant the next pull
+  // token and returns it in
+  // `RegisterBundleAvailabilityResponse.next_pull_token`.
+  bool request_next_bundle = 6;
+  // Bundles this host still needs, in ascending index order, for the
+  // piggybacked token request. If empty, all bundles not yet held by this host
+  // are used.
+  repeated int32 needed_bundle_indices = 7;
+}
+
+message RegisterBundleAvailabilityResponse {
+  bool acknowledged = 1;
+  // Piggybacked pull token; set only when a next bundle was requested and this
+  // host still lacks bundles. `granted` is false if no source is free.
+  optional AcquireBundlePullTokenResponse next_pull_token = 2;
+}
+
+// Requests a pull token: an assignment of one bundle and a source replica to
+// pull it from. Can also report a source that failed the previous pull.
+message AcquireBundlePullTokenRequest {
+  string req_id = 1;
+  int64 uuid = 2;
+  // Requesting (destination) unit.
+  RaidenIdProto dst_unit = 3;
+  int32 host_idx = 4;
+  // Bundles this host still needs, in ascending index order. If empty, no
+  // token is granted.
+  repeated int32 needed_bundle_indices = 5;
+  // Source replica that failed to serve this host's previous pull. Its token is
+  // released and the source is marked unhealthy for this `host_idx`.
+  string failed_source_replica_id = 6;
+}
+
+message AcquireBundlePullTokenResponse {
+  // False if no source became free before the coordinator's queue timeout, or
+  // if there is nothing left to pull; the caller decides whether to retry.
+  bool granted = 1;
+  int32 assigned_bundle_index = 2;
+  // Replica to pull `assigned_bundle_index` from.
+  RaidenIdProto source_unit = 3;
+  // Data endpoint of `source_unit`'s host matching the requester's `host_idx`.
+  string source_data_endpoint = 4;
 }
 
 // Round-grouped destination targets for tree-based broadcast logging and audit.
@@ -267,12 +367,16 @@ message ControlRequest {
     COMMAND_REGISTER_WORK_UNIT = 3;
     COMMAND_GET_METADATA = 4;
     COMMAND_REGISTER_TRANSFER_SCHEDULE = 5;
+    COMMAND_REGISTER_BUNDLE_AVAILABILITY = 30;
+    COMMAND_ACQUIRE_BUNDLE_PULL_TOKEN = 31;
   }
   Command command = 1;
   repeated string peers = 2;
 
   StartTransferRequest start_transfer_request = 3;
   RegisterWorkUnitRequest register_work_unit_request = 4;
+  RegisterBundleAvailabilityRequest register_bundle_availability_request = 30;
+  AcquireBundlePullTokenRequest acquire_bundle_pull_token_request = 31;
 }
 
 // Pool base address per local shard of the receiving worker.
@@ -295,4 +399,6 @@ message ControlResponse {
   string response_data = 3;
   GetMetadataResponse get_metadata_response = 4;
   map<int32, PoolHostAddrsProto> receiver_pool_addrs = 5;
+  RegisterBundleAvailabilityResponse register_bundle_availability_response = 30;
+  AcquireBundlePullTokenResponse acquire_bundle_pull_token_response = 31;
 }

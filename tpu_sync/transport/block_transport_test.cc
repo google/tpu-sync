@@ -1685,6 +1685,70 @@ TEST_P(BlockTransportTest, PushBufferCorrectness) {
               Each(Eq(0)));
 }
 
+TEST_P(BlockTransportTest, PullBufferCorrectness) {
+  constexpr size_t size = 64 * 1024;
+  MockDelegate src(size);
+  MockDelegate dst(size);
+
+  constexpr size_t kLen = 62 * 1024;
+  constexpr size_t kSrcOffset = 256;
+  constexpr size_t kDstOffset = 512;
+  uint8_t* src_buf = src.GetHostPointer(0, 0);
+  for (size_t i = 0; i < size; ++i) {
+    src_buf[i] = static_cast<uint8_t>((i % 255) + 1);
+  }
+
+  BlockTransport src_transport(&src, 0);
+  BlockTransport dst_transport(&dst, 0);
+  BindControlChannels(&src_transport, &src, &dst_transport, &dst);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const std::string src_addr =
+      absl::StrCat("localhost:", src_transport.local_port());
+  const absl::Status pull_res = dst_transport.PullBuffer(
+      src_addr, /*buffer_id=*/0, /*src_shard_idx=*/0,
+      /*src_offset_bytes=*/kSrcOffset, /*dst_shard_idx=*/0,
+      /*dst_offset_bytes=*/kDstOffset, kLen);
+  ABSL_EXPECT_OK(pull_res) << pull_res.message();
+
+  const uint8_t* dst_buf = dst.GetHostPointer(0, 0);
+  EXPECT_THAT(absl::MakeConstSpan(dst_buf, kDstOffset), Each(Eq(0)));
+  EXPECT_THAT(absl::MakeConstSpan(dst_buf + kDstOffset, kLen),
+              Pointwise(Eq(), absl::MakeConstSpan(src_buf + kSrcOffset, kLen)));
+  EXPECT_THAT(absl::MakeConstSpan(dst_buf + kDstOffset + kLen,
+                                  size - kDstOffset - kLen),
+              Each(Eq(0)));
+}
+
+TEST_P(BlockTransportTest, PullBufferZeroBytesIsNoop) {
+  constexpr size_t size = 4 * 1024;
+  MockDelegate dst(size);
+  BlockTransport dst_transport(&dst, 0);
+
+  // No slices are issued, so even an unreachable peer succeeds.
+  ABSL_EXPECT_OK(dst_transport.PullBuffer(
+      "localhost:1", /*buffer_id=*/0, /*src_shard_idx=*/0,
+      /*src_offset_bytes=*/0, /*dst_shard_idx=*/0, /*dst_offset_bytes=*/0,
+      /*size_bytes=*/0));
+}
+
+TEST_P(BlockTransportTest, PullBufferRejectsInvalidArguments) {
+  constexpr size_t size = 4 * 1024;
+  MockDelegate dst(size);
+  BlockTransport dst_transport(&dst, 0);
+
+  EXPECT_THAT(dst_transport.PullBuffer(
+                  /*peer=*/"", /*buffer_id=*/0, /*src_shard_idx=*/0,
+                  /*src_offset_bytes=*/0, /*dst_shard_idx=*/0,
+                  /*dst_offset_bytes=*/0, /*size_bytes=*/16),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(dst_transport.PullBuffer(
+                  "localhost:1", /*buffer_id=*/0, /*src_shard_idx=*/0,
+                  /*src_offset_bytes=*/0, /*dst_shard_idx=*/0,
+                  /*dst_offset_bytes=*/size - 8, /*size_bytes=*/16),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
 TEST_P(BlockTransportTest, PollEINTRIsBenign) {
   // Set up src/dst buffers.
   constexpr size_t size = 4096;

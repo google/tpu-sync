@@ -38,6 +38,33 @@ cc_library(
 )
 
 cc_library(
+    name = "swarm_service",
+    srcs = ["swarm_service.cc"],
+    hdrs = ["swarm_service.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:btree",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
     name = "weight_synchronizer_base",
     srcs = [
         "weight_synchronizer_base.cc",
@@ -54,6 +81,7 @@ cc_library(
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
+        ":swarm_service",
         ":tiling_utils",
         "//tpu_sync/common:detached_thread_group",
         "//tpu_sync/common:trace",
@@ -102,7 +130,9 @@ cc_test(
     linkopts = ["-Wl,--allow-shlib-undefined"],
     tags = ["no_oss"],
     deps = [
+        ":swarm_service",
         ":weight_synchronizer_base",
+        "//tpu_sync/common/control_pipe",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/telemetry:buffered_metrics_exporter",
@@ -137,6 +167,28 @@ cc_test(
         ":weight_synchronizer_base",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "swarm_service_test",
+    srcs = ["swarm_service_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    tags = ["no_oss"],
+    deps = [
+        ":swarm_service",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest_main",
     ],
 )

@@ -42,11 +42,14 @@
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/statusor.h"
+#include "tpu_sync/common/control_pipe/control_pipe_server.h"
+#include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/lib/test_only_rate_limiter.h"
+#include "tpu_sync/weight_sync/swarm_service.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 ABSL_DECLARE_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size);
@@ -2632,6 +2635,173 @@ TEST_F(WeightSynchronizerTest,
       EXPECT_EQ(dst2_ptr[b], expected) << "dest2 layer " << l << " byte " << b;
     }
   }
+}
+
+TEST_F(WeightSynchronizerTest, StartBundlePullTransferValidation) {
+  WeightSynchronizerBase engine(num_layers_, num_shards_, slice_byte_size_,
+                                /*local_port=*/0,
+                                /*host_blocks_to_allocate=*/1);
+
+  // 1. Request without pull_config.
+  tpu_sync::rpc::StartTransferRequest req1;
+  absl::Status s1 = engine.StartBundlePullTransfer(req1);
+  EXPECT_FALSE(s1.ok());
+  EXPECT_EQ(s1.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(s1.message(), ::testing::HasSubstr("enable_bundle_pull"));
+
+  // 2. Request with enable_bundle_pull=false.
+  tpu_sync::rpc::StartTransferRequest req2;
+  req2.mutable_pull_config()->set_enable_bundle_pull(false);
+  absl::Status s2 = engine.StartBundlePullTransfer(req2);
+  EXPECT_FALSE(s2.ok());
+  EXPECT_EQ(s2.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(s2.message(), ::testing::HasSubstr("enable_bundle_pull"));
+
+  // 3. Request with empty controller_address.
+  tpu_sync::rpc::StartTransferRequest req3;
+  req3.mutable_pull_config()->set_enable_bundle_pull(true);
+  req3.mutable_pull_config()->set_controller_address("");
+  absl::Status s3 = engine.StartBundlePullTransfer(req3);
+  EXPECT_FALSE(s3.ok());
+  EXPECT_EQ(s3.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(s3.message(), ::testing::HasSubstr("controller_address"));
+}
+
+TEST_F(WeightSynchronizerTest, BundlePullTransferExecutionE2e) {
+  auto ws_source = std::make_unique<WeightSynchronizerBase>(
+      num_layers_, num_shards_, slice_byte_size_,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+  auto ws_dest = std::make_unique<WeightSynchronizerBase>(
+      num_layers_, num_shards_, slice_byte_size_,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/1);
+
+  ASSERT_TRUE(ws_source->local_port().has_value());
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+
+  uint8_t* src_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
+  ASSERT_NE(src_ptr, nullptr);
+  std::memset(src_ptr, 0x5A, slice_byte_size_);
+
+  uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, 0));
+  ASSERT_NE(dst_ptr, nullptr);
+  std::memset(dst_ptr, 0x00, slice_byte_size_);
+
+  auto swarm = std::make_shared<SwarmService>();
+  ControlPipeConfig cfg;
+  cfg.requested_port = 0;
+  auto ctrl_server = CreateControlPipeServer(cfg);
+  ctrl_server->dispatcher()
+      .RegisterHandler<tpu_sync::rpc::ControlRequest,
+                       tpu_sync::rpc::ControlResponse>(
+          [&swarm](const ControlContext&,
+                   const tpu_sync::rpc::ControlRequest& req)
+              -> absl::StatusOr<tpu_sync::rpc::ControlResponse> {
+            tpu_sync::rpc::ControlResponse resp;
+            resp.set_success(true);
+            if (req.command() == tpu_sync::rpc::ControlRequest::
+                                     COMMAND_ACQUIRE_BUNDLE_PULL_TOKEN) {
+              auto tok = swarm->AcquireBundlePullToken(
+                  req.acquire_bundle_pull_token_request());
+              if (tok.ok()) {
+                *resp.mutable_acquire_bundle_pull_token_response() =
+                    std::move(*tok);
+              } else {
+                resp.set_success(false);
+                resp.set_message(std::string(tok.status().message()));
+              }
+            } else if (req.command() ==
+                       tpu_sync::rpc::ControlRequest::
+                           COMMAND_REGISTER_BUNDLE_AVAILABILITY) {
+              auto reg = swarm->RegisterBundleAvailability(
+                  req.register_bundle_availability_request());
+              if (reg.ok()) {
+                *resp.mutable_register_bundle_availability_response() =
+                    std::move(*reg);
+              } else {
+                resp.set_success(false);
+                resp.set_message(std::string(reg.status().message()));
+              }
+            }
+            return resp;
+          });
+  auto port_or = ctrl_server->Start(0);
+  ASSERT_TRUE(port_or.ok());
+  const std::string ctrl_addr = "127.0.0.1:" + std::to_string(*port_or);
+
+  const uint64_t kUuid = 98765;
+  SwarmService::Participant p0;
+  p0.unit.set_job_name("sampler");
+  p0.unit.set_job_replica_id("0");
+  p0.host_data_endpoints.push_back("127.0.0.1:" +
+                                   std::to_string(*ws_source->local_port()));
+
+  SwarmService::Participant p1;
+  p1.unit.set_job_name("sampler");
+  p1.unit.set_job_replica_id("1");
+  p1.host_data_endpoints.push_back("127.0.0.1:" +
+                                   std::to_string(*ws_dest->local_port()));
+
+  ASSERT_TRUE(swarm
+                  ->StartSession("test_bundle_pull", kUuid, /*num_bundles=*/1,
+                                 {p0, p1}, SwarmService::SessionConfig{})
+                  .ok());
+
+  tpu_sync::rpc::RegisterBundleAvailabilityRequest reg_req;
+  reg_req.set_req_id("test_bundle_pull");
+  reg_req.set_uuid(static_cast<int64_t>(kUuid));
+  reg_req.set_bundle_index(0);
+  reg_req.mutable_unit()->set_job_name("sampler");
+  reg_req.mutable_unit()->set_job_replica_id("0");
+  ASSERT_TRUE(swarm->RegisterBundleAvailability(reg_req).ok());
+
+  tpu_sync::rpc::StartTransferRequest pull_req;
+  pull_req.set_req_id("test_bundle_pull");
+  pull_req.set_uuid(kUuid);
+  pull_req.mutable_pull_config()->set_enable_bundle_pull(true);
+  pull_req.mutable_pull_config()->set_controller_address(ctrl_addr);
+  pull_req.mutable_pull_config()->mutable_target_unit()->set_job_name(
+      "sampler");
+  pull_req.mutable_pull_config()->mutable_target_unit()->set_job_replica_id(
+      "1");
+  pull_req.mutable_pull_config()->set_host_idx(0);
+
+  auto* bundle = pull_req.add_variable_bundles();
+  bundle->set_bundle_index(0);
+  bundle->set_bundle_name("layer0");
+  auto* var = bundle->add_variables();
+  var->set_layer_idx(0);
+
+  ASSERT_TRUE(ws_dest->StartBundlePullTransfer(pull_req).ok());
+  ASSERT_TRUE(ws_dest->WaitForTransferCompletion(kUuid).ok());
+
+  for (size_t i = 0; i < slice_byte_size_; ++i) {
+    EXPECT_EQ(dst_ptr[i], 0x5A) << "Mismatch at byte " << i;
+  }
+
+  ctrl_server->Stop();
+}
+
+class TestableWeightSynchronizer : public WeightSynchronizerBase {
+ public:
+  using WeightSynchronizerBase::GetOrCreateControlPipeClient;
+  using WeightSynchronizerBase::WeightSynchronizerBase;
+};
+
+TEST_F(WeightSynchronizerTest, ControlPipeClientCaching) {
+  TestableWeightSynchronizer engine(num_layers_, num_shards_, slice_byte_size_,
+                                    /*local_port=*/0,
+                                    /*host_blocks_to_allocate=*/1);
+  ControlPipeClient* client1 =
+      engine.GetOrCreateControlPipeClient("127.0.0.1:10001");
+  ControlPipeClient* client1_again =
+      engine.GetOrCreateControlPipeClient("127.0.0.1:10001");
+  ControlPipeClient* client2 =
+      engine.GetOrCreateControlPipeClient("127.0.0.1:10002");
+
+  EXPECT_NE(client1, nullptr);
+  EXPECT_NE(client2, nullptr);
+  EXPECT_EQ(client1, client1_again);
+  EXPECT_NE(client1, client2);
 }
 
 }  // namespace

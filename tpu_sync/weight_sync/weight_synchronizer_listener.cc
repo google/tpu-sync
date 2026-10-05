@@ -23,6 +23,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/optimization.h"
@@ -34,10 +35,12 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/synchronization/mutex.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
 #include "tpu_sync/common/control_pipe/control_pipe_server.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/weight_sync/swarm_service.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace tpu_raiden {
@@ -45,8 +48,13 @@ namespace weight_sync {
 
 WeightSynchronizerListener::WeightSynchronizerListener(
     WeightSynchronizerBase* engine, int listener_port,
-    ControlPipeBackendType backend_type)
-    : engine_(engine), listener_port_(listener_port) {
+    ControlPipeBackendType backend_type,
+    std::shared_ptr<SwarmService> swarm_service)
+    : engine_(engine),
+      listener_port_(listener_port),
+      swarm_service_(swarm_service != nullptr
+                         ? std::move(swarm_service)
+                         : std::make_shared<SwarmService>()) {
   ControlPipeConfig cfg;
   cfg.backend_type = backend_type;
   cfg.requested_port = listener_port;
@@ -60,12 +68,7 @@ WeightSynchronizerListener::WeightSynchronizerListener(
                  const ::tpu_sync::rpc::ControlRequest& req)
               -> absl::StatusOr<::tpu_sync::rpc::ControlResponse> {
             ::tpu_sync::rpc::ControlResponse resp;
-            ExecuteControlRequest(engine_, req, &resp, [this]() {
-              stopping_.store(true);
-              if (pipe_server_) {
-                pipe_server_->StopAccepting();
-              }
-            });
+            ExecuteRequest(req, &resp);
             return resp;
           },
           HandlerOptions<::tpu_sync::rpc::ControlRequest>().WithMaxPayloadBytes(
@@ -88,6 +91,81 @@ void WeightSynchronizerListener::Shutdown() {
   if (pipe_server_) {
     pipe_server_->Stop();
   }
+}
+
+void WeightSynchronizerListener::ExecuteRequest(
+    const ::tpu_sync::rpc::ControlRequest& req,
+    ::tpu_sync::rpc::ControlResponse* resp) {
+  if (req.command() ==
+      ::tpu_sync::rpc::ControlRequest::COMMAND_ACQUIRE_BUNDLE_PULL_TOKEN) {
+    auto token_or = swarm_service_->AcquireBundlePullToken(
+        req.acquire_bundle_pull_token_request());
+    if (token_or.ok()) {
+      *resp->mutable_acquire_bundle_pull_token_response() =
+          std::move(*token_or);
+      resp->set_success(true);
+      resp->set_message("SUCCESS");
+    } else {
+      resp->set_success(false);
+      resp->set_message(std::string(token_or.status().message()));
+    }
+    return;
+  }
+  if (req.command() ==
+      ::tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_BUNDLE_AVAILABILITY) {
+    auto reg_or = swarm_service_->RegisterBundleAvailability(
+        req.register_bundle_availability_request());
+    if (reg_or.ok()) {
+      *resp->mutable_register_bundle_availability_response() =
+          std::move(*reg_or);
+      resp->set_success(true);
+      resp->set_message("SUCCESS");
+    } else {
+      resp->set_success(false);
+      resp->set_message(std::string(reg_or.status().message()));
+    }
+    return;
+  }
+  if (req.command() ==
+      ::tpu_sync::rpc::ControlRequest::COMMAND_START_SWARM_SESSION) {
+    const auto& start_req = req.start_swarm_session_request();
+    const int32_t max_uploads =
+        std::max<int32_t>(1, start_req.max_concurrent_uploads_per_source());
+    std::shared_ptr<SwarmService> swarm = swarm_service();
+    std::vector<SwarmService::Participant> participants;
+    participants.reserve(start_req.participants_size());
+    for (const auto& ent : start_req.participants()) {
+      SwarmService::Participant& participant = participants.emplace_back();
+      participant.unit = ent.unit();
+      for (const std::string& shard : ent.shards()) {
+        participant.host_data_endpoints.push_back(shard);
+      }
+    }
+    SwarmService::SessionConfig config;
+    config.max_concurrent_uploads_per_source = max_uploads;
+    absl::Status status = swarm->StartSession(
+        start_req.req_id(), static_cast<uint64_t>(start_req.uuid()),
+        start_req.num_bundles(), participants, config);
+    if (status.ok()) {
+      resp->mutable_start_swarm_session_response()->set_started(true);
+      resp->set_success(true);
+      resp->set_message("SUCCESS");
+      LOG(INFO) << "C++ Listener started swarm session req_id="
+                << start_req.req_id() << " uuid=" << start_req.uuid()
+                << " num_bundles=" << start_req.num_bundles()
+                << " participants=" << participants.size();
+    } else {
+      resp->set_success(false);
+      resp->set_message(std::string(status.message()));
+    }
+    return;
+  }
+  ExecuteControlRequest(engine_, req, resp, [this]() {
+    stopping_.store(true);
+    if (pipe_server_) {
+      pipe_server_->StopAccepting();
+    }
+  });
 }
 
 void WeightSynchronizerListener::ExecuteControlRequest(
@@ -199,13 +277,27 @@ void WeightSynchronizerListener::ExecuteControlRequest(
         }
       }
     } else {
+      const auto& start_req = req.start_transfer_request();
+      uint64_t uuid = start_req.uuid();
+      if (start_req.has_pull_config() &&
+          start_req.pull_config().enable_bundle_pull()) {
+        LOG(INFO) << "C++ Listener received START_TRANSFER (Bundle Puller) "
+                  << "for req_id=" << start_req.req_id() << " uuid=" << uuid;
+        engine->StoreSkipTiling(uuid, start_req);
+        absl::Status status = engine->StartBundlePullTransfer(start_req);
+        if (!status.ok()) {
+          resp->set_success(false);
+          resp->set_message(std::string(status.message()));
+          LOG(ERROR) << "StartBundlePullTransfer failed: " << status;
+        }
+        return;
+      }
+
       LOG(INFO) << "C++ Listener received START_TRANSFER (Receiver) - "
                    "registering expected block count";
-      int64_t expected_block_count =
-          req.start_transfer_request().expected_block_count();
-      uint64_t uuid = req.start_transfer_request().uuid();
+      int64_t expected_block_count = start_req.expected_block_count();
       if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
-        std::string req_id = req.start_transfer_request().req_id();
+        std::string req_id = start_req.req_id();
         VLOG(1) << "RAIDEN_DIAG recv arm uuid=" << uuid << " req_id=" << req_id
                 << " expected_block_count=" << expected_block_count;
       }
@@ -217,8 +309,7 @@ void WeightSynchronizerListener::ExecuteControlRequest(
         LOG(ERROR) << "Invalid expected_block_count: " << expected_block_count;
         return;
       }
-      const auto& layer_counts_proto =
-          req.start_transfer_request().expected_layer_chunk_counts();
+      const auto& layer_counts_proto = start_req.expected_layer_chunk_counts();
       // Every received chunk must be attributed to a layer so that each layer
       // with data fires OnLayerDataReceived before OnDataReceived.
       int64_t total_layer_chunks = 0;
@@ -236,7 +327,7 @@ void WeightSynchronizerListener::ExecuteControlRequest(
         LOG(ERROR) << resp->message();
         return;
       }
-      engine->StoreSkipTiling(uuid, req.start_transfer_request());
+      engine->StoreSkipTiling(uuid, start_req);
 
       absl::flat_hash_map<size_t, uint32_t> layer_counts;
       for (const auto& [layer_idx, count] : layer_counts_proto) {

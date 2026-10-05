@@ -20,12 +20,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <future>
+#include <deque>
+#include <future>  // NOLINT(build/c++11)
 #include <iterator>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -53,6 +55,8 @@
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
+#include "tpu_sync/common/control_pipe/control_pipe_client.h"
+#include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -77,6 +81,17 @@ namespace weight_sync {
 
 namespace {
 static std::atomic<size_t> global_allocated_host_dram_bytes_{0};
+
+int32_t GetBundlePrefetchDepth() {
+  const char* env = std::getenv("RAIDEN_BUNDLE_PREFETCH_DEPTH");
+  if (env != nullptr && *env != '\0') {
+    int val = 0;
+    if (absl::SimpleAtoi(env, &val) && val >= 1) {
+      return std::min<int32_t>(val, 8);
+    }
+  }
+  return 2;
+}
 }  // namespace
 
 WeightSynchronizerBase::WeightSynchronizerBase(
@@ -379,6 +394,8 @@ WeightSynchronizerBase::get_local_endpoints() const {
 }
 
 WeightSynchronizerBase::~WeightSynchronizerBase() {
+  shutting_down_.store(true, std::memory_order_release);
+  pull_thread_group_.AwaitAllDone();
   StopTransportServer();
   listener_.reset();
   h2d_pool_.reset();
@@ -1800,6 +1817,277 @@ void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
     absl::MutexLock lock(pending_h2d_mu_);
     pending_h2d_states_.erase(uuid);
   }
+}
+
+ControlPipeClient* WeightSynchronizerBase::GetOrCreateControlPipeClient(
+    const std::string& controller_address) {
+  absl::MutexLock lock(control_client_mu_);
+  auto it = control_pipe_clients_.find(controller_address);
+  if (it != control_pipe_clients_.end()) {
+    return it->second.get();
+  }
+  ControlPipeConfig cfg;
+  cfg.enable_tcp_connection_pooling = true;
+  auto client = CreateControlPipeClient(cfg);
+  ControlPipeClient* ptr = client.get();
+  control_pipe_clients_.emplace(controller_address, std::move(client));
+  return ptr;
+}
+
+absl::StatusOr<tpu_sync::rpc::AcquireBundlePullTokenResponse>
+WeightSynchronizerBase::AcquirePullToken(
+    const std::string& controller_address, absl::string_view req_id,
+    uint64_t uuid, const tpu_sync::rpc::RaidenIdProto& dst_unit,
+    int32_t host_idx, absl::Span<const int32_t> needed_bundles,
+    absl::string_view failed_source_replica_id) {
+  tpu_sync::rpc::ControlRequest req;
+  req.set_command(
+      tpu_sync::rpc::ControlRequest::COMMAND_ACQUIRE_BUNDLE_PULL_TOKEN);
+  auto* acquire = req.mutable_acquire_bundle_pull_token_request();
+  acquire->set_req_id(req_id);
+  acquire->set_uuid(static_cast<int64_t>(uuid));
+  *acquire->mutable_dst_unit() = dst_unit;
+  acquire->set_host_idx(host_idx);
+  for (int32_t b_id : needed_bundles) {
+    acquire->add_needed_bundle_indices(b_id);
+  }
+  if (!failed_source_replica_id.empty()) {
+    acquire->set_failed_source_replica_id(
+        std::string(failed_source_replica_id));
+  }
+
+  ControlPipeClient* client = GetOrCreateControlPipeClient(controller_address);
+  auto resp_or =
+      client
+          ->Call<tpu_sync::rpc::ControlRequest, tpu_sync::rpc::ControlResponse>(
+              controller_address, req, absl::Seconds(30));
+  if (!resp_or.ok()) {
+    return resp_or.status();
+  }
+  if (!resp_or->success()) {
+    return absl::InternalError(resp_or->message());
+  }
+  return resp_or->acquire_bundle_pull_token_response();
+}
+
+WeightSynchronizerBase::InFlightBundle WeightSynchronizerBase::LaunchBundlePull(
+    const tpu_sync::rpc::VariableBundleSpecProto& spec,
+    const tpu_sync::rpc::AcquireBundlePullTokenResponse& token) {
+  InFlightBundle bundle;
+  bundle.bundle_index = token.assigned_bundle_index();
+  const auto& u = token.source_unit();
+  bundle.source_id =
+      !u.job_name().empty()
+          ? absl::StrCat(u.job_name(), ":", u.job_replica_id(), ":",
+                         u.data_name(), ":", u.data_replica_idx())
+          : u.job_replica_id();
+  bundle.spec = spec;
+
+  const std::string& endpoint = token.source_data_endpoint();
+  if (endpoint.empty()) {
+    return bundle;
+  }
+
+  for (const tpu_sync::rpc::VariableMetadataProto& var : spec.variables()) {
+    const int32_t l = var.layer_idx();
+    if (l < 0 || static_cast<size_t>(l) >= num_layers_) continue;
+    for (size_t s = 0; s < num_shards_; ++s) {
+      const size_t pull_bytes = layers_[l].shards[s].device_size;
+      if (pull_bytes == 0) continue;
+      bundle.total_bytes += pull_bytes;
+      bundle.futures.push_back(push_pool_->Schedule(
+          assigned_numa_node_, [this, endpoint, l, s, pull_bytes]() {
+            return PullBuffer(endpoint, l, s, /*src_offset_bytes=*/0, s,
+                              /*dst_offset_bytes=*/0, pull_bytes);
+          }));
+    }
+  }
+  return bundle;
+}
+
+absl::Status WeightSynchronizerBase::WaitForBundle(InFlightBundle& bundle) {
+  absl::Status first_error = absl::OkStatus();
+  for (auto& f : bundle.futures) {
+    if (f.valid()) {
+      absl::Status st = f.get();
+      if (!st.ok() && first_error.ok()) {
+        first_error = st;
+      }
+    }
+  }
+  return first_error;
+}
+
+absl::Status WeightSynchronizerBase::RegisterBundleAvailability(
+    const std::string& controller_address, absl::string_view req_id,
+    uint64_t uuid, const tpu_sync::rpc::RaidenIdProto& unit, int32_t host_idx,
+    int32_t bundle_index) {
+  tpu_sync::rpc::ControlRequest req;
+  req.set_command(
+      tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_BUNDLE_AVAILABILITY);
+  auto* reg = req.mutable_register_bundle_availability_request();
+  reg->set_req_id(req_id);
+  reg->set_uuid(static_cast<int64_t>(uuid));
+  *reg->mutable_unit() = unit;
+  reg->set_host_idx(host_idx);
+  reg->set_bundle_index(bundle_index);
+
+  ControlPipeClient* client = GetOrCreateControlPipeClient(controller_address);
+  auto resp_or =
+      client
+          ->Call<tpu_sync::rpc::ControlRequest, tpu_sync::rpc::ControlResponse>(
+              controller_address, req, absl::Seconds(30));
+  if (!resp_or.ok()) {
+    return resp_or.status();
+  }
+  if (!resp_or->success()) {
+    return absl::InternalError(resp_or->message());
+  }
+  return absl::OkStatus();
+}
+
+absl::Status WeightSynchronizerBase::StartBundlePullTransfer(
+    const tpu_sync::rpc::StartTransferRequest& request) {
+  if (!request.has_pull_config() ||
+      !request.pull_config().enable_bundle_pull()) {
+    return absl::InvalidArgumentError(
+        "StartBundlePullTransfer called without enable_bundle_pull");
+  }
+  if (request.pull_config().controller_address().empty()) {
+    return absl::InvalidArgumentError(
+        "StartBundlePullTransfer requires a non-empty controller_address");
+  }
+  const uint64_t uuid = request.uuid();
+  {
+    absl::MutexLock lock(pending_h2d_mu_);
+    auto& state = pending_h2d_states_[uuid];
+    if (state.expected_layers == 0) {
+      state.expected_layers = num_layers_;
+    }
+  }
+
+  pull_thread_group_.Spawn([this, req_copy = request]() mutable {
+    ExecuteBundlePullTransfer(std::move(req_copy));
+  });
+  return absl::OkStatus();
+}
+
+void WeightSynchronizerBase::ExecuteBundlePullTransfer(
+    tpu_sync::rpc::StartTransferRequest request) {
+  const uint64_t uuid = request.uuid();
+  const auto& pull_cfg = request.pull_config();
+  const std::string& controller_addr = pull_cfg.controller_address();
+
+  absl::flat_hash_map<int32_t, tpu_sync::rpc::VariableBundleSpecProto>
+      bundle_map;
+  std::vector<int32_t> needed_bundles;
+  needed_bundles.reserve(request.variable_bundles_size());
+  for (const auto& b : request.variable_bundles()) {
+    bundle_map[b.bundle_index()] = b;
+    needed_bundles.push_back(b.bundle_index());
+  }
+  std::sort(needed_bundles.begin(), needed_bundles.end());
+
+  if (!push_pool_) {
+    push_pool_ =
+        std::make_unique<tpu_raiden::NumaThreadPool>(std::max(parallelism_, 4));
+  }
+
+  const auto pull_start_time = absl::Now();
+  const absl::Time deadline = pull_start_time + absl::Seconds(180);
+  const int32_t prefetch_depth = GetBundlePrefetchDepth();
+
+  std::deque<InFlightBundle> in_flight;
+  absl::flat_hash_set<int32_t> in_flight_set;
+  std::string failed_source_replica_id;
+  size_t total_pulled_bytes = 0;
+
+  while (!needed_bundles.empty() &&
+         !shutting_down_.load(std::memory_order_acquire)) {
+    if (absl::Now() > deadline) {
+      LOG(ERROR) << "ExecuteBundlePullTransfer timed out for req_id="
+                 << request.req_id() << " uuid=" << uuid
+                 << " remaining_bundles=" << needed_bundles.size();
+      break;
+    }
+
+    std::vector<int32_t> candidates;
+    for (int32_t b_id : needed_bundles) {
+      if (!in_flight_set.contains(b_id)) candidates.push_back(b_id);
+    }
+
+    if (in_flight.size() < static_cast<size_t>(prefetch_depth) &&
+        !candidates.empty()) {
+      auto token_or = AcquirePullToken(
+          controller_addr, request.req_id(), uuid, pull_cfg.target_unit(),
+          pull_cfg.host_idx(), candidates, failed_source_replica_id);
+      if (token_or.ok() && token_or->granted()) {
+        failed_source_replica_id.clear();
+        int32_t b_idx = token_or->assigned_bundle_index();
+        in_flight.push_back(LaunchBundlePull(bundle_map[b_idx], *token_or));
+        in_flight_set.insert(b_idx);
+        if (in_flight.size() < static_cast<size_t>(prefetch_depth) &&
+            candidates.size() > 1) {
+          continue;
+        }
+      }
+    }
+
+    if (in_flight.empty()) {
+      absl::SleepFor(absl::Milliseconds(10));
+      continue;
+    }
+
+    InFlightBundle head = std::move(in_flight.front());
+    in_flight.pop_front();
+
+    absl::Status pull_st = WaitForBundle(head);
+    if (!pull_st.ok()) {
+      LOG(WARNING) << "Bundle pull failed for bundle=" << head.bundle_index
+                   << " from " << head.source_id << ": " << pull_st;
+      failed_source_replica_id = head.source_id;
+      in_flight_set.erase(head.bundle_index);
+      absl::SleepFor(absl::Milliseconds(10));
+      continue;
+    }
+
+    total_pulled_bytes += head.total_bytes;
+    for (const auto& var : head.spec.variables()) {
+      const int32_t l = var.layer_idx();
+      if (l >= 0 && static_cast<size_t>(l) < num_layers_) {
+        (void)OnLayerDataReceived(static_cast<size_t>(l), uuid);
+      }
+    }
+
+    needed_bundles.erase(std::remove(needed_bundles.begin(),
+                                     needed_bundles.end(), head.bundle_index),
+                         needed_bundles.end());
+    in_flight_set.erase(head.bundle_index);
+
+    auto reg_st = RegisterBundleAvailability(
+        controller_addr, request.req_id(), uuid, pull_cfg.target_unit(),
+        pull_cfg.host_idx(), head.bundle_index);
+    if (!reg_st.ok()) {
+      LOG(WARNING) << "RegisterBundleAvailability failed for bundle="
+                   << head.bundle_index << ": " << reg_st;
+    }
+  }
+
+  for (auto& bundle : in_flight) {
+    (void)WaitForBundle(bundle);
+  }
+
+  double pull_time_ms =
+      absl::ToDoubleMilliseconds(absl::Now() - pull_start_time);
+  {
+    absl::MutexLock lock(metrics_mu_);
+    metrics_.last_h2h_bytes = total_pulled_bytes;
+    metrics_.total_h2h_bytes += total_pulled_bytes;
+    metrics_.last_h2h_time_ms = pull_time_ms;
+    metrics_.total_h2h_time_ms += pull_time_ms;
+  }
+
+  (void)OnDataReceived(uuid);
 }
 
 uint8_t* WeightSynchronizerBase::GetHostPointer(size_t layer_idx,

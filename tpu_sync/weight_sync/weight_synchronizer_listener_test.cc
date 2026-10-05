@@ -28,6 +28,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/weight_sync/swarm_service.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace tpu_raiden {
@@ -389,6 +390,90 @@ TEST(WeightSynchronizerListenerTest,
                                                     []() {});
   EXPECT_FALSE(resp.success());
   EXPECT_THAT(resp.message(), HasSubstr("summing to 2"));
+}
+
+TEST(WeightSynchronizerListenerTest, SwarmServiceTokenAndRegistrationCommands) {
+  WeightSynchronizerBase engine(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+      /*parallelism=*/1, /*listener_port=*/std::nullopt);
+  WeightSynchronizerListener listener(&engine, /*listener_port=*/0);
+  ASSERT_NE(listener.swarm_service(), nullptr);
+
+  // Setup session on the listener's SwarmService.
+  const uint64_t kUuid = 5555;
+  SwarmService::Participant p0;
+  p0.unit.set_job_name("sampler");
+  p0.unit.set_job_replica_id("0");
+  p0.host_data_endpoints.push_back("127.0.0.1:12345");
+
+  SwarmService::Participant p1;
+  p1.unit.set_job_name("sampler");
+  p1.unit.set_job_replica_id("1");
+  p1.host_data_endpoints.push_back("127.0.0.1:12346");
+
+  ASSERT_TRUE(listener.swarm_service()
+                  ->StartSession("req_1", kUuid, /*num_bundles=*/1, {p0, p1},
+                                 SwarmService::SessionConfig{})
+                  .ok());
+
+  // 1. Register bundle availability via ExecuteRequest.
+  ControlRequest reg;
+  reg.set_command(ControlRequest::COMMAND_REGISTER_BUNDLE_AVAILABILITY);
+  auto* reg_req = reg.mutable_register_bundle_availability_request();
+  reg_req->set_req_id("req_1");
+  reg_req->set_uuid(static_cast<int64_t>(kUuid));
+  reg_req->mutable_unit()->set_job_name("sampler");
+  reg_req->mutable_unit()->set_job_replica_id("0");
+  reg_req->set_bundle_index(0);
+
+  ControlResponse reg_resp;
+  listener.ExecuteRequest(reg, &reg_resp);
+  EXPECT_TRUE(reg_resp.success()) << reg_resp.message();
+  EXPECT_TRUE(reg_resp.register_bundle_availability_response().acknowledged());
+
+  // 2. Acquire token for this bundle via ExecuteRequest.
+  ControlRequest acq;
+  acq.set_command(ControlRequest::COMMAND_ACQUIRE_BUNDLE_PULL_TOKEN);
+  auto* acq_req = acq.mutable_acquire_bundle_pull_token_request();
+  acq_req->set_req_id("req_1");
+  acq_req->set_uuid(static_cast<int64_t>(kUuid));
+  acq_req->mutable_dst_unit()->set_job_name("sampler");
+  acq_req->mutable_dst_unit()->set_job_replica_id("1");
+  acq_req->add_needed_bundle_indices(0);
+
+  ControlResponse acq_resp;
+  listener.ExecuteRequest(acq, &acq_resp);
+  EXPECT_TRUE(acq_resp.success()) << acq_resp.message();
+  const auto& token = acq_resp.acquire_bundle_pull_token_response();
+  EXPECT_TRUE(token.granted());
+  EXPECT_EQ(token.assigned_bundle_index(), 0);
+  EXPECT_EQ(token.source_unit().job_replica_id(), "0");
+  EXPECT_EQ(token.source_data_endpoint(), "127.0.0.1:12345");
+}
+
+TEST(WeightSynchronizerListenerTest, StartTransferDispatchesBundlePull) {
+  WeightSynchronizerBase engine(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+      /*parallelism=*/1, /*listener_port=*/std::nullopt);
+  WeightSynchronizerListener listener(&engine, /*listener_port=*/0);
+
+  ControlRequest req;
+  req.set_command(ControlRequest::COMMAND_START_TRANSFER);
+  auto* start_req = req.mutable_start_transfer_request();
+  start_req->set_req_id("pull_dispatch");
+  start_req->set_uuid(2002);
+  start_req->mutable_pull_config()->set_enable_bundle_pull(true);
+  start_req->mutable_pull_config()->set_controller_address("127.0.0.1:9999");
+  start_req->mutable_pull_config()->mutable_target_unit()->set_job_name(
+      "sampler");
+  start_req->mutable_pull_config()->mutable_target_unit()->set_job_replica_id(
+      "0");
+
+  ControlResponse resp;
+  listener.ExecuteRequest(req, &resp);
+  EXPECT_TRUE(resp.success()) << resp.message();
 }
 
 }  // namespace

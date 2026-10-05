@@ -1195,6 +1195,32 @@ absl::Status BlockTransport::PushBuffer(absl::string_view peer,
   return raw_transport_.ProcessSocketBufferPush(peer, req);
 }
 
+absl::Status BlockTransport::PullBuffer(absl::string_view peer,
+                                        size_t buffer_id, size_t src_shard_idx,
+                                        size_t src_offset_bytes,
+                                        size_t dst_shard_idx,
+                                        size_t dst_offset_bytes,
+                                        size_t size_bytes) {
+  // The ChunkHeader wire format carries the pull size in a 32-bit field, so
+  // large ranges are issued as sequential slices of at most 1 GiB each.
+  // TODO(justinlu): The source offset is also a 32-bit wire field; ranges whose
+  // source offset reaches 4 GiB are rejected by RawBufferTransport.
+  constexpr size_t kMaxPullSliceBytes = 1ULL << 30;
+  size_t remaining = size_bytes;
+  size_t curr_src_offset = src_offset_bytes;
+  size_t curr_dst_offset = dst_offset_bytes;
+  while (remaining > 0) {
+    const size_t chunk_bytes = std::min(remaining, kMaxPullSliceBytes);
+    ABSL_RETURN_IF_ERROR(raw_transport_.PullBuffer(
+        peer, buffer_id, src_shard_idx, curr_src_offset, dst_shard_idx,
+        curr_dst_offset, chunk_bytes));
+    curr_src_offset += chunk_bytes;
+    curr_dst_offset += chunk_bytes;
+    remaining -= chunk_bytes;
+  }
+  return absl::OkStatus();
+}
+
 absl::Status BlockTransport::PushBuffers(
     const std::vector<BufferPushTask>& tasks, int parallelism, uint64_t uuid) {
   return raw_transport_.PushBuffers(tasks, parallelism, uuid);

@@ -92,6 +92,13 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
                                 const uint8_t* data_ptr, size_t size_bytes,
                                 uint64_t uuid = 0, size_t layer_idx = 0);
 
+  // Synchronously pulls a contiguous byte range from |peer|'s |src_shard_idx|
+  // into this host's |dst_shard_idx| for |buffer_id| (layer index).
+  absl::Status PullBuffer(absl::string_view peer, size_t buffer_id,
+                          size_t src_shard_idx, size_t src_offset_bytes,
+                          size_t dst_shard_idx, size_t dst_offset_bytes,
+                          size_t size_bytes);
+
   absl::Status PushWeightsChunks(
       const std::vector<transport::BufferPushTask>& tasks, int parallelism,
       uint64_t uuid);

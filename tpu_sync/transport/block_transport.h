@@ -132,6 +132,20 @@ class BlockTransport final {
                           const uint8_t* data_ptr, size_t size_bytes,
                           uint64_t uuid = 0);
 
+  // Synchronously pulls |size_bytes| starting at |src_offset_bytes| of the
+  // remote |peer|'s buffer |buffer_id| / |src_shard_idx| into the local
+  // buffer |buffer_id| / |dst_shard_idx| at |dst_offset_bytes|. The transfer
+  // is driven entirely by the caller; the source does not need to be armed.
+  // Ranges larger than 1 GiB are split into sequential slices.
+  // TODO(justinlu): Add a batched pull only if many small ranges make the
+  // per-request round trip dominate. That needs a new wire op (one request
+  // listing N ranges, streamed back with writev) analogous to
+  // kOpBufferPushBatched; looping PullBuffer on a pool gains nothing here.
+  absl::Status PullBuffer(absl::string_view peer, size_t buffer_id,
+                          size_t src_shard_idx, size_t src_offset_bytes,
+                          size_t dst_shard_idx, size_t dst_offset_bytes,
+                          size_t size_bytes);
+
   // Pushes a vector of buffers to multiple peers.
   absl::Status PushBuffers(const std::vector<BufferPushTask>& tasks,
                            int parallelism, uint64_t uuid);

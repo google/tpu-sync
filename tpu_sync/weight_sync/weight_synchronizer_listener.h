@@ -18,10 +18,12 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <utility>
 
 #include "tpu_sync/common/control_pipe/control_pipe_server.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/weight_sync/swarm_service.h"
 
 namespace tpu_raiden {
 namespace weight_sync {
@@ -30,11 +32,14 @@ class WeightSynchronizerBase;
 
 // Control-Plane Server Daemon that runs natively in C++ to accept management
 // RPC commands (like PushWeights and Shutdown) directly via ControlPipeServer.
+// Can host an installed SwarmService to dispatch localized bundle pull and
+// token coordination directly.
 class WeightSynchronizerListener final {
  public:
   WeightSynchronizerListener(
       WeightSynchronizerBase* engine, int listener_port,
-      ControlPipeBackendType backend_type = ControlPipeBackendType::kTcp);
+      ControlPipeBackendType backend_type = ControlPipeBackendType::kTcp,
+      std::shared_ptr<SwarmService> swarm_service = nullptr);
   ~WeightSynchronizerListener();
 
   WeightSynchronizerListener(const WeightSynchronizerListener&) = delete;
@@ -45,6 +50,12 @@ class WeightSynchronizerListener final {
   bool is_active() const { return !stopping_.load(); }
 
   void Shutdown();
+
+  std::shared_ptr<SwarmService> swarm_service() const { return swarm_service_; }
+
+  // Dispatches an inbound ControlRequest to either SwarmService or engine.
+  void ExecuteRequest(const ::tpu_sync::rpc::ControlRequest& req,
+                      ::tpu_sync::rpc::ControlResponse* resp);
 
   // Executes a single ControlRequest against |engine| and populates |resp|.
   // Invokes |shutdown_callback| if a COMMAND_SHUTDOWN request is processed.
@@ -59,6 +70,7 @@ class WeightSynchronizerListener final {
   int listener_port_ = 0;
   std::atomic<bool> stopping_{false};
 
+  std::shared_ptr<SwarmService> swarm_service_;
   std::unique_ptr<ControlPipeServer> pipe_server_;
 };
 

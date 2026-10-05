@@ -295,6 +295,19 @@ absl::Status RaidenManagerBase::PushWeightsChunk(
                              dst_offset_bytes, data_ptr, size_bytes, uuid);
 }
 
+absl::Status RaidenManagerBase::PullBuffer(
+    absl::string_view peer, size_t buffer_id, size_t src_shard_idx,
+    size_t src_offset_bytes, size_t dst_shard_idx, size_t dst_offset_bytes,
+    size_t size_bytes) {
+  RAIDEN_TRACE_FN("RaidenBase::PullBuffer", [&]() {
+    return absl::StrCat("peer=", peer, " layer=", buffer_id,
+                        " src_shard=", src_shard_idx,
+                        " dst_shard=", dst_shard_idx, " bytes=", size_bytes);
+  });
+  return server_->PullBuffer(peer, buffer_id, src_shard_idx, src_offset_bytes,
+                             dst_shard_idx, dst_offset_bytes, size_bytes);
+}
+
 absl::Status RaidenManagerBase::PushWeightsChunks(
     const std::vector<transport::BufferPushTask>& tasks, int parallelism,
     uint64_t uuid) {

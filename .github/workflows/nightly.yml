@@ -1,0 +1,113 @@
+# Copyright 2026 Google LLC.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Nightly CPU build + unit tests on linux-x86-n2-32: builds the JAX extension,
+# runs the OSS-safe non-device unit tests, and builds the tpu_raiden_jax wheel
+# (twine-checked) as a packaging smoke test. Also runs on push to main and on
+# demand. Files a tracking issue on failure. TPU device coverage lives in
+# device_test.yml (v5e); the torch wheel needs a torch_tpu checkout and is out of
+# scope. See .github/README.md.
+
+name: CI - Nightly (CPU)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 9 * * *"  # 1 AM PST daily. Scheduled workflows run in UTC.
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'main' }}
+
+env:
+  CPU_TEST_TARGETS: >-
+    //kv_cache:logical_block_manager_test
+    //kv_cache:lru_cache_test
+    //tpu_raiden/frameworks/jax:resharding_planner_test
+
+jobs:
+  build_and_test:
+    name: "Nightly build + unit tests (CPU)"
+    runs-on: linux-x86-n2-32
+    container:
+      image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fix Git workspace ownership
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install clang-18
+        run: ./ci/tools/install_clang18.sh
+
+      - name: Build JAX extension
+        run: ./build.sh jax
+
+      - name: Run CPU unit tests
+        env:
+          RAIDEN_REMOTE_CACHE: "https://storage.googleapis.com/tpu-raiden-bazel-cache"
+          RAIDEN_REMOTE_UPLOAD: "true"
+        run: ./ci/tools/bazel_test.sh jax -- ${CPU_TEST_TARGETS}
+
+      - name: Build tpu_raiden_jax wheel (packaging smoke)
+        run: |
+          export WHEEL_VERSION_EXTRAS=".dev$(date +%Y%m%d%H%M%S)"
+          echo "WHEEL_VERSION_EXTRAS=$WHEEL_VERSION_EXTRAS"
+          ./build.sh jax //ci/wheel:raiden_jax_wheel \
+            --repo_env=WHEEL_VERSION_EXTRAS="$WHEEL_VERSION_EXTRAS"
+          mkdir -p dist
+          cp bazel-bin/ci/wheel/tpu_raiden_jax-*.whl dist/
+          ls -lh dist
+
+      - name: Check wheel metadata
+        run: uv run --isolated --with twine twine check dist/*.whl
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tpu_raiden_jax_wheel
+          path: dist/*.whl
+          retention-days: 14
+
+      - name: Upload test logs on failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: bazel-testlogs-nightly
+          path: bazel-testlogs/
+          retention-days: 7
+
+  notify_failure:
+    name: Notify failed runs
+    needs: [build_and_test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get current date
+        id: date
+        if: contains(needs.build_and_test.result, 'failure') && github.event_name != 'pull_request'
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+      - name: File a tracking issue on failure
+        if: contains(needs.build_and_test.result, 'failure') && github.event_name != 'pull_request'
+        uses: jayqi/failed-build-issue-action@1a893bbf43ef1c2a8705e2b115cd4f0fe3c5649b  # v1.2.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          label-name: "ci:nightly-failed"
+          title-template: "Failed Nightly build (${{ steps.date.outputs.date }})"

@@ -18,7 +18,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <future>
+#include <future>  // NOLINT(build/c++11)
 #include <memory>
 #include <optional>
 #include <string>
@@ -34,17 +34,14 @@
 #include "absl/time/time.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
+#include "tpu_sync/common/control_pipe/control_pipe_client.h"
+#include "tpu_sync/common/detached_thread_group.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/lib/test_only_rate_limiter.h"
-
-namespace tpu_sync {
-namespace rpc {
-class StartTransferRequest;
-}  // namespace rpc
-}  // namespace tpu_sync
 
 namespace tpu_raiden {
 class HostMemoryAllocator;
@@ -85,6 +82,7 @@ struct WeightSyncMetrics {
 };
 
 class WeightSynchronizerListener;
+class WeightSynchronizerTestPeer;
 
 class WeightSynchronizerControlDelegate {
  public:
@@ -325,6 +323,12 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
                                    uint64_t uuid = 0) override;
   absl::Status OnDataReceived(uint64_t uuid = 0) override;
 
+  // Starts an asynchronous bundle pull worker for |request| that acquires
+  // bundle tokens from the controller, pulls variable bundles from promoted
+  // sampler replicas, and registers each bundle upon completion.
+  virtual absl::Status StartBundlePullTransfer(
+      const tpu_sync::rpc::StartTransferRequest& request);
+
   virtual absl::Status WaitForTransferCompletion(uint64_t uuid = 0);
   virtual void DrainPendingH2d();
 
@@ -361,6 +365,50 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   }
 
  private:
+  friend class WeightSynchronizerTestPeer;
+
+  struct InFlightBundle {
+    int32_t bundle_index = -1;
+    std::string source_id;
+    tpu_sync::rpc::VariableBundleSpecProto spec;
+    std::vector<std::future<absl::Status>> futures;
+    size_t total_bytes = 0;
+  };
+
+  // Retrieves or creates a pooled ControlPipeClient connected to
+  // |controller_address|. Thread-safe.
+  ControlPipeClient* GetOrCreateControlPipeClient(
+      const std::string& controller_address);
+
+  // Requests a bundle pull token from the controller at |controller_address|
+  // for the remaining needed bundles specified in |needed_bundles|.
+  absl::StatusOr<tpu_sync::rpc::AcquireBundlePullTokenResponse>
+  AcquirePullToken(const std::string& controller_address,
+                   absl::string_view req_id, uint64_t uuid,
+                   const tpu_sync::rpc::RaidenIdProto& dst_unit,
+                   int32_t host_idx, absl::Span<const int32_t> needed_bundles,
+                   absl::string_view failed_source_replica_id);
+
+  // Asynchronously schedules shard pulls for |spec| against the source endpoint
+  // specified in |token| across the worker thread pool.
+  InFlightBundle LaunchBundlePull(
+      const tpu_sync::rpc::VariableBundleSpecProto& spec,
+      const tpu_sync::rpc::AcquireBundlePullTokenResponse& token);
+
+  // Awaits completion of all in-flight shard transfer futures within |bundle|.
+  absl::Status WaitForBundle(InFlightBundle& bundle);
+
+  // Notifies the controller at |controller_address| that |bundle_index| has
+  // been successfully received and staged for serving.
+  absl::Status RegisterBundleAvailability(
+      const std::string& controller_address, absl::string_view req_id,
+      uint64_t uuid, const tpu_sync::rpc::RaidenIdProto& unit, int32_t host_idx,
+      int32_t bundle_index);
+
+  // Main background worker loop executing bundle pull token acquisition,
+  // multi-shard transfer pipelining, and arrival registrations for |request|.
+  void ExecuteBundlePullTransfer(tpu_sync::rpc::StartTransferRequest request);
+
   WeightSynchronizerControlDelegate* control_delegate_ = nullptr;
   std::vector<int64_t> global_shard_indices_;
   std::vector<int> local_shard_indices_;
@@ -457,6 +505,13 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   mutable absl::Mutex completed_transfers_mu_;
   absl::flat_hash_set<uint64_t> completed_transfers_
       ABSL_GUARDED_BY(completed_transfers_mu_);
+
+  mutable absl::Mutex control_client_mu_;
+  absl::flat_hash_map<std::string, std::unique_ptr<ControlPipeClient>>
+      control_pipe_clients_ ABSL_GUARDED_BY(control_client_mu_);
+
+  std::atomic<bool> shutting_down_{false};
+  DetachedThreadGroup pull_thread_group_{"weight_sync_bundle_pull"};
 
   std::optional<size_t> pipeline_group_size_override_;
   void UpdateAllocatedOccupancyMetric(size_t delta = 0);

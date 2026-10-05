@@ -118,8 +118,7 @@ class RawBufferTransport final {
 
   // Synchronously pulls a buffer identified by `buffer_id` from the remote
   // `peer`, by sending out a `kOpBufferPull ChunkHeader` and then receiving
-  // the data from the peer.
-  // Note: This function is only used in RawBufferTransportTest, nowhere else.
+  // the data from the peer. Used by BlockTransport::PullBuffer.
   absl::Status PullBuffer(absl::string_view peer, size_t buffer_id,
                           size_t src_shard_idx, size_t src_offset_bytes,
                           size_t dst_shard_idx, size_t dst_offset_bytes,

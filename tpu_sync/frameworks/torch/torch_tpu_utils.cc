@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -131,10 +132,19 @@ UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
 
   // Return the buffer AND the owning base ref. The ref pins the storage buffer
   // backing the tensor for as long as the caller keeps it (manager lifetime /
-  // transfer future), so the raw PjRtBuffer* stays valid.
+  // transfer future), so the raw PjRtBuffer* stays valid. The raw alias owns
+  // the ref too: the ref also holds the PJRT client, which outlives
+  // torch_tpu's own reference at exit, so whichever of the caller and the
+  // alias is destroyed last, the alias is destroyed before the client.
+  auto ref =
+      std::make_shared<torch_tpu::TensorBufferHandle>(std::move(base_ref));
+  raiden::RaidenBufferHandle handle = std::move(handle_or.value());
+  if (handle.c_hold) {
+    handle.c_hold->owner = ref;
+  }
   return UnpackedTensor{
-      .buffer = std::move(handle_or.value()),
-      .ref = std::move(base_ref),
+      .buffer = std::move(handle),
+      .ref = std::move(ref),
       .logical_dimensions = TensorDimensions(tensor),
       .logical_slice_byte_size = logical_slice_byte_size,
       .logical_physical_size = logical_physical_size,

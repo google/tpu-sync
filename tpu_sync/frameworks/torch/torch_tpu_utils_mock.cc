@@ -16,7 +16,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -70,12 +69,12 @@ UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
   // back.
   if (tensor.dim() == 0 || tensor.size(0) <= 0) {
     return UnpackedTensor{.buffer = std::move(handle_or.value()),
-                          .ref = std::nullopt};
+                          .ref = nullptr};
   }
   const size_t logical_physical_size = static_cast<size_t>(tensor.nbytes());
   return UnpackedTensor{
       .buffer = std::move(handle_or.value()),
-      .ref = std::nullopt,
+      .ref = nullptr,
       .logical_dimensions = TensorDimensions(tensor),
       .logical_slice_byte_size =
           logical_physical_size / static_cast<size_t>(tensor.size(0)),

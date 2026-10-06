@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
@@ -38,7 +39,7 @@ namespace torch {
 // use it (e.g. store it in a member / attach it to the transfer future).
 struct UnpackedTensors {
   std::vector<std::vector<raiden::RaidenBufferHandle>> buffers;
-  std::vector<torch_tpu::TensorBufferHandle> refs;
+  std::vector<std::shared_ptr<torch_tpu::TensorBufferHandle>> refs;
   std::vector<int64_t> logical_dimensions;
   size_t logical_slice_byte_size = 0;
   size_t logical_physical_size = 0;

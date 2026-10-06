@@ -68,6 +68,7 @@ cc_library(
     hdrs = ["worker_service_server.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":worker_service_client",
         ":worker_service_impl",
         "//tpu_sync/core:host_memory_allocator",
         "//tpu_sync/core:kv_manager_holder",
@@ -143,7 +144,6 @@ cc_library(
         ":worker_service_client",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/proto:worker_service_cc_proto",
-        "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/functional:any_invocable",
@@ -309,10 +309,12 @@ cc_test(
     deps = [
         ":worker_service_client",
         ":worker_service_server",
+        "//tpu_sync/proto:transfer_program_cc_proto",
         "//tpu_sync/proto:worker_service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ],

@@ -23,6 +23,7 @@
 #include "absl/synchronization/mutex.h"
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/server_builder.h"
+#include "tpu_sync/core/controller/worker_service_client.h"
 #include "tpu_sync/core/controller/worker_service_impl.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/kv_manager_holder.h"
@@ -67,6 +68,11 @@ absl::Status WorkerServiceServer::StartServer(
 
   std::string server_address = absl::StrCat("[::]:", port);
   grpc::ServerBuilder builder;
+  // SubmitTransferProgram carries the fully expanded copy plan (one
+  // TransferStep per live chunk, every source rank for receiver arms); long
+  // prefills exceed gRPC's 4 MiB default. Match the control-plane channels.
+  builder.SetMaxReceiveMessageSize(kMaxWorkerServiceMessageBytes);
+  builder.SetMaxSendMessageSize(kMaxWorkerServiceMessageBytes);
   int selected_port = 0;
   builder.AddListeningPort(server_address, grpc::InsecureServerCredentials(),
                            &selected_port);

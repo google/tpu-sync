@@ -21,9 +21,11 @@
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
 #include "tpu_sync/core/controller/worker_service_client.h"
+#include "tpu_sync/proto/transfer_program.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 
 namespace tpu_raiden {
@@ -76,6 +78,53 @@ TEST(WorkerServiceServerTest, StartServerWithInvalidPortFails) {
   absl::Status status =
       server.StartServer(/*host_allocator=*/nullptr, /*port=*/-1);
   EXPECT_THAT(status, StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST(WorkerServiceServerTest, SubmitTransferProgramAcceptsMessagesOver4MiB) {
+  std::unique_ptr<WorkerServiceServer> server = WorkerServiceServer::Create();
+  ABSL_ASSERT_OK(server->StartServer(/*host_allocator=*/nullptr, /*port=*/0));
+  const std::string server_address =
+      "localhost:" + std::to_string(server->GetRaidenWorkerPort());
+  WorkerServiceClient client(CreateWorkerServiceChannel(server_address));
+
+  ::tpu_sync::proto::TransferProgramRequest req;
+  req.mutable_envelope()->set_uuid(1);
+  req.mutable_envelope()->set_req_id("large_prefill_req");
+  req.mutable_envelope()->set_kind(
+      ::tpu_sync::proto::TRANSFER_KIND_POOL_RESHARD);
+  req.mutable_envelope()->set_role(
+      ::tpu_sync::proto::TRANSFER_ROLE_RECEIVER_ARM);
+  auto* program = req.mutable_program();
+  program->mutable_reshard()->add_transfer_pool_indices(0);
+  auto* group = program->mutable_completion()->mutable_fan_in()->add_groups();
+  group->add_pool_indices(0);
+  group->add_dst_device_block_ids(0);
+  group->set_expected_pushes(1);
+
+  // ~130k steps (~7 MiB serialized) reproduces the 6.66 MiB 519k-token
+  // receiver-arm program that exceeded gRPC's 4 MiB default.
+  constexpr int kNumSteps = 130000;
+  program->mutable_steps()->Reserve(kNumSteps);
+  for (int i = 0; i < kNumSteps; ++i) {
+    auto* step = program->add_steps();
+    step->mutable_src()->set_block_id(i % 1024);
+    step->mutable_dst()->set_block_id(i % 1024);
+    auto* extent = step->add_extents();
+    extent->set_src_offset_bytes(i * 4096);
+    extent->set_dst_offset_bytes(i * 4096);
+    extent->set_size_bytes(4096);
+    extent->set_count(1);
+    step->set_dst_peer("10.0.0.1:50051");
+    step->set_group(0);
+    step->set_source_rank(i % 8);
+  }
+  ASSERT_GT(req.ByteSizeLong(), 6 * 1024 * 1024);
+
+  absl::StatusOr<::tpu_sync::proto::TransferProgramResponse> resp =
+      client.SubmitTransferProgram(req).Await();
+  ABSL_ASSERT_OK(resp);
+  EXPECT_FALSE(resp->success());
+  EXPECT_EQ(resp->message(), "Transfer manager is not initialized");
 }
 
 }  // namespace

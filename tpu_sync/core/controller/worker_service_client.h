@@ -16,8 +16,10 @@
 #define THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_CORE_CONTROLLER_WORKER_SERVICE_CLIENT_H_
 
 #include <memory>
+#include <string>
 
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "grpcpp/channel.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/proto/worker_service.grpc.pb.h"
@@ -25,6 +27,22 @@
 
 namespace tpu_raiden {
 namespace controller {
+
+// Upper bound on a single WorkerService message in either direction. gRPC's
+// 4 MiB default is too small for SubmitTransferProgram: the request carries
+// the fully expanded copy plan (one TransferStep per live chunk, and every
+// source rank's schedule for receiver arms), which a long prefill pushes past
+// that limit. Matches the control-plane channels in
+// core/grpc_control_plane_backend.cc; the server and every client channel
+// MUST agree on this value.
+inline constexpr int kMaxWorkerServiceMessageBytes = 64 * 1024 * 1024;
+
+// Creates an insecure channel to the WorkerService at |endpoint| with the
+// message-size limits set to kMaxWorkerServiceMessageBytes. All WorkerService
+// client channels should be created through this so the limits stay in sync
+// with WorkerServiceServer.
+std::shared_ptr<grpc::Channel> CreateWorkerServiceChannel(
+    absl::string_view endpoint);
 
 // Client for interacting with the WorkerService gRPC endpoint on a transfer
 // worker asynchronously.

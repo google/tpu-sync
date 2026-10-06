@@ -28,8 +28,6 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
-#include "grpcpp/create_channel.h"
-#include "grpcpp/security/credentials.h"
 #include "tpu_sync/core/controller/worker_service_client.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 
@@ -52,11 +50,10 @@ absl::Status WorkerRegistry::RegisterWorker(const WorkerRegistration& reg) {
   WorkerRegistration entry = reg;
   if (entry.worker_service_client == nullptr &&
       !entry.raiden_worker_endpoint.empty()) {
-    auto channel = grpc::CreateChannel(entry.raiden_worker_endpoint,
-                                       grpc::InsecureChannelCredentials());
     entry.worker_service_client =
         std::make_shared<::tpu_raiden::controller::WorkerServiceClient>(
-            std::move(channel));
+            ::tpu_raiden::controller::CreateWorkerServiceChannel(
+                entry.raiden_worker_endpoint));
   }
 
   absl::MutexLock lock(mutex_);

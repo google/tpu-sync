@@ -15,12 +15,18 @@
 #include "tpu_sync/core/controller/worker_service_client.h"
 
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "grpcpp/channel.h"
 #include "grpcpp/client_context.h"
+#include "grpcpp/create_channel.h"
+#include "grpcpp/security/credentials.h"
+#include "grpcpp/support/channel_arguments.h"
 #include "grpcpp/support/status.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/trace.h"
@@ -29,6 +35,15 @@
 
 namespace tpu_raiden {
 namespace controller {
+
+std::shared_ptr<grpc::Channel> CreateWorkerServiceChannel(
+    absl::string_view endpoint) {
+  grpc::ChannelArguments args;
+  args.SetMaxReceiveMessageSize(kMaxWorkerServiceMessageBytes);
+  args.SetMaxSendMessageSize(kMaxWorkerServiceMessageBytes);
+  return grpc::CreateCustomChannel(std::string(endpoint),
+                                   grpc::InsecureChannelCredentials(), args);
+}
 
 WorkerServiceClient::WorkerServiceClient(std::shared_ptr<grpc::Channel> channel)
     : stub_(::tpu_sync::proto::WorkerService::NewStub(channel)) {}

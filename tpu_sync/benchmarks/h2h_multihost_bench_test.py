@@ -835,6 +835,27 @@ class H2hMultihostBenchTest(absltest.TestCase):
       self.assertEqual(int(float(r['total_bytes'])), 512 * 32 * 1048576,
                        'total_bytes in %r%s' % (r, local.describe()))
 
+  def test_committed_baselines_json_valid(self):
+    path = os.path.join(_HERE, 'h2h_multihost_baselines.json')
+    self.assertTrue(os.path.exists(path), 'missing %s' % path)
+    with open(path) as f:
+      baselines = json.load(f)
+    for key in _BASELINE_KEYS:
+      self.assertIn(key, baselines, 'missing %r in %s' % (key, baselines))
+    self.assertEqual(baselines['contract_version'], 2)
+    configs = baselines['configs']
+    for label in ('1048576B_x64_P1', '2097152B_x64_P1'):
+      self.assertIn(label, configs)
+      cfg = configs[label]
+      for key in _BASELINE_CFG_KEYS:
+        self.assertIn(key, cfg, '%s missing %r: %s' % (label, key, cfg))
+      self.assertGreater(cfg['floor_gbs'], 0.0)
+      self.assertLess(cfg['floor_gbs'], cfg['baseline_gbs'])
+      self.assertIs(cfg['integrity'], True)
+      self.assertIs(cfg['suitable'], True)
+    for label in ('1048576B_x64_P8', '1048573B_x64_P4'):
+      self.assertNotIn(label, configs)
+
 
 if __name__ == '__main__':
   absltest.main()

@@ -2,18 +2,45 @@
   "_comment": [
     "Cross-host H2H gate floors. Regenerate on the multi-host runner with the",
     "h2h_multihost_record workflow (bazel target //tpu_sync/benchmarks:h2h_multihost_bench",
-    "--stage=record --iters=<large> --runs_per_config=<several>), download",
-    "h2h_multihost_baselines.json from the run's artifacts and commit it here.",
+    "--stage=record --iters=200 --runs_per_config=3 --max_margin=0.10), download",
+    "h2h_multihost_baselines.json from the run's artifacts, keep only P=1",
+    "configs, and commit it here.",
     "",
     "  sigma_k / max_margin : floor = max(median - sigma_k * MAD_sigma, median * (1 - max_margin))",
     "  configs[label]       : baseline_gbs (median when recorded, reference only),",
     "                         floor_gbs (THE GATE THRESHOLD), integrity, n_samples",
     "",
-    "Empty configs => the gate checks byte-integrity only and prints NO FLOOR."
+    "Only P=1 configs carry throughput floors (max_margin = 0.10). P > 1 gate",
+    "configs (1048576B_x64_P8, 1048573B_x64_P4) are intentionally omitted from",
+    "configs so the gate enforces cross-host byte-integrity (NO FLOOR) without",
+    "flapping on multi-stream TCP 5-tuple flow hashing variance across GKE pods."
   ],
+  "contract_version": 2,
   "sigma_k": 3.5,
-  "max_margin": 0.05,
-  "iters": 0,
-  "runs_per_config": 0,
-  "configs": {}
+  "max_margin": 0.10,
+  "iters": 200,
+  "runs_per_config": 3,
+  "gate_iters": 50,
+  "configs": {
+    "1048576B_x64_P1": {
+      "baseline_gbs": 1.353,
+      "floor_gbs": 1.218,
+      "floor_uncapped_gbs": 1.181,
+      "p_below_floor": 0.0,
+      "suitable": true,
+      "integrity": true,
+      "n_samples": 600,
+      "active_ifaces": 1
+    },
+    "2097152B_x64_P1": {
+      "baseline_gbs": 1.356,
+      "floor_gbs": 1.228,
+      "floor_uncapped_gbs": 1.228,
+      "p_below_floor": 0.0,
+      "suitable": true,
+      "integrity": true,
+      "n_samples": 600,
+      "active_ifaces": 1
+    }
+  }
 }

@@ -632,7 +632,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@torch_tpu//shims/torch:aten_headers",
-        "@xla//xla/pjrt:pjrt_client",
+        "//tpu_sync/core:xla_raw_transfer_headers",
     ],
 )
 

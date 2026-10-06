@@ -105,7 +105,7 @@ CreateDefaultOffloaderPlatform(xla::PjRtClient* client) {
 struct KVCacheOffloader::DeviceState {
   struct Layer {
     at::Tensor tensor;
-    std::optional<torch_tpu::DeviceBufferRef> ref;
+    std::optional<torch_tpu::TensorBufferHandle> ref;
     raiden::BufferHoldAndAlias buffer;
   };
 

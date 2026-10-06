@@ -859,14 +859,38 @@ TEST(SocketTransportAdapterTest, DefaultTimeoutsWhenEnvUnset) {
   auto cleanup = absl::MakeCleanup([] {
     unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S");
     unsetenv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S");
   });
   unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S");
   unsetenv("TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S");
+  unsetenv("TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S");
+  unsetenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S");
 
   RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
-  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
-  EXPECT_EQ(client_adapter.handshake_ack_read_timeout(), std::nullopt);
-  EXPECT_EQ(client_adapter.final_ack_read_timeout(), std::nullopt);
+  {
+    SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+    EXPECT_EQ(client_adapter.handshake_ack_read_timeout(), std::nullopt);
+    EXPECT_EQ(client_adapter.final_ack_read_timeout(), std::nullopt);
+    EXPECT_EQ(client_adapter.handshake_write_timeout(), std::nullopt);
+    EXPECT_EQ(client_adapter.payload_write_timeout(), std::nullopt);
+  }
+
+  setenv("TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S", "-1", 1);
+  setenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S", "invalid", 1);
+  {
+    SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+    EXPECT_EQ(client_adapter.handshake_write_timeout(), std::nullopt);
+    EXPECT_EQ(client_adapter.payload_write_timeout(), std::nullopt);
+  }
+
+  setenv("TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S", "1.5", 1);
+  setenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S", "2.5", 1);
+  {
+    SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+    EXPECT_EQ(client_adapter.handshake_write_timeout(), absl::Seconds(1.5));
+    EXPECT_EQ(client_adapter.payload_write_timeout(), absl::Seconds(2.5));
+  }
 }
 
 TEST(SocketTransportAdapterTest, PushTimesOutWhenHandshakeNeverResponds) {
@@ -918,6 +942,76 @@ TEST(SocketTransportAdapterTest, PushTimesOutWhenHandshakeNeverResponds) {
               StatusIs(absl::StatusCode::kDeadlineExceeded,
                        ::testing::HasSubstr("timed out")));
   EXPECT_LT(absl::Now() - start, absl::Seconds(1));
+}
+
+TEST(SocketTransportAdapterTest, PushTimesOutWhenPayloadWriteStalls) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S", "0.1", 1);
+
+  auto server_handler = [](int client_fd,
+                           const ChunkHeader& header) -> absl::Status {
+    int rcvbuf = 4096;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    if (header.op != 1) {
+      return absl::InvalidArgumentError("Expected op 1");
+    }
+    std::vector<int> allocated_ids(header.count_or_size, 100);
+    const std::vector<uint8_t> s_ids = SerializeBlockIds(allocated_ids);
+    if (auto s = ::peregrine::WriteExact(client_fd, s_ids.data(), s_ids.size());
+        !s.ok()) {
+      return s;
+    }
+    absl::SleepFor(absl::Milliseconds(600));
+    return absl::OkStatus();
+  };
+
+  RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{}, server_handler);
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0);
+  const std::string peer = GetIpPort(server_transport);
+  {
+    auto borrowed_fd = client_transport.BorrowConnection(peer);
+    ASSERT_THAT(borrowed_fd.status(), absl_testing::IsOk());
+    int sndbuf = 4096;
+    ASSERT_EQ(setsockopt(*borrowed_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf,
+                         sizeof(sndbuf)),
+              0);
+    client_transport.ReturnConnection(/*ok_to_pool=*/true, *borrowed_fd, peer);
+  }
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+
+  std::vector<uint8_t> test_data(16 * 1024 * 1024, 1);
+  Request req = {};
+  req.socket_opcode = 1;
+  req.laddr = test_data.data();
+  req.len = test_data.size();
+  req.count_or_size = 1;
+  req.uuid = 43;
+  req.parallelism = 1;
+  req.request_id = 0;
+  req.stream_idx = 0;
+
+  absl::Notification done;
+  absl::StatusOr<std::vector<int>> push_result;
+  const int src_bid = 10;
+  const absl::Time start = absl::Now();
+  auto handle = client_adapter.Post(
+      /*peers=*/{peer},
+      /*requests=*/absl::MakeConstSpan(&req, 1),
+      /*src_block_ids=*/absl::MakeConstSpan(&src_bid, 1),
+      /*dst_block_ids=*/{}, [&](absl::StatusOr<std::vector<int>> res) {
+        push_result = std::move(res);
+        done.Notify();
+      });
+
+  ASSERT_THAT(handle.status(), absl_testing::IsOk());
+  EXPECT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_FALSE(push_result.ok());
+  EXPECT_THAT(push_result.status(),
+              StatusIs(absl::StatusCode::kDeadlineExceeded,
+                       ::testing::HasSubstr("timed out")));
+  EXPECT_LT(absl::Now() - start, absl::Seconds(2));
 }
 
 }  // namespace

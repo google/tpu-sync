@@ -16,8 +16,7 @@
 
 Runs the C++ h2h_benchmark_runner between two hosts of a BAP multi-host job.
 BAP's multi-host runner executes this same target on every host of the slice
-(one JobSet pod per host, JOB_COMPLETION_INDEX = 0..N-1, a shared job
-directory mounted on all of them). Roles:
+(one JobSet pod per host, JOB_COMPLETION_INDEX = 0..N-1). Roles:
 
   worker 0  sender   -- also BAP's "primary": the only host whose artifacts
                         and TensorBoard events get uploaded, so all reporting
@@ -28,7 +27,11 @@ directory mounted on all of them). Roles:
   others    idle     -- write a done-marker and exit 0.
 
 Peer discovery, in order: --peers, TPU_WORKER_HOSTNAMES, or a rendezvous file
-the receiver drops into the shared job directory (--rendezvous_dir).
+(receiver.json) the receiver drops into a shared --rendezvous_dir. When the
+receiver is discovered via receiver.json, the sender also waits for done
+markers from the other workers before exiting; when peers come from the hosts
+list (e.g. Kubernetes JobSets with per-pod workspaces), completion is
+synchronized over the TCP verdict exchange and no done-marker wait happens.
 
 Stages:
   analyze  collect the throughput distribution per config, write CSV + summary
@@ -93,9 +96,10 @@ _GATE_ITERS = flags.DEFINE_integer(
 _WORKER_ID = flags.DEFINE_integer('worker_id', -1,
                                   'This host index; overrides the env.')
 _NUM_WORKERS = flags.DEFINE_integer(
-    'num_workers', -1, 'Host count. When >= 2 and a rendezvous dir exists, '
-    'the sender waits for every other worker\'s done-marker before exiting '
-    '(BAP deletes the shared job dir when the primary finishes).')
+    'num_workers', -1, 'Host count. When >= 2 and the rendezvous dir was used '
+    'for peer discovery, the sender waits for every other worker\'s '
+    'done-marker before exiting (BAP deletes the shared job dir when the '
+    'primary finishes).')
 _PEERS = flags.DEFINE_string(
     'peers', '', 'Comma-separated host list, index-aligned with worker ids; '
     'overrides TPU_WORKER_HOSTNAMES.')
@@ -1078,6 +1082,7 @@ def main(_):
         f'iters={_ITERS.value} runs_per_config={max(1, _RUNS.value)} '
         f'runner={cc}', flush=True)
 
+  used_rendezvous = False
   if mode == 'spmd':
     if worker_id == _RECEIVER_IDX.value:
       sys.exit(_run_receiver(cc, configs, worker_id, own_ip))
@@ -1102,6 +1107,7 @@ def main(_):
               file=sys.stderr)
         sys.exit(1)
       peer_ip, peer_port = info['ip'], int(info.get('peer_port', peer_port))
+      used_rendezvous = True
     results, _, aborted = _run_sender(cc, configs, peer_ip, peer_port)
     verdicts = {}
     if aborted:
@@ -1150,7 +1156,15 @@ def main(_):
     n = _NUM_WORKERS.value if _NUM_WORKERS.value > 0 else len(hosts)
     others = [w for w in range(n) if w != worker_id]
     if len(others) >= 1 and rdir:
-      _await_done(rdir, others, _STARTUP_TIMEOUT_S.value)
+      # Reading receiver.json from rdir is what proves rdir is shared across
+      # hosts; on Kubernetes JobSets each pod has an isolated workspace and
+      # peers come from the hosts list, while completion is already synchronized
+      # over the TCP VERDICTS exchange.
+      if used_rendezvous:
+        _await_done(rdir, others, _STARTUP_TIMEOUT_S.value)
+      else:
+        print('[barrier] skipping done-marker wait (receiver discovered via '
+              'hosts list; rendezvous dir not verified shared).', flush=True)
   sys.exit(rc)
 
 

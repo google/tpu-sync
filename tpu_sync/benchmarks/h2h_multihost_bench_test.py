@@ -750,16 +750,18 @@ class H2hMultihostBenchTest(absltest.TestCase):
     self._assert_samples(header, rows, _LABELS, _RUNS * _ITERS, ctx)
 
   def test_sender_waits_for_done_markers(self):
-    # (q) With a rendezvous dir and --num_workers=2 the sender leaves only
-    # after worker 1 wrote its done marker.
+    # (q) When the receiver is discovered via receiver.json in the rendezvous
+    # dir and --num_workers=2, the sender leaves only after worker 1 wrote its
+    # done marker.
     control_port, peer_port = self._ports()
     rdv = os.path.join(self.out_dir, 'rdv')
     args = self._args('analyze', control_port, peer_port)
-    args += [_PEERS, '--rendezvous_dir=%s' % rdv]
+    args.append('--rendezvous_dir=%s' % rdv)
     sender, receiver = self._run_pair(args)
     ctx = _dump(sender, receiver)
     self._assert_rc(sender, 0, receiver)
     self._assert_rc(receiver, 0, sender)
+    self._assert_in_output('[rendezvous] found', sender, receiver)
     done = os.path.join(rdv, 'worker_1.done')
     self.assertTrue(os.path.exists(done), 'missing %s%s' % (done, ctx))
     with open(done) as f:
@@ -768,8 +770,33 @@ class H2hMultihostBenchTest(absltest.TestCase):
     self.assertEqual(marker.get('attempt'), '', '%s%s' % (marker, ctx))
     self.assertIsInstance(marker.get('ts'), float, '%s%s' % (marker, ctx))
     self._assert_in_output('[barrier] all workers done.', sender, receiver)
+    self._assert_not_in_output('[barrier] skipping done-marker wait', sender,
+                               receiver)
     self._assert_not_in_output('never wrote a done marker', sender, receiver)
     self.assertFalse(os.path.exists(os.path.join(rdv, 'worker_0.done')), ctx)
+
+  def test_sender_with_peers_skips_done_markers(self):
+    # When peers come from the hosts list (--peers / TPU_WORKER_HOSTNAMES), the
+    # rendezvous dir is not verified shared across pods, so the sender must not
+    # block on done markers from workers 1..N-1.
+    control_port, peer_port = self._ports()
+    rdv = os.path.join(self.out_dir, 'rdv')
+    startup_timeout_s = 120
+    args = self._args('analyze', control_port, peer_port, num_workers=4,
+                      startup_timeout_s=startup_timeout_s)
+    args += [_PEERS, '--rendezvous_dir=%s' % rdv]
+    start = time.monotonic()
+    sender, receiver = self._run_pair(args)
+    elapsed = time.monotonic() - start
+    ctx = _dump(sender, receiver)
+    self._assert_rc(sender, 0, receiver)
+    self._assert_rc(receiver, 0, sender)
+    self._assert_in_output('[barrier] skipping done-marker wait', sender,
+                           receiver)
+    self._assert_not_in_output('never wrote a done marker', sender, receiver)
+    self._assert_not_in_output('[barrier] all workers done.', sender, receiver)
+    self.assertLess(elapsed, startup_timeout_s / 2,
+                    'took %.1fs%s' % (elapsed, ctx))
 
   def test_receiver_aborts_without_sender(self):
     # (r) No sender ever contacts the receiver: it kills its runner after

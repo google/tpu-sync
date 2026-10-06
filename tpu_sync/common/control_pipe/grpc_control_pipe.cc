@@ -14,6 +14,8 @@
 
 #include "tpu_sync/common/control_pipe/grpc_control_pipe.h"
 
+#include <algorithm>
+
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <list>
@@ -336,13 +338,13 @@ bool GrpcControlPipeClient::TEST_HasCachedStub(
   return stubs_.contains(endpoint);
 }
 
-std::shared_ptr<control_pipe::proto::ControlPipeService::Stub>
-GrpcControlPipeClient::GetOrCreateStub(absl::string_view endpoint) {
+GrpcControlPipeClient::StubConnection
+GrpcControlPipeClient::GetOrCreateConnection(absl::string_view endpoint) {
   {
     absl::MutexLock lock(stub_mu_);
     if (auto it = stubs_.find(endpoint); it != stubs_.end()) {
       lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
-      return it->second.stub;
+      return it->second.connection;
     }
   }
 
@@ -360,10 +362,10 @@ GrpcControlPipeClient::GetOrCreateStub(absl::string_view endpoint) {
   absl::MutexLock lock(stub_mu_);
   if (auto it = stubs_.find(ep_str); it != stubs_.end()) {
     lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
-    return it->second.stub;
+    return it->second.connection;
   }
   if (config_.max_cached_grpc_stubs == 0) {
-    return stub;
+    return {channel, stub};
   }
   while (stubs_.size() >= config_.max_cached_grpc_stubs &&
          !lru_order_.empty()) {
@@ -371,8 +373,10 @@ GrpcControlPipeClient::GetOrCreateStub(absl::string_view endpoint) {
     lru_order_.pop_back();
   }
   lru_order_.push_front(ep_str);
-  stubs_.emplace(std::move(ep_str), StubCacheEntry{stub, lru_order_.begin()});
-  return stub;
+  StubConnection connection{channel, stub};
+  stubs_.emplace(std::move(ep_str),
+                 StubCacheEntry{connection, lru_order_.begin()});
+  return connection;
 }
 
 absl::StatusOr<control_pipe::proto::ControlResponseEnvelope>
@@ -380,18 +384,47 @@ GrpcControlPipeClient::SendRaw(
     absl::string_view endpoint,
     const control_pipe::proto::ControlEnvelope& envelope,
     absl::Duration timeout) {
+  return SendRawImpl(endpoint, envelope, timeout, std::nullopt);
+}
+
+absl::StatusOr<control_pipe::proto::ControlResponseEnvelope>
+GrpcControlPipeClient::SendRawWithConnectTimeout(
+    absl::string_view endpoint,
+    const control_pipe::proto::ControlEnvelope& envelope,
+    absl::Duration timeout, absl::Duration connect_timeout) {
+  if (connect_timeout <= absl::ZeroDuration()) {
+    return absl::InvalidArgumentError("connect_timeout must be positive");
+  }
+  return SendRawImpl(endpoint, envelope, timeout, connect_timeout);
+}
+
+absl::StatusOr<control_pipe::proto::ControlResponseEnvelope>
+GrpcControlPipeClient::SendRawImpl(
+    absl::string_view endpoint,
+    const control_pipe::proto::ControlEnvelope& envelope,
+    absl::Duration timeout, std::optional<absl::Duration> connect_timeout) {
   absl::Duration effective_timeout =
       timeout > absl::ZeroDuration() ? timeout : config_.default_timeout;
-
-  auto stub = GetOrCreateStub(endpoint);
+  const absl::Time start = absl::Now();
+  auto connection = GetOrCreateConnection(endpoint);
+  const absl::Time deadline = effective_timeout > absl::ZeroDuration()
+      ? (connect_timeout.has_value() ? start : absl::Now()) + effective_timeout
+      : absl::InfiniteFuture();
+  if (connect_timeout.has_value() &&
+      !connection.channel->WaitForConnected(absl::ToChronoTime(
+          std::min(deadline, absl::Now() + *connect_timeout)))) {
+    // Do not classify a SendControl failure this way: the remote handler may
+    // already own the transfer's blocks when its response is lost.
+    return absl::UnavailableError(absl::StrCat(
+        "Control RPC connection failed before sending request to ", endpoint));
+  }
   grpc::ClientContext ctx;
-  if (effective_timeout > absl::ZeroDuration() &&
-      effective_timeout < absl::InfiniteDuration()) {
-    ctx.set_deadline(absl::ToChronoTime(absl::Now() + effective_timeout));
+  if (deadline < absl::InfiniteFuture()) {
+    ctx.set_deadline(absl::ToChronoTime(deadline));
   }
 
   control_pipe::proto::ControlResponseEnvelope resp_env;
-  grpc::Status status = stub->SendControl(&ctx, envelope, &resp_env);
+  grpc::Status status = connection.stub->SendControl(&ctx, envelope, &resp_env);
   if (!status.ok()) {
     return GrpcStatusToAbsl(status);
   }

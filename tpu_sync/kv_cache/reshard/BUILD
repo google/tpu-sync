@@ -203,6 +203,7 @@ cc_test(
         "//tpu_sync/common/control_pipe:control_pipe_interfaces",
         "//tpu_sync/common/control_pipe:control_pipe_types",
         "//tpu_sync/proto:control_pipe_cc_proto",
+        "//tpu_sync/proto:control_pipe_cc_grpc",
         "//tpu_sync/rpc:controller_service_cc_proto",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/cleanup",
@@ -212,6 +213,7 @@ cc_test(
         "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@com_github_grpc_grpc//:grpc++",
     ],
 )
 
@@ -226,6 +228,7 @@ cc_library(
         ":reshard_control_pipe",
         "//tpu_sync/common:raiden_id",
         "//tpu_sync/common/control_pipe:control_pipe_interfaces",
+        "//tpu_sync/common/control_pipe:grpc_control_pipe",
         "//tpu_sync/rpc:controller_service_cc_proto",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/status",

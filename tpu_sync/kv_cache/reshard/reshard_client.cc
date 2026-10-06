@@ -26,6 +26,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
+#include "tpu_sync/common/control_pipe/grpc_control_pipe.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/reshard/reshard_control_pipe.h"
 #include "tpu_sync/rpc/controller_service.pb.h"
@@ -39,6 +40,19 @@ namespace {
 
 // Facade parity: connect_socket(address, timeout=300.0) per call.
 constexpr absl::Duration kCallTimeout = absl::Seconds(300);
+
+class RuntimeGrpcClient final : public GrpcControlPipeClient {
+ public:
+  using GrpcControlPipeClient::GrpcControlPipeClient;
+
+  absl::StatusOr<control_pipe::proto::ControlResponseEnvelope> SendRaw(
+      absl::string_view endpoint,
+      const control_pipe::proto::ControlEnvelope& envelope,
+      absl::Duration timeout) override {
+    return SendRawWithConnectTimeout(endpoint, envelope, timeout,
+                                     absl::Seconds(1));
+  }
+};
 
 tpu_sync::rpc::RaidenIdProto RaidenIdProtoOf(const RaidenId& unit) {
   tpu_sync::rpc::RaidenIdProto proto;
@@ -54,7 +68,13 @@ tpu_sync::rpc::RaidenIdProto RaidenIdProtoOf(const RaidenId& unit) {
 ReshardClient::ReshardClient(std::string address, ControlPipeClient* client)
     : address_(std::move(address)) {
   if (client == nullptr) {
-    owned_client_ = CreateReshardControlPipeClient();
+    ControlPipeConfig config;
+    config.backend_type = ResolveControlPipeBackendType(std::nullopt);
+    if (config.backend_type == ControlPipeBackendType::kGrpc) {
+      owned_client_ = std::make_unique<RuntimeGrpcClient>(config);
+    } else {
+      owned_client_ = CreateControlPipeClient(config);
+    }
     client_ = owned_client_.get();
   } else {
     client_ = client;
@@ -279,9 +299,13 @@ tpu_sync::rpc::ControlRequest ReshardClient::BuildShutdown() {
 absl::StatusOr<tpu_sync::rpc::ControllerResponse> ReshardClient::CallController(
     const tpu_sync::rpc::ControllerRequest& request) {
   absl::StatusOr<tpu_sync::rpc::ControllerResponse> response =
-      CallReshardControlPipe<tpu_sync::rpc::ControllerRequest,
-                             tpu_sync::rpc::ControllerResponse>(
-          client_, address_, request, kCallTimeout);
+      owned_client_ && client_->backend_type() == ControlPipeBackendType::kGrpc
+          ? client_->Call<tpu_sync::rpc::ControllerRequest,
+                          tpu_sync::rpc::ControllerResponse>(
+                address_, request, kCallTimeout)
+          : CallReshardControlPipe<tpu_sync::rpc::ControllerRequest,
+                                  tpu_sync::rpc::ControllerResponse>(
+                client_, address_, request, kCallTimeout);
   if (!response.ok()) return response.status();
   if (!response->success()) {
     // Verbatim facade text: the connector's bounded retry substring-matches

@@ -26,13 +26,16 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <grpcpp/grpcpp.h>
 #include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
+#include "absl/time/clock.h"
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
+#include "tpu_sync/common/control_pipe/control_pipe_server.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/reshard/declaration_types.h"
@@ -40,6 +43,7 @@
 #include "tpu_sync/kv_cache/reshard/reshard_client.h"
 #include "tpu_sync/kv_cache/reshard/reshard_control_pipe.h"
 #include "tpu_sync/proto/control_pipe.pb.h"
+#include "tpu_sync/proto/control_pipe.grpc.pb.h"
 #include "tpu_sync/rpc/controller_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
@@ -498,6 +502,216 @@ class ReshardStackTest : public ::testing::Test {
   double now_ = 1000.0;
   std::unique_ptr<ReshardService> service_;
 };
+
+class UnavailableOnceClient final : public ControlPipeClient {
+ public:
+  int calls = 0;
+  absl::StatusOr<control_pipe::proto::ControlResponseEnvelope> SendRaw(
+      absl::string_view, const control_pipe::proto::ControlEnvelope& req,
+      absl::Duration) override {
+    if (++calls == 1) return absl::UnavailableError("injected unavailable");
+    control_pipe::proto::ControlResponseEnvelope env;
+    if (req.message_type() == "tpu_sync.rpc.ControllerRequest") {
+      tpu_sync::rpc::ControllerResponse response;
+      response.set_success(true);
+      env.set_payload(response.SerializeAsString());
+    } else {
+      tpu_sync::rpc::ControlResponse response;
+      response.set_success(true);
+      env.set_payload(response.SerializeAsString());
+    }
+    return env;
+  }
+  ControlPipeBackendType backend_type() const override {
+    return ControlPipeBackendType::kGrpc;
+  }
+};
+
+TEST(ReshardRuntimeRpcTest, BorrowedClientRetainsRetries) {
+  UnavailableOnceClient transport;
+  ReshardClient client("unused", &transport);
+  EXPECT_TRUE(client.ReleaseRequestBlocks("request", 1).ok());
+  EXPECT_EQ(transport.calls, 2);
+}
+
+TEST(ReshardRuntimeRpcTest, BootstrapStillRetriesUnavailable) {
+  UnavailableOnceClient transport;
+  ReshardClient client("unused", &transport);
+  EXPECT_TRUE(client.GetMetadata().ok());
+  EXPECT_EQ(transport.calls, 2);
+}
+
+// Integration coverage: distinguish a transport failure after server
+// dispatch from the precise channel-connect failure used for safe block release.
+class TransportFailureService final
+    : public control_pipe::proto::ControlPipeService::Service {
+ public:
+  int calls = 0;
+  bool cancel_after_dispatch = false;
+  grpc::Status SendControl(grpc::ServerContext* context,
+      const control_pipe::proto::ControlEnvelope*,
+      control_pipe::proto::ControlResponseEnvelope*) override {
+    ++calls;
+    if (cancel_after_dispatch) {
+      context->TryCancel();
+      absl::SleepFor(absl::Milliseconds(20));
+      return grpc::Status::OK;
+    }
+    return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                        "transport failure after dispatch");
+  }
+};
+
+TEST(ReshardRuntimeRpcTest, TransportUnavailableIsNotRetried) {
+  setenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "grpc", 1);
+  auto cleanup = absl::MakeCleanup([] {
+    unsetenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND");
+  });
+  TransportFailureService service;
+  grpc::ServerBuilder builder;
+  int port = 0;
+  builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(),
+                           &port);
+  builder.RegisterService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+  ReshardClient client(absl::StrCat("127.0.0.1:", port));
+  const auto start = absl::Now();
+  auto result = client.GetRequestBlockStatus({});
+  ASSERT_FALSE(result.ok());
+  EXPECT_TRUE(absl::IsUnavailable(result.status()));
+  EXPECT_EQ(result.status().message(), "transport failure after dispatch");
+  EXPECT_EQ(service.calls, 1);
+  EXPECT_LT(absl::Now() - start, absl::Seconds(2));
+  server->Shutdown();
+}
+
+TEST(ReshardRuntimeRpcTest, CancelledResponseAfterDispatchIsNotUnsent) {
+  setenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "grpc", 1);
+  auto cleanup = absl::MakeCleanup([] {
+    unsetenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND");
+  });
+  TransportFailureService service;
+  service.cancel_after_dispatch = true;
+  grpc::ServerBuilder builder;
+  int port = 0;
+  builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(),
+                           &port);
+  builder.RegisterService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+  const std::string endpoint = absl::StrCat("127.0.0.1:", port);
+  ReshardClient client(endpoint);
+  const auto start = absl::Now();
+  auto result = client.GetRequestBlockStatus({});
+  ASSERT_FALSE(result.ok());
+  EXPECT_NE(result.status().message(), absl::StrCat(
+      "Control RPC connection failed before sending request to ", endpoint));
+  EXPECT_EQ(service.calls, 1);
+  EXPECT_LT(absl::Now() - start, absl::Seconds(2));
+  server->Shutdown();
+}
+
+TEST(ReshardRuntimeRpcTest, CachedReadyChannelSurvivesServerDeathSafely) {
+  setenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "grpc", 1);
+  auto cleanup = absl::MakeCleanup([] {
+    unsetenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND");
+  });
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  auto server = CreateControlPipeServer(cfg);
+  int calls = 0;
+  server->dispatcher().RegisterHandler<tpu_sync::rpc::ControllerRequest,
+      tpu_sync::rpc::ControllerResponse>([&calls](const ControlContext&,
+      const tpu_sync::rpc::ControllerRequest&)
+      -> absl::StatusOr<tpu_sync::rpc::ControllerResponse> {
+    ++calls;
+    tpu_sync::rpc::ControllerResponse response;
+    response.set_success(true);
+    return response;
+  });
+  auto port = server->Start(0);
+  ASSERT_TRUE(port.ok());
+  ReshardClient client(absl::StrCat("127.0.0.1:", *port));
+  ASSERT_TRUE(client.GetRequestBlockStatus({}).ok());
+  server->Stop();
+  const auto start = absl::Now();
+  EXPECT_FALSE(client.GetRequestBlockStatus({}).ok());
+  EXPECT_LT(absl::Now() - start, absl::Seconds(2));
+  EXPECT_EQ(calls, 1);
+}
+
+TEST(ReshardRuntimeRpcTest, DeadGrpcEndpointFailsBeforeSending) {
+  setenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "grpc", 1);
+  auto cleanup = absl::MakeCleanup([] {
+    unsetenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND");
+  });
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  auto server = CreateControlPipeServer(cfg);
+  auto port = server->Start(0);
+  ASSERT_TRUE(port.ok());
+  const std::string endpoint = absl::StrCat("127.0.0.1:", *port);
+  server->Stop();
+  ReshardClient client(endpoint);
+  const auto start = absl::Now();
+  auto result = client.GetRequestBlockStatus({});
+  EXPECT_LT(absl::Now() - start, absl::Seconds(2));
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.status().message(), absl::StrCat(
+      "Control RPC connection failed before sending request to ", endpoint));
+}
+
+TEST(ReshardRuntimeRpcTest, SentUnavailableIsAmbiguousAndNotRetried) {
+  setenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "grpc", 1);
+  auto cleanup = absl::MakeCleanup([] {
+    unsetenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND");
+  });
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  auto server = CreateControlPipeServer(cfg);
+  int calls = 0;
+  server->dispatcher().RegisterHandler<tpu_sync::rpc::ControllerRequest,
+      tpu_sync::rpc::ControllerResponse>([&calls](const ControlContext&,
+      const tpu_sync::rpc::ControllerRequest&)
+      -> absl::StatusOr<tpu_sync::rpc::ControllerResponse> {
+    ++calls;
+    return absl::UnavailableError("injected after dispatch");
+  });
+  auto port = server->Start(0);
+  ASSERT_TRUE(port.ok());
+  ReshardClient client(absl::StrCat("127.0.0.1:", *port));
+  auto result = client.GetRequestBlockStatus({});
+  ASSERT_FALSE(result.ok());
+  EXPECT_TRUE(absl::IsUnavailable(result.status()));
+  EXPECT_EQ(result.status().message(), "injected after dispatch");
+  EXPECT_EQ(calls, 1);
+  server->Stop();
+}
+
+TEST(ReshardRuntimeRpcTest, ResponseRetainsItsFullDeadline) {
+  setenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "grpc", 1);
+  auto cleanup = absl::MakeCleanup([] {
+    unsetenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND");
+  });
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  auto server = CreateControlPipeServer(cfg);
+  server->dispatcher().RegisterHandler<tpu_sync::rpc::ControllerRequest,
+      tpu_sync::rpc::ControllerResponse>([](const ControlContext&,
+      const tpu_sync::rpc::ControllerRequest&)
+      -> absl::StatusOr<tpu_sync::rpc::ControllerResponse> {
+    absl::SleepFor(absl::Milliseconds(1100));
+    tpu_sync::rpc::ControllerResponse response;
+    response.set_success(true);
+    return response;
+  });
+  auto port = server->Start(0);
+  ASSERT_TRUE(port.ok());
+  ReshardClient client(absl::StrCat("127.0.0.1:", *port));
+  EXPECT_TRUE(client.GetRequestBlockStatus({}).ok());
+  server->Stop();
+}
 
 TEST(ReshardControlPipeTest, TcpBackendRoundTrip) {
   ReshardService::Options options;

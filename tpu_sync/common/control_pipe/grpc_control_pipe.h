@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <list>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "absl/base/thread_annotations.h"
@@ -26,6 +27,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
+#include "grpcpp/channel.h"
 #include "grpcpp/server.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
@@ -77,6 +79,14 @@ class GrpcControlPipeClient : public ControlPipeClient {
       const control_pipe::proto::ControlEnvelope& envelope,
       absl::Duration timeout) override;
 
+  // Bound channel readiness separately from the full RPC deadline. A failure
+  // before SendControl is invoked is safe to classify as an unsent request.
+  absl::StatusOr<control_pipe::proto::ControlResponseEnvelope>
+  SendRawWithConnectTimeout(
+      absl::string_view endpoint,
+      const control_pipe::proto::ControlEnvelope& envelope,
+      absl::Duration timeout, absl::Duration connect_timeout);
+
   ControlPipeBackendType backend_type() const override {
     return ControlPipeBackendType::kGrpc;
   }
@@ -88,13 +98,21 @@ class GrpcControlPipeClient : public ControlPipeClient {
   bool TEST_HasCachedStub(absl::string_view endpoint) const;
 
  private:
-  struct StubCacheEntry {
+  struct StubConnection {
+    std::shared_ptr<grpc::Channel> channel;
     std::shared_ptr<control_pipe::proto::ControlPipeService::Stub> stub;
+  };
+  struct StubCacheEntry {
+    StubConnection connection;
     std::list<std::string>::iterator lru_it;
   };
 
-  std::shared_ptr<control_pipe::proto::ControlPipeService::Stub>
-  GetOrCreateStub(absl::string_view endpoint);
+  StubConnection GetOrCreateConnection(absl::string_view endpoint);
+
+  absl::StatusOr<control_pipe::proto::ControlResponseEnvelope> SendRawImpl(
+      absl::string_view endpoint,
+      const control_pipe::proto::ControlEnvelope& envelope,
+      absl::Duration timeout, std::optional<absl::Duration> connect_timeout);
 
   ControlPipeConfig config_;
   mutable absl::Mutex stub_mu_;

@@ -56,6 +56,18 @@ absl::Status ReadExactWithTimeout(int fd, void* buf, size_t len,
 absl::Status ReadVExactWithTimeout(int fd, absl::Span<const struct iovec> iovs,
                                    std::optional<absl::Duration> timeout);
 
+// Writes exactly `len` bytes from `buf` to `fd`. When `timeout` is `nullopt`,
+// delegates to `::peregrine::WriteExact`; otherwise bounds the total wait by
+// `*timeout` and returns DeadlineExceededError on timeout.
+absl::Status WriteExactWithTimeout(int fd, const void* buf, size_t len,
+                                   std::optional<absl::Duration> timeout);
+
+// Writes all bytes described by `iovs` to `fd`. When `timeout` is `nullopt`,
+// delegates to `::peregrine::WriteVExact`; otherwise bounds the total wait by
+// `*timeout` and returns DeadlineExceededError on timeout.
+absl::Status WriteVExactWithTimeout(int fd, absl::Span<const struct iovec> iovs,
+                                    std::optional<absl::Duration> timeout);
+
 // Returns the local endpoint ("ip:port") for the socket `fd`.
 std::string GetLocalEndpoint(int fd);
 

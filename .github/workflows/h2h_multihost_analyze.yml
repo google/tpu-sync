@@ -27,12 +27,14 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   analyze:
     name: Run H2H Multi-Host Analyze
     uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@82682aceae058a272d67c5e8bb4e8eba2da7b7c2 # main
+    permissions:
+      contents: read
+      pull-requests: write
     with:
       registry_file: "tpu_sync/benchmarks/benchmark_registry_h2h_multihost_analyze.pbtxt"
       bap_ref: "82682aceae058a272d67c5e8bb4e8eba2da7b7c2"

@@ -46,7 +46,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   # Group by workflow name and branch to ensure runs execute sequentially.
@@ -59,6 +58,9 @@ jobs:
   run_benchmarks:
     name: Run Single Host Benchmarks
     uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@82682aceae058a272d67c5e8bb4e8eba2da7b7c2 # main
+    permissions:
+      contents: read
+      pull-requests: write
     with:
       registry_file: "tpu_sync/benchmarks/benchmark_registry.pbtxt"
       bap_ref: "82682aceae058a272d67c5e8bb4e8eba2da7b7c2"
@@ -74,6 +76,9 @@ jobs:
   run_multihost_benchmarks:
     name: Run Multi-Host Benchmarks
     uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@82682aceae058a272d67c5e8bb4e8eba2da7b7c2 # main
+    permissions:
+      contents: read
+      pull-requests: write
     with:
       registry_file: "tpu_sync/benchmarks/benchmark_registry_h2h_multihost_gate.pbtxt"
       bap_ref: "82682aceae058a272d67c5e8bb4e8eba2da7b7c2"

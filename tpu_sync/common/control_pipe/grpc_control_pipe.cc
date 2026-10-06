@@ -351,9 +351,6 @@ GrpcControlPipeClient::GetOrCreateStub(absl::string_view endpoint) {
   int max_msg_bytes = static_cast<int>(config_.max_frame_bytes);
   args.SetMaxReceiveMessageSize(max_msg_bytes);
   args.SetMaxSendMessageSize(max_msg_bytes);
-  args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 20000);
-  args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 10000);
-  args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
 
   std::shared_ptr<grpc::Channel> channel = grpc::CreateCustomChannel(
       ep_str, grpc::InsecureChannelCredentials(), args);

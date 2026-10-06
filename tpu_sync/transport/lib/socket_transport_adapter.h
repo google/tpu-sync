@@ -66,6 +66,8 @@ class SocketTransportAdapter : public TransportAdapter {
   struct Config {
     std::optional<absl::Duration> handshake_ack_read_timeout = std::nullopt;
     std::optional<absl::Duration> final_ack_read_timeout = std::nullopt;
+    std::optional<absl::Duration> handshake_write_timeout = std::nullopt;
+    std::optional<absl::Duration> payload_write_timeout = std::nullopt;
   };
 
   const Config& config() const { return config_; }
@@ -75,6 +77,12 @@ class SocketTransportAdapter : public TransportAdapter {
   }
   std::optional<absl::Duration> final_ack_read_timeout() const {
     return config_.final_ack_read_timeout;
+  }
+  std::optional<absl::Duration> handshake_write_timeout() const {
+    return config_.handshake_write_timeout;
+  }
+  std::optional<absl::Duration> payload_write_timeout() const {
+    return config_.payload_write_timeout;
   }
 
  private:

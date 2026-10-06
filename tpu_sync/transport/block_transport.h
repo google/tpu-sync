@@ -67,6 +67,7 @@ class BlockTransport final {
   struct Config {
     std::optional<absl::Duration> handshake_read_timeout = std::nullopt;
     std::optional<absl::Duration> payload_read_timeout = std::nullopt;
+    std::optional<absl::Duration> ack_write_timeout = std::nullopt;
     size_t coalesce_window_bytes = 0;
   };
 
@@ -77,6 +78,9 @@ class BlockTransport final {
   }
   std::optional<absl::Duration> payload_read_timeout() const {
     return config_.payload_read_timeout;
+  }
+  std::optional<absl::Duration> ack_write_timeout() const {
+    return config_.ack_write_timeout;
   }
 
   // Return the TCP listening socket port.

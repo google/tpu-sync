@@ -292,5 +292,83 @@ TEST(ReadWithTimeoutTest, NulloptTimeoutUsesPeregrineRead) {
   close(sv[0]);
   close(sv[1]);
 }
+
+TEST(WriteWithTimeoutTest, WriteExactTimesOutWhenPeerStalls) {
+  int sv[2];
+  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+  int sndbuf = 4096;
+  ASSERT_EQ(setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)),
+            0);
+
+  std::vector<char> buf(1024 * 1024, 'x');
+  const absl::Time start = absl::Now();
+  EXPECT_THAT(
+      WriteExactWithTimeout(sv[0], buf.data(), buf.size(),
+                            absl::Milliseconds(100)),
+      StatusIs(absl::StatusCode::kDeadlineExceeded, HasSubstr("timed out")));
+  EXPECT_GE(absl::Now() - start, absl::Milliseconds(80));
+
+  close(sv[0]);
+  close(sv[1]);
+}
+
+TEST(WriteWithTimeoutTest, WriteVExactTimesOutAndWritesAcrossIovecs) {
+  int sv[2];
+  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+
+  char part1[] = "ab";
+  char part2[] = "cdef";
+  struct iovec iovs[2] = {
+      {.iov_base = part1, .iov_len = 2},
+      {.iov_base = part2, .iov_len = 4},
+  };
+  ABSL_EXPECT_OK(WriteVExactWithTimeout(sv[0], absl::MakeConstSpan(iovs),
+                                        absl::Seconds(1)));
+
+  char recv_buf[6] = {};
+  ASSERT_EQ(read(sv[1], recv_buf, sizeof(recv_buf)), 6);
+  EXPECT_EQ(std::string(recv_buf, 6), "abcdef");
+
+  int sndbuf = 4096;
+  ASSERT_EQ(setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)),
+            0);
+  std::vector<char> large1(512 * 1024, 'a');
+  std::vector<char> large2(512 * 1024, 'b');
+  struct iovec large_iovs[2] = {
+      {.iov_base = large1.data(), .iov_len = large1.size()},
+      {.iov_base = large2.data(), .iov_len = large2.size()},
+  };
+  EXPECT_THAT(
+      WriteVExactWithTimeout(sv[0], absl::MakeConstSpan(large_iovs),
+                             absl::Milliseconds(100)),
+      StatusIs(absl::StatusCode::kDeadlineExceeded, HasSubstr("timed out")));
+
+  close(sv[0]);
+  close(sv[1]);
+}
+
+TEST(WriteWithTimeoutTest, NulloptTimeoutUsesPeregrineWrite) {
+  int sv[2];
+  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+
+  const char payload[] = "abcd";
+  ABSL_EXPECT_OK(WriteExactWithTimeout(sv[0], payload, 4, std::nullopt));
+
+  char vpart1[] = "ef";
+  char vpart2[] = "gh";
+  struct iovec iovs[2] = {
+      {.iov_base = vpart1, .iov_len = 2},
+      {.iov_base = vpart2, .iov_len = 2},
+  };
+  ABSL_EXPECT_OK(
+      WriteVExactWithTimeout(sv[0], absl::MakeConstSpan(iovs), std::nullopt));
+
+  char recv_buf[8] = {};
+  ASSERT_EQ(read(sv[1], recv_buf, sizeof(recv_buf)), 8);
+  EXPECT_EQ(std::string(recv_buf, 8), "abcdefgh");
+
+  close(sv[0]);
+  close(sv[1]);
+}
 }  // namespace
 }  // namespace tpu_raiden::transport::lib

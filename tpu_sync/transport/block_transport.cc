@@ -50,7 +50,6 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "peregrine/src/api/socket_util.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/telemetry/label_util.h"
@@ -99,6 +98,17 @@ BlockTransport::Config ReadConfigFromEnv() {
                       "timeout)";
     }
   }
+  if (const char* val = std::getenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S");
+      val != nullptr && val[0] != '\0') {
+    double parsed = 0.0;
+    if (absl::SimpleAtod(val, &parsed) && parsed > 0.0) {
+      config.ack_write_timeout = absl::Seconds(parsed);
+    } else {
+      LOG(WARNING) << "TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S=\"" << val
+                   << "\" must be a positive number; using default (no "
+                      "timeout)";
+    }
+  }
   if (const char* val = std::getenv("RAIDEN_TRANSPORT_COALESCE_WINDOW_BYTES");
       val != nullptr && val[0] != '\0') {
     size_t parsed = 0;
@@ -109,8 +119,6 @@ BlockTransport::Config ReadConfigFromEnv() {
   return config;
 }
 
-using ::peregrine::WriteExact;
-using ::peregrine::WriteVExact;
 using ::tpu_raiden::telemetry::ExtractFirstEndpointIp;
 using ::tpu_raiden::telemetry::ExtractIpFromEndpoint;
 using ::tpu_raiden::telemetry::MetricLabel;
@@ -387,7 +395,8 @@ absl::Status BlockTransport::HandleIncomingPush(
         allocated_ids,
         block_delegate_->AllocateBlocks(header.count_or_size, header.uuid));
     const std::vector<uint8_t> s_ids = lib::SerializeBlockIds(allocated_ids);
-    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s_ids.data(), s_ids.size()));
+    ABSL_RETURN_IF_ERROR(lib::WriteExactWithTimeout(
+        client_fd, s_ids.data(), s_ids.size(), ack_write_timeout()));
   } else {
     std::vector<uint8_t> ids_buf(header.count_or_size * sizeof(uint32_t));
     FaultInjectSocket(hooks::kBlockTransportRecvBlockIds, client_fd);
@@ -400,7 +409,8 @@ absl::Status BlockTransport::HandleIncomingPush(
     src_block_ids = lib::DeserializeBlockIds(ids_buf);
     uint8_t ack = 1;
     FaultInjectSocket(hooks::kBlockTransportRecvSendHandshakeAck, client_fd);
-    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
+    ABSL_RETURN_IF_ERROR(
+        lib::WriteExactWithTimeout(client_fd, &ack, 1, ack_write_timeout()));
   }
 
   uint64_t total_received_bytes = 0;
@@ -617,7 +627,8 @@ absl::Status BlockTransport::HandleIncomingPush(
   ABSL_RETURN_IF_ERROR(block_delegate_->EndIncomingPush(header.uuid));
   uint8_t ack = 1;
   FaultInjectSocket(hooks::kBlockTransportRecvSendAck, client_fd);
-  ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
+  ABSL_RETURN_IF_ERROR(
+      lib::WriteExactWithTimeout(client_fd, &ack, 1, ack_write_timeout()));
   return absl::OkStatus();
 }
 
@@ -639,7 +650,8 @@ absl::Status BlockTransport::HandleIncomingPull(
   resp_header.local_id = 0;
   resp_header.count_or_size = header.count_or_size;
   const auto s = lib::SerializeChunkHeader(resp_header);
-  ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s.data(), s.size()));
+  ABSL_RETURN_IF_ERROR(lib::WriteExactWithTimeout(client_fd, s.data(), s.size(),
+                                                  ack_write_timeout()));
 
   size_t local_blocks = header.count_or_size / block_delegate_->shard_factor();
   if (header.remote_id >
@@ -721,7 +733,8 @@ void BlockTransport::TriggerNextSendStep(
           uint32_t total_size = GetChunksTotalSize(chunks);
           const std::array<uint8_t, lib::kChunkSizeFieldSize> s_size =
               lib::SerializeChunkSize(total_size);
-          s = WriteExact(state->client_fd, s_size.data(), s_size.size());
+          s = lib::WriteExactWithTimeout(state->client_fd, s_size.data(),
+                                         s_size.size(), ack_write_timeout());
           if (!s.ok()) {
             LOG(ERROR) << "Write size failed: " << s.ToString();
             shutdown(state->client_fd, SHUT_RDWR);
@@ -730,7 +743,8 @@ void BlockTransport::TriggerNextSendStep(
             return;
           }
           if (total_size > 0) {
-            s = WriteVExact(state->client_fd, ToIovec(chunks));
+            s = lib::WriteVExactWithTimeout(state->client_fd, ToIovec(chunks),
+                                            ack_write_timeout());
           }
           if (!s.ok()) {
             LOG(ERROR) << "Write payload failed: " << s.ToString();

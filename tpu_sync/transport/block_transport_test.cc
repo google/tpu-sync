@@ -264,8 +264,15 @@ class MockDelegate : public BlockTransportDelegate {
       uint64_t uuid, const absl::Status& status = absl::OkStatus()) override {
     (void)uuid;
     absl::MutexLock lock(end_status_mu_);
+    end_incoming_push_called_ = true;
     last_end_incoming_push_status_ = status;
     return absl::OkStatus();
+  }
+
+  bool WaitForEndIncomingPush(absl::Duration timeout) const {
+    absl::MutexLock lock(end_status_mu_);
+    return end_status_mu_.AwaitWithTimeout(
+        absl::Condition(&end_incoming_push_called_), timeout);
   }
 
   absl::Status last_end_incoming_push_status() const {
@@ -295,6 +302,7 @@ class MockDelegate : public BlockTransportDelegate {
   absl::Mutex wait_events_mu_;
   std::vector<std::tuple<size_t, size_t, int>> wait_events_;
   mutable absl::Mutex end_status_mu_;
+  bool end_incoming_push_called_ ABSL_GUARDED_BY(end_status_mu_) = false;
   absl::Status last_end_incoming_push_status_ ABSL_GUARDED_BY(end_status_mu_);
   mutable absl::Mutex peer_channels_mu_;
   std::shared_ptr<grpc::Channel> default_channel_
@@ -1718,31 +1726,38 @@ TEST(DecodeReadTimeoutTest, TimeoutConfigFromEnv) {
   auto cleanup = absl::MakeCleanup([] {
     unsetenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
     unsetenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S");
+    unsetenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S");
   });
   MockDelegate delegate(/*slice_size=*/64);
 
   unsetenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
   unsetenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S");
+  unsetenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S");
   {
     BlockTransport transport(&delegate, /*local_port=*/0);
     EXPECT_EQ(transport.handshake_read_timeout(), std::nullopt);
     EXPECT_EQ(transport.payload_read_timeout(), std::nullopt);
+    EXPECT_EQ(transport.ack_write_timeout(), std::nullopt);
   }
 
   setenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S", "1.5", 1);
   setenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S", "12.5", 1);
+  setenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S", "2.5", 1);
   {
     BlockTransport transport(&delegate, /*local_port=*/0);
     EXPECT_EQ(transport.handshake_read_timeout(), absl::Milliseconds(1500));
     EXPECT_EQ(transport.payload_read_timeout(), absl::Milliseconds(12500));
+    EXPECT_EQ(transport.ack_write_timeout(), absl::Milliseconds(2500));
   }
 
   setenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S", "-3", 1);
   setenv("TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S", "invalid", 1);
+  setenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S", "-1", 1);
   {
     BlockTransport transport(&delegate, /*local_port=*/0);
     EXPECT_EQ(transport.handshake_read_timeout(), std::nullopt);
     EXPECT_EQ(transport.payload_read_timeout(), std::nullopt);
+    EXPECT_EQ(transport.ack_write_timeout(), std::nullopt);
   }
 }
 
@@ -1833,6 +1848,39 @@ TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
   EXPECT_THAT(lib::ReadExactWithTimeout(fd, &final_ack, 1, absl::Seconds(2)),
               StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
   EXPECT_EQ(delegate.layer_completion_count(), 0);
+  EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
+}
+
+TEST(DecodeReadTimeoutTest, HandshakeAckWriteTimesOutAndReleasesLease) {
+  auto cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S"); });
+  setenv("TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S", "0.1", 1);
+
+  MockDelegate delegate(/*slice_size=*/1, /*max_blocks=*/1);
+  BlockTransport receiver(&delegate, /*local_port=*/0);
+
+  TF_ASSERT_OK_AND_ASSIGN(int fd, lib::ConnectToPeer(absl::StrCat(
+                                      "127.0.0.1:", receiver.local_port())));
+  auto close_fd = absl::MakeCleanup([fd] { close(fd); });
+  int rcvbuf = 4096;
+  ASSERT_EQ(setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)), 0);
+
+  // Send an Op 1 header requesting 8M block IDs (32 MiB serialized response)
+  // and do not drain `fd`, forcing the receiver's block-ID write to stall and
+  // time out.
+  lib::ChunkHeader header = {};
+  header.version = 1;
+  header.op = 1;
+  header.flags = static_cast<uint8_t>(MajorOrder::kLayerMajor);
+  header.reserved = 1;
+  header.local_id = 0;
+  header.count_or_size = 8 * 1024 * 1024;
+  header.uuid = 99;
+  const auto s_header = lib::SerializeChunkHeader(header);
+  ASSERT_EQ(::send(fd, s_header.data(), s_header.size(), MSG_NOSIGNAL),
+            static_cast<ssize_t>(s_header.size()));
+
+  EXPECT_TRUE(delegate.WaitForEndIncomingPush(absl::Seconds(2)));
   EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
 }
 

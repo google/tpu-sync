@@ -63,8 +63,6 @@ namespace {
 
 using ::peregrine::ReadExact;
 using ::peregrine::ReadVExact;
-using ::peregrine::WriteExact;
-using ::peregrine::WriteVExact;
 using ::tpu_raiden::telemetry::ExtractFirstEndpointIp;
 using ::tpu_raiden::telemetry::MetricLabel;
 using ::tpu_raiden::telemetry::RaidenMetricStore;
@@ -85,6 +83,20 @@ SocketTransportAdapter::Config ReadConfigFromEnv() {
     double s = 0.0;
     if (absl::SimpleAtod(val, &s) && s > 0) {
       config.final_ack_read_timeout = absl::Seconds(s);
+    }
+  }
+  if (const char* val =
+          std::getenv("TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S")) {
+    double s = 0.0;
+    if (absl::SimpleAtod(val, &s) && s > 0) {
+      config.handshake_write_timeout = absl::Seconds(s);
+    }
+  }
+  if (const char* val =
+          std::getenv("TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S")) {
+    double s = 0.0;
+    if (absl::SimpleAtod(val, &s) && s > 0) {
+      config.payload_write_timeout = absl::Seconds(s);
     }
   }
   return config;
@@ -426,7 +438,8 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
   header.uuid = uuid;
   const auto s_header = SerializeChunkHeader(header);
   FaultInjectSocket(hooks::kSocketTransportPushSendHeader, fd);
-  absl::Status s = WriteExact(fd, s_header.data(), s_header.size());
+  absl::Status s = WriteExactWithTimeout(fd, s_header.data(), s_header.size(),
+                                         config_.handshake_write_timeout);
   if (!s.ok()) {
     return s;
   }
@@ -435,10 +448,14 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
     ABSL_DCHECK_LE(block_offset + block_count, dst_block_ids.size());
     const auto s_dst_ids =
         SerializeBlockIds({dst_block_ids.data() + block_offset, block_count});
-    ABSL_RETURN_IF_ERROR(WriteExact(fd, s_dst_ids.data(), s_dst_ids.size()));
+    ABSL_RETURN_IF_ERROR(
+        WriteExactWithTimeout(fd, s_dst_ids.data(), s_dst_ids.size(),
+                              config_.handshake_write_timeout));
     const auto s_src_ids =
         SerializeBlockIds({src_block_ids.data() + block_offset, block_count});
-    ABSL_RETURN_IF_ERROR(WriteExact(fd, s_src_ids.data(), s_src_ids.size()));
+    ABSL_RETURN_IF_ERROR(
+        WriteExactWithTimeout(fd, s_src_ids.data(), s_src_ids.size(),
+                              config_.handshake_write_timeout));
     uint8_t ack = 0;
     FaultInjectSocket(hooks::kSocketTransportPushRecvHandshakeAck, fd);
     s = ReadExactWithTimeout(fd, &ack, 1, config_.handshake_ack_read_timeout);
@@ -491,9 +508,11 @@ absl::Status SocketTransportAdapter::PostSocketPushInternal(
       }
       const std::array<uint8_t, kChunkSizeFieldSize> s_size =
           SerializeChunkSize(total_size);
-      ABSL_RETURN_IF_ERROR(WriteExact(fd, s_size.data(), s_size.size()));
+      ABSL_RETURN_IF_ERROR(WriteExactWithTimeout(
+          fd, s_size.data(), s_size.size(), config_.payload_write_timeout));
       if (total_size > 0) {
-        ABSL_RETURN_IF_ERROR(WriteVExact(fd, absl::MakeSpan(iov)));
+        ABSL_RETURN_IF_ERROR(WriteVExactWithTimeout(
+            fd, absl::MakeSpan(iov), config_.payload_write_timeout));
         stream_bytes_sent += total_size;
       }
       i = j;
@@ -633,7 +652,8 @@ absl::Status SocketTransportAdapter::PostSocketPullInternal(
     header.count_or_size = remote_count;
     header.uuid = uuid;
     const auto s_header = SerializeChunkHeader(header);
-    ABSL_RETURN_IF_ERROR(WriteExact(fd, s_header.data(), s_header.size()));
+    ABSL_RETURN_IF_ERROR(WriteExactWithTimeout(
+        fd, s_header.data(), s_header.size(), config_.handshake_write_timeout));
 
     char resp_buf[kChunkHeaderSize];
     ABSL_RETURN_IF_ERROR(ReadExact(fd, resp_buf, sizeof(resp_buf)));

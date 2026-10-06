@@ -7,6 +7,8 @@
 `d069a36ed0829d46cae7ecb831bd324835106bea`。Torch wheel 提供
 `tpu_sync.api.torch.kv_cache_offloader.KVCacheOffloader`，供外部共享内存池
 注册一次映射后执行完整 scheduler page 的 H2D / D2H。
+真实两 rank 整页 DMA，以及 TP2/PCP1/MTP3 的真实模型 / V6D HTTP
+保存、重载和流断开恢复均已通过；生产接口保持整页字节池契约。
 
 ## 来源与 release 适配
 
@@ -62,6 +64,13 @@ python -m unittest tpu_sync.api.torch.kv_cache_offloader_test
 完整 wheel 构建和真实两 rank 的整页 DMA 校验已通过：BF16 / FP8，
 每 page 含 1 / 3 个 kernel blocks，2 / 24 个 tensors，非连续 page IDs，
 每组 3 次往返，退出码 0、`RELEASE_WHOLE_PAGE_DMA_OK`。
+随后真实 Qwen3.5-35B-A3B-FP8 模型 / V6D HTTP E2E 退出码 0、
+`V6D_HTTP_FAILOVER_E2E_OK`：清空本地 prefix cache 后重载命中 10368
+tokens，20 个输出 token IDs 一致，warm/cold 流断开后可恢复。
+补充 logprobs 均有限，重载前后最大差为 0.0。模型实际 page 为 1179648
+bytes、每 rank 11 个物理 tensors；这些 geometry 由平台和 KVS 建立，
+offloader 按 page 字节数复制。运行栈延迟 PjRt 初始化通过独立 vLLM
+worker extension 验证适配，未写入 offloader 或 KVS 生产代码。
 完整环境、wheel 校验值、真实 TPU 整页验证和模型/V6D 复现见
 [KVS 集成记录](https://github.com/aios-tpu-infra/kvs_connector/blob/main/docs/release_offloader_20261006.md)。
 

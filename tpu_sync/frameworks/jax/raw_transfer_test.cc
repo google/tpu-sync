@@ -88,10 +88,6 @@ nb::object CreateMockDeviceArray(xla::PjRtBuffer* pjrt_buffer) {
   }
   shard_data.set_attr("shape", shape_list);
 
-  shard_data.set_attr("dtype", nb::object());
-  shard_data.set_attr("_pjrt_layout", nb::object());
-  shard_data.set_attr("ptr", nb::object(reinterpret_cast<size_t>(pjrt_buffer)));
-
   shard.set_attr("data", shard_data);
   shards.add_element(shard);
   arr.set_attr("addressable_shards", shards);

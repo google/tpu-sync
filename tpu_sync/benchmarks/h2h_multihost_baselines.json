@@ -23,10 +23,7 @@
   "configs": {
     "1048576B_x64_P1": {
       "baseline_gbs": 1.353,
-      "floor_gbs": 1.218,
-      "floor_uncapped_gbs": 1.181,
-      "p_below_floor": 0.0,
-      "suitable": true,
+      "floor_gbs": 1.2177,
       "integrity": true,
       "n_samples": 600,
       "active_ifaces": 1

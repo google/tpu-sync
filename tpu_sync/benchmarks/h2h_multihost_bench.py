@@ -261,6 +261,10 @@ def _run_attempt():
   return os.environ.get('GITHUB_RUN_ATTEMPT', '')
 
 
+def _run_id():
+  return os.environ.get('GITHUB_RUN_ID', '')
+
+
 # ---------------------------------------------------------------------------
 # Topology
 # ---------------------------------------------------------------------------
@@ -602,7 +606,10 @@ def _publish_rendezvous(rdir, info):
 
 
 def _rendezvous_is_current(info, started_at):
-  """A receiver.json from an earlier attempt of the same job is stale."""
+  """A receiver.json from another run, or an earlier attempt of this run, is stale."""
+  run_id = _run_id()
+  if run_id and info.get('run_id') and info['run_id'] != run_id:
+    return False
   attempt = _run_attempt()
   if attempt and info.get('attempt') and info['attempt'] != attempt:
     return False
@@ -646,6 +653,7 @@ def _write_done(rdir, worker_id):
   try:
     _write_atomic(os.path.join(rdir, f'worker_{worker_id}.done'),
                   json.dumps({'worker_id': worker_id, 'ts': time.time(),
+                              'run_id': _run_id(),
                               'attempt': _run_attempt()}))
   except OSError as e:
     print(f'[barrier] could not write done marker: {e}', file=sys.stderr)
@@ -712,6 +720,7 @@ def _run_receiver(cc, configs, worker_id, own_ip):
     _publish_rendezvous(rdir, {'ip': own_ip, 'hostname': socket.gethostname(),
                                'peer_port': srv.port, 'worker_id': worker_id,
                                'pid': os.getpid(), 'ts': time.time(),
+                               'run_id': _run_id(),
                                'attempt': _run_attempt()})
 
   verdicts = {}
@@ -757,9 +766,23 @@ def _run_receiver(cc, configs, worker_id, own_ip):
       aborted = True
       break
 
+    out = None
+    if proc.poll() is not None and _CONTACT_MARKER not in watcher.output:
+      # Exited before the sender connected (crash, lost bind): that is not a
+      # byte-compare result. Drain first -- the marker may still be buffered.
+      out = _finish(proc, watcher, 30)
+      if _CONTACT_MARKER not in out:
+        srv.mark_failed(idx)
+        verdicts[label] = False
+        print(f'[receiver] {label} run {run}: exited rc={proc.returncode} '
+              f'before sender contact; tail:\n{out[-2000:]}', file=sys.stderr,
+              flush=True)
+        continue
+
     # The receiver self-exits after its byte-compare; never kill it early or
     # the check is cut short and reports a false CORRUPT.
-    out = _finish(proc, watcher, _TIMEOUT_S.value + _STARTUP_TIMEOUT_S.value)
+    if out is None:
+      out = _finish(proc, watcher, _TIMEOUT_S.value + _STARTUP_TIMEOUT_S.value)
     ok = (_INTEG_PASS in out) and (_INTEG_FAIL not in out)
     verdicts[label] = verdicts.get(label, True) and ok
     print(f'[receiver] {label} run {run}: integrity='
@@ -938,6 +961,9 @@ def _write_outputs(configs, results, verdicts, out_dir):
 
 
 def _write_baselines(configs, results, verdicts, out_dir):
+  """Writes h2h_multihost_baselines.json. Returns the labels whose data is
+  incomplete (no samples, a skipped run, or no passing integrity verdict); the
+  file is still written for diagnosis, but record must not exit 0 on them."""
   cfg = {'contract_version': _CONTRACT_VERSION, 'sigma_k': _SIGMA_K.value,
          'max_margin': _MAX_MARGIN.value, 'iters': _ITERS.value,
          'runs_per_config': max(1, _RUNS.value), 'configs': {}}
@@ -947,7 +973,7 @@ def _write_baselines(configs, results, verdicts, out_dir):
     cfg['configs'][label] = {
         'baseline_gbs': round(statistics.median(s), 3) if s else 0.0,
         'floor_gbs': round(_core_floor(s, _SIGMA_K.value,
-                                       _MAX_MARGIN.value), 3) if s else 0.0,
+                                       _MAX_MARGIN.value), 4) if s else 0.0,
         'integrity': bool(verdicts.get(label, False)),
         'n_samples': len(s),
         'active_ifaces': _active_ifaces(results.get(label, {})),
@@ -955,9 +981,30 @@ def _write_baselines(configs, results, verdicts, out_dir):
   path = os.path.join(out_dir, 'h2h_multihost_baselines.json')
   with open(path, 'w') as f:
     json.dump(cfg, f, indent=2)
-  print(f'Recorded {len(cfg["configs"])} baselines+floors -> {path}\n'
-        f'Commit it to tpu_sync/benchmarks/h2h_multihost_baselines.json to '
-        f'arm the gate.', flush=True)
+  incomplete = []
+  for c in configs:
+    label = _label(*c)
+    r = results.get(label, {})
+    reasons = []
+    if not r.get('samples'):
+      reasons.append('no samples')
+    if any(m.get('skipped') for m in r.get('raw', [])):
+      reasons.append('skipped run(s)')
+    if not verdicts.get(label, False):
+      reasons.append('no passing integrity verdict')
+    if reasons:
+      incomplete.append(label)
+      print(f'[record] {label}: INCOMPLETE ({", ".join(reasons)})',
+            file=sys.stderr, flush=True)
+  if incomplete:
+    print(f'RECORD FAIL: {len(incomplete)} config(s) incomplete: {incomplete}; '
+          f'{path} is diagnostic only -- do NOT commit it.', file=sys.stderr,
+          flush=True)
+  else:
+    print(f'Recorded {len(cfg["configs"])} baselines+floors -> {path}\n'
+          f'Commit it to tpu_sync/benchmarks/h2h_multihost_baselines.json to '
+          f'arm the gate.', flush=True)
+  return incomplete
 
 
 def _gate(configs, results, verdicts):
@@ -969,9 +1016,17 @@ def _gate(configs, results, verdicts):
         base = json.load(f)
       floors = {k: float(v.get('floor_gbs', 0.0))
                 for k, v in base.get('configs', {}).items()}
-    except (OSError, ValueError) as e:
-      print(f'[gate] baselines unreadable ({e}); throughput floors disabled.',
+      floors = {k: v for k, v in floors.items() if v > 0}
+      err = None if floors else 'no config has a floor_gbs > 0'
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+      err = f'{_baselines_path()}: {e}'
+    if err:
+      # Fail closed: a missing/corrupt baselines file must not silently turn
+      # the throughput gate off. Pass --nogate_throughput to gate on integrity
+      # only.
+      print(f'GATE FAIL: baselines unreadable or empty ({err})',
             file=sys.stderr, flush=True)
+      return 1
 
   bad = []
   print('\nH2H multi-host gate\n')
@@ -995,13 +1050,13 @@ def _gate(configs, results, verdicts):
       # run was skipped on its side): unproven is a failure, but a different one.
       reasons.append('NO VERDICT')
     if _GATE_THROUGHPUT.value and s and floor > 0 and med < floor:
-      reasons.append(f'BELOW FLOOR {floor:.3f}')
+      reasons.append(f'BELOW FLOOR {floor:.4f}')
     rec_nics = base.get('configs', {}).get(label, {}).get('active_ifaces')
     got_nics = _active_ifaces(r)
     if rec_nics and got_nics and rec_nics != got_nics:
       print(f'[gate] WARNING: {label}: floor recorded with {rec_nics} active '
             f'NIC(s), this run used {got_nics}.', flush=True)
-    floor_txt = f'{floor:9.3f}' if floor > 0 else '  NO FLOOR'
+    floor_txt = f'{floor:9.4f}' if floor > 0 else '  NO FLOOR'
     print(f'{label:<22} {med:9.3f} {floor_txt}  '
           f'{"OK" if integ else "CORRUPT":<9}  '
           f'{"PASS" if not reasons else "FAIL <-- " + ", ".join(reasons)}',
@@ -1104,8 +1159,8 @@ def main(_):
     bap_metrics.emit(scalars)
 
   if stage == 'record':
-    _write_baselines(configs, results, verdicts, out_dir)
-    rc = 0 if total else 1
+    incomplete = _write_baselines(configs, results, verdicts, out_dir)
+    rc = 0 if total and not incomplete else 1
   else:
     rc = _gate(configs, results, verdicts)
   if mode == 'spmd' and aborted:

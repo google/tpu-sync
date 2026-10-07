@@ -16,10 +16,10 @@ benchmarks {
     workload_action_inputs { key: "bazel_run_flags" value: "-c opt --config=oss --config=ci" }
   }
 
-  metrics { name: "int32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
-  metrics { name: "int32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
-  metrics { name: "float32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
-  metrics { name: "float32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
+  metrics { name: "int32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN comparison { baseline { value: 835.4 } threshold { value: 0.0259 } improvement_direction: GREATER } } }
+  metrics { name: "int32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN comparison { baseline { value: 800.1 } threshold { value: 0.0617 } improvement_direction: GREATER } } }
+  metrics { name: "float32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN comparison { baseline { value: 849.0 } threshold { value: 0.0392 } improvement_direction: GREATER } } }
+  metrics { name: "float32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN comparison { baseline { value: 810.9 } threshold { value: 0.0259 } improvement_direction: GREATER } } }
 
 }
 

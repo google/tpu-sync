@@ -25,8 +25,11 @@ benchmarks {
     workload_action_inputs { key: "bazel_run_flags" value: "-c opt --config=oss --config=ci --lockfile_mode=off --experimental_convenience_symlinks=ignore" }
   }
 
-  # In gate stage the driver emits one scalar per label (the median), so MEAN == MEDIAN == that value.
-  metrics { name: "1048576B_x64_P1/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
-  metrics { name: "1048576B_x64_P8/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
-  metrics { name: "1048573B_x64_P4/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  # In gate stage the driver emits one scalar per label (the median), so only MEDIAN is
+  # tracked. P1 carries a BAP static threshold mirroring h2h_multihost_baselines.json
+  # (baseline 1.353, max_margin 0.10 -> fails below 1.2177 GB/s); P8/P4 are
+  # informational (integrity-only in the driver, NO FLOOR).
+  metrics { name: "1048576B_x64_P1/cpp_gbs" unit: "GB/s" stats { stat: MEDIAN comparison { baseline { value: 1.353 } threshold { value: 0.10 } improvement_direction: GREATER } } }
+  metrics { name: "1048576B_x64_P8/cpp_gbs" unit: "GB/s" stats { stat: MEDIAN } }
+  metrics { name: "1048573B_x64_P4/cpp_gbs" unit: "GB/s" stats { stat: MEDIAN } }
 }

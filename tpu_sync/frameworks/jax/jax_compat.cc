@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -30,11 +31,14 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/vector.h>  // IWYU pragma: keep
 #include "xla/layout.h"
+#include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "xla/pjrt/pjrt_client.h"
+#include "xla/pjrt/raw_buffer.h"
 #include "xla/python/ifrt/array.h"
 #include "xla/python/ifrt/client.h"
 #include "xla/python/nb_numpy.h"
 #include "xla/python/pjrt_ifrt/pjrt_array.h"
+#include "xla/python/safe_static_init.h"
 #include "xla/python/types.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
@@ -50,13 +54,16 @@ namespace {
 #if RAIDEN_JAX >= 1101
 
 // numpy's C API is a table each extension fills for itself with import_array;
-// the jaxlib in this process has filled its own, not ours.
+// the jaxlib in this process has filled its own, not ours. SafeStatic rather
+// than a function-local static: the import can run Python code and release
+// the GIL, which would deadlock the static's guard.
 void EnsureNumpyImported() {
-  [[maybe_unused]] static const bool imported = [] {
+  static xla::SafeStatic<bool> imported;
+  imported.Get([] {
     tsl::ImportNumpy();
     if (PyErr_Occurred()) throw nb::python_error();
-    return true;
-  }();
+    return std::make_unique<bool>(true);
+  });
 }
 
 xla::PrimitiveType PrimitiveTypeOf(nb::handle dtype) {
@@ -85,6 +92,22 @@ xla::Layout LayoutOf(nb::handle layout) {
   result.set_element_size_in_bits(
       nb::cast<int64_t>(layout.attr("sub_byte_element_size_in_bits")));
   return result;
+}
+
+// The device a buffer from unsafe_raw_buffer() lives on. Not RawBuffer's own
+// memory_space(): that goes through PjRtMemorySpace::FromC, whose lookup is
+// keyed by the calling DSO, so for a buffer jaxlib created it returns null
+// here. The C++ PjRtRawBuffer underneath (what CreateRawAliasOfBuffer always
+// builds) answers through its vtable; this is down_cast() minus its equally
+// DSO-local vtable check.
+xla::PjRtDevice* DeviceOf(RawBuffer* raw_buffer) {
+  auto* cpp_buffer = static_cast<xla::PjRtRawBuffer*>(
+      static_cast<PJRT_RawBuffer*>(raw_buffer));
+  xla::PjRtMemorySpace* memory_space = cpp_buffer->memory_space();
+  if (memory_space == nullptr || memory_space->devices().empty()) {
+    throw std::runtime_error("Raw buffer has no device");
+  }
+  return memory_space->devices()[0];
 }
 
 #else  // RAIDEN_JAX < 1101
@@ -245,6 +268,8 @@ RaidenBufferHandle AcquireShardBuffer(PyObject* shard_data,
   absl::StatusOr<RaidenBufferHandle> handle =
       RaidenBufferHandle::AcquireFromRaw(raw_buffer, shape,
                                          unsafe_skip_buffer_lock);
+  // AcquireFromRaw resolved the device through FromC; see DeviceOf.
+  if (handle.ok()) handle->device = DeviceOf(raw_buffer);
 #else
   // Older jaxlibs expose no raw buffer: go through the PjRtBuffer that the
   // PyArray mirror above reaches.

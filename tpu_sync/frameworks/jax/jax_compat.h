@@ -34,6 +34,8 @@ namespace raiden {
 // Acquires the device buffer behind one addressable shard of a jax.Array
 // (`shard.data`, a single-device jaxlib PyArray). The GIL must be held.
 // Throws std::runtime_error if the shard's buffer cannot be reached.
+// From jax 0.11.1 on, unsafe_raw_buffer() takes no usage hold, so
+// `unsafe_skip_buffer_lock` only affects older jaxlibs.
 RaidenBufferHandle AcquireShardBuffer(PyObject* shard_data,
                                       bool unsafe_skip_buffer_lock);
 

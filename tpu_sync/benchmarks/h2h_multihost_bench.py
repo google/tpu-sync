@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cross-host H2H benchmark driver for BAP: analyze -> record -> gate.
+"""Cross-host H2H benchmark driver for BAP: record -> gate.
 
 Runs the C++ h2h_benchmark_runner between two hosts of a BAP multi-host job.
 BAP's multi-host runner executes this same target on every host of the slice
@@ -33,13 +33,12 @@ markers from the other workers before exiting; when peers come from the hosts
 list (e.g. Kubernetes JobSets with per-pod workspaces), completion is
 synchronized over the TCP verdict exchange and no done-marker wait happens.
 
+Both stages write the per-iteration samples CSV, print a [measured] summary
+line per config, and emit TensorBoard metrics.
+
 Stages:
-  analyze  collect the throughput distribution per config, write CSV + summary
-           JSON + markdown report + SVG histograms, rank configs by how
-           gate-worthy they are (bootstrapping the statistic the gate actually
-           uses: the median of --gate_iters iterations). Never gates.
-  record   same, plus write h2h_multihost_baselines.json with a floor per
-           config (median - k * MAD_sigma, capped at max_margin).
+  record   write h2h_multihost_baselines.json with a floor per config
+           (median - k * MAD_sigma, capped at max_margin).
   gate     integrity always gates; throughput gates against the recorded floor
            when --gate_throughput (default) and a floor exists for the config.
 """
@@ -60,7 +59,6 @@ from absl import app
 from absl import flags
 
 from tpu_sync.benchmarks import bap_metrics
-from tpu_sync.benchmarks import h2h_dist
 
 # Bumped when the stdout / file / peer-protocol contract changes; the e2e test
 # keys on it.
@@ -70,9 +68,8 @@ _CONTRACT_VERSION = 2
 # Flags
 # ---------------------------------------------------------------------------
 
-_STAGE = flags.DEFINE_enum('stage', 'gate', ['analyze', 'record', 'gate'],
-                           'analyze: distribution only; record: write '
-                           'baselines; gate: pass/fail.')
+_STAGE = flags.DEFINE_enum('stage', 'gate', ['record', 'gate'],
+                           'record: write baselines; gate: pass/fail.')
 _MODE = flags.DEFINE_enum(
     'mode', 'auto', ['auto', 'spmd', 'local'],
     'spmd: every host runs this driver, roles from the worker index. local: '
@@ -88,10 +85,6 @@ _ITERS = flags.DEFINE_integer('iters', 5, 'Timed iterations per runner process.'
 _RUNS = flags.DEFINE_integer(
     'runs_per_config', 1, 'Independent runner processes per config; total '
     'samples per config = runs_per_config * iters.')
-_GATE_ITERS = flags.DEFINE_integer(
-    'gate_iters', 50, 'analyze/record: the --iters the GATE will run with. The '
-    'gate compares the median of that many iterations against the floor, so '
-    'suitability and p_below_floor are bootstrapped for medians of this size.')
 
 _WORKER_ID = flags.DEFINE_integer('worker_id', -1,
                                   'This host index; overrides the env.')
@@ -138,7 +131,7 @@ _RUNNER = flags.DEFINE_string('runner', '', 'Path to h2h_benchmark_runner; '
                               'default: located in the runfiles.')
 
 _OUT_DIR = flags.DEFINE_string(
-    'out_dir', '', 'Where CSV/summary/report/SVG/baselines go. Default: '
+    'out_dir', '', 'Where the samples CSV and baselines go. Default: '
     '$WORKLOAD_ARTIFACTS_DIR if set, else the current directory.')
 _BASELINES = flags.DEFINE_string(
     'baselines', None, 'Baselines JSON read by gate. Default: the copy next to '
@@ -148,8 +141,6 @@ _MAX_MARGIN = flags.DEFINE_float(
     'max_margin', 0.10, 'Floor is never looser than this fractional drop.')
 _GATE_THROUGHPUT = flags.DEFINE_bool(
     'gate_throughput', True, 'Fail when the median drops below the floor.')
-_MIN_SAMPLES = flags.DEFINE_integer(
-    'min_samples', 30, 'analyze: samples needed to call a config gate-worthy.')
 
 # (block_size_bytes, num_blocks, parallelism) -- see H2H_MULTIHOST_TEST.md.
 _CORRECTNESS_CONFIGS = [
@@ -882,8 +873,37 @@ def _active_ifaces(r):
   return None
 
 
-def _write_outputs(stage, configs, results, verdicts, out_dir):
-  """CSV + summary JSON + markdown + SVG. Returns (per_config, ranking)."""
+def _core_floor(samples, k, max_margin):
+  """Gate floor: lower edge of the normal core, capped so it is never looser
+  than max_margin (mirrors h2h_cpp_gate._core_floor exactly).
+
+      floor = max(median - k * MAD_sigma,  median * (1 - max_margin))
+
+  MAD_sigma = 1.4826 * median(|x - median|) is an outlier-resistant stddev, so a
+  low tail does not drag the bound down; the cap keeps a noisy config from ending
+  up looser than a flat max_margin.
+  """
+  med = statistics.median(samples)
+  mad = statistics.median([abs(x - med) for x in samples]) if len(samples) > 1 else 0.0
+  sigma = 1.4826 * mad
+  core = med - k * sigma
+  cap = med * (1.0 - max_margin)
+  return max(core, cap)
+
+
+def _pct(xs, q):
+  """q-th percentile (0..100) of non-empty xs via linear interpolation."""
+  xs = sorted(xs)
+  if len(xs) == 1:
+    return xs[0]
+  pos = (len(xs) - 1) * (q / 100.0)
+  lo = int(pos)
+  hi = min(lo + 1, len(xs) - 1)
+  return xs[lo] + (xs[hi] - xs[lo]) * (pos - lo)
+
+
+def _write_outputs(configs, results, verdicts, out_dir):
+  """Samples CSV + one [measured] line per config. Returns the sample count."""
   labels = [_label(*c) for c in configs]
   csv_path = os.path.join(out_dir, 'h2h_multihost_samples.csv')
   with open(csv_path, 'w', newline='') as f:
@@ -901,94 +921,36 @@ def _write_outputs(stage, configs, results, verdicts, out_dir):
                       f'{m["p50_ms"]:.4f}', f'{m["p90_ms"]:.4f}',
                       f'{m["p99_ms"]:.4f}', int(m['total_bytes']), integ])
 
-  is_gate = (stage == 'gate')
-  per_config = {}
   for label in labels:
-    r = results.get(label, {})
-    s = r.get('samples', [])
-    a = h2h_dist.assess(s, verdicts.get(label, False), _MIN_SAMPLES.value,
-                        _MAX_MARGIN.value, k=_SIGMA_K.value,
-                        gate_iters=_GATE_ITERS.value, bootstrap=not is_gate)
-    a['run_medians'] = [m['gbs'] for m in r.get('raw', []) if m.get('samples')]
-    a['active_ifaces'] = _active_ifaces(r)
-    per_config[label] = a
-  ranking = h2h_dist.rank(per_config)
-
-  summary = {'contract_version': _CONTRACT_VERSION, 'stage': stage,
-             'iters': _ITERS.value, 'runs_per_config': max(1, _RUNS.value),
-             'gate_iters': _GATE_ITERS.value, 'sigma_k': _SIGMA_K.value,
-             'max_margin': _MAX_MARGIN.value, 'configs': per_config,
-             'ranking': ranking}
-  with open(os.path.join(out_dir, 'h2h_multihost_summary.json'), 'w') as f:
-    f.write(h2h_dist.to_json(summary))
-  suitable = [c for c in configs if per_config[_label(*c)].get('suitable')]
-  suggested = {
-      'configs_flag': '--configs=' + ','.join(f'{bs}:{nb}:{p}' for bs, nb, p in suitable),
-      'metrics': [f'metrics {{ name: "{_label(*c)}/cpp_gbs" unit: "GB/s" '
-                  'stats { stat: MEAN } stats { stat: MEDIAN } }' for c in suitable],
-  }
-  if not is_gate:
-    with open(os.path.join(out_dir, 'h2h_multihost_report.md'), 'w') as f:
-      f.write(h2h_dist.render_markdown(stage, per_config, ranking,
-                                       _SIGMA_K.value, _MAX_MARGIN.value,
-                                       _GATE_ITERS.value, suggested))
-    floors = {label: a.get('floor_effective') for label, a in per_config.items()
-              if a.get('floor_effective')}
-    with open(os.path.join(out_dir, 'h2h_multihost_dist.svg'), 'w') as f:
-      f.write(h2h_dist.render_svg(
-          {label: results.get(label, {}).get('samples', []) for label in labels},
-          floors, title=f'H2H multi-host {stage}: GB/s per iteration'))
-
-  for label in ranking:
-    a = per_config[label]
-    if 'n' in a:
-      p_txt = (f'  p_below_floor(median of {_GATE_ITERS.value})={a["p_below_floor"]:.4f}'
-               if a.get('p_below_floor') is not None else '')
-      print(f'[measured] {label:<22} n={a["n"]:<5} median={a["median"]:8.3f}  '
-            f'p10={a["p10"]:8.3f}  p90={a["p90"]:8.3f}  '
-            f'cv_robust={a["cv_robust"]:6.3f}  low_tail={a["low_tail_frac"]:5.3f}  '
-            f'floor={a["floor_effective"]:8.3f}{p_txt}  '
-            f'integrity={"OK" if a["integrity"] else "CORRUPT"}  '
-            f'{"SUITABLE" if a["suitable"] else "not suitable: " + "; ".join(a["reasons"])}',
-            flush=True)
+    s = results.get(label, {}).get('samples', [])
+    integ = bool(verdicts.get(label, False))
+    if s:
+      print(f'[measured] {label:<22} n={len(s):<5} '
+            f'median={statistics.median(s):8.3f}  p10={_pct(s, 10):8.3f}  '
+            f'p90={_pct(s, 90):8.3f}  min={min(s):8.3f}  max={max(s):8.3f}  '
+            f'stdev={statistics.pstdev(s):6.3f} GB/s  '
+            f'integrity={"OK" if integ else "CORRUPT"}', flush=True)
     else:
       print(f'[measured] {label:<22} no samples  '
-            f'integrity={"OK" if a.get("integrity") else "CORRUPT"}', flush=True)
-  if not is_gate:
-    if suitable:
-      print(f'\nSuitable configs -> paste into the record and gate registries:\n'
-            f'  {suggested["configs_flag"]}', flush=True)
-    else:
-      print('\nNo config is suitable yet (see the reasons above).', flush=True)
-    print(f'\nWrote {csv_path}, h2h_multihost_summary.json, '
-          f'h2h_multihost_report.md, h2h_multihost_dist.svg -> {out_dir}',
-          flush=True)
-  else:
-    print(f'\nWrote {csv_path}, h2h_multihost_summary.json -> {out_dir}',
-          flush=True)
-  return per_config, ranking
+            f'integrity={"OK" if integ else "CORRUPT"}', flush=True)
+  print(f'\nWrote {csv_path} -> {out_dir}', flush=True)
+  return sum(len(results.get(label, {}).get('samples', [])) for label in labels)
 
 
-def _write_baselines(configs, results, verdicts, per_config, out_dir):
+def _write_baselines(configs, results, verdicts, out_dir):
   cfg = {'contract_version': _CONTRACT_VERSION, 'sigma_k': _SIGMA_K.value,
          'max_margin': _MAX_MARGIN.value, 'iters': _ITERS.value,
-         'runs_per_config': max(1, _RUNS.value),
-         'gate_iters': _GATE_ITERS.value, 'configs': {}}
+         'runs_per_config': max(1, _RUNS.value), 'configs': {}}
   for c in configs:
     label = _label(*c)
     s = results.get(label, {}).get('samples', [])
-    a = per_config.get(label, {})
     cfg['configs'][label] = {
         'baseline_gbs': round(statistics.median(s), 3) if s else 0.0,
-        'floor_gbs': round(h2h_dist.core_floor(s, _SIGMA_K.value,
-                                               _MAX_MARGIN.value), 3) if s else 0.0,
-        'floor_uncapped_gbs': round(a['floor_candidates'][f'{_SIGMA_K.value:.1f}'], 3)
-                              if a.get('floor_candidates', {}).get(f'{_SIGMA_K.value:.1f}') is not None else 0.0,
-        'p_below_floor': a.get('p_below_floor'),
-        'suitable': bool(a.get('suitable', False)),
+        'floor_gbs': round(_core_floor(s, _SIGMA_K.value,
+                                       _MAX_MARGIN.value), 3) if s else 0.0,
         'integrity': bool(verdicts.get(label, False)),
         'n_samples': len(s),
-        'active_ifaces': a.get('active_ifaces'),
+        'active_ifaces': _active_ifaces(results.get(label, {})),
     }
   path = os.path.join(out_dir, 'h2h_multihost_baselines.json')
   with open(path, 'w') as f:
@@ -1010,11 +972,6 @@ def _gate(configs, results, verdicts):
     except (OSError, ValueError) as e:
       print(f'[gate] baselines unreadable ({e}); throughput floors disabled.',
             file=sys.stderr, flush=True)
-  rec_iters = base.get('gate_iters')
-  if floors and rec_iters and rec_iters != _ITERS.value:
-    print(f'[gate] WARNING: floors were calibrated for the median of '
-          f'{rec_iters} iterations but this run uses --iters={_ITERS.value}; '
-          'the flap probability estimate does not apply.', flush=True)
 
   bad = []
   print('\nH2H multi-host gate\n')
@@ -1134,7 +1091,7 @@ def main(_):
                                        _PEER_PORT.value, _popen)
 
   out_dir = _out_dir()
-  per_config, _ = _write_outputs(stage, configs, results, verdicts, out_dir)
+  total = _write_outputs(configs, results, verdicts, out_dir)
 
   scalars = {}
   for c in configs:
@@ -1146,13 +1103,8 @@ def main(_):
   if scalars:
     bap_metrics.emit(scalars)
 
-  rc = None
-  total = sum(a.get('n', 0) for a in per_config.values())
-  if stage == 'analyze':
-    print('\nanalyze: done (no gate).', flush=True)
-    rc = 0 if total else 1
-  elif stage == 'record':
-    _write_baselines(configs, results, verdicts, per_config, out_dir)
+  if stage == 'record':
+    _write_baselines(configs, results, verdicts, out_dir)
     rc = 0 if total else 1
   else:
     rc = _gate(configs, results, verdicts)

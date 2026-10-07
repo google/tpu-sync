@@ -9,13 +9,13 @@
 # bazel-* symlink writes into user_repo.
 benchmarks {
   name: "h2h_multihost_record"
-  description: "Re-measure the cross-host H2H configs and emit h2h_multihost_baselines.json ({baseline_gbs, floor_gbs, integrity, n_samples} per label, floor = max(median - sigma_k*MAD_sigma, median*(1 - max_margin))) alongside samples CSV / summary / report / SVG as workload artifacts. Keep only the P=1 gate config (1048576B_x64_P1) in tpu_sync/benchmarks/h2h_multihost_baselines.json and commit it. Large iters*runs on purpose: the MAD sigma estimate is noisy from few samples. Must run on the same hardware the gate runs on."
+  description: "Re-measure the cross-host H2H configs and emit h2h_multihost_baselines.json ({baseline_gbs, floor_gbs, integrity, n_samples} per label, floor = max(median - sigma_k*MAD_sigma, median*(1 - max_margin))) alongside the per-iteration samples CSV as workload artifacts. Keep only the P=1 gate config (1048576B_x64_P1) in tpu_sync/benchmarks/h2h_multihost_baselines.json and commit it. Large iters*runs on purpose: the MAD sigma estimate is noisy from few samples. Must run on the same hardware the gate runs on."
   owner: "raiden-dev"
 
   workload {
     action: "./ml_actions/actions/workload_executors/bazel"
     action_inputs { key: "target" value: "//tpu_sync/benchmarks:h2h_multihost_bench" }
-    action_inputs { key: "runtime_flags" value: "--mode=spmd --num_workers=4 --data_interface=eth0 --stage=record --suite=both --iters=200 --runs_per_config=3 --gate_iters=50 --timeout_s=5400" }
+    action_inputs { key: "runtime_flags" value: "--mode=spmd --num_workers=4 --data_interface=eth0 --stage=record --suite=both --iters=200 --runs_per_config=3 --timeout_s=5400" }
   }
 
   environment_configs {

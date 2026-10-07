@@ -83,14 +83,7 @@ py_binary(
     ],
 )
 
-# Stats, gate floors, config ranking and SVG plots (stdlib only).
-py_library(
-    name = "h2h_dist",
-    testonly = True,
-    srcs = ["h2h_dist.py"],
-)
-
-# Cross-host H2H driver: --stage=analyze|record|gate on a BAP multi-host job.
+# Cross-host H2H driver: --stage=record|gate on a BAP multi-host job.
 py_binary(
     name = "h2h_multihost_bench",
     testonly = True,
@@ -101,7 +94,6 @@ py_binary(
     ],
     deps = [
         ":bap_metrics",
-        ":h2h_dist",
         "@com_google_absl_py//absl:app",
         "@com_google_absl_py//absl/flags",
     ],

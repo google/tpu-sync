@@ -20,7 +20,6 @@
   "max_margin": 0.10,
   "iters": 200,
   "runs_per_config": 3,
-  "gate_iters": 50,
   "configs": {
     "1048576B_x64_P1": {
       "baseline_gbs": 1.353,

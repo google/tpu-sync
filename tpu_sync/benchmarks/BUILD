@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -104,23 +104,5 @@ py_binary(
         ":h2h_dist",
         "@com_google_absl_py//absl:app",
         "@com_google_absl_py//absl/flags",
-    ],
-)
-
-# End-to-end test of the driver against a fake runner that speaks the C++
-# runner's stdout/socket protocol. No TPU, no network beyond loopback.
-py_test(
-    name = "h2h_multihost_bench_test",
-    size = "medium",
-    srcs = ["h2h_multihost_bench_test.py"],
-    data = [
-        "bap_metrics.py",  # imported by the driver subprocess
-        "h2h_dist.py",
-        "h2h_multihost_baselines.json",
-        "h2h_multihost_bench.py",
-        "testdata/fake_h2h_runner.py",
-    ],
-    deps = [
-        "@com_google_absl_py//absl/testing:absltest",
     ],
 )

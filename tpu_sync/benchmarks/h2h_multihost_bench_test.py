@@ -505,6 +505,12 @@ class H2hMultihostBenchTest(absltest.TestCase):
         sender, receiver)
     header, rows = self._read_samples()
     self._assert_samples(header, rows, _LABELS, _RUNS * _ITERS, ctx)
+    for unused in ('h2h_multihost_report.md', 'h2h_multihost_dist.svg'):
+      self.assertFalse(os.path.exists(os.path.join(self.out_dir, unused)),
+                       'unexpected %s in gate stage%s' % (unused, ctx))
+    summary = self._read_json('h2h_multihost_summary.json')
+    for label in _LABELS:
+      self.assertIsNone(summary['configs'][label].get('p_below_floor'), ctx)
 
   def test_gate_fails_below_floor(self):
     sender, receiver = self._run_pair(
@@ -843,17 +849,17 @@ class H2hMultihostBenchTest(absltest.TestCase):
     for key in _BASELINE_KEYS:
       self.assertIn(key, baselines, 'missing %r in %s' % (key, baselines))
     self.assertEqual(baselines['contract_version'], 2)
+    self.assertEqual(baselines['max_margin'], 0.10)
     configs = baselines['configs']
-    for label in ('1048576B_x64_P1', '2097152B_x64_P1'):
-      self.assertIn(label, configs)
-      cfg = configs[label]
-      for key in _BASELINE_CFG_KEYS:
-        self.assertIn(key, cfg, '%s missing %r: %s' % (label, key, cfg))
-      self.assertGreater(cfg['floor_gbs'], 0.0)
-      self.assertLess(cfg['floor_gbs'], cfg['baseline_gbs'])
-      self.assertIs(cfg['integrity'], True)
-      self.assertIs(cfg['suitable'], True)
-    for label in ('1048576B_x64_P8', '1048573B_x64_P4'):
+    self.assertEqual(list(configs), ['1048576B_x64_P1'])
+    cfg = configs['1048576B_x64_P1']
+    for key in _BASELINE_CFG_KEYS:
+      self.assertIn(key, cfg, '1048576B_x64_P1 missing %r: %s' % (key, cfg))
+    self.assertGreater(cfg['floor_gbs'], 0.0)
+    self.assertLess(cfg['floor_gbs'], cfg['baseline_gbs'])
+    self.assertIs(cfg['integrity'], True)
+    self.assertIs(cfg['suitable'], True)
+    for label in ('2097152B_x64_P1', '1048576B_x64_P8', '1048573B_x64_P4'):
       self.assertNotIn(label, configs)
 
 

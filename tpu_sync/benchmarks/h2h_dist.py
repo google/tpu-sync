@@ -108,7 +108,7 @@ def summarize(samples):
 
 def assess(samples, integrity, min_samples, max_margin, k=3.5, gate_iters=50,
            max_cv=DEFAULT_MAX_CV_ROBUST, max_low_tail=DEFAULT_MAX_LOW_TAIL,
-           max_p_below_floor=DEFAULT_MAX_P_BELOW_FLOOR):
+           max_p_below_floor=DEFAULT_MAX_P_BELOW_FLOOR, bootstrap=True):
   """summarize() plus floors, the bootstrapped gate statistic and a verdict.
 
   Keys added: floor_candidates (UNCAPPED median - k*sigma for each k in
@@ -131,14 +131,21 @@ def assess(samples, integrity, min_samples, max_margin, k=3.5, gate_iters=50,
                            for kk in FLOOR_K_CANDIDATES}
   s['cap'] = med * (1.0 - max_margin)
   s['floor_effective'] = core_floor(samples, k, max_margin)
-  meds = bootstrap_medians(samples, gate_iters)
-  gsig = mad_sigma(meds)
-  s['gate_iters'] = gate_iters
-  s['gate_median_sigma'] = gsig
-  s['gate_cv'] = (gsig / med) if med > 0 else float('inf')
-  s['gate_p01'] = pct(meds, 1) if meds else None
-  s['p_below_floor'] = (sum(1 for m in meds if m < s['floor_effective']) /
-                        len(meds)) if meds else 1.0
+  if bootstrap:
+    meds = bootstrap_medians(samples, gate_iters)
+    gsig = mad_sigma(meds)
+    s['gate_iters'] = gate_iters
+    s['gate_median_sigma'] = gsig
+    s['gate_cv'] = (gsig / med) if med > 0 else float('inf')
+    s['gate_p01'] = pct(meds, 1) if meds else None
+    s['p_below_floor'] = (sum(1 for m in meds if m < s['floor_effective']) /
+                          len(meds)) if meds else 1.0
+  else:
+    s['gate_iters'] = gate_iters
+    s['gate_median_sigma'] = None
+    s['gate_cv'] = None
+    s['gate_p01'] = None
+    s['p_below_floor'] = None
 
   if s['n'] < min_samples:
     reasons.append(f'n={s["n"]} < min_samples={min_samples}')
@@ -146,7 +153,7 @@ def assess(samples, integrity, min_samples, max_margin, k=3.5, gate_iters=50,
     reasons.append(f'cv_robust={s["cv_robust"]:.3f} > {max_cv}')
   if s['low_tail_frac'] > max_low_tail:
     reasons.append(f'low_tail_frac={s["low_tail_frac"]:.3f} > {max_low_tail}')
-  if s['p_below_floor'] > max_p_below_floor:
+  if s['p_below_floor'] is not None and s['p_below_floor'] > max_p_below_floor:
     reasons.append(f'p_below_floor={s["p_below_floor"]:.4f} > '
                    f'{max_p_below_floor} (gate would flap)')
   s['suitable'] = not reasons

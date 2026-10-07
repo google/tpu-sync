@@ -12,18 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Step 2 of analyze -> record -> gate: re-measure and emit h2h_multihost_baselines.json.
-# Copy it from the bundle (or the data branch) to tpu_sync/benchmarks/ and commit it for the gate.
+# Re-record cross-host H2H gate floors on the multi-host runner, download
+# h2h_multihost_baselines.json from the run's BAP artifact, keep only the P=1
+# gate config, and commit it to tpu_sync/benchmarks/h2h_multihost_baselines.json.
 name: H2H Multi-Host Record
 
 on:
   workflow_dispatch:
-    inputs:
-      publish_branch:
-        description: "Branch that receives the bundled artifacts (CSV/SVG/report/baselines) under h2h_multihost/."
-        required: false
-        type: string
-        default: "benchmark-data"
 
 permissions:
   contents: read
@@ -39,16 +34,3 @@ jobs:
       registry_file: "tpu_sync/benchmarks/benchmark_registry_h2h_multihost_record.pbtxt"
       bap_ref: "82682aceae058a272d67c5e8bb4e8eba2da7b7c2"
       runner: "linux-x86-n2-8"
-
-  # Optional: cache the bundle on a branch. Delete this job if you only want the
-  # downloadable Actions artifact.
-  publish:
-    needs: record
-    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && needs.record.outputs.job_id != '' }}
-    uses: ./.github/workflows/h2h_publish_results.yml
-    permissions:
-      contents: write
-    with:
-      job_id: ${{ needs.record.outputs.job_id }}
-      stage: record
-      publish_branch: ${{ inputs.publish_branch }}

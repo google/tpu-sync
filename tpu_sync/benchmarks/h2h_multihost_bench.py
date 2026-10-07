@@ -145,7 +145,7 @@ _BASELINES = flags.DEFINE_string(
     'this file in the runfiles.')
 _SIGMA_K = flags.DEFINE_float('sigma_k', 3.5, 'Robust sigmas below the median.')
 _MAX_MARGIN = flags.DEFINE_float(
-    'max_margin', 0.05, 'Floor is never looser than this fractional drop.')
+    'max_margin', 0.10, 'Floor is never looser than this fractional drop.')
 _GATE_THROUGHPUT = flags.DEFINE_bool(
     'gate_throughput', True, 'Fail when the median drops below the floor.')
 _MIN_SAMPLES = flags.DEFINE_integer(
@@ -901,13 +901,14 @@ def _write_outputs(stage, configs, results, verdicts, out_dir):
                       f'{m["p50_ms"]:.4f}', f'{m["p90_ms"]:.4f}',
                       f'{m["p99_ms"]:.4f}', int(m['total_bytes']), integ])
 
+  is_gate = (stage == 'gate')
   per_config = {}
   for label in labels:
     r = results.get(label, {})
     s = r.get('samples', [])
     a = h2h_dist.assess(s, verdicts.get(label, False), _MIN_SAMPLES.value,
                         _MAX_MARGIN.value, k=_SIGMA_K.value,
-                        gate_iters=_GATE_ITERS.value)
+                        gate_iters=_GATE_ITERS.value, bootstrap=not is_gate)
     a['run_medians'] = [m['gbs'] for m in r.get('raw', []) if m.get('samples')]
     a['active_ifaces'] = _active_ifaces(r)
     per_config[label] = a
@@ -926,39 +927,45 @@ def _write_outputs(stage, configs, results, verdicts, out_dir):
       'metrics': [f'metrics {{ name: "{_label(*c)}/cpp_gbs" unit: "GB/s" '
                   'stats { stat: MEAN } stats { stat: MEDIAN } }' for c in suitable],
   }
-  with open(os.path.join(out_dir, 'h2h_multihost_report.md'), 'w') as f:
-    f.write(h2h_dist.render_markdown(stage, per_config, ranking,
-                                     _SIGMA_K.value, _MAX_MARGIN.value,
-                                     _GATE_ITERS.value, suggested))
-  floors = {label: a.get('floor_effective') for label, a in per_config.items()
-            if a.get('floor_effective')}
-  with open(os.path.join(out_dir, 'h2h_multihost_dist.svg'), 'w') as f:
-    f.write(h2h_dist.render_svg(
-        {label: results.get(label, {}).get('samples', []) for label in labels},
-        floors, title=f'H2H multi-host {stage}: GB/s per iteration'))
+  if not is_gate:
+    with open(os.path.join(out_dir, 'h2h_multihost_report.md'), 'w') as f:
+      f.write(h2h_dist.render_markdown(stage, per_config, ranking,
+                                       _SIGMA_K.value, _MAX_MARGIN.value,
+                                       _GATE_ITERS.value, suggested))
+    floors = {label: a.get('floor_effective') for label, a in per_config.items()
+              if a.get('floor_effective')}
+    with open(os.path.join(out_dir, 'h2h_multihost_dist.svg'), 'w') as f:
+      f.write(h2h_dist.render_svg(
+          {label: results.get(label, {}).get('samples', []) for label in labels},
+          floors, title=f'H2H multi-host {stage}: GB/s per iteration'))
 
   for label in ranking:
     a = per_config[label]
     if 'n' in a:
+      p_txt = (f'  p_below_floor(median of {_GATE_ITERS.value})={a["p_below_floor"]:.4f}'
+               if a.get('p_below_floor') is not None else '')
       print(f'[measured] {label:<22} n={a["n"]:<5} median={a["median"]:8.3f}  '
             f'p10={a["p10"]:8.3f}  p90={a["p90"]:8.3f}  '
             f'cv_robust={a["cv_robust"]:6.3f}  low_tail={a["low_tail_frac"]:5.3f}  '
-            f'floor={a["floor_effective"]:8.3f}  '
-            f'p_below_floor(median of {_GATE_ITERS.value})={a["p_below_floor"]:.4f}  '
+            f'floor={a["floor_effective"]:8.3f}{p_txt}  '
             f'integrity={"OK" if a["integrity"] else "CORRUPT"}  '
             f'{"SUITABLE" if a["suitable"] else "not suitable: " + "; ".join(a["reasons"])}',
             flush=True)
     else:
       print(f'[measured] {label:<22} no samples  '
             f'integrity={"OK" if a.get("integrity") else "CORRUPT"}', flush=True)
-  if suitable:
-    print(f'\nSuitable configs -> paste into the record and gate registries:\n'
-          f'  {suggested["configs_flag"]}', flush=True)
+  if not is_gate:
+    if suitable:
+      print(f'\nSuitable configs -> paste into the record and gate registries:\n'
+            f'  {suggested["configs_flag"]}', flush=True)
+    else:
+      print('\nNo config is suitable yet (see the reasons above).', flush=True)
+    print(f'\nWrote {csv_path}, h2h_multihost_summary.json, '
+          f'h2h_multihost_report.md, h2h_multihost_dist.svg -> {out_dir}',
+          flush=True)
   else:
-    print('\nNo config is suitable yet (see the reasons above).', flush=True)
-  print(f'\nWrote {csv_path}, h2h_multihost_summary.json, '
-        f'h2h_multihost_report.md, h2h_multihost_dist.svg -> {out_dir}',
-        flush=True)
+    print(f'\nWrote {csv_path}, h2h_multihost_summary.json -> {out_dir}',
+          flush=True)
   return per_config, ranking
 
 

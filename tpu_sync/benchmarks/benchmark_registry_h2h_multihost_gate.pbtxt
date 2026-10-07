@@ -9,7 +9,7 @@
 # bazel-* symlink writes into user_repo.
 benchmarks {
   name: "h2h_multihost_gate"
-  description: "Cross-host H2H gate over the real NIC. Fails on DATA CORRUPTION (receiver byte check), NO MEASUREMENT, or median GB/s below the floor recorded in h2h_multihost_baselines.json; a label with no floor prints NO FLOOR and does not fail. Starts on the correctness suite; once the analyze stage has picked the stable configs, narrow the set here with --configs=bs:nb:p,... (that flag overrides --suite) and trim the metrics list to match."
+  description: "Cross-host H2H gate over the real NIC on the correctness suite (1048576B_x64_P1, 1048576B_x64_P8, 1048573B_x64_P4). Fails on DATA CORRUPTION (receiver byte check), NO MEASUREMENT, NO VERDICT, or median GB/s below the floor recorded in h2h_multihost_baselines.json; configs without a recorded floor print NO FLOOR and gate on byte-integrity only."
   owner: "raiden-dev"
 
   workload {

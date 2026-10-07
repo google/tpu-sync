@@ -77,11 +77,19 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//third_party/jax:raiden_jax_version",
-        "@com_google_absl//absl/types:span",
+        "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:xla_compat",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@nanobind",
         "@rules_python//python/cc:current_py_cc_headers",
+        "@xla//xla:shape_util",
         "@xla//xla/pjrt:pjrt_client",
+        "@xla//xla/python:nb_numpy",
+        "@xla//xla/python:types",
         "@xla//xla/python/ifrt",
         "@xla//xla/python/pjrt_ifrt",
+        "@xla//xla/tsl/python/lib/core:numpy",
     ],
 )
 
@@ -106,10 +114,6 @@ cc_library(
         "@nanobind",
         "@rules_python//python/cc:current_py_cc_headers",
         "@xla//xla:shape_util",
-        "@xla//xla/pjrt:pjrt_layout",
-        "@xla//xla/pjrt:raw_buffer",
-        "@xla//xla/python:nb_numpy",
-        "@xla//xla/python:types",
     ],
 )
 

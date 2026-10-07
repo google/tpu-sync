@@ -16,20 +16,78 @@
 
 #include <Python.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <new>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "absl/types/span.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/vector.h>  // IWYU pragma: keep
+#include "xla/layout.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/python/ifrt/array.h"
 #include "xla/python/ifrt/client.h"
+#include "xla/python/nb_numpy.h"
 #include "xla/python/pjrt_ifrt/pjrt_array.h"
+#include "xla/python/types.h"
+#include "xla/shape.h"
+#include "xla/shape_util.h"
+#include "xla/tsl/python/lib/core/numpy.h"
+#include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/xla_compat.h"
+
+namespace nb = nanobind;
 
 namespace raiden {
 namespace {
+
+#if RAIDEN_JAX >= 1101
+
+// numpy's C API is a table each extension fills for itself with import_array;
+// the jaxlib in this process has filled its own, not ours.
+void EnsureNumpyImported() {
+  [[maybe_unused]] static const bool imported = [] {
+    tsl::ImportNumpy();
+    if (PyErr_Occurred()) throw nb::python_error();
+    return true;
+  }();
+}
+
+xla::PrimitiveType PrimitiveTypeOf(nb::handle dtype) {
+  absl::StatusOr<xla::PrimitiveType> type =
+      xla::DtypeToPrimitiveType(nb::cast<xla::nb_dtype>(dtype));
+  if (!type.ok()) {
+    throw std::runtime_error(
+        absl::StrCat("Unsupported dtype: ", type.status().message()));
+  }
+  return *type;
+}
+
+// Rebuilds the XLA layout from jax.Array.format.layout: the three fields jax
+// keeps of a PjRtLayout, and all that raiden reads of one.
+xla::Layout LayoutOf(nb::handle layout) {
+  std::vector<int64_t> minor_to_major =
+      nb::cast<std::vector<int64_t>>(layout.attr("major_to_minor"));
+  std::reverse(minor_to_major.begin(), minor_to_major.end());
+  xla::Layout result(minor_to_major);
+  nb::object tiling = layout.attr("tiling");
+  if (!tiling.is_none()) {
+    for (nb::handle tile : tiling) {
+      *result.add_tiles() = xla::Tile(nb::cast<std::vector<int64_t>>(tile));
+    }
+  }
+  result.set_element_size_in_bits(
+      nb::cast<int64_t>(layout.attr("sub_byte_element_size_in_bits")));
+  return result;
+}
+
+#else  // RAIDEN_JAX < 1101
 
 #if RAIDEN_JAX >= 1100
 // Returns the runtime jaxlib version as (major * 10000 + minor * 100 + patch),
@@ -151,8 +209,8 @@ xla::ifrt::PjRtCompatibleArray* CastToPjRtCompatibleArray(
   return static_cast<xla::ifrt::PjRtCompatibleArray*>(ifrt_array);
 }
 
-}  // namespace
-
+// Returns the PjRtBuffer backing a single-device PyArray. Throws
+// std::runtime_error if the array is uninitialized or not PjRt-backed.
 xla::PjRtBuffer* PjRtBufferFromPyArray(PyObject* obj) {
   auto* arr = CastToPjRtCompatibleArray(GetIfrtArray(obj));
   if (arr == nullptr) {
@@ -163,8 +221,42 @@ xla::PjRtBuffer* PjRtBufferFromPyArray(PyObject* obj) {
   return arr->pjrt_buffers().front().get();
 }
 
-xla::ifrt::Array* IfrtArrayFromPyArray(PyObject* obj) {
-  return GetIfrtArray(obj);
+#endif  // RAIDEN_JAX >= 1101
+
+}  // namespace
+
+RaidenBufferHandle AcquireShardBuffer(PyObject* shard_data,
+                                      bool unsafe_skip_buffer_lock) {
+#if RAIDEN_JAX >= 1101
+  // jax 0.11.1 added Array.unsafe_raw_buffer(); with it the buffer, shape and
+  // layout are all public attributes.
+  EnsureNumpyImported();
+  nb::handle shard(shard_data);
+  nb::object raw = shard.attr("unsafe_raw_buffer")();
+  auto* raw_buffer =
+      reinterpret_cast<RawBuffer*>(nb::cast<std::uintptr_t>(raw.attr("ptr")));
+  xla::Shape shape = xla::ShapeUtil::MakeShape(
+      PrimitiveTypeOf(shard.attr("dtype")),
+      nb::cast<std::vector<int64_t>>(shard.attr("shape")));
+  nb::object layout = shard.attr("format").attr("layout");
+  if (!layout.is_none()) {
+    *shape.mutable_layout() = LayoutOf(layout);
+  }
+  absl::StatusOr<RaidenBufferHandle> handle =
+      RaidenBufferHandle::AcquireFromRaw(raw_buffer, shape,
+                                         unsafe_skip_buffer_lock);
+#else
+  // Older jaxlibs expose no raw buffer: go through the PjRtBuffer that the
+  // PyArray mirror above reaches.
+  absl::StatusOr<RaidenBufferHandle> handle =
+      RaidenBufferHandle::Acquire(PjRtBufferFromPyArray(shard_data), nullptr,
+                                  nullptr, unsafe_skip_buffer_lock);
+#endif
+  if (!handle.ok()) {
+    throw std::runtime_error(absl::StrCat("Failed to acquire buffer handle: ",
+                                          handle.status().message()));
+  }
+  return *std::move(handle);
 }
 
 }  // namespace raiden

@@ -24,14 +24,12 @@ BAP's multi-host runner executes this same target on every host of the slice
   worker 1  receiver -- runs the C++ receiver per config, serves readiness and
                         the byte-integrity verdicts to the sender over a small
                         TCP line protocol (--peer_port).
-  others    idle     -- write a done-marker and exit 0.
+  others    idle     -- exit 0.
 
-Peer discovery, in order: --peers, TPU_WORKER_HOSTNAMES, or a rendezvous file
-(receiver.json) the receiver drops into a shared --rendezvous_dir. When the
-receiver is discovered via receiver.json, the sender also waits for done
-markers from the other workers before exiting; when peers come from the hosts
-list (e.g. Kubernetes JobSets with per-pod workspaces), completion is
-synchronized over the TCP verdict exchange and no done-marker wait happens.
+Peers come from --peers or TPU_WORKER_HOSTNAMES (index-aligned with worker
+ids). Coordination is pure TCP: the sender polls the receiver's _PeerServer
+with READY before each run and fetches VERDICTS at the end, which also
+synchronizes completion.
 
 Both stages write the per-iteration samples CSV, print a [measured] summary
 line per config, and emit TensorBoard metrics.
@@ -60,27 +58,14 @@ from absl import flags
 
 from tpu_sync.benchmarks import bap_metrics
 
-# Bumped when the stdout / file / peer-protocol contract changes; the e2e test
-# keys on it.
-_CONTRACT_VERSION = 2
-
 # ---------------------------------------------------------------------------
 # Flags
 # ---------------------------------------------------------------------------
 
 _STAGE = flags.DEFINE_enum('stage', 'gate', ['record', 'gate'],
                            'record: write baselines; gate: pass/fail.')
-_MODE = flags.DEFINE_enum(
-    'mode', 'auto', ['auto', 'spmd', 'local'],
-    'spmd: every host runs this driver, roles from the worker index. local: '
-    'both roles on this machine over loopback. auto: spmd when a worker index '
-    'is known (--worker_id, JOB_COMPLETION_INDEX, TPU_WORKER_ID) or when '
-    'running under BAP (WORKLOAD_ARTIFACTS_DIR set), else local.')
 _SUITE = flags.DEFINE_enum('suite', 'correctness',
                            ['correctness', 'perf', 'both'], 'Config set.')
-_CONFIGS = flags.DEFINE_string(
-    'configs', '', 'Explicit configs "bs:nb:p,bs:nb:p" (bytes, blocks, '
-    'parallelism); overrides --suite.')
 _ITERS = flags.DEFINE_integer('iters', 5, 'Timed iterations per runner process.')
 _RUNS = flags.DEFINE_integer(
     'runs_per_config', 1, 'Independent runner processes per config; total '
@@ -88,25 +73,15 @@ _RUNS = flags.DEFINE_integer(
 
 _WORKER_ID = flags.DEFINE_integer('worker_id', -1,
                                   'This host index; overrides the env.')
-_NUM_WORKERS = flags.DEFINE_integer(
-    'num_workers', -1, 'Host count. When >= 2 and the rendezvous dir was used '
-    'for peer discovery, the sender waits for every other worker\'s '
-    'done-marker before exiting (BAP deletes the shared job dir when the '
-    'primary finishes).')
 _PEERS = flags.DEFINE_string(
     'peers', '', 'Comma-separated host list, index-aligned with worker ids; '
     'overrides TPU_WORKER_HOSTNAMES.')
 _SENDER_IDX = flags.DEFINE_integer('sender_index', 0, 'Worker that sends.')
 _RECEIVER_IDX = flags.DEFINE_integer('receiver_index', 1, 'Worker that receives.')
-_RENDEZVOUS_DIR = flags.DEFINE_string(
-    'rendezvous_dir', '', 'Shared directory for peer discovery and done '
-    'markers. Default: <dirname of $WORKLOAD_ARTIFACTS_DIR>/h2h_rendezvous '
-    'when that is set.')
-
 _CONTROL_IFACE = flags.DEFINE_string(
     'control_interface', '', 'Interface for the control-plane handshake. '
-    'Default: eth0 in spmd (falls back to --control_ip / the hostname\'s '
-    'address when eth0 does not exist), lo in local.')
+    'Default: eth0 (falls back to --control_ip / the hostname\'s address when '
+    'eth0 does not exist); lo for two drivers on one machine.')
 _CONTROL_IP = flags.DEFINE_string(
     'control_ip', '', 'Control-plane IP of this host when --control_interface '
     'cannot be resolved.')
@@ -114,8 +89,7 @@ _DATA_IFACE = flags.DEFINE_string(
     'data_interface', '', 'Comma-separated data-plane interfaces for the '
     'runner. Empty lets the runner auto-discover, which INCLUDES eth0 and any '
     'IPv6-only interface; pin it (eth0 on a single-NIC pod, the DRANET list '
-    'on a multi-NIC pod) so record and gate measure the same NICs. '
-    'Default lo in local mode.')
+    'on a multi-NIC pod) so record and gate measure the same NICs.')
 _NUMA_NODE = flags.DEFINE_integer('numa_node', -1, 'NUMA node to pin the runner to.')
 _CONTROL_PORT = flags.DEFINE_integer(
     'control_port', 9099, 'Base runner control port; config i run r uses '
@@ -162,16 +136,13 @@ _RE_P90 = re.compile(r'p90:\s*([0-9.]+)')
 _RE_P99 = re.compile(r'p99:\s*([0-9.]+)')
 _RE_MEAN_GBS = re.compile(r'Throughput:\s*([0-9.]+)')
 _RE_RAW_MS = re.compile(r'H2H_ITER_MS\s+([0-9.]+)')
-_RE_TOTAL_BYTES = re.compile(r'H2H_TOTAL_BYTES\s+(\d+)')
 _RE_IFACES = re.compile(r'Interfaces:\s*(\d+)\s*\(active:\s*(\d+)\)')
 _RE_AUTOSCALE = re.compile(r'Auto-scaling num_blocks to (\d+)')
 
-# Mirrors kNumLayers / kNumShards in h2h_benchmark_runner.cc; only used when
-# the runner does not print H2H_TOTAL_BYTES itself.
+# Mirrors kNumLayers / kNumShards in h2h_benchmark_runner.cc.
 _LAYERS = 32
 _SHARDS = 1
 
-_RENDEZVOUS_FILE = 'receiver.json'
 _READY_YES, _READY_NO, _READY_FAILED = '1', '0', 'X'
 
 # Filled in by main(): the control-plane flags handed to every runner process.
@@ -188,23 +159,6 @@ def _label(bs, nb, p):
 
 
 def _configs():
-  if _CONFIGS.value:
-    out = []
-    for item in _CONFIGS.value.split(','):
-      item = item.strip()
-      if not item:
-        continue
-      try:
-        bs, nb, p = (int(x) for x in item.split(':'))
-      except ValueError:
-        raise app.UsageError(
-            f'--configs item {item!r} must be bs:nb:p integers')
-      if bs <= 0 or nb <= 0 or p <= 0:
-        raise app.UsageError(f'--configs item {item!r}: all fields must be > 0')
-      out.append((bs, nb, p))
-    if not out:
-      raise app.UsageError('--configs is empty')
-    return out
   if _SUITE.value == 'correctness':
     return list(_CORRECTNESS_CONFIGS)
   if _SUITE.value == 'perf':
@@ -221,17 +175,6 @@ def _out_dir():
   d = _OUT_DIR.value or os.environ.get('WORKLOAD_ARTIFACTS_DIR') or os.getcwd()
   os.makedirs(d, exist_ok=True)
   return d
-
-
-def _rendezvous_dir():
-  if _RENDEZVOUS_DIR.value:
-    return _RENDEZVOUS_DIR.value
-  adir = os.environ.get('WORKLOAD_ARTIFACTS_DIR')
-  if adir:
-    # Sibling of the artifacts dir: on the shared BAP job volume, but neither
-    # uploaded nor scanned by tb_parser (which lists WORKLOAD_METADATA_DIR).
-    return os.path.join(os.path.dirname(os.path.abspath(adir)), 'h2h_rendezvous')
-  return ''
 
 
 def _baselines_path():
@@ -257,14 +200,6 @@ def _iface_ipv4(name):
     return None
 
 
-def _run_attempt():
-  return os.environ.get('GITHUB_RUN_ATTEMPT', '')
-
-
-def _run_id():
-  return os.environ.get('GITHUB_RUN_ID', '')
-
-
 # ---------------------------------------------------------------------------
 # Topology
 # ---------------------------------------------------------------------------
@@ -284,29 +219,12 @@ def _discover_topology():
   return wid, hosts
 
 
-def _under_bap():
-  return bool(os.environ.get('WORKLOAD_ARTIFACTS_DIR') or
-              os.environ.get('TENSORBOARD_OUTPUT_DIR'))
-
-
-def _detect_mode(worker_id):
-  if _MODE.value != 'auto':
-    return _MODE.value
-  if worker_id >= 0 or _under_bap():
-    return 'spmd'
-  return 'local'
-
-
-def _resolve_control_plane(mode):
+def _resolve_control_plane():
   """Sets _CONTROL_ARGS and returns this host's control-plane IP."""
   del _CONTROL_ARGS[:]
-  if mode == 'local':
-    iface = _CONTROL_IFACE.value or 'lo'
-    _CONTROL_ARGS.append(f'--control_interface={iface}')
-    return '127.0.0.1'
   iface = _CONTROL_IFACE.value or 'eth0'
   if iface == 'lo':
-    # Explicit loopback: spmd on one machine (tests, two shells on a laptop).
+    # Explicit loopback: both drivers on one machine (two shells on a laptop).
     _CONTROL_ARGS.append('--control_interface=lo')
     return '127.0.0.1'
   ip = _iface_ipv4(iface)
@@ -364,9 +282,7 @@ def _locate_runner():
 
 
 def _base_argv(cc, bs, nb, p, port):
-  # A .py runner (the test fake) is launched through this interpreter so it
-  # does not depend on an exec bit surviving the runfiles tree.
-  argv = ([sys.executable, cc] if cc.endswith('.py') else [cc])
+  argv = [cc]
   argv += [f'--data_interface={_DATA_IFACE.value}',
            f'--peer_control_port={port}', f'--block_size={bs}',
            f'--num_blocks={nb}', f'--parallelism={p}',
@@ -424,15 +340,11 @@ def _parse_sender(out, bs, nb):
   """Sender stdout -> per-iteration GB/s samples (+ the runner's own summary)."""
   ifm = _RE_IFACES.search(out or '')
   active = int(ifm.group(2)) if ifm else 1
-  m = _RE_TOTAL_BYTES.search(out or '')
-  if m:
-    total_bytes = float(m.group(1))
-  else:
-    # The runner caps num_blocks so one iteration stays <= 16 GiB per NIC and
-    # says so on stdout; honour that or GB/s would be inflated.
-    am = _RE_AUTOSCALE.search(out or '')
-    nb_eff = int(am.group(1)) if am else nb
-    total_bytes = float(active * _LAYERS * _SHARDS * nb_eff * bs)
+  # The runner caps num_blocks so one iteration stays <= 16 GiB per NIC and
+  # says so on stdout; honour that or GB/s would be inflated.
+  am = _RE_AUTOSCALE.search(out or '')
+  nb_eff = int(am.group(1)) if am else nb
+  total_bytes = float(active * _LAYERS * _SHARDS * nb_eff * bs)
   p50 = _f(_RE_P50, out)
   raw_gbs = [(total_bytes / 1e9) / (float(ms) / 1000.0)
              for ms in _RE_RAW_MS.findall(out or '') if float(ms) > 0]
@@ -586,114 +498,6 @@ def _await_peer(host, port, request, accept, timeout, what, interval=5):
 
 
 # ---------------------------------------------------------------------------
-# Rendezvous dir: receiver.json (receiver publishes, sender polls) and
-# worker_<id>.done markers (everyone but the sender writes one at exit).
-# ---------------------------------------------------------------------------
-
-
-def _write_atomic(path, payload):
-  os.makedirs(os.path.dirname(path), exist_ok=True)
-  tmp = f'{path}.{os.getpid()}.tmp'
-  with open(tmp, 'w') as f:
-    f.write(payload)
-  os.replace(tmp, path)
-
-
-def _publish_rendezvous(rdir, info):
-  path = os.path.join(rdir, _RENDEZVOUS_FILE)
-  _write_atomic(path, json.dumps(info))
-  print(f'[rendezvous] published {path}: {info}', flush=True)
-
-
-def _rendezvous_is_current(info, started_at):
-  """A receiver.json from another run, or an earlier attempt of this run, is stale."""
-  run_id = _run_id()
-  if run_id and info.get('run_id') and info['run_id'] != run_id:
-    return False
-  attempt = _run_attempt()
-  if attempt and info.get('attempt') and info['attempt'] != attempt:
-    return False
-  ts = info.get('ts')
-  if isinstance(ts, (int, float)) and ts < started_at - 3600:
-    return False
-  return bool(info.get('ip'))
-
-
-def _await_rendezvous(rdir, timeout, started_at, interval=5):
-  path = os.path.join(rdir, _RENDEZVOUS_FILE)
-  deadline = time.time() + timeout
-  attempt = 0
-  last_report = time.time()
-  stale_reported = False
-  while time.time() < deadline:
-    try:
-      with open(path) as f:
-        info = json.load(f)
-      if _rendezvous_is_current(info, started_at):
-        print(f'[rendezvous] found {path}: {info}', flush=True)
-        return info
-      if not stale_reported:
-        stale_reported = True
-        print(f'[rendezvous] ignoring stale {path}: {info}', flush=True)
-    except (OSError, ValueError):
-      pass
-    if time.time() - last_report >= 60:
-      last_report = time.time()
-      print(f'[rendezvous] still waiting for {path} '
-            f'({int(deadline - time.time())}s left)', flush=True)
-    time.sleep(_backoff(attempt, interval))
-    attempt += 1
-  print(f'[rendezvous] TIMEOUT waiting for {path}', flush=True)
-  return None
-
-
-def _write_done(rdir, worker_id):
-  if not rdir or worker_id < 0:
-    return
-  try:
-    _write_atomic(os.path.join(rdir, f'worker_{worker_id}.done'),
-                  json.dumps({'worker_id': worker_id, 'ts': time.time(),
-                              'run_id': _run_id(),
-                              'attempt': _run_attempt()}))
-  except OSError as e:
-    print(f'[barrier] could not write done marker: {e}', file=sys.stderr)
-
-
-def _await_done(rdir, worker_ids, timeout):
-  """Sender-side barrier: wait for every other worker's done marker."""
-  if not rdir or not worker_ids:
-    return
-  started = time.time()
-  deadline = started + timeout
-  pending = set(worker_ids)
-  attempt = 0
-  last_report = started
-  while pending and time.time() < deadline:
-    for wid in list(pending):
-      path = os.path.join(rdir, f'worker_{wid}.done')
-      try:
-        with open(path) as f:
-          info = json.load(f)
-        if _rendezvous_is_current({**info, 'ip': 'x'}, started):
-          pending.discard(wid)
-      except (OSError, ValueError):
-        pass
-    if not pending:
-      break
-    if time.time() - last_report >= 60:
-      last_report = time.time()
-      print(f'[barrier] waiting for workers {sorted(pending)} to finish '
-            f'({int(deadline - time.time())}s left)', flush=True)
-    time.sleep(_backoff(attempt, 5))
-    attempt += 1
-  if pending:
-    print(f'[barrier] workers {sorted(pending)} never wrote a done marker; '
-          'continuing (BAP will delete the shared job dir).', flush=True)
-  else:
-    print('[barrier] all workers done.', flush=True)
-
-
-# ---------------------------------------------------------------------------
 # Roles
 # ---------------------------------------------------------------------------
 
@@ -711,17 +515,11 @@ def _schedule(configs):
 
 
 def _run_receiver(cc, configs, worker_id, own_ip):
-  """SPMD receiver. Returns the process exit code."""
+  """Receiver role. Returns the process exit code."""
   srv = _PeerServer(_PEER_PORT.value)
   srv.start()
-  print(f'[receiver] peer channel on {own_ip}:{srv.port}', flush=True)
-  rdir = _rendezvous_dir()
-  if rdir:
-    _publish_rendezvous(rdir, {'ip': own_ip, 'hostname': socket.gethostname(),
-                               'peer_port': srv.port, 'worker_id': worker_id,
-                               'pid': os.getpid(), 'ts': time.time(),
-                               'run_id': _run_id(),
-                               'attempt': _run_attempt()})
+  print(f'[receiver] worker {worker_id}: peer channel on {own_ip}:{srv.port}',
+        flush=True)
 
   verdicts = {}
   aborted = False
@@ -803,62 +601,44 @@ def _run_receiver(cc, configs, worker_id, own_ip):
         f'to {wait}s for the sender to collect verdicts ...', flush=True)
   fetched = srv.fetched.wait(timeout=wait)
   srv.close()
-  _write_done(rdir, worker_id)
   if not fetched:
     print('[receiver] sender never collected the verdicts.', file=sys.stderr)
     return 1
   return 1 if aborted else 0
 
 
-def _run_sender(cc, configs, peer_ip, peer_port, spawn_receiver=None):
+def _run_sender(cc, configs, peer_ip, peer_port):
   """Runs every scheduled sender process.
 
-  spawn_receiver is None in spmd mode (the peer driver publishes readiness);
-  in local mode it is a callable(argv) -> Popen owning the receiver too.
-  Returns (results {label: {...}}, local_verdicts, aborted).
+  Waits for the peer driver to publish readiness before each run.
+  Returns (results {label: {...}}, aborted).
   """
   results = {}
-  local_verdicts = {}
   aborted = False
   sched = _schedule(configs)
   for idx, label, bs, nb, p, run, port in sched:
     argv = _base_argv(cc, bs, nb, p, port)
     r = results.setdefault(label, {'samples': [], 'raw': []})
-    recv_proc = recv_watcher = None
-    if spawn_receiver is None:
-      print(f'[sender] ({idx + 1}/{len(sched)}) {label} run {run}: waiting '
-            f'for peer receiver {peer_ip}:{peer_port}', flush=True)
-      ready = _await_peer(peer_ip, peer_port, f'READY {idx}',
-                          lambda rep: rep in (_READY_YES, _READY_FAILED),
-                          _STARTUP_TIMEOUT_S.value,
-                          f'receiver readiness for {label} run {run}')
-      if ready == _READY_FAILED:
-        print(f'[sender] {label} run {run}: receiver failed before listening; '
-              'skipping run', flush=True)
-        r['raw'].append({'run': run, 'rc': None, 'samples': [], 'gbs': -1.0,
-                         'mean_gbs': -1.0, 'p50_ms': -1.0, 'p90_ms': -1.0,
-                         'p99_ms': -1.0, 'total_bytes': 0,
-                         'active_ifaces': None, 'skipped': True})
-        continue
-      if ready != _READY_YES:
-        print(f'[sender] {label}: peer receiver never became ready. If this '
-              'is the first run, the peer is probably not running this '
-              'driver at all.', file=sys.stderr, flush=True)
-        aborted = True
-        break
-    else:
-      print(f'[sender] ({idx + 1}/{len(sched)}) {label} run {run}: local '
-            f'receiver on :{port}', flush=True)
-      recv_proc = spawn_receiver(argv + ['--role=receiver'])
-      recv_watcher = _StreamWatcher(recv_proc, _READY_MARKER)
-      recv_watcher.start()
-      recv_watcher.ready.wait(timeout=_STARTUP_TIMEOUT_S.value)
-      if _READY_MARKER not in recv_watcher.output:
-        print(f'[sender] {label}: local receiver never signalled ready.',
-              file=sys.stderr, flush=True)
-        recv_proc.kill()
-        aborted = True
-        break
+    print(f'[sender] ({idx + 1}/{len(sched)}) {label} run {run}: waiting '
+          f'for peer receiver {peer_ip}:{peer_port}', flush=True)
+    ready = _await_peer(peer_ip, peer_port, f'READY {idx}',
+                        lambda rep: rep in (_READY_YES, _READY_FAILED),
+                        _STARTUP_TIMEOUT_S.value,
+                        f'receiver readiness for {label} run {run}')
+    if ready == _READY_FAILED:
+      print(f'[sender] {label} run {run}: receiver failed before listening; '
+            'skipping run', flush=True)
+      r['raw'].append({'run': run, 'rc': None, 'samples': [], 'gbs': -1.0,
+                       'mean_gbs': -1.0, 'p50_ms': -1.0, 'p90_ms': -1.0,
+                       'p99_ms': -1.0, 'total_bytes': 0,
+                       'active_ifaces': None, 'skipped': True})
+      continue
+    if ready != _READY_YES:
+      print(f'[sender] {label}: peer receiver never became ready. If this '
+            'is the first run, the peer is probably not running this '
+            'driver at all.', file=sys.stderr, flush=True)
+      aborted = True
+      break
 
     send_proc = _popen(argv + ['--role=sender', f'--peer_control_ip={peer_ip}'])
     send_watcher = _StreamWatcher(send_proc, _READY_MARKER)
@@ -868,20 +648,12 @@ def _run_sender(cc, configs, peer_ip, peer_port, spawn_receiver=None):
     m['run'] = run
     m['rc'] = send_proc.returncode
 
-    if recv_proc is not None:
-      recv_out = _finish(recv_proc, recv_watcher, _TIMEOUT_S.value)
-      ok = (_INTEG_PASS in recv_out) and (_INTEG_FAIL not in recv_out)
-      local_verdicts[label] = local_verdicts.get(label, True) and ok
-      if not ok:
-        print(f'--- receiver tail ({label} run {run}) ---\n{recv_out[-4000:]}',
-              flush=True)
-
     if not m['samples']:
       print(f'[sender] {label} run {run} produced no throughput reading '
             f'(rc={send_proc.returncode}); output:\n{out[-4000:]}', flush=True)
     r['samples'].extend(m['samples'])
     r['raw'].append(m)
-  return results, local_verdicts, aborted
+  return results, aborted
 
 
 # ---------------------------------------------------------------------------
@@ -964,7 +736,7 @@ def _write_baselines(configs, results, verdicts, out_dir):
   """Writes h2h_multihost_baselines.json. Returns the labels whose data is
   incomplete (no samples, a skipped run, or no passing integrity verdict); the
   file is still written for diagnosis, but record must not exit 0 on them."""
-  cfg = {'contract_version': _CONTRACT_VERSION, 'sigma_k': _SIGMA_K.value,
+  cfg = {'sigma_k': _SIGMA_K.value,
          'max_margin': _MAX_MARGIN.value, 'iters': _ITERS.value,
          'runs_per_config': max(1, _RUNS.value), 'configs': {}}
   for c in configs:
@@ -1076,74 +848,50 @@ def _gate(configs, results, verdicts):
 
 
 def main(_):
-  started_at = time.time()
   worker_id, hosts = _discover_topology()
-  mode = _detect_mode(worker_id)
   configs = _configs()
   stage = _STAGE.value
 
-  if mode == 'local' and flags.FLAGS['data_interface'].using_default_value:
-    flags.FLAGS.data_interface = 'lo'
-  if mode == 'spmd' and worker_id < 0:
-    print('GATE FAIL: spmd mode but no worker index (set --worker_id, or run '
-          'under a runner that exports JOB_COMPLETION_INDEX / TPU_WORKER_ID).',
+  if worker_id < 0:
+    print('GATE FAIL: no worker index (set --worker_id, or run under a runner '
+          'that exports JOB_COMPLETION_INDEX / TPU_WORKER_ID).',
           file=sys.stderr, flush=True)
     sys.exit(1)
 
-  own_ip = _resolve_control_plane(mode)
+  own_ip = _resolve_control_plane()
   cc = _locate_runner()
-  rdir = _rendezvous_dir() if mode == 'spmd' else ''
-  print(f'[topology] mode={mode} stage={stage} worker_id={worker_id} '
-        f'hosts={hosts or "(rendezvous)"} sender={_SENDER_IDX.value} '
-        f'receiver={_RECEIVER_IDX.value} control_ip={own_ip} '
-        f'rendezvous_dir={rdir or "-"}', flush=True)
+  print(f'[topology] stage={stage} worker_id={worker_id} hosts={hosts} '
+        f'sender={_SENDER_IDX.value} receiver={_RECEIVER_IDX.value} '
+        f'control_ip={own_ip}', flush=True)
   print(f'[topology] configs={[_label(*c) for c in configs]} '
         f'iters={_ITERS.value} runs_per_config={max(1, _RUNS.value)} '
         f'runner={cc}', flush=True)
 
-  used_rendezvous = False
-  if mode == 'spmd':
-    if worker_id == _RECEIVER_IDX.value:
-      sys.exit(_run_receiver(cc, configs, worker_id, own_ip))
-    if worker_id != _SENDER_IDX.value:
-      print(f'[topology] worker {worker_id} is neither sender nor receiver; '
-            'nothing to do.', flush=True)
-      _write_done(rdir, worker_id)
-      return
-    peer_ip, peer_port = None, _PEER_PORT.value
-    if len(hosts) > _RECEIVER_IDX.value:
-      peer_ip = hosts[_RECEIVER_IDX.value]
-    else:
-      if not rdir:
-        print('GATE FAIL: no way to find the receiver: give --peers, set '
-              'TPU_WORKER_HOSTNAMES, or set --rendezvous_dir / '
-              'WORKLOAD_ARTIFACTS_DIR.', file=sys.stderr)
-        sys.exit(1)
-      info = _await_rendezvous(rdir, _STARTUP_TIMEOUT_S.value, started_at)
-      if not info:
-        print('GATE FAIL: the receiver never published its address; is worker '
-              f'{_RECEIVER_IDX.value} running this same target?',
-              file=sys.stderr)
-        sys.exit(1)
-      peer_ip, peer_port = info['ip'], int(info.get('peer_port', peer_port))
-      used_rendezvous = True
-    results, _, aborted = _run_sender(cc, configs, peer_ip, peer_port)
-    verdicts = {}
-    if aborted:
-      print('GATE FAIL: the peer receiver never became ready; run incomplete.',
-            file=sys.stderr)
-    else:
-      raw = _await_peer(peer_ip, peer_port, 'VERDICTS', bool,
-                        _TIMEOUT_S.value, 'receiver verdicts')
-      if not raw:
-        print("GATE FAIL: could not read the receiver's integrity verdicts; "
-              'nothing proves the bytes are correct.', file=sys.stderr)
-      else:
-        verdicts = json.loads(raw)
+  if worker_id == _RECEIVER_IDX.value:
+    sys.exit(_run_receiver(cc, configs, worker_id, own_ip))
+  if worker_id != _SENDER_IDX.value:
+    print(f'[topology] worker {worker_id} is neither sender nor receiver; '
+          'nothing to do.', flush=True)
+    return
+  if len(hosts) <= _RECEIVER_IDX.value:
+    print('GATE FAIL: no way to find the receiver: give --peers or set '
+          f'TPU_WORKER_HOSTNAMES with at least {_RECEIVER_IDX.value + 1} '
+          f'hosts (got {hosts}).', file=sys.stderr, flush=True)
+    sys.exit(1)
+  peer_ip, peer_port = hosts[_RECEIVER_IDX.value], _PEER_PORT.value
+  results, aborted = _run_sender(cc, configs, peer_ip, peer_port)
+  verdicts = {}
+  if aborted:
+    print('GATE FAIL: the peer receiver never became ready; run incomplete.',
+          file=sys.stderr)
   else:
-    aborted = False
-    results, verdicts, _ = _run_sender(cc, configs, '127.0.0.1',
-                                       _PEER_PORT.value, _popen)
+    raw = _await_peer(peer_ip, peer_port, 'VERDICTS', bool,
+                      _TIMEOUT_S.value, 'receiver verdicts')
+    if not raw:
+      print("GATE FAIL: could not read the receiver's integrity verdicts; "
+            'nothing proves the bytes are correct.', file=sys.stderr)
+    else:
+      verdicts = json.loads(raw)
 
   out_dir = _out_dir()
   total = _write_outputs(configs, results, verdicts, out_dir)
@@ -1163,22 +911,9 @@ def main(_):
     rc = 0 if total and not incomplete else 1
   else:
     rc = _gate(configs, results, verdicts)
-  if mode == 'spmd' and aborted:
+  if aborted:
     rc = 1
 
-  if mode == 'spmd':
-    n = _NUM_WORKERS.value if _NUM_WORKERS.value > 0 else len(hosts)
-    others = [w for w in range(n) if w != worker_id]
-    if len(others) >= 1 and rdir:
-      # Reading receiver.json from rdir is what proves rdir is shared across
-      # hosts; on Kubernetes JobSets each pod has an isolated workspace and
-      # peers come from the hosts list, while completion is already synchronized
-      # over the TCP VERDICTS exchange.
-      if used_rendezvous:
-        _await_done(rdir, others, _STARTUP_TIMEOUT_S.value)
-      else:
-        print('[barrier] skipping done-marker wait (receiver discovered via '
-              'hosts list; rendezvous dir not verified shared).', flush=True)
   sys.exit(rc)
 
 

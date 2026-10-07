@@ -1,11 +1,7 @@
-# runtime_flags: --mode=spmd (never fall back to loopback on BAP), --num_workers=4 (the
-# x4 label; when the receiver is discovered via receiver.json in a shared rendezvous
-# dir, the sender waits for the other hosts' done markers so primary cleanup cannot
-# delete the shared dir under them; when peers come from TPU_WORKER_HOSTNAMES / --peers
-# as on Kubernetes JobSets with per-pod workspaces, completion is synchronized over the
-# TCP verdict exchange and no done-marker wait happens), --data_interface=eth0 (pin the
-# data plane: runner auto-discovery includes eth0 and IPv6-only NICs, so record and gate
-# could otherwise measure different NIC sets). bazel_run_flags: no MODULE.bazel.lock /
+# Peers come from TPU_WORKER_HOSTNAMES; sender and receiver sync purely over TCP
+# (READY / VERDICTS on --peer_port). runtime_flags: --data_interface=eth0 pins the data
+# plane (runner auto-discovery includes eth0 and IPv6-only NICs, so record and gate could
+# otherwise measure different NIC sets). bazel_run_flags: no MODULE.bazel.lock /
 # bazel-* symlink writes into user_repo.
 benchmarks {
   name: "h2h_multihost_record"
@@ -15,7 +11,7 @@ benchmarks {
   workload {
     action: "./ml_actions/actions/workload_executors/bazel"
     action_inputs { key: "target" value: "//tpu_sync/benchmarks:h2h_multihost_bench" }
-    action_inputs { key: "runtime_flags" value: "--mode=spmd --num_workers=4 --data_interface=eth0 --stage=record --suite=both --iters=200 --runs_per_config=3 --timeout_s=5400" }
+    action_inputs { key: "runtime_flags" value: "--data_interface=eth0 --stage=record --suite=both --iters=200 --runs_per_config=3 --timeout_s=5400" }
   }
 
   environment_configs {

@@ -15,7 +15,6 @@
     "the gate enforces cross-host byte-integrity (NO FLOOR) without flapping on",
     "multi-stream TCP 5-tuple flow hashing variance across GKE pods."
   ],
-  "contract_version": 2,
   "sigma_k": 3.5,
   "max_margin": 0.10,
   "iters": 200,

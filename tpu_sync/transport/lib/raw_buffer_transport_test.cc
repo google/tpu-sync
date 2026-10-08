@@ -1664,6 +1664,204 @@ TEST_P(RawBufferTransportTest, HighConcurrencyColdConnectNoBacklogStall) {
   EXPECT_LT(max_latency, absl::Milliseconds(500));
 }
 
+// -----------------------------------------------------------------------------
+// Failure Mode & Reproduction Test:
+//
+// 1. Architecture of `raw_progress_` on Receiver:
+//    In `RawBufferTransport`, the receiver tracks chunk delivery progress for
+//    each transfer using an internal map `raw_progress_` guarded by
+//    `raw_progress_mu_`. When an incoming push arrives (via
+//    `ProcessSocketBufferPush` or `ProcessSocketBufferBatchPush`), the receiver
+//    extracts `header.uuid` and increments
+//    `raw_progress_[uuid].completed_chunks` (as well as per-layer counts in
+//    `completed_chunks_per_layer`). When the receiver is notified of the total
+//    expected chunks via `RegisterExpectedChunks(uuid, expected_chunks)`, it
+//    records `expected_chunks`. Once `completed_chunks >= *expected_chunks`,
+//    the transfer is deemed complete: the entry is erased from `raw_progress_`,
+//    and `raw_delegate_->OnDataReceived(uuid)` is invoked to trigger the TPU
+//    Host-to-Device (H2D) DMA transfer.
+//
+// 2. Production Failure Mode:
+//    When a network connection drops or a client process aborts mid-stream
+//    after sending partial chunks (e.g. 2 out of 4 chunks), the receiver's
+//    `ConnectionWorker` encounters an I/O error on `client_fd` and terminates,
+//    closing the socket without resetting `raw_progress_[uuid]`.
+//    The partial progress (`completed_chunks = 2`) remains indefinitely
+//    recorded in the receiver's state for that UUID.
+//
+// 3. Retry / UUID Reuse Scenario:
+//    When the client retries the transfer with the same UUID (or in UUID
+//    collision / wrap scenarios), it registers expected chunks (e.g. 4 chunks)
+//    and begins streaming the new payload from the beginning (chunk 0, chunk 1,
+//    chunk 2, chunk 3).
+//
+// 4. The Defect:
+//    The receiver does not reset `completed_chunks` upon re-registration or
+//    aborted connections. Consequently, it adds the 2 stale chunks from the
+//    aborted attempt to the first 2 new chunks from the retry. As soon as
+//    chunk 1 of the retry arrives, `completed_chunks` reaches 4 (2 stale + 2
+//    new
+//    >= 4 expected), prematurely triggering `OnDataReceived` (TPU H2D copy)
+//    before chunks 2 and 3 of the new payload have ever arrived!
+//    The TPU thus reads stale, incomplete, or corrupt memory from the host
+//    buffer.
+//
+// 5. How this test validates this:
+//    - Sets up source and destination transports with a 4-chunk payload.
+//    - Registers expected chunks = 4 on the destination.
+//    - Sender pushes chunk 0 and chunk 1 of `payload1` (2 of 4 chunks).
+//    - Injected fault `kRawBufferTransportRecvHeader` trips when attempting to
+//      push chunks 2 and 3, aborting the rest of Transfer 1.
+//    - Resets fault injector.
+//    - Verifies destination has only received 2 chunks, so
+//      `EXPECT_FALSE(dst.on_data_received())`.
+//    - Re-registers expected chunks = 4 for the retry attempt.
+//    - Sender pushes only chunk 0 and chunk 1 of `payload2`.
+//    - Chunks 2 and 3 of `payload2` have NOT been sent yet.
+//    - Asserts `EXPECT_FALSE(dst.on_data_received())` with an informative error
+//      message.
+//    - Pushes the remaining chunks 2 and 3 of `payload2` and verifies full
+//      end-to-end completion and 100% byte integrity.
+// -----------------------------------------------------------------------------
+TEST_P(RawBufferTransportTest,
+       PartialTransferAbortCausesPrematureTriggerAndDataCorruptionOnRetry) {
+  GetFaultInjector().Reset();
+  auto cleanup = absl::MakeCleanup([] { GetFaultInjector().Reset(); });
+
+  constexpr size_t kChunkSize = 1024;
+  constexpr size_t kTotalChunks = 4;
+  constexpr size_t kBufferSize = kChunkSize * kTotalChunks;
+
+  RawMockDelegate src(kBufferSize);
+  RawMockDelegate dst(kBufferSize);
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  BindControlChannels(&src_transport, &src, &dst_transport, &dst);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  std::vector<uint8_t> payload1(kBufferSize);
+  std::vector<uint8_t> payload2(kBufferSize);
+  RandomNonZero(absl::MakeSpan(payload1));
+  RandomNonZero(absl::MakeSpan(payload2));
+
+  constexpr uint64_t kUuid = 98765;
+
+  // Step 1: Destination registers expected chunks = 4 for initial transfer.
+  ASSERT_OK(dst_transport.RegisterExpectedChunks(kUuid, kTotalChunks));
+
+  // Step 2: Sender pushes chunk 0 and chunk 1 of payload1 (2 of 4 chunks).
+  std::vector<BufferPushTask> payload1_part1 = {
+      {.peer = dst_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 0 * kChunkSize,
+       .data_ptr = payload1.data() + 0 * kChunkSize,
+       .size_bytes = kChunkSize},
+      {.peer = dst_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 1 * kChunkSize,
+       .data_ptr = payload1.data() + 1 * kChunkSize,
+       .size_bytes = kChunkSize},
+  };
+  ASSERT_OK(
+      src_transport.PushBuffers(payload1_part1, /*parallelism=*/1, kUuid));
+
+  // Step 3: Inject fault kRawBufferTransportRecvHeader to abort the rest of
+  // Transfer 1 (chunks 2 and 3).
+  FaultInjectionRule abort_rule;
+  abort_rule.hook = std::string(hooks::kRawBufferTransportRecvHeader);
+  abort_rule.action = FaultInjectionType::kFail;
+  abort_rule.probability = 1.0;
+  ASSERT_OK(GetFaultInjector().Install({abort_rule}));
+
+  std::vector<BufferPushTask> payload1_part2 = {
+      {.peer = dst_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 2 * kChunkSize,
+       .data_ptr = payload1.data() + 2 * kChunkSize,
+       .size_bytes = kChunkSize},
+      {.peer = dst_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 3 * kChunkSize,
+       .data_ptr = payload1.data() + 3 * kChunkSize,
+       .size_bytes = kChunkSize},
+  };
+  EXPECT_FALSE(
+      src_transport.PushBuffers(payload1_part2, /*parallelism=*/1, kUuid).ok());
+  EXPECT_GE(
+      GetFaultInjector().GetHitCount(hooks::kRawBufferTransportRecvHeader), 1);
+
+  // Step 4: Reset fault injector and confirm destination has only received 2
+  // chunks, so OnDataReceived has not fired.
+  GetFaultInjector().Reset();
+  absl::SleepFor(kQuiesceDelay);
+  EXPECT_FALSE(dst.on_data_received());
+
+  // Step 5: Retry attempt with payload2 using the same UUID.
+  // Re-register expected chunks = 4 for the retry attempt.
+  ASSERT_OK(dst_transport.RegisterExpectedChunks(kUuid, kTotalChunks));
+
+  // Step 6: Sender pushes ONLY chunk 0 and chunk 1 of payload2.
+  std::vector<BufferPushTask> payload2_part1 = {
+      {.peer = dst_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 0 * kChunkSize,
+       .data_ptr = payload2.data() + 0 * kChunkSize,
+       .size_bytes = kChunkSize},
+      {.peer = dst_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 1 * kChunkSize,
+       .data_ptr = payload2.data() + 1 * kChunkSize,
+       .size_bytes = kChunkSize},
+  };
+  ASSERT_OK(
+      src_transport.PushBuffers(payload2_part1, /*parallelism=*/1, kUuid));
+
+  // Chunks 2 and 3 of payload2 have NOT been sent yet!
+  absl::SleepFor(kQuiesceDelay);
+
+  // Step 7: In the unpatched code, the 2 stale chunks from Transfer 1 are
+  // added to the 2 chunks from this retry, reaching expected_chunks (4) and
+  // prematurely firing OnDataReceived() before chunks 2 and 3 ever arrive.
+  EXPECT_FALSE(dst.on_data_received())
+      << "Premature trigger detected: OnDataReceived() fired after receiving "
+         "only 2 of 4 chunks during retry! The receiver retained stale "
+         "completed_chunks from the aborted transfer attempt for uuid="
+      << kUuid;
+
+  // Step 8: Sender pushes the remaining chunk 2 and chunk 3 of payload2.
+  std::vector<BufferPushTask> payload2_part2 = {
+      {.peer = dst_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 2 * kChunkSize,
+       .data_ptr = payload2.data() + 2 * kChunkSize,
+       .size_bytes = kChunkSize},
+      {.peer = dst_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 3 * kChunkSize,
+       .data_ptr = payload2.data() + 3 * kChunkSize,
+       .size_bytes = kChunkSize},
+  };
+  ASSERT_OK(
+      src_transport.PushBuffers(payload2_part2, /*parallelism=*/1, kUuid));
+
+  // Step 9: Now that ALL 4 chunks of payload2 have been received,
+  // OnDataReceived must trigger, and the destination memory must match payload2
+  // with 100% byte integrity.
+  ASSERT_TRUE(dst.WaitForDataReceived(kNotificationTimeout));
+  EXPECT_THAT(dst.DataSpan(0, kBufferSize),
+              Pointwise(Eq(), absl::MakeConstSpan(payload2)));
+}
+
 INSTANTIATE_TEST_SUITE_P(
     PspAndPlainTcp, RawBufferTransportTest, ::testing::Bool(),
     [](const ::testing::TestParamInfo<bool>& info) {

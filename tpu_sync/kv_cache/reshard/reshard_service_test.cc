@@ -1228,6 +1228,112 @@ TEST_F(ReshardStackTest, SubsetSourceManifestsPairPoolsByTag) {
   }
 }
 
+TEST_F(ReshardStackTest, OneSourceStageMovesItsLayerAlone) {
+  // Pipeline-parallel source as above, but the transfer names only rank 1: a
+  // stage that has finished its layers hands them off by itself, before the
+  // stages after it. Rank 1 alone is neither zero-based nor the full set.
+  for (int rank = 0; rank < 2; ++rank) {
+    tpu_sync::rpc::ControlRequest req;
+    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+    auto* reg = req.mutable_register_work_unit_request();
+    *reg->mutable_unit() = RaidenIdToProto(Unit(rank));
+    reg->add_shards(absl::StrCat("10.0.0.1:", 9000 + rank));
+    reg->set_control_plane_rpc_address(absl::StrCat("10.0.0.1:", 9100 + rank));
+    *reg->add_pools() = MakePool(absl::StrCat("fa.l", rank), 1024, 1024, 16);
+    reg->set_layout_fingerprint("fp1");
+    reg->set_page_tokens(512);
+    reg->set_transfer_parallelism(2);
+    reg->set_transfer_rank(rank);
+    tpu_sync::rpc::ControlResponse resp = Handle(req.SerializeAsString());
+    ASSERT_TRUE(resp.success()) << resp.message();
+  }
+  {
+    tpu_sync::rpc::ControlRequest req;
+    req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
+    auto* reg = req.mutable_register_work_unit_request();
+    *reg->mutable_unit() = RaidenIdToProto(DstUnit(0));
+    reg->add_shards("10.0.0.2:9400");
+    reg->set_control_plane_rpc_address("10.0.0.2:9600");
+    *reg->add_pools() = MakePool("fa.l0", 1024, 1024, 16);
+    *reg->add_pools() = MakePool("fa.l1", 1024, 1024, 16);
+    reg->set_layout_fingerprint("fp1");
+    reg->set_page_tokens(512);
+    reg->set_transfer_parallelism(2);
+    reg->set_transfer_rank(0);
+    tpu_sync::rpc::ControlResponse resp = Handle(req.SerializeAsString());
+    ASSERT_TRUE(resp.success()) << resp.message();
+  }
+  {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_REGISTER_REQUEST_BLOCKS);
+    auto* block_req = req.mutable_register_request_blocks_request();
+    block_req->set_req_id("req-pp.s1");
+    block_req->set_uuid(78);
+    *block_req->mutable_unit() = RaidenIdToProto(Unit(1));
+    block_req->add_block_ids(4);
+    auto* entry = block_req->add_pool_spans();
+    entry->set_tag("fa.l1");
+    entry->add_block_ids(4);
+    auto* span = entry->add_spans();
+    span->set_src_block_ordinal(0);
+    span->set_src_offset_bytes(0);
+    span->set_dst_block_index(0);
+    span->set_dst_offset_bytes(0);
+    span->set_size_bytes(1024);
+    span->set_count(1);
+    entry->set_declared_bytes(1024);
+    entry->set_dst_space_version(1);
+    tpu_sync::rpc::ControllerResponse resp =
+        HandleController(req.SerializeAsString());
+    ASSERT_TRUE(resp.success()) << resp.message();
+  }
+
+  tpu_sync::rpc::ControllerRequest req;
+  req.set_command(
+      tpu_sync::rpc::ControllerRequest::COMMAND_COORDINATE_TRANSFER);
+  auto* coord = req.mutable_coordinate_transfer_request();
+  *coord->add_src_units() = RaidenIdToProto(Unit(1));
+  *coord->add_dst_units() = RaidenIdToProto(DstUnit(0));
+  coord->set_uuid(78);
+  coord->set_is_sender(true);
+  coord->set_dst_mem_type(tpu_sync::rpc::MEMORY_TYPE_HBM);
+  coord->set_use_block_chunks(true);
+  coord->set_req_id("req-pp.s1");
+  coord->add_dst_device_block_ids(7);
+  coord->add_transfer_pool_tags("fa.l1");
+  coord->add_dst_block_counts(1);
+  tpu_sync::rpc::ControllerResponse resp =
+      HandleController(req.SerializeAsString());
+  ASSERT_TRUE(resp.success()) << resp.message();
+
+  // One arm and one dispatch, to rank 1 only; the receiver expects one push
+  // into its fa.l1 pool and leaves fa.l0 alone.
+  ASSERT_EQ(transport_.calls_.size(), 2u);
+  EXPECT_EQ(transport_.calls_[0].first, "10.0.0.2:9600");
+  tpu_sync::rpc::ControlRequest arm;
+  ASSERT_TRUE(arm.ParseFromString(transport_.calls_[0].second));
+  const auto& arm_req = arm.start_transfer_request();
+  EXPECT_FALSE(arm_req.is_sender());
+  ASSERT_EQ(arm_req.transfer_pool_indices_size(), 1);
+  EXPECT_EQ(arm_req.transfer_pool_indices(0), 1);
+  ASSERT_EQ(arm_req.pool_groups_size(), 1);
+  EXPECT_EQ(arm_req.pool_groups(0).expected_pushes(), 1);
+  EXPECT_EQ(arm_req.shard_push_schedules_size(), 1);
+
+  EXPECT_EQ(transport_.calls_[1].first, "10.0.0.1:9101");
+  tpu_sync::rpc::ControlRequest dispatch;
+  ASSERT_TRUE(dispatch.ParseFromString(transport_.calls_[1].second));
+  const auto& send_req = dispatch.start_transfer_request();
+  EXPECT_TRUE(send_req.is_sender());
+  ASSERT_EQ(send_req.shard_push_schedules_size(), 1);
+  const auto& schedule = send_req.shard_push_schedules().begin()->second;
+  ASSERT_EQ(schedule.entries_size(), 1);
+  EXPECT_EQ(schedule.entries(0).src_block_id(), 4);
+  EXPECT_EQ(schedule.entries(0).dst_block_id(), 7);
+  EXPECT_EQ(schedule.entries(0).dst_peer(), "10.0.0.2:9400");
+}
+
 TEST_F(ReshardStackTest, PipelinedDestinationStagesShareOneRequestClaim) {
   // Every destination stage plans the same request against the whole source
   // rank set; the planner keeps the source with its layer, and the request

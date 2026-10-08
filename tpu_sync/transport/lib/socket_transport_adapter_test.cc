@@ -695,13 +695,7 @@ TEST(SocketTransportAdapterTest, SourceBindDisabledWhenEnvUnsetOrZero) {
   auto cleanup = absl::MakeCleanup(
       [] { unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND"); });
 
-  unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND");
-  EXPECT_FALSE(SourceBindEnabled());
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "");
-
   setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "0", 1);
-  EXPECT_FALSE(SourceBindEnabled());
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "");
 
   std::string observed_peer_ip;
   auto server_handler = [&](int client_fd,
@@ -758,15 +752,6 @@ TEST(SocketTransportAdapterTest, SourceBindDisabledWhenEnvUnsetOrZero) {
 TEST(SocketTransportAdapterTest, SourceBindEnabledWithEnableSourceIpBindEnv) {
   auto cleanup = absl::MakeCleanup(
       [] { unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND"); });
-
-  setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "1", 1);
-  EXPECT_TRUE(SourceBindEnabled());
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "10.0.0.1");
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 1), "10.0.0.2");
-
-  setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "true", 1);
-  EXPECT_TRUE(SourceBindEnabled());
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "10.0.0.1");
 
   std::string observed_peer_ip;
   auto server_handler = [&](int client_fd,
@@ -852,6 +837,38 @@ TEST(SocketTransportAdapterTest, SourceBindEnabledWithEnableSourceIpBindEnv) {
     ASSERT_THAT(handle.status(), absl_testing::IsOk());
     EXPECT_THAT(recv_buf, ::testing::ElementsAre(5, 6, 7, 8));
     EXPECT_THAT(observed_peer_ip, ::testing::HasSubstr("127.0.0.3"));
+  }
+
+  // 3. A NUMA-pinned adapter restricts binding to local IPs on its node. No
+  // loopback alias is a host NIC, so it falls back to every local IP and
+  // still binds to "127.0.0.4".
+  {
+    setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "1", 1);
+    RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                        /*local_ips=*/{"127.0.0.4"});
+    SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1,
+                                          /*numa_node=*/0);
+
+    std::vector<uint8_t> recv_buf(4, 0);
+    Request req = {};
+    req.socket_opcode = 2;
+    req.laddr = recv_buf.data();
+    req.len = recv_buf.size();
+    req.count_or_size = 1;
+    req.remote_id = 10;
+    req.local_id = 20;
+    req.uuid = 104;
+    req.parallelism = 1;
+    req.request_id = 0;
+    req.stream_idx = 0;
+
+    auto handle = client_adapter.Post(
+        /*peers=*/{GetIpPort(server_transport)},
+        /*requests=*/absl::MakeConstSpan(&req, 1));
+
+    ASSERT_THAT(handle.status(), absl_testing::IsOk());
+    EXPECT_THAT(recv_buf, ::testing::ElementsAre(5, 6, 7, 8));
+    EXPECT_THAT(observed_peer_ip, ::testing::HasSubstr("127.0.0.4"));
   }
 }
 

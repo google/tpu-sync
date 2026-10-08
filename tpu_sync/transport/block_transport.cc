@@ -606,13 +606,32 @@ absl::Status BlockTransport::HandleIncomingPush(
       expected_senders = progress.expected_senders;
     }
     progress.completed_chunks++;
-    if (plan_declared && progress.completed_chunks > expected_chunks) {
-      return absl::AlreadyExistsError(
-          absl::StrCat("pool ", l, " received more than ", expected_chunks,
-                       " push streams for UUID ", header.uuid));
-    }
     bool array_complete = false;
-    if (expected_senders.has_value()) {
+    if (plan_declared) {
+      // The plan counts pushes that each carry every shard. A sender that
+      // split its push by source NUMA node spreads those shards over several
+      // streams, so count landed shards per sender and fold every full shard
+      // set back into one plan push. The sum reaches the plan's count only
+      // once every sender's streams have all landed, so a partial group can
+      // never complete the pool early.
+      const size_t full_shards =
+          std::max<size_t>(1, block_delegate_->num_shards());
+      auto& streams = progress.sender_streams[header.remote_id];
+      streams.landed_shards +=
+          header.buffer_id == 0 ? full_shards : stream_shards.size();
+      streams.landed += streams.landed_shards / full_shards;
+      streams.landed_shards %= full_shards;
+      size_t plan_pushes = 0;
+      for (const auto& [sender, sender_streams] : progress.sender_streams) {
+        plan_pushes += sender_streams.landed;
+      }
+      if (plan_pushes > expected_chunks) {
+        return absl::AlreadyExistsError(
+            absl::StrCat("pool ", l, " received more than ", expected_chunks,
+                         " pushes for UUID ", header.uuid));
+      }
+      array_complete = plan_pushes == expected_chunks;
+    } else if (expected_senders.has_value()) {
       auto& streams = progress.sender_streams[header.remote_id];
       if (streams.landed == 0) {
         if (header.reserved == 0) {

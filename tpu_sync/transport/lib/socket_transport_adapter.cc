@@ -149,8 +149,6 @@ absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
   return status;
 }
 
-}  // namespace
-
 // Whether to pin the client-side source address of outbound data connections.
 //
 // Binding a source IP only steers egress onto a particular NIC when the host
@@ -163,7 +161,8 @@ absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
 // anti-spoofing filters drop it. bind() itself succeeds and only the data path
 // breaks, so the failure surfaces as a hang rather than an error. Since the
 // routing rule is a property of the host that this process cannot reliably
-// detect, source binding is opt-in rather than default-on.
+// detect, source binding is opt-in rather than default-on
+// (TPU_RAIDEN_ENABLE_SOURCE_IP_BIND).
 bool SourceBindEnabled() {
   const char* v = std::getenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND");
   if (v == nullptr) return false;
@@ -179,11 +178,51 @@ std::string SelectSourceIp(absl::Span<const std::string> local_ips, size_t i) {
   return local_ips[i % local_ips.size()];
 }
 
+// Subset of |local_ips| owned by a NIC in |nics| on |numa_node|, in
+// |local_ips| order. Empty when |numa_node| < 0 or no local IP is on that
+// node.
+std::vector<std::string> SourceIpsForNumaNode(
+    absl::Span<const std::string> local_ips,
+    absl::Span<const HostNicAddress> nics, int numa_node) {
+  std::vector<std::string> result;
+  if (numa_node < 0) return result;
+  for (const std::string& ip : local_ips) {
+    const bool on_node =
+        std::any_of(nics.begin(), nics.end(), [&](const HostNicAddress& nic) {
+          return nic.ip_address == ip && nic.numa_node == numa_node;
+        });
+    if (on_node) result.push_back(ip);
+  }
+  return result;
+}
+
+// Source IPs for an adapter pinned to |numa_node|: the local IPs on that
+// node, or every local IP when unpinned or none is on that node. NIC
+// discovery is only consulted for pinned adapters, so the default adapter's
+// construction is unchanged.
+std::vector<std::string> ResolveSourceIps(
+    absl::Span<const std::string> local_ips, int numa_node) {
+  if (numa_node >= 0) {
+    std::vector<std::string> on_node =
+        SourceIpsForNumaNode(local_ips, GetLocalHostNicAddresses(), numa_node);
+    if (!on_node.empty()) return on_node;
+    LOG(WARNING) << "No local IP on NUMA node " << numa_node
+                 << "; pinned send workers will use every local IP";
+  }
+  return std::vector<std::string>(local_ips.begin(), local_ips.end());
+}
+
+}  // namespace
+
 SocketTransportAdapter::SocketTransportAdapter(
     RawBufferTransport* raw_transport, int parallelism, int numa_node)
     : raw_transport_(raw_transport),
       parallelism_(parallelism),
       numa_node_(numa_node),
+      source_ips_(ResolveSourceIps(raw_transport == nullptr
+                                       ? absl::Span<const std::string>()
+                                       : raw_transport->local_ips(),
+                                   numa_node)),
       config_(ReadConfigFromEnv()),
       rr_index_(0),
       scheduler_stopping_(false) {
@@ -327,7 +366,7 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
       ++req_end;
     }
 
-    const std::string local_ip = SelectSourceIp(local_ips, i);
+    const std::string local_ip = SelectSourceIp(source_ips_, i);
     const std::string remote_peer = peers[i % peers.size()];
 
     absl::Span<const Request> stream_requests =
@@ -569,7 +608,7 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPull(
         requests.subspan(req_offset, req_end - req_offset);
     req_offset = req_end;
 
-    const std::string local_ip = SelectSourceIp(local_ips, i);
+    const std::string local_ip = SelectSourceIp(source_ips_, i);
     const std::string remote_peer = peers[i % peers.size()];
 
     threads.emplace_back(

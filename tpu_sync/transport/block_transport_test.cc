@@ -727,6 +727,38 @@ TEST_P(BlockTransportTest, PushWithoutDestinationIdsIsNotSplitByNuma) {
                                   ::testing::ElementsAre(0, 1, 2, 3))));
 }
 
+TEST_P(BlockTransportTest, PushSplitBySourceNumaCompletesPlanDeclaredPool) {
+  constexpr size_t kSlice = 256;
+  constexpr int kBlocks = 4;
+  constexpr size_t kShards = 4;
+  constexpr uint64_t kUuid = 10;
+  TwoNumaSenderDelegate sender_delegate(kSlice, kBlocks, /*num_layers=*/1,
+                                        kShards);
+  MockDelegate receiver_delegate(kSlice, kBlocks, /*num_layers=*/1, kShards);
+  // The plan counts pushes of `parallelism` streams: one sender, P=2.
+  receiver_delegate.SetPoolPushProgress(kUuid, /*expected_pushes_per_pool=*/2,
+                                        /*transfer_pool_indices=*/{0});
+
+  BlockTransport sender(&sender_delegate, 0, /*local_ips=*/{"127.0.0.1"},
+                        /*parallelism=*/2);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // The sender splits into 2 shard groups x 2 streams; the receiver must
+  // fold the 4 streams back into the plan's 2 pushes and complete the pool
+  // exactly once, after every stream landed.
+  absl::StatusOr<std::vector<int>> pushed =
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0, 1}, /*dst_block_ids=*/{2, 3},
+                     /*parallelism=*/2, MajorOrder::kLayerMajor, kUuid,
+                     /*layer_idx=*/0)
+          .Await();
+  ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+  EXPECT_EQ(receiver_delegate.pool_completion_count(), 1);
+}
+
 TEST_P(BlockTransportTest, PullNonContiguous) {
   size_t size = 1024;
   // Delegate 1 has 3 blocks capacity

@@ -272,6 +272,9 @@ class BlockTransport final {
     struct SenderStreams {
       size_t landed = 0;
       size_t declared = 0;
+      // Plan-declared mode: shards landed beyond the last full shard set; a
+      // full set (one per split push) counts as one landed plan push.
+      size_t landed_shards = 0;
     };
     absl::flat_hash_map<uint32_t, SenderStreams> sender_streams;
     // Senders whose declared streams have all landed.

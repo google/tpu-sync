@@ -18,7 +18,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -260,13 +259,10 @@ struct CopyKeepAlive {
 
 std::shared_ptr<CopyKeepAlive> MakeCopyKeepAlive(
     const at::Tensor& a, const at::Tensor& b,
-    std::optional<torch_tpu::TensorBufferHandle>& ref) {
+    std::shared_ptr<torch_tpu::TensorBufferHandle> ref) {
   auto keep_alive = std::make_shared<CopyKeepAlive>();
   keep_alive->tensors = {a, b};
-  if (ref) {
-    keep_alive->buffer_ref =
-        std::make_shared<torch_tpu::TensorBufferHandle>(std::move(*ref));
-  }
+  keep_alive->buffer_ref = std::move(ref);
   return keep_alive;
 }
 
@@ -393,7 +389,8 @@ PjRtCopyFuture TransferD2HBatchAsync(
 
     // Keeps both tensors and the base storage buffer alive until the copy is
     // done.
-    auto keep_alive = MakeCopyKeepAlive(src_arrs[i], dst_arrs[i], unpacked.ref);
+    auto keep_alive = MakeCopyKeepAlive(src_arrs[i], dst_arrs[i],
+                                        std::move(unpacked.ref));
     futures.push_back(IssueD2HCopy(
         src_buffer, reinterpret_cast<uint8_t*>(dst_arrs[i].data_ptr()),
         dst_arrs[i].nbytes(), src_offsets_major_dim, dst_offsets_major_dim,
@@ -425,7 +422,8 @@ PjRtCopyFuture TransferH2DBatchAsync(
 
     // Keeps both tensors and the base storage buffer alive until the copy is
     // done.
-    auto keep_alive = MakeCopyKeepAlive(src_arrs[i], dst_arrs[i], unpacked.ref);
+    auto keep_alive = MakeCopyKeepAlive(src_arrs[i], dst_arrs[i],
+                                        std::move(unpacked.ref));
     futures.push_back(IssueH2DCopy(
         reinterpret_cast<const uint8_t*>(src_arrs[i].data_ptr()),
         src_arrs[i].nbytes(), dst_buffer, src_offsets_major_dim,

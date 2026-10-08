@@ -17,7 +17,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
@@ -64,7 +63,7 @@ class PreparedTorchRawTransfer
  private:
   std::shared_ptr<RawHostBuffer> host_buffer_;
   // Pins the base storage buffer behind `buffer_` for this object's lifetime.
-  std::optional<torch_tpu::TensorBufferHandle> buffer_ref_;
+  std::shared_ptr<torch_tpu::TensorBufferHandle> buffer_ref_;
   size_t physical_size_ = 0;
   RaidenBufferHandle buffer_;
 };

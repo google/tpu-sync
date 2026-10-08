@@ -230,6 +230,24 @@ py_test(
     ],
 )
 
+py_test(
+    name = "exit_teardown_test",
+    srcs = ["exit_teardown_test.py"],
+    tags = [
+        "cpu:8",
+        "requires-accel-hbm",
+        "requires-ghostlite:8",
+        "requires-net:external",
+    ],
+    deps = [
+        ":kv_cache_manager_torch_py",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@com_google_absl_py//absl/testing:parameterized",
+        "@torch_tpu//shims/torch:pytorch",
+        "@torch_tpu//src/torch_tpu",
+    ],
+)
+
 # Note: blaze shares one FaultInjector across extensions, so only
 # test_wrapper_resolves_to_torch_extension guards the wheel's wiring bug.
 py_test(

@@ -48,6 +48,12 @@ struct RawBufferHolder {
   const PJRT_Api* c_api;
   const PJRT_RawBuffer_Extension* extension;
   PJRT_RawBuffer* buffer;
+  // Optional owner of the aliased device buffer (and, for frameworks whose
+  // buffers hold the PJRT client, of the client). Members are destroyed after
+  // the destructor body, so the alias is destroyed first even when this holder
+  // outlives whoever created it, e.g. inside a transfer future. Null when the
+  // caller owns the buffer. Set it before the holder is shared.
+  std::shared_ptr<void> owner;
 
   RawBufferHolder(const PJRT_Api* api, const PJRT_RawBuffer_Extension* ext,
                   PJRT_RawBuffer* buf)

@@ -77,10 +77,10 @@ UnpackedTensors UnpackTorchTensors(
       }
       shard_buffers.push_back(unpacked.buffer);
       // Retain every owning ref so the base storage buffers stay pinned for
-      // the lifetime of `out.refs`. (The test mock returns no ref -- nullopt --
+      // the lifetime of `out.refs`. (The test mock returns no ref -- null --
       // since it hands back pre-registered buffers with no materialization.)
       if (unpacked.ref) {
-        out.refs.push_back(std::move(*unpacked.ref));
+        out.refs.push_back(std::move(unpacked.ref));
       }
     }
     out.buffers.push_back(std::move(shard_buffers));

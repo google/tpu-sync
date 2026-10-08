@@ -43,7 +43,20 @@ class KVCacheListener;
 namespace tpu_raiden {
 namespace torch {
 
-class TorchKVCacheManager : public KVCacheManagerWithTransfer {
+// The TensorBufferHandles pinning a manager's device buffers. Each handle also
+// holds the PJRT client, so once torch_tpu has released its own reference at
+// exit, these handles can be the client's last owners.
+//
+// Held in a base listed before KVCacheManagerWithTransfer so that they are
+// destroyed after it: everything the manager owns, including host DMA mappings
+// whose deleters call into the client, is released while the client is alive.
+struct TorchBufferRefsHolder {
+  std::vector<std::shared_ptr<torch_tpu::TensorBufferHandle>> buffer_refs;
+};
+
+// TorchBufferRefsHolder must remain the first base (see above).
+class TorchKVCacheManager : private TorchBufferRefsHolder,
+                            public KVCacheManagerWithTransfer {
  public:
   // PyTorch sharded constructor E2E (cache-only by default)
   TorchKVCacheManager(
@@ -125,7 +138,7 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
   // TensorBufferHandles that must outlive their use (see UnpackTorchTensor).
   struct UnpackedLayers {
     std::vector<std::vector<raiden::RaidenBufferHandle>> buffers;
-    std::vector<torch_tpu::TensorBufferHandle> refs;
+    std::vector<std::shared_ptr<torch_tpu::TensorBufferHandle>> refs;
     xla::PjRtClient* client = nullptr;
     std::vector<int64_t> logical_dimensions;
     size_t logical_slice_byte_size = 0;
@@ -140,8 +153,8 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
       bool unsafe_skip_buffer_lock = false);
 
   // Delegated-to constructor for BOTH public ctors. Moves the keep-alive refs
-  // into buffer_refs_ so the materialized device buffers survive for this
-  // manager's lifetime. `kv_caches` is retained for the disagg path's
+  // into TorchBufferRefsHolder so the materialized device buffers survive for
+  // this manager's lifetime. `kv_caches` is retained for the disagg path's
   // kv_caches() accessor (empty for the offload path).
   TorchKVCacheManager(UnpackedLayers unpacked, std::optional<int> local_port,
                       std::optional<int> host_blocks_to_allocate,
@@ -151,8 +164,6 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
                       std::vector<at::Tensor> kv_caches, bool enable_shm);
 
   std::vector<at::Tensor> kv_caches_;
-  // Keep-alives for the materialized device buffers backing the manager.
-  std::vector<torch_tpu::TensorBufferHandle> buffer_refs_;
   std::unique_ptr<tpu_raiden::kv_cache::KVCacheListener> listener_;
 };
 

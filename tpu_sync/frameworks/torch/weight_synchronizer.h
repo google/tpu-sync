@@ -173,7 +173,7 @@ class NumaAwareWeightSynchronizer
       ABSL_GUARDED_BY(expected_counts_mu_);
 
 #ifndef WITHOUT_PYTHON
-  std::vector<torch_tpu::TensorBufferHandle> buffer_refs_;
+  std::vector<std::shared_ptr<torch_tpu::TensorBufferHandle>> buffer_refs_;
 #endif
 };
 

@@ -17,7 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
+#include <memory>
 #include <vector>
 
 #include "ATen/core/TensorBody.h"
@@ -32,10 +32,12 @@ namespace torch {
 //
 // IMPORTANT: the `buffer` pointer is only valid while `ref` is alive. Callers
 // that retain `buffer` past this call MUST keep `ref` alive for as long as they
-// use it (e.g. store it in a member / attach it to the transfer future).
+// use it (e.g. store it in a member / attach it to the transfer future). The
+// raw alias in `buffer` owns `ref` as well, so it can never outlive the device
+// buffer or the PJRT client that buffer holds.
 struct UnpackedTensor {
   raiden::RaidenBufferHandle buffer;
-  std::optional<torch_tpu::TensorBufferHandle> ref;
+  std::shared_ptr<torch_tpu::TensorBufferHandle> ref;  // null in the mock
   std::vector<int64_t> logical_dimensions;
   size_t logical_slice_byte_size = 0;
   size_t logical_physical_size = 0;

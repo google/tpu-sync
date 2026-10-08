@@ -137,7 +137,8 @@ TorchKVCacheManager::TorchKVCacheManager(
     int parallelism, int64_t node_id, int64_t local_control_port,
     int64_t max_blocks, int64_t num_slots, double timeout_s,
     std::vector<at::Tensor> kv_caches, bool enable_shm)
-    : KVCacheManagerWithTransfer(
+    : TorchBufferRefsHolder{std::move(unpacked.refs)},
+      KVCacheManagerWithTransfer(
           unpacked.buffers,
           unpacked.has_logical_metadata ? unpacked.logical_slice_byte_size : 0,
           unpacked.has_logical_metadata ? unpacked.logical_dimensions
@@ -160,10 +161,7 @@ TorchKVCacheManager::TorchKVCacheManager(
                         .value_or(0)),
 
           node_id, local_control_port, max_blocks, num_slots, timeout_s),
-      kv_caches_(std::move(kv_caches)),
-      // Move the keep-alive refs in AFTER the base ctor has acquired the
-      // buffers; they pin the materialized device buffers for our lifetime.
-      buffer_refs_(std::move(unpacked.refs)) {}
+      kv_caches_(std::move(kv_caches)) {}
 
 TorchKVCacheManager::TorchKVCacheManager(
     const std::vector<at::Tensor>& kv_caches, int64_t node_id,

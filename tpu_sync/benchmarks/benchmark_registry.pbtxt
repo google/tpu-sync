@@ -1,6 +1,6 @@
 benchmarks {
   name: "h2d_d2h_gating"
-  description: "Perf gate: 5 stable configs, fail if median Gbps drops >3% vs gating_baselines.json"
+  description: "Perf gate: stable configs across JAX and PyTorch, fail if median Gbps drops below statistical floor vs gating_baselines.json"
   owner: "raiden-dev"
 
   workload {
@@ -16,11 +16,23 @@ benchmarks {
     workload_action_inputs { key: "bazel_run_flags" value: "-c opt --config=oss --config=ci" }
   }
 
+  # Symmetrical framework metrics: JAX
+  metrics { name: "jax_int32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
+  metrics { name: "jax_int32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
+  metrics { name: "jax_float32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
+  metrics { name: "jax_float32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
+
+  # Symmetrical framework metrics: PyTorch
+  metrics { name: "torch_int32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
+  metrics { name: "torch_int32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
+  metrics { name: "torch_float32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
+  metrics { name: "torch_float32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
+
+  # Legacy un-prefixed aliases for MLCompass monitoring (go/tpu-sync-oss-mlcompass)
   metrics { name: "int32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
   metrics { name: "int32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
   metrics { name: "float32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
   metrics { name: "float32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
-
 }
 
 benchmarks {

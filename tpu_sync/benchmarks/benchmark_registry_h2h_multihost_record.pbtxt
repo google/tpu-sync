@@ -1,0 +1,34 @@
+# Peers come from TPU_WORKER_HOSTNAMES; sender and receiver sync purely over TCP
+# (READY / VERDICTS on --peer_port). runtime_flags: --data_interface=eth0 pins the data
+# plane (runner auto-discovery includes eth0 and IPv6-only NICs, so record and gate could
+# otherwise measure different NIC sets). bazel_run_flags: no MODULE.bazel.lock /
+# bazel-* symlink writes into user_repo.
+benchmarks {
+  name: "h2h_multihost_record"
+  description: "Re-measure the cross-host H2H configs and emit h2h_multihost_baselines.json ({baseline_gbs, floor_gbs, integrity, n_samples} per label, floor = max(median - sigma_k*MAD_sigma, median*(1 - max_margin))) alongside the per-iteration samples CSV as workload artifacts. Keep only the P=1 gate config (1048576B_x64_P1) in tpu_sync/benchmarks/h2h_multihost_baselines.json and commit it. Large iters*runs on purpose: the MAD sigma estimate is noisy from few samples. Must run on the same hardware the gate runs on."
+  owner: "raiden-dev"
+
+  workload {
+    action: "./ml_actions/actions/workload_executors/bazel"
+    action_inputs { key: "target" value: "//tpu_sync/benchmarks:h2h_multihost_bench" }
+    action_inputs { key: "runtime_flags" value: "--data_interface=eth0 --stage=record --suite=both --iters=200 --runs_per_config=3 --timeout_s=5400" }
+  }
+
+  environment_configs {
+    id: "tpu-v5e-multi-node"
+    runner_label: "linux-x86-ct5lp-4tpu-x4"
+    container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers"
+    workload_action_inputs { key: "bazel_run_flags" value: "-c opt --config=oss --config=ci --lockfile_mode=off --experimental_convenience_symlinks=ignore" }
+  }
+
+  # correctness suite
+  metrics { name: "1048576B_x64_P1/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "1048576B_x64_P8/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "1048573B_x64_P4/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  # perf suite (2 MiB blocks, parallelism sweep)
+  metrics { name: "2097152B_x64_P1/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "2097152B_x64_P2/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "2097152B_x64_P4/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "2097152B_x64_P8/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+  metrics { name: "2097152B_x64_P16/cpp_gbs" unit: "GB/s" stats { stat: MEAN } stats { stat: MEDIAN } }
+}

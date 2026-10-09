@@ -12,25 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Presubmit Benchmarks
+# Re-record cross-host H2H gate floors on the multi-host runner, download
+# h2h_multihost_baselines.json from the run's BAP artifact, keep only the P=1
+# gate config, and commit it to tpu_sync/benchmarks/h2h_multihost_baselines.json.
+name: H2H Multi-Host Record
 
 on:
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
-  pull-requests: write
 
-jobs: 
-  run_benchmarks:
-    name: Run Single Host Benchmarks
+jobs:
+  record:
+    name: Run H2H Multi-Host Record
     uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@82682aceae058a272d67c5e8bb4e8eba2da7b7c2 # main
+    permissions:
+      contents: read
+      pull-requests: write
     with:
-      registry_file: "tpu_sync/benchmarks/benchmark_registry.pbtxt"
+      registry_file: "tpu_sync/benchmarks/benchmark_registry_h2h_multihost_record.pbtxt"
       bap_ref: "82682aceae058a272d67c5e8bb4e8eba2da7b7c2"
       runner: "linux-x86-n2-8"
-      # Benchmark the PR head commit by SHA. The reusable workflow otherwise
-      # checks out the head branch name from this repository, which does not
-      # exist for pull requests opened from forks or after the branch is
-      # deleted at merge time.
-      experiment_ref: ${{ github.event.pull_request.head.sha }}

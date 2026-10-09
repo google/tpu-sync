@@ -9,8 +9,8 @@ permissions:
 
 jobs:
   record:
-    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@aa854ba7bdb77966a9cc1a013417f1c1a208c4c0 # main
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@82682aceae058a272d67c5e8bb4e8eba2da7b7c2 # main
     with:
       registry_file: "tpu_sync/benchmarks/benchmark_registry_record.pbtxt"
-      bap_ref: "aa854ba7bdb77966a9cc1a013417f1c1a208c4c0"
+      bap_ref: "82682aceae058a272d67c5e8bb4e8eba2da7b7c2"
       runner: "linux-x86-n2-32"

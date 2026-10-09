@@ -46,7 +46,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   # Group by workflow name and branch to ensure runs execute sequentially.
@@ -58,10 +57,31 @@ concurrency:
 jobs: 
   run_benchmarks:
     name: Run Single Host Benchmarks
-    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@887b34acdb5c70bbd2bc93bb11c2d0a103698e7f # main
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@82682aceae058a272d67c5e8bb4e8eba2da7b7c2 # main
+    permissions:
+      contents: read
+      pull-requests: write
     with:
       registry_file: "tpu_sync/benchmarks/benchmark_registry.pbtxt"
-      bap_ref: "887b34acdb5c70bbd2bc93bb11c2d0a103698e7f"
+      bap_ref: "82682aceae058a272d67c5e8bb4e8eba2da7b7c2"
+      runner: "linux-x86-n2-8"
+      publish_metrics: true
+      pub_sub_gcp_project_id: "ml-oss-benchmarking-production"
+      pub_sub_gcp_topic_id: "public-results-prod"
+      benchmark_filter: ${{ inputs.benchmark_filter || '' }}
+      environment_filter: ${{ inputs.environment_filter || '' }}
+      custom_metadata: ${{ inputs.custom_metadata || '{}' }}
+      experiment_ref: ${{ inputs.experiment_ref || '' }}
+
+  run_multihost_benchmarks:
+    name: Run Multi-Host Benchmarks
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@82682aceae058a272d67c5e8bb4e8eba2da7b7c2 # main
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      registry_file: "tpu_sync/benchmarks/benchmark_registry_h2h_multihost_gate.pbtxt"
+      bap_ref: "82682aceae058a272d67c5e8bb4e8eba2da7b7c2"
       runner: "linux-x86-n2-8"
       publish_metrics: true
       pub_sub_gcp_project_id: "ml-oss-benchmarking-production"

@@ -51,15 +51,34 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs: 
   run_benchmarks:
     name: Run Single Host Benchmarks
-    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@aa854ba7bdb77966a9cc1a013417f1c1a208c4c0 # main
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@82682aceae058a272d67c5e8bb4e8eba2da7b7c2 # main
+    permissions:
+      contents: read
+      pull-requests: write
     with:
       registry_file: "tpu_sync/benchmarks/benchmark_registry.pbtxt"
-      bap_ref: "aa854ba7bdb77966a9cc1a013417f1c1a208c4c0"
+      bap_ref: "82682aceae058a272d67c5e8bb4e8eba2da7b7c2"
+      runner: "linux-x86-n2-8"
+      ab_mode: ${{ inputs.ab_mode }}
+      baseline_ref: ${{ inputs.baseline_ref }}
+      experiment_ref: ${{ inputs.experiment_ref }}
+      benchmark_filter: ${{ inputs.benchmark_filter }}
+      environment_filter: ${{ inputs.environment_filter }}
+      custom_metadata: ${{ inputs.custom_metadata }}
+
+  run_multihost_benchmarks:
+    name: Run Multi-Host Benchmarks
+    uses: google-ml-infra/bap/.github/workflows/run-benchmarks.yaml@82682aceae058a272d67c5e8bb4e8eba2da7b7c2 # main
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      registry_file: "tpu_sync/benchmarks/benchmark_registry_h2h_multihost_gate.pbtxt"
+      bap_ref: "82682aceae058a272d67c5e8bb4e8eba2da7b7c2"
       runner: "linux-x86-n2-8"
       ab_mode: ${{ inputs.ab_mode }}
       baseline_ref: ${{ inputs.baseline_ref }}

@@ -82,3 +82,19 @@ py_binary(
         "@com_google_absl_py//absl/flags",
     ],
 )
+
+# Cross-host H2H driver: --stage=record|gate on a BAP multi-host job.
+py_binary(
+    name = "h2h_multihost_bench",
+    testonly = True,
+    srcs = ["h2h_multihost_bench.py"],
+    data = [
+        "h2h_multihost_baselines.json",
+        "//examples/microbenchmarks:h2h_benchmark_runner",
+    ],
+    deps = [
+        ":bap_metrics",
+        "@com_google_absl_py//absl:app",
+        "@com_google_absl_py//absl/flags",
+    ],
+)

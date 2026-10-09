@@ -1,0 +1,921 @@
+# Copyright 2026 Google LLC.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Cross-host H2H benchmark driver for BAP: record -> gate.
+
+Runs the C++ h2h_benchmark_runner between two hosts of a BAP multi-host job.
+BAP's multi-host runner executes this same target on every host of the slice
+(one JobSet pod per host, JOB_COMPLETION_INDEX = 0..N-1). Roles:
+
+  worker 0  sender   -- also BAP's "primary": the only host whose artifacts
+                        and TensorBoard events get uploaded, so all reporting
+                        happens here.
+  worker 1  receiver -- runs the C++ receiver per config, serves readiness and
+                        the byte-integrity verdicts to the sender over a small
+                        TCP line protocol (--peer_port).
+  others    idle     -- exit 0.
+
+Peers come from --peers or TPU_WORKER_HOSTNAMES (index-aligned with worker
+ids). Coordination is pure TCP: the sender polls the receiver's _PeerServer
+with READY before each run and fetches VERDICTS at the end, which also
+synchronizes completion.
+
+Both stages write the per-iteration samples CSV, print a [measured] summary
+line per config, and emit TensorBoard metrics.
+
+Stages:
+  record   write h2h_multihost_baselines.json with a floor per config
+           (median - k * MAD_sigma, capped at max_margin).
+  gate     integrity always gates; throughput gates against the recorded floor
+           when --gate_throughput (default) and a floor exists for the config.
+"""
+
+import csv
+import json
+import os
+import re
+import socket
+import statistics
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+from absl import app
+from absl import flags
+
+from tpu_sync.benchmarks import bap_metrics
+
+# ---------------------------------------------------------------------------
+# Flags
+# ---------------------------------------------------------------------------
+
+_STAGE = flags.DEFINE_enum('stage', 'gate', ['record', 'gate'],
+                           'record: write baselines; gate: pass/fail.')
+_SUITE = flags.DEFINE_enum('suite', 'correctness',
+                           ['correctness', 'perf', 'both'], 'Config set.')
+_ITERS = flags.DEFINE_integer('iters', 5, 'Timed iterations per runner process.')
+_RUNS = flags.DEFINE_integer(
+    'runs_per_config', 1, 'Independent runner processes per config; total '
+    'samples per config = runs_per_config * iters.')
+
+_WORKER_ID = flags.DEFINE_integer('worker_id', -1,
+                                  'This host index; overrides the env.')
+_PEERS = flags.DEFINE_string(
+    'peers', '', 'Comma-separated host list, index-aligned with worker ids; '
+    'overrides TPU_WORKER_HOSTNAMES.')
+_SENDER_IDX = flags.DEFINE_integer('sender_index', 0, 'Worker that sends.')
+_RECEIVER_IDX = flags.DEFINE_integer('receiver_index', 1, 'Worker that receives.')
+_CONTROL_IFACE = flags.DEFINE_string(
+    'control_interface', '', 'Interface for the control-plane handshake. '
+    'Default: eth0 (falls back to --control_ip / the hostname\'s address when '
+    'eth0 does not exist); lo for two drivers on one machine.')
+_CONTROL_IP = flags.DEFINE_string(
+    'control_ip', '', 'Control-plane IP of this host when --control_interface '
+    'cannot be resolved.')
+_DATA_IFACE = flags.DEFINE_string(
+    'data_interface', '', 'Comma-separated data-plane interfaces for the '
+    'runner. Empty lets the runner auto-discover, which INCLUDES eth0 and any '
+    'IPv6-only interface; pin it (eth0 on a single-NIC pod, the DRANET list '
+    'on a multi-NIC pod) so record and gate measure the same NICs.')
+_NUMA_NODE = flags.DEFINE_integer('numa_node', -1, 'NUMA node to pin the runner to.')
+_CONTROL_PORT = flags.DEFINE_integer(
+    'control_port', 9099, 'Base runner control port; config i run r uses '
+    'base + i * runs_per_config + r.')
+_PEER_PORT = flags.DEFINE_integer(
+    'peer_port', 9299, 'Driver-to-driver channel on the receiver host.')
+_STARTUP_TIMEOUT_S = flags.DEFINE_integer(
+    'startup_timeout_s', 1800, 'Wait for the peer driver, for each receiver '
+    'to listen, and for the first sender contact per run. Sized for an '
+    'independent image pull + bazel build on the peer.')
+_TIMEOUT_S = flags.DEFINE_integer('timeout_s', 1800, 'Per-process hard timeout.')
+_RUNNER = flags.DEFINE_string('runner', '', 'Path to h2h_benchmark_runner; '
+                              'default: located in the runfiles.')
+
+_OUT_DIR = flags.DEFINE_string(
+    'out_dir', '', 'Where the samples CSV and baselines go. Default: '
+    '$WORKLOAD_ARTIFACTS_DIR if set, else the current directory.')
+_BASELINES = flags.DEFINE_string(
+    'baselines', None, 'Baselines JSON read by gate. Default: the copy next to '
+    'this file in the runfiles.')
+_SIGMA_K = flags.DEFINE_float('sigma_k', 3.5, 'Robust sigmas below the median.')
+_MAX_MARGIN = flags.DEFINE_float(
+    'max_margin', 0.10, 'Floor is never looser than this fractional drop.')
+_GATE_THROUGHPUT = flags.DEFINE_bool(
+    'gate_throughput', True, 'Fail when the median drops below the floor.')
+
+# (block_size_bytes, num_blocks, parallelism) -- see H2H_MULTIHOST_TEST.md.
+_CORRECTNESS_CONFIGS = [
+    (1048576, 64, 1),   # block mapping / offset / copy
+    (1048576, 64, 8),   # races, interleaving, stream partition
+    (1048573, 64, 4),   # alignment / boundary / partial write
+]
+_PERF_CONFIGS = [(2097152, 64, p) for p in (1, 2, 4, 8, 16)]
+
+# Printed by the C++ receiver once its control socket is in accept(), and once
+# a sender has been accepted.
+_READY_MARKER = 'Waiting for sender connection on control plane'
+_CONTACT_MARKER = 'Connection established on control plane'
+_INTEG_PASS = 'Data integrity verification PASSED'
+_INTEG_FAIL = 'Data integrity verification FAILED'
+
+_RE_P50 = re.compile(r'p50:\s*([0-9.]+)')
+_RE_P90 = re.compile(r'p90:\s*([0-9.]+)')
+_RE_P99 = re.compile(r'p99:\s*([0-9.]+)')
+_RE_MEAN_GBS = re.compile(r'Throughput:\s*([0-9.]+)')
+_RE_RAW_MS = re.compile(r'H2H_ITER_MS\s+([0-9.]+)')
+_RE_IFACES = re.compile(r'Interfaces:\s*(\d+)\s*\(active:\s*(\d+)\)')
+_RE_AUTOSCALE = re.compile(r'Auto-scaling num_blocks to (\d+)')
+
+# Mirrors kNumLayers / kNumShards in h2h_benchmark_runner.cc.
+_LAYERS = 32
+_SHARDS = 1
+
+_READY_YES, _READY_NO, _READY_FAILED = '1', '0', 'X'
+
+# Filled in by main(): the control-plane flags handed to every runner process.
+_CONTROL_ARGS = []
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+
+def _label(bs, nb, p):
+  return f'{bs}B_x{nb}_P{p}'
+
+
+def _configs():
+  if _SUITE.value == 'correctness':
+    return list(_CORRECTNESS_CONFIGS)
+  if _SUITE.value == 'perf':
+    return list(_PERF_CONFIGS)
+  return list(_CORRECTNESS_CONFIGS) + list(_PERF_CONFIGS)
+
+
+def _f(regex, text):
+  m = regex.search(text or '')
+  return float(m.group(1)) if m else -1.0
+
+
+def _out_dir():
+  d = _OUT_DIR.value or os.environ.get('WORKLOAD_ARTIFACTS_DIR') or os.getcwd()
+  os.makedirs(d, exist_ok=True)
+  return d
+
+
+def _baselines_path():
+  if _BASELINES.value:
+    return _BASELINES.value
+  return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      'h2h_multihost_baselines.json')
+
+
+def _iface_ipv4(name):
+  """IPv4 address of an interface via SIOCGIFADDR; None if unavailable."""
+  if not name:
+    return None
+  try:
+    import fcntl  # pylint: disable=g-import-not-at-top  (Linux only)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+      packed = struct.pack('256s', name.encode('utf-8')[:15])
+      return socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, packed)[20:24])
+    finally:
+      s.close()
+  except Exception:  # pylint: disable=broad-exception-caught
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Topology
+# ---------------------------------------------------------------------------
+
+
+def _discover_topology():
+  """Returns (worker_id, hosts). Flags win over the environment."""
+  wid = _WORKER_ID.value
+  if wid < 0:
+    for var in ('JOB_COMPLETION_INDEX', 'TPU_WORKER_ID'):
+      v = os.environ.get(var, '').strip()
+      if v.isdigit():
+        wid = int(v)
+        break
+  raw = _PEERS.value or os.environ.get('TPU_WORKER_HOSTNAMES', '')
+  hosts = [h.strip() for h in raw.split(',') if h.strip()]
+  return wid, hosts
+
+
+def _resolve_control_plane():
+  """Sets _CONTROL_ARGS and returns this host's control-plane IP."""
+  del _CONTROL_ARGS[:]
+  iface = _CONTROL_IFACE.value or 'eth0'
+  if iface == 'lo':
+    # Explicit loopback: both drivers on one machine (two shells on a laptop).
+    _CONTROL_ARGS.append('--control_interface=lo')
+    return '127.0.0.1'
+  ip = _iface_ipv4(iface)
+  if ip:
+    _CONTROL_ARGS.append(f'--control_interface={iface}')
+    return ip
+  explicit = bool(_CONTROL_IP.value)
+  ip = _CONTROL_IP.value
+  if not ip:
+    try:
+      ip = socket.gethostbyname(socket.gethostname())
+    except OSError:
+      ip = ''
+  # An inferred loopback address would make the receiver unreachable from the
+  # other host; an explicit --control_ip is taken at face value.
+  if not ip or (not explicit and ip.startswith('127.')):
+    print(f'GATE FAIL: control interface {iface!r} has no IPv4 address and '
+          'no routable --control_ip / hostname address is available.',
+          file=sys.stderr, flush=True)
+    sys.exit(1)
+  print(f'[topology] {iface!r} not found; using --control_ip={ip}', flush=True)
+  _CONTROL_ARGS.append(f'--control_ip={ip}')
+  return ip
+
+
+# ---------------------------------------------------------------------------
+# Runner processes
+# ---------------------------------------------------------------------------
+
+
+def _runfiles_root():
+  if os.environ.get('RUNFILES_DIR'):
+    return os.environ['RUNFILES_DIR']
+  d = os.path.dirname(os.path.abspath(__file__))
+  main_root = None
+  while d != os.path.dirname(d):
+    if d.endswith('.runfiles'):
+      return d
+    if os.path.basename(d) == '_main':
+      main_root = d
+    d = os.path.dirname(d)
+  return main_root or os.path.dirname(os.path.abspath(__file__))
+
+
+def _locate_runner():
+  if _RUNNER.value:
+    return _RUNNER.value
+  root = _runfiles_root()
+  for dirpath, _, files in os.walk(root, followlinks=True):
+    if 'h2h_benchmark_runner' in files:
+      cand = os.path.join(dirpath, 'h2h_benchmark_runner')
+      if os.access(cand, os.X_OK):
+        return cand
+  raise FileNotFoundError(f'could not locate h2h_benchmark_runner under {root}')
+
+
+def _base_argv(cc, bs, nb, p, port):
+  argv = [cc]
+  argv += [f'--data_interface={_DATA_IFACE.value}',
+           f'--peer_control_port={port}', f'--block_size={bs}',
+           f'--num_blocks={nb}', f'--parallelism={p}',
+           f'--numa_node={_NUMA_NODE.value}', f'--iterations={_ITERS.value}']
+  argv += _CONTROL_ARGS
+  return argv
+
+
+def _popen(argv):
+  return subprocess.Popen(argv, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT,
+                          env={**os.environ, 'PYTHONUNBUFFERED': '1'})
+
+
+class _StreamWatcher(threading.Thread):
+  """Drains a process's stdout and flags the readiness marker."""
+
+  def __init__(self, proc, marker):
+    super().__init__(daemon=True)
+    self._proc = proc
+    self._marker = marker
+    self._lines = []
+    self.ready = threading.Event()
+
+  def run(self):
+    try:
+      for raw in self._proc.stdout:
+        line = raw.decode('utf-8', 'replace')
+        self._lines.append(line)
+        if self._marker in line:
+          self.ready.set()
+    finally:
+      self.ready.set()  # unblock waiters if the process died instead
+      try:
+        self._proc.stdout.close()
+      except OSError:
+        pass
+
+  @property
+  def output(self):
+    return ''.join(list(self._lines))
+
+
+def _finish(proc, watcher, timeout):
+  try:
+    proc.wait(timeout=timeout)
+  except subprocess.TimeoutExpired:
+    proc.kill()
+    proc.wait()
+  watcher.join(timeout=60)
+  return watcher.output
+
+
+def _parse_sender(out, bs, nb):
+  """Sender stdout -> per-iteration GB/s samples (+ the runner's own summary)."""
+  ifm = _RE_IFACES.search(out or '')
+  active = int(ifm.group(2)) if ifm else 1
+  # The runner caps num_blocks so one iteration stays <= 16 GiB per NIC and
+  # says so on stdout; honour that or GB/s would be inflated.
+  am = _RE_AUTOSCALE.search(out or '')
+  nb_eff = int(am.group(1)) if am else nb
+  total_bytes = float(active * _LAYERS * _SHARDS * nb_eff * bs)
+  p50 = _f(_RE_P50, out)
+  raw_gbs = [(total_bytes / 1e9) / (float(ms) / 1000.0)
+             for ms in _RE_RAW_MS.findall(out or '') if float(ms) > 0]
+  mean_gbs = _f(_RE_MEAN_GBS, out)
+  gbs = -1.0
+  if raw_gbs:
+    gbs = statistics.median(raw_gbs)
+  elif p50 > 0:
+    gbs = (total_bytes / 1e9) / (p50 / 1000.0)
+  elif mean_gbs > 0:
+    gbs = mean_gbs
+  samples = raw_gbs or ([gbs] if gbs > 0 else [])
+  return {'gbs': gbs, 'mean_gbs': mean_gbs, 'p50_ms': p50,
+          'p90_ms': _f(_RE_P90, out), 'p99_ms': _f(_RE_P99, out),
+          'samples': samples, 'total_bytes': total_bytes,
+          'active_ifaces': active if ifm else None}
+
+
+# ---------------------------------------------------------------------------
+# Driver-to-driver channel
+# ---------------------------------------------------------------------------
+
+
+class _PeerServer(threading.Thread):
+  """Line protocol served on the receiver host.
+
+      READY <i>  -> "1" once run i's receiver is in accept(),
+                    "X" if run i's receiver died before listening,
+                    "0" otherwise
+      VERDICTS   -> JSON {label: bool} once every run is done, else ""
+  """
+
+  def __init__(self, port):
+    super().__init__(daemon=True)
+    self._lock = threading.Lock()
+    self._ready = set()
+    self._failed = set()
+    self._verdicts = None
+    self.last_query = {}   # run index -> time of the last READY query
+    self.fetched = threading.Event()
+    self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    self._srv.bind(('0.0.0.0', port))
+    self._srv.listen(8)
+    self.port = self._srv.getsockname()[1]
+
+  def mark_ready(self, index):
+    with self._lock:
+      self._ready.add(index)
+
+  def mark_failed(self, index):
+    with self._lock:
+      self._failed.add(index)
+
+  def set_verdicts(self, verdicts):
+    with self._lock:
+      self._verdicts = dict(verdicts)
+
+  def queried(self, index):
+    with self._lock:
+      return index in self.last_query
+
+  def close(self):
+    try:
+      self._srv.close()
+    except OSError:
+      pass
+
+  @staticmethod
+  def _read_request(conn):
+    buf = b''
+    while len(buf) < 4096:
+      chunk = conn.recv(4096)
+      if not chunk:
+        break
+      buf += chunk
+    return buf.decode('utf-8', 'replace').strip()
+
+  def run(self):
+    while True:
+      try:
+        conn, _ = self._srv.accept()
+      except OSError:
+        return
+      with conn:
+        try:
+          conn.settimeout(10)
+          req = self._read_request(conn)
+          if req.startswith('READY'):
+            idx = int(req.split()[1])
+            with self._lock:
+              self.last_query[idx] = time.time()
+              if idx in self._failed:
+                reply = _READY_FAILED
+              elif idx in self._ready:
+                reply = _READY_YES
+              else:
+                reply = _READY_NO
+            conn.sendall(reply.encode('utf-8'))
+          elif req == 'VERDICTS':
+            with self._lock:
+              payload = self._verdicts
+            if payload is not None:
+              conn.sendall(json.dumps(payload).encode('utf-8'))
+              self.fetched.set()
+          else:
+            conn.sendall(b'?')
+        except (OSError, ValueError, IndexError):
+          continue
+
+
+def _peer_query(host, port, request, timeout=30):
+  try:
+    with socket.create_connection((host, port), timeout=timeout) as s:
+      s.settimeout(timeout)
+      s.sendall(request.encode('utf-8'))
+      s.shutdown(socket.SHUT_WR)
+      chunks = []
+      while True:
+        chunk = s.recv(65536)
+        if not chunk:
+          break
+        chunks.append(chunk)
+    return b''.join(chunks).decode('utf-8')
+  except OSError:
+    return None
+
+
+def _backoff(attempt, max_interval):
+  """0.5 s, 1 s, 2 s, ... capped at max_interval."""
+  return min(0.5 * (2 ** min(attempt, 10)), max_interval)
+
+
+def _await_peer(host, port, request, accept, timeout, what, interval=5):
+  """Polls until `accept(reply)` is true. Returns the reply, or None."""
+  deadline = time.time() + timeout
+  attempt = 0
+  last_report = time.time()
+  while time.time() < deadline:
+    reply = _peer_query(host, port, request)
+    if reply and accept(reply):
+      return reply
+    if time.time() - last_report >= 60:
+      last_report = time.time()
+      print(f'[barrier] still waiting for {what} '
+            f'({int(deadline - time.time())}s left)', flush=True)
+    time.sleep(_backoff(attempt, interval))
+    attempt += 1
+  print(f'[barrier] TIMEOUT waiting for {what}', flush=True)
+  return None
+
+
+# ---------------------------------------------------------------------------
+# Roles
+# ---------------------------------------------------------------------------
+
+
+def _schedule(configs):
+  """[(idx, label, bs, nb, p, run, port)] -- identical on both hosts."""
+  runs = max(1, _RUNS.value)
+  out = []
+  for i, (bs, nb, p) in enumerate(configs):
+    for r in range(runs):
+      idx = i * runs + r
+      out.append((idx, _label(bs, nb, p), bs, nb, p, r,
+                  _CONTROL_PORT.value + idx))
+  return out
+
+
+def _run_receiver(cc, configs, worker_id, own_ip):
+  """Receiver role. Returns the process exit code."""
+  srv = _PeerServer(_PEER_PORT.value)
+  srv.start()
+  print(f'[receiver] worker {worker_id}: peer channel on {own_ip}:{srv.port}',
+        flush=True)
+
+  verdicts = {}
+  aborted = False
+  sched = _schedule(configs)
+  for idx, label, bs, nb, p, run, port in sched:
+    print(f'[receiver] ({idx + 1}/{len(sched)}) {label} run {run} on :{port}',
+          flush=True)
+    proc = _popen(_base_argv(cc, bs, nb, p, port) + ['--role=receiver'])
+    watcher = _StreamWatcher(proc, _READY_MARKER)
+    watcher.start()
+    watcher.ready.wait(timeout=_STARTUP_TIMEOUT_S.value)
+    if _READY_MARKER not in watcher.output:
+      # Died (bind/alloc/interface failure) or hung before listening: tell the
+      # sender so it skips this run instead of dialing a dead port.
+      if proc.poll() is None:
+        proc.kill()
+      out = _finish(proc, watcher, 30)
+      srv.mark_failed(idx)
+      print(f'[receiver] {label} run {run}: runner exited rc={proc.returncode} '
+            f'before listening; tail:\n{out[-2000:]}', file=sys.stderr,
+            flush=True)
+      continue
+    srv.mark_ready(idx)
+
+    # Bound the wait for the first sender contact: the C++ receiver blocks in
+    # accept() forever, and a sender that never comes must not cost
+    # startup+timeout per run.
+    contact_deadline = time.time() + _STARTUP_TIMEOUT_S.value
+    contacted = False
+    while time.time() < contact_deadline:
+      if proc.poll() is not None or _CONTACT_MARKER in watcher.output:
+        contacted = True
+        break
+      time.sleep(1)
+    if not contacted:
+      proc.kill()
+      _finish(proc, watcher, 30)
+      print(f'[receiver] {label} run {run}: no sender contact within '
+            f'{_STARTUP_TIMEOUT_S.value}s'
+            f'{" (sender never even asked READY)" if not srv.queried(idx) else ""}'
+            '; aborting the remaining runs.', file=sys.stderr, flush=True)
+      aborted = True
+      break
+
+    out = None
+    if proc.poll() is not None and _CONTACT_MARKER not in watcher.output:
+      # Exited before the sender connected (crash, lost bind): that is not a
+      # byte-compare result. Drain first -- the marker may still be buffered.
+      out = _finish(proc, watcher, 30)
+      if _CONTACT_MARKER not in out:
+        srv.mark_failed(idx)
+        verdicts[label] = False
+        print(f'[receiver] {label} run {run}: exited rc={proc.returncode} '
+              f'before sender contact; tail:\n{out[-2000:]}', file=sys.stderr,
+              flush=True)
+        continue
+
+    # The receiver self-exits after its byte-compare; never kill it early or
+    # the check is cut short and reports a false CORRUPT.
+    if out is None:
+      out = _finish(proc, watcher, _TIMEOUT_S.value + _STARTUP_TIMEOUT_S.value)
+    ok = (_INTEG_PASS in out) and (_INTEG_FAIL not in out)
+    verdicts[label] = verdicts.get(label, True) and ok
+    print(f'[receiver] {label} run {run}: integrity='
+          f'{"OK" if ok else "CORRUPT"}', flush=True)
+    if not ok:
+      print(f'--- receiver tail ({label} run {run}) ---\n{out[-4000:]}',
+            flush=True)
+
+  srv.set_verdicts(verdicts)
+  # The sender may still be inside its own last runner process (up to
+  # _TIMEOUT_S after ours), then it asks; size the wait accordingly. After an
+  # abort, only a sender that has already talked to us is worth waiting for.
+  if aborted:
+    wait = 60 if srv.last_query else 5
+  else:
+    wait = 2 * _TIMEOUT_S.value + _STARTUP_TIMEOUT_S.value
+  print(f'[receiver] {"aborted" if aborted else "all runs done"}; waiting up '
+        f'to {wait}s for the sender to collect verdicts ...', flush=True)
+  fetched = srv.fetched.wait(timeout=wait)
+  srv.close()
+  if not fetched:
+    print('[receiver] sender never collected the verdicts.', file=sys.stderr)
+    return 1
+  return 1 if aborted else 0
+
+
+def _run_sender(cc, configs, peer_ip, peer_port):
+  """Runs every scheduled sender process.
+
+  Waits for the peer driver to publish readiness before each run.
+  Returns (results {label: {...}}, aborted).
+  """
+  results = {}
+  aborted = False
+  sched = _schedule(configs)
+  for idx, label, bs, nb, p, run, port in sched:
+    argv = _base_argv(cc, bs, nb, p, port)
+    r = results.setdefault(label, {'samples': [], 'raw': []})
+    print(f'[sender] ({idx + 1}/{len(sched)}) {label} run {run}: waiting '
+          f'for peer receiver {peer_ip}:{peer_port}', flush=True)
+    ready = _await_peer(peer_ip, peer_port, f'READY {idx}',
+                        lambda rep: rep in (_READY_YES, _READY_FAILED),
+                        _STARTUP_TIMEOUT_S.value,
+                        f'receiver readiness for {label} run {run}')
+    if ready == _READY_FAILED:
+      print(f'[sender] {label} run {run}: receiver failed before listening; '
+            'skipping run', flush=True)
+      r['raw'].append({'run': run, 'rc': None, 'samples': [], 'gbs': -1.0,
+                       'mean_gbs': -1.0, 'p50_ms': -1.0, 'p90_ms': -1.0,
+                       'p99_ms': -1.0, 'total_bytes': 0,
+                       'active_ifaces': None, 'skipped': True})
+      continue
+    if ready != _READY_YES:
+      print(f'[sender] {label}: peer receiver never became ready. If this '
+            'is the first run, the peer is probably not running this '
+            'driver at all.', file=sys.stderr, flush=True)
+      aborted = True
+      break
+
+    send_proc = _popen(argv + ['--role=sender', f'--peer_control_ip={peer_ip}'])
+    send_watcher = _StreamWatcher(send_proc, _READY_MARKER)
+    send_watcher.start()
+    out = _finish(send_proc, send_watcher, _TIMEOUT_S.value)
+    m = _parse_sender(out, bs, nb)
+    m['run'] = run
+    m['rc'] = send_proc.returncode
+
+    if not m['samples']:
+      print(f'[sender] {label} run {run} produced no throughput reading '
+            f'(rc={send_proc.returncode}); output:\n{out[-4000:]}', flush=True)
+    r['samples'].extend(m['samples'])
+    r['raw'].append(m)
+  return results, aborted
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+
+def _active_ifaces(r):
+  for m in r.get('raw', []):
+    if m.get('active_ifaces'):
+      return m['active_ifaces']
+  return None
+
+
+def _core_floor(samples, k, max_margin):
+  """Gate floor: lower edge of the normal core, capped so it is never looser
+  than max_margin (mirrors h2h_cpp_gate._core_floor exactly).
+
+      floor = max(median - k * MAD_sigma,  median * (1 - max_margin))
+
+  MAD_sigma = 1.4826 * median(|x - median|) is an outlier-resistant stddev, so a
+  low tail does not drag the bound down; the cap keeps a noisy config from ending
+  up looser than a flat max_margin.
+  """
+  med = statistics.median(samples)
+  mad = statistics.median([abs(x - med) for x in samples]) if len(samples) > 1 else 0.0
+  sigma = 1.4826 * mad
+  core = med - k * sigma
+  cap = med * (1.0 - max_margin)
+  return max(core, cap)
+
+
+def _pct(xs, q):
+  """q-th percentile (0..100) of non-empty xs via linear interpolation."""
+  xs = sorted(xs)
+  if len(xs) == 1:
+    return xs[0]
+  pos = (len(xs) - 1) * (q / 100.0)
+  lo = int(pos)
+  hi = min(lo + 1, len(xs) - 1)
+  return xs[lo] + (xs[hi] - xs[lo]) * (pos - lo)
+
+
+def _write_outputs(configs, results, verdicts, out_dir):
+  """Samples CSV + one [measured] line per config. Returns the sample count."""
+  labels = [_label(*c) for c in configs]
+  csv_path = os.path.join(out_dir, 'h2h_multihost_samples.csv')
+  with open(csv_path, 'w', newline='') as f:
+    w = csv.writer(f)
+    # `rank`: the runner prints H2H_ITER_MS from its SORTED latency vector, so
+    # this is the ascending-latency rank within the run, not the time order.
+    w.writerow(['config', 'run', 'rank', 'gbs', 'mean_gbs', 'p50_ms', 'p90_ms',
+                'p99_ms', 'total_bytes', 'integrity'])
+    for label in labels:
+      r = results.get(label, {'raw': []})
+      integ = int(bool(verdicts.get(label, False)))
+      for m in r['raw']:
+        for j, g in enumerate(m['samples']):
+          w.writerow([label, m['run'], j, f'{g:.4f}', f'{m["mean_gbs"]:.4f}',
+                      f'{m["p50_ms"]:.4f}', f'{m["p90_ms"]:.4f}',
+                      f'{m["p99_ms"]:.4f}', int(m['total_bytes']), integ])
+
+  for label in labels:
+    s = results.get(label, {}).get('samples', [])
+    integ = bool(verdicts.get(label, False))
+    if s:
+      print(f'[measured] {label:<22} n={len(s):<5} '
+            f'median={statistics.median(s):8.3f}  p10={_pct(s, 10):8.3f}  '
+            f'p90={_pct(s, 90):8.3f}  min={min(s):8.3f}  max={max(s):8.3f}  '
+            f'stdev={statistics.pstdev(s):6.3f} GB/s  '
+            f'integrity={"OK" if integ else "CORRUPT"}', flush=True)
+    else:
+      print(f'[measured] {label:<22} no samples  '
+            f'integrity={"OK" if integ else "CORRUPT"}', flush=True)
+  print(f'\nWrote {csv_path} -> {out_dir}', flush=True)
+  return sum(len(results.get(label, {}).get('samples', [])) for label in labels)
+
+
+def _write_baselines(configs, results, verdicts, out_dir):
+  """Writes h2h_multihost_baselines.json. Returns the labels whose data is
+  incomplete (no samples, a skipped run, or no passing integrity verdict); the
+  file is still written for diagnosis, but record must not exit 0 on them."""
+  cfg = {'sigma_k': _SIGMA_K.value,
+         'max_margin': _MAX_MARGIN.value, 'iters': _ITERS.value,
+         'runs_per_config': max(1, _RUNS.value), 'configs': {}}
+  for c in configs:
+    label = _label(*c)
+    s = results.get(label, {}).get('samples', [])
+    cfg['configs'][label] = {
+        'baseline_gbs': round(statistics.median(s), 3) if s else 0.0,
+        'floor_gbs': round(_core_floor(s, _SIGMA_K.value,
+                                       _MAX_MARGIN.value), 4) if s else 0.0,
+        'integrity': bool(verdicts.get(label, False)),
+        'n_samples': len(s),
+        'active_ifaces': _active_ifaces(results.get(label, {})),
+    }
+  path = os.path.join(out_dir, 'h2h_multihost_baselines.json')
+  with open(path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+  incomplete = []
+  for c in configs:
+    label = _label(*c)
+    r = results.get(label, {})
+    reasons = []
+    if not r.get('samples'):
+      reasons.append('no samples')
+    if any(m.get('skipped') for m in r.get('raw', [])):
+      reasons.append('skipped run(s)')
+    if not verdicts.get(label, False):
+      reasons.append('no passing integrity verdict')
+    if reasons:
+      incomplete.append(label)
+      print(f'[record] {label}: INCOMPLETE ({", ".join(reasons)})',
+            file=sys.stderr, flush=True)
+  if incomplete:
+    print(f'RECORD FAIL: {len(incomplete)} config(s) incomplete: {incomplete}; '
+          f'{path} is diagnostic only -- do NOT commit it.', file=sys.stderr,
+          flush=True)
+  else:
+    print(f'Recorded {len(cfg["configs"])} baselines+floors -> {path}\n'
+          f'Commit it to tpu_sync/benchmarks/h2h_multihost_baselines.json to '
+          f'arm the gate.', flush=True)
+  return incomplete
+
+
+def _gate(configs, results, verdicts):
+  floors = {}
+  base = {}
+  if _GATE_THROUGHPUT.value:
+    try:
+      with open(_baselines_path()) as f:
+        base = json.load(f)
+      floors = {k: float(v.get('floor_gbs', 0.0))
+                for k, v in base.get('configs', {}).items()}
+      floors = {k: v for k, v in floors.items() if v > 0}
+      err = None if floors else 'no config has a floor_gbs > 0'
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+      err = f'{_baselines_path()}: {e}'
+    if err:
+      # Fail closed: a missing/corrupt baselines file must not silently turn
+      # the throughput gate off. Pass --nogate_throughput to gate on integrity
+      # only.
+      print(f'GATE FAIL: baselines unreadable or empty ({err})',
+            file=sys.stderr, flush=True)
+      return 1
+
+  bad = []
+  print('\nH2H multi-host gate\n')
+  print(f'{"config":<22} {"median":>9} {"floor":>9}  integrity  verdict')
+  print('-' * 72)
+  for c in configs:
+    label = _label(*c)
+    r = results.get(label, {})
+    s = r.get('samples', [])
+    med = statistics.median(s) if s else -1.0
+    has_verdict = label in verdicts
+    integ = bool(verdicts.get(label, False))
+    floor = floors.get(label, 0.0)
+    reasons = []
+    if not s:
+      reasons.append('NO MEASUREMENT')
+    if has_verdict and not integ:
+      reasons.append('DATA CORRUPTION')
+    elif not has_verdict and s:
+      # Bytes moved but the receiver never reported on them (crashed, or the
+      # run was skipped on its side): unproven is a failure, but a different one.
+      reasons.append('NO VERDICT')
+    if _GATE_THROUGHPUT.value and s and floor > 0 and med < floor:
+      reasons.append(f'BELOW FLOOR {floor:.4f}')
+    rec_nics = base.get('configs', {}).get(label, {}).get('active_ifaces')
+    got_nics = _active_ifaces(r)
+    if rec_nics and got_nics and rec_nics != got_nics:
+      print(f'[gate] WARNING: {label}: floor recorded with {rec_nics} active '
+            f'NIC(s), this run used {got_nics}.', flush=True)
+    floor_txt = f'{floor:9.4f}' if floor > 0 else '  NO FLOOR'
+    print(f'{label:<22} {med:9.3f} {floor_txt}  '
+          f'{"OK" if integ else "CORRUPT":<9}  '
+          f'{"PASS" if not reasons else "FAIL <-- " + ", ".join(reasons)}',
+          flush=True)
+    if reasons:
+      bad.append(label)
+  if bad:
+    print(f'\nGATE FAIL on {len(bad)} config(s): {bad}', file=sys.stderr,
+          flush=True)
+    return 1
+  print('\nGATE PASS: all configs byte-exact across hosts'
+        + (' and at/above their floors.' if floors else '.'), flush=True)
+  return 0
+
+
+# ---------------------------------------------------------------------------
+
+
+def main(_):
+  worker_id, hosts = _discover_topology()
+  configs = _configs()
+  stage = _STAGE.value
+
+  if worker_id < 0:
+    print('GATE FAIL: no worker index (set --worker_id, or run under a runner '
+          'that exports JOB_COMPLETION_INDEX / TPU_WORKER_ID).',
+          file=sys.stderr, flush=True)
+    sys.exit(1)
+
+  own_ip = _resolve_control_plane()
+  cc = _locate_runner()
+  print(f'[topology] stage={stage} worker_id={worker_id} hosts={hosts} '
+        f'sender={_SENDER_IDX.value} receiver={_RECEIVER_IDX.value} '
+        f'control_ip={own_ip}', flush=True)
+  print(f'[topology] configs={[_label(*c) for c in configs]} '
+        f'iters={_ITERS.value} runs_per_config={max(1, _RUNS.value)} '
+        f'runner={cc}', flush=True)
+
+  if worker_id == _RECEIVER_IDX.value:
+    sys.exit(_run_receiver(cc, configs, worker_id, own_ip))
+  if worker_id != _SENDER_IDX.value:
+    print(f'[topology] worker {worker_id} is neither sender nor receiver; '
+          'nothing to do.', flush=True)
+    return
+  if len(hosts) <= _RECEIVER_IDX.value:
+    print('GATE FAIL: no way to find the receiver: give --peers or set '
+          f'TPU_WORKER_HOSTNAMES with at least {_RECEIVER_IDX.value + 1} '
+          f'hosts (got {hosts}).', file=sys.stderr, flush=True)
+    sys.exit(1)
+  peer_ip, peer_port = hosts[_RECEIVER_IDX.value], _PEER_PORT.value
+  results, aborted = _run_sender(cc, configs, peer_ip, peer_port)
+  verdicts = {}
+  if aborted:
+    print('GATE FAIL: the peer receiver never became ready; run incomplete.',
+          file=sys.stderr)
+  else:
+    raw = _await_peer(peer_ip, peer_port, 'VERDICTS', bool,
+                      _TIMEOUT_S.value, 'receiver verdicts')
+    if not raw:
+      print("GATE FAIL: could not read the receiver's integrity verdicts; "
+            'nothing proves the bytes are correct.', file=sys.stderr)
+    else:
+      verdicts = json.loads(raw)
+
+  out_dir = _out_dir()
+  total = _write_outputs(configs, results, verdicts, out_dir)
+
+  scalars = {}
+  for c in configs:
+    label = _label(*c)
+    s = results.get(label, {}).get('samples', [])
+    if not s:
+      continue  # a missing metric beats a -1.0 point on the dashboard
+    scalars[f'{label}/cpp_gbs'] = statistics.median(s) if stage == 'gate' else s
+  if scalars:
+    bap_metrics.emit(scalars)
+
+  if stage == 'record':
+    incomplete = _write_baselines(configs, results, verdicts, out_dir)
+    rc = 0 if total and not incomplete else 1
+  else:
+    rc = _gate(configs, results, verdicts)
+  if aborted:
+    rc = 1
+
+  sys.exit(rc)
+
+
+if __name__ == '__main__':
+  app.run(main, flags_parser=lambda args: flags.FLAGS(args, known_only=True))

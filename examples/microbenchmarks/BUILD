@@ -93,3 +93,21 @@ py_binary(
         "@torch_tpu//src/torch_tpu",
     ],
 )
+
+py_binary(
+    name = "torch_dist_weight_sync_benchmark_runner",
+    srcs = ["torch_dist_weight_sync_benchmark_runner.py"],
+    deps = [
+        "//tpu_sync/api/torch:torch_tpu_common_loader",
+        "//tpu_sync/api/torch:weight_synchronizer_torch_py",
+        "//tpu_sync/rpc:raiden_controller",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
+        "@com_google_absl_py//absl:app",
+        "@com_google_absl_py//absl/flags",
+        "@com_google_absl_py//absl/logging",
+        "@pypi//numpy",
+        "@torch_tpu//shims/torch",
+        "@torch_tpu//shims/torch:pytorch",
+        "@torch_tpu//src/torch_tpu",
+    ],
+)

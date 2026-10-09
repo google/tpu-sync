@@ -600,6 +600,7 @@ py_test(
     main = "kv_cache_manager_test.py",
     tags = [
         "cpu:8",
+        "notap",
         "requires-accel-hbm",
         "requires-ghostlite:8",
         "requires-net:external",

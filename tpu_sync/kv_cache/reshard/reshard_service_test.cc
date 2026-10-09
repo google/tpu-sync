@@ -785,6 +785,10 @@ TEST(ReshardControlPipeTest, ZmqBackendRoundTrip) {
 }
 
 TEST_F(ReshardStackTest, FullPoolReshardFlowEmitsArmThenDispatch) {
+  // Receiver address forwarding is opt-in; this test covers the enabled path.
+  setenv("TPU_RAIDEN_FORWARD_RECEIVER_ADDRS", "1", 1);
+  auto env_cleanup = absl::MakeCleanup(
+      [] { unsetenv("TPU_RAIDEN_FORWARD_RECEIVER_ADDRS"); });
   RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
                    /*num_blocks=*/16);
   // Rank 0 covers dst block 0 fully; rank 1 covers a prefix of block 1.

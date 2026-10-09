@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <string>
@@ -28,7 +29,9 @@
 #include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -52,6 +55,18 @@ namespace {
 
 // Worker RPC timeout: WorkerRpcClient uses connect_socket(timeout=60).
 constexpr absl::Duration kWorkerRpcTimeout = absl::Seconds(60);
+
+// Opt-in: forward each receiver's pool addresses (from its arm reply) to the
+// senders as StartTransferRequest.receiver_addrs. Off by default: no sender
+// transport consumes the resulting raddr yet.
+// Set TPU_RAIDEN_FORWARD_RECEIVER_ADDRS=1 to enable.
+bool ForwardReceiverAddrsEnabled() {
+  const char* value = std::getenv("TPU_RAIDEN_FORWARD_RECEIVER_ADDRS");
+  if (value == nullptr) return false;
+  const absl::string_view v(value);
+  return v == "1" || absl::EqualsIgnoreCase(v, "true") ||
+         absl::EqualsIgnoreCase(v, "yes") || absl::EqualsIgnoreCase(v, "on");
+}
 
 int64_t MonotonicNs() { return absl::GetCurrentTimeNanos(); }
 
@@ -446,12 +461,16 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
         return status;
       }
     }
-    // Each receiver reports its pool addresses in its arm reply; senders
-    // look them up by the receiver's data endpoint.
-    for (size_t i = 0; i < plan.dst_units.size(); ++i) {
-      if (arm_replies[i].receiver_pool_addrs().empty()) continue;
-      *plan.receiver_addrs[plan.dst_units[i]].mutable_pools() =
-          arm_replies[i].receiver_pool_addrs();
+    // Each receiver reports its pool addresses in its arm reply; when
+    // forwarding is enabled, senders look them up by the receiver's data
+    // endpoint. Otherwise plan.receiver_addrs stays empty and senders fall
+    // back to receiver-resolved addressing (raddr = nullptr).
+    if (ForwardReceiverAddrsEnabled()) {
+      for (size_t i = 0; i < plan.dst_units.size(); ++i) {
+        if (arm_replies[i].receiver_pool_addrs().empty()) continue;
+        *plan.receiver_addrs[plan.dst_units[i]].mutable_pools() =
+            arm_replies[i].receiver_pool_addrs();
+      }
     }
   }
   const int64_t receiver_arm_ack_ns = MonotonicNs();

@@ -14,6 +14,7 @@
 
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("//third_party/bazel_skylib/rules:common_settings.bzl", "bool_flag")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -261,6 +262,19 @@ cc_test(
     ],
 )
 
+# Drops the ZeroMQ control pipe backend (and //third_party/zeromq) from :control_pipe. With it set,
+# a kZmq config falls back to the TCP backend.
+bool_flag(
+    name = "disable_zmq_backend",
+    build_setting_default = False,
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "zmq_backend_disabled",
+    flag_values = {":disable_zmq_backend": "True"},
+)
+
 cc_library(
     name = "control_pipe",
     srcs = ["control_pipe_factory.cc"],
@@ -275,6 +289,10 @@ cc_library(
         "-fexceptions",
     ],
     features = ["-use_header_modules"],
+    local_defines = select({
+        ":zmq_backend_disabled": ["TPU_RAIDEN_NO_ZMQ_CONTROL_PIPE"],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         ":control_dispatcher",
@@ -282,18 +300,21 @@ cc_library(
         ":control_pipe_types",
         ":grpc_control_pipe",
         ":tcp_control_pipe",
-        ":zmq_control_pipe",
         "//tpu_sync/proto:control_pipe_cc_proto",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
-    ],
+    ] + select({
+        ":zmq_backend_disabled": [],
+        "//conditions:default": [":zmq_control_pipe"],
+    }),
 )
 
 cc_test(

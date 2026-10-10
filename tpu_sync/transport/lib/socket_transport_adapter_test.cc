@@ -32,12 +32,14 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -695,13 +697,7 @@ TEST(SocketTransportAdapterTest, SourceBindDisabledWhenEnvUnsetOrZero) {
   auto cleanup = absl::MakeCleanup(
       [] { unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND"); });
 
-  unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND");
-  EXPECT_FALSE(SourceBindEnabled());
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "");
-
   setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "0", 1);
-  EXPECT_FALSE(SourceBindEnabled());
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "");
 
   std::string observed_peer_ip;
   auto server_handler = [&](int client_fd,
@@ -758,15 +754,6 @@ TEST(SocketTransportAdapterTest, SourceBindDisabledWhenEnvUnsetOrZero) {
 TEST(SocketTransportAdapterTest, SourceBindEnabledWithEnableSourceIpBindEnv) {
   auto cleanup = absl::MakeCleanup(
       [] { unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND"); });
-
-  setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "1", 1);
-  EXPECT_TRUE(SourceBindEnabled());
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "10.0.0.1");
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 1), "10.0.0.2");
-
-  setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "true", 1);
-  EXPECT_TRUE(SourceBindEnabled());
-  EXPECT_EQ(SelectSourceIp({"10.0.0.1", "10.0.0.2"}, 0), "10.0.0.1");
 
   std::string observed_peer_ip;
   auto server_handler = [&](int client_fd,
@@ -853,6 +840,160 @@ TEST(SocketTransportAdapterTest, SourceBindEnabledWithEnableSourceIpBindEnv) {
     EXPECT_THAT(recv_buf, ::testing::ElementsAre(5, 6, 7, 8));
     EXPECT_THAT(observed_peer_ip, ::testing::HasSubstr("127.0.0.3"));
   }
+
+  // 3. A NUMA-pinned adapter restricts binding to local IPs on its node. No
+  // loopback alias is a host NIC, so it falls back to every local IP and
+  // still binds to "127.0.0.4".
+  {
+    setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "1", 1);
+    RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                        /*local_ips=*/{"127.0.0.4"});
+    SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1,
+                                          /*numa_node=*/0);
+
+    std::vector<uint8_t> recv_buf(4, 0);
+    Request req = {};
+    req.socket_opcode = 2;
+    req.laddr = recv_buf.data();
+    req.len = recv_buf.size();
+    req.count_or_size = 1;
+    req.remote_id = 10;
+    req.local_id = 20;
+    req.uuid = 104;
+    req.parallelism = 1;
+    req.request_id = 0;
+    req.stream_idx = 0;
+
+    auto handle = client_adapter.Post(
+        /*peers=*/{GetIpPort(server_transport)},
+        /*requests=*/absl::MakeConstSpan(&req, 1));
+
+    ASSERT_THAT(handle.status(), absl_testing::IsOk());
+    EXPECT_THAT(recv_buf, ::testing::ElementsAre(5, 6, 7, 8));
+    EXPECT_THAT(observed_peer_ip, ::testing::HasSubstr("127.0.0.4"));
+  }
+}
+
+// Pull server that records the peer IP of every connection it serves and
+// answers each request with the 4-byte payload {5, 6, 7, 8}.
+class PeerIpRecordingPullServer {
+ public:
+  PeerIpRecordingPullServer()
+      : transport_(/*delegate=*/nullptr, /*local_port=*/0, /*local_ips=*/{},
+                   [this](int client_fd, const ChunkHeader& header) {
+                     return Handle(client_fd, header);
+                   }) {}
+
+  std::string address() const { return GetIpPort(transport_); }
+
+  std::vector<std::string> observed_peer_ips() {
+    absl::MutexLock lock(mu_);
+    return observed_peer_ips_;
+  }
+
+ private:
+  absl::Status Handle(int client_fd, const ChunkHeader& header) {
+    {
+      absl::MutexLock lock(mu_);
+      observed_peer_ips_.push_back(GetPeerIp(client_fd));
+    }
+    const auto s_resp = SerializeChunkHeader(header);
+    if (auto s =
+            ::peregrine::WriteExact(client_fd, s_resp.data(), s_resp.size());
+        !s.ok()) {
+      return s;
+    }
+    std::vector<uint8_t> payload = {5, 6, 7, 8};
+    const auto s_size = SerializeChunkSize(payload.size());
+    if (auto s =
+            ::peregrine::WriteExact(client_fd, s_size.data(), s_size.size());
+        !s.ok()) {
+      return s;
+    }
+    return ::peregrine::WriteExact(client_fd, payload.data(), payload.size());
+  }
+
+  absl::Mutex mu_;
+  std::vector<std::string> observed_peer_ips_ ABSL_GUARDED_BY(mu_);
+  RawBufferTransport transport_;
+};
+
+TEST(SocketTransportAdapterTest,
+     SourceBindSkipsCandidatesThatDoNotRouteToPeer) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND"); });
+  setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "1", 1);
+
+  PeerIpRecordingPullServer server;
+  // Index-based selection would put stream 0 on 192.0.2.1 (TEST-NET-1, not a
+  // local address, so it cannot route to the peer) and stream 1 on 127.0.0.5.
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{"192.0.2.1", "127.0.0.5"});
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/2);
+
+  std::array<std::vector<uint8_t>, 2> recv_bufs = {std::vector<uint8_t>(4, 0),
+                                                   std::vector<uint8_t>(4, 0)};
+  std::array<Request, 2> reqs = {};
+  for (int stream = 0; stream < 2; ++stream) {
+    Request& req = reqs[stream];
+    req.socket_opcode = 2;
+    req.laddr = recv_bufs[stream].data();
+    req.len = recv_bufs[stream].size();
+    req.count_or_size = 1;
+    req.remote_id = 10 + stream;
+    req.local_id = 20 + stream;
+    req.uuid = 105;
+    req.parallelism = 2;
+    req.request_id = stream;
+    req.stream_idx = stream;
+  }
+
+  auto handle = client_adapter.Post(
+      /*peers=*/{server.address()},
+      /*requests=*/absl::MakeConstSpan(reqs));
+
+  ASSERT_THAT(handle.status(), absl_testing::IsOk());
+  EXPECT_THAT(recv_bufs[0], ElementsAre(5, 6, 7, 8));
+  EXPECT_THAT(recv_bufs[1], ElementsAre(5, 6, 7, 8));
+  // The dual-stack server reports IPv4 peers as "::ffff:a.b.c.d".
+  EXPECT_THAT(
+      server.observed_peer_ips(),
+      ::testing::AllOf(::testing::SizeIs(2),
+                       ::testing::Each(::testing::HasSubstr("127.0.0.5"))));
+}
+
+TEST(SocketTransportAdapterTest,
+     SourceBindFallsBackToKernelWhenNoCandidateRoutesToPeer) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND"); });
+  setenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND", "1", 1);
+
+  PeerIpRecordingPullServer server;
+  RawBufferTransport client_transport(/*delegate=*/nullptr, /*local_port=*/0,
+                                      /*local_ips=*/{"192.0.2.1"});
+  SocketTransportAdapter client_adapter(&client_transport, /*parallelism=*/1);
+
+  std::vector<uint8_t> recv_buf(4, 0);
+  Request req = {};
+  req.socket_opcode = 2;
+  req.laddr = recv_buf.data();
+  req.len = recv_buf.size();
+  req.count_or_size = 1;
+  req.remote_id = 10;
+  req.local_id = 20;
+  req.uuid = 106;
+  req.parallelism = 1;
+  req.request_id = 0;
+  req.stream_idx = 0;
+
+  auto handle = client_adapter.Post(
+      /*peers=*/{server.address()},
+      /*requests=*/absl::MakeConstSpan(&req, 1));
+
+  ASSERT_THAT(handle.status(), absl_testing::IsOk());
+  EXPECT_THAT(recv_buf, ElementsAre(5, 6, 7, 8));
+  EXPECT_THAT(server.observed_peer_ips(),
+              ElementsAre(::testing::HasSubstr("127.0.0.1")));
 }
 
 TEST(SocketTransportAdapterTest, DefaultTimeoutsWhenEnvUnset) {

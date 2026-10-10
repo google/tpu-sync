@@ -39,13 +39,6 @@ namespace tpu_raiden {
 namespace transport {
 namespace lib {
 
-// Returns true if source IP binding is enabled via environment variable
-// TPU_RAIDEN_ENABLE_SOURCE_IP_BIND.
-bool SourceBindEnabled();
-
-// Source address for stream `i`, or "" to let the kernel choose by route.
-std::string SelectSourceIp(absl::Span<const std::string> local_ips, size_t i);
-
 // TCP Socket implementation of TransportAdapter.
 class SocketTransportAdapter : public TransportAdapter {
  public:
@@ -144,6 +137,12 @@ class SocketTransportAdapter : public TransportAdapter {
   RawBufferTransport* const raw_transport_;
   const int parallelism_;
   const int numa_node_;
+  // Candidate source addresses for outbound streams (used only when source
+  // binding is enabled): the local IPs on `numa_node_`, or every local IP
+  // when unpinned or when no local IP is on that node. Per peer, candidates
+  // are further filtered to those the kernel routes to that peer through
+  // their own NIC.
+  const std::vector<std::string> source_ips_;
   const Config config_;
 
   mutable absl::Mutex scheduler_mu_;

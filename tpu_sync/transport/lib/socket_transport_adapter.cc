@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "absl/cleanup/cleanup.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -41,6 +42,7 @@
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
@@ -54,6 +56,7 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
+#include "tpu_sync/transport/lib/socket/util.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden {
@@ -206,8 +209,6 @@ absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
   return status;
 }
 
-}  // namespace
-
 // Whether to pin the client-side source address of outbound data connections.
 //
 // Binding a source IP only steers egress onto a particular NIC when the host
@@ -218,9 +219,11 @@ absl::Status ReportError(CompletionCallback& on_complete, absl::Status status) {
 // Without such a rule the kernel still routes by destination, so the bound
 // address disagrees with the interface the packet leaves on, and cloud
 // anti-spoofing filters drop it. bind() itself succeeds and only the data path
-// breaks, so the failure surfaces as a hang rather than an error. Since the
-// routing rule is a property of the host that this process cannot reliably
-// detect, source binding is opt-in rather than default-on.
+// breaks, so the failure surfaces as a hang rather than an error. A source is
+// therefore only bound when the kernel's own route lookup confirms that the
+// source's NIC is the egress for that peer (SourceIpRoutesToPeer). Binding
+// stays opt-in (TPU_RAIDEN_ENABLE_SOURCE_IP_BIND) because the policy routing
+// that makes it useful is a property of the host.
 bool SourceBindEnabled() {
   const char* v = std::getenv("TPU_RAIDEN_ENABLE_SOURCE_IP_BIND");
   if (v == nullptr) return false;
@@ -230,17 +233,100 @@ bool SourceBindEnabled() {
          absl::EqualsIgnoreCase(sv, "on");
 }
 
-// Source address for stream `i`, or "" to let the kernel choose by route.
-std::string SelectSourceIp(absl::Span<const std::string> local_ips, size_t i) {
-  if (!SourceBindEnabled() || local_ips.empty()) return "";
-  return local_ips[i % local_ips.size()];
+// Candidates in `source_ips` (order preserved) that the kernel would route to
+// `peer` through their own NIC. A candidate whose lookup fails is dropped and
+// logged. Logs once per peer when no candidate qualifies, since every stream
+// to it then falls back to the kernel's choice of source.
+std::vector<std::string> SourceIpsRoutingToPeer(
+    absl::Span<const std::string> source_ips, absl::string_view peer) {
+  std::vector<std::string> routable;
+  for (const std::string& source_ip : source_ips) {
+    absl::StatusOr<bool> routes = SourceIpRoutesToPeer(source_ip, peer);
+    if (!routes.ok()) {
+      LOG_FIRST_N(WARNING, 8)
+          << "Skipping source IP " << source_ip << " for peer " << peer
+          << ": route lookup failed: " << routes.status();
+      continue;
+    }
+    if (*routes) routable.push_back(source_ip);
+  }
+  if (routable.empty() && !source_ips.empty()) {
+    LOG_FIRST_N(WARNING, 8)
+        << "No source IP in [" << absl::StrJoin(source_ips, ", ")
+        << "] routes to peer " << peer
+        << " through its own NIC; letting the kernel pick the source";
+  }
+  return routable;
 }
+
+// Source address for stream `i`, or "" to let the kernel choose by route:
+// binding disabled, or no candidate routes to the stream's peer through its
+// own NIC (`routable_source_ips` empty).
+std::string SelectSourceIp(absl::Span<const std::string> routable_source_ips,
+                           size_t i) {
+  if (!SourceBindEnabled() || routable_source_ips.empty()) return "";
+  return routable_source_ips[i % routable_source_ips.size()];
+}
+
+// Route-filtered source candidates for each distinct peer in `peers`. Empty
+// when source binding is disabled, so that path performs no route lookups.
+absl::flat_hash_map<std::string, std::vector<std::string>>
+RoutableSourceIpsByPeer(absl::Span<const std::string> source_ips,
+                        absl::Span<const std::string> peers) {
+  absl::flat_hash_map<std::string, std::vector<std::string>> by_peer;
+  if (!SourceBindEnabled()) return by_peer;
+  for (const std::string& peer : peers) {
+    if (by_peer.contains(peer)) continue;
+    by_peer[peer] = SourceIpsRoutingToPeer(source_ips, peer);
+  }
+  return by_peer;
+}
+
+// Subset of |local_ips| owned by a NIC in |nics| on |numa_node|, in
+// |local_ips| order. Empty when |numa_node| < 0 or no local IP is on that
+// node.
+std::vector<std::string> SourceIpsForNumaNode(
+    absl::Span<const std::string> local_ips,
+    absl::Span<const HostNicAddress> nics, int numa_node) {
+  std::vector<std::string> result;
+  if (numa_node < 0) return result;
+  for (const std::string& ip : local_ips) {
+    const bool on_node =
+        std::any_of(nics.begin(), nics.end(), [&](const HostNicAddress& nic) {
+          return nic.ip_address == ip && nic.numa_node == numa_node;
+        });
+    if (on_node) result.push_back(ip);
+  }
+  return result;
+}
+
+// Source IPs for an adapter pinned to |numa_node|: the local IPs on that
+// node, or every local IP when unpinned or none is on that node. NIC
+// discovery is only consulted for pinned adapters, so the default adapter's
+// construction is unchanged.
+std::vector<std::string> ResolveSourceIps(
+    absl::Span<const std::string> local_ips, int numa_node) {
+  if (numa_node >= 0) {
+    std::vector<std::string> on_node =
+        SourceIpsForNumaNode(local_ips, GetLocalHostNicAddresses(), numa_node);
+    if (!on_node.empty()) return on_node;
+    LOG(WARNING) << "No local IP on NUMA node " << numa_node
+                 << "; pinned send workers will use every local IP";
+  }
+  return std::vector<std::string>(local_ips.begin(), local_ips.end());
+}
+
+}  // namespace
 
 SocketTransportAdapter::SocketTransportAdapter(
     RawBufferTransport* raw_transport, int parallelism, int numa_node)
     : raw_transport_(raw_transport),
       parallelism_(parallelism),
       numa_node_(numa_node),
+      source_ips_(ResolveSourceIps(raw_transport == nullptr
+                                       ? absl::Span<const std::string>()
+                                       : raw_transport->local_ips(),
+                                   numa_node)),
       config_(ReadConfigFromEnv()),
       rr_index_(0),
       scheduler_stopping_(false) {
@@ -393,6 +479,8 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
       std::chrono::steady_clock::now();
   const size_t base_blocks_per_stream = num_blocks / P;
   const size_t remainder = num_blocks % P;
+  absl::flat_hash_map<std::string, std::vector<std::string>>
+      routable_source_ips_by_peer = RoutableSourceIpsByPeer(source_ips_, peers);
   size_t req_offset = 0;
 
   std::vector<std::unique_ptr<WriteTask>> new_tasks;
@@ -436,8 +524,9 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPush(
       ++req_end;
     }
 
-    const std::string local_ip = SelectSourceIp(local_ips, i);
     const std::string remote_peer = peers[i % peers.size()];
+    const std::string local_ip =
+        SelectSourceIp(routable_source_ips_by_peer[remote_peer], i);
 
     absl::Span<const Request> stream_requests =
         absl::MakeConstSpan(*shared_requests)
@@ -672,6 +761,8 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPull(
 
   threads.reserve(P);
 
+  absl::flat_hash_map<std::string, std::vector<std::string>>
+      routable_source_ips_by_peer = RoutableSourceIpsByPeer(source_ips_, peers);
   size_t req_offset = 0;
   for (int i = 0; i < P; ++i) {
     size_t req_end = req_offset;
@@ -683,8 +774,9 @@ absl::StatusOr<Handle> SocketTransportAdapter::PostSocketPull(
         requests.subspan(req_offset, req_end - req_offset);
     req_offset = req_end;
 
-    const std::string local_ip = SelectSourceIp(local_ips, i);
     const std::string remote_peer = peers[i % peers.size()];
+    const std::string local_ip =
+        SelectSourceIp(routable_source_ips_by_peer[remote_peer], i);
 
     threads.emplace_back(
         [this, i, remote_peer, local_ip, stream_requests, &statuses]() {

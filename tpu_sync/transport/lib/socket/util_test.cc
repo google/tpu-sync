@@ -16,6 +16,7 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -217,6 +218,94 @@ TEST(ConnectToPeerTest, DoesNotRetryOnConnectionRefused) {
   const absl::Time start = absl::Now();
   EXPECT_THAT(ConnectToPeer(addr), StatusIs(absl::StatusCode::kUnavailable));
   EXPECT_LT(absl::Now() - start, absl::Seconds(1));
+}
+
+// First non-loopback IPv4 address on this host, or nullopt if it has none.
+std::optional<std::string> FirstNonLoopbackIpv4Address() {
+  ifaddrs* ifa_list = nullptr;
+  CHECK_EQ(getifaddrs(&ifa_list), 0);
+  absl::Cleanup free_list = [ifa_list] { freeifaddrs(ifa_list); };
+  for (const ifaddrs* ifa = ifa_list; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET) {
+      continue;
+    }
+    const auto* sin = reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr);
+    if ((ntohl(sin->sin_addr.s_addr) >> 24) == 127) continue;
+    char ip[INET_ADDRSTRLEN] = {};
+    CHECK_NE(inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip)), nullptr);
+    return std::string(ip);
+  }
+  return std::nullopt;
+}
+
+TEST(SourceIpRoutesToPeerTest, LoopbackSourceToLoopbackPeer) {
+  ClearSourceIpRouteCacheForTesting();
+  EXPECT_THAT(SourceIpRoutesToPeer("127.0.0.3", "127.0.0.1:1"),
+              IsOkAndHolds(true));
+}
+
+TEST(SourceIpRoutesToPeerTest, UnownedSourceIsNotFound) {
+  ClearSourceIpRouteCacheForTesting();
+  // TEST-NET-1 is never assigned to a local interface.
+  EXPECT_THAT(SourceIpRoutesToPeer("192.0.2.1", "127.0.0.1:1"),
+              StatusIs(absl::StatusCode::kNotFound, HasSubstr("192.0.2.1")));
+}
+
+TEST(SourceIpRoutesToPeerTest, NonLoopbackSourceDoesNotRouteToLoopbackPeer) {
+  ClearSourceIpRouteCacheForTesting();
+  const std::optional<std::string> nic_ip = FirstNonLoopbackIpv4Address();
+  if (!nic_ip.has_value()) {
+    GTEST_SKIP() << "host has no non-loopback IPv4 address";
+  }
+  // The kernel egresses loopback peers via `lo`, not the NIC owning `nic_ip`.
+  EXPECT_THAT(SourceIpRoutesToPeer(*nic_ip, "127.0.0.1:1"),
+              IsOkAndHolds(false));
+}
+
+TEST(SourceIpRoutesToPeerTest, InvalidPeerIsInvalidArgument) {
+  ClearSourceIpRouteCacheForTesting();
+  EXPECT_THAT(SourceIpRoutesToPeer("127.0.0.1", "nocolon"),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST(SourceIpRoutesToPeerTest, SuccessfulResultsAreMemoizedPerSourceAndPeer) {
+  ClearSourceIpRouteCacheForTesting();
+  EXPECT_EQ(SourceIpRouteCacheSizeForTesting(), 0);
+
+  EXPECT_THAT(SourceIpRoutesToPeer("127.0.0.3", "127.0.0.1:1"),
+              IsOkAndHolds(true));
+  EXPECT_EQ(SourceIpRouteCacheSizeForTesting(), 1);
+
+  // An identical call is served from the cache and adds no entry.
+  EXPECT_THAT(SourceIpRoutesToPeer("127.0.0.3", "127.0.0.1:1"),
+              IsOkAndHolds(true));
+  EXPECT_EQ(SourceIpRouteCacheSizeForTesting(), 1);
+
+  // A different peer port is a distinct key.
+  EXPECT_THAT(SourceIpRoutesToPeer("127.0.0.3", "127.0.0.1:2"),
+              IsOkAndHolds(true));
+  EXPECT_EQ(SourceIpRouteCacheSizeForTesting(), 2);
+}
+
+TEST(SourceIpRoutesToPeerTest, ErrorsAreNotMemoized) {
+  ClearSourceIpRouteCacheForTesting();
+  // TEST-NET-1 is never assigned to a local interface, so this fails uncached.
+  EXPECT_THAT(SourceIpRoutesToPeer("192.0.2.1", "127.0.0.1:1"),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_EQ(SourceIpRouteCacheSizeForTesting(), 0);
+
+  // Re-evaluated, not served from the cache: still the same error.
+  EXPECT_THAT(SourceIpRoutesToPeer("192.0.2.1", "127.0.0.1:1"),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_EQ(SourceIpRouteCacheSizeForTesting(), 0);
+}
+
+TEST(SourceIpRoutesToPeerTest, HostnamePeerStillResolves) {
+  ClearSourceIpRouteCacheForTesting();
+  // The numeric-only fast path must fall back to name resolution. The value
+  // is not asserted: it is true if `localhost` resolves to 127.0.0.1 first
+  // and false if it resolves only to ::1 (no IPv4 address for the peer).
+  ABSL_EXPECT_OK(SourceIpRoutesToPeer("127.0.0.3", "localhost:1"));
 }
 
 }  // namespace

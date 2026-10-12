@@ -177,6 +177,16 @@ absl::StatusOr<int> ConnectToPeer(absl::string_view peer,
         !local_ip.empty() && local_ip != "0.0.0.0" && local_ip != "::";
 
     if (should_bind) {
+      // Bind only the source address; choose the port at connect() so different
+      // destinations can share a source port without sharing a TCP connection.
+      if (setsockopt(sock_fd, IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, &opt,
+                     sizeof(opt)) < 0) {
+        last_status = absl::ErrnoToStatus(
+            errno, "setsockopt(IP_BIND_ADDRESS_NO_PORT) failed");
+        close(sock_fd);
+        sock_fd = -1;
+        continue;
+      }
       std::string local_ip_str(local_ip);
       bool is_ipv6 = absl::StrContains(local_ip, ':');
       if (is_ipv6 && rp->ai_family == AF_INET6) {

@@ -41,8 +41,8 @@ namespace {
 using ::absl_testing::IsOk;
 using ::absl_testing::StatusIs;
 
-TEST(StagingArenaTest, LayerOrderAcquireAndReleaseReuse) {
-  StagingArena arena(StagingArena::Config{
+TEST(LayerArenaTest, LayerOrderAcquireAndReleaseReuse) {
+  LayerArena arena(LayerArena::Config{
       .initial_capacity = 2,
       .num_shards = 2,
       .allow_dynamic_growth = false,
@@ -60,7 +60,7 @@ TEST(StagingArenaTest, LayerOrderAcquireAndReleaseReuse) {
   // Simulate processing 6 layers in layer order while only holding 1 slot at a
   // time. The arena should reuse slot 0 without growing.
   for (size_t step = 0; step < 6; ++step) {
-    absl::StatusOr<StagingArena::Allocation> alloc = arena.Acquire();
+    absl::StatusOr<LayerArena::Allocation> alloc = arena.Acquire();
     ASSERT_THAT(alloc, IsOk());
     ASSERT_TRUE(alloc->valid());
     EXPECT_EQ(alloc->layer_idx(), 0);
@@ -92,16 +92,16 @@ TEST(StagingArenaTest, LayerOrderAcquireAndReleaseReuse) {
   EXPECT_EQ(arena.num_chunks(), 1);
 }
 
-TEST(StagingArenaTest, OutOfCapacityWithoutDynamicGrowthReturnsError) {
-  StagingArena arena(StagingArena::Config{
+TEST(LayerArenaTest, OutOfCapacityWithoutDynamicGrowthReturnsError) {
+  LayerArena arena(LayerArena::Config{
       .initial_capacity = 2,
       .num_shards = 1,
       .allow_dynamic_growth = false,
   });
 
-  absl::StatusOr<StagingArena::Allocation> alloc0 = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> alloc0 = arena.Acquire();
   ASSERT_THAT(alloc0, IsOk());
-  absl::StatusOr<StagingArena::Allocation> alloc1 = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> alloc1 = arena.Acquire();
   ASSERT_THAT(alloc1, IsOk());
   EXPECT_EQ(alloc0->layer_idx(), 0);
   EXPECT_EQ(alloc1->layer_idx(), 1);
@@ -116,12 +116,12 @@ TEST(StagingArenaTest, OutOfCapacityWithoutDynamicGrowthReturnsError) {
   EXPECT_EQ(arena.in_use_count(), 1);
   EXPECT_EQ(arena.available_count(), 1);
 
-  absl::StatusOr<StagingArena::Allocation> alloc_reused = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> alloc_reused = arena.Acquire();
   ASSERT_THAT(alloc_reused, IsOk());
   EXPECT_EQ(alloc_reused->layer_idx(), 0);
 }
 
-TEST(StagingArenaTest, DynamicCapacityGrowthPreservesPointerStability) {
+TEST(LayerArenaTest, DynamicCapacityGrowthPreservesPointerStability) {
   size_t allocator_calls = 0;
   HostBufferAllocator default_alloc = MakeDefaultHostBufferAllocator();
   HostBufferAllocator counting_alloc = [&](size_t size_bytes,
@@ -131,8 +131,8 @@ TEST(StagingArenaTest, DynamicCapacityGrowthPreservesPointerStability) {
     return default_alloc(size_bytes, device);
   };
 
-  StagingArena arena(
-      StagingArena::Config{
+  LayerArena arena(
+      LayerArena::Config{
           .initial_capacity = 2,
           .num_shards = 3,
           .shard_host_size = 128,
@@ -143,9 +143,9 @@ TEST(StagingArenaTest, DynamicCapacityGrowthPreservesPointerStability) {
   // Initial chunk of 2 layers * 3 shards = 6 allocations.
   EXPECT_EQ(allocator_calls, 6);
 
-  absl::StatusOr<StagingArena::Allocation> alloc0 = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> alloc0 = arena.Acquire();
   ASSERT_THAT(alloc0, IsOk());
-  absl::StatusOr<StagingArena::Allocation> alloc1 = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> alloc1 = arena.Acquire();
   ASSERT_THAT(alloc1, IsOk());
   LayerInfoBase* ptr0 = alloc0->get();
   LayerInfoBase* ptr1 = alloc1->get();
@@ -154,7 +154,7 @@ TEST(StagingArenaTest, DynamicCapacityGrowthPreservesPointerStability) {
 
   // Acquiring a 3rd slot triggers adding a new std::vector<LayerInfoBase> of
   // the same size (2) and allocating 2 * 3 = 6 new shard buffers.
-  absl::StatusOr<StagingArena::Allocation> alloc2 = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> alloc2 = arena.Acquire();
   ASSERT_THAT(alloc2, IsOk());
   EXPECT_EQ(allocator_calls, 12);
   EXPECT_EQ(arena.num_chunks(), 2);
@@ -177,9 +177,9 @@ TEST(StagingArenaTest, DynamicCapacityGrowthPreservesPointerStability) {
   EXPECT_EQ(&arena.GetLayer(2), alloc2->get());
 
   // Acquire 2 more to trigger a 3rd chunk of size 2 (total capacity = 6).
-  absl::StatusOr<StagingArena::Allocation> alloc3 = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> alloc3 = arena.Acquire();
   ASSERT_THAT(alloc3, IsOk());
-  absl::StatusOr<StagingArena::Allocation> alloc4 = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> alloc4 = arena.Acquire();
   ASSERT_THAT(alloc4, IsOk());
   EXPECT_EQ(allocator_calls, 18);
   EXPECT_EQ(alloc3->layer_idx(), 3);
@@ -191,15 +191,15 @@ TEST(StagingArenaTest, DynamicCapacityGrowthPreservesPointerStability) {
   EXPECT_EQ(&arena[4], alloc4->get());
 }
 
-TEST(StagingArenaTest, DynamicGrowthWithoutAllocatorReturnsError) {
+TEST(LayerArenaTest, DynamicGrowthWithoutAllocatorReturnsError) {
   std::vector<LayerInfoBase> initial_layers(1);
   initial_layers[0].shards.resize(1);
   initial_layers[0].shards[0].device_size = 256;
   initial_layers[0].shards[0].host_size = 256;
 
-  StagingArena arena(std::move(initial_layers), /*host_allocator=*/nullptr,
-                     StagingArena::Config{.allow_dynamic_growth = true});
-  absl::StatusOr<StagingArena::Allocation> alloc0 = arena.Acquire();
+  LayerArena arena(std::move(initial_layers), /*host_allocator=*/nullptr,
+                   LayerArena::Config{.allow_dynamic_growth = true});
+  absl::StatusOr<LayerArena::Allocation> alloc0 = arena.Acquire();
   ASSERT_THAT(alloc0, IsOk());
 
   // Attempting to grow when shard memory is needed but no allocator was passed
@@ -207,8 +207,8 @@ TEST(StagingArenaTest, DynamicGrowthWithoutAllocatorReturnsError) {
   EXPECT_THAT(arena.Acquire(), StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 
-TEST(StagingArenaTest, ReleaseMemoryOnFreeResetsShardBuffers) {
-  StagingArena arena(StagingArena::Config{
+TEST(LayerArenaTest, ReleaseMemoryOnFreeResetsShardBuffers) {
+  LayerArena arena(LayerArena::Config{
       .initial_capacity = 1,
       .num_shards = 1,
       .allow_dynamic_growth = false,
@@ -217,7 +217,7 @@ TEST(StagingArenaTest, ReleaseMemoryOnFreeResetsShardBuffers) {
 
   auto backing_memory = std::make_shared<std::vector<uint8_t>>(256, 0x7F);
   {
-    absl::StatusOr<StagingArena::Allocation> alloc = arena.Acquire();
+    absl::StatusOr<LayerArena::Allocation> alloc = arena.Acquire();
     ASSERT_THAT(alloc, IsOk());
     (*alloc)->shards[0].host_ptr = backing_memory->data();
     (*alloc)->shards[0].host_size = backing_memory->size();
@@ -229,7 +229,7 @@ TEST(StagingArenaTest, ReleaseMemoryOnFreeResetsShardBuffers) {
   // Destruction of `alloc` should have released `host_owner` and cleared host
   // pointers/sizes while preserving `shards.size()` and `device_size`.
   EXPECT_EQ(backing_memory.use_count(), 1);
-  absl::StatusOr<StagingArena::Allocation> reacquired = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> reacquired = arena.Acquire();
   ASSERT_THAT(reacquired, IsOk());
   ASSERT_EQ((*reacquired)->shards.size(), 1);
   EXPECT_EQ((*reacquired)->shards[0].host_ptr, nullptr);
@@ -238,16 +238,16 @@ TEST(StagingArenaTest, ReleaseMemoryOnFreeResetsShardBuffers) {
   EXPECT_EQ((*reacquired)->shards[0].device_size, 512);
 }
 
-TEST(StagingArenaTest, MoveAssignmentReleasesPreviousSlot) {
-  StagingArena arena(StagingArena::Config{
+TEST(LayerArenaTest, MoveAssignmentReleasesPreviousSlot) {
+  LayerArena arena(LayerArena::Config{
       .initial_capacity = 2,
       .num_shards = 1,
       .allow_dynamic_growth = false,
   });
 
-  absl::StatusOr<StagingArena::Allocation> alloc0 = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> alloc0 = arena.Acquire();
   ASSERT_THAT(alloc0, IsOk());
-  absl::StatusOr<StagingArena::Allocation> alloc1 = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> alloc1 = arena.Acquire();
   ASSERT_THAT(alloc1, IsOk());
   EXPECT_EQ(arena.in_use_count(), 2);
   EXPECT_EQ(arena.available_count(), 0);
@@ -259,7 +259,7 @@ TEST(StagingArenaTest, MoveAssignmentReleasesPreviousSlot) {
   EXPECT_EQ(alloc0->layer_idx(), 1);
 }
 
-TEST(StagingArenaTest, ConstructFromMovedVectorAndAccessByLayerIndex) {
+TEST(LayerArenaTest, ConstructFromMovedVectorAndAccessByLayerIndex) {
   HostBufferAllocator alloc_fn = MakeDefaultHostBufferAllocator();
   std::vector<LayerInfoBase> initial_layers(3);
   for (size_t i = 0; i < initial_layers.size(); ++i) {
@@ -275,8 +275,8 @@ TEST(StagingArenaTest, ConstructFromMovedVectorAndAccessByLayerIndex) {
     }
   }
 
-  StagingArena arena(std::move(initial_layers), alloc_fn,
-                     StagingArena::Config{.allow_dynamic_growth = true});
+  LayerArena arena(std::move(initial_layers), alloc_fn,
+                   LayerArena::Config{.allow_dynamic_growth = true});
   EXPECT_EQ(arena.size(), 3);
   EXPECT_EQ(arena.num_chunks(), 1);
   EXPECT_EQ(arena.chunk_size(), 3);
@@ -286,10 +286,10 @@ TEST(StagingArenaTest, ConstructFromMovedVectorAndAccessByLayerIndex) {
 
   // Acquiring 4 slots grows by adding another vector of size 3 (and 2 shards),
   // allocating new host memory matching each layer's template size.
-  absl::StatusOr<StagingArena::Allocation> a0 = arena.Acquire();
-  absl::StatusOr<StagingArena::Allocation> a1 = arena.Acquire();
-  absl::StatusOr<StagingArena::Allocation> a2 = arena.Acquire();
-  absl::StatusOr<StagingArena::Allocation> a3 = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> a0 = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> a1 = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> a2 = arena.Acquire();
+  absl::StatusOr<LayerArena::Allocation> a3 = arena.Acquire();
   ASSERT_THAT(a0, IsOk());
   ASSERT_THAT(a1, IsOk());
   ASSERT_THAT(a2, IsOk());
@@ -304,15 +304,14 @@ TEST(StagingArenaTest, ConstructFromMovedVectorAndAccessByLayerIndex) {
 }
 
 // ---------------------------------------------------------------------------
-// StagingBlockAllocator
+// SlotArena / BlockArena
 // ---------------------------------------------------------------------------
 
-TEST(StagingBlockAllocatorTest, FixedSlotsReserveAndLockBlocksUpFront) {
+TEST(SlotArenaTest, FixedSlotsReserveAndLockBlocksUpFront) {
   kv_cache::LogicalBlockManager blocks(/*num_blocks=*/8);
   TF_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<StagingBlockAllocator> allocator,
-      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/3,
-                                    /*dynamic_host_staging=*/false));
+      std::unique_ptr<SlotArena> allocator,
+      SlotArena::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/3));
   EXPECT_FALSE(allocator->dynamic_host_staging());
   EXPECT_EQ(allocator->num_slots(), 2);
   EXPECT_EQ(allocator->max_blocks(), 3);
@@ -330,12 +329,11 @@ TEST(StagingBlockAllocatorTest, FixedSlotsReserveAndLockBlocksUpFront) {
   EXPECT_EQ(blocks.num_allocated_blocks(), 6);
 }
 
-TEST(StagingBlockAllocatorTest, FixedSlotAcquireReleaseAndFifoReuse) {
+TEST(SlotArenaTest, FixedSlotAcquireReleaseAndFifoReuse) {
   kv_cache::LogicalBlockManager blocks(/*num_blocks=*/4);
   TF_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<StagingBlockAllocator> allocator,
-      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/2,
-                                    /*dynamic_host_staging=*/false));
+      std::unique_ptr<SlotArena> allocator,
+      SlotArena::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/2));
 
   // num_blocks <= 0 yields an empty allocation without consuming a slot.
   TF_ASSERT_OK_AND_ASSIGN(StagingAllocation none, allocator->Acquire(0));
@@ -346,7 +344,7 @@ TEST(StagingBlockAllocatorTest, FixedSlotAcquireReleaseAndFifoReuse) {
   TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a0, allocator->Acquire(1));
   TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a1, allocator->Acquire(2));
   EXPECT_TRUE(a0);
-  EXPECT_FALSE(a0.is_dynamic());
+  EXPECT_FALSE(allocator->dynamic_host_staging());
   EXPECT_EQ(a0.slot_idx(), 0);
   EXPECT_EQ(a1.slot_idx(), 1);
   // A partial request still hands out the whole slot.
@@ -378,12 +376,11 @@ TEST(StagingBlockAllocatorTest, FixedSlotAcquireReleaseAndFifoReuse) {
   EXPECT_EQ(allocator->num_free_slots(), 1);
 }
 
-TEST(StagingBlockAllocatorTest, RequestExceedingSlotCapacityIsRejected) {
+TEST(SlotArenaTest, RequestExceedingSlotCapacityIsRejected) {
   kv_cache::LogicalBlockManager blocks(/*num_blocks=*/4);
   TF_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<StagingBlockAllocator> allocator,
-      StagingBlockAllocator::Create(&blocks, /*num_slots=*/1, /*max_blocks=*/2,
-                                    /*dynamic_host_staging=*/false));
+      std::unique_ptr<SlotArena> allocator,
+      SlotArena::Create(&blocks, /*num_slots=*/1, /*max_blocks=*/2));
   EXPECT_THAT(allocator->Acquire(3),
               StatusIs(absl::StatusCode::kInvalidArgument));
   EXPECT_THAT(
@@ -393,12 +390,11 @@ TEST(StagingBlockAllocatorTest, RequestExceedingSlotCapacityIsRejected) {
   EXPECT_EQ(allocator->num_free_slots(), 1);
 }
 
-TEST(StagingBlockAllocatorTest, AcquireWithTimeoutExpiresThenWakesOnRelease) {
+TEST(SlotArenaTest, AcquireWithTimeoutExpiresThenWakesOnRelease) {
   kv_cache::LogicalBlockManager blocks(/*num_blocks=*/2);
   TF_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<StagingBlockAllocator> allocator,
-      StagingBlockAllocator::Create(&blocks, /*num_slots=*/1, /*max_blocks=*/1,
-                                    /*dynamic_host_staging=*/false));
+      std::unique_ptr<SlotArena> allocator,
+      SlotArena::Create(&blocks, /*num_slots=*/1, /*max_blocks=*/1));
   TF_ASSERT_OK_AND_ASSIGN(StagingAllocation held, allocator->Acquire(1));
 
   EXPECT_THAT(
@@ -421,12 +417,11 @@ TEST(StagingBlockAllocatorTest, AcquireWithTimeoutExpiresThenWakesOnRelease) {
   EXPECT_EQ(acquired->slot_idx(), 0);
 }
 
-TEST(StagingBlockAllocatorTest, ShutdownWakesWaitersAndCancelsTimedAcquires) {
+TEST(SlotArenaTest, ShutdownWakesWaitersAndCancelsTimedAcquires) {
   kv_cache::LogicalBlockManager blocks(/*num_blocks=*/2);
   TF_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<StagingBlockAllocator> allocator,
-      StagingBlockAllocator::Create(&blocks, /*num_slots=*/1, /*max_blocks=*/1,
-                                    /*dynamic_host_staging=*/false));
+      std::unique_ptr<SlotArena> allocator,
+      SlotArena::Create(&blocks, /*num_slots=*/1, /*max_blocks=*/1));
   TF_ASSERT_OK_AND_ASSIGN(StagingAllocation held, allocator->Acquire(1));
 
   absl::Notification waiting;
@@ -451,71 +446,115 @@ TEST(StagingBlockAllocatorTest, ShutdownWakesWaitersAndCancelsTimedAcquires) {
   EXPECT_EQ(allocator->num_free_slots(), 1);
 }
 
-TEST(StagingBlockAllocatorTest, DynamicStagingLocksAndReleasesHostBlocks) {
+TEST(BlockArenaTest, LocksAndReleasesHostBlocksPerRequest) {
   kv_cache::LogicalBlockManager blocks(/*num_blocks=*/4);
-  TF_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<StagingBlockAllocator> allocator,
-      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/2,
-                                    /*dynamic_host_staging=*/true));
-  EXPECT_TRUE(allocator->dynamic_host_staging());
+  BlockArena arena(&blocks, /*num_slots=*/2, /*max_blocks=*/2);
+  EXPECT_TRUE(arena.dynamic_host_staging());
   // No slot pool is reserved; capacity is the whole host pool.
-  EXPECT_EQ(allocator->num_free_slots(), 0);
-  EXPECT_EQ(allocator->capacity(), 4);
+  EXPECT_EQ(arena.size(), 0);
+  EXPECT_EQ(arena.capacity(), 4);
   EXPECT_EQ(blocks.num_allocated_blocks(), 0);
 
-  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a, allocator->Acquire(3));
-  EXPECT_TRUE(a.is_dynamic());
-  EXPECT_EQ(a.slot_idx(), -1);
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a, arena.Acquire(3));
+  EXPECT_TRUE(a);
+  EXPECT_EQ(a.slot_idx(), 0);
   EXPECT_EQ(a.block_ids().size(), 3);
   EXPECT_EQ(blocks.num_locked_blocks(), 3);
   for (int block_id : a.block_ids()) {
     EXPECT_TRUE(blocks.IsLocked(block_id));
   }
+  EXPECT_EQ(arena.size(), 1);
+  EXPECT_EQ(arena.in_use_count(), 1);
 
-  // Only one unlocked block remains, so a 2-block request is exhausted.
-  EXPECT_THAT(allocator->Acquire(2),
-              StatusIs(absl::StatusCode::kResourceExhausted));
-  EXPECT_THAT(allocator->Acquire(5),
-              StatusIs(absl::StatusCode::kInvalidArgument));
+  // Only one unlocked block remains, so a 2-block request is exhausted and
+  // the on-demand slot it created stays free for reuse.
+  EXPECT_THAT(arena.Acquire(2), StatusIs(absl::StatusCode::kResourceExhausted));
+  EXPECT_EQ(arena.available_count(), 1);
+  EXPECT_THAT(arena.Acquire(5), StatusIs(absl::StatusCode::kInvalidArgument));
 
   // Release unlocks and deallocates the blocks.
   a.Reset();
   EXPECT_EQ(blocks.num_locked_blocks(), 0);
   EXPECT_EQ(blocks.num_allocated_blocks(), 0);
-  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation b, allocator->Acquire(4));
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation b, arena.Acquire(4));
   EXPECT_EQ(b.block_ids().size(), 4);
+  // Slots are recycled rather than appended.
+  EXPECT_EQ(arena.size(), 2);
 }
 
-TEST(StagingBlockAllocatorTest, CreateFailsWithoutEnoughHostBlocks) {
+TEST(BlockArenaTest, AcquireWithTimeoutWaitsForBlocksToBeReleased) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/2);
+  BlockArena arena(&blocks, /*num_slots=*/1, /*max_blocks=*/2);
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation held, arena.Acquire(2));
+  EXPECT_THAT(arena.AcquireWithTimeout(1, std::chrono::steady_clock::now() +
+                                              std::chrono::milliseconds(20)),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+
+  absl::Notification waiting;
+  absl::StatusOr<StagingAllocation> acquired;
+  std::thread waiter([&] {
+    waiting.Notify();
+    acquired = arena.AcquireWithTimeout(
+        2, std::chrono::steady_clock::now() + std::chrono::seconds(10));
+  });
+  waiting.WaitForNotification();
+  absl::SleepFor(absl::Milliseconds(20));
+  held.Reset();
+  waiter.join();
+  ABSL_ASSERT_OK(acquired);
+  EXPECT_EQ(acquired->block_ids().size(), 2);
+}
+
+TEST(SlotArenaTest, CreateFailsWithoutEnoughHostBlocks) {
   kv_cache::LogicalBlockManager blocks(/*num_blocks=*/3);
-  EXPECT_THAT(
-      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/2,
-                                    /*dynamic_host_staging=*/false),
-      StatusIs(absl::StatusCode::kFailedPrecondition));
+  EXPECT_THAT(SlotArena::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/2),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
   // Nothing was reserved.
   EXPECT_EQ(blocks.num_allocated_blocks(), 0);
 }
 
-TEST(StagingBlockAllocatorTest, NullHostBlockManager) {
+TEST(SlotArenaTest, NullHostBlockManager) {
   // Without a slot pool a null manager is accepted: this is the
   // "no shards" configuration where staging is never used.
   TF_ASSERT_OK_AND_ASSIGN(
-      std::unique_ptr<StagingBlockAllocator> allocator,
-      StagingBlockAllocator::Create(/*host_block_manager=*/nullptr,
-                                    /*num_slots=*/0, /*max_blocks=*/2,
-                                    /*dynamic_host_staging=*/false));
-  EXPECT_EQ(allocator->num_free_slots(), 0);
-  EXPECT_EQ(allocator->capacity(), 2);
-  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation none, allocator->Acquire(0));
+      std::unique_ptr<SlotArena> arena,
+      SlotArena::Create(/*host_block_manager=*/nullptr, /*num_slots=*/0,
+                        /*max_blocks=*/2));
+  EXPECT_EQ(arena->num_free_slots(), 0);
+  EXPECT_EQ(arena->capacity(), 2);
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation none, arena->Acquire(0));
   EXPECT_TRUE(none.empty());
-  EXPECT_THAT(allocator->Acquire(1),
+  EXPECT_THAT(arena->Acquire(1),
               StatusIs(absl::StatusCode::kResourceExhausted));
 
   // Requesting a slot pool over a null manager fails at creation.
-  EXPECT_THAT(StagingBlockAllocator::Create(/*host_block_manager=*/nullptr,
-                                            /*num_slots=*/1, /*max_blocks=*/1,
-                                            /*dynamic_host_staging=*/false),
+  EXPECT_THAT(SlotArena::Create(/*host_block_manager=*/nullptr,
+                                /*num_slots=*/1, /*max_blocks=*/1),
               StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+TEST(StagingArenaTest, ArenasShareTheBaseContract) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/4);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<SlotArena> slot_arena,
+      SlotArena::Create(&blocks, /*num_slots=*/1, /*max_blocks=*/1));
+  BlockArena block_arena(&blocks, /*num_slots=*/1, /*max_blocks=*/1);
+  LayerArena layer_arena(
+      LayerArena::Config{.initial_capacity = 1, .num_shards = 1});
+
+  for (StagingArena* arena : {static_cast<StagingArena*>(slot_arena.get()),
+                              static_cast<StagingArena*>(&block_arena),
+                              static_cast<StagingArena*>(&layer_arena)}) {
+    EXPECT_EQ(arena->in_use_count(), 0);
+    TF_ASSERT_OK_AND_ASSIGN(StagingArena::Allocation a, arena->Acquire(1));
+    EXPECT_TRUE(a.valid());
+    EXPECT_TRUE(arena->is_in_use(a.index()));
+    EXPECT_EQ(arena->in_use_count(), 1);
+    a.Release();
+    EXPECT_EQ(arena->in_use_count(), 0);
+    arena->Shutdown();
+    EXPECT_THAT(arena->Acquire(1), StatusIs(absl::StatusCode::kCancelled));
+  }
 }
 
 }  // namespace

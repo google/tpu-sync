@@ -112,12 +112,12 @@ struct CopyPlan {
   bool RequiresHostReorder() const { return !host_dst_to_src.empty(); }
 };
 
-// Builds a `StagingBlockAllocator` over |base|'s host block manager. When
+// Builds a `HostBlockArena` over |base|'s host block manager. When
 // |num_slots| and |max_blocks| are both positive, also registers the slot
 // layout with |base| via `ConfigureHostStagingSlots()` so `HostSpan()` can
 // address the slots. Throws `std::runtime_error` if the slot pool cannot be
 // reserved (mirrors the constructor contract of `KVCacheManagerWithTransfer`).
-std::unique_ptr<StagingBlockAllocator> CreateStagingBlockAllocator(
+std::unique_ptr<HostBlockArena> CreateStagingBlockAllocator(
     kv_cache::KVCacheManagerBase* base, int64_t num_slots, int64_t max_blocks,
     std::optional<bool> dynamic_host_staging = std::nullopt);
 
@@ -319,7 +319,7 @@ class KVCacheManagerWithTransfer {
   // see DeriveControlTimeoutS.
   double control_timeout_s_ = 10.0;
 
-  std::unique_ptr<StagingBlockAllocator> staging_allocator_;
+  std::unique_ptr<HostBlockArena> staging_allocator_;
   // TransferSendSession is shared across threads: created/timed-out/cleaned-up
   // on the main thread, but accessed asynchronously in control worker threads
   // handling pull connections.

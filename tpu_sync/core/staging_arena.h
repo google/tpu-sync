@@ -20,13 +20,14 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
-#include <optional>
+#include <utility>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/host_memory_allocator.h"
@@ -97,25 +98,198 @@ inline HostBufferAllocator MakeDefaultHostBufferAllocator() {
   };
 }
 
-// Manages layer staging metadata (`LayerInfoBase`) across one or more
-// fixed-size `std::vector<LayerInfoBase>` chunk collections.
+// Base class for the host staging pools in tpu_sync.
 //
-// Supports both:
-// 1. Dynamic slot acquisition via `Acquire()` returning a move-only RAII
-//    `Allocation` handle that returns the slot to the arena when destroyed.
-//    When out of capacity and `Config::allow_dynamic_growth` is enabled,
-//    the arena grows by appending a new `std::vector<LayerInfoBase>` with the
-//    same size as the previous vector and allocating backing host buffers via
-//    the configured `HostBufferAllocator`, preserving pointer/reference
-//    stability for all existing `Allocation` handles.
-// 2. Backward-compatible index-based access (`GetLayer(layer_idx)` and
-//    `operator[](layer_idx)`).
+// A staging arena is a set of indexed slots that are handed out one at a
+// time through a move-only RAII `Allocation` and returned when the handle is
+// destroyed. The base class owns everything that is independent of what a
+// slot holds:
+//   * the mutex, free list and in-use bitmap,
+//   * `Acquire()` / `AcquireWithDeadline()` / `AcquireWithTimeout()`,
+//     including the deadline-bounded wait for a slot to be released,
+//   * `Shutdown()`, which wakes waiters and fails subsequent acquires with
+//     `kCancelled`,
+//   * `size()` / `available_count()` / `in_use_count()`.
 //
-// Thread-safe for concurrent `Acquire()` and `Allocation` release.
+// Subclasses own the per-slot payload and customise behaviour through the
+// protected `*Locked()` hooks, all of which run with `mu_` held:
+//   * `LayerArena`  - `LayerInfoBase` slots (weight sync / KV cache layers).
+//   * `SlotArena`   - fixed slots of pre-locked host blocks.
+//   * `BlockArena`  - per-request host blocks (dynamic host staging).
+//
+// Thread-safe. Hooks must not call back into the arena's public API.
 class StagingArena {
  public:
+  // Order in which released slots are handed out again.
+  enum class ReusePolicy {
+    kLifo,  // most recently released slot first
+    kFifo,  // release order (round-robin over the pool)
+  };
+
+  // Move-only RAII handle for an acquired slot. Returns the slot to the arena
+  // on destruction unless already returned via `Release()`. A
+  // default-constructed handle is empty.
+  class Allocation {
+   public:
+    Allocation() = default;
+    Allocation(std::nullptr_t) {}  // NOLINT(runtime/explicit)
+    Allocation(StagingArena* arena, size_t index)
+        : arena_(arena), index_(index) {}
+    ~Allocation() { Release(); }
+
+    Allocation(const Allocation&) = delete;
+    Allocation& operator=(const Allocation&) = delete;
+    Allocation(Allocation&& other) noexcept
+        : arena_(std::exchange(other.arena_, nullptr)),
+          index_(std::exchange(other.index_, 0)) {}
+    Allocation& operator=(Allocation&& other) noexcept {
+      if (this != &other) {
+        Release();
+        arena_ = std::exchange(other.arena_, nullptr);
+        index_ = std::exchange(other.index_, 0);
+      }
+      return *this;
+    }
+
+    // Returns the slot to the arena. Safe to call multiple times.
+    void Release();
+    // Alias of `Release()`.
+    void Reset() { Release(); }
+
+    bool valid() const { return arena_ != nullptr; }
+    bool empty() const { return !valid(); }
+    explicit operator bool() const { return valid(); }
+
+    // Slot index within `arena()`; only meaningful when `valid()`.
+    size_t index() const { return index_; }
+    StagingArena* arena() const { return arena_; }
+
+   private:
+    StagingArena* arena_ = nullptr;
+    size_t index_ = 0;
+  };
+
+  virtual ~StagingArena() = default;
+
+  StagingArena(const StagingArena&) = delete;
+  StagingArena& operator=(const StagingArena&) = delete;
+
+  // Acquires a slot sized for |num_blocks| without waiting. Returns
+  // `kResourceExhausted` when no slot is available, `kCancelled` after
+  // `Shutdown()`, or whatever the subclass hooks report (e.g.
+  // `kInvalidArgument` when |num_blocks| exceeds `capacity()`).
+  // |num_blocks| is ignored by arenas whose slots have no size (LayerArena).
+  absl::StatusOr<Allocation> Acquire(int64_t num_blocks = 1);
+
+  // Like `Acquire()`, but waits until |deadline| for a slot to become
+  // available when the arena is exhausted. Returns `kResourceExhausted` if
+  // |deadline| expires first and `kCancelled` if `Shutdown()` is called while
+  // waiting.
+  absl::StatusOr<Allocation> AcquireWithDeadline(int64_t num_blocks,
+                                                 absl::Time deadline);
+
+  // `AcquireWithDeadline()` for callers that track steady_clock deadlines.
+  absl::StatusOr<Allocation> AcquireWithTimeout(
+      int64_t num_blocks, std::chrono::steady_clock::time_point deadline);
+
+  // Wakes every waiter and fails all subsequent acquires with `kCancelled`.
+  // Outstanding allocations can still be released.
+  void Shutdown();
+
+  // Total number of slots (free and in use).
+  size_t size() const;
+  size_t available_count() const;
+  size_t in_use_count() const;
+  // True iff |index| is currently handed out through an `Allocation`.
+  bool is_in_use(size_t index) const;
+
+  // Arena capacity in the subclass' natural unit (slots by default; host
+  // blocks for the block arenas).
+  virtual int64_t capacity() const;
+
+ protected:
+  explicit StagingArena(ReusePolicy reuse_policy = ReusePolicy::kLifo)
+      : reuse_policy_(reuse_policy) {}
+
+  // Transfers the slot bookkeeping of |other| into `*this`. Subclasses that
+  // are movable call this from their move operations with both mutexes held.
+  void MoveSlotsFromLocked(StagingArena& other)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_, other.mu_);
+
+  // Registers a new free slot and returns its index. The subclass must have
+  // stored the matching payload at that index before releasing `mu_`.
+  size_t AddSlotLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // --- Hooks, all invoked with `mu_` held. ---------------------------------
+
+  // Rejects a request up front (e.g. `num_blocks > capacity()`). Runs before
+  // any waiting. Default: accept.
+  virtual absl::Status ValidateRequestLocked(int64_t num_blocks) const
+      ABSL_SHARED_LOCKS_REQUIRED(mu_) {
+    return absl::OkStatus();
+  }
+
+  // Whether an acquire for |num_blocks| could succeed right now; the deadline
+  // wait blocks until this (or shutdown) becomes true. Default: a free slot
+  // exists or the arena can grow.
+  virtual bool CanAcquireLocked(int64_t num_blocks) const
+      ABSL_SHARED_LOCKS_REQUIRED(mu_);
+
+  // Whether `GrowLocked()` may add slots. Default: false.
+  virtual bool CanGrowLocked() const ABSL_SHARED_LOCKS_REQUIRED(mu_) {
+    return false;
+  }
+
+  // Adds at least one free slot (payload + `AddSlotLocked()`). Called when the
+  // free list is empty and `CanGrowLocked()`. Default: `kResourceExhausted`.
+  virtual absl::Status GrowLocked(int64_t num_blocks)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  // Prepares slot |index| for a request of |num_blocks| right before it is
+  // handed out. On error the slot stays free. Default: no-op.
+  virtual absl::Status PrepareSlotLocked(size_t index, int64_t num_blocks)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+    return absl::OkStatus();
+  }
+
+  // Cleans up slot |index| right after it is returned. Default: no-op.
+  virtual void OnReleaseLocked(size_t index)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {}
+
+  mutable absl::Mutex mu_;
+
+ private:
+  friend class Allocation;
+
+  absl::StatusOr<Allocation> AcquireLocked(int64_t num_blocks)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void ReleaseSlot(size_t index);
+
+  ReusePolicy reuse_policy_;
+  bool shutting_down_ ABSL_GUARDED_BY(mu_) = false;
+  std::deque<size_t> free_slots_ ABSL_GUARDED_BY(mu_);
+  std::vector<bool> in_use_ ABSL_GUARDED_BY(mu_);
+};
+
+// `StagingArena` of layer staging metadata (`LayerInfoBase`), one slot per
+// layer, stored in one or more fixed-size chunks so that slot references stay
+// valid when the arena grows.
+//
+// Supports both:
+// 1. Slot acquisition via `Acquire()`. When out of capacity and
+//    `Config::allow_dynamic_growth` is enabled, the arena appends another
+//    chunk with the same shard layout as the first one and allocates its
+//    host buffers via the configured `HostBufferAllocator`. Shards whose host
+//    buffer is missing are allocated lazily on acquire.
+// 2. Index-based access (`GetLayer(layer_idx)` / `operator[]`) for callers
+//    that use the arena as a plain layer container.
+//
+// Movable (`layers_ = LayerArena(...)`); moving with outstanding allocations
+// is undefined.
+class LayerArena : public StagingArena {
+ public:
   struct Config {
-    // Number of `LayerInfoBase` slots in each allocated chunk vector.
+    // Number of `LayerInfoBase` slots in each allocated chunk.
     size_t initial_capacity = 0;
     // Number of shards to pre-size on each `LayerInfoBase` slot when a chunk
     // is allocated.
@@ -123,124 +297,78 @@ class StagingArena {
     // Per-shard host buffer size in bytes when allocating without an initial
     // `layers` template.
     size_t shard_host_size = 0;
-    // If true, appends a new `std::vector<LayerInfoBase>` of the same size as
-    // the previous chunk when `Acquire()` is called and no free slots remain.
+    // If true, appends a chunk of `initial_capacity` slots when `Acquire()`
+    // is called and no free slots remain.
     bool allow_dynamic_growth = false;
     // If true, calls `LayerInfoBase::ReleaseMemory()` when an `Allocation`
     // returns its slot to the arena.
     bool release_memory_on_free = false;
   };
 
-  // Move-only RAII handle representing an acquired `LayerInfoBase` slot in
-  // `StagingArena`. Automatically returns the slot to the arena on
-  // destruction unless already released via `Release()`.
-  class Allocation {
+  // `StagingArena::Allocation` with typed access to the layer.
+  class Allocation : public StagingArena::Allocation {
    public:
     Allocation() = default;
-    Allocation(StagingArena* arena, size_t layer_idx, LayerInfoBase* layer)
-        : arena_(arena), layer_idx_(layer_idx), layer_(layer) {}
-
-    ~Allocation() { Release(); }
-
-    Allocation(const Allocation&) = delete;
-    Allocation& operator=(const Allocation&) = delete;
-
-    Allocation(Allocation&& other) noexcept
-        : arena_(other.arena_),
-          layer_idx_(other.layer_idx_),
-          layer_(other.layer_) {
-      other.arena_ = nullptr;
-      other.layer_idx_ = 0;
-      other.layer_ = nullptr;
-    }
-
-    Allocation& operator=(Allocation&& other) noexcept {
-      if (this != &other) {
-        Release();
-        arena_ = other.arena_;
-        layer_idx_ = other.layer_idx_;
-        layer_ = other.layer_;
-        other.arena_ = nullptr;
-        other.layer_idx_ = 0;
-        other.layer_ = nullptr;
-      }
-      return *this;
-    }
-
-    // Explicitly returns the acquired slot to the arena before destruction.
-    void Release();
+    explicit Allocation(StagingArena::Allocation&& base)
+        : StagingArena::Allocation(std::move(base)) {}
 
     // Frees underlying host/tiled memory on this slot's `LayerInfoBase`.
     void ReleaseMemory() {
-      if (layer_ != nullptr) {
-        layer_->ReleaseMemory();
-      }
+      if (valid()) layer().ReleaseMemory();
     }
 
-    bool valid() const { return arena_ != nullptr && layer_ != nullptr; }
-    explicit operator bool() const { return valid(); }
-
-    size_t layer_idx() const { return layer_idx_; }
-    size_t index() const { return layer_idx_; }
-
-    LayerInfoBase& layer() { return *layer_; }
-    const LayerInfoBase& layer() const { return *layer_; }
-    LayerInfoBase* get() { return layer_; }
-    const LayerInfoBase* get() const { return layer_; }
-    LayerInfoBase& operator*() { return *layer_; }
-    const LayerInfoBase& operator*() const { return *layer_; }
-    LayerInfoBase* operator->() { return layer_; }
-    const LayerInfoBase* operator->() const { return layer_; }
-
-   private:
-    StagingArena* arena_ = nullptr;
-    size_t layer_idx_ = 0;
-    LayerInfoBase* layer_ = nullptr;
+    size_t layer_idx() const { return index(); }
+    LayerInfoBase& layer() { return *get(); }
+    const LayerInfoBase& layer() const { return *get(); }
+    LayerInfoBase* get();
+    const LayerInfoBase* get() const;
+    LayerInfoBase& operator*() { return layer(); }
+    const LayerInfoBase& operator*() const { return layer(); }
+    LayerInfoBase* operator->() { return get(); }
+    const LayerInfoBase* operator->() const { return get(); }
   };
 
-  StagingArena() = default;
-  explicit StagingArena(Config config,
-                        HostBufferAllocator host_allocator = nullptr);
-  explicit StagingArena(std::vector<LayerInfoBase> layers,
-                        HostBufferAllocator host_allocator = nullptr);
-  StagingArena(std::vector<LayerInfoBase> layers,
-               HostBufferAllocator host_allocator, Config config);
-  StagingArena(std::vector<LayerInfoBase> layers, Config config,
-               HostBufferAllocator host_allocator = nullptr);
+  LayerArena();
+  explicit LayerArena(Config config,
+                      HostBufferAllocator host_allocator = nullptr);
+  explicit LayerArena(std::vector<LayerInfoBase> layers,
+                      HostBufferAllocator host_allocator = nullptr);
+  LayerArena(std::vector<LayerInfoBase> layers,
+             HostBufferAllocator host_allocator, Config config);
+  LayerArena(std::vector<LayerInfoBase> layers, Config config,
+             HostBufferAllocator host_allocator = nullptr);
+  ~LayerArena() override = default;
 
-  StagingArena(const StagingArena&) = delete;
-  StagingArena& operator=(const StagingArena&) = delete;
-
-  StagingArena(StagingArena&& other) noexcept;
-  StagingArena& operator=(StagingArena&& other) noexcept;
+  LayerArena(LayerArena&& other) noexcept;
+  LayerArena& operator=(LayerArena&& other) noexcept;
 
   Config config() const;
 
-  // Acquires a free `LayerInfoBase` slot from the arena. If all existing
-  // slots are in use, grows the arena by adding another
-  // `std::vector<LayerInfoBase>` of the same size and allocating its host
-  // buffers via `host_allocator_` when `Config::allow_dynamic_growth` is
-  // enabled, or returns `absl::ResourceExhaustedError` otherwise.
+  // Acquires a free layer slot (see class comment for growth semantics).
   absl::StatusOr<Allocation> Acquire();
 
-  // Backward-compatible direct access to a specific layer by |layer_idx|.
+  // Direct access to a specific layer by |layer_idx|.
   LayerInfoBase& GetLayer(size_t layer_idx);
   const LayerInfoBase& GetLayer(size_t layer_idx) const;
-  LayerInfoBase& operator[](size_t layer_idx);
-  const LayerInfoBase& operator[](size_t layer_idx) const;
-
-  size_t size() const;
-  size_t capacity() const { return size(); }
+  LayerInfoBase& operator[](size_t layer_idx) { return GetLayer(layer_idx); }
+  const LayerInfoBase& operator[](size_t layer_idx) const {
+    return GetLayer(layer_idx);
+  }
 
   // Arena inspection helpers.
   size_t num_chunks() const;
   size_t chunk_size() const;
-  size_t in_use_count() const;
-  size_t available_count() const;
+
+ protected:
+  bool CanGrowLocked() const override ABSL_SHARED_LOCKS_REQUIRED(mu_);
+  absl::Status GrowLocked(int64_t num_blocks) override
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  absl::Status PrepareSlotLocked(size_t index, int64_t num_blocks) override
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void OnReleaseLocked(size_t index) override
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
  private:
-  friend class Allocation;
-
   struct ShardTemplate {
     size_t alloc_size = 0;
     size_t device_size = 0;
@@ -248,133 +376,149 @@ class StagingArena {
     const xla::PjRtDevice* device = nullptr;
   };
 
-  void ReleaseSlot(size_t layer_idx);
-  absl::Status AllocateShardUnlocked(ShardBufferInfoBase& shard,
-                                     const ShardTemplate& tmpl)
+  void MoveFromLocked(LayerArena& other)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_, other.mu_);
+  absl::Status AllocateShardLocked(ShardBufferInfoBase& shard,
+                                   const ShardTemplate& tmpl)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  absl::Status EnsureLayerAllocatedUnlocked(size_t layer_idx)
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  absl::Status AppendChunkUnlocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  LayerInfoBase& GetLayerUnlocked(size_t layer_idx)
+  absl::Status AppendChunkLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  LayerInfoBase& GetLayerLocked(size_t layer_idx)
       ABSL_SHARED_LOCKS_REQUIRED(mu_);
-  const LayerInfoBase& GetLayerUnlocked(size_t layer_idx) const
+  const LayerInfoBase& GetLayerLocked(size_t layer_idx) const
       ABSL_SHARED_LOCKS_REQUIRED(mu_);
-  size_t SizeUnlocked() const ABSL_SHARED_LOCKS_REQUIRED(mu_);
 
-  mutable absl::Mutex mu_;
   Config config_ ABSL_GUARDED_BY(mu_);
   HostBufferAllocator host_allocator_ ABSL_GUARDED_BY(mu_);
   size_t chunk_capacity_ ABSL_GUARDED_BY(mu_) = 0;
   std::vector<std::vector<ShardTemplate>> chunk_template_ ABSL_GUARDED_BY(mu_);
-  std::vector<std::unique_ptr<std::vector<LayerInfoBase>>> chunk_collections_
+  std::vector<std::unique_ptr<std::vector<LayerInfoBase>>> chunks_
       ABSL_GUARDED_BY(mu_);
-  std::deque<size_t> free_slots_ ABSL_GUARDED_BY(mu_);
-  std::vector<bool> in_use_ ABSL_GUARDED_BY(mu_);
 };
 
-// Encapsulates host staging block allocation and release (both fixed slots
-// and on-demand dynamic host blocks) behind an RAII |Allocation| handle that
-// can be transferred into session classes.
+// `StagingArena` whose slots are sets of host block ids in a
+// `kv_cache::LogicalBlockManager`. Shared contract of `SlotArena` and
+// `BlockArena` so transfer sessions can stage into either.
 //
-// Fixed slots: `num_slots` slots of `max_blocks` host blocks each are
-// allocated and locked in |host_block_manager| up front; `Acquire()` hands
-// out whole slots.
-// Dynamic staging (`dynamic_host_staging`): no slots are reserved; each
-// `Acquire(num_blocks)` locks exactly |num_blocks| blocks in
-// |host_block_manager| and releases them on `Allocation` destruction.
-//
-// Thread-safe. |host_block_manager| must outlive the allocator; it may be
-// null, in which case only empty (`num_blocks <= 0`) acquisitions succeed.
-class StagingBlockAllocator {
+// |host_block_manager| must outlive the arena; it may be null, in which case
+// only empty (`num_blocks <= 0`) acquisitions succeed.
+class HostBlockArena : public StagingArena {
  public:
-  // RAII handle owning either a fixed staging slot or a set of dynamically
-  // allocated locked host blocks. Releases the resource automatically upon
-  // destruction or Reset().
-  class Allocation {
+  // `StagingArena::Allocation` with access to the staged host block ids.
+  class Allocation : public StagingArena::Allocation {
    public:
     Allocation() = default;
     Allocation(std::nullptr_t) {}  // NOLINT(runtime/explicit)
-    Allocation(StagingBlockAllocator* allocator, int64_t slot_idx,
-               std::vector<int> block_ids);
-    Allocation(StagingBlockAllocator* allocator,
-               std::vector<int> dynamic_blocks);
-    Allocation(Allocation&& other) noexcept;
-    Allocation& operator=(Allocation&& other) noexcept;
-    Allocation(const Allocation&) = delete;
-    Allocation& operator=(const Allocation&) = delete;
-    ~Allocation();
+    explicit Allocation(StagingArena::Allocation&& base)
+        : StagingArena::Allocation(std::move(base)) {}
 
-    // Releases any held slot or dynamic host blocks back to the allocator.
-    // Safe to call multiple times.
-    void Reset();
-
-    bool empty() const { return slot_idx_ < 0 && block_ids_.empty(); }
-    explicit operator bool() const { return !empty(); }
-    bool is_dynamic() const { return slot_idx_ < 0 && !block_ids_.empty(); }
-    int64_t slot_idx() const { return slot_idx_; }
-    absl::Span<const int> block_ids() const { return block_ids_; }
-
-   private:
-    StagingBlockAllocator* allocator_ = nullptr;
-    int64_t slot_idx_ = -1;
-    std::vector<int> block_ids_;
+    // Host block ids backing this allocation; empty when `!valid()`.
+    absl::Span<const int> block_ids() const;
+    // Slot index, or -1 when `!valid()`.
+    int64_t slot_idx() const {
+      return valid() ? static_cast<int64_t>(index()) : -1;
+    }
   };
 
-  // Creates an allocator over |host_block_manager|. With |num_slots| and
-  // |max_blocks| both positive and fixed staging, reserves the slot pool
-  // eagerly and fails with `kFailedPrecondition` when |host_block_manager|
-  // lacks `num_slots * max_blocks` free blocks. |dynamic_host_staging|
-  // defaults to the `TPU_RAIDEN_DYNAMIC_HOST_STAGING=1` environment switch.
-  static absl::StatusOr<std::unique_ptr<StagingBlockAllocator>> Create(
-      kv_cache::LogicalBlockManager* host_block_manager, int64_t num_slots,
-      int64_t max_blocks,
-      std::optional<bool> dynamic_host_staging = std::nullopt);
-  ~StagingBlockAllocator();
-  StagingBlockAllocator(const StagingBlockAllocator&) = delete;
-  StagingBlockAllocator& operator=(const StagingBlockAllocator&) = delete;
-
-  // Acquires staging for |num_blocks| blocks: a fixed slot when
-  // !dynamic_host_staging_, or |num_blocks| locked dynamic host blocks when
-  // dynamic_host_staging_ is enabled. Returns an error if staging capacity is
-  // currently unavailable.
+  // Acquires staging for |num_blocks| blocks. |num_blocks <= 0| yields an
+  // empty allocation.
   absl::StatusOr<Allocation> Acquire(int64_t num_blocks);
-
-  // Waits until |deadline| to acquire staging for |num_blocks| blocks. Returns
-  // an error if |num_blocks| exceeds capacity(), if Shutdown() is called, or if
-  // |deadline| expires before staging capacity becomes available.
   absl::StatusOr<Allocation> AcquireWithTimeout(
       int64_t num_blocks, std::chrono::steady_clock::time_point deadline);
 
-  // Signals shutdown to wake any threads waiting in AcquireWithTimeout().
-  void Shutdown();
+  // Host block ids backing slot |index|.
+  virtual absl::Span<const int> block_ids(size_t index) const = 0;
 
-  size_t num_free_slots() const;
-  absl::Span<const int> slot_blocks(int64_t slot_idx) const;
+  // True for arenas that lock blocks per request (`BlockArena`).
+  virtual bool dynamic_host_staging() const = 0;
+
+  // Configured slot layout (informational; `BlockArena` does not reserve
+  // slots but still reports what it was configured with).
   int64_t num_slots() const { return num_slots_; }
   int64_t max_blocks() const { return max_blocks_; }
-  int64_t capacity() const;
-  bool dynamic_host_staging() const { return dynamic_host_staging_; }
+  size_t num_free_slots() const { return available_count(); }
+  kv_cache::LogicalBlockManager* host_block_manager() const {
+    return host_block_manager_;
+  }
+
+ protected:
+  HostBlockArena(kv_cache::LogicalBlockManager* host_block_manager,
+                 int64_t num_slots, int64_t max_blocks,
+                 ReusePolicy reuse_policy);
+
+  // Fault injection + `num_blocks > capacity()` check.
+  absl::Status ValidateRequestLocked(int64_t num_blocks) const override
+      ABSL_SHARED_LOCKS_REQUIRED(mu_);
+
+  kv_cache::LogicalBlockManager* const host_block_manager_;
+  const int64_t num_slots_;
+  const int64_t max_blocks_;
+};
+using StagingAllocation = HostBlockArena::Allocation;
+
+// `HostBlockArena` with `num_slots` fixed slots of `max_blocks` host blocks
+// each, allocated and locked in the host block manager up front. `Acquire()`
+// hands out whole slots in FIFO order; the slot pool is unlocked (but left
+// allocated) on destruction.
+class SlotArena : public HostBlockArena {
+ public:
+  // Reserves the slot pool. Fails with `kFailedPrecondition` when
+  // |host_block_manager| is null or lacks `num_slots * max_blocks` free
+  // blocks.
+  static absl::StatusOr<std::unique_ptr<SlotArena>> Create(
+      kv_cache::LogicalBlockManager* host_block_manager, int64_t num_slots,
+      int64_t max_blocks);
+  ~SlotArena() override;
+
+  absl::Span<const int> block_ids(size_t index) const override;
+  absl::Span<const int> slot_blocks(int64_t slot_idx) const {
+    return block_ids(static_cast<size_t>(slot_idx));
+  }
+  bool dynamic_host_staging() const override { return false; }
+  // Blocks per slot.
+  int64_t capacity() const override { return max_blocks_; }
 
  private:
-  StagingBlockAllocator(kv_cache::LogicalBlockManager* host_block_manager,
-                        int64_t num_slots, int64_t max_blocks,
-                        bool dynamic_host_staging);
+  SlotArena(kv_cache::LogicalBlockManager* host_block_manager,
+            int64_t num_slots, int64_t max_blocks);
   absl::Status InitializeSlotPool();
-  absl::StatusOr<Allocation> AcquireLocked(int64_t num_blocks)
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void ReleaseSlot(int64_t slot_idx);
-  void ReleaseDynamicBlocks(absl::Span<const int> blocks);
 
-  mutable absl::Mutex mu_;
-  kv_cache::LogicalBlockManager* const host_block_manager_ = nullptr;
-  bool shutting_down_ ABSL_GUARDED_BY(mu_) = false;
-  const int64_t num_slots_ = 0;
-  const int64_t max_blocks_ = 0;
-  const bool dynamic_host_staging_ = false;
-  std::deque<int64_t> free_slots_ ABSL_GUARDED_BY(mu_);
+  // Immutable after `InitializeSlotPool()`.
   std::vector<std::vector<int>> slot_blocks_;
 };
-using StagingAllocation = StagingBlockAllocator::Allocation;
+
+// `HostBlockArena` that reserves nothing up front: every `Acquire(n)` locks
+// exactly |n| blocks in the host block manager (so the pool's LRU cannot
+// evict staging that is mid-flight) and releases them when the allocation is
+// destroyed. Slots are created on demand and recycled.
+class BlockArena : public HostBlockArena {
+ public:
+  // |num_slots| / |max_blocks| are informational only (see `HostBlockArena`).
+  BlockArena(kv_cache::LogicalBlockManager* host_block_manager,
+             int64_t num_slots, int64_t max_blocks);
+  ~BlockArena() override = default;
+
+  absl::Span<const int> block_ids(size_t index) const override;
+  bool dynamic_host_staging() const override { return true; }
+  // Total blocks in the host block manager.
+  int64_t capacity() const override;
+
+ protected:
+  bool CanAcquireLocked(int64_t num_blocks) const override
+      ABSL_SHARED_LOCKS_REQUIRED(mu_);
+  bool CanGrowLocked() const override ABSL_SHARED_LOCKS_REQUIRED(mu_) {
+    return true;
+  }
+  absl::Status GrowLocked(int64_t num_blocks) override
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  absl::Status PrepareSlotLocked(size_t index, int64_t num_blocks) override
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void OnReleaseLocked(size_t index) override
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+ private:
+  // Pointer-stable so `block_ids()` spans survive growth.
+  std::deque<std::vector<int>> slots_ ABSL_GUARDED_BY(mu_);
+};
 
 }  // namespace tpu_raiden
 

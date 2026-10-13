@@ -41,6 +41,7 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
@@ -60,7 +61,7 @@ constexpr absl::string_view kPushPhase = "push";
 absl::StatusOr<std::shared_ptr<TransferSendSession>>
 TransferSendSession::Create(
     kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* absl_nullable staging_allocator, std::string req_id,
+    HostBlockArena* absl_nullable staging_allocator, std::string req_id,
     uint64_t uuid, absl::Span<const int64_t> block_ids,
     std::chrono::steady_clock::time_point deadline,
     std::chrono::steady_clock::time_point register_start) {
@@ -81,8 +82,8 @@ TransferSendSession::Create(
 }
 
 TransferSendSession::TransferSendSession(
-    kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
+    kv_cache::KVCacheManagerBase* base, HostBlockArena* staging_allocator,
+    std::string req_id, uint64_t uuid,
     std::chrono::steady_clock::time_point deadline,
     std::chrono::steady_clock::time_point register_start)
     : base_(base),

@@ -37,6 +37,7 @@
 #include "xla/future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
 
@@ -148,7 +149,7 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
 TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
   base.SetManualD2h(true);
-  std::unique_ptr<StagingBlockAllocator> allocator =
+  std::unique_ptr<HostBlockArena> allocator =
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/2);
   const auto now = std::chrono::steady_clock::now();
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
@@ -180,7 +181,7 @@ TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
 TEST(TransferSendSessionTest,
      FinishingOneSendSessionDoesNotShutdownSharedStagingAllocator) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
-  std::unique_ptr<StagingBlockAllocator> allocator =
+  std::unique_ptr<HostBlockArena> allocator =
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
@@ -196,7 +197,7 @@ TEST(TransferSendSessionTest,
   EXPECT_FALSE(session1->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 2);
 
-  // Session 2 shares the same StagingBlockAllocator and must still be able to
+  // Session 2 shares the same HostBlockArena and must still be able to
   // acquire staging and complete a push without CancelledError.
   std::shared_ptr<TransferSendSession> session2 = *TransferSendSession::Create(
       &base, allocator.get(), "req2", /*uuid=*/102, /*block_ids=*/{1},
@@ -213,7 +214,7 @@ TEST(TransferSendSessionTest,
 TEST(TransferSendSessionTest,
      CancelledWhileWaitingForStagingExitsWithoutShuttingDownAllocator) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/2);
-  std::unique_ptr<StagingBlockAllocator> allocator =
+  std::unique_ptr<HostBlockArena> allocator =
       CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
@@ -258,7 +259,7 @@ TEST(TransferSendSessionTest,
 TEST(TransferSendSessionTest,
      FinishBeforeStartPushDoesNotAcquireStagingOrAccessHbm) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
-  std::unique_ptr<StagingBlockAllocator> allocator =
+  std::unique_ptr<HostBlockArena> allocator =
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
@@ -289,7 +290,7 @@ TEST(TransferSendSessionTest,
   FakeSendBase base(/*num_layers=*/2, /*host_blocks=*/4);
   base.SetManualD2h(true);
   base.SetManualH2h(true);
-  std::unique_ptr<StagingBlockAllocator> allocator =
+  std::unique_ptr<HostBlockArena> allocator =
       CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
@@ -348,7 +349,7 @@ TEST(TransferSendSessionTest,
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/2);
   base.SetManualD2h(true);
   base.SetManualH2h(true);
-  std::unique_ptr<StagingBlockAllocator> allocator =
+  std::unique_ptr<HostBlockArena> allocator =
       CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
@@ -383,7 +384,7 @@ TEST(TransferSendSessionTest,
 TEST(TransferSendSessionTest,
      ZeroLayerSessionCompletesAndReleasesStagingWithoutHang) {
   FakeSendBase base(/*num_layers=*/0, /*host_blocks=*/4);
-  std::unique_ptr<StagingBlockAllocator> allocator =
+  std::unique_ptr<HostBlockArena> allocator =
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
@@ -404,7 +405,7 @@ TEST(TransferSendSessionTest,
 TEST(TransferSendSessionTest,
      InvalidStartPushArgumentsFailSessionImmediatelyWithoutHang) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
-  std::unique_ptr<StagingBlockAllocator> allocator =
+  std::unique_ptr<HostBlockArena> allocator =
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
@@ -425,7 +426,7 @@ TEST(TransferSendSessionTest,
 TEST(TransferSendSessionTest, StatusIsFrozenOnceSessionIsDrainingOrDone) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
   base.SetManualD2h(true);
-  std::unique_ptr<StagingBlockAllocator> allocator =
+  std::unique_ptr<HostBlockArena> allocator =
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 
@@ -457,7 +458,7 @@ TEST(TransferSendSessionTest, StatusIsFrozenOnceSessionIsDrainingOrDone) {
 TEST(TransferSendSessionTest, ReleaseStagingBlocksClearsD2hLayerFuturesOnDone) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
   base.SetManualD2h(true);
-  std::unique_ptr<StagingBlockAllocator> allocator =
+  std::unique_ptr<HostBlockArena> allocator =
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
   const auto now = std::chrono::steady_clock::now();
 

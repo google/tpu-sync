@@ -571,7 +571,7 @@ KVCacheManagerBase::KVCacheManagerBase(
     layers.push_back(std::move(layer_info));
     buffer_holds_.push_back(std::move(device_info));
   }
-  layers_ = StagingArena(
+  layers_ = LayerArena(
       std::move(layers),
       host_allocator_ ? host_allocator_ : MakeDefaultHostBufferAllocator());
   {
@@ -677,7 +677,7 @@ KVCacheManagerBase::KVCacheManagerBase(
     }
     layers.push_back(std::move(layer_info));
   }
-  layers_ = StagingArena(
+  layers_ = LayerArena(
       std::move(layers),
       host_allocator_ ? host_allocator_ : MakeDefaultHostBufferAllocator());
   {
@@ -747,7 +747,7 @@ KVCacheManagerBase::~KVCacheManagerBase() {
   dma_pool_.reset();
   pull_pool_.reset();
   buffer_holds_.clear();
-  layers_ = StagingArena();
+  layers_ = LayerArena();
   host_block_manager_.reset();
 }
 

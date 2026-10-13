@@ -35,7 +35,7 @@
 namespace tpu_raiden {
 
 class KVCacheManagerWithTransfer;
-class StagingBlockAllocator;
+class HostBlockArena;
 
 // Encapsulates the producer-side state and execution logic for a single
 // push-driven pool-reshard send transfer (identified by |uuid|).
@@ -53,7 +53,7 @@ class ReshardSendSession
   // send session.
   static absl::StatusOr<std::shared_ptr<ReshardSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,
-      StagingBlockAllocator* absl_nullable staging_allocator,
+      HostBlockArena* absl_nullable staging_allocator,
       absl::Span<const int64_t> src_block_ids, int parallelism,
       std::chrono::steady_clock::time_point deadline,
       ::tpu_sync::rpc::StartTransferRequest plan);
@@ -94,8 +94,8 @@ class ReshardSendSession
   friend struct ReshardSendSessionTestPeer;
 
   ReshardSendSession(kv_cache::KVCacheManagerBase* base,
-                     StagingBlockAllocator* staging_allocator,
-                     std::string req_id, uint64_t uuid, int parallelism,
+                     HostBlockArena* staging_allocator, std::string req_id,
+                     uint64_t uuid, int parallelism,
                      int remaining_pool_peer_pushes,
                      std::chrono::steady_clock::time_point deadline,
                      ::tpu_sync::rpc::StartTransferRequest plan);
@@ -116,7 +116,7 @@ class ReshardSendSession
   void ReleaseLeasesLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
-  StagingBlockAllocator* const staging_allocator_ = nullptr;
+  HostBlockArena* const staging_allocator_ = nullptr;
   const std::string req_id_;
   const uint64_t uuid_ = 0;
   const int parallelism_ = 8;

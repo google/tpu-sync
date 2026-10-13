@@ -348,12 +348,11 @@ absl::Status ReshardReceiveSession::ValidateReceiverCoverage(
 }
 
 absl::StatusOr<std::shared_ptr<ReshardReceiveSession>>
-ReshardReceiveSession::Create(
-    kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* absl_nullable staging_allocator,
-    const ::tpu_sync::rpc::StartTransferRequest& plan,
-    absl::Span<const int64_t> chip_blocks,
-    std::chrono::steady_clock::time_point deadline) {
+ReshardReceiveSession::Create(kv_cache::KVCacheManagerBase* base,
+                              HostBlockArena* absl_nullable staging_allocator,
+                              const ::tpu_sync::rpc::StartTransferRequest& plan,
+                              absl::Span<const int64_t> chip_blocks,
+                              std::chrono::steady_clock::time_point deadline) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
@@ -377,9 +376,8 @@ ReshardReceiveSession::Create(
 }
 
 ReshardReceiveSession::ReshardReceiveSession(
-    kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* staging_allocator, uint64_t uuid,
-    const ::tpu_sync::rpc::StartTransferRequest& plan,
+    kv_cache::KVCacheManagerBase* base, HostBlockArena* staging_allocator,
+    uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& plan,
     absl::Span<const int64_t> chip_blocks,
     std::chrono::steady_clock::time_point deadline)
     : base_(base),

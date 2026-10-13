@@ -47,6 +47,7 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_send_session.h"
@@ -78,7 +79,7 @@ void RecordTransferDuration(double duration_ms) {
 absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
 TransferReceiveSession::Create(
     kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+    HostBlockArena* absl_nullable staging_allocator, uint64_t uuid,
     const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids,
     const std::optional<std::vector<int64_t>>& local_host_block_ids,
@@ -102,11 +103,12 @@ TransferReceiveSession::Create(
 }
 
 absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
-TransferReceiveSession::Create(
-    kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-    std::string req_id, int32_t total_blocks,
-    std::chrono::steady_clock::time_point deadline, bool acquire_staging) {
+TransferReceiveSession::Create(kv_cache::KVCacheManagerBase* base,
+                               HostBlockArena* absl_nullable staging_allocator,
+                               uint64_t uuid, std::string req_id,
+                               int32_t total_blocks,
+                               std::chrono::steady_clock::time_point deadline,
+                               bool acquire_staging) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
@@ -118,7 +120,7 @@ TransferReceiveSession::Create(
 absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
 TransferReceiveSession::CreateFromActivePlan(
     kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+    HostBlockArena* absl_nullable staging_allocator, uint64_t uuid,
     const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
     std::chrono::steady_clock::time_point deadline,
     absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*

@@ -221,10 +221,9 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     layers.push_back(std::move(layer_info));
     buffer_holds_.push_back(std::move(hold_info));
   }
-  layers_ =
-      StagingArena(std::move(layers),
-                   host_allocator ? MakeHostBufferAllocator(host_allocator)
-                                  : MakeDefaultHostBufferAllocator());
+  layers_ = LayerArena(std::move(layers),
+                       host_allocator ? MakeHostBufferAllocator(host_allocator)
+                                      : MakeDefaultHostBufferAllocator());
 
   if (listener_port) {
     listener_ =
@@ -323,7 +322,7 @@ WeightSynchronizerBase::WeightSynchronizerBase(
     }
     layers.push_back(std::move(layer_info));
   }
-  layers_ = StagingArena(std::move(layers), MakeDefaultHostBufferAllocator());
+  layers_ = LayerArena(std::move(layers), MakeDefaultHostBufferAllocator());
 
   if (listener_port) {
     listener_ =

@@ -43,7 +43,7 @@ class StartTransferRequest;
 namespace tpu_raiden {
 
 class KVCacheManagerWithTransfer;
-class StagingBlockAllocator;
+class HostBlockArena;
 
 // Encapsulates the consumer-side state and execution lifecycle of a multi-tag
 // pool-reshard receive operation, including bounded pool staging lease
@@ -59,7 +59,7 @@ class ReshardReceiveSession
   // acquiring bounded pool staging leases per storage via |staging_allocator|.
   static absl::StatusOr<std::shared_ptr<ReshardReceiveSession>> Create(
       kv_cache::KVCacheManagerBase* base,
-      StagingBlockAllocator* absl_nullable staging_allocator,
+      HostBlockArena* absl_nullable staging_allocator,
       const ::tpu_sync::rpc::StartTransferRequest& plan,
       absl::Span<const int64_t> chip_blocks,
       std::chrono::steady_clock::time_point deadline);
@@ -122,7 +122,7 @@ class ReshardReceiveSession
   friend struct ReshardReceiveSessionTestPeer;
 
   ReshardReceiveSession(kv_cache::KVCacheManagerBase* base,
-                        StagingBlockAllocator* staging_allocator, uint64_t uuid,
+                        HostBlockArena* staging_allocator, uint64_t uuid,
                         const ::tpu_sync::rpc::StartTransferRequest& plan,
                         absl::Span<const int64_t> chip_blocks,
                         std::chrono::steady_clock::time_point deadline);
@@ -159,7 +159,7 @@ class ReshardReceiveSession
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
-  StagingBlockAllocator* const staging_allocator_ = nullptr;
+  HostBlockArena* const staging_allocator_ = nullptr;
   const uint64_t uuid_ = 0;
   const std::string req_id_;
   const std::chrono::steady_clock::time_point deadline_;

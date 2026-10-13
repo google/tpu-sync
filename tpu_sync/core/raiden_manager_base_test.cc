@@ -66,7 +66,7 @@ class TestRaidenManager : public RaidenManagerBase {
     for (size_t l = 0; l < num_layers; ++l) {
       layers[l].shards.resize(num_shards);
     }
-    layers_ = StagingArena(std::move(layers));
+    layers_ = LayerArena(std::move(layers));
   }
 
   absl::StatusOr<std::vector<int>> AllocateBlocks(

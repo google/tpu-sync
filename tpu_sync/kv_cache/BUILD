@@ -494,6 +494,7 @@ cc_test(
         ":kv_cache_manager_base",
         ":kv_cache_manager_with_transfer",
         "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:staging_arena",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",

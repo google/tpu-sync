@@ -59,7 +59,7 @@ class TransferReceiveSession
  public:
   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
       kv_cache::KVCacheManagerBase* base,
-      StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+      HostBlockArena* absl_nullable staging_allocator, uint64_t uuid,
       const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
       const std::vector<int64_t>& local_block_ids,
       const std::optional<std::vector<int64_t>>& local_host_block_ids,
@@ -67,7 +67,7 @@ class TransferReceiveSession
 
   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
       kv_cache::KVCacheManagerBase* base,
-      StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+      HostBlockArena* absl_nullable staging_allocator, uint64_t uuid,
       std::string req_id, int32_t total_blocks,
       std::chrono::steady_clock::time_point deadline,
       bool acquire_staging = false);
@@ -75,7 +75,7 @@ class TransferReceiveSession
   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
   CreateFromActivePlan(
       kv_cache::KVCacheManagerBase* base,
-      StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+      HostBlockArena* absl_nullable staging_allocator, uint64_t uuid,
       const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
       std::chrono::steady_clock::time_point deadline,
       absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
@@ -169,17 +169,15 @@ class TransferReceiveSession
 
  private:
   TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
-                         StagingBlockAllocator* staging_allocator,
-                         uint64_t uuid = 0)
+                         HostBlockArena* staging_allocator, uint64_t uuid = 0)
       : base_(base),
         staging_allocator_(staging_allocator),
         uuid_(uuid),
         blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0,
                                    0) {}
   TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
-                         StagingBlockAllocator* staging_allocator,
-                         uint64_t uuid, std::string req_id,
-                         int32_t total_blocks,
+                         HostBlockArena* staging_allocator, uint64_t uuid,
+                         std::string req_id, int32_t total_blocks,
                          std::chrono::steady_clock::time_point deadline,
                          bool acquire_staging = false)
       : base_(base),
@@ -257,7 +255,7 @@ class TransferReceiveSession
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* base_ = nullptr;
-  StagingBlockAllocator* staging_allocator_ = nullptr;
+  HostBlockArena* staging_allocator_ = nullptr;
   uint64_t uuid_ = 0;
   std::string req_id_ ABSL_GUARDED_BY(mu_);
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);

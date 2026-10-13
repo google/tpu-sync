@@ -56,8 +56,8 @@ class TransferSendSession
  public:
   static absl::StatusOr<std::shared_ptr<TransferSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,
-      StagingBlockAllocator* absl_nullable staging_allocator,
-      std::string req_id, uint64_t uuid, absl::Span<const int64_t> block_ids,
+      HostBlockArena* absl_nullable staging_allocator, std::string req_id,
+      uint64_t uuid, absl::Span<const int64_t> block_ids,
       std::chrono::steady_clock::time_point deadline,
       std::chrono::steady_clock::time_point register_start);
 
@@ -145,8 +145,8 @@ class TransferSendSession
 
  private:
   TransferSendSession(kv_cache::KVCacheManagerBase* base,
-                      StagingBlockAllocator* staging_allocator,
-                      std::string req_id, uint64_t uuid,
+                      HostBlockArena* staging_allocator, std::string req_id,
+                      uint64_t uuid,
                       std::chrono::steady_clock::time_point deadline,
                       std::chrono::steady_clock::time_point register_start);
 
@@ -176,7 +176,7 @@ class TransferSendSession
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
-  StagingBlockAllocator* const staging_allocator_ = nullptr;
+  HostBlockArena* const staging_allocator_ = nullptr;
   const std::string req_id_;
   const uint64_t uuid_ = 0;
   const std::chrono::steady_clock::time_point deadline_;

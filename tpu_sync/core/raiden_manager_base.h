@@ -48,7 +48,7 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
  public:
   using ShardBufferInfoBase = ::tpu_raiden::ShardBufferInfoBase;
   using LayerInfoBase = ::tpu_raiden::LayerInfoBase;
-  using StagingArena = ::tpu_raiden::StagingArena;
+  using LayerArena = ::tpu_raiden::LayerArena;
 
   // |numa_nodes| lists the distinct NUMA nodes of the incoming buffers (the
   // first one becomes `assigned_numa_node()`). |shards|, when non-empty,
@@ -171,8 +171,8 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   void SetExternalHostPointers(const std::vector<const uint8_t*>& host_ptrs,
                                const std::vector<size_t>& host_sizes);
 
-  StagingArena& staging_arena() { return layers_; }
-  const StagingArena& staging_arena() const { return layers_; }
+  LayerArena& staging_arena() { return layers_; }
+  const LayerArena& staging_arena() const { return layers_; }
 
   // Delegate overrides E2E
   size_t num_layers() const override { return num_layers_; }
@@ -206,7 +206,7 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   mutable absl::Mutex server_init_mu_;
   std::unique_ptr<tpu_raiden::transport::BlockTransport> server_;
 
-  StagingArena layers_;
+  LayerArena layers_;
 
   // Delegate allocator overrides
   absl::StatusOr<std::vector<int>> AllocateBlocks(size_t num_blocks,

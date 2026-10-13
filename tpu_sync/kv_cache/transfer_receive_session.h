@@ -20,7 +20,9 @@
 #include <cstdint>
 #include <future>  // NOLINT(build/c++11)
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -93,11 +95,8 @@ class TransferReceiveSession
 
   absl::Status AwaitForDone() override;
 
-  // When Done() became true. Meaningless before then.
-  std::chrono::steady_clock::time_point CompletedAt() const {
-    absl::MutexLock lock(mu_);
-    return completed_at_;
-  }
+  // What is known about this receive. Meaningless before Done().
+  TransferDetails Details() const;
 
   bool IsDraining() const override {
     absl::MutexLock lock(mu_);
@@ -228,8 +227,14 @@ class TransferReceiveSession
       std::shared_future<absl::StatusOr<raiden::PjRtCopyFuture>>;
 
   void ReleaseStagingLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void FinishLocked(const absl::Status& status = absl::OkStatus())
+  // A failure is attributed to |phase|, or else to the step the receive has
+  // reached (see PhaseLocked).
+  void FinishLocked(const absl::Status& status = absl::OkStatus(),
+                    std::optional<std::string_view> phase = std::nullopt)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // The earliest step of this receive still running, as named in
+  // TransferDetails::phase.
+  std::string_view PhaseLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndRecvOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   bool AllH2dDoneLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -269,6 +274,12 @@ class TransferReceiveSession
   bool h2d_started_ ABSL_GUARDED_BY(mu_) = false;
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
   absl::Status status_ ABSL_GUARDED_BY(mu_);
+  // The step the receive failed in; set with a failed status_.
+  std::string_view failed_phase_ ABSL_GUARDED_BY(mu_);
+  // A pulled receive waits for the producer to accept its pull request.
+  bool handshake_pending_ ABSL_GUARDED_BY(mu_) = false;
+  // The producer endpoint a pulled receive sent its pull request to.
+  std::string peer_ ABSL_GUARDED_BY(mu_);
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   std::chrono::steady_clock::time_point completed_at_ ABSL_GUARDED_BY(mu_);

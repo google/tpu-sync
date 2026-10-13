@@ -24,6 +24,7 @@
 #include <ratio>  // NOLINT(build/c++11)
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -56,19 +57,10 @@ namespace tpu_raiden {
 
 namespace {
 
-[[noreturn]] void ThrowStatus(const std::string& context,
-                              const absl::Status& status) {
-  if (status.code() == absl::StatusCode::kInvalidArgument) {
-    throw std::invalid_argument(context + ": " + std::string(status.message()));
-  }
-  throw std::runtime_error(context + ": " + std::string(status.message()));
-}
-
-void CheckStatus(const std::string& context, const absl::Status& status) {
-  if (!status.ok()) {
-    ThrowStatus(context, status);
-  }
-}
+// The steps of a receive, as named in TransferDetails::phase.
+constexpr std::string_view kConnectPhase = "connect";
+constexpr std::string_view kReceivePhase = "receive";
+constexpr std::string_view kH2dPhase = "h2d";
 
 double DurationMs(std::chrono::steady_clock::time_point start,
                   std::chrono::steady_clock::time_point end) {
@@ -337,6 +329,7 @@ void TransferReceiveSession::InitFromLoadPlan(
   req_id_ = req_id;
   deadline_ = deadline;
   start_time_ = std::chrono::steady_clock::now();
+  handshake_pending_ = true;
   chip_block_ids_ = load_plan.h2d_local_block_ids;
   total_blocks_ = load_plan.num_blocks;
   ResetShardProgressLocked();
@@ -360,9 +353,11 @@ void TransferReceiveSession::ReleaseStaging() {
   ReleaseStagingLocked();
 }
 
-void TransferReceiveSession::FinishLocked(const absl::Status& status) {
+void TransferReceiveSession::FinishLocked(
+    const absl::Status& status, std::optional<std::string_view> phase) {
   if (!status.ok() && status_.ok()) {
     status_ = status;
+    failed_phase_ = phase.has_value() ? *phase : PhaseLocked();
   }
   if (draining_) return;
   draining_ = true;
@@ -382,6 +377,29 @@ absl::Status TransferReceiveSession::AwaitForDone() {
   absl::MutexLock lock(mu_);
   mu_.Await(absl::Condition(&done_));
   return status_;
+}
+
+TransferDetails TransferReceiveSession::Details() const {
+  absl::MutexLock lock(mu_);
+  TransferDetails details = DetailsFromStatus(status_);
+  details.completed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             completed_at_.time_since_epoch())
+                             .count();
+  details.elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           completed_at_ - start_time_)
+                           .count();
+  if (!peer_.empty()) {
+    details.peer = peer_;
+  }
+  if (!status_.ok()) {
+    details.phase = std::string(failed_phase_);
+  }
+  return details;
+}
+
+std::string_view TransferReceiveSession::PhaseLocked() const {
+  if (handshake_pending_) return kConnectPhase;
+  return network_completed_ ? kH2dPhase : kReceivePhase;
 }
 
 void TransferReceiveSession::EndRecvOpLocked() {
@@ -502,6 +520,7 @@ void TransferReceiveSession::ExecutePullRequest(
     session_req_id = req_id_;
     req_spec.src_block_ids = load_plan_.producer_remote_block_ids;
     req_spec.dst_block_ids = load_plan_.transport_host_block_ids;
+    peer_ = remote_endpoint;
   }
   req_spec.uuid = uuid_;
   req_spec.ep_idx = 0;
@@ -516,32 +535,38 @@ void TransferReceiveSession::ExecutePullRequest(
   auto on_response = [self = shared_from_this(), session_req_id](
                          absl::StatusOr<PullStreamResponseSpec> response) {
     absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
+    absl::Status injected =
+        FaultInjectStatus(hooks::kTransferRecvSessionPullReply);
+    if (response.ok() && !injected.ok()) {
+      response = injected;
+    }
+    // A handshake that failed keeps its code (e.g. DEADLINE_EXCEEDED or
+    // UNAVAILABLE), so it is told apart from a producer that said no.
     absl::Status pull_status = absl::OkStatus();
-    try {
-      absl::Status injected =
-          FaultInjectStatus(hooks::kTransferRecvSessionPullReply);
-      if (response.ok() && !injected.ok()) {
-        response = injected;
-      }
-      CheckStatus("control pull request", response.status());
-      if (response->status != 0) {
-        throw std::runtime_error(absl::StrCat(
-            "Remote producer rejected Hybrid Bridge read request: ",
-            response->message));
-      }
+    if (!response.ok()) {
+      pull_status = absl::Status(
+          response.status().code(),
+          absl::StrCat("control pull request: ", response.status().message()));
+    } else if (response->status != 0) {
+      pull_status = absl::FailedPreconditionError(
+          absl::StrCat("Remote producer rejected Hybrid Bridge read request: ",
+                       response->message));
+    }
+    if (pull_status.ok()) {
       VLOG(1) << "StartRead (Hybrid Bridge) successfully registered pull "
                  "request with Producer. req_id: "
               << session_req_id;
-    } catch (const std::exception& e) {
-      pull_status = absl::InternalError(e.what());
+    } else {
       LOG(ERROR) << "Raiden consumer error during Hybrid Bridge StartRead "
                     "connect: "
-                 << e.what();
+                 << pull_status.message();
     }
 
+    absl::MutexLock lock(self->mu_);
     if (!pull_status.ok()) {
-      self->Finish(pull_status);
+      self->FinishLocked(pull_status);
     }
+    self->handshake_pending_ = false;
   };
   // Issued from push_pool_ so a backend that blocks (TCP) does not block the
   // StartRead caller. An async backend (gRPC) returns as soon as the RPC is
@@ -660,7 +685,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
           : absl::StatusOr<raiden::PjRtCopyFuture>(injected);
   if (!future_or.ok()) {
     absl::MutexLock lock(mu_);
-    FinishLocked(future_or.status());
+    FinishLocked(future_or.status(), kH2dPhase);
     EndRecvOpLocked();
     return future_or.status();
   }
@@ -707,7 +732,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
         LOG(ERROR) << "OnLayerReceived (H2D copy failed) layer " << layer_idx
                    << " for req_id: " << session_req_id
                    << ", error: " << status_or.status().ToString();
-        self->FinishLocked(status_or.status());
+        self->FinishLocked(status_or.status(), kH2dPhase);
       }
       if (self->draining_ && self->in_flight_ == 1 &&
           self->unregister_on_settle_) {

@@ -64,7 +64,9 @@ namespace tpu_raiden {
 namespace {
 
 using ::testing::Contains;
+using ::testing::ElementsAre;
 using ::testing::HasSubstr;
+using ::testing::Optional;
 using ::testing::UnorderedElementsAre;
 
 // Both ends of a control handshake share one pool of four workers, so four
@@ -830,6 +832,64 @@ TEST(ControlHandshakeTest, ExpiredReceiveKeepsStagingUntilHandshakeEnds) {
   EXPECT_THAT(sent_again, ::testing::IsEmpty());
   EXPECT_THAT(received_again, ::testing::IsEmpty());
   EXPECT_THAT(failed_again, ::testing::IsEmpty());
+}
+
+// Polls `consumer` until a read fails, or gives up after `timeout`.
+CompleteReadResult AwaitFailedRead(TestManager& consumer,
+                                   absl::Duration timeout) {
+  CompleteReadResult completions;
+  const absl::Time give_up = absl::Now() + timeout;
+  while (completions.failed.empty() && absl::Now() < give_up) {
+    completions = consumer.CompleteReadWithDetails();
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+  return completions;
+}
+
+TEST(ControlHandshakeTest, RejectedPullReportsWhyAndWhichProducerRejectedIt) {
+  // The short timeout bounds how long the producer waits for a registration.
+  TestManager producer(/*timeout_s=*/0.2);
+  TestManager consumer(/*timeout_s=*/5.0, /*num_layers=*/1);
+  const std::string endpoint =
+      absl::StrCat("127.0.0.1:", producer.local_control_port());
+  consumer.StartRead("req", /*uuid=*/300, endpoint, /*remote_block_ids=*/{0},
+                     /*local_block_ids=*/{0});
+
+  CompleteReadResult completions = AwaitFailedRead(consumer, absl::Seconds(10));
+
+  ASSERT_THAT(completions.failed, ElementsAre("req"));
+  const TransferDetails& details = completions.details["req"];
+  EXPECT_EQ(details.code, "FAILED_PRECONDITION");
+  EXPECT_THAT(details.reason,
+              Optional(HasSubstr("no read registered for uuid 300")));
+  EXPECT_EQ(details.phase, "connect");
+  EXPECT_EQ(details.peer, endpoint);
+}
+
+TEST(ControlHandshakeTest, RefusedConnectionKeepsItsStatusCode) {
+  // Bound but never listening: the port stays taken, and connects to it are
+  // refused.
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(fd, 0);
+  ScopedFd refusing(fd);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_EQ(bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+  socklen_t len = sizeof(addr);
+  ASSERT_EQ(getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len), 0);
+  TestManager consumer(/*timeout_s=*/5.0, /*num_layers=*/1);
+  consumer.StartRead("req", /*uuid=*/301,
+                     absl::StrCat("127.0.0.1:", ntohs(addr.sin_port)),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+
+  CompleteReadResult completions = AwaitFailedRead(consumer, absl::Seconds(10));
+
+  ASSERT_THAT(completions.failed, ElementsAre("req"));
+  const TransferDetails& details = completions.details["req"];
+  EXPECT_EQ(details.code, "UNAVAILABLE");
+  EXPECT_THAT(details.reason, Optional(HasSubstr("Connection refused")));
+  EXPECT_EQ(details.phase, "connect");
 }
 
 // --------------------------------------------------------------------------

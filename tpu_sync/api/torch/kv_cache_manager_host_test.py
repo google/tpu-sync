@@ -190,6 +190,26 @@ class _FakeDetailsImpl:
     )
 
 
+class _FakeFailureImpl:
+
+  def complete_read(self):
+    return (
+        [],
+        [],
+        ["failed"],
+        {
+            "failed": {
+                "completed_ns": 30,
+                "elapsed_ns": 20,
+                "peer": "10.0.0.2:31000",
+                "code": "DEADLINE_EXCEEDED",
+                "reason": "Send session timed out",
+                "phase": "d2h",
+            }
+        },
+    )
+
+
 class PollStatsWithDetailsTest(unittest.TestCase):
 
   def test_attaches_details_to_each_req_id(self):
@@ -211,6 +231,19 @@ class PollStatsWithDetailsTest(unittest.TestCase):
     self.assertEqual(
         manager.poll_stats(), (["sent"], ["received"], ["failed"])
     )
+
+  def test_failed_transfer_says_why(self):
+    manager = object.__new__(kv_cache_manager.KVCacheManager)
+    manager._impl = _FakeFailureImpl()  # pylint: disable=protected-access
+
+    [failed] = manager.poll_stats_with_details().failed
+
+    self.assertEqual(failed.req_id, "failed")
+    self.assertEqual(failed.code, "DEADLINE_EXCEEDED")
+    self.assertEqual(failed.reason, "Send session timed out")
+    self.assertEqual(failed.phase, "d2h")
+    self.assertEqual(failed.peer, "10.0.0.2:31000")
+    self.assertEqual(failed.elapsed_ns, 20)
 
 
 if __name__ == "__main__":

@@ -637,6 +637,13 @@ NB_MODULE(_tpu_raiden_torch, m) {
                nb::gil_scoped_release release;
                return self.CompleteReadWithDetails();
              }();
+             // Error text can quote a peer's bytes. The reports are already
+             // drained, so bytes that are not UTF-8 are escaped, not raised.
+             auto text = [](const std::string& s) {
+               return nb::steal<nb::str>(PyUnicode_DecodeUTF8(
+                   s.data(), static_cast<Py_ssize_t>(s.size()),
+                   "backslashreplace"));
+             };
              // {req_id: {field: value}}, with unset fields omitted, so a new
              // TransferDetails field needs only one more line here.
              nb::dict details;
@@ -644,6 +651,21 @@ NB_MODULE(_tpu_raiden_torch, m) {
                nb::dict fields;
                if (detail.completed_ns.has_value()) {
                  fields["completed_ns"] = *detail.completed_ns;
+               }
+               if (detail.elapsed_ns.has_value()) {
+                 fields["elapsed_ns"] = *detail.elapsed_ns;
+               }
+               if (detail.peer.has_value()) {
+                 fields["peer"] = text(*detail.peer);
+               }
+               if (detail.code.has_value()) {
+                 fields["code"] = text(*detail.code);
+               }
+               if (detail.reason.has_value()) {
+                 fields["reason"] = text(*detail.reason);
+               }
+               if (detail.phase.has_value()) {
+                 fields["phase"] = text(*detail.phase);
                }
                details[nb::str(req_id.data(), req_id.size())] = fields;
              }

@@ -64,10 +64,24 @@ class SettledTransfer:
     req_id: The transfer's request ID.
     completed_ns: When the transfer completed, in time.perf_counter_ns()
       nanoseconds; None if not recorded.
+    elapsed_ns: How long the transfer ran, from its registration until it
+      settled, in nanoseconds; None if not recorded.
+    peer: The other side's endpoints, comma-separated; None if not known.
+    code: Why a failed transfer failed, as the canonical name of its status
+      code, e.g. "DEADLINE_EXCEEDED" or "UNAVAILABLE"; None if it succeeded.
+    reason: A failed transfer's error message; None if it succeeded.
+    phase: The step a failed transfer failed in: "await_pull", "staging",
+      "d2h" or "push" for a send; "connect", "receive" or "h2d" for a
+      receive. None if it succeeded or the step is not recorded.
   """
 
   req_id: str
   completed_ns: Optional[int] = None
+  elapsed_ns: Optional[int] = None
+  peer: Optional[str] = None
+  code: Optional[str] = None
+  reason: Optional[str] = None
+  phase: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)

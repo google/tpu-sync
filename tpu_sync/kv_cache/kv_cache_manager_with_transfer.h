@@ -61,7 +61,22 @@ struct TransferDetails {
   // When the transfer completed, in steady_clock nanoseconds: CLOCK_MONOTONIC,
   // the clock of Python's time.perf_counter_ns().
   std::optional<int64_t> completed_ns;
+  // How long the transfer ran, from its registration until it settled.
+  std::optional<int64_t> elapsed_ns;
+  // The other side's endpoints, comma-separated.
+  std::optional<std::string> peer;
+  // Why a failed transfer failed: the canonical name of its status code, e.g.
+  // "DEADLINE_EXCEEDED", and its error message.
+  std::optional<std::string> code;
+  std::optional<std::string> reason;
+  // The step a failed transfer failed in: "await_pull", "staging", "d2h" or
+  // "push" for a send; "connect", "receive" or "h2d" for a receive.
+  std::optional<std::string> phase;
 };
+
+// What |status|, the outcome of a settled transfer, tells about it: its code
+// and reason if it failed, nothing if it succeeded.
+TransferDetails DetailsFromStatus(const absl::Status& status);
 
 // Result of CompleteReadWithDetails(): transfers settled since the previous
 // poll.
@@ -69,8 +84,8 @@ struct CompleteReadResult {
   std::vector<std::string> sent;
   std::vector<std::string> received;
   std::vector<std::string> failed;
-  // Details of settled transfers, by req_id. Only transfer send and receive
-  // sessions record details; other settled req_ids have no entry.
+  // Details of settled transfers, by req_id: of every failed one, and of every
+  // transfer send or receive session. Other settled req_ids have no entry.
   absl::flat_hash_map<std::string, TransferDetails> details;
 };
 

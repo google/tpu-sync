@@ -22,6 +22,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -75,11 +76,8 @@ class TransferSendSession
 
   absl::Status AwaitForDone() override;
 
-  // When Done() became true. Meaningless before then.
-  std::chrono::steady_clock::time_point CompletedAt() const {
-    absl::MutexLock lock(mu_);
-    return completed_at_;
-  }
+  // What is known about this send. Meaningless before Done().
+  TransferDetails Details() const;
 
   bool IsDraining() const override {
     absl::MutexLock lock(mu_);
@@ -160,8 +158,14 @@ class TransferSendSession
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ReleaseStagingBlocks();
   void ReleaseStagingBlocksLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void FinishLocked(const absl::Status& status = absl::OkStatus())
+  // A failure is attributed to |phase|, or else to the step the send has
+  // reached (see PhaseLocked).
+  void FinishLocked(const absl::Status& status = absl::OkStatus(),
+                    std::optional<std::string_view> phase = std::nullopt)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // The earliest step of this send still running, as named in
+  // TransferDetails::phase.
+  std::string_view PhaseLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndSendOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   absl::Status AcquireStagingWithRetry(int64_t num_blocks);
   void SendNextLayer(size_t l);
@@ -181,6 +185,8 @@ class TransferSendSession
   absl::flat_hash_set<int64_t> registered_block_set_ ABSL_GUARDED_BY(mu_);
   std::chrono::steady_clock::time_point d2h_done_ ABSL_GUARDED_BY(mu_);
   absl::Status status_ ABSL_GUARDED_BY(mu_);
+  // The step the send failed in; set with a failed status_.
+  std::string_view failed_phase_ ABSL_GUARDED_BY(mu_);
   bool pull_started_ ABSL_GUARDED_BY(mu_) = false;
   // Copies and pushes issued for this send whose completion has not been
   // observed. The staging they read and write is held until it is zero.
@@ -191,6 +197,7 @@ class TransferSendSession
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   std::chrono::steady_clock::time_point completed_at_ ABSL_GUARDED_BY(mu_);
   std::vector<raiden::PjRtCopyFuture> d2h_layer_futures_ ABSL_GUARDED_BY(mu_);
+  // The consumer's endpoints, known once StartPush serves its pull.
   std::vector<std::string> remote_data_endpoints_ ABSL_GUARDED_BY(mu_);
   std::vector<int> src_ints_ ABSL_GUARDED_BY(mu_);
   std::vector<int> dst_ints_ ABSL_GUARDED_BY(mu_);

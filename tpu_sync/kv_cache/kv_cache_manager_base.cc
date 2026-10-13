@@ -239,15 +239,6 @@ struct TransferPipelinedState {
       }
     }
     has_failed.store(true, std::memory_order_release);
-    bool expected = false;
-    if (promise_fulfilled.compare_exchange_strong(expected, true)) {
-      absl::Status err;
-      {
-        absl::MutexLock lock(err_mu);
-        err = first_error;
-      }
-      promise.Set(err);
-    }
   }
 
   void MarkChunkComplete() {
@@ -894,15 +885,24 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dSyncDispatch(
     }
 
     VLOG(1) << "H2d: Awaiting scheduled dispatches...";
+    absl::Status status = absl::OkStatus();
     for (auto& pf : pending_futures) {
-      ABSL_ASSIGN_OR_RETURN(auto local_futures, pf.future.get(),
-                            _.VLog(1) << "H2d: Scheduled dispatch failed: ");
+      auto local_futures = pf.future.get();
+      if (!local_futures.ok()) {
+        VLOG(1) << "H2d: Scheduled dispatch failed: " << local_futures.status();
+        status.Update(local_futures.status());
+        continue;
+      }
       VLOG(1) << "H2d: Scheduled dispatch completed successfully.";
       for (size_t i = 0; i < pf.works.size(); ++i) {
         const auto& work = pf.works[i];
         logical_futures[work.layer_idx * num_shards_ + work.shard_idx] =
-            std::move(local_futures[i]);
+            std::move((*local_futures)[i]);
       }
+    }
+    if (!status.ok()) {
+      raiden::DrainPjRtCopyFutures(logical_futures);
+      return status;
     }
   }
 
@@ -1029,17 +1029,26 @@ KVCacheManagerBase::DispatchD2hChunks(const std::vector<int64_t>& src_offsets,
     }
 
     VLOG(1) << "DispatchD2hChunks: Awaiting scheduled dispatches...";
+    absl::Status status = absl::OkStatus();
     for (auto& pf : pending_futures) {
-      ABSL_ASSIGN_OR_RETURN(
-          auto local_futures, pf.future.get(),
-          _.VLog(1) << "DispatchD2hChunks: Scheduled dispatch failed: ");
+      auto local_futures = pf.future.get();
+      if (!local_futures.ok()) {
+        VLOG(1) << "DispatchD2hChunks: Scheduled dispatch failed: "
+                << local_futures.status();
+        status.Update(local_futures.status());
+        continue;
+      }
       VLOG(1)
           << "DispatchD2hChunks: Scheduled dispatch completed successfully.";
       for (size_t i = 0; i < pf.works.size(); ++i) {
         const auto& work = pf.works[i];
         logical_futures[work.layer_idx * num_shards_ + work.shard_idx] =
-            std::move(local_futures[i]);
+            std::move((*local_futures)[i]);
       }
+    }
+    if (!status.ok()) {
+      raiden::DrainPjRtCopyFutures(logical_futures);
+      return status;
     }
   }
 
@@ -1298,6 +1307,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWrite(
   const absl::Time d2h_start = absl::Now();
   std::vector<raiden::PjRtCopyFuture> all_d2h_futures;
   all_d2h_futures.reserve(num_chunks);
+  auto drain = absl::MakeCleanup(
+      [&]() { raiden::DrainPjRtCopyFutures(all_d2h_futures); });
 
   for (size_t i = 0; i < num_chunks; ++i) {
     ABSL_ASSIGN_OR_RETURN(auto chunk_futures,
@@ -1313,6 +1324,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWrite(
     chunks.push_back(
         {std::move(d2h_fut), staging_block_ids[i], dst_block_ids[i]});
   }
+  std::move(drain).Cancel();
 
   // Safe to ignore the return value: JoinAndRecordTelemetry registers an
   // asynchronous OnReady callback to record overall D2H transfer telemetry
@@ -1382,6 +1394,11 @@ KVCacheManagerBase::D2hAutoAllocate(
 
   ABSL_ASSIGN_OR_RETURN(std::vector<int> allocated_block_ids,
                         AllocateBlocks(total_blocks_to_allocate));
+  auto dealloc = absl::MakeCleanup([this, &allocated_block_ids]() {
+    if (host_block_manager_ != nullptr && !allocated_block_ids.empty()) {
+      (void)host_block_manager_->Deallocate(allocated_block_ids);
+    }
+  });
 
   std::vector<int64_t> flat_src_offsets;
   std::vector<int64_t> flat_dst_offsets;
@@ -1405,6 +1422,7 @@ KVCacheManagerBase::D2hAutoAllocate(
 
   ABSL_ASSIGN_OR_RETURN(
       auto future, D2h(flat_src_offsets, flat_dst_offsets, flat_copy_sizes));
+  std::move(dealloc).Cancel();
   return std::make_pair(allocated_block_ids, std::move(future));
 }
 
@@ -1620,6 +1638,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dDirect(
   }
 
   std::vector<raiden::PjRtCopyFuture> shard_futures_to_join;
+  auto drain = absl::MakeCleanup(
+      [&]() { raiden::DrainPjRtCopyFutures(shard_futures_to_join); });
   for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
     const auto& layer_info = layers_[layer_idx];
     const auto& layer_holds = buffer_holds_[layer_idx].holds;
@@ -1676,6 +1696,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dDirect(
       shard_futures_to_join.push_back(std::move(cf));
     }
   }
+  std::move(drain).Cancel();
   std::optional<size_t> single_shard;
   if (device_id >= 0) {
     single_shard = static_cast<size_t>(device_id);
@@ -2546,6 +2567,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::CopyPoolBlocks(
   }
 
   std::vector<raiden::PjRtCopyFuture> shard_futures;
+  auto drain =
+      absl::MakeCleanup([&]() { raiden::DrainPjRtCopyFutures(shard_futures); });
   uint64_t bytes_per_shard = 0;
   for (const HostDeviceExtent& extent : extents) {
     if (extent.size > 0) {
@@ -2596,6 +2619,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::CopyPoolBlocks(
       shard_futures.push_back(std::move(cf));
     }
   }
+  std::move(drain).Cancel();
   return JoinAndRecordTelemetry(
       *this, absl::MakeSpan(shard_futures), copy_start,
       device_to_host ? telemetry::metric_names::kD2hTransferTimeMs
@@ -2711,6 +2735,8 @@ KVCacheManagerBase::DispatchH2dWork(
   VLOG(1) << "KVCacheManagerBase::DispatchH2dWork started. Works count: "
           << works.size() << ", Thread: " << std::this_thread::get_id();
   std::vector<raiden::PjRtCopyFuture> local_futures;
+  auto drain =
+      absl::MakeCleanup([&]() { raiden::DrainPjRtCopyFutures(local_futures); });
   for (const auto& work : works) {
     const auto& layer_info = layers_[work.layer_idx];
     const auto& shard_hold =
@@ -2790,6 +2816,7 @@ KVCacheManagerBase::DispatchH2dWork(
   VLOG(1) << "KVCacheManagerBase::DispatchH2dWork completed. Dispatched "
           << local_futures.size()
           << " buffer futures. Thread: " << std::this_thread::get_id();
+  std::move(drain).Cancel();
   return local_futures;
 }
 
@@ -2803,6 +2830,8 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
   VLOG(1) << "KVCacheManagerBase::DispatchD2hWork started. Works count: "
           << works.size() << ", Thread: " << std::this_thread::get_id();
   std::vector<raiden::PjRtCopyFuture> local_futures;
+  auto drain =
+      absl::MakeCleanup([&]() { raiden::DrainPjRtCopyFutures(local_futures); });
   for (const auto& work : works) {
     const auto& layer_info = layers_[work.layer_idx];
     const auto& shard_hold =
@@ -2881,6 +2910,7 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
   VLOG(1) << "KVCacheManagerBase::DispatchD2hWork completed. Dispatched "
           << local_futures.size()
           << " buffer futures. Thread: " << std::this_thread::get_id();
+  std::move(drain).Cancel();
   return local_futures;
 }
 
@@ -3741,6 +3771,11 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
   std::vector<ChunkD2h> chunks;
   chunks.reserve(num_chunks);
   raiden::BufferHolders all_holds;
+  auto drain = absl::MakeCleanup([&chunks]() {
+    for (auto& chunk : chunks) {
+      (void)chunk.d2h_fut.Await();
+    }
+  });
 
   for (size_t i = 0; i < num_chunks; ++i) {
     int64_t src_block_idx = src_device_block_ids[i];
@@ -3756,6 +3791,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
     }
     chunks.push_back({std::move(d2h_fut), static_cast<int>(dst_block_idx)});
   }
+  std::move(drain).Cancel();
 
   auto state = std::make_shared<TransferPipelinedState>(
       num_chunks, std::move(promise), std::move(all_holds));
@@ -3767,6 +3803,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
          key = block_keys[i]](absl::StatusOr<raiden::BufferHolders> status) {
           if (!status.ok()) {
             state->SetError(status.status());
+            state->MarkChunkComplete();
+            return;
+          }
+          if (state->HasFailed()) {
             state->MarkChunkComplete();
             return;
           }
@@ -3784,7 +3824,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
         });
   }
   return raiden::PjRtCopyFuture(std::move(aggregate_future),
-                                state->combined_holds);
+                                state->combined_holds, state);
 }
 
 absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
@@ -3819,8 +3859,15 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
   }
 
   auto [promise, aggregate_future] = xla::MakePromise();
+  raiden::BufferHolders all_holds;
+  for (const auto& layer_hold : buffer_holds_) {
+    for (const auto& hold : layer_hold.holds) {
+      all_holds.push_back(raiden::BufferHolder{hold.c_hold, hold.common_hold,
+                                               nullptr, nullptr});
+    }
+  }
   auto state = std::make_shared<TransferPipelinedState>(
-      num_chunks, std::move(promise), /*holds=*/raiden::BufferHolders{});
+      num_chunks, std::move(promise), std::move(all_holds));
 
   for (size_t i = 0; i < num_chunks; ++i) {
     int64_t staging_block_idx = src_host_block_ids[i];
@@ -3843,6 +3890,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
             state->MarkChunkComplete();
             return;
           }
+          if (state->HasFailed()) {
+            state->MarkChunkComplete();
+            return;
+          }
           auto h2d_fut_or = H2d({staging_block_idx}, {device_block_idx}, {1});
           if (!h2d_fut_or.ok()) {
             state->SetError(h2d_fut_or.status());
@@ -3856,7 +3907,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
               });
         });
   }
-  return raiden::PjRtCopyFuture(std::move(aggregate_future), /*holds=*/{});
+  return raiden::PjRtCopyFuture(std::move(aggregate_future),
+                                state->combined_holds, state);
 }
 
 std::vector<backends::HostBufferDescriptor>
@@ -4396,6 +4448,7 @@ KVCacheManagerBase::CopyExternalObjectBlocks(
         raiden::PjRtCopyFuture submitted =
             raiden::JoinPjRtCopyFutures(layer_futures);
         submitted.AddKeepAlive(keep_alive);
+        (void)submitted.Await();
         lease->Commit(std::move(submitted));
       }
       return future.status();

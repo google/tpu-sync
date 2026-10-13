@@ -356,6 +356,7 @@ inline xla::Future<BufferHolders> FlattenPjRtFutures(
 struct PjRtEventBundle {
   const PJRT_Api* c_api = nullptr;
   std::vector<PJRT_Event*> events;
+  xla::Future<> bridged_future;
   ~PjRtEventBundle() {
     if (!c_api) return;
     for (PJRT_Event* e : events) {
@@ -418,6 +419,7 @@ struct PjRtCopyFuture {
     for (const auto& b : event_bundles) {
       if (!b || !b->c_api) continue;
       for (PJRT_Event* e : b->events) {
+        if (e == nullptr) continue;
         PJRT_Event_IsReady_Args a;
         a.struct_size = PJRT_Event_IsReady_Args_STRUCT_SIZE;
         a.extension_start = nullptr;
@@ -446,6 +448,7 @@ struct PjRtCopyFuture {
     for (const auto& b : event_bundles) {
       if (!b || !b->c_api) continue;
       for (PJRT_Event* e : b->events) {
+        if (e == nullptr) continue;
         PJRT_Event_IsReady_Args ra;
         ra.struct_size = PJRT_Event_IsReady_Args_STRUCT_SIZE;
         ra.extension_start = nullptr;
@@ -453,7 +456,8 @@ struct PjRtCopyFuture {
         ra.is_ready = false;
         PJRT_Error* rerr = b->c_api->PJRT_Event_IsReady(&ra);
         if (rerr) {
-          status = PjrtErrorToStatusLocal(b->c_api, rerr);
+          absl::Status s = PjrtErrorToStatusLocal(b->c_api, rerr);
+          if (status.ok()) status = std::move(s);
           continue;
         }
         if (!ra.is_ready) continue;  // pending: no error to report yet
@@ -462,12 +466,22 @@ struct PjRtCopyFuture {
         ee.extension_start = nullptr;
         ee.event = e;
         PJRT_Error* eerr = b->c_api->PJRT_Event_Error(&ee);
-        if (eerr) status = PjrtErrorToStatusLocal(b->c_api, eerr);
+        if (eerr) {
+          absl::Status s = PjrtErrorToStatusLocal(b->c_api, eerr);
+          if (status.ok()) status = std::move(s);
+        }
       }
     }
     if (future.IsValid() && future.IsReady()) {
       tsl::AsyncValue* av = future.async_value();
-      if (av && av->IsError()) status = av->GetError();
+      if (av && status.ok()) {
+        if (av->IsError()) {
+          status = av->GetError();
+        } else if (av->IsConcrete()) {
+          const absl::Status& s = future.Await();
+          if (!s.ok()) status = s;
+        }
+      }
     }
     return status;
   }
@@ -482,13 +496,14 @@ struct PjRtCopyFuture {
 
   template <typename F>
   void OnReady(F&& f) {
-    if (!future.IsValid() && !event_bundles.empty()) {
-      // One PJRT completion callback per event, joined into a single future.
-      // Callbacks run on PJRT completion threads, so no thread is held per
-      // in-flight copy.
-      std::vector<xla::Future<>> event_futures;
-      for (const auto& b : event_bundles) {
-        if (!b || !b->c_api) continue;
+    std::vector<xla::Future<>> ready_futures;
+    if (future.IsValid()) {
+      ready_futures.push_back(future);
+    }
+    for (const auto& b : event_bundles) {
+      if (!b || !b->c_api) continue;
+      if (!b->bridged_future.IsValid() && !b->events.empty()) {
+        std::vector<xla::Future<>> event_futures;
         for (PJRT_Event* e : b->events) {
           if (e == nullptr) continue;
           auto [promise, fut] = xla::MakePromise();
@@ -516,14 +531,19 @@ struct PjRtCopyFuture {
             delete ctx;
           }
         }
+        b->bridged_future = xla::JoinFutures(event_futures);
       }
-      // With no live events this is an already-successful future.
-      future = xla::JoinFutures(event_futures);
+      if (b->bridged_future.IsValid()) {
+        ready_futures.push_back(b->bridged_future);
+      }
     }
 
-    if (future.IsValid()) {
-      future.OnReady([holds = holds, keep_alive = keep_alive,
-                      f = std::forward<F>(f)](absl::Status status) mutable {
+    xla::Future<> combined = ready_futures.size() == 1
+                                 ? std::move(ready_futures[0])
+                                 : xla::JoinFutures(ready_futures);
+    if (combined.IsValid()) {
+      combined.OnReady([holds = holds, keep_alive = keep_alive,
+                        f = std::forward<F>(f)](absl::Status status) mutable {
         if (status.ok()) {
           std::forward<F>(f)(absl::StatusOr<BufferHolders>(holds));
         } else {
@@ -543,13 +563,15 @@ struct PjRtCopyFuture {
     for (const auto& b : event_bundles) {
       if (!b || !b->c_api) continue;
       for (PJRT_Event* e : b->events) {
+        if (e == nullptr) continue;
         PJRT_Event_Await_Args aw;
         aw.struct_size = PJRT_Event_Await_Args_STRUCT_SIZE;
         aw.extension_start = nullptr;
         aw.event = e;
         PJRT_Error* err = b->c_api->PJRT_Event_Await(&aw);
         if (err) {
-          status = PjrtErrorToStatusLocal(b->c_api, err);
+          absl::Status s = PjrtErrorToStatusLocal(b->c_api, err);
+          if (status.ok()) status = std::move(s);
           continue;
         }
         PJRT_Event_Error_Args ee;
@@ -557,15 +579,23 @@ struct PjRtCopyFuture {
         ee.extension_start = nullptr;
         ee.event = e;
         PJRT_Error* eerr = b->c_api->PJRT_Event_Error(&ee);
-        if (eerr) status = PjrtErrorToStatusLocal(b->c_api, eerr);
+        if (eerr) {
+          absl::Status s = PjrtErrorToStatusLocal(b->c_api, eerr);
+          if (status.ok()) status = std::move(s);
+        }
       }
     }
     if (future.IsValid()) {
       future.BlockUntilReady(
           static_cast<void (*)(tsl::AsyncValue*)>(tsl::BlockUntilReady));
       tsl::AsyncValue* av = future.async_value();
-      if (av->IsError()) {
-        status = av->GetError();
+      if (av && status.ok()) {
+        if (av->IsError()) {
+          status = av->GetError();
+        } else if (av->IsConcrete()) {
+          const absl::Status& s = future.Await();
+          if (!s.ok()) status = s;
+        }
       }
     }
     return status;
@@ -614,6 +644,12 @@ inline PjRtCopyFuture JoinPjRtCopyFutures(
   return joined;
 }
 
+inline void DrainPjRtCopyFutures(absl::Span<const PjRtCopyFuture> futures) {
+  if (!futures.empty()) {
+    (void)JoinPjRtCopyFutures(futures).Await();
+  }
+}
+
 // One shard's worth of D2h copies (device->host). offsets in BYTES.
 struct D2hCopy {
   void* dst;
@@ -644,7 +680,14 @@ inline absl::StatusOr<PjRtCopyFuture> IssueD2hShard(
     evs.reserve(copies.size());
     for (const auto& c : copies) {
       auto ev = hold.CopyRawDeviceToHostEvent(c.dst, c.src_off, c.size);
-      if (!ev.ok()) return ev.status();
+      if (!ev.ok()) {
+        if (!evs.empty()) {
+          (void)PjRtCopyFuture::FromEvents(hold.c_api(), std::move(evs),
+                                           std::move(holds))
+              .Await();
+        }
+        return ev.status();
+      }
       evs.push_back(ev.value());
     }
     return PjRtCopyFuture::FromEvents(hold.c_api(), std::move(evs),
@@ -674,7 +717,14 @@ inline absl::StatusOr<PjRtCopyFuture> IssueH2dShard(
     evs.reserve(copies.size());
     for (const auto& c : copies) {
       auto ev = hold.CopyRawHostToDeviceEvent(c.src, c.dst_off, c.size);
-      if (!ev.ok()) return ev.status();
+      if (!ev.ok()) {
+        if (!evs.empty()) {
+          (void)PjRtCopyFuture::FromEvents(hold.c_api(), std::move(evs),
+                                           std::move(holds))
+              .Await();
+        }
+        return ev.status();
+      }
       evs.push_back(ev.value());
     }
     return PjRtCopyFuture::FromEvents(hold.c_api(), std::move(evs),

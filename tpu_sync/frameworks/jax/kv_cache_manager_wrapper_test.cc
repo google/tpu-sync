@@ -24,8 +24,12 @@
 #include <utility>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
+#include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
@@ -37,8 +41,11 @@
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/frameworks/jax/kv_cache_manager.h"
+#include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/transport/block_transport.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -645,6 +652,219 @@ TEST(KVCacheManagerWrapperTest, ConstructorWithRawPjRtBuffersSucceeds) {
   EXPECT_EQ(manager.num_layers(), 1);
   EXPECT_EQ(manager.num_shards(), 1);
   EXPECT_EQ(manager.slice_byte_size(), 1024 * sizeof(float));
+}
+
+class DrainTrackingSubManager : public KVCacheManagerWithTransfer {
+ public:
+  class Base : public kv_cache::KVCacheManagerBase {
+   public:
+    Base(DrainTrackingSubManager* parent, int host_blocks)
+        : kv_cache::KVCacheManagerBase(/*num_layers=*/1, /*num_shards=*/1,
+                                       /*slice_byte_size=*/128,
+                                       /*local_port=*/std::nullopt,
+                                       /*host_blocks_to_allocate=*/host_blocks),
+          parent_(parent) {}
+
+    absl::StatusOr<raiden::PjRtCopyFuture> H2d(
+        const std::vector<int64_t>& src_offsets_major_dim = {},
+        const std::vector<int64_t>& dst_offsets_major_dim = {},
+        const std::vector<int64_t>& copy_sizes_major_dim = {},
+        std::optional<int64_t> slot_idx = std::nullopt,
+        std::optional<size_t> layer_idx = std::nullopt,
+        std::optional<size_t> shard_idx = std::nullopt) override {
+      if (parent_->should_fail) {
+        return absl::InternalError("sub-manager H2d failed");
+      }
+      return MakeTrackedFuture();
+    }
+
+    absl::StatusOr<raiden::PjRtCopyFuture> D2h(
+        const std::vector<int64_t>& src_offsets_major_dim = {},
+        const std::vector<int64_t>& dst_offsets_major_dim = {},
+        const std::vector<int64_t>& copy_sizes_major_dim = {},
+        std::optional<int64_t> slot_idx = std::nullopt,
+        std::optional<size_t> layer_idx = std::nullopt,
+        std::optional<size_t> shard_idx = std::nullopt) override {
+      if (parent_->should_fail) {
+        return absl::InternalError("sub-manager D2h failed");
+      }
+      return MakeTrackedFuture();
+    }
+
+    absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
+    H2hWrite(std::string peer, const std::vector<int>& src_block_ids,
+             const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
+             int layer_idx = -1) override {
+      if (parent_->should_fail) {
+        return absl::InternalError("sub-manager H2hWrite failed");
+      }
+      return std::make_pair(std::vector<int>{0}, MakeTrackedFuture());
+    }
+
+    absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hRead(
+        std::string peer, const std::vector<int>& src_block_ids) override {
+      if (parent_->should_fail) {
+        return absl::InternalError("sub-manager H2hRead failed");
+      }
+      return std::make_pair(std::vector<int>{0}, MakeTrackedFuture());
+    }
+
+    absl::StatusOr<raiden::PjRtCopyFuture> H2hReadExplicit(
+        std::string peer, const std::vector<int>& src_block_ids,
+        const std::vector<int>& local_block_ids,
+        const std::vector<uint8_t*>& explicit_dst_ptrs, int parallelism = 1,
+        tpu_raiden::transport::MajorOrder major_order =
+            tpu_raiden::transport::MajorOrder::kLayerMajor,
+        tpu_raiden::transport::BlockReceivedCallback on_block_received = {})
+        override {
+      if (parent_->should_fail) {
+        return absl::InternalError("sub-manager H2hReadExplicit failed");
+      }
+      return MakeTrackedFuture();
+    }
+
+    absl::StatusOr<raiden::PjRtCopyFuture> H2dRead(
+        absl::string_view peer,
+        const std::vector<int64_t>& src_host_offsets_major_dim,
+        const std::vector<int64_t>& dst_host_offsets_major_dim,
+        const std::vector<int64_t>& dst_device_offsets_major_dim,
+        const std::vector<int64_t>& copy_sizes_major_dim) override {
+      if (parent_->should_fail) {
+        return absl::InternalError("sub-manager H2dRead failed");
+      }
+      return MakeTrackedFuture();
+    }
+
+    absl::StatusOr<raiden::PjRtCopyFuture> D2hWriteToBackend(
+        absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>>,
+        const std::vector<kv_cache::backends::BlockKey>&,
+        const std::vector<int64_t>&, const std::vector<int64_t>&) override {
+      if (parent_->should_fail) {
+        return absl::InternalError("sub-manager D2hWriteToBackend failed");
+      }
+      return MakeTrackedFuture();
+    }
+
+    absl::StatusOr<raiden::PjRtCopyFuture> H2dReadFromBackend(
+        absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>>,
+        const std::vector<kv_cache::backends::BlockKey>&,
+        const std::vector<int64_t>&, const std::vector<int64_t>&) override {
+      if (parent_->should_fail) {
+        return absl::InternalError("sub-manager H2dReadFromBackend failed");
+      }
+      return MakeTrackedFuture();
+    }
+
+   private:
+    raiden::PjRtCopyFuture MakeTrackedFuture() {
+      parent_->ev = FakeEvent{};
+      parent_->c_api.PJRT_Event_Await =
+          +[](PJRT_Event_Await_Args* args) -> PJRT_Error* {
+        auto* ev = reinterpret_cast<FakeEvent*>(args->event);
+        ev->awaited = true;
+        return nullptr;
+      };
+      parent_->c_api.PJRT_Event_Error =
+          +[](PJRT_Event_Error_Args*) -> PJRT_Error* { return nullptr; };
+      parent_->c_api.PJRT_Event_Destroy =
+          +[](PJRT_Event_Destroy_Args* args) -> PJRT_Error* {
+        auto* ev = reinterpret_cast<FakeEvent*>(args->event);
+        ev->destroyed = true;
+        return nullptr;
+      };
+      return raiden::PjRtCopyFuture::FromEvents(
+          &parent_->c_api, {reinterpret_cast<PJRT_Event*>(&parent_->ev)}, {});
+    }
+
+    DrainTrackingSubManager* parent_;
+  };
+
+  struct FakeEvent {
+    bool awaited = false;
+    bool destroyed = false;
+  };
+
+  explicit DrainTrackingSubManager(bool fail, int host_blocks = 4)
+      : KVCacheManagerWithTransfer(std::make_unique<Base>(this, host_blocks)),
+        should_fail(fail) {}
+
+  bool should_fail = false;
+  PJRT_Api c_api{};
+  FakeEvent ev{};
+};
+
+TEST(KVCacheManagerWrapperTest,
+     NumaAwareKVCacheManagerDrainsSubManager0WhenSubManager1Fails) {
+  auto sub0 = std::make_unique<DrainTrackingSubManager>(/*fail=*/false);
+  auto sub1 = std::make_unique<DrainTrackingSubManager>(/*fail=*/true);
+  DrainTrackingSubManager* ptr0 = sub0.get();
+
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
+  subs.push_back(std::move(sub0));
+  subs.push_back(std::move(sub1));
+  KVCacheManager mgr(std::move(subs));
+  mgr.SetSubmanagerShardsForTesting({{0}, {1}});
+
+  absl::StatusOr<raiden::PjRtCopyFuture> h2d_res = mgr.H2d({0}, {0}, {1});
+  ASSERT_FALSE(h2d_res.ok());
+  EXPECT_TRUE(ptr0->ev.awaited);
+  EXPECT_TRUE(ptr0->ev.destroyed);
+
+  absl::StatusOr<raiden::PjRtCopyFuture> d2h_res = mgr.D2h({0}, {0}, {1});
+  ASSERT_FALSE(d2h_res.ok());
+  EXPECT_TRUE(ptr0->ev.awaited);
+  EXPECT_TRUE(ptr0->ev.destroyed);
+
+  EXPECT_EQ(ptr0->base()->host_block_manager()->num_allocated_blocks(), 0);
+  auto auto_res = mgr.D2hAutoAllocate({0}, {2});
+  ASSERT_FALSE(auto_res.ok());
+  EXPECT_TRUE(ptr0->ev.awaited);
+  EXPECT_TRUE(ptr0->ev.destroyed);
+  EXPECT_EQ(ptr0->base()->host_block_manager()->num_allocated_blocks(), 0);
+  EXPECT_EQ(ptr0->base()->host_block_manager()->num_free_blocks(), 4);
+
+  auto h2h_w_str = mgr.H2hWrite("127.0.0.1:9000", {0}, {0});
+  ASSERT_FALSE(h2h_w_str.ok());
+  EXPECT_TRUE(ptr0->ev.awaited);
+  EXPECT_TRUE(ptr0->ev.destroyed);
+
+  auto h2h_r_str = mgr.H2hRead("127.0.0.1:9000", {0});
+  ASSERT_FALSE(h2h_r_str.ok());
+  EXPECT_TRUE(ptr0->ev.awaited);
+  EXPECT_TRUE(ptr0->ev.destroyed);
+
+  std::vector<RaidenTransferEndpoint> endpoints = {
+      {.endpoint = "127.0.0.1:9000", .shards = {0, 1}},
+  };
+  auto h2h_w_ep = mgr.H2hWrite(endpoints, {0}, {0});
+  ASSERT_FALSE(h2h_w_ep.ok());
+  EXPECT_TRUE(ptr0->ev.awaited);
+  EXPECT_TRUE(ptr0->ev.destroyed);
+
+  auto h2h_r_ep = mgr.H2hRead(endpoints, {0});
+  ASSERT_FALSE(h2h_r_ep.ok());
+  EXPECT_TRUE(ptr0->ev.awaited);
+  EXPECT_TRUE(ptr0->ev.destroyed);
+
+  auto h2h_r_exp = mgr.H2hReadExplicit(endpoints, {0}, {0});
+  ASSERT_FALSE(h2h_r_exp.ok());
+  EXPECT_TRUE(ptr0->ev.awaited);
+  EXPECT_TRUE(ptr0->ev.destroyed);
+
+  auto h2d_read = mgr.H2dRead(endpoints, {0}, {0}, {0}, {1});
+  ASSERT_FALSE(h2d_read.ok());
+  EXPECT_TRUE(ptr0->ev.awaited);
+  EXPECT_TRUE(ptr0->ev.destroyed);
+
+  auto d2h_backend = mgr.D2hWriteToBackend({}, {}, {0}, {0});
+  ASSERT_FALSE(d2h_backend.ok());
+  EXPECT_TRUE(ptr0->ev.awaited);
+  EXPECT_TRUE(ptr0->ev.destroyed);
+
+  auto h2d_backend = mgr.H2dReadFromBackend({}, {}, {0}, {0});
+  ASSERT_FALSE(h2d_backend.ok());
+  EXPECT_TRUE(ptr0->ev.awaited);
+  EXPECT_TRUE(ptr0->ev.destroyed);
 }
 
 }  // namespace

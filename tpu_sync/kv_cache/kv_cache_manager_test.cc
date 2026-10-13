@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <functional>
 #include <ios>
 #include <memory>
 #include <optional>
@@ -36,10 +37,14 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
+#include "xla/pjrt/c/pjrt_c_api.h"
+#include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
@@ -84,6 +89,7 @@ class TestKVCacheManager : public KVCacheManagerBase {
     major_dim_size_ = major_dim_size;
   }
 
+  using KVCacheManagerBase::buffer_holds_;
   using KVCacheManagerBase::layers_;
   using KVCacheManagerBase::UpdateAllocatedOccupancyMetric;
 };
@@ -2239,6 +2245,248 @@ TEST_F(RegisterKVBackendsTopologyTest, IgnoresCallerTpProperties) {
   EXPECT_EQ(backend->mapper()->tp_size(), 4);
   TF_ASSERT_OK_AND_ASSIGN(auto key, backend->mapper()->MapKey("block_hash"));
   EXPECT_THAT(key.resolved_key, ::testing::HasSubstr("/tp4_r1/"));
+}
+
+struct FakeKvPjRtEvent {
+  bool ready = false;
+  bool awaited = false;
+  bool destroyed = false;
+};
+
+struct FakeKvRawBufferEnv {
+  PJRT_Api c_api{};
+  PJRT_RawBuffer_Extension ext{};
+  std::vector<std::unique_ptr<FakeKvPjRtEvent>> events;
+
+  FakeKvRawBufferEnv() {
+    c_api.PJRT_Event_Await = +[](PJRT_Event_Await_Args* args) -> PJRT_Error* {
+      auto* ev = reinterpret_cast<FakeKvPjRtEvent*>(args->event);
+      ev->awaited = true;
+      ev->ready = true;
+      return nullptr;
+    };
+    c_api.PJRT_Event_Error =
+        +[](PJRT_Event_Error_Args*) -> PJRT_Error* { return nullptr; };
+    c_api.PJRT_Event_Destroy =
+        +[](PJRT_Event_Destroy_Args* args) -> PJRT_Error* {
+      auto* ev = reinterpret_cast<FakeKvPjRtEvent*>(args->event);
+      ev->destroyed = true;
+      return nullptr;
+    };
+    ext.PJRT_RawBuffer_Destroy =
+        +[](PJRT_RawBuffer_Destroy_Args*) -> PJRT_Error* { return nullptr; };
+    ext.PJRT_RawBuffer_CopyRawDeviceToHost =
+        +[](PJRT_RawBuffer_CopyRawDeviceToHost_Args* args) -> PJRT_Error* {
+      auto* env = reinterpret_cast<FakeKvRawBufferEnv*>(args->buffer);
+      auto ev = std::make_unique<FakeKvPjRtEvent>();
+      args->event = reinterpret_cast<PJRT_Event*>(ev.get());
+      env->events.push_back(std::move(ev));
+      return nullptr;
+    };
+    ext.PJRT_RawBuffer_CopyRawHostToDevice =
+        +[](PJRT_RawBuffer_CopyRawHostToDevice_Args* args) -> PJRT_Error* {
+      auto* env = reinterpret_cast<FakeKvRawBufferEnv*>(args->buffer);
+      auto ev = std::make_unique<FakeKvPjRtEvent>();
+      args->event = reinterpret_cast<PJRT_Event*>(ev.get());
+      env->events.push_back(std::move(ev));
+      return nullptr;
+    };
+  }
+
+  raiden::BufferHoldAndAlias MakeHold() {
+    raiden::BufferHoldAndAlias hold;
+    hold.is_common_buffer = false;
+    hold.c_raw_buffer = reinterpret_cast<PJRT_RawBuffer*>(this);
+    hold.c_hold = std::make_shared<raiden::RawBufferHolder>(&c_api, &ext,
+                                                            /*buf=*/nullptr);
+    return hold;
+  }
+};
+
+TEST(KVCacheManagerTest, H2dAndD2hDrainStartedLayerCopiesOnPartialFailure) {
+  FakeKvRawBufferEnv env;
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  manager.buffer_holds_[0].holds[0] = env.MakeHold();
+  manager.buffer_holds_[1].holds[0] = env.MakeHold();
+  // Shrink layer 1's device_size so block 1 is valid on layer 0 but
+  // out-of-range on layer 1.
+  manager.layers_[1].shards[0].device_size = 128;
+
+  absl::StatusOr<raiden::PjRtCopyFuture> h2d_res = manager.H2d({0}, {1}, {1});
+  ASSERT_FALSE(h2d_res.ok());
+  ASSERT_EQ(env.events.size(), 1u);
+  EXPECT_TRUE(env.events[0]->awaited);
+  EXPECT_TRUE(env.events[0]->destroyed);
+
+  env.events.clear();
+  absl::StatusOr<raiden::PjRtCopyFuture> d2h_res = manager.D2h({1}, {0}, {1});
+  ASSERT_FALSE(d2h_res.ok());
+  ASSERT_EQ(env.events.size(), 1u);
+  EXPECT_TRUE(env.events[0]->awaited);
+  EXPECT_TRUE(env.events[0]->destroyed);
+}
+
+TEST(KVCacheManagerTest,
+     H2dDirectAndCopyPoolBlocksDrainStartedShardCopiesOnPartialFailure) {
+  FakeKvRawBufferEnv env;
+  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/2,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  ABSL_ASSERT_OK(manager.RegisterPools({DensePool("kind_a", 0, 0, 128, 2)}));
+  manager.buffer_holds_[0].holds[0] = env.MakeHold();
+  manager.buffer_holds_[0].holds[1] = env.MakeHold();
+  // Shrink shard 1's device_size so block 1 succeeds on shard 0 and fails on
+  // shard 1.
+  manager.layers_[0].shards[1].device_size = 128;
+
+  absl::StatusOr<raiden::PjRtCopyFuture> h2d_direct =
+      manager.H2dDirect({0}, {1}, {1});
+  ASSERT_FALSE(h2d_direct.ok());
+  ASSERT_EQ(env.events.size(), 1u);
+  EXPECT_TRUE(env.events[0]->awaited);
+  EXPECT_TRUE(env.events[0]->destroyed);
+
+  env.events.clear();
+  absl::StatusOr<raiden::PjRtCopyFuture> pool_d2h =
+      manager.D2hPoolBlocks(/*pool_idx=*/0, /*block_ids=*/{1});
+  ASSERT_FALSE(pool_d2h.ok());
+  ASSERT_EQ(env.events.size(), 1u);
+  EXPECT_TRUE(env.events[0]->awaited);
+  EXPECT_TRUE(env.events[0]->destroyed);
+
+  env.events.clear();
+  absl::StatusOr<raiden::PjRtCopyFuture> pool_h2d =
+      manager.H2dPoolBlocks(/*pool_idx=*/0, /*block_ids=*/{1});
+  ASSERT_FALSE(pool_h2d.ok());
+  ASSERT_EQ(env.events.size(), 1u);
+  EXPECT_TRUE(env.events[0]->awaited);
+  EXPECT_TRUE(env.events[0]->destroyed);
+}
+
+TEST(KVCacheManagerTest, D2hAutoAllocateDeallocatesBlocksWhenD2hFails) {
+  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/4);
+  ASSERT_NE(manager.host_block_manager(), nullptr);
+  EXPECT_EQ(manager.host_block_manager()->num_allocated_blocks(), 0);
+  EXPECT_EQ(manager.host_block_manager()->num_free_blocks(), 4);
+
+  // Source offset 99 exceeds device_size (4 * 128), so D2h fails after
+  // AllocateBlocks has allocated and locked 2 host blocks.
+  auto res = manager.D2hAutoAllocate(/*src_offsets_major_dim=*/{99},
+                                     /*copy_sizes_major_dim=*/{2});
+  ASSERT_FALSE(res.ok());
+  EXPECT_EQ(manager.host_block_manager()->num_allocated_blocks(), 0);
+  EXPECT_EQ(manager.host_block_manager()->num_locked_blocks(), 0);
+  EXPECT_EQ(manager.host_block_manager()->num_free_blocks(), 4);
+}
+
+class ControlledAsyncBackend : public backends::KVBackend {
+ public:
+  std::string name() const override { return "controlled"; }
+  void WriteAsync(const backends::BlockKey& key,
+                  absl::Span<const backends::HostBufferDescriptor>, size_t,
+                  std::function<void(absl::Status)> on_done) override {
+    if (key.block_hash == "fail_fast") {
+      on_done(absl::InternalError("chunk 0 write failed"));
+      return;
+    }
+    pending_callbacks.push_back(std::move(on_done));
+  }
+  void ReadAsync(const backends::BlockKey& key,
+                 absl::Span<const backends::HostBufferDescriptor>, size_t,
+                 std::function<void(absl::Status)> on_done) override {
+    if (key.block_hash == "fail_fast") {
+      on_done(absl::InternalError("chunk 0 read failed"));
+      return;
+    }
+    pending_callbacks.push_back(std::move(on_done));
+  }
+  void BatchExistsAsync(absl::Span<const backends::BlockKey> keys,
+                        std::function<void(std::vector<absl::StatusOr<bool>>)>
+                            callback) override {
+    callback(std::vector<absl::StatusOr<bool>>(keys.size(), true));
+  }
+
+  std::vector<std::function<void(absl::Status)>> pending_callbacks;
+};
+
+TEST(KVCacheManagerTest,
+     D2hWriteAndD2hWriteToBackendDrainDispatchedChunksOnPartialFailure) {
+  FakeKvRawBufferEnv env;
+  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  manager.buffer_holds_[0].holds[0] = env.MakeHold();
+
+  // Chunk 0 (src block 0) dispatches an event-backed D2H copy; chunk 1 (src
+  // block 99) fails bounds validation in DispatchD2hChunks.
+  absl::StatusOr<raiden::PjRtCopyFuture> d2h_write = manager.D2hWrite(
+      "127.0.0.1:9999", /*src_device_offsets_major_dim=*/{0, 99},
+      /*src_host_offsets_major_dim=*/{0, 1},
+      /*dst_host_offsets_major_dim=*/{0, 1},
+      /*copy_sizes_major_dim=*/{1, 1});
+  ASSERT_FALSE(d2h_write.ok());
+  ASSERT_EQ(env.events.size(), 1u);
+  EXPECT_TRUE(env.events[0]->awaited);
+  EXPECT_TRUE(env.events[0]->destroyed);
+
+  env.events.clear();
+  auto backend = std::make_shared<ControlledAsyncBackend>();
+  std::vector<std::shared_ptr<backends::KVBackend>> backends = {backend};
+  std::vector<backends::BlockKey> keys = {
+      {.block_hash = "k0", .resolved_key = "k0"},
+      {.block_hash = "k1", .resolved_key = "k1"},
+  };
+  absl::StatusOr<raiden::PjRtCopyFuture> write_to_backend =
+      manager.D2hWriteToBackend(backends, keys,
+                                /*src_device_block_ids=*/{0, 99},
+                                /*dst_host_block_ids=*/{0, 1});
+  ASSERT_FALSE(write_to_backend.ok());
+  ASSERT_EQ(env.events.size(), 1u);
+  EXPECT_TRUE(env.events[0]->awaited);
+  EXPECT_TRUE(env.events[0]->destroyed);
+}
+
+TEST(KVCacheManagerTest,
+     TransferPipelinedStateWaitsForAllChunksBeforeResolvingError) {
+  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/4);
+  auto backend = std::make_shared<ControlledAsyncBackend>();
+  std::vector<std::shared_ptr<backends::KVBackend>> backends = {backend};
+  std::vector<backends::BlockKey> keys = {
+      {.block_hash = "fail_fast", .resolved_key = "k0"},
+      {.block_hash = "slow_chunk", .resolved_key = "k1"},
+  };
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture write_fut,
+      manager.D2hWriteToBackend(backends, keys, /*src_device_block_ids=*/{0, 1},
+                                /*dst_host_block_ids=*/{0, 1}));
+  if (!backend->pending_callbacks.empty()) {
+    EXPECT_FALSE(write_fut.IsReady());
+    for (auto& cb : backend->pending_callbacks) {
+      cb(absl::OkStatus());
+    }
+    backend->pending_callbacks.clear();
+  }
+  EXPECT_TRUE(write_fut.IsReady());
+  absl::Status write_status = write_fut.Await();
+  ASSERT_FALSE(write_status.ok());
+  EXPECT_EQ(write_status.message(), "chunk 0 write failed");
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture read_fut,
+      manager.H2dReadFromBackend(backends, keys, /*src_host_block_ids=*/{0, 1},
+                                 /*dst_device_block_ids=*/{0, 1}));
+  ASSERT_EQ(backend->pending_callbacks.size(), 1u);
+  EXPECT_FALSE(read_fut.IsReady());
+
+  backend->pending_callbacks[0](absl::OkStatus());
+  backend->pending_callbacks.clear();
+
+  EXPECT_TRUE(read_fut.IsReady());
+  absl::Status read_status = read_fut.Await();
+  ASSERT_FALSE(read_status.ok());
+  EXPECT_EQ(read_status.message(), "chunk 0 read failed");
 }
 
 }  // namespace

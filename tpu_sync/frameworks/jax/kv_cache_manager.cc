@@ -625,12 +625,15 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::H2d(
   }
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   sub_copy_futures.reserve(sub_managers_.size());
+  auto drain = absl::MakeCleanup(
+      [&]() { raiden::DrainPjRtCopyFutures(sub_copy_futures); });
   for (auto& sub : sub_managers_) {
     ABSL_ASSIGN_OR_RETURN(
         auto f, sub->base()->H2d(src_offsets, dst_offsets, copy_sizes, slot_idx,
                                  layer_idx, shard_idx));
     sub_copy_futures.push_back(std::move(f));
   }
+  std::move(drain).Cancel();
   // Use the event-aware join. On TPU the per-shard copies complete via the
   // PJRT C-API event path (PjRtCopyFuture::FromEvents), which leaves
   // f.future invalid and signals through event_bundles. Joining the raw
@@ -649,12 +652,15 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::D2h(
   }
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   sub_copy_futures.reserve(sub_managers_.size());
+  auto drain = absl::MakeCleanup(
+      [&]() { raiden::DrainPjRtCopyFutures(sub_copy_futures); });
   for (auto& sub : sub_managers_) {
     ABSL_ASSIGN_OR_RETURN(
         auto f, sub->base()->D2h(src_offsets, dst_offsets, copy_sizes, slot_idx,
                                  layer_idx, shard_idx));
     sub_copy_futures.push_back(std::move(f));
   }
+  std::move(drain).Cancel();
   // Use the event-aware join (see H2d above): on TPU the per-shard copies
   // complete via the PJRT C-API event path, leaving f.future invalid and
   // signalling through event_bundles, so xla::JoinFutures on the raw future
@@ -670,15 +676,32 @@ NumaAwareKVCacheManager::D2hAutoAllocate(
     return std::make_pair(std::vector<int>(), raiden::PjRtCopyFuture());
   }
   std::vector<int> all_ids;
+  std::vector<std::vector<int>> sub_allocated_ids;
+  sub_allocated_ids.reserve(sub_managers_.size());
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
+  sub_copy_futures.reserve(sub_managers_.size());
+  auto cleanup_on_error = absl::MakeCleanup([this, &sub_copy_futures,
+                                             &sub_allocated_ids]() {
+    raiden::DrainPjRtCopyFutures(sub_copy_futures);
+    for (size_t k = 0; k < sub_allocated_ids.size(); ++k) {
+      if (sub_managers_[k] != nullptr && sub_managers_[k]->base() != nullptr &&
+          sub_managers_[k]->base()->host_block_manager() != nullptr &&
+          !sub_allocated_ids[k].empty()) {
+        (void)sub_managers_[k]->base()->host_block_manager()->Deallocate(
+            sub_allocated_ids[k]);
+      }
+    }
+  });
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
     ABSL_ASSIGN_OR_RETURN(auto res, sub_managers_[s]->base()->D2hAutoAllocate(
                                         src_offsets, copy_sizes));
     if (s == 0) {
       all_ids = res.first;
     }
+    sub_allocated_ids.push_back(std::move(res.first));
     sub_copy_futures.push_back(std::move(res.second));
   }
+  std::move(cleanup_on_error).Cancel();
   // Event-aware join (see D2h/H2d): on TPU the per-shard copies use the PJRT
   // C-API event path, so f.future is invalid and completion is via
   // event_bundles; xla::JoinFutures on the raw future would CHECK-fail.
@@ -709,6 +732,9 @@ NumaAwareKVCacheManager::H2hWrite(std::string peer,
 
   std::vector<int> all_ids;
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
+  sub_copy_futures.reserve(sub_managers_.size());
+  auto drain = absl::MakeCleanup(
+      [&]() { raiden::DrainPjRtCopyFutures(sub_copy_futures); });
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
     std::string sub_peer =
         (base_port >= 0) ? host_prefix + std::to_string(base_port + s) : peer;
@@ -720,6 +746,7 @@ NumaAwareKVCacheManager::H2hWrite(std::string peer,
     }
     sub_copy_futures.push_back(std::move(res.second));
   }
+  std::move(drain).Cancel();
   // Event-aware join (see D2h/H2d): on TPU the per-shard transfers complete via
   // the PJRT C-API event path, leaving f.future invalid and signalling through
   // event_bundles; xla::JoinFutures on the raw future would CHECK-fail.
@@ -748,6 +775,9 @@ NumaAwareKVCacheManager::H2hRead(std::string peer,
 
   std::vector<int> all_ids;
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
+  sub_copy_futures.reserve(sub_managers_.size());
+  auto drain = absl::MakeCleanup(
+      [&]() { raiden::DrainPjRtCopyFutures(sub_copy_futures); });
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
     std::string sub_peer =
         (base_port >= 0) ? host_prefix + std::to_string(base_port + s) : peer;
@@ -758,6 +788,7 @@ NumaAwareKVCacheManager::H2hRead(std::string peer,
     }
     sub_copy_futures.push_back(std::move(res.second));
   }
+  std::move(drain).Cancel();
   // Event-aware join (see D2h/H2d): on TPU the per-shard transfers complete via
   // the PJRT C-API event path, leaving f.future invalid and signalling through
   // event_bundles; xla::JoinFutures on the raw future would CHECK-fail.
@@ -776,6 +807,9 @@ NumaAwareKVCacheManager::H2hWrite(
   }
   std::vector<int> all_ids;
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
+  sub_copy_futures.reserve(sub_managers_.size());
+  auto drain = absl::MakeCleanup(
+      [&]() { raiden::DrainPjRtCopyFutures(sub_copy_futures); });
 
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
     const auto& sub_shards = submanager_to_global_shards_[s];
@@ -812,6 +846,7 @@ NumaAwareKVCacheManager::H2hWrite(
     }
     sub_copy_futures.push_back(std::move(res.second));
   }
+  std::move(drain).Cancel();
   // Event-aware join (see D2h/H2d): on TPU the per-shard transfers complete via
   // the PJRT C-API event path, leaving f.future invalid and signalling through
   // event_bundles; xla::JoinFutures on the raw future would CHECK-fail.
@@ -829,6 +864,9 @@ NumaAwareKVCacheManager::H2hRead(
   }
   std::vector<int> all_ids;
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
+  sub_copy_futures.reserve(sub_managers_.size());
+  auto drain = absl::MakeCleanup(
+      [&]() { raiden::DrainPjRtCopyFutures(sub_copy_futures); });
 
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
     const auto& sub_shards = submanager_to_global_shards_[s];
@@ -854,6 +892,7 @@ NumaAwareKVCacheManager::H2hRead(
     }
     sub_copy_futures.push_back(std::move(res.second));
   }
+  std::move(drain).Cancel();
   // Event-aware join (see D2h/H2d): on TPU the per-shard transfers complete via
   // the PJRT C-API event path, leaving f.future invalid and signalling through
   // event_bundles; xla::JoinFutures on the raw future would CHECK-fail.
@@ -872,6 +911,8 @@ NumaAwareKVCacheManager::H2hReadExplicit(
   }
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   sub_copy_futures.reserve(sub_managers_.size());
+  auto drain = absl::MakeCleanup(
+      [&]() { raiden::DrainPjRtCopyFutures(sub_copy_futures); });
 
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
     // Same endpoint matching as the vector H2hRead/H2hWrite/H2dRead above.
@@ -897,6 +938,7 @@ NumaAwareKVCacheManager::H2hReadExplicit(
                               /*explicit_dst_ptrs=*/{}));
     sub_copy_futures.push_back(std::move(fut));
   }
+  std::move(drain).Cancel();
   return raiden::JoinPjRtCopyFutures(absl::MakeSpan(sub_copy_futures));
 }
 
@@ -911,6 +953,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::H2dRead(
   }
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   sub_copy_futures.reserve(sub_managers_.size());
+  auto drain = absl::MakeCleanup(
+      [&]() { raiden::DrainPjRtCopyFutures(sub_copy_futures); });
 
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
     // Same endpoint matching as the vector H2hRead/H2hWrite above: pick the
@@ -939,6 +983,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::H2dRead(
                               dst_device_offsets, copy_sizes));
     sub_copy_futures.push_back(std::move(fut));
   }
+  std::move(drain).Cancel();
   // Event-aware join (see D2h/H2d): on TPU the per-shard transfers complete via
   // the PJRT C-API event path, leaving f.future invalid and signalling through
   // event_bundles; xla::JoinFutures on the raw future would CHECK-fail.
@@ -974,6 +1019,8 @@ NumaAwareKVCacheManager::D2hWriteToBackend(
   }
   std::vector<raiden::PjRtCopyFuture> futures;
   futures.reserve(sub_managers_.size());
+  auto drain =
+      absl::MakeCleanup([&]() { raiden::DrainPjRtCopyFutures(futures); });
   for (auto& sub_mgr : sub_managers_) {
     if (sub_mgr != nullptr && sub_mgr->base() != nullptr) {
       ABSL_ASSIGN_OR_RETURN(auto fut, sub_mgr->base()->D2hWriteToBackend(
@@ -983,6 +1030,7 @@ NumaAwareKVCacheManager::D2hWriteToBackend(
       futures.push_back(std::move(fut));
     }
   }
+  std::move(drain).Cancel();
   return raiden::JoinPjRtCopyFutures(futures);
 }
 
@@ -997,6 +1045,8 @@ NumaAwareKVCacheManager::H2dReadFromBackend(
   }
   std::vector<raiden::PjRtCopyFuture> futures;
   futures.reserve(sub_managers_.size());
+  auto drain =
+      absl::MakeCleanup([&]() { raiden::DrainPjRtCopyFutures(futures); });
   for (auto& sub_mgr : sub_managers_) {
     if (sub_mgr != nullptr && sub_mgr->base() != nullptr) {
       ABSL_ASSIGN_OR_RETURN(auto fut, sub_mgr->base()->H2dReadFromBackend(
@@ -1006,6 +1056,7 @@ NumaAwareKVCacheManager::H2dReadFromBackend(
       futures.push_back(std::move(fut));
     }
   }
+  std::move(drain).Cancel();
   return raiden::JoinPjRtCopyFutures(futures);
 }
 

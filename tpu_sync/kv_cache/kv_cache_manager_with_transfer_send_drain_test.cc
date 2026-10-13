@@ -384,7 +384,8 @@ TEST(SendLifecycleTest, DuplicateRegistrationCannotReplaceLiveOffer) {
                                    std::chrono::steady_clock::now() -
                                        std::chrono::milliseconds(1)),
             0);
-  EXPECT_EQ(producer.NotifyForRead("replacement", /*uuid=*/10, {0}), 0);
+  EXPECT_THROW(producer.NotifyForRead("replacement", /*uuid=*/10, {0}),
+               std::runtime_error);
   EXPECT_TRUE(producer.has_send(10));
 
   Reports reports = producer.CompleteReadRaw();
@@ -400,7 +401,18 @@ TEST(SendLifecycleTest, DuplicateRegistrationCannotReplaceLiveOffer) {
 TEST(SendLifecycleTest, DuplicateBlocksAreRejectedAtRegistration) {
   TestManager producer(/*num_layers=*/1);
 
-  EXPECT_EQ(producer.NotifyForRead("req", /*uuid=*/15, {0, 0}), 0);
+  // A 0 return would read as "nothing to send"; the caller must learn which
+  // block repeats and where.
+  std::string message;
+  try {
+    producer.NotifyForRead("req", /*uuid=*/15, {5, 9, 5});
+    FAIL() << "a repeated block must be rejected";
+  } catch (const std::invalid_argument& e) {
+    message = e.what();
+  }
+  EXPECT_THAT(message, HasSubstr("duplicate block 5"));
+  EXPECT_THAT(message, HasSubstr("req_id=req, uuid=15"));
+  EXPECT_THAT(message, HasSubstr("positions 0 and 2 of 3 blocks"));
   EXPECT_FALSE(producer.has_send(15));
   Reports reports = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(reports), IsEmpty());

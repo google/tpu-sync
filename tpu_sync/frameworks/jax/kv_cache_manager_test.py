@@ -761,6 +761,35 @@ class KVCacheManagerTest(parameterized.TestCase):
       out = np.asarray(dst_caches[i])
       np.testing.assert_array_equal(out[6], src_refs[i][5])
 
+  def test_notify_for_read_rejects_an_invalid_registration(self):
+    """A repeated block or a live uuid raises instead of returning False,
+    which callers read as "nothing to send" and then wait out the pull."""
+    tpu_sharding = self.setup_shardings()
+    shape = (8, 128, 8, 8, 128)
+    caches = [
+        jax.device_put(jnp.zeros(shape, dtype=jnp.float32), tpu_sharding)
+        for _ in range(2)
+    ]
+    jax.block_until_ready(caches)
+    producer = _kv_cache_manager.KVCacheManager(
+        kv_caches=caches,
+        local_control_port=0,
+        max_blocks=2,
+        num_slots=2,
+        unsafe_skip_buffer_lock=self.skip_lock,
+        parallelism=1,
+    )
+
+    with self.assertRaisesRegex(
+        ValueError, r"duplicate block 5 .*positions 0 and 2 of 3 blocks"
+    ):
+      producer.notify_for_read("req", 7, [5, 9, 5])
+    self.assertEqual(producer.notify_for_read("req", 7, [5, 9]), 7)
+    with self.assertRaisesRegex(RuntimeError, "duplicate uuid=7"):
+      producer.notify_for_read("again", 7, [6])
+    # Nothing to send is still the plain False.
+    self.assertEqual(producer.notify_for_read("empty", 8, []), 0)
+
 
 if __name__ == "__main__":
   absltest.main()

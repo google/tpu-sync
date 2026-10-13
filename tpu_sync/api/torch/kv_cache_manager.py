@@ -496,6 +496,10 @@ class KVCacheManager:
     Returns:
       True if a transfer is indeed needed; False if there is nothing to be
       transferred.
+
+    Raises:
+      ValueError: block_ids lists a block twice.
+      RuntimeError: uuid still has a registered read.
     """
     return bool(self._impl.notify_for_read(req_id, uuid, block_ids))
 

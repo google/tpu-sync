@@ -70,12 +70,14 @@ TransferSendSession::Create(
   auto session = std::shared_ptr<TransferSendSession>(
       new TransferSendSession(base, staging_allocator, std::move(req_id), uuid,
                               deadline, register_start));
-  std::optional<int64_t> duplicate_block =
+  std::optional<RepeatedBlock> repeated =
       session->PopulateRegisteredBlocks(block_ids);
-  if (duplicate_block.has_value()) {
+  if (repeated.has_value()) {
     return absl::InvalidArgumentError(absl::StrCat(
-        "NotifyForRead rejected duplicate block ", *duplicate_block,
-        " for req_id=", session->req_id(), ", uuid=", uuid));
+        "NotifyForRead rejected duplicate block ", repeated->block_id,
+        " for req_id=", session->req_id(), ", uuid=", uuid, ": positions ",
+        repeated->first_pos, " and ", repeated->second_pos, " of ",
+        block_ids.size(), " blocks"));
   }
   return session;
 }
@@ -92,19 +94,20 @@ TransferSendSession::TransferSendSession(
       deadline_(deadline),
       register_start_(register_start) {}
 
-std::optional<int64_t> TransferSendSession::PopulateRegisteredBlocks(
+std::optional<TransferSendSession::RepeatedBlock>
+TransferSendSession::PopulateRegisteredBlocks(
     absl::Span<const int64_t> block_ids) {
   absl::MutexLock lock(mu_);
   registered_num_blocks_ = static_cast<int64_t>(block_ids.size());
   registered_block_ids_.assign(block_ids.begin(), block_ids.end());
   registered_block_set_.clear();
-  std::optional<int64_t> duplicate_block;
-  for (int64_t block_id : block_ids) {
-    if (!registered_block_set_.insert(block_id).second) {
-      duplicate_block = block_id;
-    }
+  for (size_t pos = 0; pos < block_ids.size(); ++pos) {
+    if (registered_block_set_.insert(block_ids[pos]).second) continue;
+    size_t first_pos = 0;
+    while (block_ids[first_pos] != block_ids[pos]) ++first_pos;
+    return RepeatedBlock{block_ids[pos], first_pos, pos};
   }
-  return duplicate_block;
+  return std::nullopt;
 }
 
 void TransferSendSession::ValidateRequestedBlocksLocked(

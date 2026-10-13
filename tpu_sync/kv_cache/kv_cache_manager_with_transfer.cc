@@ -472,9 +472,11 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
       TransferSendSession::Create(
           base_.get(), staging_allocator_.get(), req_id, uuid, block_ids,
           deadline.value_or(DeadlineFromNow()), register_start);
+  // An invalid registration is the caller's bug, not an empty transfer:
+  // raise it instead of answering 0, which the caller reads as "nothing to
+  // send" and then waits out the consumer's pull timeout.
   if (!created.ok()) {
-    LOG(ERROR) << created.status().message();
-    return 0;
+    throw std::invalid_argument(std::string(created.status().message()));
   }
   std::shared_ptr<TransferSendSession> session = *std::move(created);
 
@@ -485,9 +487,9 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
       return 0;
     }
     if (!send_sessions_.try_emplace(uuid, session).second) {
-      LOG(ERROR) << "NotifyForRead rejected duplicate uuid=" << uuid
-                 << " for req_id=" << req_id;
-      return 0;
+      throw std::runtime_error(
+          absl::StrCat("NotifyForRead rejected duplicate uuid=", uuid,
+                       " for req_id=", req_id, ": a read is still registered"));
     }
   }
   cv_.SignalAll();

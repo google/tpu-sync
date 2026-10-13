@@ -1,0 +1,82 @@
+# Copyright 2026 Google LLC.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Per-PR gate. CPU-only: builds the JAX extension and runs the OSS-safe,
+# non-device unit tests + an import smoke check on the CPU runner
+# (linux-x86-n2-32). TPU device coverage lives in device_test.yml (v5e) so a slow
+# TPU runner never blocks the PR gate. See .github/README.md.
+
+name: CI - Presubmit (CPU)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'main' }}
+
+# Curated OSS-safe, CPU-only unit tests (no TPU device, no Google-internal grpc).
+# //rpc/... and //kv_cache/global_registry/... are excluded by design -- see
+# ci/wheel/BUILD.bazel. Expand as more packages become CPU-runnable.
+env:
+  CPU_TEST_TARGETS: >-
+    //kv_cache:logical_block_manager_test
+    //kv_cache:lru_cache_test
+    //tpu_raiden/frameworks/jax:resharding_planner_test
+
+jobs:
+  build_and_test:
+    name: "Presubmit on CPU"
+    runs-on: linux-x86-n2-32
+    container:
+      image: "us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest"
+    steps:
+      - uses: actions/checkout@v5
+
+      # Git's CVE-2022-24765 patch blocks root from operating on runner-owned
+      # dirs; trust the ephemeral workspace.
+      - name: Fix Git workspace ownership
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install clang-18
+        run: ./ci/tools/install_clang18.sh
+
+      - name: Build JAX extension
+        run: ./build.sh jax
+
+      - name: Run CPU unit tests
+        env:
+          RAIDEN_REMOTE_CACHE: "https://storage.googleapis.com/tpu-raiden-bazel-cache"
+          RAIDEN_REMOTE_UPLOAD: "false"
+        run: ./ci/tools/bazel_test.sh jax -- ${CPU_TEST_TARGETS}
+
+      - name: Import smoke check (JAX mocked)
+        run: |
+          export PYTHONPATH="${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/bazel-bin:${PYTHONPATH:-}"
+          python3 - <<'PY'
+          import sys
+          from unittest.mock import MagicMock
+          for m in ("jax", "jax.core", "jax.extend", "jax.extend.ffi"):
+              sys.modules[m] = MagicMock()
+          import tpu_raiden  # noqa: F401
+          print("tpu_raiden imported successfully.")
+          PY

@@ -138,7 +138,9 @@ class KVCacheStore {
   // KVCacheMetadata table in shared memory too.
 
   // Safe factory method to create KVCacheStore from a single BackendConfig
-  // with optional secondary backend configs.
+  // with optional secondary backend configs. Telemetry `dp_rank` (the global
+  // data-parallel rank of the owning engine, matching vLLM's `engine` metric
+  // label) is derived from `raiden_id.data_replica_idx` (`>= 0`).
   static absl::StatusOr<std::unique_ptr<KVCacheStore>> Create(
       const BackendConfig& config, size_t capacity = 0,
       absl::string_view global_registry_address = "", RaidenId raiden_id = {},
@@ -554,6 +556,25 @@ class KVCacheStore {
       absl::string_view store_server_ip = "",
       absl::string_view global_registry_address = "");
 
+  // Settle a recall batch: count `block_hashes` in `kv_recall_blocks_total`
+  // under `tier` (outcome `ok` for Done), then mark them in `load_tracker_`.
+  void MarkRecallDone(absl::string_view tier,
+                      absl::Span<const std::string> block_hashes);
+  void MarkRecallFailed(absl::string_view tier, absl::string_view outcome,
+                        absl::Span<const std::string> block_hashes);
+
+  // Counts all `count` blocks of a rejected local-DRAM Load batch as
+  // `not_found` (the caller must recompute the whole batch) and returns
+  // `status`.
+  absl::Status FailLocalLoadNotFound(size_t count, absl::Status status) const;
+  void MarkSaveDone(absl::string_view tier,
+                    absl::Span<const std::string> block_hashes);
+  void MarkSaveFailed(absl::string_view tier,
+                      absl::Span<const std::string> block_hashes);
+  void IncrementSaveBlocks(absl::string_view tier, absl::string_view outcome,
+                           uint64_t count) const;
+  void IncrementEvictedBlocks(uint64_t count) const;
+
   // Registers ValidateAndPinHostBlocks/UnpinHostBlocks on raiden_controller_
   // as the source-side hooks that a peer's ReadRemote lease acquisition and
   // release run against this store's LRU (no-op if there is no controller).
@@ -631,6 +652,9 @@ class KVCacheStore {
   // The IP peers reach this node on. Never empty and never a wildcard --
   // construction rejects both.
   std::string store_server_ip_;
+  // Telemetry label (`raiden_id_.data_replica_idx`), immutable after
+  // construction.
+  const std::string dp_rank_str_;
   // Advertised "host:port" of store_server_, empty until it is started.
   std::string store_server_address_;
   // Non-owning. Points either into owned_store_server_ or at a server owned by

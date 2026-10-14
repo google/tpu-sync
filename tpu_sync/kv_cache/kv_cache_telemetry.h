@@ -43,6 +43,24 @@ inline void IncrementKvRecallBlocks(absl::string_view dp_rank,
       telemetry::metric_names::kKvRecallBlocksTotal, labels, count);
 }
 
+// Increments `kv_save_blocks_total` by `count` with the given store identity
+// and save labels. `dp_rank` must be a pre-rendered decimal string, and
+// `tier` and `outcome` must be `telemetry::metric_labels::kTier*` and
+// `kOutcome*` constants respectively (`outcome` must be `kOutcomeOk`,
+// `kOutcomeRejected`, or `kOutcomeFailed`). No-op when `count == 0`.
+inline void IncrementKvSaveBlocks(absl::string_view dp_rank,
+                                  absl::string_view tier,
+                                  absl::string_view outcome, uint64_t count) {
+  if (count == 0) return;
+  const telemetry::MetricLabel labels[] = {
+      {telemetry::metric_labels::kDpRank, dp_rank},
+      {telemetry::metric_labels::kTier, tier},
+      {telemetry::metric_labels::kOutcome, outcome},
+  };
+  telemetry::RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
+      telemetry::metric_names::kKvSaveBlocksTotal, labels, count);
+}
+
 }  // namespace kv_cache
 }  // namespace tpu_raiden
 

@@ -99,6 +99,7 @@ inline constexpr absl::string_view kBufferAllocatedBytes =
 
 inline constexpr absl::string_view kKvRecallBlocksTotal =
     "kv_recall_blocks_total";
+inline constexpr absl::string_view kKvSaveBlocksTotal = "kv_save_blocks_total";
 
 inline constexpr absl::string_view kWeightSyncSentBytesTotal =
     "weight_sync_sent_bytes_total";
@@ -159,6 +160,12 @@ inline constexpr absl::string_view kBufferAllocatedBytes =
 // outcome}`.
 inline constexpr absl::string_view kKvRecallBlocksTotal =
     "Cumulative count of KV cache block recall attempts across tiers and "
+    "outcomes.";
+// Counts KV cache block save attempts across offload tiers (`local_dram`,
+// `remote_dram`) and outcomes (`ok`, `rejected`, `failed`), labeled by
+// `{dp_rank, tier, outcome}`.
+inline constexpr absl::string_view kKvSaveBlocksTotal =
+    "Cumulative count of KV cache block save attempts across tiers and "
     "outcomes.";
 
 inline constexpr absl::string_view kH2dBytesTotal =
@@ -252,6 +259,17 @@ inline constexpr absl::string_view kOutcomeStagingExhausted =
 // Counts blocks whose recall failed during peer resolution, non-NOT_FOUND
 // RPC/storage I/O, or H2D DMA transfer.
 inline constexpr absl::string_view kOutcomeTransferFailed = "transfer_failed";
+// Counts blocks whose save was rejected prior to transfer due to admission or
+// pool capacity exhaustion (`Insert` pin/capacity refusal, `SaveLocal`
+// RESOURCE_EXHAUSTED host block allocation, or peer WriteRemote
+// RESOURCE_EXHAUSTED ack).
+inline constexpr absl::string_view kOutcomeRejected = "rejected";
+// Counts blocks whose save failed during execution due to transport/RPC/DMA
+// errors, an unresolvable peer, null controller, WRITE_PARTIAL_EXIST /
+// PARTIAL_EXIST (for the full batch), STORED_UNREGISTERED, FAILED verdicts
+// (including post-transfer CompleteWriteRemote kAdmitStrict refusal), or
+// destination hold expiry.
+inline constexpr absl::string_view kOutcomeFailed = "failed";
 
 inline constexpr absl::string_view kDirectionLabels[] = {kDirection};
 inline constexpr absl::string_view kSentBytesLabels[] = {kDirection, kSrcIp,
@@ -264,6 +282,8 @@ inline constexpr absl::string_view kPcieTransferLabels[] = {kHostIp,
                                                             kLocalRank};
 inline constexpr absl::string_view kKvRecallBlocksLabels[] = {kDpRank, kTier,
                                                               kOutcome};
+inline constexpr absl::string_view kKvSaveBlocksLabels[] = {kDpRank, kTier,
+                                                            kOutcome};
 
 }  // namespace metric_labels
 
@@ -271,6 +291,7 @@ namespace metric_metadata {
 
 using metric_labels::kDirectionLabels;
 using metric_labels::kKvRecallBlocksLabels;
+using metric_labels::kKvSaveBlocksLabels;
 using metric_labels::kP2pTransferTimeLabels;
 using metric_labels::kPcieTransferLabels;
 using metric_labels::kSentBytesLabels;
@@ -351,6 +372,12 @@ inline constexpr MetricMetadata kKvRecallBlocksTotal{
     .description = metric_descriptions::kKvRecallBlocksTotal,
     .type = MetricType::kCounter,
     .label_names = kKvRecallBlocksLabels};
+
+inline constexpr MetricMetadata kKvSaveBlocksTotal{
+    .name = metric_names::kKvSaveBlocksTotal,
+    .description = metric_descriptions::kKvSaveBlocksTotal,
+    .type = MetricType::kCounter,
+    .label_names = kKvSaveBlocksLabels};
 
 inline constexpr MetricMetadata kWeightSyncSentBytesTotal{
     .name = metric_names::kWeightSyncSentBytesTotal,
@@ -446,6 +473,7 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kD2hDmaTimeMs,
     kBufferAllocatedBytes,
     kKvRecallBlocksTotal,
+    kKvSaveBlocksTotal,
     // Weight Sync Metrics
     kWeightSyncSentBytesTotal,
     kWeightSyncReceivedBytesTotal,

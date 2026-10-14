@@ -30,6 +30,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
@@ -135,6 +136,38 @@ void ConnPool::Return(bool ok, int fd, absl::string_view peer,
     const Key key = GenPoolKey(peer, local_ip);
     pool_[key].push_back(fd);
   }
+}
+
+size_t ConnPool::CloseIdle(absl::string_view peer) {
+  // Pool keys are "<local_ip>-><peer>", so the "->" delimiter makes a suffix
+  // match exact for the peer regardless of the local IP the stream bound.
+  const std::string suffix = absl::StrCat("->", peer);
+  std::vector<int> to_close;
+  {
+    absl::MutexLock lock(mu_);
+    for (auto it = pool_.begin(); it != pool_.end();) {
+      if (!absl::EndsWith(it->first, suffix)) {
+        ++it;
+        continue;
+      }
+      to_close.insert(to_close.end(), it->second.begin(), it->second.end());
+      pool_.erase(it++);
+    }
+  }
+  for (const int fd : to_close) {
+    CloseSocket(fd);
+  }
+  return to_close.size();
+}
+
+size_t ConnPool::IdleCount(absl::string_view peer) const {
+  const std::string suffix = absl::StrCat("->", peer);
+  size_t count = 0;
+  absl::MutexLock lock(mu_);
+  for (const auto& [key, fds] : pool_) {
+    if (absl::EndsWith(key, suffix)) count += fds.size();
+  }
+  return count;
 }
 
 void ConnPool::Close() {

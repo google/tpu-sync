@@ -668,6 +668,21 @@ void RawBufferTransport::ConnectionWorker(int client_fd) {
     }
     if (ret == 0) continue;
 
+    // A peer that closes an idle connection between requests (a sender
+    // releasing its connections once a transfer settled) delivers EOF with no
+    // header: the connection simply ended, no request failed. The destructor's
+    // shutdown() also reads as EOF here; that is a local stop, not a peer
+    // close, so it is not logged.
+    char peek = 0;
+    const ssize_t peeked = recv(client_fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (peeked == 0) {
+      if (!stopping_) {
+        LOG(INFO) << absl::StrCat("peer closed tcp socket ", client_fd, ": ",
+                                  GetAddrPortPair(client_fd));
+      }
+      break;
+    }
+
     if (absl::Status status = ProcessPeerRequest(client_fd); !status.ok()) {
       LOG(ERROR) << "ProcessPeerRequest failed: " << status;
       break;

@@ -32,6 +32,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/core/data_connection_policy.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/transfer_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
@@ -52,6 +53,8 @@ class TransferSendSession
     : public TransferSession,
       public std::enable_shared_from_this<TransferSendSession> {
  public:
+  // Resolves the data connection policy (TPU_RAIDEN_DATA_CONN_REUSE) and
+  // creates a send session for |block_ids|.
   static absl::StatusOr<std::shared_ptr<TransferSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,
       StagingBlockAllocator* absl_nullable staging_allocator,
@@ -103,6 +106,8 @@ class TransferSendSession
 
   // Counts one finished copy or push; marks the send done and releases its
   // staging resources if it was draining and waiting for this operation.
+  // Under kPerTransfer that last operation first closes the idle data
+  // connections to the consumer's endpoints.
   void EndSendOp();
 
   // Stages producer device blocks into host staging and executes the
@@ -142,7 +147,8 @@ class TransferSendSession
                       StagingBlockAllocator* staging_allocator,
                       std::string req_id, uint64_t uuid,
                       std::chrono::steady_clock::time_point deadline,
-                      std::chrono::steady_clock::time_point register_start);
+                      std::chrono::steady_clock::time_point register_start,
+                      DataConnectionReuse data_connection_reuse);
 
   // Populates |registered_block_ids_| and |registered_block_set_| from
   // |block_ids|. Returns the first duplicate block ID if any duplicate is
@@ -167,6 +173,8 @@ class TransferSendSession
   const uint64_t uuid_ = 0;
   const std::chrono::steady_clock::time_point deadline_;
   const std::chrono::steady_clock::time_point register_start_;
+  // TPU_RAIDEN_DATA_CONN_REUSE as resolved when the session was created.
+  const DataConnectionReuse data_connection_reuse_;
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
   int64_t num_blocks_ ABSL_GUARDED_BY(mu_) = 0;
   int64_t registered_num_blocks_ ABSL_GUARDED_BY(mu_) = 0;
@@ -183,6 +191,8 @@ class TransferSendSession
   // waits for its in-flight work before it is reported.
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
+  // The last op already closed the idle data connections (kPerTransfer).
+  bool connections_released_ ABSL_GUARDED_BY(mu_) = false;
   std::vector<raiden::PjRtCopyFuture> d2h_layer_futures_ ABSL_GUARDED_BY(mu_);
   std::vector<std::string> remote_data_endpoints_ ABSL_GUARDED_BY(mu_);
   std::vector<int> src_ints_ ABSL_GUARDED_BY(mu_);

@@ -116,6 +116,17 @@ class RawBufferTransport final {
     conn_pool_.Return(ok_to_pool, fd, peer, local_ip);
   }
 
+  // Closes the idle pooled connections to `peer` under any local IP; borrowed
+  // connections are unaffected. See ConnPool::CloseIdle.
+  size_t CloseIdleConnections(absl::string_view peer) {
+    return conn_pool_.CloseIdle(peer);
+  }
+
+  // Idle pooled connections to `peer`, for tests and diagnostics.
+  size_t IdleConnectionCount(absl::string_view peer) const {
+    return conn_pool_.IdleCount(peer);
+  }
+
   // Synchronously pulls a buffer identified by `buffer_id` from the remote
   // `peer`, by sending out a `kOpBufferPull ChunkHeader` and then receiving
   // the data from the peer.

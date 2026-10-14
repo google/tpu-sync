@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_TRANSPORT_LIB_CONN_POOL_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_TRANSPORT_LIB_CONN_POOL_H_
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
@@ -57,6 +58,17 @@ class ConnPool {
   void Return(bool ok, int fd, absl::string_view peer,
               absl::string_view local_ip = "");
 
+  // Closes every idle pooled connection to `peer` under any local IP and
+  // returns how many were closed. A connection that is currently borrowed is
+  // not in the pool and is unaffected. Callers release a peer's idle
+  // connections once their transfers to it have settled, so a later transfer
+  // dials afresh instead of the process holding one socket per
+  // (local IP, peer, stream) for its whole life.
+  size_t CloseIdle(absl::string_view peer);
+
+  // Number of idle pooled connections to `peer` under any local IP.
+  size_t IdleCount(absl::string_view peer) const;
+
  private:
   using Key = std::string;
   using Fds = std::vector<int>;
@@ -67,7 +79,7 @@ class ConnPool {
   }
 
  private:
-  absl::Mutex mu_;
+  mutable absl::Mutex mu_;
   bool stop_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_map<Key, Fds> pool_ ABSL_GUARDED_BY(mu_);
 };

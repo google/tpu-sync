@@ -31,11 +31,13 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/common/trace.h"
+#include "tpu_sync/core/data_connection_policy.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
@@ -54,9 +56,11 @@ TransferSendSession::Create(
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
+  ABSL_ASSIGN_OR_RETURN(const DataConnectionReuse data_connection_reuse,
+                        ResolveDataConnectionReuse());
   auto session = std::shared_ptr<TransferSendSession>(
       new TransferSendSession(base, staging_allocator, std::move(req_id), uuid,
-                              deadline, register_start));
+                              deadline, register_start, data_connection_reuse));
   std::optional<int64_t> duplicate_block =
       session->PopulateRegisteredBlocks(block_ids);
   if (duplicate_block.has_value()) {
@@ -71,13 +75,15 @@ TransferSendSession::TransferSendSession(
     kv_cache::KVCacheManagerBase* base,
     StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
     std::chrono::steady_clock::time_point deadline,
-    std::chrono::steady_clock::time_point register_start)
+    std::chrono::steady_clock::time_point register_start,
+    DataConnectionReuse data_connection_reuse)
     : base_(base),
       staging_allocator_(staging_allocator),
       req_id_(std::move(req_id)),
       uuid_(uuid),
       deadline_(deadline),
-      register_start_(register_start) {}
+      register_start_(register_start),
+      data_connection_reuse_(data_connection_reuse) {}
 
 std::optional<int64_t> TransferSendSession::PopulateRegisteredBlocks(
     absl::Span<const int64_t> block_ids) {
@@ -175,6 +181,12 @@ void TransferSendSession::FinishLocked(const absl::Status& status) {
 }
 
 void TransferSendSession::Finish(const absl::Status& status) {
+  // Settling here, with no op in flight, means no push was ever issued:
+  // pushes start in SendNextLayer's push_pool task, each stays counted until
+  // its completion has run, and the completion of the last layer calls
+  // Finish() while still counted (a failed copy or push finishes under its
+  // own op). A send that pushed therefore settles in EndSendOp, which
+  // releases its data connections first.
   absl::MutexLock lock(mu_);
   FinishLocked(status);
 }
@@ -194,8 +206,32 @@ void TransferSendSession::EndSendOpLocked() {
 }
 
 void TransferSendSession::EndSendOp() {
-  absl::MutexLock lock(mu_);
-  EndSendOpLocked();
+  // Under kPerTransfer the last op of a draining send closes the idle data
+  // connections to the consumer's endpoints before it is counted out: every
+  // push has returned its socket by now, and done_ cannot be set meanwhile,
+  // so ~KVCacheManagerWithTransfer is still parked in AwaitForDone() and
+  // |base_| and its transport are alive. transport_server() cannot contend on
+  // server_init_mu_ either: every StopTransportServer() call is in a
+  // destructor that runs only after that wait. The check and the decrement
+  // share a critical section so a Finish() that starts draining in between
+  // cannot settle the send unreleased.
+  while (true) {
+    std::vector<std::string> peers;
+    {
+      absl::MutexLock lock(mu_);
+      const bool release_due =
+          data_connection_reuse_ == DataConnectionReuse::kPerTransfer &&
+          in_flight_ == 1 && draining_ && !done_ && !connections_released_ &&
+          !remote_data_endpoints_.empty();
+      if (!release_due) {
+        EndSendOpLocked();
+        return;
+      }
+      connections_released_ = true;
+      peers = remote_data_endpoints_;
+    }
+    ReleaseDataConnectionsAfterSend(base_->transport_server(), peers, uuid_);
+  }
 }
 
 CopySpec TransferSendSession::BuildCoalescedCopySpec(

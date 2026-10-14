@@ -27,6 +27,7 @@
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "tpu_sync/core/data_connection_policy.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/transfer_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
@@ -42,13 +43,14 @@ class StagingBlockAllocator;
 //
 // Thread-safety: This class is thread-safe. Immutable fields (|base_|,
 // |staging_allocator_|, |req_id_|, |uuid_|, |parallelism_|, |deadline_|,
-// |plan_|) are set at construction time and read without locking. Mutable
-// state is protected by internal |mu_|.
+// |plan_|, |dst_peers_|, |data_connection_reuse_|) are set at construction
+// time and read without locking. Mutable state is protected by internal |mu_|.
 class ReshardSendSession
     : public TransferSession,
       public std::enable_shared_from_this<ReshardSendSession> {
  public:
-  // Validates the sender schedule in |plan|, initializes the transport server,
+  // Validates the sender schedule in |plan|, resolves the data connection
+  // policy (TPU_RAIDEN_DATA_CONN_REUSE), initializes the transport server,
   // registers the active plan on |base|, and creates a producer pool-reshard
   // send session.
   static absl::StatusOr<std::shared_ptr<ReshardSendSession>> Create(
@@ -98,7 +100,9 @@ class ReshardSendSession
                      std::string req_id, uint64_t uuid, int parallelism,
                      int remaining_pool_peer_pushes,
                      std::chrono::steady_clock::time_point deadline,
-                     ::tpu_sync::rpc::StartTransferRequest plan);
+                     ::tpu_sync::rpc::StartTransferRequest plan,
+                     std::vector<std::string> dst_peers,
+                     DataConnectionReuse data_connection_reuse);
 
   // Validates |plan| against |base| and |src_block_ids|.
   static absl::Status ValidatePlan(
@@ -111,6 +115,9 @@ class ReshardSendSession
   void RecordPushCompletion(KVCacheManagerWithTransfer& manager,
                             const absl::Status& status);
   void StartPoolPush(KVCacheManagerWithTransfer& manager, size_t pool_idx);
+  // Counts one op out. The last op of a finalizing send first drops the plan
+  // and, under kPerTransfer, closes the idle data connections to |dst_peers_|
+  // while it is still counted, then settles the send.
   void EndOp();
   void SettleLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ReleaseLeasesLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -122,6 +129,10 @@ class ReshardSendSession
   const int parallelism_ = 8;
   const std::chrono::steady_clock::time_point deadline_;
   const ::tpu_sync::rpc::StartTransferRequest plan_;
+  // Data endpoints the sender schedule pushes to.
+  const std::vector<std::string> dst_peers_;
+  // TPU_RAIDEN_DATA_CONN_REUSE as resolved when the session was created.
+  const DataConnectionReuse data_connection_reuse_;
 
   mutable absl::Mutex mu_;
   int remaining_pool_peer_pushes_ ABSL_GUARDED_BY(mu_) = 0;
@@ -136,6 +147,8 @@ class ReshardSendSession
   KVCacheManagerWithTransfer* manager_ ABSL_GUARDED_BY(mu_) = nullptr;
   bool leases_released_ ABSL_GUARDED_BY(mu_) = false;
   bool plan_unregistered_ ABSL_GUARDED_BY(mu_) = false;
+  // The last op already closed the idle data connections (kPerTransfer).
+  bool connections_released_ ABSL_GUARDED_BY(mu_) = false;
 };
 
 }  // namespace tpu_raiden

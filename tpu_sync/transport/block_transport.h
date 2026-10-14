@@ -70,6 +70,18 @@ class BlockTransport final {
   // It is the first IP in `local_ips` if provided, otherwise "127.0.0.1".
   const std::string& bound_ip() const { return raw_transport_.bound_ip(); }
 
+  // Closes the idle pooled connections to `peer` (lib::ConnPool::CloseIdle).
+  // In-flight streams keep their sockets; the next push to `peer` dials
+  // afresh. Returns how many connections were closed.
+  size_t CloseIdleConnections(absl::string_view peer) {
+    return raw_transport_.CloseIdleConnections(peer);
+  }
+
+  // Idle pooled connections to `peer`, for tests and diagnostics.
+  size_t IdleConnectionCount(absl::string_view peer) const {
+    return raw_transport_.IdleConnectionCount(peer);
+  }
+
   // Returns PeregrineService to register onto the host gRPC server.
   ::peregrine::internal::control::PeregrineService::Service*
   peregrine_control_service() {

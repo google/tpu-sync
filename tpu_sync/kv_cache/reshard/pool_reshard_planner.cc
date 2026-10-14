@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <string>
@@ -31,8 +32,11 @@
 #include "absl/container/btree_map.h"
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "tpu_sync/common/raiden_id.h"
@@ -131,6 +135,25 @@ struct TagPrecheck {
 };
 
 }  // namespace
+
+absl::StatusOr<int64_t> DefaultTransferStreams(int64_t topology_parallelism) {
+  const char* raw = std::getenv(kTransferStreamsEnvVar);
+  if (raw == nullptr || raw[0] == '\0') return topology_parallelism;
+  int64_t streams = 0;
+  if (!absl::SimpleAtoi(raw, &streams) || streams < 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat(kTransferStreamsEnvVar, "=\"", raw,
+                     "\" must be unset, empty, 0 or a positive integer"));
+  }
+  if (streams == 0) return topology_parallelism;
+  if (streams > topology_parallelism) {
+    LOG_FIRST_N(WARNING, 1) << kTransferStreamsEnvVar << "=" << streams
+                            << " exceeds the admitted transfer parallelism "
+                            << topology_parallelism << "; clamping";
+    return topology_parallelism;
+  }
+  return streams;
+}
 
 absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
     const PlanRequest& request, RequestBlockRegistry* registry,
@@ -445,10 +468,13 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
       ++expected_rank;
     }
   }
-  const int64_t requested_parallelism =
-      request.parallelism.has_value()
-          ? static_cast<int64_t>(*request.parallelism)
-          : topology_parallelism;
+  int64_t requested_parallelism = 0;
+  if (request.parallelism.has_value()) {
+    requested_parallelism = static_cast<int64_t>(*request.parallelism);
+  } else {
+    ABSL_ASSIGN_OR_RETURN(requested_parallelism,
+                          DefaultTransferStreams(topology_parallelism));
+  }
   if (requested_parallelism <= 0) {
     return absl::InvalidArgumentError("parallelism must be positive");
   }

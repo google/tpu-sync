@@ -17,6 +17,7 @@
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <future>
 #include <memory>
@@ -31,6 +32,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -38,12 +40,15 @@
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/transfer_session.h"
+#include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 
 namespace tpu_raiden {
 namespace {
 
 using ::absl_testing::StatusIs;
+using ::testing::AllOf;
+using ::testing::HasSubstr;
 
 kv_cache::KVCacheManagerBase MakeTestBase(size_t num_layers = 1) {
   return kv_cache::KVCacheManagerBase(
@@ -152,6 +157,166 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
   std::vector<std::function<void(absl::StatusOr<std::vector<int>>)>>
       h2h_callbacks_ ABSL_GUARDED_BY(mu_);
 };
+
+// Sets TPU_RAIDEN_DATA_CONN_REUSE for one test (unsets it when `value` is
+// null) and restores it afterwards. Tests construct it before any manager
+// base or session, so no other thread reads the environment meanwhile.
+class ScopedDataConnReuseEnv {
+ public:
+  explicit ScopedDataConnReuseEnv(const char* value) {
+    if (const char* prev = std::getenv(kName)) previous_ = prev;
+    if (value == nullptr) {
+      unsetenv(kName);
+    } else {
+      setenv(kName, value, 1);
+    }
+  }
+  ~ScopedDataConnReuseEnv() {
+    if (previous_.has_value()) {
+      setenv(kName, previous_->c_str(), 1);
+    } else {
+      unsetenv(kName);
+    }
+  }
+
+ private:
+  static constexpr char kName[] = "TPU_RAIDEN_DATA_CONN_REUSE";
+  std::optional<std::string> previous_;
+};
+
+// Completes one real push of block 0 from `sender` to `peer`, which leaves the
+// push stream's socket idle in `sender`'s connection pool.
+absl::Status SeedIdleDataConnection(transport::BlockTransport& sender,
+                                    const std::string& peer) {
+  return sender.SyncPush({peer}, /*src_block_ids=*/{0}, /*dst_block_ids=*/{0})
+      .status();
+}
+
+TEST(TransferSendSessionTest,
+     PerTransferPolicyClosesIdlePeerConnectionsBeforeDone) {
+  ScopedDataConnReuseEnv env("per_transfer");
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  FakeSendBase receiver(/*num_layers=*/1, /*host_blocks=*/4);
+  const std::string peer =
+      absl::StrCat("127.0.0.1:", receiver.transport_server()->local_port());
+  ABSL_ASSERT_OK(SeedIdleDataConnection(*base.transport_server(), peer));
+  ASSERT_EQ(base.transport_server()->IdleConnectionCount(peer), 1u);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/2);
+  const auto now = std::chrono::steady_clock::now();
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_release", /*uuid=*/77, /*block_ids=*/{0},
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
+
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({peer}, /*src_block_ids=*/{0}, /*dst_block_ids=*/{0});
+  ABSL_ASSERT_OK(session->AwaitForDone());
+
+  // The send's last op closes the idle connections to its peer before the
+  // send is done, so nothing is left once AwaitForDone() returns.
+  EXPECT_EQ(base.transport_server()->IdleConnectionCount(peer), 0u);
+}
+
+TEST(TransferSendSessionTest, PooledPolicyKeepsIdlePeerConnections) {
+  ScopedDataConnReuseEnv env(/*value=*/nullptr);
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  FakeSendBase receiver(/*num_layers=*/1, /*host_blocks=*/4);
+  const std::string peer =
+      absl::StrCat("127.0.0.1:", receiver.transport_server()->local_port());
+  ABSL_ASSERT_OK(SeedIdleDataConnection(*base.transport_server(), peer));
+  ASSERT_EQ(base.transport_server()->IdleConnectionCount(peer), 1u);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/2);
+  const auto now = std::chrono::steady_clock::now();
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_pooled", /*uuid=*/79, /*block_ids=*/{0},
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
+
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({peer}, /*src_block_ids=*/{0}, /*dst_block_ids=*/{0});
+  ABSL_ASSERT_OK(session->AwaitForDone());
+
+  EXPECT_EQ(base.transport_server()->IdleConnectionCount(peer), 1u);
+}
+
+TEST(TransferSendSessionTest,
+     PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush) {
+  ScopedDataConnReuseEnv env("per_transfer");
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  base.SetManualH2h(true);
+  FakeSendBase receiver(/*num_layers=*/1, /*host_blocks=*/4);
+  const std::string peer =
+      absl::StrCat("127.0.0.1:", receiver.transport_server()->local_port());
+  ABSL_ASSERT_OK(SeedIdleDataConnection(*base.transport_server(), peer));
+  ASSERT_EQ(base.transport_server()->IdleConnectionCount(peer), 1u);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/2);
+  const auto now = std::chrono::steady_clock::now();
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_cancel_release", /*uuid=*/80,
+      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
+      /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({peer}, /*src_block_ids=*/{0}, /*dst_block_ids=*/{0});
+  ASSERT_TRUE(base.WaitForH2hCalls(1, absl::Seconds(2)));
+
+  // Cancelling the send while its push runs starts draining it, but the
+  // push in flight keeps it from finishing, and nothing is released yet.
+  session->Finish(absl::CancelledError("consumer cancelled"));
+  EXPECT_FALSE(session->Done());
+  EXPECT_EQ(base.transport_server()->IdleConnectionCount(peer), 1u);
+
+  // Completing the push ends the send: its last op closes the idle
+  // connections to the consumer before the send is done.
+  base.CompleteH2h(0, std::vector<int>{0});
+  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_EQ(base.transport_server()->IdleConnectionCount(peer), 0u);
+}
+
+TEST(TransferSendSessionTest,
+     PooledPolicyKeepsIdlePeerConnectionsWhenCancelledMidPush) {
+  ScopedDataConnReuseEnv env(/*value=*/nullptr);
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  base.SetManualH2h(true);
+  FakeSendBase receiver(/*num_layers=*/1, /*host_blocks=*/4);
+  const std::string peer =
+      absl::StrCat("127.0.0.1:", receiver.transport_server()->local_port());
+  ABSL_ASSERT_OK(SeedIdleDataConnection(*base.transport_server(), peer));
+  ASSERT_EQ(base.transport_server()->IdleConnectionCount(peer), 1u);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/2);
+  const auto now = std::chrono::steady_clock::now();
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_cancel_pooled", /*uuid=*/81,
+      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
+      /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({peer}, /*src_block_ids=*/{0}, /*dst_block_ids=*/{0});
+  ASSERT_TRUE(base.WaitForH2hCalls(1, absl::Seconds(2)));
+
+  session->Finish(absl::CancelledError("consumer cancelled"));
+  base.CompleteH2h(0, std::vector<int>{0});
+  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
+
+  EXPECT_EQ(base.transport_server()->IdleConnectionCount(peer), 1u);
+}
+
+TEST(TransferSendSessionTest, CreateRejectsUnknownDataConnReuseValue) {
+  ScopedDataConnReuseEnv env("per-transfer");
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(&base, /*num_slots=*/2, /*max_blocks=*/2);
+  const auto now = std::chrono::steady_clock::now();
+
+  EXPECT_THAT(TransferSendSession::Create(
+                  &base, allocator.get(), "req_bad_policy", /*uuid=*/78,
+                  /*block_ids=*/{0},
+                  /*deadline=*/now + std::chrono::seconds(10),
+                  /*register_start=*/now),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       AllOf(HasSubstr("TPU_RAIDEN_DATA_CONN_REUSE"),
+                             HasSubstr("per-transfer"))));
+}
 
 TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
   FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);

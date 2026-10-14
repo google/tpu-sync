@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -29,6 +30,9 @@
 #include <grpcpp/grpcpp.h>
 #include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
+#include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
@@ -39,9 +43,11 @@
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/reshard/declaration_types.h"
+#include "tpu_sync/kv_cache/reshard/pool_reshard_planner.h"
 #include "tpu_sync/kv_cache/reshard/request_block_registry.h"
 #include "tpu_sync/kv_cache/reshard/reshard_client.h"
 #include "tpu_sync/kv_cache/reshard/reshard_control_pipe.h"
+#include "tpu_sync/kv_cache/reshard/work_unit_directory.h"
 #include "tpu_sync/proto/control_pipe.pb.h"
 #include "tpu_sync/proto/control_pipe.grpc.pb.h"
 #include "tpu_sync/rpc/controller_service.pb.h"
@@ -52,6 +58,8 @@ namespace kv_cache {
 namespace reshard {
 namespace {
 
+using ::absl_testing::StatusIs;
+using ::testing::AllOf;
 using ::testing::HasSubstr;
 
 RaidenId Unit(int rank) {
@@ -496,6 +504,41 @@ class ReshardStackTest : public ::testing::Test {
       coord->add_dst_skip_bytes(skip);
     }
     return HandleController(req.SerializeAsString());
+  }
+
+  // Rank r declares whole pages 2r and 2r+1 of the destination's four (v1
+  // "fa" spans from its source blocks 3+2r and 4+2r), so each rank pushes two
+  // (src, dst) block pairs to the destination and the receiver's expected
+  // push count depends on the plan's stream count. Plan it with
+  // Coordinate(req_id, uuid, 2, {7, 8, 9, 10}).
+  void RegisterTwoPagesPerRank(const std::string& req_id, int64_t uuid) {
+    RegisterGlobalSpans(0, req_id, uuid, {3, 4},
+                        {{/*src_ordinal=*/0, /*src_offset=*/0,
+                          /*dst_global_offset=*/0, /*size=*/1024},
+                         {1, 0, /*dst_global_offset=*/1024, 1024}});
+    RegisterGlobalSpans(1, req_id, uuid, {5, 6},
+                        {{0, 0, /*dst_global_offset=*/2048, 1024},
+                         {1, 0, /*dst_global_offset=*/3072, 1024}});
+  }
+
+  // The planner request the coordinator builds for
+  // Coordinate(req_id, uuid, 2, {7, 8, 9, 10}): no explicit stream count.
+  absl::StatusOr<PlanRequest> TwoRankPlanRequest(const std::string& req_id,
+                                                 int64_t uuid) {
+    PlanRequest request;
+    request.src_units = {Unit(0), Unit(1)};
+    request.dst_units = {DstUnit(0)};
+    ABSL_ASSIGN_OR_RETURN(
+        request.src_metadata,
+        service_->directory()->LocalMetadata(request.src_units));
+    ABSL_ASSIGN_OR_RETURN(
+        request.dst_metadata,
+        service_->directory()->LocalMetadata(request.dst_units));
+    request.req_id = req_id;
+    request.uuid = uuid;
+    request.dst_device_block_ids = {7, 8, 9, 10};
+    request.transfer_pool_tags = {"fa"};
+    return request;
   }
 
   FakeTransport transport_;
@@ -1794,6 +1837,113 @@ TEST_F(ReshardStackTest, LegacyCommandsFailClosed) {
   EXPECT_THAT(resp.message(),
               HasSubstr("Inter-controller reshard schedule registration is "
                         "retired"));
+}
+
+// Sets TPU_RAIDEN_TRANSFER_STREAMS for one test (unsets it when `value` is
+// null) and restores it afterwards. Planning reads it on the test thread;
+// the coordinator's dispatch threads are joined before Coordinate() returns.
+class ScopedTransferStreamsEnv {
+ public:
+  explicit ScopedTransferStreamsEnv(const char* value) {
+    if (const char* prev = std::getenv(kTransferStreamsEnvVar)) {
+      previous_ = prev;
+    }
+    if (value == nullptr) {
+      unsetenv(kTransferStreamsEnvVar);
+    } else {
+      setenv(kTransferStreamsEnvVar, value, 1);
+    }
+  }
+  ~ScopedTransferStreamsEnv() {
+    if (previous_.has_value()) {
+      setenv(kTransferStreamsEnvVar, previous_->c_str(), 1);
+    } else {
+      unsetenv(kTransferStreamsEnvVar);
+    }
+  }
+
+ private:
+  std::optional<std::string> previous_;
+};
+
+TEST_F(ReshardStackTest, UnsetTransferStreamsPlansOneStreamPerSourceRank) {
+  ScopedTransferStreamsEnv env(/*value=*/nullptr);
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterTwoPagesPerRank("req-streams-default", 70);
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-streams-default", 70, 2, {7, 8, 9, 10});
+  ASSERT_TRUE(resp.success()) << resp.message();
+
+  // One arm plus two sender dispatches, all carrying the admitted stream count.
+  ASSERT_EQ(transport_.calls_.size(), 3u);
+  for (const auto& [endpoint, payload] : transport_.calls_) {
+    tpu_sync::rpc::ControlRequest request;
+    ASSERT_TRUE(request.ParseFromString(payload));
+    EXPECT_EQ(request.start_transfer_request().parallelism(), 2) << endpoint;
+  }
+  // Two streams per rank: each rank's two block pairs arrive as two pushes.
+  tpu_sync::rpc::ControlRequest arm;
+  ASSERT_TRUE(arm.ParseFromString(transport_.calls_[0].second));
+  EXPECT_EQ(arm.start_transfer_request().pool_groups(0).expected_pushes(), 4);
+}
+
+TEST_F(ReshardStackTest, TransferStreamsEnvCapsPlanStreamsAndExpectedPushes) {
+  ScopedTransferStreamsEnv env("1");
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterTwoPagesPerRank("req-streams-env", 71);
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-streams-env", 71, 2, {7, 8, 9, 10});
+  ASSERT_TRUE(resp.success()) << resp.message();
+
+  // The receiver and both senders take the capped stream count from the plan.
+  ASSERT_EQ(transport_.calls_.size(), 3u);
+  for (const auto& [endpoint, payload] : transport_.calls_) {
+    tpu_sync::rpc::ControlRequest request;
+    ASSERT_TRUE(request.ParseFromString(payload));
+    EXPECT_EQ(request.start_transfer_request().parallelism(), 1) << endpoint;
+  }
+  // One stream per rank: each rank's two block pairs arrive as one push.
+  tpu_sync::rpc::ControlRequest arm;
+  ASSERT_TRUE(arm.ParseFromString(transport_.calls_[0].second));
+  EXPECT_EQ(arm.start_transfer_request().pool_groups(0).expected_pushes(), 2);
+}
+
+TEST_F(ReshardStackTest, ExplicitPlanParallelismOverridesTransferStreamsEnv) {
+  ScopedTransferStreamsEnv env("1");
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterTwoPagesPerRank("req-streams-explicit", 72);
+  absl::StatusOr<PlanRequest> request =
+      TwoRankPlanRequest("req-streams-explicit", 72);
+  ABSL_ASSERT_OK(request);
+  request->parallelism = 2;
+  const int claim_owner = 0;
+
+  absl::StatusOr<PoolReshardPlan> plan =
+      BuildPoolReshardPlan(*request, service_->registry(), &claim_owner);
+
+  ABSL_ASSERT_OK(plan);
+  EXPECT_EQ(plan->parallelism, 2);
+  EXPECT_EQ(plan->pool_groups[0].expected_pushes_by_dst.at(DstUnit(0)), 4);
+}
+
+TEST_F(ReshardStackTest, InvalidTransferStreamsEnvFailsThePlan) {
+  ScopedTransferStreamsEnv env("many");
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterTwoPagesPerRank("req-streams-invalid", 73);
+  absl::StatusOr<PlanRequest> request =
+      TwoRankPlanRequest("req-streams-invalid", 73);
+  ABSL_ASSERT_OK(request);
+  const int claim_owner = 0;
+
+  EXPECT_THAT(
+      BuildPoolReshardPlan(*request, service_->registry(), &claim_owner),
+      StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          AllOf(HasSubstr("TPU_RAIDEN_TRANSFER_STREAMS"), HasSubstr("many"))));
 }
 
 }  // namespace

@@ -133,6 +133,21 @@ struct PlanRequest {
   std::vector<int64_t> dst_skip_bytes;
 };
 
+// Environment variable that caps the TCP streams each sender opens per
+// (pool, peer) push when the consumer did not request a stream count:
+// positive integer, clamped to the admitted transfer parallelism (the source
+// rank count). Unset, empty or 0 keeps the historical default, one stream per
+// source rank; any other value fails the plan. Read on the store that plans
+// the transfer; both the senders and the receiver take the value from the
+// plan, so push accounting stays consistent.
+inline constexpr char kTransferStreamsEnvVar[] = "TPU_RAIDEN_TRANSFER_STREAMS";
+
+// Stream count a plan uses when the request leaves it unspecified: the env cap
+// above when set, otherwise `topology_parallelism`. InvalidArgumentError
+// naming the variable and the value when it is neither unset, empty, 0 nor a
+// positive integer.
+absl::StatusOr<int64_t> DefaultTransferStreams(int64_t topology_parallelism);
+
 // _build_byte_span_plan_claimed: validates, claims the registration
 // snapshot through `registry` under `claim_owner`, binds, and emits.
 // Failure does NOT roll back the claim — the caller abandons it

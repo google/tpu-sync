@@ -104,7 +104,9 @@ cc_library(
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
     ],
@@ -186,6 +188,20 @@ cc_binary(
 )
 
 cc_test(
+    name = "pool_reshard_planner_streams_test",
+    size = "small",
+    srcs = ["pool_reshard_planner_streams_test.cc"],
+    copts = RESHARD_COPTS,
+    features = ["-use_header_modules"],
+    deps = [
+        ":pool_reshard_planner",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "reshard_service_test",
     srcs = ["reshard_service_test.cc"],
     copts = RESHARD_COPTS,
@@ -195,10 +211,12 @@ cc_test(
     linkstatic = True,
     deps = [
         ":declaration_types",
+        ":pool_reshard_planner",
         ":request_block_registry",
         ":reshard_client",
         ":reshard_control_pipe",
         ":reshard_service",
+        ":work_unit_directory",
         "//tpu_sync/common:raiden_id",
         "//tpu_sync/common/control_pipe:control_pipe_interfaces",
         "//tpu_sync/common/control_pipe:control_pipe_types",
@@ -208,6 +226,9 @@ cc_test(
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",

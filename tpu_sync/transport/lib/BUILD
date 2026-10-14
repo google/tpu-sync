@@ -279,6 +279,7 @@ cc_test(
         "-fexceptions",
     ],
     features = ["-use_header_modules"],
+    local_defines = ["ABSL_DEFINE_UNQUALIFIED_STATUS_TESTING_MACROS"],
     deps = [
         ":chunk",
         ":chunk_serializer",

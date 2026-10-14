@@ -477,6 +477,46 @@ TEST_P(BlockTransportTest, PushAndPullCorrectness) {
   EXPECT_EQ(delegate2.data()[size - 1], 0xAB);
 }
 
+TEST_P(BlockTransportTest, CloseIdleConnectionsDropsPooledPushSockets) {
+  size_t size = 1024;
+  MockDelegate delegate1(size);
+  MockDelegate delegate2(size);
+  std::memset(delegate1.data(), 0xCD, size);
+  std::memset(delegate2.data(), 0x00, size);
+
+  BlockTransport transport1(&delegate1, 0);
+  BlockTransport transport2(&delegate2, 0);
+  BindControlChannels(&transport1, &delegate1, &transport2, &delegate2);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const std::string peer = absl::StrCat("localhost:", transport2.local_port());
+  EXPECT_EQ(transport1.IdleConnectionCount(peer), 0u);
+
+  // A completed push leaves its stream's socket idle in the pool.
+  auto push_res = transport1.SyncPush({peer}, /*src_block_ids=*/{0},
+                                      /*dst_block_ids=*/{}, /*parallelism=*/1,
+                                      MajorOrder::kLayerMajor, /*uuid=*/31,
+                                      /*layer_idx=*/-1);
+  ASSERT_TRUE(push_res.ok()) << push_res.status().message();
+  EXPECT_EQ(delegate2.data()[0], 0xCD);
+  EXPECT_EQ(transport1.IdleConnectionCount(peer), 1u);
+
+  // Releasing the peer closes it; nothing is left for a later borrow.
+  EXPECT_EQ(transport1.CloseIdleConnections(peer), 1u);
+  EXPECT_EQ(transport1.IdleConnectionCount(peer), 0u);
+  EXPECT_EQ(transport1.CloseIdleConnections(peer), 0u);
+
+  // The next push dials afresh and still lands.
+  std::memset(delegate2.data(), 0x00, size);
+  push_res = transport1.SyncPush({peer}, /*src_block_ids=*/{0},
+                                 /*dst_block_ids=*/{}, /*parallelism=*/1,
+                                 MajorOrder::kLayerMajor, /*uuid=*/32,
+                                 /*layer_idx=*/-1);
+  ASSERT_TRUE(push_res.ok()) << push_res.status().message();
+  EXPECT_EQ(delegate2.data()[0], 0xCD);
+  EXPECT_EQ(delegate2.data()[size - 1], 0xCD);
+  EXPECT_EQ(transport1.IdleConnectionCount(peer), 1u);
+}
+
 // Resolves chunks inside the block array named by `layer_idx`, so a test can
 // tell which of the receiver's arrays a push landed in.
 class LayerRoutedDelegate : public MockDelegate {

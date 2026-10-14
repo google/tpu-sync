@@ -14,19 +14,31 @@
 
 #include "tpu_sync/core/reshard_send_session.h"
 
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
+#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/transport/block_transport.h"
 
 namespace tpu_raiden {
 
@@ -37,10 +49,31 @@ struct ReshardSendSessionTestPeer {
       absl::Span<const int64_t> src_block_ids) {
     return ReshardSendSession::ValidatePlan(base, plan, src_block_ids);
   }
+
+  // Counts one (pool, peer) push of `session` in flight on `manager`, as
+  // ExecutePush and StartPoolPush do before issuing it. The executor's device
+  // copies are device-only, so deviceless tests drive the op accounting here.
+  static void BeginPush(ReshardSendSession& session,
+                        KVCacheManagerWithTransfer& manager) {
+    absl::MutexLock lock(session.mu_);
+    session.manager_ = &manager;
+    ++session.in_flight_;
+  }
+
+  // Ends that push the way its AsyncPush completion callback does.
+  static void CompletePush(ReshardSendSession& session,
+                           KVCacheManagerWithTransfer& manager,
+                           const absl::Status& status) {
+    session.RecordPushCompletion(manager, status);
+    session.EndOp();
+  }
 };
 
 namespace {
 
+using ::absl_testing::StatusIs;
+using ::testing::AllOf;
+using ::testing::HasSubstr;
 using ::tpu_sync::rpc::MEMORY_TYPE_HBM;
 using ::tpu_sync::rpc::StartTransferRequest;
 
@@ -241,6 +274,181 @@ TEST(ReshardSendSessionTest, IgnoresReceiverCoverageGap) {
   EXPECT_TRUE(ReshardSendSessionTestPeer::ValidatePlan(base, plan,
                                                        std::vector<int64_t>{0})
                   .ok());
+}
+
+// Sets TPU_RAIDEN_DATA_CONN_REUSE for one test (unsets it when `value` is
+// null) and restores it afterwards. Tests construct it before any manager or
+// session, so no other thread reads the environment meanwhile.
+class ScopedDataConnReuseEnv {
+ public:
+  explicit ScopedDataConnReuseEnv(const char* value) {
+    if (const char* prev = std::getenv(kName)) previous_ = prev;
+    if (value == nullptr) {
+      unsetenv(kName);
+    } else {
+      setenv(kName, value, 1);
+    }
+  }
+  ~ScopedDataConnReuseEnv() {
+    if (previous_.has_value()) {
+      setenv(kName, previous_->c_str(), 1);
+    } else {
+      unsetenv(kName);
+    }
+  }
+
+ private:
+  static constexpr char kName[] = "TPU_RAIDEN_DATA_CONN_REUSE";
+  std::optional<std::string> previous_;
+};
+
+// Completes one real push of block 0 from `sender` to `peer`, which leaves the
+// push stream's socket idle in `sender`'s connection pool.
+absl::Status SeedIdleDataConnection(transport::BlockTransport& sender,
+                                    const std::string& peer) {
+  return sender.SyncPush({peer}, /*src_block_ids=*/{0}, /*dst_block_ids=*/{0})
+      .status();
+}
+
+// A CPU-only manager; its base is the sender of the session under test.
+KVCacheManagerWithTransfer MakeTestManager() {
+  return KVCacheManagerWithTransfer(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/std::make_optional(4));
+}
+
+TEST(ReshardSendSessionTest,
+     PerTransferPolicyClosesIdlePeerConnectionsBeforeSettling) {
+  ScopedDataConnReuseEnv env("per_transfer");
+  KVCacheManagerWithTransfer manager = MakeTestManager();
+  kv_cache::KVCacheManagerBase receiver = MakeTestBase();
+  const std::string peer =
+      absl::StrCat("127.0.0.1:", receiver.transport_server()->local_port());
+  transport::BlockTransport& transport = *manager.base()->transport_server();
+  ABSL_ASSERT_OK(SeedIdleDataConnection(transport, peer));
+  ASSERT_EQ(transport.IdleConnectionCount(peer), 1u);
+  manager.base()->AttachPlaceholderDeviceHoldForTest();
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(manager.base(), /*num_slots=*/0,
+                                  /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(/*uuid=*/1201, /*dtype_tags=*/{""});
+  (*plan.mutable_shard_push_schedules())[0].mutable_entries(0)->set_dst_peer(
+      peer);
+  absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
+      ReshardSendSession::Create(
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          /*parallelism=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
+  ABSL_ASSERT_OK(session);
+  ReshardSendSessionTestPeer::BeginPush(**session, manager);
+
+  // The plan's only push completes on another thread, as its AsyncPush
+  // callback would. That push is the send's last op, so it closes the idle
+  // connections to its peer before the send settles: none is left once the
+  // send is done. This thread polls Done() instead of blocking in
+  // AwaitForDone(): a blocked waiter wakes too late to catch a release that
+  // trails the settle.
+  std::thread last_push([&session, &manager] {
+    ReshardSendSessionTestPeer::CompletePush(**session, manager,
+                                             absl::OkStatus());
+  });
+  while (!(*session)->Done()) {
+  }
+  EXPECT_EQ(transport.IdleConnectionCount(peer), 0u);
+  last_push.join();
+  ABSL_EXPECT_OK((*session)->AwaitForDone());
+}
+
+TEST(ReshardSendSessionTest,
+     PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush) {
+  ScopedDataConnReuseEnv env("per_transfer");
+  KVCacheManagerWithTransfer manager = MakeTestManager();
+  kv_cache::KVCacheManagerBase receiver = MakeTestBase();
+  const std::string peer =
+      absl::StrCat("127.0.0.1:", receiver.transport_server()->local_port());
+  transport::BlockTransport& transport = *manager.base()->transport_server();
+  ABSL_ASSERT_OK(SeedIdleDataConnection(transport, peer));
+  ASSERT_EQ(transport.IdleConnectionCount(peer), 1u);
+  manager.base()->AttachPlaceholderDeviceHoldForTest();
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(manager.base(), /*num_slots=*/0,
+                                  /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(/*uuid=*/1204, /*dtype_tags=*/{""});
+  (*plan.mutable_shard_push_schedules())[0].mutable_entries(0)->set_dst_peer(
+      peer);
+  absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
+      ReshardSendSession::Create(
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          /*parallelism=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
+  ABSL_ASSERT_OK(session);
+  ReshardSendSessionTestPeer::BeginPush(**session, manager);
+
+  // Cancelling the send while its push runs starts finalizing it, but the
+  // push in flight keeps it from settling, and nothing is released yet.
+  (*session)->Finish(absl::CancelledError("transfer cancelled"));
+  EXPECT_FALSE((*session)->Done());
+  EXPECT_EQ(transport.IdleConnectionCount(peer), 1u);
+  EXPECT_TRUE(manager.base()->HasActivePlan(plan.uuid()));
+
+  // The push's completion is the send's last op: it drops the plan and
+  // closes the idle connections to its peer, then the send settles.
+  ReshardSendSessionTestPeer::CompletePush(**session, manager,
+                                           absl::OkStatus());
+
+  EXPECT_TRUE((*session)->Done());
+  EXPECT_EQ(transport.IdleConnectionCount(peer), 0u);
+  EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
+}
+
+TEST(ReshardSendSessionTest, PooledPolicyKeepsIdlePeerConnections) {
+  ScopedDataConnReuseEnv env(/*value=*/nullptr);
+  KVCacheManagerWithTransfer manager = MakeTestManager();
+  kv_cache::KVCacheManagerBase receiver = MakeTestBase();
+  const std::string peer =
+      absl::StrCat("127.0.0.1:", receiver.transport_server()->local_port());
+  transport::BlockTransport& transport = *manager.base()->transport_server();
+  ABSL_ASSERT_OK(SeedIdleDataConnection(transport, peer));
+  ASSERT_EQ(transport.IdleConnectionCount(peer), 1u);
+  manager.base()->AttachPlaceholderDeviceHoldForTest();
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(manager.base(), /*num_slots=*/0,
+                                  /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(/*uuid=*/1202, /*dtype_tags=*/{""});
+  (*plan.mutable_shard_push_schedules())[0].mutable_entries(0)->set_dst_peer(
+      peer);
+  absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
+      ReshardSendSession::Create(
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          /*parallelism=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
+  ABSL_ASSERT_OK(session);
+
+  ReshardSendSessionTestPeer::BeginPush(**session, manager);
+  ReshardSendSessionTestPeer::CompletePush(**session, manager,
+                                           absl::OkStatus());
+
+  EXPECT_TRUE((*session)->Done());
+  EXPECT_EQ(transport.IdleConnectionCount(peer), 1u);
+}
+
+TEST(ReshardSendSessionTest, CreateRejectsUnknownDataConnReuseValue) {
+  ScopedDataConnReuseEnv env("per-transfer");
+  kv_cache::KVCacheManagerBase base = MakeTestBase();
+  base.AttachPlaceholderDeviceHoldForTest();
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      StagingBlockAllocator::Create(&base, /*num_slots=*/0, /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(/*uuid=*/1203, /*dtype_tags=*/{""});
+
+  EXPECT_THAT(
+      ReshardSendSession::Create(
+          &base, allocator.get(), std::vector<int64_t>{0}, /*parallelism=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10), plan),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               AllOf(HasSubstr("TPU_RAIDEN_DATA_CONN_REUSE"),
+                     HasSubstr("per-transfer"))));
+  EXPECT_FALSE(base.HasActivePlan(plan.uuid()));
 }
 
 }  // namespace

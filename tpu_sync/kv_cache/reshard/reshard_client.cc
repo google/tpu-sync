@@ -50,7 +50,7 @@ class RuntimeGrpcClient final : public GrpcControlPipeClient {
       const control_pipe::proto::ControlEnvelope& envelope,
       absl::Duration timeout) override {
     return SendRawWithConnectTimeout(endpoint, envelope, timeout,
-                                     absl::Seconds(1));
+                                     absl::Seconds(4));
   }
 };
 

@@ -141,7 +141,7 @@ class ReshardClient {
  public:
   // `client` is borrowed when non-null (tests); otherwise the client
   // owns a ControlPipeClient. Response timeout is 300 seconds; the owned gRPC
-  // client bounds channel readiness to 1 second and makes Controller lifecycle
+  // client bounds channel readiness to 4 seconds and makes Controller lifecycle
   // calls once. Other backends, borrowed clients and CallRaiden retain retries.
   explicit ReshardClient(std::string address,
                          ControlPipeClient* client = nullptr);

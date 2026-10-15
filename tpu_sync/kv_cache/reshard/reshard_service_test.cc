@@ -680,7 +680,7 @@ TEST(ReshardRuntimeRpcTest, CachedReadyChannelSurvivesServerDeathSafely) {
   server->Stop();
   const auto start = absl::Now();
   EXPECT_FALSE(client.GetRequestBlockStatus({}).ok());
-  EXPECT_LT(absl::Now() - start, absl::Seconds(2));
+  EXPECT_LT(absl::Now() - start, absl::Seconds(5));
   EXPECT_EQ(calls, 1);
 }
 
@@ -699,7 +699,7 @@ TEST(ReshardRuntimeRpcTest, DeadGrpcEndpointFailsBeforeSending) {
   ReshardClient client(endpoint);
   const auto start = absl::Now();
   auto result = client.GetRequestBlockStatus({});
-  EXPECT_LT(absl::Now() - start, absl::Seconds(2));
+  EXPECT_LT(absl::Now() - start, absl::Seconds(5));
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.status().message(), absl::StrCat(
       "Control RPC connection failed before sending request to ", endpoint));
@@ -744,7 +744,7 @@ TEST(ReshardRuntimeRpcTest, ResponseRetainsItsFullDeadline) {
       tpu_sync::rpc::ControllerResponse>([](const ControlContext&,
       const tpu_sync::rpc::ControllerRequest&)
       -> absl::StatusOr<tpu_sync::rpc::ControllerResponse> {
-    absl::SleepFor(absl::Milliseconds(1100));
+    absl::SleepFor(absl::Milliseconds(4100));
     tpu_sync::rpc::ControllerResponse response;
     response.set_success(true);
     return response;

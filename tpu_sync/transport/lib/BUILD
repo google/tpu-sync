@@ -158,7 +158,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
-        "@peregrine//peregrine/src/api:socket_util",
+        "@peregrine//peregrine/src/api/v1:socket_util",
     ],
 )
 
@@ -190,7 +190,7 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
-        "@peregrine//peregrine/src/api:socket_util",
+        "@peregrine//peregrine/src/api/v1:socket_util",
     ],
 )
 
@@ -259,29 +259,6 @@ cc_test(
 )
 
 cc_library(
-    name = "test_only_rate_limiter",
-    srcs = ["test_only_rate_limiter.cc"],
-    hdrs = ["test_only_rate_limiter.h"],
-    visibility = ["//visibility:public"],
-    deps = [
-        "@com_google_absl//absl/base:core_headers",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
-    ],
-)
-
-cc_test(
-    name = "test_only_rate_limiter_test",
-    srcs = ["test_only_rate_limiter_test.cc"],
-    deps = [
-        ":test_only_rate_limiter",
-        "@com_google_absl//absl/time",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-
-cc_library(
     name = "raw_buffer_transport",
     srcs = ["raw_buffer_transport.cc"],
     hdrs = ["raw_buffer_transport.h"],
@@ -295,7 +272,6 @@ cc_library(
         ":chunk_serializer",
         ":histogram",
         ":raw_buffer_transport_delegate",
-        ":test_only_rate_limiter",
         ":transport_adapter",
         "//tpu_sync/common:detached_thread_group",
         "//tpu_sync/core:numa_thread_pool",
@@ -326,7 +302,8 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
-        "@peregrine//peregrine/src/api:socket_util",
+        "@peregrine//peregrine/src/api/v1:rate_limiter",
+        "@peregrine//peregrine/src/api/v1:socket_util",
     ],
 )
 
@@ -370,7 +347,7 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
-        "@peregrine//peregrine/src/api:socket_util",
+        "@peregrine//peregrine/src/api/v1:socket_util",
     ],
 )
 

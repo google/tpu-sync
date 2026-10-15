@@ -57,7 +57,7 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
-#include "peregrine/src/api/socket_util.h"
+#include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -75,6 +75,9 @@
 
 namespace tpu_raiden::transport::lib {
 namespace {
+
+using ::peregrine::v1::ReadExact;
+using ::peregrine::v1::WriteExact;
 
 class ScopedEnvVar {
  public:
@@ -591,13 +594,12 @@ TEST_P(RawBufferTransportTest, RejectsWrappingAndOutOfBoundsPushAndPull) {
     header.uuid = 42;
 
     const auto s_header = SerializeChunkHeader(header);
-    ASSERT_OK(
-        ::peregrine::WriteExact(client_fd, s_header.data(), s_header.size()));
+    ASSERT_OK(WriteExact(client_fd, s_header.data(), s_header.size()));
 
     // Server should reject destination out of bounds and close socket without
     // reading/writing payload or sending ACK=1.
     uint8_t ack = 0;
-    const auto read_res = ::peregrine::ReadExact(client_fd, &ack, 1);
+    const auto read_res = ReadExact(client_fd, &ack, 1);
     EXPECT_FALSE(read_res.ok());
     close(client_fd);
   }
@@ -618,14 +620,12 @@ TEST_P(RawBufferTransportTest, RejectsWrappingAndOutOfBoundsPushAndPull) {
     header.uuid = 43;
 
     const auto s_header = SerializeChunkHeader(header);
-    ASSERT_OK(
-        ::peregrine::WriteExact(client_fd, s_header.data(), s_header.size()));
+    ASSERT_OK(WriteExact(client_fd, s_header.data(), s_header.size()));
 
     // Server should reject source out of bounds and close socket without
     // sending data.
     std::vector<uint8_t> dummy(kWrapSize);
-    const auto read_res =
-        ::peregrine::ReadExact(client_fd, dummy.data(), dummy.size());
+    const auto read_res = ReadExact(client_fd, dummy.data(), dummy.size());
     EXPECT_FALSE(read_res.ok());
     close(client_fd);
   }
@@ -1868,8 +1868,7 @@ class PeerIpRecordingServer {
 
   absl::Status ServeOneRequest(int fd) {
     char header_buf[kChunkHeaderSize];
-    ABSL_RETURN_IF_ERROR(
-        ::peregrine::ReadExact(fd, header_buf, sizeof(header_buf)));
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, header_buf, sizeof(header_buf)));
     ABSL_ASSIGN_OR_RETURN(const ChunkHeader header,
                           DeserializeChunkHeader(header_buf));
     switch (header.op) {
@@ -1877,8 +1876,7 @@ class PeerIpRecordingServer {
         return ReadPayloadAndAck(fd, header.count_or_size);
       case kOpBufferPushBatched: {
         std::vector<char> metadata(header.count_or_size * header.metadata_size);
-        ABSL_RETURN_IF_ERROR(
-            ::peregrine::ReadExact(fd, metadata.data(), metadata.size()));
+        ABSL_RETURN_IF_ERROR(ReadExact(fd, metadata.data(), metadata.size()));
         size_t total_bytes = 0;
         for (uint32_t i = 0; i < header.count_or_size; ++i) {
           ABSL_ASSIGN_OR_RETURN(
@@ -1894,8 +1892,7 @@ class PeerIpRecordingServer {
       }
       case kOpBufferPull:
         CHECK_LE(header.count_or_size, pull_payload_.size());
-        return ::peregrine::WriteExact(fd, pull_payload_.data(),
-                                       header.count_or_size);
+        return WriteExact(fd, pull_payload_.data(), header.count_or_size);
       default:
         return absl::UnimplementedError(
             absl::StrCat("unexpected op ", header.op));
@@ -1904,14 +1901,13 @@ class PeerIpRecordingServer {
 
   absl::Status ReadPayloadAndAck(int fd, size_t size_bytes) {
     std::vector<uint8_t> payload(size_bytes);
-    ABSL_RETURN_IF_ERROR(
-        ::peregrine::ReadExact(fd, payload.data(), payload.size()));
+    ABSL_RETURN_IF_ERROR(ReadExact(fd, payload.data(), payload.size()));
     {
       absl::MutexLock lock(mu_);
       received_.insert(received_.end(), payload.begin(), payload.end());
     }
     const uint8_t ack = 1;
-    return ::peregrine::WriteExact(fd, &ack, 1);
+    return WriteExact(fd, &ack, 1);
   }
 
   const std::vector<uint8_t> pull_payload_;

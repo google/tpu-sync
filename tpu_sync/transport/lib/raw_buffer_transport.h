@@ -37,6 +37,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "grpcpp/channel.h"
+#include "peregrine/src/api/v1/rate_limiter.h"
 #include "tpu_sync/common/detached_thread_group.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -45,7 +46,6 @@
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
-#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden::transport::lib {
@@ -168,8 +168,9 @@ class RawBufferTransport final {
                                              absl::string_view client_key,
                                              absl::string_view peer_target);
 
-  void SetTestOnlyRateLimiters(std::shared_ptr<TestOnlyRateLimiter> egress,
-                               std::shared_ptr<TestOnlyRateLimiter> ingress);
+  void SetTestOnlyRateLimiters(
+      std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> egress,
+      std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> ingress);
 
  private:
   // Pulls a buffer request from `peer` over a borrowed TCP connection.
@@ -241,12 +242,14 @@ class RawBufferTransport final {
   // Note: Google3's libc++ does not implement the C++20
   // std::atomic<std::shared_ptr<T>> specialization, and atomic raw pointers
   // allow lock-free relaxed loads on the socket hot path.
-  std::shared_ptr<TestOnlyRateLimiter> test_only_egress_rate_limiter_ = nullptr;
-  std::shared_ptr<TestOnlyRateLimiter> test_only_ingress_rate_limiter_ =
-      nullptr;
-  std::atomic<TestOnlyRateLimiter*> test_only_egress_rate_limiter_raw_{nullptr};
-  std::atomic<TestOnlyRateLimiter*> test_only_ingress_rate_limiter_raw_{
-      nullptr};
+  std::shared_ptr<peregrine::v1::TestOnlyRateLimiter>
+      test_only_egress_rate_limiter_ = nullptr;
+  std::shared_ptr<peregrine::v1::TestOnlyRateLimiter>
+      test_only_ingress_rate_limiter_ = nullptr;
+  std::atomic<peregrine::v1::TestOnlyRateLimiter*>
+      test_only_egress_rate_limiter_raw_{nullptr};
+  std::atomic<peregrine::v1::TestOnlyRateLimiter*>
+      test_only_ingress_rate_limiter_raw_{nullptr};
 
   std::thread listener_thread_;
   telemetry::RaidenMetricStore* store_ = nullptr;

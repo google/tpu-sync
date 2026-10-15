@@ -32,6 +32,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/types/span.h"
+#include "peregrine/src/api/v1/rate_limiter.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
@@ -40,7 +41,6 @@
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/service.grpc.pb.h"
 #include "tpu_sync/transport/lib/socket_transport_adapter.h"
-#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 #include "tpu_sync/transport/lib/transport_metrics_exporter.h"
 
@@ -207,8 +207,8 @@ class BlockTransport final {
   }
 
   void SetTestOnlyRateLimiters(
-      std::shared_ptr<lib::TestOnlyRateLimiter> egress,
-      std::shared_ptr<lib::TestOnlyRateLimiter> ingress) {
+      std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> egress,
+      std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> ingress) {
     raw_transport_.SetTestOnlyRateLimiters(std::move(egress),
                                            std::move(ingress));
   }

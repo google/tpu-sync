@@ -44,7 +44,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "peregrine/src/api/socket_util.h"
+#include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/mock_metrics_backend.h"
 #include "tpu_sync/transport/lib/chunk.h"
@@ -57,6 +57,8 @@ namespace {
 
 using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
+using ::peregrine::v1::ReadExact;
+using ::peregrine::v1::WriteExact;
 using ::testing::_;
 using ::testing::ElementsAre;
 using ::testing::Gt;
@@ -150,23 +152,19 @@ TEST(SocketTransportAdapterTest, PostSocketPushOp1Success) {
       allocated_ids[i] = static_cast<int>(100 + i);
     }
     const std::vector<uint8_t> s_ids = SerializeBlockIds(allocated_ids);
-    if (auto s = ::peregrine::WriteExact(client_fd, s_ids.data(), s_ids.size());
-        !s.ok()) {
+    if (auto s = WriteExact(client_fd, s_ids.data(), s_ids.size()); !s.ok()) {
       return s;
     }
 
     for (size_t i = 0; i < header.count_or_size; ++i) {
       uint8_t size_buf[kChunkSizeFieldSize];
-      if (auto s =
-              ::peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf));
-          !s.ok()) {
+      if (auto s = ReadExact(client_fd, size_buf, sizeof(size_buf)); !s.ok()) {
         return s;
       }
       const uint32_t chunk_size = DeserializeChunkSize(size_buf);
       std::vector<uint8_t> payload(chunk_size);
       if (chunk_size > 0) {
-        if (auto s = ::peregrine::ReadExact(client_fd, payload.data(),
-                                            payload.size());
+        if (auto s = ReadExact(client_fd, payload.data(), payload.size());
             !s.ok()) {
           return s;
         }
@@ -174,7 +172,7 @@ TEST(SocketTransportAdapterTest, PostSocketPushOp1Success) {
     }
 
     uint8_t ack = 1;
-    return ::peregrine::WriteExact(client_fd, &ack, 1);
+    return WriteExact(client_fd, &ack, 1);
   };
 
   RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
@@ -219,40 +217,35 @@ TEST(SocketTransportAdapterTest, PostSocketPushOp6ExplicitPushSuccess) {
     }
     const size_t count = header.count_or_size;
     std::vector<uint8_t> ids_buf(count * sizeof(uint32_t));
-    if (auto s =
-            ::peregrine::ReadExact(client_fd, ids_buf.data(), ids_buf.size());
+    if (auto s = ReadExact(client_fd, ids_buf.data(), ids_buf.size());
         !s.ok()) {
       return s;
     }
-    if (auto s =
-            ::peregrine::ReadExact(client_fd, ids_buf.data(), ids_buf.size());
+    if (auto s = ReadExact(client_fd, ids_buf.data(), ids_buf.size());
         !s.ok()) {
       return s;
     }
     uint8_t ack = 1;
-    if (auto s = ::peregrine::WriteExact(client_fd, &ack, 1); !s.ok()) {
+    if (auto s = WriteExact(client_fd, &ack, 1); !s.ok()) {
       return s;
     }
 
     for (size_t i = 0; i < count; ++i) {
       uint8_t size_buf[kChunkSizeFieldSize];
-      if (auto s =
-              ::peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf));
-          !s.ok()) {
+      if (auto s = ReadExact(client_fd, size_buf, sizeof(size_buf)); !s.ok()) {
         return s;
       }
       const uint32_t chunk_size = DeserializeChunkSize(size_buf);
       std::vector<uint8_t> payload(chunk_size);
       if (chunk_size > 0) {
-        if (auto s = ::peregrine::ReadExact(client_fd, payload.data(),
-                                            payload.size());
+        if (auto s = ReadExact(client_fd, payload.data(), payload.size());
             !s.ok()) {
           return s;
         }
       }
     }
 
-    return ::peregrine::WriteExact(client_fd, &ack, 1);
+    return WriteExact(client_fd, &ack, 1);
   };
 
   RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
@@ -300,20 +293,16 @@ TEST(SocketTransportAdapterTest, PostSocketPullOp2Success) {
     // Echo back pull response header with identical count_or_size and flags.
     ChunkHeader resp = header;
     const auto s_resp = SerializeChunkHeader(resp);
-    if (auto s =
-            ::peregrine::WriteExact(client_fd, s_resp.data(), s_resp.size());
-        !s.ok()) {
+    if (auto s = WriteExact(client_fd, s_resp.data(), s_resp.size()); !s.ok()) {
       return s;
     }
 
     std::vector<uint8_t> payload = {1, 2, 3, 4};
     const auto s_size = SerializeChunkSize(payload.size());
-    if (auto s =
-            ::peregrine::WriteExact(client_fd, s_size.data(), s_size.size());
-        !s.ok()) {
+    if (auto s = WriteExact(client_fd, s_size.data(), s_size.size()); !s.ok()) {
       return s;
     }
-    return ::peregrine::WriteExact(client_fd, payload.data(), payload.size());
+    return WriteExact(client_fd, payload.data(), payload.size());
   };
 
   RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
@@ -385,8 +374,8 @@ TEST(SocketTransportAdapterTest,
     std::vector<int> allocated_ids(header.count_or_size, 200);
     const std::vector<uint8_t> serialized_ids =
         SerializeBlockIds(allocated_ids);
-    if (absl::Status status = peregrine::WriteExact(
-            client_fd, serialized_ids.data(), serialized_ids.size());
+    if (absl::Status status =
+            WriteExact(client_fd, serialized_ids.data(), serialized_ids.size());
         !status.ok()) {
       return status;
     }
@@ -394,7 +383,7 @@ TEST(SocketTransportAdapterTest,
     for (size_t i = 0; i < header.count_or_size; ++i) {
       uint8_t size_buf[kChunkSizeFieldSize];
       if (absl::Status status =
-              peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf));
+              ReadExact(client_fd, size_buf, sizeof(size_buf));
           !status.ok()) {
         return status;
       }
@@ -402,7 +391,7 @@ TEST(SocketTransportAdapterTest,
       std::vector<uint8_t> payload(chunk_size);
       if (chunk_size > 0) {
         if (absl::Status status =
-                peregrine::ReadExact(client_fd, payload.data(), payload.size());
+                ReadExact(client_fd, payload.data(), payload.size());
             !status.ok()) {
           return status;
         }
@@ -410,7 +399,7 @@ TEST(SocketTransportAdapterTest,
     }
 
     uint8_t ack = 1;
-    return peregrine::WriteExact(client_fd, &ack, 1);
+    return WriteExact(client_fd, &ack, 1);
   };
 
   RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
@@ -476,8 +465,8 @@ TEST(SocketTransportAdapterTest,
     const ChunkHeader response = header;
     const absl::InlinedVector<char, kChunkHeaderSize> serialized_header =
         SerializeChunkHeader(response);
-    if (absl::Status status = peregrine::WriteExact(
-            client_fd, serialized_header.data(), serialized_header.size());
+    if (absl::Status status = WriteExact(client_fd, serialized_header.data(),
+                                         serialized_header.size());
         !status.ok()) {
       return status;
     }
@@ -485,12 +474,12 @@ TEST(SocketTransportAdapterTest,
     std::vector<uint8_t> payload = {1, 2, 3, 4};
     const std::array<uint8_t, kChunkSizeFieldSize> serialized_size =
         SerializeChunkSize(payload.size());
-    if (absl::Status status = peregrine::WriteExact(
-            client_fd, serialized_size.data(), serialized_size.size());
+    if (absl::Status status = WriteExact(client_fd, serialized_size.data(),
+                                         serialized_size.size());
         !status.ok()) {
       return status;
     }
-    return peregrine::WriteExact(client_fd, payload.data(), payload.size());
+    return WriteExact(client_fd, payload.data(), payload.size());
   };
 
   RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
@@ -562,8 +551,8 @@ TEST(SocketTransportAdapterTest,
     std::vector<int> allocated_ids(header.count_or_size, 200);
     const std::vector<uint8_t> serialized_ids =
         SerializeBlockIds(allocated_ids);
-    if (absl::Status status = peregrine::WriteExact(
-            client_fd, serialized_ids.data(), serialized_ids.size());
+    if (absl::Status status =
+            WriteExact(client_fd, serialized_ids.data(), serialized_ids.size());
         !status.ok()) {
       return status;
     }
@@ -571,7 +560,7 @@ TEST(SocketTransportAdapterTest,
     for (size_t i = 0; i < header.count_or_size; ++i) {
       uint8_t size_buf[kChunkSizeFieldSize];
       if (absl::Status status =
-              peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf));
+              ReadExact(client_fd, size_buf, sizeof(size_buf));
           !status.ok()) {
         return status;
       }
@@ -579,7 +568,7 @@ TEST(SocketTransportAdapterTest,
       std::vector<uint8_t> payload(chunk_size);
       if (chunk_size > 0) {
         if (absl::Status status =
-                peregrine::ReadExact(client_fd, payload.data(), payload.size());
+                ReadExact(client_fd, payload.data(), payload.size());
             !status.ok()) {
           return status;
         }
@@ -595,7 +584,7 @@ TEST(SocketTransportAdapterTest,
     }
 
     uint8_t ack = 1;
-    return peregrine::WriteExact(client_fd, &ack, 1);
+    return WriteExact(client_fd, &ack, 1);
   };
 
   RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
@@ -705,19 +694,15 @@ TEST(SocketTransportAdapterTest, SourceBindDisabledWhenEnvUnsetOrZero) {
     observed_peer_ip = GetPeerIp(client_fd);
     ChunkHeader resp = header;
     const auto s_resp = SerializeChunkHeader(resp);
-    if (auto s =
-            ::peregrine::WriteExact(client_fd, s_resp.data(), s_resp.size());
-        !s.ok()) {
+    if (auto s = WriteExact(client_fd, s_resp.data(), s_resp.size()); !s.ok()) {
       return s;
     }
     std::vector<uint8_t> payload = {9, 8, 7, 6};
     const auto s_size = SerializeChunkSize(payload.size());
-    if (auto s =
-            ::peregrine::WriteExact(client_fd, s_size.data(), s_size.size());
-        !s.ok()) {
+    if (auto s = WriteExact(client_fd, s_size.data(), s_size.size()); !s.ok()) {
       return s;
     }
-    return ::peregrine::WriteExact(client_fd, payload.data(), payload.size());
+    return WriteExact(client_fd, payload.data(), payload.size());
   };
 
   RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
@@ -761,19 +746,15 @@ TEST(SocketTransportAdapterTest, SourceBindEnabledWithEnableSourceIpBindEnv) {
     observed_peer_ip = GetPeerIp(client_fd);
     ChunkHeader resp = header;
     const auto s_resp = SerializeChunkHeader(resp);
-    if (auto s =
-            ::peregrine::WriteExact(client_fd, s_resp.data(), s_resp.size());
-        !s.ok()) {
+    if (auto s = WriteExact(client_fd, s_resp.data(), s_resp.size()); !s.ok()) {
       return s;
     }
     std::vector<uint8_t> payload = {5, 6, 7, 8};
     const auto s_size = SerializeChunkSize(payload.size());
-    if (auto s =
-            ::peregrine::WriteExact(client_fd, s_size.data(), s_size.size());
-        !s.ok()) {
+    if (auto s = WriteExact(client_fd, s_size.data(), s_size.size()); !s.ok()) {
       return s;
     }
-    return ::peregrine::WriteExact(client_fd, payload.data(), payload.size());
+    return WriteExact(client_fd, payload.data(), payload.size());
   };
 
   RawBufferTransport server_transport(/*delegate=*/nullptr, /*local_port=*/0,
@@ -898,19 +879,15 @@ class PeerIpRecordingPullServer {
       observed_peer_ips_.push_back(GetPeerIp(client_fd));
     }
     const auto s_resp = SerializeChunkHeader(header);
-    if (auto s =
-            ::peregrine::WriteExact(client_fd, s_resp.data(), s_resp.size());
-        !s.ok()) {
+    if (auto s = WriteExact(client_fd, s_resp.data(), s_resp.size()); !s.ok()) {
       return s;
     }
     std::vector<uint8_t> payload = {5, 6, 7, 8};
     const auto s_size = SerializeChunkSize(payload.size());
-    if (auto s =
-            ::peregrine::WriteExact(client_fd, s_size.data(), s_size.size());
-        !s.ok()) {
+    if (auto s = WriteExact(client_fd, s_size.data(), s_size.size()); !s.ok()) {
       return s;
     }
-    return ::peregrine::WriteExact(client_fd, payload.data(), payload.size());
+    return WriteExact(client_fd, payload.data(), payload.size());
   }
 
   absl::Mutex mu_;
@@ -1156,15 +1133,11 @@ TEST(SocketTransportAdapterTest, PullTimesOutWhenPayloadReadStalls) {
     resp_header.flags = header.flags;
     resp_header.count_or_size = header.count_or_size;
     const auto s_resp = SerializeChunkHeader(resp_header);
-    if (auto s =
-            ::peregrine::WriteExact(client_fd, s_resp.data(), s_resp.size());
-        !s.ok()) {
+    if (auto s = WriteExact(client_fd, s_resp.data(), s_resp.size()); !s.ok()) {
       return s;
     }
     const auto s_size = SerializeChunkSize(4);
-    if (auto s =
-            ::peregrine::WriteExact(client_fd, s_size.data(), s_size.size());
-        !s.ok()) {
+    if (auto s = WriteExact(client_fd, s_size.data(), s_size.size()); !s.ok()) {
       return s;
     }
     absl::SleepFor(absl::Milliseconds(500));
@@ -1217,21 +1190,19 @@ TEST(SocketTransportAdapterTest, WorkerCountGrowsPerPeer) {
     const size_t count = header.count_or_size;
     std::vector<int> allocated_ids(count, 100);
     const std::vector<uint8_t> s_ids = SerializeBlockIds(allocated_ids);
-    ABSL_RETURN_IF_ERROR(
-        ::peregrine::WriteExact(client_fd, s_ids.data(), s_ids.size()));
+    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s_ids.data(), s_ids.size()));
     for (size_t i = 0; i < count; ++i) {
       uint8_t size_buf[kChunkSizeFieldSize];
-      ABSL_RETURN_IF_ERROR(
-          ::peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf)));
+      ABSL_RETURN_IF_ERROR(ReadExact(client_fd, size_buf, sizeof(size_buf)));
       const uint32_t chunk_size = DeserializeChunkSize(size_buf);
       std::vector<uint8_t> payload(chunk_size);
       if (chunk_size > 0) {
         ABSL_RETURN_IF_ERROR(
-            ::peregrine::ReadExact(client_fd, payload.data(), payload.size()));
+            ReadExact(client_fd, payload.data(), payload.size()));
       }
     }
     uint8_t ack = 1;
-    return ::peregrine::WriteExact(client_fd, &ack, 1);
+    return WriteExact(client_fd, &ack, 1);
   };
   RawBufferTransport server1(/*delegate=*/nullptr, /*local_port=*/0, {},
                              server_handler);
@@ -1286,21 +1257,19 @@ TEST(SocketTransportAdapterTest, WorkerCountCappedAtMaxSocketWorkers) {
     const size_t count = header.count_or_size;
     std::vector<int> allocated_ids(count, 100);
     const std::vector<uint8_t> s_ids = SerializeBlockIds(allocated_ids);
-    ABSL_RETURN_IF_ERROR(
-        ::peregrine::WriteExact(client_fd, s_ids.data(), s_ids.size()));
+    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s_ids.data(), s_ids.size()));
     for (size_t i = 0; i < count; ++i) {
       uint8_t size_buf[kChunkSizeFieldSize];
-      ABSL_RETURN_IF_ERROR(
-          ::peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf)));
+      ABSL_RETURN_IF_ERROR(ReadExact(client_fd, size_buf, sizeof(size_buf)));
       const uint32_t chunk_size = DeserializeChunkSize(size_buf);
       std::vector<uint8_t> payload(chunk_size);
       if (chunk_size > 0) {
         ABSL_RETURN_IF_ERROR(
-            ::peregrine::ReadExact(client_fd, payload.data(), payload.size()));
+            ReadExact(client_fd, payload.data(), payload.size()));
       }
     }
     uint8_t ack = 1;
-    return ::peregrine::WriteExact(client_fd, &ack, 1);
+    return WriteExact(client_fd, &ack, 1);
   };
   RawBufferTransport server1(/*delegate=*/nullptr, /*local_port=*/0, {},
                              server_handler);
@@ -1487,21 +1456,19 @@ TEST(SocketTransportAdapterTest,
     const size_t count = header.count_or_size;
     std::vector<int> allocated_ids(count, 100);
     const std::vector<uint8_t> s_ids = SerializeBlockIds(allocated_ids);
-    ABSL_RETURN_IF_ERROR(
-        ::peregrine::WriteExact(client_fd, s_ids.data(), s_ids.size()));
+    ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s_ids.data(), s_ids.size()));
     for (size_t i = 0; i < count; ++i) {
       uint8_t size_buf[kChunkSizeFieldSize];
-      ABSL_RETURN_IF_ERROR(
-          ::peregrine::ReadExact(client_fd, size_buf, sizeof(size_buf)));
+      ABSL_RETURN_IF_ERROR(ReadExact(client_fd, size_buf, sizeof(size_buf)));
       const uint32_t chunk_size = DeserializeChunkSize(size_buf);
       std::vector<uint8_t> payload(chunk_size);
       if (chunk_size > 0) {
         ABSL_RETURN_IF_ERROR(
-            ::peregrine::ReadExact(client_fd, payload.data(), payload.size()));
+            ReadExact(client_fd, payload.data(), payload.size()));
       }
     }
     uint8_t ack = 1;
-    return ::peregrine::WriteExact(client_fd, &ack, 1);
+    return WriteExact(client_fd, &ack, 1);
   };
 
   RawBufferTransport server_transport1(/*delegate=*/nullptr, /*local_port=*/0,
@@ -1560,8 +1527,7 @@ TEST(SocketTransportAdapterTest, PushTimesOutWhenPayloadWriteStalls) {
     }
     std::vector<int> allocated_ids(header.count_or_size, 100);
     const std::vector<uint8_t> s_ids = SerializeBlockIds(allocated_ids);
-    if (auto s = ::peregrine::WriteExact(client_fd, s_ids.data(), s_ids.size());
-        !s.ok()) {
+    if (auto s = WriteExact(client_fd, s_ids.data(), s_ids.size()); !s.ok()) {
       return s;
     }
     absl::SleepFor(absl::Milliseconds(600));

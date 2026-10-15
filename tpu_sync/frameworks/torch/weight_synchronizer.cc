@@ -28,10 +28,10 @@
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "peregrine/src/api/v1/rate_limiter.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
-#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 #ifndef WITHOUT_PYTHON
@@ -214,14 +214,14 @@ size_t WeightSynchronizer::slice_byte_size() const {
 void WeightSynchronizer::test_only_set_bandwidth_limit(
     double test_only_simulated_egress_gbps,
     double test_only_simulated_ingress_gbps) {
-  std::shared_ptr<transport::lib::TestOnlyRateLimiter> egress_limiter;
+  std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> egress_limiter;
   if (test_only_simulated_egress_gbps > 0.0) {
-    egress_limiter = std::make_shared<transport::lib::TestOnlyRateLimiter>(
+    egress_limiter = std::make_shared<peregrine::v1::TestOnlyRateLimiter>(
         static_cast<uint64_t>(test_only_simulated_egress_gbps * 1e9 / 8.0));
   }
-  std::shared_ptr<transport::lib::TestOnlyRateLimiter> ingress_limiter;
+  std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> ingress_limiter;
   if (test_only_simulated_ingress_gbps > 0.0) {
-    ingress_limiter = std::make_shared<transport::lib::TestOnlyRateLimiter>(
+    ingress_limiter = std::make_shared<peregrine::v1::TestOnlyRateLimiter>(
         static_cast<uint64_t>(test_only_simulated_ingress_gbps * 1e9 / 8.0));
   }
   base_->SetTestOnlyRateLimiters(std::move(egress_limiter),

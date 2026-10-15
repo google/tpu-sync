@@ -32,6 +32,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "peregrine/src/api/v1/rate_limiter.h"
 #include "xla/future.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -40,7 +41,6 @@
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
-#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 
 namespace tpu_raiden {
 
@@ -126,8 +126,8 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   virtual void ForgetPushProgress(uint64_t uuid);
 
   void SetTestOnlyRateLimiters(
-      std::shared_ptr<transport::lib::TestOnlyRateLimiter> egress,
-      std::shared_ptr<transport::lib::TestOnlyRateLimiter> ingress);
+      std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> egress,
+      std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> ingress);
 
   // Stops and joins the underlying raw transport server if active.
   void StopTransportServer();

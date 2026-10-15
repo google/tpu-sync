@@ -70,7 +70,8 @@
 #define IOV_MAX 1024
 #endif
 #include "absl/status/status_macros.h"
-#include "peregrine/src/api/socket_util.h"
+#include "peregrine/src/api/v1/rate_limiter.h"
+#include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -81,14 +82,14 @@
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/socket/util.h"
-#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 
 namespace tpu_raiden::transport::lib {
 
-using ::peregrine::ReadExact;
-using ::peregrine::ReadVExact;
-using ::peregrine::WriteExact;
-using ::peregrine::WriteVExact;
+using ::peregrine::v1::ReadExact;
+using ::peregrine::v1::ReadVExact;
+using ::peregrine::v1::TestOnlyRateLimiter;
+using ::peregrine::v1::WriteExact;
+using ::peregrine::v1::WriteVExact;
 using ::tpu_raiden::telemetry::ExtractFirstEndpointIp;
 using ::tpu_raiden::telemetry::MetricLabel;
 using ::tpu_raiden::telemetry::RaidenMetricStore;

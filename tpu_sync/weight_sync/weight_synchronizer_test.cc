@@ -37,6 +37,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "peregrine/src/api/v1/rate_limiter.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -52,7 +53,6 @@
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
-#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 ABSL_DECLARE_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size);
@@ -3181,7 +3181,7 @@ TEST_F(WeightSynchronizerTest,
   // Configure a simulated rate limiter of 10 MB/s (~50 ms per 500KB push)
   // to guarantee substantial concurrency overlap.
   auto egress_limiter =
-      std::make_shared<transport::lib::TestOnlyRateLimiter>(10000000);
+      std::make_shared<peregrine::v1::TestOnlyRateLimiter>(10'000'000);
   ws_source->SetTestOnlyRateLimiters(egress_limiter, /*ingress=*/nullptr);
 
   auto make_request = [&](uint64_t uuid) {

@@ -61,7 +61,6 @@ cc_library(
         "//tpu_sync/transport/lib:raw_buffer_transport",
         "//tpu_sync/transport/lib:service_cc_grpc",
         "//tpu_sync/transport/lib:socket_transport_adapter",
-        "//tpu_sync/transport/lib:test_only_rate_limiter",
         "//tpu_sync/transport/lib:transport_adapter",
         "//tpu_sync/transport/lib:transport_metrics_exporter",
         "//tpu_sync/transport/lib/socket:util",
@@ -78,7 +77,8 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
-        "@peregrine//peregrine/src/api:socket_util",
+        "@peregrine//peregrine/src/api/v1:rate_limiter",
+        "@peregrine//peregrine/src/api/v1:socket_util",
         "@xla//xla/tsl/concurrency:future",
     ],
 )
@@ -118,7 +118,7 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
-        "@peregrine//peregrine/src/api:socket_util",
+        "@peregrine//peregrine/src/api/v1:socket_util",
         "@xla//xla/tsl/platform:statusor",
     ],
 )
@@ -140,6 +140,6 @@ cc_binary(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
-        "@peregrine//peregrine/src/api:socket_util",
+        "@peregrine//peregrine/src/api/v1:socket_util",
     ],
 )

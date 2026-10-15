@@ -49,6 +49,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "peregrine/src/api/v1/rate_limiter.h"
 #include "xla/future.h"
 #include "xla/layout.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -68,7 +69,6 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
-#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 #include "tpu_sync/weight_sync/tiling_utils.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_listener.h"
 
@@ -2286,8 +2286,8 @@ size_t WeightSynchronizerBase::GetHostSize(size_t layer_idx,
 }
 
 void WeightSynchronizerBase::SetTestOnlyRateLimiters(
-    std::shared_ptr<transport::lib::TestOnlyRateLimiter> egress,
-    std::shared_ptr<transport::lib::TestOnlyRateLimiter> ingress) {
+    std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> egress,
+    std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> ingress) {
   RaidenManagerBase::SetTestOnlyRateLimiters(std::move(egress),
                                              std::move(ingress));
 }

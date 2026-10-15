@@ -66,15 +66,15 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "peregrine/src/api/socket_util.h"
+#include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 
 namespace {
 
-using ::peregrine::ReadExact;
-using ::peregrine::WriteExact;
-using ::peregrine::WriteVExact;
+using ::peregrine::v1::ReadExact;
+using ::peregrine::v1::WriteExact;
+using ::peregrine::v1::WriteVExact;
 using ::tpu_raiden::transport::lib::ChunkHeader;
 using ::tpu_raiden::transport::lib::DeserializeChunkHeader;
 using ::tpu_raiden::transport::lib::kChunkHeaderSize;

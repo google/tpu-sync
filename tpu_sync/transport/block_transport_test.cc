@@ -54,7 +54,7 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
-#include "peregrine/src/api/socket_util.h"
+#include "peregrine/src/api/v1/socket_util.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -72,6 +72,7 @@ namespace transport {
 namespace {
 
 using ::absl_testing::StatusIs;
+using ::peregrine::v1::ReadExact;
 using ::testing::Each;
 using ::testing::Eq;
 using ::testing::HasSubstr;
@@ -2116,7 +2117,7 @@ TEST(DecodeReadTimeoutTest, ExplicitPushBlockIdsReadTimesOut) {
             static_cast<ssize_t>(s_header.size()));
 
   uint8_t ack = 0;
-  EXPECT_THAT(::peregrine::ReadExact(fd, &ack, 1, /*timeout_ms=*/2000),
+  EXPECT_THAT(ReadExact(fd, &ack, 1, /*timeout_ms=*/2000),
               StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
   EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
 }
@@ -2158,8 +2159,7 @@ TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
             static_cast<ssize_t>(s_ids.size()));
 
   uint8_t handshake_ack = 0;
-  ABSL_ASSERT_OK(
-      ::peregrine::ReadExact(fd, &handshake_ack, 1, /*timeout_ms=*/2000));
+  ABSL_ASSERT_OK(ReadExact(fd, &handshake_ack, 1, /*timeout_ms=*/2000));
   EXPECT_EQ(handshake_ack, 1);
 
   // Send the 4-byte chunk size (64 bytes) and only 16 bytes of payload, then
@@ -2173,7 +2173,7 @@ TEST(DecodeReadTimeoutTest, PayloadReadTimesOut) {
       16);
 
   uint8_t final_ack = 0;
-  EXPECT_THAT(::peregrine::ReadExact(fd, &final_ack, 1, /*timeout_ms=*/2000),
+  EXPECT_THAT(ReadExact(fd, &final_ack, 1, /*timeout_ms=*/2000),
               StatusIs(absl::StatusCode::kInternal, HasSubstr("eof")));
   EXPECT_EQ(delegate.layer_completion_count(), 0);
   EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());

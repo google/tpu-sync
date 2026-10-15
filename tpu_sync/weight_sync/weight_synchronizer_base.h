@@ -36,6 +36,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "peregrine/src/api/v1/rate_limiter.h"
 #include "xla/future.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
@@ -46,7 +47,6 @@
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
-#include "tpu_sync/transport/lib/test_only_rate_limiter.h"
 
 namespace tpu_sync {
 namespace rpc {
@@ -307,8 +307,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   }
 
   void SetTestOnlyRateLimiters(
-      std::shared_ptr<transport::lib::TestOnlyRateLimiter> egress,
-      std::shared_ptr<transport::lib::TestOnlyRateLimiter> ingress);
+      std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> egress,
+      std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> ingress);
 
   void SetPipelineGroupSize(std::optional<size_t> group_size) {
     pipeline_group_size_override_ = group_size;

@@ -46,7 +46,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "peregrine/src/api/socket_util.h"
+#include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/telemetry/label_util.h"
@@ -64,10 +64,10 @@ namespace lib {
 
 namespace {
 
-using ::peregrine::ReadExact;
-using ::peregrine::ReadVExact;
-using ::peregrine::WriteExact;
-using ::peregrine::WriteVExact;
+using ::peregrine::v1::ReadExact;
+using ::peregrine::v1::ReadVExact;
+using ::peregrine::v1::WriteExact;
+using ::peregrine::v1::WriteVExact;
 using ::tpu_raiden::telemetry::ExtractFirstEndpointIp;
 using ::tpu_raiden::telemetry::MetricLabel;
 using ::tpu_raiden::telemetry::RaidenMetricStore;

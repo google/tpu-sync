@@ -37,6 +37,7 @@
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/escaping.h"
+#include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -1012,6 +1013,30 @@ KVCacheStore::~KVCacheStore() {
   }
 }
 
+bool KVCacheStore::IsTdsCaching() const {
+  if (backends_.size() <= 1 || backends_[1] == nullptr ||
+      !absl::EqualsIgnoreCase(backends_[1]->name(), "tds")) {
+    return false;
+  }
+  for (const auto& cfg : backend_configs_) {
+    auto it = cfg.properties.find("tds_transfer_route");
+    if (it != cfg.properties.end()) {
+      return !absl::EqualsIgnoreCase(it->second, "compat");
+    }
+  }
+  if (const auto* posix_store =
+          dynamic_cast<const backends::storage::PosixKVCacheStoreBackend*>(
+              backends_[1].get());
+      posix_store != nullptr && posix_store->storage_backend() != nullptr) {
+    const std::string route =
+        posix_store->storage_backend()->GetProperty("tds_transfer_route");
+    if (!route.empty()) {
+      return !absl::EqualsIgnoreCase(route, "compat");
+    }
+  }
+  return true;
+}
+
 absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
     const std::vector<std::string>& block_hashes, bool enable_global,
     bool pin_found) {
@@ -1053,14 +1078,21 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
   BlockSliceList accumulated_results;
   accumulated_results.reserve(block_hashes.size());
 
+  const bool is_tds_caching = IsTdsCaching();
   size_t start_idx = 0;
   for (size_t tier_idx = 0; tier_idx < backends_.size(); ++tier_idx) {
     const auto& backend = backends_[tier_idx];
     if (start_idx >= block_hashes.size()) break;
     if (!backend) continue;
 
+    LookupOptions tier_options = options;
+    if (is_tds_caching && tier_idx == 0) {
+      tier_options.enable_global = false;
+      tier_options.enable_interleaved_lookup = false;
+    }
+
     auto lookup_result = backend->Lookup(
-        absl::MakeSpan(block_hashes).subspan(start_idx), options);
+        absl::MakeSpan(block_hashes).subspan(start_idx), tier_options);
     if (!lookup_result.ok()) {
       if (!accumulated_results.empty() &&
           absl::IsNotFound(lookup_result.status())) {
@@ -1078,9 +1110,29 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
     }
 
     const auto& res = *lookup_result;
-    for (const auto& pair : res) {
-      accumulated_results.push_back(pair);
-      ++start_idx;
+    if (is_tds_caching && tier_idx == 0) {
+      size_t accepted = 0;
+      for (const auto& pair : res) {
+        if (pair.second.status != BlockStatus::HBM) {
+          break;
+        }
+        accumulated_results.push_back(pair);
+        ++start_idx;
+        ++accepted;
+      }
+      if (tier_options.pin_found && accepted < res.size()) {
+        std::vector<std::string> unaccepted_hashes;
+        unaccepted_hashes.reserve(res.size() - accepted);
+        for (size_t i = accepted; i < res.size(); ++i) {
+          unaccepted_hashes.push_back(res[i].first);
+        }
+        backend->Release(unaccepted_hashes);
+      }
+    } else {
+      for (const auto& pair : res) {
+        accumulated_results.push_back(pair);
+        ++start_idx;
+      }
     }
   }
 
@@ -1205,59 +1257,69 @@ absl::Status KVCacheStore::SaveLocal(
     }
     save_tracker_.AddPending(block_hashes);
   }
-
-  absl::StatusOr<std::vector<int>> host_blocks =
-      AllocateBlockIds(block_hashes.size());
-  if (!host_blocks.ok()) {
-    IncrementKvSaveBlocks(dp_rank_str_,
-                          telemetry::metric_labels::kTierLocalDram,
-                          absl::IsResourceExhausted(host_blocks.status())
-                              ? telemetry::metric_labels::kOutcomeRejected
-                              : telemetry::metric_labels::kOutcomeFailed,
-                          block_hashes.size());
-    save_tracker_.RemovePending(block_hashes);
-    return host_blocks.status();
-  }
-  const auto& host_block_ids = *host_blocks;
-
   std::shared_ptr<KVCacheStoreBackend> secondary_backend = nullptr;
   std::string secondary_backend_name;
   if (backends_.size() > 1 && backends_[1] != nullptr) {
     secondary_backend = backends_[1];
     secondary_backend_name = secondary_backend->name();
   }
+  const bool is_tds_backend = IsTdsCaching();
+
+  std::vector<int> host_block_ids;
+  if (!is_tds_backend) {
+    absl::StatusOr<std::vector<int>> host_blocks =
+        AllocateBlockIds(block_hashes.size());
+    if (!host_blocks.ok()) {
+      IncrementKvSaveBlocks(dp_rank_str_,
+                            telemetry::metric_labels::kTierLocalDram,
+                            absl::IsResourceExhausted(host_blocks.status())
+                                ? telemetry::metric_labels::kOutcomeRejected
+                                : telemetry::metric_labels::kOutcomeFailed,
+                            block_hashes.size());
+      save_tracker_.RemovePending(block_hashes);
+      return host_blocks.status();
+    }
+    host_block_ids = *std::move(host_blocks);
+  }
 
   if (secondary_backend != nullptr && !secondary_backend_name.empty()) {
     ::tpu_sync::proto::BackendTransferSpec spec;
     spec.set_name(secondary_backend_name);
 
-    // OFFLOAD: the HBM side is the source and the host-DRAM staging side is
-    // the destination. The staging blocks are deliberately retained on
-    // success -- they become the tier-0 host-resident copy below.
     const std::vector<int64_t> host_ids(host_block_ids.begin(),
                                         host_block_ids.end());
     tsl::Future<> future = raiden_controller_->TransferBackendBuffers(
         ::tpu_sync::proto::TRANSFER_DIR_OFFLOAD, block_hashes,
         /*hbm_block_ids=*/src_device_block_ids,
         /*host_block_ids=*/host_ids, {spec});
-    // Captures are copies only -- no `this`. The store can be destroyed while
-    // this transfer is in flight, so every touch of it goes through the
-    // lifetime fence. The fence is held only across the member accesses: the
-    // registry work further down runs on captured copies and must not block
-    // ~KVCacheStore behind a network round trip.
     future.OnReady([lifetime = lifetime_, wt_state = wt_state_,
                     host_ram_backend = backend(),
                     registry_client = registry_client_, raiden_id = raiden_id_,
-                    block_hashes, host_block_ids,
+                    is_tds_backend, block_hashes, host_block_ids,
                     src_device_block_ids](absl::Status status) {
       if (!status.ok()) {
         {
           absl::MutexLock lock(lifetime->mu);
           if (KVCacheStore* self = lifetime->store; self != nullptr) {
-            self->DeallocateBlockIds(host_block_ids);
+            if (!host_block_ids.empty()) {
+              self->DeallocateBlockIds(host_block_ids);
+            }
             MarkSaveFailed(self->save_tracker_, self->dp_rank_str_,
                            telemetry::metric_labels::kTierLocalDram,
                            block_hashes);
+          }
+        }
+        if (host_ram_backend != nullptr)
+          host_ram_backend->Release(block_hashes);
+        return;
+      }
+      if (is_tds_backend) {
+        {
+          absl::MutexLock lock(lifetime->mu);
+          if (KVCacheStore* self = lifetime->store; self != nullptr) {
+            MarkSaveDone(self->save_tracker_, self->dp_rank_str_,
+                         telemetry::metric_labels::kTierLocalDram,
+                         block_hashes);
           }
         }
         if (host_ram_backend != nullptr)
@@ -1509,30 +1571,31 @@ void KVCacheStore::LoadFromSecondaryBackend(
   // backend name carried in its slice.
   const std::shared_ptr<KVCacheStoreBackend>& secondary_backend = backends_[1];
   const RecallClock::time_point start_ts = RecallClock::now();
+  const bool is_tds_backend = IsTdsCaching();
 
   // Host staging blocks for the recall. May evict UNPINNED entries if short,
   // never pinned ones. Failure is reported through the tracker only, the same
   // way the peer path reports its own staging failure, so it is reported once.
-  absl::StatusOr<std::vector<int>> allocated =
-      AllocateBlockIds(block_hashes.size());
-  if (!allocated.ok()) {
-    LOG(WARNING) << "No host staging blocks for storage recall: "
-                 << allocated.status();
-    absl::MutexLock lock(mutex_);
-    MarkRecallFailed(load_tracker_, dp_rank_str_,
-                     telemetry::metric_labels::kTierSharedStorage,
-                     telemetry::metric_labels::kOutcomeStagingExhausted,
-                     block_hashes, start_ts);
-    return;
+  std::vector<int> staging_host_block_ids;
+  if (!is_tds_backend) {
+    absl::StatusOr<std::vector<int>> allocated =
+        AllocateBlockIds(block_hashes.size());
+    if (!allocated.ok()) {
+      LOG(WARNING) << "No host staging blocks for storage recall: "
+                   << allocated.status();
+      absl::MutexLock lock(mutex_);
+      MarkRecallFailed(load_tracker_, dp_rank_str_,
+                       telemetry::metric_labels::kTierSharedStorage,
+                       telemetry::metric_labels::kOutcomeStagingExhausted,
+                       block_hashes, start_ts);
+      return;
+    }
+    staging_host_block_ids = *std::move(allocated);
   }
-  const std::vector<int>& staging_host_block_ids = *allocated;
 
   ::tpu_sync::proto::BackendTransferSpec spec;
   spec.set_name(secondary_backend->name());
 
-  // RECALL: the host-DRAM staging side is the SOURCE and the HBM side is the
-  // destination -- the reverse of OFFLOAD. Both lists are block slot indices
-  // of the same type, so the labels below are what keeps them straight.
   const std::vector<int64_t> host_ids(staging_host_block_ids.begin(),
                                       staging_host_block_ids.end());
   const std::vector<int64_t> hbm_ids(device_block_ids.begin(),
@@ -1541,12 +1604,9 @@ void KVCacheStore::LoadFromSecondaryBackend(
       ::tpu_sync::proto::TRANSFER_DIR_RECALL, block_hashes,
       /*hbm_block_ids=*/hbm_ids, /*host_block_ids=*/host_ids, {spec});
 
-  // Captures are copies only -- no `this`, no reference to a member tracker.
-  // The store can be destroyed while this transfer is in flight, so every
-  // touch of it goes through the lifetime fence below.
   future.OnReady(
       [lifetime = lifetime_, host_ram_backend = backend(), secondary_backend,
-       raiden_id = raiden_id_, start_ts,
+       raiden_id = raiden_id_, start_ts, is_tds_backend,
        block_hashes =
            std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
        staging_host_block_ids = std::vector<int>(staging_host_block_ids.begin(),
@@ -1559,13 +1619,11 @@ void KVCacheStore::LoadFromSecondaryBackend(
           // chunk may have been missing behind an earlier error: drop the
           // entries on every recall failure so the next Lookup re-probes.
           secondary_backend->Delete(block_hashes);
-          // TODO: revisit returning every staging block and failing the whole
-          // batch on a recall error. The transfer reports a single status, so
-          // a partial storage failure (some blocks landed in HBM) is treated
-          // the same as a total one.
           absl::MutexLock lock(lifetime->mu);
           if (KVCacheStore* self = lifetime->store; self != nullptr) {
-            self->DeallocateBlockIds(staging_host_block_ids);
+            if (!staging_host_block_ids.empty()) {
+              self->DeallocateBlockIds(staging_host_block_ids);
+            }
             MarkRecallFailed(
                 self->load_tracker_, self->dp_rank_str_,
                 telemetry::metric_labels::kTierSharedStorage,
@@ -1573,6 +1631,25 @@ void KVCacheStore::LoadFromSecondaryBackend(
                     ? telemetry::metric_labels::kOutcomeNotFound
                     : telemetry::metric_labels::kOutcomeTransferFailed,
                 block_hashes, start_ts);
+          }
+          return;
+        }
+        if (is_tds_backend) {
+          std::vector<RaidenBlockId> update_slices;
+          update_slices.reserve(block_hashes.size());
+          for (size_t i = 0; i < block_hashes.size(); ++i) {
+            update_slices.emplace_back(raiden_id, /*host_block_id=*/-1,
+                                       device_block_ids[i], BlockStatus::HBM);
+          }
+          if (!block_hashes.empty() && host_ram_backend != nullptr) {
+            host_ram_backend->Insert(block_hashes, update_slices,
+                                     InsertOption::kBestEffortUpdate);
+          }
+          absl::MutexLock lock(lifetime->mu);
+          if (KVCacheStore* self = lifetime->store; self != nullptr) {
+            MarkRecallDone(self->load_tracker_, self->dp_rank_str_,
+                           telemetry::metric_labels::kTierSharedStorage,
+                           block_hashes, start_ts);
           }
           return;
         }

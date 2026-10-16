@@ -241,24 +241,6 @@ cc_test(
 )
 
 cc_library(
-    name = "histogram",
-    hdrs = ["histogram.h"],
-    deps = [
-        "@com_google_absl//absl/container:inlined_vector",
-    ],
-)
-
-cc_test(
-    name = "histogram_test",
-    srcs = ["histogram_test.cc"],
-    deps = [
-        ":histogram",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-
-cc_library(
     name = "raw_buffer_transport",
     srcs = ["raw_buffer_transport.cc"],
     hdrs = ["raw_buffer_transport.h"],
@@ -270,7 +252,6 @@ cc_library(
     deps = [
         ":chunk",
         ":chunk_serializer",
-        ":histogram",
         ":raw_buffer_transport_delegate",
         ":transport_adapter",
         "//tpu_sync/common:detached_thread_group",
@@ -302,6 +283,7 @@ cc_library(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
+        "@peregrine//peregrine/src/api/v1:histogram",
         "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@peregrine//peregrine/src/api/v1:socket_util",
     ],

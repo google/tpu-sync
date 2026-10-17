@@ -31,6 +31,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/recv_nan_check.h"
 #include "tpu_sync/core/transfer_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 
@@ -159,6 +160,7 @@ class ReshardReceiveSession
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
+  const std::unique_ptr<RecvNanCheck> recv_nan_check_;
   StagingBlockAllocator* const staging_allocator_ = nullptr;
   const uint64_t uuid_ = 0;
   const std::string req_id_;

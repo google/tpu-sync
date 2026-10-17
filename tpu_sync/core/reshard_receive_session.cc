@@ -384,6 +384,7 @@ ReshardReceiveSession::ReshardReceiveSession(
     absl::Span<const int64_t> chip_blocks,
     std::chrono::steady_clock::time_point deadline)
     : base_(base),
+      recv_nan_check_(RecvNanCheck::CreateIfEnabled(base, plan)),
       staging_allocator_(staging_allocator),
       uuid_(uuid),
       req_id_(plan.req_id()),
@@ -609,6 +610,11 @@ void ReshardReceiveSession::ExecuteEligiblePoolH2ds(
     in_flight_ += static_cast<int32_t>(to_launch.size());
   }
   for (auto& [pool_idx, dst_chip_block_ids] : to_launch) {
+    // The pool's wire transfer is complete and this operation pins its
+    // staging lease. Scan before H2D can finish and release/reuse the bytes.
+    if (recv_nan_check_) {
+      recv_nan_check_->BeforeH2d(pool_idx);
+    }
     {
       // The decision to upload was taken under |mu_| above; the receive may
       // have been finished (deadline, cancellation) since. Re-check

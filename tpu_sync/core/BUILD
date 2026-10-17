@@ -656,6 +656,7 @@ cc_library(
     srcs = [
         "data_connection_policy.cc",
         "kv_cache_manager_with_transfer.cc",
+        "recv_nan_check.cc",
         "reshard_receive_session.cc",
         "reshard_send_session.cc",
         "transfer_receive_session.cc",
@@ -664,6 +665,7 @@ cc_library(
     hdrs = [
         "data_connection_policy.h",
         "kv_cache_manager_with_transfer.h",
+        "recv_nan_check.h",
         "reshard_receive_session.h",
         "reshard_send_session.h",
         "transfer_receive_session.h",
@@ -1066,6 +1068,18 @@ cc_test(
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "recv_nan_check_test",
+    size = "small",
+    srcs = [
+        "recv_nan_check.h",
+        "recv_nan_check_test.cc",
+    ],
+    deps = [
         "@com_google_googletest//:gtest_main",
     ],
 )

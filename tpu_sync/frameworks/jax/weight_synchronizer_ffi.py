@@ -15,16 +15,243 @@
 """JAX bindings for WeightSynchronizer FFI, enabling host/device weight synchronization."""
 
 import collections
+import dataclasses
 import os
+import socket
+import struct
+from typing import Any, Sequence
 
 from absl import logging
 import jax
 from jax.experimental import compute_on
+from jax.experimental import multihost_utils
 from jax.experimental import xla_metadata
 import jax.numpy as jnp
 import numpy as np
 
 from tpu_sync.frameworks.jax import _weight_synchronizer_ffi
+
+ENDPOINTS_API_VERSION: int = 1
+
+
+class EndpointError(RuntimeError):
+  pass
+
+
+@dataclasses.dataclass(frozen=True)
+class ShardEndpoint:
+  mesh_index: int
+  device: Any
+  data_address: str
+
+
+@dataclasses.dataclass(frozen=True)
+class HostEndpoints:
+  host_index: int
+  control_address: str
+  shards: tuple[ShardEndpoint, ...]
+
+  @property
+  def devices(self) -> tuple[Any, ...]:
+    return tuple(s.device for s in self.shards)
+
+  @property
+  def data_addresses(self) -> tuple[str, ...]:
+    return tuple(s.data_address for s in self.shards)
+
+
+@dataclasses.dataclass(frozen=True)
+class SyncEndpoints:
+  """Grouped per-host control and per-shard data endpoints for a mesh."""
+
+  hosts: tuple[HostEndpoints, ...]
+
+  def single_unit_registration(self) -> tuple[list[str], str]:
+    """Returns flat data addresses and comma-joined control addresses."""
+    if not self.hosts:
+      raise EndpointError("No hosts available.")
+    shards_per_host = len(self.hosts[0].shards)
+    if shards_per_host == 0:
+      raise EndpointError("Host 0 has no shards.")
+    shards = []
+    for k, host in enumerate(self.hosts):
+      if len(host.shards) != shards_per_host:
+        raise EndpointError(
+            f"Host {k} has {len(host.shards)} shards, expected"
+            f" {shards_per_host}."
+        )
+      for i, s in enumerate(host.shards):
+        expected_index = k * shards_per_host + i
+        if s.mesh_index != expected_index:
+          raise EndpointError(
+              f"Host {k} shard {i} has mesh_index {s.mesh_index}, expected"
+              f" {expected_index}."
+          )
+        shards.append(s.data_address)
+    control_addresses = ",".join(h.control_address for h in self.hosts)
+    return shards, control_addresses
+
+
+def _decode_ip(words: Sequence[int] | np.ndarray) -> str:
+  raw_bytes = struct.pack("<4i", *(int(x) for x in words[:4]))
+  if raw_bytes == b"\x00" * 16:
+    return ""
+  if raw_bytes[:10] == b"\x00" * 10 and raw_bytes[10:12] == b"\xff\xff":
+    return socket.inet_ntop(socket.AF_INET, raw_bytes[12:16])
+  addr_str = socket.inet_ntop(socket.AF_INET6, raw_bytes)
+  return f"[{addr_str}]"
+
+
+def _default_shard_idx(mesh: jax.sharding.Mesh) -> jax.Array:
+  indices = np.arange(mesh.devices.size, dtype=np.int32).reshape(
+      mesh.devices.shape
+  )
+  return jax.device_put(
+      indices,
+      jax.sharding.NamedSharding(
+          mesh, jax.sharding.PartitionSpec(*mesh.axis_names)
+      ),
+  )
+
+
+def _default_slice_byte_sizes(
+    device_arrays: Sequence[jax.Array], mesh: jax.sharding.Mesh
+) -> jax.Array:
+  sizes = np.array(
+      [
+          int(np.prod(arr.sharding.shard_shape(arr.shape))) * arr.dtype.itemsize
+          for arr in device_arrays
+      ],
+      dtype=np.int32,
+  )
+  return jax.device_put(
+      sizes, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None))
+  )
+
+
+def start_weight_synchronizer(
+    device_arrays,
+    mesh: jax.sharding.Mesh,
+    *,
+    d2h: bool = False,  # pylint: disable=redefined-outer-name
+    shard_idx: jax.Array | None = None,
+    slice_byte_sizes: jax.Array | None = None,
+    local_port: int = 0,
+    parallelism: int = 1,
+    num_layers: int | None = None,
+    listener_port: int = 0,
+    num_shards: int | None = None,
+) -> SyncEndpoints:
+  """Initializes WeightSynchronizer across a mesh and returns host endpoints."""
+  if isinstance(device_arrays, (list, tuple)):
+    anchors_list = list(device_arrays)
+  else:
+    anchors_list = [device_arrays]
+  if not anchors_list:
+    raise ValueError("device_arrays must be non-empty")
+  if listener_port < 0:
+    raise ValueError(f"listener_port cannot be < 0, got {listener_port}")
+  if shard_idx is not None and shard_idx.ndim > len(mesh.axis_names):
+    raise ValueError(
+        "start_weight_synchronizer does not accept pre-packed shard_idx"
+    )
+
+  if num_shards is None:
+    num_processes = len(set(int(d.process_index) for d in mesh.devices.flat))
+    num_shards = mesh.devices.size // num_processes
+
+  host_indices_np, _ = _derive_host_slots(mesh.devices, num_shards)
+
+  if shard_idx is None:
+    shard_idx = _default_shard_idx(mesh)
+  if slice_byte_sizes is None:
+    slice_byte_sizes = _default_slice_byte_sizes(anchors_list, mesh)
+  if num_layers is None:
+    num_layers = len(anchors_list)
+
+  if d2h:
+    ws_info = init_weight_synchronizer_and_d2h(
+        anchors_list,
+        shard_idx,
+        mesh,
+        slice_byte_sizes,
+        local_port=local_port,
+        parallelism=parallelism,
+        num_layers=num_layers,
+        listener_port=listener_port,
+        num_shards=num_shards,
+    )
+  else:
+    ws_info = init_weight_synchronizer(
+        anchors_list,
+        shard_idx,
+        mesh,
+        slice_byte_sizes,
+        local_port=local_port,
+        parallelism=parallelism,
+        num_layers=num_layers,
+        listener_port=listener_port,
+        num_shards=num_shards,
+    )
+
+  if isinstance(ws_info, jax.Array) and jax.process_count() > 1:
+    gathered = multihost_utils.process_allgather(ws_info, tiled=True)
+    rows = np.asarray(gathered)
+  elif isinstance(ws_info, jax.Array):
+    rows = np.asarray(jax.device_get(ws_info))
+  else:
+    rows = np.asarray(ws_info)
+
+  if rows.ndim >= 2:
+    rows = rows.reshape(-1, rows.shape[-1])
+  if rows.ndim != 2 or rows.shape[0] != mesh.devices.size or rows.shape[1] < 10:
+    raise EndpointError(
+        f"Gathered endpoint rows have shape {rows.shape}, expected at least"
+        f" ({mesh.devices.size}, 10)"
+    )
+
+  by_host = collections.defaultdict(list)
+  for m, row in enumerate(rows):
+    data_ip = _decode_ip(row[0:4])
+    data_port = int(row[4])
+    ctrl_port = int(row[5])
+    ctrl_ip = _decode_ip(row[6:10])
+
+    if not data_ip or not ctrl_ip or data_port <= 0 or ctrl_port <= 0:
+      host_index = int(host_indices_np.flat[m])
+      raise EndpointError(
+          f"Host {host_index} mesh_index {m} returned invalid endpoint: data"
+          f" {data_ip}:{data_port}, control {ctrl_ip}:{ctrl_port}"
+      )
+
+    host_index = int(host_indices_np.flat[m])
+    device = mesh.devices.flat[m]
+    shard_ep = ShardEndpoint(
+        mesh_index=m, device=device, data_address=f"{data_ip}:{data_port}"
+    )
+    control_address = f"{ctrl_ip}:{ctrl_port}"
+    by_host[host_index].append((shard_ep, control_address))
+
+  hosts = []
+  for host_idx in sorted(by_host.keys()):
+    host_data = by_host[host_idx]
+    shards = tuple(sd[0] for sd in host_data)
+    control_addresses = set(sd[1] for sd in host_data)
+    if len(control_addresses) > 1:
+      raise EndpointError(
+          f"Host {host_idx} reported conflicting control addresses:"
+          f" {control_addresses}"
+      )
+    hosts.append(
+        HostEndpoints(
+            host_index=host_idx,
+            control_address=control_addresses.pop(),
+            shards=shards,
+        )
+    )
+
+  return SyncEndpoints(hosts=tuple(hosts))
+
 
 _DIRECT_DEVICE_BUFFER_ENV = "RAIDEN_FFI_USE_DIRECT_DEVICE_BUFFER"
 _orig_compute_on = compute_on.compute_on
@@ -495,7 +722,12 @@ def is_listener_active(shard_idx: int = 0) -> bool:
   return _weight_synchronizer_ffi.is_listener_active(shard_idx)
 
 
-def h2d(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
+def h2d(
+    device_array,
+    shard_idx: jax.Array | None = None,
+    mesh: jax.sharding.Mesh | None = None,
+    layer_idx: int = 0,
+) -> jax.Array:
   """Executes asynchronous Host-to-Device (H2D) copy from local staging buffer directly onto device memory via FFI.
 
   Args:
@@ -509,6 +741,10 @@ def h2d(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
     The updated sharded device array with data copied from the local host
     buffer.
   """
+  if mesh is None:
+    mesh = device_array.sharding.mesh
+  if shard_idx is None:
+    shard_idx = _default_shard_idx(mesh)
   ffi_name = (
       "raiden_weight_synchronizer_h2d"
       if _use_direct_device_buffer()
@@ -546,7 +782,11 @@ def h2d(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
   )(shard_idx)
 
 
-def multi_h2d(device_arrays, shard_idx, mesh) -> list[jax.Array]:
+def multi_h2d(
+    device_arrays,
+    shard_idx: jax.Array | None = None,
+    mesh: jax.sharding.Mesh | None = None,
+) -> list[jax.Array]:
   """Executes asynchronous Host-to-Device (H2D) copy from local staging buffers directly onto device memory via FFI.
 
   Args:
@@ -559,6 +799,10 @@ def multi_h2d(device_arrays, shard_idx, mesh) -> list[jax.Array]:
     A list of updated sharded device arrays with data copied from the local host
     buffers.
   """
+  if mesh is None:
+    mesh = device_arrays[0].sharding.mesh
+  if shard_idx is None:
+    shard_idx = _default_shard_idx(mesh)
   ffi_name = (
       "raiden_weight_synchronizer_multi_h2d"
       if _use_direct_device_buffer()
@@ -602,7 +846,12 @@ def multi_h2d(device_arrays, shard_idx, mesh) -> list[jax.Array]:
   )(shard_idx)
 
 
-def d2h(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
+def d2h(
+    device_array,
+    shard_idx: jax.Array | None = None,
+    mesh: jax.sharding.Mesh | None = None,
+    layer_idx: int = 0,
+) -> jax.Array:
   """Executes asynchronous Device-to-Host (D2H) copy from device memory directly onto local staging buffer via FFI.
 
   Args:
@@ -614,6 +863,10 @@ def d2h(device_array, shard_idx, mesh, layer_idx: int = 0) -> jax.Array:
   Returns:
     The same sharded device array (serving as an execution anchor).
   """
+  if mesh is None:
+    mesh = device_array.sharding.mesh
+  if shard_idx is None:
+    shard_idx = _default_shard_idx(mesh)
   ffi_name = (
       "raiden_weight_synchronizer_d2h"
       if _use_direct_device_buffer()

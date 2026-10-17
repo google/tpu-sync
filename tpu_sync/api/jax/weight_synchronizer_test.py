@@ -645,6 +645,87 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     self.assertEqual(m_reset["total_h2h_bandwidth_gbps"], 0.0)
     self.assertEqual(m_reset["push_resharded_call_count"], 0)
 
+  def test_push_to_local_shard_when_global_shard_indices_collide(self):
+    ws_source = WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=1,
+        num_shards=4,
+        slice_byte_size=64,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+        global_shard_indices=[0, 4, 8, 12],
+    )
+    # Process 1 on a 4-process mesh has global_shard_indices=[1, 5, 9, 13],
+    # where global_shard_indices[0] == 1 collides with local dst_shard_idx == 1.
+    ws_dest = WeightSynchronizer.test_only_create_cpu_instance(
+        num_layers=1,
+        num_shards=4,
+        slice_byte_size=64,
+        local_port=0,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+        global_shard_indices=[1, 5, 9, 13],
+    )
+    self.addCleanup(ws_source.shutdown)
+    self.addCleanup(ws_dest.shutdown)
+
+    for shard_idx in range(4):
+      src_buf = ws_source.get_host_buffer(layer_idx=0, shard_idx=shard_idx)
+      src_buf[:64] = 10 + shard_idx
+      dst_buf = ws_dest.get_host_buffer(layer_idx=0, shard_idx=shard_idx)
+      dst_buf[:64] = 0
+
+    def _send_ctrl_req(port: int, req: raiden_service_pb2.ControlRequest):
+      payload = req.SerializeToString()
+      sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+      sock.connect(("::1", port))
+      sock.sendall(len(payload).to_bytes(4, "big") + payload)
+      resp_len = int.from_bytes(sock.recv(4), "big")
+      resp_bytes = sock.recv(resp_len)
+      resp = raiden_service_pb2.ControlResponse()
+      resp.ParseFromString(resp_bytes)
+      self.assertTrue(resp.success, resp.message)
+      sock.close()
+
+    uuid = 80001
+    dst_req = raiden_service_pb2.ControlRequest(
+        command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+        start_transfer_request=raiden_service_pb2.StartTransferRequest(
+            is_sender=False,
+            uuid=uuid,
+            expected_block_count=4,
+            expected_layer_chunk_counts={0: 4},
+        ),
+    )
+    _send_ctrl_req(ws_dest.listener_port, dst_req)
+
+    src_transfer_req = raiden_service_pb2.StartTransferRequest(
+        is_sender=True,
+        uuid=uuid,
+        skip_d2h=True,
+    )
+    for shard_idx in range(4):
+      sched = src_transfer_req.shard_push_schedules[shard_idx]
+      entry = sched.entries.add()
+      entry.dst_peer = f"127.0.0.1:{ws_dest.local_port}"
+      entry.dst_shard_idx = shard_idx
+      entry.src_offset_bytes = 0
+      entry.dst_offset_bytes = 0
+      entry.size_bytes = 64
+      entry.count = 1
+      entry.layer_idx = 0
+
+    src_req = raiden_service_pb2.ControlRequest(
+        command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+        start_transfer_request=src_transfer_req,
+    )
+    _send_ctrl_req(ws_source.listener_port, src_req)
+    ws_dest.wait_for_transfer_completion(uuid)
+
+    for shard_idx in range(4):
+      dst_buf = ws_dest.get_host_buffer(layer_idx=0, shard_idx=shard_idx)
+      np.testing.assert_array_equal(dst_buf[:64], 10 + shard_idx)
+
 
 if __name__ == "__main__":
   absltest.main()

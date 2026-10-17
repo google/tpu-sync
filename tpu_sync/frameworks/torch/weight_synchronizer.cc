@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <utility>
@@ -73,6 +74,9 @@ absl::StatusOr<std::unique_ptr<WeightSynchronizer>> WeightSynchronizer::Create(
             unsafe_skip_buffer_lock, parallelism, listener_port,
             std::move(bind_ip), /*layer_names=*/std::vector<std::string>{},
             auto_h2d));
+    std::vector<int> local_shard_indices(base->num_shards());
+    std::iota(local_shard_indices.begin(), local_shard_indices.end(), 0);
+    base->SetLocalShardIndices(std::move(local_shard_indices));
     if (global_shard_indices.has_value()) {
       base->SetGlobalShardIndices(*std::move(global_shard_indices));
     }
@@ -258,6 +262,9 @@ WeightSynchronizer::test_only_create_cpu_instance(
           /*host_blocks_to_allocate=*/std::nullopt, parallelism, listener_port,
           std::move(bind_ip), /*layer_names=*/std::vector<std::string>{},
           auto_h2d));
+  std::vector<int> local_shard_indices(base->num_shards());
+  std::iota(local_shard_indices.begin(), local_shard_indices.end(), 0);
+  base->SetLocalShardIndices(std::move(local_shard_indices));
   if (global_shard_indices.has_value()) {
     base->SetGlobalShardIndices(*std::move(global_shard_indices));
   }

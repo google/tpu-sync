@@ -19,7 +19,6 @@ from collections import abc
 import functools
 import gc
 import importlib
-import ipaddress
 import os
 import socket
 import time
@@ -191,24 +190,6 @@ def _resolve_local_ip() -> str:
   return ip
 
 
-def _unpack_ip(row: np.ndarray) -> str:
-  """Unpacks an IPv4 or IPv6 address from a 6- or 10-int32 FFI info row."""
-  raw_bytes = b"".join(
-      int(x).to_bytes(4, byteorder="little", signed=True) for x in row[:4]
-  )
-  if raw_bytes[:10] == b"\x00" * 10 and raw_bytes[10:12] == b"\xff\xff":
-    return str(ipaddress.IPv4Address(raw_bytes[12:16]))
-  addr_str = str(ipaddress.IPv6Address(raw_bytes))
-  return f"[{addr_str}]" if ":" in addr_str else addr_str
-
-
-def _unpack_control_ip(row: np.ndarray) -> str:
-  """Unpacks the control-plane IP from row[6:10], falling back to row[:4]."""
-  if len(row) >= 10 and any(int(x) != 0 for x in row[6:10]):
-    return _unpack_ip(row[6:10])
-  return _unpack_ip(row)
-
-
 def _ping_port(addr: str) -> bool:
   """Returns True if the TCP endpoint 'ip:port' accepts connections."""
   ip, port_str = addr.rsplit(":", 1)
@@ -367,18 +348,8 @@ def run_source() -> None:
   ]
   jax.block_until_ready(src_vars)
 
-  slice_byte_sizes = [
-      int(np.prod(arr.sharding.shard_shape(arr.shape))) * arr.dtype.itemsize
-      for arr in src_vars
-  ]
-  sizes_sharding = jax.sharding.NamedSharding(
-      src_mesh, jax.sharding.PartitionSpec(None)
-  )
-  slice_byte_sizes_sharded = jax.device_put(
-      jnp.array(slice_byte_sizes, dtype=jnp.int32), sizes_sharding
-  )
-
   devices_per_unit = len(src_devices) // max(1, FLAGS.num_src_hosts)
+
   global_ids = jnp.arange(src_mesh.devices.size, dtype=jnp.int32).reshape(
       src_mesh_shape
   )
@@ -396,44 +367,21 @@ def run_source() -> None:
   )
   init_parallelism = max(p_values)
 
-  # Warmup and initialize C++ WeightSynchronizer FFI ONCE across all Pathways
-  # hosts (with max parallelism so push_pool_ has enough threads for all rungs).
-  src_ws_info = raiden_ffi.init_weight_synchronizer_and_d2h(
-      device_arrays=src_vars,
+  eps = raiden_ffi.start_weight_synchronizer(
+      src_vars,
+      src_mesh,
+      d2h=True,
       shard_idx=shard_idx,
-      mesh=src_mesh,
-      slice_byte_sizes=slice_byte_sizes_sharded,
       parallelism=init_parallelism,
-      num_layers=len(src_vars),
-      listener_port=0,
       num_shards=devices_per_unit,
   )
-  jax.block_until_ready(src_ws_info)
 
-  info_cols = int(src_ws_info.shape[-1])
-  gathered_ws_info = np.asarray(jax.device_get(src_ws_info)).reshape(
-      -1, info_cols
-  )
-  ips: list[str] = []
-  listeners: list[str] = []
-  for row in gathered_ws_info:
-    ip = _unpack_ip(row)
-    ctrl_ip = _unpack_control_ip(row)
-    ips.append(f"{ip}:{row[4]}")
-    listeners.append(f"{ctrl_ip}:{row[5]}")
-
-  unique_listeners: list[str] = []
-  for listener in listeners:
-    if listener not in unique_listeners:
-      unique_listeners.append(listener)
-
-  if len(unique_listeners) != FLAGS.num_src_hosts:
+  if len(eps.hosts) != FLAGS.num_src_hosts:
     raise RuntimeError(
         f"Expected {FLAGS.num_src_hosts} unique Pathways host listeners, found"
-        f" {len(unique_listeners)}: {unique_listeners}"
+        f" {len(eps.hosts)}."
     )
 
-  mesh_devices_flat = list(src_mesh.devices.flatten())
   host_units_metadata: list[
       tuple[
           raiden_controller.RaidenId,
@@ -442,13 +390,11 @@ def run_source() -> None:
           list[raiden_service_pb2.VariableMetadataProto],
       ]
   ] = []
-  for task_idx, listener_addr in enumerate(unique_listeners):
-    task_devices = [
-        mesh_devices_flat[i]
-        for i, l in enumerate(listeners)
-        if l == listener_addr
-    ]
-    task_ips = [ips[i] for i, l in enumerate(listeners) if l == listener_addr]
+
+  for host in eps.hosts:
+    task_devices = list(host.devices)
+    task_ips = list(host.data_addresses)
+    listener_addr = host.control_address
     task_var_protos = []
     for var_idx, arr in enumerate(src_vars):
       sharding = arr.sharding
@@ -471,13 +417,13 @@ def run_source() -> None:
       )
 
     task_unit = raiden_controller.RaidenId(
-        "pathways_trainer", str(task_idx), _UNIT_NAME
+        "pathways_trainer", str(host.host_index), _UNIT_NAME
     )
     host_units_metadata.append(
         (task_unit, task_ips, listener_addr, task_var_protos)
     )
 
-  for listener_addr in unique_listeners:
+  for listener_addr in [host.control_address for host in eps.hosts]:
     while not _ping_port(listener_addr):
       time.sleep(0.2)
 
@@ -586,7 +532,10 @@ def run_source() -> None:
         variables=task_var_protos,
     )
 
-  while any(_ping_port(listener_addr) for listener_addr in unique_listeners):
+  while any(
+      _ping_port(listener_addr)
+      for listener_addr in [host.control_address for host in eps.hosts]
+  ):
     time.sleep(0.5)
 
   raiden_ffi.destroy_weight_synchronizer()

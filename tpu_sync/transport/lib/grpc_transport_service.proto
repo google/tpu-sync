@@ -1,0 +1,52 @@
+// Copyright 2026 Google LLC.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package tpu_raiden.transport.lib.proto;
+
+// High-throughput gRPC block transport service for TransportAdapter.
+service GrpcTransportService {
+  // Unary RPC for Opcode 1 (dynamic destination block allocation push)
+  // and Opcode 6 (explicit destination block push).
+  rpc PushBlocks(GrpcPushRequest) returns (GrpcPushResponse) {  }
+}
+
+message ChunkProto {
+  uint32 version = 1;
+  uint32 op = 2;
+  uint32 flags = 3;
+  uint32 buffer_id = 4;
+  uint32 reserved = 5;
+  uint32 metadata_size = 6;
+  uint32 remote_id = 7;
+  uint32 local_id = 8;
+  uint32 count_or_size = 9;
+  uint64 uuid = 10;
+  bytes payload = 11 [ctype = CORD];
+}
+
+message GrpcPushRequest {
+  repeated ChunkProto chunks = 1;
+  // Populated when op == 6 (Explicit destination push).
+  repeated int32 dst_block_ids = 2;
+  repeated int32 src_block_ids = 3;
+}
+
+message GrpcPushResponse {
+  bool ack = 1;
+  // Populated when op == 1 (Dynamic block allocation push).
+  repeated int32 allocated_block_ids = 2;
+  string error_message = 3;
+}

@@ -40,6 +40,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"

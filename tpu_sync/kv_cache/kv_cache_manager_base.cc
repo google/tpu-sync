@@ -43,6 +43,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
@@ -3645,15 +3646,7 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
   LOG(INFO) << "[Worker] secondary backend " << config.type
             << " received topology: " << received;
 
-  if (!absl::EqualsIgnoreCase(config.type,
-                              backends::storage::kPosixBackendName)) {
-    LOG(FATAL) << "[Worker] unsupported secondary backend type '" << config.type
-               << "' (received topology: " << received
-               << "); supported: " << backends::storage::kPosixBackendName;
-  }
-
-  const std::string canonical_name =
-      std::string(backends::storage::kPosixBackendName);
+  const std::string canonical_name = absl::AsciiStrToLower(config.type);
   if (GetKVBackend(canonical_name) != nullptr) return false;
 
   // Storage topology comes only from BackendConfig::parallelism. Each declared
@@ -3681,8 +3674,14 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
                << " backend config (received topology: " << received
                << "): " << options.status().message();
   }
-  auto backend = std::make_shared<backends::storage::PosixKVBackend>(
-      canonical_name, resolved.properties);
+  std::shared_ptr<backends::KVBackend> backend;
+  if (canonical_name == backends::storage::kPosixBackendName) {
+    backend = std::make_shared<backends::storage::PosixKVBackend>(
+        canonical_name, resolved.properties);
+  } else {
+    LOG(FATAL) << "[Worker] unsupported secondary backend type '" << config.type
+               << "' (received topology: " << received << ")";
+  }
   {
     absl::MutexLock lock(backends_mu_);
     backends_[canonical_name] = std::move(backend);

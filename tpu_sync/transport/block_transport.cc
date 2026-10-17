@@ -637,10 +637,65 @@ absl::Status BlockTransport::HandleIncomingPush(
   return absl::OkStatus();
 }
 
+// ---------------------------------------------------------------------------
+// Peregrine receive path.
+// ---------------------------------------------------------------------------
+absl::Status BlockTransport::OnRecvComplete(
+    uint64_t uuid, absl::Span<const uint64_t> buffer_ids) {
+  if (buffer_ids.empty()) {
+    return absl::InvalidArgumentError(
+        "OnRecvComplete requires at least one buffer_id");
+  }
+  std::vector<uint32_t> unique_local_ids;
+  unique_local_ids.reserve(buffer_ids.size());
+  for (uint64_t buffer_id : buffer_ids) {
+    const uint32_t local_id = static_cast<uint32_t>(buffer_id >> 32);
+    if (local_id == 0xFFFFFFFF) {
+      return absl::InvalidArgumentError(
+          "OnRecvComplete requires an explicit layer/pool index in buffer_id");
+    }
+    if (std::find(unique_local_ids.begin(), unique_local_ids.end(), local_id) ==
+        unique_local_ids.end()) {
+      unique_local_ids.push_back(local_id);
+    }
+  }
+
+  std::vector<std::pair<uint32_t, std::optional<PoolPushProgressSpec>>>
+      resolved_specs;
+  resolved_specs.reserve(unique_local_ids.size());
+  for (uint32_t local_id : unique_local_ids) {
+    ABSL_ASSIGN_OR_RETURN(
+        IncomingPushSpec push_spec,
+        ResolveIncomingPushSpec(block_delegate_, local_id,
+                                /*is_explicit_dst_push=*/true, uuid));
+    resolved_specs.emplace_back(local_id, push_spec.pool_progress_spec);
+  }
+
+  ABSL_RETURN_IF_ERROR(block_delegate_->ValidateRecv(uuid));
+  bool push_failed = true;
+  absl::Cleanup fail_recv = [&]() {
+    if (push_failed) {
+      block_delegate_
+          ->FailRecv(uuid, absl::InternalError("Incoming push failed"))
+          .IgnoreError();
+    }
+  };
+
+  for (const auto& [local_id, pool_progress_spec] : resolved_specs) {
+    ABSL_RETURN_IF_ERROR(CompleteIncomingPush(
+        uuid, local_id, /*remote_id=*/0, /*num_streams=*/1,
+        /*landed_shards=*/0, pool_progress_spec, /*is_peregrine=*/true));
+  }
+
+  push_failed = false;
+  return absl::OkStatus();
+}
+
 absl::Status BlockTransport::CompleteIncomingPush(
     uint64_t uuid, uint32_t local_id, uint32_t remote_id, size_t num_streams,
     size_t landed_shards,
-    const std::optional<PoolPushProgressSpec>& pool_progress_spec) {
+    const std::optional<PoolPushProgressSpec>& pool_progress_spec,
+    bool is_peregrine) {
   // Unified receive accounting: one progress map and one increment path for
   // both contracts; only the expectation source and the completion callback
   // differ. Plan-declared mode counts every sender's streams against the
@@ -671,6 +726,7 @@ absl::Status BlockTransport::CompleteIncomingPush(
     expected_senders = block_delegate_->ExpectedPushSenders(uuid);
   }
   bool trigger_completion = false;
+  bool all_layers_called = false;
   {
     absl::MutexLock lock(progress_mu_);
     auto& progress = layer_progress_[{uuid, l}];
@@ -707,6 +763,17 @@ absl::Status BlockTransport::CompleteIncomingPush(
                          " pushes for UUID ", uuid));
       }
       array_complete = plan_pushes == expected_chunks;
+    } else if (expected_senders.has_value() && is_peregrine) {
+      if (*expected_senders == 0) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "block array ", l, " expected 0 senders for UUID ", uuid));
+      }
+      if (progress.completed_chunks > *expected_senders) {
+        return absl::AlreadyExistsError(absl::StrCat(
+            "block array ", l, " received pushes from more than ",
+            *expected_senders, " senders for UUID ", uuid));
+      }
+      array_complete = progress.completed_chunks == *expected_senders;
     } else if (expected_senders.has_value()) {
       auto& streams = progress.sender_streams[remote_id];
       if (streams.landed == 0) {
@@ -761,7 +828,7 @@ absl::Status BlockTransport::CompleteIncomingPush(
           }
         }
       } else {
-        bool all_layers_called = true;
+        all_layers_called = true;
         for (size_t layer = 0; layer < block_delegate_->num_layers(); ++layer) {
           auto it = layer_progress_.find({uuid, layer});
           if (it == layer_progress_.end() ||
@@ -787,6 +854,12 @@ absl::Status BlockTransport::CompleteIncomingPush(
       ABSL_RETURN_IF_ERROR(block_delegate_->OnPoolReceived(l, uuid));
     } else {
       ABSL_RETURN_IF_ERROR(block_delegate_->OnLayerReceived(l, uuid));
+    }
+  }
+  if (is_peregrine && !plan_declared) {
+    ABSL_RETURN_IF_ERROR(block_delegate_->OnRecvProgress(uuid));
+    if (all_layers_called) {
+      ABSL_RETURN_IF_ERROR(block_delegate_->OnRecvNetworkComplete(uuid));
     }
   }
   return absl::OkStatus();

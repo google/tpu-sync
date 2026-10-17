@@ -263,10 +263,15 @@ class BlockTransport final {
                                   const lib::ChunkHeader& header);
   absl::Status HandleIncomingPull(int client_fd,
                                   const lib::ChunkHeader& header);
+  // Handles receiver-side completion for an incoming Peregrine post once all of
+  // its payload requests have landed in host memory.
+  absl::Status OnRecvComplete(uint64_t uuid,
+                              absl::Span<const uint64_t> buffer_ids);
   absl::Status CompleteIncomingPush(
       uint64_t uuid, uint32_t local_id, uint32_t remote_id, size_t num_streams,
       size_t landed_shards,
-      const std::optional<PoolPushProgressSpec>& pool_progress_spec);
+      const std::optional<PoolPushProgressSpec>& pool_progress_spec,
+      bool is_peregrine = false);
 
   absl::StatusOr<std::vector<int>> SyncPullInternal(
       const std::vector<std::string>& peers,

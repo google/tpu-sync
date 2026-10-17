@@ -140,6 +140,15 @@ class TransferReceiveSession
   void ExecutePullRequest(KVCacheManagerWithTransfer& manager,
                           const std::string& remote_endpoint);
 
+  // Records first-packet timing on every completed transport unit without
+  // mutating block completion counts.
+  absl::Status OnRecvProgress(KVCacheManagerWithTransfer& manager);
+
+  // Marks network transfer complete once all layers' Posts have landed on this
+  // receiver, without mutating `blocks_received_per_shard_` or
+  // `accumulated_host_block_ids_`.
+  absl::Status OnRecvNetworkComplete(KVCacheManagerWithTransfer& manager);
+
   // Handles a transport report that |shard_ids| of |block_ids| landed. Each
   // shard's progress is tracked separately; a shard completes once it has
   // received every (layer, block) of the session, and the network phase

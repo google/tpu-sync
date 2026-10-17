@@ -294,6 +294,96 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
                      " failed: ", reshard_session->GetStatus().message()))
                : absl::OkStatus();
   };
+  hooks.validate_recv = [this](uint64_t uuid) -> absl::Status {
+    std::shared_ptr<TransferReceiveSession> recv_session;
+    std::shared_ptr<ReshardReceiveSession> reshard_session;
+    {
+      absl::MutexLock lock(mu_);
+      if (auto it = active_recv_sessions_.find(uuid);
+          it != active_recv_sessions_.end()) {
+        recv_session = it->second;
+      } else if (auto reshard_it = active_pool_reshard_recvs_.find(uuid);
+                 reshard_it != active_pool_reshard_recvs_.end()) {
+        reshard_session = reshard_it->second;
+      } else if (uuid == 0 || base_->HasActivePlan(uuid)) {
+        return absl::OkStatus();
+      } else {
+        return absl::NotFoundError(
+            absl::StrCat("No active receive session for uuid=", uuid));
+      }
+    }
+    const bool active =
+        recv_session != nullptr
+            ? (!recv_session->Done() && !recv_session->IsDraining())
+            : (!reshard_session->Done() && !reshard_session->IsDraining());
+    return active ? absl::OkStatus()
+                  : absl::CancelledError(absl::StrCat(
+                        "Receive session for uuid=", uuid, " is draining"));
+  };
+  hooks.fail_recv = [this](uint64_t uuid,
+                           const absl::Status& status) -> absl::Status {
+    std::shared_ptr<TransferReceiveSession> recv_session;
+    std::shared_ptr<ReshardReceiveSession> reshard_session;
+    {
+      absl::MutexLock lock(mu_);
+      if (auto it = active_recv_sessions_.find(uuid);
+          it != active_recv_sessions_.end()) {
+        recv_session = it->second;
+      } else if (auto reshard_it = active_pool_reshard_recvs_.find(uuid);
+                 reshard_it != active_pool_reshard_recvs_.end()) {
+        reshard_session = reshard_it->second;
+      } else {
+        return absl::OkStatus();
+      }
+    }
+    if (recv_session != nullptr) {
+      if (!status.ok()) {
+        recv_session->DeferUnregisterOnSettle();
+        recv_session->Finish(status);
+      }
+      MaybeUnregisterSettledRecv(uuid, *recv_session);
+      return !recv_session->GetStatus().ok()
+                 ? absl::CancelledError(absl::StrCat(
+                       "Receive session for uuid=", uuid,
+                       " failed: ", recv_session->GetStatus().message()))
+                 : absl::OkStatus();
+    }
+    if (!status.ok()) {
+      reshard_session->Finish(status);
+    }
+    MaybeUnregisterSettledReshardRecv(uuid, *reshard_session);
+    return !reshard_session->GetStatus().ok()
+               ? absl::CancelledError(absl::StrCat(
+                     "ReshardReceiveSession for uuid=", uuid,
+                     " failed: ", reshard_session->GetStatus().message()))
+               : absl::OkStatus();
+  };
+  hooks.on_recv_progress = [this](uint64_t uuid) -> absl::Status {
+    std::shared_ptr<TransferReceiveSession> recv_session;
+    {
+      absl::MutexLock lock(mu_);
+      auto it = active_recv_sessions_.find(uuid);
+      if (it == active_recv_sessions_.end()) {
+        return absl::OkStatus();
+      }
+      recv_session = it->second;
+    }
+    return recv_session->OnRecvProgress(*this);
+  };
+  hooks.on_recv_network_complete = [this](uint64_t uuid) -> absl::Status {
+    std::shared_ptr<TransferReceiveSession> recv_session;
+    {
+      absl::MutexLock lock(mu_);
+      auto it = active_recv_sessions_.find(uuid);
+      if (it == active_recv_sessions_.end()) {
+        return absl::OkStatus();
+      }
+      recv_session = it->second;
+    }
+    absl::Status status = recv_session->OnRecvNetworkComplete(*this);
+    MaybeUnregisterSettledRecv(uuid, *recv_session);
+    return status;
+  };
   base_->SetTransferEventHooks(std::move(hooks));
 }
 

@@ -89,6 +89,19 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
       uint64_t uuid, const absl::Status& status = absl::OkStatus()) {
     return absl::OkStatus();
   }
+  virtual absl::Status ValidateRecv(uint64_t uuid) { return absl::OkStatus(); }
+  virtual absl::Status FailRecv(uint64_t uuid, const absl::Status& status) {
+    return absl::OkStatus();
+  }
+  // Called on every completed transport unit (Peregrine Post) for uuid;
+  virtual absl::Status OnRecvProgress(uint64_t uuid) {
+    return absl::OkStatus();
+  }
+  // Called once per uuid when every expected Post for every layer has
+  // completed on this receiver.
+  virtual absl::Status OnRecvNetworkComplete(uint64_t uuid) {
+    return absl::OkStatus();
+  }
 
   // The transport address space is historically one block array per manager
   // layer. Explicit pool tables widen that address space to one block array

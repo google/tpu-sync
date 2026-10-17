@@ -589,6 +589,51 @@ void TransferReceiveSession::ExecutePullRequest(
       });
 }
 
+absl::Status TransferReceiveSession::OnRecvProgress(
+    KVCacheManagerWithTransfer& manager) {
+  absl::MutexLock lock(mu_);
+  if (done_ || draining_) {
+    return absl::OkStatus();
+  }
+  if (!any_blocks_received_) {
+    any_blocks_received_ = true;
+    MetricsCollector* const metrics = manager.metrics_collector_.get();
+    if (metrics != nullptr) {
+      metrics->RecordFirstPacket(uuid_);
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status TransferReceiveSession::OnRecvNetworkComplete(
+    KVCacheManagerWithTransfer& manager) {
+  const uint64_t uuid = uuid_;
+  const int numa_node = base_->assigned_numa_node().value_or(-1);
+  std::chrono::steady_clock::time_point session_start_time;
+  bool should_record_duration = false;
+  std::string session_req_id;
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_ || network_completed_) {
+      return absl::OkStatus();
+    }
+    const size_t total_layers = base_ != nullptr ? base_->num_layers() : 0;
+    const bool all_complete =
+        num_completed_layers_ == static_cast<int32_t>(total_layers);
+    should_record_duration = RecordNetworkCompleteLocked(
+        manager.metrics_collector_.get(), all_complete, &session_req_id,
+        &session_start_time);
+  }
+
+  if (should_record_duration) {
+    RecordTransferDuration(
+        DurationMs(session_start_time, std::chrono::steady_clock::now()));
+    LOG(INFO) << "OnRecvNetworkComplete (Network + H2D complete): req_id="
+              << session_req_id << ", uuid=" << uuid << ", numa=" << numa_node;
+  }
+  return absl::OkStatus();
+}
+
 absl::Status TransferReceiveSession::OnBlockShardsReceived(
     KVCacheManagerWithTransfer& manager, const std::vector<int>& block_ids,
     absl::Span<const int> shard_ids) {

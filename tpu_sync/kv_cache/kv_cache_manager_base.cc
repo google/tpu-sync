@@ -2639,6 +2639,29 @@ absl::Status KVCacheManagerBase::EndIncomingPush(uint64_t uuid,
              : absl::OkStatus();
 }
 
+absl::Status KVCacheManagerBase::ValidateRecv(uint64_t uuid) {
+  return transfer_hooks_.validate_recv ? transfer_hooks_.validate_recv(uuid)
+                                       : absl::OkStatus();
+}
+
+absl::Status KVCacheManagerBase::FailRecv(uint64_t uuid,
+                                          const absl::Status& status) {
+  return transfer_hooks_.fail_recv ? transfer_hooks_.fail_recv(uuid, status)
+                                   : absl::OkStatus();
+}
+
+absl::Status KVCacheManagerBase::OnRecvProgress(uint64_t uuid) {
+  return transfer_hooks_.on_recv_progress
+             ? transfer_hooks_.on_recv_progress(uuid)
+             : absl::OkStatus();
+}
+
+absl::Status KVCacheManagerBase::OnRecvNetworkComplete(uint64_t uuid) {
+  return transfer_hooks_.on_recv_network_complete
+             ? transfer_hooks_.on_recv_network_complete(uuid)
+             : absl::OkStatus();
+}
+
 absl::StatusOr<std::optional<tpu_raiden::transport::PoolPushProgressSpec>>
 KVCacheManagerBase::GetPoolPushProgressSpec(size_t pool_idx,
                                             uint64_t uuid) const {

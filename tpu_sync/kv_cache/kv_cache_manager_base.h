@@ -188,6 +188,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     std::function<absl::Status(uint64_t uuid)> begin_incoming_push;
     std::function<absl::Status(uint64_t uuid, const absl::Status& status)>
         end_incoming_push;
+    std::function<absl::Status(uint64_t uuid)> validate_recv;
+    std::function<absl::Status(uint64_t uuid, const absl::Status& status)>
+        fail_recv;
+    std::function<absl::Status(uint64_t uuid)> on_recv_progress;
+    std::function<absl::Status(uint64_t uuid)> on_recv_network_complete;
   };
 
   void SetTransferEventHooks(TransferEventHooks hooks) {
@@ -706,6 +711,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   absl::Status BeginIncomingPush(uint64_t uuid) override;
   absl::Status EndIncomingPush(
       uint64_t uuid, const absl::Status& status = absl::OkStatus()) override;
+  absl::Status ValidateRecv(uint64_t uuid) override;
+  absl::Status FailRecv(uint64_t uuid, const absl::Status& status) override;
+  absl::Status OnRecvProgress(uint64_t uuid) override;
+  absl::Status OnRecvNetworkComplete(uint64_t uuid) override;
 
   absl::StatusOr<std::optional<tpu_raiden::transport::PoolPushProgressSpec>>
   GetPoolPushProgressSpec(size_t pool_idx, uint64_t uuid) const override;

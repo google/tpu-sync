@@ -217,7 +217,13 @@ TEST_F(FaultInjectorTest, WildcardFallsThroughToCapableRule) {
   EXPECT_EQ(
       GetFaultInjector().Evaluate(hooks::kConnPoolBorrowConnectBlackhole).type,
       FaultInjectionType::kFail);
-  EXPECT_EQ(GetFaultInjector().GetHitCount(), 5);
+  EXPECT_EQ(
+      GetFaultInjector().Evaluate(hooks::kRawTransferD2hDispatch).type,
+      FaultInjectionType::kFail);
+  EXPECT_EQ(
+      GetFaultInjector().Evaluate(hooks::kRawTransferH2dDispatch).type,
+      FaultInjectionType::kFail);
+  EXPECT_EQ(GetFaultInjector().GetHitCount(), 7);
 }
 
 TEST_F(FaultInjectorTest, DelayEligibilityRejectsFailOnlyHooks) {

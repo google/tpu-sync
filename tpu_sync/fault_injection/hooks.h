@@ -119,6 +119,12 @@ inline constexpr std::string_view kRawBufferTransportRecvHeader =
 inline constexpr std::string_view kRawBufferTransportSendJitter =
     "raw_buffer_transport.send.jitter";
 
+// Raw transfer, DMA paths.
+inline constexpr std::string_view kRawTransferD2hDispatch =
+    "raw_transfer.d2h.dispatch";
+inline constexpr std::string_view kRawTransferH2dDispatch =
+    "raw_transfer.h2d.dispatch";
+
 // Hooks that support `action = "fail"`
 inline constexpr std::string_view kFailHooks[] = {
     kBlockTransportRecvBlockIds,
@@ -152,6 +158,8 @@ inline constexpr std::string_view kFailHooks[] = {
     kSocketTransportPushRecvAck,
     kRawBufferTransportAccept,
     kRawBufferTransportRecvHeader,
+    kRawTransferD2hDispatch,
+    kRawTransferH2dDispatch,
 };
 
 // Hooks that support `action = "delay"`.

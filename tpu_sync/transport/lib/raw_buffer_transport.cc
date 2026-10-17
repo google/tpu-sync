@@ -57,6 +57,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/blocking_counter.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -70,6 +71,7 @@
 #define IOV_MAX 1024
 #endif
 #include "absl/status/status_macros.h"
+#include "peregrine/src/api/v1/histogram.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/telemetry/label_util.h"
@@ -78,13 +80,13 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
-#include "tpu_sync/transport/lib/histogram.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/socket/util.h"
 
 namespace tpu_raiden::transport::lib {
 
+using ::peregrine::v1::Histogram;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::ReadVExact;
 using ::peregrine::v1::TestOnlyRateLimiter;

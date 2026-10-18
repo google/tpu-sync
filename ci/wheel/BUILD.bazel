@@ -83,6 +83,9 @@ JAX_DEPS = [
     "//tpu_sync/frameworks/jax:jax_test_utils",
     "//tpu_sync/api/jax:kv_cache_manager_jax_py",
     "//tpu_sync/api/jax:weight_synchronizer_jax_py",
+    # TPU buffer provider that Mooncake imports as
+    # tpu_sync.api.jax.mooncake_provider; brings _mooncake_provider.so.
+    "//tpu_sync/api/jax:mooncake_provider",
 ]
 # Excluded (non-OSS internal grpc / global registry):
 # //tpu_sync/api/jax:kv_cache_store depends on

@@ -16,29 +16,9 @@
 # It is only visible to the BlockTransport package.
 
 load("@com_github_google_flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")
-load("@com_github_grpc_grpc//bazel:cc_grpc_library.bzl", "cc_grpc_library")
-load("@com_google_protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
-load("@com_google_protobuf//bazel:proto_library.bzl", "proto_library")
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
-
-proto_library(
-    name = "service_proto",
-    srcs = ["service.proto"],
-)
-
-cc_proto_library(
-    name = "service_cc_proto",
-    deps = [":service_proto"],
-)
-
-cc_grpc_library(
-    name = "service_cc_grpc",
-    srcs = [":service_proto"],
-    grpc_only = True,
-    deps = [":service_cc_proto"],
-)
 
 flatbuffer_cc_library(
     name = "chunk_cc_fbs",
@@ -356,11 +336,12 @@ cc_library(
     hdrs = ["peregrine_control_service.h"],
     deps = [
         ":raw_buffer_transport",
-        ":service_cc_grpc",
-        ":service_cc_proto",
         "//tpu_sync/common:grpc_util",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status:statusor",
+        "@peregrine//peregrine/src/internal/control:message_cc_proto",
+        "@peregrine//peregrine/src/internal/control:message_internal_cc_proto",
+        "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",
     ],
 )
 
@@ -376,13 +357,14 @@ cc_test(
         ":peregrine_control_service",
         ":raw_buffer_transport",
         ":raw_buffer_transport_delegate",
-        ":service_cc_grpc",
-        ":service_cc_proto",
         "//tpu_sync/transport/lib/socket:psp_syscall_mock",
         "//tpu_sync/transport/lib/socket:tcp_psp_helper",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/flags:flag",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@peregrine//peregrine/src/internal/control:message_cc_proto",
+        "@peregrine//peregrine/src/internal/control:message_internal_cc_proto",
+        "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",
     ],
 )

@@ -53,14 +53,15 @@ cc_test(
     deps = [
         ":psp_syscall_mock",
         ":tcp_psp_helper",
-        "//tpu_sync/transport/lib:service_cc_grpc",
-        "//tpu_sync/transport/lib:service_cc_proto",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@peregrine//peregrine/src/internal/control:message_cc_proto",
+        "@peregrine//peregrine/src/internal/control:message_internal_cc_proto",
+        "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",
     ],
 )
 

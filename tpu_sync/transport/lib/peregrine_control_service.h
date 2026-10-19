@@ -18,10 +18,11 @@
 #include "absl/status/statusor.h"
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
+#include "peregrine/src/internal/control/message.pb.h"
+#include "peregrine/src/internal/control/message_internal.pb.h"
+#include "peregrine/src/internal/control/service.grpc.pb.h"
 #include "tpu_sync/common/grpc_util.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
-#include "tpu_sync/transport/lib/service.grpc.pb.h"
-#include "tpu_sync/transport/lib/service.pb.h"
 
 namespace tpu_raiden::transport::lib {
 
@@ -35,8 +36,8 @@ class PeregrineControlServiceImpl final
 
   grpc::Status ProcessUnary(
       grpc::ServerContext* context,
-      const ::peregrine::internal::control::ReqMsg* request,
-      ::peregrine::internal::control::RespMsg* response) override {
+      const ::peregrine::internal::proto::ReqMsg* request,
+      ::peregrine::internal::proto::RespMsg* response) override {
     if (transport_ == nullptr) {
       return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                           "RawBufferTransport is not initialized");

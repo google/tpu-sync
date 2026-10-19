@@ -32,8 +32,9 @@
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/channel_arguments.h"
 #include "grpcpp/support/status.h"
-#include "tpu_sync/transport/lib/service.grpc.pb.h"
-#include "tpu_sync/transport/lib/service.pb.h"
+#include "peregrine/src/internal/control/message.pb.h"
+#include "peregrine/src/internal/control/message_internal.pb.h"
+#include "peregrine/src/internal/control/service.grpc.pb.h"
 #include "tpu_sync/transport/lib/socket/psp_syscall_mock.h"  // NOLINT
 
 namespace tpu_raiden::transport::lib {
@@ -54,8 +55,8 @@ class FakePeregrineService final
 
   grpc::Status ProcessUnary(
       grpc::ServerContext* context,
-      const ::peregrine::internal::control::ReqMsg* request,
-      ::peregrine::internal::control::RespMsg* response) override {
+      const ::peregrine::internal::proto::ReqMsg* request,
+      ::peregrine::internal::proto::RespMsg* response) override {
     if (!request->has_psp_tcp_req() || !request->psp_tcp_req().has_psp()) {
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                           "Missing psp_tcp_req or psp");

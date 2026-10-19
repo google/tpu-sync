@@ -59,7 +59,6 @@ cc_library(
         "//tpu_sync/transport/lib:chunk_serializer",
         "//tpu_sync/transport/lib:peregrine_control_service",
         "//tpu_sync/transport/lib:raw_buffer_transport",
-        "//tpu_sync/transport/lib:service_cc_grpc",
         "//tpu_sync/transport/lib:socket_transport_adapter",
         "//tpu_sync/transport/lib:transport_adapter",
         "//tpu_sync/transport/lib:transport_metrics_exporter",
@@ -79,6 +78,7 @@ cc_library(
         "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@peregrine//peregrine/src/api/v1:socket_util",
+        "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",
         "@xla//xla/tsl/concurrency:future",
     ],
 )

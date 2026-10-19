@@ -29,10 +29,11 @@
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/channel_arguments.h"
 #include "grpcpp/support/status.h"
+#include "peregrine/src/internal/control/message.pb.h"
+#include "peregrine/src/internal/control/message_internal.pb.h"
+#include "peregrine/src/internal/control/service.grpc.pb.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
-#include "tpu_sync/transport/lib/service.grpc.pb.h"
-#include "tpu_sync/transport/lib/service.pb.h"
 #include "tpu_sync/transport/lib/socket/psp_syscall_mock.h"  // NOLINT
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 
@@ -40,8 +41,8 @@ namespace tpu_raiden::transport::lib {
 namespace {
 
 using ::peregrine::internal::control::PeregrineService;
-using ::peregrine::internal::control::ReqMsg;
-using ::peregrine::internal::control::RespMsg;
+using ::peregrine::internal::proto::ReqMsg;
+using ::peregrine::internal::proto::RespMsg;
 using ::testing::NotNull;
 
 class FakeRawDelegate : public RawBufferTransportDelegate {

@@ -37,12 +37,15 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "grpcpp/channel.h"
+#include "peregrine/src/api/v1/ip_util.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/transport/lib/socket/util.h"
 
 namespace tpu_raiden::transport::lib {
 
 namespace {
+using ::peregrine::v1::GetLocalEndpoint;
+
 bool HasReadableData(const int fd) {
   struct pollfd pfd = {.fd = fd, .events = POLLIN};
   return poll(&pfd, /*nfds=*/1, /*timeout=*/0) > 0;

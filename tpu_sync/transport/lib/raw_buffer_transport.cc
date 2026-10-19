@@ -72,6 +72,7 @@
 #endif
 #include "absl/status/status_macros.h"
 #include "peregrine/src/api/v1/histogram.h"
+#include "peregrine/src/api/v1/ip_util.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/telemetry/label_util.h"
@@ -82,13 +83,15 @@
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
-#include "tpu_sync/transport/lib/socket/util.h"
 
 namespace tpu_raiden::transport::lib {
 
+using ::peregrine::v1::GetAddrPortPair;
 using ::peregrine::v1::Histogram;
+using ::peregrine::v1::IsSourceBindEnabled;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::ReadVExact;
+using ::peregrine::v1::SourceIpRoutesToPeer;
 using ::peregrine::v1::TestOnlyRateLimiter;
 using ::peregrine::v1::WriteExact;
 using ::peregrine::v1::WriteVExact;
@@ -865,7 +868,7 @@ absl::Status RawBufferTransport::PullBuffer(
 }
 
 std::string RawBufferTransport::SourceIpForPeer(absl::string_view peer) const {
-  if (!SourceBindEnabled()) return "";
+  if (!IsSourceBindEnabled()) return "";
   std::vector<std::string> routable;
   for (const std::string& local_ip : local_ips_) {
     const absl::StatusOr<bool> routes = SourceIpRoutesToPeer(local_ip, peer);

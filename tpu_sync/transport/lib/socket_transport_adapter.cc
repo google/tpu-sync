@@ -46,6 +46,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "peregrine/src/api/v1/ip_util.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
@@ -55,7 +56,6 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
-#include "tpu_sync/transport/lib/socket/util.h"
 #include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden {
@@ -64,8 +64,10 @@ namespace lib {
 
 namespace {
 
+using ::peregrine::v1::IsSourceBindEnabled;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::ReadVExact;
+using ::peregrine::v1::SourceIpRoutesToPeer;
 using ::peregrine::v1::WriteExact;
 using ::peregrine::v1::WriteVExact;
 using ::tpu_raiden::telemetry::ExtractFirstEndpointIp;
@@ -239,7 +241,7 @@ std::vector<std::string> SourceIpsRoutingToPeer(
 // own NIC (`routable_source_ips` empty).
 std::string SelectSourceIp(absl::Span<const std::string> routable_source_ips,
                            size_t i) {
-  if (!SourceBindEnabled() || routable_source_ips.empty()) return "";
+  if (!IsSourceBindEnabled() || routable_source_ips.empty()) return "";
   return routable_source_ips[i % routable_source_ips.size()];
 }
 
@@ -249,7 +251,7 @@ absl::flat_hash_map<std::string, std::vector<std::string>>
 RoutableSourceIpsByPeer(absl::Span<const std::string> source_ips,
                         absl::Span<const std::string> peers) {
   absl::flat_hash_map<std::string, std::vector<std::string>> by_peer;
-  if (!SourceBindEnabled()) return by_peer;
+  if (!IsSourceBindEnabled()) return by_peer;
   for (const std::string& peer : peers) {
     if (by_peer.contains(peer)) continue;
     by_peer[peer] = SourceIpsRoutingToPeer(source_ips, peer);

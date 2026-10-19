@@ -255,12 +255,21 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       num_blocks: int = 4,
       expected_worker_count: int = 0,
       kv_pool_group: str = "",
+      store_capacity: int | None = None,
   ) -> tuple[
       kv_cache_store.KVCacheStore,
       kv_cache_manager.KVCacheManager,
       kv_cache_store.RaidenId,
   ]:
-    """Creates and binds a paired KVCacheStore and KVCacheManager."""
+    """Creates and binds a paired KVCacheStore and KVCacheManager.
+
+    Args:
+      store_capacity: Host blocks the store may hold (its LRU size and host
+        block pool); defaults to num_blocks. Smaller than num_blocks puts the
+        store under memory pressure, so saves have to evict.
+    """
+    if store_capacity is None:
+      store_capacity = num_blocks
     controller_port = find_free_port()
     worker_port = find_free_port()
     block_elements = 128 * 8 * 8 * 128
@@ -295,7 +304,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       worker_thread = threading.Thread(target=build_manager)
       worker_thread.start()
       store = kv_cache_store.KVCacheStore(
-          capacity=num_blocks,
+          capacity=store_capacity,
           global_registry_address=(
               f"localhost:{_registry_port}" if enable_global_registry else ""
           ),
@@ -319,7 +328,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       manager = built["manager"]
     else:
       store = kv_cache_store.KVCacheStore(
-          capacity=num_blocks,
+          capacity=store_capacity,
           global_registry_address=(
               f"localhost:{_registry_port}" if enable_global_registry else ""
           ),
@@ -436,6 +445,94 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
   )
   def test_e2e_save_and_load(self, use_slices: bool):
     self._run_e2e_save_and_load(use_slices=use_slices)
+
+  def test_save_under_pressure_evicts_lru_and_preserves_survivors(self):
+    """A save into a full host pool evicts the LRU block and reuses its slot.
+
+    This is KV offloading's capacity path: the store holds 2 host blocks, so
+    the third save must reclaim one. A is saved before B but then read back,
+    which makes B the least recently used -- a FIFO policy would evict A, LRU
+    evicts B. The test then checks the three things a correct eviction owes
+    the caller: B is gone (and reported through the eviction callback), C
+    landed in B's recycled host slot, and the bytes of A and C both reload
+    into HBM exactly -- so reusing the slot clobbered neither survivor.
+    """
+    num_device_blocks = 6
+    shape = (num_device_blocks, 128, 8, 8, 128)
+    # Every block holds a distinct arange slice, so a block that landed in
+    # the wrong place, or a stale host slot, cannot compare equal by chance.
+    host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    tpu_cache = torch.tensor(host_data, device=self.device)
+
+    src_a, src_b, src_c = 0, 1, 2  # where each block starts in HBM
+    touch_dst, final_dst_a, final_dst_c = 3, 4, 5  # untouched reload targets
+
+    tag = f"lru_{uuid.uuid4().hex[:8]}"
+    store, manager, rid = self._create_node(
+        tag=tag,
+        job_name="job",
+        tpu_cache=tpu_cache,
+        num_blocks=num_device_blocks,
+        store_capacity=2,
+    )
+    evicted = []
+    store.set_eviction_callback(evicted.extend)
+
+    a, b, c = (f"{tag}_{name}".encode() for name in ("a", "b", "c"))
+
+    def host_block_of(h):
+      hits = store.lookup([h], pin_found=False)
+      self.assertLen(hits, 1, f"{h!r} should be host-resident")
+      entry = hits[0][1]
+      self.assertEqual(entry.status, kv_cache_store.BlockStatus.HOST_AND_HBM)
+      return entry.host_block_id
+
+    def load_into(h, device_block):
+      # lookup() grants the pin a successful load() spends.
+      self.assertLen(store.lookup([h]), 1)
+      self.assertTrue(store.load([h], [device_block]))
+      self._wait_for_load(store)
+
+    try:
+      # 1. Fill the host pool: A first, then B. Each finished save releases
+      #    its pin at the MRU end, so B is now the more recently used.
+      for h, src in ((a, src_a), (b, src_b)):
+        self._insert_hbm_blocks(store, rid, [h], device_blocks=[src])
+        self.assertTrue(store.save([h]))
+        self._wait_for_save(store)
+      host_a, host_b = host_block_of(a), host_block_of(b)
+      self.assertNotEqual(host_a, host_b)
+      self.assertEmpty(evicted, "nothing should be evicted below capacity")
+
+      # 2. Read A back: the load's unpin moves A to the MRU end, making B
+      #    the least recently used.
+      load_into(a, touch_dst)
+
+      # 3. Save C into the full pool: the store must evict exactly B.
+      self._insert_hbm_blocks(store, rid, [c], device_blocks=[src_c])
+      self.assertTrue(store.save([c]))
+      self._wait_for_save(store)
+      self.assertEqual(evicted, [b])
+      self.assertEmpty(store.lookup([b], pin_found=False), "B must be gone")
+      self.assertEqual(host_block_of(a), host_a, "the survivor must not move")
+      self.assertEqual(
+          host_block_of(c), host_b, "C must reuse the slot B's eviction freed"
+      )
+
+      # 4. Reload both survivors into blocks that have not been written yet.
+      load_into(a, final_dst_a)
+      load_into(c, final_dst_c)
+
+      try:
+        torch.accelerator.synchronize()
+      except (AttributeError, RuntimeError):
+        pass
+      actual = tpu_cache.cpu().numpy()
+      np.testing.assert_array_equal(actual[touch_dst], host_data[src_a])
+      np.testing.assert_array_equal(actual[final_dst_a], host_data[src_a])
+      np.testing.assert_array_equal(actual[final_dst_c], host_data[src_c])
+    finally:
+      del manager, store
 
   def _run_remote_read_e2e_test(
       self,

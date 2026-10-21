@@ -65,7 +65,6 @@
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/transport/buffer_push_task.h"
-#include "tpu_sync/transport/lib/transport_adapter.h"
 
 #ifndef IOV_MAX
 #define IOV_MAX 1024

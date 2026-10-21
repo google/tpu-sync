@@ -71,7 +71,6 @@
 #include "tpu_sync/transport/lib/socket/psp_syscall_mock.h" // NOLINT
 #include "tpu_sync/transport/lib/socket/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/socket/util.h"
-#include "tpu_sync/transport/lib/transport_adapter.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {

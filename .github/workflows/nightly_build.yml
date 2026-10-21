@@ -4,10 +4,12 @@
 # torch_tpu) and built inside the ml-build container by
 # ci/build_wheel_impl.sh. Every run keeps the wheels as GitHub Actions
 # artifacts; scheduled runs (and dispatches that opt in) additionally upload
-# them to the tpu-sync Artifact Registry, where they install with:
+# them to the tpu-sync Artifact Registry, where they install with a pinned
+# version from that index only (deps come from PyPI in a separate step; never
+# use --extra-index-url here, see RELEASING.md):
 #
-#   pip install --pre tpu_sync_jax \
-#     --extra-index-url https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/simple/
+#   pip install --pre --no-deps "tpu_sync_jax==<version>" \
+#     --index-url https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/simple/
 #
 # Scheduled runs also publish the nightlies to PyPI as .dev pre-releases
 # through the OSS exit gate (publish_pypi.yml); a dispatch publishes only when

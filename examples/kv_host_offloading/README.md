@@ -48,8 +48,8 @@ In an **activated** python3.12 venv:
    # Build from source (generally available) -- from the repo root:
    ./build.sh jax
 
-   # Or, where the wheel index is reachable (internal-only until PyPI publication):
-   pip install tpu-raiden-jax --extra-index-url https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/simple/
+   # Or install the pre-built wheel from PyPI (`--pre` until the first stable release):
+   pip install --pre tpu-sync-jax
    ```
 
    The run scripts pick up whichever install you did (see `raiden_env.sh`).

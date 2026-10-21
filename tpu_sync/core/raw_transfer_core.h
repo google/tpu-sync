@@ -25,6 +25,7 @@
 
 #include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"  // IWYU pragma: keep
 #include "absl/types/span.h"
@@ -39,6 +40,7 @@
 #include "xla/tsl/concurrency/ref_count.h"
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/xla_compat.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace raiden {
@@ -256,6 +258,8 @@ struct RaidenBufferHandle {
   absl::StatusOr<PJRT_Event*> CopyRawHostToDeviceEvent(const void* src,
                                                        int64_t device_offset,
                                                        int64_t size) const {
+    ABSL_RETURN_IF_ERROR(::tpu_raiden::FaultInjectStatus(
+        ::tpu_raiden::hooks::kRawTransferH2dDispatch));
     PJRT_RawBuffer_CopyRawHostToDevice_Args args;
     args.struct_size = PJRT_RawBuffer_CopyRawHostToDevice_Args_STRUCT_SIZE;
     args.extension_start = nullptr;
@@ -273,6 +277,8 @@ struct RaidenBufferHandle {
   absl::StatusOr<PJRT_Event*> CopyRawDeviceToHostEvent(void* host_ptr,
                                                        int64_t device_offset,
                                                        int64_t size) const {
+    ABSL_RETURN_IF_ERROR(::tpu_raiden::FaultInjectStatus(
+        ::tpu_raiden::hooks::kRawTransferD2hDispatch));
     PJRT_RawBuffer_CopyRawDeviceToHost_Args args;
     args.struct_size = PJRT_RawBuffer_CopyRawDeviceToHost_Args_STRUCT_SIZE;
     args.extension_start = nullptr;
@@ -647,6 +653,8 @@ inline absl::StatusOr<PjRtCopyFuture> IssueD2hShard(
   std::vector<xla::Future<>> fs;
   fs.reserve(copies.size());
   for (const auto& c : copies) {
+    ABSL_RETURN_IF_ERROR(::tpu_raiden::FaultInjectStatus(
+        ::tpu_raiden::hooks::kRawTransferD2hDispatch));
     fs.push_back(hold.CopyRawDeviceToHost(c.dst, c.src_off, c.size));
   }
   return PjRtCopyFuture::FromFuture(
@@ -677,6 +685,8 @@ inline absl::StatusOr<PjRtCopyFuture> IssueH2dShard(
   std::vector<xla::Future<>> fs;
   fs.reserve(copies.size());
   for (const auto& c : copies) {
+    ABSL_RETURN_IF_ERROR(::tpu_raiden::FaultInjectStatus(
+        ::tpu_raiden::hooks::kRawTransferH2dDispatch));
     fs.push_back(hold.CopyRawHostToDevice(c.src, c.dst_off, c.size));
   }
   return PjRtCopyFuture::FromFuture(

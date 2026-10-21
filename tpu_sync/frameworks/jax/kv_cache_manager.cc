@@ -58,6 +58,8 @@
 #include "tpu_sync/kv_cache_offload/backends/backend.h"
 #include "tpu_sync/transport/peer_endpoint.h"
 #ifndef WITHOUT_PYTHON
+#include <nanobind/nanobind.h>
+#include "tpu_sync/frameworks/jax/jax_utils.h"
 #include "tpu_sync/frameworks/jax/utils.h"
 
 namespace nb = nanobind;
@@ -752,6 +754,47 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::D2h(
   return raiden::JoinPjRtCopyFutures(absl::MakeSpan(sub_copy_futures));
 }
 
+#ifndef WITHOUT_PYTHON
+// Dispatches a bulk packed D2H (`device_to_host=true`) or H2D
+// (`device_to_host=false`) PJRT DMA between a Python `jax.Array` staging buffer
+// (`packed_array`, shaped `[bucket_blocks, num_layers, ...]`) and
+// `host_block_ids` across all NUMA sub-managers.
+absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::CopyPacked(
+    const nanobind::object& packed_array,
+    const std::vector<int64_t>& host_block_ids, bool device_to_host,
+    bool unsafe_skip_buffer_lock) {
+  // Extract per-device PJRT buffer handles from `packed_array` once and retain
+  // them in `all_shards` via `AddKeepAlive` so the handles stay valid until
+  // every sub-manager's asynchronous DMA finishes.
+  auto all_shards = std::make_shared<std::vector<raiden::RaidenBufferHandle>>(
+      ::jax::ExtractPjRtBuffersFromPyArray(packed_array,
+                                           unsafe_skip_buffer_lock));
+  std::vector<raiden::PjRtCopyFuture> futures;
+  futures.reserve(sub_managers_.size());
+  for (size_t s = 0; s < sub_managers_.size(); ++s) {
+    // Route only the TPU device shards owned by NUMA sub-manager `s`.
+    std::vector<raiden::RaidenBufferHandle> sub;
+    if (s < submanager_to_global_shards_.size() &&
+        !submanager_to_global_shards_[s].empty()) {
+      for (int64_t g : submanager_to_global_shards_[s]) {
+        sub.push_back((*all_shards)[static_cast<size_t>(g)]);
+      }
+    } else {
+      sub = *all_shards;
+    }
+    ABSL_ASSIGN_OR_RETURN(
+        raiden::PjRtCopyFuture f,
+        sub_managers_[s]->base()->CopyPackedDeviceBuffer(sub, host_block_ids,
+                                                         device_to_host));
+    f.AddKeepAlive(all_shards);
+    futures.push_back(std::move(f));
+  }
+  // Event-aware join required on TPU (where per-shard PJRT C-API copies signal
+  // through `event_bundles` rather than `f.future`).
+  return raiden::JoinPjRtCopyFutures(absl::MakeSpan(futures));
+}
+#endif
+
 absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
 NumaAwareKVCacheManager::D2hAutoAllocate(
     const std::vector<int64_t>& src_offsets,
@@ -1050,6 +1093,29 @@ absl::Status NumaAwareKVCacheManager::UnlockBlocks(
     }
   }
   return absl::OkStatus();
+}
+
+// Allocates and locks `num_blocks` Host DRAM staging block IDs in lockstep
+// across every NUMA sub-manager. Because all sub-managers mirror the same
+// logical host slot pool, healthy allocations return identical IDs; if
+// sub-manager `s` runs out of capacity, already-allocated IDs on `0 .. s - 1`
+// are rolled back so cross-NUMA slot state never diverges.
+absl::StatusOr<std::vector<int>> NumaAwareKVCacheManager::AllocateBlocks(
+    int num_blocks) {
+  std::vector<int> all_ids;
+  for (size_t s = 0; s < sub_managers_.size(); ++s) {
+    auto res = sub_managers_[s]->base()->host_block_manager()->Allocate(
+        num_blocks, /*lock=*/true);
+    if (!res.ok()) {
+      for (size_t prev = 0; prev < s; ++prev) {
+        (void)sub_managers_[prev]->base()->host_block_manager()->Deallocate(
+            all_ids);
+      }
+      return res.status();
+    }
+    if (s == 0) all_ids = std::move(*res);
+  }
+  return all_ids;
 }
 
 std::string NumaAwareKVCacheManager::DumpMetricsToString() const {

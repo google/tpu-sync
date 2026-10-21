@@ -32,7 +32,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <system_error>  // NOLINT(build/c++11)
@@ -53,7 +52,6 @@
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
-#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
@@ -84,6 +82,7 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/block_transport_session.h"
 #include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 
@@ -780,6 +779,19 @@ absl::Status CheckAllLayersHaveHostBuffers(
 
 }  // namespace
 
+// Single reusable pinned/DMA-capable Host DRAM bounce buffer per TPU shard
+// used by `CopyPackedDeviceBuffer`. Held via `std::shared_ptr` so async PJRT
+// completion callbacks can return a buffer safely even if `KVCacheManagerBase`
+// is destroyed concurrently.
+struct KVCacheManagerBase::ShardBounceCache {
+  ShardBounceCache(size_t num_shards, HostBufferAllocator a)
+      : alloc(a ? std::move(a) : MakeDefaultHostBufferAllocator()),
+        slots(num_shards) {}
+  HostBufferAllocator alloc;
+  absl::Mutex mu;
+  std::vector<HostBufferAllocation> slots ABSL_GUARDED_BY(mu);
+};
+
 KVCacheManagerBase::KVCacheManagerBase(
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
@@ -798,7 +810,9 @@ KVCacheManagerBase::KVCacheManagerBase(
                                              layer_buffers[0][0].shape)),
           local_port, parallelism, bind_ip,
           raiden::DetectNumaNodes(layer_buffers), GetLocalHostNicAddresses()),
-      host_allocator_(host_allocator) {
+      host_allocator_(host_allocator),
+      bounce_cache_(
+          std::make_shared<ShardBounceCache>(num_shards_, host_allocator_)) {
   // Validate before the empty-cache early return so an out-of-range value is
   // rejected regardless of how many layers were registered.
   const size_t num_host_layers_to_allocate =
@@ -920,7 +934,9 @@ KVCacheManagerBase::KVCacheManagerBase(
     : RaidenManagerBase(num_layers, BuildDefaultShards(num_shards),
                         slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0],
                         local_port, parallelism, bind_ip),
-      host_allocator_(host_allocator) {
+      host_allocator_(host_allocator),
+      bounce_cache_(
+          std::make_shared<ShardBounceCache>(num_shards_, host_allocator_)) {
   int total_blocks = host_blocks_to_allocate.value_or(0);
   host_block_manager_ = std::make_unique<LogicalBlockManager>(total_blocks);
 
@@ -1116,6 +1132,7 @@ KVCacheManagerBase::~KVCacheManagerBase() {
   push_pool_.reset();
   dma_pool_.reset();
   pull_pool_.reset();
+  bounce_cache_.reset();
   buffer_holds_.clear();
   layers_ = StagingArena();
   host_block_manager_.reset();
@@ -3134,6 +3151,150 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
           << local_futures.size()
           << " buffer futures. Thread: " << std::this_thread::get_id();
   return local_futures;
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture>
+KVCacheManagerBase::CopyPackedDeviceBuffer(
+    absl::Span<const raiden::RaidenBufferHandle> packed_shards,
+    absl::Span<const int64_t> host_block_ids, bool device_to_host) {
+  const absl::Time start_time = absl::Now();
+  if (host_block_ids.empty()) return raiden::PjRtCopyFuture();
+
+  // Compute each layer's per-block byte size (`row_bytes[l]`, supporting both
+  // uniform models and hybrid models with varying layer sizes) and the packed
+  // stride `blk_bytes` of one block across all `num_layers_`. `total_bytes`
+  // covers only the `host_block_ids.size()` live blocks at the front of
+  // `packed_shards`, skipping any trailing XLA bucket-padding blocks.
+  std::vector<int64_t> row_bytes(num_layers_, 0);
+  int64_t blk_bytes = 0;
+  for (size_t l = 0; l < num_layers_; ++l) {
+    row_bytes[l] = layer_block_byte_size(l);
+    blk_bytes += row_bytes[l];
+  }
+  const size_t total_bytes = host_block_ids.size() * static_cast<size_t>(blk_bytes);
+  std::shared_ptr<ShardBounceCache> cache = bounce_cache_;
+  // Translates between Raiden's layer-major, scattered-slot Host DRAM arenas
+  // (`layers_[l].shards[sh].host_ptr + block_id * row_bytes[l]`) and the
+  // contiguous block-major bounce buffer (`[block_idx][layer_idx]`) matching
+  // the packed on-device HBM layout:
+  //   * `to_bounce == true` (H2D): gathers scattered host slots into `bounce`.
+  //   * `to_bounce == false` (D2H): scatters `bounce` into target host slots.
+  auto copy_blocks = [row_bytes, blk_bytes](
+                         absl::Span<uint8_t* const> ptrs,
+                         absl::Span<const int64_t> blks, uint8_t* bounce,
+                         bool to_bounce) {
+    for (size_t i = 0; i < blks.size(); ++i) {
+      uint8_t* bptr = bounce + i * static_cast<size_t>(blk_bytes);
+      size_t off = 0;
+      for (size_t l = 0; l < ptrs.size(); ++l) {
+        const size_t rb = static_cast<size_t>(row_bytes[l]);
+        uint8_t* hp = ptrs[l] + blks[i] * row_bytes[l];
+        if (rb > 0) std::memcpy(to_bounce ? bptr + off : hp, to_bounce ? hp : bptr + off, rb);
+        off += rb;
+      }
+    }
+  };
+
+  auto dispatch_shard =
+      [&](size_t sh) -> absl::StatusOr<raiden::PjRtCopyFuture> {
+    raiden::BufferHoldAndAlias packed_hold(packed_shards[sh]);
+    std::vector<uint8_t*> ptrs(num_layers_);
+    for (size_t l = 0; l < num_layers_; ++l) {
+      ptrs[l] = const_cast<uint8_t*>(layers_[l].shards[sh].host_ptr);
+    }
+    // Check out shard `sh`'s reusable DMA-pinned bounce buffer (grown on
+    // demand), or allocate a temporary one if an async transfer is already in
+    // flight on `sh`.
+    HostBufferAllocation buf;
+    {
+      absl::MutexLock lock(cache->mu);
+      if (cache->slots[sh].size >= total_bytes) {
+        buf = std::exchange(cache->slots[sh], {});
+      } else {
+        cache->slots[sh] = {};
+      }
+    }
+    if (buf.ptr == nullptr) {
+      ABSL_ASSIGN_OR_RETURN(buf, cache->alloc(total_bytes, packed_hold.device));
+    }
+    std::shared_ptr<HostBufferAllocation> lease(
+        new HostBufferAllocation(std::move(buf)),
+        [cache, sh](HostBufferAllocation* p) {
+          if (p->ptr != nullptr && p->size > 0) {
+            absl::MutexLock lock(cache->mu);
+            if (cache->slots[sh].size < p->size) {
+              cache->slots[sh] = std::exchange(*p, {});
+            }
+          }
+          delete p;
+        });
+
+    const auto copy_sz = static_cast<int64_t>(total_bytes);
+    if (device_to_host) {
+      // Issue one contiguous PJRT D2H DMA from offset 0 of `packed_hold` into
+      // `lease->ptr`, then scatter `[block][layer]` slices into `layers_` in
+      // `OnReady` before resolving `done_future` for the caller.
+      ABSL_ASSIGN_OR_RETURN(
+          raiden::PjRtCopyFuture raw_cf,
+          raiden::IssueD2hShard(packed_hold, {{lease->ptr, 0, copy_sz}}));
+      auto [done_promise, done_future] = xla::MakePromise<>();
+      raw_cf.OnReady(
+          [lease = std::move(lease), ptrs = std::move(ptrs),
+           blks = std::vector<int64_t>(host_block_ids.begin(),
+                                       host_block_ids.end()),
+           copy_blocks, done_promise = std::move(done_promise)](
+              absl::StatusOr<raiden::BufferHolders> st) mutable {
+            if (!st.ok()) {
+              done_promise.Set(st.status());
+              return;
+            }
+            copy_blocks(ptrs, blks, lease->ptr, /*to_bounce=*/false);
+            lease.reset();
+            done_promise.Set();
+          });
+      return raiden::PjRtCopyFuture(std::move(done_future), /*holds=*/{});
+    }
+
+    // H2D: gather scattered `host_block_ids` across all layers into
+    // `lease->ptr` first, then issue one contiguous PJRT H2D DMA into offset 0
+    // of `packed_hold`, keeping `lease` alive until PJRT finishes reading it.
+    copy_blocks(ptrs, host_block_ids, lease->ptr, /*to_bounce=*/true);
+    ABSL_ASSIGN_OR_RETURN(
+        raiden::PjRtCopyFuture cf,
+        raiden::IssueH2dShard(packed_hold, {{lease->ptr, 0, copy_sz}}));
+    cf.AddKeepAlive(std::move(lease));
+    return cf;
+  };
+
+  // Run single-shard transfers inline; on multi-chip hosts, fan out across
+  // `dma_pool_` pinned to each TPU device's host NUMA node so bounce-buffer
+  // `memcpy`s and PJRT DMA submissions stay NUMA-local and run concurrently.
+  std::vector<raiden::PjRtCopyFuture> shard_futures(num_shards_);
+  if (num_shards_ <= 1) {
+    ABSL_ASSIGN_OR_RETURN(shard_futures[0], dispatch_shard(0));
+  } else {
+    std::vector<std::future<absl::StatusOr<raiden::PjRtCopyFuture>>> pending;
+    pending.reserve(num_shards_);
+    for (size_t sh = 0; sh < num_shards_; ++sh) {
+      const int node = packed_shards[sh].device
+                           ? GetPjRtDeviceNumaNode(packed_shards[sh].device)
+                           : -1;
+      pending.push_back(dma_pool_->Schedule(
+          node >= 0 ? std::make_optional(node) : std::nullopt,
+          [&dispatch_shard, sh]() { return dispatch_shard(sh); }));
+    }
+    for (size_t sh = 0; sh < num_shards_; ++sh) {
+      ABSL_ASSIGN_OR_RETURN(shard_futures[sh], pending[sh].get());
+    }
+  }
+
+  return JoinAndRecordTelemetry(
+      *this, absl::MakeSpan(shard_futures), start_time,
+      device_to_host ? telemetry::metric_names::kD2hTransferTimeMs
+                     : telemetry::metric_names::kH2dTransferTimeMs,
+      device_to_host ? telemetry::metric_names::kD2hBytesTotal
+                     : telemetry::metric_names::kH2dBytesTotal,
+      static_cast<uint64_t>(total_bytes));
 }
 
 // The transport's block report carries no unit index, and sessions ignore the

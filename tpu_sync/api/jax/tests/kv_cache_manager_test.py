@@ -541,6 +541,95 @@ class KVCacheManagerJaxTest(parameterized.TestCase):
 
     self.assertTrue(done_prod, "Producer did not finish sending in time")
 
+  def test_hbm_staging_fragmented_d2h_and_h2d_with_donated_caches(self):
+    # Verifies the HBM-staged bulk transfer path (`enable_hbm_staging=True`)
+    # end to end across:
+    #   1. Non-power-of-two (5-block) scattered `d2h_auto_allocate` -> `h2d`.
+    #   2. JAX buffer donation (`donate_argnums`) invalidating initial
+    #      `kv_caches` before D2H and again between consecutive H2D scatters.
+    #   3. Safe no-op handling of empty (`[]`) and zero-size (`copy_sizes=[0]`)
+    #      transfers without allocating host blocks or clobbering caches.
+    tpu_sharding = self.setup_shardings()
+    shape = (8, 128, 8, 8, 128)
+    key = jax.random.key(2026)
+
+    src_refs = []
+    caches = []
+    for i in range(self.num_layers):
+      sub_key = jax.random.fold_in(key, i)
+      dev_arr, host_ref = self._generate_random_cache(
+          sub_key, shape, jnp.bfloat16, tpu_sharding
+      )
+      caches.append(dev_arr)
+      src_refs.append(host_ref)
+    jax.block_until_ready(caches)
+
+    engine = KVCacheManager(
+        kv_caches=caches,
+        local_control_port=0,
+        host_blocks_to_allocate=8,
+        unsafe_skip_buffer_lock=self.skip_lock,
+        enable_hbm_staging=True,
+    )
+
+    # Simulate an inference forward step donating and invalidating the initial
+    # `caches` buffers that `engine` saw at construction time.
+    donate_step = jax.jit(lambda xs: [x for x in xs], donate_argnums=(0,))
+    step_caches = donate_step(caches)
+    jax.block_until_ready(step_caches)
+
+    # Offload 5 scattered HBM blocks (non-power-of-two count: padded to an
+    # 8-block gather bucket in HBM, streamed via a 5-block bulk D2H DMA).
+    src_blocks = [7, 2, 5, 0, 3]
+    allocated_chunks, save_fut = engine.d2h_auto_allocate(
+        src_blocks, kv_caches=step_caches
+    )
+    save_fut.Await()
+
+    # Empty / zero-size `d2h_auto_allocate`, `d2h`, and `h2d` calls must return
+    # immediately ready futures without allocating host slots or overwriting
+    # previously saved host blocks or live device caches.
+    empty_chunks, empty_fut = engine.d2h_auto_allocate([], kv_caches=step_caches)
+    self.assertEqual(empty_chunks, [])
+    self.assertTrue(empty_fut.IsReady())
+    empty_fut.Await()
+    zero_chunks, zero_fut = engine.d2h_auto_allocate(
+        [0], [0], kv_caches=step_caches
+    )
+    self.assertEqual(zero_chunks, [])
+    zero_fut.Await()
+    engine.d2h([0], [0], [0], kv_caches=step_caches).Await()
+
+    # Recall the 5 host chunks into 5 different scattered HBM destination blocks
+    # `[6, 1, 4, 0, 5]` (decomposed into 4 + 1 power-of-two scatter buckets),
+    # then donate `engine.kv_caches` in a second step and repeat H2D to confirm
+    # no stale/donated buffer reference is retained across steps.
+    dst_caches = [
+        jax.device_put(jnp.zeros(shape, dtype=jnp.bfloat16), tpu_sharding)
+        for _ in range(self.num_layers)
+    ]
+    jax.block_until_ready(dst_caches)
+    engine.h2d([0], [0], [0], kv_caches=dst_caches).Await()
+    dst_blocks = [6, 1, 4, 0, 5]
+    engine.h2d(allocated_chunks, dst_blocks, kv_caches=dst_caches).Await()
+    step2_caches = donate_step(engine.kv_caches)
+    jax.block_until_ready(step2_caches)
+    engine.h2d(allocated_chunks, dst_blocks, kv_caches=step2_caches).Await()
+
+    # Targeted blocks match the offloaded source blocks; untouched HBM blocks
+    # remain zeroed.
+    untouched = sorted(set(range(8)) - set(dst_blocks))
+    for layer_idx in range(self.num_layers):
+      actual = np.asarray(engine.kv_caches[layer_idx])
+      for dst_blk, orig_blk in zip(dst_blocks, src_blocks):
+        np.testing.assert_array_equal(
+            actual[dst_blk], src_refs[layer_idx][orig_blk]
+        )
+      for blk in untouched:
+        np.testing.assert_array_equal(actual[blk], 0)
+
+    engine.unlock_blocks(allocated_chunks)
+
 
 if __name__ == "__main__":
   absltest.main()

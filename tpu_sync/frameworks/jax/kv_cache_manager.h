@@ -171,6 +171,11 @@ class NumaAwareKVCacheManager {
   CompleteReadRaw();
 
   absl::Status UnlockBlocks(const std::vector<int>& block_ids);
+  // Reserves and locks `num_blocks` Host DRAM staging block IDs in lockstep
+  // across all NUMA sub-managers without starting a legacy per-layer DMA
+  // (rolling back partial allocations on failure). Used by Python's HBM-staged
+  // `d2h_auto_allocate` path before streaming packed blocks via `CopyPacked`.
+  absl::StatusOr<std::vector<int>> AllocateBlocks(int num_blocks);
 
   void RegisterKVBackends(absl::Span<const kv_cache::BackendConfig> configs) {
     for (auto& sub_manager : sub_managers_) {
@@ -197,6 +202,17 @@ class NumaAwareKVCacheManager {
       std::optional<int64_t> slot_idx = std::nullopt,
       std::optional<size_t> layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt);
+
+#ifndef WITHOUT_PYTHON
+  // Transfers `host_block_ids.size()` blocks across all layers between a
+  // pre-packed Python `jax.Array` (`[bucket_blocks, num_layers, ...]`) and
+  // Host DRAM slots in a single bulk PJRT DMA per TPU shard (`device_to_host`
+  // selects D2H vs H2D).
+  absl::StatusOr<raiden::PjRtCopyFuture> CopyPacked(
+      const nanobind::object& packed_array,
+      const std::vector<int64_t>& host_block_ids, bool device_to_host,
+      bool unsafe_skip_buffer_lock = false);
+#endif
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
   D2hAutoAllocate(const std::vector<int64_t>& src_offsets_major_dim = {},
@@ -465,6 +481,12 @@ class KVCacheManager {
     return numa_manager_->UnlockBlocks(block_ids);
   }
 
+  // Reserves and locks `num_blocks` Host DRAM staging slots in lockstep across
+  // all NUMA sub-managers (see `NumaAwareKVCacheManager::AllocateBlocks`).
+  absl::StatusOr<std::vector<int>> AllocateBlocks(int num_blocks) {
+    return numa_manager_->AllocateBlocks(num_blocks);
+  }
+
   std::string DumpMetricsToString() const {
     return numa_manager_->DumpMetricsToString();
   }
@@ -492,6 +514,19 @@ class KVCacheManager {
                               copy_sizes_major_dim, slot_idx, layer_idx,
                               shard_idx);
   }
+
+#ifndef WITHOUT_PYTHON
+  // Transfers `host_block_ids.size()` blocks across all layers between a
+  // pre-packed HBM `jax.Array` and Host DRAM in one bulk PJRT DMA per shard
+  // (see `NumaAwareKVCacheManager::CopyPacked`).
+  absl::StatusOr<raiden::PjRtCopyFuture> CopyPacked(
+      const nanobind::object& packed_array,
+      const std::vector<int64_t>& host_block_ids, bool device_to_host,
+      bool unsafe_skip_buffer_lock = false) {
+    return numa_manager_->CopyPacked(packed_array, host_block_ids,
+                                     device_to_host, unsafe_skip_buffer_lock);
+  }
+#endif
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
   D2hAutoAllocate(const std::vector<int64_t>& src_offsets_major_dim = {},

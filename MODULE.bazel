@@ -191,6 +191,29 @@ git_override(
     remote = "https://github.com/google/perfetto.git",
 )
 
+# Mooncake's TPU buffer provider ABI header, for
+# //tpu_sync/frameworks/jax:_mooncake_provider. google3 imports the same file at
+# the same commit as //third_party/mooncake; keep the two pins in sync.
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "mooncake",
+    build_file_content = """
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "tpu_buffer_provider",
+    hdrs = ["mooncake-transfer-engine/tent/include/tent/platform/tpu_buffer_provider.h"],
+    include_prefix = "third_party/mooncake",
+    strip_include_prefix = "mooncake-transfer-engine/tent/include/tent/platform",
+    visibility = ["//visibility:public"],
+)
+""",
+    sha256 = "4dd5e3bbe925124600b23bf0d2eeb62dadadbe2cabcc4def4eec80227b7c7e2f",
+    strip_prefix = "Mooncake-047ae35a95023ef2a462773052e89d746ae7ec70",
+    urls = ["https://github.com/kvcache-ai/Mooncake/archive/047ae35a95023ef2a462773052e89d746ae7ec70.tar.gz"],
+)
+
 # Single-sources the wheel version from pyproject.toml [project].version and
 # appends WHEEL_VERSION_EXTRAS (e.g. ".dev<timestamp>"). Consumed by
 # //ci/wheel:raiden_wheel via @raiden_version//:version.bzl.

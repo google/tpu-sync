@@ -159,6 +159,7 @@ if [ "$BUILD_JAX" = true ]; then
   BAZEL_TARGETS+=(
     "//tpu_sync/frameworks/jax:_tpu_raiden_jax"
     "//tpu_sync/frameworks/jax:_weight_synchronizer_ffi"
+    "//tpu_sync/frameworks/jax:_mooncake_provider"
   )
 else
   DEFINE_FLAGS+=" --define with_jax=false"
@@ -415,6 +416,7 @@ if [ "$BUILD_JAX" = true ]; then
   echo "Copying JAX artifacts..."
   cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/jax/_tpu_raiden_jax.so" "${WORKSPACE_DIR}/tpu_sync/frameworks/jax/"
   cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/jax/_weight_synchronizer_ffi.so" "${WORKSPACE_DIR}/tpu_sync/frameworks/jax/"
+  cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/jax/_mooncake_provider.so" "${WORKSPACE_DIR}/tpu_sync/frameworks/jax/"
 fi
 
 if [ "${BUILD_TORCH}" = true ]; then

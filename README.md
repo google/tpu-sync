@@ -240,6 +240,20 @@ If you'd like to try out TPU Sync and see it in action, please refer to the [`ex
 
 For detailed execution instructions, dependencies, and shell scripts, consult the root [Examples README](examples/README.md).
 
+### Mooncake TPU Buffer Provider
+
+The JAX wheel ships a TPU buffer provider for [Mooncake](https://github.com/kvcache-ai/Mooncake)'s TENT transfer engine, which stages TPU data through host DRAM. Mooncake finds it by default as `tpu_sync.api.jax.mooncake_provider`:
+
+```python
+from mooncake import tpu
+
+shards = tpu.prepare(kv_caches)  # Exports every addressable shard of each array.
+# ... create the Mooncake TENT TransferEngine ...
+tpu.register_with_engine(engine, shards)
+```
+
+An exported shard keeps its HBM allocated until Mooncake releases it, but Mooncake's copies are not ordered with JAX. While shards are registered, do not write the arrays from JAX during a transfer, and do not donate them. See [`mooncake_provider.h`](tpu_sync/frameworks/jax/mooncake_provider.h) for the full contract.
+
 ### Persistent Shared Memory Cache (TPU/Host Buffer Persistence)
 
 TPU Sync supports allocating host memory staging buffers in POSIX Shared Memory (`/dev/shm`). This allows preserving the KV cache in DRAM when the model serving process terminates (e.g., during serving binary updates), preventing cold starts on process restarts.

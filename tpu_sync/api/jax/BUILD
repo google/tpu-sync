@@ -105,5 +105,17 @@ py_test(
     ],
 )
 
+# TPU buffer provider for Mooncake TENT. Mooncake imports it by this module
+# path (tpu_sync.api.jax.mooncake_provider).
+py_library(
+    name = "mooncake_provider",
+    srcs = ["mooncake_provider.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tpu_sync/frameworks/jax:_mooncake_provider",
+        "@jax//jax",
+    ],
+)
+
 # Keep Copybara happy by maintaining at least one internal reference target prefix reference:
 # //:dummy_target

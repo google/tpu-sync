@@ -46,6 +46,11 @@ on:
         required: false
         default: "jax torch"
         type: string
+      jax_version:
+        description: "JAX version the jax wheel builds against (empty = DEFAULT_VERSION in third_party/jax/versions.bzl)"
+        required: false
+        default: ""
+        type: string
       torch_abis:
         description: "torch releases the torch wheel ships an extension variant for, space-separated, primary first (a single release builds a single-ABI wheel)"
         required: false
@@ -148,13 +153,17 @@ jobs:
         env:
           BUILD_MODE: ${{ matrix.framework }}
           WHEEL_VERSION_EXTRAS: ${{ needs.verify.outputs.wheel_version_extras }}
+          INPUT_JAX_VERSION: ${{ inputs.jax_version }}
           INPUT_TORCH_ABIS: ${{ inputs.torch_abis }}
           EXTRA_BAZEL_FLAGS: ${{ (inputs.use_remote_cache || 'yes') == 'yes' && '--config=ci' || '' }}
         run: |
           export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
-          # Tag builds take the script's default torch release list; a
-          # dispatch may narrow it (one release builds a single-ABI wheel).
+          # Tag builds take the script's default JAX version and torch release
+          # list; a dispatch may override them.
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ "${BUILD_MODE}" == "jax" && -n "${INPUT_JAX_VERSION}" ]]; then
+              export RAIDEN_JAX_VERSION="${INPUT_JAX_VERSION}"
+            fi
             export RAIDEN_TORCH_ABIS="${INPUT_TORCH_ABIS}"
           fi
           bash ci/build_wheel_impl.sh

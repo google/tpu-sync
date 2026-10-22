@@ -46,11 +46,12 @@ TPU Sync is actively validated and optimized for the following accelerator gener
 ### Supported JAX versions
 
 tpu-raiden builds against one JAX version at a time, chosen at build time (defaults to 0.11.2). All
-six are validated the same way: the extension builds, `raw_transfer_test`
+seven are validated the same way: the extension builds, `raw_transfer_test`
 passes, and the full `run_tests.sh jax` suite passes on TPU.
 
 | JAX / jaxlib | libtpu | XLA | abseil | Status |
 | --- | --- | --- | --- | --- |
+| 0.12.0 | 0.0.50 | `d8679698` | 20260526.0 | Supported |
 | 0.11.2 | 0.0.48 | `f60be94c` | 20260526.0 | **Default** |
 | 0.11.1 | 0.0.48 | `f85cfbe2` | 20260526.0 | Supported |
 | 0.11.0 | 0.0.47 | `131bf41a` | 20260526.0 | Supported |

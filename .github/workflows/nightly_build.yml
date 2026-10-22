@@ -37,6 +37,11 @@ on:
     - cron: "0 8 * * *"  # 08:00 UTC daily
   workflow_dispatch:
     inputs:
+      jax_version:
+        description: "JAX version the jax wheel builds against (empty = DEFAULT_VERSION in third_party/jax/versions.bzl)"
+        required: false
+        default: ""
+        type: string
       upload_to_registry:
         description: "Upload wheels to the tpu-sync Artifact Registry?"
         type: choice
@@ -134,6 +139,7 @@ jobs:
         working-directory: tpu-sync
         env:
           BUILD_MODE: ${{ matrix.framework }}
+          RAIDEN_JAX_VERSION: ${{ matrix.framework == 'jax' && inputs.jax_version || '' }}
           WHEEL_VERSION_EXTRAS: ${{ needs.version.outputs.wheel_version_extras }}
           EXTRA_BAZEL_FLAGS: ${{ (inputs.use_remote_cache || 'yes') == 'yes' && '--config=ci' || '' }}
         run: |

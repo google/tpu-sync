@@ -27,6 +27,7 @@ cc_library(
         ":jax_1100": ["RAIDEN_JAX=1100"],
         ":jax_1101": ["RAIDEN_JAX=1101"],
         ":jax_1102": ["RAIDEN_JAX=1102"],
+        ":jax_1200": ["RAIDEN_JAX=1200"],
         "//conditions:default": ["RAIDEN_JAX=1102"],
     }),
 )
@@ -59,4 +60,9 @@ config_setting(
 config_setting(
     name = "jax_1102",
     define_values = {"raiden_jax": "1102"},
+)
+
+config_setting(
+    name = "jax_1200",
+    define_values = {"raiden_jax": "1200"},
 )

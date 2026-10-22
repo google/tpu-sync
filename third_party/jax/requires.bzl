@@ -20,6 +20,7 @@ load(":0.10.2/deps.bzl", _deps_0_10_2 = "DEPS")
 load(":0.11.0/deps.bzl", _deps_0_11_0 = "DEPS")
 load(":0.11.1/deps.bzl", _deps_0_11_1 = "DEPS")
 load(":0.11.2/deps.bzl", _deps_0_11_2 = "DEPS")
+load(":0.12.0/deps.bzl", _deps_0_12_0 = "DEPS")
 
 _DEPS_BY_SETTING = {
     "//third_party/jax:jax_1000": _deps_0_10_0,
@@ -28,6 +29,7 @@ _DEPS_BY_SETTING = {
     "//third_party/jax:jax_1100": _deps_0_11_0,
     "//third_party/jax:jax_1101": _deps_0_11_1,
     "//third_party/jax:jax_1102": _deps_0_11_2,
+    "//third_party/jax:jax_1200": _deps_0_12_0,
 }
 
 _DEFAULT_DEPS = _deps_0_11_2

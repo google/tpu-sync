@@ -1,0 +1,429 @@
+# Cuts a golden commit: a commit on main whose tpu_sync_torch nightly wheel
+# passed the two downstream canaries that consume it, recorded in lkg.version
+# and verified_commits.csv and tagged golden-YYYYMMDD. RELEASING.md describes
+# the process; ci/golden/golden_commit.py does the work of each job.
+#
+# What runs:
+#   resolve         The candidate: the newest tpu-sync-torch .dev release on
+#                   PyPI (or the tpu_sync_torch_version input) and the main
+#                   commit its nightly was built from.
+#   vllm_canary     A build of the vllm-torchtpu canary pipeline on Buildkite
+#                   (vllm-torchtpu-torchtpu-nightly) with the candidate layered
+#                   over the base image (TORCHTPU_NIGHTLY_LEG=tpu-sync), every
+#                   lane, waited for.
+#   sglang_canary   A dispatch of sglang-torchtpu's "Nightly Test (TPU - Remote
+#                   Wheel)" workflow with wheel=tpu-sync-torch==<candidate>:
+#                   feature validation and perf, waited for.
+#   record          Both green: lkg.version and verified_commits.csv updated in
+#                   a pull request labeled "pull ready", which Copybara imports
+#                   into Piper (the source of truth) and exports back to main;
+#                   the candidate commit tagged golden-YYYYMMDD.
+#   bump_downstream (opt-in, bump_downstream=yes) Pull requests on
+#                   vllm-torchtpu and sglang-torchtpu that move their
+#                   tpu-sync-torch pin to the candidate.
+#   report          A failure opens an issue naming the candidate and the runs.
+#
+# A GitHub-hosted job stops after six hours and the canaries can take longer
+# (queueing included), so the waits are resumable: rerun the workflow by hand
+# with vllm_build_number and sglang_run_id set to the numbers the first run
+# printed, and it waits for those instead of starting new ones.
+#
+# Secrets (repository settings):
+#   BUILDKITE_API_TOKEN   Buildkite token of the "vllm" organization with
+#                         read_builds and write_builds.
+#   SGLANG_GITHUB_TOKEN   GitHub token with actions:write (and contents:read) on
+#                         sgl-project/sglang-torchtpu, to dispatch and read runs.
+#   GOLDEN_COMMIT_TOKEN   GitHub token with contents:write and
+#                         pull_requests:write on this repository. The record
+#                         pull request is opened with it so that CI runs on it
+#                         (events from the workflow's own GITHUB_TOKEN start no
+#                         workflows, and Copybara waits for the Bazel CPU unit
+#                         tests check). Falls back to GITHUB_TOKEN, which
+#                         leaves the pull request without checks.
+#   DOWNSTREAM_PR_TOKEN   GitHub token with contents:write and
+#                         pull_requests:write on vllm-project/vllm-torchtpu and
+#                         sgl-project/sglang-torchtpu, or on forks of them.
+# Variables:
+#   vars.DOWNSTREAM_FORK_OWNER  (optional) GitHub owner whose forks the bump
+#                               branches are pushed to, when the token cannot
+#                               push to the downstream repositories.
+#   vars.VLLM_CANARY_PIPELINE   (optional) Buildkite pipeline slug of the
+#                               canary (default vllm-torchtpu-torchtpu-nightly).
+
+name: Golden Commit
+
+on:
+  schedule:
+    # Mondays 16:00 UTC: the 08:00 UTC nightly has long been on PyPI, and the
+    # canaries run in the US morning, when their on-calls are around.
+    - cron: "0 16 * * 1"
+  workflow_dispatch:
+    inputs:
+      tpu_sync_torch_version:
+        description: "tpu-sync-torch nightly to verify, e.g. 0.0.1.dev20261013083150 (default: newest on PyPI)"
+        required: false
+        default: ""
+        type: string
+      vllm_build_number:
+        description: "Resume: wait for this vllm-torchtpu canary build instead of starting one"
+        required: false
+        default: ""
+        type: string
+      sglang_run_id:
+        description: "Resume: wait for this sglang-torchtpu run instead of dispatching one"
+        required: false
+        default: ""
+        type: string
+      bump_downstream:
+        description: "Open the pin-bump pull requests on vllm-torchtpu and sglang-torchtpu?"
+        type: choice
+        default: "no"
+        options:
+          - "no"
+          - "yes"
+      dry_run:
+        description: "Verify only: no record pull request, tag, or downstream pull requests"
+        type: choice
+        default: "no"
+        options:
+          - "no"
+          - "yes"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  GOLDEN: python3 ci/golden/golden_commit.py
+
+jobs:
+  resolve:
+    name: "Resolve candidate"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.tpu_sync_torch_version }}
+      sha: ${{ steps.resolve.outputs.tpu_sync_commit }}
+      nightly_run_url: ${{ steps.resolve.outputs.nightly_run_url }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+      - id: resolve
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.tpu_sync_torch_version }}
+        run: |
+          ARGS=()
+          if [[ -n "${INPUT_VERSION}" ]]; then
+            ARGS+=(--version "${INPUT_VERSION}")
+          fi
+          ${GOLDEN} resolve "${ARGS[@]}"
+      - name: Summarize
+        env:
+          VERSION: ${{ steps.resolve.outputs.tpu_sync_torch_version }}
+          SHA: ${{ steps.resolve.outputs.tpu_sync_commit }}
+          RUN_URL: ${{ steps.resolve.outputs.nightly_run_url }}
+        run: |
+          {
+            echo "## Golden candidate"
+            echo
+            echo "- tpu-sync-torch: \`${VERSION}\`"
+            echo "- commit: [\`${SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${SHA})"
+            echo "- nightly: ${RUN_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  vllm_canary:
+    name: "vllm-torchtpu canary"
+    needs: resolve
+    runs-on: ubuntu-latest
+    # Under the six-hour limit of a hosted job; see the header for resuming.
+    timeout-minutes: 350
+    outputs:
+      build_url: ${{ steps.start.outputs.vllm_build_url }}
+      build_number: ${{ steps.start.outputs.vllm_build_number }}
+    env:
+      BUILDKITE_API_TOKEN: ${{ secrets.BUILDKITE_API_TOKEN }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      PIPELINE: ${{ vars.VLLM_CANARY_PIPELINE || 'vllm-torchtpu-torchtpu-nightly' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+      # Starting and waiting are separate steps so that the build number is a
+      # job output as soon as the build exists, whatever happens to the wait.
+      - id: start
+        env:
+          BUILD_NUMBER: ${{ inputs.vllm_build_number }}
+        run: |
+          ARGS=(--version "${VERSION}" --pipeline "${PIPELINE}" --no-wait)
+          if [[ -n "${BUILD_NUMBER}" ]]; then
+            ARGS+=(--build-number "${BUILD_NUMBER}")
+          fi
+          ${GOLDEN} vllm "${ARGS[@]}"
+      - id: wait
+        env:
+          BUILD_NUMBER: ${{ steps.start.outputs.vllm_build_number }}
+        run: ${GOLDEN} vllm --version "${VERSION}" --pipeline "${PIPELINE}" --build-number "${BUILD_NUMBER}" --timeout-minutes 340
+      - name: Summarize
+        if: always()
+        env:
+          BUILD_URL: ${{ steps.start.outputs.vllm_build_url }}
+          BUILD_NUMBER: ${{ steps.start.outputs.vllm_build_number }}
+          STATE: ${{ steps.wait.outputs.vllm_build_state }}
+        run: |
+          echo "vllm-torchtpu canary: ${BUILD_URL:-not started} (build ${BUILD_NUMBER:-n/a}, ${STATE:-unfinished})" >> "$GITHUB_STEP_SUMMARY"
+
+  sglang_canary:
+    name: "sglang-torchtpu remote wheel"
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    outputs:
+      run_url: ${{ steps.start.outputs.sglang_run_url }}
+      run_id: ${{ steps.start.outputs.sglang_run_id }}
+    env:
+      SGLANG_GITHUB_TOKEN: ${{ secrets.SGLANG_GITHUB_TOKEN }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+      - id: start
+        env:
+          RUN_ID: ${{ inputs.sglang_run_id }}
+        run: |
+          ARGS=(--version "${VERSION}" --no-wait)
+          if [[ -n "${RUN_ID}" ]]; then
+            ARGS+=(--run-id "${RUN_ID}")
+          fi
+          ${GOLDEN} sglang "${ARGS[@]}"
+      - id: wait
+        env:
+          RUN_ID: ${{ steps.start.outputs.sglang_run_id }}
+        run: ${GOLDEN} sglang --version "${VERSION}" --run-id "${RUN_ID}" --timeout-minutes 340
+      - name: Summarize
+        if: always()
+        env:
+          RUN_URL: ${{ steps.start.outputs.sglang_run_url }}
+          RUN_ID: ${{ steps.start.outputs.sglang_run_id }}
+          CONCLUSION: ${{ steps.wait.outputs.sglang_run_conclusion }}
+        run: |
+          echo "sglang-torchtpu remote wheel: ${RUN_URL:-not started} (run ${RUN_ID:-n/a}, ${CONCLUSION:-unfinished})" >> "$GITHUB_STEP_SUMMARY"
+
+  record:
+    name: "Record golden commit"
+    needs: [resolve, vllm_canary, sglang_canary]
+    if: inputs.dry_run != 'yes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+      tag: ${{ steps.record.outputs.golden_tag }}
+    env:
+      GH_TOKEN: ${{ secrets.GOLDEN_COMMIT_TOKEN || github.token }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      VLLM_URL: ${{ needs.vllm_canary.outputs.build_url }}
+      SGLANG_URL: ${{ needs.sglang_canary.outputs.run_url }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check the candidate is on main
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "${SHA}" origin/main; then
+            echo "ERROR: ${SHA} is not reachable from origin/main; golden commits are cut from main only." >&2
+            exit 1
+          fi
+      # The branch carries only the two record files, on top of main as it is
+      # now, so the import is a one-CL change whatever landed since the
+      # candidate.
+      - id: branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BRANCH="golden/${VERSION}"
+          git checkout -B "${BRANCH}" origin/main
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+      - id: record
+        run: ${GOLDEN} record --sha "${SHA}" --version "${VERSION}" --vllm-url "${VLLM_URL}" --sglang-url "${SGLANG_URL}"
+      - name: Tag the golden commit
+        env:
+          TAG: ${{ steps.record.outputs.golden_tag }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
+            echo "${TAG} exists already; leaving it"
+          else
+            git tag -a "${TAG}" "${SHA}" -m "tpu-sync-torch ${VERSION}: passed ${VLLM_URL} and ${SGLANG_URL}"
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${TAG}"
+          fi
+      - id: pr
+        name: Open the record pull request
+        env:
+          TAG: ${{ steps.record.outputs.golden_tag }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          PR_URL=$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${BRANCH}" --state open --json url --jq '.[0].url')
+          if [[ -n "${PR_URL}" ]]; then
+            echo "open pull request exists: ${PR_URL}"
+            echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git add lkg.version verified_commits.csv
+          if git diff --cached --quiet; then
+            echo "main already records ${SHA} for ${VERSION}; nothing to send"
+            echo "pr_url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "Record golden commit ${SHA:0:12} (tpu-sync-torch ${VERSION})"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+          cat > "${RUNNER_TEMP}/pr_body.md" <<EOF
+          Golden commit: ${SHA} (tag \`${TAG}\`), the main commit of nightly \`tpu-sync-torch==${VERSION}\`.
+
+          Verified by:
+          - vllm-torchtpu canary: ${VLLM_URL}
+          - sglang-torchtpu remote wheel: ${SGLANG_URL}
+
+          Updates \`lkg.version\` and appends the row to \`verified_commits.csv\`.
+          Opened by the Golden Commit workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          PR_URL=$(gh pr create --repo "${GITHUB_REPOSITORY}" --base main --head "${BRANCH}" \
+            --title "Record golden commit ${SHA:0:12} (tpu-sync-torch ${VERSION})" \
+            --label "pull ready" \
+            --body-file "${RUNNER_TEMP}/pr_body.md")
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+          echo "Record pull request: ${PR_URL}" >> "$GITHUB_STEP_SUMMARY"
+
+  bump_downstream:
+    name: "Bump ${{ matrix.downstream.repo }}"
+    needs: [resolve, record]
+    if: inputs.dry_run != 'yes' && inputs.bump_downstream == 'yes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        downstream:
+          - name: vllm
+            repo: vllm-project/vllm-torchtpu
+          - name: sglang
+            repo: sgl-project/sglang-torchtpu
+    env:
+      GH_TOKEN: ${{ secrets.DOWNSTREAM_PR_TOKEN }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      TAG: ${{ needs.record.outputs.tag }}
+      REPO: ${{ matrix.downstream.repo }}
+      FORK_OWNER: ${{ vars.DOWNSTREAM_FORK_OWNER }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+          path: tpu-sync
+      - name: Open the pin-bump pull request
+        run: |
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "DOWNSTREAM_PR_TOKEN is not set; no pull request on ${REPO}" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          BRANCH="tpu-sync-golden/${VERSION}"
+          PUSH_REPO="${REPO}"
+          HEAD_REF="${BRANCH}"
+          if [[ -n "${FORK_OWNER}" ]]; then
+            PUSH_REPO="${FORK_OWNER}/${REPO#*/}"
+            HEAD_REF="${FORK_OWNER}:${BRANCH}"
+          fi
+          if gh pr list --repo "${REPO}" --head "${HEAD_REF}" --state open --json url --jq '.[0].url' | grep -q .; then
+            echo "open pull request exists on ${REPO}: $(gh pr list --repo "${REPO}" --head "${HEAD_REF}" --state open --json url --jq '.[0].url')" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" downstream
+          cd downstream
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${BRANCH}"
+          python3 ../tpu-sync/ci/golden/golden_commit.py bump --downstream "${{ matrix.downstream.name }}" --repo-dir . --version "${VERSION}"
+          if git diff --quiet; then
+            echo "${REPO} already pins tpu-sync-torch==${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git commit -am "Bump tpu-sync-torch to ${VERSION} (golden ${SHA:0:12})"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${PUSH_REPO}.git" "HEAD:refs/heads/${BRANCH}"
+          cat > "${RUNNER_TEMP}/pr_body.md" <<EOF
+          Moves the \`tpu-sync-torch\` pin to \`${VERSION}\`, the nightly of tpu-sync golden commit ${SHA}
+          (tag \`${TAG}\`, https://github.com/google/tpu-sync/commit/${SHA}).
+
+          The candidate passed this repository's canary with the wheel layered over the current pins;
+          see the Golden Commit run: https://github.com/google/tpu-sync/actions/runs/${GITHUB_RUN_ID}
+
+          Opened by the tpu-sync Golden Commit workflow.
+          EOF
+          PR_URL=$(gh pr create --repo "${REPO}" --base main --head "${HEAD_REF}" \
+            --title "Bump tpu-sync-torch to ${VERSION}" \
+            --body-file "${RUNNER_TEMP}/pr_body.md")
+          echo "Pin bump on ${REPO}: ${PR_URL}" >> "$GITHUB_STEP_SUMMARY"
+
+  report:
+    name: "Report"
+    needs: [resolve, vllm_canary, sglang_canary, record, bump_downstream]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      VLLM_URL: ${{ needs.vllm_canary.outputs.build_url }}
+      VLLM_RESULT: ${{ needs.vllm_canary.result }}
+      VLLM_BUILD_NUMBER: ${{ needs.vllm_canary.outputs.build_number }}
+      SGLANG_URL: ${{ needs.sglang_canary.outputs.run_url }}
+      SGLANG_RESULT: ${{ needs.sglang_canary.result }}
+      SGLANG_RUN_ID: ${{ needs.sglang_canary.outputs.run_id }}
+      RECORD_RESULT: ${{ needs.record.result }}
+      PR_URL: ${{ needs.record.outputs.pr_url }}
+    steps:
+      - name: Summarize
+        run: |
+          {
+            echo "## Golden Commit: tpu-sync-torch ${VERSION:-?} (${SHA:-?})"
+            echo
+            echo "| Gate | Result | Link |"
+            echo "|---|---|---|"
+            echo "| vllm-torchtpu canary | ${VLLM_RESULT} | ${VLLM_URL:-n/a} |"
+            echo "| sglang-torchtpu remote wheel | ${SGLANG_RESULT} | ${SGLANG_URL:-n/a} |"
+            echo "| record | ${RECORD_RESULT} | ${PR_URL:-n/a} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      # A canary that timed out leaves its build or run going: the issue names
+      # the numbers to resume with. A dry run files nothing.
+      - name: Open an issue on failure
+        if: inputs.dry_run != 'yes' && (needs.vllm_canary.result != 'success' || needs.sglang_canary.result != 'success' || needs.record.result == 'failure')
+        run: |
+          TITLE="Golden commit ${VERSION:-?} failed: vllm ${VLLM_RESULT}, sglang ${SGLANG_RESULT}, record ${RECORD_RESULT}"
+          cat > "${RUNNER_TEMP}/issue_body.md" <<EOF
+          Candidate: \`tpu-sync-torch==${VERSION:-?}\` at ${SHA:-?}
+
+          | Gate | Result | Link |
+          |---|---|---|
+          | vllm-torchtpu canary | ${VLLM_RESULT} | ${VLLM_URL:-n/a} |
+          | sglang-torchtpu remote wheel | ${SGLANG_RESULT} | ${SGLANG_URL:-n/a} |
+          | record | ${RECORD_RESULT} | ${PR_URL:-n/a} |
+
+          Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          If a canary was still running when its job timed out, rerun the Golden Commit workflow with
+          \`tpu_sync_torch_version=${VERSION:-?}\`, \`vllm_build_number=${VLLM_BUILD_NUMBER:-?}\` and
+          \`sglang_run_id=${SGLANG_RUN_ID:-?}\` to wait for the same runs. Otherwise the previous golden
+          commit stands; see RELEASING.md.
+          EOF
+          gh issue create --repo "${GITHUB_REPOSITORY}" --title "${TITLE}" --body-file "${RUNNER_TEMP}/issue_body.md"

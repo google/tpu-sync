@@ -132,10 +132,57 @@ list them next to the torch_tpu pin. Bumping the JAX stack for a release
 means updating `JAX_REQUIRES` and `pyproject.toml` together in the release
 PR.
 
+## Golden commits
+
+A golden commit is a commit on `main` whose `tpu_sync_torch` nightly passed
+the two downstream canaries that consume the wheel. It is what a release is
+cut from and what the downstream repositories pin:
+
+| Record | Meaning |
+|--------|---------|
+| [lkg.version](lkg.version) | The newest golden commit (the stable checkout the README points users at). |
+| [verified_commits.csv](verified_commits.csv) | Every golden commit, oldest first: when it was verified, the commit, the `tpu-sync-torch` nightly version, and the downstream runs that passed. |
+| `golden-YYYYMMDD` tags | The same commits, for `git checkout`. |
+
+The `Golden Commit` workflow
+([.github/workflows/golden_commit.yml](.github/workflows/golden_commit.yml),
+tooling in [ci/golden/golden_commit.py](ci/golden/golden_commit.py)) cuts one
+every Monday and on `workflow_dispatch`:
+
+1. **Candidate**: the newest `tpu-sync-torch` `.dev` release on PyPI, or the
+   `tpu_sync_torch_version` input, mapped to its commit through the
+   `nightly-manifest-<version>` artifact the nightly leaves (older nightlies
+   are matched by their start time).
+2. **vllm-torchtpu**: a build of the Buildkite canary pipeline
+   `vllm-torchtpu-torchtpu-nightly` with `TORCHTPU_NIGHTLY_LEG=tpu-sync` and
+   `TPU_SYNC_TORCH_VERSION_OVERRIDE=<candidate>`: the candidate layered over
+   the image built from vllm-torchtpu's current pins, every lane (tests,
+   integration, perf and eval, verify). It must pass.
+3. **sglang-torchtpu**: a dispatch of the `Nightly Test (TPU - Remote Wheel)`
+   workflow with `wheel=tpu-sync-torch==<candidate>`: feature validation and
+   perf against the candidate layered over the latest nightly image. It must
+   succeed.
+4. **Record**: a pull request labeled `pull ready` that updates `lkg.version`
+   and appends to `verified_commits.csv`; Copybara imports it into Piper and
+   exports it back to `main`. The commit is tagged `golden-YYYYMMDD`.
+5. **Downstream pins** (opt-in via `bump_downstream=yes`): pull requests on
+   vllm-torchtpu (`pyproject.toml`) and sglang-torchtpu
+   (`python/pyproject_tpu.toml`, `requirements/tpu_stack_excludes.txt`) that
+   move `tpu-sync-torch==` to the candidate, for their owners to review.
+
+A failed gate opens an issue in this repository with both runs; the previous
+golden commit stands. A hosted job ends after six hours, so a canary that is
+still running when its job times out is waited for by rerunning the workflow
+with `vllm_build_number` and `sglang_run_id` set from the first run (the issue
+names them). `dry_run=yes` runs the gates without recording anything, for
+example to check a candidate before a release.
+
 ## Cutting a release
 
-1. Pick the release candidate commit on `main` — normally the last-known-good
-   commit already published in [lkg.version](lkg.version).
+1. Pick the release candidate commit on `main` — normally the newest golden
+   commit, published in [lkg.version](lkg.version) and recorded with its
+   downstream runs in [verified_commits.csv](verified_commits.csv). To release
+   a newer commit, run the `Golden Commit` workflow on its nightly first.
 2. Open a release PR that:
    - updates [torch_tpu.version](torch_tpu.version) to the torch_tpu wheel
      the release was validated with,
@@ -171,3 +218,11 @@ PR.
   grants it write access to the staging repository and the manifest folder.
 - `PYPI_FILE_LIMIT_MB` repository variable: the per-file limit PyPI has
   granted the project, once it differs from the default 100.
+- The `Golden Commit` workflow needs four secrets: `BUILDKITE_API_TOKEN` (the
+  `vllm` Buildkite organization, `read_builds` and `write_builds`),
+  `SGLANG_GITHUB_TOKEN` (`actions:write` on `sgl-project/sglang-torchtpu`),
+  `GOLDEN_COMMIT_TOKEN` (`contents:write` and `pull_requests:write` on this
+  repository, so the record pull request gets CI and Copybara imports it) and
+  `DOWNSTREAM_PR_TOKEN` (`contents:write` and `pull_requests:write` on the two
+  downstream repositories, or on forks named by the `DOWNSTREAM_FORK_OWNER`
+  repository variable). The header of the workflow file lists them.

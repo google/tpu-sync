@@ -30,6 +30,7 @@
 #include "absl/base/thread_annotations.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "perfetto/tracing/backend_type.h"
@@ -67,7 +68,8 @@ bool IsEnvVarTruthy(const char* val) {
   return true;
 }
 
-bool StartPerfettoTraceToFileInternal(absl::string_view output_file_path) {
+bool StartPerfettoTraceToFileInternal(absl::string_view output_file_path,
+                                      uint32_t buffer_size_kb = 0) {
   if (output_file_path.empty()) {
     return false;
   }
@@ -85,7 +87,7 @@ bool StartPerfettoTraceToFileInternal(absl::string_view output_file_path) {
   }
 
   ::perfetto::TraceConfig cfg;
-  cfg.add_buffers()->set_size_kb(4096);
+  cfg.add_buffers()->set_size_kb(GetPerfettoBufferSizeKb(buffer_size_kb));
   auto* ds_cfg = cfg.add_data_sources()->mutable_config();
   ds_cfg->set_name("track_event");
 
@@ -105,6 +107,23 @@ bool StartPerfettoTraceToFileInternal(absl::string_view output_file_path) {
 }
 
 }  // namespace
+
+uint32_t GetPerfettoBufferSizeKb(uint32_t explicit_buffer_size_kb) {
+  if (explicit_buffer_size_kb > 0) {
+    return explicit_buffer_size_kb;
+  }
+  const char* size_env = std::getenv("TPU_RAIDEN_PERFETTO_BUFFER_SIZE_KB");
+  if (size_env == nullptr || size_env[0] == '\0') {
+    size_env = std::getenv("RAIDEN_PERFETTO_BUFFER_SIZE_KB");
+  }
+  if (size_env != nullptr && size_env[0] != '\0') {
+    uint32_t parsed_kb = 0;
+    if (absl::SimpleAtoi(size_env, &parsed_kb) && parsed_kb > 0) {
+      return parsed_kb;
+    }
+  }
+  return kDefaultPerfettoBufferSizeKb;
+}
 
 void EnsurePerfettoInitialized() {
   static absl::once_flag once;
@@ -129,9 +148,10 @@ void EnsurePerfettoInitialized() {
   });
 }
 
-bool StartPerfettoTraceToFile(absl::string_view output_file_path) {
+bool StartPerfettoTraceToFile(absl::string_view output_file_path,
+                              uint32_t buffer_size_kb) {
   EnsurePerfettoInitialized();
-  return StartPerfettoTraceToFileInternal(output_file_path);
+  return StartPerfettoTraceToFileInternal(output_file_path, buffer_size_kb);
 }
 
 bool StopPerfettoTraceToFile() {

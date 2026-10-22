@@ -29,6 +29,7 @@
 #include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/raiden_id.h"
@@ -232,6 +233,44 @@ TEST_F(KVCacheStoreWrapperTest, RecoversHostBlocksAfterRestart) {
   EXPECT_EQ(lookup[1].first, "host_2");
   EXPECT_EQ(lookup[1].second.status, BlockStatus::HOST);
   EXPECT_EQ(lookup[1].second.host_block_id, 1);
+}
+
+TEST_F(KVCacheStoreWrapperTest,
+       RecoversHostBlocksAfterRestartAndRepublishesToRegistry) {
+  auto registry = global_registry::CreateTestGlobalRegistryServer();
+  setenv("RAIDEN_ENABLE_STORE_MONITOR", "true", /*overwrite=*/1);
+  setenv("RAIDEN_STORE_MONITOR_HEARTBEAT_S", "60", /*overwrite=*/1);
+
+  auto wrapper =
+      MakeWrapper(/*capacity=*/4, /*num_shards=*/1, registry->server_address);
+  InsertHostBlocks(*wrapper, {"host_1", "host_2"});
+
+  // Simulate a crash restart whose downtime outlived the registry TTL: the
+  // local shm metadata table survives, while the registry has no block entries.
+  wrapper.reset();
+  TF_ASSERT_OK_AND_ASSIGN(auto before_restart,
+                          registry->client->Lookup({"host_1", "host_2"}));
+  ASSERT_THAT(before_restart, IsEmpty());
+
+  wrapper =
+      MakeWrapper(/*capacity=*/4, /*num_shards=*/1, registry->server_address);
+
+  // Even with a 60s heartbeat period and no registration lapse on the new
+  // incarnation, Create() must wake the StoreMonitor to republish the
+  // recovered blocks immediately on startup.
+  const absl::Time deadline = absl::Now() + absl::Seconds(5);
+  size_t republished = 0;
+  while (absl::Now() < deadline) {
+    auto looked = registry->client->Lookup({"host_1", "host_2"});
+    if (looked.ok() && looked->size() == 2) {
+      republished = looked->size();
+      EXPECT_EQ((*looked)[0].block_id(), 0);
+      EXPECT_EQ((*looked)[1].block_id(), 1);
+      break;
+    }
+    absl::SleepFor(absl::Milliseconds(50));
+  }
+  EXPECT_EQ(republished, 2);
 }
 
 // Exercises the env contract StoreMonitorConfigFromEnv documents; the

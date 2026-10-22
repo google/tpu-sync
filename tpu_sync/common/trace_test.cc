@@ -45,6 +45,8 @@ class TraceBackendTest : public ::testing::Test {
     unsetenv("TPU_RAIDEN_USE_PERFETTO");
     unsetenv("RAIDEN_USE_PERFETTO");
     unsetenv("TPU_RAIDEN_TRACE_PERFETTO");
+    unsetenv("TPU_RAIDEN_PERFETTO_BUFFER_SIZE_KB");
+    unsetenv("RAIDEN_PERFETTO_BUFFER_SIZE_KB");
   }
 
   void TearDown() override {
@@ -54,8 +56,31 @@ class TraceBackendTest : public ::testing::Test {
     unsetenv("TPU_RAIDEN_USE_PERFETTO");
     unsetenv("RAIDEN_USE_PERFETTO");
     unsetenv("TPU_RAIDEN_TRACE_PERFETTO");
+    unsetenv("TPU_RAIDEN_PERFETTO_BUFFER_SIZE_KB");
+    unsetenv("RAIDEN_PERFETTO_BUFFER_SIZE_KB");
   }
 };
+
+TEST_F(TraceBackendTest, GetPerfettoBufferSizeKbResolution) {
+  EXPECT_EQ(GetPerfettoBufferSizeKb(), kDefaultPerfettoBufferSizeKb);
+  EXPECT_EQ(GetPerfettoBufferSizeKb(/*explicit_buffer_size_kb=*/8192), 8192u);
+
+  setenv("TPU_RAIDEN_PERFETTO_BUFFER_SIZE_KB", "131072", 1);
+  EXPECT_EQ(GetPerfettoBufferSizeKb(), 131072u);
+  // Explicit argument wins over environment variables.
+  EXPECT_EQ(GetPerfettoBufferSizeKb(/*explicit_buffer_size_kb=*/4096), 4096u);
+  unsetenv("TPU_RAIDEN_PERFETTO_BUFFER_SIZE_KB");
+
+  setenv("RAIDEN_PERFETTO_BUFFER_SIZE_KB", "32768", 1);
+  EXPECT_EQ(GetPerfettoBufferSizeKb(), 32768u);
+  unsetenv("RAIDEN_PERFETTO_BUFFER_SIZE_KB");
+
+  // Invalid or zero values fall back to default.
+  setenv("TPU_RAIDEN_PERFETTO_BUFFER_SIZE_KB", "0", 1);
+  EXPECT_EQ(GetPerfettoBufferSizeKb(), kDefaultPerfettoBufferSizeKb);
+  setenv("TPU_RAIDEN_PERFETTO_BUFFER_SIZE_KB", "not_a_number", 1);
+  EXPECT_EQ(GetPerfettoBufferSizeKb(), kDefaultPerfettoBufferSizeKb);
+}
 
 TEST_F(TraceBackendTest, GetTraceBackendDefault) {
   EXPECT_EQ(GetTraceBackend(), TraceBackend::kTraceMe);
@@ -260,7 +285,7 @@ TEST(TraceTest, StartAndStopPerfettoTraceToFile) {
   // Ensure no prior session is running
   StopPerfettoTraceToFile();
 
-  ASSERT_TRUE(StartPerfettoTraceToFile(trace_file));
+  ASSERT_TRUE(StartPerfettoTraceToFile(trace_file, /*buffer_size_kb=*/1024));
 
   // A second call should fail while active
   EXPECT_FALSE(StartPerfettoTraceToFile(trace_file));

@@ -383,11 +383,13 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
 
   // Recovery runs before the monitor starts, so the first inventory the
   // monitor publishes already carries the recovered blocks.
+  size_t recovered_blocks = 0;
   if (metadata_region != nullptr) {
     store->metadata_region_ = std::move(metadata_region);
     if (store->metadata_region_->warm()) {
       absl::StatusOr<size_t> recovered = store->RecoverFromLocalManifest();
       if (recovered.ok()) {
+        recovered_blocks = *recovered;
         LOG(INFO) << "Recovered " << *recovered
                   << " blocks from the local KV metadata table";
       } else {
@@ -461,6 +463,12 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
         std::move(sweep_fn),
         /*republish_fn=*/[s = store.get()] { return s->RepublishOnce(); });
     store->store_monitor_->Start();
+    if (recovered_blocks > 0) {
+      // RecoverFromLocalManifest() ran above before store_monitor_ was
+      // constructed, so its RequestRepublish() call was a no-op. Wake the
+      // monitor now so the recovered inventory is republished to the registry.
+      store->store_monitor_->RequestRepublish();
+    }
 
     // Remote writes skip AllocateBlockIds, which is what wakes the sweep for
     // local allocations, so have the server request a space check on refused

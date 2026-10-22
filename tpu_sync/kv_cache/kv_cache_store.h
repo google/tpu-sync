@@ -764,6 +764,11 @@ class KVCacheStore {
   // staging blocks on failure, and marks the blocks done or failed in
   // load_tracker_.
   //
+  // When IsTdsCaching(), no staging blocks are allocated: the worker reads
+  // storage straight into HBM, and on success the callback publishes each
+  // block into the host-RAM tier's LRU as an unpinned HBM entry
+  // (host_block_id = -1) rather than HOST_AND_HBM.
+  //
   // Every outcome, including failure to allocate staging blocks, is reported
   // per hash through load_tracker_ only -- the same way the peer path reports
   // its own staging failure -- so a failure is reported exactly once. Must be
@@ -786,7 +791,21 @@ class KVCacheStore {
   }
 
  private:
-  // The local half of Save(): device HBM to host DRAM.
+  // True when the secondary storage tier (backends_[1]) is the TPUDirect
+  // Storage backend, i.e. its name() is kTdsBackendName ("tds", compared
+  // case-insensitively). In that mode a block lives only in HBM or on shared
+  // storage, never in local or peer host DRAM: Lookup() reports tier-0 hits
+  // only while they are HBM-resident (no registry query), and SaveLocal() /
+  // LoadFromSecondaryBackend() move bytes HBM <-> storage directly, allocating
+  // no host staging blocks and publishing no HOST residency. The worker side
+  // of that direct path is KVCacheManagerBase::WriteDeviceToBackend /
+  // ReadDeviceFromBackend. Reads backends_, which is fixed after construction,
+  // so no lock is taken.
+  bool IsTdsCaching() const;
+
+  // The local half of Save(): device HBM to host DRAM (and on to the secondary
+  // storage tier when one is configured), or straight from HBM to storage with
+  // no host DRAM copy when IsTdsCaching().
   absl::Status SaveLocal(const std::vector<std::string>& block_hashes);
   // The remote half of Save(): offer `block_hashes` to `dst_raiden_id`.
   // `owner` has no default so every call site decides who gets the verdict.

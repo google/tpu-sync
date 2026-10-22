@@ -246,6 +246,38 @@ template <typename T>
 inline constexpr bool has_h2d_read_from_backend_v =
     has_h2d_read_from_backend<T>::value;
 
+// Detection traits for the TDS direct HBM <-> storage entry points; see
+// KVManagerHolder::Concept::WriteDeviceToBackend / ReadDeviceFromBackend.
+template <typename T, typename = void>
+struct has_write_device_to_backend : std::false_type {};
+
+template <typename T>
+struct has_write_device_to_backend<
+    T, std::void_t<decltype(std::declval<T&>().WriteDeviceToBackend(
+           std::declval<absl::Span<
+               const std::shared_ptr<kv_cache::backends::KVBackend>>>(),
+           std::declval<const std::vector<kv_cache::backends::BlockKey>&>(),
+           std::declval<const std::vector<int64_t>&>()))>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_write_device_to_backend_v =
+    has_write_device_to_backend<T>::value;
+
+template <typename T, typename = void>
+struct has_read_device_from_backend : std::false_type {};
+
+template <typename T>
+struct has_read_device_from_backend<
+    T, std::void_t<decltype(std::declval<T&>().ReadDeviceFromBackend(
+           std::declval<absl::Span<
+               const std::shared_ptr<kv_cache::backends::KVBackend>>>(),
+           std::declval<const std::vector<kv_cache::backends::BlockKey>&>(),
+           std::declval<const std::vector<int64_t>&>()))>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool has_read_device_from_backend_v =
+    has_read_device_from_backend<T>::value;
+
 template <typename T, typename = void>
 struct has_get_kv_backend : std::false_type {};
 
@@ -389,6 +421,22 @@ class KVManagerHolder {
             backends,
         const std::vector<kv_cache::backends::BlockKey>& block_keys,
         const std::vector<int64_t>& src_host_block_ids,
+        const std::vector<int64_t>& dst_device_block_ids) = 0;
+    // Direct HBM <-> storage transfers for the TDS secondary backend. Unlike
+    // D2hWriteToBackend / H2dReadFromBackend there is no host-DRAM staging
+    // block list: the worker moves the bytes between its device buffers and
+    // storage itself (KVCacheManagerBase::WriteDeviceToBackend /
+    // ReadDeviceFromBackend). Fail with Unimplemented when the wrapped manager
+    // lacks them.
+    virtual absl::StatusOr<raiden::PjRtCopyFuture> WriteDeviceToBackend(
+        absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>>
+            backends,
+        const std::vector<kv_cache::backends::BlockKey>& block_keys,
+        const std::vector<int64_t>& src_device_block_ids) = 0;
+    virtual absl::StatusOr<raiden::PjRtCopyFuture> ReadDeviceFromBackend(
+        absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>>
+            backends,
+        const std::vector<kv_cache::backends::BlockKey>& block_keys,
         const std::vector<int64_t>& dst_device_block_ids) = 0;
 
     // Returns the backend plugin registered for the specified backend name, or
@@ -667,6 +715,40 @@ class KVManagerHolder {
             "manager.");
       }
     }
+    absl::StatusOr<raiden::PjRtCopyFuture> WriteDeviceToBackend(
+        absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>>
+            backends,
+        const std::vector<kv_cache::backends::BlockKey>& block_keys,
+        const std::vector<int64_t>& src_device_block_ids) override {
+      if constexpr (internal::has_write_device_to_backend_v<T>) {
+        return impl_->WriteDeviceToBackend(backends, block_keys,
+                                           src_device_block_ids);
+      } else if constexpr (internal::has_write_device_to_backend_v<BaseT>) {
+        return base().WriteDeviceToBackend(backends, block_keys,
+                                           src_device_block_ids);
+      } else {
+        return absl::UnimplementedError(
+            "WriteDeviceToBackend is not implemented by the underlying "
+            "transfer manager.");
+      }
+    }
+    absl::StatusOr<raiden::PjRtCopyFuture> ReadDeviceFromBackend(
+        absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>>
+            backends,
+        const std::vector<kv_cache::backends::BlockKey>& block_keys,
+        const std::vector<int64_t>& dst_device_block_ids) override {
+      if constexpr (internal::has_read_device_from_backend_v<T>) {
+        return impl_->ReadDeviceFromBackend(backends, block_keys,
+                                            dst_device_block_ids);
+      } else if constexpr (internal::has_read_device_from_backend_v<BaseT>) {
+        return base().ReadDeviceFromBackend(backends, block_keys,
+                                            dst_device_block_ids);
+      } else {
+        return absl::UnimplementedError(
+            "ReadDeviceFromBackend is not implemented by the underlying "
+            "transfer manager.");
+      }
+    }
 
     std::shared_ptr<kv_cache::backends::KVBackend> GetKVBackend(
         absl::string_view backend_name) const override {
@@ -910,6 +992,49 @@ class KVManagerHolder {
     const std::shared_ptr<kv_cache::backends::KVBackend> b[] = {backend};
     return H2dReadFromBackend(absl::MakeSpan(b), block_keys, src_host_block_ids,
                               dst_device_block_ids);
+  }
+
+  // TDS direct HBM <-> storage transfers (no host staging block list); see
+  // Concept::WriteDeviceToBackend. The single-backend overloads are
+  // conveniences over the span form.
+  absl::StatusOr<raiden::PjRtCopyFuture> WriteDeviceToBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids) const {
+    if (!self_) {
+      return absl::InternalError("KVManagerHolder is null");
+    }
+    return self_->WriteDeviceToBackend(backends, block_keys,
+                                       src_device_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> WriteDeviceToBackend(
+      const std::shared_ptr<kv_cache::backends::KVBackend>& backend,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids) const {
+    const std::shared_ptr<kv_cache::backends::KVBackend> b[] = {backend};
+    return WriteDeviceToBackend(absl::MakeSpan(b), block_keys,
+                                src_device_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> ReadDeviceFromBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& dst_device_block_ids) const {
+    if (!self_) {
+      return absl::InternalError("KVManagerHolder is null");
+    }
+    return self_->ReadDeviceFromBackend(backends, block_keys,
+                                        dst_device_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> ReadDeviceFromBackend(
+      const std::shared_ptr<kv_cache::backends::KVBackend>& backend,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& dst_device_block_ids) const {
+    const std::shared_ptr<kv_cache::backends::KVBackend> b[] = {backend};
+    return ReadDeviceFromBackend(absl::MakeSpan(b), block_keys,
+                                 dst_device_block_ids);
   }
 
   // Returns the backend plugin registered for the specified backend name, or

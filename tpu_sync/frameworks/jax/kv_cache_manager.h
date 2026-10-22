@@ -244,6 +244,20 @@ class NumaAwareKVCacheManager {
       const std::vector<int64_t>& src_host_block_ids,
       const std::vector<int64_t>& dst_device_block_ids);
 
+  // TDS direct HBM <-> storage transfers (no host staging blocks). Fan out to
+  // every sub-manager like D2hWriteToBackend / H2dReadFromBackend; each
+  // sub-manager resolves `src/dst_device_block_ids` against its own device
+  // buffers (KVCacheManagerBase::ResolveDeviceBlockSlices).
+  absl::StatusOr<raiden::PjRtCopyFuture> WriteDeviceToBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids);
+
+  absl::StatusOr<raiden::PjRtCopyFuture> ReadDeviceFromBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& dst_device_block_ids);
+
   std::shared_ptr<kv_cache::backends::KVBackend> GetKVBackend(
       absl::string_view backend_name) const;
 
@@ -553,6 +567,22 @@ class KVCacheManager {
       const std::vector<int64_t>& dst_device_block_ids) {
     return numa_manager_->H2dReadFromBackend(
         backends, block_keys, src_host_block_ids, dst_device_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> WriteDeviceToBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids) {
+    return numa_manager_->WriteDeviceToBackend(backends, block_keys,
+                                               src_device_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> ReadDeviceFromBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& dst_device_block_ids) {
+    return numa_manager_->ReadDeviceFromBackend(backends, block_keys,
+                                                dst_device_block_ids);
   }
 
   std::shared_ptr<kv_cache::backends::KVBackend> GetKVBackend(

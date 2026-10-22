@@ -381,7 +381,19 @@ std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
         evicted = lru_cache_.Put(hash, RaidenBlockId());
       }
       if (evicted.has_value()) {
-        evicted_entries.push_back(std::move(*evicted));
+        // A displaced entry normally becomes an eviction candidate that keeps
+        // its host block until Evict reclaims it. An HBM-only entry
+        // (host_block_id -1, e.g. one published by a TDS storage recall) has
+        // no host block, and Evict only reclaims HOST / HOST_AND_HBM, so as a
+        // candidate it would linger forever while GetEvictableKeys kept
+        // counting it as reclaimable space that never materializes. Erase it
+        // outright. It was never registered (only host copies are), so there
+        // is nothing to withdraw from the registry either.
+        if (evicted->second.status == BlockStatus::HBM) {
+          lru_cache_.Erase(evicted->first);
+        } else {
+          evicted_entries.push_back(std::move(*evicted));
+        }
       }
     }
     client = registry_client_;
@@ -471,12 +483,18 @@ bool HostOffloadBackend::InsertAndLock(
     }
     // Put's displaced entry is discarded: a displaced entry becomes an
     // eviction candidate that still holds its host block, and GetEvictableKeys
-    // finds it there. Nothing puts a displaced entry back.
+    // finds it there. Nothing puts a displaced entry back. HBM-only entries
+    // hold no host block, so they are erased immediately on displacement
+    // (see Insert for why such a candidate would otherwise never go away).
+    std::optional<std::pair<std::string, RaidenBlockId>> evicted;
     if (i < slices.size()) {
-      lru_cache_.Put(hash, slices[i]);
+      evicted = lru_cache_.Put(hash, slices[i]);
       SetMetadataEntry(hash, slices[i]);
     } else {
-      lru_cache_.Put(hash, RaidenBlockId());
+      evicted = lru_cache_.Put(hash, RaidenBlockId());
+    }
+    if (evicted.has_value() && evicted->second.status == BlockStatus::HBM) {
+      lru_cache_.Erase(evicted->first);
     }
   }
 
@@ -991,9 +1009,13 @@ bool HostOffloadBackend::InsertAllOrNothing(
       return false;
     }
     SetMetadataEntry(hash, slices[i]);
-    // An eviction here only demotes the entry to a candidate; its host block
-    // stays allocated, so there is nothing to free.
-    (void)evicted;
+    // An eviction here only demotes a host-backed entry to a candidate; its
+    // host block stays allocated, so there is nothing to free. HBM-only
+    // entries hold no host block and are erased immediately (see Insert for
+    // why such a candidate would otherwise never go away).
+    if (evicted.has_value() && evicted->second.status == BlockStatus::HBM) {
+      lru_cache_.Erase(evicted->first);
+    }
   }
   return true;
 }

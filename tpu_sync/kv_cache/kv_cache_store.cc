@@ -37,6 +37,7 @@
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/escaping.h"
+#include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -926,6 +927,30 @@ KVCacheStore::~KVCacheStore() {
   }
 }
 
+bool KVCacheStore::IsTdsCaching() const {
+  if (backends_.size() <= 1 || backends_[1] == nullptr ||
+      !absl::EqualsIgnoreCase(backends_[1]->name(), "tds")) {
+    return false;
+  }
+  for (const auto& cfg : backend_configs_) {
+    auto it = cfg.properties.find("tds_transfer_route");
+    if (it != cfg.properties.end()) {
+      return !absl::EqualsIgnoreCase(it->second, "compat");
+    }
+  }
+  if (const auto* posix_store =
+          dynamic_cast<const backends::storage::PosixKVCacheStoreBackend*>(
+              backends_[1].get());
+      posix_store != nullptr && posix_store->storage_backend() != nullptr) {
+    const std::string route =
+        posix_store->storage_backend()->GetProperty("tds_transfer_route");
+    if (!route.empty()) {
+      return !absl::EqualsIgnoreCase(route, "compat");
+    }
+  }
+  return true;
+}
+
 absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
     const std::vector<std::string>& block_hashes, bool enable_global,
     bool pin_found) {
@@ -953,6 +978,14 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
 //   2. Tier 1+ (`backends_[1..]` - secondary storage, e.g., POSIX): queried
 //      for the remaining suffix (`subspan(start_idx)`) that missed tier 0,
 //      returning `BlockStatus::SHARED_STORAGE`.
+//   3. TDS caching mode (IsTdsCaching(): tier 1 is the "tds" backend):
+//      - Blocks live only in HBM or on shared storage, so the chain collapses
+//        to Tier 0 (HBM-resident entries only) -> Tier 1 (Storage).
+//      - Tier 0 is queried without the registry and only its leading run of
+//        `BlockStatus::HBM` hits is kept. Any other entry it may still hold for
+//        a hash (e.g. a HOST entry the application inserted) is dropped from
+//        the answer, and the pin tier 0 took on it is handed back, so that hash
+//        and everything after it fall through to the storage probe.
 absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
     const std::vector<std::string>& block_hashes,
     const LookupOptions& options) {
@@ -967,14 +1000,26 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
   BlockSliceList accumulated_results;
   accumulated_results.reserve(block_hashes.size());
 
+  const bool is_tds_caching = IsTdsCaching();
   size_t start_idx = 0;
   for (size_t tier_idx = 0; tier_idx < backends_.size(); ++tier_idx) {
     const auto& backend = backends_[tier_idx];
     if (start_idx >= block_hashes.size()) break;
     if (!backend) continue;
 
+    LookupOptions tier_options = options;
+    if (is_tds_caching && tier_idx == 0) {
+      // When TDS caching is active, cached data can reside only in HBM and
+      // Storage (not local or peer DRAM), so the registry is never asked: a
+      // REMOTE hit would name a peer DRAM copy this mode does not use.
+      // Disabling interleaving also stops tier 0's scan at its first local
+      // miss instead of pinning hits past it only to unpin them again.
+      tier_options.enable_global = false;
+      tier_options.enable_interleaved_lookup = false;
+    }
+
     auto lookup_result = backend->Lookup(
-        absl::MakeSpan(block_hashes).subspan(start_idx), options);
+        absl::MakeSpan(block_hashes).subspan(start_idx), tier_options);
     if (!lookup_result.ok()) {
       if (!accumulated_results.empty() &&
           absl::IsNotFound(lookup_result.status())) {
@@ -992,9 +1037,37 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
     }
 
     const auto& res = *lookup_result;
-    for (const auto& pair : res) {
-      accumulated_results.push_back(pair);
-      ++start_idx;
+    if (is_tds_caching && tier_idx == 0) {
+      // Keep only the leading run of HBM hits. A HOST / HOST_AND_HBM entry is
+      // not a usable copy in this mode, and the answer must stay a contiguous
+      // prefix of the request, so the first non-HBM hit ends tier 0's
+      // contribution and the storage tier is probed from that hash on.
+      size_t accepted = 0;
+      for (const auto& pair : res) {
+        if (pair.second.status != BlockStatus::HBM) {
+          break;
+        }
+        accumulated_results.push_back(pair);
+        ++start_idx;
+        ++accepted;
+      }
+      // With pin_found, tier 0 pinned every hit it returned. The caller never
+      // learns about the dropped ones, so it could never release them; hand
+      // those pins back here. Only tier 0 holds them, so release on it
+      // directly rather than through this store's all-tier Release().
+      if (tier_options.pin_found && accepted < res.size()) {
+        std::vector<std::string> unaccepted_hashes;
+        unaccepted_hashes.reserve(res.size() - accepted);
+        for (size_t i = accepted; i < res.size(); ++i) {
+          unaccepted_hashes.push_back(res[i].first);
+        }
+        backend->Release(unaccepted_hashes);
+      }
+    } else {
+      for (const auto& pair : res) {
+        accumulated_results.push_back(pair);
+        ++start_idx;
+      }
     }
   }
 
@@ -1125,18 +1198,27 @@ absl::Status KVCacheStore::SaveLocal(
     save_tracker_.AddPending(block_hashes);
   }
 
-  auto host_blocks = AllocateBlockIds(block_hashes.size());
-  if (!host_blocks.ok()) {
-    save_tracker_.RemovePending(block_hashes);
-    return host_blocks.status();
-  }
-  const auto& host_block_ids = *host_blocks;
-
   std::shared_ptr<KVCacheStoreBackend> secondary_backend = nullptr;
   std::string secondary_backend_name;
   if (backends_.size() > 1 && backends_[1] != nullptr) {
     secondary_backend = backends_[1];
     secondary_backend_name = secondary_backend->name();
+  }
+  const bool is_tds_backend = IsTdsCaching();
+
+  // Host staging blocks are needed only when the offload goes through host
+  // DRAM. In TDS mode the worker copies HBM straight to storage, so none are
+  // allocated: a save then consumes no host block pool capacity and cannot
+  // evict HOST entries to make room -- which is the point of the mode (see
+  // IsTdsCaching()).
+  std::vector<int> host_block_ids;
+  if (!is_tds_backend) {
+    auto host_blocks = AllocateBlockIds(block_hashes.size());
+    if (!host_blocks.ok()) {
+      save_tracker_.RemovePending(block_hashes);
+      return host_blocks.status();
+    }
+    host_block_ids = *std::move(host_blocks);
   }
 
   if (secondary_backend != nullptr && !secondary_backend_name.empty()) {
@@ -1144,8 +1226,11 @@ absl::Status KVCacheStore::SaveLocal(
     spec.set_name(secondary_backend_name);
 
     // OFFLOAD: the HBM side is the source and the host-DRAM staging side is
-    // the destination. The staging blocks are deliberately retained on
-    // success -- they become the tier-0 host-resident copy below.
+    // the destination. Outside TDS mode the staging blocks are deliberately
+    // retained on success -- they become the tier-0 host-resident copy below.
+    // In TDS mode host_ids is empty: the controller and the worker accept an
+    // empty host list only for the "tds" backend and dispatch the direct
+    // HBM -> storage route (see WorkerServiceImpl::TransferBackendBuffers).
     const std::vector<int64_t> host_ids(host_block_ids.begin(),
                                         host_block_ids.end());
     tsl::Future<> future = raiden_controller_->TransferBackendBuffers(
@@ -1160,14 +1245,34 @@ absl::Status KVCacheStore::SaveLocal(
     future.OnReady([lifetime = lifetime_, wt_state = wt_state_,
                     host_ram_backend = backend(),
                     registry_client = registry_client_, raiden_id = raiden_id_,
-                    block_hashes, host_block_ids,
+                    is_tds_backend, block_hashes, host_block_ids,
                     src_device_block_ids](absl::Status status) {
       if (!status.ok()) {
         {
           absl::MutexLock lock(lifetime->mu);
           if (KVCacheStore* self = lifetime->store; self != nullptr) {
-            self->DeallocateBlockIds(host_block_ids);
+            if (!host_block_ids.empty()) {
+              self->DeallocateBlockIds(host_block_ids);
+            }
             self->save_tracker_.MarkFailed(block_hashes);
+          }
+        }
+        if (host_ram_backend != nullptr)
+          host_ram_backend->Release(block_hashes);
+        return;
+      }
+      if (is_tds_backend) {
+        // In TDS caching mode, blocks reside only in HBM and Storage (not
+        // DRAM). No host staging blocks were allocated; mark done without
+        // publishing DRAM residency or advertising to the global registry --
+        // the registry only names host DRAM copies, and peers find a
+        // TDS-saved block by probing the shared storage tier instead. The
+        // tier-0 entry stays the HBM record Insert() created, and the Release
+        // consumes the caller's pin exactly as the host path does on success.
+        {
+          absl::MutexLock lock(lifetime->mu);
+          if (KVCacheStore* self = lifetime->store; self != nullptr) {
+            self->save_tracker_.MarkDone(block_hashes);
           }
         }
         if (host_ram_backend != nullptr)
@@ -1409,27 +1514,34 @@ void KVCacheStore::LoadFromSecondaryBackend(
   // SHARED_STORAGE block is recalled from backends_[1], regardless of the
   // backend name carried in its slice.
   const std::shared_ptr<KVCacheStoreBackend>& secondary_backend = backends_[1];
+  const bool is_tds_backend = IsTdsCaching();
 
-  // Host staging blocks for the recall. May evict UNPINNED entries if short,
-  // never pinned ones. Failure is reported through the tracker only, the same
-  // way the peer path reports its own staging failure, so it is reported once.
-  absl::StatusOr<std::vector<int>> allocated =
-      AllocateBlockIds(block_hashes.size());
-  if (!allocated.ok()) {
-    LOG(WARNING) << "No host staging blocks for storage recall: "
-                 << allocated.status();
-    absl::MutexLock lock(mutex_);
-    load_tracker_.MarkFailed(block_hashes);
-    return;
+  // Host staging blocks for the recall (skipped in TDS direct Storage -> HBM
+  // mode, where the worker reads storage straight into HBM and no host copy is
+  // kept). May evict UNPINNED entries if short, never pinned ones. Failure is
+  // reported through the tracker only, the same way the peer path reports its
+  // own staging failure, so it is reported once.
+  std::vector<int> staging_host_block_ids;
+  if (!is_tds_backend) {
+    absl::StatusOr<std::vector<int>> allocated =
+        AllocateBlockIds(block_hashes.size());
+    if (!allocated.ok()) {
+      LOG(WARNING) << "No host staging blocks for storage recall: "
+                   << allocated.status();
+      absl::MutexLock lock(mutex_);
+      load_tracker_.MarkFailed(block_hashes);
+      return;
+    }
+    staging_host_block_ids = *std::move(allocated);
   }
-  const std::vector<int>& staging_host_block_ids = *allocated;
 
   ::tpu_sync::proto::BackendTransferSpec spec;
   spec.set_name(secondary_backend->name());
 
-  // RECALL: the host-DRAM staging side is the SOURCE and the HBM side is the
-  // destination -- the reverse of OFFLOAD. Both lists are block slot indices
-  // of the same type, so the labels below are what keeps them straight.
+  // RECALL: the host-DRAM staging side is the SOURCE (empty in TDS mode) and
+  // the HBM side is the destination -- the reverse of OFFLOAD. Both lists are
+  // block slot indices of the same type, so the labels below are what keeps
+  // them straight.
   const std::vector<int64_t> host_ids(staging_host_block_ids.begin(),
                                       staging_host_block_ids.end());
   const std::vector<int64_t> hbm_ids(device_block_ids.begin(),
@@ -1443,7 +1555,7 @@ void KVCacheStore::LoadFromSecondaryBackend(
   // touch of it goes through the lifetime fence below.
   future.OnReady(
       [lifetime = lifetime_, host_ram_backend = backend(), secondary_backend,
-       raiden_id = raiden_id_,
+       raiden_id = raiden_id_, is_tds_backend,
        block_hashes =
            std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
        staging_host_block_ids = std::vector<int>(staging_host_block_ids.begin(),
@@ -1463,8 +1575,37 @@ void KVCacheStore::LoadFromSecondaryBackend(
           // the same as a total one.
           absl::MutexLock lock(lifetime->mu);
           if (KVCacheStore* self = lifetime->store; self != nullptr) {
-            self->DeallocateBlockIds(staging_host_block_ids);
+            if (!staging_host_block_ids.empty()) {
+              self->DeallocateBlockIds(staging_host_block_ids);
+            }
             self->load_tracker_.MarkFailed(block_hashes);
+          }
+          return;
+        }
+        if (is_tds_backend) {
+          // In TDS caching mode, recalled blocks reside only in HBM and Storage
+          // (not DRAM). Publish HBM residency (host_block_id = -1) so the next
+          // Lookup is a tier-0 HBM hit; no staging host blocks were allocated.
+          // Plain Insert is used rather than the InsertAllOrNothing dance
+          // below: with no staging block behind the entry there is nothing to
+          // return if the tier declines, and a declined hash merely resolves
+          // to SHARED_STORAGE again. The entry is left unpinned like the host
+          // path's. HBM-only entries are erased outright, not demoted to
+          // candidates, when the LRU displaces them (see
+          // HostOffloadBackend::Insert), so none can linger unreclaimable.
+          std::vector<RaidenBlockId> update_slices;
+          update_slices.reserve(block_hashes.size());
+          for (size_t i = 0; i < block_hashes.size(); ++i) {
+            update_slices.emplace_back(raiden_id, /*host_block_id=*/-1,
+                                       device_block_ids[i], BlockStatus::HBM);
+          }
+          if (!block_hashes.empty() && host_ram_backend != nullptr) {
+            host_ram_backend->Insert(block_hashes, update_slices,
+                                     /*on_host=*/false);
+          }
+          absl::MutexLock lock(lifetime->mu);
+          if (KVCacheStore* self = lifetime->store; self != nullptr) {
+            self->load_tracker_.MarkDone(block_hashes);
           }
           return;
         }

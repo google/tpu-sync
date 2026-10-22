@@ -844,8 +844,17 @@ RaidenController::BuildTransferBackendBuffersRequest(
     return absl::InvalidArgumentError(
         "block_hashes must specify at least one block hash");
   }
+  // block_hashes, hbm_block_ids and host_block_ids are parallel lists, one
+  // entry per block. The one exception is the "tds" backend, whose transfers
+  // go HBM <-> storage directly with no host staging: there the store sends
+  // no host ids at all (an empty list, never a partial one), and the worker
+  // uses that to pick the direct route (WorkerServiceImpl::
+  // TransferBackendBuffers). Only a single-spec request qualifies.
+  const bool allow_empty_host_ids =
+      backend_specs.size() == 1 && backend_specs[0].name() == "tds";
   if (hbm_block_ids.size() != block_hashes.size() ||
-      host_block_ids.size() != block_hashes.size()) {
+      (host_block_ids.size() != block_hashes.size() &&
+       !(allow_empty_host_ids && host_block_ids.empty()))) {
     return absl::InvalidArgumentError(absl::StrCat(
         "block_hashes (", block_hashes.size(), "), hbm_block_ids (",
         hbm_block_ids.size(), ") and host_block_ids (", host_block_ids.size(),

@@ -1069,6 +1069,48 @@ NumaAwareKVCacheManager::H2dReadFromBackend(
   return raiden::JoinPjRtCopyFutures(futures);
 }
 
+absl::StatusOr<raiden::PjRtCopyFuture>
+NumaAwareKVCacheManager::WriteDeviceToBackend(
+    absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+    const std::vector<kv_cache::backends::BlockKey>& block_keys,
+    const std::vector<int64_t>& src_device_block_ids) {
+  if (sub_managers_.empty()) {
+    return absl::InternalError("No sub-managers available");
+  }
+  std::vector<raiden::PjRtCopyFuture> futures;
+  futures.reserve(sub_managers_.size());
+  for (auto& sub_mgr : sub_managers_) {
+    if (sub_mgr != nullptr && sub_mgr->base() != nullptr) {
+      ABSL_ASSIGN_OR_RETURN(
+          auto fut, sub_mgr->base()->WriteDeviceToBackend(
+                        backends, block_keys, src_device_block_ids));
+      futures.push_back(std::move(fut));
+    }
+  }
+  return raiden::JoinPjRtCopyFutures(futures);
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture>
+NumaAwareKVCacheManager::ReadDeviceFromBackend(
+    absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+    const std::vector<kv_cache::backends::BlockKey>& block_keys,
+    const std::vector<int64_t>& dst_device_block_ids) {
+  if (sub_managers_.empty()) {
+    return absl::InternalError("No sub-managers available");
+  }
+  std::vector<raiden::PjRtCopyFuture> futures;
+  futures.reserve(sub_managers_.size());
+  for (auto& sub_mgr : sub_managers_) {
+    if (sub_mgr != nullptr && sub_mgr->base() != nullptr) {
+      ABSL_ASSIGN_OR_RETURN(
+          auto fut, sub_mgr->base()->ReadDeviceFromBackend(
+                        backends, block_keys, dst_device_block_ids));
+      futures.push_back(std::move(fut));
+    }
+  }
+  return raiden::JoinPjRtCopyFutures(futures);
+}
+
 std::shared_ptr<kv_cache::backends::KVBackend>
 NumaAwareKVCacheManager::GetKVBackend(absl::string_view backend_name) const {
   for (const auto& sub_mgr : sub_managers_) {

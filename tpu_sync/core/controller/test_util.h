@@ -301,6 +301,55 @@ struct MockTransferManager {
     return D2hWriteToBackend(absl::MakeSpan(b), block_keys,
                              src_device_block_ids, dst_host_block_ids);
   }
+
+  // TDS direct HBM <-> storage counterparts of the two above. They share the
+  // same call counters and last_* recorders so existing assertions apply, and
+  // clear the staging side (last_backend_dst_block_ids for a write,
+  // last_backend_src_block_ids for a read) so a test can assert that no host
+  // block ids were passed. No data moves; the future is immediately ready.
+  absl::StatusOr<raiden::PjRtCopyFuture> WriteDeviceToBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids) {
+    ++d2h_write_to_backend_calls;
+    last_d2h_backend_keys = block_keys;
+    last_backend_src_block_ids = src_device_block_ids;
+    last_backend_dst_block_ids.clear();
+    if (fail_transfers) return absl::InternalError("scripted transfer failure");
+    return raiden::PjRtCopyFuture();
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> WriteDeviceToBackend(
+      std::shared_ptr<kv_cache::backends::KVBackend> backend,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& src_device_block_ids) {
+    const std::shared_ptr<kv_cache::backends::KVBackend> b[] = {
+        std::move(backend)};
+    return WriteDeviceToBackend(absl::MakeSpan(b), block_keys,
+                                src_device_block_ids);
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> ReadDeviceFromBackend(
+      absl::Span<const std::shared_ptr<kv_cache::backends::KVBackend>> backends,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& dst_device_block_ids) {
+    ++h2d_read_from_backend_calls;
+    last_h2d_backend_keys = block_keys;
+    last_backend_src_block_ids.clear();
+    last_backend_dst_block_ids = dst_device_block_ids;
+    if (fail_transfers) return absl::InternalError("scripted transfer failure");
+    return raiden::PjRtCopyFuture();
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> ReadDeviceFromBackend(
+      std::shared_ptr<kv_cache::backends::KVBackend> backend,
+      const std::vector<kv_cache::backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& dst_device_block_ids) {
+    const std::shared_ptr<kv_cache::backends::KVBackend> b[] = {
+        std::move(backend)};
+    return ReadDeviceFromBackend(absl::MakeSpan(b), block_keys,
+                                 dst_device_block_ids);
+  }
 };
 
 // Like MockTransferManager but ALSO implements the vector

@@ -39,6 +39,7 @@
 #include "absl/base/log_severity.h"
 #include "absl/base/nullability.h"
 #include "absl/base/thread_annotations.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
 #include "absl/log/scoped_mock_log.h"
@@ -64,6 +65,8 @@
 #include "grpcpp/support/server_callback.h"
 #include "grpcpp/support/status.h"
 #include "grpcpp/support/sync_stream.h"
+#include "xla/pjrt/pjrt_client.h"
+#include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/raiden_id.h"
@@ -72,6 +75,7 @@
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
+#include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
@@ -79,6 +83,7 @@
 #include "tpu_sync/kv_cache/global_registry/global_registry_server.h"
 #include "tpu_sync/kv_cache/global_registry/test_util.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
@@ -8159,6 +8164,241 @@ TEST_F(SecondaryBackendTopologyTest, LookupProbesTpSizeRanksNotNumShards) {
   TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result, store_->Lookup({"h"}));
   ASSERT_EQ(result.size(), 1);
   EXPECT_EQ(result[0].second.status, BlockStatus::SHARED_STORAGE);
+}
+
+// Lookup under TDS caching: a tier-0 HBM entry is a hit, a tier-0 HOST entry
+// is NOT (the hash falls through to the storage probe, which finds it only if
+// its shard file exists), and a peer DRAM copy advertised in the registry is
+// ignored. Also checks that the pin tier 0 took on the skipped HOST entry was
+// handed back.
+//
+// The secondary tier is a PosixKVCacheStoreBackend named "tds", exactly what
+// the "tds" factory registration in posix_backend.cc produces: the store only
+// needs the tier's name to detect TDS mode and its existence probe for Lookup.
+TEST_F(KVCacheStoreEmbeddedControllerTest,
+       TdsCachingLookupFindsDataOnlyInHbmAndStorageNotDram) {
+  auto reg_server = global_registry::CreateTestGlobalRegistryServer();
+  RaidenId peer_id{"peer_job", "0", "kv_cache", 0};
+  ABSL_ASSERT_OK(
+      reg_server->client->Register({{"peer_dram_hash", peer_id, 100}}));
+
+  auto controller = MakeController();
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  KVCacheStore store(10, std::move(controller), reg_server->server_address, rid,
+                     std::nullopt, /*store_server_ip=*/"127.0.0.1");
+
+  std::string scratch_dir =
+      std::string(testing::TempDir()) + "/" +
+      ::testing::UnitTest::GetInstance()->current_test_info()->name();
+  auto worker_backend = std::make_shared<backends::storage::PosixKVBackend>(
+      "tds", absl::flat_hash_map<std::string, std::string>{});
+  auto mapper = std::make_shared<backends::storage::PosixPathMapper>(
+      scratch_dir, "model_test",
+      backends::ParallelismConfig{.tp_size = 1, .tp_rank = 0});
+  worker_backend->set_mapper(mapper);
+  KVCacheStoreTest::AddBackend(
+      store,
+      std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
+          worker_backend, "tds"));
+
+  ASSERT_TRUE(InsertResident(
+      store, {"hbm_hash"}, {RaidenBlockId(rid, -1, 0, BlockStatus::HBM)},
+      /*on_host=*/false));
+  ASSERT_TRUE(InsertResident(
+      store, {"dram_only_hash", "dram_and_storage_hash"},
+      {RaidenBlockId(rid, 1, -1, BlockStatus::HOST),
+       RaidenBlockId(rid, 2, -1, BlockStatus::HOST)},
+      /*on_host=*/true));
+
+  // The storage probe only checks existence, so any file content will do.
+  for (absl::string_view hash :
+       {"dram_and_storage_hash", "storage_only_hash"}) {
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto key,
+        mapper->MapKey(std::string(hash), {.parallelism = {.tp_rank = 0}}));
+    std::filesystem::create_directories(
+        std::filesystem::path(key.resolved_key).parent_path());
+    std::ofstream(key.resolved_key) << "tds dummy";
+  }
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      BlockSliceList hits,
+      store.Lookup({"hbm_hash", "dram_and_storage_hash", "storage_only_hash"},
+                   /*enable_global=*/true, /*pin_found=*/true));
+  ASSERT_EQ(hits.size(), 3);
+  EXPECT_EQ(hits[0].first, "hbm_hash");
+  EXPECT_EQ(hits[0].second.status, BlockStatus::HBM);
+  EXPECT_EQ(hits[0].second.host_block_id, -1);
+  EXPECT_EQ(hits[0].second.device_block_id, 0);
+  EXPECT_EQ(hits[1].first, "dram_and_storage_hash");
+  EXPECT_EQ(hits[1].second.status, BlockStatus::SHARED_STORAGE);
+  EXPECT_EQ(hits[2].first, "storage_only_hash");
+  EXPECT_EQ(hits[2].second.status, BlockStatus::SHARED_STORAGE);
+
+  EXPECT_EQ(store.GetPinCount("hbm_hash"), 1);
+  EXPECT_EQ(store.GetPinCount("dram_and_storage_hash"), 0);
+  EXPECT_EQ(store.GetPinCount("storage_only_hash"), 0);
+  store.Release({"hbm_hash"});
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      BlockSliceList dram_miss,
+      store.Lookup({"dram_only_hash"}, /*enable_global=*/true,
+                   /*pin_found=*/true));
+  EXPECT_TRUE(dram_miss.empty());
+  EXPECT_EQ(store.GetPinCount("dram_only_hash"), 0);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      BlockSliceList peer_miss,
+      store.Lookup({"peer_dram_hash"}, /*enable_global=*/true,
+                   /*pin_found=*/true));
+  EXPECT_TRUE(peer_miss.empty());
+}
+
+// Save under TDS caching, with the worker mocked: the offload must reach the
+// worker as a direct device write (device block ids only, no host ids), the
+// entry must stay HBM-only afterwards with the caller's pin consumed, and the
+// host block pool must be untouched.
+TEST_F(KVCacheStoreEmbeddedControllerTest,
+       TdsCachingSaveBypassesDramResidency) {
+  ::tpu_raiden::controller::MockTransferManager mock_mgr;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&mock_mgr));
+
+  auto controller = MakeController();
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  KVCacheStore store(10, std::move(controller), "", rid, std::nullopt,
+                     /*store_server_ip=*/"127.0.0.1");
+  const int initial_free = KVCacheStoreTest::GetController(store)
+                               ->block_manager()
+                               ->num_free_blocks();
+
+  std::string scratch_dir =
+      std::string(testing::TempDir()) + "/" +
+      ::testing::UnitTest::GetInstance()->current_test_info()->name();
+  auto worker_backend = std::make_shared<backends::storage::PosixKVBackend>(
+      "tds", absl::flat_hash_map<std::string, std::string>{});
+  worker_backend->set_mapper(
+      std::make_shared<backends::storage::PosixPathMapper>(
+          scratch_dir, "model_test",
+          backends::ParallelismConfig{.tp_size = 1, .tp_rank = 0}));
+  KVCacheStoreTest::AddBackend(
+      store,
+      std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
+          worker_backend, "tds"));
+  // The worker's view of the "tds" backend: the mock resolves keys through
+  // it, so it needs a mapper, but no bytes are moved.
+  mock_mgr.backends["tds"] = worker_backend;
+
+  std::vector<std::string> hashes = {"tds_save_hash"};
+  ASSERT_TRUE(InsertResident(
+      store, hashes, {RaidenBlockId(rid, -1, 3, BlockStatus::HBM)},
+      /*on_host=*/false));
+  // Save() consumes a pin; the application-level Lookup grants it.
+  ABSL_ASSERT_OK(store.Lookup(hashes));
+  ABSL_ASSERT_OK(store.Save(hashes));
+
+  bool done = false;
+  while (!done) {
+    auto [save_done, save_failed, save_pending, save_existing,
+          save_unregistered] = store.PollSaveStatus();
+    ASSERT_TRUE(save_failed.empty());
+    if (!save_done.empty()) {
+      EXPECT_THAT(save_done, ::testing::ElementsAre("tds_save_hash"));
+      done = true;
+    } else {
+      absl::SleepFor(absl::Milliseconds(10));
+    }
+  }
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList lookup_res, PeekLookup(store, hashes));
+  ASSERT_EQ(lookup_res.size(), 1);
+  EXPECT_EQ(lookup_res[0].second.status, BlockStatus::HBM);
+  EXPECT_EQ(lookup_res[0].second.host_block_id, -1);
+  EXPECT_EQ(lookup_res[0].second.device_block_id, 3);
+  EXPECT_EQ(store.GetPinCount("tds_save_hash"), 0);
+  EXPECT_THAT(mock_mgr.last_backend_src_block_ids, ::testing::ElementsAre(3));
+  EXPECT_THAT(mock_mgr.last_backend_dst_block_ids, ::testing::IsEmpty());
+  EXPECT_EQ(KVCacheStoreTest::GetController(store)
+                ->block_manager()
+                ->num_free_blocks(),
+            initial_free);
+}
+
+// Recall under TDS caching, with the worker mocked: SHARED_STORAGE hits are
+// loaded as a direct device read (device block ids only), and on completion
+// each block is republished as an HBM-only tier-0 entry, again without
+// touching the host block pool.
+TEST_F(KVCacheStoreEmbeddedControllerTest,
+       TdsCachingRecallLoadsToHbmWithoutDramResidency) {
+  ::tpu_raiden::controller::MockTransferManager mock_mgr;
+  test_server_->service->SetTransferManager(
+      ::tpu_raiden::KVManagerHolder(&mock_mgr));
+
+  auto controller = MakeController();
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  KVCacheStore store(10, std::move(controller), "", rid, std::nullopt,
+                     /*store_server_ip=*/"127.0.0.1");
+  const int initial_free = KVCacheStoreTest::GetController(store)
+                               ->block_manager()
+                               ->num_free_blocks();
+
+  std::string scratch_dir =
+      std::string(testing::TempDir()) + "/" +
+      ::testing::UnitTest::GetInstance()->current_test_info()->name();
+  auto worker_backend = std::make_shared<backends::storage::PosixKVBackend>(
+      "tds", absl::flat_hash_map<std::string, std::string>{});
+  auto mapper = std::make_shared<backends::storage::PosixPathMapper>(
+      scratch_dir, "model_test",
+      backends::ParallelismConfig{.tp_size = 1, .tp_rank = 0});
+  worker_backend->set_mapper(mapper);
+  KVCacheStoreTest::AddBackend(
+      store,
+      std::make_shared<backends::storage::PosixKVCacheStoreBackend>(
+          worker_backend, "tds"));
+  mock_mgr.backends["tds"] = worker_backend;
+
+  const std::vector<std::string> hashes = {"tds_recall_0", "tds_recall_1"};
+  for (const std::string& hash : hashes) {
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto key, mapper->MapKey(hash, {.parallelism = {.tp_rank = 0}}));
+    std::filesystem::create_directories(
+        std::filesystem::path(key.resolved_key).parent_path());
+    std::ofstream(key.resolved_key) << "tds recall bytes";
+  }
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList storage_hits, store.Lookup(hashes));
+  ASSERT_EQ(storage_hits.size(), 2);
+  EXPECT_EQ(storage_hits[0].second.status, BlockStatus::SHARED_STORAGE);
+  EXPECT_EQ(storage_hits[1].second.status, BlockStatus::SHARED_STORAGE);
+
+  ABSL_ASSERT_OK(store.Load(
+      hashes, {storage_hits[0].second, storage_hits[1].second}, {4, 5}));
+  LoadOutcome outcome = WaitForLoadSettled(store, hashes.size());
+  EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.done,
+              ::testing::UnorderedElementsAre("tds_recall_0", "tds_recall_1"));
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList hbm_hits, PeekLookup(store, hashes));
+  ASSERT_EQ(hbm_hits.size(), 2);
+  EXPECT_EQ(hbm_hits[0].second.status, BlockStatus::HBM);
+  EXPECT_EQ(hbm_hits[0].second.host_block_id, -1);
+  EXPECT_EQ(hbm_hits[0].second.device_block_id, 4);
+  EXPECT_EQ(hbm_hits[1].second.status, BlockStatus::HBM);
+  EXPECT_EQ(hbm_hits[1].second.host_block_id, -1);
+  EXPECT_EQ(hbm_hits[1].second.device_block_id, 5);
+  EXPECT_THAT(mock_mgr.last_backend_src_block_ids, ::testing::IsEmpty());
+  EXPECT_THAT(mock_mgr.last_backend_dst_block_ids,
+              ::testing::ElementsAre(4, 5));
+  EXPECT_EQ(KVCacheStoreTest::GetController(store)
+                ->block_manager()
+                ->num_free_blocks(),
+            initial_free);
 }
 
 }  // namespace

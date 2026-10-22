@@ -3891,6 +3891,37 @@ KVCacheManagerBase::ResolveBlockSlices(int staging_block_id) const {
   return slices;
 }
 
+absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::WriteDeviceToBackend(
+    absl::Span<const std::shared_ptr<backends::KVBackend>> backends,
+    const std::vector<backends::BlockKey>& block_keys,
+    const std::vector<int64_t>& src_device_block_ids) {
+  if (backends.size() > 1) {
+    return absl::InvalidArgumentError(
+        "Multiple secondary backends not supported yet");
+  }
+  auto backend = backends.empty() ? nullptr : backends.front();
+  if (backend == nullptr) {
+    return absl::InvalidArgumentError("Secondary backend is null");
+  }
+  return absl::UnimplementedError("WriteDeviceToBackend is not supported");
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture>
+KVCacheManagerBase::ReadDeviceFromBackend(
+    absl::Span<const std::shared_ptr<backends::KVBackend>> backends,
+    const std::vector<backends::BlockKey>& block_keys,
+    const std::vector<int64_t>& dst_device_block_ids) {
+  if (backends.size() > 1) {
+    return absl::InvalidArgumentError(
+        "Multiple secondary backends not supported yet");
+  }
+  auto backend = backends.empty() ? nullptr : backends.front();
+  if (backend == nullptr) {
+    return absl::InvalidArgumentError("Secondary backend is null");
+  }
+  return absl::UnimplementedError("ReadDeviceFromBackend is not supported");
+}
+
 xla::PjRtClient* KVCacheManagerBase::GetPjRtClient() const {
   for (const auto& layer_device_info : buffer_holds_) {
     for (const auto& hold : layer_device_info.holds) {

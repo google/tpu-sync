@@ -282,6 +282,7 @@ cc_test(
         ":chunk_serializer",
         ":raw_buffer_transport",
         ":raw_buffer_transport_delegate",
+        "//third_party/gloop/util/random:shared_bit_gen",
         "//tpu_sync/fault_injection:hooks",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",

@@ -54,6 +54,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "third_party/gloop/util/random/shared_bit_gen.h"
 #include "grpcpp/channel.h"
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
@@ -118,9 +119,9 @@ bool AllZero(absl::Span<const uint8_t> data) {
 }
 
 void RandomNonZero(absl::Span<uint8_t> data) {
-  thread_local absl::BitGen bitgen;
   for (uint8_t& b : data) {
-    b = absl::Uniform<uint8_t>(absl::IntervalClosedClosed, bitgen, 0x01, 0xff);
+    b = absl::Uniform<uint8_t>(absl::IntervalClosedClosed,
+                               util_random::SharedBitGen(), 0x01, 0xff);
   }
 }
 

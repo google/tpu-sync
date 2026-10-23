@@ -134,6 +134,10 @@ struct StartTransferArgs {
   // Per-tag destination clip; `if dst_skip_bytes:` — truthy, so empty
   // (no clip) is absent and skip-free encodings stay byte-identical.
   std::vector<int64_t> dst_skip_bytes;
+  // Per-tag bounded-staging window (destination blocks per sub-transfer);
+  // `if dst_window_blocks:` — truthy, so empty (unbounded) is absent and
+  // window-free encodings stay byte-identical.
+  std::vector<int64_t> dst_window_blocks;
   // num_tokens is accepted by the shim for caller compatibility and
   // dropped, exactly like the facade (retired from the wire).
 };

@@ -131,6 +131,7 @@ cc_library(
         "//tpu_sync/proto:transfer_program_cc_proto",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/random",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",

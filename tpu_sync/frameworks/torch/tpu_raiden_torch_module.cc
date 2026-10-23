@@ -1394,7 +1394,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
               bool has_transfer_pool_tags,
               const std::vector<std::string>& transfer_pool_tags,
               const std::vector<int64_t>& dst_block_counts,
-              const std::vector<int64_t>& dst_skip_bytes) {
+              const std::vector<int64_t>& dst_skip_bytes,
+              const std::vector<int64_t>& dst_window_blocks) {
              tpu_raiden::kv_cache::reshard::StartTransferArgs args;
              for (const auto& unit : src_units) {
                args.src_units.push_back(
@@ -1418,6 +1419,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
              args.transfer_pool_tags = transfer_pool_tags;
              args.dst_block_counts = dst_block_counts;
              args.dst_skip_bytes = dst_skip_bytes;
+             args.dst_window_blocks = dst_window_blocks;
              nb::gil_scoped_release release;
              absl::StatusOr<bool> result = self.client->StartTransfer(args);
              ::tpu_raiden::kv_cache::reshardpb2::ThrowIfError(result.status());
@@ -1459,6 +1461,9 @@ NB_MODULE(_tpu_raiden_torch, m) {
   // Capability marker for the vLLM connector's version-skew probe: present
   // and true iff start_transfer accepts the dst_skip_bytes clip.
   m.attr("reshard_client_supports_dst_skip_bytes") = true;
+  // Present and true iff start_transfer accepts the per-tag
+  // dst_window_blocks bounded-staging window (chained sub-transfers).
+  m.attr("reshard_client_supports_dst_window_blocks") = true;
   // Present and true iff get_request_block_status (the read-only registry
   // lifecycle probe) is bound.
   m.attr("reshard_client_supports_request_block_status") = true;

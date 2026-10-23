@@ -801,5 +801,125 @@ TEST(PoolReshardRecvTest,
   EXPECT_THAT(failed_recving, Contains("pool_reshard_req_3003"));
 }
 
+
+// ---------------------------------------------------------------------------
+// Sub-plan chains: a request coordinated as several pool-reshard plans
+// (bounded-staging windows) reports one terminal per role.
+
+StartTransferRequest ChainedRecvPlan(int64_t uuid, int32_t index,
+                                     int32_t count) {
+  StartTransferRequest plan = ValidPlan(uuid);
+  plan.set_req_id("chained_req");
+  plan.set_sub_plan_index(index);
+  plan.set_sub_plan_count(count);
+  // Each sub-plan lands its own destination block.
+  plan.mutable_pool_groups(0)->set_dst_device_block_ids(0, index);
+  (*plan.mutable_shard_push_schedules())[0]
+      .mutable_entries(0)
+      ->set_dst_block_id(index);
+  return plan;
+}
+
+TEST(SubPlanChainTest, ReceiveTerminalWaitsForTheLastSubPlan) {
+  TestManager manager;
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
+  manager.AttachPlaceholderDeviceHold();
+
+  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(
+      ChainedRecvPlan(/*uuid=*/5001, /*index=*/0, /*count=*/3),
+      std::vector<int64_t>{0}));
+  manager.FinishPoolReshardRecvPool(5001, /*pool_idx=*/0, absl::OkStatus());
+  {
+    const auto [sent, received, failed] = manager.CompleteReadRaw();
+    EXPECT_THAT(received, IsEmpty());
+    EXPECT_THAT(failed, IsEmpty());
+  }
+  // Sub-plans may arrive and settle in any order; the request completes
+  // when every one of them has.
+  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(
+      ChainedRecvPlan(5003, /*index=*/2, /*count=*/3), std::vector<int64_t>{2}));
+  manager.FinishPoolReshardRecvPool(5003, /*pool_idx=*/0, absl::OkStatus());
+  {
+    const auto [sent, received, failed] = manager.CompleteReadRaw();
+    EXPECT_THAT(received, IsEmpty());
+  }
+  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(
+      ChainedRecvPlan(5002, /*index=*/1, /*count=*/3), std::vector<int64_t>{1}));
+  manager.FinishPoolReshardRecvPool(5002, /*pool_idx=*/0, absl::OkStatus());
+  {
+    const auto [sent, received, failed] = manager.CompleteReadRaw();
+    EXPECT_THAT(received, Contains("chained_req"));
+    EXPECT_THAT(failed, IsEmpty());
+  }
+  // Reported exactly once.
+  {
+    const auto [sent, received, failed] = manager.CompleteReadRaw();
+    EXPECT_THAT(received, IsEmpty());
+  }
+}
+
+TEST(SubPlanChainTest, FirstSubPlanFailureFailsTheRequestOnce) {
+  TestManager manager;
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
+  manager.AttachPlaceholderDeviceHold();
+
+  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(
+      ChainedRecvPlan(5011, /*index=*/0, /*count=*/2), std::vector<int64_t>{0}));
+  manager.FinishPoolReshardRecvPool(5011, /*pool_idx=*/0,
+                                    absl::InternalError("push failed"));
+  CompleteReadResult first = manager.CompleteReadWithDetails();
+  EXPECT_THAT(first.failed, Contains("chained_req"));
+  ASSERT_TRUE(first.details.contains("chained_req"));
+  EXPECT_THAT(first.details.at("chained_req").reason.value_or(""),
+              ::testing::HasSubstr("sub-plan 0 of 2"));
+
+  // A later sub-plan of the failed request settling cleanly is swallowed:
+  // the connector already recomputed the request.
+  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(
+      ChainedRecvPlan(5012, /*index=*/1, /*count=*/2), std::vector<int64_t>{1}));
+  manager.FinishPoolReshardRecvPool(5012, /*pool_idx=*/0, absl::OkStatus());
+  const auto [sent, received, failed] = manager.CompleteReadRaw();
+  EXPECT_THAT(received, IsEmpty());
+  EXPECT_THAT(failed, IsEmpty());
+}
+
+TEST(SubPlanChainTest, StalledChainFailsAfterTheTransferTimeout) {
+  TestManager manager(/*timeout_s=*/0.05);
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
+  manager.AttachPlaceholderDeviceHold();
+
+  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(
+      ChainedRecvPlan(5021, /*index=*/0, /*count=*/2), std::vector<int64_t>{0}));
+  manager.FinishPoolReshardRecvPool(5021, /*pool_idx=*/0, absl::OkStatus());
+  {
+    const auto [sent, received, failed] = manager.CompleteReadRaw();
+    EXPECT_THAT(received, IsEmpty());
+    EXPECT_THAT(failed, IsEmpty());
+  }
+  // The second sub-plan never arrives: once the request has had no session
+  // for a whole transfer timeout, the sweep fails it so the consumer can
+  // recompute instead of waiting forever.
+  absl::SleepFor(absl::Milliseconds(120));
+  CompleteReadResult swept = manager.CompleteReadWithDetails();
+  EXPECT_THAT(swept.failed, Contains("chained_req"));
+  ASSERT_TRUE(swept.details.contains("chained_req"));
+  EXPECT_THAT(swept.details.at("chained_req").reason.value_or(""),
+              ::testing::HasSubstr("sub-plan chain stalled"));
+}
+
+TEST(SubPlanChainTest, SinglePlanRequestsReportAtOnce) {
+  TestManager manager;
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
+  manager.AttachPlaceholderDeviceHold();
+
+  // sub_plan_count 0 (legacy) and 1 both mean "the whole request".
+  StartTransferRequest plan = ValidPlan(/*uuid=*/5031);
+  ABSL_ASSERT_OK(
+      manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}));
+  manager.FinishPoolReshardRecvPool(5031, /*pool_idx=*/0, absl::OkStatus());
+  const auto [sent, received, failed] = manager.CompleteReadRaw();
+  EXPECT_THAT(received, Contains("pool_reshard_req_5031"));
+}
+
 }  // namespace
 }  // namespace tpu_raiden

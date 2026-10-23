@@ -399,6 +399,8 @@ ReshardReceiveSession::ReshardReceiveSession(
       staging_allocator_(staging_allocator),
       uuid_(uuid),
       req_id_(plan.req_id()),
+      sub_plan_index_(plan.sub_plan_index()),
+      sub_plan_count_(plan.sub_plan_count()),
       deadline_(deadline),
       start_time_(std::chrono::steady_clock::now()) {
   absl::MutexLock lock(mu_);

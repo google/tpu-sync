@@ -255,6 +255,10 @@ tpu_sync::rpc::ControllerRequest ReshardClient::BuildStartTransfer(
   for (int64_t skip : args.dst_skip_bytes) {
     coord->add_dst_skip_bytes(skip);
   }
+  // `if dst_window_blocks:` — truthy; empty (unbounded) is absent.
+  for (int64_t window : args.dst_window_blocks) {
+    coord->add_dst_window_blocks(window);
+  }
   return req;
 }
 

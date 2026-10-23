@@ -336,6 +336,32 @@ class KVCacheManagerWithTransfer {
   // CompleteReadResult::details not yet reported.
   absl::flat_hash_map<std::string, TransferDetails> transfer_details_
       ABSL_GUARDED_BY(mu_);
+  // A request coordinated as a chain of pool-reshard sub-plans
+  // (StartTransferRequest.sub_plan_count > 1) gets one terminal: reported
+  // when its last sub-plan settles, or at its first sub-plan failure (later
+  // sub-plans of a failed request are swallowed until the entry expires).
+  // A chain whose next sub-plan never arrives is failed by the sweep once
+  // it has had no session for timeout_s_.
+  struct SubPlanChainProgress {
+    int32_t count = 0;
+    absl::flat_hash_set<int32_t> settled;
+    bool failed = false;
+    std::chrono::steady_clock::time_point last_activity;
+  };
+  absl::flat_hash_map<std::string, SubPlanChainProgress> recv_chains_
+      ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<std::string, SubPlanChainProgress> send_chains_
+      ABSL_GUARDED_BY(mu_);
+  // Records a settled pool-reshard session (`is_recv` selects the role) into
+  // the terminal sets, aggregating per request across its sub-plans.
+  void RecordPoolReshardTerminalLocked(bool is_recv, const std::string& req_id,
+                                       int32_t sub_plan_index,
+                                       int32_t sub_plan_count,
+                                       const absl::Status& status)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Fails stalled sub-plan chains and expires reported ones.
+  void SweepSubPlanChainsLocked(std::chrono::steady_clock::time_point now)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   absl::Mutex mu_;
   absl::CondVar cv_;
   std::atomic<bool> stopping_{false};

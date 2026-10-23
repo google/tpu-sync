@@ -148,6 +148,8 @@ absl::StatusOr<::tpu_sync::proto::TransferProgramRequest> CompileStartTransfer(
   envelope->set_role(request.is_sender()
                          ? ::tpu_sync::proto::TRANSFER_ROLE_SENDER
                          : ::tpu_sync::proto::TRANSFER_ROLE_RECEIVER_ARM);
+  envelope->set_sub_plan_index(request.sub_plan_index());
+  envelope->set_sub_plan_count(request.sub_plan_count());
 
   ::tpu_sync::proto::TransferProgram* program = out.mutable_program();
 
@@ -239,6 +241,8 @@ absl::StatusOr<::tpu_sync::rpc::StartTransferRequest> LowerToStartTransfer(
   out.set_req_id(request.envelope().req_id());
   out.set_is_sender(request.envelope().role() ==
                     ::tpu_sync::proto::TRANSFER_ROLE_SENDER);
+  out.set_sub_plan_index(request.envelope().sub_plan_index());
+  out.set_sub_plan_count(request.envelope().sub_plan_count());
 
   const ::tpu_sync::proto::ReshardBinding& binding = program.reshard();
   *out.mutable_src_units() = binding.src_units();

@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -135,6 +136,12 @@ struct TagPrecheck {
   // Both live maps are one region at physical offset zero, so logical and
   // physical block offsets coincide and a strided span needs no translation.
   bool identity_maps = false;
+  // Sub-transfer window of a windowed tag, in the tag's global destination
+  // byte space: the clip replacing dst_skip_bytes (skip plus the preceding
+  // windows' pages) and the page-aligned end of a window that is not the
+  // tag's last (0 = no end clip).
+  int64_t window_skip = 0;
+  int64_t window_end = 0;
 };
 
 // True when a pool's live bytes are one contiguous region at physical
@@ -162,10 +169,12 @@ using TransferPairs = std::map<
 
 // Re-bases one strided request-global span (one head slice repeated per
 // token) to its destination page. The span must lie inside one destination
-// page, so a page-aligned clip drops it whole or keeps it whole.
+// page, so a page-aligned clip (`tag_skip` below, `tag_end` above when
+// positive) drops it whole or keeps it whole.
 absl::Status RebaseStridedGlobalSpan(const PoolByteSpan& span,
                                      const RaidenId& unit, int64_t tag_skip,
-                                     int64_t dst_live, int64_t* tag_global_end,
+                                     int64_t tag_end, int64_t dst_live,
+                                     int64_t* tag_global_end,
                                      int64_t* tag_clipped_bytes,
                                      std::vector<PoolByteSpan>* out) {
   if (span.src_stride_bytes <= 0 || span.dst_stride_bytes <= 0) {
@@ -184,7 +193,8 @@ absl::Status RebaseStridedGlobalSpan(const PoolByteSpan& span,
                      PythonRepr(unit), ")"));
   }
   *tag_global_end = std::max(*tag_global_end, span.dst_offset_bytes + extent);
-  if (span.dst_offset_bytes < tag_skip) {
+  if (span.dst_offset_bytes < tag_skip ||
+      (tag_end > 0 && span.dst_offset_bytes >= tag_end)) {
     *tag_clipped_bytes += span.size_bytes * span.count;
     return absl::OkStatus();
   }
@@ -196,17 +206,19 @@ absl::Status RebaseStridedGlobalSpan(const PoolByteSpan& span,
 }
 
 // Splits one plain request-global span at destination page boundaries, after
-// the page-aligned `tag_skip` clip: a span wholly below the cut is dropped
-// (its source bytes are never read), a straddling span is trimmed, and
-// survivors re-base into the clipped space.
+// the page-aligned `tag_skip` clip (and, when `tag_end` is positive, the
+// page-aligned end clip of a sub-transfer window): a span wholly outside
+// the window is dropped (its source bytes are never read), a straddling
+// span is trimmed, and survivors re-base into the clipped space.
 void SplitPlainGlobalSpan(const PoolByteSpan& span, int64_t tag_skip,
-                          int64_t dst_live, int64_t* tag_global_end,
-                          int64_t* tag_clipped_bytes,
+                          int64_t tag_end, int64_t dst_live,
+                          int64_t* tag_global_end, int64_t* tag_clipped_bytes,
                           std::vector<PoolByteSpan>* out) {
-  *tag_global_end =
-      std::max(*tag_global_end, span.dst_offset_bytes + span.size_bytes);
+  const int64_t span_end = span.dst_offset_bytes + span.size_bytes;
+  *tag_global_end = std::max(*tag_global_end, span_end);
   int64_t clip_advance = 0;
-  if (span.dst_offset_bytes + span.size_bytes <= tag_skip) {
+  if (span_end <= tag_skip ||
+      (tag_end > 0 && span.dst_offset_bytes >= tag_end)) {
     *tag_clipped_bytes += span.size_bytes;
     return;
   }
@@ -214,7 +226,12 @@ void SplitPlainGlobalSpan(const PoolByteSpan& span, int64_t tag_skip,
     clip_advance = tag_skip - span.dst_offset_bytes;
     *tag_clipped_bytes += clip_advance;
   }
-  int64_t remaining = span.size_bytes - clip_advance;
+  int64_t clip_tail = 0;
+  if (tag_end > 0 && span_end > tag_end) {
+    clip_tail = span_end - tag_end;
+    *tag_clipped_bytes += clip_tail;
+  }
+  int64_t remaining = span.size_bytes - clip_advance - clip_tail;
   int64_t global_offset = span.dst_offset_bytes + clip_advance - tag_skip;
   int64_t src_offset = span.src_offset_bytes + clip_advance;
   while (remaining > 0) {
@@ -242,11 +259,14 @@ void SplitPlainGlobalSpan(const PoolByteSpan& span, int64_t tag_skip,
 // are never read), the straddling span is trimmed, and survivors
 // re-base into the clipped space — skip is a dst_live multiple, so
 // in-page offsets are unchanged and only page indices shift.
+// A sub-transfer window adds a page-aligned end clip (`tag_end` > 0):
+// spans at or above it are dropped the same way, the straddling span is
+// trimmed, and the clipped bytes are accounted like the skip's.
 // `declared` then points at the rewritten registrations, which `storage`
 // owns.
 absl::Status SplitGlobalSpaceSpans(const std::string& plan_tag,
-                                   int64_t tag_skip, int64_t dst_live,
-                                   DeclaredSpans* declared,
+                                   int64_t tag_skip, int64_t tag_end,
+                                   int64_t dst_live, DeclaredSpans* declared,
                                    std::vector<PoolSpanRegistration>* storage,
                                    int64_t* tag_clipped_bytes) {
   storage->reserve(declared->size());
@@ -257,6 +277,12 @@ absl::Status SplitGlobalSpaceSpans(const std::string& plan_tag,
       if (tag_skip > 0) {
         return absl::InvalidArgumentError(absl::StrCat(
             "dst_skip_bytes requires destination-page-agnostic "
+            "(dst_space_version=1) declarations for tag ",
+            PyStrRepr(plan_tag), " (declared by ", PythonRepr(unit), ")"));
+      }
+      if (tag_end > 0) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "dst_window_blocks requires destination-page-agnostic "
             "(dst_space_version=1) declarations for tag ",
             PyStrRepr(plan_tag), " (declared by ", PythonRepr(unit), ")"));
       }
@@ -275,8 +301,8 @@ absl::Status SplitGlobalSpaceSpans(const std::string& plan_tag,
       }
       if (span.count > 1) {
         absl::Status status = RebaseStridedGlobalSpan(
-            span, unit, tag_skip, dst_live, &tag_global_end, tag_clipped_bytes,
-            &split_entry.spans);
+            span, unit, tag_skip, tag_end, dst_live, &tag_global_end,
+            tag_clipped_bytes, &split_entry.spans);
         if (!status.ok()) return status;
         continue;
       }
@@ -286,7 +312,7 @@ absl::Status SplitGlobalSpaceSpans(const std::string& plan_tag,
             "(declared by ",
             PythonRepr(unit), ")"));
       }
-      SplitPlainGlobalSpan(span, tag_skip, dst_live, &tag_global_end,
+      SplitPlainGlobalSpan(span, tag_skip, tag_end, dst_live, &tag_global_end,
                            tag_clipped_bytes, &split_entry.spans);
     }
     storage->push_back(std::move(split_entry));
@@ -297,6 +323,15 @@ absl::Status SplitGlobalSpaceSpans(const std::string& plan_tag,
         "dst_skip_bytes removes the entire tag ", PyStrRepr(plan_tag),
         ": skip=", tag_skip, ", declared_extent=", tag_global_end,
         "; a full local hit must not reach the planner"));
+  }
+  if (tag_end > 0 && tag_end > tag_global_end) {
+    // A window that is not the tag's last one must be filled: an end clip
+    // past the declared extent means the request's destination list is
+    // longer than what the producers declared.
+    return absl::InvalidArgumentError(absl::StrCat(
+        "dst_window_blocks window ends past the declared extent of tag ",
+        PyStrRepr(plan_tag), ": window_end=", tag_end,
+        ", declared_extent=", tag_global_end));
   }
   *declared = std::move(converted);
   return absl::OkStatus();
@@ -862,6 +897,47 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
       tag_skips[i] = request.dst_skip_bytes[i];
     }
   }
+  // Sub-transfer windows: per tag, the ordinal of this plan's first
+  // destination block within the tag's full destination list and that
+  // list's length (0 = not windowed). Byte values are derived once the
+  // tag's destination page geometry is known (precheck below).
+  std::vector<int64_t> tag_window_offsets(requested_tags.size(), 0);
+  std::vector<int64_t> tag_window_totals(requested_tags.size(), 0);
+  if (!request.dst_window_offset_blocks.empty() ||
+      !request.dst_window_total_blocks.empty()) {
+    if (request.dst_window_offset_blocks.size() != requested_tags.size() ||
+        request.dst_window_total_blocks.size() != requested_tags.size()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "dst_window_offset_blocks/dst_window_total_blocks must align 1:1 "
+          "with transfer_pool_tags: ",
+          request.dst_window_offset_blocks.size(), "/",
+          request.dst_window_total_blocks.size(), " entries for ",
+          requested_tags.size(), " tags"));
+    }
+    for (size_t i = 0; i < requested_tags.size(); ++i) {
+      const int64_t offset = request.dst_window_offset_blocks[i];
+      const int64_t total = request.dst_window_total_blocks[i];
+      if (offset < 0 || total < 0) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "sub-transfer window values must be non-negative; tag ",
+            PyStrRepr(requested_tags[i]), " requested offset=", offset,
+            ", total=", total));
+      }
+      if (total == 0 && offset != 0) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "sub-transfer window offset requires a total; tag ",
+            PyStrRepr(requested_tags[i]), " requested offset=", offset));
+      }
+      if (total > 0 && offset + counts[i] > total) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "sub-transfer window exceeds the tag's destination list; tag ",
+            PyStrRepr(requested_tags[i]), " requested offset=", offset,
+            ", blocks=", counts[i], ", total=", total));
+      }
+      tag_window_offsets[i] = offset;
+      tag_window_totals[i] = total;
+    }
+  }
 
   {
     std::set<std::string> available_tags;
@@ -1013,6 +1089,25 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
           PyStrRepr(plan_tag), ": skip=", tag_skips[group_idx],
           ", page_live_bytes=", precheck.dst_live));
     }
+    if (tag_window_totals[group_idx] > 0) {
+      // The window's byte clip: skip past the preceding windows' pages; a
+      // window that is not the tag's last one also ends at a page boundary.
+      const int64_t offset = tag_window_offsets[group_idx];
+      const int64_t total = tag_window_totals[group_idx];
+      const int64_t window_blocks = counts[group_idx];
+      if (offset > std::numeric_limits<int64_t>::max() / precheck.dst_live ||
+          tag_skips[group_idx] >
+              std::numeric_limits<int64_t>::max() - offset * precheck.dst_live) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "sub-transfer window byte offset overflows for tag ",
+            PyStrRepr(plan_tag)));
+      }
+      precheck.window_skip = tag_skips[group_idx] + offset * precheck.dst_live;
+      if (offset + window_blocks < total) {
+        precheck.window_end =
+            precheck.window_skip + window_blocks * precheck.dst_live;
+      }
+    }
     precheck.src_segments = std::move(src_segment_maps[0]);
     precheck.dst_segments = std::move(dst_segment_maps[0]);
     precheck.identity_maps =
@@ -1061,7 +1156,13 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
     const TagPrecheck& precheck = tag_precheck[group_idx];
     const int64_t src_live = precheck.src_live;
     const int64_t dst_live = precheck.dst_live;
-    const int64_t tag_skip = tag_skips[group_idx];
+    // A windowed tag skips the preceding windows' pages on top of the
+    // request's own prefix clip and, unless this is its last window, ends
+    // at the window's page boundary.
+    const int64_t tag_skip = tag_window_totals[group_idx] > 0
+                                 ? precheck.window_skip
+                                 : tag_skips[group_idx];
+    const int64_t tag_end = precheck.window_end;
 
     std::vector<std::pair<RaidenId, const PoolSpanRegistration*>> declared;
     for (const RaidenId& unit : request.src_units) {
@@ -1087,7 +1188,7 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
     std::vector<PoolSpanRegistration> converted_storage;
     int64_t tag_clipped_bytes = 0;
     absl::Status split_status =
-        SplitGlobalSpaceSpans(plan_tag, tag_skip, dst_live, &declared,
+        SplitGlobalSpaceSpans(plan_tag, tag_skip, tag_end, dst_live, &declared,
                               &converted_storage, &tag_clipped_bytes);
     if (!split_status.ok()) return split_status;
 
@@ -1198,7 +1299,9 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
         meta->control_plane_rpc_address();
   }
   plan.dst_peers = std::move(dst_peers);
-  plan.uuid = uuid;
+  // The engine plan identity; the registry claim above is keyed by `uuid`
+  // (one claim shared by every sub-transfer of the request).
+  plan.uuid = request.plan_uuid > 0 ? request.plan_uuid : uuid;
   plan.req_id = req_id;
   plan.expected_block_count = static_cast<int64_t>(dst_ids.size());
   plan.expected_pushes_per_pool =

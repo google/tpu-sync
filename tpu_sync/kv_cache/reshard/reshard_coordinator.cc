@@ -21,11 +21,14 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <memory>
+#include <set>
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
 
+#include "absl/log/log.h"
 #include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -171,6 +174,12 @@ tpu_sync::rpc::StartTransferRequest BuildStartTransferForTarget(
   // Python assigns transfer_plan.skip_d2h unconditionally, which marks the
   // optional field present even when false — mirror that for G1.
   start_req.set_skip_d2h(plan.skip_d2h);
+  // Sub-transfer chain position (both zero for a single-plan request, so
+  // the legacy wire bytes are unchanged).
+  if (plan.sub_plan_count > 1) {
+    start_req.set_sub_plan_index(plan.sub_plan_index);
+    start_req.set_sub_plan_count(plan.sub_plan_count);
+  }
   // Pool plans leave skip_tiling empty: absent map on the wire.
 
   for (const PlanPoolGroup& group : plan.pool_groups) {
@@ -283,6 +292,35 @@ ReshardCoordinator::ReshardCoordinator(WorkUnitDirectory* directory,
       client_(client),
       delivery_(delivery) {}
 
+ReshardCoordinator::~ReshardCoordinator() {
+  stopping_.store(true);
+  std::vector<std::pair<std::shared_ptr<ChainContext>, std::thread>> chains;
+  {
+    absl::MutexLock lock(chains_mu_);
+    chains.swap(chains_);
+  }
+  for (auto& [ctx, thread] : chains) {
+    if (thread.joinable()) thread.join();
+  }
+}
+
+// Everything a request's sub-transfers share: the decoded request, the
+// metadata fetched once for the whole chain, the request uuid (registry
+// claim key), the claim owner and the chain layout.
+struct ReshardCoordinator::ChainContext {
+  PoolReshardArgs args;
+  std::vector<tpu_sync::rpc::RegisterWorkUnitRequest> src_metadata;
+  std::vector<tpu_sync::rpc::RegisterWorkUnitRequest> dst_metadata;
+  int64_t uuid = 0;
+  const void* claim_owner = nullptr;
+  SubTransferChain chain;
+  // Per-tag start offsets into args.dst_device_block_ids.
+  std::vector<int64_t> tag_starts;
+  std::vector<int64_t> tag_counts;
+  int64_t controller_start_ns = 0;
+  std::atomic<bool> finished{false};
+};
+
 absl::StatusOr<std::vector<tpu_sync::rpc::RegisterWorkUnitRequest>>
 ReshardCoordinator::QueryRemoteMetadata(const std::string& address) {
   tpu_sync::rpc::ControlRequest req;
@@ -313,6 +351,124 @@ ReshardCoordinator::SendWorkerRpc(
         "Raiden remote native execution failed: ", resp->message()));
   }
   return resp;
+}
+
+int64_t SubPlanUuid(int64_t uuid, int32_t index) {
+  if (index <= 0) return uuid;
+  // splitmix64 over (uuid, index); the result stays positive so the engine
+  // plan uuid satisfies the same contract as a request uuid.
+  uint64_t z = static_cast<uint64_t>(uuid) +
+               0x9E3779B97F4A7C15ull * static_cast<uint64_t>(index);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  z ^= z >> 31;
+  const int64_t mixed = static_cast<int64_t>(z & 0x7FFFFFFFFFFFFFFFull);
+  return mixed > 0 ? mixed : 1;
+}
+
+absl::StatusOr<SubTransferChain> PlanSubTransfers(const PoolReshardArgs& args) {
+  SubTransferChain chain;
+  const size_t num_tags = args.transfer_pool_tags.size();
+  bool any_window = false;
+  for (int64_t window : args.dst_window_blocks) {
+    if (window < 0) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "dst_window_blocks must be non-negative; got ", window));
+    }
+    if (window > 0) any_window = true;
+  }
+  if (!any_window) return chain;
+  if (args.dst_window_blocks.size() != num_tags) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "dst_window_blocks must align 1:1 with transfer_pool_tags: ",
+        args.dst_window_blocks.size(), " windows for ", num_tags, " tags"));
+  }
+  // Per-tag destination block counts; a malformed split is left to the
+  // planner's own validation (the request then plans as one transfer and
+  // fails there with the canonical error).
+  std::vector<int64_t> counts = args.dst_block_counts;
+  if (counts.empty()) {
+    if (num_tags != 1) return chain;
+    counts = {static_cast<int64_t>(args.dst_device_block_ids.size())};
+  } else if (counts.size() != num_tags) {
+    return chain;
+  }
+  {
+    int64_t sum = 0;
+    for (int64_t count : counts) {
+      if (count <= 0) return chain;
+      sum += count;
+    }
+    if (sum != static_cast<int64_t>(args.dst_device_block_ids.size())) {
+      return chain;
+    }
+  }
+  std::vector<int32_t> windows_per_tag(num_tags, 1);
+  int32_t longest = 1;
+  for (size_t i = 0; i < num_tags; ++i) {
+    const int64_t window = args.dst_window_blocks[i];
+    if (window > 0 && counts[i] > window) {
+      windows_per_tag[i] =
+          static_cast<int32_t>((counts[i] + window - 1) / window);
+      longest = std::max(longest, windows_per_tag[i]);
+    }
+  }
+  // A windowed tag whose destination ids another tag also names would land
+  // those ids in a different sub-transfer than the other tag's copy, so the
+  // intra-plan H2D ordering of aliased arena pages (order_rank) could no
+  // longer be guaranteed: such a request is never split. Unwindowed tags may
+  // share ids among themselves (a GDN group's conv and ssm pools address the
+  // same state block); they ride together in the last sub-transfer exactly as
+  // in a single plan.
+  {
+    std::vector<std::set<int64_t>> ids_by_tag(num_tags);
+    size_t cursor = 0;
+    for (size_t i = 0; i < num_tags; ++i) {
+      ids_by_tag[i].insert(args.dst_device_block_ids.begin() + cursor,
+                           args.dst_device_block_ids.begin() + cursor +
+                               counts[i]);
+      cursor += static_cast<size_t>(counts[i]);
+    }
+    for (size_t i = 0; i < num_tags; ++i) {
+      if (windows_per_tag[i] == 1) continue;
+      for (size_t j = 0; j < num_tags; ++j) {
+        if (j == i) continue;
+        for (int64_t id : ids_by_tag[j]) {
+          if (ids_by_tag[i].count(id) == 0) continue;
+          LOG_FIRST_N(WARNING, 1)
+              << "Pool reshard req_id=" << args.req_id << ": windowed tag "
+              << args.transfer_pool_tags[i]
+              << " shares destination block ids with tag "
+              << args.transfer_pool_tags[j]
+              << "; bounded-staging windows are ignored for such requests";
+          return chain;
+        }
+      }
+    }
+  }
+  if (longest == 1) return chain;
+  chain.count = longest;
+  chain.sub_plans.resize(static_cast<size_t>(longest));
+  for (size_t i = 0; i < num_tags; ++i) {
+    const int32_t k_i = windows_per_tag[i];
+    const int32_t first = longest - k_i;
+    for (int32_t w = 0; w < k_i; ++w) {
+      SubTransferSlice slice;
+      slice.tag_index = i;
+      if (k_i == 1) {
+        slice.offset = 0;
+        slice.count = counts[i];
+        slice.total = 0;  // whole tag, not windowed
+      } else {
+        const int64_t window = args.dst_window_blocks[i];
+        slice.offset = static_cast<int64_t>(w) * window;
+        slice.count = std::min(window, counts[i] - slice.offset);
+        slice.total = counts[i];
+      }
+      chain.sub_plans[static_cast<size_t>(first + w)].push_back(slice);
+    }
+  }
+  return chain;
 }
 
 absl::Status ReshardCoordinator::StartPoolReshard(const PoolReshardArgs& args) {
@@ -376,7 +532,6 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
   }
 
   const int64_t controller_start_ns = MonotonicNs();
-  const int64_t plan_build_start_ns = controller_start_ns;
 
   auto src_metadata = directory_->LocalMetadata(args.src_units);
   if (!src_metadata.ok()) return src_metadata.status();
@@ -398,68 +553,234 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
     uuid = absl::Uniform<int64_t>(gen, 1, std::numeric_limits<int64_t>::max());
   }
 
-  PlanRequest plan_request;
-  plan_request.src_units = args.src_units;
-  plan_request.dst_units = args.dst_units;
-  plan_request.src_metadata = *std::move(src_metadata);
-  plan_request.dst_metadata = std::move(dst_metadata);
-  plan_request.req_id = args.req_id;
-  plan_request.uuid = uuid;
-  plan_request.dst_device_block_ids = args.dst_device_block_ids;
-  plan_request.num_tokens = args.num_tokens.value_or(0);
-  plan_request.transfer_pool_tags = args.transfer_pool_tags;
-  plan_request.parallelism = args.parallelism;
-  plan_request.dst_block_counts = args.dst_block_counts;
-  plan_request.dst_skip_bytes = args.dst_skip_bytes;
+  auto chain = PlanSubTransfers(args);
+  if (!chain.ok()) return chain.status();
 
   // _build_pool_reshard_plan: claim under a unique owner; abandon on any
-  // planning failure.
+  // planning failure. Every sub-transfer of the request plans under this
+  // one owner, so the registry sees one claim for the whole chain.
   static std::atomic<uintptr_t> claim_counter{1};
   const void* claim_owner =
       reinterpret_cast<const void*>(claim_counter.fetch_add(1));
-  auto plan_or = BuildPoolReshardPlan(plan_request, registry_, claim_owner);
+
+  auto ctx = std::make_shared<ChainContext>();
+  ctx->args = args;
+  ctx->src_metadata = *std::move(src_metadata);
+  ctx->dst_metadata = std::move(dst_metadata);
+  ctx->uuid = uuid;
+  ctx->claim_owner = claim_owner;
+  ctx->chain = *std::move(chain);
+  ctx->controller_start_ns = controller_start_ns;
+  if (ctx->chain.count > 1) {
+    // Chained requests have validated per-tag counts (PlanSubTransfers).
+    std::vector<int64_t> counts = args.dst_block_counts;
+    if (counts.empty()) {
+      counts = {static_cast<int64_t>(args.dst_device_block_ids.size())};
+    }
+    int64_t cursor = 0;
+    for (int64_t count : counts) {
+      ctx->tag_starts.push_back(cursor);
+      ctx->tag_counts.push_back(count);
+      cursor += count;
+    }
+  }
+
+  absl::Status first = RunSubPlan(ctx, 0);
+  if (!first.ok()) return first;
+  if (ctx->chain.count > 1) {
+    StartChain(ctx);
+  } else {
+    ctx->finished.store(true);
+  }
+  return absl::OkStatus();
+}
+
+void ReshardCoordinator::ReapFinishedChainsLocked() {
+  for (auto it = chains_.begin(); it != chains_.end();) {
+    if (it->first->finished.load()) {
+      if (it->second.joinable()) it->second.join();
+      it = chains_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void ReshardCoordinator::StartChain(std::shared_ptr<ChainContext> ctx) {
+  absl::MutexLock lock(chains_mu_);
+  ReapFinishedChainsLocked();
+  std::shared_ptr<ChainContext> shared = ctx;
+  std::thread thread([this, shared]() {
+    for (int32_t index = 1; index < shared->chain.count; ++index) {
+      if (stopping_.load()) {
+        LOG(WARNING) << "Pool reshard sub-transfer chain for req_id="
+                     << shared->args.req_id << " abandoned at sub-plan "
+                     << index << " of " << shared->chain.count
+                     << ": coordinator shutting down";
+        break;
+      }
+      absl::Status status = RunSubPlan(shared, index);
+      if (!status.ok()) {
+        LOG(ERROR) << "Pool reshard sub-transfer " << index << " of "
+                   << shared->chain.count << " failed for req_id="
+                   << shared->args.req_id << " uuid=" << shared->uuid << ": "
+                   << status
+                   << " (the request's receivers and senders settle through "
+                      "their sub-plan chain deadline)";
+        absl::MutexLock status_lock(status_mu_);
+        transfer_status_[shared->args.req_id] = Status::kFailed;
+        break;
+      }
+    }
+    shared->finished.store(true);
+  });
+  chains_.emplace_back(std::move(ctx), std::move(thread));
+}
+
+void ReshardCoordinator::WaitForSubTransferChains() {
+  std::vector<std::pair<std::shared_ptr<ChainContext>, std::thread>> chains;
+  {
+    absl::MutexLock lock(chains_mu_);
+    chains.swap(chains_);
+  }
+  for (auto& [ctx, thread] : chains) {
+    if (thread.joinable()) thread.join();
+  }
+}
+
+namespace {
+
+// A receiver arm refused because the destination's bounded staging arena is
+// still held by earlier sub-transfers: the lease wait timed out. Chained
+// sub-transfers retry such arms (the arena frees as the chain drains).
+bool ArmRefusedForBusyStaging(const absl::Status& status) {
+  return absl::StrContains(status.message(), "pool staging:") &&
+         absl::StrContains(status.message(), "waited");
+}
+
+// Arm attempts per chained sub-transfer before the chain gives up: each
+// refused attempt already waited the receiver's lease timeout.
+constexpr int kChainArmAttempts = 12;
+
+}  // namespace
+
+absl::Status ReshardCoordinator::RunSubPlan(
+    const std::shared_ptr<ChainContext>& ctx, int32_t index) {
+  const PoolReshardArgs& args = ctx->args;
+  const int64_t uuid = ctx->uuid;
+  const bool chained = ctx->chain.count > 1;
+  const int64_t sub_plan_start_ns = MonotonicNs();
+  const int64_t controller_start_ns =
+      index == 0 ? ctx->controller_start_ns : sub_plan_start_ns;
+  const int64_t plan_build_start_ns = sub_plan_start_ns;
+
+  PlanRequest plan_request;
+  plan_request.src_units = args.src_units;
+  plan_request.dst_units = args.dst_units;
+  plan_request.src_metadata = ctx->src_metadata;
+  plan_request.dst_metadata = ctx->dst_metadata;
+  plan_request.req_id = args.req_id;
+  plan_request.uuid = uuid;
+  plan_request.num_tokens = args.num_tokens.value_or(0);
+  plan_request.parallelism = args.parallelism;
+  if (!chained) {
+    plan_request.dst_device_block_ids = args.dst_device_block_ids;
+    plan_request.transfer_pool_tags = args.transfer_pool_tags;
+    plan_request.dst_block_counts = args.dst_block_counts;
+    plan_request.dst_skip_bytes = args.dst_skip_bytes;
+  } else {
+    plan_request.plan_uuid = SubPlanUuid(uuid, index);
+    for (const SubTransferSlice& slice :
+         ctx->chain.sub_plans[static_cast<size_t>(index)]) {
+      const int64_t start = ctx->tag_starts[slice.tag_index] + slice.offset;
+      plan_request.dst_device_block_ids.insert(
+          plan_request.dst_device_block_ids.end(),
+          args.dst_device_block_ids.begin() + start,
+          args.dst_device_block_ids.begin() + start + slice.count);
+      plan_request.transfer_pool_tags.push_back(
+          args.transfer_pool_tags[slice.tag_index]);
+      plan_request.dst_block_counts.push_back(slice.count);
+      plan_request.dst_skip_bytes.push_back(
+          slice.tag_index < args.dst_skip_bytes.size()
+              ? args.dst_skip_bytes[slice.tag_index]
+              : 0);
+      plan_request.dst_window_offset_blocks.push_back(slice.offset);
+      plan_request.dst_window_total_blocks.push_back(slice.total);
+    }
+  }
+
+  auto plan_or = BuildPoolReshardPlan(plan_request, registry_, ctx->claim_owner);
   if (!plan_or.ok()) {
-    registry_->AbandonClaim(args.req_id, uuid, claim_owner);
+    if (index == 0) registry_->AbandonClaim(args.req_id, uuid, ctx->claim_owner);
     return plan_or.status();
   }
   PoolReshardPlan& plan = *plan_or;
   plan.skip_d2h = args.skip_d2h;
+  if (chained) {
+    plan.sub_plan_index = index;
+    plan.sub_plan_count = ctx->chain.count;
+  }
   const int64_t plan_build_end_ns = MonotonicNs();
 
   // Receivers must be armed before any sender can put bytes on the wire.
   // Multi-destination plans arm every receiver concurrently and join
-  // before dispatching senders.
+  // before dispatching senders. A chained sub-transfer's arm may find the
+  // receiver's staging arena still held by its predecessors; such a
+  // refusal is retried per destination until the arena drains.
   const int64_t receiver_arm_start_ns = MonotonicNs();
   {
     std::vector<absl::Status> arm_status(plan.dst_units.size());
+    // One byte per destination (std::vector<bool> packs bits, which the
+    // concurrent armer threads could not write independently).
+    std::vector<char> armed(plan.dst_units.size(), 0);
     std::vector<tpu_sync::rpc::ControlResponse> arm_replies(
         plan.dst_units.size());
-    std::vector<std::thread> armers;
-    armers.reserve(plan.dst_units.size());
-    for (size_t i = 0; i < plan.dst_units.size(); ++i) {
-      const RaidenId& unit = plan.dst_units[i];
-      armers.emplace_back([this, &plan, &arm_status, &arm_replies, i, unit]() {
-        auto addr_it = plan.worker_rpc_addresses.find(unit);
-        if (addr_it == plan.worker_rpc_addresses.end()) {
-          arm_status[i] = absl::InternalError(absl::StrCat(
-              "No control endpoint recorded for ", PythonRepr(unit)));
-          return;
-        }
-        absl::StatusOr<tpu_sync::rpc::ControlResponse> reply = SendWorkerRpc(
-            addr_it->second, BuildStartTransferControlRequest(plan, unit));
-        if (!reply.ok()) {
-          arm_status[i] = reply.status();
-          return;
-        }
-        arm_replies[i] = *std::move(reply);
-      });
-    }
-    for (std::thread& t : armers) t.join();
-    for (const absl::Status& status : arm_status) {
-      if (!status.ok()) {
-        registry_->AbandonClaim(args.req_id, uuid, claim_owner);
-        return status;
+    const int attempts = index == 0 ? 1 : kChainArmAttempts;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+      std::vector<std::thread> armers;
+      armers.reserve(plan.dst_units.size());
+      for (size_t i = 0; i < plan.dst_units.size(); ++i) {
+        if (armed[i]) continue;
+        const RaidenId& unit = plan.dst_units[i];
+        armers.emplace_back(
+            [this, &plan, &arm_status, &arm_replies, &armed, i, unit]() {
+              auto addr_it = plan.worker_rpc_addresses.find(unit);
+              if (addr_it == plan.worker_rpc_addresses.end()) {
+                arm_status[i] = absl::InternalError(absl::StrCat(
+                    "No control endpoint recorded for ", PythonRepr(unit)));
+                return;
+              }
+              absl::StatusOr<tpu_sync::rpc::ControlResponse> reply =
+                  SendWorkerRpc(addr_it->second,
+                                BuildStartTransferControlRequest(plan, unit));
+              if (!reply.ok()) {
+                arm_status[i] = reply.status();
+                return;
+              }
+              arm_status[i] = absl::OkStatus();
+              arm_replies[i] = *std::move(reply);
+              armed[i] = 1;
+            });
       }
+      for (std::thread& t : armers) t.join();
+      bool retry = false;
+      for (size_t i = 0; i < plan.dst_units.size(); ++i) {
+        if (armed[i]) continue;
+        if (attempt + 1 < attempts && ArmRefusedForBusyStaging(arm_status[i]) &&
+            !stopping_.load()) {
+          retry = true;
+          continue;
+        }
+        if (index == 0) {
+          registry_->AbandonClaim(args.req_id, uuid, ctx->claim_owner);
+        }
+        return arm_status[i];
+      }
+      if (!retry) break;
+      LOG(INFO) << "Pool reshard sub-transfer " << index << " of "
+                << ctx->chain.count << " for req_id=" << args.req_id
+                << ": receiver staging arena busy, re-arming (attempt "
+                << attempt + 2 << " of " << attempts << ")";
     }
     // Each receiver reports its pool addresses in its arm reply; when
     // forwarding is enabled, senders look them up by the receiver's data
@@ -481,7 +802,9 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
   std::vector<absl::Status> sender_status(plan.src_units.size());
   if (delivery_.mode == WorkerDelivery::Mode::kController) {
     if (delivery_.controller == nullptr) {
-      registry_->AbandonClaim(args.req_id, uuid, claim_owner);
+      if (index == 0) {
+        registry_->AbandonClaim(args.req_id, uuid, ctx->claim_owner);
+      }
       return absl::InternalError(
           "WorkerDelivery::Mode::kController requires a non-null controller");
     }
@@ -544,9 +867,10 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
   }
 
   // Milestone event (D5): schema-identical JSON line on stderr,
-  // sort_keys=True ordering.
-  std::vector<std::string> sorted_tags(args.transfer_pool_tags.begin(),
-                                       args.transfer_pool_tags.end());
+  // sort_keys=True ordering. Chained sub-transfers add their chain
+  // position; a single-plan request's event is unchanged.
+  std::vector<std::string> sorted_tags(plan_request.transfer_pool_tags.begin(),
+                                       plan_request.transfer_pool_tags.end());
   std::sort(sorted_tags.begin(), sorted_tags.end());
   sorted_tags.erase(std::unique(sorted_tags.begin(), sorted_tags.end()),
                     sorted_tags.end());
@@ -563,6 +887,11 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
                       "\": ", count);
       first = false;
     }
+  }
+  std::string chain_json;
+  if (chained) {
+    chain_json = absl::StrCat(", \"sub_plan_count\": ", ctx->chain.count,
+                              ", \"sub_plan_index\": ", index);
   }
   const std::string event = absl::StrCat(
       "{\"active_source_ranks\": ", plan.src_units.size(),
@@ -582,7 +911,7 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(
       ", \"sender_dispatch_monotonic_ns\": ", sender_dispatch_ns,
       ", \"sender_dispatch_ms\": ",
       JsonFloat((sender_dispatch_end_ns - sender_dispatch_ns) / 1e6),
-      ", \"skipped_pool_counts\": {", skipped_json, "}",
+      ", \"skipped_pool_counts\": {", skipped_json, "}", chain_json,
       ", \"transfer_pool_tags\": [", tags_json, "]",
       ", \"transferred_pools\": ", plan.transfer_pool_indices.size(),
       ", \"uuid\": ", plan.uuid, "}");

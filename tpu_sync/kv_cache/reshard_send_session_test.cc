@@ -27,6 +27,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
@@ -77,12 +78,15 @@ using ::testing::HasSubstr;
 using ::tpu_sync::rpc::MEMORY_TYPE_HBM;
 using ::tpu_sync::rpc::StartTransferRequest;
 
-kv_cache::KVCacheManagerBase MakeTestBase() {
-  return kv_cache::KVCacheManagerBase(
-      /*num_layers=*/1, /*num_shards=*/1,
-      /*slice_byte_size=*/128,
-      /*local_port=*/std::nullopt,
-      /*host_blocks_to_allocate=*/std::make_optional(4));
+std::unique_ptr<kv_cache::KVCacheManagerBase> MakeTestBase() {
+  absl::StatusOr<std::unique_ptr<kv_cache::KVCacheManagerBase>> base =
+      kv_cache::KVCacheManagerBase::Create(
+          /*num_layers=*/1, /*num_shards=*/1,
+          /*slice_byte_size=*/128,
+          /*local_port=*/std::nullopt,
+          /*host_blocks_to_allocate=*/std::make_optional(4));
+  CHECK_OK(base);
+  return *std::move(base);
 }
 
 kv_cache::PoolSpec DensePool(std::string tag, int64_t block_stride = 128,
@@ -149,61 +153,61 @@ void ExpectInvalid(const absl::Status& status, const std::string& fragment) {
 }
 
 TEST(ReshardSendSessionTest, AcceptsCanonicalPlanOnExplicitPools) {
-  kv_cache::KVCacheManagerBase base = MakeTestBase();
-  ASSERT_TRUE(base.RegisterPools({DensePool("fa")}).ok());
+  std::unique_ptr<kv_cache::KVCacheManagerBase> base = MakeTestBase();
+  ASSERT_TRUE(base->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1001);
 
-  EXPECT_TRUE(ReshardSendSessionTestPeer::ValidatePlan(base, plan,
+  EXPECT_TRUE(ReshardSendSessionTestPeer::ValidatePlan(*base, plan,
                                                        std::vector<int64_t>{0})
                   .ok());
 }
 
 TEST(ReshardSendSessionTest, AcceptsImplicitPools) {
-  kv_cache::KVCacheManagerBase base = MakeTestBase();
+  std::unique_ptr<kv_cache::KVCacheManagerBase> base = MakeTestBase();
   StartTransferRequest plan = ValidPlan(/*uuid=*/1002, /*dtype_tags=*/{""});
 
-  EXPECT_TRUE(ReshardSendSessionTestPeer::ValidatePlan(base, plan,
+  EXPECT_TRUE(ReshardSendSessionTestPeer::ValidatePlan(*base, plan,
                                                        std::vector<int64_t>{0})
                   .ok());
 }
 
 TEST(ReshardSendSessionTest, RejectsMissingIdentityAndPoolFields) {
-  kv_cache::KVCacheManagerBase base = MakeTestBase();
-  ASSERT_TRUE(base.RegisterPools({DensePool("fa")}).ok());
+  std::unique_ptr<kv_cache::KVCacheManagerBase> base = MakeTestBase();
+  ASSERT_TRUE(base->RegisterPools({DensePool("fa")}).ok());
 
   StartTransferRequest plan = ValidPlan(/*uuid=*/1005);
   plan.clear_req_id();
   ExpectInvalid(ReshardSendSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+                    *base, plan, std::vector<int64_t>{0}),
                 "req_id");
 
   plan = ValidPlan(/*uuid=*/0);
   ExpectInvalid(ReshardSendSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+                    *base, plan, std::vector<int64_t>{0}),
                 "uuid must be positive");
 
   plan = ValidPlan(/*uuid=*/1006);
   plan.clear_transfer_pool_indices();
   ExpectInvalid(ReshardSendSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+                    *base, plan, std::vector<int64_t>{0}),
                 "transfer_pool_indices");
 
   plan = ValidPlan(/*uuid=*/1007);
   plan.clear_pool_groups();
   ExpectInvalid(ReshardSendSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+                    *base, plan, std::vector<int64_t>{0}),
                 "must declare pool_groups");
 
   plan = ValidPlan(/*uuid=*/1008);
   plan.set_use_block_chunks(false);
   ExpectInvalid(ReshardSendSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+                    *base, plan, std::vector<int64_t>{0}),
                 "use_block_chunks");
 }
 
 TEST(ReshardSendSessionTest, RejectsOverflowingSenderSpan) {
-  kv_cache::KVCacheManagerBase base = MakeTestBase();
-  ASSERT_TRUE(base.RegisterPools({DensePool("fa")}).ok());
+  std::unique_ptr<kv_cache::KVCacheManagerBase> base = MakeTestBase();
+  ASSERT_TRUE(base->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1016);
   auto* entry = plan.mutable_shard_push_schedules()->at(0).mutable_entries(0);
   entry->set_src_offset_bytes(96);
@@ -213,13 +217,13 @@ TEST(ReshardSendSessionTest, RejectsOverflowingSenderSpan) {
   entry->set_count(2);
 
   ExpectInvalid(ReshardSendSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+                    *base, plan, std::vector<int64_t>{0}),
                 "source span exceeds declared pool 0");
 }
 
 TEST(ReshardSendSessionTest,
      RejectsSenderSpanBetweenPackedTokenRegionsInAliasedStorage) {
-  kv_cache::KVCacheManagerBase base = MakeTestBase();
+  std::unique_ptr<kv_cache::KVCacheManagerBase> base = MakeTestBase();
   kv_cache::PoolSpec pool = DensePool("fa");
   pool.regions = {
       kv_cache::RegionSpec{
@@ -239,9 +243,9 @@ TEST(ReshardSendSessionTest,
           .units_per_stride = 2,
       },
   };
-  ASSERT_TRUE(base.RegisterPools({pool}).ok());
+  ASSERT_TRUE(base->RegisterPools({pool}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1019);
-  EXPECT_TRUE(ReshardSendSessionTestPeer::ValidatePlan(base, plan,
+  EXPECT_TRUE(ReshardSendSessionTestPeer::ValidatePlan(*base, plan,
                                                        std::vector<int64_t>{0})
                   .ok());
   auto* entry = plan.mutable_shard_push_schedules()->at(0).mutable_entries(0);
@@ -249,13 +253,13 @@ TEST(ReshardSendSessionTest,
   entry->set_size_bytes(16);
 
   ExpectInvalid(ReshardSendSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+                    *base, plan, std::vector<int64_t>{0}),
                 "source span exceeds declared pool 0 live regions");
 }
 
 TEST(ReshardSendSessionTest, IgnoresReceiverCoverageGap) {
-  kv_cache::KVCacheManagerBase base = MakeTestBase();
-  ASSERT_TRUE(base.RegisterPools({DensePool("fa")}).ok());
+  std::unique_ptr<kv_cache::KVCacheManagerBase> base = MakeTestBase();
+  ASSERT_TRUE(base->RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1101);
   plan.mutable_pool_groups(0)->clear_dst_expected_extent_bytes();
   plan.mutable_pool_groups(0)->add_dst_expected_extent_bytes(48);
@@ -271,7 +275,7 @@ TEST(ReshardSendSessionTest, IgnoresReceiverCoverageGap) {
   entry->set_dst_stride_bytes(0);
   entry->set_count(1);
 
-  EXPECT_TRUE(ReshardSendSessionTestPeer::ValidatePlan(base, plan,
+  EXPECT_TRUE(ReshardSendSessionTestPeer::ValidatePlan(*base, plan,
                                                        std::vector<int64_t>{0})
                   .ok());
 }
@@ -312,37 +316,41 @@ absl::Status SeedIdleDataConnection(transport::BlockTransport& sender,
 }
 
 // A CPU-only manager; its base is the sender of the session under test.
-KVCacheManagerWithTransfer MakeTestManager() {
-  return KVCacheManagerWithTransfer(
-      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
-      /*local_port=*/std::nullopt,
-      /*host_blocks_to_allocate=*/std::make_optional(4));
+std::unique_ptr<KVCacheManagerWithTransfer> MakeTestManager() {
+  absl::StatusOr<std::unique_ptr<KVCacheManagerWithTransfer>> mgr =
+      KVCacheManagerWithTransfer::Create(
+          /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*local_port=*/std::nullopt,
+          /*host_blocks_to_allocate=*/std::make_optional(4));
+  CHECK_OK(mgr);
+  return *std::move(mgr);
 }
 
 TEST(ReshardSendSessionTest,
      PerTransferPolicyClosesIdlePeerConnectionsBeforeSettling) {
   ScopedDataConnReuseEnv env("per_transfer");
-  KVCacheManagerWithTransfer manager = MakeTestManager();
-  kv_cache::KVCacheManagerBase receiver = MakeTestBase();
+  std::unique_ptr<KVCacheManagerWithTransfer> manager = MakeTestManager();
+  std::unique_ptr<kv_cache::KVCacheManagerBase> receiver = MakeTestBase();
   const std::string peer =
-      absl::StrCat("127.0.0.1:", receiver.transport_server()->local_port());
-  transport::BlockTransport& transport = *manager.base()->transport_server();
+      absl::StrCat("127.0.0.1:", receiver->transport_server()->local_port());
+  transport::BlockTransport& transport = *manager->base()->transport_server();
   ABSL_ASSERT_OK(SeedIdleDataConnection(transport, peer));
   ASSERT_EQ(transport.IdleConnectionCount(peer), 1u);
-  manager.base()->AttachPlaceholderDeviceHoldForTest();
-  std::unique_ptr<StagingBlockAllocator> allocator =
-      CreateStagingBlockAllocator(manager.base(), /*num_slots=*/0,
+  manager->base()->AttachPlaceholderDeviceHoldForTest();
+  absl::StatusOr<std::unique_ptr<StagingBlockAllocator>> allocator =
+      CreateStagingBlockAllocator(manager->base(), /*num_slots=*/0,
                                   /*max_blocks=*/0);
+  ABSL_ASSERT_OK(allocator);
   StartTransferRequest plan = ValidPlan(/*uuid=*/1201, /*dtype_tags=*/{""});
   (*plan.mutable_shard_push_schedules())[0].mutable_entries(0)->set_dst_peer(
       peer);
   absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
       ReshardSendSession::Create(
-          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          manager->base(), allocator->get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
   ABSL_ASSERT_OK(session);
-  ReshardSendSessionTestPeer::BeginPush(**session, manager);
+  ReshardSendSessionTestPeer::BeginPush(**session, *manager);
 
   // The plan's only push completes on another thread, as its AsyncPush
   // callback would. That push is the send's last op, so it closes the idle
@@ -351,7 +359,7 @@ TEST(ReshardSendSessionTest,
   // AwaitForDone(): a blocked waiter wakes too late to catch a release that
   // trails the settle.
   std::thread last_push([&session, &manager] {
-    ReshardSendSessionTestPeer::CompletePush(**session, manager,
+    ReshardSendSessionTestPeer::CompletePush(**session, *manager,
                                              absl::OkStatus());
   });
   while (!(*session)->Done()) {
@@ -364,70 +372,72 @@ TEST(ReshardSendSessionTest,
 TEST(ReshardSendSessionTest,
      PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush) {
   ScopedDataConnReuseEnv env("per_transfer");
-  KVCacheManagerWithTransfer manager = MakeTestManager();
-  kv_cache::KVCacheManagerBase receiver = MakeTestBase();
+  std::unique_ptr<KVCacheManagerWithTransfer> manager = MakeTestManager();
+  std::unique_ptr<kv_cache::KVCacheManagerBase> receiver = MakeTestBase();
   const std::string peer =
-      absl::StrCat("127.0.0.1:", receiver.transport_server()->local_port());
-  transport::BlockTransport& transport = *manager.base()->transport_server();
+      absl::StrCat("127.0.0.1:", receiver->transport_server()->local_port());
+  transport::BlockTransport& transport = *manager->base()->transport_server();
   ABSL_ASSERT_OK(SeedIdleDataConnection(transport, peer));
   ASSERT_EQ(transport.IdleConnectionCount(peer), 1u);
-  manager.base()->AttachPlaceholderDeviceHoldForTest();
-  std::unique_ptr<StagingBlockAllocator> allocator =
-      CreateStagingBlockAllocator(manager.base(), /*num_slots=*/0,
+  manager->base()->AttachPlaceholderDeviceHoldForTest();
+  absl::StatusOr<std::unique_ptr<StagingBlockAllocator>> allocator =
+      CreateStagingBlockAllocator(manager->base(), /*num_slots=*/0,
                                   /*max_blocks=*/0);
+  ABSL_ASSERT_OK(allocator);
   StartTransferRequest plan = ValidPlan(/*uuid=*/1204, /*dtype_tags=*/{""});
   (*plan.mutable_shard_push_schedules())[0].mutable_entries(0)->set_dst_peer(
       peer);
   absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
       ReshardSendSession::Create(
-          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          manager->base(), allocator->get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
   ABSL_ASSERT_OK(session);
-  ReshardSendSessionTestPeer::BeginPush(**session, manager);
+  ReshardSendSessionTestPeer::BeginPush(**session, *manager);
 
   // Cancelling the send while its push runs starts finalizing it, but the
   // push in flight keeps it from settling, and nothing is released yet.
   (*session)->Finish(absl::CancelledError("transfer cancelled"));
   EXPECT_FALSE((*session)->Done());
   EXPECT_EQ(transport.IdleConnectionCount(peer), 1u);
-  EXPECT_TRUE(manager.base()->HasActivePlan(plan.uuid()));
+  EXPECT_TRUE(manager->base()->HasActivePlan(plan.uuid()));
 
   // The push's completion is the send's last op: it drops the plan and
   // closes the idle connections to its peer, then the send settles.
-  ReshardSendSessionTestPeer::CompletePush(**session, manager,
+  ReshardSendSessionTestPeer::CompletePush(**session, *manager,
                                            absl::OkStatus());
 
   EXPECT_TRUE((*session)->Done());
   EXPECT_EQ(transport.IdleConnectionCount(peer), 0u);
-  EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
+  EXPECT_FALSE(manager->base()->HasActivePlan(plan.uuid()));
 }
 
 TEST(ReshardSendSessionTest, PooledPolicyKeepsIdlePeerConnections) {
   ScopedDataConnReuseEnv env(/*value=*/nullptr);
-  KVCacheManagerWithTransfer manager = MakeTestManager();
-  kv_cache::KVCacheManagerBase receiver = MakeTestBase();
+  std::unique_ptr<KVCacheManagerWithTransfer> manager = MakeTestManager();
+  std::unique_ptr<kv_cache::KVCacheManagerBase> receiver = MakeTestBase();
   const std::string peer =
-      absl::StrCat("127.0.0.1:", receiver.transport_server()->local_port());
-  transport::BlockTransport& transport = *manager.base()->transport_server();
+      absl::StrCat("127.0.0.1:", receiver->transport_server()->local_port());
+  transport::BlockTransport& transport = *manager->base()->transport_server();
   ABSL_ASSERT_OK(SeedIdleDataConnection(transport, peer));
   ASSERT_EQ(transport.IdleConnectionCount(peer), 1u);
-  manager.base()->AttachPlaceholderDeviceHoldForTest();
-  std::unique_ptr<StagingBlockAllocator> allocator =
-      CreateStagingBlockAllocator(manager.base(), /*num_slots=*/0,
+  manager->base()->AttachPlaceholderDeviceHoldForTest();
+  absl::StatusOr<std::unique_ptr<StagingBlockAllocator>> allocator =
+      CreateStagingBlockAllocator(manager->base(), /*num_slots=*/0,
                                   /*max_blocks=*/0);
+  ABSL_ASSERT_OK(allocator);
   StartTransferRequest plan = ValidPlan(/*uuid=*/1202, /*dtype_tags=*/{""});
   (*plan.mutable_shard_push_schedules())[0].mutable_entries(0)->set_dst_peer(
       peer);
   absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
       ReshardSendSession::Create(
-          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          manager->base(), allocator->get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
   ABSL_ASSERT_OK(session);
 
-  ReshardSendSessionTestPeer::BeginPush(**session, manager);
-  ReshardSendSessionTestPeer::CompletePush(**session, manager,
+  ReshardSendSessionTestPeer::BeginPush(**session, *manager);
+  ReshardSendSessionTestPeer::CompletePush(**session, *manager,
                                            absl::OkStatus());
 
   EXPECT_TRUE((*session)->Done());
@@ -436,20 +446,23 @@ TEST(ReshardSendSessionTest, PooledPolicyKeepsIdlePeerConnections) {
 
 TEST(ReshardSendSessionTest, CreateRejectsUnknownDataConnReuseValue) {
   ScopedDataConnReuseEnv env("per-transfer");
-  kv_cache::KVCacheManagerBase base = MakeTestBase();
-  base.AttachPlaceholderDeviceHoldForTest();
-  std::unique_ptr<StagingBlockAllocator> allocator =
-      CreateStagingBlockAllocator(&base, /*num_slots=*/0, /*max_blocks=*/0);
+  std::unique_ptr<kv_cache::KVCacheManagerBase> base = MakeTestBase();
+  base->AttachPlaceholderDeviceHoldForTest();
+  absl::StatusOr<std::unique_ptr<StagingBlockAllocator>> allocator =
+      CreateStagingBlockAllocator(base.get(), /*num_slots=*/0,
+                                  /*max_blocks=*/0);
+  ABSL_ASSERT_OK(allocator);
   StartTransferRequest plan = ValidPlan(/*uuid=*/1203, /*dtype_tags=*/{""});
 
   EXPECT_THAT(
       ReshardSendSession::Create(
-          &base, allocator.get(), std::vector<int64_t>{0}, /*parallelism=*/1,
+          base.get(), allocator->get(), std::vector<int64_t>{0},
+          /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan),
       StatusIs(absl::StatusCode::kInvalidArgument,
                AllOf(HasSubstr("TPU_RAIDEN_DATA_CONN_REUSE"),
                      HasSubstr("per-transfer"))));
-  EXPECT_FALSE(base.HasActivePlan(plan.uuid()));
+  EXPECT_FALSE(base->HasActivePlan(plan.uuid()));
 }
 
 }  // namespace

@@ -115,9 +115,9 @@ struct CopyPlan {
 // Builds a `StagingBlockAllocator` over |base|'s host block manager. When
 // |num_slots| and |max_blocks| are both positive, also registers the slot
 // layout with |base| via `ConfigureHostStagingSlots()` so `HostSpan()` can
-// address the slots. Throws `std::runtime_error` if the slot pool cannot be
-// reserved (mirrors the constructor contract of `KVCacheManagerWithTransfer`).
-std::unique_ptr<StagingBlockAllocator> CreateStagingBlockAllocator(
+// address the slots. Returns an error if the slot pool cannot be reserved.
+absl::StatusOr<std::unique_ptr<StagingBlockAllocator>>
+CreateStagingBlockAllocator(
     kv_cache::KVCacheManagerBase* base, int64_t num_slots, int64_t max_blocks,
     std::optional<bool> dynamic_host_staging = std::nullopt);
 
@@ -125,9 +125,8 @@ class KVCacheManagerWithTransfer {
  public:
   friend class TransferReceiveSession;
   friend class ReshardReceiveSession;
-  friend class ReshardSendSession;
 
-  KVCacheManagerWithTransfer(
+  static absl::StatusOr<std::unique_ptr<KVCacheManagerWithTransfer>> Create(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
       std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
       bool unsafe_skip_buffer_lock, int parallelism,
@@ -136,21 +135,11 @@ class KVCacheManagerWithTransfer {
       int64_t num_slots = 0, double timeout_s = 120.0,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
-  KVCacheManagerWithTransfer(
-      const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
-      size_t slice_byte_size, const std::vector<int64_t>& dimensions,
-      size_t physical_size, std::optional<int> local_port,
-      std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
-      int parallelism, HostBufferAllocator host_allocator, int64_t node_id = 0,
-      int64_t local_control_port = -1, int64_t max_blocks = 0,
-      int64_t num_slots = 0, double timeout_s = 120.0,
-      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
-
-  // Metadata-based constructor for a heterogeneous registration:
-  // slice_byte_sizes carries one stride per block array, in registration
-  // order.  Used by the host store node, which mirrors a serving host's
+  // Metadata-based factory for a heterogeneous registration:
+  // |slice_byte_sizes| carries one stride per block array, in registration
+  // order. Used by the host store node, which mirrors a serving host's
   // geometry CPU-side and must match it array for array.
-  KVCacheManagerWithTransfer(
+  static absl::StatusOr<std::unique_ptr<KVCacheManagerWithTransfer>> Create(
       size_t num_layers, size_t num_shards,
       std::vector<size_t> slice_byte_sizes, std::optional<int> local_port,
       std::optional<int> host_blocks_to_allocate, int parallelism = 1,
@@ -158,12 +147,18 @@ class KVCacheManagerWithTransfer {
       int64_t max_blocks = 0, int64_t num_slots = 0, double timeout_s = 120.0,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
-  // Metadata-based constructor for FFI / CPU-only testing
-  KVCacheManagerWithTransfer(
+  // Metadata-based factory for FFI / CPU-only testing.
+  static absl::StatusOr<std::unique_ptr<KVCacheManagerWithTransfer>> Create(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
       std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
       int parallelism = 1, int64_t node_id = 0, int64_t local_control_port = -1,
       int64_t max_blocks = 0, int64_t num_slots = 0, double timeout_s = 120.0,
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+
+  static absl::StatusOr<std::unique_ptr<KVCacheManagerWithTransfer>> Create(
+      std::unique_ptr<kv_cache::KVCacheManagerBase> base, int64_t node_id = 0,
+      int64_t local_control_port = -1, int64_t max_blocks = 0,
+      int64_t num_slots = 0, double timeout_s = 120.0,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
   void SetMetricsCollector(std::shared_ptr<MetricsCollector> collector) {
@@ -262,18 +257,22 @@ class KVCacheManagerWithTransfer {
   double control_timeout_s() const { return control_timeout_s_; }
 
  protected:
+  // Two-phase construction for Create() and subclasses: the constructor adopts
+  // |base| and initializes hooks and control-plane handlers; follow with
+  // InitTransfer() to allocate staging slots and start the control server.
   KVCacheManagerWithTransfer(
       std::unique_ptr<kv_cache::KVCacheManagerBase> base, int64_t node_id = 0,
-      int64_t local_control_port = -1, int64_t max_blocks = 0,
-      int64_t num_slots = 0, double timeout_s = 120.0,
+      int64_t local_control_port = -1, double timeout_s = 120.0,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+
+  absl::Status InitTransfer(int64_t max_blocks, int64_t num_slots);
 
   std::unique_ptr<kv_cache::KVCacheManagerBase> base_;
 
   std::vector<RaidenTransferEndpoint> BuildEndpoints(int64_t port) const;
 
   void AckSend(uint64_t uuid);
-  void ConfigureDataPortFromKvTransfer();
+  absl::Status ConfigureDataPortFromKvTransfer();
 
   // Serializes plan registration and unregistration, so a plan is never
   // published without its staging owner or torn down against a half-built
@@ -291,20 +290,20 @@ class KVCacheManagerWithTransfer {
       uint64_t uuid, const std::shared_ptr<TransferReceiveSession>& session)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
-  void StartControlServer();
+  absl::Status StartControlServer();
   void StopControlServer();
   virtual void RegisterBlockReadinessCallback(
       size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
       transport::BlockTransportDelegate::HostBlockReadyCallback cb);
 
   absl::flat_hash_map<uint64_t, std::shared_ptr<TransferReceiveSession>>
-      active_recv_sessions_;
+      active_recv_sessions_ ABSL_GUARDED_BY(mu_);
 
   absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardReceiveSession>>
-      active_pool_reshard_recvs_;
+      active_pool_reshard_recvs_ ABSL_GUARDED_BY(mu_);
 
   absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardSendSession>>
-      active_pool_reshard_sends_;
+      active_pool_reshard_sends_ ABSL_GUARDED_BY(mu_);
 
   std::chrono::steady_clock::time_point DeadlineFromNow() const;
 
@@ -328,11 +327,11 @@ class KVCacheManagerWithTransfer {
   // on the main thread, but accessed asynchronously in control worker threads
   // handling pull connections.
   absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSendSession>>
-      send_sessions_;
-  absl::flat_hash_set<uint64_t> pending_acks_;
-  absl::flat_hash_set<std::string> done_sending_;
-  absl::flat_hash_set<std::string> done_recving_;
-  absl::flat_hash_set<std::string> failed_recving_;
+      send_sessions_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_set<uint64_t> pending_acks_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_set<std::string> done_sending_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_set<std::string> done_recving_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_set<std::string> failed_recving_ ABSL_GUARDED_BY(mu_);
   // CompleteReadResult::details not yet reported.
   absl::flat_hash_map<std::string, TransferDetails> transfer_details_
       ABSL_GUARDED_BY(mu_);
@@ -341,6 +340,7 @@ class KVCacheManagerWithTransfer {
   std::atomic<bool> stopping_{false};
   std::unique_ptr<ControlPlaneHandler> control_handler_;
   std::unique_ptr<ControlPlaneBackend> control_backend_;
+  std::shared_ptr<MetricsCollector> metrics_collector_ = nullptr;
 
  private:
   class ControlPlaneHandlerImpl;
@@ -360,8 +360,6 @@ class KVCacheManagerWithTransfer {
       const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);
   absl::Status HandleAck(uint64_t uuid);
   uint64_t MaxPullStreamBlocks() const;
-
-  std::shared_ptr<MetricsCollector> metrics_collector_ = nullptr;
 };
 
 }  // namespace tpu_raiden

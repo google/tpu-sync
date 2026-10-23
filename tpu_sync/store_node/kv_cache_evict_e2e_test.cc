@@ -87,10 +87,12 @@ class EvictE2ETest : public ::testing::Test {
       bool enable_evict_sweep = true, double evict_low_watermark = 0.5,
       double evict_high_watermark = 0.75) {
     SourceAssembly src;
-    src.manager = std::make_unique<KVCacheManagerWithTransfer>(
-        kNumBlockArrays, /*num_shards=*/1, kArrayBytes,
-        /*local_port=*/0, /*host_blocks_to_allocate=*/kSourceCapacity,
-        /*parallelism=*/1, /*node_id=*/0, /*local_control_port=*/-1);
+    ABSL_ASSIGN_OR_RETURN(
+        src.manager,
+        KVCacheManagerWithTransfer::Create(
+            kNumBlockArrays, /*num_shards=*/1, kArrayBytes,
+            /*local_port=*/0, /*host_blocks_to_allocate=*/kSourceCapacity,
+            /*parallelism=*/1, /*node_id=*/0, /*local_control_port=*/-1));
 
     kv_cache::BackendConfig config;
     config.type = "HostOffloadBackend";

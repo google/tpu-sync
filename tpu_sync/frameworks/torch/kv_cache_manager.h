@@ -124,12 +124,10 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
   // refs into buffer_refs_ so the materialized device buffers survive for this
   // manager's lifetime. `kv_caches` is retained for the disagg path's
   // kv_caches() accessor (empty for the offload path).
-  TorchKVCacheManager(UnpackedLayers unpacked, std::optional<int> local_port,
-                      std::optional<int> host_blocks_to_allocate,
-                      bool unsafe_skip_buffer_lock, int parallelism,
+  TorchKVCacheManager(std::unique_ptr<kv_cache::KVCacheManagerBase> base,
                       int64_t node_id, int64_t local_control_port,
-                      int64_t max_blocks, int64_t num_slots, double timeout_s,
-                      std::vector<at::Tensor> kv_caches, bool enable_shm);
+                      double timeout_s, std::vector<at::Tensor> kv_caches,
+                      std::vector<torch_tpu::TensorBufferHandle> buffer_refs);
 
   std::vector<at::Tensor> kv_caches_;
   // Keep-alives for the materialized device buffers backing the manager.

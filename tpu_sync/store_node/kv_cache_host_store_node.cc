@@ -17,7 +17,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
 #include <memory>
 #include <string>
 #include <utility>
@@ -136,79 +135,75 @@ KVCacheHostStoreNode::Create(const Options& options,
       spec.block_array_bytes.begin(), spec.block_array_bytes.end());
 
   // Phase B: the same assembly a serving host deployment runs, CPU-backed.
+  // 1. The pools, one manager per spec worker rank, mirroring the serving
+  // hosts' transfer topology: a peer pairs each of its workers with the
+  // worker here sharing its node_id (unmatched node_ids are a hard
+  // failure), so this node must field the same dense [0, num_workers)
+  // roster. Block ids are one flat space -- every worker holds its own
+  // shards of every block -- so each manager allocates and zeroes its
+  // full num_host_blocks x num_block_arrays x num_kv_shards x
+  // block_bytes_per_array pool here, at boot, never on a request path.
+  // The factory's first and third parameters are named num_layers and
+  // slice_byte_size for historical reasons; they are the array count and
+  // the per-array block stride (see KVTransferSpec).
+  // local_control_port=-1: the slot protocol is engine-to-engine
+  // coordination and has no role on a host store node.
   std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> managers;
-  std::unique_ptr<kv_cache::KVCacheStore> store;
-  try {
-    // 1. The pools, one manager per spec worker rank, mirroring the serving
-    // hosts' transfer topology: a peer pairs each of its workers with the
-    // worker here sharing its node_id (unmatched node_ids are a hard
-    // failure), so this node must field the same dense [0, num_workers)
-    // roster. Block ids are one flat space -- every worker holds its own
-    // shards of every block -- so each manager allocates and zeroes its
-    // full num_host_blocks x num_block_arrays x num_kv_shards x
-    // block_bytes_per_array pool here, at boot, never on a request path.
-    // The constructor's first and third parameters are named num_layers and
-    // slice_byte_size for historical reasons; they are the array count and
-    // the per-array block stride (see KVTransferSpec).
-    // local_control_port=-1: the slot protocol is engine-to-engine
-    // coordination and has no role on a host store node.
-    managers.reserve(spec.num_workers);
-    for (size_t rank = 0; rank < spec.num_workers; ++rank) {
-      managers.push_back(std::make_unique<KVCacheManagerWithTransfer>(
-          num_block_arrays, spec.num_kv_shards, block_bytes_per_array,
-          /*local_port=*/0,
-          /*host_blocks_to_allocate=*/num_host_blocks, options.parallelism,
-          /*node_id=*/static_cast<int64_t>(rank),
-          /*local_control_port=*/-1));
-    }
-
-    // 2. Everything above the pool, assembled through the same
-    // KVCacheStore::Create entry point a serving host uses: the
-    // RaidenController coordination plane (num_blocks sized to the capacity,
-    // so incoming writes can allocate block ids through AllocateBlockIds),
-    // the HostOffloadBackend LRU cache, and the peer-facing store server.
-    // Create publishes the node to the global registry (RegisterStore) once
-    // the store server is bound, so registration happens exactly when the
-    // advertised address is live. With no global registry configured
-    // KVCacheStore stands up no store server at all (the registry decides
-    // whether the peer plane exists). expected_worker_count stays at its
-    // default 0: it gates construction on workers registering from outside,
-    // and this node's workers only register below, after the store exists.
-    kv_cache::BackendConfig backend_config;
-    backend_config.type = "HostOffloadBackend";
-    backend_config.kv_pool_group = options.kv_pool_group;
-    backend_config.evict_tier = options.evict_tier;
-    // The evict sweep runs on the store monitor. Without a registry there is
-    // nothing to heartbeat, so the store monitor only runs when one is
-    // configured and enable_store_monitor is true.
-    backend_config.monitor_config.enable =
-        options.enable_store_monitor &&
-        !options.global_registry_address.empty();
-    backend_config.monitor_config.enable_evict_sweep =
-        options.enable_evict_sweep && backend_config.monitor_config.enable;
-    if (options.enable_evict_sweep && !backend_config.monitor_config.enable) {
-      LOG(WARNING)
-          << "Evict sweep disabled: it runs on the store monitor, which is off "
-             "(--enable_store_monitor=false or no global registry); this node "
-             "will not reclaim space when it fills up.";
-    }
-    backend_config.monitor_config.evict_sweep_period =
-        options.evict_sweep_period;
-    backend_config.monitor_config.evict_low_watermark =
-        options.evict_low_watermark;
-    backend_config.monitor_config.evict_high_watermark =
-        options.evict_high_watermark;
+  managers.reserve(spec.num_workers);
+  for (size_t rank = 0; rank < spec.num_workers; ++rank) {
     ABSL_ASSIGN_OR_RETURN(
-        store, kv_cache::KVCacheStore::Create(
-                   backend_config, /*capacity=*/num_host_blocks,
-                   options.global_registry_address, options.raiden_id,
-                   static_cast<int>(spec.num_kv_shards),
-                   static_cast<int64_t>(block_bytes_per_array[0]),
-                   options.store_server_ip, options.raiden_controller_port));
-  } catch (const std::exception& e) {
-    return absl::UnavailableError(
-        absl::StrCat("host store node assembly failed: ", e.what()));
+        std::unique_ptr<KVCacheManagerWithTransfer> manager,
+        KVCacheManagerWithTransfer::Create(
+            num_block_arrays, spec.num_kv_shards, block_bytes_per_array,
+            /*local_port=*/0,
+            /*host_blocks_to_allocate=*/num_host_blocks, options.parallelism,
+            /*node_id=*/static_cast<int64_t>(rank),
+            /*local_control_port=*/-1));
+    managers.push_back(std::move(manager));
   }
+
+  // 2. Everything above the pool, assembled through the same
+  // KVCacheStore::Create entry point a serving host uses: the
+  // RaidenController coordination plane (num_blocks sized to the capacity,
+  // so incoming writes can allocate block ids through AllocateBlockIds),
+  // the HostOffloadBackend LRU cache, and the peer-facing store server.
+  // Create publishes the node to the global registry (RegisterStore) once
+  // the store server is bound, so registration happens exactly when the
+  // advertised address is live. With no global registry configured
+  // KVCacheStore stands up no store server at all (the registry decides
+  // whether the peer plane exists). expected_worker_count stays at its
+  // default 0: it gates construction on workers registering from outside,
+  // and this node's workers only register below, after the store exists.
+  kv_cache::BackendConfig backend_config;
+  backend_config.type = "HostOffloadBackend";
+  backend_config.kv_pool_group = options.kv_pool_group;
+  backend_config.evict_tier = options.evict_tier;
+  // The evict sweep runs on the store monitor. Without a registry there is
+  // nothing to heartbeat, so the store monitor only runs when one is
+  // configured and enable_store_monitor is true.
+  backend_config.monitor_config.enable =
+      options.enable_store_monitor && !options.global_registry_address.empty();
+  backend_config.monitor_config.enable_evict_sweep =
+      options.enable_evict_sweep && backend_config.monitor_config.enable;
+  if (options.enable_evict_sweep && !backend_config.monitor_config.enable) {
+    LOG(WARNING)
+        << "Evict sweep disabled: it runs on the store monitor, which is off "
+           "(--enable_store_monitor=false or no global registry); this node "
+           "will not reclaim space when it fills up.";
+  }
+  backend_config.monitor_config.evict_sweep_period = options.evict_sweep_period;
+  backend_config.monitor_config.evict_low_watermark =
+      options.evict_low_watermark;
+  backend_config.monitor_config.evict_high_watermark =
+      options.evict_high_watermark;
+  ABSL_ASSIGN_OR_RETURN(
+      std::unique_ptr<kv_cache::KVCacheStore> store,
+      kv_cache::KVCacheStore::Create(
+          backend_config, /*capacity=*/num_host_blocks,
+          options.global_registry_address, options.raiden_id,
+          static_cast<int>(spec.num_kv_shards),
+          static_cast<int64_t>(block_bytes_per_array[0]),
+          options.store_server_ip, options.raiden_controller_port));
 
   // 3. Make each manager reachable from the controller, one WorkerService
   // and one registration per rank. StartServer must precede RegisterWorker:

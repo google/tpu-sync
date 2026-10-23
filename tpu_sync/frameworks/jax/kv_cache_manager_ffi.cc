@@ -71,14 +71,21 @@ xla::ffi::Error TriggerRaidenInitImpl(
             << ", parallelism=" << parallelism
             << ", global_blocks=" << host_blocks_to_allocate;
 
-    g_kv_cache_managers[shard_idx] = new KVCacheManagerWithTransfer(
-        static_cast<size_t>(num_layers), static_cast<size_t>(parallelism),
-        static_cast<size_t>(slice_byte_size),
-        local_port > 0 ? std::make_optional(local_port) : std::nullopt,
-        host_blocks_to_allocate > 0
-            ? std::make_optional(host_blocks_to_allocate)
-            : std::nullopt,
-        parallelism);
+    absl::StatusOr<std::unique_ptr<KVCacheManagerWithTransfer>> mgr =
+        KVCacheManagerWithTransfer::Create(
+            static_cast<size_t>(num_layers), static_cast<size_t>(parallelism),
+            static_cast<size_t>(slice_byte_size),
+            local_port > 0 ? std::make_optional(local_port) : std::nullopt,
+            host_blocks_to_allocate > 0
+                ? std::make_optional(host_blocks_to_allocate)
+                : std::nullopt,
+            parallelism);
+    if (!mgr.ok()) {
+      return xla::ffi::Error(xla::ffi::ErrorCode::kInternal,
+                             "Failed to create KVCacheManagerWithTransfer: " +
+                                 std::string(mgr.status().message()));
+    }
+    g_kv_cache_managers[shard_idx] = mgr->release();
 
     // Allocate the StreamExecutor Stream once per shard, and cache E2E!
     int64_t dev_id = static_cast<int64_t>(shard_idx);

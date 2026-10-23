@@ -44,6 +44,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -104,12 +105,14 @@ class TestManager : private ScopedControlPlaneBackend,
                        int local_control_port = 0)
       : ScopedControlPlaneBackend("tcp", /*overwrite=*/false),
         KVCacheManagerWithTransfer(
-            num_layers, /*num_shards=*/1, /*slice_byte_size=*/128,
-            /*local_port=*/std::nullopt,
-            /*host_blocks_to_allocate=*/std::nullopt,
-            /*parallelism=*/1, /*node_id=*/0, local_control_port,
-            /*max_blocks=*/8,
-            /*num_slots=*/2 * kPoolSize, timeout_s) {}
+            *kv_cache::KVCacheManagerBase::Create(
+                num_layers, /*num_shards=*/1, /*slice_byte_size=*/128,
+                /*local_port=*/std::nullopt,
+                /*host_blocks_to_allocate=*/8 * 2 * kPoolSize,
+                /*parallelism=*/1),
+            /*node_id=*/0, local_control_port, timeout_s) {
+    CHECK_OK(InitTransfer(/*max_blocks=*/8, /*num_slots=*/2 * kPoolSize));
+  }
 
   using ControlRequestHeader = TcpControlPlaneBackend::ControlRequestHeader;
   using ControlResponseHeader = TcpControlPlaneBackend::ControlResponseHeader;

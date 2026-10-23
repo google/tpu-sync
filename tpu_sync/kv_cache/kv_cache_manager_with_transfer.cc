@@ -37,6 +37,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
+#include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -91,20 +92,6 @@ double DeriveControlTimeoutS(double timeout_s) {
   return absl::ToDoubleSeconds(
       std::min(absl::Seconds(timeout_s),
                kPullRegistrationGrace + kControlDeadlineSlack));
-}
-
-[[noreturn]] void ThrowStatus(const std::string& context,
-                              const absl::Status& status) {
-  if (status.code() == absl::StatusCode::kInvalidArgument) {
-    throw std::invalid_argument(context + ": " + std::string(status.message()));
-  }
-  throw std::runtime_error(context + ": " + std::string(status.message()));
-}
-
-void CheckStatus(const std::string& context, const absl::Status& status) {
-  if (!status.ok()) {
-    ThrowStatus(context, status);
-  }
 }
 
 void EmitTimingLog(const std::string& message) { LOG(INFO) << message; }
@@ -297,68 +284,66 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
   base_->SetTransferEventHooks(std::move(hooks));
 }
 
-KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
+absl::StatusOr<std::unique_ptr<KVCacheManagerWithTransfer>>
+KVCacheManagerWithTransfer::Create(
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     bool unsafe_skip_buffer_lock, int parallelism,
     HostBufferAllocator host_allocator, int64_t node_id,
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
-    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector)
-    : KVCacheManagerWithTransfer(
-          std::make_unique<kv_cache::KVCacheManagerBase>(
-              layer_buffers, local_port,
-              host_blocks_to_allocate.value_or(num_slots * max_blocks),
-              unsafe_skip_buffer_lock, parallelism, host_allocator),
-          node_id, local_control_port, max_blocks, num_slots, timeout_s,
-          std::move(metrics_collector)) {}
+    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector) {
+  ABSL_ASSIGN_OR_RETURN(
+      std::unique_ptr<kv_cache::KVCacheManagerBase> base,
+      kv_cache::KVCacheManagerBase::Create(
+          layer_buffers, local_port,
+          host_blocks_to_allocate.value_or(num_slots * max_blocks),
+          unsafe_skip_buffer_lock, parallelism, std::move(host_allocator)));
+  return Create(std::move(base), node_id, local_control_port, max_blocks,
+                num_slots, timeout_s, std::move(metrics_collector));
+}
 
-KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
-    const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
-    size_t slice_byte_size, const std::vector<int64_t>& dimensions,
-    size_t physical_size, std::optional<int> local_port,
-    std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
-    int parallelism, HostBufferAllocator host_allocator, int64_t node_id,
-    int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
-    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector)
-    : KVCacheManagerWithTransfer(
-          std::make_unique<kv_cache::KVCacheManagerBase>(
-              layer_buffers, local_port,
-              host_blocks_to_allocate.value_or(num_slots * max_blocks),
-              unsafe_skip_buffer_lock, parallelism, host_allocator,
-              /*bind_ip=*/std::nullopt,
-              slice_byte_size > 0 ? std::make_optional(slice_byte_size)
-                                  : std::nullopt,
-              dimensions,
-              physical_size > 0 ? std::make_optional(physical_size)
-                                : std::nullopt),
-          node_id, local_control_port, max_blocks, num_slots, timeout_s,
-          std::move(metrics_collector)) {}
-
-KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
+absl::StatusOr<std::unique_ptr<KVCacheManagerWithTransfer>>
+KVCacheManagerWithTransfer::Create(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, int64_t node_id, int64_t local_control_port,
     int64_t max_blocks, int64_t num_slots, double timeout_s,
-    std::shared_ptr<MetricsCollector> metrics_collector)
-    : KVCacheManagerWithTransfer(
-          num_layers, num_shards,
-          std::vector<size_t>(num_layers, slice_byte_size), local_port,
-          host_blocks_to_allocate, parallelism, node_id, local_control_port,
-          max_blocks, num_slots, timeout_s, std::move(metrics_collector)) {}
+    std::shared_ptr<MetricsCollector> metrics_collector) {
+  return Create(num_layers, num_shards,
+                std::vector<size_t>(num_layers, slice_byte_size), local_port,
+                host_blocks_to_allocate, parallelism, node_id,
+                local_control_port, max_blocks, num_slots, timeout_s,
+                std::move(metrics_collector));
+}
 
-KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
+absl::StatusOr<std::unique_ptr<KVCacheManagerWithTransfer>>
+KVCacheManagerWithTransfer::Create(
     size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, int64_t node_id, int64_t local_control_port,
     int64_t max_blocks, int64_t num_slots, double timeout_s,
-    std::shared_ptr<MetricsCollector> metrics_collector)
-    : KVCacheManagerWithTransfer(
-          std::make_unique<kv_cache::KVCacheManagerBase>(
-              num_layers, num_shards, std::move(slice_byte_sizes), local_port,
-              host_blocks_to_allocate.value_or(num_slots * max_blocks),
-              parallelism, nullptr),
-          node_id, local_control_port, max_blocks, num_slots, timeout_s,
-          std::move(metrics_collector)) {}
+    std::shared_ptr<MetricsCollector> metrics_collector) {
+  ABSL_ASSIGN_OR_RETURN(
+      std::unique_ptr<kv_cache::KVCacheManagerBase> base,
+      kv_cache::KVCacheManagerBase::Create(
+          num_layers, num_shards, std::move(slice_byte_sizes), local_port,
+          host_blocks_to_allocate.value_or(num_slots * max_blocks), parallelism,
+          nullptr));
+  return Create(std::move(base), node_id, local_control_port, max_blocks,
+                num_slots, timeout_s, std::move(metrics_collector));
+}
+
+absl::StatusOr<std::unique_ptr<KVCacheManagerWithTransfer>>
+KVCacheManagerWithTransfer::Create(
+    std::unique_ptr<kv_cache::KVCacheManagerBase> base, int64_t node_id,
+    int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
+    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector) {
+  auto mgr = absl::WrapUnique(new KVCacheManagerWithTransfer(
+      std::move(base), node_id, local_control_port, timeout_s,
+      std::move(metrics_collector)));
+  ABSL_RETURN_IF_ERROR(mgr->InitTransfer(max_blocks, num_slots));
+  return mgr;
+}
 
 KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
   StopControlServer();
@@ -425,8 +410,8 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
 
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     std::unique_ptr<kv_cache::KVCacheManagerBase> base, int64_t node_id,
-    int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
-    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector)
+    int64_t local_control_port, double timeout_s,
+    std::shared_ptr<MetricsCollector> metrics_collector)
     : base_(std::move(base)),
       node_id_(node_id),
       local_control_port_(static_cast<int>(local_control_port)),
@@ -436,27 +421,34 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       metrics_collector_(std::move(metrics_collector)) {
   InitializeBaseHooks();
   InitializeControlPlane();
+}
+
+absl::Status KVCacheManagerWithTransfer::InitTransfer(int64_t max_blocks,
+                                                      int64_t num_slots) {
   if (base_->num_shards() == 0) {
-    staging_allocator_ =
-        CreateStagingBlockAllocator(base_.get(), /*num_slots=*/0, max_blocks);
-    return;
+    ABSL_ASSIGN_OR_RETURN(
+        staging_allocator_,
+        CreateStagingBlockAllocator(base_.get(), /*num_slots=*/0, max_blocks));
+    return absl::OkStatus();
   }
   if (local_control_port_ >= 0) {
     if (max_blocks <= 0) {
-      throw std::invalid_argument("max_blocks must be positive");
+      return absl::InvalidArgumentError("max_blocks must be positive");
     }
     if (num_slots <= 0) {
-      throw std::invalid_argument("num_slots must be positive");
+      return absl::InvalidArgumentError("num_slots must be positive");
     }
     if (base_->num_layers() > 0) {
-      ConfigureDataPortFromKvTransfer();
+      ABSL_RETURN_IF_ERROR(ConfigureDataPortFromKvTransfer());
     }
   }
-  staging_allocator_ =
-      CreateStagingBlockAllocator(base_.get(), num_slots, max_blocks);
+  ABSL_ASSIGN_OR_RETURN(
+      staging_allocator_,
+      CreateStagingBlockAllocator(base_.get(), num_slots, max_blocks));
   if (local_control_port_ >= 0) {
-    StartControlServer();
+    ABSL_RETURN_IF_ERROR(StartControlServer());
   }
+  return absl::OkStatus();
 }
 
 int64_t KVCacheManagerWithTransfer::NotifyForRead(
@@ -1104,23 +1096,16 @@ KVCacheManagerWithTransfer::CompleteReadRaw() {
           std::move(completions.failed)};
 }
 
-std::unique_ptr<StagingBlockAllocator> CreateStagingBlockAllocator(
-    kv_cache::KVCacheManagerBase* base, int64_t num_slots, int64_t max_blocks,
-    std::optional<bool> dynamic_host_staging) {
+absl::StatusOr<std::unique_ptr<StagingBlockAllocator>>
+CreateStagingBlockAllocator(kv_cache::KVCacheManagerBase* base,
+                            int64_t num_slots, int64_t max_blocks,
+                            std::optional<bool> dynamic_host_staging) {
   if (num_slots > 0 && max_blocks > 0) {
-    absl::Status status =
-        base->ConfigureHostStagingSlots(num_slots, max_blocks);
-    if (!status.ok()) {
-      throw std::runtime_error(std::string(status.message()));
-    }
+    ABSL_RETURN_IF_ERROR(
+        base->ConfigureHostStagingSlots(num_slots, max_blocks));
   }
-  absl::StatusOr<std::unique_ptr<StagingBlockAllocator>> allocator =
-      StagingBlockAllocator::Create(base->host_block_manager(), num_slots,
-                                    max_blocks, dynamic_host_staging);
-  if (!allocator.ok()) {
-    throw std::runtime_error(std::string(allocator.status().message()));
-  }
-  return *std::move(allocator);
+  return StagingBlockAllocator::Create(base->host_block_manager(), num_slots,
+                                       max_blocks, dynamic_host_staging);
 }
 
 void KVCacheManagerWithTransfer::RegisterBlockReadinessCallback(
@@ -1209,15 +1194,20 @@ void KVCacheManagerWithTransfer::InitializeControlPlane() {
       absl::Seconds(control_timeout_s_));
 }
 
-void KVCacheManagerWithTransfer::StartControlServer() {
+absl::Status KVCacheManagerWithTransfer::StartControlServer() {
   {
     absl::MutexLock lock(mu_);
     stopping_ = false;
   }
   absl::StatusOr<int> bound_port = control_backend_->StartServer(
       local_control_port_, control_handler_.get());
-  CheckStatus("StartControlServer", bound_port.status());
+  if (!bound_port.ok()) {
+    return absl::Status(
+        bound_port.status().code(),
+        absl::StrCat("StartControlServer: ", bound_port.status().message()));
+  }
   local_control_port_ = *bound_port;
+  return absl::OkStatus();
 }
 
 void KVCacheManagerWithTransfer::StopControlServer() {
@@ -1458,16 +1448,18 @@ KVCacheManagerWithTransfer::DeadlineFromNow() const {
          std::chrono::milliseconds(static_cast<int64_t>(timeout_s_ * 1000.0));
 }
 
-void KVCacheManagerWithTransfer::ConfigureDataPortFromKvTransfer() {
+absl::Status KVCacheManagerWithTransfer::ConfigureDataPortFromKvTransfer() {
   if (base_->num_layers() == 0) {
     local_data_port_ = 0;
-    return;
+    return absl::OkStatus();
   }
   std::optional<int> data_port = base_->local_port();
   if (!data_port.has_value()) {
-    throw std::runtime_error("KVCacheManager BlockTransport is not running");
+    return absl::FailedPreconditionError(
+        "KVCacheManager BlockTransport is not running");
   }
   local_data_port_ = *data_port;
+  return absl::OkStatus();
 }
 
 absl::Status KVCacheManagerWithTransfer::OnBlockShardsReceived(

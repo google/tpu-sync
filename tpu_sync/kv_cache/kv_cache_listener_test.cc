@@ -30,6 +30,7 @@
 
 #include <gtest/gtest.h>
 #include "absl/cleanup/cleanup.h"
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -61,9 +62,9 @@ class RoutingKVCacheManager final : public KVCacheManagerBase {
   explicit RoutingKVCacheManager(
       std::optional<int> host_blocks_to_allocate = std::nullopt)
       : KVCacheManagerBase(/*num_layers=*/1, /*num_shards=*/1,
-                           /*slice_byte_size=*/64,
-                           /*local_port=*/std::nullopt,
-                           host_blocks_to_allocate) {}
+                           /*slice_byte_sizes=*/{64}) {
+    CHECK_OK(InitHostBuffers({64}, host_blocks_to_allocate));
+  }
 
   absl::Status PoolReshardPush(const StartTransferRequest& request,
                                absl::Span<const int64_t> src_block_ids,

@@ -73,8 +73,8 @@ class HostOffloadBackend : public KVCacheStoreBackend {
               absl::Span<const RaidenBlockId> slices,
               InsertOption option = InsertOption::kBestEffortUpdate) override;
 
-  void Delete(absl::Span<const std::string> block_hashes,
-              absl::Span<const RaidenBlockId> slices) override;
+  size_t Delete(absl::Span<const std::string> block_hashes,
+                const DeleteOptions& options = {}) override;
 
   bool Pin(absl::Span<const std::string> block_hashes) override;
 
@@ -91,10 +91,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   absl::StatusOr<size_t> RecoverFromLocalManifest() override;
 
   std::vector<std::string> GetEvictableKeys(size_t count) override;
-
-  std::vector<int> Evict(
-      const std::vector<std::string>& block_hashes,
-      std::vector<std::string>* evicted_hashes = nullptr) override;
 
   // --- Global Memory Pooling & RPC Methods ---
   // Loads KV cache blocks from local host DRAM (if `remote_id` is empty or

@@ -162,6 +162,32 @@ enum class InsertOption {
   kAdmitStrict,
 };
 
+// Options controlling KVCacheStoreBackend::Delete.
+struct DeleteOptions {
+  // When true, only unpinned host-resident entries (BlockStatus::HOST or
+  // BlockStatus::HOST_AND_HBM) are erased.
+  bool host_resident_only = false;
+
+  // Optional output populated with the host_block_ids of host-resident
+  // entries erased by this call.
+  std::vector<int>* deallocated_host_block_ids = nullptr;
+
+  // Optional output populated with the block hashes erased by this call.
+  std::vector<std::string>* deleted_hashes = nullptr;
+
+  // Preset for evicting unpinned host-resident entries and recording their
+  // deallocated host_block_ids and evicted block hashes.
+  static DeleteOptions EvictHostResident(
+      std::vector<int>* deallocated_host_block_ids,
+      std::vector<std::string>* evicted_hashes = nullptr) {
+    return DeleteOptions{
+        .host_resident_only = true,
+        .deallocated_host_block_ids = deallocated_host_block_ids,
+        .deleted_hashes = evicted_hashes,
+    };
+  }
+};
+
 // Abstract interface for KV cache index storage backends.
 // Implementations must be thread-safe.
 class KVCacheStoreBackend {
@@ -219,9 +245,10 @@ class KVCacheStoreBackend {
       absl::Span<const RaidenBlockId> slices,
       InsertOption option = InsertOption::kBestEffortUpdate) = 0;
 
-  // Removes unpinned entries in `block_hashes` from the backend index.
-  virtual void Delete(absl::Span<const std::string> block_hashes,
-                      absl::Span<const RaidenBlockId> slices) = 0;
+  // Removes unpinned entries in `block_hashes` matching `options` and returns
+  // the number of entries erased.
+  virtual size_t Delete(absl::Span<const std::string> block_hashes,
+                        const DeleteOptions& options = {}) = 0;
 
   // Increments the pin count of each hash in `block_hashes` to protect it
   // from LRU eviction. Returns true if all hashes are present and pinned.
@@ -249,16 +276,6 @@ class KVCacheStoreBackend {
 
   // Retrieves evictable keys from the backend.
   virtual std::vector<std::string> GetEvictableKeys(size_t count) { return {}; }
-
-  // Evicts keys from the backend and returns deallocated host block IDs.
-  // If `evicted_hashes` is non-null, it is populated with the block hashes that
-  // were actually evicted.
-  virtual std::vector<int> Evict(
-      const std::vector<std::string>& block_hashes,
-      std::vector<std::string>* evicted_hashes = nullptr) {
-    Delete(block_hashes, {});
-    return {};
-  }
 
   // --- Remote write (WriteRemote) & registry helpers -----------------------
   //

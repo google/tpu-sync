@@ -6120,8 +6120,10 @@ class ErrorLookupBackend : public KVCacheStoreBackend {
               InsertOption option = InsertOption::kBestEffortUpdate) override {
     return false;
   }
-  void Delete(absl::Span<const std::string> block_hashes,
-              absl::Span<const RaidenBlockId> slices) override {}
+  size_t Delete(absl::Span<const std::string> block_hashes,
+                const DeleteOptions& options = {}) override {
+    return 0;
+  }
   bool Pin(absl::Span<const std::string> block_hashes) override {
     return false;
   }

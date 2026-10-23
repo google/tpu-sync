@@ -545,33 +545,59 @@ bool HostOffloadBackend::InsertAdmitStrict(
   return true;
 }
 
-void HostOffloadBackend::Delete(absl::Span<const std::string> block_hashes,
-                                absl::Span<const RaidenBlockId> /*slices*/) {
+size_t HostOffloadBackend::Delete(absl::Span<const std::string> block_hashes,
+                                  const DeleteOptions& options) {
+  if (options.deallocated_host_block_ids != nullptr) {
+    options.deallocated_host_block_ids->clear();
+  }
+  if (options.deleted_hashes != nullptr) {
+    options.deleted_hashes->clear();
+  }
+
   std::shared_ptr<global_registry::GlobalRegistryClient> client;
   RaidenId local_id;
-  std::vector<std::string> deleted_hashes;
+  std::vector<std::string> hashes_to_unregister;
+  size_t erased_count = 0;
 
   {
     absl::MutexLock lock(mutex_);
     for (const std::string& hash : block_hashes) {
       if (lru_cache_.GetPinCount(hash) > 0) {
-        LOG(WARNING) << "Delete skipped pinned block hash (release it first): "
-                     << absl::BytesToHexString(hash);
+        if (!options.host_resident_only) {
+          LOG(WARNING)
+              << "Delete skipped pinned block hash (release it first): "
+              << absl::BytesToHexString(hash);
+        }
         continue;
       }
-      if (const RaidenBlockId* val = lru_cache_.PeekIncludingCandidates(hash)) {
-        ClearMetadataEntry(*val);
+      const RaidenBlockId* block = lru_cache_.PeekIncludingCandidates(hash);
+      if (block == nullptr) {
+        continue;
       }
+      const bool is_host_resident = IsHostResidentStatus(block->status);
+      if (options.host_resident_only && !is_host_resident) {
+        continue;
+      }
+      if (is_host_resident) {
+        if (options.deallocated_host_block_ids != nullptr) {
+          options.deallocated_host_block_ids->push_back(block->host_block_id);
+        }
+        hashes_to_unregister.push_back(hash);
+      }
+      ClearMetadataEntry(*block);
       lru_cache_.Erase(hash);
-      deleted_hashes.push_back(hash);
+      if (options.deleted_hashes != nullptr) {
+        options.deleted_hashes->push_back(hash);
+      }
+      ++erased_count;
     }
     client = registry_client_;
     local_id = raiden_id_;
   }
 
-  if (client != nullptr && !deleted_hashes.empty()) {
+  if (client != nullptr && !hashes_to_unregister.empty()) {
     client
-        ->UnregisterAsync(deleted_hashes, local_id,
+        ->UnregisterAsync(hashes_to_unregister, local_id,
                           global_registry::kUnwaitedMutationTimeout)
         .OnReady([](absl::Status status) {
           if (!status.ok()) {
@@ -580,6 +606,8 @@ void HostOffloadBackend::Delete(absl::Span<const std::string> block_hashes,
           }
         });
   }
+
+  return erased_count;
 }
 
 bool HostOffloadBackend::Pin(absl::Span<const std::string> block_hashes) {
@@ -691,43 +719,8 @@ std::vector<int> HostOffloadBackend::Evict(
     const std::vector<std::string>& block_hashes,
     std::vector<std::string>* evicted_hashes) {
   std::vector<int> host_ids_to_deallocate;
-  std::shared_ptr<global_registry::GlobalRegistryClient> client;
-  RaidenId local_id;
-  std::vector<std::string> local_evicted_hashes;
-
-  {
-    absl::MutexLock lock(mutex_);
-    for (const std::string& hash : block_hashes) {
-      const RaidenBlockId* block = lru_cache_.PeekIncludingCandidates(hash);
-      if (block != nullptr && lru_cache_.GetPinCount(hash) == 0 &&
-          (block->status == BlockStatus::HOST ||
-           block->status == BlockStatus::HOST_AND_HBM)) {
-        host_ids_to_deallocate.push_back(block->host_block_id);
-        ClearMetadataEntry(*block);
-        lru_cache_.Erase(hash);
-        local_evicted_hashes.push_back(hash);
-      }
-    }
-    client = registry_client_;
-    local_id = raiden_id_;
-  }
-
-  if (client != nullptr && !local_evicted_hashes.empty()) {
-    client
-        ->UnregisterAsync(local_evicted_hashes, local_id,
-                          global_registry::kUnwaitedMutationTimeout)
-        .OnReady([](absl::Status status) {
-          if (!status.ok()) {
-            LOG(WARNING) << "Global registry unregister failed: "
-                         << status.message();
-          }
-        });
-  }
-
-  if (evicted_hashes != nullptr) {
-    *evicted_hashes = std::move(local_evicted_hashes);
-  }
-
+  Delete(block_hashes, DeleteOptions::EvictHostResident(&host_ids_to_deallocate,
+                                                        evicted_hashes));
   return host_ids_to_deallocate;
 }
 

@@ -108,8 +108,28 @@ class CustomTestBackend : public KVCacheStoreBackend {
     }
     return true;
   }
-  void Delete(absl::Span<const std::string>,
-              absl::Span<const RaidenBlockId>) override {}
+  size_t Delete(absl::Span<const std::string> hashes,
+                const DeleteOptions& options = {}) override {
+    if (options.deallocated_host_block_ids != nullptr) {
+      options.deallocated_host_block_ids->clear();
+    }
+    if (options.deleted_hashes != nullptr) {
+      options.deleted_hashes->clear();
+    }
+    if (options.host_resident_only) {
+      return 0;
+    }
+    size_t erased = 0;
+    for (const auto& h : hashes) {
+      if (entries_.erase(h) > 0) {
+        ++erased;
+        if (options.deleted_hashes != nullptr) {
+          options.deleted_hashes->push_back(h);
+        }
+      }
+    }
+    return erased;
+  }
   bool Pin(absl::Span<const std::string> hashes) override {
     for (const auto& h : hashes) {
       if (!entries_.contains(h)) return false;

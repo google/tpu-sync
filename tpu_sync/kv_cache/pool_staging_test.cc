@@ -25,6 +25,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/time/time.h"
@@ -44,9 +45,11 @@ class StagingTestManager : public KVCacheManagerBase {
  public:
   StagingTestManager(size_t num_layers, size_t num_shards,
                      size_t slice_byte_size, int host_blocks)
-      : KVCacheManagerBase(num_layers, num_shards, slice_byte_size,
-                           /*local_port=*/std::nullopt,
-                           std::make_optional(host_blocks)) {
+      : KVCacheManagerBase(num_layers, num_shards,
+                           /*slice_byte_sizes=*/
+                           std::vector<size_t>(num_layers, slice_byte_size)) {
+    CHECK_OK(InitHostBuffers(std::vector<size_t>(num_layers, slice_byte_size),
+                             std::make_optional(host_blocks)));
     buffer_holds_.resize(num_layers);
     for (size_t l = 0; l < num_layers; ++l) {
       buffer_holds_[l].holds.resize(num_shards);

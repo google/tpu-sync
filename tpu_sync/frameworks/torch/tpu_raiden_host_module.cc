@@ -15,16 +15,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "nanobind/nanobind.h"
 #include "nanobind/stl/optional.h"
 #include "nanobind/stl/string.h"
+#include "nanobind/stl/unique_ptr.h"  // IWYU pragma: keep
 #include "nanobind/stl/vector.h"
+#include "absl/memory/memory.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -52,17 +57,21 @@ std::string FormatAddressWithPort(absl::string_view ip, int port) {
 // the third-party raiden library surface, 539d7ea).
 class HostKVCacheManager : public KVCacheManagerWithTransfer {
  public:
-  HostKVCacheManager(size_t num_layers, size_t num_shards,
-                     size_t slice_byte_size, int64_t node_id,
-                     std::optional<int> local_port,
-                     std::optional<int> host_blocks_to_allocate,
-                     int parallelism)
-      : KVCacheManagerWithTransfer(
+  static absl::StatusOr<std::unique_ptr<HostKVCacheManager>> Create(
+      size_t num_layers, size_t num_shards, size_t slice_byte_size,
+      int64_t node_id, std::optional<int> local_port,
+      std::optional<int> host_blocks_to_allocate, int parallelism) {
+    ABSL_ASSIGN_OR_RETURN(
+        std::unique_ptr<kv_cache::KVCacheManagerBase> base,
+        kv_cache::KVCacheManagerBase::Create(
             num_layers, num_shards, slice_byte_size, local_port,
-            host_blocks_to_allocate, parallelism, node_id,
-            /*local_control_port=*/-1,
-            /*max_blocks=*/host_blocks_to_allocate.value_or(0),
-            /*num_slots=*/0, /*timeout_s=*/120.0) {}
+            host_blocks_to_allocate, parallelism));
+    auto mgr =
+        absl::WrapUnique(new HostKVCacheManager(std::move(base), node_id));
+    ABSL_RETURN_IF_ERROR(mgr->InitTransfer(
+        /*max_blocks=*/host_blocks_to_allocate.value_or(0), /*num_slots=*/0));
+    return mgr;
+  }
 
   std::string transfer_address() const {
     std::optional<int> port = base_->local_port();
@@ -142,6 +151,13 @@ class HostKVCacheManager : public KVCacheManagerWithTransfer {
     std::memcpy(base + block * block_bytes, payload.data(), block_bytes);
     return absl::OkStatus();
   }
+
+ private:
+  HostKVCacheManager(std::unique_ptr<kv_cache::KVCacheManagerBase> base,
+                     int64_t node_id)
+      : KVCacheManagerWithTransfer(std::move(base), node_id,
+                                   /*local_control_port=*/-1,
+                                   /*timeout_s=*/120.0) {}
 };
 
 // Distinct C++ wrapper so the host and torch extension modules can each
@@ -188,8 +204,18 @@ NB_MODULE(_tpu_raiden_host, m) {
 
   auto manager_cls = nb::class_<HostKVCacheManager>(m, "KVCacheManager");
   manager_cls
-      .def(nb::init<size_t, size_t, size_t, int64_t, std::optional<int>,
-                    std::optional<int>, int>(),
+      .def(nb::new_(
+               [](size_t num_layers, size_t num_shards, size_t slice_byte_size,
+                  int64_t node_id, std::optional<int> local_port,
+                  std::optional<int> host_blocks_to_allocate, int parallelism) {
+                 absl::StatusOr<std::unique_ptr<HostKVCacheManager>> mgr =
+                     HostKVCacheManager::Create(
+                         num_layers, num_shards, slice_byte_size, node_id,
+                         local_port, host_blocks_to_allocate, parallelism);
+                 ThrowIfError(mgr.status(),
+                              "KVCacheManager construction failed");
+                 return *std::move(mgr);
+               }),
            nb::arg("num_layers"), nb::arg("num_shards"),
            nb::arg("slice_byte_size"), nb::arg("node_id"),
            nb::arg("local_port") = nb::none(),

@@ -26,6 +26,9 @@
 #include <vector>
 
 #include <gmock/gmock.h>
+#include "absl/memory/memory.h"
+#include "absl/status/status_macros.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
@@ -69,7 +72,18 @@ MATCHER_P(HasResolvedIpLabel, key,
 
 class TestBase : public kv_cache::KVCacheManagerBase {
  public:
-  using kv_cache::KVCacheManagerBase::KVCacheManagerBase;
+  static absl::StatusOr<std::unique_ptr<TestBase>> Create(
+      std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers,
+      std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+      bool unsafe_skip_buffer_lock, int parallelism,
+      HostBufferAllocator host_allocator) {
+    (void)unsafe_skip_buffer_lock;
+    auto manager = absl::WrapUnique(new TestBase(
+        layer_buffers, local_port, parallelism, std::move(host_allocator)));
+    ABSL_RETURN_IF_ERROR(manager->InitDeviceBuffers(
+        layer_buffers, host_blocks_to_allocate, parallelism));
+    return manager;
+  }
 
   void SetMockLocalIps(const std::vector<std::string>& ips) {
     mock_local_ips_ = ips;
@@ -83,29 +97,38 @@ class TestBase : public kv_cache::KVCacheManagerBase {
   }
 
  private:
+  using kv_cache::KVCacheManagerBase::KVCacheManagerBase;
+
   std::optional<std::vector<std::string>> mock_local_ips_;
 };
 
 class TestKVCacheManagerWithTransfer : public KVCacheManagerWithTransfer {
  public:
-  TestKVCacheManagerWithTransfer(
+  static absl::StatusOr<std::unique_ptr<TestKVCacheManagerWithTransfer>> Create(
       std::vector<std::vector<raiden::RaidenBufferHandle>>
           layer_buffer_handles_in,
       std::optional<int> local_port_in,
       std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
       int parallelism, HostBufferAllocator host_allocator_in, int node_id,
       int local_control_port, int64_t max_blocks, int64_t num_slots,
-      double timeout_s)
-      : KVCacheManagerWithTransfer(
-            std::make_unique<TestBase>(std::move(layer_buffer_handles_in),
-                                       local_port_in, host_blocks_to_allocate,
-                                       unsafe_skip_buffer_lock, parallelism,
-                                       std::move(host_allocator_in)),
-            node_id, local_control_port, max_blocks, num_slots, timeout_s) {}
+      double timeout_s) {
+    ABSL_ASSIGN_OR_RETURN(
+        std::unique_ptr<TestBase> base,
+        TestBase::Create(std::move(layer_buffer_handles_in), local_port_in,
+                         host_blocks_to_allocate, unsafe_skip_buffer_lock,
+                         parallelism, std::move(host_allocator_in)));
+    auto manager = absl::WrapUnique(new TestKVCacheManagerWithTransfer(
+        std::move(base), node_id, local_control_port, timeout_s));
+    ABSL_RETURN_IF_ERROR(manager->InitTransfer(max_blocks, num_slots));
+    return manager;
+  }
 
   void SetMockLocalIps(const std::vector<std::string>& ips) {
     static_cast<TestBase*>(base())->SetMockLocalIps(ips);
   }
+
+ private:
+  using KVCacheManagerWithTransfer::KVCacheManagerWithTransfer;
 };
 
 TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
@@ -153,18 +176,19 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
                           raiden::RaidenBufferHandle::Acquire(buffer.get()));
   std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
       {std::move(handle)}};
-  auto engine = std::make_unique<KVCacheManagerWithTransfer>(
-      layer_buffers,
-      /*local_port=*/std::nullopt,
-      /*host_blocks_to_allocate=*/std::nullopt,
-      /*unsafe_skip_buffer_lock=*/true,
-      /*parallelism=*/1,
-      /*host_allocator=*/nullptr,
-      /*node_id=*/0,
-      /*local_control_port=*/0,
-      /*max_blocks=*/2,
-      /*num_slots=*/2,
-      /*timeout_s=*/10.0);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManagerWithTransfer> engine,
+                          KVCacheManagerWithTransfer::Create(
+                              layer_buffers,
+                              /*local_port=*/std::nullopt,
+                              /*host_blocks_to_allocate=*/std::nullopt,
+                              /*unsafe_skip_buffer_lock=*/true,
+                              /*parallelism=*/1,
+                              /*host_allocator=*/nullptr,
+                              /*node_id=*/0,
+                              /*local_control_port=*/0,
+                              /*max_blocks=*/2,
+                              /*num_slots=*/2,
+                              /*timeout_s=*/10.0));
   const uint64_t expected_slice_bytes = engine->base()->slice_byte_size();
 
   const auto pcie_labels_matcher = ElementsAre(
@@ -302,18 +326,19 @@ TEST(KVCacheManagerWithTransferTest, StartReadAcceptsParallelism) {
   auto handle_or = raiden::RaidenBufferHandle::Acquire(buffer.get());
   std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
       {handle_or.value()}};
-  auto engine = std::make_unique<KVCacheManagerWithTransfer>(
-      layer_buffers,
-      /*local_port=*/std::nullopt,
-      /*host_blocks_to_allocate=*/std::nullopt,
-      /*unsafe_skip_buffer_lock=*/true,
-      /*parallelism=*/1,
-      /*host_allocator=*/nullptr,
-      /*node_id=*/0,
-      /*local_control_port=*/0,
-      /*max_blocks=*/2,
-      /*num_slots=*/2,
-      /*timeout_s=*/10.0);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManagerWithTransfer> engine,
+                          KVCacheManagerWithTransfer::Create(
+                              layer_buffers,
+                              /*local_port=*/std::nullopt,
+                              /*host_blocks_to_allocate=*/std::nullopt,
+                              /*unsafe_skip_buffer_lock=*/true,
+                              /*parallelism=*/1,
+                              /*host_allocator=*/nullptr,
+                              /*node_id=*/0,
+                              /*local_control_port=*/0,
+                              /*max_blocks=*/2,
+                              /*num_slots=*/2,
+                              /*timeout_s=*/10.0));
   ASSERT_THAT(engine->base()->ConfigureHostStagingSlots(2, 2), IsOk());
 
   // Calling StartRead with a non-existent port throws or returns an op that
@@ -350,18 +375,20 @@ TEST(KVCacheManagerWithTransferTest,
   auto handle_or = raiden::RaidenBufferHandle::Acquire(buffer.get());
   std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
       {handle_or.value()}};
-  auto engine = std::make_unique<KVCacheManagerWithTransfer>(
-      layer_buffers,
-      /*local_port=*/std::nullopt,
-      /*host_blocks_to_allocate=*/6,  // Allocate 6 blocks in host
-      /*unsafe_skip_buffer_lock=*/true,
-      /*parallelism=*/1,
-      /*host_allocator=*/nullptr,
-      /*node_id=*/0,
-      /*local_control_port=*/0,
-      /*max_blocks=*/2,
-      /*num_slots=*/2,
-      /*timeout_s=*/10.0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManagerWithTransfer> engine,
+      KVCacheManagerWithTransfer::Create(
+          layer_buffers,
+          /*local_port=*/std::nullopt,
+          /*host_blocks_to_allocate=*/6,  // Allocate 6 blocks in host
+          /*unsafe_skip_buffer_lock=*/true,
+          /*parallelism=*/1,
+          /*host_allocator=*/nullptr,
+          /*node_id=*/0,
+          /*local_control_port=*/0,
+          /*max_blocks=*/2,
+          /*num_slots=*/2,
+          /*timeout_s=*/10.0));
 
   // Configure staging slots: 2 slots, max 2 blocks per slot
   ASSERT_THAT(engine->base()->ConfigureHostStagingSlots(2, 2), IsOk());
@@ -478,18 +505,19 @@ TEST(KVCacheManagerWithTransferTest, TreeBroadcastCorrectness8Nodes) {
     ASSERT_OK(handle_or.status());
     std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
         {handle_or.value()}};
-    engines[i] = std::make_unique<KVCacheManagerWithTransfer>(
-        layer_buffers,
-        /*local_port=*/std::nullopt,
-        /*host_blocks_to_allocate=*/std::nullopt,
-        /*unsafe_skip_buffer_lock=*/true,
-        /*parallelism=*/1,
-        /*host_allocator=*/nullptr,
-        /*node_id=*/i,
-        /*local_control_port=*/0,
-        /*max_blocks=*/2,
-        /*num_slots=*/2,
-        /*timeout_s=*/10.0);
+    TF_ASSERT_OK_AND_ASSIGN(engines[i],
+                            KVCacheManagerWithTransfer::Create(
+                                layer_buffers,
+                                /*local_port=*/std::nullopt,
+                                /*host_blocks_to_allocate=*/std::nullopt,
+                                /*unsafe_skip_buffer_lock=*/true,
+                                /*parallelism=*/1,
+                                /*host_allocator=*/nullptr,
+                                /*node_id=*/i,
+                                /*local_control_port=*/0,
+                                /*max_blocks=*/2,
+                                /*num_slots=*/2,
+                                /*timeout_s=*/10.0));
 
     ASSERT_THAT(engines[i]->base()->ConfigureHostStagingSlots(2, 2), IsOk());
     int port = engines[i]->local_control_port();
@@ -616,18 +644,20 @@ TEST(KVCacheManagerWithTransferTest, MultiIpOrchestratedTransfer) {
   std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
       {handle_or.value()}};
 
-  auto engine = std::make_unique<TestKVCacheManagerWithTransfer>(
-      layer_buffers,
-      /*local_port=*/std::nullopt,
-      /*host_blocks_to_allocate=*/std::nullopt,
-      /*unsafe_skip_buffer_lock=*/true,
-      /*parallelism=*/2,
-      /*host_allocator=*/nullptr,
-      /*node_id=*/0,
-      /*local_control_port=*/0,
-      /*max_blocks=*/2,
-      /*num_slots=*/2,
-      /*timeout_s=*/10.0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<TestKVCacheManagerWithTransfer> engine,
+      TestKVCacheManagerWithTransfer::Create(
+          layer_buffers,
+          /*local_port=*/std::nullopt,
+          /*host_blocks_to_allocate=*/std::nullopt,
+          /*unsafe_skip_buffer_lock=*/true,
+          /*parallelism=*/2,
+          /*host_allocator=*/nullptr,
+          /*node_id=*/0,
+          /*local_control_port=*/0,
+          /*max_blocks=*/2,
+          /*num_slots=*/2,
+          /*timeout_s=*/10.0));
 
   engine->SetMockLocalIps({"127.0.0.1", "127.0.0.2"});
 
@@ -694,18 +724,19 @@ TEST(KVCacheManagerWithTransferTest, LocalDataEndpointsCarryLayerHostAddrs) {
   std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
       {std::move(handle)}};
 
-  auto engine = std::make_unique<KVCacheManagerWithTransfer>(
-      layer_buffers,
-      /*local_port=*/std::nullopt,
-      /*host_blocks_to_allocate=*/4,
-      /*unsafe_skip_buffer_lock=*/true,
-      /*parallelism=*/1,
-      /*host_allocator=*/nullptr,
-      /*node_id=*/0,
-      /*local_control_port=*/0,
-      /*max_blocks=*/2,
-      /*num_slots=*/2,
-      /*timeout_s=*/10.0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManagerWithTransfer> engine,
+      KVCacheManagerWithTransfer::Create(layer_buffers,
+                                         /*local_port=*/std::nullopt,
+                                         /*host_blocks_to_allocate=*/4,
+                                         /*unsafe_skip_buffer_lock=*/true,
+                                         /*parallelism=*/1,
+                                         /*host_allocator=*/nullptr,
+                                         /*node_id=*/0,
+                                         /*local_control_port=*/0,
+                                         /*max_blocks=*/2,
+                                         /*num_slots=*/2,
+                                         /*timeout_s=*/10.0));
 
   auto data_eps = engine->get_local_data_endpoints();
   ASSERT_FALSE(data_eps.empty());

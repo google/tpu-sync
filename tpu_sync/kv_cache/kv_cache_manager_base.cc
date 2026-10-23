@@ -29,7 +29,6 @@
 #include <memory>
 #include <optional>
 #include <set>
-#include <stdexcept>
 #include <string>
 #include <thread>  // NOLINT
 #include <utility>
@@ -40,6 +39,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
+#include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -54,7 +54,6 @@
 #include "absl/types/span.h"
 #include "xla/future.h"
 #include "xla/pjrt/pjrt_client.h"
-#include "xla/pjrt/semaphore.h"
 #include "xla/shape.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/stream.h"
@@ -419,12 +418,9 @@ std::vector<transport::ShardInfo> BuildDefaultShards(size_t num_shards) {
 
 KVCacheManagerBase::KVCacheManagerBase(
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
-    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
-    bool unsafe_skip_buffer_lock, int parallelism,
+    std::optional<int> local_port, int parallelism,
     HostBufferAllocator host_allocator, std::optional<std::string> bind_ip,
-    std::optional<size_t> logical_slice_byte_size,
-    std::vector<int64_t> logical_dimensions,
-    std::optional<size_t> logical_physical_size)
+    std::optional<size_t> logical_slice_byte_size)
     : RaidenManagerBase(
           layer_buffers.size(), raiden::DetectShards(layer_buffers),
           logical_slice_byte_size.has_value()
@@ -434,23 +430,21 @@ KVCacheManagerBase::KVCacheManagerBase(
                                              layer_buffers[0][0].shape)),
           local_port, parallelism, bind_ip,
           raiden::DetectNumaNodes(layer_buffers), GetLocalHostNicAddresses()),
-      host_allocator_(host_allocator) {
+      host_allocator_(std::move(host_allocator)) {}
+
+absl::Status KVCacheManagerBase::InitDeviceBuffers(
+    const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
+    std::optional<int> host_blocks_to_allocate, int parallelism,
+    const std::vector<int64_t>& logical_dimensions) {
   if (num_layers_ == 0 || num_shards_ == 0) {
-    return;
+    return absl::OkStatus();
   }
 
   const auto& first_handle = layer_buffers[0][0];
   const xla::Shape& shape = first_handle.shape;
 
-  is_blocked_layout_ = (shape.dimensions().size() == 5);
-
   // max_physical_size_ will be set to the max across all layers below.
   max_physical_size_ = 0;
-
-  if (!first_handle.is_common_buffer && first_handle.c_hold) {
-    c_api_ = first_handle.c_hold->c_api;
-    extension_ = first_handle.c_hold->extension;
-  }
 
   int num_host_blocks = host_blocks_to_allocate.value_or(64);
   host_block_manager_ = std::make_unique<LogicalBlockManager>(num_host_blocks);
@@ -459,7 +453,6 @@ KVCacheManagerBase::KVCacheManagerBase(
   } else if (!shape.dimensions().empty()) {
     major_dim_size_ = shape.dimensions(0);
   }
-  semaphore_ = std::make_unique<xla::Semaphore>(std::max<int>(4, parallelism));
 
   std::vector<LayerInfoBase> layers;
   layers.reserve(num_layers_);
@@ -470,7 +463,8 @@ KVCacheManagerBase::KVCacheManagerBase(
   for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
     const auto& dst_buffers = layer_buffers[layer_idx];
     if (dst_buffers.size() != num_shards_) {
-      throw std::runtime_error("Number of shards mismatch across layers");
+      return absl::InvalidArgumentError(
+          "Number of shards mismatch across layers");
     }
 
     LayerInfoBase layer_info;
@@ -493,7 +487,7 @@ KVCacheManagerBase::KVCacheManagerBase(
       const xla::Shape& layer_shape = layer_buffers[layer_idx][0].shape;
       if (!layer_shape.dimensions().empty() &&
           layer_shape.dimensions(0) != major_dim_size_) {
-        throw std::runtime_error(absl::StrCat(
+        return absl::InvalidArgumentError(absl::StrCat(
             "Layer ", layer_idx, " has major dimension ",
             layer_shape.dimensions(0), " but layer 0 has ", major_dim_size_,
             "; every layer must hold the same number of blocks because they "
@@ -501,7 +495,7 @@ KVCacheManagerBase::KVCacheManagerBase(
       }
       if (device_info.physical_size % static_cast<size_t>(major_dim_size_) !=
           0) {
-        throw std::runtime_error(absl::StrCat(
+        return absl::InvalidArgumentError(absl::StrCat(
             "Layer ", layer_idx, " on-device size ", device_info.physical_size,
             " is not a whole number of blocks at major dimension ",
             major_dim_size_));
@@ -519,27 +513,29 @@ KVCacheManagerBase::KVCacheManagerBase(
 
       shard_info.device_size = dst_buffer.GetOnDeviceSizeInBytes();
       if (shard_info.device_size < device_info.physical_size) {
-        throw std::runtime_error(
+        return absl::InvalidArgumentError(
             "Device buffer shard size smaller than physical size");
       }
 
       // Allocate this layer's host buffer at its OWN row size.
       size_t alloc_size = num_host_blocks * layer_block_byte_size(layer_idx);
-      if (host_allocator) {
+      if (host_allocator_) {
         const xla::PjRtDevice* target_dev = dst_buffer.device;
-        auto host_alloc = host_allocator(alloc_size, target_dev);
+        absl::StatusOr<HostBufferAllocation> host_alloc =
+            host_allocator_(alloc_size, target_dev);
         if (!host_alloc.ok()) {
-          throw std::runtime_error(
+          return absl::Status(
+              host_alloc.status().code(),
               absl::StrCat("Host allocator failed for size: ", alloc_size,
                            ", error: ", host_alloc.status().ToString()));
         }
         HostBufferAllocation allocation = *std::move(host_alloc);
         if (alloc_size > 0 && allocation.ptr == nullptr) {
-          throw std::runtime_error(absl::StrCat(
+          return absl::InternalError(absl::StrCat(
               "Host allocator returned null buffer for size: ", alloc_size));
         }
         if (allocation.size < alloc_size) {
-          throw std::runtime_error(absl::StrCat(
+          return absl::InternalError(absl::StrCat(
               "Host allocator returned undersized buffer. Requested: ",
               alloc_size, ", allocated: ", allocation.size));
         }
@@ -550,7 +546,7 @@ KVCacheManagerBase::KVCacheManagerBase(
         void* ptr = nullptr;
         if (alloc_size > 0) {
           if (posix_memalign(&ptr, 64, alloc_size) != 0) {
-            throw std::runtime_error(absl::StrCat(
+            return absl::ResourceExhaustedError(absl::StrCat(
                 "Failed to allocate host buffer of size: ", alloc_size));
           }
           std::memset(ptr, 0, alloc_size);
@@ -576,49 +572,32 @@ KVCacheManagerBase::KVCacheManagerBase(
   layers_ = StagingArena(
       std::move(layers),
       host_allocator_ ? host_allocator_ : MakeDefaultHostBufferAllocator());
-  {
-    absl::MutexLock lock(allocated_host_dram_bytes_mu_);
-    allocated_host_dram_bytes_ = total_host_dram_bytes;
-  }
-
-  constexpr size_t kPoolSize = 4;
-  dma_pool_ = std::make_unique<NumaThreadPool>(kPoolSize);
-  push_pool_ = std::make_shared<NumaThreadPool>(kPoolSize);
-  pull_pool_ = std::make_unique<NumaThreadPool>(kPoolSize);
-  InitShardLocalRanks();
-  InitBackgroundWorker();
-  UpdateAllocatedOccupancyMetric();
+  FinishInit(total_host_dram_bytes);
+  return absl::OkStatus();
 }
 
 KVCacheManagerBase::KVCacheManagerBase(
-    size_t num_layers, size_t num_shards, size_t slice_byte_size,
-    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
-    int parallelism, HostBufferAllocator host_allocator,
-    std::optional<std::string> bind_ip)
-    : KVCacheManagerBase(num_layers, num_shards,
-                         std::vector<size_t>(num_layers, slice_byte_size),
-                         local_port, host_blocks_to_allocate, parallelism,
-                         std::move(host_allocator), std::move(bind_ip)) {}
-
-KVCacheManagerBase::KVCacheManagerBase(
-    size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
-    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+    size_t num_layers, size_t num_shards,
+    const std::vector<size_t>& slice_byte_sizes, std::optional<int> local_port,
     int parallelism, HostBufferAllocator host_allocator,
     std::optional<std::string> bind_ip)
     : RaidenManagerBase(num_layers, BuildDefaultShards(num_shards),
                         slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0],
                         local_port, parallelism, bind_ip),
-      host_allocator_(host_allocator) {
+      host_allocator_(std::move(host_allocator)) {}
+
+absl::Status KVCacheManagerBase::InitHostBuffers(
+    const std::vector<size_t>& slice_byte_sizes,
+    std::optional<int> host_blocks_to_allocate, int parallelism) {
   int total_blocks = host_blocks_to_allocate.value_or(0);
   host_block_manager_ = std::make_unique<LogicalBlockManager>(total_blocks);
-  semaphore_ = std::make_unique<xla::Semaphore>(std::max<int>(4, parallelism));
 
   // Each array's own stride, so a heterogeneous host-side mirror allocates
   // each buffer at the width that will address it.  Arrays past the end of
   // the vector fall back to slice_byte_size_ via layer_block_byte_size().
   layer_row_bytes_.reserve(num_layers_);
   if (slice_byte_sizes.size() != num_layers_) {
-    throw std::runtime_error(
+    return absl::InvalidArgumentError(
         "slice_byte_sizes.size() != num_layers_; slice_byte_sizes must have "
         "length equal to num_layers");
   }
@@ -638,20 +617,22 @@ KVCacheManagerBase::KVCacheManagerBase(
 
       int num_host_blocks = host_blocks_to_allocate.value_or(0);
       size_t alloc_size = num_host_blocks * layer_block_byte_size(layer_idx);
-      if (host_allocator) {
-        auto host_alloc = host_allocator(alloc_size, nullptr);
+      if (host_allocator_) {
+        absl::StatusOr<HostBufferAllocation> host_alloc =
+            host_allocator_(alloc_size, nullptr);
         if (!host_alloc.ok()) {
-          throw std::runtime_error(
+          return absl::Status(
+              host_alloc.status().code(),
               absl::StrCat("Host allocator failed for size: ", alloc_size,
                            ", error: ", host_alloc.status().ToString()));
         }
         HostBufferAllocation allocation = *std::move(host_alloc);
         if (alloc_size > 0 && allocation.ptr == nullptr) {
-          throw std::runtime_error(absl::StrCat(
+          return absl::InternalError(absl::StrCat(
               "Host allocator returned null buffer for size: ", alloc_size));
         }
         if (allocation.size < alloc_size) {
-          throw std::runtime_error(absl::StrCat(
+          return absl::InternalError(absl::StrCat(
               "Host allocator returned undersized buffer. Requested: ",
               alloc_size, ", allocated: ", allocation.size));
         }
@@ -662,7 +643,7 @@ KVCacheManagerBase::KVCacheManagerBase(
         void* ptr = nullptr;
         if (alloc_size > 0) {
           if (posix_memalign(&ptr, 64, alloc_size) != 0) {
-            throw std::runtime_error(absl::StrCat(
+            return absl::ResourceExhaustedError(absl::StrCat(
                 "Failed to allocate host buffer of size: ", alloc_size));
           }
           std::memset(ptr, 0, alloc_size);
@@ -682,6 +663,11 @@ KVCacheManagerBase::KVCacheManagerBase(
   layers_ = StagingArena(
       std::move(layers),
       host_allocator_ ? host_allocator_ : MakeDefaultHostBufferAllocator());
+  FinishInit(total_host_dram_bytes);
+  return absl::OkStatus();
+}
+
+void KVCacheManagerBase::FinishInit(size_t total_host_dram_bytes) {
   {
     absl::MutexLock lock(allocated_host_dram_bytes_mu_);
     allocated_host_dram_bytes_ = total_host_dram_bytes;
@@ -693,6 +679,48 @@ KVCacheManagerBase::KVCacheManagerBase(
   InitShardLocalRanks();
   InitBackgroundWorker();
   UpdateAllocatedOccupancyMetric();
+}
+
+absl::StatusOr<std::unique_ptr<KVCacheManagerBase>> KVCacheManagerBase::Create(
+    const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
+    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+    bool unsafe_skip_buffer_lock, int parallelism,
+    HostBufferAllocator host_allocator, std::optional<std::string> bind_ip,
+    std::optional<size_t> logical_slice_byte_size,
+    std::vector<int64_t> logical_dimensions,
+    std::optional<size_t> logical_physical_size) {
+  (void)unsafe_skip_buffer_lock;
+  (void)logical_physical_size;
+  auto mgr = absl::WrapUnique(new KVCacheManagerBase(
+      layer_buffers, local_port, parallelism, std::move(host_allocator),
+      std::move(bind_ip), logical_slice_byte_size));
+  ABSL_RETURN_IF_ERROR(mgr->InitDeviceBuffers(
+      layer_buffers, host_blocks_to_allocate, parallelism, logical_dimensions));
+  return mgr;
+}
+
+absl::StatusOr<std::unique_ptr<KVCacheManagerBase>> KVCacheManagerBase::Create(
+    size_t num_layers, size_t num_shards, size_t slice_byte_size,
+    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+    int parallelism, HostBufferAllocator host_allocator,
+    std::optional<std::string> bind_ip) {
+  return Create(num_layers, num_shards,
+                std::vector<size_t>(num_layers, slice_byte_size), local_port,
+                host_blocks_to_allocate, parallelism, std::move(host_allocator),
+                std::move(bind_ip));
+}
+
+absl::StatusOr<std::unique_ptr<KVCacheManagerBase>> KVCacheManagerBase::Create(
+    size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
+    std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
+    int parallelism, HostBufferAllocator host_allocator,
+    std::optional<std::string> bind_ip) {
+  auto mgr = absl::WrapUnique(new KVCacheManagerBase(
+      num_layers, num_shards, slice_byte_sizes, local_port, parallelism,
+      std::move(host_allocator), std::move(bind_ip)));
+  ABSL_RETURN_IF_ERROR(mgr->InitHostBuffers(
+      slice_byte_sizes, host_blocks_to_allocate, parallelism));
+  return mgr;
 }
 
 void KVCacheManagerBase::InitBackgroundWorker() {
@@ -1468,21 +1496,15 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2hReadExplicit(
     tpu_raiden::transport::BlockReceivedCallback on_block_received) {
   // Copy the transport pointer under lock and execute SyncPull unlocked to
   // avoid blocking concurrent transfers.
-  tpu_raiden::transport::BlockTransport* transport_server = nullptr;
-  {
-    // TODO: Initialize server_ eagerly in every constructor and remove the
-    // post-construction InitTransportServer() call sites. Then remove the lock.
-    absl::MutexLock lock(server_init_mu_);
-    transport_server = server_.get();
-  }
-  if (!transport_server) {
+  tpu_raiden::transport::BlockTransport* transport = transport_server();
+  if (!transport) {
     return absl::FailedPreconditionError("Transport server is not running");
   }
   ABSL_ASSIGN_OR_RETURN(
       std::vector<int> allocated_ids,
-      transport_server->SyncPull({peer}, src_block_ids, local_block_ids,
-                                 explicit_dst_ptrs, parallelism, major_order,
-                                 on_block_received, kLeaseAuthorizedPullUuid));
+      transport->SyncPull({peer}, src_block_ids, local_block_ids,
+                          explicit_dst_ptrs, parallelism, major_order,
+                          on_block_received, kLeaseAuthorizedPullUuid));
   return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
 }
 
@@ -2261,12 +2283,10 @@ absl::Status KVCacheManagerBase::RegisterPools(std::vector<PoolSpec> pools,
     // Prefer the device buffer size; fall back to the host mirror; validate
     // internal consistency only (-1) when neither is known yet.
     int64_t storage_bytes = -1;
-    bool device_backed = false;
     if (pool.storage_index < buffer_holds_.size() &&
         buffer_holds_[pool.storage_index].physical_size > 0) {
       storage_bytes =
           static_cast<int64_t>(buffer_holds_[pool.storage_index].physical_size);
-      device_backed = true;
     } else {
       const size_t host_size = GetHostSize(pool.storage_index, 0);
       if (host_size > 0) {
@@ -2284,7 +2304,6 @@ absl::Status KVCacheManagerBase::RegisterPools(std::vector<PoolSpec> pools,
                        ": staging_blocks_per_request must be "
                        ">= 0"));
     }
-    (void)device_backed;
   }
   // Host staging is sized at the uniform layer-0 slice by the constructors,
   // which can under-cover heterogeneous device storages. Per storage this
@@ -2886,23 +2905,6 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
   return local_futures;
 }
 
-absl::Status KVCacheManagerBase::OnSingleBlockReceived(int block_id,
-                                                       size_t size_bytes) {
-  RecvCallback cb;
-  {
-    absl::MutexLock l(recv_mu_);
-    auto it = recv_callbacks_.find(block_id);
-    if (it != recv_callbacks_.end()) {
-      cb = std::move(it->second);
-      recv_callbacks_.erase(it);
-    }
-  }
-  if (cb) {
-    return cb(block_id, size_bytes);
-  }
-  return absl::OkStatus();
-}
-
 void KVCacheManagerBase::RegisterBlockReadinessCallback(
     size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
     transport::BlockTransportDelegate::HostBlockReadyCallback cb) {
@@ -2983,12 +2985,8 @@ absl::Status KVCacheManagerBase::PushKVCacheResharded(
               << "): uuid=" << request.uuid() << ", numa=" << numa;
     }
 
-    transport::BlockTransport* transport_server = nullptr;
-    {
-      absl::MutexLock lock(server_init_mu_);
-      transport_server = server_.get();
-    }
-    if (!transport_server) {
+    transport::BlockTransport* transport = transport_server();
+    if (!transport) {
       LOG(ERROR)
           << "Transport server is not running during resharded push for uuid "
           << request.uuid();
@@ -3008,7 +3006,7 @@ absl::Status KVCacheManagerBase::PushKVCacheResharded(
 
       if (src_block_ids.empty()) continue;
 
-      transport_server
+      transport
           ->AsyncPush({peer}, src_block_ids, dst_block_ids, /*parallelism=*/1,
                       transport::MajorOrder::kLayerMajor, request.uuid(),
                       /*layer_idx=*/-1)
@@ -3188,13 +3186,9 @@ absl::Status KVCacheManagerBase::UnregisterActivePlanDirect(uint64_t uuid) {
   }
   // Receive-progress counters key on the uuid; drop them with the plan so a
   // finished, failed, or timed-out uuid can be safely reused.
-  transport::BlockTransport* transport_server = nullptr;
-  {
-    absl::MutexLock lock(server_init_mu_);
-    transport_server = server_.get();
-  }
-  if (transport_server != nullptr) {
-    transport_server->ForgetPushProgress(uuid);
+  transport::BlockTransport* transport = transport_server();
+  if (transport != nullptr) {
+    transport->ForgetPushProgress(uuid);
   }
   VLOG(1) << "UnregisterActivePlan: Removed plan for UUID " << uuid;
   return absl::OkStatus();

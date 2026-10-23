@@ -37,10 +37,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "xla/pjrt/c/pjrt_c_api.h"
-#include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "xla/pjrt/pjrt_client.h"
-#include "xla/pjrt/semaphore.h"
 #include "xla/stream_executor/stream.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -87,9 +84,6 @@ struct BlockMetadata {
   xla::PjRtClient* pjrt_client = nullptr;
 };
 
-using RecvCallback =
-    std::function<absl::Status(int block_id, size_t size_bytes)>;
-
 namespace kv_cache {
 
 // Defined in kv_cache_store_backend_factory.h. Forward-declared so that this
@@ -122,9 +116,10 @@ using HostBlockId = int64_t;
 
 class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
  public:
-  // Core C++ Constructor wrapping raw PJRT buffers directly (used by JAX and
-  // PyTorch E2E)
-  KVCacheManagerBase(
+  // Creates a manager wrapping raw PJRT buffers in |layer_buffers|
+  // (outer index = layer, inner index = shard) and allocates one host staging
+  // buffer per shard.
+  static absl::StatusOr<std::unique_ptr<KVCacheManagerBase>> Create(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
@@ -135,24 +130,23 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::vector<int64_t> logical_dimensions = {},
       std::optional<size_t> logical_physical_size = std::nullopt);
 
-  // Standard CPU-only constructor for remote workers E2E.
-  KVCacheManagerBase(size_t num_layers, size_t num_shards,
-                     size_t slice_byte_size,
-                     std::optional<int> local_port = std::nullopt,
-                     std::optional<int> host_blocks_to_allocate = std::nullopt,
-                     int parallelism = 1,
-                     HostBufferAllocator host_allocator = nullptr,
-                     std::optional<std::string> bind_ip = std::nullopt);
+  // Creates a CPU-only manager (no device buffers) for remote workers and
+  // testing, with |slice_byte_size| bytes per layer block.
+  static absl::StatusOr<std::unique_ptr<KVCacheManagerBase>> Create(
+      size_t num_layers, size_t num_shards, size_t slice_byte_size,
+      std::optional<int> local_port = std::nullopt,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      int parallelism = 1, HostBufferAllocator host_allocator = nullptr,
+      std::optional<std::string> bind_ip = std::nullopt);
 
-  // same as above, but with a vector of slice byte sizes for heterogeneous
-  // registration.
-  KVCacheManagerBase(size_t num_layers, size_t num_shards,
-                     std::vector<size_t> slice_byte_sizes,
-                     std::optional<int> local_port = std::nullopt,
-                     std::optional<int> host_blocks_to_allocate = std::nullopt,
-                     int parallelism = 1,
-                     HostBufferAllocator host_allocator = nullptr,
-                     std::optional<std::string> bind_ip = std::nullopt);
+  // As above, with heterogeneous per-layer |slice_byte_sizes|.
+  static absl::StatusOr<std::unique_ptr<KVCacheManagerBase>> Create(
+      size_t num_layers, size_t num_shards,
+      std::vector<size_t> slice_byte_sizes,
+      std::optional<int> local_port = std::nullopt,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      int parallelism = 1, HostBufferAllocator host_allocator = nullptr,
+      std::optional<std::string> bind_ip = std::nullopt);
 
   ~KVCacheManagerBase() override;
 
@@ -852,12 +846,39 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   }
 
  protected:
-  const PJRT_Api* c_api_ = nullptr;
-  const PJRT_RawBuffer_Extension* extension_ = nullptr;
+  // Two-phase construction for Create() and subclasses: the constructors only
+  // initialize the base class and member fields; the matching Init*()
+  // validates geometry, allocates host staging buffers, and starts background
+  // thread pools. An instance whose Init*() failed must be destroyed, not
+  // used.
+  //
+  // Device-buffer variant; follow with InitDeviceBuffers().
+  KVCacheManagerBase(
+      const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
+      std::optional<int> local_port = std::nullopt, int parallelism = 1,
+      HostBufferAllocator host_allocator = nullptr,
+      std::optional<std::string> bind_ip = std::nullopt,
+      std::optional<size_t> logical_slice_byte_size = std::nullopt);
+  // CPU-only variant; follow with InitHostBuffers().
+  KVCacheManagerBase(size_t num_layers, size_t num_shards,
+                     const std::vector<size_t>& slice_byte_sizes,
+                     std::optional<int> local_port = std::nullopt,
+                     int parallelism = 1,
+                     HostBufferAllocator host_allocator = nullptr,
+                     std::optional<std::string> bind_ip = std::nullopt);
+
+  absl::Status InitDeviceBuffers(
+      const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      int parallelism = 1, const std::vector<int64_t>& logical_dimensions = {});
+  absl::Status InitHostBuffers(
+      const std::vector<size_t>& slice_byte_sizes,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      int parallelism = 1);
+
   size_t max_physical_size_ = 0;
   int64_t staging_num_slots_ = 0;
   int64_t staging_max_major_per_slot_ = 0;
-  bool is_blocked_layout_ = false;
 
   std::unique_ptr<LogicalBlockManager> host_block_manager_;
 
@@ -927,7 +948,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     return host_block_manager_->Allocate(num_blocks, /*lock=*/true);
   }
 
-  absl::Status OnSingleBlockReceived(int block_id, size_t size_bytes) override;
+  // Per-block receive completion is tracked by the transfer sessions, not here.
+  absl::Status OnSingleBlockReceived(int block_id, size_t size_bytes) override {
+    return absl::OkStatus();
+  }
 
   virtual absl::StatusOr<std::vector<raiden::PjRtCopyFuture>> DispatchD2hChunks(
       const std::vector<int64_t>& src_offsets,
@@ -941,6 +965,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   void UpdateAllocatedOccupancyMetric() const;
 
  private:
+  void FinishInit(size_t total_host_dram_bytes);
+
   // Asynchronous on-chip H2D offload enqueued to the background worker queue.
   virtual absl::StatusOr<raiden::PjRtCopyFuture> H2dAsyncDispatch(
       const std::vector<int64_t>& src_offsets_major_dim = {},
@@ -1014,11 +1040,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
                                              std::optional<uint64_t> uuid);
 
   HostBufferAllocator host_allocator_ = nullptr;
-  std::unique_ptr<xla::Semaphore> semaphore_;
-
-  absl::Mutex recv_mu_;
-  absl::flat_hash_map<int, RecvCallback> recv_callbacks_
-      ABSL_GUARDED_BY(recv_mu_);
 
   mutable absl::Mutex plans_mu_;
   struct RegisteredPlan {

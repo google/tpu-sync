@@ -30,6 +30,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/synchronization/mutex.h"
@@ -69,13 +70,16 @@ class TestManager : public KVCacheManagerWithTransfer {
  public:
   explicit TestManager(double timeout_s = 30.0)
       : KVCacheManagerWithTransfer(
-            /*num_layers=*/1, /*num_shards=*/1,
-            /*slice_byte_size=*/128,
-            /*local_port=*/std::nullopt,
-            /*host_blocks_to_allocate=*/std::make_optional(4),
-            /*parallelism=*/1, /*node_id=*/0,
-            /*local_control_port=*/-1, /*max_blocks=*/0, /*num_slots=*/0,
-            timeout_s) {}
+            *kv_cache::KVCacheManagerBase::Create(
+                /*num_layers=*/1, /*num_shards=*/1,
+                /*slice_byte_size=*/128,
+                /*local_port=*/std::nullopt,
+                /*host_blocks_to_allocate=*/std::make_optional(4),
+                /*parallelism=*/1),
+            /*node_id=*/0,
+            /*local_control_port=*/-1, timeout_s) {
+    CHECK_OK(InitTransfer(/*max_blocks=*/0, /*num_slots=*/0));
+  }
 
   void FinishPoolReshardRecvPool(uint64_t uuid, size_t pool_idx,
                                  const absl::Status& status) {
@@ -99,7 +103,7 @@ class TestManager : public KVCacheManagerWithTransfer {
   // Stages plans in per-transfer host blocks, as
   // TPU_RAIDEN_DYNAMIC_HOST_STAGING=1 does for device-attached managers.
   void EnableDemandStaging() {
-    staging_allocator_ = CreateStagingBlockAllocator(
+    staging_allocator_ = *CreateStagingBlockAllocator(
         base_.get(), staging_allocator_->num_slots(),
         staging_allocator_->max_blocks(), /*dynamic_host_staging=*/true);
   }
@@ -597,9 +601,10 @@ class DeviceBackedTestBase : public kv_cache::KVCacheManagerBase {
  public:
   DeviceBackedTestBase(size_t slice_byte_size, int host_blocks,
                        size_t physical_size)
-      : KVCacheManagerBase(/*num_layers=*/1, /*num_shards=*/1, slice_byte_size,
-                           /*local_port=*/std::nullopt,
-                           std::make_optional(host_blocks)) {
+      : KVCacheManagerBase(/*num_layers=*/1, /*num_shards=*/1,
+                           /*slice_byte_sizes=*/{slice_byte_size}) {
+    CHECK_OK(
+        InitHostBuffers({slice_byte_size}, std::make_optional(host_blocks)));
     buffer_holds_.resize(1);
     buffer_holds_[0].holds.resize(1);
     buffer_holds_[0].physical_size = physical_size;
@@ -615,8 +620,9 @@ class BoundedPoolTestManager : public KVCacheManagerWithTransfer {
       : KVCacheManagerWithTransfer(
             std::make_unique<DeviceBackedTestBase>(slice_byte_size, host_blocks,
                                                    physical_size),
-            /*node_id=*/0, /*local_control_port=*/-1, /*max_blocks=*/0,
-            /*num_slots=*/0, /*timeout_s=*/30.0) {}
+            /*node_id=*/0, /*local_control_port=*/-1, /*timeout_s=*/30.0) {
+    CHECK_OK(InitTransfer(/*max_blocks=*/0, /*num_slots=*/0));
+  }
 
   using KVCacheManagerWithTransfer::PoolReshardRegisterRecv;
 };

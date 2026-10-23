@@ -33,9 +33,11 @@
 #include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -64,10 +66,12 @@ class TestKVCacheManager : public KVCacheManagerBase {
  public:
   TestKVCacheManager(size_t num_layers, size_t num_shards,
                      size_t slice_byte_size, int host_blocks = 0)
-      : KVCacheManagerBase(
-            num_layers, num_shards, slice_byte_size,
-            /*local_port=*/std::nullopt,
-            host_blocks > 0 ? std::make_optional(host_blocks) : std::nullopt) {
+      : KVCacheManagerBase(num_layers, num_shards,
+                           /*slice_byte_sizes=*/
+                           std::vector<size_t>(num_layers, slice_byte_size)) {
+    CHECK_OK(InitHostBuffers(
+        std::vector<size_t>(num_layers, slice_byte_size),
+        host_blocks > 0 ? std::make_optional(host_blocks) : std::nullopt));
     buffer_holds_.resize(num_layers);
     for (size_t l = 0; l < num_layers; ++l) {
       buffer_holds_[l].holds.resize(num_shards);
@@ -514,18 +518,20 @@ TEST(KVCacheManagerTest, ExplicitPoolTransportEnumeratesAllPools) {
 }
 
 TEST(KVCacheManagerTest, PoolBlockCopiesRejectHostOnlyManager) {
-  KVCacheManagerBase manager(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/64,
-                             /*local_port=*/std::nullopt,
-                             /*host_blocks_to_allocate=*/2);
-  ABSL_ASSERT_OK(manager.RegisterPools({DensePool("kind_a", 0, 0, 64, 2)}));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManagerBase> manager,
+      KVCacheManagerBase::Create(/*num_layers=*/1, /*num_shards=*/1,
+                                 /*slice_byte_size=*/64,
+                                 /*local_port=*/std::nullopt,
+                                 /*host_blocks_to_allocate=*/2));
+  ABSL_ASSERT_OK(manager->RegisterPools({DensePool("kind_a", 0, 0, 64, 2)}));
 
-  auto d2h = manager.D2hPoolBlocks(/*pool_idx=*/0, /*block_ids=*/{0});
+  auto d2h = manager->D2hPoolBlocks(/*pool_idx=*/0, /*block_ids=*/{0});
   ASSERT_FALSE(d2h.ok());
   EXPECT_EQ(d2h.status().code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_THAT(d2h.status().message(), testing::HasSubstr("host-only"));
 
-  auto h2d = manager.H2dPoolBlocks(/*pool_idx=*/0, /*block_ids=*/{0});
+  auto h2d = manager->H2dPoolBlocks(/*pool_idx=*/0, /*block_ids=*/{0});
   ASSERT_FALSE(h2d.ok());
   EXPECT_EQ(h2d.status().code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_THAT(h2d.status().message(), testing::HasSubstr("host-only"));
@@ -536,14 +542,16 @@ TEST(KVCacheManagerTest, PoolBlockCopiesRejectHostOnlyManager) {
 // downstream is undefined behaviour on a null pointer, and a nonzero rank
 // offset would carry it past the null check in ValidateExternalRangeLocked.
 TEST(KVCacheManagerTest, CopyExternalObjectBlocksRejectsNullHostBase) {
-  KVCacheManagerBase manager(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/64,
-                             /*local_port=*/std::nullopt,
-                             /*host_blocks_to_allocate=*/2);
-  manager.AttachPlaceholderDeviceHoldForTest();
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManagerBase> manager,
+      KVCacheManagerBase::Create(/*num_layers=*/1, /*num_shards=*/1,
+                                 /*slice_byte_size=*/64,
+                                 /*local_port=*/std::nullopt,
+                                 /*host_blocks_to_allocate=*/2));
+  manager->AttachPlaceholderDeviceHoldForTest();
 
   const absl::Status status = manager
-                                  .CopyExternalObjectBlocks(
+                                  ->CopyExternalObjectBlocks(
                                       /*block_ids=*/{0},
                                       /*host_block_bases=*/{nullptr},
                                       /*num_ranks=*/1, /*page_nbytes=*/64,
@@ -630,13 +638,15 @@ TEST(KVCacheManagerTest, H2dFailsWithNegativeOffsets) {
 
 TEST(KVCacheManagerTest, D2hFailsWithCpuOnlyManager) {
   // Use the base class directly to test CPU-only behavior
-  KVCacheManagerBase manager(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/128);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManagerBase> manager,
+      KVCacheManagerBase::Create(/*num_layers=*/1, /*num_shards=*/1,
+                                 /*slice_byte_size=*/128));
   std::vector<int64_t> src_offsets = {0};
   std::vector<int64_t> dst_offsets = {0};
   std::vector<int64_t> sizes = {1};
 
-  auto status = manager.D2h(src_offsets, dst_offsets, sizes);
+  auto status = manager->D2h(src_offsets, dst_offsets, sizes);
   EXPECT_FALSE(status.ok());
   EXPECT_EQ(status.status().code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_THAT(status.status().message(),
@@ -660,11 +670,13 @@ TEST(KVCacheManagerTest, H2dFailsWithOutOfRangeLayer) {
 }
 
 TEST(KVCacheManagerTest, H2hReadExplicitAcceptsParallelism) {
-  KVCacheManagerBase manager(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/128);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManagerBase> manager,
+      KVCacheManagerBase::Create(/*num_layers=*/1, /*num_shards=*/1,
+                                 /*slice_byte_size=*/128));
   std::vector<uint8_t*> ptrs = {nullptr};
-  auto status = manager.H2hReadExplicit("127.0.0.1:8080", {0}, {0}, ptrs,
-                                        /*parallelism=*/2);
+  auto status = manager->H2hReadExplicit("127.0.0.1:8080", {0}, {0}, ptrs,
+                                         /*parallelism=*/2);
   EXPECT_FALSE(status.ok());
   EXPECT_EQ(status.status().code(), absl::StatusCode::kUnavailable);
   EXPECT_THAT(status.status().message(),
@@ -929,10 +941,12 @@ class TestH2dKVCacheManager : public TestKVCacheManager {
 };
 
 TEST(KVCacheManagerTest, D2hWriteFailsWithCpuOnlyManager) {
-  KVCacheManagerBase manager(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/128);
-  auto res = manager.D2hWrite("127.0.0.1:8080", /*src_device=*/{0},
-                              /*src_host=*/{0}, /*dst_host=*/{0}, {1});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManagerBase> manager,
+      KVCacheManagerBase::Create(/*num_layers=*/1, /*num_shards=*/1,
+                                 /*slice_byte_size=*/128));
+  auto res = manager->D2hWrite("127.0.0.1:8080", /*src_device=*/{0},
+                               /*src_host=*/{0}, /*dst_host=*/{0}, {1});
   EXPECT_FALSE(res.ok());
   EXPECT_EQ(res.status().code(), absl::StatusCode::kFailedPrecondition);
   EXPECT_THAT(res.status().message(),
@@ -1880,12 +1894,13 @@ TEST(KVCacheManagerTest, MultiSliceOffloadAndRecallContentValidity) {
           raiden::RaidenBufferHandle::Acquire(w.pjrt_buffers[l][0].get()));
     }
 
-    w.manager = std::make_unique<KVCacheManagerBase>(
-        w.layer_handles, /*local_port=*/std::nullopt,
-        /*host_blocks_to_allocate=*/kNumBlocks,
-        /*unsafe_skip_buffer_lock=*/true, /*parallelism=*/1,
-        /*host_allocator=*/nullptr, /*bind_ip=*/std::nullopt,
-        /*logical_slice_byte_size=*/kBlockSize);
+    TF_ASSERT_OK_AND_ASSIGN(
+        w.manager, KVCacheManagerBase::Create(
+                       w.layer_handles, /*local_port=*/std::nullopt,
+                       /*host_blocks_to_allocate=*/kNumBlocks,
+                       /*unsafe_skip_buffer_lock=*/true, /*parallelism=*/1,
+                       /*host_allocator=*/nullptr, /*bind_ip=*/std::nullopt,
+                       /*logical_slice_byte_size=*/kBlockSize));
 
     w.block_keys.reserve(kNumBlocks);
     w.dev_block_ids.reserve(kNumBlocks);
@@ -2046,12 +2061,15 @@ TEST(KVCacheManagerTest, RegisterKVBackendsPropagatesParallelismTpSize) {
     std::filesystem::remove_all(scratch_dir, ec);
   });
 
-  KVCacheManagerBase manager(/*buffers=*/{}, /*local_port=*/std::nullopt,
-                             /*host_blocks_to_allocate=*/4,
-                             /*unsafe_skip_buffer_lock=*/true,
-                             /*parallelism=*/1, /*host_allocator=*/nullptr,
-                             /*bind_ip=*/std::nullopt,
-                             /*logical_slice_byte_size=*/512);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManagerBase> manager,
+      KVCacheManagerBase::Create(/*layer_buffers=*/{},
+                                 /*local_port=*/std::nullopt,
+                                 /*host_blocks_to_allocate=*/4,
+                                 /*unsafe_skip_buffer_lock=*/true,
+                                 /*parallelism=*/1, /*host_allocator=*/nullptr,
+                                 /*bind_ip=*/std::nullopt,
+                                 /*logical_slice_byte_size=*/512));
 
   BackendConfig cfg;
   cfg.type = "posix";
@@ -2060,9 +2078,9 @@ TEST(KVCacheManagerTest, RegisterKVBackendsPropagatesParallelismTpSize) {
   cfg.SetProperty("root_dir", scratch_dir);
   cfg.SetProperty("model_name", "test_model_tp");
 
-  manager.RegisterKVBackends({cfg});
+  manager->RegisterKVBackends({cfg});
 
-  auto backend = manager.GetKVBackend("posix");
+  auto backend = manager->GetKVBackend("posix");
   ASSERT_NE(backend, nullptr);
   auto mapper = backend->mapper();
   ASSERT_NE(mapper, nullptr);
@@ -2098,15 +2116,18 @@ class RegisterKVBackendsTopologyTest : public ::testing::Test {
   }
 
   static std::unique_ptr<KVCacheManagerBase> MakeManager() {
-    return std::make_unique<KVCacheManagerBase>(
-        /*layer_buffers=*/
-        std::vector<std::vector<raiden::RaidenBufferHandle>>{},
-        /*local_port=*/std::nullopt,
-        /*host_blocks_to_allocate=*/4,
-        /*unsafe_skip_buffer_lock=*/true,
-        /*parallelism=*/1, /*host_allocator=*/nullptr,
-        /*bind_ip=*/std::nullopt,
-        /*logical_slice_byte_size=*/512);
+    absl::StatusOr<std::unique_ptr<KVCacheManagerBase>> manager =
+        KVCacheManagerBase::Create(
+            /*layer_buffers=*/
+            std::vector<std::vector<raiden::RaidenBufferHandle>>{},
+            /*local_port=*/std::nullopt,
+            /*host_blocks_to_allocate=*/4,
+            /*unsafe_skip_buffer_lock=*/true,
+            /*parallelism=*/1, /*host_allocator=*/nullptr,
+            /*bind_ip=*/std::nullopt,
+            /*logical_slice_byte_size=*/512);
+    CHECK_OK(manager.status());
+    return *std::move(manager);
   }
 
   std::string scratch_dir_;

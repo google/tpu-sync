@@ -48,13 +48,6 @@ class MetricsCollector;
 namespace kv_cache {
 namespace jax {
 
-struct UnpackedCache {
-  std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers;
-#ifndef WITHOUT_PYTHON
-  nanobind::list device_arrays;
-#endif
-};
-
 class NumaAwareKVCacheManager {
  public:
   NumaAwareKVCacheManager(const NumaAwareKVCacheManager&) = delete;
@@ -99,12 +92,6 @@ class NumaAwareKVCacheManager {
       int64_t node_id, int64_t local_control_port, int64_t max_blocks,
       int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
       int parallelism, bool enable_shm = false);
-
-  // FFI metadata factory (cache-only by default).
-  static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
-      size_t num_layers, size_t num_shards, size_t slice_byte_size,
-      std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
-      int parallelism = 1);
 
   // Test-only factory for sub-manager mock injection.
   static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
@@ -256,16 +243,6 @@ class NumaAwareKVCacheManager {
   explicit NumaAwareKVCacheManager(nanobind::list device_arrays)
       : device_arrays_(std::move(device_arrays)) {}
 
-  static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
-      UnpackedCache&& cache, std::optional<int> local_port,
-      std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
-      int parallelism, int64_t node_id = 0, bool enable_shm = false);
-
-  static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
-      UnpackedCache&& cache, int64_t node_id, int64_t local_control_port,
-      int64_t max_blocks, int64_t num_slots, double timeout_s,
-      bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm = false);
-
   std::optional<nanobind::list> device_arrays_;
 #endif
 
@@ -347,14 +324,6 @@ class KVCacheManager {
       int64_t node_id, int64_t local_control_port, int64_t max_blocks,
       int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
       int parallelism, int raiden_worker_port = 0,
-      std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt);
-
-  // FFI metadata factory (cache-only by default).
-  static absl::StatusOr<std::unique_ptr<KVCacheManager>> Create(
-      size_t num_layers, size_t num_shards, size_t slice_byte_size,
-      std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
-      int parallelism = 1, int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt);
 

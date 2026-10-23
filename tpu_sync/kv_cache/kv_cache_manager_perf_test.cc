@@ -249,13 +249,15 @@ void RunBenchmarkScenarioA(TpuPjrtManager* manager,
 
   const int64_t host_blocks_to_allocate = kNumBlocks;
 
-  auto engine = std::make_unique<kv_cache::KVCacheManagerBase>(
-      layer_buffers,
-      /*local_port=*/std::nullopt,
-      /*host_blocks_to_allocate=*/host_blocks_to_allocate,
-      /*unsafe_skip_buffer_lock=*/true,
-      /*parallelism=*/1,
-      /*host_allocator=*/allocator_fn);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<kv_cache::KVCacheManagerBase> engine,
+      kv_cache::KVCacheManagerBase::Create(
+          layer_buffers,
+          /*local_port=*/std::nullopt,
+          /*host_blocks_to_allocate=*/host_blocks_to_allocate,
+          /*unsafe_skip_buffer_lock=*/true,
+          /*parallelism=*/1,
+          /*host_allocator=*/allocator_fn));
 
   // 4. Warmup Phase
   constexpr int kWarmupIterations = 3;
@@ -432,13 +434,15 @@ void RunBenchmarkScenarioB(TpuPjrtManager* manager,
 
   const int64_t host_blocks_to_allocate = kNumBlocks;
 
-  auto engine = std::make_unique<kv_cache::KVCacheManagerBase>(
-      layer_buffers,
-      /*local_port=*/std::nullopt,
-      /*host_blocks_to_allocate=*/host_blocks_to_allocate,
-      /*unsafe_skip_buffer_lock=*/true,
-      /*parallelism=*/1,
-      /*host_allocator=*/allocator_fn);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<kv_cache::KVCacheManagerBase> engine,
+      kv_cache::KVCacheManagerBase::Create(
+          layer_buffers,
+          /*local_port=*/std::nullopt,
+          /*host_blocks_to_allocate=*/host_blocks_to_allocate,
+          /*unsafe_skip_buffer_lock=*/true,
+          /*parallelism=*/1,
+          /*host_allocator=*/allocator_fn));
 
   // 4. Warmup Phase
   constexpr int kWarmupIterations = 3;

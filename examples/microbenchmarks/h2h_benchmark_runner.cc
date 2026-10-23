@@ -337,6 +337,22 @@ int connect_to_control_server(const std::string& host, int port) {
   return -1;
 }
 
+std::unique_ptr<tpu_raiden::kv_cache::KVCacheManagerBase>
+CreateBenchmarkManager(size_t num_layers, size_t num_shards, size_t block_size,
+                       int num_blocks, int parallelism,
+                       const std::string& bind_ip) {
+  absl::StatusOr<std::unique_ptr<tpu_raiden::kv_cache::KVCacheManagerBase>>
+      mgr = tpu_raiden::kv_cache::KVCacheManagerBase::Create(
+          num_layers, num_shards, block_size, /*local_port=*/std::nullopt,
+          /*host_blocks_to_allocate=*/num_blocks, parallelism,
+          /*host_allocator=*/nullptr, /*bind_ip=*/bind_ip);
+  if (!mgr.ok()) {
+    std::cerr << "Failed to create manager: " << mgr.status() << std::endl;
+    return nullptr;
+  }
+  return *std::move(mgr);
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -466,12 +482,13 @@ int main(int argc, char* argv[]) {
           tpu_raiden::PinCurrentThreadToNumaNode(iface.numa_node);
         }
 
-        manager = std::make_unique<tpu_raiden::kv_cache::KVCacheManagerBase>(
-            kNumLayers, kNumShards, block_size,
-            /*local_port=*/std::nullopt,
-            /*host_blocks_to_allocate=*/num_blocks, parallelism,
-            /*host_allocator=*/nullptr,
-            /*bind_ip=*/iface.ip_address);
+        manager =
+            CreateBenchmarkManager(kNumLayers, kNumShards, block_size,
+                                   num_blocks, parallelism, iface.ip_address);
+        if (manager == nullptr) {
+          alloc_success = false;
+          return;
+        }
 
         auto dst_block_ids_or =
             manager->host_block_manager()->Allocate(num_blocks, /*lock=*/true);
@@ -723,12 +740,12 @@ int main(int argc, char* argv[]) {
           tpu_raiden::PinCurrentThreadToNumaNode(local_numa);
         }
 
-        manager = std::make_unique<tpu_raiden::kv_cache::KVCacheManagerBase>(
-            kNumLayers, kNumShards, block_size,
-            /*local_port=*/std::nullopt,
-            /*host_blocks_to_allocate=*/num_blocks, parallelism,
-            /*host_allocator=*/nullptr,
-            /*bind_ip=*/local_ip);
+        manager = CreateBenchmarkManager(kNumLayers, kNumShards, block_size,
+                                         num_blocks, parallelism, local_ip);
+        if (manager == nullptr) {
+          alloc_success = false;
+          return;
+        }
 
         auto src_block_ids_or =
             manager->host_block_manager()->Allocate(num_blocks, /*lock=*/true);

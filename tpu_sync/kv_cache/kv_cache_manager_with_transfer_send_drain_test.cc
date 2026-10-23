@@ -77,8 +77,9 @@ class TestManager : public KVCacheManagerWithTransfer {
   explicit TestManager(size_t num_layers, double timeout_s = kTimeoutS)
       : KVCacheManagerWithTransfer(std::make_unique<TestBase>(num_layers, this),
                                    /*node_id=*/0,
-                                   /*local_control_port=*/-1, /*max_blocks=*/1,
-                                   /*num_slots=*/kSlots, timeout_s) {}
+                                   /*local_control_port=*/-1, timeout_s) {
+    CHECK_OK(InitTransfer(/*max_blocks=*/1, /*num_slots=*/kSlots));
+  }
 
   // Serves a pull for `uuid` the way ProcessPullStream does once the
   // consumer is acknowledged: the push runs on this thread and returns
@@ -151,12 +152,13 @@ class TestManager : public KVCacheManagerWithTransfer {
   class TestBase : public kv_cache::KVCacheManagerBase {
    public:
     TestBase(size_t num_layers, TestManager* owner)
-        : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
-                                       std::vector<size_t>(num_layers, 128),
-                                       /*local_port=*/std::nullopt,
-                                       /*host_blocks_to_allocate=*/kSlots,
-                                       /*parallelism=*/1, nullptr),
-          owner_(owner) {}
+        : kv_cache::KVCacheManagerBase(
+              num_layers, /*num_shards=*/1,
+              /*slice_byte_sizes=*/std::vector<size_t>(num_layers, 128)),
+          owner_(owner) {
+      CHECK_OK(InitHostBuffers(std::vector<size_t>(num_layers, 128),
+                               /*host_blocks_to_allocate=*/kSlots));
+    }
 
     absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
         const std::vector<int64_t>& src_offsets_major_dim,
@@ -184,8 +186,9 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   explicit RecvTestManager(size_t num_layers, double timeout_s = 5.0)
       : KVCacheManagerWithTransfer(std::make_unique<RecvBase>(num_layers, this),
                                    /*node_id=*/0,
-                                   /*local_control_port=*/-1, /*max_blocks=*/1,
-                                   /*num_slots=*/kSlots, timeout_s) {}
+                                   /*local_control_port=*/-1, timeout_s) {
+    CHECK_OK(InitTransfer(/*max_blocks=*/1, /*num_slots=*/kSlots));
+  }
 
   void AddRecv(const std::string& req_id, uint64_t uuid,
                int32_t blocks_per_layer = 1,
@@ -253,12 +256,13 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   class RecvBase : public kv_cache::KVCacheManagerBase {
    public:
     RecvBase(size_t num_layers, RecvTestManager* owner)
-        : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
-                                       std::vector<size_t>(num_layers, 128),
-                                       /*local_port=*/std::nullopt,
-                                       /*host_blocks_to_allocate=*/kSlots,
-                                       /*parallelism=*/1, nullptr),
-          owner_(owner) {}
+        : kv_cache::KVCacheManagerBase(
+              num_layers, /*num_shards=*/1,
+              /*slice_byte_sizes=*/std::vector<size_t>(num_layers, 128)),
+          owner_(owner) {
+      CHECK_OK(InitHostBuffers(std::vector<size_t>(num_layers, 128),
+                               /*host_blocks_to_allocate=*/kSlots));
+    }
 
     absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
         const std::vector<int64_t>& src_offsets_major_dim,
@@ -1032,34 +1036,41 @@ TEST(
 TEST(RecvLifecycleTest,
      NonSessionTransfersSucceedOverBlockTransportWhileStaleUuidIsRejected) {
   constexpr size_t kSliceBytes = 128;
-  KVCacheManagerWithTransfer sender(
-      /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/4,
-      /*parallelism=*/1, /*node_id=*/0, /*local_control_port=*/-1,
-      /*max_blocks=*/1, /*num_slots=*/1, /*timeout_s=*/10.0);
-  KVCacheManagerWithTransfer receiver(
-      /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
-      /*local_port=*/0, /*host_blocks_to_allocate=*/4,
-      /*parallelism=*/1, /*node_id=*/1, /*local_control_port=*/-1,
-      /*max_blocks=*/1, /*num_slots=*/1, /*timeout_s=*/10.0);
+  absl::StatusOr<std::unique_ptr<KVCacheManagerWithTransfer>> sender =
+      KVCacheManagerWithTransfer::Create(
+          /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/4,
+          /*parallelism=*/1, /*node_id=*/0, /*local_control_port=*/-1,
+          /*max_blocks=*/1, /*num_slots=*/1, /*timeout_s=*/10.0);
+  ABSL_ASSERT_OK(sender);
+  absl::StatusOr<std::unique_ptr<KVCacheManagerWithTransfer>> receiver =
+      KVCacheManagerWithTransfer::Create(
+          /*num_layers=*/1, /*num_shards=*/1, kSliceBytes,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/4,
+          /*parallelism=*/1, /*node_id=*/1, /*local_control_port=*/-1,
+          /*max_blocks=*/1, /*num_slots=*/1, /*timeout_s=*/10.0);
+  ABSL_ASSERT_OK(receiver);
 
   const std::string peer =
-      absl::StrCat("127.0.0.1:", *receiver.base()->local_port());
+      absl::StrCat("127.0.0.1:", *(*receiver)->base()->local_port());
 
   // 1. Raw H2H push with dynamic block allocation (op = 1, uuid = 0).
-  std::memset(sender.base()->GetBlockHostPointer(0, 0, 0), 0x5A, kSliceBytes);
+  std::memset((*sender)->base()->GetBlockHostPointer(0, 0, 0), 0x5A,
+              kSliceBytes);
   absl::StatusOr<std::vector<int>> dyn_ids =
-      sender.base()->H2hWriteDirect(peer, /*src_block_ids=*/{0});
+      (*sender)->base()->H2hWriteDirect(peer, /*src_block_ids=*/{0});
   ASSERT_THAT(dyn_ids, ::absl_testing::IsOk());
   ASSERT_EQ(dyn_ids->size(), 1);
-  EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, (*dyn_ids)[0])[0], 0x5A);
+  EXPECT_EQ((*receiver)->base()->GetBlockHostPointer(0, 0, (*dyn_ids)[0])[0],
+            0x5A);
 
   // 2. Raw H2H push with explicit destination block (op = 6, uuid = 0).
-  std::memset(sender.base()->GetBlockHostPointer(0, 0, 0), 0xA5, kSliceBytes);
-  absl::StatusOr<std::vector<int>> exp_ids = sender.base()->H2hWriteDirect(
+  std::memset((*sender)->base()->GetBlockHostPointer(0, 0, 0), 0xA5,
+              kSliceBytes);
+  absl::StatusOr<std::vector<int>> exp_ids = (*sender)->base()->H2hWriteDirect(
       peer, /*src_block_ids=*/{0}, /*dst_block_ids=*/{2}, /*uuid=*/0);
   ASSERT_THAT(exp_ids, ::absl_testing::IsOk());
-  EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 2)[0], 0xA5);
+  EXPECT_EQ((*receiver)->base()->GetBlockHostPointer(0, 0, 2)[0], 0xA5);
 
   // 3. Host-only (MEMORY_TYPE_DRAM) active plan push (op = 6, uuid = 42,
   //    no TransferReceiveSession in active_recv_sessions_).
@@ -1074,23 +1085,26 @@ TEST(RecvLifecycleTest,
   entry->set_dst_block_id(3);
   entry->set_size_bytes(kSliceBytes);
   entry->set_count(1);
-  ASSERT_THAT(receiver.RegisterActivePlan(42, dram_plan, /*is_sender=*/false),
-              ::absl_testing::IsOk());
+  ASSERT_THAT(
+      (*receiver)->RegisterActivePlan(42, dram_plan, /*is_sender=*/false),
+      ::absl_testing::IsOk());
 
-  std::memset(sender.base()->GetBlockHostPointer(0, 0, 0), 0x3C, kSliceBytes);
-  absl::StatusOr<std::vector<int>> plan_ids = sender.base()->H2hWriteDirect(
+  std::memset((*sender)->base()->GetBlockHostPointer(0, 0, 0), 0x3C,
+              kSliceBytes);
+  absl::StatusOr<std::vector<int>> plan_ids = (*sender)->base()->H2hWriteDirect(
       peer, /*src_block_ids=*/{0}, /*dst_block_ids=*/{3}, /*uuid=*/42);
   ASSERT_THAT(plan_ids, ::absl_testing::IsOk());
-  EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 3)[0], 0x3C);
+  EXPECT_EQ((*receiver)->base()->GetBlockHostPointer(0, 0, 3)[0], 0x3C);
 
   // 4. Once the DRAM plan is unregistered, pushes for uuid = 42 are rejected
   //    before writing to host memory, preserving the existing bytes at block 3.
-  ASSERT_THAT(receiver.UnregisterActivePlan(42), ::absl_testing::IsOk());
-  std::memset(sender.base()->GetBlockHostPointer(0, 0, 0), 0xFF, kSliceBytes);
-  absl::StatusOr<std::vector<int>> rejected = sender.base()->H2hWriteDirect(
+  ASSERT_THAT((*receiver)->UnregisterActivePlan(42), ::absl_testing::IsOk());
+  std::memset((*sender)->base()->GetBlockHostPointer(0, 0, 0), 0xFF,
+              kSliceBytes);
+  absl::StatusOr<std::vector<int>> rejected = (*sender)->base()->H2hWriteDirect(
       peer, /*src_block_ids=*/{0}, /*dst_block_ids=*/{3}, /*uuid=*/42);
   EXPECT_FALSE(rejected.ok());
-  EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 3)[0], 0x3C);
+  EXPECT_EQ((*receiver)->base()->GetBlockHostPointer(0, 0, 3)[0], 0x3C);
 }
 }  // namespace
 }  // namespace tpu_raiden

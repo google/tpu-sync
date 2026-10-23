@@ -176,17 +176,19 @@ void RunSlotBenchmark(TpuPjrtManager* manager,
   // 3. Create KVCacheManagerWithTransfer
   // We pass local_control_port = -1 to disable the background threads/control
   // server
-  auto engine = std::make_unique<KVCacheManagerWithTransfer>(
-      layer_buffers,
-      /*local_port=*/std::nullopt,
-      /*host_blocks_to_allocate=*/kNumBlocks,  // 1 slot capacity
-      /*unsafe_skip_buffer_lock=*/true,
-      /*parallelism=*/1,
-      /*host_allocator=*/allocator_fn,
-      /*node_id=*/0,
-      /*local_control_port=*/-1,
-      /*max_blocks=*/kNumBlocks,
-      /*num_slots=*/1);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManagerWithTransfer> engine,
+      KVCacheManagerWithTransfer::Create(
+          layer_buffers,
+          /*local_port=*/std::nullopt,
+          /*host_blocks_to_allocate=*/kNumBlocks,  // 1 slot capacity
+          /*unsafe_skip_buffer_lock=*/true,
+          /*parallelism=*/1,
+          /*host_allocator=*/allocator_fn,
+          /*node_id=*/0,
+          /*local_control_port=*/-1,
+          /*max_blocks=*/kNumBlocks,
+          /*num_slots=*/1));
 
   // Configure staging slots manually (since local_control_port is -1)
   ASSERT_OK(engine->base()->ConfigureHostStagingSlots(

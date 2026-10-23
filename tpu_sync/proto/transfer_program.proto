@@ -60,6 +60,10 @@ message TransferEnvelope {
   // fingerprint (identity was already checked at metadata exchange).
   string layout_fingerprint = 5;
   int64 deadline_ms = 6;
+  // Pool-reshard sub-transfer chain position (StartTransferRequest
+  // sub_plan_index / sub_plan_count, verbatim; both zero = one plan).
+  int32 sub_plan_index = 7;
+  int32 sub_plan_count = 8;
 }
 
 // Generalizes BufferProto-index, pool, and variable address spaces.

@@ -86,6 +86,10 @@ class ReshardSendSession
   const std::string& req_id() const { return req_id_; }
   uint64_t uuid() const { return uuid_; }
   std::chrono::steady_clock::time_point deadline() const { return deadline_; }
+  // Position in the request's sub-transfer chain (both zero for a
+  // single-plan request); see StartTransferRequest.sub_plan_index.
+  int32_t sub_plan_index() const { return plan_.sub_plan_index(); }
+  int32_t sub_plan_count() const { return plan_.sub_plan_count(); }
 
   // Leases host staging per pool, issues D2H copies for each pool in |plan_|,
   // and chains async H2H peer pushes upon D2H completion.

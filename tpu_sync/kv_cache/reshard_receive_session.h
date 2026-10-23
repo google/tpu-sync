@@ -92,6 +92,10 @@ class ReshardReceiveSession
   const std::string& req_id() const { return req_id_; }
   uint64_t uuid() const { return uuid_; }
   std::chrono::steady_clock::time_point deadline() const { return deadline_; }
+  // Position in the request's sub-transfer chain (both zero for a
+  // single-plan request); see StartTransferRequest.sub_plan_index.
+  int32_t sub_plan_index() const { return sub_plan_index_; }
+  int32_t sub_plan_count() const { return sub_plan_count_; }
 
   // Releases any held pool staging leases for |uuid_|. Safe to call multiple
   // times.
@@ -166,6 +170,8 @@ class ReshardReceiveSession
   StagingBlockAllocator* const staging_allocator_ = nullptr;
   const uint64_t uuid_ = 0;
   const std::string req_id_;
+  const int32_t sub_plan_index_ = 0;
+  const int32_t sub_plan_count_ = 0;
   const std::chrono::steady_clock::time_point deadline_;
   const std::chrono::steady_clock::time_point start_time_;
   std::vector<int64_t> chip_block_ids_ ABSL_GUARDED_BY(mu_);

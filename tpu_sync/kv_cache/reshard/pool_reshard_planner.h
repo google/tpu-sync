@@ -111,6 +111,10 @@ struct PoolReshardPlan {
   absl::btree_map<RaidenId, tpu_sync::rpc::ReceiverAddrsProto,
                   RequestBlockRegistry::RaidenIdLess>
       receiver_addrs;
+  // Position in the request's sub-transfer chain (StartTransferRequest
+  // sub_plan_index / sub_plan_count); both zero for a single-plan request.
+  int32_t sub_plan_index = 0;
+  int32_t sub_plan_count = 0;
 };
 
 // Inputs to the plan build, mirroring _build_pool_reshard_plan's keyword
@@ -131,6 +135,22 @@ struct PlanRequest {
   // dst_skip_bytes[i] of tag i's global destination byte space, re-based
   // onto that tag's destination block list. Page-multiple, v1-only.
   std::vector<int64_t> dst_skip_bytes;
+  // Sub-transfer window (both empty = every tag's destination list is the
+  // whole request). Per tag: the ordinal of this plan's first destination
+  // block within the tag's full (post-skip) destination list, and that
+  // list's length. A total of 0 means the tag is not windowed (its
+  // destination ids are the whole list, as without windows). For a
+  // windowed tag the plan covers bytes [skip + offset * page, skip +
+  // (offset + count) * page) of the tag's global space, where count is the
+  // tag's dst_block_counts entry: spans below are dropped, spans above the
+  // window are dropped only when the window is not the tag's last one
+  // (the last window keeps the full fail-closed coverage check). v1-only.
+  std::vector<int64_t> dst_window_offset_blocks;
+  std::vector<int64_t> dst_window_total_blocks;
+  // Engine plan uuid (StartTransferRequest.uuid); 0 = `uuid`. The registry
+  // claim is always keyed by `uuid`, so the sub-transfers of one request
+  // share its claim while each carries its own engine plan identity.
+  int64_t plan_uuid = 0;
 };
 
 // Environment variable that caps the TCP streams each sender opens per

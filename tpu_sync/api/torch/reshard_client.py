@@ -48,6 +48,12 @@ _impl = torch_abi.load_extension(
 # coordinate_transfer. Absent on older shims, so consumers must getattr.
 SUPPORTS_DST_SKIP_BYTES = bool(
     getattr(_impl, "reshard_client_supports_dst_skip_bytes", False))
+# True iff coordinate_transfer accepts the per-tag dst_window_blocks
+# bounded-staging window (the source controller then chains sub-transfers
+# of at most that many destination blocks per tag). Absent on older shims,
+# so consumers must getattr.
+SUPPORTS_DST_WINDOW_BLOCKS = bool(
+    getattr(_impl, "reshard_client_supports_dst_window_blocks", False))
 # True iff get_request_block_status (read-only registry lifecycle probe)
 # is available; absent on older shims, so consumers must getattr.
 SUPPORTS_REQUEST_BLOCK_STATUS = bool(
@@ -235,6 +241,7 @@ class ReshardClient:
       transfer_pool_tags: Optional[typing.Sequence[str]] = None,
       dst_block_counts: Optional[typing.Sequence[int]] = None,
       dst_skip_bytes: Optional[typing.Sequence[int]] = None,
+      dst_window_blocks: Optional[typing.Sequence[int]] = None,
   ) -> bool:
     # num_tokens accepted for caller compatibility, retired from the wire
     # (facade parity); shard_push_schedules is a legacy-relay parameter the
@@ -268,6 +275,10 @@ class ReshardClient:
             if dst_block_counts else [],
             [int(s) for s in (dst_skip_bytes or ())]
             if dst_skip_bytes and any(int(s) != 0 for s in dst_skip_bytes)
+            else [],
+            [int(w) for w in (dst_window_blocks or ())]
+            if dst_window_blocks
+            and any(int(w) != 0 for w in dst_window_blocks)
             else [],
         ))
 

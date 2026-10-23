@@ -96,7 +96,7 @@ jobs:
             fi
             EXTRAS=""
           else
-            EXTRAS=".dev$(date -u +%Y%m%d%H%M%S)"
+            EXTRAS="rc$(date -u +%Y%m%d%H%M%S)"
           fi
           echo "wheel version: ${BASE_VERSION}${EXTRAS}"
           echo "version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"

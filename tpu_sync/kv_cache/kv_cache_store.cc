@@ -1289,7 +1289,7 @@ absl::Status KVCacheStore::SaveLocal(
       absl::Span<const int32_t>(
           reinterpret_cast<const int32_t*>(host_block_ids.data()),
           host_block_ids.size()),
-      &save_tracker_);
+      &save_tracker_, SaveOptions{});
 
   future.OnReady([wt_state = wt_state_, backend = backend(),
                   registry_client = registry_client_, raiden_id = raiden_id_,

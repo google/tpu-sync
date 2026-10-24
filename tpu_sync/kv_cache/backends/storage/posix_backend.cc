@@ -1024,27 +1024,53 @@ absl::StatusOr<BlockSliceList> PosixKVCacheStoreBackend::Lookup(
   return results;
 }
 
-void PosixKVCacheStoreBackend::Delete(
-    absl::Span<const std::string> block_hashes,
-    absl::Span<const RaidenBlockId> slices) {
-  if (!cache_options_.enabled() || !storage_backend_ ||
-      !storage_backend_->mapper()) {
-    return;
+size_t PosixKVCacheStoreBackend::Delete(
+    absl::Span<const std::string> block_hashes, const DeleteOptions& options) {
+  if (options.deallocated_host_block_ids != nullptr) {
+    options.deallocated_host_block_ids->clear();
   }
-  std::vector<std::string> resolved_keys;
-  resolved_keys.reserve(block_hashes.size() *
-                        storage_backend_->mapper()->shards_per_block());
+  if (options.deleted_hashes != nullptr) {
+    options.deleted_hashes->clear();
+  }
+  if (options.host_resident_only || !cache_options_.enabled() ||
+      !storage_backend_ || !storage_backend_->mapper()) {
+    return 0;
+  }
+
+  struct MappedBlock {
+    absl::string_view hash;
+    std::vector<std::string> resolved_keys;
+  };
+  std::vector<MappedBlock> mapped_blocks;
+  mapped_blocks.reserve(block_hashes.size());
   for (const std::string& hash : block_hashes) {
     absl::StatusOr<std::vector<BlockKey>> keys = MapShardKeys(hash);
     if (!keys.ok()) continue;  // Never cached; keep invalidating the rest.
+    MappedBlock entry{.hash = hash};
+    entry.resolved_keys.reserve(keys->size());
     for (BlockKey& key : *keys) {
-      resolved_keys.push_back(std::move(key.resolved_key));
+      entry.resolved_keys.push_back(std::move(key.resolved_key));
+    }
+    mapped_blocks.push_back(std::move(entry));
+  }
+
+  size_t erased_count = 0;
+  absl::MutexLock lock(cache_mu_);
+  for (const MappedBlock& entry : mapped_blocks) {
+    bool erased_any = false;
+    for (const std::string& resolved_key : entry.resolved_keys) {
+      if (cache_.Erase(resolved_key)) {
+        erased_any = true;
+      }
+    }
+    if (erased_any) {
+      ++erased_count;
+      if (options.deleted_hashes != nullptr) {
+        options.deleted_hashes->emplace_back(entry.hash);
+      }
     }
   }
-  absl::MutexLock lock(cache_mu_);
-  for (const std::string& resolved_key : resolved_keys) {
-    cache_.Erase(resolved_key);
-  }
+  return erased_count;
 }
 
 }  // namespace storage

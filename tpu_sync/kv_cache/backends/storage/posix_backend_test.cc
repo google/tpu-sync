@@ -2263,7 +2263,7 @@ TEST_F(MetadataCacheTest, DisabledProbesStorageEveryTime) {
 
   env.RemoveBlock("a");
   EXPECT_EQ(env.LookupCount({"a"}), 0);
-  env.store->Delete({"a"}, {});  // No-op when disabled.
+  EXPECT_EQ(env.store->Delete({"a"}), 0);  // No-op when disabled.
 }
 
 TEST_F(MetadataCacheTest, CachedHitSkipsStorageProbe) {
@@ -2363,7 +2363,7 @@ TEST_F(MetadataCacheTest, DeleteInvalidatesAllRankShards) {
   EXPECT_EQ(env.LookupCount({"a", "b"}), 2);
   EXPECT_EQ(env.store->metadata_cache_size(), 6);
 
-  env.store->Delete({"a"}, {});
+  EXPECT_EQ(env.store->Delete({"a"}), 1);
   EXPECT_EQ(env.store->metadata_cache_size(), 3);
 
   // a's rank-2 shard is gone; the re-probe sees it.
@@ -2401,7 +2401,7 @@ TEST_F(MetadataCacheTest, NoAxesDeclaredSingleShard) {
   EXPECT_EQ(env.LookupCount({"a"}), 1);
   EXPECT_EQ(env.store->metadata_cache_size(), 1);
 
-  env.store->Delete({"a"}, {});
+  EXPECT_EQ(env.store->Delete({"a"}), 1);
   EXPECT_EQ(env.store->metadata_cache_size(), 0);
   env.RemoveBlock("a");
   EXPECT_EQ(env.LookupCount({"a"}), 0);
@@ -2453,7 +2453,7 @@ TEST_F(MetadataCacheTest, DeleteInvalidatesAllPcpTimesTpShards) {
   EXPECT_EQ(env.LookupCount({"a", "b"}), 2);
   EXPECT_EQ(env.store->metadata_cache_size(), 8);
 
-  env.store->Delete({"a"}, {});
+  EXPECT_EQ(env.store->Delete({"a"}), 1);
   EXPECT_EQ(env.store->metadata_cache_size(), 4);
 
   // a's (pcp 1, tp 1) shard is gone; the re-probe sees it.
@@ -2504,7 +2504,7 @@ TEST_F(MetadataCacheTest, DeleteInvalidatesAllPpPcpTpShards) {
   EXPECT_EQ(env.LookupCount({"a", "b"}), 2);
   EXPECT_EQ(env.store->metadata_cache_size(), 16);
 
-  env.store->Delete({"a"}, {});
+  EXPECT_EQ(env.store->Delete({"a"}), 1);
   EXPECT_EQ(env.store->metadata_cache_size(), 8);
 
   // a's (pp 1, pcp 0, tp 0) shard is gone; the re-probe sees it.
@@ -2573,12 +2573,36 @@ TEST_F(MetadataCacheTest, DeleteInvalidatesSoNextLookupReprobes) {
   EXPECT_EQ(env.LookupCount({"a", "b"}), 2);
 
   env.RemoveBlock("a");
-  env.store->Delete({"a", std::string(kMaxBlockHashBytes + 1, 'x')}, {});
+  std::vector<int> deallocated_ids = {99};
+  std::vector<std::string> deleted_hashes = {"stale"};
+  EXPECT_EQ(env.store->Delete(
+                {"a", "uncached", std::string(kMaxBlockHashBytes + 1, 'x')},
+                DeleteOptions{.deallocated_host_block_ids = &deallocated_ids,
+                              .deleted_hashes = &deleted_hashes}),
+            1);
+  EXPECT_TRUE(deallocated_ids.empty());
+  EXPECT_THAT(deleted_hashes, ::testing::ElementsAre("a"));
   EXPECT_EQ(env.store->metadata_cache_size(), 1);
 
   env.backend->ResetCounts();
   EXPECT_EQ(env.LookupCount({"a", "b"}), 0);
   EXPECT_EQ(env.backend->probed_keys(), 1);  // Only "a"; "b" still cached.
+}
+
+TEST_F(MetadataCacheTest, DeleteHostResidentOnlyIsNoOp) {
+  Env env = CreateEnv(Enabled());
+  env.CreateBlock("a");
+  EXPECT_EQ(env.LookupCount({"a"}), 1);
+  EXPECT_EQ(env.store->metadata_cache_size(), 1);
+
+  std::vector<int> deallocated_ids = {99};
+  std::vector<std::string> evicted_hashes = {"stale"};
+  EXPECT_EQ(env.store->Delete({"a"}, DeleteOptions::EvictHostResident(
+                                         &deallocated_ids, &evicted_hashes)),
+            0);
+  EXPECT_TRUE(deallocated_ids.empty());
+  EXPECT_TRUE(evicted_hashes.empty());
+  EXPECT_EQ(env.store->metadata_cache_size(), 1);
 }
 
 TEST_F(MetadataCacheTest, MaxEntriesEvictsLeastRecentlyUsed) {

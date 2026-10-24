@@ -228,6 +228,13 @@ message StartTransferRequest {
   // Layout of the weight-sync host buffers moved by this transfer; see
   // HostTilingMode.
   HostTilingMode host_tiling_mode = 26;
+  // Pool reshard: this plan's position in its request's sub-transfer chain
+  // (a request whose destination exceeds the receiver's bounded-staging
+  // window is coordinated as sub_plan_count plans with derived uuids). The
+  // engine reports the request's send/receive terminal once every
+  // sub-plan has settled. Both zero = the request is one plan (legacy).
+  int32 sub_plan_index = 27;
+  int32 sub_plan_count = 28;
 }
 
 // How a weight-sync transfer treats the device (tiled) layout of the host

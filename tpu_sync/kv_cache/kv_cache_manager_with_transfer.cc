@@ -147,6 +147,107 @@ TransferDetails DetailsFromStatus(const absl::Status& status) {
   return details;
 }
 
+void KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked(
+    bool is_recv, const std::string& req_id, int32_t sub_plan_index,
+    int32_t sub_plan_count, const absl::Status& status) {
+  absl::flat_hash_set<std::string>& done =
+      is_recv ? done_recving_ : done_sending_;
+  if (sub_plan_count <= 1) {
+    // A single-plan request: the session's terminal is the request's.
+    (status.ok() ? done : failed_recving_).insert(req_id);
+    if (!status.ok()) transfer_details_[req_id] = DetailsFromStatus(status);
+    return;
+  }
+  auto& chains = is_recv ? recv_chains_ : send_chains_;
+  SubPlanChainProgress& progress = chains[req_id];
+  progress.last_activity = std::chrono::steady_clock::now();
+  if (progress.failed) return;  // the request's failure was already reported
+  progress.count = std::max(progress.count, sub_plan_count);
+  if (!status.ok()) {
+    progress.failed = true;
+    failed_recving_.insert(req_id);
+    TransferDetails details = DetailsFromStatus(status);
+    details.reason = absl::StrCat("sub-plan ", sub_plan_index, " of ",
+                                  sub_plan_count, ": ", status.message());
+    transfer_details_[req_id] = std::move(details);
+    LOG(WARNING) << "Pool reshard " << (is_recv ? "receive" : "send")
+                 << " req_id=" << req_id << " failed at sub-plan "
+                 << sub_plan_index << " of " << sub_plan_count << ": "
+                 << status;
+    return;
+  }
+  progress.settled.insert(sub_plan_index);
+  VLOG(1) << "Pool reshard " << (is_recv ? "receive" : "send")
+          << " req_id=" << req_id << " sub-plan " << sub_plan_index << " of "
+          << sub_plan_count << " settled (" << progress.settled.size()
+          << " settled so far)";
+  if (static_cast<int32_t>(progress.settled.size()) >= progress.count) {
+    done.insert(req_id);
+    chains.erase(req_id);
+  }
+}
+
+void KVCacheManagerWithTransfer::SweepSubPlanChainsLocked(
+    std::chrono::steady_clock::time_point now) {
+  if (recv_chains_.empty() && send_chains_.empty()) return;
+  const auto stall = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(timeout_s_));
+  auto sweep = [&](bool is_recv) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+    auto& chains = is_recv ? recv_chains_ : send_chains_;
+    for (auto it = chains.begin(); it != chains.end();) {
+      SubPlanChainProgress& progress = it->second;
+      if (now - progress.last_activity <= stall) {
+        ++it;
+        continue;
+      }
+      if (progress.failed) {
+        // The failure was reported; late sub-plans of the doomed request
+        // were swallowed for one timeout, which is as long as any of them
+        // can live.
+        chains.erase(it++);
+        continue;
+      }
+      // Quiet for a whole timeout: unless a sub-plan of the request is
+      // still active, its chain has stalled (the coordinator never armed or
+      // dispatched the next sub-plan).
+      bool active = false;
+      if (is_recv) {
+        for (const auto& [uuid, session] : active_pool_reshard_recvs_) {
+          if (session->req_id() == it->first) {
+            active = true;
+            break;
+          }
+        }
+      } else {
+        for (const auto& [uuid, session] : active_pool_reshard_sends_) {
+          if (session->req_id() == it->first) {
+            active = true;
+            break;
+          }
+        }
+      }
+      if (active) {
+        progress.last_activity = now;
+        ++it;
+        continue;
+      }
+      const absl::Status status = absl::DeadlineExceededError(absl::StrCat(
+          "pool reshard sub-plan chain stalled: ", progress.settled.size(),
+          " of ", progress.count, " sub-plans settled, none active for ",
+          timeout_s_, "s"));
+      failed_recving_.insert(it->first);
+      transfer_details_[it->first] = DetailsFromStatus(status);
+      LOG(WARNING) << "Pool reshard " << (is_recv ? "receive" : "send")
+                   << " req_id=" << it->first << ": " << status.message();
+      progress.failed = true;
+      progress.last_activity = now;
+      ++it;
+    }
+  };
+  sweep(/*is_recv=*/true);
+  sweep(/*is_recv=*/false);
+}
+
 void KVCacheManagerWithTransfer::InitializeBaseHooks() {
   kv_cache::KVCacheManagerBase::TransferEventHooks hooks;
   hooks.register_block_readiness_callback =
@@ -649,12 +750,10 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
     auto existing = active_pool_reshard_sends_.find(plan.uuid());
     if (existing != active_pool_reshard_sends_.end()) {
       if (existing->second->Done()) {
-        (!existing->second->GetStatus().ok() ? failed_recving_ : done_sending_)
-            .insert(existing->second->req_id());
-        if (!existing->second->GetStatus().ok()) {
-          transfer_details_[existing->second->req_id()] =
-              DetailsFromStatus(existing->second->GetStatus());
-        }
+        RecordPoolReshardTerminalLocked(
+            /*is_recv=*/false, existing->second->req_id(),
+            existing->second->sub_plan_index(),
+            existing->second->sub_plan_count(), existing->second->GetStatus());
         active_pool_reshard_sends_.erase(existing);
       } else {
         return absl::AlreadyExistsError(absl::StrCat(
@@ -688,13 +787,11 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
     auto existing_reshard = active_pool_reshard_recvs_.find(plan.uuid());
     if (existing_reshard != active_pool_reshard_recvs_.end()) {
       if (existing_reshard->second->Done()) {
-        (!existing_reshard->second->GetStatus().ok() ? failed_recving_
-                                                     : done_recving_)
-            .insert(existing_reshard->second->req_id());
-        if (!existing_reshard->second->GetStatus().ok()) {
-          transfer_details_[existing_reshard->second->req_id()] =
-              DetailsFromStatus(existing_reshard->second->GetStatus());
-        }
+        RecordPoolReshardTerminalLocked(
+            /*is_recv=*/true, existing_reshard->second->req_id(),
+            existing_reshard->second->sub_plan_index(),
+            existing_reshard->second->sub_plan_count(),
+            existing_reshard->second->GetStatus());
         active_pool_reshard_recvs_.erase(existing_reshard);
       } else {
         return absl::AlreadyExistsError(absl::StrCat(
@@ -993,10 +1090,10 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
       }
       if (session->Done()) {
         const bool failed = !session->GetStatus().ok();
-        (failed ? failed_recving_ : done_sending_).insert(session->req_id());
+        RecordPoolReshardTerminalLocked(
+            /*is_recv=*/false, session->req_id(), session->sub_plan_index(),
+            session->sub_plan_count(), session->GetStatus());
         if (failed) {
-          transfer_details_[session->req_id()] =
-              DetailsFromStatus(session->GetStatus());
           settled_plans.emplace_back(it->first, 0);
         }
         active_pool_reshard_sends_.erase(it++);
@@ -1056,12 +1153,9 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
       }
 
       if (session->Done()) {
-        (!session->GetStatus().ok() ? failed_recving_ : done_recving_)
-            .insert(session->req_id());
-        if (!session->GetStatus().ok()) {
-          transfer_details_[session->req_id()] =
-              DetailsFromStatus(session->GetStatus());
-        }
+        RecordPoolReshardTerminalLocked(
+            /*is_recv=*/true, session->req_id(), session->sub_plan_index(),
+            session->sub_plan_count(), session->GetStatus());
         uint64_t generation = 0;
         if (session->TakePendingUnregister(&generation)) {
           settled_plans.emplace_back(uuid, generation);
@@ -1071,6 +1165,7 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
         ++it;
       }
     }
+    SweepSubPlanChainsLocked(now);
     completions.sent.assign(done_sending_.begin(), done_sending_.end());
     completions.received.assign(done_recving_.begin(), done_recving_.end());
     completions.failed.assign(failed_recving_.begin(), failed_recving_.end());

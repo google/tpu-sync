@@ -4,6 +4,22 @@
 
 ### Added
 
+- Bounded-staging sub-transfer chains for pool resharding.
+  `CoordinateTransferRequest.dst_window_blocks` (per tag; 0 = unbounded) caps
+  the destination blocks one transfer may carry: a request over its window is
+  coordinated as a chain of sub-transfers, each an ordinary pool-reshard plan
+  over a page-aligned slice of the request (derived engine uuid, own receiver
+  arm and sender dispatch, own staging lease) under the request's single
+  registry claim; tags with fewer windows ride in the last sub-transfers so a
+  single-block state tag still lands after the paged tags. Sub-transfer 0
+  runs inside the coordination RPC; the rest run on a coordinator thread, and a
+  chained arm refused by the receiver's staging lease wait is retried while the
+  arena drains. `StartTransferRequest.sub_plan_index` / `sub_plan_count` carry
+  the chain position (zero for single-plan requests, wire-compatible), and
+  `KVCacheManagerWithTransfer` reports one send/receive terminal per request
+  once every sub-plan has settled, at the first sub-plan failure, or when a
+  chain stalls for the transfer timeout. The torch reshard client accepts
+  `dst_window_blocks` and exports `SUPPORTS_DST_WINDOW_BLOCKS`.
 - `TPU_RAIDEN_DATA_CONN_REUSE=per_transfer`: a sender closes its idle
   data-plane TCP connections to a peer when a send session to that peer
   settles (pool reshard and legacy pull-serve), so open connections follow the

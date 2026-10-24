@@ -58,6 +58,19 @@ message CoordinateTransferRequest {
   // tags whose declarations use dst_space_version=1. The controller
   // attaches no meaning beyond the byte arithmetic.
   repeated int64 dst_skip_bytes = 15;
+  // Per-tag bounded-staging window: the most destination blocks of tag i
+  // one sub-transfer may carry. A request whose tag exceeds its window is
+  // executed as a chain of sub-transfers (one engine plan each, derived
+  // uuids, one registry claim); every sub-transfer covers a page-aligned
+  // slice of the tag's destination list in destination order, and tags
+  // with fewer windows than the chain is long ride in its last
+  // sub-transfers so a single-block state tag lands after the paged tags.
+  // Empty = unbounded (one transfer; wire-compatible). When present, length
+  // must equal transfer_pool_tags; 0 leaves that tag unbounded; a nonzero
+  // window is valid only for tags whose declarations use
+  // dst_space_version=1. The controller attaches no meaning beyond the
+  // block arithmetic.
+  repeated int64 dst_window_blocks = 16;
 }
 
 // One contiguous (or uniformly strided) byte copy between one source block

@@ -211,6 +211,8 @@ tpu_sync::rpc::ControllerResponse ReshardService::HandleControllerCommand(
                                    coord_req.dst_block_counts().end());
       args.dst_skip_bytes.assign(coord_req.dst_skip_bytes().begin(),
                                  coord_req.dst_skip_bytes().end());
+      args.dst_window_blocks.assign(coord_req.dst_window_blocks().begin(),
+                                    coord_req.dst_window_blocks().end());
       // Wire carries no parallelism (planner derives it from admission);
       // dst_device_block_ids emptiness surfaces in the coordinator as the
       // Python path would report it.

@@ -168,6 +168,24 @@ TEST(TransferProgramReshard, SkipTilingMapRoundTrips) {
   EXPECT_EQ(Canonical(original), Canonical(*lowered));
 }
 
+TEST(TransferProgramReshard, SubPlanChainPositionRoundTrips) {
+  for (const bool is_sender : {true, false}) {
+    ::tpu_sync::rpc::StartTransferRequest original =
+        MakePoolRequest(is_sender);
+    original.set_sub_plan_index(2);
+    original.set_sub_plan_count(5);
+    auto program = CompileStartTransfer(original);
+    ASSERT_TRUE(program.ok()) << program.status();
+    EXPECT_EQ(program->envelope().sub_plan_index(), 2);
+    EXPECT_EQ(program->envelope().sub_plan_count(), 5);
+    auto lowered = LowerToStartTransfer(*program);
+    ASSERT_TRUE(lowered.ok()) << lowered.status();
+    EXPECT_EQ(lowered->sub_plan_index(), 2);
+    EXPECT_EQ(lowered->sub_plan_count(), 5);
+    EXPECT_EQ(Canonical(original), Canonical(*lowered));
+  }
+}
+
 TEST(TransferProgramReshard, WirePoolIndexMapRoundTrips) {
   ::tpu_sync::rpc::StartTransferRequest original = MakePoolRequest(true);
   (*original.mutable_wire_pool_indices())[0] = 9;

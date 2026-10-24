@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -117,6 +118,31 @@ class FakeTransport final : public ControlPipeClient {
       resp_env.set_payload(failed.SerializeAsString());
       return resp_env;
     }
+    {
+      absl::MutexLock lock(mu_);
+      size_t calls_to_endpoint = 0;
+      for (const auto& [addr, payload] : calls_) {
+        if (addr == endpoint) ++calls_to_endpoint;
+      }
+      if (fail_after_addr_ == endpoint && calls_to_endpoint > fail_after_) {
+        tpu_sync::rpc::ControlResponse failed;
+        failed.set_success(false);
+        failed.set_message("injected arm refusal");
+        resp_env.set_payload(failed.SerializeAsString());
+        return resp_env;
+      }
+      if (busy_addr_ == endpoint && calls_to_endpoint > busy_after_ &&
+          busy_remaining_ > 0) {
+        --busy_remaining_;
+        tpu_sync::rpc::ControlResponse busy;
+        busy.set_success(false);
+        busy.set_message(
+            "pool staging: uuid 1 waited 10s for 2 slots on storage 0 "
+            "(free=0 of 4, active leases=2)");
+        resp_env.set_payload(busy.SerializeAsString());
+        return resp_env;
+      }
+    }
     auto reply_it = replies_.find(std::string(endpoint));
     if (reply_it != replies_.end()) {
       resp_env.set_payload(reply_it->second.SerializeAsString());
@@ -133,10 +159,30 @@ class FakeTransport final : public ControlPipeClient {
   }
 
   void FailFor(const std::string& addr) { fail_addr_ = addr; }
+  // Refuses every call to `addr` after its first `after_calls` calls.
+  void FailAfterCalls(const std::string& addr, size_t after_calls) {
+    absl::MutexLock lock(mu_);
+    fail_after_addr_ = addr;
+    fail_after_ = after_calls;
+  }
+  // Answers `times` calls to `addr` after its first `after_calls` calls
+  // with the receiver's bounded-staging lease-wait refusal.
+  void RefuseArmsBusy(const std::string& addr, size_t after_calls,
+                      int times) {
+    absl::MutexLock lock(mu_);
+    busy_addr_ = addr;
+    busy_after_ = after_calls;
+    busy_remaining_ = times;
+  }
 
   absl::Mutex mu_;
   std::vector<std::pair<std::string, std::string>> calls_;
   std::string fail_addr_;
+  std::string fail_after_addr_;
+  size_t fail_after_ = 0;
+  std::string busy_addr_;
+  size_t busy_after_ = 0;
+  int busy_remaining_ = 0;
   // Reply returned for an endpoint instead of a bare success.
   std::map<std::string, tpu_sync::rpc::ControlResponse> replies_;
 };
@@ -537,7 +583,7 @@ class ReshardStackTest : public ::testing::Test {
   tpu_sync::rpc::ControllerResponse Coordinate(
       const std::string& req_id, int64_t uuid, int num_src,
       std::vector<int64_t> dst_blocks, std::vector<int64_t> dst_skip = {},
-      int num_dst = 1) {
+      int num_dst = 1, std::vector<int64_t> dst_window = {}) {
     tpu_sync::rpc::ControllerRequest req;
     req.set_command(
         tpu_sync::rpc::ControllerRequest::COMMAND_COORDINATE_TRANSFER);
@@ -560,7 +606,21 @@ class ReshardStackTest : public ::testing::Test {
     for (int64_t skip : dst_skip) {
       coord->add_dst_skip_bytes(skip);
     }
+    for (int64_t window : dst_window) {
+      coord->add_dst_window_blocks(window);
+    }
     return HandleController(req.SerializeAsString());
+  }
+
+  // Waits for the request's chained sub-transfers (the first one runs inside
+  // the coordination RPC; the rest on a coordinator thread).
+  void WaitForChains() { service_->coordinator()->WaitForSubTransferChains(); }
+
+  // Parses worker call `index` as a START_TRANSFER control request.
+  tpu_sync::rpc::StartTransferRequest WorkerStartTransfer(size_t index) {
+    tpu_sync::rpc::ControlRequest req;
+    EXPECT_TRUE(req.ParseFromString(transport_.calls_.at(index).second));
+    return req.start_transfer_request();
   }
 
   // Rank r declares whole pages 2r and 2r+1 of the destination's four (v1
@@ -849,6 +909,365 @@ TEST_F(ReshardStackTest, ClipDropsTrimsAndRebasesGlobalSpans) {
   }
   EXPECT_TRUE(found_rank0);
   EXPECT_TRUE(found_rank1);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded-staging windows: a request larger than its per-tag window is
+// coordinated as a chain of sub-transfers.
+
+TEST(PlanSubTransfersTest, NoWindowsPlanOneTransfer) {
+  PoolReshardArgs args;
+  args.transfer_pool_tags = {"fa"};
+  args.dst_device_block_ids = {7, 8, 9, 10};
+  auto chain = PlanSubTransfers(args);
+  ASSERT_TRUE(chain.ok()) << chain.status();
+  EXPECT_EQ(chain->count, 1);
+  EXPECT_TRUE(chain->sub_plans.empty());
+
+  // Zero windows and windows that fit the request plan one transfer too.
+  args.dst_window_blocks = {0};
+  chain = PlanSubTransfers(args);
+  ASSERT_TRUE(chain.ok()) << chain.status();
+  EXPECT_EQ(chain->count, 1);
+  args.dst_window_blocks = {4};
+  chain = PlanSubTransfers(args);
+  ASSERT_TRUE(chain.ok()) << chain.status();
+  EXPECT_EQ(chain->count, 1);
+}
+
+TEST(PlanSubTransfersTest, WindowSplitsPagedTagInDestinationOrder) {
+  PoolReshardArgs args;
+  args.transfer_pool_tags = {"fa"};
+  args.dst_device_block_ids = {7, 8, 9, 10, 11};
+  args.dst_window_blocks = {2};
+  auto chain = PlanSubTransfers(args);
+  ASSERT_TRUE(chain.ok()) << chain.status();
+  ASSERT_EQ(chain->count, 3);
+  ASSERT_EQ(chain->sub_plans.size(), 3u);
+  for (int j = 0; j < 3; ++j) {
+    ASSERT_EQ(chain->sub_plans[j].size(), 1u);
+    const SubTransferSlice& slice = chain->sub_plans[j][0];
+    EXPECT_EQ(slice.tag_index, 0u);
+    EXPECT_EQ(slice.offset, 2 * j);
+    EXPECT_EQ(slice.count, j == 2 ? 1 : 2);
+    EXPECT_EQ(slice.total, 5);
+  }
+}
+
+TEST(PlanSubTransfersTest, UnwindowedTagsRideInTheLastSubTransfer) {
+  // FA pages windowed one per sub-transfer; two single-block state tags are
+  // not windowed and must land with the final FA window (order_rank keeps
+  // state after FA inside that plan).
+  // The two state tags name the same block (a group's conv and ssm pools
+  // address one state block), which must not disable the window: only a
+  // windowed tag sharing ids would.
+  PoolReshardArgs args;
+  args.transfer_pool_tags = {"fa", "gdn.conv.g0", "gdn.ssm.g0"};
+  args.dst_device_block_ids = {7, 8, 9, 20, 20};
+  args.dst_block_counts = {3, 1, 1};
+  args.dst_window_blocks = {1, 0, 0};
+  auto chain = PlanSubTransfers(args);
+  ASSERT_TRUE(chain.ok()) << chain.status();
+  ASSERT_EQ(chain->count, 3);
+  EXPECT_EQ(chain->sub_plans[0].size(), 1u);
+  EXPECT_EQ(chain->sub_plans[1].size(), 1u);
+  ASSERT_EQ(chain->sub_plans[2].size(), 3u);
+  EXPECT_EQ(chain->sub_plans[2][0].tag_index, 0u);
+  EXPECT_EQ(chain->sub_plans[2][0].offset, 2);
+  EXPECT_EQ(chain->sub_plans[2][0].count, 1);
+  EXPECT_EQ(chain->sub_plans[2][0].total, 3);
+  for (size_t i = 1; i < 3; ++i) {
+    EXPECT_EQ(chain->sub_plans[2][i].tag_index, i);
+    EXPECT_EQ(chain->sub_plans[2][i].offset, 0);
+    EXPECT_EQ(chain->sub_plans[2][i].count, 1);
+    EXPECT_EQ(chain->sub_plans[2][i].total, 0);
+  }
+}
+
+TEST(PlanSubTransfersTest, WindowedTagSharingIdsDisablesWindows) {
+  // A windowed tag whose ids another tag also names (aliased arena pages)
+  // keeps the intra-plan H2D ordering guarantee: the request is never split.
+  PoolReshardArgs args;
+  args.transfer_pool_tags = {"fa", "state"};
+  args.dst_device_block_ids = {7, 8, 9, 7};
+  args.dst_block_counts = {3, 1};
+  args.dst_window_blocks = {1, 0};
+  auto chain = PlanSubTransfers(args);
+  ASSERT_TRUE(chain.ok()) << chain.status();
+  EXPECT_EQ(chain->count, 1);
+  // The same ids shared only between two unwindowed tags are fine.
+  args.transfer_pool_tags = {"fa", "conv", "ssm"};
+  args.dst_device_block_ids = {7, 8, 9, 11, 11};
+  args.dst_block_counts = {3, 1, 1};
+  args.dst_window_blocks = {2, 0, 0};
+  chain = PlanSubTransfers(args);
+  ASSERT_TRUE(chain.ok()) << chain.status();
+  EXPECT_EQ(chain->count, 2);
+}
+
+TEST(PlanSubTransfersTest, MalformedWindowsFailClosed) {
+  PoolReshardArgs args;
+  args.transfer_pool_tags = {"fa"};
+  args.dst_device_block_ids = {7, 8};
+  args.dst_window_blocks = {-1};
+  EXPECT_THAT(PlanSubTransfers(args).status(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("non-negative")));
+  args.dst_window_blocks = {1, 1};
+  EXPECT_THAT(PlanSubTransfers(args).status(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("align 1:1")));
+}
+
+TEST(SubPlanUuidTest, DerivedUuidsArePositiveAndDistinct) {
+  const int64_t uuid = 0x7000'1234'5678'9abc;
+  EXPECT_EQ(SubPlanUuid(uuid, 0), uuid);
+  std::set<int64_t> seen{uuid};
+  for (int32_t j = 1; j < 64; ++j) {
+    const int64_t derived = SubPlanUuid(uuid, j);
+    EXPECT_GT(derived, 0);
+    EXPECT_TRUE(seen.insert(derived).second) << "collision at " << j;
+  }
+  EXPECT_NE(SubPlanUuid(uuid, 1), SubPlanUuid(uuid + 1, 1));
+}
+
+TEST_F(ReshardStackTest, WindowedRequestChainsOneSubTransferPerWindow) {
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  // Four destination pages, two per rank; a one-page window makes four
+  // sub-transfers: arm then dispatch each, in destination order, each with
+  // its own engine uuid under one registry claim.
+  RegisterTwoPagesPerRank("req-win", 60);
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-win", 60, 2, {7, 8, 9, 10}, /*dst_skip=*/{},
+                 /*num_dst=*/1, /*dst_window=*/{1});
+  ASSERT_TRUE(resp.success()) << resp.message();
+  WaitForChains();
+
+  // Per sub-transfer: one arm plus the one sender owning that page.
+  ASSERT_EQ(transport_.calls_.size(), 8u);
+  const int64_t src_blocks[] = {3, 4, 5, 6};
+  const char* sender_addrs[] = {"10.0.0.1:9100", "10.0.0.1:9100",
+                                "10.0.0.1:9102", "10.0.0.1:9102"};
+  std::set<int64_t> uuids;
+  for (int j = 0; j < 4; ++j) {
+    EXPECT_EQ(transport_.calls_[2 * j].first, "10.0.0.2:9600");
+    const tpu_sync::rpc::StartTransferRequest arm = WorkerStartTransfer(2 * j);
+    EXPECT_FALSE(arm.is_sender());
+    EXPECT_EQ(arm.sub_plan_index(), j);
+    EXPECT_EQ(arm.sub_plan_count(), 4);
+    EXPECT_EQ(arm.uuid(), SubPlanUuid(60, j));
+    EXPECT_TRUE(uuids.insert(arm.uuid()).second);
+    EXPECT_EQ(arm.req_id(), "req-win");
+    EXPECT_EQ(arm.expected_block_count(), 1);
+    ASSERT_EQ(arm.pool_groups_size(), 1);
+    const auto& group = arm.pool_groups(0);
+    ASSERT_EQ(group.dst_device_block_ids_size(), 1);
+    EXPECT_EQ(group.dst_device_block_ids(0), 7 + j);
+    EXPECT_EQ(group.expected_pushes(), 1);
+    ASSERT_EQ(group.dst_expected_extent_bytes_size(), 1);
+    EXPECT_EQ(group.dst_expected_extent_bytes(0), 1024);
+
+    EXPECT_EQ(transport_.calls_[2 * j + 1].first, sender_addrs[j]);
+    const tpu_sync::rpc::StartTransferRequest dispatch =
+        WorkerStartTransfer(2 * j + 1);
+    EXPECT_TRUE(dispatch.is_sender());
+    EXPECT_EQ(dispatch.uuid(), arm.uuid());
+    EXPECT_EQ(dispatch.sub_plan_index(), j);
+    EXPECT_EQ(dispatch.sub_plan_count(), 4);
+    const auto& schedule = dispatch.shard_push_schedules().at(0);
+    ASSERT_EQ(schedule.entries_size(), 1);
+    EXPECT_EQ(schedule.entries(0).src_block_id(), src_blocks[j]);
+    EXPECT_EQ(schedule.entries(0).src_offset_bytes(), 0);
+    EXPECT_EQ(schedule.entries(0).dst_block_id(), 7 + j);
+    EXPECT_EQ(schedule.entries(0).dst_offset_bytes(), 0);
+    EXPECT_EQ(schedule.entries(0).size_bytes(), 1024);
+  }
+  EXPECT_EQ(uuids.count(60), 1u);
+
+  // One claim for the whole chain: the registration reads as claimed and
+  // cannot be cancelled.
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  EXPECT_EQ(RequestBlockStatuses("req-win", 60),
+            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
+  EXPECT_EQ(CancelIfUnclaimed("req-win", 60).response_data(), "false");
+}
+
+TEST_F(ReshardStackTest, WindowClipsStraddlingSpansAtWindowBoundaries) {
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  // Global space [0, 4096) = four destination pages. Rank 0 owns [0, 1536)
+  // (block 3 whole, block 4's first half); rank 1 owns [1536, 4096) as three
+  // spans, the middle one ([2560, 3584) from block 6) straddling the
+  // three-page window boundary at 3072. The first sub-transfer trims that
+  // span at the window end and the second resumes it with the source offset
+  // advanced past the bytes the first took.
+  RegisterGlobalSpans(0, "req-win2", 61, {3, 4},
+                      {{/*src_ordinal=*/0, /*src_offset=*/0,
+                        /*dst_global_offset=*/0, /*size=*/1024},
+                       {1, 0, /*dst_global_offset=*/1024, 512}});
+  RegisterGlobalSpans(1, "req-win2", 61, {5, 6, 7},
+                      {{0, 0, /*dst_global_offset=*/1536, 1024},
+                       {1, 0, /*dst_global_offset=*/2560, 1024},
+                       {2, 0, /*dst_global_offset=*/3584, 512}});
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-win2", 61, 2, {7, 8, 9, 10}, /*dst_skip=*/{},
+                 /*num_dst=*/1, /*dst_window=*/{3});
+  ASSERT_TRUE(resp.success()) << resp.message();
+  WaitForChains();
+
+  // Sub-transfer 0: arm + two senders; sub-transfer 1: arm + rank 1 only.
+  ASSERT_EQ(transport_.calls_.size(), 5u);
+  const tpu_sync::rpc::StartTransferRequest arm0 = WorkerStartTransfer(0);
+  EXPECT_EQ(arm0.sub_plan_index(), 0);
+  EXPECT_EQ(arm0.sub_plan_count(), 2);
+  ASSERT_EQ(arm0.pool_groups_size(), 1);
+  EXPECT_EQ(arm0.pool_groups(0).dst_device_block_ids_size(), 3);
+  // Two streams per sender (rank 0: 2 pairs, rank 1: 3 pairs, 2 streams).
+  EXPECT_EQ(arm0.pool_groups(0).expected_pushes(), 4);
+  ASSERT_EQ(arm0.pool_groups(0).dst_expected_extent_bytes_size(), 3);
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_EQ(arm0.pool_groups(0).dst_expected_extent_bytes(i), 1024);
+  }
+  bool saw_rank1_first = false;
+  for (size_t i = 1; i <= 2; ++i) {
+    if (transport_.calls_[i].first != "10.0.0.1:9102") continue;
+    saw_rank1_first = true;
+    const tpu_sync::rpc::StartTransferRequest dispatch = WorkerStartTransfer(i);
+    const auto& schedule = dispatch.shard_push_schedules().at(0);
+    // [1536, 2048) and [2048, 2560) of block 5 (split at the page boundary),
+    // then [2560, 3072) of block 6 trimmed at the window end.
+    ASSERT_EQ(schedule.entries_size(), 3);
+    EXPECT_EQ(schedule.entries(0).src_block_id(), 5);
+    EXPECT_EQ(schedule.entries(0).src_offset_bytes(), 0);
+    EXPECT_EQ(schedule.entries(0).dst_block_id(), 8);
+    EXPECT_EQ(schedule.entries(0).dst_offset_bytes(), 512);
+    EXPECT_EQ(schedule.entries(0).size_bytes(), 512);
+    EXPECT_EQ(schedule.entries(1).src_block_id(), 5);
+    EXPECT_EQ(schedule.entries(1).src_offset_bytes(), 512);
+    EXPECT_EQ(schedule.entries(1).dst_block_id(), 9);
+    EXPECT_EQ(schedule.entries(1).dst_offset_bytes(), 0);
+    EXPECT_EQ(schedule.entries(1).size_bytes(), 512);
+    EXPECT_EQ(schedule.entries(2).src_block_id(), 6);
+    EXPECT_EQ(schedule.entries(2).src_offset_bytes(), 0);
+    EXPECT_EQ(schedule.entries(2).dst_block_id(), 9);
+    EXPECT_EQ(schedule.entries(2).dst_offset_bytes(), 512);
+    EXPECT_EQ(schedule.entries(2).size_bytes(), 512);
+  }
+  EXPECT_TRUE(saw_rank1_first);
+
+  const tpu_sync::rpc::StartTransferRequest arm1 = WorkerStartTransfer(3);
+  EXPECT_EQ(arm1.sub_plan_index(), 1);
+  ASSERT_EQ(arm1.pool_groups_size(), 1);
+  ASSERT_EQ(arm1.pool_groups(0).dst_device_block_ids_size(), 1);
+  EXPECT_EQ(arm1.pool_groups(0).dst_device_block_ids(0), 10);
+  EXPECT_EQ(arm1.pool_groups(0).expected_pushes(), 2);
+  EXPECT_EQ(transport_.calls_[4].first, "10.0.0.1:9102");
+  const tpu_sync::rpc::StartTransferRequest dispatch1 = WorkerStartTransfer(4);
+  const auto& schedule1 = dispatch1.shard_push_schedules().at(0);
+  ASSERT_EQ(schedule1.entries_size(), 2);
+  // The tail of block 6's span: source offset advanced by the 512 bytes the
+  // first window took; then block 7 fills the page's second half.
+  EXPECT_EQ(schedule1.entries(0).src_block_id(), 6);
+  EXPECT_EQ(schedule1.entries(0).src_offset_bytes(), 512);
+  EXPECT_EQ(schedule1.entries(0).dst_block_id(), 10);
+  EXPECT_EQ(schedule1.entries(0).dst_offset_bytes(), 0);
+  EXPECT_EQ(schedule1.entries(0).size_bytes(), 512);
+  EXPECT_EQ(schedule1.entries(1).src_block_id(), 7);
+  EXPECT_EQ(schedule1.entries(1).src_offset_bytes(), 0);
+  EXPECT_EQ(schedule1.entries(1).dst_block_id(), 10);
+  EXPECT_EQ(schedule1.entries(1).dst_offset_bytes(), 512);
+  EXPECT_EQ(schedule1.entries(1).size_bytes(), 512);
+}
+
+TEST_F(ReshardStackTest, WindowComposesWithPrefixClip) {
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  // Four declared pages; the consumer already holds page 0 (skip 1024) and
+  // pulls the three-page suffix {8, 9, 10} with a two-page window: pages
+  // {8, 9} then {10}.
+  RegisterTwoPagesPerRank("req-win3", 62);
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-win3", 62, 2, {8, 9, 10}, /*dst_skip=*/{1024},
+                 /*num_dst=*/1, /*dst_window=*/{2});
+  ASSERT_TRUE(resp.success()) << resp.message();
+  WaitForChains();
+
+  ASSERT_EQ(transport_.calls_.size(), 5u);
+  const tpu_sync::rpc::StartTransferRequest arm0 = WorkerStartTransfer(0);
+  ASSERT_EQ(arm0.pool_groups(0).dst_device_block_ids_size(), 2);
+  EXPECT_EQ(arm0.pool_groups(0).dst_device_block_ids(0), 8);
+  EXPECT_EQ(arm0.pool_groups(0).dst_device_block_ids(1), 9);
+  // Rank 0's second page (global page 1 -> dst 8) and rank 1's first (global
+  // page 2 -> dst 9).
+  std::map<int64_t, int64_t> dst_by_src;
+  for (size_t i = 1; i <= 2; ++i) {
+    const tpu_sync::rpc::StartTransferRequest dispatch = WorkerStartTransfer(i);
+    const auto& schedule = dispatch.shard_push_schedules().at(0);
+    ASSERT_EQ(schedule.entries_size(), 1);
+    dst_by_src[schedule.entries(0).src_block_id()] =
+        schedule.entries(0).dst_block_id();
+  }
+  EXPECT_EQ(dst_by_src, (std::map<int64_t, int64_t>{{4, 8}, {5, 9}}));
+  const tpu_sync::rpc::StartTransferRequest arm1 = WorkerStartTransfer(3);
+  ASSERT_EQ(arm1.pool_groups(0).dst_device_block_ids_size(), 1);
+  EXPECT_EQ(arm1.pool_groups(0).dst_device_block_ids(0), 10);
+  const tpu_sync::rpc::StartTransferRequest dispatch1 = WorkerStartTransfer(4);
+  const auto& schedule1 = dispatch1.shard_push_schedules().at(0);
+  ASSERT_EQ(schedule1.entries_size(), 1);
+  EXPECT_EQ(schedule1.entries(0).src_block_id(), 6);
+  EXPECT_EQ(schedule1.entries(0).dst_block_id(), 10);
+}
+
+TEST_F(ReshardStackTest, ChainedArmRetriesWhileReceiverStagingIsBusy) {
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterTwoPagesPerRank("req-win4", 63);
+  // The receiver refuses the second sub-transfer's arm twice with the
+  // bounded-staging lease-wait message before accepting it.
+  transport_.RefuseArmsBusy("10.0.0.2:9600", /*after_calls=*/1, /*times=*/2);
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-win4", 63, 2, {7, 8, 9, 10}, /*dst_skip=*/{},
+                 /*num_dst=*/1, /*dst_window=*/{2});
+  ASSERT_TRUE(resp.success()) << resp.message();
+  WaitForChains();
+
+  // Sub-transfer 0 (pages 7, 8 = rank 0's pages): arm + rank 0's dispatch.
+  // Sub-transfer 1: 2 refused arms, the accepted arm, then rank 1's
+  // dispatch.
+  ASSERT_EQ(transport_.calls_.size(), 6u);
+  EXPECT_EQ(transport_.calls_[1].first, "10.0.0.1:9100");
+  for (size_t i = 2; i <= 4; ++i) {
+    EXPECT_EQ(transport_.calls_[i].first, "10.0.0.2:9600");
+    EXPECT_EQ(WorkerStartTransfer(i).sub_plan_index(), 1);
+  }
+  EXPECT_EQ(transport_.calls_[5].first, "10.0.0.1:9102");
+  EXPECT_EQ(service_->coordinator()->GetTransferStatus("req-win4"),
+            ReshardCoordinator::Status::kCompleted);
+}
+
+TEST_F(ReshardStackTest, ChainedArmFailureMarksTheTransferFailed) {
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterTwoPagesPerRank("req-win5", 64);
+  // A hard refusal of the second sub-transfer's arm ends the chain; the
+  // first sub-transfer was already dispatched, so the claim stays with it.
+  transport_.FailAfterCalls("10.0.0.2:9600", /*after_calls=*/1);
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-win5", 64, 2, {7, 8, 9, 10}, /*dst_skip=*/{},
+                 /*num_dst=*/1, /*dst_window=*/{2});
+  ASSERT_TRUE(resp.success()) << resp.message();
+  WaitForChains();
+
+  // Sub-transfer 0: arm + rank 0's dispatch; sub-transfer 1: the refused
+  // arm and nothing after it.
+  ASSERT_EQ(transport_.calls_.size(), 3u);
+  EXPECT_EQ(transport_.calls_[2].first, "10.0.0.2:9600");
+  EXPECT_EQ(service_->coordinator()->GetTransferStatus("req-win5"),
+            ReshardCoordinator::Status::kFailed);
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  EXPECT_EQ(RequestBlockStatuses("req-win5", 64),
+            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
 }
 
 TEST_F(ReshardStackTest, ClipValidationFailsClosed) {

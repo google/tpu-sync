@@ -1609,7 +1609,7 @@ TEST(HostOffloadBackendTest, DeleteSkipsPinnedBlocks) {
   EXPECT_EQ(backend.GetPinCount("h1"), 1);
 
   // Deleting a pinned block must skip it without erasing the block.
-  backend.Delete({"h1"}, {});
+  EXPECT_EQ(backend.Delete({"h1"}), 0);
   auto lookup_res = backend.Lookup({"h1"});
   ABSL_ASSERT_OK(lookup_res.status());
   EXPECT_EQ(lookup_res->size(), 1);
@@ -1618,10 +1618,68 @@ TEST(HostOffloadBackendTest, DeleteSkipsPinnedBlocks) {
   EXPECT_EQ(backend.GetPinCount("h1"), 0);
 
   // Now that it's unpinned, Delete removes it.
-  backend.Delete({"h1"}, {});
+  EXPECT_EQ(backend.Delete({"h1"}), 1);
   auto lookup_after = backend.Lookup({"h1"});
   ABSL_ASSERT_OK(lookup_after.status());
   EXPECT_TRUE(lookup_after->empty());
+}
+
+TEST(HostOffloadBackendTest,
+     DeleteDefaultOptionsErasesUnpinnedAndPopulatesOutputs) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/3);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"cand", "host", "pinned"},
+                 {RaidenBlockId(id, 10, BlockStatus::HOST),
+                  RaidenBlockId(id, 11, BlockStatus::HOST),
+                  RaidenBlockId(id, 12, BlockStatus::HOST)});
+  ASSERT_TRUE(backend.Pin({"pinned"}));
+  // Overflow capacity 3 to demote "cand" to an eviction candidate.
+  backend.Insert({"hbm", "both"},
+                 {RaidenBlockId(id, -1, 5, BlockStatus::HBM),
+                  RaidenBlockId(id, 13, 6, BlockStatus::HOST_AND_HBM)});
+
+  std::vector<int> deallocated_ids = {999};
+  std::vector<std::string> deleted_hashes = {"stale"};
+  EXPECT_EQ(backend.Delete(
+                {"missing", "pinned", "cand", "hbm", "both"},
+                DeleteOptions{.deallocated_host_block_ids = &deallocated_ids,
+                              .deleted_hashes = &deleted_hashes}),
+            3);
+  EXPECT_THAT(deallocated_ids, ::testing::ElementsAre(10, 13));
+  EXPECT_THAT(deleted_hashes, ::testing::ElementsAre("cand", "hbm", "both"));
+  EXPECT_EQ(backend.GetPinCount("pinned"), 1);
+}
+
+TEST(HostOffloadBackendTest,
+     DeleteEvictHostResidentSkipsHbmOnlyPinnedAndAbsent) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/3);
+  RaidenId id{"job", "0", "data", 0};
+  backend.Insert({"cand", "hbm", "pinned"},
+                 {RaidenBlockId(id, 10, BlockStatus::HOST),
+                  RaidenBlockId(id, -1, 5, BlockStatus::HBM),
+                  RaidenBlockId(id, 12, BlockStatus::HOST)});
+  ASSERT_TRUE(backend.Pin({"pinned"}));
+  // Overflow capacity 3 to demote "cand" to an eviction candidate.
+  backend.Insert({"both"},
+                 {RaidenBlockId(id, 13, 6, BlockStatus::HOST_AND_HBM)});
+
+  std::vector<int> deallocated_ids = {999};
+  std::vector<std::string> evicted_hashes = {"stale"};
+  EXPECT_EQ(backend.Delete({"missing", "pinned", "cand", "hbm", "both"},
+                           DeleteOptions::EvictHostResident(&deallocated_ids,
+                                                            &evicted_hashes)),
+            2);
+  EXPECT_THAT(deallocated_ids, ::testing::ElementsAre(10, 13));
+  EXPECT_THAT(evicted_hashes, ::testing::ElementsAre("cand", "both"));
+
+  // "hbm" and "pinned" must remain in the backend.
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto remaining,
+      backend.Lookup({"hbm", "pinned"},
+                     LookupOptions{.enable_global = false,
+                                   .match_mode = LookupMatchMode::kSubset}));
+  EXPECT_THAT(remaining, UnorderedElementsAre(::testing::Key("hbm"),
+                                              ::testing::Key("pinned")));
 }
 
 TEST(HostOffloadBackendTest, LoadUpdatesTrackerOnSuccessAndFailure) {

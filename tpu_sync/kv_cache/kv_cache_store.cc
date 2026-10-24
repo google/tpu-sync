@@ -1447,7 +1447,7 @@ void KVCacheStore::LoadFromSecondaryBackend(
           // (e.g. the files were evicted out of band). Drop those entries so
           // the next Lookup re-probes storage. The worker's error code does
           // not survive the RPC, so this is done for every recall failure.
-          secondary_backend->Delete(block_hashes, /*slices=*/{});
+          secondary_backend->Delete(block_hashes);
           // TODO: revisit returning every staging block and failing the whole
           // batch on a recall error. The transfer reports a single status, so
           // a partial storage failure (some blocks landed in HBM) is treated

@@ -308,12 +308,12 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
     return option != InsertOption::kAdmitStrict;
   }
 
-  // Storage files are never removed through this tier. When the metadata
-  // cache is enabled, this drops the cached shard keys of `block_hashes` so the
-  // next Lookup re-probes storage; KVCacheStore calls it when a recall from
-  // this tier fails. `slices` is unused. No-op when the cache is disabled.
-  void Delete(absl::Span<const std::string> block_hashes,
-              absl::Span<const RaidenBlockId> slices) override;
+  // Drops cached shard keys of `block_hashes` so the next Lookup re-probes
+  // storage. Returns the number of block hashes whose cached keys were erased.
+  // No-op (returns 0) when `options.host_resident_only` is true or the cache
+  // is disabled.
+  size_t Delete(absl::Span<const std::string> block_hashes,
+                const DeleteOptions& options = {}) override;
   bool Pin(absl::Span<const std::string> block_hashes) override { return true; }
   void Release(absl::Span<const std::string> block_hashes) override {}
   int GetPinCount(const std::string& hash) const override { return 0; }

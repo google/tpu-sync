@@ -45,7 +45,7 @@ export TPU_LIBRARY_PATH="/lib/libtpu.so"
 Execute the benchmark using the standard `bazel run` command. Use `--` to separate Bazel arguments from the benchmark's runtime flags:
 
 ```bash
-bazel run -c opt //tpu_raiden/core:raw_transfer_perf_test -- \
+bazel run -c opt //tpu_sync/core:raw_transfer_perf_test -- \
   --num_tpus=1 \
   --num_layers=256 \
   --num_blocks=32

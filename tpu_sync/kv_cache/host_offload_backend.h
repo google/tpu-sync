@@ -93,9 +93,15 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   std::vector<std::string> GetEvictableKeys(size_t count) override;
 
   // --- Global Memory Pooling & RPC Methods ---
-  // Loads KV cache blocks from local host DRAM (if `remote_id` is empty or
-  // matches this backend's id) or from the specified peer. See KVCacheStoreBackend
-  // for the argument contract.
+  // Loads KV cache blocks from local host DRAM (if `options.remote_id` is empty
+  // or matches this backend's id) or from the specified peer. See
+  // KVCacheStoreBackend for the argument contract.
+  tsl::Future<> Load(absl::Span<const std::string> block_hashes,
+                     absl::Span<const int32_t> device_block_ids,
+                     BlockTracker* absl_nonnull load_tracker,
+                     const LoadOptions& options = {}) override;
+
+  // Legacy 5-argument Load overload. Forwards to the 4-argument Load API.
   tsl::Future<> Load(const RaidenId& remote_id,
                      absl::Span<const std::string> block_hashes,
                      absl::Span<const int32_t> device_block_ids,
@@ -105,7 +111,8 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   tsl::Future<> Save(absl::Span<const std::string> block_hashes,
                      absl::Span<const int64_t> src_device_block_ids,
                      absl::Span<const int32_t> dst_host_block_ids,
-                     BlockTracker* absl_nonnull save_tracker) override;
+                     BlockTracker* absl_nonnull save_tracker,
+                     const SaveOptions& options = {}) override;
 
   // --- WriteRemote & registry overrides ------------------------------------
   tsl::Future<> RegisterBlocksAsync(

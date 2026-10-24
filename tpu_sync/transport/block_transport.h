@@ -37,6 +37,7 @@
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/lib/adapter/peregrine_transport_adapter.h"
 #include "tpu_sync/transport/lib/adapter/socket_transport_adapter.h"
 #include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/chunk.h"
@@ -59,9 +60,36 @@ using BlockReceivedCallback = lib::BlockReceivedCallback;
 // (0 = every shard, the legacy encoding).
 inline constexpr int kMaxShardMaskBits = 16;
 
+// Data-plane adapter used by a BlockTransport block op.
+enum class TransportBackend : uint8_t {
+  kSocket = 0,     // lib::SocketTransportAdapter.
+  kPeregrine = 1,  // lib::PeregrineTransportAdapter.
+};
+
 // High-speed Key-Value block transport engine.
 class BlockTransport final {
  public:
+  struct Config {
+    int handshake_read_timeout_ms = -1;
+    int payload_read_timeout_ms = -1;
+    int ack_write_timeout_ms = -1;
+    int payload_write_timeout_ms = -1;
+    size_t coalesce_window_bytes = 0;
+
+    absl::flat_hash_map<lib::TransferOp, TransportBackend> op_backends;
+
+    TransportBackend backend_for(lib::TransferOp op) const {
+      auto it = op_backends.find(op);
+      return it == op_backends.end() ? TransportBackend::kSocket : it->second;
+    }
+    bool uses_peregrine() const {
+      for (const auto& [op, backend] : op_backends) {
+        if (backend == TransportBackend::kPeregrine) return true;
+      }
+      return false;
+    }
+  };
+
   // Constructor sets up a TCP listening socket on the given `local_port`. It
   // starts #`parallelism` worker threads to handle incoming `WriteTask`s.
   //
@@ -69,20 +97,13 @@ class BlockTransport final {
   // node, push streams whose shards live on node N are sent by worker threads
   // pinned to N (see lib::SocketTransportAdapter). Otherwise every stream
   // uses the default (unpinned) send path exactly as before.
+  //
   BlockTransport(BlockTransportDelegate* delegate, int local_port,
                  const std::vector<std::string>& local_ips = {},
-                 int parallelism = 1);
+                 int parallelism = 1, bool socket_only_transport = false);
 
   // Destructor closes all sockets and joins all threads.
   ~BlockTransport();
-
-  struct Config {
-    int handshake_read_timeout_ms = -1;
-    int payload_read_timeout_ms = -1;
-    int ack_write_timeout_ms = -1;
-    int payload_write_timeout_ms = -1;
-    size_t coalesce_window_bytes = 0;
-  };
 
   const Config& config() const { return config_; }
 
@@ -256,6 +277,11 @@ class BlockTransport final {
   // when one exists, otherwise the default `transport_adapter_`.
   lib::TransportAdapter* AdapterFor(int numa_node);
 
+  // Adapter `op` is configured to use (`Config::backend_for`): the socket
+  // adapter, or the Peregrine adapter when it is running. Fails when the
+  // Peregrine backend is selected but its transport is not running.
+  absl::StatusOr<lib::TransportAdapter*> AdapterForOp(lib::TransferOp op);
+
   // Builds a batch of Requests for block pull transfer.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockPullRequests(
       const std::vector<int>& src_block_ids,
@@ -355,6 +381,9 @@ class BlockTransport final {
   // (pulls, single-group pushes) uses `transport_adapter_`.
   absl::flat_hash_map<int, std::unique_ptr<lib::SocketTransportAdapter>>
       numa_adapters_;
+  // Peregrine transport for the block ops whose backend is kPeregrine; null
+  // when no op selects it or it failed to start.
+  std::unique_ptr<lib::PeregrineTransportAdapter> peregrine_adapter_;
 };
 
 }  // namespace transport

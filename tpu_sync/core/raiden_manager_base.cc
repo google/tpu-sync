@@ -60,14 +60,15 @@ RaidenManagerBase::RaidenManagerBase(
     size_t num_layers, std::vector<transport::ShardInfo> shards,
     size_t slice_byte_size, std::optional<int> local_port, int parallelism,
     std::optional<std::string> bind_ip, std::vector<int> numa_nodes,
-    std::vector<HostNicAddress> host_nics)
+    std::vector<HostNicAddress> host_nics, bool socket_only_transport)
     : num_layers_(num_layers),
       num_shards_(shards.size()),
       slice_byte_size_(slice_byte_size),
       parallelism_(parallelism),
       shards_(std::move(shards)),
       local_port_cfg_(local_port.value_or(0)),
-      bind_ip_cfg_(std::move(bind_ip)) {
+      bind_ip_cfg_(std::move(bind_ip)),
+      socket_only_transport_(socket_only_transport) {
   shard_factor_ = 1;
   (void)telemetry::RaidenMetricStore::GetGlobalMetricStore();
   const bool has_shard_placement = absl::c_any_of(
@@ -253,7 +254,7 @@ tpu_raiden::transport::BlockTransport* RaidenManagerBase::InitTransportServer(
   }
 
   server_ = std::make_unique<tpu_raiden::transport::BlockTransport>(
-      this, local_port_cfg_, local_ips_, parallelism_);
+      this, local_port_cfg_, local_ips_, parallelism_, socket_only_transport_);
   return server_.get();
 }
 

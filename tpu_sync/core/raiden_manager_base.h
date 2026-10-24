@@ -58,13 +58,16 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   // distinct NUMA nodes of the incoming buffers (the first one becomes
   // `assigned_numa_node()`); when no shard in |shards| carries a NUMA node
   // (`numa_node >= 0`), every shard is attributed to `assigned_numa_node()`
-  // and NIC selection uses the single-node behaviour.
+  // and NIC selection uses the single-node behaviour. |socket_only_transport|
+  // keeps this manager's ops on the socket path regardless of
+  // TPU_RAIDEN_ENABLE_PEREGRINE.
   RaidenManagerBase(
       size_t num_layers, std::vector<transport::ShardInfo> shards,
       size_t slice_byte_size, std::optional<int> local_port = std::nullopt,
       int parallelism = 1, std::optional<std::string> bind_ip = std::nullopt,
       std::vector<int> numa_nodes = {},
-      std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses());
+      std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses(),
+      bool socket_only_transport = false);
 
   ~RaidenManagerBase() override;
 
@@ -199,6 +202,7 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   int local_port_cfg_ = 0;
   std::optional<std::string> bind_ip_cfg_ = std::nullopt;
   std::vector<std::string> local_ips_;
+  const bool socket_only_transport_;
 
   tpu_raiden::transport::BlockTransport* InitTransportServer(
       std::vector<HostNicAddress> host_nics = {});

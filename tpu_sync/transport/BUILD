@@ -57,6 +57,7 @@ cc_library(
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport/lib:chunk",
         "//tpu_sync/transport/lib:chunk_serializer",
+        "//tpu_sync/transport/lib:peregrine_transport_adapter",
         "//tpu_sync/transport/lib:raw_buffer_transport",
         "//tpu_sync/transport/lib:socket_transport_adapter",
         "//tpu_sync/transport/lib:transport_adapter",

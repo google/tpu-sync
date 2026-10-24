@@ -4289,7 +4289,8 @@ TEST_F(StoreDiscoveryTest, FailedLoadDropsTheCachedPeerClient) {
   // as the loads below fail while resolving or querying the peer.
   BlockTracker tracker;
   auto first =
-      backend->Load(peer_rid, {"h"}, {0}, /*slices=*/{}, &tracker).Await();
+      backend->Load({"h"}, {0}, &tracker, LoadOptions{.remote_id = peer_rid})
+          .Await();
   ASSERT_FALSE(first.ok());
   ASSERT_TRUE(absl::IsUnavailable(first)) << first.ToString();
 
@@ -4306,7 +4307,8 @@ TEST_F(StoreDiscoveryTest, FailedLoadDropsTheCachedPeerClient) {
   // the hash, because Fetch validates its arguments before it looks anything
   // up, and this store registers no workers to name as endpoints.
   auto second =
-      backend->Load(peer_rid, {"h"}, {0}, /*slices=*/{}, &tracker).Await();
+      backend->Load({"h"}, {0}, &tracker, LoadOptions{.remote_id = peer_rid})
+          .Await();
   EXPECT_TRUE(absl::IsInvalidArgument(second))
       << "expected the restarted peer to answer; got " << second.ToString()
       << " -- the cached client still points at the address it had";
@@ -6116,14 +6118,6 @@ class ErrorLookupBackend : public KVCacheStoreBackend {
       absl::Span<const std::string> block_hashes,
       const LookupOptions& options = {}) override {
     return absl::InternalError("Backend lookup failed");
-  }
-  tsl::Future<> Load(const RaidenId& remote_id,
-                     absl::Span<const std::string> block_hashes,
-                     absl::Span<const int32_t> device_block_ids,
-                     absl::Span<const RaidenBlockId> slices,
-                     BlockTracker* absl_nonnull load_tracker) override {
-    CHECK(load_tracker != nullptr);
-    return {};
   }
   bool Insert(absl::Span<const std::string> block_hashes,
               absl::Span<const RaidenBlockId> slices,

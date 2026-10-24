@@ -44,6 +44,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
@@ -61,6 +62,7 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/lib/adapter/peregrine_transport_adapter.h"
 #include "tpu_sync/transport/lib/adapter/socket_transport_adapter.h"
 #include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/chunk.h"
@@ -76,7 +78,37 @@ using ::peregrine::v1::GetAddrPortPair;
 
 constexpr absl::Duration kTransportMetricsPollInterval = absl::Seconds(1);
 
-BlockTransport::Config ReadConfigFromEnv() {
+void ApplyPeregrineEnv(BlockTransport::Config& config) {
+  const char* raw = std::getenv("TPU_RAIDEN_ENABLE_PEREGRINE");
+  if (raw == nullptr) return;
+  const std::string val =
+      absl::AsciiStrToLower(absl::StripAsciiWhitespace(raw));
+  if (val.empty() || val == "false" || val == "0") return;
+  if (val == "true" || val == "all") {
+    for (lib::TransferOp op :
+         {lib::TransferOp::kBlockPush, lib::TransferOp::kBlockPull,
+          lib::TransferOp::kBlockPushExplicit}) {
+      config.op_backends[op] = TransportBackend::kPeregrine;
+    }
+    return;
+  }
+  for (absl::string_view entry :
+       absl::StrSplit(val, ',', absl::SkipWhitespace())) {
+    int op = 0;
+    if (absl::SimpleAtoi(absl::StripAsciiWhitespace(entry), &op) &&
+        (op == 1 || op == 2 || op == 6)) {
+      config.op_backends[static_cast<lib::TransferOp>(op)] =
+          TransportBackend::kPeregrine;
+    } else {
+      LOG(WARNING) << "TPU_RAIDEN_ENABLE_PEREGRINE=\"" << raw
+                   << "\": ignoring entry \"" << entry
+                   << "\"; expected true|all, false|0, or a comma-separated "
+                      "list of block ops in {1, 2, 6}";
+    }
+  }
+}
+
+BlockTransport::Config ReadConfigFromEnv(bool socket_only_transport) {
   BlockTransport::Config config;
   if (const char* val =
           std::getenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
@@ -136,6 +168,7 @@ BlockTransport::Config ReadConfigFromEnv() {
       config.coalesce_window_bytes = parsed;
     }
   }
+  if (!socket_only_transport) ApplyPeregrineEnv(config);
   return config;
 }
 
@@ -409,10 +442,10 @@ absl::StatusOr<IncomingPushSpec> ResolveIncomingPushSpec(
 
 BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
                                const std::vector<std::string>& local_ips,
-                               int parallelism)
+                               int parallelism, bool socket_only_transport)
     : block_delegate_(delegate),
       parallelism_(parallelism),
-      config_(ReadConfigFromEnv()),
+      config_(ReadConfigFromEnv(socket_only_transport)),
       raw_transport_(
           delegate, local_port, local_ips,
           [this](int client_fd, const lib::ChunkHeader& header) {
@@ -437,6 +470,20 @@ BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
     for (const int node : send_numa_nodes) {
       numa_adapters_[node] = std::make_unique<lib::SocketTransportAdapter>(
           &raw_transport_, parallelism_, node);
+    }
+  }
+  // The Peregrine transport is started only when a block op selects it; the
+  // default socket configuration never touches Peregrine.
+  if (config_.uses_peregrine()) {
+    absl::StatusOr<std::unique_ptr<lib::PeregrineTransportAdapter>> adapter =
+        lib::PeregrineTransportAdapter::Create(raw_transport_.bound_ip(),
+                                               /*port=*/0, parallelism_);
+    if (adapter.ok()) {
+      peregrine_adapter_ = *std::move(adapter);
+    } else {
+      LOG(ERROR) << "Peregrine transport backend requested but unavailable; "
+                    "block ops configured for it will fail: "
+                 << adapter.status();
     }
   }
   LOG(INFO) << "local_port=" << local_port
@@ -1055,12 +1102,26 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
     const std::vector<int>& dst_block_ids, int parallelism,
     MajorOrder major_order, uint64_t uuid, int layer_idx,
     std::optional<int> wire_layer_idx) {
+  const size_t num_shards = block_delegate_->num_shards();
+  const lib::TransferOp op = dst_block_ids.empty()
+                                 ? lib::TransferOp::kBlockPush
+                                 : lib::TransferOp::kBlockPushExplicit;
+  if (config_.backend_for(op) == TransportBackend::kPeregrine) {
+    absl::StatusOr<lib::TransportAdapter*> adapter = AdapterForOp(op);
+    if (!adapter.ok()) {
+      RecordTransferFailure(adapter.status(), metric_labels::kDirectionPush);
+      return tsl::Future<std::vector<int>>(adapter.status());
+    }
+    const std::vector<int> all_shards = AllShards(num_shards);
+    return AsyncPushShards(peers, src_block_ids, dst_block_ids, parallelism,
+                           major_order, uuid, layer_idx, wire_layer_idx,
+                           all_shards, /*num_groups=*/1, *adapter);
+  }
   // Split the push by source NUMA node: every group of shards sharing a node
   // is pushed by the adapter pinned to that node. The receiver pairs the
   // per-group shard subsets of one block range by destination id, so a
   // multi-group push requires explicit destinations (op 6); otherwise fall
   // back to one legacy group.
-  const size_t num_shards = block_delegate_->num_shards();
   std::vector<ShardGroup> groups =
       ShardGroupsByNuma(block_delegate_->shards(), num_shards);
   if (groups.size() > 1 && dst_block_ids.empty()) {
@@ -1219,7 +1280,9 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
       BuildBlockPullRequests(src_block_ids, allocated_ids, explicit_dst_ptrs,
                              major_order, uuid, P, on_block_received));
 
-  ABSL_RETURN_IF_ERROR(transport_adapter_->Post(peers, requests).status());
+  ABSL_ASSIGN_OR_RETURN(lib::TransportAdapter* const adapter,
+                        AdapterForOp(lib::TransferOp::kBlockPull));
+  ABSL_RETURN_IF_ERROR(adapter->Post(peers, requests).status());
   return allocated_ids;
 }
 
@@ -1370,6 +1433,25 @@ lib::TransportAdapter* BlockTransport::AdapterFor(int numa_node) {
   auto it = numa_adapters_.find(numa_node);
   return it != numa_adapters_.end() ? it->second.get()
                                     : transport_adapter_.get();
+}
+
+absl::StatusOr<lib::TransportAdapter*> BlockTransport::AdapterForOp(
+    lib::TransferOp op) {
+  switch (config_.backend_for(op)) {
+    case TransportBackend::kSocket:
+      return transport_adapter_.get();
+    case TransportBackend::kPeregrine:
+      if (peregrine_adapter_ == nullptr) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "Block op ", static_cast<int>(op),
+            " is configured for the Peregrine backend, which failed to start "
+            "(see the BlockTransport startup log)"));
+      }
+      return peregrine_adapter_.get();
+  }
+  return absl::InternalError(absl::StrCat(
+      "Unknown transport backend ", static_cast<int>(config_.backend_for(op)),
+      " for block op ", static_cast<int>(op)));
 }
 
 absl::StatusOr<std::vector<lib::Request>>

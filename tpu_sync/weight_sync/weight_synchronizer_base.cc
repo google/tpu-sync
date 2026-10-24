@@ -104,7 +104,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
           layer_buffers.empty() ? 0
                                 : layer_buffers[0][0].GetOnDeviceSizeInBytes(),
           local_port, parallelism, bind_ip,
-          raiden::DetectNumaNodes(layer_buffers), GetLocalHostNicAddresses()),
+          raiden::DetectNumaNodes(layer_buffers), GetLocalHostNicAddresses(),
+          /*socket_only_transport=*/true),
       auto_h2d_(auto_h2d),
       push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
           std::max(parallelism_, 4))),
@@ -265,7 +266,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
           shards.size() == num_shards ? std::move(shards)
                                       : BuildDefaultShards(num_shards),
           slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0], local_port,
-          parallelism, bind_ip, std::move(numa_nodes), std::move(host_nics)),
+          parallelism, bind_ip, std::move(numa_nodes), std::move(host_nics),
+          /*socket_only_transport=*/true),
       auto_h2d_(auto_h2d),
       push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
           std::max(parallelism_, 4))),

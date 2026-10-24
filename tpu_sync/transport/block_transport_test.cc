@@ -2212,6 +2212,143 @@ TEST(DecodeReadTimeoutTest, HandshakeAckWriteTimesOutAndReleasesLease) {
   EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
 }
 
+TEST(TransportBackendTest, ConfigFromEnv) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  MockDelegate delegate(/*slice_size=*/64);
+  // (op 1, op 6, op 2) backends a BlockTransport picks up for `value`.
+  const auto backends_for = [&](const char* value) {
+    if (value == nullptr) {
+      unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE");
+    } else {
+      setenv("TPU_RAIDEN_ENABLE_PEREGRINE", value, 1);
+    }
+    BlockTransport transport(&delegate, /*local_port=*/0);
+    const BlockTransport::Config& config = transport.config();
+    return std::make_tuple(
+        config.backend_for(lib::TransferOp::kBlockPush),
+        config.backend_for(lib::TransferOp::kBlockPushExplicit),
+        config.backend_for(lib::TransferOp::kBlockPull));
+  };
+  constexpr TransportBackend kS = TransportBackend::kSocket;
+  constexpr TransportBackend kP = TransportBackend::kPeregrine;
+  const auto all = [](TransportBackend b) { return std::make_tuple(b, b, b); };
+
+  // Unset, empty, "false" or "0": everything stays on socket.
+  EXPECT_EQ(backends_for(nullptr), all(kS));
+  EXPECT_EQ(backends_for(""), all(kS));
+  for (const char* off : {"0", "false", "FALSE"}) {
+    EXPECT_EQ(backends_for(off), all(kS)) << off;
+  }
+  // "true" / "all": every block op on Peregrine.
+  for (const char* on : {"true", "all", "TRUE"}) {
+    EXPECT_EQ(backends_for(on), all(kP)) << on;
+  }
+  // A list of wire op numbers enables Peregrine for just those ops; "1" is op
+  // 1, not "enabled".
+  EXPECT_EQ(backends_for("1"), std::make_tuple(kP, kS, kS));
+  EXPECT_EQ(backends_for("6"), std::make_tuple(kS, kP, kS));
+  EXPECT_EQ(backends_for("2"), std::make_tuple(kS, kS, kP));
+  EXPECT_EQ(backends_for("1,6"), std::make_tuple(kP, kP, kS));
+  EXPECT_EQ(backends_for("1,2,6"), all(kP));
+  EXPECT_EQ(backends_for(" 2 , 1 "), std::make_tuple(kP, kS, kP));
+  // Unknown entries are ignored; valid entries beside them still apply.
+  EXPECT_EQ(backends_for("rdma"), all(kS));
+  EXPECT_EQ(backends_for("yes"), all(kS));
+  EXPECT_EQ(backends_for("peregrine"), all(kS));
+  EXPECT_EQ(backends_for("3"), all(kS));
+  EXPECT_EQ(backends_for("6,bogus"), std::make_tuple(kS, kP, kS));
+  EXPECT_EQ(backends_for("6=peregrine"), all(kS));
+}
+
+TEST(TransportBackendTest, SocketBackendStartsNoPeregrineTransport) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE");
+  MockDelegate delegate(/*slice_size=*/64);
+  BlockTransport transport(&delegate, /*local_port=*/0);
+  EXPECT_FALSE(transport.config().uses_peregrine());
+}
+
+TEST(TransportBackendTest, SocketOnlyTransportIgnoresEnv) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "all", 1);
+  MockDelegate delegate(/*slice_size=*/64);
+  BlockTransport transport(&delegate, /*local_port=*/0, /*local_ips=*/{},
+                           /*parallelism=*/1, /*socket_only_transport=*/true);
+  EXPECT_FALSE(transport.config().uses_peregrine());
+}
+
+TEST(TransportBackendTest, PeregrineReceiverAllocatedPushIsUnimplemented) {
+  // Only op 1 (receiver-allocated push) is on Peregrine; the adapter rejects
+  // it before contacting the peer, so the peer address is never used.
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "1", 1);
+  MockDelegate delegate(/*slice_size=*/64);
+  BlockTransport sender(&delegate, 0);
+
+  EXPECT_THAT(sender
+                  .AsyncPush({"127.0.0.1:1"}, /*src_block_ids=*/{0},
+                             /*dst_block_ids=*/{})
+                  .Await(),
+              StatusIs(absl::StatusCode::kUnimplemented));
+}
+
+TEST(TransportBackendTest, PeregrinePullWithoutRemoteAddressFails) {
+  // Only op 2 (pull) is on Peregrine. Pull requests carry no remote address,
+  // which Peregrine rejects before contacting the peer.
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "2", 1);
+  MockDelegate delegate(/*slice_size=*/64);
+  BlockTransport puller(&delegate, 0);
+
+  EXPECT_THAT(puller.SyncPull({"127.0.0.1:1"}, /*src_block_ids=*/{0}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_P(BlockTransportTest, MixedBackendsRouteIndependently) {
+  constexpr size_t kSize = 1024;
+  // Op 6 on Peregrine; op 1 and op 2 stay on the socket path.
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+  MockDelegate source_delegate(kSize);
+  MockDelegate puller_delegate(kSize);
+  std::memset(source_delegate.data(), 0xAB, kSize);
+  std::memset(puller_delegate.data(), 0x00, kSize);
+
+  BlockTransport source(&source_delegate, 0);
+  BlockTransport puller(&puller_delegate, 0);
+  BindControlChannels(&source, &source_delegate, &puller, &puller_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ASSERT_TRUE(puller.config().uses_peregrine());
+
+  // The pull stays on the socket path and addresses the raw transport port
+  // even though explicit pushes on the same transport are configured for
+  // Peregrine.
+  const absl::StatusOr<std::vector<int>> pulled =
+      puller.SyncPull({absl::StrCat("localhost:", source.local_port())},
+                      /*src_block_ids=*/{0});
+  ABSL_ASSERT_OK(pulled);
+  EXPECT_EQ(puller_delegate.data()[0], 0xAB);
+  EXPECT_EQ(puller_delegate.data()[kSize - 1], 0xAB);
+
+  // So does a receiver-allocated push (op 1): same AsyncPush entry point as
+  // op 6, different op, different backend.
+  std::memset(puller_delegate.data(), 0x00, kSize);
+  const absl::StatusOr<std::vector<int>> pushed =
+      source
+          .AsyncPush({absl::StrCat("localhost:", puller.local_port())},
+                     /*src_block_ids=*/{0}, /*dst_block_ids=*/{})
+          .Await();
+  ABSL_ASSERT_OK(pushed);
+  EXPECT_EQ(puller_delegate.data()[0], 0xAB);
+  EXPECT_EQ(puller_delegate.data()[kSize - 1], 0xAB);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     PspAndPlainTcp, BlockTransportTest, ::testing::Bool(),
     [](const ::testing::TestParamInfo<bool>& info) {

@@ -247,5 +247,81 @@ class PollStatsWithDetailsTest(unittest.TestCase):
     self.assertEqual(failed.phase, "d2h")
 
 
+class _FakeReadImpl:
+  """Records the pull-serve calls the wrapper forwards."""
+
+  def __init__(self):
+    self.calls = []
+
+  def notify_for_read(self, *args, **kwargs):
+    self.calls.append(("notify_for_read", args, kwargs))
+    return 1
+
+  def start_read(self, *args, **kwargs):
+    self.calls.append(("start_read", args, kwargs))
+
+
+class HostMemoryReadTest(unittest.TestCase):
+
+  def _manager(self):
+    manager = object.__new__(kv_cache_manager.KVCacheManager)
+    manager._impl = _FakeReadImpl()  # pylint: disable=protected-access
+    return manager
+
+  def test_register_read_names_where_its_blocks_live(self):
+    manager = self._manager()
+
+    self.assertTrue(manager.register_read("req", 7, [1, 2], source="host"))
+    self.assertTrue(manager.register_read("req", 8, [3]))
+
+    self.assertEqual(
+        manager._impl.calls,  # pylint: disable=protected-access
+        [
+            ("notify_for_read", ("req", 7, [1, 2]), {"host_source": True}),
+            ("notify_for_read", ("req", 8, [3]), {"host_source": False}),
+        ],
+    )
+
+  def test_start_read_names_its_destination_and_needs_no_device_blocks(self):
+    manager = self._manager()
+
+    manager.start_read(
+        "req",
+        7,
+        "10.0.0.1:31000",
+        [1, 2],
+        local_host_block_ids=[5, 6],
+        destination="host",
+    )
+    manager.start_read("req", 8, "10.0.0.1:31000", [3], [9])
+
+    self.assertEqual(
+        manager._impl.calls,  # pylint: disable=protected-access
+        [
+            (
+                "start_read",
+                ("req", 7, "10.0.0.1:31000", [1, 2], [], 1, [5, 6]),
+                {"host_destination": True},
+            ),
+            (
+                "start_read",
+                ("req", 8, "10.0.0.1:31000", [3], [9], 1, None),
+                {"host_destination": False},
+            ),
+        ],
+    )
+
+  def test_block_memory_is_device_or_host(self):
+    manager = self._manager()
+
+    with self.assertRaisesRegex(ValueError, "source must be 'device' or"):
+      manager.register_read("req", 7, [1], source="hbm")
+    with self.assertRaisesRegex(ValueError, "destination must be 'device' or"):
+      manager.start_read("req", 7, "10.0.0.1:31000", [1], [1], destination="x")
+
+    calls = manager._impl.calls  # pylint: disable=protected-access
+    self.assertEqual(calls, [])
+
+
 if __name__ == "__main__":
   unittest.main()

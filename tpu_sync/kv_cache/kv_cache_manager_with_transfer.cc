@@ -173,7 +173,7 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
       }
       session = it->second;
     }
-    absl::Status status = session->ExecuteLayerH2d(*this, layer_idx);
+    absl::Status status = session->OnLayerReceived(*this, layer_idx);
     MaybeUnregisterSettledRecv(uuid, *session);
     return status;
   };
@@ -466,12 +466,18 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     return;
   }
   if (local_control_port_ >= 0) {
-    if (max_blocks <= 0) {
-      throw std::invalid_argument("max_blocks must be positive");
-    }
-    if (num_slots <= 0) {
+    // A control server serves pulls out of staging slots, or, on a manager
+    // built over a host pool alone, host-resident reads of that pool.
+    const bool has_staging = max_blocks > 0 && num_slots > 0;
+    const bool has_host_pool = max_blocks == 0 && num_slots == 0 &&
+                               base_->host_block_manager()->total_blocks() > 0;
+    if (!has_staging && !has_host_pool) {
+      if (max_blocks <= 0) {
+        throw std::invalid_argument("max_blocks must be positive");
+      }
       throw std::invalid_argument("num_slots must be positive");
     }
+    serves_host_pool_reads_only_ = has_host_pool;
     if (base_->num_layers() > 0) {
       ConfigureDataPortFromKvTransfer();
     }
@@ -486,7 +492,8 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
 int64_t KVCacheManagerWithTransfer::NotifyForRead(
     const std::string& req_id, uint64_t uuid,
     const std::vector<int64_t>& block_ids,
-    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    BlockMemory source) {
   RAIDEN_TRACE_FN("KVTransfer::NotifyForRead", [&]() {
     return absl::StrCat("req=", req_id, " uuid=", uuid,
                         " blocks=", block_ids.size());
@@ -495,11 +502,26 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
   if (block_ids.empty()) {
     return 0;
   }
+  if (source == BlockMemory::kHost) {
+    // Duplicates are reported, with their positions, by the session below.
+    CheckHostBlockIds(block_ids, absl::StrCat("NotifyForRead req_id=", req_id),
+                      /*require_unique=*/false);
+  } else if (serves_host_pool_reads_only_) {
+    // Serving a device read would lease staging out of the host pool this
+    // manager's caller addresses by block id, and copy device blocks over
+    // whatever the caller keeps there. Refuse up front rather than at the
+    // pull, where the caller would only learn of it through poll_stats.
+    throw std::invalid_argument(absl::StrCat(
+        "NotifyForRead req_id=", req_id,
+        ": this manager serves reads out of its host pool and has no staging "
+        "slots, so it serves host-resident reads only; register host blocks "
+        "with source=kHost"));
+  }
 
   absl::StatusOr<std::shared_ptr<TransferSendSession>> created =
       TransferSendSession::Create(
           base_.get(), staging_allocator_.get(), req_id, uuid, block_ids,
-          deadline.value_or(DeadlineFromNow()), register_start);
+          deadline.value_or(DeadlineFromNow()), register_start, source);
   // An invalid registration is a caller bug rather than an empty transfer:
   // throw immediately instead of returning 0, which callers interpret as
   // "nothing to send" and then wait until the consumer's pull times out.
@@ -850,7 +872,8 @@ void KVCacheManagerWithTransfer::StartRead(
     const std::vector<RaidenTransferEndpoint>& remote_descriptors,
     const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids, int parallelism,
-    std::optional<std::vector<int64_t>> local_host_block_ids) {
+    std::optional<std::vector<int64_t>> local_host_block_ids,
+    BlockMemory destination) {
   RAIDEN_TRACE_FN("KVTransfer::StartRead", [&]() {
     return absl::StrCat("req=", req_id, " uuid=", uuid,
                         " blocks=", remote_block_ids.size());
@@ -868,7 +891,8 @@ void KVCacheManagerWithTransfer::StartRead(
             << " descriptors, selecting first endpoint.";
   }
   StartRead(req_id, uuid, remote_descriptors[0].endpoint, remote_block_ids,
-            local_block_ids, parallelism, std::move(local_host_block_ids));
+            local_block_ids, parallelism, std::move(local_host_block_ids),
+            /*deadline=*/std::nullopt, destination);
 }
 
 void KVCacheManagerWithTransfer::StartRead(
@@ -877,7 +901,8 @@ void KVCacheManagerWithTransfer::StartRead(
     const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids, int parallelism,
     std::optional<std::vector<int64_t>> local_host_block_ids,
-    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    BlockMemory destination) {
   RAIDEN_TRACE_FN("KVTransfer::StartRead", [&]() {
     return absl::StrCat("req=", req_id, " uuid=", uuid,
                         " blocks=", remote_block_ids.size());
@@ -891,9 +916,28 @@ void KVCacheManagerWithTransfer::StartRead(
           << req_id << ", uuid: " << uuid << ", remote: " << remote_endpoint
           << ", Thread: " << std::this_thread::get_id();
   FaultInjectThrow(hooks::kKvCacheManagerApiStartRead);
-  if (remote_block_ids.size() != local_block_ids.size() ||
+  if (destination == BlockMemory::kHost && !local_host_block_ids.has_value()) {
+    throw std::invalid_argument(
+        "a host-memory read names its host blocks: local_host_block_ids is "
+        "required");
+  }
+  if (local_host_block_ids.has_value()) {
+    // A host destination lands blocks in these for good, so one block may not
+    // receive two; staging for a device destination is overwritten by its
+    // H2D anyway, and a device block may legitimately repeat.
+    CheckHostBlockIds(*local_host_block_ids,
+                      absl::StrCat("StartRead req_id=", req_id),
+                      /*require_unique=*/destination == BlockMemory::kHost);
+  }
+  // A host destination has no device blocks to name: the host blocks stand in
+  // for them in the copy plan, whose device-side copy is never issued.
+  const std::vector<int64_t>& effective_local_block_ids =
+      destination == BlockMemory::kHost && local_block_ids.empty()
+          ? *local_host_block_ids
+          : local_block_ids;
+  if (remote_block_ids.size() != effective_local_block_ids.size() ||
       (local_host_block_ids.has_value() &&
-       local_host_block_ids->size() != local_block_ids.size())) {
+       local_host_block_ids->size() != effective_local_block_ids.size())) {
     throw std::invalid_argument(
         "remote_block_ids, local_block_ids, and local_host_block_ids must have "
         "same length");
@@ -931,10 +975,10 @@ void KVCacheManagerWithTransfer::StartRead(
     }
 
     absl::StatusOr<std::shared_ptr<TransferReceiveSession>> created =
-        TransferReceiveSession::Create(base_.get(), staging_allocator_.get(),
-                                       uuid, req_id, remote_block_ids,
-                                       local_block_ids, local_host_block_ids,
-                                       effective_deadline);
+        TransferReceiveSession::Create(
+            base_.get(), staging_allocator_.get(), uuid, req_id,
+            remote_block_ids, effective_local_block_ids, local_host_block_ids,
+            effective_deadline, destination);
     if (!created.ok()) {
       failed_recving_.insert(req_id);
       transfer_details_[req_id] = DetailsFromStatus(created.status());
@@ -1391,8 +1435,36 @@ absl::Status KVCacheManagerWithTransfer::HandleAck(uint64_t uuid) {
 }
 
 uint64_t KVCacheManagerWithTransfer::MaxPullStreamBlocks() const {
-  return static_cast<uint64_t>(
-      std::max<int64_t>(0, staging_allocator_->capacity()));
+  const int64_t staging_capacity = staging_allocator_->capacity();
+  if (staging_capacity > 0) {
+    return static_cast<uint64_t>(staging_capacity);
+  }
+  // No staging slots, and no dynamic staging either (whose capacity is the
+  // host pool): only host-resident reads can be served, and the host pool
+  // bounds those.
+  return static_cast<uint64_t>(std::max<int64_t>(0, NumHostBlocks()));
+}
+
+int64_t KVCacheManagerWithTransfer::NumHostBlocks() const {
+  return base_->host_block_manager()->total_blocks();
+}
+
+void KVCacheManagerWithTransfer::CheckHostBlockIds(
+    absl::Span<const int64_t> block_ids, absl::string_view what,
+    bool require_unique) const {
+  const int64_t num_host_blocks = NumHostBlocks();
+  absl::flat_hash_set<int64_t> seen;
+  for (int64_t block_id : block_ids) {
+    if (block_id < 0 || block_id >= num_host_blocks) {
+      throw std::invalid_argument(absl::StrCat(what, ": host block ", block_id,
+                                               " is outside the host pool of ",
+                                               num_host_blocks, " blocks"));
+    }
+    if (require_unique && !seen.insert(block_id).second) {
+      throw std::invalid_argument(absl::StrCat(
+          what, ": host block ", block_id, " is named more than once"));
+    }
+  }
 }
 
 absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {

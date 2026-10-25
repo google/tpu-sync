@@ -563,6 +563,32 @@ cc_test(
 )
 
 cc_test(
+    name = "kv_cache_manager_with_transfer_host_memory_test",
+    size = "small",
+    srcs = ["kv_cache_manager_with_transfer_host_memory_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    deps = [
+        ":kv_cache_manager_base",
+        ":kv_cache_manager_with_transfer",
+        "//tpu_sync/core:metrics_collector",
+        "//tpu_sync/fault_injection:hooks",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "kv_cache_manager_with_transfer_send_drain_test",
     size = "small",
     srcs = ["kv_cache_manager_with_transfer_send_drain_test.cc"],

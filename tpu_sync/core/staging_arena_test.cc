@@ -518,5 +518,167 @@ TEST(StagingBlockAllocatorTest, NullHostBlockManager) {
               StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 
+TEST(StagingBlockAllocatorTest, FixedSlotStatsAndReleaseHook) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/8);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StagingBlockAllocator> allocator,
+      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/3,
+                                    /*dynamic_host_staging=*/false));
+
+  StagingStats initial_stats = allocator->Stats();
+  EXPECT_EQ(initial_stats.budget_blocks, 3);
+  EXPECT_EQ(initial_stats.blocks_in_use, 0);
+  EXPECT_EQ(initial_stats.peak_blocks_in_use, 0);
+
+  int hook_invocations = 0;
+  allocator->SetReleaseCallback([&]() { ++hook_invocations; });
+
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a0, allocator->Acquire(2));
+  EXPECT_EQ(allocator->Stats().blocks_in_use, 3);
+  EXPECT_EQ(allocator->Stats().peak_blocks_in_use, 3);
+
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a1, allocator->Acquire(3));
+  EXPECT_EQ(allocator->Stats().blocks_in_use, 6);
+  EXPECT_EQ(allocator->Stats().peak_blocks_in_use, 6);
+
+  a1.Reset();
+  EXPECT_EQ(hook_invocations, 1);
+  EXPECT_EQ(allocator->Stats().blocks_in_use, 3);
+  EXPECT_EQ(allocator->Stats().peak_blocks_in_use, 6);
+
+  a0.Reset();
+  EXPECT_EQ(hook_invocations, 2);
+  EXPECT_EQ(allocator->Stats().blocks_in_use, 0);
+  EXPECT_EQ(allocator->Stats().peak_blocks_in_use, 6);
+}
+
+TEST(StagingBlockAllocatorTest, DynamicStagingStatsAndReleaseHook) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/8);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StagingBlockAllocator> allocator,
+      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/2,
+                                    /*dynamic_host_staging=*/true));
+
+  StagingStats initial_stats = allocator->Stats();
+  EXPECT_EQ(initial_stats.budget_blocks, 8);
+  EXPECT_EQ(initial_stats.blocks_in_use, 0);
+  EXPECT_EQ(initial_stats.peak_blocks_in_use, 0);
+
+  int hook_invocations = 0;
+  allocator->SetReleaseCallback([&]() { ++hook_invocations; });
+
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a0, allocator->Acquire(3));
+  EXPECT_EQ(allocator->Stats().blocks_in_use, 3);
+  EXPECT_EQ(allocator->Stats().peak_blocks_in_use, 3);
+
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a1, allocator->Acquire(4));
+  EXPECT_EQ(allocator->Stats().blocks_in_use, 7);
+  EXPECT_EQ(allocator->Stats().peak_blocks_in_use, 7);
+
+  a0.Reset();
+  EXPECT_EQ(hook_invocations, 1);
+  EXPECT_EQ(allocator->Stats().blocks_in_use, 4);
+  EXPECT_EQ(allocator->Stats().peak_blocks_in_use, 7);
+
+  a1.Reset();
+  EXPECT_EQ(hook_invocations, 2);
+  EXPECT_EQ(allocator->Stats().blocks_in_use, 0);
+  EXPECT_EQ(allocator->Stats().peak_blocks_in_use, 7);
+}
+
+TEST(StagingBlockAllocatorTest, ReleaseHookRunsOutsideAllocatorMutex) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/8);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StagingBlockAllocator> allocator,
+      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/2,
+                                    /*dynamic_host_staging=*/true));
+
+  // The hook calls Stats() and capacity() on the allocator. If the hook were
+  // called with allocator mu_ held, this would deadlock.
+  bool hook_invoked = false;
+  allocator->SetReleaseCallback([&]() {
+    hook_invoked = true;
+    StagingStats current = allocator->Stats();
+    EXPECT_GE(current.budget_blocks, 8);
+    EXPECT_EQ(allocator->capacity(), 8);
+  });
+
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation outer, allocator->Acquire(2));
+  EXPECT_FALSE(hook_invoked);
+  outer.Reset();  // Triggers release hook without deadlocking.
+
+  EXPECT_TRUE(hook_invoked);
+  EXPECT_EQ(allocator->Stats().blocks_in_use, 0);
+}
+
+TEST(StagingBlockAllocatorTest, NestedReleaseInsideCallbackDoesNotRecurse) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/8);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StagingBlockAllocator> allocator,
+      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/2,
+                                    /*dynamic_host_staging=*/true));
+
+  int callback_invocations = 0;
+  std::optional<StagingAllocation> nested_alloc;
+  TF_ASSERT_OK_AND_ASSIGN(nested_alloc, allocator->Acquire(1));
+
+  allocator->SetReleaseCallback([&]() {
+    ++callback_invocations;
+    // Triggering a release from within the callback must not re-invoke
+    // the callback due to the thread-local re-entrancy guard.
+    if (nested_alloc.has_value()) {
+      nested_alloc->Reset();
+    }
+  });
+
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation outer, allocator->Acquire(2));
+  outer.Reset();
+
+  EXPECT_EQ(callback_invocations, 1);
+  EXPECT_EQ(allocator->Stats().blocks_in_use, 0);
+}
+
+TEST(StagingBlockAllocatorTest, SetReleaseCallbackNullptrDisarmsHook) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/8);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StagingBlockAllocator> allocator,
+      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/2,
+                                    /*dynamic_host_staging=*/true));
+
+  int hook_invocations = 0;
+  allocator->SetReleaseCallback([&]() { ++hook_invocations; });
+
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a0, allocator->Acquire(2));
+  a0.Reset();
+  EXPECT_EQ(hook_invocations, 1);
+
+  // Disarming with nullptr is safe and idempotent.
+  allocator->SetReleaseCallback(nullptr);
+  allocator->SetReleaseCallback(nullptr);
+
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a1, allocator->Acquire(2));
+  a1.Reset();
+  // No new invocations after disarming.
+  EXPECT_EQ(hook_invocations, 1);
+}
+
+TEST(StagingBlockAllocatorTest,
+     SetReleaseCallbackNullptrInsideCallbackDoesNotDeadlock) {
+  kv_cache::LogicalBlockManager blocks(/*num_blocks=*/8);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<StagingBlockAllocator> allocator,
+      StagingBlockAllocator::Create(&blocks, /*num_slots=*/2, /*max_blocks=*/2,
+                                    /*dynamic_host_staging=*/true));
+
+  allocator->SetReleaseCallback(
+      [&]() { allocator->SetReleaseCallback(nullptr); });
+
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a0, allocator->Acquire(2));
+  a0.Reset();
+
+  TF_ASSERT_OK_AND_ASSIGN(StagingAllocation a1, allocator->Acquire(2));
+  a1.Reset();
+}
+
 }  // namespace
 }  // namespace tpu_raiden

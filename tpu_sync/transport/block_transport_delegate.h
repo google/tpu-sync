@@ -27,6 +27,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 
@@ -173,6 +174,20 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
   // header-declared contract: one push's own parallelism completes the array.
   virtual std::optional<size_t> ExpectedPushSenders(uint64_t uuid) const {
     return std::nullopt;
+  }
+
+  // Number of sequential push units this receiver expects for each block array
+  // (layer) of `uuid`. Default is 1 unit per layer.
+  virtual int32_t ExpectedPushesPerLayer(uint64_t uuid) const { return 1; }
+
+  // Receiver-side admission gate hook invoked before acknowledging an incoming
+  // push stream. Allows bounded-window receive sessions to validate that the
+  // incoming stream's destination blocks match the active window ring slot
+  // and that the (position, shard) pairs are not re-claimed within the unit.
+  virtual absl::Status AwaitIncomingPushSlot(
+      uint64_t uuid, int32_t layer_idx, absl::Span<const int64_t> dst_block_ids,
+      absl::Span<const int32_t> stream_shards, absl::Time deadline) {
+    return absl::OkStatus();
   }
 
   // Pool-keyed counterpart to OnLayerReceived, fired when a declared pool

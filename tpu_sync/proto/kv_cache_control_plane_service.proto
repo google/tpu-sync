@@ -47,6 +47,8 @@ message PullStreamRequest {
 
   // Consumer host addresses, one per layer. Empty if not reported.
   repeated tpu_sync.rpc.PoolHostAddrsProto layer_host_addrs = 7;
+  int32 chunk_blocks = 8;
+  int32 window_chunks = 9;
 }
 
 // Response returned by the producer acknowledging validation of the pull
@@ -64,6 +66,8 @@ message PullStreamResponse {
 
   // Optional human-readable diagnostic message on error.
   string message = 4;
+  string staging_window_ack = 5;
+  string staging_window_rejected_reason = 6;
 }
 
 // Notification sent by a peer to acknowledge completion or empty stream.
@@ -76,6 +80,12 @@ message AckResponse {
   string message = 2;
 }
 
+message GetCapabilitiesRequest {}
+message GetCapabilitiesResponse {
+  bool serve_staging_window = 1;
+  int64 max_ring_blocks = 2;
+}
+
 // gRPC service for KV Cache Manager peer-to-peer control plane handshakes.
 service KVCacheControlPlaneService {
   // Validates a consumer pull stream request and triggers async producer
@@ -84,4 +94,6 @@ service KVCacheControlPlaneService {
 
   // Notifies the remote peer of transfer acknowledgment.
   rpc Ack(AckRequest) returns (AckResponse) {}
+  rpc GetCapabilities(GetCapabilitiesRequest)
+      returns (GetCapabilitiesResponse) {}
 }

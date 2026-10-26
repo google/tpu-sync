@@ -34,9 +34,11 @@
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/controller/worker_service_server.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/staging_window.h"
 
 namespace xla {
 class PjRtBuffer;
@@ -74,11 +76,11 @@ class NumaAwareKVCacheManager {
   // New transfer-enabled constructor (flat list of arrays, single shard per
   // layer). enable_shm opts this manager's host buffers into the shared-memory
   // segments named by RAIDEN_SHM_KEY; without it the env var is ignored.
-  NumaAwareKVCacheManager(nanobind::list kv_caches, int64_t node_id,
-                          int64_t local_control_port, int64_t max_blocks,
-                          int64_t num_slots, double timeout_s,
-                          bool unsafe_skip_buffer_lock, int parallelism,
-                          bool enable_shm = false);
+  NumaAwareKVCacheManager(
+      nanobind::list kv_caches, int64_t node_id, int64_t local_control_port,
+      int64_t max_blocks, int64_t num_slots, double timeout_s,
+      bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm = false,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
 #endif
 
   // Raw PjRtBuffer constructor
@@ -99,7 +101,8 @@ class NumaAwareKVCacheManager {
       const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
       int64_t node_id, int64_t local_control_port, int64_t max_blocks,
       int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
-      int parallelism, bool enable_shm = false);
+      int parallelism, bool enable_shm = false,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
 
   // FFI metadata constructor (cache-only by default)
   NumaAwareKVCacheManager(size_t num_layers, size_t num_shards,
@@ -248,6 +251,14 @@ class NumaAwareKVCacheManager {
   std::shared_ptr<kv_cache::backends::KVBackend> GetKVBackend(
       absl::string_view backend_name) const;
 
+  // Configures mutable staging window parameters across all sub-managers.
+  absl::Status SetStagingWindowConfig(const StagingWindowConfig& config);
+  StagingWindowConfig staging_window_config() const;
+
+  // Aggregates staging stats across all sub-managers (sums counters, max for
+  // peak).
+  StagingStats staging_stats() const;
+
  private:
 #ifndef WITHOUT_PYTHON
   NumaAwareKVCacheManager(UnpackedCache&& cache, std::optional<int> local_port,
@@ -255,11 +266,11 @@ class NumaAwareKVCacheManager {
                           bool unsafe_skip_buffer_lock, int parallelism,
                           int64_t node_id = 0, bool enable_shm = false);
 
-  NumaAwareKVCacheManager(UnpackedCache&& cache, int64_t node_id,
-                          int64_t local_control_port, int64_t max_blocks,
-                          int64_t num_slots, double timeout_s,
-                          bool unsafe_skip_buffer_lock, int parallelism,
-                          bool enable_shm = false);
+  NumaAwareKVCacheManager(
+      UnpackedCache&& cache, int64_t node_id, int64_t local_control_port,
+      int64_t max_blocks, int64_t num_slots, double timeout_s,
+      bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm = false,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
 
   std::optional<nanobind::list> device_arrays_;
 #endif
@@ -269,7 +280,8 @@ class NumaAwareKVCacheManager {
       std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
       bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id,
       int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
-      double timeout_s, bool enable_shm);
+      double timeout_s, bool enable_shm,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
 
   static constexpr uint64_t k48BitMask = 0xFFFFFFFFFFFFULL;
   std::atomic<uint64_t> global_seq_counter_{1};
@@ -320,7 +332,8 @@ class KVCacheManager {
       bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt,
-      bool enable_shm = false);
+      bool enable_shm = false,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
 #endif
 
   // TODO(justinlu): Convert the remaining constructors to factory methods, make
@@ -346,7 +359,8 @@ class KVCacheManager {
       int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
       int parallelism, int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt);
+      std::optional<std::string> worker_id = std::nullopt,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
 
   // FFI metadata constructor (cache-only by default)
   KVCacheManager(
@@ -452,6 +466,16 @@ class KVCacheManager {
   absl::Status UnlockBlocks(const std::vector<int>& block_ids) {
     return numa_manager_->UnlockBlocks(block_ids);
   }
+
+  absl::Status SetStagingWindowConfig(const StagingWindowConfig& config) {
+    return numa_manager_->SetStagingWindowConfig(config);
+  }
+
+  StagingWindowConfig staging_window_config() const {
+    return numa_manager_->staging_window_config();
+  }
+
+  StagingStats staging_stats() const { return numa_manager_->staging_stats(); }
 
   std::string DumpMetricsToString() const {
     return numa_manager_->DumpMetricsToString();

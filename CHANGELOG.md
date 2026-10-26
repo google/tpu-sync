@@ -18,5 +18,12 @@
   count per push when the consumer requests none. A positive integer, clamped
   to the admitted transfer parallelism; unset, empty or `0` keeps one stream
   per source rank; any other value fails the plan with `InvalidArgument`.
+- Bounded-window host staging: Python and nanobind bindings in JAX and PyTorch
+  exposing `staging_window_chunks`, `staging_chunk_blocks`,
+  `staging_chunk_bytes`, `staging_stream_bytes`, `staging_admission`,
+  `staging_admission_timeout_ms`, and `staging_assume_peer_support` kwargs on
+  `KVCacheManager`; dynamic runtime reconfiguration via `set_staging_window()`;
+  and telemetry via `staging_stats()` reporting host staging pool budget, pinned
+  blocks in use, watermark, gate wait latencies, and admission statistics.
 
 [Unreleased]: https://github.com/tpu-raiden/tpu_raiden/compare/v0.1.0...HEAD

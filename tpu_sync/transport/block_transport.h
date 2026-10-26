@@ -307,6 +307,9 @@ class BlockTransport final {
     bool expected_senders_resolved = false;
     std::optional<size_t> expected_senders;
     bool on_layer_received_called = false;
+    int32_t units_done = 0;
+    int32_t expected_units = 1;
+    bool expected_units_resolved = false;
   };
 
   void TriggerNextSendStep(std::shared_ptr<SendStreamState> state);
@@ -344,6 +347,8 @@ class BlockTransport final {
   // (pulls, single-group pushes) uses `transport_adapter_`.
   absl::flat_hash_map<int, std::unique_ptr<lib::SocketTransportAdapter>>
       numa_adapters_;
+
+  friend class BlockTransportPeer;
 };
 
 }  // namespace transport

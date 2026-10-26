@@ -188,6 +188,12 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     std::function<absl::Status(uint64_t uuid)> begin_incoming_push;
     std::function<absl::Status(uint64_t uuid, const absl::Status& status)>
         end_incoming_push;
+    std::function<int32_t(uint64_t uuid)> expected_pushes_per_layer;
+    std::function<absl::Status(uint64_t uuid, int32_t layer_idx,
+                               absl::Span<const int64_t> dst_block_ids,
+                               absl::Span<const int32_t> stream_shards,
+                               absl::Time deadline)>
+        await_incoming_push_slot;
   };
 
   void SetTransferEventHooks(TransferEventHooks hooks) {
@@ -713,6 +719,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Source count of a registered block-addressed receive plan: one per
   // shard push schedule, each keyed by the sender node id that pushes it.
   std::optional<size_t> ExpectedPushSenders(uint64_t uuid) const override;
+  int32_t ExpectedPushesPerLayer(uint64_t uuid) const override;
+  absl::Status AwaitIncomingPushSlot(uint64_t uuid, int32_t layer_idx,
+                                     absl::Span<const int64_t> dst_block_ids,
+                                     absl::Span<const int32_t> stream_shards,
+                                     absl::Time deadline) override;
 
   virtual absl::Status RegisterActivePlan(
       uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,

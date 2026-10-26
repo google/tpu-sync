@@ -22,6 +22,8 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -31,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <future>
 #include <limits>
 #include <memory>
@@ -39,6 +42,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -50,12 +54,16 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/grpc_control_plane_backend.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/core/tcp_control_plane_backend.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/staging_window.h"
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
 // Needed for the complete type behind send_sessions_.at(uuid)->... below.
 #include "tpu_sync/kv_cache/transfer_send_session.h"  // IWYU pragma: keep
@@ -66,6 +74,7 @@ namespace {
 using ::testing::Contains;
 using ::testing::ElementsAre;
 using ::testing::HasSubstr;
+using ::testing::Not;
 using ::testing::Optional;
 using ::testing::UnorderedElementsAre;
 
@@ -100,17 +109,21 @@ class ScopedControlPlaneBackend {
 class TestManager : private ScopedControlPlaneBackend,
                     public KVCacheManagerWithTransfer {
  public:
-  explicit TestManager(double timeout_s = kTimeoutS, size_t num_layers = 0,
-                       int local_control_port = 0)
+  explicit TestManager(
+      double timeout_s = kTimeoutS, size_t num_layers = 0,
+      int local_control_port = 0,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt,
+      int64_t max_blocks = 8, int64_t num_slots = 2 * kPoolSize)
       : ScopedControlPlaneBackend("tcp", /*overwrite=*/false),
         KVCacheManagerWithTransfer(
             num_layers, /*num_shards=*/1, /*slice_byte_size=*/128,
             /*local_port=*/std::nullopt,
-            /*host_blocks_to_allocate=*/std::nullopt,
-            /*parallelism=*/1, /*node_id=*/0, local_control_port,
-            /*max_blocks=*/8,
-            /*num_slots=*/2 * kPoolSize, timeout_s) {}
+            /*host_blocks_to_allocate=*/num_slots * max_blocks,
+            /*parallelism=*/1, /*node_id=*/0, local_control_port, max_blocks,
+            num_slots, timeout_s,
+            /*metrics_collector=*/nullptr, std::move(staging_window_config)) {}
 
+  using KVCacheManagerWithTransfer::HandlePullStream;
   using ControlRequestHeader = TcpControlPlaneBackend::ControlRequestHeader;
   using ControlResponseHeader = TcpControlPlaneBackend::ControlResponseHeader;
   static constexpr uint32_t kControlMagic =
@@ -150,6 +163,12 @@ class TestManager : private ScopedControlPlaneBackend,
     absl::MutexLock lock(mu_);
     auto it = active_recv_sessions_.find(uuid);
     return it != active_recv_sessions_.end() && !it->second->Done();
+  }
+
+  std::shared_ptr<TransferReceiveSession> recv_session(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    auto it = active_recv_sessions_.find(uuid);
+    return it != active_recv_sessions_.end() ? it->second : nullptr;
   }
 
   void MarkPullStarted(uint64_t uuid) {
@@ -432,7 +451,7 @@ TEST(ControlHandshakeTest, OversizedPullIsRejectedBeforeReadingItsBody) {
   request.magic = TestManager::kControlMagic;
   request.op = TestManager::kOpPullStream;
   request.uuid = 48;
-  request.num_blocks = 9;  // TestManager is configured for at most 8 blocks.
+  request.num_blocks = kMaxWindowedPullBlocks + 1;
   WriteAll(fd.get(), &request, sizeof(request));
   ASSERT_EQ(shutdown(fd.get(), SHUT_WR), 0);
 
@@ -1150,5 +1169,982 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
   }
 }
 
+struct TestHarness {
+  TestManager producer;
+  std::shared_ptr<ControlPlaneBackend> backend;
+  std::string endpoint;
+
+  explicit TestHarness(std::optional<StagingWindowConfig> cfg = std::nullopt,
+                       double timeout_s = kTimeoutS)
+      : producer(timeout_s, /*num_layers=*/0, /*local_control_port=*/0, cfg),
+        backend(CreateControlPlaneBackend(
+            ControlPlaneBackendType::kTcp,
+            [](std::function<void()> task) {
+              std::thread(std::move(task)).detach();
+            },
+            absl::Seconds(5))),
+        endpoint(absl::StrCat("127.0.0.1:", producer.local_control_port())) {}
+
+  absl::StatusOr<PullStreamResponseSpec> Send(uint64_t uuid,
+                                              std::vector<int64_t> src,
+                                              std::vector<int64_t> dst,
+                                              int32_t chunk_blocks = 0,
+                                              int32_t window_chunks = 0) {
+    PullStreamRequestSpec req{.uuid = uuid,
+                              .src_block_ids = std::move(src),
+                              .dst_block_ids = std::move(dst),
+                              .chunk_blocks = chunk_blocks,
+                              .window_chunks = window_chunks};
+    return backend->SendPullRequest(endpoint, req, absl::Seconds(5)).Await();
+  }
+};
+
+TEST(ControlHandshakeTest, PrefillPreValidationNonWindowedOversizeRejected) {
+  TestHarness h;
+  ASSERT_GT(h.producer.NotifyForRead("req_w0_over", /*uuid=*/701, {0}), 0);
+
+  auto resp =
+      h.Send(701, std::vector<int64_t>(65, 0), std::vector<int64_t>(65, 0));
+  ASSERT_TRUE(resp.ok()) << resp.status();
+  EXPECT_EQ(resp->status, -1);
+  EXPECT_THAT(resp->message, HasSubstr("exceeds configured maximum"));
+  EXPECT_FALSE(resp->staging_window_rejected_reason.has_value());
+
+  auto valid_resp = h.Send(701, {0}, {0});
+  ASSERT_TRUE(valid_resp.ok());
+  EXPECT_EQ(valid_resp->status, 0);
+}
+
+TEST(ControlHandshakeTest, PrefillPreValidationServeDisabledRejected) {
+  StagingWindowConfig cfg{
+      .window_chunks = 2, .serve_windowed_pulls = false, .chunk_blocks = 2};
+  TestHarness h(cfg, /*timeout_s=*/5.0);
+  ASSERT_GT(h.producer.NotifyForRead("req_disabled", /*uuid=*/702, {0, 1}), 0);
+
+  auto caps = h.backend->GetCapabilities(h.endpoint, absl::Seconds(5)).Await();
+  ASSERT_TRUE(caps.ok()) << caps.status();
+  EXPECT_FALSE(caps->serve_staging_window);
+  EXPECT_EQ(caps->max_ring_blocks, 0);
+
+  // Unregistered UUID with serve_disabled: verify immediate rejection before
+  // grace wait.
+  absl::Time start = absl::Now();
+  auto unreg_resp = h.Send(9999, {0, 1}, {2, 3}, 2, 2);
+  absl::Duration elapsed = absl::Now() - start;
+  ASSERT_TRUE(unreg_resp.ok()) << unreg_resp.status();
+  EXPECT_NE(unreg_resp->status, 0);
+  EXPECT_EQ(unreg_resp->staging_window_rejected_reason, "serve_disabled");
+  EXPECT_THAT(unreg_resp->message, Not(HasSubstr("no read registered")));
+  EXPECT_LT(elapsed, absl::Seconds(1));
+
+  auto resp = h.Send(702, {0, 1}, {2, 3}, 2, 2);
+  ASSERT_TRUE(resp.ok());
+  EXPECT_NE(resp->status, 0);
+  EXPECT_THAT(resp->message,
+              HasSubstr("staging_window_rejected:serve_disabled"));
+  EXPECT_EQ(resp->staging_window_rejected_reason, "serve_disabled");
+
+  auto valid_resp = h.Send(702, {0, 1}, {2, 3});
+  ASSERT_TRUE(valid_resp.ok());
+  EXPECT_EQ(valid_resp->status, 0);
+}
+
+TEST(ControlHandshakeTest,
+     PrefillPreValidationServeDisabledOversizeRejectedByTcpPreCheck) {
+  StagingWindowConfig cfg{
+      .window_chunks = 2, .serve_windowed_pulls = false, .chunk_blocks = 2};
+  TestHarness h(cfg);
+  ASSERT_GT(h.producer.NotifyForRead("req_disabled_over", /*uuid=*/703, {0}),
+            0);
+
+  auto resp = h.Send(703, std::vector<int64_t>(65, 0),
+                     std::vector<int64_t>(65, 0), 2, 2);
+  ASSERT_TRUE(resp.ok()) << resp.status();
+  EXPECT_EQ(resp->status, -1);
+  EXPECT_THAT(resp->message, HasSubstr("exceeds configured maximum"));
+  EXPECT_FALSE(resp->staging_window_rejected_reason.has_value());
+}
+
+TEST(ControlHandshakeTest, PrefillPreValidationRingExceedsCapacityRejected) {
+  StagingWindowConfig cfg{
+      .window_chunks = 2, .serve_windowed_pulls = true, .chunk_blocks = 2};
+  TestHarness h(cfg);
+  ASSERT_GT(h.producer.NotifyForRead("req_ring_over", /*uuid=*/704, {0}), 0);
+
+  auto resp = h.Send(704, std::vector<int64_t>(80, 0),
+                     std::vector<int64_t>(80, 0), 2, 40);
+  ASSERT_TRUE(resp.ok());
+  EXPECT_NE(resp->status, 0);
+  EXPECT_THAT(resp->message,
+              HasSubstr("staging_window_rejected:ring_exceeds_capacity"));
+  EXPECT_EQ(resp->staging_window_rejected_reason, "ring_exceeds_capacity");
+}
+
+TEST(ControlHandshakeTest, PrefillPreValidationBlocksExceedCapRejected) {
+  StagingWindowConfig cfg{
+      .window_chunks = 2, .serve_windowed_pulls = true, .chunk_blocks = 2};
+  TestHarness h(cfg);
+  ASSERT_GT(h.producer.NotifyForRead("req_cap_over", /*uuid=*/705, {0}), 0);
+
+  PullStreamRequestSpec req{
+      .uuid = 705,
+      .src_block_ids = std::vector<int64_t>(kMaxWindowedPullBlocks + 1, 0),
+      .dst_block_ids = std::vector<int64_t>(kMaxWindowedPullBlocks + 1, 0),
+      .chunk_blocks = 2,
+      .window_chunks = 2};
+  auto resp = h.producer.HandlePullStream(req);
+  ASSERT_TRUE(resp.ok());
+  EXPECT_EQ(resp->status, -1);
+  EXPECT_THAT(resp->message,
+              HasSubstr("staging_window_rejected:blocks_exceed_cap"));
+  EXPECT_EQ(resp->staging_window_rejected_reason, "blocks_exceed_cap");
+}
+
+TEST(ControlHandshakeTest, WindowedPullEchoesAckAndGetCapabilities) {
+  StagingWindowConfig cfg{
+      .window_chunks = 4, .serve_windowed_pulls = true, .chunk_blocks = 2};
+  TestHarness h(cfg);
+  ASSERT_GT(h.producer.NotifyForRead("req_echo", /*uuid=*/706, {0, 1}), 0);
+
+  auto caps = h.backend->GetCapabilities(h.endpoint, absl::Seconds(5)).Await();
+  ASSERT_TRUE(caps.ok()) << caps.status();
+  EXPECT_TRUE(caps->serve_staging_window);
+  EXPECT_EQ(caps->max_ring_blocks, 64);
+
+  auto resp = h.Send(706, {0, 1}, {2, 3}, 2, 4);
+  ASSERT_TRUE(resp.ok());
+  EXPECT_EQ(resp->status, 0);
+  EXPECT_THAT(resp->message, HasSubstr("staging_window=2,4"));
+  ASSERT_TRUE(resp->staging_window_ack.has_value());
+  EXPECT_EQ(resp->staging_window_ack->chunk_blocks, 2);
+  EXPECT_EQ(resp->staging_window_ack->window_chunks, 4);
+}
+
+inline PullStreamResponseSpec OkEchoSpec(int32_t c, int32_t w) {
+  return {.status = 0,
+          .message = FormatStagingWindowAck(c, w),
+          .staging_window_ack = {{c, w}}};
+}
+
+inline PullStreamResponseSpec RejectSpec(absl::string_view reason) {
+  return {.status = -1,
+          .message = absl::StrCat("staging_window_rejected:", reason),
+          .staging_window_rejected_reason = std::string(reason)};
+}
+
+class FakeControlPlaneHandler : public ControlPlaneHandler {
+ public:
+  using PullCb = std::function<absl::StatusOr<PullStreamResponseSpec>(
+      const PullStreamRequestSpec&)>;
+  using CapsCb = std::function<ControlPlaneCapabilities()>;
+
+  void SetPullStreamCallback(PullCb cb) {
+    absl::MutexLock lock(mu_);
+    pull_stream_cb_ = std::move(cb);
+  }
+  void SetCapabilitiesCallback(CapsCb cb) {
+    absl::MutexLock lock(mu_);
+    capabilities_cb_ = std::move(cb);
+  }
+  absl::StatusOr<PullStreamResponseSpec> OnPullStream(
+      const PullStreamRequestSpec& req, absl::string_view) override {
+    PullCb cb;
+    {
+      absl::MutexLock l(mu_);
+      cb = pull_stream_cb_;
+    }
+    return cb ? cb(req) : OkEchoSpec(req.chunk_blocks, req.window_chunks);
+  }
+  absl::Status OnAck(uint64_t) override { return absl::OkStatus(); }
+  ControlPlaneCapabilities GetCapabilities() const override {
+    CapsCb cb;
+    {
+      absl::MutexLock l(mu_);
+      cb = capabilities_cb_;
+    }
+    return cb ? cb() : ControlPlaneCapabilities{};
+  }
+
+ private:
+  mutable absl::Mutex mu_;
+  PullCb pull_stream_cb_ ABSL_GUARDED_BY(mu_);
+  CapsCb capabilities_cb_ ABSL_GUARDED_BY(mu_);
+};
+
+struct SettlementResult {
+  bool succeeded = false;
+  TransferDetails details;
+};
+
+SettlementResult ExpectSettled(TestManager& consumer, absl::string_view req_id,
+                               absl::Duration timeout = absl::Seconds(5)) {
+  const absl::Time deadline = absl::Now() + timeout;
+  while (absl::Now() < deadline) {
+    auto res = consumer.CompleteReadWithDetails();
+    for (bool succ : {true, false}) {
+      const auto& l = succ ? res.received : res.failed;
+      if (std::find(l.begin(), l.end(), req_id) != l.end()) {
+        auto it = res.details.find(req_id);
+        return {succ, it != res.details.end() ? it->second : TransferDetails{}};
+      }
+    }
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  ADD_FAILURE() << "Timeout waiting for " << req_id;
+  return {};
+}
+
+struct TestServerFixture {
+  std::unique_ptr<ControlPlaneBackend> server;
+  FakeControlPlaneHandler handler;
+  std::string ep;
+
+  explicit TestServerFixture(
+      ControlPlaneBackendType type = ControlPlaneBackendType::kTcp)
+      : server(CreateControlPlaneBackend(
+            type, [](auto task) { std::thread(std::move(task)).detach(); })) {
+    handler.SetCapabilitiesCallback(
+        [] { return ControlPlaneCapabilities{true, true, 64}; });
+  }
+  void Start() {
+    auto port = server->StartServer(0, &handler);
+    ASSERT_TRUE(port.ok()) << port.status();
+    ep = absl::StrCat("127.0.0.1:", *port);
+  }
+  ~TestServerFixture() {
+    if (server) server->StopServer();
+  }
+};
+
+TestManager MakeConsumer(bool assume_peer = true, int cb = 2, int wc = 2) {
+  return TestManager(5.0, 0, 0,
+                     StagingWindowConfig{.window_chunks = wc,
+                                         .chunk_blocks = cb,
+                                         .assume_peer_support = assume_peer});
+}
+
+TEST(DecodeClientPolicyTest, CapabilityProbeCachesAndDowngradesOnOldServer) {
+  TestServerFixture fix;
+  int probe_count = 0;
+  fix.handler.SetCapabilitiesCallback([&] {
+    ++probe_count;
+    return ControlPlaneCapabilities{false};
+  });
+  fix.handler.SetPullStreamCallback([](const auto& req) {
+    EXPECT_EQ(req.chunk_blocks, 0);
+    EXPECT_EQ(req.window_chunks, 0);
+    return PullStreamResponseSpec{.status = 0};
+  });
+  fix.Start();
+  TestManager consumer = MakeConsumer(/*assume_peer=*/false);
+  consumer.StartRead("req_probe_1", 801, fix.ep, {0}, {0});
+  EXPECT_TRUE(ExpectSettled(consumer, "req_probe_1").succeeded);
+  EXPECT_EQ(probe_count, 1);
+  auto cached = consumer.GetCachedCapabilities(fix.ep);
+  ASSERT_TRUE(cached.has_value());
+  EXPECT_FALSE(cached->serve_staging_window);
+  consumer.StartRead("req_probe_2", 802, fix.ep, {0}, {0});
+  EXPECT_TRUE(ExpectSettled(consumer, "req_probe_2").succeeded);
+  EXPECT_EQ(probe_count, 1);
+}
+
+TEST(DecodeClientPolicyTest, ProbeErrorPropagatesAndFailsConnect) {
+  TestServerFixture fix;
+  fix.ep = "127.0.0.1:1";  // Unopened port; do not call fix.Start()
+  TestManager consumer = MakeConsumer(/*assume_peer=*/false);
+  consumer.StartRead("req_probe_err", 800, fix.ep, {0}, {0});
+  auto details = ExpectSettled(consumer, "req_probe_err");
+  EXPECT_FALSE(details.succeeded);
+  EXPECT_EQ(details.details.phase.value_or(""), "connect");
+  EXPECT_TRUE(details.details.reason.has_value());
+}
+
+TEST(DecodeClientPolicyTest, CapabilityProbeDowngradesOnRingTooLarge) {
+  TestServerFixture fix;
+  fix.handler.SetCapabilitiesCallback(
+      [] { return ControlPlaneCapabilities{true, true, 2}; });
+  fix.handler.SetPullStreamCallback([](const auto& req) {
+    EXPECT_EQ(req.chunk_blocks, 0);
+    EXPECT_EQ(req.window_chunks, 0);
+    return PullStreamResponseSpec{.status = 0};
+  });
+  fix.Start();
+
+  TestManager consumer = MakeConsumer(/*assume_peer=*/false);
+  consumer.StartRead("req_large", 803, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+  EXPECT_TRUE(ExpectSettled(consumer, "req_large").succeeded);
+}
+
+TEST(DecodeClientPolicyTest, AssumePeerSupportSkipsProbe) {
+  TestServerFixture fix;
+  int probe_count = 0;
+  fix.handler.SetCapabilitiesCallback([&] {
+    ++probe_count;
+    return ControlPlaneCapabilities{true, true, 64};
+  });
+  fix.Start();
+  TestManager consumer = MakeConsumer(/*assume_peer=*/true);
+  consumer.StartRead("req_assume", 804, fix.ep, {0}, {0});
+  EXPECT_TRUE(ExpectSettled(consumer, "req_assume").succeeded);
+  EXPECT_EQ(probe_count, 0);
+  EXPECT_FALSE(consumer.GetCachedCapabilities(fix.ep).has_value());
+}
+
+TEST(DecodeClientPolicyTest, MarkerRejectionTriggersExactKResend) {
+  TestServerFixture fix;
+  std::atomic<int> pull_count = 0;
+  fix.handler.SetPullStreamCallback([&](const auto& req) {
+    if (++pull_count == 1) {
+      EXPECT_EQ(req.chunk_blocks, 2);
+      EXPECT_EQ(req.window_chunks, 2);
+      return RejectSpec("serve_disabled");
+    }
+    EXPECT_EQ(req.chunk_blocks, 0);
+    EXPECT_EQ(req.window_chunks, 0);
+    EXPECT_EQ(req.uuid, 805);
+    return PullStreamResponseSpec{.status = 0};
+  });
+  fix.Start();
+  TestManager consumer = MakeConsumer();
+  consumer.SetCachedCapabilities(fix.ep, {true, true, 64});
+  consumer.StartRead("req_retry", 805, fix.ep, {0}, {0});
+  EXPECT_TRUE(ExpectSettled(consumer, "req_retry").succeeded);
+  EXPECT_EQ(pull_count, 2);
+  EXPECT_FALSE(consumer.GetCachedCapabilities(fix.ep).has_value());
+}
+
+TEST(DecodeClientPolicyTest,
+     MarkerRejectionHoldsInFlightAndHandshakePendingAcrossFirstReply) {
+  TestServerFixture fix;
+  std::atomic<int> pull_count = 0;
+  absl::Notification first_pull_replied, allow_retry;
+  fix.handler.SetPullStreamCallback([&](const auto&) {
+    if (++pull_count == 1) return RejectSpec("busy");
+    first_pull_replied.Notify();
+    allow_retry.WaitForNotification();
+    return PullStreamResponseSpec{.status = 0};
+  });
+  fix.Start();
+
+  TestManager consumer = MakeConsumer();
+  consumer.StartRead("req_in_flight", 806, fix.ep, {0}, {0});
+  first_pull_replied.WaitForNotification();
+
+  auto session = consumer.recv_session(806);
+  ASSERT_NE(session, nullptr);
+  EXPECT_TRUE(session->handshake_pending());
+  EXPECT_GE(session->in_flight(), 1);
+
+  allow_retry.Notify();
+  EXPECT_TRUE(ExpectSettled(consumer, "req_in_flight").succeeded);
+}
+
+TEST(DecodeClientPolicyTest, SecondMarkerRejectionFailsWithoutLoop) {
+  TestServerFixture fix;
+  std::atomic<int> pull_count = 0;
+  fix.handler.SetPullStreamCallback([&](const auto&) {
+    ++pull_count;
+    return RejectSpec("error");
+  });
+  fix.Start();
+
+  TestManager consumer = MakeConsumer();
+  consumer.StartRead("req_second_marker", 807, fix.ep, {0}, {0});
+  auto details = ExpectSettled(consumer, "req_second_marker");
+  EXPECT_FALSE(details.succeeded);
+  EXPECT_EQ(details.details.phase.value_or(""), "connect");
+  EXPECT_EQ(pull_count, 2);
+}
+
+TEST(DecodeClientPolicyTest, NonMarkerRejectionFailsImmediatelyWithoutRetry) {
+  TestServerFixture fix;
+  std::atomic<int> pull_count = 0;
+  fix.handler.SetPullStreamCallback([&](const auto&) {
+    ++pull_count;
+    return PullStreamResponseSpec{.status = -1,
+                                  .message = "no read registered within 5s"};
+  });
+  fix.Start();
+
+  TestManager consumer = MakeConsumer();
+  consumer.StartRead("req_non_marker", 808, fix.ep, {0}, {0});
+  auto details = ExpectSettled(consumer, "req_non_marker");
+  EXPECT_FALSE(details.succeeded);
+  EXPECT_EQ(details.details.phase.value_or(""), "connect");
+  EXPECT_EQ(pull_count, 1);
+}
+
+TEST(DecodeClientPolicyTest, EchoMismatchImmediateFailFast) {
+  TestServerFixture fix;
+  absl::Notification allow_reply;
+  fix.handler.SetPullStreamCallback([&](const auto&) {
+    allow_reply.WaitForNotification();
+    return PullStreamResponseSpec{.status = 0, .message = "legacy_ok"};
+  });
+  fix.Start();
+
+  TestManager consumer = MakeConsumer();
+  consumer.SetCachedCapabilities(fix.ep, {true, true, 64});
+  consumer.StartRead("req_echo_mismatch", 809, fix.ep, {0}, {0});
+  auto session = consumer.recv_session(809);
+  ASSERT_NE(session, nullptr);
+  ASSERT_TRUE(session->TryBeginRecvOp());
+  allow_reply.Notify();
+  while (session->handshake_pending()) absl::SleepFor(absl::Milliseconds(5));
+  EXPECT_FALSE(session->TryBeginRecvOp());
+  EXPECT_FALSE(session->Done());
+  session->EndRecvOp();
+
+  auto details = ExpectSettled(consumer, "req_echo_mismatch");
+  EXPECT_FALSE(details.succeeded);
+  EXPECT_EQ(details.details.phase.value_or(""), "connect");
+  EXPECT_THAT(details.details.reason.value_or(""),
+              HasSubstr("peer ignored staging window"));
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(consumer.GetCachedCapabilities(fix.ep).has_value());
+}
+
+TEST(DecodeClientPolicyTest, MarkerRejectionOverGrpc) {
+  ScopedControlPlaneBackend scoped_grpc("grpc");
+  TestServerFixture fix(ControlPlaneBackendType::kGrpc);
+  std::atomic<int> pull_count = 0;
+  fix.handler.SetPullStreamCallback([&](const auto& req) {
+    if (++pull_count == 1) {
+      EXPECT_EQ(req.chunk_blocks, 2);
+      EXPECT_EQ(req.window_chunks, 2);
+      return RejectSpec("serve_disabled");
+    }
+    EXPECT_EQ(req.chunk_blocks, 0);
+    EXPECT_EQ(req.window_chunks, 0);
+    return PullStreamResponseSpec{.status = 0};
+  });
+  fix.Start();
+
+  TestManager consumer = MakeConsumer();
+  consumer.StartRead("req_grpc_retry", 810, fix.ep, {0}, {0});
+  EXPECT_TRUE(ExpectSettled(consumer, "req_grpc_retry").succeeded);
+  EXPECT_EQ(pull_count, 2);
+}
+
+auto MakeDirectBase(int blocks = 16) {
+  return std::make_unique<kv_cache::KVCacheManagerBase>(
+      1, 1, std::vector<size_t>{128}, std::nullopt, blocks, 1, nullptr);
+}
+
+std::shared_ptr<TransferReceiveSession> MakeDirectSession(
+    kv_cache::KVCacheManagerBase* base, StagingBlockAllocator* alloc,
+    uint64_t uuid, absl::string_view req_id, int num_blocks = 4) {
+  std::vector<int64_t> remote(num_blocks), local(num_blocks);
+  for (int i = 0; i < num_blocks; ++i) {
+    remote[i] = i;
+    local[i] = num_blocks + i;
+  }
+  return *TransferReceiveSession::Create(
+      base, alloc, uuid, std::string(req_id), remote, local, std::nullopt,
+      std::chrono::steady_clock::now() + std::chrono::seconds(10),
+      StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2});
+}
+
+TEST(DecodeClientPolicyTest, DowngradeToExactKDirect) {
+  auto base = MakeDirectBase(16);
+  auto alloc = *StagingBlockAllocator::Create(base->host_block_manager(), 2, 4);
+  auto s = MakeDirectSession(base.get(), alloc.get(), 811, "req_downgrade", 4);
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->window_chunks(), 2);
+  EXPECT_EQ(s->chunk_blocks(), 2);
+  EXPECT_EQ(s->ExpectedPushesPerLayer(), 2);
+  ASSERT_TRUE(s->DowngradeToExactK().ok());
+  EXPECT_EQ(s->window_chunks(), 0);
+  EXPECT_EQ(s->chunk_blocks(), 0);
+  EXPECT_EQ(s->ExpectedPushesPerLayer(), 1);
+}
+
+TEST(DecodeClientPolicyTest, DowngradeToExactKResourceExhausted) {
+  auto base = MakeDirectBase(4);
+  auto alloc = *StagingBlockAllocator::Create(base->host_block_manager(), 1, 4);
+  auto s = MakeDirectSession(base.get(), alloc.get(), 812, "req_exhaust", 4);
+  ASSERT_NE(s, nullptr);
+  s->ReleaseStaging();
+  auto held = alloc->Acquire(4);
+  ASSERT_TRUE(held.ok());
+  EXPECT_TRUE(absl::IsResourceExhausted(s->DowngradeToExactK()));
+}
+
+TEST(DecodeClientPolicyTest, DowngradeToExactKCapacityExceeded) {
+  auto base = MakeDirectBase(16);
+  auto alloc = *StagingBlockAllocator::Create(base->host_block_manager(), 2, 4);
+  std::vector<int64_t> remote = {0, 1, 2, 3, 4, 5},
+                       local = {6, 7, 8, 9, 10, 11};
+  auto s = TransferReceiveSession::Create(
+      base.get(), alloc.get(), 813, "req_cap_exceeded", remote, local,
+      std::nullopt, std::chrono::steady_clock::now() + std::chrono::seconds(10),
+      StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2});
+  ASSERT_TRUE(s.ok());
+  absl::Status downgrade_status = (*s)->DowngradeToExactK();
+  EXPECT_FALSE(downgrade_status.ok());
+  EXPECT_TRUE(absl::IsResourceExhausted(downgrade_status));
+}
+
+TEST(DecodeClientPolicyTest, WindowedFailFastRejectionTextAndStats) {
+  TestManager mgr(
+      /*timeout_s=*/5.0, /*num_layers=*/0, /*local_control_port=*/0,
+      StagingWindowConfig{
+          .window_chunks = 2,
+          .chunk_blocks = 2,
+          .admission = StagingWindowConfig::Admission::kFailFast},
+      /*max_blocks=*/4, /*num_slots=*/1);
+  // Start first read which uses 4 blocks (W*C = 4).
+  mgr.StartRead("req_ff_1", 901, "127.0.0.1:9999", {0, 1, 2, 3}, {0, 1, 2, 3});
+  // With B = 1, pool is fully utilized; second read will be rejected fail-fast.
+  mgr.StartRead("req_ff_2", 902, "127.0.0.1:9999", {0, 1, 2, 3}, {0, 1, 2, 3});
+  auto res = mgr.CompleteReadWithDetails();
+  EXPECT_THAT(res.failed, Contains("req_ff_2"));
+  auto it = res.details.find("req_ff_2");
+  ASSERT_NE(it, res.details.end());
+  EXPECT_THAT(it->second.reason.value_or(""),
+              HasSubstr("staging window admission rejected"));
+  EXPECT_EQ(it->second.phase.value_or(""), "admission");
+  EXPECT_GE(mgr.staging_stats().admission_rejects, 1);
+}
+
+TEST(DecodeClientPolicyTest, WindowedWaitAdmissionQueuedAndSeated) {
+  TestServerFixture fix;
+  fix.handler.SetPullStreamCallback([](const auto& req) {
+    return OkEchoSpec(req.chunk_blocks, req.window_chunks);
+  });
+  fix.Start();
+
+  TestManager mgr(
+      /*timeout_s=*/5.0, /*num_layers=*/0, /*local_control_port=*/0,
+      StagingWindowConfig{.window_chunks = 2,
+                          .chunk_blocks = 2,
+                          .admission = StagingWindowConfig::Admission::kWait},
+      /*max_blocks=*/4, /*num_slots=*/1);
+  mgr.StartRead("req_w_1", 911, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+  // Session 1 is active. Start session 2 which should queue
+  mgr.StartRead("req_w_2", 912, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+
+  auto s2 = mgr.recv_session(912);
+  ASSERT_NE(s2, nullptr);
+  EXPECT_TRUE(s2->is_queued());
+  EXPECT_GE(mgr.staging_stats().admission_waits, 1);
+
+  // Complete read 1
+  auto s1 = mgr.recv_session(911);
+  ASSERT_NE(s1, nullptr);
+  s1->Finish();
+  mgr.CompleteReadWithDetails();
+
+  // Now session 2 should seat
+  const auto deadline = absl::Now() + absl::Seconds(5);
+  while (s2->is_queued() && absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_FALSE(s2->is_queued());
+  s2->Finish();
+  mgr.CompleteReadWithDetails();
+}
+
+TEST(DecodeClientPolicyTest, WindowedWaitAdmissionTimeout) {
+  TestServerFixture fix;
+  fix.Start();
+
+  TestManager mgr(
+      /*timeout_s=*/5.0, /*num_layers=*/0, /*local_control_port=*/0,
+      StagingWindowConfig{.window_chunks = 2,
+                          .chunk_blocks = 2,
+                          .admission = StagingWindowConfig::Admission::kWait,
+                          .admission_timeout_ms = 10},
+      /*max_blocks=*/4, /*num_slots=*/1);
+  // Exhaust staging by running first read against live fake handler so it holds
+  // the ring.
+  mgr.StartRead("req_to_1", 921, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+  auto s1 = mgr.recv_session(921);
+  ASSERT_NE(s1, nullptr);
+  // Second read queues
+  mgr.StartRead("req_to_2", 922, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+
+  auto s2 = mgr.recv_session(922);
+  ASSERT_NE(s2, nullptr);
+  EXPECT_TRUE(s2->is_queued());
+  absl::SleepFor(absl::Milliseconds(50));
+  auto res = mgr.CompleteReadWithDetails();
+  EXPECT_THAT(res.failed, Contains("req_to_2"));
+  auto it = res.details.find("req_to_2");
+  ASSERT_NE(it, res.details.end());
+  EXPECT_THAT(it->second.reason.value_or(""),
+              HasSubstr("staging window admission timed out after"));
+  EXPECT_THAT(it->second.reason.value_or(""), HasSubstr("blocks needed"));
+  EXPECT_EQ(it->second.phase.value_or(""), "admission");
+  EXPECT_GE(mgr.staging_stats().admission_timeouts, 1);
+
+  // Clean up holding read s1 and verify blocks in use returns to 0.
+  s1->Finish();
+  const auto deadline = absl::Now() + absl::Seconds(5);
+  while (mgr.staging_stats().blocks_in_use > 0 && absl::Now() < deadline) {
+    mgr.CompleteReadWithDetails();
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_EQ(mgr.staging_stats().blocks_in_use, 0);
+}
+
+TEST(DecodeClientPolicyTest, QueuedSessionDuplicateUuidRejected) {
+  TestServerFixture fix;
+  fix.Start();
+
+  TestManager mgr(
+      /*timeout_s=*/5.0, /*num_layers=*/0, /*local_control_port=*/0,
+      StagingWindowConfig{.window_chunks = 2,
+                          .chunk_blocks = 2,
+                          .admission = StagingWindowConfig::Admission::kWait},
+      /*max_blocks=*/4, /*num_slots=*/1);
+  mgr.StartRead("req_dup_1", 931, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+  auto s1 = mgr.recv_session(931);
+  ASSERT_NE(s1, nullptr);
+  // Queue second request with uuid 932
+  mgr.StartRead("req_dup_2", 932, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+
+  auto s2 = mgr.recv_session(932);
+  ASSERT_NE(s2, nullptr);
+  EXPECT_TRUE(s2->is_queued());
+  EXPECT_GE(mgr.staging_stats().admission_waits, 1);
+
+  // Attempt to register another request with same uuid 932 while queued
+  mgr.StartRead("req_dup_3", 932, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+  auto res = mgr.CompleteReadWithDetails();
+  EXPECT_THAT(res.failed, Contains("req_dup_3"));
+  auto it = res.details.find("req_dup_3");
+  ASSERT_NE(it, res.details.end());
+  EXPECT_THAT(it->second.reason.value_or(""), HasSubstr("duplicate uuid=932"));
+
+  // Settle active and queued reads
+  s1->Finish();
+  mgr.CompleteReadWithDetails();
+
+  const auto deadline = absl::Now() + absl::Seconds(5);
+  while (s2->is_queued() && absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_FALSE(s2->is_queued());
+  s2->Finish();
+  while (mgr.staging_stats().blocks_in_use > 0 && absl::Now() < deadline) {
+    mgr.CompleteReadWithDetails();
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_EQ(mgr.staging_stats().blocks_in_use, 0);
+}
+
+TEST(DecodeClientPolicyTest,
+     SweepSettlesExpiredQueuedSessionWithZeroBlocksInUse) {
+  TestServerFixture fix;
+  fix.Start();
+
+  TestManager mgr(
+      /*timeout_s=*/5.0, /*num_layers=*/0, /*local_control_port=*/0,
+      StagingWindowConfig{.window_chunks = 2,
+                          .chunk_blocks = 2,
+                          .admission = StagingWindowConfig::Admission::kWait,
+                          .admission_timeout_ms = 10},
+      /*max_blocks=*/4, /*num_slots=*/1);
+  mgr.StartRead("req_sw_1", 941, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+  auto s1 = mgr.recv_session(941);
+  ASSERT_NE(s1, nullptr);
+  mgr.StartRead("req_sw_2", 942, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+
+  auto s2 = mgr.recv_session(942);
+  ASSERT_NE(s2, nullptr);
+  EXPECT_TRUE(s2->is_queued());
+  EXPECT_GE(mgr.staging_stats().admission_waits, 1);
+
+  // Sleep 50ms while s1 still holds blocks so s2's admission_timeout_ms (10ms)
+  // expires.
+  absl::SleepFor(absl::Milliseconds(50));
+  mgr.CompleteReadWithDetails();
+  EXPECT_GE(mgr.staging_stats().admission_timeouts, 1);
+
+  // s1 remains active while held
+  s1->Finish();
+  const auto deadline = absl::Now() + absl::Seconds(5);
+  while (mgr.staging_stats().blocks_in_use > 0 && absl::Now() < deadline) {
+    mgr.CompleteReadWithDetails();
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+
+  // After sweep, blocks in use should return to 0
+  EXPECT_EQ(mgr.staging_stats().blocks_in_use, 0);
+}
+
+TEST(DecodeClientPolicyTest, QueueBehindNonEmptyQueue) {
+  TestServerFixture fix;
+  fix.Start();
+
+  TestManager mgr(
+      /*timeout_s=*/5.0, /*num_layers=*/0, /*local_control_port=*/0,
+      StagingWindowConfig{.window_chunks = 2,
+                          .chunk_blocks = 2,
+                          .admission = StagingWindowConfig::Admission::kWait},
+      /*max_blocks=*/4, /*num_slots=*/1);
+  mgr.StartRead("req_qb_1", 951, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+  mgr.StartRead("req_qb_2", 952, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+  // Third request should queue behind the second
+  mgr.StartRead("req_qb_3", 953, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+
+  auto s2 = mgr.recv_session(952);
+  auto s3 = mgr.recv_session(953);
+  ASSERT_NE(s2, nullptr);
+  EXPECT_TRUE(s2->is_queued());
+  ASSERT_NE(s3, nullptr);
+  EXPECT_TRUE(s3->is_queued());
+  EXPECT_GE(mgr.staging_stats().admission_waits, 2);
+
+  // Settle s1 -> s2 seats, and s3 cannot seat so it is requeued.
+  auto s1 = mgr.recv_session(951);
+  ASSERT_NE(s1, nullptr);
+  s1->Finish();
+  mgr.CompleteReadWithDetails();
+
+  const auto deadline = absl::Now() + absl::Seconds(5);
+  while (s2->is_queued() && absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_FALSE(s2->is_queued());
+  EXPECT_GE(mgr.staging_stats().admission_requeues, 1);
+  EXPECT_TRUE(s3->is_queued());
+
+  // Settle s2 -> s3 seats.
+  s2->Finish();
+  mgr.CompleteReadWithDetails();
+
+  while (s3->is_queued() && absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_FALSE(s3->is_queued());
+
+  // Settle s3 -> pool returns to 0 in use.
+  s3->Finish();
+  while (mgr.staging_stats().blocks_in_use > 0 && absl::Now() < deadline) {
+    mgr.CompleteReadWithDetails();
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+
+  EXPECT_EQ(mgr.staging_stats().blocks_in_use, 0);
+}
+
+TEST(DecodeClientPolicyTest, ConcurrentReleasesCoalesceIntoOneSeatingPass) {
+  TestServerFixture fix;
+  fix.Start();
+
+  TestManager mgr(
+      /*timeout_s=*/5.0, /*num_layers=*/0, /*local_control_port=*/0,
+      StagingWindowConfig{.window_chunks = 2,
+                          .chunk_blocks = 2,
+                          .admission = StagingWindowConfig::Admission::kWait},
+      /*max_blocks=*/4, /*num_slots=*/2);
+  mgr.StartRead("req_cr_1", 961, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+  mgr.StartRead("req_cr_2", 962, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+  mgr.StartRead("req_cr_3", 963, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+
+  auto s1 = mgr.recv_session(961);
+  auto s2 = mgr.recv_session(962);
+  auto s3 = mgr.recv_session(963);
+  ASSERT_NE(s1, nullptr);
+  ASSERT_NE(s2, nullptr);
+  ASSERT_NE(s3, nullptr);
+  EXPECT_TRUE(s3->is_queued());
+
+  // Concurrent releases: finish s1 and s2 before polling completion.
+  s1->Finish();
+  s2->Finish();
+  mgr.CompleteReadWithDetails();
+
+  const auto deadline = absl::Now() + absl::Seconds(5);
+  while (s3->is_queued() && absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_FALSE(s3->is_queued());
+  // Design Q6 D15: a push_pool seating pass triggered by the first release
+  // may run between two concurrent releases, lose Acquire to not-yet-returned
+  // memory from the second release, and re-queue the head once. FIFO order and
+  // all-seated remain asserted.
+  EXPECT_LE(mgr.staging_stats().admission_requeues, 1);
+
+  s3->Finish();
+  while (mgr.staging_stats().blocks_in_use > 0 && absl::Now() < deadline) {
+    mgr.CompleteReadWithDetails();
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_EQ(mgr.staging_stats().blocks_in_use, 0);
+}
+
+TEST(DecodeClientPolicyTest, DestructorWithQueuedSessionDoesNotCrash) {
+  TestServerFixture fix;
+  fix.Start();
+
+  {
+    TestManager mgr(
+        /*timeout_s=*/5.0, /*num_layers=*/0, /*local_control_port=*/0,
+        StagingWindowConfig{.window_chunks = 2,
+                            .chunk_blocks = 2,
+                            .admission = StagingWindowConfig::Admission::kWait},
+        /*max_blocks=*/4, /*num_slots=*/1);
+    mgr.StartRead("req_dest_1", 971, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+    mgr.StartRead("req_dest_2", 972, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+
+    auto s1 = mgr.recv_session(971);
+    auto s2 = mgr.recv_session(972);
+    ASSERT_NE(s1, nullptr);
+    ASSERT_NE(s2, nullptr);
+    EXPECT_TRUE(s2->is_queued());
+
+    // Settle s1 to trigger release callback and TryScheduleSeatAdmissionQueue.
+    s1->Finish();
+    // mgr destroyed here with s2 queued and release callback / push_pool work
+    // in flight.
+  }
+}
+
 }  // namespace
+
+TEST(DecodeClientPolicyTest, InitFromLoadPlanAssertsInFlightOne) {
+  auto base = MakeDirectBase(4);
+  auto alloc = *StagingBlockAllocator::Create(base->host_block_manager(), 1, 4);
+  auto s = TransferReceiveSession::CreateQueued(
+      base.get(), alloc.get(), 981, "req_assert", "127.0.0.1:9999", {0, 1},
+      {0, 1}, std::nullopt,
+      std::chrono::steady_clock::now() + std::chrono::seconds(10));
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(s->in_flight(), 1);
+  // Calling EndRecvOp sets in_flight_ to 0
+  s->EndRecvOp();
+  EXPECT_EQ(s->in_flight(), 0);
+  EXPECT_DEATH(
+      s->InitFromLoadPlan("req_assert", {}, std::chrono::steady_clock::now()),
+      "");
+}
+
+TEST(DecodeClientPolicyTest, SeatFromQueueFailureReleasesStaging) {
+  auto base = MakeDirectBase(4);
+  auto alloc = *StagingBlockAllocator::Create(base->host_block_manager(), 1, 4);
+  TestServerFixture fix;
+  fix.Start();
+  TestManager mgr(
+      /*timeout_s=*/5.0, /*num_layers=*/0, /*local_control_port=*/0,
+      StagingWindowConfig{.window_chunks = 2,
+                          .chunk_blocks = 2,
+                          .admission = StagingWindowConfig::Admission::kWait},
+      /*max_blocks=*/4, /*num_slots=*/1);
+  auto s = TransferReceiveSession::CreateQueued(
+      base.get(), alloc.get(), 982, "req_seat_fail", fix.ep, {0, 1, 2, 3},
+      {0, 1, 2, 3}, std::nullopt,
+      std::chrono::steady_clock::now() + std::chrono::seconds(10),
+      StagingWindowConfig{.window_chunks = 2,
+                          .chunk_blocks = 2,
+                          .admission = StagingWindowConfig::Admission::kWait});
+  ASSERT_NE(s, nullptr);
+  EXPECT_TRUE(s->is_queued());
+  EXPECT_EQ(alloc->Stats().blocks_in_use, 0);
+
+  // Invalidate window_chunks to 1 so Acquire leases 4 blocks from the slot
+  // pool, but ExpandRing fails because the recomputed ChunkPlan expects 2
+  // blocks (min(4, 1*2)).
+  s->SetStagingWindowConfigForTesting(
+      StagingWindowConfig{.window_chunks = 1,
+                          .chunk_blocks = 2,
+                          .admission = StagingWindowConfig::Admission::kWait});
+
+  absl::Status status = s->SeatFromQueue(mgr);
+  EXPECT_FALSE(status.ok());
+  EXPECT_TRUE(s->Done());
+  EXPECT_EQ(s->in_flight(), 0);
+  EXPECT_EQ(alloc->Stats().blocks_in_use, 0);
+  EXPECT_EQ(s->Details().phase.value_or(""), "admission");
+}
+
+TEST(DecodeClientPolicyTest, SweepFinishWithQueuedSessionDoesNotDeadlock) {
+  TestServerFixture fix;
+  fix.handler.SetPullStreamCallback([](const auto& req) {
+    return OkEchoSpec(req.chunk_blocks, req.window_chunks);
+  });
+  fix.Start();
+
+  TestManager mgr(
+      /*timeout_s=*/5.0, /*num_layers=*/0, /*local_control_port=*/0,
+      StagingWindowConfig{.window_chunks = 2,
+                          .chunk_blocks = 2,
+                          .admission = StagingWindowConfig::Admission::kWait},
+      /*max_blocks=*/4, /*num_slots=*/1);
+  mgr.StartRead(
+      "req_sw_1", 991, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3},
+      /*parallelism=*/1, /*local_host_block_ids=*/std::nullopt,
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(20));
+  mgr.StartRead("req_sw_2", 992, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+
+  auto s2 = mgr.recv_session(992);
+  ASSERT_NE(s2, nullptr);
+  EXPECT_TRUE(s2->is_queued());
+
+  absl::SleepFor(absl::Milliseconds(40));
+
+  auto res = mgr.CompleteReadWithDetails();
+  EXPECT_THAT(res.received, testing::Contains("req_sw_1"));
+
+  const auto deadline = absl::Now() + absl::Seconds(5);
+  while (s2->is_queued() && absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_FALSE(s2->is_queued());
+  s2->Finish();
+  mgr.CompleteReadWithDetails();
+}
+
+TEST(DecodeClientPolicyTest, ConcurrentFinishAndSweepDoesNotDeadlock) {
+  TestServerFixture fix;
+  fix.handler.SetPullStreamCallback([](const auto& req) {
+    return OkEchoSpec(req.chunk_blocks, req.window_chunks);
+  });
+  fix.Start();
+
+  TestManager mgr(
+      /*timeout_s=*/5.0, /*num_layers=*/0, /*local_control_port=*/0,
+      StagingWindowConfig{.window_chunks = 2,
+                          .chunk_blocks = 2,
+                          .admission = StagingWindowConfig::Admission::kWait},
+      /*max_blocks=*/4, /*num_slots=*/1);
+  mgr.StartRead("req_c_1", 993, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+  mgr.StartRead("req_c_2", 994, fix.ep, {0, 1, 2, 3}, {0, 1, 2, 3});
+
+  auto s1 = mgr.recv_session(993);
+  auto s2 = mgr.recv_session(994);
+  ASSERT_NE(s1, nullptr);
+  ASSERT_NE(s2, nullptr);
+
+  absl::Notification sweep_started;
+  std::atomic<bool> done{false};
+  std::thread finish_thread([&]() {
+    sweep_started.WaitForNotification();
+    s1->Finish();
+    done.store(true, std::memory_order_release);
+  });
+
+  const auto deadline = absl::Now() + absl::Seconds(5);
+  bool notified = false;
+  while (!done.load(std::memory_order_acquire) && absl::Now() < deadline) {
+    if (!notified) {
+      sweep_started.Notify();
+      notified = true;
+    }
+    mgr.CompleteReadWithDetails();
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+  finish_thread.join();
+  EXPECT_TRUE(done.load(std::memory_order_relaxed));
+
+  while (s2->is_queued() && absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_FALSE(s2->is_queued());
+  s2->Finish();
+  mgr.CompleteReadWithDetails();
+}
+
 }  // namespace tpu_raiden

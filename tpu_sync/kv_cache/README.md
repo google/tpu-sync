@@ -147,6 +147,103 @@ Python orchestration scripts via non-blocking tuple lambda futures.
     rescheduling the pod discards it — that is a clean cold start, not a
     correctness issue.
 
+### Bounded-Window Host Staging
+
+Bounded-window host staging throttles host memory footprint during large KV-cache
+chunk transfers by streaming blocks through a sliding ring buffer of windowed
+chunks, avoiding the memory spikes of unbounded full-transfer buffering.
+
+#### Configuration Surface
+
+The staging pipeline can be configured via constructor kwargs or environment
+variables:
+
+* `staging_window_chunks` (`TPU_RAIDEN_STAGING_WINDOW_CHUNKS`): Number of active
+  chunks in the bounded sliding window ($W$, default: 0 / disabled).
+* `staging_chunk_blocks` (`TPU_RAIDEN_STAGING_CHUNK_BLOCKS`): Number of KV blocks
+  per window chunk ($C$, default: 0 / auto-derived from byte target).
+* `staging_chunk_bytes` (`TPU_RAIDEN_STAGING_CHUNK_BYTES`): Soft chunk size
+  target in bytes (default: 8MB).
+* `staging_stream_bytes` (`TPU_RAIDEN_STAGING_STREAM_BYTES`): Stream transfer
+  target in bytes (default: 4MB).
+* `staging_admission` (`TPU_RAIDEN_STAGING_ADMISSION`): Admission control
+  behavior under memory pressure: `"fail_fast"` (default) or `"wait"`.
+* `staging_admission_timeout_ms` (`TPU_RAIDEN_STAGING_ADMISSION_TIMEOUT_MS`):
+  Timeout in milliseconds when `staging_admission="wait"` (default: 0 / no wait).
+* `staging_assume_peer_support` (`TPU_RAIDEN_STAGING_WINDOW_ASSUME_PEER`):
+  Assume peer support for windowed transfers without handshake probe (default:
+  false).
+
+#### Budget = Pool Contract
+
+Host staging enforces a strict equivalence between the staging budget and the
+allocated pool geometry:
+$$\text{budget\_blocks} = \text{num\_slots} \times \text{max\_blocks}$$
+
+Recommended sizing aligns `max_blocks` with the full window capacity and
+`num_slots` with concurrent stream concurrency:
+$$\text{max\_blocks} = W \times C, \quad \text{num\_slots} = B$$
+where $B$ is the maximum number of concurrent request streams.
+
+#### Dynamic-Mode LRU Co-Tenancy Warning
+
+When host staging buffers share an underlying host memory pool with an LRU cache
+or secondary KV store, bounded-window staging pins active host blocks while
+chunks are in flight. If the total host pool size is smaller than
+$\text{num\_slots} \times \text{max\_blocks}$, unpinned cache blocks may be
+evicted prematurely under concurrency spikes, or staging admission may block.
+Always provision the underlying pool to exceed the sum of pinned staging demand
+and cached working sets. The manager logs a one-time WARNING at construction
+when the staging window is enabled and the host pool already has other users
+(`num_free_blocks() < total_blocks()`).
+
+#### Construction-Time Selection vs. Runtime Mutation
+
+* **Construction-Time**: `window_chunks` ($W$) and `serve_windowed_pulls` define
+  the immutable memory layouts and protocol capabilities of the worker.
+  Mutating these fields via `set_staging_window()` will raise `ValueError` /
+  `kInvalidArgument`.
+* **Runtime-Mutable**: `chunk_blocks`, `chunk_bytes_target`,
+  `stream_bytes_target`, `admission`, `admission_timeout_ms`, and
+  `assume_peer_support` can be updated dynamically at runtime via
+  `manager.set_staging_window(...)`.
+
+#### Window-Off Semantics
+
+With `window_chunks = 0`, the Decode role is behaviour-identical to the
+pre-series binary (only log levels change). However, a new binary's Prefill role
+still answers capability probes (`kOpCapabilities`), pre-validates incoming
+pull requests, relaxes the TCP body pre-check to the absolute capacity cap, and
+serves windowed pulls from remote peers. Setting the kill switch
+`TPU_RAIDEN_STAGING_WINDOW_SERVE=0` explicitly disables serving windowed pulls
+on this worker: capability probe replies return empty capabilities (`caps=`),
+and windowed pulls are rejected or downgraded to unchunked exact-$k$ transfers.
+
+#### Admission Policies
+
+* `"fail_fast"`: Immediately rejects new streaming transfers if the current
+  active block reservation exceeds available budget blocks.
+* `"wait"`: Queues incoming transfer streams up to `staging_admission_timeout_ms`
+  until prior in-flight chunks retire and free up staging blocks.
+
+#### Telemetry & Metrics (`staging_stats()`)
+
+`manager.staging_stats()` returns a dictionary with 9 telemetry counters and
+watermarks:
+
+* `budget_blocks`: Total host staging block budget ($\text{num\_slots} \times
+  \text{max\_blocks}$).
+* `blocks_in_use`: Current number of pinned staging blocks across active chunks.
+* `peak_blocks_in_use`: High-water mark of pinned staging blocks since launch.
+* `gate_waits_over_1ms`: Number of staging chunk acquisitions delayed >1ms by
+  flow control gates.
+* `rejected_streams`: Number of incoming streams rejected by admission control.
+* `admission_rejects`: Cumulative streams rejected due to insufficient budget.
+* `admission_waits`: Streams that successfully waited for budget before
+  proceeding.
+* `admission_requeues`: Streams requeued during admission waits.
+* `admission_timeouts`: Streams that reached timeout during admission wait.
+
 ---
 
 ## 3. Immediate Execution Roadmap (TODO List)

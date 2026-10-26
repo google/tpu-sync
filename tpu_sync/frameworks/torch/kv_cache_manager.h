@@ -29,7 +29,9 @@
 #include "absl/types/span.h"
 #include "csrc/api/tensor_buffer.h"
 #include "xla/pjrt/pjrt_client.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/staging_window.h"
 
 namespace tpu_raiden {
 namespace controller {
@@ -64,12 +66,12 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
   // New transfer-enabled constructor (flat list of tensors, single shard per
   // layer). enable_shm opts this manager's host buffers into the shared-memory
   // segments named by RAIDEN_SHM_KEY; without it the env var is ignored.
-  TorchKVCacheManager(const std::vector<at::Tensor>& kv_caches, int64_t node_id,
-                      int64_t local_control_port, int64_t max_blocks,
-                      int64_t num_slots, double timeout_s,
-                      bool unsafe_skip_buffer_lock, int parallelism = 4,
-                      std::optional<int> listener_port = std::nullopt,
-                      bool enable_shm = false);
+  TorchKVCacheManager(
+      const std::vector<at::Tensor>& kv_caches, int64_t node_id,
+      int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
+      double timeout_s, bool unsafe_skip_buffer_lock, int parallelism = 4,
+      std::optional<int> listener_port = std::nullopt, bool enable_shm = false,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
 
   // Metadata-only constructor for host-memory Stage 1 resharding tests.
   TorchKVCacheManager(size_t num_layers, size_t num_shards,
@@ -143,12 +145,13 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
   // into buffer_refs_ so the materialized device buffers survive for this
   // manager's lifetime. `kv_caches` is retained for the disagg path's
   // kv_caches() accessor (empty for the offload path).
-  TorchKVCacheManager(UnpackedLayers unpacked, std::optional<int> local_port,
-                      std::optional<int> host_blocks_to_allocate,
-                      bool unsafe_skip_buffer_lock, int parallelism,
-                      int64_t node_id, int64_t local_control_port,
-                      int64_t max_blocks, int64_t num_slots, double timeout_s,
-                      std::vector<at::Tensor> kv_caches, bool enable_shm);
+  TorchKVCacheManager(
+      UnpackedLayers unpacked, std::optional<int> local_port,
+      std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
+      int parallelism, int64_t node_id, int64_t local_control_port,
+      int64_t max_blocks, int64_t num_slots, double timeout_s,
+      std::vector<at::Tensor> kv_caches, bool enable_shm,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
 
   std::vector<at::Tensor> kv_caches_;
   // Keep-alives for the materialized device buffers backing the manager.
@@ -196,7 +199,8 @@ class KVCacheManager {
       int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt,
-      bool enable_shm = false);
+      bool enable_shm = false,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
 
   KVCacheManager(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
@@ -279,6 +283,16 @@ class KVCacheManager {
   size_t block_bytes(size_t block_array_idx) const {
     return torch_manager_->base()->block_bytes(block_array_idx);
   }
+
+  absl::Status SetStagingWindowConfig(const StagingWindowConfig& config) {
+    return torch_manager_->SetStagingWindowConfig(config);
+  }
+
+  StagingWindowConfig staging_window_config() const {
+    return torch_manager_->staging_window_config();
+  }
+
+  StagingStats staging_stats() const { return torch_manager_->staging_stats(); }
 
   std::vector<RaidenTransferEndpoint> get_local_endpoints() const {
     return torch_manager_->get_local_endpoints();

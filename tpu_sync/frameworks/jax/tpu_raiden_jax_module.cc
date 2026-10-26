@@ -38,6 +38,7 @@
 #include "xla/pjrt/status_casters.h"
 #include "tpu_sync/core/raiden_future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/frameworks/jax/kv_cache_manager.h"
 #include "tpu_sync/frameworks/jax/nb_statusor.h"  // IWYU pragma: keep
 #include "tpu_sync/frameworks/jax/raw_transfer_internal.h"
@@ -46,6 +47,7 @@
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_wrapper.h"
+#include "tpu_sync/kv_cache/staging_window.h"
 #include "tpu_sync/telemetry/python/telemetry_binding.h"
 
 namespace nb = nanobind;
@@ -70,6 +72,9 @@ std::vector<std::string> ToStdStringVector(
 }  // namespace kv_cache
 }  // namespace tpu_raiden
 
+using ::tpu_raiden::BuildStagingWindowConfig;
+using ::tpu_raiden::StagingStats;
+using ::tpu_raiden::StagingWindowConfig;
 using ::tpu_raiden::kv_cache::ToStdStringVector;
 
 NB_MODULE(_tpu_raiden_jax, m) {
@@ -138,15 +143,62 @@ NB_MODULE(_tpu_raiden_jax, m) {
            nb::arg("raiden_controller_address") = nb::none(),
            nb::arg("worker_id") = nb::none(), nb::arg("node_id") = 0,
            nb::arg("enable_shm") = false)
-      .def(nb::new_(xla::ValueOrThrowWrapper(
-               tpu_raiden::kv_cache::jax::KVCacheManager::CreateWithNodeId)),
+      .def(nb::new_([](nanobind::list kv_caches, int64_t node_id,
+                       int64_t local_control_port, int64_t max_blocks,
+                       int64_t num_slots, double timeout_s,
+                       bool unsafe_skip_buffer_lock, int parallelism,
+                       int raiden_worker_port,
+                       std::optional<std::string> raiden_controller_address,
+                       std::optional<std::string> worker_id, bool enable_shm,
+                       std::optional<int32_t> staging_window_chunks,
+                       std::optional<int32_t> staging_chunk_blocks,
+                       std::optional<int64_t> staging_chunk_bytes,
+                       std::optional<int64_t> staging_stream_bytes,
+                       std::optional<std::string> staging_admission,
+                       std::optional<int64_t> staging_admission_timeout_ms,
+                       std::optional<bool> staging_assume_peer_support) {
+             if (staging_admission.has_value() && staging_admission->empty()) {
+               staging_admission = std::nullopt;
+             }
+             auto cfg_result = BuildStagingWindowConfig(
+                 staging_window_chunks, staging_chunk_blocks,
+                 staging_chunk_bytes, staging_stream_bytes, staging_admission,
+                 staging_admission_timeout_ms, staging_assume_peer_support);
+             if (!cfg_result.ok()) {
+               throw std::invalid_argument(
+                   std::string(cfg_result.status().message()));
+             }
+             auto mgr_result =
+                 tpu_raiden::kv_cache::jax::KVCacheManager::CreateWithNodeId(
+                     std::move(kv_caches), node_id, local_control_port,
+                     max_blocks, num_slots, timeout_s, unsafe_skip_buffer_lock,
+                     parallelism, raiden_worker_port,
+                     std::move(raiden_controller_address), std::move(worker_id),
+                     enable_shm, *std::move(cfg_result));
+             if (!mgr_result.ok()) {
+               if (absl::IsInvalidArgument(mgr_result.status())) {
+                 throw std::invalid_argument(
+                     std::string(mgr_result.status().message()));
+               }
+               throw std::runtime_error(
+                   std::string(mgr_result.status().message()));
+             }
+             return std::move(*mgr_result);
+           }),
            nb::arg("kv_caches"), nb::arg("node_id") = 0,
            nb::arg("local_control_port"), nb::arg("max_blocks"),
            nb::arg("num_slots"), nb::arg("timeout_s") = 120.0,
            nb::arg("unsafe_skip_buffer_lock") = true,
            nb::arg("parallelism") = 4, nb::arg("raiden_worker_port") = 0,
            nb::arg("raiden_controller_address") = nb::none(),
-           nb::arg("worker_id") = nb::none(), nb::arg("enable_shm") = false)
+           nb::arg("worker_id") = nb::none(), nb::arg("enable_shm") = false,
+           nb::arg("staging_window_chunks") = nb::none(),
+           nb::arg("staging_chunk_blocks") = nb::none(),
+           nb::arg("staging_chunk_bytes") = nb::none(),
+           nb::arg("staging_stream_bytes") = nb::none(),
+           nb::arg("staging_admission") = nb::none(),
+           nb::arg("staging_admission_timeout_ms") = nb::none(),
+           nb::arg("staging_assume_peer_support") = nb::none())
 
       // Use lambdas to wrap the returned raiden::PjRtCopyFuture into
       // KVCacheManagerFuture
@@ -330,7 +382,87 @@ NB_MODULE(_tpu_raiden_jax, m) {
              const std::vector<tpu_raiden::kv_cache::BackendConfig>& configs) {
             self.RegisterKVBackends(configs);
           },
-          nb::arg("configs"), "Registers optional backends on this worker.");
+          nb::arg("configs"), "Registers optional backends on this worker.")
+      .def(
+          "set_staging_window",
+          [](tpu_raiden::kv_cache::jax::KVCacheManager& self,
+             std::optional<int32_t> chunk_blocks,
+             std::optional<int64_t> chunk_bytes_target,
+             std::optional<int64_t> stream_bytes_target,
+             std::optional<std::string> admission,
+             std::optional<int64_t> admission_timeout_ms,
+             std::optional<bool> assume_peer_support,
+             std::optional<int32_t> window_chunks,
+             std::optional<bool> serve_windowed_pulls) {
+            if (window_chunks.has_value()) {
+              throw std::invalid_argument(
+                  "window_chunks is a construction-time field and cannot be "
+                  "mutated via set_staging_window");
+            }
+            if (serve_windowed_pulls.has_value()) {
+              throw std::invalid_argument(
+                  "serve_windowed_pulls is a construction-time field and "
+                  "cannot be mutated via set_staging_window");
+            }
+            StagingWindowConfig cfg = self.staging_window_config();
+            if (chunk_blocks.has_value()) cfg.chunk_blocks = *chunk_blocks;
+            if (chunk_bytes_target.has_value()) {
+              cfg.chunk_bytes_target = *chunk_bytes_target;
+            }
+            if (stream_bytes_target.has_value()) {
+              cfg.stream_bytes_target = *stream_bytes_target;
+            }
+            if (admission.has_value() && !admission->empty()) {
+              if (*admission == "fail_fast") {
+                cfg.admission = StagingWindowConfig::Admission::kFailFast;
+              } else if (*admission == "wait") {
+                cfg.admission = StagingWindowConfig::Admission::kWait;
+              } else {
+                throw std::invalid_argument(
+                    "Invalid staging_admission: must be 'fail_fast' or 'wait', "
+                    "got '" +
+                    *admission + "'");
+              }
+            }
+            if (admission_timeout_ms.has_value()) {
+              cfg.admission_timeout_ms = *admission_timeout_ms;
+            }
+            if (assume_peer_support.has_value()) {
+              cfg.assume_peer_support = *assume_peer_support;
+            }
+            absl::Status status = self.SetStagingWindowConfig(cfg);
+            if (!status.ok()) {
+              if (absl::IsInvalidArgument(status)) {
+                throw std::invalid_argument(std::string(status.message()));
+              }
+              throw std::runtime_error(std::string(status.message()));
+            }
+          },
+          nb::arg("chunk_blocks") = nb::none(),
+          nb::arg("chunk_bytes_target") = nb::none(),
+          nb::arg("stream_bytes_target") = nb::none(),
+          nb::arg("admission") = nb::none(),
+          nb::arg("admission_timeout_ms") = nb::none(),
+          nb::arg("assume_peer_support") = nb::none(),
+          nb::arg("window_chunks") = nb::none(),
+          nb::arg("serve_windowed_pulls") = nb::none())
+      // Note: multi-NUMA staging_stats() sums counters non-atomically across
+      // nodes.
+      .def("staging_stats",
+           [](const tpu_raiden::kv_cache::jax::KVCacheManager& self) {
+             StagingStats stats = self.staging_stats();
+             nb::dict d;
+             d["budget_blocks"] = stats.budget_blocks;
+             d["blocks_in_use"] = stats.blocks_in_use;
+             d["peak_blocks_in_use"] = stats.peak_blocks_in_use;
+             d["gate_waits_over_1ms"] = stats.gate_waits_over_1ms;
+             d["rejected_streams"] = stats.rejected_streams;
+             d["admission_rejects"] = stats.admission_rejects;
+             d["admission_waits"] = stats.admission_waits;
+             d["admission_requeues"] = stats.admission_requeues;
+             d["admission_timeouts"] = stats.admission_timeouts;
+             return d;
+           });
 
   // =========================================================================
   // 2. Bind WeightSynchronizer

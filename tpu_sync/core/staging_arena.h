@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
@@ -272,6 +273,19 @@ class StagingArena {
   std::vector<bool> in_use_ ABSL_GUARDED_BY(mu_);
 };
 
+// Counters and statistics for host staging allocations and admission.
+struct StagingStats {
+  int64_t budget_blocks = 0;
+  int64_t blocks_in_use = 0;
+  int64_t peak_blocks_in_use = 0;
+  int64_t gate_waits_over_1ms = 0;
+  int64_t rejected_streams = 0;
+  int64_t admission_rejects = 0;
+  int64_t admission_waits = 0;
+  int64_t admission_requeues = 0;
+  int64_t admission_timeouts = 0;
+};
+
 // Encapsulates host staging block allocation and release (both fixed slots
 // and on-demand dynamic host blocks) behind an RAII |Allocation| handle that
 // can be transferred into session classes.
@@ -348,6 +362,17 @@ class StagingBlockAllocator {
   // Signals shutdown to wake any threads waiting in AcquireWithTimeout().
   void Shutdown();
 
+  // Registers a release notification hook invoked after a staging slot or
+  // dynamic blocks are released. The hook runs outside the allocator's mutex.
+  // The callback must only post work; nested releases on the callback thread
+  // are coalesced (the hook will not be re-invoked re-entrantly).
+  // Passing nullptr disarms the hook and waits for any active callback to
+  // finish.
+  void SetReleaseCallback(absl::AnyInvocable<void()> cb);
+
+  // Returns memory and allocation counters.
+  StagingStats Stats() const;
+
   size_t num_free_slots() const;
   absl::Span<const int> slot_blocks(int64_t slot_idx) const;
   int64_t num_slots() const { return num_slots_; }
@@ -371,6 +396,10 @@ class StagingBlockAllocator {
   const int64_t num_slots_ = 0;
   const int64_t max_blocks_ = 0;
   const bool dynamic_host_staging_ = false;
+  int active_release_cbs_ ABSL_GUARDED_BY(mu_) = 0;
+  std::shared_ptr<absl::AnyInvocable<void()>> release_cb_ ABSL_GUARDED_BY(mu_);
+  int64_t blocks_in_use_ ABSL_GUARDED_BY(mu_) = 0;
+  int64_t peak_blocks_in_use_ ABSL_GUARDED_BY(mu_) = 0;
   std::deque<int64_t> free_slots_ ABSL_GUARDED_BY(mu_);
   std::vector<std::vector<int>> slot_blocks_;
 };

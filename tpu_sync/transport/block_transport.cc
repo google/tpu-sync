@@ -55,6 +55,7 @@
 #include "peregrine/src/api/v1/ip_util.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -516,6 +517,7 @@ absl::Status BlockTransport::HandleIncomingPush(
     }
   };
 
+  std::vector<int> stream_shards;
   if (header.op == 1) {
     ABSL_ASSIGN_OR_RETURN(
         allocated_ids,
@@ -523,6 +525,9 @@ absl::Status BlockTransport::HandleIncomingPush(
     const std::vector<uint8_t> s_ids = lib::SerializeBlockIds(allocated_ids);
     ABSL_RETURN_IF_ERROR(WriteExact(client_fd, s_ids.data(), s_ids.size(),
                                     config_.ack_write_timeout_ms));
+    ABSL_ASSIGN_OR_RETURN(
+        stream_shards,
+        ShardsFromMask(header.buffer_id, block_delegate_->num_shards()));
   } else {
     std::vector<uint8_t> ids_buf(header.count_or_size * sizeof(uint32_t));
     FaultInjectSocket(hooks::kBlockTransportRecvBlockIds, client_fd);
@@ -533,6 +538,24 @@ absl::Status BlockTransport::HandleIncomingPush(
     ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size(),
                                    config_.handshake_read_timeout_ms));
     src_block_ids = lib::DeserializeBlockIds(ids_buf);
+    // Shards this stream carries: every shard for a legacy push, one NUMA
+    // group's subset for a push split by source NUMA node.
+    ABSL_ASSIGN_OR_RETURN(
+        stream_shards,
+        ShardsFromMask(header.buffer_id, block_delegate_->num_shards()));
+    if (block_delegate_ != nullptr) {
+      std::vector<int64_t> dst_block_ids(allocated_ids.begin(),
+                                         allocated_ids.end());
+      const int32_t layer_idx = (header.local_id == 0xFFFFFFFF)
+                                    ? 0
+                                    : static_cast<int32_t>(header.local_id);
+      absl::Status slot_status = block_delegate_->AwaitIncomingPushSlot(
+          header.uuid, layer_idx, dst_block_ids, stream_shards,
+          absl::InfiniteFuture());
+      if (!slot_status.ok()) {
+        return slot_status;
+      }
+    }
     uint8_t ack = 1;
     FaultInjectSocket(hooks::kBlockTransportRecvSendHandshakeAck, client_fd);
     ABSL_RETURN_IF_ERROR(
@@ -540,11 +563,6 @@ absl::Status BlockTransport::HandleIncomingPush(
   }
 
   uint64_t total_received_bytes = 0;
-  // Shards this stream carries: every shard for a legacy push, one NUMA
-  // group's subset for a push split by source NUMA node.
-  ABSL_ASSIGN_OR_RETURN(
-      const std::vector<int> stream_shards,
-      ShardsFromMask(header.buffer_id, block_delegate_->num_shards()));
   // The payload arrives as one chunk per (layer, shard, block). The payload
   // fault injection hook fires once per push, right before the middle chunk,
   // so an injected failure or latency hits mid-transfer: half of the payload
@@ -659,6 +677,8 @@ absl::Status BlockTransport::CompleteIncomingPush(
   // array's first stream and kept with the array's progress.
   std::optional<size_t> expected_senders;
   bool resolve_senders = false;
+  int32_t expected_units = 1;
+  bool resolve_units = false;
   if (!plan_declared) {
     absl::MutexLock lock(progress_mu_);
     auto it = layer_progress_.find({uuid, l});
@@ -667,9 +687,23 @@ absl::Status BlockTransport::CompleteIncomingPush(
     } else {
       resolve_senders = true;
     }
+    if (it != layer_progress_.end() && it->second.expected_units_resolved) {
+      expected_units = it->second.expected_units;
+    } else {
+      resolve_units = true;
+    }
   }
   if (resolve_senders) {
     expected_senders = block_delegate_->ExpectedPushSenders(uuid);
+  }
+  if (resolve_units) {
+    expected_units = block_delegate_->ExpectedPushesPerLayer(uuid);
+    if (expected_units < 1) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "block array ", l,
+          " delegate returned invalid ExpectedPushesPerLayer=", expected_units,
+          " for UUID ", uuid));
+    }
   }
   bool trigger_completion = false;
   {
@@ -681,6 +715,11 @@ absl::Status BlockTransport::CompleteIncomingPush(
         progress.expected_senders_resolved = true;
       }
       expected_senders = progress.expected_senders;
+      if (!progress.expected_units_resolved) {
+        progress.expected_units = expected_units;
+        progress.expected_units_resolved = true;
+      }
+      expected_units = progress.expected_units;
     }
     progress.completed_chunks++;
     bool array_complete = false;
@@ -741,9 +780,9 @@ absl::Status BlockTransport::CompleteIncomingPush(
       array_complete = progress.completed_chunks == expected_chunks;
     }
     if (array_complete && !progress.on_layer_received_called) {
-      progress.on_layer_received_called = true;
-      trigger_completion = true;
       if (plan_declared) {
+        progress.on_layer_received_called = true;
+        trigger_completion = true;
         size_t completed_pools = 0;
         for (const auto& [key, pool_progress] : layer_progress_) {
           if (key.first == uuid && pool_progress.on_layer_received_called) {
@@ -762,19 +801,29 @@ absl::Status BlockTransport::CompleteIncomingPush(
           }
         }
       } else {
-        bool all_layers_called = true;
-        for (size_t layer = 0; layer < block_delegate_->num_layers(); ++layer) {
-          auto it = layer_progress_.find({uuid, layer});
-          if (it == layer_progress_.end() ||
-              !it->second.on_layer_received_called) {
-            all_layers_called = false;
-            break;
-          }
-        }
-        if (all_layers_called) {
+        progress.units_done++;
+        trigger_completion = true;
+        if (progress.units_done < progress.expected_units) {
+          progress.completed_chunks = 0;
+          progress.sender_streams.clear();
+          progress.senders_complete = 0;
+        } else {
+          progress.on_layer_received_called = true;
+          bool all_layers_called = true;
           for (size_t layer = 0; layer < block_delegate_->num_layers();
                ++layer) {
-            layer_progress_.erase({uuid, layer});
+            auto it = layer_progress_.find({uuid, layer});
+            if (it == layer_progress_.end() ||
+                !it->second.on_layer_received_called) {
+              all_layers_called = false;
+              break;
+            }
+          }
+          if (all_layers_called) {
+            for (size_t layer = 0; layer < block_delegate_->num_layers();
+                 ++layer) {
+              layer_progress_.erase({uuid, layer});
+            }
           }
         }
       }
@@ -962,6 +1011,10 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
     const std::vector<int>& dst_block_ids, int parallelism,
     MajorOrder major_order, uint64_t uuid, int layer_idx,
     std::optional<int> wire_layer_idx) {
+  RAIDEN_TRACE_FN("Window::Push", [&]() {
+    return absl::StrCat("uuid=", uuid, " l=", layer_idx,
+                        " blocks=", src_block_ids.size());
+  });
   // Split the push by source NUMA node: every group of shards sharing a node
   // is pushed by the adapter pinned to that node. The receiver pairs the
   // per-group shard subsets of one block range by destination id, so a

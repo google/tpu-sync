@@ -58,6 +58,7 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/reshard_receive_session.h"
 #include "tpu_sync/kv_cache/reshard_send_session.h"
+#include "tpu_sync/kv_cache/staging_window.h"
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
 #include "tpu_sync/kv_cache/transfer_send_session.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
@@ -175,6 +176,50 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
     }
     absl::Status status = session->ExecuteLayerH2d(*this, layer_idx);
     MaybeUnregisterSettledRecv(uuid, *session);
+    return status;
+  };
+  hooks.expected_pushes_per_layer = [this](uint64_t uuid) -> int32_t {
+    if (uuid == 0) {
+      return 1;
+    }
+    std::shared_ptr<TransferReceiveSession> session;
+    {
+      absl::MutexLock lock(mu_);
+      auto it = active_recv_sessions_.find(uuid);
+      if (it == active_recv_sessions_.end()) {
+        return 1;
+      }
+      session = it->second;
+    }
+    return session->ExpectedPushesPerLayer();
+  };
+  hooks.await_incoming_push_slot = [this](
+                                       uint64_t uuid, int32_t layer_idx,
+                                       absl::Span<const int64_t> dst_block_ids,
+                                       absl::Span<const int32_t> stream_shards,
+                                       absl::Time deadline) -> absl::Status {
+    if (uuid == 0) {
+      return absl::OkStatus();
+    }
+    std::shared_ptr<TransferReceiveSession> session;
+    {
+      absl::MutexLock lock(mu_);
+      if (active_pool_reshard_recvs_.contains(uuid) ||
+          base_->HasActivePlan(uuid)) {
+        return absl::OkStatus();
+      }
+      auto it = active_recv_sessions_.find(uuid);
+      if (it == active_recv_sessions_.end()) {
+        return absl::OkStatus();
+      }
+      session = it->second;
+    }
+    absl::Status status = session->AwaitIncomingPushSlot(
+        layer_idx, dst_block_ids, stream_shards, deadline);
+    if (!status.ok()) {
+      absl::MutexLock lock(mu_);
+      rejected_streams_++;
+    }
     return status;
   };
   hooks.on_pool_received = [this](size_t pool_idx, uint64_t uuid) {
@@ -303,14 +348,15 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     bool unsafe_skip_buffer_lock, int parallelism,
     HostBufferAllocator host_allocator, int64_t node_id,
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
-    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector)
+    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector,
+    std::optional<StagingWindowConfig> staging_window_config)
     : KVCacheManagerWithTransfer(
           std::make_unique<kv_cache::KVCacheManagerBase>(
               layer_buffers, local_port,
               host_blocks_to_allocate.value_or(num_slots * max_blocks),
               unsafe_skip_buffer_lock, parallelism, host_allocator),
           node_id, local_control_port, max_blocks, num_slots, timeout_s,
-          std::move(metrics_collector)) {}
+          std::move(metrics_collector), std::move(staging_window_config)) {}
 
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -319,7 +365,8 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     std::optional<int> host_blocks_to_allocate, bool unsafe_skip_buffer_lock,
     int parallelism, HostBufferAllocator host_allocator, int64_t node_id,
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
-    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector)
+    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector,
+    std::optional<StagingWindowConfig> staging_window_config)
     : KVCacheManagerWithTransfer(
           std::make_unique<kv_cache::KVCacheManagerBase>(
               layer_buffers, local_port,
@@ -332,67 +379,81 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
               physical_size > 0 ? std::make_optional(physical_size)
                                 : std::nullopt),
           node_id, local_control_port, max_blocks, num_slots, timeout_s,
-          std::move(metrics_collector)) {}
+          std::move(metrics_collector), std::move(staging_window_config)) {}
 
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, int64_t node_id, int64_t local_control_port,
     int64_t max_blocks, int64_t num_slots, double timeout_s,
-    std::shared_ptr<MetricsCollector> metrics_collector)
+    std::shared_ptr<MetricsCollector> metrics_collector,
+    std::optional<StagingWindowConfig> staging_window_config)
     : KVCacheManagerWithTransfer(
           num_layers, num_shards,
           std::vector<size_t>(num_layers, slice_byte_size), local_port,
           host_blocks_to_allocate, parallelism, node_id, local_control_port,
-          max_blocks, num_slots, timeout_s, std::move(metrics_collector)) {}
+          max_blocks, num_slots, timeout_s, std::move(metrics_collector),
+          std::move(staging_window_config)) {}
 
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, int64_t node_id, int64_t local_control_port,
     int64_t max_blocks, int64_t num_slots, double timeout_s,
-    std::shared_ptr<MetricsCollector> metrics_collector)
+    std::shared_ptr<MetricsCollector> metrics_collector,
+    std::optional<StagingWindowConfig> staging_window_config)
     : KVCacheManagerWithTransfer(
           std::make_unique<kv_cache::KVCacheManagerBase>(
               num_layers, num_shards, std::move(slice_byte_sizes), local_port,
               host_blocks_to_allocate.value_or(num_slots * max_blocks),
               parallelism, nullptr),
           node_id, local_control_port, max_blocks, num_slots, timeout_s,
-          std::move(metrics_collector)) {}
+          std::move(metrics_collector), std::move(staging_window_config)) {}
 
 KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
+  if (staging_allocator_) {
+    staging_allocator_->SetReleaseCallback(nullptr);
+  }
   StopControlServer();
   // Pull-serve workers read this object's state; nothing may be torn down
   // while one is still running.
   shutting_down_.store(true, std::memory_order_relaxed);
+  if (alive_token_) {
+    alive_token_->store(false, std::memory_order_relaxed);
+  }
+  {
+    absl::MutexLock lock(mu_);
+    mu_.Await(absl::Condition(
+        +[](bool* in_progress) { return !*in_progress; },
+        &seating_in_progress_));
+  }
   std::vector<std::shared_ptr<TransferSession>> sessions_to_wait;
   {
     absl::MutexLock lock(mu_);
     sessions_to_wait.reserve(
         send_sessions_.size() + active_recv_sessions_.size() +
         active_pool_reshard_sends_.size() + active_pool_reshard_recvs_.size());
-    const absl::Status cancel_status =
-        absl::CancelledError("KVCacheManagerWithTransfer shutting down");
     for (const auto& [uuid, session] : send_sessions_) {
       (void)uuid;
-      session->Finish(cancel_status);
-      sessions_to_wait.push_back(session);
+      if (session != nullptr) sessions_to_wait.push_back(session);
     }
     for (const auto& [uuid, session] : active_recv_sessions_) {
       (void)uuid;
-      session->Finish(cancel_status);
-      sessions_to_wait.push_back(session);
+      if (session != nullptr) sessions_to_wait.push_back(session);
     }
     for (const auto& [uuid, session] : active_pool_reshard_sends_) {
       (void)uuid;
-      session->Finish(cancel_status);
-      sessions_to_wait.push_back(session);
+      if (session != nullptr) sessions_to_wait.push_back(session);
     }
     for (const auto& [uuid, session] : active_pool_reshard_recvs_) {
       (void)uuid;
-      session->Finish(cancel_status);
-      sessions_to_wait.push_back(session);
+      if (session != nullptr) sessions_to_wait.push_back(session);
     }
+  }
+  const absl::Status cancel_status =
+      absl::CancelledError("KVCacheManagerWithTransfer shutting down");
+  for (const auto& session : sessions_to_wait) {
+    session->Finish(cancel_status);
   }
   if (staging_allocator_) {
     staging_allocator_->Shutdown();
@@ -426,7 +487,8 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     std::unique_ptr<kv_cache::KVCacheManagerBase> base, int64_t node_id,
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
-    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector)
+    double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector,
+    std::optional<StagingWindowConfig> staging_window_config)
     : base_(std::move(base)),
       node_id_(node_id),
       local_control_port_(static_cast<int>(local_control_port)),
@@ -436,9 +498,48 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       metrics_collector_(std::move(metrics_collector)) {
   InitializeBaseHooks();
   InitializeControlPlane();
+
+  auto resolved_window =
+      ResolveStagingWindowConfig(std::move(staging_window_config));
+  if (!resolved_window.ok()) {
+    throw std::invalid_argument(
+        std::string(resolved_window.status().message()));
+  }
+  staging_window_config_ = *resolved_window;
+
+  const int64_t pool_blocks = base_->host_block_manager() != nullptr
+                                  ? base_->host_block_manager()->total_blocks()
+                                  : (num_slots * max_blocks);
+  const int64_t num_shards = base_->num_shards();
+  const int64_t bytes_per_block_layer_shard =
+      base_ != nullptr ? static_cast<int64_t>(base_->block_bytes(0)) : 0;
+
+  absl::Status window_valid =
+      ValidateStagingWindowConfig(staging_window_config_, pool_blocks,
+                                  num_shards, bytes_per_block_layer_shard);
+  if (!window_valid.ok()) {
+    throw std::invalid_argument(std::string(window_valid.message()));
+  }
+
+  if (staging_window_config_.window_chunks > 0 &&
+      base_->host_block_manager() != nullptr &&
+      base_->host_block_manager()->num_free_blocks() <
+          base_->host_block_manager()->total_blocks()) {
+    LOG(WARNING)
+        << "Staging window enabled on host block pool with in-use blocks; "
+           "co-tenancy with LRU cache may lead to staging allocation failures.";
+  }
+
+  const bool dynamic_host_staging = staging_window_config_.window_chunks > 0;
+
   if (base_->num_shards() == 0) {
-    staging_allocator_ =
-        CreateStagingBlockAllocator(base_.get(), /*num_slots=*/0, max_blocks);
+    staging_allocator_ = CreateStagingBlockAllocator(
+        base_.get(), /*num_slots=*/0, max_blocks,
+        dynamic_host_staging ? std::make_optional(true) : std::nullopt);
+    if (staging_allocator_ != nullptr) {
+      staging_allocator_->SetReleaseCallback(
+          [this]() { TryScheduleSeatAdmissionQueue(); });
+    }
     return;
   }
   if (local_control_port_ >= 0) {
@@ -452,8 +553,13 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       ConfigureDataPortFromKvTransfer();
     }
   }
-  staging_allocator_ =
-      CreateStagingBlockAllocator(base_.get(), num_slots, max_blocks);
+  staging_allocator_ = CreateStagingBlockAllocator(
+      base_.get(), num_slots, max_blocks,
+      dynamic_host_staging ? std::make_optional(true) : std::nullopt);
+  if (staging_allocator_ != nullptr) {
+    staging_allocator_->SetReleaseCallback(
+        [this]() { TryScheduleSeatAdmissionQueue(); });
+  }
   if (local_control_port_ >= 0) {
     StartControlServer();
   }
@@ -486,6 +592,7 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
 
   {
     absl::MutexLock lock(mu_);
+    has_started_transfer_ = true;
     if (pending_acks_.erase(uuid) > 0) {
       done_sending_.insert(req_id);
       return 0;
@@ -880,8 +987,12 @@ void KVCacheManagerWithTransfer::StartRead(
   // indices, borrow a staging slot and stage into its reserved host blocks
   // (slot.block_ids -- the real, possibly non-contiguous host blocks).
   std::shared_ptr<TransferReceiveSession> session;
+  RAIDEN_TRACE_FN("Recv::Admission", [&]() {
+    return absl::StrCat("uuid=", uuid, " req_id=", req_id);
+  });
   {
     absl::MutexLock lock(mu_);
+    has_started_transfer_ = true;
     auto incumbent = active_recv_sessions_.find(uuid);
     if (incumbent != active_recv_sessions_.end()) {
       if (incumbent->second->Done()) {
@@ -889,6 +1000,8 @@ void KVCacheManagerWithTransfer::StartRead(
             .insert(incumbent->second->req_id());
         transfer_details_[incumbent->second->req_id()] =
             incumbent->second->Details();
+        aggregated_gate_waits_over_1ms_ +=
+            incumbent->second->gate_waits_over_1ms();
         active_recv_sessions_.erase(incumbent);
       } else {
         LOG(ERROR) << "StartRead rejected duplicate uuid=" << uuid
@@ -906,14 +1019,63 @@ void KVCacheManagerWithTransfer::StartRead(
       }
     }
 
+    const bool is_windowed = staging_window_config_.window_chunks > 0;
+    const bool is_wait = staging_window_config_.admission ==
+                         StagingWindowConfig::Admission::kWait;
+
+    if (is_windowed && is_wait &&
+        (!admission_queue_.empty() || seating_in_progress_)) {
+      session = TransferReceiveSession::CreateQueued(
+          base_.get(), staging_allocator_.get(), uuid, req_id, remote_endpoint,
+          remote_block_ids, local_block_ids, local_host_block_ids,
+          effective_deadline, staging_window_config_);
+      absl::Status inserted = EmplaceRecvSessionLocked(uuid, session);
+      if (!inserted.ok()) {
+        session->ReleaseStaging();
+        failed_recving_.insert(req_id);
+        transfer_details_[req_id] = DetailsFromStatus(inserted);
+        LOG(ERROR) << "StartRead failed to register queued req_id=" << req_id
+                   << ", uuid=" << uuid << ": " << inserted.message();
+        return;
+      }
+      admission_queue_.push_back(uuid);
+      admission_waits_++;
+      return;
+    }
+
     absl::StatusOr<std::shared_ptr<TransferReceiveSession>> created =
-        TransferReceiveSession::Create(base_.get(), staging_allocator_.get(),
-                                       uuid, req_id, remote_block_ids,
-                                       local_block_ids, local_host_block_ids,
-                                       effective_deadline);
+        TransferReceiveSession::Create(
+            base_.get(), staging_allocator_.get(), uuid, req_id,
+            remote_block_ids, local_block_ids, local_host_block_ids,
+            effective_deadline, staging_window_config_);
     if (!created.ok()) {
+      if (is_windowed && is_wait &&
+          absl::IsResourceExhausted(created.status())) {
+        session = TransferReceiveSession::CreateQueued(
+            base_.get(), staging_allocator_.get(), uuid, req_id,
+            remote_endpoint, remote_block_ids, local_block_ids,
+            local_host_block_ids, effective_deadline, staging_window_config_);
+        absl::Status inserted = EmplaceRecvSessionLocked(uuid, session);
+        if (!inserted.ok()) {
+          session->ReleaseStaging();
+          failed_recving_.insert(req_id);
+          transfer_details_[req_id] = DetailsFromStatus(inserted);
+          LOG(ERROR) << "StartRead failed to register queued req_id=" << req_id
+                     << ", uuid=" << uuid << ": " << inserted.message();
+          return;
+        }
+        admission_queue_.push_back(uuid);
+        admission_waits_++;
+        return;
+      }
+      if (is_windowed) {
+        admission_rejects_++;
+      }
       failed_recving_.insert(req_id);
       transfer_details_[req_id] = DetailsFromStatus(created.status());
+      if (is_windowed) {
+        transfer_details_[req_id].phase = "admission";
+      }
       return;
     }
     session = *std::move(created);
@@ -958,9 +1120,49 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
   FaultInjectThrow(hooks::kKvCacheManagerApiCompleteRead);
   CompleteReadResult completions;
   std::vector<std::pair<uint64_t, uint64_t>> settled_plans;
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<uint64_t> timed_out_queued;
+  {
+    std::vector<std::pair<uint64_t, std::shared_ptr<TransferReceiveSession>>>
+        queued_candidates;
+    int64_t free_blocks = 0;
+    {
+      absl::MutexLock lock(mu_);
+      free_blocks = staging_allocator_ != nullptr
+                        ? staging_allocator_->capacity() -
+                              staging_allocator_->Stats().blocks_in_use
+                        : 0;
+      for (uint64_t q_uuid : admission_queue_) {
+        auto it = active_recv_sessions_.find(q_uuid);
+        if (it != active_recv_sessions_.end()) {
+          queued_candidates.emplace_back(q_uuid, it->second);
+        }
+      }
+    }
+    for (size_t ahead = 0; ahead < queued_candidates.size(); ++ahead) {
+      const auto& [uuid, session] = queued_candidates[ahead];
+      if (session->is_queued() && !session->IsDraining()) {
+        if (session->admission_deadline() <= now) {
+          const int64_t n_needed = session->ring_blocks_needed();
+          const auto elapsed_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  now - session->start_time())
+                  .count();
+          session->Finish(absl::DeadlineExceededError(absl::StrFormat(
+              "staging window admission timed out after %d ms: %d blocks "
+              "needed, %d free, %d queued ahead",
+              elapsed_ms, n_needed, free_blocks, ahead)));
+          timed_out_queued.push_back(uuid);
+        }
+      }
+    }
+  }
   {
     absl::MutexLock lock(mu_);
-    const auto now = std::chrono::steady_clock::now();
+    admission_timeouts_ += timed_out_queued.size();
+    for (uint64_t q_uuid : timed_out_queued) {
+      std::erase(admission_queue_, q_uuid);
+    }
     for (auto it = send_sessions_.begin(); it != send_sessions_.end();) {
       const std::shared_ptr<TransferSendSession> session = it->second;
       const uint64_t uuid = it->first;
@@ -1012,7 +1214,10 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
          it != active_recv_sessions_.end();) {
       const uint64_t uuid = it->first;
       const std::shared_ptr<TransferReceiveSession> session = it->second;
-      if (!session->IsDraining()) {
+      const bool is_in_admission_queue =
+          std::find(admission_queue_.begin(), admission_queue_.end(), uuid) !=
+          admission_queue_.end();
+      if (!session->IsDraining() && !is_in_admission_queue) {
         if (session->IsReadyToComplete()) {
           LOG(INFO) << "CompleteReadRaw (polling completion): req_id="
                     << session->req_id();
@@ -1028,6 +1233,7 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
       }
 
       if (session->Done()) {
+        aggregated_gate_waits_over_1ms_ += session->gate_waits_over_1ms();
         (!session->GetStatus().ok() ? failed_recving_ : done_recving_)
             .insert(session->req_id());
         transfer_details_[session->req_id()] = session->Details();
@@ -1093,6 +1299,7 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
         req_id, details_it != completions.details.end() ? details_it->second
                                                         : TransferDetails{});
   }
+  TryScheduleSeatAdmissionQueue();
   return completions;
 }
 
@@ -1188,6 +1395,10 @@ class KVCacheManagerWithTransfer::ControlPlaneHandlerImpl
     return manager_->HandleAck(uuid);
   }
 
+  ControlPlaneCapabilities GetCapabilities() const override {
+    return manager_->GetCapabilities();
+  }
+
   uint64_t MaxPullStreamBlocks() const override {
     return manager_->MaxPullStreamBlocks();
   }
@@ -1241,11 +1452,43 @@ KVCacheManagerWithTransfer::HandlePullStream(
                         " blocks=", req.src_block_ids.size());
   });
   try {
-    const uint64_t block_capacity = MaxPullStreamBlocks();
-    if (req.src_block_ids.size() > block_capacity) {
-      throw std::invalid_argument(
-          absl::StrCat("pull stream block count ", req.src_block_ids.size(),
-                       " exceeds configured maximum ", block_capacity));
+    const int64_t capacity =
+        staging_allocator_ ? staging_allocator_->capacity() : 0;
+    bool serve_windowed_pulls = false;
+    int64_t stream_bytes_target = 0;
+    {
+      absl::MutexLock lock(mu_);
+      has_started_transfer_ = true;
+      serve_windowed_pulls = staging_window_config_.serve_windowed_pulls;
+      stream_bytes_target = staging_window_config_.stream_bytes_target;
+    }
+
+    if (req.window_chunks == 0) {
+      if (static_cast<int64_t>(req.src_block_ids.size()) > capacity) {
+        throw std::invalid_argument(
+            absl::StrCat("pull stream block count ", req.src_block_ids.size(),
+                         " exceeds configured maximum ", capacity));
+      }
+    } else {
+      if (!serve_windowed_pulls) {
+        throw std::invalid_argument(
+            FormatStagingWindowRejected("serve_disabled"));
+      }
+      if (req.window_chunks <= 0 || req.chunk_blocks <= 0) {
+        throw std::invalid_argument(
+            FormatStagingWindowRejected("invalid_window_params"));
+      }
+      const int64_t k = static_cast<int64_t>(req.src_block_ids.size());
+      if (k > kMaxWindowedPullBlocks) {
+        throw std::invalid_argument(
+            FormatStagingWindowRejected("blocks_exceed_cap"));
+      }
+      const int64_t ring_blocks = std::min(
+          k, static_cast<int64_t>(req.window_chunks) * req.chunk_blocks);
+      if (ring_blocks > capacity) {
+        throw std::invalid_argument(
+            FormatStagingWindowRejected("ring_exceeds_capacity"));
+      }
     }
 
     // Delays the control thread ahead of the grace wait for the producer's
@@ -1326,12 +1569,22 @@ KVCacheManagerWithTransfer::HandlePullStream(
       session->Finish(
           absl::InternalError("PullStream worker failed to launch"));
     };
+    std::optional<StagingWindowConfig> push_window_config = std::nullopt;
+    if (req.window_chunks > 0) {
+      StagingWindowConfig w_cfg;
+      w_cfg.window_chunks = req.window_chunks;
+      w_cfg.chunk_blocks = req.chunk_blocks;
+      w_cfg.stream_bytes_target = stream_bytes_target;
+      push_window_config = w_cfg;
+    }
+
     FaultInjectThrow(hooks::kKvCacheManagerPullSpawn);
     std::thread([this, session, remote_data_endpoints,
                  src_block_ids = req.src_block_ids,
-                 dst_block_ids = req.dst_block_ids]() {
+                 dst_block_ids = req.dst_block_ids, push_window_config]() {
       try {
-        session->StartPush(remote_data_endpoints, src_block_ids, dst_block_ids);
+        session->StartPush(remote_data_endpoints, src_block_ids, dst_block_ids,
+                           push_window_config);
       } catch (const std::exception& e) {
         session->Finish(absl::InternalError(e.what()));
       } catch (...) {
@@ -1343,21 +1596,35 @@ KVCacheManagerWithTransfer::HandlePullStream(
     }).detach();
     std::move(counter_cleanup).Cancel();
 
-    return PullStreamResponseSpec{
+    PullStreamResponseSpec resp{
         .status = 0,
         .num_layers =
             static_cast<uint32_t>(base_->num_layers() * base_->num_shards()),
         .data_port = static_cast<uint32_t>(local_data_port_),
         .message = "",
     };
+    if (req.window_chunks > 0) {
+      resp.message =
+          FormatStagingWindowAck(req.chunk_blocks, req.window_chunks);
+      resp.staging_window_ack = ControlPlaneStagingWindowAck{
+          .chunk_blocks = req.chunk_blocks,
+          .window_chunks = req.window_chunks,
+      };
+    }
+    return resp;
   } catch (const std::exception& e) {
     LOG(ERROR) << "Raiden producer rejected PullStream request: " << e.what();
-    return PullStreamResponseSpec{
+    PullStreamResponseSpec resp{
         .status = -1,
         .num_layers = 0,
         .data_port = 0,
         .message = e.what(),
     };
+    if (auto reason = ParseStagingWindowRejectedReason(e.what());
+        reason.has_value()) {
+      resp.staging_window_rejected_reason = std::move(reason);
+    }
+    return resp;
   }
 }
 
@@ -1366,9 +1633,88 @@ absl::Status KVCacheManagerWithTransfer::HandleAck(uint64_t uuid) {
   return absl::OkStatus();
 }
 
+absl::Status KVCacheManagerWithTransfer::SetStagingWindowConfig(
+    const StagingWindowConfig& config) {
+  absl::MutexLock lock(mu_);
+  if (has_started_transfer_) {
+    return absl::FailedPreconditionError(
+        "SetStagingWindowConfig cannot be called after transfers have started");
+  }
+  const int64_t pool_blocks =
+      base_->host_block_manager() != nullptr
+          ? base_->host_block_manager()->total_blocks()
+          : (staging_allocator_ != nullptr ? staging_allocator_->capacity()
+                                           : 0);
+  const int64_t num_shards = base_->num_shards();
+  const int64_t bytes_per_block_layer_shard =
+      base_ != nullptr ? static_cast<int64_t>(base_->block_bytes(0)) : 0;
+  absl::Status status = RevalidateMutableStagingWindowConfig(
+      staging_window_config_, config, pool_blocks, num_shards,
+      bytes_per_block_layer_shard);
+  if (!status.ok()) {
+    return status;
+  }
+  staging_window_config_ = config;
+  return absl::OkStatus();
+}
+
+StagingWindowConfig KVCacheManagerWithTransfer::staging_window_config() const {
+  absl::MutexLock lock(mu_);
+  return staging_window_config_;
+}
+
+ControlPlaneCapabilities KVCacheManagerWithTransfer::GetCapabilities() const {
+  absl::MutexLock lock(mu_);
+  ControlPlaneCapabilities caps;
+  if (staging_window_config_.serve_windowed_pulls &&
+      staging_allocator_ != nullptr) {
+    caps.serve_staging_window = true;
+    caps.max_ring_blocks = staging_allocator_->capacity();
+  } else {
+    caps.serve_staging_window = false;
+    caps.max_ring_blocks = 0;
+  }
+  return caps;
+}
+
+std::optional<ControlPlaneCapabilities>
+KVCacheManagerWithTransfer::GetCachedCapabilities(
+    absl::string_view endpoint) const {
+  absl::MutexLock lock(endpoint_caps_mu_);
+  auto it = endpoint_capabilities_.find(endpoint);
+  return it != endpoint_capabilities_.end() ? std::make_optional(it->second)
+                                            : std::nullopt;
+}
+
+void KVCacheManagerWithTransfer::SetCachedCapabilities(
+    absl::string_view endpoint, const ControlPlaneCapabilities& caps) {
+  absl::MutexLock lock(endpoint_caps_mu_);
+  endpoint_capabilities_.insert_or_assign(std::string(endpoint), caps);
+}
+
+void KVCacheManagerWithTransfer::InvalidateCachedCapabilities(
+    absl::string_view endpoint) {
+  absl::MutexLock lock(endpoint_caps_mu_);
+  endpoint_capabilities_.erase(endpoint);
+}
+
+absl::StatusOr<ControlPlaneCapabilities>
+KVCacheManagerWithTransfer::ProbeCapabilities(absl::string_view endpoint,
+                                              absl::Duration timeout) {
+  return control_backend_ != nullptr
+             ? control_backend_->GetCapabilitiesBlocking(endpoint, timeout)
+             : absl::FailedPreconditionError("control_backend_ is null");
+}
+
 uint64_t KVCacheManagerWithTransfer::MaxPullStreamBlocks() const {
-  return static_cast<uint64_t>(
-      std::max<int64_t>(0, staging_allocator_->capacity()));
+  absl::MutexLock lock(mu_);
+  const uint64_t capacity = static_cast<uint64_t>(std::max<int64_t>(
+      0, staging_allocator_ ? staging_allocator_->capacity() : 0));
+  if (staging_window_config_.serve_windowed_pulls) {
+    return std::max<uint64_t>(capacity,
+                              static_cast<uint64_t>(kMaxWindowedPullBlocks));
+  }
+  return capacity;
 }
 
 absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
@@ -1494,6 +1840,140 @@ absl::Status KVCacheManagerWithTransfer::OnBlockShardsReceived(
       session->OnBlockShardsReceived(*this, block_ids, shard_ids);
   MaybeUnregisterSettledRecv(uuid, *session);
   return status;
+}
+
+void KVCacheManagerWithTransfer::TryScheduleSeatAdmissionQueue() {
+  if (shutting_down_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  bool expected = false;
+  if (!seat_wake_pending_.compare_exchange_strong(expected, true,
+                                                  std::memory_order_acq_rel)) {
+    return;
+  }
+  if (base_ == nullptr || base_->push_pool() == nullptr) {
+    seat_wake_pending_.store(false, std::memory_order_release);
+    return;
+  }
+  try {
+    base_->push_pool()->Schedule(
+        base_->assigned_numa_node(), [this, token = alive_token_]() {
+          if (!token->load(std::memory_order_relaxed)) {
+            return;  // F17: Return before touching this->seat_wake_pending_ if
+                     // manager token cleared!
+          }
+          if (shutting_down_.load(std::memory_order_relaxed)) {
+            seat_wake_pending_.store(false, std::memory_order_release);
+            return;
+          }
+          SeatAdmissionQueueHead();
+        });
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "Failed to schedule SeatAdmissionQueueHead on push_pool: "
+                 << e.what();
+    seat_wake_pending_.store(false, std::memory_order_release);
+  }
+}
+
+void KVCacheManagerWithTransfer::SeatAdmissionQueueHead() {
+  {
+    absl::MutexLock lock(mu_);
+    if (shutting_down_.load(std::memory_order_relaxed) ||
+        admission_queue_.empty()) {
+      seat_wake_pending_.store(false, std::memory_order_release);
+      return;
+    }
+    if (seating_in_progress_) {
+      seat_requested_ = true;
+      seat_wake_pending_.store(false, std::memory_order_release);
+      return;
+    }
+    seating_in_progress_ = true;
+    seat_requested_ = false;
+    seat_wake_pending_.store(false, std::memory_order_release);
+  }
+
+  while (true) {
+    if (shutting_down_.load(std::memory_order_relaxed)) {
+      absl::MutexLock lock(mu_);
+      seating_in_progress_ = false;
+      seat_requested_ = false;
+      break;
+    }
+
+    std::shared_ptr<TransferReceiveSession> session;
+    uint64_t uuid = 0;
+    {
+      absl::MutexLock lock(mu_);
+      while (!admission_queue_.empty()) {
+        uint64_t head_uuid = admission_queue_.front();
+        admission_queue_.pop_front();
+        auto it = active_recv_sessions_.find(head_uuid);
+        if (it != active_recv_sessions_.end()) {
+          uuid = head_uuid;
+          session = it->second;
+          break;
+        }
+      }
+      if (session == nullptr) {
+        if ((seat_requested_ ||
+             seat_wake_pending_.load(std::memory_order_acquire)) &&
+            !admission_queue_.empty()) {
+          seat_requested_ = false;
+          seat_wake_pending_.store(false, std::memory_order_release);
+          continue;
+        }
+        seating_in_progress_ = false;
+        seat_requested_ = false;
+        break;
+      }
+    }
+
+    if (session->Done() || !session->is_queued()) {
+      continue;
+    }
+
+    absl::Status status = session->SeatFromQueue(*this);
+    if (absl::IsResourceExhausted(status)) {
+      const bool still_queued = !session->Done() && session->is_queued();
+      absl::MutexLock lock(mu_);
+      if (still_queued) {
+        admission_queue_.push_front(uuid);
+        admission_requeues_++;
+      }
+      if (seat_requested_ ||
+          seat_wake_pending_.load(std::memory_order_acquire)) {
+        seat_requested_ = false;
+        seat_wake_pending_.store(false, std::memory_order_release);
+        continue;
+      }
+      seating_in_progress_ = false;
+      break;
+    }
+  }
+}
+
+StagingStats KVCacheManagerWithTransfer::staging_stats() const {
+  StagingStats stats;
+  if (staging_allocator_ != nullptr) {
+    stats = staging_allocator_->Stats();
+  }
+  absl::MutexLock lock(mu_);
+  int64_t active_gate_waits = 0;
+  for (const auto& [uuid, session] : active_recv_sessions_) {
+    (void)uuid;
+    if (session != nullptr) {
+      active_gate_waits += session->gate_waits_over_1ms();
+    }
+  }
+  stats.gate_waits_over_1ms =
+      aggregated_gate_waits_over_1ms_ + active_gate_waits;
+  stats.rejected_streams = rejected_streams_;
+  stats.admission_rejects = admission_rejects_;
+  stats.admission_waits = admission_waits_;
+  stats.admission_requeues = admission_requeues_;
+  stats.admission_timeouts = admission_timeouts_;
+  return stats;
 }
 
 }  // namespace tpu_raiden

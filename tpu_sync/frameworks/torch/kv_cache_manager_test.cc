@@ -855,6 +855,59 @@ TEST_F(KVCacheManagerTorchTest, ObjectTransferWithoutDeviceBuffersIsReported) {
       << d2h.message();
 }
 
+TEST_F(KVCacheManagerTorchTest, StagingStatsAndWindowConfig) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client_->addressable_devices()[0]->default_memory_space());
+  std::vector<float> data(8 * 1024, 1.0f);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pjrt_buffer, client_->BufferFromHostBuffer(
+                            data.data(), xla::F32, {8, 1024},
+                            /*byte_strides=*/std::nullopt,
+                            xla::PjRtClient::HostBufferSemantics::
+                                kImmutableUntilTransferCompletes,
+                            /*on_done_with_host_buffer=*/nullptr, memory_space,
+                            /*device_layout=*/nullptr));
+  at::Tensor tensor = at::zeros({8, 1024}, at::kFloat);
+  RegisterMockTensor(tensor, pjrt_buffer.get());
+
+  StagingWindowConfig window_cfg;
+  window_cfg.window_chunks = 2;
+  window_cfg.chunk_blocks = 4;
+  window_cfg.admission = StagingWindowConfig::Admission::kWait;
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::CreateWithNodeId(
+                              {tensor}, /*node_id=*/0,
+                              /*local_control_port=*/-1,
+                              /*max_blocks=*/8, /*num_slots=*/4,
+                              /*timeout_s=*/120.0,
+                              /*unsafe_skip_buffer_lock=*/true,
+                              /*parallelism=*/1, /*listener_port=*/std::nullopt,
+                              /*raiden_worker_port=*/0,
+                              /*raiden_controller_address=*/std::nullopt,
+                              /*worker_id=*/std::nullopt,
+                              /*enable_shm=*/false,
+                              /*staging_window_config=*/window_cfg));
+
+  // staging_stats budget_blocks should equal num_slots * max_blocks = 32.
+  auto stats = mgr->staging_stats();
+  EXPECT_EQ(stats.budget_blocks, 32);
+  EXPECT_EQ(stats.blocks_in_use, 0);
+
+  // SetStagingWindowConfig rejects mutating window_chunks
+  StagingWindowConfig mutated = mgr->staging_window_config();
+  mutated.window_chunks = 4;
+  EXPECT_EQ(mgr->SetStagingWindowConfig(mutated).code(),
+            absl::StatusCode::kInvalidArgument);
+
+  // SetStagingWindowConfig succeeds on mutable fields
+  mutated.window_chunks = 2;
+  mutated.chunk_blocks = 8;
+  EXPECT_TRUE(mgr->SetStagingWindowConfig(mutated).ok());
+  EXPECT_EQ(mgr->staging_window_config().chunk_blocks, 8);
+}
+
 }  // namespace
 }  // namespace torch
 }  // namespace tpu_raiden

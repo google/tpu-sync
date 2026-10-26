@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -33,6 +34,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/host_memory_allocator.h"
@@ -40,6 +42,7 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/staging_window.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_sync {
@@ -134,7 +137,8 @@ class KVCacheManagerWithTransfer {
       HostBufferAllocator host_allocator, int64_t node_id = 0,
       int64_t local_control_port = -1, int64_t max_blocks = 0,
       int64_t num_slots = 0, double timeout_s = 120.0,
-      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
 
   KVCacheManagerWithTransfer(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -144,7 +148,8 @@ class KVCacheManagerWithTransfer {
       int parallelism, HostBufferAllocator host_allocator, int64_t node_id = 0,
       int64_t local_control_port = -1, int64_t max_blocks = 0,
       int64_t num_slots = 0, double timeout_s = 120.0,
-      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
 
   // Metadata-based constructor for a heterogeneous registration:
   // slice_byte_sizes carries one stride per block array, in registration
@@ -156,7 +161,8 @@ class KVCacheManagerWithTransfer {
       std::optional<int> host_blocks_to_allocate, int parallelism = 1,
       int64_t node_id = 0, int64_t local_control_port = -1,
       int64_t max_blocks = 0, int64_t num_slots = 0, double timeout_s = 120.0,
-      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
 
   // Metadata-based constructor for FFI / CPU-only testing
   KVCacheManagerWithTransfer(
@@ -164,7 +170,8 @@ class KVCacheManagerWithTransfer {
       std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
       int parallelism = 1, int64_t node_id = 0, int64_t local_control_port = -1,
       int64_t max_blocks = 0, int64_t num_slots = 0, double timeout_s = 120.0,
-      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
 
   void SetMetricsCollector(std::shared_ptr<MetricsCollector> collector) {
     metrics_collector_ = std::move(collector);
@@ -261,12 +268,32 @@ class KVCacheManagerWithTransfer {
   // Bound on one control handshake, end to end, in seconds.
   double control_timeout_s() const { return control_timeout_s_; }
 
+  // Configures mutable staging window parameters before transfers begin.
+  absl::Status SetStagingWindowConfig(const StagingWindowConfig& config);
+  StagingWindowConfig staging_window_config() const;
+  StagingStats staging_stats() const;
+  ControlPlaneCapabilities GetCapabilities() const;
+
+  // Per-control-endpoint capability cache methods.
+  std::optional<ControlPlaneCapabilities> GetCachedCapabilities(
+      absl::string_view endpoint) const;
+  void SetCachedCapabilities(absl::string_view endpoint,
+                             const ControlPlaneCapabilities& caps);
+  void InvalidateCachedCapabilities(absl::string_view endpoint);
+  absl::StatusOr<ControlPlaneCapabilities> ProbeCapabilities(
+      absl::string_view endpoint, absl::Duration timeout);
+
  protected:
   KVCacheManagerWithTransfer(
       std::unique_ptr<kv_cache::KVCacheManagerBase> base, int64_t node_id = 0,
       int64_t local_control_port = -1, int64_t max_blocks = 0,
       int64_t num_slots = 0, double timeout_s = 120.0,
-      std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt);
+
+  absl::StatusOr<PullStreamResponseSpec> HandlePullStream(
+      const PullStreamRequestSpec& req,
+      absl::string_view fallback_peer_ip = "");
 
   std::unique_ptr<kv_cache::KVCacheManagerBase> base_;
 
@@ -336,11 +363,16 @@ class KVCacheManagerWithTransfer {
   // CompleteReadResult::details not yet reported.
   absl::flat_hash_map<std::string, TransferDetails> transfer_details_
       ABSL_GUARDED_BY(mu_);
-  absl::Mutex mu_;
+  mutable absl::Mutex mu_;
+  bool has_started_transfer_ ABSL_GUARDED_BY(mu_) = false;
+  StagingWindowConfig staging_window_config_ ABSL_GUARDED_BY(mu_);
   absl::CondVar cv_;
   std::atomic<bool> stopping_{false};
   std::unique_ptr<ControlPlaneHandler> control_handler_;
   std::unique_ptr<ControlPlaneBackend> control_backend_;
+  mutable absl::Mutex endpoint_caps_mu_;
+  absl::flat_hash_map<std::string, ControlPlaneCapabilities>
+      endpoint_capabilities_ ABSL_GUARDED_BY(endpoint_caps_mu_);
 
  private:
   class ControlPlaneHandlerImpl;
@@ -356,10 +388,24 @@ class KVCacheManagerWithTransfer {
   // uploads and every push it admitted have ended); a no-op before then.
   void MaybeUnregisterSettledReshardRecv(uint64_t uuid,
                                          ReshardReceiveSession& session);
-  absl::StatusOr<PullStreamResponseSpec> HandlePullStream(
-      const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);
   absl::Status HandleAck(uint64_t uuid);
   uint64_t MaxPullStreamBlocks() const;
+
+  void TryScheduleSeatAdmissionQueue();
+  void SeatAdmissionQueueHead();
+
+  std::deque<uint64_t> admission_queue_ ABSL_GUARDED_BY(mu_);
+  bool seating_in_progress_ ABSL_GUARDED_BY(mu_) = false;
+  bool seat_requested_ ABSL_GUARDED_BY(mu_) = false;
+  std::atomic<bool> seat_wake_pending_{false};
+  std::shared_ptr<std::atomic<bool>> alive_token_ =
+      std::make_shared<std::atomic<bool>>(true);
+  int64_t aggregated_gate_waits_over_1ms_ ABSL_GUARDED_BY(mu_) = 0;
+  int64_t rejected_streams_ ABSL_GUARDED_BY(mu_) = 0;
+  int64_t admission_rejects_ ABSL_GUARDED_BY(mu_) = 0;
+  int64_t admission_waits_ ABSL_GUARDED_BY(mu_) = 0;
+  int64_t admission_requeues_ ABSL_GUARDED_BY(mu_) = 0;
+  int64_t admission_timeouts_ ABSL_GUARDED_BY(mu_) = 0;
 
   std::shared_ptr<MetricsCollector> metrics_collector_ = nullptr;
 };

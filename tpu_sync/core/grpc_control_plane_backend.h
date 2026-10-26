@@ -59,6 +59,11 @@ class KVCacheControlPlaneServiceImpl final
                    const control_plane::proto::AckRequest* request,
                    control_plane::proto::AckResponse* response) override;
 
+  grpc::Status GetCapabilities(
+      grpc::ServerContext* context,
+      const control_plane::proto::GetCapabilitiesRequest* request,
+      control_plane::proto::GetCapabilitiesResponse* response) override;
+
  private:
   ControlPlaneHandler* handler_ = nullptr;
 };
@@ -83,6 +88,9 @@ class GrpcControlPlaneBackend : public ControlPlaneBackend {
 
   absl::Status SendAck(absl::string_view remote_endpoint, uint64_t uuid,
                        absl::Duration timeout) override;
+
+  tsl::Future<ControlPlaneCapabilities> GetCapabilities(
+      absl::string_view remote_endpoint, absl::Duration timeout) override;
 
   absl::string_view Name() const override { return "grpc"; }
 
@@ -109,6 +117,15 @@ class GrpcControlPlaneBackend : public ControlPlaneBackend {
     tsl::Promise<PullStreamResponseSpec> promise;
   };
 
+  struct PendingCapabilities {
+    grpc::ClientContext context;
+    control_plane::proto::GetCapabilitiesRequest request;
+    control_plane::proto::GetCapabilitiesResponse response;
+    std::shared_ptr<control_plane::proto::KVCacheControlPlaneService::Stub>
+        stub;
+    tsl::Promise<ControlPlaneCapabilities> promise;
+  };
+
   std::shared_ptr<control_plane::proto::KVCacheControlPlaneService::Stub>
   GetOrCreateStub(absl::string_view endpoint);
 
@@ -129,6 +146,9 @@ class GrpcControlPlaneBackend : public ControlPlaneBackend {
   absl::Mutex pending_mu_;
   absl::flat_hash_map<PendingPull*, std::shared_ptr<PendingPull>> pending_pulls_
       ABSL_GUARDED_BY(pending_mu_);
+  absl::flat_hash_map<PendingCapabilities*,
+                      std::shared_ptr<PendingCapabilities>>
+      pending_caps_ ABSL_GUARDED_BY(pending_mu_);
 };
 
 }  // namespace tpu_raiden

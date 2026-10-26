@@ -14,13 +14,17 @@
 
 #include "tpu_sync/core/control_plane_backend.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -37,9 +41,12 @@
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "grpcpp/security/server_credentials.h"
+#include "grpcpp/server_builder.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/core/grpc_control_plane_backend.h"
 #include "tpu_sync/core/tcp_control_plane_backend.h"
+#include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
@@ -96,10 +103,30 @@ class MockControlPlaneHandler : public ControlPlaneHandler {
     return absl::OkStatus();
   }
 
+  using CapabilitiesCallback = std::function<ControlPlaneCapabilities()>;
+
+  void SetCapabilitiesCallback(CapabilitiesCallback cb) {
+    absl::MutexLock lock(mu_);
+    capabilities_cb_ = std::move(cb);
+  }
+
+  ControlPlaneCapabilities GetCapabilities() const override {
+    CapabilitiesCallback cb;
+    {
+      absl::MutexLock lock(mu_);
+      cb = capabilities_cb_;
+    }
+    if (cb) {
+      return cb();
+    }
+    return ControlPlaneCapabilities{};
+  }
+
  private:
-  absl::Mutex mu_;
+  mutable absl::Mutex mu_;
   PullStreamCallback pull_stream_cb_ ABSL_GUARDED_BY(mu_);
   AckCallback ack_cb_ ABSL_GUARDED_BY(mu_);
+  CapabilitiesCallback capabilities_cb_ ABSL_GUARDED_BY(mu_);
 };
 
 // Simple thread-spawning executor for tests so TCP handlers can run
@@ -467,6 +494,106 @@ TEST_P(ControlPlaneBackendTest, ConcurrentRequestsOverSharedBackend) {
   server->StopServer();
 }
 
+TEST_P(ControlPlaneBackendTest, PullStreamWindowParametersAndAckEcho) {
+  MockControlPlaneHandler handler;
+  PullStreamRequestSpec received_req;
+  handler.SetPullStreamCallback(
+      [&](const PullStreamRequestSpec& req, absl::string_view) {
+        received_req = req;
+        std::string msg;
+        if (req.chunk_blocks > 0 && req.window_chunks > 0) {
+          msg = FormatStagingWindowAck(req.chunk_blocks, req.window_chunks);
+        }
+        return PullStreamResponseSpec{
+            .status = 0,
+            .message = std::move(msg),
+        };
+      });
+
+  auto server = CreateControlPlaneBackend(GetParam(), AsyncTestExecutor());
+  absl::StatusOr<int> port = server->StartServer(0, &handler);
+  ASSERT_TRUE(port.ok()) << port.status();
+
+  auto client = CreateControlPlaneBackend(GetParam());
+  PullStreamRequestSpec req{
+      .uuid = 777, .chunk_blocks = 64, .window_chunks = 2};
+  auto resp = client
+                  ->SendPullRequest(absl::StrCat("127.0.0.1:", *port), req,
+                                    absl::Seconds(5))
+                  .Await();
+  ASSERT_TRUE(resp.ok()) << resp.status();
+  EXPECT_EQ(resp->status, 0);
+  EXPECT_EQ(resp->message, "staging_window=64,2");
+  EXPECT_EQ(received_req.chunk_blocks, 64);
+  EXPECT_EQ(received_req.window_chunks, 2);
+  EXPECT_EQ(ParseStagingWindowAck(resp->message), std::make_pair(64, 2));
+
+  PullStreamRequestSpec legacy_req{
+      .uuid = 778, .chunk_blocks = 0, .window_chunks = 0};
+  auto legacy_resp = client
+                         ->SendPullRequest(absl::StrCat("127.0.0.1:", *port),
+                                           legacy_req, absl::Seconds(5))
+                         .Await();
+  ASSERT_TRUE(legacy_resp.ok()) << legacy_resp.status();
+  EXPECT_EQ(legacy_resp->status, 0);
+  EXPECT_TRUE(legacy_resp->message.empty());
+  EXPECT_EQ(received_req.chunk_blocks, 0);
+  EXPECT_EQ(received_req.window_chunks, 0);
+  server->StopServer();
+}
+
+TEST_P(ControlPlaneBackendTest, StagingWindowRejectedDelivery) {
+  MockControlPlaneHandler handler;
+  handler.SetPullStreamCallback(
+      [](const PullStreamRequestSpec&, absl::string_view) {
+        return PullStreamResponseSpec{
+            .status = -1,
+            .message = FormatStagingWindowRejected("serve_disabled"),
+        };
+      });
+
+  auto server = CreateControlPlaneBackend(GetParam(), AsyncTestExecutor());
+  absl::StatusOr<int> port = server->StartServer(0, &handler);
+  ASSERT_TRUE(port.ok()) << port.status();
+
+  auto client = CreateControlPlaneBackend(GetParam());
+  PullStreamRequestSpec req{
+      .uuid = 888, .chunk_blocks = 64, .window_chunks = 2};
+  auto resp = client
+                  ->SendPullRequest(absl::StrCat("127.0.0.1:", *port), req,
+                                    absl::Seconds(5))
+                  .Await();
+  ASSERT_TRUE(resp.ok()) << resp.status();
+  EXPECT_NE(resp->status, 0);
+  EXPECT_EQ(ParseStagingWindowRejectedReason(resp->message), "serve_disabled");
+  server->StopServer();
+}
+
+TEST_P(ControlPlaneBackendTest, CapabilitiesDefaultAndCustomHandler) {
+  MockControlPlaneHandler handler;
+  auto server = CreateControlPlaneBackend(GetParam(), AsyncTestExecutor());
+  absl::StatusOr<int> port = server->StartServer(0, &handler);
+  ASSERT_TRUE(port.ok()) << port.status();
+
+  auto client = CreateControlPlaneBackend(GetParam());
+  std::string ep = absl::StrCat("127.0.0.1:", *port);
+
+  auto def_caps = client->GetCapabilities(ep, absl::Seconds(5)).Await();
+  ASSERT_TRUE(def_caps.ok()) << def_caps.status();
+  EXPECT_FALSE(def_caps->serve_staging_window);
+  EXPECT_EQ(def_caps->max_ring_blocks, 0);
+
+  handler.SetCapabilitiesCallback([] {
+    return ControlPlaneCapabilities{.serve_staging_window = true,
+                                    .max_ring_blocks = 512};
+  });
+  auto custom_caps = client->GetCapabilities(ep, absl::Seconds(5)).Await();
+  ASSERT_TRUE(custom_caps.ok()) << custom_caps.status();
+  EXPECT_TRUE(custom_caps->serve_staging_window);
+  EXPECT_EQ(custom_caps->max_ring_blocks, 512);
+  server->StopServer();
+}
+
 INSTANTIATE_TEST_SUITE_P(TcpAndGrpc, ControlPlaneBackendTest,
                          ::testing::Values(ControlPlaneBackendType::kTcp,
                                            ControlPlaneBackendType::kGrpc));
@@ -644,6 +771,241 @@ TEST(GrpcControlPlaneBackendAsyncTest, DestructionCancelsPendingPull) {
 
   release.Notify();
   server.StopServer();
+}
+
+TEST(TcpControlPlaneWireTest, PaddingPackUnpackRoundTrip) {
+  int32_t c = 0, w = 0;
+  uint32_t pad = TcpControlPlaneBackend::PackPullStreamPadding(64, 2);
+  EXPECT_NE(pad & (1u << 24), 0u);
+  TcpControlPlaneBackend::UnpackPullStreamPadding(pad, &c, &w);
+  EXPECT_EQ(c, 64);
+  EXPECT_EQ(w, 2);
+
+  uint32_t max_pad = TcpControlPlaneBackend::PackPullStreamPadding(65535, 255);
+  TcpControlPlaneBackend::UnpackPullStreamPadding(max_pad, &c, &w);
+  EXPECT_EQ(c, 65535);
+  EXPECT_EQ(w, 255);
+
+  EXPECT_EQ(TcpControlPlaneBackend::PackPullStreamPadding(64, 0), 0u);
+  EXPECT_EQ(TcpControlPlaneBackend::PackPullStreamPadding(64, -1), 0u);
+  EXPECT_EQ(TcpControlPlaneBackend::PackPullStreamPadding(0, 2), 0u);
+  EXPECT_EQ(TcpControlPlaneBackend::PackPullStreamPadding(-1, 2), 0u);
+  EXPECT_EQ(TcpControlPlaneBackend::PackPullStreamPadding(65536, 2), 0u);
+  EXPECT_EQ(TcpControlPlaneBackend::PackPullStreamPadding(64, 256), 0u);
+  TcpControlPlaneBackend::UnpackPullStreamPadding(0, &c, &w);
+  EXPECT_EQ(c, 0);
+  EXPECT_EQ(w, 0);
+  TcpControlPlaneBackend::UnpackPullStreamPadding(0x00020040u, &c, &w);
+  EXPECT_EQ(c, 0);
+  EXPECT_EQ(w, 0);
+  TcpControlPlaneBackend::UnpackPullStreamPadding((1u << 24) | 64u, &c, &w);
+  EXPECT_EQ(c, 0);
+  EXPECT_EQ(w, 0);
+  TcpControlPlaneBackend::UnpackPullStreamPadding((1u << 24) | (2u << 16), &c,
+                                                  &w);
+  EXPECT_EQ(c, 0);
+  EXPECT_EQ(w, 0);
+}
+
+TEST(ControlPlaneMarkerAndAckHelpersTest, FormatAndParseHelpers) {
+  EXPECT_EQ(FormatStagingWindowRejected("serve_disabled"),
+            "staging_window_rejected:serve_disabled");
+  EXPECT_EQ(ParseStagingWindowRejectedReason(
+                "staging_window_rejected:serve_disabled"),
+            "serve_disabled");
+  EXPECT_EQ(ParseStagingWindowRejectedReason(
+                "staging_window_rejected:ring_exceeds_capacity"),
+            "ring_exceeds_capacity");
+  EXPECT_EQ(ParseStagingWindowRejectedReason("staging_window_rejected:"),
+            std::nullopt);
+  EXPECT_EQ(ParseStagingWindowRejectedReason("unrelated error"), std::nullopt);
+
+  EXPECT_EQ(FormatStagingWindowAck(64, 2), "staging_window=64,2");
+  EXPECT_EQ(ParseStagingWindowAck("staging_window=64,2"),
+            std::make_pair(64, 2));
+  EXPECT_EQ(ParseStagingWindowAck("staging_window=0,2"), std::nullopt);
+  EXPECT_EQ(ParseStagingWindowAck("staging_window=64,0"), std::nullopt);
+  EXPECT_EQ(ParseStagingWindowAck("not_ack_64,2"), std::nullopt);
+
+  EXPECT_EQ(FormatCapabilitiesReply({.serve_staging_window = false}), "caps=");
+  EXPECT_EQ(FormatCapabilitiesReply(
+                {.serve_staging_window = true, .max_ring_blocks = 512}),
+            "caps=staging_window:serve;max_ring_blocks=512");
+  auto parsed =
+      ParseCapabilitiesReply("caps=staging_window:serve;max_ring_blocks=512");
+  ASSERT_TRUE(parsed.ok());
+  EXPECT_TRUE(parsed->serve_staging_window);
+  EXPECT_EQ(parsed->max_ring_blocks, 512);
+  EXPECT_FALSE(ParseCapabilitiesReply("no_prefix").ok());
+  EXPECT_FALSE(ParseCapabilitiesReply("caps=max_ring_blocks=bad").ok());
+  EXPECT_FALSE(ParseCapabilitiesReply("caps=max_ring_blocks=-1").ok());
+
+  EXPECT_TRUE(IsCapabilitiesUnsupportedStatus(
+      absl::UnimplementedError("unimplemented")));
+  EXPECT_TRUE(IsCapabilitiesUnsupportedStatus(
+      absl::InternalError("unknown control op code: 4")));
+  EXPECT_FALSE(IsCapabilitiesUnsupportedStatus(absl::OkStatus()));
+}
+
+TEST(TcpControlPlaneBackendTest, OldClientIgnoresSuccessMessageAndNoDesync) {
+  MockControlPlaneHandler handler;
+  handler.SetPullStreamCallback(
+      [](const PullStreamRequestSpec&, absl::string_view) {
+        return PullStreamResponseSpec{.status = 0,
+                                      .message = "staging_window=64,2"};
+      });
+  TcpControlPlaneBackend server(AsyncTestExecutor());
+  absl::StatusOr<int> port = server.StartServer(0, &handler);
+  ASSERT_TRUE(port.ok()) << port.status();
+
+  TcpControlPlaneBackend client;
+  std::string ep = absl::StrCat("127.0.0.1:", *port);
+  PullStreamRequestSpec req{.uuid = 42};
+  auto resp = client.SendPullRequest(ep, req, absl::Seconds(5)).Await();
+  ASSERT_TRUE(resp.ok()) << resp.status();
+  EXPECT_EQ(resp->status, 0);
+  EXPECT_EQ(resp->message, "staging_window=64,2");
+  EXPECT_TRUE(client.SendAck(ep, 42, absl::Seconds(5)).ok());
+
+  absl::StatusOr<int> fd = TcpControlPlaneBackend::ConnectTcp(ep, 5.0);
+  ASSERT_TRUE(fd.ok()) << fd.status();
+  TcpControlPlaneBackend::ControlRequestHeader legacy_req{
+      .magic = TcpControlPlaneBackend::kControlMagic,
+      .op = TcpControlPlaneBackend::kOpPullStream,
+      .uuid = 43,
+  };
+  ASSERT_TRUE(
+      TcpControlPlaneBackend::WriteExact(*fd, &legacy_req, sizeof(legacy_req))
+          .ok());
+  TcpControlPlaneBackend::ControlResponseHeader legacy_resp_hdr;
+  ASSERT_TRUE(TcpControlPlaneBackend::ReadExact(*fd, &legacy_resp_hdr,
+                                                sizeof(legacy_resp_hdr))
+                  .ok());
+  EXPECT_EQ(legacy_resp_hdr.status, 0);
+  EXPECT_EQ(legacy_resp_hdr.message_len, 19);
+  close(*fd);
+
+  EXPECT_TRUE(client.SendAck(ep, 43, absl::Seconds(5)).ok());
+  server.StopServer();
+}
+
+TEST(TcpControlPlaneBackendTest, UnknownOpReturnsUnimplemented) {
+  MockControlPlaneHandler handler;
+  TcpControlPlaneBackend server(AsyncTestExecutor());
+  absl::StatusOr<int> port = server.StartServer(0, &handler);
+  ASSERT_TRUE(port.ok()) << port.status();
+
+  absl::StatusOr<int> fd = TcpControlPlaneBackend::ConnectTcp(
+      absl::StrCat("127.0.0.1:", *port), 5.0);
+  ASSERT_TRUE(fd.ok()) << fd.status();
+
+  TcpControlPlaneBackend::ControlRequestHeader req{
+      .magic = TcpControlPlaneBackend::kControlMagic, .op = 99};
+  ASSERT_TRUE(TcpControlPlaneBackend::WriteExact(*fd, &req, sizeof(req)).ok());
+
+  TcpControlPlaneBackend::ControlResponseHeader resp;
+  ASSERT_TRUE(TcpControlPlaneBackend::ReadExact(*fd, &resp, sizeof(resp)).ok());
+  EXPECT_EQ(resp.status, -1);
+  std::string msg(resp.message_len, '\0');
+  ASSERT_TRUE(
+      TcpControlPlaneBackend::ReadExact(*fd, msg.data(), msg.size()).ok());
+  EXPECT_THAT(msg, HasSubstr("unknown control op code: 99"));
+  close(*fd);
+  server.StopServer();
+}
+
+TEST(CapabilitiesUnsupportedFallbackTest, TcpOldServerReturnsUnsupported) {
+  int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(listen_fd, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  ASSERT_EQ(bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
+            0);
+  ASSERT_EQ(listen(listen_fd, 1), 0);
+  socklen_t addr_len = sizeof(addr);
+  ASSERT_EQ(
+      getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
+  int port = ntohs(addr.sin_port);
+
+  std::thread server_thread([listen_fd]() {
+    sockaddr_in client_addr{};
+    socklen_t client_len = sizeof(client_addr);
+    int client_fd = accept(listen_fd, reinterpret_cast<sockaddr*>(&client_addr),
+                           &client_len);
+    if (client_fd >= 0) {
+      TcpControlPlaneBackend::ControlRequestHeader req{};
+      if (TcpControlPlaneBackend::ReadExact(client_fd, &req, sizeof(req))
+              .ok()) {
+        std::string err_msg = absl::StrCat("unknown control op code: ", req.op);
+        TcpControlPlaneBackend::ControlResponseHeader resp{
+            .magic = TcpControlPlaneBackend::kResponseMagic,
+            .status = -1,
+            .message_len = static_cast<uint32_t>(err_msg.size()),
+        };
+        if (TcpControlPlaneBackend::WriteExact(client_fd, &resp, sizeof(resp))
+                .ok()) {
+          (void)TcpControlPlaneBackend::WriteExact(client_fd, err_msg.data(),
+                                                   err_msg.size());
+        }
+      }
+      close(client_fd);
+    }
+    close(listen_fd);
+  });
+
+  TcpControlPlaneBackend client;
+  auto caps =
+      client.GetCapabilities(absl::StrCat("127.0.0.1:", port), absl::Seconds(5))
+          .Await();
+  EXPECT_FALSE(caps.ok());
+  EXPECT_TRUE(absl::IsUnimplemented(caps.status())) << caps.status();
+  EXPECT_TRUE(IsCapabilitiesUnsupportedStatus(caps.status()));
+
+  server_thread.join();
+}
+
+TEST(CapabilitiesUnsupportedFallbackTest,
+     GrpcMissingServiceReturnsUnsupported) {
+  grpc::ServerBuilder builder;
+  int port = 0;
+  builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(),
+                           &port);
+  control_plane::proto::KVCacheControlPlaneService::Service service;
+  builder.RegisterService(&service);
+  std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+
+  GrpcControlPlaneBackend client;
+  auto caps =
+      client.GetCapabilities(absl::StrCat("127.0.0.1:", port), absl::Seconds(5))
+          .Await();
+  EXPECT_FALSE(caps.ok());
+  EXPECT_TRUE(absl::IsUnimplemented(caps.status())) << caps.status();
+  EXPECT_TRUE(IsCapabilitiesUnsupportedStatus(caps.status()));
+
+  server->Shutdown();
+}
+
+TEST(CapabilitiesUnsupportedFallbackTest,
+     GetCapabilitiesBlockingTranslatesUnsupported) {
+  grpc::ServerBuilder builder;
+  int port = 0;
+  builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(),
+                           &port);
+  control_plane::proto::KVCacheControlPlaneService::Service service;
+  builder.RegisterService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+
+  auto caps = GrpcControlPlaneBackend().GetCapabilitiesBlocking(
+      absl::StrCat("127.0.0.1:", port), absl::Seconds(5));
+  ASSERT_TRUE(caps.ok()) << caps.status();
+  EXPECT_FALSE(caps->supported);
+  EXPECT_FALSE(caps->serve_staging_window);
+  EXPECT_EQ(caps->max_ring_blocks, 0);
+  server->Shutdown();
 }
 
 }  // namespace

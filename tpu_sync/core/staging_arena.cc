@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -36,6 +37,17 @@
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 
 namespace tpu_raiden {
+namespace {
+thread_local bool in_staging_release_cb = false;
+
+class ReleaseCallbackScope {
+ public:
+  ReleaseCallbackScope() { in_staging_release_cb = true; }
+  ~ReleaseCallbackScope() { in_staging_release_cb = false; }
+  ReleaseCallbackScope(const ReleaseCallbackScope&) = delete;
+  ReleaseCallbackScope& operator=(const ReleaseCallbackScope&) = delete;
+};
+}  // namespace
 
 void StagingArena::Allocation::Release() {
   if (arena_ != nullptr) {
@@ -496,6 +508,8 @@ StagingBlockAllocator::AcquireLocked(int64_t num_blocks) {
     }
     int64_t slot_idx = free_slots_.front();
     free_slots_.pop_front();
+    blocks_in_use_ += slot_blocks_[slot_idx].size();
+    peak_blocks_in_use_ = std::max(peak_blocks_in_use_, blocks_in_use_);
     return Allocation(this, slot_idx, slot_blocks_[slot_idx]);
   }
   if (host_block_manager_ == nullptr) {
@@ -508,6 +522,8 @@ StagingBlockAllocator::AcquireLocked(int64_t num_blocks) {
   ABSL_ASSIGN_OR_RETURN(std::vector<int> allocated,
                         host_block_manager_->Allocate(
                             static_cast<int>(num_blocks), /*lock=*/true));
+  blocks_in_use_ += allocated.size();
+  peak_blocks_in_use_ = std::max(peak_blocks_in_use_, blocks_in_use_);
   return Allocation(this, std::move(allocated));
 }
 
@@ -550,6 +566,30 @@ StagingBlockAllocator::AcquireWithTimeout(
   return AcquireLocked(num_blocks);
 }
 
+void StagingBlockAllocator::SetReleaseCallback(absl::AnyInvocable<void()> cb) {
+  absl::MutexLock lock(mu_);
+  release_cb_ = cb ? std::make_shared<absl::AnyInvocable<void()>>(std::move(cb))
+                   : nullptr;
+  if (release_cb_ == nullptr) {
+    if (in_staging_release_cb) {
+      mu_.Await(absl::Condition(
+          +[](int* active) { return *active <= 1; }, &active_release_cbs_));
+    } else {
+      mu_.Await(absl::Condition(
+          +[](int* active) { return *active == 0; }, &active_release_cbs_));
+    }
+  }
+}
+
+StagingStats StagingBlockAllocator::Stats() const {
+  absl::MutexLock lock(mu_);
+  StagingStats stats;
+  stats.budget_blocks = capacity();
+  stats.blocks_in_use = blocks_in_use_;
+  stats.peak_blocks_in_use = peak_blocks_in_use_;
+  return stats;
+}
+
 size_t StagingBlockAllocator::num_free_slots() const {
   absl::MutexLock lock(mu_);
   return free_slots_.size();
@@ -569,21 +609,53 @@ int64_t StagingBlockAllocator::capacity() const {
 }
 
 void StagingBlockAllocator::ReleaseSlot(int64_t slot_idx) {
-  absl::MutexLock lock(mu_);
-  if (slot_idx < 0 || slot_idx >= num_slots_) {
-    return;
+  std::shared_ptr<absl::AnyInvocable<void()>> cb;
+  {
+    absl::MutexLock lock(mu_);
+    if (slot_idx < 0 || slot_idx >= num_slots_) {
+      return;
+    }
+    free_slots_.push_back(slot_idx);
+    blocks_in_use_ -= slot_blocks_[slot_idx].size();
+    if (release_cb_ != nullptr && *release_cb_ && !in_staging_release_cb) {
+      cb = release_cb_;
+      ++active_release_cbs_;
+    }
   }
-  free_slots_.push_back(slot_idx);
+  if (cb != nullptr) {
+    ReleaseCallbackScope scope;
+    (*cb)();
+    {
+      absl::MutexLock lock(mu_);
+      --active_release_cbs_;
+    }
+  }
 }
 
 void StagingBlockAllocator::ReleaseDynamicBlocks(absl::Span<const int> blocks) {
   if (blocks.empty() || host_block_manager_ == nullptr) {
     return;
   }
-  absl::MutexLock lock(mu_);
-  std::vector<int> block_vec(blocks.begin(), blocks.end());
-  (void)host_block_manager_->Unlock(block_vec);
-  (void)host_block_manager_->Deallocate(block_vec);
+  std::shared_ptr<absl::AnyInvocable<void()>> cb;
+  {
+    absl::MutexLock lock(mu_);
+    std::vector<int> block_vec(blocks.begin(), blocks.end());
+    (void)host_block_manager_->Unlock(block_vec);
+    (void)host_block_manager_->Deallocate(block_vec);
+    blocks_in_use_ -= blocks.size();
+    if (release_cb_ != nullptr && *release_cb_ && !in_staging_release_cb) {
+      cb = release_cb_;
+      ++active_release_cbs_;
+    }
+  }
+  if (cb != nullptr) {
+    ReleaseCallbackScope scope;
+    (*cb)();
+    {
+      absl::MutexLock lock(mu_);
+      --active_release_cbs_;
+    }
+  }
 }
 
 }  // namespace tpu_raiden

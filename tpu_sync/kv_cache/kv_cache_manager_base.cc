@@ -2704,6 +2704,23 @@ std::optional<size_t> KVCacheManagerBase::ExpectedPushSenders(
       plan_snapshot->request.shard_push_schedules_size());
 }
 
+int32_t KVCacheManagerBase::ExpectedPushesPerLayer(uint64_t uuid) const {
+  if (transfer_hooks_.expected_pushes_per_layer) {
+    return transfer_hooks_.expected_pushes_per_layer(uuid);
+  }
+  return 1;
+}
+
+absl::Status KVCacheManagerBase::AwaitIncomingPushSlot(
+    uint64_t uuid, int32_t layer_idx, absl::Span<const int64_t> dst_block_ids,
+    absl::Span<const int32_t> stream_shards, absl::Time deadline) {
+  if (transfer_hooks_.await_incoming_push_slot) {
+    return transfer_hooks_.await_incoming_push_slot(
+        uuid, layer_idx, dst_block_ids, stream_shards, deadline);
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<std::vector<raiden::PjRtCopyFuture>>
 KVCacheManagerBase::DispatchH2dWork(
     const std::vector<CopyWork>& works, std::optional<int64_t> slot_idx,

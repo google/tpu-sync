@@ -190,22 +190,25 @@ NumaAwareKVCacheManager::NumaAwareKVCacheManager(
 NumaAwareKVCacheManager::NumaAwareKVCacheManager(
     nanobind::list kv_caches, int64_t node_id, int64_t local_control_port,
     int64_t max_blocks, int64_t num_slots, double timeout_s,
-    bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm)
+    bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm,
+    std::optional<StagingWindowConfig> staging_window_config)
     : NumaAwareKVCacheManager(
           UnpackAndMove(std::move(kv_caches), unsafe_skip_buffer_lock), node_id,
           local_control_port, max_blocks, num_slots, timeout_s,
-          unsafe_skip_buffer_lock, parallelism, enable_shm) {}
+          unsafe_skip_buffer_lock, parallelism, enable_shm,
+          std::move(staging_window_config)) {}
 
 NumaAwareKVCacheManager::NumaAwareKVCacheManager(
     UnpackedCache&& cache, int64_t node_id, int64_t local_control_port,
     int64_t max_blocks, int64_t num_slots, double timeout_s,
-    bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm)
+    bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm,
+    std::optional<StagingWindowConfig> staging_window_config)
     : device_arrays_(std::move(cache.device_arrays)) {
   metrics_collector_ = MetricsCollectorFromEnv();
   InitSubManagers(cache.layer_buffers, std::nullopt, std::nullopt,
                   unsafe_skip_buffer_lock, parallelism, node_id,
                   local_control_port, max_blocks, num_slots, timeout_s,
-                  enable_shm);
+                  enable_shm, std::move(staging_window_config));
 }
 #endif
 
@@ -236,7 +239,8 @@ NumaAwareKVCacheManager::NumaAwareKVCacheManager(
     const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
     int64_t node_id, int64_t local_control_port, int64_t max_blocks,
     int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
-    int parallelism, bool enable_shm) {
+    int parallelism, bool enable_shm,
+    std::optional<StagingWindowConfig> staging_window_config) {
   // TODO(justinlu): Convert the remaining constructors to factory methods, make
   // the constructors private, and avoid try/catch/throw statements in favor of
   // absl::Status/absl::StatusOr error propagation.
@@ -254,7 +258,7 @@ NumaAwareKVCacheManager::NumaAwareKVCacheManager(
   InitSubManagers(*layer_buffers, std::nullopt, std::nullopt,
                   unsafe_skip_buffer_lock, parallelism, node_id,
                   local_control_port, max_blocks, num_slots, timeout_s,
-                  enable_shm);
+                  enable_shm, std::move(staging_window_config));
 }
 
 NumaAwareKVCacheManager::NumaAwareKVCacheManager(
@@ -289,7 +293,8 @@ void NumaAwareKVCacheManager::InitSubManagers(
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id,
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
-    double timeout_s, bool enable_shm) {
+    double timeout_s, bool enable_shm,
+    std::optional<StagingWindowConfig> staging_window_config) {
   if (layer_buffers.empty()) return;
   size_t num_layers = layer_buffers.size();
   total_num_shards_ = layer_buffers[0].size();
@@ -424,11 +429,10 @@ void NumaAwareKVCacheManager::InitSubManagers(
         sub_mgr = std::make_unique<KVCacheManagerWithTransfer>(
             sub_buffers, sub_port, host_blocks_to_allocate,
             unsafe_skip_buffer_lock, parallelism, host_alloc, node_id + sub_idx,
-            sub_ctrl_port, max_blocks, num_slots, timeout_s);
-        if (metrics_collector_) {
-          sub_mgr->SetMetricsCollector(metrics_collector_);
-        }
+            sub_ctrl_port, max_blocks, num_slots, timeout_s, metrics_collector_,
+            staging_window_config);
       } catch (const std::exception& e) {
+        if (dynamic_cast<const std::invalid_argument*>(&e) != nullptr) throw;
         // A consecutive (or requested) port was unavailable. Retry the whole
         // allocation from a fresh ephemeral base; for fixed ports, propagate.
         if (!ephemeral_data_port || attempt + 1 >= kMaxPortAttempts) throw;
@@ -998,6 +1002,45 @@ absl::Status NumaAwareKVCacheManager::UnlockBlocks(
   return absl::OkStatus();
 }
 
+absl::Status NumaAwareKVCacheManager::SetStagingWindowConfig(
+    const StagingWindowConfig& config) {
+  for (const auto& sub_mgr : sub_managers_) {
+    if (sub_mgr != nullptr) {
+      absl::Status status = sub_mgr->SetStagingWindowConfig(config);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
+StagingWindowConfig NumaAwareKVCacheManager::staging_window_config() const {
+  if (!sub_managers_.empty() && sub_managers_[0] != nullptr) {
+    return sub_managers_[0]->staging_window_config();
+  }
+  return StagingWindowConfig{};
+}
+
+StagingStats NumaAwareKVCacheManager::staging_stats() const {
+  StagingStats agg;
+  for (const auto& sub_mgr : sub_managers_) {
+    if (sub_mgr == nullptr) continue;
+    StagingStats s = sub_mgr->staging_stats();
+    agg.budget_blocks += s.budget_blocks;
+    agg.blocks_in_use += s.blocks_in_use;
+    agg.peak_blocks_in_use =
+        std::max(agg.peak_blocks_in_use, s.peak_blocks_in_use);
+    agg.gate_waits_over_1ms += s.gate_waits_over_1ms;
+    agg.rejected_streams += s.rejected_streams;
+    agg.admission_rejects += s.admission_rejects;
+    agg.admission_waits += s.admission_waits;
+    agg.admission_requeues += s.admission_requeues;
+    agg.admission_timeouts += s.admission_timeouts;
+  }
+  return agg;
+}
+
 std::string NumaAwareKVCacheManager::DumpMetricsToString() const {
   if (metrics_collector_) {
     return metrics_collector_->DumpMetricsToString();
@@ -1096,17 +1139,21 @@ KVCacheManager::CreateWithNodeId(
     int64_t max_blocks, int64_t num_slots, double timeout_s,
     bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id, bool enable_shm) {
+    std::optional<std::string> worker_id, bool enable_shm,
+    std::optional<StagingWindowConfig> staging_window_config) {
   try {
     auto manager = absl::WrapUnique(
         new KVCacheManager(std::make_unique<NumaAwareKVCacheManager>(
             std::move(kv_caches), node_id, local_control_port, max_blocks,
             num_slots, timeout_s, unsafe_skip_buffer_lock, parallelism,
-            enable_shm)));
+            enable_shm, std::move(staging_window_config))));
     manager->StartGrpcServer(raiden_worker_port,
                              std::move(raiden_controller_address),
                              std::move(worker_id));
     return manager;
+  } catch (const std::invalid_argument& e) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("KVCacheManager::CreateWithNodeId failed: ", e.what()));
   } catch (const std::exception& e) {
     return absl::InternalError(
         absl::StrCat("KVCacheManager::CreateWithNodeId failed: ", e.what()));
@@ -1133,7 +1180,8 @@ KVCacheManager::CreateFromPjRtBuffers(
     int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
     int parallelism, int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id) {
+    std::optional<std::string> worker_id,
+    std::optional<StagingWindowConfig> staging_window_config) {
   // TODO(justinlu): Convert the remaining constructors to factory methods, make
   // the constructors private, and avoid try/catch/throw statements in favor of
   // absl::Status/absl::StatusOr error propagation.
@@ -1141,11 +1189,15 @@ KVCacheManager::CreateFromPjRtBuffers(
     auto manager = absl::WrapUnique(
         new KVCacheManager(std::make_unique<NumaAwareKVCacheManager>(
             device_buffers, node_id, local_control_port, max_blocks, num_slots,
-            timeout_s, unsafe_skip_buffer_lock, parallelism)));
+            timeout_s, unsafe_skip_buffer_lock, parallelism,
+            /*enable_shm=*/false, std::move(staging_window_config))));
     manager->StartGrpcServer(raiden_worker_port,
                              std::move(raiden_controller_address),
                              std::move(worker_id));
     return manager;
+  } catch (const std::invalid_argument& e) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "KVCacheManager::CreateFromPjRtBuffers failed: ", e.what()));
   } catch (const std::exception& e) {
     return absl::InternalError(absl::StrCat(
         "KVCacheManager::CreateFromPjRtBuffers failed: ", e.what()));

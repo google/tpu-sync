@@ -31,12 +31,14 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/data_connection_policy.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/staging_window.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
@@ -118,9 +120,11 @@ class TransferSendSession
 
   // Stages producer device blocks into host staging and executes the
   // multi-layer D2H copy and pipelined H2H push.
-  void StartPush(const std::vector<std::string>& remote_data_endpoints,
-                 const std::vector<int64_t>& src_block_ids,
-                 const std::vector<int64_t>& dst_block_ids);
+  void StartPush(
+      const std::vector<std::string>& remote_data_endpoints,
+      const std::vector<int64_t>& src_block_ids,
+      const std::vector<int64_t>& dst_block_ids,
+      std::optional<StagingWindowConfig> window_config = std::nullopt);
 
   // Coalesces contiguous (src_block_ids, dst_block_ids) block runs into
   // CopySpec segments.
@@ -128,11 +132,25 @@ class TransferSendSession
       const std::vector<int64_t>& src_block_ids,
       const std::vector<int64_t>& dst_block_ids);
 
+  // Configures bounded-window send parameters and per-chunk D2H / H2H plans.
+  absl::Status ConfigureWindowedSend(
+      int32_t window_chunks, std::vector<std::vector<CopySpec>> chunk_d2h_specs,
+      std::vector<std::vector<int32_t>> chunk_src_host_block_ids,
+      std::vector<std::vector<int32_t>> chunk_dst_host_block_ids,
+      int64_t block_bytes_per_layer_per_group = 0,
+      int64_t stream_bytes_target = StagingWindowConfig{}.stream_bytes_target);
+
+  static constexpr absl::string_view kAckWaitPhase = "ack-wait";
+
   const std::string& req_id() const { return req_id_; }
   uint64_t uuid() const { return uuid_; }
   std::chrono::steady_clock::time_point deadline() const { return deadline_; }
   std::chrono::steady_clock::time_point register_start() const {
     return register_start_;
+  }
+  absl::Time last_unit_progress() const {
+    absl::MutexLock lock(mu_);
+    return last_unit_progress_;
   }
 
   int64_t num_blocks() const {
@@ -146,6 +164,10 @@ class TransferSendSession
   std::chrono::steady_clock::time_point d2h_done() const {
     absl::MutexLock lock(mu_);
     return d2h_done_;
+  }
+  bool IsWindowed() const {
+    absl::MutexLock lock(mu_);
+    return IsWindowedLocked();
   }
 
  private:
@@ -186,7 +208,19 @@ class TransferSendSession
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndSendOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   absl::Status AcquireStagingWithRetry(int64_t num_blocks);
-  void SendNextLayer(size_t l);
+  bool IsWindowedLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+    return window_chunks_ > 0 || n_chunks_ > 1;
+  }
+  bool IsLayerAckWaitingLocked(size_t l) const
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void MaybeScheduleNextLayerUnitsLocked(size_t l)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  void DispatchD2h(size_t l, int32_t c);
+  void OnD2hComplete(size_t l, int32_t c, const absl::Status& status);
+  void DispatchH2h(size_t l, int32_t c);
+  void OnH2hComplete(size_t l, int32_t c,
+                     const absl::StatusOr<std::vector<int>>& push_res);
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
@@ -209,6 +243,21 @@ class TransferSendSession
   // set to a non-OK status.
   absl::string_view failed_phase_ ABSL_GUARDED_BY(mu_);
   bool pull_started_ ABSL_GUARDED_BY(mu_) = false;
+  bool d2h_started_ ABSL_GUARDED_BY(mu_) = false;
+  friend class TransferSendSessionPeer;
+  int32_t window_chunks_ ABSL_GUARDED_BY(mu_) = 0;
+  int32_t n_chunks_ ABSL_GUARDED_BY(mu_) = 1;
+  int64_t block_bytes_per_layer_per_group_ ABSL_GUARDED_BY(mu_) = 0;
+  int64_t stream_bytes_target_ ABSL_GUARDED_BY(mu_) =
+      StagingWindowConfig{}.stream_bytes_target;
+  std::vector<std::vector<CopySpec>> chunk_d2h_specs_ ABSL_GUARDED_BY(mu_);
+  std::vector<std::vector<int>> chunk_src_host_block_ids_ ABSL_GUARDED_BY(mu_);
+  std::vector<std::vector<int>> chunk_dst_host_block_ids_ ABSL_GUARDED_BY(mu_);
+  std::vector<int32_t> d2h_issued_units_ ABSL_GUARDED_BY(mu_);
+  std::vector<std::vector<bool>> d2h_unit_ready_ ABSL_GUARDED_BY(mu_);
+  std::vector<int32_t> h2h_issued_units_ ABSL_GUARDED_BY(mu_);
+  std::vector<int32_t> h2h_acked_units_ ABSL_GUARDED_BY(mu_);
+
   // Copies and pushes issued for this send whose completion has not been
   // observed. The staging they read and write is held until it is zero.
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
@@ -219,12 +268,12 @@ class TransferSendSession
   // The last op already closed the idle data connections (kPerTransfer).
   bool connections_released_ ABSL_GUARDED_BY(mu_) = false;
   std::chrono::steady_clock::time_point completed_at_ ABSL_GUARDED_BY(mu_);
-  std::vector<raiden::PjRtCopyFuture> d2h_layer_futures_ ABSL_GUARDED_BY(mu_);
+  std::vector<std::vector<raiden::PjRtCopyFuture>> d2h_unit_futures_
+      ABSL_GUARDED_BY(mu_);
   // The consumer's data endpoints, populated once `StartPush` serves its pull.
   std::vector<std::string> remote_data_endpoints_ ABSL_GUARDED_BY(mu_);
-  std::vector<int> src_ints_ ABSL_GUARDED_BY(mu_);
-  std::vector<int> dst_ints_ ABSL_GUARDED_BY(mu_);
-  std::atomic<size_t> remaining_h2h_layers_{0};
+  std::atomic<size_t> remaining_h2h_units_{0};
+  absl::Time last_unit_progress_ ABSL_GUARDED_BY(mu_) = absl::InfinitePast();
 };
 
 }  // namespace tpu_raiden

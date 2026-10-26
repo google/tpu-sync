@@ -14,6 +14,7 @@
 
 #include "tpu_sync/kv_cache/transfer_send_session.h"
 
+#include <atomic>
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
@@ -21,14 +22,19 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/log_severity.h"
 #include "absl/base/thread_annotations.h"
+#include "absl/log/check.h"
+#include "absl/log/scoped_mock_log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
@@ -41,6 +47,7 @@
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/staging_window.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
 #include "tpu_sync/transport/block_transport.h"
 
@@ -48,17 +55,20 @@ namespace tpu_raiden {
 namespace {
 
 using ::absl_testing::StatusIs;
+using ::testing::_;
 using ::testing::AllOf;
 using ::testing::HasSubstr;
 
 class FakeSendBase : public kv_cache::KVCacheManagerBase {
  public:
-  explicit FakeSendBase(size_t num_layers = 1, int64_t host_blocks = 4)
-      : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
-                                     std::vector<size_t>(num_layers, 128),
-                                     /*local_port=*/std::nullopt,
-                                     /*host_blocks_to_allocate=*/host_blocks,
-                                     /*parallelism=*/1, nullptr) {}
+  explicit FakeSendBase(size_t num_layers = 1, int64_t host_blocks = 4,
+                        size_t block_byte_size = 128)
+      : kv_cache::KVCacheManagerBase(
+            num_layers, /*num_shards=*/1,
+            std::vector<size_t>(num_layers, block_byte_size),
+            /*local_port=*/std::nullopt,
+            /*host_blocks_to_allocate=*/host_blocks,
+            /*parallelism=*/1, nullptr) {}
 
   void SetManualD2h(bool manual) {
     absl::MutexLock lock(mu_);
@@ -88,6 +98,37 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
     cb(std::move(res));
   }
 
+  struct DispatchedD2h {
+    std::vector<int64_t> src_offsets;
+    std::vector<int64_t> dst_offsets;
+    std::vector<int64_t> sizes;
+    std::optional<size_t> layer_idx;
+    std::thread::id thread_id;
+  };
+
+  struct DispatchedH2h {
+    std::vector<int> src_block_ids;
+    std::vector<int> dst_block_ids;
+    int layer_idx;
+    std::thread::id thread_id;
+    std::optional<int> parallelism = std::nullopt;
+  };
+
+  void SetParallelism(int p) { parallelism_ = p; }
+
+  void SetNumNumaGroups(int g) {
+    absl::MutexLock lock(mu_);
+    num_numa_groups_override_ = g;
+  }
+
+  int num_numa_groups() const override {
+    absl::MutexLock lock(mu_);
+    if (num_numa_groups_override_.has_value()) {
+      return *num_numa_groups_override_;
+    }
+    return kv_cache::KVCacheManagerBase::num_numa_groups();
+  }
+
   int d2h_calls() const {
     absl::MutexLock lock(mu_);
     return d2h_calls_;
@@ -98,12 +139,30 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
     return h2h_calls_;
   }
 
+  bool WaitForD2hCalls(int expected, absl::Duration timeout) const {
+    absl::MutexLock lock(mu_);
+    auto cond = [this, expected]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+      return d2h_calls_ >= expected;
+    };
+    return mu_.AwaitWithTimeout(absl::Condition(&cond), timeout);
+  }
+
   bool WaitForH2hCalls(int expected, absl::Duration timeout) const {
     absl::MutexLock lock(mu_);
     auto cond = [this, expected]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
       return h2h_calls_ >= expected;
     };
     return mu_.AwaitWithTimeout(absl::Condition(&cond), timeout);
+  }
+
+  std::vector<DispatchedD2h> d2h_dispatched() const {
+    absl::MutexLock lock(mu_);
+    return d2h_dispatched_;
+  }
+
+  std::vector<DispatchedH2h> h2h_dispatched() const {
+    absl::MutexLock lock(mu_);
+    return h2h_dispatched_;
   }
 
   absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
@@ -114,6 +173,9 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
       std::optional<size_t> shard_idx) override {
     absl::MutexLock lock(mu_);
     ++d2h_calls_;
+    d2h_dispatched_.push_back({src_offsets_major_dim, dst_offsets_major_dim,
+                               copy_sizes_major_dim, layer_idx,
+                               std::this_thread::get_id()});
     auto [promise, future] = xla::MakePromise<>();
     if (manual_d2h_) {
       d2h_promises_.push_back(std::move(promise));
@@ -123,15 +185,17 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
     return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
   }
 
-  void H2hWriteDirectAsync(const std::vector<std::string>& peers,
-                           const std::vector<int>& src_block_ids,
-                           const std::vector<int>& dst_block_ids, uint64_t uuid,
-                           int layer_idx,
-                           std::function<void(absl::StatusOr<std::vector<int>>)>
-                               on_complete) override {
+  void H2hWriteDirectAsync(
+      const std::vector<std::string>& peers,
+      const std::vector<int>& src_block_ids,
+      const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx,
+      std::function<void(absl::StatusOr<std::vector<int>>)> on_complete,
+      std::optional<int> parallelism = std::nullopt) override {
     {
       absl::MutexLock lock(mu_);
       ++h2h_calls_;
+      h2h_dispatched_.push_back({src_block_ids, dst_block_ids, layer_idx,
+                                 std::this_thread::get_id(), parallelism});
       if (manual_h2h_) {
         h2h_callbacks_.push_back(std::move(on_complete));
         return;
@@ -146,9 +210,13 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
   bool manual_h2h_ ABSL_GUARDED_BY(mu_) = false;
   int d2h_calls_ ABSL_GUARDED_BY(mu_) = 0;
   int h2h_calls_ ABSL_GUARDED_BY(mu_) = 0;
+  std::optional<int> num_numa_groups_override_ ABSL_GUARDED_BY(mu_) =
+      std::nullopt;
   std::vector<xla::Promise<>> d2h_promises_ ABSL_GUARDED_BY(mu_);
   std::vector<std::function<void(absl::StatusOr<std::vector<int>>)>>
       h2h_callbacks_ ABSL_GUARDED_BY(mu_);
+  std::vector<DispatchedD2h> d2h_dispatched_ ABSL_GUARDED_BY(mu_);
+  std::vector<DispatchedH2h> h2h_dispatched_ ABSL_GUARDED_BY(mu_);
 };
 
 // Sets TPU_RAIDEN_DATA_CONN_REUSE for one test (unsets it when `value` is
@@ -645,6 +713,614 @@ TEST(TransferSendSessionTest, ReleaseStagingBlocksClearsD2hLayerFuturesOnDone) {
   EXPECT_FALSE(session->HasStaging());
   EXPECT_FALSE(
       session->OwnsBlockWithReadyFuture(/*block_id=*/0, /*layer_idx=*/0));
+}
+
+}  // namespace
+
+class TransferSendSessionPeer {
+ public:
+  static int32_t d2h_issued_units(const TransferSendSession& s, size_t l) {
+    absl::MutexLock lock(s.mu_);
+    return l < s.d2h_issued_units_.size() ? s.d2h_issued_units_[l] : 0;
+  }
+  static int32_t h2h_issued_units(const TransferSendSession& s, size_t l) {
+    absl::MutexLock lock(s.mu_);
+    return l < s.h2h_issued_units_.size() ? s.h2h_issued_units_[l] : 0;
+  }
+  static int32_t h2h_acked_units(const TransferSendSession& s, size_t l) {
+    absl::MutexLock lock(s.mu_);
+    return l < s.h2h_acked_units_.size() ? s.h2h_acked_units_[l] : 0;
+  }
+  static size_t remaining_h2h_units(const TransferSendSession& s) {
+    return s.remaining_h2h_units_.load(std::memory_order_acquire);
+  }
+  static absl::string_view CurrentPhase(const TransferSendSession& s) {
+    absl::MutexLock lock(s.mu_);
+    return s.CurrentPhaseLocked();
+  }
+  static bool IsWindowed(const TransferSendSession& s) {
+    absl::MutexLock lock(s.mu_);
+    return s.IsWindowedLocked();
+  }
+  static int32_t window_chunks(const TransferSendSession& s) {
+    absl::MutexLock lock(s.mu_);
+    return s.window_chunks_;
+  }
+  static int32_t n_chunks(const TransferSendSession& s) {
+    absl::MutexLock lock(s.mu_);
+    return s.n_chunks_;
+  }
+};
+
+namespace {
+
+struct WindowedTestContext {
+  std::unique_ptr<FakeSendBase> base;
+  std::unique_ptr<StagingBlockAllocator> allocator;
+  std::shared_ptr<TransferSendSession> session;
+};
+
+WindowedTestContext MakeWindowedSession(int layers, int chunks, int window,
+                                        uint64_t uuid = 400,
+                                        bool manual_d2h = true) {
+  auto base =
+      std::make_unique<FakeSendBase>(layers, /*host_blocks=*/chunks * 4);
+  base->SetManualD2h(manual_d2h);
+  base->SetManualH2h(true);
+  auto allocator = CreateStagingBlockAllocator(base.get(), /*num_slots=*/2,
+                                               /*max_blocks=*/chunks * 2);
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<int64_t> blocks(chunks * 2);
+  std::iota(blocks.begin(), blocks.end(), 0);
+  auto session =
+      *TransferSendSession::Create(base.get(), allocator.get(), "req", uuid,
+                                   blocks, now + std::chrono::seconds(10), now);
+  std::vector<std::vector<CopySpec>> specs(chunks,
+                                           std::vector<CopySpec>(layers));
+  std::vector<std::vector<int32_t>> src_ids(chunks), dst_ids(chunks);
+  for (int c = 0; c < chunks; ++c) {
+    src_ids[c] = {c * 2, c * 2 + 1};
+    dst_ids[c] = {100 + c * 2, 100 + c * 2 + 1};
+    for (int l = 0; l < layers; ++l) {
+      specs[c][l].src_offsets = {c * 2, c * 2 + 1};
+      specs[c][l].dst_offsets = {c * 2, c * 2 + 1};
+      specs[c][l].sizes = {1, 1};
+    }
+  }
+  ABSL_CHECK_OK(
+      session->ConfigureWindowedSend(window, specs, src_ids, dst_ids));
+  return WindowedTestContext{std::move(base), std::move(allocator),
+                             std::move(session)};
+}
+
+TEST(TransferSendSessionTest, WindowedSendPerLayerUnitOrderingAndD2hLookahead) {
+  auto ctx = MakeWindowedSession(/*layers=*/2, /*chunks=*/4, /*window=*/2, 401);
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<int64_t> src = {0, 1, 2, 3, 4, 5, 6, 7};
+  std::vector<int64_t> dst = {100, 101, 102, 103, 104, 105, 106, 107};
+  ctx.session->ValidateAndBeginPull(src, now);
+  ctx.session->StartPush({"127.0.0.1:9000"}, src, dst);
+
+  EXPECT_EQ(ctx.base->d2h_calls(), 4);
+  EXPECT_EQ(ctx.base->h2h_calls(), 0);
+  EXPECT_EQ(TransferSendSessionPeer::remaining_h2h_units(*ctx.session), 8);
+  EXPECT_EQ(TransferSendSessionPeer::d2h_issued_units(*ctx.session, 0), 2);
+  EXPECT_EQ(TransferSendSessionPeer::window_chunks(*ctx.session), 2);
+  EXPECT_EQ(TransferSendSessionPeer::n_chunks(*ctx.session), 4);
+  EXPECT_TRUE(TransferSendSessionPeer::IsWindowed(*ctx.session));
+
+  ctx.base->CompleteD2h(0, absl::OkStatus());
+  ASSERT_TRUE(ctx.base->WaitForH2hCalls(1, absl::Seconds(2)));
+  EXPECT_EQ(TransferSendSessionPeer::h2h_issued_units(*ctx.session, 0), 1);
+
+  ctx.base->CompleteD2h(1, absl::OkStatus());
+  absl::SleepFor(absl::Milliseconds(20));
+  EXPECT_EQ(ctx.base->h2h_calls(), 1);
+  EXPECT_EQ(ctx.base->d2h_calls(), 4);
+
+  ctx.base->CompleteH2h(0, std::vector<int>{0, 1});
+  ASSERT_TRUE(ctx.base->WaitForD2hCalls(5, absl::Seconds(2)));
+  ASSERT_TRUE(ctx.base->WaitForH2hCalls(2, absl::Seconds(2)));
+  EXPECT_EQ(TransferSendSessionPeer::h2h_acked_units(*ctx.session, 0), 1);
+  EXPECT_EQ(TransferSendSessionPeer::h2h_issued_units(*ctx.session, 0), 2);
+
+  ctx.base->CompleteD2h(2, absl::OkStatus());
+  ASSERT_TRUE(ctx.base->WaitForH2hCalls(3, absl::Seconds(2)));
+  ctx.base->CompleteD2h(3, absl::OkStatus());
+  ctx.base->CompleteH2h(2, std::vector<int>{0, 1});
+  ASSERT_TRUE(ctx.base->WaitForD2hCalls(6, absl::Seconds(2)));
+  ASSERT_TRUE(ctx.base->WaitForH2hCalls(4, absl::Seconds(2)));
+
+  ctx.base->CompleteD2h(4, absl::OkStatus());
+  ctx.base->CompleteH2h(1, std::vector<int>{2, 3});
+  ASSERT_TRUE(ctx.base->WaitForD2hCalls(7, absl::Seconds(2)));
+  ASSERT_TRUE(ctx.base->WaitForH2hCalls(5, absl::Seconds(2)));
+
+  ctx.base->CompleteD2h(5, absl::OkStatus());
+  ctx.base->CompleteH2h(3, std::vector<int>{2, 3});
+  ASSERT_TRUE(ctx.base->WaitForD2hCalls(8, absl::Seconds(2)));
+  ASSERT_TRUE(ctx.base->WaitForH2hCalls(6, absl::Seconds(2)));
+
+  ctx.base->CompleteD2h(6, absl::OkStatus());
+  ctx.base->CompleteH2h(4, std::vector<int>{4, 5});
+  ASSERT_TRUE(ctx.base->WaitForH2hCalls(7, absl::Seconds(2)));
+
+  ctx.base->CompleteD2h(7, absl::OkStatus());
+  ctx.base->CompleteH2h(5, std::vector<int>{4, 5});
+  ASSERT_TRUE(ctx.base->WaitForH2hCalls(8, absl::Seconds(2)));
+
+  ctx.base->CompleteH2h(6, std::vector<int>{6, 7});
+  ctx.base->CompleteH2h(7, std::vector<int>{6, 7});
+
+  ABSL_EXPECT_OK(ctx.session->AwaitForDone());
+  EXPECT_TRUE(ctx.session->Done());
+
+  const auto d2h_disp = ctx.base->d2h_dispatched();
+  const auto h2h_disp = ctx.base->h2h_dispatched();
+  ASSERT_EQ(d2h_disp.size(), 8);
+  ASSERT_EQ(h2h_disp.size(), 8);
+  for (const auto& d : d2h_disp) {
+    EXPECT_EQ(d.sizes, (std::vector<int64_t>{1, 1}));
+  }
+  for (const auto& h : h2h_disp) {
+    EXPECT_EQ(h.src_block_ids.size(), 2);
+    EXPECT_EQ(h.dst_block_ids.size(), 2);
+  }
+}
+
+TEST(TransferSendSessionTest, WindowedSendSynchronousD2hNoDoubleDispatch) {
+  auto ctx = MakeWindowedSession(/*layers=*/2, /*chunks=*/4, /*window=*/2, 405,
+                                 /*manual_d2h=*/false);
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<int64_t> src(8), dst(8);
+  std::iota(src.begin(), src.end(), 0);
+  std::iota(dst.begin(), dst.end(), 100);
+  ctx.session->ValidateAndBeginPull(src, now);
+  ctx.session->StartPush({"127.0.0.1:9000"}, src, dst);
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_TRUE(ctx.base->WaitForH2hCalls(i + 1, absl::Seconds(2)));
+    ctx.base->CompleteH2h(i, std::vector<int>{0});
+  }
+  ABSL_EXPECT_OK(ctx.session->AwaitForDone());
+  EXPECT_EQ(ctx.base->d2h_calls(), 8);
+  EXPECT_EQ(ctx.base->h2h_calls(), 8);
+}
+
+TEST(TransferSendSessionTest, WindowedSendPushPoolThreadHop) {
+  const std::thread::id caller_thread_id = std::this_thread::get_id();
+  auto ctx = MakeWindowedSession(/*layers=*/1, /*chunks=*/2, /*window=*/1, 402);
+  const auto now = std::chrono::steady_clock::now();
+  ctx.session->ValidateAndBeginPull({0, 1}, now);
+  ctx.session->StartPush({"127.0.0.1:9000"}, {0, 1}, {100, 101});
+
+  ctx.base->CompleteD2h(0, absl::OkStatus());
+  ASSERT_TRUE(ctx.base->WaitForH2hCalls(1, absl::Seconds(2)));
+  EXPECT_NE(ctx.base->h2h_dispatched()[0].thread_id, caller_thread_id);
+
+  ctx.base->CompleteH2h(0, std::vector<int>{0});
+  ASSERT_TRUE(ctx.base->WaitForD2hCalls(2, absl::Seconds(2)));
+  EXPECT_NE(ctx.base->d2h_dispatched()[1].thread_id, caller_thread_id);
+
+  ctx.base->CompleteD2h(1, absl::OkStatus());
+  ASSERT_TRUE(ctx.base->WaitForH2hCalls(2, absl::Seconds(2)));
+  EXPECT_NE(ctx.base->h2h_dispatched()[1].thread_id, caller_thread_id);
+
+  ctx.base->CompleteH2h(1, std::vector<int>{1});
+  ABSL_EXPECT_OK(ctx.session->AwaitForDone());
+}
+
+TEST(TransferSendSessionTest,
+     WindowedSendFailureMidWindowDrainsAndAckWaitPhase) {
+  for (bool fail_d2h : {false, true}) {
+    auto ctx =
+        MakeWindowedSession(/*layers=*/2, /*chunks=*/2, /*window=*/2, 403);
+    const auto now = std::chrono::steady_clock::now();
+    ctx.session->ValidateAndBeginPull({0, 1, 2, 3}, now);
+    ctx.session->StartPush({"127.0.0.1:9000"}, {0, 1, 2, 3},
+                           {100, 101, 102, 103});
+    ASSERT_EQ(ctx.base->d2h_calls(), 4);
+
+    ctx.base->CompleteD2h(0, absl::OkStatus());
+    ASSERT_TRUE(ctx.base->WaitForH2hCalls(1, absl::Seconds(2)));
+
+    if (!fail_d2h) {
+      ctx.base->CompleteD2h(1, absl::OkStatus());
+      ctx.base->CompleteD2h(2, absl::OkStatus());
+      ctx.base->CompleteD2h(3, absl::OkStatus());
+      ASSERT_TRUE(ctx.base->WaitForH2hCalls(2, absl::Seconds(2)));
+      EXPECT_EQ(TransferSendSessionPeer::CurrentPhase(*ctx.session),
+                TransferSendSession::kAckWaitPhase);
+      ctx.base->CompleteH2h(0, absl::UnavailableError("peer socket reset"));
+      EXPECT_TRUE(ctx.session->IsDraining());
+      EXPECT_FALSE(ctx.session->Done());
+      EXPECT_TRUE(ctx.session->HasStaging());
+      ctx.base->CompleteH2h(1, std::vector<int>{0});
+      EXPECT_THAT(ctx.session->AwaitForDone(),
+                  StatusIs(absl::StatusCode::kUnavailable,
+                           HasSubstr("peer socket reset")));
+      EXPECT_EQ(ctx.session->Details().phase, "push");
+    } else {
+      ctx.base->CompleteD2h(1, absl::InternalError("D2H hardware error"));
+      EXPECT_TRUE(ctx.session->IsDraining());
+      EXPECT_FALSE(ctx.session->Done());
+      EXPECT_TRUE(ctx.session->HasStaging());
+      ctx.base->CompleteD2h(2, absl::OkStatus());
+      ctx.base->CompleteD2h(3, absl::OkStatus());
+      ctx.base->CompleteH2h(0, std::vector<int>{0});
+      EXPECT_THAT(ctx.session->AwaitForDone(),
+                  StatusIs(absl::StatusCode::kInternal,
+                           HasSubstr("D2H hardware error")));
+      EXPECT_EQ(ctx.session->Details().phase, "d2h");
+    }
+    EXPECT_TRUE(ctx.session->Done());
+    EXPECT_FALSE(ctx.session->HasStaging());
+  }
+}
+
+TEST(TransferSendSessionTest, WindowedSendValidationAndPullRefusal) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  auto allocator = CreateStagingBlockAllocator(&base, 1, 2);
+  const auto now = std::chrono::steady_clock::now();
+  auto session =
+      *TransferSendSession::Create(&base, allocator.get(), "req_val", 404,
+                                   {0, 1}, now + std::chrono::seconds(10), now);
+
+  std::vector<std::vector<CopySpec>> specs(2, std::vector<CopySpec>(1));
+  std::vector<std::vector<int32_t>> src = {{0}, {1}}, dst = {{10}, {11}};
+
+  EXPECT_THAT(session->ConfigureWindowedSend(0, specs, src, dst),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(session->ConfigureWindowedSend(1, {}, src, dst),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(session->ConfigureWindowedSend(1, specs, {{0}}, dst),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(session->ConfigureWindowedSend(1, specs, src, {{10}}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+
+  ABSL_ASSERT_OK(session->ConfigureWindowedSend(1, specs, src, dst));
+  EXPECT_FALSE(session->OwnsBlockWithReadyFuture(0, 0));
+
+  absl::Status cb_status;
+  session->RegisterLayerReadinessCallback(0, [&](auto s) { cb_status = s; });
+  EXPECT_THAT(cb_status, StatusIs(absl::StatusCode::kFailedPrecondition));
+
+  session->ValidateAndBeginPull({0, 1}, now);
+  EXPECT_THAT(session->ConfigureWindowedSend(1, specs, src, dst),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+TEST(TransferSendSessionTest, WindowedSendComputesAndPassesPerUnitStreamCount) {
+  const int layers = 1;
+  const int chunks = 2;
+  const int window = 2;
+  const uint64_t uuid = 501;
+
+  auto base = std::make_unique<FakeSendBase>(layers, /*host_blocks=*/16);
+  base->SetParallelism(8);
+  base->SetManualD2h(false);
+  base->SetManualH2h(true);
+
+  auto allocator = CreateStagingBlockAllocator(base.get(), /*num_slots=*/2,
+                                               /*max_blocks=*/8);
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<int64_t> blocks = {0, 1, 2, 3, 4, 5};
+  auto session =
+      *TransferSendSession::Create(base.get(), allocator.get(), "req_nu", uuid,
+                                   blocks, now + std::chrono::seconds(10), now);
+
+  std::vector<std::vector<CopySpec>> specs(chunks,
+                                           std::vector<CopySpec>(layers));
+  std::vector<std::vector<int32_t>> src_ids = {{0, 1, 2, 3}, {4, 5}};
+  std::vector<std::vector<int32_t>> dst_ids = {{100, 101, 102, 103},
+                                               {104, 105}};
+
+  for (int c = 0; c < chunks; ++c) {
+    for (int l = 0; l < layers; ++l) {
+      specs[c][l].src_offsets = {src_ids[c].begin(), src_ids[c].end()};
+      specs[c][l].dst_offsets = {dst_ids[c].begin(), dst_ids[c].end()};
+      specs[c][l].sizes = std::vector<int64_t>(src_ids[c].size(), 1);
+    }
+  }
+
+  // 2 MiB per block, 4 MiB stream bytes target, P = 8.
+  // Chunk 0: 4 blocks * 2 MiB = 8 MiB / 4 MiB -> n_u = 2.
+  // Strictly satisfies non-degenerate case: 1 < n_u (2) < min(P=8, C_0=4) = 4.
+  // Chunk 1: 2 blocks * 2 MiB = 4 MiB / 4 MiB -> n_u = 1.
+  // Strictly satisfies: 1 <= n_u (1) < min(P=8, C_1=2) = 2.
+  const int64_t block_bytes = 2 << 20;
+  const int64_t stream_bytes_target = 4 << 20;
+  ABSL_CHECK_OK(session->ConfigureWindowedSend(
+      window, specs, src_ids, dst_ids, block_bytes, stream_bytes_target));
+
+  session->StartPush({"127.0.0.1:1234"}, {0, 1, 2, 3, 4, 5},
+                     {100, 101, 102, 103, 104, 105});
+
+  ASSERT_TRUE(base->WaitForH2hCalls(1, absl::Seconds(2)));
+  auto h2h = base->h2h_dispatched();
+  ASSERT_EQ(h2h.size(), 1);
+  EXPECT_EQ(h2h[0].src_block_ids, (std::vector<int>{0, 1, 2, 3}));
+  EXPECT_EQ(h2h[0].parallelism, 2);
+
+  base->CompleteH2h(0, std::vector<int>{0, 1, 2, 3});
+
+  ASSERT_TRUE(base->WaitForH2hCalls(2, absl::Seconds(2)));
+  h2h = base->h2h_dispatched();
+  ASSERT_EQ(h2h.size(), 2);
+  EXPECT_EQ(h2h[1].src_block_ids, (std::vector<int>{4, 5}));
+  EXPECT_EQ(h2h[1].parallelism, 1);
+
+  base->CompleteH2h(1, std::vector<int>{4, 5});
+  ABSL_EXPECT_OK(session->AwaitForDone());
+}
+
+TEST(TransferSendSessionTest, WindowedSendDerivesBlockBytesFromBaseWhenZero) {
+  const int layers = 1;
+  const int chunks = 1;
+  const int window = 1;
+  const uint64_t uuid = 504;
+  const size_t block_size = 2 << 20;  // 2 MiB per block in base_
+
+  auto base =
+      std::make_unique<FakeSendBase>(layers, /*host_blocks=*/16, block_size);
+  base->SetParallelism(8);
+  base->SetManualD2h(false);
+  base->SetManualH2h(true);
+
+  auto allocator = CreateStagingBlockAllocator(base.get(), /*num_slots=*/2,
+                                               /*max_blocks=*/8);
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<int64_t> blocks = {0, 1, 2, 3};
+  auto session = *TransferSendSession::Create(
+      base.get(), allocator.get(), "req_base_bytes", uuid, blocks,
+      now + std::chrono::seconds(10), now);
+
+  std::vector<std::vector<CopySpec>> specs(chunks,
+                                           std::vector<CopySpec>(layers));
+  std::vector<std::vector<int32_t>> src_ids = {{0, 1, 2, 3}};
+  std::vector<std::vector<int32_t>> dst_ids = {{100, 101, 102, 103}};
+
+  specs[0][0].src_offsets = {src_ids[0].begin(), src_ids[0].end()};
+  specs[0][0].dst_offsets = {dst_ids[0].begin(), dst_ids[0].end()};
+  specs[0][0].sizes = std::vector<int64_t>(src_ids[0].size(), 1);
+
+  // block_bytes_per_layer_per_group = 0 -> derived from base_: 2 MiB * 1 shard
+  // / 1 group = 2 MiB. 4 blocks * 2 MiB = 8 MiB / 4 MiB stream_bytes_target ->
+  // n_u = 2.
+  const int64_t stream_bytes_target = 4 << 20;
+  ABSL_CHECK_OK(session->ConfigureWindowedSend(
+      window, specs, src_ids, dst_ids, /*block_bytes_per_layer_per_group=*/0,
+      stream_bytes_target));
+
+  session->StartPush({"127.0.0.1:1234"}, {0, 1, 2, 3}, {100, 101, 102, 103});
+
+  ASSERT_TRUE(base->WaitForH2hCalls(1, absl::Seconds(2)));
+  auto h2h = base->h2h_dispatched();
+  ASSERT_EQ(h2h.size(), 1);
+  EXPECT_EQ(h2h[0].src_block_ids, (std::vector<int>{0, 1, 2, 3}));
+  EXPECT_EQ(h2h[0].parallelism, 2);
+
+  base->CompleteH2h(0, std::vector<int>{0, 1, 2, 3});
+  ABSL_EXPECT_OK(session->AwaitForDone());
+}
+
+TEST(TransferSendSessionTest, NonWindowedSendPassesFullParallelism) {
+  const int layers = 1;
+  const uint64_t uuid = 502;
+
+  auto base = std::make_unique<FakeSendBase>(layers, /*host_blocks=*/16);
+  base->SetParallelism(4);
+  base->SetManualD2h(false);
+  base->SetManualH2h(true);
+
+  auto allocator = CreateStagingBlockAllocator(base.get(), /*num_slots=*/2,
+                                               /*max_blocks=*/4);
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<int64_t> blocks = {0, 1};
+  auto session = *TransferSendSession::Create(
+      base.get(), allocator.get(), "req_non_win", uuid, blocks,
+      now + std::chrono::seconds(10), now);
+
+  EXPECT_FALSE(session->IsWindowed());
+
+  session->StartPush({"127.0.0.1:1234"}, {0, 1}, {100, 101});
+
+  ASSERT_TRUE(base->WaitForH2hCalls(1, absl::Seconds(2)));
+  auto h2h = base->h2h_dispatched();
+  ASSERT_EQ(h2h.size(), 1);
+  EXPECT_EQ(h2h[0].parallelism, 4);
+
+  base->CompleteH2h(0, std::vector<int>{0, 1});
+  ABSL_EXPECT_OK(session->AwaitForDone());
+}
+
+TEST(TransferSendSessionTest,
+     WindowedSendEmitsParallelismAndStreamSlotWarnings) {
+  const int layers = 1;
+  const int chunks = 1;
+  const int window = 1;
+  const uint64_t uuid = 503;
+
+  auto base = std::make_unique<FakeSendBase>(layers, /*host_blocks=*/16);
+  // P = 4 < 16, G = 2 -> P * G = 8. L = 1, n_u = 1 -> L * n_u = 1 < 8.
+  base->SetParallelism(4);
+  base->SetNumNumaGroups(2);
+  base->SetManualD2h(false);
+  base->SetManualH2h(false);
+
+  auto allocator = CreateStagingBlockAllocator(base.get(), /*num_slots=*/2,
+                                               /*max_blocks=*/4);
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<int64_t> blocks = {0};
+  auto session = *TransferSendSession::Create(
+      base.get(), allocator.get(), "req_warn", uuid, blocks,
+      now + std::chrono::seconds(10), now);
+
+  std::vector<std::vector<CopySpec>> specs(chunks,
+                                           std::vector<CopySpec>(layers));
+  specs[0][0].src_offsets = {0};
+  specs[0][0].dst_offsets = {100};
+  specs[0][0].sizes = {1};
+
+  ABSL_CHECK_OK(session->ConfigureWindowedSend(window, specs, {{0}}, {{100}}));
+
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(
+      log, Log(absl::LogSeverity::kWarning, _,
+               HasSubstr("Windowed send running with parallelism = 4 < 16")));
+  EXPECT_CALL(log, Log(absl::LogSeverity::kWarning, _,
+                       HasSubstr("cannot saturate all peer stream slots")));
+  log.StartCapturingLogs();
+
+  session->StartPush({"127.0.0.1:1234"}, {0}, {100});
+  ABSL_EXPECT_OK(session->AwaitForDone());
+}
+
+TEST(TransferSendSessionTest,
+     WindowedSendEmitsNoWarningsWhenParallelismAndSlotsSaturated) {
+  // P = 16 (no underutilization warning), G = 1 -> peer_slots = 16.
+  // L = 16 layers, 1 block chunk with n_u = 1 -> total_active_streams = 16 * 1
+  // = 16 >= peer_slots (16). Neither warning should be emitted.
+  const int layers = 16;
+  const int chunks = 1;
+  const int window = 1;
+  const uint64_t uuid = 505;
+
+  auto base = std::make_unique<FakeSendBase>(layers, /*host_blocks=*/16);
+  base->SetParallelism(16);
+  base->SetNumNumaGroups(1);
+  base->SetManualD2h(false);
+  base->SetManualH2h(false);
+
+  auto allocator = CreateStagingBlockAllocator(base.get(), /*num_slots=*/2,
+                                               /*max_blocks=*/4);
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<int64_t> blocks = {0};
+  auto session = *TransferSendSession::Create(
+      base.get(), allocator.get(), "req_no_warn", uuid, blocks,
+      now + std::chrono::seconds(10), now);
+
+  std::vector<std::vector<CopySpec>> specs(chunks,
+                                           std::vector<CopySpec>(layers));
+  for (int l = 0; l < layers; ++l) {
+    specs[0][l].src_offsets = {0};
+    specs[0][l].dst_offsets = {100};
+    specs[0][l].sizes = {1};
+  }
+
+  ABSL_CHECK_OK(session->ConfigureWindowedSend(window, specs, {{0}}, {{100}}));
+
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kWarning, _,
+                       HasSubstr("Windowed send running with parallelism")))
+      .Times(0);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kWarning, _,
+                       HasSubstr("cannot saturate all peer stream slots")))
+      .Times(0);
+  log.StartCapturingLogs();
+
+  session->StartPush({"127.0.0.1:1234"}, {0}, {100});
+  ABSL_EXPECT_OK(session->AwaitForDone());
+}
+
+TEST(TransferSendSessionTest, WindowedSendPrefillRealWRingReuseOrder) {
+  const int layers = 1;
+  const uint64_t uuid = 601;
+  constexpr int64_t k = 7;
+  constexpr int32_t chunk_blocks = 2;
+  constexpr int32_t window_chunks = 2;
+
+  auto base = std::make_unique<FakeSendBase>(layers, /*host_blocks=*/4);
+  base->SetParallelism(4);
+  base->SetManualD2h(true);
+  base->SetManualH2h(true);
+
+  // Staging pool of only W * C = 4 blocks (1 slot with max_blocks = 4).
+  auto allocator = CreateStagingBlockAllocator(base.get(), /*num_slots=*/1,
+                                               /*max_blocks=*/4);
+  const auto now = std::chrono::steady_clock::now();
+  std::vector<int64_t> src_block_ids(k);
+  std::iota(src_block_ids.begin(), src_block_ids.end(), 0);
+  std::vector<int64_t> dst_block_ids(k);
+  std::iota(dst_block_ids.begin(), dst_block_ids.end(), 100);
+  auto session = *TransferSendSession::Create(
+      base.get(), allocator.get(), "req_real_w_reuse", uuid, src_block_ids,
+      now + std::chrono::seconds(10), now);
+
+  StagingWindowConfig win_cfg{
+      .window_chunks = window_chunks,
+      .serve_windowed_pulls = true,
+      .chunk_blocks = chunk_blocks,
+  };
+
+  session->StartPush({"127.0.0.1:1234"}, src_block_ids, dst_block_ids, win_cfg);
+
+  // Initially: Chunks 0 and 1 issue D2H immediately into slots 0 and 1.
+  // Chunk 2 D2H is blocked by the window (c < h2h_acked + W => 2 < 0 + 2 is
+  // false).
+  ASSERT_TRUE(base->WaitForD2hCalls(2, absl::Seconds(2)));
+  EXPECT_EQ(base->d2h_calls(), 2);
+  EXPECT_EQ(base->h2h_calls(), 0);
+
+  auto d2h = base->d2h_dispatched();
+  ASSERT_EQ(d2h.size(), 2);
+  // Chunk 0 targets ring blocks 0, 1 (coalesced: offset 0, size 2)
+  EXPECT_EQ(d2h[0].dst_offsets, (std::vector<int64_t>{0}));
+  EXPECT_EQ(d2h[0].sizes, (std::vector<int64_t>{2}));
+  // Chunk 1 targets ring blocks 2, 3 (coalesced: offset 2, size 2)
+  EXPECT_EQ(d2h[1].dst_offsets, (std::vector<int64_t>{2}));
+  EXPECT_EQ(d2h[1].sizes, (std::vector<int64_t>{2}));
+
+  // Complete chunk 0 D2H -> chunk 0 H2H is dispatched.
+  base->CompleteD2h(0, absl::OkStatus());
+  ASSERT_TRUE(base->WaitForH2hCalls(1, absl::Seconds(2)));
+  EXPECT_EQ(base->h2h_calls(), 1);
+  EXPECT_EQ(base->d2h_calls(), 2);  // Chunk 2 still not issued.
+
+  // Chunk 0 H2H completes (push acked).
+  base->CompleteH2h(0, std::vector<int>{100, 101});
+
+  // Now that chunk 0 push is acked, chunk 2 D2H issues into reused slot 0
+  // (blocks 0, 1).
+  ASSERT_TRUE(base->WaitForD2hCalls(3, absl::Seconds(2)));
+  EXPECT_EQ(base->d2h_calls(), 3);
+  d2h = base->d2h_dispatched();
+  ASSERT_EQ(d2h.size(), 3);
+  EXPECT_EQ(d2h[2].dst_offsets, (std::vector<int64_t>{0}));
+  EXPECT_EQ(d2h[2].sizes, (std::vector<int64_t>{2}));
+  // Chunk 3 D2H still not issued (3 < 1 + 2 is false).
+  EXPECT_EQ(base->h2h_calls(), 1);
+
+  // Complete chunk 1 D2H -> chunk 1 H2H is dispatched.
+  base->CompleteD2h(1, absl::OkStatus());
+  ASSERT_TRUE(base->WaitForH2hCalls(2, absl::Seconds(2)));
+  EXPECT_EQ(base->h2h_calls(), 2);
+  EXPECT_EQ(base->d2h_calls(), 3);  // Chunk 3 still not issued.
+
+  // Chunk 1 H2H completes (push acked).
+  base->CompleteH2h(1, std::vector<int>{102, 103});
+
+  // Now that chunk 1 push is acked, chunk 3 D2H issues into reused slot 1
+  // (block 2).
+  ASSERT_TRUE(base->WaitForD2hCalls(4, absl::Seconds(2)));
+  EXPECT_EQ(base->d2h_calls(), 4);
+  d2h = base->d2h_dispatched();
+  ASSERT_EQ(d2h.size(), 4);
+  EXPECT_EQ(d2h[3].dst_offsets, (std::vector<int64_t>{2}));
+  EXPECT_EQ(d2h[3].sizes, (std::vector<int64_t>{1}));
+
+  // Drain remaining chunks: chunk 2 and chunk 3.
+  base->CompleteD2h(2, absl::OkStatus());
+  ASSERT_TRUE(base->WaitForH2hCalls(3, absl::Seconds(2)));
+  base->CompleteH2h(2, std::vector<int>{104, 105});
+
+  base->CompleteD2h(3, absl::OkStatus());
+  ASSERT_TRUE(base->WaitForH2hCalls(4, absl::Seconds(2)));
+  base->CompleteH2h(3, std::vector<int>{106});
+
+  ABSL_EXPECT_OK(session->AwaitForDone());
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 1);
 }
 
 }  // namespace

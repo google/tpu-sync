@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -69,6 +70,26 @@
 
 namespace tpu_raiden {
 namespace transport {
+
+class BlockTransportPeer {
+ public:
+  static absl::Status CompleteIncomingPush(
+      BlockTransport* transport, uint64_t uuid, uint32_t local_id = 0,
+      uint32_t remote_id = 0, size_t num_streams = 1, size_t landed_shards = 0,
+      const std::optional<PoolPushProgressSpec>& pool_progress_spec =
+          std::nullopt) {
+    return transport->CompleteIncomingPush(uuid, local_id, remote_id,
+                                           num_streams, landed_shards,
+                                           pool_progress_spec);
+  }
+
+  static bool HasLayerProgress(BlockTransport* transport, uint64_t uuid,
+                               int layer_idx = 0) {
+    absl::MutexLock lock(transport->progress_mu_);
+    return transport->layer_progress_.contains({uuid, layer_idx});
+  }
+};
+
 namespace {
 
 using ::absl_testing::StatusIs;
@@ -155,10 +176,43 @@ class MockDelegate : public BlockTransportDelegate {
   }
 
   absl::Status OnLayerReceived(size_t layer_idx, uint64_t uuid) override {
-    (void)layer_idx;
-    (void)uuid;
     ++layer_completion_count_;
+    std::function<void(size_t, uint64_t)> cb;
+    {
+      absl::MutexLock lock(layer_events_mu_);
+      per_layer_received_count_[layer_idx]++;
+      cb = on_layer_received_cb_;
+    }
+    if (cb) {
+      cb(layer_idx, uuid);
+    }
     return absl::OkStatus();
+  }
+
+  void SetOnLayerReceivedCallback(
+      std::function<void(size_t layer_idx, uint64_t uuid)> cb) {
+    absl::MutexLock lock(layer_events_mu_);
+    on_layer_received_cb_ = std::move(cb);
+  }
+
+  int32_t ExpectedPushesPerLayer(uint64_t uuid) const override {
+    absl::MutexLock lock(expected_pushes_mu_);
+    auto it = expected_pushes_per_layer_.find(uuid);
+    if (it != expected_pushes_per_layer_.end()) {
+      return it->second;
+    }
+    return BlockTransportDelegate::ExpectedPushesPerLayer(uuid);
+  }
+
+  void SetExpectedPushesPerLayer(uint64_t uuid, int32_t count) {
+    absl::MutexLock lock(expected_pushes_mu_);
+    expected_pushes_per_layer_[uuid] = count;
+  }
+
+  int layer_received_count(size_t layer_idx) const {
+    absl::MutexLock lock(layer_events_mu_);
+    auto it = per_layer_received_count_.find(layer_idx);
+    return it == per_layer_received_count_.end() ? 0 : it->second;
   }
 
   absl::StatusOr<std::optional<PoolPushProgressSpec>> GetPoolPushProgressSpec(
@@ -283,7 +337,44 @@ class MockDelegate : public BlockTransportDelegate {
     return last_end_incoming_push_status_;
   }
 
+  struct AwaitSlotCall {
+    uint64_t uuid;
+    int32_t layer_idx;
+    std::vector<int64_t> dst_block_ids;
+    std::vector<int32_t> stream_shards;
+  };
+
+  absl::Status AwaitIncomingPushSlot(uint64_t uuid, int32_t layer_idx,
+                                     absl::Span<const int64_t> dst_block_ids,
+                                     absl::Span<const int32_t> stream_shards,
+                                     absl::Time deadline) override {
+    absl::MutexLock lock(await_slot_mu_);
+    await_slot_calls_.push_back(
+        {uuid, layer_idx,
+         std::vector<int64_t>(dst_block_ids.begin(), dst_block_ids.end()),
+         std::vector<int32_t>(stream_shards.begin(), stream_shards.end())});
+    auto it = await_slot_status_.find(uuid);
+    if (it != await_slot_status_.end()) {
+      return it->second;
+    }
+    return absl::OkStatus();
+  }
+
+  void SetAwaitIncomingPushSlotStatus(uint64_t uuid, absl::Status status) {
+    absl::MutexLock lock(await_slot_mu_);
+    await_slot_status_[uuid] = std::move(status);
+  }
+
+  std::vector<AwaitSlotCall> await_slot_calls() const {
+    absl::MutexLock lock(await_slot_mu_);
+    return await_slot_calls_;
+  }
+
  private:
+  mutable absl::Mutex await_slot_mu_;
+  std::vector<AwaitSlotCall> await_slot_calls_ ABSL_GUARDED_BY(await_slot_mu_);
+  absl::flat_hash_map<uint64_t, absl::Status> await_slot_status_
+      ABSL_GUARDED_BY(await_slot_mu_);
   size_t BufferIndex(size_t layer_idx, size_t shard_idx) const {
     return layer_idx * num_shards_ + shard_idx;
   }
@@ -312,6 +403,14 @@ class MockDelegate : public BlockTransportDelegate {
       ABSL_GUARDED_BY(peer_channels_mu_);
   absl::flat_hash_map<std::string, std::shared_ptr<grpc::Channel>>
       peer_channels_ ABSL_GUARDED_BY(peer_channels_mu_);
+  mutable absl::Mutex expected_pushes_mu_;
+  absl::flat_hash_map<uint64_t, int32_t> expected_pushes_per_layer_
+      ABSL_GUARDED_BY(expected_pushes_mu_);
+  mutable absl::Mutex layer_events_mu_;
+  absl::flat_hash_map<size_t, int> per_layer_received_count_
+      ABSL_GUARDED_BY(layer_events_mu_);
+  std::function<void(size_t, uint64_t)> on_layer_received_cb_
+      ABSL_GUARDED_BY(layer_events_mu_);
 };
 
 class SamePeerFanoutDelegate : public MockDelegate {
@@ -2210,6 +2309,466 @@ TEST(DecodeReadTimeoutTest, HandshakeAckWriteTimesOutAndReleasesLease) {
 
   EXPECT_TRUE(delegate.WaitForEndIncomingPush(absl::Seconds(2)));
   EXPECT_FALSE(delegate.last_end_incoming_push_status().ok());
+}
+
+TEST_P(BlockTransportTest,
+       TwoUnitsPerLayerResetsCountersAndRetiresAfterAllUnits) {
+  constexpr uint64_t kUuid = 950;
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kSliceSize = 64;
+  constexpr int kMaxBlocks = 2;
+  MockDelegate sender(kSliceSize, kMaxBlocks, kNumLayers);
+  MockDelegate receiver(kSliceSize, kMaxBlocks, kNumLayers);
+  receiver.SetExpectedPushesPerLayer(kUuid, 2);
+
+  BlockTransport sender_transport(&sender, 0);
+  BlockTransport receiver_transport(&receiver, 0);
+  BindControlChannels(&sender_transport, &sender, &receiver_transport,
+                      &receiver);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  auto push_unit = [&](int layer_idx) {
+    return sender_transport
+        .AsyncPush(
+            {absl::StrCat("localhost:", receiver_transport.local_port())},
+            /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+            /*parallelism=*/1, MajorOrder::kLayerMajor, kUuid, layer_idx)
+        .Await();
+  };
+
+  // Push unit 0 for layer 0: completes unit 0, OnLayerReceived fires once for
+  // layer 0.
+  ASSERT_TRUE(push_unit(0).ok());
+  EXPECT_EQ(receiver.layer_received_count(0), 1);
+  EXPECT_EQ(receiver.layer_completion_count(), 1);
+
+  // Push unit 1 for layer 0: completes unit 1, OnLayerReceived fires second
+  // time for layer 0. Layer 0 is latched complete (2 units done), but layer 1
+  // has not completed yet, so uuid entry must NOT be erased yet.
+  ASSERT_TRUE(push_unit(0).ok());
+  EXPECT_EQ(receiver.layer_received_count(0), 2);
+  EXPECT_EQ(receiver.layer_completion_count(), 2);
+
+  // An extra push to layer 0 before layer 1 finishes should NOT fire
+  // OnLayerReceived again, confirming layer 0 is latched.
+  ASSERT_TRUE(push_unit(0).ok());
+  EXPECT_EQ(receiver.layer_received_count(0), 2);
+  EXPECT_EQ(receiver.layer_completion_count(), 2);
+
+  // Push unit 0 for layer 1: completes unit 0 of layer 1.
+  ASSERT_TRUE(push_unit(1).ok());
+  EXPECT_EQ(receiver.layer_received_count(1), 1);
+  EXPECT_EQ(receiver.layer_completion_count(), 3);
+
+  // Push unit 1 for layer 1: completes unit 1 of layer 1.
+  // Now all L=2 layers have completed all n=2 units (L*n = 4 units total).
+  // All uuid entries in layer_progress_ are now erased.
+  ASSERT_TRUE(push_unit(1).ok());
+  EXPECT_EQ(receiver.layer_received_count(1), 2);
+  EXPECT_EQ(receiver.layer_completion_count(), 4);
+
+  // Subsequent push to layer 0 starts fresh (because uuid entry was erased)!
+  ASSERT_TRUE(push_unit(0).ok());
+  EXPECT_EQ(receiver.layer_received_count(0), 3);
+  EXPECT_EQ(receiver.layer_completion_count(), 5);
+}
+
+TEST_P(BlockTransportTest,
+       TwoUnitsPerLayerWithNumaFanoutWaitsForFullGroupAndResets) {
+  constexpr uint64_t kUuid = 951;
+  constexpr size_t kSlice = 256;
+  constexpr int kBlocks = 4;
+  constexpr size_t kShards = 4;
+  // Sender delegate with shards on NUMA nodes {0, 0, 1, 1}, so G = 2 groups.
+  // With parallelism = 2 (n_u = 2), reserved = n_u * G = 4 streams per push.
+  TwoNumaSenderDelegate sender_delegate(kSlice, kBlocks, /*num_layers=*/1,
+                                        kShards);
+  MockDelegate receiver_delegate(kSlice, kBlocks, /*num_layers=*/1, kShards);
+  receiver_delegate.SetExpectedPushesPerLayer(kUuid, 2);
+
+  // Populate sender blocks with distinct non-zero bytes per (unit, block,
+  // shard).
+  for (int b = 0; b < 2; ++b) {
+    for (size_t sh = 0; sh < kShards; ++sh) {
+      std::memset(sender_delegate.block_data(b, 0, sh),
+                  static_cast<int>(0x10 * (b + 1) + sh + 1), kSlice);
+    }
+  }
+  for (int b = 2; b < 4; ++b) {
+    for (size_t sh = 0; sh < kShards; ++sh) {
+      std::memset(sender_delegate.block_data(b, 0, sh),
+                  static_cast<int>(0x80 + 0x10 * (b - 1) + sh + 1), kSlice);
+    }
+  }
+
+  // Snapshot receiver block bytes inside OnLayerReceived to ensure callback
+  // fires only after all 4 streams of the unit have arrived, never prematurely.
+  std::vector<std::vector<uint8_t>> snapshot_unit0(2 * kShards);
+  std::vector<std::vector<uint8_t>> snapshot_unit1(2 * kShards);
+  receiver_delegate.SetOnLayerReceivedCallback(
+      [&](size_t layer, uint64_t uuid) {
+        int count = receiver_delegate.layer_completion_count();
+        if (count == 1) {
+          for (int b = 0; b < 2; ++b) {
+            for (size_t sh = 0; sh < kShards; ++sh) {
+              const uint8_t* p = receiver_delegate.block_data(b, 0, sh);
+              snapshot_unit0[b * kShards + sh].assign(p, p + kSlice);
+            }
+          }
+        } else if (count == 2) {
+          for (int b = 2; b < 4; ++b) {
+            for (size_t sh = 0; sh < kShards; ++sh) {
+              const uint8_t* p = receiver_delegate.block_data(b, 0, sh);
+              snapshot_unit1[(b - 2) * kShards + sh].assign(p, p + kSlice);
+            }
+          }
+        }
+      });
+
+  BlockTransport sender(&sender_delegate, 0, /*local_ips=*/{"127.0.0.1"},
+                        /*parallelism=*/2);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  auto push_unit = [&](const std::vector<int>& src_bids,
+                       const std::vector<int>& dst_bids) {
+    return sender
+        .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                   src_bids, dst_bids,
+                   /*parallelism=*/2, MajorOrder::kLayerMajor, kUuid,
+                   /*layer_idx=*/0)
+        .Await();
+  };
+
+  // Unit 0: pushes 4 streams (2 groups x 2 streams). All 4 streams must land
+  // for unit 0 to complete.
+  auto pushed0 = push_unit({0, 1}, {0, 1});
+  ASSERT_TRUE(pushed0.ok()) << pushed0.status().message();
+  EXPECT_EQ(receiver_delegate.layer_completion_count(), 1);
+  EXPECT_EQ(receiver_delegate.layer_received_count(0), 1);
+  for (int b = 0; b < 2; ++b) {
+    for (size_t sh = 0; sh < kShards; ++sh) {
+      uint8_t val = static_cast<uint8_t>(0x10 * (b + 1) + sh + 1);
+      EXPECT_THAT(snapshot_unit0[b * kShards + sh], Each(Eq(val)));
+    }
+  }
+
+  // Unit 1: pushes 4 streams into different blocks. Counters reset cleanly,
+  // so unit 1 also waits for all 4 streams before firing.
+  auto pushed1 = push_unit({2, 3}, {2, 3});
+  ASSERT_TRUE(pushed1.ok()) << pushed1.status().message();
+  EXPECT_EQ(receiver_delegate.layer_completion_count(), 2);
+  EXPECT_EQ(receiver_delegate.layer_received_count(0), 2);
+  for (int b = 2; b < 4; ++b) {
+    for (size_t sh = 0; sh < kShards; ++sh) {
+      uint8_t val = static_cast<uint8_t>(0x80 + 0x10 * (b - 1) + sh + 1);
+      EXPECT_THAT(snapshot_unit1[(b - 2) * kShards + sh], Each(Eq(val)));
+    }
+  }
+}
+
+TEST_P(BlockTransportTest, DowngradeExpectedPushesPerLayerBeforeFirstStream) {
+  constexpr uint64_t kUuid = 952;
+  constexpr size_t kSliceSize = 64;
+  constexpr int kMaxBlocks = 1;
+  constexpr size_t kNumLayers = 2;
+  MockDelegate sender(kSliceSize, kMaxBlocks, kNumLayers);
+  MockDelegate receiver(kSliceSize, kMaxBlocks, kNumLayers);
+  // Initially configured with n = 4 before any stream exists.
+  receiver.SetExpectedPushesPerLayer(kUuid, 4);
+
+  BlockTransport sender_transport(&sender, 0);
+  BlockTransport receiver_transport(&receiver, 0);
+  BindControlChannels(&sender_transport, &sender, &receiver_transport,
+                      &receiver);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  EXPECT_FALSE(
+      BlockTransportPeer::HasLayerProgress(&receiver_transport, kUuid, 0));
+
+  // Downgrade n -> 1 before the first incoming stream arrives (simulating
+  // DowngradeToExactK).
+  receiver.SetExpectedPushesPerLayer(kUuid, 1);
+
+  // Send single unit to layer 0.
+  auto pushed0 =
+      sender_transport
+          .AsyncPush(
+              {absl::StrCat("localhost:", receiver_transport.local_port())},
+              /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+              /*parallelism=*/1, MajorOrder::kLayerMajor, kUuid,
+              /*layer_idx=*/0)
+          .Await();
+  ASSERT_TRUE(pushed0.ok()) << pushed0.status().message();
+  EXPECT_EQ(receiver.layer_completion_count(), 1);
+  EXPECT_EQ(receiver.layer_received_count(0), 1);
+  EXPECT_TRUE(
+      BlockTransportPeer::HasLayerProgress(&receiver_transport, kUuid, 0));
+
+  // Extra push to layer 0 before layer 1 completes: proves layer 0 latched at
+  // expected_units == 1 (layer_received_count stays 1, whereas under
+  // expected_units == 4 it would increment to 2).
+  auto pushed0_extra =
+      sender_transport
+          .AsyncPush(
+              {absl::StrCat("localhost:", receiver_transport.local_port())},
+              /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+              /*parallelism=*/1, MajorOrder::kLayerMajor, kUuid,
+              /*layer_idx=*/0)
+          .Await();
+  ASSERT_TRUE(pushed0_extra.ok()) << pushed0_extra.status().message();
+  EXPECT_EQ(receiver.layer_received_count(0), 1);
+
+  // Send 1 unit to layer 1.
+  auto pushed1 =
+      sender_transport
+          .AsyncPush(
+              {absl::StrCat("localhost:", receiver_transport.local_port())},
+              /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+              /*parallelism=*/1, MajorOrder::kLayerMajor, kUuid,
+              /*layer_idx=*/1)
+          .Await();
+  ASSERT_TRUE(pushed1.ok()) << pushed1.status().message();
+  EXPECT_EQ(receiver.layer_received_count(1), 1);
+  EXPECT_FALSE(
+      BlockTransportPeer::HasLayerProgress(&receiver_transport, kUuid, 0));
+  EXPECT_FALSE(
+      BlockTransportPeer::HasLayerProgress(&receiver_transport, kUuid, 1));
+}
+
+TEST_P(BlockTransportTest, DefaultExpectedPushesPerLayerIsOne) {
+  constexpr uint64_t kUuid = 953;
+  constexpr size_t kSliceSize = 64;
+  constexpr int kMaxBlocks = 1;
+  constexpr size_t kNumLayers = 1;
+  MockDelegate sender(kSliceSize, kMaxBlocks, kNumLayers);
+  MockDelegate receiver(kSliceSize, kMaxBlocks, kNumLayers);
+  EXPECT_EQ(receiver.ExpectedPushesPerLayer(kUuid), 1);
+
+  BlockTransport sender_transport(&sender, 0);
+  BlockTransport receiver_transport(&receiver, 0);
+  BindControlChannels(&sender_transport, &sender, &receiver_transport,
+                      &receiver);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  auto pushed =
+      sender_transport
+          .AsyncPush(
+              {absl::StrCat("localhost:", receiver_transport.local_port())},
+              /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+              /*parallelism=*/1, MajorOrder::kLayerMajor, kUuid,
+              /*layer_idx=*/0)
+          .Await();
+  ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+  EXPECT_EQ(receiver.layer_completion_count(), 1);
+  EXPECT_EQ(receiver.layer_received_count(0), 1);
+}
+
+TEST_P(BlockTransportTest,
+       ExpectedPushesPerLayerNonPositiveFailsWithInvalidArgument) {
+  constexpr uint64_t kUuidZero = 954;
+  constexpr uint64_t kUuidNegative = 955;
+  constexpr size_t kSliceSize = 64;
+  constexpr int kMaxBlocks = 1;
+  constexpr size_t kNumLayers = 1;
+  MockDelegate sender(kSliceSize, kMaxBlocks, kNumLayers);
+  MockDelegate receiver(kSliceSize, kMaxBlocks, kNumLayers);
+  receiver.SetExpectedPushesPerLayer(kUuidZero, 0);
+  receiver.SetExpectedPushesPerLayer(kUuidNegative, -1);
+
+  BlockTransport receiver_transport(&receiver, 0);
+
+  EXPECT_THAT(
+      BlockTransportPeer::CompleteIncomingPush(
+          &receiver_transport, kUuidZero, /*local_id=*/0,
+          /*remote_id=*/0, /*num_streams=*/1,
+          /*landed_shards=*/0, std::nullopt),
+      StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          HasSubstr("delegate returned invalid ExpectedPushesPerLayer=0")));
+
+  EXPECT_THAT(
+      BlockTransportPeer::CompleteIncomingPush(
+          &receiver_transport, kUuidNegative, /*local_id=*/0,
+          /*remote_id=*/0, /*num_streams=*/1,
+          /*landed_shards=*/0, std::nullopt),
+      StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          HasSubstr("delegate returned invalid ExpectedPushesPerLayer=-1")));
+
+  BlockTransport sender_transport(&sender, 0);
+  BindControlChannels(&sender_transport, &sender, &receiver_transport,
+                      &receiver);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  auto pushed =
+      sender_transport
+          .AsyncPush(
+              {absl::StrCat("localhost:", receiver_transport.local_port())},
+              /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+              /*parallelism=*/1, MajorOrder::kLayerMajor, kUuidZero,
+              /*layer_idx=*/0)
+          .Await();
+  EXPECT_FALSE(pushed.ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 0);
+  EXPECT_EQ(receiver.layer_received_count(0), 0);
+}
+
+TEST_P(BlockTransportTest,
+       MultiUnitMultiSenderResetsSendersAndIgnoresExpectedPushesInPlanMode) {
+  constexpr uint64_t kUuid = 956;
+  MultiSenderReceiverDelegate receiver(/*slice_size=*/64, /*max_blocks=*/2,
+                                       /*num_layers=*/1);
+  receiver.ExpectSenders(kUuid, /*senders=*/2);
+  receiver.SetExpectedPushesPerLayer(kUuid, 2);
+  BlockTransport receiver_transport(&receiver, 0);
+
+  // Unit 0: requires both senders (remote_id 1 and 2, 2 streams each).
+  // Sender 1 stream 1: not complete.
+  EXPECT_TRUE(BlockTransportPeer::CompleteIncomingPush(
+                  &receiver_transport, kUuid, /*local_id=*/0, /*remote_id=*/1,
+                  /*num_streams=*/2)
+                  .ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 0);
+  // Sender 1 stream 2: sender 1 complete, but sender 2 has not landed.
+  EXPECT_TRUE(BlockTransportPeer::CompleteIncomingPush(
+                  &receiver_transport, kUuid, /*local_id=*/0, /*remote_id=*/1,
+                  /*num_streams=*/2)
+                  .ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 0);
+  // Sender 2 stream 1: sender 2 not complete.
+  EXPECT_TRUE(BlockTransportPeer::CompleteIncomingPush(
+                  &receiver_transport, kUuid, /*local_id=*/0, /*remote_id=*/2,
+                  /*num_streams=*/2)
+                  .ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 0);
+  // Sender 2 stream 2: both senders complete -> unit 0 completes.
+  EXPECT_TRUE(BlockTransportPeer::CompleteIncomingPush(
+                  &receiver_transport, kUuid, /*local_id=*/0, /*remote_id=*/2,
+                  /*num_streams=*/2)
+                  .ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 1);
+  EXPECT_EQ(receiver.layer_received_count(0), 1);
+
+  // Unit 1: sender_streams and senders_complete must have reset, so unit 1
+  // again requires all 4 streams (2 senders x 2 streams) before completing.
+  EXPECT_TRUE(BlockTransportPeer::CompleteIncomingPush(
+                  &receiver_transport, kUuid, /*local_id=*/0, /*remote_id=*/1,
+                  /*num_streams=*/2)
+                  .ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 1);
+  EXPECT_TRUE(BlockTransportPeer::CompleteIncomingPush(
+                  &receiver_transport, kUuid, /*local_id=*/0, /*remote_id=*/1,
+                  /*num_streams=*/2)
+                  .ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 1);
+  EXPECT_TRUE(BlockTransportPeer::CompleteIncomingPush(
+                  &receiver_transport, kUuid, /*local_id=*/0, /*remote_id=*/2,
+                  /*num_streams=*/2)
+                  .ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 1);
+  // 4th stream arrives: unit 1 completes and layer 0 is latched.
+  EXPECT_TRUE(BlockTransportPeer::CompleteIncomingPush(
+                  &receiver_transport, kUuid, /*local_id=*/0, /*remote_id=*/2,
+                  /*num_streams=*/2)
+                  .ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 2);
+  EXPECT_EQ(receiver.layer_received_count(0), 2);
+
+  // Plan-declared branch: when SetPoolPushProgress is installed,
+  // ExpectedPushesPerLayer > 1 is ignored and plan mode governs completion.
+  constexpr uint64_t kUuidPlan = 957;
+  receiver.SetPoolPushProgress(kUuidPlan, /*expected_pushes_per_pool=*/2,
+                               /*transfer_pool_indices=*/{0});
+  receiver.SetExpectedPushesPerLayer(kUuidPlan, 2);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::optional<PoolPushProgressSpec> pool_spec,
+      receiver.GetPoolPushProgressSpec(/*pool_idx=*/0, kUuidPlan));
+  ASSERT_TRUE(pool_spec.has_value());
+
+  EXPECT_TRUE(BlockTransportPeer::CompleteIncomingPush(
+                  &receiver_transport, kUuidPlan, /*local_id=*/0,
+                  /*remote_id=*/1,
+                  /*num_streams=*/1, /*landed_shards=*/0, pool_spec)
+                  .ok());
+  EXPECT_EQ(receiver.pool_completion_count(), 0);
+  EXPECT_EQ(receiver.layer_completion_count(), 2);
+
+  EXPECT_TRUE(BlockTransportPeer::CompleteIncomingPush(
+                  &receiver_transport, kUuidPlan, /*local_id=*/0,
+                  /*remote_id=*/1,
+                  /*num_streams=*/1, /*landed_shards=*/0, pool_spec)
+                  .ok());
+  EXPECT_EQ(receiver.pool_completion_count(), 1);
+  EXPECT_EQ(receiver.layer_completion_count(), 2);
+}
+
+TEST_P(BlockTransportTest, HandleIncomingPushInvokesAwaitIncomingPushSlot) {
+  constexpr uint64_t kUuidSuccess = 960;
+  constexpr uint64_t kUuidFailure = 961;
+  constexpr size_t kSliceSize = 64;
+  constexpr int kMaxBlocks = 1;
+  constexpr size_t kNumLayers = 1;
+
+  MockDelegate sender(kSliceSize, kMaxBlocks, kNumLayers);
+  MockDelegate receiver(kSliceSize, kMaxBlocks, kNumLayers);
+  receiver.SetAwaitIncomingPushSlotStatus(
+      kUuidFailure, absl::FailedPreconditionError("window slot unavailable"));
+
+  BlockTransport receiver_transport(&receiver, 0);
+  BlockTransport sender_transport(&sender, 0);
+  BindControlChannels(&sender_transport, &sender, &receiver_transport,
+                      &receiver);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Case 1: AwaitIncomingPushSlot succeeds (default OkStatus()).
+  auto pushed_ok =
+      sender_transport
+          .AsyncPush(
+              {absl::StrCat("localhost:", receiver_transport.local_port())},
+              /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+              /*parallelism=*/1, MajorOrder::kLayerMajor, kUuidSuccess,
+              /*layer_idx=*/0)
+          .Await();
+  ASSERT_TRUE(pushed_ok.ok()) << pushed_ok.status().message();
+  EXPECT_EQ(receiver.layer_completion_count(), 1);
+
+  auto calls = receiver.await_slot_calls();
+  ASSERT_FALSE(calls.empty());
+  bool found_success = false;
+  for (const auto& call : calls) {
+    if (call.uuid == kUuidSuccess) {
+      found_success = true;
+      EXPECT_EQ(call.layer_idx, 0);
+      EXPECT_THAT(call.dst_block_ids, ::testing::ElementsAre(0));
+      EXPECT_THAT(call.stream_shards, ::testing::ElementsAre(0));
+    }
+  }
+  EXPECT_TRUE(found_success);
+
+  // Case 2: AwaitIncomingPushSlot fails -> connection closed before handshake
+  // ack, push fails, receiver layer count does not increment.
+  auto pushed_fail =
+      sender_transport
+          .AsyncPush(
+              {absl::StrCat("localhost:", receiver_transport.local_port())},
+              /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+              /*parallelism=*/1, MajorOrder::kLayerMajor, kUuidFailure,
+              /*layer_idx=*/0)
+          .Await();
+  EXPECT_FALSE(pushed_fail.ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 1);
+
+  calls = receiver.await_slot_calls();
+  bool found_failure = false;
+  for (const auto& call : calls) {
+    if (call.uuid == kUuidFailure) {
+      found_failure = true;
+      EXPECT_EQ(call.layer_idx, 0);
+    }
+  }
+  EXPECT_TRUE(found_failure);
 }
 
 INSTANTIATE_TEST_SUITE_P(

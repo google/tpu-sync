@@ -79,7 +79,8 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
       const std::vector<std::string>& peers,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx,
-      std::function<void(absl::StatusOr<std::vector<int>>)> on_complete);
+      std::function<void(absl::StatusOr<std::vector<int>>)> on_complete,
+      std::optional<int> parallelism = std::nullopt);
 
   // Direct C++ H2H network read (Pull)
   absl::StatusOr<std::vector<int>> H2hReadDirect(
@@ -182,6 +183,8 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   // the layer size is not initialized (0).
   size_t block_bytes(size_t layer_idx) const override;
   size_t shard_factor() const override { return shard_factor_; }
+  int parallelism() const { return parallelism_; }
+  virtual int num_numa_groups() const;
 
  protected:
   size_t num_layers_ = 0;

@@ -29,6 +29,7 @@
 #include <cstring>
 #include <ctime>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -510,6 +511,8 @@ void TcpControlPlaneBackend::HandleControlConnection(
     spec.consumer_data_port = req.consumer_data_port;
     spec.src_block_ids = std::move(*src_blocks);
     spec.dst_block_ids = std::move(*dst_blocks);
+    UnpackPullStreamPadding(req.padding, &spec.chunk_blocks,
+                            &spec.window_chunks);
 
     if (req.num_ips > 0) {
       for (uint32_t i = 0;
@@ -574,8 +577,28 @@ void TcpControlPlaneBackend::HandleControlConnection(
     response.status = 0;
     response.num_layers = result->num_layers;
     response.data_port = result->data_port;
-    response.message_len = 0;
-    (void)WriteExact(fd, &response, sizeof(response));
+    response.message_len =
+        std::min(result->message.size(),
+                 static_cast<size_t>(kMaxControlErrorMessageBytes));
+    if (WriteExact(fd, &response, sizeof(response)).ok() &&
+        response.message_len > 0) {
+      (void)WriteExact(fd, result->message.data(), response.message_len);
+    }
+    return;
+  }
+
+  if (req.op == kOpCapabilities) {
+    if (!handler) {
+      SendErrorResponse(fd, "ControlPlaneHandler not initialized");
+      return;
+    }
+    const std::string reply =
+        FormatCapabilitiesReply(handler->GetCapabilities());
+    ControlResponseHeader response{.magic = kResponseMagic,
+                                   .message_len = reply.size()};
+    if (WriteExact(fd, &response, sizeof(response)).ok() && !reply.empty()) {
+      (void)WriteExact(fd, reply.data(), reply.size());
+    }
     return;
   }
 
@@ -605,6 +628,8 @@ TcpControlPlaneBackend::SendPullRequestBlocking(
   stream_request.ep_idx = req.ep_idx;
   stream_request.num_blocks = static_cast<uint64_t>(req.src_block_ids.size());
   stream_request.consumer_data_port = req.consumer_data_port;
+  stream_request.padding =
+      PackPullStreamPadding(req.chunk_blocks, req.window_chunks);
 
   stream_request.num_ips = static_cast<uint32_t>(
       std::min(req.consumer_ips.size(), static_cast<size_t>(kMaxNics)));
@@ -651,11 +676,26 @@ TcpControlPlaneBackend::SendPullRequestBlocking(
     }
   }
 
+  std::optional<ControlPlaneStagingWindowAck> ack;
+  std::optional<std::string> rejected_reason;
+  if (resp_hdr.status == 0) {
+    if (auto parsed_ack = ParseStagingWindowAck(message)) {
+      ack = ControlPlaneStagingWindowAck{
+          .chunk_blocks = parsed_ack->first,
+          .window_chunks = parsed_ack->second,
+      };
+    }
+  } else {
+    rejected_reason = ParseStagingWindowRejectedReason(message);
+  }
+
   return PullStreamResponseSpec{
       .status = resp_hdr.status,
       .num_layers = resp_hdr.num_layers,
       .data_port = resp_hdr.data_port,
       .message = std::move(message),
+      .staging_window_ack = std::move(ack),
+      .staging_window_rejected_reason = std::move(rejected_reason),
   };
 }
 
@@ -708,6 +748,38 @@ absl::Status TcpControlPlaneBackend::SendAck(absl::string_view remote_endpoint,
     return absl::InternalError(absl::StrCat("Ack rejected by peer: ", message));
   }
   return absl::OkStatus();
+}
+
+absl::StatusOr<ControlPlaneCapabilities>
+TcpControlPlaneBackend::SendCapabilitiesRequestBlocking(
+    absl::string_view remote_endpoint, absl::Duration timeout) {
+  absl::StatusOr<int> fd =
+      ConnectTcp(remote_endpoint, absl::ToDoubleSeconds(timeout));
+  if (!fd.ok()) return fd.status();
+  absl::Cleanup close_fd = [sock = *fd]() { close(sock); };
+  ControlRequestHeader req{.magic = kControlMagic, .op = kOpCapabilities};
+  if (absl::Status s = WriteExact(*fd, &req, sizeof(req)); !s.ok()) return s;
+  ControlResponseHeader resp;
+  if (absl::Status s = ReadExact(*fd, &resp, sizeof(resp)); !s.ok()) return s;
+  if (resp.magic != kResponseMagic) {
+    return absl::InternalError(absl::StrCat("bad magic: ", resp.magic));
+  }
+  if (resp.status == 0 && resp.message_len > kMaxControlErrorMessageBytes) {
+    return absl::InternalError("capabilities reply exceeds maximum size");
+  }
+  std::string msg(std::min(resp.message_len, kMaxControlErrorMessageBytes),
+                  '\0');
+  if (resp.message_len > 0) {
+    if (absl::Status s = ReadExact(*fd, msg.data(), msg.size()); !s.ok()) {
+      return s;
+    }
+  }
+  if (resp.status != 0) {
+    return absl::StrContains(msg, "unknown control op code")
+               ? absl::UnimplementedError(msg)
+               : absl::InternalError(absl::StrCat("GetCapabilities: ", msg));
+  }
+  return ParseCapabilitiesReply(msg);
 }
 
 }  // namespace tpu_raiden

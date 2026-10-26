@@ -2370,6 +2370,30 @@ TEST(KVCacheManagerTest,
   EXPECT_FALSE(d2h_sync_err.PollError().ok());
 }
 
+TEST(KVCacheManagerTest, ExpectedPushesPerLayerReflectsTransferHooks) {
+  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/128);
+  constexpr uint64_t kUuid = 0xbeef;
+
+  // 1. Returns 1 by default when unset.
+  EXPECT_EQ(manager.ExpectedPushesPerLayer(kUuid), 1);
+
+  // 2. Forwards uuid to the hook and returns the hook's result when configured.
+  uint64_t observed_uuid = 0;
+  KVCacheManagerBase::TransferEventHooks hooks;
+  hooks.expected_pushes_per_layer = [&observed_uuid](uint64_t uuid) -> int32_t {
+    observed_uuid = uuid;
+    return 3;
+  };
+  manager.SetTransferEventHooks(std::move(hooks));
+  EXPECT_EQ(manager.ExpectedPushesPerLayer(kUuid), 3);
+  EXPECT_EQ(observed_uuid, kUuid);
+
+  // 3. Reverts to 1 when hooks are cleared.
+  manager.SetTransferEventHooks({});
+  EXPECT_EQ(manager.ExpectedPushesPerLayer(kUuid), 1);
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

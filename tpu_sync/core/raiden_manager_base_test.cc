@@ -14,6 +14,7 @@
 
 #include "tpu_sync/core/raiden_manager_base.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -23,8 +24,11 @@
 #include <utility>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
@@ -77,6 +81,19 @@ class TestRaidenManager : public RaidenManagerBase {
     }
     return ids;
   }
+
+  absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
+                                     absl::Span<const int> shard_ids,
+                                     uint64_t uuid = 0) override {
+    ++incoming_streams_;
+    return absl::OkStatus();
+  }
+
+  int incoming_streams() const { return incoming_streams_.load(); }
+  void reset_incoming_streams() { incoming_streams_.store(0); }
+
+ private:
+  std::atomic<int> incoming_streams_{0};
 };
 
 TEST(RaidenManagerBaseTest, LifecycleAndConfig) {
@@ -473,6 +490,177 @@ TEST(RaidenManagerBaseTest, ShardsCarryPerShardPlacement) {
   EXPECT_EQ(shards[1].global_index, 1);
   EXPECT_EQ(shards[3].global_index, 3);
   EXPECT_EQ(shards[3].local_index, 3);
+}
+
+TEST(RaidenManagerBaseTest, ParallelismAndNumNumaGroups) {
+  TestRaidenManager manager_multi(
+      /*num_layers=*/1,
+      /*shards=*/ShardsOnNuma({0, 1}),
+      /*slice_byte_size=*/1024,
+      /*local_port=*/std::nullopt,
+      /*parallelism=*/4);
+  EXPECT_EQ(manager_multi.parallelism(), 4);
+  EXPECT_EQ(manager_multi.num_numa_groups(), 2);
+
+  TestRaidenManager manager_single(
+      /*num_layers=*/1,
+      /*shards=*/ShardsOnNuma({0, 0}),
+      /*slice_byte_size=*/1024,
+      /*local_port=*/std::nullopt,
+      /*parallelism=*/1);
+  EXPECT_EQ(manager_single.parallelism(), 1);
+  EXPECT_EQ(manager_single.num_numa_groups(), 1);
+
+  TestRaidenManager manager_mixed(
+      /*num_layers=*/1,
+      /*shards=*/ShardsOnNuma({0, 1, -1}),
+      /*slice_byte_size=*/1024,
+      /*local_port=*/std::nullopt,
+      /*parallelism=*/2);
+  EXPECT_EQ(manager_mixed.num_numa_groups(), 1);
+}
+
+TEST(RaidenManagerBaseTest, H2hWriteDirectAsyncRejectsNonPositiveParallelism) {
+  TestRaidenManager manager(
+      /*num_layers=*/1,
+      /*shards=*/ShardsOnNuma({-1}),
+      /*slice_byte_size=*/1024);
+
+  {
+    absl::Notification done;
+    absl::Status result_status;
+    manager.H2hWriteDirectAsync(
+        {"127.0.0.1:1234"}, {0}, {0}, /*uuid=*/1, /*layer_idx=*/0,
+        [&](absl::StatusOr<std::vector<int>> res) {
+          result_status = res.status();
+          done.Notify();
+        },
+        /*parallelism=*/0);
+    EXPECT_TRUE(done.HasBeenNotified());
+    EXPECT_TRUE(absl::IsInvalidArgument(result_status));
+    EXPECT_THAT(result_status.message(),
+                ::testing::HasSubstr("parallelism must be positive"));
+  }
+
+  {
+    absl::Notification done;
+    absl::Status result_status;
+    manager.H2hWriteDirectAsync(
+        {"127.0.0.1:1234"}, {0}, {0}, /*uuid=*/2, /*layer_idx=*/0,
+        [&](absl::StatusOr<std::vector<int>> res) {
+          result_status = res.status();
+          done.Notify();
+        },
+        /*parallelism=*/-2);
+    EXPECT_TRUE(done.HasBeenNotified());
+    EXPECT_TRUE(absl::IsInvalidArgument(result_status));
+    EXPECT_THAT(result_status.message(),
+                ::testing::HasSubstr("parallelism must be positive"));
+  }
+}
+
+TEST(RaidenManagerBaseTest, H2hWriteDirectAsyncForwardsParallelism) {
+  const size_t slice_size = 1024;
+  const size_t total_bytes = 2 * slice_size;
+  TestRaidenManager sender_p1(/*num_layers=*/1, ShardsOnNuma({-1}), slice_size,
+                              /*local_port=*/std::nullopt, /*parallelism=*/1);
+  TestRaidenManager sender_p2(/*num_layers=*/1, ShardsOnNuma({-1}), slice_size,
+                              /*local_port=*/std::nullopt, /*parallelism=*/2);
+  TestRaidenManager receiver(/*num_layers=*/1, ShardsOnNuma({-1}), slice_size,
+                             /*local_port=*/std::nullopt, /*parallelism=*/1);
+  ASSERT_TRUE(receiver.local_port().has_value());
+
+  std::vector<uint8_t> send_buf(total_bytes, 0xAB);
+  std::vector<uint8_t> recv_buf(total_bytes, 0x00);
+  sender_p1.SetExternalHostPointers({send_buf.data()}, {total_bytes});
+  sender_p2.SetExternalHostPointers({send_buf.data()}, {total_bytes});
+  receiver.SetExternalHostPointers({recv_buf.data()}, {total_bytes});
+
+  const std::string peer_address =
+      absl::StrCat("127.0.0.1:", receiver.local_port().value());
+
+  // 1. Forward default parallelism (std::nullopt) from sender configured with
+  // parallelism=1 -> 1 stream.
+  {
+    receiver.reset_incoming_streams();
+    absl::Notification done;
+    absl::StatusOr<std::vector<int>> push_res;
+    sender_p1.H2hWriteDirectAsync(
+        {peer_address}, {0, 1}, {0, 1}, /*uuid=*/10, /*layer_idx=*/0,
+        [&](absl::StatusOr<std::vector<int>> res) {
+          push_res = std::move(res);
+          done.Notify();
+        },
+        /*parallelism=*/std::nullopt);
+    ASSERT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(5)));
+    ABSL_EXPECT_OK(push_res.status());
+    if (push_res.ok()) {
+      EXPECT_EQ(push_res->size(), 2);
+    }
+    EXPECT_EQ(receiver.incoming_streams(), 1);
+  }
+
+  // 2. Forward explicit parallelism (n_u = 2) from sender_p1 -> 2 streams.
+  {
+    receiver.reset_incoming_streams();
+    absl::Notification done;
+    absl::StatusOr<std::vector<int>> push_res;
+    sender_p1.H2hWriteDirectAsync(
+        {peer_address}, {0, 1}, {0, 1}, /*uuid=*/11, /*layer_idx=*/0,
+        [&](absl::StatusOr<std::vector<int>> res) {
+          push_res = std::move(res);
+          done.Notify();
+        },
+        /*parallelism=*/2);
+    ASSERT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(5)));
+    ABSL_EXPECT_OK(push_res.status());
+    if (push_res.ok()) {
+      EXPECT_EQ(push_res->size(), 2);
+    }
+    EXPECT_EQ(receiver.incoming_streams(), 2);
+  }
+
+  // 3. Forward explicit parallelism (n_u = 1) from sender_p2 (configured with
+  // parallelism=2) -> 1 stream.
+  {
+    receiver.reset_incoming_streams();
+    absl::Notification done;
+    absl::StatusOr<std::vector<int>> push_res;
+    sender_p2.H2hWriteDirectAsync(
+        {peer_address}, {0, 1}, {0, 1}, /*uuid=*/12, /*layer_idx=*/0,
+        [&](absl::StatusOr<std::vector<int>> res) {
+          push_res = std::move(res);
+          done.Notify();
+        },
+        /*parallelism=*/1);
+    ASSERT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(5)));
+    ABSL_EXPECT_OK(push_res.status());
+    if (push_res.ok()) {
+      EXPECT_EQ(push_res->size(), 2);
+    }
+    EXPECT_EQ(receiver.incoming_streams(), 1);
+  }
+
+  // 4. Forward default parallelism (std::nullopt) from sender configured with
+  // parallelism=2 -> 2 streams.
+  {
+    receiver.reset_incoming_streams();
+    absl::Notification done;
+    absl::StatusOr<std::vector<int>> push_res;
+    sender_p2.H2hWriteDirectAsync(
+        {peer_address}, {0, 1}, {0, 1}, /*uuid=*/13, /*layer_idx=*/0,
+        [&](absl::StatusOr<std::vector<int>> res) {
+          push_res = std::move(res);
+          done.Notify();
+        },
+        /*parallelism=*/std::nullopt);
+    ASSERT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(5)));
+    ABSL_EXPECT_OK(push_res.status());
+    if (push_res.ok()) {
+      EXPECT_EQ(push_res->size(), 2);
+    }
+    EXPECT_EQ(receiver.incoming_streams(), 2);
+  }
 }
 
 }  // namespace

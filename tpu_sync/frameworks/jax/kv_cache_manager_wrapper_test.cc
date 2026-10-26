@@ -63,6 +63,15 @@ class MockSubManager : public KVCacheManagerWithTransfer {
                                        nullptr),
           parent_(parent) {}
 
+    MockBase(MockSubManager* parent, int64_t total_host_blocks)
+        : kv_cache::KVCacheManagerBase(
+              /*num_layers=*/1, /*num_shards=*/1,
+              /*slice_byte_size=*/4096,
+              /*local_port=*/std::nullopt,
+              /*host_blocks_to_allocate=*/static_cast<int>(total_host_blocks),
+              /*parallelism=*/1, /*host_allocator=*/nullptr),
+          parent_(parent) {}
+
     absl::StatusOr<raiden::PjRtCopyFuture> D2h(
         const std::vector<int64_t>& src_offsets_major_dim = {},
         const std::vector<int64_t>& dst_offsets_major_dim = {},
@@ -116,6 +125,15 @@ class MockSubManager : public KVCacheManagerWithTransfer {
 
   MockSubManager()
       : KVCacheManagerWithTransfer(std::make_unique<MockBase>(this)) {}
+
+  MockSubManager(
+      int64_t max_blocks, int64_t num_slots,
+      std::optional<StagingWindowConfig> window_config = std::nullopt)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<MockBase>(this, max_blocks * num_slots),
+            /*node_id=*/0, /*local_control_port=*/-1, max_blocks, num_slots,
+            /*timeout_s=*/120.0,
+            /*metrics_collector=*/nullptr, window_config) {}
 
   std::vector<std::string> sending, recving, failed;
   std::string started_ep;
@@ -645,6 +663,47 @@ TEST(KVCacheManagerWrapperTest, ConstructorWithRawPjRtBuffersSucceeds) {
   EXPECT_EQ(manager.num_layers(), 1);
   EXPECT_EQ(manager.num_shards(), 1);
   EXPECT_EQ(manager.slice_byte_size(), 1024 * sizeof(float));
+}
+
+TEST(KVCacheManagerWrapperTest, MultiNumaStagingStatsAndWindowConfig) {
+  StagingWindowConfig cfg;
+  cfg.window_chunks = 2;
+  cfg.chunk_blocks = 4;
+  cfg.admission = StagingWindowConfig::Admission::kWait;
+
+  auto sub0 =
+      std::make_unique<MockSubManager>(/*max_blocks=*/8, /*num_slots=*/4, cfg);
+  auto sub1 = std::make_unique<MockSubManager>(/*max_blocks=*/16,
+                                               /*num_slots=*/2, cfg);
+
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
+  subs.push_back(std::move(sub0));
+  subs.push_back(std::move(sub1));
+
+  KVCacheManager mgr(std::move(subs));
+
+  // Multi-NUMA aggregation:
+  // sub0 budget_blocks = 8 * 4 = 32
+  // sub1 budget_blocks = 16 * 2 = 32
+  // total budget_blocks = 64
+  StagingStats stats = mgr.staging_stats();
+  EXPECT_EQ(stats.budget_blocks, 64);
+  EXPECT_EQ(stats.blocks_in_use, 0);
+
+  // staging_window_config reflects sub0
+  EXPECT_EQ(mgr.staging_window_config().chunk_blocks, 4);
+
+  // Mutation of window_chunks rejected
+  StagingWindowConfig mutated = mgr.staging_window_config();
+  mutated.window_chunks = 8;
+  EXPECT_EQ(mgr.SetStagingWindowConfig(mutated).code(),
+            absl::StatusCode::kInvalidArgument);
+
+  // Mutation of mutable fields succeeds
+  mutated.window_chunks = 2;
+  mutated.chunk_blocks = 8;
+  EXPECT_TRUE(mgr.SetStagingWindowConfig(mutated).ok());
+  EXPECT_EQ(mgr.staging_window_config().chunk_blocks, 8);
 }
 
 }  // namespace

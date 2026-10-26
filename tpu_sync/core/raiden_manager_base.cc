@@ -29,6 +29,7 @@
 
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -405,21 +406,39 @@ void RaidenManagerBase::H2hWriteDirectAsync(
     const std::vector<std::string>& peers,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx,
-    std::function<void(absl::StatusOr<std::vector<int>>)> on_complete) {
+    std::function<void(absl::StatusOr<std::vector<int>>)> on_complete,
+    std::optional<int> parallelism) {
   RAIDEN_TRACE_FN("RaidenBase::H2hWriteDirectAsync", [&]() {
     return absl::StrCat("blocks=", src_block_ids.size(),
                         " peers=", peers.size(), " uuid=", uuid);
   });
+  if (parallelism.has_value() && *parallelism <= 0) {
+    on_complete(absl::InvalidArgumentError(
+        absl::StrCat("parallelism must be positive, got ", *parallelism)));
+    return;
+  }
   absl::Status status = FaultInjectStatus(hooks::kRaidenManagerBaseH2hWrite);
   if (!status.ok()) {
     on_complete(status);
     return;
   }
+  const int push_parallelism = parallelism.value_or(parallelism_);
   server_
-      ->AsyncPush(peers, src_block_ids, dst_block_ids, parallelism_,
+      ->AsyncPush(peers, src_block_ids, dst_block_ids, push_parallelism,
                   tpu_raiden::transport::MajorOrder::kLayerMajor, uuid,
                   layer_idx)
       .OnReady(std::move(on_complete));
+}
+
+int RaidenManagerBase::num_numa_groups() const {
+  absl::flat_hash_set<int> numa_nodes;
+  for (const auto& shard : shards_) {
+    if (shard.numa_node < 0) {
+      return 1;
+    }
+    numa_nodes.insert(shard.numa_node);
+  }
+  return numa_nodes.size() > 1 ? static_cast<int>(numa_nodes.size()) : 1;
 }
 
 absl::StatusOr<std::vector<int>> RaidenManagerBase::H2hReadDirect(

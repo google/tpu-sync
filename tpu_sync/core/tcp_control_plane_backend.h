@@ -62,7 +62,21 @@ class TcpControlPlaneBackend : public ControlPlaneBackend {
   static constexpr uint32_t kResponseMagic = 0x44494152;
   static constexpr uint32_t kOpAck = 2;
   static constexpr uint32_t kOpPullStream = 3;
+  static constexpr uint32_t kOpCapabilities = 4;
   static constexpr uint64_t kMaxControlErrorMessageBytes = 4 * 1024;
+
+  static inline uint32_t PackPullStreamPadding(int32_t c, int32_t w) {
+    if (w <= 0 || c <= 0 || c > 0xFFFF || w > 0xFF) return 0;
+    return (static_cast<uint32_t>(c) & 0xFFFFu) |
+           ((static_cast<uint32_t>(w) & 0xFFu) << 16) | (1u << 24);
+  }
+  static inline void UnpackPullStreamPadding(uint32_t p, int32_t* c,
+                                             int32_t* w) {
+    bool ok =
+        ((p >> 24) & 1u) != 0 && (p & 0xFFFFu) != 0 && ((p >> 16) & 0xFFu) != 0;
+    if (c) *c = ok ? static_cast<int32_t>(p & 0xFFFFu) : 0;
+    if (w) *w = ok ? static_cast<int32_t>((p >> 16) & 0xFFu) : 0;
+  }
 
   explicit TcpControlPlaneBackend(
       TaskExecutor executor = nullptr,
@@ -80,6 +94,12 @@ class TcpControlPlaneBackend : public ControlPlaneBackend {
 
   absl::Status SendAck(absl::string_view remote_endpoint, uint64_t uuid,
                        absl::Duration timeout) override;
+
+  tsl::Future<ControlPlaneCapabilities> GetCapabilities(
+      absl::string_view remote_endpoint, absl::Duration timeout) override {
+    return tsl::Future<ControlPlaneCapabilities>(
+        SendCapabilitiesRequestBlocking(remote_endpoint, timeout));
+  }
 
   absl::string_view Name() const override { return "tcp"; }
 
@@ -104,6 +124,8 @@ class TcpControlPlaneBackend : public ControlPlaneBackend {
   absl::StatusOr<PullStreamResponseSpec> SendPullRequestBlocking(
       absl::string_view remote_endpoint, const PullStreamRequestSpec& req,
       absl::Duration timeout);
+  absl::StatusOr<ControlPlaneCapabilities> SendCapabilitiesRequestBlocking(
+      absl::string_view remote_endpoint, absl::Duration timeout);
   void ControlServerLoop();
   void SendErrorResponse(int fd, absl::string_view message);
 

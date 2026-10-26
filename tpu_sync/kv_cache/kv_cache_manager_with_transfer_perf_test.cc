@@ -41,16 +41,31 @@
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_pjrt_manager.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/staging_window.h"
 
 ABSL_FLAG(int, num_tpus, 1, "Number of TPUs to use");
 ABSL_FLAG(int, num_layers, 64, "Number of layers to use for the benchmark.");
 ABSL_FLAG(int64_t, num_blocks, 16,
           "Number of blocks to use for the benchmark.");
+ABSL_FLAG(int, slice_kib, 16, "Size of one slice in KiB.");
+ABSL_FLAG(int, staging_window_chunks, 0,
+          "Window chunks (W) for bounded window staging.");
+ABSL_FLAG(int, staging_chunk_blocks, 0, "Chunk size (C) in blocks (0 = auto).");
+ABSL_FLAG(int64_t, staging_chunk_bytes, 0, "Chunk size target in bytes.");
+ABSL_FLAG(int64_t, staging_stream_bytes, 0,
+          "Stream slice size target in bytes.");
+ABSL_FLAG(std::string, staging_admission, "fail_fast",
+          "Admission policy: 'fail_fast' or 'wait'.");
+ABSL_FLAG(int, num_slots, 2, "Number of host staging slots.");
+ABSL_FLAG(int64_t, max_blocks, 512, "Max blocks to allocate / manage.");
+ABSL_FLAG(int, num_transfers, 1, "Number of transfers to run.");
+ABSL_FLAG(bool, mixed_role, false, "Run mixed-role (bidirectional) transfers.");
 
 namespace tpu_raiden {
 namespace {
@@ -352,6 +367,263 @@ TEST_F(KVCacheManagerWithTransferPerfTest, BenchmarkF32) {
 
   RunSlotBenchmark<float>(manager, devices, xla::PrimitiveType::F32, "F32",
                           num_layers, num_blocks);
+}
+
+TEST_F(KVCacheManagerWithTransferPerfTest, BenchmarkPullWindow) {
+  const int num_tpus = absl::GetFlag(FLAGS_num_tpus);
+  const int num_layers = absl::GetFlag(FLAGS_num_layers);
+  const int64_t num_blocks = absl::GetFlag(FLAGS_num_blocks);
+  const int slice_kib = absl::GetFlag(FLAGS_slice_kib);
+  const int staging_window_chunks = absl::GetFlag(FLAGS_staging_window_chunks);
+  const int staging_chunk_blocks = absl::GetFlag(FLAGS_staging_chunk_blocks);
+  const int64_t staging_chunk_bytes = absl::GetFlag(FLAGS_staging_chunk_bytes);
+  const int64_t staging_stream_bytes =
+      absl::GetFlag(FLAGS_staging_stream_bytes);
+  const std::string staging_admission = absl::GetFlag(FLAGS_staging_admission);
+  const int num_slots = absl::GetFlag(FLAGS_num_slots);
+  const int64_t max_blocks = absl::GetFlag(FLAGS_max_blocks);
+  const int num_transfers = absl::GetFlag(FLAGS_num_transfers);
+  const bool mixed_role = absl::GetFlag(FLAGS_mixed_role);
+
+  std::cout << "[INFO] BenchmarkPullWindow: num_tpus=" << num_tpus
+            << ", num_layers=" << num_layers << ", num_blocks=" << num_blocks
+            << ", slice_kib=" << slice_kib
+            << ", window_chunks=" << staging_window_chunks
+            << ", chunk_blocks=" << staging_chunk_blocks
+            << ", num_transfers=" << num_transfers << std::endl;
+
+  auto manager_or = TpuPjrtManager::GetDefault();
+  ASSERT_OK(manager_or.status());
+  auto manager = manager_or.value();
+
+  auto all_devices = manager->client()->addressable_devices();
+  std::vector<xla::PjRtDevice*> devices;
+  for (int i = 0; i < num_tpus && i < all_devices.size(); ++i) {
+    devices.push_back(all_devices[i]);
+  }
+  ASSERT_FALSE(devices.empty()) << "No local TPUs found";
+
+  // Calculate slice geometry
+  const int64_t slice_bytes = static_cast<int64_t>(slice_kib) * 1024;
+  const int64_t elements_per_slice = slice_bytes / sizeof(float);
+  const int64_t total_blocks = std::max<int64_t>(num_blocks * 2, max_blocks);
+  const int64_t elements_per_buffer = total_blocks * elements_per_slice;
+  std::vector<int64_t> buffer_shape = {total_blocks, 32,
+                                       elements_per_slice / 32};
+  if (elements_per_slice % 32 != 0) {
+    buffer_shape = {total_blocks, elements_per_slice};
+  }
+
+  // Build StagingWindowConfig
+  std::optional<StagingWindowConfig> window_config;
+  if (staging_window_chunks > 0) {
+    StagingWindowConfig cfg;
+    cfg.window_chunks = staging_window_chunks;
+    cfg.chunk_blocks = staging_chunk_blocks;
+    if (staging_chunk_bytes > 0) {
+      cfg.chunk_bytes_target = staging_chunk_bytes;
+    }
+    if (staging_stream_bytes > 0) {
+      cfg.stream_bytes_target = staging_stream_bytes;
+    }
+    if (staging_admission == "wait") {
+      cfg.admission = StagingWindowConfig::Admission::kWait;
+    } else {
+      cfg.admission = StagingWindowConfig::Admission::kFailFast;
+    }
+    window_config = cfg;
+  }
+
+  // Create buffers and initialize
+  std::vector<std::vector<std::unique_ptr<xla::PjRtBuffer>>> device_buffers(
+      num_layers);
+  std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers(
+      num_layers);
+  std::vector<std::vector<std::vector<float>>> host_init_buffers(num_layers);
+
+  for (int l = 0; l < num_layers; ++l) {
+    device_buffers[l].resize(devices.size());
+    layer_buffers[l].resize(devices.size());
+    host_init_buffers[l].resize(devices.size());
+
+    for (size_t d = 0; d < devices.size(); ++d) {
+      host_init_buffers[l][d].resize(elements_per_buffer);
+      for (int64_t b = 0; b < total_blocks; ++b) {
+        for (int64_t e = 0; e < elements_per_slice; ++e) {
+          const int64_t idx = b * elements_per_slice + e;
+          if (b < num_blocks) {
+            host_init_buffers[l][d][idx] =
+                static_cast<float>(l * 100000 + d * 1000 + b * 10 + (e % 10));
+          } else {
+            host_init_buffers[l][d][idx] = 0.0f;
+          }
+        }
+      }
+
+      TF_ASSERT_OK_AND_ASSIGN(
+          auto buf, manager->BufferFromHost(host_init_buffers[l][d].data(),
+                                            xla::PrimitiveType::F32,
+                                            buffer_shape, devices[d]));
+      device_buffers[l][d] = std::move(buf);
+      auto handle_or =
+          raiden::RaidenBufferHandle::Acquire(device_buffers[l][d].get());
+      ASSERT_OK(handle_or.status());
+      layer_buffers[l][d] = std::move(handle_or).value();
+    }
+  }
+
+  for (auto& bufs : layer_buffers) {
+    for (auto& handle : bufs) {
+      ASSERT_OK(handle.buffer->GetReadyFuture().Await());
+    }
+  }
+
+  // 2. Create Host Allocator
+  TF_ASSERT_OK_AND_ASSIGN(auto host_allocator,
+                          XlaHostMemoryAllocator::Create(manager->client()));
+  HostMemoryAllocator* raw_allocator = host_allocator.get();
+  HostBufferAllocator allocator_fn =
+      [raw_allocator](size_t size, const xla::PjRtDevice* device) {
+        return raw_allocator->AllocateDmaMappedForDevice(size, device);
+      };
+
+  // Construct engine on loopback
+  auto engine = std::make_unique<KVCacheManagerWithTransfer>(
+      layer_buffers,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/std::nullopt,
+      /*unsafe_skip_buffer_lock=*/true,
+      /*parallelism=*/1,
+      /*host_allocator=*/allocator_fn,
+      /*node_id=*/0,
+      /*local_control_port=*/0,
+      /*max_blocks=*/total_blocks,
+      /*num_slots=*/num_slots,
+      /*timeout_s=*/60.0,
+      /*metrics_collector=*/nullptr,
+      /*staging_window_config=*/window_config);
+
+  int port = engine->local_control_port();
+  ASSERT_GT(port, 0);
+  std::string remote_endpoint = absl::StrCat("127.0.0.1:", port);
+
+  std::vector<int64_t> src_block_ids(num_blocks);
+  std::vector<int64_t> dst_block_ids(num_blocks);
+  for (int64_t i = 0; i < num_blocks; ++i) {
+    src_block_ids[i] = i;
+    dst_block_ids[i] = num_blocks + i;
+  }
+
+  std::vector<double> transfer_bandwidths;
+  const int64_t bytes_per_transfer =
+      num_layers * devices.size() * num_blocks * slice_bytes;
+
+  for (int t = 0; t < num_transfers; ++t) {
+    std::string req_id = absl::StrCat("pull_window_req_", t);
+    uint64_t uuid = 100000 + t;
+
+    engine->NotifyForRead(req_id, uuid, src_block_ids);
+
+    absl::Time start_time = absl::Now();
+    engine->StartRead(req_id, uuid, remote_endpoint, src_block_ids,
+                      dst_block_ids);
+
+    bool done = false;
+    while (!done && absl::Now() - start_time < absl::Seconds(60)) {
+      auto [done_sending, done_recving, failed_recving] =
+          engine->CompleteReadRaw();
+      if (std::find(failed_recving.begin(), failed_recving.end(), req_id) !=
+          failed_recving.end()) {
+        FAIL() << "Transfer failed for req_id " << req_id;
+      }
+      if (std::find(done_recving.begin(), done_recving.end(), req_id) !=
+          done_recving.end()) {
+        done = true;
+        break;
+      }
+      absl::SleepFor(absl::Milliseconds(1));
+    }
+    ASSERT_TRUE(done) << "Transfer timed out for req_id " << req_id;
+
+    absl::Duration duration = absl::Now() - start_time;
+    double seconds = absl::ToDoubleSeconds(duration);
+    double bandwidth =
+        (bytes_per_transfer / (1024.0 * 1024.0 * 1024.0)) / seconds;
+    transfer_bandwidths.push_back(bandwidth);
+  }
+
+  PrintDistribution("KVCacheManagerWithTransfer PullWindow Bandwidth",
+                    transfer_bandwidths);
+
+  // Verify correctness: dst blocks should match src blocks
+  std::cout << "[INFO] Verifying device buffer content match..." << std::endl;
+  for (int l = 0; l < num_layers; ++l) {
+    for (size_t d = 0; d < devices.size(); ++d) {
+      TF_ASSERT_OK_AND_ASSIGN(auto literal,
+                              device_buffers[l][d]->ToLiteral().Await());
+      auto read_back = literal->data<float>();
+      for (int64_t i = 0; i < num_blocks; ++i) {
+        int64_t dst_offset = dst_block_ids[i] * elements_per_slice;
+        for (int64_t e = 0; e < elements_per_slice; ++e) {
+          float expected =
+              static_cast<float>(l * 100000 + d * 1000 + i * 10 + (e % 10));
+          ASSERT_EQ(read_back[dst_offset + e], expected)
+              << "Mismatch at layer " << l << ", device " << d << ", block "
+              << dst_block_ids[i] << ", elem " << e;
+        }
+      }
+    }
+  }
+  std::cout << "[SUCCESS] Verification passed!" << std::endl;
+
+  if (mixed_role) {
+    std::cout << "[INFO] Running mixed-role reverse transfer..." << std::endl;
+    std::string rev_req_id = "pull_window_rev_req";
+    uint64_t rev_uuid = 999999;
+    engine->NotifyForRead(rev_req_id, rev_uuid, dst_block_ids);
+    absl::Time rev_start = absl::Now();
+    engine->StartRead(rev_req_id, rev_uuid, remote_endpoint, dst_block_ids,
+                      src_block_ids);
+    bool rev_done = false;
+    while (!rev_done && absl::Now() - rev_start < absl::Seconds(60)) {
+      auto [done_sending, done_recving, failed_recving] =
+          engine->CompleteReadRaw();
+      if (std::find(failed_recving.begin(), failed_recving.end(), rev_req_id) !=
+          failed_recving.end()) {
+        FAIL() << "Reverse transfer failed";
+      }
+      if (std::find(done_recving.begin(), done_recving.end(), rev_req_id) !=
+          done_recving.end()) {
+        rev_done = true;
+        break;
+      }
+      absl::SleepFor(absl::Milliseconds(1));
+    }
+    ASSERT_TRUE(rev_done) << "Reverse transfer timed out";
+    std::cout << "[INFO] Mixed-role transfer completed successfully."
+              << std::endl;
+  }
+
+  // Dump staging stats breakdown
+  StagingStats stats = engine->staging_stats();
+  std::cout << "\n=== Host Staging Stats Breakdown ===" << std::endl;
+  std::cout << "  budget_blocks:         " << stats.budget_blocks << std::endl;
+  std::cout << "  blocks_in_use:         " << stats.blocks_in_use << std::endl;
+  std::cout << "  peak_blocks_in_use:    " << stats.peak_blocks_in_use
+            << std::endl;
+  std::cout << "  gate_waits_over_1ms:   " << stats.gate_waits_over_1ms
+            << std::endl;
+  std::cout << "  rejected_streams:      " << stats.rejected_streams
+            << std::endl;
+  std::cout << "  admission_rejects:     " << stats.admission_rejects
+            << std::endl;
+  std::cout << "  admission_waits:       " << stats.admission_waits
+            << std::endl;
+  std::cout << "  admission_requeues:    " << stats.admission_requeues
+            << std::endl;
+  std::cout << "  admission_timeouts:    " << stats.admission_timeouts
+            << std::endl;
+  std::cout << "====================================\n" << std::endl;
 }
 
 }  // namespace

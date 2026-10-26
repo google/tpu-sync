@@ -62,7 +62,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-# [MODIFIED] Use OSS import paths instead of 'google3.third_party...'
 from tpu_sync.api.jax import kv_cache_manager
 from tpu_sync.rpc import coordination_helper
 
@@ -97,6 +96,21 @@ _COORDINATOR = flags.DEFINE_string(
 _PROCESS_INDEX = flags.DEFINE_integer('process_index', -1, 'JAX process index')
 _NUM_PROCESSES = flags.DEFINE_integer(
     'num_processes', 1, 'Number of JAX processes.'
+)
+_STAGING_WINDOW_CHUNKS = flags.DEFINE_integer(
+    'staging_window_chunks', 0, 'Window chunks (W) for bounded window staging.'
+)
+_STAGING_CHUNK_BLOCKS = flags.DEFINE_integer(
+    'staging_chunk_blocks', 0, 'Chunk size (C) in blocks (0 = auto).'
+)
+_STAGING_CHUNK_BYTES = flags.DEFINE_integer(
+    'staging_chunk_bytes', 0, 'Chunk size target in bytes.'
+)
+_STAGING_STREAM_BYTES = flags.DEFINE_integer(
+    'staging_stream_bytes', 0, 'Stream slice size target in bytes.'
+)
+_STAGING_ADMISSION = flags.DEFINE_string(
+    'staging_admission', 'fail_fast', 'Admission policy: fail_fast or wait.'
 )
 
 def setup_shardings(devices):
@@ -175,7 +189,7 @@ def main(_):
       jax.distributed.initialize()
     except ValueError:
       pass
-      
+
   print(f'Initialized JAX distributed mesh: process_index={jax.process_index()}, process_count={jax.process_count()}')
 
   # This runner assumes ONE process per side. The cross-process machinery it
@@ -250,6 +264,11 @@ def main(_):
         num_slots=_NUM_SLOTS.value,
         unsafe_skip_buffer_lock=True,
         parallelism=_PARALLELISM.value,
+        staging_window_chunks=_STAGING_WINDOW_CHUNKS.value or None,
+        staging_chunk_blocks=_STAGING_CHUNK_BLOCKS.value or None,
+        staging_chunk_bytes=_STAGING_CHUNK_BYTES.value or None,
+        staging_stream_bytes=_STAGING_STREAM_BYTES.value or None,
+        staging_admission=_STAGING_ADMISSION.value or None,
     )
 
     print(f'KVCacheManager ready in {time.perf_counter() - t0:.2f}s')
@@ -290,7 +309,9 @@ def main(_):
 
   elif _ROLE.value == 'receiver':
     print('Starting H2H Receiver process...')
-    
+
+    if not _PEER.value:
+      raise ValueError('--peer must be specified for receiver role.')
     resolved_peer = get_peer_grpc_path(_PEER.value)
     print(f'Connecting to peer coordination server at: {resolved_peer}')
     client = coordination_helper.CoordinationClient(server_address=resolved_peer)
@@ -335,6 +356,11 @@ def main(_):
         num_slots=_NUM_SLOTS.value,
         unsafe_skip_buffer_lock=True,
         parallelism=_PARALLELISM.value,
+        staging_window_chunks=_STAGING_WINDOW_CHUNKS.value or None,
+        staging_chunk_blocks=_STAGING_CHUNK_BLOCKS.value or None,
+        staging_chunk_bytes=_STAGING_CHUNK_BYTES.value or None,
+        staging_stream_bytes=_STAGING_STREAM_BYTES.value or None,
+        staging_admission=_STAGING_ADMISSION.value or None,
     )
     print(f'KVCacheManager ready in {time.perf_counter() - t0:.2f}s')
 
@@ -394,6 +420,13 @@ def main(_):
     print(f'Bandwidth: {bandwidth_gbps:.3f} Gbps '
           f'({total_bytes / elapsed_time / 1e9:.3f} GB/s)')
     print('===================================\n')
+
+    if _STAGING_WINDOW_CHUNKS.value > 0:
+      stats = manager.staging_stats()
+      print('\n=== Host Staging Window Stats ===')
+      for k, v in stats.items():
+        print(f'{k}: {v}')
+      print('=================================\n')
 
     t0 = time.perf_counter()
     success = verify_deterministic_cache(

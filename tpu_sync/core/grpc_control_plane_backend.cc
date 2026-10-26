@@ -19,11 +19,13 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "grpc/impl/channel_arg_names.h"
+#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -72,6 +74,8 @@ control_plane::proto::PullStreamRequest ToProto(
   }
   proto_req.mutable_layer_host_addrs()->Add(req.layer_host_addrs.begin(),
                                             req.layer_host_addrs.end());
+  proto_req.set_chunk_blocks(req.chunk_blocks);
+  proto_req.set_window_chunks(req.window_chunks);
   return proto_req;
 }
 
@@ -81,11 +85,32 @@ absl::StatusOr<PullStreamResponseSpec> FromProto(
   if (!rpc_status.ok()) {
     return FromGrpcStatus(rpc_status);
   }
+  std::string msg = proto_resp.message();
+  std::optional<ControlPlaneStagingWindowAck> ack;
+  if (proto_resp.status() == 0 && !proto_resp.staging_window_ack().empty()) {
+    msg = proto_resp.staging_window_ack();
+    if (auto parsed = ParseStagingWindowAck(proto_resp.staging_window_ack())) {
+      ack = ControlPlaneStagingWindowAck{
+          .chunk_blocks = parsed->first,
+          .window_chunks = parsed->second,
+      };
+    }
+  } else if (proto_resp.status() != 0 &&
+             !proto_resp.staging_window_rejected_reason().empty()) {
+    msg = FormatStagingWindowRejected(
+        proto_resp.staging_window_rejected_reason());
+  }
+  std::optional<std::string> rejected_reason;
+  if (!proto_resp.staging_window_rejected_reason().empty()) {
+    rejected_reason = proto_resp.staging_window_rejected_reason();
+  }
   return PullStreamResponseSpec{
       .status = proto_resp.status(),
       .num_layers = proto_resp.num_layers(),
       .data_port = proto_resp.data_port(),
-      .message = proto_resp.message(),
+      .message = std::move(msg),
+      .staging_window_ack = std::move(ack),
+      .staging_window_rejected_reason = std::move(rejected_reason),
   };
 }
 
@@ -150,6 +175,8 @@ grpc::Status KVCacheControlPlaneServiceImpl::PullStream(
                             request->dst_block_ids().end());
   spec.layer_host_addrs.assign(request->layer_host_addrs().begin(),
                                request->layer_host_addrs().end());
+  spec.chunk_blocks = request->chunk_blocks();
+  spec.window_chunks = request->window_chunks();
 
   std::string fallback_peer_ip;
   if (spec.consumer_ips.empty()) {
@@ -167,6 +194,9 @@ grpc::Status KVCacheControlPlaneServiceImpl::PullStream(
   if (!result.ok()) {
     response->set_status(-1);
     response->set_message(std::string(result.status().message()));
+    if (auto r = ParseStagingWindowRejectedReason(result.status().message())) {
+      response->set_staging_window_rejected_reason(*r);
+    }
     return grpc::Status::OK;
   }
 
@@ -174,6 +204,19 @@ grpc::Status KVCacheControlPlaneServiceImpl::PullStream(
   response->set_num_layers(result->num_layers);
   response->set_data_port(result->data_port);
   response->set_message(result->message);
+  if (result->staging_window_ack.has_value()) {
+    response->set_staging_window_ack(
+        FormatStagingWindowAck(result->staging_window_ack->chunk_blocks,
+                               result->staging_window_ack->window_chunks));
+  } else if (result->status == 0 && !result->message.empty()) {
+    response->set_staging_window_ack(result->message);
+  }
+  if (result->staging_window_rejected_reason.has_value()) {
+    response->set_staging_window_rejected_reason(
+        *result->staging_window_rejected_reason);
+  } else if (auto r = ParseStagingWindowRejectedReason(result->message)) {
+    response->set_staging_window_rejected_reason(*r);
+  }
   return grpc::Status::OK;
 }
 
@@ -192,6 +235,19 @@ grpc::Status KVCacheControlPlaneServiceImpl::Ack(
     return grpc::Status::OK;
   }
   response->set_status(0);
+  return grpc::Status::OK;
+}
+
+grpc::Status KVCacheControlPlaneServiceImpl::GetCapabilities(
+    grpc::ServerContext*, const control_plane::proto::GetCapabilitiesRequest*,
+    control_plane::proto::GetCapabilitiesResponse* response) {
+  if (!handler_) {
+    return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                        "ControlPlaneHandler not initialized");
+  }
+  const ControlPlaneCapabilities caps = handler_->GetCapabilities();
+  response->set_serve_staging_window(caps.serve_staging_window);
+  response->set_max_ring_blocks(caps.max_ring_blocks);
   return grpc::Status::OK;
 }
 
@@ -352,22 +408,68 @@ void GrpcControlPlaneBackend::CancelPendingPulls() {
   // pending_mu_, so cancel outside the lock; the copies keep each context
   // alive until its TryCancel returns.
   std::vector<std::shared_ptr<PendingPull>> to_cancel;
+  std::vector<std::shared_ptr<PendingCapabilities>> to_cancel_caps;
   {
     absl::MutexLock lock(pending_mu_);
     to_cancel.reserve(pending_pulls_.size());
     for (const auto& [call, owned] : pending_pulls_) {
       to_cancel.push_back(owned);
     }
+    for (const auto& [call, owned] : pending_caps_) {
+      to_cancel_caps.push_back(owned);
+    }
   }
   for (const auto& call : to_cancel) {
     call->context.TryCancel();
   }
+  for (const auto& call : to_cancel_caps) {
+    call->context.TryCancel();
+  }
   to_cancel.clear();
+  to_cancel_caps.clear();
   absl::MutexLock lock(pending_mu_);
   pending_mu_.Await(absl::Condition(
-      +[](absl::flat_hash_map<PendingPull*, std::shared_ptr<PendingPull>>*
-              pulls) { return pulls->empty(); },
-      &pending_pulls_));
+      +[](GrpcControlPlaneBackend* b)
+           ABSL_SHARED_LOCKS_REQUIRED(b->pending_mu_) {
+             return b->pending_pulls_.empty() && b->pending_caps_.empty();
+           },
+      this));
+}
+
+tsl::Future<ControlPlaneCapabilities> GrpcControlPlaneBackend::GetCapabilities(
+    absl::string_view remote_endpoint, absl::Duration timeout) {
+  auto [promise, future] = tsl::MakePromise<ControlPlaneCapabilities>();
+  auto owned = std::make_shared<PendingCapabilities>();
+  PendingCapabilities* call = owned.get();
+  call->stub = GetOrCreateStub(remote_endpoint);
+  if (timeout > absl::ZeroDuration()) {
+    call->context.set_deadline(std::chrono::system_clock::now() +
+                               absl::ToChronoMilliseconds(timeout));
+  }
+  call->promise = std::move(promise);
+  {
+    absl::MutexLock lock(pending_mu_);
+    pending_caps_.emplace(call, std::move(owned));
+  }
+  call->stub->async()->GetCapabilities(
+      &call->context, &call->request, &call->response,
+      [this, call](grpc::Status status) {
+        if (status.ok()) {
+          call->promise.Set(ControlPlaneCapabilities{
+              .supported = true,
+              .serve_staging_window = call->response.serve_staging_window(),
+              .max_ring_blocks = call->response.max_ring_blocks()});
+        } else {
+          call->promise.Set(FromGrpcStatus(status));
+        }
+        std::shared_ptr<PendingCapabilities> done;
+        {
+          absl::MutexLock lock(pending_mu_);
+          if (auto n = pending_caps_.extract(call))
+            done = std::move(n.mapped());
+        }
+      });
+  return future;
 }
 
 absl::Status GrpcControlPlaneBackend::SendAck(absl::string_view remote_endpoint,

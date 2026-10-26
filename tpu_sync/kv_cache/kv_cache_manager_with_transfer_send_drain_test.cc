@@ -35,10 +35,12 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/log_severity.h"
+#include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/log/check.h"
 #include "absl/log/scoped_mock_log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -52,8 +54,10 @@
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/staging_window.h"
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
 #include "tpu_sync/kv_cache/transfer_send_session.h"
+#include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
 namespace {
@@ -101,7 +105,10 @@ class TestManager : public KVCacheManagerWithTransfer {
   // Completes the `index`-th copy issued.
   void FinishCopy(size_t index, absl::Status status) {
     absl::MutexLock lock(copies_mu_);
-    copies_.at(index).Set(std::move(status));
+    CHECK_LT(index, copies_.size())
+        << "FinishCopy index " << index << " out of bounds (" << copies_.size()
+        << ")";
+    copies_[index].Set(std::move(status));
   }
 
   size_t free_slots() { return staging_allocator_->num_free_slots(); }
@@ -181,11 +188,15 @@ class TestManager : public KVCacheManagerWithTransfer {
 // A consumer whose host-to-device copies complete when the test says so.
 class RecvTestManager : public KVCacheManagerWithTransfer {
  public:
-  explicit RecvTestManager(size_t num_layers, double timeout_s = 5.0)
-      : KVCacheManagerWithTransfer(std::make_unique<RecvBase>(num_layers, this),
-                                   /*node_id=*/0,
-                                   /*local_control_port=*/-1, /*max_blocks=*/1,
-                                   /*num_slots=*/kSlots, timeout_s) {}
+  explicit RecvTestManager(
+      size_t num_layers, double timeout_s = 5.0, size_t num_slots = kSlots,
+      size_t num_shards = 1,
+      std::optional<StagingWindowConfig> staging_window_config = std::nullopt)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<RecvBase>(num_layers, num_slots, num_shards, this),
+            /*node_id=*/0, /*local_control_port=*/-1, /*max_blocks=*/1,
+            num_slots, timeout_s, /*metrics_collector=*/nullptr,
+            staging_window_config) {}
 
   void AddRecv(const std::string& req_id, uint64_t uuid,
                int32_t blocks_per_layer = 1,
@@ -195,6 +206,35 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     active_recv_sessions_[uuid] = *TransferReceiveSession::Create(
         base(), staging_allocator_.get(), uuid, req_id, blocks_per_layer,
         deadline.value_or(DeadlineFromNow()), /*acquire_staging=*/true);
+  }
+
+  absl::StatusOr<std::shared_ptr<TransferReceiveSession>> AddWindowedRecv(
+      const std::string& req_id, uint64_t uuid,
+      const std::vector<int64_t>& remote_block_ids,
+      const std::vector<int64_t>& local_block_ids,
+      StagingWindowConfig staging_window_config,
+      std::optional<std::chrono::steady_clock::time_point> deadline =
+          std::nullopt) {
+    ABSL_ASSIGN_OR_RETURN(
+        std::shared_ptr<TransferReceiveSession> session,
+        TransferReceiveSession::Create(
+            base(), staging_allocator_.get(), uuid, req_id, remote_block_ids,
+            local_block_ids, /*local_host_block_ids=*/std::nullopt,
+            deadline.value_or(DeadlineFromNow()), staging_window_config));
+    session->EndRecvOp();
+    absl::MutexLock lock(mu_);
+    active_recv_sessions_[uuid] = session;
+    return session;
+  }
+
+  void InsertPoolReshardRecv(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    active_pool_reshard_recvs_[uuid] = nullptr;
+  }
+
+  void ErasePoolReshardRecv(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    active_pool_reshard_recvs_.erase(uuid);
   }
 
   absl::Status ReceiveLayer(size_t layer, uint64_t uuid) {
@@ -209,7 +249,10 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
 
   void FinishCopy(size_t index, absl::Status status) {
     absl::MutexLock lock(copies_mu_);
-    copies_.at(index).Set(std::move(status));
+    CHECK_LT(index, copies_.size())
+        << "FinishCopy index " << index << " out of bounds (" << copies_.size()
+        << ")";
+    copies_[index].Set(std::move(status));
   }
 
   size_t copies_issued() {
@@ -226,6 +269,24 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     absl::MutexLock lock(mu_);
     auto it = active_recv_sessions_.find(uuid);
     return it != active_recv_sessions_.end() && !it->second->Done();
+  }
+
+  std::shared_ptr<TransferReceiveSession> GetRecvSession(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    auto it = active_recv_sessions_.find(uuid);
+    return it != active_recv_sessions_.end() ? it->second : nullptr;
+  }
+
+  struct IssuedCopy {
+    std::vector<int64_t> src_offsets;
+    std::vector<int64_t> dst_offsets;
+    std::vector<int64_t> sizes;
+    std::optional<size_t> layer_idx;
+  };
+
+  std::vector<IssuedCopy> issued_copies() {
+    absl::MutexLock lock(copies_mu_);
+    return issued_copies_;
   }
 
   void FailRecv(uint64_t uuid, absl::Status status) {
@@ -252,11 +313,12 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
  private:
   class RecvBase : public kv_cache::KVCacheManagerBase {
    public:
-    RecvBase(size_t num_layers, RecvTestManager* owner)
-        : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
+    RecvBase(size_t num_layers, size_t num_slots, size_t num_shards,
+             RecvTestManager* owner)
+        : kv_cache::KVCacheManagerBase(num_layers, num_shards,
                                        std::vector<size_t>(num_layers, 128),
                                        /*local_port=*/std::nullopt,
-                                       /*host_blocks_to_allocate=*/kSlots,
+                                       /*host_blocks_to_allocate=*/num_slots,
                                        /*parallelism=*/1, nullptr),
           owner_(owner) {}
 
@@ -271,8 +333,13 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
         owner_->release_dispatch_.WaitForNotification();
       }
       auto [promise, future] = xla::MakePromise<>();
-      absl::MutexLock lock(owner_->copies_mu_);
-      owner_->copies_.push_back(std::move(promise));
+      {
+        absl::MutexLock lock(owner_->copies_mu_);
+        owner_->copies_.push_back(std::move(promise));
+        owner_->issued_copies_.push_back({src_offsets_major_dim,
+                                          dst_offsets_major_dim,
+                                          copy_sizes_major_dim, layer_idx});
+      }
       return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
     }
 
@@ -281,7 +348,8 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   };
 
   absl::Mutex copies_mu_;
-  std::vector<xla::Promise<>> copies_;
+  std::vector<xla::Promise<>> copies_ ABSL_GUARDED_BY(copies_mu_);
+  std::vector<IssuedCopy> issued_copies_ ABSL_GUARDED_BY(copies_mu_);
   std::atomic<bool> block_dispatch_{false};
   absl::Notification dispatch_entered_;
   absl::Notification release_dispatch_;
@@ -1092,5 +1160,866 @@ TEST(RecvLifecycleTest,
   EXPECT_FALSE(rejected.ok());
   EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 3)[0], 0x3C);
 }
+
+TEST(RecvWindowAccountingTest, UnitCountReadinessAndPerChunkH2dSubSpec) {
+  RecvTestManager consumer(/*num_layers=*/2);
+  const uint64_t uuid = 101;
+  consumer.AddRecv("req_test_1", uuid, /*blocks_per_layer=*/2);
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+
+  CopySpec spec_c0_l0{{100}, {200}, {1}};
+  CopySpec spec_c0_l1{{101}, {201}, {1}};
+  CopySpec spec_c1_l0{{110}, {210}, {1}};
+  CopySpec spec_c1_l1{{111}, {211}, {1}};
+  std::vector<std::vector<CopySpec>> specs = {
+      {spec_c0_l0, spec_c0_l1},
+      {spec_c1_l0, spec_c1_l1},
+  };
+  ASSERT_THAT(session->SetChunkH2dSpecs(/*n_chunks=*/2, specs),
+              ::absl_testing::IsOk());
+  EXPECT_EQ(session->n_chunks(), 2);
+  EXPECT_EQ(session->ExpectedPushesPerLayer(), 2);
+  EXPECT_EQ(consumer.base()->ExpectedPushesPerLayer(uuid), 2);
+
+  // Unit 0 across all layers.
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+  consumer.FinishCopy(0, absl::OkStatus());
+  ASSERT_THAT(consumer.ReceiveLayer(1, uuid), ::absl_testing::IsOk());
+  consumer.FinishCopy(1, absl::OkStatus());
+
+  EXPECT_EQ(session->units_complete(), 2);
+  EXPECT_EQ(session->h2d_issued(), 2);
+  EXPECT_EQ(session->h2d_ready(), 2);
+  EXPECT_FALSE(session->IsReadyToComplete());
+  EXPECT_FALSE(session->Done());
+
+  // Unit 1 across all layers.
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+  consumer.FinishCopy(2, absl::OkStatus());
+  ASSERT_THAT(consumer.ReceiveLayer(1, uuid), ::absl_testing::IsOk());
+  consumer.FinishCopy(3, absl::OkStatus());
+
+  EXPECT_EQ(session->units_complete(), 4);
+  EXPECT_EQ(session->h2d_issued(), 4);
+  EXPECT_EQ(session->h2d_ready(), 4);
+  EXPECT_TRUE(session->IsReadyToComplete());
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(session->GetStatus(), ::absl_testing::IsOk());
+
+  auto copies = consumer.issued_copies();
+  ASSERT_EQ(copies.size(), 4);
+  EXPECT_EQ(copies[0].src_offsets, spec_c0_l0.src_offsets);
+  EXPECT_EQ(copies[0].dst_offsets, spec_c0_l0.dst_offsets);
+  EXPECT_EQ(copies[1].src_offsets, spec_c0_l1.src_offsets);
+  EXPECT_EQ(copies[1].dst_offsets, spec_c0_l1.dst_offsets);
+  EXPECT_EQ(copies[2].src_offsets, spec_c1_l0.src_offsets);
+  EXPECT_EQ(copies[2].dst_offsets, spec_c1_l0.dst_offsets);
+  EXPECT_EQ(copies[3].src_offsets, spec_c1_l1.src_offsets);
+  EXPECT_EQ(copies[3].dst_offsets, spec_c1_l1.dst_offsets);
+}
+
+TEST(RecvWindowAccountingTest, NetworkCompleteTrueBeforeLastH2dIssuedNotReady) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  const uint64_t uuid = 102;
+  consumer.AddRecv("req_test_2", uuid, /*blocks_per_layer=*/2);
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+  ASSERT_THAT(session->SetChunkH2dSpecs(/*n_chunks=*/2),
+              ::absl_testing::IsOk());
+  EXPECT_EQ(session->n_chunks(), 2);
+
+  // Unit 0 arrives and finishes H2D.
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+  consumer.FinishCopy(0, absl::OkStatus());
+  EXPECT_EQ(session->units_complete(), 1);
+  EXPECT_EQ(session->h2d_issued(), 1);
+  EXPECT_EQ(session->h2d_ready(), 1);
+
+  // Unit 1 arrives, but pause inside H2dSyncDispatch so units_complete_ is 2
+  // while h2d_issued_ is still 1 and h2d_ready_ is 1.
+  consumer.BlockH2dDispatch();
+  auto receive_unit1 = std::async(std::launch::async, [&consumer] {
+    return consumer.ReceiveLayer(0, uuid);
+  });
+  DispatchReleaseGuard release_guard(&consumer);
+  ASSERT_TRUE(consumer.WaitForH2dDispatch(absl::Seconds(5)));
+
+  // While paused inside H2dSyncDispatch, units_complete_ == total_units (2)
+  // and h2d_ready_ == h2d_issued_ (1 == 1), isolating the h2d_issued_ ==
+  // total_units clause.
+  EXPECT_EQ(session->units_complete(), 2);
+  EXPECT_EQ(session->h2d_issued(), 1);
+  EXPECT_EQ(session->h2d_ready(), 1);
+
+  // All blocks received on transport -> network_completed_ becomes true.
+  ASSERT_THAT(consumer.ReceiveBlocks({0, 1}, uuid), ::absl_testing::IsOk());
+  EXPECT_FALSE(session->IsReadyToComplete());
+  EXPECT_FALSE(session->Done());
+
+  // Release H2D dispatch and wait for unit 1's ReceiveLayer to return.
+  release_guard.Release();
+  ASSERT_EQ(receive_unit1.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  ASSERT_THAT(receive_unit1.get(), ::absl_testing::IsOk());
+  EXPECT_EQ(session->units_complete(), 2);
+  EXPECT_EQ(session->h2d_issued(), 2);
+  EXPECT_EQ(session->h2d_ready(), 1);
+  EXPECT_FALSE(session->IsReadyToComplete());
+  EXPECT_FALSE(session->Done());
+
+  // Finish unit 1's H2D -> now all units and H2D done.
+  consumer.FinishCopy(1, absl::OkStatus());
+  EXPECT_EQ(session->h2d_ready(), 2);
+  EXPECT_TRUE(session->IsReadyToComplete());
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(session->GetStatus(), ::absl_testing::IsOk());
+}
+
+TEST(RecvWindowAccountingTest, OutOfOrderUnitH2dCompletion) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  const uint64_t uuid = 103;
+  consumer.AddRecv("req_test_3", uuid, /*blocks_per_layer=*/2);
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+  ASSERT_THAT(session->SetChunkH2dSpecs(/*n_chunks=*/2),
+              ::absl_testing::IsOk());
+
+  // Issue unit 0 and unit 1 so both copies are in flight.
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+  EXPECT_EQ(session->units_complete(), 2);
+  EXPECT_EQ(session->h2d_issued(), 2);
+  EXPECT_EQ(session->h2d_ready(), 0);
+
+  // Complete unit 1's copy first (out of order).
+  consumer.FinishCopy(1, absl::OkStatus());
+  EXPECT_EQ(session->h2d_ready(), 1);
+  EXPECT_FALSE(session->IsReadyToComplete());
+  EXPECT_FALSE(session->Done());
+
+  // Complete unit 0's copy.
+  consumer.FinishCopy(0, absl::OkStatus());
+  EXPECT_EQ(session->h2d_ready(), 2);
+  EXPECT_TRUE(session->IsReadyToComplete());
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(session->GetStatus(), ::absl_testing::IsOk());
+}
+
+TEST(RecvWindowAccountingTest, LateH2dCallbackIsSafeNoOp) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  const uint64_t uuid = 104;
+  consumer.AddRecv("req_test_4", uuid, /*blocks_per_layer=*/1);
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+
+  // Issue H2D for layer 0.
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+  EXPECT_EQ(consumer.copies_issued(), 1);
+
+  // Fail/cancel the session while H2D is in flight.
+  const absl::Status cancel_status =
+      absl::CancelledError("cancelled during test");
+  consumer.FailRecv(uuid, cancel_status);
+  EXPECT_EQ(session->GetStatus().code(), absl::StatusCode::kCancelled);
+
+  // Resolve the in-flight H2D future afterwards.
+  consumer.FinishCopy(0, absl::OkStatus());
+
+  // Terminal status is preserved and not overwritten; no crash.
+  EXPECT_EQ(session->GetStatus().code(), absl::StatusCode::kCancelled);
+  EXPECT_THAT(session->GetStatus().message(),
+              ::testing::HasSubstr("cancelled during test"));
+}
+
+TEST(RecvWindowAccountingTest, WindowOffDefaultsToOnePushPerLayer) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  const uint64_t uuid = 105;
+  consumer.AddRecv("req_test_5", uuid, /*blocks_per_layer=*/1);
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+
+  EXPECT_EQ(session->ExpectedPushesPerLayer(), 1);
+  EXPECT_EQ(consumer.base()->ExpectedPushesPerLayer(uuid), 1);
+  EXPECT_EQ(consumer.base()->ExpectedPushesPerLayer(0), 1);
+  EXPECT_EQ(consumer.base()->ExpectedPushesPerLayer(99999), 1);
+}
+
+TEST(RecvWindowAccountingTest, ExtraReceiveLayerBeyondNChunksFails) {
+  RecvTestManager consumer(/*num_layers=*/2);
+  const uint64_t uuid = 106;
+  consumer.AddRecv("req_test_extra", uuid, /*blocks_per_layer=*/1);
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+  ASSERT_THAT(session->SetChunkH2dSpecs(/*n_chunks=*/1),
+              ::absl_testing::IsOk());
+  EXPECT_EQ(session->n_chunks(), 1);
+
+  // First unit succeeds.
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+  consumer.FinishCopy(0, absl::OkStatus());
+
+  // Session remains live because layer 1 has not completed yet.
+  EXPECT_FALSE(session->Done());
+
+  // Extra ReceiveLayer call beyond n_chunks_ (1) fails with
+  // kFailedPrecondition.
+  absl::Status status = consumer.ReceiveLayer(0, uuid);
+  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(status.message(),
+              ::testing::HasSubstr("already received all 1 units"));
+  EXPECT_TRUE(session->Done());
+  EXPECT_EQ(session->GetStatus().code(), absl::StatusCode::kFailedPrecondition);
+}
+
+TEST(RecvWindowAccountingTest, SetChunkH2dSpecsValidationAndMidFlight) {
+  RecvTestManager consumer(/*num_layers=*/2);
+  const uint64_t uuid = 107;
+  consumer.AddRecv("req_test_specs", uuid, /*blocks_per_layer=*/2);
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+
+  // n_chunks < 1 returns kInvalidArgument.
+  EXPECT_EQ(session->SetChunkH2dSpecs(/*n_chunks=*/0).code(),
+            absl::StatusCode::kInvalidArgument);
+
+  // Outer dimension mismatch: n_chunks = 2, but specs has 1 chunk.
+  CopySpec spec{{100}, {200}, {1}};
+  EXPECT_EQ(session->SetChunkH2dSpecs(/*n_chunks=*/2, {{spec, spec}}).code(),
+            absl::StatusCode::kInvalidArgument);
+
+  // Inner dimension mismatch: n_chunks = 2, chunk 0 has 2 layers, but chunk 1
+  // has 1 layer (expected 2).
+  EXPECT_EQ(
+      session->SetChunkH2dSpecs(/*n_chunks=*/2, {{spec, spec}, {spec}}).code(),
+      absl::StatusCode::kInvalidArgument);
+
+  // Valid specs config succeeds.
+  std::vector<std::vector<CopySpec>> valid_specs = {
+      {spec, spec},
+      {spec, spec},
+  };
+  ASSERT_THAT(session->SetChunkH2dSpecs(/*n_chunks=*/2, valid_specs),
+              ::absl_testing::IsOk());
+  EXPECT_EQ(session->n_chunks(), 2);
+
+  // Start receiving a unit (mid-flight).
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+
+  // Mutating chunk config mid-flight (units_complete_ > 0 || h2d_issued_ > 0)
+  // returns kFailedPrecondition.
+  EXPECT_EQ(session->SetChunkH2dSpecs(/*n_chunks=*/2, valid_specs).code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  consumer.FinishCopy(0, absl::OkStatus());
+}
+
+TEST(RecvWindowGateTest, ShardGroupG2AdmittedAndClaimResetOnUnitComplete) {
+  constexpr size_t kNumLayers = 1;
+  constexpr size_t kNumShards = 2;
+  constexpr size_t kNumSlots = 64;
+  RecvTestManager consumer(
+      kNumLayers, /*timeout_s=*/5.0, kNumSlots, kNumShards,
+      StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2});
+  const uint64_t uuid = 201;
+
+  // Windowed session: k = 4, C = 2, W = 2 -> 2 chunks.
+  const std::vector<int64_t> remote_bids = {0, 1, 2, 3};
+  const std::vector<int64_t> local_bids = {10, 11, 12, 13};
+  ASSERT_THAT(consumer.AddWindowedRecv(
+                  "req_g2", uuid, remote_bids, local_bids,
+                  StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2}),
+              ::absl_testing::IsOk());
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+  EXPECT_TRUE(session->IsWindowed());
+
+  const std::vector<int64_t> transport_host_bids =
+      session->transport_host_block_ids();
+  ASSERT_EQ(transport_host_bids.size(), 4);
+
+  // Unit 0: chunk 0 maps to slot 0 -> blocks {transport_host_bids[0],
+  // transport_host_bids[1]}.
+  const std::vector<int64_t> chunk0_bids = {transport_host_bids[0],
+                                            transport_host_bids[1]};
+  const absl::Time deadline = absl::InfiniteFuture();
+
+  // Stream 0: shard 0 in G=2. Admitted.
+  EXPECT_THAT(
+      consumer.base()->AwaitIncomingPushSlot(uuid, /*layer_idx=*/0, chunk0_bids,
+                                             /*stream_shards=*/{0}, deadline),
+      ::absl_testing::IsOk());
+
+  // Stream 1: shard 1 in G=2. Disjoint shard, identical dst_ids. Admitted.
+  EXPECT_THAT(
+      consumer.base()->AwaitIncomingPushSlot(uuid, /*layer_idx=*/0, chunk0_bids,
+                                             /*stream_shards=*/{1}, deadline),
+      ::absl_testing::IsOk());
+
+  // Duplicate claim within unit 0 for stream 0 (shard 0) is rejected.
+  absl::Status dup_status = consumer.base()->AwaitIncomingPushSlot(
+      uuid, /*layer_idx=*/0, chunk0_bids, /*stream_shards=*/{0}, deadline);
+  EXPECT_EQ(dup_status.code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(
+      dup_status.message(),
+      ::testing::HasSubstr("re-claims staging (position, shard) pairs"));
+  EXPECT_THAT(dup_status.message(),
+              ::testing::HasSubstr("peer window mismatch"));
+  EXPECT_TRUE(session->Done());
+  EXPECT_EQ(session->Details().phase, "gate");
+
+  // Reset/test unit 1 on a fresh session: verify claim set resets on unit
+  // completion.
+  const uint64_t uuid2 = 202;
+  ASSERT_THAT(consumer.AddWindowedRecv(
+                  "req_g2_unit1", uuid2, remote_bids, local_bids,
+                  StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2}),
+              ::absl_testing::IsOk());
+  auto session2 = consumer.GetRecvSession(uuid2);
+  ASSERT_NE(session2, nullptr);
+
+  const std::vector<int64_t> host_bids2 = session2->transport_host_block_ids();
+  const std::vector<int64_t> chunk0_bids2 = {host_bids2[0], host_bids2[1]};
+  const std::vector<int64_t> chunk1_bids2 = {host_bids2[2], host_bids2[3]};
+
+  // Unit 0 admissions for G=2.
+  ASSERT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid2, /*layer_idx=*/0, chunk0_bids2, {0}, deadline),
+              ::absl_testing::IsOk());
+  ASSERT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid2, /*layer_idx=*/0, chunk0_bids2, {1}, deadline),
+              ::absl_testing::IsOk());
+
+  // Complete unit 0.
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid2), ::absl_testing::IsOk());
+  consumer.FinishCopy(consumer.copies_issued() - 1, absl::OkStatus());
+
+  // Unit 1: claim set has reset; stream 0 and 1 admitted for chunk 1.
+  EXPECT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid2, /*layer_idx=*/0, chunk1_bids2, {0}, deadline),
+              ::absl_testing::IsOk());
+  EXPECT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid2, /*layer_idx=*/0, chunk1_bids2, {1}, deadline),
+              ::absl_testing::IsOk());
+
+  // Duplicate for unit 1 rejected.
+  absl::Status dup1 = consumer.base()->AwaitIncomingPushSlot(
+      uuid2, /*layer_idx=*/0, chunk1_bids2, {0}, deadline);
+  EXPECT_EQ(dup1.code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(dup1.message(), ::testing::HasSubstr(
+                                  "re-claims staging (position, shard) pairs"));
+  EXPECT_TRUE(session2->Done());
+  EXPECT_EQ(session2->Details().phase, "gate");
+}
+
+TEST(RecvWindowGateTest, IntraStreamDuplicatePositionClaimRejected) {
+  constexpr size_t kNumLayers = 1;
+  constexpr size_t kNumShards = 1;
+  constexpr size_t kNumSlots = 64;
+  RecvTestManager consumer(
+      kNumLayers, /*timeout_s=*/5.0, kNumSlots, kNumShards,
+      StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2});
+  const uint64_t uuid = 203;
+
+  // Windowed session: k = 4, C = 2, W = 2 -> 2 chunks.
+  const std::vector<int64_t> remote_bids = {0, 1, 2, 3};
+  const std::vector<int64_t> local_bids = {10, 11, 12, 13};
+  ASSERT_THAT(consumer.AddWindowedRecv(
+                  "req_intra_dup", uuid, remote_bids, local_bids,
+                  StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2}),
+              ::absl_testing::IsOk());
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+  EXPECT_TRUE(session->IsWindowed());
+
+  const std::vector<int64_t> host_bids = session->transport_host_block_ids();
+  ASSERT_EQ(host_bids.size(), 4);
+
+  // The first stream of the unit passes duplicate destination block IDs
+  // belonging to ring[0] with |dst_ids| <= C_c ({host_bids[0], host_bids[0]}).
+  // This exercises the intra-stream duplicate claim branch
+  // (!new_claims.insert(key).second) at transfer_receive_session.cc:760.
+  const std::vector<int64_t> duplicate_dst_bids = {host_bids[0], host_bids[0]};
+  const absl::Time deadline = absl::InfiniteFuture();
+
+  absl::Status status = consumer.base()->AwaitIncomingPushSlot(
+      uuid, /*layer_idx=*/0, duplicate_dst_bids, /*stream_shards=*/{0},
+      deadline);
+  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(
+      status.message(),
+      ::testing::HasSubstr("re-claims staging (position, shard) pairs"));
+  EXPECT_TRUE(session->Done());
+  EXPECT_EQ(session->Details().phase, "gate");
+}
+
+TEST(RecvWindowGateTest, LegacySenderFailSafeW1C64K256) {
+  constexpr size_t kNumLayers = 1;
+  constexpr size_t kNumSlots = 512;
+  const absl::Time deadline = absl::InfiniteFuture();
+
+  for (int p_parallelism : {4, 2, 1}) {
+    for (int g_shards : {1, 2}) {
+      RecvTestManager consumer(
+          kNumLayers, /*timeout_s=*/5.0, kNumSlots,
+          /*num_shards=*/g_shards,
+          StagingWindowConfig{.window_chunks = 1, .chunk_blocks = 64});
+      const uint64_t uuid = 300 + p_parallelism * 10 + g_shards;
+      std::vector<int64_t> remote_bids(256);
+      std::vector<int64_t> local_bids(256);
+      std::iota(remote_bids.begin(), remote_bids.end(), 0);
+      std::iota(local_bids.begin(), local_bids.end(), 1000);
+
+      ASSERT_THAT(
+          consumer.AddWindowedRecv(
+              absl::StrCat("req_fail_safe_w1_p", p_parallelism, "_g", g_shards),
+              uuid, remote_bids, local_bids,
+              StagingWindowConfig{.window_chunks = 1, .chunk_blocks = 64}),
+          ::absl_testing::IsOk());
+      auto session = consumer.GetRecvSession(uuid);
+      ASSERT_NE(session, nullptr);
+      const std::vector<int64_t> host_bids =
+          session->transport_host_block_ids();
+      ASSERT_EQ(host_bids.size(), 256);
+
+      const size_t stream_size = 256 / p_parallelism;
+      if (p_parallelism == 4) {
+        // stream_size = 64 == C_0.
+        // Stream 0 (or G streams for chunk 0) admitted.
+        const std::vector<int64_t> chunk0_bids(host_bids.begin(),
+                                               host_bids.begin() + 64);
+        for (int g = 0; g < g_shards; ++g) {
+          EXPECT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                          uuid, /*layer_idx=*/0, chunk0_bids, {g}, deadline),
+                      ::absl_testing::IsOk())
+              << "Failed for P=" << p_parallelism << " G=" << g_shards
+              << " shard=" << g;
+        }
+
+        // Remaining streams (e.g. stream for chunk 1: host_bids[64..127]) are
+        // rejected because the receiver is still at unit 0.
+        const std::vector<int64_t> chunk1_bids(host_bids.begin() + 64,
+                                               host_bids.begin() + 128);
+        absl::Status rej_status = consumer.base()->AwaitIncomingPushSlot(
+            uuid, /*layer_idx=*/0, chunk1_bids, {0}, deadline);
+        EXPECT_EQ(rej_status.code(), absl::StatusCode::kFailedPrecondition);
+        EXPECT_THAT(rej_status.message(),
+                    ::testing::HasSubstr("peer window mismatch"));
+        EXPECT_TRUE(session->Done());
+        EXPECT_EQ(session->Details().phase, "gate");
+        EXPECT_EQ(consumer.copies_issued(), 0);
+      } else {
+        // P in {2, 1}: stream_size > C_0 (128 or 256 > 64). Zero streams
+        // admitted.
+        const std::vector<int64_t> oversized_bids(
+            host_bids.begin(), host_bids.begin() + stream_size);
+        absl::Status rej_status = consumer.base()->AwaitIncomingPushSlot(
+            uuid, /*layer_idx=*/0, oversized_bids, {0}, deadline);
+        EXPECT_EQ(rej_status.code(), absl::StatusCode::kFailedPrecondition);
+        EXPECT_THAT(rej_status.message(),
+                    ::testing::HasSubstr("peer window mismatch"));
+        EXPECT_TRUE(session->Done());
+        EXPECT_EQ(session->Details().phase, "gate");
+        EXPECT_EQ(consumer.copies_issued(), 0);
+      }
+    }
+  }
+}
+
+TEST(RecvWindowGateTest, LegacySenderFailSafeW2C64K256) {
+  constexpr size_t kNumLayers = 1;
+  constexpr size_t kNumSlots = 512;
+  const absl::Time deadline = absl::InfiniteFuture();
+  RecvTestManager consumer(
+      kNumLayers, /*timeout_s=*/5.0, kNumSlots,
+      /*num_shards=*/1,
+      StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 64});
+  const uint64_t uuid = 401;
+
+  std::vector<int64_t> remote_bids(256);
+  std::vector<int64_t> local_bids(256);
+  std::iota(remote_bids.begin(), remote_bids.end(), 0);
+  std::iota(local_bids.begin(), local_bids.end(), 1000);
+
+  ASSERT_THAT(consumer.AddWindowedRecv(
+                  "req_fail_safe_w2", uuid, remote_bids, local_bids,
+                  StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 64}),
+              ::absl_testing::IsOk());
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+  const std::vector<int64_t> host_bids = session->transport_host_block_ids();
+  ASSERT_EQ(host_bids.size(), 256);
+
+  // Stream 0: chunk 0 in slot 0 (blocks 0..63) -> admitted.
+  const std::vector<int64_t> stream0_bids(host_bids.begin(),
+                                          host_bids.begin() + 64);
+  EXPECT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid, /*layer_idx=*/0, stream0_bids, {0}, deadline),
+              ::absl_testing::IsOk());
+
+  // Stream 1: chunk 1 in slot 1 (blocks 64..127).
+  // Rejected because receiver is still at unit 0 (unit 0 H2D has not
+  // completed).
+  const std::vector<int64_t> stream1_bids(host_bids.begin() + 64,
+                                          host_bids.begin() + 128);
+  absl::Status status = consumer.base()->AwaitIncomingPushSlot(
+      uuid, /*layer_idx=*/0, stream1_bids, {0}, deadline);
+  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(status.message(), ::testing::HasSubstr("peer window mismatch"));
+  EXPECT_TRUE(session->Done());
+  EXPECT_EQ(session->Details().phase, "gate");
+}
+
+TEST(RecvWindowGateTest, HookNoOpForUuidZeroPlanAndPoolReshard) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  const absl::Time deadline = absl::InfiniteFuture();
+  const std::vector<int64_t> arbitrary_bids = {123, 456};
+  const std::vector<int32_t> shards = {0};
+
+  // 1. uuid == 0: always returns OkStatus().
+  EXPECT_THAT(
+      consumer.base()->AwaitIncomingPushSlot(
+          /*uuid=*/0, /*layer_idx=*/0, arbitrary_bids, shards, deadline),
+      ::absl_testing::IsOk());
+
+  // 2. Unknown uuid (no session registered): returns OkStatus().
+  EXPECT_THAT(
+      consumer.base()->AwaitIncomingPushSlot(
+          /*uuid=*/99999, /*layer_idx=*/0, arbitrary_bids, shards, deadline),
+      ::absl_testing::IsOk());
+
+  // 3. Active-plan push: returns OkStatus().
+  constexpr uint64_t kPlanUuid = 777;
+  ::tpu_sync::rpc::StartTransferRequest plan;
+  plan.set_uuid(kPlanUuid);
+  plan.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  ASSERT_THAT(consumer.RegisterActivePlan(kPlanUuid, plan, /*is_sender=*/false),
+              ::absl_testing::IsOk());
+  EXPECT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  kPlanUuid, /*layer_idx=*/0, arbitrary_bids, shards, deadline),
+              ::absl_testing::IsOk());
+  ASSERT_THAT(consumer.UnregisterActivePlan(kPlanUuid), ::absl_testing::IsOk());
+
+  // 4. Pool-reshard push: returns OkStatus().
+  constexpr uint64_t kPoolUuid = 888;
+  consumer.InsertPoolReshardRecv(kPoolUuid);
+  EXPECT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  kPoolUuid, /*layer_idx=*/0, arbitrary_bids, shards, deadline),
+              ::absl_testing::IsOk());
+  consumer.ErasePoolReshardRecv(kPoolUuid);
+}
+
+TEST(RecvWindowGateTest, ReceiverGateBlocksUntilH2dDone) {
+  constexpr size_t kNumLayers = 1;
+  constexpr size_t kNumShards = 1;
+  constexpr size_t kNumSlots = 64;
+  RecvTestManager consumer(
+      kNumLayers, /*timeout_s=*/5.0, kNumSlots, kNumShards,
+      StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2});
+  const uint64_t uuid = 701;
+
+  // Windowed session: k = 7, C = 2, W = 2 -> 4 chunks. Ring = 4 blocks.
+  const std::vector<int64_t> remote_bids = {0, 1, 2, 3, 4, 5, 6};
+  const std::vector<int64_t> local_bids = {10, 11, 12, 13, 14, 15, 16};
+  ASSERT_THAT(consumer.AddWindowedRecv(
+                  "req_gate_block", uuid, remote_bids, local_bids,
+                  StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2}),
+              ::absl_testing::IsOk());
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+  EXPECT_TRUE(session->IsWindowed());
+
+  const std::vector<int64_t> host_bids = session->transport_host_block_ids();
+  ASSERT_EQ(host_bids.size(), 7);
+
+  // Chunk 0: slot 0 (blocks host_bids[0], host_bids[1])
+  // Chunk 1: slot 1 (blocks host_bids[2], host_bids[3])
+  // Chunk 2: slot 0 (blocks host_bids[0], host_bids[1])
+  const std::vector<int64_t> chunk0_bids = {host_bids[0], host_bids[1]};
+  const std::vector<int64_t> chunk1_bids = {host_bids[2], host_bids[3]};
+  const std::vector<int64_t> chunk2_bids = {host_bids[0], host_bids[1]};
+  const absl::Time deadline = absl::InfiniteFuture();
+
+  // Chunk 0 passes gate without waiting (needed_done = 0).
+  EXPECT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid, /*layer_idx=*/0, chunk0_bids, {0}, deadline),
+              ::absl_testing::IsOk());
+  // Land and complete unit 0: issues H2D for chunk 0 into copies_[0].
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+
+  // Chunk 1 passes gate without waiting (slot 1, needed_done = 0).
+  EXPECT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid, /*layer_idx=*/0, chunk1_bids, {0}, deadline),
+              ::absl_testing::IsOk());
+  // Land and complete unit 1: advances recv_gen_[0] to 2 so chunk 2 can be
+  // gated.
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+
+  // Chunk 2 requires h2d_done_[0][0] >= 1. Currently 0, so it must block.
+  std::atomic<bool> gate_returned{false};
+  absl::Status gate_status;
+  std::thread t([&]() {
+    gate_status = consumer.base()->AwaitIncomingPushSlot(
+        uuid, /*layer_idx=*/0, chunk2_bids, {0}, deadline);
+    gate_returned.store(true);
+  });
+
+  // Verify gate is blocked.
+  absl::SleepFor(absl::Milliseconds(50));
+  EXPECT_FALSE(gate_returned.load());
+
+  // Complete chunk 0 H2D: FinishCopy(0).
+  consumer.FinishCopy(0, absl::OkStatus());
+
+  t.join();
+  EXPECT_TRUE(gate_returned.load());
+  EXPECT_THAT(gate_status, ::absl_testing::IsOk());
+  EXPECT_EQ(session->h2d_done(0, 0), 1);
+  consumer.FinishCopy(1, absl::OkStatus());
+}
+
+TEST(RecvWindowGateTest, ReceiverGateCancelledWhenDraining) {
+  constexpr size_t kNumLayers = 1;
+  constexpr size_t kNumShards = 1;
+  constexpr size_t kNumSlots = 64;
+  RecvTestManager consumer(
+      kNumLayers, /*timeout_s=*/5.0, kNumSlots, kNumShards,
+      StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2});
+  const uint64_t uuid = 702;
+
+  const std::vector<int64_t> remote_bids = {0, 1, 2, 3, 4, 5, 6};
+  const std::vector<int64_t> local_bids = {10, 11, 12, 13, 14, 15, 16};
+  ASSERT_THAT(consumer.AddWindowedRecv(
+                  "req_gate_cancel", uuid, remote_bids, local_bids,
+                  StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2}),
+              ::absl_testing::IsOk());
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+
+  const std::vector<int64_t> host_bids = session->transport_host_block_ids();
+  const std::vector<int64_t> chunk0_bids = {host_bids[0], host_bids[1]};
+  const std::vector<int64_t> chunk1_bids = {host_bids[2], host_bids[3]};
+  const std::vector<int64_t> chunk2_bids = {host_bids[0], host_bids[1]};
+  const absl::Time deadline = absl::InfiniteFuture();
+
+  ASSERT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid, /*layer_idx=*/0, chunk0_bids, {0}, deadline),
+              ::absl_testing::IsOk());
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+
+  ASSERT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid, /*layer_idx=*/0, chunk1_bids, {0}, deadline),
+              ::absl_testing::IsOk());
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+
+  // Chunk 2 blocks at gate.
+  std::atomic<bool> gate_returned{false};
+  absl::Status gate_status;
+  std::thread t([&]() {
+    gate_status = consumer.base()->AwaitIncomingPushSlot(
+        uuid, /*layer_idx=*/0, chunk2_bids, {0}, deadline);
+    gate_returned.store(true);
+  });
+
+  absl::SleepFor(absl::Milliseconds(50));
+  EXPECT_FALSE(gate_returned.load());
+
+  // Cancel / drain session while chunk 2 is waiting at the gate.
+  consumer.FailRecv(uuid, absl::CancelledError("cancelled during test"));
+
+  t.join();
+  EXPECT_TRUE(gate_returned.load());
+  EXPECT_EQ(gate_status.code(), absl::StatusCode::kCancelled);
+
+  // In-flight H2D copies from chunks 0 and 1 pin staging; Done() remains false.
+  EXPECT_FALSE(session->Done());
+  consumer.FinishCopy(0, absl::OkStatus());
+  EXPECT_FALSE(session->Done());
+  consumer.FinishCopy(1, absl::OkStatus());
+  EXPECT_TRUE(session->Done());
+
+  // Originating failure was the external cancel; first error wins per Q7,
+  // so phase reflects the cancel time ("connect"), not the gate waiter wake.
+  EXPECT_EQ(session->Details().phase, "connect");
+}
+
+TEST(RecvWindowGateTest, ReceiverGateTimeoutPhaseGate) {
+  constexpr size_t kNumLayers = 1;
+  constexpr size_t kNumShards = 1;
+  constexpr size_t kNumSlots = 64;
+  RecvTestManager consumer(
+      kNumLayers, /*timeout_s=*/5.0, kNumSlots, kNumShards,
+      StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2});
+  const uint64_t uuid = 703;
+
+  const std::vector<int64_t> remote_bids = {0, 1, 2, 3, 4, 5, 6};
+  const std::vector<int64_t> local_bids = {10, 11, 12, 13, 14, 15, 16};
+  ASSERT_THAT(consumer.AddWindowedRecv(
+                  "req_gate_timeout", uuid, remote_bids, local_bids,
+                  StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2}),
+              ::absl_testing::IsOk());
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+
+  const std::vector<int64_t> host_bids = session->transport_host_block_ids();
+  const std::vector<int64_t> chunk0_bids = {host_bids[0], host_bids[1]};
+  const std::vector<int64_t> chunk1_bids = {host_bids[2], host_bids[3]};
+  const std::vector<int64_t> chunk2_bids = {host_bids[0], host_bids[1]};
+  const absl::Time deadline = absl::InfiniteFuture();
+
+  ASSERT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid, /*layer_idx=*/0, chunk0_bids, {0}, deadline),
+              ::absl_testing::IsOk());
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+
+  ASSERT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid, /*layer_idx=*/0, chunk1_bids, {0}, deadline),
+              ::absl_testing::IsOk());
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+
+  // Chunk 2 arrives with a short 50ms deadline.
+  const absl::Time short_deadline = absl::Now() + absl::Milliseconds(50);
+  absl::Status status = consumer.base()->AwaitIncomingPushSlot(
+      uuid, /*layer_idx=*/0, chunk2_bids, {0}, short_deadline);
+  EXPECT_EQ(status.code(), absl::StatusCode::kDeadlineExceeded);
+  EXPECT_EQ(session->Details().phase, "gate");
+
+  // Outstanding H2D copies for chunks 0 and 1 keep Done() false until drained.
+  EXPECT_FALSE(session->Done());
+  consumer.FinishCopy(0, absl::OkStatus());
+  EXPECT_FALSE(session->Done());
+  consumer.FinishCopy(1, absl::OkStatus());
+  EXPECT_TRUE(session->Done());
+}
+
+TEST(RecvWindowGateTest, ReceiverGateWaitOver1msCounted) {
+  constexpr size_t kNumLayers = 1;
+  constexpr size_t kNumShards = 1;
+  constexpr size_t kNumSlots = 64;
+  RecvTestManager consumer(
+      kNumLayers, /*timeout_s=*/5.0, kNumSlots, kNumShards,
+      StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2});
+  const uint64_t uuid = 704;
+
+  const std::vector<int64_t> remote_bids = {0, 1, 2, 3, 4, 5, 6};
+  const std::vector<int64_t> local_bids = {10, 11, 12, 13, 14, 15, 16};
+  ASSERT_THAT(consumer.AddWindowedRecv(
+                  "req_gate_wait_count", uuid, remote_bids, local_bids,
+                  StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2}),
+              ::absl_testing::IsOk());
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+
+  const std::vector<int64_t> host_bids = session->transport_host_block_ids();
+  const std::vector<int64_t> chunk0_bids = {host_bids[0], host_bids[1]};
+  const std::vector<int64_t> chunk1_bids = {host_bids[2], host_bids[3]};
+  const std::vector<int64_t> chunk2_bids = {host_bids[0], host_bids[1]};
+  const absl::Time deadline = absl::InfiniteFuture();
+
+  ASSERT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid, /*layer_idx=*/0, chunk0_bids, {0}, deadline),
+              ::absl_testing::IsOk());
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+
+  ASSERT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid, /*layer_idx=*/0, chunk1_bids, {0}, deadline),
+              ::absl_testing::IsOk());
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+
+  // Chunk 2 waits at the gate. Sleep for > 1ms (10ms) before completing H2D.
+  std::atomic<bool> gate_returned{false};
+  absl::Status gate_status;
+  std::thread t([&]() {
+    gate_status = consumer.base()->AwaitIncomingPushSlot(
+        uuid, /*layer_idx=*/0, chunk2_bids, {0}, deadline);
+    gate_returned.store(true);
+  });
+
+  absl::SleepFor(absl::Milliseconds(10));
+  EXPECT_FALSE(gate_returned.load());
+
+  consumer.FinishCopy(0, absl::OkStatus());
+
+  t.join();
+  EXPECT_TRUE(gate_returned.load());
+  EXPECT_THAT(gate_status, ::absl_testing::IsOk());
+  EXPECT_GE(session->gate_waits_over_1ms(), 1);
+  EXPECT_EQ(session->h2d_done(0, 0), 1);
+  consumer.FinishCopy(1, absl::OkStatus());
+}
+
+TEST(RecvWindowGateTest, ReceiverGateLockOrderWithPollAndH2dCompletion) {
+  constexpr size_t kNumLayers = 1;
+  constexpr size_t kNumShards = 1;
+  constexpr size_t kNumSlots = 64;
+  RecvTestManager consumer(
+      kNumLayers, /*timeout_s=*/5.0, kNumSlots, kNumShards,
+      StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2});
+  const uint64_t uuid = 705;
+
+  const std::vector<int64_t> remote_bids = {0, 1, 2, 3, 4, 5, 6};
+  const std::vector<int64_t> local_bids = {10, 11, 12, 13, 14, 15, 16};
+  ASSERT_THAT(consumer.AddWindowedRecv(
+                  "req_gate_lock_order", uuid, remote_bids, local_bids,
+                  StagingWindowConfig{.window_chunks = 2, .chunk_blocks = 2}),
+              ::absl_testing::IsOk());
+  auto session = consumer.GetRecvSession(uuid);
+  ASSERT_NE(session, nullptr);
+
+  const std::vector<int64_t> host_bids = session->transport_host_block_ids();
+  const std::vector<int64_t> chunk0_bids = {host_bids[0], host_bids[1]};
+  const std::vector<int64_t> chunk1_bids = {host_bids[2], host_bids[3]};
+  const std::vector<int64_t> chunk2_bids = {host_bids[0], host_bids[1]};
+  const absl::Time deadline = absl::InfiniteFuture();
+
+  ASSERT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid, /*layer_idx=*/0, chunk0_bids, {0}, deadline),
+              ::absl_testing::IsOk());
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+
+  ASSERT_THAT(consumer.base()->AwaitIncomingPushSlot(
+                  uuid, /*layer_idx=*/0, chunk1_bids, {0}, deadline),
+              ::absl_testing::IsOk());
+  ASSERT_THAT(consumer.ReceiveLayer(0, uuid), ::absl_testing::IsOk());
+
+  std::atomic<bool> stop_polling{false};
+  // Thread 1: polls Details(), Done(), h2d_done(), gate_waits_over_1ms().
+  std::thread poller([&]() {
+    while (!stop_polling.load(std::memory_order_relaxed)) {
+      (void)session->Details();
+      (void)session->Done();
+      (void)session->h2d_done(0, 0);
+      (void)session->gate_waits_over_1ms();
+      (void)session->last_unit_progress();
+      absl::SleepFor(absl::Microseconds(100));
+    }
+  });
+
+  // Thread 2: enters AwaitIncomingPushSlot and blocks on gate.
+  std::atomic<bool> gate_returned{false};
+  absl::Status gate_status;
+  std::thread waiter([&]() {
+    gate_status = consumer.base()->AwaitIncomingPushSlot(
+        uuid, /*layer_idx=*/0, chunk2_bids, {0}, deadline);
+    gate_returned.store(true);
+  });
+
+  absl::SleepFor(absl::Milliseconds(10));
+  EXPECT_FALSE(gate_returned.load());
+
+  // Thread 3: finishes H2D completion callback for chunk 0.
+  consumer.FinishCopy(0, absl::OkStatus());
+
+  waiter.join();
+  EXPECT_TRUE(gate_returned.load());
+  EXPECT_THAT(gate_status, ::absl_testing::IsOk());
+
+  stop_polling.store(true, std::memory_order_relaxed);
+  poller.join();
+
+  EXPECT_EQ(session->h2d_done(0, 0), 1);
+  consumer.FinishCopy(1, absl::OkStatus());
+}
+
 }  // namespace
 }  // namespace tpu_raiden

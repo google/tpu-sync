@@ -41,8 +41,27 @@ class KVCacheManager:
       worker_id: Optional[str] = None,
       enable_shm: bool = False,
       backend_configs: Optional[Sequence[Any]] = None,
+      staging_window_chunks: Optional[int] = None,
+      staging_chunk_blocks: Optional[int] = None,
+      staging_chunk_bytes: Optional[int] = None,
+      staging_stream_bytes: Optional[int] = None,
+      staging_admission: Optional[str] = None,
+      staging_admission_timeout_ms: Optional[int] = None,
+      staging_assume_peer_support: Optional[bool] = None,
   ):
     """Instantiates the TransferEngine-based KVCacheManager.
+
+    Bounded-window host staging enforces that the host staging block budget
+    matches the staging pool size: `budget = num_slots * max_blocks`.
+    Recommended configuration sets `max_blocks = W * C` (where W is
+    `staging_window_chunks` and C is `staging_chunk_blocks`) and `num_slots = B`
+    (concurrency limit / batch slots).
+
+    WARNING: In dynamic mode where host buffers are shared with an LRU cache or
+    KV store, bounded-window staging pins host blocks while chunks are in
+    flight.
+    If the total allocated host pool is smaller than `num_slots * max_blocks`,
+    unpinned blocks may be evicted prematurely or admission may stall.
 
     Args:
       kv_caches: List of device-placed contiguous Tensors representing the
@@ -72,8 +91,39 @@ class KVCacheManager:
         and set `<axis>_rank` to this worker's rank in [0, size). Duplicate or
         missing ranks cause wrong or missed recalls. An invalid config aborts
         the process (LOG(FATAL)) at registration.
+      staging_window_chunks: Number of active chunks in the bounded sliding
+        window (W).
+      staging_chunk_blocks: Number of KV blocks per window chunk (C).
+      staging_chunk_bytes: Target chunk size in bytes (default 8MB).
+      staging_stream_bytes: Target stream transfer chunk size in bytes (default
+        4MB).
+      staging_admission: Admission policy when budget is constrained:
+        "fail_fast" or "wait".
+      staging_admission_timeout_ms: Timeout in ms when staging_admission="wait".
+      staging_assume_peer_support: Whether to assume peer support for windowed
+        streaming. Staging options default to None. If all are None,
+        configuration falls back to environment variables
+        (TPU_RAIDEN_STAGING_*). Explicit kwargs always override environment
+        variables and omitted kwargs keep env-resolved values or defaults.
     """
+    has_staging_args = any(
+        arg is not None
+        for arg in (
+            staging_window_chunks,
+            staging_chunk_blocks,
+            staging_chunk_bytes,
+            staging_stream_bytes,
+            staging_admission,
+            staging_admission_timeout_ms,
+            staging_assume_peer_support,
+        )
+    )
     if host_blocks_to_allocate is not None:
+      if has_staging_args:
+        raise ValueError(
+            "Bounded-window host staging options cannot be combined with"
+            " host_blocks_to_allocate. Use (max_blocks, num_slots) instead."
+        )
       self._impl = _impl.KVCacheManager(
           kv_caches,
           local_control_port if local_control_port > 0 else None,
@@ -107,6 +157,13 @@ class KVCacheManager:
           raiden_controller_address=raiden_controller_address,
           worker_id=worker_id,
           enable_shm=enable_shm,
+          staging_window_chunks=staging_window_chunks,
+          staging_chunk_blocks=staging_chunk_blocks,
+          staging_chunk_bytes=staging_chunk_bytes,
+          staging_stream_bytes=staging_stream_bytes,
+          staging_admission=staging_admission,
+          staging_admission_timeout_ms=staging_admission_timeout_ms,
+          staging_assume_peer_support=staging_assume_peer_support,
       )
     if backend_configs:
       self._impl.register_kv_backends(list(backend_configs))
@@ -257,3 +314,68 @@ class KVCacheManager:
       A JSON string representing the collected telemetry metrics.
     """
     return self._impl.dump_metrics_to_string()
+
+  def set_staging_window(
+      self,
+      *,
+      chunk_blocks: Optional[int] = None,
+      chunk_bytes_target: Optional[int] = None,
+      stream_bytes_target: Optional[int] = None,
+      admission: Optional[str] = None,
+      admission_timeout_ms: Optional[int] = None,
+      assume_peer_support: Optional[bool] = None,
+      window_chunks: Optional[int] = None,
+      serve_windowed_pulls: Optional[bool] = None,
+  ) -> None:
+    """Updates runtime-mutable configuration for bounded-window host staging.
+
+    Args:
+      chunk_blocks: Number of blocks per chunk.
+      chunk_bytes_target: Soft target chunk size in bytes.
+      stream_bytes_target: Soft target stream size in bytes.
+      admission: Admission policy string ("fail_fast" or "wait").
+      admission_timeout_ms: Timeout in milliseconds when admission is "wait".
+      assume_peer_support: Whether peer is assumed to support windowing.
+      window_chunks: Construction-time field; mutating raises ValueError.
+      serve_windowed_pulls: Construction-time field; mutating raises ValueError.
+
+    Raises:
+      ValueError: If a construction-time field (window_chunks or
+        serve_windowed_pulls) is provided, or if an argument is invalid.
+    """
+    kwargs = {}
+    if chunk_blocks is not None:
+      kwargs["chunk_blocks"] = chunk_blocks
+    if chunk_bytes_target is not None:
+      kwargs["chunk_bytes_target"] = chunk_bytes_target
+    if stream_bytes_target is not None:
+      kwargs["stream_bytes_target"] = stream_bytes_target
+    if admission is not None:
+      kwargs["admission"] = admission
+    if admission_timeout_ms is not None:
+      kwargs["admission_timeout_ms"] = admission_timeout_ms
+    if assume_peer_support is not None:
+      kwargs["assume_peer_support"] = assume_peer_support
+    if window_chunks is not None:
+      kwargs["window_chunks"] = window_chunks
+    if serve_windowed_pulls is not None:
+      kwargs["serve_windowed_pulls"] = serve_windowed_pulls
+    self._impl.set_staging_window(**kwargs)
+
+  def staging_stats(self) -> Dict[str, int]:
+    """Returns telemetry counters and watermark metrics for host staging.
+
+    Returns:
+      A dictionary containing 9 fields:
+        - budget_blocks: Host staging block pool budget (num_slots *
+        max_blocks).
+        - blocks_in_use: Number of staging blocks currently pinned.
+        - peak_blocks_in_use: High-water mark of pinned staging blocks.
+        - gate_waits_over_1ms: Number of times staging gate waited >1ms.
+        - rejected_streams: Number of streams rejected by admission control.
+        - admission_rejects: Streams rejected due to insufficient budget.
+        - admission_waits: Streams that waited for budget before admission.
+        - admission_requeues: Streams requeued during admission.
+        - admission_timeouts: Streams that timed out waiting for budget.
+    """
+    return self._impl.staging_stats()

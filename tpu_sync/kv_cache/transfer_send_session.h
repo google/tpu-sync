@@ -217,10 +217,12 @@ class TransferSendSession
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   void DispatchD2h(size_t l, int32_t c);
-  void OnD2hComplete(size_t l, int32_t c, const absl::Status& status);
+  void OnD2hComplete(size_t l, int32_t c, const absl::Status& status,
+                     absl::Time d2h_start = absl::InfinitePast());
   void DispatchH2h(size_t l, int32_t c);
   void OnH2hComplete(size_t l, int32_t c,
-                     const absl::StatusOr<std::vector<int>>& push_res);
+                     const absl::StatusOr<std::vector<int>>& push_res,
+                     absl::Time h2h_start = absl::InfinitePast());
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
@@ -274,6 +276,11 @@ class TransferSendSession
   std::vector<std::string> remote_data_endpoints_ ABSL_GUARDED_BY(mu_);
   std::atomic<size_t> remaining_h2h_units_{0};
   absl::Time last_unit_progress_ ABSL_GUARDED_BY(mu_) = absl::InfinitePast();
+  std::vector<std::vector<absl::Time>> d2h_ready_time_ ABSL_GUARDED_BY(mu_);
+  std::atomic<int64_t> total_d2h_us_{0};
+  std::atomic<int64_t> total_h2h_us_{0};
+  std::atomic<int64_t> total_ack_wait_us_{0};
+  std::atomic<int32_t> last_effective_n_u_{0};
 };
 
 }  // namespace tpu_raiden

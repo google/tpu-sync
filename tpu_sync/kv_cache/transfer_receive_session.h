@@ -462,6 +462,9 @@ class TransferReceiveSession
   std::vector<int64_t> queued_local_block_ids_ ABSL_GUARDED_BY(mu_);
   std::optional<std::vector<int64_t>> queued_local_host_block_ids_
       ABSL_GUARDED_BY(mu_);
+  std::atomic<int64_t> total_gate_wait_us_{0};
+  std::atomic<int64_t> total_h2d_dispatch_us_{0};
+  std::atomic<int64_t> total_h2d_dma_us_{0};
 };
 
 }  // namespace tpu_raiden

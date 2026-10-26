@@ -191,6 +191,8 @@ absl::Status TransferSendSession::ConfigureWindowedSend(
   chunk_dst_host_block_ids_ = std::move(chunk_dst_host_block_ids);
   block_bytes_per_layer_per_group_ = block_bytes_per_layer_per_group;
   stream_bytes_target_ = stream_bytes_target;
+  d2h_ready_time_.assign(
+      total_layers, std::vector<absl::Time>(n_chunks, absl::InfinitePast()));
   return absl::OkStatus();
 }
 
@@ -568,6 +570,8 @@ void TransferSendSession::StartPush(
     d2h_issued_units_.assign(total_layers, init_units);
     in_flight_ += static_cast<int>(total_layers) * init_units;
     d2h_unit_ready_.assign(total_layers, std::vector<bool>(n_chunks_, false));
+    d2h_ready_time_.assign(
+        total_layers, std::vector<absl::Time>(n_chunks_, absl::InfinitePast()));
     h2h_issued_units_.assign(total_layers, 0);
     h2h_acked_units_.assign(total_layers, 0);
     d2h_unit_futures_.assign(total_layers,
@@ -584,8 +588,17 @@ void TransferSendSession::StartPush(
     }
     const int64_t unit_bytes_0 =
         static_cast<int64_t>(first_chunk_blocks) * block_bytes;
+    const int32_t shards_per_group =
+        (base_ != nullptr)
+            ? std::max<int32_t>(1, static_cast<int32_t>(base_->num_shards()) /
+                                       std::max(1, base_->num_numa_groups()))
+            : 1;
+    const int32_t effective_blocks_0 =
+        (base_ != nullptr && base_->num_layers() < static_cast<size_t>(P))
+            ? first_chunk_blocks * shards_per_group
+            : first_chunk_blocks;
     const int n_u_first_chunk = StreamsPerUnit(
-        unit_bytes_0, stream_bytes_target, P, first_chunk_blocks);
+        unit_bytes_0, stream_bytes_target, P, effective_blocks_0);
     if (P < 16) {
       LOG(WARNING) << "Windowed send running with parallelism = " << P
                    << " < 16 for uuid=" << uuid_;
@@ -608,6 +621,7 @@ void TransferSendSession::StartPush(
 }
 
 void TransferSendSession::DispatchD2h(size_t l, int32_t c) {
+  const absl::Time d2h_start = absl::Now();
   RAIDEN_TRACE_FN("Window::D2H", [&]() {
     return absl::StrCat("uuid=", uuid_, " l=", l, " c=", c);
   });
@@ -645,13 +659,19 @@ void TransferSendSession::DispatchD2h(size_t l, int32_t c) {
     d2h_unit_futures_[l][c] = copy_future;
   }
   std::move(end_op).Cancel();
-  copy_future.OnReady([self = shared_from_this(), l, c](auto copy_status) {
-    self->OnD2hComplete(l, c, copy_status.status());
-  });
+  copy_future.OnReady(
+      [self = shared_from_this(), l, c, d2h_start](auto copy_status) {
+        self->OnD2hComplete(l, c, copy_status.status(), d2h_start);
+      });
 }
 
 void TransferSendSession::OnD2hComplete(size_t l, int32_t c,
-                                        const absl::Status& status) {
+                                        const absl::Status& status,
+                                        absl::Time d2h_start) {
+  if (d2h_start != absl::InfinitePast()) {
+    total_d2h_us_.fetch_add(absl::ToInt64Microseconds(absl::Now() - d2h_start),
+                            std::memory_order_relaxed);
+  }
   absl::Cleanup end_op = [this]() { EndSendOp(); };
   absl::Status injected =
       FaultInjectStatus(hooks::kTransferSendSessionD2hComplete);
@@ -667,6 +687,10 @@ void TransferSendSession::OnD2hComplete(size_t l, int32_t c,
   absl::MutexLock lock(mu_);
   if (draining_ || done_) return;
   d2h_unit_ready_[l][c] = true;
+  if (l < d2h_ready_time_.size() &&
+      c < static_cast<int32_t>(d2h_ready_time_[l].size())) {
+    d2h_ready_time_[l][c] = absl::Now();
+  }
   last_unit_progress_ = absl::Now();
   if (d2h_done_ == std::chrono::steady_clock::time_point{}) {
     d2h_done_ = std::chrono::steady_clock::now();
@@ -680,12 +704,17 @@ void TransferSendSession::DispatchH2h(size_t l, int32_t c) {
   std::vector<int> src_ints, dst_ints;
   std::optional<int> push_parallelism = std::nullopt;
   int n_u_log = 0;
+  absl::Time ready_time = absl::InfinitePast();
   {
     absl::MutexLock lock(mu_);
     if (draining_ || done_) return;
     endpoints = remote_data_endpoints_;
     src_ints = chunk_src_host_block_ids_[c];
     dst_ints = chunk_dst_host_block_ids_[c];
+    if (l < d2h_ready_time_.size() &&
+        c < static_cast<int32_t>(d2h_ready_time_[l].size())) {
+      ready_time = d2h_ready_time_[l][c];
+    }
     const int P = base_ != nullptr ? base_->parallelism() : 1;
     if (IsWindowedLocked()) {
       const int32_t chunk_blocks_c = static_cast<int32_t>(src_ints.size());
@@ -697,13 +726,32 @@ void TransferSendSession::DispatchH2h(size_t l, int32_t c) {
       }
       const int64_t unit_bytes =
           static_cast<int64_t>(chunk_blocks_c) * block_bytes_per_group;
-      const int32_t n_u =
-          StreamsPerUnit(unit_bytes, stream_bytes_target_, P, chunk_blocks_c);
+      const int32_t shards_per_group =
+          (base_ != nullptr)
+              ? std::max<int32_t>(1, static_cast<int32_t>(base_->num_shards()) /
+                                         std::max(1, base_->num_numa_groups()))
+              : 1;
+      const int32_t effective_chunk_blocks =
+          (base_ != nullptr && base_->num_layers() < static_cast<size_t>(P))
+              ? chunk_blocks_c * shards_per_group
+              : chunk_blocks_c;
+      const int32_t n_u = StreamsPerUnit(unit_bytes, stream_bytes_target_, P,
+                                         effective_chunk_blocks);
+      last_effective_n_u_.store(n_u, std::memory_order_relaxed);
       push_parallelism = n_u;
       n_u_log = n_u;
     } else {
+      last_effective_n_u_.store(P, std::memory_order_relaxed);
       push_parallelism = P;
       n_u_log = P;
+    }
+  }
+
+  if (ready_time != absl::InfinitePast()) {
+    const absl::Duration ack_wait = absl::Now() - ready_time;
+    if (ack_wait > absl::ZeroDuration()) {
+      total_ack_wait_us_.fetch_add(absl::ToInt64Microseconds(ack_wait),
+                                   std::memory_order_relaxed);
     }
   }
 
@@ -711,18 +759,24 @@ void TransferSendSession::DispatchH2h(size_t l, int32_t c) {
           << " n_u=" << n_u_log << "): uuid=" << uuid_ << ", numa="
           << (base_ != nullptr ? base_->assigned_numa_node().value_or(-1) : -1);
 
+  const absl::Time h2h_start = absl::Now();
   std::move(end_op).Cancel();
   base_->H2hWriteDirectAsync(
       endpoints, src_ints, dst_ints, uuid_, static_cast<int>(l),
-      [self = shared_from_this(), l, c](auto push_res) {
-        self->OnH2hComplete(l, c, push_res);
+      [self = shared_from_this(), l, c, h2h_start](auto push_res) {
+        self->OnH2hComplete(l, c, push_res, h2h_start);
       },
       push_parallelism);
 }
 
 void TransferSendSession::OnH2hComplete(
-    size_t l, int32_t c, const absl::StatusOr<std::vector<int>>& push_res) {
+    size_t l, int32_t c, const absl::StatusOr<std::vector<int>>& push_res,
+    absl::Time h2h_start) {
   absl::Cleanup end_op = [this]() { EndSendOp(); };
+  if (h2h_start != absl::InfinitePast()) {
+    total_h2h_us_.fetch_add(absl::ToInt64Microseconds(absl::Now() - h2h_start),
+                            std::memory_order_relaxed);
+  }
   if (!push_res.ok()) {
     LOG(ERROR) << "H2hWrite failed for layer " << l << " unit " << c << ": "
                << push_res.status();
@@ -739,7 +793,11 @@ void TransferSendSession::OnH2hComplete(
   h2h_acked_units_[l] = c + 1;
   last_unit_progress_ = absl::Now();
   if (remaining_h2h_units_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-    LOG(INFO) << "StartPush (All H2H complete): uuid=" << uuid_;
+    LOG(INFO) << "StartPush (All H2H complete): uuid=" << uuid_
+              << " total_d2h_us=" << total_d2h_us_.load()
+              << " total_h2h_us=" << total_h2h_us_.load()
+              << " total_ack_wait_us=" << total_ack_wait_us_.load()
+              << " effective_streams_per_unit=" << last_effective_n_u_.load();
     FinishLocked(absl::OkStatus());
     return;
   }

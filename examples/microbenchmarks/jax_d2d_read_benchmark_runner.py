@@ -49,6 +49,7 @@ See README.md in this directory for how this compares with the other
 microbenchmarks here.
 """
 
+import functools
 import os
 import sys
 
@@ -77,15 +78,15 @@ _GRPC_PORT = flags.DEFINE_integer(
 _NUM_BLOCKS = flags.DEFINE_integer(
     'num_blocks', 512, 'Number of cache blocks to allocate.'
 )
-_BLOCK_SIZE = flags.DEFINE_integer('block_size', 2, 'Size of cache blocks.')
+_BLOCK_SIZE = flags.DEFINE_integer('block_size', 4096, 'Size of cache blocks.')
 _NUM_LAYERS = flags.DEFINE_integer(
-    'num_layers', 8, 'Number of transformer layers.'
+    'num_layers', 60, 'Number of transformer layers.'
 )
 _PARALLELISM = flags.DEFINE_integer(
     'parallelism', 1, 'Number of parallel TCP streams for H2H.'
 )
 _NUM_SLOTS = flags.DEFINE_integer(
-    'num_slots', 2, 'Number of host staging slots to allocate.'
+    'num_slots', 1, 'Number of host staging slots to allocate.'
 )
 _ENABLE_METRICS = flags.DEFINE_boolean(
     'enable_metrics', False, 'Enable internal telemetry metrics collection.'
@@ -141,35 +142,48 @@ def get_peer_grpc_path(peer_arg: str) -> str:
 def populate_deterministic_cache(
     num_blocks: int, num_layers: int, shape: tuple[int, ...], sharding
 ) -> list[jax.Array]:
-  arrs = []
-  for layer_idx in range(num_layers):
-    base = jnp.arange(np.prod(shape), dtype=jnp.float32).reshape(shape) + float(
-        layer_idx * 1000.0
-    )
-    arrs.append(jax.device_put(base, sharding))
+
+  @functools.partial(jax.jit, static_argnums=(0,), out_shardings=sharding)
+  def _make_layer(shape_tuple: tuple[int, ...], layer_idx: int) -> jax.Array:
+    block_vals = jnp.arange(shape_tuple[0], dtype=jnp.float32)[
+        :, None, None, None, None
+    ] + (layer_idx * 1000.0 + 1.0)
+    return jnp.broadcast_to(block_vals, shape_tuple)
+
+  arrs = [_make_layer(shape, layer_idx) for layer_idx in range(num_layers)]
   jax.block_until_ready(arrs)
   return arrs
+
 
 def verify_deterministic_cache(
     num_blocks: int,
     num_layers: int,
     shape: tuple[int, ...],
     dst_tpu_arrs: list[jax.Array],
+    sharding=None,
 ) -> bool:
   print('Verifying data consistency across all sharded cache layers...')
+
+  @functools.partial(jax.jit, static_argnums=(0,))
+  def _check_layer(
+      shape_tuple: tuple[int, ...], layer_idx: int, actual: jax.Array
+  ) -> jax.Array:
+    block_vals = jnp.arange(shape_tuple[0], dtype=jnp.float32)[
+        :, None, None, None, None
+    ] + (layer_idx * 1000.0 + 1.0)
+    expected = jnp.broadcast_to(block_vals, shape_tuple)
+    if sharding is not None:
+      expected = jax.lax.with_sharding_constraint(expected, sharding)
+    return jnp.array_equal(actual, expected)
+
   for layer_idx in range(num_layers):
-    expected = jnp.arange(np.prod(shape), dtype=jnp.float32).reshape(
-        shape
-    ) + float(layer_idx * 1000.0)
-    actual = np.asarray(dst_tpu_arrs[layer_idx])
-    try:
-      np.testing.assert_array_equal(actual, np.asarray(expected))
-    except AssertionError as exc:
+    is_equal = bool(_check_layer(shape, layer_idx, dst_tpu_arrs[layer_idx]))
+    if not is_equal:
       print(f'Verification FAILED on Layer {layer_idx}!')
-      print(exc)
       return False
   print('Data consistency verified successfully! 0% corruption.')
   return True
+
 
 def main(_):
   if not _ROLE.value:
@@ -184,11 +198,6 @@ def main(_):
         num_processes=_NUM_PROCESSES.value,
         process_id=_PROCESS_INDEX.value,
     )
-  elif not jax.distributed.is_initialized():
-    try:
-      jax.distributed.initialize()
-    except ValueError:
-      pass
 
   print(f'Initialized JAX distributed mesh: process_index={jax.process_index()}, process_count={jax.process_count()}')
 
@@ -213,20 +222,30 @@ def main(_):
   sorted_devices = sorted(devices, key=lambda d: d.numa_node if hasattr(d, 'numa_node') else -1)
   tpu_sharding, _ = setup_shardings(sorted_devices)
 
-  cache_shape = (_NUM_BLOCKS.value, 32, _BLOCK_SIZE.value, 8, 128)
+  cache_shape = (_NUM_BLOCKS.value, _BLOCK_SIZE.value, 8, 2, 128)
 
-  # setup_shardings partitions cache axis 2 (block_size) across every device, so
-  # block_size must divide evenly by the device count. Saying so here beats the
+  # setup_shardings partitions cache axis 2 (8 heads) across every device, so
+  # 8 must divide evenly by the device count. Saying so here beats the
   # bare IndivisibleError that XLA raises several frames deeper.
-  if _BLOCK_SIZE.value % len(devices) != 0:
+  if 8 % len(devices) != 0:
     raise ValueError(
-        f'--block_size={_BLOCK_SIZE.value} is not divisible by the '
+        'Axis 2 size (8) is not divisible by the '
         f'{len(devices)} local devices it is sharded across. Pass a multiple '
         f'of {len(devices)}.'
     )
 
   block_bytes = int(np.prod(cache_shape[1:])) * 4
   payload_bytes = _NUM_LAYERS.value * _NUM_BLOCKS.value * block_bytes
+  if _STAGING_WINDOW_CHUNKS.value > 0 and _STAGING_CHUNK_BLOCKS.value > 0:
+    effective_max_blocks = min(
+        _NUM_BLOCKS.value,
+        _STAGING_WINDOW_CHUNKS.value * _STAGING_CHUNK_BLOCKS.value,
+    )
+  else:
+    effective_max_blocks = _NUM_BLOCKS.value
+  staging_pool_bytes = (
+      _NUM_LAYERS.value * effective_max_blocks * _NUM_SLOTS.value * block_bytes
+  )
   print(
       f'Config: role={_ROLE.value} parallelism={_PARALLELISM.value} '
       f'num_slots={_NUM_SLOTS.value} num_layers={_NUM_LAYERS.value} '
@@ -236,6 +255,12 @@ def main(_):
       f'Cache: shape={cache_shape} dtype=float32 '
       f'block={block_bytes / (1024 * 1024):.2f} MiB '
       f'payload={payload_bytes / (1024 * 1024):.2f} MiB'
+  )
+  print(
+      f'Staging Pool: max_blocks={effective_max_blocks} '
+      f'num_slots={_NUM_SLOTS.value} '
+      f'total={staging_pool_bytes / (1024 * 1024):.2f} MiB '
+      f'({staging_pool_bytes / (1024 ** 3):.3f} GiB)'
   )
 
   if _ROLE.value == 'sender':
@@ -260,7 +285,7 @@ def main(_):
     manager = kv_cache_manager.KVCacheManager(
         kv_caches=tpu_src_arrs,
         local_control_port=0,
-        max_blocks=_NUM_BLOCKS.value,
+        max_blocks=effective_max_blocks,
         num_slots=_NUM_SLOTS.value,
         unsafe_skip_buffer_lock=True,
         parallelism=_PARALLELISM.value,
@@ -352,7 +377,7 @@ def main(_):
     manager = kv_cache_manager.KVCacheManager(
         kv_caches=device_arrs,
         local_control_port=0,
-        max_blocks=_NUM_BLOCKS.value,
+        max_blocks=effective_max_blocks,
         num_slots=_NUM_SLOTS.value,
         unsafe_skip_buffer_lock=True,
         parallelism=_PARALLELISM.value,
@@ -389,20 +414,20 @@ def main(_):
       elif transfer_req_id in failed_recving:
         raise RuntimeError(f'Transfer failed! req_id: {transfer_req_id}')
       else:
-        time.sleep(0.01)
+        time.sleep(0.0002)
 
     end_time = time.perf_counter()
     elapsed_time = end_time - start_time
 
     # start_read is asynchronous, so the split shows how much of the elapsed
     # time was the call itself versus waiting for the transfer to land. The poll
-    # loop sleeps 10ms per iteration, which quantises short transfers -- if
+    # loop sleeps 0.2ms per iteration, which quantises short transfers -- if
     # polls is small, the measurement is dominated by that granularity.
     print(
-        f'start_read returned in '
+        'start_read returned in '
         f'{(start_read_returned - start_time) * 1e3:.1f} ms; '
         f'waited {(end_time - start_read_returned) * 1e3:.1f} ms across '
-        f'{polls} poll(s) at 10ms granularity'
+        f'{polls} poll(s) at 0.2ms granularity'
     )
 
     block_byte_size = np.prod(cache_shape[1:]) * 4
@@ -430,7 +455,11 @@ def main(_):
 
     t0 = time.perf_counter()
     success = verify_deterministic_cache(
-        _NUM_BLOCKS.value, _NUM_LAYERS.value, cache_shape, device_arrs
+        _NUM_BLOCKS.value,
+        _NUM_LAYERS.value,
+        cache_shape,
+        device_arrs,
+        tpu_sharding,
     )
     print(f'Verification took {time.perf_counter() - t0:.2f}s')
 

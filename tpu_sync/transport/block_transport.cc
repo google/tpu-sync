@@ -471,10 +471,9 @@ BlockTransport::~BlockTransport() {
 
 absl::Status BlockTransport::HandleCustomRequest(
     int client_fd, const lib::ChunkHeader& header) {
-  LOG(INFO) << "HandleCustomRequest (H2H read start): client_fd=" << client_fd
-            << ", op=" << static_cast<int>(header.op)
-            << ", uuid=" << header.uuid
-            << ", numa=" << block_delegate_->node_id();
+  VLOG(1) << "HandleCustomRequest (H2H read start): client_fd=" << client_fd
+          << ", op=" << static_cast<int>(header.op) << ", uuid=" << header.uuid
+          << ", numa=" << block_delegate_->node_id();
 
   if (header.op == 1 || header.op == 6) {
     absl::Status push_status = HandleIncomingPush(client_fd, header);
@@ -639,9 +638,9 @@ absl::Status BlockTransport::HandleIncomingPush(
       header.buffer_id == 0 ? 0 : stream_shards.size(),
       push_spec.pool_progress_spec));
 
-  LOG(INFO) << "HandleCustomRequest (H2H read complete): client_fd="
-            << client_fd << ", uuid=" << header.uuid
-            << ", numa=" << block_delegate_->node_id();
+  VLOG(1) << "HandleCustomRequest (H2H read complete): client_fd=" << client_fd
+          << ", uuid=" << header.uuid
+          << ", numa=" << block_delegate_->node_id();
   // Report exactly the shards this stream carried: every shard for a legacy
   // stream, one route's subset for a routed stream. The delegate owns
   // per-block shard accounting across streams.
@@ -1028,6 +1027,40 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
         << "Push without explicit destination block ids cannot be split by "
            "NUMA node; sending every shard on each stream.";
     groups = ShardGroupsByNuma({}, num_shards);
+  }
+  const int check_layer = layer_idx < 0 ? 0 : layer_idx;
+  auto pool_spec = block_delegate_->GetPoolPushProgressSpec(check_layer, uuid);
+  const bool is_plan_declared = pool_spec.ok() && pool_spec->has_value();
+  if (!dst_block_ids.empty() && !is_plan_declared && groups.size() > 1 &&
+      parallelism > static_cast<int>(src_block_ids.size()) &&
+      !src_block_ids.empty()) {
+    const size_t num_blocks = src_block_ids.size();
+    const size_t target_sub_groups_per_numa = std::max<size_t>(
+        1, (static_cast<size_t>(parallelism) + num_blocks - 1) / num_blocks);
+    std::vector<ShardGroup> subdivided;
+    for (const ShardGroup& g : groups) {
+      const size_t sub_count =
+          std::min<size_t>(g.shards.size(), target_sub_groups_per_numa);
+      if (sub_count <= 1) {
+        subdivided.push_back(g);
+        continue;
+      }
+      const size_t base_sh = g.shards.size() / sub_count;
+      const size_t rem_sh = g.shards.size() % sub_count;
+      size_t offset = 0;
+      for (size_t s = 0; s < sub_count; ++s) {
+        const size_t count = base_sh + (s < rem_sh ? 1 : 0);
+        ShardGroup sub{g.numa_node, {}, 0};
+        for (size_t i = 0; i < count; ++i) {
+          const int sh = g.shards[offset + i];
+          sub.shards.push_back(sh);
+          sub.shard_mask |= static_cast<uint16_t>(1u << sh);
+        }
+        offset += count;
+        subdivided.push_back(std::move(sub));
+      }
+    }
+    groups = std::move(subdivided);
   }
   std::vector<tsl::Future<std::vector<int>>> futures;
   futures.reserve(groups.size());

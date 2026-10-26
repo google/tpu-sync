@@ -1037,6 +1037,9 @@ absl::Status TransferReceiveSession::AwaitIncomingPushSlot(
   }
 
   if (h2d_done_[s][layer_idx] < needed_done) {
+    RAIDEN_TRACE_FN("Recv::GateWait", [&]() {
+      return absl::StrCat("uuid=", uuid_, " l=", layer_idx, " c=", c, " s=", s);
+    });
     const absl::Time wait_start = absl::Now();
     if (last_unit_progress_ != absl::InfinitePast() &&
         wait_start - last_unit_progress_ > kUnitProgressStallThreshold) {
@@ -1073,6 +1076,8 @@ absl::Status TransferReceiveSession::AwaitIncomingPushSlot(
     mu_.AwaitWithDeadline(absl::Condition(&can_proceed), effective_deadline);
 
     const absl::Duration waited = absl::Now() - wait_start;
+    total_gate_wait_us_.fetch_add(absl::ToInt64Microseconds(waited),
+                                  std::memory_order_relaxed);
     if (waited > absl::Milliseconds(1)) {
       ++gate_waits_over_1ms_;
       if (static_cast<size_t>(layer_idx) <
@@ -1440,11 +1445,14 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
   std::string session_req_id;
   bool trigger_enqueue = false;
   int32_t chunk_idx = -1;
+  bool is_multi_shard_windowed = false;
   {
     absl::MutexLock lock(mu_);
     if (done_ || draining_) {
       return absl::OkStatus();
     }
+    is_multi_shard_windowed =
+        window_chunks_ > 0 && base_ != nullptr && base_->num_shards() >= 4;
     const size_t total_layers = base_ != nullptr ? base_->num_layers() : 0;
     if (layer_idx >= total_layers) {
       return absl::InvalidArgumentError(absl::StrCat(
@@ -1514,96 +1522,194 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
     }
   }
   const uint64_t uuid = uuid_;
+  absl::Status injected =
+      FaultInjectStatus(hooks::kTransferRecvSessionH2dDispatch);
+
+  auto attach_completion = [self = shared_from_this(), &manager, uuid,
+                            layer_idx, chunk_idx,
+                            session_req_id](raiden::PjRtCopyFuture future,
+                                            absl::Time dma_start) {
+    const int numa_node = self->base_ != nullptr
+                              ? self->base_->assigned_numa_node().value_or(-1)
+                              : -1;
+    future.OnReady([self, &manager, uuid, numa_node, layer_idx, chunk_idx,
+                    session_req_id, dma_start,
+                    metrics_collector =
+                        manager.metrics_collector_](auto copy_status) {
+      self->total_h2d_dma_us_.fetch_add(
+          absl::ToInt64Microseconds(absl::Now() - dma_start),
+          std::memory_order_relaxed);
+      absl::Status injected =
+          FaultInjectStatus(hooks::kTransferRecvSessionH2dComplete);
+      if (copy_status.ok() && !injected.ok()) {
+        copy_status = injected;
+      }
+      absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
+      bool all_layers_done = false;
+      std::chrono::steady_clock::time_point session_start_time;
+      bool should_unregister = false;
+      uint64_t generation = 0;
+      int64_t gate_waits_over_1ms = 0;
+      {
+        absl::MutexLock lock(self->mu_);
+        if (self->done_) {
+          LOG(DFATAL) << "H2D callback for retired receive UUID " << uuid;
+          return;
+        }
+        if (copy_status.ok()) {
+          VLOG(1) << "OnLayerReceived (H2D copy complete) layer " << layer_idx
+                  << ": req_id=" << session_req_id << ", numa=" << numa_node;
+          ++self->h2d_ready_;
+          if (self->window_chunks_ > 0 && !self->h2d_done_.empty()) {
+            const int32_t s = chunk_idx % self->window_chunks_;
+            if (static_cast<size_t>(s) < self->h2d_done_.size() &&
+                layer_idx < self->h2d_done_[s].size()) {
+              ++self->h2d_done_[s][layer_idx];
+            }
+          }
+          self->last_unit_progress_ = absl::Now();
+          if (self->AllUnitsAndH2dDoneLocked() && !self->draining_) {
+            all_layers_done = true;
+            session_start_time = self->start_time_;
+            gate_waits_over_1ms = self->gate_waits_over_1ms_;
+            self->FinishLocked();
+          }
+        } else {
+          LOG(ERROR) << "OnLayerReceived (H2D copy failed) layer " << layer_idx
+                     << " for req_id: " << session_req_id
+                     << ", error: " << copy_status.status().ToString();
+          self->FinishLocked(copy_status.status(), kH2dPhase);
+        }
+        if (self->draining_ && self->in_flight_ == 1 &&
+            self->unregister_on_settle_) {
+          self->unregister_on_settle_ = false;
+          generation = self->plan_generation_;
+          should_unregister = true;
+        }
+      }
+      if (all_layers_done) {
+        RecordTransferDuration(
+            DurationMs(session_start_time, std::chrono::steady_clock::now()));
+        if (metrics_collector) {
+          metrics_collector->RecordH2dComplete(uuid);
+        }
+        LOG(INFO) << "All layers H2D copy complete: req_id=" << session_req_id
+                  << " total_gate_wait_us=" << self->total_gate_wait_us_.load()
+                  << " gate_waits_over_1ms=" << gate_waits_over_1ms
+                  << " total_h2d_dispatch_us="
+                  << self->total_h2d_dispatch_us_.load()
+                  << " total_h2d_dma_us=" << self->total_h2d_dma_us_.load();
+        if (metrics_collector) {
+          metrics_collector->RecordEnd(uuid);
+        }
+      }
+      if (should_unregister && !manager.IsShuttingDown()) {
+        manager.UnregisterSettledPlan(uuid, generation);
+      }
+    });
+  };
+
+  if (is_multi_shard_windowed) {
+    {
+      absl::MutexLock lock(mu_);
+      ++h2d_issued_;
+    }
+    const auto target_node = base_->assigned_numa_node();
+    base_->push_pool()->Schedule(
+        target_node, [self = shared_from_this(), &manager, uuid, layer_idx,
+                      copy_spec, injected, attach_completion]() mutable {
+          {
+            absl::MutexLock lock(self->mu_);
+            if (self->done_ || self->draining_) {
+              bool should_unregister = false;
+              uint64_t generation = 0;
+              if (self->draining_ && self->in_flight_ == 1 &&
+                  self->unregister_on_settle_) {
+                self->unregister_on_settle_ = false;
+                generation = self->plan_generation_;
+                should_unregister = true;
+              }
+              self->EndRecvOpLocked();
+              if (should_unregister && !manager.IsShuttingDown()) {
+                manager.UnregisterSettledPlan(uuid, generation);
+              }
+              return;
+            }
+          }
+          RAIDEN_TRACE_FN("Recv::H2D", [&]() {
+            return absl::StrCat("uuid=", uuid, " l=", layer_idx);
+          });
+          const absl::Time dispatch_start = absl::Now();
+          auto future_or =
+              injected.ok() ? self->base_->H2dSyncDispatch(
+                                  copy_spec.src_offsets, copy_spec.dst_offsets,
+                                  copy_spec.sizes, /*slot_idx=*/std::nullopt,
+                                  /*layer_idx=*/layer_idx)
+                            : absl::StatusOr<raiden::PjRtCopyFuture>(injected);
+          self->total_h2d_dispatch_us_.fetch_add(
+              absl::ToInt64Microseconds(absl::Now() - dispatch_start),
+              std::memory_order_relaxed);
+          if (!future_or.ok()) {
+            bool should_unregister = false;
+            uint64_t generation = 0;
+            {
+              absl::MutexLock lock(self->mu_);
+              self->FinishLocked(future_or.status(), kH2dPhase);
+              if (self->draining_ && self->in_flight_ == 1 &&
+                  self->unregister_on_settle_) {
+                self->unregister_on_settle_ = false;
+                generation = self->plan_generation_;
+                should_unregister = true;
+              }
+              self->EndRecvOpLocked();
+            }
+            if (should_unregister && !manager.IsShuttingDown()) {
+              manager.UnregisterSettledPlan(uuid, generation);
+            }
+            return;
+          }
+          attach_completion(*std::move(future_or), absl::Now());
+        });
+    return absl::OkStatus();
+  }
+
   RAIDEN_TRACE_FN("Recv::H2D", [&]() {
     return absl::StrCat("uuid=", uuid, " l=", layer_idx);
   });
-  absl::Status injected =
-      FaultInjectStatus(hooks::kTransferRecvSessionH2dDispatch);
+  const absl::Time dispatch_start = absl::Now();
   auto future_or =
       injected.ok()
           ? base_->H2dSyncDispatch(copy_spec.src_offsets, copy_spec.dst_offsets,
                                    copy_spec.sizes, /*slot_idx=*/std::nullopt,
                                    /*layer_idx=*/layer_idx)
           : absl::StatusOr<raiden::PjRtCopyFuture>(injected);
+  total_h2d_dispatch_us_.fetch_add(
+      absl::ToInt64Microseconds(absl::Now() - dispatch_start),
+      std::memory_order_relaxed);
   if (!future_or.ok()) {
-    absl::MutexLock lock(mu_);
-    FinishLocked(future_or.status(), kH2dPhase);
-    EndRecvOpLocked();
-    return future_or.status();
-  }
-
-  auto future = *future_or;
-  {
-    absl::MutexLock lock(mu_);
-    ++h2d_issued_;
-  }
-  const int numa_node = base_->assigned_numa_node().value_or(-1);
-  future.OnReady([self = shared_from_this(), &manager, uuid, numa_node,
-                  layer_idx, chunk_idx, session_req_id,
-                  metrics_collector =
-                      manager.metrics_collector_](auto copy_status) {
-    absl::Status injected =
-        FaultInjectStatus(hooks::kTransferRecvSessionH2dComplete);
-    if (copy_status.ok() && !injected.ok()) {
-      copy_status = injected;
-    }
-    absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
-    bool all_layers_done = false;
-    std::chrono::steady_clock::time_point session_start_time;
     bool should_unregister = false;
     uint64_t generation = 0;
     {
-      absl::MutexLock lock(self->mu_);
-      if (self->done_) {
-        LOG(DFATAL) << "H2D callback for retired receive UUID " << uuid;
-        return;
-      }
-      if (copy_status.ok()) {
-        VLOG(1) << "OnLayerReceived (H2D copy complete) layer " << layer_idx
-                << ": req_id=" << session_req_id << ", numa=" << numa_node;
-        ++self->h2d_ready_;
-        if (self->window_chunks_ > 0 && !self->h2d_done_.empty()) {
-          const int32_t s = chunk_idx % self->window_chunks_;
-          if (static_cast<size_t>(s) < self->h2d_done_.size() &&
-              layer_idx < self->h2d_done_[s].size()) {
-            ++self->h2d_done_[s][layer_idx];
-          }
-        }
-        self->last_unit_progress_ = absl::Now();
-        if (self->AllUnitsAndH2dDoneLocked() && !self->draining_) {
-          all_layers_done = true;
-          session_start_time = self->start_time_;
-          self->FinishLocked();
-        }
-      } else {
-        LOG(ERROR) << "OnLayerReceived (H2D copy failed) layer " << layer_idx
-                   << " for req_id: " << session_req_id
-                   << ", error: " << copy_status.status().ToString();
-        self->FinishLocked(copy_status.status(), kH2dPhase);
-      }
-      if (self->draining_ && self->in_flight_ == 1 &&
-          self->unregister_on_settle_) {
-        self->unregister_on_settle_ = false;
-        generation = self->plan_generation_;
+      absl::MutexLock lock(mu_);
+      FinishLocked(future_or.status(), kH2dPhase);
+      if (draining_ && in_flight_ == 1 && unregister_on_settle_) {
+        unregister_on_settle_ = false;
+        generation = plan_generation_;
         should_unregister = true;
       }
-    }
-    if (all_layers_done) {
-      RecordTransferDuration(
-          DurationMs(session_start_time, std::chrono::steady_clock::now()));
-      if (metrics_collector) {
-        metrics_collector->RecordH2dComplete(uuid);
-      }
-      LOG(INFO) << "All layers H2D copy complete: req_id=" << session_req_id;
-      if (metrics_collector) {
-        metrics_collector->RecordEnd(uuid);
-      }
+      EndRecvOpLocked();
     }
     if (should_unregister && !manager.IsShuttingDown()) {
       manager.UnregisterSettledPlan(uuid, generation);
     }
-  });
+    return future_or.status();
+  }
 
+  {
+    absl::MutexLock lock(mu_);
+    ++h2d_issued_;
+  }
+  attach_completion(*std::move(future_or), absl::Now());
   return absl::OkStatus();
 }
 

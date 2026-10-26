@@ -50,7 +50,9 @@ namespace tpu_raiden {
 // Encapsulates the per-transfer state and execution lifecycle of a consumer
 // receive operation (pull/push H2D receives), including host staging
 // ownership, reference-counted drain and sticky-failure tracking, block/layer
-// readiness accounting, and H2D copy execution.
+// readiness accounting, and H2D copy execution. A receive whose destination
+// is host memory (`BlockMemory::kHost`) lands in the caller's host blocks and
+// settles once every layer has arrived, with no H2D copy.
 //
 // Thread-safe: all mutable session state is synchronized via internal |mu_|.
 class TransferReceiveSession
@@ -63,7 +65,8 @@ class TransferReceiveSession
       const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
       const std::vector<int64_t>& local_block_ids,
       const std::optional<std::vector<int64_t>>& local_host_block_ids,
-      std::chrono::steady_clock::time_point deadline);
+      std::chrono::steady_clock::time_point deadline,
+      BlockMemory destination = BlockMemory::kDevice);
 
   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
       kv_cache::KVCacheManagerBase* base,
@@ -157,6 +160,12 @@ class TransferReceiveSession
                                      const std::vector<int>& block_ids,
                                      absl::Span<const int> shard_ids);
 
+  // Handles a transport report that every block of |layer_idx| landed in host
+  // memory: issues the layer's H2D copy for a device destination, or counts
+  // the layer as settled for a host destination.
+  absl::Status OnLayerReceived(KVCacheManagerWithTransfer& manager,
+                               size_t layer_idx);
+
   // Issues H2D copy for |layer_idx| using |base_| and registers the completion
   // callback.
   absl::Status ExecuteLayerH2d(KVCacheManagerWithTransfer& manager,
@@ -174,14 +183,17 @@ class TransferReceiveSession
     absl::MutexLock lock(mu_);
     return deadline_;
   }
+  BlockMemory destination() const { return destination_; }
 
  private:
   TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
                          StagingBlockAllocator* staging_allocator,
-                         uint64_t uuid = 0)
+                         uint64_t uuid = 0,
+                         BlockMemory destination = BlockMemory::kDevice)
       : base_(base),
         staging_allocator_(staging_allocator),
         uuid_(uuid),
+        destination_(destination),
         blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0,
                                    0) {}
   TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
@@ -237,6 +249,11 @@ class TransferReceiveSession
       std::shared_future<absl::StatusOr<raiden::PjRtCopyFuture>>;
 
   void ReleaseStagingLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Host destination: counts |layer_idx| as settled and, once every layer has
+  // landed, closes the network phase (last packet, metrics) and finishes the
+  // receive; there is no H2D step after it.
+  absl::Status SettleHostLayer(KVCacheManagerWithTransfer& manager,
+                               size_t layer_idx);
   // Transitions the session into draining/completed state. If |status| is
   // non-OK and this is the first failure, records |status| and attributes the
   // failure to |phase| (or infers the current phase via CurrentPhaseLocked()
@@ -267,6 +284,9 @@ class TransferReceiveSession
   kv_cache::KVCacheManagerBase* base_ = nullptr;
   StagingBlockAllocator* staging_allocator_ = nullptr;
   uint64_t uuid_ = 0;
+  // Where the received blocks end up: device blocks after an H2D copy, or
+  // the host blocks they were pushed into.
+  const BlockMemory destination_ = BlockMemory::kDevice;
   std::string req_id_ ABSL_GUARDED_BY(mu_);
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
   CopyPlan load_plan_ ABSL_GUARDED_BY(mu_);

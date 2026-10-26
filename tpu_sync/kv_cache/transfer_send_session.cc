@@ -65,15 +65,15 @@ TransferSendSession::Create(
     StagingBlockAllocator* absl_nullable staging_allocator, std::string req_id,
     uint64_t uuid, absl::Span<const int64_t> block_ids,
     std::chrono::steady_clock::time_point deadline,
-    std::chrono::steady_clock::time_point register_start) {
+    std::chrono::steady_clock::time_point register_start, BlockMemory source) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
   ABSL_ASSIGN_OR_RETURN(const DataConnectionReuse data_connection_reuse,
                         ResolveDataConnectionReuse());
-  auto session = std::shared_ptr<TransferSendSession>(
-      new TransferSendSession(base, staging_allocator, std::move(req_id), uuid,
-                              deadline, register_start, data_connection_reuse));
+  auto session = std::shared_ptr<TransferSendSession>(new TransferSendSession(
+      base, staging_allocator, std::move(req_id), uuid, deadline,
+      register_start, data_connection_reuse, source));
   std::optional<DuplicateBlock> duplicate_block =
       session->PopulateRegisteredBlocks(block_ids);
   if (duplicate_block.has_value()) {
@@ -91,14 +91,15 @@ TransferSendSession::TransferSendSession(
     StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
     std::chrono::steady_clock::time_point deadline,
     std::chrono::steady_clock::time_point register_start,
-    DataConnectionReuse data_connection_reuse)
+    DataConnectionReuse data_connection_reuse, BlockMemory source)
     : base_(base),
       staging_allocator_(staging_allocator),
       req_id_(std::move(req_id)),
       uuid_(uuid),
       deadline_(deadline),
       register_start_(register_start),
-      data_connection_reuse_(data_connection_reuse) {}
+      data_connection_reuse_(data_connection_reuse),
+      source_(source) {}
 
 std::optional<TransferSendSession::DuplicateBlock>
 TransferSendSession::PopulateRegisteredBlocks(
@@ -242,6 +243,8 @@ TransferDetails TransferSendSession::Details() const {
 
 absl::string_view TransferSendSession::CurrentPhaseLocked() const {
   if (remote_data_endpoints_.empty()) return kAwaitPullPhase;
+  // A host-resident send has nothing to stage or copy.
+  if (source_ == BlockMemory::kHost) return kPushPhase;
   if (staging_.empty()) return kStagingPhase;
   if (d2h_layer_futures_.size() < base_->num_layers()) return kD2hPhase;
   for (const raiden::PjRtCopyFuture& future : d2h_layer_futures_) {
@@ -362,10 +365,6 @@ void TransferSendSession::StartPush(
   RAIDEN_TRACE_FN("KVTransfer::StartPush", [&]() {
     return absl::StrCat("uuid=", uuid_, " blocks=", src_block_ids.size());
   });
-  // Stage the producer's device KV into a host slot (slot.block_ids) and send
-  // those host blocks to the consumer, keeping host offsets within the staging
-  // pool. Writing D2H straight to host[src_block_id] overflows the host buffer
-  // once a device block id exceeds num_host_blocks.
   if (src_block_ids.empty() || src_block_ids.size() != dst_block_ids.size() ||
       remote_data_endpoints.empty()) {
     Finish(absl::InvalidArgumentError(
@@ -375,8 +374,24 @@ void TransferSendSession::StartPush(
   {
     absl::MutexLock lock(mu_);
     remote_data_endpoints_ = remote_data_endpoints;
+    dst_ints_.assign(dst_block_ids.begin(), dst_block_ids.end());
   }
 
+  if (source_ == BlockMemory::kHost) {
+    // The registered blocks already are host blocks: push them as they are.
+    {
+      absl::MutexLock lock(mu_);
+      src_ints_.assign(src_block_ids.begin(), src_block_ids.end());
+      d2h_done_ = std::chrono::steady_clock::now();
+    }
+    PushHostLayers();
+    return;
+  }
+
+  // Stage the producer's device KV into a host slot (slot.block_ids) and send
+  // those host blocks to the consumer, keeping host offsets within the staging
+  // pool. Writing D2H straight to host[src_block_id] overflows the host buffer
+  // once a device block id exceeds num_host_blocks.
   absl::Status acquire_status =
       AcquireStagingWithRetry(static_cast<int64_t>(src_block_ids.size()));
   if (!acquire_status.ok()) {
@@ -400,7 +415,6 @@ void TransferSendSession::StartPush(
                           blocks.begin() + src_block_ids.size());
     d2h_layer_futures_.reserve(total_layers);
     src_ints_.assign(host_block_ids.begin(), host_block_ids.end());
-    dst_ints_.assign(dst_block_ids.begin(), dst_block_ids.end());
   }
 
   // Coalesce contiguous (device,host) block runs into a few large copies. With
@@ -499,51 +513,83 @@ void TransferSendSession::SendNextLayer(size_t l) {
     std::move(end_op).Cancel();
     self->base_->push_pool()->Schedule([self, l]() {
       absl::Cleanup end_op = [self]() { self->EndSendOp(); };
-      std::vector<std::string> remote_data_endpoints;
-      std::vector<int> src_ints;
-      std::vector<int> dst_ints;
-      {
-        absl::MutexLock lock(self->mu_);
-        if (self->draining_) {
-          return;
-        }
-        remote_data_endpoints = self->remote_data_endpoints_;
-        src_ints = self->src_ints_;
-        dst_ints = self->dst_ints_;
-        ++self->in_flight_;
-      }
-      LOG(INFO) << "StartPush (H2H start layer " << l
-                << "): uuid=" << self->uuid_
-                << ", numa=" << self->base_->assigned_numa_node().value_or(-1);
-      self->base_->H2hWriteDirectAsync(
-          remote_data_endpoints, src_ints, dst_ints, self->uuid_,
-          static_cast<int>(l),
-          [self, l](absl::StatusOr<std::vector<int>> push_res) {
-            absl::Cleanup end_op = [self]() { self->EndSendOp(); };
-            if (!push_res.ok()) {
-              LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
-                         << push_res.status().ToString();
-              absl::MutexLock lock(self->mu_);
-              self->FinishLocked(push_res.status(), kPushPhase);
-              return;
-            }
-
-            LOG(INFO) << "StartPush (H2H complete layer " << l
-                      << "): uuid=" << self->uuid_ << ", numa="
-                      << self->base_->assigned_numa_node().value_or(-1);
-
-            const bool last = self->remaining_h2h_layers_.fetch_sub(1) == 1;
-            if (last) {
-              LOG(INFO) << "StartPush (All H2H complete): uuid=" << self->uuid_;
-              self->Finish();
-            }
-          });
-
+      self->PushLayer(l);
       // Immediately queue the next layer's push without waiting for this one to
       // finish.
       self->SendNextLayer(l + 1);
     });
   });
+}
+
+void TransferSendSession::PushHostLayers() {
+  const size_t total_layers = base_->num_layers();
+  {
+    absl::MutexLock lock(mu_);
+    if (draining_ || done_) return;
+    if (total_layers == 0) {
+      FinishLocked(absl::OkStatus());
+      return;
+    }
+  }
+  remaining_h2h_layers_.store(total_layers, std::memory_order_relaxed);
+  // Every layer is ready at once; each push is issued from a push-pool worker,
+  // as on the device path, and is counted as in flight from here on.
+  for (size_t l = 0; l < total_layers; ++l) {
+    {
+      absl::MutexLock lock(mu_);
+      if (draining_) return;
+      ++in_flight_;
+    }
+    base_->push_pool()->Schedule([self = shared_from_this(), l]() {
+      absl::Cleanup end_op = [self]() { self->EndSendOp(); };
+      self->PushLayer(l);
+    });
+  }
+}
+
+void TransferSendSession::PushLayer(size_t l) {
+  std::vector<std::string> remote_data_endpoints;
+  std::vector<int> src_ints;
+  std::vector<int> dst_ints;
+  {
+    absl::MutexLock lock(mu_);
+    // The send expired or failed meanwhile: nothing more is pushed.
+    if (draining_) {
+      return;
+    }
+    remote_data_endpoints = remote_data_endpoints_;
+    src_ints = src_ints_;
+    dst_ints = dst_ints_;
+    ++in_flight_;
+  }
+  LOG(INFO) << "StartPush (H2H start layer " << l << "): uuid=" << uuid_
+            << ", numa=" << base_->assigned_numa_node().value_or(-1);
+  base_->H2hWriteDirectAsync(
+      remote_data_endpoints, src_ints, dst_ints, uuid_, static_cast<int>(l),
+      [self = shared_from_this(), l](absl::StatusOr<std::vector<int>> res) {
+        self->OnLayerPushed(l, std::move(res));
+      });
+}
+
+void TransferSendSession::OnLayerPushed(
+    size_t l, absl::StatusOr<std::vector<int>> push_result) {
+  absl::Cleanup end_op = [this]() { EndSendOp(); };
+  if (!push_result.ok()) {
+    LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
+               << push_result.status().ToString();
+    absl::MutexLock lock(mu_);
+    FinishLocked(push_result.status(), kPushPhase);
+    return;
+  }
+
+  LOG(INFO) << "StartPush (H2H complete layer " << l << "): uuid=" << uuid_
+            << ", numa=" << base_->assigned_numa_node().value_or(-1);
+
+  const bool last = remaining_h2h_layers_.fetch_sub(1) == 1;
+  if (last) {
+    LOG(INFO) << "StartPush (All H2H complete): uuid=" << uuid_;
+    Finish();
+  }
 }
 
 }  // namespace tpu_raiden

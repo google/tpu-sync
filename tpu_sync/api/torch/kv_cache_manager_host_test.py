@@ -247,5 +247,41 @@ class PollStatsWithDetailsTest(unittest.TestCase):
     self.assertEqual(failed.phase, "d2h")
 
 
+class _FakeReadImpl:
+
+  def __init__(self):
+    self.calls = []
+
+  def notify_for_read(self, *args, host_source):
+    self.calls.append((*args, host_source))
+    return 1
+
+  def start_read(self, *args, host_destination):
+    self.calls.append((*args, host_destination))
+
+
+class HostMemoryReadTest(unittest.TestCase):
+
+  def test_read_source_and_destination(self):
+    manager = object.__new__(kv_cache_manager.KVCacheManager)
+    manager._impl = impl = _FakeReadImpl()  # pylint: disable=protected-access
+    with self.assertRaisesRegex(ValueError, "source must be 'device' or"):
+      manager.register_read("r", 7, [1], source="hbm")
+    with self.assertRaisesRegex(ValueError, "destination must be 'device' or"):
+      manager.start_read("r", 7, "h", [1], [1], destination="x")
+    self.assertEqual(impl.calls, [])
+
+    self.assertTrue(manager.register_read("r", 7, [1, 2], source="host"))
+    self.assertTrue(manager.register_read("r", 8, [3]))
+    manager.start_read(
+        "r", 7, "h", [1, 2], local_host_block_ids=[5, 6], destination="host"
+    )
+    manager.start_read("r", 8, "h", [3], [9])
+    self.assertEqual(impl.calls[0], ("r", 7, [1, 2], True))
+    self.assertEqual(impl.calls[1], ("r", 8, [3], False))
+    self.assertEqual(impl.calls[2], ("r", 7, "h", [1, 2], [], 1, [5, 6], True))
+    self.assertEqual(impl.calls[3], ("r", 8, "h", [3], [9], 1, None, False))
+
+
 if __name__ == "__main__":
   unittest.main()

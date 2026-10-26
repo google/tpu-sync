@@ -100,13 +100,13 @@ TorchKVCacheManager::Create(
     const std::vector<std::vector<at::Tensor>>& device_tensors,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id,
-    bool enable_shm) {
+    bool enable_shm, int64_t local_control_port, double timeout_s) {
   try {
     return absl::WrapUnique(new TorchKVCacheManager(
         UnpackLayers(device_tensors, unsafe_skip_buffer_lock), local_port,
         host_blocks_to_allocate, unsafe_skip_buffer_lock, parallelism, node_id,
-        /*local_control_port=*/-1, /*max_blocks=*/0, /*num_slots=*/0,
-        /*timeout_s=*/120.0, /*kv_caches=*/{}, enable_shm));
+        local_control_port, /*max_blocks=*/0, /*num_slots=*/0, timeout_s,
+        /*kv_caches=*/{}, enable_shm));
   } catch (const std::invalid_argument& e) {
     return absl::InvalidArgumentError(e.what());
   } catch (const std::exception& e) {
@@ -294,12 +294,13 @@ absl::StatusOr<std::unique_ptr<KVCacheManager>> KVCacheManager::Create(
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id, int64_t node_id, bool enable_shm) {
-  ABSL_ASSIGN_OR_RETURN(
-      std::unique_ptr<TorchKVCacheManager> torch_manager,
-      TorchKVCacheManager::Create(
-          device_tensors, local_port, host_blocks_to_allocate,
-          unsafe_skip_buffer_lock, parallelism, node_id, enable_shm));
+    std::optional<std::string> worker_id, int64_t node_id, bool enable_shm,
+    int64_t local_control_port, double timeout_s) {
+  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<TorchKVCacheManager> torch_manager,
+                        TorchKVCacheManager::Create(
+                            device_tensors, local_port, host_blocks_to_allocate,
+                            unsafe_skip_buffer_lock, parallelism, node_id,
+                            enable_shm, local_control_port, timeout_s));
   auto manager = absl::WrapUnique(new KVCacheManager(std::move(torch_manager)));
   ABSL_RETURN_IF_ERROR(manager->StartGrpcServer(
       raiden_worker_port, std::move(raiden_controller_address),

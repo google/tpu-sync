@@ -656,6 +656,11 @@ cc_library(
     srcs = [
         "data_connection_policy.cc",
         "kv_cache_manager_with_transfer.cc",
+        "recv_nan_check.cc",
+        "recv_nan_check_fp8.cc",
+        "recv_nan_check_plan.cc",
+        "recv_nan_check_program.cc",
+        "recv_nan_check_worker.cc",
         "reshard_receive_session.cc",
         "reshard_send_session.cc",
         "transfer_receive_session.cc",
@@ -664,6 +669,11 @@ cc_library(
     hdrs = [
         "data_connection_policy.h",
         "kv_cache_manager_with_transfer.h",
+        "nan_log_level.h",
+        "recv_nan_check.h",
+        "recv_nan_check_fp8.h",
+        "recv_nan_check_program.h",
+        "recv_nan_check_worker.h",
         "reshard_receive_session.h",
         "reshard_send_session.h",
         "transfer_receive_session.h",
@@ -711,6 +721,12 @@ cc_library(
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@xla//xla/tsl/concurrency:future",
+        "@xla//xla/hlo/builder:xla_builder",
+        "@xla//xla/pjrt/proto:compile_options_proto_cc",
+        "@xla//xla:debug_options_flags",
+        "@xla//xla/hlo/builder/lib:constants",
+        "@xla//xla:literal",
+        "@xla//xla:shape_util",
     ],
 )
 
@@ -1066,6 +1082,56 @@ cc_test(
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "nan_log_level_test",
+    size = "small",
+    srcs = [
+        "nan_log_level.h",
+        "nan_log_level_test.cc",
+    ],
+    deps = ["@com_google_googletest//:gtest_main"],
+)
+
+cc_test(
+    name = "recv_nan_check_fp8_test",
+    size = "small",
+    srcs = [
+        "recv_nan_check.h",
+        "recv_nan_check_fp8.cc",
+        "recv_nan_check_fp8.h",
+        "recv_nan_check_fp8_test.cc",
+        "recv_nan_check_plan.cc",
+        "recv_nan_check_program.cc",
+        "recv_nan_check_program.h",
+        "recv_nan_check_program_test.cc",
+    ],
+    deps = [
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla/hlo/builder:xla_builder",
+        "@xla//xla/hlo/builder/lib:constants",
+        "@xla//xla/hlo/evaluator:hlo_evaluator",
+        "@xla//xla/hlo/ir:hlo",
+        "@xla//xla:literal",
+        "@xla//xla:literal_util",
+        "@xla//xla:shape_util",
+    ],
+)
+
+cc_test(
+    name = "recv_nan_check_test",
+    size = "small",
+    srcs = [
+        "recv_nan_check.h",
+        "recv_nan_check_plan.cc",
+        "recv_nan_check_test.cc",
+        "recv_nan_check_worker.cc",
+        "recv_nan_check_worker.h",
+    ],
+    deps = [
         "@com_google_googletest//:gtest_main",
     ],
 )

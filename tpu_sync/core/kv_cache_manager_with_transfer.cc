@@ -14,6 +14,8 @@
 
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 
+#include <cassert>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -53,6 +55,7 @@
 #include "tpu_sync/core/metrics_collector.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/recv_nan_check.h"
 #include "tpu_sync/core/reshard_receive_session.h"
 #include "tpu_sync/core/reshard_send_session.h"
 #include "tpu_sync/core/transfer_receive_session.h"
@@ -317,6 +320,12 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
           node_id, local_control_port, max_blocks, num_slots, timeout_s,
           std::move(metrics_collector)) {}
 
+void KVCacheManagerWithTransfer::SetRecvNanCheckBufferOwner(
+    std::weak_ptr<void> owner) {
+  assert(!recv_nan_check_ && "typed buffer owner must be registered once");
+  recv_nan_check_ = std::make_shared<RecvNanCheck>(std::move(owner));
+}
+
 KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
   StopControlServer();
   // Pull-serve workers read this object's state; nothing may be torn down
@@ -362,6 +371,7 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
   for (const auto& session : sessions_to_wait) {
     session->AwaitForDone().IgnoreError();
   }
+  if (recv_nan_check_) recv_nan_check_->Drain();
   if (base_) {
     base_->StopTransportServer();
     base_->ShutdownTransferPools();
@@ -652,7 +662,8 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
   ABSL_ASSIGN_OR_RETURN(
       std::shared_ptr<ReshardReceiveSession> recv_session,
       ReshardReceiveSession::Create(base_.get(), staging_allocator_.get(), plan,
-                                    chip_block_ids, DeadlineFromNow()));
+                                    chip_block_ids, DeadlineFromNow(),
+                                    &recv_nan_check_));
 
   ABSL_RETURN_IF_ERROR(
       base_->RegisterActivePlanDirect(plan.uuid(), plan, /*is_sender=*/false));

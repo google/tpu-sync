@@ -14,6 +14,7 @@
 
 #include "tpu_sync/core/xla_compat.h"
 
+#include <cassert>
 #include <memory>
 #include <type_traits>
 #include <utility>
@@ -111,6 +112,23 @@ const PJRT_RawBuffer_Extension* GetRawBufferExtension(
   if (capi_client == nullptr) return nullptr;
   return capi_client->FindExtension<PJRT_RawBuffer_Extension>(
       PJRT_Extension_Type::PJRT_Extension_Type_RawBuffer);
+}
+
+PJRT_Buffer* BorrowCApiBuffer(xla::PjRtBuffer* buffer) {
+  auto* capi_buffer = dynamic_cast<xla::PjRtCApiBuffer*>(buffer);
+  assert(capi_buffer != nullptr && "borrow requires a pinned C API buffer");
+  return capi_buffer->c_buffer();
+}
+
+absl::StatusOr<CApiDeviceHandles> GetCApiDeviceHandles(
+    xla::PjRtDevice* device) {
+  auto* capi_device = dynamic_cast<xla::PjRtCApiDevice*>(device);
+  if (capi_device == nullptr)
+    return absl::UnimplementedError("PJRT C API device required");
+  auto* client = dynamic_cast<xla::PjRtCApiClient*>(
+      capi_device->xla::PjRtCApiDevice::client());
+  assert(client != nullptr && "C API device must belong to a C API client");
+  return CApiDeviceHandles{client->pjrt_c_client(), capi_device->c_device()};
 }
 
 }  // namespace raiden

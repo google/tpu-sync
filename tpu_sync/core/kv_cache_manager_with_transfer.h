@@ -51,6 +51,7 @@ namespace tpu_raiden {
 
 class MetricsCollector;
 class ReshardReceiveSession;
+class RecvNanCheck;
 class ReshardSendSession;
 class TransferSendSession;
 class TransferReceiveSession;
@@ -306,6 +307,9 @@ class KVCacheManagerWithTransfer {
       int64_t num_slots = 0, double timeout_s = 120.0,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
+  // Frontends register their existing typed buffer owner during construction.
+  void SetRecvNanCheckBufferOwner(std::weak_ptr<void> owner);
+
   std::unique_ptr<kv_cache::KVCacheManagerBase> base_;
 
   std::vector<RaidenTransferEndpoint> BuildEndpoints(int64_t port) const;
@@ -317,6 +321,9 @@ class KVCacheManagerWithTransfer {
   // published without its staging owner or torn down against a half-built
   // registration.
   absl::Mutex plan_lifecycle_mu_;
+  // Registered during frontend construction, then read-only. Device programs,
+  // worker, and strong input owner are created only when diagnostics are enabled.
+  std::shared_ptr<RecvNanCheck> recv_nan_check_;
   // Source of plan generations: the uuid names a transfer, a generation
   // names one registration of it (the same uuid may come back, e.g. on a
   // retry of the same transfer).

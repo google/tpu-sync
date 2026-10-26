@@ -38,6 +38,7 @@
 
 namespace xla {
 class PjRtBuffer;
+class PjRtDevice;
 }  // namespace xla
 
 namespace raiden {
@@ -105,6 +106,17 @@ absl::StatusOr<PJRT_RawBuffer*> CreateCApiRawAlias(
 // if unsupported. If out_c_api is provided, populates the PJRT_Api pointer.
 const PJRT_RawBuffer_Extension* GetRawBufferExtension(
     const xla::PjRtBuffer* buffer, const PJRT_Api** out_c_api = nullptr);
+
+// Borrows a C API handle. The caller must pin the original PjRtBuffer and
+// must not destroy the returned handle. The input must be a C API buffer.
+PJRT_Buffer* BorrowCApiBuffer(xla::PjRtBuffer* buffer);
+
+struct CApiDeviceHandles {
+  PJRT_Client* client;
+  PJRT_Device* device;
+};
+// Extracts stable C handles without carrying a C++ Status/Future across DSOs.
+absl::StatusOr<CApiDeviceHandles> GetCApiDeviceHandles(xla::PjRtDevice* device);
 
 }  // namespace raiden
 

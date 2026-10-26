@@ -14,7 +14,10 @@
 
 #include "tpu_sync/core/reshard_receive_session.h"
 
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -43,6 +46,32 @@ namespace {
 using ::tpu_sync::rpc::MEMORY_TYPE_HBM;
 using ::tpu_sync::rpc::ShardPushEntryProto;
 using ::tpu_sync::rpc::StartTransferRequest;
+
+TEST(ReshardReceiveSessionTest, RejectsInvalidNanLevelAtEntryWithoutThrowing) {
+  const char* previous = std::getenv("TPU_NAN_LOG_LEVEL");
+  const std::optional<std::string> saved =
+      previous == nullptr ? std::nullopt
+                          : std::make_optional<std::string>(previous);
+  setenv("TPU_NAN_LOG_LEVEL", "5", 1);
+  std::shared_ptr<RecvNanCheck> owner;
+  auto create = [&](std::shared_ptr<RecvNanCheck>* diagnostic_owner) {
+    return ReshardReceiveSession::Create(
+        nullptr, nullptr, StartTransferRequest(), {},
+        std::chrono::steady_clock::time_point::max(), diagnostic_owner);
+  };
+  const auto invalid = create(&owner);
+  EXPECT_EQ(invalid.status().code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_NE(invalid.status().message().find("TPU_NAN_LOG_LEVEL"),
+            std::string::npos);
+  const auto disabled = create(nullptr);
+  EXPECT_EQ(disabled.status().code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(disabled.status().message(), "staging_allocator must not be null");
+  if (saved) {
+    setenv("TPU_NAN_LOG_LEVEL", saved->c_str(), 1);
+  } else {
+    unsetenv("TPU_NAN_LOG_LEVEL");
+  }
+}
 
 kv_cache::KVCacheManagerBase MakeTestBase() {
   return kv_cache::KVCacheManagerBase(

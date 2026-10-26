@@ -152,7 +152,7 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
 
   std::vector<at::Tensor> kv_caches_;
   // Keep-alives for the materialized device buffers backing the manager.
-  std::vector<torch_tpu::TensorBufferHandle> buffer_refs_;
+  std::shared_ptr<std::vector<torch_tpu::TensorBufferHandle>> buffer_refs_;
   std::unique_ptr<tpu_raiden::kv_cache::KVCacheListener> listener_;
 };
 

@@ -163,7 +163,10 @@ TorchKVCacheManager::TorchKVCacheManager(
       kv_caches_(std::move(kv_caches)),
       // Move the keep-alive refs in AFTER the base ctor has acquired the
       // buffers; they pin the materialized device buffers for our lifetime.
-      buffer_refs_(std::move(unpacked.refs)) {}
+      buffer_refs_(std::make_shared<std::vector<torch_tpu::TensorBufferHandle>>(
+          std::move(unpacked.refs))) {
+  if (!buffer_refs_->empty()) SetRecvNanCheckBufferOwner(buffer_refs_);
+}
 
 TorchKVCacheManager::TorchKVCacheManager(
     const std::vector<at::Tensor>& kv_caches, int64_t node_id,

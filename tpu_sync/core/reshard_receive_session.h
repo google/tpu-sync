@@ -31,6 +31,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/recv_nan_check.h"
 #include "tpu_sync/core/transfer_session.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 
@@ -62,7 +63,8 @@ class ReshardReceiveSession
       StagingBlockAllocator* absl_nullable staging_allocator,
       const ::tpu_sync::rpc::StartTransferRequest& plan,
       absl::Span<const int64_t> chip_blocks,
-      std::chrono::steady_clock::time_point deadline);
+      std::chrono::steady_clock::time_point deadline,
+      std::shared_ptr<RecvNanCheck>* diagnostic_owner = nullptr);
 
   ~ReshardReceiveSession() override { ReleaseStaging(); }
 
@@ -125,7 +127,8 @@ class ReshardReceiveSession
                         StagingBlockAllocator* staging_allocator, uint64_t uuid,
                         const ::tpu_sync::rpc::StartTransferRequest& plan,
                         absl::Span<const int64_t> chip_blocks,
-                        std::chrono::steady_clock::time_point deadline);
+                        std::chrono::steady_clock::time_point deadline,
+                        std::shared_ptr<RecvNanCheck::Task> recv_nan_check);
 
   static absl::Status ValidatePlan(
       const kv_cache::KVCacheManagerBase& base,
@@ -147,6 +150,7 @@ class ReshardReceiveSession
   // pool-reshard receive when all pools have completed or on error.
   void FinishPoolH2d(KVCacheManagerWithTransfer& manager, size_t pool_idx,
                      const absl::Status& status);
+  void FinishReceive(const absl::Status& status);
 
   bool AllH2dDoneLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   absl::Status RecordPoolReceivedLocked(size_t pool_idx)
@@ -159,6 +163,7 @@ class ReshardReceiveSession
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
+  const std::shared_ptr<RecvNanCheck::Task> recv_nan_check_;
   StagingBlockAllocator* const staging_allocator_ = nullptr;
   const uint64_t uuid_ = 0;
   const std::string req_id_;

@@ -58,6 +58,8 @@ struct RawProgress {
   absl::Time arm_time = absl::InfinitePast();
   absl::Time first_chunk_time = absl::InfinitePast();
   uint64_t total_bytes = 0;
+  uint64_t expected_xor_hash = 0;
+  bool has_expected_hash = false;
 };
 
 // Weight-sync buffer push/pull (kOpBufferPush / kOpBufferPull /

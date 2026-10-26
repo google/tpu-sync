@@ -61,6 +61,8 @@ ChunkHeader MakeSampleHeaderV2() {
   };
 }
 
+constexpr uint64_t kSampleExpectedHash = 0xCAFEBABEDEADBEEFULL;
+
 ChunkMetadata MakeSampleMetadataV2() {
   return ChunkMetadata{
       .layer_idx = 0x12345678,
@@ -69,6 +71,7 @@ ChunkMetadata MakeSampleMetadataV2() {
       .size_bytes = 0x99AABBCCDDEEFF00ULL,
       .dst_stride_bytes = 0x0102030405060708ULL,
       .count = 0x12345678,
+      .expected_hash = kSampleExpectedHash,
   };
 }
 
@@ -151,6 +154,7 @@ TEST(ChunkMetadataSerializerTest, SerializeAndDeserializeV1) {
       .size_bytes = 0x99AABBCCDDEEFF00ULL,
       .dst_stride_bytes = 0x99AABBCCDDEEFF00ULL,
       .count = 1,
+      .expected_hash = kSampleExpectedHash,
   };
   const auto bytes = SerializeChunkMetadata(original, /*ver=*/1);
   ASSERT_EQ(bytes.size(), GetChunkMetadataSize(1));
@@ -171,22 +175,22 @@ TEST(ChunkMetadataSerializerTest, SerializeToLittleEndian) {
   const auto wire = SerializeChunkMetadata(MakeSampleMetadataV2(), /*ver=*/2);
   ASSERT_EQ(wire.size(), GetChunkMetadataSize(2));
 
-  alignas(8) const uint8_t expected_wire[40] = {
-      0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A, 0x88, 0x77,
-      0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00, 0xFF, 0xEE, 0xDD,
-      0xCC, 0xBB, 0xAA, 0x99, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
-      0x02, 0x01, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00,
+  alignas(8) const uint8_t expected_wire[48] = {
+      0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A, 0x88, 0x77, 0x66, 0x55,
+      0x44, 0x33, 0x22, 0x11, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99,
+      0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x78, 0x56, 0x34, 0x12,
+      0x00, 0x00, 0x00, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 0xBE, 0xBA, 0xFE, 0xCA,
   };
 
   EXPECT_THAT(wire, ElementsAreArray(expected_wire));
 }
 
 TEST(ChunkMetadataSerializerTest, DeserializeLittleEndian) {
-  alignas(8) const uint8_t raw_wire[40] = {
-      0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A, 0x88, 0x77,
-      0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00, 0xFF, 0xEE, 0xDD,
-      0xCC, 0xBB, 0xAA, 0x99, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03,
-      0x02, 0x01, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00,
+  alignas(8) const uint8_t raw_wire[48] = {
+      0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A, 0x88, 0x77, 0x66, 0x55,
+      0x44, 0x33, 0x22, 0x11, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99,
+      0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x78, 0x56, 0x34, 0x12,
+      0x00, 0x00, 0x00, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 0xBE, 0xBA, 0xFE, 0xCA,
   };
 
   const auto wire = absl::MakeConstSpan(reinterpret_cast<const char*>(raw_wire),
@@ -197,9 +201,10 @@ TEST(ChunkMetadataSerializerTest, DeserializeLittleEndian) {
 }
 
 TEST(ChunkMetadataSerializerTest, DeserializeV1LittleEndian) {
-  alignas(8) const uint8_t raw_wire[24] = {
-      0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A, 0x88, 0x77, 0x66, 0x55,
-      0x44, 0x33, 0x22, 0x11, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99,
+  alignas(8) const uint8_t raw_wire[32] = {
+      0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A, 0x88, 0x77, 0x66,
+      0x55, 0x44, 0x33, 0x22, 0x11, 0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB,
+      0xAA, 0x99, 0xEF, 0xBE, 0xAD, 0xDE, 0xBE, 0xBA, 0xFE, 0xCA,
   };
 
   const auto wire = absl::MakeConstSpan(reinterpret_cast<const char*>(raw_wire),
@@ -212,6 +217,7 @@ TEST(ChunkMetadataSerializerTest, DeserializeV1LittleEndian) {
       .size_bytes = 0x99AABBCCDDEEFF00ULL,
       .dst_stride_bytes = 0x99AABBCCDDEEFF00ULL,
       .count = 1,
+      .expected_hash = kSampleExpectedHash,
   };
 
   EXPECT_THAT(DeserializeChunkMetadata(wire, /*ver=*/1),
@@ -220,10 +226,10 @@ TEST(ChunkMetadataSerializerTest, DeserializeV1LittleEndian) {
 
 TEST(ChunkMetadataSerializerTest, DeserializeRejectsInvalidVersion) {
   const auto bytes = SerializeChunkMetadata(MakeSampleMetadataV2(), /*ver=*/2);
-  // Version 1 has metadata size 24, so 40 bytes does not match.
+  // Version 1 has metadata size 32, so 48 bytes does not match.
   EXPECT_THAT(DeserializeChunkMetadata(bytes, /*ver=*/1),
               StatusIs(absl::StatusCode::kInvalidArgument));
-  // Version 3 has metadata size 0, so 40 bytes does not match.
+  // Version 3 has metadata size 0, so 48 bytes does not match.
   EXPECT_THAT(DeserializeChunkMetadata(bytes, /*ver=*/3),
               StatusIs(absl::StatusCode::kInvalidArgument));
   // Version 3 with 0-size input returns FailedPrecondition due to unsupported
@@ -263,6 +269,33 @@ TEST(ChunkSizeSerializerTest, SerializeToLittleEndian) {
 
   const uint8_t expected_wire[4] = {0x78, 0x56, 0x34, 0x12};
   EXPECT_THAT(bytes, ElementsAreArray(expected_wire));
+}
+
+TEST(ComputeChunkXorHashTest, SplitChunksProduceSameXorHashAsFullChunk) {
+  const std::vector<uint8_t> data = {10, 20, 30, 40, 50, 60, 70, 80};
+  const ChunkMetadata full_chunk = {
+      .layer_idx = 2,
+      .dst_shard_idx = 1,
+      .dst_offset_bytes = 100,
+      .size_bytes = 8,
+  };
+  const ChunkMetadata part1 = {
+      .layer_idx = 2,
+      .dst_shard_idx = 1,
+      .dst_offset_bytes = 100,
+      .size_bytes = 3,
+  };
+  const ChunkMetadata part2 = {
+      .layer_idx = 2,
+      .dst_shard_idx = 1,
+      .dst_offset_bytes = 103,
+      .size_bytes = 5,
+  };
+
+  const uint64_t expected_full = ComputeChunkXorHash(full_chunk, data.data());
+  EXPECT_EQ(expected_full, ComputeChunkXorHash(part2, data.data() + 3) ^
+                               ComputeChunkXorHash(part1, data.data()));
+  EXPECT_NE(expected_full, 0u);
 }
 
 }  // namespace

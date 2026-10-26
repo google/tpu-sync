@@ -31,9 +31,11 @@
 #include "absl/flags/flag.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -54,6 +56,7 @@
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 ABSL_DECLARE_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size);
@@ -61,6 +64,12 @@ ABSL_DECLARE_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size);
 namespace tpu_raiden {
 namespace weight_sync {
 namespace {
+
+using ::absl_testing::StatusIs;
+using ::testing::HasSubstr;
+
+constexpr absl::string_view kXorChecksumMismatchError = "XOR checksum mismatch";
+constexpr uint64_t kCorruptedXorHash = 0x1234ULL;
 
 class WeightSynchronizerTest : public ::testing::Test {
  protected:
@@ -3707,6 +3716,181 @@ TEST_F(WeightSynchronizerTest, AutoH2dOnDataReceivedRecordsH2dBytes) {
   EXPECT_EQ(m.total_h2d_bytes, s.total_device_bytes);
   EXPECT_GT(m.last_h2d_time_ms, 0.0);
   EXPECT_DOUBLE_EQ(m.total_h2d_time_ms, m.last_h2d_time_ms);
+}
+
+TEST_F(WeightSynchronizerTest,
+       VerifyHostBuffersIgnoresTilePaddingBytesInLogicalShapeModes) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::PjRtClient> client,
+                       xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client->addressable_devices()[0]->default_memory_space());
+
+  // Logical shape F32[3, 3] is 36 bytes (9 floats), while a 4x4 tile pads
+  // device_size to 64 bytes (16 floats).
+  constexpr int64_t kLogicalDim = 3;
+  constexpr int64_t kPaddedDim = 4;
+  constexpr size_t kLogicalBytes = kLogicalDim * kLogicalDim * sizeof(float);
+  constexpr size_t kDeviceBytes = kPaddedDim * kPaddedDim * sizeof(float);
+  std::vector<float> initial_device_data(kPaddedDim * kPaddedDim, 0.0f);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<xla::PjRtBuffer> pjrt_buffer,
+      client->BufferFromHostBuffer(
+          initial_device_data.data(), xla::PrimitiveType::F32,
+          {kPaddedDim, kPaddedDim}, /*byte_strides=*/std::nullopt,
+          xla::PjRtClient::HostBufferSemantics::
+              kImmutableUntilTransferCompletes,
+          /*on_done_with_host_buffer=*/nullptr, memory_space,
+          /*device_layout=*/nullptr));
+  TF_ASSERT_OK_AND_ASSIGN(raiden::RaidenBufferHandle handle,
+                       raiden::RaidenBufferHandle::Acquire(pjrt_buffer.get()));
+  handle.shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::F32, {kLogicalDim, kLogicalDim}, {1, 0},
+      {xla::Tile({kPaddedDim, kPaddedDim})});
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws,
+      WeightSynchronizerBase::Create({{handle}}, /*local_port=*/0));
+  ASSERT_EQ(ws->GetHostSize(0, 0), kDeviceBytes);
+
+  uint8_t* host_ptr = ws->GetHostPointer(0, 0);
+  ASSERT_NE(host_ptr, nullptr);
+  std::memset(host_ptr, 0x2A, kLogicalBytes);
+  // Fill the padding tail [kLogicalBytes, kDeviceBytes) with non-zero garbage.
+  std::memset(host_ptr + kLogicalBytes, 0xDE, kDeviceBytes - kLogicalBytes);
+
+  const uint64_t expected_logical_hash =
+      transport::lib::ComputeContiguousXorHash(
+          /*layer_idx=*/0, /*dst_shard_idx=*/0, /*dst_offset_bytes=*/0,
+          host_ptr, kLogicalBytes);
+
+  // 1. In default HOST_TILING_MODE_DEFERRED mode, VerifyHostBuffers hashes
+  // only kLogicalBytes and ignores the 0xDE padding tail.
+  EXPECT_OK(ws->VerifyHostBuffers(/*uuid=*/9101, expected_logical_hash));
+
+  // 2. In HOST_TILING_MODE_ON_ARRIVAL mode, OnLayerDataReceived records the
+  // pre-tile hash of the logical bytes before tiling host_ptr in-place.
+  constexpr uint64_t kOnArrivalUuid = 9102;
+  tpu_sync::rpc::StartTransferRequest on_arrival_req;
+  on_arrival_req.set_uuid(kOnArrivalUuid);
+  on_arrival_req.set_host_tiling_mode(
+      tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL);
+  ws->StoreSkipTilingLocal(kOnArrivalUuid, on_arrival_req);
+  ASSERT_OK(ws->OnLayerDataReceived(/*layer_idx=*/0, kOnArrivalUuid));
+  EXPECT_OK(ws->OnDataReceived(kOnArrivalUuid, expected_logical_hash));
+}
+
+TEST_F(WeightSynchronizerTest,
+       VerifyHostBuffersHashesFullDeviceSizeWhenPreTiledOrSkipTiling) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::PjRtClient> client,
+                       xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client->addressable_devices()[0]->default_memory_space());
+
+  constexpr int64_t kLogicalDim = 3;
+  constexpr int64_t kPaddedDim = 4;
+  constexpr size_t kLogicalBytes = kLogicalDim * kLogicalDim * sizeof(float);
+  constexpr size_t kDeviceBytes = kPaddedDim * kPaddedDim * sizeof(float);
+  std::vector<float> initial_device_data(kPaddedDim * kPaddedDim, 0.0f);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<xla::PjRtBuffer> pjrt_buffer,
+      client->BufferFromHostBuffer(
+          initial_device_data.data(), xla::PrimitiveType::F32,
+          {kPaddedDim, kPaddedDim}, /*byte_strides=*/std::nullopt,
+          xla::PjRtClient::HostBufferSemantics::
+              kImmutableUntilTransferCompletes,
+          /*on_done_with_host_buffer=*/nullptr, memory_space,
+          /*device_layout=*/nullptr));
+  TF_ASSERT_OK_AND_ASSIGN(raiden::RaidenBufferHandle handle,
+                       raiden::RaidenBufferHandle::Acquire(pjrt_buffer.get()));
+  handle.shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::PrimitiveType::F32, {kLogicalDim, kLogicalDim}, {1, 0},
+      {xla::Tile({kPaddedDim, kPaddedDim})});
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws,
+      WeightSynchronizerBase::Create({{handle}}, /*local_port=*/0));
+  uint8_t* host_ptr = ws->GetHostPointer(0, 0);
+  ASSERT_NE(host_ptr, nullptr);
+  std::memset(host_ptr, 0x3C, kDeviceBytes);
+
+  const uint64_t full_device_hash = transport::lib::ComputeContiguousXorHash(
+      /*layer_idx=*/0, /*dst_shard_idx=*/0, /*dst_offset_bytes=*/0, host_ptr,
+      kDeviceBytes);
+
+  // 1. When skip_tiling is true, all kDeviceBytes are hashed.
+  constexpr uint64_t kSkipTilingUuid = 9201;
+  tpu_sync::rpc::StartTransferRequest skip_req;
+  skip_req.set_uuid(kSkipTilingUuid);
+  (*skip_req.mutable_skip_tiling())[0] = true;
+  ws->StoreSkipTilingLocal(kSkipTilingUuid, skip_req);
+  EXPECT_OK(ws->VerifyHostBuffers(kSkipTilingUuid, full_device_hash));
+
+  // Mutating a byte in the padding tail [kLogicalBytes, kDeviceBytes) must
+  // fail verification when skip_tiling is true.
+  host_ptr[kLogicalBytes] ^= 0xFF;
+  EXPECT_THAT(ws->VerifyHostBuffers(kSkipTilingUuid, full_device_hash),
+              StatusIs(absl::StatusCode::kDataLoss,
+                       HasSubstr(kXorChecksumMismatchError)));
+  host_ptr[kLogicalBytes] ^= 0xFF;
+
+  // 2. When HOST_TILING_MODE_PRE_TILED is active, all kDeviceBytes are hashed.
+  constexpr uint64_t kPreTiledUuid = 9202;
+  tpu_sync::rpc::StartTransferRequest pre_tiled_req;
+  pre_tiled_req.set_uuid(kPreTiledUuid);
+  pre_tiled_req.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED);
+  ws->StoreSkipTilingLocal(kPreTiledUuid, pre_tiled_req);
+  EXPECT_OK(ws->VerifyHostBuffers(kPreTiledUuid, full_device_hash));
+}
+
+TEST_F(WeightSynchronizerTest,
+       OnDataReceivedWithAutoH2dVerifiesExpectedXorHash) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::PjRtClient> client,
+                       xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client->addressable_devices()[0]->default_memory_space());
+
+  constexpr int64_t kNumFloats = 16;
+  constexpr size_t kByteSize = kNumFloats * sizeof(float);
+  std::vector<float> initial_device_data(kNumFloats, 0.0f);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<xla::PjRtBuffer> pjrt_buffer,
+      client->BufferFromHostBuffer(
+          initial_device_data.data(), xla::PrimitiveType::F32, {kNumFloats},
+          /*byte_strides=*/std::nullopt,
+          xla::PjRtClient::HostBufferSemantics::
+              kImmutableUntilTransferCompletes,
+          /*on_done_with_host_buffer=*/nullptr, memory_space,
+          /*device_layout=*/nullptr));
+  TF_ASSERT_OK_AND_ASSIGN(raiden::RaidenBufferHandle handle,
+                       raiden::RaidenBufferHandle::Acquire(pjrt_buffer.get()));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws,
+      WeightSynchronizerBase::Create(
+          {{handle}}, /*local_port=*/0, /*external_host_ptrs=*/std::nullopt,
+          /*unsafe_skip_buffer_lock=*/false, /*parallelism=*/1,
+          /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
+          /*layer_names=*/{}, /*auto_h2d=*/true));
+
+  uint8_t* host_ptr = ws->GetHostPointer(0, 0);
+  ASSERT_NE(host_ptr, nullptr);
+  std::memset(host_ptr, 0x5A, kByteSize);
+  const uint64_t valid_hash = transport::lib::ComputeContiguousXorHash(
+      /*layer_idx=*/0, /*dst_shard_idx=*/0, /*dst_offset_bytes=*/0, host_ptr,
+      kByteSize);
+
+  constexpr uint64_t kValidUuid = 9301;
+  ASSERT_OK(ws->OnLayerDataReceived(/*layer_idx=*/0, kValidUuid));
+  EXPECT_OK(ws->OnDataReceived(kValidUuid, valid_hash));
+
+  constexpr uint64_t kInvalidUuid = 9302;
+  ASSERT_OK(ws->OnLayerDataReceived(/*layer_idx=*/0, kInvalidUuid));
+  EXPECT_THAT(ws->OnDataReceived(kInvalidUuid, kCorruptedXorHash),
+              StatusIs(absl::StatusCode::kDataLoss,
+                       HasSubstr(kXorChecksumMismatchError)));
 }
 
 }  // namespace

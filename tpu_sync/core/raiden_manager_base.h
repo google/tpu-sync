@@ -230,6 +230,10 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   absl::Status OnDataReceived(uint64_t uuid = 0) override {
     return absl::OkStatus();
   }
+  absl::Status OnDataReceived(
+      uint64_t uuid, std::optional<uint64_t> /*expected_xor_hash*/) override {
+    return OnDataReceived(uuid);
+  }
 
   // Runs |fn| once per shard, concurrently, each as a task on |pool| pinned to
   // that shard's NUMA node so host-side work on the shard's buffers touches

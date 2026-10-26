@@ -27,7 +27,13 @@ flatbuffer_cc_library(
 
 cc_library(
     name = "chunk",
+    srcs = ["chunk.cc"],
     hdrs = ["chunk.h"],
+    visibility = [
+        "//tpu_sync/transport:__pkg__",
+        "//tpu_sync/transport/lib:__subpackages__",
+        "//tpu_sync/weight_sync:__pkg__",
+    ],
 )
 
 cc_library(

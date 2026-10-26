@@ -354,6 +354,14 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   absl::Status OnLayerDataReceived(size_t layer_idx,
                                    uint64_t uuid = 0) override;
   absl::Status OnDataReceived(uint64_t uuid = 0) override;
+  absl::Status OnDataReceived(
+      uint64_t uuid, std::optional<uint64_t> expected_xor_hash) override;
+
+  // Verifies that the receiver's host staging buffers for `uuid` match the
+  // sender's XOR-accumulated chunk hashes before H2d copies them to device.
+  absl::Status VerifyHostBuffers(uint64_t uuid,
+                                 uint64_t expected_xor_hash) const
+      ABSL_LOCKS_EXCLUDED(pending_h2d_mu_, skip_tiling_mu_);
 
   virtual absl::Status WaitForTransferCompletion(uint64_t uuid = 0);
   virtual void DrainPendingH2d();
@@ -469,7 +477,9 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // Runs the start hook, copies all layers of |uuid| to device and waits,
   // then runs the end hook with the copy status, which is returned. Holds
   // |h2d_hook_mu_| throughout so hooked H2Ds never overlap.
-  absl::Status HookedH2d(uint64_t uuid) ABSL_LOCKS_EXCLUDED(h2d_hook_mu_);
+  absl::Status HookedH2d(
+      uint64_t uuid, std::optional<uint64_t> expected_xor_hash = std::nullopt)
+      ABSL_LOCKS_EXCLUDED(h2d_hook_mu_);
 
   // Guards the hooks and serializes hooked H2Ds. The destructor stops the
   // listener and transport server (waiting for in-flight callbacks) before any
@@ -529,13 +539,20 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   // Returns true if skip_tiling is set for |layer_idx| under |uuid|, falling
   // back to the latest stored skip_tiling when |uuid| is unknown.
-  bool IsTilingSkipped(size_t layer_idx, uint64_t uuid)
+  bool IsTilingSkipped(size_t layer_idx, uint64_t uuid) const
       ABSL_LOCKS_EXCLUDED(skip_tiling_mu_);
   // Returns the StartTransferRequest.host_tiling_mode the receiver was armed
   // with for |uuid|, normalized so that UNSPECIFIED becomes
   // HOST_TILING_MODE_DEFERRED.
-  tpu_sync::rpc::HostTilingMode GetReceiverTiling(uint64_t uuid)
+  tpu_sync::rpc::HostTilingMode GetReceiverTiling(uint64_t uuid) const
       ABSL_LOCKS_EXCLUDED(skip_tiling_mu_);
+  // Computes the XOR-accumulated chunk hash across all shards of |layer_idx|
+  // in host staging memory for |uuid|.
+  uint64_t ComputeLayerXorHash(size_t layer_idx, uint64_t uuid) const
+      ABSL_LOCKS_EXCLUDED(skip_tiling_mu_);
+  // Maps a wire or caller |shard_idx| (local or global) to the local shard
+  // slot in `layers_[layer_idx].shards`.
+  size_t ResolveShardSlot(size_t layer_idx, size_t shard_idx) const;
   // Sets the in-place tiling signal of |layer_idx|; nullptr marks the layer's
   // host buffers as holding logical-layout bytes.
   void SetLayerTileReady(size_t layer_idx,
@@ -576,7 +593,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
   // Returns the per-layer skip-tiling mask for |uuid|, falling back to the
   // latest mask set via SetSkipTiling() and then to all-false.
-  std::vector<bool> GetActiveSkipTiling(uint64_t uuid);
+  std::vector<bool> GetActiveSkipTiling(uint64_t uuid) const;
 
   // Starts the host-to-device copy of shard |shard_idx| of layer |layer_idx|.
   // If |tile| is true and the shard has a tiled layout, first tiles the host
@@ -656,6 +673,11 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   mutable absl::Mutex pending_h2d_mu_;
   absl::flat_hash_map<uint64_t, PendingH2dState> pending_h2d_states_
       ABSL_GUARDED_BY(pending_h2d_mu_);
+  // Per-layer XOR hashes computed across all shards right before TileLayer()
+  // overwrites the host staging buffers in-place under
+  // HOST_TILING_MODE_ON_ARRIVAL.
+  absl::flat_hash_map<uint64_t, absl::flat_hash_map<size_t, uint64_t>>
+      pre_tile_layer_hashes_ ABSL_GUARDED_BY(pending_h2d_mu_);
   absl::flat_hash_set<uint64_t> active_h2d_uuids_
       ABSL_GUARDED_BY(pending_h2d_mu_);
 

@@ -15,6 +15,7 @@
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -64,7 +65,8 @@ void DeserializeHeaderV2(const flatbuf::ChunkHeader& h, ChunkHeader& header) {
 absl::InlinedVector<char, kMaxMetadataSize> SerializeMetadataV1(
     const ChunkMetadata& meta) {
   const flatbuf::ChunkMetadataV1 m(meta.layer_idx, meta.dst_shard_idx,
-                                   meta.dst_offset_bytes, meta.size_bytes);
+                                   meta.dst_offset_bytes, meta.size_bytes,
+                                   meta.expected_hash);
   absl::InlinedVector<char, kMaxMetadataSize> bytes(sizeof(m));
   std::memcpy(bytes.data(), &m, sizeof(m));
   return bytes;
@@ -75,7 +77,7 @@ absl::InlinedVector<char, kMaxMetadataSize> SerializeMetadataV2(
   const flatbuf::ChunkMetadataV2 m(meta.layer_idx, meta.dst_shard_idx,
                                    meta.dst_offset_bytes, meta.size_bytes,
                                    meta.dst_stride_bytes, meta.count,
-                                   /*padding=*/0);
+                                   /*padding=*/0, meta.expected_hash);
   absl::InlinedVector<char, kMaxMetadataSize> bytes(sizeof(m));
   std::memcpy(bytes.data(), &m, sizeof(m));
   return bytes;
@@ -89,6 +91,7 @@ void DeserializeMetadataV1(const flatbuf::ChunkMetadataV1& m,
   meta.size_bytes = m.size_bytes();
   meta.dst_stride_bytes = m.size_bytes();
   meta.count = 1;
+  meta.expected_hash = m.expected_hash();
 }
 
 void DeserializeMetadataV2(const flatbuf::ChunkMetadataV2& m,
@@ -99,6 +102,7 @@ void DeserializeMetadataV2(const flatbuf::ChunkMetadataV2& m,
   meta.size_bytes = m.size_bytes();
   meta.dst_stride_bytes = m.dst_stride_bytes();
   meta.count = m.count();
+  meta.expected_hash = m.expected_hash();
 }
 
 absl::InlinedVector<char, kChunkHeaderSize> SerializeHeaderV1(

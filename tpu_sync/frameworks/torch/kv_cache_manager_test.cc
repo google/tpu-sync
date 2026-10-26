@@ -47,6 +47,7 @@
 #include "tpu_sync/core/controller/controller_service.h"
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/frameworks/torch/torch_tpu_utils_mock.h"
+#include "tpu_sync/kv_cache/staging_window.h"
 
 namespace tpu_raiden {
 namespace torch {

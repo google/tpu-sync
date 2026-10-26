@@ -1335,7 +1335,7 @@ void TransferReceiveSession::ExecutePullRequest(
         [self, &manager, remote_endpoint, target_node, sent_c, sent_w,
          end_handshake, on_terminal, send_pull, make_req, status_from_reply](
             absl::StatusOr<PullStreamResponseSpec> resp) mutable {
-          RAIDEN_TRACE_FN("Recv::FinalAck",
+          RAIDEN_TRACE_FN("Recv::WindowAck",
                           [&]() { return absl::StrCat("uuid=", self->uuid_); });
           absl::Status injected =
               FaultInjectStatus(hooks::kTransferRecvSessionPullReply);

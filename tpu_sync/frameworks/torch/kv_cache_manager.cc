@@ -45,6 +45,7 @@
 #include "tpu_sync/frameworks/torch/torch_utils.h"
 #include "tpu_sync/kv_cache/kv_cache_listener.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/staging_window.h"
 #include "tpu_sync/transport/block_transport.h"
 
 namespace tpu_raiden {

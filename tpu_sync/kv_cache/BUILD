@@ -711,6 +711,7 @@ cc_test(
         "//tpu_sync/common:trace",
         "//tpu_sync/core:host_memory_allocator",
         "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:staging_arena",
         "//tpu_sync/core:tpu_pjrt_manager",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/status",

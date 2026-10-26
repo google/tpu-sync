@@ -768,7 +768,7 @@ void TransferSendSession::MaybeScheduleNextLayerUnitsLocked(size_t l) {
     auto meta_fn = [this, acked, l]() {
       return absl::StrCat("uuid=", uuid_, " l=", l, " acked=", acked);
     };
-    RAIDEN_TRACE_FN("Window::AckWait", meta_fn);
+    RAIDEN_TRACE_FN("Window::AckWaitEnter", meta_fn);
   }
 
   const int32_t c = h2h_issued_units_[l];

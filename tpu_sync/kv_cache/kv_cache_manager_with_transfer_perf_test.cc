@@ -44,6 +44,7 @@
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/core/tpu_pjrt_manager.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
@@ -370,6 +371,7 @@ TEST_F(KVCacheManagerWithTransferPerfTest, BenchmarkF32) {
 }
 
 TEST_F(KVCacheManagerWithTransferPerfTest, BenchmarkPullWindow) {
+  RAIDEN_TRACE("PerfTest::BenchmarkPullWindow");
   const int num_tpus = absl::GetFlag(FLAGS_num_tpus);
   const int num_layers = absl::GetFlag(FLAGS_num_layers);
   const int64_t num_blocks = absl::GetFlag(FLAGS_num_blocks);

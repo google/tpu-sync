@@ -546,6 +546,7 @@ cc_test(
         ":torch_tpu_utils_mock",
         "//tpu_sync/core/controller:controller_service",
         "//tpu_sync/core/controller:test_util",
+        "//tpu_sync/kv_cache:staging_window",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings",

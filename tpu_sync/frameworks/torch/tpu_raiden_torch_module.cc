@@ -260,7 +260,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
            nb::arg("parallelism") = 1, nb::arg("raiden_worker_port") = 0,
            nb::arg("raiden_controller_address") = nb::none(),
            nb::arg("worker_id") = nb::none(), nb::arg("node_id") = 0,
-           nb::arg("enable_shm") = false)
+           nb::arg("enable_shm") = false, nb::arg("local_control_port") = -1,
+           nb::arg("timeout_s") = 120.0)
       .def(nb::new_(xla::ValueOrThrowWrapper(KVCacheManager::CreateWithNodeId)),
            nb::arg("kv_caches"), nb::arg("node_id"),
            nb::arg("local_control_port"), nb::arg("max_blocks"),
@@ -585,20 +586,33 @@ NB_MODULE(_tpu_raiden_torch, m) {
       .def_prop_ro("transfer_address", &KVCacheManager::transfer_address)
       .def_prop_ro("listener_address", &KVCacheManager::listener_address)
 
-      .def("notify_for_read", &KVCacheManager::NotifyForRead, nb::arg("req_id"),
-           nb::arg("uuid"), nb::arg("block_ids"))
+      .def(
+          "notify_for_read",
+          [](KVCacheManager& self, const std::string& req_id, uint64_t uuid,
+             const std::vector<int64_t>& block_ids, bool host_source) {
+            return self.NotifyForRead(req_id, uuid, block_ids,
+                                      host_source
+                                          ? tpu_raiden::BlockMemory::kHost
+                                          : tpu_raiden::BlockMemory::kDevice);
+          },
+          nb::arg("req_id"), nb::arg("uuid"), nb::arg("block_ids"),
+          nb::arg("host_source") = false)
       .def(
           "start_read",
           [](KVCacheManager& self, const std::string& req_id, uint64_t uuid,
              nb::object remote_endpoint,
              const std::vector<int64_t>& remote_block_ids,
              const std::vector<int64_t>& local_block_ids, int parallelism,
-             std::optional<std::vector<int64_t>> local_host_block_ids) {
+             std::optional<std::vector<int64_t>> local_host_block_ids,
+             bool host_destination) {
+            const tpu_raiden::BlockMemory destination =
+                host_destination ? tpu_raiden::BlockMemory::kHost
+                                 : tpu_raiden::BlockMemory::kDevice;
             if (nb::isinstance<nb::str>(remote_endpoint)) {
               self.StartRead(req_id, uuid,
                              nb::cast<std::string>(remote_endpoint),
                              remote_block_ids, local_block_ids, parallelism,
-                             local_host_block_ids);
+                             local_host_block_ids, destination);
             } else if (nb::isinstance<nb::list>(remote_endpoint)) {
               std::vector<tpu_raiden::RaidenTransferEndpoint> descriptors;
               nb::list ep_list = nb::cast<nb::list>(remote_endpoint);
@@ -610,8 +624,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
                 descriptors.push_back(std::move(desc));
               }
               self.StartRead(req_id, uuid, descriptors, remote_block_ids,
-                             local_block_ids, parallelism,
-                             local_host_block_ids);
+                             local_block_ids, parallelism, local_host_block_ids,
+                             destination);
             } else {
               throw std::runtime_error(
                   "remote_endpoint must be str or list of dicts");
@@ -620,7 +634,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
           nb::arg("req_id"), nb::arg("uuid"), nb::arg("remote_endpoint"),
           nb::arg("remote_block_ids"), nb::arg("local_block_ids"),
           nb::arg("parallelism") = 1,
-          nb::arg("local_host_block_ids") = nb::none())
+          nb::arg("local_host_block_ids") = nb::none(),
+          nb::arg("host_destination") = false)
       .def("complete_read",
            [](KVCacheManager& self) {
              auto completions = [&self] {

@@ -82,12 +82,18 @@ TransferReceiveSession::Create(
     const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids,
     const std::optional<std::vector<int64_t>>& local_host_block_ids,
-    std::chrono::steady_clock::time_point deadline) {
+    std::chrono::steady_clock::time_point deadline, BlockMemory destination) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
+  if (destination == BlockMemory::kHost && !local_host_block_ids.has_value()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "a host-memory read names its host blocks: local_host_block_ids is "
+        "required for req_id=",
+        req_id, ", uuid=", uuid));
+  }
   auto session = std::shared_ptr<TransferReceiveSession>(
-      new TransferReceiveSession(base, staging_allocator, uuid));
+      new TransferReceiveSession(base, staging_allocator, uuid, destination));
   std::vector<int64_t> host_block_ids;
   if (!session->AllocateStagingForLoad(req_id, local_block_ids,
                                        local_host_block_ids, &host_block_ids)) {
@@ -400,6 +406,8 @@ TransferDetails TransferReceiveSession::Details() const {
 
 absl::string_view TransferReceiveSession::CurrentPhaseLocked() const {
   if (handshake_pending_) return kConnectPhase;
+  // A host-memory receive ends with the network; there is no H2D step.
+  if (destination_ == BlockMemory::kHost) return kReceivePhase;
   return network_completed_ ? kH2dPhase : kReceivePhase;
 }
 
@@ -565,7 +573,11 @@ void TransferReceiveSession::ExecutePullRequest(
     }
 
     absl::MutexLock lock(self->mu_);
-    if (!pull_status.ok()) {
+    // A receive that already settled (the data outran a slow control reply,
+    // which a host destination with no H2D step makes likely) keeps its
+    // verdict: the blocks it reports landed regardless of how the handshake
+    // ended.
+    if (!pull_status.ok() && !self->draining_) {
       self->FinishLocked(pull_status);
     }
     self->handshake_pending_ = false;
@@ -666,6 +678,48 @@ absl::Status TransferReceiveSession::OnBlockShardsReceived(
     LOG(INFO) << "OnBlockShardsReceived (Network + H2D complete): req_id="
               << session_req_id << ", uuid=" << uuid << ", numa=" << numa_node;
   }
+  return absl::OkStatus();
+}
+
+absl::Status TransferReceiveSession::OnLayerReceived(
+    KVCacheManagerWithTransfer& manager, size_t layer_idx) {
+  if (destination_ == BlockMemory::kHost) {
+    return SettleHostLayer(manager, layer_idx);
+  }
+  return ExecuteLayerH2d(manager, layer_idx);
+}
+
+absl::Status TransferReceiveSession::SettleHostLayer(
+    KVCacheManagerWithTransfer& manager, size_t layer_idx) {
+  bool all_layers_done = false;
+  std::string session_req_id;
+  std::chrono::steady_clock::time_point session_start_time;
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) {
+      return absl::OkStatus();
+    }
+    session_req_id = req_id_;
+    ++num_completed_layers_;
+    if (num_completed_layers_ == static_cast<int32_t>(base_->num_layers())) {
+      // The transport reports a layer before it reports the layer's blocks,
+      // so the shard callback that would normally close the network phase
+      // finds this receive already settled. Close it here: the last layer is
+      // the last packet, and there is no H2D after it.
+      all_layers_done = RecordNetworkCompleteLocked(
+          manager.metrics_collector_.get(), /*all_complete=*/true,
+          &session_req_id, &session_start_time);
+    }
+  }
+  VLOG(1) << "OnLayerReceived (host memory) layer " << layer_idx
+          << ": req_id=" << session_req_id << ", uuid=" << uuid_;
+  if (!all_layers_done) {
+    return absl::OkStatus();
+  }
+  RecordTransferDuration(
+      DurationMs(session_start_time, std::chrono::steady_clock::now()));
+  LOG(INFO) << "All layers landed in host memory: req_id=" << session_req_id
+            << ", uuid=" << uuid_;
   return absl::OkStatus();
 }
 

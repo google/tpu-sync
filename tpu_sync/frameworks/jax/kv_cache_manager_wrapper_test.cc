@@ -136,7 +136,8 @@ class MockSubManager : public KVCacheManagerWithTransfer {
       const std::vector<int64_t>& local_block_ids, int parallelism = 1,
       std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt,
       std::optional<std::chrono::steady_clock::time_point> deadline =
-          std::nullopt) override {
+          std::nullopt,
+      BlockMemory destination = BlockMemory::kDevice) override {
     started_ep = remote_endpoint;
     started_remote_blocks = remote_block_ids;
     started_local_blocks = local_block_ids;

@@ -91,6 +91,15 @@ struct CompleteReadResult {
   absl::flat_hash_map<std::string, TransferDetails> details;
 };
 
+// Where the blocks of a transfer live on this manager: in the device buffers
+// it wraps, or in its host pool. A device send is staged device-to-host
+// before it is pushed; a host send is pushed straight from the named host
+// blocks. A device receive lands in host staging and is copied
+// host-to-device; a host receive lands in the named host blocks and settles
+// there, so a consumer whose KV lives in host memory (e.g. a hierarchical
+// cache) takes it without a round trip through its device.
+enum class BlockMemory { kDevice, kHost };
+
 struct CopySpec {
   std::vector<int64_t> src_offsets;
   std::vector<int64_t> dst_offsets;
@@ -176,15 +185,31 @@ class KVCacheManagerWithTransfer {
 
   // Registers `block_ids` to be served when a consumer pulls `uuid`. Returns
   // `uuid`, or 0 when there is nothing to send (`block_ids` is empty, or the
-  // consumer has already acknowledged the transfer). Throws
-  // `std::invalid_argument` if `block_ids` contains duplicate block IDs, and
-  // `std::runtime_error` if `uuid` already has an active registered read.
+  // consumer has already acknowledged the transfer). With `source` kHost the
+  // ids name blocks of this manager's host pool, which are pushed as they are
+  // (no staging, no device-to-host copy); the caller keeps them unchanged
+  // until the send settles. Throws `std::invalid_argument` if `block_ids`
+  // contains duplicate block IDs or a host block outside the pool, or if
+  // `source` is kDevice on a manager whose control server serves its host
+  // pool alone (no staging slots: such a manager serves host-resident reads
+  // only), and `std::runtime_error` if `uuid` already has an active
+  // registered read.
   virtual int64_t NotifyForRead(
       const std::string& req_id, uint64_t uuid,
       const std::vector<int64_t>& block_ids,
       std::optional<std::chrono::steady_clock::time_point> deadline =
-          std::nullopt);
+          std::nullopt,
+      BlockMemory source = BlockMemory::kDevice);
 
+  // Pulls `remote_block_ids` of the producer at `remote_endpoint` into
+  // `local_block_ids`. With `destination` kDevice the blocks land in host
+  // staging (`local_host_block_ids` when given, else blocks leased from the
+  // staging pool) and are copied into the device blocks `local_block_ids`.
+  // With kHost they land in the host blocks `local_host_block_ids`, which is
+  // then required and must not repeat a block, and the read settles once
+  // every layer has arrived; `local_block_ids` may be empty, and otherwise
+  // must match it in length. Host block ids are checked against the host pool
+  // whenever they are given; throws `std::invalid_argument` on any of these.
   virtual void StartRead(
       const std::string& req_id, uint64_t uuid,
       const std::string& remote_endpoint,
@@ -192,7 +217,8 @@ class KVCacheManagerWithTransfer {
       const std::vector<int64_t>& local_block_ids, int parallelism = 1,
       std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt,
       std::optional<std::chrono::steady_clock::time_point> deadline =
-          std::nullopt);
+          std::nullopt,
+      BlockMemory destination = BlockMemory::kDevice);
 
   // Reports each transfer settled since the previous poll, exactly once, with
   // its details.
@@ -252,7 +278,8 @@ class KVCacheManagerWithTransfer {
       const std::vector<RaidenTransferEndpoint>& remote_descriptors,
       const std::vector<int64_t>& remote_block_ids,
       const std::vector<int64_t>& local_block_ids, int parallelism = 1,
-      std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt);
+      std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt,
+      BlockMemory destination = BlockMemory::kDevice);
 
   virtual int local_control_port() const { return local_control_port_; }
   virtual int64_t node_id() const { return node_id_; }
@@ -403,6 +430,18 @@ class KVCacheManagerWithTransfer {
       const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);
   absl::Status HandleAck(uint64_t uuid);
   uint64_t MaxPullStreamBlocks() const;
+  // Blocks of this manager's host pool, as a transfer may name them.
+  int64_t NumHostBlocks() const;
+  // Throws `std::invalid_argument` when a block id falls outside the host
+  // pool, or, with `require_unique`, when a block id repeats.
+  void CheckHostBlockIds(absl::Span<const int64_t> block_ids,
+                         absl::string_view what, bool require_unique) const;
+
+  // True when the control server was opened over the host pool alone (no
+  // staging slots). Such a manager serves host-resident reads only: a device
+  // read would have to stage through the very host pool its caller addresses
+  // by block id, and is rejected at registration instead.
+  bool serves_host_pool_reads_only_ = false;
 };
 
 }  // namespace tpu_raiden

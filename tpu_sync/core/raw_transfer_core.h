@@ -35,6 +35,7 @@
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_external.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/shape.h"
+#include "xla/primitive_util.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/concurrency/async_value.h"
 #include "xla/tsl/concurrency/ref_count.h"
@@ -129,6 +130,36 @@ inline int64_t GetMajorSliceByteSize(const xla::Shape& shape) {
   }
 
   return stride * itemsize;
+}
+
+// Bytes of one major-dimension slice of `shape` as laid out on the device,
+// given the buffer's on-device size.
+//
+// For whole-byte element types this is the shape-only size above. XLA packs
+// the 4-bit types (F4E2M1FN, S4, U4) two per byte, but
+// ShapeUtil::ByteSizeOfPrimitiveType cannot report less than one byte per
+// element, so for them the shape-only size is twice the physical one and the
+// chunk offsets it would produce land on the wrong slices. Their slice is the
+// on-device size over the major dimension, which the callers have established
+// as the outermost physical dimension.
+inline int64_t GetMajorSliceByteSize(const xla::Shape& shape,
+                                     int64_t physical_size) {
+  if (shape.dimensions_size() == 0 || physical_size <= 0) {
+    return GetMajorSliceByteSize(shape);
+  }
+  const xla::PrimitiveType type = shape.element_type();
+  const bool sub_byte =
+      type != xla::PRED && xla::primitive_util::BitWidth(type) < 8;
+  if (!sub_byte) {
+    return GetMajorSliceByteSize(shape);
+  }
+  const int64_t major = shape.dimensions(0);
+  if (major <= 0 || physical_size % major != 0) {
+    throw std::invalid_argument(absl::StrCat(
+        "sub-byte buffer of ", physical_size, " bytes is not a whole number of ",
+        major, " major-dimension slices"));
+  }
+  return physical_size / major;
 }
 
 struct RaidenBufferHandle {

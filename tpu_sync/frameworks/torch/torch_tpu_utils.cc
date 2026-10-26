@@ -96,8 +96,13 @@ UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
         "buffer; raw transfer requires a layout-preserving full view of the "
         "block-major storage.");
   }
+  // torch packs float4_e2m1fn_x2 two values per byte while the base buffer
+  // (an XLA F4E2M1FN array of twice the minor dimension) is accounted at one
+  // byte per element, so the same storage counts twice over there.
+  const int64_t base_bytes_per_tensor_byte =
+      tensor.scalar_type() == at::kFloat4_e2m1fn_x2 ? 2 : 1;
   if (static_cast<int64_t>(base_ref.size_bytes()) !=
-      static_cast<int64_t>(tensor.nbytes())) {
+      static_cast<int64_t>(tensor.nbytes()) * base_bytes_per_tensor_byte) {
     throw std::invalid_argument(
         "Tensor does not span its entire base storage buffer; raw transfer "
         "requires a full reinterpret of the storage, not a partial view.");

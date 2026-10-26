@@ -230,6 +230,18 @@ def transfer_h2d_batch(
   )
 
 
+def major_slice_bytes(tpu_tensor: Any, unsafe_skip_buffer_lock: bool = False) -> int:
+  """Bytes one unit of ``copy_sizes_major_dim`` moves for ``tpu_tensor``.
+
+  The tensor's major-dimension slice as laid out on the device, which a host
+  buffer must hold per unit copied. It differs from ``nbytes // shape[0]``
+  when the device layout pads the minor dimensions or packs sub-byte
+  elements: a ``float4_e2m1fn_x2`` weight's storage is accounted at one byte
+  per nibble while its slices move packed.
+  """
+  return int(_impl().major_slice_bytes(tpu_tensor, unsafe_skip_buffer_lock))
+
+
 def set_dma_pacing(
     max_inflight_bytes: int, chunk_bytes: int = 16 << 20
 ) -> None:

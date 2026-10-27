@@ -237,6 +237,7 @@ cc_library(
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport:block_transport",
         "//tpu_sync/transport:block_transport_delegate",
+        "//tpu_sync/transport:block_transport_session",
         "//tpu_sync/transport:peer_endpoint",
         "//tpu_sync/transport:transfer_session",
         "@com_google_absl//absl/base:core_headers",

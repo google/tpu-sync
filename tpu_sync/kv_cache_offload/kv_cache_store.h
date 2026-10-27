@@ -778,6 +778,21 @@ class KVCacheStore {
   }
 
  private:
+  // Returns true when the secondary storage tier (`backends_[1]`) transfers
+  // blocks directly between device HBM and storage (`IsDirectStorage()`).
+  //
+  // Normally, Raiden moves KV blocks between TPU HBM and secondary storage in
+  // two hops through a Host DRAM pool:
+  //   - Indirect Save: TPU HBM --(D2H)--> Host DRAM slot --(OFFLOAD)--> Storage
+  //   - Indirect Load: Storage --(RECALL)--> Host DRAM slot --(H2D)--> TPU HBM
+  // When `UsesDirectStorage()` is true, `SaveLocal` and
+  // `LoadFromSecondaryBackend` omit Host DRAM block allocation so the worker
+  // transfers blocks directly between TPU HBM and storage, `Lookup` treats only
+  // `HBM` and `SHARED_STORAGE` (never local or remote Host DRAM) as valid hits,
+  // and tier-0 catalog entries remain `BlockStatus::HBM` (`host_block_id = -1`)
+  // across saves and loads.
+  bool UsesDirectStorage() const;
+
   // The local half of Save(): device HBM to host DRAM.
   absl::Status SaveLocal(const std::vector<std::string>& block_hashes);
   // The remote half of Save(): offer `block_hashes` to `dst_raiden_id`.

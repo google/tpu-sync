@@ -744,6 +744,13 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // (HMA) models sizes may differ (e.g. mamba conv_state bf16 vs ssm f32).
   struct LayerDeviceInfo {
     std::vector<raiden::BufferHoldAndAlias> holds;
+    // Per-shard PCIe BAR2 `dma-buf` descriptors (`{dma_buf_fd, offset, size,
+    // pin}`) populated all-or-nothing at backend registration time by
+    // `RegisterDeviceBuffersWithBackend` and read lock-free during transfers.
+    // Empty when PJRT `AcquireExternalDmaAccess` is unsupported or BAR2
+    // registration fails, in which case direct-storage backends fall back to
+    // temporary aligned host bounce buffers unless configured for strict DMA.
+    std::vector<raiden::ExternalDmaInfo> external_dma_infos;
     // Total on-device bytes for this layer's buffer.  Set by the
     // device-backed constructor from PjRtBuffer.  DMA functions use
     // this for per-layer offset and copy-size calculations.
@@ -1063,6 +1070,29 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       backends_ ABSL_GUARDED_BY(backends_mu_);
 
   bool InitializeSingleSecondaryBackend(const BackendConfig& config);
+  // Queries PJRT `AcquireExternalDmaAccess` on every `(layer, shard)` device
+  // buffer and pre-registers their PCIe BAR2 `dma-buf` ranges with `backend`.
+  // Commits `external_dma_infos` all-or-nothing so partial HBM pins are
+  // automatically rolled back if any buffer fails registration.
+  absl::Status RegisterDeviceBuffersWithBackend(backends::KVBackend* backend);
+
+  // Resolves the on-device TPU HBM slices for `device_block_id` across all
+  // layers and local shards in canonical layer-major order (`layer 0..L-1`,
+  // `shard 0..S-1`). Populates both PJRT `buffer_handle`/`buffer_offset` and
+  // (when startup BAR2 registration succeeded) `dma_buf_fd`/`dma_buf_offset`
+  // (`ext.offset + buffer_offset`). Returns an empty vector if
+  // `device_block_id` is out of bounds or no device buffers are attached.
+  std::vector<backends::DeviceBufferDescriptor> ResolveDeviceBlockSlices(
+      int64_t device_block_id) const;
+
+  // Transfers `block_keys` directly between TPU HBM slots `device_block_ids`
+  // and `backend` (`is_write = true` for offload, `false` for recall) without
+  // allocating or touching slots in the Host DRAM `StagingArena`. Returns a
+  // `PjRtCopyFuture` that resolves once all block transfers finish.
+  absl::StatusOr<raiden::PjRtCopyFuture> TransferDeviceWithBackend(
+      backends::KVBackend* backend,
+      const std::vector<backends::BlockKey>& block_keys,
+      const std::vector<int64_t>& device_block_ids, bool is_write);
   enum class MappingPhase {
     kUnmapped,
     kMapping,

@@ -72,6 +72,7 @@
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
@@ -83,7 +84,10 @@
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
+#include "tpu_sync/kv_cache/kv_cache_store_server.h"
 #include "tpu_sync/proto/kv_cache_store_service.grpc.pb.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
+#include "tpu_sync/telemetry/mock_metrics_backend.h"
 
 #ifndef _WIN32
 int ignore_sigpipe = []() {
@@ -7111,15 +7115,30 @@ struct StorageRecallTransferManager
 
   absl::Mutex mu;
   bool fail_recall = false;
+  bool fail_recall_not_found = false;
+  // Stall every host-to-device copy (`h2d_delay`) or storage read
+  // (`recall_delay`) by this long before it is issued. Set from the test
+  // thread, read on the worker service thread.
+  absl::Duration h2d_delay ABSL_GUARDED_BY(mu) = absl::ZeroDuration();
+  absl::Duration recall_delay ABSL_GUARDED_BY(mu) = absl::ZeroDuration();
   std::vector<std::vector<int64_t>> h2d_dst_batches ABSL_GUARDED_BY(mu);
+
+  void SetDelays(absl::Duration h2d, absl::Duration recall) {
+    absl::MutexLock lock(mu);
+    h2d_delay = h2d;
+    recall_delay = recall;
+  }
 
   Result H2d(const std::vector<int64_t>& src_offsets,
              const std::vector<int64_t>& dst_offsets,
              const std::vector<int64_t>& copy_sizes) {
+    absl::Duration delay;
     {
       absl::MutexLock lock(mu);
       h2d_dst_batches.push_back(dst_offsets);
+      delay = h2d_delay;
     }
+    absl::SleepFor(delay);
     return Base::H2d(src_offsets, dst_offsets, copy_sizes);
   }
 
@@ -7128,6 +7147,18 @@ struct StorageRecallTransferManager
       const std::vector<backends::BlockKey>& block_keys,
       const std::vector<int64_t>& src_host_block_ids,
       const std::vector<int64_t>& dst_device_block_ids) {
+    absl::Duration delay;
+    {
+      absl::MutexLock lock(mu);
+      delay = recall_delay;
+    }
+    absl::SleepFor(delay);
+    if (fail_recall_not_found) {
+      ++h2d_read_from_backend_calls;
+      return raiden::PjRtCopyFuture(
+          tsl::Future<>(absl::NotFoundError("Block file not found")),
+          /*holds=*/{});
+    }
     if (fail_recall) {
       ++h2d_read_from_backend_calls;
       return Result(absl::InternalError("scripted recall failure"));
@@ -7180,9 +7211,12 @@ class ReadRemoteTest : public KVCacheStoreEmbeddedControllerTest {
     bool register_peer_blocks = false;
     bool with_empty_registry = false;
     bool with_storage = true;
+    int dp_rank = 0;
   };
 
   void MakeStore(const StoreOptions& opts) {
+    local_id_.data_replica_idx = opts.dp_rank;
+    unit_.set_data_replica_idx(opts.dp_rank);
     auto controller = MakeController(opts.num_host_blocks);
     RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
 
@@ -8126,6 +8160,330 @@ TEST_F(SecondaryBackendTopologyTest, LookupProbesTpSizeRanksNotNumShards) {
   TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result, store_->Lookup({"h"}));
   ASSERT_EQ(result.size(), 1);
   EXPECT_EQ(result[0].second.status, BlockStatus::SHARED_STORAGE);
+}
+
+using ::absl_testing::StatusIs;
+using ::testing::HasSubstr;
+using ::testing::IsEmpty;
+using ::testing::NiceMock;
+using ::testing::UnorderedElementsAre;
+using ::testing::UnorderedElementsAreArray;
+
+class KVRecallBlocksMetricsTest : public ReadRemoteTest {
+ protected:
+  void SetUp() override {
+    auto mock_backend =
+        std::make_unique<NiceMock<telemetry::MockMetricsBackend>>();
+    mock_metrics_ = mock_backend.get();
+    metrics_reset_ = std::make_unique<telemetry::ScopedMetricsBackendReset>(
+        std::move(mock_backend));
+    ReadRemoteTest::SetUp();
+  }
+
+  void TearDown() override {
+    ReadRemoteTest::TearDown();
+    mock_metrics_ = nullptr;
+    metrics_reset_.reset();
+  }
+
+  // Expects one `kv_recall_blocks_total` increment of `count` and one
+  // `kv_recall_duration_ms` sample in [`min_duration_ms`, 60 s), both labeled
+  // with (`tier`, `outcome`, `dp_rank`) and the store's host IP.
+  void ExpectRecallBlocks(absl::string_view tier, absl::string_view outcome,
+                          uint64_t count, absl::string_view dp_rank = "0",
+                          double min_duration_ms = 0) {
+    const std::string& host_ip = GetLocalHostPrimaryIp();
+    EXPECT_FALSE(host_ip.empty());
+    EXPECT_NE(host_ip, telemetry::metric_labels::kUnknownIp);
+    const telemetry::MetricLabel expected_labels[] = {
+        {telemetry::metric_labels::kHostIp, host_ip},
+        {telemetry::metric_labels::kDpRank, dp_rank},
+        {telemetry::metric_labels::kTier, tier},
+        {telemetry::metric_labels::kOutcome, outcome},
+    };
+    EXPECT_CALL(
+        *mock_metrics_,
+        IncrementCounter(telemetry::metric_names::kKvRecallBlocksTotal,
+                         UnorderedElementsAreArray(expected_labels), count));
+    // Other histograms are not under test here.
+    EXPECT_CALL(*mock_metrics_,
+                ObserveHistogram(
+                    testing::Ne(telemetry::metric_names::kKvRecallDurationMs),
+                    testing::_, testing::_))
+        .Times(testing::AnyNumber());
+    // Exactly one duration sample per counted batch, with the same labels.
+    EXPECT_CALL(*mock_metrics_,
+                ObserveHistogram(telemetry::metric_names::kKvRecallDurationMs,
+                                 UnorderedElementsAreArray(expected_labels),
+                                 // The upper bound catches a start time that
+                                 // was never set (a default `time_point` reads
+                                 // as time since boot).
+                                 testing::AllOf(testing::Ge(min_duration_ms),
+                                                testing::Lt(60'000.0))));
+  }
+
+  telemetry::MockMetricsBackend* mock_metrics_ = nullptr;
+  std::unique_ptr<telemetry::ScopedMetricsBackendReset> metrics_reset_;
+};
+
+TEST_F(KVRecallBlocksMetricsTest, LocalDramRecallOutcomes) {
+  MakeStore({});
+
+  // Missing block hash -> not_found.
+  ExpectRecallBlocks(telemetry::metric_labels::kTierLocalDram,
+                     telemetry::metric_labels::kOutcomeNotFound, 2);
+  EXPECT_THAT(store_->Load({"missing0", "missing1"}, {0, 1}),
+              StatusIs(absl::StatusCode::kNotFound));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Unpinned local block -> not_found.
+  ASSERT_TRUE(InsertResident(*store_, {"unpinned"}, {LocalSlice(0)},
+                             /*on_host=*/true));
+  ExpectRecallBlocks(telemetry::metric_labels::kTierLocalDram,
+                     telemetry::metric_labels::kOutcomeNotFound, 1);
+  EXPECT_THAT(store_->Load({"unpinned"}, {0}),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Successful local DRAM recall -> ok.
+  AddPinnedLocal({"l0", "l1"});
+  ExpectRecallBlocks(telemetry::metric_labels::kTierLocalDram,
+                     telemetry::metric_labels::kOutcomeOk, 2);
+  ABSL_ASSERT_OK(store_->Load({"l0", "l1"}, {2, 3}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 2).done,
+              UnorderedElementsAre("l0", "l1"));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Transfer failure -> transfer_failed.
+  AddPinnedLocal({"l2", "l3"});
+  mgr_.fail_transfers = true;
+  ExpectRecallBlocks(telemetry::metric_labels::kTierLocalDram,
+                     telemetry::metric_labels::kOutcomeTransferFailed, 2);
+  ABSL_ASSERT_OK(store_->Load({"l2", "l3"}, {2, 3}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 2).failed,
+              UnorderedElementsAre("l2", "l3"));
+  store_->Release({"l2", "l3"});
+}
+
+TEST_F(KVRecallBlocksMetricsTest, RemoteDramRecallOutcomes) {
+  MakeStore({.peer_hashes = {"r0", "r1"}});
+
+  // Successful remote DRAM recall -> ok.
+  ExpectRecallBlocks(telemetry::metric_labels::kTierRemoteDram,
+                     telemetry::metric_labels::kOutcomeOk, 2);
+  ABSL_ASSERT_OK(store_->ReadRemote(
+      {"r0", "r1"}, {PeerSlice(peer_a_, 0), PeerSlice(peer_a_, 1)}, {2, 3}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 2).done,
+              UnorderedElementsAre("r0", "r1"));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Staging exhaustion on remote DRAM recall -> staging_exhausted.
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held,
+      KVCacheStoreTest::AllocateBlockIds(*store_, FreeBlocks()));
+  ASSERT_EQ(FreeBlocks(), 0);
+  ExpectRecallBlocks(telemetry::metric_labels::kTierRemoteDram,
+                     telemetry::metric_labels::kOutcomeStagingExhausted, 2);
+  ABSL_ASSERT_OK(store_->ReadRemote(
+      {"r0", "r1"}, {PeerSlice(peer_a_, 0), PeerSlice(peer_a_, 1)}, {2, 3}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 2).failed,
+              UnorderedElementsAre("r0", "r1"));
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Peer fetch miss -> not_found.
+  ExpectRecallBlocks(telemetry::metric_labels::kTierRemoteDram,
+                     telemetry::metric_labels::kOutcomeNotFound, 1);
+  ABSL_ASSERT_OK(
+      store_->ReadRemote({"r_missing"}, {PeerSlice(peer_a_, 99)}, {2}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 1).failed, ElementsAre("r_missing"));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Unknown peer / transfer failure -> transfer_failed.
+  ExpectRecallBlocks(telemetry::metric_labels::kTierRemoteDram,
+                     telemetry::metric_labels::kOutcomeTransferFailed, 1);
+  ABSL_ASSERT_OK(
+      store_->ReadRemote({"r_unknown_peer"}, {PeerSlice(peer_b_, 0)}, {2}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 1).failed,
+              ElementsAre("r_unknown_peer"));
+}
+
+TEST_F(KVRecallBlocksMetricsTest, SharedStorageRecallOutcomes) {
+  MakeStore({});
+
+  // Successful shared storage recall -> ok.
+  ExpectRecallBlocks(telemetry::metric_labels::kTierSharedStorage,
+                     telemetry::metric_labels::kOutcomeOk, 2);
+  ABSL_ASSERT_OK(store_->ReadRemote({"s0", "s1"},
+                                    {StorageSlice(), StorageSlice()}, {4, 5}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 2).done,
+              UnorderedElementsAre("s0", "s1"));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Staging exhaustion on shared storage recall -> staging_exhausted.
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held,
+      KVCacheStoreTest::AllocateBlockIds(*store_, FreeBlocks()));
+  KVCacheStoreTest::Evict(*store_, {"s0", "s1"});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held2,
+      KVCacheStoreTest::AllocateBlockIds(*store_, FreeBlocks()));
+  ASSERT_EQ(FreeBlocks(), 0);
+  ExpectRecallBlocks(telemetry::metric_labels::kTierSharedStorage,
+                     telemetry::metric_labels::kOutcomeStagingExhausted, 2);
+  ABSL_ASSERT_OK(store_->ReadRemote({"s2", "s3"},
+                                    {StorageSlice(), StorageSlice()}, {4, 5}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 2).failed,
+              UnorderedElementsAre("s2", "s3"));
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held2));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Storage file not found -> not_found.
+  mgr_.fail_recall_not_found = true;
+  ExpectRecallBlocks(telemetry::metric_labels::kTierSharedStorage,
+                     telemetry::metric_labels::kOutcomeNotFound, 2);
+  ABSL_ASSERT_OK(store_->ReadRemote({"s_nf0", "s_nf1"},
+                                    {StorageSlice(), StorageSlice()}, {4, 5}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 2).failed,
+              UnorderedElementsAre("s_nf0", "s_nf1"));
+  mgr_.fail_recall_not_found = false;
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Storage read failure -> transfer_failed.
+  mgr_.fail_recall = true;
+  ExpectRecallBlocks(telemetry::metric_labels::kTierSharedStorage,
+                     telemetry::metric_labels::kOutcomeTransferFailed, 2);
+  ABSL_ASSERT_OK(store_->ReadRemote({"s4", "s5"},
+                                    {StorageSlice(), StorageSlice()}, {4, 5}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 2).failed,
+              UnorderedElementsAre("s4", "s5"));
+  mgr_.fail_recall = false;
+}
+
+TEST_F(KVRecallBlocksMetricsTest, MixedRemoteAndSharedStorageRecallViaLoad) {
+  MakeStore({.peer_hashes = {"r0", "r1"}});
+
+  ExpectRecallBlocks(telemetry::metric_labels::kTierRemoteDram,
+                     telemetry::metric_labels::kOutcomeOk, 2);
+  ExpectRecallBlocks(telemetry::metric_labels::kTierSharedStorage,
+                     telemetry::metric_labels::kOutcomeOk, 1);
+
+  ABSL_ASSERT_OK(store_->Load(
+      {"r0", "r1", "s0"},
+      {PeerSlice(peer_a_, 0), PeerSlice(peer_a_, 1), StorageSlice()},
+      {2, 3, 4}));
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 3);
+  EXPECT_THAT(outcome.done, UnorderedElementsAre("r0", "r1", "s0"));
+  EXPECT_THAT(outcome.failed, IsEmpty());
+}
+
+// Each duration sample spans its tier's whole recall, not just the dispatch:
+// stalling the H2D copy (`local_dram`, `remote_dram`) or the storage read
+// (`shared_storage`) by `kDelay` yields a sample of at least `kDelay`, for both
+// successful and failed recalls (failures on `local_dram` and
+// `shared_storage`).
+TEST_F(KVRecallBlocksMetricsTest, DurationSpansWholeRecallPerTier) {
+  constexpr absl::Duration kDelay = absl::Milliseconds(50);
+  const double delay_ms = absl::ToDoubleMilliseconds(kDelay);
+  MakeStore({.peer_hashes = {"r0"}});
+  const auto expect_slow = [&](absl::string_view tier,
+                               absl::string_view outcome, uint64_t count) {
+    ExpectRecallBlocks(tier, outcome, count, /*dp_rank=*/"0",
+                       /*min_duration_ms=*/delay_ms);
+  };
+
+  // local_dram: the H2D copy is stalled.
+  mgr_.SetDelays(/*h2d=*/kDelay, /*recall=*/absl::ZeroDuration());
+  AddPinnedLocal({"l0"});
+  expect_slow(telemetry::metric_labels::kTierLocalDram,
+              telemetry::metric_labels::kOutcomeOk, 1);
+  ABSL_ASSERT_OK(store_->Load({"l0"}, {2}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 1).done, ElementsAre("l0"));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  AddPinnedLocal({"l1"});
+  mgr_.fail_transfers = true;
+  expect_slow(telemetry::metric_labels::kTierLocalDram,
+              telemetry::metric_labels::kOutcomeTransferFailed, 1);
+  ABSL_ASSERT_OK(store_->Load({"l1"}, {2}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 1).failed, ElementsAre("l1"));
+  mgr_.fail_transfers = false;
+  store_->Release({"l1"});
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // remote_dram: the H2D copy after the peer Fetch is stalled.
+  expect_slow(telemetry::metric_labels::kTierRemoteDram,
+              telemetry::metric_labels::kOutcomeOk, 1);
+  ABSL_ASSERT_OK(store_->ReadRemote({"r0"}, {PeerSlice(peer_a_, 0)}, {3}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 1).done, ElementsAre("r0"));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // shared_storage: the storage read is stalled.
+  mgr_.SetDelays(/*h2d=*/absl::ZeroDuration(), /*recall=*/kDelay);
+  expect_slow(telemetry::metric_labels::kTierSharedStorage,
+              telemetry::metric_labels::kOutcomeOk, 2);
+  ABSL_ASSERT_OK(store_->ReadRemote({"s0", "s1"},
+                                    {StorageSlice(), StorageSlice()}, {4, 5}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 2).done,
+              UnorderedElementsAre("s0", "s1"));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  mgr_.fail_recall = true;
+  expect_slow(telemetry::metric_labels::kTierSharedStorage,
+              telemetry::metric_labels::kOutcomeTransferFailed, 1);
+  ABSL_ASSERT_OK(store_->ReadRemote({"s2"}, {StorageSlice()}, {6}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 1).failed, ElementsAre("s2"));
+  mgr_.fail_recall = false;
+  mgr_.SetDelays(absl::ZeroDuration(), absl::ZeroDuration());
+}
+
+TEST_F(KVRecallBlocksMetricsTest, DpRankAttribution) {
+  MakeStore({.dp_rank = 7});
+  AddPinnedLocal({"l0"});
+
+  ExpectRecallBlocks(telemetry::metric_labels::kTierLocalDram,
+                     telemetry::metric_labels::kOutcomeOk, 1,
+                     /*dp_rank=*/"7");
+  ABSL_ASSERT_OK(store_->Load({"l0"}, {2}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 1).done, ElementsAre("l0"));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  ExpectRecallBlocks(telemetry::metric_labels::kTierSharedStorage,
+                     telemetry::metric_labels::kOutcomeOk, 1,
+                     /*dp_rank=*/"7");
+  ABSL_ASSERT_OK(store_->ReadRemote({"s0"}, {StorageSlice()}, {3}));
+  EXPECT_THAT(WaitForLoadSettled(*store_, 1).done, ElementsAre("s0"));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Verify KVCacheStore::Create() validates raiden_id.data_replica_idx >= 0
+  // and propagates dp_rank into backend-emitted metric labels at construction.
+  const auto create_store = [&](int dp_rank) {
+    const RaidenId id{"created_job", "0", "kv", dp_rank};
+    return KVCacheStore::Create(
+        BackendConfig{.type = "HostOffloadBackend",
+                      .capacity = 4,
+                      .global_registry_address = registry_address_,
+                      .raiden_id = id},
+        /*capacity=*/4, registry_address_, id, /*num_shards=*/1,
+        /*shard_size_bytes=*/512, /*store_server_ip=*/"127.0.0.1",
+        /*raiden_controller_port=*/0, /*metadata=*/std::nullopt,
+        /*expected_worker_count=*/0, /*secondary_backend_configs=*/{});
+  };
+  EXPECT_THAT(create_store(-1), StatusIs(absl::StatusCode::kInvalidArgument,
+                                         HasSubstr("dp_rank")));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheStore> created_store,
+                          create_store(9));
+  ExpectRecallBlocks(telemetry::metric_labels::kTierRemoteDram,
+                     telemetry::metric_labels::kOutcomeTransferFailed, 1,
+                     /*dp_rank=*/"9");
+  ABSL_ASSERT_OK(created_store->ReadRemote({"r_unknown_peer"},
+                                           {PeerSlice(peer_b_, 0)}, {0}));
+  EXPECT_THAT(WaitForLoadSettled(*created_store, 1).failed,
+              ElementsAre("r_unknown_peer"));
 }
 
 }  // namespace

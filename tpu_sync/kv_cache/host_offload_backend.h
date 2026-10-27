@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_KV_CACHE_HOST_OFFLOAD_BACKEND_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_RAIDEN_KV_CACHE_HOST_OFFLOAD_BACKEND_H_
 
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -176,18 +177,23 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   // Pulls blocks held by the peer `remote_id` into `device_block_ids`, in two
   // hops: a Fetch RPC that lands the bytes in host blocks allocated here, then
   // a DRAM->HBM copy chained off it.
-  tsl::Future<> LoadRemoteBlocks(const RaidenId& remote_id,
-                                 absl::Span<const std::string> block_hashes,
-                                 absl::Span<const int32_t> device_block_ids,
-                                 BlockTracker* absl_nonnull load_tracker);
+  // `recall_start` is when Load() began, for `kv_recall_duration_ms`.
+  tsl::Future<> LoadRemoteBlocks(
+      const RaidenId& remote_id, absl::Span<const std::string> block_hashes,
+      absl::Span<const int32_t> device_block_ids,
+      BlockTracker* absl_nonnull load_tracker,
+      std::chrono::steady_clock::time_point recall_start);
 
   // Copies blocks already resident in this node's host DRAM into
   // `device_block_ids`, as a single TransferBuffers.
-  // `slices` is the caller's pre-resolved index entries.
-  tsl::Future<> LoadLocalHostBlocks(absl::Span<const std::string> block_hashes,
-                                    absl::Span<const int32_t> device_block_ids,
-                                    absl::Span<const RaidenBlockId> slices,
-                                    BlockTracker* absl_nonnull load_tracker);
+  // `slices` is the caller's pre-resolved index entries. `recall_start` is
+  // when Load() began, for `kv_recall_duration_ms`.
+  tsl::Future<> LoadLocalHostBlocks(
+      absl::Span<const std::string> block_hashes,
+      absl::Span<const int32_t> device_block_ids,
+      absl::Span<const RaidenBlockId> slices,
+      BlockTracker* absl_nonnull load_tracker,
+      std::chrono::steady_clock::time_point recall_start);
 
   void SetMetadataEntry(absl::string_view hash, const RaidenBlockId& block)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
@@ -202,6 +208,18 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   bool InsertAdmitStrict(absl::Span<const std::string> block_hashes,
                          absl::Span<const RaidenBlockId> slices);
 
+  // Settle a recall batch: record `block_hashes` in `kv_recall_blocks_total`
+  // and `kv_recall_duration_ms` under `tier` (outcome `ok` for Done), then mark
+  // them in `load_tracker`.
+  void MarkRecallDone(BlockTracker* absl_nonnull load_tracker,
+                      absl::string_view tier,
+                      absl::Span<const std::string> block_hashes,
+                      std::chrono::steady_clock::time_point start) const;
+  void MarkRecallFailed(BlockTracker* absl_nonnull load_tracker,
+                        absl::string_view tier, absl::string_view outcome,
+                        absl::Span<const std::string> block_hashes,
+                        std::chrono::steady_clock::time_point start) const;
+
   // INVARIANT: no thread holds `mutex_` across a registry RPC. Every call site
   // unlocks first, and nothing enforces that but their shape. The synchronous
   // Register and Unregister are Await() on a promise a gRPC callback thread
@@ -215,6 +233,9 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   // BackendConfig.kv_pool_group.
   const std::string kv_pool_group_;
   controller::RaidenController* raiden_controller_ = nullptr;
+  // Configured at construction, immutable afterwards.
+  const std::string host_ip_;
+  const std::string dp_rank_str_;
 
   std::shared_ptr<global_registry::GlobalRegistryClient> registry_client_
       ABSL_GUARDED_BY(mutex_);

@@ -278,6 +278,7 @@ cc_library(
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
         "@xla//xla/tsl/platform:logging",
     ],
 )
@@ -831,6 +832,7 @@ cc_test(
         "@com_google_absl//absl/base:log_severity",
         "@com_google_absl//absl/log:scoped_mock_log",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
         "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/tsl/platform:logging",
         "@xla//xla/tsl/platform:statusor",

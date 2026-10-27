@@ -50,6 +50,7 @@
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/host_memory_allocator.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
@@ -57,9 +58,11 @@
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
+#include "tpu_sync/kv_cache/kv_cache_telemetry.h"
 #include "tpu_sync/kv_cache/reshard/reshard_service.h"
 #include "tpu_sync/kv_cache/store_monitor.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -220,9 +223,12 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
     absl::string_view global_registry_address, RaidenId raiden_id,
     int num_shards, int64_t shard_size_bytes, absl::string_view store_server_ip,
     int raiden_controller_port, std::optional<KVCacheMetadata> metadata,
-    int expected_worker_count) {
+    int expected_worker_count, int dp_rank) {
   if (backend_configs.empty()) {
     return absl::InvalidArgumentError("backend_configs must not be empty");
+  }
+  if (dp_rank < 0) {
+    return absl::InvalidArgumentError("dp_rank must be non-negative");
   }
   // Before any resource is created (violation must not leak).
   ABSL_RETURN_IF_ERROR(ValidateConstructionRules(store_server_ip, num_shards));
@@ -341,7 +347,7 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
   // does the wiring below instead.
   auto store = absl::WrapUnique(new KVCacheStore(
       std::move(backends), effective_raiden_id, std::move(raiden_controller),
-      store_server_ip, global_registry_address));
+      store_server_ip, global_registry_address, dp_rank));
 
   // Before SetRaidenController: the registration published there carries
   // these attributes.
@@ -487,22 +493,23 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
     int num_shards, int64_t shard_size_bytes, absl::string_view store_server_ip,
     int raiden_controller_port, std::optional<KVCacheMetadata> metadata,
     int expected_worker_count,
-    absl::Span<const BackendConfig> secondary_backend_configs) {
+    absl::Span<const BackendConfig> secondary_backend_configs, int dp_rank) {
   if (secondary_backend_configs.empty()) {
-    return KVCacheStore::Create(
-        absl::MakeConstSpan(&config, 1), capacity, global_registry_address,
-        raiden_id, num_shards, shard_size_bytes, store_server_ip,
-        raiden_controller_port, std::move(metadata), expected_worker_count);
+    return KVCacheStore::Create(absl::MakeConstSpan(&config, 1), capacity,
+                                global_registry_address, raiden_id, num_shards,
+                                shard_size_bytes, store_server_ip,
+                                raiden_controller_port, std::move(metadata),
+                                expected_worker_count, dp_rank);
   }
   std::vector<BackendConfig> all_configs;
   all_configs.reserve(1 + secondary_backend_configs.size());
   all_configs.push_back(config);
   all_configs.insert(all_configs.end(), secondary_backend_configs.begin(),
                      secondary_backend_configs.end());
-  return KVCacheStore::Create(all_configs, capacity, global_registry_address,
-                              raiden_id, num_shards, shard_size_bytes,
-                              store_server_ip, raiden_controller_port,
-                              std::move(metadata), expected_worker_count);
+  return KVCacheStore::Create(
+      all_configs, capacity, global_registry_address, raiden_id, num_shards,
+      shard_size_bytes, store_server_ip, raiden_controller_port,
+      std::move(metadata), expected_worker_count, dp_rank);
 }
 
 absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::CreateReshardStore(
@@ -584,11 +591,12 @@ KVCacheStore::KVCacheStore(
     RaidenId raiden_id,
     std::unique_ptr<controller::RaidenController> raiden_controller,
     absl::string_view store_server_ip,
-    absl::string_view global_registry_address)
+    absl::string_view global_registry_address, int dp_rank)
     : backends_(std::move(backends)),
       raiden_id_(std::move(raiden_id)),
       raiden_controller_(std::move(raiden_controller)),
       store_server_ip_(store_server_ip),
+      dp_rank_(dp_rank),
       lifetime_(std::make_shared<Lifetime>()) {
   lifetime_->store = this;
   if (absl::Status v = ValidateConstructionRules(
@@ -611,6 +619,7 @@ KVCacheStore::KVCacheStore(
     registry_client_ =
         std::make_shared<global_registry::GlobalRegistryClient>(channel);
   }
+  InitializeTelemetry();
 }
 
 KVCacheStore::KVCacheStore(
@@ -702,6 +711,7 @@ KVCacheStore::KVCacheStore(
                << " Use KVCacheStore::Create() for a recoverable error.";
   }
   backends_ = {std::move(*backend)};
+  InitializeTelemetry();
 
   if (raiden_controller_) {
     if (absl::Status s = SetRaidenController(raiden_controller_.get());
@@ -719,10 +729,12 @@ KVCacheStore::KVCacheStore(
     std::unique_ptr<::tpu_raiden::controller::RaidenController>
         raiden_controller,
     absl::string_view global_registry_address, RaidenId raiden_id,
-    std::optional<KVCacheMetadata> metadata, absl::string_view store_server_ip)
+    std::optional<KVCacheMetadata> metadata, absl::string_view store_server_ip,
+    int dp_rank)
     : raiden_id_(raiden_id),
       raiden_controller_(std::move(raiden_controller)),
       store_server_ip_(store_server_ip),
+      dp_rank_(dp_rank),
       lifetime_(std::make_shared<Lifetime>()) {
   lifetime_->store = this;
   if (absl::Status v =
@@ -760,6 +772,7 @@ KVCacheStore::KVCacheStore(
                << " Use KVCacheStore::Create() for a recoverable error.";
   }
   backends_ = {std::move(*backend)};
+  InitializeTelemetry();
 
   if (raiden_controller_) {
     if (absl::Status s = SetRaidenController(raiden_controller_.get());
@@ -770,6 +783,30 @@ KVCacheStore::KVCacheStore(
     }
     RegisterReadRemoteHooks();
   }
+}
+
+// Uses GetLocalHostPrimaryIp() rather than store_server_ip_ because
+// store_server_ip_ defaults to "127.0.0.1" in single-node runs, which would
+// bucket all hosts together in multi-host dashboards. On multi-NUMA hosts with
+// multiple data-plane NICs, a worker's bound_ip() may select a NUMA-local NIC
+// rather than the first data-plane NIC chosen here, so dashboards correlating
+// store-emitted and worker-emitted metrics should join on pod/instance rather
+// than host_ip.
+void KVCacheStore::InitializeTelemetry() {
+  CHECK_GE(dp_rank_, 0) << "dp_rank must be non-negative";
+  dp_rank_str_ = absl::StrCat(dp_rank_);
+  host_ip_ = GetLocalHostPrimaryIp();
+  for (const auto& backend : backends_) {
+    if (backend != nullptr) {
+      backend->SetTelemetryIdentity(host_ip_, dp_rank_);
+    }
+  }
+}
+
+void KVCacheStore::IncrementRecallBlocks(absl::string_view tier,
+                                         absl::string_view outcome,
+                                         uint64_t count) const {
+  IncrementKvRecallBlocks(host_ip_, dp_rank_str_, tier, outcome, count);
 }
 
 absl::Status KVCacheStore::SetRaidenController(
@@ -1341,8 +1378,18 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
 
   {
     absl::MutexLock lock(mutex_);
+    // Counts every block in the rejected batch as `not_found` because a batch
+    // rejection forces the caller to recompute all blocks in the batch,
+    // including when a local precondition fails (unpinned, HBM-only, or
+    // invalid host_block_id).
+    const auto record_not_found = [&]() {
+      IncrementRecallBlocks(telemetry::metric_labels::kTierLocalDram,
+                            telemetry::metric_labels::kOutcomeNotFound,
+                            block_hashes.size());
+    };
     ABSL_ASSIGN_OR_RETURN(const auto& slices, backend()->Lookup(block_hashes));
     if (slices.size() < block_hashes.size()) {
+      record_not_found();
       return absl::NotFoundError(
           absl::StrCat("Block hash not found: ", block_hashes[slices.size()]));
     }
@@ -1360,6 +1407,7 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
             "a peer."));
       }
       if (backend()->GetPinCount(hash) <= 0) {
+        record_not_found();
         return absl::FailedPreconditionError(
             absl::StrCat("Block is not pinned: ", hash));
       }
@@ -1369,10 +1417,12 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
       }
       if (existing.status != BlockStatus::HOST &&
           existing.status != BlockStatus::HOST_AND_HBM) {
+        record_not_found();
         return absl::FailedPreconditionError(
             absl::StrCat("Block is not on host: ", hash));
       }
       if (existing.host_block_id == -1) {
+        record_not_found();
         return absl::FailedPreconditionError(
             absl::StrCat("Block host_block_id is -1: ", hash));
       }
@@ -1409,6 +1459,9 @@ void KVCacheStore::LoadFromSecondaryBackend(
   if (!allocated.ok()) {
     LOG(WARNING) << "No host staging blocks for storage recall: "
                  << allocated.status();
+    IncrementRecallBlocks(telemetry::metric_labels::kTierSharedStorage,
+                          telemetry::metric_labels::kOutcomeStagingExhausted,
+                          block_hashes.size());
     absl::MutexLock lock(mutex_);
     load_tracker_.MarkFailed(block_hashes);
     return;
@@ -1444,9 +1497,10 @@ void KVCacheStore::LoadFromSecondaryBackend(
           absl::Status status) {
         if (!status.ok()) {
           // The tier's Lookup may have answered from a stale existence cache
-          // (e.g. the files were evicted out of band). Drop those entries so
-          // the next Lookup re-probes storage. The worker's error code does
-          // not survive the RPC, so this is done for every recall failure.
+          // (e.g. the files were evicted out of band), or a later chunk in the
+          // batch may have been missing behind an earlier non-NOT_FOUND error.
+          // Drop those entries on every recall failure so the next Lookup
+          // re-probes storage.
           secondary_backend->Delete(block_hashes);
           // TODO: revisit returning every staging block and failing the whole
           // batch on a recall error. The transfer reports a single status, so
@@ -1454,6 +1508,12 @@ void KVCacheStore::LoadFromSecondaryBackend(
           // the same as a total one.
           absl::MutexLock lock(lifetime->mu);
           if (KVCacheStore* self = lifetime->store; self != nullptr) {
+            self->IncrementRecallBlocks(
+                telemetry::metric_labels::kTierSharedStorage,
+                absl::IsNotFound(status)
+                    ? telemetry::metric_labels::kOutcomeNotFound
+                    : telemetry::metric_labels::kOutcomeTransferFailed,
+                block_hashes.size());
             self->DeallocateBlockIds(staging_host_block_ids);
             self->load_tracker_.MarkFailed(block_hashes);
           }
@@ -1489,6 +1549,9 @@ void KVCacheStore::LoadFromSecondaryBackend(
         absl::MutexLock lock(lifetime->mu);
         if (KVCacheStore* self = lifetime->store; self != nullptr) {
           if (!to_return.empty()) self->DeallocateBlockIds(to_return);
+          self->IncrementRecallBlocks(
+              telemetry::metric_labels::kTierSharedStorage,
+              telemetry::metric_labels::kOutcomeOk, block_hashes.size());
           // MarkDone, not MarkFailed: the transfer landed all N blocks in HBM,
           // so the Load succeeded even if the host-RAM tier refused a copy.
           self->load_tracker_.MarkDone(block_hashes);
@@ -1537,6 +1600,15 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
   // Local path: every slice is HOST / HOST_AND_HBM.
   {
     absl::MutexLock lock(mutex_);
+    // Counts every block in the rejected batch as `not_found` because a batch
+    // rejection forces the caller to recompute all blocks in the batch,
+    // including when a local precondition fails (unpinned or invalid
+    // host_block_id).
+    const auto record_not_found = [&]() {
+      IncrementRecallBlocks(telemetry::metric_labels::kTierLocalDram,
+                            telemetry::metric_labels::kOutcomeNotFound,
+                            block_hashes.size());
+    };
     for (size_t i = 0; i < slices.size(); ++i) {
       const auto& hash = block_hashes[i];
       const auto& existing = slices[i];
@@ -1548,6 +1620,7 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
       // to exist. The no-slices form has always required it; this form did
       // not, which left one signature hiding two different pin contracts.
       if (backend()->GetPinCount(hash) <= 0) {
+        record_not_found();
         return absl::FailedPreconditionError(
             absl::StrCat("Block is not pinned: ", hash));
       }
@@ -1557,6 +1630,7 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
             absl::StrCat("Block is not on host: ", hash));
       }
       if (existing.host_block_id == -1) {
+        record_not_found();
         return absl::FailedPreconditionError(
             absl::StrCat("Block host_block_id is -1: ", hash));
       }

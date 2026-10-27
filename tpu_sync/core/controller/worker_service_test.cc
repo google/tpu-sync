@@ -22,12 +22,20 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "grpcpp/server.h"
+#include "grpcpp/server_context.h"
+#include "grpcpp/support/status.h"
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/controller/worker_service_client.h"
 #include "tpu_sync/core/controller/worker_service_impl.h"
 #include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
+#include "tpu_sync/proto/worker_service.grpc.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
@@ -36,6 +44,7 @@ namespace controller {
 
 namespace {
 
+using ::absl_testing::StatusIs;
 using ::testing::ElementsAre;
 using ::testing::HasSubstr;
 
@@ -631,6 +640,139 @@ TEST_F(WorkerServiceTest, TransferBuffersWithInvalidBufferProtoFails) {
   auto status = test_server_->client->TransferBuffers(transfer_req).Await();
   EXPECT_FALSE(status.ok());
   EXPECT_THAT(status.message(), HasSubstr("BufferProto missing valid index"));
+}
+
+TEST_F(WorkerServiceTest, TransferBackendBuffersPropagatesNotFoundErrorCode) {
+  // 0. Unconfigured transfer_manager_ returns FAILED_PRECONDITION.
+  ::tpu_sync::proto::TransferBackendBuffersRequest req;
+  req.set_direction(::tpu_sync::proto::TRANSFER_DIR_RECALL);
+  req.add_block_hashes("missing_block");
+  req.add_hbm_block_ids(4);
+  req.add_host_block_ids(1);
+  req.add_backend_specs()->set_name("posix");
+  EXPECT_THAT(
+      test_server_->client->TransferBackendBuffers(req).Await(),
+      StatusIs(absl::StatusCode::kFailedPrecondition,
+               HasSubstr("Transfer manager is not configured")));
+
+  MockTransferManager mock_mgr;
+  kv_cache::BackendConfig cfg;
+  cfg.type = "posix";
+  cfg.parallelism.tp_rank = 0;
+  cfg.parallelism.tp_size = 1;
+  mock_mgr.RegisterKVBackends({cfg});
+  test_server_->service->SetTransferManager(KVManagerHolder(&mock_mgr));
+
+  // 1. Pipelined completion failure (copy_future.value().Await() returns
+  //    NOT_FOUND, as produced by PosixKVBackend::ReadAsync on ENOENT).
+  mock_mgr.backend_future_status =
+      absl::NotFoundError("Failed to open file for reading");
+  EXPECT_THAT(test_server_->client->TransferBackendBuffers(req).Await(),
+              StatusIs(absl::StatusCode::kNotFound,
+                       HasSubstr("Failed to open file for reading")));
+  mock_mgr.backend_future_status = absl::OkStatus();
+
+  // 2. Synchronous dispatch failure (H2dReadFromBackend returns NOT_FOUND).
+  mock_mgr.backend_transfer_status =
+      absl::NotFoundError("Dispatch file not found");
+  EXPECT_THAT(test_server_->client->TransferBackendBuffers(req).Await(),
+              StatusIs(absl::StatusCode::kNotFound,
+                       HasSubstr("Dispatch file not found")));
+  mock_mgr.backend_transfer_status = absl::OkStatus();
+
+  // 3. Key-mapping failure (MapKey returns INVALID_ARGUMENT on empty hash).
+  ::tpu_sync::proto::TransferBackendBuffersRequest bad_key_req;
+  bad_key_req.set_direction(::tpu_sync::proto::TRANSFER_DIR_RECALL);
+  bad_key_req.add_block_hashes("");
+  bad_key_req.add_hbm_block_ids(4);
+  bad_key_req.add_host_block_ids(1);
+  bad_key_req.add_backend_specs()->set_name("posix");
+  EXPECT_THAT(test_server_->client->TransferBackendBuffers(bad_key_req).Await(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Failed to map block hash")));
+
+  // 4. Server-side request & backend precondition validation codes.
+  ::tpu_sync::proto::TransferBackendBuffersRequest empty_req;
+  empty_req.set_direction(::tpu_sync::proto::TRANSFER_DIR_RECALL);
+  empty_req.add_backend_specs()->set_name("posix");
+  EXPECT_THAT(test_server_->client->TransferBackendBuffers(empty_req).Await(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("must specify at least one block hash")));
+
+  ::tpu_sync::proto::TransferBackendBuffersRequest unknown_backend_req = req;
+  unknown_backend_req.mutable_backend_specs(0)->set_name("unregistered");
+  EXPECT_THAT(
+      test_server_->client->TransferBackendBuffers(unknown_backend_req).Await(),
+      StatusIs(absl::StatusCode::kFailedPrecondition,
+               HasSubstr("No backend registered for backend_name")));
+
+  ::tpu_sync::proto::TransferBackendBuffersRequest bad_dir_req = req;
+  bad_dir_req.set_direction(::tpu_sync::proto::TRANSFER_DIR_UNSPECIFIED);
+  EXPECT_THAT(test_server_->client->TransferBackendBuffers(bad_dir_req).Await(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Unsupported transfer direction")));
+}
+
+TEST_F(WorkerServiceTest,
+       TransferBackendBuffersDefaultsUnsetErrorCodeToInternal) {
+  // Worker stub returning raw wire error_code values (0 / unset from older
+  // workers, < 0, or > kUnauthenticated) so client-side ParseWorkerErrorCode
+  // boundary handling is exercised directly over the wire without absl::Status
+  // clamping out-of-range codes to kUnknown on the server first.
+  class RawErrorCodeWorkerService final
+      : public ::tpu_sync::proto::WorkerService::Service {
+   public:
+    int32_t raw_error_code = 0;
+    std::string message = "Legacy worker failure without error_code";
+
+    grpc::Status TransferBackendBuffers(
+        grpc::ServerContext* /*context*/,
+        const ::tpu_sync::proto::TransferBackendBuffersRequest* /*request*/,
+        ::tpu_sync::proto::TransferBackendBuffersResponse* response) override {
+      response->set_success(false);
+      if (raw_error_code != 0) {
+        response->set_error_code(raw_error_code);
+      }
+      response->set_message(message);
+      return grpc::Status::OK;
+    }
+  };
+  RawErrorCodeWorkerService raw_service;
+  int port = 0;
+  std::unique_ptr<grpc::Server> raw_server =
+      test_util_internal::StartOnPrivateEphemeralPort(&raw_service, &port);
+  ASSERT_NE(raw_server, nullptr);
+  WorkerServiceClient raw_client(
+      CreateWorkerServiceChannel(absl::StrCat("localhost:", port)));
+
+  ::tpu_sync::proto::TransferBackendBuffersRequest req;
+  req.set_direction(::tpu_sync::proto::TRANSFER_DIR_RECALL);
+  req.add_block_hashes("block_0");
+  req.add_hbm_block_ids(4);
+  req.add_host_block_ids(1);
+  req.add_backend_specs()->set_name("posix");
+
+  // 1. Unset error_code (0 on the wire) defaults to kInternal.
+  EXPECT_THAT(raw_client.TransferBackendBuffers(req).Await(),
+              StatusIs(absl::StatusCode::kInternal,
+                       HasSubstr("Legacy worker failure without error_code")));
+
+  // 2. Negative error_code (< 0) defaults to kInternal.
+  raw_service.raw_error_code = -1;
+  raw_service.message = "Negative error code";
+  EXPECT_THAT(
+      raw_client.TransferBackendBuffers(req).Await(),
+      StatusIs(absl::StatusCode::kInternal, HasSubstr("Negative error code")));
+
+  // 3. Out-of-upper-bound error_code (> kUnauthenticated) defaults to
+  //    kInternal.
+  raw_service.raw_error_code = 999;
+  raw_service.message = "Out-of-upper-bound error code";
+  EXPECT_THAT(raw_client.TransferBackendBuffers(req).Await(),
+              StatusIs(absl::StatusCode::kInternal,
+                       HasSubstr("Out-of-upper-bound error code")));
+
+  raw_server->Shutdown();
 }
 }  // namespace
 }  // namespace controller

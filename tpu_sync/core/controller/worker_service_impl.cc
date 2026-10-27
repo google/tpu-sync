@@ -353,6 +353,8 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
 
   if (!transfer_manager_) {
     response->set_success(false);
+    response->set_error_code(
+        static_cast<int32_t>(absl::StatusCode::kFailedPrecondition));
     response->set_message(
         "Transfer manager is not configured on WorkerService");
     return grpc::Status::OK;
@@ -362,6 +364,8 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
     LOG(ERROR) << "[Worker] TransferBackendBuffers received "
                << request->backend_specs_size() << " backend_specs";
     response->set_success(false);
+    response->set_error_code(
+        static_cast<int32_t>(absl::StatusCode::kInvalidArgument));
     response->set_message(absl::StrCat(
         "TransferBackendBuffers requires exactly 1 backend_spec, got ",
         request->backend_specs_size()));
@@ -374,6 +378,8 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
   if (num_blocks == 0) {
     LOG(ERROR) << "[Worker] Backend transfer request contains 0 block hashes";
     response->set_success(false);
+    response->set_error_code(
+        static_cast<int32_t>(absl::StatusCode::kInvalidArgument));
     response->set_message(
         "Backend transfer request must specify at least one block hash");
     return grpc::Status::OK;
@@ -390,6 +396,8 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
                << request->host_block_ids_size() << "), block_hashes ("
                << num_blocks << ")";
     response->set_success(false);
+    response->set_error_code(
+        static_cast<int32_t>(absl::StatusCode::kInvalidArgument));
     response->set_message(absl::StrCat(
         "Mismatch between block id count (hbm: ", request->hbm_block_ids_size(),
         ", host: ", request->host_block_ids_size(),
@@ -404,6 +412,8 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
     LOG(ERROR) << "[Worker] No backend registered for backend_name: "
                << backend_name;
     response->set_success(false);
+    response->set_error_code(
+        static_cast<int32_t>(absl::StatusCode::kFailedPrecondition));
     response->set_message(
         absl::StrCat("No backend registered for backend_name: ", backend_name));
     return grpc::Status::OK;
@@ -413,6 +423,8 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
     LOG(ERROR) << "[Worker] Backend driver '" << backend_name
                << "' has no mapper configured";
     response->set_success(false);
+    response->set_error_code(
+        static_cast<int32_t>(absl::StatusCode::kFailedPrecondition));
     response->set_message(absl::StrCat("Backend driver '", backend_name,
                                        "' has no mapper configured"));
     return grpc::Status::OK;
@@ -427,6 +439,7 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
       LOG(ERROR) << "[Worker] Failed to map block hash for backend '"
                  << backend_name << "': " << key.status();
       response->set_success(false);
+      response->set_error_code(static_cast<int32_t>(key.status().code()));
       response->set_message(
           absl::StrCat("Failed to map block hash: ", key.status().message()));
       return grpc::Status::OK;
@@ -463,6 +476,8 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
 
     default:
       response->set_success(false);
+      response->set_error_code(
+          static_cast<int32_t>(absl::StatusCode::kInvalidArgument));
       response->set_message(absl::StrCat("Unsupported transfer direction: ",
                                          request->direction()));
       return grpc::Status::OK;
@@ -472,6 +487,7 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
     LOG(ERROR) << "[Worker] Backend transfer dispatch failed: "
                << copy_future.status();
     response->set_success(false);
+    response->set_error_code(static_cast<int32_t>(copy_future.status().code()));
     response->set_message(copy_future.status().message());
     return grpc::Status::OK;
   }
@@ -480,6 +496,7 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
   if (!status.ok()) {
     LOG(ERROR) << "[Worker] Pipelined backend transfer failed: " << status;
     response->set_success(false);
+    response->set_error_code(static_cast<int32_t>(status.code()));
     response->set_message(status.message());
     return grpc::Status::OK;
   }

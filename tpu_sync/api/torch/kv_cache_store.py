@@ -149,6 +149,7 @@ class KVCacheStore:
       expected_worker_count: int = 0,
       kv_pool_group: str = "",
       secondary_backend_configs: Sequence[Any] = (),
+      dp_rank: int = 0,
   ):
     """Creates a KVCacheStore.
 
@@ -205,6 +206,9 @@ class KVCacheStore:
         The posix backend derives its storage topology from `parallelism`:
         declare the same axes and sizes (`<axis>_size`) as the workers. Ranks
         are ignored. An invalid config fails construction.
+      dp_rank: Global data-parallel rank of the vLLM engine that owns this store
+        (must equal vLLM's `engine` metric label); used only for telemetry
+        attribution.
     """
     raw_raiden_id = RaidenId()
     if raiden_id is not None:
@@ -222,6 +226,7 @@ class KVCacheStore:
         expected_worker_count=expected_worker_count,
         kv_pool_group=kv_pool_group,
         secondary_backend_configs=list(secondary_backend_configs),
+        dp_rank=dp_rank,
     )
 
   @property

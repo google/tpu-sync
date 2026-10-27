@@ -14,6 +14,7 @@
 
 #include "tpu_sync/core/controller/worker_service_client.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -35,6 +36,17 @@
 
 namespace tpu_raiden {
 namespace controller {
+namespace {
+
+absl::StatusCode ParseWorkerErrorCode(int32_t raw_code) {
+  if (raw_code > 0 &&
+      raw_code <= static_cast<int32_t>(absl::StatusCode::kUnauthenticated)) {
+    return static_cast<absl::StatusCode>(raw_code);
+  }
+  return absl::StatusCode::kInternal;
+}
+
+}  // namespace
 
 std::shared_ptr<grpc::Channel> CreateWorkerServiceChannel(
     absl::string_view endpoint) {
@@ -156,7 +168,9 @@ tsl::Future<> WorkerServiceClient::TransferBackendBuffers(
           promise->Set(absl::InternalError(absl::StrCat(
               "TransferBackendBuffers RPC failed: ", status.error_message())));
         } else if (!response->success()) {
-          promise->Set(absl::InternalError(response->message()));
+          promise->Set(absl::Status(
+              ParseWorkerErrorCode(response->error_code()),
+              response->message()));
         } else {
           promise->Set(absl::OkStatus());
         }

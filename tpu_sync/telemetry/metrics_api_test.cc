@@ -397,6 +397,35 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(metric_labels::kPcieTransferLabels,
               ElementsAre(metric_labels::kHostIp, metric_labels::kLocalRank));
 
+  // KV Cache Labels & Metrics
+  EXPECT_EQ(metric_labels::kDpRank, "dp_rank");
+  EXPECT_EQ(metric_labels::kTier, "tier");
+  EXPECT_EQ(metric_labels::kTierLocalDram, "local_dram");
+  EXPECT_EQ(metric_labels::kTierRemoteDram, "remote_dram");
+  EXPECT_EQ(metric_labels::kTierSharedStorage, "shared_storage");
+  EXPECT_EQ(metric_labels::kOutcome, "outcome");
+  EXPECT_EQ(metric_labels::kOutcomeOk, "ok");
+  EXPECT_EQ(metric_labels::kOutcomeNotFound, "not_found");
+  EXPECT_EQ(metric_labels::kOutcomeStagingExhausted, "staging_exhausted");
+  EXPECT_EQ(metric_labels::kOutcomeTransferFailed, "transfer_failed");
+  EXPECT_THAT(metric_labels::kKvRecallBlocksLabels,
+              ElementsAre(metric_labels::kHostIp, metric_labels::kDpRank,
+                          metric_labels::kTier, metric_labels::kOutcome));
+
+  EXPECT_EQ(metric_names::kKvRecallBlocksTotal, "kv_recall_blocks_total");
+  EXPECT_EQ(metric_descriptions::kKvRecallBlocksTotal,
+            "Cumulative count of KV cache block recall attempts across tiers "
+            "and outcomes.");
+  EXPECT_EQ(metric_metadata::kKvRecallBlocksTotal.name,
+            "kv_recall_blocks_total");
+  EXPECT_EQ(metric_metadata::kKvRecallBlocksTotal.description,
+            "Cumulative count of KV cache block recall attempts across tiers "
+            "and outcomes.");
+  EXPECT_EQ(metric_metadata::kKvRecallBlocksTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kKvRecallBlocksTotal.label_names,
+              ElementsAre(metric_labels::kHostIp, metric_labels::kDpRank,
+                          metric_labels::kTier, metric_labels::kOutcome));
+
   // All Metrics
   // clang-format off
   EXPECT_THAT(
@@ -414,6 +443,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kD2hTransferTimeMs,
           metric_metadata::kD2hDmaTimeMs,
           metric_metadata::kBufferAllocatedBytes,
+          metric_metadata::kKvRecallBlocksTotal,
           metric_metadata::kWeightSyncSentBytesTotal,
           metric_metadata::kWeightSyncReceivedBytesTotal,
           metric_metadata::kWeightSyncTransferFailuresTotal,

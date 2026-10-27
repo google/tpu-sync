@@ -95,7 +95,7 @@ KVCacheStoreWrapper::KVCacheStoreWrapper(
     RaidenId raiden_id, int num_shards, int64_t shard_size_bytes,
     std::string store_server_ip, int raiden_controller_port,
     int expected_worker_count, std::string kv_pool_group,
-    std::vector<BackendConfig> secondary_backend_configs) {
+    std::vector<BackendConfig> secondary_backend_configs, int dp_rank) {
   // Routed through Create() (not the raw constructor) so a misconfigured
   // caller -- e.g. a missing store_server_ip -- gets a Python exception
   // instead of aborting the process.
@@ -119,7 +119,7 @@ KVCacheStoreWrapper::KVCacheStoreWrapper(
       host_config, /*capacity=*/lru_capacity, global_registry_address,
       raiden_id, num_shards, shard_size_bytes, store_server_ip,
       raiden_controller_port, /*metadata=*/std::nullopt, expected_worker_count,
-      secondary_backend_configs);
+      secondary_backend_configs, dp_rank);
   if (!created_store.ok()) {
     // invalid_argument maps to Python ValueError, runtime_error to
     // RuntimeError: a bad configuration is the caller's mistake, everything

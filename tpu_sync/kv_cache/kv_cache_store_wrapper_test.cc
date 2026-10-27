@@ -359,6 +359,25 @@ TEST_F(KVCacheStoreWrapperTest, StorageExtensionConfiguration) {
   EXPECT_EQ(wrapper->backends()[1]->name(), "posix");
 }
 
+TEST_F(KVCacheStoreWrapperTest, DpRankForwardedToStore) {
+  RaidenId rid{"wrapper_test_job", "0", "wrapper_test_cache", 0};
+  KVCacheStoreWrapper wrapper(
+      /*lru_capacity=*/4, /*global_registry_address=*/"", rid, /*num_shards=*/1,
+      /*shard_size_bytes=*/512, /*store_server_ip=*/"127.0.0.1",
+      /*raiden_controller_port=*/0, /*expected_worker_count=*/0,
+      /*kv_pool_group=*/"", /*secondary_backend_configs=*/{}, /*dp_rank=*/5);
+  EXPECT_EQ(wrapper->dp_rank(), 5);
+
+  EXPECT_THROW(
+      KVCacheStoreWrapper(
+          /*lru_capacity=*/4, /*global_registry_address=*/"", rid,
+          /*num_shards=*/1, /*shard_size_bytes=*/512,
+          /*store_server_ip=*/"127.0.0.1", /*raiden_controller_port=*/0,
+          /*expected_worker_count=*/0, /*kv_pool_group=*/"",
+          /*secondary_backend_configs=*/{}, /*dp_rank=*/-1),
+      std::invalid_argument);
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

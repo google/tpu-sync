@@ -198,6 +198,11 @@ class KVCacheStoreBackend {
   // controller and block trackers.
   virtual void Shutdown() {}
 
+  // Configures the telemetry identity (host IP and data-parallel rank) attached
+  // to metrics emitted by this backend. Not thread-safe; must be called once
+  // from the KVCacheStore constructor before any Load/Save is issued.
+  virtual void SetTelemetryIdentity(absl::string_view host_ip, int dp_rank) {}
+
   // Human-readable backend name for logging and diagnostics (e.g.,
   // "HostOffloadBackend", "posix").
   virtual std::string name() const = 0;

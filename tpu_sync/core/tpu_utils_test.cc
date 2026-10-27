@@ -30,6 +30,7 @@
 #include "absl/base/log_severity.h"
 #include "absl/log/scoped_mock_log.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/tsl/platform/logging.h"
 #include "xla/tsl/platform/statusor.h"
@@ -889,6 +890,63 @@ TEST(TpuUtilsTest,
   EXPECT_EQ(it2_enp->numa_node, 1);
 
   fs::remove_all(sysfs);
+}
+
+TEST(TpuUtilsTest, SelectPrimaryHostIpTest) {
+  // 1. Empty span returns default fallback ("unknown") or custom fallback.
+  EXPECT_EQ(SelectPrimaryHostIp({}), "unknown");
+  EXPECT_EQ(SelectPrimaryHostIp({}, "127.0.0.1"), "127.0.0.1");
+
+  // 2. All NICs have empty ip_address -> returns fallback.
+  std::vector<HostNicAddress> empty_ip_nics = {
+      {"eth0", "", 0, NicClassification::kDataPlane},
+      {"eth1", "", 0, NicClassification::kControlPlane},
+      {"eth2", "", 0, NicClassification::kUnknown},
+  };
+  EXPECT_EQ(SelectPrimaryHostIp(empty_ip_nics), "unknown");
+  EXPECT_EQ(SelectPrimaryHostIp(empty_ip_nics, "fallback_ip"), "fallback_ip");
+
+  // 3. Prefers first kDataPlane NIC with non-empty IP over earlier
+  // control/unknown or empty-IP data-plane NICs.
+  std::vector<HostNicAddress> mixed_nics = {
+      {"eth0", "10.0.0.1", 0, NicClassification::kControlPlane},
+      {"eth1", "", 0, NicClassification::kDataPlane},
+      {"eth2", "192.168.1.10", 0, NicClassification::kDataPlane},
+      {"eth3", "192.168.1.11", 1, NicClassification::kDataPlane},
+  };
+  EXPECT_EQ(SelectPrimaryHostIp(mixed_nics), "192.168.1.10");
+
+  // 4. Falls back to first kControlPlane NIC with non-empty IP when no
+  // data-plane NIC has a non-empty IP.
+  std::vector<HostNicAddress> control_and_unknown_nics = {
+      {"eth0", "172.16.0.1", -1, NicClassification::kUnknown},
+      {"eth1", "", 0, NicClassification::kControlPlane},
+      {"eth2", "10.0.0.2", 0, NicClassification::kControlPlane},
+      {"eth3", "10.0.0.3", 0, NicClassification::kControlPlane},
+  };
+  EXPECT_EQ(SelectPrimaryHostIp(control_and_unknown_nics), "10.0.0.2");
+
+  // 5. Falls back to first NIC with non-empty IP (e.g. kUnknown) when neither
+  // kDataPlane nor kControlPlane has a non-empty IP.
+  std::vector<HostNicAddress> unknown_only_nics = {
+      {"eth0", "", -1, NicClassification::kUnknown},
+      {"eth1", "172.16.0.5", -1, NicClassification::kUnknown},
+      {"eth2", "172.16.0.6", -1, NicClassification::kUnknown},
+  };
+  EXPECT_EQ(SelectPrimaryHostIp(unknown_only_nics), "172.16.0.5");
+}
+
+TEST(TpuUtilsTest, GetCachedLocalHostNicAddressesAndPrimaryIpTest) {
+  const auto& cached_nics_1 = GetCachedLocalHostNicAddresses();
+  const auto& cached_nics_2 = GetCachedLocalHostNicAddresses();
+  EXPECT_EQ(&cached_nics_1, &cached_nics_2);
+  EXPECT_FALSE(cached_nics_1.empty());
+
+  const std::string& primary_ip_1 = GetLocalHostPrimaryIp();
+  const std::string& primary_ip_2 = GetLocalHostPrimaryIp();
+  EXPECT_EQ(&primary_ip_1, &primary_ip_2);
+  EXPECT_FALSE(primary_ip_1.empty());
+  EXPECT_EQ(primary_ip_1, SelectPrimaryHostIp(cached_nics_1));
 }
 
 }  // namespace

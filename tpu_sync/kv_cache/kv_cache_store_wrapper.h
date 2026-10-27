@@ -48,7 +48,9 @@ namespace kv_cache {
 StoreMonitorConfig StoreMonitorConfigFromEnv();
 
 // Constructs the KVCacheStore behind the framework Python bindings (the jax
-// and torch modules both bind this class).
+// and torch modules both bind this class). `dp_rank` is the global
+// data-parallel rank of the owning engine (must equal vLLM's `engine` metric
+// label), used only for telemetry attribution.
 class KVCacheStoreWrapper {
  public:
   explicit KVCacheStoreWrapper(
@@ -56,7 +58,8 @@ class KVCacheStoreWrapper {
       RaidenId raiden_id = {}, int num_shards = 0, int64_t shard_size_bytes = 0,
       std::string store_server_ip = "", int raiden_controller_port = 0,
       int expected_worker_count = 0, std::string kv_pool_group = "",
-      std::vector<BackendConfig> secondary_backend_configs = {});
+      std::vector<BackendConfig> secondary_backend_configs = {},
+      int dp_rank = 0);
 
   explicit KVCacheStoreWrapper(std::unique_ptr<KVCacheStore> store)
       : controller_(std::move(store)) {}

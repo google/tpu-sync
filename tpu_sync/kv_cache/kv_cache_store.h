@@ -49,6 +49,7 @@
 #include "tpu_sync/kv_cache/kv_cache_store_server.h"
 #include "tpu_sync/kv_cache/lru_cache.h"
 #include "tpu_sync/kv_cache/reshard/reshard_service.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden {
 
@@ -138,7 +139,11 @@ class KVCacheStore {
   // KVCacheMetadata table in shared memory too.
 
   // Safe factory method to create KVCacheStore from a single BackendConfig
-  // with optional secondary backend configs.
+  // with optional secondary backend configs. `dp_rank` is the global
+  // data-parallel rank of the owning engine (must equal vLLM's `engine` metric
+  // label), used only for telemetry attribution; `Create()` is the supported
+  // way to configure it (the non-test public constructors below default to
+  // `dp_rank = 0`).
   static absl::StatusOr<std::unique_ptr<KVCacheStore>> Create(
       const BackendConfig& config, size_t capacity = 0,
       absl::string_view global_registry_address = "", RaidenId raiden_id = {},
@@ -146,7 +151,8 @@ class KVCacheStore {
       absl::string_view store_server_ip = "", int raiden_controller_port = 0,
       std::optional<KVCacheMetadata> metadata = std::nullopt,
       int expected_worker_count = 0,
-      absl::Span<const BackendConfig> secondary_backend_configs = {});
+      absl::Span<const BackendConfig> secondary_backend_configs = {},
+      int dp_rank = 0);
 
   // Safe factory method to create KVCacheStore from a list of BackendConfigs.
   // backend_configs[0] specifies Tier 0 (Host DRAM). Any additional configs
@@ -157,7 +163,7 @@ class KVCacheStore {
       int num_shards = 0, int64_t shard_size_bytes = 0,
       absl::string_view store_server_ip = "", int raiden_controller_port = 0,
       std::optional<KVCacheMetadata> metadata = std::nullopt,
-      int expected_worker_count = 0);
+      int expected_worker_count = 0, int dp_rank = 0);
 
   // Thin-store factory: hosts a RaidenController (expected_worker_count=0)
   // and a ReshardService in WorkerDelivery::Mode::kController mode within a
@@ -173,7 +179,9 @@ class KVCacheStore {
       int raiden_controller_port = 0, int reshard_service_port = 0,
       double request_registry_ttl_s = 600.0);
 
-  // Flexible constructor accepting a custom root backend
+  // Flexible constructor accepting a custom root backend. Note: the non-test
+  // public constructors always report `dp_rank = 0`; use `Create()` to set
+  // `dp_rank`.
   explicit KVCacheStore(std::shared_ptr<KVCacheStoreBackend> backend,
                         RaidenId raiden_id = {}, int num_shards = 0,
                         int64_t shard_size_bytes = 0,
@@ -212,14 +220,16 @@ class KVCacheStore {
                         std::optional<KVCacheMetadata> metadata = std::nullopt,
                         int expected_worker_count = 0);
 
-  // Test-only constructor for injecting mock controller
+  // Test-only constructor for injecting mock controller (`dp_rank >= 0` is
+  // enforced with a `CHECK`). Production callers should use `Create()` to
+  // configure `dp_rank`.
   explicit KVCacheStore(
       size_t capacity,
       std::unique_ptr<tpu_raiden::controller::RaidenController>
           raiden_controller,
       absl::string_view global_registry_address = "", RaidenId raiden_id = {},
       std::optional<KVCacheMetadata> metadata = std::nullopt,
-      absl::string_view store_server_ip = "");
+      absl::string_view store_server_ip = "", int dp_rank = 0);
 
   // Create a reshard-only thin-store mode. The
   // returned store owns nothing but a bound reshard::ReshardService — no
@@ -404,6 +414,8 @@ class KVCacheStore {
 
   const RaidenId& raiden_id() const { return raiden_id_; }
 
+  int dp_rank() const { return dp_rank_; }
+
   tpu_raiden::controller::RaidenController* raiden_controller() const {
     return raiden_controller_.get();
   }
@@ -552,7 +564,14 @@ class KVCacheStore {
       RaidenId raiden_id,
       std::unique_ptr<controller::RaidenController> raiden_controller,
       absl::string_view store_server_ip = "",
-      absl::string_view global_registry_address = "");
+      absl::string_view global_registry_address = "", int dp_rank = 0);
+
+  // Resolves store telemetry labels (host_ip, dp_rank) and propagates them to
+  // backends_; must run after backends_ is populated and before any Load is
+  // issued.
+  void InitializeTelemetry();
+  void IncrementRecallBlocks(absl::string_view tier, absl::string_view outcome,
+                             uint64_t count) const;
 
   // Registers ValidateAndPinHostBlocks/UnpinHostBlocks on raiden_controller_
   // as the source-side hooks that a peer's ReadRemote lease acquisition and
@@ -631,6 +650,9 @@ class KVCacheStore {
   // The IP peers reach this node on. Never empty and never a wildcard --
   // construction rejects both.
   std::string store_server_ip_;
+  int dp_rank_ = 0;
+  std::string dp_rank_str_ = "0";
+  std::string host_ip_ = std::string(telemetry::metric_labels::kUnknownIp);
   // Advertised "host:port" of store_server_, empty until it is started.
   std::string store_server_address_;
   // Non-owning. Points either into owned_store_server_ or at a server owned by

@@ -50,6 +50,7 @@
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/tsl/platform/logging.h"
 
@@ -739,6 +740,34 @@ const std::vector<HostNicAddress>& GetCachedLocalHostNicAddresses() {
   static const std::vector<HostNicAddress>* nics =
       new std::vector<HostNicAddress>(GetLocalHostNicAddresses());
   return *nics;
+}
+
+std::string SelectPrimaryHostIp(absl::Span<const HostNicAddress> nics,
+                                absl::string_view fallback) {
+  for (const auto& nic : nics) {
+    if (nic.classification == NicClassification::kDataPlane &&
+        !nic.ip_address.empty()) {
+      return nic.ip_address;
+    }
+  }
+  for (const auto& nic : nics) {
+    if (nic.classification == NicClassification::kControlPlane &&
+        !nic.ip_address.empty()) {
+      return nic.ip_address;
+    }
+  }
+  for (const auto& nic : nics) {
+    if (!nic.ip_address.empty()) {
+      return nic.ip_address;
+    }
+  }
+  return std::string(fallback);
+}
+
+const std::string& GetLocalHostPrimaryIp() {
+  static const std::string* const primary_ip =
+      new std::string(SelectPrimaryHostIp(GetCachedLocalHostNicAddresses()));
+  return *primary_ip;
 }
 
 std::optional<HostNicAddress> GetSocketLocalNic(int fd) {

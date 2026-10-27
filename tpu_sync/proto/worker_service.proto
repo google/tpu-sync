@@ -184,6 +184,9 @@ message TransferBackendBuffersRequest {
 message TransferBackendBuffersResponse {
   bool success = 1;
   string message = 2;
+  // Canonical absl::StatusCode when `success` is false (0 / unset defaults to
+  // INTERNAL on the client for compatibility with older workers).
+  int32 error_code = 3;
 }
 
 // Specification for copying disjoint memory regions in one buffer.

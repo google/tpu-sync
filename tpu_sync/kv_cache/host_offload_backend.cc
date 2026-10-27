@@ -51,10 +51,12 @@
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
+#include "tpu_sync/kv_cache/kv_cache_telemetry.h"
 #include "tpu_sync/kv_cache/lru_cache.h"
 #include "tpu_sync/proto/kv_cache_store_service.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -115,6 +117,18 @@ void HostOffloadBackend::Shutdown() {
   // completions to finish before KVCacheStore destroys its borrowed objects.
   absl::WriterMutexLock lock(lifetime_->mu);
   lifetime_->is_alive = false;
+}
+
+void HostOffloadBackend::SetTelemetryIdentity(absl::string_view host_ip,
+                                              int dp_rank) {
+  host_ip_ = std::string(host_ip);
+  dp_rank_str_ = absl::StrCat(dp_rank);
+}
+
+void HostOffloadBackend::IncrementRecallBlocks(absl::string_view tier,
+                                               absl::string_view outcome,
+                                               uint64_t count) const {
+  IncrementKvRecallBlocks(host_ip_, dp_rank_str_, tier, outcome, count);
 }
 
 absl::StatusOr<std::shared_ptr<KVCacheStoreBackend>> HostOffloadBackend::Create(
@@ -1052,6 +1066,9 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
   CHECK(load_tracker != nullptr);
   auto client = GetKVCacheStoreClient(remote_id);
   if (!client.ok()) {
+    IncrementRecallBlocks(telemetry::metric_labels::kTierRemoteDram,
+                          telemetry::metric_labels::kOutcomeTransferFailed,
+                          block_hashes.size());
     load_tracker->MarkFailed(block_hashes);
     return tsl::Future<>(client.status());
   }
@@ -1059,6 +1076,9 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
 
   auto host_blocks = raiden_controller_->AllocateBlockIds(block_hashes.size());
   if (!host_blocks.ok()) {
+    IncrementRecallBlocks(telemetry::metric_labels::kTierRemoteDram,
+                          telemetry::metric_labels::kOutcomeStagingExhausted,
+                          block_hashes.size());
     load_tracker->MarkFailed(block_hashes);
     return tsl::Future<>(host_blocks.status());
   }
@@ -1095,6 +1115,17 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
             // The peer may have restarted on a new port; drop the cached client
             // so the next attempt re-resolves instead of redialling a dead one.
             InvalidateStoreClient(remote_id);
+            // KVCacheStoreServiceImpl::Fetch returns NOT_FOUND when a requested
+            // block hash is missing on the peer (or peer Lookup fails) before
+            // any bytes move. (FAILED_PRECONDITION is shared by the peer's
+            // non-DRAM residency check and uninitialized backend/controller
+            // guard, so it stays in `transfer_failed`.)
+            const absl::string_view outcome =
+                absl::IsNotFound(fetch_response.status())
+                    ? telemetry::metric_labels::kOutcomeNotFound
+                    : telemetry::metric_labels::kOutcomeTransferFailed;
+            IncrementRecallBlocks(telemetry::metric_labels::kTierRemoteDram,
+                                  outcome, hashes.size());
             load_tracker->MarkFailed(hashes);
             load_promise.Set(fetch_response.status());
             return;
@@ -1106,6 +1137,14 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
             std::string err_msg = response.error_message().empty()
                                       ? "Fetch RPC returned failed blocks"
                                       : response.error_message();
+            // TODO: FetchResponse.failed_block_hashes is not populated by
+            // KVCacheStoreServiceImpl::Fetch today (missing blocks fail the RPC
+            // with NOT_FOUND) and its proto semantics are generic fetch failure
+            // rather than "missing on peer", so count it as `transfer_failed`.
+            IncrementRecallBlocks(
+                telemetry::metric_labels::kTierRemoteDram,
+                telemetry::metric_labels::kOutcomeTransferFailed,
+                hashes.size());
             load_tracker->MarkFailed(hashes);
             load_promise.Set(absl::InternalError(err_msg));
             return;
@@ -1142,8 +1181,15 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
           }
           (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
           if (status.ok()) {
+            IncrementRecallBlocks(telemetry::metric_labels::kTierRemoteDram,
+                                  telemetry::metric_labels::kOutcomeOk,
+                                  hashes.size());
             load_tracker->MarkDone(hashes);
           } else {
+            IncrementRecallBlocks(
+                telemetry::metric_labels::kTierRemoteDram,
+                telemetry::metric_labels::kOutcomeTransferFailed,
+                hashes.size());
             load_tracker->MarkFailed(hashes);
           }
           load_promise.Set(status);
@@ -1159,6 +1205,12 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
     absl::Span<const RaidenBlockId> slices,
     BlockTracker* absl_nonnull load_tracker) {
   CHECK(load_tracker != nullptr);
+  const auto fail_not_found = [&]() {
+    IncrementRecallBlocks(telemetry::metric_labels::kTierLocalDram,
+                          telemetry::metric_labels::kOutcomeNotFound,
+                          block_hashes.size());
+    load_tracker->MarkFailed(block_hashes);
+  };
   std::vector<int64_t> src_host_block_ids;
   src_host_block_ids.reserve(block_hashes.size());
   if (!slices.empty()) {
@@ -1169,7 +1221,7 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
     }
     for (size_t i = 0; i < slices.size(); ++i) {
       if (slices[i].host_block_id == -1) {
-        load_tracker->MarkFailed(block_hashes);
+        fail_not_found();
         return tsl::Future<>(absl::FailedPreconditionError(
             absl::StrCat("Block host_block_id is -1: ", block_hashes[i])));
       }
@@ -1180,18 +1232,18 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
     for (const auto& hash : block_hashes) {
       const RaidenBlockId* entry = lru_cache_.Peek(hash);
       if (entry == nullptr) {
-        load_tracker->MarkFailed(block_hashes);
+        fail_not_found();
         return tsl::Future<>(absl::NotFoundError(
             absl::StrCat("Block hash not found in host backend: ", hash)));
       }
       if (entry->status != BlockStatus::HOST &&
           entry->status != BlockStatus::HOST_AND_HBM) {
-        load_tracker->MarkFailed(block_hashes);
+        fail_not_found();
         return tsl::Future<>(absl::FailedPreconditionError(
             absl::StrCat("Block is not on host: ", hash)));
       }
       if (entry->host_block_id == -1) {
-        load_tracker->MarkFailed(block_hashes);
+        fail_not_found();
         return tsl::Future<>(absl::FailedPreconditionError(
             absl::StrCat("Block host_block_id is -1: ", hash)));
       }
@@ -1257,9 +1309,15 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
         Insert(update_hashes, update_slices);
         Release(update_hashes);
       }
+      IncrementRecallBlocks(telemetry::metric_labels::kTierLocalDram,
+                            telemetry::metric_labels::kOutcomeOk,
+                            hashes.size());
       load_tracker->MarkDone(hashes);
       promise.Set(absl::OkStatus());
     } else {
+      IncrementRecallBlocks(telemetry::metric_labels::kTierLocalDram,
+                            telemetry::metric_labels::kOutcomeTransferFailed,
+                            hashes.size());
       load_tracker->MarkFailed(hashes);
       promise.Set(status);
     }

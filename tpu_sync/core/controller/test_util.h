@@ -36,6 +36,7 @@
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
+#include "xla/future.h"
 #include "xla/tsl/platform/test.h"
 #include "tpu_sync/core/controller/controller_client.h"
 #include "tpu_sync/core/controller/controller_service.h"
@@ -251,6 +252,8 @@ struct MockTransferManager {
 
   int h2d_read_from_backend_calls = 0;
   int d2h_write_to_backend_calls = 0;
+  absl::Status backend_transfer_status = absl::OkStatus();
+  absl::Status backend_future_status = absl::OkStatus();
   std::vector<kv_cache::backends::BlockKey> last_h2d_backend_keys;
   std::vector<kv_cache::backends::BlockKey> last_d2h_backend_keys;
   std::vector<int64_t> last_backend_src_block_ids;
@@ -265,6 +268,11 @@ struct MockTransferManager {
     last_h2d_backend_keys = block_keys;
     last_backend_src_block_ids = src_host_block_ids;
     last_backend_dst_block_ids = dst_device_block_ids;
+    if (!backend_transfer_status.ok()) return backend_transfer_status;
+    if (!backend_future_status.ok()) {
+      return raiden::PjRtCopyFuture(xla::Future<>(backend_future_status),
+                                    /*holds=*/{});
+    }
     return H2d(src_host_block_ids, dst_device_block_ids, {1});
   }
 
@@ -288,6 +296,11 @@ struct MockTransferManager {
     last_d2h_backend_keys = block_keys;
     last_backend_src_block_ids = src_device_block_ids;
     last_backend_dst_block_ids = dst_host_block_ids;
+    if (!backend_transfer_status.ok()) return backend_transfer_status;
+    if (!backend_future_status.ok()) {
+      return raiden::PjRtCopyFuture(xla::Future<>(backend_future_status),
+                                    /*holds=*/{});
+    }
     return D2h(src_device_block_ids, dst_host_block_ids, {1});
   }
 

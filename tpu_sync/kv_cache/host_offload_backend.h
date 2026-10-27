@@ -42,6 +42,7 @@
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
 #include "tpu_sync/kv_cache/lru_cache.h"
 #include "tpu_sync/proto/kv_cache_store_service.pb.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden {
 
@@ -62,6 +63,8 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   ~HostOffloadBackend() override;
 
   void Shutdown() override;
+
+  void SetTelemetryIdentity(absl::string_view host_ip, int dp_rank) override;
 
   std::string name() const override { return "HostOffloadBackend"; }
 
@@ -202,6 +205,9 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   bool InsertAdmitStrict(absl::Span<const std::string> block_hashes,
                          absl::Span<const RaidenBlockId> slices);
 
+  void IncrementRecallBlocks(absl::string_view tier, absl::string_view outcome,
+                             uint64_t count) const;
+
   // INVARIANT: no thread holds `mutex_` across a registry RPC. Every call site
   // unlocks first, and nothing enforces that but their shape. The synchronous
   // Register and Unregister are Await() on a promise a gRPC callback thread
@@ -215,6 +221,9 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   // BackendConfig.kv_pool_group.
   const std::string kv_pool_group_;
   controller::RaidenController* raiden_controller_ = nullptr;
+  // Set once by SetTelemetryIdentity() before any Load; read-only afterwards.
+  std::string host_ip_ = std::string(telemetry::metric_labels::kUnknownIp);
+  std::string dp_rank_str_ = "0";
 
   std::shared_ptr<global_registry::GlobalRegistryClient> registry_client_
       ABSL_GUARDED_BY(mutex_);

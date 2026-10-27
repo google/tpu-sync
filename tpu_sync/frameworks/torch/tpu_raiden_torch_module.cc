@@ -985,7 +985,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
   nb::class_<tpu_raiden::kv_cache::KVCacheStoreWrapper>(m, "KVCacheStore")
       .def(nb::init<size_t, std::string, tpu_raiden::kv_cache::RaidenId, int,
                     int64_t, std::string, int, int, std::string,
-                    std::vector<tpu_raiden::kv_cache::BackendConfig>>(),
+                    std::vector<tpu_raiden::kv_cache::BackendConfig>, int>(),
            nb::arg("capacity"), nb::arg("global_registry_address") = "",
            nb::arg("raiden_id") = tpu_raiden::kv_cache::RaidenId(),
            // No defaults: every KVCacheStore has a controller and a
@@ -1003,6 +1003,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
            nb::arg("kv_pool_group") = "",
            nb::arg("secondary_backend_configs") =
                std::vector<tpu_raiden::kv_cache::BackendConfig>{},
+           nb::arg("dp_rank") = 0,
            // Release the GIL during construction so concurrent in-process
            // Python threads (e.g., worker registration threads) can run and
            // avoid deadlocking on the expected_worker_count barrier.

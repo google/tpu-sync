@@ -437,7 +437,11 @@ bool HostOffloadBackend::InsertBestEffortUpdate(
         evicted = lru_cache_.Put(hash, RaidenBlockId());
       }
       if (evicted.has_value()) {
-        evicted_hashes.push_back(std::move(evicted->first));
+        if (evicted->second.status == BlockStatus::HBM) {
+          lru_cache_.Erase(evicted->first);
+        } else {
+          evicted_hashes.push_back(std::move(evicted->first));
+        }
       }
     }
     client = registry_client_;
@@ -513,11 +517,15 @@ bool HostOffloadBackend::InsertAndPin(
         ClearMetadataEntry(*stale);
       }
     }
+    std::optional<std::pair<std::string, RaidenBlockId>> evicted;
     if (i < slices.size()) {
-      lru_cache_.Put(hash, slices[i]);
+      evicted = lru_cache_.Put(hash, slices[i]);
       SetMetadataEntry(hash, slices[i]);
     } else {
-      lru_cache_.Put(hash, RaidenBlockId());
+      evicted = lru_cache_.Put(hash, RaidenBlockId());
+    }
+    if (evicted.has_value() && evicted->second.status == BlockStatus::HBM) {
+      lru_cache_.Erase(evicted->first);
     }
   }
 
@@ -582,8 +590,10 @@ bool HostOffloadBackend::InsertAdmitStrict(
     }
     SetMetadataEntry(hash, slices[i]);
     // Displaced entries move to eviction candidates and keep their host
-    // blocks.
-    (void)evicted;
+    // blocks; HBM-only entries hold no host block and are erased immediately.
+    if (evicted.has_value() && evicted->second.status == BlockStatus::HBM) {
+      lru_cache_.Erase(evicted->first);
+    }
   }
   return true;
 }

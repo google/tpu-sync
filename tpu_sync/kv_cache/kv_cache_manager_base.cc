@@ -444,7 +444,6 @@ size_t ResolveNumStagingLayers(size_t num_layers,
   }
   return requested;
 }
-
 // Rejects an all-layer dispatch (|target_layer_idx| unset) when fewer host
 // layer buffers than device layers are allocated: an all-layer dispatch maps
 // each layer to its own host buffer index and has no leased |host_layer_idx|.
@@ -557,6 +556,26 @@ KVCacheManagerBase::KVCacheManagerBase(
       device_info.holds.push_back(dst_buffer);
     }
     buffer_holds_.push_back(std::move(device_info));
+  }
+  // Attach per-shard BAR2 dma-buf arenas (1 dma-buf-fd per TPU shard across all
+  // layers, Design Doc §3.3.4 Step 1) when external DMA info is not already
+  // populated by the underlying PJRT runtime.
+  for (size_t s = 0; s < num_shards_; ++s) {
+    std::vector<raiden::RaidenBufferHandle*> shard_handles;
+    shard_handles.reserve(num_layers_);
+    for (size_t l = 0; l < num_layers_; ++l) {
+      if (s < buffer_holds_[l].holds.size() &&
+          !buffer_holds_[l].holds[s].GetExternalDmaInfo().ok()) {
+        shard_handles.push_back(&buffer_holds_[l].holds[s]);
+      }
+    }
+    if (!shard_handles.empty()) {
+      absl::Status status = raiden::AttachMockBar2DmaBufArena(shard_handles);
+      if (!status.ok()) {
+        LOG(WARNING) << "AttachMockBar2DmaBufArena failed for shard " << s
+                     << ": " << status;
+      }
+    }
   }
   absl::StatusOr<HostLayers> host_layers = AllocateHostLayers(
       num_layers_, num_shards_, num_host_layers_to_allocate, num_host_blocks,
@@ -3119,8 +3138,8 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
       }
     }
   } else {
-    // When fewer host layer buffers exist than layers, a transfer's layer
-    // lives in the buffer its session leased to that layer.
+    // When fewer host layer buffers exist than layers, a receiving transfer's
+    // layer lives in the buffer its session leased to that layer.
     size_t host_layer_idx = layer_idx;
     if (layers_.size() < num_layers_) {
       if (uuid == 0 || session == nullptr) {
@@ -3612,6 +3631,37 @@ KVCacheManagerBase::ResolveBlockSlices(int staging_block_id) const {
     }
   }
   return slices;
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::WriteDeviceToBackend(
+    absl::Span<const std::shared_ptr<backends::KVBackend>> backends,
+    const std::vector<backends::BlockKey>& block_keys,
+    const std::vector<int64_t>& src_device_block_ids) {
+  if (backends.size() > 1) {
+    return absl::InvalidArgumentError(
+        "Multiple secondary backends not supported yet");
+  }
+  auto backend = backends.empty() ? nullptr : backends.front();
+  if (backend == nullptr) {
+    return absl::InvalidArgumentError("Secondary backend is null");
+  }
+  return absl::UnimplementedError("WriteDeviceToBackend is not supported");
+}
+
+absl::StatusOr<raiden::PjRtCopyFuture>
+KVCacheManagerBase::ReadDeviceFromBackend(
+    absl::Span<const std::shared_ptr<backends::KVBackend>> backends,
+    const std::vector<backends::BlockKey>& block_keys,
+    const std::vector<int64_t>& dst_device_block_ids) {
+  if (backends.size() > 1) {
+    return absl::InvalidArgumentError(
+        "Multiple secondary backends not supported yet");
+  }
+  auto backend = backends.empty() ? nullptr : backends.front();
+  if (backend == nullptr) {
+    return absl::InvalidArgumentError("Secondary backend is null");
+  }
+  return absl::UnimplementedError("ReadDeviceFromBackend is not supported");
 }
 
 xla::PjRtClient* KVCacheManagerBase::GetPjRtClient() const {

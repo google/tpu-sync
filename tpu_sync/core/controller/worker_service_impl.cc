@@ -390,12 +390,14 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
     return grpc::Status::OK;
   }
 
-  // block_hashes, hbm_block_ids and host_block_ids are parallel by contract;
-  // entry i describes exactly one block. The equivalent check used to live in
-  // RaidenController::BuildTransferBuffersRequest, which this RPC bypasses
-  // entirely, so it is enforced server-side here instead.
+  // Mirror `RaidenController::BuildTransferBackendBuffersRequest`:
+  // `hbm_block_ids` must match `num_blocks`, and `host_block_ids` must either
+  // match `num_blocks` (staged through Host DRAM) or be completely empty when
+  // `driver->SupportsDeviceTransfer()` is true (validated once `driver` is
+  // resolved below).
   if (request->hbm_block_ids_size() != num_blocks ||
-      request->host_block_ids_size() != num_blocks) {
+      (request->host_block_ids_size() != num_blocks &&
+       !request->host_block_ids().empty())) {
     LOG(ERROR) << "[Worker] Block id count mismatch: hbm_block_ids ("
                << request->hbm_block_ids_size() << "), host_block_ids ("
                << request->host_block_ids_size() << "), block_hashes ("
@@ -421,6 +423,20 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
         static_cast<int32_t>(absl::StatusCode::kFailedPrecondition));
     response->set_message(
         absl::StrCat("No backend registered for backend_name: ", backend_name));
+    return grpc::Status::OK;
+  }
+
+  if (request->host_block_ids().empty() && !driver->SupportsDeviceTransfer()) {
+    LOG(ERROR) << "[Worker] Backend '" << backend_name
+               << "' requires host_block_ids (does not support direct device "
+                  "transfers)";
+    response->set_success(false);
+    response->set_error_code(
+        static_cast<int32_t>(absl::StatusCode::kInvalidArgument));
+    response->set_message(absl::StrCat(
+        "Mismatch between block id count (hbm: ", request->hbm_block_ids_size(),
+        ", host: 0) and block_hashes count (", num_blocks, "): backend '",
+        backend_name, "' does not support direct device transfers"));
     return grpc::Status::OK;
   }
 

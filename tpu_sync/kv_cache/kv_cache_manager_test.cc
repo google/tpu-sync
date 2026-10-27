@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>  // NOLINT
 #include <cstddef>
 #include <cstdint>
@@ -54,7 +55,10 @@
 #include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
+#include "xla/shape.h"
+#include "xla/shape_util.h"
 #include "xla/tsl/concurrency/future.h"
+#include "xla/tsl/concurrency/ref_count.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raw_transfer_core.h"

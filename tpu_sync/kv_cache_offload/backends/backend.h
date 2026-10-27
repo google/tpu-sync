@@ -31,6 +31,10 @@
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 
+namespace raiden {
+struct RaidenBufferHandle;
+}  // namespace raiden
+
 namespace tpu_raiden {
 namespace kv_cache {
 namespace backends {
@@ -67,6 +71,21 @@ struct HostBufferDescriptor {
   // longer).
   int fd = -1;
   int64_t offset = 0;
+};
+
+// Describes one `(layer, shard)` device HBM slice of `size` bytes belonging to
+// a logical KV block for direct device <-> storage transfers
+// (`SupportsDeviceTransfer()`):
+//   - `dma_buf_fd` (`>= 0` when startup BAR2 registration succeeded) and
+//     `dma_buf_offset` locate the slice inside the chip's PCIe BAR2 `dma-buf`.
+//   - `buffer_handle` and `buffer_offset` locate the same slice inside PJRT's
+//     `RaidenBufferHandle`, for backends that copy through PJRT instead.
+struct DeviceBufferDescriptor {
+  const ::raiden::RaidenBufferHandle* buffer_handle = nullptr;
+  int64_t buffer_offset = 0;
+  int dma_buf_fd = -1;
+  size_t dma_buf_offset = 0;
+  size_t size = 0;
 };
 
 class BlockKeyMapper;
@@ -141,6 +160,46 @@ class KVBackend : public std::enable_shared_from_this<KVBackend> {
   virtual void BatchExistsAsync(
       absl::Span<const BlockKey> keys,
       std::function<void(std::vector<absl::StatusOr<bool>>)> callback) = 0;
+
+  // Returns true if this backend transfers blocks directly between device HBM
+  // and storage (`WriteDeviceAsync` / `ReadDeviceAsync`) without Host DRAM
+  // staging slots.
+  virtual bool SupportsDeviceTransfer() const { return false; }
+
+  // Pre-registers a `[offset, offset + size)` device BAR2 `dma-buf` range.
+  // `dma_buf_fd` is borrowed: the caller keeps it open, and the range pinned,
+  // for as long as this backend may transfer to or from it.
+  virtual absl::Status RegisterDeviceMemory(int /*dma_buf_fd*/,
+                                            size_t /*offset*/,
+                                            size_t /*size*/) {
+    return absl::UnimplementedError(
+        "Backend does not support RegisterDeviceMemory.");
+  }
+
+  // Asynchronously writes a sequence of device HBM slices directly to `key`.
+  // Implementations copy `slices` before returning; the device memory they
+  // describe must stay valid until `callback` runs.
+  virtual void WriteDeviceAsync(
+      const BlockKey& /*key*/,
+      absl::Span<const DeviceBufferDescriptor> /*slices*/,
+      std::function<void(absl::Status)> callback) {
+    if (callback) {
+      callback(absl::UnimplementedError(
+          "Backend does not support WriteDeviceAsync."));
+    }
+  }
+
+  // Asynchronously reads from `key` directly into a sequence of device HBM
+  // slices. `slices` and the device memory follow the `WriteDeviceAsync` rules.
+  virtual void ReadDeviceAsync(
+      const BlockKey& /*key*/,
+      absl::Span<const DeviceBufferDescriptor> /*slices*/,
+      std::function<void(absl::Status)> callback) {
+    if (callback) {
+      callback(absl::UnimplementedError(
+          "Backend does not support ReadDeviceAsync."));
+    }
+  }
 
  protected:
   absl::flat_hash_map<std::string, std::string> properties_;

@@ -23,14 +23,12 @@
 #include <cstring>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
-#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
 #include "absl/memory/memory.h"
@@ -182,7 +180,7 @@ absl::Status RaidenController::Init(
 
   // Publish ourselves to in-flight reads (cleared in the destructor / Cleanup).
   {
-    absl::MutexLock lock(&lifetime_->mu);
+    absl::MutexLock lock(lifetime_->mu);
     lifetime_->ctrl = this;
   }
   // 1. Set callback on registry
@@ -321,7 +319,7 @@ void RaidenController::Cleanup() {
   // continuation has finished or it will see a null ctrl and fail the read
   // cleanly -- never a use-after-free.
   {
-    absl::MutexLock lock(&lifetime_->mu);
+    absl::MutexLock lock(lifetime_->mu);
     lifetime_->ctrl = nullptr;
   }
   if (worker_registry_) {
@@ -844,8 +842,13 @@ RaidenController::BuildTransferBackendBuffersRequest(
     return absl::InvalidArgumentError(
         "block_hashes must specify at least one block hash");
   }
+  // Single-backend Direct Storage (`KVBackend::SupportsDeviceTransfer()`) omits
+  // Host DRAM staging by passing an empty `host_block_ids` list; the worker
+  // validates whether the target backend supports direct device transfers.
+  const bool allow_empty_host_ids = (backend_specs.size() == 1);
   if (hbm_block_ids.size() != block_hashes.size() ||
-      host_block_ids.size() != block_hashes.size()) {
+      (host_block_ids.size() != block_hashes.size() &&
+       !(allow_empty_host_ids && host_block_ids.empty()))) {
     return absl::InvalidArgumentError(absl::StrCat(
         "block_hashes (", block_hashes.size(), "), hbm_block_ids (",
         hbm_block_ids.size(), ") and host_block_ids (", host_block_ids.size(),
@@ -942,7 +945,7 @@ struct RemoteReadState {
   // Idempotent: the deadline timer and the release callback race by design.
   void Settle(absl::Status status) {
     {
-      absl::MutexLock lock(&mu);
+      absl::MutexLock lock(mu);
       if (settled) return;
       settled = true;
     }
@@ -1097,7 +1100,7 @@ tsl::Future<> RaidenController::ReadRemote(
               {group.node_id(), group.worker_id(), std::move(eps)});
         }
 
-        absl::MutexLock lock(&lifetime->mu);
+        absl::MutexLock lock(lifetime->mu);
         if (lifetime->ctrl == nullptr) {
           // The controller went away mid-read. Release best-effort so the
           // source does not hold pins for a full TTL, then fail the read.
@@ -1125,7 +1128,7 @@ tsl::Future<> RaidenController::ReadRemote(
   std::thread([state, deadline = RemoteReadDeadline()] {
     absl::SleepFor(deadline);
     {
-      absl::MutexLock lock(&state->mu);
+      absl::MutexLock lock(state->mu);
       if (state->settled) return;
     }
     if (state->lease_id != 0) {

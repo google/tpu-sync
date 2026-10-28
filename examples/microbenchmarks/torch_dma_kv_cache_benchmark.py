@@ -12,14 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Single-host KV-cache DMA benchmark: KVCacheManager vs PyTorch host copies.
+
+Each case times D2H and H2D of a sharded KV cache on one TPU host, one process
+per local TPU device, three ways: KVCacheManager zero-copy DMA, PyTorch pinned
+host memory, and PyTorch pageable host memory.
+"""
+
+import dataclasses
 import gc
 import json
 import os
 import pathlib
+import queue
 import socket
 import sys
 import time
-from typing import Sequence
+import traceback
+from typing import Any, Sequence
 
 from absl import flags
 from absl.testing import absltest
@@ -62,7 +72,8 @@ def log_telemetry(
   """Appends benchmark telemetry stats to the JSONL file at telemetry_log_path.
 
   Takes its settings as arguments rather than reading FLAGS: it runs inside
-  mp.spawn workers, where absl flags are not parsed in open-source builds.
+  spawned worker processes, where absl flags are not parsed in open-source
+  builds.
 
   Args:
     telemetry_log_path: JSONL file to append the record to.
@@ -365,19 +376,124 @@ def _report_results(
   sys.stderr.flush()
 
 
-def _mpmd_benchmark_worker(
+_CASE_TIMEOUT_S = 1800.0
+_RESULT_POLL_S = 5.0
+_WORKER_EXIT_TIMEOUT_S = 120.0
+
+
+def _join_all(processes: Sequence[Any], timeout_s: float) -> None:
+  """Waits for every process to exit, for at most `timeout_s` in total."""
+  deadline = time.monotonic() + timeout_s
+  for process in processes:
+    process.join(timeout=max(0.0, deadline - time.monotonic()))
+
+
+@dataclasses.dataclass(frozen=True)
+class _BenchmarkCase:
+  """One benchmark configuration, run by every rank of the worker group."""
+
+  test_name: str
+  dtype: torch.dtype
+  num_layers: int
+  shape: tuple[int, ...]
+  benchmark_runs: int
+  locality: str
+  telemetry_log_path: str
+
+
+def _run_case(rank: int, world_size: int, case: _BenchmarkCase) -> None:
+  """Runs one benchmark case on this rank; rank 0 reports the results."""
+  device = torch.device("tpu")
+  shard_shape = list(case.shape)
+  if len(case.shape) > 2:
+    # shard axis 2 (num_kv_heads) across TPU ranks.
+    shard_shape[2] //= world_size
+
+  src_tensors = create_tpu_tensors(
+      case.num_layers, shard_shape, case.dtype, device
+  )
+  num_blocks = shard_shape[0]
+
+  # Branch 1: Raiden Zero-Copy DMA
+  mgr_d2h, mgr_h2d = _benchmark_raiden(
+      src_tensors, num_blocks, case.benchmark_runs
+  )
+  if rank == 0:
+    _report_results(
+        "KVCacheManager",
+        case.dtype,
+        case.num_layers,
+        case.shape,
+        mgr_d2h,
+        mgr_h2d,
+    )
+    log_telemetry(
+        case.telemetry_log_path,
+        case.locality,
+        case.test_name,
+        case.dtype,
+        case.num_layers,
+        case.shape,
+        mgr_d2h,
+        mgr_h2d,
+    )
+
+  # Branch 2: PyTorch Pinned Host Baseline
+  pin_d2h, pin_h2d = _benchmark_torch_copy(
+      src_tensors,
+      shard_shape,
+      case.dtype,
+      device,
+      case.benchmark_runs,
+      pinned=True,
+  )
+  if rank == 0:
+    _report_results(
+        "PyTorch Pinned",
+        case.dtype,
+        case.num_layers,
+        case.shape,
+        pin_d2h,
+        pin_h2d,
+    )
+
+  # Branch 3: PyTorch Standard Host Baseline
+  std_d2h, std_h2d = _benchmark_torch_copy(
+      src_tensors,
+      shard_shape,
+      case.dtype,
+      device,
+      case.benchmark_runs,
+      pinned=False,
+  )
+  if rank == 0:
+    _report_results(
+        "PyTorch Standard",
+        case.dtype,
+        case.num_layers,
+        case.shape,
+        std_d2h,
+        std_h2d,
+    )
+
+
+def _benchmark_worker_main(
     rank: int,
     world_size: int,
     master_port: int,
-    test_name: str,
-    dtype: torch.dtype,
-    num_layers: int,
-    shape: Sequence[int],
-    benchmark_runs: int,
-    locality: str,
-    telemetry_log_path: str,
+    cases: Any,
+    results: Any,
 ) -> None:
-  """Runs the benchmark worker for one distributed rank."""
+  """Worker process: joins the TPU slice once, then runs cases until None.
+
+  Args:
+    rank: This worker's rank; also the local TPU device it owns.
+    world_size: Number of workers, one per local TPU device.
+    master_port: Port of the gloo rendezvous shared by all workers.
+    cases: Queue this worker reads `_BenchmarkCase`s from; None means exit.
+    results: Queue shared by all workers; each case puts (rank, error), where
+      error is None on success or the formatted traceback on failure.
+  """
   os.environ.pop("TPU_PREMAPPED_BUFFER_SIZE", None)
   os.environ.pop("stairways_ifrt_tpu_premapped_buffer_size", None)
   os.environ.pop("pathways_tpu_premapped_buffer_size", None)
@@ -397,60 +513,132 @@ def _mpmd_benchmark_worker(
       rank=rank,
       world_size=world_size,
   )
-
   try:
-    device = torch.device("tpu")
-    shard_shape = list(shape)
-    if len(shape) > 2:
-      # shard axis 2 (num_kv_heads) across TPU ranks.
-      shard_shape[2] //= world_size
-
-    src_tensors = create_tpu_tensors(num_layers, shard_shape, dtype, device)
-    num_blocks = shard_shape[0]
-
-    # Branch 1: Raiden Zero-Copy DMA
-    mgr_d2h, mgr_h2d = _benchmark_raiden(
-        src_tensors, num_blocks, benchmark_runs
-    )
-    if rank == 0:
-      _report_results(
-          "KVCacheManager", dtype, num_layers, shape, mgr_d2h, mgr_h2d
-      )
-      log_telemetry(
-          telemetry_log_path,
-          locality,
-          test_name,
-          dtype,
-          num_layers,
-          shape,
-          mgr_d2h,
-          mgr_h2d,
-      )
-
-    # Branch 2: PyTorch Pinned Host Baseline
-    pin_d2h, pin_h2d = _benchmark_torch_copy(
-        src_tensors, shard_shape, dtype, device, benchmark_runs, pinned=True
-    )
-    if rank == 0:
-      _report_results(
-          "PyTorch Pinned", dtype, num_layers, shape, pin_d2h, pin_h2d
-      )
-
-    # Branch 3: PyTorch Standard Host Baseline
-    std_d2h, std_h2d = _benchmark_torch_copy(
-        src_tensors, shard_shape, dtype, device, benchmark_runs, pinned=False
-    )
-    if rank == 0:
-      _report_results(
-          "PyTorch Standard", dtype, num_layers, shape, std_d2h, std_h2d
-      )
-
+    while (case := cases.get()) is not None:
+      try:
+        _run_case(rank, world_size, case)
+      except Exception:
+        # Report, then exit: the other ranks may be stuck in a collective, so
+        # this group cannot run more cases.
+        results.put((rank, traceback.format_exc()))
+        raise
+      gc.collect()
+      results.put((rank, None))
   finally:
     dist.destroy_process_group()
 
 
+class _BenchmarkWorkers:
+  """Runs benchmark cases on one long-lived process per local TPU device.
+
+  The processes form one multi-process TPU slice: it is created when the
+  first case starts and torn down once by `close()`. A fresh process group
+  per case would re-create the slice every time, and on TPU v7 the new
+  slice's START_SESSION fails for minutes whenever the previous slice's
+  teardown timed out (b/568095515).
+
+  When a case fails, its workers are stopped (the surviving ranks may be stuck
+  in a collective) and the next `run()` starts a fresh group.
+  """
+
+  def __init__(self, world_size: int):
+    self._world_size = world_size
+    self._processes = []
+    self._cases = []
+    self._results = None
+
+  def run(self, case: _BenchmarkCase) -> None:
+    """Runs `case` on every rank.
+
+    Args:
+      case: The benchmark configuration to run.
+
+    Raises:
+      RuntimeError: if a rank fails, exits, or the case exceeds
+        _CASE_TIMEOUT_S.
+    """
+    if not self._processes:
+      self._start()
+    for cases in self._cases:
+      cases.put(case)
+    pending = set(range(self._world_size))
+    deadline = time.monotonic() + _CASE_TIMEOUT_S
+    while pending:
+      try:
+        rank, error = self._results.get(timeout=_RESULT_POLL_S)
+      except queue.Empty:
+        exited = {
+            r: self._processes[r].exitcode
+            for r in sorted(pending)
+            if not self._processes[r].is_alive()
+        }
+        timed_out = time.monotonic() > deadline
+        if exited or timed_out:
+          self._stop()
+          if exited:
+            reason = (
+                f"workers exited without a result (rank: exitcode {exited})"
+            )
+          else:
+            reason = (
+                f"ranks {sorted(pending)} timed out after"
+                f" {_CASE_TIMEOUT_S:.0f}s"
+            )
+          raise RuntimeError(f"{case.test_name}: {reason}") from None
+        continue
+      if error is not None:
+        self._stop()
+        raise RuntimeError(f"{case.test_name}: rank {rank} failed:\n{error}")
+      pending.discard(rank)
+
+  def close(self) -> None:
+    """Asks every worker to exit, which tears the TPU slice down once."""
+    for cases in self._cases:
+      cases.put(None)
+    _join_all(self._processes, _WORKER_EXIT_TIMEOUT_S)
+    self._stop()
+
+  def _start(self) -> None:
+    """Spawns one worker per device; they join the TPU slice on first use."""
+    prepare_tpu_environment(self._world_size)
+    master_port = pick_unused_ports(1)[0]
+    ctx = mp.get_context("spawn")
+    self._results = ctx.Queue()
+    self._cases = [ctx.Queue() for _ in range(self._world_size)]
+    self._processes = [
+        ctx.Process(
+            target=_benchmark_worker_main,
+            args=(
+                rank,
+                self._world_size,
+                master_port,
+                self._cases[rank],
+                self._results,
+            ),
+        )
+        for rank in range(self._world_size)
+    ]
+    for process in self._processes:
+      process.start()
+
+  def _stop(self) -> None:
+    """Terminates any worker still running and forgets the group."""
+    for process in self._processes:
+      if process.is_alive():
+        process.terminate()
+    _join_all(self._processes, _WORKER_EXIT_TIMEOUT_S)
+    for process in self._processes:
+      if process.is_alive():
+        process.kill()
+        process.join()
+    self._processes = []
+    self._cases = []
+    self._results = None
+
+
 class KVCacheManagerPerfTest(parameterized.TestCase):
   device_count: int = 0
+  workers: _BenchmarkWorkers | None = None
 
   @classmethod
   def setUpClass(cls):
@@ -459,6 +647,14 @@ class KVCacheManagerPerfTest(parameterized.TestCase):
     os.environ.pop("stairways_ifrt_tpu_premapped_buffer_size", None)
     os.environ.pop("pathways_tpu_premapped_buffer_size", None)
     cls.device_count, _ = _scan_pci_tpus()
+    if cls.device_count:
+      cls.workers = _BenchmarkWorkers(cls.device_count)
+
+  @classmethod
+  def tearDownClass(cls):
+    if cls.workers is not None:
+      cls.workers.close()
+    super().tearDownClass()
 
   def setUp(self):
     super().setUp()
@@ -489,24 +685,16 @@ class KVCacheManagerPerfTest(parameterized.TestCase):
           f" ({world_size})"
       )
 
-    prepare_tpu_environment(world_size)
-    master_port = pick_unused_ports(1)[0]
-
-    mp.spawn(
-        _mpmd_benchmark_worker,
-        args=(
-            world_size,
-            master_port,
-            test_name,
-            dtype,
-            num_layers,
-            shape,
-            FLAGS.benchmark_runs,
-            FLAGS.locality,
-            FLAGS.telemetry_log_path,
-        ),
-        nprocs=world_size,
-        join=True,
+    self.workers.run(
+        _BenchmarkCase(
+            test_name=test_name,
+            dtype=dtype,
+            num_layers=num_layers,
+            shape=tuple(shape),
+            benchmark_runs=FLAGS.benchmark_runs,
+            locality=FLAGS.locality,
+            telemetry_log_path=FLAGS.telemetry_log_path,
+        )
     )
 
   @parameterized.named_parameters(

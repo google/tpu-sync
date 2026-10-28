@@ -96,9 +96,13 @@ inline constexpr absl::string_view kD2hTransferTimeMs = "d2h_transfer_time_ms";
 inline constexpr absl::string_view kD2hDmaTimeMs = "d2h_dma_time_ms";
 inline constexpr absl::string_view kBufferAllocatedBytes =
     "buffer_allocated_bytes";
+inline constexpr absl::string_view kHostPoolBlocks = "host_pool_blocks";
 
 inline constexpr absl::string_view kKvRecallBlocksTotal =
     "kv_recall_blocks_total";
+inline constexpr absl::string_view kKvSaveBlocksTotal = "kv_save_blocks_total";
+inline constexpr absl::string_view kKvEvictedBlocksTotal =
+    "kv_evicted_blocks_total";
 
 inline constexpr absl::string_view kWeightSyncSentBytesTotal =
     "weight_sync_sent_bytes_total";
@@ -152,6 +156,8 @@ inline constexpr absl::string_view kP2pTransferTimeMs =
 inline constexpr absl::string_view kBufferAllocatedBytes =
     "Current host DRAM buffer capacity allocated in bytes for KV cache staging "
     "across all layers and shards.";
+inline constexpr absl::string_view kHostPoolBlocks =
+    "Number of host DRAM KV cache pool blocks by state (total, used, pinned).";
 
 // Counts KV cache block recall attempts across offload tiers (`local_dram`,
 // `remote_dram`, `shared_storage`) and outcomes (`ok`, `not_found`,
@@ -160,6 +166,14 @@ inline constexpr absl::string_view kBufferAllocatedBytes =
 inline constexpr absl::string_view kKvRecallBlocksTotal =
     "Cumulative count of KV cache block recall attempts across tiers and "
     "outcomes.";
+// Counts KV cache block save attempts across offload tiers (`local_dram`,
+// `remote_dram`) and outcomes (`ok`, `rejected`, `failed`), labeled by
+// `{dp_rank, tier, outcome}`.
+inline constexpr absl::string_view kKvSaveBlocksTotal =
+    "Cumulative count of KV cache block save attempts across tiers and "
+    "outcomes.";
+inline constexpr absl::string_view kKvEvictedBlocksTotal =
+    "Cumulative count of KV cache blocks evicted from the host DRAM pool.";
 
 inline constexpr absl::string_view kH2dBytesTotal =
     "Cumulative bytes requested for Host DRAM to Device HBM transfers that "
@@ -252,6 +266,27 @@ inline constexpr absl::string_view kOutcomeStagingExhausted =
 // Counts blocks whose recall failed during peer resolution, non-NOT_FOUND
 // RPC/storage I/O, or H2D DMA transfer.
 inline constexpr absl::string_view kOutcomeTransferFailed = "transfer_failed";
+// Counts blocks whose save was rejected prior to transfer due to admission or
+// pool capacity exhaustion (`Insert` pin/capacity refusal, `SaveLocal`
+// RESOURCE_EXHAUSTED host block allocation, or peer WriteRemote
+// RESOURCE_EXHAUSTED ack).
+inline constexpr absl::string_view kOutcomeRejected = "rejected";
+// Counts blocks whose save failed during execution due to transport/RPC/DMA
+// errors, an unresolvable peer, null controller, WRITE_PARTIAL_EXIST /
+// PARTIAL_EXIST (for the full batch), STORED_UNREGISTERED, FAILED verdicts
+// (including post-transfer CompleteWriteRemote kAdmitStrict refusal), or
+// destination hold expiry.
+inline constexpr absl::string_view kOutcomeFailed = "failed";
+
+// `host_pool_blocks` states. `total` is the host DRAM pool capacity in blocks,
+// `used` is the number of allocated blocks, and `pinned` is the number of
+// allocated blocks that are not evictable: LRU-pinned entries plus in-flight
+// remote-recall staging, WriteRemote landing, and Save destination blocks.
+// Invariant: pinned <= used <= total.
+inline constexpr absl::string_view kState = "state";
+inline constexpr absl::string_view kStateTotal = "total";
+inline constexpr absl::string_view kStateUsed = "used";
+inline constexpr absl::string_view kStatePinned = "pinned";
 
 inline constexpr absl::string_view kDirectionLabels[] = {kDirection};
 inline constexpr absl::string_view kSentBytesLabels[] = {kDirection, kSrcIp,
@@ -264,13 +299,20 @@ inline constexpr absl::string_view kPcieTransferLabels[] = {kHostIp,
                                                             kLocalRank};
 inline constexpr absl::string_view kKvRecallBlocksLabels[] = {kDpRank, kTier,
                                                               kOutcome};
+inline constexpr absl::string_view kKvSaveBlocksLabels[] = {kDpRank, kTier,
+                                                            kOutcome};
+inline constexpr absl::string_view kKvEvictedBlocksLabels[] = {kDpRank};
+inline constexpr absl::string_view kHostPoolBlocksLabels[] = {kDpRank, kState};
 
 }  // namespace metric_labels
 
 namespace metric_metadata {
 
 using metric_labels::kDirectionLabels;
+using metric_labels::kHostPoolBlocksLabels;
+using metric_labels::kKvEvictedBlocksLabels;
 using metric_labels::kKvRecallBlocksLabels;
+using metric_labels::kKvSaveBlocksLabels;
 using metric_labels::kP2pTransferTimeLabels;
 using metric_labels::kPcieTransferLabels;
 using metric_labels::kSentBytesLabels;
@@ -351,6 +393,24 @@ inline constexpr MetricMetadata kKvRecallBlocksTotal{
     .description = metric_descriptions::kKvRecallBlocksTotal,
     .type = MetricType::kCounter,
     .label_names = kKvRecallBlocksLabels};
+
+inline constexpr MetricMetadata kKvSaveBlocksTotal{
+    .name = metric_names::kKvSaveBlocksTotal,
+    .description = metric_descriptions::kKvSaveBlocksTotal,
+    .type = MetricType::kCounter,
+    .label_names = kKvSaveBlocksLabels};
+
+inline constexpr MetricMetadata kKvEvictedBlocksTotal{
+    .name = metric_names::kKvEvictedBlocksTotal,
+    .description = metric_descriptions::kKvEvictedBlocksTotal,
+    .type = MetricType::kCounter,
+    .label_names = kKvEvictedBlocksLabels};
+
+inline constexpr MetricMetadata kHostPoolBlocks{
+    .name = metric_names::kHostPoolBlocks,
+    .description = metric_descriptions::kHostPoolBlocks,
+    .type = MetricType::kGauge,
+    .label_names = kHostPoolBlocksLabels};
 
 inline constexpr MetricMetadata kWeightSyncSentBytesTotal{
     .name = metric_names::kWeightSyncSentBytesTotal,
@@ -446,6 +506,9 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kD2hDmaTimeMs,
     kBufferAllocatedBytes,
     kKvRecallBlocksTotal,
+    kKvSaveBlocksTotal,
+    kKvEvictedBlocksTotal,
+    kHostPoolBlocks,
     // Weight Sync Metrics
     kWeightSyncSentBytesTotal,
     kWeightSyncReceivedBytesTotal,

@@ -722,7 +722,10 @@ cc_test(
 cc_library(
     name = "lru_cache",
     hdrs = ["lru_cache.h"],
-    deps = ["@com_google_absl//absl/container:flat_hash_map"],
+    deps = [
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log:check",
+    ],
 )
 
 cc_test(
@@ -794,6 +797,7 @@ cc_library(
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/base:nullability",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/functional:any_invocable",
@@ -994,6 +998,7 @@ cc_library(
         "//tpu_sync/kv_cache/global_registry:global_registry_client_cc",
         "//tpu_sync/kv_cache/reshard:reshard_service",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
@@ -1034,6 +1039,7 @@ cc_test(
         ":kv_cache_store_backend_factory",
         ":kv_cache_store_client",
         ":kv_cache_store_server",
+        ":kv_cache_telemetry",
         "//tpu_sync/common:raiden_id",
         "//tpu_sync/core:kv_manager_holder",
         "//tpu_sync/core:raiden_transfer_endpoint",
@@ -1096,11 +1102,16 @@ cc_test(
         "//tpu_sync/kv_cache/global_registry:global_registry_client_cc",
         "//tpu_sync/kv_cache/global_registry:test_util",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/telemetry:metrics_backend",
+        "//tpu_sync/telemetry:mock_metrics_backend",
         "@com_github_grpc_grpc//:grpc++",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest",

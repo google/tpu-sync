@@ -24,10 +24,13 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "grpcpp/create_channel.h"
@@ -47,6 +50,8 @@
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
 #include "tpu_sync/kv_cache/kv_cache_store_server.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
+#include "tpu_sync/telemetry/mock_metrics_backend.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -1820,6 +1825,142 @@ TEST(HostOffloadBackendTest, SaveUpdatesTrackerOnSuccessAndFailure) {
   BlockTracker::StatusResult failure_res = failure_tracker.Poll();
   EXPECT_TRUE(failure_res.done.empty());
   EXPECT_THAT(failure_res.failed, UnorderedElementsAre("save_fail_1"));
+}
+
+TEST(HostOffloadBackendTest, NumEvictableHostBlocksTracksPinsAndResidency) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/4);
+  RaidenId id{"job", "0", "data", 0};
+  ASSERT_TRUE(backend.Insert(
+      {"host", "host_and_hbm", "hbm_only"},
+      {RaidenBlockId(id, 10, BlockStatus::HOST),
+       RaidenBlockId(id, 11, BlockStatus::HOST_AND_HBM),
+       RaidenBlockId(id, -1, /*device_block_id=*/3, BlockStatus::HBM)}));
+  // HBM-only entries hold no host block, so only two entries are counted.
+  EXPECT_EQ(backend.NumEvictableHostBlocks(), 2);
+
+  ASSERT_TRUE(backend.Pin({"host"}));
+  EXPECT_EQ(backend.NumEvictableHostBlocks(), 1);
+
+  backend.Release({"host"});
+  EXPECT_EQ(backend.NumEvictableHostBlocks(), 2);
+
+  backend.Delete({"host_and_hbm"}, DeleteOptions::EvictHostResident(nullptr));
+  EXPECT_EQ(backend.NumEvictableHostBlocks(), 1);
+}
+
+// Captures the latest `host_pool_blocks` value per `state` and verifies the
+// label set is exactly {dp_rank, state}.
+class HostPoolGaugeRecorder {
+ public:
+  explicit HostPoolGaugeRecorder(absl::string_view expected_dp_rank) {
+    auto mock =
+        std::make_unique<::testing::NiceMock<telemetry::MockMetricsBackend>>();
+    mock_ = mock.get();
+    ON_CALL(*mock_, SetGauge(::testing::_, ::testing::_, ::testing::_))
+        .WillByDefault([this, dp_rank = std::string(expected_dp_rank)](
+                           absl::string_view name, telemetry::LabelSpan labels,
+                           double val) {
+          if (name != telemetry::metric_names::kHostPoolBlocks) return;
+          std::string state;
+          absl::MutexLock lock(mu_);
+          ++num_calls_;
+          for (const auto& label : labels) {
+            if (label.key == telemetry::metric_labels::kState) {
+              state = std::string(label.value);
+            } else if (label.key == telemetry::metric_labels::kDpRank) {
+              EXPECT_EQ(label.value, dp_rank);
+            } else {
+              ADD_FAILURE() << "Unexpected label: " << label.key;
+            }
+          }
+          latest_[state] = val;
+        });
+    reset_ =
+        std::make_unique<telemetry::ScopedMetricsBackendReset>(std::move(mock));
+  }
+
+  double Get(absl::string_view state) {
+    absl::MutexLock lock(mu_);
+    auto it = latest_.find(state);
+    return it == latest_.end() ? -1.0 : it->second;
+  }
+
+  int num_calls() {
+    absl::MutexLock lock(mu_);
+    return num_calls_;
+  }
+
+ private:
+  telemetry::MockMetricsBackend* mock_ = nullptr;
+  std::unique_ptr<telemetry::ScopedMetricsBackendReset> reset_;
+  absl::Mutex mu_;
+  absl::flat_hash_map<std::string, double> latest_ ABSL_GUARDED_BY(mu_);
+  int num_calls_ ABSL_GUARDED_BY(mu_) = 0;
+};
+
+TEST(HostOffloadBackendTest, RecordsHostPoolBlocksGauge) {
+  HostPoolGaugeRecorder gauges(/*expected_dp_rank=*/"3");
+  RaidenId node_id{"node_job", "0", "data", 3};
+  ::tpu_sync::rpc::RaidenIdProto unit_proto;
+  unit_proto.set_job_name(node_id.job_name);
+  unit_proto.set_job_replica_id(node_id.job_replica_id);
+  unit_proto.set_data_name(node_id.data_name);
+  unit_proto.set_data_replica_idx(node_id.data_replica_idx);
+  TF_ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
+                                               unit_proto, /*num_blocks=*/8,
+                                               /*num_shards=*/1,
+                                               /*shard_size_bytes=*/1024));
+  BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = 8;
+  config.raiden_id = node_id;
+  TF_ASSERT_OK_AND_ASSIGN(auto backend_base,
+                          HostOffloadBackend::Create(config, controller.get()));
+  auto backend = std::dynamic_pointer_cast<HostOffloadBackend>(backend_base);
+  ASSERT_NE(backend, nullptr);
+
+  // Construction publishes the empty pool.
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStateTotal), 8.0);
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStateUsed), 0.0);
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStatePinned), 0.0);
+
+  // Two allocated host blocks inserted unpinned: used, but evictable.
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> ids,
+                          controller->AllocateBlockIds(2));
+  ASSERT_TRUE(backend->Insert(
+      {"a", "b"}, {RaidenBlockId(node_id, ids[0], BlockStatus::HOST),
+                   RaidenBlockId(node_id, ids[1], BlockStatus::HOST)}));
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStateUsed), 2.0);
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStatePinned), 0.0);
+
+  // Pin / Release move a block in and out of `pinned`.
+  ASSERT_TRUE(backend->Pin({"a"}));
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStatePinned), 1.0);
+  backend->Release({"a"});
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStatePinned), 0.0);
+
+  // An allocated block the LRU does not track (e.g. a staging block) is not
+  // evictable, so it counts as pinned.
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> staging,
+                          controller->AllocateBlockIds(1));
+  backend->RecordHostPoolMetrics();
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStateUsed), 3.0);
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStatePinned), 1.0);
+
+  ABSL_ASSERT_OK(controller->DeallocateBlockIds(staging));
+  backend->RecordHostPoolMetrics();
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStateUsed), 2.0);
+  EXPECT_DOUBLE_EQ(gauges.Get(telemetry::metric_labels::kStatePinned), 0.0);
+}
+
+TEST(HostOffloadBackendTest, HostPoolBlocksGaugeIsNoOpWithoutController) {
+  HostPoolGaugeRecorder gauges(/*expected_dp_rank=*/"0");
+  HostOffloadBackendTest::Backend backend(/*capacity=*/4);
+  RaidenId id{"job", "0", "data", 0};
+  ASSERT_TRUE(
+      backend.Insert({"h1"}, {RaidenBlockId(id, 10, BlockStatus::HOST)}));
+  backend.RecordHostPoolMetrics();
+  EXPECT_EQ(gauges.num_calls(), 0);
 }
 
 }  // namespace

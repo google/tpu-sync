@@ -17,6 +17,7 @@
 
 // Telemetry helper functions for KVCacheStore and its offload backends.
 
+#include <cstddef>
 #include <cstdint>
 
 #include "absl/strings/string_view.h"
@@ -41,6 +42,51 @@ inline void IncrementKvRecallBlocks(absl::string_view dp_rank,
   };
   telemetry::RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
       telemetry::metric_names::kKvRecallBlocksTotal, labels, count);
+}
+
+// Increments `kv_save_blocks_total` by `count` with the given store identity
+// and save labels. `dp_rank` must be a pre-rendered decimal string, and
+// `tier` and `outcome` must be `telemetry::metric_labels::kTier*` and
+// `kOutcome*` constants respectively (`outcome` must be `kOutcomeOk`,
+// `kOutcomeRejected`, or `kOutcomeFailed`). No-op when `count == 0`.
+inline void IncrementKvSaveBlocks(absl::string_view dp_rank,
+                                  absl::string_view tier,
+                                  absl::string_view outcome, uint64_t count) {
+  if (count == 0) return;
+  const telemetry::MetricLabel labels[] = {
+      {telemetry::metric_labels::kDpRank, dp_rank},
+      {telemetry::metric_labels::kTier, tier},
+      {telemetry::metric_labels::kOutcome, outcome},
+  };
+  telemetry::RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
+      telemetry::metric_names::kKvSaveBlocksTotal, labels, count);
+}
+
+// Sets the `host_pool_blocks` gauge for each `state` (`total`, `used`,
+// `pinned`) with the given store identity labels. `dp_rank` must be a
+// pre-rendered decimal string.
+inline void RecordKvHostPoolBlocks(absl::string_view dp_rank, size_t total,
+                                   size_t used, size_t pinned) {
+  auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  const telemetry::MetricLabel total_labels[] = {
+      {telemetry::metric_labels::kDpRank, dp_rank},
+      {telemetry::metric_labels::kState, telemetry::metric_labels::kStateTotal},
+  };
+  const telemetry::MetricLabel used_labels[] = {
+      {telemetry::metric_labels::kDpRank, dp_rank},
+      {telemetry::metric_labels::kState, telemetry::metric_labels::kStateUsed},
+  };
+  const telemetry::MetricLabel pinned_labels[] = {
+      {telemetry::metric_labels::kDpRank, dp_rank},
+      {telemetry::metric_labels::kState,
+       telemetry::metric_labels::kStatePinned},
+  };
+  store.SetGauge(telemetry::metric_names::kHostPoolBlocks, total_labels,
+                 static_cast<double>(total));
+  store.SetGauge(telemetry::metric_names::kHostPoolBlocks, used_labels,
+                 static_cast<double>(used));
+  store.SetGauge(telemetry::metric_names::kHostPoolBlocks, pinned_labels,
+                 static_cast<double>(pinned));
 }
 
 }  // namespace kv_cache

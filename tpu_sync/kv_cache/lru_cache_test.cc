@@ -428,6 +428,69 @@ TEST(LRUCacheTest, ConstPeekEnforcesConstAccess) {
   static_assert(std::is_same_v<decltype(cache.Peek(1)), const std::string*>);
 }
 
+enum class TestBlockStatus {
+  INIT,
+  REMOTE,
+  HBM,
+  HOST,
+  HOST_AND_HBM,
+  SHARED_STORAGE,
+};
+
+struct TestBlockValue {
+  int host_block_id = -1;
+  TestBlockStatus status = TestBlockStatus::INIT;
+};
+
+TEST(LRUCacheTest, NumEvictableHostBlocksTracksUnpinnedHostEntries) {
+  LRUCache<std::string, TestBlockValue> cache(2);
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+
+  // Dead HBM-only entry (e.g. before or after failed save) does not count.
+  cache.Put("hbm_only", TestBlockValue{-1, TestBlockStatus::HBM});
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+
+  // Host-resident entries count when unpinned.
+  cache.Put("host_1", TestBlockValue{0, TestBlockStatus::HOST});
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+
+  // Displacing hbm_only to candidate list and adding host_2.
+  cache.Put("host_2", TestBlockValue{1, TestBlockStatus::HOST_AND_HBM});
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 2);
+
+  // Pinning a host-resident entry removes it from evictable count.
+  ASSERT_TRUE(cache.Pin("host_1"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+  ASSERT_TRUE(cache.Pin("host_1"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+
+  // Unpinning once keeps pin_count=1; second unpin restores evictability.
+  ASSERT_TRUE(cache.Unpin("host_1"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+  ASSERT_TRUE(cache.Unpin("host_1"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 2);
+
+  // Demoting to candidate list preserves evictable host block count until
+  // Erase.
+  ASSERT_TRUE(cache.Evict().has_value());
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 2);
+
+  // Updating an unpinned entry from HOST_AND_HBM to HBM decrements count.
+  ASSERT_TRUE(
+      cache.UpdateValue("host_1", TestBlockValue{-1, TestBlockStatus::HBM}));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+  ASSERT_TRUE(
+      cache.UpdateValue("host_1", TestBlockValue{0, TestBlockStatus::HOST}));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 2);
+
+  // Erasing candidate and active entries decrements count.
+  ASSERT_TRUE(cache.Erase("host_2"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+
+  cache.Clear();
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

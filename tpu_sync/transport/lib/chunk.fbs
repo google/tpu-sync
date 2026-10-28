@@ -36,6 +36,7 @@ struct ChunkMetadataV1 {
   dst_shard_idx:uint32;
   dst_offset_bytes:uint64;
   size_bytes:uint64;
+  expected_hash:uint64;
 }
 
 struct ChunkMetadataV2 {
@@ -49,5 +50,6 @@ struct ChunkMetadataV2 {
   dst_stride_bytes:uint64;
   count:uint32;
   padding:uint32;
+  expected_hash:uint64;
 // LINT.ThenChange(chunk.h)
 }

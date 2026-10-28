@@ -74,6 +74,7 @@ struct ShardInfo {
 class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
  public:
   ~BlockTransportDelegate() override = default;
+  using lib::RawBufferTransportDelegate::OnDataReceived;
 
   // Explicit-destination (op=6) pushes normally ride a registered transfer
   // plan. Legacy uniform-layer delegates accept plan-less explicit pushes

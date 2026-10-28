@@ -421,6 +421,7 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
 
     bool trigger_h2d = false;
+    std::optional<uint64_t> expected_xor_hash;
     std::vector<size_t> layers_to_trigger;
     if (header.uuid > 0) {
       absl::MutexLock lock(raw_progress_mu_);
@@ -478,6 +479,9 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
                   << elapsed_since_first_chunk_ms
                   << " bytes=" << prog.total_bytes;
         }
+        if (prog.has_expected_hash) {
+          expected_xor_hash = prog.expected_xor_hash;
+        }
         raw_progress_.erase(header.uuid);
         trigger_h2d = true;
         VLOG(1) << "Triggering H2D for uuid=" << header.uuid;
@@ -488,7 +492,8 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
       ABSL_RETURN_IF_ERROR(raw_delegate_->OnLayerDataReceived(l, header.uuid));
     }
     if (trigger_h2d) {
-      ABSL_RETURN_IF_ERROR(raw_delegate_->OnDataReceived(header.uuid));
+      ABSL_RETURN_IF_ERROR(
+          raw_delegate_->OnDataReceived(header.uuid, expected_xor_hash));
     }
 
     return absl::OkStatus();
@@ -540,7 +545,7 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
 
       if (count == 1 || dst_stride == meta.size_bytes) {
         const size_t task_bytes = count * meta.size_bytes;
-        if (meta.size_bytes > host_size ||
+        if (task_bytes > host_size ||
             meta.dst_offset_bytes > host_size - task_bytes) {
           return absl::InvalidArgumentError(
               "Destination out of bounds in batched push");
@@ -597,6 +602,7 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
 
     bool trigger_h2d = false;
+    std::optional<uint64_t> expected_xor_hash;
     std::vector<size_t> layers_to_trigger;
     if (header.uuid > 0) {
       // Collapse the batch into a per-layer histogram *before* taking the
@@ -606,13 +612,17 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
       // ~3 hash operations per chunk under `raw_progress_mu_` into ~3 per
       // distinct layer.
       Histogram<size_t> layer_histogram;
+      uint64_t batch_xor_hash = 0;
       for (uint32_t i = 0; i < batch_size; ++i) {
         layer_histogram.Add(metadata[i].layer_idx, 1);
+        batch_xor_hash ^= metadata[i].expected_hash;
       }
 
       absl::MutexLock lock(raw_progress_mu_);
       auto& prog = raw_progress_[header.uuid];
       prog.completed_chunks += batch_size;
+      prog.expected_xor_hash ^= batch_xor_hash;
+      prog.has_expected_hash = true;
       if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
         prog.total_bytes += total_bytes;
         if (prog.first_chunk_time == absl::InfinitePast()) {
@@ -667,6 +677,9 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
                   << elapsed_since_first_chunk_ms
                   << " bytes=" << prog.total_bytes;
         }
+        if (prog.has_expected_hash) {
+          expected_xor_hash = prog.expected_xor_hash;
+        }
         raw_progress_.erase(header.uuid);
         trigger_h2d = true;
         VLOG(1) << "Triggering H2D for uuid=" << header.uuid;
@@ -677,7 +690,8 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
       ABSL_RETURN_IF_ERROR(raw_delegate_->OnLayerDataReceived(l, header.uuid));
     }
     if (trigger_h2d) {
-      ABSL_RETURN_IF_ERROR(raw_delegate_->OnDataReceived(header.uuid));
+      ABSL_RETURN_IF_ERROR(
+          raw_delegate_->OnDataReceived(header.uuid, expected_xor_hash));
     }
 
     return absl::OkStatus();
@@ -994,6 +1008,7 @@ absl::Status RawBufferTransport::RegisterExpectedChunks(
   }
 
   bool trigger_h2d = false;
+  std::optional<uint64_t> expected_xor_hash;
   {
     absl::MutexLock lock(raw_progress_mu_);
     auto& prog = raw_progress_[uuid];
@@ -1025,6 +1040,9 @@ absl::Status RawBufferTransport::RegisterExpectedChunks(
                 << elapsed_since_first_chunk_ms
                 << " bytes=" << prog.total_bytes;
       }
+      if (prog.has_expected_hash) {
+        expected_xor_hash = prog.expected_xor_hash;
+      }
       raw_progress_.erase(uuid);
       trigger_h2d = true;
       VLOG(1) << "RegisterExpectedChunks triggering H2D for uuid=" << uuid;
@@ -1032,7 +1050,8 @@ absl::Status RawBufferTransport::RegisterExpectedChunks(
   }
 
   if (trigger_h2d) {
-    ABSL_RETURN_IF_ERROR(raw_delegate_->OnDataReceived(uuid));
+    ABSL_RETURN_IF_ERROR(
+        raw_delegate_->OnDataReceived(uuid, expected_xor_hash));
   }
 
   return absl::OkStatus();
@@ -1476,6 +1495,7 @@ absl::Status RawBufferTransport::ProcessSocketBufferBatchPush(
         .dst_stride_bytes = req.dst_stride_bytes,
         .count = count,
     };
+    meta.expected_hash = ComputeChunkXorHash(meta, req.laddr, src_stride);
     const auto s_meta = SerializeChunkMetadata(meta, version);
     DCHECK_EQ(s_meta.size(), header.metadata_size);
     std::memcpy(s_metadata_buf.data() + i * header.metadata_size, s_meta.data(),

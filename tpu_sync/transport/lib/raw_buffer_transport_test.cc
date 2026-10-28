@@ -174,6 +174,15 @@ class RawMockDelegate : public RawBufferTransportDelegate {
     return absl::OkStatus();
   }
 
+  absl::Status OnDataReceived(
+      uint64_t uuid, std::optional<uint64_t> expected_xor_hash) override {
+    {
+      absl::MutexLock lock(mu_);
+      last_expected_xor_hash_ = expected_xor_hash.value_or(0);
+    }
+    return OnDataReceived(uuid);
+  }
+
   void SetOnDataReceivedCallback(std::function<void(uint64_t)> cb) {
     absl::MutexLock lock(mu_);
     on_data_received_callback_ = std::move(cb);
@@ -213,6 +222,11 @@ class RawMockDelegate : public RawBufferTransportDelegate {
     return on_data_received_called_;
   }
 
+  uint64_t last_expected_xor_hash() const {
+    absl::MutexLock lock(mu_);
+    return last_expected_xor_hash_;
+  }
+
   // Layer indices passed to `OnLayerDataReceived()`, in notification order.
   std::vector<size_t> layer_triggers() const {
     absl::MutexLock lock(mu_);
@@ -242,6 +256,7 @@ class RawMockDelegate : public RawBufferTransportDelegate {
   std::vector<uint8_t> buffer_;
   mutable absl::Mutex mu_;
   bool on_data_received_called_ ABSL_GUARDED_BY(mu_) = false;
+  uint64_t last_expected_xor_hash_ ABSL_GUARDED_BY(mu_) = 0;
   std::function<void(uint64_t)> on_data_received_callback_ ABSL_GUARDED_BY(mu_);
   std::vector<size_t> layer_triggers_ ABSL_GUARDED_BY(mu_);
   std::shared_ptr<grpc::Channel> default_channel_ ABSL_GUARDED_BY(mu_);
@@ -434,6 +449,56 @@ TEST_P(RawBufferTransportTest, PushBuffersCorrectness) {
   EXPECT_THAT(dst2.DataSpan(8192, payload4.size()),
               Pointwise(Eq(), absl::MakeConstSpan(payload4)));
   EXPECT_TRUE(dst2.WaitForDataReceived(kNotificationTimeout));
+}
+
+TEST_P(RawBufferTransportTest,
+       PushBuffersPassesAccumulatedExpectedXorHashToOnDataReceived) {
+  constexpr size_t kBufferSize = 8192;
+  RawMockDelegate src(kBufferSize);
+  RawMockDelegate dst(kBufferSize);
+
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  const std::string dst_addr = GetIpPort(dst_transport);
+  src.SetPeerChannel(dst_addr, StartControlServer(&dst_transport));
+  absl::SleepFor(absl::Milliseconds(50));
+
+  std::vector<uint8_t> payload1(1024);
+  std::vector<uint8_t> payload2(2048);
+  RandomNonZero(absl::MakeSpan(payload1));
+  RandomNonZero(absl::MakeSpan(payload2));
+
+  constexpr uint64_t kUuid = 54321;
+  ASSERT_OK(dst_transport.RegisterExpectedChunks(kUuid, 2));
+
+  const std::vector<BufferPushTask> tasks = {
+      {.peer = dst_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 0,
+       .data_ptr = payload1.data(),
+       .size_bytes = payload1.size()},
+      {.peer = dst_addr,
+       .buffer_id = kBufferId,
+       .dst_shard_idx = kDstShardIdx,
+       .dst_offset_bytes = 4096,
+       .data_ptr = payload2.data(),
+       .size_bytes = payload2.size()},
+  };
+
+  ASSERT_OK(src_transport.PushBuffers(tasks, /*parallelism=*/2, kUuid));
+  ASSERT_TRUE(dst.WaitForDataReceived(kNotificationTimeout));
+
+  EXPECT_NE(dst.last_expected_xor_hash(), 0u);
+  EXPECT_EQ(dst.last_expected_xor_hash(),
+            ComputeContiguousXorHash(static_cast<uint32_t>(kBufferId),
+                                     static_cast<uint32_t>(kDstShardIdx),
+                                     /*dst_offset_bytes=*/0, payload1.data(),
+                                     payload1.size()) ^
+                ComputeContiguousXorHash(static_cast<uint32_t>(kBufferId),
+                                         static_cast<uint32_t>(kDstShardIdx),
+                                         /*dst_offset_bytes=*/4096,
+                                         payload2.data(), payload2.size()));
 }
 
 TEST_P(RawBufferTransportTest, PushBuffersPreservesFirstSeenPeerOrder) {

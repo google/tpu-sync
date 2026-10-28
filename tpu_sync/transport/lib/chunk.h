@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TRANSPORT_LIB_CHUNK_H_
 #define THIRD_PARTY_TPU_RAIDEN_TRANSPORT_LIB_CHUNK_H_
 
+#include <cstddef>
 #include <cstdint>
 
 namespace tpu_raiden::transport::lib {
@@ -51,10 +52,27 @@ struct ChunkMetadata {
   uint64_t size_bytes;
   uint64_t dst_stride_bytes = 0;
   uint32_t count = 1;
+  uint64_t expected_hash = 0;
   // LINT.ThenChange(chunk.fbs)
 
   bool operator==(const ChunkMetadata&) const = default;
 };
+
+// Computes a deterministic 64-bit position-dependent hash for a single byte at
+// destination coordinate (layer_idx, dst_shard_idx, dst_byte_offset).
+uint64_t ComputeByteXorHash(uint32_t layer_idx, uint32_t dst_shard_idx,
+                            uint64_t dst_byte_offset, uint8_t byte_val);
+
+// XOR-accumulates ComputeByteXorHash over a contiguous byte range
+// [dst_offset_bytes, dst_offset_bytes + size_bytes).
+uint64_t ComputeContiguousXorHash(uint32_t layer_idx, uint32_t dst_shard_idx,
+                                  uint64_t dst_offset_bytes,
+                                  const uint8_t* data, size_t size_bytes);
+
+// Computes the XOR hash for a single ChunkMetadata payload (supporting both 1D
+// contiguous chunks where count == 1 and 2D strided chunks where count > 1).
+uint64_t ComputeChunkXorHash(const ChunkMetadata& meta, const uint8_t* src_ptr,
+                             size_t src_stride_bytes = 0);
 
 }  // namespace tpu_raiden::transport::lib
 

@@ -30,8 +30,8 @@
 namespace tpu_raiden::transport::lib {
 
 inline constexpr size_t kChunkHeaderSize = 64;
-inline constexpr size_t kMetadataV1Size = 24;
-inline constexpr size_t kMetadataV2Size = 40;
+inline constexpr size_t kMetadataV1Size = 32;
+inline constexpr size_t kMetadataV2Size = 48;
 inline constexpr size_t kMaxMetadataSize = kMetadataV2Size;
 inline constexpr size_t kChunkSizeFieldSize = sizeof(uint32_t);
 
@@ -47,9 +47,9 @@ static_assert(sizeof(flatbuf::ChunkMetadataV2) == kMetadataV2Size);
 constexpr size_t GetChunkMetadataSize(uint16_t ver) {
   switch (ver) {
     case 1:
-      return 24;
+      return kMetadataV1Size;
     case 2:
-      return 40;
+      return kMetadataV2Size;
     default:
       return 0;
   }

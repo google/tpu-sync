@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
@@ -50,6 +51,10 @@ class RawBufferTransportDelegate {
   // transfer.
   virtual absl::Status OnDataReceived(uint64_t uuid = 0) {
     return absl::OkStatus();
+  }
+  virtual absl::Status OnDataReceived(
+      uint64_t uuid, std::optional<uint64_t> /*expected_xor_hash*/) {
+    return OnDataReceived(uuid);
   }
 
   // Returns the gRPC channel for PeregrineControlService for the given peer.

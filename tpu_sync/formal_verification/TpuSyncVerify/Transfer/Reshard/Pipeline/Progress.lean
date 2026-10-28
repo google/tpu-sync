@@ -549,6 +549,333 @@ theorem reachable_unarmed_can_settle {ranks peerCounts : List Nat} {s : Pipeline
       s'.send.planUnregistered = true ∧ s'.recv.planUnregistered = true :=
   can_settle_of_inv (sysUnarmed ranks peerCounts) rfl (reachable_unarmed_inv hvalid h)
 
+/-! ### Buffer release predicates, non-interference, and single-request handoff
+
+The predicates `SrcReleased` and `HandedOff` capture when a reshard request's
+source buffers or all four buffers have been released, `wroteReleased_eq_false`
+and `Inv.recycleSrcBufs` / `Inv.recycleAllBufs` package the single-request
+write-after-release and read-after-release guarantees, and `inv_can_handoff`
+packages single-request eventual drain for `MultiRequest.lean`. -/
+
+/-- For any step other than `.reclaim`, source HBM is unmodified. -/
+theorem srcHbm_quiet_step {s s' : Pipeline} {e : Ev}
+    (hne : e ≠ .reclaim) (hs : step s e = some s') :
+    s'.srcHbm = s.srcHbm := by
+  cases e with
+  | armRecv =>
+    simp only [step, armRecv] at hs; split at hs <;> simp at hs; subst hs; rfl
+  | send e =>
+    cases e <;> simp only [step, sendStep, Option.map_eq_some_iff] at hs
+    · split at hs <;> try cases hs
+      simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · obtain ⟨_, _, rfl⟩ := hs; rfl
+    · obtain ⟨_, _, hs'⟩ := hs; split at hs' <;> { subst hs'; rfl }
+    · obtain ⟨_, _, hs'⟩ := hs; split at hs' <;> { subst hs'; rfl }
+    · obtain ⟨_, _, rfl⟩ := hs; rfl
+    · obtain ⟨_, _, rfl⟩ := hs; rfl
+  | recv e =>
+    cases e <;> simp only [step, recvStep] at hs
+    · split at hs <;> try cases hs
+      simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · split at hs <;> try cases hs
+      simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · split at hs <;> try cases hs
+      simp only [Option.map_eq_some_iff] at hs
+      obtain ⟨_, _, hs'⟩ := hs; split at hs' <;> { subst hs'; rfl }
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+  | landStream p =>
+    simp only [step, landStream] at hs
+    split at hs <;> try cases hs
+    split at hs <;> try cases hs
+    split at hs <;> simp at hs; subst hs; rfl
+  | reclaim =>
+    exact absurd rfl hne
+  | reseatSrcStaging =>
+    simp only [step, reseatSrcStaging] at hs; split at hs <;> simp at hs; subst hs; rfl
+  | reseatDstStaging =>
+    simp only [step, reseatDstStaging] at hs; split at hs <;> simp at hs; subst hs; rfl
+
+/-- Every pipeline step preserves `numPools`. -/
+theorem step_numPools {s s' : Pipeline} {e : Ev} (hs : step s e = some s') :
+    s'.numPools = s.numPools := by
+  cases e with
+  | armRecv =>
+    simp only [step, armRecv] at hs; split at hs <;> simp at hs; subst hs; rfl
+  | send e =>
+    cases e <;> simp only [step, sendStep, Option.map_eq_some_iff] at hs
+    · split at hs <;> try cases hs
+      simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · obtain ⟨_, _, rfl⟩ := hs; rfl
+    · obtain ⟨_, _, hs'⟩ := hs; split at hs' <;> { subst hs'; rfl }
+    · obtain ⟨_, _, hs'⟩ := hs; split at hs' <;> { subst hs'; rfl }
+    · obtain ⟨_, _, rfl⟩ := hs; rfl
+    · obtain ⟨_, _, rfl⟩ := hs; rfl
+  | recv e =>
+    cases e <;> simp only [step, recvStep] at hs
+    · split at hs <;> try cases hs
+      simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · split at hs <;> try cases hs
+      simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · split at hs <;> try cases hs
+      simp only [Option.map_eq_some_iff] at hs
+      obtain ⟨_, _, hs'⟩ := hs; split at hs' <;> { subst hs'; rfl }
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
+  | landStream p =>
+    simp only [step, landStream] at hs
+    split at hs <;> try cases hs
+    split at hs <;> try cases hs
+    split at hs <;> simp at hs; subst hs; rfl
+  | reclaim =>
+    simp only [step, reclaim] at hs
+    split at hs <;> simp at hs; subst hs; rfl
+  | reseatSrcStaging =>
+    simp only [step, reseatSrcStaging] at hs; split at hs <;> simp at hs; subst hs; rfl
+  | reseatDstStaging =>
+    simp only [step, reseatDstStaging] at hs; split at hs <;> simp at hs; subst hs; rfl
+
+/-- Once the sender releases its staging lease, no event other than `.reseatSrcStaging`
+can modify `srcStaging` or `wire`. -/
+theorem srcStaging_quiet_step {s s' : Pipeline} {e : Ev} (h : Inv s)
+    (hst : s.send.life.hasStaging = false) (hne : e ≠ .reseatSrcStaging)
+    (hs : step s e = some s') :
+    s'.srcStaging = s.srcStaging ∧ s'.wire = s.wire := by
+  cases e with
+  | armRecv =>
+    simp only [step, armRecv] at hs; split at hs <;> simp at hs; subst hs; exact ⟨rfl, rfl⟩
+  | send e =>
+    exact srcStaging_quiet h hst hs
+  | recv e =>
+    cases e <;> simp only [step, recvStep] at hs
+    · split at hs <;> try cases hs
+      simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
+    · split at hs <;> try cases hs
+      simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
+    · split at hs <;> try cases hs
+      simp only [Option.map_eq_some_iff] at hs
+      obtain ⟨_, _, hs'⟩ := hs; split at hs' <;> { subst hs'; exact ⟨rfl, rfl⟩ }
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
+    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
+  | landStream p =>
+    simp only [step, landStream] at hs
+    split at hs <;> try cases hs
+    split at hs <;> try cases hs
+    split at hs <;> simp at hs; subst hs; exact ⟨rfl, rfl⟩
+  | reclaim =>
+    simp only [step, reclaim] at hs
+    split at hs <;> simp at hs; subst hs; exact ⟨rfl, rfl⟩
+  | reseatSrcStaging =>
+    exact absurd rfl hne
+  | reseatDstStaging =>
+    simp only [step, reseatDstStaging] at hs; split at hs <;> simp at hs; subst hs; exact ⟨rfl, rfl⟩
+
+/-- True if `e` is one of the environment buffer-overwrite events (`.reclaim`,
+`.reseatSrcStaging`, `.reseatDstStaging`). -/
+def isRecycleEv (e : Ev) : Bool :=
+  e == .reclaim || e == .reseatSrcStaging || e == .reseatDstStaging
+
+/-- Per-buffer write-after-release detector: checks whether a transition `r → r'`
+modified any of the four buffers after `r` had already released that specific
+buffer. -/
+def wroteReleased (r r' : Pipeline) : Bool :=
+  (r.send.published != none && r'.srcHbm != r.srcHbm) ||
+  (!r.send.life.hasStaging && r'.srcStaging != r.srcStaging) ||
+  (!r.recv.life.hasStaging && r'.dstStaging != r.dstStaging) ||
+  (r.recv.published != none && r'.dstHbm != r.dstHbm)
+
+/-- Key per-buffer non-interference lemma: for any reshard request `r` satisfying `Inv r`,
+no transfer step ever modifies any of the four buffers after `r` has released
+that specific buffer (`wroteReleased r r' = false`). -/
+theorem wroteReleased_eq_false {r r' : Pipeline} {e : Ev} (h : Inv r)
+    (hne₀ : e ≠ .reclaim)
+    (hne₁ : e ≠ .reseatSrcStaging) (hne₂ : e ≠ .reseatDstStaging)
+    (hs : step r e = some r') :
+    wroteReleased r r' = false := by
+  have hq₀ : r'.srcHbm = r.srcHbm := srcHbm_quiet_step hne₀ hs
+  have hq₁ : (!r.send.life.hasStaging && r'.srcStaging != r.srcStaging) = false := by
+    cases hst : r.send.life.hasStaging
+    · simp [(srcStaging_quiet_step h hst hne₁ hs).1]
+    · simp
+  have hq₂ : (!r.recv.life.hasStaging && r'.dstStaging != r.dstStaging) = false := by
+    cases hst : r.recv.life.hasStaging
+    · simp [(dstStaging_quiet h hst hne₂ hs).1]
+    · simp
+  have hq₃ : (r.recv.published != none && r'.dstHbm != r.dstHbm) = false := by
+    cases hp : r.recv.published with
+    | none => simp
+    | some b =>
+      have hne : r.recv.published ≠ none := by simp [hp]
+      simp [(dstHbm_quiet h hne hs).1]
+  simp [wroteReleased, hq₀, hq₁, hq₂, hq₃]
+
+theorem not_isRecycleEv_and_wroteReleased_eq_false {r r' : Pipeline} {e : Ev}
+    (h : Inv r) (hs : step r e = some r') :
+    (!isRecycleEv e && wroteReleased r r') = false := by
+  by_cases he : isRecycleEv e = true
+  · simp [he]
+  · simp only [isRecycleEv, Bool.or_eq_true, beq_iff_eq, not_or] at he
+    rw [wroteReleased_eq_false h he.1.1 he.1.2 he.2 hs]
+    simp
+
+/-- The source side of a reshard request has released both of its buffers: its host
+staging buffer has been returned to `PoolStagingStorage`
+(`send.life.hasStaging = false`) and `CompleteReadWithDetails` has published
+`done_sending` or `failed_recving` (`send.published ≠ none`). -/
+def SrcReleased (s : Pipeline) : Prop :=
+  s.send.life.hasStaging = false ∧
+  s.send.published ≠ none
+
+instance (s : Pipeline) : Decidable (SrcReleased s) :=
+  inferInstanceAs (Decidable (_ ∧ _))
+
+/-- TPU Sync has finished with all four memories of this reshard transfer:
+both host staging leases have been released back to `PoolStagingStorage`
+(`hasStaging = false`), and both HBM outcomes have been published via
+`CompleteReadWithDetails` (`send.published ≠ none`, `recv.published ≠ none`). -/
+def HandedOff (s : Pipeline) : Prop :=
+  s.send.life.hasStaging = false ∧
+  s.recv.life.hasStaging = false ∧
+  s.send.published ≠ none ∧
+  s.recv.published ≠ none
+
+instance (s : Pipeline) : Decidable (HandedOff s) :=
+  inferInstanceAs (Decidable (_ ∧ _ ∧ _ ∧ _))
+
+theorem HandedOff.srcReleased {s : Pipeline} (h : HandedOff s) : SrcReleased s :=
+  ⟨h.1, h.2.2.1⟩
+
+/-- Overwrite a request's source buffers (`srcHbm` and `srcStaging`) with `.junk`
+when a later request recycles them (`recycleSrc`). -/
+def recycleSrcBufs (s : Pipeline) : Pipeline :=
+  { s with
+    srcHbm := List.replicate s.numPools .junk,
+    reclaimed := true,
+    srcStaging := List.replicate s.numPools .junk }
+
+/-- Overwrite a request's `srcHbm`, `srcStaging`, and `dstStaging` with `.junk`
+when a later request recycles all buffers (`nextRequest`). -/
+def recycleAllBufs (s : Pipeline) : Pipeline :=
+  { s with
+    srcHbm := List.replicate s.numPools .junk,
+    reclaimed := true,
+    srcStaging := List.replicate s.numPools .junk,
+    dstStaging := List.replicate s.numPools .junk }
+
+theorem Inv.recycleSrcBufs {s : Pipeline} (h : Inv s) (hp : SrcReleased s) :
+    Inv (Pipeline.recycleSrcBufs s) := by
+  have hd : s.send.life.done = true := by
+    have hst := hp.1
+    rw [h.sendInv.life.staging] at hst; simpa using hst
+  unfold Pipeline.recycleSrcBufs
+  exact ⟨h.sendInv, h.recvInv, h.num_pos, h.len_peers, h.len_send, h.len_recv,
+    by simp, by simp, h.len_wire, h.len_dstStg, h.len_dstHbm,
+    h.len_sent, h.len_landed, h.peers_match,
+    fun hr => by simp at hr, fun _ => hp.2,
+    fun hnd => by simp [hd] at hnd,
+    h.sent_bound, h.wire_ok, h.landed_le_sent,
+    h.dstStg_ok, h.recv_stage_landed, h.done_intact,
+    h.unarmed_send, h.unarmed_recv⟩
+
+theorem Inv.recycleAllBufs {s : Pipeline} (h : Inv s) (hp : HandedOff s) :
+    Inv (Pipeline.recycleAllBufs s) := by
+  have hdS : s.send.life.done = true := by
+    have hst := hp.1
+    rw [h.sendInv.life.staging] at hst; simpa using hst
+  have hdR : s.recv.life.done = true := by
+    have hst := hp.2.1
+    rw [h.recvInv.life.staging] at hst; simpa using hst
+  unfold Pipeline.recycleAllBufs
+  exact ⟨h.sendInv, h.recvInv, h.num_pos, h.len_peers, h.len_send, h.len_recv,
+    by simp, by simp, h.len_wire, by simp, h.len_dstHbm,
+    h.len_sent, h.len_landed, h.peers_match,
+    fun hr => by simp at hr, fun _ => hp.2.2.1,
+    fun hnd => by simp [hdS] at hnd,
+    h.sent_bound, h.wire_ok, h.landed_le_sent,
+    fun hnd => by simp [hdR] at hnd,
+    h.recv_stage_landed, h.done_intact,
+    h.unarmed_send, h.unarmed_recv⟩
+
+/-- Once a reshard transfer has released both staging buffers and published both
+HBM outcomes (`HandedOff`), no subsequent transfer transition can ever modify
+any of the five memories (`srcHbm`, `srcStaging`, `wire`, `dstStaging`, `dstHbm`).
+Proved by combining `srcHbm_quiet_step`, `srcStaging_quiet_step`,
+`dstStaging_quiet`, and `dstHbm_quiet`. -/
+theorem handedOff_quiet {r r' : Pipeline} {e : Ev} (h : Inv r) (hp : HandedOff r)
+    (hne₀ : e ≠ .reclaim)
+    (hne₁ : e ≠ .reseatSrcStaging) (hne₂ : e ≠ .reseatDstStaging)
+    (hs : step r e = some r') :
+    r'.srcHbm = r.srcHbm ∧
+    r'.srcStaging = r.srcStaging ∧
+    r'.wire = r.wire ∧
+    r'.dstStaging = r.dstStaging ∧
+    r'.dstHbm = r.dstHbm :=
+  ⟨srcHbm_quiet_step hne₀ hs,
+   (srcStaging_quiet_step h hp.1 hne₁ hs).1,
+   (srcStaging_quiet_step h hp.1 hne₁ hs).2,
+   (dstStaging_quiet h hp.2.1 hne₂ hs).1,
+   (dstHbm_quiet h hp.2.2.2 hs).1⟩
+
+/-- From any settled reshard pipeline state, publishing both sessions completes handoff. -/
+theorem settled_can_handoff (sys₀ : System Pipeline Ev) (hstep : sys₀.step = step)
+    {s : Pipeline}
+    (hs_done : s.send.life.done = true) (hr_done : s.recv.life.done = true)
+    (hs_stg : s.send.life.hasStaging = false) (hr_stg : s.recv.life.hasStaging = false) :
+    ∃ evs s', sys₀.runFrom s evs = some s' ∧ HandedOff s' := by
+  cases hpubS : s.send.published with
+  | none =>
+    let s₁ : Pipeline :=
+      { s with send := { s.send with published := some s.send.life.statusOk } }
+    have hstepS : step s (.send .publish) = some s₁ := by
+      simp [step, sendStep, Send.step, Send.publish, hs_done, hpubS, s₁]
+    cases hpubR : s.recv.published with
+    | none =>
+      let s₂ : Pipeline :=
+        { s₁ with recv := { s₁.recv with published := some s₁.recv.life.statusOk,
+                                         planUnregistered := true } }
+      have hstepR : step s₁ (.recv .publish) = some s₂ := by
+        simp [step, recvStep, Recv.step, Recv.publish, hr_done, hpubR, s₂, s₁]
+      refine ⟨[.send .publish, .recv .publish], s₂, ?_, ⟨hs_stg, hr_stg, by simp [s₂, s₁], by simp [s₂]⟩⟩
+      simp [System.runFrom, hstep, hstepS, hstepR]
+    | some bR =>
+      refine ⟨[.send .publish], s₁, ?_, ⟨hs_stg, hr_stg, by simp [s₁], by simp [s₁, hpubR]⟩⟩
+      simp [System.runFrom, hstep, hstepS]
+  | some bS =>
+    cases hpubR : s.recv.published with
+    | none =>
+      let s₂ : Pipeline :=
+        { s with recv := { s.recv with published := some s.recv.life.statusOk,
+                                       planUnregistered := true } }
+      have hstepR : step s (.recv .publish) = some s₂ := by
+        simp [step, recvStep, Recv.step, Recv.publish, hr_done, hpubR, s₂]
+      refine ⟨[.recv .publish], s₂, ?_, ⟨hs_stg, hr_stg, by simp [s₂, hpubS], by simp [s₂]⟩⟩
+      simp [System.runFrom, hstep, hstepR]
+    | some bR =>
+      refine ⟨[], s, rfl, ⟨hs_stg, hr_stg, by simp [hpubS], by simp [hpubR]⟩⟩
+
+/-- From any pipeline state satisfying `Inv`, a finite trace settles both
+sessions, releases both host staging buffers to `PoolStagingStorage`, and
+publishes both HBM outcomes (`HandedOff`). -/
+theorem inv_can_handoff {ranks peerCounts : List Nat} {s : Pipeline}
+    (hinv : Inv s) :
+    ∃ evs s', (sys ranks peerCounts).runFrom s evs = some s' ∧ HandedOff s' := by
+  obtain ⟨evs₁, s₁, hrun₁, hsd, hrd, hstS, hstR, _, _⟩ :=
+    can_settle_of_inv (sys ranks peerCounts) rfl hinv
+  obtain ⟨evs₂, s', hrun₂, hhand⟩ := settled_can_handoff (sys ranks peerCounts) rfl hsd hrd hstS hstR
+  exact ⟨evs₁ ++ evs₂, s', (sys ranks peerCounts).runFrom_append evs₁ evs₂ hrun₁ hrun₂, hhand⟩
+
 
 end Pipeline
 

@@ -8,12 +8,6 @@ machine-checked proofs about them.
 
 ## What is modelled
 
-The shared infrastructure (`Common/`), the transfer-session lifecycle model,
-the prefill-to-decode subsystem (`Transfer/PrefillDecode/`, including the
-transport and engine caller models) and the pool-resharding subsystem
-(`Transfer/Reshard/`) are in; the controller model below arrives in a
-follow-up change.
-
 **Prefill-to-decode transfer** — [prefill_decode.md](docs/transfer/prefill_decode.md)
 - C++: `TransferSendSession`, `TransferReceiveSession`,
   `KVCacheManagerWithTransfer`, the receiver side of `BlockTransport`.
@@ -22,10 +16,10 @@ follow-up change.
 - Proved: data correctness on publication, HBM and staging safety,
   drain-to-settle termination, cross-peer isolation.
 
-**Engine caller contract** — [prefill_decode.md](docs/transfer/prefill_decode.md) §Boundaries
-- Python: vLLM's scheduler through tpu-inference's connector, above
-  `poll_stats()`.
-- Lean: [`Transfer/PrefillDecode/Caller.lean`](TpuSyncVerify/Transfer/PrefillDecode/Caller.lean).
+**Engine caller contract** — [prefill_decode.md](docs/transfer/prefill_decode.md) §Boundaries, [reshard.md](docs/transfer/reshard.md) §Boundaries
+- Python: vLLM's scheduler through tpu-inference's and vllm-torchtpu's
+  connectors, above `poll_stats()`.
+- Lean: [`Transfer/Caller.lean`](TpuSyncVerify/Transfer/Caller.lean).
 - Proved: a connector that forwards every publication leaks no held block and
   never decodes on unwritten KV.
 
@@ -37,13 +31,6 @@ follow-up change.
   ordering, staging slot conservation, registry claim safety,
   arm-before-dispatch, termination.
 
-**Controller remote leases** — `docs/controller/read_remote.md` *(follow-up)*
-- C++: `RaidenController::ReadRemote`.
-- Lean: `Controller/ReadRemote.lean`.
-- Checked: `NoWriteAfterRelease` by exhaustive search — violated by the
-  current code (two witness traces), holds if the deadline defers while a pull
-  is in flight.
-
 ## Layout
 
 ```text
@@ -51,14 +38,14 @@ TpuSyncVerify.lean            imports every model
 TpuSyncVerify/
   Common/                     transition-system core, list lemmas, bounded model checker
   Transfer/Session.lean       settle protocol shared by every transfer session
-  Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport, caller
+  Transfer/Caller.lean        engine caller contract above poll_stats() shared by both transfer paths
+  Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport
   Transfer/Reshard/           pool-resharding sessions, staging arena, registry, coordinator
-  Controller/ReadRemote.lean  controller remote-read lease (follow-up)
 docs/
   conventions.md              how the models are written (one executable step, ghost
                               fields, replay traces, mutants) and how the C++ is cited
-  transfer/, controller/      per-subsystem C++ <-> Lean docs: states, events,
-                              assumptions, proved theorems (controller follow-up)
+  transfer/                   per-subsystem C++ <-> Lean docs: states, events,
+                              assumptions, proved theorems
 tools/
   resolve_anchors.py          resolves and checks the source-map tables
 lakefile.toml, lake-manifest.json, lean-toolchain
@@ -71,9 +58,9 @@ GTest names (`Suite.TestName`); exact line spans live in per-file
 `<!-- source-map:begin --> ... <!-- source-map:end -->` tables. Those spans were
 last resolved at commit **`c9bc124`**;
 [`tools/resolve_anchors.py`](tools/resolve_anchors.py) `--check` re-verifies
-them against the working tree. The two external callers that `Caller.lean`
-cites are pinned separately, to the pair `examples/*_disagg/setup.sh`
-installs: tpu-inference `7ed46a6`, vLLM `6185d73`.
+them against the working tree. The external callers that `Caller.lean`
+cites are pinned separately: tpu-inference `7ed46a6`, vllm-torchtpu `9725110`,
+and vLLM `6185d73`.
 
 ## Building & Verifying
 

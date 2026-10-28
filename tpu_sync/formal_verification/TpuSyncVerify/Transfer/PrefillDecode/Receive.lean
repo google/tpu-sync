@@ -71,6 +71,61 @@ see `Transport.lean`.)
 | `cancel`       | any `Finish(error)` from outside the session: deadline (`CompleteReadWithDetails`), shutdown (`~KVCacheManagerWithTransfer`), plan unregister (`UnregisterActivePlan`) |
 | `publish`      | `CompleteReadWithDetails` / `CompleteReadRaw` moves a settled session (`session->Done()`) into `done_recving_` or `failed_recving_` by its status and erases it from `active_recv_sessions_` |
 
+## Lock scopes
+
+Every mutable field of `TransferReceiveSession` is `ABSL_GUARDED_BY(mu_)`;
+`base_`, `uuid_` and `staging_allocator_` are set in the constructor and never
+written again, and they (with `base_` / `manager` configuration getters) are the
+only state an event reads outside `mu_`.
+
+| Event          | `mu_` scopes | Between them |
+|----------------|--------------|--------------|
+| `pushBegin`    | 1: `TryBeginRecvOp` | preceded by the hook's `active_recv_sessions_` lookup under manager `mu_`; a session published in between is `done_` and refuses the op (`none`) |
+| `pushEnd`      | `EndRecvOp`, plus `MaybeUnregisterSettledRecv` (`Done()`, and `TakePendingUnregister` if settled) and 1–2 read-only `GetStatus()` scopes for the hook's return value | on a failed push, the hook's `DeferUnregisterOnSettle()` and `Finish(status)` run in earlier scopes (`cancel` before `pushEnd`; `unregister_on_settle_` is not modelled) |
+| `pullReply`    | 2: `on_response`'s `absl::MutexLock lock(self->mu_)` (`FinishLocked(pull_status)` on failure, `handshake_pending_ = false`), then `EndRecvOp()` from `absl::Cleanup end_op` after `lock` is released (`ExecutePullRequest` also takes an initial `mu_` scope before scheduling to read `load_plan_` and set `peer_endpoint_`; the fault-injected `Finish(status); EndRecvOp()` in `StartRead` is the same two scopes without `ExecutePullRequest`, leaving `handshake_pending_ = true` on a settled session) | an `EndRecvOp` tail, below |
+| `h2dBegin`     | 1: first scope of `ExecuteLayerH2d` | — |
+| `h2dIssue`     | 1–2 in `ExecuteLayerH2d`: the `done_ || draining_` re-check (`EndRecvOpLocked()` and return in 1 scope when draining), then `h2d_futures_.push_back(future)` after the unlocked `H2dSyncDispatch` (or, on dispatch failure, `FinishLocked(future_or.status(), kH2dPhase); EndRecvOpLocked()`), followed by `MaybeUnregisterSettledRecv` | during `H2dSyncDispatch` the copy is not yet in `h2d_futures_`, so `AllH2dDoneLocked` does not see it. Harmless by A4: this thread calls `OnBlockShardsReceived` only after `ExecuteLayerH2d` returns, so `network_completed_` cannot be set in the gap, and `num_completed_layers_ == total_layers` is false while a layer is unissued, keeping `IsReadyToComplete` false. A `Finish(error)` before the re-check is `cancel` then `h2dIssue` (`trace_finish_between_locks`); one during the dispatch finds the op `h2dBegin` took, cannot settle, and commutes with `push_back`, i.e. `h2dIssue true` then `cancel` (`trace_deadline_during_copy`, `RecvDrainTest.TimeoutDuringH2dDispatchKeepsStaging`) |
+| `h2dReady`     | 0 (device) | — |
+| `h2dDone`      | 2: the callback's `absl::MutexLock lock(self->mu_)` (`done_` check, `num_completed_layers_++`, `FinishLocked`), then `EndRecvOp()` from `absl::Cleanup end_op` | an `EndRecvOp` tail, below (when this is the last op of a draining session with `unregister_on_settle_`, the unmodelled `UnregisterSettledPlan` also runs in this gap after `in_flight_ == 1`) |
+| `netAccount`   | 1: `OnBlockShardsReceived` (`RecordBlockShardsReceivedLocked`, `RecordNetworkCompleteLocked`, `FinishLocked`), preceded by the manager's `active_recv_sessions_` lookup and followed by `MaybeUnregisterSettledRecv` | — |
+| `pollReady`    | on the poll thread under manager `mu_`: `IsDraining()`, `IsReadyToComplete()`, `req_id()` (for the log), `Finish()` | the poll, below |
+| `cancel`       | 1: `Finish(error)`, after its condition was checked in earlier scopes (`!IsDraining()`, `IsReadyToComplete()`, `deadline() <= now`, and `DeferUnregisterOnSettle()` for the sweep; `!Done()` under manager `mu_` and `DeferUnregisterOnSettle()` for `UnregisterActivePlan`, followed by `Done()` and `TakePendingUnregister` if settled) | `cancel` has no guard in the model, so it admits every such interleaving; late errors, below |
+| `publish`      | under manager `mu_`: `Done()`, `GetStatus()`, `Details()`, `TakePendingUnregister()` | on a settled session only `status_` can still change; late errors, below |
+
+**`EndRecvOp` tails.** `pullReply` and `h2dDone` run their decision under `mu_`
+and then call `EndRecvOp` in a second scope. Between the two scopes, `in_flight_`
+still counts the op. Because only the settle checks in `FinishLocked` and
+`EndRecvOpLocked` inspect `in_flight_`, any interleaved step makes the same
+decision as it would after `EndRecvOp`, except that an interleaved `Finish`
+leaves the final settle to `EndRecvOp` with the same resulting `draining_`,
+`done_` and `status_`. Every such interleaving therefore reaches the same state
+as running the whole event first, which is why the ghost `pending` and `retired`
+counters need no intermediate state for the tail.
+
+**The poll.** `pollReady` checks `IsDraining()` and `IsReadyToComplete()`, reads
+`req_id()`, and calls `Finish()`. Once `IsReadyToComplete()` is true it stays
+true: when `network_completed_ || num_completed_layers_ == total_layers` holds,
+`issued = numLayers` (`CountersOrdered` with A1), so no new future can join
+`h2d_futures_` and each ingredient of `IsReadyToComplete` is monotone. If
+`Finish(error)` runs between the check and `Finish()`, the session is already
+draining when the poll's OK `Finish()` runs, so `FinishLocked` returns at
+`if (draining_) return;` without touching `status_` — matching `pollReady`
+being disabled after `cancel`.
+
+**Late errors.** `FinishLocked` records a non-OK status before testing
+`draining_`, so a `Finish(error)` after an OK settle still flips `status_`;
+`Lifecycle.finishLocked` does the same, which is why `cancel` is unguarded and
+a subsequent `publish` reports `some false`. Two callers can do this: the
+deadline sweep's `Finish(DeadlineExceeded)` if the last H2D callback settled the
+session after `IsReadyToComplete()` returned false; and `UnregisterActivePlan`,
+whose `!Done()` check holds manager `mu_` while its `Finish(CancelledError)`
+runs after releasing manager `mu_`. In the second case, `Finish(CancelledError)`
+can land during `CompleteReadWithDetails` between the `GetStatus()` that selects
+`done_recving_` and the `Details()` stored in `transfer_details_`, producing a
+`done_recving_` entry whose details carry an error (`transfer_details_` is
+outside the model's state; on the modelled fields every interleaving is `cancel`
+before or after `publish`).
+
 ## Assumptions
 
 * **A1 (one dispatch per layer).** `BlockTransport::CompleteIncomingPush` fires
@@ -163,26 +218,44 @@ Generated by `tools/resolve_anchors.py`.
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
+| `recv.h` | `TransferReceiveSession::Done` | `:86-89` |
+| `recv.h` | `TransferReceiveSession::GetStatus` | `:93-96` |
+| `recv.h` | `TransferReceiveSession::IsDraining` | `:103-106` |
 | `recv.h` | `TransferReceiveSession::TryBeginRecvOp` | `:117-122` |
+| `recv.h` | `TransferReceiveSession::req_id` | `:165-168` |
+| `recv.h` | `TransferReceiveSession::deadline` | `:173-176` |
 | `recv.h` | `TransferReceiveSession` (`std::vector<int64_t> blocks_received_per_shard_` .. `std::vector<raiden::PjRtCopyFuture> h2d_futures_`) | `:281-304` |
+| `recv.h` | `TransferReceiveSession` (`mutable absl::Mutex mu_;` .. `uint64_t plan_generation_ ABSL_GUARDED_BY(mu_) = 0;`) | `:266-313` |
 | `recv.cc` | `TransferReceiveSession::InitFromActivePlan` | `:136-206` |
 | `recv.cc` | `TransferReceiveSession::InitFromLoadPlan` | `:326-346` |
+| `recv.cc` | `TransferReceiveSession::ReleaseStaging` | `:352-355` |
 | `recv.cc` | `TransferReceiveSession::FinishLocked` | `:357-370` |
+| `recv.cc` | `TransferReceiveSession::FinishLocked` (`if (!status.ok() && status_.ok())`) | `:359-362` |
+| `recv.cc` | `TransferReceiveSession::Finish` | `:372-375` |
 | `recv.cc` | `TransferReceiveSession::Details` | `:383-399` |
 | `recv.cc` | `TransferReceiveSession::CurrentPhaseLocked` | `:401-404` |
 | `recv.cc` | `TransferReceiveSession::EndRecvOpLocked` | `:406-417` |
+| `recv.cc` | `TransferReceiveSession::EndRecvOp` | `:419-422` |
+| `recv.cc` | `TransferReceiveSession::DeferUnregisterOnSettle` | `:424-431` |
+| `recv.cc` | `TransferReceiveSession::TakePendingUnregister` | `:433-441` |
 | `recv.cc` | `TransferReceiveSession::AllH2dDoneLocked` | `:443-448` |
 | `recv.cc` | `TransferReceiveSession::IsReadyToComplete` | `:450-456` |
 | `recv.cc` | `TransferReceiveSession::RecordBlockShardsReceivedLocked` | `:465-492` |
 | `recv.cc` | `TransferReceiveSession::RecordNetworkCompleteLocked` | `:494-512` |
 | `recv.cc` | `TransferReceiveSession::ExecutePullRequest` | `:514-590` |
 | `recv.cc` | `TransferReceiveSession::ExecutePullRequest` (`auto on_response =`) | `:536-572` |
+| `recv.cc` | `TransferReceiveSession::ExecutePullRequest` (`absl::Cleanup end_op`) | `:538` |
+| `recv.cc` | `TransferReceiveSession::ExecutePullRequest` (`absl::MutexLock lock(self->mu_);` .. `self->handshake_pending_ = false;`) | `:567-571` |
 | `recv.cc` | `TransferReceiveSession::OnRecvNetworkComplete` | `:608-620` |
 | `recv.cc` | `TransferReceiveSession::OnBlockShardsReceived` | `:622-670` |
 | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:672-793` |
 | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`++in_flight_;` .. `trigger_enqueue = true;`) | `:682-687` |
 | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`// The receive may have been finished` .. `h2d_futures_.push_back(future);`) | `:699-728` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`if (!future_or.ok())`) | `:718-723` |
 | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`future.OnReady`) | `:732-790` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`absl::Cleanup end_op`) | `:741` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`absl::MutexLock lock(self->mu_);` .. `should_unregister = true;`) | `:747-773` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`if (should_unregister && !manager.IsShuttingDown())`) | `:787-789` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.on_layer_received =`) | `:163-179` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.begin_incoming_push =`) | `:224-249` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.end_incoming_push =`) | `:250-296` |
@@ -190,8 +263,13 @@ Generated by `tools/resolve_anchors.py`.
 | `mgr.cc` | `KVCacheManagerWithTransfer::EmplaceRecvSessionLocked` | `:535-551` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::RegisterActivePlan` | `:553-641` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:741-778` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` (`if (recv != nullptr)`) | `:765-771` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterSettledPlan` | `:780-796` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::MaybeUnregisterSettledRecv` | `:798-804` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:874-978` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_recv_sessions_.begin();`) | `:1035-1066` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`// Reclaim recv sessions whose transfer never completed` .. `absl::DeadlineExceededError("Receive session timed out"));`) | `:1031-1050` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`absl::DeadlineExceededError("Receive session timed out"));` .. `active_recv_sessions_.erase(it++);`) | `:1050-1062` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::OnBlockShardsReceived` | `:1497-1521` |
 | `bt.cc` | `BlockTransport::HandleCustomRequest` | `:471-494` |
 | `bt.cc` | `BlockTransport::HandleIncomingPush` | `:496-639` |

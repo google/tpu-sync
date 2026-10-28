@@ -39,7 +39,7 @@ inductive CoordPhase where
       `PoolReshardRegisterRecv` RPCs to `dst_units` are in flight. -/
   | arming
   /-- Stage 2 (`ReshardCoordinator::ExecutePoolReshard`, `sender_status` fan-out): all `dst_units` armed with
-      `arm_status.ok()`; concurrent `PoolReshardSend` RPCs to `src_units` are
+      `arm_status.ok()`; concurrent `PoolReshardPush` RPCs to `src_units` are
       in flight. -/
   | dispatching
   /-- Both stages completed with `return absl::OkStatus()` (`ReshardCoordinator::ExecutePoolReshard`). -/
@@ -132,7 +132,7 @@ structure CoordState where
   armResults : List (Nat × Bool)
   /-- `true` if `!arm_status.ok()` during Stage 1 (`arm_status[i]` in `ReshardCoordinator::ExecutePoolReshard`). -/
   armFailed : Bool
-  /-- Completed `PoolReshardSend` RPC results `(srcUnit, ok)` collected during
+  /-- Completed `PoolReshardPush` RPC results `(srcUnit, ok)` collected during
       Stage 2 (`futures` / `senders` in `ReshardCoordinator::ExecutePoolReshard`). -/
   sendResults : List (Nat × Bool)
   /-- `true` if `!sender_status.ok()` during Stage 2 (`sender_status[i]` in `ReshardCoordinator::ExecutePoolReshard`). -/
@@ -157,7 +157,7 @@ inductive Ev where
   /-- Stage 1 join barrier `for (std::thread& t : armers) t.join()` and
       `for (const absl::Status& status : arm_status)` check (`ReshardCoordinator::ExecutePoolReshard`). -/
   | finishArmBarrier
-  /-- Stage 2 worker RPC `PoolReshardSend` finishes for `srcUnit`
+  /-- Stage 2 worker RPC `PoolReshardPush` finishes for `srcUnit`
       (`SubmitTransferProgram` / `senders.emplace_back` in `ReshardCoordinator::ExecutePoolReshard`). -/
   | sendSrcResult (srcUnit : Nat) (ok : Bool)
   /-- Stage 2 join barrier `for (std::thread& t : senders) t.join()` and
@@ -273,7 +273,7 @@ def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState 
     else if !s.srcUnits.contains srcUnit || hasResult s.sendResults srcUnit then
       none
     else if ok then
-      -- `PoolReshardSend` succeeded (`ReshardCoordinator::ExecutePoolReshard`,
+      -- `PoolReshardPush` succeeded (`ReshardCoordinator::ExecutePoolReshard`,
       -- `ReshardService::HandleControllerCommand` `COMMAND_COMPLETE_REQUEST_BLOCKS`, `RequestBlockRegistry::Complete`):
       -- pushes sub-blocks to armed `dst_units` and votes `registry_->Complete`.
       let dstStates' :=

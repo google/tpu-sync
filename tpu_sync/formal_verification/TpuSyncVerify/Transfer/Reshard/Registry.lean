@@ -12,7 +12,9 @@ registration, multi-owner planning claims, claim abandonment, per-unit
 completion voting, and unclaimed cancellation tombstones.
 
 File aliases used in the source map below:
-`reg.h` / `reg.cc` (`tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}`).
+`reg.h` / `reg.cc` (`tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}`)
+and `reshard_service_test.cc`
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc`).
 
   ## C++ anchorage
 
@@ -78,6 +80,19 @@ File aliases used in the source map below:
      `purgeExpiredAll_inv`, `trace_single_stage_votes_retire_multi_owner_claim`,
      and `trace_split_ttl_purges_request_blocks_while_claim_active`).
 
+  ## Lock scopes
+
+  Every mutable map of `RequestBlockRegistry` (`request_blocks_`, `claimed_`,
+  `claimed_units_`, `claimed_owners_`, `completed_units_`, and `cancelled_`) is
+  `ABSL_GUARDED_BY(mu_)` (the controller mutex shared with `WorkUnitDirectory`).
+
+  | Event | `mu_` scopes | Between them |
+  |---|---|---|
+  | `register` | 1 deciding `RequestBlockRegistry::mu_` scope (`PurgeExpiredRequestBlocksLocked`, `PurgeExpiredLifecycleLocked`, `cancelled_` / `claimed_` checks, `request_blocks_` insertion); when `pool_spans` is non-empty, `Register` takes `mu_` once beforehand only to snapshot `directory_->PoolManifestLocked(unit)` | the manifest snapshot touches none of the registry maps (`retired` in `RegGen` is a single-generation latch assuming no re-registration of the same `(req_id, uuid)` after `RetireLocked`) |
+  | `lookupAndClaim`, `complete`, `release` | 1 `RequestBlockRegistry::mu_` scope (each runs `PurgeExpiredRequestBlocksLocked` and `PurgeExpiredLifecycleLocked` on entry) | — |
+  | `cancelIfUnclaimed` | 1 `RequestBlockRegistry::mu_` scope (runs `PurgeExpiredLifecycleLocked` on entry) | — |
+  | `abandonClaim` | 1 `RequestBlockRegistry::mu_` scope | — |
+
   ## Main results
 
   - `reachable_safe` (`Inv`): proves inductively across all reachable registry
@@ -111,6 +126,7 @@ File aliases used in the source map below:
   | `reg.cc` | `RequestBlockRegistry::PurgeExpiredLifecycleLocked` | `:71-96` |
   | `reg.cc` | `RequestBlockRegistry::RetireLocked` | `:98-116` |
   | `reg.cc` | `RequestBlockRegistry::Register` | `:118-300` |
+  | `reg.cc` | `RequestBlockRegistry::Register` (`manifest = directory_->PoolManifestLocked(unit);`) | `:149` |
   | `reg.cc` | `RequestBlockRegistry::Register` (`registration.expires_at = now + ttl_s_;`) | `:263` |
   | `reg.cc` | `RequestBlockRegistry::Register` (`if (cancelled_.find(lifecycle_key) != cancelled_.end())`) | `:276-280` |
   | `reg.cc` | `RequestBlockRegistry::Register` (`if (claimed_.find(lifecycle_key) != claimed_.end())`) | `:281-285` |

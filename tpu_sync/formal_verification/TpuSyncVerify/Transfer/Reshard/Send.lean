@@ -37,7 +37,8 @@ into `active_pool_reshard_sends_`. It then calls
 (`++in_flight_; manager_ = &manager;`) and iterates over
 `plan_.transfer_pool_indices()`:
 * Pools whose group has no entries on this sender are skipped
-  (`if (entries.empty()) continue;`), matching `CountPoolReshardSendSlots`.
+  (`if (pool_src_block_ids.empty())`), matching `CountPoolReshardSendSlots`
+  (`if (it == peers_by_group.end()) continue;`).
 * For each active pool, `ExecutePush` acquires a per-UUID `PoolStagingLease`
   on the pool's storage (`AcquirePoolStagingLease`) and issues
   `base_->D2hPoolBlocks`. On synchronous failure of either step, it calls
@@ -77,7 +78,7 @@ is a `SendPool := ⟨peers, stage⟩`:
 | `.pending`    | not yet reached by the `ExecutePush` loop (`for (int32_t encoded_pool_idx : plan_.transfer_pool_indices())`) | `0` | `peers` |
 | `.d2h`        | `D2hPoolBlocks` succeeded (`++in_flight_`); `OnReady` not yet finished | `1`          | `peers`              |
 | `.pushing k`  | `StartPoolPush` added `peers` ops (`in_flight_ += static_cast<int>(transfers_by_peer.size());`) and released the D2H op; `k` peer `AsyncPush` callbacks remain in flight | `k` | `k` |
-| `.aborted`    | D2H failed or `StartPoolPush` returned early on `done_ \|\| finalizing_` | `0`                   | `0`                  |
+| `.aborted`    | D2H failed or `StartPoolPush` returned early on `done_ || finalizing_` | `0`                   | `0`                  |
 
 Session-level fields:
 
@@ -101,12 +102,57 @@ Session-level fields:
 | `cancel`           | external `Finish(error)`: deadline (`CompleteReadWithDetails`) or shutdown (`~KVCacheManagerWithTransfer`) |
 | `publish`          | `CompleteReadWithDetails` moves a settled session into `done_sending_` or `failed_recving_` and erases it |
 
+## Lock scopes
+
+Every mutable field of `ReshardSendSession` is `ABSL_GUARDED_BY(mu_)`;
+`base_`, `staging_allocator_`, `req_id_`, `uuid_`, `parallelism_`, `deadline_`,
+`plan_`, `dst_peers_`, and `data_connection_reuse_` are `const`.
+`ReshardSendSession::EndOp` is always at least two `mu_` scopes: the
+fallback-unregistration check
+(`if (in_flight_ == 1 && finalizing_ && !done_ && !plan_unregistered_`), then
+the `while (true)` decrement/settle scope — three under `kPerTransfer` when
+`release_due` holds (A4).
+
+| Event | `mu_` scopes | Between them |
+|---|---|---|
+| `d2hIssue p ok` | 1–5 in `ReshardSendSession::ExecutePush` (after unlocked `AcquirePoolStagingLease` and `D2hPoolBlocks`): on `ok = true`, 1 scope (`d2h_futures_.push_back(pool_future); ++in_flight_;`) before `pool_future.OnReady`; on `ok = false`, `RecordPushCompletion` (1 scope) and `EndOp()` (2–3 scopes) before returning early (`execActive = false`) | the caller op keeps `in_flight_ >= 1` throughout `ExecutePush`; no `done_ || finalizing_` re-check, below |
+| `execFinish` | 2–3: final `EndOp()` at the end of `ReshardSendSession::ExecutePush` | `EndOp` tail, below |
+| `d2hDone p ok` | 3–6 in `pool_future.OnReady`: on `ok = false` (or `transport_srv == nullptr`), `RecordPushCompletion` (1–2 scopes) + `absl::Cleanup` `EndOp()` (2–3 scopes); on `ok = true`, `StartPoolPush` checks `if (done_ || finalizing_) return;` on entry and again when adding `in_flight_ += static_cast<int>(transfers_by_peer.size());` (1–2 scopes, folded by A3), dispatches `AsyncPush` per peer outside `mu_`, and runs `EndOp()` (2–3 scopes) | the D2H op and (on `ok = true`) the added peer ops keep `in_flight_ >= 1` until `EndOp()`; `EndOp` tail, below |
+| `pushDone p ok` | 3–5 in `StartPoolPush`'s `AsyncPush(...).OnReady` callback: `RecordPushCompletion` (1–2 scopes) followed by `absl::Cleanup` `EndOp()` (2–3 scopes) | the peer op keeps `in_flight_ >= 1` until `EndOp()`; `EndOp` tail, below |
+| `cancel` | 1–2: `ReshardSendSession::Finish(error)`, called from `~KVCacheManagerWithTransfer` (1 scope) or after `!session->IsDraining() && session->deadline() <= now` in `CompleteReadWithDetails` (2 scopes) | `Finish` sets `status_ = status` if `!status.ok() && status_.ok()`, then returns if `done_ || finalizing_`, matching `cancel` |
+| `publish` | 2–3 in `CompleteReadWithDetails` (under manager `mu_`): `session->Done()` and `session->GetStatus()` (twice on failure) before `active_pool_reshard_sends_.erase(it++)` | on a settled session only `status_` can change if it was still OK |
+
+**Caller and callback ops hold `in_flight_ >= 1` until `EndOp()`.** Throughout
+`ExecutePush`, `StartPoolPush`, and `RecordPushCompletion`, the running caller
+or callback holds its own op in `in_flight_` (and `StartPoolPush` adds
+`transfers_by_peer.size()` before dropping `mu_` to call `AsyncPush` and
+`EndOp()`), so `done_` cannot become `true` before `EndOp()`'s decrement scope.
+
+**No re-check in `ExecutePush`'s loop.** `ExecutePush` does not check
+`done_ || finalizing_` before `AcquirePoolStagingLease`, `D2hPoolBlocks`, or
+`++in_flight_`. If an external `Finish(error)` or an earlier pool's
+`RecordPushCompletion` sets `finalizing_ = true` mid-loop, `ExecutePush`'s
+caller op keeps `in_flight_ >= 1` so `SettleLocked()` cannot release leases
+while `ExecutePush` is still acquiring them, and any D2H future queued after
+`finalizing_ = true` aborts at `StartPoolPush`'s entry check (`d2hDone p true`
+when draining).
+
+**`EndOp()` tail.** When `EndOp()` is the last op (`in_flight_ == 1 &&
+finalizing_ && !done_`), its pre-decrement scope sets `plan_unregistered_ = true`
+(to call `settle_manager->UnregisterActivePlan(uuid_)` outside `mu_`) and, under
+`kPerTransfer`, `connections_released_ = true` (A4). Because `finalizing_ == true`
+and `in_flight_ == 1` (owned by this `EndOp()` call), `execActive = false` and
+`poolOps = 0`: no other op can run, `publish` is disabled (`done_ == false`),
+and an interleaved `Finish(error)` only updates `status_` if it was still OK
+(matching `cancel` after `EndOp()`).
+
 ## Assumptions
 
 * **A1 (non-empty schedule with positive peer counts per active pool).**
   `ReshardSendSession::Create` rejects plans with `remaining_pool_peer_pushes <= 0`,
   and `ExecutePush` skips any pool whose group has no entries on this sender
-  (`if (entries.empty()) continue;`), matching `CountPoolReshardSendSlots`.
+  (`if (pool_src_block_ids.empty())`), matching `CountPoolReshardSendSlots`
+  (`if (it == peers_by_group.end()) continue;`).
   Modeled by `validPools (init peerCounts).pools = true` (`peerCounts ≠ []` and
   `∀ n ∈ peerCounts, 0 < n`).
 * **A2 (`ExecutePush` starts before external `Finish`).** `PoolReshardPush`
@@ -129,9 +175,10 @@ Session-level fields:
   `finalizing_` is already `true` and `in_flight_` is `1` (held by this caller),
   no other op is in flight (`execActive = false` and `poolOps = 0`), no new op
   can be started, and a concurrent `Finish(error)` on a session with
-  `finalizing_ == true` is a no-op, so the next loop iteration is guaranteed to
+  `finalizing_ == true` is a no-op on `in_flight_` and `done_` (it can only flip
+  `status_`, matching `cancel`), so the next loop iteration is guaranteed to
   reach `--in_flight_ == 0` and `SettleLocked()` with no observable change to
-  any modelled variable.
+  any other modelled variable.
 
 ## Properties
 
@@ -171,13 +218,17 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
+| `reshard_send.h` | `ReshardSendSession::Done` | `:67-70` |
+| `reshard_send.h` | `ReshardSendSession::GetStatus` | `:74-77` |
 | `reshard_send.h` | `ReshardSendSession::IsDraining` | `:81-84` |
+| `reshard_send.h` | `ReshardSendSession::deadline` | `:88` |
 | `reshard_send.h` | `ReshardSendSession` (`int remaining_pool_peer_pushes_` .. `bool connections_released_`) | `:138-151` |
 | `reshard_send.cc` | `ReshardSendSession::ValidatePlan` | `:52-90` |
 | `reshard_send.cc` | `ReshardSendSession::Create` | `:92-151` |
 | `reshard_send.cc` | `ReshardSendSession::ExecutePush` | `:177-265` |
 | `reshard_send.cc` | `ReshardSendSession::ExecutePush` (`manager_ = &manager;`) | `:183` |
 | `reshard_send.cc` | `ReshardSendSession::ExecutePush` (`for (int32_t encoded_pool_idx : plan_.transfer_pool_indices())`) | `:204-262` |
+| `reshard_send.cc` | `ReshardSendSession::ExecutePush` (`d2h_futures_.push_back(pool_future);` .. `++in_flight_;`) | `:250-251` |
 | `reshard_send.cc` | `ReshardSendSession::ExecutePush` (`pool_future.OnReady`) | `:253-261` |
 | `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:267-349` |
 | `reshard_send.cc` | `ReshardSendSession::StartPoolPush` (`in_flight_ += static_cast<int>(transfers_by_peer.size());`) | `:318` |
@@ -193,6 +244,7 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 | `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : active_pool_reshard_sends_)`) | `:410-414` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:664-701` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:741-778` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_sends_.begin();`) | `:1011-1030` |
 | `base.cc` | `KVCacheManagerBase::GetBlockChunks` | `:3235-3519` |
 | `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`if (schedule_it != schedules.end())`) | `:3414-3446` |

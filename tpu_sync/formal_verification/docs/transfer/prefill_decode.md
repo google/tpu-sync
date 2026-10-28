@@ -38,7 +38,7 @@ statement column is the one-line form, the module docstring has the exact one.
 | Termination | `Recv.NoOpLeak`, `Send.NoOpLeak`, `Pipeline.NoOpLeak`, `Recv.reachable_can_settle`, `Send.reachable_can_settle`, `Pipeline.reachable_can_settle` | Every unit of `in_flight_` has an enabled step that advances or retires it, and every reachable state drains to `done ∧ ¬hasStaging` and publishes. |
 | Per-side counters | `Recv.Publication`, `Send.Publication`, `Recv.ReadinessSound`, `Recv.SettleSafe`, `Send.SettleSafe`, `Send.NoUnderflow` | `done_recving → every H2D callback ran OK`; `done_sending → every push completed OK`; `IsReadyToComplete → ready = numLayers`; `done → inFlight = 0`; `EndSendOpLocked` never underflows. |
 | Transport accounting | `Transport.reachable_safe` (`OnceDispatched`, `NetworkSound`, `CompleteOnSuccess`) | With honest senders, `OnLayerReceived` fires once per layer, the block target is reached only after every layer was dispatched, and a successful receive copied every layer exactly once. |
-| Engine caller contract | `Caller.contract_safe`, `Caller.leakP_absorbing`, `Caller.leakD_absorbing` | A connector that forwards every publication leaks no held block on either node and never lets decode read unwritten KV; a missed publication is unrecoverable by any later engine action. |
+| Engine caller contract (single- and multi-worker) | `Caller.contract_safe`, `Caller.mw_contract_safe`, `Caller.leakP_absorbing`, `Caller.leakD_absorbing`, `Caller.mwLeakP_absorbing`, `Caller.mwLeakD_absorbing` | A connector that forwards every publication leaks no held block on either node, never frees HBM while a worker on that node is still in flight (`mwEarlyFree = false`), and never lets decode read unwritten KV, both for one worker and across workers aggregated by `KVOutputAggregator`; a missed publication is unrecoverable by any later engine action. |
 | Peer isolation and uuid tables | `PeerIsolation.tcp_healthy_blocked_when_pool_full`, `PeerIsolation.grpc_healthy_can_complete`, `PeerIsolation.reachable_quota_admits_healthy`, `UuidTable.reachable_inv` | On the blocking TCP control plane a wedged pull holds a `push_pool_` worker, so `poolSize` pulls to a sick peer stop every further handshake, healthy peers included; on the gRPC backend a waiting pull holds no worker and a healthy peer completes regardless; a per-peer staging quota always admits healthy peers. A uuid is refused until its draining incumbent has settled, so staging slots are conserved. |
 
 ## Modules
@@ -63,7 +63,7 @@ over the four shared buffers.
 | `PrefillDecode/BlockOrdering.lean` | within-layer blocks: `PopulateRegisteredBlocks`, `ValidateRequestedBlocksLocked`, `BuildCoalescedCopySpec`, `BuildLoadCopyPlan` (`remote_order` / `local_order`), custom host staging, `BlockPipeline` | `execCoalesced_buildCoalescedSpec`, `landStage_get_requested`, `h2dStage_get_requested`, `BlockPipeline.step_pipe`, `BlockPipeline.reachable_safe` |
 | `PrefillDecode/PipelineChecks.lean` | `Pipeline` / `multiSys` traces, `#guard` searches, mutants | `Pipeline.trace_normal`, `trace_layers_out_of_order`, `trace_pull_ahead_of_registration`, `trace_multi_request`, `trace_overlapped_requests` |
 | `PrefillDecode/Transport.lean` | `BlockTransport` receiver-side stream accounting (`layer_progress_`, chunk-count and sender-declared contracts, once-latch, retirement) feeding the receiver's block and layer counters; discharges `Receive` A1 and the A4 coarsening under one explicit assumption (honest senders) and shows what one extra stream does without it | `Transport.reachable_safe`, `trace_dup_chunk_publishes_missing_layer`, `trace_dup_after_retirement`, `trace_dup_declared_rejected`, bounded `searchHardened` |
-| `PrefillDecode/Caller.lean` | the engine above `poll_stats()` for the production caller pair (tpu-inference `tpu_raiden_connector.py` @ `7ed46a6` on vLLM `6185d73`): the worker-side connector as a `Connector` (the shipping one, the fix, two half-fixes) and the scheduler's block lifecycle under both `kv_load_failure_policy` values; the other direction of `Pipeline` A4 (`Contract`) | `Caller.contract_safe`, `fixed_contract`, `leakP_absorbing`, `leakD_absorbing`, `trace_current_connector_*`, `trace_naive_decodes`, `trace_loadErrorOnly_*`, exhaustive `search` per configuration |
+| `Transfer/Caller.lean` | the engine above `poll_stats()` shared by both transfer paths (tpu-inference `tpu_raiden_connector.py` @ `7ed46a6` and vllm-torchtpu `tpu_connector.py` @ `9725110` on vLLM `6185d73`): the worker-side connector as a `Connector` (the shipping prefill-decode one, the fix / Stage-3 reshard one, two half-fixes), `KVOutputAggregator` multi-worker counting (`MultiWorker.lean`), and the scheduler's block lifecycle under both `kv_load_failure_policy` values; the other direction of `Pipeline` A4 (`Contract`, `mwEarlyFree = false`) | `Caller.contract_safe`, `Caller.mw_contract_safe`, `fixed_contract`, `earlyLoadError_fail_eq_finish`, `earlyLoadError_fail_holds_blocks`, `leakP_absorbing`, `leakD_absorbing`, `mwLeakP_absorbing`, `mwLeakD_absorbing`, `trace_current_connector_*`, `trace_mw_current_partial_failure_leaks`, `trace_naive_decodes`, `trace_loadErrorOnly_*`, exhaustive `search` and `mwSearch` per configuration |
 
 ## Boundaries
 
@@ -80,8 +80,7 @@ registration (`NotifyForRead` / `register_read`), consumer pull and load
 
 Out of scope: pool resharding (`ReshardSendSession` / `ReshardReceiveSession`,
 `active_pool_reshard_{sends,recvs}_` in the same poll loop) — see
-[reshard.md](reshard.md); `RaidenController` — see
-[../controller/read_remote.md](../controller/read_remote.md); and
+[reshard.md](reshard.md); `RaidenController`; and
 `kv_cache_store` / `host_offload_backend`.
 
 ### Engine boundary (above `poll_stats()`)
@@ -94,19 +93,22 @@ recycle is `MultiRequest.lean` (`.recyclePrefill` only after the send is
 published, `.nextRequest` only after the receive is; `wroteReleased` catches a
 premature recycle). What the engine owes a publication is `Caller.lean`, for
 the production caller pair tpu-inference `tpu_raiden_connector.py` @ `7ed46a6`
-on vLLM `6185d73`: a connector that forwards every outcome and reports a failed
-receive on the load-failure channel leaks no held block and never decodes on
-unwritten KV (`Caller.contract_safe`); the shipping connector reports no
-failures and so leaks the blocks (`trace_current_connector_*`).
+on vLLM `6185d73` (both for a single worker and across workers aggregated by
+`KVOutputAggregator` in `Caller/MultiWorker.lean`): a connector that forwards
+every outcome and reports a failed receive on the load-failure channel never
+frees HBM while a worker on that node is still in flight (`mwEarlyFree = false`),
+leaks no held block, and never decodes on unwritten KV (`Caller.contract_safe`,
+`Caller.mw_contract_safe`); the shipping connector reports no failures and so
+leaks the blocks (`trace_current_connector_*`,
+`trace_mw_current_partial_failure_leaks`).
 
 Not modelled: the Python orchestration itself (bootstrap and proxy servers,
 scheduler queues, external block allocators, engine-side timeouts). An engine
 that frees HBM before `poll_stats()` publishes violates `Pipeline` A4, which
 `wroteReleased` makes visible. tpu-sync has no caller-invoked cancel on this
 path: a session ends only on its own deadline, a transport error, manager
-shutdown or plan unregister. `Caller.lean` leaves out (its B1–B3) the
-multi-worker `KVOutputAggregator`, partial-prefix load failures, and
-preemption, prefix caching and chunked prefill.
+shutdown or plan unregister. `Caller.lean` leaves out (its B2–B3) partial-prefix
+load failures and preemption, prefix caching and chunked prefill.
 
 ### Transport boundary (below the session callbacks)
 
@@ -148,6 +150,7 @@ control flow, or an external contract.
 | Pipeline A1 — whole-layer cells | A layer moves as one unit. | Discharged: `BlockOrdering.BlockPipeline.step_pipe` (lockstep simulation over blocks). |
 | Pipeline A2 — delivery after the push callback | The model lands a layer at or after its push callback; C++ lands it before the ack. Sound because the push pins staging. | Soundness argument in `Pipeline.lean`. |
 | Transport A1–A4 — one lock, contract latched by the first stream, uniform declaration, honest senders | `Transport.lean` §Assumptions. | Stated there; A2 rests on controller-side ordering outside this repository, A4 is the one the C++ does not enforce and the traces drop. |
+| Caller B1–B3 — multi-worker `KVOutputAggregator` threshold (`expectedP = 2`, `expectedD = 2`), whole-transfer failure, no preemption/prefix caching/chunked prefill | `Caller.lean` §Assumptions. | B1's `KVOutputAggregator` combining step is modelled directly in `Caller/MultiWorker.lean` (`mw_contract_safe`, `applyRecv_staggered_eq_batch`; `trace_mw_overcounted_expected_leaks` shows what breaks when `get_finished_count()` exceeds participating workers); B2 matches single-outcome `CompleteReadWithDetails` publication; B3 does not change which event frees a transfer-held block. |
 
 ## Shipping C++ vs. modelled design alternatives
 
@@ -249,7 +252,7 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `mgr.cc` | `KVCacheManagerWithTransfer::RegisterActivePlan` | `:553-641` | `PrefillDecode/UuidTable.lean`, `PrefillDecode/Receive.lean` | `UuidTable.Ev.registerRecv`, Receive A2 | `UuidTable.reachable_inv` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::RegisterRecv` | `:643-662` | `PrefillDecode/UuidTable.lean`, `PrefillDecode/Receive.lean` | `UuidTable.Ev.registerRecv` | `UuidTable.reachable_inv` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:874-978` | `PrefillDecode/UuidTable.lean`, `PrefillDecode/PeerIsolation.lean`, `PrefillDecode/Receive.lean` | `UuidTable.Ev.startRead`, `PeerIsolation.Ev.startRead peer` | `UuidTable.trace_duplicate_receive_different_req_id`, `UuidTable.trace_repeated_receive_same_req_id_idempotent` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:980-1121` | `PrefillDecode/Send.lean`, `PrefillDecode/Receive.lean`, `PrefillDecode/Pipeline.lean`, `PrefillDecode/UuidTable.lean` | `cancel`, `pollReady`, `publish`, `sweepSend`, `sweepRecv` | `Send.trace_deadline_during_copy`, `Recv.trace_deadline_during_copy`, `Pipeline.PrefillHbmSafe`, `Pipeline.DecodeHbmSafe`, `Pipeline.StagingSafe` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:980-1121` | `PrefillDecode/Send.lean`, `PrefillDecode/Receive.lean`, `PrefillDecode/Pipeline.lean`, `PrefillDecode/UuidTable.lean`, `Transfer/Caller.lean` | `cancel`, `pollReady`, `publish`, `sweepSend`, `sweepRecv`, `Caller.Ev.pOutcome`, `Caller.Ev.dOutcome` | `Send.trace_deadline_during_copy`, `Recv.trace_deadline_during_copy`, `Pipeline.PrefillHbmSafe`, `Pipeline.DecodeHbmSafe`, `Pipeline.StagingSafe`, `Caller.contract_safe` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadRaw` | `:1124-1129` | `PrefillDecode/Receive.lean` | `CompleteReadRaw` wrapper around `CompleteReadWithDetails` | `Recv.ReadinessSound` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` | `:1260-1386` | `PrefillDecode/Pipeline.lean`, `PrefillDecode/PipelineChecks.lean`, `PrefillDecode/Send.lean` | `Pipeline.Ev.pullWait`, `Send.Ev.beginPull`, `Send.Ev.cancel` | `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe`, `Pipeline.trace_pull_ahead_of_registration`, `Pipeline.trace_unregistered_pull_rejected`, `Send.trace_pull_spawn_failure_cleanup` |
 | `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2700-2717` | `PrefillDecode/Transport.lean` | sender-declared vs. chunk-count contract | `Transport.trace_chunk_two_senders`, `Transport.trace_dup_declared_rejected` |
@@ -275,14 +278,20 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `grpc_control_plane_backend.cc` | `GrpcControlPlaneBackend::SendPullRequest` | `:306-334` | `PrefillDecode/PeerIsolation.lean` | `Backend.grpcAsync` | `PeerIsolation.grpc_healthy_can_complete`, `PeerIsolation.reachable_quota_admits_healthy` |
 <!-- source-map:end -->
 
-*External, the production caller pair (`PrefillDecode/Caller.lean`):*
-tpu-inference `tpu_inference/distributed/tpu_raiden_connector.py` @ `7ed46a6`
-and vLLM `vllm/v1/core/sched/scheduler.py` @ `6185d73` (`TPUConnectorWorker.get_finished`,
-`get_block_ids_with_load_errors`, `request_finished`, `update_state_after_alloc`;
+*External, the production caller pair (`Transfer/Caller.lean`):*
+tpu-inference `tpu_inference/distributed/tpu_raiden_connector.py` @ `7ed46a6`,
+vLLM `vllm/distributed/kv_transfer/kv_connector/utils.py`, and
+vLLM `vllm/v1/core/sched/scheduler.py` @ `6185d73` (`TPUConnectorWorker.get_finished`,
+`get_block_ids_with_load_errors`, `request_finished`, `update_state_after_alloc`,
+`get_finished_count`; `KVOutputAggregator.aggregate`;
 scheduler `_handle_invalid_blocks`, `_update_from_kv_xfer_finished`,
 `finish_requests`, `_update_waiting_for_remote_kv`, `kv_load_failure_policy`) →
-`Caller.contract_safe`, `Caller.leakP_absorbing`, `Caller.leakD_absorbing`,
-`trace_current_connector_*`, `trace_naive_decodes`, `trace_loadErrorOnly_*`, `trace_fixed_*`.
+`Caller.contract_safe`, `Caller.mw_contract_safe`,
+`Caller.applyRecv_staggered_eq_batch`, `Caller.leakP_absorbing`,
+`Caller.leakD_absorbing`, `Caller.mwLeakP_absorbing`, `Caller.mwLeakD_absorbing`,
+`trace_current_connector_*`, `trace_mw_current_partial_failure_leaks`,
+`trace_naive_decodes`, `trace_loadErrorOnly_*`, `trace_fixed_*`,
+`trace_mw_staggered_*`, `trace_mw_overcounted_expected_leaks`.
 
 ## Where the rest lives
 

@@ -22,8 +22,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <future>  // NOLINT(build/c++11)
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -48,7 +50,9 @@
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -79,6 +83,15 @@
 namespace tpu_raiden {
 namespace kv_cache {
 namespace {
+
+constexpr int64_t kHostMemorySampleIntervalNs = 5'000'000'000LL;
+
+// Last Unix timestamp in nanoseconds when `host_memory_breakdown_bytes` was
+// sampled, used to throttle periodic refreshes on transfer paths.
+static_assert(std::atomic<int64_t>::is_always_lock_free,
+              "std::atomic<int64_t> must be lock-free");
+std::atomic<int64_t> g_last_host_mem_sample_ns{
+    std::numeric_limits<int64_t>::min()};
 
 absl::Status ValidateOffsetsAndSizes(const std::vector<int64_t>& src_offsets,
                                      const std::vector<int64_t>& dst_offsets,
@@ -344,6 +357,105 @@ double ComputeDmaTransferTimeMs(absl::string_view dma_metric,
   return std::max(0.0, absl::ToDoubleMilliseconds(end_time - effective_start));
 }
 
+void RecordStorageBytes(absl::Span<const std::string> shard_local_ranks,
+                        absl::string_view direction, uint64_t bytes_per_shard) {
+  if (bytes_per_shard == 0 || shard_local_ranks.empty()) {
+    return;
+  }
+  telemetry::RaidenMetricStore& store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) {
+    return;
+  }
+  for (absl::string_view local_rank : shard_local_ranks) {
+    const telemetry::MetricLabel labels[] = {
+        {telemetry::metric_labels::kDirection, direction},
+        {telemetry::metric_labels::kLocalRank, local_rank}};
+    store.IncrementCounter(telemetry::metric_names::kStorageBytesTotal, labels,
+                           bytes_per_shard);
+  }
+}
+
+// Samples `/proc/meminfo` (or `meminfo_path`) and updates the
+// `host_memory_breakdown_bytes` gauge across `kv_pool`, `process_heap`,
+// `page_cache`, and `free` on the primary local worker (`local_rank == "0"`).
+void UpdateHostMemoryBreakdownMetrics(
+    const KVCacheManagerBase& manager, size_t kv_pool_bytes,
+    absl::string_view meminfo_path = "/proc/meminfo") {
+  if (!telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+    return;
+  }
+  const absl::Span<const std::string> shard_ranks = manager.shard_local_ranks();
+  if (!shard_ranks.empty() && shard_ranks.front() != "0") {
+    return;
+  }
+  std::ifstream file{std::string(meminfo_path)};
+  if (!file.is_open()) {
+    return;
+  }
+  const std::string content((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+  const std::optional<HostMemoryBreakdown> breakdown =
+      ParseHostMemoryBreakdown(content, kv_pool_bytes);
+  if (!breakdown.has_value()) {
+    return;
+  }
+  auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  static constexpr telemetry::MetricLabel kKvPoolLabel[] = {
+      {telemetry::metric_labels::kComponent,
+       telemetry::metric_labels::kComponentKvPool}};
+  static constexpr telemetry::MetricLabel kProcessHeapLabel[] = {
+      {telemetry::metric_labels::kComponent,
+       telemetry::metric_labels::kComponentProcessHeap}};
+  static constexpr telemetry::MetricLabel kPageCacheLabel[] = {
+      {telemetry::metric_labels::kComponent,
+       telemetry::metric_labels::kComponentPageCache}};
+  static constexpr telemetry::MetricLabel kFreeLabel[] = {
+      {telemetry::metric_labels::kComponent,
+       telemetry::metric_labels::kComponentFree}};
+
+  store.SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                 kKvPoolLabel, static_cast<double>(breakdown->kv_pool_bytes));
+  store.SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                 kProcessHeapLabel,
+                 static_cast<double>(breakdown->process_heap_bytes));
+  store.SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                 kPageCacheLabel,
+                 static_cast<double>(breakdown->page_cache_bytes));
+  store.SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes, kFreeLabel,
+                 static_cast<double>(breakdown->free_bytes));
+}
+
+// Throttled wrapper around `UpdateHostMemoryBreakdownMetrics` that samples
+// `/proc/meminfo` at most once every `kHostMemorySampleIntervalNs` (5s).
+// TODO: Replace periodic timestamp-throttled sampling on the transfer path
+// with scrape-time collection or event-driven updates once all telemetry
+// backends support pull callbacks.
+void MaybeUpdateHostMemoryBreakdownMetrics(
+    const KVCacheManagerBase& manager, int64_t now_ns,
+    absl::string_view meminfo_path = "/proc/meminfo") {
+  if (!telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+    return;
+  }
+  const absl::Span<const std::string> shard_ranks = manager.shard_local_ranks();
+  if (!shard_ranks.empty() && shard_ranks.front() != "0") {
+    return;
+  }
+  int64_t last_ns = g_last_host_mem_sample_ns.load(std::memory_order_relaxed);
+  if (last_ns != std::numeric_limits<int64_t>::min() &&
+      (now_ns <= last_ns ||
+       static_cast<uint64_t>(now_ns) - static_cast<uint64_t>(last_ns) <
+           static_cast<uint64_t>(kHostMemorySampleIntervalNs))) {
+    return;
+  }
+  if (!g_last_host_mem_sample_ns.compare_exchange_strong(
+          last_ns, now_ns, std::memory_order_relaxed)) {
+    return;
+  }
+  UpdateHostMemoryBreakdownMetrics(manager, manager.GetAllocatedHostDramBytes(),
+                                   meminfo_path);
+}
+
 // Joins the given PjRtCopyFutures and records transfer latency and per-device
 // bytes transferred if telemetry is enabled.
 raiden::PjRtCopyFuture JoinAndRecordTelemetry(
@@ -357,6 +469,7 @@ raiden::PjRtCopyFuture JoinAndRecordTelemetry(
       futures.empty()) {
     return joined_future;
   }
+  MaybeUpdateHostMemoryBreakdownMetrics(manager, absl::ToUnixNanos(start_time));
 
   const size_t num_shards = manager.num_shards();
   const size_t start_shard = single_shard_idx.value_or(0);
@@ -3694,12 +3807,80 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2h(
                          /*host_layer_idx=*/std::nullopt, target_shard_idx);
 }
 
+std::optional<HostMemoryBreakdown> ParseHostMemoryBreakdown(
+    absl::string_view meminfo_content, uint64_t kv_pool_bytes) {
+  std::optional<uint64_t> mem_free_kb;
+  uint64_t buffers_kb = 0;
+  std::optional<uint64_t> cached_kb;
+  std::optional<uint64_t> anon_pages_kb;
+
+  const auto parse_kb = [](absl::string_view rest, uint64_t* out) -> bool {
+    rest = absl::StripLeadingAsciiWhitespace(rest);
+    const size_t token_end = rest.find_first_of(" \t");
+    const absl::string_view num_str =
+        token_end == absl::string_view::npos ? rest : rest.substr(0, token_end);
+    return absl::SimpleAtoi(num_str, out);
+  };
+
+  for (absl::string_view line :
+       absl::StrSplit(meminfo_content, '\n', absl::SkipEmpty())) {
+    line = absl::StripAsciiWhitespace(line);
+    uint64_t val_kb = 0;
+    if (absl::ConsumePrefix(&line, "MemFree:")) {
+      if (!parse_kb(line, &val_kb)) return std::nullopt;
+      mem_free_kb = val_kb;
+    } else if (absl::ConsumePrefix(&line, "Buffers:")) {
+      if (!parse_kb(line, &val_kb)) return std::nullopt;
+      buffers_kb = val_kb;
+    } else if (absl::ConsumePrefix(&line, "Cached:")) {
+      if (!parse_kb(line, &val_kb)) return std::nullopt;
+      cached_kb = val_kb;
+    } else if (absl::ConsumePrefix(&line, "AnonPages:")) {
+      if (!parse_kb(line, &val_kb)) return std::nullopt;
+      anon_pages_kb = val_kb;
+    }
+  }
+
+  if (!mem_free_kb.has_value() || !cached_kb.has_value() ||
+      !anon_pages_kb.has_value()) {
+    return std::nullopt;
+  }
+
+  constexpr uint64_t kBytesPerKiB = 1024ULL;
+  auto kib_to_bytes = [](uint64_t kib) -> uint64_t {
+    if (kib > std::numeric_limits<uint64_t>::max() / kBytesPerKiB) {
+      return std::numeric_limits<uint64_t>::max();
+    }
+    return kib * kBytesPerKiB;
+  };
+
+  const uint64_t free_bytes = kib_to_bytes(*mem_free_kb);
+  const uint64_t buffers_bytes = kib_to_bytes(buffers_kb);
+  const uint64_t cached_bytes = kib_to_bytes(*cached_kb);
+  const uint64_t page_cache_bytes =
+      buffers_bytes > std::numeric_limits<uint64_t>::max() - cached_bytes
+          ? std::numeric_limits<uint64_t>::max()
+          : buffers_bytes + cached_bytes;
+  const uint64_t anon_bytes = kib_to_bytes(*anon_pages_kb);
+  const uint64_t process_heap_bytes =
+      anon_bytes > kv_pool_bytes ? anon_bytes - kv_pool_bytes : 0ULL;
+
+  return HostMemoryBreakdown{
+      .kv_pool_bytes = kv_pool_bytes,
+      .process_heap_bytes = process_heap_bytes,
+      .page_cache_bytes = page_cache_bytes,
+      .free_bytes = free_bytes,
+  };
+}
+
 size_t KVCacheManagerBase::GetAllocatedHostDramBytes() const {
   absl::MutexLock lock(allocated_host_dram_bytes_mu_);
   return allocated_host_dram_bytes_;
 }
 
 void KVCacheManagerBase::UpdateAllocatedOccupancyMetric() const {
+  g_last_host_mem_sample_ns.store(absl::GetCurrentTimeNanos(),
+                                  std::memory_order_relaxed);
   if (!telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
     return;
   }
@@ -3707,6 +3888,7 @@ void KVCacheManagerBase::UpdateAllocatedOccupancyMetric() const {
   telemetry::RaidenMetricStore::GetGlobalMetricStore().SetGauge(
       telemetry::metric_names::kBufferAllocatedBytes, {},
       static_cast<double>(total_host_dram));
+  UpdateHostMemoryBreakdownMetrics(*this, total_host_dram);
 }
 
 std::shared_ptr<backends::KVBackend> KVCacheManagerBase::GetKVBackend(
@@ -3857,11 +4039,33 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
           for (const auto& s : slices) {
             total_bytes += s.size;
           }
-          backend->WriteAsync(key, slices, total_bytes,
-                              [state](absl::Status s) {
-                                if (!s.ok()) state->SetError(s);
-                                state->MarkChunkComplete();
-                              });
+          const uint64_t bytes_per_shard =
+              num_shards_ > 0 ? static_cast<uint64_t>(total_bytes / num_shards_)
+                              : 0;
+          std::vector<std::string> shard_local_ranks;
+          if (bytes_per_shard > 0 &&
+              telemetry::RaidenMetricStore::GetGlobalMetricStore()
+                  .HasBackends()) {
+            const absl::Span<const std::string> ranks =
+                this->shard_local_ranks();
+            const size_t active_shards = std::min(num_shards_, ranks.size());
+            shard_local_ranks.assign(ranks.begin(),
+                                     ranks.begin() + active_shards);
+          }
+          backend->WriteAsync(
+              key, slices, total_bytes,
+              [state, bytes_per_shard,
+               shard_local_ranks =
+                   std::move(shard_local_ranks)](absl::Status s) {
+                if (!s.ok()) {
+                  state->SetError(s);
+                } else {
+                  RecordStorageBytes(shard_local_ranks,
+                                     telemetry::metric_labels::kDirectionWrite,
+                                     bytes_per_shard);
+                }
+                state->MarkChunkComplete();
+              });
         });
   }
   return raiden::PjRtCopyFuture(std::move(aggregate_future),
@@ -3914,16 +4118,29 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
     for (const auto& s : slices) {
       total_bytes += s.size;
     }
+    const uint64_t bytes_per_shard =
+        num_shards_ > 0 ? static_cast<uint64_t>(total_bytes / num_shards_) : 0;
+    std::vector<std::string> shard_local_ranks;
+    if (bytes_per_shard > 0 &&
+        telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+      const absl::Span<const std::string> ranks = this->shard_local_ranks();
+      const size_t active_shards = std::min(num_shards_, ranks.size());
+      shard_local_ranks.assign(ranks.begin(), ranks.begin() + active_shards);
+    }
 
     backend->ReadAsync(
         key, slices, total_bytes,
-        [this, state, staging_block_idx,
-         device_block_idx](absl::Status read_status) {
+        [this, state, staging_block_idx, device_block_idx, bytes_per_shard,
+         shard_local_ranks =
+             std::move(shard_local_ranks)](absl::Status read_status) {
           if (!read_status.ok()) {
             state->SetError(read_status);
             state->MarkChunkComplete();
             return;
           }
+          RecordStorageBytes(shard_local_ranks,
+                             telemetry::metric_labels::kDirectionRead,
+                             bytes_per_shard);
           auto h2d_fut_or = H2d({staging_block_idx}, {device_block_idx}, {1});
           if (!h2d_fut_or.ok()) {
             state->SetError(h2d_fut_or.status());

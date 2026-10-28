@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>  // NOLINT
 #include <cstddef>
@@ -20,6 +22,7 @@
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <functional>
 #include <ios>
 #include <memory>
 #include <optional>
@@ -41,6 +44,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
+#include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
@@ -1740,6 +1744,11 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramTelemetry) {
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
                testing::IsEmpty(), testing::DoubleEq(2048.0)))
       .Times(testing::AtLeast(1));
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
+               testing::_, testing::Ge(0.0)))
+      .Times(testing::AnyNumber());
 
   TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/2,
                              /*slice_byte_size=*/128,
@@ -1752,6 +1761,12 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
   auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
   telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
   telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
+               testing::_, testing::Ge(0.0)))
+      .Times(testing::AnyNumber());
 
   // Initial gauge set in constructor (2 * 2 * 4 * 128 = 2048 bytes).
   EXPECT_CALL(
@@ -1789,6 +1804,108 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
                testing::IsEmpty(), testing::DoubleEq(3072.0)))
       .Times(1);
   manager.UpdateAllocatedOccupancyMetric();
+}
+
+TEST(KVCacheManagerTest, ParseHostMemoryBreakdownComputesComponentsAndClamps) {
+  constexpr absl::string_view kSyntheticMeminfo = R"(
+MemTotal:       16384000 kB
+MemFree:         4096000 kB
+MemAvailable:    6144000 kB
+Buffers:          512000 kB
+Cached:          2048000 kB
+AnonPages:       3072000 kB
+)";
+  constexpr uint64_t kKvPoolBytes = 1024ULL * 1024ULL * 1024ULL;  // 1 GiB
+  const std::optional<HostMemoryBreakdown> breakdown =
+      ParseHostMemoryBreakdown(kSyntheticMeminfo, kKvPoolBytes);
+  ASSERT_TRUE(breakdown.has_value());
+  EXPECT_EQ(breakdown->kv_pool_bytes, kKvPoolBytes);
+  EXPECT_EQ(breakdown->process_heap_bytes, 3072000ULL * 1024ULL - kKvPoolBytes);
+  EXPECT_EQ(breakdown->page_cache_bytes, (512000ULL + 2048000ULL) * 1024ULL);
+  EXPECT_EQ(breakdown->free_bytes, 4096000ULL * 1024ULL);
+
+  // When kv_pool_bytes exceeds AnonPages (e.g. shared memory backed pool),
+  // process_heap_bytes is clamped to 0.
+  const std::optional<HostMemoryBreakdown> clamped =
+      ParseHostMemoryBreakdown(kSyntheticMeminfo, 4000000ULL * 1024ULL);
+  ASSERT_TRUE(clamped.has_value());
+  EXPECT_EQ(clamped->kv_pool_bytes, 4000000ULL * 1024ULL);
+  EXPECT_EQ(clamped->process_heap_bytes, 0ULL);
+
+  // Missing required fields or malformed numbers return std::nullopt.
+  EXPECT_FALSE(ParseHostMemoryBreakdown("MemFree: 100 kB\nCached: 200 kB\n", 0)
+                   .has_value());
+  EXPECT_FALSE(
+      ParseHostMemoryBreakdown(
+          "MemFree: invalid kB\nCached: 200 kB\nAnonPages: 300 kB\n", 0)
+          .has_value());
+  EXPECT_FALSE(ParseHostMemoryBreakdown("", 0).has_value());
+}
+
+auto HostMemoryComponentLabel(absl::string_view component) {
+  return testing::ElementsAre(testing::FieldsAre(
+      telemetry::metric_labels::kComponent, std::string(component)));
+}
+
+TEST(KVCacheManagerTest, AllocatedOccupancyMetricEmitsHostMemoryBreakdown) {
+  ScopedUnsetLocalRank unset_local_rank;
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/2,
+                             /*slice_byte_size=*/128, /*host_blocks=*/4);
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               testing::IsEmpty(), testing::DoubleEq(2048.0)));
+  EXPECT_CALL(*raw_mock,
+              SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                       HostMemoryComponentLabel(
+                           telemetry::metric_labels::kComponentKvPool),
+                       testing::DoubleEq(2048.0)));
+  EXPECT_CALL(*raw_mock,
+              SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                       HostMemoryComponentLabel(
+                           telemetry::metric_labels::kComponentProcessHeap),
+                       testing::Ge(0.0)));
+  EXPECT_CALL(*raw_mock,
+              SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                       HostMemoryComponentLabel(
+                           telemetry::metric_labels::kComponentPageCache),
+                       testing::Ge(0.0)));
+  EXPECT_CALL(*raw_mock,
+              SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                       HostMemoryComponentLabel(
+                           telemetry::metric_labels::kComponentFree),
+                       testing::Ge(0.0)));
+
+  manager.UpdateAllocatedOccupancyMetric();
+}
+
+TEST(KVCacheManagerTest, HostMemoryBreakdownMetricsSkippedOnNonZeroLocalRank) {
+  ScopedUnsetLocalRank restore_local_rank;
+  setenv(telemetry::kLocalRankEnvVar, "1", 1);
+
+  TestKVCacheManager worker1_mgr(/*num_layers=*/1, /*num_shards=*/1,
+                                 /*slice_byte_size=*/128, /*host_blocks=*/4);
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               testing::IsEmpty(), testing::DoubleEq(512.0)));
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
+               testing::_, testing::_))
+      .Times(0);
+
+  worker1_mgr.UpdateAllocatedOccupancyMetric();
 }
 
 // ===========================================================================
@@ -2549,6 +2666,176 @@ TEST(KVCacheManagerTest, SingleLayerDispatchWithBoundedStagingSucceeds) {
   EXPECT_EQ(std::vector<uint8_t>(host_ptr,
                                  host_ptr + BoundedStagingTestRig::kBlockBytes),
             std::vector<uint8_t>(BoundedStagingTestRig::kBlockBytes, 0xB1));
+}
+
+class ConfigurableFakeKVBackend : public backends::KVBackend {
+ public:
+  explicit ConfigurableFakeKVBackend(
+      absl::Status write_status = absl::OkStatus(),
+      absl::Status read_status = absl::OkStatus())
+      : write_status_(std::move(write_status)),
+        read_status_(std::move(read_status)) {}
+
+  std::string name() const override { return "fake"; }
+
+  void WriteAsync(const backends::BlockKey&,
+                  absl::Span<const backends::HostBufferDescriptor>, size_t,
+                  std::function<void(absl::Status)> callback) override {
+    callback(write_status_);
+  }
+
+  void ReadAsync(const backends::BlockKey&,
+                 absl::Span<const backends::HostBufferDescriptor>, size_t,
+                 std::function<void(absl::Status)> callback) override {
+    callback(read_status_);
+  }
+
+  void BatchExistsAsync(absl::Span<const backends::BlockKey> keys,
+                        std::function<void(std::vector<absl::StatusOr<bool>>)>
+                            callback) override {
+    callback(std::vector<absl::StatusOr<bool>>(keys.size(), true));
+  }
+
+ private:
+  absl::Status write_status_;
+  absl::Status read_status_;
+};
+
+auto StorageBytesLabels(absl::string_view direction,
+                        absl::string_view local_rank) {
+  return testing::ElementsAre(
+      testing::FieldsAre(telemetry::metric_labels::kDirection,
+                         std::string(direction)),
+      testing::FieldsAre(telemetry::metric_labels::kLocalRank,
+                         std::string(local_rank)));
+}
+
+TEST(KVCacheManagerTest,
+     D2hWriteToBackendAndH2dReadFromBackendEmitStorageBytesTotal) {
+  ScopedEnvVar restore_local_rank(telemetry::kLocalRankEnvVar, "3");
+
+  // 2 layers * 128 bytes/slice = 256 bytes per shard per block.
+  // For multi_shard_mgr (2 shards), each block has 512 total bytes across both
+  // shards (256 bytes for shard 0 and 256 bytes for shard 1).
+  TestKVCacheManager single_shard_mgr(/*num_layers=*/2, /*num_shards=*/1,
+                                      /*slice_byte_size=*/128,
+                                      /*host_blocks=*/2);
+  TestKVCacheManager multi_shard_mgr(/*num_layers=*/2, /*num_shards=*/2,
+                                     /*slice_byte_size=*/128,
+                                     /*host_blocks=*/2);
+
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(testing::Ne(telemetry::metric_names::kStorageBytesTotal),
+                       testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  // 2 blocks transferred: each block increments per-shard bytes (256), never
+  // total_bytes (512) per shard.
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(
+          telemetry::metric_names::kStorageBytesTotal,
+          StorageBytesLabels(telemetry::metric_labels::kDirectionWrite, "3"),
+          256))
+      .Times(2);
+  EXPECT_CALL(*raw_mock, IncrementCounter(
+                             telemetry::metric_names::kStorageBytesTotal,
+                             StorageBytesLabels(
+                                 telemetry::metric_labels::kDirectionRead, "3"),
+                             256))
+      .Times(2);
+
+  for (absl::string_view rank : {"0", "1"}) {
+    EXPECT_CALL(
+        *raw_mock,
+        IncrementCounter(
+            telemetry::metric_names::kStorageBytesTotal,
+            StorageBytesLabels(telemetry::metric_labels::kDirectionWrite, rank),
+            256))
+        .Times(2);
+    EXPECT_CALL(
+        *raw_mock,
+        IncrementCounter(
+            telemetry::metric_names::kStorageBytesTotal,
+            StorageBytesLabels(telemetry::metric_labels::kDirectionRead, rank),
+            256))
+        .Times(2);
+  }
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  auto fake_backend = std::make_shared<ConfigurableFakeKVBackend>();
+
+  const std::vector<backends::BlockKey> keys = {
+      {.block_hash = "k0", .resolved_key = "/tmp/k0"},
+      {.block_hash = "k1", .resolved_key = "/tmp/k1"}};
+  const std::vector<int64_t> block_ids = {0, 1};
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture single_write,
+                       single_shard_mgr.D2hWriteToBackend(
+                           {fake_backend}, keys, block_ids, block_ids));
+  ABSL_EXPECT_OK(single_write.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture single_read,
+                       single_shard_mgr.H2dReadFromBackend(
+                           {fake_backend}, keys, block_ids, block_ids));
+  ABSL_EXPECT_OK(single_read.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture multi_write,
+                       multi_shard_mgr.D2hWriteToBackend({fake_backend}, keys,
+                                                         block_ids, block_ids));
+  ABSL_EXPECT_OK(multi_write.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture multi_read,
+                       multi_shard_mgr.H2dReadFromBackend(
+                           {fake_backend}, keys, block_ids, block_ids));
+  ABSL_EXPECT_OK(multi_read.Await());
+}
+
+TEST(KVCacheManagerTest,
+     FailedStorageWriteOrReadDoesNotIncrementStorageBytesTotal) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/2,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(testing::Ne(telemetry::metric_names::kStorageBytesTotal),
+                       testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(telemetry::metric_names::kStorageBytesTotal,
+                               testing::_, testing::_))
+      .Times(0);
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  auto fail_backend = std::make_shared<ConfigurableFakeKVBackend>(
+      absl::UnavailableError("simulated storage write failure"),
+      absl::NotFoundError("simulated storage read failure"));
+
+  const std::vector<backends::BlockKey> keys = {
+      {.block_hash = "fail0", .resolved_key = "/tmp/fail0"},
+      {.block_hash = "fail1", .resolved_key = "/tmp/fail1"}};
+  const std::vector<int64_t> block_ids = {0, 1};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture write_fail,
+      manager.D2hWriteToBackend({fail_backend}, keys, block_ids, block_ids));
+  EXPECT_THAT(write_fail.Await(), StatusIs(absl::StatusCode::kUnavailable));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture read_fail,
+      manager.H2dReadFromBackend({fail_backend}, keys, block_ids, block_ids));
+  EXPECT_THAT(read_fail.Await(), StatusIs(absl::StatusCode::kNotFound));
 }
 
 }  // namespace

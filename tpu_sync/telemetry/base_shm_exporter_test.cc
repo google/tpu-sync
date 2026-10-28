@@ -424,6 +424,14 @@ TEST_F(BaseShmExporterTest, SetGaugeLabelHandlingAndCapacity) {
       MetricLabel{.key = metric_labels::kLocalRank, .value = "99"}};
   exporter.SetGauge("custom_rank_gauge", custom_rank_labels, 30.0);
 
+  // 2b. Caller provides dp_rank (store-level gauge) -> does not inject
+  // local_rank even when options.local_rank is set.
+  constexpr std::array<MetricLabel, 2> dp_rank_labels = {
+      MetricLabel{.key = metric_labels::kHostIp, .value = "10.0.0.1"},
+      MetricLabel{.key = metric_labels::kDpRank, .value = "0"},
+  };
+  exporter.SetGauge("dp_rank_gauge", dp_rank_labels, 64.0);
+
   // 3. Pre-sorted 8-label set (capacity boundary: 8 -> 9 slots, sorted
   // insertion).
   const std::string expected = "a=1;b=2;c=3;d=4;local_rank=2;m=5;n=6;y=7;z=8";
@@ -446,6 +454,10 @@ TEST_F(BaseShmExporterTest, SetGaugeLabelHandlingAndCapacity) {
   EXPECT_DOUBLE_EQ(metrics.gauges["empty_label_gauge"]["local_rank=2"], 10.0);
   EXPECT_DOUBLE_EQ(metrics.gauges["custom_rank_gauge"]["local_rank=99"], 30.0);
   EXPECT_FALSE(metrics.gauges["custom_rank_gauge"].contains("local_rank=2"));
+  EXPECT_DOUBLE_EQ(
+      metrics.gauges["dp_rank_gauge"]["dp_rank=0;host_ip=10.0.0.1"], 64.0);
+  EXPECT_FALSE(metrics.gauges["dp_rank_gauge"].contains(
+      "dp_rank=0;host_ip=10.0.0.1;local_rank=2"));
   EXPECT_DOUBLE_EQ(metrics.gauges["sorted_gauge"][expected], 42.0);
   EXPECT_DOUBLE_EQ(metrics.gauges["unsorted_gauge"][expected], 42.0);
 }

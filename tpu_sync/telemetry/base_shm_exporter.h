@@ -61,8 +61,8 @@ class BaseShmExporter : public MetricsBackend {
   void IncrementCounter(absl::string_view name, LabelSpan labels,
                         uint64_t val) const override;
   // Records a gauge value. Automatically attaches the "local_rank" label for
-  // worker processes (when options.local_rank is set) unless already present in
-  // caller labels.
+  // worker processes (when options.local_rank is set) unless "local_rank" or
+  // "dp_rank" is already present in caller labels.
   void SetGauge(absl::string_view name, LabelSpan labels,
                 double val) const override;
   // Records a histogram observation. Safe for concurrent execution across

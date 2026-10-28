@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 
 struct ifaddrs;
@@ -91,6 +92,19 @@ struct HostNicAddress {
 // node and classification.
 std::vector<HostNicAddress> GetLocalHostNicAddresses(
     absl::string_view sysfs_root = "/sys");
+
+// Returns the process-wide cached list of local host NIC addresses.
+const std::vector<HostNicAddress>& GetCachedLocalHostNicAddresses();
+
+// Selects the primary host IP from `nics`: first kDataPlane NIC with a
+// non-empty ip_address, else first kControlPlane NIC with a non-empty
+// ip_address, else first NIC with a non-empty ip_address, else `fallback`.
+std::string SelectPrimaryHostIp(absl::Span<const HostNicAddress> nics,
+                                absl::string_view fallback = "unknown");
+
+// Returns the process-wide cached primary host IP via
+// SelectPrimaryHostIp(GetCachedLocalHostNicAddresses()).
+const std::string& GetLocalHostPrimaryIp();
 
 namespace internal {
 std::vector<HostNicAddress> GetLocalHostNicAddressesInternal(

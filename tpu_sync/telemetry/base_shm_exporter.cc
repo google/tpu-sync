@@ -99,7 +99,8 @@ void BaseShmExporter::SetGauge(absl::string_view name, LabelSpan labels,
     return;
   }
   if (absl::c_any_of(labels, [](const MetricLabel& label) {
-        return label.key == metric_labels::kLocalRank;
+        return label.key == metric_labels::kLocalRank ||
+               label.key == metric_labels::kDpRank;
       })) {
     shm_writer_.SetGauge(name, labels, val);
     return;

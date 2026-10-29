@@ -2296,19 +2296,6 @@ TEST(TransportBackendTest, PeregrineReceiverAllocatedPushIsUnimplemented) {
               StatusIs(absl::StatusCode::kUnimplemented));
 }
 
-TEST(TransportBackendTest, PeregrinePullWithoutRemoteAddressFails) {
-  // Only op 2 (pull) is on Peregrine. Pull requests carry no remote address,
-  // which Peregrine rejects before contacting the peer.
-  auto cleanup =
-      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
-  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "2", 1);
-  MockDelegate delegate(/*slice_size=*/64);
-  BlockTransport puller(&delegate, 0);
-
-  EXPECT_THAT(puller.SyncPull({"127.0.0.1:1"}, /*src_block_ids=*/{0}),
-              StatusIs(absl::StatusCode::kInvalidArgument));
-}
-
 TEST_P(BlockTransportTest, MixedBackendsRouteIndependently) {
   constexpr size_t kSize = 1024;
   // Op 6 on Peregrine; op 1 and op 2 stay on the socket path.

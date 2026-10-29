@@ -714,6 +714,16 @@ cc_library(
 )
 
 cc_library(
+    name = "kv_cache_telemetry",
+    hdrs = ["kv_cache_telemetry.h"],
+    deps = [
+        "//tpu_sync/telemetry:metrics_api",
+        "//tpu_sync/telemetry:metrics_backend",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_library(
     name = "host_offload_backend",
     srcs = ["host_offload_backend.cc"],
     hdrs = ["host_offload_backend.h"],
@@ -724,6 +734,7 @@ cc_library(
         ":kv_cache_store_backend",
         ":kv_cache_store_backend_factory",
         ":kv_cache_store_client",
+        ":kv_cache_telemetry",
         ":lru_cache",
         "//tpu_sync/common:raiden_id",
         "//tpu_sync/core:buffer",
@@ -733,6 +744,7 @@ cc_library(
         "//tpu_sync/proto:kv_cache_store_service_cc_proto",
         "//tpu_sync/proto:worker_service_cc_proto",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/telemetry:metrics_backend",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/base:nullability",
@@ -924,6 +936,7 @@ cc_library(
         ":kv_cache_store_backend_factory",
         ":kv_cache_store_client",
         ":kv_cache_store_server",
+        ":kv_cache_telemetry",
         ":lru_cache",
         ":store_monitor",
         "//tpu_sync/common:raiden_id",
@@ -935,6 +948,7 @@ cc_library(
         "//tpu_sync/kv_cache/global_registry:global_registry_client_cc",
         "//tpu_sync/kv_cache/reshard:reshard_service",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/telemetry:metrics_backend",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
@@ -973,6 +987,7 @@ cc_test(
         ":kv_cache_store_backend",
         ":kv_cache_store_backend_factory",
         ":kv_cache_store_client",
+        ":kv_cache_store_server",
         "//tpu_sync/common:raiden_id",
         "//tpu_sync/core:kv_manager_holder",
         "//tpu_sync/core:raiden_transfer_endpoint",
@@ -986,6 +1001,8 @@ cc_test(
         "//tpu_sync/kv_cache/global_registry:global_registry_server_lib",
         "//tpu_sync/kv_cache/global_registry:test_util",
         "//tpu_sync/proto:kv_cache_store_service_cc_grpc",
+        "//tpu_sync/telemetry:metrics_backend",
+        "//tpu_sync/telemetry:mock_metrics_backend",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/base:log_severity",

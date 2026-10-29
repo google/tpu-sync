@@ -202,6 +202,24 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   bool InsertAdmitStrict(absl::Span<const std::string> block_hashes,
                          absl::Span<const RaidenBlockId> slices);
 
+  // Settle a recall batch: count `block_hashes` in `kv_recall_blocks_total`
+  // under `tier` (outcome `ok` for Done), then mark them in `load_tracker`.
+  void MarkRecallDone(BlockTracker* absl_nonnull load_tracker,
+                      absl::string_view tier,
+                      absl::Span<const std::string> block_hashes) const;
+  void MarkRecallFailed(BlockTracker* absl_nonnull load_tracker,
+                        absl::string_view tier, absl::string_view outcome,
+                        absl::Span<const std::string> block_hashes) const;
+
+  void MarkSaveDone(BlockTracker* absl_nonnull save_tracker,
+                    absl::string_view tier,
+                    absl::Span<const std::string> block_hashes) const;
+  void MarkSaveFailed(BlockTracker* absl_nonnull save_tracker,
+                      absl::string_view tier,
+                      absl::Span<const std::string> block_hashes) const;
+  void IncrementSaveBlocks(absl::string_view tier, absl::string_view outcome,
+                           uint64_t count) const;
+
   // INVARIANT: no thread holds `mutex_` across a registry RPC. Every call site
   // unlocks first, and nothing enforces that but their shape. The synchronous
   // Register and Unregister are Await() on a promise a gRPC callback thread
@@ -215,6 +233,8 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   // BackendConfig.kv_pool_group.
   const std::string kv_pool_group_;
   controller::RaidenController* raiden_controller_ = nullptr;
+  // Configured at construction, immutable afterwards.
+  const std::string dp_rank_str_;
 
   std::shared_ptr<global_registry::GlobalRegistryClient> registry_client_
       ABSL_GUARDED_BY(mutex_);

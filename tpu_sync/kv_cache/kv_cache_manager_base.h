@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -89,6 +90,26 @@ namespace kv_cache {
 // Defined in kv_cache_store_backend_factory.h. Forward-declared so that this
 // widely-included header does not also drag in the backend registration macro.
 struct BackendConfig;
+
+// Host DRAM memory breakdown in bytes across the four components tracked by
+// `tpu_raiden_host_memory_breakdown_bytes`:
+//   - kv_pool_bytes: bytes allocated to the Raiden host DRAM KV pool.
+//   - process_heap_bytes: non-KV-pool anonymous/heap memory (`AnonPages` minus
+//     `kv_pool_bytes`, clamped to >= 0).
+//   - page_cache_bytes: OS file-backed page cache (`Buffers + Cached`).
+//   - free_bytes: free host DRAM (`MemFree`).
+struct HostMemoryBreakdown {
+  uint64_t kv_pool_bytes = 0;
+  uint64_t process_heap_bytes = 0;
+  uint64_t page_cache_bytes = 0;
+  uint64_t free_bytes = 0;
+};
+
+// Parses `/proc/meminfo` text content and computes the 4-component host DRAM
+// breakdown given `kv_pool_bytes`. Returns `std::nullopt` if required fields
+// (`MemFree`, `Cached`, `AnonPages`) are missing or malformed.
+std::optional<HostMemoryBreakdown> ParseHostMemoryBreakdown(
+    absl::string_view meminfo_content, uint64_t kv_pool_bytes);
 
 struct KVCacheCopySpec {
   std::vector<int64_t> src_offsets;
@@ -809,6 +830,21 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Returns the total number of bytes allocated in host DRAM.
   size_t GetAllocatedHostDramBytes() const;
 
+  // Samples `/proc/meminfo` (or `meminfo_path`) and updates the
+  // `host_memory_breakdown_bytes` gauge across `kv_pool`, `process_heap`,
+  // `page_cache`, and `free` on the primary local worker (`local_rank == "0"`).
+  void UpdateHostMemoryBreakdownMetrics(
+      size_t kv_pool_bytes,
+      absl::string_view meminfo_path = "/proc/meminfo") const;
+
+  // Throttled wrapper around `UpdateHostMemoryBreakdownMetrics` that samples
+  // `/proc/meminfo` at most once every `kHostMemorySampleIntervalNs` (5s).
+  // TODO: Replace periodic timestamp-throttled sampling on the transfer path
+  // with scrape-time collection or event-driven updates once all telemetry
+  // backends support pull callbacks.
+  void MaybeUpdateHostMemoryBreakdownMetrics(
+      int64_t now_ns, absl::string_view meminfo_path = "/proc/meminfo") const;
+
   // Synchronous on-chip H2D offload (bypasses background worker thread queue).
   // |host_layer_idx| is the host layer buffer the copy reads; it requires a
   // single |layer_idx| and defaults to that device layer's own host buffer.
@@ -1125,6 +1161,13 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Running total of allocated host DRAM bytes.
   size_t allocated_host_dram_bytes_
       ABSL_GUARDED_BY(allocated_host_dram_bytes_mu_) = 0;
+
+  // Last Unix timestamp in nanoseconds when `host_memory_breakdown_bytes` was
+  // sampled, used to throttle periodic refreshes on transfer paths.
+  static_assert(std::atomic<int64_t>::is_always_lock_free,
+                "std::atomic<int64_t> must be lock-free");
+  mutable std::atomic<int64_t> last_host_mem_sample_ns_{
+      std::numeric_limits<int64_t>::min()};
 
   // Initializes background worker thread if RAIDEN_ENABLE_ASYNC_DISPATCH is
   // enabled.

@@ -96,6 +96,11 @@ inline constexpr absl::string_view kD2hTransferTimeMs = "d2h_transfer_time_ms";
 inline constexpr absl::string_view kD2hDmaTimeMs = "d2h_dma_time_ms";
 inline constexpr absl::string_view kBufferAllocatedBytes =
     "buffer_allocated_bytes";
+inline constexpr absl::string_view kStorageBytesTotal = "storage_bytes_total";
+inline constexpr absl::string_view kHostMemoryBreakdownBytes =
+    "host_memory_breakdown_bytes";
+inline constexpr absl::string_view kHostNumaMemoryBytes =
+    "host_numa_memory_bytes";
 
 inline constexpr absl::string_view kWeightSyncSentBytesTotal =
     "weight_sync_sent_bytes_total";
@@ -149,6 +154,11 @@ inline constexpr absl::string_view kP2pTransferTimeMs =
 inline constexpr absl::string_view kBufferAllocatedBytes =
     "Current host DRAM buffer capacity allocated in bytes for KV cache staging "
     "across all layers and shards.";
+inline constexpr absl::string_view kHostMemoryBreakdownBytes =
+    "Host DRAM memory breakdown in bytes by component (kv_pool, process_heap, "
+    "page_cache, free)";
+inline constexpr absl::string_view kHostNumaMemoryBytes =
+    "Per-NUMA-node host DRAM memory in bytes by state (used, free, total)";
 
 inline constexpr absl::string_view kH2dBytesTotal =
     "Cumulative bytes requested for Host DRAM to Device HBM transfers that "
@@ -166,6 +176,8 @@ inline constexpr absl::string_view kD2hTransferTimeMs =
 inline constexpr absl::string_view kD2hDmaTimeMs =
     "Non-overlapping Device-to-Host PCIe DMA wire transfer duration in "
     "milliseconds.";
+inline constexpr absl::string_view kStorageBytesTotal =
+    "Total bytes read from or written to secondary storage";
 
 inline constexpr absl::string_view kWeightSyncSentBytesTotal =
     "Total count of bytes sent over TPU Raiden weight sync interfaces.";
@@ -220,6 +232,16 @@ inline constexpr absl::string_view kSrcIp = "src_ip";
 inline constexpr absl::string_view kDstIp = "dst_ip";
 inline constexpr absl::string_view kUnknownIp = "unknown";
 inline constexpr absl::string_view kHostIp = "host_ip";
+inline constexpr absl::string_view kComponent = "component";
+inline constexpr absl::string_view kComponentKvPool = "kv_pool";
+inline constexpr absl::string_view kComponentProcessHeap = "process_heap";
+inline constexpr absl::string_view kComponentPageCache = "page_cache";
+inline constexpr absl::string_view kComponentFree = "free";
+inline constexpr absl::string_view kNumaNode = "numa_node";
+inline constexpr absl::string_view kState = "state";
+inline constexpr absl::string_view kStateUsed = "used";
+inline constexpr absl::string_view kStateFree = "free";
+inline constexpr absl::string_view kStateTotal = "total";
 
 inline constexpr absl::string_view kDirectionLabels[] = {kDirection};
 inline constexpr absl::string_view kSentBytesLabels[] = {kDirection, kSrcIp,
@@ -230,15 +252,23 @@ inline constexpr absl::string_view kP2pTransferTimeLabels[] = {kSrcIp, kDstIp,
                                                                kLocalRank};
 inline constexpr absl::string_view kPcieTransferLabels[] = {kHostIp,
                                                             kLocalRank};
+inline constexpr absl::string_view kStorageBytesLabels[] = {kLocalRank,
+                                                            kDirection};
+inline constexpr absl::string_view kHostMemoryBreakdownLabels[] = {kComponent};
+inline constexpr absl::string_view kHostNumaMemoryLabels[] = {kNumaNode,
+                                                              kState};
 
 }  // namespace metric_labels
 
 namespace metric_metadata {
 
 using metric_labels::kDirectionLabels;
+using metric_labels::kHostMemoryBreakdownLabels;
+using metric_labels::kHostNumaMemoryLabels;
 using metric_labels::kP2pTransferTimeLabels;
 using metric_labels::kPcieTransferLabels;
 using metric_labels::kSentBytesLabels;
+using metric_labels::kStorageBytesLabels;
 using metric_labels::kTransferFailuresLabels;
 
 inline constexpr MetricMetadata kSentBytesTotal{
@@ -309,6 +339,23 @@ inline constexpr MetricMetadata kBufferAllocatedBytes{
     .description = metric_descriptions::kBufferAllocatedBytes,
     .type = MetricType::kGauge};
 
+inline constexpr MetricMetadata kStorageBytesTotal{
+    .name = metric_names::kStorageBytesTotal,
+    .description = metric_descriptions::kStorageBytesTotal,
+    .type = MetricType::kCounter,
+    .label_names = kStorageBytesLabels};
+
+inline constexpr MetricMetadata kHostMemoryBreakdownBytes{
+    .name = metric_names::kHostMemoryBreakdownBytes,
+    .description = metric_descriptions::kHostMemoryBreakdownBytes,
+    .type = MetricType::kGauge,
+    .label_names = kHostMemoryBreakdownLabels};
+
+inline constexpr MetricMetadata kHostNumaMemoryBytes{
+    .name = metric_names::kHostNumaMemoryBytes,
+    .description = metric_descriptions::kHostNumaMemoryBytes,
+    .type = MetricType::kGauge,
+    .label_names = kHostNumaMemoryLabels};
 inline constexpr MetricMetadata kWeightSyncSentBytesTotal{
     .name = metric_names::kWeightSyncSentBytesTotal,
     .description = metric_descriptions::kWeightSyncSentBytesTotal,
@@ -418,6 +465,9 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kPeregrineRequestSizeBytes,
     kPeregrineBytesTotal,
     kPeregrineErrorsTotal,
+    kStorageBytesTotal,
+    kHostMemoryBreakdownBytes,
+    kHostNumaMemoryBytes,
 };
 }  // namespace metric_metadata
 

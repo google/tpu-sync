@@ -30,6 +30,8 @@ statement column is the one-line form, the module docstring has the exact one.
 | Property | Theorems | Statement |
 |---|---|---|
 | Publication correctness and aliased-page rank-wave safety | `Pipeline.reachable_safe`, `Pipeline.reachable_unarmed_safe` (`PublicationCorrect`, `AliasedPageCorrect`), `Pipeline.attention_safe`, `Recv.RankWaveOrder` (`rankWaveOrder_iff`) | No pool is queued, issued, or completed for H2D while any strictly lower-rank pool is not yet `completed`, so lower-rank H2D waves never clobber completed higher-rank pool bytes on shared hybrid-model device pages; when `poll_stats()` publishes `done_recving`, `dstHbm = good numPools` and stays invariant afterwards. |
+| Data correctness and post-publication safety across transfers | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe`, `Pipeline.system_unarmed_data_correct`, `Pipeline.system_unarmed_attention_safe` | In any reachable state of `multiSys` or `multiSysUnarmed` (concurrent, overlapped and recycled reshard transfers), no transfer ever writes any of its four buffers after releasing them (`wroteReleased = false`) or reads from recycled `srcHbm`, `srcStaging`, or `dstStaging`; whenever a transfer publishes `done_recving`, its `dstHbm` holds `good ranks.length` and stays equal to `good ranks.length` across every subsequent transition of any transfer. |
+| Progress across transfers | `Pipeline.system_progress`, `Pipeline.system_unarmed_progress` | From any reachable multi-transfer state (`multiSys` or `multiSysUnarmed`), any transfer can settle, release both staging leases to `PoolStagingStorage`, and publish both outcomes (`HandedOff`) in finitely many steps, enabling both `.recycleSrc` and `.nextRequest`. |
 | Sub-block byte-interval coverage and reconstruction | `Coverage.partition_reconstructs_block`, `Coverage.partition_reconstructs_perm`, `CoveragePipeline.step_pipe`, `CoveragePipeline.reachable_safe` | Any sub-block interval set accepted by `ValidateReceiverCoverage` forms a complete disjoint partition of `[0, extent)` and reconstructs `good extent` under every stream arrival permutation. |
 | Multi-sender stream count conservation | `Coverage.stream_count_matches`, `Coverage.senderStreams_pos_iff`, `Pipeline.StreamAccountingSafe` | For every pool group, the receiver's `expected_pushes` validated by `ValidateReceiverCoverage` equals $\sum_s \min(\text{parallelism}, |\text{pairs}_s|)$; a sender with zero scheduled pairs opens zero streams; and `OnPoolReceived(p)` fires only after all `expected_pushes` streams for pool `p` have landed. |
 | Destination and source HBM quietness | `Pipeline.DstHbmSafe`, `Pipeline.dstHbm_quiet`, `Pipeline.SrcHbmSafe`, `Pipeline.srcHbm_quiet` | Once the receive is published no H2D copy is pending or unretired (`dstHbm` never changes afterwards); once the send is published no D2H copy is pending or unretired (`srcHbm` may be reclaimed). |
@@ -38,6 +40,7 @@ statement column is the one-line form, the module docstring has the exact one.
 | Sender slot conservation and active-until-finalizing invariant | `Send.reachable_safe` (`ActiveOrDraining`, `Publication`) | While `!finalizing_`, `remaining_pool_peer_pushes_` equals $\sum_p \text{remainingSlots}_p$, and `ExecutePush`'s caller op keeps `0 < inFlight` until `finalizing_` is latched; `done_sending` requires every active pool to have completed all peer pushes. |
 | Deferred plan unregistration and poll-finish equivalence | `Recv.PlanIntegrity`, `Recv.reachable_pollReady_disabled`, `Send.PlanIntegrity`, `Send.reachable_onSettle_plan_iff_done` | On the receiver, `(planUnregistered → done) ∧ (published ≠ none → planUnregistered)` and `IsReadyToComplete() && !IsDraining()` is disabled in every reachable state because `FinishPoolH2d` sets `network_completed_` and calls `Finish` in the same step; on the sender, `done → planUnregistered` under both policies, strengthened to `planUnregistered = done` under `UnregisterPolicy.onSettle`. |
 | Two-phase Arm-then-Dispatch barrier and producer block registry | `Coordinator.reachable_coord_inv`, `Coordinator.no_push_before_all_armed`, `Coordinator.claimed_while_arming`, `Coordinator.reachable_disarmAndAbandon_no_orphans`, `Pipeline.NoUnarmedPush`, `Registry.reachable_safe`, `Registry.tombstone_blocks_register_and_claim`, `Registry.claimed_blocks_register_and_cancel`, `Registry.abandonClaim_preserves_when_other_owner_present`, `Registry.complete_retires_iff_all_claimed_voted`, `Registry.purgeExpiredAll_inv` | No sender is dispatched and no stream lands until every destination unit has armed its `ReshardReceiveSession`; producer blocks remain claimed in `RequestBlockRegistry` throughout arming, blocking `CancelIfUnclaimed` and duplicate `Register`; abandoning one owner's claim preserves sibling owners' claims; `Complete` retires a generation iff every claimed source unit has voted; and cancelling an unclaimed generation leaves a tombstone blocking late registration and claims. |
+| Engine caller contract above `poll_stats()` (single- and multi-worker) | `Caller.contract_safe`, `Caller.mw_contract_safe`, `Caller.fixed_contract`, `Caller.earlyLoadError_fail_eq_finish`, `Caller.earlyLoadError_fail_holds_blocks`, `Caller.leakP_absorbing`, `Caller.leakD_absorbing`, `Caller.mwLeakP_absorbing`, `Caller.mwLeakD_absorbing` | A connector that forwards every publication (`connectorFixed`, matching `vllm-torchtpu`'s Stage-3 `tpu_connector.py`) never frees HBM while any worker on that node is still in flight (`mwEarlyFree = false`), leaks no held block on either node, and never lets decode read unwritten KV, both for a single worker and across workers aggregated by `KVOutputAggregator`; staging `invalid_block_ids` early on an uncertain post-arm RPC error under `Policy.fail` defers the block free until the native receiver settles (`dHeld = true`). |
 
 ## Modules
 
@@ -56,10 +59,12 @@ and `PoolStagingLease` lifecycles.
 | `Reshard/Receive.lean` | One `ReshardReceiveSession` + manager poll/unregister hooks: static plan/pool validation (`validPlan`, `validPlanPoolsAndBlocks`), rank-gated `CollectEligiblePoolH2dsLocked`, batch `in_flight_ += to_launch.size()`, `ExecuteEligiblePoolH2ds` (`draining_` early exit), `FinishPoolH2d`, `TakePendingUnregister`, `PushEndPolicy` (`finishOnError` vs. `endOpOnly`) | `Recv.reachable_safe` (`SettleSafe`, `NoRetiredCallback`, `StagingIntegrity`, `PlanIntegrity`, `SettlesPromptly`, `RankWaveOrder`, `ReadinessSound`, `Publication`, `NoOpLeak`), `Recv.rankWaveOrder_iff`, `Recv.reachable_pollReady_disabled`, `Recv.reachable_can_settle` |
 | `Reshard/Send.lean` | One `ReshardSendSession` (`CountPoolReshardSendSlots`): per-pool D2H (`ExecutePush`), per-peer `StartPoolPush`, `remaining_pool_peer_pushes_` conservation, `UnregisterPolicy` (`shipping` vs. `onSettle`) | `Send.reachable_safe` (`SettleSafe`, `NoRetiredCallback`, `StagingIntegrity`, `SettlesPromptly`, `ActiveOrDraining`, `PlanIntegrity`, `Publication`, `NoOpLeak`), `Send.reachable_onSettle_plan_iff_done`, `Send.reachable_can_settle` |
 | `Reshard/Pipeline.lean` | Single reshard transfer: `Send` + `Recv` + per-pool `BlockTransport` stream counters + five pool-indexed memories + aliased-page `writePoolHbm` (`clobberHigherRanks`) + Arm-then-Dispatch barrier (`init` vs. `initUnarmed`) | `Pipeline.reachable_safe`, `Pipeline.reachable_unarmed_safe` (`PublicationCorrect`, `AliasedPageCorrect`, `DstHbmSafe`, `SrcHbmSafe`, `StagingSafe`, `StreamAccountingSafe`, `NoUnarmedPush`, `NoOpLeak`), `Pipeline.attention_safe`, `Pipeline.dstHbm_quiet`, `Pipeline.srcHbm_quiet`, `Pipeline.reachable_can_settle`, `Pipeline.reachable_unarmed_can_settle` |
+| `Reshard/MultiRequest.lean` | `multiSys` and `multiSysUnarmed`: concurrent and overlapped reshard transfers (`recycleSrc`, `nextRequest`), per-buffer write-after-release checks (`wroteReleased`), and post-publication HBM safety across transfers | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe`, `Pipeline.system_progress`, `Pipeline.system_unarmed_data_correct`, `Pipeline.system_unarmed_attention_safe`, `Pipeline.system_unarmed_progress`, `Pipeline.trace_multi_request`, `Pipeline.trace_overlapped_requests`, `Pipeline.trace_unarmed_multi_request`, `Pipeline.trace_mutant_write_after_release_corrupts_all` |
 | `Reshard/Coverage.lean` | Multi-sender stream count conservation (`Σ_s min(parallelism, \|pairs_s\|) = expected_pushes`), `DefaultTransferStreams` (`TPU_RAIDEN_TRANSFER_STREAMS`), `ValidateReceiverCoverage` interval-partition completeness, and byte-level refinement `CoveragePipeline` over `Pipeline` | `Coverage.stream_count_matches`, `Coverage.senderStreams_pos_iff`, `Coverage.partition_reconstructs_block`, `Coverage.partition_reconstructs_perm`, `CoveragePipeline.step_pipe`, `CoveragePipeline.reachable_safe` |
 | `Reshard/PoolStaging.lean` | `PoolStagingStorage` bounded slot arena, per-`(storage, uuid)` lease idempotency & cross-UUID disjointness, and receive registration order (`RegistrationPolicy.reserveBeforeLease` vs. the `.leaseBeforeReserve` mutant) | `PoolStaging.acquireLease_idempotent`, `PoolStaging.no_slot_aliasing_between_distinct_uuids`, `PoolStaging.allocateMissing_slot_sum`, `PoolStaging.reachable_reserveBeforeLease_safe`, `PoolStaging.trace_duplicate_uuid_frees_survivor_lease_and_aliases_slot`, `PoolStaging.trace_pool_staging_recv_registration_tests` |
 | `Reshard/Registry.lean` | `RequestBlockRegistry` generation lifecycle: per-unit `Register`, multi-owner `LookupAndClaim`, `AbandonClaim`, full-set `Complete` voting, `CancelIfUnclaimed` tombstones, and TTL expiration (`purgeExpiredAll` vs. split `purgeExpiredRequestBlocks`) | `Registry.reachable_safe`, `Registry.tombstone_blocks_register_and_claim`, `Registry.claimed_blocks_register_and_cancel`, `Registry.abandonClaim_preserves_when_other_owner_present`, `Registry.complete_retires_iff_all_claimed_voted`, `Registry.purgeExpiredAll_inv`, `Registry.trace_single_stage_votes_retire_multi_owner_claim`, `Registry.trace_split_ttl_purges_request_blocks_while_claim_active` |
 | `Reshard/Coordinator.lean` | Two-stage `ReshardCoordinator::ExecutePoolReshard` composed with `RequestBlockRegistry` and per-destination receiver sessions (`CleanupPolicy.shipping` vs. `disarmAndAbandonOnFailure`) | `Coordinator.reachable_coord_inv`, `Coordinator.no_push_before_all_armed`, `Coordinator.claimed_while_arming`, `Coordinator.reachable_disarmAndAbandon_no_orphans`, `Coordinator.trace_partial_arm_orphans_armed_receiver`, `Coordinator.trace_dispatch_failure_orphans_receivers_and_claim` |
+| `Transfer/Caller.lean` | Serving engine above `poll_stats()` shared with `PrefillDecode` (`vllm-torchtpu` `tpu_connector.py` @ `9725110` and `tpu-inference` `tpu_raiden_connector.py` @ `7ed46a6` on vLLM `6185d73`): `connectorFixed` models Stage-3 reshard outcome forwarding, `MultiWorker.lean` models `KVOutputAggregator` across worker ranks, and `earlyLoadError_fail_holds_blocks` models `_stage3_fail_uncertain_loads_early` | `Caller.contract_safe`, `Caller.mw_contract_safe`, `Caller.fixed_contract`, `Caller.earlyLoadError_fail_eq_finish`, `Caller.earlyLoadError_fail_holds_blocks`, `Caller.leakP_absorbing`, `Caller.leakD_absorbing`, `Caller.mwLeakP_absorbing`, `Caller.mwLeakD_absorbing`, `Caller.trace_mw_staggered_*` |
 
 ## Boundaries
 
@@ -88,10 +93,25 @@ Modelled: the `RequestBlockRegistry` and `ReshardCoordinator` two-stage
 protocol — producer block registration (`Register`), multi-owner
 `LookupAndClaim`, `CancelIfUnclaimed` tombstones, Stage 1 destination arming
 (`PoolReshardRegisterRecv`), Stage 2 sender dispatch (`PoolReshardPush`),
-per-unit `Complete` voting, and `CompleteReadWithDetails` (`poll_stats()`)
-outcome publication.
+per-unit `Complete` voting, `CompleteReadWithDetails` (`poll_stats()`) outcome
+publication, and the connector/scheduler block lifecycle above `poll_stats()`
+(`Transfer/Caller.lean`: when the engine may recycle is `.recycleSrc` /
+`.nextRequest` in `Reshard/MultiRequest.lean`; what the engine owes a
+publication is `Caller.Contract`, satisfied by `connectorFixed` for
+`vllm-torchtpu`'s Stage-3 connector both for a single worker and across
+workers aggregated by `KVOutputAggregator` in `Caller/MultiWorker.lean`,
+including its early `invalid_block_ids` path
+`_stage3_fail_uncertain_loads_early` via `earlyLoadError_fail_holds_blocks`
+and `mw_earlyLoadError_fail_holds_blocks`).
 
-Not modelled: external Python serving-engine scheduling above `ReshardService`,
+Not modelled: Python submit-worker threading and topology-admission tables in
+the external connector above `ReshardService`, partial-prefix load failures and
+preemption/prefix caching (`Caller` B2–B3), disjointness of destination device
+pages across concurrent transfers (`MultiRequest` A1: all pools sharing a
+`storage_index` use a uniform `block_stride_bytes` in `ConfigurePoolStaging` so
+blocks $b \neq b'$ occupy disjoint device byte ranges $[b \cdot S, (b+1) \cdot S)$,
+and the engine's unified `[0, num_blocks)` block pool hands out distinct
+uncached `dst_device_block_ids` across all cache groups to concurrent transfers),
 and disjointness of source and destination units (`src_units ∩ dst_units = ∅`),
 which is treated as a caller/planner precondition (`BuildStartTransferForTarget`
 sets `is_sender = true` when a unit appears in both lists, which
@@ -121,6 +141,8 @@ the full statements and arguments are in the module docstrings.
 
 | Assumption | One-line statement | Status |
 |---|---|---|
+| Pipeline / MultiRequest engine contract | Destination reads `dstHbm` only after `done_recving`; producer reclaims `srcHbm` only after transfer settlement. | External contract; encoded as the guards of `.recycleSrc` / `.nextRequest` in `Reshard/MultiRequest.lean`. The other direction is `Transfer/Caller.lean`. |
+| MultiRequest A1 — cross-transfer destination page disjointness | Destination device pages (`dstHbm`) of distinct concurrent transfers are disjoint, guaranteed by the allocator. | All pools sharing a `storage_index` have a uniform `block_stride_bytes` and `num_blocks` (`ConfigurePoolStaging`) and fit inside `[b * stride, (b + 1) * stride)` (`PoolSpec::Validate(storage_bytes)` when `storage_bytes = num_blocks * stride`, and the caller's manifest builder), so blocks $b \neq b'$ never overlap in device bytes; the engine's unified `[0, num_blocks)` block pool hands out distinct uncached `dst_device_block_ids` across all cache groups to concurrent transfers, and host arena slots are disjoint across `uuid`s (`PoolStaging.no_slot_aliasing_between_distinct_uuids`). |
 | Receive A1 — at-most-once `OnPoolReceived` per declared pool | `CompleteIncomingPush` fires `OnPoolReceived(l, uuid)` only when `plan_pushes == expected_chunks`, and `RecordPoolReceivedLocked` rejects undeclared or duplicate pool indices. | Discharged: `Pipeline.StreamAccountingSafe`, `Coverage.stream_count_matches`, `CoveragePipeline.step_pipe`. |
 | Receive A2 — registration before visibility | `RegisterActivePlanDirect` and `AcquireStagingLeases` in `ReshardReceiveSession::Create` succeed before insertion into `active_pool_reshard_recvs_`, rolling back both on failure. | Discharged: `PoolStaging.reachable_reserveBeforeLease_safe`, `Coordinator.no_push_before_all_armed`. |
 | Receive A3 / Send A3 — no double end and single `StartPoolPush` lock step | Each admitted push and each H2D/D2H op ends at most once; `StartPoolPush`'s two `done_ \|\| finalizing_` checks inspect only immutable plan fields in between and fold into `d2hDone`. | C++ callback and control-flow discipline. |
@@ -128,6 +150,7 @@ the full statements and arguments are in the module docstrings.
 | Send A1 — non-empty schedule with positive peer counts per active pool | `ReshardSendSession::Create` rejects `remaining_pool_peer_pushes <= 0`, and `ExecutePush` skips pools with zero scheduled entries on this sender, matching `CountPoolReshardSendSlots`. | Discharged: `Coverage.senderStreams_pos_iff`, `Send.validPools`. |
 | Send A2 — `ExecutePush` starts before external `Finish` | `PoolReshardPush` inserts the session into `active_pool_reshard_sends_` and immediately invokes `ExecutePush`, which takes its caller op (`++in_flight_`). | C++ init discipline (`KVCacheManagerWithTransfer::PoolReshardPush`). |
 | Send A4 — per-transfer connection-release window in `EndOp` | Under `DataConnectionReuse::kPerTransfer`, the last op (`in_flight_ == 1 && finalizing_`) drops `mu_` in `EndOp` to call `ReleaseDataConnectionsAfterSend` before `--in_flight_` and `SettleLocked()`; nothing modelled changes in the window. | Soundness argument in `Send.lean`. |
+| Caller B1–B3 — multi-worker `KVOutputAggregator` threshold (`expectedP = 2`, `expectedD = 2`), whole-transfer failure, no preemption/prefix caching | `Transfer/Caller.lean` §Assumptions. | B1's `KVOutputAggregator` combining step is modelled directly in `Caller/MultiWorker.lean` (`mw_contract_safe`, `applyRecv_staggered_eq_batch`, `mw_earlyLoadError_fail_holds_blocks`; enforced across TP ranks by `_sync_stage3_tp_submit_states`); B2 matches single-outcome `CompleteReadWithDetails` publication; B3 does not change which event frees a transfer-held block. |
 
 ## Shipping C++ vs. modelled design alternatives
 
@@ -160,6 +183,7 @@ by an executable counterexample trace or `#guard` check in
 | `Pipeline.mutant_ignoring_rank_corrupts_aliased_page` | Rank-ordered H2D wave gate on shared device pages (`ReshardReceiveSession::CollectEligiblePoolH2dsLocked`) | `AliasedPageCorrect` / `PublicationCorrect` (out-of-order arrival writes rank 1 first, then rank 0's `writePoolHbm` clobbers rank 1 to `.junk`, yielding `dstHbm = [kv 0, junk]`) |
 | `Pipeline.mutant_onPoolReceived_before_all_streams` | `BlockTransport::CompleteIncomingPush` waits until `completed_streams == expected_pushes` before calling `OnPoolReceived(pool_idx)` | `StreamAccountingSafe` / `PublicationCorrect` (H2D reads incomplete staging before all sender streams land) |
 | `Pipeline.mutant_reclaim_before_publish_corrupts_dstHbm` | Caller/coordinator retires producer blocks only after transfer completion (`SrcHbmSafe`) | `PublicationCorrect` (reclaiming `srcHbm` before D2H copies `.junk` into `dstHbm`) |
+| `Pipeline.trace_mutant_write_after_release_corrupts_all` | `ReshardSendSession::SettleLocked` releases `PoolStagingLease` only when `in_flight_ == 0` (`StagingSafe`) | `wroteReleased = false` (releasing `srcStaging` at `execFinish` while D2H is in flight causes `d2hDone` to write after release and corrupt all transfers' buffers) |
 | `Coverage.mutant_gap_in_coverage_leaves_unwritten_byte` | `ValidateReceiverCoverage` rejects coverage intervals with a gap (`cursor != extent`) | Sub-block reconstruction (`dstStaging` retains `.uninit` bytes after all streams land) |
 | `Coverage.mutant_overlap_in_coverage_rejected` | `ValidateReceiverCoverage` rejects overlapping sub-block intervals (`seg.start < cursor`) | Disjoint interval partition (`validBlockCoverage = false`) |
 | `Coverage.mutant_mismatched_expected_pushes_rejected` | `ValidateReceiverCoverage` rejects plans where `expected_pushes` disagrees with $\sum_s \min(\text{parallelism}, |\text{pairs}_s|)$ | `stream_count_matches` (`validExpectedPushes = false`) |
@@ -221,7 +245,7 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:664-701` | `Reshard/Send.lean` | Inserts sender into `active_pool_reshard_sends_` and calls `ExecutePush` (`Send` A2) | `Send.reachable_safe` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:703-739` | `Reshard/Receive.lean`, `Reshard/PoolStaging.lean` | `PoolStaging.RegEv` (`beginArm`, `acquireArmLease`, `finishArm`, `settleSession`) | `PoolStaging.reachable_reserveBeforeLease_safe`, `PoolStaging.trace_duplicate_uuid_frees_survivor_lease_and_aliases_slot` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::MaybeUnregisterSettledReshardRecv` | `:806-812` | `Reshard/Receive.lean` | `Recv.maybeUnregisterSettled` (`TakePendingUnregister` → `UnregisterSettledPlan`) | `Recv.PlanIntegrity` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:980-1121` | `Reshard/Receive.lean`, `Reshard/Send.lean`, `Reshard/Pipeline.lean` | Reshard send/recv sweeps (`Send.Ev.publish`, `Recv.Ev.publish`) | `Pipeline.PublicationCorrect`, `Pipeline.attention_safe` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:980-1121` | `Reshard/Receive.lean`, `Reshard/Send.lean`, `Reshard/Pipeline.lean`, `Reshard/MultiRequest.lean`, `Transfer/Caller.lean` | Reshard send/recv sweeps (`Send.Ev.publish`, `Recv.Ev.publish`, `Caller.Ev.pOutcome`, `Caller.Ev.dOutcome`) | `Pipeline.PublicationCorrect`, `Pipeline.attention_safe`, `Pipeline.system_data_correct`, `Caller.contract_safe` |
 | `base.h` | `KVCacheManagerBase` | `:123-1164` | `Reshard/PoolStaging.lean` | `PoolStagingStorage` and aliased hybrid-model pool declarations | `PoolStaging.ArenaInv` |
 | `base.cc` | `KVCacheManagerBase::AcquirePoolStagingLease` | `:2088-2145` | `Reshard/PoolStaging.lean` | `PoolStaging.Arena.acquireLease` | `PoolStaging.acquireLease_idempotent`, `PoolStaging.no_slot_aliasing_between_distinct_uuids`, mutant `mutant_non_idempotent_acquire_exhausts_shared_storage` |
 | `base.cc` | `KVCacheManagerBase::ReleasePoolStagingLeases` | `:2147-2163` | `Reshard/PoolStaging.lean` | `PoolStaging.Arena.releaseLease` | `PoolStaging.allocateMissing_slot_sum`, mutant `mutant_leaking_release_breaks_conservation_and_starves` |
@@ -261,6 +285,25 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `coord.cc` | `BuildStartTransferForTarget` | `:108-262` | `Reshard/Coordinator.lean` | Target request construction (`is_sender` when unit in `src_units`) | — |
 | `coord.cc` | `ReshardCoordinator::ExecutePoolReshard` | `:369-592` | `Reshard/Coordinator.lean`, `Reshard/Pipeline.lean` | `CleanupPolicy` (`shipping` vs. `disarmAndAbandonOnFailure`), Stage 0 `LookupAndClaim`, Stage 1 parallel destination arming, Stage 2 parallel sender dispatch | `Coordinator.no_push_before_all_armed`, `Coordinator.claimed_while_arming`, `Coordinator.reachable_disarmAndAbandon_no_orphans`, `Coordinator.trace_partial_arm_orphans_armed_receiver`, `Coordinator.trace_dispatch_failure_orphans_receivers_and_claim` |
 <!-- source-map:end -->
+
+*External, the production reshard caller pair (`Transfer/Caller.lean`):*
+vllm-torchtpu `src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py` @
+`9725110`, vLLM `vllm/distributed/kv_transfer/kv_connector/utils.py`, and
+vLLM `vllm/v1/core/sched/scheduler.py` @ `6185d73`
+(`TPURaidenConnectorWorker.get_finished`, `_poll_finished`,
+`_apply_stage3_submit_outcome`, `_stage3_fail_uncertain_loads_early`,
+`get_block_ids_with_load_errors`, `_sync_stage3_tp_submit_states`,
+`get_finished_count`; `KVOutputAggregator.aggregate`;
+scheduler `_handle_invalid_blocks`, `_update_from_kv_xfer_finished`,
+`finish_requests`, `_update_waiting_for_remote_kv`, `kv_load_failure_policy`) →
+`Caller.contract_safe`, `Caller.mw_contract_safe`,
+`Caller.applyRecv_staggered_eq_batch`, `Caller.fixed_contract`,
+`Caller.earlyLoadError_fail_eq_finish`,
+`Caller.earlyLoadError_fail_holds_blocks`,
+`Caller.mw_earlyLoadError_fail_eq_finish`,
+`Caller.mw_earlyLoadError_fail_holds_blocks`,
+`Caller.trace_fixed_early_uncertain_load_error`, `Caller.trace_fixed_*`,
+`Caller.trace_mw_staggered_*`, `Caller.trace_mw_overcounted_expected_leaks`.
 
 ## Where the rest lives
 

@@ -270,7 +270,9 @@ NB_MODULE(_tpu_raiden_torch, m) {
            nb::arg("parallelism") = 4, nb::arg("listener_port") = nb::none(),
            nb::arg("raiden_worker_port") = 0,
            nb::arg("raiden_controller_address") = nb::none(),
-           nb::arg("worker_id") = nb::none(), nb::arg("enable_shm") = false)
+           nb::arg("worker_id") = nb::none(), nb::arg("enable_shm") = false,
+           nb::arg("host_blocks_to_allocate") = nb::none(),
+           nb::arg("window_blocks") = 0, nb::arg("window_depth") = 2)
       .def("node_id", &KVCacheManager::node_id)
       .def("get_raiden_worker_port", &KVCacheManager::GetRaidenWorkerPort)
       .def(

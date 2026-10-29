@@ -73,5 +73,45 @@ TEST_F(KVCacheManagerTransferTest, Basic) {
   EXPECT_EQ(engine->kv_caches().size(), 1);
 }
 
+TEST_F(KVCacheManagerTransferTest,
+       CreateWithNodeIdConfiguresBoundedStagingWindow) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client_->addressable_devices()[0]->default_memory_space());
+  std::vector<float> data(8 * 1024, 1.0f);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pjrt_buffer, client_->BufferFromHostBuffer(
+                            data.data(), xla::F32, {8, 1024},
+                            /*byte_strides=*/std::nullopt,
+                            xla::PjRtClient::HostBufferSemantics::
+                                kImmutableUntilTransferCompletes,
+                            /*on_done_with_host_buffer=*/nullptr, memory_space,
+                            /*device_layout=*/nullptr));
+
+  at::Tensor tensor = at::zeros({8, 1024}, at::kFloat);
+  RegisterMockTensor(tensor, pjrt_buffer.get());
+  std::vector<at::Tensor> kv_caches = {tensor};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> engine,
+      KVCacheManager::CreateWithNodeId(
+          kv_caches, /*node_id=*/0, /*local_control_port=*/0, /*max_blocks=*/8,
+          /*num_slots=*/2, /*timeout_s=*/10.0, /*unsafe_skip_buffer_lock=*/true,
+          /*parallelism=*/4, /*listener_port=*/std::nullopt,
+          /*raiden_worker_port=*/0, /*raiden_controller_address=*/std::nullopt,
+          /*worker_id=*/std::nullopt, /*enable_shm=*/false,
+          /*host_blocks_to_allocate=*/std::nullopt, /*window_blocks=*/2,
+          /*window_depth=*/2));
+
+  ASSERT_NE(engine->torch_manager(), nullptr);
+  EXPECT_EQ(engine->torch_manager()->window_blocks(), 2);
+  EXPECT_EQ(engine->torch_manager()->window_depth(), 2);
+  ASSERT_NE(engine->torch_manager()->staging_allocator(), nullptr);
+  EXPECT_TRUE(
+      engine->torch_manager()->staging_allocator()->dynamic_host_staging());
+  EXPECT_EQ(engine->torch_manager()->base()->GetHostSize(0, 0),
+            4 * engine->slice_byte_size());
+}
+
 }  // namespace
 }  // namespace tpu_raiden::torch

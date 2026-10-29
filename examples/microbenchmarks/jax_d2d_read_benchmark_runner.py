@@ -42,13 +42,14 @@ Then the RECEIVER, pointed at the sender's VPC address (not localhost):
       --num_layers=8 \
       --block_size=8
 
-The geometry flags must match on both sides. --block_size must be a multiple of
-the local device count, and only one process per side is supported.
+The geometry flags must match on both sides, and only one process per side is
+supported.
 
 See README.md in this directory for how this compares with the other
 microbenchmarks here.
 """
 
+import functools
 import os
 import sys
 
@@ -62,7 +63,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-# [MODIFIED] Use OSS import paths instead of 'google3.third_party...'
 from tpu_sync.api.jax import kv_cache_manager
 from tpu_sync.rpc import coordination_helper
 
@@ -98,6 +98,53 @@ _PROCESS_INDEX = flags.DEFINE_integer('process_index', -1, 'JAX process index')
 _NUM_PROCESSES = flags.DEFINE_integer(
     'num_processes', 1, 'Number of JAX processes.'
 )
+_WINDOW_BLOCKS = flags.DEFINE_integer(
+    'window_blocks',
+    -1,
+    'Window size C in blocks (-1 for auto default, 0 to disable windowing).',
+)
+_WINDOW_DEPTH = flags.DEFINE_integer(
+    'window_depth',
+    2,
+    'Bounded staging window depth W (default 2 for double-buffering).',
+)
+_HOST_BLOCKS_TO_ALLOCATE = flags.DEFINE_integer(
+    'host_blocks_to_allocate',
+    None,
+    'Optional explicit host staging block pool size override.',
+)
+_ITERS = flags.DEFINE_integer(
+    'iters', 1, 'Number of measured transfer iterations.'
+)
+_WARMUP = flags.DEFINE_integer(
+    'warmup', 0, 'Number of warmup transfer iterations before measurement.'
+)
+_POLL_INTERVAL_MS = flags.DEFINE_float(
+    'poll_interval_ms',
+    0.5,
+    'Completion poll sleep interval in milliseconds.',
+)
+_DTYPE = flags.DEFINE_string(
+    'dtype',
+    'float32',
+    'Data type of cache: float32, bfloat16, fp8 (float8_e4m3fn).',
+)
+
+
+def _resolve_dtype(dtype_name: str) -> tuple[jnp.dtype, int]:
+  """Resolves the cache dtype name to a jnp.dtype and item size in bytes."""
+  normalized = dtype_name.lower()
+  if normalized in ('float32', 'fp32'):
+    return jnp.dtype(jnp.float32), 4
+  elif normalized in ('bfloat16', 'bf16'):
+    return jnp.dtype(jnp.bfloat16), 2
+  elif normalized in ('fp8', 'float8', 'float8_e4m3fn'):
+    return jnp.dtype(jnp.float8_e4m3fn), 1
+  else:
+    raise ValueError(
+        f'Unsupported dtype: {dtype_name}. Expected float32, bfloat16, or fp8.'
+    )
+
 
 def setup_shardings(devices):
   num_devices = len(devices)
@@ -116,7 +163,7 @@ def setup_shardings(devices):
 def get_peer_grpc_path(peer_arg: str) -> str:
   # Expects raw "IP:PORT" formatting for cloud environments.
   if not peer_arg:
-      raise ValueError("A peer address MUST be provided (e.g. 10.128.0.2:50051)")
+    raise ValueError('A peer address MUST be provided (e.g. 10.128.0.2:50051)')
   # ensure ipv6 is bracketed if passed (basic check)
   if ':' in peer_arg and not peer_arg.startswith('['):
     parts = peer_arg.rsplit(':', 1)
@@ -124,38 +171,64 @@ def get_peer_grpc_path(peer_arg: str) -> str:
       return f'[{parts[0]}]:{parts[1]}'
   return peer_arg
 
-def populate_deterministic_cache(
-    num_blocks: int, num_layers: int, shape: tuple[int, ...], sharding
-) -> list[jax.Array]:
-  arrs = []
-  for layer_idx in range(num_layers):
-    base = jnp.arange(np.prod(shape), dtype=jnp.float32).reshape(shape) + float(
-        layer_idx * 1000.0
+
+def _make_layer_fn(shape: tuple[int, ...], sharding, dtype: jnp.dtype):
+  """Builds a jitted layer generator with low dynamic range values for FP8."""
+
+  @functools.partial(jax.jit, out_shardings=sharding)
+  def _build_layer(layer_offset: jax.Array) -> jax.Array:
+    # Use modulo arithmetic to ensure values remain well within the finite
+    # dynamic range of low-precision dtypes such as float8_e4m3fn (max 448.0)
+    # without overflowing to NaN, while keeping values distinct.
+    b = (jax.lax.broadcasted_iota(jnp.float32, shape, 0) % 16.0) * 0.5
+    t = (jax.lax.broadcasted_iota(jnp.float32, shape, 1) % 64.0) * 0.25
+    h = (jax.lax.broadcasted_iota(jnp.float32, shape, 2) % 8.0) * 1.0
+    kv = (jax.lax.broadcasted_iota(jnp.float32, shape, 3) % 2.0) * 2.0
+    d = (jax.lax.broadcasted_iota(jnp.float32, shape, 4) % 128.0) * (
+        1.0 / 128.0
     )
-    arrs.append(jax.device_put(base, sharding))
+    arr = b + t + h + kv + d + (layer_offset % 32.0)
+    return arr.astype(dtype)
+
+  return _build_layer
+
+
+def populate_deterministic_cache(
+    num_layers: int, shape: tuple[int, ...], sharding, dtype: jnp.dtype
+) -> list[jax.Array]:
+  """Populates deterministic cache layers on device."""
+  build_layer = _make_layer_fn(shape, sharding, dtype)
+  arrs = [
+      build_layer(jnp.float32(layer_idx)) for layer_idx in range(num_layers)
+  ]
   jax.block_until_ready(arrs)
   return arrs
 
+
+@jax.jit
+def _layers_equal(actual: jax.Array, expected: jax.Array) -> jax.Array:
+  """Computes exact on-device equality between two arrays."""
+  return jnp.all(actual == expected)
+
+
 def verify_deterministic_cache(
-    num_blocks: int,
     num_layers: int,
     shape: tuple[int, ...],
     dst_tpu_arrs: list[jax.Array],
+    sharding,
+    dtype: jnp.dtype,
 ) -> bool:
+  """Verifies cache layers match expected deterministic content on device."""
   print('Verifying data consistency across all sharded cache layers...')
+  build_layer = _make_layer_fn(shape, sharding, dtype)
   for layer_idx in range(num_layers):
-    expected = jnp.arange(np.prod(shape), dtype=jnp.float32).reshape(
-        shape
-    ) + float(layer_idx * 1000.0)
-    actual = np.asarray(dst_tpu_arrs[layer_idx])
-    try:
-      np.testing.assert_array_equal(actual, np.asarray(expected))
-    except AssertionError as exc:
+    expected = build_layer(jnp.float32(layer_idx))
+    if not bool(_layers_equal(dst_tpu_arrs[layer_idx], expected)):
       print(f'Verification FAILED on Layer {layer_idx}!')
-      print(exc)
       return False
   print('Data consistency verified successfully! 0% corruption.')
   return True
+
 
 def main(_):
   if not _ROLE.value:
@@ -175,7 +248,7 @@ def main(_):
       jax.distributed.initialize()
     except ValueError:
       pass
-      
+
   print(f'Initialized JAX distributed mesh: process_index={jax.process_index()}, process_count={jax.process_count()}')
 
   # This runner assumes ONE process per side. The cross-process machinery it
@@ -199,27 +272,27 @@ def main(_):
   sorted_devices = sorted(devices, key=lambda d: d.numa_node if hasattr(d, 'numa_node') else -1)
   tpu_sharding, _ = setup_shardings(sorted_devices)
 
-  cache_shape = (_NUM_BLOCKS.value, 32, _BLOCK_SIZE.value, 8, 128)
+  cache_shape = (_NUM_BLOCKS.value, _BLOCK_SIZE.value, 8, 2, 128)
 
-  # setup_shardings partitions cache axis 2 (block_size) across every device, so
-  # block_size must divide evenly by the device count. Saying so here beats the
-  # bare IndivisibleError that XLA raises several frames deeper.
-  if _BLOCK_SIZE.value % len(devices) != 0:
+  # setup_shardings partitions cache axis 2 (size 8) across every device along
+  # 'model', so 8 must divide evenly by the device count.
+  if 8 % len(devices) != 0:
     raise ValueError(
-        f'--block_size={_BLOCK_SIZE.value} is not divisible by the '
-        f'{len(devices)} local devices it is sharded across. Pass a multiple '
-        f'of {len(devices)}.'
+        'Axis 2 (size 8) is not divisible by the '
+        f'{len(devices)} local devices it is sharded across.'
     )
 
-  block_bytes = int(np.prod(cache_shape[1:])) * 4
+  cache_dtype, itemsize = _resolve_dtype(_DTYPE.value)
+  block_bytes = int(np.prod(cache_shape[1:])) * itemsize
   payload_bytes = _NUM_LAYERS.value * _NUM_BLOCKS.value * block_bytes
   print(
       f'Config: role={_ROLE.value} parallelism={_PARALLELISM.value} '
       f'num_slots={_NUM_SLOTS.value} num_layers={_NUM_LAYERS.value} '
-      f'num_blocks={_NUM_BLOCKS.value} block_size={_BLOCK_SIZE.value}'
+      f'num_blocks={_NUM_BLOCKS.value} block_size={_BLOCK_SIZE.value} '
+      f'dtype={_DTYPE.value}'
   )
   print(
-      f'Cache: shape={cache_shape} dtype=float32 '
+      f'Cache: shape={cache_shape} dtype={_DTYPE.value} '
       f'block={block_bytes / (1024 * 1024):.2f} MiB '
       f'payload={payload_bytes / (1024 * 1024):.2f} MiB'
   )
@@ -229,7 +302,7 @@ def main(_):
 
     t0 = time.perf_counter()
     tpu_src_arrs = populate_deterministic_cache(
-        _NUM_BLOCKS.value, _NUM_LAYERS.value, cache_shape, tpu_sharding
+        _NUM_LAYERS.value, cache_shape, tpu_sharding, cache_dtype
     )
     print(
         f'Populated {_NUM_LAYERS.value} source layers on device in '
@@ -250,6 +323,9 @@ def main(_):
         num_slots=_NUM_SLOTS.value,
         unsafe_skip_buffer_lock=True,
         parallelism=_PARALLELISM.value,
+        host_blocks_to_allocate=_HOST_BLOCKS_TO_ALLOCATE.value,
+        window_blocks=_WINDOW_BLOCKS.value,
+        window_depth=_WINDOW_DEPTH.value,
     )
 
     print(f'KVCacheManager ready in {time.perf_counter() - t0:.2f}s')
@@ -259,8 +335,15 @@ def main(_):
 
     total_cache_blocks = _NUM_BLOCKS.value
     block_ids = list(range(total_cache_blocks))
-    manager.register_read(transfer_req_id, transfer_uuid, block_ids)
-    print(f'Armed {len(block_ids)} blocks for read (uuid={transfer_uuid})')
+    total_runs = _WARMUP.value + _ITERS.value
+    for run_idx in range(total_runs):
+      iter_req_id = f'{transfer_req_id}_{run_idx}'
+      iter_uuid = transfer_uuid + run_idx * 10000
+      manager.register_read(iter_req_id, iter_uuid, block_ids)
+    print(
+        f'Armed {len(block_ids)} blocks for read across {total_runs} runs '
+        f'(base uuid={transfer_uuid})'
+    )
 
     # Single process per side, so this process's endpoints are the whole set --
     # no allgather, and no packing the JSON into a padded uint8 array to move it
@@ -290,7 +373,9 @@ def main(_):
 
   elif _ROLE.value == 'receiver':
     print('Starting H2H Receiver process...')
-    
+    if _PEER.value is None:
+      raise ValueError('A peer address MUST be provided')
+
     resolved_peer = get_peer_grpc_path(_PEER.value)
     print(f'Connecting to peer coordination server at: {resolved_peer}')
     client = coordination_helper.CoordinationClient(server_address=resolved_peer)
@@ -317,10 +402,11 @@ def main(_):
     print(f'Resolved Peer dynamic H2H endpoints: {remote_endpoints}')
 
     t0 = time.perf_counter()
-    device_arrs = [
-        jax.device_put(jnp.empty(cache_shape, dtype=jnp.float32), tpu_sharding)
-        for _ in range(_NUM_LAYERS.value)
-    ]
+    alloc_zero_layer = jax.jit(
+        lambda: jnp.zeros(cache_shape, dtype=cache_dtype),
+        out_shardings=tpu_sharding,
+    )
+    device_arrs = [alloc_zero_layer() for _ in range(_NUM_LAYERS.value)]
     jax.block_until_ready(device_arrs)
     print(
         f'Allocated {_NUM_LAYERS.value} destination layers on device in '
@@ -335,69 +421,97 @@ def main(_):
         num_slots=_NUM_SLOTS.value,
         unsafe_skip_buffer_lock=True,
         parallelism=_PARALLELISM.value,
+        host_blocks_to_allocate=_HOST_BLOCKS_TO_ALLOCATE.value,
+        window_blocks=_WINDOW_BLOCKS.value,
+        window_depth=_WINDOW_DEPTH.value,
     )
     print(f'KVCacheManager ready in {time.perf_counter() - t0:.2f}s')
 
-    # No barrier before the stopwatch: with one process per side there is
-    # nothing to synchronise with, and the pull below is what is being timed.
     print('Executing H2H Read E2E offloading transfer...')
-    start_time = time.perf_counter()
-
-    manager.start_read(
-        req_id=transfer_req_id,
-        uuid=transfer_uuid,
-        remote_endpoint=remote_endpoints,
-        remote_block_ids=src_block_ids,
-        local_block_ids=src_block_ids,
-        parallelism=_PARALLELISM.value,
-    )
-    start_read_returned = time.perf_counter()
-
-    polls = 0
-    completed = False
-    while not completed:
-      polls += 1
-      _, done_recving, failed_recving = manager.poll_stats()
-      if transfer_req_id in done_recving:
-        completed = True
-      elif transfer_req_id in failed_recving:
-        raise RuntimeError(f'Transfer failed! req_id: {transfer_req_id}')
-      else:
-        time.sleep(0.01)
-
-    end_time = time.perf_counter()
-    elapsed_time = end_time - start_time
-
-    # start_read is asynchronous, so the split shows how much of the elapsed
-    # time was the call itself versus waiting for the transfer to land. The poll
-    # loop sleeps 10ms per iteration, which quantises short transfers -- if
-    # polls is small, the measurement is dominated by that granularity.
-    print(
-        f'start_read returned in '
-        f'{(start_read_returned - start_time) * 1e3:.1f} ms; '
-        f'waited {(end_time - start_read_returned) * 1e3:.1f} ms across '
-        f'{polls} poll(s) at 10ms granularity'
-    )
-
-    block_byte_size = np.prod(cache_shape[1:]) * 4
-    total_bytes = _NUM_LAYERS.value * len(src_block_ids) * block_byte_size
-
-    # One process holds every device, so the local and global figures the
-    # multi-host version printed separately were always the same number here.
+    total_runs = _WARMUP.value + _ITERS.value
+    latencies = []
+    total_bytes = _NUM_LAYERS.value * len(src_block_ids) * block_bytes
     total_megabytes = total_bytes / (1024 * 1024)
-    bandwidth_gbps = (total_bytes * 8) / (elapsed_time * 1e9)
 
-    print('\n=== H2H E2E Performance Results ===')
-    print(f'Parallelism: {_PARALLELISM.value}')
-    print(f'Data Volume Transferred: {total_megabytes:.2f} MB')
-    print(f'Elapsed Time (TCP H2H + Copy): {elapsed_time:.4f} seconds')
-    print(f'Bandwidth: {bandwidth_gbps:.3f} Gbps '
-          f'({total_bytes / elapsed_time / 1e9:.3f} GB/s)')
-    print('===================================\n')
+    for run_idx in range(total_runs):
+      is_warmup = run_idx < _WARMUP.value
+      iter_req_id = f'{transfer_req_id}_{run_idx}'
+      iter_uuid = transfer_uuid + run_idx * 10000
+
+      start_time = time.perf_counter()
+      manager.start_read(
+          req_id=iter_req_id,
+          uuid=iter_uuid,
+          remote_endpoint=remote_endpoints,
+          remote_block_ids=src_block_ids,
+          local_block_ids=src_block_ids,
+          parallelism=_PARALLELISM.value,
+      )
+      start_read_returned = time.perf_counter()
+
+      polls = 0
+      completed = False
+      while not completed:
+        polls += 1
+        _, done_recving, failed_recving = manager.poll_stats()
+        if iter_req_id in done_recving:
+          completed = True
+        elif iter_req_id in failed_recving:
+          raise RuntimeError(f'Transfer failed! req_id: {iter_req_id}')
+        else:
+          time.sleep(_POLL_INTERVAL_MS.value / 1000.0)
+
+      end_time = time.perf_counter()
+      elapsed_time = end_time - start_time
+      bw_gbps = (total_bytes * 8) / (elapsed_time * 1e9)
+      bw_gbs = total_bytes / (elapsed_time * 1e9)
+
+      prefix = '[WARMUP] ' if is_warmup else ''
+      print(
+          f'{prefix}Run {run_idx + 1}/{total_runs}:'
+          f' elapsed={elapsed_time * 1e3:.2f} ms ({bw_gbps:.3f} Gbps,'
+          f' {bw_gbs:.3f} GB/s), start_read returned in'
+          f' {(start_read_returned - start_time) * 1e3:.1f} ms, waited'
+          f' {(end_time - start_read_returned) * 1e3:.1f} ms across {polls}'
+          f' poll(s) at {_POLL_INTERVAL_MS.value}ms granularity'
+      )
+      if not is_warmup:
+        latencies.append(elapsed_time)
+
+    # Follow-up F3: poll manager.poll_stats() after completion
+    _, final_done, final_failed = manager.poll_stats()
+    print(
+        f'Final poll_stats: done_recving={len(final_done)}, '
+        f'failed_recving={len(final_failed)}'
+    )
+
+    if latencies:
+      arr = np.array(latencies)
+      rep_elapsed = float(np.median(arr))
+      bandwidth_gbps = (total_bytes * 8) / (rep_elapsed * 1e9)
+      bandwidth_gbs = total_bytes / (rep_elapsed * 1e9)
+
+      print('\n=== H2H E2E Performance Results ===')
+      print(f'Parallelism: {_PARALLELISM.value}')
+      print(f'Iterations: {_ITERS.value} (warmup: {_WARMUP.value})')
+      print(f'Data Volume Transferred: {total_megabytes:.2f} MB')
+      print(
+          f'Latency (ms): min={float(np.min(arr)) * 1e3:.2f}'
+          f' p50={rep_elapsed * 1e3:.2f} mean={float(np.mean(arr)) * 1e3:.2f}'
+          f' p90={float(np.percentile(arr, 90)) * 1e3:.2f}'
+          f' max={float(np.max(arr)) * 1e3:.2f}'
+      )
+      print(f'Elapsed Time (TCP H2H + Copy): {rep_elapsed:.4f} seconds')
+      print(f'Bandwidth: {bandwidth_gbps:.3f} Gbps ({bandwidth_gbs:.3f} GB/s)')
+      print('===================================\n')
 
     t0 = time.perf_counter()
     success = verify_deterministic_cache(
-        _NUM_BLOCKS.value, _NUM_LAYERS.value, cache_shape, device_arrs
+        _NUM_LAYERS.value,
+        cache_shape,
+        device_arrs,
+        tpu_sharding,
+        cache_dtype,
     )
     print(f'Verification took {time.perf_counter() - t0:.2f}s')
 

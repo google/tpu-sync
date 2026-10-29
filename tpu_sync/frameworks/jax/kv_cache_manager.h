@@ -77,7 +77,10 @@ class NumaAwareKVCacheManager {
   static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
       nanobind::list kv_caches, int64_t node_id, int64_t local_control_port,
       int64_t max_blocks, int64_t num_slots, double timeout_s,
-      bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm = false);
+      bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm = false,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      int64_t window_blocks = 0,
+      int32_t window_depth = kDefaultStagingWindowDepth);
 #endif
 
   // Raw PjRtBuffer factory.
@@ -98,7 +101,10 @@ class NumaAwareKVCacheManager {
       const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
       int64_t node_id, int64_t local_control_port, int64_t max_blocks,
       int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
-      int parallelism, bool enable_shm = false);
+      int parallelism, bool enable_shm = false,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      int64_t window_blocks = 0,
+      int32_t window_depth = kDefaultStagingWindowDepth);
 
   // FFI metadata factory (cache-only by default).
   static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
@@ -247,6 +253,11 @@ class NumaAwareKVCacheManager {
   std::shared_ptr<kv_cache::backends::KVBackend> GetKVBackend(
       absl::string_view backend_name) const;
 
+  const std::vector<std::unique_ptr<KVCacheManagerWithTransfer>>& sub_managers()
+      const {
+    return sub_managers_;
+  }
+
  private:
   NumaAwareKVCacheManager() = default;
   explicit NumaAwareKVCacheManager(
@@ -264,7 +275,10 @@ class NumaAwareKVCacheManager {
   static absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>> Create(
       UnpackedCache&& cache, int64_t node_id, int64_t local_control_port,
       int64_t max_blocks, int64_t num_slots, double timeout_s,
-      bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm = false);
+      bool unsafe_skip_buffer_lock, int parallelism, bool enable_shm = false,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      int64_t window_blocks = 0,
+      int32_t window_depth = kDefaultStagingWindowDepth);
 
   std::optional<nanobind::list> device_arrays_;
 #endif
@@ -274,7 +288,8 @@ class NumaAwareKVCacheManager {
       std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
       bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id,
       int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
-      double timeout_s, bool enable_shm);
+      double timeout_s, bool enable_shm, int64_t window_blocks = 0,
+      int32_t window_depth = kDefaultStagingWindowDepth);
 
   static constexpr uint64_t k48BitMask = 0xFFFFFFFFFFFFULL;
   std::atomic<uint64_t> global_seq_counter_{1};
@@ -325,7 +340,10 @@ class KVCacheManager {
       bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt,
-      bool enable_shm = false);
+      bool enable_shm = false,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      int64_t window_blocks = 0,
+      int32_t window_depth = kDefaultStagingWindowDepth);
 #endif
 
   // Raw PjRtBuffer factory (cache-only by default).
@@ -348,7 +366,11 @@ class KVCacheManager {
       int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
       int parallelism, int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
-      std::optional<std::string> worker_id = std::nullopt);
+      std::optional<std::string> worker_id = std::nullopt,
+      bool enable_shm = false,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      int64_t window_blocks = 0,
+      int32_t window_depth = kDefaultStagingWindowDepth);
 
   // FFI metadata factory (cache-only by default).
   static absl::StatusOr<std::unique_ptr<KVCacheManager>> Create(

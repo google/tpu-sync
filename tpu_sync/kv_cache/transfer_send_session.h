@@ -32,6 +32,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/data_connection_policy.h"
@@ -55,6 +56,15 @@ class TransferSendSession
     : public TransferSession,
       public std::enable_shared_from_this<TransferSendSession> {
  public:
+  // Describes a block ID appearing more than once, with its first 2 indices.
+  struct DuplicateBlock {
+    int64_t block_id;
+    size_t first_index, duplicate_index;
+  };
+  // Returns the first duplicate block ID and its first two indices, or nullopt.
+  static std::optional<DuplicateBlock> FindDuplicateBlock(
+      absl::Span<const int64_t> block_ids);
+
   // Resolves the data connection policy (TPU_RAIDEN_DATA_CONN_REUSE) and
   // creates a send session for |block_ids|.
   static absl::StatusOr<std::shared_ptr<TransferSendSession>> Create(
@@ -62,7 +72,9 @@ class TransferSendSession
       StagingBlockAllocator* absl_nullable staging_allocator,
       std::string req_id, uint64_t uuid, absl::Span<const int64_t> block_ids,
       std::chrono::steady_clock::time_point deadline,
-      std::chrono::steady_clock::time_point register_start);
+      std::chrono::steady_clock::time_point register_start,
+      KVCacheManagerWithTransfer* absl_nullable manager = nullptr,
+      uint64_t base_uuid = 0, int32_t sub_plan_index = 0);
 
   ~TransferSendSession() override { ReleaseStagingBlocks(); }
 
@@ -153,7 +165,7 @@ class TransferSendSession
 
   int64_t num_blocks() const {
     absl::MutexLock lock(mu_);
-    return num_blocks_;
+    return static_cast<int64_t>(pulled_blocks_);
   }
   int64_t total_bytes() const {
     absl::MutexLock lock(mu_);
@@ -164,25 +176,27 @@ class TransferSendSession
     return d2h_done_;
   }
 
+  uint64_t base_uuid() const { return base_uuid_; }
+  int32_t sub_plan_index() const { return sub_plan_index_; }
+  size_t pulled_blocks() const {
+    absl::MutexLock l(mu_);
+    return pulled_blocks_;
+  }
+  void BeginOrQueueH2h();
+  void StartGatedH2h();
+  void DropH2hGateHold();
+  void CancelFromManagerLocked(const absl::Status& status);
+
  private:
   TransferSendSession(kv_cache::KVCacheManagerBase* base,
                       StagingBlockAllocator* staging_allocator,
                       std::string req_id, uint64_t uuid,
                       std::chrono::steady_clock::time_point deadline,
                       std::chrono::steady_clock::time_point register_start,
-                      DataConnectionReuse data_connection_reuse);
+                      DataConnectionReuse data_connection_reuse,
+                      KVCacheManagerWithTransfer* absl_nullable manager,
+                      uint64_t base_uuid, int32_t sub_plan_index);
 
-  // Describes a block ID that appears more than once in a single registration,
-  // along with the indices of its first two occurrences.
-  struct DuplicateBlock {
-    int64_t block_id;
-    size_t first_index;
-    size_t duplicate_index;
-  };
-
-  // Populates `registered_block_ids_` and `registered_block_set_` from
-  // `block_ids`. Returns the first duplicate block ID and its indices if any
-  // duplicate is present, or `std::nullopt` when all IDs are unique.
   std::optional<DuplicateBlock> PopulateRegisteredBlocks(
       absl::Span<const int64_t> block_ids);
   void ValidateRequestedBlocksLocked(
@@ -203,21 +217,24 @@ class TransferSendSession
   void EndSendOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   absl::Status AcquireStagingWithRetry(int64_t num_blocks);
   void SendNextLayer(size_t l);
+  void BeginStageTraceLocked(std::optional<ScopedTrace>& trace,
+                             absl::string_view name, uint32_t stage_tag)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
   StagingBlockAllocator* const staging_allocator_ = nullptr;
+  KVCacheManagerWithTransfer* const manager_ = nullptr;
   const std::string req_id_;
   const uint64_t uuid_ = 0;
+  const uint64_t base_uuid_ = 0;
+  const int32_t sub_plan_index_ = 0;
   const std::chrono::steady_clock::time_point deadline_;
   const std::chrono::steady_clock::time_point register_start_;
   // TPU_RAIDEN_DATA_CONN_REUSE as resolved when the session was created.
   const DataConnectionReuse data_connection_reuse_;
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
-  int64_t num_blocks_ ABSL_GUARDED_BY(mu_) = 0;
-  int64_t registered_num_blocks_ ABSL_GUARDED_BY(mu_) = 0;
   int64_t total_bytes_ ABSL_GUARDED_BY(mu_) = 0;
-  std::vector<int64_t> registered_block_ids_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<int64_t> registered_block_set_ ABSL_GUARDED_BY(mu_);
   std::chrono::steady_clock::time_point d2h_done_ ABSL_GUARDED_BY(mu_);
   absl::Status status_ ABSL_GUARDED_BY(mu_);
@@ -225,6 +242,8 @@ class TransferSendSession
   // set to a non-OK status.
   absl::string_view failed_phase_ ABSL_GUARDED_BY(mu_);
   bool pull_started_ ABSL_GUARDED_BY(mu_) = false;
+  size_t pulled_blocks_ ABSL_GUARDED_BY(mu_) = 0;
+  bool has_h2h_gate_hold_ ABSL_GUARDED_BY(mu_) = false;
   // Copies and pushes issued for this send whose completion has not been
   // observed. The staging they read and write is held until it is zero.
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
@@ -240,9 +259,13 @@ class TransferSendSession
   std::vector<std::string> remote_data_endpoints_ ABSL_GUARDED_BY(mu_);
   std::vector<int> src_ints_ ABSL_GUARDED_BY(mu_);
   std::vector<int> dst_ints_ ABSL_GUARDED_BY(mu_);
+  std::atomic<size_t> remaining_d2h_layers_{0};
   std::atomic<size_t> remaining_h2h_layers_{0};
   std::atomic<bool> cancelled_{false};
   StagingLayerManager staging_layer_manager_;
+  std::optional<ScopedTrace> d2h_stage_trace_ ABSL_GUARDED_BY(mu_);
+  std::optional<ScopedTrace> h2h_gate_wait_trace_ ABSL_GUARDED_BY(mu_);
+  std::optional<ScopedTrace> h2h_push_trace_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace tpu_raiden

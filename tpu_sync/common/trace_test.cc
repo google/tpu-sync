@@ -21,6 +21,8 @@
 #include <iterator>
 #include <optional>
 #include <string>  // IWYU pragma: keep
+#include <thread>
+#include <utility>
 #include <vector>  // IWYU pragma: keep
 
 #include <gtest/gtest.h>
@@ -290,6 +292,46 @@ TEST(TraceTest, StartAndStopPerfettoTraceToFile) {
   EXPECT_TRUE(absl::StrContains(view, "FileTraceScopedSlice"));
   EXPECT_TRUE(absl::StrContains(view, "FileTraceExplicitSlice"));
   EXPECT_TRUE(absl::StrContains(view, "FileTraceDynamicSlice_99"));
+}
+
+TEST(TraceTest, PerfettoCrossThreadTrackScopedTraceClosesCleanlyWithMetadata) {
+  EnsurePerfettoInitialized();
+
+  // NOLINTNEXTLINE(misc-include-cleaner)
+  perfetto::TraceConfig cfg;
+  cfg.add_buffers()->set_size_kb(1024);
+  auto* ds_cfg = cfg.add_data_sources()->mutable_config();
+  ds_cfg->set_name("track_event");
+
+  auto session = perfetto::Tracing::NewTrace(perfetto::kInProcessBackend);
+  session->Setup(cfg);
+  session->StartBlocking();
+
+  SetTraceBackendForTesting(TraceBackend::kPerfetto);
+
+  {
+    ScopedTrace trace("CrossThreadStage", TraceMeLevel::kInfo,
+                      SubTransferStageTrackId(42, 1));
+    trace.AppendMetadata(
+        [&]() { return "req_id=req_0,uuid=42,sub_plan_index=1"; });
+
+    std::thread worker([t = std::move(trace)]() mutable {
+      // Trace slice closes when t is destroyed on worker thread.
+    });
+    worker.join();
+  }
+
+  SetTraceBackendForTesting(std::nullopt);
+
+  ::tpu_raiden::TrackEvent::Flush();
+  session->StopBlocking();
+  std::vector<char> trace_data = session->ReadTraceBlocking();
+
+  EXPECT_FALSE(trace_data.empty());
+  absl::string_view trace_view(trace_data.data(), trace_data.size());
+  EXPECT_TRUE(absl::StrContains(trace_view, "CrossThreadStage"));
+  EXPECT_TRUE(
+      absl::StrContains(trace_view, "req_id=req_0,uuid=42,sub_plan_index=1"));
 }
 
 }  // namespace

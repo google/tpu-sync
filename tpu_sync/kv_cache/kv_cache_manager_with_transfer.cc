@@ -42,6 +42,7 @@
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
@@ -55,6 +56,7 @@
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
+#include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/reshard_receive_session.h"
@@ -137,6 +139,35 @@ std::string DescribeFailure(absl::string_view req_id,
   return line;
 }
 
+std::optional<int64_t> ReadEnvStagingWindowBlocks() {
+  const char* raw = std::getenv("TPU_RAIDEN_STAGING_WINDOW_BLOCKS");
+  if (raw == nullptr || raw[0] == '\0') return std::nullopt;
+  if (absl::EqualsIgnoreCase(raw, "auto") || absl::string_view(raw) == "-1") {
+    return -1;
+  }
+  if (int64_t val = 0; absl::SimpleAtoi(raw, &val) && val >= 0) return val;
+  throw std::invalid_argument(absl::StrCat(
+      "Invalid TPU_RAIDEN_STAGING_WINDOW_BLOCKS value: '", raw, "'"));
+}
+
+std::optional<int32_t> ReadEnvStagingWindowDepth() {
+  const char* raw = std::getenv("TPU_RAIDEN_STAGING_WINDOW_DEPTH");
+  if (raw == nullptr || raw[0] == '\0') return std::nullopt;
+  if (int32_t val = 0; absl::SimpleAtoi(raw, &val) && val > 0) return val;
+  throw std::invalid_argument(absl::StrCat(
+      "Invalid TPU_RAIDEN_STAGING_WINDOW_DEPTH value: '", raw, "'"));
+}
+
+uint64_t ReadEnvStagingWindowTargetBytesPerNic(uint64_t default_bytes) {
+  const char* raw =
+      std::getenv("TPU_RAIDEN_STAGING_WINDOW_TARGET_BYTES_PER_NIC");
+  if (raw == nullptr || raw[0] == '\0') return default_bytes;
+  if (uint64_t val = 0; absl::SimpleAtoi(raw, &val) && val > 0) return val;
+  throw std::invalid_argument(absl::StrCat(
+      "Invalid TPU_RAIDEN_STAGING_WINDOW_TARGET_BYTES_PER_NIC value: '", raw,
+      "'"));
+}
+
 }  // namespace
 
 TransferDetails DetailsFromStatus(const absl::Status& status) {
@@ -148,10 +179,101 @@ TransferDetails DetailsFromStatus(const absl::Status& status) {
   return details;
 }
 
+int64_t SubPlanUuid(int64_t uuid, int32_t index) {
+  if (index <= 0) return uuid;
+  // Keep the splitmix64 result positive (63-bit) for engine request
+  // compatibility.
+  uint64_t z = static_cast<uint64_t>(uuid) +
+               0x9E3779B97F4A7C15ull * static_cast<uint64_t>(index);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  return std::max<int64_t>(
+      1, static_cast<int64_t>((z ^ (z >> 31)) & 0x7FFFFFFFFFFFFFFFull));
+}
+
+size_t ResolveActiveDataNicCount(std::optional<size_t> num_ext_nics) {
+  if (num_ext_nics.has_value()) return std::max<size_t>(1, *num_ext_nics);
+  size_t data_nics = 0;
+  for (const auto& nic : GetLocalHostNicAddresses()) {
+    if (nic.classification == NicClassification::kDataPlane) ++data_nics;
+  }
+  return std::max<size_t>(1, data_nics);
+}
+
+int64_t ResolveDefaultStagingWindowBlocks(
+    size_t num_layers, size_t num_shards, size_t slice_byte_size,
+    size_t num_nics, int64_t max_blocks, uint64_t target_bytes_per_nic,
+    std::optional<size_t> host_pool_blocks, int32_t window_depth) {
+  if (max_blocks <= 0 || num_layers == 0 || num_shards == 0 ||
+      slice_byte_size == 0 || target_bytes_per_nic == 0) {
+    return 0;
+  }
+  const uint64_t target_window_bytes =
+      static_cast<uint64_t>(std::max<size_t>(1, num_nics)) *
+      target_bytes_per_nic;
+  const uint64_t bytes_per_block = static_cast<uint64_t>(num_layers) *
+                                   static_cast<uint64_t>(num_shards) *
+                                   static_cast<uint64_t>(slice_byte_size);
+  const uint64_t raw_c =
+      (target_window_bytes + bytes_per_block - 1) / bytes_per_block;
+  int64_t c = static_cast<int64_t>(
+      std::clamp<uint64_t>(raw_c, 1ULL, static_cast<uint64_t>(max_blocks)));
+  if (host_pool_blocks.has_value() && *host_pool_blocks > 0) {
+    const int64_t pool_cap = std::max<int64_t>(
+        1, static_cast<int64_t>(
+               *host_pool_blocks /
+               static_cast<size_t>(std::max<int32_t>(1, window_depth))));
+    c = std::min<int64_t>(c, pool_cap);
+  }
+  return std::max<int64_t>(1, c);
+}
+
+int64_t ResolveDefaultStagingWindowBlocks(
+    const kv_cache::KVCacheManagerBase* base, int64_t max_blocks,
+    uint64_t target_bytes_per_nic, int32_t window_depth) {
+  if (base == nullptr) return 0;
+  return ResolveDefaultStagingWindowBlocks(
+      base->num_layers(), base->num_shards(), base->slice_byte_size(),
+      std::max<size_t>(1, base->local_ips().size()), max_blocks,
+      target_bytes_per_nic,
+      base->host_block_manager()
+          ? std::make_optional(base->host_block_manager()->total_blocks())
+          : std::nullopt,
+      window_depth);
+}
+
+int64_t ResolveHostBlocksToAllocate(std::optional<int> host_blocks_to_allocate,
+                                    int64_t num_slots, int64_t max_blocks,
+                                    size_t num_layers, size_t num_shards,
+                                    size_t slice_byte_size, size_t num_nics,
+                                    std::optional<int64_t> window_blocks,
+                                    std::optional<int32_t> window_depth) {
+  if (window_blocks.value_or(0) < -1) {
+    throw std::invalid_argument(
+        absl::StrCat("window_blocks must be >= -1, got ", *window_blocks));
+  }
+  if (window_depth.value_or(1) <= 0) {
+    throw std::invalid_argument(
+        absl::StrCat("window_depth must be > 0, got ", *window_depth));
+  }
+  if (host_blocks_to_allocate.has_value()) return *host_blocks_to_allocate;
+
+  const int32_t effective_depth = window_depth.value_or(
+      ReadEnvStagingWindowDepth().value_or(kDefaultStagingWindowDepth));
+  int64_t c = window_blocks.value_or(ReadEnvStagingWindowBlocks().value_or(0));
+  if (c == -1) {
+    c = ResolveDefaultStagingWindowBlocks(
+        num_layers, num_shards, slice_byte_size, num_nics, max_blocks,
+        ReadEnvStagingWindowTargetBytesPerNic(
+            kDefaultStagingWindowTargetBytesPerNic),
+        /*host_pool_blocks=*/std::nullopt, effective_depth);
+  }
+  return c > 0 ? c * effective_depth : num_slots * max_blocks;
+}
+
 void KVCacheManagerWithTransfer::NoteSubPlanRegisteredLocked(
     bool is_recv, const std::string& req_id, uint64_t uuid,
     int32_t sub_plan_index, int32_t sub_plan_count) {
-  if (sub_plan_count <= 1) return;
   auto& chains = is_recv ? recv_chains_ : send_chains_;
   if (sub_plan_index == 0) {
     // Sub-plan 0 is armed before any other sub-plan of its chain: a new
@@ -176,17 +298,28 @@ void KVCacheManagerWithTransfer::NoteSubPlanRegisteredLocked(
 
 void KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked(
     bool is_recv, const std::string& req_id, uint64_t uuid,
-    int32_t sub_plan_index, int32_t sub_plan_count,
-    const absl::Status& status) {
+    int32_t sub_plan_index, int32_t sub_plan_count, const absl::Status& status,
+    std::optional<TransferDetails> details) {
   absl::flat_hash_set<std::string>& done =
       is_recv ? done_recving_ : done_sending_;
+  auto& chains = is_recv ? recv_chains_ : send_chains_;
   if (sub_plan_count <= 1) {
     // A single-plan request: the session's terminal is the request's.
     (status.ok() ? done : failed_recving_).insert(req_id);
-    if (!status.ok()) transfer_details_[req_id] = DetailsFromStatus(status);
+    if (!status.ok()) {
+      TransferDetails d = details.value_or(DetailsFromStatus(status));
+      if (!d.code) d.code = absl::StatusCodeToString(status.code());
+      if (!d.reason) d.reason = std::string(status.message());
+      transfer_details_[req_id] = std::move(d);
+      if (auto it = chains.find(req_id); it != chains.end()) {
+        it->second.failed = true;
+      }
+    } else {
+      if (details) transfer_details_[req_id] = *details;
+      chains.erase(req_id);
+    }
     return;
   }
-  auto& chains = is_recv ? recv_chains_ : send_chains_;
   if (auto it = chains.find(req_id);
       it != chains.end() && it->second.anchored &&
       !it->second.plan_uuids.contains(uuid)) {
@@ -205,10 +338,15 @@ void KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked(
   if (!status.ok()) {
     progress.failed = true;
     failed_recving_.insert(req_id);
-    TransferDetails details = DetailsFromStatus(status);
-    details.reason = absl::StrCat("sub-plan ", sub_plan_index, " of ",
-                                  sub_plan_count, ": ", status.message());
-    transfer_details_[req_id] = std::move(details);
+    TransferDetails d = details.value_or(DetailsFromStatus(status));
+    if (!d.code) d.code = absl::StatusCodeToString(status.code());
+    const std::string base_reason =
+        d.reason.value_or(std::string(status.message()));
+    if (!absl::StartsWith(base_reason, "sub-plan ")) {
+      d.reason = absl::StrCat("sub-plan ", sub_plan_index, " of ",
+                              sub_plan_count, ": ", base_reason);
+    }
+    transfer_details_[req_id] = std::move(d);
     LOG(WARNING) << "Pool reshard " << (is_recv ? "receive" : "send")
                  << " req_id=" << req_id << " failed at sub-plan "
                  << sub_plan_index << " of " << sub_plan_count << ": "
@@ -222,6 +360,7 @@ void KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked(
           << " settled so far)";
   if (static_cast<int32_t>(progress.settled.size()) >= progress.count) {
     done.insert(req_id);
+    if (details) transfer_details_[req_id] = *details;
     chains.erase(req_id);
   }
 }
@@ -257,11 +396,29 @@ void KVCacheManagerWithTransfer::SweepSubPlanChainsLocked(
             break;
           }
         }
+        if (!active) {
+          for (const auto& [_, s] : active_recv_sessions_) {
+            if (s->req_id() == it->first && !s->Done()) active = true;
+          }
+        }
+        if (!active) {
+          if (auto c = active_recv_chains_.find(it->first);
+              c != active_recv_chains_.end()) {
+            active = !c->second.aborted &&
+                     (c->second.in_flight_sub_plans > 0 ||
+                      c->second.next_sub_plan_index < c->second.sub_plan_count);
+          }
+        }
       } else {
         for (const auto& [uuid, session] : active_pool_reshard_sends_) {
           if (session->req_id() == it->first) {
             active = true;
             break;
+          }
+        }
+        if (!active) {
+          for (const auto& [_, s] : send_sessions_) {
+            if (s->req_id() == it->first && !s->Done()) active = true;
           }
         }
       }
@@ -497,10 +654,9 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
     double timeout_s, std::shared_ptr<MetricsCollector> metrics_collector)
     : KVCacheManagerWithTransfer(
-          std::make_unique<kv_cache::KVCacheManagerBase>(
-              layer_buffers, local_port,
-              host_blocks_to_allocate.value_or(num_slots * max_blocks),
-              unsafe_skip_buffer_lock, parallelism, host_allocator),
+          layer_buffers, /*slice_byte_size=*/0, /*dimensions=*/{},
+          /*physical_size=*/0, local_port, host_blocks_to_allocate,
+          unsafe_skip_buffer_lock, parallelism, std::move(host_allocator),
           node_id, local_control_port, max_blocks, num_slots, timeout_s,
           std::move(metrics_collector)) {}
 
@@ -515,7 +671,17 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     : KVCacheManagerWithTransfer(
           std::make_unique<kv_cache::KVCacheManagerBase>(
               layer_buffers, local_port,
-              host_blocks_to_allocate.value_or(num_slots * max_blocks),
+              static_cast<int>(ResolveHostBlocksToAllocate(
+                  host_blocks_to_allocate, num_slots, max_blocks,
+                  layer_buffers.size(),
+                  layer_buffers.empty() ? 0 : layer_buffers[0].size(),
+                  slice_byte_size > 0
+                      ? slice_byte_size
+                      : ((layer_buffers.empty() || layer_buffers[0].empty())
+                             ? 0
+                             : raiden::GetMajorSliceByteSize(
+                                   layer_buffers[0][0].shape)),
+                  ResolveActiveDataNicCount())),
               unsafe_skip_buffer_lock, parallelism, host_allocator,
               /*bind_ip=*/std::nullopt,
               slice_byte_size > 0 ? std::make_optional(slice_byte_size)
@@ -545,10 +711,18 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
     int64_t max_blocks, int64_t num_slots, double timeout_s,
     std::shared_ptr<MetricsCollector> metrics_collector)
     : KVCacheManagerWithTransfer(
-          std::make_unique<kv_cache::KVCacheManagerBase>(
-              num_layers, num_shards, std::move(slice_byte_sizes), local_port,
-              host_blocks_to_allocate.value_or(num_slots * max_blocks),
-              parallelism, nullptr),
+          [&] {
+            const size_t first_slice_byte_size =
+                slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0];
+            const int host_blocks =
+                static_cast<int>(ResolveHostBlocksToAllocate(
+                    host_blocks_to_allocate, num_slots, max_blocks, num_layers,
+                    num_shards, first_slice_byte_size,
+                    ResolveActiveDataNicCount()));
+            return std::make_unique<kv_cache::KVCacheManagerBase>(
+                num_layers, num_shards, std::move(slice_byte_sizes), local_port,
+                host_blocks, parallelism, nullptr);
+          }(),
           node_id, local_control_port, max_blocks, num_slots, timeout_s,
           std::move(metrics_collector)) {}
 
@@ -558,16 +732,31 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
   // while one is still running.
   shutting_down_.store(true, std::memory_order_relaxed);
   std::vector<std::shared_ptr<TransferSession>> sessions_to_wait;
+  std::vector<std::shared_ptr<TransferSendSession>> gated_send_sessions;
+  const absl::Status cancel_status =
+      absl::CancelledError("KVCacheManagerWithTransfer shutting down");
   {
     absl::MutexLock lock(mu_);
+    for (auto& [_, parent] : parent_send_registrations_) {
+      for (auto& s : parent.pending_h2h_sessions) {
+        gated_send_sessions.push_back(std::move(s));
+      }
+    }
+    parent_send_registrations_.clear();
+    sub_uuid_to_parent_.clear();
+
+    for (auto& [_, chain] : active_recv_chains_) {
+      AbortRecvChainLocked(chain, /*terminal_status=*/nullptr,
+                           /*siblings_to_cancel=*/nullptr);
+    }
+    active_recv_chains_.clear();
+
     sessions_to_wait.reserve(
         send_sessions_.size() + active_recv_sessions_.size() +
         active_pool_reshard_sends_.size() + active_pool_reshard_recvs_.size());
-    const absl::Status cancel_status =
-        absl::CancelledError("KVCacheManagerWithTransfer shutting down");
     for (const auto& [uuid, session] : send_sessions_) {
       (void)uuid;
-      session->Finish(cancel_status);
+      session->CancelFromManagerLocked(cancel_status);
       sessions_to_wait.push_back(session);
     }
     for (const auto& [uuid, session] : active_recv_sessions_) {
@@ -593,6 +782,10 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
     absl::MutexLock lock(pull_workers_mu_);
     pull_workers_mu_.Await(absl::Condition(
         +[](int* active) { return *active == 0; }, &active_pull_workers_));
+  }
+  for (const auto& s : gated_send_sessions) {
+    if (!s->IsDraining()) s->Finish(cancel_status);
+    s->DropH2hGateHold();
   }
   for (const auto& session : sessions_to_wait) {
     session->AwaitForDone().IgnoreError();
@@ -644,11 +837,72 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       ConfigureDataPortFromKvTransfer();
     }
   }
-  staging_allocator_ =
-      CreateStagingBlockAllocator(base_.get(), num_slots, max_blocks);
-  if (local_control_port_ >= 0) {
-    StartControlServer();
+  const int64_t env_blocks = ReadEnvStagingWindowBlocks().value_or(0);
+  const bool has_env_window = (env_blocks > 0 || env_blocks == -1);
+  const bool bounded_host_pool =
+      base_->host_block_manager() != nullptr && num_slots > 0 &&
+      max_blocks > 0 &&
+      base_->host_block_manager()->total_blocks() <
+          static_cast<size_t>(num_slots * max_blocks);
+  staging_allocator_ = CreateStagingBlockAllocator(
+      base_.get(), num_slots, max_blocks,
+      (has_env_window || bounded_host_pool) ? std::make_optional(true)
+                                            : std::nullopt);
+  if (local_control_port_ >= 0) StartControlServer();
+  if (has_env_window) {
+    SetStagingWindowConfig(env_blocks, ReadEnvStagingWindowDepth().value_or(
+                                           kDefaultStagingWindowDepth));
   }
+}
+
+void KVCacheManagerWithTransfer::SetStagingWindowConfig(int64_t window_blocks,
+                                                        int32_t window_depth) {
+  if (window_blocks < -1) {
+    throw std::invalid_argument(
+        absl::StrCat("window_blocks must be >= -1, got ", window_blocks));
+  }
+  if (window_depth <= 0) {
+    throw std::invalid_argument(
+        absl::StrCat("window_depth must be > 0, got ", window_depth));
+  }
+  window_depth_ = window_depth;
+  const int64_t num_slots =
+      staging_allocator_ ? staging_allocator_->num_slots() : 0;
+  const int64_t max_blocks =
+      staging_allocator_ ? staging_allocator_->max_blocks() : 0;
+  window_blocks_ = window_blocks == -1
+                       ? ResolveDefaultStagingWindowBlocks(
+                             base_.get(), max_blocks,
+                             ReadEnvStagingWindowTargetBytesPerNic(
+                                 kDefaultStagingWindowTargetBytesPerNic),
+                             window_depth_)
+                       : std::max<int64_t>(0, window_blocks);
+
+  if (window_blocks_ > 0 && staging_allocator_ != nullptr &&
+      !staging_allocator_->dynamic_host_staging()) {
+    std::vector<int> slot_block_ids;
+    for (int64_t s = 0; s < num_slots; ++s) {
+      auto blocks = staging_allocator_->slot_blocks(s);
+      slot_block_ids.insert(slot_block_ids.end(), blocks.begin(), blocks.end());
+    }
+    staging_allocator_.reset();
+    if (base_->host_block_manager() != nullptr && !slot_block_ids.empty()) {
+      CheckStatus("SetStagingWindowConfig",
+                  base_->host_block_manager()->Deallocate(slot_block_ids));
+    }
+    staging_allocator_ = CreateStagingBlockAllocator(
+        base_.get(), num_slots, max_blocks, /*dynamic_host_staging=*/true);
+  }
+  LOG(INFO) << "Staging window config: window_blocks=" << window_blocks_
+            << " window_depth=" << window_depth_ << " host_pool_blocks="
+            << (base_ != nullptr && base_->host_block_manager() != nullptr
+                    ? base_->host_block_manager()->total_blocks()
+                    : 0)
+            << " host_pool_mib="
+            << (base_ != nullptr
+                    ? static_cast<double>(base_->GetAllocatedHostDramBytes()) /
+                          (1024.0 * 1024.0)
+                    : 0.0);
 }
 
 int64_t KVCacheManagerWithTransfer::NotifyForRead(
@@ -664,10 +918,11 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
     return 0;
   }
 
+  const auto effective_deadline = deadline.value_or(DeadlineFromNow());
   absl::StatusOr<std::shared_ptr<TransferSendSession>> created =
-      TransferSendSession::Create(
-          base_.get(), staging_allocator_.get(), req_id, uuid, block_ids,
-          deadline.value_or(DeadlineFromNow()), register_start);
+      TransferSendSession::Create(base_.get(), staging_allocator_.get(), req_id,
+                                  uuid, block_ids, effective_deadline,
+                                  register_start, /*manager=*/this);
   // An invalid registration is a caller bug rather than an empty transfer:
   // throw immediately instead of returning 0, which callers interpret as
   // "nothing to send" and then wait until the consumer's pull times out.
@@ -675,17 +930,36 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
     throw std::invalid_argument(std::string(created.status().message()));
   }
   std::shared_ptr<TransferSendSession> session = *std::move(created);
-
   {
     absl::MutexLock lock(mu_);
-    if (pending_acks_.erase(uuid) > 0) {
+    bool has_pending_ack = (pending_acks_.erase(uuid) > 0);
+    for (int32_t c = 1;
+         !pending_acks_.empty() && c < static_cast<int32_t>(block_ids.size());
+         ++c) {
+      has_pending_ack |= (pending_acks_.erase(SubPlanUuid(uuid, c)) > 0);
+    }
+    if (has_pending_ack) {
       done_sending_.insert(req_id);
       return 0;
     }
-    if (!send_sessions_.try_emplace(uuid, session).second) {
+    if (send_sessions_.contains(uuid) ||
+        parent_send_registrations_.contains(uuid)) {
       throw std::runtime_error(
           absl::StrCat("NotifyForRead rejected duplicate uuid=", uuid,
                        " for req_id=", req_id, ": a read is still registered"));
+    }
+    send_sessions_[uuid] = session;
+    parent_send_registrations_[uuid] = ParentSendRegistration{
+        .req_id = req_id,
+        .base_uuid = uuid,
+        .registered_block_set = {block_ids.begin(), block_ids.end()},
+        .total_blocks = block_ids.size(),
+        .deadline = effective_deadline,
+        .register_start = register_start,
+    };
+    // Register every possible sub-plan: the consumer chooses the chunking.
+    for (int32_t c = 0; c < static_cast<int32_t>(block_ids.size()); ++c) {
+      sub_uuid_to_parent_[SubPlanUuid(uuid, c)] = {uuid, c};
     }
   }
   cv_.SignalAll();
@@ -702,13 +976,8 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
 
 absl::Status KVCacheManagerWithTransfer::EmplaceRecvSessionLocked(
     uint64_t uuid, const std::shared_ptr<TransferReceiveSession>& session) {
-  auto existing = active_recv_sessions_.find(uuid);
-  if (existing != active_recv_sessions_.end() && existing->second->Done()) {
-    (!existing->second->GetStatus().ok() ? failed_recving_ : done_recving_)
-        .insert(existing->second->req_id());
-    transfer_details_[existing->second->req_id()] = existing->second->Details();
-    active_recv_sessions_.erase(existing);
-  }
+  RetireSettledRecvSessionLocked(uuid, /*settled_plans=*/nullptr,
+                                 /*siblings_to_cancel=*/nullptr);
   // try_emplace leaves session untouched on a duplicate. Callers rely on that
   // guarantee to release staging owned by the rejected session.
   if (!active_recv_sessions_.try_emplace(uuid, session).second) {
@@ -968,10 +1237,196 @@ void KVCacheManagerWithTransfer::UnregisterSettledPlan(uint64_t uuid,
 
 void KVCacheManagerWithTransfer::MaybeUnregisterSettledRecv(
     uint64_t uuid, TransferReceiveSession& session) {
+  if (!session.Done()) return;
   uint64_t generation = 0;
-  if (session.Done() && session.TakePendingUnregister(&generation)) {
+  if (session.TakePendingUnregister(&generation)) {
     UnregisterSettledPlan(uuid, generation);
   }
+  OnRecvSessionSettled(uuid, session);
+}
+
+void KVCacheManagerWithTransfer::RetireSettledRecvSessionLocked(
+    uint64_t uuid, std::vector<std::pair<uint64_t, uint64_t>>* settled_plans,
+    std::vector<std::shared_ptr<TransferReceiveSession>>* siblings_to_cancel) {
+  auto it = active_recv_sessions_.find(uuid);
+  if (it == active_recv_sessions_.end() || !it->second->Done()) return;
+  std::shared_ptr<TransferReceiveSession> session = it->second;
+  if (settled_plans != nullptr) {
+    uint64_t gen = 0;
+    if (session->TakePendingUnregister(&gen)) {
+      settled_plans->emplace_back(uuid, gen);
+    }
+  }
+  active_recv_sessions_.erase(it);
+
+  if (auto rc = recv_chains_.find(session->req_id());
+      session->sub_plan_count() > 1 || rc == recv_chains_.end() ||
+      !rc->second.anchored || rc->second.plan_uuids.contains(uuid)) {
+    RecordPoolReshardTerminalLocked(
+        /*is_recv=*/true, session->req_id(), uuid, session->sub_plan_index(),
+        session->sub_plan_count(), session->GetStatus(), session->Details());
+  }
+
+  if (auto chain_it = active_recv_chains_.find(session->req_id());
+      chain_it != active_recv_chains_.end()) {
+    ActiveRecvChain& c = chain_it->second;
+    if (uuid == SubPlanUuid(c.base_uuid, session->sub_plan_index())) {
+      c.in_flight_sub_plans = std::max<int32_t>(0, c.in_flight_sub_plans - 1);
+      if (!session->GetStatus().ok()) {
+        AbortRecvChainLocked(c, /*terminal_status=*/nullptr,
+                             siblings_to_cancel);
+      }
+      if (c.in_flight_sub_plans == 0 &&
+          (c.aborted || c.next_sub_plan_index >= c.sub_plan_count)) {
+        active_recv_chains_.erase(chain_it);
+      }
+    }
+  }
+}
+
+void KVCacheManagerWithTransfer::AbortRecvChainLocked(
+    ActiveRecvChain& chain, const absl::Status* terminal_status,
+    std::vector<std::shared_ptr<TransferReceiveSession>>* siblings_to_cancel) {
+  chain.aborted = true;
+  if (terminal_status != nullptr) {
+    RecordPoolReshardTerminalLocked(
+        /*is_recv=*/true, chain.req_id,
+        SubPlanUuid(chain.base_uuid, chain.next_sub_plan_index),
+        chain.next_sub_plan_index, chain.sub_plan_count, *terminal_status);
+  }
+  if (siblings_to_cancel != nullptr) {
+    for (int32_t c = 0; c < chain.next_sub_plan_index; ++c) {
+      auto sib_it = active_recv_sessions_.find(SubPlanUuid(chain.base_uuid, c));
+      if (sib_it != active_recv_sessions_.end() && !sib_it->second->Done()) {
+        siblings_to_cancel->push_back(sib_it->second);
+      }
+    }
+  }
+}
+
+void KVCacheManagerWithTransfer::CancelAndUnregisterRecvSiblings(
+    absl::Span<const std::shared_ptr<TransferReceiveSession>> siblings) {
+  for (const auto& sib : siblings) {
+    if (!sib->IsDraining()) {
+      sib->Finish(absl::CancelledError("Receive chain aborted"));
+    }
+    MaybeUnregisterSettledRecv(sib->uuid(), *sib);
+  }
+}
+
+void KVCacheManagerWithTransfer::DispatchNextRecvSubPlansLocked(
+    ActiveRecvChain& chain, std::vector<DispatchedSubRecv>* to_start,
+    std::vector<std::shared_ptr<TransferReceiveSession>>* siblings_to_cancel) {
+  const size_t total_blocks = chain.remote_block_ids.size();
+  const size_t c_blocks =
+      static_cast<size_t>(std::max<int64_t>(1, chain.window_blocks));
+  while (!IsShuttingDown() && !chain.aborted &&
+         chain.in_flight_sub_plans < chain.window_depth &&
+         chain.next_sub_plan_index < chain.sub_plan_count) {
+    const int32_t c = chain.next_sub_plan_index;
+    const size_t begin = static_cast<size_t>(c) * c_blocks;
+    if (begin >= total_blocks) break;
+    const size_t count = std::min(total_blocks, begin + c_blocks) - begin;
+    const uint64_t sub_uuid = SubPlanUuid(chain.base_uuid, c);
+    RetireSettledRecvSessionLocked(sub_uuid, nullptr, siblings_to_cancel);
+
+    auto created = TransferReceiveSession::Create(
+        base_.get(), staging_allocator_.get(), sub_uuid, chain.req_id,
+        {chain.remote_block_ids.begin() + begin,
+         chain.remote_block_ids.begin() + begin + count},
+        {chain.local_block_ids.begin() + begin,
+         chain.local_block_ids.begin() + begin + count},
+        std::nullopt, chain.deadline, c, chain.sub_plan_count,
+        metrics_collector_);
+    absl::Status status = created.ok()
+                              ? EmplaceRecvSessionLocked(sub_uuid, *created)
+                              : created.status();
+    if (!status.ok()) {
+      if (created.ok()) (*created)->ReleaseStaging();
+      if (!created.ok() && absl::IsResourceExhausted(status)) break;
+      AbortRecvChainLocked(chain, &status, siblings_to_cancel);
+      break;
+    }
+    ++chain.next_sub_plan_index;
+    ++chain.in_flight_sub_plans;
+    if (to_start)
+      to_start->push_back({*std::move(created), chain.remote_endpoint});
+  }
+}
+
+void KVCacheManagerWithTransfer::ResumeOrExpireRecvChainsLocked(
+    std::chrono::steady_clock::time_point now,
+    std::vector<DispatchedSubRecv>* to_start,
+    std::vector<std::shared_ptr<TransferReceiveSession>>* siblings_to_cancel) {
+  for (auto it = active_recv_chains_.begin();
+       it != active_recv_chains_.end();) {
+    ActiveRecvChain& chain = it->second;
+    if (!chain.aborted && chain.next_sub_plan_index < chain.sub_plan_count) {
+      if (chain.deadline <= now) {
+        const absl::Status s =
+            absl::DeadlineExceededError("Receive session timed out");
+        AbortRecvChainLocked(chain, &s, siblings_to_cancel);
+      } else {
+        DispatchNextRecvSubPlansLocked(chain, to_start, siblings_to_cancel);
+      }
+    }
+    if (chain.in_flight_sub_plans == 0 &&
+        (chain.aborted || chain.next_sub_plan_index >= chain.sub_plan_count)) {
+      active_recv_chains_.erase(it++);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void KVCacheManagerWithTransfer::StartDispatchedRecvSessions(
+    std::vector<DispatchedSubRecv> to_start) {
+  for (auto& item : to_start) {
+    const int64_t num_blocks = item.session->total_blocks();
+    if (metrics_collector_) {
+      const uint64_t bytes = static_cast<uint64_t>(num_blocks) *
+                             base_->num_layers() * base_->num_shards() *
+                             base_->slice_byte_size();
+      metrics_collector_->RecordStart(
+          item.session->uuid(), item.session->req_id(), num_blocks, bytes);
+    }
+    if (num_blocks == 0) {
+      item.session->Finish();
+      MaybeUnregisterSettledRecv(item.session->uuid(), *item.session);
+      continue;
+    }
+    if (absl::Status status =
+            FaultInjectStatus(hooks::kKvCacheManagerApiStartReadSubmitPull);
+        !status.ok()) {
+      item.session->Finish(status);
+      item.session->EndRecvOp();
+      MaybeUnregisterSettledRecv(item.session->uuid(), *item.session);
+      continue;
+    }
+    item.session->ExecutePullRequest(*this, item.remote_endpoint);
+  }
+}
+
+void KVCacheManagerWithTransfer::OnRecvSessionSettled(
+    uint64_t uuid, TransferReceiveSession& session) {
+  if (IsShuttingDown()) return;
+  std::vector<std::pair<uint64_t, uint64_t>> settled_plans;
+  std::vector<std::shared_ptr<TransferReceiveSession>> siblings_to_cancel;
+  std::vector<DispatchedSubRecv> to_start;
+  {
+    absl::MutexLock lock(mu_);
+    if (session.sub_plan_count() > 1 ||
+        active_recv_chains_.contains(session.req_id())) {
+      RetireSettledRecvSessionLocked(uuid, &settled_plans, &siblings_to_cancel);
+    }
+    ResumeOrExpireRecvChainsLocked(std::chrono::steady_clock::now(), &to_start,
+                                   &siblings_to_cancel);
+  }
+  for (const auto& [plan_uuid, generation] : settled_plans) {
+    UnregisterSettledPlan(plan_uuid, generation);
+  }
+  CancelAndUnregisterRecvSiblings(siblings_to_cancel);
+  StartDispatchedRecvSessions(std::move(to_start));
 }
 
 void KVCacheManagerWithTransfer::MaybeUnregisterSettledReshardRecv(
@@ -1074,78 +1529,106 @@ void KVCacheManagerWithTransfer::StartRead(
   // block id exceeds num_host_blocks. If the caller didn't supply explicit host
   // indices, borrow a staging slot and stage into its reserved host blocks
   // (slot.block_ids -- the real, possibly non-contiguous host blocks).
-  std::shared_ptr<TransferReceiveSession> session;
+  std::vector<std::pair<uint64_t, uint64_t>> settled_plans;
+  std::vector<std::shared_ptr<TransferReceiveSession>> siblings_to_cancel;
+  std::vector<DispatchedSubRecv> to_start;
   {
     absl::MutexLock lock(mu_);
-    auto incumbent = active_recv_sessions_.find(uuid);
-    if (incumbent != active_recv_sessions_.end()) {
-      if (incumbent->second->Done()) {
-        (!incumbent->second->GetStatus().ok() ? failed_recving_ : done_recving_)
-            .insert(incumbent->second->req_id());
-        transfer_details_[incumbent->second->req_id()] =
-            incumbent->second->Details();
-        active_recv_sessions_.erase(incumbent);
-      } else {
-        LOG(ERROR) << "StartRead rejected duplicate uuid=" << uuid
-                   << " for req_id=" << req_id;
-        // Re-delivery of the same announcement is idempotent. The incumbent
-        // remains responsible for producing this request's one terminal report.
-        if (incumbent->second->req_id() != req_id) {
-          failed_recving_.insert(req_id);
-          transfer_details_[req_id] =
-              DetailsFromStatus(absl::AlreadyExistsError(absl::StrCat(
-                  "StartRead rejected duplicate uuid=", uuid,
-                  ", already receiving req_id=", incumbent->second->req_id())));
+    const int64_t c_blocks = std::max<int64_t>(1, window_blocks_);
+    const int32_t w_depth = std::max<int32_t>(1, window_depth_);
+    const size_t k = remote_block_ids.size();
+    const bool use_bounded_window = window_blocks_ > 0 &&
+                                    !local_host_block_ids.has_value() &&
+                                    !remote_block_ids.empty();
+    const int32_t sub_plan_count =
+        use_bounded_window
+            ? static_cast<int32_t>((k + static_cast<size_t>(c_blocks) - 1) /
+                                   static_cast<size_t>(c_blocks))
+            : 1;
+
+    std::string incumbent_req_id;
+    for (int32_t c = 0; c < sub_plan_count && incumbent_req_id.empty(); ++c) {
+      const uint64_t cand_uuid = SubPlanUuid(uuid, c);
+      RetireSettledRecvSessionLocked(cand_uuid, &settled_plans,
+                                     &siblings_to_cancel);
+      if (auto it = active_recv_sessions_.find(cand_uuid);
+          it != active_recv_sessions_.end() && !it->second->Done()) {
+        incumbent_req_id = it->second->req_id();
+        break;
+      }
+      for (const auto& [_, chain] : active_recv_chains_) {
+        for (int32_t sc = 0; sc < chain.sub_plan_count; ++sc) {
+          if (static_cast<uint64_t>(SubPlanUuid(chain.base_uuid, sc)) ==
+              cand_uuid) {
+            incumbent_req_id = chain.req_id;
+            break;
+          }
         }
-        return;
+        if (!incumbent_req_id.empty()) break;
       }
     }
 
-    absl::StatusOr<std::shared_ptr<TransferReceiveSession>> created =
-        TransferReceiveSession::Create(base_.get(), staging_allocator_.get(),
-                                       uuid, req_id, remote_block_ids,
-                                       local_block_ids, local_host_block_ids,
-                                       effective_deadline, metrics_collector_);
-    if (!created.ok()) {
-      failed_recving_.insert(req_id);
-      transfer_details_[req_id] = DetailsFromStatus(created.status());
-      return;
+    if (!incumbent_req_id.empty()) {
+      LOG(ERROR) << "StartRead rejected duplicate uuid=" << uuid
+                 << " for req_id=" << req_id;
+      if (incumbent_req_id != req_id) {
+        failed_recving_.insert(req_id);
+        transfer_details_[req_id] = DetailsFromStatus(absl::AlreadyExistsError(
+            absl::StrCat("StartRead rejected duplicate uuid=", uuid,
+                         ", already receiving req_id=", incumbent_req_id)));
+      }
+    } else if (use_bounded_window) {
+      if (auto old_it = active_recv_chains_.find(req_id);
+          old_it != active_recv_chains_.end()) {
+        AbortRecvChainLocked(old_it->second, /*terminal_status=*/nullptr,
+                             &siblings_to_cancel);
+      }
+      for (int32_t c = 0; c < sub_plan_count; ++c) {
+        NoteSubPlanRegisteredLocked(/*is_recv=*/true, req_id,
+                                    SubPlanUuid(uuid, c), c, sub_plan_count);
+      }
+      ActiveRecvChain& chain = (active_recv_chains_[req_id] = ActiveRecvChain{
+                                    .req_id = req_id,
+                                    .remote_endpoint = remote_endpoint,
+                                    .base_uuid = uuid,
+                                    .remote_block_ids = remote_block_ids,
+                                    .local_block_ids = local_block_ids,
+                                    .deadline = effective_deadline,
+                                    .window_blocks = c_blocks,
+                                    .window_depth = w_depth,
+                                    .sub_plan_count = sub_plan_count});
+      DispatchNextRecvSubPlansLocked(chain, &to_start, &siblings_to_cancel);
+      if (chain.in_flight_sub_plans == 0 &&
+          (chain.aborted ||
+           chain.next_sub_plan_index >= chain.sub_plan_count)) {
+        active_recv_chains_.erase(req_id);
+      }
+    } else {
+      NoteSubPlanRegisteredLocked(/*is_recv=*/true, req_id, uuid, 0, 1);
+      auto created = TransferReceiveSession::Create(
+          base_.get(), staging_allocator_.get(), uuid, req_id, remote_block_ids,
+          local_block_ids, local_host_block_ids, effective_deadline,
+          /*sub_plan_index=*/0, /*sub_plan_count=*/1, metrics_collector_);
+      absl::Status inserted = created.ok()
+                                  ? EmplaceRecvSessionLocked(uuid, *created)
+                                  : created.status();
+      if (!inserted.ok()) {
+        if (created.ok()) (*created)->ReleaseStaging();
+        failed_recving_.insert(req_id);
+        transfer_details_[req_id] = DetailsFromStatus(inserted);
+        LOG(ERROR) << "StartRead failed to register req_id=" << req_id
+                   << ", uuid=" << uuid << ": " << inserted.message();
+      } else {
+        to_start.push_back({*std::move(created), remote_endpoint});
+      }
     }
-    session = *std::move(created);
-
-    absl::Status inserted = EmplaceRecvSessionLocked(uuid, session);
-    if (!inserted.ok()) {
-      session->ReleaseStaging();
-      failed_recving_.insert(req_id);
-      transfer_details_[req_id] = DetailsFromStatus(inserted);
-      LOG(ERROR) << "StartRead failed to register req_id=" << req_id
-                 << ", uuid=" << uuid << ": " << inserted.message();
-      return;
-    }
   }
 
-  const int64_t num_blocks = session->total_blocks();
-  if (metrics_collector_) {
-    uint64_t total_bytes = static_cast<uint64_t>(num_blocks) *
-                           base_->num_layers() * base_->num_shards() *
-                           base_->slice_byte_size();
-    metrics_collector_->RecordStart(uuid, req_id, num_blocks, total_bytes);
+  for (const auto& [plan_uuid, generation] : settled_plans) {
+    UnregisterSettledPlan(plan_uuid, generation);
   }
-
-  if (num_blocks == 0) {
-    session->Finish();
-    return;
-  }
-
-  if (absl::Status status =
-          FaultInjectStatus(hooks::kKvCacheManagerApiStartReadSubmitPull);
-      !status.ok()) {
-    session->Finish(status);
-    session->EndRecvOp();
-    return;
-  }
-
-  session->ExecutePullRequest(*this, remote_endpoint);
+  CancelAndUnregisterRecvSiblings(siblings_to_cancel);
+  StartDispatchedRecvSessions(std::move(to_start));
 }
 
 CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
@@ -1153,31 +1636,48 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
   FaultInjectThrow(hooks::kKvCacheManagerApiCompleteRead);
   CompleteReadResult completions;
   std::vector<std::pair<uint64_t, uint64_t>> settled_plans;
+  std::vector<std::shared_ptr<TransferSendSession>> sessions_to_release;
+  std::vector<std::shared_ptr<TransferReceiveSession>> siblings_to_cancel;
+  std::vector<DispatchedSubRecv> to_start;
+  const auto now = std::chrono::steady_clock::now();
   {
     absl::MutexLock lock(mu_);
-    const auto now = std::chrono::steady_clock::now();
-    for (auto it = send_sessions_.begin(); it != send_sessions_.end();) {
-      const std::shared_ptr<TransferSendSession> session = it->second;
-      const uint64_t uuid = it->first;
+    std::vector<uint64_t> send_uuids;
+    for (const auto& [uuid, session] : send_sessions_) {
       if (!session->IsDraining() && session->deadline() <= now) {
-        // Past its deadline the transfer failed. One nobody pulled is
-        // reported now; one whose copies or pushes still run keeps its
-        // staging until they end, so the next transfer is never seated on
-        // memory a copy still writes.
-        session->Finish(absl::DeadlineExceededError("Send session timed out"));
+        session->CancelFromManagerLocked(
+            absl::DeadlineExceededError("Send session timed out"));
       }
-      if (session->Done()) {
-        const bool failed = !session->GetStatus().ok();
-        (failed ? failed_recving_ : done_sending_).insert(session->req_id());
-        transfer_details_[session->req_id()] = session->Details();
-        if (failed) {
-          settled_plans.emplace_back(uuid, 0);
+      send_uuids.push_back(uuid);
+    }
+    for (auto it = parent_send_registrations_.begin();
+         it != parent_send_registrations_.end();) {
+      std::erase_if(it->second.pending_h2h_sessions, [&](auto& s) {
+        if (!s->IsDraining()) return false;
+        sessions_to_release.push_back(std::move(s));
+        return true;
+      });
+      if (it->second.deadline <= now &&
+          std::none_of(send_sessions_.begin(), send_sessions_.end(),
+                       [&](const auto& kv) {
+                         return kv.second->base_uuid() == it->first;
+                       })) {
+        if (!it->second.failed) {
+          failed_recving_.insert(it->second.req_id);
+          transfer_details_[it->second.req_id] = DetailsFromStatus(
+              absl::DeadlineExceededError("Send session timed out"));
         }
-        base_->ClearRemoteLayerAddrs(uuid);
-        send_sessions_.erase(it++);
+        for (auto& s : it->second.pending_h2h_sessions) {
+          sessions_to_release.push_back(std::move(s));
+        }
+        CleanupParentSendRegistrationLocked((it++)->first);
       } else {
         ++it;
       }
+    }
+    for (uint64_t uuid : send_uuids) {
+      RetireSettledSendSessionLocked(uuid, &settled_plans,
+                                     &sessions_to_release);
     }
     for (auto it = active_pool_reshard_sends_.begin();
          it != active_pool_reshard_sends_.end();) {
@@ -1204,10 +1704,8 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
     // died or never finished pushing). Without this the session and its host
     // staging slot leak forever, eventually exhausting the slot pool. Surface
     // the timeout as a recv failure so the connector can recompute the blocks.
-    for (auto it = active_recv_sessions_.begin();
-         it != active_recv_sessions_.end();) {
-      const uint64_t uuid = it->first;
-      const std::shared_ptr<TransferReceiveSession> session = it->second;
+    std::vector<uint64_t> recv_uuids;
+    for (const auto& [uuid, session] : active_recv_sessions_) {
       if (!session->IsDraining()) {
         if (session->IsReadyToComplete()) {
           LOG(INFO) << "CompleteReadRaw (polling completion): req_id="
@@ -1222,19 +1720,10 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
               absl::DeadlineExceededError("Receive session timed out"));
         }
       }
-
-      if (session->Done()) {
-        (!session->GetStatus().ok() ? failed_recving_ : done_recving_)
-            .insert(session->req_id());
-        transfer_details_[session->req_id()] = session->Details();
-        uint64_t generation = 0;
-        if (session->TakePendingUnregister(&generation)) {
-          settled_plans.emplace_back(uuid, generation);
-        }
-        active_recv_sessions_.erase(it++);
-      } else {
-        ++it;
-      }
+      recv_uuids.push_back(uuid);
+    }
+    for (uint64_t uuid : recv_uuids) {
+      RetireSettledRecvSessionLocked(uuid, &settled_plans, &siblings_to_cancel);
     }
     for (auto it = active_pool_reshard_recvs_.begin();
          it != active_pool_reshard_recvs_.end();) {
@@ -1265,6 +1754,7 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
         ++it;
       }
     }
+    ResumeOrExpireRecvChainsLocked(now, &to_start, &siblings_to_cancel);
     SweepSubPlanChainsLocked(now);
     completions.sent.assign(done_sending_.begin(), done_sending_.end());
     completions.received.assign(done_recving_.begin(), done_recving_.end());
@@ -1274,6 +1764,11 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
     done_recving_.clear();
     failed_recving_.clear();
   }
+  for (const auto& s : sessions_to_release) {
+    if (!s->IsDraining()) s->Finish(absl::CancelledError("Send chain aborted"));
+    s->DropH2hGateHold();
+  }
+  CancelAndUnregisterRecvSiblings(siblings_to_cancel);
   // Unregistering drops the plan and its transport receive-progress counters
   // (ForgetPushProgress), so a settled uuid is reusable.
   for (const auto& [uuid, generation] : settled_plans) {
@@ -1282,6 +1777,7 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
     // still hold bounded-staging arena slots.
     base_->ReleasePoolStagingLeases(uuid);
   }
+  StartDispatchedRecvSessions(std::move(to_start));
   for (const std::string& req_id : completions.failed) {
     auto details_it = completions.details.find(req_id);
     LOG(WARNING) << DescribeFailure(
@@ -1454,32 +1950,72 @@ KVCacheManagerWithTransfer::HandlePullStream(
       absl::MutexLock lock(mu_);
       const absl::Time give_up = absl::Now() + grace;
       while (true) {
-        auto it = send_sessions_.find(req.uuid);
-        if (it != send_sessions_.end()) {
-          session = it->second;
-          break;
-        }
+        if (sub_uuid_to_parent_.contains(req.uuid)) break;
         const absl::Duration left = give_up - absl::Now();
-        if (stopping_.load() || left <= absl::ZeroDuration()) {
-          break;
-        }
+        if (stopping_.load() || left <= absl::ZeroDuration()) break;
         cv_.WaitWithTimeout(&mu_, left);
       }
       if (stopping_.load()) {
         return PullStreamResponseSpec{
             .status = -1, .message = "Producer control server is stopping"};
       }
-      if (!session) {
+
+      const auto now = std::chrono::steady_clock::now();
+      auto sub_it = sub_uuid_to_parent_.find(req.uuid);
+      auto parent_it =
+          sub_it != sub_uuid_to_parent_.end()
+              ? parent_send_registrations_.find(sub_it->second.base_uuid)
+              : parent_send_registrations_.end();
+      if (parent_it == parent_send_registrations_.end()) {
         throw std::runtime_error(
-            absl::StrCat("no read registered for uuid ", req.uuid, " within ",
-                         absl::FormatDuration(grace),
-                         ": the producer expired it or never registered it"));
+            absl::StrCat("no read registered for uuid ", req.uuid));
       }
-      // Registration guards prevent a live session from being replaced, so an
-      // expired session cannot become valid while this pull waits out the
-      // grace.
-      session->ValidateAndBeginPull(req.src_block_ids,
-                                    std::chrono::steady_clock::now());
+      ParentSendRegistration& parent = parent_it->second;
+      if (parent.failed) {
+        throw std::runtime_error(absl::StrCat("read registration for uuid ",
+                                              req.uuid, " has failed"));
+      }
+      if (now >= parent.deadline) {
+        throw std::runtime_error(
+            absl::StrCat("read registration for uuid ", req.uuid, " expired"));
+      }
+      for (int64_t b : req.src_block_ids) {
+        if (!parent.registered_block_set.contains(b)) {
+          throw std::invalid_argument(
+              "pull stream requested block not registered by producer");
+        }
+        if (parent.claimed_blocks.contains(b)) {
+          throw std::invalid_argument(
+              "pull stream requested block already claimed");
+        }
+      }
+      const int32_t sub_idx = sub_it->second.sub_plan_index;
+      auto it = send_sessions_.find(req.uuid);
+      if (sub_idx == 0) {
+        if (it == send_sessions_.end()) {
+          throw std::runtime_error(
+              absl::StrCat("pull already started for uuid ", req.uuid));
+        }
+        session = it->second;
+      } else {
+        if (it != send_sessions_.end()) {
+          throw std::runtime_error(
+              absl::StrCat("pull already started for uuid ", req.uuid));
+        }
+        auto created = TransferSendSession::Create(
+            base_.get(), staging_allocator_.get(), parent.req_id, req.uuid,
+            req.src_block_ids, parent.deadline, parent.register_start, this,
+            parent.base_uuid, sub_idx);
+        if (!created.ok()) {
+          throw std::runtime_error(std::string(created.status().message()));
+        }
+        session = *std::move(created);
+      }
+      session->ValidateAndBeginPull(req.src_block_ids, now);
+      if (sub_idx > 0) send_sessions_.emplace(req.uuid, session);
+      parent.claimed_blocks.insert(req.src_block_ids.begin(),
+                                   req.src_block_ids.end());
+      ++parent.sub_pulls_dispatched;
       base_->SetRemoteLayerAddrs(req.uuid, req.layer_host_addrs);
     }
 
@@ -1571,14 +2107,28 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
   LOG(INFO) << "Waiting for pending transfer work to complete...";
   const absl::Time start = absl::Now();
   while (true) {
+    std::vector<DispatchedSubRecv> to_start;
+    std::vector<std::shared_ptr<TransferReceiveSession>> siblings_to_cancel;
     {
       absl::MutexLock lock(mu_);
+      ResumeOrExpireRecvChainsLocked(std::chrono::steady_clock::now(),
+                                     &to_start, &siblings_to_cancel);
       bool recv_pending = false;
       for (const auto& [uuid, session] : active_recv_sessions_) {
         (void)uuid;
         if (!session->Done()) {
           recv_pending = true;
           break;
+        }
+      }
+      if (!recv_pending) {
+        for (const auto& [_, chain] : active_recv_chains_) {
+          if (!chain.aborted &&
+              (chain.in_flight_sub_plans > 0 ||
+               chain.next_sub_plan_index < chain.sub_plan_count)) {
+            recv_pending = true;
+            break;
+          }
         }
       }
       if (!recv_pending) {
@@ -1607,7 +2157,7 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
           }
         }
       }
-      if (!recv_pending && !send_pending) {
+      if (!recv_pending && !send_pending && to_start.empty()) {
         break;
       }
       const absl::Duration elapsed = absl::Now() - start;
@@ -1616,6 +2166,8 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
             "Timeout waiting for pending transfer work");
       }
     }
+    CancelAndUnregisterRecvSiblings(siblings_to_cancel);
+    StartDispatchedRecvSessions(std::move(to_start));
     absl::SleepFor(absl::Milliseconds(100));
   }
   LOG(INFO) << "All pending transfer work completed.";
@@ -1645,6 +2197,168 @@ void KVCacheManagerWithTransfer::AckSend(uint64_t uuid) {
          << DurationMs(session->register_start(), ack_done)
          << " failed=" << (!session->GetStatus().ok() ? 1 : 0);
   EmitTimingLog(timing.str());
+}
+
+bool KVCacheManagerWithTransfer::TryEnterSendH2hGate(
+    uint64_t base_uuid, int32_t sub_plan_index,
+    std::shared_ptr<TransferSendSession> session, bool* rejected) {
+  absl::MutexLock lock(mu_);
+  auto parent_it = parent_send_registrations_.find(base_uuid);
+  if (IsShuttingDown() || session->IsDraining() ||
+      (parent_it != parent_send_registrations_.end() &&
+       parent_it->second.failed)) {
+    *rejected = true;
+    return false;
+  }
+  *rejected = false;
+  if (parent_it == parent_send_registrations_.end()) return true;
+  ParentSendRegistration& parent = parent_it->second;
+  if (!parent.h2h_in_flight &&
+      sub_plan_index == parent.next_h2h_sub_plan_index) {
+    parent.h2h_in_flight = true;
+    return true;
+  }
+  parent.pending_h2h_sessions.insert(
+      std::upper_bound(parent.pending_h2h_sessions.begin(),
+                       parent.pending_h2h_sessions.end(), session,
+                       [](const auto& a, const auto& b) {
+                         return a->sub_plan_index() < b->sub_plan_index();
+                       }),
+      std::move(session));
+  return false;
+}
+
+void KVCacheManagerWithTransfer::OnSendSessionSettled(
+    uint64_t uuid, TransferSendSession& session) {
+  if (IsShuttingDown()) return;
+  std::vector<std::pair<uint64_t, uint64_t>> settled_plans;
+  std::vector<std::shared_ptr<TransferSendSession>> sessions_to_release;
+  std::shared_ptr<TransferSendSession> next_to_start;
+  {
+    absl::MutexLock lock(mu_);
+    RetireSettledSendSessionLocked(uuid, &settled_plans, &sessions_to_release);
+    if (auto it = parent_send_registrations_.find(session.base_uuid());
+        it != parent_send_registrations_.end() && !it->second.failed &&
+        session.sub_plan_index() == it->second.next_h2h_sub_plan_index) {
+      ParentSendRegistration& p = it->second;
+      p.h2h_in_flight = false;
+      p.next_h2h_sub_plan_index = session.sub_plan_index() + 1;
+      while (
+          !p.pending_h2h_sessions.empty() &&
+          (p.pending_h2h_sessions.front()->IsDraining() || IsShuttingDown())) {
+        if (p.pending_h2h_sessions.front()->sub_plan_index() ==
+            p.next_h2h_sub_plan_index) {
+          ++p.next_h2h_sub_plan_index;
+        }
+        sessions_to_release.push_back(
+            std::move(p.pending_h2h_sessions.front()));
+        p.pending_h2h_sessions.pop_front();
+      }
+      if (!p.pending_h2h_sessions.empty() &&
+          p.pending_h2h_sessions.front()->sub_plan_index() ==
+              p.next_h2h_sub_plan_index) {
+        next_to_start = std::move(p.pending_h2h_sessions.front());
+        p.pending_h2h_sessions.pop_front();
+        p.h2h_in_flight = true;
+      }
+    }
+  }
+  for (const auto& [plan_uuid, gen] : settled_plans) {
+    UnregisterSettledPlan(plan_uuid, gen);
+    base_->ReleasePoolStagingLeases(plan_uuid);
+  }
+  const absl::Status chain_status =
+      session.GetStatus().ok() ? absl::CancelledError("Send chain aborted")
+                               : session.GetStatus();
+  for (const auto& s : sessions_to_release) {
+    if (!s->IsDraining()) s->Finish(chain_status);
+    s->DropH2hGateHold();
+  }
+  if (next_to_start != nullptr) next_to_start->StartGatedH2h();
+}
+
+void KVCacheManagerWithTransfer::CleanupParentSendRegistrationLocked(
+    uint64_t base_uuid) {
+  auto it = parent_send_registrations_.find(base_uuid);
+  if (it == parent_send_registrations_.end()) return;
+  for (size_t c = 0; c < it->second.total_blocks; ++c) {
+    sub_uuid_to_parent_.erase(SubPlanUuid(base_uuid, static_cast<int32_t>(c)));
+  }
+  parent_send_registrations_.erase(it);
+}
+
+void KVCacheManagerWithTransfer::RetireSettledSendSessionLocked(
+    uint64_t uuid, std::vector<std::pair<uint64_t, uint64_t>>* settled_plans,
+    std::vector<std::shared_ptr<TransferSendSession>>* sessions_to_release) {
+  auto it = send_sessions_.find(uuid);
+  if (it == send_sessions_.end() || !it->second->Done()) return;
+
+  std::shared_ptr<TransferSendSession> session = it->second;
+  base_->ClearRemoteLayerAddrs(uuid);
+  send_sessions_.erase(it);
+
+  auto parent_it = parent_send_registrations_.find(session->base_uuid());
+  if (parent_it == parent_send_registrations_.end()) {
+    const bool failed = !session->GetStatus().ok();
+    if (failed && settled_plans) settled_plans->emplace_back(uuid, 0);
+    if (!done_sending_.contains(session->req_id()) &&
+        !failed_recving_.contains(session->req_id())) {
+      (failed ? failed_recving_ : done_sending_).insert(session->req_id());
+      transfer_details_[session->req_id()] = session->Details();
+    }
+    return;
+  }
+
+  ParentSendRegistration& parent = parent_it->second;
+  const bool has_remaining_siblings = std::any_of(
+      send_sessions_.begin(), send_sessions_.end(), [&](const auto& kv) {
+        return kv.second->base_uuid() == parent.base_uuid;
+      });
+
+  if (!session->GetStatus().ok()) {
+    if (settled_plans) settled_plans->emplace_back(uuid, 0);
+    if (!parent.failed) {
+      parent.failed = true;
+      failed_recving_.insert(parent.req_id);
+      transfer_details_[parent.req_id] = session->Details();
+    }
+    if (sessions_to_release) {
+      for (auto& s : parent.pending_h2h_sessions) {
+        sessions_to_release->push_back(std::move(s));
+      }
+      for (auto& [_, s] : send_sessions_) {
+        if (s->base_uuid() == parent.base_uuid && !s->Done()) {
+          sessions_to_release->push_back(s);
+        }
+      }
+    }
+    parent.pending_h2h_sessions.clear();
+  }
+  if (parent.failed) {
+    if (!has_remaining_siblings) {
+      CleanupParentSendRegistrationLocked(parent.base_uuid);
+    }
+    return;
+  }
+
+  parent.settled_blocks += session->pulled_blocks();
+  const bool single_pull_complete =
+      uuid == parent.base_uuid && parent.sub_pulls_dispatched == 1 &&
+      (window_blocks_ <= 0 ||
+       session->pulled_blocks() < static_cast<size_t>(window_blocks_) ||
+       parent.total_blocks <= static_cast<size_t>(window_blocks_));
+  if ((parent.sub_pulls_dispatched == 0 && session->pulled_blocks() == 0 &&
+       uuid == parent.base_uuid) ||
+      single_pull_complete || parent.settled_blocks >= parent.total_blocks) {
+    if (!done_sending_.contains(parent.req_id) &&
+        !failed_recving_.contains(parent.req_id)) {
+      done_sending_.insert(parent.req_id);
+      transfer_details_[parent.req_id] = session->Details();
+    }
+    if (!has_remaining_siblings) {
+      CleanupParentSendRegistrationLocked(parent.base_uuid);
+    }
+  }
 }
 
 std::chrono::steady_clock::time_point

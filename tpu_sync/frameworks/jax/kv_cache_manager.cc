@@ -201,10 +201,13 @@ NumaAwareKVCacheManager::Create(nanobind::list kv_caches, int64_t node_id,
                                 int64_t local_control_port, int64_t max_blocks,
                                 int64_t num_slots, double timeout_s,
                                 bool unsafe_skip_buffer_lock, int parallelism,
-                                bool enable_shm) {
+                                bool enable_shm,
+                                std::optional<int> host_blocks_to_allocate,
+                                int64_t window_blocks, int32_t window_depth) {
   return Create(UnpackAndMove(std::move(kv_caches), unsafe_skip_buffer_lock),
                 node_id, local_control_port, max_blocks, num_slots, timeout_s,
-                unsafe_skip_buffer_lock, parallelism, enable_shm);
+                unsafe_skip_buffer_lock, parallelism, enable_shm,
+                host_blocks_to_allocate, window_blocks, window_depth);
 }
 
 absl::StatusOr<std::unique_ptr<NumaAwareKVCacheManager>>
@@ -212,14 +215,17 @@ NumaAwareKVCacheManager::Create(UnpackedCache&& cache, int64_t node_id,
                                 int64_t local_control_port, int64_t max_blocks,
                                 int64_t num_slots, double timeout_s,
                                 bool unsafe_skip_buffer_lock, int parallelism,
-                                bool enable_shm) {
+                                bool enable_shm,
+                                std::optional<int> host_blocks_to_allocate,
+                                int64_t window_blocks, int32_t window_depth) {
   auto manager = absl::WrapUnique(
       new NumaAwareKVCacheManager(std::move(cache.device_arrays)));
   manager->metrics_collector_ = MetricsCollectorFromEnv();
   ABSL_RETURN_IF_ERROR(manager->InitSubManagers(
-      cache.layer_buffers, std::nullopt, std::nullopt, unsafe_skip_buffer_lock,
-      parallelism, node_id, local_control_port, max_blocks, num_slots,
-      timeout_s, enable_shm));
+      cache.layer_buffers, std::nullopt, host_blocks_to_allocate,
+      unsafe_skip_buffer_lock, parallelism, node_id, local_control_port,
+      max_blocks, num_slots, timeout_s, enable_shm, window_blocks,
+      window_depth));
   return manager;
 }
 #endif
@@ -246,16 +252,19 @@ NumaAwareKVCacheManager::Create(
     const std::vector<std::vector<xla::PjRtBuffer*>>& device_buffers,
     int64_t node_id, int64_t local_control_port, int64_t max_blocks,
     int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
-    int parallelism, bool enable_shm) {
+    int parallelism, bool enable_shm,
+    std::optional<int> host_blocks_to_allocate, int64_t window_blocks,
+    int32_t window_depth) {
   ABSL_ASSIGN_OR_RETURN(
       std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers,
       ::tpu_raiden::UnpackLayers(device_buffers, unsafe_skip_buffer_lock));
   auto manager = absl::WrapUnique(new NumaAwareKVCacheManager());
   manager->metrics_collector_ = MetricsCollectorFromEnv();
   ABSL_RETURN_IF_ERROR(manager->InitSubManagers(
-      layer_buffers, std::nullopt, std::nullopt, unsafe_skip_buffer_lock,
-      parallelism, node_id, local_control_port, max_blocks, num_slots,
-      timeout_s, enable_shm));
+      layer_buffers, std::nullopt, host_blocks_to_allocate,
+      unsafe_skip_buffer_lock, parallelism, node_id, local_control_port,
+      max_blocks, num_slots, timeout_s, enable_shm, window_blocks,
+      window_depth));
   return manager;
 }
 
@@ -306,7 +315,8 @@ absl::Status NumaAwareKVCacheManager::InitSubManagers(
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     bool unsafe_skip_buffer_lock, int parallelism, int64_t node_id,
     int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
-    double timeout_s, bool enable_shm) {
+    double timeout_s, bool enable_shm, int64_t window_blocks,
+    int32_t window_depth) {
   if (layer_buffers.empty()) return absl::OkStatus();
   size_t num_layers = layer_buffers.size();
   total_num_shards_ = layer_buffers[0].size();
@@ -394,6 +404,20 @@ absl::Status NumaAwareKVCacheManager::InitSubManagers(
         }
       }
 
+      const size_t sub_num_shards =
+          sub_buffers.empty() ? 0 : sub_buffers[0].size();
+      const size_t sub_slice_byte_size =
+          (sub_buffers.empty() || sub_buffers[0].empty())
+              ? 0
+              : raiden::GetMajorSliceByteSize(sub_buffers[0][0].shape);
+      const size_t sub_num_nics =
+          (numa_to_shards.size() > 1) ? 1 : std::max<size_t>(1, num_ext_nics);
+      const int64_t resolved_host_blocks = ResolveHostBlocksToAllocate(
+          host_blocks_to_allocate, num_slots, max_blocks, num_layers,
+          sub_num_shards, sub_slice_byte_size, sub_num_nics,
+          window_blocks != 0 ? std::make_optional(window_blocks) : std::nullopt,
+          window_blocks != 0 ? std::make_optional(window_depth) : std::nullopt);
+
       xla::PjRtClient* client = nullptr;
       if (!sub_buffers.empty() && !sub_buffers[0].empty()) {
         if (sub_buffers[0][0].device != nullptr) {
@@ -405,11 +429,8 @@ absl::Status NumaAwareKVCacheManager::InitSubManagers(
       if (enable_shm && shm_key_env != nullptr && std::strlen(shm_key_env) > 0) {
         // The same resolution KVCacheManagerWithTransfer applies, so the SHM
         // segment identity records the pool size actually allocated.
-        const int64_t num_host_blocks = host_blocks_to_allocate.has_value()
-                                            ? *host_blocks_to_allocate
-                                            : num_slots * max_blocks;
         host_alloc = ::tpu_raiden::CreateHostMemoryAllocator(
-            client, enable_shm, num_host_blocks,
+            client, enable_shm, resolved_host_blocks,
             (sub_buffers.empty() || sub_buffers[0].empty())
                 ? 0
                 : sub_buffers[0][0].GetOnDeviceSizeInBytes());
@@ -436,12 +457,16 @@ absl::Status NumaAwareKVCacheManager::InitSubManagers(
                                   ? local_control_port + sub_idx
                                   : local_control_port;
 
+      std::optional<int> sub_host_blocks =
+          (local_control_port >= 0 || window_blocks != 0)
+              ? std::make_optional(static_cast<int>(resolved_host_blocks))
+              : host_blocks_to_allocate;
       std::unique_ptr<KVCacheManagerWithTransfer> sub_mgr;
       try {
         sub_mgr = std::make_unique<KVCacheManagerWithTransfer>(
-            sub_buffers, sub_port, host_blocks_to_allocate,
-            unsafe_skip_buffer_lock, parallelism, host_alloc, node_id + sub_idx,
-            sub_ctrl_port, max_blocks, num_slots, timeout_s);
+            sub_buffers, sub_port, sub_host_blocks, unsafe_skip_buffer_lock,
+            parallelism, host_alloc, node_id + sub_idx, sub_ctrl_port,
+            max_blocks, num_slots, timeout_s);
       } catch (const std::exception& e) {
         // A consecutive (or requested) port was unavailable. Retry the whole
         // allocation from a fresh ephemeral base; for fixed ports, propagate.
@@ -453,6 +478,9 @@ absl::Status NumaAwareKVCacheManager::InitSubManagers(
       }
       if (metrics_collector_) {
         sub_mgr->SetMetricsCollector(metrics_collector_);
+      }
+      if (window_blocks != 0) {
+        sub_mgr->SetStagingWindowConfig(window_blocks, window_depth);
       }
       if (local_port.has_value()) {
         (void)sub_mgr->base()->local_port();
@@ -1111,12 +1139,15 @@ KVCacheManager::CreateWithNodeId(
     int64_t max_blocks, int64_t num_slots, double timeout_s,
     bool unsafe_skip_buffer_lock, int parallelism, int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id, bool enable_shm) {
-  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<NumaAwareKVCacheManager> numa_manager,
-                        NumaAwareKVCacheManager::Create(
-                            std::move(kv_caches), node_id, local_control_port,
-                            max_blocks, num_slots, timeout_s,
-                            unsafe_skip_buffer_lock, parallelism, enable_shm));
+    std::optional<std::string> worker_id, bool enable_shm,
+    std::optional<int> host_blocks_to_allocate, int64_t window_blocks,
+    int32_t window_depth) {
+  ABSL_ASSIGN_OR_RETURN(
+      std::unique_ptr<NumaAwareKVCacheManager> numa_manager,
+      NumaAwareKVCacheManager::Create(
+          std::move(kv_caches), node_id, local_control_port, max_blocks,
+          num_slots, timeout_s, unsafe_skip_buffer_lock, parallelism,
+          enable_shm, host_blocks_to_allocate, window_blocks, window_depth));
   auto manager = absl::WrapUnique(new KVCacheManager(std::move(numa_manager)));
   ABSL_RETURN_IF_ERROR(manager->StartGrpcServer(
       raiden_worker_port, std::move(raiden_controller_address),
@@ -1149,12 +1180,15 @@ KVCacheManager::CreateFromPjRtBuffers(
     int64_t num_slots, double timeout_s, bool unsafe_skip_buffer_lock,
     int parallelism, int raiden_worker_port,
     std::optional<std::string> raiden_controller_address,
-    std::optional<std::string> worker_id) {
+    std::optional<std::string> worker_id, bool enable_shm,
+    std::optional<int> host_blocks_to_allocate, int64_t window_blocks,
+    int32_t window_depth) {
   ABSL_ASSIGN_OR_RETURN(
       std::unique_ptr<NumaAwareKVCacheManager> numa_manager,
       NumaAwareKVCacheManager::Create(
           device_buffers, node_id, local_control_port, max_blocks, num_slots,
-          timeout_s, unsafe_skip_buffer_lock, parallelism));
+          timeout_s, unsafe_skip_buffer_lock, parallelism, enable_shm,
+          host_blocks_to_allocate, window_blocks, window_depth));
   auto manager = absl::WrapUnique(new KVCacheManager(std::move(numa_manager)));
   ABSL_RETURN_IF_ERROR(manager->StartGrpcServer(
       raiden_worker_port, std::move(raiden_controller_address),

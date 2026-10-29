@@ -796,5 +796,22 @@ TEST(TransferSendSessionTest,
   EXPECT_EQ(allocator->num_free_slots(), 2);
 }
 
+TEST(TransferSendSessionTest, FindDuplicateBlockDetectsDuplicatesInLinearTime) {
+  const std::vector<int64_t> unique_blocks = {10, 20, 30, 40, 50};
+  EXPECT_EQ(TransferSendSession::FindDuplicateBlock(unique_blocks),
+            std::nullopt);
+
+  const std::vector<int64_t> empty_blocks = {};
+  EXPECT_EQ(TransferSendSession::FindDuplicateBlock(empty_blocks),
+            std::nullopt);
+
+  const std::vector<int64_t> duplicate_blocks = {5, 12, 7, 12, 9};
+  auto dup = TransferSendSession::FindDuplicateBlock(duplicate_blocks);
+  ASSERT_TRUE(dup.has_value());
+  EXPECT_EQ(dup->block_id, 12);
+  EXPECT_EQ(dup->first_index, 1);
+  EXPECT_EQ(dup->duplicate_index, 3);
+}
+
 }  // namespace
 }  // namespace tpu_raiden

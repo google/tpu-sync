@@ -34,6 +34,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
@@ -65,6 +66,7 @@ class TransferReceiveSession
       const std::vector<int64_t>& local_block_ids,
       const std::optional<std::vector<int64_t>>& local_host_block_ids,
       std::chrono::steady_clock::time_point deadline,
+      int32_t sub_plan_index = 0, int32_t sub_plan_count = 1,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
@@ -182,6 +184,9 @@ class TransferReceiveSession
     absl::MutexLock lock(mu_);
     return req_id_;
   }
+  uint64_t uuid() const { return uuid_; }
+  int32_t sub_plan_index() const { return sub_plan_index_; }
+  int32_t sub_plan_count() const { return sub_plan_count_; }
   int32_t total_blocks() const {
     absl::MutexLock lock(mu_);
     return total_blocks_;
@@ -192,13 +197,16 @@ class TransferReceiveSession
   }
 
  private:
-  TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
-                         StagingBlockAllocator* staging_allocator,
-                         uint64_t uuid,
-                         std::shared_ptr<MetricsCollector> metrics_collector)
+  TransferReceiveSession(
+      kv_cache::KVCacheManagerBase* base,
+      StagingBlockAllocator* staging_allocator, uint64_t uuid = 0,
+      int32_t sub_plan_index = 0, int32_t sub_plan_count = 1,
+      std::shared_ptr<MetricsCollector> metrics_collector = nullptr)
       : base_(base),
         staging_allocator_(staging_allocator),
         uuid_(uuid),
+        sub_plan_index_(sub_plan_index),
+        sub_plan_count_(sub_plan_count),
         metrics_collector_(std::move(metrics_collector)),
         blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0, 0),
         staging_layer_manager_(base != nullptr && base->num_host_layers() <
@@ -294,6 +302,8 @@ class TransferReceiveSession
   StagingBlockAllocator* staging_allocator_ = nullptr;
   uint64_t uuid_ = 0;
   std::shared_ptr<MetricsCollector> metrics_collector_;
+  int32_t sub_plan_index_ = 0;
+  int32_t sub_plan_count_ = 1;
   std::string req_id_ ABSL_GUARDED_BY(mu_);
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
   CopyPlan load_plan_ ABSL_GUARDED_BY(mu_);
@@ -343,6 +353,7 @@ class TransferReceiveSession
   // mu_.
   StagingLayerManager staging_layer_manager_;
   std::atomic<bool> cancelled_{false};
+  std::optional<ScopedTrace> h2d_stage_trace_ ABSL_GUARDED_BY(mu_);
 };
 
 }  // namespace tpu_raiden

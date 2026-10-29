@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -121,8 +122,43 @@ std::unique_ptr<StagingBlockAllocator> CreateStagingBlockAllocator(
     kv_cache::KVCacheManagerBase* base, int64_t num_slots, int64_t max_blocks,
     std::optional<bool> dynamic_host_staging = std::nullopt);
 
+// Derives a deterministic positive 63-bit sub-plan UUID (returns `uuid` for
+// index <= 0).
+int64_t SubPlanUuid(int64_t uuid, int32_t index);
+
+inline constexpr uint64_t kDefaultStagingWindowTargetBytesPerNic =
+    256ULL * 1024 * 1024;  // 256 MiB per active data NIC
+inline constexpr int32_t kDefaultStagingWindowDepth = 2;
+
+// Returns the active data-plane NIC count (at least 1).
+size_t ResolveActiveDataNicCount(
+    std::optional<size_t> num_ext_nics = std::nullopt);
+
+// Computes staging window size C (in blocks) from KV geometry and NIC count.
+int64_t ResolveDefaultStagingWindowBlocks(
+    size_t num_layers, size_t num_shards, size_t slice_byte_size,
+    size_t num_nics, int64_t max_blocks,
+    uint64_t target_bytes_per_nic = kDefaultStagingWindowTargetBytesPerNic,
+    std::optional<size_t> host_pool_blocks = std::nullopt,
+    int32_t window_depth = kDefaultStagingWindowDepth);
+
+int64_t ResolveDefaultStagingWindowBlocks(
+    const kv_cache::KVCacheManagerBase* base, int64_t max_blocks,
+    uint64_t target_bytes_per_nic = kDefaultStagingWindowTargetBytesPerNic,
+    int32_t window_depth = kDefaultStagingWindowDepth);
+
+// Resolves the host block pool size from explicit override, window config, or
+// slots.
+int64_t ResolveHostBlocksToAllocate(
+    std::optional<int> host_blocks_to_allocate, int64_t num_slots,
+    int64_t max_blocks, size_t num_layers = 0, size_t num_shards = 0,
+    size_t slice_byte_size = 0, size_t num_nics = 1,
+    std::optional<int64_t> window_blocks = std::nullopt,
+    std::optional<int32_t> window_depth = std::nullopt);
+
 class KVCacheManagerWithTransfer {
  public:
+  friend class TransferSendSession;
   friend class TransferReceiveSession;
   friend class ReshardReceiveSession;
 
@@ -173,6 +209,14 @@ class KVCacheManagerWithTransfer {
 
   kv_cache::KVCacheManagerBase* base() { return base_.get(); }
   const kv_cache::KVCacheManagerBase* base() const { return base_.get(); }
+
+  void SetStagingWindowConfig(
+      int64_t window_blocks, int32_t window_depth = kDefaultStagingWindowDepth);
+  int64_t window_blocks() const { return window_blocks_; }
+  int32_t window_depth() const { return window_depth_; }
+  StagingBlockAllocator* staging_allocator() const {
+    return staging_allocator_.get();
+  }
 
   // Registers `block_ids` to be served when a consumer pulls `uuid`. Returns
   // `uuid`, or 0 when there is nothing to send (`block_ids` is empty, or the
@@ -322,6 +366,9 @@ class KVCacheManagerWithTransfer {
   // see DeriveControlTimeoutS.
   double control_timeout_s_ = 10.0;
 
+  int64_t window_blocks_ = 0;
+  int32_t window_depth_ = kDefaultStagingWindowDepth;
+
   std::unique_ptr<StagingBlockAllocator> staging_allocator_;
   // TransferSendSession is shared across threads: created/timed-out/cleaned-up
   // on the main thread, but accessed asynchronously in control worker threads
@@ -367,17 +414,86 @@ class KVCacheManagerWithTransfer {
                                    uint64_t uuid, int32_t sub_plan_index,
                                    int32_t sub_plan_count)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  // Records a settled pool-reshard session of plan `uuid` (`is_recv` selects
-  // the role) into the terminal sets, aggregating per request across its
-  // sub-plans.
-  void RecordPoolReshardTerminalLocked(bool is_recv, const std::string& req_id,
-                                       uint64_t uuid, int32_t sub_plan_index,
-                                       int32_t sub_plan_count,
-                                       const absl::Status& status)
+  // Records completion of sub-plan `uuid` into the request's terminal status.
+  void RecordPoolReshardTerminalLocked(
+      bool is_recv, const std::string& req_id, uint64_t uuid,
+      int32_t sub_plan_index, int32_t sub_plan_count,
+      const absl::Status& status,
+      std::optional<TransferDetails> details = std::nullopt)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   // Fails stalled sub-plan chains and expires reported ones.
   void SweepSubPlanChainsLocked(std::chrono::steady_clock::time_point now)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  struct ParentSendRegistration {
+    std::string req_id;
+    uint64_t base_uuid = 0;
+    absl::flat_hash_set<int64_t> registered_block_set, claimed_blocks;
+    size_t total_blocks = 0, settled_blocks = 0;
+    int32_t sub_pulls_dispatched = 0, next_h2h_sub_plan_index = 0;
+    std::chrono::steady_clock::time_point deadline, register_start;
+    std::deque<std::shared_ptr<TransferSendSession>> pending_h2h_sessions;
+    bool h2h_in_flight = false, failed = false;
+  };
+  struct SubSendParentRef {
+    uint64_t base_uuid = 0;
+    int32_t sub_plan_index = 0;
+  };
+  absl::flat_hash_map<uint64_t, ParentSendRegistration>
+      parent_send_registrations_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<uint64_t, SubSendParentRef> sub_uuid_to_parent_
+      ABSL_GUARDED_BY(mu_);
+
+  bool TryEnterSendH2hGate(uint64_t base_uuid, int32_t sub_plan_index,
+                           std::shared_ptr<TransferSendSession> session,
+                           bool* rejected);
+  void OnSendSessionSettled(uint64_t uuid, TransferSendSession& session);
+  void RetireSettledSendSessionLocked(
+      uint64_t uuid, std::vector<std::pair<uint64_t, uint64_t>>* settled_plans,
+      std::vector<std::shared_ptr<TransferSendSession>>* sessions_to_release)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void CleanupParentSendRegistrationLocked(uint64_t base_uuid)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  struct ActiveRecvChain {
+    std::string req_id, remote_endpoint;
+    uint64_t base_uuid = 0;
+    std::vector<int64_t> remote_block_ids, local_block_ids;
+    std::chrono::steady_clock::time_point deadline;
+    int64_t window_blocks = 0;
+    int32_t window_depth = kDefaultStagingWindowDepth, sub_plan_count = 1;
+    int32_t next_sub_plan_index = 0, in_flight_sub_plans = 0;
+    bool aborted = false;
+  };
+  struct DispatchedSubRecv {
+    std::shared_ptr<TransferReceiveSession> session;
+    std::string remote_endpoint;
+  };
+  absl::flat_hash_map<std::string, ActiveRecvChain> active_recv_chains_
+      ABSL_GUARDED_BY(mu_);
+
+  void RetireSettledRecvSessionLocked(
+      uint64_t uuid, std::vector<std::pair<uint64_t, uint64_t>>* settled_plans,
+      std::vector<std::shared_ptr<TransferReceiveSession>>* siblings_to_cancel)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void DispatchNextRecvSubPlansLocked(
+      ActiveRecvChain& chain, std::vector<DispatchedSubRecv>* to_start,
+      std::vector<std::shared_ptr<TransferReceiveSession>>* siblings_to_cancel)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void ResumeOrExpireRecvChainsLocked(
+      std::chrono::steady_clock::time_point now,
+      std::vector<DispatchedSubRecv>* to_start,
+      std::vector<std::shared_ptr<TransferReceiveSession>>* siblings_to_cancel)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void AbortRecvChainLocked(
+      ActiveRecvChain& chain, const absl::Status* terminal_status,
+      std::vector<std::shared_ptr<TransferReceiveSession>>* siblings_to_cancel)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void CancelAndUnregisterRecvSiblings(
+      absl::Span<const std::shared_ptr<TransferReceiveSession>> siblings);
+  void StartDispatchedRecvSessions(std::vector<DispatchedSubRecv> to_start);
+  void OnRecvSessionSettled(uint64_t uuid, TransferReceiveSession& session);
+
   absl::Mutex mu_;
   absl::CondVar cv_;
   std::atomic<bool> stopping_{false};
@@ -399,6 +515,8 @@ class KVCacheManagerWithTransfer {
   // uploads and every push it admitted have ended); a no-op before then.
   void MaybeUnregisterSettledReshardRecv(uint64_t uuid,
                                          ReshardReceiveSession& session);
+
+ protected:
   absl::StatusOr<PullStreamResponseSpec> HandlePullStream(
       const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);
   absl::Status HandleAck(uint64_t uuid);

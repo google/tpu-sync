@@ -41,6 +41,8 @@ class KVCacheManager:
       worker_id: Optional[str] = None,
       enable_shm: bool = False,
       backend_configs: Optional[Sequence[Any]] = None,
+      window_blocks: int = 0,
+      window_depth: int = 2,
   ):
     """Instantiates the TransferEngine-based KVCacheManager.
 
@@ -55,13 +57,13 @@ class KVCacheManager:
       host_blocks_to_allocate: Legacy/unified total blocks to allocate in host
         pool.
       parallelism: Number of parallel network copies per layer.
-      node_id: This worker's index among the workers of its store: the
-        workers registering with one controller must cover the dense range
-        [0, expected_worker_count) (checked when the store has a global
-        registry). Peer stores pair transfers on it -- worker k of one store
-        reads from worker k of another -- so it must name the same KV shard
-        in every store: the rank within the engine (TP x PCP x PP), not a
-        rank counted across data-parallel replicas.
+      node_id: This worker's index among the workers of its store: the workers
+        registering with one controller must cover the dense range [0,
+        expected_worker_count) (checked when the store has a global registry).
+        Peer stores pair transfers on it -- worker k of one store reads from
+        worker k of another -- so it must name the same KV shard in every store:
+        the rank within the engine (TP x PCP x PP), not a rank counted across
+        data-parallel replicas.
       raiden_worker_port: Optional port for WorkerService gRPC server.
       raiden_controller_address: Optional address of central RaidenController.
         If provided, the WorkerService gRPC server is enabled.
@@ -78,8 +80,15 @@ class KVCacheManager:
         and set `<axis>_rank` to this worker's rank in [0, size). Duplicate or
         missing ranks cause wrong or missed recalls. An invalid config aborts
         the process (LOG(FATAL)) at registration.
+      window_blocks: Number of blocks per sub-transfer in bounded-window mode.
+      window_depth: Number of sub-transfers in flight concurrently.
     """
-    if host_blocks_to_allocate is not None:
+    if (
+        max_blocks is None
+        and num_slots is None
+        and window_blocks == 0
+        and host_blocks_to_allocate is not None
+    ):
       self._impl = _impl.KVCacheManager(
           kv_caches,
           local_control_port if local_control_port > 0 else None,
@@ -113,6 +122,9 @@ class KVCacheManager:
           raiden_controller_address=raiden_controller_address,
           worker_id=worker_id,
           enable_shm=enable_shm,
+          host_blocks_to_allocate=host_blocks_to_allocate,
+          window_blocks=window_blocks,
+          window_depth=window_depth,
       )
     if backend_configs:
       self._impl.register_kv_backends(list(backend_configs))

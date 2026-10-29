@@ -22,8 +22,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <future>
+#include <ios>
+#include <iterator>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -39,17 +42,22 @@
 #include "absl/base/log_severity.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/log/scoped_mock_log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "xla/future.h"
+#include "tpu_sync/common/trace.h"
+#include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
@@ -72,6 +80,7 @@ using ::testing::HasSubstr;
 using ::testing::IsEmpty;
 using ::testing::Le;
 using ::testing::Optional;
+using ::testing::UnorderedElementsAre;
 
 constexpr int64_t kSlots = 2;
 constexpr double kTimeoutS = 0.05;
@@ -85,6 +94,17 @@ class TestManager : public KVCacheManagerWithTransfer {
                                    /*local_control_port=*/-1, /*max_blocks=*/1,
                                    /*num_slots=*/kSlots, timeout_s) {}
 
+  ~TestManager() override {
+    std::vector<std::function<void(absl::Status)>> pending;
+    {
+      absl::MutexLock lock(h2h_mu_);
+      pending.swap(h2h_callbacks_);
+    }
+    for (auto& cb : pending) {
+      if (cb) cb(absl::CancelledError("TestManager shutting down"));
+    }
+  }
+
   // Serves a pull for `uuid` the way ProcessPullStream does once the
   // consumer is acknowledged: the push runs on this thread and returns
   // with its copies issued.
@@ -93,6 +113,7 @@ class TestManager : public KVCacheManagerWithTransfer {
     {
       absl::MutexLock lock(mu_);
       session = send_sessions_.at(uuid);
+      served_sends_[uuid] = session;
     }
     session->StartPush({"127.0.0.1:1"}, /*src_block_ids=*/{0},
                        /*dst_block_ids=*/{0});
@@ -117,6 +138,43 @@ class TestManager : public KVCacheManagerWithTransfer {
     session->Finish(absl::CancelledError("send cancelled"));
   }
 
+  using KVCacheManagerWithTransfer::HandleAck;
+  absl::StatusOr<PullStreamResponseSpec> ProcessPull(
+      uint64_t uuid, std::vector<int64_t> blocks) {
+    return HandlePullStream(
+        PullStreamRequestSpec{.uuid = uuid,
+                              .consumer_data_port = 1,
+                              .consumer_ips = {"127.0.0.1"},
+                              .src_block_ids = std::move(blocks),
+                              .dst_block_ids = {0}},
+        "");
+  }
+  int h2h_calls() {
+    absl::MutexLock lock(h2h_mu_);
+    return h2h_calls_;
+  }
+  size_t active_h2h_count() {
+    absl::MutexLock lock(h2h_mu_);
+    return active_h2h_uuids_.size();
+  }
+  bool WaitForH2hCalls(int expected,
+                       absl::Duration timeout = absl::Seconds(5)) {
+    absl::MutexLock lock(h2h_mu_);
+    auto done = [&] {
+      h2h_mu_.AssertReaderHeld();
+      return h2h_calls_ >= expected;
+    };
+    return h2h_mu_.AwaitWithTimeout(absl::Condition(&done), timeout);
+  }
+  bool WaitForCopies(size_t expected,
+                     absl::Duration timeout = absl::Seconds(5)) {
+    absl::MutexLock lock(copies_mu_);
+    auto done = [&] {
+      copies_mu_.AssertReaderHeld();
+      return copies_.size() >= expected;
+    };
+    return copies_mu_.AwaitWithTimeout(absl::Condition(&done), timeout);
+  }
   size_t copies_issued() {
     absl::MutexLock lock(copies_mu_);
     return copies_.size();
@@ -220,14 +278,21 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   const StagingLayerManager& staging_layer_manager(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    return send_sessions_.at(uuid)->staging_layer_manager();
+    auto it = send_sessions_.find(uuid);
+    if (it != send_sessions_.end()) {
+      served_sends_[uuid] = it->second;
+      return it->second->staging_layer_manager();
+    }
+    return served_sends_.at(uuid)->staging_layer_manager();
   }
 
   absl::Status AwaitSendDone(uint64_t uuid) {
     std::shared_ptr<TransferSendSession> session;
     {
       absl::MutexLock lock(mu_);
-      session = send_sessions_.at(uuid);
+      auto it = send_sessions_.find(uuid);
+      session =
+          it != send_sessions_.end() ? it->second : served_sends_.at(uuid);
     }
     return session->AwaitForDone();
   }
@@ -276,6 +341,8 @@ class TestManager : public KVCacheManagerWithTransfer {
       {
         absl::MutexLock lock(owner_->h2h_mu_);
         if (owner_->manual_h2h_) {
+          ++owner_->h2h_calls_;
+          owner_->active_h2h_uuids_.insert(uuid);
           const size_t layer = static_cast<size_t>(layer_idx);
           std::vector<int64_t> block_ids(src_block_ids.begin(),
                                          src_block_ids.end());
@@ -284,8 +351,12 @@ class TestManager : public KVCacheManagerWithTransfer {
           owner_->h2h_chunk_ptrs_.push_back(chunks.empty() ? nullptr
                                                            : chunks[0].ptr);
           owner_->h2h_callbacks_.push_back(
-              [on_complete = std::move(on_complete),
-               src_block_ids](absl::Status status) mutable {
+              [on_complete = std::move(on_complete), src_block_ids, uuid,
+               owner = owner_](absl::Status status) mutable {
+                {
+                  absl::MutexLock lock(owner->h2h_mu_);
+                  owner->active_h2h_uuids_.erase(uuid);
+                }
                 if (!status.ok()) {
                   on_complete(std::move(status));
                   return;
@@ -309,9 +380,13 @@ class TestManager : public KVCacheManagerWithTransfer {
   std::vector<int64_t> copy_destinations_ ABSL_GUARDED_BY(copies_mu_);
   absl::Mutex h2h_mu_;
   bool manual_h2h_ ABSL_GUARDED_BY(h2h_mu_) = false;
+  int h2h_calls_ ABSL_GUARDED_BY(h2h_mu_) = 0;
+  absl::flat_hash_set<uint64_t> active_h2h_uuids_ ABSL_GUARDED_BY(h2h_mu_);
   std::vector<uint8_t*> h2h_chunk_ptrs_ ABSL_GUARDED_BY(h2h_mu_);
   std::vector<std::function<void(absl::Status)>> h2h_callbacks_
       ABSL_GUARDED_BY(h2h_mu_);
+  absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSendSession>>
+      served_sends_ ABSL_GUARDED_BY(mu_);
 };
 
 // A consumer whose host-to-device copies complete when the test says so.
@@ -1733,5 +1808,516 @@ TEST(SendLifecycleTest,
   EXPECT_EQ(producer.free_slots(), kSlots);
   EXPECT_FALSE(producer.has_send(404));
 }
+
+TEST(SendDrainTest,
+     DynamicProducerSubPullsEnforceOneChunkInH2hAndInOrderH2hEntry) {
+  TestManager producer(/*num_layers=*/1);
+  producer.SetManualH2h(true);
+  producer.SetStagingWindowConfig(1, 2);
+  ASSERT_GT(producer.NotifyForRead("req_h2h_order", 1000, {10, 20}), 0);
+  // Sub-plan 1 arrives before sub-plan 0.
+  ASSERT_TRUE(producer.ProcessPull(SubPlanUuid(1000, 1), {20}).ok());
+  ASSERT_TRUE(producer.ProcessPull(1000, {10}).ok());
+  ASSERT_TRUE(producer.WaitForCopies(2));
+  EXPECT_EQ(producer.copies_issued(), 2);
+  producer.FinishCopy(0, absl::OkStatus());
+  producer.FinishCopy(1, absl::OkStatus());
+  ASSERT_TRUE(producer.WaitForH2hCalls(1));
+  EXPECT_EQ(producer.h2h_calls(), 1);
+  EXPECT_EQ(producer.active_h2h_count(), 1);
+  producer.FinishH2h(0, absl::OkStatus());
+  ASSERT_TRUE(producer.WaitForH2hCalls(2));
+  EXPECT_EQ(producer.h2h_calls(), 2);
+  EXPECT_EQ(producer.active_h2h_count(), 1);
+  Reports during = producer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(during), IsEmpty());
+  EXPECT_THAT(FailedRecving(during), IsEmpty());
+  EXPECT_THROW(producer.NotifyForRead("req_h2h_order", 1000, {10, 20}),
+               std::runtime_error);
+  producer.FinishH2h(1, absl::OkStatus());
+  producer.WaitForPendingWork().IgnoreError();
+  Reports after = producer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(after), ElementsAre("req_h2h_order"));
+  EXPECT_THAT(FailedRecving(after), IsEmpty());
+  EXPECT_EQ(producer.base()->host_block_manager()->num_allocated_blocks(), 0u);
+}
+
+TEST(SendDrainTest,
+     GatedSendSessionCancellationTimeoutAndShutdownDoNotDeadlock) {
+  {
+    TestManager producer(/*num_layers=*/1);
+    producer.SetManualH2h(true);
+    ASSERT_GT(producer.NotifyForRead("req_fail_abort", 2000, {10, 20}), 0);
+    ASSERT_TRUE(producer.ProcessPull(SubPlanUuid(2000, 1), {20}).ok());
+    ASSERT_TRUE(producer.WaitForCopies(1));
+    ASSERT_TRUE(producer.ProcessPull(2000, {10}).ok());
+    ASSERT_TRUE(producer.WaitForCopies(2));
+    producer.FinishCopy(0, absl::OkStatus());
+    producer.FinishCopy(1, absl::InternalError("d2h failed"));
+    Reports reports = producer.CompleteReadRaw();
+    EXPECT_THAT(DoneSending(reports), IsEmpty());
+    EXPECT_THAT(FailedRecving(reports), ElementsAre("req_fail_abort"));
+    EXPECT_EQ(producer.free_slots(), kSlots);
+  }
+  {
+    auto producer = std::make_unique<TestManager>(/*num_layers=*/1);
+    producer->SetManualH2h(true);
+    ASSERT_GT(producer->NotifyForRead("req_shutdown", 3000, {10, 20}), 0);
+    ASSERT_TRUE(producer->ProcessPull(SubPlanUuid(3000, 1), {20}).ok());
+    ASSERT_TRUE(producer->WaitForCopies(1));
+    ASSERT_TRUE(producer->ProcessPull(3000, {10}).ok());
+    ASSERT_TRUE(producer->WaitForCopies(2));
+    producer->FinishCopy(0, absl::OkStatus());
+    producer->FinishCopy(1, absl::OkStatus());
+    ASSERT_TRUE(producer->WaitForH2hCalls(1));
+    producer.reset();
+  }
+  {
+    TestManager producer(/*num_layers=*/1);
+    producer.SetManualH2h(true);
+    producer.SetStagingWindowConfig(1, 2);
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    ASSERT_GT(producer.NotifyForRead("req_timeout", 4000, {10, 20}, deadline),
+              0);
+    ASSERT_TRUE(producer.ProcessPull(SubPlanUuid(4000, 1), {20}).ok());
+    ASSERT_TRUE(producer.WaitForCopies(1));
+    producer.FinishCopy(0, absl::OkStatus());
+    absl::SleepFor(absl::Milliseconds(60));
+    CompleteReadResult result = producer.CompleteReadWithDetails();
+    EXPECT_THAT(result.failed, ElementsAre("req_timeout"));
+    EXPECT_EQ(producer.base()->host_block_manager()->num_allocated_blocks(),
+              0u);
+  }
+}
+
+TEST(SendLifecycleTest,
+     PendingAckOnSubPlanAcknowledgesTransferInNotifyForRead) {
+  TestManager producer(/*num_layers=*/1);
+  EXPECT_TRUE(producer.HandleAck(SubPlanUuid(4000, 1)).ok());
+  EXPECT_EQ(producer.NotifyForRead("req_pending_sub_ack", 4000, {10, 20}), 0);
+  Reports reports = producer.CompleteReadRaw();
+  EXPECT_THAT(DoneSending(reports), ElementsAre("req_pending_sub_ack"));
+  EXPECT_THAT(FailedRecving(reports), IsEmpty());
+  EXPECT_EQ(producer.free_slots(), kSlots);
+}
+
+struct SimulatedBase : public kv_cache::KVCacheManagerBase {
+  SimulatedBase(size_t l, size_t sz, int b)
+      : kv_cache::KVCacheManagerBase(l, 1, sz, std::nullopt, b, 1, nullptr),
+        device_data(l, std::vector<uint8_t>(64 * sz)) {
+    for (size_t i = 0; i < l; ++i) {
+      for (size_t j = 0; j < 64 * sz; ++j) device_data[i][j] = i * 37 + j * 7;
+    }
+  }
+  void SetHoldH2d(bool hold) {
+    absl::MutexLock l(h2d_mu);
+    hold_h2d = hold;
+  }
+  void ReleaseH2d(absl::Status s = absl::OkStatus(), bool all = true) {
+    absl::MutexLock l(h2d_mu);
+    while (!held_promises.empty()) {
+      held_promises.front().Set(s);
+      held_promises.erase(held_promises.begin());
+      if (!all) break;
+    }
+  }
+  bool WaitForHeldH2d(size_t n) {
+    absl::MutexLock l(h2d_mu);
+    auto c = [&] {
+      h2d_mu.AssertReaderHeld();
+      return held_promises.size() >= n;
+    };
+    return h2d_mu.AwaitWithTimeout(absl::Condition(&c), absl::Seconds(5));
+  }
+  using V = const std::vector<int64_t>&;
+  using O = std::optional<size_t>;
+  using H = raiden::BufferHolders;
+  using F = raiden::PjRtCopyFuture;
+  absl::StatusOr<F> D2hSyncDispatch(V src, V dst, V sz, std::optional<int64_t>,
+                                    O l, O host_l, O s) override {
+    return Copy(false, l.value_or(0), host_l.value_or(l.value_or(0)),
+                s.value_or(0), src, dst, sz);
+  }
+  absl::StatusOr<F> H2dSyncDispatch(V src, V dst, V sz, std::optional<int64_t>,
+                                    O l, O host_l, O s) override {
+    return Copy(true, l.value_or(0), host_l.value_or(l.value_or(0)),
+                s.value_or(0), src, dst, sz);
+  }
+  F Copy(bool h2d, size_t l, size_t host_l, size_t s, V src, V dst, V sz) {
+    if (auto* m = host_block_manager()) {
+      size_t cur = m->num_allocated_blocks(), prev = peak.load();
+      while (cur > prev && !peak.compare_exchange_weak(prev, cur)) {
+      }
+    }
+    uint8_t *host = GetHostPointer(host_l, s), *dev = device_data[l].data();
+    for (size_t i = 0; i < src.size(); ++i) {
+      std::memcpy((h2d ? dev : host) + dst[i] * slice_byte_size_,
+                  (h2d ? host : dev) + src[i] * slice_byte_size_,
+                  sz[i] * slice_byte_size_);
+    }
+    absl::MutexLock lock(h2d_mu);
+    if (!h2d || !hold_h2d) return F(H{});
+    auto [p, f] = xla::MakePromise<>();
+    held_promises.push_back(std::move(p));
+    return F(std::move(f), H{});
+  }
+  std::vector<std::vector<uint8_t>> device_data;
+  absl::Mutex h2d_mu;
+  bool hold_h2d = false;
+  std::vector<xla::Promise<>> held_promises;
+  std::atomic<size_t> peak = 0;
+};
+
+class SimulatedDeviceManager : public KVCacheManagerWithTransfer {
+ public:
+  SimulatedDeviceManager(size_t l, size_t sz, int b)
+      : KVCacheManagerWithTransfer(std::make_unique<SimulatedBase>(l, sz, b), 0,
+                                   0, 8, 2, 10.0) {}
+  ~SimulatedDeviceManager() override {
+    if (sim()) sim()->ReleaseH2d();
+  }
+  SimulatedBase* sim() { return static_cast<SimulatedBase*>(base()); }
+  std::string endpoint() const {
+    return absl::StrCat("127.0.0.1:", local_control_port());
+  }
+  size_t allocated() const {
+    return base()->host_block_manager()->num_allocated_blocks();
+  }
+};
+
+void WaitUntil(std::function<bool()> check) {
+  for (const absl::Time end = absl::Now() + absl::Seconds(5);
+       !check() && absl::Now() < end;) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  ASSERT_TRUE(check());
+}
+
+TEST(BoundedWindowTest,
+     BoundedWindowStartReadTransfers4xHostCapacityWithDoubleBuffering) {
+  SimulatedDeviceManager p(2, 128, 8), c(2, 128, 4);
+  p.SetStagingWindowConfig(2, 2);
+  c.SetStagingWindowConfig(2, 2);
+  const std::vector<int64_t> b = {0, 1, 2, 3, 4, 5, 6, 7};
+  p.NotifyForRead("req_4x", 10001, b);
+  c.StartRead("req_4x", 10001, p.endpoint(), b, b);
+
+  std::vector<std::string> c_recv, p_sent;
+  WaitUntil([&] {
+    auto [s, r, f] = c.CompleteReadRaw();
+    EXPECT_THAT(f, IsEmpty());
+    c_recv.insert(c_recv.end(), r.begin(), r.end());
+    auto [ps, pr, pf] = p.CompleteReadRaw();
+    EXPECT_THAT(pf, IsEmpty());
+    p_sent.insert(p_sent.end(), ps.begin(), ps.end());
+    return !c_recv.empty() && !p_sent.empty();
+  });
+
+  EXPECT_THAT(c_recv, ElementsAre("req_4x"));
+  EXPECT_THAT(p_sent, ElementsAre("req_4x"));
+  EXPECT_EQ(c.sim()->device_data, p.sim()->device_data);
+  EXPECT_LE(c.sim()->peak.load(), 4u);
+  EXPECT_GE(c.sim()->peak.load(), 2u);
+  EXPECT_EQ(c.allocated(), 0u);
+  EXPECT_EQ(p.allocated(), 0u);
+
+  const std::vector<int64_t> b1 = {0, 1};
+  p.NotifyForRead("req_1x", 10002, b1);
+  c.StartRead("req_1x", 10002, p.endpoint(), b1, b1);
+  ABSL_ASSERT_OK(c.WaitForPendingWork());
+  CompleteReadResult r1 = c.CompleteReadWithDetails();
+  EXPECT_THAT(r1.received, ElementsAre("req_1x"));
+  EXPECT_THAT(r1.failed, IsEmpty());
+  p.WaitForPendingWork().IgnoreError();
+  EXPECT_EQ(c.allocated(), 0u);
+  EXPECT_EQ(p.allocated(), 0u);
+}
+
+TEST(
+    BoundedWindowTest,
+    BoundedWindowStartReadQueuesOnStagingContentionAndResumesWithoutBlockingMu) {
+  SimulatedDeviceManager p(2, 128, 4), c(2, 128, 2);
+  p.SetStagingWindowConfig(1, 2);
+  c.SetStagingWindowConfig(1, 2);
+  c.sim()->SetHoldH2d(true);
+  p.NotifyForRead("req_contention_1", 20001, {0, 1});
+  c.StartRead("req_contention_1", 20001, p.endpoint(), {0, 1}, {0, 1});
+
+  ASSERT_TRUE(c.sim()->WaitForHeldH2d(2));
+  EXPECT_EQ(c.allocated(), 2u);
+
+  p.NotifyForRead("req_contention_2", 20002, {2, 3});
+  const absl::Time t0 = absl::Now();
+  c.StartRead("req_contention_2", 20002, p.endpoint(), {2, 3}, {2, 3});
+  EXPECT_LT(absl::Now() - t0, absl::Milliseconds(500));
+  EXPECT_FALSE(c.IsShuttingDown());
+  EXPECT_EQ(c.allocated(), 2u);
+
+  c.sim()->SetHoldH2d(false);
+  c.sim()->ReleaseH2d();
+
+  std::vector<std::string> c_recv, p_sent;
+  WaitUntil([&] {
+    auto [cs, cr, cf] = c.CompleteReadRaw();
+    EXPECT_THAT(cf, IsEmpty());
+    c_recv.insert(c_recv.end(), cr.begin(), cr.end());
+    auto [ps, pr, pf] = p.CompleteReadRaw();
+    EXPECT_THAT(pf, IsEmpty());
+    p_sent.insert(p_sent.end(), ps.begin(), ps.end());
+    return c_recv.size() >= 2 && p_sent.size() >= 2;
+  });
+
+  EXPECT_THAT(c_recv,
+              UnorderedElementsAre("req_contention_1", "req_contention_2"));
+  EXPECT_THAT(p_sent,
+              UnorderedElementsAre("req_contention_1", "req_contention_2"));
+  EXPECT_EQ(c.sim()->device_data, p.sim()->device_data);
+  EXPECT_EQ(c.allocated(), 0u);
+  EXPECT_EQ(p.allocated(), 0u);
+}
+
+TEST(BoundedWindowTest,
+     SubPlanChainAbortsUndispatchedAndCancelsInFlightSiblingOnTimeout) {
+  SimulatedDeviceManager p(1, 128, 4), c(1, 128, 4);
+  p.SetStagingWindowConfig(1, 2);
+  c.SetStagingWindowConfig(1, 2);
+  c.sim()->SetHoldH2d(true);
+  p.NotifyForRead("req_chain_abort", 30001, {0, 1, 2, 3});
+  c.StartRead("req_chain_abort", 30001, p.endpoint(), {0, 1, 2, 3},
+              {0, 1, 2, 3});
+
+  ASSERT_TRUE(c.sim()->WaitForHeldH2d(2));
+
+  // Fail sub-plan 0's H2D copy to trigger RetireSettledRecvSessionLocked ->
+  // AbortRecvChainLocked (aborting sub-plans 2, 3) and
+  // CancelAndUnregisterRecvSiblings (cancelling sub-plan 1).
+  c.sim()->ReleaseH2d(absl::InternalError("injected h2d error"), /*all=*/false);
+  c.sim()->SetHoldH2d(false);
+  c.sim()->ReleaseH2d();
+
+  std::vector<std::string> failed;
+  WaitUntil([&] {
+    auto [s, r, f] = c.CompleteReadRaw();
+    EXPECT_THAT(r, IsEmpty());
+    failed.insert(failed.end(), f.begin(), f.end());
+    return !failed.empty();
+  });
+  EXPECT_THAT(failed, ElementsAre("req_chain_abort"));
+
+  auto after = c.CompleteReadRaw();
+  EXPECT_THAT(std::get<1>(after), IsEmpty());
+  EXPECT_THAT(std::get<2>(after), IsEmpty());
+
+  p.WaitForPendingWork().IgnoreError();
+  EXPECT_EQ(c.allocated(), 0u);
+  EXPECT_EQ(p.allocated(), 0u);
+}
+
+TEST(BoundedWindowTest,
+     ThreeStagePipelineOverlapsD2hH2hH2dWithStrictlyOneChunkInH2h) {
+  SimulatedDeviceManager p(2, 128, 4), c(2, 128, 4);
+  p.SetStagingWindowConfig(2, 2);
+  c.SetStagingWindowConfig(2, 2);
+  c.sim()->SetHoldH2d(true);
+  const std::vector<int64_t> b = {0, 1, 2, 3, 4, 5, 6, 7};
+  p.NotifyForRead("req_overlap_pipe", 50001, b);
+  c.StartRead("req_overlap_pipe", 50001, p.endpoint(), b, b);
+
+  // Sub-plan 0 enters H2D (Stage 3) and is held. Sub-plan 1 completes D2H
+  // (Stage 1) + cross-host H2H (Stage 2) and also enters Consumer H2D (Stage
+  // 3). Both sub-plans across 2 layers produce 4 held H2D promises.
+  ASSERT_TRUE(c.sim()->WaitForHeldH2d(4));
+  EXPECT_EQ(c.allocated(), 4u);
+  EXPECT_LE(p.sim()->peak.load(), 4u);
+
+  // Releasing both layers of sub-plan 0 frees D-slot 0, so sub-plan 2
+  // dispatches and enters H2D across both layers.
+  c.sim()->ReleaseH2d(absl::OkStatus(), /*all=*/false);
+  c.sim()->ReleaseH2d(absl::OkStatus(), /*all=*/false);
+
+  // With sub-plan 1 still held and sub-plan 2 entering H2D across both layers,
+  // held promises reaches 4 again.
+  ASSERT_TRUE(c.sim()->WaitForHeldH2d(4));
+
+  // Release both layers of sub-plan 1 to allow sub-plan 3 to progress into
+  // D-slot 1.
+  c.sim()->ReleaseH2d(absl::OkStatus(), /*all=*/false);
+  c.sim()->ReleaseH2d(absl::OkStatus(), /*all=*/false);
+
+  // With sub-plan 2 still held and sub-plan 3 entering H2D across both layers,
+  // held promises reaches 4 again.
+  ASSERT_TRUE(c.sim()->WaitForHeldH2d(4));
+
+  // Release remaining copies and unhold future H2D dispatches.
+  c.sim()->SetHoldH2d(false);
+  c.sim()->ReleaseH2d();
+
+  std::vector<std::string> c_recv, p_sent;
+  WaitUntil([&] {
+    auto [s, r, f] = c.CompleteReadRaw();
+    EXPECT_THAT(f, IsEmpty());
+    c_recv.insert(c_recv.end(), r.begin(), r.end());
+    auto [ps, pr, pf] = p.CompleteReadRaw();
+    EXPECT_THAT(pf, IsEmpty());
+    p_sent.insert(p_sent.end(), ps.begin(), ps.end());
+    return !c_recv.empty() && !p_sent.empty();
+  });
+
+  EXPECT_THAT(c_recv, ElementsAre("req_overlap_pipe"));
+  EXPECT_THAT(p_sent, ElementsAre("req_overlap_pipe"));
+  EXPECT_EQ(c.sim()->device_data, p.sim()->device_data);
+  EXPECT_LE(p.sim()->peak.load(), 4u);
+  EXPECT_LE(c.sim()->peak.load(), 4u);
+  EXPECT_EQ(c.allocated(), 0u);
+  EXPECT_EQ(p.allocated(), 0u);
+}
+
+TEST(BoundedWindowTest,
+     MidChainErrorAndDeadlineExpiryAbortSiblingsAndCleanUpMaps) {
+  SimulatedDeviceManager p(2, 128, 4), c(2, 128, 4);
+  p.SetStagingWindowConfig(2, 2);
+  c.SetStagingWindowConfig(2, 2);
+  c.sim()->SetHoldH2d(true);
+  const std::vector<int64_t> b = {0, 1, 2, 3, 4, 5, 6, 7};
+  const auto p_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+  p.NotifyForRead("req_mid_abort", 60001, b, p_deadline);
+  c.StartRead("req_mid_abort", 60001, p.endpoint(), b, b);
+
+  // Wait for initial sub-plans (0 and 1) to enter Consumer H2D across both
+  // layers (4 promises total) so sub-plan 1 is an active in-flight sibling.
+  ASSERT_TRUE(c.sim()->WaitForHeldH2d(4));
+
+  // Inject a failure on sub-plan 0 to abort active and queued siblings.
+  c.sim()->ReleaseH2d(absl::InternalError("injected mid-chain failure"),
+                      /*all=*/false);
+  c.sim()->SetHoldH2d(false);
+  c.sim()->ReleaseH2d();
+
+  std::vector<std::string> failed;
+  WaitUntil([&] {
+    auto [s, r, f] = c.CompleteReadRaw();
+    EXPECT_THAT(r, IsEmpty());
+    failed.insert(failed.end(), f.begin(), f.end());
+    return !failed.empty();
+  });
+  EXPECT_THAT(failed, ElementsAre("req_mid_abort"));
+
+  // Sibling completion must not emit duplicate failure notifications.
+  auto after = c.CompleteReadRaw();
+  EXPECT_THAT(std::get<1>(after), IsEmpty());
+  EXPECT_THAT(std::get<2>(after), IsEmpty());
+
+  p.WaitForPendingWork().IgnoreError();
+  (void)p.CompleteReadRaw();
+  EXPECT_EQ(c.allocated(), 0u);
+  EXPECT_EQ(p.allocated(), 0u);
+
+  // Exercise deadline expiry on a bounded-window transfer while H2D is held.
+  c.sim()->SetHoldH2d(true);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+  p.NotifyForRead("req_deadline_abort", 60002, b, deadline);
+  c.StartRead("req_deadline_abort", 60002, p.endpoint(), b, b,
+              /*parallelism=*/1, /*local_host_block_ids=*/std::nullopt,
+              deadline);
+  ASSERT_TRUE(c.sim()->WaitForHeldH2d(4));
+  absl::SleepFor(absl::Milliseconds(100));
+  c.sim()->SetHoldH2d(false);
+  c.sim()->ReleaseH2d();
+
+  std::vector<std::string> deadline_failed;
+  WaitUntil([&] {
+    auto [s, r, f] = c.CompleteReadRaw();
+    EXPECT_THAT(r, IsEmpty());
+    deadline_failed.insert(deadline_failed.end(), f.begin(), f.end());
+    return !deadline_failed.empty();
+  });
+  EXPECT_THAT(deadline_failed, ElementsAre("req_deadline_abort"));
+
+  p.WaitForPendingWork().IgnoreError();
+  (void)p.CompleteReadRaw();
+  EXPECT_EQ(c.allocated(), 0u);
+  EXPECT_EQ(p.allocated(), 0u);
+
+  // Verify internal registration/chain maps are completely cleaned up by
+  // immediately re-running a successful transfer with the same uuid and req_id.
+  p.NotifyForRead("req_mid_abort", 60001, b);
+  c.StartRead("req_mid_abort", 60001, p.endpoint(), b, b);
+
+  std::vector<std::string> c_recv, p_sent;
+  WaitUntil([&] {
+    auto [s, r, f] = c.CompleteReadRaw();
+    EXPECT_THAT(f, IsEmpty());
+    c_recv.insert(c_recv.end(), r.begin(), r.end());
+    auto [ps, pr, pf] = p.CompleteReadRaw();
+    EXPECT_THAT(pf, IsEmpty());
+    p_sent.insert(p_sent.end(), ps.begin(), ps.end());
+    return !c_recv.empty() && !p_sent.empty();
+  });
+
+  EXPECT_THAT(c_recv, ElementsAre("req_mid_abort"));
+  EXPECT_THAT(p_sent, ElementsAre("req_mid_abort"));
+  EXPECT_EQ(c.sim()->device_data, p.sim()->device_data);
+  EXPECT_EQ(c.allocated(), 0u);
+  EXPECT_EQ(p.allocated(), 0u);
+}
+
+TEST(BoundedWindowTest,
+     BoundedWindowTransferEmitsSubTransferPerfettoStageSlices) {
+  std::string temp_dir = testing::TempDir();
+  std::string trace_file =
+      absl::StrCat(temp_dir, "/raiden_subtransfer_test_",
+                   absl::ToUnixMicros(absl::Now()), ".pftrace");
+
+  StopPerfettoTraceToFile();
+  ASSERT_TRUE(StartPerfettoTraceToFile(trace_file));
+  SetTraceBackendForTesting(TraceBackend::kPerfetto);
+
+  {
+    SimulatedDeviceManager p(2, 128, 4), c(2, 128, 4);
+    p.SetStagingWindowConfig(2, 2);
+    c.SetStagingWindowConfig(2, 2);
+    const std::vector<int64_t> b = {0, 1, 2, 3};
+    p.NotifyForRead("req_trace_stages", 70001, b);
+    c.StartRead("req_trace_stages", 70001, p.endpoint(), b, b);
+
+    std::vector<std::string> c_recv, p_sent;
+    WaitUntil([&] {
+      auto [s, r, f] = c.CompleteReadRaw();
+      EXPECT_THAT(f, IsEmpty());
+      c_recv.insert(c_recv.end(), r.begin(), r.end());
+      auto [ps, pr, pf] = p.CompleteReadRaw();
+      EXPECT_THAT(pf, IsEmpty());
+      p_sent.insert(p_sent.end(), ps.begin(), ps.end());
+      return !c_recv.empty() && !p_sent.empty();
+    });
+
+    EXPECT_THAT(c_recv, ElementsAre("req_trace_stages"));
+    EXPECT_THAT(p_sent, ElementsAre("req_trace_stages"));
+    EXPECT_EQ(c.sim()->device_data, p.sim()->device_data);
+    EXPECT_EQ(c.allocated(), 0u);
+    EXPECT_EQ(p.allocated(), 0u);
+  }
+
+  SetTraceBackendForTesting(std::nullopt);
+  ASSERT_TRUE(StopPerfettoTraceToFile());
+
+  std::ifstream in(trace_file, std::ios::in | std::ios::binary);
+  ASSERT_TRUE(in.is_open());
+  std::string file_content((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+  in.close();
+
+  EXPECT_FALSE(file_content.empty());
+  absl::string_view view(file_content);
+  EXPECT_TRUE(absl::StrContains(view, "SubTransferD2h"));
+  EXPECT_TRUE(absl::StrContains(view, "SubTransferH2hGateWait"));
+  EXPECT_TRUE(absl::StrContains(view, "SubTransferH2hPush"));
+  EXPECT_TRUE(absl::StrContains(view, "SubTransferH2d"));
+  EXPECT_TRUE(absl::StrContains(view, "sub_plan_index="));
+}
+
 }  // namespace
 }  // namespace tpu_raiden

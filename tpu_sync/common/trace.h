@@ -105,6 +105,14 @@ inline bool IsTraceLoggingEnabled() {
   return false;
 }
 
+inline uint64_t SubTransferStageTrackId(uint64_t uuid, uint32_t stage_tag) {
+  uint64_t z =
+      uuid ^ (0x9E3779B97F4A7C15ULL * (static_cast<uint64_t>(stage_tag) + 1));
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return (z ^ (z >> 31)) | 1ULL;
+}
+
 // RAII scoped trace that emits trace events to TraceMe and/or Perfetto.
 class ScopedTrace {
  public:
@@ -112,36 +120,38 @@ class ScopedTrace {
       typename NameType,
       std::enable_if_t<!std::is_same_v<std::decay_t<NameType>, TraceBackend>,
                        bool> = true>
-  explicit ScopedTrace(NameType&& name, int level = 1)
-      : ScopedTrace(GetTraceBackend(), std::forward<NameType>(name), level) {}
+  explicit ScopedTrace(NameType&& name, int level = 1,
+                       std::optional<uint64_t> track_id = std::nullopt)
+      : ScopedTrace(GetTraceBackend(), std::forward<NameType>(name), level,
+                    track_id) {}
 
   template <typename NameType>
-  ScopedTrace(TraceBackend backend, NameType&& name, int level = 1) {
+  ScopedTrace(TraceBackend backend, NameType&& name, int level = 1,
+              std::optional<uint64_t> track_id = std::nullopt)
+      : track_id_(track_id) {
     Init(backend, std::forward<NameType>(name), level);
   }
 
-  ~ScopedTrace() {
-    if (perfetto_active_) {
-      PERFETTO_USE_CATEGORIES_FROM_NAMESPACE_SCOPED(tpu_raiden);
-      TRACE_EVENT_END("tpu_raiden");
-    }
-  }
+  ~ScopedTrace() { EndPerfettoSlice(); }
 
   ScopedTrace(ScopedTrace&& other) noexcept
       : traceme_(std::move(other.traceme_)),
-        perfetto_active_(other.perfetto_active_) {
+        perfetto_active_(other.perfetto_active_),
+        track_id_(other.track_id_),
+        perfetto_metadata_(std::move(other.perfetto_metadata_)) {
     other.perfetto_active_ = false;
+    other.track_id_.reset();
   }
 
   ScopedTrace& operator=(ScopedTrace&& other) noexcept {
     if (this != &other) {
-      if (perfetto_active_) {
-        PERFETTO_USE_CATEGORIES_FROM_NAMESPACE_SCOPED(tpu_raiden);
-        TRACE_EVENT_END("tpu_raiden");
-      }
+      EndPerfettoSlice();
       traceme_ = std::move(other.traceme_);
       perfetto_active_ = other.perfetto_active_;
+      track_id_ = other.track_id_;
+      perfetto_metadata_ = std::move(other.perfetto_metadata_);
       other.perfetto_active_ = false;
+      other.track_id_.reset();
     }
     return *this;
   }
@@ -158,14 +168,22 @@ class ScopedTrace {
     }
     if (perfetto_active_) {
       PERFETTO_USE_CATEGORIES_FROM_NAMESPACE_SCOPED(tpu_raiden);
+      std::string val;
+      if constexpr (std::is_invocable_v<MetadataGenerator>) {
+        val = std::string(metadata_generator());
+      } else {
+        val = std::string(metadata_generator);
+      }
+      absl::string_view sv(val);
+      if (!perfetto_metadata_.empty()) {
+        perfetto_metadata_.push_back(',');
+      }
+      perfetto_metadata_.append(sv.data(), sv.size());
       TRACE_EVENT_INSTANT(
           "tpu_raiden", "metadata", [&](::perfetto::EventContext ctx) {
             auto* annotation = ctx.event()->add_debug_annotations();
             annotation->set_name("metadata");
-            if constexpr (std::is_invocable_v<MetadataGenerator>) {
-              std::string val = std::string(metadata_generator());
-              annotation->set_string_value(val);
-            }
+            annotation->set_string_value(val);
           });
     }
   }
@@ -184,38 +202,68 @@ class ScopedTrace {
       EnsurePerfettoInitialized();
       PERFETTO_USE_CATEGORIES_FROM_NAMESPACE_SCOPED(tpu_raiden);
       if (TRACE_EVENT_CATEGORY_ENABLED("tpu_raiden")) {
-        EmitPerfettoBegin(std::forward<NameType>(name));
+        EmitPerfettoBegin(std::forward<NameType>(name), track_id_);
         perfetto_active_ = true;
       }
     }
   }
 
   template <typename NameType>
-  static void EmitPerfettoBegin(NameType&& name) {
+  static void EmitPerfettoBegin(
+      NameType&& name, std::optional<uint64_t> track_id = std::nullopt) {
     PERFETTO_USE_CATEGORIES_FROM_NAMESPACE_SCOPED(tpu_raiden);
+#define RAIDEN_EMIT_BEGIN_(event_name)                 \
+  do {                                                 \
+    if (track_id.has_value()) {                        \
+      TRACE_EVENT_BEGIN("tpu_raiden", event_name,      \
+                        ::perfetto::Track(*track_id)); \
+    } else {                                           \
+      TRACE_EVENT_BEGIN("tpu_raiden", event_name);     \
+    }                                                  \
+  } while (0)
     if constexpr (std::is_invocable_v<NameType>) {
       auto dynamic_name = name();
-      TRACE_EVENT_BEGIN(
-          "tpu_raiden",
+      RAIDEN_EMIT_BEGIN_(
           ::perfetto::DynamicString(dynamic_name.data(), dynamic_name.size()));
     } else if constexpr (std::is_same_v<std::decay_t<NameType>,
                                         ::perfetto::DynamicString> ||
                          std::is_same_v<std::decay_t<NameType>,
-                                        ::perfetto::StaticString>) {
-      TRACE_EVENT_BEGIN("tpu_raiden", name);
-    } else if constexpr (std::is_array_v<std::remove_reference_t<NameType>>) {
-      TRACE_EVENT_BEGIN("tpu_raiden", name);
+                                        ::perfetto::StaticString> ||
+                         std::is_array_v<std::remove_reference_t<NameType>>) {
+      RAIDEN_EMIT_BEGIN_(name);
     } else if constexpr (std::is_convertible_v<NameType, absl::string_view>) {
       absl::string_view sv = name;
-      TRACE_EVENT_BEGIN("tpu_raiden",
-                        ::perfetto::DynamicString(sv.data(), sv.size()));
+      RAIDEN_EMIT_BEGIN_(::perfetto::DynamicString(sv.data(), sv.size()));
     } else {
-      TRACE_EVENT_BEGIN("tpu_raiden", name);
+      RAIDEN_EMIT_BEGIN_(name);
     }
+#undef RAIDEN_EMIT_BEGIN_
+  }
+
+  void EndPerfettoSlice() {
+    if (!perfetto_active_) return;
+    PERFETTO_USE_CATEGORIES_FROM_NAMESPACE_SCOPED(tpu_raiden);
+    const ::perfetto::DynamicString meta(perfetto_metadata_.data(),
+                                         perfetto_metadata_.size());
+    if (track_id_.has_value()) {
+      if (!perfetto_metadata_.empty()) {
+        TRACE_EVENT_END("tpu_raiden", ::perfetto::Track(*track_id_), "metadata",
+                        meta);
+      } else {
+        TRACE_EVENT_END("tpu_raiden", ::perfetto::Track(*track_id_));
+      }
+    } else if (!perfetto_metadata_.empty()) {
+      TRACE_EVENT_END("tpu_raiden", "metadata", meta);
+    } else {
+      TRACE_EVENT_END("tpu_raiden");
+    }
+    perfetto_active_ = false;
   }
 
   std::optional<::tsl::profiler::TraceMe> traceme_;
   bool perfetto_active_ = false;
+  std::optional<uint64_t> track_id_;
+  std::string perfetto_metadata_;
 };
 
 }  // namespace tpu_raiden

@@ -60,7 +60,10 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
       const std::vector<at::Tensor>& kv_caches, int64_t node_id,
       int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
       double timeout_s, bool unsafe_skip_buffer_lock, int parallelism = 4,
-      std::optional<int> listener_port = std::nullopt, bool enable_shm = false);
+      std::optional<int> listener_port = std::nullopt, bool enable_shm = false,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      int64_t window_blocks = 0,
+      int32_t window_depth = kDefaultStagingWindowDepth);
 
   ~TorchKVCacheManager() override;
 
@@ -125,11 +128,13 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
   // manager's lifetime. `kv_caches` is retained for the disagg path's
   // kv_caches() accessor (empty for the offload path).
   TorchKVCacheManager(UnpackedLayers unpacked, std::optional<int> local_port,
-                      std::optional<int> host_blocks_to_allocate,
-                      bool unsafe_skip_buffer_lock, int parallelism,
-                      int64_t node_id, int64_t local_control_port,
-                      int64_t max_blocks, int64_t num_slots, double timeout_s,
-                      std::vector<at::Tensor> kv_caches, bool enable_shm);
+                      int64_t host_blocks, bool unsafe_skip_buffer_lock,
+                      int parallelism, int64_t node_id,
+                      int64_t local_control_port, int64_t max_blocks,
+                      int64_t num_slots, double timeout_s,
+                      std::vector<at::Tensor> kv_caches, bool enable_shm,
+                      int64_t window_blocks = 0,
+                      int32_t window_depth = kDefaultStagingWindowDepth);
 
   std::vector<at::Tensor> kv_caches_;
   // Keep-alives for the materialized device buffers backing the manager.
@@ -167,7 +172,10 @@ class KVCacheManager {
       int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt,
-      bool enable_shm = false);
+      bool enable_shm = false,
+      std::optional<int> host_blocks_to_allocate = std::nullopt,
+      int64_t window_blocks = 0,
+      int32_t window_depth = kDefaultStagingWindowDepth);
 
   ~KVCacheManager();
 

@@ -668,6 +668,48 @@ TEST(KVCacheManagerWrapperTest, ConstructorWithRawPjRtBuffersSucceeds) {
   EXPECT_EQ(manager->slice_byte_size(), 1024 * sizeof(float));
 }
 
+TEST(KVCacheManagerWrapperTest,
+     CreateFromPjRtBuffersConfiguresBoundedStagingWindow) {
+  TF_ASSERT_OK_AND_ASSIGN(auto client,
+                          xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client->addressable_devices()[0]->default_memory_space());
+  std::vector<float> data(8 * 1024, 1.0f);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto pjrt_buffer, client->BufferFromHostBuffer(
+                            data.data(), xla::F32, {8, 1024},
+                            /*byte_strides=*/std::nullopt,
+                            xla::PjRtClient::HostBufferSemantics::
+                                kImmutableUntilTransferCompletes,
+                            /*on_done_with_host_buffer=*/nullptr, memory_space,
+                            /*device_layout=*/nullptr));
+
+  std::vector<std::vector<xla::PjRtBuffer*>> device_buffers = {
+      {pjrt_buffer.get()}};
+
+  const size_t slice_byte_size = 1024 * sizeof(float);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> manager,
+      KVCacheManager::CreateFromPjRtBuffers(
+          device_buffers, /*node_id=*/0, /*local_control_port=*/-1,
+          /*max_blocks=*/8, /*num_slots=*/2, /*timeout_s=*/120.0,
+          /*unsafe_skip_buffer_lock=*/true, /*parallelism=*/1,
+          /*raiden_worker_port=*/0, /*raiden_controller_address=*/std::nullopt,
+          /*worker_id=*/std::nullopt, /*enable_shm=*/false,
+          /*host_blocks_to_allocate=*/std::nullopt, /*window_blocks=*/2,
+          /*window_depth=*/2));
+
+  ASSERT_NE(manager->numa_manager(), nullptr);
+  ASSERT_FALSE(manager->numa_manager()->sub_managers().empty());
+  auto* sub = manager->numa_manager()->sub_managers()[0].get();
+  EXPECT_EQ(sub->window_blocks(), 2);
+  EXPECT_EQ(sub->window_depth(), 2);
+  ASSERT_NE(sub->staging_allocator(), nullptr);
+  EXPECT_TRUE(sub->staging_allocator()->dynamic_host_staging());
+  EXPECT_EQ(manager->GetHostSize(0, 0), 4 * slice_byte_size);
+}
+
 }  // namespace
 }  // namespace jax
 }  // namespace kv_cache

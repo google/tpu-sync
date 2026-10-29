@@ -151,7 +151,9 @@ NB_MODULE(_tpu_raiden_jax, m) {
            nb::arg("unsafe_skip_buffer_lock") = true,
            nb::arg("parallelism") = 4, nb::arg("raiden_worker_port") = 0,
            nb::arg("raiden_controller_address") = nb::none(),
-           nb::arg("worker_id") = nb::none(), nb::arg("enable_shm") = false)
+           nb::arg("worker_id") = nb::none(), nb::arg("enable_shm") = false,
+           nb::arg("host_blocks_to_allocate") = nb::none(),
+           nb::arg("window_blocks") = 0, nb::arg("window_depth") = 2)
 
       // Use lambdas to wrap the returned raiden::PjRtCopyFuture into
       // KVCacheManagerFuture

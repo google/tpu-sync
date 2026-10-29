@@ -47,6 +47,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/metrics_collector.h"  // IWYU pragma: keep
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -168,14 +169,15 @@ TransferReceiveSession::Create(
     const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids,
     const std::optional<std::vector<int64_t>>& local_host_block_ids,
-    std::chrono::steady_clock::time_point deadline,
+    std::chrono::steady_clock::time_point deadline, int32_t sub_plan_index,
+    int32_t sub_plan_count,
     std::shared_ptr<MetricsCollector> metrics_collector) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
-  auto session =
-      std::shared_ptr<TransferReceiveSession>(new TransferReceiveSession(
-          base, staging_allocator, uuid, std::move(metrics_collector)));
+  auto session = std::shared_ptr<TransferReceiveSession>(
+      new TransferReceiveSession(base, staging_allocator, uuid, sub_plan_index,
+                                 sub_plan_count, std::move(metrics_collector)));
   std::vector<int64_t> host_block_ids;
   if (!session->AllocateStagingForLoad(req_id, local_block_ids,
                                        local_host_block_ids, &host_block_ids)) {
@@ -218,7 +220,8 @@ TransferReceiveSession::CreateFromActivePlan(
   }
   auto session =
       std::shared_ptr<TransferReceiveSession>(new TransferReceiveSession(
-          base, staging_allocator, uuid, std::move(metrics_collector)));
+          base, staging_allocator, uuid, /*sub_plan_index=*/0,
+          /*sub_plan_count=*/1, std::move(metrics_collector)));
   ABSL_RETURN_IF_ERROR(session->InitFromActivePlan(request, generation,
                                                    deadline, host_block_of));
   return session;
@@ -439,6 +442,7 @@ void TransferReceiveSession::InitFromLoadPlan(
 void TransferReceiveSession::ReleaseStagingLocked() {
   staging_layer_manager_.ReleaseAll();
   staging_.Reset();
+  h2d_stage_trace_.reset();
 }
 
 void TransferReceiveSession::ReleaseStaging() {
@@ -451,6 +455,7 @@ void TransferReceiveSession::FinishLocked(
   if (!status.ok() && status_.ok()) {
     status_ = status;
     failed_phase_ = phase.has_value() ? *phase : CurrentPhaseLocked();
+    h2d_stage_trace_.reset();
   }
   if (draining_) return;
   draining_ = true;
@@ -625,10 +630,17 @@ void TransferReceiveSession::ExecutePullRequest(
   LOG(INFO) << "StartRead (connecting): req_id=" << session_req_id
             << ", uuid=" << uuid_ << ", numa=" << target_node.value_or(-1);
 
+  const uint64_t uuid = uuid_;
   // May run on a transport thread, so it must not block.
-  auto on_response = [self = shared_from_this(), session_req_id](
+  auto on_response = [self = shared_from_this(), &manager, uuid,
+                      session_req_id](
                          absl::StatusOr<PullStreamResponseSpec> response) {
-    absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
+    absl::Cleanup end_op = [self, &manager, uuid]() {
+      self->EndRecvOp();
+      if (!manager.IsShuttingDown()) {
+        manager.MaybeUnregisterSettledRecv(uuid, *self);
+      }
+    };
     absl::Status injected =
         FaultInjectStatus(hooks::kTransferRecvSessionPullReply);
     if (response.ok() && !injected.ok()) {
@@ -813,6 +825,18 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
       h2d_started_ = true;
       trigger_enqueue = true;
     }
+    if (!h2d_stage_trace_.has_value()) {
+      const int32_t num_blocks = total_blocks_;
+      h2d_stage_trace_.emplace("SubTransferH2d", /*level=*/1,
+                               SubTransferStageTrackId(uuid_, 4));
+      h2d_stage_trace_->AppendMetadata([&]() {
+        return absl::StrCat("req_id=", session_req_id, ",uuid=", uuid_,
+                            ",sub_plan_index=", sub_plan_index_,
+                            ",sub_plan_count=", sub_plan_count_,
+                            ",num_blocks=", num_blocks,
+                            ",d_slot=", sub_plan_index_ % 2);
+      });
+    }
   }
   if (trigger_enqueue && metrics_collector_ != nullptr) {
     metrics_collector_->RecordH2dEnqueue(uuid_);
@@ -846,9 +870,14 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
           : absl::StatusOr<raiden::PjRtCopyFuture>(injected);
   if (!future_or.ok()) {
     staging_layer_manager_.Release(layer_idx);
-    absl::MutexLock lock(mu_);
-    FinishLocked(future_or.status(), kH2dPhase);
-    EndRecvOpLocked();
+    {
+      absl::MutexLock lock(mu_);
+      FinishLocked(future_or.status(), kH2dPhase);
+      EndRecvOpLocked();
+    }
+    if (!manager.IsShuttingDown()) {
+      manager.MaybeUnregisterSettledRecv(uuid_, *this);
+    }
     return future_or.status();
   }
 
@@ -866,11 +895,14 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
     if (status_or.ok() && !injected.ok()) {
       status_or = injected;
     }
-    absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
+    absl::Cleanup end_op = [self, &manager, uuid]() {
+      self->EndRecvOp();
+      if (!manager.IsShuttingDown()) {
+        manager.MaybeUnregisterSettledRecv(uuid, *self);
+      }
+    };
     bool all_layers_done = false;
     std::chrono::steady_clock::time_point session_start_time;
-    bool should_unregister = false;
-    uint64_t generation = 0;
     {
       absl::MutexLock lock(self->mu_);
       if (self->done_) {
@@ -886,6 +918,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
             !self->draining_) {
           all_layers_done = true;
           session_start_time = self->start_time_;
+          self->h2d_stage_trace_.reset();
           self->FinishLocked();
         }
       } else {
@@ -893,12 +926,6 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
                    << " for req_id: " << session_req_id
                    << ", error: " << status_or.status().ToString();
         self->FinishLocked(status_or.status(), kH2dPhase);
-      }
-      if (self->draining_ && self->in_flight_ == 1 &&
-          self->unregister_on_settle_) {
-        self->unregister_on_settle_ = false;
-        generation = self->plan_generation_;
-        should_unregister = true;
       }
     }
     // The device has the bytes (or never will): the staging buffer is free
@@ -915,9 +942,6 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
       if (self->metrics_collector_ != nullptr) {
         self->metrics_collector_->RecordEnd(uuid);
       }
-    }
-    if (should_unregister && !manager.IsShuttingDown()) {
-      manager.UnregisterSettledPlan(uuid, generation);
     }
   });
 

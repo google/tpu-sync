@@ -99,19 +99,101 @@ _NUM_SLOTS = flags.DEFINE_integer(
 _ENABLE_METRICS = flags.DEFINE_bool(
     'enable_metrics', False, 'Enable Raiden internal C++ metrics'
 )
+_WINDOW_BLOCKS = flags.DEFINE_integer(
+    'window_blocks',
+    -1,
+    'Window size C in blocks (-1 for auto default, 0 to disable windowing).',
+)
+_WINDOW_DEPTH = flags.DEFINE_integer(
+    'window_depth',
+    2,
+    'Bounded staging window depth W (default 2 for double-buffering).',
+)
+_HOST_BLOCKS_TO_ALLOCATE = flags.DEFINE_integer(
+    'host_blocks_to_allocate',
+    None,
+    'Optional explicit host staging block pool size override.',
+)
+_ITERS = flags.DEFINE_integer(
+    'iters', 1, 'Number of measured transfer iterations.'
+)
+_WARMUP = flags.DEFINE_integer(
+    'warmup', 0, 'Number of warmup transfer iterations before measurement.'
+)
+_POLL_INTERVAL_MS = flags.DEFINE_float(
+    'poll_interval_ms',
+    0.5,
+    'Completion poll sleep interval in milliseconds.',
+)
+_DTYPE = flags.DEFINE_string(
+    'dtype',
+    'float32',
+    'Data type of cache: float32, bfloat16, fp8 (float8_e4m3fn).',
+)
+
+
+def _resolve_dtype(dtype_name: str) -> tuple[torch.dtype, int]:
+  """Resolves the cache dtype name to a torch.dtype and item size in bytes."""
+  normalized = dtype_name.lower()
+  if normalized in ('float32', 'fp32'):
+    return torch.float32, 4
+  elif normalized in ('bfloat16', 'bf16'):
+    return torch.bfloat16, 2
+  elif normalized in ('fp8', 'float8', 'float8_e4m3fn'):
+    return torch.float8_e4m3fn, 1
+  else:
+    raise ValueError(
+        f'Unsupported dtype: {dtype_name}. Expected float32, bfloat16, or fp8.'
+    )
+
+
+def _make_base_tensor(
+    shape: Sequence[int], device: torch.device
+) -> torch.Tensor:
+  """Creates the 5D base tensor on device using broadcasted 1D aranges."""
+  b = (
+      torch.arange(shape[0], device=device, dtype=torch.float32).view(
+          -1, 1, 1, 1, 1
+      )
+      % 16.0
+  ) * 0.5
+  t = (
+      torch.arange(shape[1], device=device, dtype=torch.float32).view(
+          1, -1, 1, 1, 1
+      )
+      % 64.0
+  ) * 0.25
+  h = (
+      torch.arange(shape[2], device=device, dtype=torch.float32).view(
+          1, 1, -1, 1, 1
+      )
+      % 8.0
+  ) * 1.0
+  kv = (
+      torch.arange(shape[3], device=device, dtype=torch.float32).view(
+          1, 1, 1, -1, 1
+      )
+      % 2.0
+  ) * 2.0
+  d = (
+      torch.arange(shape[4], device=device, dtype=torch.float32).view(
+          1, 1, 1, 1, -1
+      )
+      % 128.0
+  ) * (1.0 / 128.0)
+  return b + t + h + kv + d
 
 
 def populate_deterministic_cache(
-    num_layers: int, shape: Sequence[int]
+    num_layers: int, shape: Sequence[int], dtype: torch.dtype
 ) -> list[torch.Tensor]:
+  """Populates deterministic cache layers on device."""
   device = torch.device('tpu')
+  base = _make_base_tensor(shape, device)
   tensors = []
   for layer_idx in range(num_layers):
-    # Every layer has distinct values: layer 0 starts at 0, layer 1 at 1000, etc.
-    base = torch.arange(int(np.prod(shape)), dtype=torch.float32).reshape(
-        shape
-    ) + float(layer_idx * 1000.0)
-    tensors.append(base.to(device))
+    layer_tensor = (base + float(layer_idx % 32)).to(dtype)
+    tensors.append(layer_tensor)
   torch.accelerator.synchronize()
   return tensors
 
@@ -120,14 +202,18 @@ def verify_deterministic_cache(
     num_layers: int,
     shape: Sequence[int],
     received_tensors: list[torch.Tensor],
+    dtype: torch.dtype,
 ) -> bool:
+  """Verifies data consistency across all cache layers on device."""
   print('Verifying data consistency across all cache layers...')
+  device = received_tensors[0].device
+  base = _make_base_tensor(shape, device)
   for layer_idx in range(num_layers):
-    expected = torch.arange(int(np.prod(shape)), dtype=torch.float32).reshape(
-        shape
-    ) + float(layer_idx * 1000.0)
-    actual = received_tensors[layer_idx].cpu()
-    if not torch.equal(actual, expected):
+    expected = (base + float(layer_idx % 32)).to(dtype)
+    actual = received_tensors[layer_idx]
+    if not bool(
+        torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    ):
       print(f'Verification FAILED on Layer {layer_idx}!')
       return False
   print('Data consistency verified successfully! 0% corruption.')
@@ -154,19 +240,21 @@ def main(_):
     os.environ['ENABLE_RAIDEN_METRICS'] = 'true'
 
   device = torch.device('tpu')
-  # KV-cache shape: (num_blocks, num_heads, block_size, num_kv_heads, head_dim)
-  cache_shape = (_NUM_BLOCKS.value, 32, _BLOCK_SIZE.value, 8, 128)
+  cache_dtype, itemsize = _resolve_dtype(_DTYPE.value)
+  # KV-cache shape: (num_blocks, block_size, num_heads, num_kv, head_dim)
+  cache_shape = (_NUM_BLOCKS.value, _BLOCK_SIZE.value, 8, 2, 128)
 
-  # Size of a single block in bytes (float32 = 4 bytes)
-  block_bytes = int(np.prod(cache_shape[1:])) * 4
+  # Size of a single block in bytes
+  block_bytes = int(np.prod(cache_shape[1:])) * itemsize
   payload_bytes = _NUM_LAYERS.value * _NUM_BLOCKS.value * block_bytes
   print(
       f'Config: role={_ROLE.value} parallelism={_PARALLELISM.value} '
       f'num_slots={_NUM_SLOTS.value} num_layers={_NUM_LAYERS.value} '
-      f'num_blocks={_NUM_BLOCKS.value} block_size={_BLOCK_SIZE.value}'
+      f'num_blocks={_NUM_BLOCKS.value} block_size={_BLOCK_SIZE.value} '
+      f'dtype={_DTYPE.value}'
   )
   print(
-      f'Cache: shape={cache_shape} dtype=float32 '
+      f'Cache: shape={cache_shape} dtype={_DTYPE.value} '
       f'block={block_bytes / (1024 * 1024):.2f} MiB '
       f'payload={payload_bytes / (1024 * 1024):.2f} MiB'
   )
@@ -176,7 +264,9 @@ def main(_):
     t0 = time.perf_counter()
 
     # 1. Populate deterministic cache on TPU
-    tpu_src_arr = populate_deterministic_cache(_NUM_LAYERS.value, cache_shape)
+    tpu_src_arr = populate_deterministic_cache(
+        _NUM_LAYERS.value, cache_shape, cache_dtype
+    )
     print(
         f'Populated {_NUM_LAYERS.value} source layers on device in '
         f'{time.perf_counter() - t0:.2f}s'
@@ -197,6 +287,9 @@ def main(_):
         num_slots=_NUM_SLOTS.value,
         unsafe_skip_buffer_lock=True,
         parallelism=_PARALLELISM.value,
+        host_blocks_to_allocate=_HOST_BLOCKS_TO_ALLOCATE.value,
+        window_blocks=_WINDOW_BLOCKS.value,
+        window_depth=_WINDOW_DEPTH.value,
     )
 
     print(
@@ -216,8 +309,15 @@ def main(_):
     transfer_req_id = f'perf_test_{transfer_uuid}'
 
     block_ids = list(range(_NUM_BLOCKS.value))
-    sender_manager.register_read(transfer_req_id, transfer_uuid, block_ids)
-    print(f'Armed {len(block_ids)} blocks for read (uuid={transfer_uuid})')
+    total_runs = _WARMUP.value + _ITERS.value
+    for run_idx in range(total_runs):
+      iter_req_id = f'{transfer_req_id}_{run_idx}'
+      iter_uuid = transfer_uuid + run_idx * 10000
+      sender_manager.register_read(iter_req_id, iter_uuid, block_ids)
+    print(
+        f'Armed {len(block_ids)} blocks for read across {total_runs} runs '
+        f'(base uuid={transfer_uuid})'
+    )
 
     # 4. Publish metadata to CoordinationServer
     all_endpoints = sender_manager.get_local_endpoints()
@@ -252,10 +352,10 @@ def main(_):
     if not _PEER.value:
       raise ValueError('A peer address MUST be provided')
 
-    # 2. Allocate empty destination tensors on TPU
+    # 2. Allocate zero-filled destination tensors on TPU
     t0 = time.perf_counter()
     device_tensors = [
-        torch.empty(cache_shape, dtype=torch.float32, device='tpu')
+        torch.zeros(cache_shape, dtype=cache_dtype, device=device)
         for _ in range(_NUM_LAYERS.value)
     ]
     torch.accelerator.synchronize()
@@ -274,6 +374,9 @@ def main(_):
         num_slots=_NUM_SLOTS.value,
         unsafe_skip_buffer_lock=True,
         parallelism=_PARALLELISM.value,
+        host_blocks_to_allocate=_HOST_BLOCKS_TO_ALLOCATE.value,
+        window_blocks=_WINDOW_BLOCKS.value,
+        window_depth=_WINDOW_DEPTH.value,
     )
 
     print(f'Receiver KVCacheManager ready in {time.perf_counter() - t0:.2f}s')
@@ -338,54 +441,85 @@ def main(_):
 
     # 6. Time the transfer (start_read -> poll_stats -> completion)
     print('Executing H2H Read E2E offloading transfer...')
-    start_time = time.perf_counter()
-
-    receiver_manager.start_read(
-        req_id=transfer_req_id,
-        uuid=transfer_uuid,
-        remote_endpoint=remote_endpoints,
-        remote_block_ids=src_block_ids,
-        local_block_ids=src_block_ids,
-        parallelism=_PARALLELISM.value,
-    )
-
-    start_read_returned = time.perf_counter()
-
-    polls = 0
-    completed = False
-    while not completed:
-      polls += 1
-      _, done_recving, failed_recving = receiver_manager.poll_stats()
-      if transfer_req_id in done_recving:
-        completed = True
-      elif transfer_req_id in failed_recving:
-        raise RuntimeError(f'Transfer failed! req_id: {transfer_req_id}')
-      else:
-        time.sleep(0.01)
-
-    end_time = time.perf_counter()
-    elapsed_time = end_time - start_time
-    print(
-        'start_read returned in '
-        f'{(start_read_returned - start_time) * 1e3:.1f} ms; '
-        f'waited {(end_time - start_read_returned) * 1e3:.1f} ms across '
-        f'{polls} poll(s) at 10ms granularity'
-    )
-
-    # 7. Compute GB/s bandwidth and verify data
+    total_runs = _WARMUP.value + _ITERS.value
+    latencies = []
     total_bytes = _NUM_LAYERS.value * len(src_block_ids) * block_bytes
     total_megabytes = total_bytes / (1024 * 1024)
-    bandwidth_gbps = (total_bytes * 8) / (elapsed_time * 1e9)
-    bandwidth_gbs = total_bytes / (elapsed_time * 1e9)
-    print('\n=== H2H E2E Performance Results ===')
-    print(f'Parallelism: {_PARALLELISM.value}')
-    print(f'Data Volume Transferred: {total_megabytes:.2f} MB')
-    print(f'Elapsed Time (TCP H2H + Copy): {elapsed_time:.4f} seconds')
-    print(f'Bandwidth: {bandwidth_gbps:.3f} Gbps ({bandwidth_gbs:.3f} GB/s)')
-    print('===================================\n')
+
+    for run_idx in range(total_runs):
+      is_warmup = run_idx < _WARMUP.value
+      iter_req_id = f'{transfer_req_id}_{run_idx}'
+      iter_uuid = transfer_uuid + run_idx * 10000
+
+      start_time = time.perf_counter()
+      receiver_manager.start_read(
+          req_id=iter_req_id,
+          uuid=iter_uuid,
+          remote_endpoint=remote_endpoints,
+          remote_block_ids=src_block_ids,
+          local_block_ids=src_block_ids,
+          parallelism=_PARALLELISM.value,
+      )
+      start_read_returned = time.perf_counter()
+
+      polls = 0
+      completed = False
+      while not completed:
+        polls += 1
+        _, done_recving, failed_recving = receiver_manager.poll_stats()
+        if iter_req_id in done_recving:
+          completed = True
+        elif iter_req_id in failed_recving:
+          raise RuntimeError(f'Transfer failed! req_id: {iter_req_id}')
+        else:
+          time.sleep(_POLL_INTERVAL_MS.value / 1000.0)
+
+      end_time = time.perf_counter()
+      elapsed_time = end_time - start_time
+      bw_gbps = (total_bytes * 8) / (elapsed_time * 1e9)
+      bw_gbs = total_bytes / (elapsed_time * 1e9)
+
+      prefix = '[WARMUP] ' if is_warmup else ''
+      print(
+          f'{prefix}Run {run_idx + 1}/{total_runs}:'
+          f' elapsed={elapsed_time * 1e3:.2f} ms ({bw_gbps:.3f} Gbps,'
+          f' {bw_gbs:.3f} GB/s), start_read returned in'
+          f' {(start_read_returned - start_time) * 1e3:.1f} ms, waited'
+          f' {(end_time - start_read_returned) * 1e3:.1f} ms across {polls}'
+          f' poll(s) at {_POLL_INTERVAL_MS.value}ms granularity'
+      )
+      if not is_warmup:
+        latencies.append(elapsed_time)
+
+    # Follow-up F3: poll manager.poll_stats() after completion
+    _, final_done, final_failed = receiver_manager.poll_stats()
+    print(
+        f'Final poll_stats: done_recving={len(final_done)}, '
+        f'failed_recving={len(final_failed)}'
+    )
+
+    if latencies:
+      arr = np.array(latencies)
+      rep_elapsed = float(np.median(arr))
+      bandwidth_gbps = (total_bytes * 8) / (rep_elapsed * 1e9)
+      bandwidth_gbs = total_bytes / (rep_elapsed * 1e9)
+
+      print('\n=== H2H E2E Performance Results ===')
+      print(f'Parallelism: {_PARALLELISM.value}')
+      print(f'Iterations: {_ITERS.value} (warmup: {_WARMUP.value})')
+      print(f'Data Volume Transferred: {total_megabytes:.2f} MB')
+      print(
+          f'Latency (ms): min={float(np.min(arr)) * 1e3:.2f}'
+          f' p50={rep_elapsed * 1e3:.2f} mean={float(np.mean(arr)) * 1e3:.2f}'
+          f' p90={float(np.percentile(arr, 90)) * 1e3:.2f}'
+          f' max={float(np.max(arr)) * 1e3:.2f}'
+      )
+      print(f'Elapsed Time (TCP H2H + Copy): {rep_elapsed:.4f} seconds')
+      print(f'Bandwidth: {bandwidth_gbps:.3f} Gbps ({bandwidth_gbs:.3f} GB/s)')
+      print('===================================\n')
     t0 = time.perf_counter()
     success = verify_deterministic_cache(
-        _NUM_LAYERS.value, cache_shape, device_tensors
+        _NUM_LAYERS.value, cache_shape, device_tensors, cache_dtype
     )
     print(f'Verification took {time.perf_counter() - t0:.2f}s')
     if not success:

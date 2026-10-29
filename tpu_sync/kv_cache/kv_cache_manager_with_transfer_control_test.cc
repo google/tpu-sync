@@ -36,14 +36,17 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -52,9 +55,11 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/grpc_control_plane_backend.h"
 #include "tpu_sync/core/tcp_control_plane_backend.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
 // Needed for the complete type behind send_sessions_.at(uuid)->... below.
@@ -94,6 +99,25 @@ class ScopedControlPlaneBackend {
 
  private:
   static constexpr char kVar[] = "TPU_RAIDEN_CONTROL_PLANE_BACKEND";
+  std::optional<std::string> old_;
+};
+
+class ScopedEnvVar {
+ public:
+  ScopedEnvVar(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name)) old_ = old;
+    setenv(name, value, /*overwrite=*/1);
+  }
+  ~ScopedEnvVar() {
+    if (old_.has_value()) {
+      setenv(name_.c_str(), old_->c_str(), /*overwrite=*/1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
   std::optional<std::string> old_;
 };
 
@@ -156,6 +180,73 @@ class TestManager : private ScopedControlPlaneBackend,
     absl::MutexLock lock(mu_);
     send_sessions_.at(uuid)->ValidateAndBeginPull(
         {0}, std::chrono::steady_clock::now());
+  }
+
+  void TestNoteSubPlanRegistered(bool is_recv, const std::string& req_id,
+                                 uint64_t uuid, int32_t sub_plan_index,
+                                 int32_t sub_plan_count) {
+    absl::MutexLock lock(mu_);
+    NoteSubPlanRegisteredLocked(is_recv, req_id, uuid, sub_plan_index,
+                                sub_plan_count);
+  }
+
+  void TestRecordPoolReshardTerminal(
+      bool is_recv, const std::string& req_id, uint64_t uuid,
+      int32_t sub_plan_index, int32_t sub_plan_count,
+      const absl::Status& status,
+      std::optional<TransferDetails> details = std::nullopt) {
+    absl::MutexLock lock(mu_);
+    RecordPoolReshardTerminalLocked(is_recv, req_id, uuid, sub_plan_index,
+                                    sub_plan_count, status, std::move(details));
+  }
+
+  void TestSweepSubPlanChains(std::chrono::steady_clock::time_point now) {
+    absl::MutexLock lock(mu_);
+    SweepSubPlanChainsLocked(now);
+  }
+
+  void EmplaceActiveRecvSessionForTest(
+      uint64_t uuid, const std::shared_ptr<TransferReceiveSession>& session) {
+    absl::MutexLock lock(mu_);
+    active_recv_sessions_[uuid] = session;
+  }
+
+  void FinishSendSessionForTest(uint64_t uuid, const absl::Status& status) {
+    absl::MutexLock lock(mu_);
+    auto it = send_sessions_.find(uuid);
+    if (it != send_sessions_.end()) {
+      it->second->CancelFromManagerLocked(status);
+    }
+  }
+
+  void FinishRecvSessionForTest(uint64_t uuid, const absl::Status& status) {
+    absl::MutexLock lock(mu_);
+    auto it = active_recv_sessions_.find(uuid);
+    if (it != active_recv_sessions_.end()) {
+      it->second->Finish(status);
+    }
+  }
+
+  bool HasRecvChain(const std::string& req_id) {
+    absl::MutexLock lock(mu_);
+    return recv_chains_.contains(req_id);
+  }
+
+  bool HasSendChain(const std::string& req_id) {
+    absl::MutexLock lock(mu_);
+    return send_chains_.contains(req_id);
+  }
+
+  bool IsRecvChainFailed(const std::string& req_id) {
+    absl::MutexLock lock(mu_);
+    auto it = recv_chains_.find(req_id);
+    return it != recv_chains_.end() && it->second.failed;
+  }
+
+  bool IsSendChainFailed(const std::string& req_id) {
+    absl::MutexLock lock(mu_);
+    auto it = send_chains_.find(req_id);
+    return it != send_chains_.end() && it->second.failed;
   }
 };
 
@@ -1148,6 +1239,321 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
     settled += received.size() + failed.size();
     absl::SleepFor(absl::Milliseconds(20));
   }
+}
+
+TEST(SubPlanUuidTest, SubPlanUuidIsDeterministicAndMatchesIndexZeroIdentity) {
+  constexpr int64_t kUuid = 123456789LL;
+  EXPECT_EQ(SubPlanUuid(kUuid, 0), kUuid);
+  EXPECT_EQ(SubPlanUuid(kUuid, -1), kUuid);
+  EXPECT_EQ(SubPlanUuid(kUuid, -42), kUuid);
+
+  absl::flat_hash_set<int64_t> derived;
+  for (int32_t c = 1; c <= 8; ++c) {
+    const int64_t sub_uuid = SubPlanUuid(kUuid, c);
+    EXPECT_GT(sub_uuid, 0);
+    EXPECT_TRUE(derived.insert(sub_uuid).second);
+    EXPECT_EQ(SubPlanUuid(kUuid, c), sub_uuid);
+  }
+}
+
+TEST(StagingWindowTest,
+     ResolveDefaultStagingWindowBlocksScalesWithOneAndTwoNics) {
+  constexpr size_t kNumLayers = 32;
+  constexpr size_t kNumShards = 1;
+  constexpr size_t kSliceByteSize = 128 * 1024;
+  constexpr int64_t kMaxBlocks = 512;
+  constexpr uint64_t kTargetBytesPerNic = 256ULL * 1024 * 1024;
+
+  const int64_t c_1nic =
+      ResolveDefaultStagingWindowBlocks(kNumLayers, kNumShards, kSliceByteSize,
+                                        1, kMaxBlocks, kTargetBytesPerNic);
+  EXPECT_EQ(c_1nic, 64);
+  const int64_t c_2nic =
+      ResolveDefaultStagingWindowBlocks(kNumLayers, kNumShards, kSliceByteSize,
+                                        2, kMaxBlocks, kTargetBytesPerNic);
+  EXPECT_EQ(c_2nic, 128);
+  EXPECT_EQ(c_2nic, 2 * c_1nic);
+
+  EXPECT_EQ(
+      ResolveDefaultStagingWindowBlocks(kNumLayers, kNumShards, kSliceByteSize,
+                                        1, 30, kTargetBytesPerNic),
+      30);
+  EXPECT_EQ(ResolveDefaultStagingWindowBlocks(
+                kNumLayers, kNumShards, kSliceByteSize, 1, kMaxBlocks, 1024),
+            1);
+  EXPECT_EQ(ResolveDefaultStagingWindowBlocks(kNumLayers, kNumShards,
+                                              kSliceByteSize, 1, kMaxBlocks,
+                                              kTargetBytesPerNic, 50, 2),
+            25);
+  EXPECT_EQ(ResolveDefaultStagingWindowBlocks(kNumLayers, kNumShards,
+                                              kSliceByteSize, 1, kMaxBlocks,
+                                              kTargetBytesPerNic, 1, 2),
+            1);
+
+  EXPECT_EQ(ResolveDefaultStagingWindowBlocks(0, kNumShards, kSliceByteSize, 1,
+                                              kMaxBlocks),
+            0);
+  EXPECT_EQ(ResolveDefaultStagingWindowBlocks(kNumLayers, 0, kSliceByteSize, 1,
+                                              kMaxBlocks),
+            0);
+  EXPECT_EQ(ResolveDefaultStagingWindowBlocks(kNumLayers, kNumShards, 0, 1,
+                                              kMaxBlocks),
+            0);
+  EXPECT_EQ(ResolveDefaultStagingWindowBlocks(kNumLayers, kNumShards,
+                                              kSliceByteSize, 1, 0),
+            0);
+
+  kv_cache::KVCacheManagerBase base(
+      kNumLayers, kNumShards, std::vector<size_t>(kNumLayers, kSliceByteSize),
+      /*local_port=*/std::nullopt, /*host_blocks_to_allocate=*/200);
+  EXPECT_EQ(
+      ResolveDefaultStagingWindowBlocks(&base, kMaxBlocks, kTargetBytesPerNic),
+      c_1nic);
+  EXPECT_EQ(ResolveDefaultStagingWindowBlocks(nullptr, kMaxBlocks), 0);
+  EXPECT_EQ(ResolveActiveDataNicCount(/*num_ext_nics=*/1), 1u);
+  EXPECT_EQ(ResolveActiveDataNicCount(/*num_ext_nics=*/2), 2u);
+  EXPECT_GE(ResolveActiveDataNicCount(), 1u);
+}
+
+TEST(
+    StagingWindowTest,
+    ResolveHostBlocksToAllocateSupportsExplicitAndAutoWindowBeforeBaseConstruction) {
+  constexpr size_t kNumLayers = 32;
+  constexpr size_t kNumShards = 1;
+  constexpr size_t kSliceByteSize = 128 * 1024;
+  constexpr int64_t kNumSlots = 4;
+  constexpr int64_t kMaxBlocks = 128;
+
+  EXPECT_EQ(ResolveHostBlocksToAllocate(100, kNumSlots, kMaxBlocks), 100);
+  EXPECT_EQ(ResolveHostBlocksToAllocate(
+                std::nullopt, kNumSlots, kMaxBlocks, kNumLayers, kNumShards,
+                kSliceByteSize, /*num_nics=*/1, /*window_blocks=*/32, 2),
+            64);
+  const int64_t expected_c = ResolveDefaultStagingWindowBlocks(
+      kNumLayers, kNumShards, kSliceByteSize, /*num_nics=*/1, kMaxBlocks);
+  EXPECT_EQ(ResolveHostBlocksToAllocate(
+                std::nullopt, kNumSlots, kMaxBlocks, kNumLayers, kNumShards,
+                kSliceByteSize, /*num_nics=*/1, /*window_blocks=*/-1, 2),
+            2 * expected_c);
+  EXPECT_EQ(ResolveHostBlocksToAllocate(std::nullopt, kNumSlots, kMaxBlocks,
+                                        kNumLayers, kNumShards, kSliceByteSize,
+                                        /*num_nics=*/1, /*window_blocks=*/0),
+            kNumSlots * kMaxBlocks);
+}
+
+TEST(ControlHandshakeTest,
+     SetStagingWindowConfigReclaimsFixedSlotBlocksAndEnablesDynamicStaging) {
+  TestManager manager(/*timeout_s=*/5.0, /*num_layers=*/1);
+  ASSERT_NE(manager.base()->host_block_manager(), nullptr);
+  EXPECT_EQ(manager.base()->host_block_manager()->num_free_blocks(), 0);
+  ASSERT_NE(manager.staging_allocator(), nullptr);
+  EXPECT_FALSE(manager.staging_allocator()->dynamic_host_staging());
+  const int total = manager.base()->host_block_manager()->total_blocks();
+  EXPECT_GT(total, 0);
+
+  manager.SetStagingWindowConfig(/*window_blocks=*/4, /*window_depth=*/2);
+  EXPECT_EQ(manager.window_blocks(), 4);
+  EXPECT_EQ(manager.window_depth(), 2);
+  EXPECT_EQ(manager.base()->host_block_manager()->num_free_blocks(), total);
+  EXPECT_TRUE(manager.staging_allocator()->dynamic_host_staging());
+
+  KVCacheManagerWithTransfer bounded_mgr(
+      1, 1, 128, std::nullopt, /*host_blocks_to_allocate=*/8, 1, 0, -1,
+      /*max_blocks=*/8, /*num_slots=*/4, 5.0);
+  ASSERT_NE(bounded_mgr.staging_allocator(), nullptr);
+  EXPECT_TRUE(bounded_mgr.staging_allocator()->dynamic_host_staging());
+  bounded_mgr.SetStagingWindowConfig(/*window_blocks=*/4, /*window_depth=*/2);
+  EXPECT_EQ(bounded_mgr.window_blocks(), 4);
+  EXPECT_EQ(bounded_mgr.window_depth(), 2);
+}
+
+TEST(ControlHandshakeTest,
+     RecordPoolReshardTerminalPreservesDetailsAndPopulatesDefaultReason) {
+  TestManager manager(/*timeout_s=*/5.0, /*num_layers=*/1);
+
+  TransferDetails d_succ1;
+  d_succ1.phase = "recv_succ_single";
+  manager.TestRecordPoolReshardTerminal(
+      /*is_recv=*/true, "req_s1", /*uuid=*/101, /*sub_plan_index=*/0,
+      /*sub_plan_count=*/1, absl::OkStatus(), d_succ1);
+  CompleteReadResult res1 = manager.CompleteReadWithDetails();
+  EXPECT_THAT(res1.received, Contains("req_s1"));
+  ASSERT_TRUE(res1.details.contains("req_s1"));
+  EXPECT_EQ(res1.details.at("req_s1").phase, "recv_succ_single");
+
+  TransferDetails d_fail1;
+  d_fail1.phase = "recv_fail_single";
+  manager.TestRecordPoolReshardTerminal(
+      /*is_recv=*/true, "req_f1", /*uuid=*/102, /*sub_plan_index=*/0,
+      /*sub_plan_count=*/1, absl::InternalError("single error"), d_fail1);
+  CompleteReadResult res2 = manager.CompleteReadWithDetails();
+  EXPECT_THAT(res2.failed, Contains("req_f1"));
+  ASSERT_TRUE(res2.details.contains("req_f1"));
+  EXPECT_EQ(res2.details.at("req_f1").phase, "recv_fail_single");
+  EXPECT_EQ(res2.details.at("req_f1").reason, "single error");
+
+  TransferDetails d_succ2;
+  d_succ2.phase = "recv_succ_multi";
+  manager.TestNoteSubPlanRegistered(/*is_recv=*/true, "req_s2", /*uuid=*/103, 0,
+                                    2);
+  manager.TestNoteSubPlanRegistered(/*is_recv=*/true, "req_s2", /*uuid=*/104, 1,
+                                    2);
+  manager.TestRecordPoolReshardTerminal(/*is_recv=*/true, "req_s2",
+                                        /*uuid=*/103, 0, 2, absl::OkStatus());
+  manager.TestRecordPoolReshardTerminal(/*is_recv=*/true, "req_s2",
+                                        /*uuid=*/104, 1, 2, absl::OkStatus(),
+                                        d_succ2);
+  CompleteReadResult res3 = manager.CompleteReadWithDetails();
+  EXPECT_THAT(res3.received, Contains("req_s2"));
+  ASSERT_TRUE(res3.details.contains("req_s2"));
+  EXPECT_EQ(res3.details.at("req_s2").phase, "recv_succ_multi");
+
+  manager.TestNoteSubPlanRegistered(/*is_recv=*/true, "req_f2_nullopt",
+                                    /*uuid=*/105, 0, 2);
+  manager.TestRecordPoolReshardTerminal(
+      /*is_recv=*/true, "req_f2_nullopt", /*uuid=*/105, 0, 2,
+      absl::InternalError("multi error nullopt"), std::nullopt);
+  TransferDetails d_fail2;
+  d_fail2.phase = "recv_fail_multi";
+  d_fail2.reason = "explicit reason";
+  manager.TestNoteSubPlanRegistered(/*is_recv=*/true, "req_f2", /*uuid=*/106, 0,
+                                    2);
+  manager.TestRecordPoolReshardTerminal(
+      /*is_recv=*/true, "req_f2", /*uuid=*/106, 0, 2,
+      absl::InternalError("multi error"), d_fail2);
+  CompleteReadResult res4 = manager.CompleteReadWithDetails();
+  EXPECT_THAT(res4.failed, Contains("req_f2_nullopt"));
+  ASSERT_TRUE(res4.details.contains("req_f2_nullopt"));
+  EXPECT_EQ(res4.details.at("req_f2_nullopt").reason,
+            "sub-plan 0 of 2: multi error nullopt");
+  EXPECT_THAT(res4.failed, Contains("req_f2"));
+  ASSERT_TRUE(res4.details.contains("req_f2"));
+  EXPECT_EQ(res4.details.at("req_f2").phase, "recv_fail_multi");
+  EXPECT_EQ(res4.details.at("req_f2").reason,
+            "sub-plan 0 of 2: explicit reason");
+}
+
+TEST(ControlHandshakeTest,
+     SweepSubPlanChainsLockedDoesNotStallWhileNonReshardSessionsAreActive) {
+  TestManager manager(/*timeout_s=*/5.0, /*num_layers=*/1);
+
+  manager.TestNoteSubPlanRegistered(/*is_recv=*/true, "req_recv", /*uuid=*/201,
+                                    0, 2);
+  manager.TestRecordPoolReshardTerminal(/*is_recv=*/true, "req_recv",
+                                        /*uuid=*/201, 0, 2, absl::OkStatus());
+  ASSERT_TRUE(manager.HasRecvChain("req_recv"));
+  EXPECT_FALSE(manager.IsRecvChainFailed("req_recv"));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferReceiveSession> recv_session,
+      TransferReceiveSession::Create(
+          manager.base(), manager.staging_allocator(), /*uuid=*/202, "req_recv",
+          /*total_blocks=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(100),
+          /*acquire_staging=*/false));
+  manager.EmplaceActiveRecvSessionForTest(202, std::move(recv_session));
+
+  auto past_timeout =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  manager.TestSweepSubPlanChains(past_timeout);
+  EXPECT_TRUE(manager.HasRecvChain("req_recv"));
+  EXPECT_FALSE(manager.IsRecvChainFailed("req_recv"));
+
+  manager.FinishRecvSessionForTest(202, absl::OkStatus());
+  past_timeout += std::chrono::seconds(10);
+  manager.TestSweepSubPlanChains(past_timeout);
+  EXPECT_TRUE(manager.IsRecvChainFailed("req_recv"));
+  CompleteReadResult res_recv = manager.CompleteReadWithDetails();
+  EXPECT_THAT(res_recv.failed, Contains("req_recv"));
+
+  manager.TestNoteSubPlanRegistered(/*is_recv=*/false, "req_send", /*uuid=*/301,
+                                    0, 2);
+  manager.TestRecordPoolReshardTerminal(/*is_recv=*/false, "req_send",
+                                        /*uuid=*/301, 0, 2, absl::OkStatus());
+  ASSERT_TRUE(manager.HasSendChain("req_send"));
+  EXPECT_FALSE(manager.IsSendChainFailed("req_send"));
+
+  ASSERT_GT(manager.NotifyForRead("req_send", /*uuid=*/302, {0}), 0);
+
+  past_timeout = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  manager.TestSweepSubPlanChains(past_timeout);
+  EXPECT_TRUE(manager.HasSendChain("req_send"));
+  EXPECT_FALSE(manager.IsSendChainFailed("req_send"));
+
+  manager.FinishSendSessionForTest(302, absl::OkStatus());
+  past_timeout += std::chrono::seconds(10);
+  manager.TestSweepSubPlanChains(past_timeout);
+  EXPECT_TRUE(manager.IsSendChainFailed("req_send"));
+  CompleteReadResult res_send = manager.CompleteReadWithDetails();
+  EXPECT_THAT(res_send.failed, Contains("req_send"));
+}
+
+TEST(ControlHandshakeTest, SetStagingWindowConfigAutoResolvesWindowBlocks) {
+  TestManager manager(/*timeout_s=*/5.0, /*num_layers=*/1);
+  manager.SetStagingWindowConfig(/*window_blocks=*/-1, /*window_depth=*/2);
+  EXPECT_GT(manager.window_blocks(), 0);
+  EXPECT_EQ(manager.window_depth(), 2);
+  ASSERT_NE(manager.staging_allocator(), nullptr);
+  EXPECT_TRUE(manager.staging_allocator()->dynamic_host_staging());
+}
+
+TEST(ControlHandshakeTest, ConstructorEnvVarSizingConfiguresWindowAndPool) {
+  {
+    ScopedEnvVar blocks("TPU_RAIDEN_STAGING_WINDOW_BLOCKS", "4");
+    ScopedEnvVar depth("TPU_RAIDEN_STAGING_WINDOW_DEPTH", "2");
+    TestManager manager(/*timeout_s=*/5.0, /*num_layers=*/1);
+    EXPECT_EQ(manager.window_blocks(), 4);
+    EXPECT_EQ(manager.window_depth(), 2);
+    ASSERT_NE(manager.base()->host_block_manager(), nullptr);
+    EXPECT_EQ(manager.base()->host_block_manager()->total_blocks(), 8);
+    ASSERT_NE(manager.staging_allocator(), nullptr);
+    EXPECT_TRUE(manager.staging_allocator()->dynamic_host_staging());
+  }
+
+  {
+    ScopedEnvVar blocks("TPU_RAIDEN_STAGING_WINDOW_BLOCKS", "auto");
+    ScopedEnvVar depth("TPU_RAIDEN_STAGING_WINDOW_DEPTH", "2");
+    TestManager manager(/*timeout_s=*/5.0, /*num_layers=*/1);
+    EXPECT_GT(manager.window_blocks(), 0);
+    EXPECT_EQ(manager.window_depth(), 2);
+    ASSERT_NE(manager.base()->host_block_manager(), nullptr);
+    EXPECT_EQ(manager.base()->host_block_manager()->total_blocks(),
+              manager.window_blocks() * 2);
+    ASSERT_NE(manager.staging_allocator(), nullptr);
+    EXPECT_TRUE(manager.staging_allocator()->dynamic_host_staging());
+  }
+}
+
+TEST(ControlHandshakeTest, InvalidStagingWindowEnvVarsAreRejected) {
+  {
+    ScopedEnvVar env("TPU_RAIDEN_STAGING_WINDOW_BLOCKS", "invalid");
+    EXPECT_THROW(TestManager manager(5.0, 1), std::invalid_argument);
+  }
+  {
+    ScopedEnvVar env("TPU_RAIDEN_STAGING_WINDOW_DEPTH", "0");
+    EXPECT_THROW(TestManager manager(5.0, 1), std::invalid_argument);
+  }
+  {
+    ScopedEnvVar blocks("TPU_RAIDEN_STAGING_WINDOW_BLOCKS", "auto");
+    ScopedEnvVar target("TPU_RAIDEN_STAGING_WINDOW_TARGET_BYTES_PER_NIC",
+                        "bad");
+    EXPECT_THROW(TestManager manager(5.0, 1), std::invalid_argument);
+  }
+  {
+    ScopedEnvVar target("TPU_RAIDEN_STAGING_WINDOW_TARGET_BYTES_PER_NIC",
+                        "bad");
+    TestManager manager(5.0, 1);
+    EXPECT_THROW(manager.SetStagingWindowConfig(-1, 2), std::invalid_argument);
+  }
+  TestManager inv_mgr(5.0, 1);
+  EXPECT_THROW(inv_mgr.SetStagingWindowConfig(-2, 2), std::invalid_argument);
+  EXPECT_THROW(inv_mgr.SetStagingWindowConfig(4, 0), std::invalid_argument);
+  EXPECT_THROW(ResolveHostBlocksToAllocate(std::nullopt, 4, 8, 1, 1, 128, 1,
+                                           /*window_blocks=*/-2),
+               std::invalid_argument);
+  EXPECT_THROW(ResolveHostBlocksToAllocate(std::nullopt, 4, 8, 1, 1, 128, 1, 4,
+                                           /*window_depth=*/0),
+               std::invalid_argument);
 }
 
 }  // namespace

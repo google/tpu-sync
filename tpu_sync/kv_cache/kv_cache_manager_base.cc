@@ -178,6 +178,37 @@ void CoalesceMajorDimCopies(const std::vector<int64_t>& src_offsets,
   }
 }
 
+std::vector<std::string> GetActiveShardLocalRanks(
+    const KVCacheManagerBase& manager) {
+  // Fast path: if no telemetry backends are registered, return empty to avoid
+  // copying ranks or recording storage metrics.
+  if (!telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+    return {};
+  }
+  const absl::Span<const std::string> ranks = manager.shard_local_ranks();
+  const size_t count = std::min(manager.num_shards(), ranks.size());
+  return std::vector<std::string>(ranks.begin(), ranks.begin() + count);
+}
+
+void RecordStorageBytes(absl::Span<const std::string> shard_local_ranks,
+                        absl::string_view direction, uint64_t bytes_per_shard) {
+  if (bytes_per_shard == 0 || shard_local_ranks.empty()) {
+    return;
+  }
+  telemetry::RaidenMetricStore& store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) {
+    return;
+  }
+  for (absl::string_view local_rank : shard_local_ranks) {
+    const telemetry::MetricLabel labels[] = {
+        {telemetry::metric_labels::kDirection, direction},
+        {telemetry::metric_labels::kLocalRank, local_rank}};
+    store.IncrementCounter(telemetry::metric_names::kStorageBytesTotal, labels,
+                           bytes_per_shard);
+  }
+}
+
 struct TransferPipelinedState {
   size_t total_chunks = 0;
   std::atomic<size_t> completed_chunks{0};
@@ -189,6 +220,10 @@ struct TransferPipelinedState {
 
   xla::Promise<> promise;
   raiden::BufferHolders combined_holds;
+
+  std::vector<std::string> shard_local_ranks;
+  absl::string_view storage_direction;
+  std::atomic<uint64_t> completed_bytes_per_shard{0};
 
   TransferPipelinedState(size_t total_chunks, xla::Promise<> p,
                          raiden::BufferHolders holds)
@@ -219,6 +254,14 @@ struct TransferPipelinedState {
   void MarkChunkComplete() {
     size_t prev = completed_chunks.fetch_add(1, std::memory_order_acq_rel);
     if (prev + 1 == total_chunks) {
+      if (!has_failed.load(std::memory_order_acquire) &&
+          !shard_local_ranks.empty()) {
+        const uint64_t bytes =
+            completed_bytes_per_shard.load(std::memory_order_relaxed);
+        if (bytes > 0 && !storage_direction.empty()) {
+          RecordStorageBytes(shard_local_ranks, storage_direction, bytes);
+        }
+      }
       bool expected = false;
       if (promise_fulfilled.compare_exchange_strong(expected, true)) {
         if (has_failed.load(std::memory_order_acquire)) {
@@ -3442,6 +3485,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
 
   auto state = std::make_shared<TransferPipelinedState>(
       num_chunks, std::move(promise), std::move(all_holds));
+  state->shard_local_ranks = GetActiveShardLocalRanks(*this);
+  state->storage_direction = telemetry::metric_labels::kDirectionWrite;
 
   for (size_t i = 0; i < num_chunks; ++i) {
     int staging_block_id = chunks[i].staging_block_id;
@@ -3459,11 +3504,20 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
           for (const auto& s : slices) {
             total_bytes += s.size;
           }
-          backend->WriteAsync(key, slices, total_bytes,
-                              [state](absl::Status s) {
-                                if (!s.ok()) state->SetError(s);
-                                state->MarkChunkComplete();
-                              });
+          const uint64_t bytes_per_shard =
+              num_shards_ > 0 ? static_cast<uint64_t>(total_bytes / num_shards_)
+                              : 0;
+          backend->WriteAsync(
+              key, slices, total_bytes,
+              [state, bytes_per_shard](absl::Status s) {
+                if (!s.ok()) {
+                  state->SetError(s);
+                } else {
+                  state->completed_bytes_per_shard.fetch_add(
+                      bytes_per_shard, std::memory_order_relaxed);
+                }
+                state->MarkChunkComplete();
+              });
         });
   }
   return raiden::PjRtCopyFuture(std::move(aggregate_future),
@@ -3504,6 +3558,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
   auto [promise, aggregate_future] = xla::MakePromise();
   auto state = std::make_shared<TransferPipelinedState>(
       num_chunks, std::move(promise), /*holds=*/raiden::BufferHolders{});
+  state->shard_local_ranks = GetActiveShardLocalRanks(*this);
+  state->storage_direction = telemetry::metric_labels::kDirectionRead;
 
   for (size_t i = 0; i < num_chunks; ++i) {
     int64_t staging_block_idx = src_host_block_ids[i];
@@ -3516,16 +3572,20 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
     for (const auto& s : slices) {
       total_bytes += s.size;
     }
+    const uint64_t bytes_per_shard =
+        num_shards_ > 0 ? static_cast<uint64_t>(total_bytes / num_shards_) : 0;
 
     backend->ReadAsync(
         key, slices, total_bytes,
-        [this, state, staging_block_idx,
-         device_block_idx](absl::Status read_status) {
+        [this, state, staging_block_idx, device_block_idx,
+         bytes_per_shard](absl::Status read_status) {
           if (!read_status.ok()) {
             state->SetError(read_status);
             state->MarkChunkComplete();
             return;
           }
+          state->completed_bytes_per_shard.fetch_add(
+              bytes_per_shard, std::memory_order_relaxed);
           auto h2d_fut_or = H2d({staging_block_idx}, {device_block_idx}, {1});
           if (!h2d_fut_or.ok()) {
             state->SetError(h2d_fut_or.status());

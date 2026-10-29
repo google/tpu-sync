@@ -263,6 +263,18 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kBufferAllocatedBytes.type, MetricType::kGauge);
   EXPECT_THAT(metric_metadata::kBufferAllocatedBytes.label_names, IsEmpty());
 
+  // StorageBytesTotal
+  EXPECT_EQ(metric_names::kStorageBytesTotal, "storage_bytes_total");
+  EXPECT_EQ(metric_descriptions::kStorageBytesTotal,
+            "Total bytes read from or written to secondary storage");
+  EXPECT_EQ(metric_metadata::kStorageBytesTotal.name, "storage_bytes_total");
+  EXPECT_EQ(metric_metadata::kStorageBytesTotal.description,
+            "Total bytes read from or written to secondary storage");
+  EXPECT_EQ(metric_metadata::kStorageBytesTotal.type, MetricType::kCounter);
+  EXPECT_THAT(
+      metric_metadata::kStorageBytesTotal.label_names,
+      ElementsAre(metric_labels::kLocalRank, metric_labels::kDirection));
+
   // Weight Sync Metrics
   EXPECT_EQ(metric_names::kWeightSyncSentBytesTotal,
             "weight_sync_sent_bytes_total");
@@ -397,6 +409,11 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(metric_labels::kPcieTransferLabels,
               ElementsAre(metric_labels::kHostIp, metric_labels::kLocalRank));
 
+  // Storage Bytes Labels
+  EXPECT_THAT(
+      metric_labels::kStorageBytesLabels,
+      ElementsAre(metric_labels::kLocalRank, metric_labels::kDirection));
+
   // All Metrics
   // clang-format off
   EXPECT_THAT(
@@ -429,7 +446,8 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kPeregrineE2eLatencyUs,
           metric_metadata::kPeregrineRequestSizeBytes,
           metric_metadata::kPeregrineBytesTotal,
-          metric_metadata::kPeregrineErrorsTotal));
+          metric_metadata::kPeregrineErrorsTotal,
+          metric_metadata::kStorageBytesTotal));
   // clang-format on
 }
 

@@ -344,6 +344,25 @@ double ComputeDmaTransferTimeMs(absl::string_view dma_metric,
   return std::max(0.0, absl::ToDoubleMilliseconds(end_time - effective_start));
 }
 
+void RecordStorageBytes(absl::Span<const std::string> shard_local_ranks,
+                        absl::string_view direction, uint64_t bytes_per_shard) {
+  if (bytes_per_shard == 0 || shard_local_ranks.empty()) {
+    return;
+  }
+  telemetry::RaidenMetricStore& store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) {
+    return;
+  }
+  for (absl::string_view local_rank : shard_local_ranks) {
+    const telemetry::MetricLabel labels[] = {
+        {telemetry::metric_labels::kDirection, direction},
+        {telemetry::metric_labels::kLocalRank, local_rank}};
+    store.IncrementCounter(telemetry::metric_names::kStorageBytesTotal, labels,
+                           bytes_per_shard);
+  }
+}
+
 // Joins the given PjRtCopyFutures and records transfer latency and per-device
 // bytes transferred if telemetry is enabled.
 raiden::PjRtCopyFuture JoinAndRecordTelemetry(
@@ -3857,11 +3876,33 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
           for (const auto& s : slices) {
             total_bytes += s.size;
           }
-          backend->WriteAsync(key, slices, total_bytes,
-                              [state](absl::Status s) {
-                                if (!s.ok()) state->SetError(s);
-                                state->MarkChunkComplete();
-                              });
+          const uint64_t bytes_per_shard =
+              num_shards_ > 0 ? static_cast<uint64_t>(total_bytes / num_shards_)
+                              : 0;
+          std::vector<std::string> shard_local_ranks;
+          if (bytes_per_shard > 0 &&
+              telemetry::RaidenMetricStore::GetGlobalMetricStore()
+                  .HasBackends()) {
+            const absl::Span<const std::string> ranks =
+                this->shard_local_ranks();
+            const size_t active_shards = std::min(num_shards_, ranks.size());
+            shard_local_ranks.assign(ranks.begin(),
+                                     ranks.begin() + active_shards);
+          }
+          backend->WriteAsync(
+              key, slices, total_bytes,
+              [state, bytes_per_shard,
+               shard_local_ranks =
+                   std::move(shard_local_ranks)](absl::Status s) {
+                if (!s.ok()) {
+                  state->SetError(s);
+                } else {
+                  RecordStorageBytes(shard_local_ranks,
+                                     telemetry::metric_labels::kDirectionWrite,
+                                     bytes_per_shard);
+                }
+                state->MarkChunkComplete();
+              });
         });
   }
   return raiden::PjRtCopyFuture(std::move(aggregate_future),
@@ -3914,16 +3955,29 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
     for (const auto& s : slices) {
       total_bytes += s.size;
     }
+    const uint64_t bytes_per_shard =
+        num_shards_ > 0 ? static_cast<uint64_t>(total_bytes / num_shards_) : 0;
+    std::vector<std::string> shard_local_ranks;
+    if (bytes_per_shard > 0 &&
+        telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+      const absl::Span<const std::string> ranks = this->shard_local_ranks();
+      const size_t active_shards = std::min(num_shards_, ranks.size());
+      shard_local_ranks.assign(ranks.begin(), ranks.begin() + active_shards);
+    }
 
     backend->ReadAsync(
         key, slices, total_bytes,
-        [this, state, staging_block_idx,
-         device_block_idx](absl::Status read_status) {
+        [this, state, staging_block_idx, device_block_idx, bytes_per_shard,
+         shard_local_ranks =
+             std::move(shard_local_ranks)](absl::Status read_status) {
           if (!read_status.ok()) {
             state->SetError(read_status);
             state->MarkChunkComplete();
             return;
           }
+          RecordStorageBytes(shard_local_ranks,
+                             telemetry::metric_labels::kDirectionRead,
+                             bytes_per_shard);
           auto h2d_fut_or = H2d({staging_block_idx}, {device_block_idx}, {1});
           if (!h2d_fut_or.ok()) {
             state->SetError(h2d_fut_or.status());

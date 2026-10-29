@@ -3239,11 +3239,15 @@ absl::Status KVCacheManagerBase::RegisterActivePlan(
       }
     }
   }
+  auto plan = std::make_shared<RegisteredPlan>(
+      RegisteredPlan{request, is_sender, std::move(host_block_of),
+                     std::move(staged_device_blocks), generation});
+  // Index the stored copy (not `request`): GetBlockChunks scans
+  // plan->request, and the receiver path picks the first matching source
+  // shard in that map's iteration order.
+  plan->entry_index = BuildScheduleEntryIndex(plan->request);
   absl::MutexLock l(plans_mu_);
-  if (auto [it, inserted] = active_plans_.try_emplace(
-          uuid, std::make_shared<const RegisteredPlan>(RegisteredPlan{
-                    request, is_sender, std::move(host_block_of),
-                    std::move(staged_device_blocks), generation}));
+  if (auto [it, inserted] = active_plans_.try_emplace(uuid, std::move(plan));
       !inserted) {
     return absl::AlreadyExistsError(
         absl::StrCat("Plan with UUID ", uuid, " is already registered!"));
@@ -3299,6 +3303,22 @@ void KVCacheManagerBase::SetRemoteLayerAddrs(
 void KVCacheManagerBase::ClearRemoteLayerAddrs(uint64_t uuid) {
   absl::MutexLock l(plans_mu_);
   remote_layer_addrs_.erase(uuid);
+}
+
+KVCacheManagerBase::ScheduleEntryIndex
+KVCacheManagerBase::BuildScheduleEntryIndex(
+    const ::tpu_sync::rpc::StartTransferRequest& request) {
+  ScheduleEntryIndex index;
+  for (const auto& [src_shard, schedule] : request.shard_push_schedules()) {
+    const auto& entries = schedule.entries();
+    for (int pos = 0; pos < entries.size(); ++pos) {
+      const auto& entry = entries[pos];
+      index.by_src_block[{src_shard, entry.src_block_id()}].push_back(pos);
+      index.by_dst_block[{entry.dst_shard_idx(), entry.dst_block_id()}]
+          .push_back({src_shard, pos});
+    }
+  }
+  return index;
 }
 
 std::vector<tpu_raiden::transport::BlockChunk>
@@ -3475,6 +3495,7 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
   }
 
   const auto& request = plan_snapshot->request;
+  const ScheduleEntryIndex& entry_index = plan_snapshot->entry_index;
   const auto& schedules = request.shard_push_schedules();
   auto schedule_it = schedules.find(static_cast<int32_t>(shard_idx));
 
@@ -3529,9 +3550,14 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
     std::vector<tpu_raiden::transport::BlockChunk> block_resolved_chunks;
 
     if (is_sender) {
-      if (schedule_it != schedules.end()) {
-        const auto& schedule = schedule_it->second;
-        for (const auto& entry : schedule.entries()) {
+      // Only this block's entries, in schedule order (see ScheduleEntryIndex).
+      const auto positions_it = entry_index.by_src_block.find(
+          {static_cast<int32_t>(shard_idx), block_id});
+      if (schedule_it != schedules.end() &&
+          positions_it != entry_index.by_src_block.end()) {
+        const auto& entries = schedule_it->second.entries();
+        for (int pos : positions_it->second) {
+          const auto& entry = entries[pos];
           if (!entry_targets_pool(entry)) {
             continue;
           }
@@ -3563,6 +3589,18 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
         }
       }
     } else {
+      // Entries addressed to this (dst shard, dst block), in the order the
+      // full scan would visit them (see ScheduleEntryIndex).
+      const auto candidates_it = entry_index.by_dst_block.find(
+          {static_cast<int64_t>(shard_idx), block_id});
+      static const std::vector<std::pair<int32_t, int>> kNoCandidates;
+      const auto& candidates = candidates_it != entry_index.by_dst_block.end()
+                                   ? candidates_it->second
+                                   : kNoCandidates;
+      const auto entry_at = [&schedules](int32_t src_shard, int pos)
+          -> const ::tpu_sync::rpc::ShardPushEntryProto& {
+        return schedules.at(src_shard).entries(pos);
+      };
       int found_src_shard = -1;
       if (sender_node_id != -1) {
         found_src_shard = static_cast<int>(sender_node_id);
@@ -3571,26 +3609,28 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
         // block we are receiving. This is crucial for heterogeneous block sizes
         // (merging) where multiple source blocks target the same dst_block_id.
         // If src_block_id is -1, we fall back to matching only on dst_block_id.
-        for (const auto& [src_shard, src_schedule] : schedules) {
-          for (const auto& entry : src_schedule.entries()) {
-            if (entry_targets_pool(entry) &&
-                static_cast<size_t>(entry.dst_shard_idx()) == shard_idx &&
-                static_cast<size_t>(entry.dst_block_id()) == block_id &&
-                (src_block_id == -1 ||
-                 static_cast<size_t>(entry.src_block_id()) == src_block_id)) {
-              found_src_shard = src_shard;
-              break;
-            }
+        for (const auto& [src_shard, pos] : candidates) {
+          const auto& entry = entry_at(src_shard, pos);
+          if (entry_targets_pool(entry) &&
+              static_cast<size_t>(entry.dst_shard_idx()) == shard_idx &&
+              static_cast<size_t>(entry.dst_block_id()) == block_id &&
+              (src_block_id == -1 ||
+               static_cast<size_t>(entry.src_block_id()) == src_block_id)) {
+            found_src_shard = src_shard;
+            break;
           }
-          if (found_src_shard != -1) break;
         }
       }
 
       if (found_src_shard != -1) {
         auto schedule_found_it = schedules.find(found_src_shard);
         if (schedule_found_it != schedules.end()) {
-          const auto& schedule = schedule_found_it->second;
-          for (const auto& entry : schedule.entries()) {
+          const auto& schedule_entries = schedule_found_it->second.entries();
+          for (const auto& [src_shard, pos] : candidates) {
+            if (src_shard != found_src_shard) {
+              continue;
+            }
+            const auto& entry = schedule_entries[pos];
             if (!entry_targets_pool(entry)) {
               continue;
             }

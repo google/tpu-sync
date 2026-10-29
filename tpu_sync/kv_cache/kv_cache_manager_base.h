@@ -1046,6 +1046,26 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   HostBufferAllocator host_allocator_ = nullptr;
 
   mutable absl::Mutex plans_mu_;
+  // Lookup tables over a plan's shard_push_schedules(), built once when the
+  // plan is registered. A pool-reshard plan carries one schedule entry per
+  // (pool, rank, page range), and GetBlockChunks used to scan every entry for
+  // every pushed block, which made resolving one transfer quadratic in its
+  // page count (~60 s for an 819k-token DeepSeek-V4 request). Positions are
+  // indices into the corresponding ShardPushScheduleProto::entries() and keep
+  // the scan order, so lookups return entries in the order the scan saw them.
+  struct ScheduleEntryIndex {
+    // (src shard, src block) -> positions in that shard's entries().
+    absl::flat_hash_map<std::pair<int32_t, int64_t>, std::vector<int>>
+        by_src_block;
+    // (dst shard, dst block) -> (src shard, position), in
+    // shard_push_schedules() iteration order, then entry order.
+    absl::flat_hash_map<std::pair<int64_t, int64_t>,
+                        std::vector<std::pair<int32_t, int>>>
+        by_dst_block;
+  };
+  static ScheduleEntryIndex BuildScheduleEntryIndex(
+      const ::tpu_sync::rpc::StartTransferRequest& request);
+
   struct RegisteredPlan {
     ::tpu_sync::rpc::StartTransferRequest request;
     bool is_sender = false;
@@ -1062,6 +1082,9 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     // registration cannot touch a newer one under the same uuid. 0 when
     // the caller keeps no generations; cleanup then matches by uuid alone.
     uint64_t generation = 0;
+    // Built from `request` after the plan is constructed (see
+    // RegisterActivePlan), so it indexes this exact map instance.
+    ScheduleEntryIndex entry_index;
   };
   // Plans are stored behind shared_ptr so the per-push readers
   // (GetBlockChunks / GetPoolPushProgressSpec) snapshot with a refcount bump

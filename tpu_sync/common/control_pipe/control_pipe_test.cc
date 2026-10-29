@@ -25,6 +25,7 @@
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"

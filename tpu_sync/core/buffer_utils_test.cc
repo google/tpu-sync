@@ -18,10 +18,10 @@
 #include <optional>
 #include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
-#include "xla/tsl/platform/statusor.h"
 
 namespace tpu_raiden {
 namespace {
@@ -34,7 +34,7 @@ TEST(BufferUtilsTest, UnpackLayersEmptyReturnsEmpty) {
 
 TEST(BufferUtilsTest, UnpackLayersSucceedsWithCpuBuffers) {
   TF_ASSERT_OK_AND_ASSIGN(auto client,
-                          xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
+                       xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
   TF_ASSERT_OK_AND_ASSIGN(
       xla::PjRtMemorySpace * memory_space,
       client->addressable_devices()[0]->default_memory_space());

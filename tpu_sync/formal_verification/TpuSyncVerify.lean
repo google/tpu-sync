@@ -2,6 +2,7 @@ import TpuSyncVerify.Common.System
 import TpuSyncVerify.Common.ModelCheck
 import TpuSyncVerify.Common.ListAux
 import TpuSyncVerify.Transfer.Session
+import TpuSyncVerify.Transfer.Caller
 import TpuSyncVerify.Transfer.PrefillDecode.Receive
 import TpuSyncVerify.Transfer.PrefillDecode.ReceivePoll
 import TpuSyncVerify.Transfer.PrefillDecode.Send
@@ -12,10 +13,10 @@ import TpuSyncVerify.Transfer.PrefillDecode.PipelineChecks
 import TpuSyncVerify.Transfer.PrefillDecode.PeerIsolation
 import TpuSyncVerify.Transfer.PrefillDecode.UuidTable
 import TpuSyncVerify.Transfer.PrefillDecode.Transport
-import TpuSyncVerify.Transfer.PrefillDecode.Caller
 import TpuSyncVerify.Transfer.Reshard.Receive
 import TpuSyncVerify.Transfer.Reshard.Send
 import TpuSyncVerify.Transfer.Reshard.Pipeline
+import TpuSyncVerify.Transfer.Reshard.MultiRequest
 import TpuSyncVerify.Transfer.Reshard.Coverage
 import TpuSyncVerify.Transfer.Reshard.PoolStaging
 import TpuSyncVerify.Transfer.Reshard.Registry
@@ -30,5 +31,6 @@ modelled, the directory layout, and how the C++ is cited.
 
 * `Common` — transition-system core, list lemmas, bounded model checker.
 * `Transfer` — `Session` (settle protocol shared by every transfer session),
-  `PrefillDecode/`, `Reshard/`.
+  `Caller` (engine caller contract above `poll_stats()`), `PrefillDecode/`,
+  `Reshard/`.
 -/

@@ -188,6 +188,9 @@ struct DeleteOptions {
   }
 };
 
+// Options controlling KVCacheStoreBackend::Save.
+struct SaveOptions {};
+
 // Abstract interface for KV cache index storage backends.
 // Implementations must be thread-safe.
 class KVCacheStoreBackend {
@@ -227,13 +230,15 @@ class KVCacheStoreBackend {
                              absl::Span<const RaidenBlockId> slices,
                              BlockTracker* absl_nonnull load_tracker) = 0;
 
-  // Asynchronously saves KV cache blocks from device (HBM) to host DRAM.
+  // Asynchronously saves KV cache blocks from device (HBM) to host DRAM
+  // according to `options` (see SaveOptions).
   // The tracker's transfer status is updated when the operation completes or
   // settles.
   virtual tsl::Future<> Save(absl::Span<const std::string> block_hashes,
                              absl::Span<const int64_t> src_device_block_ids,
                              absl::Span<const int32_t> dst_host_block_ids,
-                             BlockTracker* absl_nonnull save_tracker) {
+                             BlockTracker* absl_nonnull save_tracker,
+                             const SaveOptions& options = {}) {
     CHECK(save_tracker != nullptr);
     return tsl::Future<>(absl::UnimplementedError("Save not implemented."));
   }

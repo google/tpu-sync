@@ -1326,7 +1326,7 @@ tsl::Future<> HostOffloadBackend::Save(
     absl::Span<const std::string> block_hashes,
     absl::Span<const int64_t> src_device_block_ids,
     absl::Span<const int32_t> dst_host_block_ids,
-    BlockTracker* absl_nonnull save_tracker) {
+    BlockTracker* absl_nonnull save_tracker, const SaveOptions& /*options*/) {
   CHECK(save_tracker != nullptr);
   if (block_hashes.empty()) {
     return tsl::Future<>(absl::OkStatus());

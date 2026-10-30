@@ -1794,8 +1794,8 @@ TEST(HostOffloadBackendTest, SaveUpdatesTrackerOnSuccessAndFailure) {
 
   BlockTracker success_tracker;
   success_tracker.AddPending("save_success_1");
-  auto success_future =
-      backend->Save({"save_success_1"}, {7}, {10}, &success_tracker);
+  auto success_future = backend->Save({"save_success_1"}, {7}, {10},
+                                      &success_tracker, SaveOptions{});
   ABSL_EXPECT_OK(success_future.Await());
 
   BlockTracker::StatusResult success_res = success_tracker.Poll();

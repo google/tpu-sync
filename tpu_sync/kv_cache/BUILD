@@ -557,6 +557,7 @@ cc_test(
         ":kv_cache_manager_with_transfer",
         "//tpu_sync/core:control_plane_backend",
         "//tpu_sync/core:grpc_control_plane_backend",
+        "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:tcp_control_plane_backend",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/log",

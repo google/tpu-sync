@@ -568,12 +568,16 @@ absl::Status TransferReceiveSession::AwaitPredecessorH2dComplete() {
   std::chrono::steady_clock::time_point deadline;
   {
     absl::MutexLock lock(mu_);
-    pred = std::move(predecessor_session_);
-    predecessor_session_.reset();
+    pred = predecessor_session_;
     deadline = deadline_;
   }
   if (pred == nullptr) return absl::OkStatus();
-  return pred->WaitUntilH2dCompleteOrDone(deadline);
+  absl::Status status = pred->WaitUntilH2dCompleteOrDone(deadline);
+  if (status.ok()) {
+    absl::MutexLock lock(mu_);
+    predecessor_session_.reset();
+  }
+  return status;
 }
 
 absl::Status TransferReceiveSession::WaitUntilH2dCompleteOrDone(
@@ -581,8 +585,12 @@ absl::Status TransferReceiveSession::WaitUntilH2dCompleteOrDone(
   absl::MutexLock lock(mu_);
   auto cond =
       +[](TransferReceiveSession* self) ABSL_SHARED_LOCKS_REQUIRED(self->mu_) {
-        return self->done_ || self->draining_ ||
-               (self->network_completed_ && self->AllH2dDoneLocked());
+        const size_t total_layers =
+            self->base_ != nullptr ? self->base_->num_layers() : 0;
+        const bool all_layers_h2d_done =
+            self->num_completed_layers_ == static_cast<int32_t>(total_layers) &&
+            self->AllH2dDoneLocked();
+        return self->done_ || !self->status_.ok() || all_layers_h2d_done;
       };
   if (!mu_.AwaitWithDeadline(absl::Condition(cond, this),
                              ToAbslDeadline(wait_deadline))) {

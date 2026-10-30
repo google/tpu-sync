@@ -263,6 +263,54 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kBufferAllocatedBytes.type, MetricType::kGauge);
   EXPECT_THAT(metric_metadata::kBufferAllocatedBytes.label_names, IsEmpty());
 
+  // StorageBytesTotal
+  EXPECT_EQ(metric_names::kStorageBytesTotal, "storage_bytes_total");
+  EXPECT_EQ(metric_descriptions::kStorageBytesTotal,
+            "Total bytes read from or written to secondary storage");
+  EXPECT_EQ(metric_metadata::kStorageBytesTotal.name, "storage_bytes_total");
+  EXPECT_EQ(metric_metadata::kStorageBytesTotal.description,
+            "Total bytes read from or written to secondary storage");
+  EXPECT_EQ(metric_metadata::kStorageBytesTotal.type, MetricType::kCounter);
+  EXPECT_THAT(
+      metric_metadata::kStorageBytesTotal.label_names,
+      ElementsAre(metric_labels::kLocalRank, metric_labels::kDirection));
+
+  // HostMemoryBreakdownBytes
+  EXPECT_EQ(metric_names::kHostMemoryBreakdownBytes,
+            "host_memory_breakdown_bytes");
+  EXPECT_EQ(metric_descriptions::kHostMemoryBreakdownBytes,
+            "Host DRAM memory breakdown in bytes by component (kv_pool, "
+            "process_heap, page_cache, free)");
+  EXPECT_EQ(metric_metadata::kHostMemoryBreakdownBytes.name,
+            "host_memory_breakdown_bytes");
+  EXPECT_EQ(metric_metadata::kHostMemoryBreakdownBytes.description,
+            "Host DRAM memory breakdown in bytes by component (kv_pool, "
+            "process_heap, page_cache, free)");
+  EXPECT_EQ(metric_metadata::kHostMemoryBreakdownBytes.type,
+            MetricType::kGauge);
+  EXPECT_THAT(metric_metadata::kHostMemoryBreakdownBytes.label_names,
+              ElementsAre(metric_labels::kComponent));
+
+  // HostNumaMemoryBytes
+  EXPECT_EQ(metric_labels::kNumaNode, "numa_node");
+  EXPECT_EQ(metric_labels::kState, "state");
+  EXPECT_EQ(metric_labels::kStateUsed, "used");
+  EXPECT_EQ(metric_labels::kStateFree, "free");
+  EXPECT_EQ(metric_labels::kStateTotal, "total");
+  EXPECT_THAT(metric_labels::kHostNumaMemoryLabels,
+              ElementsAre(metric_labels::kNumaNode, metric_labels::kState));
+  EXPECT_EQ(metric_names::kHostNumaMemoryBytes, "host_numa_memory_bytes");
+  EXPECT_EQ(metric_descriptions::kHostNumaMemoryBytes,
+            "Per-NUMA-node host DRAM memory in bytes by state (used, free, "
+            "total)");
+  EXPECT_EQ(metric_metadata::kHostNumaMemoryBytes.name,
+            "host_numa_memory_bytes");
+  EXPECT_EQ(metric_metadata::kHostNumaMemoryBytes.description,
+            "Per-NUMA-node host DRAM memory in bytes by state (used, free, "
+            "total)");
+  EXPECT_EQ(metric_metadata::kHostNumaMemoryBytes.type, MetricType::kGauge);
+  EXPECT_THAT(metric_metadata::kHostNumaMemoryBytes.label_names,
+              ElementsAre(metric_labels::kNumaNode, metric_labels::kState));
   // Weight Sync Metrics
   EXPECT_EQ(metric_names::kWeightSyncSentBytesTotal,
             "weight_sync_sent_bytes_total");
@@ -397,6 +445,19 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(metric_labels::kPcieTransferLabels,
               ElementsAre(metric_labels::kHostIp, metric_labels::kLocalRank));
 
+  // Storage Bytes Labels
+  EXPECT_THAT(
+      metric_labels::kStorageBytesLabels,
+      ElementsAre(metric_labels::kLocalRank, metric_labels::kDirection));
+
+  // Host Memory Breakdown Labels
+  EXPECT_EQ(metric_labels::kComponent, "component");
+  EXPECT_EQ(metric_labels::kComponentKvPool, "kv_pool");
+  EXPECT_EQ(metric_labels::kComponentProcessHeap, "process_heap");
+  EXPECT_EQ(metric_labels::kComponentPageCache, "page_cache");
+  EXPECT_EQ(metric_labels::kComponentFree, "free");
+  EXPECT_THAT(metric_labels::kHostMemoryBreakdownLabels,
+              ElementsAre(metric_labels::kComponent));
   // All Metrics
   // clang-format off
   EXPECT_THAT(
@@ -429,7 +490,10 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kPeregrineE2eLatencyUs,
           metric_metadata::kPeregrineRequestSizeBytes,
           metric_metadata::kPeregrineBytesTotal,
-          metric_metadata::kPeregrineErrorsTotal));
+          metric_metadata::kPeregrineErrorsTotal,
+          metric_metadata::kStorageBytesTotal,
+          metric_metadata::kHostMemoryBreakdownBytes,
+          metric_metadata::kHostNumaMemoryBytes));
   // clang-format on
 }
 

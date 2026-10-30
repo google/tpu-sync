@@ -4451,7 +4451,7 @@ class FakeDestinationService
 
     proto::WriteRemoteEvent ack_event;
     auto* ack = ack_event.mutable_ack();
-    ack->set_operation_id(kOperationId);
+    ack->set_operation_id(operation_id_override_.value_or(kOperationId));
     ack->set_exist_state(exist_state_);
     ack->set_granted_deadline_ms(granted_deadline_ms_override_ > 0
                                      ? granted_deadline_ms_override_
@@ -4591,6 +4591,11 @@ class FakeDestinationService
     granted_deadline_ms_override_ = ms;
   }
 
+  void SetOperationId(uint64_t id) {
+    absl::MutexLock lock(mutex_);
+    operation_id_override_ = id;
+  }
+
   int write_calls() const {
     absl::MutexLock lock(mutex_);
     return write_calls_;
@@ -4624,6 +4629,7 @@ class FakeDestinationService
   int poll_calls_ ABSL_GUARDED_BY(mutex_) = 0;
   int64_t requested_deadline_ms_ ABSL_GUARDED_BY(mutex_) = 0;
   int64_t granted_deadline_ms_override_ ABSL_GUARDED_BY(mutex_) = 0;
+  std::optional<uint64_t> operation_id_override_ ABSL_GUARDED_BY(mutex_);
 };
 
 class RemoteWriteSourceTest : public StoreDiscoveryTest {
@@ -8361,6 +8367,234 @@ TEST_F(KVRecallBlocksMetricsTest, DpRankAttribution) {
   EXPECT_THAT(create_store(-1), StatusIs(absl::StatusCode::kInvalidArgument,
                                          HasSubstr("dp_rank")));
   ABSL_EXPECT_OK(create_store(9));
+}
+
+void WaitForSaveDone(KVCacheStore& store, size_t expected) {
+  const absl::Time deadline = absl::Now() + absl::Seconds(30);
+  size_t settled = 0;
+  while (settled < expected && absl::Now() < deadline) {
+    auto [done, failed, pending, existing, unregistered] =
+        store.PollSaveStatus();
+    settled += done.size() + failed.size();
+    if (settled < expected) {
+      absl::SleepFor(absl::Milliseconds(10));
+    }
+  }
+}
+
+class KVSaveBlocksMetricsTest : public KVRecallBlocksMetricsTest {
+ protected:
+  void ExpectSaveBlocks(absl::string_view tier, absl::string_view outcome,
+                        uint64_t count, absl::string_view dp_rank = "0") {
+    const telemetry::MetricLabel expected_labels[] = {
+        {telemetry::metric_labels::kDpRank, dp_rank},
+        {telemetry::metric_labels::kTier, tier},
+        {telemetry::metric_labels::kOutcome, outcome},
+    };
+    EXPECT_CALL(
+        *mock_metrics_,
+        IncrementCounter(telemetry::metric_names::kKvSaveBlocksTotal,
+                         UnorderedElementsAreArray(expected_labels), count));
+  }
+
+  RaidenBlockId HbmSlice(int dev_id) const {
+    return RaidenBlockId(local_id_, /*host_block_id=*/-1, dev_id,
+                         BlockStatus::HBM);
+  }
+};
+
+TEST_F(KVSaveBlocksMetricsTest, LocalDramSaveOutcomes) {
+  MakeStore({.with_storage = false, .dp_rank = 2});
+
+  // Insert admission rejected when all LRU slots are pinned.
+  std::vector<std::string> filler_hashes;
+  std::vector<RaidenBlockId> filler_slices;
+  for (int i = 0; i < 10; ++i) {
+    filler_hashes.push_back(absl::StrCat("f", i));
+    filler_slices.push_back(LocalSlice(i));
+  }
+  ABSL_ASSERT_OK(
+      store_->Insert(filler_hashes, filler_slices, /*on_host=*/true));
+  ExpectSaveBlocks(telemetry::metric_labels::kTierLocalDram,
+                   telemetry::metric_labels::kOutcomeRejected, 2, "2");
+  EXPECT_THAT(store_->Insert({"overflow_0", "overflow_1"},
+                             {LocalSlice(10), LocalSlice(11)},
+                             /*on_host=*/true),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+  store_->Release(filler_hashes);
+  store_->backend()->Delete(filler_hashes);
+
+  // SaveLocal admission rejected when host blocks cannot be allocated.
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held,
+      KVCacheStoreTest::AllocateBlockIds(*store_, FreeBlocks()));
+  ABSL_ASSERT_OK(store_->Insert({"hbm0", "hbm1"}, {HbmSlice(0), HbmSlice(1)},
+                                /*on_host=*/false));
+  ExpectSaveBlocks(telemetry::metric_labels::kTierLocalDram,
+                   telemetry::metric_labels::kOutcomeRejected, 2, "2");
+  EXPECT_THAT(store_->Save({"hbm0", "hbm1"}),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Exercises success and transfer failure for both host-only and
+  // storage write-through saves.
+  for (bool with_storage : {false, true}) {
+    SCOPED_TRACE(absl::StrCat("with_storage=", with_storage));
+    MakeStore({.with_storage = with_storage, .dp_rank = 2});
+
+    mgr_.fail_transfers = false;
+    ABSL_ASSERT_OK(store_->Insert({"s0", "s1"}, {HbmSlice(0), HbmSlice(1)},
+                                  /*on_host=*/false));
+    ExpectSaveBlocks(telemetry::metric_labels::kTierLocalDram,
+                     telemetry::metric_labels::kOutcomeOk, 2, "2");
+    ABSL_ASSERT_OK(store_->Save({"s0", "s1"}));
+    WaitForSaveDone(*store_, /*expected=*/2);
+    testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+    mgr_.fail_transfers = true;
+    ABSL_ASSERT_OK(store_->Insert({"s2", "s3"}, {HbmSlice(2), HbmSlice(3)},
+                                  /*on_host=*/false));
+    ExpectSaveBlocks(telemetry::metric_labels::kTierLocalDram,
+                     telemetry::metric_labels::kOutcomeFailed, 2, "2");
+    ABSL_ASSERT_OK(store_->Save({"s2", "s3"}));
+    WaitForSaveDone(*store_, /*expected=*/2);
+    testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+  }
+}
+
+class KVRemoteSaveBlocksMetricsTest : public RemoteWriteSourceTest {
+ protected:
+  void SetUp() override {
+    auto mock_backend =
+        std::make_unique<NiceMock<telemetry::MockMetricsBackend>>();
+    mock_metrics_ = mock_backend.get();
+    metrics_reset_ = std::make_unique<telemetry::ScopedMetricsBackendReset>(
+        std::move(mock_backend));
+    RemoteWriteSourceTest::SetUp();
+  }
+
+  void TearDown() override {
+    src_store_.reset();
+    RemoteWriteSourceTest::TearDown();
+    mock_metrics_ = nullptr;
+    metrics_reset_.reset();
+  }
+
+  void InitSourceAndDestination(const std::vector<std::string>& hashes,
+                                int src_dp_rank = 5,
+                                bool start_destination = true) {
+    src_ = RaidenId{"rw_metrics_src", "0", "kv", src_dp_rank};
+    dst_ = RaidenId{"rw_metrics_dst", "0", "kv", 0};
+    src_store_ = MakeStore(src_);
+    Populate(*src_store_, src_, hashes);
+    if (start_destination) {
+      StartFakeDestination(dst_);
+    }
+  }
+
+  void ExpectRemoteSaveBlocks(absl::string_view outcome, uint64_t count,
+                              absl::string_view dp_rank = "5") {
+    const telemetry::MetricLabel expected_labels[] = {
+        {telemetry::metric_labels::kDpRank, dp_rank},
+        {telemetry::metric_labels::kTier,
+         telemetry::metric_labels::kTierRemoteDram},
+        {telemetry::metric_labels::kOutcome, outcome},
+    };
+    EXPECT_CALL(
+        *mock_metrics_,
+        IncrementCounter(telemetry::metric_names::kKvSaveBlocksTotal,
+                         UnorderedElementsAreArray(expected_labels), count));
+  }
+
+  RaidenId src_;
+  RaidenId dst_;
+  std::unique_ptr<KVCacheStore> src_store_;
+  telemetry::MockMetricsBackend* mock_metrics_ = nullptr;
+  std::unique_ptr<telemetry::ScopedMetricsBackendReset> metrics_reset_;
+};
+
+TEST_F(KVRemoteSaveBlocksMetricsTest, RemoteDramOfferOutcomes) {
+  InitSourceAndDestination({"r0", "r1"});
+
+  // Peer RESOURCE_EXHAUSTED -> outcome="rejected".
+  fake_destination_.SetWriteRemoteStatus(
+      grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "peer full"));
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeRejected, 2);
+  EXPECT_THAT(src_store_->Save({"r0", "r1"}, dst_),
+              StatusIs(absl::StatusCode::kResourceExhausted));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Peer UNAVAILABLE transport error -> outcome="failed".
+  fake_destination_.SetWriteRemoteStatus(
+      grpc::Status(grpc::StatusCode::UNAVAILABLE, "peer unreachable"));
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeFailed, 2);
+  EXPECT_THAT(src_store_->Save({"r0", "r1"}, dst_),
+              StatusIs(absl::StatusCode::kUnavailable));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // WRITE_ALL_EXIST ack -> outcome="ok".
+  fake_destination_.SetWriteRemoteStatus(grpc::Status::OK);
+  fake_destination_.SetWriteExistState(proto::WRITE_ALL_EXIST);
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeOk, 2);
+  ABSL_ASSERT_OK(src_store_->Save({"r0", "r1"}, dst_));
+  AwaitWriteSettled(*src_store_);
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // WRITE_PARTIAL_EXIST ack -> outcome="failed" for the full batch size.
+  Populate(*src_store_, src_, {"s2", "s3"});
+  fake_destination_.SetWriteExistState(proto::WRITE_PARTIAL_EXIST);
+  fake_destination_.SetExistingHashes({"s2"});
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeFailed, 2);
+  ABSL_ASSERT_OK(src_store_->Save({"s2", "s3"}, dst_));
+  AwaitWriteSettled(*src_store_);
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // ack.operation_id == 0 -> outcome="failed".
+  Populate(*src_store_, src_, {"s4", "s5"});
+  fake_destination_.SetWriteExistState(proto::WRITE_EXIST_STATE_UNSPECIFIED);
+  fake_destination_.SetOperationId(0);
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeFailed, 2);
+  EXPECT_THAT(src_store_->Save({"s4", "s5"}, dst_),
+              StatusIs(absl::StatusCode::kInternal));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Null raiden_controller_ in BeginWriteRemote -> outcome="failed".
+  auto null_ctrl = std::make_shared<TestHostOffloadBackend>(
+      /*capacity=*/4, /*metadata=*/std::nullopt, /*raiden_id=*/src_,
+      /*raiden_controller=*/nullptr, /*registry_client=*/nullptr);
+  BlockTracker tracker;
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeFailed, 2);
+  EXPECT_THAT(
+      null_ctrl->BeginWriteRemote(dst_, {"s0", "s1"}, {0, 1}, absl::Seconds(5),
+                                  absl::Seconds(5), &tracker),
+      StatusIs(absl::StatusCode::kFailedPrecondition));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+}
+
+TEST_F(KVRemoteSaveBlocksMetricsTest, RemoteDramPollOutcomes) {
+  InitSourceAndDestination({"p0", "p1"});
+
+  // Peer FAILED verdict -> outcome="failed".
+  proto::PollWriteRemoteResponse verdict;
+  verdict.set_state(proto::PollWriteRemoteResponse::FAILED);
+  fake_destination_.SetPollResponse(verdict);
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeFailed, 2);
+  ABSL_ASSERT_OK(src_store_->Save({"p0", "p1"}, dst_));
+  AwaitWriteSettled(*src_store_);
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  // Peer COMMITTED verdict -> outcome="ok".
+  verdict.set_state(proto::PollWriteRemoteResponse::COMMITTED);
+  verdict.add_committed_hashes("p0");
+  verdict.add_committed_hashes("p1");
+  fake_destination_.SetPollResponse(verdict);
+  ExpectRemoteSaveBlocks(telemetry::metric_labels::kOutcomeOk, 2);
+  ABSL_ASSERT_OK(src_store_->Save({"p0", "p1"}, dst_));
+  AwaitWriteSettled(*src_store_);
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
 }
 
 }  // namespace

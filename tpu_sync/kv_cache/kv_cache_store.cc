@@ -51,6 +51,7 @@
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata_shm.h"
@@ -211,6 +212,25 @@ absl::StatusOr<BackendConfig> ResolveSecondaryBackendTopology(
   // worker would write the same shard files.
   ABSL_RETURN_IF_ERROR(RequireDeclaredAxis(received, sec_cfg.parallelism));
   return sec_cfg;
+}
+
+// Settle a save batch: count `block_hashes` in `kv_save_blocks_total`
+// under `tier` (`ok` for Done, `failed` for Failed), then mark them in
+// `save_tracker`.
+void MarkSaveDone(BlockTracker& save_tracker, absl::string_view dp_rank,
+                  absl::string_view tier,
+                  absl::Span<const std::string> block_hashes) {
+  IncrementKvSaveBlocks(dp_rank, tier, telemetry::metric_labels::kOutcomeOk,
+                        block_hashes.size());
+  save_tracker.MarkDone(block_hashes);
+}
+
+void MarkSaveFailed(BlockTracker& save_tracker, absl::string_view dp_rank,
+                    absl::string_view tier,
+                    absl::Span<const std::string> block_hashes) {
+  IncrementKvSaveBlocks(dp_rank, tier, telemetry::metric_labels::kOutcomeFailed,
+                        block_hashes.size());
+  save_tracker.MarkFailed(block_hashes);
 }
 
 }  // namespace
@@ -1068,6 +1088,9 @@ absl::Status KVCacheStore::Insert(const std::vector<std::string>& block_hashes,
 
   if (!backends_[0]->Insert(block_hashes, slices,
                             InsertOption::kInsertAndPin)) {
+    IncrementKvSaveBlocks(
+        dp_rank_str_, telemetry::metric_labels::kTierLocalDram,
+        telemetry::metric_labels::kOutcomeRejected, block_hashes.size());
     return absl::ResourceExhaustedError(
         "Insert refused: not enough unpinned space, or a hash could not be "
         "pinned");
@@ -1151,8 +1174,15 @@ absl::Status KVCacheStore::SaveLocal(
     save_tracker_.AddPending(block_hashes);
   }
 
-  auto host_blocks = AllocateBlockIds(block_hashes.size());
+  absl::StatusOr<std::vector<int>> host_blocks =
+      AllocateBlockIds(block_hashes.size());
   if (!host_blocks.ok()) {
+    IncrementKvSaveBlocks(dp_rank_str_,
+                          telemetry::metric_labels::kTierLocalDram,
+                          absl::IsResourceExhausted(host_blocks.status())
+                              ? telemetry::metric_labels::kOutcomeRejected
+                              : telemetry::metric_labels::kOutcomeFailed,
+                          block_hashes.size());
     save_tracker_.RemovePending(block_hashes);
     return host_blocks.status();
   }
@@ -1193,7 +1223,9 @@ absl::Status KVCacheStore::SaveLocal(
           absl::MutexLock lock(lifetime->mu);
           if (KVCacheStore* self = lifetime->store; self != nullptr) {
             self->DeallocateBlockIds(host_block_ids);
-            self->save_tracker_.MarkFailed(block_hashes);
+            MarkSaveFailed(self->save_tracker_, self->dp_rank_str_,
+                           telemetry::metric_labels::kTierLocalDram,
+                           block_hashes);
           }
         }
         if (host_ram_backend != nullptr)
@@ -1216,7 +1248,8 @@ absl::Status KVCacheStore::SaveLocal(
       {
         absl::MutexLock lock(lifetime->mu);
         if (KVCacheStore* self = lifetime->store; self != nullptr) {
-          self->save_tracker_.MarkDone(block_hashes);
+          MarkSaveDone(self->save_tracker_, self->dp_rank_str_,
+                       telemetry::metric_labels::kTierLocalDram, block_hashes);
         }
       }
       std::vector<global_registry::Registration> write_through_regs;

@@ -998,6 +998,7 @@ cc_test(
         ":kv_cache_store_backend_factory",
         ":kv_cache_store_client",
         ":kv_cache_store_server",
+        ":kv_cache_telemetry",
         "//tpu_sync/common:raiden_id",
         "//tpu_sync/core:kv_manager_holder",
         "//tpu_sync/core:raiden_transfer_endpoint",

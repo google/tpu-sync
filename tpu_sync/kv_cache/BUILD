@@ -711,6 +711,7 @@ cc_library(
     hdrs = ["kv_cache_store_backend.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":block_tracker",
         "//tpu_sync/common:raiden_id",
         "@com_google_absl//absl/base:nullability",
         "@com_google_absl//absl/log:check",

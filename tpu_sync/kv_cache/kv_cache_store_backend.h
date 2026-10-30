@@ -31,12 +31,12 @@
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
+#include "tpu_sync/kv_cache/block_tracker.h"
 
 namespace tpu_raiden {
 
 namespace kv_cache {
 
-class BlockTracker;
 class WriteRemoteCancel;
 
 enum class BlockStatus {
@@ -188,6 +188,21 @@ struct DeleteOptions {
   }
 };
 
+// Options controlling KVCacheStoreBackend::Save.
+struct SaveOptions {};
+
+// Options controlling KVCacheStoreBackend::Load.
+struct LoadOptions {
+  // Remote peer to load from. If empty or matching this backend's RaidenId,
+  // blocks are loaded from local host DRAM.
+  RaidenId remote_id = {};
+
+  // Optional pre-looked up RaidenBlockIds from a prior Lookup. When non-empty,
+  // must match block_hashes in size, and blocks must already be pinned
+  // externally. Ignored for remote peer loads.
+  absl::Span<const RaidenBlockId> slices = {};
+};
+
 // Abstract interface for KV cache index storage backends.
 // Implementations must be thread-safe.
 class KVCacheStoreBackend {
@@ -211,29 +226,26 @@ class KVCacheStoreBackend {
       absl::Span<const std::string> block_hashes,
       const LookupOptions& options = {}) = 0;
 
-  // Asynchronously loads KV cache blocks to device (HBM), either from local
-  // host DRAM or from the peer named by `remote_id`.
-  //
-  // `device_block_ids` is the destination and must name one device block per
-  // hash.
-  //
-  // If `slices` is non-empty, the caller's pre-looked up RaidenBlockIds are
-  // used directly. Note that blocks in `slices` must be already pinned
-  // externally (when Load from local host), and remote loads will re-resolve
-  // hashes at the peer, ignoring `slices`.
-  virtual tsl::Future<> Load(const RaidenId& remote_id,
-                             absl::Span<const std::string> block_hashes,
+  // Asynchronously loads KV cache blocks from host DRAM or a remote peer to
+  // device (HBM) according to `options` (see LoadOptions).
+  virtual tsl::Future<> Load(absl::Span<const std::string> block_hashes,
                              absl::Span<const int32_t> device_block_ids,
-                             absl::Span<const RaidenBlockId> slices,
-                             BlockTracker* absl_nonnull load_tracker) = 0;
+                             BlockTracker* absl_nonnull load_tracker,
+                             const LoadOptions& options = {}) {
+    CHECK(load_tracker != nullptr);
+    load_tracker->MarkFailed(block_hashes);
+    return tsl::Future<>(absl::UnimplementedError("Load not implemented."));
+  }
 
-  // Asynchronously saves KV cache blocks from device (HBM) to host DRAM.
+  // Asynchronously saves KV cache blocks from device (HBM) to host DRAM
+  // according to `options` (see SaveOptions).
   // The tracker's transfer status is updated when the operation completes or
   // settles.
   virtual tsl::Future<> Save(absl::Span<const std::string> block_hashes,
                              absl::Span<const int64_t> src_device_block_ids,
                              absl::Span<const int32_t> dst_host_block_ids,
-                             BlockTracker* absl_nonnull save_tracker) {
+                             BlockTracker* absl_nonnull save_tracker,
+                             const SaveOptions& options = {}) {
     CHECK(save_tracker != nullptr);
     return tsl::Future<>(absl::UnimplementedError("Save not implemented."));
   }

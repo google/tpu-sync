@@ -292,14 +292,6 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
       absl::Span<const std::string> block_hashes,
       const LookupOptions& options = {}) override;
 
-  tsl::Future<> Load(const RaidenId& remote_id,
-                     absl::Span<const std::string> block_hashes,
-                     absl::Span<const int32_t> device_block_ids,
-                     absl::Span<const RaidenBlockId> slices,
-                     BlockTracker* absl_nonnull load_tracker) override {
-    return tsl::Future<>(absl::OkStatus());
-  }
-
   // No-op on the storage tier (blocks are written via async offload transfers).
   // Returns false for kAdmitStrict, which applies only to host-RAM admission.
   bool Insert(absl::Span<const std::string> block_hashes,

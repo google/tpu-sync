@@ -1289,7 +1289,7 @@ absl::Status KVCacheStore::SaveLocal(
       absl::Span<const int32_t>(
           reinterpret_cast<const int32_t*>(host_block_ids.data()),
           host_block_ids.size()),
-      &save_tracker_);
+      &save_tracker_, SaveOptions{});
 
   future.OnReady([wt_state = wt_state_, backend = backend(),
                   registry_client = registry_client_, raiden_id = raiden_id_,
@@ -1419,11 +1419,11 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
     load_tracker_.AddPending(block_hashes);
   }
 
-  backend()->Load(RaidenId(), block_hashes,
+  backend()->Load(block_hashes,
                   absl::Span<const int32_t>(
                       reinterpret_cast<const int32_t*>(device_block_ids.data()),
                       device_block_ids.size()),
-                  /*slices=*/{}, &load_tracker_);
+                  &load_tracker_);
 
   return absl::OkStatus();
 }
@@ -1612,12 +1612,11 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
     load_tracker_.AddPending(block_hashes);
   }
 
-  // An empty RaidenId routes HostOffloadBackend::Load to LoadLocalHostBlocks.
-  backend()->Load(RaidenId(), block_hashes,
+  backend()->Load(block_hashes,
                   absl::Span<const int32_t>(
                       reinterpret_cast<const int32_t*>(device_block_ids.data()),
                       device_block_ids.size()),
-                  slices, &load_tracker_);
+                  &load_tracker_, LoadOptions{.slices = slices});
 
   return absl::OkStatus();
 }
@@ -1761,8 +1760,9 @@ absl::Status KVCacheStore::ReadRemote(
   // does not affect the other group. The call itself returns OK.
   if (!peer_hashes.empty()) {
     // The future is ignored, as in Load(slices): failures reach the tracker.
-    backend()->Load(*peer_id, peer_hashes, dest_device_ids_for_loads_from_peer,
-                    peer_slices, &load_tracker_);
+    backend()->Load(peer_hashes, dest_device_ids_for_loads_from_peer,
+                    &load_tracker_,
+                    LoadOptions{.remote_id = *peer_id, .slices = peer_slices});
   }
   if (!storage_hashes.empty()) {
     LoadFromSecondaryBackend(storage_hashes,

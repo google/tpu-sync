@@ -1784,5 +1784,90 @@ TEST(RecvLifecycleTest,
               StatusIs(absl::StatusCode::kNotFound));
 }
 
+// ExecuteLayerH2d: H2dSyncDispatch fails. The receive finishes with the
+// dispatch error in the h2d phase, releases the op it took and settles at
+// once, since no copy was issued; the poll reports it failed.
+TEST(RecvLifecycleTest, FailedH2dDispatchFailsAndSettlesTheReceive) {
+  GetFaultInjector().Reset();
+  absl::Cleanup reset_faults = [] { GetFaultInjector().Reset(); };
+  FaultInjectionRule failed_dispatch;
+  failed_dispatch.hook = std::string(hooks::kTransferRecvSessionH2dDispatch);
+  failed_dispatch.probability = 1.0;
+  ABSL_ASSERT_OK(GetFaultInjector().Install({failed_dispatch}));
+
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.AddRecv("req", /*uuid=*/501);
+  EXPECT_FALSE(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/501).ok());
+  EXPECT_EQ(consumer.copies_issued(), 0);
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+
+  CompleteReadResult completions = consumer.CompleteReadWithDetails();
+  EXPECT_THAT(completions.received, IsEmpty());
+  EXPECT_THAT(completions.failed, ElementsAre("req"));
+  EXPECT_EQ(completions.details["req"].phase, "h2d");
+  EXPECT_FALSE(consumer.has_recv(501));
+}
+
+// A second Finish(error) on a draining receive changes nothing: the first
+// error is the one reported, once, when the copy ends.
+TEST(RecvLifecycleTest, SecondFinishOnAFailedReceiveIsANoOp) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  consumer.AddRecv("req", /*uuid=*/502);
+  ABSL_ASSERT_OK(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/502));
+  consumer.FailRecv(/*uuid=*/502, absl::InternalError("first"));
+  consumer.FailRecv(/*uuid=*/502, absl::UnavailableError("second"));
+  EXPECT_TRUE(consumer.has_recv(502));
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  consumer.FinishCopy(0, absl::OkStatus());
+  CompleteReadResult completions = consumer.CompleteReadWithDetails();
+  EXPECT_THAT(completions.failed, ElementsAre("req"));
+  EXPECT_EQ(completions.details["req"].code, "INTERNAL");
+  EXPECT_EQ(completions.details["req"].reason, "first");
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+  EXPECT_THAT(consumer.CompleteReadWithDetails().failed, IsEmpty());
+}
+
+// An incoming push lease that closes while the layer's copy is still
+// running, the usual order for an asynchronous H2D: the lease release
+// neither settles the receive nor returns its staging; the copy's
+// completion does.
+TEST(RecvLifecycleTest, PushLeaseClosingBeforeTheCopyEndsDoesNotSettle) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  consumer.AddRecv("req", /*uuid=*/503);
+  ABSL_ASSERT_OK(consumer.base()->BeginIncomingPush(/*uuid=*/503));
+  ABSL_ASSERT_OK(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/503));
+  ABSL_ASSERT_OK(consumer.ReceiveBlocks({0}, /*uuid=*/503));
+  ABSL_ASSERT_OK(consumer.base()->EndIncomingPush(/*uuid=*/503));
+
+  Reports during = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneReceiving(during), IsEmpty());
+  EXPECT_TRUE(consumer.has_recv(503));
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  consumer.FinishCopy(0, absl::OkStatus());
+  Reports after = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneReceiving(after), ElementsAre("req"));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+}
+
+// A cancelled receive whose only copy then fails keeps the cancellation: the
+// copy's error is absorbed by the draining receive, its callback ends the
+// last op, and the receive settles and is reported failed once.
+TEST(RecvDrainTest, CancelledReceiveWhoseCopyThenFailsStaysCancelled) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  consumer.AddRecv("req", /*uuid=*/504);
+  ABSL_ASSERT_OK(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/504));
+  consumer.FailRecv(/*uuid=*/504, absl::CancelledError("cancel"));
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  consumer.FinishCopy(0, absl::InternalError("copy failed"));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+  CompleteReadResult completions = consumer.CompleteReadWithDetails();
+  EXPECT_THAT(completions.failed, ElementsAre("req"));
+  EXPECT_EQ(completions.details["req"].code, "CANCELLED");
+  EXPECT_THAT(consumer.CompleteReadWithDetails().failed, IsEmpty());
+}
+
 }  // namespace
 }  // namespace tpu_raiden

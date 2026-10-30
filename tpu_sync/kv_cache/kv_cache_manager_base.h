@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_KV_CACHE_KV_CACHE_MANAGER_BASE_H_
 #define THIRD_PARTY_TPU_RAIDEN_KV_CACHE_KV_CACHE_MANAGER_BASE_H_
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -797,6 +798,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Returns the number of allocated host layer buffers (equals num_layers()
   // unless bounded via TPU_RAIDEN_NUM_STAGING_LAYERS).
   size_t num_host_layers() const { return layers_.size(); }
+
+  size_t max_concurrent_push_layers() const override {
+    return std::min({num_layers(), num_host_layers(),
+                     static_cast<size_t>(std::max<int>(4, parallelism()))});
+  }
 
   // Returns the total number of bytes allocated in host DRAM.
   size_t GetAllocatedHostDramBytes() const;

@@ -547,6 +547,51 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
            "NUMA node; sending every shard on each stream.";
     groups = ShardGroupsByNuma({}, num_shards);
   }
+  const size_t active_layers =
+      std::max<size_t>(1, block_delegate_->max_concurrent_push_layers());
+  const size_t num_blocks = std::max<size_t>(1, src_block_ids.size());
+  if (!dst_block_ids.empty() &&
+      num_shards <= static_cast<size_t>(kMaxShardMaskBits) &&
+      static_cast<size_t>(parallelism) > num_blocks &&
+      active_layers * groups.size() * num_blocks <
+          static_cast<size_t>(parallelism)) {
+    const size_t target_groups_per_layer =
+        (static_cast<size_t>(parallelism) + active_layers * num_blocks - 1) /
+        (active_layers * num_blocks);
+    const size_t split_factor =
+        (target_groups_per_layer + groups.size() - 1) / groups.size();
+    if (split_factor > 1) {
+      std::vector<ShardGroup> subdivided;
+      for (const ShardGroup& g : groups) {
+        if (g.shards.size() <= 1) {
+          subdivided.push_back(g);
+          continue;
+        }
+        const size_t sub_count = std::min(g.shards.size(), split_factor);
+        const size_t base_sz = g.shards.size() / sub_count;
+        const size_t rem = g.shards.size() % sub_count;
+        size_t offset = 0;
+        for (size_t i = 0; i < sub_count; ++i) {
+          const size_t cnt = base_sz + (i < rem ? 1 : 0);
+          uint16_t mask = 0;
+          for (size_t k = 0; k < cnt; ++k) {
+            int s = g.shards[offset + k];
+            if (s >= 0 && s < kMaxShardMaskBits) {
+              mask |= static_cast<uint16_t>(1u << s);
+            }
+          }
+          subdivided.push_back(ShardGroup{
+              .numa_node = g.numa_node,
+              .shards = std::vector<int>(g.shards.begin() + offset,
+                                         g.shards.begin() + offset + cnt),
+              .shard_mask = mask,
+          });
+          offset += cnt;
+        }
+      }
+      groups = std::move(subdivided);
+    }
+  }
   std::vector<tsl::Future<std::vector<int>>> futures;
   futures.reserve(groups.size());
   for (const ShardGroup& group : groups) {
@@ -1022,6 +1067,14 @@ BlockTransport::BuildBlockPullRequests(
 
 void BlockTransport::ForgetPushProgress(uint64_t uuid) {
   raw_transport_.ForgetPushProgress(uuid);
+  if (transport_adapter_ != nullptr) {
+    transport_adapter_->ForgetUuid(uuid);
+  }
+  for (auto& [_, adapter] : numa_adapters_) {
+    if (adapter != nullptr) {
+      adapter->ForgetUuid(uuid);
+    }
+  }
   std::shared_ptr<BlockTransportServerPushSession> session;
   {
     absl::MutexLock lock(server_sessions_mu_);

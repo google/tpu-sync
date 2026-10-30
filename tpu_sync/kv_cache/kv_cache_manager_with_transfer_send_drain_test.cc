@@ -44,6 +44,7 @@
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/hash/hash.h"
 #include "absl/log/check.h"
 #include "absl/log/scoped_mock_log.h"
 #include "absl/status/status.h"
@@ -61,11 +62,13 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
+#include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
 #include "tpu_sync/kv_cache/transfer_send_session.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
+#include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {
@@ -85,9 +88,19 @@ using ::testing::UnorderedElementsAre;
 constexpr int64_t kSlots = 2;
 constexpr double kTimeoutS = 0.05;
 
+void WaitUntil(std::function<bool()> check) {
+  for (const absl::Time end = absl::Now() + absl::Seconds(10);
+       !check() && absl::Now() < end;) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  ASSERT_TRUE(check());
+}
+
 // A producer whose device-to-host copies complete when the test says so.
 class TestManager : public KVCacheManagerWithTransfer {
  public:
+  using H2hKey = std::pair<uint64_t, size_t>;
+
   explicit TestManager(size_t num_layers, double timeout_s = kTimeoutS)
       : KVCacheManagerWithTransfer(std::make_unique<TestBase>(num_layers, this),
                                    /*node_id=*/0,
@@ -98,7 +111,11 @@ class TestManager : public KVCacheManagerWithTransfer {
     std::vector<std::function<void(absl::Status)>> pending;
     {
       absl::MutexLock lock(h2h_mu_);
-      pending.swap(h2h_callbacks_);
+      for (auto& [_, cb] : h2h_callbacks_) {
+        pending.push_back(std::move(cb));
+      }
+      h2h_callbacks_.clear();
+      h2h_chunk_ptrs_.clear();
     }
     for (auto& cb : pending) {
       if (cb) cb(absl::CancelledError("TestManager shutting down"));
@@ -251,29 +268,45 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   size_t h2h_issued() {
     absl::MutexLock lock(h2h_mu_);
-    return h2h_callbacks_.size();
+    return h2h_calls_;
   }
 
   bool WaitForH2hIssued(size_t expected, absl::Duration timeout) {
     absl::MutexLock lock(h2h_mu_);
     auto cond = [this, expected]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(h2h_mu_) {
-      return h2h_callbacks_.size() >= expected;
+      return h2h_calls_ >= expected;
     };
     return h2h_mu_.AwaitWithTimeout(absl::Condition(&cond), timeout);
   }
 
-  uint8_t* h2h_chunk_ptr(size_t index) {
+  uint8_t* h2h_chunk_ptr(uint64_t uuid, size_t layer) {
     absl::MutexLock lock(h2h_mu_);
-    return h2h_chunk_ptrs_.at(index);
+    auto it = h2h_chunk_ptrs_.find({uuid, layer});
+    if (it == h2h_chunk_ptrs_.end()) {
+      ADD_FAILURE() << "No H2H chunk ptr for uuid=" << uuid
+                    << " layer=" << layer;
+      return nullptr;
+    }
+    return it->second;
   }
 
-  void FinishH2h(size_t index, absl::Status status) {
+  void FinishH2h(uint64_t uuid, size_t layer,
+                 absl::Status status = absl::OkStatus()) {
     std::function<void(absl::Status)> cb;
     {
       absl::MutexLock lock(h2h_mu_);
-      cb = std::move(h2h_callbacks_.at(index));
+      auto it = h2h_callbacks_.find({uuid, layer});
+      if (it == h2h_callbacks_.end()) {
+        ADD_FAILURE() << "No H2H callback for uuid=" << uuid
+                      << " layer=" << layer;
+        return;
+      }
+      cb = std::move(it->second);
+      h2h_callbacks_.erase(it);
     }
-    cb(std::move(status));
+    if (cb) {
+      cb(std::move(status));
+    }
   }
 
   const StagingLayerManager& staging_layer_manager(uint64_t uuid) {
@@ -348,9 +381,10 @@ class TestManager : public KVCacheManagerWithTransfer {
                                          src_block_ids.end());
           std::vector<transport::BlockChunk> chunks = GetBlockChunks(
               layer, /*shard_idx=*/0, block_ids, block_bytes(layer), uuid);
-          owner_->h2h_chunk_ptrs_.push_back(chunks.empty() ? nullptr
-                                                           : chunks[0].ptr);
-          owner_->h2h_callbacks_.push_back(
+          const H2hKey key{uuid, layer};
+          owner_->h2h_chunk_ptrs_[key] =
+              chunks.empty() ? nullptr : chunks[0].ptr;
+          owner_->h2h_callbacks_[key] =
               [on_complete = std::move(on_complete), src_block_ids, uuid,
                owner = owner_](absl::Status status) mutable {
                 {
@@ -362,7 +396,7 @@ class TestManager : public KVCacheManagerWithTransfer {
                   return;
                 }
                 on_complete(src_block_ids);
-              });
+              };
           return;
         }
       }
@@ -382,8 +416,9 @@ class TestManager : public KVCacheManagerWithTransfer {
   bool manual_h2h_ ABSL_GUARDED_BY(h2h_mu_) = false;
   int h2h_calls_ ABSL_GUARDED_BY(h2h_mu_) = 0;
   absl::flat_hash_set<uint64_t> active_h2h_uuids_ ABSL_GUARDED_BY(h2h_mu_);
-  std::vector<uint8_t*> h2h_chunk_ptrs_ ABSL_GUARDED_BY(h2h_mu_);
-  std::vector<std::function<void(absl::Status)>> h2h_callbacks_
+  absl::flat_hash_map<H2hKey, uint8_t*> h2h_chunk_ptrs_
+      ABSL_GUARDED_BY(h2h_mu_);
+  absl::flat_hash_map<H2hKey, std::function<void(absl::Status)>> h2h_callbacks_
       ABSL_GUARDED_BY(h2h_mu_);
   absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSendSession>>
       served_sends_ ABSL_GUARDED_BY(mu_);
@@ -392,11 +427,15 @@ class TestManager : public KVCacheManagerWithTransfer {
 // A consumer whose host-to-device copies complete when the test says so.
 class RecvTestManager : public KVCacheManagerWithTransfer {
  public:
-  explicit RecvTestManager(size_t num_layers, double timeout_s = 5.0)
-      : KVCacheManagerWithTransfer(std::make_unique<RecvBase>(num_layers, this),
-                                   /*node_id=*/0,
-                                   /*local_control_port=*/-1, /*max_blocks=*/1,
-                                   /*num_slots=*/kSlots, timeout_s) {}
+  explicit RecvTestManager(size_t num_layers, double timeout_s = 5.0,
+                           size_t num_shards = 1)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<RecvBase>(num_layers, num_shards, this),
+            /*node_id=*/0,
+            /*local_control_port=*/-1, /*max_blocks=*/1,
+            /*num_slots=*/kSlots, timeout_s) {}
+
+  ~RecvTestManager() override { ReleasePushPool(); }
 
   void AddRecv(const std::string& req_id, uint64_t uuid,
                int32_t blocks_per_layer = 1,
@@ -405,17 +444,26 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     ::tpu_sync::rpc::StartTransferRequest plan;
     plan.set_uuid(uuid);
     plan.set_use_block_chunks(true);
-    auto* entry = (*plan.mutable_shard_push_schedules())[0].add_entries();
-    entry->set_dst_shard_idx(0);
-    entry->set_src_block_id(0);
-    entry->set_dst_block_id(0);
-    entry->set_size_bytes(base()->block_bytes(0));
-    entry->set_count(blocks_per_layer);
+    for (size_t s = 0; s < base()->num_shards(); ++s) {
+      auto* entry = (*plan.mutable_shard_push_schedules())[s].add_entries();
+      entry->set_dst_shard_idx(s);
+      entry->set_src_block_id(0);
+      entry->set_dst_block_id(0);
+      entry->set_size_bytes(base()->block_bytes(0));
+      entry->set_count(blocks_per_layer);
+    }
     CHECK_OK(RegisterActivePlan(uuid, plan, /*is_sender=*/false));
     absl::MutexLock lock(mu_);
     active_recv_sessions_[uuid] = *TransferReceiveSession::Create(
         base(), staging_allocator_.get(), uuid, req_id, blocks_per_layer,
         deadline.value_or(DeadlineFromNow()), /*acquire_staging=*/true);
+  }
+
+  std::shared_ptr<TransferReceiveSession> recv_session(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    auto it = active_recv_sessions_.find(uuid);
+    if (it == active_recv_sessions_.end()) return nullptr;
+    return it->second;
   }
 
   absl::Status ReceiveLayer(size_t layer, uint64_t uuid) {
@@ -439,6 +487,16 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   void FinishCopy(size_t index, absl::Status status) {
     absl::MutexLock lock(copies_mu_);
     copies_.at(index).Set(std::move(status));
+  }
+
+  bool WaitForCopies(size_t expected,
+                     absl::Duration timeout = absl::Seconds(5)) {
+    absl::MutexLock lock(copies_mu_);
+    auto done = [&] {
+      copies_mu_.AssertReaderHeld();
+      return copies_.size() >= expected;
+    };
+    return copies_mu_.AwaitWithTimeout(absl::Condition(&done), timeout);
   }
 
   size_t copies_issued() {
@@ -480,6 +538,32 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     session->Finish(status);
   }
 
+  void StallPushPool() {
+    absl::MutexLock lock(&stall_mu_);
+    stall_release_ = std::make_shared<absl::Notification>();
+    absl::Notification all_entered;
+    auto entered = std::make_shared<std::atomic<size_t>>(0);
+    const size_t num_threads = base()->push_pool()->num_threads();
+    for (size_t i = 0; i < num_threads; ++i) {
+      base()->push_pool()->Schedule(
+          std::nullopt,
+          [release = stall_release_, entered, &all_entered, num_threads]() {
+            if (entered->fetch_add(1) + 1 == num_threads) {
+              all_entered.Notify();
+            }
+            release->WaitForNotification();
+          });
+    }
+    all_entered.WaitForNotification();
+  }
+
+  void ReleasePushPool() {
+    absl::MutexLock lock(&stall_mu_);
+    if (stall_release_ && !stall_release_->HasBeenNotified()) {
+      stall_release_->Notify();
+    }
+  }
+
   void BlockH2dDispatch() { block_dispatch_.store(true); }
 
   bool WaitForH2dDispatch(absl::Duration timeout) {
@@ -493,8 +577,8 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
  private:
   class RecvBase : public kv_cache::KVCacheManagerBase {
    public:
-    RecvBase(size_t num_layers, RecvTestManager* owner)
-        : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
+    RecvBase(size_t num_layers, size_t num_shards, RecvTestManager* owner)
+        : kv_cache::KVCacheManagerBase(num_layers, num_shards,
                                        std::vector<size_t>(num_layers, 128),
                                        /*local_port=*/std::nullopt,
                                        /*host_blocks_to_allocate=*/kSlots,
@@ -531,6 +615,8 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   std::atomic<bool> block_dispatch_{false};
   absl::Notification dispatch_entered_;
   absl::Notification release_dispatch_;
+  absl::Mutex stall_mu_;
+  std::shared_ptr<absl::Notification> stall_release_ ABSL_GUARDED_BY(stall_mu_);
 };
 
 // Sets environment variable |name| to |value| until destroyed. The staging
@@ -1289,6 +1375,96 @@ TEST(
   EXPECT_FALSE(consumer.has_recv(93));
 }
 
+TEST(RecvH2dOffloadTest,
+     NotReadyWhileNetworkCompleteAndH2dQueuedDrainsAndCompletes) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/5.0,
+                           /*num_shards=*/4);
+  consumer.AddRecv("req_offload_drain", /*uuid=*/101);
+  auto session = consumer.recv_session(101);
+  ASSERT_NE(session, nullptr);
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  consumer.StallPushPool();
+  ASSERT_THAT(session->OnRecvNetworkComplete(), ::absl_testing::IsOk());
+  ASSERT_THAT(session->ExecuteLayerH2d(consumer, /*layer_idx=*/0),
+              ::absl_testing::IsOk());
+
+  // (a) IsReadyToComplete() == false while network_completed_ is true and
+  // dispatch task is still queued in push_pool.
+  EXPECT_EQ(consumer.copies_issued(), 0);
+  EXPECT_FALSE(session->IsReadyToComplete());
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  // Once push_pool unblocks, the queued dispatch task executes and calls
+  // H2dSyncDispatch.
+  consumer.ReleasePushPool();
+  ASSERT_TRUE(consumer.WaitForCopies(1));
+  EXPECT_EQ(consumer.copies_issued(), 1);
+
+  // Allocator slot remains held while H2D copy is in flight.
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  // (c) Allocator slots return only after queued task drains and completes.
+  consumer.FinishCopy(0, absl::OkStatus());
+  WaitUntil([&] { return consumer.free_slots() == kSlots; });
+  EXPECT_TRUE(session->IsReadyToComplete());
+}
+
+TEST(RecvH2dOffloadTest,
+     FaultInjectionFailsSynchronouslyBeforeSchedulingWithH2dPhase) {
+  GetFaultInjector().Reset();
+  absl::Cleanup reset_faults = [] { GetFaultInjector().Reset(); };
+  FaultInjectionRule failed_dispatch;
+  failed_dispatch.hook = std::string(hooks::kTransferRecvSessionH2dDispatch);
+  failed_dispatch.action = FaultInjectionType::kFail;
+  failed_dispatch.probability = 1.0;
+  ABSL_ASSERT_OK(GetFaultInjector().Install({failed_dispatch}));
+
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/5.0,
+                           /*num_shards=*/4);
+  consumer.AddRecv("req_fault_dispatch", /*uuid=*/102);
+  auto session = consumer.recv_session(102);
+  ASSERT_NE(session, nullptr);
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  // (b) kTransferRecvSessionH2dDispatch fault fails session synchronously
+  // before task is scheduled with Details().phase == "h2d".
+  absl::Status status = session->ExecuteLayerH2d(consumer, /*layer_idx=*/0);
+  EXPECT_FALSE(status.ok());
+  EXPECT_TRUE(session->Done());
+  EXPECT_EQ(session->Details().phase, "h2d");
+  EXPECT_EQ(consumer.copies_issued(), 0);
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+}
+
+TEST(RecvH2dOffloadTest,
+     CancelledWhileQueuedInPushPoolReturnsSlotOnlyAfterDrain) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/5.0,
+                           /*num_shards=*/4);
+  consumer.AddRecv("req_cancel_drain", /*uuid=*/103);
+  auto session = consumer.recv_session(103);
+  ASSERT_NE(session, nullptr);
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  consumer.StallPushPool();
+  ASSERT_THAT(session->ExecuteLayerH2d(consumer, /*layer_idx=*/0),
+              ::absl_testing::IsOk());
+
+  // Fail/cancel the session while dispatch task is queued in push_pool.
+  consumer.FailRecv(103, absl::CancelledError("cancelled during queue"));
+  EXPECT_FALSE(session->Done());
+  EXPECT_TRUE(session->IsDraining());
+
+  // (c) Slot is NOT returned yet because queued task is still in push_pool.
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  // Unblock push_pool so the queued task drains and exits.
+  consumer.ReleasePushPool();
+  WaitUntil([&] { return consumer.free_slots() == kSlots; });
+  EXPECT_TRUE(session->Done());
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+}
+
 TEST(RecvLifecycleTest,
      NonSessionTransfersSucceedOverBlockTransportWhileStaleUuidIsRejected) {
   constexpr size_t kSliceBytes = 128;
@@ -1607,23 +1783,24 @@ TEST(SendLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
   EXPECT_EQ(staging_manager.num_free(), 0);
   EXPECT_EQ(producer.copies_issued(), kNumStagingLayers);
   for (size_t layer = 0; layer < kNumStagingLayers; ++layer) {
-    EXPECT_NE(producer.h2h_chunk_ptr(layer), nullptr);
-    EXPECT_GE(producer.h2h_chunk_ptr(layer), base->GetHostPointer(layer, 0));
-    EXPECT_LT(producer.h2h_chunk_ptr(layer),
+    EXPECT_NE(producer.h2h_chunk_ptr(304, layer), nullptr);
+    EXPECT_GE(producer.h2h_chunk_ptr(304, layer),
+              base->GetHostPointer(layer, 0));
+    EXPECT_LT(producer.h2h_chunk_ptr(304, layer),
               base->GetHostPointer(layer, 0) + base->GetHostSize(layer, 0));
   }
 
   // Completing layer 1's H2H push frees buffer 1, which layer 4 acquires for
   // its D2H copy and subsequent H2H push.
-  producer.FinishH2h(1, absl::OkStatus());
+  producer.FinishH2h(304, 1, absl::OkStatus());
   ASSERT_TRUE(producer.WaitForCopiesIssued(5, absl::Seconds(5)));
   EXPECT_EQ(staging_manager.Lookup(1), std::nullopt);
   EXPECT_THAT(staging_manager.Lookup(4), Optional(1u));
   EXPECT_EQ(producer.copy_destination(4), 1);
   producer.FinishCopy(4, absl::OkStatus());
   ASSERT_TRUE(producer.WaitForH2hIssued(5, absl::Seconds(5)));
-  EXPECT_GE(producer.h2h_chunk_ptr(4), base->GetHostPointer(1, 0));
-  EXPECT_LT(producer.h2h_chunk_ptr(4),
+  EXPECT_GE(producer.h2h_chunk_ptr(304, 4), base->GetHostPointer(1, 0));
+  EXPECT_LT(producer.h2h_chunk_ptr(304, 4),
             base->GetHostPointer(1, 0) + base->GetHostSize(1, 0));
 
   // Stream the remaining layers through the manager: each takes the buffer of
@@ -1631,23 +1808,23 @@ TEST(SendLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
   for (size_t layer = 5; layer < kNumLayers; ++layer) {
     const size_t finished_layer = layer == 5 ? 0 : layer - 4;
     const size_t freed_slot = *staging_manager.Lookup(finished_layer);
-    producer.FinishH2h(finished_layer, absl::OkStatus());
+    producer.FinishH2h(304, finished_layer, absl::OkStatus());
     ASSERT_TRUE(producer.WaitForCopiesIssued(layer + 1, absl::Seconds(5)));
     EXPECT_THAT(staging_manager.Lookup(layer), Optional(freed_slot));
     EXPECT_EQ(producer.copy_destination(layer),
               static_cast<int64_t>(freed_slot));
     producer.FinishCopy(layer, absl::OkStatus());
     ASSERT_TRUE(producer.WaitForH2hIssued(layer + 1, absl::Seconds(5)));
-    EXPECT_GE(producer.h2h_chunk_ptr(layer),
+    EXPECT_GE(producer.h2h_chunk_ptr(304, layer),
               base->GetHostPointer(freed_slot, 0));
     EXPECT_LT(
-        producer.h2h_chunk_ptr(layer),
+        producer.h2h_chunk_ptr(304, layer),
         base->GetHostPointer(freed_slot, 0) + base->GetHostSize(freed_slot, 0));
   }
 
   for (size_t layer = kNumLayers - kNumStagingLayers; layer < kNumLayers;
        ++layer) {
-    producer.FinishH2h(layer, absl::OkStatus());
+    producer.FinishH2h(304, layer, absl::OkStatus());
   }
   ABSL_EXPECT_OK(producer.AwaitSendDone(304));
   EXPECT_EQ(staging_manager.num_free(), kNumStagingLayers);
@@ -1731,13 +1908,13 @@ TEST(SendLifecycleTest,
   EXPECT_EQ(manager2.num_free(), 0);
   EXPECT_EQ(producer.free_slots(), kSlots - 1);
 
-  producer.FinishH2h(0, absl::UnavailableError("H2H error on layer 0"));
+  producer.FinishH2h(402, 0, absl::UnavailableError("H2H error on layer 0"));
   pull_thread2.join();
   EXPECT_EQ(producer.copies_issued(), base_copies2 + kNumStagingLayers);
   EXPECT_EQ(producer.free_slots(), kSlots - 1);
 
   for (size_t i = 1; i < kNumStagingLayers; ++i) {
-    producer.FinishH2h(i, absl::OkStatus());
+    producer.FinishH2h(402, i, absl::OkStatus());
   }
   EXPECT_THAT(producer.AwaitSendDone(402),
               ::absl_testing::StatusIs(absl::StatusCode::kUnavailable));
@@ -1825,7 +2002,7 @@ TEST(SendDrainTest,
   ASSERT_TRUE(producer.WaitForH2hCalls(1));
   EXPECT_EQ(producer.h2h_calls(), 1);
   EXPECT_EQ(producer.active_h2h_count(), 1);
-  producer.FinishH2h(0, absl::OkStatus());
+  producer.FinishH2h(1000, 0, absl::OkStatus());
   ASSERT_TRUE(producer.WaitForH2hCalls(2));
   EXPECT_EQ(producer.h2h_calls(), 2);
   EXPECT_EQ(producer.active_h2h_count(), 1);
@@ -1834,7 +2011,7 @@ TEST(SendDrainTest,
   EXPECT_THAT(FailedRecving(during), IsEmpty());
   EXPECT_THROW(producer.NotifyForRead("req_h2h_order", 1000, {10, 20}),
                std::runtime_error);
-  producer.FinishH2h(1, absl::OkStatus());
+  producer.FinishH2h(SubPlanUuid(1000, 1), 0, absl::OkStatus());
   producer.WaitForPendingWork().IgnoreError();
   Reports after = producer.CompleteReadRaw();
   EXPECT_THAT(DoneSending(after), ElementsAre("req_h2h_order"));
@@ -1916,9 +2093,15 @@ struct SimulatedBase : public kv_cache::KVCacheManagerBase {
   }
   void ReleaseH2d(absl::Status s = absl::OkStatus(), bool all = true) {
     absl::MutexLock l(h2d_mu);
-    while (!held_promises.empty()) {
-      held_promises.front().Set(s);
-      held_promises.erase(held_promises.begin());
+    while (!held_h2ds.empty()) {
+      auto& item = held_h2ds.front();
+      if (s.ok()) {
+        for (const auto& op : item.pending_copies) {
+          std::memcpy(op.dst_ptr, op.src_ptr, op.size);
+        }
+      }
+      item.promise.Set(s);
+      held_h2ds.erase(held_h2ds.begin());
       if (!all) break;
     }
   }
@@ -1926,7 +2109,7 @@ struct SimulatedBase : public kv_cache::KVCacheManagerBase {
     absl::MutexLock l(h2d_mu);
     auto c = [&] {
       h2d_mu.AssertReaderHeld();
-      return held_promises.size() >= n;
+      return held_h2ds.size() >= n;
     };
     return h2d_mu.AwaitWithTimeout(absl::Condition(&c), absl::Seconds(5));
   }
@@ -1944,6 +2127,15 @@ struct SimulatedBase : public kv_cache::KVCacheManagerBase {
     return Copy(true, l.value_or(0), host_l.value_or(l.value_or(0)),
                 s.value_or(0), src, dst, sz);
   }
+  struct PendingCopy {
+    uint8_t* dst_ptr;
+    const uint8_t* src_ptr;
+    size_t size;
+  };
+  struct HeldH2d {
+    xla::Promise<> promise;
+    std::vector<PendingCopy> pending_copies;
+  };
   F Copy(bool h2d, size_t l, size_t host_l, size_t s, V src, V dst, V sz) {
     if (auto* m = host_block_manager()) {
       size_t cur = m->num_allocated_blocks(), prev = peak.load();
@@ -1951,48 +2143,61 @@ struct SimulatedBase : public kv_cache::KVCacheManagerBase {
       }
     }
     uint8_t *host = GetHostPointer(host_l, s), *dev = device_data[l].data();
-    for (size_t i = 0; i < src.size(); ++i) {
-      std::memcpy((h2d ? dev : host) + dst[i] * slice_byte_size_,
-                  (h2d ? host : dev) + src[i] * slice_byte_size_,
-                  sz[i] * slice_byte_size_);
-    }
     absl::MutexLock lock(h2d_mu);
-    if (!h2d || !hold_h2d) return F(H{});
+    if (!h2d || !hold_h2d) {
+      for (size_t i = 0; i < src.size(); ++i) {
+        std::memcpy((h2d ? dev : host) + dst[i] * slice_byte_size_,
+                    (h2d ? host : dev) + src[i] * slice_byte_size_,
+                    sz[i] * slice_byte_size_);
+      }
+      return F(H{});
+    }
     auto [p, f] = xla::MakePromise<>();
-    held_promises.push_back(std::move(p));
+    HeldH2d held{.promise = std::move(p)};
+    for (size_t i = 0; i < src.size(); ++i) {
+      held.pending_copies.push_back({
+          .dst_ptr = dev + dst[i] * slice_byte_size_,
+          .src_ptr = host + src[i] * slice_byte_size_,
+          .size = static_cast<size_t>(sz[i] * slice_byte_size_),
+      });
+    }
+    held_h2ds.push_back(std::move(held));
     return F(std::move(f), H{});
   }
   std::vector<std::vector<uint8_t>> device_data;
   absl::Mutex h2d_mu;
   bool hold_h2d = false;
-  std::vector<xla::Promise<>> held_promises;
+  std::vector<HeldH2d> held_h2ds;
   std::atomic<size_t> peak = 0;
 };
 
 class SimulatedDeviceManager : public KVCacheManagerWithTransfer {
  public:
-  SimulatedDeviceManager(size_t l, size_t sz, int b)
+  SimulatedDeviceManager(size_t l, size_t sz, int b, double timeout_s = 10.0)
       : KVCacheManagerWithTransfer(std::make_unique<SimulatedBase>(l, sz, b), 0,
-                                   0, 8, 2, 10.0) {}
+                                   0, 8, 2, timeout_s) {}
   ~SimulatedDeviceManager() override {
     if (sim()) sim()->ReleaseH2d();
   }
   SimulatedBase* sim() { return static_cast<SimulatedBase*>(base()); }
+  using KVCacheManagerWithTransfer::HandlePullStream;
   std::string endpoint() const {
     return absl::StrCat("127.0.0.1:", local_control_port());
   }
   size_t allocated() const {
     return base()->host_block_manager()->num_allocated_blocks();
   }
-};
-
-void WaitUntil(std::function<bool()> check) {
-  for (const absl::Time end = absl::Now() + absl::Seconds(5);
-       !check() && absl::Now() < end;) {
-    absl::SleepFor(absl::Milliseconds(10));
+  bool has_send(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    auto it = send_sessions_.find(uuid);
+    return it != send_sessions_.end() && !it->second->Done();
   }
-  ASSERT_TRUE(check());
-}
+  std::shared_ptr<TransferReceiveSession> recv_session(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    auto it = active_recv_sessions_.find(uuid);
+    return it != active_recv_sessions_.end() ? it->second : nullptr;
+  }
+};
 
 TEST(BoundedWindowTest,
      BoundedWindowStartReadTransfers4xHostCapacityWithDoubleBuffering) {
@@ -2109,9 +2314,216 @@ TEST(BoundedWindowTest,
   EXPECT_THAT(std::get<1>(after), IsEmpty());
   EXPECT_THAT(std::get<2>(after), IsEmpty());
 
+  WaitUntil([&] {
+    c.CompleteReadRaw();
+    return c.allocated() == 0u;
+  });
   p.WaitForPendingWork().IgnoreError();
   EXPECT_EQ(c.allocated(), 0u);
   EXPECT_EQ(p.allocated(), 0u);
+}
+
+TEST(BoundedWindowTest,
+     EarlyPullDispatchOnNetworkCompleteAndPredecessorGuardTest) {
+  // 4 blocks transfer under W_blocks = 1, W_depth = 2 (sub-plans 0, 1, 2, 3).
+  // Sub-plans 0 and 1 share window slots with sub-plans 2 and 3 respectively
+  // (c % W_depth).
+  SimulatedDeviceManager p(1, 128, 4), c(1, 128, 4);
+  p.SetStagingWindowConfig(1, 2);
+  c.SetStagingWindowConfig(1, 2);
+
+  // Hold H2D copies on the consumer.
+  c.sim()->SetHoldH2d(true);
+  // Cross-sub-plan duplicate: local_block_ids {0, 1, 1, 2} with window_blocks =
+  // 1 puts duplicate local block 1 across sub-plans 1 and 2.
+  const std::vector<int64_t> remote_bids = {0, 1, 2, 3};
+  const std::vector<int64_t> local_bids = {0, 1, 1, 2};
+  std::memcpy(p.sim()->device_data[0].data() + 2 * 128,
+              p.sim()->device_data[0].data() + 1 * 128, 128);
+  p.NotifyForRead("req_early_pull", 40001, remote_bids);
+  c.StartRead("req_early_pull", 40001, p.endpoint(), remote_bids, local_bids);
+
+  // Verify that sub-plans 0 and 1 complete network transfer and enter H2D.
+  ASSERT_TRUE(c.sim()->WaitForHeldH2d(2));
+
+  // Property (a): Early dispatch: With early Pull(c+W) dispatch on network
+  // complete, sub-plan 2 has been dispatched and accepted on producer BEFORE
+  // sub-plan 0's held H2D is released!
+  WaitUntil([&] { return p.has_send(SubPlanUuid(40001, 2)); });
+  EXPECT_TRUE(p.has_send(SubPlanUuid(40001, 2)));
+
+  // Sub-plan 2's network push is admitted but blocked at begin_incoming_push
+  // awaiting predecessor (sub-plan 0) H2D complete.
+  // Release sub-plan 0's H2D copy.
+  c.sim()->ReleaseH2d(absl::OkStatus(), /*all=*/false);
+
+  // Once sub-plan 0 H2D completes, sub-plan 2 unblocks from predecessor guard,
+  // completes its network transfer, and enters H2D.
+  ASSERT_TRUE(c.sim()->WaitForHeldH2d(2));
+
+  // Release the remaining H2D copies.
+  c.sim()->SetHoldH2d(false);
+  c.sim()->ReleaseH2d();
+
+  std::vector<std::string> recvd;
+  WaitUntil([&] {
+    auto [s, r, f] = c.CompleteReadRaw();
+    EXPECT_THAT(f, IsEmpty());
+    recvd.insert(recvd.end(), r.begin(), r.end());
+    return !recvd.empty();
+  });
+  EXPECT_THAT(recvd, ElementsAre("req_early_pull"));
+  for (size_t l = 0; l < 1; ++l) {
+    for (size_t i = 0; i < remote_bids.size(); ++i) {
+      const uint8_t* p_blk =
+          p.sim()->device_data[l].data() + remote_bids[i] * 128;
+      const uint8_t* c_blk =
+          c.sim()->device_data[l].data() + local_bids[i] * 128;
+      EXPECT_EQ(std::memcmp(p_blk, c_blk, 128), 0);
+    }
+  }
+  WaitUntil([&] { return c.allocated() == 0u; });
+  p.WaitForPendingWork().IgnoreError();
+  EXPECT_EQ(c.allocated(), 0u);
+  EXPECT_EQ(p.allocated(), 0u);
+}
+
+TEST(BoundedWindowTest, IntraSubPlanDuplicateLocalBlocksDedupStaging) {
+  SimulatedDeviceManager p(1, 128, 4), c(1, 128, 4);
+  p.SetStagingWindowConfig(2, 2);
+  c.SetStagingWindowConfig(2, 2);
+
+  const std::vector<int64_t> remote_bids = {0, 1, 2, 3};
+  const std::vector<int64_t> local_bids = {1, 1, 2, 3};
+  // Initialize producer remote block 1 identical to block 0 so intra-sub-plan
+  // duplicate local block 1 receives bit-exact data.
+  std::memcpy(p.sim()->device_data[0].data() + 1 * 128,
+              p.sim()->device_data[0].data() + 0 * 128, 128);
+  p.NotifyForRead("req_intra_dedup", 40003, remote_bids);
+  c.StartRead("req_intra_dedup", 40003, p.endpoint(), remote_bids, local_bids);
+
+  std::vector<std::string> recvd;
+  WaitUntil([&] {
+    auto [s, r, f] = c.CompleteReadRaw();
+    EXPECT_THAT(f, IsEmpty());
+    recvd.insert(recvd.end(), r.begin(), r.end());
+    return !recvd.empty();
+  });
+  EXPECT_THAT(recvd, ElementsAre("req_intra_dedup"));
+  for (size_t i = 0; i < remote_bids.size(); ++i) {
+    const uint8_t* p_blk =
+        p.sim()->device_data[0].data() + remote_bids[i] * 128;
+    const uint8_t* c_blk = c.sim()->device_data[0].data() + local_bids[i] * 128;
+    EXPECT_EQ(std::memcmp(p_blk, c_blk, 128), 0);
+  }
+  WaitUntil([&] { return c.allocated() == 0u; });
+  p.WaitForPendingWork().IgnoreError();
+  EXPECT_EQ(c.allocated(), 0u);
+  EXPECT_EQ(p.allocated(), 0u);
+}
+
+TEST(BoundedWindowTest,
+     EarlyPullDispatchShortDeadlineHoldsStagingUntilH2dResolves) {
+  SimulatedDeviceManager p(1, 128, 4), c(1, 128, 4);
+  p.SetStagingWindowConfig(1, 2);
+  c.SetStagingWindowConfig(1, 2);
+
+  c.sim()->SetHoldH2d(true);
+  auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+  p.NotifyForRead("req_short_deadline", 40002, {0, 1, 2, 3}, deadline);
+  c.StartRead("req_short_deadline", 40002, p.endpoint(), {0, 1, 2, 3},
+              {0, 1, 2, 3}, /*parallelism=*/1,
+              /*local_host_block_ids=*/std::nullopt, deadline);
+
+  ASSERT_TRUE(c.sim()->WaitForHeldH2d(2));
+  // Wait until past deadline
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+
+  // Drive deadline sweep.
+  auto [s, r, f] = c.CompleteReadRaw();
+  EXPECT_THAT(f, ElementsAre("req_short_deadline"));
+  auto sub0 = c.recv_session(SubPlanUuid(40002, 0));
+  ASSERT_NE(sub0, nullptr);
+  EXPECT_TRUE(sub0->IsDraining());
+
+  // Property (d): Staging remains allocated while H2D is held even past
+  // deadline.
+  EXPECT_GT(c.allocated(), 0u);
+
+  // Release held H2Ds.
+  c.sim()->SetHoldH2d(false);
+  c.sim()->ReleaseH2d();
+
+  WaitUntil([&] {
+    c.CompleteReadRaw();
+    return c.allocated() == 0u;
+  });
+  p.WaitForPendingWork().IgnoreError();
+  EXPECT_EQ(c.allocated(), 0u);
+  EXPECT_EQ(p.allocated(), 0u);
+}
+
+TEST(ProducerSendRetryTest, FailedSubPlanPushRetiredAllowsRetryWithSameUuid) {
+  SimulatedDeviceManager p(1, 128, 4, /*timeout_s=*/0.5),
+      c(1, 128, 4, /*timeout_s=*/0.5);
+  p.SetStagingWindowConfig(1, 2);
+  c.SetStagingWindowConfig(1, 2);
+
+  const uint64_t u = 60001;
+  const int32_t chunk_idx = 1;
+  const uint64_t sub_uuid = SubPlanUuid(u, chunk_idx);
+
+  // 1. Initial registration on producer for parent UUID u.
+  p.NotifyForRead("req_producer_retry", u, {0, 1, 2, 3});
+
+  // 2. Dispatch a pull request for sub-plan c pointing to an invalid data port (port 1),
+  // causing TCP connection failure during StartPush.
+  PullStreamRequestSpec fail_req{
+      .uuid = sub_uuid,
+      .consumer_data_port = 1,
+      .consumer_ips = {"127.0.0.1"},
+      .src_block_ids = {2, 3},
+      .dst_block_ids = {2, 3},
+      .layer_host_addrs = p.base()->LayerHostAddrs(sub_uuid),
+  };
+  EXPECT_TRUE(p.HandlePullStream(fail_req, "127.0.0.1").ok());
+
+  // 3. CompleteReadRaw sweeps and settles the failed send session, retiring it.
+  std::vector<std::string> p_failed;
+  WaitUntil([&] {
+    auto [s, r, f] = p.CompleteReadRaw();
+    p_failed.insert(p_failed.end(), f.begin(), f.end());
+    return !p_failed.empty();
+  });
+  EXPECT_THAT(p_failed, ElementsAre("req_producer_retry"));
+
+  // 4. Re-register NotifyForRead with the same parent UUID u.
+  p.NotifyForRead("req_producer_retry", u, {0, 1, 2, 3});
+
+  // 5. Assert the retry's sub-plan c push is accepted (exercises ForgetUuid).
+  // If ForgetUuid was not called upon retirement of the failed session,
+  // the retry push for sub_uuid would be rejected with
+  // CancelledError("Request cancelled due to previous failure on same transfer
+  // session").
+  const std::vector<int64_t> b = {0, 1, 2, 3};
+  c.StartRead("req_producer_retry", u, p.endpoint(), b, b);
+
+  std::vector<std::string> c_recv, p_sent;
+  WaitUntil([&] {
+    auto [s, r, f] = c.CompleteReadRaw();
+    EXPECT_THAT(f, IsEmpty());
+    c_recv.insert(c_recv.end(), r.begin(), r.end());
+    auto [ps, pr, pf] = p.CompleteReadRaw();
+    EXPECT_THAT(pf, IsEmpty());
+    p_sent.insert(p_sent.end(), ps.begin(), ps.end());
+    return !c_recv.empty() && !p_sent.empty();
+  });
+  EXPECT_THAT(c_recv, ElementsAre("req_producer_retry"));
+  EXPECT_THAT(p_sent, ElementsAre("req_producer_retry"));
+
+  p.WaitForPendingWork().IgnoreError();
+  c.WaitForPendingWork().IgnoreError();
 }
 
 TEST(BoundedWindowTest,
@@ -2210,7 +2622,11 @@ TEST(BoundedWindowTest,
   EXPECT_THAT(std::get<2>(after), IsEmpty());
 
   p.WaitForPendingWork().IgnoreError();
-  (void)p.CompleteReadRaw();
+  WaitUntil([&] {
+    c.CompleteReadRaw();
+    p.CompleteReadRaw();
+    return c.allocated() == 0u && p.allocated() == 0u;
+  });
   EXPECT_EQ(c.allocated(), 0u);
   EXPECT_EQ(p.allocated(), 0u);
 
@@ -2237,7 +2653,11 @@ TEST(BoundedWindowTest,
   EXPECT_THAT(deadline_failed, ElementsAre("req_deadline_abort"));
 
   p.WaitForPendingWork().IgnoreError();
-  (void)p.CompleteReadRaw();
+  WaitUntil([&] {
+    c.CompleteReadRaw();
+    p.CompleteReadRaw();
+    return c.allocated() == 0u && p.allocated() == 0u;
+  });
   EXPECT_EQ(c.allocated(), 0u);
   EXPECT_EQ(p.allocated(), 0u);
 

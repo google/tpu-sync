@@ -274,7 +274,16 @@ void TransferSendSession::FinishLocked(const absl::Status& status,
   cancelled_.store(true, std::memory_order_relaxed);
   staging_layer_manager_.Shutdown();
   draining_ = true;
-  if (std::exchange(has_h2h_gate_hold_, false)) {
+  for (size_t l = 0; l < has_layer_gate_hold_.size(); ++l) {
+    if (std::exchange(has_layer_gate_hold_[l], 0) != 0) {
+      staging_layer_manager_.Release(l);
+      --in_flight_;
+    }
+  }
+  while (!ready_h2h_layers_.empty()) {
+    const size_t queued_l = ready_h2h_layers_.front();
+    ready_h2h_layers_.pop_front();
+    staging_layer_manager_.Release(queued_l);
     --in_flight_;
   }
   if (in_flight_ == 0) {
@@ -286,7 +295,7 @@ void TransferSendSession::FinishLocked(const absl::Status& status,
 
 void TransferSendSession::Finish(const absl::Status& status) {
   // Settling here, with no op in flight, means no push was ever issued:
-  // pushes start in SendNextLayer's push_pool task, each stays counted until
+  // pushes start in ScheduleLayerH2hPush's push task, each stays counted until
   // its completion has run, and the completion of the last layer calls
   // Finish() while still counted (a failed copy or push finishes under its
   // own op). A send that pushed therefore settles in EndSendOp, which
@@ -522,6 +531,7 @@ void TransferSendSession::StartPush(
     }
     src_ints_.assign(host_block_ids.begin(), host_block_ids.end());
     dst_ints_.assign(dst_block_ids.begin(), dst_block_ids.end());
+    has_layer_gate_hold_.assign(total_layers, 0);
   }
 
   // Coalesce contiguous (device,host) block runs into a few large copies. With
@@ -530,17 +540,10 @@ void TransferSendSession::StartPush(
   // GEMMs on the shared TensorCore; coalescing collapses a contiguous range to
   // one copy, matching the pre-Hybrid-Push pull path.
   CopySpec d2h_copy = BuildCoalescedCopySpec(src_block_ids, host_block_ids);
-  remaining_d2h_layers_.store(total_layers, std::memory_order_relaxed);
-  remaining_h2h_layers_.store(total_layers, std::memory_order_relaxed);
+  remaining_h2h_layers_.store(total_layers, std::memory_order_release);
+  remaining_d2h_layers_.store(total_layers, std::memory_order_release);
 
-  // 1. Arm the H2H chain on layer 0's future before any copy is issued, so
-  // pushes start as copies complete while this (pull worker) thread is still
-  // issuing the later layers. When fewer host layer buffers exist than layers
-  // the loop below blocks in AcquireStagingSlot until an earlier layer's push
-  // frees its buffer, which is only possible because the chain is running.
-  BeginOrQueueH2h();
-
-  // 2. Issue D2H copies layer-by-layer, each into the host layer buffer its
+  // Issue D2H copies layer-by-layer, each into the host layer buffer its
   // layer leases (layer l's own buffer on a full mirror). Each copy is
   // counted against the send before it starts and released by its own
   // completion, so the staging it writes stays owned for as long as it runs.
@@ -594,10 +597,14 @@ void TransferSendSession::StartPush(
       // those of the layers after it, are failed by `fail_unissued_layers`.
       LOG(ERROR) << "StartPush: failed to issue D2H for layer " << l << ": "
                  << future.status();
-      staging_layer_manager_.Release(l);
       {
         absl::MutexLock lock(mu_);
-        FinishLocked(future.status());
+        FinishLocked(future.status(), kD2hPhase);
+      }
+      staging_layer_manager_.Release(l);
+      if (manager_ != nullptr) {
+        manager_->OnLayerSendH2hComplete(base_uuid_, sub_plan_index_, l,
+                                         future.status());
       }
       EndSendOp();
       return;
@@ -609,7 +616,8 @@ void TransferSendSession::StartPush(
           absl::Status injected =
               FaultInjectStatus(hooks::kTransferSendSessionD2hComplete);
           if (status_or.ok() && !injected.ok()) status_or = injected;
-          if (!status_or.ok()) {
+          const bool ok = status_or.ok();
+          if (!ok) {
             LOG(ERROR) << "StartPush: D2H copy failed for layer " << l
                        << ", status: " << status_or.status();
             {
@@ -617,161 +625,210 @@ void TransferSendSession::StartPush(
               self->FinishLocked(status_or.status(), kD2hPhase);
             }
             self->staging_layer_manager_.Release(l);
+            if (self->manager_ != nullptr) {
+              self->manager_->OnLayerSendH2hComplete(self->base_uuid_,
+                                                     self->sub_plan_index_, l,
+                                                     status_or.status());
+            }
           }
-          if (self->remaining_d2h_layers_.fetch_sub(1) == 1) {
+          if (self->remaining_d2h_layers_.fetch_sub(
+                  1, std::memory_order_acq_rel) == 1) {
             absl::MutexLock lock(self->mu_);
+            self->d2h_done_ = std::chrono::steady_clock::now();
             self->d2h_stage_trace_.reset();
           }
           promise.Set(status_or.status());
+          if (ok) {
+            self->BeginOrQueueLayerH2h(l);
+          }
           self->EndSendOp();
         });
     next_layer = l + 1;
   }
 }
 
-void TransferSendSession::BeginOrQueueH2h() {
+void TransferSendSession::BeginOrQueueLayerH2h(size_t l) {
   if (manager_ == nullptr) {
-    SendNextLayer(0);
+    DispatchLayerH2h(l);
     return;
   }
   {
     absl::MutexLock lock(mu_);
-    if (draining_) return;
+    if (draining_) {
+      staging_layer_manager_.Release(l);
+      return;
+    }
     ++in_flight_;
-    has_h2h_gate_hold_ = true;
-    BeginStageTraceLocked(h2h_gate_wait_trace_, "SubTransferH2hGateWait", 2);
+    if (l < has_layer_gate_hold_.size()) {
+      has_layer_gate_hold_[l] = 1;
+    }
+    if (l == 0) {
+      BeginStageTraceLocked(h2h_gate_wait_trace_, "SubTransferH2hGateWait", 2);
+    }
   }
   bool rejected = false;
-  const bool enter = manager_->TryEnterSendH2hGate(
-      base_uuid_, sub_plan_index_, shared_from_this(), &rejected);
-  if (enter) SendNextLayer(0);
-  if (enter || rejected) DropH2hGateHold();
+  const bool enter = manager_->TryEnterLayerH2hGate(
+      base_uuid_, sub_plan_index_, l, shared_from_this(), &rejected);
+  if (enter) {
+    DispatchLayerH2h(l);
+    DropLayerH2hGateHold(l, /*release_layer_slot=*/false);
+  } else if (rejected) {
+    DropLayerH2hGateHold(l, /*release_layer_slot=*/true);
+  }
 }
 
-void TransferSendSession::StartGatedH2h() {
-  if (!IsDraining()) SendNextLayer(0);
-  DropH2hGateHold();
+void TransferSendSession::StartGatedLayerH2h(size_t l) {
+  if (!IsDraining()) {
+    DispatchLayerH2h(l);
+    DropLayerH2hGateHold(l, /*release_layer_slot=*/false);
+  } else {
+    DropLayerH2hGateHold(l, /*release_layer_slot=*/true);
+  }
 }
 
-void TransferSendSession::DropH2hGateHold() {
-  bool should_drop = false;
+void TransferSendSession::DropLayerH2hGateHold(size_t l,
+                                               bool release_layer_slot) {
+  bool had_hold = false;
+  {
+    absl::MutexLock lock(mu_);
+    if (l == 0) h2h_gate_wait_trace_.reset();
+    if (l < has_layer_gate_hold_.size()) {
+      had_hold = (std::exchange(has_layer_gate_hold_[l], 0) != 0);
+    }
+  }
+  if (had_hold) {
+    if (release_layer_slot) {
+      staging_layer_manager_.Release(l);
+    }
+    EndSendOp();
+  }
+}
+
+void TransferSendSession::DropAllLayerH2hGateHolds() {
+  size_t num_layers = 0;
   {
     absl::MutexLock lock(mu_);
     h2h_gate_wait_trace_.reset();
-    should_drop = std::exchange(has_h2h_gate_hold_, false);
+    num_layers = has_layer_gate_hold_.size();
   }
-  if (should_drop) EndSendOp();
+  for (size_t l = 0; l < num_layers; ++l) {
+    DropLayerH2hGateHold(l, /*release_layer_slot=*/true);
+  }
 }
 
-void TransferSendSession::CancelFromManagerLocked(const absl::Status& status) {
+void TransferSendSession::CancelWithoutSettleCallback(
+    const absl::Status& status) {
   absl::MutexLock lock(mu_);
   FinishLocked(status);
 }
 
-void TransferSendSession::SendNextLayer(size_t l) {
-  RAIDEN_TRACE_FN("KVTransfer::SendNextLayer",
-                  [&]() { return absl::StrCat("uuid=", uuid_, " layer=", l); });
-  if (l >= base_->num_layers()) {
-    // Reached end of layer loop. Background asynchronous transfers will clean
-    // up when remaining_h2h_layers_ reaches 0.
-    return;
-  }
-  std::optional<raiden::PjRtCopyFuture> layer_future;
+void TransferSendSession::DispatchLayerH2h(size_t l) {
+  const int32_t max_concurrent =
+      std::max<int32_t>(4, base_ != nullptr ? base_->parallelism() : 4);
   {
     absl::MutexLock lock(mu_);
     if (l == 0) {
       h2h_gate_wait_trace_.reset();
     }
-    if (draining_ || l >= d2h_layer_futures_.size()) {
+    if (draining_) {
+      staging_layer_manager_.Release(l);
       return;
     }
-    if (l == 0 && !h2h_push_trace_.has_value()) {
+    if (!h2h_push_trace_.has_value()) {
       BeginStageTraceLocked(h2h_push_trace_, "SubTransferH2hPush", 3);
     }
-    layer_future = d2h_layer_futures_[l];
     ++in_flight_;
-  }
-
-  layer_future->OnReady([self = shared_from_this(), l](auto status_or) {
-    absl::Cleanup end_op = [self]() { self->EndSendOp(); };
-    if (!status_or.ok()) {
-      LOG(ERROR) << "StartPush: D2H copy failed for layer " << l
-                 << ", status: " << status_or.status().ToString();
-      {
-        absl::MutexLock lock(self->mu_);
-        self->FinishLocked(status_or.status(), kD2hPhase);
-      }
-      self->staging_layer_manager_.Release(l);
+    if (in_flight_push_layers_ >= max_concurrent) {
+      ready_h2h_layers_.push_back(l);
       return;
     }
-    {
-      absl::MutexLock session_lock(self->mu_);
-      // The send expired or failed while the copy ran: nothing is pushed.
-      if (self->draining_) {
-        self->staging_layer_manager_.Release(l);
-        return;
-      }
-    }
+    ++in_flight_push_layers_;
+  }
+  ScheduleLayerH2hPush(l);
+}
 
-    std::move(end_op).Cancel();
-    self->base_->push_pool()->Schedule([self, l]() {
-      absl::Cleanup end_op = [self]() { self->EndSendOp(); };
-      std::vector<std::string> remote_data_endpoints;
-      std::vector<int> src_ints;
-      std::vector<int> dst_ints;
-      {
-        absl::MutexLock lock(self->mu_);
-        if (self->draining_) {
-          self->staging_layer_manager_.Release(l);
-          return;
+void TransferSendSession::ScheduleLayerH2hPush(size_t l) {
+  base_->push_pool()->Schedule(
+      base_->assigned_numa_node(), [self = shared_from_this(), l]() {
+        absl::Cleanup end_op = [self]() { self->EndSendOp(); };
+        std::vector<std::string> remote_data_endpoints;
+        std::vector<int> src_ints;
+        std::vector<int> dst_ints;
+        {
+          absl::MutexLock lock(self->mu_);
+          if (self->draining_) {
+            --self->in_flight_push_layers_;
+            self->staging_layer_manager_.Release(l);
+            return;
+          }
+          remote_data_endpoints = self->remote_data_endpoints_;
+          src_ints = self->src_ints_;
+          dst_ints = self->dst_ints_;
+          ++self->in_flight_;
         }
-        remote_data_endpoints = self->remote_data_endpoints_;
-        src_ints = self->src_ints_;
-        dst_ints = self->dst_ints_;
-        ++self->in_flight_;
-      }
-      LOG(INFO) << "StartPush (H2H start layer " << l
-                << "): uuid=" << self->uuid_
-                << ", numa=" << self->base_->assigned_numa_node().value_or(-1);
-      self->base_->H2hWriteDirectAsync(
-          remote_data_endpoints, src_ints, dst_ints, self->uuid_,
-          static_cast<int>(l),
-          [self, l](absl::StatusOr<std::vector<int>> push_res) {
-            absl::Cleanup end_op = [self]() { self->EndSendOp(); };
-            if (!push_res.ok()) {
-              LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
-                         << push_res.status().ToString();
-              {
-                absl::MutexLock lock(self->mu_);
-                self->FinishLocked(push_res.status(), kPushPhase);
+        LOG(INFO) << "StartPush (H2H start layer " << l
+                  << "): uuid=" << self->uuid_ << ", numa="
+                  << self->base_->assigned_numa_node().value_or(-1);
+        self->base_->H2hWriteDirectAsync(
+            remote_data_endpoints, src_ints, dst_ints, self->uuid_,
+            static_cast<int>(l),
+            [self, l](absl::StatusOr<std::vector<int>> push_res) {
+              absl::Cleanup end_op = [self]() { self->EndSendOp(); };
+              if (!push_res.ok()) {
+                LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
+                           << push_res.status().ToString();
+                {
+                  absl::MutexLock lock(self->mu_);
+                  --self->in_flight_push_layers_;
+                  self->FinishLocked(push_res.status(), kPushPhase);
+                }
+                self->staging_layer_manager_.Release(l);
+                if (self->manager_ != nullptr) {
+                  self->manager_->OnLayerSendH2hComplete(self->base_uuid_,
+                                                         self->sub_plan_index_,
+                                                         l, push_res.status());
+                }
+                return;
               }
               self->staging_layer_manager_.Release(l);
-              return;
-            }
-            // The push has read the layer out of its host buffer: return
-            // the buffer so a later layer can D2H into it.
-            self->staging_layer_manager_.Release(l);
-
-            LOG(INFO) << "StartPush (H2H complete layer " << l
-                      << "): uuid=" << self->uuid_ << ", numa="
-                      << self->base_->assigned_numa_node().value_or(-1);
-
-            const bool last = self->remaining_h2h_layers_.fetch_sub(1) == 1;
-            if (last) {
-              LOG(INFO) << "StartPush (All H2H complete): uuid=" << self->uuid_;
+              if (self->manager_ != nullptr) {
+                self->manager_->OnLayerSendH2hComplete(self->base_uuid_,
+                                                       self->sub_plan_index_, l,
+                                                       absl::OkStatus());
+              }
+              std::optional<size_t> next_queued_layer;
               {
                 absl::MutexLock lock(self->mu_);
-                self->h2h_push_trace_.reset();
+                if (!self->draining_ && !self->ready_h2h_layers_.empty()) {
+                  next_queued_layer = self->ready_h2h_layers_.front();
+                  self->ready_h2h_layers_.pop_front();
+                } else {
+                  --self->in_flight_push_layers_;
+                }
               }
-              self->Finish();
-            }
-          });
-
-      // Immediately queue the next layer's push without waiting for this one to
-      // finish.
-      self->SendNextLayer(l + 1);
-    });
-  });
+              if (next_queued_layer.has_value()) {
+                self->ScheduleLayerH2hPush(*next_queued_layer);
+              }
+              if (self->remaining_h2h_layers_.fetch_sub(
+                      1, std::memory_order_acq_rel) == 1) {
+                LOG(INFO) << "StartPush (All H2H complete): uuid="
+                          << self->uuid_;
+                bool newly_settled = false;
+                {
+                  absl::MutexLock lock(self->mu_);
+                  self->h2h_push_trace_.reset();
+                  const bool was_done = self->done_;
+                  self->FinishLocked(absl::OkStatus());
+                  self->ReleaseStagingBlocksLocked();
+                  newly_settled = (!was_done && self->done_);
+                }
+                if (newly_settled && self->manager_ != nullptr &&
+                    !self->manager_->IsShuttingDown()) {
+                  self->manager_->OnSendSessionSettled(self->uuid_, *self);
+                }
+              }
+            });
+      });
 }
 
 }  // namespace tpu_raiden

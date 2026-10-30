@@ -340,6 +340,7 @@ cc_library(
         "//tpu_sync/core:control_plane_backend",
         "//tpu_sync/core:host_memory_allocator",
         "//tpu_sync/core:metrics_collector",
+        "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:pool_reshard_send_slots",
         "//tpu_sync/core:raiden_manager_base",
         "//tpu_sync/core:raiden_transfer_endpoint",

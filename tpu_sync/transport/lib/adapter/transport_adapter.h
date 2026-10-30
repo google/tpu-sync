@@ -120,6 +120,10 @@ class TransportAdapter {
   // Port peers use to reach this transport.
   virtual int local_port() const = 0;
 
+  // Cleans up any cached per-session state (such as cancellation flags)
+  // associated with uuid so that the uuid may be safely reused.
+  virtual void ForgetUuid(uint64_t uuid) {}
+
   virtual ::peregrine::TransportMetrics GetTransportMetrics() const {
     return {};
   }

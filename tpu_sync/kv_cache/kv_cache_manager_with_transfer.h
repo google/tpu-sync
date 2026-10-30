@@ -52,6 +52,7 @@ class StartTransferRequest;
 namespace tpu_raiden {
 
 class MetricsCollector;
+class NumaThreadPool;
 class ReshardReceiveSession;
 class ReshardSendSession;
 class TransferSendSession;
@@ -430,10 +431,13 @@ class KVCacheManagerWithTransfer {
     uint64_t base_uuid = 0;
     absl::flat_hash_set<int64_t> registered_block_set, claimed_blocks;
     size_t total_blocks = 0, settled_blocks = 0;
-    int32_t sub_pulls_dispatched = 0, next_h2h_sub_plan_index = 0;
+    int32_t sub_pulls_dispatched = 0;
     std::chrono::steady_clock::time_point deadline, register_start;
-    std::deque<std::shared_ptr<TransferSendSession>> pending_h2h_sessions;
-    bool h2h_in_flight = false, failed = false;
+    std::vector<int32_t> next_h2h_sub_plan_per_layer;
+    std::vector<uint8_t> h2h_in_flight_per_layer;
+    std::vector<std::deque<std::shared_ptr<TransferSendSession>>>
+        pending_layer_sessions;
+    bool failed = false;
   };
   struct SubSendParentRef {
     uint64_t base_uuid = 0;
@@ -444,16 +448,27 @@ class KVCacheManagerWithTransfer {
   absl::flat_hash_map<uint64_t, SubSendParentRef> sub_uuid_to_parent_
       ABSL_GUARDED_BY(mu_);
 
-  bool TryEnterSendH2hGate(uint64_t base_uuid, int32_t sub_plan_index,
-                           std::shared_ptr<TransferSendSession> session,
-                           bool* rejected);
+  bool TryEnterLayerH2hGate(uint64_t base_uuid, int32_t sub_plan_index,
+                            size_t layer_index,
+                            std::shared_ptr<TransferSendSession> session,
+                            bool* rejected);
+  void OnLayerSendH2hComplete(uint64_t base_uuid, int32_t sub_plan_index,
+                              size_t layer_index, const absl::Status& status);
   void OnSendSessionSettled(uint64_t uuid, TransferSendSession& session);
+  void DrainAllPendingLayerSessionsLocked(
+      ParentSendRegistration& parent,
+      std::vector<std::shared_ptr<TransferSendSession>>* out)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void RetireSettledSendSessionLocked(
       uint64_t uuid, std::vector<std::pair<uint64_t, uint64_t>>* settled_plans,
-      std::vector<std::shared_ptr<TransferSendSession>>* sessions_to_release)
+      std::vector<std::shared_ptr<TransferSendSession>>* sessions_to_release,
+      std::vector<uint64_t>* retired_send_uuids)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void CleanupParentSendRegistrationLocked(uint64_t base_uuid)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  static constexpr int kPullWorkerPoolSize = 8;
+  std::unique_ptr<NumaThreadPool> pull_worker_pool_;
 
   struct ActiveRecvChain {
     std::string req_id, remote_endpoint;
@@ -463,6 +478,9 @@ class KVCacheManagerWithTransfer {
     int64_t window_blocks = 0;
     int32_t window_depth = kDefaultStagingWindowDepth, sub_plan_count = 1;
     int32_t next_sub_plan_index = 0, in_flight_sub_plans = 0;
+    int32_t window_in_flight = 0;
+    std::vector<std::shared_ptr<StagingAllocation>> slot_allocations;
+    std::vector<std::shared_ptr<TransferReceiveSession>> slot_occupants;
     bool aborted = false;
   };
   struct DispatchedSubRecv {
@@ -471,6 +489,9 @@ class KVCacheManagerWithTransfer {
   };
   absl::flat_hash_map<std::string, ActiveRecvChain> active_recv_chains_
       ABSL_GUARDED_BY(mu_);
+
+  void OnRecvSubPlanNetworkComplete(uint64_t sub_uuid,
+                                    TransferReceiveSession& session);
 
   void RetireSettledRecvSessionLocked(
       uint64_t uuid, std::vector<std::pair<uint64_t, uint64_t>>* settled_plans,

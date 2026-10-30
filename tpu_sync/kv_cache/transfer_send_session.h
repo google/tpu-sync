@@ -19,6 +19,7 @@
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -182,10 +183,14 @@ class TransferSendSession
     absl::MutexLock l(mu_);
     return pulled_blocks_;
   }
-  void BeginOrQueueH2h();
-  void StartGatedH2h();
-  void DropH2hGateHold();
-  void CancelFromManagerLocked(const absl::Status& status);
+  void BeginOrQueueLayerH2h(size_t layer_index);
+  void StartGatedLayerH2h(size_t layer_index);
+  void DropLayerH2hGateHold(size_t layer_index, bool release_layer_slot);
+  void DropAllLayerH2hGateHolds();
+  // Cancels the session without notifying the manager's settle callback.
+  // Acquires session mu_; safe to call while holding
+  // KVCacheManagerWithTransfer::mu_.
+  void CancelWithoutSettleCallback(const absl::Status& status);
 
  private:
   TransferSendSession(kv_cache::KVCacheManagerBase* base,
@@ -216,7 +221,8 @@ class TransferSendSession
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndSendOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   absl::Status AcquireStagingWithRetry(int64_t num_blocks);
-  void SendNextLayer(size_t l);
+  void DispatchLayerH2h(size_t layer_index);
+  void ScheduleLayerH2hPush(size_t layer_index);
   void BeginStageTraceLocked(std::optional<ScopedTrace>& trace,
                              absl::string_view name, uint32_t stage_tag)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -243,7 +249,9 @@ class TransferSendSession
   absl::string_view failed_phase_ ABSL_GUARDED_BY(mu_);
   bool pull_started_ ABSL_GUARDED_BY(mu_) = false;
   size_t pulled_blocks_ ABSL_GUARDED_BY(mu_) = 0;
-  bool has_h2h_gate_hold_ ABSL_GUARDED_BY(mu_) = false;
+  std::vector<uint8_t> has_layer_gate_hold_ ABSL_GUARDED_BY(mu_);
+  int32_t in_flight_push_layers_ ABSL_GUARDED_BY(mu_) = 0;
+  std::deque<size_t> ready_h2h_layers_ ABSL_GUARDED_BY(mu_);
   // Copies and pushes issued for this send whose completion has not been
   // observed. The staging they read and write is held until it is zero.
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;

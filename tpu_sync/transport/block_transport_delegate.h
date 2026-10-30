@@ -104,6 +104,9 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
   // per pool without changing the wire's integer index.
   virtual size_t num_block_arrays() const { return num_layers(); }
 
+  // Returns the maximum number of layers that can be concurrently in H2H push.
+  virtual size_t max_concurrent_push_layers() const { return num_layers(); }
+
   // Geometry and host bounds for one wire-addressable block array. Legacy
   // delegates inherit the uniform layer behavior; pool-aware delegates may
   // map an array to an interior range of a different backing storage.

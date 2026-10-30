@@ -358,6 +358,12 @@ void SocketTransportAdapter::SocketWorkerLoop() {
   }
 }
 
+void SocketTransportAdapter::ForgetUuid(uint64_t uuid) {
+  absl::MutexLock lock(scheduler_mu_);
+  session_failed_by_uuid_.erase(uuid);
+  std::erase(uuid_lru_order_, uuid);
+}
+
 std::unique_ptr<SocketTransportAdapter::WriteTask>
 SocketTransportAdapter::SelectNextTask() {
   if (active_peers_.empty()) return nullptr;

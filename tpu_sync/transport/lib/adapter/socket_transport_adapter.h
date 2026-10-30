@@ -61,6 +61,8 @@ class SocketTransportAdapter : public TransportAdapter {
 
   int local_port() const override { return raw_transport_->local_port(); }
 
+  void ForgetUuid(uint64_t uuid) override;
+
   static constexpr int kDefaultMaxSocketWorkers = 64;
 
   struct Config {

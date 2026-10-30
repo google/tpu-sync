@@ -115,8 +115,26 @@ class TransferReceiveSession
   // multiple times.
   bool HasStaging() const {
     absl::MutexLock lock(mu_);
-    return !staging_.empty();
+    return !staging_.empty() ||
+           (shared_staging_slot_ != nullptr && !shared_staging_slot_->empty());
   }
+
+  void SetSharedStagingSlot(std::shared_ptr<StagingAllocation> slot) {
+    absl::MutexLock lock(mu_);
+    shared_staging_slot_ = std::move(slot);
+  }
+
+  void SetPredecessorSession(std::shared_ptr<TransferReceiveSession> pred) {
+    absl::MutexLock lock(mu_);
+    predecessor_session_ = std::move(pred);
+  }
+
+  bool TryReleaseWindowSlot() { return !window_slot_released_.exchange(true); }
+
+  absl::Status AwaitPredecessorH2dComplete();
+
+  absl::Status WaitUntilH2dCompleteOrDone(
+      std::chrono::steady_clock::time_point wait_deadline);
 
   void ReleaseStaging();
 
@@ -285,7 +303,7 @@ class TransferReceiveSession
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndRecvOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
-  bool AllH2dDoneLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  bool AllH2dDoneLocked() const ABSL_SHARED_LOCKS_REQUIRED(mu_);
   bool RecordBlockShardsReceivedLocked(const std::vector<int>& block_ids,
                                        absl::Span<const int> shard_ids,
                                        bool* first_packet,
@@ -353,6 +371,11 @@ class TransferReceiveSession
   // mu_.
   StagingLayerManager staging_layer_manager_;
   std::atomic<bool> cancelled_{false};
+  std::shared_ptr<StagingAllocation> shared_staging_slot_ ABSL_GUARDED_BY(mu_);
+  std::shared_ptr<TransferReceiveSession> predecessor_session_
+      ABSL_GUARDED_BY(mu_);
+  std::atomic<bool> window_slot_released_{false};
+  int32_t h2d_dispatched_layers_ ABSL_GUARDED_BY(mu_) = 0;
   std::optional<ScopedTrace> h2d_stage_trace_ ABSL_GUARDED_BY(mu_);
 };
 

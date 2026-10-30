@@ -215,7 +215,7 @@ class TestManager : private ScopedControlPlaneBackend,
     absl::MutexLock lock(mu_);
     auto it = send_sessions_.find(uuid);
     if (it != send_sessions_.end()) {
-      it->second->CancelFromManagerLocked(status);
+      it->second->CancelWithoutSettleCallback(status);
     }
   }
 
@@ -247,6 +247,16 @@ class TestManager : private ScopedControlPlaneBackend,
     absl::MutexLock lock(mu_);
     auto it = send_chains_.find(req_id);
     return it != send_chains_.end() && it->second.failed;
+  }
+
+  bool IsDoneRecving(const std::string& req_id) {
+    absl::MutexLock lock(mu_);
+    return done_recving_.contains(req_id);
+  }
+
+  bool IsFailedRecving(const std::string& req_id) {
+    absl::MutexLock lock(mu_);
+    return failed_recving_.contains(req_id);
   }
 };
 
@@ -1486,6 +1496,38 @@ TEST(ControlHandshakeTest,
   EXPECT_TRUE(manager.IsSendChainFailed("req_send"));
   CompleteReadResult res_send = manager.CompleteReadWithDetails();
   EXPECT_THAT(res_send.failed, Contains("req_send"));
+}
+
+TEST(ControlHandshakeTest,
+     SweepSubPlanChainsSinglePlanFailedOverriddenByOkTerminal) {
+  TestManager manager(/*timeout_s=*/5.0, /*num_layers=*/1);
+  const std::string req_id = "req_single_retry";
+  const uint64_t uuid = 401;
+
+  manager.TestNoteSubPlanRegistered(/*is_recv=*/true, req_id, uuid,
+                                    /*sub_plan_index=*/0,
+                                    /*sub_plan_count=*/1);
+  ASSERT_TRUE(manager.HasRecvChain(req_id));
+  EXPECT_FALSE(manager.IsRecvChainFailed(req_id));
+
+  // Sweep with a past timeout to force the chain into failed status.
+  const auto past_timeout =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  manager.TestSweepSubPlanChains(past_timeout);
+  EXPECT_TRUE(manager.IsRecvChainFailed(req_id));
+  EXPECT_TRUE(manager.IsFailedRecving(req_id));
+  EXPECT_FALSE(manager.IsDoneRecving(req_id));
+
+  // Genuine OK terminal arriving after sweep marked the chain failed.
+  manager.TestRecordPoolReshardTerminal(/*is_recv=*/true, req_id, uuid,
+                                        /*sub_plan_index=*/0,
+                                        /*sub_plan_count=*/1, absl::OkStatus());
+
+  // Genuine OK terminal overrides the sweep failure: done_recving_ contains it,
+  // failed_recving_ does not, and the chain entry is erased.
+  EXPECT_TRUE(manager.IsDoneRecving(req_id));
+  EXPECT_FALSE(manager.IsFailedRecving(req_id));
+  EXPECT_FALSE(manager.HasRecvChain(req_id));
 }
 
 TEST(ControlHandshakeTest, SetStagingWindowConfigAutoResolvesWindowBlocks) {

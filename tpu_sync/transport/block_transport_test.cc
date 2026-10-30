@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <thread>  // NOLINT
@@ -252,6 +253,12 @@ class MockDelegate : public BlockTransportDelegate {
   size_t num_shards() const override { return num_shards_; }
   size_t slice_byte_size() const override { return slice_size_; }
   size_t shard_factor() const override { return 1; }
+  size_t max_concurrent_push_layers() const override {
+    return max_concurrent_push_layers_.value_or(num_layers_);
+  }
+  void set_max_concurrent_push_layers(size_t l) {
+    max_concurrent_push_layers_ = l;
+  }
 
   uint8_t* data(size_t layer_idx = 0, size_t shard_idx = 0) {
     return buffers_[BufferIndex(layer_idx, shard_idx)].data();
@@ -314,6 +321,7 @@ class MockDelegate : public BlockTransportDelegate {
       ABSL_GUARDED_BY(peer_channels_mu_);
   absl::flat_hash_map<std::string, std::shared_ptr<grpc::Channel>>
       peer_channels_ ABSL_GUARDED_BY(peer_channels_mu_);
+  std::optional<size_t> max_concurrent_push_layers_;
 };
 
 class SamePeerFanoutDelegate : public MockDelegate {
@@ -814,6 +822,137 @@ TEST_P(BlockTransportTest, PushSplitBySourceNumaCompletesPlanDeclaredPool) {
           .Await();
   ASSERT_TRUE(pushed.ok()) << pushed.status().message();
   EXPECT_EQ(receiver_delegate.pool_completion_count(), 1);
+}
+
+TEST_P(BlockTransportTest,
+       PushAdaptiveSubdivisionSplitsShardGroupWhenUnderutilized) {
+  constexpr size_t kSlice = 256;
+  constexpr int kBlocks = 1;
+  constexpr size_t kShards = 4;
+  MockDelegate sender_delegate(kSlice, kBlocks, /*num_layers=*/4, kShards);
+  sender_delegate.set_max_concurrent_push_layers(4);
+  BlockShardsReceivedRecordingDelegate receiver_delegate(
+      kSlice, kBlocks, /*num_layers=*/4, kShards);
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // L=4, P=32, num_blocks=1: active_layers(4) * groups(1) * num_blocks(1) = 4
+  // < 32. split_factor = (32/4 + 1 - 1)/1 = 8. 4 shards subdivides into 4
+  // groups of 1 shard each.
+  absl::StatusOr<std::vector<int>> pushed =
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+                     /*parallelism=*/32, MajorOrder::kLayerMajor, /*uuid=*/20,
+                     /*layer_idx=*/-1)
+          .Await();
+  ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+
+  EXPECT_THAT(
+      receiver_delegate.reports(),
+      ::testing::UnorderedElementsAre(
+          ::testing::Pair(::testing::ElementsAre(0), ::testing::ElementsAre(0)),
+          ::testing::Pair(::testing::ElementsAre(0), ::testing::ElementsAre(1)),
+          ::testing::Pair(::testing::ElementsAre(0), ::testing::ElementsAre(2)),
+          ::testing::Pair(::testing::ElementsAre(0),
+                          ::testing::ElementsAre(3))));
+}
+
+TEST_P(BlockTransportTest,
+       PushAdaptiveSubdivisionDoesNotSplitWhenSaturatedOrEmptyDst) {
+  constexpr size_t kSlice = 256;
+  constexpr int kBlocks = 1;
+  constexpr size_t kShards = 4;
+
+  // Case 1: num_layers=60 (L * groups * num_blocks = 60 * 1 * 1 = 60 >= P=32),
+  // no split.
+  {
+    MockDelegate sender_delegate(kSlice, kBlocks, /*num_layers=*/60, kShards);
+    sender_delegate.set_max_concurrent_push_layers(60);
+    BlockShardsReceivedRecordingDelegate receiver_delegate(
+        kSlice, kBlocks, /*num_layers=*/60, kShards);
+
+    BlockTransport sender(&sender_delegate, 0);
+    BlockTransport receiver(&receiver_delegate, 0);
+    BindControlChannels(&sender, &sender_delegate, &receiver,
+                        &receiver_delegate);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    absl::StatusOr<std::vector<int>> pushed =
+        sender
+            .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                       /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+                       /*parallelism=*/32, MajorOrder::kLayerMajor, /*uuid=*/21,
+                       /*layer_idx=*/-1)
+            .Await();
+    ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+    EXPECT_THAT(
+        receiver_delegate.reports(),
+        ::testing::ElementsAre(::testing::Pair(
+            ::testing::ElementsAre(0), ::testing::ElementsAre(0, 1, 2, 3))));
+  }
+
+  // Case 2: num_blocks (32) >= parallelism (32), no split.
+  {
+    constexpr int kManyBlocks = 32;
+    MockDelegate sender_delegate(kSlice, kManyBlocks, /*num_layers=*/1,
+                                 kShards);
+    sender_delegate.set_max_concurrent_push_layers(1);
+    BlockShardsReceivedRecordingDelegate receiver_delegate(
+        kSlice, kManyBlocks, /*num_layers=*/1, kShards);
+
+    BlockTransport sender(&sender_delegate, 0);
+    BlockTransport receiver(&receiver_delegate, 0);
+    BindControlChannels(&sender, &sender_delegate, &receiver,
+                        &receiver_delegate);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    std::vector<int> bids(32);
+    std::iota(bids.begin(), bids.end(), 0);
+
+    absl::StatusOr<std::vector<int>> pushed =
+        sender
+            .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                       /*src_block_ids=*/bids, /*dst_block_ids=*/bids,
+                       /*parallelism=*/32, MajorOrder::kLayerMajor, /*uuid=*/22,
+                       /*layer_idx=*/-1)
+            .Await();
+    ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+    ASSERT_FALSE(receiver_delegate.reports().empty());
+    for (const auto& r : receiver_delegate.reports()) {
+      EXPECT_THAT(r.second, ::testing::ElementsAre(0, 1, 2, 3));
+    }
+  }
+
+  // Case 3: dst_block_ids is empty, no split.
+  {
+    MockDelegate sender_delegate(kSlice, kBlocks, /*num_layers=*/1, kShards);
+    sender_delegate.set_max_concurrent_push_layers(1);
+    BlockShardsReceivedRecordingDelegate receiver_delegate(
+        kSlice, kBlocks, /*num_layers=*/1, kShards);
+
+    BlockTransport sender(&sender_delegate, 0);
+    BlockTransport receiver(&receiver_delegate, 0);
+    BindControlChannels(&sender, &sender_delegate, &receiver,
+                        &receiver_delegate);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    absl::StatusOr<std::vector<int>> pushed =
+        sender
+            .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                       /*src_block_ids=*/{0}, /*dst_block_ids=*/{},
+                       /*parallelism=*/32, MajorOrder::kLayerMajor, /*uuid=*/23,
+                       /*layer_idx=*/-1)
+            .Await();
+    ASSERT_TRUE(pushed.ok()) << pushed.status().message();
+    EXPECT_THAT(
+        receiver_delegate.reports(),
+        ::testing::ElementsAre(::testing::Pair(
+            ::testing::ElementsAre(0), ::testing::ElementsAre(0, 1, 2, 3))));
+  }
 }
 
 TEST_P(BlockTransportTest, PullNonContiguous) {

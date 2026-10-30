@@ -767,6 +767,9 @@ TEST(SendDrainTest, DetailsSayAFailedPushFailedInPushWhileCopiesRun) {
   }
   ASSERT_TRUE(producer.send_draining(27));
   producer.FinishCopy(1, absl::OkStatus());
+  EXPECT_THAT(producer.AwaitSendDone(27),
+              ::absl_testing::StatusIs(absl::StatusCode::kInternal,
+                                       HasSubstr("injected fault")));
   CompleteReadResult completions = producer.CompleteReadWithDetails();
 
   EXPECT_THAT(completions.failed, ElementsAre("req"));

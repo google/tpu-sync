@@ -271,6 +271,24 @@ TEST(KVCacheListenerTest, PartiallyPopulatedPoolPlanStillRoutesToPoolPath) {
   EXPECT_EQ(manager.route(), Route::kPoolReshardRegisterRecv);
 }
 
+TEST(KVCacheListenerTest, PoollessSenderIsRejected) {
+  RoutingKVCacheManager manager;
+  KVCacheListener listener(&manager, /*listener_port=*/0);
+
+  ControlRequest request;
+  request.set_command(ControlRequest::COMMAND_START_TRANSFER);
+  StartTransferRequest* plan = request.mutable_start_transfer_request();
+  plan->set_uuid(4321);
+  plan->set_is_sender(true);
+  auto* schedule = &(*plan->mutable_shard_push_schedules())[0];
+  schedule->add_entries()->set_src_block_id(1);
+
+  ControlResponse response = SendRequest(listener.listener_port(), request);
+
+  EXPECT_FALSE(response.success());
+  EXPECT_EQ(manager.route(), Route::kNone);
+}
+
 TEST(KVCacheListenerTest, PoollessReceiverPreservesRegisterActivePlan) {
   RoutingKVCacheManager manager;
   KVCacheListener listener(&manager, /*listener_port=*/0);

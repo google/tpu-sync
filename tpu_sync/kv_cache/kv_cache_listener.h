@@ -64,16 +64,6 @@ class KVCacheListener final {
                       return engine->PoolReshardRegisterRecv(req,
                                                              chip_block_ids);
                     },
-                .push_kv_cache_resharded =
-                    [engine](const tpu_sync::rpc::StartTransferRequest& req) {
-                      if constexpr (requires {
-                                      engine->PushKVCacheResharded(req);
-                                    }) {
-                        return engine->PushKVCacheResharded(req);
-                      } else {
-                        return engine->base()->PushKVCacheResharded(req);
-                      }
-                    },
                 .register_active_plan =
                     [engine](uint64_t uuid,
                              const tpu_sync::rpc::StartTransferRequest& req,
@@ -119,8 +109,6 @@ class KVCacheListener final {
     std::function<absl::Status(const tpu_sync::rpc::StartTransferRequest&,
                                absl::Span<const int64_t>)>
         pool_reshard_register_recv;
-    std::function<absl::Status(const tpu_sync::rpc::StartTransferRequest&)>
-        push_kv_cache_resharded;
     std::function<absl::Status(
         uint64_t, const tpu_sync::rpc::StartTransferRequest&, bool)>
         register_active_plan;

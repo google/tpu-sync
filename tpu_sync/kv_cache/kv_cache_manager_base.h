@@ -310,15 +310,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   virtual absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
   H2hRead(std::string peer, const std::vector<int>& src_block_ids);
 
-  // Executes a distributed resharding push transfer based on precise
-  // centralized Controller schedules.
-  absl::Status PushKVCacheResharded(
-      const ::tpu_sync::rpc::StartTransferRequest& request);
-
-  // Pool-plan executor hooks used by KVCacheListener. Designed as the
-  // successor of PushKVCacheResharded/RegisterActivePlan for pool-addressed
-  // plans; managers without transfer support fail closed instead of falling
-  // back to the legacy whole-layer reshard path.
+  // Pool-plan executor hooks used by KVCacheListener; managers without
+  // transfer support fail closed.
   virtual absl::Status PoolReshardPush(
       const ::tpu_sync::rpc::StartTransferRequest& request,
       absl::Span<const int64_t> src_block_ids, int parallelism = 8) {

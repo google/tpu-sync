@@ -171,16 +171,15 @@ void KVCacheListener::HandleControlRequest(const ControlRequest& req,
           }
         }
       } else if (start_req.is_sender()) {
-        // Preserve the pre-pool controller protocol for existing callers.
-        LOG(INFO) << "C++ KVCacheListener received legacy START_TRANSFER "
-                     "(Sender)";
-        absl::Status status = callbacks_.push_kv_cache_resharded(start_req);
-        if (!status.ok()) {
-          resp->set_success(false);
-          resp->set_message(std::string(status.message()));
-          LOG(ERROR) << "PushKVCacheResharded native execution failed: "
-                     << status;
-        }
+        // Block-addressed (poolless) sender pushes are no longer supported;
+        // use the pool-addressed reshard path instead.
+        LOG(ERROR) << "C++ KVCacheListener rejected poolless START_TRANSFER "
+                      "(Sender) for uuid "
+                   << start_req.uuid();
+        resp->set_success(false);
+        resp->set_message(
+            "poolless sender START_TRANSFER is unsupported; use pool-addressed "
+            "resharding");
       } else {
         LOG(INFO) << "C++ KVCacheListener received START_TRANSFER (Receiver), "
                      "registering expected buffers for uuid "

@@ -556,18 +556,6 @@ class KVCacheStore {
       absl::string_view store_server_ip = "",
       absl::string_view global_registry_address = "");
 
-  // Settle a recall batch: count `block_hashes` in `kv_recall_blocks_total`
-  // under `tier` (outcome `ok` for Done), then mark them in `load_tracker_`.
-  void MarkRecallDone(absl::string_view tier,
-                      absl::Span<const std::string> block_hashes);
-  void MarkRecallFailed(absl::string_view tier, absl::string_view outcome,
-                        absl::Span<const std::string> block_hashes);
-
-  // Counts all `count` blocks of a rejected local-DRAM Load batch as
-  // `not_found` (the caller must recompute the whole batch) and returns
-  // `status`.
-  absl::Status FailLocalLoadNotFound(size_t count, absl::Status status) const;
-
   // Registers ValidateAndPinHostBlocks/UnpinHostBlocks on raiden_controller_
   // as the source-side hooks that a peer's ReadRemote lease acquisition and
   // release run against this store's LRU (no-op if there is no controller).

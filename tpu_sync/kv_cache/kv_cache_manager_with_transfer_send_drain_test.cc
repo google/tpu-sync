@@ -96,7 +96,8 @@ class TestManager : public KVCacheManagerWithTransfer {
     std::shared_ptr<TransferSendSession> session;
     {
       absl::MutexLock lock(mu_);
-      session = send_sessions_.at(uuid);
+      session = FindSessionLocked<TransferSendSession>(uuid);
+      CHECK(session != nullptr);
     }
     session->StartPush({"127.0.0.1:1"}, /*src_block_ids=*/{0},
                        /*dst_block_ids=*/{0});
@@ -116,7 +117,8 @@ class TestManager : public KVCacheManagerWithTransfer {
     std::shared_ptr<TransferSendSession> session;
     {
       absl::MutexLock lock(mu_);
-      session = send_sessions_.at(uuid);
+      session = FindSessionLocked<TransferSendSession>(uuid);
+      CHECK(session != nullptr);
     }
     session->Finish(absl::CancelledError("send cancelled"));
   }
@@ -145,7 +147,8 @@ class TestManager : public KVCacheManagerWithTransfer {
     std::shared_ptr<TransferSendSession> session;
     {
       absl::MutexLock lock(mu_);
-      session = send_sessions_.at(uuid);
+      session = FindSessionLocked<TransferSendSession>(uuid);
+      CHECK(session != nullptr);
     }
     if (in_flight > 0) {
       ServePull(uuid);
@@ -165,14 +168,14 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   bool has_send(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    auto it = send_sessions_.find(uuid);
-    return it != send_sessions_.end() && !it->second->Done();
+    auto session = FindSessionLocked<TransferSendSession>(uuid);
+    return session != nullptr && !session->Done();
   }
 
   bool send_draining(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    auto it = send_sessions_.find(uuid);
-    return it != send_sessions_.end() && it->second->IsDraining();
+    auto session = FindSessionLocked<TransferSendSession>(uuid);
+    return session != nullptr && session->IsDraining();
   }
 
   // Host layer buffer the `index`-th copy issued writes to; -1 when the copy
@@ -224,14 +227,15 @@ class TestManager : public KVCacheManagerWithTransfer {
 
   const StagingLayerManager& staging_layer_manager(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    return send_sessions_.at(uuid)->staging_layer_manager();
+    return FindSessionLocked<TransferSendSession>(uuid)
+        ->staging_layer_manager();
   }
 
   absl::Status AwaitSendDone(uint64_t uuid) {
     std::shared_ptr<TransferSendSession> session;
     {
       absl::MutexLock lock(mu_);
-      session = send_sessions_.at(uuid);
+      session = FindSessionLocked<TransferSendSession>(uuid);
     }
     return session->AwaitForDone();
   }
@@ -348,7 +352,7 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     entry->set_size_bytes(base()->block_bytes(0));
     entry->set_count(blocks_per_layer);
     absl::MutexLock lock(mu_);
-    active_recv_sessions_[uuid] = *TransferReceiveSession::Create(
+    sessions_[uuid] = *TransferReceiveSession::Create(
         base(), staging_allocator_.get(), uuid, req_id, blocks_per_layer,
         deadline.value_or(DeadlineFromNow()), /*acquire_staging=*/true);
   }
@@ -395,22 +399,22 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
 
   const StagingLayerManager& staging_layer_manager(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    return active_recv_sessions_.at(uuid)->staging_layer_manager();
+    return FindSessionLocked<TransferReceiveSession>(uuid)
+        ->staging_layer_manager();
   }
 
   bool has_recv(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    auto it = active_recv_sessions_.find(uuid);
-    return it != active_recv_sessions_.end() && !it->second->Done();
+    auto session = FindSessionLocked<TransferReceiveSession>(uuid);
+    return session != nullptr && !session->Done();
   }
 
   void FailRecv(uint64_t uuid, absl::Status status) {
     std::shared_ptr<TransferReceiveSession> session;
     {
       absl::MutexLock lock(mu_);
-      auto it = active_recv_sessions_.find(uuid);
-      if (it == active_recv_sessions_.end()) return;
-      session = it->second;
+      session = FindSessionLocked<TransferReceiveSession>(uuid);
+      if (session == nullptr) return;
     }
     session->Finish(status);
   }
@@ -1012,6 +1016,63 @@ TEST(RecvDrainTest, DuplicateUuidIsRejectedUntilExpiredReceiveDrains) {
   EXPECT_THAT(FailedRecving(repeated), IsEmpty());
 }
 
+TEST(RecvLifecycleTest, RedeliveredStartReadLeavesAReadyReceiveToCompleteRead) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.AddRecv("req", /*uuid=*/30);
+  // Every shard's blocks arrive before any layer's H2D is issued: the network
+  // phase completes, no H2D is outstanding, and nothing finishes the receive.
+  ABSL_ASSERT_OK(consumer.ReceiveBlocks({0}, /*uuid=*/30));
+  TF_ASSERT_OK_AND_ASSIGN(auto incumbent, consumer.GetSession(/*uuid=*/30));
+  auto recv = std::dynamic_pointer_cast<TransferReceiveSession>(incumbent);
+  ASSERT_NE(recv, nullptr);
+  ASSERT_TRUE(recv->IsReadyToComplete());
+  ASSERT_FALSE(recv->IsDraining());
+
+  // A re-delivered announcement of the same request must neither finish the
+  // incumbent nor seat a second receive under its uuid.
+  consumer.StartRead("req", /*uuid=*/30, /*remote_endpoint=*/"unused:1",
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+  EXPECT_THAT(consumer.GetSession(/*uuid=*/30), IsOkAndHolds(incumbent));
+  EXPECT_FALSE(recv->IsDraining());
+  EXPECT_EQ(consumer.free_slots(), kSlots - 1);
+
+  CompleteReadResult completions = consumer.CompleteReadWithDetails();
+  EXPECT_THAT(completions.received, ElementsAre("req"));
+  EXPECT_THAT(completions.failed, IsEmpty());
+  EXPECT_FALSE(consumer.has_recv(30));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+
+  CompleteReadResult repeated = consumer.CompleteReadWithDetails();
+  EXPECT_THAT(repeated.received, IsEmpty());
+  EXPECT_THAT(repeated.failed, IsEmpty());
+}
+
+TEST(RecvLifecycleTest, RegisterRecvFinishesAReadyIncumbentBeforeReplacingIt) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.AddRecv("old", /*uuid=*/31);
+  // Network completes before any H2D is issued, leaving the receive ready to
+  // complete but unfinished.
+  ABSL_ASSERT_OK(consumer.ReceiveBlocks({0}, /*uuid=*/31));
+  TF_ASSERT_OK_AND_ASSIGN(auto incumbent, consumer.GetSession(/*uuid=*/31));
+  auto recv = std::dynamic_pointer_cast<TransferReceiveSession>(incumbent);
+  ASSERT_NE(recv, nullptr);
+  ASSERT_TRUE(recv->IsReadyToComplete());
+  ASSERT_FALSE(recv->IsDraining());
+
+  ABSL_EXPECT_OK(consumer.RegisterRecv(/*uuid=*/31, "retry",
+                                       /*expected_block_count=*/1));
+  EXPECT_TRUE(recv->Done());
+  TF_ASSERT_OK_AND_ASSIGN(auto replacement, consumer.GetSession(/*uuid=*/31));
+  EXPECT_NE(replacement, incumbent);
+  EXPECT_TRUE(consumer.has_recv(31));
+  EXPECT_EQ(consumer.free_slots(), kSlots);
+
+  CompleteReadResult completions = consumer.CompleteReadWithDetails();
+  EXPECT_THAT(completions.received, ElementsAre("old"));
+  EXPECT_THAT(completions.failed, IsEmpty());
+  EXPECT_TRUE(consumer.has_recv(31));
+}
+
 TEST(RecvDrainTest, FailedLayerWaitsForOtherH2dCopies) {
   RecvTestManager consumer(/*num_layers=*/2);
   consumer.AddRecv("req", /*uuid=*/26);
@@ -1249,7 +1310,7 @@ TEST(RecvLifecycleTest,
   EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 2)[0], 0xA5);
 
   // 3. Host-only (MEMORY_TYPE_DRAM) active plan push (op = 6, uuid = 42,
-  //    no TransferReceiveSession in active_recv_sessions_).
+  //    TransferReceiveSession in sessions_ with tracks_completion = false).
   ::tpu_sync::rpc::StartTransferRequest dram_plan;
   dram_plan.set_uuid(42);
   dram_plan.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);

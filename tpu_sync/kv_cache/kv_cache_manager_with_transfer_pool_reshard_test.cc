@@ -86,9 +86,8 @@ class TestManager : public KVCacheManagerWithTransfer {
     std::shared_ptr<ReshardReceiveSession> session;
     {
       absl::MutexLock lock(mu_);
-      auto it = active_pool_reshard_recvs_.find(uuid);
-      if (it == active_pool_reshard_recvs_.end()) return;
-      session = it->second;
+      session = FindSessionLocked<ReshardReceiveSession>(uuid);
+      if (session == nullptr) return;
     }
     PoolReshardRecvTestPeer::FinishPoolH2d(*session, *this, pool_idx, status);
   }
@@ -102,7 +101,7 @@ class TestManager : public KVCacheManagerWithTransfer {
       return session.status();
     }
     absl::MutexLock lock(mu_);
-    active_pool_reshard_sends_[plan.uuid()] = *std::move(session);
+    sessions_[plan.uuid()] = *std::move(session);
     return absl::OkStatus();
   }
   using KVCacheManagerWithTransfer::PoolReshardRegisterRecv;

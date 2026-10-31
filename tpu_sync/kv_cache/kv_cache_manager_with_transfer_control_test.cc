@@ -58,7 +58,7 @@
 #include "tpu_sync/core/tcp_control_plane_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
-// Needed for the complete type behind send_sessions_.at(uuid)->... below.
+// Needed for the complete type behind FindSessionLocked<TransferSendSession>.
 #include "tpu_sync/kv_cache/transfer_send_session.h"  // IWYU pragma: keep
 
 namespace tpu_raiden {
@@ -136,12 +136,9 @@ class TestManager : private ScopedControlPlaneBackend,
 
   std::optional<std::string> recv_req_id(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    auto it = active_recv_sessions_.find(uuid);
-    if (it == active_recv_sessions_.end()) {
-      return std::nullopt;
-    }
-    const std::shared_ptr<TransferReceiveSession>& session = it->second;
-    if (session->Done()) {
+    std::shared_ptr<TransferReceiveSession> session =
+        FindSessionLocked<TransferReceiveSession>(uuid);
+    if (session == nullptr || session->Done()) {
       return std::nullopt;
     }
     return session->req_id();
@@ -149,24 +146,24 @@ class TestManager : private ScopedControlPlaneBackend,
 
   bool has_recv(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    auto it = active_recv_sessions_.find(uuid);
-    return it != active_recv_sessions_.end() && !it->second->Done();
+    std::shared_ptr<TransferReceiveSession> session =
+        FindSessionLocked<TransferReceiveSession>(uuid);
+    return session != nullptr && !session->Done();
   }
 
   void FailRecv(uint64_t uuid, const absl::Status& status) {
     std::shared_ptr<TransferReceiveSession> session;
     {
       absl::MutexLock lock(mu_);
-      auto it = active_recv_sessions_.find(uuid);
-      if (it == active_recv_sessions_.end()) return;
-      session = it->second;
+      session = FindSessionLocked<TransferReceiveSession>(uuid);
+      if (session == nullptr) return;
     }
     session->Finish(status);
   }
 
   void MarkPullStarted(uint64_t uuid) {
     absl::MutexLock lock(mu_);
-    send_sessions_.at(uuid)->ValidateAndBeginPull(
+    FindSessionLocked<TransferSendSession>(uuid)->ValidateAndBeginPull(
         {0}, std::chrono::steady_clock::now());
   }
 };

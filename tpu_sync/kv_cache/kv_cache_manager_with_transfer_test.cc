@@ -153,7 +153,7 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
                           raiden::RaidenBufferHandle::Acquire(buffer.get()));
   std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
       {std::move(handle)}};
-  auto engine = std::make_unique<KVCacheManagerWithTransfer>(
+  auto producer = std::make_unique<KVCacheManagerWithTransfer>(
       layer_buffers,
       /*local_port=*/std::nullopt,
       /*host_blocks_to_allocate=*/std::nullopt,
@@ -165,7 +165,19 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
       /*max_blocks=*/2,
       /*num_slots=*/2,
       /*timeout_s=*/10.0);
-  const uint64_t expected_slice_bytes = engine->base()->slice_byte_size();
+  auto consumer = std::make_unique<KVCacheManagerWithTransfer>(
+      layer_buffers,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/std::nullopt,
+      /*unsafe_skip_buffer_lock=*/true,
+      /*parallelism=*/1,
+      /*host_allocator=*/nullptr,
+      /*node_id=*/1,
+      /*local_control_port=*/0,
+      /*max_blocks=*/2,
+      /*num_slots=*/2,
+      /*timeout_s=*/10.0);
+  const uint64_t expected_slice_bytes = producer->base()->slice_byte_size();
 
   const auto pcie_labels_matcher = ElementsAre(
       HasResolvedIpLabel(telemetry::metric_labels::kHostIp),
@@ -238,28 +250,29 @@ TEST(KVCacheManagerWithTransferTest, LocalOrchestratedTransfer) {
       std::move(mock_backend));
 
   // Configure staging slots: 2 slots, max 2 blocks per slot
-  ASSERT_THAT(engine->base()->ConfigureHostStagingSlots(2, 2), IsOk());
+  ASSERT_THAT(producer->base()->ConfigureHostStagingSlots(2, 2), IsOk());
+  ASSERT_THAT(consumer->base()->ConfigureHostStagingSlots(2, 2), IsOk());
 
-  // Register Block 0 as ready for read on ourselves (producer)
+  // Register Block 0 as ready for read on producer
   uint64_t uuid = 12345;
   std::string req_id = "local_test_req";
-  engine->NotifyForRead(req_id, uuid, /*block_ids=*/{0});
+  producer->NotifyForRead(req_id, uuid, /*block_ids=*/{0});
 
-  // Get our own control port
-  int port = engine->local_control_port();
+  // Get producer's control port
+  int port = producer->local_control_port();
   ASSERT_GT(port, 0);
   std::string remote_endpoint = "127.0.0.1:" + std::to_string(port);
 
   // Start read: pull Block 0 (remote) and store it in Block 1 (local)
-  engine->StartRead(req_id, uuid, remote_endpoint,
-                    /*remote_block_ids=*/{0},
-                    /*local_block_ids=*/{1});
+  consumer->StartRead(req_id, uuid, remote_endpoint,
+                      /*remote_block_ids=*/{0},
+                      /*local_block_ids=*/{1});
 
   // Wait for transfer to complete by polling CompleteReadRaw
   bool done = false;
   for (int i = 0; i < 100; ++i) {
     auto [done_sending, done_recving, failed_recving] =
-        engine->CompleteReadRaw();
+        consumer->CompleteReadRaw();
     if (std::find(failed_recving.begin(), failed_recving.end(), req_id) !=
         failed_recving.end()) {
       FAIL() << "Transfer failed";
@@ -350,7 +363,7 @@ TEST(KVCacheManagerWithTransferTest,
   auto handle_or = raiden::RaidenBufferHandle::Acquire(buffer.get());
   std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
       {handle_or.value()}};
-  auto engine = std::make_unique<KVCacheManagerWithTransfer>(
+  auto producer = std::make_unique<KVCacheManagerWithTransfer>(
       layer_buffers,
       /*local_port=*/std::nullopt,
       /*host_blocks_to_allocate=*/6,  // Allocate 6 blocks in host
@@ -362,33 +375,46 @@ TEST(KVCacheManagerWithTransferTest,
       /*max_blocks=*/2,
       /*num_slots=*/2,
       /*timeout_s=*/10.0);
+  auto consumer = std::make_unique<KVCacheManagerWithTransfer>(
+      layer_buffers,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/6,  // Allocate 6 blocks in host
+      /*unsafe_skip_buffer_lock=*/true,
+      /*parallelism=*/1,
+      /*host_allocator=*/nullptr,
+      /*node_id=*/1,
+      /*local_control_port=*/0,
+      /*max_blocks=*/2,
+      /*num_slots=*/2,
+      /*timeout_s=*/10.0);
 
   // Configure staging slots: 2 slots, max 2 blocks per slot
-  ASSERT_THAT(engine->base()->ConfigureHostStagingSlots(2, 2), IsOk());
+  ASSERT_THAT(producer->base()->ConfigureHostStagingSlots(2, 2), IsOk());
+  ASSERT_THAT(consumer->base()->ConfigureHostStagingSlots(2, 2), IsOk());
 
-  // Register Block 0 as ready for read on ourselves (producer)
+  // Register Block 0 as ready for read on producer
   uint64_t uuid = 12346;
   std::string req_id = "local_test_custom_host_req";
-  engine->NotifyForRead(req_id, uuid, /*block_ids=*/{0});
+  producer->NotifyForRead(req_id, uuid, /*block_ids=*/{0});
 
-  // Get our own control port
-  int port = engine->local_control_port();
+  // Get producer's control port
+  int port = producer->local_control_port();
   ASSERT_GT(port, 0);
   std::string remote_endpoint = "127.0.0.1:" + std::to_string(port);
 
   // Start read: pull Remote Block 0 -> Local Device Block 1,
   // but target Local Host Block 0 as the staging/host block.
-  engine->StartRead(req_id, uuid, remote_endpoint,
-                    /*remote_block_ids=*/{0},
-                    /*local_block_ids=*/{1},
-                    /*parallelism=*/1,
-                    /*local_host_block_ids=*/std::vector<int64_t>{4});
+  consumer->StartRead(req_id, uuid, remote_endpoint,
+                      /*remote_block_ids=*/{0},
+                      /*local_block_ids=*/{1},
+                      /*parallelism=*/1,
+                      /*local_host_block_ids=*/std::vector<int64_t>{4});
 
   // Wait for transfer to complete
   bool done = false;
   for (int i = 0; i < 100; ++i) {
     auto [done_sending, done_recving, failed_recving] =
-        engine->CompleteReadRaw();
+        consumer->CompleteReadRaw();
     if (std::find(failed_recving.begin(), failed_recving.end(), req_id) !=
         failed_recving.end()) {
       FAIL() << "Transfer failed";
@@ -413,8 +439,8 @@ TEST(KVCacheManagerWithTransferTest,
   }
 
   // Verify host buffer:
-  uint8_t* host_block_4 = engine->base()->GetBlockHostPointer(0, 0, 4);
-  uint8_t* host_block_5 = engine->base()->GetBlockHostPointer(0, 0, 5);
+  uint8_t* host_block_4 = consumer->base()->GetBlockHostPointer(0, 0, 4);
+  uint8_t* host_block_5 = consumer->base()->GetBlockHostPointer(0, 0, 5);
 
   float* host_block_4_float = reinterpret_cast<float*>(host_block_4);
   float* host_block_5_float = reinterpret_cast<float*>(host_block_5);
@@ -616,7 +642,7 @@ TEST(KVCacheManagerWithTransferTest, MultiIpOrchestratedTransfer) {
   std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers = {
       {handle_or.value()}};
 
-  auto engine = std::make_unique<TestKVCacheManagerWithTransfer>(
+  auto producer = std::make_unique<TestKVCacheManagerWithTransfer>(
       layer_buffers,
       /*local_port=*/std::nullopt,
       /*host_blocks_to_allocate=*/std::nullopt,
@@ -628,28 +654,42 @@ TEST(KVCacheManagerWithTransferTest, MultiIpOrchestratedTransfer) {
       /*max_blocks=*/2,
       /*num_slots=*/2,
       /*timeout_s=*/10.0);
+  auto consumer = std::make_unique<TestKVCacheManagerWithTransfer>(
+      layer_buffers,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/std::nullopt,
+      /*unsafe_skip_buffer_lock=*/true,
+      /*parallelism=*/2,
+      /*host_allocator=*/nullptr,
+      /*node_id=*/1,
+      /*local_control_port=*/0,
+      /*max_blocks=*/2,
+      /*num_slots=*/2,
+      /*timeout_s=*/10.0);
 
-  engine->SetMockLocalIps({"127.0.0.1", "127.0.0.2"});
+  producer->SetMockLocalIps({"127.0.0.1", "127.0.0.2"});
+  consumer->SetMockLocalIps({"127.0.0.1", "127.0.0.2"});
 
-  ASSERT_THAT(engine->base()->ConfigureHostStagingSlots(2, 2), IsOk());
+  ASSERT_THAT(producer->base()->ConfigureHostStagingSlots(2, 2), IsOk());
+  ASSERT_THAT(consumer->base()->ConfigureHostStagingSlots(2, 2), IsOk());
 
   uint64_t uuid = 12347;
   std::string req_id = "multi_ip_test_req";
-  engine->NotifyForRead(req_id, uuid, /*block_ids=*/{0});
+  producer->NotifyForRead(req_id, uuid, /*block_ids=*/{0});
 
-  int port = engine->local_control_port();
+  int port = producer->local_control_port();
   ASSERT_GT(port, 0);
   std::string remote_endpoint = "127.0.0.1:" + std::to_string(port);
 
-  engine->StartRead(req_id, uuid, remote_endpoint,
-                    /*remote_block_ids=*/{0},
-                    /*local_block_ids=*/{1},
-                    /*parallelism=*/2);
+  consumer->StartRead(req_id, uuid, remote_endpoint,
+                      /*remote_block_ids=*/{0},
+                      /*local_block_ids=*/{1},
+                      /*parallelism=*/2);
 
   bool done = false;
   for (int i = 0; i < 100; ++i) {
     auto [done_sending, done_recving, failed_recving] =
-        engine->CompleteReadRaw();
+        consumer->CompleteReadRaw();
     if (std::find(failed_recving.begin(), failed_recving.end(), req_id) !=
         failed_recving.end()) {
       FAIL() << "Transfer failed";

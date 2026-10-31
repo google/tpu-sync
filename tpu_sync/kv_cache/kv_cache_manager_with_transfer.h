@@ -285,23 +285,38 @@ class KVCacheManagerWithTransfer {
       uint64_t uuid, const std::shared_ptr<TransferReceiveSession>& session)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
+  template <typename SessionT>
+  std::shared_ptr<SessionT> FindSessionLocked(uint64_t uuid) const
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+    auto it = sessions_.find(uuid);
+    if (it == sessions_.end()) {
+      return nullptr;
+    }
+    return std::dynamic_pointer_cast<SessionT>(it->second);
+  }
+
+  // If |it->second| is already Done(), records its terminal completion into
+  // |done_sending_| / |done_recving_| / |failed_recving_| /
+  // |transfer_details_|, erases |it| from |sessions_|, and returns true.
+  // Otherwise returns false. Never calls Finish(): a caller that wants a
+  // ready-to-complete session retired must finish it first.
+  bool RetireSettledSessionLocked(
+      absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>>::iterator
+          it,
+      bool* retired_push_progress = nullptr,
+      bool* retired_pool_staging = nullptr) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
   void StartControlServer();
   void StopControlServer();
   virtual void RegisterBlockReadinessCallback(
       size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
       transport::BlockTransportDelegate::HostBlockReadyCallback cb);
 
-  absl::flat_hash_map<uint64_t, std::shared_ptr<TransferReceiveSession>>
-      active_recv_sessions_ ABSL_GUARDED_BY(mu_);
-
-  absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardReceiveSession>>
-      active_pool_reshard_recvs_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>> sessions_
+      ABSL_GUARDED_BY(mu_);
 
   absl::flat_hash_set<uint64_t> pending_pool_reshard_recvs_
       ABSL_GUARDED_BY(mu_);
-
-  absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardSendSession>>
-      active_pool_reshard_sends_ ABSL_GUARDED_BY(mu_);
 
   std::chrono::steady_clock::time_point DeadlineFromNow() const;
 
@@ -321,11 +336,6 @@ class KVCacheManagerWithTransfer {
   double control_timeout_s_ = 10.0;
 
   std::unique_ptr<StagingBlockAllocator> staging_allocator_;
-  // TransferSendSession is shared across threads: created/timed-out/cleaned-up
-  // on the main thread, but accessed asynchronously in control worker threads
-  // handling pull connections.
-  absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSendSession>>
-      send_sessions_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<uint64_t> pending_acks_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<std::string> done_sending_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<std::string> done_recving_ ABSL_GUARDED_BY(mu_);

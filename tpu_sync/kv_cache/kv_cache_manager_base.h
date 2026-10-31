@@ -92,6 +92,30 @@ namespace kv_cache {
 // widely-included header does not also drag in the backend registration macro.
 struct BackendConfig;
 
+// Host DRAM memory breakdown in bytes across the four components tracked by
+// `tpu_raiden_host_memory_breakdown_bytes`:
+//   - kv_pool_bytes: bytes allocated to the primary worker's (rank 0)
+//     anonymous host DRAM staging allocation (`allocated_host_dram_bytes_`).
+//     Note: for POSIX shared-memory pools (`/dev/shm`), backing pages are
+//     accounted by Linux under `Cached`/`Shmem` rather than `AnonPages`, which
+//     may be addressed in a follow-up.
+//   - process_heap_bytes: non-KV-pool anonymous/heap memory (`AnonPages` minus
+//     `kv_pool_bytes`, clamped to >= 0).
+//   - page_cache_bytes: OS file-backed page cache (`Buffers + Cached`).
+//   - free_bytes: free host DRAM (`MemFree`).
+struct HostMemoryBreakdown {
+  uint64_t kv_pool_bytes = 0;
+  uint64_t process_heap_bytes = 0;
+  uint64_t page_cache_bytes = 0;
+  uint64_t free_bytes = 0;
+};
+
+// Parses `/proc/meminfo` text content and computes the 4-component host DRAM
+// breakdown given `kv_pool_bytes`. Returns `std::nullopt` if required fields
+// (`MemFree`, `Cached`, `AnonPages`) are missing or malformed.
+std::optional<HostMemoryBreakdown> ParseHostMemoryBreakdown(
+    absl::string_view meminfo_content, uint64_t kv_pool_bytes);
+
 struct KVCacheCopySpec {
   std::vector<int64_t> src_offsets;
   std::vector<int64_t> dst_offsets;

@@ -31,9 +31,12 @@
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/time/time.h"
+#include "absl/types/optional.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/transfer_session.h"
@@ -74,6 +77,28 @@ class StagingTestManager : public KVCacheManagerBase {
         shard.device_size = physical_size;
       }
     }
+  }
+};
+
+// Hosts a |Base| test manager behind KVCacheManagerWithTransfer so that
+// registered plans live in transfer sessions, the only place plans are
+// stored. Base-level plan calls on manager() route through its hooks.
+template <typename Base>
+class WithPlanSessions : public KVCacheManagerWithTransfer {
+ public:
+  template <typename... Args>
+  explicit WithPlanSessions(Args&&... args)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<Base>(std::forward<Args>(args)...)) {}
+
+  Base& manager() { return static_cast<Base&>(*base_); }
+
+  // Stages plans in per-transfer host blocks, as
+  // TPU_RAIDEN_DYNAMIC_HOST_STAGING=1 does.
+  void EnableDemandStaging() {
+    staging_allocator_ = CreateStagingBlockAllocator(
+        base_.get(), staging_allocator_->num_slots(),
+        staging_allocator_->max_blocks(), /*dynamic_host_staging=*/true);
   }
 };
 
@@ -126,8 +151,10 @@ PoolSpec StridedPool(const std::string& tag, size_t storage_index,
 TEST(PoolStagingTest, BoundedArenaLeasesAndAddressing) {
   constexpr int64_t kStride = 64;
   constexpr int64_t kNumBlocks = 16;
-  StagingTestManager manager(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  WithPlanSessions<StagingTestManager> manager_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  StagingTestManager& manager = manager_host.manager();
   manager.SetDeviceBacked(0, kStride * kNumBlocks);
   // 2 leases x 2 blocks per lease = 4 slots, well under the 16-block pool.
   absl::Status status =
@@ -260,8 +287,10 @@ TEST(PoolStagingTest, SmallPoolIdentitySharedStorageAndStrideMismatch) {
   ABSL_ASSERT_OK(status);
   EXPECT_FALSE(small.PoolStorageStagingBounded(0));
 
-  StagingTestManager shared(/*num_layers=*/1, /*num_shards=*/1,
-                            /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  WithPlanSessions<StagingTestManager> shared_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  StagingTestManager& shared = shared_host.manager();
   shared.SetDeviceBacked(0, kStride * 32);
   status = shared.RegisterPools(
       {StridedPool("gdn.conv", 0, /*base_offset=*/0, kStride, 32, 1),
@@ -318,9 +347,11 @@ TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer) {
   constexpr int64_t kDstBase = 128;
   constexpr int64_t kDstStride = 64;
   constexpr int64_t kDstBlocks = 8;
-  StagingTestManager receiver(/*num_layers=*/1, /*num_shards=*/1,
-                              /*slice_byte_size=*/kDstStride,
-                              /*host_blocks=*/1);
+  WithPlanSessions<StagingTestManager> receiver_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/kDstStride,
+      /*host_blocks=*/1);
+  StagingTestManager& receiver = receiver_host.manager();
   receiver.SetDeviceBacked(0, kDstBase + kDstStride * kDstBlocks);
   ABSL_ASSERT_OK(receiver.RegisterPools(
       {DensePool("fa", 0, kDstBase, kDstStride, kDstBlocks, 0)},
@@ -329,8 +360,10 @@ TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer) {
 
   constexpr int64_t kSrcStride = 32;
   constexpr int64_t kSrcBlocks = 16;
-  StagingTestManager sender(/*num_layers=*/1, /*num_shards=*/1,
-                            /*slice_byte_size=*/kSrcStride, /*host_blocks=*/1);
+  WithPlanSessions<StagingTestManager> sender_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/kSrcStride, /*host_blocks=*/1);
+  StagingTestManager& sender = sender_host.manager();
   sender.SetDeviceBacked(0, kSrcStride * kSrcBlocks);
   ABSL_ASSERT_OK(
       sender.RegisterPools({DensePool("fa", 0, 0, kSrcStride, kSrcBlocks, 0)},
@@ -430,8 +463,10 @@ TEST(PoolStagingTest, SenderRaddrMatchesReceiverPointer) {
 TEST(PoolStagingTest, SenderRaddrUsesReceiverLeaseSlot) {
   constexpr int64_t kStride = 64;
   constexpr int64_t kBlocks = 16;
-  StagingTestManager receiver(/*num_layers=*/1, /*num_shards=*/1,
-                              /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  WithPlanSessions<StagingTestManager> receiver_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  StagingTestManager& receiver = receiver_host.manager();
   receiver.SetDeviceBacked(0, kStride * kBlocks);
   ABSL_ASSERT_OK(
       receiver.RegisterPools({DensePool("fa", 0, 0, kStride, kBlocks,
@@ -442,8 +477,10 @@ TEST(PoolStagingTest, SenderRaddrUsesReceiverLeaseSlot) {
       /*uuid=*/11, /*storage_idx=*/0, std::vector<int64_t>{5, 9},
       absl::Milliseconds(50)));
 
-  StagingTestManager sender(/*num_layers=*/1, /*num_shards=*/1,
-                            /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  WithPlanSessions<StagingTestManager> sender_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+  StagingTestManager& sender = sender_host.manager();
   sender.SetDeviceBacked(0, kStride * kBlocks);
   ABSL_ASSERT_OK(sender.RegisterPools(
       {DensePool("fa", 0, 0, kStride, kBlocks, 0)}, /*staging_leases=*/0));
@@ -562,29 +599,7 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
               static_cast<size_t>(4 * kStride));
   }
 
-  // Setup hooks to lease host layer 1 for pool 3.
-  class StubPoolTransferSession : public TransferSession {
-   public:
-    bool Done() const override { return false; }
-    void Finish(const absl::Status& status) override {}
-    absl::Status GetStatus() const override { return absl::OkStatus(); }
-    absl::Status AwaitForDone() override { return absl::OkStatus(); }
-    bool IsDraining() const override { return false; }
-    absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
-      return unit % 2;
-    }
-  };
-  auto session = std::make_shared<StubPoolTransferSession>();
-  KVCacheManagerBase::TransferEventHooks hooks;
-  hooks.get_session = [session](uint64_t uuid)
-      -> absl::StatusOr<std::shared_ptr<TransferSession>> { return session; };
-  manager.SetTransferEventHooks(std::move(hooks));
-
-  // Lease blocks 2 and 4 on storage 3 under uuid 42.
-  ABSL_ASSERT_OK(
-      manager.AcquirePoolStagingLease(42, 3, {2, 4}, absl::Milliseconds(50)));
-
-  // Register receiver plan for uuid 42.
+  // Receiver plan for uuid 42.
   tpu_sync::rpc::StartTransferRequest request;
   request.set_uuid(42);
   request.set_is_sender(false);
@@ -596,7 +611,41 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
   entry->set_dst_offset_bytes(0);
   entry->set_src_offset_bytes(0);
   entry->set_size_bytes(16);
-  ABSL_ASSERT_OK(manager.RegisterActivePlan(42, request, /*is_sender=*/false));
+  absl::StatusOr<TransferPlan> plan =
+      TransferPlan::Create(request, /*is_sender=*/false, manager.num_pools(),
+                           manager.has_explicit_pools(), manager.pools());
+  ABSL_ASSERT_OK(plan);
+
+  // A session that carries the plan and leases host layer 1 for pool 3.
+  class StubPoolTransferSession : public TransferSession {
+   public:
+    explicit StubPoolTransferSession(std::shared_ptr<const TransferPlan> plan)
+        : plan_(std::move(plan)) {}
+    bool Done() const override { return false; }
+    void Finish(const absl::Status& status) override {}
+    absl::Status GetStatus() const override { return absl::OkStatus(); }
+    absl::Status AwaitForDone() override { return absl::OkStatus(); }
+    bool IsDraining() const override { return false; }
+    absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
+      return unit % 2;
+    }
+    absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+      return plan_;
+    }
+
+   private:
+    std::shared_ptr<const TransferPlan> plan_;
+  };
+  auto session = std::make_shared<StubPoolTransferSession>(
+      std::make_shared<const TransferPlan>(*std::move(plan)));
+  KVCacheManagerBase::TransferEventHooks hooks;
+  hooks.get_session = [session](uint64_t uuid)
+      -> absl::StatusOr<std::shared_ptr<TransferSession>> { return session; };
+  manager.SetTransferEventHooks(std::move(hooks));
+
+  // Lease blocks 2 and 4 on storage 3 under uuid 42.
+  ABSL_ASSERT_OK(
+      manager.AcquirePoolStagingLease(42, 3, {2, 4}, absl::Milliseconds(50)));
 
   // For pool 3, the hook returns host slot 1 (pool 3 % 2 = 1).
   // Destination block 4 was leased as the 2nd block (slot 1 within the lease
@@ -609,7 +658,6 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
   uint8_t* expected_host_base = manager.GetHostPointer(/*layer_idx=*/1, 0);
   EXPECT_EQ(chunks[0].ptr, expected_host_base + 1 * kStride);
 
-  ABSL_ASSERT_OK(manager.UnregisterActivePlan(42));
   manager.ReleasePoolStagingLeases(42);
 }
 
@@ -623,8 +671,12 @@ TEST(PoolStagingTest, GetBlockChunksLargePlanLinearScaling) {
   constexpr uint64_t kUuid = 101;
   constexpr char kPeer[] = "127.0.0.1:1";
 
-  StagingTestManager receiver(1, kNumShards, kStride, /*host_blocks=*/1);
-  StagingTestManager sender(1, kNumShards, kStride, /*host_blocks=*/1);
+  WithPlanSessions<StagingTestManager> receiver_host(1, kNumShards, kStride,
+                                                     /*host_blocks=*/1);
+  StagingTestManager& receiver = receiver_host.manager();
+  WithPlanSessions<StagingTestManager> sender_host(1, kNumShards, kStride,
+                                                   /*host_blocks=*/1);
+  StagingTestManager& sender = sender_host.manager();
   const size_t storage_bytes = kTotalPools * kStride * kMaxBlocks;
   receiver.SetDeviceBacked(0, storage_bytes);
   sender.SetDeviceBacked(0, storage_bytes);

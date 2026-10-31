@@ -46,6 +46,7 @@
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
@@ -618,10 +619,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
                                                      size_t shard_idx,
                                                      int block_id);
 
-  // Registers explicit block pools over the wrapped storages. Fails while
-  // active plans are registered. Until this is called the manager exposes one
-  // implicit pool per constructor storage (tag "opaque", base_offset 0,
-  // block_stride LayerBlockByteSize) and all legacy paths are unchanged.
+  // Registers explicit block pools over the wrapped storages. Until this is
+  // called the manager exposes one implicit pool per constructor storage (tag
+  // "opaque", base_offset 0, block_stride LayerBlockByteSize) and all legacy
+  // paths are unchanged.
   absl::Status RegisterPools(std::vector<PoolSpec> pools);
 
   // Same, with bounded host staging.
@@ -680,6 +681,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   const PoolSpec* pool(size_t pool_idx) const;
 
+  absl::Span<const PoolSpec> pools() const;
+
   size_t num_pools() const;
 
   bool has_explicit_pools() const;
@@ -721,45 +724,22 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // shard push schedule, each keyed by the sender node id that pushes it.
   std::optional<size_t> ExpectedPushSenders(uint64_t uuid) const override;
 
+  // Registers / unregisters an active transfer plan. Plans are owned by
+  // transfer sessions, so these require KVCacheManagerWithTransfer's hooks and
+  // fail with kFailedPrecondition on a standalone manager.
   virtual absl::Status RegisterActivePlan(
       uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
       bool is_sender);
-  absl::Status RegisterActivePlanDirect(
-      uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
-      bool is_sender);
-  // Same, with the plan's device blocks staged in explicitly chosen host
-  // blocks instead of at their own ids: `host_block_of` maps each device
-  // block id the plan names on this side to the host block staging it.
-  // `generation` identifies this registration among transfers that reuse
-  // the same uuid (e.g. a retry); see RegisteredPlan::generation.
-  absl::Status RegisterActivePlan(
-      uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
-      bool is_sender,
-      absl::flat_hash_map<DeviceBlockId, HostBlockId> host_block_of,
-      uint64_t generation = 0);
-
   virtual absl::Status UnregisterActivePlan(uint64_t uuid);
-  absl::Status UnregisterActivePlanDirect(uint64_t uuid);
 
-  // Whether a transfer plan is currently registered under `uuid`.
-  bool HasActivePlan(uint64_t uuid) const {
-    absl::MutexLock l(plans_mu_);
-    return active_plans_.contains(uuid);
-  }
+  // Whether an active session under `uuid` carries a transfer plan.
+  bool HasActivePlan(uint64_t uuid) const;
 
   // Peer host addresses, one per layer, for plan-less pushes under `uuid`.
   void SetRemoteLayerAddrs(
       uint64_t uuid,
       std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs);
   void ClearRemoteLayerAddrs(uint64_t uuid);
-
-  // The generation of the plan registered under `uuid`, if any.
-  std::optional<uint64_t> ActivePlanGeneration(uint64_t uuid) const {
-    absl::MutexLock l(plans_mu_);
-    auto it = active_plans_.find(uuid);
-    if (it == active_plans_.end()) return std::nullopt;
-    return it->second->generation;
-  }
 
   // Host blocks staging `block_ids` under plan `uuid`: the ids themselves
   // when the plan stages blocks at their own ids, otherwise the blocks the
@@ -1038,39 +1018,10 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   HostBufferAllocator host_allocator_ = nullptr;
 
-  mutable absl::Mutex plans_mu_;
-  struct RegisteredPlan {
-    using EntryList = std::vector<const ::tpu_sync::rpc::ShardPushEntryProto*>;
-    using BlockEntryMap = absl::flat_hash_map<int64_t, EntryList>;
+  absl::StatusOr<std::shared_ptr<const TransferPlan>> GetTransferPlan(
+      uint64_t uuid) const;
 
-    ::tpu_sync::rpc::StartTransferRequest request;
-    bool is_sender = false;
-    // Host block holding each device block the plan names on this side
-    // (src blocks for a sender, dst blocks for a receiver). Empty means the
-    // host mirror is addressed by device block id.
-    absl::flat_hash_map<DeviceBlockId, HostBlockId> host_block_of;
-    // Device blocks the plan's schedules name on this side; the set
-    // PlanHostBlocks() answers for.
-    absl::flat_hash_set<int64_t> staged_device_blocks;
-    // Extension of the uuid for when the same uuid names more than one
-    // transfer over time (e.g. a retry of the same transfer): each
-    // registration gets its own generation, so cleanup queued for an old
-    // registration cannot touch a newer one under the same uuid. 0 when
-    // the caller keeps no generations; cleanup then matches by uuid alone.
-    uint64_t generation = 0;
-    // Per-source-shard schedule entries indexed by src_block_id (sender) or
-    // dst_block_id (receiver). Pointers alias `request.shard_push_schedules()`.
-    absl::flat_hash_map<int32_t, BlockEntryMap> schedule_by_block;
-  };
-  // Plans are stored behind shared_ptr so the per-push readers
-  // (GetBlockChunks / GetPoolPushProgressSpec) snapshot with a refcount bump
-  // instead of deep-copying the schedule proto under plans_mu_: a pool-reshard
-  // receiver's plan carries one schedule entry per (pool, rank, page range)
-  // and the copy dominated per-push latency. Unregister drops the map entry
-  // while in-flight readers keep their snapshot alive, which preserves the
-  // previous copy semantics exactly.
-  absl::flat_hash_map<uint64_t, std::shared_ptr<const RegisteredPlan>>
-      active_plans_ ABSL_GUARDED_BY(plans_mu_);
+  mutable absl::Mutex plans_mu_;
 
   absl::flat_hash_map<
       uint64_t,

@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,10 +29,13 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/optional.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
 
 namespace tpu_sync {
@@ -55,12 +59,9 @@ class ReshardReceiveSession
     : public TransferSession,
       public std::enable_shared_from_this<ReshardReceiveSession> {
  public:
-  // Creates and initializes a consumer pool-reshard receive session for |plan|.
-  // Claims |plan.uuid()| in |base|'s active plans (ALREADY_EXISTS if it is
-  // taken) and only then acquires bounded pool staging leases per storage via
-  // |staging_allocator|; a lease failure releases the claim again. Callers
-  // must not register the plan themselves. The claim is dropped by
-  // UnregisterActivePlan / UnregisterSettledPlan, not by this object.
+  // Creates and initializes a consumer pool-reshard receive session for |plan|
+  // and acquires bounded pool staging leases per storage via
+  // |staging_allocator|.
   static absl::StatusOr<std::shared_ptr<ReshardReceiveSession>> Create(
       kv_cache::KVCacheManagerBase* base,
       StagingBlockAllocator* absl_nullable staging_allocator,
@@ -109,10 +110,6 @@ class ReshardReceiveSession
   }
   void EndRecvOp();
 
-  // Atomically claims any pending settle-unregister request and writes its
-  // plan generation (0 for pool-reshard plans) to |generation|.
-  bool TakePendingUnregister(uint64_t* generation);
-
   // Returns true if network/pool transfer is complete and all H2D futures are
   // ready.
   bool IsReadyToComplete() const;
@@ -130,6 +127,13 @@ class ReshardReceiveSession
     return AcquireStagingSlot(pool_idx);
   }
 
+  absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+    if (transfer_plan_ == nullptr || Done()) {
+      return absl::nullopt;
+    }
+    return transfer_plan_;
+  }
+
  private:
   friend struct PoolReshardRecvTestPeer;
   friend struct ReshardReceiveSessionTestPeer;
@@ -144,6 +148,7 @@ class ReshardReceiveSession
 
   ReshardReceiveSession(kv_cache::KVCacheManagerBase* base,
                         StagingBlockAllocator* staging_allocator, uint64_t uuid,
+                        TransferPlan transfer_plan,
                         const ::tpu_sync::rpc::StartTransferRequest& plan,
                         absl::Span<const int64_t> chip_blocks,
                         std::chrono::steady_clock::time_point deadline);
@@ -187,6 +192,7 @@ class ReshardReceiveSession
   const int32_t sub_plan_count_ = 0;
   const std::chrono::steady_clock::time_point deadline_;
   const std::chrono::steady_clock::time_point start_time_;
+  const std::shared_ptr<const TransferPlan> transfer_plan_;
   std::vector<int64_t> chip_block_ids_ ABSL_GUARDED_BY(mu_);
   bool staging_released_ ABSL_GUARDED_BY(mu_) = true;
   bool network_completed_ ABSL_GUARDED_BY(mu_) = false;
@@ -195,7 +201,6 @@ class ReshardReceiveSession
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   bool reshard_finalizing_ ABSL_GUARDED_BY(mu_) = false;
-  bool unregister_on_settle_ ABSL_GUARDED_BY(mu_) = true;
   std::vector<raiden::PjRtCopyFuture> h2d_futures_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<size_t> expected_pool_indices_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<size_t> started_pool_indices_ ABSL_GUARDED_BY(mu_);

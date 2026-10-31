@@ -281,14 +281,6 @@ class KVCacheManagerWithTransfer {
   void AckSend(uint64_t uuid);
   void ConfigureDataPortFromKvTransfer();
 
-  // Serializes plan registration and unregistration, so a plan is never
-  // published without its staging owner or torn down against a half-built
-  // registration.
-  absl::Mutex plan_lifecycle_mu_;
-  // Source of plan generations: the uuid names a transfer, a generation
-  // names one registration of it (the same uuid may come back, e.g. on a
-  // retry of the same transfer).
-  uint64_t plan_generation_counter_ ABSL_GUARDED_BY(plan_lifecycle_mu_) = 0;
   absl::Status EmplaceRecvSessionLocked(
       uint64_t uuid, const std::shared_ptr<TransferReceiveSession>& session)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -304,6 +296,9 @@ class KVCacheManagerWithTransfer {
 
   absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardReceiveSession>>
       active_pool_reshard_recvs_ ABSL_GUARDED_BY(mu_);
+
+  absl::flat_hash_set<uint64_t> pending_pool_reshard_recvs_
+      ABSL_GUARDED_BY(mu_);
 
   absl::flat_hash_map<uint64_t, std::shared_ptr<ReshardSendSession>>
       active_pool_reshard_sends_ ABSL_GUARDED_BY(mu_);
@@ -393,15 +388,6 @@ class KVCacheManagerWithTransfer {
 
   void InitializeBaseHooks();
   void InitializeControlPlane();
-  // Drops the plan of a receive that has settled; a plan already gone, or
-  // a newer registration reusing the uuid, is left alone.
-  void UnregisterSettledPlan(uint64_t uuid, uint64_t generation);
-  void MaybeUnregisterSettledRecv(uint64_t uuid,
-                                  TransferReceiveSession& session);
-  // Drops the plan of a pool-reshard receive that has settled (its H2D
-  // uploads and every push it admitted have ended); a no-op before then.
-  void MaybeUnregisterSettledReshardRecv(uint64_t uuid,
-                                         ReshardReceiveSession& session);
   absl::StatusOr<PullStreamResponseSpec> HandlePullStream(
       const PullStreamRequestSpec& req, absl::string_view fallback_peer_ip);
   absl::Status HandleAck(uint64_t uuid);

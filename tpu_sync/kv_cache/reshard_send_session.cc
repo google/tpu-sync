@@ -47,6 +47,7 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
 
@@ -141,23 +142,26 @@ absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
   }
 
   base->InitTransportServer();
-  ABSL_RETURN_IF_ERROR(
-      base->RegisterActivePlanDirect(plan.uuid(), plan, /*is_sender=*/true));
+  ABSL_ASSIGN_OR_RETURN(
+      TransferPlan transfer_plan,
+      TransferPlan::Create(plan, /*is_sender=*/true, base->num_pools(),
+                           base->has_explicit_pools(), base->pools()));
 
   std::string req_id = plan.req_id();
   const uint64_t uuid = plan.uuid();
-  return std::shared_ptr<ReshardSendSession>(new ReshardSendSession(
+  auto session = std::shared_ptr<ReshardSendSession>(new ReshardSendSession(
       base, staging_allocator, std::move(req_id), uuid, parallelism,
-      remaining_pool_peer_pushes, deadline, std::move(plan),
-      std::vector<std::string>(peers.begin(), peers.end()),
+      remaining_pool_peer_pushes, deadline, std::move(transfer_plan),
+      std::move(plan), std::vector<std::string>(peers.begin(), peers.end()),
       data_connection_reuse));
+  return session;
 }
 
 ReshardSendSession::ReshardSendSession(
     kv_cache::KVCacheManagerBase* base,
     StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
     int parallelism, int remaining_pool_peer_pushes,
-    std::chrono::steady_clock::time_point deadline,
+    std::chrono::steady_clock::time_point deadline, TransferPlan transfer_plan,
     ::tpu_sync::rpc::StartTransferRequest plan,
     std::vector<std::string> dst_peers,
     DataConnectionReuse data_connection_reuse)
@@ -170,6 +174,8 @@ ReshardSendSession::ReshardSendSession(
       plan_(std::move(plan)),
       dst_peers_(std::move(dst_peers)),
       data_connection_reuse_(data_connection_reuse),
+      transfer_plan_(
+          std::make_shared<const TransferPlan>(std::move(transfer_plan))),
       remaining_pool_peer_pushes_(remaining_pool_peer_pushes),
       staging_layer_manager_(base != nullptr ? base->num_host_layers() : 0) {}
 
@@ -504,57 +510,34 @@ void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
 
 void ReshardSendSession::RecordPushCompletion(
     KVCacheManagerWithTransfer& manager, const absl::Status& status) {
+  (void)manager;
   RAIDEN_TRACE_FN("KVTransfer::FinishPoolReshardSend", [&]() {
     return absl::StrCat("uuid=", uuid_, " status=", status.code());
   });
-  bool should_unregister = false;
-  {
-    absl::MutexLock lock(mu_);
-    if (done_ || finalizing_) return;
-    if (!status.ok()) {
-      LOG(ERROR) << "Pool reshard send failed uuid=" << uuid_
-                 << " req_id=" << req_id_ << ": " << status;
-      if (status_.ok()) {
-        status_ = status;
-      }
-      finalizing_ = true;
-      cancelled_.store(true, std::memory_order_relaxed);
-      staging_layer_manager_.Shutdown();
-      should_unregister = !plan_unregistered_;
-    } else if (--remaining_pool_peer_pushes_ == 0) {
-      finalizing_ = true;
-      cancelled_.store(true, std::memory_order_relaxed);
-      staging_layer_manager_.Shutdown();
-      should_unregister = !plan_unregistered_;
-    }
-    if (should_unregister) plan_unregistered_ = true;
-  }
-  if (!should_unregister) {
-    return;
-  }
-  // All callers of RecordPushCompletion hold an active in_flight_ count and
-  // invoke EndOp() after RecordPushCompletion returns, so |this| remains live
-  // while UnregisterActivePlan runs outside |mu_|.
-  if (manager.IsShuttingDown()) {
-    return;
-  }
-  absl::Status unregister = manager.UnregisterActivePlan(uuid_);
-  if (!unregister.ok() && !absl::IsNotFound(unregister)) {
-    LOG(ERROR) << "Failed to unregister pool reshard sender plan " << uuid_
-               << ": " << unregister;
-    absl::MutexLock lock(mu_);
+  absl::MutexLock lock(mu_);
+  if (done_ || finalizing_) return;
+  if (!status.ok()) {
+    LOG(ERROR) << "Pool reshard send failed uuid=" << uuid_
+               << " req_id=" << req_id_ << ": " << status;
     if (status_.ok()) {
-      status_ = unregister;
+      status_ = status;
     }
+    finalizing_ = true;
+    cancelled_.store(true, std::memory_order_relaxed);
+    staging_layer_manager_.Shutdown();
+  } else if (--remaining_pool_peer_pushes_ == 0) {
+    finalizing_ = true;
+    cancelled_.store(true, std::memory_order_relaxed);
+    staging_layer_manager_.Shutdown();
   }
 }
 
 void ReshardSendSession::Finish(const absl::Status& status) {
   absl::MutexLock lock(mu_);
+  if (done_ || finalizing_) return;
   if (!status.ok() && status_.ok()) {
     status_ = status;
   }
-  if (done_ || finalizing_) return;
   finalizing_ = true;
   cancelled_.store(true, std::memory_order_relaxed);
   staging_layer_manager_.Shutdown();
@@ -576,30 +559,8 @@ absl::Status ReshardSendSession::AwaitForDone() {
 }
 
 void ReshardSendSession::EndOp() {
-  // A send that was finished from outside (deadline sweep or cancellation)
-  // while its pushes ran never reached RecordPushCompletion's unregister:
-  // drop the plan here, on the last push's completion, rather than leaving
-  // it to the next poll's sweep. The plan is dropped before this op is
-  // counted out, so the session cannot settle -- and its manager cannot be
-  // torn down -- while the unregister runs.
-  KVCacheManagerWithTransfer* settle_manager = nullptr;
-  {
-    absl::MutexLock lock(mu_);
-    if (in_flight_ == 1 && finalizing_ && !done_ && !plan_unregistered_ &&
-        manager_ != nullptr && !manager_->IsShuttingDown()) {
-      plan_unregistered_ = true;
-      settle_manager = manager_;
-    }
-  }
-  if (settle_manager != nullptr) {
-    absl::Status unregister = settle_manager->UnregisterActivePlan(uuid_);
-    if (!unregister.ok() && !absl::IsNotFound(unregister)) {
-      LOG(ERROR) << "Failed to unregister pool reshard sender plan " << uuid_
-                 << " on settle: " << unregister;
-    }
-  }
-  // Likewise, under kPerTransfer the last op closes the idle data connections
-  // to |dst_peers_| before it is counted out: every push has returned its
+  // Under kPerTransfer the last op closes the idle data connections to
+  // |dst_peers_| before it is counted out: every push has returned its
   // socket by now, and ~KVCacheManagerWithTransfer is still parked in
   // AwaitForDone(), so the manager, |base_| and its transport are alive.
   // transport_server() cannot contend on server_init_mu_ either: every

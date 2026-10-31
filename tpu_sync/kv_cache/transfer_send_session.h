@@ -32,12 +32,14 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/optional.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/data_connection_policy.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
@@ -67,14 +69,12 @@ class TransferSendSession
       std::chrono::steady_clock::time_point register_start);
 
   // Creates a send session for a block-addressed resharding plan, acquiring
-  // dynamic host staging when enabled and populating |*host_block_of|.
+  // dynamic host staging when enabled.
   static absl::StatusOr<std::shared_ptr<TransferSendSession>>
-  CreateFromActivePlan(
-      kv_cache::KVCacheManagerBase* base,
-      StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-      const ::tpu_sync::rpc::StartTransferRequest& request,
-      absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
-          host_block_of);
+  CreateFromActivePlan(kv_cache::KVCacheManagerBase* base,
+                       StagingBlockAllocator* absl_nullable staging_allocator,
+                       uint64_t uuid,
+                       const ::tpu_sync::rpc::StartTransferRequest& request);
 
   ~TransferSendSession() override { ReleaseStagingBlocks(); }
 
@@ -99,6 +99,13 @@ class TransferSendSession
   bool IsDraining() const override {
     absl::MutexLock lock(mu_);
     return draining_;
+  }
+
+  absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+    if (transfer_plan_ == nullptr || Done()) {
+      return absl::nullopt;
+    }
+    return transfer_plan_;
   }
 
   bool HasStaging() const {
@@ -187,7 +194,8 @@ class TransferSendSession
                       std::string req_id, uint64_t uuid,
                       std::chrono::steady_clock::time_point deadline,
                       std::chrono::steady_clock::time_point register_start,
-                      DataConnectionReuse data_connection_reuse);
+                      DataConnectionReuse data_connection_reuse,
+                      std::shared_ptr<const TransferPlan> plan = nullptr);
 
   // Describes a block ID that appears more than once in a single registration,
   // along with the indices of its first two occurrences.
@@ -230,6 +238,7 @@ class TransferSendSession
   const std::chrono::steady_clock::time_point register_start_;
   // TPU_RAIDEN_DATA_CONN_REUSE as resolved when the session was created.
   const DataConnectionReuse data_connection_reuse_;
+  const std::shared_ptr<const TransferPlan> transfer_plan_;
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
   int64_t num_blocks_ ABSL_GUARDED_BY(mu_) = 0;
   int64_t registered_num_blocks_ ABSL_GUARDED_BY(mu_) = 0;

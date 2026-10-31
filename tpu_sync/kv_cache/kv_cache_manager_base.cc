@@ -51,6 +51,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "absl/types/optional.h"
 #include "absl/types/span.h"
 #include "xla/future.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -69,6 +70,7 @@
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -110,43 +112,6 @@ absl::Status ValidateOffsetsAndSizes(const std::vector<int64_t>& src_offsets,
     }
   }
   return absl::OkStatus();
-}
-
-const ::tpu_sync::rpc::PoolHostAddrsProto* FindReceiverAddrs(
-    const ::tpu_sync::rpc::StartTransferRequest& request,
-    absl::string_view peer, int32_t idx) {
-  if (peer.empty()) return nullptr;
-  auto receiver_it = request.receiver_addrs().find(std::string(peer));
-  if (receiver_it == request.receiver_addrs().end()) return nullptr;
-  const auto& pools = receiver_it->second.pools();
-  auto pool_it = pools.find(idx);
-  if (pool_it == pools.end() || pool_it->second.host_base_addrs().empty()) {
-    return nullptr;
-  }
-  return &pool_it->second;
-}
-
-// Returns the receiver's host addresses for the sender's local pool
-// `pool_idx`, or nullptr if the sender cannot compute remote addresses.
-const ::tpu_sync::rpc::PoolHostAddrsProto* GetReceiverPoolAddrs(
-    const ::tpu_sync::rpc::StartTransferRequest& request,
-    absl::string_view peer, size_t pool_idx) {
-  if (request.pool_groups_size() == 0) return nullptr;
-  int32_t wire_pool_idx = static_cast<int32_t>(pool_idx);
-  if (auto wire_it = request.wire_pool_indices().find(wire_pool_idx);
-      wire_it != request.wire_pool_indices().end()) {
-    wire_pool_idx = wire_it->second;
-  }
-  return FindReceiverAddrs(request, peer, wire_pool_idx);
-}
-
-// Returns the receiver's host addresses for layer `layer_idx` of a planned
-// transfer.
-const ::tpu_sync::rpc::PoolHostAddrsProto* GetReceiverLayerAddrs(
-    const ::tpu_sync::rpc::StartTransferRequest& request,
-    absl::string_view peer, size_t layer_idx) {
-  if (request.pool_groups_size() > 0) return nullptr;
-  return FindReceiverAddrs(request, peer, static_cast<int32_t>(layer_idx));
 }
 
 // Returns the chunk's address in the receiver's host memory, or nullptr if
@@ -2316,13 +2281,6 @@ absl::Status KVCacheManagerBase::RegisterPools(std::vector<PoolSpec> pools,
   if (staging_leases < 0) {
     return absl::InvalidArgumentError("staging_leases must be >= 0");
   }
-  {
-    absl::MutexLock l(plans_mu_);
-    if (!active_plans_.empty()) {
-      return absl::FailedPreconditionError(
-          "pools cannot be changed while active plans are registered");
-    }
-  }
   for (size_t pool_idx = 0; pool_idx < pools.size(); ++pool_idx) {
     const PoolSpec& pool = pools[pool_idx];
     if (pool.storage_index >= num_layers_) {
@@ -2487,11 +2445,11 @@ std::vector<::tpu_sync::rpc::PoolHostAddrsProto>
 KVCacheManagerBase::LayerHostAddrs(uint64_t uuid) const {
   if (explicit_pools_ || layers_.size() < num_layers_) return {};
   absl::flat_hash_map<DeviceBlockId, HostBlockId> host_block_of;
-  {
-    absl::MutexLock l(plans_mu_);
-    auto it = active_plans_.find(uuid);
-    if (it != active_plans_.end()) {
-      host_block_of = it->second->host_block_of;
+  if (uuid != 0) {
+    absl::StatusOr<std::shared_ptr<const TransferPlan>> plan =
+        GetTransferPlan(uuid);
+    if (plan.ok() && (*plan)->host_block_of() != nullptr) {
+      host_block_of = *(*plan)->host_block_of();
     }
   }
   std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs;
@@ -2521,6 +2479,11 @@ const PoolSpec* KVCacheManagerBase::pool(size_t pool_idx) const {
     return nullptr;
   }
   return &pools_[pool_idx];
+}
+
+absl::Span<const PoolSpec> KVCacheManagerBase::pools() const {
+  EnsureImplicitPools();
+  return pools_;
 }
 
 size_t KVCacheManagerBase::num_pools() const {
@@ -2703,8 +2666,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dPoolBlocks(
 
 bool KVCacheManagerBase::AcceptsPlanlessExplicitPush(uint64_t uuid) const {
   if (!explicit_pools_) return true;
-  absl::MutexLock l(plans_mu_);
-  return active_plans_.contains(uuid);
+  return HasActivePlan(uuid);
 }
 
 absl::Status KVCacheManagerBase::BeginIncomingPush(uint64_t uuid) {
@@ -2734,73 +2696,43 @@ absl::Status KVCacheManagerBase::OnRecvNetworkComplete(uint64_t uuid) {
 
 absl::StatusOr<std::shared_ptr<TransferSession>> KVCacheManagerBase::GetSession(
     uint64_t uuid) const {
-  return transfer_hooks_.get_session ? transfer_hooks_.get_session(uuid)
-                                     : absl::NotFoundError(absl::StrCat(
-                                           "Session ", uuid, " not found"));
+  if (transfer_hooks_.get_session) {
+    return transfer_hooks_.get_session(uuid);
+  }
+  return absl::NotFoundError(absl::StrCat("Session ", uuid, " not found"));
+}
+
+absl::StatusOr<std::shared_ptr<const TransferPlan>>
+KVCacheManagerBase::GetTransferPlan(uint64_t uuid) const {
+  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> session,
+                        GetSession(uuid));
+  absl::optional<std::shared_ptr<const TransferPlan>> plan = session->plan();
+  if (!plan.has_value()) {
+    return absl::NotFoundError(
+        absl::StrCat("no active transfer plan with uuid ", uuid));
+  }
+  return *std::move(plan);
 }
 
 absl::StatusOr<std::optional<tpu_raiden::transport::PoolPushProgressSpec>>
 KVCacheManagerBase::GetPoolPushProgressSpec(size_t pool_idx,
                                             uint64_t uuid) const {
-  std::shared_ptr<const RegisteredPlan> plan_snapshot;
-  {
-    absl::MutexLock l(plans_mu_);
-    auto it = active_plans_.find(uuid);
-    if (it != active_plans_.end()) {
-      plan_snapshot = it->second;
-    }
-  }
-  if (plan_snapshot == nullptr ||
-      plan_snapshot->request.pool_groups_size() == 0) {
+  absl::StatusOr<std::shared_ptr<const TransferPlan>> plan =
+      GetTransferPlan(uuid);
+  if (!plan.ok()) {
     return std::nullopt;
   }
-
-  const auto& request = plan_snapshot->request;
-  bool pool_is_transferred = false;
-  for (int32_t transferred_pool_idx : request.transfer_pool_indices()) {
-    if (transferred_pool_idx >= 0 &&
-        static_cast<size_t>(transferred_pool_idx) == pool_idx) {
-      pool_is_transferred = true;
-      break;
-    }
-  }
-  if (!pool_is_transferred) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "pool ", pool_idx, " is not in the active plan's transfer set"));
-  }
-
-  for (const auto& group : request.pool_groups()) {
-    const auto& indices = group.pool_indices();
-    if (std::find(indices.begin(), indices.end(),
-                  static_cast<int32_t>(pool_idx)) != indices.end()) {
-      return tpu_raiden::transport::PoolPushProgressSpec{
-          .expected_pushes = static_cast<size_t>(group.expected_pushes()),
-          .expected_pools =
-              static_cast<size_t>(request.transfer_pool_indices_size()),
-      };
-    }
-  }
-  return absl::InvalidArgumentError(absl::StrCat(
-      "pool ", pool_idx, " is not in any of the plan's pool groups"));
+  return (*plan)->GetPoolPushProgressSpec(pool_idx);
 }
 
 std::optional<size_t> KVCacheManagerBase::ExpectedPushSenders(
     uint64_t uuid) const {
-  std::shared_ptr<const RegisteredPlan> plan_snapshot;
-  {
-    absl::MutexLock l(plans_mu_);
-    auto it = active_plans_.find(uuid);
-    if (it != active_plans_.end()) {
-      plan_snapshot = it->second;
-    }
-  }
-  if (plan_snapshot == nullptr || plan_snapshot->is_sender ||
-      plan_snapshot->request.pool_groups_size() > 0 ||
-      plan_snapshot->request.shard_push_schedules_size() == 0) {
+  absl::StatusOr<std::shared_ptr<const TransferPlan>> plan =
+      GetTransferPlan(uuid);
+  if (!plan.ok()) {
     return std::nullopt;
   }
-  return static_cast<size_t>(
-      plan_snapshot->request.shard_push_schedules_size());
+  return (*plan)->ExpectedPushSenders();
 }
 
 absl::StatusOr<std::vector<raiden::PjRtCopyFuture>>
@@ -3045,181 +2977,37 @@ void KVCacheManagerBase::ScheduleAsyncTask(std::function<void()> task) {
   std::thread(std::move(task)).detach();
 }
 
+bool KVCacheManagerBase::HasActivePlan(uint64_t uuid) const {
+  return GetTransferPlan(uuid).ok();
+}
+
 absl::Status KVCacheManagerBase::RegisterActivePlan(
     uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
     bool is_sender) {
   if (transfer_hooks_.register_active_plan) {
     return transfer_hooks_.register_active_plan(uuid, request, is_sender);
   }
-  return RegisterActivePlanDirect(uuid, request, is_sender);
-}
-
-absl::Status KVCacheManagerBase::RegisterActivePlanDirect(
-    uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
-    bool is_sender) {
-  return RegisterActivePlan(uuid, request, is_sender, {});
+  return absl::FailedPreconditionError(
+      "RegisterActivePlan requires KVCacheManagerWithTransfer");
 }
 
 absl::StatusOr<std::vector<HostBlockId>> KVCacheManagerBase::PlanHostBlocks(
     uint64_t uuid, const std::vector<DeviceBlockId>& block_ids) const {
-  std::shared_ptr<const RegisteredPlan> plan;
-  {
-    absl::MutexLock l(plans_mu_);
-    auto it = active_plans_.find(uuid);
-    if (it != active_plans_.end()) plan = it->second;
-  }
-  if (plan == nullptr) {
+  absl::StatusOr<std::shared_ptr<const TransferPlan>> plan =
+      GetTransferPlan(uuid);
+  if (!plan.ok()) {
     return absl::NotFoundError(
         absl::StrCat("no active transfer plan with uuid ", uuid));
   }
-  if (plan->request.pool_groups_size() > 0) {
-    return absl::FailedPreconditionError(absl::StrCat(
-        "transfer plan ", uuid, " is pool-addressed; its bytes are staged at "
-        "pool offsets, not per-block host blocks"));
-  }
-  std::vector<int64_t> out;
-  out.reserve(block_ids.size());
-  for (int64_t id : block_ids) {
-    if (!plan->staged_device_blocks.contains(id)) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "block ", id, " is not staged by transfer plan ", uuid));
-    }
-    if (plan->host_block_of.empty()) {
-      out.push_back(id);
-      continue;
-    }
-    auto it = plan->host_block_of.find(id);
-    if (it == plan->host_block_of.end()) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "block ", id, " is not staged by transfer plan ", uuid));
-    }
-    out.push_back(it->second);
-  }
-  return out;
-}
-
-absl::Status KVCacheManagerBase::RegisterActivePlan(
-    uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
-    bool is_sender,
-    absl::flat_hash_map<DeviceBlockId, HostBlockId> host_block_of,
-    uint64_t generation) {
-  // Structural contract for pool-addressed plans. Pool selection is request
-  // data resolved by the controller; raiden validates consistency (indices
-  // resolve against this manager's pool table, explicit or implicit) and
-  // never tag policy.
-  const bool has_transfer_pools = request.transfer_pool_indices_size() > 0;
-  if (has_transfer_pools != (request.pool_groups_size() > 0)) {
-    return absl::InvalidArgumentError(
-        "pool-addressed plans must declare pool_groups partitioning their "
-        "transfer_pool_indices");
-  }
-  if (has_transfer_pools) {
-    for (const auto& group : request.pool_groups()) {
-      if (group.expected_pushes() <= 0) {
-        return absl::InvalidArgumentError(
-            "every pool group must expect a positive push count");
-      }
-    }
-    if (request.req_id().empty()) {
-      return absl::InvalidArgumentError(
-          "pool-keyed transfer plans require a non-empty req_id");
-    }
-    const size_t pool_count = num_pools();
-    std::set<int32_t> seen_pool_indices;
-    for (int32_t pool_idx : request.transfer_pool_indices()) {
-      if (pool_idx < 0 || static_cast<size_t>(pool_idx) >= pool_count) {
-        return absl::InvalidArgumentError(
-            absl::StrCat("transfer pool index ", pool_idx,
-                         " out of range: ", pool_count, " registered pools"));
-      }
-      if (!seen_pool_indices.insert(pool_idx).second) {
-        return absl::InvalidArgumentError(
-            absl::StrCat("duplicate transfer pool index ", pool_idx));
-      }
-    }
-  }
-  // When the sender declares per-pool dtype tags, they must match the local
-  // pool table (both peers must agree on canonical pool order and dtypes).
-  if (request.pool_dtype_tags_size() > 0 && explicit_pools_) {
-    if (static_cast<size_t>(request.pool_dtype_tags_size()) != pools_.size()) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "plan pool_dtype_tags count ", request.pool_dtype_tags_size(),
-          " does not match local pool count ", pools_.size()));
-    }
-    for (size_t pool_idx = 0; pool_idx < pools_.size(); ++pool_idx) {
-      if (request.pool_dtype_tags(pool_idx) != pools_[pool_idx].dtype_tag) {
-        std::string local_pools;
-        for (size_t i = 0; i < pools_.size(); ++i) {
-          absl::StrAppend(&local_pools, i ? "," : "", pools_[i].tag, ":",
-                          pools_[i].dtype_tag);
-        }
-        return absl::InvalidArgumentError(absl::StrCat(
-            "plan dtype tag mismatch for pool ", pool_idx, " (",
-            pools_[pool_idx].tag, "): plan=", request.pool_dtype_tags(pool_idx),
-            " local=", pools_[pool_idx].dtype_tag, "; plan dtype tags=[",
-            absl::StrJoin(request.pool_dtype_tags(), ","), "] local pools=[",
-            local_pools, "]"));
-      }
-    }
-  }
-  absl::flat_hash_set<int64_t> staged_device_blocks;
-  if (request.pool_groups_size() == 0) {
-    for (const auto& [src_shard, schedule] : request.shard_push_schedules()) {
-      for (const auto& entry : schedule.entries()) {
-        staged_device_blocks.insert(is_sender ? entry.src_block_id()
-                                              : entry.dst_block_id());
-      }
-    }
-  }
-  auto plan_ptr = std::make_shared<RegisteredPlan>(
-      RegisteredPlan{request, is_sender, std::move(host_block_of),
-                     std::move(staged_device_blocks), generation});
-  for (const auto& [src_shard, schedule] :
-       plan_ptr->request.shard_push_schedules()) {
-    auto& block_map = plan_ptr->schedule_by_block[src_shard];
-    for (const auto& entry : schedule.entries()) {
-      block_map[is_sender ? entry.src_block_id() : entry.dst_block_id()]
-          .push_back(&entry);
-    }
-  }
-  absl::MutexLock l(plans_mu_);
-  if (auto [it, inserted] =
-          active_plans_.try_emplace(uuid, std::move(plan_ptr));
-      !inserted) {
-    return absl::AlreadyExistsError(
-        absl::StrCat("Plan with UUID ", uuid, " is already registered!"));
-  }
-  VLOG(1) << "RegisterActivePlan: Registered plan for UUID " << uuid
-          << ", is_sender: " << is_sender << ", shard_push_schedules size: "
-          << request.shard_push_schedules().size();
-  return absl::OkStatus();
+  return (*plan)->PlanHostBlocks(uuid, block_ids);
 }
 
 absl::Status KVCacheManagerBase::UnregisterActivePlan(uint64_t uuid) {
   if (transfer_hooks_.unregister_active_plan) {
     return transfer_hooks_.unregister_active_plan(uuid);
   }
-  return UnregisterActivePlanDirect(uuid);
-}
-
-absl::Status KVCacheManagerBase::UnregisterActivePlanDirect(uint64_t uuid) {
-  {
-    absl::MutexLock l(plans_mu_);
-    auto it = active_plans_.find(uuid);
-    if (it == active_plans_.end()) {
-      return absl::NotFoundError(
-          absl::StrCat("Plan with UUID ", uuid, " is not registered"));
-    }
-    active_plans_.erase(it);
-  }
-  // Receive-progress counters key on the uuid; drop them with the plan so a
-  // finished, failed, or timed-out uuid can be safely reused.
-  transport::BlockTransport* transport = transport_server();
-  if (transport != nullptr) {
-    transport->ForgetPushProgress(uuid);
-  }
-  VLOG(1) << "UnregisterActivePlan: Removed plan for UUID " << uuid;
-  return absl::OkStatus();
+  return absl::FailedPreconditionError(
+      "UnregisterActivePlan requires KVCacheManagerWithTransfer");
 }
 
 void KVCacheManagerBase::SetRemoteLayerAddrs(
@@ -3249,21 +3037,35 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
                                    int64_t sender_node_id,
                                    absl::string_view peer, int64_t src_block_id,
                                    int64_t dst_block_id) {
-  std::shared_ptr<const RegisteredPlan> plan_snapshot;
+  std::shared_ptr<TransferSession> session;
+  std::shared_ptr<const TransferPlan> plan;
+  if (uuid != 0) {
+    absl::StatusOr<std::shared_ptr<TransferSession>> session_or =
+        GetSession(uuid);
+    if (session_or.ok()) {
+      session = *std::move(session_or);
+    } else if (!absl::IsNotFound(session_or.status())) {
+      return {};
+    }
+    if (session != nullptr) {
+      if (absl::optional<std::shared_ptr<const TransferPlan>> session_plan =
+              session->plan();
+          session_plan.has_value()) {
+        plan = *std::move(session_plan);
+      }
+    }
+  }
+  const bool has_plan = plan != nullptr;
+
   std::shared_ptr<const std::vector<::tpu_sync::rpc::PoolHostAddrsProto>>
       remote;
-  {
+  if (!has_plan || uuid == 0) {
     absl::MutexLock l(plans_mu_);
-    auto it = active_plans_.find(uuid);
-    if (it != active_plans_.end()) {
-      plan_snapshot = it->second;
-    }
     auto remote_it = remote_layer_addrs_.find(uuid);
     if (remote_it != remote_layer_addrs_.end()) {
       remote = remote_it->second;
     }
   }
-  const bool has_plan = plan_snapshot != nullptr;
 
   // Resolve addressing geometry. With explicit pools the wire index is a pool
   // index: blocks stride at the pool's own stride from the pool's base offset
@@ -3289,13 +3091,9 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
     block_size_bytes = static_cast<size_t>(pool.block_stride_bytes);
     size_t host_layer_idx = pool.storage_index;
     if (uuid != 0) {
-      absl::StatusOr<std::shared_ptr<TransferSession>> session =
-          GetSession(uuid);
       absl::StatusOr<size_t> slot = absl::NotFoundError("session not found");
-      if (session.ok()) {
-        slot = (*session)->ResolveStagingSlot(layer_idx);
-      } else if (!absl::IsNotFound(session.status())) {
-        return {};
+      if (session != nullptr) {
+        slot = session->ResolveStagingSlot(layer_idx);
       }
       if (slot.ok()) {
         host_layer_idx = *slot;
@@ -3324,17 +3122,10 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
     // lives in the buffer its session leased to that layer.
     size_t host_layer_idx = layer_idx;
     if (layers_.size() < num_layers_) {
-      if (uuid == 0) {
+      if (uuid == 0 || session == nullptr) {
         return {};
       }
-      absl::StatusOr<std::shared_ptr<TransferSession>> session =
-          GetSession(uuid);
-      absl::StatusOr<size_t> slot = absl::NotFoundError("session not found");
-      if (session.ok()) {
-        slot = (*session)->ResolveStagingSlot(layer_idx);
-      } else if (!absl::IsNotFound(session.status())) {
-        return {};
-      }
+      absl::StatusOr<size_t> slot = session->ResolveStagingSlot(layer_idx);
       if (!slot.ok()) {
         return {};
       }
@@ -3409,185 +3200,9 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
     return chunks;
   }
 
-  const auto& request = plan_snapshot->request;
-  const auto& schedules = plan_snapshot->schedule_by_block;
-  bool is_sender = plan_snapshot->is_sender;
-  const int32_t fixed_src_shard = is_sender
-                                      ? static_cast<int32_t>(shard_idx)
-                                      : static_cast<int32_t>(sender_node_id);
-  auto schedule_it =
-      fixed_src_shard != -1 ? schedules.find(fixed_src_shard) : schedules.end();
-  const auto block_entries = [](const RegisteredPlan::BlockEntryMap& block_map,
-                                int64_t block_id)
-      -> absl::Span<const ::tpu_sync::rpc::ShardPushEntryProto* const> {
-    auto it = block_map.find(block_id);
-    if (it == block_map.end()) return {};
-    return it->second;
-  };
-
-  // Pool reshard plans scope every entry to one pool group; an entry only
-  // resolves chunks for pools of its own group. Only LEGACY (non-pool)
-  // chunked plans carry no groups; they keep the whole-plan replay.
-  const auto entry_targets_pool = [&request,
-                                   layer_idx](const auto& entry) -> bool {
-    if (request.pool_groups_size() == 0) {
-      return true;
-    }
-    const int32_t group_idx = entry.pool_group();
-    if (group_idx < 0 || group_idx >= request.pool_groups_size()) {
-      return false;
-    }
-    const auto& indices = request.pool_groups(group_idx).pool_indices();
-    return std::find(indices.begin(), indices.end(),
-                     static_cast<int32_t>(layer_idx)) != indices.end();
-  };
-
-  const ::tpu_sync::rpc::PoolHostAddrsProto* dst_addrs = nullptr;
-  if (is_sender) {
-    dst_addrs = explicit_pools_
-                    ? GetReceiverPoolAddrs(request, peer, layer_idx)
-                    : GetReceiverLayerAddrs(request, peer, layer_idx);
-  }
-
-  std::vector<tpu_raiden::transport::BlockChunk> chunks;
-  std::vector<tpu_raiden::transport::BlockChunk> block_resolved_chunks;
-  size_t accumulated_bytes = 0;
-
-  for (int64_t block_id : block_ids) {
-    if (accumulated_bytes >= total_bytes) break;
-    // Block-addressed plans under demand staging: the wire names device
-    // blocks, the bytes live in the host block the plan allocated for them
-    // (own id unless the plan says otherwise). Pool-addressed plans on a
-    // bounded-staging storage resolve through the uuid's arena lease instead.
-    int64_t host_block = block_id;
-    if (!plan_snapshot->host_block_of.empty()) {
-      auto hb = plan_snapshot->host_block_of.find(block_id);
-      if (hb == plan_snapshot->host_block_of.end()) {
-        return {};
-      }
-      host_block = hb->second;
-    }
-    uint8_t* const block_base = block_host_base(block_id, host_block);
-    if (block_base == nullptr) {
-      // Bounded storage: this uuid's lease does not cover the block.
-      return {};
-    }
-    block_resolved_chunks.clear();
-
-    if (is_sender) {
-      if (schedule_it != schedules.end()) {
-        const auto& schedule = schedule_it->second;
-        for (const ::tpu_sync::rpc::ShardPushEntryProto* entry_ptr :
-             block_entries(schedule, block_id)) {
-          const ::tpu_sync::rpc::ShardPushEntryProto& entry = *entry_ptr;
-          if (!entry_targets_pool(entry)) {
-            continue;
-          }
-          if (!peer.empty() && entry.dst_peer() != peer) {
-            continue;
-          }
-          if (dst_block_id != -1 && entry.dst_block_id() != dst_block_id) {
-            continue;
-          }
-          if (static_cast<size_t>(entry.src_block_id()) == block_id) {
-            size_t src_base_offset = entry.src_offset_bytes();
-            size_t size = entry.size_bytes();
-            size_t src_stride = entry.src_stride_bytes();
-            int count = entry.count();
-            if (count <= 0) count = 1;
-
-            for (int c = 0; c < count; ++c) {
-              size_t src_offset = src_base_offset + c * src_stride;
-              const int64_t dst_offset =
-                  entry.dst_offset_bytes() + c * entry.dst_stride_bytes();
-              block_resolved_chunks.push_back(
-                  {.ptr = block_base + src_offset,
-                   .size = size,
-                   .raddr = RemoteAddress(dst_addrs, entry.dst_shard_idx(),
-                                          entry.dst_block_id(), dst_offset,
-                                          entry.size_bytes())});
-            }
-          }
-        }
-      }
-    } else {
-      int found_src_shard = -1;
-      if (sender_node_id != -1) {
-        found_src_shard = static_cast<int>(sender_node_id);
-      } else {
-        // If src_block_id is provided, we use it to disambiguate which source
-        // block we are receiving. This is crucial for heterogeneous block sizes
-        // (merging) where multiple source blocks target the same dst_block_id.
-        // If src_block_id is -1, we fall back to matching only on dst_block_id.
-        for (const auto& [src_shard, src_schedule] : schedules) {
-          for (const ::tpu_sync::rpc::ShardPushEntryProto* entry_ptr :
-               block_entries(src_schedule, block_id)) {
-            const ::tpu_sync::rpc::ShardPushEntryProto& entry = *entry_ptr;
-            if (entry_targets_pool(entry) &&
-                static_cast<size_t>(entry.dst_shard_idx()) == shard_idx &&
-                static_cast<size_t>(entry.dst_block_id()) == block_id &&
-                (src_block_id == -1 ||
-                 static_cast<size_t>(entry.src_block_id()) == src_block_id)) {
-              found_src_shard = src_shard;
-              break;
-            }
-          }
-          if (found_src_shard != -1) break;
-        }
-      }
-
-      if (found_src_shard != -1) {
-        auto schedule_found_it = sender_node_id != -1
-                                     ? schedule_it
-                                     : schedules.find(found_src_shard);
-        if (schedule_found_it != schedules.end()) {
-          const auto& schedule = schedule_found_it->second;
-          for (const ::tpu_sync::rpc::ShardPushEntryProto* entry_ptr :
-               block_entries(schedule, block_id)) {
-            const ::tpu_sync::rpc::ShardPushEntryProto& entry = *entry_ptr;
-            if (!entry_targets_pool(entry)) {
-              continue;
-            }
-            if (static_cast<size_t>(entry.dst_shard_idx()) == shard_idx &&
-                static_cast<size_t>(entry.dst_block_id()) == block_id &&
-                (src_block_id == -1 ||
-                 static_cast<size_t>(entry.src_block_id()) == src_block_id)) {
-              if (!peer.empty() && entry.dst_peer() != peer) {
-                continue;
-              }
-              size_t dst_base_offset = entry.dst_offset_bytes();
-              size_t size = entry.size_bytes();
-              size_t dst_stride = entry.dst_stride_bytes();
-              int count = entry.count();
-              if (count <= 0) count = 1;
-
-              for (int c = 0; c < count; ++c) {
-                size_t dst_offset = dst_base_offset + c * dst_stride;
-                block_resolved_chunks.push_back(
-                    {.ptr = block_base + dst_offset, .size = size});
-              }
-            }
-          }
-        }
-      }
-    }
-
-    for (const auto& chunk : block_resolved_chunks) {
-      if (accumulated_bytes >= total_bytes) break;
-      size_t size_to_add =
-          std::min(chunk.size, total_bytes - accumulated_bytes);
-      if (size_to_add > 0) {
-        chunks.push_back(
-            {.ptr = chunk.ptr, .size = size_to_add, .raddr = chunk.raddr});
-        accumulated_bytes += size_to_add;
-      }
-    }
-  }
-
-  if (!chunks.empty()) {
-    return chunks;
-  }
-  return {};
+  return plan->ResolvePlanBlockChunks(
+      layer_idx, shard_idx, block_ids, total_bytes, sender_node_id, peer,
+      src_block_id, dst_block_id, explicit_pools_, block_host_base);
 }
 
 uint8_t* KVCacheManagerBase::GetBlockHostPointer(size_t layer_idx,

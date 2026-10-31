@@ -47,7 +47,7 @@
 #include "tpu_sync/kv_cache/data_connection_policy.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
-#include "tpu_sync/kv_cache/transfer_session.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {
@@ -93,10 +93,10 @@ absl::StatusOr<std::shared_ptr<TransferSendSession>>
 TransferSendSession::CreateFromActivePlan(
     kv_cache::KVCacheManagerBase* base,
     StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-    const ::tpu_sync::rpc::StartTransferRequest& request,
-    absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
-        host_block_of) {
+    const ::tpu_sync::rpc::StartTransferRequest& request) {
   StagingAllocation staging;
+  absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>
+      host_block_of;
   if (staging_allocator != nullptr &&
       staging_allocator->dynamic_host_staging() &&
       request.pool_groups_size() == 0) {
@@ -119,20 +119,25 @@ TransferSendSession::CreateFromActivePlan(
       staging = *std::move(allocated);
       absl::Span<const int> plan_blocks = staging.block_ids();
       for (size_t i = 0; i < device_blocks.size(); ++i) {
-        (*host_block_of)[device_blocks[i]] = plan_blocks[i];
+        host_block_of[device_blocks[i]] = plan_blocks[i];
       }
     }
   }
   ABSL_ASSIGN_OR_RETURN(const DataConnectionReuse data_connection_reuse,
                         ResolveDataConnectionReuse());
+  ABSL_ASSIGN_OR_RETURN(
+      TransferPlan plan,
+      TransferPlan::Create(request, /*is_sender=*/true, base->num_pools(),
+                           base->has_explicit_pools(), base->pools(),
+                           std::move(host_block_of)));
   const auto now = std::chrono::steady_clock::now();
   std::string req_id = request.req_id().empty()
                            ? absl::StrCat("resharded_transfer_", uuid)
                            : request.req_id();
-  auto session = std::shared_ptr<TransferSendSession>(
-      new TransferSendSession(base, staging_allocator, std::move(req_id), uuid,
-                              std::chrono::steady_clock::time_point::max(), now,
-                              data_connection_reuse));
+  auto session = std::shared_ptr<TransferSendSession>(new TransferSendSession(
+      base, staging_allocator, std::move(req_id), uuid,
+      std::chrono::steady_clock::time_point::max(), now, data_connection_reuse,
+      std::make_shared<const TransferPlan>(std::move(plan))));
   {
     absl::MutexLock lock(session->mu_);
     session->staging_ = std::move(staging);
@@ -145,7 +150,8 @@ TransferSendSession::TransferSendSession(
     StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
     std::chrono::steady_clock::time_point deadline,
     std::chrono::steady_clock::time_point register_start,
-    DataConnectionReuse data_connection_reuse)
+    DataConnectionReuse data_connection_reuse,
+    std::shared_ptr<const TransferPlan> plan)
     : base_(base),
       staging_allocator_(staging_allocator),
       req_id_(std::move(req_id)),
@@ -153,6 +159,7 @@ TransferSendSession::TransferSendSession(
       deadline_(deadline),
       register_start_(register_start),
       data_connection_reuse_(data_connection_reuse),
+      transfer_plan_(std::move(plan)),
       staging_layer_manager_(base != nullptr ? base->num_host_layers() : 0) {}
 
 std::optional<TransferSendSession::DuplicateBlock>

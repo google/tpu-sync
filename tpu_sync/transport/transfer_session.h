@@ -16,11 +16,15 @@
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TRANSPORT_TRANSFER_SESSION_H_
 
 #include <cstddef>
+#include <memory>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/optional.h"
 
 namespace tpu_raiden {
+
+class TransferPlan;
 
 // Base interface for producer and consumer KV-cache transfer sessions.
 //
@@ -56,6 +60,10 @@ class TransferSession {
   // session deadline while every buffer is leased. kNotFound means the unit
   // has no staging buffer and is addressed in place. Thread-safe.
   virtual absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) = 0;
+
+  // Returns the session's active transfer plan, or absl::nullopt if this
+  // session is planless or done.
+  virtual absl::optional<std::shared_ptr<const TransferPlan>> plan() const = 0;
 };
 
 }  // namespace tpu_raiden

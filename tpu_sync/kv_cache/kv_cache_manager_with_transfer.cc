@@ -313,9 +313,7 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
       }
       session = it->second;
     }
-    absl::Status status = session->ExecuteLayerH2d(*this, layer_idx);
-    MaybeUnregisterSettledRecv(uuid, *session);
-    return status;
+    return session->ExecuteLayerH2d(*this, layer_idx);
   };
   hooks.on_pool_received = [this](size_t pool_idx, uint64_t uuid) {
     RAIDEN_TRACE_FN("KVTransfer::OnPoolReceived", [&]() {
@@ -372,12 +370,16 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
       } else if (auto reshard_it = active_pool_reshard_recvs_.find(uuid);
                  reshard_it != active_pool_reshard_recvs_.end()) {
         reshard_session = reshard_it->second;
-      } else if (uuid == 0 || base_->HasActivePlan(uuid)) {
-        return absl::OkStatus();
-      } else {
-        return absl::NotFoundError(
-            absl::StrCat("No active receive session for uuid=", uuid));
       }
+    }
+    if (recv_session == nullptr && reshard_session == nullptr) {
+      // Plans live in sessions, so HasActivePlan() takes mu_ through
+      // GetSession(): check it only after mu_ is released.
+      if (uuid == 0 || base_->HasActivePlan(uuid)) {
+        return absl::OkStatus();
+      }
+      return absl::NotFoundError(
+          absl::StrCat("No active receive session for uuid=", uuid));
     }
     FaultInjectDelay(hooks::kBlockTransportRecvBeginPush);
     const bool started = recv_session != nullptr
@@ -404,12 +406,12 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
       }
     }
     if (recv_session != nullptr) {
+      // The plan lives in the session: settling it here (last op of a
+      // draining session) drops the plan together with its staging.
       if (!status.ok()) {
-        recv_session->DeferUnregisterOnSettle();
         recv_session->Finish(status);
       }
       recv_session->EndRecvOp();
-      MaybeUnregisterSettledRecv(uuid, *recv_session);
       return !recv_session->GetStatus().ok()
                  ? absl::CancelledError(absl::StrCat(
                        "Receive session for uuid=", uuid,
@@ -423,11 +425,6 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
       reshard_session->Finish(status);
     }
     reshard_session->EndRecvOp();
-    uint64_t generation = 0;
-    if (reshard_session->Done() &&
-        reshard_session->TakePendingUnregister(&generation)) {
-      UnregisterSettledPlan(uuid, generation);
-    }
     return !reshard_session->GetStatus().ok()
                ? absl::CancelledError(absl::StrCat(
                      "ReshardReceiveSession for uuid=", uuid,
@@ -465,7 +462,40 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
 absl::StatusOr<std::shared_ptr<TransferSession>>
 KVCacheManagerWithTransfer::GetSession(uint64_t uuid) const {
   absl::MutexLock lock(mu_);
-  if (auto it = send_sessions_.find(uuid); it != send_sessions_.end()) {
+  if (auto it = active_recv_sessions_.find(uuid);
+      it != active_recv_sessions_.end() && !it->second->Done() &&
+      it->second->plan().has_value()) {
+    return it->second;
+  }
+  if (auto it = active_pool_reshard_sends_.find(uuid);
+      it != active_pool_reshard_sends_.end() && !it->second->Done() &&
+      it->second->plan().has_value()) {
+    return it->second;
+  }
+  if (auto it = active_pool_reshard_recvs_.find(uuid);
+      it != active_pool_reshard_recvs_.end() && !it->second->Done() &&
+      it->second->plan().has_value()) {
+    return it->second;
+  }
+  if (auto it = send_sessions_.find(uuid); it != send_sessions_.end() &&
+                                           !it->second->Done() &&
+                                           it->second->plan().has_value()) {
+    return it->second;
+  }
+  if (auto it = active_recv_sessions_.find(uuid);
+      it != active_recv_sessions_.end() && !it->second->Done()) {
+    return it->second;
+  }
+  if (auto it = active_pool_reshard_sends_.find(uuid);
+      it != active_pool_reshard_sends_.end() && !it->second->Done()) {
+    return it->second;
+  }
+  if (auto it = active_pool_reshard_recvs_.find(uuid);
+      it != active_pool_reshard_recvs_.end() && !it->second->Done()) {
+    return it->second;
+  }
+  if (auto it = send_sessions_.find(uuid);
+      it != send_sessions_.end() && !it->second->Done()) {
     return it->second;
   }
   if (auto it = active_recv_sessions_.find(uuid);
@@ -478,6 +508,9 @@ KVCacheManagerWithTransfer::GetSession(uint64_t uuid) const {
   }
   if (auto it = active_pool_reshard_recvs_.find(uuid);
       it != active_pool_reshard_recvs_.end()) {
+    return it->second;
+  }
+  if (auto it = send_sessions_.find(uuid); it != send_sessions_.end()) {
     return it->second;
   }
   return absl::NotFoundError(absl::StrCat("Session ", uuid, " not found"));
@@ -698,11 +731,20 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
 absl::Status KVCacheManagerWithTransfer::EmplaceRecvSessionLocked(
     uint64_t uuid, const std::shared_ptr<TransferReceiveSession>& session) {
   auto existing = active_recv_sessions_.find(uuid);
-  if (existing != active_recv_sessions_.end() && existing->second->Done()) {
-    (!existing->second->GetStatus().ok() ? failed_recving_ : done_recving_)
-        .insert(existing->second->req_id());
-    transfer_details_[existing->second->req_id()] = existing->second->Details();
-    active_recv_sessions_.erase(existing);
+  if (existing != active_recv_sessions_.end()) {
+    if (!existing->second->IsDraining() &&
+        existing->second->IsReadyToComplete()) {
+      existing->second->Finish();
+    }
+    if (existing->second->Done()) {
+      if (existing->second->tracks_completion()) {
+        (!existing->second->GetStatus().ok() ? failed_recving_ : done_recving_)
+            .insert(existing->second->req_id());
+        transfer_details_[existing->second->req_id()] =
+            existing->second->Details();
+      }
+      active_recv_sessions_.erase(existing);
+    }
   }
   // try_emplace leaves session untouched on a duplicate. Callers rely on that
   // guarantee to release staging owned by the rejected session.
@@ -716,79 +758,131 @@ absl::Status KVCacheManagerWithTransfer::EmplaceRecvSessionLocked(
 absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
     uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
     bool is_sender) {
-  // Registration is one indivisible step: a concurrent unregister or a
-  // second registration of the same uuid waits for it, so a plan is never
-  // visible without the staging and receive state that belong to it.
-  absl::MutexLock lifecycle(plan_lifecycle_mu_);
-  if (base_->HasActivePlan(uuid)) {
-    return absl::AlreadyExistsError(
-        absl::StrCat("Plan with UUID ", uuid, " is already registered!"));
-  }
-  const uint64_t generation = ++plan_generation_counter_;
-  // Under demand staging a plan's device blocks are staged in host blocks
-  // allocated for the plan, so the host mirror no longer has to span the
-  // device block space. Pool-addressed plans keep their own addressing.
-  absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>
-      host_block_of;
-  if (is_sender) {
-    ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSendSession> send_session,
-                          TransferSendSession::CreateFromActivePlan(
-                              base_.get(), staging_allocator_.get(), uuid,
-                              request, &host_block_of));
-    {
-      absl::MutexLock lock(mu_);
-      send_sessions_.insert_or_assign(uuid, send_session);
-    }
-    absl::Status registered = base_->RegisterActivePlan(
-        uuid, request, /*is_sender=*/true, host_block_of, generation);
-    if (!registered.ok()) {
-      {
-        absl::MutexLock lock(mu_);
-        send_sessions_.erase(uuid);
-      }
-      send_session->Finish(registered);
-      return registered;
-    }
-    return absl::OkStatus();
-  }
-
+  bool retired_existing = false;
+  bool retired_pool_staging = false;
   {
     absl::MutexLock lock(mu_);
-    ABSL_ASSIGN_OR_RETURN(
-        std::shared_ptr<TransferReceiveSession> recv_session,
-        TransferReceiveSession::CreateFromActivePlan(
-            base_.get(), staging_allocator_.get(), uuid, request, generation,
-            DeadlineFromNow(), &host_block_of, metrics_collector_));
+    auto has_plan = [](const auto& map, uint64_t id) {
+      auto it = map.find(id);
+      return it != map.end() && it->second->plan().has_value();
+    };
+    if (has_plan(send_sessions_, uuid) ||
+        has_plan(active_recv_sessions_, uuid) ||
+        has_plan(active_pool_reshard_recvs_, uuid) ||
+        has_plan(active_pool_reshard_sends_, uuid) ||
+        pending_pool_reshard_recvs_.contains(uuid)) {
+      return absl::AlreadyExistsError(
+          absl::StrCat("Plan with UUID ", uuid, " is already registered!"));
+    }
+    if (is_sender) {
+      if (auto it = send_sessions_.find(uuid);
+          it != send_sessions_.end() && !it->second->Done()) {
+        return absl::AlreadyExistsError(
+            absl::StrCat("Send with UUID ", uuid, " is already registered"));
+      }
+    } else {
+      if (auto it = active_recv_sessions_.find(uuid);
+          it != active_recv_sessions_.end()) {
+        if (!it->second->IsDraining() && it->second->IsReadyToComplete()) {
+          it->second->Finish();
+        }
+        if (!it->second->Done()) {
+          return absl::AlreadyExistsError(absl::StrCat(
+              "Receive with UUID ", uuid, " is already registered"));
+        }
+      }
+    }
 
-    if (recv_session->total_blocks() > 0 || recv_session->HasStaging()) {
+    auto retire_settled_other_maps = [&]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+      if (auto it = active_pool_reshard_recvs_.find(uuid);
+          it != active_pool_reshard_recvs_.end() && it->second->Done()) {
+        RecordPoolReshardTerminalLocked(
+            /*is_recv=*/true, it->second->req_id(), it->second->uuid(),
+            it->second->sub_plan_index(), it->second->sub_plan_count(),
+            it->second->GetStatus());
+        retired_existing = true;
+        retired_pool_staging = true;
+        active_pool_reshard_recvs_.erase(it);
+      }
+      if (auto it = active_pool_reshard_sends_.find(uuid);
+          it != active_pool_reshard_sends_.end() && it->second->Done()) {
+        RecordPoolReshardTerminalLocked(
+            /*is_recv=*/false, it->second->req_id(), it->second->uuid(),
+            it->second->sub_plan_index(), it->second->sub_plan_count(),
+            it->second->GetStatus());
+        if (!it->second->GetStatus().ok()) {
+          retired_existing = true;
+          retired_pool_staging = true;
+        }
+        active_pool_reshard_sends_.erase(it);
+      }
+      if (auto it = send_sessions_.find(uuid);
+          it != send_sessions_.end() && it->second->Done()) {
+        const bool failed = !it->second->GetStatus().ok();
+        (failed ? failed_recving_ : done_sending_).insert(it->second->req_id());
+        transfer_details_[it->second->req_id()] = it->second->Details();
+        if (failed) {
+          retired_existing = true;
+        }
+        base_->ClearRemoteLayerAddrs(uuid);
+        send_sessions_.erase(it);
+      }
+      if (is_sender) {
+        if (auto it = active_recv_sessions_.find(uuid);
+            it != active_recv_sessions_.end()) {
+          if (!it->second->IsDraining() && it->second->IsReadyToComplete()) {
+            it->second->Finish();
+          }
+          if (it->second->Done()) {
+            if (it->second->tracks_completion()) {
+              (!it->second->GetStatus().ok() ? failed_recving_ : done_recving_)
+                  .insert(it->second->req_id());
+              transfer_details_[it->second->req_id()] = it->second->Details();
+            }
+            retired_existing = true;
+            active_recv_sessions_.erase(it);
+          }
+        }
+      }
+    };
+
+    if (is_sender) {
+      ABSL_ASSIGN_OR_RETURN(
+          std::shared_ptr<TransferSendSession> send_session,
+          TransferSendSession::CreateFromActivePlan(
+              base_.get(), staging_allocator_.get(), uuid, request));
+      retire_settled_other_maps();
+      send_sessions_.emplace(uuid, std::move(send_session));
+    } else {
+      ABSL_ASSIGN_OR_RETURN(
+          std::shared_ptr<TransferReceiveSession> recv_session,
+          TransferReceiveSession::CreateFromActivePlan(
+              base_.get(), staging_allocator_.get(), uuid, request,
+              DeadlineFromNow(), metrics_collector_));
+      retire_settled_other_maps();
+      retired_existing =
+          retired_existing || active_recv_sessions_.contains(uuid);
       absl::Status inserted = EmplaceRecvSessionLocked(uuid, recv_session);
       if (!inserted.ok()) {
         recv_session->ReleaseStaging();
         return inserted;
       }
       if (recv_session->total_blocks() > 0) {
-        LOG(INFO)
-            << "RegisterActivePlan (Receiver): Populated "
-               "active_recv_sessions_ for UUID "
-            << uuid << " with " << recv_session->total_blocks()
-            << " total physical block-pushes (including duplicates across "
-               "sources) for automatic H2D.";
+        LOG(INFO) << "RegisterActivePlan (Receiver): Populated "
+                     "active_recv_sessions_ for UUID "
+                  << uuid << " with " << recv_session->total_blocks()
+                  << " total physical block-pushes (including duplicates "
+                     "across sources) for automatic H2D.";
       }
     }
   }
-
-  // Publish the plan last: pushes resolve through it, so everything they
-  // may touch exists by the time it is visible.
-  absl::Status registered = base_->RegisterActivePlan(
-      uuid, request, /*is_sender=*/false, host_block_of, generation);
-  if (!registered.ok()) {
-    absl::MutexLock lock(mu_);
-    auto recv = active_recv_sessions_.find(uuid);
-    if (recv != active_recv_sessions_.end()) {
-      recv->second->ReleaseStaging();
-      active_recv_sessions_.erase(recv);
+  if (retired_existing) {
+    if (auto* transport = base_->transport_server()) {
+      transport->ForgetPushProgress(uuid);
     }
-    return registered;
+  }
+  if (retired_pool_staging) {
+    base_->ReleasePoolStagingLeases(uuid);
   }
   return absl::OkStatus();
 }
@@ -822,6 +916,7 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
     return absl::StrCat("uuid=", plan.uuid(),
                         " src_blocks=", src_block_ids.size());
   });
+  bool retired_existing = false;
   {
     absl::MutexLock lock(mu_);
     auto existing = active_pool_reshard_sends_.find(plan.uuid());
@@ -832,12 +927,16 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
             existing->second->uuid(),
             existing->second->sub_plan_index(),
             existing->second->sub_plan_count(), existing->second->GetStatus());
+        retired_existing = !existing->second->GetStatus().ok();
         active_pool_reshard_sends_.erase(existing);
       } else {
         return absl::AlreadyExistsError(absl::StrCat(
             "pool reshard send UUID already active: ", plan.uuid()));
       }
     }
+  }
+  if (retired_existing) {
+    base_->ReleasePoolStagingLeases(plan.uuid());
   }
 
   ABSL_ASSIGN_OR_RETURN(
@@ -862,6 +961,7 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
     return absl::StrCat("uuid=", plan.uuid(),
                         " chip_blocks=", chip_block_ids.size());
   });
+  bool retired_existing = false;
   {
     absl::MutexLock lock(mu_);
     auto existing_reshard = active_pool_reshard_recvs_.find(plan.uuid());
@@ -873,13 +973,28 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
             existing_reshard->second->sub_plan_index(),
             existing_reshard->second->sub_plan_count(),
             existing_reshard->second->GetStatus());
+        retired_existing = true;
         active_pool_reshard_recvs_.erase(existing_reshard);
       } else {
         return absl::AlreadyExistsError(absl::StrCat(
             "pool reshard recv UUID already active: ", plan.uuid()));
       }
     }
+    if (!pending_pool_reshard_recvs_.insert(plan.uuid()).second) {
+      return absl::AlreadyExistsError(
+          absl::StrCat("pool reshard recv UUID already active: ", plan.uuid()));
+    }
   }
+  if (retired_existing) {
+    if (auto* transport = base_->transport_server()) {
+      transport->ForgetPushProgress(plan.uuid());
+    }
+    base_->ReleasePoolStagingLeases(plan.uuid());
+  }
+  absl::Cleanup clear_pending = [this, uuid = plan.uuid()]() {
+    absl::MutexLock lock(mu_);
+    pending_pool_reshard_recvs_.erase(uuid);
+  };
 
   ABSL_ASSIGN_OR_RETURN(
       std::shared_ptr<ReshardReceiveSession> recv_session,
@@ -887,6 +1002,7 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
                                     chip_block_ids, DeadlineFromNow()));
   {
     absl::MutexLock lock(mu_);
+    pending_pool_reshard_recvs_.erase(plan.uuid());
     active_pool_reshard_recvs_[plan.uuid()] = std::move(recv_session);
     NoteSubPlanRegisteredLocked(/*is_recv=*/true, plan.req_id(), plan.uuid(),
                                 plan.sub_plan_index(), plan.sub_plan_count());
@@ -895,85 +1011,79 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
 }
 
 absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {
-  absl::MutexLock lifecycle(plan_lifecycle_mu_);
+  std::shared_ptr<TransferSendSession> send;
   std::shared_ptr<TransferReceiveSession> recv;
   std::shared_ptr<ReshardReceiveSession> reshard_recv;
-  std::shared_ptr<TransferSendSession> send;
+  std::shared_ptr<ReshardSendSession> reshard_send;
+  bool found = false;
   {
     absl::MutexLock lock(mu_);
     if (auto it = active_recv_sessions_.find(uuid);
-        it != active_recv_sessions_.end() && !it->second->Done()) {
+        it != active_recv_sessions_.end() && it->second->plan().has_value()) {
       recv = it->second;
-    } else if (auto reshard_it = active_pool_reshard_recvs_.find(uuid);
-               reshard_it != active_pool_reshard_recvs_.end() &&
-               !reshard_it->second->Done()) {
-      reshard_recv = reshard_it->second;
+      found = true;
+    } else if (auto it = active_pool_reshard_recvs_.find(uuid);
+               it != active_pool_reshard_recvs_.end() &&
+               it->second->plan().has_value()) {
+      reshard_recv = it->second;
+      found = true;
     } else if (auto send_it = send_sessions_.find(uuid);
-               send_it != send_sessions_.end()) {
+               send_it != send_sessions_.end() &&
+               send_it->second->plan().has_value()) {
       // The plan's registrant, not the CompleteReadWithDetails sweep, owns
       // its send session: drop it before finishing it so the sweep never
       // reports it as a transfer.
       send = std::move(send_it->second);
       send_sessions_.erase(send_it);
+      found = true;
+    } else if (auto it = active_pool_reshard_sends_.find(uuid);
+               it != active_pool_reshard_sends_.end() &&
+               it->second->plan().has_value()) {
+      reshard_send = it->second;
+      found = true;
     }
   }
-  // Unregistering a live receive, on either the block-addressed or the
-  // pool-reshard path, cancels it: no further push is admitted
-  // (TryBeginRecvOp) and no further H2D starts. Work the transport already
-  // accepted keeps the plan -- its writes resolve through the plan's staging
-  // -- until it ends; the plan then goes with the session, together with
-  // the staging it leased, instead of outliving the receive until the
-  // deadline sweep. An idle receive settles here and its plan is dropped
-  // at once.
+  if (!found) {
+    return absl::NotFoundError(absl::StrCat("No active plan with UUID ", uuid));
+  }
+  if (send != nullptr) {
+    if (!send->Done()) {
+      send->Finish(absl::CancelledError("send plan unregistered"));
+    }
+    return absl::OkStatus();
+  }
+  if (reshard_send != nullptr) {
+    if (!reshard_send->Done()) {
+      reshard_send->Finish(absl::CancelledError("send plan unregistered"));
+    }
+    return absl::OkStatus();
+  }
   if (recv != nullptr) {
-    recv->DeferUnregisterOnSettle();
-    recv->Finish(absl::CancelledError("receive plan unregistered"));
-    if (!recv->Done()) return absl::OkStatus();
-    uint64_t generation = 0;
-    recv->TakePendingUnregister(&generation);
+    if (!recv->Done()) {
+      recv->Finish(absl::CancelledError("receive plan unregistered"));
+    }
+    if (!recv->Done()) {
+      return absl::OkStatus();
+    }
+    if (!recv->tracks_completion()) {
+      absl::MutexLock lock(mu_);
+      auto it = active_recv_sessions_.find(uuid);
+      if (it != active_recv_sessions_.end() && it->second == recv) {
+        active_recv_sessions_.erase(it);
+      }
+    }
   } else if (reshard_recv != nullptr) {
-    reshard_recv->Finish(absl::CancelledError("receive plan unregistered"));
-    if (!reshard_recv->Done()) return absl::OkStatus();
-    uint64_t generation = 0;
-    reshard_recv->TakePendingUnregister(&generation);
-  } else if (send != nullptr && !send->Done()) {
-    send->Finish(absl::CancelledError("send plan unregistered"));
-  }
-  return base_->UnregisterActivePlanDirect(uuid);
-}
-
-void KVCacheManagerWithTransfer::UnregisterSettledPlan(uint64_t uuid,
-                                                       uint64_t generation) {
-  // Serialized with registration so cleanup for one registration can never
-  // remove a newer one reusing the uuid, or race its progress counters.
-  absl::MutexLock lifecycle(plan_lifecycle_mu_);
-  if (generation != 0) {
-    std::optional<uint64_t> current = base_->ActivePlanGeneration(uuid);
-    if (!current.has_value() || *current != generation) {
-      return;  // the plan is gone, or the uuid already belongs to a newer one
+    if (!reshard_recv->Done()) {
+      reshard_recv->Finish(absl::CancelledError("receive plan unregistered"));
+    }
+    if (!reshard_recv->Done()) {
+      return absl::OkStatus();
     }
   }
-  absl::Status status = base_->UnregisterActivePlanDirect(uuid);
-  if (!status.ok() && !absl::IsNotFound(status)) {
-    LOG(ERROR) << "Failed to unregister settled transfer plan " << uuid << ": "
-               << status;
+  if (auto* transport = base_->transport_server()) {
+    transport->ForgetPushProgress(uuid);
   }
-}
-
-void KVCacheManagerWithTransfer::MaybeUnregisterSettledRecv(
-    uint64_t uuid, TransferReceiveSession& session) {
-  uint64_t generation = 0;
-  if (session.Done() && session.TakePendingUnregister(&generation)) {
-    UnregisterSettledPlan(uuid, generation);
-  }
-}
-
-void KVCacheManagerWithTransfer::MaybeUnregisterSettledReshardRecv(
-    uint64_t uuid, ReshardReceiveSession& session) {
-  uint64_t generation = 0;
-  if (session.Done() && session.TakePendingUnregister(&generation)) {
-    UnregisterSettledPlan(uuid, generation);
-  }
+  return absl::OkStatus();
 }
 
 std::vector<RaidenTransferEndpoint>
@@ -1074,10 +1184,13 @@ void KVCacheManagerWithTransfer::StartRead(
     auto incumbent = active_recv_sessions_.find(uuid);
     if (incumbent != active_recv_sessions_.end()) {
       if (incumbent->second->Done()) {
-        (!incumbent->second->GetStatus().ok() ? failed_recving_ : done_recving_)
-            .insert(incumbent->second->req_id());
-        transfer_details_[incumbent->second->req_id()] =
-            incumbent->second->Details();
+        if (incumbent->second->tracks_completion()) {
+          (!incumbent->second->GetStatus().ok() ? failed_recving_
+                                                : done_recving_)
+              .insert(incumbent->second->req_id());
+          transfer_details_[incumbent->second->req_id()] =
+              incumbent->second->Details();
+        }
         active_recv_sessions_.erase(incumbent);
       } else {
         LOG(ERROR) << "StartRead rejected duplicate uuid=" << uuid
@@ -1146,7 +1259,7 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
   RAIDEN_TRACE("KVTransfer::CompleteReadWithDetails");
   FaultInjectThrow(hooks::kKvCacheManagerApiCompleteRead);
   CompleteReadResult completions;
-  std::vector<std::pair<uint64_t, uint64_t>> settled_plans;
+  std::vector<uint64_t> retired_uuids;
   {
     absl::MutexLock lock(mu_);
     const auto now = std::chrono::steady_clock::now();
@@ -1165,7 +1278,7 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
         (failed ? failed_recving_ : done_sending_).insert(session->req_id());
         transfer_details_[session->req_id()] = session->Details();
         if (failed) {
-          settled_plans.emplace_back(uuid, 0);
+          retired_uuids.push_back(uuid);
         }
         base_->ClearRemoteLayerAddrs(uuid);
         send_sessions_.erase(it++);
@@ -1187,7 +1300,7 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
             session->sub_plan_index(),
             session->sub_plan_count(), session->GetStatus());
         if (failed) {
-          settled_plans.emplace_back(it->first, 0);
+          retired_uuids.push_back(it->first);
         }
         active_pool_reshard_sends_.erase(it++);
       } else {
@@ -1208,23 +1321,18 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
                     << session->req_id();
           session->Finish();
         } else if (session->deadline() <= now) {
-          // Preserve the pre-existing timeout cleanup behavior even for
-          // receives registered without a plan: UnregisterSettledPlan also
-          // clears any transport-side progress associated with the UUID.
-          session->DeferUnregisterOnSettle();
           session->Finish(
               absl::DeadlineExceededError("Receive session timed out"));
         }
       }
 
       if (session->Done()) {
-        (!session->GetStatus().ok() ? failed_recving_ : done_recving_)
-            .insert(session->req_id());
-        transfer_details_[session->req_id()] = session->Details();
-        uint64_t generation = 0;
-        if (session->TakePendingUnregister(&generation)) {
-          settled_plans.emplace_back(uuid, generation);
+        if (session->tracks_completion()) {
+          (!session->GetStatus().ok() ? failed_recving_ : done_recving_)
+              .insert(session->req_id());
+          transfer_details_[session->req_id()] = session->Details();
         }
+        retired_uuids.push_back(uuid);
         active_recv_sessions_.erase(it++);
       } else {
         ++it;
@@ -1250,16 +1358,21 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
             /*is_recv=*/true, session->req_id(), session->uuid(),
             session->sub_plan_index(),
             session->sub_plan_count(), session->GetStatus());
-        uint64_t generation = 0;
-        if (session->TakePendingUnregister(&generation)) {
-          settled_plans.emplace_back(uuid, generation);
-        }
+        retired_uuids.push_back(uuid);
         active_pool_reshard_recvs_.erase(it++);
       } else {
         ++it;
       }
     }
     SweepSubPlanChainsLocked(now);
+    std::erase_if(retired_uuids,
+                  [this](uint64_t uuid) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+                    return send_sessions_.contains(uuid) ||
+                           active_recv_sessions_.contains(uuid) ||
+                           active_pool_reshard_sends_.contains(uuid) ||
+                           active_pool_reshard_recvs_.contains(uuid) ||
+                           pending_pool_reshard_recvs_.contains(uuid);
+                  });
     completions.sent.assign(done_sending_.begin(), done_sending_.end());
     completions.received.assign(done_recving_.begin(), done_recving_.end());
     completions.failed.assign(failed_recving_.begin(), failed_recving_.end());
@@ -1268,12 +1381,12 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
     done_recving_.clear();
     failed_recving_.clear();
   }
-  // Unregistering drops the plan and its transport receive-progress counters
-  // (ForgetPushProgress), so a settled uuid is reusable.
-  for (const auto& [uuid, generation] : settled_plans) {
-    UnregisterSettledPlan(uuid, generation);
-    // A settled (completed or timed-out) pool-reshard sender/receiver may
-    // still hold bounded-staging arena slots.
+  // Drop transport receive-progress counters (ForgetPushProgress) and any
+  // remaining pool staging leases, so a settled uuid is reusable.
+  for (uint64_t uuid : retired_uuids) {
+    if (auto* transport = base_->transport_server()) {
+      transport->ForgetPushProgress(uuid);
+    }
     base_->ReleasePoolStagingLeases(uuid);
   }
   for (const std::string& req_id : completions.failed) {
@@ -1570,7 +1683,7 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
       bool recv_pending = false;
       for (const auto& [uuid, session] : active_recv_sessions_) {
         (void)uuid;
-        if (!session->Done()) {
+        if (session->HasPendingWork()) {
           recv_pending = true;
           break;
         }
@@ -1679,10 +1792,7 @@ absl::Status KVCacheManagerWithTransfer::OnBlockShardsReceived(
     }
     session = it->second;
   }
-  absl::Status status =
-      session->OnBlockShardsReceived(*this, block_ids, shard_ids);
-  MaybeUnregisterSettledRecv(uuid, *session);
-  return status;
+  return session->OnBlockShardsReceived(*this, block_ids, shard_ids);
 }
 
 }  // namespace tpu_raiden

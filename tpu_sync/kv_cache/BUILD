@@ -224,7 +224,9 @@ cc_test(
     features = ["-use_header_modules"],
     deps = [
         ":kv_cache_manager_base",
+        ":kv_cache_manager_with_transfer",
         ":pool_layout",
+        ":transfer_plan",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/transport:block_transport_delegate",
         "//tpu_sync/transport:transfer_session",
@@ -232,6 +234,7 @@ cc_test(
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:optional",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@xla//xla/tsl/platform:statusor",
@@ -259,6 +262,32 @@ cc_test(
 )
 
 cc_library(
+    name = "transfer_plan",
+    srcs = ["transfer_plan.cc"],
+    hdrs = ["transfer_plan.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":pool_layout",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/transport:block_transport_delegate",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/functional:function_ref",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
     name = "kv_cache_manager_base",
     srcs = [
         "kv_cache_manager_base.cc",
@@ -276,6 +305,7 @@ cc_library(
         ":kv_cache_store_backend_factory",
         ":logical_block_manager",
         ":pool_layout",
+        ":transfer_plan",
         "//tpu_sync/core:host_memory_allocator",
         "//tpu_sync/core:numa_thread_pool",
         "//tpu_sync/core:raiden_manager_base",
@@ -303,6 +333,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:span",
         "@xla//xla/stream_executor:device_address",
     ],
@@ -339,6 +370,7 @@ cc_library(
     deps = [
         ":kv_cache_manager_base",
         ":pool_layout",
+        ":transfer_plan",
         "//tpu_sync/common:trace",
         "//tpu_sync/core:control_plane_backend",
         "//tpu_sync/core:host_memory_allocator",
@@ -369,6 +401,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:span",
         "@xla//xla/tsl/concurrency:future",
     ],

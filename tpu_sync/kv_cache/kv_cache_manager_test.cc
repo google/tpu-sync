@@ -26,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
 
@@ -43,6 +44,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
+#include "absl/types/optional.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
@@ -51,6 +53,7 @@
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -95,6 +98,33 @@ class TestKVCacheManager : public KVCacheManagerBase {
   using KVCacheManagerBase::buffer_holds_;
   using KVCacheManagerBase::layers_;
   using KVCacheManagerBase::UpdateAllocatedOccupancyMetric;
+};
+
+// Hosts a |Base| test manager behind KVCacheManagerWithTransfer so that
+// registered plans live in transfer sessions, the only place plans are
+// stored. Base-level plan calls on manager() route through its hooks.
+template <typename Base>
+class WithPlanSessions : public KVCacheManagerWithTransfer {
+ public:
+  template <typename... Args>
+  explicit WithPlanSessions(Args&&... args)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<Base>(std::forward<Args>(args)...)) {}
+
+  WithPlanSessions(std::unique_ptr<Base> base, double timeout_s)
+      : KVCacheManagerWithTransfer(std::move(base), /*node_id=*/0,
+                                   /*local_control_port=*/-1, /*max_blocks=*/0,
+                                   /*num_slots=*/0, timeout_s) {}
+
+  Base& manager() { return static_cast<Base&>(*base_); }
+
+  // Stages plans in per-transfer host blocks, as
+  // TPU_RAIDEN_DYNAMIC_HOST_STAGING=1 does.
+  void EnableDemandStaging() {
+    staging_allocator_ = CreateStagingBlockAllocator(
+        base_.get(), staging_allocator_->num_slots(),
+        staging_allocator_->max_blocks(), /*dynamic_host_staging=*/true);
+  }
 };
 
 // Pool with one strided live region per block: live [0, 32) and [64, 96)
@@ -244,23 +274,6 @@ TEST(KVCacheManagerTest, RegisterPoolsGrowsDeviceBackedHostMirror) {
   EXPECT_EQ(last_ref.ptr, grown + 3 * 64);
 }
 
-// The pool table is frozen while plans are active.
-TEST(KVCacheManagerTest, RegisterPoolsFailsAfterActivePlanRegistered) {
-  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/128, /*host_blocks=*/1);
-  tpu_sync::rpc::StartTransferRequest request;
-  request.set_uuid(445566);
-  request.set_is_sender(true);
-
-  ABSL_ASSERT_OK(
-      manager.RegisterActivePlan(445566, request, /*is_sender=*/true));
-
-  absl::Status status =
-      manager.RegisterPools({DensePool("kind_a", 0, 0, 128, 1)});
-  EXPECT_EQ(status.code(), absl::StatusCode::kFailedPrecondition);
-  EXPECT_THAT(status.message(), testing::HasSubstr("active plans"));
-}
-
 TEST(KVCacheManagerTest, PoolIndicesWithTag) {
   TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
                              /*slice_byte_size=*/128, /*host_blocks=*/2);
@@ -278,8 +291,10 @@ TEST(KVCacheManagerTest, PoolIndicesWithTag) {
 }
 
 TEST(KVCacheManagerTest, RegisterActivePlanChecksPoolDtypeTags) {
-  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
-                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  WithPlanSessions<TestKVCacheManager> manager_host(
+      /*num_layers=*/2, /*num_shards=*/1,
+      /*slice_byte_size=*/128, /*host_blocks=*/2);
+  TestKVCacheManager& manager = manager_host.manager();
   PoolSpec pool_b = DensePool("kind_b", 1, 0, 128, 2);
   pool_b.dtype_tag = "dtype_b";
   ABSL_ASSERT_OK(manager.RegisterPools({
@@ -341,8 +356,10 @@ TEST(KVCacheManagerTest,
      ExplicitPoolTransportUsesBackingStorageBaseAndPoolStride) {
   TestKVCacheManager sender(/*num_layers=*/2, /*num_shards=*/1,
                             /*slice_byte_size=*/64, /*host_blocks=*/8);
-  TestKVCacheManager receiver(/*num_layers=*/2, /*num_shards=*/1,
-                              /*slice_byte_size=*/64, /*host_blocks=*/8);
+  WithPlanSessions<TestKVCacheManager> receiver_host(
+      /*num_layers=*/2, /*num_shards=*/1,
+      /*slice_byte_size=*/64, /*host_blocks=*/8);
+  TestKVCacheManager& receiver = receiver_host.manager();
   const std::vector<PoolSpec> pools = {
       DensePool("kind_a", /*storage_index=*/1, /*base_offset=*/64,
                 /*stride=*/128, /*num_blocks=*/2),
@@ -402,8 +419,10 @@ TEST(KVCacheManagerTest,
      AliasedPoolTransportCopiesOnlyLiveRegionsAndPreservesPadding) {
   TestKVCacheManager sender(/*num_layers=*/1, /*num_shards=*/1,
                             /*slice_byte_size=*/128, /*host_blocks=*/2);
-  TestKVCacheManager receiver(/*num_layers=*/1, /*num_shards=*/1,
-                              /*slice_byte_size=*/128, /*host_blocks=*/2);
+  WithPlanSessions<TestKVCacheManager> receiver_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/128, /*host_blocks=*/2);
+  TestKVCacheManager& receiver = receiver_host.manager();
   const std::vector<PoolSpec> pools = {
       StridedPool("aliased", /*storage_index=*/0, /*base_offset=*/32,
                   /*stride=*/128, /*num_blocks=*/2),
@@ -448,8 +467,10 @@ TEST(KVCacheManagerTest,
 TEST(KVCacheManagerTest, ExplicitPoolTransportEnumeratesAllPools) {
   TestKVCacheManager sender(/*num_layers=*/1, /*num_shards=*/1,
                             /*slice_byte_size=*/64, /*host_blocks=*/8);
-  TestKVCacheManager receiver(/*num_layers=*/1, /*num_shards=*/1,
-                              /*slice_byte_size=*/64, /*host_blocks=*/8);
+  WithPlanSessions<TestKVCacheManager> receiver_host(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/64, /*host_blocks=*/8);
+  TestKVCacheManager& receiver = receiver_host.manager();
   const std::vector<PoolSpec> pools = {
       DensePool("kind_a", /*storage_index=*/0, /*base_offset=*/0,
                 /*stride=*/64, /*num_blocks=*/2),
@@ -586,8 +607,10 @@ TEST(KVCacheManagerTest, ImplicitPoolsMirrorStorages) {
 }
 
 TEST(KVCacheManagerTest, UnregisterActivePlanAllowsUuidReuse) {
-  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
-                             /*slice_byte_size=*/128);
+  WithPlanSessions<TestKVCacheManager> manager_host(/*num_layers=*/1,
+                                                    /*num_shards=*/1,
+                                                    /*slice_byte_size=*/128);
+  TestKVCacheManager& manager = manager_host.manager();
   tpu_sync::rpc::StartTransferRequest request;
   request.set_uuid(112233);
   request.set_is_sender(true);
@@ -680,16 +703,20 @@ TEST(KVCacheManagerTest, H2hReadExplicitAcceptsParallelism) {
 
 TEST(KVCacheManagerTest, AsymmetricBlockSizesGetBlockChunks) {
   // 1. Sender (Block size: 256 bytes)
-  TestKVCacheManager sender(/*num_layers=*/1, /*num_shards=*/1,
-                            /*slice_byte_size=*/256);
+  WithPlanSessions<TestKVCacheManager> sender_host(/*num_layers=*/1,
+                                                   /*num_shards=*/1,
+                                                   /*slice_byte_size=*/256);
+  TestKVCacheManager& sender = sender_host.manager();
   std::vector<uint8_t> sender_buffer(256 * 10, 0);
   std::vector<const uint8_t*> sender_ptrs = {sender_buffer.data()};
   std::vector<size_t> sender_sizes = {sender_buffer.size()};
   sender.SetExternalHostPointers(sender_ptrs, sender_sizes);
 
   // 2. Receiver (Block size: 512 bytes)
-  TestKVCacheManager receiver(/*num_layers=*/1, /*num_shards=*/1,
-                              /*slice_byte_size=*/512);
+  WithPlanSessions<TestKVCacheManager> receiver_host(/*num_layers=*/1,
+                                                     /*num_shards=*/1,
+                                                     /*slice_byte_size=*/512);
+  TestKVCacheManager& receiver = receiver_host.manager();
   std::vector<uint8_t> receiver_buffer(512 * 10, 0);
   std::vector<const uint8_t*> receiver_ptrs = {receiver_buffer.data()};
   std::vector<size_t> receiver_sizes = {receiver_buffer.size()};
@@ -787,10 +814,14 @@ TEST(KVCacheManagerTest, PlanlessPushRaddrUsesPeerLayerAddrs) {
 }
 
 TEST(KVCacheManagerTest, PlannedPushRaddrUsesReceiverLayerAddrs) {
-  TestKVCacheManager receiver(/*num_layers=*/2, /*num_shards=*/2,
-                              /*slice_byte_size=*/128, /*host_blocks=*/4);
-  TestKVCacheManager sender(/*num_layers=*/2, /*num_shards=*/2,
-                            /*slice_byte_size=*/128, /*host_blocks=*/4);
+  WithPlanSessions<TestKVCacheManager> receiver_host(
+      /*num_layers=*/2, /*num_shards=*/2,
+      /*slice_byte_size=*/128, /*host_blocks=*/4);
+  TestKVCacheManager& receiver = receiver_host.manager();
+  WithPlanSessions<TestKVCacheManager> sender_host(
+      /*num_layers=*/2, /*num_shards=*/2,
+      /*slice_byte_size=*/128, /*host_blocks=*/4);
+  TestKVCacheManager& sender = sender_host.manager();
   tpu_sync::rpc::StartTransferRequest request;
   request.set_uuid(9);
   auto* entry = (*request.mutable_shard_push_schedules())[1].add_entries();
@@ -820,14 +851,18 @@ TEST(KVCacheManagerTest, PlannedPushRaddrUsesReceiverLayerAddrs) {
   EXPECT_EQ(send_chunks[0].raddr, recv_chunks[0].ptr);
 }
 
-// When a receiver plan stages device blocks in remapped host blocks
-// (host_block_of), LayerHostAddrs reports that map in host_slot_by_block and
+// When a receiver plan stages device blocks in remapped host blocks (demand
+// staging), LayerHostAddrs reports that map in host_slot_by_block and
 // the sender computes raddr at the remapped host block.
 TEST(KVCacheManagerTest, PlannedPushRaddrUsesReceiverRemappedHostBlocks) {
-  TestKVCacheManager receiver(/*num_layers=*/2, /*num_shards=*/2,
-                              /*slice_byte_size=*/128, /*host_blocks=*/4);
-  TestKVCacheManager sender(/*num_layers=*/2, /*num_shards=*/2,
-                            /*slice_byte_size=*/128, /*host_blocks=*/4);
+  WithPlanSessions<TestKVCacheManager> receiver_host(
+      /*num_layers=*/2, /*num_shards=*/2,
+      /*slice_byte_size=*/128, /*host_blocks=*/4);
+  TestKVCacheManager& receiver = receiver_host.manager();
+  WithPlanSessions<TestKVCacheManager> sender_host(
+      /*num_layers=*/2, /*num_shards=*/2,
+      /*slice_byte_size=*/128, /*host_blocks=*/4);
+  TestKVCacheManager& sender = sender_host.manager();
   tpu_sync::rpc::StartTransferRequest request;
   request.set_uuid(9);
   auto* entry = (*request.mutable_shard_push_schedules())[1].add_entries();
@@ -838,8 +873,8 @@ TEST(KVCacheManagerTest, PlannedPushRaddrUsesReceiverRemappedHostBlocks) {
   entry->set_size_bytes(64);
   entry->set_src_block_id(2);
   entry->set_dst_block_id(7);
-  ABSL_ASSERT_OK(receiver.RegisterActivePlan(9, request, /*is_sender=*/false,
-                                             /*host_block_of=*/{{7, 1}}));
+  receiver_host.EnableDemandStaging();
+  ABSL_ASSERT_OK(receiver.RegisterActivePlan(9, request, /*is_sender=*/false));
   std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs =
       receiver.LayerHostAddrs(/*uuid=*/9);
   ASSERT_EQ(layer_host_addrs.size(), 2u);
@@ -2603,6 +2638,9 @@ class StubTransferSession : public TransferSession {
   absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
     return size_t{0};
   }
+  absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+    return absl::nullopt;
+  }
 };
 
 TEST(KVCacheManagerTest, GetSessionDefaultsToNotFoundAndDelegatesToHook) {
@@ -2626,6 +2664,123 @@ TEST(KVCacheManagerTest, GetSessionDefaultsToNotFoundAndDelegatesToHook) {
   EXPECT_THAT(manager.GetSession(/*uuid=*/42), IsOkAndHolds(expected_session));
   EXPECT_THAT(manager.GetSession(/*uuid=*/99),
               StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST(KVCacheManagerTest,
+     ZeroBlockAndNonHbmReceiverActivePlansDoNotHangWaitOrTimeout) {
+  WithPlanSessions<TestKVCacheManager> host(
+      std::make_unique<TestKVCacheManager>(
+          /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*host_blocks=*/4),
+      /*timeout_s=*/0.05);
+  host.EnableDemandStaging();
+
+  // 1) Non-HBM receiver plan with 1 block in schedule (acquires demand staging
+  // while total_blocks() == 0).
+  ::tpu_sync::rpc::StartTransferRequest dram_plan;
+  dram_plan.set_uuid(9001);
+  dram_plan.set_req_id("dram_plan_9001");
+  dram_plan.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_DRAM);
+  auto* entry = (*dram_plan.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_src_block_id(0);
+  entry->set_dst_block_id(0);
+  ABSL_ASSERT_OK(host.RegisterActivePlan(9001, dram_plan, /*is_sender=*/false));
+
+  // 2) HBM receiver plan with 0 blocks (total_blocks() == 0).
+  ::tpu_sync::rpc::StartTransferRequest zero_hbm_plan;
+  zero_hbm_plan.set_uuid(9002);
+  zero_hbm_plan.set_req_id("zero_hbm_plan_9002");
+  zero_hbm_plan.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  ABSL_ASSERT_OK(
+      host.RegisterActivePlan(9002, zero_hbm_plan, /*is_sender=*/false));
+
+  ABSL_EXPECT_OK(host.WaitForPendingWork());
+
+  // Past the 50ms transfer timeout, neither plan times out or reports a false
+  // failure in CompleteReadWithDetails.
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  CompleteReadResult completions = host.CompleteReadWithDetails();
+  EXPECT_THAT(completions.received, testing::IsEmpty());
+  EXPECT_THAT(completions.failed, testing::IsEmpty());
+  EXPECT_TRUE(host.manager().HasActivePlan(9001));
+  EXPECT_TRUE(host.manager().HasActivePlan(9002));
+
+  ABSL_EXPECT_OK(host.UnregisterActivePlan(9001));
+  ABSL_EXPECT_OK(host.UnregisterActivePlan(9002));
+  completions = host.CompleteReadWithDetails();
+  EXPECT_THAT(completions.failed, testing::IsEmpty());
+  EXPECT_FALSE(host.manager().HasActivePlan(9001));
+  EXPECT_FALSE(host.manager().HasActivePlan(9002));
+}
+
+TEST(KVCacheManagerTest,
+     RegisterActivePlanReusingSettledUuidPreservesCompletionAndLivePlan) {
+  WithPlanSessions<TestKVCacheManager> host(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/4);
+  ABSL_ASSERT_OK(host.manager().RegisterPools(
+      {DensePool("fa", /*storage_index=*/0, /*base_offset=*/0, /*stride=*/128,
+                 /*num_blocks=*/4)}));
+
+  // Subcase 1: Pool-reshard receive settles via UnregisterActivePlan before
+  // CompleteReadWithDetails is polled, then the same UUID is reused by
+  // RegisterActivePlan.
+  ::tpu_sync::rpc::StartTransferRequest pool_recv;
+  pool_recv.set_uuid(9101);
+  pool_recv.set_req_id("pool_recv_9101");
+  pool_recv.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  pool_recv.set_use_block_chunks(true);
+  pool_recv.set_parallelism(1);
+  pool_recv.add_transfer_pool_indices(0);
+  pool_recv.add_pool_dtype_tags("dtype_a");
+  auto* group = pool_recv.add_pool_groups();
+  group->add_pool_indices(0);
+  group->add_dst_device_block_ids(0);
+  group->set_expected_pushes(1);
+  group->add_dst_expected_extent_bytes(128);
+  auto* pool_entry =
+      (*pool_recv.mutable_shard_push_schedules())[0].add_entries();
+  pool_entry->set_dst_peer("127.0.0.1:1");
+  pool_entry->set_dst_shard_idx(0);
+  pool_entry->set_src_block_id(0);
+  pool_entry->set_dst_block_id(0);
+  pool_entry->set_size_bytes(128);
+  pool_entry->set_count(1);
+
+  ABSL_ASSERT_OK(
+      host.PoolReshardRegisterRecv(pool_recv, std::vector<int64_t>{0}));
+  ABSL_ASSERT_OK(host.UnregisterActivePlan(9101));
+  EXPECT_FALSE(host.manager().HasActivePlan(9101));
+
+  ::tpu_sync::rpc::StartTransferRequest sender_plan = pool_recv;
+  sender_plan.set_req_id("sender_plan_9101");
+  ABSL_ASSERT_OK(
+      host.RegisterActivePlan(9101, sender_plan, /*is_sender=*/true));
+  EXPECT_TRUE(host.manager().HasActivePlan(9101));
+
+  CompleteReadResult completions = host.CompleteReadWithDetails();
+  EXPECT_THAT(completions.failed, testing::ElementsAre("pool_recv_9101"));
+  EXPECT_TRUE(host.manager().HasActivePlan(9101));
+  ABSL_EXPECT_OK(host.UnregisterActivePlan(9101));
+
+  // Subcase 2: Block receive settles via OnBlockShardsReceived before
+  // CompleteReadWithDetails is polled, then the same UUID is reused by a
+  // sender RegisterActivePlan.
+  ABSL_ASSERT_OK(host.RegisterRecv(/*uuid=*/9102, "block_recv_9102",
+                                   /*expected_block_count=*/1));
+  ABSL_ASSERT_OK(host.OnBlockShardsReceived(/*block_ids=*/{0},
+                                            /*shard_ids=*/{0}, /*uuid=*/9102));
+
+  sender_plan.set_uuid(9102);
+  sender_plan.set_req_id("sender_plan_9102");
+  ABSL_ASSERT_OK(
+      host.RegisterActivePlan(9102, sender_plan, /*is_sender=*/true));
+  EXPECT_TRUE(host.manager().HasActivePlan(9102));
+
+  completions = host.CompleteReadWithDetails();
+  EXPECT_THAT(completions.received, testing::ElementsAre("block_recv_9102"));
+  EXPECT_TRUE(host.manager().HasActivePlan(9102));
+  ABSL_EXPECT_OK(host.UnregisterActivePlan(9102));
 }
 
 }  // namespace

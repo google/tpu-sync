@@ -86,6 +86,14 @@ struct ReshardSendSessionTestPeer {
     session.RecordPushCompletion(manager, status);
     session.EndOp();
   }
+
+  static void RecordPushCompletion(ReshardSendSession& session,
+                                   KVCacheManagerWithTransfer& manager,
+                                   const absl::Status& status) {
+    session.RecordPushCompletion(manager, status);
+  }
+
+  static void EndOp(ReshardSendSession& session) { session.EndOp(); }
 };
 
 namespace {
@@ -411,7 +419,7 @@ TEST(ReshardSendSessionTest,
   (*session)->Finish(absl::CancelledError("transfer cancelled"));
   EXPECT_FALSE((*session)->Done());
   EXPECT_EQ(transport.IdleConnectionCount(peer), 1u);
-  EXPECT_TRUE(manager.base()->HasActivePlan(plan.uuid()));
+  EXPECT_TRUE((*session)->plan().has_value());
 
   // The push's completion is the send's last op: it drops the plan and
   // closes the idle connections to its peer, then the send settles.
@@ -420,7 +428,7 @@ TEST(ReshardSendSessionTest,
 
   EXPECT_TRUE((*session)->Done());
   EXPECT_EQ(transport.IdleConnectionCount(peer), 0u);
-  EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
+  EXPECT_FALSE((*session)->plan().has_value());
 }
 
 TEST(ReshardSendSessionTest, PooledPolicyKeepsIdlePeerConnections) {
@@ -568,7 +576,7 @@ TEST(ReshardSendSessionTest, ExecutePushFailsFastWithoutTransportServer) {
           manager.base(), allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
-  ASSERT_TRUE(manager.base()->HasActivePlan(plan.uuid()));
+  ASSERT_TRUE(session->plan().has_value());
 
   manager.base()->StopTransportServer();
   EXPECT_THAT(session->ExecutePush(manager, std::vector<int64_t>{0}),
@@ -577,7 +585,7 @@ TEST(ReshardSendSessionTest, ExecutePushFailsFastWithoutTransportServer) {
   EXPECT_TRUE(session->Done());
   EXPECT_THAT(session->GetStatus(),
               StatusIs(absl::StatusCode::kFailedPrecondition));
-  EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
+  EXPECT_FALSE(session->plan().has_value());
   // A finished send refuses further pushes with its terminal status.
   EXPECT_THAT(session->ExecutePush(manager, std::vector<int64_t>{0}),
               StatusIs(absl::StatusCode::kFailedPrecondition));
@@ -628,7 +636,7 @@ TEST(ReshardSendSessionTest, PipelineSlotWaitTimeoutSettlesSendOutOfBand) {
   EXPECT_THAT(session->AwaitForDone(),
               StatusIs(absl::StatusCode::kDeadlineExceeded));
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
+  EXPECT_FALSE(session->plan().has_value());
   // SettleLocked released the parked leases along with everything else.
   for (size_t unit : kParkedUnits) {
     EXPECT_THAT(session->ResolveStagingSlot(unit),
@@ -671,9 +679,37 @@ TEST(ReshardSendSessionTest, StagingSlotReleasedAfterLastPeerPush) {
 
   ABSL_EXPECT_OK(session->AwaitForDone());
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
+  EXPECT_FALSE(session->plan().has_value());
   EXPECT_THAT(session->ResolveStagingSlot(0),
               StatusIs(absl::StatusCode::kCancelled));
+}
+
+TEST(ReshardSendSessionTest, FinishAfterLastPushFinalizingPreservesOkStatus) {
+  KVCacheManagerWithTransfer manager = MakeTestManager();
+  manager.base()->AttachPlaceholderDeviceHoldForTest();
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(manager.base(), /*num_slots=*/0,
+                                  /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(/*uuid=*/1404, /*dtype_tags=*/{""});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ReshardSendSession> session,
+      ReshardSendSession::Create(
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          /*parallelism=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
+
+  ReshardSendSessionTestPeer::BeginPush(*session, manager);
+  ReshardSendSessionTestPeer::RecordPushCompletion(*session, manager,
+                                                   absl::OkStatus());
+  EXPECT_FALSE(session->Done());
+
+  // A concurrent Finish(error) while finalizing is already true (before EndOp
+  // settles the session) must not overwrite the completed OK status.
+  session->Finish(absl::CancelledError("receive plan unregistered"));
+  ReshardSendSessionTestPeer::EndOp(*session);
+
+  EXPECT_TRUE(session->Done());
+  ABSL_EXPECT_OK(session->GetStatus());
 }
 
 }  // namespace

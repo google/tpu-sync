@@ -33,11 +33,13 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/optional.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
 
 namespace tpu_sync {
@@ -79,10 +81,8 @@ class TransferReceiveSession
   CreateFromActivePlan(
       kv_cache::KVCacheManagerBase* base,
       StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-      const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
+      const ::tpu_sync::rpc::StartTransferRequest& request,
       std::chrono::steady_clock::time_point deadline,
-      absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
-          host_block_of,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
   ~TransferReceiveSession() override { ReleaseStaging(); }
@@ -109,6 +109,13 @@ class TransferReceiveSession
     return draining_;
   }
 
+  absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+    if (transfer_plan_ == nullptr || Done()) {
+      return absl::nullopt;
+    }
+    return transfer_plan_;
+  }
+
   // Releases any held staging slot or dynamic host blocks. Safe to call
   // multiple times.
   bool HasStaging() const {
@@ -125,15 +132,6 @@ class TransferReceiveSession
     return true;
   }
   void EndRecvOp();
-
-  // Marks the plan to be unregistered when the receive settles, returning true
-  // if the receive is still active and will unregister on settle, or false if
-  // it is already done.
-  bool DeferUnregisterOnSettle();
-
-  // Atomically claims any pending settle-unregister request and writes its
-  // plan generation to |generation|.
-  bool TakePendingUnregister(uint64_t* generation);
 
   // Returns true if network/layer transfer is complete and all H2D futures are
   // ready.
@@ -185,6 +183,14 @@ class TransferReceiveSession
     absl::MutexLock lock(mu_);
     return total_blocks_;
   }
+  bool tracks_completion() const {
+    absl::MutexLock lock(mu_);
+    return tracks_completion_;
+  }
+  bool HasPendingWork() const {
+    absl::MutexLock lock(mu_);
+    return (tracks_completion_ && !done_) || in_flight_ > 0;
+  }
   std::chrono::steady_clock::time_point deadline() const {
     absl::MutexLock lock(mu_);
     return deadline_;
@@ -204,11 +210,13 @@ class TransferReceiveSession
   TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
                          StagingBlockAllocator* staging_allocator,
                          uint64_t uuid,
-                         std::shared_ptr<MetricsCollector> metrics_collector)
+                         std::shared_ptr<MetricsCollector> metrics_collector,
+                         std::shared_ptr<const TransferPlan> plan = nullptr)
       : base_(base),
         staging_allocator_(staging_allocator),
         uuid_(uuid),
         metrics_collector_(std::move(metrics_collector)),
+        transfer_plan_(std::move(plan)),
         blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0, 0),
         staging_layer_manager_(base != nullptr && base->num_host_layers() <
                                                       base->num_layers()
@@ -243,12 +251,11 @@ class TransferReceiveSession
     }
   }
 
-  // Initializes this receive session for an HBM destination active plan,
-  // allocating dynamic host staging via |staging_allocator_| when enabled.
-  absl::Status InitFromActivePlan(
-      const ::tpu_sync::rpc::StartTransferRequest& request, uint64_t generation,
-      std::chrono::steady_clock::time_point deadline,
-      absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
+  // Initializes this receive session for an HBM destination active plan.
+  void InitFromActivePlan(
+      const ::tpu_sync::rpc::StartTransferRequest& request,
+      std::chrono::steady_clock::time_point deadline, StagingAllocation staging,
+      const absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>&
           host_block_of);
 
   // Allocates host staging for a consumer StartRead load plan via
@@ -312,6 +319,7 @@ class TransferReceiveSession
       host_to_chip_ ABSL_GUARDED_BY(mu_);
   std::vector<H2dIssueFuture> h2d_dispatch_futures_ ABSL_GUARDED_BY(mu_);
   int32_t total_blocks_ ABSL_GUARDED_BY(mu_) = 0;
+  bool tracks_completion_ ABSL_GUARDED_BY(mu_) = true;
   // Per-shard count of (layer, block) units reported so far, indexed by shard;
   // shard `s` is complete at total_blocks_ * num_layers.
   std::vector<int64_t> blocks_received_per_shard_ ABSL_GUARDED_BY(mu_);
@@ -336,17 +344,9 @@ class TransferReceiveSession
   std::chrono::steady_clock::time_point completed_at_ ABSL_GUARDED_BY(mu_);
   std::vector<int> accumulated_host_block_ids_ ABSL_GUARDED_BY(mu_);
   std::chrono::steady_clock::time_point deadline_ ABSL_GUARDED_BY(mu_);
+  const std::shared_ptr<const TransferPlan> transfer_plan_;
   std::chrono::steady_clock::time_point start_time_ ABSL_GUARDED_BY(mu_);
   std::vector<raiden::PjRtCopyFuture> h2d_futures_ ABSL_GUARDED_BY(mu_);
-  // The plan is dropped when this receive settles: set for every
-  // demand-staged receiver plan (whose mapping would otherwise outlive its
-  // freed blocks) and when an unregister arrives while the receive is in
-  // flight (the plan stays mapped until then so late pushes resolve
-  // through its blocks).
-  bool unregister_on_settle_ ABSL_GUARDED_BY(mu_) = false;
-  // Generation of the plan this receive belongs to; settlement cleanup
-  // only touches that registration.
-  uint64_t plan_generation_ ABSL_GUARDED_BY(mu_) = 0;
   // staging_layer_manager_ synchronizes itself; cancelled_ mirrors draining_
   // so waiters in staging_layer_manager_.Acquire() can bail out without taking
   // mu_.

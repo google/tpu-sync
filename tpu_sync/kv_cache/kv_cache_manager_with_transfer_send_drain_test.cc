@@ -338,6 +338,8 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
                    std::nullopt) {
     ::tpu_sync::rpc::StartTransferRequest plan;
     plan.set_uuid(uuid);
+    plan.set_req_id(req_id);
+    plan.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
     plan.set_use_block_chunks(true);
     auto* entry = (*plan.mutable_shard_push_schedules())[0].add_entries();
     entry->set_dst_shard_idx(0);
@@ -345,7 +347,6 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     entry->set_dst_block_id(0);
     entry->set_size_bytes(base()->block_bytes(0));
     entry->set_count(blocks_per_layer);
-    CHECK_OK(RegisterActivePlan(uuid, plan, /*is_sender=*/false));
     absl::MutexLock lock(mu_);
     active_recv_sessions_[uuid] = *TransferReceiveSession::Create(
         base(), staging_allocator_.get(), uuid, req_id, blocks_per_layer,

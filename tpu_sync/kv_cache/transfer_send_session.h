@@ -26,6 +26,7 @@
 
 #include "absl/base/nullability.h"
 #include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -38,6 +39,7 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
+#include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {
@@ -63,6 +65,16 @@ class TransferSendSession
       std::string req_id, uint64_t uuid, absl::Span<const int64_t> block_ids,
       std::chrono::steady_clock::time_point deadline,
       std::chrono::steady_clock::time_point register_start);
+
+  // Creates a send session for a block-addressed resharding plan, acquiring
+  // dynamic host staging when enabled and populating |*host_block_of|.
+  static absl::StatusOr<std::shared_ptr<TransferSendSession>>
+  CreateFromActivePlan(
+      kv_cache::KVCacheManagerBase* base,
+      StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+      const ::tpu_sync::rpc::StartTransferRequest& request,
+      absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
+          host_block_of);
 
   ~TransferSendSession() override { ReleaseStagingBlocks(); }
 

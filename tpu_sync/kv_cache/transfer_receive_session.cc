@@ -255,11 +255,19 @@ absl::Status TransferReceiveSession::InitFromActivePlan(
       }
     }
   }
-  unregister_on_settle_ = !staging_.empty();
+  const bool hbm_receiver =
+      request.dst_mem_type() == ::tpu_sync::rpc::MEMORY_TYPE_HBM;
+  unregister_on_settle_ = hbm_receiver && !staging_.empty();
   plan_generation_ = generation;
   req_id_ = request.req_id().empty()
                 ? absl::StrCat("resharded_transfer_", uuid_)
                 : request.req_id();
+  deadline_ = deadline;
+  start_time_ = std::chrono::steady_clock::now();
+  if (!hbm_receiver) {
+    total_blocks_ = 0;
+    return absl::OkStatus();
+  }
 
   absl::flat_hash_set<int> unique_dst_blocks;
   int64_t expected_blocks = 0;
@@ -759,6 +767,11 @@ absl::Status TransferReceiveSession::OnBlockShardsReceived(
 
 absl::StatusOr<size_t> TransferReceiveSession::AcquireStagingSlot(
     size_t layer_idx) {
+  // A full host mirror stages every layer in place: there is no slot to lease
+  // and callers address the layer's own buffer.
+  if (base_ == nullptr || base_->num_host_layers() >= base_->num_layers()) {
+    return absl::NotFoundError("no bounded host staging");
+  }
   std::chrono::steady_clock::time_point deadline;
   {
     absl::MutexLock lock(mu_);

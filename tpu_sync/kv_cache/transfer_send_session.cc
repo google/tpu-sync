@@ -28,6 +28,7 @@
 
 #include "absl/base/nullability.h"
 #include "absl/cleanup/cleanup.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -84,6 +85,57 @@ TransferSendSession::Create(
         " for req_id=", session->req_id(), ", uuid=", uuid, ": positions ",
         duplicate_block->first_index, " and ", duplicate_block->duplicate_index,
         " of ", block_ids.size(), " blocks"));
+  }
+  return session;
+}
+
+absl::StatusOr<std::shared_ptr<TransferSendSession>>
+TransferSendSession::CreateFromActivePlan(
+    kv_cache::KVCacheManagerBase* base,
+    StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+    const ::tpu_sync::rpc::StartTransferRequest& request,
+    absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>*
+        host_block_of) {
+  StagingAllocation staging;
+  if (staging_allocator != nullptr &&
+      staging_allocator->dynamic_host_staging() &&
+      request.pool_groups_size() == 0) {
+    std::vector<int64_t> device_blocks;
+    absl::flat_hash_set<int64_t> seen;
+    for (const auto& [src_shard, schedule] : request.shard_push_schedules()) {
+      for (const auto& e : schedule.entries()) {
+        int64_t id = e.src_block_id();
+        if (seen.insert(id).second) device_blocks.push_back(id);
+      }
+    }
+    if (!device_blocks.empty()) {
+      absl::StatusOr<StagingAllocation> allocated = staging_allocator->Acquire(
+          static_cast<int64_t>(device_blocks.size()));
+      if (!allocated.ok()) {
+        return absl::ResourceExhaustedError(absl::StrCat(
+            "cannot stage ", device_blocks.size(), " blocks for plan ", uuid,
+            ": ", allocated.status().message()));
+      }
+      staging = *std::move(allocated);
+      absl::Span<const int> plan_blocks = staging.block_ids();
+      for (size_t i = 0; i < device_blocks.size(); ++i) {
+        (*host_block_of)[device_blocks[i]] = plan_blocks[i];
+      }
+    }
+  }
+  ABSL_ASSIGN_OR_RETURN(const DataConnectionReuse data_connection_reuse,
+                        ResolveDataConnectionReuse());
+  const auto now = std::chrono::steady_clock::now();
+  std::string req_id = request.req_id().empty()
+                           ? absl::StrCat("resharded_transfer_", uuid)
+                           : request.req_id();
+  auto session = std::shared_ptr<TransferSendSession>(
+      new TransferSendSession(base, staging_allocator, std::move(req_id), uuid,
+                              std::chrono::steady_clock::time_point::max(), now,
+                              data_connection_reuse));
+  {
+    absl::MutexLock lock(session->mu_);
+    session->staging_ = std::move(staging);
   }
   return session;
 }
@@ -236,6 +288,10 @@ absl::StatusOr<size_t> TransferSendSession::LookupStagingSlot(
   }
   std::optional<size_t> slot = staging_layer_manager_.Lookup(layer_idx);
   if (!slot.has_value()) {
+    // On a full host mirror a layer with no lease is addressed in place.
+    if (base_ == nullptr || base_->num_host_layers() >= base_->num_layers()) {
+      return absl::NotFoundError("no bounded host staging");
+    }
     return absl::FailedPreconditionError(absl::StrCat(
         "No staging slot leased for layer ", layer_idx, " (uuid=", uuid_, ")"));
   }

@@ -289,10 +289,6 @@ class KVCacheManagerWithTransfer {
   // names one registration of it (the same uuid may come back, e.g. on a
   // retry of the same transfer).
   uint64_t plan_generation_counter_ ABSL_GUARDED_BY(plan_lifecycle_mu_) = 0;
-  // Host staging held by a plan: a sender's, or a receiver's whose
-  // destination is host memory. Released when the plan is unregistered.
-  absl::flat_hash_map<uint64_t, StagingAllocation> plan_staging_
-      ABSL_GUARDED_BY(mu_);
   absl::Status EmplaceRecvSessionLocked(
       uint64_t uuid, const std::shared_ptr<TransferReceiveSession>& session)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);

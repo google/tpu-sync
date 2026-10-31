@@ -654,7 +654,6 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
     active_recv_sessions_.clear();
     active_pool_reshard_sends_.clear();
     active_pool_reshard_recvs_.clear();
-    plan_staging_.clear();
   }
   staging_allocator_.reset();
 }
@@ -779,15 +778,29 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
   // device block space. Pool-addressed plans keep their own addressing.
   absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>
       host_block_of;
-  // Staging ownership is settled before the plan is published. An HBM
-  // receiver's blocks belong to its receive session and return when the
-  // upload settles; a sender's blocks, and a host-memory receiver's,
-  // belong to the plan and return when it is unregistered.
-  const bool hbm_receiver =
-      !is_sender && request.dst_mem_type() == ::tpu_sync::rpc::MEMORY_TYPE_HBM;
-  // 2. If we are the receiver and the destination memory type is HBM,
-  //    populate active_recv_sessions_ to enable automatic H2D copy!
-  if (hbm_receiver) {
+  if (is_sender) {
+    ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSendSession> send_session,
+                          TransferSendSession::CreateFromActivePlan(
+                              base_.get(), staging_allocator_.get(), uuid,
+                              request, &host_block_of));
+    {
+      absl::MutexLock lock(mu_);
+      send_sessions_.insert_or_assign(uuid, send_session);
+    }
+    absl::Status registered = base_->RegisterActivePlan(
+        uuid, request, /*is_sender=*/true, host_block_of, generation);
+    if (!registered.ok()) {
+      {
+        absl::MutexLock lock(mu_);
+        send_sessions_.erase(uuid);
+      }
+      send_session->Finish(registered);
+      return registered;
+    }
+    return absl::OkStatus();
+  }
+
+  {
     absl::MutexLock lock(mu_);
     ABSL_ASSIGN_OR_RETURN(
         std::shared_ptr<TransferReceiveSession> recv_session,
@@ -795,53 +808,29 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
             base_.get(), staging_allocator_.get(), uuid, request, generation,
             DeadlineFromNow(), &host_block_of, metrics_collector_));
 
-    if (recv_session->total_blocks() > 0) {
+    if (recv_session->total_blocks() > 0 || recv_session->HasStaging()) {
       absl::Status inserted = EmplaceRecvSessionLocked(uuid, recv_session);
       if (!inserted.ok()) {
         recv_session->ReleaseStaging();
         return inserted;
       }
-      LOG(INFO) << "RegisterActivePlan (Receiver): Populated "
-                   "active_recv_sessions_ for UUID "
-                << uuid << " with " << recv_session->total_blocks()
-                << " total physical block-pushes (including duplicates across "
-                   "sources) for automatic H2D.";
-    }
-  } else if (staging_allocator_->dynamic_host_staging() &&
-             request.pool_groups_size() == 0) {
-    std::vector<int64_t> device_blocks;
-    absl::flat_hash_set<int64_t> seen;
-    for (const auto& [src_shard, schedule] : request.shard_push_schedules()) {
-      for (const auto& e : schedule.entries()) {
-        int64_t id = is_sender ? e.src_block_id() : e.dst_block_id();
-        if (seen.insert(id).second) device_blocks.push_back(id);
+      if (recv_session->total_blocks() > 0) {
+        LOG(INFO)
+            << "RegisterActivePlan (Receiver): Populated "
+               "active_recv_sessions_ for UUID "
+            << uuid << " with " << recv_session->total_blocks()
+            << " total physical block-pushes (including duplicates across "
+               "sources) for automatic H2D.";
       }
-    }
-    if (!device_blocks.empty()) {
-      absl::MutexLock lock(mu_);
-      absl::StatusOr<StagingAllocation> allocated = staging_allocator_->Acquire(
-          static_cast<int64_t>(device_blocks.size()));
-      if (!allocated.ok()) {
-        return absl::ResourceExhaustedError(absl::StrCat(
-            "cannot stage ", device_blocks.size(), " blocks for plan ", uuid,
-            ": ", allocated.status().message()));
-      }
-      StagingAllocation plan_staging = *std::move(allocated);
-      absl::Span<const int> plan_blocks = plan_staging.block_ids();
-      for (size_t i = 0; i < device_blocks.size(); ++i) {
-        host_block_of[device_blocks[i]] = plan_blocks[i];
-      }
-      plan_staging_[uuid] = std::move(plan_staging);
     }
   }
 
   // Publish the plan last: pushes resolve through it, so everything they
   // may touch exists by the time it is visible.
   absl::Status registered = base_->RegisterActivePlan(
-      uuid, request, is_sender, host_block_of, generation);
+      uuid, request, /*is_sender=*/false, host_block_of, generation);
   if (!registered.ok()) {
     absl::MutexLock lock(mu_);
-    plan_staging_.erase(uuid);
     auto recv = active_recv_sessions_.find(uuid);
     if (recv != active_recv_sessions_.end()) {
       recv->second->ReleaseStaging();
@@ -957,9 +946,9 @@ absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {
   absl::MutexLock lifecycle(plan_lifecycle_mu_);
   std::shared_ptr<TransferReceiveSession> recv;
   std::shared_ptr<ReshardReceiveSession> reshard_recv;
+  std::shared_ptr<TransferSendSession> send;
   {
     absl::MutexLock lock(mu_);
-    plan_staging_.erase(uuid);
     if (auto it = active_recv_sessions_.find(uuid);
         it != active_recv_sessions_.end() && !it->second->Done()) {
       recv = it->second;
@@ -967,6 +956,13 @@ absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {
                reshard_it != active_pool_reshard_recvs_.end() &&
                !reshard_it->second->Done()) {
       reshard_recv = reshard_it->second;
+    } else if (auto send_it = send_sessions_.find(uuid);
+               send_it != send_sessions_.end()) {
+      // The plan's registrant, not the CompleteReadWithDetails sweep, owns
+      // its send session: drop it before finishing it so the sweep never
+      // reports it as a transfer.
+      send = std::move(send_it->second);
+      send_sessions_.erase(send_it);
     }
   }
   // Unregistering a live receive, on either the block-addressed or the
@@ -988,6 +984,8 @@ absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {
     if (!reshard_recv->Done()) return absl::OkStatus();
     uint64_t generation = 0;
     reshard_recv->TakePendingUnregister(&generation);
+  } else if (send != nullptr && !send->Done()) {
+    send->Finish(absl::CancelledError("send plan unregistered"));
   }
   return base_->UnregisterActivePlanDirect(uuid);
 }

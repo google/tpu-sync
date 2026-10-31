@@ -285,6 +285,37 @@ TEST(ExpectedPushSendersTest, CountsReceiverPlanSchedules) {
   EXPECT_EQ(manager.base()->ExpectedPushSenders(1), std::nullopt);
 }
 
+// A sender plan's send session belongs to whoever registered the plan: the
+// CompleteReadWithDetails sweep never reports it, neither while it is
+// registered nor after unregistering cancels it.
+TEST(ActivePlanTest, SenderPlanIsNeverReportedAsATransfer) {
+  TestManager manager;
+  StartTransferRequest send_plan;
+  send_plan.set_uuid(7);
+  send_plan.set_req_id("sender_plan");
+  send_plan.set_is_sender(true);
+  send_plan.set_use_block_chunks(true);
+  auto* entry = (*send_plan.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer("127.0.0.1:1");
+  entry->set_src_block_id(0);
+  entry->set_dst_block_id(0);
+  entry->set_size_bytes(16);
+  entry->set_count(1);
+  ASSERT_TRUE(
+      manager.RegisterActivePlan(7, send_plan, /*is_sender=*/true).ok());
+
+  CompleteReadResult registered = manager.CompleteReadWithDetails();
+  EXPECT_THAT(registered.sent, IsEmpty());
+  EXPECT_THAT(registered.failed, IsEmpty());
+
+  ASSERT_TRUE(manager.UnregisterActivePlan(7).ok());
+  EXPECT_THAT(manager.GetSession(7), StatusIs(absl::StatusCode::kNotFound));
+  CompleteReadResult unregistered = manager.CompleteReadWithDetails();
+  EXPECT_THAT(unregistered.sent, IsEmpty());
+  EXPECT_THAT(unregistered.failed, IsEmpty());
+  EXPECT_FALSE(unregistered.details.contains("sender_plan"));
+}
+
 TEST(PoolReshardValidationTest, DeviceOnlyRejectionAtPublicEntryPoints) {
   TestManager manager;
   ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());

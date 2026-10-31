@@ -2600,10 +2600,7 @@ class StubTransferSession : public TransferSession {
   absl::Status GetStatus() const override { return absl::OkStatus(); }
   absl::Status AwaitForDone() override { return absl::OkStatus(); }
   bool IsDraining() const override { return false; }
-  absl::StatusOr<size_t> AcquireStagingSlot(size_t unit) override {
-    return size_t{0};
-  }
-  absl::StatusOr<size_t> LookupStagingSlot(size_t unit) const override {
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
     return size_t{0};
   }
 };

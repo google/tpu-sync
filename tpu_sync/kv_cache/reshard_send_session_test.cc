@@ -15,6 +15,7 @@
 #include "tpu_sync/kv_cache/reshard_send_session.h"
 
 #include <chrono>  // NOLINT(build/c++11)
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -44,6 +45,11 @@
 namespace tpu_raiden {
 
 struct ReshardSendSessionTestPeer {
+  static absl::StatusOr<size_t> AcquireStagingSlot(ReshardSendSession& session,
+                                                   size_t pool_idx) {
+    return session.AcquireStagingSlot(pool_idx);
+  }
+
   static absl::Status ValidatePlan(
       const kv_cache::KVCacheManagerBase& base,
       const ::tpu_sync::rpc::StartTransferRequest& plan,
@@ -497,30 +503,35 @@ TEST(ReshardSendSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
           std::chrono::steady_clock::now() + std::chrono::seconds(2), plan));
 
   // Pool 0 leases slot 0 (the only allocated host layer).
-  EXPECT_THAT(session->AcquireStagingSlot(0), IsOkAndHolds(0u));
-  EXPECT_THAT(session->LookupStagingSlot(0), IsOkAndHolds(0u));
+  EXPECT_THAT(ReshardSendSessionTestPeer::AcquireStagingSlot(*session, 0),
+              IsOkAndHolds(0u));
+  EXPECT_THAT(session->ResolveStagingSlot(0), IsOkAndHolds(0u));
 
   // Pool 1 blocks waiting for slot 0 until pool 0 releases its lease.
   absl::StatusOr<size_t> slot1;
-  std::thread release_waiter([&]() { slot1 = session->AcquireStagingSlot(1); });
+  std::thread release_waiter([&]() {
+    slot1 = ReshardSendSessionTestPeer::AcquireStagingSlot(*session, 1);
+  });
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
   EXPECT_EQ(ReshardSendSessionTestPeer::ReleaseStagingSlot(*session, 0),
             std::make_optional(0u));
   release_waiter.join();
   EXPECT_THAT(slot1, IsOkAndHolds(0u));
-  EXPECT_THAT(session->LookupStagingSlot(1), IsOkAndHolds(0u));
+  EXPECT_THAT(session->ResolveStagingSlot(1), IsOkAndHolds(0u));
 
   // Cancelling the session while pool 0 is blocked in AcquireStagingSlot wakes
   // the waiter with CancelledError and releases all staging slots on settle.
   absl::StatusOr<size_t> slot0_cancelled;
-  std::thread cancel_waiter(
-      [&]() { slot0_cancelled = session->AcquireStagingSlot(0); });
+  std::thread cancel_waiter([&]() {
+    slot0_cancelled =
+        ReshardSendSessionTestPeer::AcquireStagingSlot(*session, 0);
+  });
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
   session->Finish(absl::CancelledError("cancelled"));
   cancel_waiter.join();
   EXPECT_THAT(slot0_cancelled, StatusIs(absl::StatusCode::kCancelled));
   EXPECT_TRUE(session->Done());
-  EXPECT_THAT(session->LookupStagingSlot(1),
+  EXPECT_THAT(session->ResolveStagingSlot(1),
               StatusIs(absl::StatusCode::kCancelled));
 
   // Timeout when no slot is released before the session deadline.
@@ -533,9 +544,12 @@ TEST(ReshardSendSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
           &base, allocator.get(), std::vector<int64_t>{0}, /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::milliseconds(30),
           timeout_plan));
-  EXPECT_THAT(timeout_session->AcquireStagingSlot(0), IsOkAndHolds(0u));
-  EXPECT_THAT(timeout_session->AcquireStagingSlot(1),
-              StatusIs(absl::StatusCode::kDeadlineExceeded));
+  EXPECT_THAT(
+      ReshardSendSessionTestPeer::AcquireStagingSlot(*timeout_session, 0),
+      IsOkAndHolds(0u));
+  EXPECT_THAT(
+      ReshardSendSessionTestPeer::AcquireStagingSlot(*timeout_session, 1),
+      StatusIs(absl::StatusCode::kDeadlineExceeded));
 }
 
 // A precondition that needs no waiting fails ExecutePush synchronously, so
@@ -603,8 +617,12 @@ TEST(ReshardSendSessionTest, PipelineSlotWaitTimeoutSettlesSendOutOfBand) {
   // Park every slot on units the pipeline never releases, so pool 0's
   // AcquireStagingSlot can only end at the deadline.
   constexpr size_t kParkedUnits[] = {7, 8};
-  EXPECT_THAT(session->AcquireStagingSlot(kParkedUnits[0]), IsOkAndHolds(0u));
-  EXPECT_THAT(session->AcquireStagingSlot(kParkedUnits[1]), IsOkAndHolds(1u));
+  EXPECT_THAT(
+      ReshardSendSessionTestPeer::AcquireStagingSlot(*session, kParkedUnits[0]),
+      IsOkAndHolds(0u));
+  EXPECT_THAT(
+      ReshardSendSessionTestPeer::AcquireStagingSlot(*session, kParkedUnits[1]),
+      IsOkAndHolds(1u));
 
   ABSL_ASSERT_OK(session->ExecutePush(manager, std::vector<int64_t>{0}));
   EXPECT_THAT(session->AwaitForDone(),
@@ -613,10 +631,10 @@ TEST(ReshardSendSessionTest, PipelineSlotWaitTimeoutSettlesSendOutOfBand) {
   EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
   // SettleLocked released the parked leases along with everything else.
   for (size_t unit : kParkedUnits) {
-    EXPECT_THAT(session->LookupStagingSlot(unit),
+    EXPECT_THAT(session->ResolveStagingSlot(unit),
                 StatusIs(absl::StatusCode::kDeadlineExceeded));
   }
-  EXPECT_THAT(session->LookupStagingSlot(0),
+  EXPECT_THAT(session->ResolveStagingSlot(0),
               StatusIs(absl::StatusCode::kDeadlineExceeded));
 }
 
@@ -647,13 +665,14 @@ TEST(ReshardSendSessionTest, StagingSlotReleasedAfterLastPeerPush) {
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
 
   // Stage pool 0 as the pipeline would, then issue its two peer pushes.
-  EXPECT_THAT(session->AcquireStagingSlot(0), IsOkAndHolds(0u));
+  EXPECT_THAT(ReshardSendSessionTestPeer::AcquireStagingSlot(*session, 0),
+              IsOkAndHolds(0u));
   ReshardSendSessionTestPeer::StartPoolPush(*session, manager, /*pool_idx=*/0);
 
   ABSL_EXPECT_OK(session->AwaitForDone());
   EXPECT_TRUE(session->Done());
   EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
-  EXPECT_THAT(session->LookupStagingSlot(0),
+  EXPECT_THAT(session->ResolveStagingSlot(0),
               StatusIs(absl::StatusCode::kCancelled));
 }
 

@@ -191,15 +191,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
         end_incoming_push;
     std::function<absl::Status(uint64_t uuid)> on_recv_progress;
     std::function<absl::Status(uint64_t uuid)> on_recv_network_complete;
-    // Returns the host layer buffer the receive session of |uuid| leased to
-    // |layer_idx|, leasing one if needed and blocking while every buffer is in
-    // use.
-    std::function<absl::StatusOr<size_t>(uint64_t uuid, size_t layer_idx)>
-        acquire_recv_staging;
-    // Returns the host layer buffer the send session of |uuid| leased to
-    // |layer_idx|, or an error if |layer_idx| holds no lease.
-    std::function<absl::StatusOr<size_t>(uint64_t uuid, size_t layer_idx)>
-        lookup_send_staging;
     // Returns the active transfer session registered under |uuid|, or
     // kNotFound when no session holds it.
     std::function<absl::StatusOr<std::shared_ptr<TransferSession>>(

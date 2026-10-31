@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -28,12 +29,14 @@
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/time/time.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -560,15 +563,21 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
   }
 
   // Setup hooks to lease host layer 1 for pool 3.
+  class StubPoolTransferSession : public TransferSession {
+   public:
+    bool Done() const override { return false; }
+    void Finish(const absl::Status& status) override {}
+    absl::Status GetStatus() const override { return absl::OkStatus(); }
+    absl::Status AwaitForDone() override { return absl::OkStatus(); }
+    bool IsDraining() const override { return false; }
+    absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
+      return unit % 2;
+    }
+  };
+  auto session = std::make_shared<StubPoolTransferSession>();
   KVCacheManagerBase::TransferEventHooks hooks;
-  hooks.acquire_recv_staging = [](uint64_t uuid,
-                                  size_t pool_idx) -> absl::StatusOr<size_t> {
-    return pool_idx % 2;
-  };
-  hooks.lookup_send_staging = [](uint64_t uuid,
-                                 size_t pool_idx) -> absl::StatusOr<size_t> {
-    return pool_idx % 2;
-  };
+  hooks.get_session = [session](uint64_t uuid)
+      -> absl::StatusOr<std::shared_ptr<TransferSession>> { return session; };
   manager.SetTransferEventHooks(std::move(hooks));
 
   // Lease blocks 2 and 4 on storage 3 under uuid 42.

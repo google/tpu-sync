@@ -142,15 +142,10 @@ class TransferSendSession
       const std::vector<int64_t>& src_block_ids,
       const std::vector<int64_t>& dst_block_ids);
 
-  // Returns the host layer buffer leased to |layer_idx|, leasing one when it
-  // has none and blocking while every buffer is in use. There is one buffer
-  // per layer on a full host mirror, so the lease is then layer_idx itself
-  // and never waits. A timeout fails the send in the staging phase.
-  absl::StatusOr<size_t> AcquireStagingSlot(size_t layer_idx) override;
-
-  // Returns the host layer buffer currently leased to |layer_idx|, or
-  // kFailedPrecondition if |layer_idx| holds no lease.
-  absl::StatusOr<size_t> LookupStagingSlot(size_t layer_idx) const override;
+  // Returns the buffer the device-to-host copy leased to |layer_idx|.
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t layer_idx) override {
+    return LookupStagingSlot(layer_idx);
+  }
 
   const StagingLayerManager& staging_layer_manager() const {
     return staging_layer_manager_;
@@ -177,6 +172,16 @@ class TransferSendSession
   }
 
  private:
+  // Returns the host layer buffer leased to |layer_idx|, leasing one when it
+  // has none and blocking while every buffer is in use. There is one buffer
+  // per layer on a full host mirror, so the lease is then layer_idx itself
+  // and never waits. A timeout fails the send in the staging phase.
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t layer_idx);
+
+  // Returns the host layer buffer currently leased to |layer_idx|, or
+  // kFailedPrecondition if |layer_idx| holds no lease.
+  absl::StatusOr<size_t> LookupStagingSlot(size_t layer_idx) const;
+
   TransferSendSession(kv_cache::KVCacheManagerBase* base,
                       StagingBlockAllocator* staging_allocator,
                       std::string req_id, uint64_t uuid,

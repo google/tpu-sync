@@ -3289,16 +3289,13 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
     block_size_bytes = static_cast<size_t>(pool.block_stride_bytes);
     size_t host_layer_idx = pool.storage_index;
     if (uuid != 0) {
-      absl::StatusOr<size_t> slot =
-          absl::NotFoundError("no staging hook configured");
-      if ((!has_plan || plan_snapshot->is_sender) &&
-          transfer_hooks_.lookup_send_staging != nullptr) {
-        slot = transfer_hooks_.lookup_send_staging(uuid, layer_idx);
-      }
-      if (absl::IsNotFound(slot.status()) &&
-          (!has_plan || !plan_snapshot->is_sender) &&
-          transfer_hooks_.acquire_recv_staging != nullptr) {
-        slot = transfer_hooks_.acquire_recv_staging(uuid, layer_idx);
+      absl::StatusOr<std::shared_ptr<TransferSession>> session =
+          GetSession(uuid);
+      absl::StatusOr<size_t> slot = absl::NotFoundError("session not found");
+      if (session.ok()) {
+        slot = (*session)->ResolveStagingSlot(layer_idx);
+      } else if (!absl::IsNotFound(session.status())) {
+        return {};
       }
       if (slot.ok()) {
         host_layer_idx = *slot;
@@ -3330,16 +3327,13 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
       if (uuid == 0) {
         return {};
       }
-      absl::StatusOr<size_t> slot =
-          absl::NotFoundError("no staging hook configured");
-      if ((!has_plan || plan_snapshot->is_sender) &&
-          transfer_hooks_.lookup_send_staging != nullptr) {
-        slot = transfer_hooks_.lookup_send_staging(uuid, layer_idx);
-      }
-      if (absl::IsNotFound(slot.status()) &&
-          (!has_plan || !plan_snapshot->is_sender) &&
-          transfer_hooks_.acquire_recv_staging != nullptr) {
-        slot = transfer_hooks_.acquire_recv_staging(uuid, layer_idx);
+      absl::StatusOr<std::shared_ptr<TransferSession>> session =
+          GetSession(uuid);
+      absl::StatusOr<size_t> slot = absl::NotFoundError("session not found");
+      if (session.ok()) {
+        slot = (*session)->ResolveStagingSlot(layer_idx);
+      } else if (!absl::IsNotFound(session.status())) {
+        return {};
       }
       if (!slot.ok()) {
         return {};

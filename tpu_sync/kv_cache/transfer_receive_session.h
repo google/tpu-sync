@@ -168,15 +168,10 @@ class TransferReceiveSession
   absl::Status ExecuteLayerH2d(KVCacheManagerWithTransfer& manager,
                                size_t layer_idx);
 
-  // Returns the host layer buffer leased to |layer_idx|, leasing one when it
-  // has none and blocking while every buffer is in use. A timeout fails the
-  // receive. Callable from any thread; concurrent calls for the same layer
-  // (one per shard stream) observe one lease.
-  absl::StatusOr<size_t> AcquireStagingSlot(size_t layer_idx) override;
-
-  // Returns the host layer buffer currently leased to |layer_idx|, or
-  // kFailedPrecondition if |layer_idx| holds no lease.
-  absl::StatusOr<size_t> LookupStagingSlot(size_t layer_idx) const override;
+  // Leases a buffer to |layer_idx| on first use.
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t layer_idx) override {
+    return AcquireStagingSlot(layer_idx);
+  }
 
   const StagingLayerManager& staging_layer_manager() const {
     return staging_layer_manager_;
@@ -196,6 +191,16 @@ class TransferReceiveSession
   }
 
  private:
+  // Returns the host layer buffer leased to |layer_idx|, leasing one when it
+  // has none and blocking while every buffer is in use. A timeout fails the
+  // receive. Callable from any thread; concurrent calls for the same layer
+  // (one per shard stream) observe one lease.
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t layer_idx);
+
+  // Returns the host layer buffer currently leased to |layer_idx|, or
+  // kFailedPrecondition if |layer_idx| holds no lease.
+  absl::StatusOr<size_t> LookupStagingSlot(size_t layer_idx) const;
+
   TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
                          StagingBlockAllocator* staging_allocator,
                          uint64_t uuid,

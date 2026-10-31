@@ -99,18 +99,23 @@ class ReshardSendSession
   absl::Status ExecutePush(KVCacheManagerWithTransfer& manager,
                            absl::Span<const int64_t> src_block_ids);
 
+  // Returns the buffer the device-to-host copy leased to |pool_idx|.
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t pool_idx) override {
+    return LookupStagingSlot(pool_idx);
+  }
+
+ private:
+  friend struct ReshardSendSessionTestPeer;
+
   // Returns the host staging buffer leased to |pool_idx|, leasing one when it
   // has none and waiting until deadline when every slot is leased.
-  absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx) override;
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx);
 
   // Returns the host staging buffer currently leased to |pool_idx|. Fails
   // with the session's status (or kCancelled) once the session is draining
   // and holds no lease for |pool_idx|, and kFailedPrecondition when a live
   // session holds none.
-  absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const override;
-
- private:
-  friend struct ReshardSendSessionTestPeer;
+  absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const;
 
   // Checks the preconditions of ExecutePush that need no waiting: a running
   // transport server, at least one host staging layer, and every transfer

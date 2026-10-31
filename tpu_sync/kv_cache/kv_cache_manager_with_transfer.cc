@@ -458,54 +458,6 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
     }
     return recv_session->OnRecvNetworkComplete();
   };
-  hooks.acquire_recv_staging =
-      [this](uint64_t uuid, size_t layer_idx) -> absl::StatusOr<size_t> {
-    std::shared_ptr<TransferReceiveSession> recv_session;
-    std::shared_ptr<ReshardReceiveSession> reshard_session;
-    {
-      absl::MutexLock lock(mu_);
-      auto it = active_recv_sessions_.find(uuid);
-      if (it != active_recv_sessions_.end()) {
-        recv_session = it->second;
-      } else {
-        auto reshard_it = active_pool_reshard_recvs_.find(uuid);
-        if (reshard_it != active_pool_reshard_recvs_.end()) {
-          reshard_session = reshard_it->second;
-        } else {
-          return absl::NotFoundError(
-              absl::StrCat("Receive session ", uuid, " not found"));
-        }
-      }
-    }
-    if (recv_session != nullptr) {
-      return recv_session->AcquireStagingSlot(layer_idx);
-    }
-    return reshard_session->AcquireStagingSlot(layer_idx);
-  };
-  hooks.lookup_send_staging =
-      [this](uint64_t uuid, size_t layer_idx) -> absl::StatusOr<size_t> {
-    std::shared_ptr<TransferSendSession> send_session;
-    std::shared_ptr<ReshardSendSession> reshard_session;
-    {
-      absl::MutexLock lock(mu_);
-      auto it = send_sessions_.find(uuid);
-      if (it != send_sessions_.end()) {
-        send_session = it->second;
-      } else {
-        auto reshard_it = active_pool_reshard_sends_.find(uuid);
-        if (reshard_it != active_pool_reshard_sends_.end()) {
-          reshard_session = reshard_it->second;
-        } else {
-          return absl::NotFoundError(
-              absl::StrCat("Send session ", uuid, " not found"));
-        }
-      }
-    }
-    if (send_session != nullptr) {
-      return send_session->LookupStagingSlot(layer_idx);
-    }
-    return reshard_session->LookupStagingSlot(layer_idx);
-  };
   hooks.get_session = [this](uint64_t uuid) { return GetSession(uuid); };
   base_->SetTransferEventHooks(std::move(hooks));
 }

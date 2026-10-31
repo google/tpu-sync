@@ -125,17 +125,22 @@ class ReshardReceiveSession
   absl::Status OnPoolReceived(KVCacheManagerWithTransfer& manager,
                               size_t pool_idx);
 
-  // Returns the host staging buffer leased to |pool_idx|, leasing one when it
-  // has none and waiting until deadline when every slot is leased.
-  absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx) override;
-
-  // Returns the host staging buffer currently leased to |pool_idx|, or
-  // kFailedPrecondition if |pool_idx| holds no lease.
-  absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const override;
+  // Leases a buffer to |pool_idx| on first use.
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t pool_idx) override {
+    return AcquireStagingSlot(pool_idx);
+  }
 
  private:
   friend struct PoolReshardRecvTestPeer;
   friend struct ReshardReceiveSessionTestPeer;
+
+  // Returns the host staging buffer leased to |pool_idx|, leasing one when it
+  // has none and waiting until deadline when every slot is leased.
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx);
+
+  // Returns the host staging buffer currently leased to |pool_idx|, or
+  // kFailedPrecondition if |pool_idx| holds no lease.
+  absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const;
 
   ReshardReceiveSession(kv_cache::KVCacheManagerBase* base,
                         StagingBlockAllocator* staging_allocator, uint64_t uuid,

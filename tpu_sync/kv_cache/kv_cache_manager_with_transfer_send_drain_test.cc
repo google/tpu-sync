@@ -1174,9 +1174,8 @@ TEST(RecvLifecycleTest,
             std::chrono::steady_clock::now() + std::chrono::seconds(10),
             /*acquire_staging=*/true);
     weak_session = session;
-    EXPECT_TRUE(session->HasStaging());
     EXPECT_EQ(consumer.free_slots(), kSlots - 1);
-    ASSERT_THAT(session->ExecuteLayerH2d(consumer, /*layer_idx=*/0),
+    ASSERT_THAT(session->ExecuteLayerH2d(/*layer_idx=*/0),
                 ::absl_testing::IsOk());
     ASSERT_EQ(consumer.copies_issued(), 1);
   }

@@ -94,7 +94,6 @@ class ReshardSendSession
   }
 
   const std::string& req_id() const { return req_id_; }
-  uint64_t uuid() const { return uuid_; }
   std::chrono::steady_clock::time_point deadline() const { return deadline_; }
   // Position in the request's sub-transfer chain (both zero for a
   // single-plan request); see StartTransferRequest.sub_plan_index.
@@ -139,8 +138,7 @@ class ReshardSendSession
   // pool index resolving on |base_|.
   absl::Status ValidatePushPreconditions() const;
 
-  void ExecutePushPipeline(KVCacheManagerWithTransfer& manager,
-                           std::vector<int64_t> src_block_ids);
+  void ExecutePushPipeline(std::vector<int64_t> src_block_ids);
 
   ReshardSendSession(kv_cache::KVCacheManagerBase* base,
                      StagingBlockAllocator* staging_allocator,
@@ -160,9 +158,8 @@ class ReshardSendSession
 
   // Records completion or failure of one (pool, peer) push operation and
   // releases staging resources once all scheduled pushes settle.
-  void RecordPushCompletion(KVCacheManagerWithTransfer& manager,
-                            const absl::Status& status);
-  void StartPoolPush(KVCacheManagerWithTransfer& manager, size_t pool_idx);
+  void RecordPushCompletion(const absl::Status& status);
+  void StartPoolPush(size_t pool_idx);
   void SettleLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ReleaseLeasesLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 

@@ -117,15 +117,6 @@ class TransferReceiveSession
     return transfer_plan_;
   }
 
-  // Releases any held staging slot or dynamic host blocks. Safe to call
-  // multiple times.
-  bool HasStaging() const {
-    absl::MutexLock lock(mu_);
-    return !staging_.empty();
-  }
-
-  void ReleaseStaging();
-
   bool TryBeginOp() override {
     absl::MutexLock lock(mu_);
     if (done_ || draining_) return false;
@@ -156,16 +147,14 @@ class TransferReceiveSession
   // received every (layer, block) of the session, and the network phase
   // completes once every shard has. Routed pushes report a block range once
   // per shard subset, so a shard's count only advances on streams carrying it.
-  absl::Status OnBlockShardsReceived(KVCacheManagerWithTransfer& manager,
-                                     const std::vector<int>& block_ids,
+  absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
                                      absl::Span<const int> shard_ids);
 
   // Issues H2D copy for |layer_idx| using |base_| and registers the completion
   // callback. When fewer host layer buffers exist than layers, the copy reads
   // the host layer buffer leased to |layer_idx| and the callback releases the
   // lease.
-  absl::Status ExecuteLayerH2d(KVCacheManagerWithTransfer& manager,
-                               size_t layer_idx);
+  absl::Status ExecuteLayerH2d(size_t layer_idx);
 
   // Leases a buffer to |layer_idx| on first use.
   absl::StatusOr<size_t> ResolveStagingSlot(size_t layer_idx) override {
@@ -279,6 +268,7 @@ class TransferReceiveSession
   using H2dIssueFuture =
       std::shared_future<absl::StatusOr<raiden::PjRtCopyFuture>>;
 
+  void ReleaseStaging();
   void ReleaseStagingLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   // Transitions the session into draining/completed state. If |status| is
   // non-OK and this is the first failure, records |status| and attributes the

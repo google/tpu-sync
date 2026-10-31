@@ -46,7 +46,6 @@ class StartTransferRequest;
 
 namespace tpu_raiden {
 
-class KVCacheManagerWithTransfer;
 class StagingBlockAllocator;
 
 // Encapsulates the consumer-side state and execution lifecycle of a multi-tag
@@ -99,28 +98,15 @@ class ReshardReceiveSession
   }
 
   const std::string& req_id() const { return req_id_; }
-  uint64_t uuid() const { return uuid_; }
   std::chrono::steady_clock::time_point deadline() const { return deadline_; }
   // Position in the request's sub-transfer chain (both zero for a
   // single-plan request); see StartTransferRequest.sub_plan_index.
   int32_t sub_plan_index() const { return sub_plan_index_; }
   int32_t sub_plan_count() const { return sub_plan_count_; }
 
-  // Releases any held pool staging leases for |uuid_|. Safe to call multiple
-  // times.
-  void ReleaseStaging();
-
-  // Returns true if network/pool transfer is complete and all H2D futures are
-  // ready.
-  bool IsReadyToComplete() const;
-
-  // Returns true if this session still has pending network or H2D work.
-  bool HasPendingWork() const;
-
   // Handles pool completion notifications for this pool-reshard receive
   // session.
-  absl::Status OnPoolReceived(KVCacheManagerWithTransfer& manager,
-                              size_t pool_idx);
+  absl::Status OnPoolReceived(size_t pool_idx);
 
   // Leases a buffer to |pool_idx| on first use.
   absl::StatusOr<size_t> ResolveStagingSlot(size_t pool_idx) override {
@@ -164,6 +150,7 @@ class ReshardReceiveSession
   absl::Status AcquireStagingLeases(
       const ::tpu_sync::rpc::StartTransferRequest& plan);
 
+  void ReleaseStaging();
   void ReleaseStagingLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void FinishLocked(const absl::Status& status = absl::OkStatus())
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -171,17 +158,15 @@ class ReshardReceiveSession
 
   // Handles completion of |pool_idx|'s H2D upload and finalizes the
   // pool-reshard receive when all pools have completed or on error.
-  void FinishPoolH2d(KVCacheManagerWithTransfer& manager, size_t pool_idx,
-                     const absl::Status& status);
+  void FinishPoolH2d(size_t pool_idx, const absl::Status& status);
 
-  bool AllH2dDoneLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   absl::Status RecordPoolReceivedLocked(size_t pool_idx)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   std::vector<std::pair<size_t, std::vector<int64_t>>>
   CollectEligiblePoolH2dsLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   bool RecordPoolH2dResultLocked(size_t pool_idx, const absl::Status& status)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  void ExecuteEligiblePoolH2ds(KVCacheManagerWithTransfer& manager);
+  void ExecuteEligiblePoolH2ds();
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
@@ -195,13 +180,11 @@ class ReshardReceiveSession
   const std::shared_ptr<const TransferPlan> transfer_plan_;
   std::vector<int64_t> chip_block_ids_ ABSL_GUARDED_BY(mu_);
   bool staging_released_ ABSL_GUARDED_BY(mu_) = true;
-  bool network_completed_ ABSL_GUARDED_BY(mu_) = false;
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
   absl::Status status_ ABSL_GUARDED_BY(mu_);
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   bool reshard_finalizing_ ABSL_GUARDED_BY(mu_) = false;
-  std::vector<raiden::PjRtCopyFuture> h2d_futures_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<size_t> expected_pool_indices_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<size_t> started_pool_indices_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<size_t> completed_pool_indices_ ABSL_GUARDED_BY(mu_);

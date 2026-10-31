@@ -559,25 +559,6 @@ void ReshardReceiveSession::EndOp() {
   EndRecvOpLocked();
 }
 
-bool ReshardReceiveSession::AllH2dDoneLocked() const {
-  for (const auto& f : h2d_futures_) {
-    if (!f.IsReady()) return false;
-  }
-  return true;
-}
-
-bool ReshardReceiveSession::IsReadyToComplete() const {
-  absl::MutexLock lock(mu_);
-  return network_completed_ && AllH2dDoneLocked();
-}
-
-bool ReshardReceiveSession::HasPendingWork() const {
-  absl::MutexLock lock(mu_);
-  if (done_) return false;
-  if (!network_completed_) return true;
-  return !AllH2dDoneLocked();
-}
-
 absl::Status ReshardReceiveSession::RecordPoolReceivedLocked(size_t pool_idx) {
   if (expected_pool_indices_.find(pool_idx) == expected_pool_indices_.end()) {
     return absl::InvalidArgumentError(absl::StrCat(
@@ -637,8 +618,7 @@ bool ReshardReceiveSession::RecordPoolH2dResultLocked(
   return false;
 }
 
-absl::Status ReshardReceiveSession::OnPoolReceived(
-    KVCacheManagerWithTransfer& manager, size_t pool_idx) {
+absl::Status ReshardReceiveSession::OnPoolReceived(size_t pool_idx) {
   {
     absl::MutexLock lock(mu_);
     if (done_) {
@@ -647,12 +627,11 @@ absl::Status ReshardReceiveSession::OnPoolReceived(
     }
     TF_RETURN_IF_ERROR(RecordPoolReceivedLocked(pool_idx));
   }
-  ExecuteEligiblePoolH2ds(manager);
+  ExecuteEligiblePoolH2ds();
   return absl::OkStatus();
 }
 
-void ReshardReceiveSession::ExecuteEligiblePoolH2ds(
-    KVCacheManagerWithTransfer& manager) {
+void ReshardReceiveSession::ExecuteEligiblePoolH2ds() {
   std::vector<std::pair<size_t, std::vector<int64_t>>> to_launch;
   {
     absl::MutexLock lock(mu_);
@@ -680,17 +659,16 @@ void ReshardReceiveSession::ExecuteEligiblePoolH2ds(
     if (dst_chip_block_ids.empty()) {
       // ValidateReceiverCoverage rejects groups without destination blocks,
       // so an empty list here is a broken invariant, not a legal no-op.
-      FinishPoolH2d(manager, pool_idx,
-                    absl::InternalError(
-                        absl::StrCat("pool ", pool_idx, " of UUID ", uuid_,
-                                     " has no destination blocks to upload")));
+      FinishPoolH2d(pool_idx, absl::InternalError(absl::StrCat(
+                                  "pool ", pool_idx, " of UUID ", uuid_,
+                                  " has no destination blocks to upload")));
       staging_layer_manager_.Release(pool_idx);
       EndOp();
       continue;
     }
     absl::StatusOr<size_t> slot = LookupStagingSlot(pool_idx);
     if (!slot.ok()) {
-      FinishPoolH2d(manager, pool_idx, slot.status());
+      FinishPoolH2d(pool_idx, slot.status());
       EndOp();
       continue;
     }
@@ -699,32 +677,27 @@ void ReshardReceiveSession::ExecuteEligiblePoolH2ds(
         base_->H2dPoolBlocks(pool_idx, dst_chip_block_ids,
                              /*shard_idx=*/std::nullopt, uuid_, host_layer_idx);
     if (!copy_future.ok()) {
-      FinishPoolH2d(manager, pool_idx, copy_future.status());
+      FinishPoolH2d(pool_idx, copy_future.status());
       staging_layer_manager_.Release(pool_idx);
       EndOp();
       continue;
     }
     raiden::PjRtCopyFuture future = *std::move(copy_future);
-    {
-      absl::MutexLock lock(mu_);
-      h2d_futures_.push_back(future);
-    }
-    future.OnReady([self = shared_from_this(), &manager,
-                    pool_idx = pool_idx](auto copy_status) {
-      if (copy_status.ok()) {
-        self->staging_layer_manager_.Release(pool_idx);
-        self->FinishPoolH2d(manager, pool_idx, absl::OkStatus());
-      } else {
-        self->FinishPoolH2d(manager, pool_idx, copy_status.status());
-        self->staging_layer_manager_.Release(pool_idx);
-      }
-      self->EndOp();
-    });
+    future.OnReady(
+        [self = shared_from_this(), pool_idx = pool_idx](auto copy_status) {
+          if (copy_status.ok()) {
+            self->staging_layer_manager_.Release(pool_idx);
+            self->FinishPoolH2d(pool_idx, absl::OkStatus());
+          } else {
+            self->FinishPoolH2d(pool_idx, copy_status.status());
+            self->staging_layer_manager_.Release(pool_idx);
+          }
+          self->EndOp();
+        });
   }
 }
 
-void ReshardReceiveSession::FinishPoolH2d(KVCacheManagerWithTransfer& manager,
-                                          size_t pool_idx,
+void ReshardReceiveSession::FinishPoolH2d(size_t pool_idx,
                                           const absl::Status& status) {
   bool finished = false;
   {
@@ -735,7 +708,7 @@ void ReshardReceiveSession::FinishPoolH2d(KVCacheManagerWithTransfer& manager,
     finished = RecordPoolH2dResultLocked(pool_idx, status);
   }
   if (!finished && status.ok()) {
-    ExecuteEligiblePoolH2ds(manager);
+    ExecuteEligiblePoolH2ds();
   }
   std::chrono::steady_clock::time_point session_start_time;
   bool should_record_duration = false;
@@ -752,7 +725,6 @@ void ReshardReceiveSession::FinishPoolH2d(KVCacheManagerWithTransfer& manager,
       } else {
         session_start_time = start_time_;
         should_record_duration = true;
-        network_completed_ = true;
       }
     }
     Finish(terminal_status);

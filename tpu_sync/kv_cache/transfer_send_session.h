@@ -116,11 +116,6 @@ class TransferSendSession
     return transfer_plan_;
   }
 
-  bool HasStaging() const {
-    absl::MutexLock lock(mu_);
-    return !staging_.empty();
-  }
-
   // Validates deadline, requested blocks, and single-pull invariant, then marks
   // |pull_started_| true. Throws std::runtime_error or std::invalid_argument on
   // violation.
@@ -161,24 +156,7 @@ class TransferSendSession
   }
 
   const std::string& req_id() const { return req_id_; }
-  uint64_t uuid() const { return uuid_; }
   std::chrono::steady_clock::time_point deadline() const { return deadline_; }
-  std::chrono::steady_clock::time_point register_start() const {
-    return register_start_;
-  }
-
-  int64_t num_blocks() const {
-    absl::MutexLock lock(mu_);
-    return num_blocks_;
-  }
-  int64_t total_bytes() const {
-    absl::MutexLock lock(mu_);
-    return total_bytes_;
-  }
-  std::chrono::steady_clock::time_point d2h_done() const {
-    absl::MutexLock lock(mu_);
-    return d2h_done_;
-  }
 
  private:
   // Returns the host layer buffer leased to |layer_idx|, leasing one when it
@@ -242,12 +220,8 @@ class TransferSendSession
   const DataConnectionReuse data_connection_reuse_;
   const std::shared_ptr<const TransferPlan> transfer_plan_;
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
-  int64_t num_blocks_ ABSL_GUARDED_BY(mu_) = 0;
-  int64_t registered_num_blocks_ ABSL_GUARDED_BY(mu_) = 0;
-  int64_t total_bytes_ ABSL_GUARDED_BY(mu_) = 0;
   std::vector<int64_t> registered_block_ids_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<int64_t> registered_block_set_ ABSL_GUARDED_BY(mu_);
-  std::chrono::steady_clock::time_point d2h_done_ ABSL_GUARDED_BY(mu_);
   absl::Status status_ ABSL_GUARDED_BY(mu_);
   // The transfer phase in which the send failed; populated when `status_` is
   // set to a non-OK status.

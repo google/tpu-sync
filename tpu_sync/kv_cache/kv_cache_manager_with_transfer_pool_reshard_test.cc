@@ -50,10 +50,9 @@
 namespace tpu_raiden {
 
 struct PoolReshardRecvTestPeer {
-  static void FinishPoolH2d(ReshardReceiveSession& session,
-                            KVCacheManagerWithTransfer& manager,
-                            size_t pool_idx, const absl::Status& status) {
-    session.FinishPoolH2d(manager, pool_idx, status);
+  static void FinishPoolH2d(ReshardReceiveSession& session, size_t pool_idx,
+                            const absl::Status& status) {
+    session.FinishPoolH2d(pool_idx, status);
   }
 };
 
@@ -89,7 +88,7 @@ class TestManager : public KVCacheManagerWithTransfer {
       session = FindSessionLocked<ReshardReceiveSession>(uuid);
       if (session == nullptr) return;
     }
-    PoolReshardRecvTestPeer::FinishPoolH2d(*session, *this, pool_idx, status);
+    PoolReshardRecvTestPeer::FinishPoolH2d(*session, pool_idx, status);
   }
   absl::Status AddPoolReshardSend(const StartTransferRequest& plan,
                                   absl::Span<const int64_t> src_block_ids) {

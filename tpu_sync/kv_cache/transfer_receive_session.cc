@@ -710,8 +710,7 @@ absl::Status TransferReceiveSession::OnRecvNetworkComplete() {
 }
 
 absl::Status TransferReceiveSession::OnBlockShardsReceived(
-    KVCacheManagerWithTransfer& manager, const std::vector<int>& block_ids,
-    absl::Span<const int> shard_ids) {
+    const std::vector<int>& block_ids, absl::Span<const int> shard_ids) {
   const uint64_t uuid = uuid_;
   const int numa_node = base_->assigned_numa_node().value_or(-1);
   std::chrono::steady_clock::time_point session_start_time;
@@ -799,8 +798,7 @@ absl::StatusOr<size_t> TransferReceiveSession::LookupStagingSlot(
   return *slot;
 }
 
-absl::Status TransferReceiveSession::ExecuteLayerH2d(
-    KVCacheManagerWithTransfer& manager, size_t layer_idx) {
+absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
   // Host source of the copy: the layer's own buffer on a full mirror, or its
   // leased buffer when fewer host layer buffers exist than layers (acquired
   // when the layer's bytes were addressed in GetBlockChunks).

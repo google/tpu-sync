@@ -265,14 +265,14 @@ absl::Status ReshardSendSession::ExecutePush(
   // pipeline thread below.
   if (absl::Status precondition = ValidatePushPreconditions();
       !precondition.ok()) {
-    RecordPushCompletion(manager, precondition);
+    RecordPushCompletion(precondition);
     return precondition;
   }
   std::vector<int64_t> src_ids(src_block_ids.begin(), src_block_ids.end());
   try {
-    std::thread([self = shared_from_this(), &manager,
+    std::thread([self = shared_from_this(),
                  src_ids = std::move(src_ids)]() mutable {
-      self->ExecutePushPipeline(manager, std::move(src_ids));
+      self->ExecutePushPipeline(std::move(src_ids));
       self->EndOp();
     }).detach();
   } catch (const std::system_error& e) {
@@ -281,7 +281,7 @@ absl::Status ReshardSendSession::ExecutePush(
     // sweep with the exception unwinding through the RPC handler.
     absl::Status status = absl::InternalError(
         absl::StrCat("failed to start pool reshard push thread: ", e.what()));
-    RecordPushCompletion(manager, status);
+    RecordPushCompletion(status);
     return status;
   }
   std::move(end_op).Cancel();
@@ -289,7 +289,7 @@ absl::Status ReshardSendSession::ExecutePush(
 }
 
 void ReshardSendSession::ExecutePushPipeline(
-    KVCacheManagerWithTransfer& manager, std::vector<int64_t> src_block_ids) {
+    std::vector<int64_t> src_block_ids) {
   // Multi-tag plans scope each pool's staging and pushes to its group's
   // entries; the flat src_block_ids argument is the legacy single-tag
   // whole-plan block list.
@@ -351,7 +351,7 @@ void ReshardSendSession::ExecutePushPipeline(
 
     absl::StatusOr<size_t> host_slot = AcquireStagingSlot(pool_idx);
     if (!host_slot.ok()) {
-      RecordPushCompletion(manager, host_slot.status());
+      RecordPushCompletion(host_slot.status());
       return;
     }
     {
@@ -371,7 +371,7 @@ void ReshardSendSession::ExecutePushPipeline(
           uuid_, pool_spec->storage_index, pool_src_block_ids,
           base_->pool_staging_lease_timeout());
       if (!lease_status.ok()) {
-        RecordPushCompletion(manager, lease_status);
+        RecordPushCompletion(lease_status);
         staging_layer_manager_.Release(pool_idx);
         return;
       }
@@ -380,7 +380,7 @@ void ReshardSendSession::ExecutePushPipeline(
         base_->D2hPoolBlocks(pool_idx, pool_src_block_ids,
                              /*shard_idx=*/std::nullopt, uuid_, *host_slot);
     if (!future.ok()) {
-      RecordPushCompletion(manager, future.status());
+      RecordPushCompletion(future.status());
       staging_layer_manager_.Release(pool_idx);
       return;
     }
@@ -391,20 +391,19 @@ void ReshardSendSession::ExecutePushPipeline(
       ++in_flight_;
     }
     pool_future.OnReady(
-        [self = shared_from_this(), &manager, pool_idx](auto copy_status) {
+        [self = shared_from_this(), pool_idx](auto copy_status) {
           absl::Cleanup end_op = [self]() { self->EndOp(); };
           if (!copy_status.ok()) {
-            self->RecordPushCompletion(manager, copy_status.status());
+            self->RecordPushCompletion(copy_status.status());
             self->staging_layer_manager_.Release(pool_idx);
             return;
           }
-          self->StartPoolPush(manager, pool_idx);
+          self->StartPoolPush(pool_idx);
         });
   }
 }
 
-void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
-                                       size_t pool_idx) {
+void ReshardSendSession::StartPoolPush(size_t pool_idx) {
   RAIDEN_TRACE_FN("KVTransfer::StartPoolReshardPush", [&]() {
     return absl::StrCat("uuid=", uuid_, " pool=", pool_idx);
   });
@@ -452,8 +451,8 @@ void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
 
   transport::BlockTransport* transport_srv = base_->transport_server();
   if (transport_srv == nullptr) {
-    RecordPushCompletion(manager, absl::FailedPreconditionError(
-                                      "transport server is not running"));
+    RecordPushCompletion(
+        absl::FailedPreconditionError("transport server is not running"));
     staging_layer_manager_.Release(pool_idx);
     return;
   }
@@ -488,29 +487,26 @@ void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
         ->AsyncPush({peer}, src_ids, dst_ids, parallelism_,
                     transport::MajorOrder::kLayerMajor, uuid_,
                     static_cast<int>(pool_idx), wire_pool_idx)
-        .OnReady(
-            [self = shared_from_this(), &manager, pool_idx,
-             remaining_pushes](const absl::StatusOr<std::vector<int>>& result) {
-              absl::Cleanup end_op = [self]() { self->EndOp(); };
-              const bool last_for_pool = remaining_pushes->fetch_sub(1) == 1;
-              if (!result.ok()) {
-                self->RecordPushCompletion(manager, result.status());
-                if (last_for_pool) {
-                  self->staging_layer_manager_.Release(pool_idx);
-                }
-                return;
-              }
-              if (last_for_pool) {
-                self->staging_layer_manager_.Release(pool_idx);
-              }
-              self->RecordPushCompletion(manager, absl::OkStatus());
-            });
+        .OnReady([self = shared_from_this(), pool_idx, remaining_pushes](
+                     const absl::StatusOr<std::vector<int>>& result) {
+          absl::Cleanup end_op = [self]() { self->EndOp(); };
+          const bool last_for_pool = remaining_pushes->fetch_sub(1) == 1;
+          if (!result.ok()) {
+            self->RecordPushCompletion(result.status());
+            if (last_for_pool) {
+              self->staging_layer_manager_.Release(pool_idx);
+            }
+            return;
+          }
+          if (last_for_pool) {
+            self->staging_layer_manager_.Release(pool_idx);
+          }
+          self->RecordPushCompletion(absl::OkStatus());
+        });
   }
 }
 
-void ReshardSendSession::RecordPushCompletion(
-    KVCacheManagerWithTransfer& manager, const absl::Status& status) {
-  (void)manager;
+void ReshardSendSession::RecordPushCompletion(const absl::Status& status) {
   RAIDEN_TRACE_FN("KVTransfer::FinishPoolReshardSend", [&]() {
     return absl::StrCat("uuid=", uuid_, " status=", status.code());
   });

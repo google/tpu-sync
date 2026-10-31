@@ -65,10 +65,8 @@ struct ReshardSendSessionTestPeer {
   }
 
   // Issues `pool_idx`'s peer pushes as the D2H completion callback does.
-  static void StartPoolPush(ReshardSendSession& session,
-                            KVCacheManagerWithTransfer& manager,
-                            size_t pool_idx) {
-    session.StartPoolPush(manager, pool_idx);
+  static void StartPoolPush(ReshardSendSession& session, size_t pool_idx) {
+    session.StartPoolPush(pool_idx);
   }
 
   // Counts one (pool, peer) push of `session` in flight on `manager`, as
@@ -83,16 +81,14 @@ struct ReshardSendSessionTestPeer {
 
   // Ends that push the way its AsyncPush completion callback does.
   static void CompletePush(ReshardSendSession& session,
-                           KVCacheManagerWithTransfer& manager,
                            const absl::Status& status) {
-    session.RecordPushCompletion(manager, status);
+    session.RecordPushCompletion(status);
     session.EndOp();
   }
 
   static void RecordPushCompletion(ReshardSendSession& session,
-                                   KVCacheManagerWithTransfer& manager,
                                    const absl::Status& status) {
-    session.RecordPushCompletion(manager, status);
+    session.RecordPushCompletion(status);
   }
 
   static void EndOp(ReshardSendSession& session) { session.EndOp(); }
@@ -397,9 +393,8 @@ TEST(ReshardSendSessionTest,
   // send is done. This thread polls Done() instead of blocking in
   // AwaitForDone(): a blocked waiter wakes too late to catch a release that
   // trails the settle.
-  std::thread last_push([&session, &manager] {
-    ReshardSendSessionTestPeer::CompletePush(**session, manager,
-                                             absl::OkStatus());
+  std::thread last_push([&session] {
+    ReshardSendSessionTestPeer::CompletePush(**session, absl::OkStatus());
   });
   while (!(*session)->Done()) {
   }
@@ -442,8 +437,7 @@ TEST(ReshardSendSessionTest,
 
   // The push's completion is the send's last op: it drops the plan and
   // closes the idle connections to its peer, then the send settles.
-  ReshardSendSessionTestPeer::CompletePush(**session, manager,
-                                           absl::OkStatus());
+  ReshardSendSessionTestPeer::CompletePush(**session, absl::OkStatus());
 
   EXPECT_TRUE((*session)->Done());
   EXPECT_EQ(transport.IdleConnectionCount(peer), 0u);
@@ -474,8 +468,7 @@ TEST(ReshardSendSessionTest, PooledPolicyKeepsIdlePeerConnections) {
   ABSL_ASSERT_OK(session);
 
   ReshardSendSessionTestPeer::BeginPush(**session, manager);
-  ReshardSendSessionTestPeer::CompletePush(**session, manager,
-                                           absl::OkStatus());
+  ReshardSendSessionTestPeer::CompletePush(**session, absl::OkStatus());
 
   EXPECT_TRUE((*session)->Done());
   EXPECT_EQ(transport.IdleConnectionCount(peer), 1u);
@@ -704,7 +697,7 @@ TEST(ReshardSendSessionTest, StagingSlotReleasedAfterLastPeerPush) {
   // Stage pool 0 as the pipeline would, then issue its two peer pushes.
   EXPECT_THAT(ReshardSendSessionTestPeer::AcquireStagingSlot(*session, 0),
               IsOkAndHolds(0u));
-  ReshardSendSessionTestPeer::StartPoolPush(*session, manager, /*pool_idx=*/0);
+  ReshardSendSessionTestPeer::StartPoolPush(*session, /*pool_idx=*/0);
 
   ABSL_EXPECT_OK(session->AwaitForDone());
   EXPECT_TRUE(session->Done());
@@ -728,8 +721,7 @@ TEST(ReshardSendSessionTest, FinishAfterLastPushFinalizingPreservesOkStatus) {
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
 
   ReshardSendSessionTestPeer::BeginPush(*session, manager);
-  ReshardSendSessionTestPeer::RecordPushCompletion(*session, manager,
-                                                   absl::OkStatus());
+  ReshardSendSessionTestPeer::RecordPushCompletion(*session, absl::OkStatus());
   EXPECT_FALSE(session->Done());
 
   // A concurrent Finish(error) while finalizing is already true (before EndOp

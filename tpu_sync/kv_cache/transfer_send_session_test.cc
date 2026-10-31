@@ -356,7 +356,7 @@ TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
   session->ValidateAndBeginPull({0, 1}, now);
   session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0, 1},
                      /*dst_block_ids=*/{0, 1});
-  EXPECT_TRUE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 1);
   EXPECT_FALSE(base_session->Done());
   EXPECT_FALSE(base_session->IsDraining());
   ABSL_EXPECT_OK(base_session->GetStatus());
@@ -369,7 +369,7 @@ TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
 
   base.CompleteD2h(0, absl::OkStatus());
   EXPECT_TRUE(base_session->Done());
-  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 2);
   EXPECT_THAT(base_session->AwaitForDone(),
               StatusIs(absl::StatusCode::kUnavailable));
 }
@@ -390,7 +390,6 @@ TEST(TransferSendSessionTest,
                       /*dst_block_ids=*/{0});
   ABSL_EXPECT_OK(session1->AwaitForDone());
   EXPECT_TRUE(session1->Done());
-  EXPECT_FALSE(session1->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 2);
 
   // Session 2 shares the same StagingBlockAllocator and must still be able to
@@ -403,7 +402,6 @@ TEST(TransferSendSessionTest,
                       /*dst_block_ids=*/{0});
   ABSL_EXPECT_OK(session2->AwaitForDone());
   EXPECT_TRUE(session2->Done());
-  EXPECT_FALSE(session2->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 2);
 }
 
@@ -442,7 +440,7 @@ TEST(TransferSendSessionTest,
   EXPECT_LT(absl::Now() - cancel_start, absl::Seconds(1));
 
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 0);
 
   // Returning the held slot leaves the shared allocator healthy.
   held_slot->Reset();
@@ -475,7 +473,6 @@ TEST(TransferSendSessionTest,
   session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
                      /*dst_block_ids=*/{0});
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
   EXPECT_EQ(base.d2h_calls(), 0);
   EXPECT_EQ(base.h2h_calls(), 0);
   EXPECT_EQ(allocator->num_free_slots(), 2);
@@ -499,7 +496,6 @@ TEST(TransferSendSessionTest,
 
   // Both D2H copies (layers 0 and 1) have been issued; slot is held.
   ASSERT_EQ(base.d2h_calls(), 2);
-  EXPECT_TRUE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 0);
   EXPECT_FALSE(session->Done());
 
@@ -512,14 +508,12 @@ TEST(TransferSendSessionTest,
   session->Finish(absl::DeadlineExceededError("send deadline exceeded"));
   EXPECT_TRUE(session->IsDraining());
   EXPECT_FALSE(session->Done());
-  EXPECT_TRUE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 0);
 
   // Layer 0 H2H finishes first: Done() MUST remain false and staging MUST
   // remain pinned because Layer 1 D2H is still accessing HBM & host staging.
   base.CompleteH2h(0, std::vector<int>{0});
   EXPECT_FALSE(session->Done());
-  EXPECT_TRUE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 0);
 
   // Layer 1 D2H finishes: because the session is draining, Layer 1 H2H is NOT
@@ -528,7 +522,6 @@ TEST(TransferSendSessionTest,
   EXPECT_THAT(session->AwaitForDone(),
               StatusIs(absl::StatusCode::kDeadlineExceeded));
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 1);
   EXPECT_EQ(base.h2h_calls(), 1);
 
@@ -594,7 +587,6 @@ TEST(TransferSendSessionTest,
 
   ABSL_EXPECT_OK(session->AwaitForDone());
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 2);
 }
 
@@ -615,7 +607,6 @@ TEST(TransferSendSessionTest,
   EXPECT_THAT(session->AwaitForDone(),
               StatusIs(absl::StatusCode::kInvalidArgument));
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 2);
 }
 
@@ -667,12 +658,12 @@ TEST(TransferSendSessionTest, ReleaseStagingBlocksClearsD2hLayerFuturesOnDone) {
 
   EXPECT_TRUE(
       session->OwnsBlockWithReadyFuture(/*block_id=*/0, /*layer_idx=*/0));
-  EXPECT_TRUE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 1);
 
   base.CompleteD2h(0, absl::OkStatus());
   ABSL_EXPECT_OK(session->AwaitForDone());
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 2);
   EXPECT_FALSE(
       session->OwnsBlockWithReadyFuture(/*block_id=*/0, /*layer_idx=*/0));
 }
@@ -704,7 +695,7 @@ TEST(TransferSendSessionTest,
   EXPECT_THAT(session->GetStatus(),
               StatusIs(absl::StatusCode::kResourceExhausted));
   EXPECT_FALSE(session->Done());
-  EXPECT_TRUE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 0);
 
   // A reader gating on the never-issued layer 2 is told about the failure.
   absl::Mutex cb_mu;
@@ -730,7 +721,6 @@ TEST(TransferSendSessionTest,
   EXPECT_THAT(session->AwaitForDone(),
               StatusIs(absl::StatusCode::kResourceExhausted));
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 1);
   EXPECT_EQ(base.h2h_calls(), 0);
 }
@@ -792,7 +782,6 @@ TEST(TransferSendSessionTest,
   EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
   EXPECT_EQ(base.transport_server()->IdleConnectionCount(peer), 0u);
   EXPECT_EQ(base.h2h_calls(), 1);
-  EXPECT_FALSE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 2);
 }
 
@@ -818,7 +807,6 @@ TEST(TransferSendSessionTest, FailedD2hDispatchOnFirstLayerSettlesAtOnce) {
   EXPECT_EQ(base.d2h_calls(), 1);
   EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kInternal));
   EXPECT_TRUE(session->Done());
-  EXPECT_FALSE(session->HasStaging());
   EXPECT_EQ(base.h2h_calls(), 0);
   EXPECT_EQ(allocator->num_free_slots(), 2);
 }
@@ -848,7 +836,6 @@ TEST(TransferSendSessionTest, CancelledSendWhosePushThenFailsKeepsCancelled) {
 
   base.CompleteH2h(0, absl::InternalError("push failed"));
   EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
-  EXPECT_FALSE(session->HasStaging());
   EXPECT_EQ(allocator->num_free_slots(), 2);
 }
 

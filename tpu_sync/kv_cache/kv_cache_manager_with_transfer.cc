@@ -300,7 +300,7 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
         return absl::OkStatus();
       }
     }
-    return session->ExecuteLayerH2d(*this, layer_idx);
+    return session->ExecuteLayerH2d(layer_idx);
   };
   hooks.on_pool_received = [this](size_t pool_idx, uint64_t uuid) {
     RAIDEN_TRACE_FN("KVTransfer::OnPoolReceived", [&]() {
@@ -321,7 +321,7 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
             absl::StrCat("no active receiver for UUID ", uuid));
       }
     }
-    return session->OnPoolReceived(*this, pool_idx);
+    return session->OnPoolReceived(pool_idx);
   };
   hooks.pool_reshard_push =
       [this](const ::tpu_sync::rpc::StartTransferRequest& plan,
@@ -549,7 +549,7 @@ bool KVCacheManagerWithTransfer::RetireSettledSessionLocked(
       return false;
     }
     RecordPoolReshardTerminalLocked(
-        /*is_recv=*/true, reshard_recv->req_id(), reshard_recv->uuid(),
+        /*is_recv=*/true, reshard_recv->req_id(), uuid,
         reshard_recv->sub_plan_index(), reshard_recv->sub_plan_count(),
         reshard_recv->GetStatus());
     if (retired_push_progress != nullptr) {
@@ -582,7 +582,7 @@ bool KVCacheManagerWithTransfer::RetireSettledSessionLocked(
     }
     const bool failed = !reshard_send->GetStatus().ok();
     RecordPoolReshardTerminalLocked(
-        /*is_recv=*/false, reshard_send->req_id(), reshard_send->uuid(),
+        /*is_recv=*/false, reshard_send->req_id(), uuid,
         reshard_send->sub_plan_index(), reshard_send->sub_plan_count(),
         reshard_send->GetStatus());
     if (failed) {
@@ -715,7 +715,6 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
       }
       absl::Status inserted = EmplaceRecvSessionLocked(uuid, recv_session);
       if (!inserted.ok()) {
-        recv_session->ReleaseStaging();
         return inserted;
       }
       if (recv_session->total_blocks() > 0) {
@@ -1031,7 +1030,6 @@ void KVCacheManagerWithTransfer::StartRead(
 
     absl::Status inserted = EmplaceRecvSessionLocked(uuid, session);
     if (!inserted.ok()) {
-      session->ReleaseStaging();
       failed_recving_.insert(req_id);
       transfer_details_[req_id] = DetailsFromStatus(inserted);
       LOG(ERROR) << "StartRead failed to register req_id=" << req_id
@@ -1105,11 +1103,7 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
         } else if (auto reshard_recv =
                        std::dynamic_pointer_cast<ReshardReceiveSession>(
                            session)) {
-          if (reshard_recv->IsReadyToComplete()) {
-            LOG(INFO) << "CompleteReadRaw (polling completion): req_id="
-                      << reshard_recv->req_id();
-            reshard_recv->Finish();
-          } else if (reshard_recv->deadline() <= now) {
+          if (reshard_recv->deadline() <= now) {
             reshard_recv->Finish(
                 absl::DeadlineExceededError("Pool reshard receive timed out"));
           }
@@ -1445,13 +1439,6 @@ absl::Status KVCacheManagerWithTransfer::WaitForPendingWork() {
             pending = true;
             break;
           }
-        } else if (auto reshard_recv =
-                       std::dynamic_pointer_cast<ReshardReceiveSession>(
-                           session)) {
-          if (reshard_recv->HasPendingWork()) {
-            pending = true;
-            break;
-          }
         } else if (!session->Done()) {
           pending = true;
           break;
@@ -1483,15 +1470,10 @@ void KVCacheManagerWithTransfer::AckSend(uint64_t uuid) {
     }
   }
   session->Finish();
-  const auto ack_done = std::chrono::steady_clock::now();
   std::ostringstream timing;
   timing << "RAIDEN_TIMING event=producer_ack"
-         << " req_id=" << session->req_id() << " uuid=" << session->uuid()
-         << " node_id=" << node_id_ << " blocks=" << session->num_blocks()
-         << " bytes=" << session->total_bytes()
-         << " stage_to_ack_ms=" << DurationMs(session->d2h_done(), ack_done)
-         << " register_to_ack_ms="
-         << DurationMs(session->register_start(), ack_done)
+         << " req_id=" << session->req_id() << " uuid=" << uuid
+         << " node_id=" << node_id_
          << " failed=" << (!session->GetStatus().ok() ? 1 : 0);
   EmitTimingLog(timing.str());
 }
@@ -1533,7 +1515,7 @@ absl::Status KVCacheManagerWithTransfer::OnBlockShardsReceived(
       return absl::OkStatus();
     }
   }
-  return session->OnBlockShardsReceived(*this, block_ids, shard_ids);
+  return session->OnBlockShardsReceived(block_ids, shard_ids);
 }
 
 }  // namespace tpu_raiden

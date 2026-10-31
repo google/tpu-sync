@@ -164,6 +164,9 @@ void BindTorchRawTransfer(nb::module_& m) {
   });
   m.def("reset_dma_pacing_peak", []() { GlobalRawDmaPacer().ResetPeak(); });
 
+  m.def("major_slice_bytes", &MajorSliceBytes, nb::arg("tpu_tensor"),
+        nb::arg("unsafe_skip_buffer_lock") = false,
+        nb::call_guard<nb::gil_scoped_release>());
   m.def("transfer_d2h_async", &TransferD2HAsync, nb::arg("src_arr"),
         nb::arg("dst_arr"), nb::kw_only(),
         nb::arg("src_offsets_major_dim") = std::vector<int64_t>{},

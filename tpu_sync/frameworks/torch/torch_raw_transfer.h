@@ -97,6 +97,15 @@ PjRtCopyFuture TransferH2DBatchAsync(
     const std::vector<int64_t>& copy_sizes_major_dim,
     bool unsafe_skip_buffer_lock = false);
 
+// Bytes of one major-dimension slice of `tpu_tensor` as laid out on the
+// device: what one unit of `copy_sizes_major_dim` moves and what a host
+// buffer must hold per unit. Differs from nbytes / size(0) for tensors whose
+// device layout pads the minor dimensions or packs sub-byte elements (the
+// float4_e2m1fn_x2 weights, whose storage XLA accounts at one byte per
+// nibble).
+int64_t MajorSliceBytes(const at::Tensor& tpu_tensor,
+                        bool unsafe_skip_buffer_lock = false);
+
 PjRtCopyFuture TransferD2HAsync(
     const at::Tensor& src_arr, const at::Tensor& dst_arr,
     const std::vector<int64_t>& src_offsets_major_dim,

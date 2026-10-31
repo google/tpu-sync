@@ -229,7 +229,6 @@ void ValidateMajorDimLayout(const RaidenBufferHandle& buffer,
                      "the "
                      "outermost, physically contiguous dimension."));
   }
-  const int64_t slice = GetMajorSliceByteSize(shape);
   // Fallback to buffer->GetOnDeviceSizeInBytes() if available, but for now we
   // might not have it easily without deprecated buffer pointer if it's not
   // cached in handle.
@@ -241,6 +240,7 @@ void ValidateMajorDimLayout(const RaidenBufferHandle& buffer,
                 absl::StrCat(role, " physical buffer size for layout check"),
                 buffer.buffer->GetOnDeviceSizeInBytes())
           : xla::ShapeUtil::ByteSizeOf(shape);  // Fallback
+  const int64_t slice = GetMajorSliceByteSize(shape, physical_size);
 
   if (slice <= 0 || physical_size % slice != 0) {
     throw std::invalid_argument(
@@ -285,7 +285,8 @@ PjRtCopyFuture IssueD2HCopy(const RaidenBufferHandle& src_buffer,
           ? ValueOrThrow("Failed to get source physical buffer size",
                          src_buffer.buffer->GetOnDeviceSizeInBytes())
           : xla::ShapeUtil::ByteSizeOf(src_buffer.shape);
-  const int64_t slice_byte_size = GetMajorSliceByteSize(src_buffer.shape);
+  const int64_t slice_byte_size =
+      GetMajorSliceByteSize(src_buffer.shape, physical_size);
 
   if (is_partial) {
     tpu_raiden::ValidatePartialAlignment(src_buffer.shape, slice_byte_size);
@@ -336,7 +337,8 @@ PjRtCopyFuture IssueH2DCopy(const uint8_t* src_data, size_t src_size,
           ? ValueOrThrow("Failed to get destination physical buffer size",
                          dst_buffer.buffer->GetOnDeviceSizeInBytes())
           : xla::ShapeUtil::ByteSizeOf(dst_buffer.shape);
-  const int64_t slice_byte_size = GetMajorSliceByteSize(dst_buffer.shape);
+  const int64_t slice_byte_size =
+      GetMajorSliceByteSize(dst_buffer.shape, physical_size);
 
   if (is_partial) {
     tpu_raiden::ValidatePartialAlignment(dst_buffer.shape, slice_byte_size);
@@ -400,6 +402,19 @@ PjRtCopyFuture TransferD2HBatchAsync(
         copy_sizes_major_dim, std::move(keep_alive)));
   }
   return JoinPjRtCopyFutures(absl::MakeSpan(futures));
+}
+
+int64_t MajorSliceBytes(const at::Tensor& tpu_tensor,
+                        bool unsafe_skip_buffer_lock) {
+  auto unpacked = UnpackTorchTensor(tpu_tensor, unsafe_skip_buffer_lock);
+  AwaitReady(unpacked.buffer.buffer, "Tensor");
+  const RaidenBufferHandle& buffer = unpacked.buffer;
+  ValidateMajorDimLayout(buffer, "Tensor");
+  const int64_t physical_size =
+      buffer.buffer ? ValueOrThrow("Failed to get physical buffer size",
+                                   buffer.buffer->GetOnDeviceSizeInBytes())
+                    : xla::ShapeUtil::ByteSizeOf(buffer.shape);
+  return GetMajorSliceByteSize(buffer.shape, physical_size);
 }
 
 PjRtCopyFuture TransferH2DBatchAsync(

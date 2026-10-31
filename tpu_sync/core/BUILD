@@ -387,6 +387,22 @@ cc_library(
     ],
 )
 
+cc_test(
+    name = "raw_transfer_slice_test",
+    srcs = ["raw_transfer_slice_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    deps = [
+        ":raw_transfer_core",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla:shape_util",
+        "@xla//xla:xla_data_proto_cc",
+    ],
+)
+
 cc_library(
     name = "raw_dma_pacer",
     srcs = ["raw_dma_pacer.cc"],

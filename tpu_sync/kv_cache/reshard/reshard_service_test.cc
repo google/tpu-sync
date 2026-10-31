@@ -573,6 +573,47 @@ class ReshardStackTest : public ::testing::Test {
     return HandleController(req.SerializeAsString());
   }
 
+  // One rank's registration of bare `block_ids` (no byte spans). Returns the
+  // controller response so callers can assert on refusals.
+  tpu_sync::rpc::ControllerResponse RegisterBlockIds(
+      int rank, const std::string& req_id, int64_t uuid,
+      const std::vector<int64_t>& block_ids) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_REGISTER_REQUEST_BLOCKS);
+    auto* block_req = req.mutable_register_request_blocks_request();
+    block_req->set_req_id(req_id);
+    block_req->set_uuid(uuid);
+    *block_req->mutable_unit() = RaidenIdToProto(Unit(rank));
+    for (int64_t block : block_ids) block_req->add_block_ids(block);
+    return HandleController(req.SerializeAsString());
+  }
+
+  // One rank's completion vote for the request generation.
+  tpu_sync::rpc::ControllerResponse CompleteRequestBlocks(
+      const std::string& req_id, int64_t uuid, int rank) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_COMPLETE_REQUEST_BLOCKS);
+    auto* complete_req = req.mutable_complete_request_blocks_request();
+    complete_req->set_req_id(req_id);
+    complete_req->set_uuid(uuid);
+    *complete_req->mutable_unit() = RaidenIdToProto(Unit(rank));
+    return HandleController(req.SerializeAsString());
+  }
+
+  tpu_sync::rpc::ControllerResponse ReleaseRequestBlocks(
+      const std::string& req_id, int64_t uuid, bool force) {
+    tpu_sync::rpc::ControllerRequest req;
+    req.set_command(
+        tpu_sync::rpc::ControllerRequest::COMMAND_RELEASE_REQUEST_BLOCKS);
+    auto* release_req = req.mutable_release_request_blocks_request();
+    release_req->set_req_id(req_id);
+    release_req->set_uuid(uuid);
+    release_req->set_force(force);
+    return HandleController(req.SerializeAsString());
+  }
+
   std::vector<int> RequestBlockStatuses(const std::string& req_id,
                                         int64_t uuid) {
     tpu_sync::rpc::ControllerRequest req;
@@ -2359,6 +2400,306 @@ TEST_F(ReshardStackTest, InvalidTransferStreamsEnvFailsThePlan) {
       StatusIs(
           absl::StatusCode::kInvalidArgument,
           AllOf(HasSubstr("TPU_RAIDEN_TRANSFER_STREAMS"), HasSubstr("many"))));
+}
+
+TEST_F(ReshardStackTest,
+       DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/1, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterSpans(0, "req-reg-refresh", 80, 1024, /*src_block=*/3,
+                /*dst_index=*/0, /*dst_offset=*/0, /*size=*/1024);
+
+  // Identical re-registration refreshes the 600 s TTL.
+  now_ += 400.0;
+  RegisterSpans(0, "req-reg-refresh", 80, 1024, /*src_block=*/3,
+                /*dst_index=*/0, /*dst_offset=*/0, /*size=*/1024);
+  now_ += 300.0;
+  EXPECT_EQ(RequestBlockStatuses("req-reg-refresh", 80),
+            std::vector<int>{ProtoStatus::STATUS_REGISTERED});
+
+  // Conflicting payload for the same (req_id, unit) is rejected.
+  tpu_sync::rpc::ControllerResponse conflict_resp =
+      RegisterBlockIds(0, "req-reg-refresh", 80, {4});
+  EXPECT_FALSE(conflict_resp.success());
+  EXPECT_THAT(conflict_resp.message(),
+              HasSubstr("Conflicting request block registration"));
+
+  // Once claimed, late or duplicate producer registration is rejected.
+  ASSERT_TRUE(Coordinate("req-reg-refresh", 80, 1, {7}).success());
+  tpu_sync::rpc::ControllerResponse claimed_resp =
+      RegisterBlockIds(0, "req-reg-refresh", 80, {3});
+  EXPECT_FALSE(claimed_resp.success());
+  EXPECT_THAT(claimed_resp.message(), HasSubstr("already claimed"));
+  EXPECT_EQ(RequestBlockStatuses("req-reg-refresh", 80),
+            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
+}
+
+TEST_F(ReshardStackTest,
+       IncompatibleClaimUnitSetAndNonOwnerAbandonPreserveClaim) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterSpans(0, "req-claim-guard", 81, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-claim-guard", 81, 1024, 5, 1, 0, 1024);
+
+  // Claim owners are compared by address; the values are irrelevant.
+  const int owner_a = 0;
+  const int owner_b = 0;
+  ABSL_ASSERT_OK(service_->registry()->LookupAndClaim(
+      "req-claim-guard", 81, {Unit(0), Unit(1)}, &owner_a));
+
+  EXPECT_THAT(
+      service_->registry()->LookupAndClaim("req-claim-guard", 81, {Unit(0)},
+                                           &owner_b),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("already claimed for a different source unit set")));
+
+  EXPECT_FALSE(
+      service_->registry()->AbandonClaim("req-claim-guard", 81, &owner_b));
+  EXPECT_EQ(RequestBlockStatuses("req-claim-guard", 81),
+            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
+
+  EXPECT_TRUE(
+      service_->registry()->AbandonClaim("req-claim-guard", 81, &owner_a));
+  EXPECT_EQ(RequestBlockStatuses("req-claim-guard", 81),
+            std::vector<int>{ProtoStatus::STATUS_REGISTERED});
+}
+
+TEST_F(ReshardStackTest, CompletionNoOpsAndPreClaimGuard) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+
+  // Unknown generation: idempotent no-op.
+  tpu_sync::rpc::ControllerResponse unknown_resp =
+      CompleteRequestBlocks("req-comp-unknown", 82, 0);
+  ASSERT_TRUE(unknown_resp.success()) << unknown_resp.message();
+  EXPECT_EQ(unknown_resp.response_data(), "0");
+  EXPECT_EQ(RequestBlockStatuses("req-comp-unknown", 82),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+
+  // Registered generation: non-empty registered unit is refused pre-claim,
+  // while an unregistered sibling unit is a no-op.
+  RegisterSpans(0, "req-comp-guard", 83, 1024, 3, 0, 0, 1024);
+  tpu_sync::rpc::ControllerResponse pre_claim =
+      CompleteRequestBlocks("req-comp-guard", 83, 0);
+  EXPECT_FALSE(pre_claim.success());
+  EXPECT_THAT(pre_claim.message(),
+              HasSubstr("Only an empty producer registration may complete"));
+  tpu_sync::rpc::ControllerResponse unreg_unit =
+      CompleteRequestBlocks("req-comp-guard", 83, 1);
+  ASSERT_TRUE(unreg_unit.success()) << unreg_unit.message();
+  EXPECT_EQ(unreg_unit.response_data(), "0");
+  EXPECT_EQ(RequestBlockStatuses("req-comp-guard", 83),
+            std::vector<int>{ProtoStatus::STATUS_REGISTERED});
+
+  // Claimed generation: a unit outside the claimed set is a no-op; the
+  // claimed unit retires the generation, and repeating after retirement is a
+  // no-op.
+  ASSERT_TRUE(Coordinate("req-comp-guard", 83, 1, {7}).success());
+  tpu_sync::rpc::ControllerResponse unclaimed_unit =
+      CompleteRequestBlocks("req-comp-guard", 83, 1);
+  ASSERT_TRUE(unclaimed_unit.success()) << unclaimed_unit.message();
+  EXPECT_EQ(unclaimed_unit.response_data(), "0");
+  EXPECT_EQ(RequestBlockStatuses("req-comp-guard", 83),
+            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
+
+  tpu_sync::rpc::ControllerResponse retired =
+      CompleteRequestBlocks("req-comp-guard", 83, 0);
+  ASSERT_TRUE(retired.success()) << retired.message();
+  EXPECT_EQ(retired.response_data(), "1");
+  EXPECT_EQ(RequestBlockStatuses("req-comp-guard", 83),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+  tpu_sync::rpc::ControllerResponse after_retire =
+      CompleteRequestBlocks("req-comp-guard", 83, 0);
+  ASSERT_TRUE(after_retire.success()) << after_retire.message();
+  EXPECT_EQ(after_retire.response_data(), "0");
+  EXPECT_EQ(RequestBlockStatuses("req-comp-guard", 83),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+
+  // Cancelled generation: repeated CancelIfUnclaimed stays true, and Complete
+  // is a no-op leaving the tombstone in place.
+  EXPECT_EQ(CancelIfUnclaimed("req-comp-cancel", 84).response_data(), "true");
+  EXPECT_EQ(CancelIfUnclaimed("req-comp-cancel", 84).response_data(), "true");
+  tpu_sync::rpc::ControllerResponse cancelled_comp =
+      CompleteRequestBlocks("req-comp-cancel", 84, 0);
+  ASSERT_TRUE(cancelled_comp.success()) << cancelled_comp.message();
+  EXPECT_EQ(cancelled_comp.response_data(), "0");
+  EXPECT_EQ(RequestBlockStatuses("req-comp-cancel", 84),
+            std::vector<int>{ProtoStatus::STATUS_CANCELLED});
+}
+
+TEST_F(ReshardStackTest,
+       EmptyRegistrationCompletesBeforeClaimAndRetiresOnClaim) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/1, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+
+  ASSERT_TRUE(RegisterBlockIds(0, "req-empty-pre", 85, {}).success());
+  EXPECT_EQ(RequestBlockStatuses("req-empty-pre", 85),
+            std::vector<int>{ProtoStatus::STATUS_REGISTERED});
+
+  // An empty registration may vote before the claim; the vote is recorded
+  // without retiring anything yet.
+  tpu_sync::rpc::ControllerResponse comp_resp =
+      CompleteRequestBlocks("req-empty-pre", 85, 0);
+  ASSERT_TRUE(comp_resp.success()) << comp_resp.message();
+  EXPECT_EQ(comp_resp.response_data(), "0");
+  EXPECT_EQ(RequestBlockStatuses("req-empty-pre", 85),
+            std::vector<int>{ProtoStatus::STATUS_REGISTERED});
+
+  // The claim finds every claimed unit already voted and retires at once.
+  const int owner = 0;
+  auto claimed = service_->registry()->LookupAndClaim("req-empty-pre", 85,
+                                                      {Unit(0)}, &owner);
+  ABSL_ASSERT_OK(claimed);
+  EXPECT_EQ(claimed->size(), 1u);
+  EXPECT_EQ(RequestBlockStatuses("req-empty-pre", 85),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+}
+
+TEST_F(ReshardStackTest, ForcedReleaseClearsEveryLifecycleState) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+
+  tpu_sync::rpc::ControllerResponse unforced =
+      ReleaseRequestBlocks("req-rel-u", 86, /*force=*/false);
+  EXPECT_FALSE(unforced.success());
+  EXPECT_THAT(unforced.message(),
+              HasSubstr("Legacy rank-local release is unsafe"));
+
+  // Unknown (fresh and repeated).
+  tpu_sync::rpc::ControllerResponse rel_u1 =
+      ReleaseRequestBlocks("req-rel-u", 86, /*force=*/true);
+  ASSERT_TRUE(rel_u1.success()) << rel_u1.message();
+  EXPECT_EQ(rel_u1.response_data(), "0");
+  EXPECT_EQ(RequestBlockStatuses("req-rel-u", 86),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+  tpu_sync::rpc::ControllerResponse rel_u2 =
+      ReleaseRequestBlocks("req-rel-u", 86, /*force=*/true);
+  ASSERT_TRUE(rel_u2.success()) << rel_u2.message();
+  EXPECT_EQ(rel_u2.response_data(), "0");
+  EXPECT_EQ(RequestBlockStatuses("req-rel-u", 86),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+
+  // Registered.
+  RegisterSpans(0, "req-rel-r", 87, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-rel-r", 87, 1024, 5, 1, 0, 1024);
+  tpu_sync::rpc::ControllerResponse rel_r =
+      ReleaseRequestBlocks("req-rel-r", 87, /*force=*/true);
+  ASSERT_TRUE(rel_r.success()) << rel_r.message();
+  EXPECT_EQ(rel_r.response_data(), "2");
+  EXPECT_EQ(RequestBlockStatuses("req-rel-r", 87),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+
+  // Claimed, followed by cancel-after-retire and release.
+  RegisterSpans(0, "req-rel-c", 88, 1024, 3, 0, 0, 1024);
+  ASSERT_TRUE(Coordinate("req-rel-c", 88, 1, {7}).success());
+  tpu_sync::rpc::ControllerResponse rel_c =
+      ReleaseRequestBlocks("req-rel-c", 88, /*force=*/true);
+  ASSERT_TRUE(rel_c.success()) << rel_c.message();
+  EXPECT_EQ(rel_c.response_data(), "1");
+  EXPECT_EQ(RequestBlockStatuses("req-rel-c", 88),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+  EXPECT_EQ(CancelIfUnclaimed("req-rel-c", 88).response_data(), "true");
+  EXPECT_EQ(RequestBlockStatuses("req-rel-c", 88),
+            std::vector<int>{ProtoStatus::STATUS_CANCELLED});
+  tpu_sync::rpc::ControllerResponse rel_after_retire_cancel =
+      ReleaseRequestBlocks("req-rel-c", 88, /*force=*/true);
+  ASSERT_TRUE(rel_after_retire_cancel.success())
+      << rel_after_retire_cancel.message();
+  EXPECT_EQ(rel_after_retire_cancel.response_data(), "0");
+  EXPECT_EQ(RequestBlockStatuses("req-rel-c", 88),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+
+  // Cancelled on a fresh generation.
+  EXPECT_EQ(CancelIfUnclaimed("req-rel-x", 89).response_data(), "true");
+  tpu_sync::rpc::ControllerResponse rel_x =
+      ReleaseRequestBlocks("req-rel-x", 89, /*force=*/true);
+  ASSERT_TRUE(rel_x.success()) << rel_x.message();
+  EXPECT_EQ(rel_x.response_data(), "0");
+  EXPECT_EQ(RequestBlockStatuses("req-rel-x", 89),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+}
+
+TEST_F(ReshardStackTest,
+       TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16, /*num_dst=*/2);
+  RegisterSpans(0, "req-arm2-fail", 90, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-arm2-fail", 90, 1024, 5, 1, 0, 512);
+
+  // Destination 1 refuses its arm while destination 0 accepts. The arms are
+  // joined before the verdict, so one refusal fails the plan, abandons the
+  // claim, and dispatches no sender.
+  transport_.FailFor("10.0.0.2:9601");
+  tpu_sync::rpc::ControllerResponse resp = Coordinate(
+      "req-arm2-fail", 90, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("injected arm refusal"));
+
+  // Both arms went out (their order is unspecified); no sender did.
+  ASSERT_EQ(transport_.calls_.size(), 2u);
+  std::vector<std::string> arm_addresses = {transport_.calls_[0].first,
+                                            transport_.calls_[1].first};
+  std::sort(arm_addresses.begin(), arm_addresses.end());
+  EXPECT_EQ(arm_addresses,
+            (std::vector<std::string>{"10.0.0.2:9600", "10.0.0.2:9601"}));
+  EXPECT_FALSE(WorkerStartTransfer(0).is_sender());
+  EXPECT_FALSE(WorkerStartTransfer(1).is_sender());
+  EXPECT_EQ(RequestBlockStatuses("req-arm2-fail", 90),
+            std::vector<int>{ProtoStatus::STATUS_REGISTERED});
+  EXPECT_EQ(service_->coordinator()->GetTransferStatus("req-arm2-fail"),
+            ReshardCoordinator::Status::kFailed);
+
+  // The abandoned claim lets a fresh coordination arm both and dispatch both.
+  transport_.FailFor("");
+  transport_.calls_.clear();
+  tpu_sync::rpc::ControllerResponse retry = Coordinate(
+      "req-arm2-fail", 90, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_TRUE(retry.success()) << retry.message();
+  EXPECT_EQ(transport_.calls_.size(), 4u);
+}
+
+TEST_F(ReshardStackTest, SenderDispatchFailurePropagatesErrorAfterReceiverArm) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterSpans(0, "req-send-fail", 91, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-send-fail", 91, 1024, 5, 1, 0, 512);
+
+  tpu_sync::rpc::ControlResponse sender_failure;
+  sender_failure.set_success(false);
+  sender_failure.set_message("injected sender failure");
+  transport_.replies_["10.0.0.1:9100"] = sender_failure;
+
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-send-fail", 91, 2, {7, 9});
+  ASSERT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("injected sender failure"));
+
+  // The arm precedes both sender dispatches, which are joined before the
+  // first failure is reported.
+  ASSERT_EQ(transport_.calls_.size(), 3u);
+  EXPECT_EQ(transport_.calls_[0].first, "10.0.0.2:9600");
+  EXPECT_FALSE(WorkerStartTransfer(0).is_sender());
+  std::vector<std::string> sender_addresses = {transport_.calls_[1].first,
+                                               transport_.calls_[2].first};
+  std::sort(sender_addresses.begin(), sender_addresses.end());
+  EXPECT_EQ(sender_addresses,
+            (std::vector<std::string>{"10.0.0.1:9100", "10.0.0.1:9102"}));
+  EXPECT_TRUE(WorkerStartTransfer(1).is_sender());
+  EXPECT_TRUE(WorkerStartTransfer(2).is_sender());
+
+  // The receiver is already armed, so a sender failure keeps the claim and
+  // the request reads as failed.
+  EXPECT_EQ(RequestBlockStatuses("req-send-fail", 91),
+            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
+  EXPECT_EQ(service_->coordinator()->GetTransferStatus("req-send-fail"),
+            ReshardCoordinator::Status::kFailed);
 }
 
 }  // namespace

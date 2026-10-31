@@ -99,6 +99,11 @@ inline constexpr absl::string_view kBufferAllocatedBytes =
 
 inline constexpr absl::string_view kKvRecallBlocksTotal =
     "kv_recall_blocks_total";
+inline constexpr absl::string_view kKvSaveBlocksTotal = "kv_save_blocks_total";
+inline constexpr absl::string_view kKvEvictedBlocksTotal =
+    "kv_evicted_blocks_total";
+inline constexpr absl::string_view kKvRecallDurationMs =
+    "kv_recall_duration_ms";
 
 inline constexpr absl::string_view kWeightSyncSentBytesTotal =
     "weight_sync_sent_bytes_total";
@@ -160,6 +165,30 @@ inline constexpr absl::string_view kBufferAllocatedBytes =
 inline constexpr absl::string_view kKvRecallBlocksTotal =
     "Cumulative count of KV cache block recall attempts across tiers and "
     "outcomes.";
+// Counts KV cache block save attempts across offload tiers (`local_dram`,
+// `remote_dram`) and outcomes (`ok`, `rejected`, `failed`), labeled by
+// `{dp_rank, tier, outcome}`.
+inline constexpr absl::string_view kKvSaveBlocksTotal =
+    "Cumulative count of KV cache block save attempts across tiers and "
+    "outcomes.";
+inline constexpr absl::string_view kKvEvictedBlocksTotal =
+    "Cumulative count of KV cache blocks evicted from the host DRAM pool.";
+
+// Elapsed time (monotonic clock) of each KV cache recall batch, with the same
+// labels as `kv_recall_blocks_total`. One sample per batch per tier, not per
+// block, so `_count` counts batches while `kv_recall_blocks_total` counts
+// blocks. Recorded where the batch settles with its `outcome`. The clock starts
+// when the store begins the tier's recall: entry to
+// `HostOffloadBackend::LoadLocalHostBlocks` / `LoadRemoteBlocks` for
+// `local_dram` / `remote_dram`, entry to
+// `KVCacheStore::LoadFromSecondaryBackend` for `shared_storage`, and local
+// lookup/pin validation in `KVCacheStore::Load` for batches the store rejects
+// before dispatch (`local_dram` `not_found`). Store-level validation, the store
+// mutex wait and, in a mixed peer + storage batch, the peer group's synchronous
+// dispatch are therefore not included.
+inline constexpr absl::string_view kKvRecallDurationMs =
+    "Duration in milliseconds of each KV cache recall batch, from tier "
+    "dispatch until it settles, across tiers and outcomes.";
 
 inline constexpr absl::string_view kH2dBytesTotal =
     "Cumulative bytes requested for Host DRAM to Device HBM transfers that "
@@ -252,6 +281,17 @@ inline constexpr absl::string_view kOutcomeStagingExhausted =
 // Counts blocks whose recall failed during peer resolution, non-NOT_FOUND
 // RPC/storage I/O, or H2D DMA transfer.
 inline constexpr absl::string_view kOutcomeTransferFailed = "transfer_failed";
+// Counts blocks whose save was rejected prior to transfer due to admission or
+// pool capacity exhaustion (`Insert` pin/capacity refusal, `SaveLocal`
+// RESOURCE_EXHAUSTED host block allocation, or peer WriteRemote
+// RESOURCE_EXHAUSTED ack).
+inline constexpr absl::string_view kOutcomeRejected = "rejected";
+// Counts blocks whose save failed during execution due to transport/RPC/DMA
+// errors, an unresolvable peer, null controller, WRITE_PARTIAL_EXIST /
+// PARTIAL_EXIST (for the full batch), STORED_UNREGISTERED, FAILED verdicts
+// (including post-transfer CompleteWriteRemote kAdmitStrict refusal), or
+// destination hold expiry.
+inline constexpr absl::string_view kOutcomeFailed = "failed";
 
 inline constexpr absl::string_view kDirectionLabels[] = {kDirection};
 inline constexpr absl::string_view kSentBytesLabels[] = {kDirection, kSrcIp,
@@ -264,13 +304,18 @@ inline constexpr absl::string_view kPcieTransferLabels[] = {kHostIp,
                                                             kLocalRank};
 inline constexpr absl::string_view kKvRecallBlocksLabels[] = {kDpRank, kTier,
                                                               kOutcome};
+inline constexpr absl::string_view kKvSaveBlocksLabels[] = {kDpRank, kTier,
+                                                            kOutcome};
+inline constexpr absl::string_view kKvEvictedBlocksLabels[] = {kDpRank};
 
 }  // namespace metric_labels
 
 namespace metric_metadata {
 
 using metric_labels::kDirectionLabels;
+using metric_labels::kKvEvictedBlocksLabels;
 using metric_labels::kKvRecallBlocksLabels;
+using metric_labels::kKvSaveBlocksLabels;
 using metric_labels::kP2pTransferTimeLabels;
 using metric_labels::kPcieTransferLabels;
 using metric_labels::kSentBytesLabels;
@@ -350,6 +395,24 @@ inline constexpr MetricMetadata kKvRecallBlocksTotal{
     .name = metric_names::kKvRecallBlocksTotal,
     .description = metric_descriptions::kKvRecallBlocksTotal,
     .type = MetricType::kCounter,
+    .label_names = kKvRecallBlocksLabels};
+
+inline constexpr MetricMetadata kKvSaveBlocksTotal{
+    .name = metric_names::kKvSaveBlocksTotal,
+    .description = metric_descriptions::kKvSaveBlocksTotal,
+    .type = MetricType::kCounter,
+    .label_names = kKvSaveBlocksLabels};
+
+inline constexpr MetricMetadata kKvEvictedBlocksTotal{
+    .name = metric_names::kKvEvictedBlocksTotal,
+    .description = metric_descriptions::kKvEvictedBlocksTotal,
+    .type = MetricType::kCounter,
+    .label_names = kKvEvictedBlocksLabels};
+
+inline constexpr MetricMetadata kKvRecallDurationMs{
+    .name = metric_names::kKvRecallDurationMs,
+    .description = metric_descriptions::kKvRecallDurationMs,
+    .type = MetricType::kHistogram,
     .label_names = kKvRecallBlocksLabels};
 
 inline constexpr MetricMetadata kWeightSyncSentBytesTotal{
@@ -446,6 +509,9 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kD2hDmaTimeMs,
     kBufferAllocatedBytes,
     kKvRecallBlocksTotal,
+    kKvSaveBlocksTotal,
+    kKvEvictedBlocksTotal,
+    kKvRecallDurationMs,
     // Weight Sync Metrics
     kWeightSyncSentBytesTotal,
     kWeightSyncReceivedBytesTotal,

@@ -18,6 +18,7 @@ import asyncio
 import collections
 from concurrent import futures
 import enum
+import logging
 import os
 import socket
 import struct
@@ -28,6 +29,9 @@ from typing import Any, Callable, Optional, Type, TypeVar
 from google.protobuf import message as proto_message
 
 from tpu_sync.proto import control_pipe_pb2
+
+# Standard-library logging (absl's handler picks it up when absl is in use).
+_logger = logging.getLogger(__name__)
 
 try:
   import grpc  # pylint: disable=g-import-not-at-top
@@ -536,20 +540,91 @@ class ControlPipeClient:
 
 
 def _create_dual_stack_server_socket(port: int) -> socket.socket:
-  """Creates an IPv6 dual-stack or IPv4 listening TCP socket."""
-  try:
+  """Creates a listening TCP socket on all interfaces.
+
+  Tries, in order:
+    1. IPv6 dual-stack (IPV6_V6ONLY=0) on ("::", port): serves IPv4 and IPv6.
+    2. IPv6-only (IPV6_V6ONLY=1) on ("::", port): for hosts or network
+       namespaces with IPv4 disabled, where enabling dual-stack fails with
+       EAFNOSUPPORT (e.g. IPv6-only Borg tasks).
+    3. IPv4 on ("0.0.0.0", port): for hosts without IPv6.
+
+  Args:
+    port: Port to bind; 0 picks a free port.
+
+  Returns:
+    The bound, listening socket.
+
+  Raises:
+    OSError: If every attempt fails; the message lists each attempt's error and
+      the last one is chained.
+  """
+
+  def dual_stack() -> socket.socket:
     sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("::", port))
-    sock.listen(128)
+    try:
+      sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+      sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      sock.bind(("::", port))
+      sock.listen(128)
+    except BaseException:
+      sock.close()
+      raise
     return sock
-  except OSError:
+
+  def ipv6_only() -> socket.socket:
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+      try:
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+      except OSError as e:
+        # IPv6-only is what this attempt wants anyway (and the only option on
+        # hosts without IPv4), so a failure to set it explicitly is not fatal.
+        _logger.warning("Could not set IPV6_V6ONLY=1, continuing: %s", e)
+      sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      sock.bind(("::", port))
+      sock.listen(128)
+    except BaseException:
+      sock.close()
+      raise
+    return sock
+
+  def ipv4() -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("0.0.0.0", port))
-    sock.listen(128)
+    try:
+      sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      sock.bind(("0.0.0.0", port))
+      sock.listen(128)
+    except BaseException:
+      sock.close()
+      raise
     return sock
+
+  errors: list[str] = []
+  last_error: Optional[OSError] = None
+  for mode, create in (
+      ("IPv6 dual-stack", dual_stack),
+      ("IPv6-only", ipv6_only),
+      ("IPv4", ipv4),
+  ):
+    try:
+      sock = create()
+    except OSError as e:
+      errors.append(f"{mode}: {e!r}")
+      last_error = e
+      continue
+    if errors:
+      _logger.warning(
+          "ControlPipeServer listening %s on port %d after: %s",
+          mode,
+          sock.getsockname()[1],
+          "; ".join(errors),
+      )
+    return sock
+  raise OSError(
+      f"Could not create a listening socket on port {port}: "
+      + "; ".join(errors)
+  ) from last_error
 
 
 class ControlPipeServer:

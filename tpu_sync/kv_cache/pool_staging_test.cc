@@ -623,6 +623,8 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
         : plan_(std::move(plan)) {}
     bool Done() const override { return false; }
     void Finish(const absl::Status& status) override {}
+    bool TryBeginOp() override { return true; }
+    void EndOp() override {}
     absl::Status GetStatus() const override { return absl::OkStatus(); }
     absl::Status AwaitForDone() override { return absl::OkStatus(); }
     bool IsDraining() const override { return false; }

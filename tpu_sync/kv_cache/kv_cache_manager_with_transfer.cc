@@ -359,78 +359,6 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
     return UnregisterActivePlan(uuid);
   };
   hooks.get_node_id = [this]() { return node_id(); };
-  hooks.begin_incoming_push = [this](uint64_t uuid) -> absl::Status {
-    std::shared_ptr<TransferReceiveSession> recv_session;
-    std::shared_ptr<ReshardReceiveSession> reshard_session;
-    {
-      absl::MutexLock lock(mu_);
-      if (auto it = active_recv_sessions_.find(uuid);
-          it != active_recv_sessions_.end()) {
-        recv_session = it->second;
-      } else if (auto reshard_it = active_pool_reshard_recvs_.find(uuid);
-                 reshard_it != active_pool_reshard_recvs_.end()) {
-        reshard_session = reshard_it->second;
-      }
-    }
-    if (recv_session == nullptr && reshard_session == nullptr) {
-      // Plans live in sessions, so HasActivePlan() takes mu_ through
-      // GetSession(): check it only after mu_ is released.
-      if (uuid == 0 || base_->HasActivePlan(uuid)) {
-        return absl::OkStatus();
-      }
-      return absl::NotFoundError(
-          absl::StrCat("No active receive session for uuid=", uuid));
-    }
-    FaultInjectDelay(hooks::kBlockTransportRecvBeginPush);
-    const bool started = recv_session != nullptr
-                             ? recv_session->TryBeginRecvOp()
-                             : reshard_session->TryBeginRecvOp();
-    return started ? absl::OkStatus()
-                   : absl::CancelledError(absl::StrCat(
-                         "Receive session for uuid=", uuid, " is draining"));
-  };
-  hooks.end_incoming_push = [this](uint64_t uuid,
-                                   const absl::Status& status) -> absl::Status {
-    std::shared_ptr<TransferReceiveSession> recv_session;
-    std::shared_ptr<ReshardReceiveSession> reshard_session;
-    {
-      absl::MutexLock lock(mu_);
-      if (auto it = active_recv_sessions_.find(uuid);
-          it != active_recv_sessions_.end()) {
-        recv_session = it->second;
-      } else if (auto reshard_it = active_pool_reshard_recvs_.find(uuid);
-                 reshard_it != active_pool_reshard_recvs_.end()) {
-        reshard_session = reshard_it->second;
-      } else {
-        return absl::OkStatus();
-      }
-    }
-    if (recv_session != nullptr) {
-      // The plan lives in the session: settling it here (last op of a
-      // draining session) drops the plan together with its staging.
-      if (!status.ok()) {
-        recv_session->Finish(status);
-      }
-      recv_session->EndRecvOp();
-      return !recv_session->GetStatus().ok()
-                 ? absl::CancelledError(absl::StrCat(
-                       "Receive session for uuid=", uuid,
-                       " failed: ", recv_session->GetStatus().message()))
-                 : absl::OkStatus();
-    }
-    // A failed push is terminal for the pool receive (the sender does not
-    // retry): fail the session so EndRecvOp settles it now, releasing its
-    // staging lease and plan claim, instead of waiting for the deadline sweep.
-    if (!status.ok()) {
-      reshard_session->Finish(status);
-    }
-    reshard_session->EndRecvOp();
-    return !reshard_session->GetStatus().ok()
-               ? absl::CancelledError(absl::StrCat(
-                     "ReshardReceiveSession for uuid=", uuid,
-                     " failed: ", reshard_session->GetStatus().message()))
-               : absl::OkStatus();
-  };
   hooks.on_recv_progress = [this](uint64_t uuid) -> absl::Status {
     std::shared_ptr<TransferReceiveSession> recv_session;
     {
@@ -1248,7 +1176,7 @@ void KVCacheManagerWithTransfer::StartRead(
           FaultInjectStatus(hooks::kKvCacheManagerApiStartReadSubmitPull);
       !status.ok()) {
     session->Finish(status);
-    session->EndRecvOp();
+    session->EndOp();
     return;
   }
 

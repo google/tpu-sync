@@ -78,6 +78,14 @@ class ReshardReceiveSession
 
   void Finish(const absl::Status& status = absl::OkStatus()) override;
 
+  bool TryBeginOp() override {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) return false;
+    ++in_flight_;
+    return true;
+  }
+  void EndOp() override;
+
   absl::Status GetStatus() const override {
     absl::MutexLock lock(mu_);
     return status_;
@@ -101,14 +109,6 @@ class ReshardReceiveSession
   // Releases any held pool staging leases for |uuid_|. Safe to call multiple
   // times.
   void ReleaseStaging();
-
-  bool TryBeginRecvOp() {
-    absl::MutexLock lock(mu_);
-    if (done_ || draining_) return false;
-    ++in_flight_;
-    return true;
-  }
-  void EndRecvOp();
 
   // Returns true if network/pool transfer is complete and all H2D futures are
   // ready.

@@ -29,6 +29,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/transfer_session.h"
 
@@ -152,23 +153,35 @@ TEST(BlockTransportServerPushSessionTest, LifecycleAndPostCompletion) {
                                /*num_layers=*/2, /*num_shards=*/1);
   BlockTransportConfig config;
 
-  auto session = std::make_shared<BlockTransportServerPushSession>(
+  auto unregistered_session = std::make_shared<BlockTransportServerPushSession>(
       /*uuid=*/42, &delegate, config);
+  EXPECT_THAT(unregistered_session->uuid(), Eq(42u));
+  EXPECT_THAT(
+      unregistered_session->OnPeregrinePostComplete(
+          lib::PostMetadata{
+              .uuid = 42, .remote_id = 0, .local_id = 0, .shard_mask = 0},
+          /*requests=*/{}),
+      StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_FALSE(unregistered_session->IsDone());
+  EXPECT_THAT(delegate.layers_received(), Eq(0));
 
-  EXPECT_THAT(session->uuid(), Eq(42u));
+  auto session = std::make_shared<BlockTransportServerPushSession>(
+      /*uuid=*/0, &delegate, config);
+
+  EXPECT_THAT(session->uuid(), Eq(0u));
   EXPECT_THAT(session->kind(), Eq(BlockTransportServerSession::Kind::kPush));
   EXPECT_FALSE(session->IsDone());
   EXPECT_THAT(session->status(), IsOk());
 
   // First layer arrives via Peregrine post:
   lib::PostMetadata post0{
-      .uuid = 42, .remote_id = 0, .local_id = 0, .shard_mask = 0};
+      .uuid = 0, .remote_id = 0, .local_id = 0, .shard_mask = 0};
   ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post0, /*requests=*/{}));
   EXPECT_FALSE(session->IsDone());
 
   // Second layer arrives:
   lib::PostMetadata post1{
-      .uuid = 42, .remote_id = 0, .local_id = 1, .shard_mask = 0};
+      .uuid = 0, .remote_id = 0, .local_id = 1, .shard_mask = 0};
   ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post1, /*requests=*/{}));
   EXPECT_TRUE(session->IsDone());
   EXPECT_THAT(session->status(), IsOk());

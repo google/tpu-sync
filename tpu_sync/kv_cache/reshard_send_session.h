@@ -74,6 +74,13 @@ class ReshardSendSession
 
   void Finish(const absl::Status& status = absl::OkStatus()) override;
 
+  bool TryBeginOp() override { return false; }
+
+  // Counts one op out. Under kPerTransfer, the last op of a finalizing send
+  // closes the idle data connections to |dst_peers_| while it is still
+  // counted, then settles the send (which also retires its plan).
+  void EndOp() override;
+
   absl::Status GetStatus() const override {
     absl::MutexLock lock(mu_);
     return status_;
@@ -156,10 +163,6 @@ class ReshardSendSession
   void RecordPushCompletion(KVCacheManagerWithTransfer& manager,
                             const absl::Status& status);
   void StartPoolPush(KVCacheManagerWithTransfer& manager, size_t pool_idx);
-  // Counts one op out. Under kPerTransfer, the last op of a finalizing send
-  // closes the idle data connections to |dst_peers_| while it is still
-  // counted, then settles the send (which also retires its plan).
-  void EndOp();
   void SettleLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ReleaseLeasesLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 

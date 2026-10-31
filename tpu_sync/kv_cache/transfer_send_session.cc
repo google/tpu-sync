@@ -327,7 +327,7 @@ void TransferSendSession::Finish(const absl::Status& status) {
   // pushes start in SendNextLayer's push_pool task, each stays counted until
   // its completion has run, and the completion of the last layer calls
   // Finish() while still counted (a failed copy or push finishes under its
-  // own op). A send that pushed therefore settles in EndSendOp, which
+  // own op). A send that pushed therefore settles in EndOp, which
   // releases its data connections first.
   absl::MutexLock lock(mu_);
   FinishLocked(status);
@@ -376,7 +376,7 @@ void TransferSendSession::EndSendOpLocked() {
   }
 }
 
-void TransferSendSession::EndSendOp() {
+void TransferSendSession::EndOp() {
   // Under kPerTransfer the last op of a draining send closes the idle data
   // connections to the consumer's endpoints before it is counted out: every
   // push has returned its socket by now, and done_ cannot be set meanwhile,
@@ -605,9 +605,9 @@ void TransferSendSession::StartPush(
         FinishLocked(future.status());
       }
       // Earlier layers may already have been pushed, so this can be the
-      // send's last op: EndSendOp (unlike EndSendOpLocked) first closes the
+      // send's last op: EndOp (unlike EndSendOpLocked) first closes the
       // idle data connections under kPerTransfer.
-      EndSendOp();  // this copy never started
+      EndOp();  // this copy never started
       return;
     }
     raiden::PjRtCopyFuture layer_future = *std::move(future);
@@ -615,7 +615,7 @@ void TransferSendSession::StartPush(
         [self = shared_from_this(), promise = std::move(d2h_promises[l])](
             absl::StatusOr<raiden::BufferHolders> status_or) mutable {
           promise.Set(status_or.status());
-          self->EndSendOp();
+          self->EndOp();
         });
     next_layer = l + 1;
   }
@@ -645,7 +645,7 @@ void TransferSendSession::SendNextLayer(size_t l) {
     if (status_or.ok() && !injected.ok()) {
       status_or = injected;
     }
-    absl::Cleanup end_op = [self]() { self->EndSendOp(); };
+    absl::Cleanup end_op = [self]() { self->EndOp(); };
     if (!status_or.ok()) {
       LOG(ERROR) << "StartPush: D2H copy failed for layer " << l
                  << ", status: " << status_or.status().ToString();
@@ -667,7 +667,7 @@ void TransferSendSession::SendNextLayer(size_t l) {
 
     std::move(end_op).Cancel();
     self->base_->push_pool()->Schedule([self, l]() {
-      absl::Cleanup end_op = [self]() { self->EndSendOp(); };
+      absl::Cleanup end_op = [self]() { self->EndOp(); };
       std::vector<std::string> remote_data_endpoints;
       std::vector<int> src_ints;
       std::vector<int> dst_ints;
@@ -689,7 +689,7 @@ void TransferSendSession::SendNextLayer(size_t l) {
           remote_data_endpoints, src_ints, dst_ints, self->uuid_,
           static_cast<int>(l),
           [self, l](absl::StatusOr<std::vector<int>> push_res) {
-            absl::Cleanup end_op = [self]() { self->EndSendOp(); };
+            absl::Cleanup end_op = [self]() { self->EndOp(); };
             if (!push_res.ok()) {
               LOG(ERROR) << "H2hWrite failed for layer " << l << ": "
                          << push_res.status().ToString();

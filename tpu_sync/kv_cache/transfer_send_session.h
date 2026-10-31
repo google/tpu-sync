@@ -85,6 +85,14 @@ class TransferSendSession
 
   void Finish(const absl::Status& status = absl::OkStatus()) override;
 
+  bool TryBeginOp() override { return false; }
+
+  // Counts one finished copy or push; marks the send done and releases its
+  // staging resources if it was draining and waiting for this operation.
+  // Under kPerTransfer that last operation first closes the idle data
+  // connections to the consumer's endpoints.
+  void EndOp() override;
+
   absl::Status GetStatus() const override {
     absl::MutexLock lock(mu_);
     return status_;
@@ -130,12 +138,6 @@ class TransferSendSession
   void RegisterLayerReadinessCallback(
       size_t layer_idx,
       transport::BlockTransportDelegate::HostBlockReadyCallback cb);
-
-  // Counts one finished copy or push; marks the send done and releases its
-  // staging resources if it was draining and waiting for this operation.
-  // Under kPerTransfer that last operation first closes the idle data
-  // connections to the consumer's endpoints.
-  void EndSendOp();
 
   // Stages producer device blocks into host staging and executes the
   // multi-layer D2H copy and pipelined H2H push.

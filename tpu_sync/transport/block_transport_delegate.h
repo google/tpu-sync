@@ -84,13 +84,6 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
   // host mirror.
   virtual bool AcceptsPlanlessExplicitPush(uint64_t uuid) const { return true; }
 
-  virtual absl::Status BeginIncomingPush(uint64_t uuid) {
-    return absl::OkStatus();
-  }
-  virtual absl::Status EndIncomingPush(
-      uint64_t uuid, const absl::Status& status = absl::OkStatus()) {
-    return absl::OkStatus();
-  }
   // Peregrine receive hooks.
   virtual absl::Status OnRecvProgress(uint64_t uuid) {
     return absl::OkStatus();

@@ -530,7 +530,7 @@ void TransferReceiveSession::EndRecvOpLocked() {
   }
 }
 
-void TransferReceiveSession::EndRecvOp() {
+void TransferReceiveSession::EndOp() {
   absl::MutexLock lock(mu_);
   EndRecvOpLocked();
 }
@@ -629,7 +629,7 @@ void TransferReceiveSession::ExecutePullRequest(
   // May run on a transport thread, so it must not block.
   auto on_response = [self = shared_from_this(), session_req_id](
                          absl::StatusOr<PullStreamResponseSpec> response) {
-    absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
+    absl::Cleanup end_op = [self]() { self->EndOp(); };
     absl::Status injected =
         FaultInjectStatus(hooks::kTransferRecvSessionPullReply);
     if (response.ok() && !injected.ok()) {
@@ -877,7 +877,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
     if (status_or.ok() && !injected.ok()) {
       status_or = injected;
     }
-    absl::Cleanup end_op = [self]() { self->EndRecvOp(); };
+    absl::Cleanup end_op = [self]() { self->EndOp(); };
     bool all_layers_done = false;
     std::chrono::steady_clock::time_point session_start_time;
     {

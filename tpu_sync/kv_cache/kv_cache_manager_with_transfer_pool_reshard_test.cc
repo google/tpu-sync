@@ -526,7 +526,8 @@ TEST(DemandStagingTest, UnregisteringInFlightReceiverDefersUntilItSettles) {
   const auto staged = manager.base()->PlanHostBlocks(26, {2, 3});
   ASSERT_TRUE(staged.ok()) << staged.status();
   // The transport has admitted a push that is still writing.
-  ASSERT_TRUE(manager.base()->BeginIncomingPush(26).ok());
+  TF_ASSERT_OK_AND_ASSIGN(auto session, manager.base()->GetSession(26));
+  EXPECT_TRUE(session->TryBeginOp());
 
   // Unregistering cancels the receive, but the admitted push keeps the
   // plan's mapping and its staging, so its writes still land in the plan's
@@ -537,13 +538,13 @@ TEST(DemandStagingTest, UnregisteringInFlightReceiverDefersUntilItSettles) {
   EXPECT_EQ(*still_staged, *staged);
   EXPECT_EQ(pool->num_free_blocks(), free_before - 2);
   // ... while no further push is admitted.
-  EXPECT_EQ(manager.base()->BeginIncomingPush(26).code(),
-            absl::StatusCode::kCancelled);
+  EXPECT_FALSE(session->TryBeginOp());
 
   // When the admitted push ends the receive settles, and the plan, its
   // staging and the receive session go together.
-  EXPECT_EQ(manager.base()->EndIncomingPush(26).code(),
-            absl::StatusCode::kCancelled);
+  session->EndOp();
+  EXPECT_TRUE(session->Done());
+  EXPECT_EQ(session->GetStatus().code(), absl::StatusCode::kCancelled);
   EXPECT_EQ(manager.base()->PlanHostBlocks(26, {2, 3}).status().code(),
             absl::StatusCode::kNotFound);
   EXPECT_EQ(pool->num_free_blocks(), free_before);
@@ -834,11 +835,13 @@ TEST(PoolReshardRecvTest,
   // A push that fails mid-stream (socket timeout, peer disconnect) is terminal
   // for the receive: the session must settle now, releasing its staging lease
   // and plan claim, rather than at the session deadline.
-  ABSL_ASSERT_OK(manager.base()->BeginIncomingPush(/*uuid=*/3003));
-  EXPECT_THAT(
-      manager.base()->EndIncomingPush(
-          /*uuid=*/3003, absl::DeadlineExceededError("Socket read timed out")),
-      StatusIs(absl::StatusCode::kCancelled));
+  TF_ASSERT_OK_AND_ASSIGN(auto session, manager.base()->GetSession(/*uuid=*/3003));
+  EXPECT_TRUE(session->TryBeginOp());
+  session->Finish(absl::DeadlineExceededError("Socket read timed out"));
+  session->EndOp();
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(session->GetStatus(),
+              StatusIs(absl::StatusCode::kDeadlineExceeded));
   EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
   EXPECT_FALSE(manager.base()->HasActivePlan(3003));
 

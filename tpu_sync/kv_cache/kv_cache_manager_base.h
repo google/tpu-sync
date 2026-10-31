@@ -187,9 +187,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
         register_active_plan;
     std::function<absl::Status(uint64_t uuid)> unregister_active_plan;
     std::function<int64_t()> get_node_id;
-    std::function<absl::Status(uint64_t uuid)> begin_incoming_push;
-    std::function<absl::Status(uint64_t uuid, const absl::Status& status)>
-        end_incoming_push;
     std::function<absl::Status(uint64_t uuid)> on_recv_progress;
     std::function<absl::Status(uint64_t uuid)> on_recv_network_complete;
     // Returns the active transfer session registered under |uuid|, or
@@ -709,9 +706,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<size_t> host_layer_idx = std::nullopt);
 
   bool AcceptsPlanlessExplicitPush(uint64_t uuid) const override;
-  absl::Status BeginIncomingPush(uint64_t uuid) override;
-  absl::Status EndIncomingPush(
-      uint64_t uuid, const absl::Status& status = absl::OkStatus()) override;
   absl::Status OnRecvProgress(uint64_t uuid) override;
   absl::Status OnRecvNetworkComplete(uint64_t uuid) override;
   absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(

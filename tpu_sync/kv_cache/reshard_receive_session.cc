@@ -554,7 +554,7 @@ void ReshardReceiveSession::EndRecvOpLocked() {
   }
 }
 
-void ReshardReceiveSession::EndRecvOp() {
+void ReshardReceiveSession::EndOp() {
   absl::MutexLock lock(mu_);
   EndRecvOpLocked();
 }
@@ -685,13 +685,13 @@ void ReshardReceiveSession::ExecuteEligiblePoolH2ds(
                         absl::StrCat("pool ", pool_idx, " of UUID ", uuid_,
                                      " has no destination blocks to upload")));
       staging_layer_manager_.Release(pool_idx);
-      EndRecvOp();
+      EndOp();
       continue;
     }
     absl::StatusOr<size_t> slot = LookupStagingSlot(pool_idx);
     if (!slot.ok()) {
       FinishPoolH2d(manager, pool_idx, slot.status());
-      EndRecvOp();
+      EndOp();
       continue;
     }
     const size_t host_layer_idx = *slot;
@@ -701,7 +701,7 @@ void ReshardReceiveSession::ExecuteEligiblePoolH2ds(
     if (!copy_future.ok()) {
       FinishPoolH2d(manager, pool_idx, copy_future.status());
       staging_layer_manager_.Release(pool_idx);
-      EndRecvOp();
+      EndOp();
       continue;
     }
     raiden::PjRtCopyFuture future = *std::move(copy_future);
@@ -718,7 +718,7 @@ void ReshardReceiveSession::ExecuteEligiblePoolH2ds(
         self->FinishPoolH2d(manager, pool_idx, copy_status.status());
         self->staging_layer_manager_.Release(pool_idx);
       }
-      self->EndRecvOp();
+      self->EndOp();
     });
   }
 }

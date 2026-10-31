@@ -43,6 +43,16 @@ class TransferSession {
   // flight).
   virtual void Finish(const absl::Status& status = absl::OkStatus()) = 0;
 
+  // Attempts to admit an incoming push on this session, returning true if the
+  // session accepts it and false if it is draining or done, or never accepts
+  // pushes (send sessions). Each successful TryBeginOp() must be paired with a
+  // matching EndOp().
+  virtual bool TryBeginOp() = 0;
+
+  // Marks one in-flight operation started via TryBeginOp() as complete,
+  // settling the session if it is draining and no operations remain in flight.
+  virtual void EndOp() = 0;
+
   // Returns the session's status (OkStatus() unless the session has failed).
   virtual absl::Status GetStatus() const = 0;
 

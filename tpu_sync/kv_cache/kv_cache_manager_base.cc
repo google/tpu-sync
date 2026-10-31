@@ -2669,19 +2669,6 @@ bool KVCacheManagerBase::AcceptsPlanlessExplicitPush(uint64_t uuid) const {
   return HasActivePlan(uuid);
 }
 
-absl::Status KVCacheManagerBase::BeginIncomingPush(uint64_t uuid) {
-  return transfer_hooks_.begin_incoming_push
-             ? transfer_hooks_.begin_incoming_push(uuid)
-             : absl::OkStatus();
-}
-
-absl::Status KVCacheManagerBase::EndIncomingPush(uint64_t uuid,
-                                                 const absl::Status& status) {
-  return transfer_hooks_.end_incoming_push
-             ? transfer_hooks_.end_incoming_push(uuid, status)
-             : absl::OkStatus();
-}
-
 absl::Status KVCacheManagerBase::OnRecvProgress(uint64_t uuid) {
   return transfer_hooks_.on_recv_progress
              ? transfer_hooks_.on_recv_progress(uuid)

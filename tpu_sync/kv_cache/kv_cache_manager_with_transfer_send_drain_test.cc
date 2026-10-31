@@ -160,7 +160,7 @@ class TestManager : public KVCacheManagerWithTransfer {
   }
 
   void End(const std::shared_ptr<TransferSendSession>& session) {
-    session->EndSendOp();
+    session->EndOp();
   }
 
   bool has_send(uint64_t uuid) {
@@ -1135,22 +1135,23 @@ TEST(RecvLifecycleTest,
   consumer.AddRecv("req_ingress_lease", /*uuid=*/91, /*blocks_per_layer=*/1);
   ASSERT_EQ(consumer.free_slots(), kSlots - 1);
 
-  EXPECT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/999),
+  EXPECT_THAT(consumer.base()->GetSession(/*uuid=*/999),
               ::absl_testing::StatusIs(absl::StatusCode::kNotFound));
 
-  ASSERT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/91),
-              ::absl_testing::IsOk());
+  TF_ASSERT_OK_AND_ASSIGN(auto session, consumer.base()->GetSession(/*uuid=*/91));
+  EXPECT_TRUE(session->TryBeginOp());
 
   // Failing/timing out mid-write marks the session draining and keeps staging
-  // pinned until EndIncomingPush finishes.
+  // pinned until EndOp finishes.
   consumer.FailRecv(/*uuid=*/91, absl::InternalError("simulated failure"));
   EXPECT_EQ(consumer.free_slots(), kSlots - 1);
 
-  EXPECT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/91),
-              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_FALSE(session->TryBeginOp());
 
-  EXPECT_THAT(consumer.base()->EndIncomingPush(/*uuid=*/91),
-              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  session->EndOp();
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(session->GetStatus(),
+              ::absl_testing::StatusIs(absl::StatusCode::kInternal));
   EXPECT_EQ(consumer.free_slots(), kSlots);
 }
 
@@ -1163,20 +1164,21 @@ TEST(RecvLifecycleTest,
   // Simulate BlockTransport::HandleIncomingPush holding the incoming push lease
   // across OnLayerReceived, synchronous H2D completion, and
   // OnBlockShardsReceived.
-  ASSERT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/92),
-              ::absl_testing::IsOk());
+  TF_ASSERT_OK_AND_ASSIGN(auto session, consumer.base()->GetSession(/*uuid=*/92));
+  EXPECT_TRUE(session->TryBeginOp());
   ASSERT_THAT(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/92),
               ::absl_testing::IsOk());
   consumer.FinishCopy(0, absl::OkStatus());
   // Even though the H2D copy finished, staging must remain pinned until
-  // OnBlockShardsReceived and EndIncomingPush complete.
+  // OnBlockShardsReceived and EndOp complete.
   EXPECT_EQ(consumer.free_slots(), kSlots - 1);
 
   ASSERT_THAT(consumer.ReceiveBlocks({0}, /*uuid=*/92), ::absl_testing::IsOk());
   EXPECT_EQ(consumer.free_slots(), kSlots - 1);
 
-  EXPECT_THAT(consumer.base()->EndIncomingPush(/*uuid=*/92),
-              ::absl_testing::IsOk());
+  session->EndOp();
+  EXPECT_TRUE(session->Done());
+  ABSL_EXPECT_OK(session->GetStatus());
   EXPECT_EQ(consumer.free_slots(), kSlots);
   Reports reports = consumer.CompleteReadRaw();
   EXPECT_THAT(DoneReceiving(reports), Contains("req_handoff"));
@@ -1190,20 +1192,21 @@ TEST(
   consumer.AddRecv("req_push_died", /*uuid=*/93, /*blocks_per_layer=*/1);
   ASSERT_EQ(consumer.free_slots(), kSlots - 1);
 
-  ABSL_ASSERT_OK(consumer.base()->BeginIncomingPush(/*uuid=*/93));
+  TF_ASSERT_OK_AND_ASSIGN(auto session, consumer.base()->GetSession(/*uuid=*/93));
+  EXPECT_TRUE(session->TryBeginOp());
 
   // When an incoming push fails (e.g. socket read timeout or peer disconnect),
-  // EndIncomingPush receives the non-OK push status and immediately fails the
-  // session, releasing the staging slot without waiting for the 120s deadline.
-  EXPECT_THAT(
-      consumer.base()->EndIncomingPush(
-          /*uuid=*/93, absl::DeadlineExceededError("Socket read timed out")),
-      ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  // Finish + EndOp immediately fails the session, releasing the staging slot
+  // without waiting for the 120s deadline.
+  session->Finish(absl::DeadlineExceededError("Socket read timed out"));
+  session->EndOp();
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(session->GetStatus(),
+              ::absl_testing::StatusIs(absl::StatusCode::kDeadlineExceeded));
   EXPECT_EQ(consumer.free_slots(), kSlots);
 
   // Subsequent incoming pushes for the same uuid are immediately rejected.
-  EXPECT_THAT(consumer.base()->BeginIncomingPush(/*uuid=*/93),
-              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_FALSE(session->TryBeginOp());
 
   // CompleteReadRaw immediately reports the request in failed_recving and
   // retires the session before the 120s deadline.
@@ -1429,7 +1432,8 @@ TEST(RecvLifecycleTest,
   //    releases both the layer lease and the staging block.
   consumer.AddRecv("req_push_abort_after_chunk", /*uuid=*/202);
   const StagingLayerManager& manager2 = consumer.staging_layer_manager(202);
-  ASSERT_THAT(base->BeginIncomingPush(/*uuid=*/202), ::absl_testing::IsOk());
+  TF_ASSERT_OK_AND_ASSIGN(auto session202, base->GetSession(/*uuid=*/202));
+  EXPECT_TRUE(session202->TryBeginOp());
   std::vector<transport::BlockChunk> chunks = base->GetBlockChunks(
       /*layer_idx=*/0, /*shard_idx=*/0, /*block_ids=*/{0}, block_bytes,
       /*uuid=*/202);
@@ -1440,8 +1444,10 @@ TEST(RecvLifecycleTest,
   consumer.FailRecv(/*uuid=*/202, absl::UnavailableError("socket closed"));
   // Still pinned while the incoming push is in flight.
   EXPECT_EQ(consumer.free_slots(), kSlots - 1);
-  EXPECT_THAT(base->EndIncomingPush(/*uuid=*/202),
-              ::absl_testing::StatusIs(absl::StatusCode::kCancelled));
+  session202->EndOp();
+  EXPECT_TRUE(session202->Done());
+  EXPECT_THAT(session202->GetStatus(),
+              ::absl_testing::StatusIs(absl::StatusCode::kUnavailable));
   EXPECT_EQ(manager2.num_free(), kNumStagingLayers);
   EXPECT_EQ(consumer.free_slots(), kSlots);
   Reports reports2 = consumer.CompleteReadRaw();
@@ -1836,10 +1842,11 @@ TEST(RecvLifecycleTest, SecondFinishOnAFailedReceiveIsANoOp) {
 TEST(RecvLifecycleTest, PushLeaseClosingBeforeTheCopyEndsDoesNotSettle) {
   RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
   consumer.AddRecv("req", /*uuid=*/503);
-  ABSL_ASSERT_OK(consumer.base()->BeginIncomingPush(/*uuid=*/503));
+  TF_ASSERT_OK_AND_ASSIGN(auto session, consumer.base()->GetSession(/*uuid=*/503));
+  ASSERT_TRUE(session->TryBeginOp());
   ABSL_ASSERT_OK(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/503));
   ABSL_ASSERT_OK(consumer.ReceiveBlocks({0}, /*uuid=*/503));
-  ABSL_ASSERT_OK(consumer.base()->EndIncomingPush(/*uuid=*/503));
+  session->EndOp();
 
   Reports during = consumer.CompleteReadRaw();
   EXPECT_THAT(DoneReceiving(during), IsEmpty());

@@ -56,6 +56,7 @@
 #include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -282,6 +283,37 @@ absl::StatusOr<IncomingPushSpec> ResolveIncomingPushSpec(
   };
 }
 
+absl::StatusOr<std::shared_ptr<TransferSession>> BeginIncomingPush(
+    BlockTransportDelegate* delegate, uint64_t uuid) {
+  if (uuid == 0) {
+    return nullptr;
+  }
+  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> session,
+                        delegate->GetSession(uuid));
+  FaultInjectDelay(hooks::kBlockTransportRecvBeginPush);
+  if (!session->TryBeginOp()) {
+    return absl::CancelledError(
+        absl::StrCat("Session for uuid=", uuid,
+                     " is not accepting pushes (draining or a send session)"));
+  }
+  return session;
+}
+
+absl::Status EndIncomingPush(const std::shared_ptr<TransferSession>& session,
+                             const absl::Status& status = absl::OkStatus()) {
+  if (session == nullptr) {
+    return status;
+  }
+  if (!status.ok()) {
+    session->Finish(status);
+  }
+  session->EndOp();
+  if (!status.ok() || session->GetStatus().ok()) {
+    return status;
+  }
+  return absl::CancelledError(session->GetStatus().message());
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -321,13 +353,12 @@ absl::Status BlockTransportServerPushSession::StartStream(
 
   std::vector<int> allocated_ids;
   std::vector<int> src_block_ids;
-  ABSL_RETURN_IF_ERROR(delegate_->BeginIncomingPush(header.uuid));
+  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> session,
+                        BeginIncomingPush(delegate_, header.uuid));
   bool incoming_push_lease_held = true;
   absl::Cleanup end_incoming_push = [&]() {
     if (incoming_push_lease_held) {
-      delegate_
-          ->EndIncomingPush(header.uuid,
-                            absl::InternalError("Incoming push failed"))
+      EndIncomingPush(session, absl::InternalError("Incoming push failed"))
           .IgnoreError();
     }
   };
@@ -438,7 +469,7 @@ absl::Status BlockTransportServerPushSession::StartStream(
   ABSL_RETURN_IF_ERROR(delegate_->OnBlockShardsReceived(
       allocated_ids, stream_shards, header.uuid));
   incoming_push_lease_held = false;
-  ABSL_RETURN_IF_ERROR(delegate_->EndIncomingPush(header.uuid));
+  ABSL_RETURN_IF_ERROR(EndIncomingPush(session));
   uint8_t ack = 1;
   FaultInjectSocket(hooks::kBlockTransportRecvSendAck, client_fd);
   ABSL_RETURN_IF_ERROR(
@@ -474,16 +505,13 @@ absl::Status BlockTransportServerPushSession::OnPeregrinePostComplete(
       ResolveIncomingPushSpec(delegate_, post.local_id,
                               /*is_explicit_dst_push=*/true, uuid_));
 
-  ABSL_RETURN_IF_ERROR(delegate_->BeginIncomingPush(uuid_));
+  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> session,
+                        BeginIncomingPush(delegate_, uuid_));
   absl::Status s = CompleteIncomingPush(
       post.local_id, post.remote_id, /*num_streams=*/1,
       post.shard_mask == 0 ? 0 : shards.size(), push_spec.pool_progress_spec,
       /*is_peregrine=*/true);
-  if (!s.ok()) {
-    delegate_->EndIncomingPush(uuid_, s).IgnoreError();
-    return s;
-  }
-  return delegate_->EndIncomingPush(uuid_);
+  return EndIncomingPush(session, s);
 }
 
 size_t BlockTransportServerPushSession::AccumulateLandedShards(

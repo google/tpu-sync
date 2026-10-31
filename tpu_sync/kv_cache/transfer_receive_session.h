@@ -19,6 +19,7 @@
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <future>  // NOLINT(build/c++11)
 #include <memory>
 #include <optional>
@@ -125,13 +126,13 @@ class TransferReceiveSession
 
   void ReleaseStaging();
 
-  bool TryBeginRecvOp() {
+  bool TryBeginOp() override {
     absl::MutexLock lock(mu_);
     if (done_ || draining_) return false;
     ++in_flight_;
     return true;
   }
-  void EndRecvOp();
+  void EndOp() override;
 
   // Returns true if network/layer transfer is complete and all H2D futures are
   // ready.
@@ -257,7 +258,6 @@ class TransferReceiveSession
       std::chrono::steady_clock::time_point deadline, StagingAllocation staging,
       const absl::flat_hash_map<kv_cache::DeviceBlockId, kv_cache::HostBlockId>&
           host_block_of);
-
   // Allocates host staging for a consumer StartRead load plan via
   // |staging_allocator_| (unless |local_host_block_ids| is explicitly provided)
   // and populates |*host_block_ids|. Returns false if staging capacity is

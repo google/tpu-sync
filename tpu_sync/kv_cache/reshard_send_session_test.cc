@@ -39,8 +39,10 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
+#include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 
@@ -104,6 +106,23 @@ using ::testing::AllOf;
 using ::testing::HasSubstr;
 using ::tpu_sync::rpc::MEMORY_TYPE_HBM;
 using ::tpu_sync::rpc::StartTransferRequest;
+
+class StubRecvSession : public TransferSession {
+ public:
+  bool Done() const override { return false; }
+  void Finish(const absl::Status& status) override {}
+  bool TryBeginOp() override { return true; }
+  void EndOp() override {}
+  absl::Status GetStatus() const override { return absl::OkStatus(); }
+  absl::Status AwaitForDone() override { return absl::OkStatus(); }
+  bool IsDraining() const override { return false; }
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
+    return unit;
+  }
+  std::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+    return std::nullopt;
+  }
+};
 
 kv_cache::KVCacheManagerBase MakeTestBase() {
   return kv_cache::KVCacheManagerBase(
@@ -652,6 +671,16 @@ TEST(ReshardSendSessionTest, StagingSlotReleasedAfterLastPeerPush) {
   KVCacheManagerWithTransfer manager = MakeTestManager();
   kv_cache::KVCacheManagerBase receiver_a = MakeTestBase();
   kv_cache::KVCacheManagerBase receiver_b = MakeTestBase();
+  auto recv_session = std::make_shared<StubRecvSession>();
+  for (kv_cache::KVCacheManagerBase* receiver : {&receiver_a, &receiver_b}) {
+    kv_cache::KVCacheManagerBase::TransferEventHooks hooks;
+    hooks.get_session =
+        [recv_session](
+            uint64_t uuid) -> absl::StatusOr<std::shared_ptr<TransferSession>> {
+      return recv_session;
+    };
+    receiver->SetTransferEventHooks(std::move(hooks));
+  }
   const std::string peer_a =
       absl::StrCat("127.0.0.1:", receiver_a.transport_server()->local_port());
   const std::string peer_b =

@@ -51,7 +51,8 @@ void RegisterMockTensor(const at::Tensor& tensor, xla::PjRtBuffer* buffer) {
 }
 
 UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
-                                 bool unsafe_skip_buffer_lock) {
+                                 bool unsafe_skip_buffer_lock,
+                                 FoldedViews /*folded_views*/) {
   auto it = GetMockMap().find(tensor.unsafeGetTensorImpl());
   if (it == GetMockMap().end()) {
     throw std::runtime_error(

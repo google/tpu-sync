@@ -41,10 +41,24 @@ struct UnpackedTensor {
   size_t logical_physical_size = 0;
 };
 
+// How UnpackTorchTensor treats a tensor whose shape folds two or more leading
+// dimensions of its base storage buffer into its first dimension, such as
+// `x.reshape(E * F, D).clone()`, which torch_tpu backs with x's [E, F, D]
+// buffer. The unpacked buffer keeps the base buffer's shape, so consumers that
+// address it in units of its leading dimension must reject such tensors.
+enum class FoldedViews {
+  kReject,
+  // Accepts the tensor if its base buffer keeps every element at the device
+  // byte offset where a buffer of the tensor's shape would, which suffices for
+  // consumers that copy whole buffers.
+  kAcceptIfLayoutMatches,
+};
+
 // Unpacks a single PyTorch tensor into its materialized PjRtBuffer AND the
 // owning TensorBufferHandle. Throws if validation or materialization fails.
 UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
-                                 bool unsafe_skip_buffer_lock = false);
+                                 bool unsafe_skip_buffer_lock,
+                                 FoldedViews folded_views);
 
 }  // namespace torch
 }  // namespace tpu_raiden

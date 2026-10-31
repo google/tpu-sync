@@ -260,6 +260,22 @@ class KVCacheManagerTorchTest(parameterized.TestCase):
           err_msg=f"layer {layer_idx} untouched rows unexpectedly written",
       )
 
+  def test_rejects_view_folding_leading_dims(self):
+    """Rejects a KV cache view that folds the leading dims of its buffer.
+
+    The manager addresses device buffers in units of their leading dimension,
+    which for a [16, 8, 128] view of a [2, 8, 8, 128] buffer is not the
+    view's.
+    """
+    base = torch.zeros(2, 8, 8, 128, dtype=torch.float32, device=self.device)
+    with self.assertRaisesRegex(Exception, "folds leading dimensions"):
+      _kv_cache_manager.KVCacheManager(
+          [[base.view(16, 8, 128)]],
+          local_port=0,
+          host_blocks_to_allocate=4,
+          parallelism=1,
+      )
+
 
 if __name__ == "__main__":
   absltest.main()

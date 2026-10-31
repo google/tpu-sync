@@ -19,11 +19,14 @@
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_CORE_XLA_COMPAT_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
+#include "xla/layout.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "xla/pjrt/raw_buffer.h"
@@ -113,6 +116,16 @@ bool PjRtClientSupportsDma(const xla::PjRtClient* client);
 
 absl::Status PjRtClientDmaMap(xla::PjRtClient* client, void* data, size_t size);
 absl::Status PjRtClientDmaUnmap(xla::PjRtClient* client, void* data);
+
+// Returns the device layout that `client` gives an `element_type` array of
+// `dims` by default, i.e. the layout of a buffer of that shape created without
+// asking for one. Answers through `xla::PjRtCApiClient`'s own implementation,
+// which asks the plugin through the PJRT_Api function table. Returns
+// UNIMPLEMENTED for any other client, and for a plugin without the PJRT layouts
+// extension.
+absl::StatusOr<xla::Layout> PjRtClientDefaultLayout(
+    xla::PjRtClient* client, xla::PrimitiveType element_type,
+    absl::Span<const int64_t> dims);
 
 }  // namespace raiden
 

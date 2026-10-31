@@ -47,6 +47,15 @@ namespace tpu_raiden {
 namespace torch {
 
 #ifndef WITHOUT_PYTHON
+namespace {
+
+// WeightSynchronizer copies whole device buffers, tiled or raw, so it accepts
+// tensors that fold leading dimensions of their base buffer when that buffer
+// holds its bytes as a buffer of the tensor's shape would.
+constexpr FoldedViews kFoldedViews = FoldedViews::kAcceptIfLayoutMatches;
+
+}  // namespace
+
 struct WeightSynchronizer::BoundTensors {
   explicit BoundTensors(bool unsafe_skip_buffer_lock)
       : unsafe_skip_buffer_lock(unsafe_skip_buffer_lock) {}
@@ -69,8 +78,8 @@ absl::StatusOr<std::vector<std::vector<raiden::RaidenBufferHandle>>>
 WeightSynchronizer::ResolveDeviceBuffers(BoundTensors& bound) {
   absl::MutexLock lock(bound.mu);
   try {
-    UnpackedTensors unpacked =
-        UnpackTorchTensors(bound.tensors, bound.unsafe_skip_buffer_lock);
+    UnpackedTensors unpacked = UnpackTorchTensors(
+        bound.tensors, bound.unsafe_skip_buffer_lock, kFoldedViews);
     // Raw device copies do not wait for TorchTPU's pending executions.
     for (torch_tpu::TensorBufferHandle& ref : unpacked.refs) {
       ABSL_RETURN_IF_ERROR(ref.Synchronize());
@@ -92,8 +101,8 @@ absl::StatusOr<std::unique_ptr<WeightSynchronizer>> WeightSynchronizer::Create(
     bool unsafe_skip_buffer_lock, bool auto_h2d,
     std::optional<std::vector<int64_t>> global_shard_indices) {
   try {
-    UnpackedTensors unpacked =
-        UnpackTorchTensors(device_tensors, unsafe_skip_buffer_lock);
+    UnpackedTensors unpacked = UnpackTorchTensors(
+        device_tensors, unsafe_skip_buffer_lock, kFoldedViews);
     if (unpacked.buffers.empty()) {
       return absl::InvalidArgumentError(
           "WeightSynchronizer::Create: device_tensors yielded no layer "
@@ -135,8 +144,8 @@ absl::Status WeightSynchronizer::BindWeights(
       UnbindWeights();
       return absl::OkStatus();
     }
-    UnpackedTensors unpacked =
-        UnpackTorchTensors(device_tensors, bound_->unsafe_skip_buffer_lock);
+    UnpackedTensors unpacked = UnpackTorchTensors(
+        device_tensors, bound_->unsafe_skip_buffer_lock, kFoldedViews);
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers =
         unpacked.buffers;
     if (layer_buffers.empty()) {

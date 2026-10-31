@@ -1057,6 +1057,269 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
 
       self._assert_bit_exact(dst_tensors, expected, f"step {step}")
 
+  @parameterized.named_parameters(
+      ("view_tiled", "view", False),
+      ("view_skip_tiling", "view", True),
+      ("view_clone_tiled", "view_clone", False),
+      ("view_clone_skip_tiling", "view_clone", True),
+      ("empty_copy_tiled", "empty_copy", False),
+      ("empty_copy_skip_tiling", "empty_copy", True),
+      ("times_one_tiled", "times_one", False),
+      ("times_one_skip_tiling", "times_one", True),
+      ("host_round_trip_tiled", "host_round_trip", False),
+      ("host_round_trip_skip_tiling", "host_round_trip", True),
+  )
+  def test_push_folded_expert_stack(self, variant, skip_tiling):
+    """Pushes an [E, F, D] expert stack folded to [E * F, D] each way.
+
+    verl sends MoE expert stacks folded this way. torch_tpu backs the view, its
+    clone and a copy into an empty tensor with the stack's storage buffer; the
+    product and the host round trip get buffers of their own.
+
+    Args:
+      variant: How the folded tensor is made from the stack.
+      skip_tiling: Whether both synchronizers copy raw device bytes instead of
+        detiling on D2H and tiling on H2D.
+    """
+    generator = torch.Generator().manual_seed(101)
+    stack = torch.randn(8, 768, 2048, generator=generator).to(torch.bfloat16)
+    view = stack.to(self.device).reshape(8 * 768, 2048)
+    if variant == "view":
+      src = view
+    elif variant == "view_clone":
+      src = view.clone()
+    elif variant == "empty_copy":
+      src = torch.empty_like(view).copy_(view)
+    elif variant == "times_one":
+      src = view * 1
+    else:
+      src = view.cpu().to(self.device)
+    dst = torch.zeros(8 * 768, 2048, dtype=torch.bfloat16, device=self.device)
+    ws_source = WeightSynchronizer(
+        [[src]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        [[dst]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_dest.shutdown)
+    ws_source.test_only_set_skip_tiling(skip_tiling)
+    ws_dest.test_only_set_skip_tiling(skip_tiling)
+
+    ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+    ws_dest.h2d()
+
+    self._assert_bit_exact(
+        [[dst]], [[stack.reshape(8 * 768, 2048)]], "receiver"
+    )
+
+  @parameterized.named_parameters(
+      ("fp32_tiled", torch.float32, False),
+      ("fp32_skip_tiling", torch.float32, True),
+      ("bf16_tiled", torch.bfloat16, False),
+      ("bf16_skip_tiling", torch.bfloat16, True),
+  )
+  def test_push_from_clone_of_folded_tensor(self, dtype, skip_tiling):
+    """Pushes a clone of an [E, F, D] expert stack folded to [E * F, D].
+
+    torch_tpu backs the clone with the stack's [E, F, D] storage buffer.
+    Skipping tiling sends that buffer's raw device bytes into the receiver's
+    [E * F, D] buffer.
+
+    Args:
+      dtype: Element type of the stack.
+      skip_tiling: Whether both synchronizers copy raw device bytes instead of
+        detiling on D2H and tiling on H2D.
+    """
+    generator = torch.Generator().manual_seed(102)
+    stack = torch.randn(8, 64, 256, generator=generator).to(dtype)
+    src = stack.to(self.device).reshape(8 * 64, 256).clone()
+    dst = torch.zeros(8 * 64, 256, dtype=dtype, device=self.device)
+    ws_source = WeightSynchronizer(
+        [[src]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        [[dst]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_dest.shutdown)
+    ws_source.test_only_set_skip_tiling(skip_tiling)
+    ws_dest.test_only_set_skip_tiling(skip_tiling)
+
+    ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+    ws_dest.h2d()
+
+    self._assert_bit_exact([[dst]], [[stack.reshape(8 * 64, 256)]], "receiver")
+    # Raw copies neither detile on the sender nor tile on the receiver.
+    self.assertEqual(
+        ws_source.get_metrics()["total_detiled_bytes"] == 0, skip_tiling
+    )
+    self.assertEqual(
+        ws_dest.get_metrics()["total_tiled_bytes"] == 0, skip_tiling
+    )
+
+  @parameterized.named_parameters(
+      ("tiled", False),
+      ("skip_tiling", True),
+  )
+  def test_push_from_folded_view_of_another_dtype(self, skip_tiling):
+    """Pushes an int32 [E * F, D] view of an f32 [E, F, D] stack.
+
+    The view is backed by the stack's f32 storage buffer, whose element type is
+    not the view's.
+
+    Args:
+      skip_tiling: Whether both synchronizers copy raw device bytes instead of
+        detiling on D2H and tiling on H2D.
+    """
+    generator = torch.Generator().manual_seed(103)
+    stack = torch.randn(8, 64, 256, generator=generator)
+    src = stack.to(self.device).view(torch.int32).view(8 * 64, 256)
+    dst = torch.zeros(8 * 64, 256, dtype=torch.int32, device=self.device)
+    ws_source = WeightSynchronizer(
+        [[src]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        [[dst]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_dest.shutdown)
+    ws_source.test_only_set_skip_tiling(skip_tiling)
+    ws_dest.test_only_set_skip_tiling(skip_tiling)
+
+    ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+    ws_dest.h2d()
+
+    self._assert_bit_exact(
+        [[dst]], [[stack.view(torch.int32).reshape(8 * 64, 256)]], "receiver"
+    )
+    self.assertEqual(
+        ws_source.get_metrics()["total_detiled_bytes"] == 0, skip_tiling
+    )
+    self.assertEqual(
+        ws_dest.get_metrics()["total_tiled_bytes"] == 0, skip_tiling
+    )
+
+  def test_bind_weights_to_view_folding_leading_dims(self):
+    """Pushes from a folded view bound in place of an unfolded tensor.
+
+    The view is backed by an [E, F, D] storage buffer, and every later transfer
+    resolves the device buffers of the bound tensors again.
+    """
+    generator = torch.Generator().manual_seed(104)
+    stack = torch.randn(8, 64, 256, generator=generator)
+    dst = torch.zeros(8 * 64, 256, dtype=torch.float32, device=self.device)
+    ws_source = WeightSynchronizer(
+        [[torch.zeros(8 * 64, 256, dtype=torch.float32, device=self.device)]],
+        local_port=0,
+        parallelism=1,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        [[dst]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_dest.shutdown)
+
+    ws_source.bind_weights([[stack.to(self.device).view(8 * 64, 256)]])
+    ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+    ws_dest.h2d()
+
+    self._assert_bit_exact([[dst]], [[stack.reshape(8 * 64, 256)]], "receiver")
+
+  @parameterized.named_parameters(
+      ("tiled", False),
+      ("skip_tiling", True),
+  )
+  def test_h2d_into_view_folding_leading_dims_updates_base(self, skip_tiling):
+    """H2D into an [E * F, D] view of an [E, F, D] tensor writes the tensor.
+
+    The view is backed by the [E, F, D] storage buffer.
+
+    Args:
+      skip_tiling: Whether both synchronizers copy raw device bytes instead of
+        detiling on D2H and tiling on H2D.
+    """
+    generator = torch.Generator().manual_seed(105)
+    expected = torch.randn(8 * 64, 256, generator=generator)
+    base = torch.zeros(8, 64, 256, dtype=torch.float32, device=self.device)
+    ws_source = WeightSynchronizer(
+        [[expected.to(self.device)]],
+        local_port=0,
+        parallelism=1,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        [[base.view(8 * 64, 256)]],
+        local_port=0,
+        parallelism=1,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_dest.shutdown)
+    ws_source.test_only_set_skip_tiling(skip_tiling)
+    ws_dest.test_only_set_skip_tiling(skip_tiling)
+
+    ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+    ws_dest.h2d()
+
+    self._assert_bit_exact([[base]], [[expected.reshape(8, 64, 256)]], "base")
+    self.assertEqual(
+        ws_dest.get_metrics()["total_tiled_bytes"] == 0, skip_tiling
+    )
+
+  def test_rejects_folded_view_with_different_device_layout(self):
+    """Rejects a fold whose device bytes differ from a buffer of its shape's.
+
+    An f32 [4, 5, 256] buffer cannot hold its 5-row dimension the way a
+    [20, 256] buffer does, since 5 rows are not a whole (8, 128) tile, so raw
+    copies of the [20, 256] view would misplace rows.
+    """
+    base = torch.randn(4, 5, 256).to(self.device)
+    # The base itself is accepted, so the rejection below is about the view.
+    ws_base = WeightSynchronizer(
+        [[base]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_base.shutdown)
+
+    with self.assertRaises(RuntimeError) as raised:
+      WeightSynchronizer(
+          [[base.view(20, 256)]],
+          local_port=0,
+          parallelism=1,
+          bind_ip="127.0.0.1",
+      )
+
+    message = str(raised.exception)
+    self.assertIn("folds the leading dimensions", message)
+    self.assertIn(
+        "does not hold its bytes as a [20, 256] buffer would", message
+    )
+    self.assertIn("[20, 256]", message)
+    self.assertIn("[4, 5, 256]", message)
+
+  def test_rejects_view_that_does_not_fold_leading_dims(self):
+    """Rejects a view that regroups more than the leading dimensions."""
+    base = torch.randn(4, 8, 256).to(self.device)
+    # The base itself is accepted, so the rejection below is about the view.
+    ws_base = WeightSynchronizer(
+        [[base]], local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_base.shutdown)
+
+    with self.assertRaises(RuntimeError) as raised:
+      WeightSynchronizer(
+          [[base.view(64, 128)]],
+          local_port=0,
+          parallelism=1,
+          bind_ip="127.0.0.1",
+      )
+
+    message = str(raised.exception)
+    self.assertIn("leading (block) dimension does not match", message)
+    self.assertIn("[64, 128]", message)
+    self.assertIn("[4, 8, 256]", message)
+
 
 if __name__ == "__main__":
   absltest.main()

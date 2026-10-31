@@ -15,6 +15,7 @@
 #include "tpu_sync/core/xla_compat.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -23,6 +24,8 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
+#include "xla/layout.h"
 #include "xla/pjrt/abstract_tracked_device_buffer.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
@@ -261,6 +264,31 @@ absl::Status PjRtClientDmaUnmap(xla::PjRtClient* client, void* data) {
   args.client = c_client;
   args.data = data;
   return ConsumePjrtError(c_api, c_api->PJRT_Client_DmaUnmap(&args));
+}
+
+absl::StatusOr<xla::Layout> PjRtClientDefaultLayout(
+    xla::PjRtClient* client, xla::PrimitiveType element_type,
+    absl::Span<const int64_t> dims) {
+  if (client == nullptr) {
+    return absl::InvalidArgumentError(
+        "PjRtClient is null in PjRtClientDefaultLayout");
+  }
+  auto* capi_client = dynamic_cast<xla::PjRtCApiClient*>(client);
+  if (capi_client == nullptr) {
+    return absl::UnimplementedError(
+        "Default device layouts require a PJRT C-API client");
+  }
+  // Without the extension, PjRtCApiClient answers with an untiled layout rather
+  // than the one the device uses.
+  if (capi_client->FindExtension<PJRT_Extension_Base>(
+          PJRT_Extension_Type::PJRT_Extension_Type_Layouts) == nullptr) {
+    return absl::UnimplementedError(
+        "The PJRT plugin has no layouts extension to report default device "
+        "layouts");
+  }
+  // Qualified, so that it does not dispatch through the xla::PjRtClient vtable
+  // of a client that may come from another XLA build.
+  return capi_client->xla::PjRtCApiClient::GetDefaultLayout(element_type, dims);
 }
 
 }  // namespace raiden

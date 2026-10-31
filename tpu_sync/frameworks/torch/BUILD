@@ -91,13 +91,20 @@ cc_library(
         "-use_header_modules",
     ],
     deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
         "@torch_tpu//shims/torch/torch/headeronly:torch_headeronly",
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
+        "//tpu_sync/core:layout_utils",
         "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/core:xla_compat",
+        "//tpu_sync/core:xla_raw_transfer_headers",
     ],
 )
 

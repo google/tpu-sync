@@ -17,14 +17,24 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "absl/status/status_macros.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
 #include "ATen/core/TensorBody.h"
 #include "torch/headeronly/core/DeviceType.h"
 #include "csrc/api/tensor_buffer.h"
+#include "xla/layout.h"
+#include "xla/pjrt/pjrt_client.h"
+#include "xla/shape.h"
+#include "tpu_sync/core/layout_utils.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/xla_compat.h"
 
 namespace tpu_raiden {
 namespace torch {
@@ -39,10 +49,37 @@ std::vector<int64_t> TensorDimensions(const at::Tensor& tensor) {
   return dimensions;
 }
 
+// Returns OK if `buffer`, whose leading dimensions `tensor_dims` folds, keeps
+// every element at the device byte offset where a buffer of shape `tensor_dims`
+// keeps it: raw copies move the bytes as they are, to and from peers that hold
+// the tensor in buffers of its own shape.
+absl::Status CheckFoldedBufferLayout(const xla::PjRtBuffer& buffer,
+                                     absl::Span<const int64_t> tensor_dims) {
+  const xla::Shape& buffer_shape = buffer.on_device_shape();
+  ABSL_ASSIGN_OR_RETURN(
+      const xla::Layout tensor_layout,
+      raiden::PjRtClientDefaultLayout(buffer.client(),
+                                      buffer_shape.element_type(), tensor_dims),
+      _.SetPrepend() << "could not get the device layout of a "
+                     << DimsToString(tensor_dims)
+                     << " buffer to compare it with: ");
+  // Not ABSL_RETURN_IF_ERROR: the open-source Abseil backport
+  // (third_party/abseil/status_macros.patch) cannot annotate its error.
+  if (absl::Status status =
+          CheckFoldedDeviceLayout(buffer_shape, tensor_dims, tensor_layout);
+      !status.ok()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "the buffer does not hold its bytes as a ", DimsToString(tensor_dims),
+        " buffer would: ", status.message()));
+  }
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
-                                 bool unsafe_skip_buffer_lock) {
+                                 bool unsafe_skip_buffer_lock,
+                                 FoldedViews folded_views) {
   if (tensor.device().type() != at::DeviceType::PrivateUse1) {
     throw std::invalid_argument(
         "Tensor must reside on TPU device private use space");
@@ -82,19 +119,41 @@ UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
   // The base buffer is the storage and may carry different logical dimensions
   // than the tensor's view. Raw transfer slices it by the tensor's logical
   // major (block) dimension while DMAing the base storage buffer. Accept either
-  // a matching base major dimension or vLLM's raw rank-1 byte storage exposed
-  // as a full rank-2 block-major view: (num_blocks, bytes_per_block).
-  if (base_ref.dimensions().empty()) {
+  // a matching base major dimension, vLLM's raw rank-1 byte storage exposed
+  // as a full rank-2 block-major view: (num_blocks, bytes_per_block), or, where
+  // `folded_views` allows it, a view that folds the buffer's leading dimensions
+  // into its own. The last includes clones: torch_tpu backs
+  // `x.reshape(E * F, D).clone()` with x's [E, F, D] buffer.
+  const absl::Span<const int64_t> base_dims = base_ref.dimensions();
+  if (base_dims.empty()) {
     throw std::invalid_argument("Tensor base storage buffer has no dimensions");
   }
-  const bool base_major_matches = base_ref.dimensions()[0] == tensor.size(0);
+  std::vector<int64_t> tensor_dims = TensorDimensions(tensor);
+  const bool base_major_matches = base_dims[0] == tensor.size(0);
   const bool is_rank1_raw_storage_block_view =
-      base_ref.dimensions().size() == 1 && tensor.dim() == 2;
-  if (!base_major_matches && !is_rank1_raw_storage_block_view) {
-    throw std::invalid_argument(
+      base_dims.size() == 1 && tensor.dim() == 2;
+  const bool folds_leading_dims = !base_major_matches &&
+                                  !is_rank1_raw_storage_block_view &&
+                                  FoldsLeadingDims(base_dims, tensor_dims);
+  if (folds_leading_dims && folded_views == FoldedViews::kReject) {
+    throw std::invalid_argument(absl::StrCat(
+        "Tensor's leading (block) dimension does not match its base storage "
+        "buffer: the tensor's shape ",
+        DimsToString(tensor_dims), " folds leading dimensions of the buffer's ",
+        DimsToString(base_dims),
+        ". Raw transfer and KVCacheManager address the buffer in units of its "
+        "own leading dimension, so they reject such tensors; "
+        "WeightSynchronizer accepts them if the buffer's device layout "
+        "matches."));
+  }
+  if (!base_major_matches && !is_rank1_raw_storage_block_view &&
+      !folds_leading_dims) {
+    throw std::invalid_argument(absl::StrCat(
         "Tensor's leading (block) dimension does not match its base storage "
         "buffer; raw transfer requires a layout-preserving full view of the "
-        "block-major storage.");
+        "block-major storage (tensor shape ",
+        DimsToString(tensor_dims), ", base storage buffer shape ",
+        DimsToString(base_dims), ")."));
   }
   // torch packs float4_e2m1fn_x2 two values per byte while the base buffer
   // (an XLA F4E2M1FN array of twice the minor dimension) is accounted at one
@@ -124,6 +183,20 @@ UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
     throw std::runtime_error(absl::StrCat(
         "Failed to fetch PjRtBuffer from TPU reference: ", status_or_buf.status().message()));
   }
+  if (folds_leading_dims) {
+    if (absl::Status status =
+            CheckFoldedBufferLayout(*status_or_buf.value(), tensor_dims);
+        !status.ok()) {
+      const std::string message = absl::StrCat(
+          "Tensor of shape ", DimsToString(tensor_dims),
+          " folds the leading dimensions of its base storage buffer of shape ",
+          DimsToString(base_dims), ", but ", status.message());
+      if (absl::IsInvalidArgument(status)) {
+        throw std::invalid_argument(message);
+      }
+      throw std::runtime_error(message);
+    }
+  }
 
   auto handle_or = raiden::RaidenBufferHandle::Acquire(
       status_or_buf.value(), /*c_api=*/nullptr, /*extension=*/nullptr,
@@ -140,7 +213,7 @@ UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor,
   return UnpackedTensor{
       .buffer = std::move(handle_or.value()),
       .ref = std::move(base_ref),
-      .logical_dimensions = TensorDimensions(tensor),
+      .logical_dimensions = std::move(tensor_dims),
       .logical_slice_byte_size = logical_slice_byte_size,
       .logical_physical_size = logical_physical_size,
   };

@@ -79,8 +79,10 @@ TorchKVCacheManager::UnpackedLayers TorchKVCacheManager::UnpackLayers(
   // Retain the owning TensorBufferHandles: they pin the base storage buffers
   // backing the tensors, so they must outlive every D2h/H2d the manager
   // dispatches.
-  UnpackedTensors u =
-      UnpackTorchTensors(device_tensors, unsafe_skip_buffer_lock);
+  // Rejects folded views: the manager addresses buffers in units of their
+  // leading dimension.
+  UnpackedTensors u = UnpackTorchTensors(
+      device_tensors, unsafe_skip_buffer_lock, FoldedViews::kReject);
   UnpackedLayers unpacked;
   unpacked.buffers = std::move(u.buffers);
   unpacked.refs = std::move(u.refs);

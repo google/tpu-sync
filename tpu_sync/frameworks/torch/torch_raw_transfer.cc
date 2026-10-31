@@ -49,6 +49,7 @@ namespace {
 
 using TensorList = std::vector<at::Tensor>;
 
+using ::tpu_raiden::torch::FoldedViews;
 using ::tpu_raiden::torch::UnpackTorchTensor;
 
 void DeleteHostBufferAllocation(void* ctx) {
@@ -389,7 +390,10 @@ PjRtCopyFuture TransferD2HBatchAsync(
   futures.reserve(src_arrs.size());
   for (size_t i = 0; i < src_arrs.size(); ++i) {
     ValidateCpuTensor(dst_arrs[i], "Destination");
-    auto unpacked = UnpackTorchTensor(src_arrs[i], unsafe_skip_buffer_lock);
+    // Rejects folded views: the major-dimension offsets address the base
+    // buffer's leading dimension.
+    auto unpacked = UnpackTorchTensor(src_arrs[i], unsafe_skip_buffer_lock,
+                                      FoldedViews::kReject);
     AwaitReady(unpacked.buffer.buffer, "Source");
     const RaidenBufferHandle& src_buffer = unpacked.buffer;
 
@@ -406,7 +410,10 @@ PjRtCopyFuture TransferD2HBatchAsync(
 
 int64_t MajorSliceBytes(const at::Tensor& tpu_tensor,
                         bool unsafe_skip_buffer_lock) {
-  auto unpacked = UnpackTorchTensor(tpu_tensor, unsafe_skip_buffer_lock);
+  // Rejects folded views, like the transfers whose major-dimension units this
+  // reports: the slice below is one of the base buffer's leading dimension.
+  auto unpacked = UnpackTorchTensor(tpu_tensor, unsafe_skip_buffer_lock,
+                                    FoldedViews::kReject);
   AwaitReady(unpacked.buffer.buffer, "Tensor");
   const RaidenBufferHandle& buffer = unpacked.buffer;
   ValidateMajorDimLayout(buffer, "Tensor");
@@ -432,7 +439,8 @@ PjRtCopyFuture TransferH2DBatchAsync(
   futures.reserve(src_arrs.size());
   for (size_t i = 0; i < src_arrs.size(); ++i) {
     ValidateCpuTensor(src_arrs[i], "Source");
-    auto unpacked = UnpackTorchTensor(dst_arrs[i], unsafe_skip_buffer_lock);
+    auto unpacked = UnpackTorchTensor(dst_arrs[i], unsafe_skip_buffer_lock,
+                                      FoldedViews::kReject);
     // The destination buffer's ready future signals that it is safe to write
     // into (allocation defined, no pending producer).
     AwaitReady(unpacked.buffer.buffer, "Destination");
@@ -478,7 +486,8 @@ PreparedTorchRawTransfer::PreparedTorchRawTransfer(
   if (!host_buffer_) {
     throw std::invalid_argument("host_buffer must not be None");
   }
-  auto unpacked = UnpackTorchTensor(tpu_tensor, unsafe_skip_buffer_lock);
+  auto unpacked = UnpackTorchTensor(tpu_tensor, unsafe_skip_buffer_lock,
+                                    FoldedViews::kReject);
   AwaitReady(unpacked.buffer.buffer, "TPU tensor");
   buffer_ = std::move(unpacked.buffer);
   buffer_ref_ = std::move(unpacked.ref);  // keep the materialized buffer alive

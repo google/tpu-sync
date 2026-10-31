@@ -215,6 +215,7 @@ class KVCacheStore {
                         int expected_worker_count = 0);
 
   // Test-only constructor for injecting mock controller
+  // (`raiden_id.data_replica_idx >= 0` is enforced with a `CHECK`).
   explicit KVCacheStore(
       size_t capacity,
       std::unique_ptr<tpu_raiden::controller::RaidenController>
@@ -406,6 +407,8 @@ class KVCacheStore {
 
   const RaidenId& raiden_id() const { return raiden_id_; }
 
+  int dp_rank() const { return raiden_id_.data_replica_idx; }
+
   tpu_raiden::controller::RaidenController* raiden_controller() const {
     return raiden_controller_.get();
   }
@@ -572,6 +575,12 @@ class KVCacheStore {
   // as the source-side hooks that a peer's ReadRemote lease acquisition and
   // release run against this store's LRU (no-op if there is no controller).
   void RegisterReadRemoteHooks();
+
+  // Refreshes the `host_pool_blocks` gauges by delegating to the primary
+  // backend's KVCacheStoreBackend::RecordHostPoolMetrics(). Must be called
+  // without the backend's `mutex_` held (the backend acquires it). No-op if
+  // there is no primary backend, or if the backend has no controller.
+  void RecordHostPoolMetrics() const;
 
   // Evicts host blocks by their logical block hashes.
   //

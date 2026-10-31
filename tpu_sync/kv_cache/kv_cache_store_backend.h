@@ -201,6 +201,10 @@ class KVCacheStoreBackend {
   // controller and block trackers.
   virtual void Shutdown() {}
 
+  // Refreshes host DRAM pool occupancy gauges (total, used, pinned) if this
+  // backend manages a host block pool.
+  virtual void RecordHostPoolMetrics() const {}
+
   // Human-readable backend name for logging and diagnostics (e.g.,
   // "HostOffloadBackend", "posix").
   virtual std::string name() const = 0;
@@ -274,6 +278,9 @@ class KVCacheStoreBackend {
 
   // Remaining evictable/unpinned space in this backend.
   virtual size_t GetAvailableSpace() const = 0;
+
+  // Number of unpinned entries that currently hold a host DRAM block.
+  virtual size_t NumEvictableHostBlocks() const { return 0; }
 
   // Reconstructs index entries from a local persistent manifest/metadata table.
   // Default implementation returns 0 (no recovery).

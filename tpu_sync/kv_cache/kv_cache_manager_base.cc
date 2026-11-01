@@ -2713,18 +2713,6 @@ bool KVCacheManagerBase::AcceptsPlanlessExplicitPush(uint64_t uuid) const {
   return HasActivePlan(uuid);
 }
 
-absl::Status KVCacheManagerBase::OnRecvProgress(uint64_t uuid) {
-  return transfer_hooks_.on_recv_progress
-             ? transfer_hooks_.on_recv_progress(uuid)
-             : absl::OkStatus();
-}
-
-absl::Status KVCacheManagerBase::OnRecvNetworkComplete(uint64_t uuid) {
-  return transfer_hooks_.on_recv_network_complete
-             ? transfer_hooks_.on_recv_network_complete(uuid)
-             : absl::OkStatus();
-}
-
 absl::StatusOr<std::shared_ptr<TransferSession>> KVCacheManagerBase::GetSession(
     uint64_t uuid) const {
   if (transfer_hooks_.get_session) {

@@ -165,7 +165,6 @@ class BlockTransportServerPushSession final
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   absl::Status status_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_map<int, LayerProgress> layer_progress_ ABSL_GUARDED_BY(mu_);
-  size_t layers_dispatched_ ABSL_GUARDED_BY(mu_) = 0;
 };
 
 // Server-side session managing incoming pull requests (op 2).

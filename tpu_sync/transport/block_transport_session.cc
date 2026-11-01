@@ -682,30 +682,13 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
     }
   }
 
-  // Telemetry-only hook: a failure must not block layer completion below.
-  if (is_peregrine && !plan_declared) {
-    if (absl::Status s = delegate_->OnRecvProgress(uuid_); !s.ok()) {
-      LOG(WARNING) << "OnRecvProgress failed for uuid " << uuid_ << ": " << s;
-    }
-  }
   if (trigger_completion) {
     ABSL_RETURN_IF_ERROR(
         FaultInjectStatus(hooks::kBlockTransportRecvLayerDone));
     if (plan_declared) {
       ABSL_RETURN_IF_ERROR(delegate_->OnPoolReceived(l, uuid_));
     } else {
-      absl::Status layer_status = delegate_->OnLayerReceived(l, uuid_);
-      bool all_layers_dispatched = false;
-      if (is_peregrine) {
-        absl::MutexLock lock(mu_);
-        if (++layers_dispatched_ >= delegate_->num_layers()) {
-          all_layers_dispatched = true;
-        }
-      }
-      ABSL_RETURN_IF_ERROR(layer_status);
-      if (all_layers_dispatched) {
-        ABSL_RETURN_IF_ERROR(delegate_->OnRecvNetworkComplete(uuid_));
-      }
+      ABSL_RETURN_IF_ERROR(delegate_->OnLayerReceived(l, uuid_));
     }
   }
   return absl::OkStatus();

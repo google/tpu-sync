@@ -538,6 +538,19 @@ void TransferReceiveSession::EndRecvOpLocked() {
   }
 }
 
+bool TransferReceiveSession::TryBeginOp() {
+  absl::MutexLock lock(mu_);
+  if (done_ || draining_) return false;
+  ++in_flight_;
+  if (!any_blocks_received_) {
+    any_blocks_received_ = true;
+    if (metrics_collector_ != nullptr) {
+      metrics_collector_->RecordFirstPacket(uuid_);
+    }
+  }
+  return true;
+}
+
 void TransferReceiveSession::EndOp() {
   absl::MutexLock lock(mu_);
   EndRecvOpLocked();
@@ -694,32 +707,6 @@ absl::Status TransferReceiveSession::Start() {
                               absl::Seconds(manager->control_timeout_s_))
             .OnReady(std::move(on_response));
       });
-  return absl::OkStatus();
-}
-
-absl::Status TransferReceiveSession::OnRecvProgress() {
-  absl::MutexLock lock(mu_);
-  if (done_ || draining_) {
-    return absl::OkStatus();
-  }
-  if (!any_blocks_received_) {
-    any_blocks_received_ = true;
-    if (metrics_collector_ != nullptr) {
-      metrics_collector_->RecordFirstPacket(uuid_);
-    }
-  }
-  return absl::OkStatus();
-}
-
-absl::Status TransferReceiveSession::OnRecvNetworkComplete() {
-  absl::MutexLock lock(mu_);
-  if (done_ || draining_ || network_completed_) {
-    return absl::OkStatus();
-  }
-  network_completed_ = true;
-  if (metrics_collector_ != nullptr) {
-    metrics_collector_->RecordLastPacket(uuid_);
-  }
   return absl::OkStatus();
 }
 
@@ -954,6 +941,18 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
     }
   });
 
+  // Every layer's bytes have landed once each layer's copy has been issued.
+  // A block report may have completed the network phase first (TCP), and a
+  // receive that finished meanwhile records nothing.
+  absl::MutexLock lock(mu_);
+  dispatched_layers_.insert(layer_idx);
+  if (dispatched_layers_.size() == base_->num_layers() && !network_completed_ &&
+      !done_ && !draining_) {
+    network_completed_ = true;
+    if (metrics_collector_ != nullptr) {
+      metrics_collector_->RecordLastPacket(uuid_);
+    }
+  }
   return absl::OkStatus();
 }
 

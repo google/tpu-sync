@@ -626,6 +626,7 @@ cc_test(
     deps = [
         ":kv_cache_manager_base",
         ":kv_cache_manager_with_transfer",
+        "//tpu_sync/core:metrics_collector",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:staging_arena",
         "//tpu_sync/fault_injection:hooks",

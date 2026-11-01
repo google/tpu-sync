@@ -276,28 +276,6 @@ void KVCacheManagerWithTransfer::SweepSubPlanChainsLocked(
 
 void KVCacheManagerWithTransfer::InitializeBaseHooks() {
   kv_cache::KVCacheManagerBase::TransferEventHooks hooks;
-  hooks.on_recv_progress = [this](uint64_t uuid) -> absl::Status {
-    std::shared_ptr<TransferReceiveSession> recv_session;
-    {
-      absl::MutexLock lock(mu_);
-      recv_session = FindSessionLocked<TransferReceiveSession>(uuid);
-      if (recv_session == nullptr) {
-        return absl::OkStatus();
-      }
-    }
-    return recv_session->OnRecvProgress();
-  };
-  hooks.on_recv_network_complete = [this](uint64_t uuid) -> absl::Status {
-    std::shared_ptr<TransferReceiveSession> recv_session;
-    {
-      absl::MutexLock lock(mu_);
-      recv_session = FindSessionLocked<TransferReceiveSession>(uuid);
-      if (recv_session == nullptr) {
-        return absl::OkStatus();
-      }
-    }
-    return recv_session->OnRecvNetworkComplete();
-  };
   hooks.get_session = [this](uint64_t uuid) { return GetSession(uuid); };
   base_->SetTransferEventHooks(std::move(hooks));
 }

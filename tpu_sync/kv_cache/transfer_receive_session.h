@@ -30,6 +30,7 @@
 #include "absl/base/nullability.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -127,31 +128,21 @@ class TransferReceiveSession
     return transfer_plan_;
   }
 
-  bool TryBeginOp() override {
-    absl::MutexLock lock(mu_);
-    if (done_ || draining_) return false;
-    ++in_flight_;
-    return true;
-  }
+  // Admits one incoming push unless the session is draining or done. The first
+  // admitted push records first-packet timing.
+  bool TryBeginOp() override;
   void EndOp() override;
 
   // Returns true if network/layer transfer is complete and all H2D futures are
   // ready.
   bool IsReadyToComplete() const;
 
-  // Peregrine receive hook: records first-packet timing the first time any
-  // Post for this session lands.
-  absl::Status OnRecvProgress();
-
-  // Peregrine receive hook: marks the network phase complete and records
-  // last-packet timing once every layer's Posts have landed on this receiver.
-  absl::Status OnRecvNetworkComplete();
-
   // With empty |minor_dimension_indices|, starts the H2D copy for layer
   // |major_dimension_idx|, failing with kFailedPrecondition while this receive
   // is live on a pool-addressed plan, which only a ReshardReceiveSession can
-  // execute. Otherwise records that |shard_ids| of |minor_dimension_indices|
-  // landed (see RecordBlockShards()).
+  // execute; once every layer's copy has been issued, the network phase is
+  // complete (see ExecuteLayerH2d()). Otherwise records that |shard_ids| of
+  // |minor_dimension_indices| landed (see RecordBlockShards()).
   absl::Status OnDataReceived(size_t major_dimension_idx,
                               absl::Span<const int> minor_dimension_indices,
                               absl::Span<const int> shard_ids) override;
@@ -203,7 +194,9 @@ class TransferReceiveSession
   // Issues H2D copy for |layer_idx| using |base_| and registers the completion
   // callback. When fewer host layer buffers exist than layers, the copy reads
   // the host layer buffer leased to |layer_idx| and the callback releases the
-  // lease.
+  // lease. Once copies have been issued for every distinct layer, marks the
+  // network phase complete and records last-packet timing, unless a block
+  // report already did or the receive is draining.
   absl::Status ExecuteLayerH2d(size_t layer_idx);
 
   // Returns the host layer buffer leased to |layer_idx|, leasing one when it
@@ -339,8 +332,13 @@ class TransferReceiveSession
   std::vector<int64_t> blocks_received_per_shard_ ABSL_GUARDED_BY(mu_);
   // Shards whose count reached completion; network done at num_shards.
   int32_t num_completed_shards_ ABSL_GUARDED_BY(mu_) = 0;
+  // True once first-packet timing is recorded: by the first push TryBeginOp()
+  // admits, or by the first RecordBlockShards() report if no push came first.
   bool any_blocks_received_ ABSL_GUARDED_BY(mu_) = false;
   int32_t num_completed_layers_ ABSL_GUARDED_BY(mu_) = 0;
+  // Distinct layers whose H2D copy has been issued; the network phase is
+  // complete once it holds every layer.
+  absl::flat_hash_set<size_t> dispatched_layers_ ABSL_GUARDED_BY(mu_);
   bool network_completed_ ABSL_GUARDED_BY(mu_) = false;
   bool h2d_started_ ABSL_GUARDED_BY(mu_) = false;
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;

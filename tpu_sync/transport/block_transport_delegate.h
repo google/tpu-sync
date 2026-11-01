@@ -84,16 +84,6 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
   // host mirror.
   virtual bool AcceptsPlanlessExplicitPush(uint64_t uuid) const { return true; }
 
-  // Peregrine receive hooks.
-  virtual absl::Status OnRecvProgress(uint64_t uuid) {
-    return absl::OkStatus();
-  }
-  // Called once per uuid when every expected Post for every layer has
-  // completed on this receiver.
-  virtual absl::Status OnRecvNetworkComplete(uint64_t uuid) {
-    return absl::OkStatus();
-  }
-
   // The transport address space is historically one block array per manager
   // layer. Explicit pool tables widen that address space to one block array
   // per pool without changing the wire's integer index.

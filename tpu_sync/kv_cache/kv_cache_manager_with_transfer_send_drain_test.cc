@@ -43,12 +43,15 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "xla/future.h"
+#include "tpu_sync/core/metrics_collector.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
@@ -1288,6 +1291,307 @@ TEST(RecvLifecycleTest,
   EXPECT_THAT(session->GetStatus(),
               ::absl_testing::StatusIs(absl::StatusCode::kInternal));
   EXPECT_EQ(consumer.free_slots(), kSlots);
+}
+
+TEST(RecvLifecycleTest, FirstAdmittedPushRecordsFirstPacketOnce) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/93, "req_first_packet", /*num_blocks=*/2,
+                       /*total_bytes=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferReceiveSession> session,
+      TransferReceiveSession::Create(
+          consumer.base(), consumer.staging_allocator(), /*uuid=*/93,
+          "req_first_packet", /*total_blocks=*/2,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10),
+          /*acquire_staging=*/true, metrics));
+  const std::string before_admission = metrics->DumpMetricsToString();
+
+  ASSERT_TRUE(session->TryBeginOp());
+  const std::string after_first_admission = metrics->DumpMetricsToString();
+  EXPECT_NE(after_first_admission, before_admission);
+
+  // Neither a second admitted push nor a partial block report re-stamps
+  // first-packet timing, even once the clock has moved on.
+  absl::SleepFor(absl::Milliseconds(2));
+  session->EndOp();
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{0},
+                                         /*shard_ids=*/{0}));
+  session->EndOp();
+  EXPECT_FALSE(session->Done());
+  EXPECT_EQ(metrics->DumpMetricsToString(), after_first_admission);
+  session->Finish();
+}
+
+TEST(RecvLifecycleTest, AdmissionRejectedByDoneSessionRecordsNoFirstPacket) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/94, "req_done", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  metrics->RecordStart(/*uuid=*/95, "req_live", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferReceiveSession> done_session,
+                       TransferReceiveSession::Create(
+                           consumer.base(), consumer.staging_allocator(),
+                           /*uuid=*/94, "req_done", /*total_blocks=*/1,
+                           deadline, /*acquire_staging=*/true, metrics));
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferReceiveSession> live_session,
+                       TransferReceiveSession::Create(
+                           consumer.base(), consumer.staging_allocator(),
+                           /*uuid=*/95, "req_live", /*total_blocks=*/1,
+                           deadline, /*acquire_staging=*/true, metrics));
+  done_session->Finish(absl::CancelledError("receive cancelled"));
+  ASSERT_TRUE(done_session->Done());
+  const std::string before_admission = metrics->DumpMetricsToString();
+
+  EXPECT_FALSE(done_session->TryBeginOp());
+  EXPECT_EQ(metrics->DumpMetricsToString(), before_admission);
+
+  // The same report does record an admitted push.
+  ASSERT_TRUE(live_session->TryBeginOp());
+  EXPECT_NE(metrics->DumpMetricsToString(), before_admission);
+  live_session->EndOp();
+  live_session->Finish();
+}
+
+TEST(RecvLifecycleTest,
+     AdmissionRejectedByDrainingSessionRecordsNoFirstPacket) {
+  RecvTestManager consumer(/*num_layers=*/1, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/96, "req_draining", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  metrics->RecordStart(/*uuid=*/97, "req_live", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferReceiveSession> draining_session,
+                       TransferReceiveSession::Create(
+                           consumer.base(), consumer.staging_allocator(),
+                           /*uuid=*/96, "req_draining", /*total_blocks=*/1,
+                           deadline, /*acquire_staging=*/true, metrics));
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferReceiveSession> live_session,
+                       TransferReceiveSession::Create(
+                           consumer.base(), consumer.staging_allocator(),
+                           /*uuid=*/97, "req_live", /*total_blocks=*/1,
+                           deadline, /*acquire_staging=*/true, metrics));
+  // A pending layer H2D copy keeps the cancelled receive draining, not done.
+  ABSL_ASSERT_OK(draining_session->OnDataReceived(
+      /*major_dimension_idx=*/0, /*minor_dimension_indices=*/{},
+      /*shard_ids=*/{}));
+  ASSERT_EQ(consumer.copies_issued(), 1);
+  draining_session->Finish(absl::CancelledError("receive cancelled"));
+  ASSERT_TRUE(draining_session->IsDraining());
+  ASSERT_FALSE(draining_session->Done());
+  const std::string before_admission = metrics->DumpMetricsToString();
+
+  EXPECT_FALSE(draining_session->TryBeginOp());
+  EXPECT_EQ(metrics->DumpMetricsToString(), before_admission);
+
+  // The same report does record an admitted push.
+  ASSERT_TRUE(live_session->TryBeginOp());
+  EXPECT_NE(metrics->DumpMetricsToString(), before_admission);
+  live_session->EndOp();
+  live_session->Finish();
+  consumer.FinishCopy(0, absl::OkStatus());
+  EXPECT_TRUE(draining_session->Done());
+}
+
+// Returns the "network_transit_us" field (last-packet minus first-packet time)
+// of the one transfer in |metrics|'s report. It is negative while first-packet
+// is recorded and last-packet is not.
+int64_t NetworkTransitUs(MetricsCollector& metrics) {
+  const std::string report = metrics.DumpMetricsToString();
+  constexpr absl::string_view kField = "\"network_transit_us\": ";
+  const size_t field_start = report.find(kField);
+  CHECK_NE(field_start, std::string::npos) << report;
+  const size_t value_start = field_start + kField.size();
+  const size_t value_end = report.find(',', value_start);
+  int64_t transit_us = 0;
+  CHECK(absl::SimpleAtoi(report.substr(value_start, value_end - value_start),
+                         &transit_us))
+      << report;
+  return transit_us;
+}
+
+TEST(RecvLifecycleTest,
+     PeregrineLayerCompletionsRecordLastPacketOnceAndFinishAfterH2d) {
+  RecvTestManager consumer(/*num_layers=*/2, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/98, "req_peregrine", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferReceiveSession> session,
+      TransferReceiveSession::Create(
+          consumer.base(), consumer.staging_allocator(), /*uuid=*/98,
+          "req_peregrine", /*total_blocks=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10),
+          /*acquire_staging=*/true, metrics));
+
+  // Each Post completes one layer; Peregrine sends no block reports.
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  session->EndOp();
+  EXPECT_LT(NetworkTransitUs(*metrics), 0);
+
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/1,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  session->EndOp();
+  const int64_t transit_us = NetworkTransitUs(*metrics);
+  EXPECT_GE(transit_us, 0);
+  ASSERT_EQ(consumer.copies_issued(), 2);
+  EXPECT_FALSE(session->Done());
+
+  absl::SleepFor(absl::Milliseconds(2));
+  consumer.FinishCopy(0, absl::OkStatus());
+  EXPECT_FALSE(session->Done());
+  consumer.FinishCopy(1, absl::OkStatus());
+  EXPECT_TRUE(session->Done());
+  ABSL_EXPECT_OK(session->GetStatus());
+  EXPECT_EQ(NetworkTransitUs(*metrics), transit_us);
+}
+
+TEST(RecvLifecycleTest,
+     TcpLastLayerThenItsBlockReportRecordLastPacketOnceAndFinishOnce) {
+  RecvTestManager consumer(/*num_layers=*/2, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/99, "req_tcp", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferReceiveSession> session,
+      TransferReceiveSession::Create(
+          consumer.base(), consumer.staging_allocator(), /*uuid=*/99, "req_tcp",
+          /*total_blocks=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10),
+          /*acquire_staging=*/true, metrics));
+
+  // A TCP stream completes its layer, then reports the layer's blocks.
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{0},
+                                         /*shard_ids=*/{0}));
+  session->EndOp();
+  EXPECT_LT(NetworkTransitUs(*metrics), 0);
+
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/1,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  const int64_t transit_us = NetworkTransitUs(*metrics);
+  EXPECT_GE(transit_us, 0);
+  // The block report that completes every shard does not re-record.
+  absl::SleepFor(absl::Milliseconds(2));
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{0},
+                                         /*shard_ids=*/{0}));
+  session->EndOp();
+  EXPECT_EQ(NetworkTransitUs(*metrics), transit_us);
+  EXPECT_FALSE(session->Done());
+
+  consumer.FinishCopy(0, absl::OkStatus());
+  consumer.FinishCopy(1, absl::OkStatus());
+  EXPECT_TRUE(session->Done());
+  ABSL_EXPECT_OK(session->GetStatus());
+  EXPECT_EQ(NetworkTransitUs(*metrics), transit_us);
+}
+
+TEST(RecvLifecycleTest,
+     TcpH2dFinishingBeforeLastBlockReportRecordsLastPacketAndFinishesOnce) {
+  RecvTestManager consumer(/*num_layers=*/2, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/100, "req_tcp_h2d_first", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferReceiveSession> session,
+      TransferReceiveSession::Create(
+          consumer.base(), consumer.staging_allocator(), /*uuid=*/100,
+          "req_tcp_h2d_first", /*total_blocks=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10),
+          /*acquire_staging=*/true, metrics));
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{0},
+                                         /*shard_ids=*/{0}));
+  session->EndOp();
+
+  // Both copies finish while the last stream still holds its push lease,
+  // before it reports its blocks.
+  ASSERT_TRUE(session->TryBeginOp());
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/1,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  const int64_t transit_us = NetworkTransitUs(*metrics);
+  EXPECT_GE(transit_us, 0);
+  consumer.FinishCopy(0, absl::OkStatus());
+  consumer.FinishCopy(1, absl::OkStatus());
+  EXPECT_TRUE(session->IsDraining());
+  EXPECT_FALSE(session->Done());
+
+  absl::SleepFor(absl::Milliseconds(2));
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{0},
+                                         /*shard_ids=*/{0}));
+  session->EndOp();
+  EXPECT_TRUE(session->Done());
+  ABSL_EXPECT_OK(session->GetStatus());
+  EXPECT_EQ(NetworkTransitUs(*metrics), transit_us);
+}
+
+TEST(RecvLifecycleTest, RedeliveredLayerDoesNotCompleteNetworkPhase) {
+  RecvTestManager consumer(/*num_layers=*/2, /*timeout_s=*/10.0);
+  auto metrics = std::make_shared<MetricsCollector>(
+      absl::StrCat(::testing::TempDir(), "/no_sysfs"));
+  metrics->RecordStart(/*uuid=*/101, "req_redelivered", /*num_blocks=*/1,
+                       /*total_bytes=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferReceiveSession> session,
+      TransferReceiveSession::Create(
+          consumer.base(), consumer.staging_allocator(), /*uuid=*/101,
+          "req_redelivered", /*total_blocks=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10),
+          /*acquire_staging=*/true, metrics));
+  ASSERT_TRUE(session->TryBeginOp());
+
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  ASSERT_EQ(consumer.copies_issued(), 2);
+  EXPECT_LT(NetworkTransitUs(*metrics), 0);
+
+  // The missing layer does complete it.
+  ABSL_ASSERT_OK(session->OnDataReceived(/*major_dimension_idx=*/1,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  EXPECT_GE(NetworkTransitUs(*metrics), 0);
+
+  session->Finish(absl::CancelledError("receive cancelled"));
+  session->EndOp();
+  consumer.FinishCopy(0, absl::OkStatus());
+  consumer.FinishCopy(1, absl::OkStatus());
+  consumer.FinishCopy(2, absl::OkStatus());
+  EXPECT_TRUE(session->Done());
 }
 
 TEST(RecvLifecycleTest,

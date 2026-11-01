@@ -163,8 +163,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // pool-reshard / plan lifecycle events without inheriting from
   // KVCacheManagerBase.
   struct TransferEventHooks {
-    std::function<absl::Status(uint64_t uuid)> on_recv_progress;
-    std::function<absl::Status(uint64_t uuid)> on_recv_network_complete;
     // Returns the active transfer session registered under |uuid|, or
     // kNotFound when no session holds it.
     std::function<absl::StatusOr<std::shared_ptr<TransferSession>>(
@@ -654,8 +652,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<size_t> host_layer_idx = std::nullopt);
 
   bool AcceptsPlanlessExplicitPush(uint64_t uuid) const override;
-  absl::Status OnRecvProgress(uint64_t uuid) override;
-  absl::Status OnRecvNetworkComplete(uint64_t uuid) override;
   absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
       uint64_t uuid) const override;
 

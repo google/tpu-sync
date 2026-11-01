@@ -93,9 +93,9 @@ class TestManager : public KVCacheManagerWithTransfer {
   absl::Status AddPoolReshardSend(const StartTransferRequest& plan,
                                   absl::Span<const int64_t> src_block_ids) {
     absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
-        ReshardSendSession::Create(base(), staging_allocator_.get(),
-                                   src_block_ids, /*parallelism=*/1,
-                                   DeadlineFromNow(), plan);
+        ReshardSendSession::Create(base(), /*manager=*/nullptr,
+                                   staging_allocator_.get(), src_block_ids,
+                                   /*parallelism=*/1, DeadlineFromNow(), plan);
     if (!session.ok()) {
       return session.status();
     }

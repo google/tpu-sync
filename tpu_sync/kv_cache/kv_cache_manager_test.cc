@@ -2635,6 +2635,7 @@ TEST(KVCacheManagerTest, NumStagingLayersBoundsHostLayerBuffers) {
 
 class StubTransferSession : public TransferSession {
  public:
+  absl::Status Start() override { return absl::OkStatus(); }
   bool Done() const override { return false; }
   void Finish(const absl::Status& status) override {}
   bool TryBeginOp() override { return true; }

@@ -83,6 +83,10 @@ class TransferSendSession
     return done_;
   }
 
+  // The consumer's pull drives this send (see StartPush), so there is nothing
+  // to start.
+  absl::Status Start() override { return absl::OkStatus(); }
+
   void Finish(const absl::Status& status = absl::OkStatus()) override;
 
   bool TryBeginOp() override { return false; }

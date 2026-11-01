@@ -34,6 +34,12 @@ class TransferSession {
  public:
   virtual ~TransferSession() = default;
 
+  // Begins the work this side initiates, once the session is registered with
+  // its manager. Sessions that only wait for a peer (passive receives, and
+  // send sessions driven by the consumer's pull) return OkStatus(). Call at
+  // most once, without holding the manager's lock. Thread-safe.
+  virtual absl::Status Start() = 0;
+
   // Returns true once the session's outcome has been decided and all in-flight
   // operations have drained.
   virtual bool Done() const = 0;

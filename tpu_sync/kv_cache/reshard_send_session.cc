@@ -95,6 +95,7 @@ absl::Status ReshardSendSession::ValidatePlan(
 
 absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
     kv_cache::KVCacheManagerBase* base,
+    KVCacheManagerWithTransfer* absl_nullable manager,
     StagingBlockAllocator* absl_nullable staging_allocator,
     absl::Span<const int64_t> src_block_ids, int parallelism,
     std::chrono::steady_clock::time_point deadline,
@@ -150,23 +151,28 @@ absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
   std::string req_id = plan.req_id();
   const uint64_t uuid = plan.uuid();
   auto session = std::shared_ptr<ReshardSendSession>(new ReshardSendSession(
-      base, staging_allocator, std::move(req_id), uuid, parallelism,
-      remaining_pool_peer_pushes, deadline, std::move(transfer_plan),
-      std::move(plan), std::vector<std::string>(peers.begin(), peers.end()),
+      base, manager, staging_allocator,
+      std::vector<int64_t>(src_block_ids.begin(), src_block_ids.end()),
+      std::move(req_id), uuid, parallelism, remaining_pool_peer_pushes,
+      deadline, std::move(transfer_plan), std::move(plan),
+      std::vector<std::string>(peers.begin(), peers.end()),
       data_connection_reuse));
   return session;
 }
 
 ReshardSendSession::ReshardSendSession(
-    kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
+    kv_cache::KVCacheManagerBase* base, KVCacheManagerWithTransfer* manager,
+    StagingBlockAllocator* staging_allocator,
+    std::vector<int64_t> src_block_ids, std::string req_id, uint64_t uuid,
     int parallelism, int remaining_pool_peer_pushes,
     std::chrono::steady_clock::time_point deadline, TransferPlan transfer_plan,
     ::tpu_sync::rpc::StartTransferRequest plan,
     std::vector<std::string> dst_peers,
     DataConnectionReuse data_connection_reuse)
     : base_(base),
+      manager_(manager),
       staging_allocator_(staging_allocator),
+      src_block_ids_(std::move(src_block_ids)),
       req_id_(std::move(req_id)),
       uuid_(uuid),
       parallelism_(parallelism),
@@ -246,9 +252,11 @@ absl::Status ReshardSendSession::ValidatePushPreconditions() const {
   return absl::OkStatus();
 }
 
-absl::Status ReshardSendSession::ExecutePush(
-    KVCacheManagerWithTransfer& manager,
-    absl::Span<const int64_t> src_block_ids) {
+absl::Status ReshardSendSession::Start() {
+  if (manager_ == nullptr) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "pool reshard send uuid=", uuid_, " was created without a manager"));
+  }
   {
     absl::MutexLock lock(mu_);
     if (done_ || finalizing_) {
@@ -256,7 +264,6 @@ absl::Status ReshardSendSession::ExecutePush(
                            : absl::CancelledError("Send session is draining");
     }
     ++in_flight_;
-    manager_ = &manager;
   }
   absl::Cleanup end_op = [this]() { EndOp(); };
   // Fail fast on the plan-shape and transport preconditions that need no
@@ -268,7 +275,7 @@ absl::Status ReshardSendSession::ExecutePush(
     RecordPushCompletion(precondition);
     return precondition;
   }
-  std::vector<int64_t> src_ids(src_block_ids.begin(), src_block_ids.end());
+  std::vector<int64_t> src_ids = src_block_ids_;
   try {
     std::thread([self = shared_from_this(),
                  src_ids = std::move(src_ids)]() mutable {
@@ -538,7 +545,7 @@ void ReshardSendSession::Finish(const absl::Status& status) {
   cancelled_.store(true, std::memory_order_relaxed);
   staging_layer_manager_.Shutdown();
   // Settling here, with no op in flight, means no push was ever issued:
-  // ExecutePush holds an op while it schedules, StartPoolPush counts every
+  // Start holds an op while it schedules, StartPoolPush counts every
   // push before issuing it, and each push stays counted until its completion
   // has run RecordPushCompletion, which starts finalizing on the first
   // failure or the last scheduled success. A send that pushed therefore

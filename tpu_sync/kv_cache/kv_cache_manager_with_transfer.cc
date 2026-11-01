@@ -582,6 +582,13 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
                        " for req_id=", req_id, ": a read is still registered"));
     }
   }
+  // A send session only waits for the consumer's pull; its Start() is a no-op
+  // today, but any failure it reports follows this function's throw contract.
+  if (absl::Status started = session->Start(); !started.ok()) {
+    throw std::runtime_error(
+        absl::StrCat("NotifyForRead failed to start uuid=", uuid,
+                     " for req_id=", req_id, ": ", started.message()));
+  }
   cv_.SignalAll();
 
   std::ostringstream timing;
@@ -618,6 +625,7 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
     bool is_sender) {
   bool retired_existing = false;
   bool retired_pool_staging = false;
+  std::shared_ptr<TransferSession> registered;
   {
     absl::MutexLock lock(mu_);
     auto existing = sessions_.find(uuid);
@@ -648,6 +656,7 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
         RetireSettledSessionLocked(existing, &retired_existing,
                                    &retired_pool_staging);
       }
+      registered = send_session;
       sessions_.emplace(uuid, std::move(send_session));
     } else {
       ABSL_ASSIGN_OR_RETURN(
@@ -663,6 +672,7 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
       if (!inserted.ok()) {
         return inserted;
       }
+      registered = recv_session;
       if (recv_session->total_blocks() > 0) {
         LOG(INFO) << "RegisterActivePlan (Receiver): Populated "
                      "sessions_ for UUID "
@@ -680,29 +690,32 @@ absl::Status KVCacheManagerWithTransfer::RegisterActivePlan(
   if (retired_pool_staging) {
     base_->ReleasePoolStagingLeases(uuid);
   }
-  return absl::OkStatus();
+  return registered->Start();
 }
 
 absl::Status KVCacheManagerWithTransfer::RegisterRecv(
     uint64_t uuid, const std::string& req_id, int64_t expected_block_count,
     std::optional<std::chrono::steady_clock::time_point> deadline) {
-  absl::MutexLock lock(mu_);
-  ASSIGN_OR_RETURN(
-      std::shared_ptr<TransferReceiveSession> recv_session,
-      TransferReceiveSession::Create(
-          base_.get(), staging_allocator_.get(), uuid, req_id,
-          expected_block_count, deadline.value_or(DeadlineFromNow()),
-          /*acquire_staging=*/false, metrics_collector_));
-  // host_to_chip is left empty -> defaults to 1-to-1 mapping in
-  // OnBlockShardsReceived
-  absl::Status inserted = EmplaceRecvSessionLocked(uuid, recv_session);
-  if (!inserted.ok()) {
-    return inserted;
+  std::shared_ptr<TransferReceiveSession> recv_session;
+  {
+    absl::MutexLock lock(mu_);
+    ASSIGN_OR_RETURN(
+        recv_session,
+        TransferReceiveSession::Create(
+            base_.get(), staging_allocator_.get(), uuid, req_id,
+            expected_block_count, deadline.value_or(DeadlineFromNow()),
+            /*acquire_staging=*/false, metrics_collector_));
+    // host_to_chip is left empty -> defaults to 1-to-1 mapping in
+    // OnBlockShardsReceived
+    absl::Status inserted = EmplaceRecvSessionLocked(uuid, recv_session);
+    if (!inserted.ok()) {
+      return inserted;
+    }
+    VLOG(1)
+        << "RegisterRecv (Receiver): Registered expected block count for UUID "
+        << uuid << " with " << expected_block_count << " expected blocks.";
   }
-  VLOG(1)
-      << "RegisterRecv (Receiver): Registered expected block count for UUID "
-      << uuid << " with " << expected_block_count << " expected blocks.";
-  return absl::OkStatus();
+  return recv_session->Start();
 }
 
 absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
@@ -735,7 +748,7 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
 
   ABSL_ASSIGN_OR_RETURN(
       std::shared_ptr<ReshardSendSession> state,
-      ReshardSendSession::Create(base_.get(), staging_allocator_.get(),
+      ReshardSendSession::Create(base_.get(), this, staging_allocator_.get(),
                                  src_block_ids, parallelism, DeadlineFromNow(),
                                  plan));
   {
@@ -745,7 +758,7 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
                                 plan.sub_plan_index(), plan.sub_plan_count());
   }
 
-  return state->ExecutePush(*this, src_block_ids);
+  return state->Start();
 }
 
 absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
@@ -791,11 +804,11 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
   {
     absl::MutexLock lock(mu_);
     pending_pool_reshard_recvs_.erase(plan.uuid());
-    sessions_[plan.uuid()] = std::move(recv_session);
+    sessions_[plan.uuid()] = recv_session;
     NoteSubPlanRegisteredLocked(/*is_recv=*/true, plan.req_id(), plan.uuid(),
                                 plan.sub_plan_index(), plan.sub_plan_count());
   }
-  return absl::OkStatus();
+  return recv_session->Start();
 }
 
 absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {
@@ -963,10 +976,10 @@ void KVCacheManagerWithTransfer::StartRead(
     }
 
     absl::StatusOr<std::shared_ptr<TransferReceiveSession>> created =
-        TransferReceiveSession::Create(base_.get(), staging_allocator_.get(),
-                                       uuid, req_id, remote_block_ids,
-                                       local_block_ids, local_host_block_ids,
-                                       effective_deadline, metrics_collector_);
+        TransferReceiveSession::Create(
+            base_.get(), this, staging_allocator_.get(), uuid, req_id,
+            remote_endpoint, remote_block_ids, local_block_ids,
+            local_host_block_ids, effective_deadline, metrics_collector_);
     if (!created.ok()) {
       failed_recving_.insert(req_id);
       transfer_details_[req_id] = DetailsFromStatus(created.status());
@@ -1005,7 +1018,12 @@ void KVCacheManagerWithTransfer::StartRead(
     return;
   }
 
-  session->ExecutePullRequest(*this, remote_endpoint);
+  // The pull handshake reports its own outcome through the session. A Start()
+  // failure means the handshake never ran, so release the op it would have.
+  if (absl::Status started = session->Start(); !started.ok()) {
+    session->Finish(started);
+    session->EndOp();
+  }
 }
 
 CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {

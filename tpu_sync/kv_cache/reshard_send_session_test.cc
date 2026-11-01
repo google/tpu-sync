@@ -69,13 +69,12 @@ struct ReshardSendSessionTestPeer {
     session.StartPoolPush(pool_idx);
   }
 
-  // Counts one (pool, peer) push of `session` in flight on `manager`, as
-  // ExecutePush and StartPoolPush do before issuing it. The executor's device
-  // copies are device-only, so deviceless tests drive the op accounting here.
-  static void BeginPush(ReshardSendSession& session,
-                        KVCacheManagerWithTransfer& manager) {
+  // Counts one (pool, peer) push of `session` in flight on the manager it was
+  // created with, as Start and StartPoolPush do before issuing it. The
+  // executor's device copies are device-only, so deviceless tests drive the op
+  // accounting here.
+  static void BeginPush(ReshardSendSession& session) {
     absl::MutexLock lock(session.mu_);
-    session.manager_ = &manager;
     ++session.in_flight_;
   }
 
@@ -105,6 +104,7 @@ using ::tpu_sync::rpc::StartTransferRequest;
 
 class StubRecvSession : public TransferSession {
  public:
+  absl::Status Start() override { return absl::OkStatus(); }
   bool Done() const override { return false; }
   void Finish(const absl::Status& status) override {}
   bool TryBeginOp() override { return true; }
@@ -382,11 +382,11 @@ TEST(ReshardSendSessionTest,
       peer);
   absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
       ReshardSendSession::Create(
-          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          manager.base(), &manager, allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
   ABSL_ASSERT_OK(session);
-  ReshardSendSessionTestPeer::BeginPush(**session, manager);
+  ReshardSendSessionTestPeer::BeginPush(**session);
 
   // The plan's only push completes on another thread, as its AsyncPush
   // callback would. That push is the send's last op, so it closes the idle
@@ -423,11 +423,11 @@ TEST(ReshardSendSessionTest,
       peer);
   absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
       ReshardSendSession::Create(
-          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          manager.base(), &manager, allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
   ABSL_ASSERT_OK(session);
-  ReshardSendSessionTestPeer::BeginPush(**session, manager);
+  ReshardSendSessionTestPeer::BeginPush(**session);
 
   // Cancelling the send while its push runs starts finalizing it, but the
   // push in flight keeps it from settling, and nothing is released yet.
@@ -463,12 +463,12 @@ TEST(ReshardSendSessionTest, PooledPolicyKeepsIdlePeerConnections) {
       peer);
   absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
       ReshardSendSession::Create(
-          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          manager.base(), &manager, allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
   ABSL_ASSERT_OK(session);
 
-  ReshardSendSessionTestPeer::BeginPush(**session, manager);
+  ReshardSendSessionTestPeer::BeginPush(**session);
   ReshardSendSessionTestPeer::CompletePush(**session, absl::OkStatus());
 
   EXPECT_TRUE((*session)->Done());
@@ -485,7 +485,8 @@ TEST(ReshardSendSessionTest, CreateRejectsUnknownDataConnReuseValue) {
 
   EXPECT_THAT(
       ReshardSendSession::Create(
-          &base, allocator.get(), std::vector<int64_t>{0}, /*parallelism=*/1,
+          &base, /*manager=*/nullptr, allocator.get(), std::vector<int64_t>{0},
+          /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan),
       StatusIs(absl::StatusCode::kInvalidArgument,
                AllOf(HasSubstr("TPU_RAIDEN_DATA_CONN_REUSE"),
@@ -520,7 +521,8 @@ TEST(ReshardSendSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ReshardSendSession> session,
       ReshardSendSession::Create(
-          &base, allocator.get(), std::vector<int64_t>{0}, /*parallelism=*/1,
+          &base, /*manager=*/nullptr, allocator.get(), std::vector<int64_t>{0},
+          /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(2), plan));
 
   // Pool 0 leases slot 0 (the only allocated host layer).
@@ -562,7 +564,8 @@ TEST(ReshardSendSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ReshardSendSession> timeout_session,
       ReshardSendSession::Create(
-          &base, allocator.get(), std::vector<int64_t>{0}, /*parallelism=*/1,
+          &base, /*manager=*/nullptr, allocator.get(), std::vector<int64_t>{0},
+          /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::milliseconds(30),
           timeout_plan));
   EXPECT_THAT(
@@ -573,10 +576,10 @@ TEST(ReshardSendSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
       StatusIs(absl::StatusCode::kDeadlineExceeded));
 }
 
-// A precondition that needs no waiting fails ExecutePush synchronously, so
+// A precondition that needs no waiting fails Start synchronously, so
 // the START_TRANSFER reply carries it, and the send settles with its plan
 // dropped rather than waiting for the deadline sweep.
-TEST(ReshardSendSessionTest, ExecutePushFailsFastWithoutTransportServer) {
+TEST(ReshardSendSessionTest, StartFailsFastWithoutTransportServer) {
   KVCacheManagerWithTransfer manager = MakeTestManager();
   manager.base()->AttachPlaceholderDeviceHoldForTest();
   std::unique_ptr<StagingBlockAllocator> allocator =
@@ -586,26 +589,25 @@ TEST(ReshardSendSessionTest, ExecutePushFailsFastWithoutTransportServer) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ReshardSendSession> session,
       ReshardSendSession::Create(
-          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          manager.base(), &manager, allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
   ASSERT_TRUE(session->plan().has_value());
 
   manager.base()->StopTransportServer();
-  EXPECT_THAT(session->ExecutePush(manager, std::vector<int64_t>{0}),
-              StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("transport server")));
+  EXPECT_THAT(session->Start(), StatusIs(absl::StatusCode::kFailedPrecondition,
+                                         HasSubstr("transport server")));
   EXPECT_TRUE(session->Done());
   EXPECT_THAT(session->GetStatus(),
               StatusIs(absl::StatusCode::kFailedPrecondition));
   EXPECT_FALSE(session->plan().has_value());
   // A finished send refuses further pushes with its terminal status.
-  EXPECT_THAT(session->ExecutePush(manager, std::vector<int64_t>{0}),
+  EXPECT_THAT(session->Start(),
               StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 
 // A failure on the pipeline thread (here: the staging slot wait running
-// into the session deadline) is reported out of band: ExecutePush returns
+// into the session deadline) is reported out of band: Start returns
 // OK, the send settles with the error, every lease is released, and the plan
 // is dropped.
 TEST(ReshardSendSessionTest, PipelineSlotWaitTimeoutSettlesSendOutOfBand) {
@@ -630,7 +632,7 @@ TEST(ReshardSendSessionTest, PipelineSlotWaitTimeoutSettlesSendOutOfBand) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ReshardSendSession> session,
       ReshardSendSession::Create(
-          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          manager.base(), &manager, allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::milliseconds(200),
           plan));
@@ -645,7 +647,7 @@ TEST(ReshardSendSessionTest, PipelineSlotWaitTimeoutSettlesSendOutOfBand) {
       ReshardSendSessionTestPeer::AcquireStagingSlot(*session, kParkedUnits[1]),
       IsOkAndHolds(1u));
 
-  ABSL_ASSERT_OK(session->ExecutePush(manager, std::vector<int64_t>{0}));
+  ABSL_ASSERT_OK(session->Start());
   EXPECT_THAT(session->AwaitForDone(),
               StatusIs(absl::StatusCode::kDeadlineExceeded));
   EXPECT_TRUE(session->Done());
@@ -691,7 +693,8 @@ TEST(ReshardSendSessionTest, StagingSlotReleasedAfterLastPeerPush) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ReshardSendSession> session,
       ReshardSendSession::Create(
-          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          manager.base(), /*manager=*/nullptr, allocator.get(),
+          std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
 
@@ -717,11 +720,11 @@ TEST(ReshardSendSessionTest, FinishAfterLastPushFinalizingPreservesOkStatus) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ReshardSendSession> session,
       ReshardSendSession::Create(
-          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          manager.base(), &manager, allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
 
-  ReshardSendSessionTestPeer::BeginPush(*session, manager);
+  ReshardSendSessionTestPeer::BeginPush(*session);
   ReshardSendSessionTestPeer::RecordPushCompletion(*session, absl::OkStatus());
   EXPECT_FALSE(session->Done());
 

@@ -75,6 +75,9 @@ class ReshardReceiveSession
     return done_;
   }
 
+  // A pool-reshard receive only waits for its senders' pushes.
+  absl::Status Start() override { return absl::OkStatus(); }
+
   void Finish(const absl::Status& status = absl::OkStatus()) override;
 
   bool TryBeginOp() override {

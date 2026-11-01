@@ -620,6 +620,7 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
   // A session that carries the plan and leases host layer 1 for pool 3.
   class StubPoolTransferSession : public TransferSession {
    public:
+    absl::Status Start() override { return absl::OkStatus(); }
     explicit StubPoolTransferSession(std::shared_ptr<const TransferPlan> plan)
         : plan_(std::move(plan)) {}
     bool Done() const override { return false; }

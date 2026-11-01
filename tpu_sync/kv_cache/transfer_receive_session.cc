@@ -164,9 +164,10 @@ size_t StagingLayerManager::num_free() const {
 
 absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
 TransferReceiveSession::Create(
-    kv_cache::KVCacheManagerBase* base,
+    kv_cache::KVCacheManagerBase* base, KVCacheManagerWithTransfer* manager,
     StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-    const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
+    const std::string& req_id, const std::string& remote_endpoint,
+    const std::vector<int64_t>& remote_block_ids,
     const std::vector<int64_t>& local_block_ids,
     const std::optional<std::vector<int64_t>>& local_host_block_ids,
     std::chrono::steady_clock::time_point deadline,
@@ -174,9 +175,15 @@ TransferReceiveSession::Create(
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
+  if (manager == nullptr) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("pulled receive req_id=", req_id, " requires a manager"));
+  }
   auto session =
       std::shared_ptr<TransferReceiveSession>(new TransferReceiveSession(
           base, staging_allocator, uuid, std::move(metrics_collector)));
+  session->pull_manager_ = manager;
+  session->pull_endpoint_ = remote_endpoint;
   std::vector<int64_t> host_block_ids;
   if (!session->AllocateStagingForLoad(req_id, local_block_ids,
                                        local_host_block_ids, &host_block_ids)) {
@@ -605,8 +612,12 @@ bool TransferReceiveSession::RecordNetworkCompleteLocked(
   return true;
 }
 
-void TransferReceiveSession::ExecutePullRequest(
-    KVCacheManagerWithTransfer& manager, const std::string& remote_endpoint) {
+absl::Status TransferReceiveSession::Start() {
+  if (pull_manager_ == nullptr) {
+    return absl::OkStatus();
+  }
+  KVCacheManagerWithTransfer* const manager = pull_manager_;
+  const std::string& remote_endpoint = pull_endpoint_;
   std::optional<int> target_node = base_->assigned_numa_node();
   std::string session_req_id;
   PullStreamRequestSpec req_spec;
@@ -619,7 +630,8 @@ void TransferReceiveSession::ExecutePullRequest(
   }
   req_spec.uuid = uuid_;
   req_spec.ep_idx = 0;
-  req_spec.consumer_data_port = static_cast<uint32_t>(manager.local_data_port_);
+  req_spec.consumer_data_port =
+      static_cast<uint32_t>(manager->local_data_port_);
   req_spec.consumer_ips = base_->local_ips();
   req_spec.layer_host_addrs = base_->LayerHostAddrs(uuid_);
 
@@ -668,7 +680,7 @@ void TransferReceiveSession::ExecutePullRequest(
   // StartRead caller. An async backend (gRPC) returns as soon as the RPC is
   // issued, so the worker is not held while the handshake waits.
   base_->push_pool()->Schedule(
-      target_node, [&manager, remote_endpoint, req_spec = std::move(req_spec),
+      target_node, [manager, remote_endpoint, req_spec = std::move(req_spec),
                     on_response = std::move(on_response)]() mutable {
         try {
           FaultInjectThrow(hooks::kTransferRecvSessionPullRequest);
@@ -676,11 +688,12 @@ void TransferReceiveSession::ExecutePullRequest(
           on_response(absl::InternalError(e.what()));
           return;
         }
-        manager.control_backend_
+        manager->control_backend_
             ->SendPullRequest(remote_endpoint, req_spec,
-                              absl::Seconds(manager.control_timeout_s_))
+                              absl::Seconds(manager->control_timeout_s_))
             .OnReady(std::move(on_response));
       });
+  return absl::OkStatus();
 }
 
 absl::Status TransferReceiveSession::OnRecvProgress() {

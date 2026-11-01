@@ -125,6 +125,7 @@ struct ScopedPrometheusBackend {
 
 class StubReceiveSession : public TransferSession {
  public:
+  absl::Status Start() override { return absl::OkStatus(); }
   absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     return std::nullopt;
   }
@@ -2571,6 +2572,7 @@ TEST(PeregrineRecvCompleteTest, PerRequestMetadataIsNotInterpretedYet) {
 TEST(PeregrineRecvCompleteTest, RejectsSenderSession) {
   class StubSendSession : public TransferSession {
    public:
+    absl::Status Start() override { return absl::OkStatus(); }
     absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
       return std::nullopt;
     }

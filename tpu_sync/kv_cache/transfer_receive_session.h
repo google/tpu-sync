@@ -61,10 +61,14 @@ class TransferReceiveSession
     : public TransferSession,
       public std::enable_shared_from_this<TransferReceiveSession> {
  public:
+  // Creates a pulled receive: Start() sends its pull request for
+  // |remote_block_ids| to the producer control endpoint |remote_endpoint|
+  // through |manager|'s control backend.
   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
-      kv_cache::KVCacheManagerBase* base,
+      kv_cache::KVCacheManagerBase* base, KVCacheManagerWithTransfer* manager,
       StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-      const std::string& req_id, const std::vector<int64_t>& remote_block_ids,
+      const std::string& req_id, const std::string& remote_endpoint,
+      const std::vector<int64_t>& remote_block_ids,
       const std::vector<int64_t>& local_block_ids,
       const std::optional<std::vector<int64_t>>& local_host_block_ids,
       std::chrono::steady_clock::time_point deadline,
@@ -87,6 +91,11 @@ class TransferReceiveSession
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
   ~TransferReceiveSession() override { ReleaseStaging(); }
+
+  // A pulled receive starts the consumer pull handshake through the control
+  // backend without blocking; the handshake's outcome updates session state.
+  // Every other receive only waits for pushes and returns OkStatus().
+  absl::Status Start() override;
 
   bool Done() const override {
     absl::MutexLock lock(mu_);
@@ -128,11 +137,6 @@ class TransferReceiveSession
   // Returns true if network/layer transfer is complete and all H2D futures are
   // ready.
   bool IsReadyToComplete() const;
-
-  // Starts the consumer pull handshake through the control backend without
-  // blocking, and updates session state upon completion or error.
-  void ExecutePullRequest(KVCacheManagerWithTransfer& manager,
-                          const std::string& remote_endpoint);
 
   // Peregrine receive hook: records first-packet timing the first time any
   // Post for this session lands.
@@ -302,6 +306,11 @@ class TransferReceiveSession
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* base_ = nullptr;
+  // Set only by the pulled-receive Create(), before the session is shared:
+  // the manager whose control backend Start() sends the pull through (null
+  // for every other receive) and the producer control endpoint it targets.
+  KVCacheManagerWithTransfer* pull_manager_ = nullptr;
+  std::string pull_endpoint_;
   StagingBlockAllocator* staging_allocator_ = nullptr;
   uint64_t uuid_ = 0;
   std::shared_ptr<MetricsCollector> metrics_collector_;

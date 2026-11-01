@@ -55,9 +55,12 @@ class ReshardSendSession
  public:
   // Validates the sender schedule in |plan|, resolves the data connection
   // policy (TPU_RAIDEN_DATA_CONN_REUSE), initializes the transport server,
-  // and creates a producer pool-reshard send session.
+  // and creates a producer pool-reshard send session that Start() pushes on
+  // |manager|. |manager| is null only for sessions that are never started
+  // (tests that drive the executor directly).
   static absl::StatusOr<std::shared_ptr<ReshardSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,
+      KVCacheManagerWithTransfer* absl_nullable manager,
       StagingBlockAllocator* absl_nullable staging_allocator,
       absl::Span<const int64_t> src_block_ids, int parallelism,
       std::chrono::steady_clock::time_point deadline,
@@ -100,13 +103,13 @@ class ReshardSendSession
   int32_t sub_plan_index() const { return plan_.sub_plan_index(); }
   int32_t sub_plan_count() const { return plan_.sub_plan_count(); }
 
-  // Leases host staging per pool, issues D2H copies for each pool in |plan_|,
-  // and chains async H2H peer pushes upon D2H completion. Non-blocking
-  // preconditions (transport, host staging layers, pool indices) are checked
-  // synchronously and returned; the staging waits, copies and pushes run on
-  // a pipeline thread and report through GetStatus() / Done().
-  absl::Status ExecutePush(KVCacheManagerWithTransfer& manager,
-                           absl::Span<const int64_t> src_block_ids);
+  // Leases host staging per pool, issues D2H copies for each pool in |plan_|
+  // from the source blocks given to Create(), and chains async H2H peer
+  // pushes upon D2H completion. Non-blocking preconditions (manager,
+  // transport, host staging layers, pool indices) are checked synchronously
+  // and returned; the staging waits, copies and pushes run on a pipeline
+  // thread and report through GetStatus() / Done().
+  absl::Status Start() override;
 
   // Returns the buffer the device-to-host copy leased to |pool_idx|.
   absl::StatusOr<size_t> ResolveStagingSlot(size_t pool_idx) override {
@@ -136,7 +139,7 @@ class ReshardSendSession
   // session holds none.
   absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const;
 
-  // Checks the preconditions of ExecutePush that need no waiting: a running
+  // Checks the preconditions of Start that need no waiting: a running
   // transport server, at least one host staging layer, and every transfer
   // pool index resolving on |base_|.
   absl::Status ValidatePushPreconditions() const;
@@ -144,8 +147,10 @@ class ReshardSendSession
   void ExecutePushPipeline(std::vector<int64_t> src_block_ids);
 
   ReshardSendSession(kv_cache::KVCacheManagerBase* base,
+                     KVCacheManagerWithTransfer* manager,
                      StagingBlockAllocator* staging_allocator,
-                     std::string req_id, uint64_t uuid, int parallelism,
+                     std::vector<int64_t> src_block_ids, std::string req_id,
+                     uint64_t uuid, int parallelism,
                      int remaining_pool_peer_pushes,
                      std::chrono::steady_clock::time_point deadline,
                      TransferPlan transfer_plan,
@@ -167,7 +172,11 @@ class ReshardSendSession
   void ReleaseLeasesLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
+  // The manager this send executes on; null for a session never started.
+  KVCacheManagerWithTransfer* const manager_ = nullptr;
   StagingBlockAllocator* const staging_allocator_ = nullptr;
+  // Source device blocks Start() copies from.
+  const std::vector<int64_t> src_block_ids_;
   const std::string req_id_;
   const uint64_t uuid_ = 0;
   const int parallelism_ = 8;
@@ -186,8 +195,6 @@ class ReshardSendSession
   bool finalizing_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   std::vector<raiden::PjRtCopyFuture> d2h_futures_ ABSL_GUARDED_BY(mu_);
-  // The manager this send executes on, set by ExecutePush.
-  KVCacheManagerWithTransfer* manager_ ABSL_GUARDED_BY(mu_) = nullptr;
   bool leases_released_ ABSL_GUARDED_BY(mu_) = false;
   // The last op already closed the idle data connections (kPerTransfer).
   bool connections_released_ ABSL_GUARDED_BY(mu_) = false;

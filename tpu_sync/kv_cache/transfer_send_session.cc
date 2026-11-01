@@ -338,6 +338,12 @@ absl::Status TransferSendSession::AwaitForDone() {
   return status_;
 }
 
+absl::Status TransferSendSession::OnDataReceived(size_t layer_idx) {
+  return absl::FailedPreconditionError(
+      absl::StrCat("send session does not receive data: layer ", layer_idx,
+                   " reported received on send session for UUID ", uuid_));
+}
+
 TransferDetails TransferSendSession::Details() const {
   absl::MutexLock lock(mu_);
   TransferDetails details = DetailsFromStatus(status_);

@@ -170,10 +170,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     std::function<absl::Status(const std::vector<int>& block_ids,
                                absl::Span<const int> shard_ids, uint64_t uuid)>
         on_block_shards_received;
-    std::function<absl::Status(size_t layer_idx, uint64_t uuid)>
-        on_layer_received;
-    std::function<absl::Status(size_t pool_idx, uint64_t uuid)>
-        on_pool_received;
     std::function<absl::Status(const ::tpu_sync::rpc::StartTransferRequest&,
                                absl::Span<const int64_t>, int)>
         pool_reshard_push;

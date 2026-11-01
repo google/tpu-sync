@@ -2940,20 +2940,29 @@ absl::Status KVCacheManagerBase::OnBlockShardsReceived(
   return absl::OkStatus();
 }
 
+// A uuid with no session (e.g. uuid 0 or a planless push) needs no H2D work
+// here, so a layer completion for it succeeds.
 absl::Status KVCacheManagerBase::OnLayerReceived(size_t layer_idx,
                                                  uint64_t uuid) {
-  if (transfer_hooks_.on_layer_received) {
-    return transfer_hooks_.on_layer_received(layer_idx, uuid);
+  absl::StatusOr<std::shared_ptr<TransferSession>> session = GetSession(uuid);
+  if (absl::IsNotFound(session.status())) {
+    return absl::OkStatus();
   }
-  return absl::OkStatus();
+  ABSL_RETURN_IF_ERROR(session.status());
+  return (*session)->OnDataReceived(layer_idx);
 }
 
+// A pool completion always belongs to an armed receiver, so a uuid with no
+// session fails with kNotFound.
 absl::Status KVCacheManagerBase::OnPoolReceived(size_t pool_idx,
                                                 uint64_t uuid) {
-  if (transfer_hooks_.on_pool_received) {
-    return transfer_hooks_.on_pool_received(pool_idx, uuid);
+  absl::StatusOr<std::shared_ptr<TransferSession>> session = GetSession(uuid);
+  if (absl::IsNotFound(session.status())) {
+    return absl::NotFoundError(
+        absl::StrCat("no active receiver for UUID ", uuid));
   }
-  return absl::OkStatus();
+  ABSL_RETURN_IF_ERROR(session.status());
+  return (*session)->OnDataReceived(pool_idx);
 }
 
 void KVCacheManagerBase::ScheduleAsyncTask(std::function<void()> task) {

@@ -631,6 +631,9 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
     absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
       return unit % 2;
     }
+    absl::Status OnDataReceived(size_t idx) override {
+      return absl::OkStatus();
+    }
     absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
       return plan_;
     }

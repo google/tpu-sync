@@ -71,6 +71,13 @@ class TransferSession {
   // has no staging buffer and is addressed in place. Thread-safe.
   virtual absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) = 0;
 
+  // Signals that the data for unit |idx| has fully landed in host staging.
+  // |idx| is a layer index on the layer transfer path and a pool index on the
+  // pool reshard path, matching ResolveStagingSlot(). Receive sessions start
+  // the host-to-device work for that unit. Send sessions never receive data
+  // and return kFailedPrecondition. Thread-safe.
+  virtual absl::Status OnDataReceived(size_t idx) = 0;
+
   // Returns the session's active transfer plan, or absl::nullopt if this
   // session is planless or done.
   virtual absl::optional<std::shared_ptr<const TransferPlan>> plan() const = 0;

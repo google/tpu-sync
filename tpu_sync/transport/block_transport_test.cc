@@ -171,6 +171,7 @@ class StubReceiveSession : public TransferSession {
   absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
     return size_t{0};
   }
+  absl::Status OnDataReceived(size_t idx) override { return absl::OkStatus(); }
   bool WaitForDone(absl::Duration timeout) const {
     absl::MutexLock lock(mu_);
     return mu_.AwaitWithTimeout(absl::Condition(&done_), timeout);
@@ -2585,6 +2586,11 @@ TEST(PeregrineRecvCompleteTest, RejectsSenderSession) {
     absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
       ADD_FAILURE() << "ResolveStagingSlot should not be called";
       return absl::UnimplementedError("unused");
+    }
+    absl::Status OnDataReceived(size_t idx) override {
+      ADD_FAILURE() << "OnDataReceived should not be called on sender session";
+      return absl::FailedPreconditionError(
+          "send session does not receive data");
     }
   };
 

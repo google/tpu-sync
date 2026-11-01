@@ -554,6 +554,12 @@ absl::Status ReshardSendSession::AwaitForDone() {
   return status_;
 }
 
+absl::Status ReshardSendSession::OnDataReceived(size_t pool_idx) {
+  return absl::FailedPreconditionError(
+      absl::StrCat("send session does not receive data: pool ", pool_idx,
+                   " reported received on send session for UUID ", uuid_));
+}
+
 void ReshardSendSession::EndOp() {
   // Under kPerTransfer the last op closes the idle data connections to
   // |dst_peers_| before it is counted out: every push has returned its

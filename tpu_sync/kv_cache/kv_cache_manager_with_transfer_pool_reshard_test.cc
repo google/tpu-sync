@@ -1082,5 +1082,31 @@ TEST(PoolReshardSessionLookupTest,
               StatusIs(absl::StatusCode::kNotFound));
 }
 
+// A pool plan armed through RegisterActivePlan lands on a legacy
+// TransferReceiveSession, which cannot execute pool completions: the
+// completion is rejected before any H2D work, leaving the receive untouched.
+TEST(PoolReshardSessionLookupTest,
+     PoolCompletionOnLegacyArmedReceiverFailsWithoutH2d) {
+  TestManager manager;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({DensePool("fa")}));
+  ABSL_ASSERT_OK(manager.RegisterActivePlan(
+      /*uuid=*/8003, ValidPlan(/*uuid=*/8003), /*is_sender=*/false));
+  absl::StatusOr<std::shared_ptr<TransferSession>> recv_session =
+      manager.GetSession(/*uuid=*/8003);
+  ABSL_ASSERT_OK(recv_session);
+  ASSERT_NE(*recv_session, nullptr);
+
+  EXPECT_THAT(manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/8003),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       ::testing::HasSubstr("armed on the legacy path")));
+
+  // The rejection precedes ExecuteLayerH2d, so the receive is still live and
+  // unfailed.
+  EXPECT_FALSE((*recv_session)->Done());
+  EXPECT_FALSE((*recv_session)->IsDraining());
+  ABSL_EXPECT_OK((*recv_session)->GetStatus());
+  ABSL_EXPECT_OK(manager.UnregisterActivePlan(/*uuid=*/8003));
+}
+
 }  // namespace
 }  // namespace tpu_raiden

@@ -113,6 +113,9 @@ class ReshardSendSession
     return LookupStagingSlot(pool_idx);
   }
 
+  // Always returns kFailedPrecondition: a send session never receives data.
+  absl::Status OnDataReceived(size_t pool_idx) override;
+
   absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     if (transfer_plan_ == nullptr || Done()) {
       return absl::nullopt;

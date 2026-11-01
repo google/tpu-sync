@@ -150,11 +150,10 @@ class TransferReceiveSession
   absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
                                      absl::Span<const int> shard_ids);
 
-  // Issues H2D copy for |layer_idx| using |base_| and registers the completion
-  // callback. When fewer host layer buffers exist than layers, the copy reads
-  // the host layer buffer leased to |layer_idx| and the callback releases the
-  // lease.
-  absl::Status ExecuteLayerH2d(size_t layer_idx);
+  // Starts the H2D copy for layer |layer_idx|. Fails with kFailedPrecondition
+  // while this receive is live on a pool-addressed plan, which only a
+  // ReshardReceiveSession can execute.
+  absl::Status OnDataReceived(size_t layer_idx) override;
 
   // Leases a buffer to |layer_idx| on first use.
   absl::StatusOr<size_t> ResolveStagingSlot(size_t layer_idx) override {
@@ -187,6 +186,12 @@ class TransferReceiveSession
   }
 
  private:
+  // Issues H2D copy for |layer_idx| using |base_| and registers the completion
+  // callback. When fewer host layer buffers exist than layers, the copy reads
+  // the host layer buffer leased to |layer_idx| and the callback releases the
+  // lease.
+  absl::Status ExecuteLayerH2d(size_t layer_idx);
+
   // Returns the host layer buffer leased to |layer_idx|, leasing one when it
   // has none and blocking while every buffer is in use. A timeout fails the
   // receive. Callable from any thread; concurrent calls for the same layer

@@ -104,9 +104,10 @@ class ReshardReceiveSession
   int32_t sub_plan_index() const { return sub_plan_index_; }
   int32_t sub_plan_count() const { return sub_plan_count_; }
 
-  // Handles pool completion notifications for this pool-reshard receive
-  // session.
-  absl::Status OnPoolReceived(size_t pool_idx);
+  // Handles completion of pool |pool_idx|.
+  absl::Status OnDataReceived(size_t pool_idx) override {
+    return OnPoolReceived(pool_idx);
+  }
 
   // Leases a buffer to |pool_idx| on first use.
   absl::StatusOr<size_t> ResolveStagingSlot(size_t pool_idx) override {
@@ -123,6 +124,10 @@ class ReshardReceiveSession
  private:
   friend struct PoolReshardRecvTestPeer;
   friend struct ReshardReceiveSessionTestPeer;
+
+  // Handles pool completion notifications for this pool-reshard receive
+  // session.
+  absl::Status OnPoolReceived(size_t pool_idx);
 
   // Returns the host staging buffer leased to |pool_idx|, leasing one when it
   // has none and waiting until deadline when every slot is leased.

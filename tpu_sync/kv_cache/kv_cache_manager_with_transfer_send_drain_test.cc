@@ -1175,7 +1175,7 @@ TEST(RecvLifecycleTest,
             /*acquire_staging=*/true);
     weak_session = session;
     EXPECT_EQ(consumer.free_slots(), kSlots - 1);
-    ASSERT_THAT(session->ExecuteLayerH2d(/*layer_idx=*/0),
+    ASSERT_THAT(session->OnDataReceived(/*layer_idx=*/0),
                 ::absl_testing::IsOk());
     ASSERT_EQ(consumer.copies_issued(), 1);
   }

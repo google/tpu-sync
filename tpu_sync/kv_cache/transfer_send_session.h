@@ -151,6 +151,9 @@ class TransferSendSession
     return LookupStagingSlot(layer_idx);
   }
 
+  // Always returns kFailedPrecondition: a send session never receives data.
+  absl::Status OnDataReceived(size_t layer_idx) override;
+
   const StagingLayerManager& staging_layer_manager() const {
     return staging_layer_manager_;
   }

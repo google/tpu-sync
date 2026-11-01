@@ -2640,6 +2640,7 @@ class StubTransferSession : public TransferSession {
   absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
     return size_t{0};
   }
+  absl::Status OnDataReceived(size_t idx) override { return absl::OkStatus(); }
   absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     return absl::nullopt;
   }

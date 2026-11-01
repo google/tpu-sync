@@ -798,6 +798,18 @@ absl::StatusOr<size_t> TransferReceiveSession::LookupStagingSlot(
   return *slot;
 }
 
+absl::Status TransferReceiveSession::OnDataReceived(size_t layer_idx) {
+  // |transfer_plan_| is immutable after construction, so only the Done()
+  // check takes |mu_|, and only on this misuse path.
+  if (transfer_plan_ != nullptr &&
+      transfer_plan_->request().pool_groups_size() > 0 && !Done()) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("pool completion for UUID ", uuid_,
+                     " but the receiver was armed on the legacy path"));
+  }
+  return ExecuteLayerH2d(layer_idx);
+}
+
 absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
   // Host source of the copy: the layer's own buffer on a full mirror, or its
   // leased buffer when fewer host layer buffers exist than layers (acquired

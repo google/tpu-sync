@@ -288,41 +288,6 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
                                           uint64_t uuid) {
     return OnBlockShardsReceived(block_ids, shard_ids, uuid);
   };
-  hooks.on_layer_received = [this](size_t layer_idx, uint64_t uuid) {
-    RAIDEN_TRACE_FN("KVTransfer::OnLayerReceived", [&]() {
-      return absl::StrCat("layer=", layer_idx, " uuid=", uuid);
-    });
-    std::shared_ptr<TransferReceiveSession> session;
-    {
-      absl::MutexLock lock(mu_);
-      session = FindSessionLocked<TransferReceiveSession>(uuid);
-      if (session == nullptr) {
-        return absl::OkStatus();
-      }
-    }
-    return session->ExecuteLayerH2d(layer_idx);
-  };
-  hooks.on_pool_received = [this](size_t pool_idx, uint64_t uuid) {
-    RAIDEN_TRACE_FN("KVTransfer::OnPoolReceived", [&]() {
-      return absl::StrCat("pool=", pool_idx, " uuid=", uuid);
-    });
-    std::shared_ptr<ReshardReceiveSession> session;
-    {
-      absl::MutexLock lock(mu_);
-      session = FindSessionLocked<ReshardReceiveSession>(uuid);
-      if (session == nullptr) {
-        auto legacy = FindSessionLocked<TransferReceiveSession>(uuid);
-        if (legacy != nullptr && !legacy->Done()) {
-          return absl::FailedPreconditionError(
-              absl::StrCat("pool completion for UUID ", uuid,
-                           " but the receiver was armed on the legacy path"));
-        }
-        return absl::NotFoundError(
-            absl::StrCat("no active receiver for UUID ", uuid));
-      }
-    }
-    return session->OnPoolReceived(pool_idx);
-  };
   hooks.pool_reshard_push =
       [this](const ::tpu_sync::rpc::StartTransferRequest& plan,
              absl::Span<const int64_t> src_block_ids, int parallelism) {

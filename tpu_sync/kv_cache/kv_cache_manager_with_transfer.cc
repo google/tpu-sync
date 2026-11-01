@@ -288,26 +288,7 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
                                           uint64_t uuid) {
     return OnBlockShardsReceived(block_ids, shard_ids, uuid);
   };
-  hooks.pool_reshard_push =
-      [this](const ::tpu_sync::rpc::StartTransferRequest& plan,
-             absl::Span<const int64_t> src_block_ids, int parallelism) {
-        return PoolReshardPush(plan, src_block_ids, parallelism);
-      };
-  hooks.pool_reshard_register_recv =
-      [this](const ::tpu_sync::rpc::StartTransferRequest& plan,
-             absl::Span<const int64_t> chip_block_ids) {
-        return PoolReshardRegisterRecv(plan, chip_block_ids);
-      };
   hooks.wait_for_pending_work = [this]() { return WaitForPendingWork(); };
-  hooks.register_active_plan =
-      [this](uint64_t uuid,
-             const ::tpu_sync::rpc::StartTransferRequest& request,
-             bool is_sender) {
-        return RegisterActivePlan(uuid, request, is_sender);
-      };
-  hooks.unregister_active_plan = [this](uint64_t uuid) {
-    return UnregisterActivePlan(uuid);
-  };
   hooks.get_node_id = [this]() { return node_id(); };
   hooks.on_recv_progress = [this](uint64_t uuid) -> absl::Status {
     std::shared_ptr<TransferReceiveSession> recv_session;

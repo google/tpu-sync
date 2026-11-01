@@ -67,7 +67,7 @@ class RoutingKVCacheManager final : public KVCacheManagerBase {
 
   absl::Status PoolReshardPush(const StartTransferRequest& request,
                                absl::Span<const int64_t> src_block_ids,
-                               int parallelism) override {
+                               int parallelism) {
     request_ = request;
     local_block_ids_.assign(src_block_ids.begin(), src_block_ids.end());
     recorded_parallelism_ = parallelism;
@@ -77,7 +77,7 @@ class RoutingKVCacheManager final : public KVCacheManagerBase {
 
   absl::Status PoolReshardRegisterRecv(
       const StartTransferRequest& request,
-      absl::Span<const int64_t> chip_block_ids) override {
+      absl::Span<const int64_t> chip_block_ids) {
     request_ = request;
     local_block_ids_.assign(chip_block_ids.begin(), chip_block_ids.end());
     route_.store(Route::kPoolReshardRegisterRecv, std::memory_order_release);
@@ -86,7 +86,7 @@ class RoutingKVCacheManager final : public KVCacheManagerBase {
 
   absl::Status RegisterActivePlan(uint64_t uuid,
                                   const StartTransferRequest& request,
-                                  bool is_sender) override {
+                                  bool is_sender) {
     request_ = request;
     registered_uuid_ = uuid;
     registered_is_sender_ = is_sender;

@@ -170,18 +170,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     std::function<absl::Status(const std::vector<int>& block_ids,
                                absl::Span<const int> shard_ids, uint64_t uuid)>
         on_block_shards_received;
-    std::function<absl::Status(const ::tpu_sync::rpc::StartTransferRequest&,
-                               absl::Span<const int64_t>, int)>
-        pool_reshard_push;
-    std::function<absl::Status(const ::tpu_sync::rpc::StartTransferRequest&,
-                               absl::Span<const int64_t>)>
-        pool_reshard_register_recv;
     std::function<absl::Status()> wait_for_pending_work;
-    std::function<absl::Status(uint64_t uuid,
-                               const ::tpu_sync::rpc::StartTransferRequest&,
-                               bool is_sender)>
-        register_active_plan;
-    std::function<absl::Status(uint64_t uuid)> unregister_active_plan;
     std::function<int64_t()> get_node_id;
     std::function<absl::Status(uint64_t uuid)> on_recv_progress;
     std::function<absl::Status(uint64_t uuid)> on_recv_network_complete;
@@ -294,30 +283,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   virtual absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
   H2hRead(std::string peer, const std::vector<int>& src_block_ids);
-
-  // Pool-plan executor hooks used by KVCacheListener; managers without
-  // transfer support fail closed.
-  virtual absl::Status PoolReshardPush(
-      const ::tpu_sync::rpc::StartTransferRequest& request,
-      absl::Span<const int64_t> src_block_ids, int parallelism = 8) {
-    if (transfer_hooks_.pool_reshard_push) {
-      return transfer_hooks_.pool_reshard_push(request, src_block_ids,
-                                               parallelism);
-    }
-    return absl::UnimplementedError(
-        "pool reshard push is not supported by this manager");
-  }
-
-  virtual absl::Status PoolReshardRegisterRecv(
-      const ::tpu_sync::rpc::StartTransferRequest& request,
-      absl::Span<const int64_t> chip_block_ids) {
-    if (transfer_hooks_.pool_reshard_register_recv) {
-      return transfer_hooks_.pool_reshard_register_recv(request,
-                                                        chip_block_ids);
-    }
-    return absl::UnimplementedError(
-        "pool reshard receive is not supported by this manager");
-  }
 
   // Blocks until all pending asynchronous transfers/copies are complete.
   virtual absl::Status WaitForPendingWork() {
@@ -713,14 +678,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Source count of a registered block-addressed receive plan: one per
   // shard push schedule, each keyed by the sender node id that pushes it.
   std::optional<size_t> ExpectedPushSenders(uint64_t uuid) const override;
-
-  // Registers / unregisters an active transfer plan. Plans are owned by
-  // transfer sessions, so these require KVCacheManagerWithTransfer's hooks and
-  // fail with kFailedPrecondition on a standalone manager.
-  virtual absl::Status RegisterActivePlan(
-      uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
-      bool is_sender);
-  virtual absl::Status UnregisterActivePlan(uint64_t uuid);
 
   // Whether an active session under `uuid` carries a transfer plan.
   bool HasActivePlan(uint64_t uuid) const;

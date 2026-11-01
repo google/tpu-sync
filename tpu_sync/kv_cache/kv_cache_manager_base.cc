@@ -2977,16 +2977,6 @@ bool KVCacheManagerBase::HasActivePlan(uint64_t uuid) const {
   return GetTransferPlan(uuid).ok();
 }
 
-absl::Status KVCacheManagerBase::RegisterActivePlan(
-    uint64_t uuid, const ::tpu_sync::rpc::StartTransferRequest& request,
-    bool is_sender) {
-  if (transfer_hooks_.register_active_plan) {
-    return transfer_hooks_.register_active_plan(uuid, request, is_sender);
-  }
-  return absl::FailedPreconditionError(
-      "RegisterActivePlan requires KVCacheManagerWithTransfer");
-}
-
 absl::StatusOr<std::vector<HostBlockId>> KVCacheManagerBase::PlanHostBlocks(
     uint64_t uuid, const std::vector<DeviceBlockId>& block_ids) const {
   absl::StatusOr<std::shared_ptr<const TransferPlan>> plan =
@@ -2996,14 +2986,6 @@ absl::StatusOr<std::vector<HostBlockId>> KVCacheManagerBase::PlanHostBlocks(
         absl::StrCat("no active transfer plan with uuid ", uuid));
   }
   return (*plan)->PlanHostBlocks(uuid, block_ids);
-}
-
-absl::Status KVCacheManagerBase::UnregisterActivePlan(uint64_t uuid) {
-  if (transfer_hooks_.unregister_active_plan) {
-    return transfer_hooks_.unregister_active_plan(uuid);
-  }
-  return absl::FailedPreconditionError(
-      "UnregisterActivePlan requires KVCacheManagerWithTransfer");
 }
 
 void KVCacheManagerBase::SetRemoteLayerAddrs(

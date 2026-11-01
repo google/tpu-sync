@@ -363,11 +363,11 @@ absl::Status KVCacheManager::StartGrpcServer(
   if (use_private_server) {
     private_grpc_server_ = controller::WorkerServiceServer::Create();
     status = private_grpc_server_->StartServer(
-        /*host_allocator=*/nullptr, KVManagerHolder(torch_manager_->base()),
+        /*host_allocator=*/nullptr, KVManagerHolder(torch_manager_.get()),
         raiden_worker_port);
   } else {
     status = controller::WorkerServiceServer::GetInstance().StartServer(
-        /*host_allocator=*/nullptr, KVManagerHolder(torch_manager_->base()),
+        /*host_allocator=*/nullptr, KVManagerHolder(torch_manager_.get()),
         raiden_worker_port);
   }
 

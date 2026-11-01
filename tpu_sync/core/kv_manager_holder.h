@@ -371,7 +371,7 @@ class KVManagerHolder {
         const std::vector<int64_t>& copy_sizes) = 0;
     // Pool-reshard executor hooks used by the transfer-program worker entry.
     // Fail closed with Unimplemented when the wrapped manager lacks the pool
-    // executor, matching the KVCacheManagerBase defaults.
+    // executor (KVCacheManagerWithTransfer provides it).
     virtual absl::Status PoolReshardPush(
         const tpu_sync::rpc::StartTransferRequest& request,
         absl::Span<const int64_t> src_block_ids, int parallelism) = 0;

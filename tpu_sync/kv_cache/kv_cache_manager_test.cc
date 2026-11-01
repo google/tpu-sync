@@ -308,19 +308,20 @@ TEST(KVCacheManagerTest, RegisterActivePlanChecksPoolDtypeTags) {
   request.add_pool_dtype_tags("dtype_a");
   request.add_pool_dtype_tags("dtype_b");
   absl::Status status =
-      manager.RegisterActivePlan(777, request, /*is_sender=*/true);
+      manager_host.RegisterActivePlan(777, request, /*is_sender=*/true);
   EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
   EXPECT_THAT(status.message(), testing::HasSubstr("pool_dtype_tags count"));
 
   request.add_pool_dtype_tags("dtype_a");
   request.set_pool_dtype_tags(1, "dtype_wrong");
-  status = manager.RegisterActivePlan(777, request, /*is_sender=*/true);
+  status = manager_host.RegisterActivePlan(777, request, /*is_sender=*/true);
   EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
   EXPECT_THAT(status.message(), testing::HasSubstr("dtype tag mismatch"));
 
   request.set_pool_dtype_tags(1, "dtype_b");
-  ABSL_ASSERT_OK(manager.RegisterActivePlan(777, request, /*is_sender=*/true));
-  ABSL_EXPECT_OK(manager.UnregisterActivePlan(777));
+  ABSL_ASSERT_OK(
+      manager_host.RegisterActivePlan(777, request, /*is_sender=*/true));
+  ABSL_EXPECT_OK(manager_host.UnregisterActivePlan(777));
 }
 
 TEST(KVCacheManagerTest, ExplicitPoolAddressingUsesPoolBaseAndStride) {
@@ -383,7 +384,7 @@ TEST(KVCacheManagerTest,
   ASSERT_TRUE(receiver_port.has_value());
   tpu_sync::rpc::StartTransferRequest dummy_plan;
   ABSL_ASSERT_OK(
-      receiver.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
+      receiver_host.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
   ABSL_ASSERT_OK(sender.H2hWriteDirect(
       absl::StrCat(receiver.local_ip(), ":", *receiver_port),
       /*src_block_ids=*/{0}, /*dst_block_ids=*/{1}, /*uuid=*/0,
@@ -451,7 +452,7 @@ TEST(KVCacheManagerTest,
   ASSERT_TRUE(receiver_port.has_value());
   tpu_sync::rpc::StartTransferRequest dummy_plan;
   ABSL_ASSERT_OK(
-      receiver.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
+      receiver_host.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
   ABSL_ASSERT_OK(sender.H2hWriteDirect(
       absl::StrCat(receiver.local_ip(), ":", *receiver_port),
       /*src_block_ids=*/{0}, /*dst_block_ids=*/{1}, /*uuid=*/0,
@@ -493,7 +494,7 @@ TEST(KVCacheManagerTest, ExplicitPoolTransportEnumeratesAllPools) {
   ASSERT_TRUE(receiver_port.has_value());
   tpu_sync::rpc::StartTransferRequest dummy_plan;
   ABSL_ASSERT_OK(
-      receiver.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
+      receiver_host.RegisterActivePlan(0, dummy_plan, /*is_sender=*/false));
   ABSL_ASSERT_OK(sender.H2hWriteDirect(
       absl::StrCat(receiver.local_ip(), ":", *receiver_port),
       /*src_block_ids=*/{0}, /*dst_block_ids=*/{1}, /*uuid=*/0,
@@ -615,19 +616,19 @@ TEST(KVCacheManagerTest, UnregisterActivePlanAllowsUuidReuse) {
   request.set_uuid(112233);
   request.set_is_sender(true);
 
-  absl::Status status = manager.UnregisterActivePlan(112233);
+  absl::Status status = manager_host.UnregisterActivePlan(112233);
   EXPECT_EQ(status.code(), absl::StatusCode::kNotFound);
 
   ABSL_EXPECT_OK(
-      manager.RegisterActivePlan(112233, request, /*is_sender=*/true));
+      manager_host.RegisterActivePlan(112233, request, /*is_sender=*/true));
 
-  status = manager.RegisterActivePlan(112233, request, /*is_sender=*/true);
+  status = manager_host.RegisterActivePlan(112233, request, /*is_sender=*/true);
   EXPECT_EQ(status.code(), absl::StatusCode::kAlreadyExists);
 
-  ABSL_EXPECT_OK(manager.UnregisterActivePlan(112233));
+  ABSL_EXPECT_OK(manager_host.UnregisterActivePlan(112233));
 
   ABSL_EXPECT_OK(
-      manager.RegisterActivePlan(112233, request, /*is_sender=*/true));
+      manager_host.RegisterActivePlan(112233, request, /*is_sender=*/true));
 }
 
 TEST(KVCacheManagerTest, D2hFailsWithMismatchedCopySpecLengths) {
@@ -744,12 +745,12 @@ TEST(KVCacheManagerTest, AsymmetricBlockSizesGetBlockChunks) {
 
   // Register active plan on both sides
   ABSL_ASSERT_OK(
-      sender.RegisterActivePlan(112233, request, /*is_sender=*/true));
+      sender_host.RegisterActivePlan(112233, request, /*is_sender=*/true));
 
   // Receiver schedule should be the same request but marked as is_sender=false
   request.set_is_sender(false);
   ABSL_ASSERT_OK(
-      receiver.RegisterActivePlan(112233, request, /*is_sender=*/false));
+      receiver_host.RegisterActivePlan(112233, request, /*is_sender=*/false));
 
   // 3. Resolve chunks on Sender (should return offset 64 from block 0 base)
   std::vector<int64_t> src_block_ids = {0};
@@ -832,13 +833,15 @@ TEST(KVCacheManagerTest, PlannedPushRaddrUsesReceiverLayerAddrs) {
   entry->set_size_bytes(64);
   entry->set_src_block_id(2);
   entry->set_dst_block_id(3);
-  ABSL_ASSERT_OK(receiver.RegisterActivePlan(9, request, /*is_sender=*/false));
+  ABSL_ASSERT_OK(
+      receiver_host.RegisterActivePlan(9, request, /*is_sender=*/false));
   std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs =
       receiver.LayerHostAddrs(/*uuid=*/9);
   ASSERT_EQ(layer_host_addrs.size(), 2u);
   auto& pools = *(*request.mutable_receiver_addrs())["peer"].mutable_pools();
   for (int32_t l = 0; l < 2; ++l) pools[l] = layer_host_addrs[l];
-  ABSL_ASSERT_OK(sender.RegisterActivePlan(9, request, /*is_sender=*/true));
+  ABSL_ASSERT_OK(
+      sender_host.RegisterActivePlan(9, request, /*is_sender=*/true));
 
   std::vector<transport::BlockChunk> recv_chunks = receiver.GetBlockChunks(
       /*layer_idx=*/1, /*shard_idx=*/1, std::vector<int64_t>{3},
@@ -874,13 +877,15 @@ TEST(KVCacheManagerTest, PlannedPushRaddrUsesReceiverRemappedHostBlocks) {
   entry->set_src_block_id(2);
   entry->set_dst_block_id(7);
   receiver_host.EnableDemandStaging();
-  ABSL_ASSERT_OK(receiver.RegisterActivePlan(9, request, /*is_sender=*/false));
+  ABSL_ASSERT_OK(
+      receiver_host.RegisterActivePlan(9, request, /*is_sender=*/false));
   std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs =
       receiver.LayerHostAddrs(/*uuid=*/9);
   ASSERT_EQ(layer_host_addrs.size(), 2u);
   auto& pools = *(*request.mutable_receiver_addrs())["peer"].mutable_pools();
   for (int32_t l = 0; l < 2; ++l) pools[l] = layer_host_addrs[l];
-  ABSL_ASSERT_OK(sender.RegisterActivePlan(9, request, /*is_sender=*/true));
+  ABSL_ASSERT_OK(
+      sender_host.RegisterActivePlan(9, request, /*is_sender=*/true));
 
   std::vector<transport::BlockChunk> recv_chunks = receiver.GetBlockChunks(
       /*layer_idx=*/1, /*shard_idx=*/1, std::vector<int64_t>{7},

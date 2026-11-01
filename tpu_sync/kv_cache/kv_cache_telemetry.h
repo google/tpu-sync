@@ -17,7 +17,9 @@
 
 // Telemetry helper functions for KVCacheStore and its offload backends.
 
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstdint>
+#include <ratio>  // NOLINT(build/c++11)
 
 #include "absl/strings/string_view.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -26,13 +28,46 @@
 namespace tpu_raiden {
 namespace kv_cache {
 
-// Increments `kv_recall_blocks_total` by `count` with the given store identity
-// and recall labels. `dp_rank` must be a pre-rendered decimal string, and
+// Monotonic clock used to time KV cache recall batches.
+using RecallClock = std::chrono::steady_clock;
+
+// Records one settled recall batch of `count` blocks with the given store
+// identity and recall labels: increments `kv_recall_blocks_total` by `count`
+// and observes the time elapsed since `start_ts` (in milliseconds) in
+// `kv_recall_duration_ms`, with the same labels. `dp_rank` must be a
+// pre-rendered decimal string, and `tier` and `outcome` must be
+// `telemetry::metric_labels::kTier*` and `kOutcome*` constants respectively.
+// No-op when `count == 0`, so an empty batch adds no duration sample.
+inline void RecordKvRecallMetrics(absl::string_view dp_rank,
+                                  absl::string_view tier,
+                                  absl::string_view outcome, uint64_t count,
+                                  RecallClock::time_point start_ts) {
+  if (count == 0) return;
+  const telemetry::RaidenMetricStore& store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) return;
+  const double duration_ms =
+      std::chrono::duration<double, std::milli>(RecallClock::now() - start_ts)
+          .count();
+  const telemetry::MetricLabel labels[] = {
+      {telemetry::metric_labels::kDpRank, dp_rank},
+      {telemetry::metric_labels::kTier, tier},
+      {telemetry::metric_labels::kOutcome, outcome},
+  };
+  store.IncrementCounter(telemetry::metric_names::kKvRecallBlocksTotal, labels,
+                         count);
+  store.ObserveHistogram(telemetry::metric_names::kKvRecallDurationMs, labels,
+                         duration_ms);
+}
+
+// Increments `kv_save_blocks_total` by `count` with the given store identity
+// and save labels. `dp_rank` must be a pre-rendered decimal string, and
 // `tier` and `outcome` must be `telemetry::metric_labels::kTier*` and
-// `kOutcome*` constants respectively. No-op when `count == 0`.
-inline void IncrementKvRecallBlocks(absl::string_view dp_rank,
-                                    absl::string_view tier,
-                                    absl::string_view outcome, uint64_t count) {
+// `kOutcome*` constants respectively (`outcome` must be `kOutcomeOk`,
+// `kOutcomeRejected`, or `kOutcomeFailed`). No-op when `count == 0`.
+inline void IncrementKvSaveBlocks(absl::string_view dp_rank,
+                                  absl::string_view tier,
+                                  absl::string_view outcome, uint64_t count) {
   if (count == 0) return;
   const telemetry::MetricLabel labels[] = {
       {telemetry::metric_labels::kDpRank, dp_rank},
@@ -40,7 +75,7 @@ inline void IncrementKvRecallBlocks(absl::string_view dp_rank,
       {telemetry::metric_labels::kOutcome, outcome},
   };
   telemetry::RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
-      telemetry::metric_names::kKvRecallBlocksTotal, labels, count);
+      telemetry::metric_names::kKvSaveBlocksTotal, labels, count);
 }
 
 }  // namespace kv_cache

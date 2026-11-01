@@ -167,11 +167,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
         size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
         transport::BlockTransportDelegate::HostBlockReadyCallback cb)>
         register_block_readiness_callback;
-    std::function<absl::Status(const std::vector<int>& block_ids,
-                               absl::Span<const int> shard_ids, uint64_t uuid)>
-        on_block_shards_received;
     std::function<absl::Status()> wait_for_pending_work;
-    std::function<int64_t()> get_node_id;
     std::function<absl::Status(uint64_t uuid)> on_recv_progress;
     std::function<absl::Status(uint64_t uuid)> on_recv_network_complete;
     // Returns the active transfer session registered under |uuid|, or
@@ -299,12 +295,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   virtual void set_worker_id(std::string worker_id) {
     worker_id_ = std::move(worker_id);
   }
-  virtual int64_t node_id() const {
-    if (transfer_hooks_.get_node_id) {
-      return transfer_hooks_.get_node_id();
-    }
-    return -1;
-  }
+  // Returns the node id set by set_node_id(), or -1 if unset.
+  virtual int64_t node_id() const { return node_id_; }
+  // Sets the node id reported to the transport. A composing transfer manager
+  // (e.g. KVCacheManagerWithTransfer) calls this once at construction.
+  void set_node_id(int64_t node_id) { node_id_ = node_id; }
 
   // Returns the backend plugin registered for the specified backend name, or
   // nullptr if none.
@@ -843,6 +838,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   std::shared_ptr<NumaThreadPool> push_pool_;
   std::unique_ptr<NumaThreadPool> pull_pool_;
   std::string worker_id_;
+  int64_t node_id_ = -1;
   TransferEventHooks transfer_hooks_;
 
   // One shard copy between device layer |layer_idx| (buffer_holds_) and host

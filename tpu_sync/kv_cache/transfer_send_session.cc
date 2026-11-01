@@ -338,10 +338,12 @@ absl::Status TransferSendSession::AwaitForDone() {
   return status_;
 }
 
-absl::Status TransferSendSession::OnDataReceived(size_t layer_idx) {
-  return absl::FailedPreconditionError(
-      absl::StrCat("send session does not receive data: layer ", layer_idx,
-                   " reported received on send session for UUID ", uuid_));
+absl::Status TransferSendSession::OnDataReceived(
+    size_t major_dimension_idx, absl::Span<const int> minor_dimension_indices,
+    absl::Span<const int> shard_ids) {
+  return absl::FailedPreconditionError(absl::StrCat(
+      "send session does not receive data: layer ", major_dimension_idx,
+      " reported received on send session for UUID ", uuid_));
 }
 
 TransferDetails TransferSendSession::Details() const {

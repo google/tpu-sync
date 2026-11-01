@@ -156,7 +156,9 @@ class TransferSendSession
   }
 
   // Always returns kFailedPrecondition: a send session never receives data.
-  absl::Status OnDataReceived(size_t layer_idx) override;
+  absl::Status OnDataReceived(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override;
 
   const StagingLayerManager& staging_layer_manager() const {
     return staging_layer_manager_;

@@ -47,6 +47,7 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/metrics_collector.h"  // IWYU pragma: keep
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -565,7 +566,7 @@ void TransferReceiveSession::ResetShardProgressLocked() {
 }
 
 bool TransferReceiveSession::RecordBlockShardsReceivedLocked(
-    const std::vector<int>& block_ids, absl::Span<const int> shard_ids,
+    absl::Span<const int> block_ids, absl::Span<const int> shard_ids,
     bool* first_packet, bool* network_just_completed) {
   *first_packet = !any_blocks_received_;
   any_blocks_received_ = true;
@@ -722,8 +723,12 @@ absl::Status TransferReceiveSession::OnRecvNetworkComplete() {
   return absl::OkStatus();
 }
 
-absl::Status TransferReceiveSession::OnBlockShardsReceived(
-    const std::vector<int>& block_ids, absl::Span<const int> shard_ids) {
+absl::Status TransferReceiveSession::RecordBlockShards(
+    absl::Span<const int> block_ids, absl::Span<const int> shard_ids) {
+  RAIDEN_TRACE_FN("KVTransfer::OnBlockShardsReceived", [&]() {
+    return absl::StrCat("blocks=", block_ids.size(),
+                        " shards=", shard_ids.size(), " uuid=", uuid_);
+  });
   const uint64_t uuid = uuid_;
   const int numa_node = base_->assigned_numa_node().value_or(-1);
   std::chrono::steady_clock::time_point session_start_time;
@@ -811,7 +816,12 @@ absl::StatusOr<size_t> TransferReceiveSession::LookupStagingSlot(
   return *slot;
 }
 
-absl::Status TransferReceiveSession::OnDataReceived(size_t layer_idx) {
+absl::Status TransferReceiveSession::OnDataReceived(
+    size_t major_dimension_idx, absl::Span<const int> minor_dimension_indices,
+    absl::Span<const int> shard_ids) {
+  if (!minor_dimension_indices.empty()) {
+    return RecordBlockShards(minor_dimension_indices, shard_ids);
+  }
   // |transfer_plan_| is immutable after construction, so only the Done()
   // check takes |mu_|, and only on this misuse path.
   if (transfer_plan_ != nullptr &&
@@ -820,7 +830,7 @@ absl::Status TransferReceiveSession::OnDataReceived(size_t layer_idx) {
         absl::StrCat("pool completion for UUID ", uuid_,
                      " but the receiver was armed on the legacy path"));
   }
-  return ExecuteLayerH2d(layer_idx);
+  return ExecuteLayerH2d(major_dimension_idx);
 }
 
 absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {

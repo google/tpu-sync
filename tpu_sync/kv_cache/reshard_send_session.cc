@@ -561,10 +561,12 @@ absl::Status ReshardSendSession::AwaitForDone() {
   return status_;
 }
 
-absl::Status ReshardSendSession::OnDataReceived(size_t pool_idx) {
-  return absl::FailedPreconditionError(
-      absl::StrCat("send session does not receive data: pool ", pool_idx,
-                   " reported received on send session for UUID ", uuid_));
+absl::Status ReshardSendSession::OnDataReceived(
+    size_t major_dimension_idx, absl::Span<const int> minor_dimension_indices,
+    absl::Span<const int> shard_ids) {
+  return absl::FailedPreconditionError(absl::StrCat(
+      "send session does not receive data: pool ", major_dimension_idx,
+      " reported received on send session for UUID ", uuid_));
 }
 
 void ReshardSendSession::EndOp() {

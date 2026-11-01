@@ -146,18 +146,14 @@ class TransferReceiveSession
   // last-packet timing once every layer's Posts have landed on this receiver.
   absl::Status OnRecvNetworkComplete();
 
-  // Handles a transport report that |shard_ids| of |block_ids| landed. Each
-  // shard's progress is tracked separately; a shard completes once it has
-  // received every (layer, block) of the session, and the network phase
-  // completes once every shard has. Routed pushes report a block range once
-  // per shard subset, so a shard's count only advances on streams carrying it.
-  absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
-                                     absl::Span<const int> shard_ids);
-
-  // Starts the H2D copy for layer |layer_idx|. Fails with kFailedPrecondition
-  // while this receive is live on a pool-addressed plan, which only a
-  // ReshardReceiveSession can execute.
-  absl::Status OnDataReceived(size_t layer_idx) override;
+  // With empty |minor_dimension_indices|, starts the H2D copy for layer
+  // |major_dimension_idx|, failing with kFailedPrecondition while this receive
+  // is live on a pool-addressed plan, which only a ReshardReceiveSession can
+  // execute. Otherwise records that |shard_ids| of |minor_dimension_indices|
+  // landed (see RecordBlockShards()).
+  absl::Status OnDataReceived(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override;
 
   // Leases a buffer to |layer_idx| on first use.
   absl::StatusOr<size_t> ResolveStagingSlot(size_t layer_idx) override {
@@ -190,6 +186,14 @@ class TransferReceiveSession
   }
 
  private:
+  // Records a transport report that |shard_ids| of |block_ids| landed. Each
+  // shard's progress is tracked separately; a shard completes once it has
+  // received every (layer, block) of the session, and the network phase
+  // completes once every shard has. Routed pushes report a block range once
+  // per shard subset, so a shard's count only advances on streams carrying it.
+  absl::Status RecordBlockShards(absl::Span<const int> block_ids,
+                                 absl::Span<const int> shard_ids);
+
   // Issues H2D copy for |layer_idx| using |base_| and registers the completion
   // callback. When fewer host layer buffers exist than layers, the copy reads
   // the host layer buffer leased to |layer_idx| and the callback releases the
@@ -293,7 +297,7 @@ class TransferReceiveSession
   void EndRecvOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   bool AllH2dDoneLocked() const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  bool RecordBlockShardsReceivedLocked(const std::vector<int>& block_ids,
+  bool RecordBlockShardsReceivedLocked(absl::Span<const int> block_ids,
                                        absl::Span<const int> shard_ids,
                                        bool* first_packet,
                                        bool* network_just_completed)

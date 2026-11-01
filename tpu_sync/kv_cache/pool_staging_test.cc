@@ -32,6 +32,7 @@
 #include "absl/status/statusor.h"
 #include "absl/time/time.h"
 #include "absl/types/optional.h"
+#include "absl/types/span.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
@@ -633,7 +634,9 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
     absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
       return unit % 2;
     }
-    absl::Status OnDataReceived(size_t idx) override {
+    absl::Status OnDataReceived(size_t major_dimension_idx,
+                                absl::Span<const int> minor_dimension_indices,
+                                absl::Span<const int> shard_ids) override {
       return absl::OkStatus();
     }
     absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {

@@ -283,13 +283,7 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
         RegisterBlockReadinessCallback(layer_idx, shard_idx, block_id, uuid,
                                        std::move(cb));
       };
-  hooks.on_block_shards_received = [this](const std::vector<int>& block_ids,
-                                          absl::Span<const int> shard_ids,
-                                          uint64_t uuid) {
-    return OnBlockShardsReceived(block_ids, shard_ids, uuid);
-  };
   hooks.wait_for_pending_work = [this]() { return WaitForPendingWork(); };
-  hooks.get_node_id = [this]() { return node_id(); };
   hooks.on_recv_progress = [this](uint64_t uuid) -> absl::Status {
     std::shared_ptr<TransferReceiveSession> recv_session;
     {
@@ -443,6 +437,7 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
       timeout_s_(timeout_s),
       control_timeout_s_(DeriveControlTimeoutS(timeout_s)),
       metrics_collector_(std::move(metrics_collector)) {
+  base_->set_node_id(node_id_);
   InitializeBaseHooks();
   InitializeControlPlane();
   if (base_->num_shards() == 0) {
@@ -1458,28 +1453,6 @@ void KVCacheManagerWithTransfer::ConfigureDataPortFromKvTransfer() {
     throw std::runtime_error("KVCacheManager BlockTransport is not running");
   }
   local_data_port_ = *data_port;
-}
-
-absl::Status KVCacheManagerWithTransfer::OnBlockShardsReceived(
-    const std::vector<int>& block_ids, absl::Span<const int> shard_ids,
-    uint64_t uuid) {
-  RAIDEN_TRACE_FN("KVTransfer::OnBlockShardsReceived", [&]() {
-    return absl::StrCat("blocks=", block_ids.size(),
-                        " shards=", shard_ids.size(), " uuid=", uuid);
-  });
-  VLOG(1) << "KVCacheManagerWithTransfer::OnBlockShardsReceived called. uuid: "
-          << uuid << ", received blocks count: " << block_ids.size()
-          << ", shards: " << shard_ids.size();
-
-  std::shared_ptr<TransferReceiveSession> session;
-  {
-    absl::MutexLock lock(mu_);
-    session = FindSessionLocked<TransferReceiveSession>(uuid);
-    if (session == nullptr) {
-      return absl::OkStatus();
-    }
-  }
-  return session->OnBlockShardsReceived(block_ids, shard_ids);
 }
 
 }  // namespace tpu_raiden

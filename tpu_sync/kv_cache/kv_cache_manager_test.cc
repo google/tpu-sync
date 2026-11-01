@@ -2648,7 +2648,11 @@ class StubTransferSession : public TransferSession {
   absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
     return size_t{0};
   }
-  absl::Status OnDataReceived(size_t idx) override { return absl::OkStatus(); }
+  absl::Status OnDataReceived(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override {
+    return absl::OkStatus();
+  }
   absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     return absl::nullopt;
   }
@@ -2779,8 +2783,8 @@ TEST(KVCacheManagerTest,
   // sender RegisterActivePlan.
   ABSL_ASSERT_OK(host.RegisterRecv(/*uuid=*/9102, "block_recv_9102",
                                    /*expected_block_count=*/1));
-  ABSL_ASSERT_OK(host.OnBlockShardsReceived(/*block_ids=*/{0},
-                                            /*shard_ids=*/{0}, /*uuid=*/9102));
+  ABSL_ASSERT_OK(host.manager().OnBlockShardsReceived(
+      /*block_ids=*/{0}, /*shard_ids=*/{0}, /*uuid=*/9102));
 
   sender_plan.set_uuid(9102);
   sender_plan.set_req_id("sender_plan_9102");

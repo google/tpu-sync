@@ -234,13 +234,6 @@ class KVCacheManagerWithTransfer {
     return shutting_down_.load(std::memory_order_relaxed);
   }
 
-  // Transport callback: |shard_ids| of |block_ids| landed for |uuid|. Routed
-  // pushes report each block range once per shard subset; the receive session
-  // accumulates them.
-  virtual absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
-                                             absl::Span<const int> shard_ids,
-                                             uint64_t uuid = 0);
-
   virtual std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
 
   // Endpoints for the block-transport DATA protocol (pulls and pushes),

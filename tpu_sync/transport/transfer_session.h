@@ -21,6 +21,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/optional.h"
+#include "absl/types/span.h"
 
 namespace tpu_raiden {
 
@@ -77,12 +78,18 @@ class TransferSession {
   // has no staging buffer and is addressed in place. Thread-safe.
   virtual absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) = 0;
 
-  // Signals that the data for unit |idx| has fully landed in host staging.
-  // |idx| is a layer index on the layer transfer path and a pool index on the
-  // pool reshard path, matching ResolveStagingSlot(). Receive sessions start
-  // the host-to-device work for that unit. Send sessions never receive data
-  // and return kFailedPrecondition. Thread-safe.
-  virtual absl::Status OnDataReceived(size_t idx) = 0;
+  // Reports received data for this session, as routed by its manager. With
+  // empty |minor_dimension_indices|, unit |major_dimension_idx| (a layer index
+  // on the layer transfer path, a pool index on the pool reshard path,
+  // matching ResolveStagingSlot()) has fully landed in host staging, and
+  // receive sessions start its host-to-device or pool work. With non-empty
+  // |minor_dimension_indices|, it is a block report that |shard_ids| of those
+  // destination blocks have landed; it completes no unit and
+  // |major_dimension_idx| is ignored. Send sessions return
+  // kFailedPrecondition. Thread-safe.
+  virtual absl::Status OnDataReceived(
+      size_t major_dimension_idx, absl::Span<const int> minor_dimension_indices,
+      absl::Span<const int> shard_ids) = 0;
 
   // Returns the session's active transfer plan, or absl::nullopt if this
   // session is planless or done.

@@ -117,7 +117,9 @@ class ReshardSendSession
   }
 
   // Always returns kFailedPrecondition: a send session never receives data.
-  absl::Status OnDataReceived(size_t pool_idx) override;
+  absl::Status OnDataReceived(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override;
 
   absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     if (transfer_plan_ == nullptr || Done()) {

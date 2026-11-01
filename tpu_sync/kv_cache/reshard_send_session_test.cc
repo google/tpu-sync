@@ -115,7 +115,11 @@ class StubRecvSession : public TransferSession {
   absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
     return unit;
   }
-  absl::Status OnDataReceived(size_t idx) override { return absl::OkStatus(); }
+  absl::Status OnDataReceived(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override {
+    return absl::OkStatus();
+  }
   std::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     return std::nullopt;
   }

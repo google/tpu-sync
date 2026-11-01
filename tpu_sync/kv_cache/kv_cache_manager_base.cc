@@ -2974,13 +2974,27 @@ void KVCacheManagerBase::RegisterBlockReadinessCallback(
   cb(absl::OkStatus());
 }
 
+// The transport's block report carries no unit index, and sessions ignore the
+// index of a block report, so 0 is passed. A uuid with no session (e.g. uuid 0
+// or a planless push) has no blocks to account here.
 absl::Status KVCacheManagerBase::OnBlockShardsReceived(
     const std::vector<int>& block_ids, absl::Span<const int> shard_ids,
     uint64_t uuid) {
-  if (transfer_hooks_.on_block_shards_received) {
-    return transfer_hooks_.on_block_shards_received(block_ids, shard_ids, uuid);
+  VLOG(1) << "KVCacheManagerBase::OnBlockShardsReceived called. uuid: " << uuid
+          << ", received blocks count: " << block_ids.size()
+          << ", shards: " << shard_ids.size();
+  // Sessions read an empty block list as a unit completion, so an empty block
+  // report must not reach them.
+  if (block_ids.empty()) {
+    return absl::OkStatus();
   }
-  return absl::OkStatus();
+  absl::StatusOr<std::shared_ptr<TransferSession>> session = GetSession(uuid);
+  if (absl::IsNotFound(session.status())) {
+    return absl::OkStatus();
+  }
+  ABSL_RETURN_IF_ERROR(session.status());
+  return (*session)->OnDataReceived(/*major_dimension_idx=*/0, block_ids,
+                                    shard_ids);
 }
 
 // A uuid with no session (e.g. uuid 0 or a planless push) needs no H2D work
@@ -2992,7 +3006,8 @@ absl::Status KVCacheManagerBase::OnLayerReceived(size_t layer_idx,
     return absl::OkStatus();
   }
   ABSL_RETURN_IF_ERROR(session.status());
-  return (*session)->OnDataReceived(layer_idx);
+  return (*session)->OnDataReceived(layer_idx, /*minor_dimension_indices=*/{},
+                                    /*shard_ids=*/{});
 }
 
 // A pool completion always belongs to an armed receiver, so a uuid with no
@@ -3005,7 +3020,8 @@ absl::Status KVCacheManagerBase::OnPoolReceived(size_t pool_idx,
         absl::StrCat("no active receiver for UUID ", uuid));
   }
   ABSL_RETURN_IF_ERROR(session.status());
-  return (*session)->OnDataReceived(pool_idx);
+  return (*session)->OnDataReceived(pool_idx, /*minor_dimension_indices=*/{},
+                                    /*shard_ids=*/{});
 }
 
 void KVCacheManagerBase::ScheduleAsyncTask(std::function<void()> task) {

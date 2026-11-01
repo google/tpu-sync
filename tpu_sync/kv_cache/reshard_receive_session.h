@@ -107,9 +107,16 @@ class ReshardReceiveSession
   int32_t sub_plan_index() const { return sub_plan_index_; }
   int32_t sub_plan_count() const { return sub_plan_count_; }
 
-  // Handles completion of pool |pool_idx|.
-  absl::Status OnDataReceived(size_t pool_idx) override {
-    return OnPoolReceived(pool_idx);
+  // Handles completion of pool |major_dimension_idx| when
+  // |minor_dimension_indices| is empty. Block reports carry nothing this
+  // session tracks, so they succeed without effect.
+  absl::Status OnDataReceived(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override {
+    if (!minor_dimension_indices.empty()) {
+      return absl::OkStatus();
+    }
+    return OnPoolReceived(major_dimension_idx);
   }
 
   // Leases a buffer to |pool_idx| on first use.

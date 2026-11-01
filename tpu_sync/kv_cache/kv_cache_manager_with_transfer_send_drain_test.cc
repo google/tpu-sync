@@ -372,7 +372,7 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   absl::Status ReceiveBlocks(const std::vector<int>& blocks, uint64_t uuid) {
     std::vector<int> all_shards(base()->num_shards());
     std::iota(all_shards.begin(), all_shards.end(), 0);
-    return OnBlockShardsReceived(blocks, all_shards, uuid);
+    return base()->OnBlockShardsReceived(blocks, all_shards, uuid);
   }
 
   void FinishCopy(size_t index, absl::Status status) {
@@ -804,6 +804,26 @@ TEST(RecvLifecycleTest, NetworkCompletionWaitsForH2d) {
   EXPECT_EQ(consumer.free_slots(), kSlots);
 }
 
+TEST(RecvLifecycleTest, EmptyBlockReportIssuesNoH2d) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.AddRecv("req", /*uuid=*/24);
+
+  // An empty block report must not be read as a layer completion.
+  ABSL_ASSERT_OK(consumer.base()->OnBlockShardsReceived(
+      /*block_ids=*/{}, /*shard_ids=*/{0}, /*uuid=*/24));
+  EXPECT_EQ(consumer.copies_issued(), 0);
+  EXPECT_TRUE(consumer.has_recv(24));
+
+  // The real completion and block report still drive the receive to done.
+  ABSL_ASSERT_OK(consumer.ReceiveLayer(/*layer=*/0, /*uuid=*/24));
+  EXPECT_EQ(consumer.copies_issued(), 1);
+  ABSL_ASSERT_OK(consumer.ReceiveBlocks({0}, /*uuid=*/24));
+  consumer.FinishCopy(0, absl::OkStatus());
+  Reports after = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneReceiving(after), Contains("req"));
+  EXPECT_FALSE(consumer.has_recv(24));
+}
+
 TEST(RecvLifecycleTest, DetailsReportWhenTheLastH2dLanded) {
   RecvTestManager consumer(/*num_layers=*/1);
   consumer.AddRecv("req", /*uuid=*/26);
@@ -1175,7 +1195,9 @@ TEST(RecvLifecycleTest,
             /*acquire_staging=*/true);
     weak_session = session;
     EXPECT_EQ(consumer.free_slots(), kSlots - 1);
-    ASSERT_THAT(session->OnDataReceived(/*layer_idx=*/0),
+    ASSERT_THAT(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                        /*minor_dimension_indices=*/{},
+                                        /*shard_ids=*/{}),
                 ::absl_testing::IsOk());
     ASSERT_EQ(consumer.copies_issued(), 1);
   }

@@ -96,6 +96,7 @@ inline constexpr absl::string_view kD2hTransferTimeMs = "d2h_transfer_time_ms";
 inline constexpr absl::string_view kD2hDmaTimeMs = "d2h_dma_time_ms";
 inline constexpr absl::string_view kBufferAllocatedBytes =
     "buffer_allocated_bytes";
+inline constexpr absl::string_view kStorageBytesTotal = "storage_bytes_total";
 
 inline constexpr absl::string_view kKvRecallBlocksTotal =
     "kv_recall_blocks_total";
@@ -177,6 +178,8 @@ inline constexpr absl::string_view kD2hTransferTimeMs =
 inline constexpr absl::string_view kD2hDmaTimeMs =
     "Non-overlapping Device-to-Host PCIe DMA wire transfer duration in "
     "milliseconds.";
+inline constexpr absl::string_view kStorageBytesTotal =
+    "Total bytes read from or written to secondary storage";
 
 inline constexpr absl::string_view kWeightSyncSentBytesTotal =
     "Total count of bytes sent over TPU Raiden weight sync interfaces.";
@@ -264,6 +267,8 @@ inline constexpr absl::string_view kPcieTransferLabels[] = {kHostIp,
                                                             kLocalRank};
 inline constexpr absl::string_view kKvRecallBlocksLabels[] = {kDpRank, kTier,
                                                               kOutcome};
+inline constexpr absl::string_view kStorageBytesLabels[] = {kLocalRank,
+                                                            kDirection};
 
 }  // namespace metric_labels
 
@@ -274,6 +279,7 @@ using metric_labels::kKvRecallBlocksLabels;
 using metric_labels::kP2pTransferTimeLabels;
 using metric_labels::kPcieTransferLabels;
 using metric_labels::kSentBytesLabels;
+using metric_labels::kStorageBytesLabels;
 using metric_labels::kTransferFailuresLabels;
 
 inline constexpr MetricMetadata kSentBytesTotal{
@@ -352,6 +358,11 @@ inline constexpr MetricMetadata kKvRecallBlocksTotal{
     .type = MetricType::kCounter,
     .label_names = kKvRecallBlocksLabels};
 
+inline constexpr MetricMetadata kStorageBytesTotal{
+    .name = metric_names::kStorageBytesTotal,
+    .description = metric_descriptions::kStorageBytesTotal,
+    .type = MetricType::kCounter,
+    .label_names = kStorageBytesLabels};
 inline constexpr MetricMetadata kWeightSyncSentBytesTotal{
     .name = metric_names::kWeightSyncSentBytesTotal,
     .description = metric_descriptions::kWeightSyncSentBytesTotal,
@@ -446,6 +457,7 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kD2hDmaTimeMs,
     kBufferAllocatedBytes,
     kKvRecallBlocksTotal,
+    kStorageBytesTotal,
     // Weight Sync Metrics
     kWeightSyncSentBytesTotal,
     kWeightSyncReceivedBytesTotal,

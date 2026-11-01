@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <functional>
 #include <ios>
 #include <memory>
 #include <optional>
@@ -45,6 +46,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/types/optional.h"
+#include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
@@ -2792,6 +2794,190 @@ TEST(KVCacheManagerTest,
   ABSL_EXPECT_OK(host.UnregisterActivePlan(9102));
 }
 
+class ConfigurableFakeKVBackend : public backends::KVBackend {
+ public:
+  explicit ConfigurableFakeKVBackend(
+      absl::Status write_status = absl::OkStatus(),
+      absl::Status read_status = absl::OkStatus(),
+      std::string fail_block_hash = "")
+      : write_status_(std::move(write_status)),
+        read_status_(std::move(read_status)),
+        fail_block_hash_(std::move(fail_block_hash)) {}
+
+  std::string name() const override { return "fake"; }
+
+  void WriteAsync(const backends::BlockKey& key,
+                  absl::Span<const backends::HostBufferDescriptor>, size_t,
+                  std::function<void(absl::Status)> callback) override {
+    if (!fail_block_hash_.empty() && key.block_hash != fail_block_hash_) {
+      callback(absl::OkStatus());
+      return;
+    }
+    callback(write_status_);
+  }
+
+  void ReadAsync(const backends::BlockKey& key,
+                 absl::Span<const backends::HostBufferDescriptor>, size_t,
+                 std::function<void(absl::Status)> callback) override {
+    if (!fail_block_hash_.empty() && key.block_hash != fail_block_hash_) {
+      callback(absl::OkStatus());
+      return;
+    }
+    callback(read_status_);
+  }
+
+  void BatchExistsAsync(absl::Span<const backends::BlockKey> keys,
+                        std::function<void(std::vector<absl::StatusOr<bool>>)>
+                            callback) override {
+    callback(std::vector<absl::StatusOr<bool>>(keys.size(), true));
+  }
+
+ private:
+  absl::Status write_status_;
+  absl::Status read_status_;
+  std::string fail_block_hash_;
+};
+
+auto StorageBytesLabels(absl::string_view direction,
+                        absl::string_view local_rank) {
+  return testing::ElementsAre(
+      testing::FieldsAre(telemetry::metric_labels::kDirection,
+                         std::string(direction)),
+      testing::FieldsAre(telemetry::metric_labels::kLocalRank,
+                         std::string(local_rank)));
+}
+
+TEST(KVCacheManagerTest,
+     D2hWriteToBackendAndH2dReadFromBackendEmitStorageBytesTotal) {
+  ScopedEnvVar restore_local_rank(telemetry::kLocalRankEnvVar, "3");
+
+  // 2 layers * 128 bytes/slice = 256 bytes per shard per block.
+  // For multi_shard_mgr (2 shards), each block has 512 total bytes across both
+  // shards (256 bytes for shard 0 and 256 bytes for shard 1).
+  TestKVCacheManager single_shard_mgr(/*num_layers=*/2, /*num_shards=*/1,
+                                      /*slice_byte_size=*/128,
+                                      /*host_blocks=*/2);
+  TestKVCacheManager multi_shard_mgr(/*num_layers=*/2, /*num_shards=*/2,
+                                     /*slice_byte_size=*/128,
+                                     /*host_blocks=*/2);
+
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(testing::Ne(telemetry::metric_names::kStorageBytesTotal),
+                       testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  // 2 blocks transferred across the batch: completed bytes per shard are
+  // accumulated (256 * 2 = 512) and recorded once when the final chunk
+  // completes.
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(
+          telemetry::metric_names::kStorageBytesTotal,
+          StorageBytesLabels(telemetry::metric_labels::kDirectionWrite, "3"),
+          512))
+      .Times(1);
+  EXPECT_CALL(*raw_mock, IncrementCounter(
+                             telemetry::metric_names::kStorageBytesTotal,
+                             StorageBytesLabels(
+                                 telemetry::metric_labels::kDirectionRead, "3"),
+                             512))
+      .Times(1);
+
+  for (absl::string_view rank : {"0", "1"}) {
+    EXPECT_CALL(
+        *raw_mock,
+        IncrementCounter(
+            telemetry::metric_names::kStorageBytesTotal,
+            StorageBytesLabels(telemetry::metric_labels::kDirectionWrite, rank),
+            512))
+        .Times(1);
+    EXPECT_CALL(
+        *raw_mock,
+        IncrementCounter(
+            telemetry::metric_names::kStorageBytesTotal,
+            StorageBytesLabels(telemetry::metric_labels::kDirectionRead, rank),
+            512))
+        .Times(1);
+  }
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  auto fake_backend = std::make_shared<ConfigurableFakeKVBackend>();
+
+  const std::vector<backends::BlockKey> keys = {
+      {.block_hash = "k0", .resolved_key = "/tmp/k0"},
+      {.block_hash = "k1", .resolved_key = "/tmp/k1"}};
+  const std::vector<int64_t> block_ids = {0, 1};
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture single_write,
+                       single_shard_mgr.D2hWriteToBackend(
+                           {fake_backend}, keys, block_ids, block_ids));
+  ABSL_EXPECT_OK(single_write.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture single_read,
+                       single_shard_mgr.H2dReadFromBackend(
+                           {fake_backend}, keys, block_ids, block_ids));
+  ABSL_EXPECT_OK(single_read.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture multi_write,
+                       multi_shard_mgr.D2hWriteToBackend({fake_backend}, keys,
+                                                         block_ids, block_ids));
+  ABSL_EXPECT_OK(multi_write.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture multi_read,
+                       multi_shard_mgr.H2dReadFromBackend(
+                           {fake_backend}, keys, block_ids, block_ids));
+  ABSL_EXPECT_OK(multi_read.Await());
+}
+
+TEST(KVCacheManagerTest,
+     FailedStorageWriteOrReadDoesNotIncrementStorageBytesTotal) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/2,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(testing::Ne(telemetry::metric_names::kStorageBytesTotal),
+                       testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(telemetry::metric_names::kStorageBytesTotal,
+                               testing::_, testing::_))
+      .Times(0);
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  // Block "fail1" fails while block "ok0" succeeds to verify that partial batch
+  // completions do not emit metric increments on failure.
+  auto fail_backend = std::make_shared<ConfigurableFakeKVBackend>(
+      absl::UnavailableError("simulated storage write failure"),
+      absl::NotFoundError("simulated storage read failure"),
+      /*fail_block_hash=*/"fail1");
+
+  const std::vector<backends::BlockKey> keys = {
+      {.block_hash = "ok0", .resolved_key = "/tmp/ok0"},
+      {.block_hash = "fail1", .resolved_key = "/tmp/fail1"}};
+  const std::vector<int64_t> block_ids = {0, 1};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture write_fail,
+      manager.D2hWriteToBackend({fail_backend}, keys, block_ids, block_ids));
+  EXPECT_THAT(write_fail.Await(), StatusIs(absl::StatusCode::kUnavailable));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture read_fail,
+      manager.H2dReadFromBackend({fail_backend}, keys, block_ids, block_ids));
+  EXPECT_THAT(read_fail.Await(), StatusIs(absl::StatusCode::kNotFound));
+}
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

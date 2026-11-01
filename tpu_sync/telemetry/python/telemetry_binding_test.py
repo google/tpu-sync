@@ -248,9 +248,13 @@ class TelemetryBindingTest(absltest.TestCase):
         ["host_ip", "local_rank"],
     )
     self.assertEqual(metrics_by_name["buffer_allocated_bytes"].label_names, [])
+    self.assertEqual(
+        metrics_by_name["storage_bytes_total"].label_names,
+        ["local_rank", "direction"],
+    )
 
     # Verify weight sync metrics
-    self.assertLen(metrics, 29)
+    self.assertLen(metrics, 30)
     self.assertEqual(
         metrics_by_name["weight_sync_sent_bytes_total"].label_names, []
     )

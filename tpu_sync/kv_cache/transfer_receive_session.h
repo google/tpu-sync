@@ -36,6 +36,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/optional.h"
 #include "absl/types/span.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
@@ -154,6 +155,11 @@ class TransferReceiveSession
   absl::Status OnDataReceived(size_t major_dimension_idx,
                               absl::Span<const int> minor_dimension_indices,
                               absl::Span<const int> shard_ids) override;
+
+  // A receive session stages no outgoing data, so the future is already OK.
+  tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+    return tsl::Future<>(absl::OkStatus());
+  }
 
   // Leases a buffer to |layer_idx| on first use.
   absl::StatusOr<size_t> ResolveStagingSlot(size_t layer_idx) override {

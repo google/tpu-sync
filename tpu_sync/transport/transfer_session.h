@@ -22,6 +22,7 @@
 #include "absl/status/statusor.h"
 #include "absl/types/optional.h"
 #include "absl/types/span.h"
+#include "xla/tsl/concurrency/future.h"
 
 namespace tpu_raiden {
 
@@ -90,6 +91,17 @@ class TransferSession {
   virtual absl::Status OnDataReceived(
       size_t major_dimension_idx, absl::Span<const int> minor_dimension_indices,
       absl::Span<const int> shard_ids) = 0;
+
+  // Returns a future that resolves once the data of unit |major_dimension_idx|
+  // (a layer index on the layer transfer path, a pool index on the pool
+  // reshard path, matching ResolveStagingSlot()) is ready in host memory for
+  // the transport to read. Send sessions that stage the unit with a
+  // device-to-host copy resolve it with that copy's status, or with the
+  // send's failure if the copy is never issued. A session holding no pending
+  // copy for the unit (receive sessions, a send whose copy has not been set
+  // up or whose staging was released) returns an already-OK future.
+  // Thread-safe.
+  virtual tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) = 0;
 
   // Returns the session's active transfer plan, or absl::nullopt if this
   // session is planless or done.

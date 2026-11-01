@@ -48,7 +48,6 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_plan.h"
-#include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {
 
@@ -216,29 +215,13 @@ void TransferSendSession::ValidateAndBeginPull(
   pull_started_ = true;
 }
 
-bool TransferSendSession::OwnsBlockWithReadyFuture(int block_id,
-                                                   size_t layer_idx) const {
+tsl::Future<> TransferSendSession::GetDataReadyFuture(
+    size_t major_dimension_idx) {
   absl::MutexLock lock(mu_);
-  return registered_block_set_.find(block_id) != registered_block_set_.end() &&
-         layer_idx < d2h_layer_futures_.size();
-}
-
-void TransferSendSession::RegisterLayerReadinessCallback(
-    size_t layer_idx,
-    transport::BlockTransportDelegate::HostBlockReadyCallback cb) {
-  std::optional<raiden::PjRtCopyFuture> future;
-  {
-    absl::MutexLock lock(mu_);
-    if (layer_idx < d2h_layer_futures_.size()) {
-      future = d2h_layer_futures_[layer_idx];
-    }
+  if (major_dimension_idx >= d2h_layer_futures_.size()) {
+    return tsl::Future<>(absl::OkStatus());
   }
-  if (!future.has_value()) {
-    cb(absl::OkStatus());
-    return;
-  }
-  future->OnReady(
-      [cb = std::move(cb)](auto status_or) { cb(status_or.status()); });
+  return d2h_layer_futures_[major_dimension_idx].future;
 }
 
 void TransferSendSession::ReleaseStagingBlocksLocked() {

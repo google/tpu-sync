@@ -27,6 +27,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:span",
+        "@xla//xla/tsl/concurrency:future",
     ],
 )
 
@@ -170,7 +171,7 @@ cc_test(
         "@com_google_googletest//:gtest_main",
         "@peregrine//peregrine/src/api/v1:conn_util",
         "@peregrine//peregrine/src/api/v1:socket_util",
-        "@xla//xla/tsl/platform:statusor",
+        "@xla//xla/tsl/concurrency:future",
     ],
 )
 

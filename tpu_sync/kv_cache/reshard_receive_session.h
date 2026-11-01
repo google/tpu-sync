@@ -33,7 +33,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/optional.h"
 #include "absl/types/span.h"
-#include "tpu_sync/core/raw_transfer_core.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
@@ -117,6 +117,11 @@ class ReshardReceiveSession
       return absl::OkStatus();
     }
     return OnPoolReceived(major_dimension_idx);
+  }
+
+  // A receive session stages no outgoing data, so the future is already OK.
+  tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+    return tsl::Future<>(absl::OkStatus());
   }
 
   // Leases a buffer to |pool_idx| on first use.

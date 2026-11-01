@@ -40,7 +40,6 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
-#include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_sync {
@@ -301,9 +300,6 @@ class KVCacheManagerWithTransfer {
 
   void StartControlServer();
   void StopControlServer();
-  virtual void RegisterBlockReadinessCallback(
-      size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
-      transport::BlockTransportDelegate::HostBlockReadyCallback cb);
 
   absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>> sessions_
       ABSL_GUARDED_BY(mu_);

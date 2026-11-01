@@ -34,6 +34,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/optional.h"
 #include "absl/types/span.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/data_connection_policy.h"
@@ -42,7 +43,6 @@
 #include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
-#include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {
 
@@ -126,17 +126,12 @@ class TransferSendSession
   void ValidateAndBeginPull(const std::vector<int64_t>& requested_block_ids,
                             std::chrono::steady_clock::time_point now);
 
-  // Returns true if |block_id| is registered in this session and StartPush has
-  // created |layer_idx|'s D2H future (its copy may not have been issued yet).
-  bool OwnsBlockWithReadyFuture(int block_id, size_t layer_idx) const;
-
-  // Registers |cb| to be invoked with |layer_idx|'s D2H copy status once the
-  // copy completes, or with the send's failure if the copy is never issued.
-  // Invokes |cb(OkStatus())| immediately if the session holds no future for
-  // |layer_idx| (StartPush has not run, or the send has settled).
-  void RegisterLayerReadinessCallback(
-      size_t layer_idx,
-      transport::BlockTransportDelegate::HostBlockReadyCallback cb);
+  // Returns layer |major_dimension_idx|'s D2H copy future once StartPush has
+  // created it (its copy may not have been issued yet): it resolves with the
+  // copy's status, or with the send's failure if the copy is never issued.
+  // Returns an already-OK future if the session holds no future for the layer
+  // (StartPush has not run, or the send released its staging).
+  tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override;
 
   // Stages producer device blocks into host staging and executes the
   // multi-layer D2H copy and pipelined H2H push.

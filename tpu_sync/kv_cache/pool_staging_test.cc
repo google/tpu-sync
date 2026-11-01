@@ -33,6 +33,7 @@
 #include "absl/time/time.h"
 #include "absl/types/optional.h"
 #include "absl/types/span.h"
+#include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
@@ -638,6 +639,9 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
                                 absl::Span<const int> minor_dimension_indices,
                                 absl::Span<const int> shard_ids) override {
       return absl::OkStatus();
+    }
+    tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+      return tsl::Future<>(absl::OkStatus());
     }
     absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
       return plan_;

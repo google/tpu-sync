@@ -57,7 +57,7 @@
 #include "grpcpp/support/channel_arguments.h"
 #include "peregrine/src/api/v1/conn_util.h"
 #include "peregrine/src/api/v1/socket_util.h"
-#include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/prometheus_exporter.h"
@@ -176,6 +176,9 @@ class StubReceiveSession : public TransferSession {
                               absl::Span<const int> minor_dimension_indices,
                               absl::Span<const int> shard_ids) override {
     return absl::OkStatus();
+  }
+  tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+    return tsl::Future<>(absl::OkStatus());
   }
   bool WaitForDone(absl::Duration timeout) const {
     absl::MutexLock lock(mu_);
@@ -2599,6 +2602,9 @@ TEST(PeregrineRecvCompleteTest, RejectsSenderSession) {
       ADD_FAILURE() << "OnDataReceived should not be called on sender session";
       return absl::FailedPreconditionError(
           "send session does not receive data");
+    }
+    tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+      return tsl::Future<>(absl::OkStatus());
     }
   };
 

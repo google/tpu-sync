@@ -30,6 +30,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/optional.h"
 #include "absl/types/span.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/data_connection_policy.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
@@ -120,6 +121,12 @@ class ReshardSendSession
   absl::Status OnDataReceived(size_t major_dimension_idx,
                               absl::Span<const int> minor_dimension_indices,
                               absl::Span<const int> shard_ids) override;
+
+  // Pool-reshard sends push each pool themselves once its device-to-host copy
+  // lands, so no transport read gates on them: the future is already OK.
+  tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+    return tsl::Future<>(absl::OkStatus());
+  }
 
   absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     if (transfer_plan_ == nullptr || Done()) {

@@ -58,10 +58,10 @@ namespace tpu_raiden {
 // lease, so the source must NOT gate it on device-to-host readiness.
 //
 // Why a sentinel rather than 0: the readiness gate
-// (KVCacheManagerWithTransfer::RegisterBlockReadinessCallback) identifies a
+// (KVCacheManagerBase::RegisterBlockReadinessCallback) identifies a
 // transfer by uuid. Pulls historically sent 0, which is indistinguishable from
 // "no uuid supplied", so the gate could never match a pull to its own transfer
-// and always fell through to scanning every live send entry -- coupling the
+// and fell through to scanning every live send entry -- coupling the
 // pull to an unrelated transfer's D2H future. This value says something
 // specific and true instead: "the lease already ordered this read."
 //
@@ -163,10 +163,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // pool-reshard / plan lifecycle events without inheriting from
   // KVCacheManagerBase.
   struct TransferEventHooks {
-    std::function<void(
-        size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
-        transport::BlockTransportDelegate::HostBlockReadyCallback cb)>
-        register_block_readiness_callback;
     std::function<absl::Status()> wait_for_pending_work;
     std::function<absl::Status(uint64_t uuid)> on_recv_progress;
     std::function<absl::Status(uint64_t uuid)> on_recv_network_complete;
@@ -181,6 +177,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     transfer_hooks_ = std::move(hooks);
   }
 
+  // Invokes |cb| once block |block_id| of layer |layer_idx| is ready in host
+  // memory for the transport to read on behalf of transfer |uuid|: gates on
+  // the data-ready future of the live session registered under |uuid|.
+  // Invokes |cb(OkStatus())| immediately for a negative |block_id|, for
+  // kLeaseAuthorizedPullUuid, and when no live session holds |uuid|.
   void RegisterBlockReadinessCallback(
       size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
       transport::BlockTransportDelegate::HostBlockReadyCallback cb) override;

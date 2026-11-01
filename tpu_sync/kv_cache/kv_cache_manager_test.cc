@@ -2653,6 +2653,9 @@ class StubTransferSession : public TransferSession {
                               absl::Span<const int> shard_ids) override {
     return absl::OkStatus();
   }
+  tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+    return tsl::Future<>(absl::OkStatus());
+  }
   absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     return absl::nullopt;
   }

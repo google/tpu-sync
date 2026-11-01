@@ -58,6 +58,7 @@
 #include "xla/shape.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/stream.h"
+#include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -2963,15 +2964,33 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
   return local_futures;
 }
 
+// A lease-authorised pull (kLeaseAuthorizedPullUuid) reads blocks this node
+// already published as host-resident: their device-to-host copy provably
+// completed before the lease was granted, and the pin keeps them from being
+// reused for the duration of the read, so it is never gated. A uuid with no
+// live session (e.g. a pull that did not identify itself) has no copy to wait
+// on either.
 void KVCacheManagerBase::RegisterBlockReadinessCallback(
     size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
     transport::BlockTransportDelegate::HostBlockReadyCallback cb) {
-  if (transfer_hooks_.register_block_readiness_callback) {
-    transfer_hooks_.register_block_readiness_callback(
-        layer_idx, shard_idx, block_id, uuid, std::move(cb));
+  if (block_id < 0 || uuid == kLeaseAuthorizedPullUuid) {
+    cb(absl::OkStatus());
     return;
   }
-  cb(absl::OkStatus());
+  absl::StatusOr<std::shared_ptr<TransferSession>> session = GetSession(uuid);
+  if (absl::IsNotFound(session.status())) {
+    cb(absl::OkStatus());
+    return;
+  }
+  if (!session.ok()) {
+    cb(session.status());
+    return;
+  }
+  if ((*session)->Done()) {
+    cb(absl::OkStatus());
+    return;
+  }
+  (*session)->GetDataReadyFuture(layer_idx).OnReady(std::move(cb));
 }
 
 // The transport's block report carries no unit index, and sessions ignore the

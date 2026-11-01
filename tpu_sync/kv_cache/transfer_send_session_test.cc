@@ -656,16 +656,20 @@ TEST(TransferSendSessionTest, ReleaseStagingBlocksClearsD2hLayerFuturesOnDone) {
   session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
                      /*dst_block_ids=*/{0});
 
-  EXPECT_TRUE(
-      session->OwnsBlockWithReadyFuture(/*block_id=*/0, /*layer_idx=*/0));
+  // The layer's D2H future exists and is pending until the copy completes.
+  EXPECT_FALSE(
+      session->GetDataReadyFuture(/*major_dimension_idx=*/0).IsReady());
   EXPECT_EQ(allocator->num_free_slots(), 1);
 
   base.CompleteD2h(0, absl::OkStatus());
   ABSL_EXPECT_OK(session->AwaitForDone());
   EXPECT_TRUE(session->Done());
   EXPECT_EQ(allocator->num_free_slots(), 2);
-  EXPECT_FALSE(
-      session->OwnsBlockWithReadyFuture(/*block_id=*/0, /*layer_idx=*/0));
+  // Releasing the staging drops the future, so readers are not gated.
+  tsl::Future<> released =
+      session->GetDataReadyFuture(/*major_dimension_idx=*/0);
+  EXPECT_TRUE(released.IsReady());
+  ABSL_EXPECT_OK(released.Await());
 }
 
 // A D2H dispatch failure fails the send, and the layers whose copy was never
@@ -698,22 +702,8 @@ TEST(TransferSendSessionTest,
   EXPECT_EQ(allocator->num_free_slots(), 0);
 
   // A reader gating on the never-issued layer 2 is told about the failure.
-  absl::Mutex cb_mu;
-  std::optional<absl::Status> layer2_status;
-  session->RegisterLayerReadinessCallback(
-      /*layer_idx=*/2, [&](absl::Status status) {
-        absl::MutexLock lock(cb_mu);
-        layer2_status = std::move(status);
-      });
-  {
-    absl::MutexLock lock(cb_mu);
-    auto called = [&]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(cb_mu) {
-      return layer2_status.has_value();
-    };
-    ASSERT_TRUE(
-        cb_mu.AwaitWithTimeout(absl::Condition(&called), absl::Seconds(2)));
-    EXPECT_THAT(*layer2_status, StatusIs(absl::StatusCode::kResourceExhausted));
-  }
+  EXPECT_THAT(session->GetDataReadyFuture(/*major_dimension_idx=*/2).Await(),
+              StatusIs(absl::StatusCode::kResourceExhausted));
 
   // The issued copy of layer 0 still pins the staging; its completion settles
   // the send without starting any push.

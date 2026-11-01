@@ -62,7 +62,6 @@
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
 #include "tpu_sync/kv_cache/transfer_send_session.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
-#include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace tpu_raiden {
 
@@ -277,12 +276,6 @@ void KVCacheManagerWithTransfer::SweepSubPlanChainsLocked(
 
 void KVCacheManagerWithTransfer::InitializeBaseHooks() {
   kv_cache::KVCacheManagerBase::TransferEventHooks hooks;
-  hooks.register_block_readiness_callback =
-      [this](size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
-             transport::BlockTransportDelegate::HostBlockReadyCallback cb) {
-        RegisterBlockReadinessCallback(layer_idx, shard_idx, block_id, uuid,
-                                       std::move(cb));
-      };
   hooks.wait_for_pending_work = [this]() { return WaitForPendingWork(); };
   hooks.on_recv_progress = [this](uint64_t uuid) -> absl::Status {
     std::shared_ptr<TransferReceiveSession> recv_session;
@@ -1131,57 +1124,6 @@ std::unique_ptr<StagingBlockAllocator> CreateStagingBlockAllocator(
     throw std::runtime_error(std::string(allocator.status().message()));
   }
   return *std::move(allocator);
-}
-
-void KVCacheManagerWithTransfer::RegisterBlockReadinessCallback(
-    size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
-    transport::BlockTransportDelegate::HostBlockReadyCallback cb) {
-  if (block_id < 0 || staging_allocator_ == nullptr ||
-      staging_allocator_->max_blocks() <= 0) {
-    cb(absl::OkStatus());
-    return;
-  }
-  if (uuid == kLeaseAuthorizedPullUuid) {
-    // A lease-authorised pull. The reader holds a lease over blocks this node
-    // already published as host-resident, so their device-to-host copy
-    // provably completed before the lease was granted, and the pin keeps them
-    // from being reused for the duration of the read. Gating here would add
-    // nothing -- and would be actively wrong, because the fallback scan below
-    // can only match some OTHER transfer's session, making this read wait on a
-    // future that has nothing to do with it.
-    cb(absl::OkStatus());
-    return;
-  }
-  std::shared_ptr<TransferSendSession> session;
-  {
-    absl::MutexLock lock(mu_);
-    // Exact match: the transfer named itself, so gate on its own D2H. Reached
-    // by uuid-carrying senders; a pull that did not identify itself falls
-    // through to the scan below.
-    auto candidate = FindSessionLocked<TransferSendSession>(uuid);
-    if (candidate != nullptr && !candidate->Done()) {
-      session = std::move(candidate);
-    } else {
-      // Fallback: no session owns this uuid, so look for any live transfer that
-      // registered this block id and wait on ITS copy. Conservative and
-      // imprecise -- the match is by block id alone, so an unrelated transfer
-      // can gate this one, and a stale session whose future never resolves
-      // would stall it until the reader's own deadline fires.
-      for (const auto& [u, s] : sessions_) {
-        auto send = std::dynamic_pointer_cast<TransferSendSession>(s);
-        if (send != nullptr && !send->Done() &&
-            send->OwnsBlockWithReadyFuture(block_id, layer_idx)) {
-          session = std::move(send);
-          break;
-        }
-      }
-    }
-  }
-  if (!session) {
-    cb(absl::OkStatus());
-    return;
-  }
-  session->RegisterLayerReadinessCallback(layer_idx, std::move(cb));
 }
 
 class KVCacheManagerWithTransfer::ControlPlaneHandlerImpl

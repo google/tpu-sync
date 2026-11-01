@@ -276,7 +276,6 @@ void KVCacheManagerWithTransfer::SweepSubPlanChainsLocked(
 
 void KVCacheManagerWithTransfer::InitializeBaseHooks() {
   kv_cache::KVCacheManagerBase::TransferEventHooks hooks;
-  hooks.wait_for_pending_work = [this]() { return WaitForPendingWork(); };
   hooks.on_recv_progress = [this](uint64_t uuid) -> absl::Status {
     std::shared_ptr<TransferReceiveSession> recv_session;
     {

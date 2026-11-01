@@ -94,6 +94,9 @@ class RoutingKVCacheManager final : public KVCacheManagerBase {
     return absl::OkStatus();
   }
 
+  // KVCacheListener drains pending work on shutdown; this stub has none.
+  absl::Status WaitForPendingWork() { return absl::OkStatus(); }
+
   Route route() const { return route_.load(std::memory_order_acquire); }
   const StartTransferRequest& request() const { return request_; }
   const std::vector<int64_t>& local_block_ids() const {

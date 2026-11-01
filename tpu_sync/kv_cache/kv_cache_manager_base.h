@@ -163,7 +163,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // pool-reshard / plan lifecycle events without inheriting from
   // KVCacheManagerBase.
   struct TransferEventHooks {
-    std::function<absl::Status()> wait_for_pending_work;
     std::function<absl::Status(uint64_t uuid)> on_recv_progress;
     std::function<absl::Status(uint64_t uuid)> on_recv_network_complete;
     // Returns the active transfer session registered under |uuid|, or
@@ -280,14 +279,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   virtual absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
   H2hRead(std::string peer, const std::vector<int>& src_block_ids);
-
-  // Blocks until all pending asynchronous transfers/copies are complete.
-  virtual absl::Status WaitForPendingWork() {
-    if (transfer_hooks_.wait_for_pending_work) {
-      return transfer_hooks_.wait_for_pending_work();
-    }
-    return absl::OkStatus();
-  }
 
   virtual std::string worker_id() const {
     if (!worker_id_.empty()) return worker_id_;

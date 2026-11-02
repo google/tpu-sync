@@ -96,9 +96,18 @@ callback finishes and retires the session before `OnBlockShardsReceived` runs; t
 late `netAccount` is ignored (`KVCacheManagerWithTransfer::OnBlockShardsReceived`
 returns `OkStatus()` on `it == active_recv_sessions_.end()` once the poll has
 dropped the session, and `TransferReceiveSession::OnBlockShardsReceived` returns
-`OkStatus()` on `done_ || draining_` while it is still seated). -/
+`OkStatus()` on `done_ || draining_` while it is still seated). The same copy
+without the poll is
+`RecvLifecycleTest.SessionRemainsValidAcrossAsyncH2dCallbacksAfterCallerDropsPtr`:
+the caller drops its `shared_ptr` after `ExecuteLayerH2d`, the pending callback
+keeps the session and its staging slot alive (`hasStaging` until `h2dDone`), and
+the callback's `FinishLocked()` settles it and returns the slot. -/
 theorem trace_late_net_account_after_retire :
     let pre := [.h2dBegin, .h2dIssue true, .h2dReady, .h2dDone true, .publish]
+    ((sysPush 1).run (pre.take 3)).map
+      (fun s => (s.life.done, s.life.hasStaging)) = some (false, true) ∧
+    ((sysPush 1).run (pre.take 4)).map
+      (fun s => (s.life.done, s.life.hasStaging)) = some (true, false) ∧
     ((sysPush 1).run pre).map
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some true) ∧
     (sysPush 1).run (pre ++ [.netAccount]) = none := by

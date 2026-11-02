@@ -921,6 +921,145 @@ class RaidenController:
     with self._lock:
       return self._active_transfers.get(req_id)
 
+  def _collect_idle_weight_sync_sender_endpoints(
+      self,
+      src_units: Sequence[RaidenId],
+      cached_schedule: _CachedTransferSchedule,
+      shard_push_schedules: Optional[dict[Any, Any]],
+      endpoint_to_shards: dict[Any, set[int]],
+      rpc_addresses: dict[RaidenId, str],
+  ) -> list[tuple[JobEntity, str]]:
+    """Finds sender control endpoints that own zero pushed shards in this sync.
+
+    Args:
+      src_units: Source work units participating in the transfer.
+      cached_schedule: Computed or cached transfer schedule for this sync.
+      shard_push_schedules: Optional caller-supplied push schedules.
+      endpoint_to_shards: Mapping from `(unit, control_addr)` to owned shards.
+      rpc_addresses: Resolved control-plane RPC endpoint strings per unit.
+
+    Returns:
+      Deduplicated `(JobEntity, control_address)` pairs with zero active pushes
+      across all `src_units`, so idle DP trainer hosts still mark `uuid` D2H
+      completed instead of hanging in `wait_for_d2h_completion(uuid)`.
+    """
+    active_shards_by_unit: dict[RaidenId, set[int]] = {}
+    for group in cached_schedule.broadcast_groups.values():
+      if isinstance(group, controller_types.StageBroadcastGroup):
+        sub_groups = group.eq_class_groups if group.eq_class_groups else [group]
+        for s_u in group.src_units:
+          unique_pids = (
+              {pid for _, pid in group.stage_ordered_vars_by_unit[s_u]}
+              if s_u in group.stage_ordered_vars_by_unit
+              else set()
+          )
+          for sub_g in sub_groups:
+            if not sub_g.dst_units or s_u not in sub_g.canonical_variable_plans:
+              continue
+            sub_var_plans = sub_g.canonical_variable_plans[s_u]
+            for pid in unique_pids if unique_pids else sub_var_plans:
+              if pid in sub_var_plans:
+                active_shards_by_unit.setdefault(s_u, set()).update(
+                    idx for idx, t9 in sub_var_plans[pid].items() if t9
+                )
+      elif isinstance(group, Sequence) and not isinstance(group, (str, bytes)):
+        for item in group:
+          if isinstance(item, tuple) and len(item) == 2 and item[1]:
+            key = item[0]
+            if isinstance(key, tuple) and len(key) >= 2:
+              active_shards_by_unit.setdefault(key[0], set()).add(key[1])
+
+    for sched_map in (
+        shard_push_schedules,
+        cached_schedule.computed_schedules,
+        cached_schedule.direct_schedules,
+    ):
+      if sched_map:
+        for s_u, unit_sched in sched_map.items():
+          active_shards_by_unit.setdefault(s_u, set()).update(
+              idx for idx, entries in unit_sched.items() if entries
+          )
+
+    active_ctrl_addrs: set[str] = set()
+    idle_candidates: list[tuple[JobEntity, str]] = []
+    for src_u in src_units:
+      src_ent = self.get_or_create_entity(src_u)
+      unit_eps = src_ent._endpoints_by_unit  # pylint: disable=protected-access
+      if src_u in unit_eps and unit_eps[src_u]:
+        raw_eps = list(unit_eps[src_u])
+      elif src_u.job_replica_id:
+        raw_eps = src_ent.get_registered_endpoints(src_u.job_replica_id)
+      else:
+        raw_eps = src_ent.get_registered_endpoints()
+      if not raw_eps and src_u in rpc_addresses and rpc_addresses[src_u]:
+        raw_eps = [rpc_addresses[src_u]]
+      if not raw_eps and src_u in self._registered_control_plane_endpoints:
+        raw_eps = list(self._registered_control_plane_endpoints[src_u])
+
+      clean_addrs: list[str] = []
+      seen_addrs: set[str] = set()
+      for raw_ep in raw_eps:
+        for part in str(raw_ep).split(","):
+          addr = part.strip()
+          if addr and addr not in seen_addrs:
+            seen_addrs.add(addr)
+            clean_addrs.append(addr)
+      if not clean_addrs:
+        continue
+
+      all_shards = (
+          self._registered_shards[src_u]
+          if src_u in self._registered_shards
+          else list(src_ent.shards)
+      )
+      unit_active = (
+          active_shards_by_unit[src_u]
+          if src_u in active_shards_by_unit
+          else set()
+      )
+      delegate = src_ent._rpc_delegate  # pylint: disable=protected-access
+      has_stubbed_start_transfer = (
+          delegate is not None
+          and (
+              type(delegate).start_transfer
+              not in (
+                  WorkerRpcClient.start_transfer,
+                  WeightSyncWorkerRpcClient.start_transfer,
+              )
+              or "start_transfer" in delegate.__dict__
+          )
+          and type(delegate)._send_rpc is WorkerRpcClient._send_rpc  # pylint: disable=protected-access
+          and type(delegate)._send_rpc_sync is WorkerRpcClient._send_rpc_sync  # pylint: disable=protected-access
+          and type(delegate)._send_and_verify is WorkerRpcClient._send_and_verify  # pylint: disable=protected-access
+          and "_send_and_verify" not in delegate.__dict__
+      )
+      for c_addr in clean_addrs:
+        if (src_u, c_addr) in endpoint_to_shards:
+          owned_shards: Optional[set[int]] = endpoint_to_shards[(src_u, c_addr)]
+        elif (src_ent.unit, c_addr) in endpoint_to_shards:
+          owned_shards = endpoint_to_shards[(src_ent.unit, c_addr)]
+        elif len(clean_addrs) == 1 and all_shards:
+          owned_shards = set(range(len(all_shards)))
+        else:
+          owned_shards = None
+
+        is_idle = not unit_active or (
+            owned_shards is not None and owned_shards.isdisjoint(unit_active)
+        )
+        if is_idle:
+          if not has_stubbed_start_transfer:
+            idle_candidates.append((src_ent, c_addr))
+        else:
+          active_ctrl_addrs.add(c_addr)
+
+    seen_idle_addrs: set[str] = set()
+    result: list[tuple[JobEntity, str]] = []
+    for src_ent, c_addr in idle_candidates:
+      if c_addr not in active_ctrl_addrs and c_addr not in seen_idle_addrs:
+        seen_idle_addrs.add(c_addr)
+        result.append((src_ent, c_addr))
+    return result
+
   async def _execute_slice_broadcast(
       self,
       keys_and_targets: list[tuple[tuple[Any, ...], list[tuple[Any, ...]]]],
@@ -1311,7 +1450,14 @@ class RaidenController:
                   )
               )
 
-          if cached_schedule.is_weight_sync:
+          is_weight_sync = bool(
+              cached_schedule.is_weight_sync
+              or any(
+                  u in self._registered_variables
+                  for u in (*src_units, *dst_units)
+              )
+          )
+          if is_weight_sync:
             for src_u in src_units:
               src_ent = self.get_or_create_entity(src_u)
               all_shards = self._registered_shards.get(src_u, []) or list(
@@ -1470,7 +1616,7 @@ class RaidenController:
               skip_d2h=skip_d2h,
               skip_tiling=local_skip_tiling,
               parallelism=parallelism or 1,
-              is_weight_sync=cached_schedule.is_weight_sync,
+              is_weight_sync=is_weight_sync,
               sender_push_schedule_protos=(
                   cached_schedule.sender_push_schedule_protos
               ),
@@ -1524,6 +1670,31 @@ class RaidenController:
                 )
 
           push_tasks = []
+
+          if is_weight_sync and uuid:
+            idle_targets = self._collect_idle_weight_sync_sender_endpoints(
+                src_units=src_units,
+                cached_schedule=cached_schedule,
+                shard_push_schedules=shard_push_schedules,
+                endpoint_to_shards=endpoint_to_shards,
+                rpc_addresses=rpc_addresses,
+            )
+            if idle_targets:
+              idle_req = raiden_service_pb2.ControlRequest(
+                  command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+                  start_transfer_request=raiden_service_pb2.StartTransferRequest(
+                      uuid=uuid,
+                      req_id=req_id,
+                      is_sender=True,
+                      use_block_chunks=True,
+                      skip_d2h=True,
+                  ),
+              )
+              idle_payload = idle_req.SerializeToString()
+              for src_ent, c_addr in idle_targets:
+                push_tasks.append(
+                    src_ent._send_and_verify(c_addr, idle_payload)  # pylint: disable=protected-access
+                )
 
           senders_start = time.monotonic()
           logging.vlog(

@@ -24,6 +24,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/time/time.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #ifndef WITHOUT_PYTHON
@@ -73,9 +74,10 @@ class WeightSynchronizer {
 #endif
   // Releases all bound device tensors and TPU HBM buffer holds while keeping
   // the synchronizer (host staging memory, listeners, controller registration)
-  // alive for a later BindWeights(). D2h()/H2d()/pushes fail with
-  // FailedPrecondition until weights are re-bound. Must not be called while a
-  // D2H/H2D/push is in flight.
+  // alive for a later BindWeights(). D2h()/H2d()/pushes with skip_d2h=false
+  // fail with FailedPrecondition until weights are re-bound. During a pipelined
+  // push (`skip_d2h=false`), wait for `WaitForD2hCompletion(uuid)` before
+  // calling `UnbindWeights()` while H2H network broadcast continues.
   void UnbindWeights();
 
   ~WeightSynchronizer();
@@ -91,6 +93,8 @@ class WeightSynchronizer {
   void SetSkipTiling(bool skip_all);
   void DrainPendingH2d();
   absl::Status WaitForTransferCompletion(uint64_t uuid = 0);
+  absl::Status WaitForD2hCompletion(
+      uint64_t uuid, std::optional<absl::Duration> timeout = std::nullopt);
 
   weight_sync::WeightSyncMetrics GetMetrics() const;
   void ResetMetrics();

@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -36,6 +38,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/time.h"
 #include "xla/pjrt/status_casters.h"
 #include "tpu_sync/core/raiden_future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -861,7 +864,40 @@ NB_MODULE(_tpu_raiden_torch, m) {
             }
           },
           nb::call_guard<nb::gil_scoped_release>(),
-          nb::arg("uuid") = nb::none());
+          nb::arg("uuid") = nb::none())
+      .def(
+          "wait_for_d2h_completion",
+          [](WeightSynchronizer& self, uint64_t uuid,
+             std::optional<double> timeout_s) {
+            std::optional<absl::Duration> timeout;
+            if (timeout_s.has_value()) {
+              if (!std::isfinite(*timeout_s) || *timeout_s < 0.0) {
+                throw std::invalid_argument(absl::StrCat(
+                    "wait_for_d2h_completion requires a finite non-negative "
+                    "timeout_s for uuid=",
+                    uuid, "; got timeout_s=", *timeout_s));
+              }
+              timeout = absl::Seconds(*timeout_s);
+            }
+            absl::Status s;
+            {
+              nb::gil_scoped_release release;
+              s = self.WaitForD2hCompletion(uuid, timeout);
+            }
+            if (!s.ok()) {
+              if (absl::IsInvalidArgument(s)) {
+                throw std::invalid_argument(std::string(s.message()));
+              }
+              if (absl::IsDeadlineExceeded(s)) {
+                std::string msg(s.message());
+                PyErr_SetString(PyExc_TimeoutError, msg.c_str());
+                throw nb::python_error();
+              }
+              throw std::runtime_error(
+                  absl::StrCat("WaitForD2hCompletion failed: ", s.message()));
+            }
+          },
+          nb::arg("uuid"), nb::arg("timeout_s") = nb::none());
 
   nb::class_<tpu_raiden::weight_sync::WeightSyncMetrics>(m, "WeightSyncMetrics")
       .def_ro("last_d2h_time_ms",

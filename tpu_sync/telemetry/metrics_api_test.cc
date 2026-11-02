@@ -311,6 +311,21 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kHostNumaMemoryBytes.type, MetricType::kGauge);
   EXPECT_THAT(metric_metadata::kHostNumaMemoryBytes.label_names,
               ElementsAre(metric_labels::kNumaNode, metric_labels::kState));
+
+  // StorageFilesystemBytes
+  EXPECT_EQ(metric_labels::kMount, "mount");
+  EXPECT_EQ(metric_names::kStorageFilesystemBytes, "storage_filesystem_bytes");
+  EXPECT_EQ(metric_descriptions::kStorageFilesystemBytes,
+            "Secondary storage filesystem capacity in bytes by mount and state "
+            "(total, used, free)");
+  EXPECT_EQ(metric_metadata::kStorageFilesystemBytes.name,
+            "storage_filesystem_bytes");
+  EXPECT_EQ(metric_metadata::kStorageFilesystemBytes.description,
+            "Secondary storage filesystem capacity in bytes by mount and state "
+            "(total, used, free)");
+  EXPECT_EQ(metric_metadata::kStorageFilesystemBytes.type, MetricType::kGauge);
+  EXPECT_THAT(metric_metadata::kStorageFilesystemBytes.label_names,
+              ElementsAre(metric_labels::kMount, metric_labels::kState));
   // Weight Sync Metrics
   EXPECT_EQ(metric_names::kWeightSyncSentBytesTotal,
             "weight_sync_sent_bytes_total");
@@ -486,6 +501,11 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_labels::kComponentFree, "free");
   EXPECT_THAT(metric_labels::kHostMemoryBreakdownLabels,
               ElementsAre(metric_labels::kComponent));
+
+  // Storage Filesystem Labels
+  EXPECT_THAT(metric_labels::kStorageFilesystemBytesLabels,
+              ElementsAre(metric_labels::kMount, metric_labels::kState));
+
   // All Metrics
   // clang-format off
   EXPECT_THAT(
@@ -507,6 +527,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kStorageBytesTotal,
           metric_metadata::kHostMemoryBreakdownBytes,
           metric_metadata::kHostNumaMemoryBytes,
+          metric_metadata::kStorageFilesystemBytes,
           metric_metadata::kWeightSyncSentBytesTotal,
           metric_metadata::kWeightSyncReceivedBytesTotal,
           metric_metadata::kWeightSyncTransferFailuresTotal,

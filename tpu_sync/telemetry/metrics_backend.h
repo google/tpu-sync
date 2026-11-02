@@ -101,6 +101,8 @@ inline constexpr absl::string_view kHostMemoryBreakdownBytes =
     "host_memory_breakdown_bytes";
 inline constexpr absl::string_view kHostNumaMemoryBytes =
     "host_numa_memory_bytes";
+inline constexpr absl::string_view kStorageFilesystemBytes =
+    "storage_filesystem_bytes";
 
 inline constexpr absl::string_view kKvRecallBlocksTotal =
     "kv_recall_blocks_total";
@@ -189,6 +191,9 @@ inline constexpr absl::string_view kD2hDmaTimeMs =
     "milliseconds.";
 inline constexpr absl::string_view kStorageBytesTotal =
     "Total bytes read from or written to secondary storage";
+inline constexpr absl::string_view kStorageFilesystemBytes =
+    "Secondary storage filesystem capacity in bytes by mount and state (total, "
+    "used, free)";
 
 inline constexpr absl::string_view kWeightSyncSentBytesTotal =
     "Total count of bytes sent over TPU Raiden weight sync interfaces.";
@@ -250,6 +255,7 @@ inline constexpr absl::string_view kComponentProcessHeap = "process_heap";
 inline constexpr absl::string_view kComponentPageCache = "page_cache";
 inline constexpr absl::string_view kComponentFree = "free";
 inline constexpr absl::string_view kNumaNode = "numa_node";
+inline constexpr absl::string_view kMount = "mount";
 inline constexpr absl::string_view kState = "state";
 inline constexpr absl::string_view kStateUsed = "used";
 inline constexpr absl::string_view kStateFree = "free";
@@ -291,6 +297,8 @@ inline constexpr absl::string_view kStorageBytesLabels[] = {kLocalRank,
 inline constexpr absl::string_view kHostMemoryBreakdownLabels[] = {kComponent};
 inline constexpr absl::string_view kHostNumaMemoryLabels[] = {kNumaNode,
                                                               kState};
+inline constexpr absl::string_view kStorageFilesystemBytesLabels[] = {kMount,
+                                                                      kState};
 
 }  // namespace metric_labels
 
@@ -304,6 +312,7 @@ using metric_labels::kP2pTransferTimeLabels;
 using metric_labels::kPcieTransferLabels;
 using metric_labels::kSentBytesLabels;
 using metric_labels::kStorageBytesLabels;
+using metric_labels::kStorageFilesystemBytesLabels;
 using metric_labels::kTransferFailuresLabels;
 
 inline constexpr MetricMetadata kSentBytesTotal{
@@ -399,6 +408,12 @@ inline constexpr MetricMetadata kHostNumaMemoryBytes{
     .description = metric_descriptions::kHostNumaMemoryBytes,
     .type = MetricType::kGauge,
     .label_names = kHostNumaMemoryLabels};
+
+inline constexpr MetricMetadata kStorageFilesystemBytes{
+    .name = metric_names::kStorageFilesystemBytes,
+    .description = metric_descriptions::kStorageFilesystemBytes,
+    .type = MetricType::kGauge,
+    .label_names = kStorageFilesystemBytesLabels};
 inline constexpr MetricMetadata kWeightSyncSentBytesTotal{
     .name = metric_names::kWeightSyncSentBytesTotal,
     .description = metric_descriptions::kWeightSyncSentBytesTotal,
@@ -496,6 +511,7 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kStorageBytesTotal,
     kHostMemoryBreakdownBytes,
     kHostNumaMemoryBytes,
+    kStorageFilesystemBytes,
     // Weight Sync Metrics
     kWeightSyncSentBytesTotal,
     kWeightSyncReceivedBytesTotal,

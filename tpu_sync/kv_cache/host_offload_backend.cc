@@ -1091,10 +1091,9 @@ tsl::Future<> HostOffloadBackend::UnregisterBlocksAsync(
 }
 
 tsl::Future<> HostOffloadBackend::Load(
-    const RaidenId& remote_id, absl::Span<const std::string> block_hashes,
+    absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> device_block_ids,
-    absl::Span<const RaidenBlockId> slices,
-    BlockTracker* absl_nonnull load_tracker) {
+    BlockTracker* absl_nonnull load_tracker, const LoadOptions& options) {
   CHECK(load_tracker != nullptr);
   if (block_hashes.empty()) {
     return tsl::Future<>(absl::OkStatus());
@@ -1111,15 +1110,24 @@ tsl::Future<> HostOffloadBackend::Load(
   bool is_remote = false;
   {
     absl::MutexLock lock(mutex_);
-    is_remote = !remote_id.empty() && remote_id != raiden_id_;
+    is_remote = !options.remote_id.empty() && options.remote_id != raiden_id_;
   }
 
   if (is_remote) {
-    return LoadRemoteBlocks(remote_id, block_hashes, device_block_ids,
+    return LoadRemoteBlocks(options.remote_id, block_hashes, device_block_ids,
                             load_tracker);
   }
-  return LoadLocalHostBlocks(block_hashes, device_block_ids, slices,
+  return LoadLocalHostBlocks(block_hashes, device_block_ids, options.slices,
                              load_tracker);
+}
+
+tsl::Future<> HostOffloadBackend::Load(
+    const RaidenId& remote_id, absl::Span<const std::string> block_hashes,
+    absl::Span<const int32_t> device_block_ids,
+    absl::Span<const RaidenBlockId> slices,
+    BlockTracker* absl_nonnull load_tracker) {
+  return Load(block_hashes, device_block_ids, load_tracker,
+              LoadOptions{.remote_id = remote_id, .slices = slices});
 }
 
 tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(

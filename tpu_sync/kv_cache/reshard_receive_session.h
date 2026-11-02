@@ -104,10 +104,6 @@ class ReshardReceiveSession
   std::chrono::steady_clock::time_point deadline() const override {
     return deadline_;
   }
-  // Position in the request's sub-transfer chain (both zero for a
-  // single-plan request); see StartTransferRequest.sub_plan_index.
-  int32_t sub_plan_index() const { return request().sub_plan_index(); }
-  int32_t sub_plan_count() const { return request().sub_plan_count(); }
 
   // Handles completion of pool |major_dimension_idx| when
   // |minor_dimension_indices| is empty. Block reports carry nothing this

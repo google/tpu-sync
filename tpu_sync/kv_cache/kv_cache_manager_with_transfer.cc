@@ -145,59 +145,80 @@ TransferDetails DetailsFromStatus(const absl::Status& status) {
 }
 
 void KVCacheManagerWithTransfer::NoteSubPlanRegisteredLocked(
-    bool is_recv, const std::string& req_id, uint64_t uuid,
+    const std::string& req_id, const std::shared_ptr<TransferSession>& session,
     int32_t sub_plan_index, int32_t sub_plan_count) {
-  if (sub_plan_count <= 1) return;
-  auto& chains = is_recv ? recv_chains_ : send_chains_;
+  if (sub_plan_count <= 1 || sub_plan_index < 0) {
+    sub_plan_chains_.erase(req_id);
+    return;
+  }
+  auto [it, inserted] = sub_plan_chains_.try_emplace(req_id);
+  SubPlanChainProgress& progress = it->second;
   if (sub_plan_index == 0) {
     // Sub-plan 0 is armed before any other sub-plan of its chain: a new
     // chain for this req_id (e.g. a retry) starts from a fresh entry.
-    auto it = chains.find(req_id);
-    if (it != chains.end() && !it->second.failed) {
-      LOG(WARNING) << "Pool reshard " << (is_recv ? "receive" : "send")
-                   << " req_id=" << req_id
+    if (!inserted && !progress.failed && !progress.completed) {
+      size_t settled_count = 0;
+      for (const auto& sub_session : progress.sub_sessions) {
+        if (sub_session != nullptr && sub_session->Done()) {
+          ++settled_count;
+        }
+      }
+      LOG(WARNING) << "Pool reshard req_id=" << req_id
                    << ": sub-plan 0 of a new chain registered while the "
                       "previous chain was still unsettled ("
-                   << it->second.settled.size() << " of " << it->second.count
+                   << settled_count << " of " << progress.sub_sessions.size()
                    << " sub-plans settled); tracking the new chain";
     }
-    chains[req_id] = SubPlanChainProgress{};
-    chains[req_id].anchored = true;
+    progress = SubPlanChainProgress{};
+    progress.anchored = true;
   }
-  SubPlanChainProgress& progress = chains[req_id];
-  progress.plan_uuids.insert(uuid);
-  progress.count = std::max(progress.count, sub_plan_count);
+  const size_t needed_size = std::max<size_t>(
+      progress.sub_sessions.size(),
+      static_cast<size_t>(std::max(sub_plan_count, sub_plan_index + 1)));
+  if (progress.sub_sessions.size() < needed_size) {
+    progress.sub_sessions.resize(needed_size);
+  }
+  progress.sub_sessions[sub_plan_index] = session;
   progress.last_activity = std::chrono::steady_clock::now();
 }
 
 void KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked(
     bool is_recv, const std::string& req_id, uint64_t uuid,
-    int32_t sub_plan_index, int32_t sub_plan_count,
+    const std::shared_ptr<TransferSession>& session,
     const absl::Status& status) {
   absl::flat_hash_set<std::string>& done =
       is_recv ? done_recving_ : done_sending_;
-  if (sub_plan_count <= 1) {
+  auto it = sub_plan_chains_.find(req_id);
+  if (it == sub_plan_chains_.end()) {
     // A single-plan request: the session's terminal is the request's.
     (status.ok() ? done : failed_recving_).insert(req_id);
     if (!status.ok()) transfer_details_[req_id] = DetailsFromStatus(status);
     return;
   }
-  auto& chains = is_recv ? recv_chains_ : send_chains_;
-  if (auto it = chains.find(req_id);
-      it != chains.end() && it->second.anchored &&
-      !it->second.plan_uuids.contains(uuid)) {
-    // A sub-plan of an earlier chain under the same req_id settling after a
-    // new chain (a retry) started: that chain was already reported.
-    VLOG(1) << "Pool reshard " << (is_recv ? "receive" : "send")
-            << " req_id=" << req_id << " uuid=" << uuid
-            << ": ignoring sub-plan " << sub_plan_index
-            << " of a superseded chain (" << status << ")";
+  SubPlanChainProgress& progress = it->second;
+  auto sub_it = std::find(progress.sub_sessions.begin(),
+                          progress.sub_sessions.end(), session);
+  if (sub_it == progress.sub_sessions.end()) {
+    if (progress.anchored) {
+      // A sub-plan of an earlier chain under the same req_id settling after a
+      // new chain (a retry) started, or after the chain completed: ignore it.
+      VLOG(1) << "Pool reshard " << (is_recv ? "receive" : "send")
+              << " req_id=" << req_id << " uuid=" << uuid
+              << ": ignoring sub-plan of a superseded chain (" << status << ")";
+      return;
+    }
+    (status.ok() ? done : failed_recving_).insert(req_id);
+    if (!status.ok()) transfer_details_[req_id] = DetailsFromStatus(status);
     return;
   }
-  SubPlanChainProgress& progress = chains[req_id];
+  const int32_t sub_plan_index =
+      static_cast<int32_t>(sub_it - progress.sub_sessions.begin());
+  const int32_t sub_plan_count =
+      static_cast<int32_t>(progress.sub_sessions.size());
   progress.last_activity = std::chrono::steady_clock::now();
-  if (progress.failed) return;  // the request's failure was already reported
-  progress.count = std::max(progress.count, sub_plan_count);
+  if (progress.failed || progress.completed) {
+    return;  // the request's terminal was already reported
+  }
   if (!status.ok()) {
     progress.failed = true;
     failed_recving_.insert(req_id);
@@ -211,63 +232,72 @@ void KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked(
                  << status;
     return;
   }
-  progress.settled.insert(sub_plan_index);
+  size_t settled_count = 0;
+  for (const auto& sub_session : progress.sub_sessions) {
+    if (sub_session != nullptr && sub_session->Done() &&
+        sub_session->GetStatus().ok()) {
+      ++settled_count;
+    }
+  }
   VLOG(1) << "Pool reshard " << (is_recv ? "receive" : "send")
           << " req_id=" << req_id << " sub-plan " << sub_plan_index << " of "
-          << sub_plan_count << " settled (" << progress.settled.size()
+          << sub_plan_count << " settled (" << settled_count
           << " settled so far)";
-  if (static_cast<int32_t>(progress.settled.size()) >= progress.count) {
+  if (settled_count == progress.sub_sessions.size()) {
     done.insert(req_id);
-    chains.erase(req_id);
+    progress.completed = true;
+    progress.sub_sessions.clear();
   }
 }
 
 void KVCacheManagerWithTransfer::SweepSubPlanChainsLocked(
     std::chrono::steady_clock::time_point now) {
-  if (recv_chains_.empty() && send_chains_.empty()) return;
+  if (sub_plan_chains_.empty()) return;
   const auto stall = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::duration<double>(timeout_s_));
-  for (auto* chains : {&recv_chains_, &send_chains_}) {
-    for (auto it = chains->begin(); it != chains->end();) {
-      SubPlanChainProgress& progress = it->second;
-      if (now - progress.last_activity <= stall) {
-        ++it;
-        continue;
+  for (auto it = sub_plan_chains_.begin(); it != sub_plan_chains_.end();) {
+    SubPlanChainProgress& progress = it->second;
+    if (now - progress.last_activity <= stall) {
+      ++it;
+      continue;
+    }
+    if (progress.failed || progress.completed) {
+      // The terminal was reported; late sub-plans of a failed or superseded
+      // request were swallowed for one timeout, which is as long as any of
+      // them can live.
+      sub_plan_chains_.erase(it++);
+      continue;
+    }
+    // Quiet for a whole timeout: unless a sub-plan of the request is
+    // still active, its chain has stalled (the coordinator never armed or
+    // dispatched the next sub-plan).
+    bool active = false;
+    size_t settled_count = 0;
+    for (const auto& sub_session : progress.sub_sessions) {
+      if (sub_session == nullptr) continue;
+      if (!sub_session->Done()) {
+        active = true;
+      } else {
+        ++settled_count;
       }
-      if (progress.failed) {
-        // The failure was reported; late sub-plans of the doomed request
-        // were swallowed for one timeout, which is as long as any of them
-        // can live.
-        chains->erase(it++);
-        continue;
-      }
-      // Quiet for a whole timeout: unless a sub-plan of the request is
-      // still active, its chain has stalled (the coordinator never armed or
-      // dispatched the next sub-plan).
-      bool active = false;
-      for (uint64_t uuid : progress.plan_uuids) {
-        if (sessions_.contains(uuid)) {
-          active = true;
-          break;
-        }
-      }
-      if (active) {
-        progress.last_activity = now;
-        ++it;
-        continue;
-      }
-      const absl::Status status = absl::DeadlineExceededError(absl::StrCat(
-          "pool reshard sub-plan chain stalled: ", progress.settled.size(),
-          " of ", progress.count, " sub-plans settled, none active for ",
-          timeout_s_, "s"));
-      failed_recving_.insert(it->first);
-      transfer_details_[it->first] = DetailsFromStatus(status);
-      LOG(WARNING) << "Pool reshard req_id=" << it->first << ": "
-                   << status.message();
-      progress.failed = true;
+    }
+    if (active) {
       progress.last_activity = now;
       ++it;
+      continue;
     }
+    const absl::Status status = absl::DeadlineExceededError(
+        absl::StrCat("pool reshard sub-plan chain stalled: ", settled_count,
+                     " of ", progress.sub_sessions.size(),
+                     " sub-plans settled, none active for ", timeout_s_, "s"));
+    failed_recving_.insert(it->first);
+    transfer_details_[it->first] = DetailsFromStatus(status);
+    LOG(WARNING) << "Pool reshard req_id=" << it->first << ": "
+                 << status.message();
+    progress.failed = true;
+    progress.sub_sessions.clear();
+    progress.last_activity = now;
+    ++it;
   }
 }
 
@@ -392,6 +422,7 @@ KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
   {
     absl::MutexLock lock(mu_);
     sessions_.clear();
+    sub_plan_chains_.clear();
   }
   staging_allocator_.reset();
 }
@@ -459,10 +490,9 @@ bool KVCacheManagerWithTransfer::RetireSettledSessionLocked(
     if (!reshard_recv->Done()) {
       return false;
     }
-    RecordPoolReshardTerminalLocked(
-        /*is_recv=*/true, reshard_recv->req_id(), uuid,
-        reshard_recv->sub_plan_index(), reshard_recv->sub_plan_count(),
-        reshard_recv->GetStatus());
+    RecordPoolReshardTerminalLocked(/*is_recv=*/true, reshard_recv->req_id(),
+                                    uuid, reshard_recv,
+                                    reshard_recv->GetStatus());
     if (retired_push_progress != nullptr) {
       *retired_push_progress = true;
     }
@@ -492,10 +522,9 @@ bool KVCacheManagerWithTransfer::RetireSettledSessionLocked(
       return false;
     }
     const bool failed = !reshard_send->GetStatus().ok();
-    RecordPoolReshardTerminalLocked(
-        /*is_recv=*/false, reshard_send->req_id(), uuid,
-        reshard_send->sub_plan_index(), reshard_send->sub_plan_count(),
-        reshard_send->GetStatus());
+    RecordPoolReshardTerminalLocked(/*is_recv=*/false, reshard_send->req_id(),
+                                    uuid, reshard_send,
+                                    reshard_send->GetStatus());
     if (failed) {
       if (retired_push_progress != nullptr) {
         *retired_push_progress = true;
@@ -716,8 +745,8 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
   {
     absl::MutexLock lock(mu_);
     sessions_[plan.uuid()] = state;
-    NoteSubPlanRegisteredLocked(/*is_recv=*/false, plan.req_id(), plan.uuid(),
-                                plan.sub_plan_index(), plan.sub_plan_count());
+    NoteSubPlanRegisteredLocked(plan.req_id(), state, plan.sub_plan_index(),
+                                plan.sub_plan_count());
   }
 
   return state->Start();
@@ -767,7 +796,7 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
     absl::MutexLock lock(mu_);
     pending_pool_reshard_recvs_.erase(plan.uuid());
     sessions_[plan.uuid()] = recv_session;
-    NoteSubPlanRegisteredLocked(/*is_recv=*/true, plan.req_id(), plan.uuid(),
+    NoteSubPlanRegisteredLocked(plan.req_id(), recv_session,
                                 plan.sub_plan_index(), plan.sub_plan_count());
   }
   return recv_session->Start();

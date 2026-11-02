@@ -100,7 +100,10 @@ class TestManager : public KVCacheManagerWithTransfer {
       return session.status();
     }
     absl::MutexLock lock(mu_);
-    sessions_[plan.uuid()] = *std::move(session);
+    std::shared_ptr<ReshardSendSession> send_session = *std::move(session);
+    sessions_[plan.uuid()] = send_session;
+    NoteSubPlanRegisteredLocked(plan.req_id(), send_session,
+                                plan.sub_plan_index(), plan.sub_plan_count());
     return absl::OkStatus();
   }
   using KVCacheManagerWithTransfer::PoolReshardRegisterRecv;
@@ -1013,6 +1016,36 @@ TEST(SubPlanChainTest, SinglePlanRequestsReportAtOnce) {
   manager.FinishPoolReshardRecvPool(5031, /*pool_idx=*/0, absl::OkStatus());
   const auto [sent, received, failed] = manager.CompleteReadRaw();
   EXPECT_THAT(received, Contains("pool_reshard_req_5031"));
+}
+
+TEST(SubPlanChainTest, SendTerminalWaitsForTheLastSubPlan) {
+  TestManager manager;
+  ASSERT_TRUE(manager.base()->RegisterPools({DensePool("fa")}).ok());
+  manager.AttachPlaceholderDeviceHold();
+
+  ABSL_ASSERT_OK(manager.AddPoolReshardSend(
+      ChainedRecvPlan(/*uuid=*/5041, /*index=*/0, /*count=*/2),
+      std::vector<int64_t>{0, 1}));
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferSession> sub0,
+                       manager.GetSession(5041));
+  sub0->Finish();
+  {
+    const auto [sent, received, failed] = manager.CompleteReadRaw();
+    EXPECT_THAT(sent, IsEmpty());
+    EXPECT_THAT(failed, IsEmpty());
+  }
+
+  ABSL_ASSERT_OK(manager.AddPoolReshardSend(
+      ChainedRecvPlan(/*uuid=*/5042, /*index=*/1, /*count=*/2),
+      std::vector<int64_t>{0, 1}));
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferSession> sub1,
+                       manager.GetSession(5042));
+  sub1->Finish();
+  {
+    const auto [sent, received, failed] = manager.CompleteReadRaw();
+    EXPECT_THAT(sent, Contains("chained_req"));
+    EXPECT_THAT(failed, IsEmpty());
+  }
 }
 
 TEST(PoolReshardSessionLookupTest,

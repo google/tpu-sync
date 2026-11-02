@@ -335,36 +335,34 @@ class KVCacheManagerWithTransfer {
   // Registering sub-plan 0 of a chain starts a fresh entry for its req_id
   // (the coordinator arms sub-plan 0 before any other sub-plan of the
   // chain), so a retry under a reused req_id is tracked on its own; only
-  // sessions registered into the current entry (`plan_uuids`) count toward
+  // sessions registered into the current entry (`sub_sessions`) count toward
   // it, and late terminals of an earlier chain's sub-plans are ignored.
   struct SubPlanChainProgress {
-    int32_t count = 0;
-    absl::flat_hash_set<int32_t> settled;
+    // Indexed by sub_plan_index; nullptr slots await registration. Cleared
+    // once the chain's terminal is reported.
+    std::vector<std::shared_ptr<TransferSession>> sub_sessions;
+    bool completed = false;
     bool failed = false;
     std::chrono::steady_clock::time_point last_activity;
     // Set once sub-plan 0 of the chain has registered here; from then on
-    // only sessions in `plan_uuids` belong to this chain.
+    // only sessions in `sub_sessions` belong to this chain.
     bool anchored = false;
-    absl::flat_hash_set<uint64_t> plan_uuids;
   };
-  absl::flat_hash_map<std::string, SubPlanChainProgress> recv_chains_
+  absl::flat_hash_map<std::string, SubPlanChainProgress> sub_plan_chains_
       ABSL_GUARDED_BY(mu_);
-  absl::flat_hash_map<std::string, SubPlanChainProgress> send_chains_
-      ABSL_GUARDED_BY(mu_);
-  // Records a newly registered pool-reshard session of plan `uuid` into its
-  // request's sub-plan chain (no-op for single-plan requests).
-  void NoteSubPlanRegisteredLocked(bool is_recv, const std::string& req_id,
-                                   uint64_t uuid, int32_t sub_plan_index,
-                                   int32_t sub_plan_count)
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  // Records a settled pool-reshard session of plan `uuid` (`is_recv` selects
+  // Records a newly registered pool-reshard |session| into its request's
+  // sub-plan chain (clears any stale chain entry for single-plan requests).
+  void NoteSubPlanRegisteredLocked(
+      const std::string& req_id,
+      const std::shared_ptr<TransferSession>& session, int32_t sub_plan_index,
+      int32_t sub_plan_count) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Records a settled pool-reshard |session| of plan `uuid` (`is_recv` selects
   // the role) into the terminal sets, aggregating per request across its
   // sub-plans.
-  void RecordPoolReshardTerminalLocked(bool is_recv, const std::string& req_id,
-                                       uint64_t uuid, int32_t sub_plan_index,
-                                       int32_t sub_plan_count,
-                                       const absl::Status& status)
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void RecordPoolReshardTerminalLocked(
+      bool is_recv, const std::string& req_id, uint64_t uuid,
+      const std::shared_ptr<TransferSession>& session,
+      const absl::Status& status) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   // Fails stalled sub-plan chains and expires reported ones.
   void SweepSubPlanChainsLocked(std::chrono::steady_clock::time_point now)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);

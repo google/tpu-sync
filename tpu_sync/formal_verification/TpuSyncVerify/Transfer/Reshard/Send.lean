@@ -201,11 +201,13 @@ All proved on every reachable state (`reachable_safe`) for any valid schedule
   0 < inFlight`: the session never drops to `in_flight_ == 0` before
   `finalizing_` is set.
 * **Plan unregistration (`PlanIntegrity`).** `done → planUnregistered` and
-  `planUnregistered → draining` under both policies; under
-  `UnregisterPolicy.onSettle`, `planUnregistered = done` (`reachable_onSettle_plan_iff_done`),
-  so the active plan is never torn down while sibling pools or peer pushes are
-  still resolving chunks through `KVCacheManagerBase::GetBlockChunks`
-  (`if (schedule_it != schedules.end())`).
+  `planUnregistered → draining`. The converse does not hold:
+  `RecordPushCompletion` unregisters the plan as soon as `finalizing_` is
+  latched, while sibling pools or peer pushes may still resolve chunks through
+  `KVCacheManagerBase::GetBlockChunks` (`if (schedule_it != schedules.end())`)
+  (`trace_early_unregister_on_error`); `Traces.lean` §"The `EndOp`-only
+  unregistration alternative" shows the `step` change under which
+  `planUnregistered = done`.
 * **Slot accounting & publication (`Publication`).** `published = some true →
   remainingPushes = 0 ∧ allPushed pools = true`: `done_sending` is published
   only when `CountPoolReshardSendSlots` has counted down to `0` and every active

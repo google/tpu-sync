@@ -26,12 +26,13 @@ data paths and machine-checked proofs about them.
   arm-before-dispatch, termination.
 
 **Engine caller contract** — [prefill_decode.md](docs/transfer/prefill_decode.md) §Boundaries, [reshard.md](docs/transfer/reshard.md) §Boundaries
-- Python: vLLM's scheduler and `KVOutputAggregator` through tpu-inference's and
+- C++ / Python: `NumaAwareKVCacheManager` (`tpu_sync/frameworks/jax/`), and
+  vLLM's scheduler and `KVOutputAggregator` through tpu-inference's and
   vllm-torchtpu's connectors, above `poll_stats()`.
 - Lean: [`Transfer/Caller.lean`](TpuSyncVerify/Transfer/Caller.lean).
-- Proved: a connector that forwards every publication leaks no held block,
-  never frees HBM while a worker is still in flight, and never decodes on
-  unwritten KV.
+- Proved: a connector and sub-manager barrier that forward one settled outcome
+  per transfer leak no held block, never free HBM while a worker or sub-manager
+  is still in flight, and never decode on unwritten KV.
 
 ## Layout
 

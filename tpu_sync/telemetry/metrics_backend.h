@@ -97,6 +97,8 @@ inline constexpr absl::string_view kD2hDmaTimeMs = "d2h_dma_time_ms";
 inline constexpr absl::string_view kBufferAllocatedBytes =
     "buffer_allocated_bytes";
 inline constexpr absl::string_view kStorageBytesTotal = "storage_bytes_total";
+inline constexpr absl::string_view kHostMemoryBreakdownBytes =
+    "host_memory_breakdown_bytes";
 
 inline constexpr absl::string_view kKvRecallBlocksTotal =
     "kv_recall_blocks_total";
@@ -153,6 +155,9 @@ inline constexpr absl::string_view kP2pTransferTimeMs =
 inline constexpr absl::string_view kBufferAllocatedBytes =
     "Current host DRAM buffer capacity allocated in bytes for KV cache staging "
     "across all layers and shards.";
+inline constexpr absl::string_view kHostMemoryBreakdownBytes =
+    "Host DRAM memory breakdown in bytes by component (kv_pool, process_heap, "
+    "page_cache, free)";
 
 // Counts KV cache block recall attempts across offload tiers (`local_dram`,
 // `remote_dram`, `shared_storage`) and outcomes (`ok`, `not_found`,
@@ -235,6 +240,11 @@ inline constexpr absl::string_view kSrcIp = "src_ip";
 inline constexpr absl::string_view kDstIp = "dst_ip";
 inline constexpr absl::string_view kUnknownIp = "unknown";
 inline constexpr absl::string_view kHostIp = "host_ip";
+inline constexpr absl::string_view kComponent = "component";
+inline constexpr absl::string_view kComponentKvPool = "kv_pool";
+inline constexpr absl::string_view kComponentProcessHeap = "process_heap";
+inline constexpr absl::string_view kComponentPageCache = "page_cache";
+inline constexpr absl::string_view kComponentFree = "free";
 
 inline constexpr absl::string_view kTier = "tier";
 inline constexpr absl::string_view kTierLocalDram = "local_dram";
@@ -269,12 +279,14 @@ inline constexpr absl::string_view kKvRecallBlocksLabels[] = {kDpRank, kTier,
                                                               kOutcome};
 inline constexpr absl::string_view kStorageBytesLabels[] = {kLocalRank,
                                                             kDirection};
+inline constexpr absl::string_view kHostMemoryBreakdownLabels[] = {kComponent};
 
 }  // namespace metric_labels
 
 namespace metric_metadata {
 
 using metric_labels::kDirectionLabels;
+using metric_labels::kHostMemoryBreakdownLabels;
 using metric_labels::kKvRecallBlocksLabels;
 using metric_labels::kP2pTransferTimeLabels;
 using metric_labels::kPcieTransferLabels;
@@ -363,6 +375,12 @@ inline constexpr MetricMetadata kStorageBytesTotal{
     .description = metric_descriptions::kStorageBytesTotal,
     .type = MetricType::kCounter,
     .label_names = kStorageBytesLabels};
+
+inline constexpr MetricMetadata kHostMemoryBreakdownBytes{
+    .name = metric_names::kHostMemoryBreakdownBytes,
+    .description = metric_descriptions::kHostMemoryBreakdownBytes,
+    .type = MetricType::kGauge,
+    .label_names = kHostMemoryBreakdownLabels};
 inline constexpr MetricMetadata kWeightSyncSentBytesTotal{
     .name = metric_names::kWeightSyncSentBytesTotal,
     .description = metric_descriptions::kWeightSyncSentBytesTotal,
@@ -458,6 +476,7 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kBufferAllocatedBytes,
     kKvRecallBlocksTotal,
     kStorageBytesTotal,
+    kHostMemoryBreakdownBytes,
     // Weight Sync Metrics
     kWeightSyncSentBytesTotal,
     kWeightSyncReceivedBytesTotal,

@@ -275,6 +275,21 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
       metric_metadata::kStorageBytesTotal.label_names,
       ElementsAre(metric_labels::kLocalRank, metric_labels::kDirection));
 
+  // HostMemoryBreakdownBytes
+  EXPECT_EQ(metric_names::kHostMemoryBreakdownBytes,
+            "host_memory_breakdown_bytes");
+  EXPECT_EQ(metric_descriptions::kHostMemoryBreakdownBytes,
+            "Host DRAM memory breakdown in bytes by component (kv_pool, "
+            "process_heap, page_cache, free)");
+  EXPECT_EQ(metric_metadata::kHostMemoryBreakdownBytes.name,
+            "host_memory_breakdown_bytes");
+  EXPECT_EQ(metric_metadata::kHostMemoryBreakdownBytes.description,
+            "Host DRAM memory breakdown in bytes by component (kv_pool, "
+            "process_heap, page_cache, free)");
+  EXPECT_EQ(metric_metadata::kHostMemoryBreakdownBytes.type,
+            MetricType::kGauge);
+  EXPECT_THAT(metric_metadata::kHostMemoryBreakdownBytes.label_names,
+              ElementsAre(metric_labels::kComponent));
   // Weight Sync Metrics
   EXPECT_EQ(metric_names::kWeightSyncSentBytesTotal,
             "weight_sync_sent_bytes_total");
@@ -442,6 +457,14 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(
       metric_labels::kStorageBytesLabels,
       ElementsAre(metric_labels::kLocalRank, metric_labels::kDirection));
+  // Host Memory Breakdown Labels
+  EXPECT_EQ(metric_labels::kComponent, "component");
+  EXPECT_EQ(metric_labels::kComponentKvPool, "kv_pool");
+  EXPECT_EQ(metric_labels::kComponentProcessHeap, "process_heap");
+  EXPECT_EQ(metric_labels::kComponentPageCache, "page_cache");
+  EXPECT_EQ(metric_labels::kComponentFree, "free");
+  EXPECT_THAT(metric_labels::kHostMemoryBreakdownLabels,
+              ElementsAre(metric_labels::kComponent));
   // All Metrics
   // clang-format off
   EXPECT_THAT(
@@ -461,6 +484,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kBufferAllocatedBytes,
           metric_metadata::kKvRecallBlocksTotal,
           metric_metadata::kStorageBytesTotal,
+          metric_metadata::kHostMemoryBreakdownBytes,
           metric_metadata::kWeightSyncSentBytesTotal,
           metric_metadata::kWeightSyncReceivedBytesTotal,
           metric_metadata::kWeightSyncTransferFailuresTotal,

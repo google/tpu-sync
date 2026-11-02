@@ -40,28 +40,25 @@
 
 namespace tpu_raiden {
 
-class KVCacheManagerWithTransfer;
 class StagingBlockAllocator;
 
 // Encapsulates the producer-side state and execution logic for a single
 // push-driven pool-reshard send transfer (identified by |uuid|).
 //
 // Thread-safety: This class is thread-safe. Immutable fields (|base_|,
-// |staging_allocator_|, |req_id_|, |uuid_|, |parallelism_|, |deadline_|,
-// |plan_|, |dst_peers_|, |data_connection_reuse_|) are set at construction
-// time and read without locking. Mutable state is protected by internal |mu_|.
+// |parallelism_|, |deadline_|, |dst_peers_|, |data_connection_reuse_|, and
+// |transfer_plan_|, whose request supplies the uuid, req_id and plan) are set
+// at construction time and read without locking. Mutable state is protected
+// by internal |mu_|.
 class ReshardSendSession
     : public TransferSession,
       public std::enable_shared_from_this<ReshardSendSession> {
  public:
   // Validates the sender schedule in |plan|, resolves the data connection
   // policy (TPU_RAIDEN_DATA_CONN_REUSE), initializes the transport server,
-  // and creates a producer pool-reshard send session that Start() pushes on
-  // |manager|. |manager| is null only for sessions that are never started
-  // (tests that drive the executor directly).
+  // and creates a producer pool-reshard send session.
   static absl::StatusOr<std::shared_ptr<ReshardSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,
-      KVCacheManagerWithTransfer* absl_nullable manager,
       StagingBlockAllocator* absl_nullable staging_allocator,
       absl::Span<const int64_t> src_block_ids, int parallelism,
       std::chrono::steady_clock::time_point deadline,
@@ -97,14 +94,14 @@ class ReshardSendSession
     return finalizing_;
   }
 
-  const std::string& req_id() const { return req_id_; }
+  const std::string& req_id() const { return request().req_id(); }
   std::chrono::steady_clock::time_point deadline() const { return deadline_; }
   // Position in the request's sub-transfer chain (both zero for a
   // single-plan request); see StartTransferRequest.sub_plan_index.
-  int32_t sub_plan_index() const { return plan_.sub_plan_index(); }
-  int32_t sub_plan_count() const { return plan_.sub_plan_count(); }
+  int32_t sub_plan_index() const { return request().sub_plan_index(); }
+  int32_t sub_plan_count() const { return request().sub_plan_count(); }
 
-  // Leases host staging per pool, issues D2H copies for each pool in |plan_|
+  // Leases host staging per pool, issues D2H copies for each pool in the plan
   // from the source blocks given to Create(), and chains async H2H peer
   // pushes upon D2H completion. Non-blocking preconditions (manager,
   // transport, host staging layers, pool indices) are checked synchronously
@@ -156,16 +153,18 @@ class ReshardSendSession
   void ExecutePushPipeline(std::vector<int64_t> src_block_ids);
 
   ReshardSendSession(kv_cache::KVCacheManagerBase* base,
-                     KVCacheManagerWithTransfer* manager,
-                     StagingBlockAllocator* staging_allocator,
-                     std::vector<int64_t> src_block_ids, std::string req_id,
-                     uint64_t uuid, int parallelism,
+                     std::vector<int64_t> src_block_ids, int parallelism,
                      int remaining_pool_peer_pushes,
                      std::chrono::steady_clock::time_point deadline,
                      TransferPlan transfer_plan,
-                     ::tpu_sync::rpc::StartTransferRequest plan,
                      std::vector<std::string> dst_peers,
                      DataConnectionReuse data_connection_reuse);
+
+  // The sender plan this session executes; immutable for its lifetime.
+  const ::tpu_sync::rpc::StartTransferRequest& request() const {
+    return transfer_plan_->request();
+  }
+  uint64_t uuid() const { return request().uuid(); }
 
   // Validates |plan| against |base| and |src_block_ids|.
   static absl::Status ValidatePlan(
@@ -181,16 +180,10 @@ class ReshardSendSession
   void ReleaseLeasesLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
-  // The manager this send executes on; null for a session never started.
-  KVCacheManagerWithTransfer* const manager_ = nullptr;
-  StagingBlockAllocator* const staging_allocator_ = nullptr;
   // Source device blocks Start() copies from.
   const std::vector<int64_t> src_block_ids_;
-  const std::string req_id_;
-  const uint64_t uuid_ = 0;
   const int parallelism_ = 8;
   const std::chrono::steady_clock::time_point deadline_;
-  const ::tpu_sync::rpc::StartTransferRequest plan_;
   // Data endpoints the sender schedule pushes to.
   const std::vector<std::string> dst_peers_;
   // TPU_RAIDEN_DATA_CONN_REUSE as resolved when the session was created.

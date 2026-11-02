@@ -229,10 +229,6 @@ class KVCacheManagerWithTransfer {
 
   virtual absl::Status WaitForPendingWork();
 
-  bool IsShuttingDown() const {
-    return shutting_down_.load(std::memory_order_relaxed);
-  }
-
   virtual std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
 
   // Endpoints for the block-transport DATA protocol (pulls and pushes),
@@ -250,9 +246,6 @@ class KVCacheManagerWithTransfer {
 
   virtual int local_control_port() const { return local_control_port_; }
   virtual int64_t node_id() const { return node_id_; }
-
-  // Bound on one control handshake, end to end, in seconds.
-  double control_timeout_s() const { return control_timeout_s_; }
 
   // Returns the active transfer session registered under |uuid|, or kNotFound
   // when no session holds it. Thread-safe.
@@ -314,8 +307,8 @@ class KVCacheManagerWithTransfer {
   int local_data_port_ = 0;
 
   // Pull-serve workers launched by ProcessPullStream. The destructor waits
-  // for them, and shutting_down_ ends a worker's staging wait early.
-  std::atomic<bool> shutting_down_{false};
+  // for them; staging_allocator_->Shutdown() ends a worker's staging wait
+  // early.
   absl::Mutex pull_workers_mu_;
   int active_pull_workers_ ABSL_GUARDED_BY(pull_workers_mu_) = 0;
   double timeout_s_ = 120.0;

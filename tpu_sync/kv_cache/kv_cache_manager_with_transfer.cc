@@ -25,7 +25,6 @@
 #include <memory>
 #include <optional>
 #include <ratio>  // NOLINT(build/c++11)
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -106,8 +105,6 @@ void CheckStatus(const std::string& context, const absl::Status& status) {
     ThrowStatus(context, status);
   }
 }
-
-void EmitTimingLog(const std::string& message) { LOG(INFO) << message; }
 
 double DurationMs(std::chrono::steady_clock::time_point start,
                   std::chrono::steady_clock::time_point end) {
@@ -355,10 +352,13 @@ KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(
           std::move(metrics_collector)) {}
 
 KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer() {
+  // Stop admitting transfer requests, then drain what is in flight before any
+  // state is torn down: Finish(Cancelled) every session so it settles (a
+  // passive receive would otherwise hold this destructor until its deadline),
+  // end staging waits, wait for the pull-serve workers that read this
+  // object's state, and wait for every session to be done. Only then stop
+  // the transport, which those sessions' last ops still use.
   StopControlServer();
-  // Pull-serve workers read this object's state; nothing may be torn down
-  // while one is still running.
-  shutting_down_.store(true, std::memory_order_relaxed);
   std::vector<std::shared_ptr<TransferSession>> sessions_to_wait;
   {
     absl::MutexLock lock(mu_);
@@ -556,13 +556,12 @@ int64_t KVCacheManagerWithTransfer::NotifyForRead(
   }
   cv_.SignalAll();
 
-  std::ostringstream timing;
-  timing << "RAIDEN_TIMING event=producer_register"
-         << " req_id=" << req_id << " uuid=" << uuid << " node_id=" << node_id_
-         << " blocks=" << block_ids.size() << " enqueue_ms="
-         << DurationMs(register_start, std::chrono::steady_clock::now())
-         << " failed=0";
-  EmitTimingLog(timing.str());
+  LOG(INFO) << "RAIDEN_TIMING event=producer_register"
+            << " req_id=" << req_id << " uuid=" << uuid
+            << " node_id=" << node_id_ << " blocks=" << block_ids.size()
+            << " enqueue_ms="
+            << DurationMs(register_start, std::chrono::steady_clock::now())
+            << " failed=0";
   return static_cast<int64_t>(uuid);
 }
 
@@ -670,8 +669,6 @@ absl::Status KVCacheManagerWithTransfer::RegisterRecv(
             base_.get(), staging_allocator_.get(), uuid, req_id,
             expected_block_count, deadline.value_or(DeadlineFromNow()),
             /*acquire_staging=*/false, metrics_collector_));
-    // host_to_chip is left empty -> defaults to 1-to-1 mapping in
-    // OnBlockShardsReceived
     absl::Status inserted = EmplaceRecvSessionLocked(uuid, recv_session);
     if (!inserted.ok()) {
       return inserted;
@@ -713,7 +710,7 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardPush(
 
   ABSL_ASSIGN_OR_RETURN(
       std::shared_ptr<ReshardSendSession> state,
-      ReshardSendSession::Create(base_.get(), this, staging_allocator_.get(),
+      ReshardSendSession::Create(base_.get(), staging_allocator_.get(),
                                  src_block_ids, parallelism, DeadlineFromNow(),
                                  plan));
   {
@@ -1348,12 +1345,10 @@ void KVCacheManagerWithTransfer::AckSend(uint64_t uuid) {
     }
   }
   session->Finish();
-  std::ostringstream timing;
-  timing << "RAIDEN_TIMING event=producer_ack"
-         << " req_id=" << session->req_id() << " uuid=" << uuid
-         << " node_id=" << node_id_
-         << " failed=" << (!session->GetStatus().ok() ? 1 : 0);
-  EmitTimingLog(timing.str());
+  LOG(INFO) << "RAIDEN_TIMING event=producer_ack"
+            << " req_id=" << session->req_id() << " uuid=" << uuid
+            << " node_id=" << node_id_
+            << " failed=" << (!session->GetStatus().ok() ? 1 : 0);
 }
 
 std::chrono::steady_clock::time_point

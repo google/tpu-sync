@@ -390,7 +390,7 @@ TEST(ReshardSendSessionTest,
       peer);
   absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
       ReshardSendSession::Create(
-          manager.base(), &manager, allocator.get(), std::vector<int64_t>{0},
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
   ABSL_ASSERT_OK(session);
@@ -431,7 +431,7 @@ TEST(ReshardSendSessionTest,
       peer);
   absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
       ReshardSendSession::Create(
-          manager.base(), &manager, allocator.get(), std::vector<int64_t>{0},
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
   ABSL_ASSERT_OK(session);
@@ -471,7 +471,7 @@ TEST(ReshardSendSessionTest, PooledPolicyKeepsIdlePeerConnections) {
       peer);
   absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
       ReshardSendSession::Create(
-          manager.base(), &manager, allocator.get(), std::vector<int64_t>{0},
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan);
   ABSL_ASSERT_OK(session);
@@ -493,7 +493,7 @@ TEST(ReshardSendSessionTest, CreateRejectsUnknownDataConnReuseValue) {
 
   EXPECT_THAT(
       ReshardSendSession::Create(
-          &base, /*manager=*/nullptr, allocator.get(), std::vector<int64_t>{0},
+          &base, allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan),
       StatusIs(absl::StatusCode::kInvalidArgument,
@@ -529,7 +529,7 @@ TEST(ReshardSendSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ReshardSendSession> session,
       ReshardSendSession::Create(
-          &base, /*manager=*/nullptr, allocator.get(), std::vector<int64_t>{0},
+          &base, allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(2), plan));
 
@@ -572,7 +572,7 @@ TEST(ReshardSendSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ReshardSendSession> timeout_session,
       ReshardSendSession::Create(
-          &base, /*manager=*/nullptr, allocator.get(), std::vector<int64_t>{0},
+          &base, allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::milliseconds(30),
           timeout_plan));
@@ -597,7 +597,7 @@ TEST(ReshardSendSessionTest, StartFailsFastWithoutTransportServer) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ReshardSendSession> session,
       ReshardSendSession::Create(
-          manager.base(), &manager, allocator.get(), std::vector<int64_t>{0},
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
   ASSERT_TRUE(session->plan().has_value());
@@ -640,7 +640,7 @@ TEST(ReshardSendSessionTest, PipelineSlotWaitTimeoutSettlesSendOutOfBand) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ReshardSendSession> session,
       ReshardSendSession::Create(
-          manager.base(), &manager, allocator.get(), std::vector<int64_t>{0},
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::milliseconds(200),
           plan));
@@ -701,8 +701,7 @@ TEST(ReshardSendSessionTest, StagingSlotReleasedAfterLastPeerPush) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ReshardSendSession> session,
       ReshardSendSession::Create(
-          manager.base(), /*manager=*/nullptr, allocator.get(),
-          std::vector<int64_t>{0},
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
 
@@ -728,7 +727,7 @@ TEST(ReshardSendSessionTest, FinishAfterLastPushFinalizingPreservesOkStatus) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<ReshardSendSession> session,
       ReshardSendSession::Create(
-          manager.base(), &manager, allocator.get(), std::vector<int64_t>{0},
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
           /*parallelism=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
 

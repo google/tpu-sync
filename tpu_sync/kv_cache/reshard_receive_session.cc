@@ -378,8 +378,7 @@ ReshardReceiveSession::Create(
                            base->has_explicit_pools(), base->pools()));
   auto session =
       std::shared_ptr<ReshardReceiveSession>(new ReshardReceiveSession(
-          base, staging_allocator, plan.uuid(), std::move(transfer_plan), plan,
-          chip_blocks, deadline));
+          base, std::move(transfer_plan), chip_blocks, deadline));
   if (absl::Status status = session->AcquireStagingLeases(plan); !status.ok()) {
     session->ReleaseStaging();
     return status;
@@ -388,18 +387,10 @@ ReshardReceiveSession::Create(
 }
 
 ReshardReceiveSession::ReshardReceiveSession(
-    kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* staging_allocator, uint64_t uuid,
-    TransferPlan transfer_plan,
-    const ::tpu_sync::rpc::StartTransferRequest& plan,
+    kv_cache::KVCacheManagerBase* base, TransferPlan transfer_plan,
     absl::Span<const int64_t> chip_blocks,
     std::chrono::steady_clock::time_point deadline)
     : base_(base),
-      staging_allocator_(staging_allocator),
-      uuid_(uuid),
-      req_id_(plan.req_id()),
-      sub_plan_index_(plan.sub_plan_index()),
-      sub_plan_count_(plan.sub_plan_count()),
       deadline_(deadline),
       start_time_(std::chrono::steady_clock::now()),
       transfer_plan_(
@@ -407,11 +398,11 @@ ReshardReceiveSession::ReshardReceiveSession(
       staging_layer_manager_(base != nullptr ? base->num_host_layers() : 0) {
   absl::MutexLock lock(mu_);
   chip_block_ids_.assign(chip_blocks.begin(), chip_blocks.end());
-  for (int32_t pool_idx : plan.transfer_pool_indices()) {
+  for (int32_t pool_idx : request().transfer_pool_indices()) {
     expected_pool_indices_.insert(static_cast<size_t>(pool_idx));
     pool_order_ranks_[static_cast<size_t>(pool_idx)] = 0;
   }
-  for (const auto& group : plan.pool_groups()) {
+  for (const auto& group : request().pool_groups()) {
     std::vector<int64_t> group_dst_ids(group.dst_device_block_ids().begin(),
                                        group.dst_device_block_ids().end());
     for (int32_t pool_idx : group.pool_indices()) {
@@ -454,7 +445,7 @@ absl::Status ReshardReceiveSession::AcquireStagingLeases(
   for (const auto& [storage_idx, ids] : dst_ids_by_storage) {
     std::vector<int64_t> id_list(ids.begin(), ids.end());
     absl::Status lease_status = base_->AcquirePoolStagingLease(
-        uuid_, storage_idx, id_list, base_->pool_staging_lease_timeout());
+        uuid(), storage_idx, id_list, base_->pool_staging_lease_timeout());
     if (!lease_status.ok()) {
       return lease_status;
     }
@@ -466,7 +457,7 @@ void ReshardReceiveSession::ReleaseStagingLocked() {
   staging_layer_manager_.ReleaseAll();
   if (staging_released_) return;
   staging_released_ = true;
-  base_->ReleasePoolStagingLeases(uuid_);
+  base_->ReleasePoolStagingLeases(uuid());
 }
 
 void ReshardReceiveSession::ReleaseStaging() {
@@ -495,7 +486,7 @@ absl::StatusOr<size_t> ReshardReceiveSession::AcquireStagingSlot(
     absl::MutexLock lock(mu_);
     if (done_ || draining_) {
       return absl::CancelledError(
-          absl::StrCat("Receive session ", uuid_, " is draining"));
+          absl::StrCat("Receive session ", uuid(), " is draining"));
     }
     ++in_flight_;
     deadline = deadline_;
@@ -508,7 +499,7 @@ absl::StatusOr<size_t> ReshardReceiveSession::AcquireStagingSlot(
   } else if (slot.ok() && (done_ || draining_)) {
     staging_layer_manager_.Release(pool_idx);
     slot = absl::CancelledError(
-        absl::StrCat("Receive session ", uuid_, " is draining"));
+        absl::StrCat("Receive session ", uuid(), " is draining"));
   }
   EndRecvOpLocked();
   return slot;
@@ -520,7 +511,7 @@ absl::StatusOr<size_t> ReshardReceiveSession::LookupStagingSlot(
     absl::MutexLock lock(mu_);
     if (done_ || draining_) {
       return absl::CancelledError(
-          absl::StrCat("Receive session ", uuid_, " is draining"));
+          absl::StrCat("Receive session ", uuid(), " is draining"));
     }
   }
   std::optional<size_t> slot = staging_layer_manager_.Lookup(pool_idx);
@@ -544,7 +535,7 @@ absl::Status ReshardReceiveSession::AwaitForDone() {
 
 void ReshardReceiveSession::EndRecvOpLocked() {
   if (in_flight_ <= 0) {
-    LOG(DFATAL) << "Receive operation count underflow for UUID " << uuid_;
+    LOG(DFATAL) << "Receive operation count underflow for UUID " << uuid();
     return;
   }
   --in_flight_;
@@ -562,7 +553,7 @@ void ReshardReceiveSession::EndOp() {
 absl::Status ReshardReceiveSession::RecordPoolReceivedLocked(size_t pool_idx) {
   if (expected_pool_indices_.find(pool_idx) == expected_pool_indices_.end()) {
     return absl::InvalidArgumentError(absl::StrCat(
-        "received undeclared pool ", pool_idx, " for UUID ", uuid_));
+        "received undeclared pool ", pool_idx, " for UUID ", uuid()));
   }
   if (started_pool_indices_.find(pool_idx) != started_pool_indices_.end()) {
     return absl::AlreadyExistsError(
@@ -623,7 +614,7 @@ absl::Status ReshardReceiveSession::OnPoolReceived(size_t pool_idx) {
     absl::MutexLock lock(mu_);
     if (done_) {
       return absl::NotFoundError(
-          absl::StrCat("no active receiver for UUID ", uuid_));
+          absl::StrCat("no active receiver for UUID ", uuid()));
     }
     TF_RETURN_IF_ERROR(RecordPoolReceivedLocked(pool_idx));
   }
@@ -660,7 +651,7 @@ void ReshardReceiveSession::ExecuteEligiblePoolH2ds() {
       // ValidateReceiverCoverage rejects groups without destination blocks,
       // so an empty list here is a broken invariant, not a legal no-op.
       FinishPoolH2d(pool_idx, absl::InternalError(absl::StrCat(
-                                  "pool ", pool_idx, " of UUID ", uuid_,
+                                  "pool ", pool_idx, " of UUID ", uuid(),
                                   " has no destination blocks to upload")));
       staging_layer_manager_.Release(pool_idx);
       EndOp();
@@ -673,9 +664,9 @@ void ReshardReceiveSession::ExecuteEligiblePoolH2ds() {
       continue;
     }
     const size_t host_layer_idx = *slot;
-    absl::StatusOr<raiden::PjRtCopyFuture> copy_future =
-        base_->H2dPoolBlocks(pool_idx, dst_chip_block_ids,
-                             /*shard_idx=*/std::nullopt, uuid_, host_layer_idx);
+    absl::StatusOr<raiden::PjRtCopyFuture> copy_future = base_->H2dPoolBlocks(
+        pool_idx, dst_chip_block_ids,
+        /*shard_idx=*/std::nullopt, uuid(), host_layer_idx);
     if (!copy_future.ok()) {
       FinishPoolH2d(pool_idx, copy_future.status());
       staging_layer_manager_.Release(pool_idx);

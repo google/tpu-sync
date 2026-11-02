@@ -165,7 +165,6 @@ std::optional<TransferSendSession::DuplicateBlock>
 TransferSendSession::PopulateRegisteredBlocks(
     absl::Span<const int64_t> block_ids) {
   absl::MutexLock lock(mu_);
-  registered_block_ids_.assign(block_ids.begin(), block_ids.end());
   registered_block_set_.clear();
   for (size_t i = 0; i < block_ids.size(); ++i) {
     if (registered_block_set_.insert(block_ids[i]).second) continue;

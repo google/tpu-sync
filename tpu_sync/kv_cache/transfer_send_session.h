@@ -189,9 +189,9 @@ class TransferSendSession
     size_t duplicate_index;
   };
 
-  // Populates `registered_block_ids_` and `registered_block_set_` from
-  // `block_ids`. Returns the first duplicate block ID and its indices if any
-  // duplicate is present, or `std::nullopt` when all IDs are unique.
+  // Populates `registered_block_set_` from `block_ids`. Returns the first
+  // duplicate block ID and its indices if any duplicate is present, or
+  // `std::nullopt` when all IDs are unique.
   std::optional<DuplicateBlock> PopulateRegisteredBlocks(
       absl::Span<const int64_t> block_ids);
   void ValidateRequestedBlocksLocked(
@@ -224,7 +224,6 @@ class TransferSendSession
   const DataConnectionReuse data_connection_reuse_;
   const std::shared_ptr<const TransferPlan> transfer_plan_;
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
-  std::vector<int64_t> registered_block_ids_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_set<int64_t> registered_block_set_ ABSL_GUARDED_BY(mu_);
   absl::Status status_ ABSL_GUARDED_BY(mu_);
   // The transfer phase in which the send failed; populated when `status_` is

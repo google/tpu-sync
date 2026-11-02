@@ -100,12 +100,12 @@ class ReshardReceiveSession
     return draining_;
   }
 
-  const std::string& req_id() const { return req_id_; }
+  const std::string& req_id() const { return request().req_id(); }
   std::chrono::steady_clock::time_point deadline() const { return deadline_; }
   // Position in the request's sub-transfer chain (both zero for a
   // single-plan request); see StartTransferRequest.sub_plan_index.
-  int32_t sub_plan_index() const { return sub_plan_index_; }
-  int32_t sub_plan_count() const { return sub_plan_count_; }
+  int32_t sub_plan_index() const { return request().sub_plan_index(); }
+  int32_t sub_plan_count() const { return request().sub_plan_count(); }
 
   // Handles completion of pool |major_dimension_idx| when
   // |minor_dimension_indices| is empty. Block reports carry nothing this
@@ -152,10 +152,14 @@ class ReshardReceiveSession
   // kFailedPrecondition if |pool_idx| holds no lease.
   absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const;
 
+  // The receiver plan this session executes; immutable for its lifetime.
+  const ::tpu_sync::rpc::StartTransferRequest& request() const {
+    return transfer_plan_->request();
+  }
+  uint64_t uuid() const { return request().uuid(); }
+
   ReshardReceiveSession(kv_cache::KVCacheManagerBase* base,
-                        StagingBlockAllocator* staging_allocator, uint64_t uuid,
                         TransferPlan transfer_plan,
-                        const ::tpu_sync::rpc::StartTransferRequest& plan,
                         absl::Span<const int64_t> chip_blocks,
                         std::chrono::steady_clock::time_point deadline);
 
@@ -190,11 +194,6 @@ class ReshardReceiveSession
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
-  StagingBlockAllocator* const staging_allocator_ = nullptr;
-  const uint64_t uuid_ = 0;
-  const std::string req_id_;
-  const int32_t sub_plan_index_ = 0;
-  const int32_t sub_plan_count_ = 0;
   const std::chrono::steady_clock::time_point deadline_;
   const std::chrono::steady_clock::time_point start_time_;
   const std::shared_ptr<const TransferPlan> transfer_plan_;

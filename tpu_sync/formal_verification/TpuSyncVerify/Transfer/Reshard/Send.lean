@@ -105,8 +105,9 @@ Session-level fields:
 ## Lock scopes
 
 Every mutable field of `ReshardSendSession` is `ABSL_GUARDED_BY(mu_)`;
-`base_`, `staging_allocator_`, `req_id_`, `uuid_`, `parallelism_`, `deadline_`,
-`plan_`, `dst_peers_`, and `data_connection_reuse_` are `const`.
+`base_`, `src_block_ids_`, `parallelism_`, `deadline_`, `dst_peers_`,
+`data_connection_reuse_`, and `transfer_plan_` (whose request supplies the
+uuid, req_id and plan) are `const`.
 `ReshardSendSession::EndOp` is always at least two `mu_` scopes: the
 fallback-unregistration check
 (`if (in_flight_ == 1 && finalizing_ && !done_ && !plan_unregistered_`), then

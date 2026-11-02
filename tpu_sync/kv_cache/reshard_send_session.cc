@@ -45,11 +45,11 @@
 #include "tpu_sync/core/utils.h"
 #include "tpu_sync/kv_cache/data_connection_policy.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
-#include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
+#include "tpu_sync/transport/block_transport_session.h"
 
 namespace tpu_raiden {
 
@@ -95,7 +95,6 @@ absl::Status ReshardSendSession::ValidatePlan(
 
 absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
     kv_cache::KVCacheManagerBase* base,
-    KVCacheManagerWithTransfer* absl_nullable manager,
     StagingBlockAllocator* absl_nullable staging_allocator,
     absl::Span<const int64_t> src_block_ids, int parallelism,
     std::chrono::steady_clock::time_point deadline,
@@ -148,36 +147,25 @@ absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
       TransferPlan::Create(plan, /*is_sender=*/true, base->num_pools(),
                            base->has_explicit_pools(), base->pools()));
 
-  std::string req_id = plan.req_id();
-  const uint64_t uuid = plan.uuid();
   auto session = std::shared_ptr<ReshardSendSession>(new ReshardSendSession(
-      base, manager, staging_allocator,
-      std::vector<int64_t>(src_block_ids.begin(), src_block_ids.end()),
-      std::move(req_id), uuid, parallelism, remaining_pool_peer_pushes,
-      deadline, std::move(transfer_plan), std::move(plan),
+      base, std::vector<int64_t>(src_block_ids.begin(), src_block_ids.end()),
+      parallelism, remaining_pool_peer_pushes, deadline,
+      std::move(transfer_plan),
       std::vector<std::string>(peers.begin(), peers.end()),
       data_connection_reuse));
   return session;
 }
 
 ReshardSendSession::ReshardSendSession(
-    kv_cache::KVCacheManagerBase* base, KVCacheManagerWithTransfer* manager,
-    StagingBlockAllocator* staging_allocator,
-    std::vector<int64_t> src_block_ids, std::string req_id, uint64_t uuid,
+    kv_cache::KVCacheManagerBase* base, std::vector<int64_t> src_block_ids,
     int parallelism, int remaining_pool_peer_pushes,
     std::chrono::steady_clock::time_point deadline, TransferPlan transfer_plan,
-    ::tpu_sync::rpc::StartTransferRequest plan,
     std::vector<std::string> dst_peers,
     DataConnectionReuse data_connection_reuse)
     : base_(base),
-      manager_(manager),
-      staging_allocator_(staging_allocator),
       src_block_ids_(std::move(src_block_ids)),
-      req_id_(std::move(req_id)),
-      uuid_(uuid),
       parallelism_(parallelism),
       deadline_(deadline),
-      plan_(std::move(plan)),
       dst_peers_(std::move(dst_peers)),
       data_connection_reuse_(data_connection_reuse),
       transfer_plan_(
@@ -242,7 +230,7 @@ absl::Status ReshardSendSession::ValidatePushPreconditions() const {
     return absl::FailedPreconditionError(
         "pool reshard push requires at least one host staging layer");
   }
-  for (int32_t encoded_pool_idx : plan_.transfer_pool_indices()) {
+  for (int32_t encoded_pool_idx : request().transfer_pool_indices()) {
     const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
     if (base_->pool(pool_idx) == nullptr) {
       return absl::InvalidArgumentError(
@@ -253,10 +241,6 @@ absl::Status ReshardSendSession::ValidatePushPreconditions() const {
 }
 
 absl::Status ReshardSendSession::Start() {
-  if (manager_ == nullptr) {
-    return absl::FailedPreconditionError(absl::StrCat(
-        "pool reshard send uuid=", uuid_, " was created without a manager"));
-  }
   {
     absl::MutexLock lock(mu_);
     if (done_ || finalizing_) {
@@ -301,8 +285,9 @@ void ReshardSendSession::ExecutePushPipeline(
   // entries; the flat src_block_ids argument is the legacy single-tag
   // whole-plan block list.
   const auto pool_group_index = [this](size_t pool_idx) -> int {
-    for (int group_idx = 0; group_idx < plan_.pool_groups_size(); ++group_idx) {
-      const auto& indices = plan_.pool_groups(group_idx).pool_indices();
+    for (int group_idx = 0; group_idx < request().pool_groups_size();
+         ++group_idx) {
+      const auto& indices = request().pool_groups(group_idx).pool_indices();
       if (std::find(indices.begin(), indices.end(),
                     static_cast<int32_t>(pool_idx)) != indices.end()) {
         return group_idx;
@@ -310,26 +295,26 @@ void ReshardSendSession::ExecutePushPipeline(
     }
     return -1;
   };
-  auto local_schedule_it = plan_.shard_push_schedules().find(0);
-  if (local_schedule_it == plan_.shard_push_schedules().end() &&
-      plan_.shard_push_schedules().size() == 1) {
-    local_schedule_it = plan_.shard_push_schedules().begin();
+  auto local_schedule_it = request().shard_push_schedules().find(0);
+  if (local_schedule_it == request().shard_push_schedules().end() &&
+      request().shard_push_schedules().size() == 1) {
+    local_schedule_it = request().shard_push_schedules().begin();
   }
 
   std::vector<size_t> ordered_pools;
-  ordered_pools.reserve(plan_.transfer_pool_indices_size());
-  for (int32_t encoded_pool_idx : plan_.transfer_pool_indices()) {
+  ordered_pools.reserve(request().transfer_pool_indices_size());
+  for (int32_t encoded_pool_idx : request().transfer_pool_indices()) {
     ordered_pools.push_back(static_cast<size_t>(encoded_pool_idx));
   }
   std::stable_sort(
       ordered_pools.begin(), ordered_pools.end(), [&](size_t a, size_t b) {
         const int ga = pool_group_index(a);
         const int gb = pool_group_index(b);
-        const int rank_a = (ga >= 0 && ga < plan_.pool_groups_size())
-                               ? plan_.pool_groups(ga).order_rank()
+        const int rank_a = (ga >= 0 && ga < request().pool_groups_size())
+                               ? request().pool_groups(ga).order_rank()
                                : 0;
-        const int rank_b = (gb >= 0 && gb < plan_.pool_groups_size())
-                               ? plan_.pool_groups(gb).order_rank()
+        const int rank_b = (gb >= 0 && gb < request().pool_groups_size())
+                               ? request().pool_groups(gb).order_rank()
                                : 0;
         return rank_a < rank_b;
       });
@@ -337,7 +322,7 @@ void ReshardSendSession::ExecutePushPipeline(
   for (size_t pool_idx : ordered_pools) {
     std::vector<int64_t> pool_src_block_ids(src_block_ids.begin(),
                                             src_block_ids.end());
-    if (local_schedule_it != plan_.shard_push_schedules().end()) {
+    if (local_schedule_it != request().shard_push_schedules().end()) {
       const int group_idx = pool_group_index(pool_idx);
       std::set<int64_t> group_src_ids;
       for (const auto& entry : local_schedule_it->second.entries()) {
@@ -375,7 +360,7 @@ void ReshardSendSession::ExecutePushPipeline(
     if (const kv_cache::PoolSpec* pool_spec = base_->pool(pool_idx);
         pool_spec != nullptr) {
       absl::Status lease_status = base_->AcquirePoolStagingLease(
-          uuid_, pool_spec->storage_index, pool_src_block_ids,
+          uuid(), pool_spec->storage_index, pool_src_block_ids,
           base_->pool_staging_lease_timeout());
       if (!lease_status.ok()) {
         RecordPushCompletion(lease_status);
@@ -385,7 +370,7 @@ void ReshardSendSession::ExecutePushPipeline(
     }
     absl::StatusOr<raiden::PjRtCopyFuture> future =
         base_->D2hPoolBlocks(pool_idx, pool_src_block_ids,
-                             /*shard_idx=*/std::nullopt, uuid_, *host_slot);
+                             /*shard_idx=*/std::nullopt, uuid(), *host_slot);
     if (!future.ok()) {
       RecordPushCompletion(future.status());
       staging_layer_manager_.Release(pool_idx);
@@ -412,7 +397,7 @@ void ReshardSendSession::ExecutePushPipeline(
 
 void ReshardSendSession::StartPoolPush(size_t pool_idx) {
   RAIDEN_TRACE_FN("KVTransfer::StartPoolReshardPush", [&]() {
-    return absl::StrCat("uuid=", uuid_, " pool=", pool_idx);
+    return absl::StrCat("uuid=", uuid(), " pool=", pool_idx);
   });
   {
     absl::MutexLock lock(mu_);
@@ -422,14 +407,15 @@ void ReshardSendSession::StartPoolPush(size_t pool_idx) {
     }
   }
 
-  auto schedule_it = plan_.shard_push_schedules().find(0);
-  if (schedule_it == plan_.shard_push_schedules().end()) {
-    schedule_it = plan_.shard_push_schedules().begin();
+  auto schedule_it = request().shard_push_schedules().find(0);
+  if (schedule_it == request().shard_push_schedules().end()) {
+    schedule_it = request().shard_push_schedules().begin();
   }
   // A pool pushes only its own group's (src, dst) pairs.
   int pool_group_idx = -1;
-  for (int group_idx = 0; group_idx < plan_.pool_groups_size(); ++group_idx) {
-    const auto& indices = plan_.pool_groups(group_idx).pool_indices();
+  for (int group_idx = 0; group_idx < request().pool_groups_size();
+       ++group_idx) {
+    const auto& indices = request().pool_groups(group_idx).pool_indices();
     if (std::find(indices.begin(), indices.end(),
                   static_cast<int32_t>(pool_idx)) != indices.end()) {
       pool_group_idx = group_idx;
@@ -476,8 +462,9 @@ void ReshardSendSession::StartPoolPush(size_t pool_idx) {
   // The plan names this pool in the sender's own index space; the receiver
   // resolves the wire index against the destination's pool table.
   std::optional<int> wire_pool_idx;
-  auto wire_it = plan_.wire_pool_indices().find(static_cast<int32_t>(pool_idx));
-  if (wire_it != plan_.wire_pool_indices().end()) {
+  auto wire_it =
+      request().wire_pool_indices().find(static_cast<int32_t>(pool_idx));
+  if (wire_it != request().wire_pool_indices().end()) {
     wire_pool_idx = wire_it->second;
   }
 
@@ -492,7 +479,7 @@ void ReshardSendSession::StartPoolPush(size_t pool_idx) {
     }
     transport_srv
         ->AsyncPush({peer}, src_ids, dst_ids, parallelism_,
-                    transport::MajorOrder::kLayerMajor, uuid_,
+                    transport::MajorOrder::kLayerMajor, uuid(),
                     static_cast<int>(pool_idx), wire_pool_idx)
         .OnReady([self = shared_from_this(), pool_idx, remaining_pushes](
                      const absl::StatusOr<std::vector<int>>& result) {
@@ -515,13 +502,13 @@ void ReshardSendSession::StartPoolPush(size_t pool_idx) {
 
 void ReshardSendSession::RecordPushCompletion(const absl::Status& status) {
   RAIDEN_TRACE_FN("KVTransfer::FinishPoolReshardSend", [&]() {
-    return absl::StrCat("uuid=", uuid_, " status=", status.code());
+    return absl::StrCat("uuid=", uuid(), " status=", status.code());
   });
   absl::MutexLock lock(mu_);
   if (done_ || finalizing_) return;
   if (!status.ok()) {
-    LOG(ERROR) << "Pool reshard send failed uuid=" << uuid_
-               << " req_id=" << req_id_ << ": " << status;
+    LOG(ERROR) << "Pool reshard send failed uuid=" << uuid()
+               << " req_id=" << request().req_id() << ": " << status;
     if (status_.ok()) {
       status_ = status;
     }
@@ -566,14 +553,15 @@ absl::Status ReshardSendSession::OnDataReceived(
     absl::Span<const int> shard_ids) {
   return absl::FailedPreconditionError(absl::StrCat(
       "send session does not receive data: pool ", major_dimension_idx,
-      " reported received on send session for UUID ", uuid_));
+      " reported received on send session for UUID ", uuid()));
 }
 
 void ReshardSendSession::EndOp() {
-  // Under kPerTransfer the last op closes the idle data connections to
-  // |dst_peers_| before it is counted out: every push has returned its
-  // socket by now, and ~KVCacheManagerWithTransfer is still parked in
-  // AwaitForDone(), so the manager, |base_| and its transport are alive.
+  // Under kPerTransfer the last op of a send closes the idle data
+  // connections to |dst_peers_| before it is counted out, also while the
+  // manager is being destroyed: every push has returned its socket by now,
+  // and ~KVCacheManagerWithTransfer is still parked in AwaitForDone(), which
+  // this op releases, so the manager, |base_| and its transport are alive.
   // transport_server() cannot contend on server_init_mu_ either: every
   // StopTransportServer() call is in a destructor that runs only after that
   // wait. The check and the decrement share a critical section so a Finish()
@@ -583,8 +571,7 @@ void ReshardSendSession::EndOp() {
       absl::MutexLock lock(mu_);
       const bool release_due =
           data_connection_reuse_ == DataConnectionReuse::kPerTransfer &&
-          in_flight_ == 1 && finalizing_ && !done_ && !connections_released_ &&
-          manager_ != nullptr && !manager_->IsShuttingDown();
+          in_flight_ == 1 && finalizing_ && !done_ && !connections_released_;
       if (!release_due) {
         --in_flight_;
         if (finalizing_ && in_flight_ == 0 && !done_) {
@@ -595,7 +582,7 @@ void ReshardSendSession::EndOp() {
       connections_released_ = true;
     }
     ReleaseDataConnectionsAfterSend(base_->transport_server(), dst_peers_,
-                                    uuid_);
+                                    uuid());
   }
 }
 
@@ -603,7 +590,7 @@ void ReshardSendSession::ReleaseLeasesLocked() {
   staging_layer_manager_.ReleaseAll();
   if (leases_released_) return;
   leases_released_ = true;
-  base_->ReleasePoolStagingLeases(uuid_);
+  base_->ReleasePoolStagingLeases(uuid());
 }
 
 void ReshardSendSession::SettleLocked() {

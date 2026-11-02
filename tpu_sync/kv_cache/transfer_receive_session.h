@@ -20,7 +20,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <future>  // NOLINT(build/c++11)
 #include <memory>
 #include <optional>
 #include <string>
@@ -277,8 +276,6 @@ class TransferReceiveSession
   // Initializes this receive session for a consumer StartRead load plan.
   void InitFromLoadPlan(const std::string& req_id, CopyPlan load_plan,
                         std::chrono::steady_clock::time_point deadline);
-  using H2dIssueFuture =
-      std::shared_future<absl::StatusOr<raiden::PjRtCopyFuture>>;
 
   void ReleaseStaging();
   void ReleaseStagingLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -321,10 +318,6 @@ class TransferReceiveSession
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
   CopyPlan load_plan_ ABSL_GUARDED_BY(mu_);
   CopySpec h2d_copy_ ABSL_GUARDED_BY(mu_);
-  std::vector<int64_t> chip_block_ids_ ABSL_GUARDED_BY(mu_);
-  absl::flat_hash_map<kv_cache::HostBlockId, kv_cache::DeviceBlockId>
-      host_to_chip_ ABSL_GUARDED_BY(mu_);
-  std::vector<H2dIssueFuture> h2d_dispatch_futures_ ABSL_GUARDED_BY(mu_);
   int32_t total_blocks_ ABSL_GUARDED_BY(mu_) = 0;
   bool tracks_completion_ ABSL_GUARDED_BY(mu_) = true;
   // Per-shard count of (layer, block) units reported so far, indexed by shard;
@@ -354,7 +347,6 @@ class TransferReceiveSession
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   std::chrono::steady_clock::time_point completed_at_ ABSL_GUARDED_BY(mu_);
-  std::vector<int> accumulated_host_block_ids_ ABSL_GUARDED_BY(mu_);
   std::chrono::steady_clock::time_point deadline_ ABSL_GUARDED_BY(mu_);
   const std::shared_ptr<const TransferPlan> transfer_plan_;
   std::chrono::steady_clock::time_point start_time_ ABSL_GUARDED_BY(mu_);

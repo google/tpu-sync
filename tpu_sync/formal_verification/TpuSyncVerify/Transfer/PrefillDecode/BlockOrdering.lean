@@ -60,8 +60,8 @@ per-block arrays `Layer → BlockId → BlockCell`, modelling:
 1. **Producer block registration & pull validation**
    (`TransferSendSession::PopulateRegisteredBlocks` and
    `TransferSendSession::ValidateRequestedBlocksLocked`):
-   - `PopulateRegisteredBlocks`: `NotifyForRead` rejects duplicate block IDs in
-     `registered_block_ids_` (reported with both positions by
+   - `PopulateRegisteredBlocks`: `NotifyForRead` rejects duplicate block IDs
+     while populating `registered_block_set_` (reported with both positions by
      `TransferSendSession::Create` and thrown as `std::invalid_argument` by
      `KVCacheManagerWithTransfer::NotifyForRead`).
    - `ValidateRequestedBlocksLocked`: `ValidateAndBeginPull` rejects empty

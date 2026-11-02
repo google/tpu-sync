@@ -294,8 +294,6 @@ void TransferReceiveSession::InitFromActivePlan(
     for (const auto& push_entry : schedule.entries()) {
       const int64_t dst = push_entry.dst_block_id();
       unique_dst_blocks.insert(dst);
-      auto hb = host_block_of.find(dst);
-      host_to_chip_[hb == host_block_of.end() ? dst : hb->second] = dst;
       unique_transfers_from_this_source.insert(
           {push_entry.src_block_id(), push_entry.dst_block_id()});
     }
@@ -450,17 +448,11 @@ void TransferReceiveSession::InitFromLoadPlan(
   deadline_ = deadline;
   start_time_ = std::chrono::steady_clock::now();
   handshake_pending_ = true;
-  chip_block_ids_ = load_plan.h2d_local_block_ids;
   total_blocks_ = load_plan.num_blocks;
   ResetShardProgressLocked();
   num_completed_layers_ = 0;
   in_flight_ = load_plan.num_blocks > 0 ? 1 : 0;
   h2d_copy_ = load_plan.h2d_copy;
-  for (size_t i = 0; i < load_plan.transport_host_block_ids.size(); ++i) {
-    host_to_chip_[load_plan.transport_host_block_ids[i]] =
-        load_plan.h2d_local_block_ids[i];
-  }
-  h2d_dispatch_futures_.reserve(load_plan.h2d_local_block_ids.size());
   load_plan_ = std::move(load_plan);
 }
 
@@ -584,8 +576,6 @@ bool TransferReceiveSession::RecordBlockShardsReceivedLocked(
   *first_packet = !any_blocks_received_;
   any_blocks_received_ = true;
   *network_just_completed = false;
-  accumulated_host_block_ids_.insert(accumulated_host_block_ids_.end(),
-                                     block_ids.begin(), block_ids.end());
   const size_t total_layers = base_ != nullptr ? base_->num_layers() : 0;
   const int64_t per_shard_target =
       static_cast<int64_t>(total_blocks_) * static_cast<int64_t>(total_layers);

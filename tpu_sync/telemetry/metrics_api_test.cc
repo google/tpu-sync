@@ -432,6 +432,25 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kPeregrineErrorsTotal.type, MetricType::kCounter);
   EXPECT_THAT(metric_metadata::kPeregrineErrorsTotal.label_names, IsEmpty());
 
+  // Storage Metadata Check Metrics
+  EXPECT_EQ(metric_labels::kDpRank, "dp_rank");
+  EXPECT_EQ(metric_labels::kResult, "result");
+  EXPECT_EQ(metric_labels::kResultCacheHit, "cache_hit");
+  EXPECT_EQ(metric_labels::kResultStatHit, "stat_hit");
+  EXPECT_EQ(metric_labels::kResultStatMiss, "stat_miss");
+  EXPECT_EQ(metric_names::kStorageMetadataCheckTotal,
+            "storage_metadata_check_total");
+  EXPECT_EQ(metric_descriptions::kStorageMetadataCheckTotal,
+            "Total secondary storage metadata existence checks by result");
+  EXPECT_EQ(metric_metadata::kStorageMetadataCheckTotal.name,
+            "storage_metadata_check_total");
+  EXPECT_EQ(metric_metadata::kStorageMetadataCheckTotal.description,
+            "Total secondary storage metadata existence checks by result");
+  EXPECT_EQ(metric_metadata::kStorageMetadataCheckTotal.type,
+            MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kStorageMetadataCheckTotal.label_names,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kResult));
+
   // Direction Labels
   EXPECT_EQ(metric_labels::kDirection, "direction");
   EXPECT_EQ(metric_labels::kDirectionPush, "push");
@@ -528,6 +547,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kHostMemoryBreakdownBytes,
           metric_metadata::kHostNumaMemoryBytes,
           metric_metadata::kStorageFilesystemBytes,
+          metric_metadata::kStorageMetadataCheckTotal,
           metric_metadata::kWeightSyncSentBytesTotal,
           metric_metadata::kWeightSyncReceivedBytesTotal,
           metric_metadata::kWeightSyncTransferFailuresTotal,

@@ -266,7 +266,7 @@ class TelemetryBindingTest(absltest.TestCase):
     )
 
     # Verify weight sync metrics
-    self.assertLen(metrics, 33)
+    self.assertLen(metrics, 34)
     self.assertEqual(
         metrics_by_name["weight_sync_sent_bytes_total"].label_names, []
     )
@@ -315,6 +315,10 @@ class TelemetryBindingTest(absltest.TestCase):
     )
     self.assertEqual(metrics_by_name["peregrine_bytes_total"].label_names, [])
     self.assertEqual(metrics_by_name["peregrine_errors_total"].label_names, [])
+    self.assertEqual(
+        metrics_by_name["storage_metadata_check_total"].label_names,
+        ["dp_rank", "result"],
+    )
 
     # Verify KV cache store metrics
     self.assertEqual(

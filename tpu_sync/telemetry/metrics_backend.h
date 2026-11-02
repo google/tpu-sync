@@ -141,6 +141,9 @@ inline constexpr absl::string_view kPeregrineBytesTotal =
 inline constexpr absl::string_view kPeregrineErrorsTotal =
     "peregrine_errors_total";
 
+inline constexpr absl::string_view kStorageMetadataCheckTotal =
+    "storage_metadata_check_total";
+
 }  // namespace metric_names
 
 namespace metric_descriptions {
@@ -231,6 +234,9 @@ inline constexpr absl::string_view kPeregrineBytesTotal =
 inline constexpr absl::string_view kPeregrineErrorsTotal =
     "Cumulative total count of Peregrine transfer failures.";
 
+inline constexpr absl::string_view kStorageMetadataCheckTotal =
+    "Total secondary storage metadata existence checks by result";
+
 }  // namespace metric_descriptions
 
 namespace metric_labels {
@@ -281,6 +287,10 @@ inline constexpr absl::string_view kOutcomeStagingExhausted =
 // RPC/storage I/O, or H2D DMA transfer.
 inline constexpr absl::string_view kOutcomeTransferFailed = "transfer_failed";
 
+inline constexpr absl::string_view kResult = "result";
+inline constexpr absl::string_view kResultCacheHit = "cache_hit";
+inline constexpr absl::string_view kResultStatHit = "stat_hit";
+inline constexpr absl::string_view kResultStatMiss = "stat_miss";
 inline constexpr absl::string_view kDirectionLabels[] = {kDirection};
 inline constexpr absl::string_view kSentBytesLabels[] = {kDirection, kSrcIp,
                                                          kDstIp};
@@ -299,6 +309,8 @@ inline constexpr absl::string_view kHostNumaMemoryLabels[] = {kNumaNode,
                                                               kState};
 inline constexpr absl::string_view kStorageFilesystemBytesLabels[] = {kMount,
                                                                       kState};
+inline constexpr absl::string_view kStorageMetadataCheckLabels[] = {kDpRank,
+                                                                    kResult};
 
 }  // namespace metric_labels
 
@@ -313,6 +325,7 @@ using metric_labels::kPcieTransferLabels;
 using metric_labels::kSentBytesLabels;
 using metric_labels::kStorageBytesLabels;
 using metric_labels::kStorageFilesystemBytesLabels;
+using metric_labels::kStorageMetadataCheckLabels;
 using metric_labels::kTransferFailuresLabels;
 
 inline constexpr MetricMetadata kSentBytesTotal{
@@ -494,6 +507,12 @@ inline constexpr MetricMetadata kPeregrineErrorsTotal{
     .description = metric_descriptions::kPeregrineErrorsTotal,
     .type = MetricType::kCounter};
 
+inline constexpr MetricMetadata kStorageMetadataCheckTotal{
+    .name = metric_names::kStorageMetadataCheckTotal,
+    .description = metric_descriptions::kStorageMetadataCheckTotal,
+    .type = MetricType::kCounter,
+    .label_names = kStorageMetadataCheckLabels};
+
 inline constexpr MetricMetadata kAllMetrics[] = {
     kSentBytesTotal,
     kReceivedBytesTotal,
@@ -512,6 +531,7 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kHostMemoryBreakdownBytes,
     kHostNumaMemoryBytes,
     kStorageFilesystemBytes,
+    kStorageMetadataCheckTotal,
     // Weight Sync Metrics
     kWeightSyncSentBytesTotal,
     kWeightSyncReceivedBytesTotal,

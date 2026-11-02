@@ -127,6 +127,9 @@ class StubRecvSession : public TransferSession {
   std::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     return std::nullopt;
   }
+  std::chrono::steady_clock::time_point deadline() const override {
+    return std::chrono::steady_clock::time_point::max();
+  }
 };
 
 kv_cache::KVCacheManagerBase MakeTestBase() {

@@ -348,10 +348,12 @@ TEST(TransferSendSessionTest, SendSessionImplementsTransferSessionInterface) {
   std::unique_ptr<StagingBlockAllocator> allocator =
       CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/2);
   const auto now = std::chrono::steady_clock::now();
+  const auto expected_deadline = now + std::chrono::seconds(10);
   std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
       &base, allocator.get(), "req1", /*uuid=*/42, /*block_ids=*/{0, 1},
-      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
+      /*deadline=*/expected_deadline, /*register_start=*/now);
   TransferSession* base_session = session.get();
+  EXPECT_EQ(base_session->deadline(), expected_deadline);
 
   session->ValidateAndBeginPull({0, 1}, now);
   session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0, 1},

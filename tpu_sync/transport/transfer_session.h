@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TRANSPORT_TRANSFER_SESSION_H_
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_TRANSPORT_TRANSFER_SESSION_H_
 
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <memory>
 
@@ -106,6 +107,11 @@ class TransferSession {
   // Returns the session's active transfer plan, or absl::nullopt if this
   // session is planless or done.
   virtual absl::optional<std::shared_ptr<const TransferPlan>> plan() const = 0;
+
+  // Returns the session's completion deadline, or
+  // std::chrono::steady_clock::time_point::max() if the session tracks no
+  // deadline. Thread-safe.
+  virtual std::chrono::steady_clock::time_point deadline() const = 0;
 };
 
 }  // namespace tpu_raiden

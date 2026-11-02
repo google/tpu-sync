@@ -2659,6 +2659,9 @@ class StubTransferSession : public TransferSession {
   absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     return absl::nullopt;
   }
+  std::chrono::steady_clock::time_point deadline() const override {
+    return std::chrono::steady_clock::time_point::max();
+  }
 };
 
 TEST(KVCacheManagerTest, GetSessionDefaultsToNotFoundAndDelegatesToHook) {

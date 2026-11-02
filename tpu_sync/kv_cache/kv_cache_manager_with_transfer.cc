@@ -1000,39 +1000,19 @@ CompleteReadResult KVCacheManagerWithTransfer::CompleteReadWithDetails() {
       const uint64_t uuid = it->first;
       const std::shared_ptr<TransferSession> session = it->second;
       if (!session->IsDraining()) {
-        if (auto send =
-                std::dynamic_pointer_cast<TransferSendSession>(session)) {
-          if (send->deadline() <= now) {
-            // Past its deadline the transfer failed. One nobody pulled is
-            // reported now; one whose copies or pushes still run keeps its
-            // staging until they end, so the next transfer is never seated on
-            // memory a copy still writes.
-            send->Finish(absl::DeadlineExceededError("Send session timed out"));
-          }
-        } else if (auto reshard_send =
-                       std::dynamic_pointer_cast<ReshardSendSession>(session)) {
-          if (reshard_send->deadline() <= now) {
-            reshard_send->Finish(
-                absl::DeadlineExceededError("Pool reshard send timed out"));
-          }
-        } else if (auto recv =
-                       std::dynamic_pointer_cast<TransferReceiveSession>(
-                           session)) {
-          if (recv->IsReadyToComplete()) {
-            LOG(INFO) << "CompleteReadRaw (polling completion): req_id="
-                      << recv->req_id();
-            recv->Finish();
-          } else if (recv->deadline() <= now) {
-            recv->Finish(
-                absl::DeadlineExceededError("Receive session timed out"));
-          }
-        } else if (auto reshard_recv =
-                       std::dynamic_pointer_cast<ReshardReceiveSession>(
-                           session)) {
-          if (reshard_recv->deadline() <= now) {
-            reshard_recv->Finish(
-                absl::DeadlineExceededError("Pool reshard receive timed out"));
-          }
+        if (auto recv =
+                std::dynamic_pointer_cast<TransferReceiveSession>(session);
+            recv != nullptr && recv->IsReadyToComplete()) {
+          LOG(INFO) << "CompleteReadRaw (polling completion): req_id="
+                    << recv->req_id();
+          recv->Finish();
+        } else if (session->deadline() <= now) {
+          // Past its deadline the transfer failed. One nobody pulled is
+          // reported now; one whose copies or pushes still run keeps its
+          // staging until they end, so the next transfer is never seated on
+          // memory a copy still writes.
+          session->Finish(
+              absl::DeadlineExceededError("Transfer session timed out"));
         }
       }
       auto current = it++;

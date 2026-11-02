@@ -129,6 +129,9 @@ class StubReceiveSession : public TransferSession {
   absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     return std::nullopt;
   }
+  std::chrono::steady_clock::time_point deadline() const override {
+    return std::chrono::steady_clock::time_point::max();
+  }
   bool Done() const override {
     absl::MutexLock lock(mu_);
     return done_;
@@ -2589,6 +2592,9 @@ TEST(PeregrineRecvCompleteTest, RejectsSenderSession) {
     absl::Status Start() override { return absl::OkStatus(); }
     absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
       return std::nullopt;
+    }
+    std::chrono::steady_clock::time_point deadline() const override {
+      return std::chrono::steady_clock::time_point::max();
     }
     bool Done() const override { return false; }
     void Finish(const absl::Status& status) override {}

@@ -17,6 +17,7 @@
 // full-mirror fallbacks. Host-only manager with device-backed storages declared
 // via physical sizes (no TPU needed).
 
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -645,6 +646,9 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
     }
     absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
       return plan_;
+    }
+    std::chrono::steady_clock::time_point deadline() const override {
+      return std::chrono::steady_clock::time_point::max();
     }
 
    private:

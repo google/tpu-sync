@@ -176,7 +176,7 @@ class TransferReceiveSession
     absl::MutexLock lock(mu_);
     return (tracks_completion_ && !done_) || in_flight_ > 0;
   }
-  std::chrono::steady_clock::time_point deadline() const {
+  std::chrono::steady_clock::time_point deadline() const override {
     absl::MutexLock lock(mu_);
     return deadline_;
   }

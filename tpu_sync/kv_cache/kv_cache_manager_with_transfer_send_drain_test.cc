@@ -764,7 +764,7 @@ TEST(SendLifecycleTest, DetailsSayAnUnpulledSendTimedOutAwaitingItsPull) {
   EXPECT_THAT(completions.failed, ElementsAre("req"));
   const TransferDetails& details = completions.details["req"];
   EXPECT_EQ(details.code, "DEADLINE_EXCEEDED");
-  EXPECT_EQ(details.reason, "Send session timed out");
+  EXPECT_EQ(details.reason, "Transfer session timed out");
   EXPECT_EQ(details.phase, "await_pull");
   EXPECT_EQ(details.peer, std::nullopt);
   EXPECT_THAT(details.elapsed_ns, Optional(Ge(0)));
@@ -901,7 +901,7 @@ TEST(RecvLifecycleTest, DetailsSayAReceiveTimedOutWaitingForData) {
   EXPECT_THAT(completions.failed, ElementsAre("req"));
   const TransferDetails& details = completions.details["req"];
   EXPECT_EQ(details.code, "DEADLINE_EXCEEDED");
-  EXPECT_EQ(details.reason, "Receive session timed out");
+  EXPECT_EQ(details.reason, "Transfer session timed out");
   EXPECT_EQ(details.phase, "receive");
 }
 

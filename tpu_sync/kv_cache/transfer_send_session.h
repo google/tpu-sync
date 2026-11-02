@@ -160,7 +160,9 @@ class TransferSendSession
   }
 
   const std::string& req_id() const { return req_id_; }
-  std::chrono::steady_clock::time_point deadline() const { return deadline_; }
+  std::chrono::steady_clock::time_point deadline() const override {
+    return deadline_;
+  }
 
  private:
   // Returns the host layer buffer leased to |layer_idx|, leasing one when it

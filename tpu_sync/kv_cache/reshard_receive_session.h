@@ -101,7 +101,9 @@ class ReshardReceiveSession
   }
 
   const std::string& req_id() const { return request().req_id(); }
-  std::chrono::steady_clock::time_point deadline() const { return deadline_; }
+  std::chrono::steady_clock::time_point deadline() const override {
+    return deadline_;
+  }
   // Position in the request's sub-transfer chain (both zero for a
   // single-plan request); see StartTransferRequest.sub_plan_index.
   int32_t sub_plan_index() const { return request().sub_plan_index(); }

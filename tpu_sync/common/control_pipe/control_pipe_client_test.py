@@ -16,6 +16,7 @@
 
 import asyncio
 from concurrent import futures
+import errno
 import os
 import socket
 import struct
@@ -583,6 +584,122 @@ class ControlPipeClientTest(absltest.TestCase):
       asyncio.run(_run())
     finally:
       grpc_server.stop(grace=None)
+
+
+_REAL_SOCKET = socket.socket
+
+
+def _eafnosupport() -> OSError:
+  return OSError(errno.EAFNOSUPPORT, os.strerror(errno.EAFNOSUPPORT))
+
+
+class _NoDualStackSocket(socket.socket):
+  """IPv6 socket on a host with IPv4 disabled: dual-stack can't be enabled."""
+
+  def setsockopt(self, level, optname, value, *args):
+    if (
+        level == socket.IPPROTO_IPV6
+        and optname == socket.IPV6_V6ONLY
+        and value == 0
+    ):
+      raise _eafnosupport()
+    return super().setsockopt(level, optname, value, *args)
+
+
+def _ipv6_only_host_socket(family=socket.AF_INET, *args, **kwargs):
+  """`socket.socket` replacement modelling an IPv6-only network namespace."""
+  if family == socket.AF_INET:
+    raise _eafnosupport()
+  if family == socket.AF_INET6:
+    return _NoDualStackSocket(family, *args, **kwargs)
+  return _REAL_SOCKET(family, *args, **kwargs)
+
+
+class ServerSocketFallbackTest(absltest.TestCase):
+
+  def test_ipv6_only_host_serves_on_ipv6_only_socket(self) -> None:
+    # Exactly the failure seen on IPv6-only Borg tasks:
+    # setsockopt(IPV6_V6ONLY, 0) and socket(AF_INET) both raise EAFNOSUPPORT.
+    with mock.patch.object(
+        control_pipe_client.socket, "socket", _ipv6_only_host_socket
+    ):
+      server = control_pipe_client.ControlPipeServer(
+          0,
+          lambda _: raiden_service_pb2.ControlResponse(
+              success=True, message="V6_OK"
+          ).SerializeToString(),
+      )
+    self.addCleanup(server.stop)
+    sock = server._sock
+    self.assertEqual(sock.family, socket.AF_INET6)
+    self.assertEqual(
+        sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY), 1
+    )
+    self.assertGreater(server.port, 0)
+
+    server.start()
+    client = control_pipe_client.ControlPipeClient(
+        backend=control_pipe_client.ControlPipeBackendType.TCP
+    )
+    self.addCleanup(client.close)
+    resp = client.call_sync(
+        f"[::1]:{server.port}",
+        raiden_service_pb2.ControlRequest(
+            command=raiden_service_pb2.ControlRequest.COMMAND_SHUTDOWN
+        ),
+        raiden_service_pb2.ControlResponse,
+        timeout=5.0,
+    )
+    self.assertTrue(resp.success)
+    self.assertEqual(resp.message, "V6_OK")
+
+  def test_default_host_keeps_dual_stack(self) -> None:
+    # Only meaningful where dual-stack is available; IPv6-only hosts correctly
+    # use an IPv6-only socket and IPv4-only hosts an IPv4 one.
+    if not socket.has_dualstack_ipv6():
+      self.skipTest("host has no dual-stack IPv6")
+    server = control_pipe_client.ControlPipeServer(0, lambda b: b)
+    self.addCleanup(server.stop)
+    self.assertEqual(server._sock.family, socket.AF_INET6)
+    self.assertEqual(
+        server._sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY), 0
+    )
+
+  def test_ipv6_only_host_reports_port_in_use(self) -> None:
+    # EADDRINUSE is raised as is, not masked by an IPv4 attempt (which would
+    # fail with EAFNOSUPPORT on this host).
+    holder = socket.create_server(("::", 0), family=socket.AF_INET6)
+    self.addCleanup(holder.close)
+    port = holder.getsockname()[1]
+    with mock.patch.object(
+        control_pipe_client.socket, "socket", _ipv6_only_host_socket
+    ):
+      with self.assertRaises(OSError) as cm:
+        control_pipe_client.ControlPipeServer(port, lambda b: b)
+    self.assertEqual(cm.exception.errno, errno.EADDRINUSE)
+
+  def test_host_without_ipv6_serves_on_ipv4(self) -> None:
+    def ipv4_only_host_socket(family=socket.AF_INET, *args, **kwargs):
+      if family == socket.AF_INET6:
+        raise _eafnosupport()
+      return _REAL_SOCKET(family, *args, **kwargs)
+
+    with mock.patch.object(
+        control_pipe_client.socket, "socket", ipv4_only_host_socket
+    ):
+      server = control_pipe_client.ControlPipeServer(0, lambda b: b)
+    self.addCleanup(server.stop)
+    self.assertEqual(server._sock.family, socket.AF_INET)
+    self.assertGreater(server.port, 0)
+
+  def test_all_attempts_failing_raises(self) -> None:
+    def no_sockets(*args, **kwargs):
+      del args, kwargs
+      raise _eafnosupport()
+
+    with mock.patch.object(control_pipe_client.socket, "socket", no_sockets):
+      with self.assertRaisesRegex(OSError, "Address family not supported"):
+        control_pipe_client.ControlPipeServer(0, lambda b: b)
 
 
 if __name__ == "__main__":

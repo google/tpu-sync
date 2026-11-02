@@ -18,6 +18,7 @@ import asyncio
 import collections
 from concurrent import futures
 import enum
+import errno
 import os
 import socket
 import struct
@@ -55,6 +56,11 @@ DEFAULT_MAX_CACHED_GRPC_STUBS = 100000
 DEFAULT_GRPC_KEEPALIVE_TIME_MS = 60000
 DEFAULT_GRPC_KEEPALIVE_TIMEOUT_MS = 20000
 _HEADER_STRUCT = struct.Struct("!4sI")
+# Errors from creating or binding an IPv6 socket that mean IPv6 is unusable on
+# this host, so the server falls back to IPv4.
+_IPV6_UNAVAILABLE_ERRNOS = frozenset(
+    (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT, errno.EADDRNOTAVAIL)
+)
 _GRPC_CHANNEL_OPTIONS = (
     ("grpc.max_send_message_length", DEFAULT_MAX_FRAME_BYTES),
     ("grpc.max_receive_message_length", DEFAULT_MAX_FRAME_BYTES),
@@ -535,21 +541,40 @@ class ControlPipeClient:
         self._zmq_aio_ctx = None
 
 
-def _create_dual_stack_server_socket(port: int) -> socket.socket:
-  """Creates an IPv6 dual-stack or IPv4 listening TCP socket."""
+def _create_server_socket(port: int) -> socket.socket:
+  """Creates a listening TCP socket on all interfaces.
+
+  Tries, in order:
+    1. IPv6 dual-stack on ("::", port): serves IPv4 and IPv6.
+    2. IPv6-only on ("::", port): for hosts or network namespaces with IPv4
+       disabled, where enabling dual-stack fails with EAFNOSUPPORT (e.g.
+       IPv6-only Borg tasks).
+    3. IPv4 on ("0.0.0.0", port): for hosts without IPv6.
+
+  Args:
+    port: Port to bind; 0 picks a free port.
+
+  Returns:
+    The bound, listening socket.
+
+  Raises:
+    OSError: If no socket can be created and bound. Errors other than "IPv6 is
+      unavailable" (e.g. EADDRINUSE on a fixed port) are raised right away
+      instead of falling back to IPv4, so the real cause is reported.
+  """
+  if socket.has_dualstack_ipv6():
+    return socket.create_server(
+        ("::", port), family=socket.AF_INET6, dualstack_ipv6=True, backlog=128
+    )
   try:
-    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("::", port))
-    sock.listen(128)
-    return sock
-  except OSError:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("0.0.0.0", port))
-    sock.listen(128)
-    return sock
+    # Sets IPV6_V6ONLY=1.
+    return socket.create_server(
+        ("::", port), family=socket.AF_INET6, backlog=128
+    )
+  except OSError as e:
+    if e.errno not in _IPV6_UNAVAILABLE_ERRNOS:
+      raise
+    return socket.create_server(("0.0.0.0", port), backlog=128)
 
 
 class ControlPipeServer:
@@ -563,7 +588,7 @@ class ControlPipeServer:
   ) -> None:
     self._handler = handler
     self._max_frame_bytes = max_frame_bytes
-    self._sock = _create_dual_stack_server_socket(port)
+    self._sock = _create_server_socket(port)
     self._port = int(self._sock.getsockname()[1]) if port == 0 else port
     self._stopped = False
     self._thread: Optional[threading.Thread] = None

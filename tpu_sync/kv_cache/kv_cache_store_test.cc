@@ -7126,15 +7126,29 @@ struct StorageRecallTransferManager
   absl::Mutex mu;
   bool fail_recall = false;
   bool fail_recall_not_found = false;
+  // Stall every host-to-device copy (`h2d_delay`) or storage read
+  // (`recall_delay`) by this long before it is issued. Set from the test
+  // thread, read on the worker service thread.
+  absl::Duration h2d_delay ABSL_GUARDED_BY(mu) = absl::ZeroDuration();
+  absl::Duration recall_delay ABSL_GUARDED_BY(mu) = absl::ZeroDuration();
   std::vector<std::vector<int64_t>> h2d_dst_batches ABSL_GUARDED_BY(mu);
+
+  void SetDelays(absl::Duration h2d, absl::Duration recall) {
+    absl::MutexLock lock(mu);
+    h2d_delay = h2d;
+    recall_delay = recall;
+  }
 
   Result H2d(const std::vector<int64_t>& src_offsets,
              const std::vector<int64_t>& dst_offsets,
              const std::vector<int64_t>& copy_sizes) {
+    absl::Duration delay;
     {
       absl::MutexLock lock(mu);
       h2d_dst_batches.push_back(dst_offsets);
+      delay = h2d_delay;
     }
+    absl::SleepFor(delay);
     return Base::H2d(src_offsets, dst_offsets, copy_sizes);
   }
 
@@ -7143,6 +7157,12 @@ struct StorageRecallTransferManager
       const std::vector<backends::BlockKey>& block_keys,
       const std::vector<int64_t>& src_host_block_ids,
       const std::vector<int64_t>& dst_device_block_ids) {
+    absl::Duration delay;
+    {
+      absl::MutexLock lock(mu);
+      delay = recall_delay;
+    }
+    absl::SleepFor(delay);
     if (fail_recall_not_found) {
       ++h2d_read_from_backend_calls;
       return raiden::PjRtCopyFuture(
@@ -8196,8 +8216,12 @@ class KVRecallBlocksMetricsTest : public ReadRemoteTest {
     metrics_reset_.reset();
   }
 
+  // Expects one `kv_recall_blocks_total` increment of `count` and one
+  // `kv_recall_duration_ms` sample in [`min_duration_ms`, 60 s), both labeled
+  // with (`dp_rank`, `tier`, `outcome`).
   void ExpectRecallBlocks(absl::string_view tier, absl::string_view outcome,
-                          uint64_t count, absl::string_view dp_rank = "0") {
+                          uint64_t count, absl::string_view dp_rank = "0",
+                          double min_duration_ms = 0) {
     const telemetry::MetricLabel expected_labels[] = {
         {telemetry::metric_labels::kDpRank, dp_rank},
         {telemetry::metric_labels::kTier, tier},
@@ -8212,6 +8236,21 @@ class KVRecallBlocksMetricsTest : public ReadRemoteTest {
                     testing::Ne(telemetry::metric_names::kKvRecallBlocksTotal),
                     testing::_, testing::_))
         .Times(testing::AnyNumber());
+    // Other histograms are not under test here.
+    EXPECT_CALL(*mock_metrics_,
+                ObserveHistogram(
+                    testing::Ne(telemetry::metric_names::kKvRecallDurationMs),
+                    testing::_, testing::_))
+        .Times(testing::AnyNumber());
+    // Exactly one duration sample per counted batch, with the same labels.
+    EXPECT_CALL(*mock_metrics_,
+                ObserveHistogram(telemetry::metric_names::kKvRecallDurationMs,
+                                 UnorderedElementsAreArray(expected_labels),
+                                 // The upper bound catches a start time that
+                                 // was never set (a default `time_point` reads
+                                 // as time since boot).
+                                 testing::AllOf(testing::Ge(min_duration_ms),
+                                                testing::Lt(60'000.0))));
   }
 
   StagingExhaustionGuard ExhaustStagingBlocks() {
@@ -8332,6 +8371,62 @@ TEST_F(KVRecallBlocksMetricsTest, SharedStorageRecallOutcomes) {
                                     {StorageSlice(), StorageSlice()}, {4, 5}));
   WaitForLoadSettled(*store_, 2);
   mgr_.fail_recall = false;
+}
+
+// Each duration sample spans its tier's whole recall, not just the dispatch:
+// stalling the H2D copy (`local_dram`, `remote_dram`) or the storage read
+// (`shared_storage`) by `kDelay` yields a sample of at least `kDelay`, for both
+// successful and failed recalls across all three tiers.
+TEST_F(KVRecallBlocksMetricsTest, DurationSpansWholeRecallPerTier) {
+  constexpr absl::Duration kDelay = absl::Milliseconds(50);
+  const double delay_ms = absl::ToDoubleMilliseconds(kDelay);
+  MakeStore({.peer_hashes = {"r0"}});
+
+  EXPECT_CALL(*mock_metrics_, IncrementCounter).Times(0);
+  EXPECT_CALL(*mock_metrics_, ObserveHistogram).Times(0);
+  ABSL_ASSERT_OK(store_->Load(/*block_hashes=*/{}, /*device_block_ids=*/{}));
+  testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+  for (bool fail : {false, true}) {
+    SCOPED_TRACE(fail);
+    const absl::string_view outcome =
+        fail ? telemetry::metric_labels::kOutcomeTransferFailed
+             : telemetry::metric_labels::kOutcomeOk;
+    const auto expect_slow = [&](absl::string_view tier, uint64_t count) {
+      ExpectRecallBlocks(tier, outcome, count, /*dp_rank=*/"0",
+                         /*min_duration_ms=*/delay_ms);
+    };
+
+    // local_dram & remote_dram: stall the H2D copy.
+    mgr_.SetDelays(/*h2d=*/kDelay, /*recall=*/absl::ZeroDuration());
+    mgr_.fail_transfers = fail;
+    const std::string local_hash = fail ? "l1" : "l0";
+    AddPinnedLocal({local_hash});
+    expect_slow(telemetry::metric_labels::kTierLocalDram, 1);
+    ABSL_ASSERT_OK(store_->Load({local_hash}, {2}));
+    WaitForLoadSettled(*store_, 1);
+    if (fail) {
+      store_->Release({local_hash});
+    }
+    testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+
+    expect_slow(telemetry::metric_labels::kTierRemoteDram, 1);
+    ABSL_ASSERT_OK(store_->ReadRemote({"r0"}, {PeerSlice(peer_a_, 0)}, {3}));
+    WaitForLoadSettled(*store_, 1);
+    testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+    mgr_.fail_transfers = false;
+
+    // shared_storage: stall the storage read.
+    mgr_.SetDelays(/*h2d=*/absl::ZeroDuration(), /*recall=*/kDelay);
+    mgr_.fail_recall = fail;
+    expect_slow(telemetry::metric_labels::kTierSharedStorage, 1);
+    ABSL_ASSERT_OK(
+        store_->ReadRemote({fail ? "s1" : "s0"}, {StorageSlice()}, {4}));
+    WaitForLoadSettled(*store_, 1);
+    mgr_.fail_recall = false;
+    testing::Mock::VerifyAndClearExpectations(mock_metrics_);
+  }
+  mgr_.SetDelays(absl::ZeroDuration(), absl::ZeroDuration());
 }
 
 TEST_F(KVRecallBlocksMetricsTest, DpRankAttribution) {

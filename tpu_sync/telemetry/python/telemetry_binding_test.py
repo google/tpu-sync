@@ -270,7 +270,7 @@ class TelemetryBindingTest(absltest.TestCase):
     )
 
     # Verify weight sync metrics
-    self.assertLen(metrics, 37)
+    self.assertLen(metrics, 38)
     self.assertEqual(
         metrics_by_name["weight_sync_sent_bytes_total"].label_names, []
     )
@@ -337,6 +337,10 @@ class TelemetryBindingTest(absltest.TestCase):
         metrics_by_name["kv_evicted_blocks_total"].label_names,
         ["dp_rank"],
     )
+    self.assertEqual(
+        metrics_by_name["kv_recall_duration_ms"].label_names,
+        ["dp_rank", "tier", "outcome"],
+    )
 
   def test_increment_counter_and_observe_in_buffered_backend(self):
     telemetry_ext.configure_telemetry(["buffered"])
@@ -348,6 +352,11 @@ class TelemetryBindingTest(absltest.TestCase):
     telemetry_ext.set_gauge("weight_sync_buffer_allocated_bytes", 1048576.0)
     telemetry_ext.observe_histogram(
         "weight_sync_p2p_transfer_time_ms", 12.5, {"direction": "push"}
+    )
+    telemetry_ext.observe_histogram(
+        "kv_recall_duration_ms",
+        4.5,
+        {"dp_rank": "0", "tier": "local_dram", "outcome": "ok"},
     )
 
     samples = telemetry_ext.get_and_reset_metric_samples()
@@ -375,6 +384,12 @@ class TelemetryBindingTest(absltest.TestCase):
             'tpu_raiden_weight_sync_p2p_transfer_time_ms{direction="push"}'
         ],
         [12.5],
+    )
+    self.assertEqual(
+        samples[
+            'tpu_raiden_kv_recall_duration_ms{dp_rank="0",outcome="ok",tier="local_dram"}'
+        ],
+        [4.5],
     )
 
     samples_after = telemetry_ext.get_and_reset_metric_samples()

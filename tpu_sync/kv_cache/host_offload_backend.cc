@@ -94,21 +94,24 @@ bool IsHostResidentStatus(BlockStatus status) {
   return status == BlockStatus::HOST || status == BlockStatus::HOST_AND_HBM;
 }
 
-// Settle a recall batch: count `block_hashes` in `kv_recall_blocks_total`
-// under `tier` (outcome `ok` for Done), then mark them in `load_tracker`.
+// Settle a recall batch: record `block_hashes` in `kv_recall_blocks_total`
+// and `kv_recall_duration_ms` under `tier` (outcome `ok` for Done), then mark
+// them in `load_tracker`.
 void MarkRecallDone(BlockTracker* absl_nonnull load_tracker,
                     absl::string_view dp_rank, absl::string_view tier,
-                    absl::Span<const std::string> block_hashes) {
-  IncrementKvRecallBlocks(dp_rank, tier, telemetry::metric_labels::kOutcomeOk,
-                          block_hashes.size());
+                    absl::Span<const std::string> block_hashes,
+                    RecallClock::time_point start_ts) {
+  RecordKvRecallMetrics(dp_rank, tier, telemetry::metric_labels::kOutcomeOk,
+                        block_hashes.size(), start_ts);
   load_tracker->MarkDone(block_hashes);
 }
 
 void MarkRecallFailed(BlockTracker* absl_nonnull load_tracker,
                       absl::string_view dp_rank, absl::string_view tier,
                       absl::string_view outcome,
-                      absl::Span<const std::string> block_hashes) {
-  IncrementKvRecallBlocks(dp_rank, tier, outcome, block_hashes.size());
+                      absl::Span<const std::string> block_hashes,
+                      RecallClock::time_point start_ts) {
+  RecordKvRecallMetrics(dp_rank, tier, outcome, block_hashes.size(), start_ts);
   load_tracker->MarkFailed(block_hashes);
 }
 
@@ -1124,11 +1127,12 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
     absl::Span<const int32_t> device_block_ids,
     BlockTracker* absl_nonnull load_tracker) {
   CHECK(load_tracker != nullptr);
+  const RecallClock::time_point start_ts = RecallClock::now();
   const auto fail_transfer = [&](absl::string_view outcome,
                                  absl::Status status) {
     MarkRecallFailed(load_tracker, dp_rank_str_,
                      telemetry::metric_labels::kTierRemoteDram, outcome,
-                     block_hashes);
+                     block_hashes, start_ts);
     return tsl::Future<>(std::move(status));
   };
   auto client = GetKVCacheStoreClient(remote_id);
@@ -1156,7 +1160,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
                         client_raiden_id, client_worker_endpoints);
 
   fetch_future.OnReady(
-      [this, lifetime = lifetime_, remote_id, dst_host_block_ids,
+      [this, lifetime = lifetime_, remote_id, dst_host_block_ids, start_ts,
        hashes =
            std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
        dev_ids_vec = std::vector<int32_t>(device_block_ids.begin(),
@@ -1187,7 +1191,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
                     : telemetry::metric_labels::kOutcomeTransferFailed;
             MarkRecallFailed(load_tracker, dp_rank_str_,
                              telemetry::metric_labels::kTierRemoteDram, outcome,
-                             hashes);
+                             hashes, start_ts);
             load_promise.Set(fetch_response.status());
             return;
           }
@@ -1205,7 +1209,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
             MarkRecallFailed(load_tracker, dp_rank_str_,
                              telemetry::metric_labels::kTierRemoteDram,
                              telemetry::metric_labels::kOutcomeTransferFailed,
-                             hashes);
+                             hashes, start_ts);
             load_promise.Set(absl::InternalError(err_msg));
             return;
           }
@@ -1230,7 +1234,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
               raiden_controller_->TransferBuffers(src_buffers, dst_buffers);
         }
 
-        h2d_future.OnReady([this, lifetime, dst_host_block_ids,
+        h2d_future.OnReady([this, lifetime, dst_host_block_ids, start_ts,
                             hashes = std::move(hashes), load_tracker,
                             load_promise = std::move(load_promise)](
                                absl::Status status) mutable {
@@ -1242,12 +1246,13 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
           (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
           if (status.ok()) {
             MarkRecallDone(load_tracker, dp_rank_str_,
-                           telemetry::metric_labels::kTierRemoteDram, hashes);
+                           telemetry::metric_labels::kTierRemoteDram, hashes,
+                           start_ts);
           } else {
             MarkRecallFailed(load_tracker, dp_rank_str_,
                              telemetry::metric_labels::kTierRemoteDram,
                              telemetry::metric_labels::kOutcomeTransferFailed,
-                             hashes);
+                             hashes, start_ts);
           }
           load_promise.Set(status);
         });
@@ -1262,10 +1267,11 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
     absl::Span<const RaidenBlockId> slices,
     BlockTracker* absl_nonnull load_tracker) {
   CHECK(load_tracker != nullptr);
+  const RecallClock::time_point start_ts = RecallClock::now();
   const auto fail_recall = [&](absl::Status status) {
-    MarkRecallFailed(load_tracker, dp_rank_str_,
-                     telemetry::metric_labels::kTierLocalDram,
-                     telemetry::metric_labels::kOutcomeNotFound, block_hashes);
+    MarkRecallFailed(
+        load_tracker, dp_rank_str_, telemetry::metric_labels::kTierLocalDram,
+        telemetry::metric_labels::kOutcomeNotFound, block_hashes, start_ts);
     return tsl::Future<>(std::move(status));
   };
   std::vector<int64_t> src_host_block_ids;
@@ -1328,7 +1334,7 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
       raiden_controller_->TransferBuffers(src_buffers, dst_buffers);
 
   auto [promise, future] = tsl::MakePromise<>();
-  h2d_future.OnReady([this, lifetime = lifetime_,
+  h2d_future.OnReady([this, lifetime = lifetime_, start_ts,
                       hashes = std::vector<std::string>(block_hashes.begin(),
                                                         block_hashes.end()),
                       dev_ids = std::vector<int32_t>(device_block_ids.begin(),
@@ -1363,12 +1369,13 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
         Release(update_hashes);
       }
       MarkRecallDone(load_tracker, dp_rank_str_,
-                     telemetry::metric_labels::kTierLocalDram, hashes);
+                     telemetry::metric_labels::kTierLocalDram, hashes,
+                     start_ts);
       promise.Set(absl::OkStatus());
     } else {
       MarkRecallFailed(
           load_tracker, dp_rank_str_, telemetry::metric_labels::kTierLocalDram,
-          telemetry::metric_labels::kOutcomeTransferFailed, hashes);
+          telemetry::metric_labels::kOutcomeTransferFailed, hashes, start_ts);
       promise.Set(status);
     }
   });

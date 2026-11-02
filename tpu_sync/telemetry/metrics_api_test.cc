@@ -49,6 +49,7 @@ namespace {
 using ::absl_testing::StatusIs;
 using ::testing::_;
 using ::testing::ElementsAre;
+using testing::ElementsAreArray;
 using ::testing::Eq;
 using ::testing::HasSubstr;
 using ::testing::IsEmpty;
@@ -555,6 +556,20 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(metric_metadata::kKvEvictedBlocksTotal.label_names,
               ElementsAre(metric_labels::kDpRank));
 
+  EXPECT_EQ(metric_names::kKvRecallDurationMs, "kv_recall_duration_ms");
+  EXPECT_EQ(metric_descriptions::kKvRecallDurationMs,
+            "Duration in milliseconds of each KV cache recall batch, from "
+            "tier dispatch until it settles, across tiers and outcomes.");
+  EXPECT_EQ(metric_metadata::kKvRecallDurationMs.name, "kv_recall_duration_ms");
+  EXPECT_EQ(metric_metadata::kKvRecallDurationMs.description,
+            metric_descriptions::kKvRecallDurationMs);
+  EXPECT_EQ(metric_metadata::kKvRecallDurationMs.type, MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kKvRecallDurationMs.buckets,
+              ElementsAreArray(kDefaultHistogramBuckets));
+  EXPECT_THAT(metric_metadata::kKvRecallDurationMs.label_names,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
+                          metric_labels::kOutcome));
+
   // Storage Bytes Labels
   EXPECT_THAT(
       metric_labels::kStorageBytesLabels,
@@ -596,6 +611,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kKvRecallBlocksTotal,
           metric_metadata::kKvSaveBlocksTotal,
           metric_metadata::kKvEvictedBlocksTotal,
+          metric_metadata::kKvRecallDurationMs,
           metric_metadata::kStorageBytesTotal,
           metric_metadata::kHostMemoryBreakdownBytes,
           metric_metadata::kHostNumaMemoryBytes,

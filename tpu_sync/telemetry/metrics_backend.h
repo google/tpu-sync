@@ -110,6 +110,8 @@ inline constexpr absl::string_view kKvRecallBlocksTotal =
 inline constexpr absl::string_view kKvSaveBlocksTotal = "kv_save_blocks_total";
 inline constexpr absl::string_view kKvEvictedBlocksTotal =
     "kv_evicted_blocks_total";
+inline constexpr absl::string_view kKvRecallDurationMs =
+    "kv_recall_duration_ms";
 
 inline constexpr absl::string_view kWeightSyncSentBytesTotal =
     "weight_sync_sent_bytes_total";
@@ -187,6 +189,22 @@ inline constexpr absl::string_view kKvSaveBlocksTotal =
     "outcomes.";
 inline constexpr absl::string_view kKvEvictedBlocksTotal =
     "Cumulative count of KV cache blocks evicted from the host DRAM pool.";
+
+// Elapsed time (monotonic clock) of each KV cache recall batch, with the same
+// labels as `kv_recall_blocks_total`. One sample per batch per tier, not per
+// block, so `_count` counts batches while `kv_recall_blocks_total` counts
+// blocks. Recorded where the batch settles with its `outcome`. The clock starts
+// when the store begins the tier's recall: entry to
+// `HostOffloadBackend::LoadLocalHostBlocks` / `LoadRemoteBlocks` for
+// `local_dram` / `remote_dram`, entry to
+// `KVCacheStore::LoadFromSecondaryBackend` for `shared_storage`, and local
+// lookup/pin validation in `KVCacheStore::Load` for batches the store rejects
+// before dispatch (`local_dram` `not_found`). Store-level validation, the store
+// mutex wait and, in a mixed peer + storage batch, the peer group's synchronous
+// dispatch are therefore not included.
+inline constexpr absl::string_view kKvRecallDurationMs =
+    "Duration in milliseconds of each KV cache recall batch, from tier "
+    "dispatch until it settles, across tiers and outcomes.";
 
 inline constexpr absl::string_view kH2dBytesTotal =
     "Cumulative bytes requested for Host DRAM to Device HBM transfers that "
@@ -450,6 +468,12 @@ inline constexpr MetricMetadata kKvEvictedBlocksTotal{
     .type = MetricType::kCounter,
     .label_names = kKvEvictedBlocksLabels};
 
+inline constexpr MetricMetadata kKvRecallDurationMs{
+    .name = metric_names::kKvRecallDurationMs,
+    .description = metric_descriptions::kKvRecallDurationMs,
+    .type = MetricType::kHistogram,
+    .label_names = kKvRecallBlocksLabels};
+
 inline constexpr MetricMetadata kStorageBytesTotal{
     .name = metric_names::kStorageBytesTotal,
     .description = metric_descriptions::kStorageBytesTotal,
@@ -581,6 +605,7 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kKvRecallBlocksTotal,
     kKvSaveBlocksTotal,
     kKvEvictedBlocksTotal,
+    kKvRecallDurationMs,
     kStorageBytesTotal,
     kHostMemoryBreakdownBytes,
     kHostNumaMemoryBytes,

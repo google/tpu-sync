@@ -215,6 +215,38 @@ absl::StatusOr<BackendConfig> ResolveSecondaryBackendTopology(
   return sec_cfg;
 }
 
+// Settle a recall batch: record `block_hashes` in `kv_recall_blocks_total`
+// and `kv_recall_duration_ms` under `tier` (outcome `ok` for Done), then mark
+// them in `load_tracker`.
+void MarkRecallDone(BlockTracker& load_tracker, absl::string_view dp_rank,
+                    absl::string_view tier,
+                    absl::Span<const std::string> block_hashes,
+                    RecallClock::time_point start_ts) {
+  RecordKvRecallMetrics(dp_rank, tier, telemetry::metric_labels::kOutcomeOk,
+                        block_hashes.size(), start_ts);
+  load_tracker.MarkDone(block_hashes);
+}
+
+void MarkRecallFailed(BlockTracker& load_tracker, absl::string_view dp_rank,
+                      absl::string_view tier, absl::string_view outcome,
+                      absl::Span<const std::string> block_hashes,
+                      RecallClock::time_point start_ts) {
+  RecordKvRecallMetrics(dp_rank, tier, outcome, block_hashes.size(), start_ts);
+  load_tracker.MarkFailed(block_hashes);
+}
+
+// Records all `count` blocks of a rejected local-DRAM Load batch as
+// `not_found` (the caller must recompute the whole batch) and returns
+// `status`.
+absl::Status FailLocalLoadNotFound(absl::string_view dp_rank, size_t count,
+                                   RecallClock::time_point start_ts,
+                                   absl::Status status) {
+  RecordKvRecallMetrics(dp_rank, telemetry::metric_labels::kTierLocalDram,
+                        telemetry::metric_labels::kOutcomeNotFound, count,
+                        start_ts);
+  return status;
+}
+
 // Settle a save batch: count `block_hashes` in `kv_save_blocks_total`
 // under `tier` (`ok` for Done, `failed` for Failed), then mark them in
 // `save_tracker`.
@@ -816,29 +848,6 @@ KVCacheStore::KVCacheStore(
   }
 }
 
-void KVCacheStore::MarkRecallDone(absl::string_view tier,
-                                  absl::Span<const std::string> block_hashes) {
-  IncrementKvRecallBlocks(dp_rank_str_, tier,
-                          telemetry::metric_labels::kOutcomeOk,
-                          block_hashes.size());
-  load_tracker_.MarkDone(block_hashes);
-}
-
-void KVCacheStore::MarkRecallFailed(
-    absl::string_view tier, absl::string_view outcome,
-    absl::Span<const std::string> block_hashes) {
-  IncrementKvRecallBlocks(dp_rank_str_, tier, outcome, block_hashes.size());
-  load_tracker_.MarkFailed(block_hashes);
-}
-
-absl::Status KVCacheStore::FailLocalLoadNotFound(size_t count,
-                                                 absl::Status status) const {
-  IncrementKvRecallBlocks(dp_rank_str_,
-                          telemetry::metric_labels::kTierLocalDram,
-                          telemetry::metric_labels::kOutcomeNotFound, count);
-  return status;
-}
-
 absl::Status KVCacheStore::SetRaidenController(
     tpu_raiden::controller::RaidenController* controller) {
   // Runs first so that store_server_ip_ decides the bind address: StartServer
@@ -1421,10 +1430,11 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
 
   {
     absl::MutexLock lock(mutex_);
+    const RecallClock::time_point start_ts = RecallClock::now();
     ABSL_ASSIGN_OR_RETURN(const auto& slices, backend()->Lookup(block_hashes));
     if (slices.size() < block_hashes.size()) {
       return FailLocalLoadNotFound(
-          block_hashes.size(),
+          dp_rank_str_, block_hashes.size(), start_ts,
           absl::NotFoundError(absl::StrCat("Block hash not found: ",
                                            block_hashes[slices.size()])));
     }
@@ -1442,7 +1452,8 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
             "a peer."));
       }
       if (backend()->GetPinCount(hash) <= 0) {
-        return FailLocalLoadNotFound(block_hashes.size(),
+        return FailLocalLoadNotFound(dp_rank_str_, block_hashes.size(),
+                                     start_ts,
                                      absl::FailedPreconditionError(absl::StrCat(
                                          "Block is not pinned: ", hash)));
       }
@@ -1452,12 +1463,14 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
       }
       if (existing.status != BlockStatus::HOST &&
           existing.status != BlockStatus::HOST_AND_HBM) {
-        return FailLocalLoadNotFound(block_hashes.size(),
+        return FailLocalLoadNotFound(dp_rank_str_, block_hashes.size(),
+                                     start_ts,
                                      absl::FailedPreconditionError(absl::StrCat(
                                          "Block is not on host: ", hash)));
       }
       if (existing.host_block_id == -1) {
-        return FailLocalLoadNotFound(block_hashes.size(),
+        return FailLocalLoadNotFound(dp_rank_str_, block_hashes.size(),
+                                     start_ts,
                                      absl::FailedPreconditionError(absl::StrCat(
                                          "Block host_block_id is -1: ", hash)));
       }
@@ -1485,6 +1498,7 @@ void KVCacheStore::LoadFromSecondaryBackend(
   // SHARED_STORAGE block is recalled from backends_[1], regardless of the
   // backend name carried in its slice.
   const std::shared_ptr<KVCacheStoreBackend>& secondary_backend = backends_[1];
+  const RecallClock::time_point start_ts = RecallClock::now();
 
   // Host staging blocks for the recall. May evict UNPINNED entries if short,
   // never pinned ones. Failure is reported through the tracker only, the same
@@ -1495,9 +1509,10 @@ void KVCacheStore::LoadFromSecondaryBackend(
     LOG(WARNING) << "No host staging blocks for storage recall: "
                  << allocated.status();
     absl::MutexLock lock(mutex_);
-    MarkRecallFailed(telemetry::metric_labels::kTierSharedStorage,
+    MarkRecallFailed(load_tracker_, dp_rank_str_,
+                     telemetry::metric_labels::kTierSharedStorage,
                      telemetry::metric_labels::kOutcomeStagingExhausted,
-                     block_hashes);
+                     block_hashes, start_ts);
     return;
   }
   const std::vector<int>& staging_host_block_ids = *allocated;
@@ -1521,7 +1536,7 @@ void KVCacheStore::LoadFromSecondaryBackend(
   // touch of it goes through the lifetime fence below.
   future.OnReady(
       [lifetime = lifetime_, host_ram_backend = backend(), secondary_backend,
-       raiden_id = raiden_id_,
+       raiden_id = raiden_id_, start_ts,
        block_hashes =
            std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
        staging_host_block_ids = std::vector<int>(staging_host_block_ids.begin(),
@@ -1541,12 +1556,13 @@ void KVCacheStore::LoadFromSecondaryBackend(
           absl::MutexLock lock(lifetime->mu);
           if (KVCacheStore* self = lifetime->store; self != nullptr) {
             self->DeallocateBlockIds(staging_host_block_ids);
-            self->MarkRecallFailed(
+            MarkRecallFailed(
+                self->load_tracker_, self->dp_rank_str_,
                 telemetry::metric_labels::kTierSharedStorage,
                 absl::IsNotFound(status)
                     ? telemetry::metric_labels::kOutcomeNotFound
                     : telemetry::metric_labels::kOutcomeTransferFailed,
-                block_hashes);
+                block_hashes, start_ts);
           }
           return;
         }
@@ -1582,8 +1598,9 @@ void KVCacheStore::LoadFromSecondaryBackend(
           if (!to_return.empty()) self->DeallocateBlockIds(to_return);
           // MarkDone, not MarkFailed: the transfer landed all N blocks in HBM,
           // so the Load succeeded even if the host-RAM tier refused a copy.
-          self->MarkRecallDone(telemetry::metric_labels::kTierSharedStorage,
-                               block_hashes);
+          MarkRecallDone(self->load_tracker_, self->dp_rank_str_,
+                         telemetry::metric_labels::kTierSharedStorage,
+                         block_hashes, start_ts);
         }
       });
 }
@@ -1629,6 +1646,7 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
   // Local path: every slice is HOST / HOST_AND_HBM.
   {
     absl::MutexLock lock(mutex_);
+    const RecallClock::time_point start_ts = RecallClock::now();
     for (size_t i = 0; i < slices.size(); ++i) {
       const auto& hash = block_hashes[i];
       const auto& existing = slices[i];
@@ -1640,7 +1658,8 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
       // to exist. The no-slices form has always required it; this form did
       // not, which left one signature hiding two different pin contracts.
       if (backend()->GetPinCount(hash) <= 0) {
-        return FailLocalLoadNotFound(block_hashes.size(),
+        return FailLocalLoadNotFound(dp_rank_str_, block_hashes.size(),
+                                     start_ts,
                                      absl::FailedPreconditionError(absl::StrCat(
                                          "Block is not pinned: ", hash)));
       }
@@ -1650,7 +1669,8 @@ absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,
             absl::StrCat("Block is not on host: ", hash));
       }
       if (existing.host_block_id == -1) {
-        return FailLocalLoadNotFound(block_hashes.size(),
+        return FailLocalLoadNotFound(dp_rank_str_, block_hashes.size(),
+                                     start_ts,
                                      absl::FailedPreconditionError(absl::StrCat(
                                          "Block host_block_id is -1: ", hash)));
       }

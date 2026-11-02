@@ -504,7 +504,12 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_labels::kOutcomeNotFound, "not_found");
   EXPECT_EQ(metric_labels::kOutcomeStagingExhausted, "staging_exhausted");
   EXPECT_EQ(metric_labels::kOutcomeTransferFailed, "transfer_failed");
+  EXPECT_EQ(metric_labels::kOutcomeRejected, "rejected");
+  EXPECT_EQ(metric_labels::kOutcomeFailed, "failed");
   EXPECT_THAT(metric_labels::kKvRecallBlocksLabels,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
+                          metric_labels::kOutcome));
+  EXPECT_THAT(metric_labels::kKvSaveBlocksLabels,
               ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
                           metric_labels::kOutcome));
 
@@ -519,6 +524,19 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
             "and outcomes.");
   EXPECT_EQ(metric_metadata::kKvRecallBlocksTotal.type, MetricType::kCounter);
   EXPECT_THAT(metric_metadata::kKvRecallBlocksTotal.label_names,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
+                          metric_labels::kOutcome));
+
+  EXPECT_EQ(metric_names::kKvSaveBlocksTotal, "kv_save_blocks_total");
+  EXPECT_EQ(metric_descriptions::kKvSaveBlocksTotal,
+            "Cumulative count of KV cache block save attempts across tiers "
+            "and outcomes.");
+  EXPECT_EQ(metric_metadata::kKvSaveBlocksTotal.name, "kv_save_blocks_total");
+  EXPECT_EQ(metric_metadata::kKvSaveBlocksTotal.description,
+            "Cumulative count of KV cache block save attempts across tiers "
+            "and outcomes.");
+  EXPECT_EQ(metric_metadata::kKvSaveBlocksTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kKvSaveBlocksTotal.label_names,
               ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
                           metric_labels::kOutcome));
 
@@ -561,6 +579,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kD2hDmaTimeMs,
           metric_metadata::kBufferAllocatedBytes,
           metric_metadata::kKvRecallBlocksTotal,
+          metric_metadata::kKvSaveBlocksTotal,
           metric_metadata::kStorageBytesTotal,
           metric_metadata::kHostMemoryBreakdownBytes,
           metric_metadata::kHostNumaMemoryBytes,

@@ -112,6 +112,25 @@ void MarkRecallFailed(BlockTracker* absl_nonnull load_tracker,
   load_tracker->MarkFailed(block_hashes);
 }
 
+// Settle a save batch: count `block_hashes` in `kv_save_blocks_total`
+// under `tier` (`ok` for Done, `failed` for Failed), then mark them in
+// `save_tracker`.
+void MarkSaveDone(BlockTracker* absl_nonnull save_tracker,
+                  absl::string_view dp_rank, absl::string_view tier,
+                  absl::Span<const std::string> block_hashes) {
+  IncrementKvSaveBlocks(dp_rank, tier, telemetry::metric_labels::kOutcomeOk,
+                        block_hashes.size());
+  save_tracker->MarkDone(block_hashes);
+}
+
+void MarkSaveFailed(BlockTracker* absl_nonnull save_tracker,
+                    absl::string_view dp_rank, absl::string_view tier,
+                    absl::Span<const std::string> block_hashes) {
+  IncrementKvSaveBlocks(dp_rank, tier, telemetry::metric_labels::kOutcomeFailed,
+                        block_hashes.size());
+  save_tracker->MarkFailed(block_hashes);
+}
+
 }  // namespace
 
 HostOffloadBackend::HostOffloadBackend(
@@ -793,11 +812,25 @@ HostOffloadBackend::BeginWriteRemote(
     return absl::InvalidArgumentError(
         "src_host_block_ids must have one entry per block hash");
   }
+  const auto fail_save = [&](absl::string_view outcome, absl::Status status) {
+    IncrementKvSaveBlocks(dp_rank_str_,
+                          telemetry::metric_labels::kTierRemoteDram, outcome,
+                          block_hashes.size());
+    return status;
+  };
+  if (raiden_controller_ == nullptr) {
+    return fail_save(
+        telemetry::metric_labels::kOutcomeFailed,
+        absl::FailedPreconditionError("RaidenController is not initialized"));
+  }
 
   // Resolves the peer through the global registry. A missing registry
   // client fails here; there is no separate precondition check.
-  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<KVCacheStoreClient> client,
-                        GetKVCacheStoreClient(dst_raiden_id));
+  absl::StatusOr<std::shared_ptr<KVCacheStoreClient>> client =
+      GetKVCacheStoreClient(dst_raiden_id);
+  if (!client.ok()) {
+    return fail_save(telemetry::metric_labels::kOutcomeFailed, client.status());
+  }
 
   auto hold_expiry = std::make_shared<absl::Time>(absl::Now() + hold_window);
 
@@ -806,7 +839,7 @@ HostOffloadBackend::BeginWriteRemote(
   // below are dropped, and the sweep's eviction skips pinned blocks -- it
   // would free nothing and give up the episode. Every verdict is recorded
   // here instead, after the release.
-  auto call = client->WriteRemote(
+  auto call = (*client)->WriteRemote(
       raiden_controller_->unit(), block_hashes, src_host_block_ids,
       BuildLocalWorkerEndpoints(raiden_controller_),
       absl::ToInt64Milliseconds(requested_deadline), hold_window,
@@ -820,7 +853,10 @@ HostOffloadBackend::BeginWriteRemote(
     if (IsTransportError(response.status())) {
       InvalidateStoreClient(dst_raiden_id);
     }
-    return response.status();
+    return fail_save(absl::IsResourceExhausted(response.status())
+                         ? telemetry::metric_labels::kOutcomeRejected
+                         : telemetry::metric_labels::kOutcomeFailed,
+                     response.status());
   }
 
   RemoteWriteAck ack;
@@ -837,7 +873,8 @@ HostOffloadBackend::BeginWriteRemote(
       // by the verdict must find the blocks already unpinned.
       Release(block_hashes);
       Release(block_hashes);
-      save_tracker->MarkDone(block_hashes);
+      MarkSaveDone(save_tracker, dp_rank_str_,
+                   telemetry::metric_labels::kTierRemoteDram, block_hashes);
       return ack;
     case ::tpu_raiden::kv_cache::proto::WRITE_PARTIAL_EXIST:
       ack.existing_hashes.assign(response->existing_hashes().begin(),
@@ -845,6 +882,9 @@ HostOffloadBackend::BeginWriteRemote(
       // Only the transfer's hold; a failed offer keeps the caller's pin for
       // the caller to drop.
       Release(block_hashes);
+      IncrementKvSaveBlocks(
+          dp_rank_str_, telemetry::metric_labels::kTierRemoteDram,
+          telemetry::metric_labels::kOutcomeFailed, block_hashes.size());
       save_tracker->MarkFailedWithExisting(block_hashes, ack.existing_hashes);
       return ack;
     default:
@@ -853,8 +893,10 @@ HostOffloadBackend::BeginWriteRemote(
   if (ack.operation_id == 0) {
     // Neither an existence answer nor an accepted operation: a protocol
     // error, not a silent no-op.
-    return absl::InternalError(
-        "Destination accepted the offer but returned no operation id.");
+    return fail_save(
+        telemetry::metric_labels::kOutcomeFailed,
+        absl::InternalError(
+            "Destination accepted the offer but returned no operation id."));
   }
   std::vector<std::string> hashes(block_hashes.begin(), block_hashes.end());
   call.result.OnReady([this, lifetime = lifetime_, dst_raiden_id, save_tracker,
@@ -887,6 +929,11 @@ HostOffloadBackend::BeginWriteRemote(
           // A successful save also consumes the caller's pin.
           Release(hashes);
         }
+        IncrementKvSaveBlocks(
+            dp_rank_str_, telemetry::metric_labels::kTierRemoteDram,
+            succeeded ? telemetry::metric_labels::kOutcomeOk
+                      : telemetry::metric_labels::kOutcomeFailed,
+            hashes.size());
         switch (result.state()) {
           case proto::PollWriteRemoteResponse::COMMITTED:
           case proto::PollWriteRemoteResponse::ALL_EXIST:
@@ -915,7 +962,8 @@ HostOffloadBackend::BeginWriteRemote(
       if (op_id == 0 || remaining_hold <= absl::ZeroDuration()) {
         // No operation to chase, or the destination's hold has lapsed.
         Release(hashes);
-        save_tracker->MarkFailed(hashes);
+        MarkSaveFailed(save_tracker, dp_rank_str_,
+                       telemetry::metric_labels::kTierRemoteDram, hashes);
         return;
       }
       // Started while holding the lock, so `this` cannot be destroyed under us.
@@ -938,6 +986,11 @@ HostOffloadBackend::BeginWriteRemote(
           if (poll_succeeded) {
             Release(hashes);
           }
+          IncrementKvSaveBlocks(
+              dp_rank_str_, telemetry::metric_labels::kTierRemoteDram,
+              poll_succeeded ? telemetry::metric_labels::kOutcomeOk
+                             : telemetry::metric_labels::kOutcomeFailed,
+              hashes.size());
           if (!resp.ok()) {
             save_tracker->MarkFailed(hashes);
             return;
@@ -1403,13 +1456,15 @@ tsl::Future<> HostOffloadBackend::Save(
           if (!update_hashes.empty()) {
             Insert(update_hashes, update_slices);
           }
-          save_tracker->MarkDone(hashes);
+          MarkSaveDone(save_tracker, dp_rank_str_,
+                       telemetry::metric_labels::kTierLocalDram, hashes);
           save_promise.Set(absl::OkStatus());
         } else {
           if (raiden_controller_ != nullptr) {
             (void)raiden_controller_->DeallocateBlockIds(dst_host_ids);
           }
-          save_tracker->MarkFailed(hashes);
+          MarkSaveFailed(save_tracker, dp_rank_str_,
+                         telemetry::metric_labels::kTierLocalDram, hashes);
           save_promise.Set(status);
         }
       });

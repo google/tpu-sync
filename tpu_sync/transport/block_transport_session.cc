@@ -856,69 +856,84 @@ void BlockTransportServerPullSession::TriggerNextSendStep() {
   int block_id = remote_id_ + static_cast<int>(k);
 
   auto self = shared_from_this();
-  delegate_->RegisterBlockReadinessCallback(
-      l, sh, block_id, uuid_,
-      [self, l, sh, block_id, step](absl::Status ready_status) {
-        if (!ready_status.ok()) {
-          LOG(ERROR) << "Pull response failed at step " << step << " for uuid "
-                     << self->uuid_ << ", status: " << ready_status;
-          self->Finish(ready_status);
-          return;
-        }
+  auto on_ready = [self, l, sh, block_id, step](absl::Status ready_status) {
+    if (!ready_status.ok()) {
+      LOG(ERROR) << "Pull response failed at step " << step << " for uuid "
+                 << self->uuid_ << ", status: " << ready_status;
+      self->Finish(ready_status);
+      return;
+    }
 
-        self->delegate_->ScheduleAsyncTask([self, l, sh, block_id]() {
-          const int64_t block_id_val = block_id;
-          std::vector<BlockChunk> chunks = self->delegate_->GetBlockChunks(
-              l, sh, absl::MakeConstSpan(&block_id_val, 1),
-              self->delegate_->block_bytes(l), self->uuid_);
-          if (chunks.empty()) {
-            LOG(ERROR) << "No transfer chunks found for block " << block_id
-                       << " and uuid " << self->uuid_;
-            self->Finish(absl::NotFoundError(
-                absl::StrCat("No chunks for block ", block_id)));
-            return;
-          }
-          absl::Status s = ValidateChunks(self->delegate_, l, sh, chunks);
-          if (!s.ok()) {
-            LOG(ERROR) << "Chunks validation failed: " << s;
-            self->Finish(s);
-            return;
-          }
+    self->delegate_->ScheduleAsyncTask([self, l, sh, block_id]() {
+      const int64_t block_id_val = block_id;
+      std::vector<BlockChunk> chunks = self->delegate_->GetBlockChunks(
+          l, sh, absl::MakeConstSpan(&block_id_val, 1),
+          self->delegate_->block_bytes(l), self->uuid_);
+      if (chunks.empty()) {
+        LOG(ERROR) << "No transfer chunks found for block " << block_id
+                   << " and uuid " << self->uuid_;
+        self->Finish(absl::NotFoundError(
+            absl::StrCat("No chunks for block ", block_id)));
+        return;
+      }
+      absl::Status s = ValidateChunks(self->delegate_, l, sh, chunks);
+      if (!s.ok()) {
+        LOG(ERROR) << "Chunks validation failed: " << s;
+        self->Finish(s);
+        return;
+      }
 
-          uint32_t total_size = self->GetChunksTotalSize(chunks);
-          const std::array<uint8_t, lib::kChunkSizeFieldSize> s_size =
-              lib::SerializeChunkSize(total_size);
-          s = WriteExact(self->client_fd_, s_size.data(), s_size.size(),
-                         self->config_.payload_write_timeout_ms);
-          if (!s.ok()) {
-            LOG(ERROR) << "Write size failed: " << s;
-            self->Finish(s);
-            return;
-          }
-          if (total_size > 0) {
-            s = WriteVExact(self->client_fd_, ToIovec(chunks),
-                            self->config_.payload_write_timeout_ms);
-          }
-          if (!s.ok()) {
-            LOG(ERROR) << "Write payload failed: " << s;
-            self->Finish(s);
-            return;
-          }
+      uint32_t total_size = self->GetChunksTotalSize(chunks);
+      const std::array<uint8_t, lib::kChunkSizeFieldSize> s_size =
+          lib::SerializeChunkSize(total_size);
+      s = WriteExact(self->client_fd_, s_size.data(), s_size.size(),
+                     self->config_.payload_write_timeout_ms);
+      if (!s.ok()) {
+        LOG(ERROR) << "Write size failed: " << s;
+        self->Finish(s);
+        return;
+      }
+      if (total_size > 0) {
+        s = WriteVExact(self->client_fd_, ToIovec(chunks),
+                        self->config_.payload_write_timeout_ms);
+      }
+      if (!s.ok()) {
+        LOG(ERROR) << "Write payload failed: " << s;
+        self->Finish(s);
+        return;
+      }
 
-          if (total_size > 0) {
-            // TODO: Add interface name (e.g. eth0, lo) using
-            // GetSocketLocalNic(client_fd_) as a label key.
-            RecordPullResponseSentBytes(self->client_fd_, self->local_ips_,
-                                        total_size);
-          }
+      if (total_size > 0) {
+        // TODO: Add interface name (e.g. eth0, lo) using
+        // GetSocketLocalNic(client_fd_) as a label key.
+        RecordPullResponseSentBytes(self->client_fd_, self->local_ips_,
+                                    total_size);
+      }
 
-          {
-            absl::MutexLock lock(self->mu_);
-            self->current_step_++;
-          }
-          self->TriggerNextSendStep();
-        });
-      });
+      {
+        absl::MutexLock lock(self->mu_);
+        self->current_step_++;
+      }
+      self->TriggerNextSendStep();
+    });
+  };
+
+  absl::StatusOr<std::shared_ptr<TransferSession>> session =
+      delegate_->GetSession(uuid_);
+  if (absl::IsNotFound(session.status()) ||
+      absl::IsUnimplemented(session.status())) {
+    on_ready(absl::OkStatus());
+    return;
+  }
+  if (!session.ok()) {
+    on_ready(session.status());
+    return;
+  }
+  if (*session == nullptr || (*session)->Done()) {
+    on_ready(absl::OkStatus());
+    return;
+  }
+  (*session)->GetDataReadyFuture(l).OnReady(std::move(on_ready));
 }
 
 }  // namespace transport

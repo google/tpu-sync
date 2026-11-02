@@ -193,14 +193,6 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
     return OnDataReceived();
   }
 
-  using HostBlockReadyCallback = std::function<void(absl::Status)>;
-  virtual void RegisterBlockReadinessCallback(size_t layer_idx,
-                                              size_t shard_idx, int block_id,
-                                              uint64_t uuid,
-                                              HostBlockReadyCallback cb) {
-    cb(absl::OkStatus());
-  }
-
   virtual void ScheduleAsyncTask(std::function<void()> task) {
     std::thread(std::move(task)).detach();
   }

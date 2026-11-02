@@ -2952,35 +2952,6 @@ KVCacheManagerBase::DispatchD2hWork(const std::vector<CopyWork>& works,
   return local_futures;
 }
 
-// A lease-authorised pull (kLeaseAuthorizedPullUuid) reads blocks this node
-// already published as host-resident: their device-to-host copy provably
-// completed before the lease was granted, and the pin keeps them from being
-// reused for the duration of the read, so it is never gated. A uuid with no
-// live session (e.g. a pull that did not identify itself) has no copy to wait
-// on either.
-void KVCacheManagerBase::RegisterBlockReadinessCallback(
-    size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
-    transport::BlockTransportDelegate::HostBlockReadyCallback cb) {
-  if (block_id < 0 || uuid == kLeaseAuthorizedPullUuid) {
-    cb(absl::OkStatus());
-    return;
-  }
-  absl::StatusOr<std::shared_ptr<TransferSession>> session = GetSession(uuid);
-  if (absl::IsNotFound(session.status())) {
-    cb(absl::OkStatus());
-    return;
-  }
-  if (!session.ok()) {
-    cb(session.status());
-    return;
-  }
-  if ((*session)->Done()) {
-    cb(absl::OkStatus());
-    return;
-  }
-  (*session)->GetDataReadyFuture(layer_idx).OnReady(std::move(cb));
-}
-
 // The transport's block report carries no unit index, and sessions ignore the
 // index of a block report, so 0 is passed. A uuid with no session (e.g. uuid 0
 // or a planless push) has no blocks to account here.

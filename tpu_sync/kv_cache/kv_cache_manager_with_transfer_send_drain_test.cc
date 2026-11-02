@@ -560,44 +560,37 @@ TEST(SendDrainTest, FailedLayerWaitsForTheOtherLayersCopies) {
 
 // A transport read of a block for a live send waits for that send's
 // device-to-host copy of the layer and carries the copy's status. Reads that
-// name no live send, and lease-authorised reads, are not gated.
+// name no live send, and lease-authorised reads, have no live session.
 TEST(SendDrainTest, BlockReadinessWaitsForTheSendsLayerCopy) {
   TestManager producer(/*num_layers=*/2, /*timeout_s=*/5.0);
   ASSERT_GT(producer.NotifyForRead("req", /*uuid=*/9, {0}), 0);
   producer.ServePull(9);
   ASSERT_EQ(producer.copies_issued(), 2);
 
-  auto register_readiness = [&](size_t layer_idx, uint64_t uuid,
-                                absl::Notification* done,
-                                absl::Status* status) {
-    producer.base()->RegisterBlockReadinessCallback(
-        layer_idx, /*shard_idx=*/0, /*block_id=*/0, uuid,
-        [done, status](absl::Status s) {
-          *status = std::move(s);
-          done->Notify();
-        });
-  };
+  EXPECT_THAT(producer.base()->GetSession(/*uuid=*/1234),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(producer.base()->GetSession(kLeaseAuthorizedPullUuid),
+              StatusIs(absl::StatusCode::kNotFound));
 
-  absl::Notification unknown_done;
-  absl::Status unknown_status = absl::UnknownError("not called");
-  register_readiness(/*layer_idx=*/0, /*uuid=*/1234, &unknown_done,
-                     &unknown_status);
-  ASSERT_TRUE(unknown_done.HasBeenNotified());
-  ABSL_EXPECT_OK(unknown_status);
-
-  absl::Notification lease_done;
-  absl::Status lease_status = absl::UnknownError("not called");
-  register_readiness(/*layer_idx=*/0, kLeaseAuthorizedPullUuid, &lease_done,
-                     &lease_status);
-  ASSERT_TRUE(lease_done.HasBeenNotified());
-  ABSL_EXPECT_OK(lease_status);
+  absl::StatusOr<std::shared_ptr<TransferSession>> session =
+      producer.base()->GetSession(/*uuid=*/9);
+  ABSL_ASSERT_OK(session);
+  ASSERT_NE(*session, nullptr);
 
   absl::Notification layer0_done;
   absl::Status layer0_status = absl::UnknownError("not called");
-  register_readiness(/*layer_idx=*/0, /*uuid=*/9, &layer0_done, &layer0_status);
+  (*session)->GetDataReadyFuture(0).OnReady(
+      [&layer0_done, &layer0_status](absl::Status s) {
+        layer0_status = std::move(s);
+        layer0_done.Notify();
+      });
   absl::Notification layer1_done;
   absl::Status layer1_status = absl::UnknownError("not called");
-  register_readiness(/*layer_idx=*/1, /*uuid=*/9, &layer1_done, &layer1_status);
+  (*session)->GetDataReadyFuture(1).OnReady(
+      [&layer1_done, &layer1_status](absl::Status s) {
+        layer1_status = std::move(s);
+        layer1_done.Notify();
+      });
   EXPECT_FALSE(layer0_done.HasBeenNotified());
   EXPECT_FALSE(layer1_done.HasBeenNotified());
 

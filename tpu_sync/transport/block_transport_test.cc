@@ -264,14 +264,21 @@ class MockDelegate : public BlockTransportDelegate {
     transfer_pool_indices_ = std::move(transfer_pool_indices);
   }
 
-  void RegisterBlockReadinessCallback(size_t layer_idx, size_t shard_idx,
-                                      int block_id, uint64_t uuid,
-                                      HostBlockReadyCallback cb) override {
-    {
+  std::vector<BlockChunk> GetBlockChunks(size_t layer_idx, size_t shard_idx,
+                                         absl::Span<const int64_t> block_ids,
+                                         size_t total_bytes, uint64_t uuid,
+                                         int64_t sender_node_id = -1,
+                                         absl::string_view peer = "",
+                                         int64_t src_block_id = -1,
+                                         int64_t dst_block_id = -1) override {
+    if (!block_ids.empty()) {
       absl::MutexLock lock(wait_events_mu_);
-      wait_events_.push_back(std::make_tuple(layer_idx, shard_idx, block_id));
+      wait_events_.push_back(std::make_tuple(layer_idx, shard_idx,
+                                             static_cast<int>(block_ids[0])));
     }
-    cb(absl::OkStatus());
+    return BlockTransportDelegate::GetBlockChunks(
+        layer_idx, shard_idx, block_ids, total_bytes, uuid, sender_node_id,
+        peer, src_block_id, dst_block_id);
   }
 
   void SetPeerChannel(absl::string_view peer,

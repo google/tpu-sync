@@ -174,14 +174,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     transfer_hooks_ = std::move(hooks);
   }
 
-  // Invokes |cb| once block |block_id| of layer |layer_idx| is ready in host
-  // memory for the transport to read on behalf of transfer |uuid|: gates on
-  // the data-ready future of the live session registered under |uuid|.
-  // Invokes |cb(OkStatus())| immediately for a negative |block_id|, for
-  // kLeaseAuthorizedPullUuid, and when no live session holds |uuid|.
-  void RegisterBlockReadinessCallback(
-      size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
-      transport::BlockTransportDelegate::HostBlockReadyCallback cb) override;
   absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
                                      absl::Span<const int> shard_ids,
                                      uint64_t uuid = 0) override;

@@ -290,6 +290,27 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
             MetricType::kGauge);
   EXPECT_THAT(metric_metadata::kHostMemoryBreakdownBytes.label_names,
               ElementsAre(metric_labels::kComponent));
+
+  // HostNumaMemoryBytes
+  EXPECT_EQ(metric_labels::kNumaNode, "numa_node");
+  EXPECT_EQ(metric_labels::kState, "state");
+  EXPECT_EQ(metric_labels::kStateUsed, "used");
+  EXPECT_EQ(metric_labels::kStateFree, "free");
+  EXPECT_EQ(metric_labels::kStateTotal, "total");
+  EXPECT_THAT(metric_labels::kHostNumaMemoryLabels,
+              ElementsAre(metric_labels::kNumaNode, metric_labels::kState));
+  EXPECT_EQ(metric_names::kHostNumaMemoryBytes, "host_numa_memory_bytes");
+  EXPECT_EQ(metric_descriptions::kHostNumaMemoryBytes,
+            "Per-NUMA-node host DRAM memory in bytes by state (used, free, "
+            "total)");
+  EXPECT_EQ(metric_metadata::kHostNumaMemoryBytes.name,
+            "host_numa_memory_bytes");
+  EXPECT_EQ(metric_metadata::kHostNumaMemoryBytes.description,
+            "Per-NUMA-node host DRAM memory in bytes by state (used, free, "
+            "total)");
+  EXPECT_EQ(metric_metadata::kHostNumaMemoryBytes.type, MetricType::kGauge);
+  EXPECT_THAT(metric_metadata::kHostNumaMemoryBytes.label_names,
+              ElementsAre(metric_labels::kNumaNode, metric_labels::kState));
   // Weight Sync Metrics
   EXPECT_EQ(metric_names::kWeightSyncSentBytesTotal,
             "weight_sync_sent_bytes_total");
@@ -485,6 +506,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kKvRecallBlocksTotal,
           metric_metadata::kStorageBytesTotal,
           metric_metadata::kHostMemoryBreakdownBytes,
+          metric_metadata::kHostNumaMemoryBytes,
           metric_metadata::kWeightSyncSentBytesTotal,
           metric_metadata::kWeightSyncReceivedBytesTotal,
           metric_metadata::kWeightSyncTransferFailuresTotal,

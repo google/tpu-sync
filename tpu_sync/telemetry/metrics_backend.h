@@ -99,6 +99,8 @@ inline constexpr absl::string_view kBufferAllocatedBytes =
 inline constexpr absl::string_view kStorageBytesTotal = "storage_bytes_total";
 inline constexpr absl::string_view kHostMemoryBreakdownBytes =
     "host_memory_breakdown_bytes";
+inline constexpr absl::string_view kHostNumaMemoryBytes =
+    "host_numa_memory_bytes";
 
 inline constexpr absl::string_view kKvRecallBlocksTotal =
     "kv_recall_blocks_total";
@@ -158,6 +160,8 @@ inline constexpr absl::string_view kBufferAllocatedBytes =
 inline constexpr absl::string_view kHostMemoryBreakdownBytes =
     "Host DRAM memory breakdown in bytes by component (kv_pool, process_heap, "
     "page_cache, free)";
+inline constexpr absl::string_view kHostNumaMemoryBytes =
+    "Per-NUMA-node host DRAM memory in bytes by state (used, free, total)";
 
 // Counts KV cache block recall attempts across offload tiers (`local_dram`,
 // `remote_dram`, `shared_storage`) and outcomes (`ok`, `not_found`,
@@ -245,6 +249,11 @@ inline constexpr absl::string_view kComponentKvPool = "kv_pool";
 inline constexpr absl::string_view kComponentProcessHeap = "process_heap";
 inline constexpr absl::string_view kComponentPageCache = "page_cache";
 inline constexpr absl::string_view kComponentFree = "free";
+inline constexpr absl::string_view kNumaNode = "numa_node";
+inline constexpr absl::string_view kState = "state";
+inline constexpr absl::string_view kStateUsed = "used";
+inline constexpr absl::string_view kStateFree = "free";
+inline constexpr absl::string_view kStateTotal = "total";
 
 inline constexpr absl::string_view kTier = "tier";
 inline constexpr absl::string_view kTierLocalDram = "local_dram";
@@ -280,6 +289,8 @@ inline constexpr absl::string_view kKvRecallBlocksLabels[] = {kDpRank, kTier,
 inline constexpr absl::string_view kStorageBytesLabels[] = {kLocalRank,
                                                             kDirection};
 inline constexpr absl::string_view kHostMemoryBreakdownLabels[] = {kComponent};
+inline constexpr absl::string_view kHostNumaMemoryLabels[] = {kNumaNode,
+                                                              kState};
 
 }  // namespace metric_labels
 
@@ -287,6 +298,7 @@ namespace metric_metadata {
 
 using metric_labels::kDirectionLabels;
 using metric_labels::kHostMemoryBreakdownLabels;
+using metric_labels::kHostNumaMemoryLabels;
 using metric_labels::kKvRecallBlocksLabels;
 using metric_labels::kP2pTransferTimeLabels;
 using metric_labels::kPcieTransferLabels;
@@ -381,6 +393,12 @@ inline constexpr MetricMetadata kHostMemoryBreakdownBytes{
     .description = metric_descriptions::kHostMemoryBreakdownBytes,
     .type = MetricType::kGauge,
     .label_names = kHostMemoryBreakdownLabels};
+
+inline constexpr MetricMetadata kHostNumaMemoryBytes{
+    .name = metric_names::kHostNumaMemoryBytes,
+    .description = metric_descriptions::kHostNumaMemoryBytes,
+    .type = MetricType::kGauge,
+    .label_names = kHostNumaMemoryLabels};
 inline constexpr MetricMetadata kWeightSyncSentBytesTotal{
     .name = metric_names::kWeightSyncSentBytesTotal,
     .description = metric_descriptions::kWeightSyncSentBytesTotal,
@@ -477,6 +495,7 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kKvRecallBlocksTotal,
     kStorageBytesTotal,
     kHostMemoryBreakdownBytes,
+    kHostNumaMemoryBytes,
     // Weight Sync Metrics
     kWeightSyncSentBytesTotal,
     kWeightSyncReceivedBytesTotal,

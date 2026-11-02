@@ -40,6 +40,7 @@
 #ifndef WITHOUT_PYTHON
 #include "ATen/core/TensorBody.h"
 #include "csrc/api/tensor_buffer.h"
+#include "tpu_sync/frameworks/torch/torch_tpu_utils.h"
 #include "tpu_sync/frameworks/torch/torch_utils.h"
 #endif
 
@@ -77,6 +78,11 @@ WeightSynchronizer::WeightSynchronizer(
 absl::StatusOr<std::vector<std::vector<raiden::RaidenBufferHandle>>>
 WeightSynchronizer::ResolveDeviceBuffers(BoundTensors& bound) {
   absl::MutexLock lock(bound.mu);
+  if (bound.tensors.empty()) {
+    return absl::FailedPreconditionError(
+        "WeightSynchronizer device weights are unbound; call bind_weights() "
+        "before transferring.");
+  }
   try {
     UnpackedTensors unpacked = UnpackTorchTensors(
         bound.tensors, bound.unsafe_skip_buffer_lock, kFoldedViews);
@@ -162,14 +168,15 @@ absl::Status WeightSynchronizer::BindWeights(
           absl::StrCat("Shard count mismatch in BindWeights: expected ",
                        num_shards(), ", got ", layer_buffers[0].size()));
     }
-    // Held across the rebind so that a concurrent resolve sees either the old
-    // tensors and buffers or the new ones.
-    absl::MutexLock lock(bound_->mu);
-    absl::Status status = base_->BindWeights(layer_buffers);
-    if (!status.ok()) return status;
-    bound_->tensors = device_tensors;
-    bound_->refs = std::move(unpacked.refs);
-    bound_->previous_refs.clear();
+    // `base_->BindWeights` drains any in-flight D2H before taking its resolver
+    // lock and invoking `on_rebind`, so `bound_->mu` is never held across a
+    // future and concurrent resolves see either the old or new tensors/buffers.
+    ABSL_RETURN_IF_ERROR(base_->BindWeights(layer_buffers, [&]() {
+      absl::MutexLock lock(bound_->mu);
+      bound_->tensors = device_tensors;
+      bound_->refs = std::move(unpacked.refs);
+      bound_->previous_refs.clear();
+    }));
     return absl::OkStatus();
   } catch (const std::exception& e) {
     return absl::InternalError(e.what());
@@ -203,6 +210,11 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizer::D2h(uint64_t uuid) {
 
 absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizer::H2d(uint64_t uuid) {
   return base_->H2d(uuid);
+}
+
+absl::StatusOr<const uint8_t*> WeightSynchronizer::WaitAndGetHostBufferPtr(
+    size_t layer_idx, size_t shard_idx) const {
+  return base_->WaitAndGetHostBufferPtr(layer_idx, shard_idx);
 }
 
 absl::Status WeightSynchronizer::PushWeights(

@@ -509,7 +509,7 @@ def _run_source_worker(rank: int, world_size: int, cfg: dict[str, Any]) -> None:
       for _ in range(cfg["num_iterations"]):
         _barrier()
         t0 = time.perf_counter()
-        ws.d2h()
+        ws.d2h().wait()
         _barrier()
         d2h_times.append(time.perf_counter() - t0)
       if rank == 0:

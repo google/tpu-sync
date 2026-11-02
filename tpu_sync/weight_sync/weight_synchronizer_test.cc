@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -25,28 +26,34 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
 #include "absl/log/log.h"
+#include "absl/memory/memory.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
+#include "xla/future.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
+#include "xla/pjrt/c/pjrt_c_api.h"
+#include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/cpu_client_options.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/tpu_utils.h"
@@ -3723,6 +3730,666 @@ TEST_F(WeightSynchronizerTest, AutoH2dOnDataReceivedRecordsH2dBytes) {
   EXPECT_EQ(m.total_h2d_bytes, s.total_device_bytes);
   EXPECT_GT(m.last_h2d_time_ms, 0.0);
   EXPECT_DOUBLE_EQ(m.total_h2d_time_ms, m.last_h2d_time_ms);
+}
+
+// Fake PJRT C-API raw buffer with in-memory bytes, optional lifetime token, and
+// optional caller-controlled gate on CopyRawDeviceToHost.
+class GatedRawBuffer {
+ public:
+  struct D2hGate {
+    xla::Promise<> promise;
+    std::shared_ptr<absl::Notification> started;
+  };
+
+  explicit GatedRawBuffer(std::vector<uint8_t> initial_bytes,
+                          std::shared_ptr<int> lifetime_token = nullptr)
+      : data_(std::move(initial_bytes)),
+        lifetime_token_(std::move(lifetime_token)) {}
+
+  static std::shared_ptr<GatedRawBuffer> Filled(
+      size_t bytes, uint8_t val, std::shared_ptr<int> token = nullptr) {
+    return std::make_shared<GatedRawBuffer>(std::vector<uint8_t>(bytes, val),
+                                            std::move(token));
+  }
+
+  void Fill(uint8_t val) {
+    absl::MutexLock lock(mu_);
+    std::fill(data_.begin(), data_.end(), val);
+  }
+
+  D2hGate ArmGate() {
+    auto [promise, future] = xla::MakePromise();
+    auto started = std::make_shared<absl::Notification>();
+    absl::MutexLock lock(mu_);
+    next_d2h_gate_ = std::move(future);
+    next_d2h_started_ = started;
+    return {std::move(promise), std::move(started)};
+  }
+
+  size_t d2h_call_count() const {
+    absl::MutexLock lock(mu_);
+    return d2h_calls_;
+  }
+
+  size_t GetOnDeviceSizeInBytes() const {
+    absl::MutexLock lock(mu_);
+    return data_.size();
+  }
+
+  xla::Future<> CopyRawHostToDevice(const void* src, int64_t offset,
+                                    int64_t transfer_size) {
+    absl::MutexLock lock(mu_);
+    if (offset < 0 || transfer_size < 0 ||
+        static_cast<size_t>(offset + transfer_size) > data_.size()) {
+      return xla::Future<>(absl::OutOfRangeError("H2D copy out of bounds"));
+    }
+    std::memcpy(data_.data() + offset, src, static_cast<size_t>(transfer_size));
+    return xla::Future<>(absl::OkStatus());
+  }
+
+  xla::Future<> CopyRawDeviceToHost(void* dst, int64_t offset,
+                                    int64_t transfer_size) {
+    std::vector<uint8_t> snapshot;
+    xla::Future<> gate;
+    std::shared_ptr<absl::Notification> started;
+    {
+      absl::MutexLock lock(mu_);
+      ++d2h_calls_;
+      if (offset < 0 || transfer_size < 0 ||
+          static_cast<size_t>(offset + transfer_size) > data_.size()) {
+        return xla::Future<>(absl::OutOfRangeError("D2H copy out of bounds"));
+      }
+      snapshot.assign(data_.begin() + offset,
+                      data_.begin() + offset + transfer_size);
+      gate = std::move(next_d2h_gate_);
+      next_d2h_gate_ = xla::Future<>();
+      started = std::move(next_d2h_started_);
+      next_d2h_started_.reset();
+    }
+    if (started != nullptr && !started->HasBeenNotified()) started->Notify();
+    if (!gate.IsValid()) {
+      std::memcpy(dst, snapshot.data(), snapshot.size());
+      return xla::Future<>(absl::OkStatus());
+    }
+    auto [promise, done] = xla::MakePromise();
+    std::move(gate).OnReady(
+        [dst, snapshot = std::move(snapshot),
+         promise = std::move(promise)](absl::Status s) mutable {
+          if (s.ok()) std::memcpy(dst, snapshot.data(), snapshot.size());
+          promise.Set(std::move(s));
+        });
+    return done;
+  }
+
+  static raiden::RaidenBufferHandle MakeHandle(
+      const std::shared_ptr<GatedRawBuffer>& raw, const xla::Shape& shape) {
+    static const PJRT_Api kApi = [] {
+      PJRT_Api api{};
+      api.struct_size = PJRT_Api_STRUCT_SIZE;
+      api.PJRT_Error_Message = +[](PJRT_Error_Message_Args* a) {
+        absl::string_view m =
+            reinterpret_cast<const absl::Status*>(a->error)->message();
+        a->message = m.data();
+        a->message_size = m.size();
+      };
+      api.PJRT_Error_GetCode = +[](PJRT_Error_GetCode_Args* a) -> PJRT_Error* {
+        int c = static_cast<int>(
+            reinterpret_cast<const absl::Status*>(a->error)->code());
+        std::memcpy(&a->code, &c, sizeof(a->code));
+        return nullptr;
+      };
+      api.PJRT_Error_Destroy = +[](PJRT_Error_Destroy_Args* a) {
+        delete reinterpret_cast<absl::Status*>(a->error);
+      };
+      api.PJRT_Error_ForEachPayload =
+          +[](PJRT_Error_ForEachPayload_Args*) -> PJRT_Error* {
+        return nullptr;
+      };
+      api.PJRT_Event_OnReady = +[](PJRT_Event_OnReady_Args* a) -> PJRT_Error* {
+        // Move out onto the stack first: synchronous `cb` invokes
+        // `PJRT_Event_Destroy(a->event)` before `OnReady` returns.
+        xla::Future<> fut =
+            std::move(*reinterpret_cast<xla::Future<>*>(a->event));
+        std::move(fut).OnReady(
+            [cb = a->callback, arg = a->user_arg](absl::Status s) {
+              PJRT_Error* err =
+                  s.ok() ? nullptr
+                         : reinterpret_cast<PJRT_Error*>(new absl::Status(s));
+              cb(err, arg);
+            });
+        return nullptr;
+      };
+      api.PJRT_Event_Destroy = +[](PJRT_Event_Destroy_Args* a) -> PJRT_Error* {
+        delete reinterpret_cast<xla::Future<>*>(a->event);
+        return nullptr;
+      };
+      return api;
+    }();
+    static const PJRT_RawBuffer_Extension kExt = [] {
+      PJRT_RawBuffer_Extension ext{};
+      ext.base.struct_size = PJRT_RawBuffer_Extension_STRUCT_SIZE;
+      ext.base.type = PJRT_Extension_Type_RawBuffer;
+      ext.PJRT_RawBuffer_Destroy =
+          +[](PJRT_RawBuffer_Destroy_Args* a) -> PJRT_Error* {
+        delete reinterpret_cast<std::shared_ptr<GatedRawBuffer>*>(a->buffer);
+        return nullptr;
+      };
+      ext.PJRT_RawBuffer_GetOnDeviceSizeInBytes =
+          +[](PJRT_RawBuffer_GetOnDeviceSizeInBytes_Args* a) -> PJRT_Error* {
+        a->on_device_size_in_bytes =
+            Unwrap(a->buffer)->GetOnDeviceSizeInBytes();
+        return nullptr;
+      };
+      ext.PJRT_RawBuffer_CopyRawHostToDevice =
+          +[](PJRT_RawBuffer_CopyRawHostToDevice_Args* a) -> PJRT_Error* {
+        a->event = reinterpret_cast<PJRT_Event*>(
+            new xla::Future<>(Unwrap(a->buffer)->CopyRawHostToDevice(
+                a->src, a->offset, a->transfer_size)));
+        return nullptr;
+      };
+      ext.PJRT_RawBuffer_CopyRawDeviceToHost =
+          +[](PJRT_RawBuffer_CopyRawDeviceToHost_Args* a) -> PJRT_Error* {
+        a->event = reinterpret_cast<PJRT_Event*>(
+            new xla::Future<>(Unwrap(a->buffer)->CopyRawDeviceToHost(
+                a->dst, a->offset, a->transfer_size)));
+        return nullptr;
+      };
+      return ext;
+    }();
+    raiden::RaidenBufferHandle result;
+    result.shape = shape;
+    result.is_common_buffer = false;
+    result.c_raw_buffer = reinterpret_cast<PJRT_RawBuffer*>(
+        new std::shared_ptr<GatedRawBuffer>(raw));
+    result.c_hold = std::make_shared<raiden::RawBufferHolder>(
+        &kApi, &kExt, result.c_raw_buffer);
+    return result;
+  }
+
+  static raiden::RaidenBufferHandle MakeU8Handle(
+      const std::shared_ptr<GatedRawBuffer>& raw) {
+    return MakeHandle(
+        raw,
+        xla::ShapeUtil::MakeShape(
+            xla::U8, {static_cast<int64_t>(raw->GetOnDeviceSizeInBytes())}));
+  }
+
+ private:
+  static const std::shared_ptr<GatedRawBuffer>& Unwrap(PJRT_RawBuffer* buf) {
+    return *reinterpret_cast<std::shared_ptr<GatedRawBuffer>*>(buf);
+  }
+
+  mutable absl::Mutex mu_;
+  std::vector<uint8_t> data_ ABSL_GUARDED_BY(mu_);
+  xla::Future<> next_d2h_gate_ ABSL_GUARDED_BY(mu_);
+  std::shared_ptr<absl::Notification> next_d2h_started_ ABSL_GUARDED_BY(mu_);
+  size_t d2h_calls_ ABSL_GUARDED_BY(mu_) = 0;
+  std::shared_ptr<int> lifetime_token_;
+};
+
+class LayerNotifyingSynchronizer : public WeightSynchronizerBase {
+ public:
+  static absl::StatusOr<std::unique_ptr<LayerNotifyingSynchronizer>> CreateCpu(
+      size_t num_layers, size_t slice_byte_size) {
+    std::vector<size_t> sizes(num_layers, slice_byte_size);
+    auto ws = absl::WrapUnique(new LayerNotifyingSynchronizer(sizes));
+    ABSL_RETURN_IF_ERROR(ws->InitHostBuffers(sizes, std::nullopt));
+    return ws;
+  }
+
+  absl::Status OnLayerDataReceived(size_t layer_idx, uint64_t uuid) override {
+    absl::Status s =
+        WeightSynchronizerBase::OnLayerDataReceived(layer_idx, uuid);
+    if (layer_idx < layer_count_ && !received_[layer_idx].HasBeenNotified()) {
+      received_[layer_idx].Notify();
+    }
+    return s;
+  }
+
+  absl::Notification& layer_received(size_t layer_idx) {
+    return received_[layer_idx];
+  }
+
+ private:
+  explicit LayerNotifyingSynchronizer(const std::vector<size_t>& sizes)
+      : WeightSynchronizerBase(sizes.size(), 1, sizes, 0, 1, std::nullopt, {},
+                               false),
+        layer_count_(sizes.size()),
+        received_(std::make_unique<absl::Notification[]>(sizes.size())) {}
+  size_t layer_count_;
+  std::unique_ptr<absl::Notification[]> received_;
+};
+
+tpu_sync::rpc::StartTransferRequest MakeSimplePushRequest(
+    uint64_t uuid, bool skip_d2h, const WeightSynchronizerBase& dest,
+    size_t num_layers, size_t layer_bytes,
+    std::optional<bool> skip_tiling_all = std::nullopt) {
+  const std::string peer = absl::StrCat("127.0.0.1:", *dest.local_port());
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_uuid(uuid);
+  request.set_is_sender(true);
+  request.set_skip_d2h(skip_d2h);
+  auto& schedule = (*request.mutable_shard_push_schedules())[0];
+  for (size_t l = 0; l < num_layers; ++l) {
+    auto* entry = schedule.add_entries();
+    entry->set_dst_peer(peer);
+    entry->set_dst_shard_idx(0);
+    entry->set_size_bytes(layer_bytes);
+    entry->set_count(1);
+    entry->set_layer_idx(static_cast<int32_t>(l));
+    if (skip_tiling_all.has_value()) {
+      (*request.mutable_skip_tiling())[static_cast<int32_t>(l)] =
+          *skip_tiling_all;
+    }
+  }
+  return request;
+}
+
+absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> CreateGatedSource(
+    const std::vector<std::vector<raiden::RaidenBufferHandle>>& handles,
+    std::vector<std::string> layer_names = {}, int parallelism = 1) {
+  return WeightSynchronizerBase::Create(handles, 0, std::nullopt, false,
+                                        parallelism, std::nullopt, std::nullopt,
+                                        std::move(layer_names), false);
+}
+
+absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> CreateU8Source(
+    absl::Span<const std::shared_ptr<GatedRawBuffer>> raws,
+    std::vector<std::string> layer_names = {}, int parallelism = 1) {
+  std::vector<std::vector<raiden::RaidenBufferHandle>> handles;
+  for (const auto& r : raws)
+    handles.push_back({GatedRawBuffer::MakeU8Handle(r)});
+  return CreateGatedSource(handles, std::move(layer_names), parallelism);
+}
+
+void ExpectErr(const absl::Status& s, absl::StatusCode code,
+               absl::Span<const absl::string_view> substrs) {
+  EXPECT_EQ(s.code(), code) << s;
+  for (absl::string_view sub : substrs) {
+    EXPECT_TRUE(absl::StrContains(s.message(), sub)) << s;
+  }
+}
+
+std::vector<uint8_t> ReadHostLayerBytes(const WeightSynchronizerBase& ws,
+                                        size_t layer_idx, size_t bytes) {
+  const uint8_t* ptr = ws.GetHostBufferPtr(layer_idx, 0);
+  return std::vector<uint8_t>(ptr, ptr + bytes);
+}
+
+std::future<absl::Status> PushAsync(WeightSynchronizerBase& ws,
+                                    tpu_sync::rpc::StartTransferRequest req) {
+  return std::async(std::launch::async, [&ws, req = std::move(req)]() {
+    return ws.PushWeightsResharded(req);
+  });
+}
+
+xla::Shape MakeTiledF32Shape() {
+  return xla::ShapeUtil::MakeShapeWithDenseLayout(
+      xla::F32, {16, 256}, /*minor_to_major=*/{1, 0}, {xla::Tile({8, 128})});
+}
+
+std::vector<uint8_t> MakeTiledPatternBytes(size_t bytes, uint8_t mul) {
+  std::vector<uint8_t> out(bytes);
+  for (size_t i = 0; i < bytes; ++i) {
+    out[i] = static_cast<uint8_t>(((i ^ (i >> 8)) * mul + 11) & 0xFF);
+  }
+  return out;
+}
+
+TEST_F(WeightSynchronizerTest,
+       ExplicitD2hSkipD2hPushStreamsPerLayerWithoutSendingUnstagedBytes) {
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kBytes = 4096;
+  auto raw0 = GatedRawBuffer::Filled(kBytes, 0xA1);
+  auto raw1 = GatedRawBuffer::Filled(kBytes, 0xB2);
+  TF_ASSERT_OK_AND_ASSIGN(auto source,
+                       CreateU8Source({raw0, raw1}, {"layer_0", "layer_1"}));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto dest, LayerNotifyingSynchronizer::CreateCpu(kNumLayers, kBytes));
+  auto g0 = raw0->ArmGate();
+  auto g1 = raw1->ArmGate();
+  TF_ASSERT_OK_AND_ASSIGN(auto d2h_future, source->D2h());
+  EXPECT_FALSE(d2h_future.IsReady());
+
+  constexpr uint64_t kUuid = 92001;
+  ABSL_ASSERT_OK(dest->RegisterExpectedLayerChunks(kUuid, {{0, 1}, {1, 1}}));
+  ABSL_ASSERT_OK(dest->RegisterExpectedChunks(kUuid, 2));
+  auto push_future = PushAsync(
+      *source, MakeSimplePushRequest(kUuid, true, *dest, kNumLayers, kBytes));
+  g0.started->WaitForNotification();
+  g1.started->WaitForNotification();
+  EXPECT_FALSE(dest->layer_received(0).HasBeenNotified());
+  EXPECT_FALSE(dest->layer_received(1).HasBeenNotified());
+  EXPECT_EQ(ReadHostLayerBytes(*dest, 0, kBytes),
+            std::vector<uint8_t>(kBytes, 0));
+
+  // Release layer 0 only: H2H streams layer 0 while layer 1's D2H stays gated.
+  g0.promise.Set(absl::OkStatus());
+  ASSERT_TRUE(dest->layer_received(0).WaitForNotificationWithTimeout(
+      absl::Seconds(10)));
+  EXPECT_FALSE(d2h_future.IsReady());
+  EXPECT_FALSE(dest->layer_received(1).HasBeenNotified());
+  EXPECT_EQ(ReadHostLayerBytes(*dest, 0, kBytes),
+            std::vector<uint8_t>(kBytes, 0xA1));
+  EXPECT_EQ(ReadHostLayerBytes(*dest, 1, kBytes),
+            std::vector<uint8_t>(kBytes, 0));
+  g1.promise.Set(absl::OkStatus());
+  ABSL_ASSERT_OK(push_future.get());
+  ABSL_ASSERT_OK(d2h_future.Await());
+  ABSL_ASSERT_OK(dest->WaitForTransferCompletion(kUuid));
+  EXPECT_EQ(ReadHostLayerBytes(*dest, 1, kBytes),
+            std::vector<uint8_t>(kBytes, 0xB2));
+}
+
+TEST_F(WeightSynchronizerTest,
+       ExplicitD2hErrorPropagatesToFuturePushWaitAndH2d) {
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kBytes = 2048;
+  auto raw0 = GatedRawBuffer::Filled(kBytes, 0x33);
+  auto raw1 = GatedRawBuffer::Filled(kBytes, 0x44);
+  TF_ASSERT_OK_AND_ASSIGN(auto source, CreateU8Source({raw0, raw1}));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto dest, WeightSynchronizerBase::Create(kNumLayers, 1, kBytes, 0));
+  auto g0 = raw0->ArmGate();
+  auto g1 = raw1->ArmGate();
+  TF_ASSERT_OK_AND_ASSIGN(auto d2h_future, source->D2h());
+  g0.promise.Set(absl::OkStatus());
+  constexpr absl::string_view kErr = "simulated_d2h_dma_failure_layer_1";
+  g1.promise.Set(absl::UnavailableError(kErr));
+  ExpectErr(d2h_future.Await(), absl::StatusCode::kUnavailable, {kErr});
+  ABSL_EXPECT_OK(source->WaitForExplicitD2h(0));
+  TF_ASSERT_OK_AND_ASSIGN(const uint8_t* ptr0,
+                       source->WaitAndGetHostBufferPtr(0, 0));
+  EXPECT_EQ(ptr0, source->GetHostBufferPtr(0, 0));
+  ExpectErr(source->WaitForExplicitD2h(1), absl::StatusCode::kUnavailable,
+            {kErr});
+  ExpectErr(source->WaitAndGetHostBufferPtr(1, 0).status(),
+            absl::StatusCode::kUnavailable, {kErr});
+  ExpectErr(source->WaitAndGetHostBufferPtr(2, 0).status(),
+            absl::StatusCode::kOutOfRange, {"layer_idx=2", "num_layers=2"});
+  ExpectErr(source->H2d().status(), absl::StatusCode::kUnavailable, {kErr});
+  ExpectErr(source->PushWeightsResharded(
+                MakeSimplePushRequest(92002, true, *dest, kNumLayers, kBytes)),
+            absl::StatusCode::kUnavailable, {kErr});
+
+  // Positive recovery: a clean D2h() restores WaitAndGetHostBufferPtr/H2d/push.
+  TF_ASSERT_OK_AND_ASSIGN(auto recovery_d2h, source->D2h());
+  ABSL_ASSERT_OK(recovery_d2h.Await());
+  ABSL_EXPECT_OK(source->WaitAndGetHostBufferPtr(1, 0));
+  TF_ASSERT_OK_AND_ASSIGN(auto recovery_h2d, source->H2d());
+  ABSL_ASSERT_OK(recovery_h2d.Await());
+  ABSL_ASSERT_OK(dest->RegisterExpectedChunks(92003, 2));
+  ABSL_ASSERT_OK(source->PushWeightsResharded(
+      MakeSimplePushRequest(92003, true, *dest, kNumLayers, kBytes)));
+  ABSL_ASSERT_OK(dest->WaitForTransferCompletion(92003));
+  EXPECT_EQ(ReadHostLayerBytes(*dest, 1, kBytes),
+            std::vector<uint8_t>(kBytes, 0x44));
+}
+
+TEST_F(
+    WeightSynchronizerTest,
+    ExplicitD2hSkipTilingMismatchRestagesWhenBoundAndFailsLoudlyWhenUnbound) {
+  const xla::Shape tiled_shape = MakeTiledF32Shape();
+  const size_t kBytes = xla::ShapeUtil::ByteSizeOf(tiled_shape);
+  ASSERT_EQ(kBytes, 16384u);
+  const auto device_tiled_bytes = MakeTiledPatternBytes(kBytes, 37);
+  auto raw = std::make_shared<GatedRawBuffer>(device_tiled_bytes);
+  auto handle = GatedRawBuffer::MakeHandle(raw, tiled_shape);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto source, CreateGatedSource({{handle}}, {"transformer.layer_0.attn"}));
+  TF_ASSERT_OK_AND_ASSIGN(auto dest,
+                       WeightSynchronizerBase::Create(1, 1, kBytes, 0));
+  TF_ASSERT_OK_AND_ASSIGN(auto d2h_bound, source->D2h());
+  ABSL_ASSERT_OK(d2h_bound.Await());
+  ASSERT_NE(ReadHostLayerBytes(*source, 0, kBytes), device_tiled_bytes);
+
+  // Case 1: Bound weights re-stage automatically on skip_tiling=true plan.
+  ABSL_ASSERT_OK(dest->RegisterExpectedChunks(92010, 1));
+  ABSL_ASSERT_OK(source->PushWeightsResharded(
+      MakeSimplePushRequest(92010, true, *dest, 1, kBytes, true)));
+  ABSL_ASSERT_OK(dest->WaitForTransferCompletion(92010));
+  EXPECT_EQ(ReadHostLayerBytes(*dest, 0, kBytes), device_tiled_bytes);
+
+  // Case 2: Unbinding before a mismatched skip_tiling=true plan fails loudly.
+  ABSL_ASSERT_OK(source->BindWeights({{handle}}));
+  source->SetSkipTiling(false);
+  TF_ASSERT_OK_AND_ASSIGN(auto d2h_unbound, source->D2h());
+  ABSL_ASSERT_OK(d2h_unbound.Await());
+  source->UnbindWeights();
+  ExpectErr(source->PushWeightsResharded(
+                MakeSimplePushRequest(92011, true, *dest, 1, kBytes, true)),
+            absl::StatusCode::kFailedPrecondition,
+            {"transformer.layer_0.attn", "uuid=92011", "skip_tiling=false",
+             "skip_tiling=true", "skip_d2h=false"});
+}
+
+TEST_F(WeightSynchronizerTest,
+       ExplicitD2hReleasesDeviceHoldsWhileFutureRemainsAlive) {
+  // Case 1: Untiled U8[4096], normal verl order (await D2H -> UnbindWeights()).
+  {
+    auto token = std::make_shared<int>(7);
+    std::weak_ptr<int> weak_token = token;
+    auto raw = GatedRawBuffer::Filled(4096, 0x7E, std::move(token));
+    TF_ASSERT_OK_AND_ASSIGN(auto source, CreateU8Source({raw}));
+    auto gate = raw->ArmGate();
+    raw.reset();
+    ASSERT_FALSE(weak_token.expired());
+    TF_ASSERT_OK_AND_ASSIGN(auto d2h_future, source->D2h());
+    EXPECT_TRUE(d2h_future.holds.empty());
+    EXPECT_EQ(d2h_future.keep_alive, nullptr);
+    gate.started->WaitForNotification();
+    gate.promise.Set(absl::OkStatus());
+    ABSL_ASSERT_OK(d2h_future.Await());
+    EXPECT_FALSE(weak_token.expired());
+    source->UnbindWeights();
+    EXPECT_TRUE(weak_token.expired());
+    EXPECT_TRUE(d2h_future.IsReady());
+  }
+  // Case 2: Tiled F32[16,256] ({8,128} tile) with UnbindWeights() called while
+  // D2H+detile is still gated: buffer stays pinned until completion, then
+  // drops.
+  {
+    const xla::Shape tiled_shape = MakeTiledF32Shape();
+    const size_t kBytes = xla::ShapeUtil::ByteSizeOf(tiled_shape);
+    const auto tiled_bytes = MakeTiledPatternBytes(kBytes, 29);
+    auto token = std::make_shared<int>(9);
+    std::weak_ptr<int> weak_token = token;
+    auto raw = std::make_shared<GatedRawBuffer>(tiled_bytes, std::move(token));
+    TF_ASSERT_OK_AND_ASSIGN(
+        auto source,
+        CreateGatedSource({{GatedRawBuffer::MakeHandle(raw, tiled_shape)}}));
+    auto gate = raw->ArmGate();
+    raw.reset();
+    TF_ASSERT_OK_AND_ASSIGN(auto tiled_fut, source->D2h());
+    gate.started->WaitForNotification();
+    source->UnbindWeights();
+    EXPECT_FALSE(weak_token.expired());
+    gate.promise.Set(absl::OkStatus());
+    ABSL_ASSERT_OK(tiled_fut.Await());
+    EXPECT_TRUE(weak_token.expired());
+    EXPECT_TRUE(tiled_fut.IsReady());
+    EXPECT_NE(ReadHostLayerBytes(*source, 0, kBytes), tiled_bytes);
+  }
+}
+
+TEST_F(WeightSynchronizerTest,
+       SecondD2hInPushD2hAndGetHostBufferWaitForInFlightExplicitD2h) {
+  constexpr size_t kBytes = 4096;
+  auto raw = GatedRawBuffer::Filled(kBytes, 0x11);
+  TF_ASSERT_OK_AND_ASSIGN(auto source, CreateU8Source({raw}));
+  TF_ASSERT_OK_AND_ASSIGN(auto dest,
+                       WeightSynchronizerBase::Create(1, 1, kBytes, 0));
+  // Part 1a: WaitAndGetHostBufferPtr() waits for an in-flight explicit D2h().
+  auto g1 = raw->ArmGate();
+  TF_ASSERT_OK_AND_ASSIGN(auto first_d2h, source->D2h());
+  g1.started->WaitForNotification();
+  EXPECT_EQ(raw->d2h_call_count(), 1u);
+  absl::Notification host_read_done;
+  uint8_t observed_first_byte = 0;
+  std::thread host_reader([&]() {
+    TF_ASSERT_OK_AND_ASSIGN(const uint8_t* ptr,
+                         source->WaitAndGetHostBufferPtr(0, 0));
+    observed_first_byte = ptr[0];
+    host_read_done.Notify();
+  });
+  EXPECT_FALSE(
+      host_read_done.WaitForNotificationWithTimeout(absl::Milliseconds(50)));
+  g1.promise.Set(absl::OkStatus());
+  host_reader.join();
+  EXPECT_EQ(observed_first_byte, 0x11);
+  ABSL_ASSERT_OK(first_d2h.Await());
+
+  // Part 1b: A second explicit D2h() serializes behind the in-flight D2h().
+  raw->Fill(0x22);
+  auto g2 = raw->ArmGate();
+  TF_ASSERT_OK_AND_ASSIGN(auto second_d2h, source->D2h());
+  g2.started->WaitForNotification();
+  EXPECT_EQ(raw->d2h_call_count(), 2u);
+  raw->Fill(0x33);
+  absl::Notification third_d2h_returned;
+  auto third_d2h_done = std::async(std::launch::async, [&]() -> absl::Status {
+    ABSL_ASSIGN_OR_RETURN(auto f3, source->D2h());
+    third_d2h_returned.Notify();
+    return f3.Await();
+  });
+  EXPECT_FALSE(third_d2h_returned.WaitForNotificationWithTimeout(
+      absl::Milliseconds(50)));
+  EXPECT_EQ(raw->d2h_call_count(), 2u);
+  g2.promise.Set(absl::OkStatus());
+  ABSL_ASSERT_OK(second_d2h.Await());
+  ABSL_ASSERT_OK(third_d2h_done.get());
+  EXPECT_EQ(raw->d2h_call_count(), 3u);
+  EXPECT_EQ(source->GetHostBufferPtr(0, 0)[0], 0x33);
+
+  // Part 2: In-push D2H (skip_d2h=false) and unawaited D2h() + BindWeights()
+  // serialize behind explicit D2h().
+  auto g4 = raw->ArmGate();
+  TF_ASSERT_OK_AND_ASSIGN(auto fourth_d2h, source->D2h());
+  g4.started->WaitForNotification();
+  EXPECT_EQ(raw->d2h_call_count(), 4u);
+  raw->Fill(0x55);
+  constexpr uint64_t kInPushUuid = 92020;
+  ABSL_ASSERT_OK(dest->RegisterExpectedChunks(kInPushUuid, 1));
+  auto in_push_req =
+      MakeSimplePushRequest(kInPushUuid, false, *dest, 1, kBytes);
+  absl::Notification in_push_finished;
+  auto in_push_done = std::async(std::launch::async, [&]() {
+    absl::Status s = source->PushWeightsResharded(in_push_req);
+    in_push_finished.Notify();
+    return s;
+  });
+  EXPECT_FALSE(
+      in_push_finished.WaitForNotificationWithTimeout(absl::Milliseconds(50)));
+  EXPECT_EQ(raw->d2h_call_count(), 4u);
+  g4.promise.Set(absl::OkStatus());
+  ABSL_ASSERT_OK(fourth_d2h.Await());
+  ABSL_ASSERT_OK(in_push_done.get());
+  ABSL_ASSERT_OK(dest->WaitForTransferCompletion(kInPushUuid));
+  EXPECT_EQ(raw->d2h_call_count(), 5u);
+  EXPECT_EQ(dest->GetHostBufferPtr(0, 0)[0], 0x55);
+  // Dropping the returned future without awaiting is still awaited by rebind.
+  (void)source->D2h();
+  ABSL_ASSERT_OK(source->BindWeights({{GatedRawBuffer::MakeU8Handle(raw)}}));
+}
+
+TEST_F(WeightSynchronizerTest, PreTiledRelayAndActivePushGuards) {
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kBytes = 4096;
+  auto raw0 = GatedRawBuffer::Filled(kBytes, 0x11);
+  auto raw1 = GatedRawBuffer::Filled(kBytes, 0x22);
+  auto h0 = GatedRawBuffer::MakeU8Handle(raw0);
+  auto h1 = GatedRawBuffer::MakeU8Handle(raw1);
+  TF_ASSERT_OK_AND_ASSIGN(auto relay, CreateGatedSource({{h0}, {h1}}));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto dest, LayerNotifyingSynchronizer::CreateCpu(kNumLayers, kBytes));
+  TF_ASSERT_OK_AND_ASSIGN(auto init_d2h, relay->D2h());
+  ABSL_ASSERT_OK(init_d2h.Await());
+  EXPECT_EQ(raw0->d2h_call_count(), 1u);
+
+  // Arm `relay` as a PRE_TILED relay with planned skip_tiling=true: layer 0
+  // exercises the PRE_TILED PushWeightsResharded gate directly; layer 1 parks
+  // on tile_ready[1] so active_h2h_pushes=1 is deterministic.
+  constexpr uint64_t kRelayUuid = 92500;
+  ABSL_ASSERT_OK(
+      dest->RegisterExpectedLayerChunks(kRelayUuid, {{0, 1}, {1, 1}}));
+  ABSL_ASSERT_OK(dest->RegisterExpectedChunks(kRelayUuid, 2));
+  auto relay_req =
+      MakeSimplePushRequest(kRelayUuid, true, *dest, kNumLayers, kBytes, true);
+  relay_req.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED);
+  auto recv_req = relay_req;
+  recv_req.set_is_sender(false);
+  relay->StoreSkipTiling(kRelayUuid, recv_req);
+  relay->StoreSkipTiling(kRelayUuid, relay_req);
+  ABSL_ASSERT_OK(relay->RegisterExpectedLayerChunks(kRelayUuid, {{1, 1}}));
+  std::memset(relay->GetHostPointer(0, 0), 0xC1, kBytes);
+  auto push_fut = PushAsync(*relay, relay_req);
+  ASSERT_TRUE(dest->layer_received(0).WaitForNotificationWithTimeout(
+      absl::Seconds(10)));
+  EXPECT_EQ(raw0->d2h_call_count(), 1u);
+  EXPECT_EQ(ReadHostLayerBytes(*dest, 0, kBytes),
+            std::vector<uint8_t>(kBytes, 0xC1));
+  ExpectErr(relay->D2h().status(), absl::StatusCode::kFailedPrecondition,
+            {"active_h2h_pushes=1",
+             "await the in-flight transfer before bind_weights()/d2h()"});
+  ExpectErr(relay->BindWeights({{h0}, {h1}}),
+            absl::StatusCode::kFailedPrecondition, {"active_h2h_pushes=1"});
+  ABSL_EXPECT_OK(relay->BindWeights({}));
+  std::memset(relay->GetHostPointer(1, 0), 0xD2, kBytes);
+  ABSL_ASSERT_OK(relay->OnLayerDataReceived(1, kRelayUuid));
+  ABSL_ASSERT_OK(relay->OnDataReceived(kRelayUuid));
+  ABSL_ASSERT_OK(push_fut.get());
+  ABSL_ASSERT_OK(dest->WaitForTransferCompletion(kRelayUuid));
+  EXPECT_EQ(ReadHostLayerBytes(*dest, 1, kBytes),
+            std::vector<uint8_t>(kBytes, 0xD2));
+
+  ABSL_ASSERT_OK(relay->BindWeights({{h0}, {h1}}));
+  relay->SetSkipTiling(false);
+  TF_ASSERT_OK_AND_ASSIGN(auto post_d2h, relay->D2h());
+  ABSL_ASSERT_OK(post_d2h.Await());
+  ABSL_ASSERT_OK(relay->RegisterExpectedChunks(92501, 1));
+  relay->UnbindWeights();
+  ABSL_ASSERT_OK(dest->RegisterExpectedChunks(92502, 2));
+  ABSL_ASSERT_OK(relay->PushWeightsResharded(
+      MakeSimplePushRequest(92502, true, *dest, kNumLayers, kBytes, true)));
+  ABSL_ASSERT_OK(dest->WaitForTransferCompletion(92502));
+}
+
+TEST_F(WeightSynchronizerTest,
+       ConcurrentUnbindDuringSkipD2hPushIsDataRaceFree) {
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kBytes = 16384;
+  auto raw0 = GatedRawBuffer::Filled(kBytes, 0x10);
+  auto raw1 = GatedRawBuffer::Filled(kBytes, 0x20);
+  auto h0 = GatedRawBuffer::MakeU8Handle(raw0);
+  auto h1 = GatedRawBuffer::MakeU8Handle(raw1);
+  TF_ASSERT_OK_AND_ASSIGN(auto source,
+                       CreateGatedSource({{h0}, {h1}}, {}, /*parallelism=*/2));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto dest, WeightSynchronizerBase::Create(kNumLayers, 1, kBytes, 0));
+  source->SetTestOnlyRateLimiters(
+      std::make_shared<peregrine::v1::TestOnlyRateLimiter>(8 * 1024 * 1024),
+      nullptr);
+
+  for (int iter = 0; iter < 8; ++iter) {
+    const uint8_t v0 = static_cast<uint8_t>(0x30 + iter);
+    const uint8_t v1 = static_cast<uint8_t>(0x80 + iter);
+    raw0->Fill(v0);
+    raw1->Fill(v1);
+    ABSL_ASSERT_OK(source->BindWeights({{h0}, {h1}}));
+
+    const uint64_t uuid = 93000 + static_cast<uint64_t>(iter);
+    ABSL_ASSERT_OK(dest->RegisterExpectedChunks(uuid, kNumLayers));
+    TF_ASSERT_OK_AND_ASSIGN(auto d2h_fut, source->D2h());
+    auto push_fut = PushAsync(
+        *source, MakeSimplePushRequest(uuid, true, *dest, kNumLayers, kBytes));
+
+    ABSL_ASSERT_OK(d2h_fut.Await());
+    source->UnbindWeights();
+    ABSL_ASSERT_OK(push_fut.get());
+    ABSL_ASSERT_OK(dest->WaitForTransferCompletion(uuid));
+    EXPECT_EQ(dest->GetHostBufferPtr(0, 0)[0], v0);
+    EXPECT_EQ(dest->GetHostBufferPtr(1, 0)[0], v1);
+  }
 }
 
 }  // namespace

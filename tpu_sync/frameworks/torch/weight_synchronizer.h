@@ -73,15 +73,21 @@ class WeightSynchronizer {
 #endif
   // Releases all bound device tensors and TPU HBM buffer holds while keeping
   // the synchronizer (host staging memory, listeners, controller registration)
-  // alive for a later BindWeights(). D2h()/H2d()/pushes fail with
-  // FailedPrecondition until weights are re-bound. Must not be called while a
-  // D2H/H2D/push is in flight.
+  // alive for a later BindWeights(). D2h()/H2d() and pushes that must read
+  // device buffers fail with FailedPrecondition until weights are re-bound.
+  // Once D2h() has completed, UnbindWeights() may be called even while a
+  // skip_d2h=true H2H push is still sending from host staging buffers (for the
+  // first transfer to a destination topology whose skip_tiling plan is not yet
+  // cached, keep weights bound until the transfer finishes so any layout
+  // mismatch can be re-staged).
   void UnbindWeights();
 
   ~WeightSynchronizer();
 
   absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
   absl::StatusOr<raiden::PjRtCopyFuture> H2d(uint64_t uuid = 0);
+  absl::StatusOr<const uint8_t*> WaitAndGetHostBufferPtr(
+      size_t layer_idx, size_t shard_idx) const;
 
   absl::Status PushWeights(const std::vector<std::string>& peers);
   absl::Status PushWeightsResharded(

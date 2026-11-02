@@ -707,7 +707,7 @@ def _run_distributed_worker(
     uuid_warmup = 999
     req_id_warmup = "warmup"
     if is_source:
-      ws.d2h()
+      ws.d2h().wait()
     dist.barrier()
 
     if rank == 0:
@@ -786,7 +786,7 @@ def _run_distributed_worker(
       dist.barrier()
       t0 = time.perf_counter()
       if is_source:
-        ws.d2h()
+        ws.d2h().wait()
       dist.barrier()
       d2h_ms = (time.perf_counter() - t0) * 1000.0
 

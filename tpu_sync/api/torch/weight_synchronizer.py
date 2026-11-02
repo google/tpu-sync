@@ -30,6 +30,9 @@ _weight_synchronizer = torch_abi.load_extension(
     "_tpu_raiden_torch",
 )
 
+# Native future type returned by `WeightSynchronizer.d2h()`.
+RaidenFuture = _weight_synchronizer.RaidenFuture
+
 common.register_telemetry_callbacks(
     increment_counter=_weight_synchronizer.increment_counter,
     set_gauge=_weight_synchronizer.set_gauge,
@@ -182,10 +185,15 @@ class WeightSynchronizer:
   def bind_weights(self, device_tensors: List[List[torch.Tensor]]) -> None:
     """Dynamically re-binds new device weights in-place without daemon restart.
 
+    Host staging buffers are single-buffered: non-empty `bind_weights()` raises
+    if an H2H push is still reading host memory — await the in-flight transfer
+    before calling `bind_weights()` / `d2h()` for the next sync.
+    `bind_weights([])`
+    aliases `unbind_weights()` and remains allowed during H2H.
+
     Args:
-      device_tensors: New per-layer, per-shard device tensors to bind. Must
-        match the layer/shard/size configuration from construction. An empty
-        list is equivalent to calling `unbind_weights()`.
+      device_tensors: New per-layer, per-shard device tensors matching the
+        initial configuration, or `[]` to unbind.
     """
     if not device_tensors:
       self.unbind_weights()
@@ -195,22 +203,37 @@ class WeightSynchronizer:
   def unbind_weights(self) -> None:
     """Releases all bound device tensors and their TPU HBM holds immediately.
 
-    The synchronizer itself (pinned host staging buffers, listeners, controller
-    registration) stays alive, so a later `bind_weights()` is cheap and does not
-    require re-creating or re-registering the WeightSynchronizer. Use this right
-    after a transfer completes so temporary send tensors do not stay pinned in
-    HBM during the next training step.
+    Host staging buffers, listeners, and controller registration stay alive for
+    a later `bind_weights()`. After unbinding, `d2h()`, `h2d()`, and any push
+    that must read device buffers raise until `bind_weights()` is called again.
 
-    After unbinding, `d2h()`, `h2d()`, and any controller-driven push that
-    performs D2H raise until `bind_weights()` is called again.
-
-    Must not be called while a D2H/H2D/push on this synchronizer is in flight.
+    Once `d2h().wait()` finishes, `unbind_weights()` may run while a
+    `skip_d2h=True` transfer streams from host memory (await that transfer
+    before non-empty `bind_weights()` / `d2h()` for the next sync). Keep weights
+    bound across the first transfer to an uncached destination topology so any
+    `skip_tiling` mismatch can be re-staged from device.
     """
     self._impl.unbind_weights()
 
-  def d2h(self) -> None:
-    """Triggers asynchronous D2H copy of current weights to Host buffer."""
-    self._impl.D2h()
+  def d2h(self) -> RaidenFuture:
+    """Starts a non-blocking D2H copy of bound weights into host staging buffers.
+
+    `skip_d2h=True` transfers and `get_host_buffer()` wait per layer; `h2d()`
+    waits for the whole in-flight `d2h()`. The future holds no device buffers;
+    once it completes the copy no longer reads them, so `unbind_weights()` can
+    release them (and their HBM) even while a `skip_d2h=True` transfer is still
+    sending from host staging memory. Await that transfer before non-empty
+    `bind_weights()` or `d2h()` for the next sync, and keep weights bound across
+    the first transfer to an uncached topology so layout mismatches re-stage.
+
+    Returns:
+      A `RaidenFuture` (`wait()`, `is_ready()`, `ok()`, `error_message()`).
+
+    Raises:
+      RuntimeError: If weights are unbound, an H2H push is still reading host
+        staging buffers, or refreshing bound device buffers fails.
+    """
+    return self._impl.D2h()
 
   def h2d(self) -> None:
     """Triggers asynchronous H2D copy of weights from Host buffer to Device."""

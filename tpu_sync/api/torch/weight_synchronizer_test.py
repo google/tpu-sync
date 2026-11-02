@@ -12,18 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import gc
 import os
 import socket
+import threading
+import time
 
+from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
 import torch_tpu  # pylint: disable=unused-import
 
-from tpu_sync.api.torch.weight_synchronizer import (
-    WeightSynchronizer,
-)
+from tpu_sync.api.torch import weight_synchronizer as ws_lib
+from tpu_sync.api.torch.weight_synchronizer import WeightSynchronizer
+from tpu_sync.rpc import raiden_controller
 from tpu_sync.rpc import raiden_service_pb2
 
 # Slice size for CPU-only synchronizers whose host buffer contents are unused.
@@ -32,6 +36,18 @@ _SMALL_SLICE_BYTES = 1024 * 1024
 # Seconds to wait for a TCP handshake with a listener on loopback. A closed port
 # is refused immediately, so this only bounds a hung handshake.
 _CONNECT_TIMEOUT_SECS = 5.0
+
+# 2D float32 weight shapes totaling 10 MiB (4 MiB + 4 MiB + 2 MiB), all
+# (8, 128)-tile-aligned, for controller-driven pipelined D2H + H2H verification.
+_PIPELINED_CONTROLLER_SHAPES = ((1024, 1024), (512, 2048), (512, 1024))
+
+# 0.010 Gbps == 1.25 MB/s, so 10 MiB takes ~8.4 s on H2H while local TPU D2H
+# finishes in tens of milliseconds (leaving >5 s margin beyond HBM poll window).
+_PIPELINED_EGRESS_GBPS = 0.010
+_CONTROLLER_TRANSFER_TIMEOUT_SECS = 60.0
+_HBM_POLL_TIMEOUT_SECS = 3.0
+_HBM_POLL_INTERVAL_SECS = 0.02
+_MIN_HBM_RELEASE_FRACTION = 0.85
 
 # Layer shapes for the bit-exact tests: one multiple of the TPU tile, and others
 # of several ranks that are not, so device layouts carry padding.
@@ -90,6 +106,29 @@ def _listener_accepts_connections(port: int) -> bool:
       return True
   except ConnectionRefusedError:
     return False
+
+
+def _synced_hbm_bytes() -> int:
+  gc.collect()
+  torch.accelerator.synchronize()
+  return torch.accelerator.memory_allocated()
+
+
+def _run_step_k_plus_1_on_tpu(
+    device: torch.device,
+) -> tuple[list[list[torch.Tensor]], list[list[torch.Tensor]]]:
+  """Allocates step-(k+1) TPU tensors and runs a bit-exact affine TPU op."""
+  device_tensors: list[list[torch.Tensor]] = []
+  cpu_expected: list[list[torch.Tensor]] = []
+  for layer_idx, shape in enumerate(_PIPELINED_CONTROLLER_SHAPES):
+    gen = torch.Generator().manual_seed(80_001 + layer_idx * 1_009)
+    cpu_base = torch.randint(
+        -1024, 1024, shape, generator=gen, dtype=torch.int32
+    ).to(torch.float32)
+    cpu_expected.append([cpu_base * 2.0 + 3.0])
+    device_tensors.append([cpu_base.to(device) * 2.0 + 3.0])
+  torch.accelerator.synchronize()
+  return device_tensors, cpu_expected
 
 
 class WeightSynchronizerTorchTest(parameterized.TestCase):
@@ -269,7 +308,7 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
         for _ in range(self.num_layers)
     ]
     ws_source.bind_weights(new_src_tensors)
-    ws_source.d2h()
+    ws_source.d2h().wait()
 
     new_dst_tensors = [
         [torch.full(shape, fill_value=-1.0, dtype=dtype, device=self.device)]
@@ -336,7 +375,7 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
         for _ in range(self.num_layers)
     ]
     ws_source.bind_weights(new_src_tensors)
-    ws_source.d2h()
+    ws_source.d2h().wait()
 
     new_dst_tensors = [
         [torch.full(shape, fill_value=-1.0, dtype=dtype, device=self.device)]
@@ -466,7 +505,7 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
         for _ in range(self.num_layers)
     ]
     ws_source.bind_weights(new_src_tensors)
-    ws_source.d2h()
+    ws_source.d2h().wait()
 
     new_dst_tensors = [
         [torch.full(shape, fill_value=-2.0, dtype=dtype, device=self.device)]
@@ -552,7 +591,7 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
     ws = WeightSynchronizer(
         src_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
     )
-    ws.d2h()
+    ws.d2h().wait()
 
     # Zero out new destination tensors and bind them
     zero_tensors = [
@@ -826,7 +865,7 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
     self.assertEqual(m0["last_h2d_bytes"], 0)
     self.assertEqual(m0["h2d_bandwidth_gbps"], 0.0)
 
-    ws.d2h()
+    ws.d2h().wait()
     m1 = ws.get_metrics()
     self.assertEqual(m1["d2h_call_count"], 1)
     self.assertGreaterEqual(m1["last_d2h_bytes"], logical_bytes)
@@ -843,7 +882,7 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
     self.assertEqual(m2["total_h2d_time_ms"], m2["last_h2d_time_ms"])
     self.assertGreater(m2["h2d_bandwidth_gbps"], 0.0)
 
-    ws.d2h()
+    ws.d2h().wait()
     ws.h2d()
     m3 = ws.get_metrics()
     self.assertEqual(m3["d2h_call_count"], 2)
@@ -1050,9 +1089,7 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
       expected = _random_weights(dtype, num_shards=2, step=step)
       self._copy_in_place(src_tensors, expected)
 
-      self._push_resharded(
-          ws_source, ws_dest, expected, uuid, host_tiling_mode
-      )
+      self._push_resharded(ws_source, ws_dest, expected, uuid, host_tiling_mode)
       ws_dest.wait_for_transfer_completion(uuid)
 
       self._assert_bit_exact(dst_tensors, expected, f"step {step}")
@@ -1319,6 +1356,381 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
     self.assertIn("leading (block) dimension does not match", message)
     self.assertIn("[64, 128]", message)
     self.assertIn("[4, 8, 256]", message)
+
+  def _create_ws(
+      self,
+      tensors: list[list[torch.Tensor]],
+      listener_port: int | None = None,
+  ) -> WeightSynchronizer:
+    ws = WeightSynchronizer(
+        tensors,
+        local_port=0,
+        parallelism=1,
+        listener_port=listener_port,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws.shutdown)
+    return ws
+
+  def test_d2h_returns_raiden_future_and_syncs_with_host_buffer_and_h2d(
+      self,
+  ) -> None:
+    """Verifies non-blocking d2h() future API and per-layer consumer waits."""
+    expected = _random_weights(torch.float32, num_shards=1, step=31)
+    ws = self._create_ws(self._to_device(expected))
+
+    for layer_idx, shards in enumerate(expected):
+      nbytes = shards[0].numel() * shards[0].element_size()
+      ws.get_host_buffer(layer_idx, 0)[:nbytes].zero_()
+
+    d2h_fut = ws.d2h()
+    bound_future_cls = ws_lib.RaidenFuture
+    self.assertIsInstance(d2h_fut, bound_future_cls)
+    self.assertEqual(type(d2h_fut).__name__, "RaidenFuture")
+
+    def _assert_staged_matches(
+        ref_weights: list[list[torch.Tensor]], tag: str
+    ) -> None:
+      for layer_idx, shards in enumerate(ref_weights):
+        cpu_ref = shards[0]
+        nbytes = cpu_ref.numel() * cpu_ref.element_size()
+        staged = (
+            ws.get_host_buffer(layer_idx, 0)[:nbytes]
+            .clone()
+            .view(torch.float32)
+            .reshape(cpu_ref.shape)
+        )
+        self._assert_bit_exact([[staged]], [[cpu_ref]], f"{tag}_{layer_idx}")
+
+    # Calling get_host_buffer() without d2h_fut.wait() must wait per layer.
+    _assert_staged_matches(expected, "get_host_buffer_layer")
+    d2h_fut.wait()
+    self.assertTrue(d2h_fut.is_ready())
+    self.assertTrue(d2h_fut.ok())
+    self.assertEqual(d2h_fut.error_message(), "")
+
+    with self.assertRaisesRegex(
+        RuntimeError,
+        f"layer_idx={ws.num_layers}.*num_layers={ws.num_layers}",
+    ):
+      ws.get_host_buffer(ws.num_layers, 0)
+
+    # Calling h2d() right after d2h() without .wait() must also wait on D2H.
+    updated_expected = _random_weights(torch.float32, num_shards=1, step=32)
+    ws.bind_weights(self._to_device(updated_expected))
+    d2h_fut_2 = ws.d2h()
+    ws.h2d()
+    d2h_fut_2.wait()
+    self.assertTrue(d2h_fut_2.ok())
+    _assert_staged_matches(updated_expected, "h2d_after_async_d2h_layer")
+
+  def _make_pipelined_weights(self, seed_base: int) -> list[list[torch.Tensor]]:
+    out: list[list[torch.Tensor]] = []
+    for layer_idx, shape in enumerate(_PIPELINED_CONTROLLER_SHAPES):
+      gen = torch.Generator().manual_seed(seed_base + layer_idx * 1_009)
+      out.append([torch.randn(shape, generator=gen, dtype=torch.float32)])
+    return out
+
+  def _register_pipelined_controller_units(
+      self,
+      ws_src: WeightSynchronizer,
+      ws_dst_list: list[WeightSynchronizer],
+  ) -> tuple[
+      raiden_controller.RaidenController,
+      raiden_controller.RaidenId,
+      list[raiden_controller.RaidenId],
+  ]:
+    """Creates a RaidenController and registers 1 trainer + N sampler units."""
+    var_protos = [
+        raiden_service_pb2.VariableMetadataProto(
+            name=f"layer.{layer_idx}.weight",
+            shape=list(shape),
+            mesh_shape=[1, 1],
+            layout=[1, 0],
+            item_size=4,
+            layer_idx=layer_idx,
+            sharding_spec=["", ""],
+            global_shard_indices=[0],
+        )
+        for layer_idx, shape in enumerate(_PIPELINED_CONTROLLER_SHAPES)
+    ]
+    controller = raiden_controller.RaidenController(port=0)
+    self.addCleanup(controller.worker_rpc_client.close)
+
+    def _reg(
+        role: str, idx: int, ws: WeightSynchronizer
+    ) -> raiden_controller.RaidenId:
+      unit = raiden_controller.RaidenId(role, str(idx), "weights", 0)
+      controller.register_work_unit(
+          unit,
+          shards=[f"127.0.0.1:{ws.local_port}"],
+          control_plane_rpc_address=f"127.0.0.1:{ws.listener_port}",
+          mesh_shape=[1, 1],
+          mesh_axes=["dp", "tp"],
+          variables=var_protos,
+      )
+      return unit
+
+    src_unit = _reg("trainer", 0, ws_src)
+    dst_units = [_reg("sampler", i, ws) for i, ws in enumerate(ws_dst_list)]
+    return controller, src_unit, dst_units
+
+  def _drive_skip_d2h_transfer(
+      self,
+      controller: raiden_controller.RaidenController,
+      src_unit: raiden_controller.RaidenId,
+      dst_units: list[raiden_controller.RaidenId],
+      req_id: str,
+  ) -> tuple[
+      threading.Thread, threading.Event, threading.Event, list[BaseException]
+  ]:
+    """Starts `start_transfer(..., skip_d2h=True)` on a background loop."""
+    started, done = threading.Event(), threading.Event()
+    errors: list[BaseException] = []
+
+    def _drive() -> None:
+      loop = asyncio.new_event_loop()
+      asyncio.set_event_loop(loop)
+
+      async def _run() -> None:
+        fut = controller.start_transfer(
+            src_units=[src_unit],
+            dst_units=dst_units,
+            use_block_chunks=True,
+            is_sender=True,
+            skip_d2h=True,
+            req_id=req_id,
+        )
+        started.set()
+        await asyncio.wait_for(
+            fut.wait(), timeout=_CONTROLLER_TRANSFER_TIMEOUT_SECS
+        )
+
+      try:
+        loop.run_until_complete(_run())
+      except BaseException as exc:  # pylint: disable=broad-exception-caught
+        errors.append(exc)
+      finally:
+        started.set()
+        done.set()
+        asyncio.set_event_loop(None)
+        loop.close()
+
+    thread = threading.Thread(target=_drive, daemon=True)
+    thread.start()
+    self.addCleanup(thread.join, _CONTROLLER_TRANSFER_TIMEOUT_SECS)
+    return thread, started, done, errors
+
+  def _join_driver(
+      self,
+      driver: threading.Thread,
+      errors: list[BaseException],
+      reraise: bool = True,
+  ) -> None:
+    driver.join(timeout=_CONTROLLER_TRANSFER_TIMEOUT_SECS)
+    self.assertFalse(driver.is_alive(), "H2H transfer hung.")
+    if reraise and errors:
+      raise errors[0]
+
+  def _assert_samplers_bit_exact(
+      self,
+      ws_dst_list: list[WeightSynchronizer],
+      dst_tensors_by_sampler: list[list[list[torch.Tensor]]],
+      expected: list[list[torch.Tensor]],
+      tag_prefix: str,
+  ) -> None:
+    for idx, ws_dst in enumerate(ws_dst_list):
+      ws_dst.h2d()
+      self._assert_bit_exact(
+          dst_tensors_by_sampler[idx], expected, f"{tag_prefix}_{idx}"
+      )
+
+  @parameterized.named_parameters(
+      ("one_sampler", 1),
+      ("two_samplers", 2),
+  )
+  def test_controller_pipelined_sync_unblocks_after_d2h_and_frees_hbm(
+      self, num_samplers: int
+  ) -> None:
+    """Verifies uuid-free verl flow: async d2h + skip_d2h=True frees HBM."""
+    _synced_hbm_bytes()
+    expected_step_0 = self._make_pipelined_weights(70_001)
+    expected_step_k = self._make_pipelined_weights(75_001)
+    src_bytes = sum(s[0].numel() * s[0].element_size() for s in expected_step_0)
+    min_expected_release = int(src_bytes * _MIN_HBM_RELEASE_FRACTION)
+
+    dst_tensors_by_sampler = [
+        self._zeros_on_device(expected_step_0) for _ in range(num_samplers)
+    ]
+    ws_dst_list = [
+        self._create_ws(t, listener_port=0) for t in dst_tensors_by_sampler
+    ]
+    mem_before_src_alloc = _synced_hbm_bytes()
+
+    src_tensors_0 = self._to_device(expected_step_0)
+    ws_src = self._create_ws(src_tensors_0, listener_port=0)
+    ws_src.test_only_set_bandwidth_limit(
+        test_only_simulated_egress_gbps=_PIPELINED_EGRESS_GBPS
+    )
+    baseline_mem = _synced_hbm_bytes()
+    self.assertGreaterEqual(baseline_mem - mem_before_src_alloc, src_bytes)
+
+    controller, src_unit, dst_units = self._register_pipelined_controller_units(
+        ws_src, ws_dst_list
+    )
+
+    # Sync 1 (fresh synchronizer, skip_tiling plan unknown): re-stages bound.
+    t0_sync1 = time.monotonic()
+    d2h_fut_0 = ws_src.d2h()
+    driver_0, started_0, _, errors_0 = self._drive_skip_d2h_transfer(
+        controller, src_unit, dst_units, f"verl_sync_1_s{num_samplers}"
+    )
+    self.assertTrue(started_0.wait(timeout=10.0))
+    d2h_fut_0.wait()
+    d2h_elapsed_0_s = time.monotonic() - t0_sync1
+    self.assertTrue(d2h_fut_0.ok(), d2h_fut_0.error_message())
+    self._join_driver(driver_0, errors_0)
+    total_transfer_0_s = time.monotonic() - t0_sync1
+
+    metrics_after_0 = ws_src.get_metrics()
+    self.assertGreater(int(metrics_after_0["last_detiled_bytes"]), 0)
+
+    del src_tensors_0
+    ws_src.unbind_weights()
+    mem_after_unbind_0 = _synced_hbm_bytes()
+    self.assertGreaterEqual(
+        baseline_mem - mem_after_unbind_0, min_expected_release
+    )
+    self._assert_samplers_bit_exact(
+        ws_dst_list, dst_tensors_by_sampler, expected_step_0, "sync_1_sampler"
+    )
+
+    # Sync 2 (steady-state verl flow): unbind after D2H while H2H streams.
+    step_k_tensors = self._to_device(expected_step_k)
+    ws_src.bind_weights(step_k_tensors)
+    mem_after_bind_k = _synced_hbm_bytes()
+    self.assertGreaterEqual(mem_after_bind_k - mem_after_unbind_0, src_bytes)
+
+    t0_k = time.monotonic()
+    d2h_fut_k = ws_src.d2h()
+    driver_k, started_k, done_k, errors_k = self._drive_skip_d2h_transfer(
+        controller, src_unit, dst_units, f"verl_sync_2_s{num_samplers}"
+    )
+    self.assertTrue(started_k.wait(timeout=10.0))
+    d2h_fut_k.wait()
+    d2h_elapsed_k_s = time.monotonic() - t0_k
+    self.assertTrue(d2h_fut_k.is_ready())
+    self.assertTrue(d2h_fut_k.ok(), d2h_fut_k.error_message())
+    self.assertFalse(done_k.is_set(), f"d2h_elapsed_k_s={d2h_elapsed_k_s:.4f}")
+
+    # Negative control: del alone must not free HBM while ws_src stays bound.
+    del step_k_tensors
+    mem_after_del_before_unbind = _synced_hbm_bytes()
+    self.assertLess(
+        mem_after_bind_k - mem_after_del_before_unbind, src_bytes // 4
+    )
+
+    # Keep `d2h_fut_k` alive across unbind_weights() to verify no held HBM.
+    ws_src.unbind_weights()
+    poll_deadline = time.monotonic() + _HBM_POLL_TIMEOUT_SECS
+    mem_after_unbind_k = _synced_hbm_bytes()
+    while (
+        mem_after_bind_k - mem_after_unbind_k < min_expected_release
+        and time.monotonic() < poll_deadline
+    ):
+      time.sleep(_HBM_POLL_INTERVAL_SECS)
+      mem_after_unbind_k = _synced_hbm_bytes()
+
+    self.assertGreaterEqual(
+        mem_after_bind_k - mem_after_unbind_k, min_expected_release
+    )
+    self.assertFalse(done_k.is_set(), "HBM release must precede H2H end.")
+    self.assertTrue(d2h_fut_k.ok())
+
+    step_k_plus_1_tensors, expected_step_k_plus_1 = _run_step_k_plus_1_on_tpu(
+        self.device
+    )
+    self._join_driver(driver_k, errors_k)
+    total_transfer_k_s = time.monotonic() - t0_k
+    self.assertGreater(total_transfer_k_s, d2h_elapsed_k_s)
+
+    metrics_after_k = ws_src.get_metrics()
+    self.assertEqual(int(metrics_after_k["last_detiled_bytes"]), 0)
+    self.assertEqual(
+        int(metrics_after_k["d2h_call_count"])
+        - int(metrics_after_0["d2h_call_count"]),
+        1,
+    )
+    self._assert_samplers_bit_exact(
+        ws_dst_list, dst_tensors_by_sampler, expected_step_k, "sync_2_sampler"
+    )
+    self._assert_bit_exact(
+        step_k_plus_1_tensors, expected_step_k_plus_1, "step_k_plus_1_compute"
+    )
+
+    timing_str = (
+        f"sync1_d2h_s={d2h_elapsed_0_s:.4f}"
+        f" sync1_total_s={total_transfer_0_s:.4f}"
+        f" sync2_d2h_s={d2h_elapsed_k_s:.4f}"
+        f" sync2_total_s={total_transfer_k_s:.4f}"
+    )
+    logging.info(
+        "CONTROLLER_PIPELINED_SYNC_METRICS num_samplers=%d src_bytes=%d %s"
+        " mem_after_bind_k=%d mem_after_del=%d mem_after_unbind_k=%d",
+        num_samplers,
+        src_bytes,
+        timing_str,
+        mem_after_bind_k,
+        mem_after_del_before_unbind,
+        mem_after_unbind_k,
+    )
+
+  def test_first_sync_unbound_skip_tiling_mismatch_raises(self) -> None:
+    """Unbinding before the first transfer fails loudly on layout mismatch."""
+    expected = self._make_pipelined_weights(90_001)
+    src_tensors = self._to_device(expected)
+    dst_tensors = self._zeros_on_device(expected)
+    ws_src = self._create_ws(src_tensors, listener_port=0)
+    ws_dst = self._create_ws(dst_tensors, listener_port=0)
+    controller, src_unit, dst_units = self._register_pipelined_controller_units(
+        ws_src, [ws_dst]
+    )
+
+    ws_src.d2h().wait()
+    ws_src.unbind_weights()
+
+    bad_req_id = "first_sync_unbound_mismatch"
+    driver, _, _, errors = self._drive_skip_d2h_transfer(
+        controller, src_unit, dst_units, bad_req_id
+    )
+    self._join_driver(driver, errors, reraise=False)
+
+    plan = controller.get_plan(bad_req_id)
+    self.assertIsNotNone(plan)
+    assert plan is not None
+    self.assertTrue(any(plan.skip_tiling.values()), f"{plan.skip_tiling}")
+
+    self.assertLen(errors, 1)
+    err_msg = str(errors[0])
+    for token in (
+        "weights_0",
+        "skip_tiling=false",
+        "skip_tiling=true",
+        "skip_d2h=false",
+        "unbound",
+    ):
+      self.assertIn(token, err_msg)
+
+    # Positive recovery: rebinding and staging succeeds now that plan is cached.
+    ws_src.bind_weights(src_tensors)
+    d2h_fut = ws_src.d2h()
+    driver_ok, _, _, errors_ok = self._drive_skip_d2h_transfer(
+        controller, src_unit, dst_units, "first_sync_rebound_recovery"
+    )
+    d2h_fut.wait()
+    self._join_driver(driver_ok, errors_ok)
+    ws_dst.h2d()
+    self._assert_bit_exact(dst_tensors, expected, "rebound_after_mismatch")
 
 
 if __name__ == "__main__":

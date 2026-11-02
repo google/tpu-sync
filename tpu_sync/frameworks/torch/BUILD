@@ -60,6 +60,7 @@ cc_library(
     deps = [
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
+        ":torch_tpu_utils",
         ":torch_utils",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/memory",
@@ -459,6 +460,7 @@ cc_library(
     deps = [
         # buildcleaner: keep
         ":torch_tpu_tensor_buffer_headers",
+        ":torch_tpu_utils_mock",
         ":torch_utils_mock",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/memory",

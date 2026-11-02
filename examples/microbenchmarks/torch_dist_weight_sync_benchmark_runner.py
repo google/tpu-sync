@@ -249,7 +249,7 @@ def _source_worker_fn(local_rank: int) -> None:
 
   # 6. Benchmark D2H
   # Warmup
-  ws.d2h()
+  ws.d2h().wait()
   torch.tpu.synchronize()
   if dist.is_initialized():
     dist.barrier()
@@ -258,7 +258,7 @@ def _source_worker_fn(local_rank: int) -> None:
   num_iters = _NUM_ITERATIONS.value
   for _ in range(num_iters):
     t0 = time.perf_counter()
-    ws.d2h()
+    ws.d2h().wait()
     torch.tpu.synchronize()
     if dist.is_initialized():
       dist.barrier()

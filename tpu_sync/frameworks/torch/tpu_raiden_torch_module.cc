@@ -768,17 +768,13 @@ NB_MODULE(_tpu_raiden_torch, m) {
       .def(
           "D2h",
           [](WeightSynchronizer& self) {
-            auto status_or_future = self.D2h();
-            if (!status_or_future.ok()) {
+            absl::StatusOr<raiden::PjRtCopyFuture> d2h_future = self.D2h();
+            if (!d2h_future.ok()) {
               throw std::runtime_error(
                   "WeightSynchronizer D2H failed: " +
-                  std::string(status_or_future.status().message()));
+                  std::string(d2h_future.status().message()));
             }
-            absl::Status status = status_or_future.value().Await();
-            if (!status.ok()) {
-              throw std::runtime_error("WeightSynchronizer D2H copy failed: " +
-                                       std::string(status.message()));
-            }
+            return tpu_raiden::RaidenFuture{*std::move(d2h_future)};
           },
           nb::call_guard<nb::gil_scoped_release>())
       .def(
@@ -801,9 +797,17 @@ NB_MODULE(_tpu_raiden_torch, m) {
           "get_host_buffer",
           [](WeightSynchronizer& self, size_t layer_idx, size_t shard_idx)
               -> nb::ndarray<uint8_t, nb::pytorch, nb::c_contig> {
-            const uint8_t* ptr = self.GetHostBufferPtr(layer_idx, shard_idx);
-            if (!ptr) {
-              throw std::runtime_error("Invalid layer or shard index");
+            const uint8_t* ptr = nullptr;
+            {
+              nb::gil_scoped_release release;
+              absl::StatusOr<const uint8_t*> host_ptr =
+                  self.WaitAndGetHostBufferPtr(layer_idx, shard_idx);
+              if (!host_ptr.ok()) {
+                throw std::runtime_error(
+                    absl::StrCat("WeightSynchronizer get_host_buffer failed: ",
+                                 host_ptr.status().message()));
+              }
+              ptr = *host_ptr;
             }
             size_t size = self.GetHostBufferSize(layer_idx, shard_idx);
             if (size == 0) {

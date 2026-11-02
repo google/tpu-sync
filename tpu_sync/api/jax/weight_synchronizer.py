@@ -163,6 +163,8 @@ class WeightSynchronizer:
 
   def d2h(self) -> None:
     """Triggers asynchronous Device-to-Host (D2H) copy of current weights to Host buffer."""
+    # TODO(raiden-eng): Return the copy's `RaidenFuture` without blocking, as
+    # the PyTorch `WeightSynchronizer.d2h()` does.
     self._impl.D2h()
 
   def h2d(self) -> None:

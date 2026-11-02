@@ -103,6 +103,7 @@ inline constexpr absl::string_view kHostNumaMemoryBytes =
     "host_numa_memory_bytes";
 inline constexpr absl::string_view kStorageFilesystemBytes =
     "storage_filesystem_bytes";
+inline constexpr absl::string_view kStorageIoTimeMs = "storage_io_time_ms";
 
 inline constexpr absl::string_view kKvRecallBlocksTotal =
     "kv_recall_blocks_total";
@@ -197,6 +198,9 @@ inline constexpr absl::string_view kStorageBytesTotal =
 inline constexpr absl::string_view kStorageFilesystemBytes =
     "Secondary storage filesystem capacity in bytes by mount and state (total, "
     "used, free)";
+inline constexpr absl::string_view kStorageIoTimeMs =
+    "Non-overlapping secondary storage I/O transfer duration in "
+    "milliseconds.";
 
 inline constexpr absl::string_view kWeightSyncSentBytesTotal =
     "Total count of bytes sent over TPU Raiden weight sync interfaces.";
@@ -311,6 +315,8 @@ inline constexpr absl::string_view kStorageFilesystemBytesLabels[] = {kMount,
                                                                       kState};
 inline constexpr absl::string_view kStorageMetadataCheckLabels[] = {kDpRank,
                                                                     kResult};
+inline constexpr absl::string_view kStorageIoLabels[] = {kLocalRank,
+                                                         kDirection};
 
 }  // namespace metric_labels
 
@@ -325,6 +331,7 @@ using metric_labels::kPcieTransferLabels;
 using metric_labels::kSentBytesLabels;
 using metric_labels::kStorageBytesLabels;
 using metric_labels::kStorageFilesystemBytesLabels;
+using metric_labels::kStorageIoLabels;
 using metric_labels::kStorageMetadataCheckLabels;
 using metric_labels::kTransferFailuresLabels;
 
@@ -427,6 +434,12 @@ inline constexpr MetricMetadata kStorageFilesystemBytes{
     .description = metric_descriptions::kStorageFilesystemBytes,
     .type = MetricType::kGauge,
     .label_names = kStorageFilesystemBytesLabels};
+
+inline constexpr MetricMetadata kStorageIoTimeMs{
+    .name = metric_names::kStorageIoTimeMs,
+    .description = metric_descriptions::kStorageIoTimeMs,
+    .type = MetricType::kHistogram,
+    .label_names = kStorageIoLabels};
 inline constexpr MetricMetadata kWeightSyncSentBytesTotal{
     .name = metric_names::kWeightSyncSentBytesTotal,
     .description = metric_descriptions::kWeightSyncSentBytesTotal,
@@ -532,6 +545,7 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kHostNumaMemoryBytes,
     kStorageFilesystemBytes,
     kStorageMetadataCheckTotal,
+    kStorageIoTimeMs,
     // Weight Sync Metrics
     kWeightSyncSentBytesTotal,
     kWeightSyncReceivedBytesTotal,

@@ -326,6 +326,20 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_metadata::kStorageFilesystemBytes.type, MetricType::kGauge);
   EXPECT_THAT(metric_metadata::kStorageFilesystemBytes.label_names,
               ElementsAre(metric_labels::kMount, metric_labels::kState));
+
+  // StorageIoTimeMs
+  EXPECT_EQ(metric_names::kStorageIoTimeMs, "storage_io_time_ms");
+  EXPECT_EQ(metric_descriptions::kStorageIoTimeMs,
+            "Non-overlapping secondary storage I/O transfer duration in "
+            "milliseconds.");
+  EXPECT_EQ(metric_metadata::kStorageIoTimeMs.name, "storage_io_time_ms");
+  EXPECT_EQ(metric_metadata::kStorageIoTimeMs.description,
+            "Non-overlapping secondary storage I/O transfer duration in "
+            "milliseconds.");
+  EXPECT_EQ(metric_metadata::kStorageIoTimeMs.type, MetricType::kHistogram);
+  EXPECT_THAT(
+      metric_metadata::kStorageIoTimeMs.label_names,
+      ElementsAre(metric_labels::kLocalRank, metric_labels::kDirection));
   // Weight Sync Metrics
   EXPECT_EQ(metric_names::kWeightSyncSentBytesTotal,
             "weight_sync_sent_bytes_total");
@@ -525,6 +539,10 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(metric_labels::kStorageFilesystemBytesLabels,
               ElementsAre(metric_labels::kMount, metric_labels::kState));
 
+  // Storage I/O Labels
+  EXPECT_THAT(
+      metric_labels::kStorageIoLabels,
+      ElementsAre(metric_labels::kLocalRank, metric_labels::kDirection));
   // All Metrics
   // clang-format off
   EXPECT_THAT(
@@ -548,6 +566,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kHostNumaMemoryBytes,
           metric_metadata::kStorageFilesystemBytes,
           metric_metadata::kStorageMetadataCheckTotal,
+          metric_metadata::kStorageIoTimeMs,
           metric_metadata::kWeightSyncSentBytesTotal,
           metric_metadata::kWeightSyncReceivedBytesTotal,
           metric_metadata::kWeightSyncTransferFailuresTotal,

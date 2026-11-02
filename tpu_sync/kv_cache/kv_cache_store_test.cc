@@ -8597,6 +8597,128 @@ TEST_F(KVRemoteSaveBlocksMetricsTest, RemoteDramPollOutcomes) {
   testing::Mock::VerifyAndClearExpectations(mock_metrics_);
 }
 
+class KVEvictedBlocksMetricsTest : public KVSaveBlocksMetricsTest {
+ protected:
+  void SetUp() override {
+    KVSaveBlocksMetricsTest::SetUp();
+    EXPECT_CALL(*mock_metrics_,
+                IncrementCounter(
+                    testing::Ne(telemetry::metric_names::kKvEvictedBlocksTotal),
+                    testing::_, testing::_))
+        .Times(testing::AnyNumber());
+  }
+
+  void ExpectEvictedBlocks(uint64_t count, absl::string_view dp_rank = "0") {
+    const telemetry::MetricLabel expected_labels[] = {
+        {telemetry::metric_labels::kDpRank, dp_rank},
+    };
+    EXPECT_CALL(
+        *mock_metrics_,
+        IncrementCounter(telemetry::metric_names::kKvEvictedBlocksTotal,
+                         UnorderedElementsAreArray(expected_labels), count));
+  }
+
+  void InsertColdHostBlocks(const std::vector<std::string>& hashes) {
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::vector<int> ids,
+        KVCacheStoreTest::AllocateBlockIds(*store_, hashes.size()));
+    std::vector<RaidenBlockId> slices;
+    for (int id : ids) {
+      slices.emplace_back(local_id_, id, /*device_block_id=*/-1,
+                          BlockStatus::HOST);
+    }
+    ABSL_ASSERT_OK(store_->Insert(hashes, slices, /*on_host=*/true));
+    store_->Release(hashes);
+  }
+};
+
+TEST_F(KVEvictedBlocksMetricsTest,
+       DirectEvictFiltersNonEvictableAndCountsUniqueHostBlocks) {
+  MakeStore({.num_host_blocks = 4, .with_storage = false, .dp_rank = 3});
+
+  // Empty Evict emits no counters.
+  EXPECT_EQ(KVCacheStoreTest::Evict(*store_, /*block_hashes=*/{}), 0);
+
+  // Populate unpinned HBM block and mixed pinned/unpinned host blocks.
+  ABSL_ASSERT_OK(store_->Insert({"hbm0"}, {HbmSlice(0)}, /*on_host=*/false));
+  store_->Release({"hbm0"});
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> ids,
+                          KVCacheStoreTest::AllocateBlockIds(*store_, 3));
+  ABSL_ASSERT_OK(
+      store_->Insert({"pinned0", "host0", "host1"},
+                     {RaidenBlockId(local_id_, ids[0], /*device_block_id=*/-1,
+                                    BlockStatus::HOST),
+                      RaidenBlockId(local_id_, ids[1], /*device_block_id=*/-1,
+                                    BlockStatus::HOST),
+                      RaidenBlockId(local_id_, ids[2], /*device_block_id=*/-1,
+                                    BlockStatus::HOST)},
+                     /*on_host=*/true));
+  store_->Release({"host0", "host1"});
+
+  // Mixed batch with HBM-only, pinned, and duplicate unpinned host hashes
+  // counts only the 2 unique evicted host blocks.
+  ExpectEvictedBlocks(2, /*dp_rank=*/"3");
+  EXPECT_EQ(KVCacheStoreTest::Evict(
+                *store_, {"hbm0", "pinned0", "host0", "host0", "host1"}),
+            2);
+}
+
+TEST_F(KVEvictedBlocksMetricsTest, AllocationDrivenEvictionOnHostExhaustion) {
+  MakeStore({.num_host_blocks = 4, .with_storage = false, .dp_rank = 2});
+  InsertColdHostBlocks({"c0", "c1", "c2", "c3"});
+  ASSERT_EQ(FreeBlocks(), 0);
+
+  // Local Save with 0 free host blocks evicts 2 cold LRU blocks via
+  // AllocateBlockIds.
+  ABSL_ASSERT_OK(store_->Insert({"s_hbm0", "s_hbm1"},
+                                {HbmSlice(0), HbmSlice(1)},
+                                /*on_host=*/false));
+  ExpectEvictedBlocks(2, /*dp_rank=*/"2");
+  ABSL_ASSERT_OK(store_->Save({"s_hbm0", "s_hbm1"}));
+  WaitForSaveDone(*store_, /*expected=*/2);
+}
+
+TEST_F(KVEvictedBlocksMetricsTest,
+       NonEvictionDeallocationsDoNotEmitEvictedBlocks) {
+  MakeStore({.num_host_blocks = 4, .with_storage = false, .dp_rank = 1});
+
+  // Failed local save rolls back newly allocated host blocks via
+  // DeallocateBlockIds without emitting eviction counters.
+  mgr_.fail_transfers = true;
+  ABSL_ASSERT_OK(
+      store_->Insert({"fail_save0"}, {HbmSlice(0)}, /*on_host=*/false));
+  ABSL_ASSERT_OK(store_->Save({"fail_save0"}));
+  WaitForSaveDone(*store_, /*expected=*/1);
+}
+
+using KVEvictedBlocksSweepMetricsTest = EvictSweepTest;
+
+TEST_F(KVEvictedBlocksSweepMetricsTest, SweepEvictionEmitsEvictedBlocks) {
+  auto mock_backend =
+      std::make_unique<NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* mock_metrics = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset metrics_reset(std::move(mock_backend));
+
+  const telemetry::MetricLabel labels[] = {
+      {telemetry::metric_labels::kDpRank, "3"},
+  };
+  EXPECT_CALL(*mock_metrics,
+              IncrementCounter(telemetry::metric_names::kKvEvictedBlocksTotal,
+                               UnorderedElementsAreArray(labels), 4));
+  EXPECT_CALL(*mock_metrics,
+              IncrementCounter(
+                  testing::Ne(telemetry::metric_names::kKvEvictedBlocksTotal),
+                  testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  RaidenId src{"sweep_src_drop", "0", "kv", /*data_replica_idx=*/3};
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheStore> store,
+                          MakeSweepStore(src, "sweepgroup_bottom"));
+  PopulateCold(*store, src, {"a", "b", "c", "d", "e", "f"});
+  AwaitSweepFreed(*store, 6);
+  EXPECT_EQ(fake_destination_.write_calls(), 0);
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

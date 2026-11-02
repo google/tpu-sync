@@ -62,6 +62,7 @@
 #include "tpu_sync/kv_cache/reshard/reshard_service.h"
 #include "tpu_sync/kv_cache/store_monitor.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden {
@@ -231,6 +232,18 @@ void MarkSaveFailed(BlockTracker& save_tracker, absl::string_view dp_rank,
   IncrementKvSaveBlocks(dp_rank, tier, telemetry::metric_labels::kOutcomeFailed,
                         block_hashes.size());
   save_tracker.MarkFailed(block_hashes);
+}
+
+// Increments `kv_evicted_blocks_total` by `count` with the given store
+// identity label. `dp_rank` must be a pre-rendered decimal string.
+// No-op when `count == 0`.
+void IncrementKvEvictedBlocks(absl::string_view dp_rank, uint64_t count) {
+  if (count == 0) return;
+  const telemetry::MetricLabel labels[] = {
+      {telemetry::metric_labels::kDpRank, dp_rank},
+  };
+  telemetry::RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
+      telemetry::metric_names::kKvEvictedBlocksTotal, labels, count);
 }
 
 }  // namespace
@@ -1872,6 +1885,7 @@ size_t KVCacheStore::Evict(const std::vector<std::string>& block_hashes) {
   }
 
   DeallocateBlockIds(host_ids_to_deallocate);
+  IncrementKvEvictedBlocks(dp_rank_str_, host_ids_to_deallocate.size());
 
   // Snapshot the registered callback and invoke it after unlocking: it runs
   // arbitrary user code (possibly re-entering this store, and in the Python

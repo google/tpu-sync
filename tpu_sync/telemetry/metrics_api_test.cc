@@ -512,6 +512,8 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(metric_labels::kKvSaveBlocksLabels,
               ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
                           metric_labels::kOutcome));
+  EXPECT_THAT(metric_labels::kKvEvictedBlocksLabels,
+              ElementsAre(metric_labels::kDpRank));
 
   EXPECT_EQ(metric_names::kKvRecallBlocksTotal, "kv_recall_blocks_total");
   EXPECT_EQ(metric_descriptions::kKvRecallBlocksTotal,
@@ -539,6 +541,19 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(metric_metadata::kKvSaveBlocksTotal.label_names,
               ElementsAre(metric_labels::kDpRank, metric_labels::kTier,
                           metric_labels::kOutcome));
+
+  EXPECT_EQ(metric_names::kKvEvictedBlocksTotal, "kv_evicted_blocks_total");
+  EXPECT_EQ(
+      metric_descriptions::kKvEvictedBlocksTotal,
+      "Cumulative count of KV cache blocks evicted from the host DRAM pool.");
+  EXPECT_EQ(metric_metadata::kKvEvictedBlocksTotal.name,
+            "kv_evicted_blocks_total");
+  EXPECT_EQ(
+      metric_metadata::kKvEvictedBlocksTotal.description,
+      "Cumulative count of KV cache blocks evicted from the host DRAM pool.");
+  EXPECT_EQ(metric_metadata::kKvEvictedBlocksTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kKvEvictedBlocksTotal.label_names,
+              ElementsAre(metric_labels::kDpRank));
 
   // Storage Bytes Labels
   EXPECT_THAT(
@@ -580,6 +595,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kBufferAllocatedBytes,
           metric_metadata::kKvRecallBlocksTotal,
           metric_metadata::kKvSaveBlocksTotal,
+          metric_metadata::kKvEvictedBlocksTotal,
           metric_metadata::kStorageBytesTotal,
           metric_metadata::kHostMemoryBreakdownBytes,
           metric_metadata::kHostNumaMemoryBytes,

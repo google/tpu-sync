@@ -1001,6 +1001,7 @@ cc_library(
         "//tpu_sync/kv_cache/global_registry:global_registry_client_cc",
         "//tpu_sync/kv_cache/reshard:reshard_service",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",

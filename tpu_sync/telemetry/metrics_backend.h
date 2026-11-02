@@ -108,6 +108,8 @@ inline constexpr absl::string_view kStorageIoTimeMs = "storage_io_time_ms";
 inline constexpr absl::string_view kKvRecallBlocksTotal =
     "kv_recall_blocks_total";
 inline constexpr absl::string_view kKvSaveBlocksTotal = "kv_save_blocks_total";
+inline constexpr absl::string_view kKvEvictedBlocksTotal =
+    "kv_evicted_blocks_total";
 
 inline constexpr absl::string_view kWeightSyncSentBytesTotal =
     "weight_sync_sent_bytes_total";
@@ -183,6 +185,8 @@ inline constexpr absl::string_view kKvRecallBlocksTotal =
 inline constexpr absl::string_view kKvSaveBlocksTotal =
     "Cumulative count of KV cache block save attempts across tiers and "
     "outcomes.";
+inline constexpr absl::string_view kKvEvictedBlocksTotal =
+    "Cumulative count of KV cache blocks evicted from the host DRAM pool.";
 
 inline constexpr absl::string_view kH2dBytesTotal =
     "Cumulative bytes requested for Host DRAM to Device HBM transfers that "
@@ -326,6 +330,7 @@ inline constexpr absl::string_view kKvRecallBlocksLabels[] = {kDpRank, kTier,
                                                               kOutcome};
 inline constexpr absl::string_view kKvSaveBlocksLabels[] = {kDpRank, kTier,
                                                             kOutcome};
+inline constexpr absl::string_view kKvEvictedBlocksLabels[] = {kDpRank};
 inline constexpr absl::string_view kStorageBytesLabels[] = {kLocalRank,
                                                             kDirection};
 inline constexpr absl::string_view kHostMemoryBreakdownLabels[] = {kComponent};
@@ -345,6 +350,7 @@ namespace metric_metadata {
 using metric_labels::kDirectionLabels;
 using metric_labels::kHostMemoryBreakdownLabels;
 using metric_labels::kHostNumaMemoryLabels;
+using metric_labels::kKvEvictedBlocksLabels;
 using metric_labels::kKvRecallBlocksLabels;
 using metric_labels::kKvSaveBlocksLabels;
 using metric_labels::kP2pTransferTimeLabels;
@@ -437,6 +443,12 @@ inline constexpr MetricMetadata kKvSaveBlocksTotal{
     .description = metric_descriptions::kKvSaveBlocksTotal,
     .type = MetricType::kCounter,
     .label_names = kKvSaveBlocksLabels};
+
+inline constexpr MetricMetadata kKvEvictedBlocksTotal{
+    .name = metric_names::kKvEvictedBlocksTotal,
+    .description = metric_descriptions::kKvEvictedBlocksTotal,
+    .type = MetricType::kCounter,
+    .label_names = kKvEvictedBlocksLabels};
 
 inline constexpr MetricMetadata kStorageBytesTotal{
     .name = metric_names::kStorageBytesTotal,
@@ -568,6 +580,7 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kBufferAllocatedBytes,
     kKvRecallBlocksTotal,
     kKvSaveBlocksTotal,
+    kKvEvictedBlocksTotal,
     kStorageBytesTotal,
     kHostMemoryBreakdownBytes,
     kHostNumaMemoryBytes,

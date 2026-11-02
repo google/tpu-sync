@@ -85,8 +85,6 @@ cc_library(
         "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api/v1:ip_util",
         "@peregrine//peregrine/src/api/v1:socket_util",
-        "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",
-        "@xla//xla/tsl/concurrency:future",
     ],
 )
 

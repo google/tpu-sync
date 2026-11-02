@@ -215,8 +215,8 @@ TEST(BlockTransportServerPullSessionTest, InvalidArgumentsRejected) {
   EXPECT_THAT(session->uuid(), Eq(77u));
   EXPECT_THAT(session->kind(), Eq(BlockTransportServerSession::Kind::kPull));
 
-  absl::Status start_status = session->StartStream(/*client_fd=*/-1, header);
-  EXPECT_FALSE(start_status.ok());
+  EXPECT_DEBUG_DEATH(
+      session->StartStream(/*client_fd=*/-1, header).IgnoreError(), "");
 }
 
 TEST(BlockTransportServerPullSessionTest, UuidMismatchRejected) {

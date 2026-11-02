@@ -23,7 +23,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <iterator>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -46,7 +45,6 @@
 #include "absl/types/span.h"
 #include "peregrine/src/api/v1/ip_util.h"
 #include "peregrine/src/api/v1/socket_util.h"
-#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/telemetry/label_util.h"
@@ -74,19 +72,6 @@ using ::tpu_raiden::telemetry::MetricLabel;
 using ::tpu_raiden::telemetry::RaidenMetricStore;
 namespace metric_labels = ::tpu_raiden::telemetry::metric_labels;
 namespace metric_names = ::tpu_raiden::telemetry::metric_names;
-
-void RecordTransferFailure(const absl::Status& status,
-                           absl::string_view direction, uint64_t count = 1) {
-  RaidenMetricStore& store = RaidenMetricStore::GetGlobalMetricStore();
-  if (status.ok() || !store.HasBackends()) return;
-  const absl::string_view error_code =
-      absl::StatusCodeToStringView(status.code());
-  const MetricLabel labels[] = {
-      {metric_labels::kErrorCode, error_code},
-      {metric_labels::kDirection, direction},
-  };
-  store.IncrementCounter(metric_names::kTransferFailuresTotal, labels, count);
-}
 
 constexpr MetricLabel kPushLabels[] = {
     {.key = metric_labels::kDirection, .value = metric_labels::kDirectionPush},

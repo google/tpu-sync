@@ -196,6 +196,10 @@ void WeightSynchronizerListener::ExecuteControlRequest(
             resp->set_message(std::string(status.message()));
             LOG(ERROR) << "PushWeights native execution failed: " << status;
           }
+        } else if (engine != nullptr && req.has_start_transfer_request() &&
+                   req.start_transfer_request().use_block_chunks() &&
+                   req.start_transfer_request().uuid() != 0) {
+          engine->MarkD2hCompleted(req.start_transfer_request().uuid());
         }
       }
     } else {

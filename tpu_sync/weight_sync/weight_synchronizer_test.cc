@@ -55,6 +55,7 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
+#include "tpu_sync/weight_sync/weight_synchronizer_listener.h"
 
 ABSL_DECLARE_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size);
 
@@ -3723,6 +3724,385 @@ TEST_F(WeightSynchronizerTest, AutoH2dOnDataReceivedRecordsH2dBytes) {
   EXPECT_EQ(m.total_h2d_bytes, s.total_device_bytes);
   EXPECT_GT(m.last_h2d_time_ms, 0.0);
   EXPECT_DOUBLE_EQ(m.total_h2d_time_ms, m.last_h2d_time_ms);
+}
+
+TEST_F(WeightSynchronizerTest,
+       WaitForD2hCompletionUnblocksBeforeRateLimitedH2hAndAllowsUnbind) {
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kNumShards = 2;
+  constexpr int64_t kRows = 256;
+  constexpr int64_t kCols = 256;
+  constexpr size_t kSliceBytes = kRows * kCols * sizeof(float);  // 256 KiB
+  constexpr uint64_t kEgressBytesPerSec = 2'000'000;  // ~524 ms for 1 MiB H2H
+  constexpr uint64_t kUuid = 92001;
+
+  xla::CpuClientOptions options;
+  options.cpu_device_count = kNumShards;
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::PjRtClient> client,
+                       xla::GetXlaPjrtCpuClient(options));
+  ASSERT_GE(client->addressable_devices().size(), kNumShards);
+
+  const xla::Layout tiled_layout =
+      xla::LayoutUtil::MakeLayout({1, 0}, {xla::Tile({8, 128})});
+  std::vector<std::vector<uint8_t>> host_patterns(kNumLayers * kNumShards);
+  std::vector<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffers;
+  std::vector<std::vector<raiden::RaidenBufferHandle>> src_buffers(kNumLayers);
+  std::vector<std::weak_ptr<raiden::RawBufferHolder>> weak_holds;
+  weak_holds.reserve(kNumLayers * kNumShards);
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t s = 0; s < kNumShards; ++s) {
+      std::vector<uint8_t>& pattern = host_patterns[l * kNumShards + s];
+      pattern.resize(kSliceBytes);
+      for (size_t b = 0; b < kSliceBytes; ++b) {
+        pattern[b] = static_cast<uint8_t>((l * 73 + s * 37 + b) % 251 + 1);
+      }
+      TF_ASSERT_OK_AND_ASSIGN(
+          xla::PjRtMemorySpace * memory_space,
+          client->addressable_devices()[s]->default_memory_space());
+      TF_ASSERT_OK_AND_ASSIGN(
+          std::unique_ptr<xla::PjRtBuffer> pjrt_buf,
+          client->BufferFromHostBuffer(
+              pattern.data(), xla::PrimitiveType::F32, {kRows, kCols},
+              /*byte_strides=*/std::nullopt,
+              xla::PjRtClient::HostBufferSemantics::
+                  kImmutableUntilTransferCompletes,
+              /*on_done_with_host_buffer=*/nullptr, memory_space,
+              /*device_layout=*/nullptr));
+      TF_ASSERT_OK_AND_ASSIGN(raiden::RaidenBufferHandle handle,
+                           raiden::RaidenBufferHandle::Acquire(pjrt_buf.get()));
+      if (!handle.c_hold) {
+        handle.c_hold = std::make_shared<raiden::RawBufferHolder>(
+            /*api=*/nullptr, /*ext=*/nullptr, /*buf=*/nullptr);
+      }
+      weak_holds.push_back(handle.c_hold);
+      if (l == 1) {
+        handle.shape = xla::ShapeUtil::MakeShapeWithDenseLayout(
+            xla::PrimitiveType::F32, {kRows, kCols},
+            tiled_layout.minor_to_major(), tiled_layout.tiles());
+      }
+      src_buffers[l].push_back(std::move(handle));
+      pjrt_buffers.push_back(std::move(pjrt_buf));
+    }
+  }
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws_source,
+      WeightSynchronizerBase::Create(src_buffers, /*local_port=*/0));
+  src_buffers.clear();
+  for (const auto& weak_hold : weak_holds) {
+    EXPECT_FALSE(weak_hold.expired());
+  }
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws_dest,
+      WeightSynchronizerBase::Create(kNumLayers, kNumShards, kSliceBytes,
+                                     /*local_port=*/0,
+                                     /*host_blocks_to_allocate=*/1));
+  ASSERT_TRUE(ws_dest->local_port().has_value());
+  const std::string dest_peer =
+      absl::StrCat("127.0.0.1:", *ws_dest->local_port());
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t s = 0; s < kNumShards; ++s) {
+      std::memset(const_cast<uint8_t*>(ws_source->GetHostPointer(l, s)), 0,
+                  kSliceBytes);
+      std::memset(const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s)), 0,
+                  kSliceBytes);
+    }
+  }
+
+  auto egress_limiter =
+      std::make_shared<peregrine::v1::TestOnlyRateLimiter>(kEgressBytesPerSec);
+  ws_source->SetTestOnlyRateLimiters(egress_limiter, /*ingress=*/nullptr);
+
+  ABSL_ASSERT_OK(
+      ws_dest->RegisterExpectedChunks(kUuid, kNumLayers * kNumShards));
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(false);
+  request.set_uuid(kUuid);
+  for (size_t s = 0; s < kNumShards; ++s) {
+    auto& sched = (*request.mutable_shard_push_schedules())[s];
+    for (size_t l = 0; l < kNumLayers; ++l) {
+      auto* entry = sched.add_entries();
+      entry->set_dst_peer(dest_peer);
+      entry->set_dst_shard_idx(static_cast<int32_t>(s));
+      entry->set_src_offset_bytes(0);
+      entry->set_dst_offset_bytes(0);
+      entry->set_size_bytes(kSliceBytes);
+      entry->set_count(1);
+      entry->set_layer_idx(static_cast<int32_t>(l));
+    }
+  }
+
+  absl::Notification push_done;
+  absl::Status push_status;
+  std::thread push_thread([&]() {
+    push_status = ws_source->PushWeightsResharded(request);
+    push_done.Notify();
+  });
+
+  ABSL_ASSERT_OK(ws_source->WaitForD2hCompletion(kUuid, absl::Seconds(10)));
+  EXPECT_FALSE(push_done.HasBeenNotified());
+
+  // Release PJRT buffer holds immediately while H2H network broadcast is still
+  // streaming from staged host buffers, and verify no background D2H future
+  // retains any buffer hold during active H2H.
+  ws_source->UnbindWeights();
+  for (const auto& weak_hold : weak_holds) {
+    EXPECT_TRUE(weak_hold.expired());
+  }
+  EXPECT_FALSE(push_done.HasBeenNotified());
+  absl::Status unbound_d2h = ws_source->D2h().status();
+  EXPECT_TRUE(absl::IsFailedPrecondition(unbound_d2h));
+  EXPECT_TRUE(absl::StrContains(unbound_d2h.message(), "unbound"));
+
+  push_thread.join();
+  ABSL_ASSERT_OK(push_status);
+  ABSL_ASSERT_OK(ws_dest->WaitForTransferCompletion(kUuid));
+
+  // Layer 0 was untiled, so its staged host bytes match the raw device pattern
+  // byte-for-byte. Layer 1 was tiled on device and detiled on host, so verify
+  // non-zero staged payload arrived accurately on destination.
+  for (size_t s = 0; s < kNumShards; ++s) {
+    const std::vector<uint8_t>& expected_l0 = host_patterns[s];
+    EXPECT_EQ(std::memcmp(ws_dest->GetHostPointer(/*layer_idx=*/0, s),
+                          expected_l0.data(), kSliceBytes),
+              0);
+    EXPECT_EQ(
+        std::memcmp(ws_dest->GetHostPointer(/*layer_idx=*/1, s),
+                    ws_source->GetHostPointer(/*layer_idx=*/1, s), kSliceBytes),
+        0);
+  }
+}
+
+TEST_F(WeightSynchronizerTest,
+       WaitForD2hCompletionPreRpcWaiterSkipD2hAndIdleListener) {
+  constexpr size_t kSliceBytes = 4096;
+  const std::vector<DeviceLayerSpec> specs = {{xla::U8, {kSliceBytes}, {}}};
+  DeviceBackedSynchronizer source;
+  ASSERT_NO_FATAL_FAILURE(
+      CreateDeviceBackedSynchronizer(specs, /*auto_h2d=*/false, &source));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> dest,
+      WeightSynchronizerBase::Create(/*num_layers=*/1, /*num_shards=*/1,
+                                     kSliceBytes, /*local_port=*/0,
+                                     /*host_blocks_to_allocate=*/1));
+  ASSERT_TRUE(dest->local_port().has_value());
+  const std::string dest_peer = absl::StrCat("127.0.0.1:", *dest->local_port());
+
+  // 1. Pre-RPC race: waiter blocks on kUuidPreRpc before PushWeightsResharded.
+  constexpr uint64_t kUuidPreRpc = 92010;
+  absl::Notification waiter_started;
+  absl::Status waiter_status;
+  std::thread waiter_thread([&]() {
+    waiter_started.Notify();
+    waiter_status =
+        source.ws->WaitForD2hCompletion(kUuidPreRpc, absl::Seconds(5));
+  });
+  waiter_started.WaitForNotification();
+  absl::SleepFor(absl::Milliseconds(25));
+
+  ABSL_ASSERT_OK(dest->RegisterExpectedChunks(kUuidPreRpc, 1));
+  tpu_sync::rpc::StartTransferRequest req1;
+  req1.set_skip_d2h(false);
+  req1.set_uuid(kUuidPreRpc);
+  auto* e1 = (*req1.mutable_shard_push_schedules())[0].add_entries();
+  e1->set_dst_peer(dest_peer);
+  e1->set_dst_shard_idx(0);
+  e1->set_size_bytes(kSliceBytes);
+  e1->set_count(1);
+  e1->set_layer_idx(0);
+
+  ABSL_ASSERT_OK(source.ws->PushWeightsResharded(req1));
+  waiter_thread.join();
+  ABSL_ASSERT_OK(waiter_status);
+  ABSL_ASSERT_OK(dest->WaitForTransferCompletion(kUuidPreRpc));
+  EXPECT_EQ(std::memcmp(dest->GetHostPointer(0, 0),
+                        source.placeholders[0].data(), kSliceBytes),
+            0);
+
+  // 2. skip_d2h=true marks D2H completed immediately.
+  constexpr uint64_t kUuidSkipD2h = 92011;
+  ABSL_ASSERT_OK(dest->RegisterExpectedChunks(kUuidSkipD2h, 1));
+  tpu_sync::rpc::StartTransferRequest req2 = req1;
+  req2.set_uuid(kUuidSkipD2h);
+  req2.set_skip_d2h(true);
+  ABSL_ASSERT_OK(source.ws->PushWeightsResharded(req2));
+  ABSL_ASSERT_OK(
+      source.ws->WaitForD2hCompletion(kUuidSkipD2h, absl::Milliseconds(100)));
+  ABSL_ASSERT_OK(dest->WaitForTransferCompletion(kUuidSkipD2h));
+
+  // 3. Idle block-chunk sender notified via WeightSynchronizerListener marks
+  // D2H completed without running legacy PushWeights.
+  constexpr uint64_t kUuidIdleSender = 92012;
+  const uint64_t d2h_calls_before = source.ws->GetMetrics().d2h_call_count;
+  tpu_sync::rpc::ControlRequest idle_ctrl;
+  idle_ctrl.set_command(tpu_sync::rpc::ControlRequest::COMMAND_START_TRANSFER);
+  auto* idle_transfer = idle_ctrl.mutable_start_transfer_request();
+  idle_transfer->set_uuid(kUuidIdleSender);
+  idle_transfer->set_is_sender(true);
+  idle_transfer->set_use_block_chunks(true);
+  idle_transfer->set_skip_d2h(true);
+  tpu_sync::rpc::ControlResponse idle_resp;
+  WeightSynchronizerListener::ExecuteControlRequest(source.ws.get(), idle_ctrl,
+                                                    &idle_resp);
+  EXPECT_TRUE(idle_resp.success()) << idle_resp.message();
+  ABSL_ASSERT_OK(source.ws->WaitForD2hCompletion(kUuidIdleSender,
+                                                 absl::Milliseconds(100)));
+  EXPECT_EQ(source.ws->GetMetrics().d2h_call_count, d2h_calls_before);
+}
+
+TEST_F(WeightSynchronizerTest,
+       WaitForD2hCompletionErrorPropagationValidationAndTimeout) {
+  constexpr size_t kSliceBytes = 4096;
+  const std::vector<DeviceLayerSpec> specs = {{xla::U8, {kSliceBytes}, {}}};
+  DeviceBackedSynchronizer source;
+  ASSERT_NO_FATAL_FAILURE(
+      CreateDeviceBackedSynchronizer(specs, /*auto_h2d=*/false, &source));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> dest,
+      WeightSynchronizerBase::Create(/*num_layers=*/1, /*num_shards=*/1,
+                                     kSliceBytes, /*local_port=*/0,
+                                     /*host_blocks_to_allocate=*/1));
+  ASSERT_TRUE(dest->local_port().has_value());
+  const std::string dest_peer = absl::StrCat("127.0.0.1:", *dest->local_port());
+
+  // 1. Validation: uuid == 0 and negative timeout fail with InvalidArgument.
+  absl::Status zero_uuid_status =
+      source.ws->WaitForD2hCompletion(/*uuid=*/0, absl::Milliseconds(10));
+  EXPECT_TRUE(absl::IsInvalidArgument(zero_uuid_status));
+  EXPECT_TRUE(absl::StrContains(zero_uuid_status.message(), "uuid=0"));
+
+  constexpr uint64_t kNegTimeoutUuid = 92020;
+  absl::Status neg_timeout_status =
+      source.ws->WaitForD2hCompletion(kNegTimeoutUuid, -absl::Milliseconds(5));
+  EXPECT_TRUE(absl::IsInvalidArgument(neg_timeout_status));
+  EXPECT_TRUE(absl::StrContains(neg_timeout_status.message(), "92020"));
+  EXPECT_TRUE(absl::StrContains(neg_timeout_status.message(), "-5ms"));
+
+  // 2. Timeout expiry on an unstarted uuid returns DeadlineExceededError.
+  constexpr uint64_t kTimeoutUuid = 92021;
+  absl::Status timeout_status =
+      source.ws->WaitForD2hCompletion(kTimeoutUuid, absl::Milliseconds(30));
+  EXPECT_TRUE(absl::IsDeadlineExceeded(timeout_status));
+  EXPECT_TRUE(absl::StrContains(timeout_status.message(), "92021"));
+
+  // 3. Unbound sender error propagates immediately to a blocked waiter instead
+  // of stranding it.
+  source.ws->UnbindWeights();
+  constexpr uint64_t kFailUuid = 92022;
+  absl::Notification waiter_started;
+  absl::Status waiter_status;
+  std::thread waiter_thread([&]() {
+    waiter_started.Notify();
+    waiter_status =
+        source.ws->WaitForD2hCompletion(kFailUuid, absl::Seconds(5));
+  });
+  waiter_started.WaitForNotification();
+  absl::SleepFor(absl::Milliseconds(20));
+
+  tpu_sync::rpc::StartTransferRequest fail_req;
+  fail_req.set_skip_d2h(false);
+  fail_req.set_uuid(kFailUuid);
+  auto* entry = (*fail_req.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer(dest_peer);
+  entry->set_dst_shard_idx(0);
+  entry->set_size_bytes(kSliceBytes);
+  entry->set_count(1);
+  entry->set_layer_idx(0);
+
+  absl::Status push_err = source.ws->PushWeightsResharded(fail_req);
+  EXPECT_TRUE(absl::IsFailedPrecondition(push_err));
+  EXPECT_TRUE(absl::StrContains(push_err.message(), "unbound"));
+
+  waiter_thread.join();
+  EXPECT_TRUE(absl::IsFailedPrecondition(waiter_status));
+  EXPECT_TRUE(absl::StrContains(waiter_status.message(), "unbound"));
+}
+
+TEST_F(WeightSynchronizerTest,
+       WaitForD2hCompletionMultiStageFifoEvictionStress) {
+  constexpr size_t kSliceBytes = 1024;
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kMaxTracked = 64;
+  constexpr size_t kNumSteps = 100;
+  constexpr uint64_t kBaseUuid = 93001;
+
+  const std::vector<DeviceLayerSpec> specs = {
+      {xla::U8, {kSliceBytes}, {}},
+      {xla::U8, {kSliceBytes}, {}},
+  };
+  DeviceBackedSynchronizer source;
+  ASSERT_NO_FATAL_FAILURE(
+      CreateDeviceBackedSynchronizer(specs, /*auto_h2d=*/false, &source));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> dest,
+      WeightSynchronizerBase::Create(kNumLayers, /*num_shards=*/1, kSliceBytes,
+                                     /*local_port=*/0,
+                                     /*host_blocks_to_allocate=*/1));
+  ASSERT_TRUE(dest->local_port().has_value());
+  const std::string dest_peer = absl::StrCat("127.0.0.1:", *dest->local_port());
+
+  for (size_t step = 0; step < kNumSteps; ++step) {
+    const uint64_t uuid = kBaseUuid + step;
+    ABSL_ASSERT_OK(dest->RegisterExpectedChunks(uuid, kNumLayers));
+
+    // Stage 0 pushes layer 0 and performs the D2H across all layers.
+    tpu_sync::rpc::StartTransferRequest stage0;
+    stage0.set_skip_d2h(false);
+    stage0.set_uuid(uuid);
+    stage0.set_req_id(absl::StrCat("step_", step, "_s0"));
+    auto* e0 = (*stage0.mutable_shard_push_schedules())[0].add_entries();
+    e0->set_dst_peer(dest_peer);
+    e0->set_dst_shard_idx(0);
+    e0->set_size_bytes(kSliceBytes);
+    e0->set_count(1);
+    e0->set_layer_idx(0);
+
+    // Stage 1 shares `uuid` with `skip_d2h=false`, coalescing D2H via
+    // `already_completed` while pushing layer 1.
+    tpu_sync::rpc::StartTransferRequest stage1;
+    stage1.set_skip_d2h(false);
+    stage1.set_uuid(uuid);
+    stage1.set_req_id(absl::StrCat("step_", step, "_s1"));
+    auto* e1 = (*stage1.mutable_shard_push_schedules())[0].add_entries();
+    e1->set_dst_peer(dest_peer);
+    e1->set_dst_shard_idx(0);
+    e1->set_size_bytes(kSliceBytes);
+    e1->set_count(1);
+    e1->set_layer_idx(1);
+
+    ABSL_ASSERT_OK(source.ws->PushWeightsResharded(stage0));
+    ABSL_ASSERT_OK(source.ws->PushWeightsResharded(stage1));
+    ABSL_ASSERT_OK(source.ws->WaitForD2hCompletion(uuid, absl::Seconds(5)));
+    ABSL_ASSERT_OK(dest->WaitForTransferCompletion(uuid));
+  }
+
+  EXPECT_EQ(source.ws->GetMetrics().d2h_call_count, kNumSteps);
+  const auto [tracked_states, tracked_completed] =
+      source.ws->GetTrackedD2hCountsForTesting();
+  EXPECT_EQ(tracked_states, kMaxTracked);
+  EXPECT_EQ(tracked_completed, kMaxTracked);
+
+  // Oldest 36 UUIDs were evicted in FIFO order; newest 64 remain immediately
+  // queryable.
+  for (size_t step = 0; step < kNumSteps - kMaxTracked; ++step) {
+    absl::Status evicted_status = source.ws->WaitForD2hCompletion(
+        kBaseUuid + step, absl::Milliseconds(50));
+    EXPECT_TRUE(absl::IsFailedPrecondition(evicted_status));
+    EXPECT_TRUE(absl::StrContains(evicted_status.message(), "already evicted"));
+  }
+  for (size_t step = kNumSteps - kMaxTracked; step < kNumSteps; ++step) {
+    ABSL_ASSERT_OK(source.ws->WaitForD2hCompletion(kBaseUuid + step,
+                                                   absl::Milliseconds(50)));
+  }
+
+  source.ws->ForgetPushProgress(kBaseUuid + kNumSteps - 1);
+  const auto [after_forget_states, after_forget_completed] =
+      source.ws->GetTrackedD2hCountsForTesting();
+  EXPECT_EQ(after_forget_states, kMaxTracked - 1);
+  EXPECT_EQ(after_forget_completed, kMaxTracked - 1);
 }
 
 }  // namespace

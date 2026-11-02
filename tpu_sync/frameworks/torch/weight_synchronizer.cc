@@ -31,6 +31,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/time/time.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -227,6 +228,11 @@ void WeightSynchronizer::DrainPendingH2d() { base_->DrainPendingH2d(); }
 
 absl::Status WeightSynchronizer::WaitForTransferCompletion(uint64_t uuid) {
   return base_->WaitForTransferCompletion(uuid);
+}
+
+absl::Status WeightSynchronizer::WaitForD2hCompletion(
+    uint64_t uuid, std::optional<absl::Duration> timeout) {
+  return base_->WaitForD2hCompletion(uuid, timeout);
 }
 
 weight_sync::WeightSyncMetrics WeightSynchronizer::GetMetrics() const {

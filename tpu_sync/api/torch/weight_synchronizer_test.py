@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import gc
 import os
 import socket
+import threading
+import time
 
+from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import torch
@@ -24,6 +28,7 @@ import torch_tpu  # pylint: disable=unused-import
 from tpu_sync.api.torch.weight_synchronizer import (
     WeightSynchronizer,
 )
+from tpu_sync.rpc import raiden_controller
 from tpu_sync.rpc import raiden_service_pb2
 
 # Slice size for CPU-only synchronizers whose host buffer contents are unused.
@@ -32,6 +37,19 @@ _SMALL_SLICE_BYTES = 1024 * 1024
 # Seconds to wait for a TCP handshake with a listener on loopback. A closed port
 # is refused immediately, so this only bounds a hung handshake.
 _CONNECT_TIMEOUT_SECS = 5.0
+
+# 2D float32 weight shapes totaling 10 MiB (4 MiB + 4 MiB + 2 MiB) for
+# controller-driven pipelined D2H + H2H sync verification.
+_PIPELINED_CONTROLLER_SHAPES = ((1024, 1024), (512, 2048), (512, 1024))
+
+# 0.016 Gbps == 2.0 MB/s, so 10 MiB takes ~5.24 s on H2H while local TPU D2H
+# finishes in tens of milliseconds.
+_PIPELINED_EGRESS_GBPS = 0.016
+_D2H_WAIT_TIMEOUT_SECS = 30.0
+_CONTROLLER_TRANSFER_TIMEOUT_SECS = 60.0
+_HBM_POLL_TIMEOUT_SECS = 5.0
+_HBM_POLL_INTERVAL_SECS = 0.02
+_MIN_HBM_RELEASE_FRACTION = 0.85
 
 # Layer shapes for the bit-exact tests: one multiple of the TPU tile, and others
 # of several ranks that are not, so device layouts carry padding.
@@ -90,6 +108,54 @@ def _listener_accepts_connections(port: int) -> bool:
       return True
   except ConnectionRefusedError:
     return False
+
+
+def _start_controller_transfer_driver(
+    test_case: absltest.TestCase,
+    fut: raiden_controller.RaidenFuture,
+) -> tuple[threading.Thread, threading.Event, list[BaseException]]:
+  """Drives `fut.wait()` on a background thread and registers join cleanup."""
+  done = threading.Event()
+  errors: list[BaseException] = []
+
+  def _drive() -> None:
+    loop = asyncio.new_event_loop()
+    try:
+      loop.run_until_complete(
+          asyncio.wait_for(
+              fut.wait(), timeout=_CONTROLLER_TRANSFER_TIMEOUT_SECS
+          )
+      )
+    except BaseException as exc:  # pylint: disable=broad-exception-caught
+      errors.append(exc)
+    finally:
+      done.set()
+      loop.close()
+
+  thread = threading.Thread(target=_drive, daemon=True)
+  thread.start()
+  test_case.addCleanup(thread.join, _CONTROLLER_TRANSFER_TIMEOUT_SECS)
+  return thread, done, errors
+
+
+def _run_step_k_plus_1_on_tpu(
+    device: torch.device,
+) -> tuple[list[list[torch.Tensor]], list[list[torch.Tensor]]]:
+  """Allocates step-(k+1) TPU tensors and runs a bit-exact affine TPU op."""
+  device_tensors: list[list[torch.Tensor]] = []
+  cpu_expected: list[list[torch.Tensor]] = []
+  for layer_idx, shape in enumerate(_PIPELINED_CONTROLLER_SHAPES):
+    generator = torch.Generator().manual_seed(80_001 + layer_idx * 1_009)
+    cpu_base = torch.randint(
+        -1024, 1024, shape, generator=generator, dtype=torch.int32
+    ).to(torch.float32)
+    cpu_expected.append([cpu_base * 2.0 + 3.0])
+    dev_base = cpu_base.to(device)
+    dev_updated = dev_base * 2.0 + 3.0
+    del dev_base
+    device_tensors.append([dev_updated])
+  torch.accelerator.synchronize()
+  return device_tensors, cpu_expected
 
 
 class WeightSynchronizerTorchTest(parameterized.TestCase):
@@ -904,16 +970,39 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
               f" differ, first at index {tuple(mismatches[0].tolist())}"
           )
 
-  def _send_control_request(
+  def _send_control_request_raw(
       self, port: int, request: raiden_service_pb2.ControlRequest
-  ) -> None:
+  ) -> raiden_service_pb2.ControlResponse:
     payload = request.SerializeToString()
     with socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0) as sock:
       sock.connect(("::1", port))
       sock.sendall(len(payload).to_bytes(4, "big") + payload)
-      response_len = int.from_bytes(sock.recv(4), "big")
-      response = raiden_service_pb2.ControlResponse()
-      response.ParseFromString(sock.recv(response_len))
+      len_buf = bytearray()
+      while len(len_buf) < 4:
+        chunk = sock.recv(4 - len(len_buf))
+        if not chunk:
+          raise ConnectionError(
+              f"EOF reading ControlResponse length on port={port}"
+          )
+        len_buf.extend(chunk)
+      response_len = int.from_bytes(len_buf, "big")
+      resp_buf = bytearray()
+      while len(resp_buf) < response_len:
+        chunk = sock.recv(response_len - len(resp_buf))
+        if not chunk:
+          raise ConnectionError(
+              f"EOF reading ControlResponse payload (expected {response_len}"
+              f" bytes) on port={port}"
+          )
+        resp_buf.extend(chunk)
+    response = raiden_service_pb2.ControlResponse()
+    response.ParseFromString(bytes(resp_buf))
+    return response
+
+  def _send_control_request(
+      self, port: int, request: raiden_service_pb2.ControlRequest
+  ) -> None:
+    response = self._send_control_request_raw(port, request)
     self.assertTrue(response.success, response.message)
 
   def _push_resharded(
@@ -1319,6 +1408,546 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
     self.assertIn("leading (block) dimension does not match", message)
     self.assertIn("[64, 128]", message)
     self.assertIn("[4, 8, 256]", message)
+
+  def test_wait_for_d2h_completion_unbind_and_overwrite_during_h2h(self):
+    """Unbinding and mutating TPU weights after D2H barrier preserves H2H data."""
+    dtype = torch.float32
+    expected = _random_weights(dtype, num_shards=2, step=11)
+    overwritten = _random_weights(dtype, num_shards=2, step=99)
+    src_tensors = self._to_device(expected)
+    dst_tensors = self._zeros_on_device(src_tensors)
+
+    ws_source = WeightSynchronizer(
+        src_tensors,
+        local_port=0,
+        parallelism=1,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        dst_tensors,
+        local_port=0,
+        parallelism=1,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_dest.shutdown)
+
+    # 0.016 Gbps == 2 MB/s, so >2 MiB across 2 shards takes >1.0 s on H2H
+    # while local TPU D2H + detiling completes in milliseconds.
+    ws_source.test_only_set_bandwidth_limit(
+        test_only_simulated_egress_gbps=0.016
+    )
+
+    sync_uuid = 88001
+    push_errors: list[BaseException] = []
+
+    def _run_push() -> None:
+      try:
+        self._push_resharded(
+            ws_source,
+            ws_dest,
+            expected,
+            sync_uuid,
+            raiden_service_pb2.HOST_TILING_MODE_DEFERRED,
+        )
+      except BaseException as exc:  # pylint: disable=broad-exception-caught
+        push_errors.append(exc)
+
+    push_thread = threading.Thread(target=_run_push, daemon=True)
+    push_thread.start()
+    self.addCleanup(push_thread.join, 20.0)
+
+    ws_source.wait_for_d2h_completion(sync_uuid, timeout_s=15.0)
+    self.assertTrue(
+        push_thread.is_alive(),
+        "wait_for_d2h_completion() must return while rate-limited H2H is still"
+        " in flight.",
+    )
+
+    ws_source.unbind_weights()
+    with self.assertRaisesRegex(RuntimeError, "unbound"):
+      ws_source.d2h()
+
+    # Overwrite, drop, and reallocate source TPU tensors while H2H continues
+    # streaming from staged host memory.
+    self._copy_in_place(src_tensors, overwritten)
+    del src_tensors
+    gc.collect()
+    reallocated = self._to_device(overwritten)
+    self.assertTrue(
+        push_thread.is_alive(),
+        "Dropping and reallocating TPU tensors must succeed while rate-limited"
+        " H2H is still in flight.",
+    )
+
+    push_thread.join(timeout=20.0)
+    self.assertFalse(push_thread.is_alive(), "Background H2H push hung.")
+    if push_errors:
+      raise push_errors[0]
+
+    ws_dest.wait_for_transfer_completion(sync_uuid)
+    ws_dest.h2d()
+    self._assert_bit_exact(dst_tensors, expected, "pipelined_d2h_barrier")
+
+    ws_source.bind_weights(reallocated)
+    ws_source.d2h()
+
+  def test_wait_for_d2h_completion_validation_timeout_and_unbound_error(
+      self,
+  ) -> None:
+    """Verifies wait_for_d2h_completion error paths across Python and C++."""
+    src_tensor = torch.ones((64, 128), dtype=torch.float32, device=self.device)
+    dst_tensor = torch.zeros((64, 128), dtype=torch.float32, device=self.device)
+    ws_source = WeightSynchronizer(
+        [[src_tensor]],
+        local_port=0,
+        parallelism=1,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        [[dst_tensor]],
+        local_port=0,
+        parallelism=1,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_dest.shutdown)
+
+    # (a) Python wrapper input validation for uuid and timeout_s.
+    for bad_uuid, pattern in (
+        (0, r"got 0\b"),
+        (-7, r"got -7\b"),
+        (True, r"got True\b"),
+    ):
+      with self.assertRaisesRegex(ValueError, pattern):
+        ws_source.wait_for_d2h_completion(bad_uuid, timeout_s=0.05)
+
+    valid_uuid = 88100
+    for bad_timeout, pattern in (
+        (-0.25, rf"uuid={valid_uuid}.*got -0\.25"),
+        (float("nan"), rf"uuid={valid_uuid}.*got nan"),
+        (float("inf"), rf"uuid={valid_uuid}.*got inf"),
+        (True, rf"uuid={valid_uuid}.*got True"),
+    ):
+      with self.assertRaisesRegex(ValueError, pattern):
+        ws_source.wait_for_d2h_completion(valid_uuid, timeout_s=bad_timeout)
+
+    # (b) Nanobind TimeoutError (with GIL released) and direct C++ validation.
+    unstarted_uuid = 88101
+    with self.assertRaisesRegex(TimeoutError, rf"uuid={unstarted_uuid}\b"):
+      ws_source.wait_for_d2h_completion(unstarted_uuid, timeout_s=0.03)
+
+    binding_uuid = 88102
+    impl = ws_source._impl  # pylint: disable=protected-access
+    self.assertIsNotNone(impl)
+    assert impl is not None
+    with self.assertRaisesRegex(
+        ValueError, rf"uuid={binding_uuid}.*timeout_s=-1"
+    ):
+      impl.wait_for_d2h_completion(binding_uuid, -1.0)
+    with self.assertRaisesRegex(
+        ValueError, rf"uuid={binding_uuid}.*timeout_s=nan"
+    ):
+      impl.wait_for_d2h_completion(binding_uuid, float("nan"))
+    with self.assertRaisesRegex(ValueError, r"uuid=0\b"):
+      impl.wait_for_d2h_completion(0, 0.05)
+
+    # (c) Unbound source wakes a blocked waiter with RuntimeError("unbound").
+    ws_source.unbind_weights()
+    unbound_uuid = 88103
+    waiter_entered = threading.Event()
+    waiter_errors: list[BaseException] = []
+
+    def _wait_for_unbound_d2h() -> None:
+      waiter_entered.set()
+      try:
+        ws_source.wait_for_d2h_completion(unbound_uuid, timeout_s=5.0)
+      except BaseException as exc:  # pylint: disable=broad-exception-caught
+        waiter_errors.append(exc)
+
+    waiter_thread = threading.Thread(target=_wait_for_unbound_d2h, daemon=True)
+    waiter_thread.start()
+    self.addCleanup(waiter_thread.join, 10.0)
+    self.assertTrue(waiter_entered.wait(timeout=5.0))
+    time.sleep(0.05)
+    self.assertTrue(
+        waiter_thread.is_alive(),
+        "Waiter thread must block until the unbound push runs.",
+    )
+
+    unbound_push = raiden_service_pb2.StartTransferRequest(
+        is_sender=True, uuid=unbound_uuid, skip_d2h=False
+    )
+    entry = unbound_push.shard_push_schedules[0].entries.add()
+    entry.dst_peer = f"127.0.0.1:{ws_dest.local_port}"
+    entry.dst_shard_idx = 0
+    entry.size_bytes = src_tensor.numel() * src_tensor.element_size()
+    entry.layer_idx = 0
+
+    listener_port = ws_source.listener_port
+    self.assertIsNotNone(listener_port)
+    assert listener_port is not None
+    t_wake = time.monotonic()
+    push_resp = self._send_control_request_raw(
+        listener_port,
+        raiden_service_pb2.ControlRequest(
+            command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+            start_transfer_request=unbound_push,
+        ),
+    )
+    self.assertFalse(push_resp.success, push_resp.message)
+    self.assertIn("unbound", push_resp.message)
+
+    waiter_thread.join(timeout=2.0)
+    wake_elapsed_s = time.monotonic() - t_wake
+    self.assertFalse(
+        waiter_thread.is_alive(),
+        "Waiter thread was not woken by unbound D2H failure.",
+    )
+    self.assertLess(wake_elapsed_s, 4.0)
+    self.assertLen(waiter_errors, 1)
+    self.assertIsInstance(waiter_errors[0], RuntimeError)
+    self.assertRegex(str(waiter_errors[0]), "unbound")
+
+    # Positive liveness check: rebinding restores normal D2H + H2H sync.
+    rebound_uuid = 88104
+    ws_source.bind_weights([[src_tensor]])
+    self._push_resharded(
+        ws_source,
+        ws_dest,
+        [[src_tensor]],
+        rebound_uuid,
+        raiden_service_pb2.HOST_TILING_MODE_DEFERRED,
+    )
+    ws_source.wait_for_d2h_completion(rebound_uuid, timeout_s=5.0)
+    ws_dest.wait_for_transfer_completion(rebound_uuid)
+    ws_dest.h2d()
+    self._assert_bit_exact(
+        [[dst_tensor]], [[src_tensor.cpu()]], "rebound_after_unbound_error"
+    )
+
+  @parameterized.named_parameters(
+      ("one_sampler", 1),
+      ("two_samplers", 2),
+  )
+  def test_controller_pipelined_sync_unblocks_after_d2h_and_frees_hbm(
+      self, num_samplers: int
+  ) -> None:
+    """Verifies controller-driven pipelined sync frees TPU HBM during H2H."""
+    gc.collect()
+    torch.accelerator.synchronize()
+
+    expected_step_k: list[list[torch.Tensor]] = []
+    for layer_idx, shape in enumerate(_PIPELINED_CONTROLLER_SHAPES):
+      generator = torch.Generator().manual_seed(70_001 + layer_idx * 1_009)
+      expected_step_k.append(
+          [torch.randn(shape, generator=generator, dtype=torch.float32)]
+      )
+    src_bytes = sum(
+        shards[0].numel() * shards[0].element_size()
+        for shards in expected_step_k
+    )
+
+    dst_tensors_by_sampler = [
+        self._zeros_on_device(expected_step_k) for _ in range(num_samplers)
+    ]
+    ws_dst_list: list[WeightSynchronizer] = []
+    for sampler_idx in range(num_samplers):
+      ws_dst = WeightSynchronizer(
+          dst_tensors_by_sampler[sampler_idx],
+          local_port=0,
+          parallelism=1,
+          listener_port=0,
+          bind_ip="127.0.0.1",
+      )
+      self.addCleanup(ws_dst.shutdown)
+      ws_dst_list.append(ws_dst)
+
+    gc.collect()
+    torch.accelerator.synchronize()
+    mem_before_src_alloc = torch.accelerator.memory_allocated()
+
+    src_tensors = self._to_device(expected_step_k)
+    torch.accelerator.synchronize()
+    ws_src = WeightSynchronizer(
+        src_tensors,
+        local_port=0,
+        parallelism=1,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_src.shutdown)
+    ws_src.test_only_set_bandwidth_limit(
+        test_only_simulated_egress_gbps=_PIPELINED_EGRESS_GBPS
+    )
+
+    torch.accelerator.synchronize()
+    baseline_mem = torch.accelerator.memory_allocated()
+    self.assertGreaterEqual(
+        baseline_mem - mem_before_src_alloc,
+        src_bytes,
+        f"Expected source tensor allocation to add >= {src_bytes} bytes of TPU"
+        f" HBM; got mem_before_src_alloc={mem_before_src_alloc},"
+        f" baseline_mem={baseline_mem}.",
+    )
+
+    var_protos = [
+        raiden_service_pb2.VariableMetadataProto(
+            name=f"layer.{layer_idx}.weight",
+            shape=list(shape),
+            mesh_shape=[1, 1],
+            layout=[1, 0],
+            item_size=4,
+            layer_idx=layer_idx,
+            sharding_spec=["", ""],
+            global_shard_indices=[0],
+        )
+        for layer_idx, shape in enumerate(_PIPELINED_CONTROLLER_SHAPES)
+    ]
+
+    controller = raiden_controller.RaidenController(port=0)
+    self.addCleanup(controller.worker_rpc_client.close)
+    src_unit = raiden_controller.RaidenId("trainer", "0", "weights", 0)
+    controller.register_work_unit(
+        src_unit,
+        shards=[f"127.0.0.1:{ws_src.local_port}"],
+        control_plane_rpc_address=f"127.0.0.1:{ws_src.listener_port}",
+        mesh_shape=[1, 1],
+        mesh_axes=["dp", "tp"],
+        variables=var_protos,
+    )
+    dst_units: list[raiden_controller.RaidenId] = []
+    for sampler_idx, ws_dst in enumerate(ws_dst_list):
+      dst_unit = raiden_controller.RaidenId(
+          "sampler", str(sampler_idx), "weights", 0
+      )
+      controller.register_work_unit(
+          dst_unit,
+          shards=[f"127.0.0.1:{ws_dst.local_port}"],
+          control_plane_rpc_address=f"127.0.0.1:{ws_dst.listener_port}",
+          mesh_shape=[1, 1],
+          mesh_axes=["dp", "tp"],
+          variables=var_protos,
+      )
+      dst_units.append(dst_unit)
+
+    metrics_before_k = ws_src.get_metrics()
+    sync_uuid_k = 91_000 + num_samplers * 10 + 1
+    fut_k = controller.start_transfer(
+        src_units=[src_unit],
+        dst_units=dst_units,
+        use_block_chunks=True,
+        is_sender=True,
+        uuid=sync_uuid_k,
+        req_id=f"controller_pipelined_step_k_s{num_samplers}",
+        skip_d2h=False,
+    )
+
+    t0_k = time.monotonic()
+    driver_k, done_k, errors_k = _start_controller_transfer_driver(self, fut_k)
+
+    ws_src.wait_for_d2h_completion(
+        sync_uuid_k, timeout_s=_D2H_WAIT_TIMEOUT_SECS
+    )
+    d2h_elapsed_k_s = time.monotonic() - t0_k
+    self.assertFalse(
+        done_k.is_set(),
+        "wait_for_d2h_completion() must unblock while rate-limited H2H is"
+        f" still in flight (d2h_elapsed_k_s={d2h_elapsed_k_s:.4f}).",
+    )
+
+    # Negative control: dropping Python references alone must NOT free HBM
+    # while `ws_src` still holds bound tensor/buffer handles.
+    del src_tensors
+    gc.collect()
+    torch.accelerator.synchronize()
+    mem_after_del_before_unbind = torch.accelerator.memory_allocated()
+    self.assertLess(
+        baseline_mem - mem_after_del_before_unbind,
+        src_bytes // 4,
+        "TPU HBM dropped before unbind_weights():"
+        f" baseline_mem={baseline_mem},"
+        f" mem_after_del_before_unbind={mem_after_del_before_unbind},"
+        f" src_bytes={src_bytes}.",
+    )
+
+    ws_src.unbind_weights()
+    min_expected_release = int(src_bytes * _MIN_HBM_RELEASE_FRACTION)
+    poll_deadline = time.monotonic() + _HBM_POLL_TIMEOUT_SECS
+    gc.collect()
+    torch.accelerator.synchronize()
+    mem_after_unbind = torch.accelerator.memory_allocated()
+    while (
+        baseline_mem - mem_after_unbind < min_expected_release
+        and time.monotonic() < poll_deadline
+    ):
+      time.sleep(_HBM_POLL_INTERVAL_SECS)
+      gc.collect()
+      torch.accelerator.synchronize()
+      mem_after_unbind = torch.accelerator.memory_allocated()
+
+    self.assertGreaterEqual(
+        baseline_mem - mem_after_unbind,
+        min_expected_release,
+        "unbind_weights() did not free bound source tensor TPU HBM:"
+        f" baseline_mem={baseline_mem}, mem_after_unbind={mem_after_unbind},"
+        f" src_bytes={src_bytes}, min_expected_release={min_expected_release}.",
+    )
+    self.assertFalse(
+        done_k.is_set(),
+        "Source tensor TPU HBM release must occur while rate-limited H2H is"
+        " still in flight.",
+    )
+
+    # Simulate training step k+1 on TPU while step-k H2H broadcast continues.
+    step_k_plus_1_tensors, expected_step_k_plus_1 = _run_step_k_plus_1_on_tpu(
+        self.device
+    )
+
+    driver_k.join(timeout=_CONTROLLER_TRANSFER_TIMEOUT_SECS)
+    total_transfer_k_s = time.monotonic() - t0_k
+    self.assertFalse(driver_k.is_alive(), "Background H2H transfer hung.")
+    if errors_k:
+      raise errors_k[0]
+    self.assertGreater(total_transfer_k_s, d2h_elapsed_k_s)
+
+    for sampler_idx, ws_dst in enumerate(ws_dst_list):
+      ws_dst.wait_for_transfer_completion(sync_uuid_k)
+      ws_dst.h2d()
+      self._assert_bit_exact(
+          dst_tensors_by_sampler[sampler_idx],
+          expected_step_k,
+          f"step_k_sampler_{sampler_idx}",
+      )
+
+    metrics_after_k = ws_src.get_metrics()
+    d2h_delta_k = int(metrics_after_k["d2h_call_count"]) - int(
+        metrics_before_k["d2h_call_count"]
+    )
+    push_delta_k = int(metrics_after_k["push_resharded_call_count"]) - int(
+        metrics_before_k["push_resharded_call_count"]
+    )
+    self.assertEqual(d2h_delta_k, 1)
+    self.assertGreaterEqual(push_delta_k, 1)
+
+    # Steady-state step k+1: rebind new TPU weights and run a second sync.
+    ws_src.bind_weights(step_k_plus_1_tensors)
+    torch.accelerator.synchronize()
+    mem_after_bind_k1 = torch.accelerator.memory_allocated()
+    self.assertGreaterEqual(
+        mem_after_bind_k1 - mem_after_unbind,
+        src_bytes,
+        f"Expected step-(k+1) source tensors to add >= {src_bytes} bytes of TPU"
+        f" HBM; got mem_after_unbind={mem_after_unbind},"
+        f" mem_after_bind_k1={mem_after_bind_k1}.",
+    )
+    sync_uuid_k1 = sync_uuid_k + 1
+    fut_k1 = controller.start_transfer(
+        src_units=[src_unit],
+        dst_units=dst_units,
+        use_block_chunks=True,
+        is_sender=True,
+        uuid=sync_uuid_k1,
+        req_id=f"controller_pipelined_step_k1_s{num_samplers}",
+        skip_d2h=False,
+    )
+
+    t0_k1 = time.monotonic()
+    driver_k1, done_k1, errors_k1 = _start_controller_transfer_driver(
+        self, fut_k1
+    )
+    ws_src.wait_for_d2h_completion(
+        sync_uuid_k1, timeout_s=_D2H_WAIT_TIMEOUT_SECS
+    )
+    d2h_elapsed_k1_s = time.monotonic() - t0_k1
+    self.assertFalse(
+        done_k1.is_set(),
+        "Steady-state wait_for_d2h_completion() must unblock while H2H is"
+        f" still in flight (d2h_elapsed_k1_s={d2h_elapsed_k1_s:.4f}).",
+    )
+
+    del step_k_plus_1_tensors
+    ws_src.unbind_weights()
+    poll_deadline_k1 = time.monotonic() + _HBM_POLL_TIMEOUT_SECS
+    gc.collect()
+    torch.accelerator.synchronize()
+    mem_after_unbind_k1 = torch.accelerator.memory_allocated()
+    while (
+        mem_after_bind_k1 - mem_after_unbind_k1 < min_expected_release
+        and time.monotonic() < poll_deadline_k1
+    ):
+      time.sleep(_HBM_POLL_INTERVAL_SECS)
+      gc.collect()
+      torch.accelerator.synchronize()
+      mem_after_unbind_k1 = torch.accelerator.memory_allocated()
+
+    self.assertGreaterEqual(
+        mem_after_bind_k1 - mem_after_unbind_k1,
+        min_expected_release,
+        "Steady-state unbind_weights() did not free rebound step-(k+1) TPU HBM:"
+        f" mem_after_bind_k1={mem_after_bind_k1},"
+        f" mem_after_unbind_k1={mem_after_unbind_k1},"
+        f" src_bytes={src_bytes}, min_expected_release={min_expected_release}.",
+    )
+    self.assertFalse(
+        done_k1.is_set(),
+        "Steady-state unbind_weights() must finish while H2H is in flight.",
+    )
+
+    driver_k1.join(timeout=_CONTROLLER_TRANSFER_TIMEOUT_SECS)
+    total_transfer_k1_s = time.monotonic() - t0_k1
+    self.assertFalse(driver_k1.is_alive(), "Steady-state H2H transfer hung.")
+    if errors_k1:
+      raise errors_k1[0]
+
+    for sampler_idx, ws_dst in enumerate(ws_dst_list):
+      ws_dst.wait_for_transfer_completion(sync_uuid_k1)
+      ws_dst.h2d()
+      self._assert_bit_exact(
+          dst_tensors_by_sampler[sampler_idx],
+          expected_step_k_plus_1,
+          f"step_k_plus_1_sampler_{sampler_idx}",
+      )
+
+    metrics_after_k1 = ws_src.get_metrics()
+    d2h_delta_k1 = int(metrics_after_k1["d2h_call_count"]) - int(
+        metrics_after_k["d2h_call_count"]
+    )
+    push_delta_k1 = int(metrics_after_k1["push_resharded_call_count"]) - int(
+        metrics_after_k["push_resharded_call_count"]
+    )
+    self.assertEqual(d2h_delta_k1, 1)
+    self.assertGreaterEqual(push_delta_k1, 1)
+
+    logging.info(
+        "CONTROLLER_PIPELINED_SYNC_METRICS num_samplers=%d src_bytes=%d"
+        " step_k_d2h_s=%.4f step_k_total_s=%.4f"
+        " step_k1_d2h_s=%.4f step_k1_total_s=%.4f"
+        " mem_before_src_alloc=%d mem_baseline=%d"
+        " mem_after_del_before_unbind=%d mem_after_unbind=%d"
+        " mem_after_bind_k1=%d mem_after_unbind_k1=%d"
+        " d2h_call_deltas=(%d,%d) push_resharded_call_deltas=(%d,%d)",
+        num_samplers,
+        src_bytes,
+        d2h_elapsed_k_s,
+        total_transfer_k_s,
+        d2h_elapsed_k1_s,
+        total_transfer_k1_s,
+        mem_before_src_alloc,
+        baseline_mem,
+        mem_after_del_before_unbind,
+        mem_after_unbind,
+        mem_after_bind_k1,
+        mem_after_unbind_k1,
+        d2h_delta_k,
+        d2h_delta_k1,
+        push_delta_k,
+        push_delta_k1,
+    )
 
 
 if __name__ == "__main__":

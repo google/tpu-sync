@@ -14,6 +14,7 @@
 
 """High-performance PyTorch Weight Synchronizer for Trainer-Inference Pipelines."""
 
+import math
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -198,13 +199,16 @@ class WeightSynchronizer:
     The synchronizer itself (pinned host staging buffers, listeners, controller
     registration) stays alive, so a later `bind_weights()` is cheap and does not
     require re-creating or re-registering the WeightSynchronizer. Use this right
-    after a transfer completes so temporary send tensors do not stay pinned in
-    HBM during the next training step.
+    after a transfer completes—or, during a pipelined transfer
+    (`skip_d2h=False`), immediately after `wait_for_d2h_completion(uuid)`
+    returns while H2H network broadcast continues in the background—so temporary
+    send tensors do not stay pinned in HBM during the next training step.
 
     After unbinding, `d2h()`, `h2d()`, and any controller-driven push that
     performs D2H raise until `bind_weights()` is called again.
 
-    Must not be called while a D2H/H2D/push on this synchronizer is in flight.
+    Must not be called while local D2H or H2D copies on this synchronizer are
+    in flight.
     """
     self._impl.unbind_weights()
 
@@ -219,6 +223,61 @@ class WeightSynchronizer:
   def wait_for_transfer_completion(self, uuid: Optional[int] = None) -> None:
     """Blocks until the transfer with the given UUID (or any transfer if None) has finished ingestion."""
     self._impl.wait_for_transfer_completion(uuid)
+
+  def wait_for_d2h_completion(
+      self, uuid: int, timeout_s: Optional[float] = None
+  ) -> None:
+    """Blocks until local D2H (and host detiling) completes for `uuid`.
+
+    During a pipelined transfer (`skip_d2h=False`), callers pass the same
+    `uuid` they gave `controller.start_transfer(..., uuid=...)` (identical on
+    every trainer host) to wait only until local D2H finishes, then immediately
+    call `unbind_weights()` while H2H network broadcast continues in the
+    background.
+
+    Caller requirements:
+      1. This call does not drive the transfer: the future returned by
+         `controller.start_transfer(...)` must be awaited concurrently (e.g.
+         `fut.wait()` on a background thread/event loop), otherwise no D2H runs
+         and this wait blocks until `timeout_s`.
+      2. H2H keeps reading this synchronizer's host staging buffers until that
+         future completes, so await it before starting the next transfer on this
+         synchronizer (the next D2H would overwrite those buffers);
+         `bind_weights()` and training may proceed meanwhile.
+
+    Args:
+      uuid: Positive 64-bit transfer UUID passed to
+        `controller.start_transfer(..., uuid=...)` (identical across all trainer
+        hosts in the sync).
+      timeout_s: Optional non-negative timeout in seconds. If None, blocks until
+        local D2H finishes or fails.
+
+    Raises:
+      ValueError: If `uuid` is not a positive integer or `timeout_s` is negative
+        or non-finite.
+      TimeoutError: If `timeout_s` elapses before local D2H completes for
+        `uuid`.
+      RuntimeError: If local D2H fails or device weights are unbound.
+    """
+    if isinstance(uuid, bool) or not isinstance(uuid, int) or uuid <= 0:
+      raise ValueError(
+          "wait_for_d2h_completion requires a positive integer uuid; got"
+          f" {uuid!r}"
+      )
+    if timeout_s is not None:
+      if (
+          isinstance(timeout_s, bool)
+          or not isinstance(timeout_s, (int, float))
+          or not math.isfinite(timeout_s)
+          or timeout_s < 0.0
+      ):
+        raise ValueError(
+            "wait_for_d2h_completion requires a finite non-negative timeout_s"
+            f" for uuid={uuid}; got {timeout_s!r}"
+        )
+    self._impl.wait_for_d2h_completion(
+        uuid, float(timeout_s) if timeout_s is not None else None
+    )
 
   def get_host_buffer(
       self, layer_idx: int = 0, shard_idx: int = 0

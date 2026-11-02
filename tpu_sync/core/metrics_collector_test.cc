@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 
@@ -56,6 +57,27 @@ TEST(MetricsCollectorTest, BasicSequenceAndJsonDump) {
   EXPECT_TRUE(absl::StrContains(content, "connection_setup_us"));
   EXPECT_TRUE(absl::StrContains(content, "network_transit_us"));
   EXPECT_TRUE(absl::StrContains(content, "h2d_copy_us"));
+}
+
+TEST(MetricsCollectorTest, GetTransferMetricsReturnsRecordedTimestamps) {
+  MetricsCollector collector;
+  constexpr uint64_t kUuid = 4242;
+  EXPECT_FALSE(collector.GetTransferMetrics(kUuid).has_value());
+
+  collector.RecordStart(kUuid, "typed", /*num_blocks=*/3, /*total_bytes=*/384);
+  collector.RecordFirstPacket(kUuid);
+  collector.RecordLastPacket(kUuid);
+  collector.RecordEnd(kUuid);
+
+  std::optional<TransferMetrics> metrics = collector.GetTransferMetrics(kUuid);
+  ASSERT_TRUE(metrics.has_value());
+  EXPECT_EQ(metrics->uuid, kUuid);
+  EXPECT_EQ(metrics->req_id, "typed");
+  EXPECT_EQ(metrics->num_blocks, 3);
+  EXPECT_EQ(metrics->total_bytes, 384);
+  EXPECT_LE(metrics->start_time, metrics->first_packet_time);
+  EXPECT_LE(metrics->first_packet_time, metrics->last_packet_time);
+  EXPECT_LE(metrics->last_packet_time, metrics->end_time);
 }
 
 TEST(MetricsCollectorTest, AsynchronousNicBandwidthTracking) {

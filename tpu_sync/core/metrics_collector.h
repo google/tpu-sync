@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -86,6 +87,12 @@ class MetricsCollector {
   void WriteJsonReport(
       const std::string& filepath = "/tmp/raiden_metrics.json");
   std::string DumpMetricsToString();
+
+  // The metrics recorded for `uuid` (the same ones `DumpMetricsToString`
+  // reports), or nullopt before `RecordStart` for it. A slot is shared by the
+  // uuids congruent modulo kMaxMetrics, so the result is the latest of them.
+  // Read it once the transfer has settled, as the Record* calls race with it.
+  std::optional<TransferMetrics> GetTransferMetrics(uint64_t uuid) const;
 
  private:
   absl::flat_hash_map<std::string, NicBytes> SnapshotAllNics();

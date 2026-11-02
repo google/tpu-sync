@@ -19,6 +19,7 @@
 #include <cstring>
 #include <filesystem>  // NOLINT(c++17-feature-std-filesystem)
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -198,6 +199,15 @@ std::string MetricsCollector::DumpMetricsToString() {
   }
   f << "\n]\n";
   return f.str();
+}
+
+std::optional<TransferMetrics> MetricsCollector::GetTransferMetrics(
+    uint64_t uuid) const {
+  const size_t idx = uuid % kMaxMetrics;
+  if (!metrics_valid_[idx].load(std::memory_order_acquire)) {
+    return std::nullopt;
+  }
+  return metrics_array_[idx];
 }
 
 }  // namespace tpu_raiden

@@ -32,6 +32,7 @@
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/chunk.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -129,10 +130,12 @@ class BlockTransportServerPushSession final
       absl::Span<const lib::RequestMetadata> requests);
 
  private:
-  // Accounting for stream and shard arrivals.
+  // Accounting for stream and shard arrivals. A block array this push
+  // completes is reported to |session|, the session the push holds an op on,
+  // or to the delegate when the push names no session (uuid 0).
   absl::Status CompleteIncomingPush(
-      uint32_t local_id, uint32_t remote_id, size_t num_streams,
-      size_t landed_shards,
+      std::shared_ptr<TransferSession> session, uint32_t local_id,
+      uint32_t remote_id, size_t num_streams, size_t landed_shards,
       const std::optional<PoolPushProgressSpec>& pool_progress_spec,
       bool is_peregrine = false);
 

@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -125,6 +126,10 @@ struct ScopedPrometheusBackend {
 
 class StubReceiveSession : public TransferSession {
  public:
+  StubReceiveSession() = default;
+  explicit StubReceiveSession(std::function<void()> on_data_received)
+      : on_data_received_(std::move(on_data_received)) {}
+
   absl::Status Start() override { return absl::OkStatus(); }
   absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
     return std::nullopt;
@@ -178,6 +183,9 @@ class StubReceiveSession : public TransferSession {
   absl::Status OnDataReceived(size_t major_dimension_idx,
                               absl::Span<const int> minor_dimension_indices,
                               absl::Span<const int> shard_ids) override {
+    if (on_data_received_) {
+      on_data_received_();
+    }
     return absl::OkStatus();
   }
   tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
@@ -189,6 +197,7 @@ class StubReceiveSession : public TransferSession {
   }
 
  private:
+  std::function<void()> on_data_received_;
   mutable absl::Mutex mu_;
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
@@ -251,13 +260,6 @@ class MockDelegate : public BlockTransportDelegate {
         .expected_pushes = expected_pushes_per_pool_,
         .expected_pools = transfer_pool_indices_.size(),
     };
-  }
-
-  absl::Status OnPoolReceived(size_t pool_idx, uint64_t uuid) override {
-    (void)pool_idx;
-    (void)uuid;
-    ++pool_completion_count_;
-    return absl::OkStatus();
   }
 
   void SetPoolPushProgress(uint64_t uuid, size_t expected_pushes_per_pool,
@@ -386,7 +388,8 @@ class MockDelegate : public BlockTransportDelegate {
   std::vector<std::tuple<size_t, size_t, int>> wait_events_;
   mutable absl::Mutex sessions_mu_;
   std::shared_ptr<TransferSession> default_session_ =
-      std::make_shared<StubReceiveSession>();
+      std::make_shared<StubReceiveSession>(
+          [this]() { ++pool_completion_count_; });
   absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>> sessions_
       ABSL_GUARDED_BY(sessions_mu_);
   mutable absl::Mutex peer_channels_mu_;

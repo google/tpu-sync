@@ -2988,20 +2988,6 @@ absl::Status KVCacheManagerBase::OnLayerReceived(size_t layer_idx,
                                     /*shard_ids=*/{});
 }
 
-// A pool completion always belongs to an armed receiver, so a uuid with no
-// session fails with kNotFound.
-absl::Status KVCacheManagerBase::OnPoolReceived(size_t pool_idx,
-                                                uint64_t uuid) {
-  absl::StatusOr<std::shared_ptr<TransferSession>> session = GetSession(uuid);
-  if (absl::IsNotFound(session.status())) {
-    return absl::NotFoundError(
-        absl::StrCat("no active receiver for UUID ", uuid));
-  }
-  ABSL_RETURN_IF_ERROR(session.status());
-  return (*session)->OnDataReceived(pool_idx, /*minor_dimension_indices=*/{},
-                                    /*shard_ids=*/{});
-}
-
 void KVCacheManagerBase::ScheduleAsyncTask(std::function<void()> task) {
   if (push_pool_) {
     push_pool_->Schedule(std::move(task));

@@ -443,10 +443,10 @@ absl::Status BlockTransportServerPushSession::StartStream(
         metric_names::kReceivedBytesTotal, kPushLabels, total_received_bytes);
   }
 
-  ABSL_RETURN_IF_ERROR(
-      CompleteIncomingPush(header.local_id, header.remote_id, header.reserved,
-                           header.buffer_id == 0 ? 0 : stream_shards.size(),
-                           push_spec.pool_progress_spec));
+  ABSL_RETURN_IF_ERROR(CompleteIncomingPush(
+      session, header.local_id, header.remote_id, header.reserved,
+      header.buffer_id == 0 ? 0 : stream_shards.size(),
+      push_spec.pool_progress_spec));
 
   // Report exactly the shards this stream carried: every shard for a legacy
   // stream, one route's subset for a routed stream. The delegate owns
@@ -493,7 +493,7 @@ absl::Status BlockTransportServerPushSession::OnPeregrinePostComplete(
   ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> session,
                         BeginIncomingPush(delegate_, uuid_));
   absl::Status s = CompleteIncomingPush(
-      post.local_id, post.remote_id, /*num_streams=*/1,
+      session, post.local_id, post.remote_id, /*num_streams=*/1,
       post.shard_mask == 0 ? 0 : shards.size(), push_spec.pool_progress_spec,
       /*is_peregrine=*/true);
   return EndIncomingPush(session, s);
@@ -509,8 +509,8 @@ size_t BlockTransportServerPushSession::AccumulateLandedShards(
 }
 
 absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
-    uint32_t local_id, uint32_t remote_id, size_t num_streams,
-    size_t landed_shards,
+    std::shared_ptr<TransferSession> session, uint32_t local_id,
+    uint32_t remote_id, size_t num_streams, size_t landed_shards,
     const std::optional<PoolPushProgressSpec>& pool_progress_spec,
     bool is_peregrine) {
   // Unified receive accounting: one progress map and one increment path for
@@ -671,7 +671,8 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
     ABSL_RETURN_IF_ERROR(
         FaultInjectStatus(hooks::kBlockTransportRecvLayerDone));
     if (plan_declared) {
-      ABSL_RETURN_IF_ERROR(delegate_->OnPoolReceived(l, uuid_));
+      ABSL_RETURN_IF_ERROR(session->OnDataReceived(
+          l, /*minor_dimension_indices=*/{}, /*shard_ids=*/{}));
     } else {
       ABSL_RETURN_IF_ERROR(delegate_->OnLayerReceived(l, uuid_));
     }

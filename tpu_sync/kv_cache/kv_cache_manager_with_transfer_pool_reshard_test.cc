@@ -1082,26 +1082,6 @@ TEST(PoolReshardSessionLookupTest,
               StatusIs(absl::StatusCode::kNotFound));
 }
 
-// A pool completion always belongs to an armed receiver: with no session for
-// the uuid it fails with kNotFound naming the uuid, while the same completion
-// for a registered receiver reaches its session.
-TEST(PoolReshardSessionLookupTest, PoolCompletionWithoutReceiverIsNotFound) {
-  TestManager manager;
-  ABSL_ASSERT_OK(manager.base()->RegisterPools({DensePool("fa")}));
-
-  EXPECT_THAT(
-      manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/8004),
-      StatusIs(absl::StatusCode::kNotFound,
-               ::testing::HasSubstr("no active receiver for UUID 8004")));
-
-  ABSL_ASSERT_OK(manager.RegisterActivePlan(
-      /*uuid=*/8004, ValidPlan(/*uuid=*/8004), /*is_sender=*/false));
-  EXPECT_THAT(manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/8004),
-              StatusIs(absl::StatusCode::kFailedPrecondition,
-                       ::testing::HasSubstr("armed on the legacy path")));
-  ABSL_EXPECT_OK(manager.UnregisterActivePlan(/*uuid=*/8004));
-}
-
 // A pool plan armed through RegisterActivePlan lands on a legacy
 // TransferReceiveSession, which cannot execute pool completions: the
 // completion is rejected before any H2D work, leaving the receive untouched.
@@ -1116,7 +1096,10 @@ TEST(PoolReshardSessionLookupTest,
   ABSL_ASSERT_OK(recv_session);
   ASSERT_NE(*recv_session, nullptr);
 
-  EXPECT_THAT(manager.base()->OnPoolReceived(/*pool_idx=*/0, /*uuid=*/8003),
+  EXPECT_THAT((*recv_session)
+                  ->OnDataReceived(/*major_dimension_idx=*/0,
+                                   /*minor_dimension_indices=*/{},
+                                   /*shard_ids=*/{}),
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        ::testing::HasSubstr("armed on the legacy path")));
 

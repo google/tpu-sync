@@ -169,13 +169,6 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
     return std::nullopt;
   }
 
-  // Pool-keyed counterpart to OnLayerReceived, fired when a declared pool
-  // reaches its plan-declared push count. An explicit-pool index is not
-  // necessarily a constructor layer/storage index, so the default is a no-op.
-  virtual absl::Status OnPoolReceived(size_t pool_idx, uint64_t uuid) {
-    return absl::OkStatus();
-  }
-
   // Fired once per incoming push stream after its payload for |block_ids| has
   // landed in host memory. |shard_ids| is the set of shards that stream
   // carried: every shard for an unrouted push, or one route's subset for a

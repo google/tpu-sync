@@ -178,7 +178,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
                                      absl::Span<const int> shard_ids,
                                      uint64_t uuid = 0) override;
   absl::Status OnLayerReceived(size_t layer_idx, uint64_t uuid = 0) override;
-  absl::Status OnPoolReceived(size_t pool_idx, uint64_t uuid = 0) override;
   void ScheduleAsyncTask(std::function<void()> task) override;
 
   // Async on-chip H2D offloads returning PJRT copy future E2E.

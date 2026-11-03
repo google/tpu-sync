@@ -81,8 +81,25 @@ using ::testing::Optional;
 constexpr int64_t kSlots = 2;
 constexpr double kTimeoutS = 0.05;
 
+// Host-to-host state that TestManager's TestBase reads from push-pool
+// threads. ~KVCacheManagerWithTransfer drains those threads, and it runs
+// after TestManager's own members are destroyed, so this state lives in a
+// base class listed before KVCacheManagerWithTransfer (the base-from-member
+// idiom): it is constructed before and destroyed after the manager.
+// The device-to-host copy state stays a TestManager member on purpose: its
+// unset promises must be destroyed before that drain, which fails their
+// copies so the sends still in flight can finish.
+struct TestManagerH2hState {
+  absl::Mutex h2h_mu_;
+  bool manual_h2h_ ABSL_GUARDED_BY(h2h_mu_) = false;
+  std::vector<uint8_t*> h2h_chunk_ptrs_ ABSL_GUARDED_BY(h2h_mu_);
+  std::vector<std::function<void(absl::Status)>> h2h_callbacks_
+      ABSL_GUARDED_BY(h2h_mu_);
+};
+
 // A producer whose device-to-host copies complete when the test says so.
-class TestManager : public KVCacheManagerWithTransfer {
+class TestManager : private TestManagerH2hState,
+                    public KVCacheManagerWithTransfer {
  public:
   explicit TestManager(size_t num_layers, double timeout_s = kTimeoutS,
                        std::optional<int> num_staging_layers = std::nullopt)
@@ -321,11 +338,6 @@ class TestManager : public KVCacheManagerWithTransfer {
   absl::Mutex copies_mu_;
   std::vector<xla::Promise<>> copies_ ABSL_GUARDED_BY(copies_mu_);
   std::vector<int64_t> copy_destinations_ ABSL_GUARDED_BY(copies_mu_);
-  absl::Mutex h2h_mu_;
-  bool manual_h2h_ ABSL_GUARDED_BY(h2h_mu_) = false;
-  std::vector<uint8_t*> h2h_chunk_ptrs_ ABSL_GUARDED_BY(h2h_mu_);
-  std::vector<std::function<void(absl::Status)>> h2h_callbacks_
-      ABSL_GUARDED_BY(h2h_mu_);
 };
 
 // A consumer whose host-to-device copies complete when the test says so.

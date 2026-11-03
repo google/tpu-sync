@@ -160,6 +160,38 @@ inline int64_t GetMajorSliceByteSize(const xla::Shape& shape,
   return physical_size / major;
 }
 
+// Mirrors the upcoming xla::PjRtRawBuffer::ExternalDmaInfo /
+// PJRT_RawBuffer_GetExternalDmaInfo_Args contract (External DMA on PJRT design
+// doc), exposing the per-chip TPU HBM BAR2 dma-buf file descriptor, the
+// buffer's byte offset and size within that BAR2 aperture, and the host-mapped
+// BAR2 virtual address window.
+struct ExternalDmaInfo {
+  int dma_buf_fd = -1;
+  size_t offset = 0;
+  size_t size = 0;
+  void* dma_buf_vaddr = nullptr;
+  size_t bar2_total_size = 0;
+  bool needs_mock_sync = false;
+};
+
+// Shared simulated BAR2 dma-buf arena backed by an anonymous memfd file
+// descriptor and a MAP_SHARED virtual address mapping so libtdsul's
+// tds_buffer_register_dmabuf / tds_buffer_register_vaddr can register and
+// perform P2P DMA I/O against per-chip device HBM slices.
+struct MockBar2DmaBufArena {
+  int dma_buf_fd = -1;
+  void* base_ptr = nullptr;
+  size_t total_size = 0;
+
+  MockBar2DmaBufArena() = default;
+  MockBar2DmaBufArena(const MockBar2DmaBufArena&) = delete;
+  MockBar2DmaBufArena& operator=(const MockBar2DmaBufArena&) = delete;
+  ~MockBar2DmaBufArena();
+
+  static absl::StatusOr<std::shared_ptr<MockBar2DmaBufArena>> Create(
+      size_t total_size);
+};
+
 struct RaidenBufferHandle {
   xla::PjRtBuffer* buffer =
       nullptr;  // ABSL_DEPRECATED("Use shape/device or raw handles instead")
@@ -175,6 +207,11 @@ struct RaidenBufferHandle {
   // For PjRtCApiBuffer:
   PJRT_RawBuffer* c_raw_buffer = nullptr;
   std::shared_ptr<RawBufferHolder> c_hold;
+
+  // External DMA / BAR2 dma-buf metadata (populated from PJRT external DMA
+  // extension or AttachMockBar2DmaBufArena when mocking the BAR2 aperture).
+  ExternalDmaInfo external_dma_info;
+  std::shared_ptr<MockBar2DmaBufArena> mock_bar2_arena;
 
   static absl::StatusOr<RaidenBufferHandle> Acquire(
       xla::PjRtBuffer* buf, const PJRT_Api* c_api = nullptr,
@@ -317,9 +354,26 @@ struct RaidenBufferHandle {
     if (err) return PjrtErrorToStatusLocal(c_hold->c_api, err);
     return args.event;
   }
+
+  // Queries the BAR2 dma-buf file descriptor, layer HBM base offset, and mapped
+  // BAR2 virtual address for this device buffer (Design Doc §3.3.4 Step 1).
+  absl::StatusOr<ExternalDmaInfo> GetExternalDmaInfo() const;
+
+  // When backed by a simulated BAR2 dma-buf arena (`needs_mock_sync == true`),
+  // synchronizes `[buffer_offset, buffer_offset + size)` between the underlying
+  // PjRtBuffer and the BAR2 mmap window before/after P2P storage DMA. No-op on
+  // real hardware BAR2 apertures where `needs_mock_sync == false`.
+  absl::Status SyncDeviceToBar2Window(int64_t buffer_offset, size_t size) const;
+  absl::Status SyncBar2WindowToDevice(int64_t buffer_offset, size_t size) const;
 };
 
 using BufferHoldAndAlias = RaidenBufferHandle;
+
+// Attaches one shared simulated BAR2 dma-buf arena (1 dma-buf-fd per TPU shard)
+// across all layer handles of a shard, assigning each layer a 4096-byte
+// page-aligned base offset within the shard's BAR2 aperture.
+absl::Status AttachMockBar2DmaBufArena(
+    absl::Span<RaidenBufferHandle* const> shard_layer_handles);
 
 // Distinct NUMA nodes (in first-seen order) of the devices backing
 // |layer_buffers|. Devices whose NUMA node cannot be resolved are skipped.

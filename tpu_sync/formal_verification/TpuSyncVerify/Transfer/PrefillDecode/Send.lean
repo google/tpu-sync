@@ -167,9 +167,13 @@ buffer for a waiting layer), and wholesale at settle (`ReleaseAll()` in
 loop, pushes of earlier layers still complete and release buffers while the D2H
 loop is blocked in `AcquireStagingSlot` (`SendLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers`,
 `SendLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes`).
-What this module does not model is the host-buffer reuse across layers itself
-and the bounded wait in `Acquire`; `Pipeline.lean` keeps one `prefillStaging`
-cell per layer.
+`PrefillDecode/LayerStaging.lean` (with `Transfer/LayerStaging.lean`) models
+`StagingLayerManager`, `TransferSendSession::AcquireStagingSlot`,
+`LookupStagingSlot`, `prefillSlots` reuse across layers, and the unlocked gaps
+around `Acquire`, proving publication correctness, slot conservation/exclusivity,
+drain-to-settle termination, and the `1`-slot sufficiency witness
+(`LayerStaging.reachable_safe`, `LayerStaging.reachable_can_settle`,
+`LayerStaging.exists_complete_trace`).
 
 ## Assumptions
 
@@ -254,6 +258,11 @@ All proved on every reachable state (`reachable_safe`):
 * **Pull claim (`PullClaimed`).** `(started → pullStarted) ∧ ((d2hPending ∨ 0 < d2hIssued) → started)`:
   `StartPush` never runs unless `ValidateAndBeginPull` claimed `pull_started_`,
   and no D2H copy is pending or issued unless `StartPush` started.
+* **Published is quiet (`PublishedQuiet`).** `published ≠ none → d2hPending = false ∧ d2hRetired = d2hIssued`:
+  once `poll_stats()` has reported the send, as `done_sending` or as failed,
+  no D2H copy is dispatching or still reading prefill HBM, so the engine may
+  reclaim it. The sender's promise to the engine at the session level (the
+  pipeline restates it as `PrefillHbmSafe`).
 * **No op leak.** `0 < inFlight →` some event in `drainEvents` is enabled:
   every accounted unit of `in_flight_` has an owner that can advance or retire
   it (`NoOpLeak`), and every reachable state can drain to `done = true` and

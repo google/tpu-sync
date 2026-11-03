@@ -39,9 +39,7 @@ theorem drain_send_step {s : Pipeline} (h : Inv s)
       · rfl
       · exact absurd hq hp
     by_cases hrd : s.send.d2hReady < s.send.d2hIssued
-    · have hk : s.send.d2hIssued ≤ s.d2hReadyL.length := by
-        rw [h.len_d2hReadyL, ← h.n_send]; omega
-      obtain ⟨l, hl, hf⟩ := exists_false_lt hk (by rw [h.cnt_d2hReady]; exact hrd)
+    · obtain ⟨l, hl, hf⟩ := h.chk_d2hReady.exists_false (by rw [← h.n_send]; omega) hrd
       have hs₁ : step s (.d2hReady l) =
           some { s with send := { s.send with d2hReady := s.send.d2hReady + 1 },
                         prefillStaging := s.prefillStaging.set l (s.prefillHbm.getD l .junk),
@@ -56,10 +54,8 @@ theorem drain_send_step {s : Pipeline} (h : Inv s)
       · by_cases hwk : s.send.woken < s.send.queued
         · by_cases hwi : s.send.woken < s.send.d2hIssued
           · have hwr : s.send.woken < s.send.d2hReady := by omega
-            have hready_eq : s.send.d2hIssued ≤ countTrue s.d2hReadyL := by
-              rw [h.cnt_d2hReady]; omega
             have hwl : s.d2hReadyL[s.send.woken]? = some true :=
-              all_true_lt_of_countTrue h.d2hReady_lt hready_eq s.send.woken hwi
+              all_true_lt_of_countTrue h.d2hReady_lt (by rw [h.cnt_d2hReady]; omega) s.send.woken hwi
             have hs₁ : step s (.send (.wake true)) =
                 some { s with send := { s.send with woken := s.send.woken + 1 }.endOp } := by
               simp [step, sendStep, hwl, Send.step, Send.wake, hwk, hwr, hdr]
@@ -85,9 +81,7 @@ theorem drain_send_step {s : Pipeline} (h : Inv s)
               exact ⟨.send .sendNext, _, hs₁, by simp [hdr], rfl, by rw [Send.drainRank_endOp]; simp [Send.drainRank]; omega⟩
             · have hh2h : s.send.h2hRetired < s.send.h2hIssued := by
                 cases hdp : s.send.d2hPending <;> simp_all <;> omega
-              have hk : s.send.h2hIssued ≤ s.h2hRetiredL.length := by
-                rw [h.len_h2hRetiredL, ← h.n_send]; omega
-              obtain ⟨l, hl, hf⟩ := exists_false_lt hk (by rw [h.cnt_h2hRetired]; exact hh2h)
+              obtain ⟨l, hl, hf⟩ := h.chk_h2hRetired.exists_false (by rw [← h.n_send]; omega) hh2h
               have hs₁ : step s (.h2hDone l true) =
                   some { s with send := { s.send with h2hRetired := s.send.h2hRetired + 1, h2hOk := s.send.h2hOk + 1 }.endOp,
                                 wire := s.wire.set l (s.prefillStaging.getD l .junk),
@@ -120,7 +114,7 @@ theorem drain_recv_step {s : Pipeline} (h : Inv s)
         simp [step, recvStep, Recv.step, Recv.pullReply, hq]
       exact ⟨.recv (.pullReply false), _, hs₁, by simp, rfl, by simp [Recv.drainRank, hq]⟩
     · by_cases hpend : 0 < s.recv.pending
-      · obtain ⟨l, _, hpl⟩ := exists_true_of_countTrue_pos (by rw [h.cnt_h2dPending]; exact hpend)
+      · obtain ⟨l, _, hpl⟩ := h.chk_h2dPending.exists_true hpend
         have hs₁ : step s (.h2dIssue l true) =
             some { s with recv := { s.recv with pending := s.recv.pending - 1, life := s.recv.life.endOpLocked },
                           h2dPendingL := s.h2dPendingL.set l false,
@@ -128,11 +122,7 @@ theorem drain_recv_step {s : Pipeline} (h : Inv s)
           simp [step, h2dIssue, hpl, Recv.step, Recv.h2dIssue, hdr]; omega
         exact ⟨.h2dIssue l true, _, hs₁, by simp [hdr], rfl, by simp [Recv.drainRank]; omega⟩
       · by_cases hrd : s.recv.ready < s.recv.issued
-        · have hlen : s.h2dReadyL.length = s.h2dIssuedL.length := by
-            rw [h.len_h2dReadyL, h.len_h2dIssuedL]
-          have hcnt : countTrue s.h2dReadyL < countTrue s.h2dIssuedL := by
-            rw [h.cnt_h2dReady, h.cnt_h2dIssued]; exact hrd
-          obtain ⟨l, _, hrf, hit⟩ := exists_diff_of_countTrue_lt hlen hcnt
+        · obtain ⟨l, _, hrf, hit⟩ := h.chk_h2dReady.exists_diff h.chk_h2dIssued hrd
           have hs₁ : step s (.h2dReady l) =
               some { s with recv := { s.recv with ready := s.recv.ready + 1 },
                             decodeHbm := s.decodeHbm.set l (s.decodeStaging.getD l .junk),

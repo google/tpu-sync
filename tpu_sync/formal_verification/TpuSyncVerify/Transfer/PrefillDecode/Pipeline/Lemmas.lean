@@ -34,7 +34,6 @@ theorem getElem?_set_kv {l : List Cell} {k j : Nat} (hk : k < l.length)
   · subst hjk; exact List.getElem?_set_self hk
   · rw [List.getElem?_set_ne (Ne.symm hjk)]; exact hj hjk
 
-
 end Pipeline
 
 end TpuSyncVerify.Transfer.PrefillDecode

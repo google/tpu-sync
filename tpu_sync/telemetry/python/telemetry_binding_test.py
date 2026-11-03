@@ -268,9 +268,13 @@ class TelemetryBindingTest(absltest.TestCase):
         metrics_by_name["storage_io_time_ms"].label_names,
         ["local_rank", "direction"],
     )
+    self.assertEqual(
+        metrics_by_name["host_pool_blocks"].label_names,
+        ["dp_rank", "state"],
+    )
 
     # Verify weight sync metrics
-    self.assertLen(metrics, 38)
+    self.assertLen(metrics, 39)
     self.assertEqual(
         metrics_by_name["weight_sync_sent_bytes_total"].label_names, []
     )
@@ -344,6 +348,11 @@ class TelemetryBindingTest(absltest.TestCase):
 
   def test_increment_counter_and_observe_in_buffered_backend(self):
     telemetry_ext.configure_telemetry(["buffered"])
+    telemetry_ext.set_gauge(
+        "host_pool_blocks",
+        64.0,
+        {"dp_rank": "0", "state": "total"},
+    )
     telemetry_ext.increment_counter("weight_sync_sent_bytes_total", 4096)
     telemetry_ext.increment_counter("weight_sync_sent_bytes_total", 2048)
     telemetry_ext.increment_counter(
@@ -360,6 +369,16 @@ class TelemetryBindingTest(absltest.TestCase):
     )
 
     samples = telemetry_ext.get_and_reset_metric_samples()
+    self.assertIn(
+        'tpu_raiden_host_pool_blocks{dp_rank="0",state="total"}',
+        samples,
+    )
+    self.assertEqual(
+        samples[
+            'tpu_raiden_host_pool_blocks{dp_rank="0",state="total"}'
+        ][-1],
+        64.0,
+    )
     self.assertIn("tpu_raiden_weight_sync_sent_bytes_total", samples)
     self.assertEqual(
         sum(samples["tpu_raiden_weight_sync_sent_bytes_total"]), 6144

@@ -591,6 +591,23 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(
       metric_labels::kStorageIoLabels,
       ElementsAre(metric_labels::kLocalRank, metric_labels::kDirection));
+  // Host Pool Blocks Labels & Metadata
+  EXPECT_EQ(metric_labels::kStatePinned, "pinned");
+  EXPECT_THAT(metric_labels::kHostPoolBlocksLabels,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kState));
+
+  EXPECT_EQ(metric_names::kHostPoolBlocks, "host_pool_blocks");
+  EXPECT_EQ(metric_descriptions::kHostPoolBlocks,
+            "Number of host DRAM KV cache pool blocks by state (total, used, "
+            "pinned).");
+  EXPECT_EQ(metric_metadata::kHostPoolBlocks.name, "host_pool_blocks");
+  EXPECT_EQ(metric_metadata::kHostPoolBlocks.description,
+            "Number of host DRAM KV cache pool blocks by state (total, used, "
+            "pinned).");
+  EXPECT_EQ(metric_metadata::kHostPoolBlocks.type, MetricType::kGauge);
+  EXPECT_THAT(metric_metadata::kHostPoolBlocks.label_names,
+              ElementsAre(metric_labels::kDpRank, metric_labels::kState));
+
   // All Metrics
   // clang-format off
   EXPECT_THAT(
@@ -618,6 +635,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kStorageFilesystemBytes,
           metric_metadata::kStorageMetadataCheckTotal,
           metric_metadata::kStorageIoTimeMs,
+          metric_metadata::kHostPoolBlocks,
           metric_metadata::kWeightSyncSentBytesTotal,
           metric_metadata::kWeightSyncReceivedBytesTotal,
           metric_metadata::kWeightSyncTransferFailuresTotal,

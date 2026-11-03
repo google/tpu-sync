@@ -104,6 +104,7 @@ inline constexpr absl::string_view kHostNumaMemoryBytes =
 inline constexpr absl::string_view kStorageFilesystemBytes =
     "storage_filesystem_bytes";
 inline constexpr absl::string_view kStorageIoTimeMs = "storage_io_time_ms";
+inline constexpr absl::string_view kHostPoolBlocks = "host_pool_blocks";
 
 inline constexpr absl::string_view kKvRecallBlocksTotal =
     "kv_recall_blocks_total";
@@ -173,6 +174,8 @@ inline constexpr absl::string_view kHostMemoryBreakdownBytes =
     "page_cache, free)";
 inline constexpr absl::string_view kHostNumaMemoryBytes =
     "Per-NUMA-node host DRAM memory in bytes by state (used, free, total)";
+inline constexpr absl::string_view kHostPoolBlocks =
+    "Number of host DRAM KV cache pool blocks by state (total, used, pinned).";
 
 // Counts KV cache block recall attempts across offload tiers (`local_dram`,
 // `remote_dram`, `shared_storage`) and outcomes (`ok`, `not_found`,
@@ -335,6 +338,14 @@ inline constexpr absl::string_view kResult = "result";
 inline constexpr absl::string_view kResultCacheHit = "cache_hit";
 inline constexpr absl::string_view kResultStatHit = "stat_hit";
 inline constexpr absl::string_view kResultStatMiss = "stat_miss";
+// `host_pool_blocks` states (reusing `kState`, `kStateTotal`, `kStateUsed`
+// above). `total` is the host DRAM pool capacity in blocks, `used` is the
+// number of allocated blocks, and `pinned` is the number of allocated blocks
+// that are not evictable: LRU-pinned entries plus in-flight remote-recall
+// staging, WriteRemote landing, and Save destination blocks.
+// Invariant: pinned <= used <= total.
+inline constexpr absl::string_view kStatePinned = "pinned";
+
 inline constexpr absl::string_view kDirectionLabels[] = {kDirection};
 inline constexpr absl::string_view kSentBytesLabels[] = {kDirection, kSrcIp,
                                                          kDstIp};
@@ -360,6 +371,7 @@ inline constexpr absl::string_view kStorageMetadataCheckLabels[] = {kDpRank,
                                                                     kResult};
 inline constexpr absl::string_view kStorageIoLabels[] = {kLocalRank,
                                                          kDirection};
+inline constexpr absl::string_view kHostPoolBlocksLabels[] = {kDpRank, kState};
 
 }  // namespace metric_labels
 
@@ -368,6 +380,7 @@ namespace metric_metadata {
 using metric_labels::kDirectionLabels;
 using metric_labels::kHostMemoryBreakdownLabels;
 using metric_labels::kHostNumaMemoryLabels;
+using metric_labels::kHostPoolBlocksLabels;
 using metric_labels::kKvEvictedBlocksLabels;
 using metric_labels::kKvRecallBlocksLabels;
 using metric_labels::kKvSaveBlocksLabels;
@@ -503,6 +516,12 @@ inline constexpr MetricMetadata kStorageIoTimeMs{
     .description = metric_descriptions::kStorageIoTimeMs,
     .type = MetricType::kHistogram,
     .label_names = kStorageIoLabels};
+inline constexpr MetricMetadata kHostPoolBlocks{
+    .name = metric_names::kHostPoolBlocks,
+    .description = metric_descriptions::kHostPoolBlocks,
+    .type = MetricType::kGauge,
+    .label_names = kHostPoolBlocksLabels};
+
 inline constexpr MetricMetadata kWeightSyncSentBytesTotal{
     .name = metric_names::kWeightSyncSentBytesTotal,
     .description = metric_descriptions::kWeightSyncSentBytesTotal,
@@ -612,6 +631,7 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kStorageFilesystemBytes,
     kStorageMetadataCheckTotal,
     kStorageIoTimeMs,
+    kHostPoolBlocks,
     // Weight Sync Metrics
     kWeightSyncSentBytesTotal,
     kWeightSyncReceivedBytesTotal,

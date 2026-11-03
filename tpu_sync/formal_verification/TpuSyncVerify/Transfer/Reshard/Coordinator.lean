@@ -1,7 +1,6 @@
 import TpuSyncVerify.Transfer.Reshard.Coordinator.Model
 import TpuSyncVerify.Transfer.Reshard.Coordinator.Lemmas
 import TpuSyncVerify.Transfer.Reshard.Coordinator.Invariant
-import TpuSyncVerify.Transfer.Reshard.Coordinator.Hardened
 import TpuSyncVerify.Transfer.Reshard.Coordinator.Traces
 
 /-!
@@ -69,8 +68,7 @@ ranges for every symbol, sub-block, and test are in the generated
 
   What this file proves:
   1. **Universal Protocol Guarantees (`CoordInv`, `reachable_coord_inv`)**:
-     Across all reachable states (under both shipping and hardened cleanup
-     policies):
+     Across all reachable states:
      * `Registry.Inv s.reg` holds at every step.
      * `NoPushBeforeAllArmed` (`ReshardCoordinator::RunSubPlan`, `for (std::thread& t : armers) t.join();` before `sender_dispatch_ns`): No sender
        is dispatched (`s.sendResults = []`) and no receiver receives any push
@@ -84,7 +82,7 @@ ranges for every symbol, sub-block, and test are in the generated
        preventing `CancelIfUnclaimed` and conflicting `Register` calls.
      * `LeaseMatchesSession`: Every destination unit holds a `PoolStagingLease`
        if and only if its `ReshardReceiveSession` is currently armed.
-  2. **Failure-Cleanup Counterexample Traces under `.shipping`**:
+  2. **What the two abort paths leave behind (`Traces.lean`)**:
      * `trace_partial_arm_orphans_armed_receiver`
        (`ReshardCoordinator::RunSubPlan`, `return arm_status[i];`): When `dst_unit 10` succeeds in arming
        and `dst_unit 11` fails, `RunSubPlan` calls `AbandonClaim` (`if (index == 0)`) and
@@ -99,10 +97,13 @@ ranges for every symbol, sub-block, and test are in the generated
        `dst_units` remain orphaned with active sessions/leases AND
        `claimed_[(req_id, uuid)]` remains pinned in `RequestBlockRegistry`
        until `ttl_s_`.
-  3. **Hardened Cleanup Policy Proof (`reachable_disarmAndAbandon_no_orphans`)**:
-     Under `CleanupPolicy.disarmAndAbandonOnFailure`, every reachable `.aborted`
-     state has zero armed receiver sessions, zero held staging leases, and
-     `s.reg.claimedUnits = none ∧ s.reg.claimOwners = []`.
+  3. **Searches and the disarm-and-abandon alternative (`Traces.lean`)**:
+     `violatesCoordInv = !decide (CoordInv s)` finds no violation over the 2×2
+     instance; `stepDisarmAndAbandon`, which also disarms the armed
+     destinations and calls `AbandonClaim` on both aborts, is the one `step`
+     change under which `NoOrphansWhenAborted` holds on that instance
+     (`trace_disarm_and_abandon_cleans_up_both_aborts`); the shipping `step`
+     violates it on both abort traces.
 
   ## Lock scopes
 

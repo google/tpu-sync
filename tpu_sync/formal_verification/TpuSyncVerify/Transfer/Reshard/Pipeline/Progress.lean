@@ -336,7 +336,7 @@ theorem send_drain_step_lift {s : Pipeline} (h : Inv s)
     | pending | aborted => simp [hst, SendStage.opCount] at hop
     | d2h =>
       let snd := Send.endOp { s.send with pools := s.send.pools.set p { pool with stage := .aborted } }
-      have hs₁ : Send.step .shipping s.send (.d2hDone p true) = some snd := by
+      have hs₁ : Send.step s.send (.d2hDone p true) = some snd := by
         simp [Send.step, Send.d2hDone, hget, hst, hdr, snd]
       let s' : Pipeline := { s with send := snd, srcStaging := s.srcStaging.set p (s.srcHbm.getD p .junk) }
       refine ⟨.d2hDone p true, s', ?_, by simp [s', snd, hdr], rfl, by simp [s', snd]; omega⟩
@@ -346,7 +346,7 @@ theorem send_drain_step_lift {s : Pipeline} (h : Inv s)
       | zero => simp [hst, SendStage.opCount] at hop
       | succ k =>
         let snd := Send.endOp { s.send with pools := s.send.pools.set p { pool with stage := .pushing k } }
-        have hs₁ : Send.step .shipping s.send (.pushDone p true) = some snd := by
+        have hs₁ : Send.step s.send (.pushDone p true) = some snd := by
           simp [Send.step, Send.pushDone, hget, hst, Send.recordPushCompletion, hdr, snd]
         let s' : Pipeline :=
           { s with send := snd
@@ -358,13 +358,13 @@ theorem send_drain_step_lift {s : Pipeline} (h : Inv s)
     · obtain ⟨p, _, pool, hget, hp⟩ := Send.exists_pending_of_allIssued_false hiss
       let snd := Send.endOp { s.send with pools := s.send.pools.set p { pool with stage := .aborted },
                                           execActive := false }
-      have hs₁ : Send.step .shipping s.send (.d2hIssue p false) = some snd := by
+      have hs₁ : Send.step s.send (.d2hIssue p false) = some snd := by
         simp [Send.step, Send.d2hIssue, hex, hget, hp, Send.recordPushCompletion, hdr, snd]
       let s' : Pipeline := { s with send := snd }
       refine ⟨.d2hIssue p false, s', ?_, by simp [s', snd, hdr], rfl, by simp [s', snd]; omega⟩
       simp [step, sendStep, hs₁, s']
     · let snd := Send.endOp { s.send with execActive := false }
-      have hs₁ : Send.step .shipping s.send .execFinish = some snd := by
+      have hs₁ : Send.step s.send .execFinish = some snd := by
         simp [Send.step, Send.execFinish, hex, hiss, snd]
       let s' : Pipeline := { s with send := snd }
       refine ⟨.execFinish, s', ?_, by simp [s', snd, hdr], rfl, by simp [s', snd]; omega⟩

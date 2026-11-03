@@ -16,9 +16,9 @@ namespace Send
 Concrete traces, checked by `decide`, covering multi-pool multi-peer slot
 counting (`CountPoolReshardSendSlots`), `ReshardSendSessionTest` and
 `PoolReshardSendTest` parity, external deadline or cancellation unregistration
-in `ReshardSendSession::EndOp`, and the contrast between
-`UnregisterPolicy.shipping` and `UnregisterPolicy.onSettle` when one pool fails
-while a sibling pool is still in flight. -/
+in `ReshardSendSession::EndOp`, and the early plan unregistration of
+`ReshardSendSession::RecordPushCompletion` when one pool fails while a sibling
+pool is still in flight (contrasted below with an `EndOp`-only alternative). -/
 
 /-- Sender source-span validation (`ReshardSendSession::ValidatePlan`, invoked
 by `ReshardSendSession::Create`; `StridedSpanFitsBlock` and
@@ -41,6 +41,9 @@ def validSenderSpan (blockStride liveBytes tokenStride tokenLive offset size : N
     decide (offset / tokenStride = (offset + size - 1) / tokenStride) &&
     decide (offset % tokenStride + size ≤ tokenLive)
 
+def tr_parity_send : List Ev :=
+  [.d2hIssue 0 true, .execFinish, .d2hDone 0 true, .pushDone 0 true, .publish]
+
 /-- Replay of `ReshardSendSessionTest` and
 `PoolReshardSendTest.SenderWithNoBytesForAnyTransferredPoolRefusedUpFront`:
 1. `PoolReshardSendTest.SenderWithNoBytesForAnyTransferredPoolRefusedUpFront` and
@@ -60,9 +63,10 @@ def validSenderSpan (blockStride liveBytes tokenStride tokenLive offset size : N
    (`true`).
 4. `ReshardSendSessionTest.AcceptsCanonicalPlanOnExplicitPools`,
    `ReshardSendSessionTest.AcceptsImplicitPools`, and
-   `ReshardSendSessionTest.IgnoresReceiverCoverageGap`: a 1-pool, 1-peer sender
-   schedule (`ns = [1]`) is accepted (`validSchedule [1] = true`) and completes
-   D2H + push to settle with `published = some true`. -/
+   `ReshardSendSessionTest.IgnoresReceiverCoverageGap`: those tests accept a
+   1-pool, 1-peer sender schedule (`ns = [1]`, `validSchedule [1] = true`);
+   run through the session it completes D2H + push to settle with
+   `published = some true`. -/
 theorem trace_reshard_send_session_test_parity :
     validSchedule [] = false ∧
     validSchedule [0] = false ∧
@@ -70,11 +74,14 @@ theorem trace_reshard_send_session_test_parity :
     validSenderSpan 256 128 64 32 16 32 = false ∧
     validSenderSpan 256 128 64 32 64 32 = true ∧
     validSchedule [1] = true ∧
-    ((sys [1]).run
-      [.d2hIssue 0 true, .execFinish, .d2hDone 0 true, .pushDone 0 true, .publish]).map
+    ((sys [1]).run tr_parity_send).map
       (fun r => (r.life.done, r.life.hasStaging, r.planUnregistered, r.published)) =
       some (true, false, true, some true) := by
   decide
+
+def tr_multi_pool_multi_peer_send : List Ev :=
+  [.d2hIssue 0 true, .d2hIssue 1 true, .execFinish, .d2hDone 0 true,
+   .pushDone 0 true, .pushDone 0 true, .d2hDone 1 true, .pushDone 1 true, .publish]
 
 /-- Two active pools with peer counts `[2, 1]` (`CountPoolReshardSendSlots = 3`,
 e.g. an attention group pushing to 2 peers and a state group pushing to 1 peer,
@@ -85,47 +92,50 @@ all 3 `(pool, peer)` pushes have completed. -/
 theorem trace_multi_pool_multi_peer_send :
     let s := sys [2, 1]
     -- ExecutePush issues D2H for pool 0 and pool 1, then calls EndOp (`inFlight = 2`).
-    (s.run [.d2hIssue 0 true, .d2hIssue 1 true, .execFinish]).map
+    (s.run (tr_multi_pool_multi_peer_send.take 3)).map
       (fun r => (r.pools.map SendPool.stage, r.life.inFlight, r.remainingPushes, r.life.done)) =
       some ([.d2h, .d2h], 2, 3, false) ∧
     -- Pool 0's D2H completes (`StartPoolPush` adds 2 peer ops and releases 1 D2H op: `inFlight = 3`).
-    (s.run [.d2hIssue 0 true, .d2hIssue 1 true, .execFinish, .d2hDone 0 true]).map
+    (s.run (tr_multi_pool_multi_peer_send.take 4)).map
       (fun r => (r.pools.map SendPool.stage, r.life.inFlight, r.remainingPushes)) =
       some ([.pushing 2, .d2h], 3, 3) ∧
     -- Pool 0's two peer pushes and pool 1's D2H complete (`remainingPushes = 1`, still not done).
-    (s.run [.d2hIssue 0 true, .d2hIssue 1 true, .execFinish, .d2hDone 0 true,
-            .pushDone 0 true, .pushDone 0 true, .d2hDone 1 true]).map
+    (s.run (tr_multi_pool_multi_peer_send.take 7)).map
       (fun r => (r.pools.map SendPool.stage, r.life.inFlight, r.remainingPushes, r.life.done)) =
       some ([.pushing 0, .pushing 1], 1, 1, false) ∧
     -- Pool 1's peer push completes: `remainingPushes` hits 0, session settles and publishes `done_sending`.
-    (s.run [.d2hIssue 0 true, .d2hIssue 1 true, .execFinish, .d2hDone 0 true,
-            .pushDone 0 true, .pushDone 0 true, .d2hDone 1 true,
-            .pushDone 1 true, .publish]).map
+    (s.run tr_multi_pool_multi_peer_send).map
       (fun r => (r.life.done, r.life.hasStaging, r.planUnregistered, r.published)) =
       some (true, false, true, some true) := by
   decide
 
+def tr_cancel_unregisters_on_last_endOp : List Ev :=
+  [.d2hIssue 0 true, .execFinish, .d2hDone 0 true, .cancel,
+   .pushDone 0 true, .pushDone 0 true, .publish]
+
 /-- External deadline or cancellation (`cancel` in
 `KVCacheManagerWithTransfer::CompleteReadWithDetails`, `ReshardSendSession::Finish`)
-while peer pushes are in flight
-(`ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush`):
-`Finish(error)` sets `finalizing_ = true` without unregistering the plan while
+while peer pushes are in flight: `Finish(error)` sets `finalizing_ = true`
+without unregistering the plan while
 `in_flight_ == 2`; the first peer push to finish decrements `in_flight_` to `1`
 without unregistering; the last peer push's `ReshardSendSession::EndOp`
-unregisters the plan, releases the staging leases, and settles the session. -/
+unregisters the plan, releases the staging leases, and settles the session.
+`ReshardSendSessionTest.PerTransferPolicyClosesIdlePeerConnectionsWhenCancelledMidPush`
+drives the one-peer version of the last two steps (`cancel`, then the push
+completing) from a session whose push op `ReshardSendSessionTestPeer::BeginPush`
+took. -/
 theorem trace_cancel_unregisters_on_last_endOp :
     let s := sys [2]
-    let pre := [.d2hIssue 0 true, .execFinish, .d2hDone 0 true, .cancel]
     -- After cancel with 2 peer pushes in flight: draining, but plan still registered and staging held.
-    (s.run pre).map
+    (s.run (tr_cancel_unregisters_on_last_endOp.take 4)).map
       (fun r => (r.life.draining, r.life.done, r.life.inFlight, r.planUnregistered)) =
       some (true, false, 2, false) ∧
     -- First peer push finishes (`inFlight = 1`): still not done, plan still registered.
-    (s.run (pre ++ [.pushDone 0 true])).map
+    (s.run (tr_cancel_unregisters_on_last_endOp.take 5)).map
       (fun r => (r.life.done, r.life.inFlight, r.planUnregistered, r.life.hasStaging)) =
       some (false, 1, false, true) ∧
     -- Second peer push finishes (`inFlight = 0`): `EndOp` unregisters the plan and settles.
-    (s.run (pre ++ [.pushDone 0 true, .pushDone 0 true, .publish])).map
+    (s.run tr_cancel_unregisters_on_last_endOp).map
       (fun r => (r.life.done, r.planUnregistered, r.life.hasStaging, r.published)) =
       some (true, true, false, some false) := by
   decide
@@ -141,27 +151,20 @@ Assumption A4 above justifies folding the per-transfer connection-release window
 in `ReshardSendSession::EndOp` (`while (true)`) into the atomic `endOp`
 transition. -/
 
-/-- Early plan unregistration on partial failure (`ReshardSendSession::RecordPushCompletion`
-vs. `ReshardSendSession::EndOp`): when pool 0's push fails (`pushDone 0 false`)
-while pool 1's push is still in flight, `UnregisterPolicy.shipping` unregisters
-the active plan immediately (`planUnregistered = true` while `done = false` and
-`inFlight = 1`). Under `UnregisterPolicy.onSettle`, the plan remains registered
-until pool 1's op also finishes (`planUnregistered = false` until
-`done = true`). -/
-theorem trace_early_unregister_on_error_vs_onSettle :
-    let evs := [.d2hIssue 0 true, .d2hIssue 1 true, .execFinish,
-                .d2hDone 0 true, .d2hDone 1 true, .pushDone 0 false]
-    -- Shipping: planUnregistered is already true while pool 1 still has 1 push in flight (`done = false`).
-    ((sys [1, 1] .shipping).run evs).map
+def tr_early_unregister_on_error : List Ev :=
+  [.d2hIssue 0 true, .d2hIssue 1 true, .execFinish,
+   .d2hDone 0 true, .d2hDone 1 true, .pushDone 0 false]
+
+/-- Early plan unregistration on partial failure
+(`ReshardSendSession::RecordPushCompletion` vs. `ReshardSendSession::EndOp`):
+when pool 0's push fails (`pushDone 0 false`) while pool 1's push is still in
+flight, `RecordPushCompletion` unregisters the active plan at once
+(`planUnregistered = true` while `done = false` and `inFlight = 1`), so pool 1's
+`StartPoolPush` resolves its chunks against an unregistered plan. -/
+theorem trace_early_unregister_on_error :
+    ((sys [1, 1]).run tr_early_unregister_on_error).map
       (fun r => (r.life.done, r.life.inFlight, r.planUnregistered)) =
-      some (false, 1, true) ∧
-    -- onSettle: plan stays registered while pool 1 is in flight, and unregisters when pool 1 finishes.
-    ((sys [1, 1] .onSettle).run evs).map
-      (fun r => (r.life.done, r.life.inFlight, r.planUnregistered)) =
-      some (false, 1, false) ∧
-    ((sys [1, 1] .onSettle).run (evs ++ [.pushDone 1 true])).map
-      (fun r => (r.life.done, r.life.inFlight, r.planUnregistered)) =
-      some (true, 0, true) := by
+      some (false, 1, true) := by
   decide
 
 def events (numPools : Nat) : List Ev :=
@@ -171,16 +174,20 @@ def events (numPools : Nat) : List Ev :=
      .d2hDone p true, .d2hDone p false,
      .pushDone p true, .pushDone p false]
 
-instance (pol : UnregisterPolicy) (s : Send) : Decidable (Safe pol s) := by
+instance (s : Send) : Decidable (Safe s) := by
   unfold Safe SettleSafe NoRetiredCallback StagingIntegrity SettlesPromptly ActiveOrDraining PlanIntegrity Publication NoOpLeak
   infer_instance
 
 /-- Executable negation of `Safe`, by construction: the bounded searches and the
 `reachable_safe` theorem check the same predicate. -/
-def violates (pol : UnregisterPolicy) (s : Send) : Bool := !decide (Safe pol s)
+def violates (s : Send) : Bool := !decide (Safe s)
 
-theorem violates_iff (pol : UnregisterPolicy) (s : Send) : violates pol s = false ↔ Safe pol s := by
+theorem violates_iff (s : Send) : violates s = false ↔ Safe s := by
   simp [violates]
+
+#guard ModelCheck.check (sys [2]) (events 1) violates 12 = .safe
+#guard ModelCheck.check (sys [1, 1]) (events 2) violates 12 = .safe
+#guard ModelCheck.check (sys [2, 1]) (events 2) violates 12 = .safe
 
 
 /-- Mutant 1 (`initOvercountedSlots`, cf. `ReshardSendSession::Create`):
@@ -191,8 +198,8 @@ instead of `2 + 1 = 3`) leaves the session open with `in_flight_ == 0` and
 def initOvercountedSlots : Send :=
   { (init [2, 1]) with remainingPushes := 4 }
 
-#guard (match ModelCheck.check ⟨initOvercountedSlots, step .shipping⟩
-          (events 2) (violates .shipping) 9 with
+#guard (match ModelCheck.check ⟨initOvercountedSlots, step⟩
+          (events 2) violates 9 with
         | .counterexample _ => true
         | _ => false)
 
@@ -208,10 +215,10 @@ def stepWithoutEndOpUnregister (s : Send) : Ev → Option Send
     if s.execActive = true ∧ allIssued s.pools = true then
       some (endOpWithoutUnregister { s with execActive := false })
     else none
-  | e => step .shipping s e
+  | e => step s e
 
 #guard (match ModelCheck.check ⟨init [1], stepWithoutEndOpUnregister⟩
-          (events 1) (violates .shipping) 4 with
+          (events 1) violates 4 with
         | .counterexample _ => true
         | _ => false)
 
@@ -225,14 +232,84 @@ def d2hDoneLeakOnDraining (p : Nat) (ok : Bool) (s : Send) : Option Send :=
     if pool.stage != .d2h then none
     else if ok && (s.life.done || s.life.draining) then
       some { s with pools := s.pools.set p { pool with stage := .aborted } }
-    else s.d2hDone .shipping p ok
+    else s.d2hDone p ok
   | none => none
 
 #guard (match ModelCheck.check ⟨init [1], fun s e => match e with
           | .d2hDone p ok => d2hDoneLeakOnDraining p ok s
-          | e => step .shipping s e⟩ (events 1) (violates .shipping) 5 with
+          | e => step s e⟩ (events 1) violates 5 with
         | .counterexample _ => true
         | _ => false)
+
+/-! ### The `EndOp`-only unregistration alternative
+
+`ReshardReceiveSession` unregisters its plan only when its last op ends
+(`FinishPoolH2d` / `EndRecvOpLocked`); `ReshardSendSession::RecordPushCompletion`
+unregisters as soon as `finalizing_` is latched. `stepUnregisterOnSettle` is
+`step` with the send session doing what the receive session does — the plan
+stays registered until `EndOp` settles the session. It is not the shipping
+code. -/
+
+/-- `RecordPushCompletion` without `UnregisterActivePlan`. -/
+def recordPushCompletionOnSettle (ok : Bool) (s : Send) : Send :=
+  { recordPushCompletion ok s with planUnregistered := s.planUnregistered }
+
+def stepUnregisterOnSettle (s : Send) : Ev → Option Send
+  | .d2hIssue p ok =>
+    if !s.execActive then none
+    else match s.pools[p]? with
+    | some pool =>
+      if pool.stage != .pending then none
+      else if ok then step s (.d2hIssue p ok)
+      else some (endOp (recordPushCompletionOnSettle false
+        { s with pools := s.pools.set p { pool with stage := .aborted }, execActive := false }))
+    | none => none
+  | .d2hDone p ok =>
+    match s.pools[p]? with
+    | some pool =>
+      if pool.stage != .d2h then none
+      else if !ok then
+        some (endOp (recordPushCompletionOnSettle false
+          { s with pools := s.pools.set p { pool with stage := .aborted } }))
+      else step s (.d2hDone p ok)
+    | none => none
+  | .pushDone p ok =>
+    match s.pools[p]? with
+    | some pool =>
+      match pool.stage with
+      | .pushing (k + 1) =>
+        some (endOp (recordPushCompletionOnSettle ok
+          { s with pools := s.pools.set p { pool with stage := .pushing k } }))
+      | _ => none
+    | none => none
+  | e => step s e
+
+/-- Under the alternative the plan stays registered while pool 1 is in flight
+and is unregistered when pool 1's op ends the session. -/
+theorem trace_unregister_on_settle_alternative :
+    ((⟨init [1, 1], stepUnregisterOnSettle⟩ : System Send Ev).run tr_early_unregister_on_error).map
+      (fun r => (r.life.done, r.life.inFlight, r.planUnregistered)) =
+      some (false, 1, false) ∧
+    ((⟨init [1, 1], stepUnregisterOnSettle⟩ : System Send Ev).run
+        (tr_early_unregister_on_error ++ [.pushDone 1 true])).map
+      (fun r => (r.life.done, r.life.inFlight, r.planUnregistered)) =
+      some (true, 0, true) := by
+  decide
+
+/-- `Safe` and `planUnregistered = done` in every state the alternative reaches
+on the 1- and 2-pool instances (exhaustive); shipping `sys` violates the
+biconditional on a multi-pool failure (`planUnregistered = true` while sibling
+ops drain). -/
+def violatesPlanIffDone (s : Send) : Bool :=
+  !decide (Safe s ∧ s.planUnregistered = s.life.done)
+
+#guard ModelCheck.check (⟨init [2], stepUnregisterOnSettle⟩ : System Send Ev) (events 1)
+  violatesPlanIffDone 12 = .safe
+#guard ModelCheck.check (⟨init [1, 1], stepUnregisterOnSettle⟩ : System Send Ev) (events 2)
+  violatesPlanIffDone 12 = .safe
+#guard ModelCheck.check (⟨init [2, 1], stepUnregisterOnSettle⟩ : System Send Ev) (events 2)
+  violatesPlanIffDone 12 = .safe
+#guard (ModelCheck.check (sys [1, 1]) (events 2) violatesPlanIffDone 12 matches .counterexample _)
 
 end Send
 

@@ -9,17 +9,6 @@ namespace TpuSyncVerify.Transfer.Reshard
 
 open TpuSyncVerify.Transfer (Lifecycle)
 
-/-- Policy for when `ReshardSendSession` unregisters its active plan:
-`shipping` unregisters immediately inside `RecordPushCompletion` when
-`finalizing_` is latched and in `EndOp` when an externally finished session
-drains its last op; `onSettle` always defers unregistration to `EndOp` when
-`in_flight_ == 1 && finalizing_` (matching `ReshardReceiveSession::FinishPoolH2d`
-and `ReshardReceiveSession::EndRecvOpLocked`). -/
-inductive UnregisterPolicy where
-  | shipping
-  | onSettle
-  deriving Repr, DecidableEq
-
 inductive SendStage where
   | pending
   | d2h
@@ -124,19 +113,20 @@ def endOp (s : Send) : Send :=
     planUnregistered := unreg }
 
 /-- `ReshardSendSession::RecordPushCompletion`: on the first error or when
-`--remaining_pool_peer_pushes_ == 0`, latches `finalizing_ = true` (and under
-`UnregisterPolicy.shipping`, unregisters the active plan immediately). -/
-def recordPushCompletion (pol : UnregisterPolicy) (ok : Bool) (s : Send) : Send :=
+`--remaining_pool_peer_pushes_ == 0`, latches `finalizing_ = true` and
+unregisters the active plan at once (`UnregisterActivePlan`), while sibling
+pools and peers may still have ops in flight. -/
+def recordPushCompletion (ok : Bool) (s : Send) : Send :=
   if s.life.done = true ∨ s.life.draining = true then s
   else if !ok then
     { s with
       life := s.life.finishLocked false
-      planUnregistered := if pol == .shipping then true else s.planUnregistered }
+      planUnregistered := true }
   else if s.remainingPushes <= 1 then
     { s with
       remainingPushes := 0
       life := s.life.finishLocked true
-      planUnregistered := if pol == .shipping then true else s.planUnregistered }
+      planUnregistered := true }
   else
     { s with remainingPushes := s.remainingPushes - 1 }
 
@@ -150,7 +140,7 @@ inductive Ev where
   deriving Repr, DecidableEq
 
 /-- Per-pool body of `ReshardSendSession::ExecutePush`. -/
-def d2hIssue (pol : UnregisterPolicy) (p : Nat) (ok : Bool) (s : Send) : Option Send :=
+def d2hIssue (p : Nat) (ok : Bool) (s : Send) : Option Send :=
   if !s.execActive then none
   else match s.pools[p]? with
   | some pool =>
@@ -160,7 +150,7 @@ def d2hIssue (pol : UnregisterPolicy) (p : Nat) (ok : Bool) (s : Send) : Option 
         pools := s.pools.set p { pool with stage := .d2h }
         life := { s.life with inFlight := s.life.inFlight + 1 } }
     else
-      let s₁ := recordPushCompletion pol false
+      let s₁ := recordPushCompletion false
         { s with
           pools := s.pools.set p { pool with stage := .aborted }
           execActive := false }
@@ -174,12 +164,12 @@ def execFinish (s : Send) : Option Send :=
   else none
 
 /-- `pool_future.OnReady` callback + `ReshardSendSession::StartPoolPush` + `EndOp()`. -/
-def d2hDone (pol : UnregisterPolicy) (p : Nat) (ok : Bool) (s : Send) : Option Send :=
+def d2hDone (p : Nat) (ok : Bool) (s : Send) : Option Send :=
   match s.pools[p]? with
   | some pool =>
     if pool.stage != .d2h then none
     else if !ok then
-      let s₁ := recordPushCompletion pol false
+      let s₁ := recordPushCompletion false
         { s with pools := s.pools.set p { pool with stage := .aborted } }
       some (endOp s₁)
     else if s.life.done = true ∨ s.life.draining = true then
@@ -191,12 +181,12 @@ def d2hDone (pol : UnregisterPolicy) (p : Nat) (ok : Bool) (s : Send) : Option S
   | none => none
 
 /-- `AsyncPush(...).OnReady` callback for one peer of pool `p` in `ReshardSendSession::StartPoolPush`. -/
-def pushDone (pol : UnregisterPolicy) (p : Nat) (ok : Bool) (s : Send) : Option Send :=
+def pushDone (p : Nat) (ok : Bool) (s : Send) : Option Send :=
   match s.pools[p]? with
   | some pool =>
     match pool.stage with
     | .pushing (k + 1) =>
-      let s₁ := recordPushCompletion pol ok
+      let s₁ := recordPushCompletion ok
         { s with pools := s.pools.set p { pool with stage := .pushing k } }
       some (endOp s₁)
     | _ => none
@@ -214,16 +204,16 @@ def publish (s : Send) : Option Send :=
     some { s with published := some s.life.statusOk }
   else none
 
-def step (pol : UnregisterPolicy := .shipping) (s : Send) : Ev → Option Send
-  | .d2hIssue p ok => s.d2hIssue pol p ok
+def step (s : Send) : Ev → Option Send
+  | .d2hIssue p ok => s.d2hIssue p ok
   | .execFinish => s.execFinish
-  | .d2hDone p ok => s.d2hDone pol p ok
-  | .pushDone p ok => s.pushDone pol p ok
+  | .d2hDone p ok => s.d2hDone p ok
+  | .pushDone p ok => s.pushDone p ok
   | .cancel => s.cancel
   | .publish => s.publish
 
-def sys (peerCounts : List Nat) (pol : UnregisterPolicy := .shipping) : System Send Ev :=
-  ⟨init peerCounts, step pol⟩
+def sys (peerCounts : List Nat) : System Send Ev :=
+  ⟨init peerCounts, step⟩
 
 end Send
 

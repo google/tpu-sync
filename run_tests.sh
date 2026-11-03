@@ -59,6 +59,7 @@ if [ "$RUN_JAX" = true ]; then
   python "${WORKSPACE_DIR}/tpu_sync/api/jax/kv_cache_manager_transfer_test.py"
   python "${WORKSPACE_DIR}/tpu_sync/api/jax/weight_synchronizer_test.py"
   python "${WORKSPACE_DIR}/tpu_sync/api/jax/kv_cache_manager_mpmd_test.py"
+  python "${WORKSPACE_DIR}/tpu_sync/api/jax/mooncake_provider_test.py"
 fi
 
 if [ "$RUN_TORCH" = true ]; then

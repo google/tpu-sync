@@ -15,6 +15,7 @@ part of the transfer path they isolate:
 | `jax_pathways_mcjax_weight_sync_benchmark_runner.py` | Multi-host weight sync: Pathways source -> McJAX destination, D2H + Net + H2D per stage | yes, on all hosts | JAX / Pathways |
 | `torch_weight_sync_benchmark_runner.py` | Cross-node weight sync: PyTorch source -> PyTorch destination (row -> column reshard), D2H + Net + H2D per stage | yes, on both nodes | PyTorch |
 | `torch_dist_weight_sync_benchmark_runner.py` | Cross-node distributed weight sync: D2H + Net + H2D with TP resharding | yes, multi-host TPU | PyTorch |
+| `ray_weight_sync_benchmark_runner.py` | Multi-slice Ray weight sync: PyTorch Trainer `(ep,fsdp,tp)` -> Sampler `(ep,fsdp,tp)` reshard via `WeightSynchronizerManager` | yes, on both slices | PyTorch / Ray |
 
 Pick by what you are trying to localise. The C++ H2H runner gives the wire
 ceiling; the D2D read runner shows what the device path delivers against that
@@ -68,5 +69,28 @@ The microbenchmark runs across different tensor shapes, layers, and dtypes (`bf1
 3. **PyTorch Standard Baseline**: Native PyTorch transfers using standard unpinned host memory.
 
 The script logs telemetry with 95% confidence intervals and standard deviation to `--telemetry_log_path`, recording median latency and throughput (GB/s) for both D2H and H2D.
+
+---
+
+## `ray_weight_sync_benchmark_runner.py` — multi-slice Ray PyTorch weight sync
+
+Runs an end-to-end weight transfer benchmark across a source (Trainer) TPU slice
+and destination (Sampler) TPU slice on an active Ray cluster using
+`WeightSynchronizerManager`, `RaidenControllerClientFacade`, and PyTorch
+`WeightSynchronizer`. Model weight shapes and 3D `(ep, fsdp, tp)` sharding rules
+are loaded at runtime from either an explicit JSON tensor manifest
+(`--spec-file`) or a HuggingFace config (`--hf-config` / inline `"hf_config"`
+with regex `"sharding_rules"`).
+
+```bash
+python3 examples/microbenchmarks/ray_weight_sync_benchmark_runner.py \
+  --spec-file=/path/to/model_spec.json \
+  --src-mesh=ep=8,fsdp=8,tp=1 \
+  --dst-mesh=ep=8,fsdp=1,tp=8 \
+  --num-iters=5 \
+  --parallelism=8 \
+  --group-size=16 \
+  --output-json=/tmp/weight_sync_metrics.json
+```
 
 

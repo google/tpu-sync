@@ -775,11 +775,21 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Path of the meminfo file read by `host_memory_breakdown_bytes` telemetry.
   absl::string_view proc_meminfo_path() const { return proc_meminfo_path_; }
 
+  // Directory of per-NUMA-node `node<N>/meminfo` files read by
+  // `host_numa_memory_bytes` telemetry.
+  absl::string_view sysfs_node_dir() const { return sysfs_node_dir_; }
+
  protected:
   // Meminfo file read by `host_memory_breakdown_bytes` telemetry. Changing it
   // is allowed only in tests, to point at a fake meminfo file; production code
   // must keep the default `/proc/meminfo`.
   std::string proc_meminfo_path_ = "/proc/meminfo";
+
+  // Directory of per-NUMA-node `node<N>/meminfo` files read by
+  // `host_numa_memory_bytes` telemetry. Changing it is allowed only in tests,
+  // to point at a fake sysfs tree; production code must keep the default
+  // `/sys/devices/system/node`.
+  std::string sysfs_node_dir_ = "/sys/devices/system/node";
 
   size_t max_physical_size_ = 0;
   int64_t staging_num_slots_ = 0;

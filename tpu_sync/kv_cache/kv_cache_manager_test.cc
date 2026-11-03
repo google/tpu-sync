@@ -30,6 +30,7 @@
 #include <string>
 #include <system_error>
 #include <thread>  // NOLINT(build/c++11)
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1793,6 +1794,11 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramTelemetry) {
       SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
                testing::_, testing::Ge(0.0)))
       .Times(testing::AnyNumber());
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
 
   TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/2,
                              /*slice_byte_size=*/128,
@@ -1818,6 +1824,11 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
                testing::IsEmpty(), testing::DoubleEq(2048.0)))
       .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
 
   TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/2,
                              /*slice_byte_size=*/128,
@@ -1919,6 +1930,11 @@ TEST(KVCacheManagerTest, AllocatedOccupancyMetricEmitsHostMemoryBreakdown) {
                        HostMemoryComponentLabel(
                            telemetry::metric_labels::kComponentFree),
                        testing::DoubleEq(4096000.0 * 1024)));
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
 
   manager.UpdateAllocatedOccupancyMetric();
 }
@@ -1943,6 +1959,11 @@ TEST(KVCacheManagerTest, HostMemoryBreakdownMetricsSkippedWhenMeminfoMissing) {
       SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
                testing::_, testing::_))
       .Times(0);
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
 
   manager.UpdateAllocatedOccupancyMetric();
 }
@@ -1967,6 +1988,140 @@ TEST(KVCacheManagerTest, HostMemoryBreakdownMetricsSkippedOnNonZeroLocalRank) {
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
                testing::_, testing::_))
+      .Times(0);
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(0);
+
+  worker1_mgr.UpdateAllocatedOccupancyMetric();
+}
+
+// Builds a fake `/sys/devices/system/node` tree under a fresh temp directory
+// and removes it on destruction.
+class FakeSysfsNodeDir {
+ public:
+  explicit FakeSysfsNodeDir(absl::string_view name)
+      : root_(absl::StrCat(testing::TempDir(), "/", name, "_", getpid())) {
+    std::filesystem::remove_all(root_);
+    std::filesystem::create_directories(root_);
+  }
+  ~FakeSysfsNodeDir() {
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+  }
+
+  // Creates `<root>/<dirname>/` and, if `meminfo` is set, its `meminfo` file.
+  void AddDir(absl::string_view dirname,
+              std::optional<absl::string_view> meminfo = std::nullopt) {
+    const std::filesystem::path dir = root_ / std::string(dirname);
+    std::filesystem::create_directories(dir);
+    if (meminfo.has_value()) {
+      std::ofstream(dir / "meminfo") << *meminfo;
+    }
+  }
+
+  std::string path() const { return root_.string(); }
+
+ private:
+  std::filesystem::path root_;
+};
+
+// Points `host_numa_memory_bytes` telemetry at `sysfs_node_dir` instead of
+// `/sys/devices/system/node`. Overriding the directory is allowed only in
+// tests.
+class FakeSysfsKVCacheManager : public TestKVCacheManager {
+ public:
+  FakeSysfsKVCacheManager(size_t num_layers, size_t num_shards,
+                          size_t slice_byte_size, int host_blocks,
+                          std::string sysfs_node_dir)
+      : TestKVCacheManager(num_layers, num_shards, slice_byte_size,
+                           host_blocks) {
+    sysfs_node_dir_ = std::move(sysfs_node_dir);
+  }
+};
+
+auto NumaStateLabels(absl::string_view node, absl::string_view state) {
+  return testing::ElementsAre(
+      testing::FieldsAre(telemetry::metric_labels::kNumaNode,
+                         std::string(node)),
+      testing::FieldsAre(telemetry::metric_labels::kState, std::string(state)));
+}
+
+TEST(KVCacheManagerTest, AllocatedOccupancyMetricEmitsHostNumaMemoryPerNode) {
+  ScopedUnsetLocalRank unset_local_rank;
+  FakeSysfsNodeDir sysfs("numa_sysfs_rank0");
+  sysfs.AddDir("node0",
+               "Node 0 MemTotal: 1000 kB\n"
+               "Node 0 MemFree:   400 kB\n"
+               "Node 0 MemUsed:   600 kB\n");
+  // MemUsed absent: used falls back to MemTotal - MemFree.
+  sysfs.AddDir("node1",
+               "Node 1 MemTotal: 2000 kB\n"
+               "Node 1 MemFree:   500 kB\n");
+  // Skipped: non-node directories, a leading-zero id, a node without
+  // meminfo, and a node whose meminfo lacks MemFree.
+  sysfs.AddDir("cpu0", "Node 9 MemTotal: 1 kB\nNode 9 MemFree: 1 kB\n");
+  sysfs.AddDir("node01", "Node 1 MemTotal: 1 kB\nNode 1 MemFree: 1 kB\n");
+  sysfs.AddDir("node2");
+  sysfs.AddDir("node3", "Node 3 MemTotal: 1000 kB\n");
+  FakeSysfsKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                                  /*slice_byte_size=*/128, /*host_blocks=*/2,
+                                  sysfs.path());
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Ne(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*raw_mock, SetGauge(telemetry::metric_names::kHostNumaMemoryBytes,
+                                  testing::_, testing::_))
+      .Times(0);
+  for (const auto& [node, state, kib] :
+       std::vector<std::tuple<std::string, absl::string_view, double>>{
+           {"0", telemetry::metric_labels::kStateUsed, 600},
+           {"0", telemetry::metric_labels::kStateFree, 400},
+           {"0", telemetry::metric_labels::kStateTotal, 1000},
+           {"1", telemetry::metric_labels::kStateUsed, 1500},
+           {"1", telemetry::metric_labels::kStateFree, 500},
+           {"1", telemetry::metric_labels::kStateTotal, 2000}}) {
+    EXPECT_CALL(
+        *raw_mock,
+        SetGauge(telemetry::metric_names::kHostNumaMemoryBytes,
+                 NumaStateLabels(node, state), testing::DoubleEq(kib * 1024.0)))
+        .Times(1);
+  }
+
+  manager.UpdateAllocatedOccupancyMetric();
+  // An immediate second update is throttled and emits no more NUMA samples.
+  manager.UpdateAllocatedOccupancyMetric();
+}
+
+TEST(KVCacheManagerTest, HostNumaMemoryMetricsSkippedOnNonZeroLocalRank) {
+  ScopedUnsetLocalRank restore_local_rank;
+  setenv(telemetry::kLocalRankEnvVar, "1", 1);
+  FakeSysfsNodeDir sysfs("numa_sysfs_rank1");
+  sysfs.AddDir("node0", "Node 0 MemTotal: 1000 kB\nNode 0 MemFree: 400 kB\n");
+  FakeSysfsKVCacheManager worker1_mgr(/*num_layers=*/1, /*num_shards=*/1,
+                                      /*slice_byte_size=*/128,
+                                      /*host_blocks=*/2, sysfs.path());
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Ne(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*raw_mock, SetGauge(telemetry::metric_names::kHostNumaMemoryBytes,
+                                  testing::_, testing::_))
       .Times(0);
 
   worker1_mgr.UpdateAllocatedOccupancyMetric();

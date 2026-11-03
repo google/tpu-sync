@@ -47,6 +47,23 @@ struct HostMemoryBreakdown {
 std::optional<HostMemoryBreakdown> ParseHostMemoryBreakdown(
     absl::string_view meminfo_content, uint64_t kv_pool_bytes);
 
+// Per-NUMA-node host DRAM memory in bytes across states (used, free, total)
+// tracked by `tpu_raiden_host_numa_memory_bytes`.
+struct NumaNodeMemory {
+  int node_id = -1;
+  uint64_t used_bytes = 0;
+  uint64_t free_bytes = 0;
+  uint64_t total_bytes = 0;
+};
+
+// Parses a NUMA node's meminfo text content (e.g. from
+// `/sys/devices/system/node/node<N>/meminfo`) and computes used, free,
+// and total bytes. If `MemUsed` is absent, falls back to `MemTotal - MemFree`
+// (clamped to >= 0). Returns `std::nullopt` if required fields (`MemTotal`,
+// `MemFree`) are missing or malformed.
+std::optional<NumaNodeMemory> ParseNumaNodeMeminfo(
+    int node_id, absl::string_view meminfo_content);
+
 }  // namespace kv_cache
 }  // namespace tpu_raiden
 

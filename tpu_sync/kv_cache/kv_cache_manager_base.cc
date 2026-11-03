@@ -18,10 +18,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <functional>
 #include <future>  // NOLINT(build/c++11)
@@ -33,10 +35,12 @@
 #include <set>
 #include <stdexcept>
 #include <string>
-#include <thread>  // NOLINT
+#include <system_error>  // NOLINT(build/c++11)
+#include <thread>        // NOLINT
 #include <utility>
 #include <vector>
 
+#include "absl/base/const_init.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
@@ -47,6 +51,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
@@ -87,13 +92,21 @@ namespace kv_cache {
 namespace {
 
 constexpr int64_t kHostMemorySampleIntervalNs = 5'000'000'000LL;
+constexpr int64_t kHostNumaMemorySampleIntervalNs = 5'000'000'000LL;
+
+static_assert(std::atomic<int64_t>::is_always_lock_free,
+              "std::atomic<int64_t> must be lock-free");
 
 // Last Unix timestamp in nanoseconds when `host_memory_breakdown_bytes` was
 // sampled, used to throttle periodic refreshes on transfer paths.
-static_assert(std::atomic<int64_t>::is_always_lock_free,
-              "std::atomic<int64_t> must be lock-free");
 std::atomic<int64_t> g_last_host_mem_sample_ns{
     std::numeric_limits<int64_t>::min()};
+
+// Tracks the last per-NUMA-node memory sample timestamp (in monotonic
+// nanoseconds) per sysfs node directory.
+absl::Mutex g_numa_mem_mu(absl::kConstInit);
+absl::flat_hash_map<std::string, int64_t> g_last_numa_mem_sample_ns
+    ABSL_GUARDED_BY(g_numa_mem_mu);
 
 absl::Status ValidateOffsetsAndSizes(const std::vector<int64_t>& src_offsets,
                                      const std::vector<int64_t>& dst_offsets,
@@ -444,6 +457,115 @@ void MaybeUpdateHostMemoryBreakdownMetrics(const KVCacheManagerBase& manager,
   }
   UpdateHostMemoryBreakdownMetrics(manager,
                                    manager.GetAllocatedHostDramBytes());
+}
+
+// Samples per-NUMA-node host DRAM usage (used, free, total) in bytes from
+// `<sysfs_node_dir>/node<N>/meminfo` and updates the
+// `host_numa_memory_bytes` gauge.
+void RecordHostNumaMemoryMetrics(absl::string_view sysfs_node_dir) {
+  auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends() || sysfs_node_dir.empty()) {
+    return;
+  }
+
+  std::error_code ec;
+  std::filesystem::directory_iterator dir_it(
+      std::filesystem::path(std::string(sysfs_node_dir)), ec);
+  if (ec) {
+    return;
+  }
+
+  std::vector<std::pair<int, std::filesystem::path>> node_dirs;
+  for (const std::filesystem::directory_entry& entry : dir_it) {
+    std::error_code is_dir_ec;
+    if (!entry.is_directory(is_dir_ec) || is_dir_ec) {
+      continue;
+    }
+    const std::string dirname = entry.path().filename().string();
+    if (!absl::StartsWith(dirname, "node")) {
+      continue;
+    }
+    const absl::string_view node_id_view = absl::string_view(dirname).substr(4);
+    int node_id = -1;
+    if (node_id_view.empty() ||
+        (node_id_view.size() > 1 && node_id_view[0] == '0') ||
+        !std::all_of(node_id_view.begin(), node_id_view.end(),
+                     absl::ascii_isdigit) ||
+        !absl::SimpleAtoi(node_id_view, &node_id) || node_id < 0) {
+      continue;
+    }
+    node_dirs.emplace_back(node_id, entry.path());
+  }
+
+  std::sort(node_dirs.begin(), node_dirs.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+
+  for (const auto& [node_id, node_path] : node_dirs) {
+    std::ifstream meminfo_file(node_path / "meminfo");
+    if (!meminfo_file.is_open()) {
+      continue;
+    }
+    const std::string content((std::istreambuf_iterator<char>(meminfo_file)),
+                              std::istreambuf_iterator<char>());
+    const std::optional<NumaNodeMemory> mem =
+        ParseNumaNodeMeminfo(node_id, content);
+    if (!mem.has_value()) {
+      continue;
+    }
+
+    const std::string node_id_str = absl::StrCat(node_id);
+    const telemetry::MetricLabel used_labels[] = {
+        {telemetry::metric_labels::kNumaNode, node_id_str},
+        {telemetry::metric_labels::kState,
+         telemetry::metric_labels::kStateUsed}};
+    const telemetry::MetricLabel free_labels[] = {
+        {telemetry::metric_labels::kNumaNode, node_id_str},
+        {telemetry::metric_labels::kState,
+         telemetry::metric_labels::kStateFree}};
+    const telemetry::MetricLabel total_labels[] = {
+        {telemetry::metric_labels::kNumaNode, node_id_str},
+        {telemetry::metric_labels::kState,
+         telemetry::metric_labels::kStateTotal}};
+    store.SetGauge(telemetry::metric_names::kHostNumaMemoryBytes, used_labels,
+                   static_cast<double>(mem->used_bytes));
+    store.SetGauge(telemetry::metric_names::kHostNumaMemoryBytes, free_labels,
+                   static_cast<double>(mem->free_bytes));
+    store.SetGauge(telemetry::metric_names::kHostNumaMemoryBytes, total_labels,
+                   static_cast<double>(mem->total_bytes));
+  }
+}
+
+// Samples `manager.sysfs_node_dir()` (`/sys/devices/system/node` in
+// production) at most once every 5 seconds per directory. NUMA memory is
+// host-wide, so only the primary local worker (`local_rank == "0"`) emits it;
+// otherwise every worker would export a duplicate series (or, without
+// `local_rank`, a summed one).
+// TODO: Replace periodic timestamp-throttled sampling with scrape-time
+// collection or event-driven updates once all telemetry backends support
+// pull callbacks.
+void MaybeRecordHostNumaMemoryMetrics(const KVCacheManagerBase& manager) {
+  if (!telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+    return;
+  }
+  const absl::Span<const std::string> shard_ranks = manager.shard_local_ranks();
+  if (!shard_ranks.empty() && shard_ranks.front() != "0") {
+    return;
+  }
+  const absl::string_view sysfs_node_dir = manager.sysfs_node_dir();
+  const int64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  {
+    absl::MutexLock lock(g_numa_mem_mu);
+    auto it = g_last_numa_mem_sample_ns.find(sysfs_node_dir);
+    if (it != g_last_numa_mem_sample_ns.end() &&
+        now_ns - it->second < kHostNumaMemorySampleIntervalNs) {
+      return;
+    }
+    g_last_numa_mem_sample_ns[sysfs_node_dir] = now_ns;
+  }
+  RecordHostNumaMemoryMetrics(sysfs_node_dir);
 }
 
 // Joins the given PjRtCopyFutures and records transfer latency and per-device
@@ -3427,6 +3549,7 @@ void KVCacheManagerBase::UpdateAllocatedOccupancyMetric() const {
       telemetry::metric_names::kBufferAllocatedBytes, {},
       static_cast<double>(total_host_dram));
   UpdateHostMemoryBreakdownMetrics(*this, total_host_dram);
+  MaybeRecordHostNumaMemoryMetrics(*this);
 }
 
 std::shared_ptr<backends::KVBackend> KVCacheManagerBase::GetKVBackend(

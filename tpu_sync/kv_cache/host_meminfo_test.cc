@@ -59,6 +59,68 @@ AnonPages:       3072000 kB
           .has_value());
 }
 
+TEST(HostMeminfoTest, ParseNumaNodeMeminfoComputesStatesAndFallback) {
+  // Test case 1: Standard sysfs meminfo containing MemTotal, MemFree, MemUsed.
+  constexpr absl::string_view kStandardMeminfo = R"(
+Node 0 MemTotal:       131919728 kB
+Node 0 MemFree:        120394812 kB
+Node 0 MemUsed:         11524916 kB
+Node 0 Active:           1000000 kB
+)";
+  const std::optional<NumaNodeMemory> mem0 =
+      ParseNumaNodeMeminfo(/*node_id=*/0, kStandardMeminfo);
+  ASSERT_TRUE(mem0.has_value());
+  EXPECT_EQ(mem0->node_id, 0);
+  EXPECT_EQ(mem0->used_bytes, 11524916ULL * 1024ULL);
+  EXPECT_EQ(mem0->free_bytes, 120394812ULL * 1024ULL);
+  EXPECT_EQ(mem0->total_bytes, 131919728ULL * 1024ULL);
+
+  // Test case 2: MemUsed absent -> fallback to MemTotal - MemFree.
+  constexpr absl::string_view kFallbackMeminfo = R"(
+Node 1 MemTotal:        1000 kB
+Node 1 MemFree:          400 kB
+)";
+  const std::optional<NumaNodeMemory> mem1 =
+      ParseNumaNodeMeminfo(/*node_id=*/1, kFallbackMeminfo);
+  ASSERT_TRUE(mem1.has_value());
+  EXPECT_EQ(mem1->node_id, 1);
+  EXPECT_EQ(mem1->used_bytes, 600ULL * 1024ULL);
+  EXPECT_EQ(mem1->free_bytes, 400ULL * 1024ULL);
+  EXPECT_EQ(mem1->total_bytes, 1000ULL * 1024ULL);
+
+  // Test case 3: MemUsed absent and MemFree > MemTotal -> fallback
+  // clamped to 0.
+  constexpr absl::string_view kClampedMeminfo = R"(
+Node 2 MemTotal:         200 kB
+Node 2 MemFree:          500 kB
+)";
+  const std::optional<NumaNodeMemory> mem2 =
+      ParseNumaNodeMeminfo(/*node_id=*/2, kClampedMeminfo);
+  ASSERT_TRUE(mem2.has_value());
+  EXPECT_EQ(mem2->node_id, 2);
+  EXPECT_EQ(mem2->used_bytes, 0ULL);
+  EXPECT_EQ(mem2->free_bytes, 500ULL * 1024ULL);
+  EXPECT_EQ(mem2->total_bytes, 200ULL * 1024ULL);
+
+  // Test case 4: Missing MemFree -> returns std::nullopt.
+  constexpr absl::string_view kMissingFree = "Node 3 MemTotal:       1000 kB\n";
+  EXPECT_FALSE(ParseNumaNodeMeminfo(3, kMissingFree).has_value());
+
+  // Test case 5: Missing MemTotal -> returns std::nullopt.
+  constexpr absl::string_view kMissingTotal = "Node 4 MemFree:        500 kB\n";
+  EXPECT_FALSE(ParseNumaNodeMeminfo(4, kMissingTotal).has_value());
+
+  // Test case 6: Malformed number -> returns std::nullopt.
+  constexpr absl::string_view kMalformed = R"(
+Node 5 MemTotal:       not_a_number kB
+Node 5 MemFree:        500 kB
+)";
+  EXPECT_FALSE(ParseNumaNodeMeminfo(5, kMalformed).has_value());
+
+  // Test case 7: Empty content -> returns std::nullopt.
+  EXPECT_FALSE(ParseNumaNodeMeminfo(6, "").has_value());
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

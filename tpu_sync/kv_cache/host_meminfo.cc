@@ -33,8 +33,10 @@ constexpr absl::string_view kCachedKey = "Cached";
 constexpr absl::string_view kAnonPagesKey = "AnonPages";
 constexpr absl::string_view kBuffersKey = "Buffers";
 
-// Parses meminfo lines of the form "<Key>: <value> kB" and returns each value
-// in KiB keyed by field name. Lines with a malformed value are skipped.
+// Parses meminfo lines of the form "<Key>: <value> kB", as found in
+// `/proc/meminfo` and in `/sys/devices/system/node/node<N>/meminfo` (whose
+// keys carry a "Node <N> " prefix that is dropped here). Returns each value in
+// KiB keyed by field name; lines with a malformed value are skipped.
 absl::flat_hash_map<absl::string_view, uint64_t> ParseMeminfoKiB(
     absl::string_view meminfo_content) {
   absl::flat_hash_map<absl::string_view, uint64_t> fields;
@@ -44,8 +46,12 @@ absl::flat_hash_map<absl::string_view, uint64_t> ParseMeminfoKiB(
     if (colon_pos == absl::string_view::npos) {
       continue;
     }
-    const absl::string_view key =
+    absl::string_view key =
         absl::StripAsciiWhitespace(line.substr(0, colon_pos));
+    if (const size_t space_pos = key.rfind(' ');
+        space_pos != absl::string_view::npos) {
+      key.remove_prefix(space_pos + 1);
+    }
     absl::string_view value =
         absl::StripLeadingAsciiWhitespace(line.substr(colon_pos + 1));
     value = value.substr(0, value.find_first_of(" \t"));
@@ -102,6 +108,31 @@ std::optional<HostMemoryBreakdown> ParseHostMemoryBreakdown(
       .process_heap_bytes = process_heap_bytes,
       .page_cache_bytes = page_cache_bytes,
       .free_bytes = free_bytes,
+  };
+}
+
+std::optional<NumaNodeMemory> ParseNumaNodeMeminfo(
+    int node_id, absl::string_view meminfo_content) {
+  const absl::flat_hash_map<absl::string_view, uint64_t> fields_kib =
+      ParseMeminfoKiB(meminfo_content);
+  const auto total_it = fields_kib.find("MemTotal");
+  const auto free_it = fields_kib.find("MemFree");
+  if (total_it == fields_kib.end() || free_it == fields_kib.end()) {
+    return std::nullopt;
+  }
+  const uint64_t total_bytes = KiBToBytes(total_it->second);
+  const uint64_t free_bytes = KiBToBytes(free_it->second);
+  const auto used_it = fields_kib.find("MemUsed");
+  const uint64_t used_bytes =
+      used_it != fields_kib.end()
+          ? KiBToBytes(used_it->second)
+          : (total_bytes >= free_bytes ? total_bytes - free_bytes : 0ULL);
+
+  return NumaNodeMemory{
+      .node_id = node_id,
+      .used_bytes = used_bytes,
+      .free_bytes = free_bytes,
+      .total_bytes = total_bytes,
   };
 }
 

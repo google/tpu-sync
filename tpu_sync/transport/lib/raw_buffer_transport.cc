@@ -49,6 +49,7 @@
 #include "absl/log/log.h"
 #include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
@@ -60,24 +61,19 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "tpu_sync/core/numa_thread_pool.h"
-#include "tpu_sync/core/tpu_utils.h"
-#include "tpu_sync/fault_injection/fault_injector.h"
-#include "tpu_sync/fault_injection/hooks.h"
-#include "tpu_sync/transport/buffer_push_task.h"
-
-#ifndef IOV_MAX
-#define IOV_MAX 1024
-#endif
-#include "absl/status/status_macros.h"
 #include "peregrine/src/api/v1/conn_pool.h"
 #include "peregrine/src/api/v1/histogram.h"
 #include "peregrine/src/api/v1/ip_util.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "peregrine/src/api/v1/socket_util.h"
+#include "tpu_sync/core/numa_thread_pool.h"
+#include "tpu_sync/core/tpu_utils.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
+#include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
+#include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
@@ -495,6 +491,7 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
 
   } else if (header.op == kOpBufferPushBatched) {  // peer batched push request
     const uint32_t batch_size = header.count_or_size;
+    static_assert(IOV_MAX == 1024);
     if (batch_size > IOV_MAX) {
       return absl::InvalidArgumentError(absl::StrCat(
           "Batch size ", batch_size, " exceeds IOV_MAX (", IOV_MAX, ")"));

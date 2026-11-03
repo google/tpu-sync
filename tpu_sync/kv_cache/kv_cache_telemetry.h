@@ -18,6 +18,7 @@
 // Telemetry helper functions for KVCacheStore and its offload backends.
 
 #include <chrono>  // NOLINT(build/c++11)
+#include <cstddef>
 #include <cstdint>
 #include <ratio>  // NOLINT(build/c++11)
 
@@ -76,6 +77,33 @@ inline void IncrementKvSaveBlocks(absl::string_view dp_rank,
   };
   telemetry::RaidenMetricStore::GetGlobalMetricStore().IncrementCounter(
       telemetry::metric_names::kKvSaveBlocksTotal, labels, count);
+}
+
+// Sets the `host_pool_blocks` gauge for each `state` (`total`, `used`,
+// `pinned`) with the given store identity labels. `dp_rank` must be a
+// pre-rendered decimal string.
+inline void RecordKvHostPoolBlocks(absl::string_view dp_rank, size_t total,
+                                   size_t used, size_t pinned) {
+  auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  const telemetry::MetricLabel total_labels[] = {
+      {telemetry::metric_labels::kDpRank, dp_rank},
+      {telemetry::metric_labels::kState, telemetry::metric_labels::kStateTotal},
+  };
+  const telemetry::MetricLabel used_labels[] = {
+      {telemetry::metric_labels::kDpRank, dp_rank},
+      {telemetry::metric_labels::kState, telemetry::metric_labels::kStateUsed},
+  };
+  const telemetry::MetricLabel pinned_labels[] = {
+      {telemetry::metric_labels::kDpRank, dp_rank},
+      {telemetry::metric_labels::kState,
+       telemetry::metric_labels::kStatePinned},
+  };
+  store.SetGauge(telemetry::metric_names::kHostPoolBlocks, total_labels,
+                 static_cast<double>(total));
+  store.SetGauge(telemetry::metric_names::kHostPoolBlocks, used_labels,
+                 static_cast<double>(used));
+  store.SetGauge(telemetry::metric_names::kHostPoolBlocks, pinned_labels,
+                 static_cast<double>(pinned));
 }
 
 }  // namespace kv_cache

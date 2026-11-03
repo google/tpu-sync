@@ -602,6 +602,9 @@ void KVCacheStoreServiceImpl::ReleaseLandingBlocks(
   // Deallocate outside write_mutex_: controller_ has its own lock.
   (void)controller_->DeallocateBlockIds(
       std::vector<int>(to_free.begin(), to_free.end()));
+  if (backend_ != nullptr) {
+    backend_->RecordHostPoolMetrics();
+  }
 }
 
 void KVCacheStoreServiceImpl::Settle(const std::shared_ptr<WriteOp>& op) {
@@ -735,6 +738,7 @@ KVCacheStoreServiceImpl::WriteRemote(
                      allocated_ids.status().message())));
     return reactor;
   }
+  backend_->RecordHostPoolMetrics();
   std::vector<int32_t> landing_block_ids(allocated_ids->begin(),
                                          allocated_ids->end());
 

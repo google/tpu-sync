@@ -88,6 +88,17 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   size_t GetAvailableSpace() const override;
 
+  // Number of unpinned LRU entries (incl. eviction candidates) that hold a
+  // host DRAM block.
+  size_t NumEvictableHostBlocks() const ABSL_LOCKS_EXCLUDED(mutex_);
+
+  // Must be called with no HostOffloadBackend lock held: it takes
+  // `metrics_mu_`, then `mutex_`, then the controller mutex. Methods of this
+  // class that hold `mutex_` declare an absl::Cleanup before their MutexLock
+  // so the refresh runs after unlock. Callers may hold KVCacheStore locks.
+  void RecordHostPoolMetrics() const override
+      ABSL_LOCKS_EXCLUDED(metrics_mu_, mutex_);
+
   absl::StatusOr<size_t> RecoverFromLocalManifest() override;
 
   std::vector<std::string> GetEvictableKeys(size_t count) override;
@@ -207,6 +218,9 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   // Register and Unregister are Await() on a promise a gRPC callback thread
   // sets, so holding this across one waits for a path that may need it.
   mutable absl::Mutex mutex_;
+  // Serializes RecordHostPoolMetrics() snapshot + publish. Acquired before
+  // `mutex_` (lock order: metrics_mu_ -> mutex_ -> controller mutex).
+  mutable absl::Mutex metrics_mu_ ABSL_ACQUIRED_BEFORE(mutex_);
   LRUCache<std::string, RaidenBlockId> lru_cache_ ABSL_GUARDED_BY(mutex_);
   std::optional<KVCacheMetadata> metadata_ ABSL_GUARDED_BY(mutex_);
   uint64_t next_metadata_seq_ ABSL_GUARDED_BY(mutex_) = 0;

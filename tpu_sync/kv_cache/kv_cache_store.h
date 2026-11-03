@@ -561,6 +561,12 @@ class KVCacheStore {
   // release run against this store's LRU (no-op if there is no controller).
   void RegisterReadRemoteHooks();
 
+  // Refreshes the `host_pool_blocks` gauges by delegating to the primary
+  // backend's KVCacheStoreBackend::RecordHostPoolMetrics(). Must be called
+  // without holding any backend lock. No-op if there is no primary backend,
+  // or if the backend has no controller.
+  void RecordHostPoolMetrics() const;
+
   // Evicts host blocks by their logical block hashes.
   //
   // Checks if the blocks exist in the cache and are in HOST or HOST_AND_HBM

@@ -685,6 +685,7 @@ KVCacheStore::KVCacheStore(
     registry_client_ =
         std::make_shared<global_registry::GlobalRegistryClient>(channel);
   }
+  RecordHostPoolMetrics();
 }
 
 KVCacheStore::KVCacheStore(
@@ -710,6 +711,7 @@ KVCacheStore::KVCacheStore(
                  << " Use KVCacheStore::Create() for a recoverable error.";
     }
     RegisterReadRemoteHooks();
+    RecordHostPoolMetrics();
   }
 }
 
@@ -786,6 +788,7 @@ KVCacheStore::KVCacheStore(
                  << " Use KVCacheStore::Create() for a recoverable error.";
     }
     RegisterReadRemoteHooks();
+    RecordHostPoolMetrics();
   }
 }
 
@@ -845,6 +848,13 @@ KVCacheStore::KVCacheStore(
                  << " Use KVCacheStore::Create() for a recoverable error.";
     }
     RegisterReadRemoteHooks();
+    RecordHostPoolMetrics();
+  }
+}
+
+void KVCacheStore::RecordHostPoolMetrics() const {
+  if (!backends_.empty() && backends_[0]) {
+    backends_[0]->RecordHostPoolMetrics();
   }
 }
 
@@ -2190,7 +2200,12 @@ absl::StatusOr<std::vector<int>> KVCacheStore::AllocateBlockIds(int needed) {
     Evict(hashes_to_deallocate);
   }
 
-  return raiden_controller_->AllocateBlockIds(needed);
+  absl::StatusOr<std::vector<int>> block_ids =
+      raiden_controller_->AllocateBlockIds(needed);
+  if (block_ids.ok()) {
+    RecordHostPoolMetrics();
+  }
+  return block_ids;
 }
 
 void KVCacheStore::DeallocateBlockIds(absl::Span<const int> block_ids) {
@@ -2199,6 +2214,8 @@ void KVCacheStore::DeallocateBlockIds(absl::Span<const int> block_ids) {
     if (!status.ok()) {
       LOG(WARNING) << "Failed to deallocate host block IDs: "
                    << status.message();
+    } else {
+      RecordHostPoolMetrics();
     }
   }
 }

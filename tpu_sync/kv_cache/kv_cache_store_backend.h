@@ -213,6 +213,10 @@ class KVCacheStoreBackend {
   // controller and block trackers.
   virtual void Shutdown() {}
 
+  // Refreshes host DRAM pool occupancy gauges (total, used, pinned) if this
+  // backend manages a host block pool.
+  virtual void RecordHostPoolMetrics() const {}
+
   // Human-readable backend name for logging and diagnostics (e.g.,
   // "HostOffloadBackend", "posix").
   virtual std::string name() const = 0;

@@ -6066,6 +6066,19 @@ TEST(KVCacheStoreConstructionRulesTest, CreateRejectsZeroShards) {
       << store_result.status();
 }
 
+TEST(KVCacheStoreConstructionRulesTest, CreateRejectsNegativeDataReplicaIdx) {
+  RaidenId invalid_id{"invalid_dp_job", "0", "kv_cache", -1};
+  BackendConfig cfg;
+  cfg.type = "HostOffloadBackend";
+  cfg.capacity = 4;
+  cfg.raiden_id = invalid_id;
+  EXPECT_THAT(KVCacheStore::Create(cfg, /*capacity=*/4,
+                                   /*global_registry_address=*/"", invalid_id,
+                                   /*num_shards=*/1, /*shard_size_bytes=*/1024,
+                                   /*store_server_ip=*/"127.0.0.1"),
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
 TEST(KVCacheStoreConstructionRulesDeathTest, CapacityCtorDiesOnEmptyIp) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_DEATH(
@@ -8806,6 +8819,197 @@ TEST_F(KVEvictedBlocksSweepMetricsTest, SweepEvictionEmitsEvictedBlocks) {
   PopulateCold(*store, src, {"a", "b", "c", "d", "e", "f"});
   AwaitSweepFreed(*store, 6);
   EXPECT_EQ(fake_destination_.write_calls(), 0);
+}
+
+class KVHostPoolBlocksMetricsTest : public ReadRemoteTest {
+ protected:
+  RaidenBlockId HbmSlice(int dev_id) const {
+    return RaidenBlockId(local_id_, -1, dev_id, BlockStatus::HBM);
+  }
+
+  void SetUp() override {
+    auto mock_backend =
+        std::make_unique<::testing::NiceMock<telemetry::MockMetricsBackend>>();
+    ON_CALL(*mock_backend, SetGauge(::testing::_, ::testing::_, ::testing::_))
+        .WillByDefault([this](absl::string_view name,
+                              telemetry::LabelSpan labels, double val) {
+          if (name != telemetry::metric_names::kHostPoolBlocks) return;
+          std::string state;
+          std::string dp_rank;
+          for (const auto& label : labels) {
+            if (label.key == telemetry::metric_labels::kState) {
+              state = std::string(label.value);
+            } else if (label.key == telemetry::metric_labels::kDpRank) {
+              dp_rank = std::string(label.value);
+            }
+          }
+          absl::MutexLock lock(gauge_mu_);
+          latest_rank_state_values_[dp_rank][state] = val;
+          if (state == telemetry::metric_labels::kStateUsed) {
+            double& max_used = max_rank_used_values_[dp_rank];
+            max_used = std::max(max_used, val);
+          }
+        });
+    metrics_reset_ = std::make_unique<telemetry::ScopedMetricsBackendReset>(
+        std::move(mock_backend));
+    ReadRemoteTest::SetUp();
+  }
+
+  void TearDown() override {
+    ReadRemoteTest::TearDown();
+    metrics_reset_.reset();
+  }
+
+  double GetRankStateGauge(absl::string_view dp_rank, absl::string_view state) {
+    absl::MutexLock lock(gauge_mu_);
+    auto rank_it = latest_rank_state_values_.find(dp_rank);
+    if (rank_it == latest_rank_state_values_.end()) return -1.0;
+    auto state_it = rank_it->second.find(state);
+    return state_it == rank_it->second.end() ? -1.0 : state_it->second;
+  }
+
+  // Latest {total, used, pinned} values published for `dp_rank` (-1 if unset).
+  std::tuple<double, double, double> PoolGauges(absl::string_view dp_rank) {
+    return {GetRankStateGauge(dp_rank, telemetry::metric_labels::kStateTotal),
+            GetRankStateGauge(dp_rank, telemetry::metric_labels::kStateUsed),
+            GetRankStateGauge(dp_rank, telemetry::metric_labels::kStatePinned)};
+  }
+
+  // Polls PoolGauges(dp_rank) until it equals `expected` or a 10s deadline
+  // passes, and returns the last value. Some releases (e.g. Save's caller pin,
+  // WriteRemote landing blocks) land asynchronously after the operation is
+  // reported as settled.
+  std::tuple<double, double, double> WaitForPoolGauges(
+      absl::string_view dp_rank, std::tuple<double, double, double> expected) {
+    const absl::Time deadline = absl::Now() + absl::Seconds(10);
+    std::tuple<double, double, double> gauges = PoolGauges(dp_rank);
+    while (gauges != expected && absl::Now() < deadline) {
+      absl::SleepFor(absl::Milliseconds(10));
+      gauges = PoolGauges(dp_rank);
+    }
+    return gauges;
+  }
+
+  // Returns the largest `used` value published for `dp_rank`, or -1 if none.
+  double GetMaxRankUsedGauge(absl::string_view dp_rank) {
+    absl::MutexLock lock(gauge_mu_);
+    auto it = max_rank_used_values_.find(dp_rank);
+    return it == max_rank_used_values_.end() ? -1.0 : it->second;
+  }
+
+  absl::Mutex gauge_mu_;
+  absl::flat_hash_map<std::string, absl::flat_hash_map<std::string, double>>
+      latest_rank_state_values_ ABSL_GUARDED_BY(gauge_mu_);
+  absl::flat_hash_map<std::string, double> max_rank_used_values_
+      ABSL_GUARDED_BY(gauge_mu_);
+  std::unique_ptr<telemetry::ScopedMetricsBackendReset> metrics_reset_;
+};
+
+TEST_F(KVHostPoolBlocksMetricsTest, TotalUsedAndPinnedStatesStayConsistent) {
+  MakeStore({.num_host_blocks = 6, .with_storage = false, .dp_rank = 1});
+
+  // 1. After store initialization: total=6, used=0, pinned=0.
+  EXPECT_THAT(PoolGauges("1"), ::testing::FieldsAre(6.0, 0.0, 0.0));
+
+  // 2. Save 2 HBM-only blocks to local DRAM. Once settled, Save releases the
+  // caller pin, so 2 blocks are used and 0 are pinned (evictable = 2).
+  ABSL_ASSERT_OK(store_->Insert({"hp0", "hp1"}, {HbmSlice(0), HbmSlice(1)},
+                                /*on_host=*/false));
+  ABSL_ASSERT_OK(store_->Save({"hp0", "hp1"}));
+  WaitForSaveDone(*store_, /*expected=*/2);
+  EXPECT_THAT(WaitForPoolGauges("1", {6.0, 2.0, 0.0}),
+              ::testing::FieldsAre(6.0, 2.0, 0.0));
+
+  // 3. Pin 2 blocks via Lookup: used=2, pinned=2 (evictable = 0).
+  ABSL_ASSERT_OK(store_->Lookup({"hp0", "hp1"}));
+  EXPECT_THAT(PoolGauges("1"), ::testing::FieldsAre(6.0, 2.0, 2.0));
+
+  // 4. Release 1 block: used=2, pinned=1 (evictable = 1).
+  store_->Release({"hp0"});
+  EXPECT_THAT(PoolGauges("1"), ::testing::FieldsAre(6.0, 2.0, 1.0));
+  store_->Release({"hp1"});
+
+  // 5. Evicting hp0 and hp1 frees both host blocks: used=0, pinned=0.
+  EXPECT_EQ(KVCacheStoreTest::Evict(*store_, {"hp0", "hp1"}), 2);
+  EXPECT_THAT(PoolGauges("1"), ::testing::FieldsAre(6.0, 0.0, 0.0));
+}
+
+TEST_F(KVHostPoolBlocksMetricsTest,
+       RecoverFromLocalManifestUpdatesHostPoolGauges) {
+  // Crash recovery from a local manifest populates unpinned HOST blocks and
+  // refreshes total, used, and pinned gauges.
+  RaidenId rid{"manifest_gauge_job", "0", "kv_cache", 5};
+  MetadataRegion region(8);
+  TF_ASSERT_OK_AND_ASSIGN(KVCacheMetadata metadata,
+                       KVCacheMetadata::Format(region.span(), 8));
+  ABSL_ASSERT_OK(metadata.Set(1, "rec_a", 1));
+  ABSL_ASSERT_OK(metadata.Set(4, "rec_b", 2));
+  ABSL_ASSERT_OK(metadata.Set(6, "rec_c", 3));
+
+  auto controller = MakeRecoveryController(rid, 8);
+  KVCacheStore recovery_store(8, std::move(controller),
+                              /*global_registry_address=*/"", rid, metadata,
+                              /*store_server_ip=*/"127.0.0.1");
+  ABSL_ASSERT_OK(recovery_store.RecoverFromLocalManifest());
+  EXPECT_THAT(PoolGauges("5"), ::testing::FieldsAre(8.0, 3.0, 0.0));
+}
+
+TEST_F(KVHostPoolBlocksMetricsTest, StorageRecallUpdatesHostPoolGauges) {
+  // Storage recall allocates staging blocks and publishes them as unpinned
+  // HOST_AND_HBM entries on completion.
+  MakeStore({.num_host_blocks = 6, .with_storage = true, .dp_rank = 6});
+  ABSL_ASSERT_OK(
+      store_->Load({"s0", "s1"}, {StorageSlice(), StorageSlice()}, {0, 1}));
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 2);
+  EXPECT_THAT(outcome.done, ::testing::UnorderedElementsAre("s0", "s1"));
+  EXPECT_THAT(WaitForPoolGauges("6", {6.0, 2.0, 0.0}),
+              ::testing::FieldsAre(6.0, 2.0, 0.0));
+}
+
+TEST_F(KVHostPoolBlocksMetricsTest,
+       DestinationWriteRemoteLandingBlocksUpdateHostPoolGaugesOnRelease) {
+  // Set up a destination store (dp_rank=7) with 4 host blocks but no registered
+  // workers so its incoming WriteRemote pull fails after allocating landing
+  // blocks, exercising ReleaseLandingBlocks -> RecordHostPoolMetrics.
+  RaidenId dst_id{"dst_gauge_job", "0", "kv_cache", 7};
+  BackendConfig dst_config;
+  dst_config.type = "HostOffloadBackend";
+  dst_config.capacity = 4;
+  dst_config.raiden_id = dst_id;
+  dst_config.global_registry_address = registry_address_;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheStore> dst_store,
+      KVCacheStore::Create(dst_config, /*capacity=*/4, registry_address_,
+                           dst_id, /*num_shards=*/1,
+                           /*shard_size_bytes=*/1024,
+                           /*store_server_ip=*/"127.0.0.1",
+                           /*raiden_controller_port=*/0,
+                           /*metadata=*/std::nullopt,
+                           /*expected_worker_count=*/0,
+                           /*secondary_backend_configs=*/{}));
+
+  // Source store (dp_rank=1) offers 2 blocks to dst_store.
+  MakeStore({.num_host_blocks = 4,
+             .with_empty_registry = true,
+             .with_storage = false,
+             .dp_rank = 1});
+  ABSL_ASSERT_OK(store_->Insert({"w0", "w1"}, {HbmSlice(0), HbmSlice(1)},
+                                /*on_host=*/false));
+  ABSL_ASSERT_OK(store_->Save({"w0", "w1"}));
+  WaitForSaveDone(*store_, /*expected=*/2);
+  ABSL_ASSERT_OK(store_->Lookup({"w0", "w1"}));
+
+  ABSL_ASSERT_OK(store_->Save({"w0", "w1"}, dst_id));
+  WaitForSaveDone(*store_, /*expected=*/2);
+
+  // The destination must have allocated both landing blocks before its pull
+  // failed; otherwise the release path below was never exercised.
+  EXPECT_DOUBLE_EQ(GetMaxRankUsedGauge("7"), 2.0);
+
+  // After the destination's pull fails and ReleaseLandingBlocks returns the
+  // landing blocks to dst_store's pool, dst_store's gauges must be back to 0.
+  EXPECT_THAT(WaitForPoolGauges("7", {4.0, 0.0, 0.0}),
+              ::testing::FieldsAre(4.0, 0.0, 0.0));
 }
 
 }  // namespace

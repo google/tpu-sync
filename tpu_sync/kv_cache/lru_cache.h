@@ -18,10 +18,12 @@
 #include <cstddef>
 #include <list>
 #include <optional>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -67,6 +69,21 @@ class LRUCache {
   }
   size_t active_size() const { return lru_list_.size() + pinned_list_.size(); }
 
+  // Returns the number of unpinned (evictable) entries, including eviction
+  // candidates, that currently hold a host DRAM block (status is HOST or
+  // HOST_AND_HBM with host_block_id >= 0).
+  // The count is maintained only by Put/PutBack/UpdateValue and the pin/unpin/
+  // erase paths. Mutating `status` or `host_block_id` through a pointer from
+  // Get()/PeekMutable()/PeekMutableIncludingCandidates() bypasses it; use
+  // UpdateValue() for those changes instead.
+  size_t NumEvictableHostBlocks() const { return evictable_host_blocks_; }
+
+  // True if `Value` exposes `status` and `host_block_id` members, i.e. if
+  // NumEvictableHostBlocks() tracks it. Otherwise the count is always 0.
+  static constexpr bool TracksHostResidency() {
+    return HasHostResidency<Value>::value;
+  }
+
   // Returns true if the cache is completely empty.
   bool empty() const { return map_.empty(); }
 
@@ -82,6 +99,7 @@ class LRUCache {
     lru_list_.clear();
     pinned_list_.clear();
     evict_candidate_list_.clear();
+    evictable_host_blocks_ = 0;
   }
 
   // Inserts or updates a key-value pair.
@@ -100,6 +118,10 @@ class LRUCache {
     auto it = map_.find(key);
     if (it != map_.end()) {
       // Update existing item and promote to MRU
+      if (it->second->pin_count == 0) {
+        OnUnpinnedNodeRemoved(it->second->value);
+        OnUnpinnedNodeAdded(value);
+      }
       it->second->value = std::move(value);
       Promote(it->second);
       return std::nullopt;
@@ -114,6 +136,7 @@ class LRUCache {
     // Insert new item at the front of the lru_list_ (MRU)
     lru_list_.emplace_front(std::move(key), std::move(value), 0,
                             NodeLocation::kLru);
+    OnUnpinnedNodeAdded(lru_list_.front().value);
     map_.emplace_hint(it, lru_list_.front().key, lru_list_.begin());
     return evicted;
   }
@@ -124,6 +147,10 @@ class LRUCache {
   void PutBack(Key key, Value value) {
     auto it = map_.find(key);
     if (it != map_.end()) {
+      if (it->second->pin_count == 0) {
+        OnUnpinnedNodeRemoved(it->second->value);
+        OnUnpinnedNodeAdded(value);
+      }
       it->second->value = std::move(value);
       PromoteBack(it->second);
       return;
@@ -135,11 +162,30 @@ class LRUCache {
 
     lru_list_.emplace_back(std::move(key), std::move(value), 0,
                            NodeLocation::kLru);
+    OnUnpinnedNodeAdded(lru_list_.back().value);
     map_.emplace_hint(it, lru_list_.back().key, std::prev(lru_list_.end()));
+  }
+
+  // Updates an existing non-candidate key's value in-place without perturbing
+  // LRU order. Returns true if the key was found and updated, false if absent
+  // or an eviction candidate.
+  bool UpdateValue(const Key& key, Value value) {
+    auto it = map_.find(key);
+    if (it == map_.end() || it->second->location == NodeLocation::kCandidate) {
+      return false;
+    }
+    if (it->second->pin_count == 0) {
+      OnUnpinnedNodeRemoved(it->second->value);
+      OnUnpinnedNodeAdded(value);
+    }
+    it->second->value = std::move(value);
+    return true;
   }
 
   // Retrieves a pointer to the stored value for the given key and promotes
   // the item to Most Recently Used (MRU). Returns nullptr if absent.
+  // Writing `status`/`host_block_id` through the returned pointer bypasses
+  // NumEvictableHostBlocks(); use UpdateValue() instead.
   Value* Get(const Key& key) {
     auto it = map_.find(key);
     if (it == map_.end()) {
@@ -162,6 +208,8 @@ class LRUCache {
 
   // Exposes a mutable pointer via Peek without perturbing LRU order.
   // Returns nullptr if absent or candidate.
+  // Writing `status`/`host_block_id` through the returned pointer bypasses
+  // NumEvictableHostBlocks(); use UpdateValue() instead.
   Value* PeekMutable(const Key& key) {
     auto it = map_.find(key);
     if (it == map_.end() || it->second->location == NodeLocation::kCandidate) {
@@ -180,6 +228,8 @@ class LRUCache {
   }
 
   // Exposes a mutable pointer even if it is a candidate.
+  // Writing `status`/`host_block_id` through the returned pointer bypasses
+  // NumEvictableHostBlocks(); use UpdateValue() instead.
   Value* PeekMutableIncludingCandidates(const Key& key) {
     auto it = map_.find(key);
     if (it == map_.end()) {
@@ -200,6 +250,7 @@ class LRUCache {
       return nullptr;
     }
     if (it->second->pin_count == 0) {
+      OnUnpinnedNodeRemoved(it->second->value);
       if (it->second->location == NodeLocation::kLru) {
         pinned_list_.splice(pinned_list_.begin(), lru_list_, it->second);
       } else if (it->second->location == NodeLocation::kCandidate) {
@@ -235,6 +286,7 @@ class LRUCache {
         // Move from pinned_list_ to lru_list_ (promote to MRU)
         lru_list_.splice(lru_list_.begin(), pinned_list_, it->second);
         it->second->location = NodeLocation::kLru;
+        OnUnpinnedNodeAdded(it->second->value);
       }
     }
     return true;
@@ -284,6 +336,7 @@ class LRUCache {
     if (it == map_.end() || it->second->pin_count > 0) {
       return false;
     }
+    OnUnpinnedNodeRemoved(it->second->value);
     if (it->second->location == NodeLocation::kLru) {
       lru_list_.erase(it->second);
     } else if (it->second->location == NodeLocation::kCandidate) {
@@ -318,6 +371,41 @@ class LRUCache {
   }
 
  private:
+  template <typename T, typename = void>
+  struct HasHostResidency : std::false_type {};
+
+  template <typename T>
+  struct HasHostResidency<
+      T, std::void_t<decltype(std::declval<const T&>().status),
+                     decltype(std::declval<const T&>().host_block_id)>>
+      : std::true_type {};
+
+  static bool IsHostResidentValue(const Value& value) {
+    if constexpr (HasHostResidency<Value>::value) {
+      using StatusType = std::decay_t<decltype(value.status)>;
+      return (value.status == StatusType::HOST ||
+              value.status == StatusType::HOST_AND_HBM) &&
+             value.host_block_id >= 0;
+    } else {
+      return false;
+    }
+  }
+
+  void OnUnpinnedNodeAdded(const Value& value) {
+    if (IsHostResidentValue(value)) {
+      ++evictable_host_blocks_;
+    }
+  }
+
+  void OnUnpinnedNodeRemoved(const Value& value) {
+    if (!IsHostResidentValue(value)) return;
+    DCHECK_GT(evictable_host_blocks_, 0u)
+        << "evictable host block count underflow";
+    if (evictable_host_blocks_ > 0) {
+      --evictable_host_blocks_;
+    }
+  }
+
   struct CacheNode {
     Key key;
     Value value;
@@ -357,6 +445,7 @@ class LRUCache {
   }
 
   size_t capacity_;
+  size_t evictable_host_blocks_ = 0;
   std::list<CacheNode> lru_list_;
   std::list<CacheNode> pinned_list_;
   std::list<CacheNode> evict_candidate_list_;

@@ -18,6 +18,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -426,6 +427,138 @@ TEST(LRUCacheTest, ConstPeekEnforcesConstAccess) {
   EXPECT_EQ(*val, "one");
   static_assert(std::is_same_v<decltype(const_cache.Peek(1)), const std::string*>);
   static_assert(std::is_same_v<decltype(cache.Peek(1)), const std::string*>);
+}
+
+enum class TestBlockStatus {
+  INIT,
+  REMOTE,
+  HBM,
+  HOST,
+  HOST_AND_HBM,
+  SHARED_STORAGE,
+};
+
+struct TestBlockValue {
+  int host_block_id = -1;
+  TestBlockStatus status = TestBlockStatus::INIT;
+};
+
+TEST(LRUCacheTest, NumEvictableHostBlocksTracksUnpinnedHostEntries) {
+  LRUCache<std::string, TestBlockValue> cache(2);
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+
+  // Dead HBM-only entry (e.g. before or after failed save) does not count.
+  cache.Put("hbm_only", TestBlockValue{-1, TestBlockStatus::HBM});
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+
+  // Host-resident entries count when unpinned.
+  cache.Put("host_1", TestBlockValue{0, TestBlockStatus::HOST});
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+
+  // Displacing hbm_only to candidate list and adding host_2.
+  cache.Put("host_2", TestBlockValue{1, TestBlockStatus::HOST_AND_HBM});
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 2);
+
+  // Pinning a host-resident entry removes it from evictable count.
+  ASSERT_TRUE(cache.Pin("host_1"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+  ASSERT_TRUE(cache.Pin("host_1"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+
+  // Unpinning once keeps pin_count=1; second unpin restores evictability.
+  ASSERT_TRUE(cache.Unpin("host_1"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+  ASSERT_TRUE(cache.Unpin("host_1"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 2);
+
+  // Demoting to candidate list preserves evictable host block count until
+  // Erase.
+  ASSERT_TRUE(cache.Evict().has_value());
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 2);
+
+  // Updating an unpinned entry from HOST_AND_HBM to HBM decrements count.
+  ASSERT_TRUE(
+      cache.UpdateValue("host_1", TestBlockValue{-1, TestBlockStatus::HBM}));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+  ASSERT_TRUE(
+      cache.UpdateValue("host_1", TestBlockValue{0, TestBlockStatus::HOST}));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 2);
+
+  // Erasing candidate and active entries decrements count.
+  ASSERT_TRUE(cache.Erase("host_2"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+
+  cache.Clear();
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+}
+
+TEST(LRUCacheTest, NumEvictableHostBlocksPutOverwritingPinnedKey) {
+  LRUCache<std::string, TestBlockValue> cache(4);
+  cache.Put("a", TestBlockValue{0, TestBlockStatus::HOST});
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+  ASSERT_TRUE(cache.Pin("a"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+
+  // Overwriting a pinned key does not count it while it stays pinned.
+  cache.Put("a", TestBlockValue{-1, TestBlockStatus::HBM});
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+  cache.PutBack("a", TestBlockValue{1, TestBlockStatus::HOST_AND_HBM});
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+  EXPECT_EQ(cache.GetPinCount("a"), 1);
+
+  // Unpinning counts the latest (host-resident) value.
+  ASSERT_TRUE(cache.Unpin("a"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+
+  // Overwriting a pinned key with an HBM-only value: not counted on unpin.
+  ASSERT_TRUE(cache.Pin("a"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+  cache.PutBack("a", TestBlockValue{-1, TestBlockStatus::HBM});
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+  ASSERT_TRUE(cache.Unpin("a"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+}
+
+TEST(LRUCacheTest, NumEvictableHostBlocksUpdateValueOnPinnedEntry) {
+  LRUCache<std::string, TestBlockValue> cache(4);
+  cache.Put("a", TestBlockValue{-1, TestBlockStatus::HBM});
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+  ASSERT_TRUE(cache.Pin("a"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+
+  // Updating a pinned entry to host-resident is counted only once unpinned.
+  ASSERT_TRUE(
+      cache.UpdateValue("a", TestBlockValue{2, TestBlockStatus::HOST}));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+  ASSERT_TRUE(cache.Unpin("a"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+
+  // Updating a pinned entry back to HBM-only is not counted once unpinned.
+  ASSERT_TRUE(cache.Pin("a"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+  ASSERT_TRUE(
+      cache.UpdateValue("a", TestBlockValue{-1, TestBlockStatus::HBM}));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+  ASSERT_TRUE(cache.Unpin("a"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 0);
+}
+
+TEST(LRUCacheTest, NumEvictableHostBlocksGetAndPinOnEvictionCandidate) {
+  LRUCache<std::string, TestBlockValue> cache(1);
+  cache.Put("a", TestBlockValue{0, TestBlockStatus::HOST});
+  // Overflowing capacity demotes "a" to an eviction candidate; it still
+  // counts as evictable.
+  cache.Put("b", TestBlockValue{1, TestBlockStatus::HOST});
+  ASSERT_EQ(cache.GetEvictCandidateKeys(), std::vector<std::string>{"a"});
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 2);
+
+  // Pinning the candidate resurrects it and removes it from the count.
+  ASSERT_NE(cache.GetAndPin("a"), nullptr);
+  EXPECT_TRUE(cache.GetEvictCandidateKeys().empty());
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+
+  ASSERT_TRUE(cache.Unpin("a"));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 2);
 }
 
 }  // namespace

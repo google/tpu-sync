@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "absl/base/nullability.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
@@ -56,6 +57,7 @@
 #include "tpu_sync/proto/kv_cache_store_service.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden {
@@ -134,6 +136,12 @@ void MarkSaveFailed(BlockTracker* absl_nonnull save_tracker,
   save_tracker->MarkFailed(block_hashes);
 }
 
+// host_pool_blocks derives `pinned` from LRUCache::NumEvictableHostBlocks(),
+// which silently reports 0 if RaidenBlockId loses `status`/`host_block_id`.
+static_assert(LRUCache<std::string, RaidenBlockId>::TracksHostResidency(),
+              "LRUCache must track RaidenBlockId host residency "
+              "(status/host_block_id) for the host_pool_blocks metric");
+
 }  // namespace
 
 HostOffloadBackend::HostOffloadBackend(
@@ -147,7 +155,9 @@ HostOffloadBackend::HostOffloadBackend(
       kv_pool_group_(std::move(kv_pool_group)),
       raiden_controller_(raiden_controller),
       dp_rank_str_(absl::StrCat(raiden_id_.data_replica_idx)),
-      registry_client_(std::move(registry_client)) {}
+      registry_client_(std::move(registry_client)) {
+  RecordHostPoolMetrics();
+}
 
 HostOffloadBackend::~HostOffloadBackend() { Shutdown(); }
 
@@ -158,6 +168,27 @@ void HostOffloadBackend::Shutdown() {
   // completions to finish before KVCacheStore destroys its borrowed objects.
   absl::WriterMutexLock lock(lifetime_->mu);
   lifetime_->is_alive = false;
+}
+
+void HostOffloadBackend::RecordHostPoolMetrics() const {
+  // Skip the locks and snapshot entirely when telemetry is off.
+  if (raiden_controller_ == nullptr ||
+      !telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+    return;
+  }
+  // Serializes snapshot + publish so the last writer always publishes the
+  // newest snapshot. Lock order: metrics_mu_ -> mutex_ -> controller mutex.
+  absl::MutexLock metrics_lock(metrics_mu_);
+  const size_t evictable = NumEvictableHostBlocks();
+  const int total_raw = raiden_controller_->total_blocks();
+  const int free_raw = raiden_controller_->num_free_blocks();
+  const size_t total = total_raw > 0 ? static_cast<size_t>(total_raw) : 0;
+  const size_t free_blocks =
+      free_raw > 0 ? std::min(total, static_cast<size_t>(free_raw)) : 0;
+  const size_t used = total - free_blocks;
+  const size_t clamped_evictable = std::min(used, evictable);
+  const size_t pinned = used - clamped_evictable;
+  RecordKvHostPoolBlocks(dp_rank_str_, total, used, pinned);
 }
 
 absl::StatusOr<std::shared_ptr<KVCacheStoreBackend>> HostOffloadBackend::Create(
@@ -201,6 +232,10 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
 
   // Fast Path A: full snapshot of the local index.
   if (options.match_mode == LookupMatchMode::kSubset && block_hashes.empty()) {
+    bool any_blocks_pinned = false;
+    absl::Cleanup record_metrics = [&] {
+      if (any_blocks_pinned) RecordHostPoolMetrics();
+    };
     absl::MutexLock lock(mutex_);
     BlockSliceList results;
     results.reserve(lru_cache_.size());
@@ -224,11 +259,16 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
       }
       results.emplace_back(hash, *block_id_ptr);
     }
+    any_blocks_pinned = options.pin_found && !results.empty();
     return results;
   }
 
   // Fast Path B: non-contiguous subset over block_hashes.
   if (options.match_mode == LookupMatchMode::kSubset) {
+    bool any_blocks_pinned = false;
+    absl::Cleanup record_metrics = [&] {
+      if (any_blocks_pinned) RecordHostPoolMetrics();
+    };
     absl::MutexLock lock(mutex_);
     BlockSliceList results;
     results.reserve(block_hashes.size());
@@ -249,6 +289,7 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
       }
       results.emplace_back(hash, *block_id_ptr);
     }
+    any_blocks_pinned = options.pin_found && !results.empty();
     return results;
   }
 
@@ -257,6 +298,10 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
     if (block_hashes.empty()) {
       return BlockSliceList{};
     }
+    bool any_blocks_pinned = false;
+    absl::Cleanup record_metrics = [&] {
+      if (any_blocks_pinned) RecordHostPoolMetrics();
+    };
     absl::MutexLock lock(mutex_);
     BlockSliceList results;
     results.reserve(block_hashes.size());
@@ -277,6 +322,7 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
       }
       results.emplace_back(hash, *block_id_ptr);
     }
+    any_blocks_pinned = options.pin_found && !results.empty();
     return results;
   }
 
@@ -386,6 +432,10 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
     }
   }
 
+  if (options.pin_found && !results.empty()) {
+    RecordHostPoolMetrics();
+  }
+
   return results;
 }
 
@@ -416,8 +466,7 @@ bool HostOffloadBackend::InsertBestEffortUpdate(
       const std::string& hash = block_hashes[i];
       if (lru_cache_.Contains(hash)) {
         if (i < slices.size()) {
-          if (RaidenBlockId* existing = lru_cache_.PeekMutable(hash)) {
-            *existing = slices[i];
+          if (lru_cache_.UpdateValue(hash, slices[i])) {
             SetMetadataEntry(hash, slices[i]);
           }
         }
@@ -443,6 +492,7 @@ bool HostOffloadBackend::InsertBestEffortUpdate(
     client = registry_client_;
     local_id = raiden_id_;
   }
+  RecordHostPoolMetrics();
 
   // Unregister entries displaced from the active LRU cache.
   if (client != nullptr && !evicted_hashes.empty()) {
@@ -464,6 +514,7 @@ bool HostOffloadBackend::InsertBestEffortUpdate(
 bool HostOffloadBackend::InsertAndPin(
     absl::Span<const std::string> block_hashes,
     absl::Span<const RaidenBlockId> slices) {
+  absl::Cleanup record_metrics = [this] { RecordHostPoolMetrics(); };
   absl::MutexLock lock(mutex_);
 
   std::vector<size_t> existing_indices;
@@ -487,10 +538,10 @@ bool HostOffloadBackend::InsertAndPin(
     // Overwrite HBM-only entries with the new slice; preserve HOST and
     // HOST_AND_HBM entries.
     if (i < slices.size()) {
-      RaidenBlockId* existing = lru_cache_.PeekMutable(block_hashes[i]);
+      const RaidenBlockId* existing = lru_cache_.Peek(block_hashes[i]);
       if (existing != nullptr && existing->status == BlockStatus::HBM) {
         ClearMetadataEntry(*existing);
-        *existing = slices[i];
+        lru_cache_.UpdateValue(block_hashes[i], slices[i]);
         SetMetadataEntry(block_hashes[i], slices[i]);
       }
     }
@@ -550,6 +601,7 @@ bool HostOffloadBackend::InsertAdmitStrict(
   if (block_hashes.empty() || block_hashes.size() != slices.size()) {
     return false;
   }
+  absl::Cleanup record_metrics = [this] { RecordHostPoolMetrics(); };
   absl::MutexLock lock(mutex_);
 
   // Reject duplicate keys (in batch, active, or eviction candidates) or
@@ -637,6 +689,12 @@ size_t HostOffloadBackend::Delete(absl::Span<const std::string> block_hashes,
     client = registry_client_;
     local_id = raiden_id_;
   }
+  // When the caller collects the deallocated host block IDs (e.g.
+  // KVCacheStore::Evict), it frees those host blocks and refreshes the gauge
+  // via DeallocateBlockIds; publishing here would briefly over-count `pinned`.
+  if (options.deallocated_host_block_ids == nullptr) {
+    RecordHostPoolMetrics();
+  }
 
   if (client != nullptr && !hashes_to_unregister.empty()) {
     client
@@ -654,6 +712,7 @@ size_t HostOffloadBackend::Delete(absl::Span<const std::string> block_hashes,
 }
 
 bool HostOffloadBackend::Pin(absl::Span<const std::string> block_hashes) {
+  absl::Cleanup record_metrics = [this] { RecordHostPoolMetrics(); };
   absl::MutexLock lock(mutex_);
   for (size_t i = 0; i < block_hashes.size(); ++i) {
     if (!lru_cache_.Pin(block_hashes[i])) {
@@ -667,6 +726,7 @@ bool HostOffloadBackend::Pin(absl::Span<const std::string> block_hashes) {
 }
 
 void HostOffloadBackend::Release(absl::Span<const std::string> block_hashes) {
+  absl::Cleanup record_metrics = [this] { RecordHostPoolMetrics(); };
   absl::MutexLock lock(mutex_);
   // Reverse order so that block_hashes[0] ends up nearest the MRU end: Unpin
   // splices an entry to the front of the active list, and the first hash of a
@@ -696,7 +756,13 @@ size_t HostOffloadBackend::GetAvailableSpace() const {
   return lru_cache_.available_space();
 }
 
+size_t HostOffloadBackend::NumEvictableHostBlocks() const {
+  absl::MutexLock lock(mutex_);
+  return lru_cache_.NumEvictableHostBlocks();
+}
+
 absl::StatusOr<size_t> HostOffloadBackend::RecoverFromLocalManifest() {
+  absl::Cleanup record_metrics = [this] { RecordHostPoolMetrics(); };
   absl::MutexLock lock(mutex_);
   if (!metadata_.has_value()) {
     return absl::FailedPreconditionError(
@@ -1146,6 +1212,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
     return fail_transfer(telemetry::metric_labels::kOutcomeStagingExhausted,
                          host_blocks.status());
   }
+  RecordHostPoolMetrics();
   std::vector<int32_t> dst_host_block_ids(host_blocks->begin(),
                                           host_blocks->end());
 
@@ -1176,6 +1243,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
           }
           if (!fetch_response.ok()) {
             (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
+            RecordHostPoolMetrics();
             // The peer may have restarted on a new port; drop the cached client
             // so the next attempt re-resolves instead of redialling a dead one.
             InvalidateStoreClient(remote_id);
@@ -1198,6 +1266,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
           const auto& response = *fetch_response;
           if (!response.failed_block_hashes().empty()) {
             (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
+            RecordHostPoolMetrics();
             std::string err_msg = response.error_message().empty()
                                       ? "Fetch RPC returned failed blocks"
                                       : response.error_message();
@@ -1243,6 +1312,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
             return;
           }
           (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
+          RecordHostPoolMetrics();
           if (status.ok()) {
             MarkRecallDone(load_tracker, dp_rank_str_,
                            telemetry::metric_labels::kTierRemoteDram, hashes,
@@ -1468,6 +1538,7 @@ tsl::Future<> HostOffloadBackend::Save(
         } else {
           if (raiden_controller_ != nullptr) {
             (void)raiden_controller_->DeallocateBlockIds(dst_host_ids);
+            RecordHostPoolMetrics();
           }
           MarkSaveFailed(save_tracker, dp_rank_str_,
                          telemetry::metric_labels::kTierLocalDram, hashes);

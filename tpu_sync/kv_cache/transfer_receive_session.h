@@ -160,10 +160,6 @@ class TransferReceiveSession
     return AcquireStagingSlot(layer_idx);
   }
 
-  const StagingLayerManager& staging_layer_manager() const {
-    return staging_layer_manager_;
-  }
-
   int32_t total_blocks() const {
     absl::MutexLock lock(mu_);
     return total_blocks_;

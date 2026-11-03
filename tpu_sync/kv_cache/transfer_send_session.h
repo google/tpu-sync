@@ -161,10 +161,6 @@ class TransferSendSession
                               absl::Span<const int> minor_dimension_indices,
                               absl::Span<const int> shard_ids) override;
 
-  const StagingLayerManager& staging_layer_manager() const {
-    return staging_layer_manager_;
-  }
-
   std::chrono::steady_clock::time_point deadline() const override {
     return deadline_;
   }

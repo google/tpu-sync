@@ -22,8 +22,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <future>  // NOLINT(build/c++11)
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -68,6 +70,7 @@
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache/host_meminfo.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
@@ -82,6 +85,15 @@
 namespace tpu_raiden {
 namespace kv_cache {
 namespace {
+
+constexpr int64_t kHostMemorySampleIntervalNs = 5'000'000'000LL;
+
+// Last Unix timestamp in nanoseconds when `host_memory_breakdown_bytes` was
+// sampled, used to throttle periodic refreshes on transfer paths.
+static_assert(std::atomic<int64_t>::is_always_lock_free,
+              "std::atomic<int64_t> must be lock-free");
+std::atomic<int64_t> g_last_host_mem_sample_ns{
+    std::numeric_limits<int64_t>::min()};
 
 absl::Status ValidateOffsetsAndSizes(const std::vector<int64_t>& src_offsets,
                                      const std::vector<int64_t>& dst_offsets,
@@ -353,6 +365,87 @@ double ComputeDmaTransferTimeMs(absl::string_view dma_metric,
   return std::max(0.0, absl::ToDoubleMilliseconds(end_time - effective_start));
 }
 
+// Samples `manager.proc_meminfo_path()` (`/proc/meminfo` in production) and
+// updates the `host_memory_breakdown_bytes` gauge across `kv_pool`,
+// `process_heap`, `page_cache`, and `free` on the primary local worker
+// (`local_rank == "0"`).
+void UpdateHostMemoryBreakdownMetrics(const KVCacheManagerBase& manager,
+                                      size_t kv_pool_bytes) {
+  if (!telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+    return;
+  }
+  const absl::Span<const std::string> shard_ranks = manager.shard_local_ranks();
+  if (!shard_ranks.empty() && shard_ranks.front() != "0") {
+    return;
+  }
+  std::ifstream file{std::string(manager.proc_meminfo_path())};
+  if (!file.is_open()) {
+    return;
+  }
+  const std::string content((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+  const std::optional<HostMemoryBreakdown> breakdown =
+      ParseHostMemoryBreakdown(content, kv_pool_bytes);
+  if (!breakdown.has_value()) {
+    return;
+  }
+  g_last_host_mem_sample_ns.store(absl::GetCurrentTimeNanos(),
+                                  std::memory_order_relaxed);
+  auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  static constexpr telemetry::MetricLabel kKvPoolLabel[] = {
+      {telemetry::metric_labels::kComponent,
+       telemetry::metric_labels::kComponentKvPool}};
+  static constexpr telemetry::MetricLabel kProcessHeapLabel[] = {
+      {telemetry::metric_labels::kComponent,
+       telemetry::metric_labels::kComponentProcessHeap}};
+  static constexpr telemetry::MetricLabel kPageCacheLabel[] = {
+      {telemetry::metric_labels::kComponent,
+       telemetry::metric_labels::kComponentPageCache}};
+  static constexpr telemetry::MetricLabel kFreeLabel[] = {
+      {telemetry::metric_labels::kComponent,
+       telemetry::metric_labels::kComponentFree}};
+
+  store.SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                 kKvPoolLabel, static_cast<double>(breakdown->kv_pool_bytes));
+  store.SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                 kProcessHeapLabel,
+                 static_cast<double>(breakdown->process_heap_bytes));
+  store.SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                 kPageCacheLabel,
+                 static_cast<double>(breakdown->page_cache_bytes));
+  store.SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes, kFreeLabel,
+                 static_cast<double>(breakdown->free_bytes));
+}
+
+// Throttled wrapper around `UpdateHostMemoryBreakdownMetrics` that samples
+// `/proc/meminfo` at most once every `kHostMemorySampleIntervalNs` (5s).
+// TODO: Replace periodic timestamp-throttled sampling on the transfer path
+// with scrape-time collection or event-driven updates once all telemetry
+// backends support pull callbacks.
+void MaybeUpdateHostMemoryBreakdownMetrics(const KVCacheManagerBase& manager,
+                                           int64_t now_ns) {
+  if (!telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+    return;
+  }
+  const absl::Span<const std::string> shard_ranks = manager.shard_local_ranks();
+  if (!shard_ranks.empty() && shard_ranks.front() != "0") {
+    return;
+  }
+  int64_t last_ns = g_last_host_mem_sample_ns.load(std::memory_order_relaxed);
+  if (last_ns != std::numeric_limits<int64_t>::min() &&
+      (now_ns <= last_ns ||
+       static_cast<uint64_t>(now_ns) - static_cast<uint64_t>(last_ns) <
+           static_cast<uint64_t>(kHostMemorySampleIntervalNs))) {
+    return;
+  }
+  if (!g_last_host_mem_sample_ns.compare_exchange_strong(
+          last_ns, now_ns, std::memory_order_relaxed)) {
+    return;
+  }
+  UpdateHostMemoryBreakdownMetrics(manager,
+                                   manager.GetAllocatedHostDramBytes());
+}
+
 // Joins the given PjRtCopyFutures and records transfer latency and per-device
 // bytes transferred if telemetry is enabled.
 raiden::PjRtCopyFuture JoinAndRecordTelemetry(
@@ -366,6 +459,7 @@ raiden::PjRtCopyFuture JoinAndRecordTelemetry(
       futures.empty()) {
     return joined_future;
   }
+  MaybeUpdateHostMemoryBreakdownMetrics(manager, absl::ToUnixNanos(start_time));
 
   const size_t num_shards = manager.num_shards();
   const size_t start_shard = single_shard_idx.value_or(0);
@@ -3332,6 +3426,7 @@ void KVCacheManagerBase::UpdateAllocatedOccupancyMetric() const {
   telemetry::RaidenMetricStore::GetGlobalMetricStore().SetGauge(
       telemetry::metric_names::kBufferAllocatedBytes, {},
       static_cast<double>(total_host_dram));
+  UpdateHostMemoryBreakdownMetrics(*this, total_host_dram);
 }
 
 std::shared_ptr<backends::KVBackend> KVCacheManagerBase::GetKVBackend(

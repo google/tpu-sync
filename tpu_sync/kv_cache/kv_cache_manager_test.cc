@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>  // NOLINT
 #include <cstddef>
@@ -1786,6 +1788,11 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramTelemetry) {
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
                testing::IsEmpty(), testing::DoubleEq(2048.0)))
       .Times(testing::AtLeast(1));
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
+               testing::_, testing::Ge(0.0)))
+      .Times(testing::AnyNumber());
 
   TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/2,
                              /*slice_byte_size=*/128,
@@ -1798,6 +1805,12 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
   auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
   telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
   telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
+               testing::_, testing::Ge(0.0)))
+      .Times(testing::AnyNumber());
 
   // Initial gauge set in constructor (2 * 2 * 4 * 128 = 2048 bytes).
   EXPECT_CALL(
@@ -1835,6 +1848,128 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
                testing::IsEmpty(), testing::DoubleEq(4096.0)))
       .Times(1);
   manager.UpdateAllocatedOccupancyMetric();
+}
+
+auto HostMemoryComponentLabel(absl::string_view component) {
+  return testing::ElementsAre(testing::FieldsAre(
+      telemetry::metric_labels::kComponent, std::string(component)));
+}
+
+// Points `host_memory_breakdown_bytes` telemetry at `meminfo_path` instead of
+// `/proc/meminfo`. Overriding the path is allowed only in tests.
+class FakeMeminfoKVCacheManager : public TestKVCacheManager {
+ public:
+  FakeMeminfoKVCacheManager(size_t num_layers, size_t num_shards,
+                            size_t slice_byte_size, int host_blocks,
+                            std::string meminfo_path)
+      : TestKVCacheManager(num_layers, num_shards, slice_byte_size,
+                           host_blocks) {
+    proc_meminfo_path_ = std::move(meminfo_path);
+  }
+};
+
+// Writes `content` to a fresh file under the test temp directory and returns
+// its path.
+std::string WriteFakeMeminfo(absl::string_view name,
+                             absl::string_view content) {
+  const std::string path =
+      absl::StrCat(testing::TempDir(), "/", name, "_", getpid());
+  std::ofstream(path) << content;
+  return path;
+}
+
+constexpr absl::string_view kFakeProcMeminfo = R"(MemTotal:       16384000 kB
+MemFree:         4096000 kB
+Buffers:          512000 kB
+Cached:          2048000 kB
+AnonPages:       3072000 kB
+)";
+
+TEST(KVCacheManagerTest, AllocatedOccupancyMetricEmitsHostMemoryBreakdown) {
+  ScopedUnsetLocalRank unset_local_rank;
+  FakeMeminfoKVCacheManager manager(
+      /*num_layers=*/2, /*num_shards=*/2, /*slice_byte_size=*/128,
+      /*host_blocks=*/4, WriteFakeMeminfo("meminfo_rank0", kFakeProcMeminfo));
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               testing::IsEmpty(), testing::DoubleEq(2048.0)));
+  EXPECT_CALL(*raw_mock,
+              SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                       HostMemoryComponentLabel(
+                           telemetry::metric_labels::kComponentKvPool),
+                       testing::DoubleEq(2048.0)));
+  EXPECT_CALL(*raw_mock,
+              SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                       HostMemoryComponentLabel(
+                           telemetry::metric_labels::kComponentProcessHeap),
+                       testing::DoubleEq(3072000.0 * 1024 - 2048)));
+  EXPECT_CALL(*raw_mock,
+              SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                       HostMemoryComponentLabel(
+                           telemetry::metric_labels::kComponentPageCache),
+                       testing::DoubleEq((512000.0 + 2048000.0) * 1024)));
+  EXPECT_CALL(*raw_mock,
+              SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
+                       HostMemoryComponentLabel(
+                           telemetry::metric_labels::kComponentFree),
+                       testing::DoubleEq(4096000.0 * 1024)));
+
+  manager.UpdateAllocatedOccupancyMetric();
+}
+
+TEST(KVCacheManagerTest, HostMemoryBreakdownMetricsSkippedWhenMeminfoMissing) {
+  ScopedUnsetLocalRank unset_local_rank;
+  FakeMeminfoKVCacheManager manager(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/4,
+      absl::StrCat(testing::TempDir(), "/missing_meminfo_", getpid()));
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               testing::IsEmpty(), testing::DoubleEq(512.0)));
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
+               testing::_, testing::_))
+      .Times(0);
+
+  manager.UpdateAllocatedOccupancyMetric();
+}
+
+TEST(KVCacheManagerTest, HostMemoryBreakdownMetricsSkippedOnNonZeroLocalRank) {
+  ScopedUnsetLocalRank restore_local_rank;
+  setenv(telemetry::kLocalRankEnvVar, "1", 1);
+
+  FakeMeminfoKVCacheManager worker1_mgr(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/4, WriteFakeMeminfo("meminfo_rank1", kFakeProcMeminfo));
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               testing::IsEmpty(), testing::DoubleEq(512.0)));
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
+               testing::_, testing::_))
+      .Times(0);
+
+  worker1_mgr.UpdateAllocatedOccupancyMetric();
 }
 
 // ===========================================================================

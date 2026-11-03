@@ -772,7 +772,15 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     return server_.get();
   }
 
+  // Path of the meminfo file read by `host_memory_breakdown_bytes` telemetry.
+  absl::string_view proc_meminfo_path() const { return proc_meminfo_path_; }
+
  protected:
+  // Meminfo file read by `host_memory_breakdown_bytes` telemetry. Changing it
+  // is allowed only in tests, to point at a fake meminfo file; production code
+  // must keep the default `/proc/meminfo`.
+  std::string proc_meminfo_path_ = "/proc/meminfo";
+
   size_t max_physical_size_ = 0;
   int64_t staging_num_slots_ = 0;
   int64_t staging_max_major_per_slot_ = 0;

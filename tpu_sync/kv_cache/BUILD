@@ -290,6 +290,27 @@ cc_library(
 )
 
 cc_library(
+    name = "host_meminfo",
+    srcs = ["host_meminfo.cc"],
+    hdrs = ["host_meminfo.h"],
+    deps = [
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_test(
+    name = "host_meminfo_test",
+    srcs = ["host_meminfo_test.cc"],
+    deps = [
+        ":host_meminfo",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "kv_cache_manager_base",
     srcs = [
         "kv_cache_manager_base.cc",
@@ -304,6 +325,7 @@ cc_library(
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
+        ":host_meminfo",
         ":kv_cache_store_backend_factory",
         ":logical_block_manager",
         ":pool_layout",

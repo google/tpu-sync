@@ -56,11 +56,11 @@ structure Pipeline where
   dstHbm : List Cell
   /-- Completed sender peer pushes per pool (`ReshardSendSession::StartPoolPush`). -/
   sentStreams : List Nat
-  /-- Streams landed by `BlockTransport::CompleteIncomingPush` per pool (`progress.completed_chunks++;`). -/
+  /-- Streams landed by `BlockTransportServerPushSession::CompleteIncomingPush` per pool (`progress.completed_chunks++;`). -/
   landedStreams : List Nat
   /-- Whether source HBM has been freed after `send.published ≠ none`. -/
   reclaimed : Bool := false
-  /-- Whether `PoolReshardRegisterRecv` has armed the receiver (`ReshardCoordinator::ExecutePoolReshard`). -/
+  /-- Whether `PoolReshardRegisterRecv` has armed the receiver (`ReshardCoordinator::RunSubPlan`). -/
   armed : Bool := true
   deriving Repr, DecidableEq
 
@@ -85,7 +85,7 @@ def init (ranks peerCounts : List Nat) : Pipeline :=
     reclaimed := false
     armed := true }
 
-/-- Initial state before Phase 1 of `ReshardCoordinator::ExecutePoolReshard`
+/-- Initial state before Phase 1 of `ReshardCoordinator::RunSubPlan`
 (`PoolReshardRegisterRecv`) has armed the receiver. -/
 def initUnarmed (ranks peerCounts : List Nat) : Pipeline :=
   { init ranks peerCounts with armed := false }
@@ -100,7 +100,7 @@ inductive Ev where
   | reseatDstStaging
   deriving Repr, DecidableEq
 
-/-- Phase 1 of `ReshardCoordinator::ExecutePoolReshard`
+/-- Phase 1 of `ReshardCoordinator::RunSubPlan`
 (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`): arms the destination
 receiver. -/
 def armRecv (s : Pipeline) : Option Pipeline :=
@@ -110,7 +110,7 @@ def armRecv (s : Pipeline) : Option Pipeline :=
 
 /-- Sender transition (`ReshardSendSession::ExecutePush`, `StartPoolPush`,
 `EndOp`). Launching a D2H copy (`d2hIssue p true`) requires the receiver to be
-armed (`ReshardCoordinator::ExecutePoolReshard`); `d2hDone p true` copies
+armed (`ReshardCoordinator::RunSubPlan`); `d2hDone p true` copies
 `srcHbm[p]` into `srcStaging[p]`; `pushDone p true` places `srcStaging[p]` on
 `wire[p]` and increments `sentStreams[p]`. -/
 def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
@@ -138,10 +138,10 @@ def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
 
 /-- Receiver transition (`ReshardReceiveSession::OnPoolReceived`,
 `ExecuteEligiblePoolH2ds`, `FinishPoolH2d`,
-`BlockTransport::CompleteIncomingPush`). `pushBegin` requires the receiver to be
+`BlockTransportServerPushSession::CompleteIncomingPush`). `pushBegin` requires the receiver to be
 armed (`KVCacheManagerWithTransfer::InitializeBaseHooks`,
 `hooks.begin_incoming_push =`); `onPoolReceived p` requires all `peerCounts[p]`
-expected streams to have landed (`BlockTransport::CompleteIncomingPush`);
+expected streams to have landed (`BlockTransportServerPushSession::CompleteIncomingPush`);
 `h2dDone p true` writes `dstStaging[p]` to `dstHbm[p]` and clobbers any strictly
 higher-rank pool slots on the aliased page (`writePoolHbm`). -/
 def recvStep (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
@@ -168,9 +168,10 @@ def recvStep (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
   | e =>
     (Recv.step .finishOnError s.recv e).map fun rcv => { s with recv := rcv }
 
-/-- `BlockTransport::HandleIncomingPush` (`if (expected_size > 0)`) lands one
-push stream for pool `p` into `dstStaging[p]` and `CompleteIncomingPush`
-increments `completed_chunks`. -/
+/-- `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`,
+reached from `BlockTransport::HandleIncomingPush`) lands one push stream for
+pool `p` into `dstStaging[p]` and `CompleteIncomingPush` increments
+`completed_chunks`. -/
 def landStream (s : Pipeline) (p : Nat) : Option Pipeline :=
   if 0 < s.recv.pushes then
     match s.landedStreams[p]?, s.sentStreams[p]?, s.wire[p]? with
@@ -184,7 +185,7 @@ def landStream (s : Pipeline) (p : Nat) : Option Pipeline :=
 
 /-- Source engine/registry reclaims producer HBM once
 `KVCacheManagerWithTransfer::CompleteReadWithDetails` has published the send
-session (`ReshardCoordinator::ExecutePoolReshard`). -/
+session (`ReshardCoordinator::RunSubPlan`). -/
 def reclaim (s : Pipeline) : Option Pipeline :=
   if s.send.published ≠ none ∧ s.reclaimed = false then
     some { s with srcHbm := List.replicate s.numPools .junk, reclaimed := true }

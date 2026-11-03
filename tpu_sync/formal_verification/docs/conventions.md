@@ -34,14 +34,15 @@ guards could drift from the function. Three things follow:
 
 Events are named in the voice of the C++ (`h2dBegin`, `pullReply`, `cancel`),
 not of the property, and carry their outcome as an argument (`h2dDone (ok :
-Bool)`, `acquireReply ok`) instead of being split into a success and a
+Bool)`, `pullReply ok`) instead of being split into a success and a
 failure constructor. Event lists stay short, and one C++ callback maps to one
 row of the events table.
 
 ## How a module file is laid out
 
-Modules are grouped by subsystem (`Transfer/…`, `Controller/…`), with shared
-machinery in `Common/`. Each model file has these sections, in this order:
+Modules are grouped by transfer path (`Transfer/PrefillDecode/…`,
+`Transfer/Reshard/…`), with shared machinery in `Common/` and `Transfer/`. Each
+model file has these sections, in this order:
 
 1. **Module docstring** — what is modelled; abbreviations for cited files; the
    **State** table (field → C++ → role); the **Events** table (event → C++

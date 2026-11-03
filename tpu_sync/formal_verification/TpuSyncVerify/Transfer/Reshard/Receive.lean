@@ -16,8 +16,9 @@ are modelled in `Reshard/Send.lean` and `Reshard/Pipeline.lean`.
 
 `reshard_recv.h`/`reshard_recv.cc` are
 `tpu_sync/kv_cache/reshard_receive_session.{h,cc}`; `mgr.cc` is
-`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `bt.cc` is
-`tpu_sync/transport/block_transport.cc`; `utils.h` is
+`tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `bt.cc` and `bts.cc` are
+`tpu_sync/transport/block_transport.cc` and
+`tpu_sync/transport/block_transport_session.cc`; `utils.h` is
 `tpu_sync/core/utils.h`; `reshard_recv_test.cc` is
 `tpu_sync/kv_cache/reshard_receive_session_test.cc`; and `pool_reshard_test.cc`
 is `tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`.
@@ -38,12 +39,14 @@ transferred pool in `expected_pool_indices_` has an order rank in
 `pool_order_ranks_` (`pool_order_ranks_[static_cast<size_t>(pool_idx)] = group.order_rank()`
 in `ReshardReceiveSession::ReshardReceiveSession`).
 
-As incoming push streams arrive at `BlockTransport::HandleIncomingPush` /
-`BlockTransport::CompleteIncomingPush`, each stream takes a receive op via
-`hooks.begin_incoming_push` (`ReshardReceiveSession::TryBeginRecvOp`) and
-releases it in `hooks.end_incoming_push` (`ReshardReceiveSession::EndRecvOp`).
-When all `expected_pushes` streams for a pool have landed, the transport fires
-`block_delegate_->OnPoolReceived(l, uuid)` (`hooks.on_pool_received` →
+As incoming push streams arrive at the destination's per-uuid
+`BlockTransportServerPushSession` (`StartStream`, reached from
+`BlockTransport::HandleIncomingPush`, then `CompleteIncomingPush`), each stream
+takes a receive op via `hooks.begin_incoming_push`
+(`ReshardReceiveSession::TryBeginRecvOp`) and releases it in
+`hooks.end_incoming_push` (`ReshardReceiveSession::EndRecvOp`). When all
+`expected_pushes` streams for a pool have landed, the push session fires
+`delegate_->OnPoolReceived(l, uuid_)` (`hooks.on_pool_received` →
 `ReshardReceiveSession::OnPoolReceived`), which records the pool in
 `started_pool_indices_` (`ReshardReceiveSession::RecordPoolReceivedLocked`) and
 calls `ReshardReceiveSession::ExecuteEligiblePoolH2ds`.
@@ -96,22 +99,22 @@ Session-level fields:
 | `networkCompleted` | `network_completed_` (set in `FinishPoolH2d`)                       | latched on final pool H2D success |
 | `planUnregistered` | `!unregister_on_settle_` (claimed in `ReshardReceiveSession::TakePendingUnregister`) | active plan unregistered on settle |
 | `durationRecorded` | ghost (`should_record_duration` / `RecordTransferDuration` in `FinishPoolH2d`) | end-of-transfer latency histogram recorded |
-| `published`        | membership in `done_recving_` / `failed_recving_` (`CompleteReadWithDetails`) | what `poll_stats()` shows the engine |
+| `published`        | the session's terminal as `CompleteReadWithDetails` hands it to `RecordPoolReshardTerminalLocked`: membership in `done_recving_` / `failed_recving_` for a single-plan request (`sub_plan_count <= 1`), or the sub-plan's entry in the request's `recv_chains_` record | what `poll_stats()` shows the engine |
 | `pushes`           | ghost                                                               | incoming pushes between `TryBeginRecvOp` (`hooks.begin_incoming_push`) and `EndRecvOp` (`hooks.end_incoming_push`) |
 
 ## Events
 
 | Event               | C++ |
 |---------------------|-----|
-| `pushBegin`         | `ReshardReceiveSession::TryBeginRecvOp` from `hooks.begin_incoming_push`, called in `BlockTransport::HandleIncomingPush` (`block_delegate_->BeginIncomingPush(header.uuid)`) |
-| `pushEnd ok`        | `hooks.end_incoming_push`, called in `BlockTransport::HandleIncomingPush` (`block_delegate_->EndIncomingPush`). Parameterized by `PushEndPolicy`: `.finishOnError` (shipping) calls `reshard_session->Finish(status)` before `reshard_session->EndRecvOp()` on `ok = false` (matching the `TransferReceiveSession` branch), whereas `.endOpOnly` (mutant) runs `EndRecvOp()` unconditionally |
+| `pushBegin`         | `ReshardReceiveSession::TryBeginRecvOp` from `hooks.begin_incoming_push`, called in `BlockTransportServerPushSession::StartStream` (`delegate_->BeginIncomingPush(header.uuid)`) |
+| `pushEnd ok`        | `hooks.end_incoming_push`, called in `BlockTransportServerPushSession::StartStream` (`delegate_->EndIncomingPush`, directly or from the `end_incoming_push` cleanup on failure). Parameterized by `PushEndPolicy`: `.finishOnError` (shipping) calls `reshard_session->Finish(status)` before `reshard_session->EndRecvOp()` on `ok = false` (matching the `TransferReceiveSession` branch), whereas `.endOpOnly` (mutant) runs `EndRecvOp()` unconditionally |
 | `onPoolReceived p`  | `ReshardReceiveSession::OnPoolReceived` + `ExecuteEligiblePoolH2ds` first lock (`to_launch = CollectEligiblePoolH2dsLocked()`): records `p` in `started_pool_indices_` and batch-queues every eligible started pool |
 | `h2dIssue p ok`     | `ExecuteEligiblePoolH2ds` loop body (`for (auto& [pool_idx, dst_chip_block_ids] : to_launch)`): re-checks `if (done_ || draining_)` under `mu_`, otherwise dispatches `base_->H2dPoolBlocks` |
 | `h2dReady p`        | device finishes pool `p`'s H2D copy: its future in `h2d_futures_` becomes `IsReady()` |
 | `h2dDone p ok`      | `ExecuteEligiblePoolH2ds`'s `future.OnReady` callback calling `FinishPoolH2d`, `EndRecvOp`, and `MaybeUnregisterSettledReshardRecv` |
 | `pollReady`         | `CompleteReadWithDetails` sees `!session->IsDraining()` and `session->IsReadyToComplete()` and calls `session->Finish()` |
 | `cancel`            | external `Finish(error)`: deadline (`CompleteReadWithDetails`), shutdown (`~KVCacheManagerWithTransfer`), or `UnregisterActivePlan` |
-| `publish`           | `CompleteReadWithDetails` moves a settled session (`session->Done()`) into `done_recving_` or `failed_recving_`, claims `session->TakePendingUnregister(&generation)`, and erases it from `active_pool_reshard_recvs_` |
+| `publish`           | `CompleteReadWithDetails` reports a settled session (`session->Done()`) through `RecordPoolReshardTerminalLocked` — into `done_recving_` or `failed_recving_` for a single-plan request, or into the request's `recv_chains_` entry for a sub-plan of a chain (the request reaches `done_recving_` when its last sub-plan settles and `failed_recving_` at its first failed sub-plan) — claims `session->TakePendingUnregister(&generation)`, and erases it from `active_pool_reshard_recvs_` |
 
 ## Lock scopes
 
@@ -129,7 +132,7 @@ supplies the uuid and req_id) are `const`.
 | `h2dDone p ok` | 2–6 in `ExecuteEligiblePoolH2ds`'s `future.OnReady` callback: `FinishPoolH2d` locks `mu_` once for `if (done_) return;` and `finished = RecordPoolH2dResultLocked(pool_idx, status);`; on `!finished && status.ok()` it runs `ExecuteEligiblePoolH2ds`'s opening lock (1 scope, folded by A4), on `finished` it latches `terminal_status` or `should_record_duration = true; network_completed_ = true;` and calls `Finish(terminal_status)` (2 scopes), and on `!finished && !status.ok()` (when `reshard_finalizing_` was already set) neither branch runs; then `self->EndRecvOp()` (1 scope) and `MaybeUnregisterSettledReshardRecv` (0–2 scopes) | see the `reshard_finalizing_` latch, wave launch, and `EndRecvOp` tail notes below |
 | `pollReady` | 3 in `CompleteReadWithDetails` (under manager `mu_`): `session->IsDraining()`, `session->IsReadyToComplete()`, `session->Finish()` | disabled on every reachable state (`reachable_pollReady_disabled`) because `FinishPoolH2d` calls `Finish(terminal_status)` right after setting `network_completed_ = true` while the final pool's op still holds `in_flight_ >= 1` |
 | `cancel` | 1–4: `ReshardReceiveSession::Finish(error)` (`FinishLocked`), called directly in `~KVCacheManagerWithTransfer` (1 scope), after `!session->IsDraining()`, `!session->IsReadyToComplete()`, and `session->deadline() <= now` in `CompleteReadWithDetails` (3 scopes), or after `!reshard_it->second->Done()` under manager `mu_` in `UnregisterActivePlan` followed by `Done()` and `TakePendingUnregister` if idle (3–4 scopes) | `cancel` has no `!draining` guard, admitting every interleaving; late errors, below |
-| `publish` | 3–4 in `CompleteReadWithDetails` (under manager `mu_`): `session->Done()`, `session->GetStatus()` (twice on failure), and `session->TakePendingUnregister(&generation)` before `active_pool_reshard_recvs_.erase(it++)` | on a settled session only `status_` can still change; late errors, below |
+| `publish` | 3 in `CompleteReadWithDetails` (under manager `mu_`): `session->Done()`, `session->GetStatus()` (passed to `RecordPoolReshardTerminalLocked`), and `session->TakePendingUnregister(&generation)` before `active_pool_reshard_recvs_.erase(it++)` | on a settled session only `status_` can still change; late errors, below |
 
 **`reshard_finalizing_` latch in `FinishPoolH2d`.** When `RecordPoolH2dResultLocked`
 returns `finished == true`, it has already set `reshard_finalizing_ = true`
@@ -164,8 +167,9 @@ flips `status_` to the error (`cancel` has no `!draining` guard).
 ## Assumptions
 
 * **A1 (at-most-once `OnPoolReceived` per declared pool).**
-  `BlockTransport::CompleteIncomingPush` fires `block_delegate_->OnPoolReceived(l, uuid)`
-  only when `plan_pushes == expected_chunks`, and
+  `BlockTransportServerPushSession::CompleteIncomingPush` fires `delegate_->OnPoolReceived(l, uuid_)`
+  only when `plan_pushes == expected_chunks` (under the push session's own
+  `mu_`, with `layer_progress_` per uuid), and
   `ReshardReceiveSession::RecordPoolReceivedLocked` rejects undeclared or
   duplicate pool indices. Encoded as the `onPoolReceived p` guard
   `pool.stage == .waiting`. (Discharged in `Reshard/Pipeline.lean` by explicit
@@ -244,44 +248,45 @@ Generated by `tools/resolve_anchors.py`.
 | `reshard_recv.h` | `ReshardReceiveSession::GetStatus` | `:80-83` |
 | `reshard_recv.h` | `ReshardReceiveSession::IsDraining` | `:87-90` |
 | `reshard_recv.h` | `ReshardReceiveSession::deadline` | `:94` |
-| `reshard_recv.h` | `ReshardReceiveSession::TryBeginRecvOp` | `:100-105` |
-| `reshard_recv.h` | `ReshardReceiveSession` (`bool staging_released_` .. `absl::flat_hash_set<size_t> h2d_launched_pools_`) | `:172-190` |
+| `reshard_recv.h` | `ReshardReceiveSession::TryBeginRecvOp` | `:104-109` |
+| `reshard_recv.h` | `ReshardReceiveSession` (`bool staging_released_` .. `absl::flat_hash_set<size_t> h2d_launched_pools_`) | `:178-196` |
 | `reshard_recv.cc` | `RecordTransferDuration` | `:60-63` |
 | `reshard_recv.cc` | `ReshardReceiveSession::ValidatePlan` | `:67-144` |
 | `reshard_recv.cc` | `ReshardReceiveSession::Create` | `:351-390` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ReshardReceiveSession` | `:392-418` |
-| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingLeases` | `:420-459` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:461-465` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStaging` | `:467-470` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishLocked` | `:472-482` |
-| `reshard_recv.cc` | `ReshardReceiveSession::Finish` | `:484-487` |
-| `reshard_recv.cc` | `ReshardReceiveSession::EndRecvOpLocked` | `:495-505` |
-| `reshard_recv.cc` | `ReshardReceiveSession::EndRecvOp` | `:507-510` |
-| `reshard_recv.cc` | `ReshardReceiveSession::TakePendingUnregister` | `:512-520` |
-| `reshard_recv.cc` | `ReshardReceiveSession::AllH2dDoneLocked` | `:522-527` |
-| `reshard_recv.cc` | `ReshardReceiveSession::IsReadyToComplete` | `:529-532` |
-| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolReceivedLocked` | `:541-552` |
-| `reshard_recv.cc` | `ReshardReceiveSession::CollectEligiblePoolH2dsLocked` | `:554-583` |
-| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolH2dResultLocked` | `:585-598` |
-| `reshard_recv.cc` | `ReshardReceiveSession::OnPoolReceived` | `:600-612` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` | `:614-666` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`to_launch = CollectEligiblePoolH2dsLocked();` .. `in_flight_ += static_cast<int32_t>(to_launch.size());`) | `:622-623` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`EndRecvOpLocked();`) | `:635` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`h2d_futures_.push_back(future);`) | `:652` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`future.OnReady`) | `:654-664` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:668-706` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` (`finished = RecordPoolH2dResultLocked(pool_idx, status);`) | `:677` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` (`should_record_duration = true;` .. `Finish(terminal_status);`) | `:696-700` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.on_pool_received =`) | `:180-202` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.begin_incoming_push =`) | `:224-249` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.end_incoming_push =`) | `:250-296` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : active_pool_reshard_recvs_)`) | `:415-419` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:703-739` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:741-778` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::MaybeUnregisterSettledReshardRecv` | `:806-812` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_recvs_.begin();`) | `:1067-1097` |
-| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:496-639` |
-| `bt.cc` | `BlockTransport::CompleteIncomingPush` | `:691-887` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ReshardReceiveSession` | `:392-420` |
+| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingLeases` | `:422-461` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:463-467` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStaging` | `:469-472` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishLocked` | `:474-484` |
+| `reshard_recv.cc` | `ReshardReceiveSession::Finish` | `:486-489` |
+| `reshard_recv.cc` | `ReshardReceiveSession::EndRecvOpLocked` | `:497-507` |
+| `reshard_recv.cc` | `ReshardReceiveSession::EndRecvOp` | `:509-512` |
+| `reshard_recv.cc` | `ReshardReceiveSession::TakePendingUnregister` | `:514-522` |
+| `reshard_recv.cc` | `ReshardReceiveSession::AllH2dDoneLocked` | `:524-529` |
+| `reshard_recv.cc` | `ReshardReceiveSession::IsReadyToComplete` | `:531-534` |
+| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolReceivedLocked` | `:543-554` |
+| `reshard_recv.cc` | `ReshardReceiveSession::CollectEligiblePoolH2dsLocked` | `:556-585` |
+| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolH2dResultLocked` | `:587-600` |
+| `reshard_recv.cc` | `ReshardReceiveSession::OnPoolReceived` | `:602-614` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` | `:616-668` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`to_launch = CollectEligiblePoolH2dsLocked();` .. `in_flight_ += static_cast<int32_t>(to_launch.size());`) | `:624-625` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`EndRecvOpLocked();`) | `:637` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`h2d_futures_.push_back(future);`) | `:654` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` (`future.OnReady`) | `:656-666` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:670-708` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` (`finished = RecordPoolH2dResultLocked(pool_idx, status);`) | `:679` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` (`should_record_duration = true;` .. `Finish(terminal_status);`) | `:698-702` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.on_pool_received =`) | `:320-342` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.begin_incoming_push =`) | `:364-389` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.end_incoming_push =`) | `:390-436` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : active_pool_reshard_recvs_)`) | `:583-587` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:873-910` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:912-949` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::MaybeUnregisterSettledReshardRecv` | `:977-983` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_recvs_.begin();`) | `:1239-1267` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:458-463` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` | `:321-455` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:506-702` |
 | `utils.h` | `ValidateCommonPoolReshardPlan` | `:353-469` |
 | `utils.h` | `ValidatePoolBlockBounds` | `:473-489` |
 | `reshard_recv_test.cc` | `ReshardReceiveSessionTest.AcceptsCanonicalPlanOnExplicitPools` | `:137-145` |

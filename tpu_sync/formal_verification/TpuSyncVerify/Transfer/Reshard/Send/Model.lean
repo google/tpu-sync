@@ -207,7 +207,8 @@ def pushDone (pol : UnregisterPolicy) (p : Nat) (ok : Bool) (s : Send) : Option 
 def cancel (s : Send) : Option Send :=
   some { s with life := s.life.finishLocked false }
 
-/-- `KVCacheManagerWithTransfer::CompleteReadWithDetails` publishes a settled session. -/
+/-- `KVCacheManagerWithTransfer::CompleteReadWithDetails` publishes a settled
+session (reported through `RecordPoolReshardTerminalLocked`). -/
 def publish (s : Send) : Option Send :=
   if s.life.done = true ∧ s.published = none then
     some { s with published := some s.life.statusOk }

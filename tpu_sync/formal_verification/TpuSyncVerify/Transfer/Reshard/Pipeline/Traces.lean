@@ -67,7 +67,7 @@ theorem trace_aliased_page_out_of_order_arrival :
       (fun p => (p.send.published, p.recv.published, p.dstHbm, p.reclaimed)) =
       some (some true, some true, [.kv 0, .kv 1], true) := by decide
 
-/-- Two-phase Arm-then-Dispatch trace (`ReshardCoordinator::ExecutePoolReshard`):
+/-- Two-phase Arm-then-Dispatch trace (`ReshardCoordinator::RunSubPlan`):
 from `initUnarmed`, neither sender D2H (`d2hIssue 0 true`) nor receiver
 `pushBegin` can fire before `armRecv`; once `armRecv` runs, the transfer
 completes cleanly. -/
@@ -124,7 +124,7 @@ theorem violates_iff {s : Pipeline} : violates s = false ↔ Safe s := by
    H2D copy clobbers `dstHbm[1]` to `.junk`, violating `PublicationCorrect` and
    `AliasedPageCorrect`.
 2. **Premature `OnPoolReceived` (`stepPrematurePoolReceived`)**: if
-   `BlockTransport::CompleteIncomingPush` fires `OnPoolReceived(p)` on the first
+   `BlockTransportServerPushSession::CompleteIncomingPush` fires `OnPoolReceived(p)` on the first
    arriving stream (`0 < landedStreams[p]`) instead of waiting for all
    `peerCounts[p]` streams (`progress.completed_chunks >= progress.expected_chunks`),
    `StreamAccountingSafe` is violated.

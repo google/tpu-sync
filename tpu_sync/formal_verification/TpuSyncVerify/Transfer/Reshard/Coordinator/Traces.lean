@@ -13,13 +13,14 @@ open TpuSyncVerify.Transfer.Reshard.Registry
 
 /-! ## Part V — Failure-Cleanup Counterexamples, Happy-Path Trace, and Mutants -/
 
-/-- **Partial-arm failure counterexample trace (`ReshardCoordinator::ExecutePoolReshard`, `for (const absl::Status& status : arm_status)`)**:
+/-- **Partial-arm failure counterexample trace (`ReshardCoordinator::RunSubPlan`, `return arm_status[i];`)**:
 Two source units `[0, 1]` and two destination units `[10, 11]`.
 During Stage 1 (receiver arming), `dst_unit 10` succeeds (`armDstResult 10 true`),
 creating an active `ReshardReceiveSession` holding a `PoolStagingLease`, while
 `dst_unit 11` fails (`armDstResult 11 false`).
-At `finishArmBarrier`, the shipping coordinator calls `AbandonClaim` and returns
-`arm_status` (`.aborted`) **without disarming `dst_unit 10`**. -/
+At `finishArmBarrier`, the shipping coordinator calls `AbandonClaim`
+(`if (index == 0)`) and returns `arm_status[i]` (`.aborted`) **without disarming
+`dst_unit 10`**. -/
 def partialArmFailureTrace : List Ev :=
   [ .registerProducer 0
   , .registerProducer 1
@@ -40,7 +41,7 @@ theorem trace_partial_arm_orphans_armed_receiver :
       some (.aborted, [(10, true, true), (11, false, false)], none) := by
   decide
 
-/-- **Sender-dispatch failure counterexample trace (`ReshardCoordinator::ExecutePoolReshard`, `for (const absl::Status& status : sender_status)`)**:
+/-- **Sender-dispatch failure counterexample trace (`ReshardCoordinator::RunSubPlan`, `for (const absl::Status& status : sender_status)`)**:
 Two source units `[0, 1]` and two destination units `[10, 11]`.
 Both `dst_unit 10` and `dst_unit 11` arm in Stage 1 (`finishArmBarrier` transitions
 to `.dispatching`). During Stage 2 (sender dispatch), `src_unit 0` succeeds
@@ -48,7 +49,8 @@ to `.dispatching`). During Stage 2 (sender dispatch), `src_unit 0` succeeds
 `RequestBlockRegistry`, while `src_unit 1` fails (`sendSrcResult 1 false`).
 At `finishSendBarrier`, the shipping coordinator returns `sender_status`
 (`.aborted`) **without disarming `dst_units` AND without calling
-`registry_->AbandonClaim(args.req_id, uuid, claim_owner)`**! -/
+`registry_->AbandonClaim(args.req_id, uuid, ctx->claim_owner)`** (for any
+sub-plan index). -/
 def dispatchFailureTrace : List Ev :=
   [ .registerProducer 0
   , .registerProducer 1
@@ -98,7 +100,7 @@ theorem trace_hardened_policy_cleans_up_partial_arm_and_dispatch_failure :
   exact ⟨rfl, rfl⟩
 
 /-- Happy-path 2x2 multicast reshard execution trace
-(`ReshardCoordinator::ExecutePoolReshard`,
+(`ReshardCoordinator::RunSubPlan`,
 `ReshardStackTest.TwoDestinationsArmEachThenDispatchSendersOnce`):
 both producers (`[0, 1]`) register, coordinator claims the plan, both
 destinations (`[10, 11]`) arm concurrently before either sender is dispatched,
@@ -169,7 +171,7 @@ theorem trace_arm_failure_abandons_claim_and_skips_senders :
   exact ⟨rfl, rfl⟩
 
 /-- Mutant: If Stage 2 dispatched senders without waiting for the Stage 1 join
-barrier (`for (std::thread& t : armers) t.join()` in `ReshardCoordinator::ExecutePoolReshard`), a sender push arriving before
+barrier (`for (std::thread& t : armers) t.join()` in `ReshardCoordinator::RunSubPlan`), a sender push arriving before
 `dst_unit 11` has armed would be dropped (`d.sessionArmed = false`), leaving
 `dst_unit 11` incomplete even after all senders finish. -/
 def stepSendWithoutArmBarrier (s : CoordState) (srcUnit : Nat) : CoordState :=

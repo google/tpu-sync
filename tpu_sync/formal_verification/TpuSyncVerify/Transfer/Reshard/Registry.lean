@@ -149,13 +149,13 @@ and `reshard_service_test.cc`
   | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`if (completion_it != completed_units_.end())`) | `:477-489` |
   | `reg.cc` | `RequestBlockRegistry::AbandonClaim` | `:493-509` |
   | `reg.cc` | `RequestBlockRegistry::AbandonClaim` (`if (owner_it->second.empty())`) | `:503-507` |
-  | `reshard_service_test.cc` | `ReshardStackTest.CancelTombstoneBlocksLateRegistration` | `:933-961` |
-  | `reshard_service_test.cc` | `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle` | `:963-1027` |
-  | `reshard_service_test.cc` | `ReshardStackTest.CompletionVotesRetireAfterClaim` | `:1029-1052` |
-  | `reshard_service_test.cc` | `ReshardStackTest.TtlPurgesExpiredRegistrations` | `:1054-1062` |
-  | `reshard_service_test.cc` | `ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim` | `:1278-1303` |
-  | `reshard_service_test.cc` | `ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace` | `:1305-1332` |
-  | `reshard_service_test.cc` | `ReshardStackTest.AbandoningTheLastStageFreesTheClaim` | `:1334-1361` |
+  | `reshard_service_test.cc` | `ReshardStackTest.CancelTombstoneBlocksLateRegistration` | `:1399-1427` |
+  | `reshard_service_test.cc` | `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle` | `:1429-1493` |
+  | `reshard_service_test.cc` | `ReshardStackTest.CompletionVotesRetireAfterClaim` | `:1495-1518` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TtlPurgesExpiredRegistrations` | `:1520-1528` |
+  | `reshard_service_test.cc` | `ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim` | `:1744-1769` |
+  | `reshard_service_test.cc` | `ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace` | `:1771-1798` |
+  | `reshard_service_test.cc` | `ReshardStackTest.AbandoningTheLastStageFreesTheClaim` | `:1800-1827` |
   <!-- source-map:end -->
 -/
 

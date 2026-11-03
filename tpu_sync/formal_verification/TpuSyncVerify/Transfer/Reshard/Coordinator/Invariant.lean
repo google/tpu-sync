@@ -22,7 +22,7 @@ def IdleShape (s : CoordState) : Prop :=
     ∀ d ∈ s.dstStates, d.sessionArmed = false ∧ d.stagingLeaseHeld = false
 
 /-- **Source Snapshot Claimed Throughout Stage 1 Arming (`ClaimedWhileArming`,
-`ReshardCoordinator::ExecutePoolReshard`)**:
+`ReshardCoordinator::RunSubPlan`)**:
 While `s.phase = .arming`, the source snapshot is actively claimed in
 `RequestBlockRegistry` (`s.reg.claimedUnits = some s.srcUnits` and
 `s.reg.claimOwners = [s.claimOwner]`). -/
@@ -41,7 +41,7 @@ def DispatchingShape (s : CoordState) : Prop :=
     (s.reg.claimedUnits = none ∧ s.reg.claimOwners = [])
 
 /-- **No Push Before All Armed (`NoPushBeforeAllArmed`,
-`ReshardCoordinator::ExecutePoolReshard`)**:
+`ReshardCoordinator::RunSubPlan`)**:
 While the coordinator is in `.idle` or `.arming`, no sender has been dispatched
 (`s.sendResults = []`) and no destination unit has received any push
 (`∀ d ∈ s.dstStates, d.pushesReceived = []`). -/
@@ -50,7 +50,7 @@ def NoPushBeforeAllArmed (s : CoordState) : Prop :=
     s.sendResults = [] ∧ ∀ d ∈ s.dstStates, d.pushesReceived = []
 
 /-- **All Armed In Dispatching (`AllArmedInDispatching`,
-`ReshardCoordinator::ExecutePoolReshard`)**:
+`ReshardCoordinator::RunSubPlan`)**:
 Whenever the coordinator is in `.dispatching` or `.succeeded`, the Stage 1
 arming barrier succeeded (`s.armFailed = false` and `allReported s.dstUnits s.armResults = true`). -/
 def AllArmedInDispatching (s : CoordState) : Prop :=

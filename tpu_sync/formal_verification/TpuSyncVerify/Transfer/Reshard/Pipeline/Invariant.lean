@@ -48,7 +48,7 @@ def StagingSafe (s : Pipeline) : Prop :=
     s.recv.pushes = 0 ∧ Recv.poolOps s.recv.pools = 0)
 
 /-- Plan-declared transport progress accounting
-(`BlockTransport::CompleteIncomingPush`): landed streams never exceed sent
+(`BlockTransportServerPushSession::CompleteIncomingPush`): landed streams never exceed sent
 streams, sent streams never exceed `peerCounts`, and any pool that has passed
 `OnPoolReceived` (`stage ≠ .waiting`) has landed all `peerCounts[p]` expected
 streams. -/
@@ -60,7 +60,7 @@ def StreamAccountingSafe (s : Pipeline) : Prop :=
       s.landedStreams.getD p 0 = s.peerCounts.getD p 0)
 
 /-- Two-phase Arm-then-Dispatch barrier
-(`ReshardCoordinator::ExecutePoolReshard`): before `PoolReshardRegisterRecv`
+(`ReshardCoordinator::RunSubPlan`): before `PoolReshardRegisterRecv`
 arms the receiver (`armed = false`), no sender pool has launched a D2H copy or
 push and no receiver push or H2D is active. -/
 def NoUnarmedPush (s : Pipeline) : Prop :=

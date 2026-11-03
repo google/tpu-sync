@@ -261,7 +261,8 @@ def pollReady (s : Recv) : Option Recv :=
 def cancel (s : Recv) : Option Recv :=
   some { s with life := s.life.finishLocked false }
 
-/-- `CompleteReadWithDetails` publishes a settled session (`session->Done()`). -/
+/-- `CompleteReadWithDetails` publishes a settled session (`session->Done()`,
+reported through `RecordPoolReshardTerminalLocked`). -/
 def publish (s : Recv) : Option Recv :=
   if s.life.done = true ∧ s.published = none then
     some { s with published := some s.life.statusOk, planUnregistered := true }

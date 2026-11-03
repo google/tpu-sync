@@ -30,8 +30,11 @@ In the source-map table below, `reshard_send.h` and `reshard_send.cc` are
 (`ReshardSendSession::Create`), which validates the plan, computes
 `remaining_pool_peer_pushes_ = CountPoolReshardSendSlots(plan, schedule)`,
 registers the active plan (`RegisterActivePlanDirect`), and inserts the session
-into `active_pool_reshard_sends_`. It then calls
-`ExecutePush(*this, src_block_ids)`.
+into `active_pool_reshard_sends_` (recording it in the request's `send_chains_`
+entry, `NoteSubPlanRegisteredLocked`, when the plan is a sub-plan of a chain).
+It then calls `ExecutePush(*this, src_block_ids)`. The model is one such
+session — one plan `uuid`, which for a windowed request is one sub-plan of
+its chain (`Pipeline.lean` §"Scope: one plan").
 
 `ReshardSendSession::ExecutePush` takes its own caller op
 (`++in_flight_; manager_ = &manager;`) and iterates over
@@ -89,7 +92,7 @@ Session-level fields:
 | `execActive`       | `ExecutePush` caller op between `++in_flight_;` and `EndOp()`       | caller op active |
 | `remainingPushes`  | `remaining_pool_peer_pushes_`                                       | remaining `(pool, peer)` completions |
 | `planUnregistered` | `plan_unregistered_`                                                | active plan unregistered |
-| `published`        | membership in `done_sending_` / `failed_recving_` (`CompleteReadWithDetails`) | what `poll_stats()` shows the engine |
+| `published`        | the session's terminal as `CompleteReadWithDetails` hands it to `RecordPoolReshardTerminalLocked`: membership in `done_sending_` / `failed_recving_` for a single-plan request (`sub_plan_count <= 1`), or the sub-plan's entry in the request's `send_chains_` record | what `poll_stats()` shows the engine |
 
 ## Events
 
@@ -100,7 +103,7 @@ Session-level fields:
 | `d2hDone p ok`     | `pool_future.OnReady` callback + `StartPoolPush` + `EndOp()` |
 | `pushDone p ok`    | one peer's `AsyncPush(...).OnReady` callback for pool `p`: calls `RecordPushCompletion` + `EndOp()` |
 | `cancel`           | external `Finish(error)`: deadline (`CompleteReadWithDetails`) or shutdown (`~KVCacheManagerWithTransfer`) |
-| `publish`          | `CompleteReadWithDetails` moves a settled session into `done_sending_` or `failed_recving_` and erases it |
+| `publish`          | `CompleteReadWithDetails` reports a settled session through `RecordPoolReshardTerminalLocked` (into `done_sending_` or `failed_recving_` for a single-plan request; into the request's `send_chains_` entry for a sub-plan of a chain, which reaches `done_sending_` when the last sub-plan settles and `failed_recving_` at the first failed sub-plan) and erases it |
 
 ## Lock scopes
 
@@ -121,7 +124,7 @@ the `while (true)` decrement/settle scope — three under `kPerTransfer` when
 | `d2hDone p ok` | 3–6 in `pool_future.OnReady`: on `ok = false` (or `transport_srv == nullptr`), `RecordPushCompletion` (1–2 scopes) + `absl::Cleanup` `EndOp()` (2–3 scopes); on `ok = true`, `StartPoolPush` checks `if (done_ || finalizing_) return;` on entry and again when adding `in_flight_ += static_cast<int>(transfers_by_peer.size());` (1–2 scopes, folded by A3), dispatches `AsyncPush` per peer outside `mu_`, and runs `EndOp()` (2–3 scopes) | the D2H op and (on `ok = true`) the added peer ops keep `in_flight_ >= 1` until `EndOp()`; `EndOp` tail, below |
 | `pushDone p ok` | 3–5 in `StartPoolPush`'s `AsyncPush(...).OnReady` callback: `RecordPushCompletion` (1–2 scopes) followed by `absl::Cleanup` `EndOp()` (2–3 scopes) | the peer op keeps `in_flight_ >= 1` until `EndOp()`; `EndOp` tail, below |
 | `cancel` | 1–2: `ReshardSendSession::Finish(error)`, called from `~KVCacheManagerWithTransfer` (1 scope) or after `!session->IsDraining() && session->deadline() <= now` in `CompleteReadWithDetails` (2 scopes) | `Finish` sets `status_ = status` if `!status.ok() && status_.ok()`, then returns if `done_ || finalizing_`, matching `cancel` |
-| `publish` | 2–3 in `CompleteReadWithDetails` (under manager `mu_`): `session->Done()` and `session->GetStatus()` (twice on failure) before `active_pool_reshard_sends_.erase(it++)` | on a settled session only `status_` can change if it was still OK |
+| `publish` | 3 in `CompleteReadWithDetails` (under manager `mu_`): `session->Done()` and `session->GetStatus()` twice (`const bool failed = !session->GetStatus().ok();`, then the argument of `RecordPoolReshardTerminalLocked`) before `active_pool_reshard_sends_.erase(it++)` | on a settled session only `status_` can change if it was still OK |
 
 **Caller and callback ops hold `in_flight_ >= 1` until `EndOp()`.** Throughout
 `ExecutePush`, `StartPoolPush`, and `RecordPushCompletion`, the running caller
@@ -223,7 +226,7 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 | `reshard_send.h` | `ReshardSendSession::GetStatus` | `:74-77` |
 | `reshard_send.h` | `ReshardSendSession::IsDraining` | `:81-84` |
 | `reshard_send.h` | `ReshardSendSession::deadline` | `:88` |
-| `reshard_send.h` | `ReshardSendSession` (`int remaining_pool_peer_pushes_` .. `bool connections_released_`) | `:138-151` |
+| `reshard_send.h` | `ReshardSendSession` (`int remaining_pool_peer_pushes_` .. `bool connections_released_`) | `:142-155` |
 | `reshard_send.cc` | `ReshardSendSession::ValidatePlan` | `:52-90` |
 | `reshard_send.cc` | `ReshardSendSession::Create` | `:92-151` |
 | `reshard_send.cc` | `ReshardSendSession::ExecutePush` | `:177-265` |
@@ -241,14 +244,14 @@ Line ranges are populated and checked by `tpu_sync/formal_verification/tools/res
 | `reshard_send.cc` | `ReshardSendSession::EndOp` (`while (true)`) | `:449-467` |
 | `reshard_send.cc` | `ReshardSendSession::ReleaseLeasesLocked` | `:470-474` |
 | `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:476-481` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:668-706` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:670-708` |
 | `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : active_pool_reshard_sends_)`) | `:410-414` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:664-701` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:741-778` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_sends_.begin();`) | `:1011-1030` |
-| `base.cc` | `KVCacheManagerBase::GetBlockChunks` | `:3235-3519` |
-| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`if (schedule_it != schedules.end())`) | `:3414-3446` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : active_pool_reshard_sends_)`) | `:578-582` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:833-871` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:912-949` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_sends_.begin();`) | `:1182-1202` |
+| `base.cc` | `KVCacheManagerBase::GetBlockChunks` | `:3271-3582` |
+| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`if (schedule_it != schedules.end())`) | `:3477-3509` |
 | `utils.h` | `StridedSpanFitsBlock` | `:322-333` |
 | `utils.h` | `StridedSpanFitsRegions` | `:335-349` |
 | `pool_layout.cc` | `RegionCoversOffset` | `:66-87` |

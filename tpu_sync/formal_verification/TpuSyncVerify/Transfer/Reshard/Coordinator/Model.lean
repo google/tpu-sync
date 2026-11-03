@@ -14,12 +14,12 @@ open TpuSyncVerify.Transfer.Reshard.Registry
 /-! ## Part I — Coordinator, Receiver-Arming, and Cleanup Policy State Machine -/
 
 /-- Coordinator failure cleanup policy comparing the shipping implementation
-(`ReshardCoordinator::ExecutePoolReshard`'s `arm_status` and `sender_status` checks) against a hardened policy that
+(`ReshardCoordinator::RunSubPlan`'s `arm_status` and `sender_status` checks, sub-plan `index == 0`) against a hardened policy that
 disarms armed receivers and abandons the registry claim on any barrier failure. -/
 inductive CleanupPolicy where
   /-- Shipping C++ behavior:
-      * Arm failure (`for (const absl::Status& status : arm_status)`): calls `AbandonClaim`,
-        does not disarm already-armed `dst_units`.
+      * Arm failure (`if (armed[i]) continue;` scan ending in `return arm_status[i];`): calls `AbandonClaim`
+        (`if (index == 0)`), does not disarm already-armed `dst_units`.
       * Send failure (`for (const absl::Status& status : sender_status)`): neither disarms
         `dst_units` nor calls `AbandonClaim`. -/
   | shipping
@@ -30,22 +30,22 @@ inductive CleanupPolicy where
   | disarmAndAbandonOnFailure
   deriving DecidableEq, Repr
 
-/-- Lifecycle phase of `ReshardCoordinator::ExecutePoolReshard`. -/
+/-- Lifecycle phase of one `ReshardCoordinator::RunSubPlan` call. -/
 inductive CoordPhase where
-  /-- Before `ExecutePoolReshard` claims the source snapshot. -/
+  /-- Before `RunSubPlan` claims the source snapshot. -/
   | idle
-  /-- Stage 1 (`ReshardCoordinator::ExecutePoolReshard`, `armers` fan-out): `BuildPoolReshardPlan`
+  /-- Stage 1 (`ReshardCoordinator::RunSubPlan`, `armers` fan-out): `BuildPoolReshardPlan`
       claimed the source snapshot in `RequestBlockRegistry`; concurrent
       `PoolReshardRegisterRecv` RPCs to `dst_units` are in flight. -/
   | arming
-  /-- Stage 2 (`ReshardCoordinator::ExecutePoolReshard`, `sender_status` fan-out): all `dst_units` armed with
+  /-- Stage 2 (`ReshardCoordinator::RunSubPlan`, `sender_status` fan-out): all `dst_units` armed with
       `arm_status.ok()`; concurrent `PoolReshardPush` RPCs to `src_units` are
       in flight. -/
   | dispatching
-  /-- Both stages completed with `return absl::OkStatus()` (`ReshardCoordinator::ExecutePoolReshard`). -/
+  /-- Both stages completed with `return absl::OkStatus()` (`ReshardCoordinator::RunSubPlan`). -/
   | succeeded
-  /-- `ExecutePoolReshard` returned a non-OK `absl::Status`
-      (`if (!plan_or.ok())`, `for (const absl::Status& status : arm_status)`, or `for (const absl::Status& status : sender_status)`). -/
+  /-- `RunSubPlan` returned a non-OK `absl::Status`
+      (`if (!plan_or.ok())`, `return arm_status[i];`, or `for (const absl::Status& status : sender_status)`). -/
   | aborted
   deriving DecidableEq, Repr
 
@@ -113,7 +113,7 @@ def receivePush (d : DstUnitState) (srcUnits : List Nat) (srcUnit : Nat) : DstUn
 
 end DstUnitState
 
-/-- Combined state of `ReshardCoordinator::ExecutePoolReshard`, the destination
+/-- Combined state of one `ReshardCoordinator::RunSubPlan` call, the destination
 units' `ReshardReceiveSession`s, and the shared `RequestBlockRegistry` generation. -/
 structure CoordState where
   /-- Source unit IDs (`plan.src_units`). -/
@@ -121,21 +121,22 @@ structure CoordState where
   /-- Destination unit IDs (`plan.dst_units`). -/
   dstUnits : List Nat
   /-- Coordinator's unique `claim_owner` token (`claim_counter.fetch_add(1)` in
-      `ReshardCoordinator::ExecutePoolReshard`). -/
+      `ReshardCoordinator::ExecutePoolReshard`, kept in `ChainContext::claim_owner`
+      for every sub-plan of the request). -/
   claimOwner : Nat
   /-- Current coordinator lifecycle phase. -/
   phase : CoordPhase
   /-- Per-destination-unit state. -/
   dstStates : List DstUnitState
   /-- Completed `PoolReshardRegisterRecv` RPC results `(dstUnit, ok)` collected
-      during Stage 1 (`armers` in `ReshardCoordinator::ExecutePoolReshard`). -/
+      during Stage 1 (`armers` in `ReshardCoordinator::RunSubPlan`). -/
   armResults : List (Nat × Bool)
-  /-- `true` if `!arm_status.ok()` during Stage 1 (`arm_status[i]` in `ReshardCoordinator::ExecutePoolReshard`). -/
+  /-- `true` if `!arm_status.ok()` during Stage 1 (`arm_status[i]` in `ReshardCoordinator::RunSubPlan`). -/
   armFailed : Bool
   /-- Completed `PoolReshardPush` RPC results `(srcUnit, ok)` collected during
-      Stage 2 (`futures` / `senders` in `ReshardCoordinator::ExecutePoolReshard`). -/
+      Stage 2 (`futures` / `senders` in `ReshardCoordinator::RunSubPlan`). -/
   sendResults : List (Nat × Bool)
-  /-- `true` if `!sender_status.ok()` during Stage 2 (`sender_status[i]` in `ReshardCoordinator::ExecutePoolReshard`). -/
+  /-- `true` if `!sender_status.ok()` during Stage 2 (`sender_status[i]` in `ReshardCoordinator::RunSubPlan`). -/
   sendFailed : Bool
   /-- Underlying `RequestBlockRegistry` state for `(args.req_id, args.uuid)`. -/
   reg : RegGen
@@ -146,22 +147,23 @@ inductive Ev where
   /-- Producer unit registers its source blocks in `RequestBlockRegistry`
       before reshard planning (`RequestBlockRegistry::Register`). -/
   | registerProducer (srcUnit : Nat)
-  /-- `BuildPoolReshardPlan(plan_request, registry_, claim_owner)` (`ReshardCoordinator::ExecutePoolReshard`):
+  /-- `BuildPoolReshardPlan(plan_request, registry_, ctx->claim_owner)` (`ReshardCoordinator::RunSubPlan`):
       claims `srcUnits` in `RequestBlockRegistry` (`LookupAndClaim`), and then
       either succeeds (`planOk = true` -> `.arming`) or fails after claiming
       (`planOk = false` -> `AbandonClaim` + `.aborted`). -/
   | startPlan (planOk : Bool)
   /-- Stage 1 worker RPC `PoolReshardRegisterRecv` finishes for `dstUnit`
-      (`armers.emplace_back` in `ReshardCoordinator::ExecutePoolReshard`). -/
+      (`armers.emplace_back` in `ReshardCoordinator::RunSubPlan`). -/
   | armDstResult (dstUnit : Nat) (ok : Bool)
-  /-- Stage 1 join barrier `for (std::thread& t : armers) t.join()` and
-      `for (const absl::Status& status : arm_status)` check (`ReshardCoordinator::ExecutePoolReshard`). -/
+  /-- Stage 1 join barrier `for (std::thread& t : armers) t.join()` and the
+      `if (armed[i]) continue;` scan ending in `return arm_status[i];` (`ReshardCoordinator::RunSubPlan`;
+      a single attempt for sub-plan 0, `attempts = 1`). -/
   | finishArmBarrier
   /-- Stage 2 worker RPC `PoolReshardPush` finishes for `srcUnit`
-      (`SubmitTransferProgram` / `senders.emplace_back` in `ReshardCoordinator::ExecutePoolReshard`). -/
+      (`SubmitTransferProgram` / `senders.emplace_back` in `ReshardCoordinator::RunSubPlan`). -/
   | sendSrcResult (srcUnit : Nat) (ok : Bool)
   /-- Stage 2 join barrier `for (std::thread& t : senders) t.join()` and
-      `for (const absl::Status& status : sender_status)` check (`ReshardCoordinator::ExecutePoolReshard`). -/
+      `for (const absl::Status& status : sender_status)` check (`ReshardCoordinator::RunSubPlan`). -/
   | finishSendBarrier
   deriving DecidableEq, Repr
 
@@ -196,8 +198,8 @@ def init (srcUnits dstUnits : List Nat) (claimOwner : Nat) : CoordState :=
     sendFailed := false
     reg := RegGen.init }
 
-/-- Small-step transition relation of `ReshardCoordinator::ExecutePoolReshard`
-parameterized by `CleanupPolicy`. -/
+/-- Small-step transition relation of one `ReshardCoordinator::RunSubPlan` call
+(sub-plan `index == 0`) parameterized by `CleanupPolicy`. -/
 def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState :=
   match e with
   | .registerProducer srcUnit =>
@@ -213,15 +215,15 @@ def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState 
       none
     else
       -- `BuildPoolReshardPlan` calls `LookupAndClaim(req_id, uuid, request.src_units, claim_owner)`
-      -- (`ReshardCoordinator::ExecutePoolReshard`, `BuildPoolReshardPlan`).
+      -- (`ReshardCoordinator::RunSubPlan`, `BuildPoolReshardPlan`).
       match RegGen.step s.reg (.lookupAndClaim s.claimOwner s.srcUnits) with
       | none => none
       | some regClaimed =>
         if planOk then
           some { s with phase := .arming, reg := regClaimed }
         else
-          -- `if (!plan_or.ok())`: on plan failure, calls `registry_->AbandonClaim(args.req_id, uuid, claim_owner)`
-          -- and returns error.
+          -- `if (!plan_or.ok())`: on plan failure, calls `registry_->AbandonClaim(args.req_id, uuid, ctx->claim_owner)`
+          -- (`if (index == 0)`) and returns error.
           some
             { s with
               phase := .aborted
@@ -251,11 +253,11 @@ def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState 
       -- All `dst_units` armed with `arm_status.ok()` (`for (std::thread& t : armers) t.join()`).
       some { s with phase := .dispatching }
     else
-      -- `if (!status.ok())` in `for (const absl::Status& status : arm_status)`:
+      -- an unarmed destination (`if (armed[i]) continue;`) after the join:
       match policy with
       | .shipping =>
-        -- Shipping code calls `registry_->AbandonClaim(args.req_id, uuid, claim_owner)` and returns `status`
-        -- WITHOUT disarming `dst_units` that already armed!
+        -- Shipping code calls `registry_->AbandonClaim(args.req_id, uuid, ctx->claim_owner)` (`if (index == 0)`)
+        -- and `return arm_status[i];` WITHOUT disarming `dst_units` that already armed!
         some
           { s with
             phase := .aborted
@@ -273,7 +275,7 @@ def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState 
     else if !s.srcUnits.contains srcUnit || hasResult s.sendResults srcUnit then
       none
     else if ok then
-      -- `PoolReshardPush` succeeded (`ReshardCoordinator::ExecutePoolReshard`,
+      -- `PoolReshardPush` succeeded (`ReshardCoordinator::RunSubPlan`,
       -- `ReshardService::HandleControllerCommand` `COMMAND_COMPLETE_REQUEST_BLOCKS`, `RequestBlockRegistry::Complete`):
       -- pushes sub-blocks to armed `dst_units` and votes `registry_->Complete`.
       let dstStates' :=
@@ -288,7 +290,7 @@ def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState 
           sendResults := (srcUnit, true) :: s.sendResults
           reg := reg' }
     else
-      -- `!status.ok()` (`sender_status[i]` in `ReshardCoordinator::ExecutePoolReshard`):
+      -- `!status.ok()` (`sender_status[i]` in `ReshardCoordinator::RunSubPlan`):
       -- records `sender_status = status`; does NOT call `registry_->Complete`.
       some
         { s with

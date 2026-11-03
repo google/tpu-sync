@@ -15,9 +15,17 @@ byte-interval coverage and multi-sender push-stream accounting:
   deduplication)
 * `tpu_sync/core/pool_reshard_send_slots.cc` (`CountPoolReshardSendSlots`)
 * `tpu_sync/transport/block_transport.cc` (`BlockTransport::AsyncPushShards`
-  stream clamping `P = min(parallelism, num_blocks)` and
-  `BlockTransport::HandleIncomingPush` / `BlockTransport::CompleteIncomingPush`
-  plan-declared progress counter)
+  stream clamping `P = min(parallelism, num_blocks)`) and
+  `tpu_sync/transport/block_transport_session.cc` (the per-uuid
+  `BlockTransportServerPushSession::StartStream` /
+  `BlockTransportServerPushSession::CompleteIncomingPush` plan-declared
+  progress counter)
+
+The coverage check is per plan: for a sub-plan of a windowed request
+(`ReshardCoordinator::StartChain`), `BuildPoolReshardPlan` clips each tag's
+declared spans to the sub-plan's window (`dst_window_offset_blocks` /
+`dst_window_total_blocks` in `PlanRequest`) and `ValidateReceiverCoverage`
+checks that sub-plan's own destination blocks.
 
 File aliases used in the source map below:
 `reshard_recv.cc` (`tpu_sync/kv_cache/reshard_receive_session.cc`),
@@ -25,6 +33,7 @@ File aliases used in the source map below:
 `reshard_send.cc` (`tpu_sync/kv_cache/reshard_send_session.cc`),
 `slots.cc` (`tpu_sync/core/pool_reshard_send_slots.cc`),
 `bt.cc` (`tpu_sync/transport/block_transport.cc`),
+`bts.cc` (`tpu_sync/transport/block_transport_session.cc`),
 `base.cc` (`tpu_sync/kv_cache/kv_cache_manager_base.cc`),
 `reshard_recv_test.cc` (`tpu_sync/kv_cache/reshard_receive_session_test.cc`),
 `pool_reshard_test.cc` (`tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`).
@@ -71,20 +80,20 @@ What this module proves:
 | `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (int64_t repeat = 0; repeat < entry.count(); ++repeat)` .. `state.pairs_by_sender[source_rank].insert`) | `:286-305` |
 | `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`int64_t calculated_pushes = 0;` .. `if (calculated_pushes != view.expected_pushes)`) | `:314-319` |
 | `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`std::sort(intervals.begin(), intervals.end());` .. `if (covered_until != view.extents[ordinal])`) | `:328-339` |
-| `planner.h` | `*` (`inline constexpr char kTransferStreamsEnvVar[]`) | `:143` |
-| `planner.cc` | `ValidateSpanCoverage` | `:315-452` |
-| `planner.cc` | `EmitSpanSchedule` | `:468-572` |
-| `planner.cc` | `DefaultTransferStreams` | `:576-593` |
-| `planner.cc` | `BuildPoolReshardPlan` (`int64_t requested_parallelism = 0;` .. `if (requested_parallelism > topology_parallelism)`) | `:908-918` |
-| `planner.cc` | `BuildPoolReshardPlan` (`expected_pushes_by_dst;` .. `if (expected_pushes_by_dst.at(dst_unit_id) <= 0)`) | `:1133-1145` |
+| `planner.h` | `*` (`inline constexpr char kTransferStreamsEnvVar[]`) | `:163` |
+| `planner.cc` | `ValidateSpanCoverage` | `:350-487` |
+| `planner.cc` | `EmitSpanSchedule` | `:503-607` |
+| `planner.cc` | `DefaultTransferStreams` | `:611-628` |
+| `planner.cc` | `BuildPoolReshardPlan` (`int64_t requested_parallelism = 0;` .. `if (requested_parallelism > topology_parallelism)`) | `:984-994` |
+| `planner.cc` | `BuildPoolReshardPlan` (`expected_pushes_by_dst;` .. `if (expected_pushes_by_dst.at(dst_unit_id) <= 0)`) | `:1234-1246` |
 | `reshard_send.cc` | `ReshardSendSession::ExecutePush` (`for (int32_t encoded_pool_idx : plan_.transfer_pool_indices())` .. `if (pool_src_block_ids.empty())`) | `:204-217` |
 | `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:267-349` |
 | `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
-| `bt.cc` | `BlockTransport::HandleIncomingPush` (`if (expected_size > 0)`) | `:604-608` |
-| `bt.cc` | `BlockTransport::CompleteIncomingPush` | `:691-887` |
-| `bt.cc` | `BlockTransport::AsyncPushShards` (`size_t num_blocks = src_block_ids.size();` .. `auto requests = BuildBlockRequests(`) | `:1104-1134` |
-| `base.cc` | `KVCacheManagerBase::GetPoolPushProgressSpec` | `:2655-2698` |
-| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2700-2717` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:423-427` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:506-702` |
+| `bt.cc` | `BlockTransport::AsyncPushShards` (`size_t num_blocks = src_block_ids.size();` .. `auto requests = BuildBlockRequests(`) | `:568-598` |
+| `base.cc` | `KVCacheManagerBase::GetPoolPushProgressSpec` | `:2700-2743` |
+| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2745-2762` |
 | `reshard_recv_test.cc` | `ReshardReceiveSessionTest.ChecksEveryPoolSpanAndDestinationZeroCover` | `:227-255` |
 | `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageGap` | `:278-289` |
 | `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageOverlap` | `:291-302` |
@@ -99,10 +108,10 @@ What this module proves:
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.PositiveValueCapsStreamsWithinAdmission` | `:74-87` |
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.RejectsUnparsableValueNamingVariableAndValue` | `:89-95` |
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.RejectsNegativeValueNamingVariableAndValue` | `:97-103` |
-| `reshard_service_test.cc` | `ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank` | `:1818-1838` |
-| `reshard_service_test.cc` | `ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes` | `:1840-1860` |
-| `reshard_service_test.cc` | `ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv` | `:1862-1879` |
-| `reshard_service_test.cc` | `ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan` | `:1881-1896` |
+| `reshard_service_test.cc` | `ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank` | `:2284-2304` |
+| `reshard_service_test.cc` | `ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes` | `:2306-2326` |
+| `reshard_service_test.cc` | `ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv` | `:2328-2345` |
+| `reshard_service_test.cc` | `ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan` | `:2347-2362` |
 <!-- source-map:end -->
 -/
 
@@ -228,9 +237,9 @@ def validBlockCoverage (extent : Nat) (intervals : List Interval) : Bool :=
   decide (0 < extent) && decide (checkContiguousIntervals 0 intervals = some extent)
 
 /-- Write one logical byte interval `[iv.startByte, iv.endByte)` into a
-destination block byte buffer (`BlockTransport::HandleIncomingPush`
-`ReadVExact(client_fd, ToIovec(chunks),` in `block_transport.cc`). Byte `b` in
-range receives `.kv b`. -/
+destination block byte buffer (`BlockTransportServerPushSession::StartStream`
+`ReadVExact(client_fd, ToIovec(chunks),` in `block_transport_session.cc`). Byte
+`b` in range receives `.kv b`. -/
 def writeInterval (iv : Interval) (buf : List Cell) : List Cell :=
   buf.mapIdx fun b c => if iv.startByte ≤ b ∧ b < iv.endByte then .kv b else c
 

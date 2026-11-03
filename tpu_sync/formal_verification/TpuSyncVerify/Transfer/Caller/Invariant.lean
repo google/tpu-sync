@@ -342,9 +342,9 @@ theorem contract_safe {c : Cfg} (hc : Contract c.conn) {s : S}
     (hr : (sys c).Reachable s) : Safe s :=
   inv_safe ((sys c).reachable_induction inv_init (fun _ _ _ h hs => step_inv hc h hs) hr)
 
-theorem fixed_safe {policy : Policy} {s : S}
-    (hr : (sys ⟨connectorFixed, policy⟩).Reachable s) : Safe s :=
-  contract_safe fixed_contract hr
+theorem twoChannel_safe {policy : Policy} {s : S}
+    (hr : (sys ⟨connectorTwoChannel, policy⟩).Reachable s) : Safe s :=
+  contract_safe twoChannel_contract hr
 
 /-- On a waiting request, staging an early `invalid_block_ids` under
 `Policy.fail` (`vllm-torchtpu`'s `_stage3_fail_uncertain_loads_early` in

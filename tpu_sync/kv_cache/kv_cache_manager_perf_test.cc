@@ -550,8 +550,8 @@ class KVCacheManagerPerfTest : public ::testing::Test {
 
     std::cout << "[INFO] Using " << devices_.size() << " TPUs:" << std::endl;
     for (auto* dev : devices_) {
-      std::cout << "  Device " << dev->id() << ": " << dev->device_kind()
-                << std::endl;
+      std::cout << "  Device " << dev->global_device_id() << ": "
+                << dev->device_kind() << std::endl;
     }
   }
 

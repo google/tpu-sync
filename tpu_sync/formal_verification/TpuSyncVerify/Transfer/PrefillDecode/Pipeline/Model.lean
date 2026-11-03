@@ -16,7 +16,7 @@ inductive Cell where
   | blank
   | kv (layer : Nat)
   | junk
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 structure Pipeline where
   numLayers : Nat
@@ -46,7 +46,7 @@ structure Pipeline where
   registered : Bool := true
   /-- Whether `HandlePullStream` arrived before `NotifyForRead` and is waiting in `cv_.WaitWithTimeout`. -/
   pullWaiting : Bool := false
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Pipeline
 
@@ -108,7 +108,10 @@ layer-indexed `d2hReady l` / `h2hDone l ok` and are disabled here. `beginPull`
 (`session->ValidateAndBeginPull` in `HandlePullStream`) requires the offer to be registered in
 `send_sessions_` (`s.registered = true`) and clears any grace-wait state
 (`pullWaiting := false`). `wake` gets the per-layer guard the counter model
-cannot state: `SendNextLayer(woken)` waits on layer `woken`'s own future. -/
+cannot state: `SendNextLayer(woken)` waits on layer `woken`'s own future
+(`d2hReadyL[woken]? = some true`), unless layer `woken` was never issued
+(`d2hIssued ≤ woken`) and `fail_unissued_layers` resolves its promise on a
+draining send with no dispatch in progress. -/
 def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
   match e with
   | .d2hReady => none
@@ -117,9 +120,11 @@ def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
     if s.registered = true then
       (Send.step s.send .beginPull).map fun snd => { s with send := snd, pullWaiting := false }
     else none
-  | .wake _ =>
-    if s.d2hReadyL[s.send.woken]? = some true then
-      (Send.step s.send e).map fun snd => { s with send := snd }
+  | .wake ok =>
+    if s.d2hReadyL[s.send.woken]? = some true ∨
+        (ok = false ∧ s.send.life.draining = true ∧
+          s.send.d2hPending = false ∧ s.send.d2hIssued ≤ s.send.woken) then
+      (Send.step s.send (.wake ok)).map fun snd => { s with send := snd }
     else none
   | _ => (Send.step s.send e).map fun snd => { s with send := snd }
 
@@ -292,7 +297,8 @@ def HandshakeSafe (s : Pipeline) : Prop :=
 
 /-- Events that advance or retire an in-flight operation on either side. -/
 def drainEvents (n : Nat) : List Ev :=
-  [.send (.d2hIssue true), .send .d2hEnd, .send (.wake true),
+  [.send .d2hBegin, .send (.d2hIssue true), .send .d2hEnd,
+   .send (.wake true), .send (.wake false),
    .send .h2hIssue, .send .sendNext,
    .recv .pushEnd, .recv (.pullReply false), .recv (.h2dDone true)] ++
   (List.range n).flatMap fun l =>

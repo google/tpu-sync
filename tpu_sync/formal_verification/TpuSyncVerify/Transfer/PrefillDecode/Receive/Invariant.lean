@@ -69,15 +69,22 @@ theorem inv_noOpLeak {s : Recv} (h : Inv s) : NoOpLeak s := by
 
 theorem inv_safe {s : Recv} (h : Inv s) : Safe s := by
   have hnl := inv_noOpLeak h
-  obtain ⟨hl, hacc, hc, hr, hy, hi, ha, hok, hdr, _, hpub⟩ := h
+  obtain ⟨hl, hacc, hc, hr, hy, hi, ha, hok, hdr, hpd, hpub⟩ := h
   unfold Accounted at hacc
-  refine ⟨hl.done_idle, ?_, hl.staging, hl.prompt, ?_, hpub, ⟨hc, hr, hy, by omega, ha⟩, hnl⟩
+  refine ⟨hl.done_idle, ?_, hl.staging, hl.prompt, ?_, hpub, ⟨hc, hr, hy, by omega, ha⟩, hnl, ?_⟩
   · intro hd
     have h0 := hl.done_idle hd
     omega
   · rintro ⟨hnet | hcomp, hall⟩
     · unfold networkCompleted at hnet; unfold allH2dDone at hall; omega
     · unfold allH2dDone at hall; omega
+  · intro hp
+    have hd : s.life.done = true := by
+      cases hpb : s.published with
+      | none => exact absurd hpb hp
+      | some b => exact hpd b hpb
+    have h0 := hl.done_idle hd
+    omega
 
 /-- Each event preserves the invariant. One case per event; the `Lifecycle`
 lemmas discharge the settle protocol and `omega` the arithmetic. -/

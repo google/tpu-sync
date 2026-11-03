@@ -59,6 +59,8 @@ ALIASES = {
     "mgr.h": "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h",
     "bt.cc": "tpu_sync/transport/block_transport.cc",
     "bt.h": "tpu_sync/transport/block_transport.h",
+    "bts.cc": "tpu_sync/transport/block_transport_session.cc",
+    "bts.h": "tpu_sync/transport/block_transport_session.h",
     "arena.cc": "tpu_sync/core/staging_arena.cc",
     "arena.h": "tpu_sync/core/staging_arena.h",
     "coord.cc": "tpu_sync/kv_cache/reshard/reshard_coordinator.cc",
@@ -75,13 +77,6 @@ ALIASES = {
     "reg.h": "tpu_sync/kv_cache/reshard/request_block_registry.h",
     "planner.cc": "tpu_sync/kv_cache/reshard/pool_reshard_planner.cc",
     "planner.h": "tpu_sync/kv_cache/reshard/pool_reshard_planner.h",
-    "ctrl.cc": "tpu_sync/core/controller/raiden_controller.cc",
-    "ctrl.h": "tpu_sync/core/controller/raiden_controller.h",
-    "ctrl_test.cc": "tpu_sync/core/controller/raiden_controller_test.cc",
-    "store.cc": "tpu_sync/kv_cache/kv_cache_store.cc",
-    "store.h": "tpu_sync/kv_cache/kv_cache_store.h",
-    "offload.cc": "tpu_sync/kv_cache/host_offload_backend.cc",
-    "offload.h": "tpu_sync/kv_cache/host_offload_backend.h",
     "send_drain_test.cc":
         "tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc",
     "control_test.cc":

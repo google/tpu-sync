@@ -18,8 +18,9 @@ with the transport's block accounting, the readiness predicate
 
 `recv.h`/`recv.cc` are `tpu_sync/kv_cache/transfer_receive_session.{h,cc}`;
 `mgr.cc` is `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `bt.cc` is
-`tpu_sync/transport/block_transport.cc`. Exact line ranges for every symbol,
-sub-block, and test are in the generated `## Source map` table below.
+`tpu_sync/transport/block_transport.cc`; `bts.cc` is
+`tpu_sync/transport/block_transport_session.cc`. Exact line ranges for every
+symbol, sub-block, and test are in the generated `## Source map` table below.
 
 ## State
 
@@ -52,31 +53,35 @@ shard has (`num_completed_shards_ == static_cast<int32_t>(blocks_received_per_sh
 The model keeps the per-layer view: one `netAccount` per layer, which is the
 coarsening A4 justifies. (`TransferReceiveSession::OnRecvNetworkComplete` is a
 second setter of `network_completed_`, reached only through the Peregrine
-receive path of `BlockTransport::CompleteIncomingPush`, which is out of scope;
-see `Transport.lean`.)
+receive path of `BlockTransportServerPushSession::CompleteIncomingPush`, which
+is out of scope; see `Transport.lean`.)
 
 ## Events
 
 | Event          | C++ |
 |----------------|-----|
-| `pushBegin`    | `TryBeginRecvOp` from `hooks.begin_incoming_push`, called in `BlockTransport::HandleIncomingPush` (`BeginIncomingPush`) |
-| `pushEnd`      | `EndRecvOp` from `hooks.end_incoming_push`, called in `BlockTransport::HandleIncomingPush` (`EndIncomingPush`). The hook takes the push's status and, when it is not OK, runs `DeferUnregisterOnSettle(); recv_session->Finish(status)` before `EndRecvOp()` (the transport's `absl::Cleanup end_incoming_push` passes `InternalError("Incoming push failed")` on any early return) — in the model, `cancel` followed by `pushEnd`, see `trace_push_lease_pins_staging_on_cancel` |
+| `pushBegin`    | `TryBeginRecvOp` from `hooks.begin_incoming_push`, called in `BlockTransportServerPushSession::StartStream` (`BeginIncomingPush`; the stream's entry point is `BlockTransport::HandleIncomingPush`, which looks the uuid's push session up and delegates to it) |
+| `pushEnd`      | `EndRecvOp` from `hooks.end_incoming_push`, called in `StartStream` (`EndIncomingPush`). The hook takes the push's status and, when it is not OK, runs `DeferUnregisterOnSettle(); recv_session->Finish(status)` before `EndRecvOp()` (the transport's `absl::Cleanup end_incoming_push` passes `InternalError("Incoming push failed")` on any early return) — in the model, `cancel` followed by `pushEnd`, see `trace_push_lease_pins_staging_on_cancel` |
 | `pullReply ok` | `on_response` of `ExecutePullRequest`: a transport failure keeps its status code, a producer rejection (`response->status != 0`) becomes `FailedPrecondition`; under `mu_` the error runs `FinishLocked(pull_status)` and clears `handshake_pending_ = false`, then the `absl::Cleanup end_op` ends the op. Also the fault-injected `Finish(status); EndRecvOp()` in `StartRead` (`kKvCacheManagerApiStartReadSubmitPull`) |
-| `h2dBegin`     | `ExecuteLayerH2d`, first critical section (`++in_flight_`), from `hooks.on_layer_received` (`BlockTransport::CompleteIncomingPush` → `OnLayerReceived`) |
+| `h2dBegin`     | `ExecuteLayerH2d`, first critical section (`++in_flight_`), from `hooks.on_layer_received` (`BlockTransportServerPushSession::CompleteIncomingPush` → `OnLayerReceived`) |
 | `h2dIssue ok`  | `ExecuteLayerH2d` from the `done_ || draining_` re-check through `H2dSyncDispatch` and `h2d_futures_.push_back(future)` |
 | `h2dReady`     | the device finishes a copy: its future becomes `IsReady()` |
 | `h2dDone ok`   | `ExecuteLayerH2d`'s `future.OnReady` H2D completion callback |
-| `netAccount`   | `OnBlockShardsReceived` via `BlockTransport::HandleIncomingPush` / `KVCacheManagerWithTransfer::OnBlockShardsReceived`: accounts a stream's blocks per shard (`RecordBlockShardsReceivedLocked`), may set `network_completed_`, and finishes the session if every layer is also complete (`RecordNetworkCompleteLocked`) |
+| `netAccount`   | `OnBlockShardsReceived` via `StartStream` / `KVCacheManagerWithTransfer::OnBlockShardsReceived`: accounts a stream's blocks per shard (`RecordBlockShardsReceivedLocked`), may set `network_completed_`, and finishes the session if every layer is also complete (`RecordNetworkCompleteLocked`) |
 | `pollReady`    | `CompleteReadWithDetails` / `CompleteReadRaw` sees `IsReadyToComplete()` and calls `Finish()` |
 | `cancel`       | any `Finish(error)` from outside the session: deadline (`CompleteReadWithDetails`), shutdown (`~KVCacheManagerWithTransfer`), plan unregister (`UnregisterActivePlan`) |
 | `publish`      | `CompleteReadWithDetails` / `CompleteReadRaw` moves a settled session (`session->Done()`) into `done_recving_` or `failed_recving_` by its status and erases it from `active_recv_sessions_` |
 
 ## Lock scopes
 
-Every mutable field of `TransferReceiveSession` is `ABSL_GUARDED_BY(mu_)`;
-`base_`, `uuid_` and `staging_allocator_` are set in the constructor and never
-written again, and they (with `base_` / `manager` configuration getters) are the
-only state an event reads outside `mu_`.
+Every mutable field of `TransferReceiveSession` is `ABSL_GUARDED_BY(mu_)`
+except two that serve the bounded-staging wait below: `staging_layer_manager_`
+(a `StagingLayerManager` with its own `mu_`) and the atomic `cancelled_`, a
+mirror of `draining_` written only by `FinishLocked`
+(`cancelled_.store(true, std::memory_order_relaxed)`). `base_`, `uuid_`,
+`staging_allocator_` and `metrics_collector_` are set in the constructor and
+never written again, and they (with `base_` / `manager` configuration getters)
+are the only other state an event reads outside `mu_`.
 
 | Event          | `mu_` scopes | Between them |
 |----------------|--------------|--------------|
@@ -126,18 +131,54 @@ can land during `CompleteReadWithDetails` between the `GetStatus()` that selects
 outside the model's state; on the modelled fields every interleaving is `cancel`
 before or after `publish`).
 
+**Bounded host layer staging.** The model is the full host mirror, one host
+layer buffer per layer (`KVCacheManagerBase::num_host_layers() == num_layers()`,
+the default; `TPU_RAIDEN_NUM_STAGING_LAYERS` in `ResolveEnvNumStagingLayers`
+bounds it). When fewer buffers than layers exist, a layer's payload is written
+into a buffer leased from the session's `StagingLayerManager`: each chunk's
+`KVCacheManagerBase::GetBlockChunks` (inside the push lease, from
+`StartStream`'s payload loop) calls `hooks.acquire_recv_staging` →
+`TransferReceiveSession::AcquireStagingSlot`, which takes an op
+(`if (done_ || draining_)` refusal, `++in_flight_`, the pattern of
+`TryBeginRecvOp`), waits in `StagingLayerManager::Acquire` until a buffer is
+free, the layer already holds one, the session's `deadline_` passes or
+`cancelled_` is set (`FinishLocked` also calls
+`staging_layer_manager_.Shutdown()` to wake waiters), then under `mu_` fails
+the receive on a timeout (`FinishLocked(slot.status(), kReceivePhase)`),
+returns a lease won by a draining session, and ends the op
+(`EndRecvOpLocked()`). `ExecuteLayerH2d` then reads the leased buffer
+(`staging_layer_manager_.Lookup(layer_idx)`, before its first lock, failing with
+`FailedPrecondition` if the lease is gone) and dispatches with it as
+`host_layer_idx`; the lease is returned on each early return, by the H2D
+callback after its `FinishLocked` (`self->staging_layer_manager_.Release(layer_idx)`),
+and wholesale at settle (`ReleaseAll()` in `ReleaseStagingLocked`). Nothing
+proved here changes under that mode: the extra op is nested inside the push
+lease on the push thread (taken after `pushBegin`, ended before the stream's
+`CompleteIncomingPush`), so `in_flight_` is transiently one higher while
+`pushes > 0` already holds and every settle decision is the one the model
+makes; a timeout, a cancelled wait or a failed `Lookup` fails the stream, which
+is `cancel` before `pushEnd` (the unguarded `cancel` admits it), and a
+`Lookup` can only fail on a draining session (its lease was released by an
+early return or `ReleaseAll`). What the mode adds and this module does not
+model is the buffer recycle itself — a later layer's payload lands in a buffer
+whose earlier layer's copy the device has finished (the lease is released only
+by that copy's callback) — and the liveness of the wait, which is bounded by
+`deadline_`; `Pipeline.lean` keeps one `decodeStaging` cell per layer.
+
 ## Assumptions
 
-* **A1 (one dispatch per layer).** `BlockTransport::CompleteIncomingPush` fires
-  `OnLayerReceived` once per layer (`if (array_complete && !progress.on_layer_received_called)`),
-  so `ExecuteLayerH2d` is entered at most `numLayers` times. Encoded as the
+* **A1 (one dispatch per layer).** `BlockTransportServerPushSession::CompleteIncomingPush`
+  fires `OnLayerReceived` once per layer
+  (`if (array_complete && !progress.on_layer_received_called)`), so
+  `ExecuteLayerH2d` is entered at most `numLayers` times. Encoded as the
   `h2dBegin` guard `issued + pending < numLayers`. The once-latch lives in the
-  `{uuid, layer}` entry of `layer_progress_`, which `CompleteIncomingPush` erases
-  once every layer has been called (`if (all_layers_called)`); A1 therefore also
-  assumes no sender re-pushes a uuid after its entries were retired while the
-  receive is still live. `Transport.lean` models the table and proves A1
-  (`Transport.OnceDispatched`) from exactly that assumption (its A4, honest
-  senders); `Transport.trace_dup_after_retirement` is the re-push.
+  layer's entry of the uuid's push-session table `layer_progress_`, which
+  `CompleteIncomingPush` clears once every layer has been called
+  (`if (all_layers_called)`); A1 therefore also assumes no sender re-pushes a
+  uuid after its entries were retired while the receive is still live.
+  `Transport.lean` models the table and proves A1 (`Transport.OnceDispatched`)
+  from exactly that assumption (its A4, honest senders);
+  `Transport.trace_dup_after_retirement` is the re-push.
 * **A2 (registration).** The session has blocks to receive and is registered.
   `ReleaseStaging()` is only called from outside on registration failure:
   in `RegisterActivePlan` and `StartRead` when `EmplaceRecvSessionLocked` fails
@@ -152,10 +193,12 @@ before or after `publish`).
   underflows: `h2dDone` is only enabled while a callback is outstanding,
   `pushEnd` only while a push is open.
 * **A4 (transport ordering).** For the request that completes a layer,
-  `HandleIncomingPush` (dispatched from `HandleCustomRequest`) calls
-  `CompleteIncomingPush` → `OnLayerReceived` before `OnBlockShardsReceived`, on
-  the same thread, and `ExecuteLayerH2d` pushes the future into `h2d_futures_`
-  (`h2d_futures_.push_back(future)`) before returning. A layer's blocks are
+  `BlockTransportServerPushSession::StartStream` (reached from
+  `BlockTransport::HandleIncomingPush`, dispatched from `HandleCustomRequest`)
+  calls `CompleteIncomingPush` → `OnLayerReceived` before
+  `OnBlockShardsReceived`, on the same thread, and `ExecuteLayerH2d` pushes the
+  future into `h2d_futures_` (`h2d_futures_.push_back(future)`) before
+  returning. A layer's blocks are
   accounted as one event once its copy is issued: guard
   `layersAccounted < issued`. With several streams per layer (several senders,
   or one sender's push split by source NUMA node into shard groups, each stream
@@ -218,74 +261,83 @@ Generated by `tools/resolve_anchors.py`.
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `recv.h` | `TransferReceiveSession::Done` | `:86-89` |
-| `recv.h` | `TransferReceiveSession::GetStatus` | `:93-96` |
-| `recv.h` | `TransferReceiveSession::IsDraining` | `:103-106` |
-| `recv.h` | `TransferReceiveSession::TryBeginRecvOp` | `:117-122` |
-| `recv.h` | `TransferReceiveSession::req_id` | `:165-168` |
-| `recv.h` | `TransferReceiveSession::deadline` | `:173-176` |
-| `recv.h` | `TransferReceiveSession` (`std::vector<int64_t> blocks_received_per_shard_` .. `std::vector<raiden::PjRtCopyFuture> h2d_futures_`) | `:281-304` |
-| `recv.h` | `TransferReceiveSession` (`mutable absl::Mutex mu_;` .. `uint64_t plan_generation_ ABSL_GUARDED_BY(mu_) = 0;`) | `:266-313` |
-| `recv.cc` | `TransferReceiveSession::InitFromActivePlan` | `:136-206` |
-| `recv.cc` | `TransferReceiveSession::InitFromLoadPlan` | `:326-346` |
-| `recv.cc` | `TransferReceiveSession::ReleaseStaging` | `:352-355` |
-| `recv.cc` | `TransferReceiveSession::FinishLocked` | `:357-370` |
-| `recv.cc` | `TransferReceiveSession::FinishLocked` (`if (!status.ok() && status_.ok())`) | `:359-362` |
-| `recv.cc` | `TransferReceiveSession::Finish` | `:372-375` |
-| `recv.cc` | `TransferReceiveSession::Details` | `:383-399` |
-| `recv.cc` | `TransferReceiveSession::CurrentPhaseLocked` | `:401-404` |
-| `recv.cc` | `TransferReceiveSession::EndRecvOpLocked` | `:406-417` |
-| `recv.cc` | `TransferReceiveSession::EndRecvOp` | `:419-422` |
-| `recv.cc` | `TransferReceiveSession::DeferUnregisterOnSettle` | `:424-431` |
-| `recv.cc` | `TransferReceiveSession::TakePendingUnregister` | `:433-441` |
-| `recv.cc` | `TransferReceiveSession::AllH2dDoneLocked` | `:443-448` |
-| `recv.cc` | `TransferReceiveSession::IsReadyToComplete` | `:450-456` |
-| `recv.cc` | `TransferReceiveSession::RecordBlockShardsReceivedLocked` | `:465-492` |
-| `recv.cc` | `TransferReceiveSession::RecordNetworkCompleteLocked` | `:494-512` |
-| `recv.cc` | `TransferReceiveSession::ExecutePullRequest` | `:514-590` |
-| `recv.cc` | `TransferReceiveSession::ExecutePullRequest` (`auto on_response =`) | `:536-572` |
-| `recv.cc` | `TransferReceiveSession::ExecutePullRequest` (`absl::Cleanup end_op`) | `:538` |
-| `recv.cc` | `TransferReceiveSession::ExecutePullRequest` (`absl::MutexLock lock(self->mu_);` .. `self->handshake_pending_ = false;`) | `:567-571` |
-| `recv.cc` | `TransferReceiveSession::OnRecvNetworkComplete` | `:608-620` |
-| `recv.cc` | `TransferReceiveSession::OnBlockShardsReceived` | `:622-670` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:672-793` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`++in_flight_;` .. `trigger_enqueue = true;`) | `:682-687` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`// The receive may have been finished` .. `h2d_futures_.push_back(future);`) | `:699-728` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`if (!future_or.ok())`) | `:718-723` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`future.OnReady`) | `:732-790` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`absl::Cleanup end_op`) | `:741` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`absl::MutexLock lock(self->mu_);` .. `should_unregister = true;`) | `:747-773` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`if (should_unregister && !manager.IsShuttingDown())`) | `:787-789` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.on_layer_received =`) | `:163-179` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.begin_incoming_push =`) | `:224-249` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.end_incoming_push =`) | `:250-296` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : active_recv_sessions_)`) | `:405-409` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::EmplaceRecvSessionLocked` | `:535-551` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::RegisterActivePlan` | `:553-641` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:741-778` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` (`if (recv != nullptr)`) | `:765-771` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterSettledPlan` | `:780-796` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::MaybeUnregisterSettledRecv` | `:798-804` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:874-978` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_recv_sessions_.begin();`) | `:1035-1066` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`// Reclaim recv sessions whose transfer never completed` .. `absl::DeadlineExceededError("Receive session timed out"));`) | `:1031-1050` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`absl::DeadlineExceededError("Receive session timed out"));` .. `active_recv_sessions_.erase(it++);`) | `:1050-1062` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::OnBlockShardsReceived` | `:1497-1521` |
-| `bt.cc` | `BlockTransport::HandleCustomRequest` | `:471-494` |
-| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:496-639` |
-| `bt.cc` | `BlockTransport::CompleteIncomingPush` | `:691-887` |
-| `send_drain_test.cc` | `RecvLifecycleTest.DetailsSayAReceiveTimedOutWaitingForData` | `:636-649` |
-| `send_drain_test.cc` | `RecvLifecycleTest.DetailsSayAFailedUploadFailedInH2dWhileDataArrives` | `:651-665` |
-| `send_drain_test.cc` | `RecvLifecycleTest.SingleFailedH2dReportsFailureAndReturnsStaging` | `:725-736` |
-| `send_drain_test.cc` | `RecvLifecycleTest.NetworkCompletionWaitsForH2d` | `:599-617` |
-| `send_drain_test.cc` | `RecvLifecycleTest.LateBlockAccountingAfterRetirementIsANoOp` | `:680-702` |
-| `send_drain_test.cc` | `RecvLifecycleTest.ReceiveWithoutTrafficFailsAtItsDeadline` | `:738-749` |
-| `send_drain_test.cc` | `RecvDrainTest.ExpiredReceiveKeepsStagingUntilH2dEnds` | `:751-778` |
-| `send_drain_test.cc` | `RecvDrainTest.FailedLayerWaitsForOtherH2dCopies` | `:831-857` |
-| `send_drain_test.cc` | `RecvDrainTest.TimeoutDuringH2dDispatchKeepsStaging` | `:859-895` |
-| `send_drain_test.cc` | `RecvLifecycleTest.IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining` | `:948-971` |
-| `send_drain_test.cc` | `RecvLifecycleTest.IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing` | `:973-1000` |
-| `send_drain_test.cc` | `RecvLifecycleTest.FailedIncomingPushImmediatelyFailsSessionAndReleasesStagingBeforeDeadline` | `:1002-1030` |
+| `recv.h` | `TransferReceiveSession::Done` | `:90-93` |
+| `recv.h` | `TransferReceiveSession::GetStatus` | `:97-100` |
+| `recv.h` | `TransferReceiveSession::IsDraining` | `:107-110` |
+| `recv.h` | `TransferReceiveSession::TryBeginRecvOp` | `:121-126` |
+| `recv.h` | `TransferReceiveSession::req_id` | `:181-184` |
+| `recv.h` | `TransferReceiveSession::deadline` | `:189-192` |
+| `recv.h` | `TransferReceiveSession` (`std::vector<int64_t> blocks_received_per_shard_` .. `std::vector<raiden::PjRtCopyFuture> h2d_futures_`) | `:308-331` |
+| `recv.h` | `TransferReceiveSession` (`mutable absl::Mutex mu_;` .. `std::atomic<bool> cancelled_{false};`) | `:292-345` |
+| `recv.h` | `TransferReceiveSession` (`absl::StatusOr<size_t> AcquireStagingSlot(size_t layer_idx);`) | `:175` |
+| `recv.cc` | `TransferReceiveSession::InitFromActivePlan` | `:227-297` |
+| `recv.cc` | `TransferReceiveSession::InitFromLoadPlan` | `:417-437` |
+| `recv.cc` | `TransferReceiveSession::ReleaseStaging` | `:444-447` |
+| `recv.cc` | `TransferReceiveSession::FinishLocked` | `:449-464` |
+| `recv.cc` | `TransferReceiveSession::FinishLocked` (`if (!status.ok() && status_.ok())`) | `:451-454` |
+| `recv.cc` | `TransferReceiveSession::Finish` | `:466-469` |
+| `recv.cc` | `TransferReceiveSession::Details` | `:477-493` |
+| `recv.cc` | `TransferReceiveSession::CurrentPhaseLocked` | `:495-498` |
+| `recv.cc` | `TransferReceiveSession::EndRecvOpLocked` | `:500-511` |
+| `recv.cc` | `TransferReceiveSession::EndRecvOp` | `:513-516` |
+| `recv.cc` | `TransferReceiveSession::DeferUnregisterOnSettle` | `:518-525` |
+| `recv.cc` | `TransferReceiveSession::TakePendingUnregister` | `:527-535` |
+| `recv.cc` | `TransferReceiveSession::AllH2dDoneLocked` | `:537-542` |
+| `recv.cc` | `TransferReceiveSession::IsReadyToComplete` | `:544-550` |
+| `recv.cc` | `TransferReceiveSession::RecordBlockShardsReceivedLocked` | `:559-586` |
+| `recv.cc` | `TransferReceiveSession::RecordNetworkCompleteLocked` | `:588-605` |
+| `recv.cc` | `TransferReceiveSession::ExecutePullRequest` | `:607-683` |
+| `recv.cc` | `TransferReceiveSession::ExecutePullRequest` (`auto on_response =`) | `:629-665` |
+| `recv.cc` | `TransferReceiveSession::ExecutePullRequest` (`absl::Cleanup end_op`) | `:631` |
+| `recv.cc` | `TransferReceiveSession::ExecutePullRequest` (`absl::MutexLock lock(self->mu_);` .. `self->handshake_pending_ = false;`) | `:660-664` |
+| `recv.cc` | `TransferReceiveSession::OnRecvNetworkComplete` | `:699-709` |
+| `recv.cc` | `TransferReceiveSession::OnBlockShardsReceived` | `:711-758` |
+| `recv.cc` | `TransferReceiveSession::AcquireStagingSlot` | `:760-784` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:786-925` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`std::optional<size_t> slot = staging_layer_manager_.Lookup(layer_idx);`) | `:793` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`++in_flight_;` .. `trigger_enqueue = true;`) | `:809-814` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`// The receive may have been finished` .. `h2d_futures_.push_back(future);`) | `:826-858` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`if (!future_or.ok())`) | `:847-853` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`future.OnReady`) | `:862-922` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`absl::Cleanup end_op`) | `:869` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`absl::MutexLock lock(self->mu_);` .. `should_unregister = true;`) | `:875-901` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`if (should_unregister && !manager.IsShuttingDown())`) | `:919-921` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.on_layer_received =`) | `:303-319` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.begin_incoming_push =`) | `:364-389` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.end_incoming_push =`) | `:390-436` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer` (`for (const auto& [uuid, session] : active_recv_sessions_)`) | `:573-577` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::EmplaceRecvSessionLocked` | `:703-719` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::RegisterActivePlan` | `:721-809` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` | `:912-949` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterActivePlan` (`if (recv != nullptr)`) | `:936-942` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::UnregisterSettledPlan` | `:951-967` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::MaybeUnregisterSettledRecv` | `:969-975` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:1045-1149` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_recv_sessions_.begin();`) | `:1207-1238` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`// Reclaim recv sessions whose transfer never completed` .. `absl::DeadlineExceededError("Receive session timed out"));`) | `:1203-1222` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`absl::DeadlineExceededError("Receive session timed out"));` .. `active_recv_sessions_.erase(it++);`) | `:1222-1234` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::OnBlockShardsReceived` | `:1668-1692` |
+| `bt.cc` | `BlockTransport::HandleCustomRequest` | `:418-441` |
+| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:458-463` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` | `:321-455` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:506-702` |
+| `base.cc` | `*` (`size_t ResolveEnvNumStagingLayers(size_t num_layers) {` .. `return requested;`) | `:420-429` |
+| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`slot = transfer_hooks_.acquire_recv_staging(uuid, layer_idx);`) | `:3346` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.acquire_recv_staging =`) | `:461-474` |
+| `send_drain_test.cc` | `RecvLifecycleTest.DetailsSayAReceiveTimedOutWaitingForData` | `:821-834` |
+| `send_drain_test.cc` | `RecvLifecycleTest.DetailsSayAFailedUploadFailedInH2dWhileDataArrives` | `:836-850` |
+| `send_drain_test.cc` | `RecvLifecycleTest.SingleFailedH2dReportsFailureAndReturnsStaging` | `:910-921` |
+| `send_drain_test.cc` | `RecvLifecycleTest.NetworkCompletionWaitsForH2d` | `:784-802` |
+| `send_drain_test.cc` | `RecvLifecycleTest.LateBlockAccountingAfterRetirementIsANoOp` | `:865-887` |
+| `send_drain_test.cc` | `RecvLifecycleTest.ReceiveWithoutTrafficFailsAtItsDeadline` | `:923-934` |
+| `send_drain_test.cc` | `RecvDrainTest.ExpiredReceiveKeepsStagingUntilH2dEnds` | `:936-963` |
+| `send_drain_test.cc` | `RecvDrainTest.FailedLayerWaitsForOtherH2dCopies` | `:1016-1042` |
+| `send_drain_test.cc` | `RecvDrainTest.TimeoutDuringH2dDispatchKeepsStaging` | `:1044-1080` |
+| `send_drain_test.cc` | `RecvLifecycleTest.IncomingPushLeasePinsStagingDuringWriteAndRejectsWhenDraining` | `:1133-1156` |
+| `send_drain_test.cc` | `RecvLifecycleTest.IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing` | `:1158-1185` |
+| `send_drain_test.cc` | `RecvLifecycleTest.FailedIncomingPushImmediatelyFailsSessionAndReleasesStagingBeforeDeadline` | `:1187-1215` |
+| `send_drain_test.cc` | `RecvLifecycleTest.StagingLayerManagerCyclesHostLayerBuffers` | `:1285-1370` |
+| `send_drain_test.cc` | `RecvLifecycleTest.StagingLayerManagerReleasesAllResourcesAcrossFailureModes` | `:1372-1480` |
 | `control_test.cc` | `ControlHandshakeTest.ExpiredReceiveKeepsStagingUntilHandshakeEnds` | `:795-835` |
 | `control_test.cc` | `ControlHandshakeTest.RejectedPullReportsWhyAndWhichProducerRejectedIt` | `:849-867` |
 | `control_test.cc` | `ControlHandshakeTest.RefusedConnectionKeepsItsStatusCode` | `:869-894` |

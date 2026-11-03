@@ -135,8 +135,9 @@ theorem trace_push_lease_pins_staging_on_cancel :
   decide
 
 /-- `RecvLifecycleTest.IncomingPushLeaseSpansLayerH2dAndBlockAccountingBeforeReleasing`:
-even if the H2D copy and its callback finish inside `HandleIncomingPush` before
-`EndIncomingPush` runs, the open push lease (`pushes = 1`) keeps `done = false`
+even if the H2D copy and its callback finish inside the push stream
+(`BlockTransportServerPushSession::StartStream`) before `EndIncomingPush`
+runs, the open push lease (`pushes = 1`) keeps `done = false`
 and `hasStaging = true` until `pushEnd`. -/
 theorem trace_push_lease_outlives_h2d :
     let pre := [.pushBegin, .h2dBegin, .h2dIssue true, .h2dReady, .h2dDone true]
@@ -170,7 +171,7 @@ def events : List Ev :=
    .netAccount, .pollReady, .cancel, .publish]
 
 instance (s : Recv) : Decidable (Safe s) := by
-  unfold Safe SettleSafe NoRetiredCallback StagingIntegrity SettlesPromptly ReadinessSound Publication CountersOrdered NoOpLeak
+  unfold Safe SettleSafe NoRetiredCallback StagingIntegrity SettlesPromptly ReadinessSound Publication CountersOrdered NoOpLeak PublishedQuiet
   infer_instance
 
 /-- Executable negation of `Safe`, by construction: the bounded searches and the

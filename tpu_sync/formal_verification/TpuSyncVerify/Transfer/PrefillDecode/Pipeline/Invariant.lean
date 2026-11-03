@@ -50,8 +50,10 @@ structure Inv (s : Pipeline) : Prop where
   d2hReady_lt : ∀ l : Nat, s.d2hReadyL[l]? = some true → l < s.send.d2hIssued
   /-- The per-layer record of retired H2H pushes agrees with the send's counter. -/
   cnt_h2hRetired : countTrue s.h2hRetiredL = s.send.h2hRetired
-  /-- `SendNextLayer(l)`'s callback has run only for layers whose copy finished. -/
-  woken_d2hReady : ∀ l : Nat, l < s.send.woken → s.d2hReadyL[l]? = some true
+  /-- `SendNextLayer(l)`'s callback has run for an issued layer only after that
+  layer's copy finished (unissued layers are resolved with an error by
+  `fail_unissued_layers` once the D2H loop has exited). -/
+  woken_d2hReady : ∀ l : Nat, l < s.send.woken → l < s.send.d2hIssued → s.d2hReadyL[l]? = some true
   /-- While the send holds its staging, every finished copy's layer is there. -/
   pstaging_good : s.send.life.done = false →
     ∀ l : Nat, s.d2hReadyL[l]? = some true → s.prefillStaging[l]? = some (.kv l)
@@ -149,7 +151,11 @@ theorem inv_noOpLeak {s : Pipeline} (h : Inv s) : NoOpLeak s := by
     by_cases hp : s.send.d2hPending = true
     · refine ⟨.send (.d2hIssue true), by simp [drainEvents], ?_⟩
       simp [step, sendStep, Send.step, Send.d2hIssue, hp]
-    · by_cases hrd : s.send.d2hReady < s.send.d2hIssued
+    · have hp' : s.send.d2hPending = false := by
+        cases hq : s.send.d2hPending
+        · rfl
+        · exact absurd hq hp
+      by_cases hrd : s.send.d2hReady < s.send.d2hIssued
       · have hk : s.send.d2hIssued ≤ s.d2hReadyL.length := by
           rw [h.len_d2hReadyL, ← h.n_send]; omega
         obtain ⟨l, hl, hf⟩ := exists_false_lt hk (by rw [h.cnt_d2hReady]; exact hrd)
@@ -160,16 +166,28 @@ theorem inv_noOpLeak {s : Pipeline} (h : Inv s) : NoOpLeak s := by
         · refine ⟨.send .d2hEnd, by simp [drainEvents], ?_⟩
           simp [step, sendStep, Send.step, Send.d2hEnd, hret]
         · by_cases hwk : s.send.woken < s.send.queued
-          · have hwr : s.send.woken < s.send.d2hReady := by omega
-            have hwi : s.send.woken < s.send.d2hIssued := by omega
-            have hready_eq : s.send.d2hIssued ≤ countTrue s.d2hReadyL := by
-              rw [h.cnt_d2hReady]; omega
-            have hwl : s.d2hReadyL[s.send.woken]? = some true :=
-              all_true_lt_of_countTrue h.d2hReady_lt hready_eq s.send.woken hwi
-            refine ⟨.send (.wake true), by simp [drainEvents], ?_⟩
-            simp only [step, sendStep, hwl, ↓reduceIte, Send.step, Send.wake, hwk, hwr,
-              and_self, Bool.true_eq_false]
-            split <;> rfl
+          · by_cases hwi : s.send.woken < s.send.d2hIssued
+            · have hwr : s.send.woken < s.send.d2hReady := by omega
+              have hready_eq : s.send.d2hIssued ≤ countTrue s.d2hReadyL := by
+                rw [h.cnt_d2hReady]; omega
+              have hwl : s.d2hReadyL[s.send.woken]? = some true :=
+                all_true_lt_of_countTrue h.d2hReady_lt hready_eq s.send.woken hwi
+              refine ⟨.send (.wake true), by simp [drainEvents], ?_⟩
+              simp only [step, sendStep, hwl, true_or, ↓reduceIte, Send.step, Send.wake, hwk, hwr,
+                and_self, Bool.true_eq_false]
+              split <;> rfl
+            · have hle : s.send.d2hIssued ≤ s.send.woken := by omega
+              cases hdr : s.send.life.draining
+              · have hst : s.send.started = true := h.send.queued_started (by omega)
+                have hnd : s.send.life.done = false := by
+                  cases hd : s.send.life.done
+                  · rfl
+                  · have := h.send.life.done_draining hd; rw [hdr] at this; cases this
+                have hlt : s.send.d2hIssued < s.send.numLayers := by omega
+                refine ⟨.send .d2hBegin, by simp [drainEvents], ?_⟩
+                simp [step, sendStep, Send.step, Send.d2hBegin, hst, hp', hlt, Lifecycle.beginOp, hdr, hnd]
+              · refine ⟨.send (.wake false), by simp [drainEvents], ?_⟩
+                simp [step, sendStep, Send.step, Send.wake, hwk, hdr, hp', hle]
           · by_cases hpool : 0 < s.send.pooled
             · have hne : s.send.pooled ≠ 0 := by omega
               refine ⟨.send .h2hIssue, by simp [drainEvents], ?_⟩
@@ -286,10 +304,10 @@ theorem inv_safe {s : Pipeline} (h : Inv s) : Safe s := by
 /-! ### Preservation, one lemma per kind of effect -/
 
 /-- A send event that updates `send`, `h2hRetiredL`, and `wire`, given that the
-layers `SendNextLayer` has consumed afterwards all have their copy finished. -/
+issued layers `SendNextLayer` has consumed afterwards all have their copy finished. -/
 theorem Inv.send_wire_frame {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s)
     (hs : Send.step s.send e = some snd) (he : e ≠ .d2hReady) (he_bp : e ≠ .beginPull)
-    (hw : ∀ l < snd.woken, s.d2hReadyL[l]? = some true) (x : List Bool)
+    (hw : ∀ l < snd.woken, l < snd.d2hIssued → s.d2hReadyL[l]? = some true) (x : List Bool)
     (hxlen : x.length = s.numLayers) (hxcnt : countTrue x = snd.h2hRetired)
     (w : List Cell) (hwlen : w.length = s.numLayers)
     (hwgood : ∀ (k : Nat) (c : Cell), w[k]? = some c → c = .blank ∨ c = .kv k) :
@@ -317,7 +335,7 @@ theorem Inv.send_wire_frame {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s
 /-- A send event that moves no memory. -/
 theorem Inv.send_frame {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s)
     (hs : Send.step s.send e = some snd) (he : e ≠ .d2hReady) (he_bp : e ≠ .beginPull)
-    (hw : ∀ l < snd.woken, s.d2hReadyL[l]? = some true) (x : List Bool)
+    (hw : ∀ l < snd.woken, l < snd.d2hIssued → s.d2hReadyL[l]? = some true) (x : List Bool)
     (hxlen : x.length = s.numLayers) (hxcnt : countTrue x = snd.h2hRetired) :
     Inv { s with send := snd, h2hRetiredL := x } :=
   h.send_wire_frame hs he he_bp hw x hxlen hxcnt s.wire h.len_wire h.wire_good
@@ -369,9 +387,9 @@ theorem Inv.send_d2hReady {s : Pipeline} {snd : Send} {l : Nat} (h : Inv s)
     rcases mem_of_set_true hj with rfl | hj
     · exact hl
     · exact h.d2hReady_lt j hj
-  · show ∀ j < s.send.woken, (s.d2hReadyL.set l true)[j]? = some true
-    intro j hj
-    exact set_true_of_mem hf (h.woken_d2hReady j hj)
+  · show ∀ j < s.send.woken, j < s.send.d2hIssued → (s.d2hReadyL.set l true)[j]? = some true
+    intro j hj hji
+    exact set_true_of_mem hf (h.woken_d2hReady j hj hji)
   · show _ → ∀ j : Nat, (s.d2hReadyL.set l true)[j]? = some true →
       (s.prefillStaging.set l (.kv l))[j]? = some (.kv j)
     intro _ j hj
@@ -383,7 +401,7 @@ theorem Inv.send_d2hReady {s : Pipeline} {snd : Send} {l : Nat} (h : Inv s)
 theorem Inv.send_h2hDone {s : Pipeline} {snd : Send} {l : Nat} (h : Inv s)
     (hl : l < s.send.h2hIssued) (hf : s.h2hRetiredL[l]? = some false)
     (hs : Send.step s.send (.h2hDone true) = some snd)
-    (hw : ∀ l' < snd.woken, s.d2hReadyL[l']? = some true) :
+    (hw : ∀ l' < snd.woken, l' < snd.d2hIssued → s.d2hReadyL[l']? = some true) :
     Inv { s with send := snd, h2hRetiredL := s.h2hRetiredL.set l true,
                  wire := s.wire.set l (s.prefillStaging.getD l .junk) } := by
   have hlt := Send.h2hDone_guard hs
@@ -391,7 +409,7 @@ theorem Inv.send_h2hDone {s : Pipeline} {snd : Send} {l : Nat} (h : Inv s)
   unfold Send.CountersOrdered at hcnt
   have hd : s.send.life.done = false := send_not_done_of_outstanding h.send (Or.inr hlt)
   have hk : l < s.numLayers := by have := h.n_send; omega
-  have hdl : s.d2hReadyL[l]? = some true := h.woken_d2hReady l (by omega)
+  have hdl : s.d2hReadyL[l]? = some true := h.woken_d2hReady l (by omega) (by omega)
   have hsrc : s.prefillStaging.getD l .junk = .kv l := by
     rw [List.getD_eq_getElem?_getD, h.pstaging_good hd l hdl]; rfl
   rw [hsrc]
@@ -523,23 +541,42 @@ theorem Inv.env_frame {s : Pipeline} (h : Inv s)
    h.cnt_h2dIssued, hdstg, h.cnt_h2dReady, h.dhbm_good,
    h.pullStarted_registered, h.pullWaiting_state⟩
 
-/-- Layers `SendNextLayer` has consumed after a `wake`: the ones before, plus
-the one the guard checked. -/
+/-- Issued layers `SendNextLayer` has consumed after a `wake`: the ones before,
+plus layer `woken` when it was issued (an unissued layer has `d2hIssued ≤ woken`). -/
 theorem woken_after_wake {s : Pipeline} {snd : Send} {ok : Bool} (h : Inv s)
     (hs : Send.step s.send (.wake ok) = some snd)
-    (hg : s.d2hReadyL[s.send.woken]? = some true) :
-    ∀ l < snd.woken, s.d2hReadyL[l]? = some true := by
-  rw [Send.wake_woken hs]
-  intro l hl
+    (hg : s.d2hReadyL[s.send.woken]? = some true ∨
+      (ok = false ∧ s.send.life.draining = true ∧
+        s.send.d2hPending = false ∧ s.send.d2hIssued ≤ s.send.woken)) :
+    ∀ l < snd.woken, l < snd.d2hIssued → s.d2hReadyL[l]? = some true := by
+  rw [Send.wake_woken hs, Send.step_d2hIssued_of_ne_d2hIssue hs nofun]
+  intro l hl hli
   rcases Nat.lt_succ_iff_lt_or_eq.mp hl with hl | rfl
-  · exact h.woken_d2hReady l hl
-  · exact hg
+  · exact h.woken_d2hReady l hl hli
+  · rcases hg with hd2h | ⟨_, _, _, hle⟩
+    · exact hd2h
+    · omega
 
-/-- Layers `SendNextLayer` has consumed after any other send event: unchanged. -/
+/-- Issued layers `SendNextLayer` has consumed after any other send event: unchanged
+(`d2hIssue` only runs with `d2hPending = true`, when `woken ≤ d2hIssued`). -/
 theorem woken_after_other {s : Pipeline} {snd : Send} {e : Send.Ev} (h : Inv s)
     (hs : Send.step s.send e = some snd) (he : ∀ ok, e ≠ .wake ok) :
-    ∀ l < snd.woken, s.d2hReadyL[l]? = some true := by
-  rw [Send.step_woken hs he]; exact h.woken_d2hReady
+    ∀ l < snd.woken, l < snd.d2hIssued → s.d2hReadyL[l]? = some true := by
+  rw [Send.step_woken hs he]
+  intro l hl hli
+  match e with
+  | .d2hIssue ok =>
+    obtain ⟨hp, _⟩ := Send.d2hIssue_spec hs
+    have hwle : s.send.woken ≤ s.send.d2hIssued := by
+      refine Nat.le_of_not_lt fun hlt => ?_
+      have := (h.send.woken_issued hlt).2
+      rw [hp] at this; cases this
+    exact h.woken_d2hReady l hl (Nat.lt_of_lt_of_le hl hwle)
+  | .beginPull | .start | .d2hBegin | .d2hReady | .d2hEnd | .h2hIssue
+  | .sendNext | .h2hDone _ | .cancel | .publish =>
+    rw [Send.step_d2hIssued_of_ne_d2hIssue hs nofun] at hli
+    exact h.woken_d2hReady l hl hli
+  | .wake ok => exact absurd rfl (he ok)
 
 theorem step_inv {s s' : Pipeline} {e : Ev} (h : Inv s) (hs : step s e = some s') : Inv s' := by
   cases e with

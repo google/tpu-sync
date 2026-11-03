@@ -48,9 +48,13 @@ theorem drain_step {s : Send} (h : Inv s) (hdr : s.life.draining = true)
   unfold CountersOrdered at hcnt
   by_cases hp : s.d2hPending = true
   · have hs₁ : step s (.d2hIssue true) = some { s with d2hPending := false, d2hIssued := s.d2hIssued + 1 } := by
-      simp [step, d2hIssue, hp, trySendNext_of_draining (s := { s with d2hPending := false, d2hIssued := s.d2hIssued + 1 }) hdr]
+      simp [step, d2hIssue, hp]
     exact ⟨.d2hIssue true, _, hs₁, by simp [hdr], by simp [drainRank, hp]; omega⟩
-  · by_cases hrd : s.d2hReady < s.d2hIssued
+  · have hp' : s.d2hPending = false := by
+      cases hq : s.d2hPending
+      · rfl
+      · exact absurd hq hp
+    by_cases hrd : s.d2hReady < s.d2hIssued
     · have hs₁ : step s .d2hReady = some { s with d2hReady := s.d2hReady + 1 } := by
         simp [step, markD2hReady, hrd]
       exact ⟨.d2hReady, _, hs₁, by simp [hdr], by simp [drainRank]; omega⟩
@@ -59,10 +63,16 @@ theorem drain_step {s : Send} (h : Inv s) (hdr : s.life.draining = true)
           simp [step, d2hEnd, hret]
         exact ⟨.d2hEnd, _, hs₁, by simp [hdr], by rw [drainRank_endOp]; simp [drainRank]; omega⟩
       · by_cases hwk : s.woken < s.queued
-        · have hwr : s.woken < s.d2hReady := by omega
-          have hs₁ : step s (.wake true) = some { s with woken := s.woken + 1 }.endOp := by
-            simp [step, wake, hwk, hwr, hdr]
-          exact ⟨.wake true, _, hs₁, by simp [hdr], by rw [drainRank_endOp]; simp [drainRank]; omega⟩
+        · by_cases hwr : s.woken < s.d2hReady
+          · have hs₁ : step s (.wake true) = some { s with woken := s.woken + 1 }.endOp := by
+              simp [step, wake, hwk, hwr, hdr]
+            exact ⟨.wake true, _, hs₁, by simp [hdr], by rw [drainRank_endOp]; simp [drainRank]; omega⟩
+          · -- layer `woken` was never issued: `fail_unissued_layers` resolved its promise
+            have hle : s.d2hIssued ≤ s.woken := by omega
+            have hs₁ : step s (.wake false) = some ({ s with woken := s.woken + 1 }.finish false).endOp := by
+              simp [step, wake, hwk, hwr, hdr, hp', hle]
+            rw [finish_of_draining false (s := { s with woken := s.woken + 1 }) hdr] at hs₁
+            exact ⟨.wake false, _, hs₁, by simp [hdr], by rw [drainRank_endOp]; simp [drainRank]; omega⟩
         · by_cases hpool : 0 < s.pooled
           · have hs₁ : step s .h2hIssue = some { s with pooled := s.pooled - 1 }.endOp := by
               simp [step, h2hIssue, Lifecycle.beginOp_of_draining hdr]; omega
@@ -73,7 +83,7 @@ theorem drain_step {s : Send} (h : Inv s) (hdr : s.life.draining = true)
                 omega
               exact ⟨.sendNext, _, hs₁, by simp [hdr], by rw [drainRank_endOp]; simp [drainRank]; omega⟩
             · have hh2h : s.h2hRetired < s.h2hIssued := by
-                cases hdp : s.d2hPending <;> simp_all <;> omega
+                simp [hp'] at hacc; omega
               have hs₁ : step s (.h2hDone true) =
                   some { s with h2hRetired := s.h2hRetired + 1, h2hOk := s.h2hOk + 1 }.endOp := by
                 simp [step, h2hDone, hh2h,

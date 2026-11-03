@@ -488,7 +488,7 @@ theorem step_inv {s s' : BlockPipeline} {e : Pipeline.Ev}
           · rfl
           · have := h.pstg_reseated_done hpr; rw [hd] at this; cases this
         have hk : l < s.pipe.numLayers := by have := h.pipe.n_send; omega
-        have hdl : s.pipe.d2hReadyL[l]? = some true := h.pipe.woken_d2hReady l (by omega)
+        have hdl : s.pipe.d2hReadyL[l]? = some true := h.pipe.woken_d2hReady l (by omega) (by omega)
         have hsrc : s.prefillStagingB.getD l [] = d2hStage l s.numBlocks s.plan := by
           rw [List.getD_eq_getElem?_getD, h.pstagingB_good hnpr l hdl]; rfl
         rw [hsrc]

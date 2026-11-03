@@ -11,7 +11,9 @@ concurrently and recycle the four memories (`prefillHbm`, `prefillStaging`,
 - **Host staging (`prefillStaging`, `decodeStaging`)** is owned by TPU Sync's
   `StagingBlockAllocator` and is returned to the pool by `Lifecycle.settleLocked`
   (`ReleaseStagingBlocksLocked` / `ReleaseStagingLocked` in `FinishLocked` and
-  `EndSendOpLocked` / `EndRecvOpLocked`) as soon as each session settles
+  `EndSendOpLocked` / `EndRecvOpLocked`, which also return any host layer
+  buffer leases a bounded-staging session still holds,
+  `staging_layer_manager_.ReleaseAll()`) as soon as each session settles
   (`hasStaging = false`).
 - **TPU HBM (`prefillHbm`, `decodeHbm`)** is owned by the serving engines and
   is handed back to the caller when `poll_stats()` publishes the session
@@ -57,11 +59,11 @@ request `idx`:
 | `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::Acquire` | `:514-518` |
 | `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::ReleaseSlot` | `:571-577` |
 | `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::ReleaseDynamicBlocks` | `:579-587` |
-| `tpu_sync/kv_cache/transfer_send_session.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:183-186` |
-| `tpu_sync/kv_cache/transfer_receive_session.cc` | `TransferReceiveSession::ReleaseStagingLocked` | `:348-350` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:486-533` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:874-978` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:980-1121` |
+| `tpu_sync/kv_cache/transfer_send_session.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:186-190` |
+| `tpu_sync/kv_cache/transfer_receive_session.cc` | `TransferReceiveSession::ReleaseStagingLocked` | `:439-442` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:654-701` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:1045-1149` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:1151-1292` |
 <!-- source-map:end -->
 -/
 

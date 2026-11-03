@@ -22,7 +22,7 @@ structure Recv where
   pullPending : Bool := false
   pending : Nat := 0
   retired : Nat := 0
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Recv
 
@@ -223,10 +223,16 @@ while `inFlight > 0`, some event in `drainEvents` is enabled. -/
 def NoOpLeak (s : Recv) : Prop :=
   0 < s.life.inFlight → ∃ e ∈ drainEvents, (step s e).isSome = true
 
+/-- The receiver's promise to the engine: once `poll_stats()` has reported the
+receive, as `done_recving` or as `failed_recving`, no H2D copy is dispatching
+or still writing decode HBM, so the caller may reuse or refill it. -/
+def PublishedQuiet (s : Recv) : Prop :=
+  s.published ≠ none → s.pending = 0 ∧ s.retired = s.issued
+
 /-- Everything we want to know about a reachable receive session. -/
 def Safe (s : Recv) : Prop :=
   SettleSafe s ∧ NoRetiredCallback s ∧ StagingIntegrity s ∧ SettlesPromptly s ∧
-    ReadinessSound s ∧ Publication s ∧ CountersOrdered s ∧ NoOpLeak s
+    ReadinessSound s ∧ Publication s ∧ CountersOrdered s ∧ NoOpLeak s ∧ PublishedQuiet s
 
 
 end Recv

@@ -32,10 +32,13 @@ theorem drain_send_step {s : Pipeline} (h : Inv s)
   by_cases hp : s.send.d2hPending = true
   · have hs₁ : step s (.send (.d2hIssue true)) =
         some { s with send := { s.send with d2hPending := false, d2hIssued := s.send.d2hIssued + 1 } } := by
-      simp [step, sendStep, Send.step, Send.d2hIssue, hp,
-        Send.trySendNext_of_draining (s := { s.send with d2hPending := false, d2hIssued := s.send.d2hIssued + 1 }) hdr]
+      simp [step, sendStep, Send.step, Send.d2hIssue, hp]
     exact ⟨.send (.d2hIssue true), _, hs₁, by simp [hdr], rfl, by simp [Send.drainRank, hp]; omega⟩
-  · by_cases hrd : s.send.d2hReady < s.send.d2hIssued
+  · have hp' : s.send.d2hPending = false := by
+      cases hq : s.send.d2hPending
+      · rfl
+      · exact absurd hq hp
+    by_cases hrd : s.send.d2hReady < s.send.d2hIssued
     · have hk : s.send.d2hIssued ≤ s.d2hReadyL.length := by
         rw [h.len_d2hReadyL, ← h.n_send]; omega
       obtain ⟨l, hl, hf⟩ := exists_false_lt hk (by rw [h.cnt_d2hReady]; exact hrd)
@@ -51,16 +54,23 @@ theorem drain_send_step {s : Pipeline} (h : Inv s)
           simp [step, sendStep, Send.step, Send.d2hEnd, hret]
         exact ⟨.send .d2hEnd, _, hs₁, by simp [hdr], rfl, by rw [Send.drainRank_endOp]; simp [Send.drainRank]; omega⟩
       · by_cases hwk : s.send.woken < s.send.queued
-        · have hwr : s.send.woken < s.send.d2hReady := by omega
-          have hwi : s.send.woken < s.send.d2hIssued := by omega
-          have hready_eq : s.send.d2hIssued ≤ countTrue s.d2hReadyL := by
-            rw [h.cnt_d2hReady]; omega
-          have hwl : s.d2hReadyL[s.send.woken]? = some true :=
-            all_true_lt_of_countTrue h.d2hReady_lt hready_eq s.send.woken hwi
-          have hs₁ : step s (.send (.wake true)) =
-              some { s with send := { s.send with woken := s.send.woken + 1 }.endOp } := by
-            simp [step, sendStep, hwl, Send.step, Send.wake, hwk, hwr, hdr]
-          exact ⟨.send (.wake true), _, hs₁, by simp [hdr], rfl, by rw [Send.drainRank_endOp]; simp [Send.drainRank]; omega⟩
+        · by_cases hwi : s.send.woken < s.send.d2hIssued
+          · have hwr : s.send.woken < s.send.d2hReady := by omega
+            have hready_eq : s.send.d2hIssued ≤ countTrue s.d2hReadyL := by
+              rw [h.cnt_d2hReady]; omega
+            have hwl : s.d2hReadyL[s.send.woken]? = some true :=
+              all_true_lt_of_countTrue h.d2hReady_lt hready_eq s.send.woken hwi
+            have hs₁ : step s (.send (.wake true)) =
+                some { s with send := { s.send with woken := s.send.woken + 1 }.endOp } := by
+              simp [step, sendStep, hwl, Send.step, Send.wake, hwk, hwr, hdr]
+            exact ⟨.send (.wake true), _, hs₁, by simp [hdr], rfl, by rw [Send.drainRank_endOp]; simp [Send.drainRank]; omega⟩
+          · have hwr : ¬ s.send.woken < s.send.d2hReady := by omega
+            have hle : s.send.d2hIssued ≤ s.send.woken := by omega
+            have hs₁ : step s (.send (.wake false)) =
+                some { s with send := ({ s.send with woken := s.send.woken + 1 }.finish false).endOp } := by
+              simp [step, sendStep, Send.step, Send.wake, hwk, hwr, hdr, hp', hle]
+            rw [Send.finish_of_draining false (s := { s.send with woken := s.send.woken + 1 }) hdr] at hs₁
+            exact ⟨.send (.wake false), _, hs₁, by simp [hdr], rfl, by rw [Send.drainRank_endOp]; simp [Send.drainRank]; omega⟩
         · by_cases hpool : 0 < s.send.pooled
           · have hs₁ : step s (.send .h2hIssue) =
                 some { s with send := { s.send with pooled := s.send.pooled - 1 }.endOp } := by

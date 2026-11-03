@@ -26,27 +26,35 @@ The payload matches `jax_pathways_mcjax_weight_sync_benchmark_runner.py`
 are directly comparable. Per-stage metrics mirror the JAX runner too:
 D2H on the source, Net transfer and H2D on the destination.
 
-Start the SOURCE first; with --parallelism_list it hosts an in-process
-`RaidenControllerServer` on port (29550 + p) for each rung and waits for the
-destination to drive and then shut each rung down:
+Start the SOURCE first. For each rung p in --parallelism_list it hosts an
+in-process `RaidenControllerServer` on port (29550 + p) and waits for the
+destination to drive and then shut that rung down:
 
   cd <tpu-raiden>
   PYTHONUNBUFFERED=1 PYTHONPATH=$PWD python3 \
     examples/microbenchmarks/torch_weight_sync_benchmark_runner.py \
       --role=source \
       --parallelism_list=1,4,8 \
-      --src_log_dir=/tmp/raiden_ws
+      --results_dir=/tmp/raiden_ws
 
-Then, for each rung P, the DESTINATION pointed at the source host:
+Then start the DESTINATION, pointed at the source host, with the same list. It
+drives every rung from one set of processes, connecting to each rung's
+controller in turn:
 
   cd <tpu-raiden>
   PYTHONUNBUFFERED=1 PYTHONPATH=$PWD python3 \
     examples/microbenchmarks/torch_weight_sync_benchmark_runner.py \
       --role=destination \
-      --controller_address=10.128.0.241:$((29550 + P)) \
-      --parallelism=$P
+      --controller_host=10.128.0.241 \
+      --parallelism_list=1,4,8 \
+      --results_dir=/tmp/raiden_ws
 
-The payload flags must match on both sides.
+Both roles keep one set of processes for the whole ladder: starting fresh
+processes per rung re-creates the multi-process TPU slice, and on TPU v7 the
+new slice's START_SESSION can fail for minutes after the previous slice's
+teardown timed out (b/568095515).
+
+The payload flags and --parallelism_list must match on both sides.
 """
 
 import asyncio
@@ -82,10 +90,10 @@ flags.DEFINE_enum(
     required=True,
 )
 flags.DEFINE_string(
-    "controller_address",
-    "localhost:29551",
-    "Host:port of the RaidenController (destination only). The source hosts"
-    " the controller itself on port (29550 + parallelism).",
+    "controller_host",
+    "localhost",
+    "Destination only: host of the source, which serves each rung's"
+    " RaidenController on port (29550 + parallelism).",
 )
 flags.DEFINE_integer(
     "num_processes",
@@ -116,13 +124,15 @@ flags.DEFINE_enum(
 flags.DEFINE_integer(
     "parallelism",
     8,
-    "Number of parallel transport streams for weight synchronization.",
+    "Number of parallel transport streams for a single-rung run.",
 )
 flags.DEFINE_list(
     "parallelism_list",
     [],
-    "Source only: comma-separated parallelism values to sweep. For each"
-    " value p the source hosts a RaidenControllerServer on port (29550 + p).",
+    "Comma-separated parallelism values to sweep, in order; overrides"
+    " --parallelism. Must match on both roles: for each value p the source"
+    " hosts a RaidenControllerServer on port (29550 + p) and the destination"
+    " drives that rung.",
 )
 flags.DEFINE_integer(
     "group_size",
@@ -130,9 +140,10 @@ flags.DEFINE_integer(
     "Number of variables grouped per transfer request. 0 = all variables.",
 )
 flags.DEFINE_string(
-    "src_log_dir",
+    "results_dir",
     "",
-    "Optional directory to write torch_ws_src_p{p}.log files on the source.",
+    "Optional directory for per-rung result files: torch_ws_src_p{p}.log on"
+    " the source, torch_ws_dst_p{p}.log on the destination.",
 )
 flags.DEFINE_string(
     "bind_ip",
@@ -395,6 +406,36 @@ def _ping_port(addr: str) -> bool:
     return False
 
 
+def _controller_port(parallelism: int) -> int:
+  """Port the source serves rung `parallelism`'s RaidenController on."""
+  return _CONTROLLER_BASE_PORT + parallelism
+
+
+def _wait_for_port(addr: str, timeout_s: float) -> None:
+  """Blocks until addr accepts TCP connections; raises after timeout_s."""
+  deadline = time.time() + timeout_s
+  while not _ping_port(addr):
+    if time.time() > deadline:
+      raise RuntimeError(f"Timed out after {timeout_s:.0f}s waiting for {addr}")
+    time.sleep(1.0)
+
+
+def _emit_rung_report(
+    lines: abc.Sequence[str],
+    file_prefix: str,
+    parallelism: int,
+    results_dir: str,
+) -> None:
+  """Prints a rung's result block; also saves it under results_dir if set."""
+  report = "\n".join(lines) + "\n"
+  print(report, end="", flush=True)
+  if results_dir:
+    os.makedirs(results_dir, exist_ok=True)
+    path = os.path.join(results_dir, f"{file_prefix}_p{parallelism}.log")
+    with open(path, "w") as f:
+      f.write(report)
+
+
 # ----------------------------------------------------------------------------
 # Source
 # ----------------------------------------------------------------------------
@@ -404,13 +445,13 @@ def _report_source(
     d2h_times: abc.Sequence[float],
     total_bytes: int,
     parallelism: int,
-    src_log_dir: str,
+    results_dir: str,
 ) -> None:
   total_mb = total_bytes / (1024.0 * 1024.0)
   avg_d2h_time = float(np.mean(d2h_times))
   avg_d2h_bw_gbs = (total_bytes / 1e9) / max(avg_d2h_time, 1e-9)
-  report = (
-      "\n".join([
+  _emit_rung_report(
+      [
           "==================================================",
           "SOURCE BENCHMARK RESULTS",
           "==================================================",
@@ -422,16 +463,11 @@ def _report_source(
               f" ({avg_d2h_bw_gbs * 8.0:.2f} Gbps)"
           ),
           "==================================================",
-      ])
-      + "\n"
+      ],
+      "torch_ws_src",
+      parallelism,
+      results_dir,
   )
-  print(report, end="", flush=True)
-  if src_log_dir:
-    os.makedirs(src_log_dir, exist_ok=True)
-    with open(
-        os.path.join(src_log_dir, f"torch_ws_src_p{parallelism}.log"), "w"
-    ) as f:
-      f.write(report)
 
 
 def _run_source_worker(rank: int, world_size: int, cfg: dict[str, Any]) -> None:
@@ -476,7 +512,7 @@ def _run_source_worker(rank: int, world_size: int, cfg: dict[str, Any]) -> None:
   worker_rpc_client = None
   try:
     for p in p_values:
-      ctrl_port = _CONTROLLER_BASE_PORT + p
+      ctrl_port = _controller_port(p)
       server = None
       if rank == 0:
         worker_rpc_client = raiden_controller.WeightSyncWorkerRpcClient(
@@ -513,7 +549,7 @@ def _run_source_worker(rank: int, world_size: int, cfg: dict[str, Any]) -> None:
         _barrier()
         d2h_times.append(time.perf_counter() - t0)
       if rank == 0:
-        _report_source(d2h_times, total_bytes, p, cfg["src_log_dir"])
+        _report_source(d2h_times, total_bytes, p, cfg["results_dir"])
 
       # Register this rank's shard with the rung's controller.
       ctrl_client = raiden_controller.RaidenControllerClientFacade(
@@ -560,16 +596,42 @@ def _run_source_worker(rank: int, world_size: int, cfg: dict[str, Any]) -> None:
 def _run_destination_worker(
     rank: int, world_size: int, cfg: dict[str, Any]
 ) -> None:
-  """Destination process: holds column shards, drives one rung, verifies."""
+  """Destination process: holds column shards and drives every rung in turn.
+
+  Like the source, one process (and one TPU client) serves the whole ladder;
+  each rung gets fresh tensors and a fresh WeightSynchronizer.
+
+  Args:
+    rank: This process's rank among the destination's local processes.
+    world_size: Number of destination processes, one per local TPU device.
+    cfg: Benchmark configuration built by main(); cfg["p_values"] lists the
+      rungs to drive, in order.
+  """
   if world_size > 1:
     dist.init_process_group(backend="tpu_dist")
+  try:
+    for parallelism in cfg["p_values"]:
+      _run_destination_rung(rank, world_size, cfg, parallelism)
+  finally:
+    if world_size > 1:
+      dist.destroy_process_group()
+
+
+def _run_destination_rung(
+    rank: int, world_size: int, cfg: dict[str, Any], parallelism: int
+) -> None:
+  """Drives one rung: registers, transfers, verifies, then stops its controller."""
   device = torch.device("tpu")
   torch_dtype, item_size = _resolve_torch_dtype(cfg["dtype"])
   var_shape: tuple[int, int] = cfg["var_shape"]
   num_variables: int = cfg["num_variables"]
-  parallelism: int = cfg["parallelism"]
   self_ip: str = cfg["self_ip"]
+  controller_address = (
+      f"{cfg['controller_host']}:{_controller_port(parallelism)}"
+  )
 
+  # Freshly zeroed per rung, so the warmup verification proves this rung's
+  # transfer rather than data left over from the previous rung.
   tensors = _allocate_tensors(
       "destination",
       rank,
@@ -598,8 +660,10 @@ def _run_destination_worker(
   while not _ping_port(ctrl_addr):
     time.sleep(0.2)
 
+  # The source opens a rung's controller only after its own D2H stage.
+  _wait_for_port(controller_address, _REGISTRATION_TIMEOUT_S)
   ctrl_client = raiden_controller.RaidenControllerClientFacade(
-      cfg["controller_address"], name_resolver=None
+      controller_address, name_resolver=None
   )
   ctrl_client.register_work_unit(
       _unit(_DST_JOB, rank),
@@ -680,26 +744,33 @@ def _run_destination_worker(
       avg_h2d = float(np.mean(h2d_times))
       net_gbs = (total_bytes / 1e9) / max(avg_net, 1e-9)
       h2d_gbs = (total_bytes / 1e9) / max(avg_h2d, 1e-9)
-      print("==================================================")
-      print("DESTINATION BENCHMARK RESULTS")
-      print("==================================================")
-      print(f"Total Size:           {total_mb:.2f} MB")
-      print(f"Parallelism:          {parallelism}")
-      print(f"Avg Net Transfer Time:{avg_net:.6f} s")
-      print(
-          f"Avg Net Transfer BW:  {net_gbs:.2f} GB/s ({net_gbs * 8.0:.2f} Gbps)"
+      _emit_rung_report(
+          [
+              "==================================================",
+              "DESTINATION BENCHMARK RESULTS",
+              "==================================================",
+              f"Total Size:           {total_mb:.2f} MB",
+              f"Parallelism:          {parallelism}",
+              f"Avg Net Transfer Time:{avg_net:.6f} s",
+              (
+                  f"Avg Net Transfer BW:  {net_gbs:.2f} GB/s"
+                  f" ({net_gbs * 8.0:.2f} Gbps)"
+              ),
+              f"Avg H2D Time:         {avg_h2d:.6f} s",
+              (
+                  f"Avg H2D BW:           {h2d_gbs:.2f} GB/s"
+                  f" ({h2d_gbs * 8.0:.2f} Gbps)"
+              ),
+              "==================================================",
+          ],
+          "torch_ws_dst",
+          parallelism,
+          cfg["results_dir"],
       )
-      print(f"Avg H2D Time:         {avg_h2d:.6f} s")
-      print(
-          f"Avg H2D BW:           {h2d_gbs:.2f} GB/s ({h2d_gbs * 8.0:.2f} Gbps)"
-      )
-      print("==================================================", flush=True)
       ctrl_client.shutdown()
     _barrier()
   finally:
-    del ws
-    if world_size > 1:
-      dist.destroy_process_group()
+    ws.shutdown()
 
 
 # ----------------------------------------------------------------------------
@@ -764,6 +835,17 @@ def main(argv: abc.Sequence[str]) -> None:
   var_shape = tuple(int(x) for x in FLAGS.variable_shape)
   if len(var_shape) != 2:
     raise app.UsageError("--variable_shape must be 2D (rows,cols).")
+  p_values = (
+      [int(x) for x in FLAGS.parallelism_list]
+      if FLAGS.parallelism_list
+      else [FLAGS.parallelism]
+  )
+  # Rungs are keyed by parallelism (controller port, the source's last-rung
+  # check), so a repeated value would collide with an earlier rung.
+  if len(set(p_values)) != len(p_values):
+    raise app.UsageError(
+        f"--parallelism_list must not repeat a value: {p_values}"
+    )
   world_size = _local_world_size()
   cfg: dict[str, Any] = {
       "role": FLAGS.role,
@@ -773,14 +855,9 @@ def main(argv: abc.Sequence[str]) -> None:
       "num_iterations": FLAGS.num_iterations,
       "group_size": FLAGS.group_size,
       "self_ip": _resolve_local_ip(),
-      "src_log_dir": FLAGS.src_log_dir,
-      "controller_address": FLAGS.controller_address,
-      "parallelism": FLAGS.parallelism,
-      "p_values": (
-          [int(x) for x in FLAGS.parallelism_list]
-          if FLAGS.parallelism_list
-          else [FLAGS.parallelism]
-      ),
+      "results_dir": FLAGS.results_dir,
+      "controller_host": FLAGS.controller_host,
+      "p_values": p_values,
       # Source and destination hosts are assumed symmetric (same chip count);
       # the destination only needs a lower bound on registered source shards.
       "num_src_shards": world_size,

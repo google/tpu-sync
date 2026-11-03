@@ -130,7 +130,7 @@ theorem step_send_inv {s s' : Pipeline} {e : Send.Ev} (h : Inv s)
     rename_i hguard
     simp only [Option.map_eq_some_iff] at hs
     obtain ⟨snd, hsnd, rfl⟩ := hs
-    have hsndInv := Send.step_inv .shipping h.sendInv hsnd
+    have hsndInv := Send.step_inv h.sendInv hsnd
     have hpub_m : s.send.published ≠ none → snd.published ≠ none :=
       send_step_published_ne_none hsnd
     have hdone_m : snd.life.done = false → s.send.life.done = false := by
@@ -194,7 +194,7 @@ theorem step_send_inv {s s' : Pipeline} {e : Send.Ev} (h : Inv s)
         exact h.unarmed_send ha q hq pool' hget'
   · simp only [sendStep, Option.map_eq_some_iff] at hs
     obtain ⟨snd, hsnd, rfl⟩ := hs
-    have hsndInv := Send.step_inv .shipping h.sendInv hsnd
+    have hsndInv := Send.step_inv h.sendInv hsnd
     have hpub_m : s.send.published ≠ none → snd.published ≠ none :=
       send_step_published_ne_none hsnd
     have hdone_m : snd.life.done = false → s.send.life.done = false := by
@@ -214,7 +214,7 @@ theorem step_send_inv {s s' : Pipeline} {e : Send.Ev} (h : Inv s)
       h.done_intact, fun ha => by rw [hpools_eq]; exact h.unarmed_send ha, h.unarmed_recv⟩
   · simp only [sendStep, Option.map_eq_some_iff] at hs
     obtain ⟨snd, hsnd, hs'⟩ := hs
-    have hsndInv := Send.step_inv .shipping h.sendInv hsnd
+    have hsndInv := Send.step_inv h.sendInv hsnd
     have hpub_m : s.send.published ≠ none → snd.published ≠ none :=
       send_step_published_ne_none hsnd
     have hdone_m : snd.life.done = false → s.send.life.done = false := by
@@ -333,7 +333,7 @@ theorem step_send_inv {s s' : Pipeline} {e : Send.Ev} (h : Inv s)
           exact h.sent_bound q hq pool' hget'
   · simp only [sendStep, Option.map_eq_some_iff] at hs
     obtain ⟨snd, hsnd, hs'⟩ := hs
-    have hsndInv := Send.step_inv .shipping h.sendInv hsnd
+    have hsndInv := Send.step_inv h.sendInv hsnd
     have hpub_m : s.send.published ≠ none → snd.published ≠ none :=
       send_step_published_ne_none hsnd
     have hdone_m : snd.life.done = false → s.send.life.done = false := by
@@ -442,7 +442,7 @@ theorem step_send_inv {s s' : Pipeline} {e : Send.Ev} (h : Inv s)
         · rw [getD_set_ne (by omega)]; exact hle
   · simp only [sendStep, Option.map_eq_some_iff] at hs
     obtain ⟨snd, hsnd, rfl⟩ := hs
-    have hsndInv := Send.step_inv .shipping h.sendInv hsnd
+    have hsndInv := Send.step_inv h.sendInv hsnd
     have hpub_m : s.send.published ≠ none → snd.published ≠ none :=
       send_step_published_ne_none hsnd
     have hdone_m : snd.life.done = false → s.send.life.done = false := by
@@ -462,7 +462,7 @@ theorem step_send_inv {s s' : Pipeline} {e : Send.Ev} (h : Inv s)
       h.done_intact, fun ha => by rw [hpools_eq]; exact h.unarmed_send ha, h.unarmed_recv⟩
   · simp only [sendStep, Option.map_eq_some_iff] at hs
     obtain ⟨snd, hsnd, rfl⟩ := hs
-    have hsndInv := Send.step_inv .shipping h.sendInv hsnd
+    have hsndInv := Send.step_inv h.sendInv hsnd
     have hpub_m : s.send.published ≠ none → snd.published ≠ none :=
       send_step_published_ne_none hsnd
     have hdone_m : snd.life.done = false → s.send.life.done = false := by

@@ -772,6 +772,11 @@ class KVCacheStore {
   }
 
  private:
+  // True when the secondary storage tier (backends_[1]) is the TPUDirect
+  // Storage backend, i.e. its name() is kTdsBackendName ("tds", compared
+  // case-insensitively).
+  bool IsTdsCaching() const;
+
   // The local half of Save(): device HBM to host DRAM.
   absl::Status SaveLocal(const std::vector<std::string>& block_hashes);
   // The remote half of Save(): offer `block_hashes` to `dst_raiden_id`.

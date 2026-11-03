@@ -410,11 +410,23 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     self._run_e2e_test(enable_multi_numa=True, use_slices=True)
 
   @parameterized.named_parameters(
-      ("buffered", False),
-      ("direct_io", True),
+      ("buffered", False, "posix"),
+      ("direct_io", True, "posix"),
+      ("tds", False, "tds"),
   )
-  def test_secondary_storage_e2e_offload_recall(self, direct_io: bool = False):
-    """Verifies end-to-end offload to storage and recall across TPU chips."""
+  def test_secondary_storage_e2e_offload_recall(
+      self, direct_io: bool = False, backend_type: str = "posix"
+  ):
+    """Verifies end-to-end offload to storage and recall across TPU chips.
+
+    Runs once per secondary backend flavour. With `backend_type="posix"`
+    (buffered or `direct_io`) blocks are staged through host DRAM, so after a
+    save or recall they are HOST_AND_HBM with a real host_block_id. With
+    `backend_type="tds"` the store bypasses DRAM residency entirely: blocks
+    move HBM <-> storage directly and stay HBM-only (host_block_id == -1)
+    after both save and recall. The on-disk layout is the same for both, so
+    the shard-file integrity checks are shared.
+    """
     tpu_sharding = self.setup_shardings()
     num_blocks = 2
     # Shape: (num_blocks, tokens_per_block, head_shards, heads_per_shard, head_dim)
@@ -422,7 +434,11 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     shape = (num_blocks, 128, 8, 8, 128)
     block_bytes = (np.prod(shape) // num_blocks) * 4
     total_bytes = np.prod(shape) * 4
-    mode_str = "direct_io" if direct_io else "buffered"
+    mode_str = (
+        "tds"
+        if backend_type == "tds"
+        else ("direct_io" if direct_io else "buffered")
+    )
     print(
         "\n======================================================================\n[JAX"
         f" E2E Storage] STARTING 4-CHIP SECONDARY STORAGE E2E TEST (mode={mode_str})\n  Total TPU"
@@ -468,7 +484,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
           flush=True,
       )
       cfg = kv_cache_store._impl.BackendConfig()
-      cfg.type = "posix"
+      cfg.type = backend_type
       cfg.parallelism.tp_rank = 0
       # One process writes every chip's data to tp1_r0.
       cfg.parallelism.tp_size = 1
@@ -587,8 +603,17 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
         )
         lookup_res = store1.lookup(hashes, pin_found=False)
         self.assertLen(lookup_res, 2)
+        # TDS caching never publishes a host copy (KVCacheStore::IsTdsCaching
+        # in kv_cache_store.h), so the entry stays HBM-only after the save.
+        expected_post_save_status = (
+            kv_cache_store.BlockStatus.HBM
+            if backend_type == "tds"
+            else kv_cache_store.BlockStatus.HOST_AND_HBM
+        )
         for h, b in lookup_res:
-          self.assertEqual(b.status, kv_cache_store.BlockStatus.HOST_AND_HBM)
+          self.assertEqual(b.status, expected_post_save_status)
+          if backend_type == "tds":
+            self.assertEqual(b.host_block_id, -1)
           print(
               f"  [Node 1 Post-Save] hash={h!r} host_block_id={b.host_block_id}"
               f" device_block_id={b.device_block_id} status={b.status.name}",
@@ -783,10 +808,18 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
         )
         repopulated = store2.lookup(hashes, pin_found=False)
         self.assertLen(repopulated, 2)
+        expected_post_recall_status = (
+            kv_cache_store.BlockStatus.HBM
+            if backend_type == "tds"
+            else kv_cache_store.BlockStatus.HOST_AND_HBM
+        )
         for h, b in repopulated:
-          self.assertEqual(b.status, kv_cache_store.BlockStatus.HOST_AND_HBM)
+          self.assertEqual(b.status, expected_post_recall_status)
           self.assertIn(b.device_block_id, [0, 1])
-          self.assertGreaterEqual(b.host_block_id, 0)
+          if backend_type == "tds":
+            self.assertEqual(b.host_block_id, -1)
+          else:
+            self.assertGreaterEqual(b.host_block_id, 0)
           print(
               f"  [Node 2 Post-Recall] hash={h!r}"
               f" host_block_id={b.host_block_id}"

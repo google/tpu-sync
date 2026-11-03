@@ -101,7 +101,7 @@ class TestManager : public KVCacheManagerWithTransfer {
     }
     absl::MutexLock lock(mu_);
     std::shared_ptr<ReshardSendSession> send_session = *std::move(session);
-    sessions_[plan.uuid()] = send_session;
+    sessions_[plan.uuid()] = SessionEntry{send_session, plan.req_id()};
     NoteSubPlanRegisteredLocked(plan.req_id(), send_session,
                                 plan.sub_plan_index(), plan.sub_plan_count());
     return absl::OkStatus();

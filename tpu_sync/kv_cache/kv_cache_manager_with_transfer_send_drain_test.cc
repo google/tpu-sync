@@ -355,9 +355,11 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     entry->set_size_bytes(base()->block_bytes(0));
     entry->set_count(blocks_per_layer);
     absl::MutexLock lock(mu_);
-    sessions_[uuid] = *TransferReceiveSession::Create(
-        base(), staging_allocator_.get(), uuid, req_id, blocks_per_layer,
-        deadline.value_or(DeadlineFromNow()), /*acquire_staging=*/true);
+    sessions_[uuid] = SessionEntry{
+        *TransferReceiveSession::Create(
+            base(), staging_allocator_.get(), uuid, blocks_per_layer,
+            deadline.value_or(DeadlineFromNow()), /*acquire_staging=*/true),
+        req_id};
   }
 
   absl::Status ReceiveLayer(size_t layer, uint64_t uuid) {
@@ -648,7 +650,8 @@ TEST(SendLifecycleTest, DuplicateBlocksAreRejectedAtRegistration) {
     error_message = e.what();
   }
   EXPECT_THAT(error_message, HasSubstr("duplicate block 5"));
-  EXPECT_THAT(error_message, HasSubstr("req_id=req, uuid=15"));
+  EXPECT_THAT(error_message, HasSubstr("uuid=15"));
+  EXPECT_THAT(error_message, HasSubstr("req_id=req"));
   EXPECT_THAT(error_message, HasSubstr("positions 0 and 2 of 3 blocks"));
   EXPECT_FALSE(producer.has_send(15));
   Reports reports = producer.CompleteReadRaw();
@@ -1238,8 +1241,7 @@ TEST(RecvLifecycleTest,
     std::shared_ptr<TransferReceiveSession> session =
         *TransferReceiveSession::Create(
             consumer.base(), consumer.staging_allocator(),
-            /*uuid=*/88, "req_lifetime",
-            /*total_blocks=*/1,
+            /*uuid=*/88, /*total_blocks=*/1,
             std::chrono::steady_clock::now() + std::chrono::seconds(10),
             /*acquire_staging=*/true);
     weak_session = session;
@@ -1296,7 +1298,7 @@ TEST(RecvLifecycleTest, FirstAdmittedPushRecordsFirstPacketOnce) {
       std::shared_ptr<TransferReceiveSession> session,
       TransferReceiveSession::Create(
           consumer.base(), consumer.staging_allocator(), /*uuid=*/93,
-          "req_first_packet", /*total_blocks=*/2,
+          /*total_blocks=*/2,
           std::chrono::steady_clock::now() + std::chrono::seconds(10),
           /*acquire_staging=*/true, metrics));
   const std::string before_admission = metrics->DumpMetricsToString();
@@ -1332,13 +1334,13 @@ TEST(RecvLifecycleTest, AdmissionRejectedByDoneSessionRecordsNoFirstPacket) {
   TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferReceiveSession> done_session,
                        TransferReceiveSession::Create(
                            consumer.base(), consumer.staging_allocator(),
-                           /*uuid=*/94, "req_done", /*total_blocks=*/1,
-                           deadline, /*acquire_staging=*/true, metrics));
+                           /*uuid=*/94, /*total_blocks=*/1, deadline,
+                           /*acquire_staging=*/true, metrics));
   TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferReceiveSession> live_session,
                        TransferReceiveSession::Create(
                            consumer.base(), consumer.staging_allocator(),
-                           /*uuid=*/95, "req_live", /*total_blocks=*/1,
-                           deadline, /*acquire_staging=*/true, metrics));
+                           /*uuid=*/95, /*total_blocks=*/1, deadline,
+                           /*acquire_staging=*/true, metrics));
   done_session->Finish(absl::CancelledError("receive cancelled"));
   ASSERT_TRUE(done_session->Done());
   const std::string before_admission = metrics->DumpMetricsToString();
@@ -1367,13 +1369,13 @@ TEST(RecvLifecycleTest,
   TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferReceiveSession> draining_session,
                        TransferReceiveSession::Create(
                            consumer.base(), consumer.staging_allocator(),
-                           /*uuid=*/96, "req_draining", /*total_blocks=*/1,
-                           deadline, /*acquire_staging=*/true, metrics));
+                           /*uuid=*/96, /*total_blocks=*/1, deadline,
+                           /*acquire_staging=*/true, metrics));
   TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferReceiveSession> live_session,
                        TransferReceiveSession::Create(
                            consumer.base(), consumer.staging_allocator(),
-                           /*uuid=*/97, "req_live", /*total_blocks=*/1,
-                           deadline, /*acquire_staging=*/true, metrics));
+                           /*uuid=*/97, /*total_blocks=*/1, deadline,
+                           /*acquire_staging=*/true, metrics));
   // A pending layer H2D copy keeps the cancelled receive draining, not done.
   ABSL_ASSERT_OK(draining_session->OnDataReceived(
       /*major_dimension_idx=*/0, /*minor_dimension_indices=*/{},
@@ -1424,7 +1426,7 @@ TEST(RecvLifecycleTest,
       std::shared_ptr<TransferReceiveSession> session,
       TransferReceiveSession::Create(
           consumer.base(), consumer.staging_allocator(), /*uuid=*/98,
-          "req_peregrine", /*total_blocks=*/1,
+          /*total_blocks=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10),
           /*acquire_staging=*/true, metrics));
 
@@ -1465,7 +1467,7 @@ TEST(RecvLifecycleTest,
   TF_ASSERT_OK_AND_ASSIGN(
       std::shared_ptr<TransferReceiveSession> session,
       TransferReceiveSession::Create(
-          consumer.base(), consumer.staging_allocator(), /*uuid=*/99, "req_tcp",
+          consumer.base(), consumer.staging_allocator(), /*uuid=*/99,
           /*total_blocks=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10),
           /*acquire_staging=*/true, metrics));
@@ -1514,7 +1516,7 @@ TEST(RecvLifecycleTest,
       std::shared_ptr<TransferReceiveSession> session,
       TransferReceiveSession::Create(
           consumer.base(), consumer.staging_allocator(), /*uuid=*/100,
-          "req_tcp_h2d_first", /*total_blocks=*/1,
+          /*total_blocks=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10),
           /*acquire_staging=*/true, metrics));
   ASSERT_TRUE(session->TryBeginOp());
@@ -1559,7 +1561,7 @@ TEST(RecvLifecycleTest, RedeliveredLayerDoesNotCompleteNetworkPhase) {
       std::shared_ptr<TransferReceiveSession> session,
       TransferReceiveSession::Create(
           consumer.base(), consumer.staging_allocator(), /*uuid=*/101,
-          "req_redelivered", /*total_blocks=*/1,
+          /*total_blocks=*/1,
           std::chrono::steady_clock::now() + std::chrono::seconds(10),
           /*acquire_staging=*/true, metrics));
   ASSERT_TRUE(session->TryBeginOp());

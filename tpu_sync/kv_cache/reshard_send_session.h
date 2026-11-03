@@ -47,7 +47,7 @@ class StagingBlockAllocator;
 //
 // Thread-safety: This class is thread-safe. Immutable fields (|base_|,
 // |parallelism_|, |deadline_|, |dst_peers_|, |data_connection_reuse_|, and
-// |transfer_plan_|, whose request supplies the uuid, req_id and plan) are set
+// |transfer_plan_|, whose request supplies the uuid and plan) are set
 // at construction time and read without locking. Mutable state is protected
 // by internal |mu_|.
 class ReshardSendSession
@@ -94,7 +94,6 @@ class ReshardSendSession
     return finalizing_;
   }
 
-  const std::string& req_id() const { return request().req_id(); }
   std::chrono::steady_clock::time_point deadline() const override {
     return deadline_;
   }

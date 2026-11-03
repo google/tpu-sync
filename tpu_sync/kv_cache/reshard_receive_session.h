@@ -100,7 +100,6 @@ class ReshardReceiveSession
     return draining_;
   }
 
-  const std::string& req_id() const { return request().req_id(); }
   std::chrono::steady_clock::time_point deadline() const override {
     return deadline_;
   }

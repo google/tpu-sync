@@ -507,8 +507,7 @@ void ReshardSendSession::RecordPushCompletion(const absl::Status& status) {
   absl::MutexLock lock(mu_);
   if (done_ || finalizing_) return;
   if (!status.ok()) {
-    LOG(ERROR) << "Pool reshard send failed uuid=" << uuid()
-               << " req_id=" << request().req_id() << ": " << status;
+    LOG(ERROR) << "Pool reshard send failed uuid=" << uuid() << ": " << status;
     if (status_.ok()) {
       status_ = status;
     }

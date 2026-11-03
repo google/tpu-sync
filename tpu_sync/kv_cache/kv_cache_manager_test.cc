@@ -2804,6 +2804,49 @@ TEST(KVCacheManagerTest,
   ABSL_EXPECT_OK(host.UnregisterActivePlan(9102));
 }
 
+TEST(KVCacheManagerTest, ActivePlanWithoutReqIdReportsUnderDefaultReqId) {
+  WithPlanSessions<TestKVCacheManager> sender_host(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/4);
+  WithPlanSessions<TestKVCacheManager> receiver_host(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/4);
+  ::tpu_sync::rpc::StartTransferRequest plan;
+  plan.set_uuid(9201);
+  plan.clear_req_id();
+  plan.set_dst_mem_type(::tpu_sync::rpc::MEMORY_TYPE_HBM);
+  auto* entry = (*plan.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer("127.0.0.1:1");
+  entry->set_dst_shard_idx(0);
+  entry->set_src_block_id(0);
+  entry->set_dst_block_id(1);
+  entry->set_size_bytes(128);
+  ASSERT_TRUE(plan.req_id().empty());
+  ABSL_ASSERT_OK(sender_host.RegisterActivePlan(9201, plan,
+                                                /*is_sender=*/true));
+  ABSL_ASSERT_OK(receiver_host.RegisterActivePlan(9201, plan,
+                                                  /*is_sender=*/false));
+
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferSession> send_session,
+                       sender_host.GetSession(9201));
+  send_session->Finish();
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferSession> recv_session,
+                       receiver_host.GetSession(9201));
+  recv_session->Finish();
+
+  CompleteReadResult sent = sender_host.CompleteReadWithDetails();
+  EXPECT_THAT(sent.sent, testing::ElementsAre("resharded_transfer_9201"));
+  EXPECT_THAT(sent.failed, testing::IsEmpty());
+  EXPECT_THAT(sent.details,
+              testing::ElementsAre(testing::Key("resharded_transfer_9201")));
+  CompleteReadResult received = receiver_host.CompleteReadWithDetails();
+  EXPECT_THAT(received.received,
+              testing::ElementsAre("resharded_transfer_9201"));
+  EXPECT_THAT(received.failed, testing::IsEmpty());
+  EXPECT_THAT(received.details,
+              testing::ElementsAre(testing::Key("resharded_transfer_9201")));
+}
+
 class ConfigurableFakeKVBackend : public backends::KVBackend {
  public:
   explicit ConfigurableFakeKVBackend(

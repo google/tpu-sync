@@ -64,8 +64,8 @@ constexpr absl::string_view kPushPhase = "push";
 absl::StatusOr<std::shared_ptr<TransferSendSession>>
 TransferSendSession::Create(
     kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* absl_nullable staging_allocator, std::string req_id,
-    uint64_t uuid, absl::Span<const int64_t> block_ids,
+    StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+    absl::Span<const int64_t> block_ids,
     std::chrono::steady_clock::time_point deadline,
     std::chrono::steady_clock::time_point register_start) {
   if (staging_allocator == nullptr) {
@@ -74,16 +74,16 @@ TransferSendSession::Create(
   ABSL_ASSIGN_OR_RETURN(const DataConnectionReuse data_connection_reuse,
                         ResolveDataConnectionReuse());
   auto session = std::shared_ptr<TransferSendSession>(
-      new TransferSendSession(base, staging_allocator, std::move(req_id), uuid,
-                              deadline, register_start, data_connection_reuse));
+      new TransferSendSession(base, staging_allocator, uuid, deadline,
+                              register_start, data_connection_reuse));
   std::optional<DuplicateBlock> duplicate_block =
       session->PopulateRegisteredBlocks(block_ids);
   if (duplicate_block.has_value()) {
     return absl::InvalidArgumentError(absl::StrCat(
         "NotifyForRead rejected duplicate block ", duplicate_block->block_id,
-        " for req_id=", session->req_id(), ", uuid=", uuid, ": positions ",
-        duplicate_block->first_index, " and ", duplicate_block->duplicate_index,
-        " of ", block_ids.size(), " blocks"));
+        " for uuid=", uuid, ": positions ", duplicate_block->first_index,
+        " and ", duplicate_block->duplicate_index, " of ", block_ids.size(),
+        " blocks"));
   }
   return session;
 }
@@ -130,11 +130,8 @@ TransferSendSession::CreateFromActivePlan(
                            base->has_explicit_pools(), base->pools(),
                            std::move(host_block_of)));
   const auto now = std::chrono::steady_clock::now();
-  std::string req_id = request.req_id().empty()
-                           ? absl::StrCat("resharded_transfer_", uuid)
-                           : request.req_id();
   auto session = std::shared_ptr<TransferSendSession>(new TransferSendSession(
-      base, staging_allocator, std::move(req_id), uuid,
+      base, staging_allocator, uuid,
       std::chrono::steady_clock::time_point::max(), now, data_connection_reuse,
       std::make_shared<const TransferPlan>(std::move(plan))));
   {
@@ -146,14 +143,13 @@ TransferSendSession::CreateFromActivePlan(
 
 TransferSendSession::TransferSendSession(
     kv_cache::KVCacheManagerBase* base,
-    StagingBlockAllocator* staging_allocator, std::string req_id, uint64_t uuid,
+    StagingBlockAllocator* staging_allocator, uint64_t uuid,
     std::chrono::steady_clock::time_point deadline,
     std::chrono::steady_clock::time_point register_start,
     DataConnectionReuse data_connection_reuse,
     std::shared_ptr<const TransferPlan> plan)
     : base_(base),
       staging_allocator_(staging_allocator),
-      req_id_(std::move(req_id)),
       uuid_(uuid),
       deadline_(deadline),
       register_start_(register_start),

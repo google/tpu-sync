@@ -141,7 +141,7 @@ class TestManager : private ScopedControlPlaneBackend,
     if (session == nullptr || session->Done()) {
       return std::nullopt;
     }
-    return session->req_id();
+    return sessions_.find(uuid)->second.req_id;
   }
 
   bool has_recv(uint64_t uuid) {

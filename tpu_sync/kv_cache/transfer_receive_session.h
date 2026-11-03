@@ -68,7 +68,7 @@ class TransferReceiveSession
   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
       kv_cache::KVCacheManagerBase* base, KVCacheManagerWithTransfer* manager,
       StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-      const std::string& req_id, const std::string& remote_endpoint,
+      const std::string& remote_endpoint,
       const std::vector<int64_t>& remote_block_ids,
       const std::vector<int64_t>& local_block_ids,
       const std::optional<std::vector<int64_t>>& local_host_block_ids,
@@ -78,8 +78,7 @@ class TransferReceiveSession
   static absl::StatusOr<std::shared_ptr<TransferReceiveSession>> Create(
       kv_cache::KVCacheManagerBase* base,
       StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
-      std::string req_id, int32_t total_blocks,
-      std::chrono::steady_clock::time_point deadline,
+      int32_t total_blocks, std::chrono::steady_clock::time_point deadline,
       bool acquire_staging = false,
       std::shared_ptr<MetricsCollector> metrics_collector = nullptr);
 
@@ -160,10 +159,6 @@ class TransferReceiveSession
     return staging_layer_manager_;
   }
 
-  std::string req_id() const {
-    absl::MutexLock lock(mu_);
-    return req_id_;
-  }
   int32_t total_blocks() const {
     absl::MutexLock lock(mu_);
     return total_blocks_;
@@ -225,8 +220,7 @@ class TransferReceiveSession
                                    : 0) {}
   TransferReceiveSession(kv_cache::KVCacheManagerBase* base,
                          StagingBlockAllocator* staging_allocator,
-                         uint64_t uuid, std::string req_id,
-                         int32_t total_blocks,
+                         uint64_t uuid, int32_t total_blocks,
                          std::chrono::steady_clock::time_point deadline,
                          bool acquire_staging,
                          std::shared_ptr<MetricsCollector> metrics_collector)
@@ -234,7 +228,6 @@ class TransferReceiveSession
         staging_allocator_(staging_allocator),
         uuid_(uuid),
         metrics_collector_(std::move(metrics_collector)),
-        req_id_(std::move(req_id)),
         total_blocks_(total_blocks),
         blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0, 0),
         deadline_(deadline),
@@ -263,7 +256,7 @@ class TransferReceiveSession
   // and populates |*host_block_ids|. Returns false if staging capacity is
   // unavailable.
   bool AllocateStagingForLoad(
-      const std::string& req_id, const std::vector<int64_t>& local_block_ids,
+      const std::vector<int64_t>& local_block_ids,
       const std::optional<std::vector<int64_t>>& local_host_block_ids,
       std::vector<int64_t>* host_block_ids);
 
@@ -274,7 +267,7 @@ class TransferReceiveSession
       const std::vector<int64_t>& local_host_block_ids);
 
   // Initializes this receive session for a consumer StartRead load plan.
-  void InitFromLoadPlan(const std::string& req_id, CopyPlan load_plan,
+  void InitFromLoadPlan(CopyPlan load_plan,
                         std::chrono::steady_clock::time_point deadline);
 
   void ReleaseStaging();
@@ -300,7 +293,7 @@ class TransferReceiveSession
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void ResetShardProgressLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   bool RecordNetworkCompleteLocked(
-      bool all_complete, std::string* session_req_id,
+      bool all_complete,
       std::chrono::steady_clock::time_point* session_start_time)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
@@ -314,7 +307,6 @@ class TransferReceiveSession
   StagingBlockAllocator* staging_allocator_ = nullptr;
   uint64_t uuid_ = 0;
   std::shared_ptr<MetricsCollector> metrics_collector_;
-  std::string req_id_ ABSL_GUARDED_BY(mu_);
   StagingAllocation staging_ ABSL_GUARDED_BY(mu_);
   CopyPlan load_plan_ ABSL_GUARDED_BY(mu_);
   CopySpec h2d_copy_ ABSL_GUARDED_BY(mu_);

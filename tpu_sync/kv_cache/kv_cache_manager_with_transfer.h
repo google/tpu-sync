@@ -266,8 +266,16 @@ class KVCacheManagerWithTransfer {
   void AckSend(uint64_t uuid);
   void ConfigureDataPortFromKvTransfer();
 
+  // A registered session and the req_id its terminal is reported under.
+  struct SessionEntry {
+    std::shared_ptr<TransferSession> session;
+    std::string req_id;
+  };
+
+  // Registers |session| under |uuid|, recording |req_id| as its req_id.
   absl::Status EmplaceRecvSessionLocked(
-      uint64_t uuid, const std::shared_ptr<TransferReceiveSession>& session)
+      uint64_t uuid, absl::string_view req_id,
+      const std::shared_ptr<TransferReceiveSession>& session)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   template <typename SessionT>
@@ -277,25 +285,23 @@ class KVCacheManagerWithTransfer {
     if (it == sessions_.end()) {
       return nullptr;
     }
-    return std::dynamic_pointer_cast<SessionT>(it->second);
+    return std::dynamic_pointer_cast<SessionT>(it->second.session);
   }
 
-  // If |it->second| is already Done(), records its terminal completion into
+  // If |it|'s session is already Done(), records its terminal completion into
   // |done_sending_| / |done_recving_| / |failed_recving_| /
   // |transfer_details_|, erases |it| from |sessions_|, and returns true.
   // Otherwise returns false. Never calls Finish(): a caller that wants a
   // ready-to-complete session retired must finish it first.
   bool RetireSettledSessionLocked(
-      absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>>::iterator
-          it,
+      absl::flat_hash_map<uint64_t, SessionEntry>::iterator it,
       bool* retired_push_progress = nullptr,
       bool* retired_pool_staging = nullptr) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   void StartControlServer();
   void StopControlServer();
 
-  absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>> sessions_
-      ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<uint64_t, SessionEntry> sessions_ ABSL_GUARDED_BY(mu_);
 
   absl::flat_hash_set<uint64_t> pending_pool_reshard_recvs_
       ABSL_GUARDED_BY(mu_);

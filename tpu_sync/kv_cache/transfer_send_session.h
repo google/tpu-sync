@@ -63,8 +63,8 @@ class TransferSendSession
   // creates a send session for |block_ids|.
   static absl::StatusOr<std::shared_ptr<TransferSendSession>> Create(
       kv_cache::KVCacheManagerBase* base,
-      StagingBlockAllocator* absl_nullable staging_allocator,
-      std::string req_id, uint64_t uuid, absl::Span<const int64_t> block_ids,
+      StagingBlockAllocator* absl_nullable staging_allocator, uint64_t uuid,
+      absl::Span<const int64_t> block_ids,
       std::chrono::steady_clock::time_point deadline,
       std::chrono::steady_clock::time_point register_start);
 
@@ -159,7 +159,6 @@ class TransferSendSession
     return staging_layer_manager_;
   }
 
-  const std::string& req_id() const { return req_id_; }
   std::chrono::steady_clock::time_point deadline() const override {
     return deadline_;
   }
@@ -176,8 +175,7 @@ class TransferSendSession
   absl::StatusOr<size_t> LookupStagingSlot(size_t layer_idx) const;
 
   TransferSendSession(kv_cache::KVCacheManagerBase* base,
-                      StagingBlockAllocator* staging_allocator,
-                      std::string req_id, uint64_t uuid,
+                      StagingBlockAllocator* staging_allocator, uint64_t uuid,
                       std::chrono::steady_clock::time_point deadline,
                       std::chrono::steady_clock::time_point register_start,
                       DataConnectionReuse data_connection_reuse,
@@ -218,7 +216,6 @@ class TransferSendSession
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
   StagingBlockAllocator* const staging_allocator_ = nullptr;
-  const std::string req_id_;
   const uint64_t uuid_ = 0;
   const std::chrono::steady_clock::time_point deadline_;
   const std::chrono::steady_clock::time_point register_start_;

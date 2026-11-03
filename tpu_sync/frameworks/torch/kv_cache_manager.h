@@ -45,13 +45,18 @@ namespace torch {
 
 class TorchKVCacheManager : public KVCacheManagerWithTransfer {
  public:
-  // PyTorch sharded factory E2E (cache-only by default).
+  // PyTorch sharded factory E2E (cache-only by default). A non-negative
+  // |local_control_port| also serves host-resident reads of the host pool
+  // (`NotifyForRead` with `BlockLocation::kHost`) on that control port; -1
+  // opens no control server, which a manager that only pulls (`StartRead`)
+  // does not need.
   static absl::StatusOr<std::unique_ptr<TorchKVCacheManager>> Create(
       const std::vector<std::vector<at::Tensor>>& device_tensors,
       std::optional<int> local_port = std::nullopt,
       std::optional<int> host_blocks_to_allocate = std::nullopt,
       bool unsafe_skip_buffer_lock = false, int parallelism = 1,
-      int64_t node_id = 0, bool enable_shm = false);
+      int64_t node_id = 0, bool enable_shm = false,
+      int64_t local_control_port = -1);
 
   // Transfer-enabled factory (flat list of tensors, single shard per layer).
   // |enable_shm| opts this manager's host buffers into the shared-memory
@@ -143,9 +148,12 @@ class KVCacheManager {
  public:
   // Creates a cache-only manager over |device_tensors| (outer index = layer,
   // inner index = shard) and, when |raiden_controller_address| is set, starts
-  // the worker gRPC server on |raiden_worker_port|. Returns Internal if
-  // unpacking the tensors, building the TorchKVCacheManager, or starting the
-  // gRPC server fails.
+  // the worker gRPC server on |raiden_worker_port|. A non-negative
+  // |local_control_port| opens a control server that serves host-resident
+  // reads of the host pool; a manager that only pulls needs none. Returns
+  // InvalidArgument if |local_control_port| is non-negative but there is no
+  // host pool to serve; Internal if unpacking the tensors, building the
+  // TorchKVCacheManager, or starting the gRPC server fails.
   static absl::StatusOr<std::unique_ptr<KVCacheManager>> Create(
       const std::vector<std::vector<at::Tensor>>& device_tensors,
       std::optional<int> local_port = std::nullopt,
@@ -154,7 +162,7 @@ class KVCacheManager {
       int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt, int64_t node_id = 0,
-      bool enable_shm = false);
+      bool enable_shm = false, int64_t local_control_port = -1);
 
   // Creates a transfer-enabled manager over the flat list of per-layer
   // tensors in |kv_caches| (single shard per layer). |enable_shm| opts this
@@ -278,8 +286,10 @@ class KVCacheManager {
   }
 
   int64_t NotifyForRead(const std::string& req_id, uint64_t uuid,
-                        const std::vector<int64_t>& block_ids) {
-    return torch_manager_->NotifyForRead(req_id, uuid, block_ids);
+                        const std::vector<int64_t>& block_ids,
+                        BlockLocation source = BlockLocation::kDevice) {
+    return torch_manager_->NotifyForRead(req_id, uuid, block_ids,
+                                         /*deadline=*/std::nullopt, source);
   }
 
   void StartRead(
@@ -287,10 +297,12 @@ class KVCacheManager {
       const std::string& remote_endpoint,
       const std::vector<int64_t>& remote_block_ids,
       const std::vector<int64_t>& local_block_ids, int parallelism = 1,
-      std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt) {
+      std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt,
+      BlockLocation destination = BlockLocation::kDevice) {
     torch_manager_->StartRead(req_id, uuid, remote_endpoint, remote_block_ids,
                               local_block_ids, parallelism,
-                              local_host_block_ids);
+                              local_host_block_ids, /*deadline=*/std::nullopt,
+                              destination);
   }
 
   void StartRead(
@@ -298,10 +310,11 @@ class KVCacheManager {
       const std::vector<RaidenTransferEndpoint>& remote_descriptors,
       const std::vector<int64_t>& remote_block_ids,
       const std::vector<int64_t>& local_block_ids, int parallelism = 1,
-      std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt) {
+      std::optional<std::vector<int64_t>> local_host_block_ids = std::nullopt,
+      BlockLocation destination = BlockLocation::kDevice) {
     torch_manager_->StartRead(req_id, uuid, remote_descriptors,
                               remote_block_ids, local_block_ids, parallelism,
-                              local_host_block_ids);
+                              local_host_block_ids, destination);
   }
 
   CompleteReadResult CompleteReadWithDetails() {

@@ -172,7 +172,8 @@ TransferReceiveSession::Create(
     const std::vector<int64_t>& local_block_ids,
     const std::optional<std::vector<int64_t>>& local_host_block_ids,
     std::chrono::steady_clock::time_point deadline,
-    std::shared_ptr<MetricsCollector> metrics_collector) {
+    std::shared_ptr<MetricsCollector> metrics_collector,
+    BlockLocation destination) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
@@ -180,9 +181,18 @@ TransferReceiveSession::Create(
     return absl::InvalidArgumentError(
         absl::StrCat("pulled receive uuid=", uuid, " requires a manager"));
   }
+  // A host destination has no staging to lease: its blocks are the host
+  // blocks the caller named, which the manager passes as
+  // `local_host_block_ids`.
+  if (destination == BlockLocation::kHost &&
+      !local_host_block_ids.has_value()) {
+    return absl::InvalidArgumentError(
+        "a host destination needs its host blocks in local_host_block_ids");
+  }
   auto session =
       std::shared_ptr<TransferReceiveSession>(new TransferReceiveSession(
-          base, staging_allocator, uuid, std::move(metrics_collector)));
+          base, staging_allocator, uuid, std::move(metrics_collector),
+          /*plan=*/nullptr, destination));
   session->pull_manager_ = manager;
   session->pull_endpoint_ = remote_endpoint;
   std::vector<int64_t> host_block_ids;
@@ -323,6 +333,9 @@ bool TransferReceiveSession::AllocateStagingForLoad(
     std::vector<int64_t>* host_block_ids) {
   absl::MutexLock lock(mu_);
   if (local_host_block_ids.has_value()) {
+    // Caller-named host blocks: explicit staging for a device destination, or
+    // the destination blocks themselves for a host destination (the manager's
+    // StartRead names them in `local_host_block_ids` either way).
     *host_block_ids = *local_host_block_ids;
     return true;
   }
@@ -507,6 +520,8 @@ TransferDetails TransferReceiveSession::Details() const {
 
 absl::string_view TransferReceiveSession::CurrentPhaseLocked() const {
   if (handshake_pending_) return kConnectPhase;
+  // A host-memory receive ends with the network; there is no H2D step.
+  if (destination_ == BlockLocation::kHost) return kReceivePhase;
   return network_completed_ ? kH2dPhase : kReceivePhase;
 }
 
@@ -665,7 +680,11 @@ absl::Status TransferReceiveSession::Start() {
     }
 
     absl::MutexLock lock(self->mu_);
-    if (!pull_status.ok()) {
+    // A receive that already settled (the data outran a slow control reply,
+    // which a host destination with no H2D step makes likely) keeps its
+    // verdict: the blocks it reports landed regardless of how the handshake
+    // ended.
+    if (!pull_status.ok() && !self->draining_) {
       self->FinishLocked(pull_status);
     }
     self->handshake_pending_ = false;
@@ -796,7 +815,40 @@ absl::Status TransferReceiveSession::OnDataReceived(
         absl::StrCat("pool completion for UUID ", uuid_,
                      " but the receiver was armed on the legacy path"));
   }
+  // A host destination has no H2D step: the layer report settles the layer.
+  if (destination_ == BlockLocation::kHost) {
+    return SettleHostLayer(major_dimension_idx);
+  }
   return ExecuteLayerH2d(major_dimension_idx);
+}
+
+absl::Status TransferReceiveSession::SettleHostLayer(size_t layer_idx) {
+  bool all_layers_done = false;
+  std::chrono::steady_clock::time_point session_start_time;
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) {
+      return absl::OkStatus();
+    }
+    ++num_completed_layers_;
+    if (num_completed_layers_ == static_cast<int32_t>(base_->num_layers())) {
+      // The transport reports a layer before it reports the layer's blocks,
+      // so the shard report that would normally close the network phase finds
+      // this receive already settled. Close it here: the last layer is the
+      // last packet, and there is no H2D after it.
+      all_layers_done = RecordNetworkCompleteLocked(/*all_complete=*/true,
+                                                    &session_start_time);
+    }
+  }
+  VLOG(1) << "OnDataReceived (host memory) layer " << layer_idx
+          << ": uuid=" << uuid_;
+  if (!all_layers_done) {
+    return absl::OkStatus();
+  }
+  RecordTransferDuration(
+      DurationMs(session_start_time, std::chrono::steady_clock::now()));
+  LOG(INFO) << "All layers landed in host memory: uuid=" << uuid_;
+  return absl::OkStatus();
 }
 
 absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {

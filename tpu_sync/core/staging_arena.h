@@ -354,6 +354,12 @@ class StagingBlockAllocator {
   int64_t max_blocks() const { return max_blocks_; }
   int64_t capacity() const;
   bool dynamic_host_staging() const { return dynamic_host_staging_; }
+  // True when this allocator hands out blocks of the host pool it was built
+  // over, as fixed slots carved out of it or as dynamic leases from it. A pool
+  // that nothing stages through is the caller's to address by block id.
+  bool LeasesHostBlocks() const {
+    return dynamic_host_staging_ || num_slots_ > 0;
+  }
 
  private:
   StagingBlockAllocator(kv_cache::LogicalBlockManager* host_block_manager,

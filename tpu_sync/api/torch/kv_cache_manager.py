@@ -15,7 +15,7 @@
 """High-performance PyTorch KV Cache Manager (repurposed as TransferEngine)."""
 
 import dataclasses
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 _HOST_IMPL = None
 _TORCH_IMPL = None
@@ -94,6 +94,26 @@ class PollStatsWithDetails:
   failed: List[SettledTransfer]
 
 
+# Where a transfer's blocks live on this manager: in the device KV caches it
+# wraps ("device"), or in its host pool ("host"). Host blocks are the ids
+# ``d2h`` / ``h2d`` address. "host" needs a manager built over a host pool
+# alone (``host_blocks_to_allocate``, no staging slots); with a control port
+# such a manager serves "host" reads only.
+BlockLocation = Literal["device", "host"]
+
+
+def _native_block_location(location: BlockLocation, what: str) -> Any:
+  """Maps ``location`` onto the extension's ``BlockLocation`` enum."""
+  impl = _torch_impl()
+  native_by_location = {
+      "device": impl.BlockLocation.DEVICE,
+      "host": impl.BlockLocation.HOST,
+  }
+  if location not in native_by_location:
+    raise ValueError(f"{what} must be 'device' or 'host', got {location!r}")
+  return native_by_location[location]
+
+
 class KVCacheManager:
   """Wrapper around compiled C++ KV Cache Manager.
 
@@ -125,13 +145,18 @@ class KVCacheManager:
     Args:
       kv_caches: List of device-placed contiguous Tensors representing the
         sharded KV caches.
-      local_control_port: TCP socket server port for control plane coordination.
+      local_control_port: TCP port for the pull-serve control server, which
+        only the producer (the ``register_read`` side) needs. With
+        ``max_blocks``/``num_slots``, 0 picks a free port. With
+        ``host_blocks_to_allocate``, > 0 serves host reads on that port and
+        <= 0 opens no server (the data port is always ephemeral).
       max_blocks: Maximum number of blocks per staging slot.
       num_slots: Number of transfer slots to allocate.
-      timeout_s: Timeout in seconds for transfer operations.
+      timeout_s: Timeout in seconds for transfer operations (ignored with
+        ``host_blocks_to_allocate``, where transfers use the 120 s default).
       unsafe_skip_buffer_lock: Skip dynamic safety locking.
       host_blocks_to_allocate: Legacy/unified total blocks to allocate in host
-        pool.
+        pool, with no staging slots (see ``BlockLocation``).
       parallelism: Number of parallel network copies per layer.
       node_id: This worker's index among the workers of its store: the
         workers registering with one controller must cover the dense range
@@ -178,9 +203,15 @@ class KVCacheManager:
             f" [1, {len(kv_caches)}] (number of kv_caches layers)."
         )
     if host_blocks_to_allocate is not None:
+      # A host-pool manager opens a control server only for a port > 0: the
+      # C++ constructor treats any port >= 0 as a request for one, and host-pool
+      # callers that never serve reads (store workers, benchmarks, pure
+      # consumers) pass 0.
+      control_port = local_control_port if local_control_port > 0 else -1
       self._impl = impl.KVCacheManager(
           kv_caches,
-          local_control_port if local_control_port > 0 else None,
+          # The data port is ephemeral; the control port is the caller's.
+          None,
           host_blocks_to_allocate,
           unsafe_skip_buffer_lock,
           parallelism,
@@ -191,6 +222,7 @@ class KVCacheManager:
           # node_id (see the non-host_blocks branch, which already forwards it).
           node_id=node_id,
           enable_shm=enable_shm,
+          local_control_port=control_port,
       )
     else:
       if max_blocks is None or num_slots is None:
@@ -508,24 +540,40 @@ class KVCacheManager:
     self._impl.RegisterRecv(uuid, req_id, expected_block_count)
 
   def register_read(
-      self, req_id: str, uuid: int, block_ids: List[int]
+      self,
+      req_id: str,
+      uuid: int,
+      block_ids: List[int],
+      source: BlockLocation = "device",
   ) -> bool:
     """Producer node notifies the registry/peer that blocks are ready for read.
 
     Args:
       req_id: The request ID of the transfer operation.
       uuid: The UUID of the request.
-      block_ids: The list of block IDs to be read.
+      block_ids: The block IDs to be read. Host blocks are pushed as they are
+        (no staging, no D2H): writes into them must have completed before this
+        call, and they must stay unchanged until the send settles.
+      source: Where ``block_ids`` live (see ``BlockLocation``).
 
     Returns:
       True if a transfer is indeed needed; False if there is nothing to be
       transferred.
 
     Raises:
-      ValueError: If `block_ids` contains duplicate block IDs.
+      ValueError: If ``source`` is not "device" or "host", if `block_ids`
+        repeats a block or (with "host") names one outside the host pool, or if
+        this manager cannot serve ``source`` (see ``BlockLocation``).
       RuntimeError: If `uuid` already has an active registered read.
     """
-    return bool(self._impl.notify_for_read(req_id, uuid, block_ids))
+    return bool(
+        self._impl.notify_for_read(
+            req_id,
+            uuid,
+            block_ids,
+            source=_native_block_location(source, "source"),
+        )
+    )
 
   def start_read(
       self,
@@ -535,15 +583,42 @@ class KVCacheManager:
       remote_block_ids: List[int],
       local_block_ids: List[int],
       parallelism: int = 1,
-  ) -> int:
-    """Consumer node initiates an asynchronous pull of blocks from a remote peer."""
-    return self._impl.start_read(
+      destination: BlockLocation = "device",
+  ) -> None:
+    """Consumer node starts an asynchronous pull of blocks from a remote peer.
+
+    Only the producer needs a control port. Failures after admission (e.g. the
+    producer never registered ``uuid``) are reported by ``poll_stats``, not
+    raised.
+
+    Args:
+      req_id: The request ID of the transfer operation.
+      uuid: The UUID of the request, as the producer registered it.
+      remote_endpoint: The producer's control endpoint, or its endpoint
+        descriptors.
+      remote_block_ids: The producer's block IDs, as it registered them.
+      local_block_ids: The blocks the pull lands in: device blocks copied into
+        from host staging, or host blocks (no repeats, no H2D) that settle once
+        every layer has arrived.
+      parallelism: Streams per layer.
+      destination: Where the read lands (see ``BlockLocation``).
+
+    Raises:
+      ValueError: If ``destination`` is not "device" or "host", if the block id
+        lists disagree in length, if a host destination names a block outside
+        the host pool or twice, or if this manager cannot hold ``destination``
+        (see ``BlockLocation``).
+      RuntimeError: If ``remote_endpoint`` is neither a str nor a list of
+        endpoint descriptors.
+    """
+    self._impl.start_read(
         req_id,
         uuid,
         remote_endpoint,
         remote_block_ids,
         local_block_ids,
         parallelism,
+        destination=_native_block_location(destination, "destination"),
     )
 
   def poll_stats(self) -> Tuple[List[str], List[str], List[str]]:

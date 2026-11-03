@@ -14,7 +14,9 @@
 
 """Host-only tests for the Python pool-admission surface."""
 
+import enum
 import unittest
+from unittest import mock
 
 from tpu_sync.api.torch import kv_cache_manager
 from tpu_sync.api.torch import pool_layout
@@ -245,6 +247,60 @@ class PollStatsWithDetailsTest(unittest.TestCase):
     self.assertEqual(failed.code, "DEADLINE_EXCEEDED")
     self.assertEqual(failed.reason, "Send session timed out")
     self.assertEqual(failed.phase, "d2h")
+
+
+class _FakeBlockLocation(enum.Enum):
+  """Stands in for the extension's ``BlockLocation`` enum."""
+
+  DEVICE = 0
+  HOST = 1
+
+
+class _FakeTorchModule:
+  BlockLocation = _FakeBlockLocation
+
+
+class _FakeReadImpl:
+
+  def __init__(self):
+    self.calls = []
+
+  def notify_for_read(self, *args, source):
+    self.calls.append((*args, source))
+    return 1
+
+  def start_read(self, *args, destination):
+    self.calls.append((*args, destination))
+
+
+class HostMemoryReadTest(unittest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    # The host-only test cannot load the torch extension; the wrapper only
+    # needs its BlockLocation enum here.
+    self.enterContext(
+        mock.patch.object(kv_cache_manager, "_TORCH_IMPL", _FakeTorchModule())
+    )
+
+  def test_read_source_and_destination(self):
+    manager = object.__new__(kv_cache_manager.KVCacheManager)
+    manager._impl = impl = _FakeReadImpl()  # pylint: disable=protected-access
+    with self.assertRaisesRegex(ValueError, "source must be 'device' or"):
+      manager.register_read("r", 7, [1], source="hbm")
+    with self.assertRaisesRegex(ValueError, "destination must be 'device' or"):
+      manager.start_read("r", 7, "h", [1], [1], destination="x")
+    self.assertEqual(impl.calls, [])
+
+    self.assertTrue(manager.register_read("r", 7, [1, 2], source="host"))
+    self.assertTrue(manager.register_read("r", 8, [3]))
+    manager.start_read("r", 7, "h", [1, 2], [5, 6], destination="host")
+    manager.start_read("r", 8, "h", [3], [9])
+    host, device = _FakeBlockLocation.HOST, _FakeBlockLocation.DEVICE
+    self.assertEqual(impl.calls[0], ("r", 7, [1, 2], host))
+    self.assertEqual(impl.calls[1], ("r", 8, [3], device))
+    self.assertEqual(impl.calls[2], ("r", 7, "h", [1, 2], [5, 6], 1, host))
+    self.assertEqual(impl.calls[3], ("r", 8, "h", [3], [9], 1, device))
 
 
 if __name__ == "__main__":

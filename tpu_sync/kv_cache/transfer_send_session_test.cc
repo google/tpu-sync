@@ -50,6 +50,7 @@ namespace {
 
 using ::absl_testing::StatusIs;
 using ::testing::AllOf;
+using ::testing::ElementsAre;
 using ::testing::HasSubstr;
 
 class FakeSendBase : public kv_cache::KVCacheManagerBase {
@@ -113,6 +114,18 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
     return h2h_calls_;
   }
 
+  // One H2hWriteDirectAsync call, as the session issued it.
+  struct H2hPush {
+    int layer_idx;
+    std::vector<int> src_block_ids;
+    std::vector<int> dst_block_ids;
+  };
+
+  std::vector<H2hPush> h2h_pushes() const {
+    absl::MutexLock lock(mu_);
+    return h2h_pushes_;
+  }
+
   bool WaitForH2hCalls(int expected, absl::Duration timeout) const {
     absl::MutexLock lock(mu_);
     auto cond = [this, expected]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
@@ -159,6 +172,7 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
     {
       absl::MutexLock lock(mu_);
       ++h2h_calls_;
+      h2h_pushes_.push_back({layer_idx, src_block_ids, dst_block_ids});
       if (manual_h2h_) {
         h2h_callbacks_.push_back(std::move(on_complete));
         return;
@@ -176,6 +190,7 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
   std::optional<size_t> fail_d2h_layer_ ABSL_GUARDED_BY(mu_);
   absl::Status fail_d2h_status_ ABSL_GUARDED_BY(mu_);
   std::function<void(size_t)> d2h_dispatch_hook_ ABSL_GUARDED_BY(mu_);
+  std::vector<H2hPush> h2h_pushes_ ABSL_GUARDED_BY(mu_);
   std::vector<xla::Promise<>> d2h_promises_ ABSL_GUARDED_BY(mu_);
   std::vector<std::function<void(absl::StatusOr<std::vector<int>>)>>
       h2h_callbacks_ ABSL_GUARDED_BY(mu_);
@@ -214,6 +229,27 @@ absl::Status SeedIdleDataConnection(transport::BlockTransport& sender,
   return sender.AsyncPush({peer}, /*src_block_ids=*/{0}, /*dst_block_ids=*/{0})
       .Await()
       .status();
+}
+
+// A producer whose registered blocks {2, 0} live in its host pool
+// (BlockLocation::kHost), with the pull already validated.
+std::shared_ptr<TransferSendSession> CreateHostSendSession(
+    FakeSendBase& base, StagingBlockAllocator* allocator) {
+  const auto now = std::chrono::steady_clock::now();
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator, /*uuid=*/200, /*block_ids=*/{2, 0},
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now,
+      BlockLocation::kHost);
+  session->ValidateAndBeginPull({2, 0}, now);
+  return session;
+}
+
+// The allocator of a manager built over a host pool alone: no staging slots
+// are carved out of the pool, so every host block id is the caller's. The
+// manager admits host-memory transfers only on such a pool.
+std::unique_ptr<StagingBlockAllocator> CreateHostPoolAllocator(
+    FakeSendBase& base) {
+  return CreateStagingBlockAllocator(&base, /*num_slots=*/0, /*max_blocks=*/0);
 }
 
 TEST(TransferSendSessionTest,
@@ -829,6 +865,121 @@ TEST(TransferSendSessionTest, CancelledSendWhosePushThenFailsKeepsCancelled) {
   base.CompleteH2h(0, absl::InternalError("push failed"));
   EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
   EXPECT_EQ(allocator->num_free_slots(), 2);
+}
+
+TEST(TransferSendSessionTest,
+     HostSourcePushesRegisteredHostBlocksWithoutStagingOrD2h) {
+  FakeSendBase base(/*num_layers=*/3, /*host_blocks=*/4);
+  base.SetManualH2h(true);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateHostPoolAllocator(base);
+  std::shared_ptr<TransferSendSession> session =
+      CreateHostSendSession(base, allocator.get());
+
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{2, 0},
+                     /*dst_block_ids=*/{1, 3});
+  ASSERT_TRUE(base.WaitForH2hCalls(3, absl::Seconds(2)));
+
+  // Every layer is pushed straight from the registered host blocks: no
+  // staging is leased and no D2H copy is issued; the already-OK D2H futures
+  // stand in for the copies, so a reader gating on a layer is never held.
+  EXPECT_EQ(base.d2h_calls(), 0);
+  EXPECT_EQ(base.host_block_manager()->num_free_blocks(), 4);
+  tsl::Future<> layer_ready =
+      session->GetDataReadyFuture(/*major_dimension_idx=*/2);
+  EXPECT_TRUE(layer_ready.IsReady());
+  ABSL_EXPECT_OK(layer_ready.Await());
+  std::vector<int> layers;
+  for (const FakeSendBase::H2hPush& push : base.h2h_pushes()) {
+    layers.push_back(push.layer_idx);
+    EXPECT_THAT(push.src_block_ids, ElementsAre(2, 0));
+    EXPECT_THAT(push.dst_block_ids, ElementsAre(1, 3));
+  }
+  EXPECT_THAT(layers, ElementsAre(0, 1, 2));
+
+  // The send settles with the last push to complete, whichever layer it is.
+  base.CompleteH2h(0, std::vector<int>{2, 0});
+  base.CompleteH2h(2, std::vector<int>{2, 0});
+  EXPECT_FALSE(session->Done());
+  base.CompleteH2h(1, std::vector<int>{2, 0});
+  ABSL_EXPECT_OK(session->AwaitForDone());
+  EXPECT_EQ(base.host_block_manager()->num_free_blocks(), 4);
+}
+
+TEST(TransferSendSessionTest,
+     HostSourceFailedLayerPushFailsTheSendOnceInFlightLayersDrain) {
+  FakeSendBase base(/*num_layers=*/2, /*host_blocks=*/4);
+  base.SetManualH2h(true);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateHostPoolAllocator(base);
+  std::shared_ptr<TransferSendSession> session =
+      CreateHostSendSession(base, allocator.get());
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{2, 0},
+                     /*dst_block_ids=*/{1, 3});
+  ASSERT_TRUE(base.WaitForH2hCalls(2, absl::Seconds(2)));
+
+  // Layer 0's push fails: the send drains, but is not done while layer 1's
+  // push is still in flight.
+  base.CompleteH2h(0, absl::InternalError("socket reset"));
+  EXPECT_TRUE(session->IsDraining());
+  EXPECT_FALSE(session->Done());
+  EXPECT_THAT(session->GetStatus(), StatusIs(absl::StatusCode::kInternal));
+
+  base.CompleteH2h(1, std::vector<int>{2, 0});
+  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kInternal));
+  EXPECT_EQ(session->Details().phase, "push");
+}
+
+TEST(TransferSendSessionTest,
+     HostSourceDeadlineWhilePushingIsAttributedToThePushPhase) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  base.SetManualH2h(true);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateHostPoolAllocator(base);
+  std::shared_ptr<TransferSendSession> session =
+      CreateHostSendSession(base, allocator.get());
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{2, 0},
+                     /*dst_block_ids=*/{1, 3});
+  ASSERT_TRUE(base.WaitForH2hCalls(1, absl::Seconds(2)));
+
+  // A host send has no staging or D2H step, so a deadline that strikes while
+  // its push runs is attributed to the push rather than to staging.
+  session->Finish(absl::DeadlineExceededError("send deadline exceeded"));
+  base.CompleteH2h(0, std::vector<int>{2, 0});
+  EXPECT_THAT(session->AwaitForDone(),
+              StatusIs(absl::StatusCode::kDeadlineExceeded));
+  EXPECT_EQ(session->Details().phase, "push");
+}
+
+TEST(TransferSendSessionTest, HostSourceWithNoLayersSettlesWithoutAPush) {
+  FakeSendBase base(/*num_layers=*/0, /*host_blocks=*/4);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateHostPoolAllocator(base);
+  std::shared_ptr<TransferSendSession> session =
+      CreateHostSendSession(base, allocator.get());
+
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{2, 0},
+                     /*dst_block_ids=*/{1, 3});
+
+  ABSL_EXPECT_OK(session->AwaitForDone());
+  EXPECT_EQ(base.h2h_calls(), 0);
+  EXPECT_EQ(base.d2h_calls(), 0);
+}
+
+TEST(TransferSendSessionTest, HostSourceFinishedBeforeStartPushIssuesNothing) {
+  FakeSendBase base(/*num_layers=*/2, /*host_blocks=*/4);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateHostPoolAllocator(base);
+  std::shared_ptr<TransferSendSession> session =
+      CreateHostSendSession(base, allocator.get());
+  session->Finish(absl::CancelledError("consumer went away"));
+
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{2, 0},
+                     /*dst_block_ids=*/{1, 3});
+
+  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_EQ(base.h2h_calls(), 0);
+  EXPECT_EQ(base.d2h_calls(), 0);
 }
 
 }  // namespace

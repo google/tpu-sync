@@ -229,6 +229,7 @@ nanobind_extension(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/fault_injection:fault_injection_bindings",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
+        "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
         "//tpu_sync/kv_cache:kv_cache_store",
         "//tpu_sync/kv_cache:kv_cache_store_backend_factory",
         "//tpu_sync/kv_cache:kv_cache_store_wrapper",

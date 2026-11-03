@@ -21,6 +21,17 @@ def Accounted (s : Send) : Prop :=
     (if s.d2hPending then 1 else 0) + (s.d2hIssued - s.d2hRetired) + (s.queued - s.woken) +
       s.pooled + s.chaining + (s.h2hIssued - s.h2hRetired)
 
+/-- Single-baton invariant of `TransferSendSession::SendNextLayer`'s push chain:
+at most one layer is waiting on its future (`queued - woken`), queued on
+`push_pool` (`pooled`), or chaining into the next layer (`chaining`). -/
+structure ChainInv (s : Send) : Prop where
+  chain_le : (s.queued - s.woken) + s.pooled + s.chaining ≤ 1
+  woken_bounds : s.h2hIssued ≤ s.woken ∧ s.woken ≤ s.h2hIssued + 1
+  pooled_state : s.pooled = 1 → s.woken = s.h2hIssued + 1 ∧ s.h2hIssued < s.d2hIssued
+  chaining_state : s.chaining = 1 → s.woken = s.h2hIssued
+  woken_ahead : s.woken = s.h2hIssued + 1 →
+    s.queued = s.woken ∧ s.chaining = 0 ∧ (s.pooled = 1 ∨ s.life.draining = true)
+
 structure Inv (s : Send) : Prop where
   life : s.life.Consistent
   accounted : Accounted s
@@ -39,9 +50,11 @@ structure Inv (s : Send) : Prop where
   published_done : ∀ b, s.published = some b → s.life.done = true
   /-- Once published as done, every layer had been pushed (and still has). -/
   published_ok : s.published = some true → s.h2hOk = s.numLayers
+  /-- Single-baton invariant of `SendNextLayer`'s sequential push chain. -/
+  chain : ChainInv s
 
 theorem inv_init (n : Nat) : Inv (init n) := by
-  refine ⟨Lifecycle.consistent_init, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
+  refine ⟨Lifecycle.consistent_init, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ⟨?_, ?_, ?_, ?_, ?_⟩⟩ <;>
     simp [init, Accounted, CountersOrdered, PullClaimed]
 
 theorem inv_noOpLeak {s : Send} (h : Inv s) : NoOpLeak s := by
@@ -92,7 +105,7 @@ theorem inv_noOpLeak {s : Send} (h : Inv s) : NoOpLeak s := by
 
 theorem inv_safe {s : Send} (h : Inv s) : Safe s := by
   have hnl := inv_noOpLeak h
-  obtain ⟨hl, hacc, hu, hcnt, hpc, _, _, _, hpd, hpub⟩ := h
+  obtain ⟨hl, hacc, hu, hcnt, hpc, _, _, _, hpd, hpub, _⟩ := h
   unfold Accounted at hacc
   unfold CountersOrdered at hcnt
   refine ⟨hl.done_idle, ?_, hl.staging, hl.prompt, hu, hpub, hcnt, hnl, hpc, ?_⟩
@@ -136,9 +149,176 @@ theorem trySendNext_cases (s : Send) :
     · left; rfl
   · left; rfl
 
+private theorem endOp_draining (s : Send) (hdr : s.life.draining = true) :
+    s.endOp.life.draining = true := by
+  unfold endOp Lifecycle.endOpLocked Lifecycle.settleLocked
+  split
+  · exact hdr
+  · split <;> exact hdr
+
+private theorem chainInv_of_same {s s' : Send} (hc : ChainInv s)
+    (hQ : s'.queued = s.queued) (hW : s'.woken = s.woken) (hP : s'.pooled = s.pooled)
+    (hC : s'.chaining = s.chaining) (hH : s'.h2hIssued = s.h2hIssued)
+    (hD : s.d2hIssued ≤ s'.d2hIssued)
+    (hDr : s.life.draining = true → s'.life.draining = true) :
+    ChainInv s' := by
+  refine ⟨by rw [hQ, hW, hP, hC]; exact hc.chain_le,
+    by rw [hH, hW]; exact hc.woken_bounds,
+    fun hp => by obtain ⟨hw, hlt⟩ := hc.pooled_state (hP ▸ hp); exact ⟨by omega, by omega⟩,
+    fun hch => by have := hc.chaining_state (hC ▸ hch); omega,
+    fun ha => ?_⟩
+  obtain ⟨hq, hch, hpdr⟩ := hc.woken_ahead (by omega)
+  exact ⟨by omega, by omega, hpdr.imp (fun hp => hP ▸ hp) hDr⟩
+
+@[simp] private theorem finish_queued (ok : Bool) (s : Send) : (s.finish ok).queued = s.queued := rfl
+@[simp] private theorem finish_woken (ok : Bool) (s : Send) : (s.finish ok).woken = s.woken := rfl
+@[simp] private theorem finish_pooled (ok : Bool) (s : Send) : (s.finish ok).pooled = s.pooled := rfl
+@[simp] private theorem finish_chaining (ok : Bool) (s : Send) : (s.finish ok).chaining = s.chaining := rfl
+@[simp] private theorem finish_h2hIssued (ok : Bool) (s : Send) : (s.finish ok).h2hIssued = s.h2hIssued := rfl
+@[simp] private theorem finish_d2hIssued (ok : Bool) (s : Send) : (s.finish ok).d2hIssued = s.d2hIssued := rfl
+@[simp] private theorem endOp_queued (s : Send) : s.endOp.queued = s.queued := by unfold endOp; split <;> rfl
+@[simp] private theorem endOp_woken (s : Send) : s.endOp.woken = s.woken := by unfold endOp; split <;> rfl
+@[simp] private theorem endOp_pooled (s : Send) : s.endOp.pooled = s.pooled := by unfold endOp; split <;> rfl
+@[simp] private theorem endOp_chaining (s : Send) : s.endOp.chaining = s.chaining := by unfold endOp; split <;> rfl
+@[simp] private theorem endOp_h2hIssued (s : Send) : s.endOp.h2hIssued = s.h2hIssued := by unfold endOp; split <;> rfl
+@[simp] private theorem endOp_d2hIssued (s : Send) : s.endOp.d2hIssued = s.d2hIssued := by unfold endOp; split <;> rfl
+
+theorem step_chainInv {s s' : Send} {e : Ev}
+    (hl : s.life.Consistent) (hcnt : CountersOrdered s) (hacc : Accounted s)
+    (hqs : 0 < s.queued → s.started = true) (hc : ChainInv s)
+    (hs : step s e = some s') : ChainInv s' := by
+  unfold CountersOrdered at hcnt; unfold Accounted at hacc
+  cases e with
+  | beginPull =>
+    simp only [step, beginPull] at hs; split at hs <;> cases hs
+    exact chainInv_of_same hc rfl rfl rfl rfl rfl (Nat.le_refl _) id
+  | start =>
+    simp only [step, start] at hs; split at hs
+    · cases hs
+    · rename_i hng
+      have hst : s.started = false := by cases h : s.started <;> simp_all
+      have hq0 : s.queued = 0 := by
+        cases hq : s.queued with
+        | zero => rfl
+        | succ _ => have := hqs (by omega); simp [hst] at this
+      have hw0 : s.woken = 0 := by omega
+      have hh0 : s.h2hIssued = 0 := by omega
+      have hp0 : s.pooled = 0 := by omega
+      have hch0 : s.chaining = 0 := by omega
+      split at hs <;> simp only [Option.some.injEq] at hs <;> subst hs
+      · refine ⟨by simp; omega, by simp; omega, by simp [hp0], by simp [hch0], fun ha => by simp [hw0, hh0] at ha⟩
+      · rcases trySendNext_cases { s with started := true } with heq | ⟨_, _, _, heq⟩ <;>
+          (rw [heq]; refine ⟨by simp [hq0, hw0, hp0, hch0], by simp [hw0, hh0],
+            by simp [hp0], by simp [hch0], fun ha => by simp [hw0, hh0] at ha⟩)
+  | d2hBegin =>
+    simp only [step, d2hBegin] at hs; split at hs <;> try cases hs
+    rcases Option.map_eq_some_iff.mp hs with ⟨l, hb, rfl⟩
+    obtain ⟨_, hdr0⟩ := Lifecycle.beginOp_active hb
+    exact chainInv_of_same hc rfl rfl rfl rfl rfl (Nat.le_refl _) (fun h => by simp [hdr0] at h)
+  | d2hIssue ok =>
+    simp only [step, d2hIssue] at hs; split at hs
+    · cases hs
+    · split at hs <;> simp only [Option.some.injEq] at hs <;> subst hs
+      · exact chainInv_of_same hc rfl rfl rfl rfl rfl (Nat.le_succ _) id
+      · exact chainInv_of_same hc (by simp) (by simp) (by simp) (by simp) (by simp) (by simp)
+          (fun _ => endOp_draining _ (hl.finishOnceLocked_draining false))
+  | d2hReady =>
+    simp only [step, markD2hReady] at hs; split at hs <;> cases hs
+    exact chainInv_of_same hc rfl rfl rfl rfl rfl (Nat.le_refl _) id
+  | d2hEnd =>
+    simp only [step, d2hEnd] at hs; split at hs <;> cases hs
+    exact chainInv_of_same hc (by simp) (by simp) (by simp) (by simp) (by simp) (by simp)
+      (fun hdr => endOp_draining _ hdr)
+  | wake ok =>
+    simp only [step, wake] at hs; split at hs
+    · rename_i hg; obtain ⟨_, hbr⟩ := hg
+      have hp0 : s.pooled = 0 := by have := hc.chain_le; omega
+      have hch0 : s.chaining = 0 := by have := hc.chain_le; omega
+      have hwh : s.woken = s.h2hIssued := by
+        have := hc.woken_bounds
+        by_cases heq : s.woken = s.h2hIssued + 1
+        · have := (hc.woken_ahead heq).1; omega
+        · omega
+      have hqw : s.queued = s.woken + 1 := by have := hc.chain_le; omega
+      split at hs
+      · simp only [Option.some.injEq] at hs; subst hs
+        refine ⟨by simp [hp0, hch0]; omega, by simp [hwh], by simp [hp0], by simp [hch0],
+          fun _ => ⟨by simp [hqw], by simp [hch0],
+            Or.inr (endOp_draining _ (hl.finishOnceLocked_draining false))⟩⟩
+      · split at hs <;> rename_i hok hdr <;> simp only [Option.some.injEq] at hs <;> subst hs
+        · refine ⟨by simp [hp0, hch0]; omega, by simp [hwh], by simp [hp0], by simp [hch0],
+            fun _ => ⟨by simp [hqw], by simp [hch0], Or.inr (endOp_draining _ hdr)⟩⟩
+        · have hdr_f : s.life.draining = false := by cases h : s.life.draining <;> simp_all
+          have hlt : s.h2hIssued < s.d2hIssued := by
+            rcases hbr with hwr | ⟨_, hdr_t, _, _⟩
+            · omega
+            · simp [hdr_f] at hdr_t
+          exact ⟨by simp; omega, by simp; omega, fun _ => ⟨by simp [hwh], hlt⟩,
+            by simp [hch0], fun _ => ⟨by simp [hqw], hch0, Or.inl (by simp [hp0])⟩⟩
+    · cases hs
+  | h2hIssue =>
+    simp only [step, h2hIssue] at hs; split at hs
+    · cases hs
+    · have hp1 : s.pooled = 1 := by have := hc.chain_le; omega
+      obtain ⟨hwh, _⟩ := hc.pooled_state hp1
+      have hqw : s.queued = s.woken := by have := hc.chain_le; omega
+      have hch0 : s.chaining = 0 := by have := hc.chain_le; omega
+      split at hs <;> simp only [Option.some.injEq] at hs <;> subst hs
+      · exact ⟨by simp [hp1, hqw, hch0], by simp [hwh], by simp [hp1],
+          fun _ => by simp [hwh], fun ha => by simp [hwh] at ha⟩
+      · rename_i hnone
+        have hnd : s.life.done = false := by
+          cases hd : s.life.done
+          · rfl
+          · have := hl.done_idle hd; omega
+        have hdr : s.life.draining = true := by
+          unfold Lifecycle.beginOp at hnone; split at hnone
+          · rename_i hc0; exact hc0.elim (fun hd => by simp [hnd] at hd) id
+          · cases hnone
+        exact ⟨by simp [hp1, hqw, hch0], by simp [hwh], by simp [hp1], by simp [hch0],
+          fun _ => ⟨by simp [hqw], by simp [hch0], Or.inr (endOp_draining _ hdr)⟩⟩
+  | sendNext =>
+    simp only [step, sendNext] at hs; split at hs
+    · cases hs
+    · simp only [Option.some.injEq] at hs; subst hs
+      have hch1 : s.chaining = 1 := by have := hc.chain_le; omega
+      have hwh : s.woken = s.h2hIssued := hc.chaining_state hch1
+      have hqw : s.queued = s.woken := by have := hc.chain_le; omega
+      have hp0 : s.pooled = 0 := by have := hc.chain_le; omega
+      rcases trySendNext_cases { s with chaining := s.chaining - 1 } with heq | ⟨_, _, _, heq⟩ <;>
+        (rw [heq]; exact ⟨by simp [hqw, hp0, hch1], by simp [hwh], by simp [hp0],
+          by simp [hch1], fun ha => by simp [hwh] at ha⟩)
+  | h2hDone ok =>
+    simp only [step, h2hDone] at hs; split at hs <;> try cases hs
+    split at hs <;> simp only [Option.some.injEq] at hs <;> subst hs
+    · split
+      · exact chainInv_of_same hc (by simp) (by simp) (by simp) (by simp) (by simp) (by simp)
+          (fun _ => endOp_draining _ (hl.finishOnceLocked_draining true))
+      · exact chainInv_of_same hc (by simp) (by simp) (by simp) (by simp) (by simp) (by simp)
+          (fun hdr => endOp_draining _ hdr)
+    · exact chainInv_of_same hc (by simp) (by simp) (by simp) (by simp) (by simp) (by simp)
+        (fun _ => endOp_draining _ (hl.finishOnceLocked_draining false))
+  | cancel =>
+    cases hs
+    exact chainInv_of_same hc (by simp) (by simp) (by simp) (by simp) (by simp) (by simp)
+      (fun _ => hl.finishOnceLocked_draining false)
+  | publish =>
+    simp only [step, publish] at hs; split at hs <;> cases hs
+    exact chainInv_of_same hc rfl rfl rfl rfl rfl (Nat.le_refl _) id
+
 /-- Each event preserves the invariant. -/
 theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : Inv s' := by
-  obtain ⟨hl, hacc, hu, hcnt, hpc, hqs, hwi, hdr, hpd, hpub⟩ := h
+  obtain ⟨hl, hacc, hu, hcnt, hpc, hqs, hwi, hdr, hpd, hpub, hc⟩ := h
+  have hc' : ChainInv s' := step_chainInv hl hcnt hacc hqs hc hs
+  suffices hb :
+      s'.life.Consistent ∧ Accounted s' ∧ s'.underflow = false ∧ CountersOrdered s' ∧
+      PullClaimed s' ∧ (0 < s'.queued → s'.started = true) ∧
+      (s'.d2hIssued < s'.woken → s'.life.draining = true ∧ s'.d2hPending = false) ∧
+      (s'.life.statusOk = true → s'.life.draining = true → s'.h2hOk = s'.numLayers) ∧
+      (∀ b, s'.published = some b → s'.life.done = true) ∧
+      (s'.published = some true → s'.h2hOk = s'.numLayers) by
+    obtain ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10⟩ := hb
+    exact ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, hc'⟩
   unfold Accounted at hacc
   unfold CountersOrdered at hcnt
   cases e with
@@ -168,7 +348,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
         dsimp only [finish]
         refine ⟨Lifecycle.finishOnceLocked_consistent true hl,
           by unfold Accounted; simpa using hacc, hu, hcnt, hpc, hqs, ?_,
-          by intro _ _; simp; omega,
+          by intro _ _; omega,
           fun b hp => Lifecycle.finishOnceLocked_done_mono true (hpd b hp), hpub⟩
         intro hlt
         obtain ⟨_, hp⟩ := hwi hlt

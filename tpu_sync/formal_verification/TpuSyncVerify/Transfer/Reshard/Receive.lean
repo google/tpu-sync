@@ -119,8 +119,8 @@ Session-level fields:
 ## Lock scopes
 
 Every mutable field of `ReshardReceiveSession` is `ABSL_GUARDED_BY(mu_)`;
-`base_`, `deadline_`, `start_time_`, and `transfer_plan_` (whose request
-supplies the uuid and req_id) are `const`.
+`base_`, `staging_allocator_`, `uuid_`, `req_id_`, `sub_plan_index_`,
+`sub_plan_count_`, `deadline_`, and `start_time_` are `const`.
 
 | Event | `mu_` scopes | Between them |
 |---|---|---|

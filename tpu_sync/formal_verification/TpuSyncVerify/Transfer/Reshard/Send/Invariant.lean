@@ -25,10 +25,9 @@ def SettlesPromptly (s : Send) : Prop :=
 def ActiveOrDraining (s : Send) : Prop :=
   s.life.draining = false → 0 < s.life.inFlight
 
-def PlanIntegrity (pol : UnregisterPolicy) (s : Send) : Prop :=
+def PlanIntegrity (s : Send) : Prop :=
   (s.life.done = true → s.planUnregistered = true) ∧
-  (s.planUnregistered = true → s.life.draining = true) ∧
-  (pol = .onSettle → s.planUnregistered = true → s.life.done = true)
+  (s.planUnregistered = true → s.life.draining = true)
 
 def Publication (s : Send) : Prop :=
   s.published = some true → s.remainingPushes = 0 ∧ allPushed s.pools = true
@@ -37,19 +36,19 @@ def drainEvents (n : Nat) : List Ev :=
   [.execFinish] ++
   (List.range n).flatMap fun p => [.d2hIssue p false, .d2hDone p true, .pushDone p true]
 
-def NoOpLeak (pol : UnregisterPolicy) (s : Send) : Prop :=
-  0 < s.life.inFlight → ∃ e ∈ drainEvents s.pools.length, (step pol s e).isSome = true
+def NoOpLeak (s : Send) : Prop :=
+  0 < s.life.inFlight → ∃ e ∈ drainEvents s.pools.length, (step s e).isSome = true
 
-def Safe (pol : UnregisterPolicy) (s : Send) : Prop :=
+def Safe (s : Send) : Prop :=
   SettleSafe s ∧ NoRetiredCallback s ∧ StagingIntegrity s ∧ SettlesPromptly s ∧
-    ActiveOrDraining s ∧ PlanIntegrity pol s ∧ Publication s ∧ NoOpLeak pol s
+    ActiveOrDraining s ∧ PlanIntegrity s ∧ Publication s ∧ NoOpLeak s
 
 /-! ## Inductive invariant -/
 
 def Accounted (s : Send) : Prop :=
   s.life.inFlight = (if s.execActive then 1 else 0) + poolOps s.pools
 
-structure Inv (pol : UnregisterPolicy) (s : Send) : Prop where
+structure Inv (s : Send) : Prop where
   valid : validPools s.pools = true
   life : s.life.Consistent
   accounted : Accounted s
@@ -59,14 +58,13 @@ structure Inv (pol : UnregisterPolicy) (s : Send) : Prop where
   ok_draining : s.life.statusOk = true → s.life.draining = true →
     s.remainingPushes = 0 ∧ allPushed s.pools = true
   plan_draining : s.planUnregistered = true → s.life.draining = true
-  plan_onSettle : pol = .onSettle → s.planUnregistered = true → s.life.done = true
   done_plan : s.life.done = true → s.planUnregistered = true
   published_done : ∀ b, s.published = some b → s.life.done = true
   published_ok : s.published = some true → s.remainingPushes = 0 ∧ allPushed s.pools = true
 
-theorem inv_init (pol : UnregisterPolicy) {ns : List Nat} (h : validSchedule ns = true) :
-    Inv pol (init ns) := by
-  refine ⟨validPools_init h, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+theorem inv_init {ns : List Nat} (h : validSchedule ns = true) :
+    Inv (init ns) := by
+  refine ⟨validPools_init h, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · constructor <;> simp [init]
   · simp [init, Accounted, poolOps_init]
   · simp [init]
@@ -77,9 +75,8 @@ theorem inv_init (pol : UnregisterPolicy) {ns : List Nat} (h : validSchedule ns 
   · simp [init]
   · simp [init]
   · simp [init]
-  · simp [init]
 
-theorem inv_activeOrDraining {pol : UnregisterPolicy} {s : Send} (h : Inv pol s) :
+theorem inv_activeOrDraining {s : Send} (h : Inv s) :
     ActiveOrDraining s := by
   intro hdr
   have hacc := h.accounted; unfold Accounted at hacc
@@ -107,7 +104,7 @@ theorem mem_drainEvents_pushDone {n p : Nat} (hp : p < n) :
   simp only [drainEvents, List.mem_append, List.mem_flatMap, List.mem_range]
   exact Or.inr ⟨p, hp, by simp⟩
 
-theorem inv_noOpLeak {pol : UnregisterPolicy} {s : Send} (h : Inv pol s) : NoOpLeak pol s := by
+theorem inv_noOpLeak {s : Send} (h : Inv s) : NoOpLeak s := by
   intro hif
   have hacc := h.accounted; unfold Accounted at hacc
   cases hex : s.execActive
@@ -133,10 +130,10 @@ theorem inv_noOpLeak {pol : UnregisterPolicy} {s : Send} (h : Inv pol s) : NoOpL
     · refine ⟨.execFinish, by simp [drainEvents], ?_⟩
       simp [step, execFinish, hex, hiss]
 
-theorem inv_safe {pol : UnregisterPolicy} {s : Send} (h : Inv pol s) : Safe pol s := by
+theorem inv_safe {s : Send} (h : Inv s) : Safe s := by
   have hacc := h.accounted; unfold Accounted at hacc
   refine ⟨h.life.done_idle, ?_, h.life.staging, h.life.prompt,
-    inv_activeOrDraining h, ⟨h.done_plan, h.plan_draining, h.plan_onSettle⟩,
+    inv_activeOrDraining h, ⟨h.done_plan, h.plan_draining⟩,
     h.published_ok, inv_noOpLeak h⟩
   intro hd
   have h0 := h.life.done_idle hd
@@ -156,7 +153,7 @@ theorem consistent_add_inFlight_of_pos {l : Lifecycle} (h : l.Consistent)
   constructor <;> simp [hnd, h.staging]
   intro _ h0; omega
 
-theorem endOp_inv {pol : UnregisterPolicy} {s : Send}
+theorem endOp_inv {s : Send}
     (hvalid : validPools s.pools = true)
     (hlife : s.life.Consistent)
     (hpos : 0 < s.life.inFlight)
@@ -167,17 +164,16 @@ theorem endOp_inv {pol : UnregisterPolicy} {s : Send}
     (hok : s.life.statusOk = true → s.life.draining = true →
       s.remainingPushes = 0 ∧ allPushed s.pools = true)
     (hplan_dr : s.planUnregistered = true → s.life.draining = true)
-    (hplan_os : pol = .onSettle → s.planUnregistered = true → s.life.done = true)
     (_hdone_pl : s.life.done = true → s.planUnregistered = true)
     (hpub_d : ∀ b, s.published = some b → s.life.done = true)
     (hpub_ok : s.published = some true → s.remainingPushes = 0 ∧ allPushed s.pools = true) :
-    Inv pol (endOp s) := by
+    Inv (endOp s) := by
   have hnd : s.life.done = false := by
     cases hd : s.life.done
     · rfl
     · have := hlife.done_idle hd; omega
   unfold endOp
-  refine ⟨hvalid, Lifecycle.endOpLocked_consistent hlife, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, hpub_ok⟩
+  refine ⟨hvalid, Lifecycle.endOpLocked_consistent hlife, ?_, ?_, ?_, ?_, ?_, ?_, ?_, hpub_ok⟩
   · unfold Accounted
     simp only [Lifecycle.endOpLocked_inFlight]
     omega
@@ -197,16 +193,6 @@ theorem endOp_inv {pol : UnregisterPolicy} {s : Send}
       simp only [Bool.and_eq_true] at hc
       intro _; exact hc.1.2
     · exact hplan_dr
-  · intro hpol
-    dsimp only
-    split
-    · rename_i hc
-      simp only [Bool.and_eq_true, beq_iff_eq, Bool.not_eq_true'] at hc
-      intro _
-      unfold Lifecycle.endOpLocked
-      simp [Lifecycle.settleLocked, hc.1.1, hc.1.2, hc.2]
-    · intro hp
-      exact Lifecycle.endOpLocked_done_mono (hplan_os hpol hp)
   · dsimp only
     split
     · intro _; rfl
@@ -226,8 +212,8 @@ theorem endOp_inv {pol : UnregisterPolicy} {s : Send}
   · intro b hb
     exact Lifecycle.endOpLocked_done_mono (hpub_d b hb)
 
-theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
-    (h : Inv pol s) (hs : step pol s e = some s') : Inv pol s' := by
+theorem step_inv {s s' : Send} {e : Ev}
+    (h : Inv s) (hs : step s e = some s') : Inv s' := by
   have hacc := h.accounted; unfold Accounted at hacc
   have hallPos : allPosPeers s.pools = true := by
     have hv := h.valid; unfold validPools at hv
@@ -262,7 +248,7 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
           split at hs
           · cases hs
             refine ⟨hvalid', consistent_add_inFlight_of_pos h.life hif_pos 1,
-              ?_, ?_, ?_, ?_, h.plan_draining, h.plan_onSettle, h.done_plan,
+              ?_, ?_, ?_, ?_, h.plan_draining, h.done_plan,
               h.published_done, ?_⟩
             · unfold Accounted
               simp only [hex_t, ↓reduceIte] at hacc ⊢
@@ -288,7 +274,7 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
               rcases hact with hd | hdr
               · simp [hnd] at hd
               · refine endOp_inv hvalid_ab h.life hif_pos ?_ ?_ ?_ ?_
-                  h.plan_draining h.plan_onSettle h.done_plan h.published_done ?_
+                  h.plan_draining h.done_plan h.published_done ?_
                 · simp only [hex_t, ↓reduceIte] at hacc
                   simp only [hpend, SendStage.opCount] at hpo_ab
                   simp; omega
@@ -304,7 +290,7 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
               simp only [not_or, Bool.not_eq_true] at hact
               obtain ⟨_, hdr⟩ := hact
               refine endOp_inv hvalid_ab (Lifecycle.finishLocked_consistent false h.life)
-                ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
+                ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
               · simp [Lifecycle.finishLocked_inFlight, hif_pos]
               · simp only [hex_t, ↓reduceIte] at hacc
                 simp only [hpend, SendStage.opCount] at hpo_ab
@@ -313,11 +299,6 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
               · simp
               · simp
               · simp
-              · intro hpol
-                simp only [hpol, beq_iff_eq, reduceCtorEq, ↓reduceIte]
-                intro hp
-                have hd := h.plan_onSettle hpol hp
-                simp [hnd] at hd
               · intro hd
                 simp only [Bool.not_false, ↓reduceIte] at hd
                 rw [Lifecycle.finishLocked_done_of_inFlight _ (Nat.ne_of_gt hif_pos)] at hd
@@ -337,7 +318,7 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
       cases hs
       have hif_pos : 0 < s.life.inFlight := by simp [hex] at hacc; omega
       refine endOp_inv h.valid h.life hif_pos ?_ ?_ h.not_draining h.ok_draining
-        h.plan_draining h.plan_onSettle h.done_plan h.published_done h.published_ok
+        h.plan_draining h.done_plan h.published_done h.published_ok
       · simp [hex] at hacc; simp; omega
       · intro _ _; exact hiss
     · cases hs
@@ -373,7 +354,7 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
             rcases hact with hd | hdr
             · simp [hnd] at hd
             · refine endOp_inv hvalid_ab h.life hif_pos (by dsimp only; omega) ?_ ?_ ?_
-                h.plan_draining h.plan_onSettle h.done_plan h.published_done ?_
+                h.plan_draining h.done_plan h.published_done ?_
               · intro _ hdr'; dsimp only at hdr'; simp [hdr] at hdr'
               · intro hdr'; dsimp only at hdr'; simp [hdr] at hdr'
               · intro hok _; have ⟨_, hp⟩ := h.ok_draining hok hdr; simp [hallPushed_f] at hp
@@ -381,16 +362,13 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
           · rename_i hact
             simp only [not_or, Bool.not_eq_true] at hact
             refine endOp_inv hvalid_ab (Lifecycle.finishLocked_consistent false h.life)
-              ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
+              ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
             · simp [Lifecycle.finishLocked_inFlight, hif_pos]
             · simp [Lifecycle.finishLocked_inFlight]; omega
             · simp
             · simp
             · simp
             · simp
-            · intro hpol
-              simp only [hpol, beq_iff_eq, reduceCtorEq, ↓reduceIte]
-              intro hp; have hd := h.plan_onSettle hpol hp; simp [hnd] at hd
             · intro hd
               simp only [Bool.not_false, ↓reduceIte] at hd
               rw [Lifecycle.finishLocked_done_of_inFlight _ (Nat.ne_of_gt hif_pos)] at hd
@@ -403,7 +381,7 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
             rcases hact with hd | hdr
             · simp [hnd] at hd
             · refine endOp_inv hvalid_ab h.life hif_pos (by dsimp only; omega) ?_ ?_ ?_
-                h.plan_draining h.plan_onSettle h.done_plan h.published_done ?_
+                h.plan_draining h.done_plan h.published_done ?_
               · intro _ hdr'; dsimp only at hdr'; simp [hdr] at hdr'
               · intro hdr'; dsimp only at hdr'; simp [hdr] at hdr'
               · intro hok _; have ⟨_, hp⟩ := h.ok_draining hok hdr; simp [hallPushed_f] at hp
@@ -414,7 +392,7 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
             obtain ⟨_, hdr⟩ := hact
             have hp_pos := peers_pos_of_allPosPeers hallPos hget
             refine endOp_inv hvalid_pu (consistent_add_inFlight_of_pos h.life hif_pos pool.peers)
-              ?_ ?_ ?_ ?_ ?_ h.plan_draining h.plan_onSettle ?_ ?_ ?_
+              ?_ ?_ ?_ ?_ ?_ h.plan_draining ?_ ?_ ?_
             · dsimp only; omega
             · dsimp only; omega
             · intro hex hdr'
@@ -458,7 +436,7 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
           rcases hact with hd | hdr
           · simp [hnd] at hd
           · refine endOp_inv hvalid' h.life hif_pos (by dsimp only; omega) ?_ ?_ ?_
-              h.plan_draining h.plan_onSettle h.done_plan h.published_done ?_
+              h.plan_draining h.done_plan h.published_done ?_
             · intro _ hdr'; dsimp only at hdr'; simp [hdr] at hdr'
             · intro hdr'; dsimp only at hdr'; simp [hdr] at hdr'
             · intro hok _; have ⟨_, hp⟩ := h.ok_draining hok hdr; simp [hallPushed_f] at hp
@@ -471,20 +449,14 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
           split
           · cases ok
             · refine endOp_inv hvalid' (Lifecycle.finishLocked_consistent false h.life)
-                ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
+                ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
               · simp [Lifecycle.finishLocked_inFlight, hif_pos]
               · dsimp only; simp [Lifecycle.finishLocked_inFlight]; omega
               · simp
               · simp
               · simp
               · simp
-              · intro hpol
-                simp only [hpol, beq_iff_eq, reduceCtorEq, ↓reduceIte]
-                intro hp; have hd := h.plan_onSettle hpol hp; simp [hnd] at hd
-              · intro hd
-                dsimp only at hd
-                rw [Lifecycle.finishLocked_done_of_inFlight _ (Nat.ne_of_gt hif_pos)] at hd
-                simp [hnd] at hd
+              · intro _; rfl
               · intro b hb; have hd := h.published_done b hb; simp [hnd] at hd
               · intro hpub; have hd := h.published_done true hpub; simp [hnd] at hd
             · rename_i hfalse; simp at hfalse
@@ -494,25 +466,19 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
                 omega
               have hallPushed' := allPushed_of_sumRemainingSlots_zero hallPos' hno' hsum0
               refine endOp_inv hvalid' (Lifecycle.finishLocked_consistent true h.life)
-                ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
+                ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
               · simp [Lifecycle.finishLocked_inFlight, hif_pos]
               · dsimp only; simp [Lifecycle.finishLocked_inFlight]; omega
               · simp
               · simp
               · intro _ _; exact ⟨rfl, hallPushed'⟩
               · simp
-              · intro hpol
-                simp only [hpol, beq_iff_eq, reduceCtorEq, ↓reduceIte]
-                intro hp; have hd := h.plan_onSettle hpol hp; simp [hnd] at hd
-              · intro hd
-                dsimp only at hd
-                rw [Lifecycle.finishLocked_done_of_inFlight _ (Nat.ne_of_gt hif_pos)] at hd
-                simp [hnd] at hd
+              · intro _; rfl
               · intro b hb; have hd := h.published_done b hb; simp [hnd] at hd
               · intro hpub; have hd := h.published_done true hpub; simp [hnd] at hd
             · rename_i hgt1
               refine endOp_inv hvalid' h.life hif_pos ?_ ?_ ?_ ?_
-                h.plan_draining h.plan_onSettle h.done_plan h.published_done ?_
+                h.plan_draining h.done_plan h.published_done ?_
               · dsimp only; omega
               · intro hex _
                 exact allIssued_set_of_ne_pending hget (by simp) (h.exec_pending hex hdr)
@@ -526,15 +492,13 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
   | cancel =>
     simp only [step, cancel] at hs
     cases hs
-    refine ⟨h.valid, Lifecycle.finishLocked_consistent false h.life, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_,
+    refine ⟨h.valid, Lifecycle.finishLocked_consistent false h.life, ?_, ?_, ?_, ?_, ?_, ?_, ?_,
       h.published_ok⟩
     · unfold Accounted; simpa using hacc
     · simp
     · simp
     · simp
     · simp
-    · intro hpol hp
-      exact Lifecycle.finishLocked_done_mono false (h.plan_onSettle hpol hp)
     · intro hd
       dsimp only at hd
       by_cases hdone : s.life.done = true
@@ -558,34 +522,21 @@ theorem step_inv (pol : UnregisterPolicy) {s s' : Send} {e : Ev}
       obtain ⟨hdone, _⟩ := hc
       cases hs
       refine ⟨h.valid, h.life, h.accounted, h.exec_pending, h.not_draining, h.ok_draining,
-        h.plan_draining, h.plan_onSettle, h.done_plan, fun _ _ => hdone, ?_⟩
+        h.plan_draining, h.done_plan, fun _ _ => hdone, ?_⟩
       simp only [Option.some.injEq]
       intro hok
       exact h.ok_draining hok (h.life.done_draining hdone)
     · cases hs
 
-theorem reachable_inv {ns : List Nat} {pol : UnregisterPolicy} {s : Send}
-    (hvalid : validSchedule ns = true) (h : (sys ns pol).Reachable s) : Inv pol s :=
-  (sys ns pol).reachable_induction (inv_init pol hvalid) (fun _ _ _ hi hs => step_inv pol hi hs) h
+theorem reachable_inv {ns : List Nat} {s : Send}
+    (hvalid : validSchedule ns = true) (h : (sys ns).Reachable s) : Inv s :=
+  (sys ns).reachable_induction (inv_init hvalid) (fun _ _ _ hi hs => step_inv hi hs) h
 
 /-- Main result: every reachable reshard send session on a valid schedule
-satisfies all safety properties under both `UnregisterPolicy.shipping` and
-`UnregisterPolicy.onSettle`. -/
-theorem reachable_safe {ns : List Nat} {pol : UnregisterPolicy} {s : Send}
-    (hvalid : validSchedule ns = true) (h : (sys ns pol).Reachable s) : Safe pol s :=
+satisfies all safety properties. -/
+theorem reachable_safe {ns : List Nat} {s : Send}
+    (hvalid : validSchedule ns = true) (h : (sys ns).Reachable s) : Safe s :=
   inv_safe (reachable_inv hvalid h)
-
-/-- Under `UnregisterPolicy.onSettle`, the active plan is unregistered if and
-only if the session has settled (`done = true`). -/
-theorem reachable_onSettle_plan_iff_done {ns : List Nat} {s : Send}
-    (hvalid : validSchedule ns = true) (h : (sys ns .onSettle).Reachable s) :
-    s.planUnregistered = s.life.done := by
-  have hinv := reachable_inv hvalid h
-  cases hp : s.planUnregistered <;> cases hd : s.life.done
-  · rfl
-  · have := hinv.done_plan hd; simp [hp] at this
-  · have := hinv.plan_onSettle rfl hp; simp [hd] at this
-  · rfl
 
 end Send
 

@@ -2253,6 +2253,14 @@ TEST_F(StorageDriverTest, FactoryWiresMetadataCacheOptions) {
   EXPECT_EQ(store->metadata_cache_options().ttl, absl::Seconds(5));
 }
 
+TEST_F(PosixBackendTest, LoadReturnsUnimplemented) {
+  PosixKVCacheStoreBackend backend(/*storage_backend=*/nullptr);
+  BlockTracker tracker;
+  auto future = backend.Load({"hash1"}, {0}, &tracker);
+  EXPECT_THAT(future.Await(), StatusIs(absl::StatusCode::kUnimplemented));
+  EXPECT_THAT(tracker.Poll().failed, ::testing::UnorderedElementsAre("hash1"));
+}
+
 TEST_F(MetadataCacheTest, DisabledProbesStorageEveryTime) {
   Env env = CreateEnv(MetadataCacheOptions{});
   env.CreateBlock("a");

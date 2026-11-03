@@ -86,14 +86,6 @@ class CustomTestBackend : public KVCacheStoreBackend {
     }
     return result;
   }
-  tsl::Future<> Load(const RaidenId& remote_id,
-                     absl::Span<const std::string> block_hashes,
-                     absl::Span<const int32_t> device_block_ids,
-                     absl::Span<const RaidenBlockId> slices,
-                     BlockTracker* absl_nonnull load_tracker) override {
-    CHECK(load_tracker != nullptr);
-    return tsl::Future<>(absl::UnimplementedError("Load is not supported."));
-  }
   bool Insert(absl::Span<const std::string> hashes,
               absl::Span<const RaidenBlockId> slices,
               InsertOption option = InsertOption::kBestEffortUpdate) override {
@@ -301,6 +293,11 @@ TEST(KVCacheStoreBackendFactoryTest, CustomBackendDefaultHostOffloadHooks) {
       StatusIs(absl::StatusCode::kFailedPrecondition,
                testing::HasSubstr("registering the KVTransferSpec requires a "
                                   "HostOffloadBackend at tier 0")));
+
+  BlockTracker load_tracker;
+  auto load_future = backend->Load({"h1"}, {0}, &load_tracker);
+  EXPECT_THAT(load_future.Await(), StatusIs(absl::StatusCode::kUnimplemented));
+  EXPECT_THAT(load_tracker.Poll().failed, testing::UnorderedElementsAre("h1"));
 }
 
 TEST(KVCacheStoreBackendFactoryTest,

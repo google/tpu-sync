@@ -1121,15 +1121,6 @@ tsl::Future<> HostOffloadBackend::Load(
                              load_tracker);
 }
 
-tsl::Future<> HostOffloadBackend::Load(
-    const RaidenId& remote_id, absl::Span<const std::string> block_hashes,
-    absl::Span<const int32_t> device_block_ids,
-    absl::Span<const RaidenBlockId> slices,
-    BlockTracker* absl_nonnull load_tracker) {
-  return Load(block_hashes, device_block_ids, load_tracker,
-              LoadOptions{.remote_id = remote_id, .slices = slices});
-}
-
 tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
     const RaidenId& remote_id, absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> device_block_ids,

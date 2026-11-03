@@ -6125,14 +6125,6 @@ class ErrorLookupBackend : public KVCacheStoreBackend {
       const LookupOptions& options = {}) override {
     return absl::InternalError("Backend lookup failed");
   }
-  tsl::Future<> Load(const RaidenId& remote_id,
-                     absl::Span<const std::string> block_hashes,
-                     absl::Span<const int32_t> device_block_ids,
-                     absl::Span<const RaidenBlockId> slices,
-                     BlockTracker* absl_nonnull load_tracker) override {
-    CHECK(load_tracker != nullptr);
-    return {};
-  }
   bool Insert(absl::Span<const std::string> block_hashes,
               absl::Span<const RaidenBlockId> slices,
               InsertOption option = InsertOption::kBestEffortUpdate) override {

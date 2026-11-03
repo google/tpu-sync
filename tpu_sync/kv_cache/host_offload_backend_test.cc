@@ -1252,14 +1252,6 @@ TEST(HostOffloadBackendTest, LoadWithOptionsOverload) {
   ABSL_EXPECT_OK(load_future3.Await());
   EXPECT_THAT(tracker3.Poll().done, UnorderedElementsAre("remote_hash_1"));
 
-  // 4. Exercise legacy 5-argument Load forwarder.
-  BlockTracker tracker4;
-  tracker4.AddPending("remote_hash_1");
-  auto load_future4 = backend->Load(remote_node_id, {"remote_hash_1"}, {8},
-                                    /*slices=*/{}, &tracker4);
-  ABSL_EXPECT_OK(load_future4.Await());
-  EXPECT_THAT(tracker4.Poll().done, UnorderedElementsAre("remote_hash_1"));
-
   remote_server->Shutdown();
 }
 

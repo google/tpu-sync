@@ -237,16 +237,6 @@ class KVCacheStoreBackend {
     return tsl::Future<>(absl::UnimplementedError("Load not implemented."));
   }
 
-  // Legacy 5-argument Load overload. Forwards to the 4-argument Load API.
-  virtual tsl::Future<> Load(const RaidenId& remote_id,
-                             absl::Span<const std::string> block_hashes,
-                             absl::Span<const int32_t> device_block_ids,
-                             absl::Span<const RaidenBlockId> slices,
-                             BlockTracker* absl_nonnull load_tracker) {
-    return Load(block_hashes, device_block_ids, load_tracker,
-                LoadOptions{.remote_id = remote_id, .slices = slices});
-  }
-
   // Asynchronously saves KV cache blocks from device (HBM) to host DRAM
   // according to `options` (see SaveOptions).
   // The tracker's transfer status is updated when the operation completes or

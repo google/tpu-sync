@@ -101,13 +101,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
                      BlockTracker* absl_nonnull load_tracker,
                      const LoadOptions& options = {}) override;
 
-  // Legacy 5-argument Load overload. Forwards to the 4-argument Load API.
-  tsl::Future<> Load(const RaidenId& remote_id,
-                     absl::Span<const std::string> block_hashes,
-                     absl::Span<const int32_t> device_block_ids,
-                     absl::Span<const RaidenBlockId> slices,
-                     BlockTracker* absl_nonnull load_tracker) override;
-
   tsl::Future<> Save(absl::Span<const std::string> block_hashes,
                      absl::Span<const int64_t> src_device_block_ids,
                      absl::Span<const int32_t> dst_host_block_ids,

@@ -51,8 +51,6 @@ class StartTransferRequest;
 namespace tpu_raiden {
 
 class MetricsCollector;
-class ReshardReceiveSession;
-class ReshardSendSession;
 class TransferSendSession;
 class TransferReceiveSession;
 
@@ -133,7 +131,6 @@ std::unique_ptr<StagingBlockAllocator> CreateStagingBlockAllocator(
 class KVCacheManagerWithTransfer {
  public:
   friend class TransferReceiveSession;
-  friend class ReshardReceiveSession;
 
   KVCacheManagerWithTransfer(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -293,10 +290,21 @@ class KVCacheManagerWithTransfer {
   void AckSend(uint64_t uuid);
   void ConfigureDataPortFromKvTransfer();
 
+  // What a registered session does. The pool-reshard session types are
+  // private to their .cc files, so the manager tells them apart by role.
+  enum class SessionRole {
+    kTransfer,            // TransferSendSession or TransferReceiveSession.
+    kPoolReshardSend,     // Registered by PoolReshardPush.
+    kPoolReshardReceive,  // Registered by PoolReshardRegisterRecv.
+  };
+
   // A registered session and the req_id its terminal is reported under.
+  // Every construction states |role| explicitly; an omitted |role| would
+  // value-initialize to kTransfer.
   struct SessionEntry {
     std::shared_ptr<TransferSession> session;
     std::string req_id;
+    SessionRole role;
   };
 
   // Registers |session| under |uuid|, recording |req_id| as its req_id.

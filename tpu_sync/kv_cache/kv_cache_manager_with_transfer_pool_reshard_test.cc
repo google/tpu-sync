@@ -30,6 +30,8 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
@@ -37,10 +39,11 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "xla/future.h"
+#include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
-#include "tpu_sync/kv_cache/reshard_receive_session.h"
 #include "tpu_sync/kv_cache/reshard_send_session.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -48,13 +51,6 @@
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
-
-struct PoolReshardRecvTestPeer {
-  static void FinishPoolH2d(ReshardReceiveSession& session, size_t pool_idx,
-                            const absl::Status& status) {
-    session.FinishPoolH2d(pool_idx, status);
-  }
-};
 
 namespace {
 
@@ -68,40 +64,83 @@ using ::tpu_sync::rpc::MEMORY_TYPE_DRAM;
 using ::tpu_sync::rpc::MEMORY_TYPE_HBM;
 using ::tpu_sync::rpc::StartTransferRequest;
 
+// A CPU-only base whose pool host-to-device upload of a pool armed with
+// ArmPoolUpload() completes with the armed status instead of copying to a
+// device. Other uploads take the real (device-only) path.
+class FakeH2dBase : public kv_cache::KVCacheManagerBase {
+ public:
+  using kv_cache::KVCacheManagerBase::KVCacheManagerBase;
+
+  void ArmPoolUpload(size_t pool_idx, absl::Status status) {
+    absl::MutexLock lock(fake_mu_);
+    armed_uploads_.insert_or_assign(pool_idx, std::move(status));
+  }
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
+      size_t pool_idx, absl::Span<const int64_t> block_ids,
+      std::optional<size_t> shard_idx, std::optional<uint64_t> uuid,
+      std::optional<size_t> host_layer_idx) override {
+    std::optional<absl::Status> armed;
+    {
+      absl::MutexLock lock(fake_mu_);
+      if (auto it = armed_uploads_.find(pool_idx); it != armed_uploads_.end()) {
+        armed = std::move(it->second);
+        armed_uploads_.erase(it);
+      }
+    }
+    if (!armed.has_value()) {
+      return kv_cache::KVCacheManagerBase::H2dPoolBlocks(
+          pool_idx, block_ids, shard_idx, uuid, host_layer_idx);
+    }
+    auto [promise, future] = xla::MakePromise();
+    promise.Set(*std::move(armed));
+    return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
+  }
+
+ private:
+  absl::Mutex fake_mu_;
+  absl::flat_hash_map<size_t, absl::Status> armed_uploads_
+      ABSL_GUARDED_BY(fake_mu_);
+};
+
 class TestManager : public KVCacheManagerWithTransfer {
  public:
   explicit TestManager(double timeout_s = 30.0)
       : KVCacheManagerWithTransfer(
-            /*num_layers=*/1, /*num_shards=*/1,
-            /*slice_byte_size=*/128,
-            /*local_port=*/std::nullopt,
-            /*host_blocks_to_allocate=*/std::make_optional(4),
-            /*parallelism=*/1, /*node_id=*/0,
-            /*local_control_port=*/-1, /*max_blocks=*/0, /*num_slots=*/0,
-            timeout_s) {}
+            std::make_unique<FakeH2dBase>(
+                /*num_layers=*/1, /*num_shards=*/1,
+                /*slice_byte_sizes=*/std::vector<size_t>{128},
+                /*local_port=*/std::nullopt,
+                /*host_blocks_to_allocate=*/std::make_optional(4),
+                /*parallelism=*/1, /*host_allocator=*/nullptr),
+            /*node_id=*/0, /*local_control_port=*/-1, /*max_blocks=*/0,
+            /*num_slots=*/0, timeout_s) {}
 
+  // Lands pool `pool_idx` of pool-reshard receive `uuid` and completes its
+  // upload with `status`, through the session's public interface as the
+  // transport (lease, then pool completion) and the device copy would.
   void FinishPoolReshardRecvPool(uint64_t uuid, size_t pool_idx,
                                  const absl::Status& status) {
-    std::shared_ptr<ReshardReceiveSession> session;
-    {
-      absl::MutexLock lock(mu_);
-      session = FindSessionLocked<ReshardReceiveSession>(uuid);
-      if (session == nullptr) return;
-    }
-    PoolReshardRecvTestPeer::FinishPoolH2d(*session, pool_idx, status);
+    absl::StatusOr<std::shared_ptr<TransferSession>> session = GetSession(uuid);
+    ABSL_ASSERT_OK(session);
+    static_cast<FakeH2dBase&>(*base_).ArmPoolUpload(pool_idx, status);
+    ABSL_ASSERT_OK((*session)->ResolveStagingSlot(pool_idx));
+    ABSL_ASSERT_OK((*session)->OnDataReceived(
+        pool_idx, /*minor_dimension_indices=*/{}, /*shard_ids=*/{}));
   }
   absl::Status AddPoolReshardSend(const StartTransferRequest& plan,
                                   absl::Span<const int64_t> src_block_ids) {
-    absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
-        ReshardSendSession::Create(base(), staging_allocator_.get(),
-                                   src_block_ids,
-                                   /*parallelism=*/1, DeadlineFromNow(), plan);
+    absl::StatusOr<std::shared_ptr<TransferSession>> session =
+        CreateReshardSendSession(base(), staging_allocator_.get(),
+                                 src_block_ids,
+                                 /*parallelism=*/1, DeadlineFromNow(), plan);
     if (!session.ok()) {
       return session.status();
     }
     absl::MutexLock lock(mu_);
-    std::shared_ptr<ReshardSendSession> send_session = *std::move(session);
-    sessions_[plan.uuid()] = SessionEntry{send_session, plan.req_id()};
+    std::shared_ptr<TransferSession> send_session = *std::move(session);
+    sessions_[plan.uuid()] = SessionEntry{send_session, plan.req_id(),
+                                          SessionRole::kPoolReshardSend};
     NoteSubPlanRegisteredLocked(plan.req_id(), send_session,
                                 plan.sub_plan_index(), plan.sub_plan_count());
     return absl::OkStatus();

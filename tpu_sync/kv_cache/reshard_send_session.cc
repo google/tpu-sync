@@ -37,8 +37,11 @@
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/optional.h"
 #include "absl/types/span.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/pool_reshard_send_slots.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -47,11 +50,165 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/kv_cache/transfer_plan.h"
+#include "tpu_sync/kv_cache/transfer_session.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_session.h"
 
 namespace tpu_raiden {
+
+namespace {
+
+// Encapsulates the producer-side state and execution logic for a single
+// push-driven pool-reshard send transfer (identified by |uuid|).
+//
+// Thread-safety: This class is thread-safe. Immutable fields (|base_|,
+// |parallelism_|, |deadline_|, |dst_peers_|, |data_connection_reuse_|, and
+// |transfer_plan_|, whose request supplies the uuid and plan) are set
+// at construction time and read without locking. Mutable state is protected
+// by internal |mu_|.
+class ReshardSendSession final
+    : public TransferSession,
+      public std::enable_shared_from_this<ReshardSendSession> {
+ public:
+  // Built only by CreateReshardSendSession(), which validates |transfer_plan|
+  // and the other arguments first.
+  ReshardSendSession(kv_cache::KVCacheManagerBase* base,
+                     std::vector<int64_t> src_block_ids, int parallelism,
+                     int remaining_pool_peer_pushes,
+                     std::chrono::steady_clock::time_point deadline,
+                     TransferPlan transfer_plan,
+                     std::vector<std::string> dst_peers,
+                     DataConnectionReuse data_connection_reuse);
+
+  // Validates |plan| against |base| and |src_block_ids|.
+  static absl::Status ValidatePlan(
+      const kv_cache::KVCacheManagerBase& base,
+      const ::tpu_sync::rpc::StartTransferRequest& plan,
+      absl::Span<const int64_t> src_block_ids);
+
+  // Releases any pool staging leases still held (a session dropped before it
+  // settled); a settled session has already released them.
+  ~ReshardSendSession() override;
+
+  bool Done() const override {
+    absl::MutexLock lock(mu_);
+    return done_;
+  }
+
+  void Finish(const absl::Status& status = absl::OkStatus()) override;
+
+  bool TryBeginOp() override { return false; }
+
+  // Counts one op out. Under kPerTransfer, the last op of a finalizing send
+  // closes the idle data connections to |dst_peers_| while it is still
+  // counted, then settles the send (which also retires its plan).
+  void EndOp() override;
+
+  absl::Status GetStatus() const override {
+    absl::MutexLock lock(mu_);
+    return status_;
+  }
+
+  absl::Status AwaitForDone() override;
+
+  bool IsDraining() const override {
+    absl::MutexLock lock(mu_);
+    return finalizing_;
+  }
+
+  std::chrono::steady_clock::time_point deadline() const override {
+    return deadline_;
+  }
+
+  // Leases host staging per pool, issues D2H copies for each pool in the plan
+  // from the source blocks given to CreateReshardSendSession(), and chains
+  // async H2H peer pushes upon D2H completion. Non-blocking preconditions
+  // (manager, transport, host staging layers, pool indices) are checked
+  // synchronously and returned; the staging waits, copies and pushes run on a
+  // pipeline thread and report through GetStatus() / Done().
+  absl::Status Start() override;
+
+  // Returns the buffer the device-to-host copy leased to |pool_idx|.
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t pool_idx) override {
+    return LookupStagingSlot(pool_idx);
+  }
+
+  // Always returns kFailedPrecondition: a send session never receives data.
+  absl::Status OnDataReceived(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override;
+
+  // Pool-reshard sends push each pool themselves once its device-to-host copy
+  // lands, so no transport read gates on them: the future is already OK.
+  tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+    return tsl::Future<>(absl::OkStatus());
+  }
+
+  absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+    if (transfer_plan_ == nullptr || Done()) {
+      return absl::nullopt;
+    }
+    return transfer_plan_;
+  }
+
+ private:
+  // Returns the host staging buffer leased to |pool_idx|, leasing one when it
+  // has none and waiting until deadline when every slot is leased.
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx);
+
+  // Returns the host staging buffer currently leased to |pool_idx|. Fails
+  // with the session's status (or kCancelled) once the session is draining
+  // and holds no lease for |pool_idx|, and kFailedPrecondition when a live
+  // session holds none.
+  absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const;
+
+  // Checks the preconditions of Start that need no waiting: a running
+  // transport server, at least one host staging layer, and every transfer
+  // pool index resolving on |base_|.
+  absl::Status ValidatePushPreconditions() const;
+
+  void ExecutePushPipeline(std::vector<int64_t> src_block_ids);
+
+  // The sender plan this session executes; immutable for its lifetime.
+  const ::tpu_sync::rpc::StartTransferRequest& request() const {
+    return transfer_plan_->request();
+  }
+  uint64_t uuid() const { return request().uuid(); }
+
+  // Records completion or failure of one (pool, peer) push operation and
+  // releases staging resources once all scheduled pushes settle.
+  void RecordPushCompletion(const absl::Status& status);
+  void StartPoolPush(size_t pool_idx);
+  void SettleLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  void ReleaseLeasesLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+  kv_cache::KVCacheManagerBase* const base_ = nullptr;
+  // Source device blocks Start() copies from.
+  const std::vector<int64_t> src_block_ids_;
+  const int parallelism_ = 8;
+  const std::chrono::steady_clock::time_point deadline_;
+  // Data endpoints the sender schedule pushes to.
+  const std::vector<std::string> dst_peers_;
+  // TPU_RAIDEN_DATA_CONN_REUSE as resolved when the session was created.
+  const DataConnectionReuse data_connection_reuse_;
+  const std::shared_ptr<const TransferPlan> transfer_plan_;
+
+  mutable absl::Mutex mu_;
+  int remaining_pool_peer_pushes_ ABSL_GUARDED_BY(mu_) = 0;
+  int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
+  absl::Status status_ ABSL_GUARDED_BY(mu_);
+  bool finalizing_ ABSL_GUARDED_BY(mu_) = false;
+  bool done_ ABSL_GUARDED_BY(mu_) = false;
+  std::vector<raiden::PjRtCopyFuture> d2h_futures_ ABSL_GUARDED_BY(mu_);
+  bool leases_released_ ABSL_GUARDED_BY(mu_) = false;
+  // The last op already closed the idle data connections (kPerTransfer).
+  bool connections_released_ ABSL_GUARDED_BY(mu_) = false;
+  StagingLayerManager staging_layer_manager_;
+  std::atomic<bool> cancelled_{false};
+};
+
+}  // namespace
 
 absl::Status ReshardSendSession::ValidatePlan(
     const kv_cache::KVCacheManagerBase& base,
@@ -93,7 +250,7 @@ absl::Status ReshardSendSession::ValidatePlan(
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
+absl::StatusOr<std::shared_ptr<TransferSession>> CreateReshardSendSession(
     kv_cache::KVCacheManagerBase* base,
     StagingBlockAllocator* absl_nullable staging_allocator,
     absl::Span<const int64_t> src_block_ids, int parallelism,
@@ -104,7 +261,8 @@ absl::StatusOr<std::shared_ptr<ReshardSendSession>> ReshardSendSession::Create(
   }
   ABSL_ASSIGN_OR_RETURN(const DataConnectionReuse data_connection_reuse,
                         ResolveDataConnectionReuse());
-  ABSL_RETURN_IF_ERROR(ValidatePlan(*base, plan, src_block_ids));
+  ABSL_RETURN_IF_ERROR(
+      ReshardSendSession::ValidatePlan(*base, plan, src_block_ids));
   // Device-only executor: without device attachments there are no bytes this
   // path could legitimately move; host-only managers fail closed with no
   // host-mode branch to mask device bugs.

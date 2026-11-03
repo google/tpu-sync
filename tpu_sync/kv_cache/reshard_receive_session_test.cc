@@ -30,32 +30,16 @@
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
+#include "xla/future.h"
 #include "xla/tsl/platform/statusor.h"
+#include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
-
-struct ReshardReceiveSessionTestPeer {
-  static absl::StatusOr<size_t> LookupStagingSlot(
-      const ReshardReceiveSession& session, size_t pool_idx) {
-    return session.LookupStagingSlot(pool_idx);
-  }
-
-  static absl::Status ValidatePlan(
-      const kv_cache::KVCacheManagerBase& base,
-      const ::tpu_sync::rpc::StartTransferRequest& plan,
-      absl::Span<const int64_t> chip_blocks) {
-    return ReshardReceiveSession::ValidatePlan(base, plan, chip_blocks);
-  }
-
-  static std::optional<size_t> ReleaseStagingSlot(
-      ReshardReceiveSession& session, size_t pool_idx) {
-    return session.staging_layer_manager_.Release(pool_idx);
-  }
-};
 
 namespace {
 
@@ -155,23 +139,51 @@ void ExpectInvalid(const absl::Status& status, const std::string& fragment) {
       << status.ToString();
 }
 
+// Returns the status of creating a receive session for `plan` on `base`.
+// Create validates the plan before anything else that can fail here; the
+// placeholder device hold passes its device-attachment check for plans that
+// validate.
+absl::Status CreateStatus(kv_cache::KVCacheManagerBase& base,
+                          const StartTransferRequest& plan,
+                          absl::Span<const int64_t> chip_blocks) {
+  base.AttachPlaceholderDeviceHoldForTest();
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/0, /*max_blocks=*/0);
+  return CreateReshardReceiveSession(
+             &base, allocator.get(), plan, chip_blocks,
+             std::chrono::steady_clock::now() + std::chrono::seconds(10))
+      .status();
+}
+
+// A CPU-only receiver base whose pool host-to-device uploads need no device:
+// every upload completes OK as soon as it is issued.
+class FakeH2dBase : public kv_cache::KVCacheManagerBase {
+ public:
+  using kv_cache::KVCacheManagerBase::KVCacheManagerBase;
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
+      size_t pool_idx, absl::Span<const int64_t> block_ids,
+      std::optional<size_t> shard_idx, std::optional<uint64_t> uuid,
+      std::optional<size_t> host_layer_idx) override {
+    auto [promise, future] = xla::MakePromise();
+    promise.Set();
+    return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
+  }
+};
+
 TEST(ReshardReceiveSessionTest, AcceptsCanonicalPlanOnExplicitPools) {
   kv_cache::KVCacheManagerBase base = MakeTestBase();
   ASSERT_TRUE(base.RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1001);
 
-  EXPECT_TRUE(ReshardReceiveSessionTestPeer::ValidatePlan(
-                  base, plan, std::vector<int64_t>{0})
-                  .ok());
+  EXPECT_TRUE(CreateStatus(base, plan, std::vector<int64_t>{0}).ok());
 }
 
 TEST(ReshardReceiveSessionTest, AcceptsImplicitPools) {
   kv_cache::KVCacheManagerBase base = MakeTestBase();
   StartTransferRequest plan = ValidPlan(/*uuid=*/1002, /*dtype_tags=*/{""});
 
-  EXPECT_TRUE(ReshardReceiveSessionTestPeer::ValidatePlan(
-                  base, plan, std::vector<int64_t>{0})
-                  .ok());
+  EXPECT_TRUE(CreateStatus(base, plan, std::vector<int64_t>{0}).ok());
 }
 
 TEST(ReshardReceiveSessionTest, HasNoTagPolicy) {
@@ -179,9 +191,7 @@ TEST(ReshardReceiveSessionTest, HasNoTagPolicy) {
   ASSERT_TRUE(base.RegisterPools({DensePool("gdn.conv")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1003);
 
-  EXPECT_TRUE(ReshardReceiveSessionTestPeer::ValidatePlan(
-                  base, plan, std::vector<int64_t>{0})
-                  .ok());
+  EXPECT_TRUE(CreateStatus(base, plan, std::vector<int64_t>{0}).ok());
 }
 
 TEST(ReshardReceiveSessionTest, RejectsMissingIdentityAndPoolFields) {
@@ -190,31 +200,25 @@ TEST(ReshardReceiveSessionTest, RejectsMissingIdentityAndPoolFields) {
 
   StartTransferRequest plan = ValidPlan(/*uuid=*/1005);
   plan.clear_req_id();
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
-                "req_id");
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}), "req_id");
 
   plan = ValidPlan(/*uuid=*/0);
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "uuid must be positive");
 
   plan = ValidPlan(/*uuid=*/1006);
   plan.clear_transfer_pool_indices();
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "transfer_pool_indices");
 
   plan = ValidPlan(/*uuid=*/1007);
   plan.clear_pool_groups();
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "must declare pool_groups");
 
   plan = ValidPlan(/*uuid=*/1008);
   plan.set_use_block_chunks(false);
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "use_block_chunks");
 }
 
@@ -224,24 +228,20 @@ TEST(ReshardReceiveSessionTest, RejectsOutOfRangeDuplicateAndDtypeMismatch) {
 
   StartTransferRequest plan = ValidPlan(/*uuid=*/1009, /*dtype_tags=*/{"bf16"},
                                         /*transferred_pools=*/{1});
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "out of range");
 
   plan = ValidPlan(/*uuid=*/1010, /*dtype_tags=*/{"bf16"},
                    /*transferred_pools=*/{0, 0});
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "duplicate transfer pool index");
 
   plan = ValidPlan(/*uuid=*/1011, /*dtype_tags=*/{"fp8"});
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "dtype tag mismatch");
 
   plan = ValidPlan(/*uuid=*/1012, /*dtype_tags=*/{"bf16", "bf16"});
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "one dtype tag per pool");
 }
 
@@ -255,23 +255,20 @@ TEST(ReshardReceiveSessionTest, ChecksEveryPoolSpanAndDestinationZeroCover) {
   auto* entry = plan.mutable_shard_push_schedules()->at(0).mutable_entries(0);
   entry->set_dst_offset_bytes(48);
   entry->set_size_bytes(32);
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "destination span exceeds declared pool 1");
 
   plan = ValidPlan(/*uuid=*/1014, /*dtype_tags=*/{"bf16", "bf16"},
                    /*transferred_pools=*/{0, 1});
   entry = plan.mutable_shard_push_schedules()->at(0).mutable_entries(0);
   entry->set_dst_offset_bytes(16);
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "no transfer entry starting at offset 0");
 
   plan = ValidPlan(/*uuid=*/1015, /*dtype_tags=*/{"bf16", "bf16"},
                    /*transferred_pools=*/{0, 1});
   plan.mutable_shard_push_schedules()->at(0).clear_entries();
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "no entries");
 }
 
@@ -280,19 +277,15 @@ TEST(ReshardReceiveSessionTest, RejectsBlockIdsOutsideDeclaredPool) {
   ASSERT_TRUE(base.RegisterPools({DensePool("fa")}).ok());
   StartTransferRequest plan = ValidPlan(/*uuid=*/1017);
   plan.mutable_pool_groups(0)->set_dst_device_block_ids(0, 9);
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{9}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{9}),
                 "out of range for pool");
 
   plan = ValidPlan(/*uuid=*/1018);
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{8}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{8}),
                 "must concatenate to the plan's local block ids");
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0, 0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0, 0}),
                 "must cover the plan's local block ids");
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{}),
                 "must not be empty");
 }
 
@@ -304,8 +297,7 @@ TEST(ReshardReceiveSessionTest, RejectsCoverageGap) {
   plan.mutable_pool_groups(0)->add_dst_expected_extent_bytes(48);
   AddEntry(plan, 0, /*dst_block_id=*/0, /*dst_offset=*/32, /*size=*/16);
 
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "coverage gap");
 }
 
@@ -317,8 +309,7 @@ TEST(ReshardReceiveSessionTest, RejectsCoverageOverlap) {
   plan.mutable_pool_groups(0)->add_dst_expected_extent_bytes(24);
   AddEntry(plan, 0, /*dst_block_id=*/0, /*dst_offset=*/8, /*size=*/16);
 
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "coverage overlap");
 }
 
@@ -329,8 +320,7 @@ TEST(ReshardReceiveSessionTest, RejectsShortCoverage) {
   plan.mutable_pool_groups(0)->clear_dst_expected_extent_bytes();
   plan.mutable_pool_groups(0)->add_dst_expected_extent_bytes(24);
 
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "does not cover the exact live bytes");
 }
 
@@ -345,8 +335,7 @@ TEST(ReshardReceiveSessionTest, RejectsNonPrefixExtents) {
   group->add_dst_expected_extent_bytes(16);
   AddEntry(plan, 0, /*dst_block_id=*/1, /*dst_offset=*/0, /*size=*/16);
 
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0, 1}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0, 1}),
                 "except the final one");
 }
 
@@ -356,8 +345,7 @@ TEST(ReshardReceiveSessionTest, RejectsMissingExtents) {
   StartTransferRequest plan = ValidPlan(/*uuid=*/1105);
   plan.mutable_pool_groups(0)->clear_dst_expected_extent_bytes();
 
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "require dst_expected_extent_bytes");
 }
 
@@ -367,8 +355,7 @@ TEST(ReshardReceiveSessionTest, RejectsMissingParallelism) {
   StartTransferRequest plan = ValidPlan(/*uuid=*/1106);
   plan.set_parallelism(0);
 
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "positive parallelism");
 }
 
@@ -378,8 +365,7 @@ TEST(ReshardReceiveSessionTest, RejectsExpectedPushMismatch) {
   StartTransferRequest plan = ValidPlan(/*uuid=*/1107);
   plan.mutable_pool_groups(0)->set_expected_pushes(2);
 
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "do not match the received schedules");
 }
 
@@ -412,15 +398,12 @@ TEST(ReshardReceiveSessionTest, RejectsWriteBeyondDeclaredLiveTail) {
   AddEntry(plan, 0, /*dst_block_id=*/0, /*dst_offset=*/0, /*size=*/32);
   AddEntry(plan, 0, /*dst_block_id=*/0, /*dst_offset=*/64, /*size=*/16);
 
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{0}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "declared live tail");
 
   plan.mutable_shard_push_schedules()->at(0).mutable_entries(1)->set_size_bytes(
       8);
-  EXPECT_TRUE(ReshardReceiveSessionTestPeer::ValidatePlan(
-                  base, plan, std::vector<int64_t>{0})
-                  .ok());
+  EXPECT_TRUE(CreateStatus(base, plan, std::vector<int64_t>{0}).ok());
 }
 
 TEST(ReshardReceiveSessionTest, GroupScopesDestinationBlocks) {
@@ -448,19 +431,16 @@ TEST(ReshardReceiveSessionTest, GroupScopesDestinationBlocks) {
   state_group->add_dst_expected_extent_bytes(8);
   state_group->set_order_rank(1);
 
-  EXPECT_TRUE(ReshardReceiveSessionTestPeer::ValidatePlan(
-                  base, plan, std::vector<int64_t>{2, 3})
-                  .ok());
+  EXPECT_TRUE(CreateStatus(base, plan, std::vector<int64_t>{2, 3}).ok());
 
   AddEntry(plan, 0, /*dst_block_id=*/2, /*dst_offset=*/0, /*size=*/8,
            /*group_idx=*/1);
-  ExpectInvalid(ReshardReceiveSessionTestPeer::ValidatePlan(
-                    base, plan, std::vector<int64_t>{2, 3}),
+  ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{2, 3}),
                 "outside its group");
 }
 
 TEST(ReshardReceiveSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
-  kv_cache::KVCacheManagerBase base(
+  FakeH2dBase base(
       /*num_layers=*/2, /*num_shards=*/1,
       /*slice_byte_size=*/128,
       /*local_port=*/std::nullopt,
@@ -484,28 +464,27 @@ TEST(ReshardReceiveSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
       /*uuid=*/1301, /*dtype_tags=*/{"bf16", "bf16"},
       /*transferred_pools=*/{0, 1});
   TF_ASSERT_OK_AND_ASSIGN(
-      std::shared_ptr<ReshardReceiveSession> session,
-      ReshardReceiveSession::Create(
+      std::shared_ptr<TransferSession> session,
+      CreateReshardReceiveSession(
           &base, allocator.get(), plan, std::vector<int64_t>{0},
           std::chrono::steady_clock::now() + std::chrono::seconds(2)));
 
-  // Pool 0 leases slot 0 (the only allocated host layer).
+  // Pool 0 leases slot 0 (the only allocated host layer) and keeps it.
   EXPECT_THAT(session->ResolveStagingSlot(0), IsOkAndHolds(0u));
-  EXPECT_THAT(ReshardReceiveSessionTestPeer::LookupStagingSlot(*session, 0),
-              IsOkAndHolds(0u));
+  EXPECT_THAT(session->ResolveStagingSlot(0), IsOkAndHolds(0u));
 
-  // Pool 1 blocks waiting for slot 0 until pool 0 releases its lease.
+  // Pool 1 blocks waiting for slot 0 until pool 0's upload releases it.
   absl::StatusOr<size_t> slot1;
   std::thread release_waiter([&]() { slot1 = session->ResolveStagingSlot(1); });
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  EXPECT_EQ(ReshardReceiveSessionTestPeer::ReleaseStagingSlot(*session, 0),
-            std::make_optional(0u));
+  ABSL_EXPECT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
   release_waiter.join();
   EXPECT_THAT(slot1, IsOkAndHolds(0u));
-  EXPECT_THAT(ReshardReceiveSessionTestPeer::LookupStagingSlot(*session, 1),
-              IsOkAndHolds(0u));
+  EXPECT_THAT(session->ResolveStagingSlot(1), IsOkAndHolds(0u));
 
-  // Cancelling the session while pool 0 is blocked in AcquireStagingSlot wakes
+  // Cancelling the session while pool 0 is blocked waiting for a slot wakes
   // the waiter with CancelledError and releases all held slots once settled.
   absl::StatusOr<size_t> slot0_cancelled;
   std::thread cancel_waiter(
@@ -515,7 +494,7 @@ TEST(ReshardReceiveSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
   cancel_waiter.join();
   EXPECT_THAT(slot0_cancelled, StatusIs(absl::StatusCode::kCancelled));
   EXPECT_TRUE(session->Done());
-  EXPECT_THAT(ReshardReceiveSessionTestPeer::LookupStagingSlot(*session, 1),
+  EXPECT_THAT(session->ResolveStagingSlot(1),
               StatusIs(absl::StatusCode::kCancelled));
 
   // Pool 1 cannot lease while slot 0 is held by pool 0 and deadline expires;
@@ -524,8 +503,8 @@ TEST(ReshardReceiveSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
       /*uuid=*/1302, /*dtype_tags=*/{"bf16", "bf16"},
       /*transferred_pools=*/{0, 1});
   TF_ASSERT_OK_AND_ASSIGN(
-      std::shared_ptr<ReshardReceiveSession> timeout_session,
-      ReshardReceiveSession::Create(
+      std::shared_ptr<TransferSession> timeout_session,
+      CreateReshardReceiveSession(
           &base, allocator.get(), timeout_plan, std::vector<int64_t>{0},
           std::chrono::steady_clock::now() + std::chrono::milliseconds(30)));
   EXPECT_THAT(timeout_session->ResolveStagingSlot(0), IsOkAndHolds(0u));
@@ -534,9 +513,8 @@ TEST(ReshardReceiveSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
   EXPECT_TRUE(timeout_session->Done());
   EXPECT_THAT(timeout_session->GetStatus(),
               StatusIs(absl::StatusCode::kDeadlineExceeded));
-  EXPECT_THAT(
-      ReshardReceiveSessionTestPeer::LookupStagingSlot(*timeout_session, 0),
-      StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_THAT(timeout_session->ResolveStagingSlot(0),
+              StatusIs(absl::StatusCode::kCancelled));
 }
 
 }  // namespace

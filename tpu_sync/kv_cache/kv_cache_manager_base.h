@@ -628,15 +628,18 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Padding and live regions belonging only to aliased sibling pools are
   // preserved. All shards unless shard_idx is given.
   // `uuid` selects the staging lease on bounded storages (required there);
-  // unbounded storages ignore it.
-  absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks(
+  // unbounded storages ignore it. Virtual only as a test seam: CPU tests
+  // override it to drive pool-reshard sends without device copies.
+  virtual absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx = std::nullopt,
       std::optional<uint64_t> uuid = std::nullopt,
       std::optional<size_t> host_layer_idx = std::nullopt);
 
-  // Inverse of D2hPoolBlocks: host mirror -> device storage.
-  absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
+  // Inverse of D2hPoolBlocks: host mirror -> device storage. Virtual only as a
+  // test seam: CPU tests override it to drive pool-reshard receives without
+  // device copies.
+  virtual absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx = std::nullopt,
       std::optional<uint64_t> uuid = std::nullopt,

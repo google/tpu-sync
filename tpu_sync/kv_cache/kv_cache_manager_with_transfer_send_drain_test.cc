@@ -371,7 +371,7 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
         *TransferReceiveSession::Create(
             base(), staging_allocator_.get(), uuid, blocks_per_layer,
             deadline.value_or(DeadlineFromNow()), /*acquire_staging=*/true),
-        req_id};
+        req_id, SessionRole::kTransfer};
   }
 
   absl::Status ReceiveLayer(size_t layer, uint64_t uuid) {

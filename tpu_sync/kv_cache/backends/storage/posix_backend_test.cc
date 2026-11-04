@@ -59,6 +59,9 @@
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/proto/worker_service.pb.h"
+#include "tpu_sync/telemetry/metrics_api.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
+#include "tpu_sync/telemetry/mock_metrics_backend.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -2709,6 +2712,185 @@ TEST_F(MetadataCacheTest, UnmappableHashTruncatesPrefix) {
             1);
 }
 
+auto MetadataCheckLabels(absl::string_view dp_rank, absl::string_view result) {
+  return testing::ElementsAre(
+      testing::FieldsAre(telemetry::metric_labels::kDpRank,
+                         std::string(dp_rank)),
+      testing::FieldsAre(telemetry::metric_labels::kResult,
+                         std::string(result)));
+}
+
+TEST_F(MetadataCacheTest, EmitsStatHitAndStatMissWhenCacheDisabled) {
+  Env env = CreateEnv(MetadataCacheOptions{}, /*batch_size=*/8, /*tp_size=*/2);
+  env.CreateAllShards("a");
+  env.CreateBlock("b", /*tp_rank=*/0);  // Rank 1 shard is missing.
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  auto* raw_backend = mock_backend.get();
+  EXPECT_CALL(
+      *raw_backend,
+      IncrementCounter(
+          telemetry::metric_names::kStorageMetadataCheckTotal,
+          MetadataCheckLabels("0", telemetry::metric_labels::kResultStatHit),
+          3));
+  EXPECT_CALL(
+      *raw_backend,
+      IncrementCounter(
+          telemetry::metric_names::kStorageMetadataCheckTotal,
+          MetadataCheckLabels("0", telemetry::metric_labels::kResultStatMiss),
+          3));
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+  // 6 shards in one chunk: a_r0, a_r1, b_r0 exist (3 stat_hits); b_r1, c_r0,
+  // c_r1 are absent (3 stat_misses).
+  EXPECT_EQ(env.LookupCount({"a", "b", "c"}), 1);
+}
+
+TEST_F(MetadataCacheTest,
+       EmitsCacheHitStatHitAndStatMissWithTtlExpiryAndDelete) {
+  Env env =
+      CreateEnv(Enabled(/*max_entries=*/1000, kShortTtl), /*batch_size=*/4);
+  env.CreateBlock("a");
+  env.CreateBlock("b");
+
+  // 1. Cold lookup of {"a", "b"}: 2 stat_hit, 0 cache_hit, 0 stat_miss.
+  {
+    auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+    EXPECT_CALL(
+        *mock_backend,
+        IncrementCounter(
+            telemetry::metric_names::kStorageMetadataCheckTotal,
+            MetadataCheckLabels("0", telemetry::metric_labels::kResultStatHit),
+            2));
+    telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+    EXPECT_EQ(env.LookupCount({"a", "b"}), 2);
+  }
+
+  // 2. Warm lookup of {"a", "b", "c"} where "c" is missing: 2 cache_hit,
+  // 1 stat_miss.
+  {
+    auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+    EXPECT_CALL(
+        *mock_backend,
+        IncrementCounter(
+            telemetry::metric_names::kStorageMetadataCheckTotal,
+            MetadataCheckLabels("0", telemetry::metric_labels::kResultCacheHit),
+            2));
+    EXPECT_CALL(
+        *mock_backend,
+        IncrementCounter(
+            telemetry::metric_names::kStorageMetadataCheckTotal,
+            MetadataCheckLabels("0", telemetry::metric_labels::kResultStatMiss),
+            1));
+    telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+    EXPECT_EQ(env.LookupCount({"a", "b", "c"}), 2);
+  }
+
+  // 3. Create "c" on disk and lookup {"a", "b", "c"}: 2 cache_hit, 1 stat_hit.
+  env.CreateBlock("c");
+  {
+    auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+    EXPECT_CALL(
+        *mock_backend,
+        IncrementCounter(
+            telemetry::metric_names::kStorageMetadataCheckTotal,
+            MetadataCheckLabels("0", telemetry::metric_labels::kResultCacheHit),
+            2));
+    EXPECT_CALL(
+        *mock_backend,
+        IncrementCounter(
+            telemetry::metric_names::kStorageMetadataCheckTotal,
+            MetadataCheckLabels("0", telemetry::metric_labels::kResultStatHit),
+            1));
+    telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+    EXPECT_EQ(env.LookupCount({"a", "b", "c"}), 3);
+  }
+
+  // 4. Delete "b" from cache and disk, then lookup {"a", "b", "c"}: "a" and "c"
+  // hit in cache (2 cache_hit), "b" is re-probed on disk (1 stat_miss).
+  EXPECT_EQ(env.store->Delete({"b"}), 1);
+  env.RemoveBlock("b");
+  {
+    auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+    EXPECT_CALL(
+        *mock_backend,
+        IncrementCounter(
+            telemetry::metric_names::kStorageMetadataCheckTotal,
+            MetadataCheckLabels("0", telemetry::metric_labels::kResultCacheHit),
+            2));
+    EXPECT_CALL(
+        *mock_backend,
+        IncrementCounter(
+            telemetry::metric_names::kStorageMetadataCheckTotal,
+            MetadataCheckLabels("0", telemetry::metric_labels::kResultStatMiss),
+            1));
+    telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+    EXPECT_EQ(env.LookupCount({"a", "b", "c"}), 1);
+  }
+
+  // 5. After TTL expiry, "a" is re-probed on disk (1 stat_hit, 0 cache_hit).
+  absl::SleepFor(kShortTtl + absl::Milliseconds(50));
+  {
+    auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+    EXPECT_CALL(
+        *mock_backend,
+        IncrementCounter(
+            telemetry::metric_names::kStorageMetadataCheckTotal,
+            MetadataCheckLabels("0", telemetry::metric_labels::kResultStatHit),
+            1));
+    telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+    EXPECT_EQ(env.LookupCount({"a"}), 1);
+  }
+}
+
+TEST_F(MetadataCacheTest, PropagatesCustomDpRankViaConstructorAndFactory) {
+  auto backend = std::make_shared<CountingPosixKVBackend>(
+      "posix", absl::flat_hash_map<std::string, std::string>{});
+  auto mapper = std::make_shared<PosixPathMapper>(
+      scratch_dir_, "model_test",
+      ParallelismConfig{.tp_size = 1, .tp_rank = 0});
+  backend->set_mapper(mapper);
+
+  // Empty dp_rank falls back to "0".
+  PosixKVCacheStoreBackend default_store(backend, "posix", /*capacity=*/0,
+                                         /*lookup_batch_size=*/4,
+                                         MetadataCacheOptions{},
+                                         /*dp_rank=*/"");
+  EXPECT_EQ(default_store.dp_rank(), "0");
+
+  // Factory propagates config.raiden_id.data_replica_idx to dp_rank.
+  BackendConfig config;
+  config.type = "posix";
+  config.SetProperty("root_dir", scratch_dir_);
+  config.SetProperty("model_name", "model_test");
+  config.parallelism = {.tp_size = 1, .tp_rank = 0};
+  config.raiden_id = {"test_job", "0", "kv_cache", /*data_replica_idx=*/3};
+
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<KVCacheStoreBackend> created,
+                       KVCacheStoreBackendFactory::Instance().CreateBackend(
+                           config, /*controller=*/nullptr));
+  auto factory_store =
+      std::dynamic_pointer_cast<PosixKVCacheStoreBackend>(created);
+  ASSERT_NE(factory_store, nullptr);
+  EXPECT_EQ(factory_store->dp_rank(), "3");
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  auto* raw_backend = mock_backend.get();
+  EXPECT_CALL(
+      *raw_backend,
+      IncrementCounter(
+          telemetry::metric_names::kStorageMetadataCheckTotal,
+          MetadataCheckLabels("3", telemetry::metric_labels::kResultStatMiss),
+          1));
+  EXPECT_CALL(*raw_backend,
+              SetGauge(telemetry::metric_names::kStorageFilesystemBytes,
+                       testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result,
+                       factory_store->Lookup({"missing_block"}));
+  EXPECT_TRUE(result.empty());
+}
 }  // namespace
 }  // namespace storage
 }  // namespace backends

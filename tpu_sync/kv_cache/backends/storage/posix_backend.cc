@@ -60,6 +60,8 @@
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
+#include "tpu_sync/telemetry/metrics_api.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -780,13 +782,14 @@ MetadataCacheOptions MetadataCacheOptions::FromPosixOptions(
 PosixKVCacheStoreBackend::PosixKVCacheStoreBackend(
     std::shared_ptr<KVBackend> storage_backend, std::string name,
     size_t capacity_bytes, size_t lookup_batch_size,
-    MetadataCacheOptions cache_options)
+    MetadataCacheOptions cache_options, std::string dp_rank)
     : storage_backend_(std::move(storage_backend)),
       name_(std::move(name)),
       capacity_bytes_(capacity_bytes),
       lookup_batch_size_(lookup_batch_size > 0 ? lookup_batch_size
                                                : kDefaultLookupBatchSize),
       cache_options_(cache_options),
+      dp_rank_(dp_rank.empty() ? "0" : std::move(dp_rank)),
       cache_(cache_options.max_entries) {
   if (cache_options_.enabled()) {
     LOG(INFO) << "PosixKVCacheStoreBackend '" << name_
@@ -968,12 +971,19 @@ absl::StatusOr<BlockSliceList> PosixKVCacheStoreBackend::Lookup(
     size_t block;
     size_t shard;
   };
+  uint64_t cache_hits = 0;
   std::vector<ShardRef> misses;
   for (size_t i = 0; i < shard_keys.size(); ++i) {
     for (size_t j = 0; j < shard_keys[i].size(); ++j) {
-      if (!present[i][j]) misses.push_back({i, j});
+      if (present[i][j]) {
+        ++cache_hits;
+      } else {
+        misses.push_back({i, j});
+      }
     }
   }
+  uint64_t stat_hits = 0;
+  uint64_t stat_misses = 0;
   std::vector<const BlockKey*> confirmed;
   for (size_t offset = 0; offset < misses.size();
        offset += lookup_batch_size_) {
@@ -992,8 +1002,10 @@ absl::StatusOr<BlockSliceList> PosixKVCacheStoreBackend::Lookup(
       if (exists[k]) {
         present[miss.block][miss.shard] = true;
         confirmed.push_back(&shard_keys[miss.block][miss.shard]);
+        ++stat_hits;
       } else {
         chunk_has_absent = true;
+        ++stat_misses;
       }
     }
     if (options.match_mode == LookupMatchMode::kPrefix && chunk_has_absent) {
@@ -1001,6 +1013,23 @@ absl::StatusOr<BlockSliceList> PosixKVCacheStoreBackend::Lookup(
     }
   }
   CacheInsert(confirmed);
+
+  telemetry::RaidenMetricStore& metric_store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (metric_store.HasBackends()) {
+    auto record = [&](absl::string_view result, uint64_t count) {
+      if (count == 0) return;
+      const telemetry::MetricLabel labels[] = {
+          {telemetry::metric_labels::kDpRank, dp_rank_},
+          {telemetry::metric_labels::kResult, result},
+      };
+      metric_store.IncrementCounter(
+          telemetry::metric_names::kStorageMetadataCheckTotal, labels, count);
+    };
+    record(telemetry::metric_labels::kResultCacheHit, cache_hits);
+    record(telemetry::metric_labels::kResultStatHit, stat_hits);
+    record(telemetry::metric_labels::kResultStatMiss, stat_misses);
+  }
 
   // Phase 3 (merge).
   auto all_present = [](const std::vector<bool>& shards) {
@@ -1127,5 +1156,6 @@ REGISTER_KV_CACHE_STORE_BACKEND(
           std::move(backend), backend_name, options.capacity_bytes,
           options.lookup_batch_size,
           ::tpu_raiden::kv_cache::backends::storage::MetadataCacheOptions::
-              FromPosixOptions(options));
+              FromPosixOptions(options),
+          absl::StrCat(config.raiden_id.data_replica_idx));
     });

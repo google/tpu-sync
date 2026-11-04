@@ -379,18 +379,16 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
     const auto& config = effective_configs[i];
     BackendConfig effective_config = (i == 0) ? effective_config0 : config;
 
-    // Apply global registry address and raiden_id to tier 0
-    // (HostOffloadBackend).
+    // Apply global registry address to tier 0 (HostOffloadBackend), and
+    // propagate the store's raiden_id to every tier that did not set its own.
     // TODO: Revisit secondary tier registration with global registry.
-    if (i == 0) {
-      if (effective_config.global_registry_address.empty() &&
-          !global_registry_address.empty()) {
-        effective_config.global_registry_address =
-            std::string(global_registry_address);
-      }
-      if (effective_config.raiden_id.empty() && !raiden_id.empty()) {
-        effective_config.raiden_id = raiden_id;
-      }
+    if (i == 0 && effective_config.global_registry_address.empty() &&
+        !global_registry_address.empty()) {
+      effective_config.global_registry_address =
+          std::string(global_registry_address);
+    }
+    if (effective_config.raiden_id.empty()) {
+      effective_config.raiden_id = effective_raiden_id;
     }
 
     ABSL_ASSIGN_OR_RETURN(auto backend,

@@ -272,9 +272,12 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
                            std::string name = std::string(kPosixBackendName),
                            size_t capacity_bytes = 0,
                            size_t lookup_batch_size = kDefaultLookupBatchSize,
-                           MetadataCacheOptions cache_options = {});
+                           MetadataCacheOptions cache_options = {},
+                           std::string dp_rank = "0");
 
   std::string name() const override { return name_; }
+
+  const std::string& dp_rank() const { return dp_rank_; }
 
   size_t lookup_batch_size() const { return lookup_batch_size_; }
 
@@ -354,6 +357,7 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
   size_t capacity_bytes_ = 0;
   size_t lookup_batch_size_ = 32;
   const MetadataCacheOptions cache_options_;
+  const std::string dp_rank_ = "0";
 
   // Never held across storage I/O or key mapping.
   mutable absl::Mutex cache_mu_;

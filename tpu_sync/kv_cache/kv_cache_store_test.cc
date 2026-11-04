@@ -9012,6 +9012,45 @@ TEST_F(KVHostPoolBlocksMetricsTest,
               ::testing::FieldsAre(4.0, 0.0, 0.0));
 }
 
+TEST_F(SecondaryBackendTopologyTest,
+       PropagatesRaidenIdDpRankToSecondaryPosixBackend) {
+  BackendConfig host_cfg;
+  host_cfg.type = "HostOffloadBackend";
+  host_cfg.capacity = 16;
+  BackendConfig posix_cfg = PosixConfig();
+  posix_cfg.parallelism.tp_size = 1;
+  const BackendConfig configs[] = {host_cfg, posix_cfg};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      store_, KVCacheStore::Create(absl::MakeConstSpan(configs),
+                                   /*capacity=*/16,
+                                   /*global_registry_address=*/"",
+                                   RaidenId{"topology_job", "0", "kv",
+                                            /*data_replica_idx=*/7},
+                                   /*num_shards=*/1, /*shard_size_bytes=*/512,
+                                   /*store_server_ip=*/"127.0.0.1"));
+  ASSERT_EQ(store_->backends().size(), 2);
+  auto tier =
+      std::dynamic_pointer_cast<backends::storage::PosixKVCacheStoreBackend>(
+          store_->backends()[1]);
+  ASSERT_NE(tier, nullptr);
+  EXPECT_EQ(tier->dp_rank(), "7");
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  auto* raw_backend = mock_backend.get();
+  EXPECT_CALL(
+      *raw_backend,
+      IncrementCounter(
+          telemetry::metric_names::kStorageMetadataCheckTotal,
+          testing::ElementsAre(
+              testing::FieldsAre(telemetry::metric_labels::kDpRank, "7"),
+              testing::FieldsAre(telemetry::metric_labels::kResult,
+                                 telemetry::metric_labels::kResultStatMiss)),
+          1));
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result, store_->Lookup({"missing"}));
+  EXPECT_TRUE(result.empty());
+}
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

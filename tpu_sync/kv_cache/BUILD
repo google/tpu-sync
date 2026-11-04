@@ -1123,6 +1123,7 @@ cc_test(
         "//tpu_sync/kv_cache/global_registry:global_registry_server_lib",
         "//tpu_sync/kv_cache/global_registry:test_util",
         "//tpu_sync/proto:kv_cache_store_service_cc_grpc",
+        "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/telemetry:mock_metrics_backend",
         "@com_github_grpc_grpc//:grpc++",

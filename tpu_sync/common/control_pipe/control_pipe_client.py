@@ -230,7 +230,36 @@ class ControlPipeClient:
     if grpc is None or control_pipe_pb2_grpc is None:
       raise RuntimeError("gRPC is required for ControlPipeBackendType.GRPC")
     resolved = self._resolve_address(endpoint)
+    try:
+      current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+      current_loop = None
+
     with self._lock:
+      if current_loop is not None:
+        stale_keys = [
+            k
+            for k, ch in self._aio_channels.items()
+            if getattr(ch, "_loop", None) is not None
+            and (
+                getattr(ch, "_loop").is_closed()
+                or getattr(ch, "_loop") is not current_loop
+            )
+        ]
+        for k in stale_keys:
+          self._aio_stubs.pop(k, None)
+          self._aio_channels.pop(k, None)
+      else:
+        stale_keys = [
+            k
+            for k, ch in self._aio_channels.items()
+            if getattr(ch, "_loop", None) is not None
+            and getattr(ch, "_loop").is_closed()
+        ]
+        for k in stale_keys:
+          self._aio_stubs.pop(k, None)
+          self._aio_channels.pop(k, None)
+
       stub = self._aio_stubs.get(resolved)
       if stub is not None:
         self._aio_stubs.move_to_end(resolved)

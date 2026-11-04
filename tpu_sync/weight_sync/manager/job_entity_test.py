@@ -669,6 +669,22 @@ class JobEntityTest(absltest.TestCase):
         {2, 3},
     )
 
+  def test_weight_sync_worker_rpc_client_defaults_to_grpc(self):
+    """Verifies WeightSyncWorkerRpcClient and its created entities default to gRPC."""
+    client = job_entity.WeightSyncWorkerRpcClient()
+    try:
+      self.assertEqual(
+          client.control_pipe_client.backend,
+          control_pipe_client.ControlPipeBackendType.GRPC,
+      )
+      entity = client.get_or_create_entity(self.src_unit)
+      self.assertEqual(
+          entity.control_pipe_client.backend,
+          control_pipe_client.ControlPipeBackendType.GRPC,
+      )
+    finally:
+      client.close()
+
 
 if __name__ == "__main__":
   absltest.main()

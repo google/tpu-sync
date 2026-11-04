@@ -18,6 +18,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <optional>
 
 #include "tpu_sync/common/control_pipe/control_pipe_server.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
@@ -34,7 +35,7 @@ class WeightSynchronizerListener final {
  public:
   WeightSynchronizerListener(
       WeightSynchronizerBase* engine, int listener_port,
-      ControlPipeBackendType backend_type = ControlPipeBackendType::kTcp);
+      std::optional<ControlPipeBackendType> backend_type = std::nullopt);
   ~WeightSynchronizerListener();
 
   WeightSynchronizerListener(const WeightSynchronizerListener&) = delete;
@@ -43,6 +44,10 @@ class WeightSynchronizerListener final {
 
   int listener_port() const { return listener_port_; }
   bool is_active() const { return !stopping_.load(); }
+  ControlPipeBackendType backend_type() const {
+    return pipe_server_ ? pipe_server_->backend_type()
+                        : ControlPipeBackendType::kGrpc;
+  }
 
   void Shutdown();
 

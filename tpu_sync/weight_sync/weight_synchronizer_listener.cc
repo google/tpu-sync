@@ -22,6 +22,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,7 @@
 #include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
@@ -45,12 +47,28 @@ namespace weight_sync {
 
 WeightSynchronizerListener::WeightSynchronizerListener(
     WeightSynchronizerBase* engine, int listener_port,
-    ControlPipeBackendType backend_type)
+    std::optional<ControlPipeBackendType> backend_type)
     : engine_(engine), listener_port_(listener_port) {
   ControlPipeConfig cfg;
-  cfg.backend_type = backend_type;
+  if (backend_type.has_value()) {
+    cfg.backend_type = *backend_type;
+  } else if (const char* env_backend =
+                 std::getenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND")) {
+    cfg.backend_type = ParseControlPipeBackendType(env_backend)
+                           .value_or(ControlPipeBackendType::kGrpc);
+  } else if (const char* env_flag =
+                 std::getenv("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE")) {
+    std::string val = absl::AsciiStrToLower(env_flag);
+    if (val == "0" || val == "false") {
+      cfg.backend_type = ControlPipeBackendType::kTcp;
+    } else {
+      cfg.backend_type = ControlPipeBackendType::kGrpc;
+    }
+  } else {
+    cfg.backend_type = ControlPipeBackendType::kGrpc;
+  }
   cfg.requested_port = listener_port;
-  cfg.allow_legacy_framing = true;
+  cfg.allow_legacy_framing = (cfg.backend_type == ControlPipeBackendType::kTcp);
 
   pipe_server_ = CreateControlPipeServer(cfg);
   pipe_server_->dispatcher()

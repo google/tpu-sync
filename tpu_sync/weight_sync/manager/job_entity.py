@@ -2072,6 +2072,12 @@ class WeightSyncWorkerRpcClient(WorkerRpcClient):
       executor: Optional[concurrent.futures.ThreadPoolExecutor] = None,
       bind_entity: Optional[JobEntity] = None,
   ):
+    if control_pipe is None:
+      control_pipe = control_pipe_client.ControlPipeClient(
+          backend=control_pipe_client.ControlPipeBackendType.GRPC,
+          name_resolver=name_resolver,
+          use_legacy_tcp_framing=use_legacy_tcp_framing,
+      )
     super().__init__(
         endpoint_addresses=endpoint_addresses,
         resolve_timeout=resolve_timeout,

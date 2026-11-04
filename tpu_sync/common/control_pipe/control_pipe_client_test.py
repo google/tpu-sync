@@ -432,6 +432,49 @@ class ControlPipeClientTest(absltest.TestCase):
     finally:
       grpc_server.stop(grace=None)
 
+  def test_grpc_backend_reused_across_closed_event_loops(self) -> None:
+    servicer = _MockControlPipeServicer()
+    grpc_server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+    control_pipe_pb2_grpc.add_ControlPipeServiceServicer_to_server(
+        servicer, grpc_server
+    )
+    port = grpc_server.add_insecure_port("[::]:0")
+    grpc_server.start()
+    endpoint = f"localhost:{port}"
+
+    try:
+      client = control_pipe_client.ControlPipeClient(
+          backend=control_pipe_client.ControlPipeBackendType.GRPC
+      )
+      req = raiden_service_pb2.ControlRequest(
+          command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER
+      )
+
+      # First call in loop 1
+      async def _call_in_loop() -> None:
+        resp = await client.call(
+            endpoint, req, raiden_service_pb2.ControlResponse, timeout=5.0
+        )
+        self.assertTrue(resp.success)
+
+      asyncio.run(_call_in_loop())
+
+      # Second call in loop 2 (loop 1 is now closed)
+      asyncio.run(_call_in_loop())
+
+      # Third call via synchronous wrapper which creates and closes its own loop
+      resp_bytes = client.send_raw_bytes_sync(
+          endpoint,
+          req.SerializeToString(),
+          timeout=5.0,
+          message_type="tpu_sync.rpc.ControlRequest",
+      )
+      resp = raiden_service_pb2.ControlResponse()
+      resp.ParseFromString(resp_bytes)
+      self.assertTrue(resp.success)
+    finally:
+      grpc_server.stop(grace=None)
+
   def test_zmq_backend(self) -> None:
     server = _ZmqTestServer()
     endpoint = f"127.0.0.1:{server.port}"

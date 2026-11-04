@@ -27,6 +27,7 @@ import torch_tpu  # pylint: disable=unused-import
 
 from tpu_sync.api.torch import weight_synchronizer as ws_lib
 from tpu_sync.api.torch.weight_synchronizer import WeightSynchronizer
+from tpu_sync.common.control_pipe import control_pipe_client
 from tpu_sync.rpc import raiden_controller
 from tpu_sync.rpc import raiden_service_pb2
 
@@ -788,15 +789,21 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
 
     def _send_ctrl_req(port: int, req: raiden_service_pb2.ControlRequest):
       payload = req.SerializeToString()
-      sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
-      sock.connect(("::1", port))
-      sock.sendall(len(payload).to_bytes(4, "big") + payload)
-      resp_len = int.from_bytes(sock.recv(4), "big")
-      resp_bytes = sock.recv(resp_len)
+      pipe_client = control_pipe_client.ControlPipeClient(
+          backend=control_pipe_client.ControlPipeBackendType.GRPC
+      )
+      try:
+        resp_bytes = pipe_client.send_raw_bytes_sync(
+            f"localhost:{port}",
+            payload,
+            timeout=_CONNECT_TIMEOUT_SECS,
+            message_type="tpu_sync.rpc.ControlRequest",
+        )
+      finally:
+        pipe_client.close()
       resp = raiden_service_pb2.ControlResponse()
       resp.ParseFromString(resp_bytes)
       self.assertTrue(resp.success, resp.message)
-      sock.close()
 
     for step in range(2):
       uuid = 70001 + step
@@ -947,12 +954,20 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
       self, port: int, request: raiden_service_pb2.ControlRequest
   ) -> None:
     payload = request.SerializeToString()
-    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0) as sock:
-      sock.connect(("::1", port))
-      sock.sendall(len(payload).to_bytes(4, "big") + payload)
-      response_len = int.from_bytes(sock.recv(4), "big")
-      response = raiden_service_pb2.ControlResponse()
-      response.ParseFromString(sock.recv(response_len))
+    pipe_client = control_pipe_client.ControlPipeClient(
+        backend=control_pipe_client.ControlPipeBackendType.GRPC
+    )
+    try:
+      response_bytes = pipe_client.send_raw_bytes_sync(
+          f"localhost:{port}",
+          payload,
+          timeout=_CONNECT_TIMEOUT_SECS,
+          message_type="tpu_sync.rpc.ControlRequest",
+      )
+    finally:
+      pipe_client.close()
+    response = raiden_service_pb2.ControlResponse()
+    response.ParseFromString(response_bytes)
     self.assertTrue(response.success, response.message)
 
   def _push_resharded(

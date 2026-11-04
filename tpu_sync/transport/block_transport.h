@@ -149,10 +149,16 @@ class BlockTransport final {
   // timed-out plan so the `uuid` can be safely reused.
   void ForgetPushProgress(uint64_t uuid);
 
-  // Receiver-side completion for a Peregrine push: one call per landed Post,
-  // with the Post's metadata and that of each of its requests.
-  absl::Status OnRecvComplete(const lib::PostMetadata& post,
-                              absl::Span<const lib::RequestMetadata> requests);
+  // Receiver-side completion for a Peregrine push: one call per Post, with the
+  // Post's metadata, that of each of its requests, and the transport status.
+  absl::Status OnRecvComplete(
+      const lib::PostMetadata& post,
+      absl::Span<const lib::RequestMetadata> requests,
+      const absl::Status& post_status = absl::OkStatus());
+
+  // Receiver-side address resolution for incoming Peregrine request.
+  uint8_t* ResolveRecvBuffer(const lib::PostMetadata& post,
+                             const lib::RequestMetadata& req);
 
   // Synchronously pushes a buffer identified by `buffer_id` to the remote
   // `peer`, by sending out a `kOpBufferPush ChunkHeader` followed by the data.
@@ -260,8 +266,10 @@ class BlockTransport final {
                                   const lib::ChunkHeader& header);
   std::shared_ptr<BlockTransportServerPushSession> GetOrCreatePushSession(
       uint64_t uuid);
-  // Erases the active push session for |uuid| from active_push_sessions_.
-  void DeletePushSession(uint64_t uuid);
+  // Erases |session| once it is done: only while it is still the session
+  // mapped for its uuid, and only once nothing it admitted is in flight.
+  void DeletePushSession(
+      const std::shared_ptr<BlockTransportServerPushSession>& session);
   // Erases the active pull session for |session_id| from active_pull_sessions_.
   void DeletePullSession(uint64_t session_id);
 

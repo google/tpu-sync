@@ -21,6 +21,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -112,7 +113,7 @@ class BlockTransportServerPushSession final
                                   BlockTransportDelegate* delegate,
                                   const BlockTransportConfig& config);
 
-  ~BlockTransportServerPushSession() override = default;
+  ~BlockTransportServerPushSession() override;
 
   Kind kind() const override { return Kind::kPush; }
   uint64_t uuid() const override { return uuid_; }
@@ -124,10 +125,19 @@ class BlockTransportServerPushSession final
   absl::Status StartStream(int client_fd,
                            const lib::ChunkHeader& header) override;
 
+  // Receiver-side address of one incoming Peregrine request. Thread-safe across
+  // concurrent requests of the same or different Posts; admits each PostKey at
+  // most once and holds its TransferSession lease until OnPeregrinePostComplete.
+  uint8_t* ResolveRecvBuffer(const lib::PostMetadata& post,
+                             const lib::RequestMetadata& req);
+
   // Processes receiver-side completion of a Peregrine Post.
   absl::Status OnPeregrinePostComplete(
       const lib::PostMetadata& post,
-      absl::Span<const lib::RequestMetadata> requests);
+      absl::Span<const lib::RequestMetadata> requests,
+      const absl::Status& post_status = absl::OkStatus());
+  // True while a Peregrine Post admitted here has not completed.
+  bool HasAdmittedPosts() const;
 
  private:
   // Accounting for stream and shard arrivals. A block array this push
@@ -156,6 +166,25 @@ class BlockTransportServerPushSession final
   static size_t AccumulateLandedShards(LayerProgress::SenderStreams& streams,
                                        size_t shards, size_t full_shards);
 
+  // One Peregrine Post seen by ResolveRecvBuffer and the op it holds.
+  struct PostLease {
+    enum class State { kAdmitting, kAdmitted, kReleased };
+    State state = State::kAdmitting;
+    absl::Status status;
+    std::shared_ptr<TransferSession> session;
+    bool settled() const { return state != State::kAdmitting; }
+  };
+  // Waits until the lease's admission has settled.
+  void AwaitSettled(const PostLease& lease) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Marks the lease released and drops it from the map; the caller ends the op.
+  void DropLeaseLocked(const lib::PostMetadata& post,
+                       std::shared_ptr<PostLease> lease)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Releases the lease of an admitted Post that is being refused.
+  void RejectPost(const lib::PostMetadata& post, const absl::Status& status);
+  // Releases the leases of every admitted Post with the session's status.
+  void ReleaseAdmittedPosts();
+
   const uint64_t uuid_;
   BlockTransportDelegate* const delegate_;
   const BlockTransportConfig config_;
@@ -164,6 +193,13 @@ class BlockTransportServerPushSession final
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   absl::Status status_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_map<int, LayerProgress> layer_progress_ ABSL_GUARDED_BY(mu_);
+  // Keyed by (remote_id, local_id, shard_mask) rather than Peregrine's handle
+  // (one Post per key per uuid). Only receiver-resolved Posts get a lease here;
+  // sender-addressed Posts take the op in OnPeregrinePostComplete.
+  using PostKey = std::tuple<uint32_t, uint32_t, uint16_t>;
+  static PostKey PostKeyOf(const lib::PostMetadata& post);
+  absl::flat_hash_map<PostKey, std::shared_ptr<PostLease>> peregrine_posts_
+      ABSL_GUARDED_BY(mu_);
 };
 
 // Server-side session managing incoming pull requests (op 2).

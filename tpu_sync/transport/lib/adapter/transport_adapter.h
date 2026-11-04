@@ -89,6 +89,9 @@ using Status = ::peregrine::Status;
 using CompletionCallback =
     absl::AnyInvocable<void(absl::StatusOr<std::vector<int>>)>;
 
+// Sentinel `local_id` when no specific layer/block-array index is specified.
+inline constexpr uint32_t kUnspecifiedLocalId = 0xFFFF'FFFF;
+
 // Application metadata attached to one Post. Identical across the Post's
 // requests.
 struct PostMetadata {
@@ -98,10 +101,13 @@ struct PostMetadata {
   uint16_t shard_mask = 0;
 };
 
-// Application metadata attached to one request of a Post. Expected to grow
-// with what the receiver needs to resolve a request's destination buffer.
+// Application metadata attached to one request of a Post.
 struct RequestMetadata {
-  uint32_t shard;
+  uint32_t shard = 0;
+  int32_t block_id = -1;
+  int32_t src_block_id = -1;
+  uint16_t chunk_idx = 0;
+  uint32_t len = 0;
 };
 
 // Abstract transport adapter interface for Post and Poll operations.

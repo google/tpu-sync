@@ -193,12 +193,20 @@ TEST(BlockTransportServerPushSessionTest, Cancel) {
   BlockTransportConfig config;
 
   auto session = std::make_shared<BlockTransportServerPushSession>(
-      /*uuid=*/100, &delegate, config);
+      /*uuid=*/0, &delegate, config);
 
   EXPECT_FALSE(session->IsDone());
   session->Cancel();
   EXPECT_TRUE(session->IsDone());
   EXPECT_THAT(session->status(), StatusIs(absl::StatusCode::kCancelled));
+
+  const lib::PostMetadata post{.uuid = 0, .remote_id = 0, .local_id = 0};
+  EXPECT_EQ(session->ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 1024}),
+            nullptr);
+  EXPECT_THAT(session->OnPeregrinePostComplete(post, /*requests=*/{}),
+              StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_THAT(delegate.layers_received(), Eq(0));
 }
 
 TEST(BlockTransportServerPullSessionTest, InvalidArgumentsRejected) {

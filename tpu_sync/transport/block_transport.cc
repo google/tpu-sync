@@ -445,7 +445,8 @@ std::shared_ptr<BlockTransportServerPushSession>
 BlockTransport::GetOrCreatePushSession(uint64_t uuid) {
   absl::MutexLock lock(server_sessions_mu_);
   auto& session = active_push_sessions_[uuid];
-  if (session != nullptr) {
+  if (session != nullptr &&
+      (!session->IsDone() || session->HasAdmittedPosts())) {
     return session;
   }
   session = std::make_shared<BlockTransportServerPushSession>(
@@ -453,9 +454,14 @@ BlockTransport::GetOrCreatePushSession(uint64_t uuid) {
   return session;
 }
 
-void BlockTransport::DeletePushSession(uint64_t uuid) {
+void BlockTransport::DeletePushSession(
+    const std::shared_ptr<BlockTransportServerPushSession>& session) {
   absl::MutexLock lock(server_sessions_mu_);
-  active_push_sessions_.erase(uuid);
+  auto it = active_push_sessions_.find(session->uuid());
+  if (it != active_push_sessions_.end() && it->second == session &&
+      !session->HasAdmittedPosts()) {
+    active_push_sessions_.erase(it);
+  }
 }
 
 void BlockTransport::DeletePullSession(uint64_t session_id) {
@@ -469,7 +475,7 @@ absl::Status BlockTransport::HandleIncomingPush(
       GetOrCreatePushSession(header.uuid);
   absl::Status status = session->StartStream(client_fd, header);
   if (session->IsDone()) {
-    DeletePushSession(header.uuid);
+    DeletePushSession(session);
   }
   return status;
 }
@@ -477,14 +483,27 @@ absl::Status BlockTransport::HandleIncomingPush(
 // ---------------------------------------------------------------------------
 // Peregrine receive path.
 // ---------------------------------------------------------------------------
-absl::Status BlockTransport::OnRecvComplete(
-    const lib::PostMetadata& post,
-    absl::Span<const lib::RequestMetadata> requests) {
+uint8_t* BlockTransport::ResolveRecvBuffer(const lib::PostMetadata& post,
+                                           const lib::RequestMetadata& req) {
   std::shared_ptr<BlockTransportServerPushSession> session =
       GetOrCreatePushSession(post.uuid);
-  absl::Status status = session->OnPeregrinePostComplete(post, requests);
+  uint8_t* addr = session->ResolveRecvBuffer(post, req);
   if (session->IsDone()) {
-    DeletePushSession(post.uuid);
+    DeletePushSession(session);
+  }
+  return addr;
+}
+
+absl::Status BlockTransport::OnRecvComplete(
+    const lib::PostMetadata& post,
+    absl::Span<const lib::RequestMetadata> requests,
+    const absl::Status& post_status) {
+  std::shared_ptr<BlockTransportServerPushSession> session =
+      GetOrCreatePushSession(post.uuid);
+  absl::Status status =
+      session->OnPeregrinePostComplete(post, requests, post_status);
+  if (session->IsDone()) {
+    DeletePushSession(session);
   }
   return status;
 }
@@ -745,7 +764,7 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
   // header names the array the receiver writes into.
   const int header_layer_idx = wire_layer_idx.value_or(layer_idx);
   const uint32_t local_id = header_layer_idx == -1
-                                ? 0xFFFF'FFFF
+                                ? lib::kUnspecifiedLocalId
                                 : static_cast<uint32_t>(header_layer_idx);
   if (num_blocks == 0) {
     return std::vector<lib::Request>{BuildBlockRequest(

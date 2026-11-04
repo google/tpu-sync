@@ -67,6 +67,13 @@ _STORAGE_PHASE = flags.DEFINE_string(
     "both",
     "Phase of secondary storage test: 'write', 'read', or 'both'",
 )
+_STORAGE_METADATA_CACHE = flags.DEFINE_boolean(
+    "storage_metadata_cache",
+    False,
+    "storage_eviction mode: enable the coordinator's POSIX existence cache"
+    " (unbounded, never expiring), so Lookup can answer from stale entries"
+    " after files are evicted out of band.",
+)
 _REPLICA_CONTROLLER_PORTS = flags.DEFINE_list(
     "replica_controller_ports",
     [],
@@ -1737,6 +1744,494 @@ def _worker_three_source_main(argv):
 
 
 # -----------------------------------------------------------------------------
+# Helpers for the storage-eviction worker.
+# -----------------------------------------------------------------------------
+# Expected storage-eviction lookup answers: the number of leading hashes
+# (ev_0, ev_1, ...) reported SHARED_STORAGE after each read-phase step, keyed
+# by --storage_metadata_cache. With the cache off, lookup probes storage and
+# sees an eviction at once; with a stale cache it keeps reporting evicted
+# blocks until a failed recall drops their entries. A truncated file still
+# passes faccessat(F_OK) in both modes (4a/8) until its failed recall drops
+# the cache entry and the corrupt files are removed (4b/8).
+_EVICTION_LOOKUP_PREFIX = {
+    False: {
+        "1/8": 4,
+        "2/8": 3,
+        "3/8": 3,
+        "4a/8": 3,
+        "4b/8": 2,
+        "5/8": 1,
+        "6/8": 1,
+    },
+    True: {
+        "1/8": 4,
+        "2/8": 4,
+        "3/8": 3,
+        "4a/8": 3,
+        "4b/8": 2,
+        "5/8": 2,
+        "6/8": 1,
+    },
+}
+
+
+def _wait_for_failed(
+    poll_fn, expected_hashes, what, timeout_s=_THREE_SOURCE_WAIT_TIMEOUT_S
+):
+  """Blocks until every hash in expected_hashes is reported failed by poll_fn.
+
+  The inverse of _wait_for_all: any hash reported done fails the wait.
+
+  Args:
+    poll_fn: store.poll_load_status. Returns a tuple whose first two entries are
+      (done, failed); results are drained.
+    expected_hashes: the exact set of block hashes that must fail.
+    what: label used in error messages.
+    timeout_s: fails with the unreported hashes after this many seconds.
+
+  Raises:
+    AssertionError: if any hash is reported done, or a hash outside
+      expected_hashes is reported failed.
+    TimeoutError: if not all expected hashes fail within timeout_s.
+  """
+  expected = set(expected_hashes)
+  failed_seen = set()
+  start = time.time()
+  while True:
+    done, failed = poll_fn()[:2]
+    if done:
+      raise AssertionError(f"{what}: expected failure, but done for {done}")
+    failed_seen.update(failed)
+    if failed_seen == expected:
+      return
+    if failed_seen - expected:
+      raise AssertionError(
+          f"{what}: unexpected failures {sorted(failed_seen - expected)}"
+      )
+    if time.time() - start > timeout_s:
+      raise TimeoutError(
+          f"{what} not reported failed after {timeout_s}s:"
+          f" missing={sorted(expected - failed_seen)}"
+      )
+    time.sleep(0.01)
+
+
+def _worker_storage_eviction_main(argv):
+  """4-rank MPMD: shard files evicted or truncated in POSIX storage.
+
+  Simulates Lustre evicting or truncating KV files out of band (no Raiden
+  involvement) and checks that Raiden turns missing/corrupt files into lookup
+  misses or failed recalls without leaking host staging blocks or admitting bad
+  data into HBM/DRAM.
+
+  Write phase (writer group): saves ev_0..ev_3 to storage; every TP rank
+  writes one shard file per block (16 files).
+
+  Read phase (cold reader group, 4 host staging blocks), rank 0 drives, every
+  step ends in a barrier:
+    1. Baseline:       lookup -> all 4 SHARED_STORAGE. The answer's slices are
+                       kept and reused below, as a caller that looked up before
+                       the eviction would.
+    2. Evict whole:    every rank deletes its shard of ev_3 (tail block).
+                       no cache:    lookup -> [ev_0, ev_1, ev_2] immediately.
+                       stale cache: lookup still -> all 4 (stale entries).
+    3. Mixed & single: read_remote([ev_0, ev_3]) with intact ev_0 + evicted
+                       ev_3 fails atomically (both reported FAILED; ev_0 not
+                       admitted to HOST_AND_HBM); single read_remote([ev_3])
+                       also fails. Both modes: lookup -> [ev_0, ev_1, ev_2]
+                       (ev_3's stale cache entry is dropped; ev_0 is re-probed).
+    4. Truncated file: rank 0 truncates its shard of ev_2 to half size.
+                       4a: lookup still -> [ev_0, ev_1, ev_2] (faccessat F_OK).
+                       read_remote([ev_2]) hits unexpected EOF -> FAILED and
+                       drops ev_2's cache entry. All ranks remove ev_2;
+                       4b: lookup -> [ev_0, ev_1] in both modes.
+    5. Evict shard:    only the last TP rank deletes its shard of ev_1, so the
+                       other ranks' ev_1 shards remain on disk.
+                       no cache:    lookup -> [ev_0] (prefix halts at ev_1).
+                       stale cache: lookup -> [ev_0, ev_1].
+    6. Recall ev_1:    read_remote([ev_1]) -> FAILED on the missing shard for
+                       rank world_size - 1 (bringing the cumulative failed
+                       staging allocations across steps 3-6 to 5). Both modes:
+                       lookup -> [ev_0].
+    7. Recall ev_0:    surviving block recalls into HBM 0 -> done (requiring 1
+                       free staging block after the 5 failed allocations above);
+                       HBM block 0 is bit-exact on every rank and ev_0 is now
+                       HOST_AND_HBM.
+    8. Re-save & cold: insert + save([ev_3]) from HBM block 3 to recreate ev_3
+                       on disk; issue a 4-block absent read_remote to allocate
+                       all 4 host blocks at once (if even 1 staging block had
+                       leaked in steps 3-6, AllocateBlockIds(4) would fail with
+                       ResourceExhausted without evicting {ev_0, ev_3});
+                       lookup([ev_0, ev_3]) -> SHARED_STORAGE for both; batch
+                       read_remote([ev_0, ev_3]) -> HBM [1, 2] bit-exact on
+                       every rank.
+
+  Args:
+    argv: Unused command-line arguments.
+  """
+  del argv
+  tag = "MPMD STORAGE EVICTION"
+  rank = FLAGS.rank
+  world_size = FLAGS.world_size
+  controller_port = FLAGS.controller_port
+  storage_root = _STORAGE_ROOT.value
+  phase = _STORAGE_PHASE.value
+  metadata_cache = _STORAGE_METADATA_CACHE.value
+  model_name = "test_model_mpmd_eviction"
+  status = kv_cache_store.BlockStatus
+
+  _init_worker_process_group(tag, rank, world_size, FLAGS.master_port, phase)
+  try:
+    cfg = kv_cache_store._impl.BackendConfig()
+    cfg.type = "posix"
+    cfg.parallelism.tp_rank = rank
+    cfg.parallelism.tp_size = world_size
+    cfg.set_property("root_dir", storage_root)
+    cfg.set_property("model_name", model_name)
+    if _STORAGE_DIRECT_IO.value:
+      cfg.set_property("direct_io", "true")
+    if metadata_cache:
+      # Unbounded and never expiring: an entry is only dropped by a failed
+      # recall, which is exactly the path under test.
+      cfg.set_property("metadata_cache_max_entries", "-1")
+      cfg.set_property("metadata_cache_ttl_secs", "-1")
+
+    device = torch.device("tpu")
+    num_blocks = 4
+    # Shape: (4 blocks, 128 tokens/block, 8 head shards, 8 heads/shard,
+    # head_dim 128).
+    shape = (num_blocks, 128, 8, 8, 128)
+    host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) + (
+        rank * 1000.0
+    )
+    shard_size_bytes = int(np.prod(shape[1:])) * np.dtype(np.float32).itemsize
+    hashes = [f"hash_mpmd_ev_{i}".encode() for i in range(num_blocks)]
+    ev0, ev1, ev2, ev3 = hashes
+
+    def shard_path(key, tp_rank):
+      return _expected_shard_path(
+          storage_root, model_name, key, [("tp", world_size, tp_rank)]
+      )
+
+    if phase in ("write", "both"):
+      tpu_cache = torch.tensor(host_data, device=device)
+      _tpu_sync()
+      rid_w = kv_cache_store.RaidenId(
+          "mpmd_ev_job_writer", "0", "mpmd_ev_cache_writer", 0
+      )
+      store_w = None
+      if rank == 0:
+        store_w = kv_cache_store.KVCacheStore(
+            capacity=num_blocks,
+            raiden_id=rid_w,
+            num_shards=world_size,
+            shard_size_bytes=shard_size_bytes,
+            store_server_ip="127.0.0.1",
+            raiden_controller_port=controller_port,
+            secondary_backend_configs=[cfg],
+        )
+        assert store_w.insert(
+            hashes, _hbm_slices(rid_w, num_blocks), on_host=False
+        ), "writer insert failed"
+      dist.barrier()
+      manager_w = _create_managers(
+          rank,
+          world_size,
+          kv_caches=[[tpu_cache]],
+          max_blocks=num_blocks,
+          raiden_controller_address=f"localhost:{controller_port}",
+          worker_id=f"worker_w_{rank}",
+          backend_configs=[cfg],
+      )
+      if rank == 0:
+        _log(tag, "W", rank, f"Saving {len(hashes)} blocks -> SHARED_STORAGE.")
+        assert store_w.save(hashes), "writer save failed"
+        secs = _wait_for_all(store_w.poll_save_status, hashes, "storage save")
+        _log(tag, "W", rank, f"Saved in {secs:.3f}s.")
+      dist.barrier()
+      _verify_and_print_shard_files(
+          tag, "W", storage_root, model_name, world_size, rank, hashes
+      )
+      del manager_w, store_w, tpu_cache
+      dist.barrier()
+      if phase == "write":
+        return
+
+    if phase in ("read", "both"):
+      mode = "stale metadata cache" if metadata_cache else "no metadata cache"
+      # Populate HBM block 3 with ev_3's payload before KVCacheManager binds
+      # the PJRT buffer (in-place XLA ops after binding would replace the
+      # backing buffer). Blocks 0-2 start at zero: blocks 1-2 are scratch
+      # targets for failed recalls and then the destination of Step 8's batch
+      # recall; block 0 is the destination of Step 7's recall.
+      init_r = np.zeros(shape, dtype=np.float32)
+      init_r[3] = host_data[3]
+      tpu_cache = torch.tensor(init_r, device=device)
+      _tpu_sync()
+      rid_r = kv_cache_store.RaidenId(
+          "mpmd_ev_job_reader", "0", "mpmd_ev_cache_reader", 0
+      )
+      store = None
+      if rank == 0:
+        store = kv_cache_store.KVCacheStore(
+            capacity=num_blocks,
+            raiden_id=rid_r,
+            num_shards=world_size,
+            shard_size_bytes=shard_size_bytes,
+            store_server_ip="127.0.0.1",
+            raiden_controller_port=controller_port,
+            secondary_backend_configs=[cfg],
+        )
+      dist.barrier()
+      manager = _create_managers(
+          rank,
+          world_size,
+          kv_caches=[[tpu_cache]],
+          max_blocks=num_blocks,
+          raiden_controller_address=f"localhost:{controller_port}",
+          worker_id=f"worker_r_{rank}",
+          backend_configs=[cfg],
+      )
+
+      expected_prefix = _EVICTION_LOOKUP_PREFIX[metadata_cache]
+
+      def expect_lookup(step):
+        expected_hashes = hashes[: expected_prefix[step]]
+        result = store.lookup(hashes, pin_found=False)
+        _assert_statuses(
+            result,
+            expected_hashes,
+            [status.SHARED_STORAGE] * len(expected_hashes),
+        )
+        _log(
+            tag,
+            step,
+            rank,
+            f"[{mode}] lookup -> {len(result)} SHARED_STORAGE:"
+            f" {[h for h, _ in result]}",
+        )
+        return result
+
+      # ---- Phase 1/8: baseline. ----
+      slice_of = None
+      if rank == 0:
+        slice_of = dict(expect_lookup("1/8"))
+      dist.barrier()
+
+      # ---- Phase 2/8: every rank evicts its own shard of tail block ev_3. ----
+      os.remove(shard_path(ev3, rank))
+      _log(tag, "2/8", rank, f"Evicted {shard_path(ev3, rank)}")
+      dist.barrier()
+      if rank == 0:
+        expect_lookup("2/8")
+      dist.barrier()
+
+      # ---- Phase 3/8: mixed [ev_0, ev_3] + single [ev_3] recall fail. ----
+      if rank == 0:
+        assert store.read_remote(
+            [ev0, ev3], [slice_of[ev0], slice_of[ev3]], [1, 2]
+        ), "read_remote([ev_0, ev_3]) did not launch"
+        _wait_for_failed(
+            store.poll_load_status, [ev0, ev3], "mixed recall of [ev_0, ev_3]"
+        )
+        _log(
+            tag,
+            "3/8",
+            rank,
+            f"Mixed recall [{ev0!r}, {ev3!r}] failed atomically; {ev0!r} not"
+            " admitted to HOST_AND_HBM.",
+        )
+        assert store.read_remote(
+            [ev3], [slice_of[ev3]], [2]
+        ), "read_remote(ev_3) did not launch"
+        _wait_for_failed(store.poll_load_status, [ev3], "recall of ev_3")
+        _log(tag, "3/8", rank, f"Recall of evicted {ev3!r} reported FAILED.")
+        expect_lookup("3/8")
+        assert not store.lookup(
+            [ev3], pin_found=False
+        ), f"{ev3!r} must not be resident after a failed recall"
+      dist.barrier()
+
+      # ---- Phase 4/8: rank 0 truncates ev_2 -> lookup hit, recall EOF. ----
+      if rank == 0:
+        os.truncate(shard_path(ev2, 0), shard_size_bytes // 2)
+        _log(
+            tag,
+            "4/8",
+            rank,
+            f"Truncated {shard_path(ev2, 0)} to {shard_size_bytes // 2} bytes",
+        )
+      dist.barrier()
+      if rank == 0:
+        expect_lookup("4a/8")
+        assert store.read_remote(
+            [ev2], [slice_of[ev2]], [2]
+        ), "read_remote(ev_2) did not launch"
+        _wait_for_failed(
+            store.poll_load_status, [ev2], "recall of truncated ev_2"
+        )
+        _log(
+            tag,
+            "4/8",
+            rank,
+            f"Recall of truncated {ev2!r} reported FAILED (unexpected EOF).",
+        )
+      dist.barrier()
+      os.remove(shard_path(ev2, rank))
+      dist.barrier()
+      if rank == 0:
+        expect_lookup("4b/8")
+      dist.barrier()
+
+      # ---- Phase 5/8: only the last TP rank evicts its shard of ev_1. ----
+      if rank == world_size - 1:
+        os.remove(shard_path(ev1, rank))
+        _log(tag, "5/8", rank, f"Evicted {shard_path(ev1, rank)}")
+      dist.barrier()
+      for tp_rank in range(world_size - 1):
+        assert os.path.exists(
+            shard_path(ev1, tp_rank)
+        ), f"Rank {rank}: shard of ev_1 for TP rank {tp_rank} must survive"
+      if rank == 0:
+        expect_lookup("5/8")
+      dist.barrier()
+
+      # ---- Phase 6/8: missing shard on rank world_size - 1 fails ev_1. ----
+      if rank == 0:
+        assert store.read_remote(
+            [ev1], [slice_of[ev1]], [1]
+        ), "read_remote(ev_1) did not launch"
+        _wait_for_failed(store.poll_load_status, [ev1], "recall of ev_1")
+        _log(
+            tag,
+            "6/8",
+            rank,
+            f"Recall of partially evicted {ev1!r} reported FAILED.",
+        )
+        expect_lookup("6/8")
+      dist.barrier()
+
+      # ---- Phase 7/8: surviving ev_0 recalls bit-exact (needs >= 1 free ----
+      # ---- staging block after the 5 failed allocations in steps 3-6).  ----
+      if rank == 0:
+        assert store.read_remote(
+            [ev0], [slice_of[ev0]], [0]
+        ), "read_remote(ev_0) did not launch"
+        secs = _wait_for_all(store.poll_load_status, [ev0], "recall of ev_0")
+        _log(tag, "7/8", rank, f"Recall of {ev0!r} done in {secs:.3f}s.")
+      dist.barrier()
+      _tpu_sync()
+      # Blocks 1-3 were targets of failed recalls: their contents are
+      # undefined, so only block 0 is checked.
+      np.testing.assert_array_equal(tpu_cache.cpu().numpy()[0], host_data[0])
+      _log(tag, "7/8", rank, "HBM block 0 bit-exact after eviction of others.")
+      dist.barrier()
+      if rank == 0:
+        local = store.lookup([ev0], pin_found=False)
+        _assert_statuses(local, [ev0], [status.HOST_AND_HBM])
+        _log(tag, "7/8", rank, f"{ev0!r} published HOST_AND_HBM.")
+      dist.barrier()
+
+      # ---- Phase 8/8: re-save ev_3, evict Tier-0 DRAM, recall [ev_0, ev_3].
+      if rank == 0:
+        recomputed_slice = kv_cache_store.RaidenBlockId(
+            rid_r,
+            host_block_id=-1,
+            device_block_id=3,
+            status=status.HBM,
+        )
+        assert store.insert(
+            [ev3], [recomputed_slice], on_host=False
+        ), "re-insert of ev_3 failed"
+        assert store.save([ev3]), "re-save of ev_3 failed"
+        secs = _wait_for_all(store.poll_save_status, [ev3], "re-save of ev_3")
+        _log(tag, "8/8", rank, f"Re-saved {ev3!r} to storage in {secs:.3f}s.")
+      dist.barrier()
+      resaved_path = shard_path(ev3, rank)
+      assert (
+          os.path.getsize(resaved_path) == shard_size_bytes
+      ), f"Rank {rank}: re-saved {resaved_path} size != {shard_size_bytes}"
+      with open(resaved_path, "rb") as f:
+        resaved_np = np.frombuffer(f.read(), dtype=np.float32).reshape(
+            shape[1:]
+        )
+      np.testing.assert_array_equal(resaved_np, host_data[3])
+      dist.barrier()
+
+      if rank == 0:
+        # Request all 4 host blocks at once. This both evicts {ev0, ev3} from
+        # Tier-0 DRAM and verifies that none of the 5 staging allocations in
+        # steps 3-6 leaked: if even 1 block had leaked, AllocateBlockIds(4)
+        # would fail with ResourceExhausted before evicting anything, leaving
+        # evicted_from_host empty.
+        evicted_from_host = []
+        store.set_eviction_callback(evicted_from_host.extend)
+        absent_batch = [
+            ev2,
+            b"hash_mpmd_ev_absent_0",
+            b"hash_mpmd_ev_absent_1",
+            b"hash_mpmd_ev_absent_2",
+        ]
+        assert store.read_remote(
+            absent_batch, [slice_of[ev2]] * 4, [0, 1, 2, 3]
+        ), "staging-pressure read_remote did not launch"
+        _wait_for_failed(
+            store.poll_load_status, absent_batch, "staging-pressure recall"
+        )
+        store.set_eviction_callback(None)
+        assert set(evicted_from_host) == {
+            ev0,
+            ev3,
+        }, f"Expected Tier-0 eviction of {{ev0, ev3}}, got {evicted_from_host}"
+        cold_lookup = store.lookup([ev0, ev3], pin_found=False)
+        _assert_statuses(cold_lookup, [ev0, ev3], [status.SHARED_STORAGE] * 2)
+        _log(
+            tag,
+            "8/8",
+            rank,
+            f"Evicted {evicted_from_host} from Tier-0 DRAM; lookup([ev_0,"
+            " ev_3]) -> 2 SHARED_STORAGE.",
+        )
+      dist.barrier()
+
+      if rank == 0:
+        assert store.read_remote(
+            [ev0, ev3], [slice_of[ev0], slice_of[ev3]], [1, 2]
+        ), "read_remote([ev_0, ev_3]) after re-save did not launch"
+        secs = _wait_for_all(
+            store.poll_load_status, [ev0, ev3], "recall of [ev_0, ev_3]"
+        )
+        _log(
+            tag,
+            "8/8",
+            rank,
+            f"Recalled [{ev0!r}, {ev3!r}] into HBM [1, 2] in {secs:.3f}s.",
+        )
+      dist.barrier()
+      _tpu_sync()
+      final_np = tpu_cache.cpu().numpy()
+      np.testing.assert_array_equal(final_np[0], host_data[0])
+      np.testing.assert_array_equal(final_np[1], host_data[0])
+      np.testing.assert_array_equal(final_np[2], host_data[3])
+      np.testing.assert_array_equal(final_np[3], host_data[3])
+      _log(
+          tag,
+          "8/8",
+          rank,
+          "HBM blocks [1, 2] bit-exact for [ev_0, re-saved ev_3].",
+      )
+      dist.barrier()
+      if rank == 0:
+        repopulated = store.lookup([ev0, ev3], pin_found=False)
+        _assert_statuses(repopulated, [ev0, ev3], [status.HOST_AND_HBM] * 2)
+      del manager, store
+      dist.barrier()
+  finally:
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+# -----------------------------------------------------------------------------
 # Storage offload helpers for the GDN hybrid cache mock below.
 # -----------------------------------------------------------------------------
 _SENTINEL = 0xA5  # every byte of a reader buffer starts as this
@@ -2445,6 +2940,22 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
         "gdn_hybrid_mock", direct_io, [f"--replica_controller_ports={ports}"]
     )
 
+  @parameterized.named_parameters(
+      ("buffered_no_metadata_cache", False, False),
+      ("buffered_stale_metadata_cache", True, False),
+      ("direct_io_no_metadata_cache", False, True),
+      ("direct_io_stale_metadata_cache", True, True),
+  )
+  def test_mpmd_4rank_e2e_storage_eviction(
+      self, metadata_cache: bool, direct_io: bool
+  ):
+    """Shard files evicted or truncated in storage: misses, not bad data."""
+    self._drive_secondary_storage(
+        "storage_eviction",
+        direct_io,
+        [f"--storage_metadata_cache={metadata_cache}"],
+    )
+
   def _drive_secondary_storage(self, worker_mode, direct_io, extra_flags):
     """Runs a writer group, then a cold reader group, of 4 ranks each."""
     world_size = 4
@@ -2696,6 +3207,8 @@ def main(argv):
       _worker_gdn_hybrid_mock_main(argv)
     elif FLAGS.worker_mode == "three_source":
       _worker_three_source_main(argv)
+    elif FLAGS.worker_mode == "storage_eviction":
+      _worker_storage_eviction_main(argv)
     else:
       _worker_save_load_main(argv)
   else:

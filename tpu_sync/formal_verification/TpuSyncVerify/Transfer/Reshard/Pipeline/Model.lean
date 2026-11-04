@@ -117,24 +117,24 @@ def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
   match e with
   | .d2hIssue p ok =>
     if ok = false ∨ s.armed = true then
-      (Send.step .shipping s.send (.d2hIssue p ok)).map fun snd =>
+      (Send.step s.send (.d2hIssue p ok)).map fun snd =>
         { s with send := snd }
     else none
   | .d2hDone p ok =>
-    (Send.step .shipping s.send (.d2hDone p ok)).map fun snd =>
+    (Send.step s.send (.d2hDone p ok)).map fun snd =>
       if ok then
         { s with send := snd
                  srcStaging := s.srcStaging.set p (s.srcHbm.getD p .junk) }
       else { s with send := snd }
   | .pushDone p ok =>
-    (Send.step .shipping s.send (.pushDone p ok)).map fun snd =>
+    (Send.step s.send (.pushDone p ok)).map fun snd =>
       if ok then
         { s with send := snd
                  wire := s.wire.set p (s.srcStaging.getD p .junk)
                  sentStreams := s.sentStreams.set p (s.sentStreams.getD p 0 + 1) }
       else { s with send := snd }
   | e =>
-    (Send.step .shipping s.send e).map fun snd => { s with send := snd }
+    (Send.step s.send e).map fun snd => { s with send := snd }
 
 /-- Receiver transition (`ReshardReceiveSession::OnPoolReceived`,
 `ExecuteEligiblePoolH2ds`, `FinishPoolH2d`,

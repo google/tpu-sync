@@ -1,6 +1,6 @@
 import TpuSyncVerify.Transfer.Reshard.Coordinator.Lemmas
 
-/-! # `Coordinator`: universal protocol invariants (both policies)
+/-! # `Coordinator`: universal protocol invariants
 
 Part of `TpuSyncVerify.Transfer.Reshard.Coordinator`. -/
 
@@ -10,7 +10,7 @@ open TpuSyncVerify
 
 open TpuSyncVerify.Transfer.Reshard.Registry
 
-/-! ## Part III — Universal Protocol Invariants (Both Policies) -/
+/-! ## Part III — Universal Protocol Invariants -/
 
 /-- In `.idle`, the registry has no active claim or completion votes, and all
 destination units are unarmed. -/
@@ -66,8 +66,7 @@ For every destination unit, its `PoolStagingLease` is held if and only if its
 def LeaseMatchesSession (s : CoordState) : Prop :=
   ∀ d ∈ s.dstStates, d.stagingLeaseHeld = d.sessionArmed
 
-/-- Combined universal invariant of `CoordState` (holds for both `.shipping` and
-`.disarmAndAbandonOnFailure`). -/
+/-- Combined universal invariant of `CoordState`. -/
 structure CoordInv (s : CoordState) : Prop where
   regInv : Registry.Inv s.reg
   idleShape : IdleShape s
@@ -100,8 +99,8 @@ theorem init_coordInv (srcUnits dstUnits : List Nat) (claimOwner : Nat) :
     obtain ⟨u, _, rfl⟩ := hd
     rfl
 
-theorem step_preserves_coordInv {policy : CleanupPolicy} {s s' : CoordState} {e : Ev}
-    (hinv : CoordInv s) (hstep : CoordState.step policy s e = some s') :
+theorem step_preserves_coordInv {s s' : CoordState} {e : Ev}
+    (hinv : CoordInv s) (hstep : CoordState.step s e = some s') :
     CoordInv s' := by
   cases e with
   | registerProducer srcUnit =>
@@ -212,29 +211,14 @@ theorem step_preserves_coordInv {policy : CleanupPolicy} {s s' : CoordState} {e 
       · intro _; exact Or.inl ⟨hc, ho⟩
       · intro h; cases h <;> contradiction
       · intro _; exact ⟨hno_fail, hall_rep⟩
-    · cases policy with
-      | shipping =>
-        injection hstep with h; subst h
-        refine ⟨abandonIfClaimed_inv s.reg s.claimOwner hinv.regInv,
-          ?_, ?_, ?_, ?_, ?_, hinv.leaseMatches⟩
-        · intro h; contradiction
-        · intro h; contradiction
-        · intro h; contradiction
-        · intro h; cases h <;> contradiction
-        · intro h; cases h <;> contradiction
-      | disarmAndAbandonOnFailure =>
-        injection hstep with h; subst h
-        refine ⟨abandonIfClaimed_inv s.reg s.claimOwner hinv.regInv,
-          ?_, ?_, ?_, ?_, ?_, ?_⟩
-        · intro h; contradiction
-        · intro h; contradiction
-        · intro h; contradiction
-        · intro h; cases h <;> contradiction
-        · intro h; cases h <;> contradiction
-        · intro d hd
-          simp only [List.mem_map] at hd
-          obtain ⟨d0, _, rfl⟩ := hd
-          rfl
+    · injection hstep with h; subst h
+      refine ⟨abandonIfClaimed_inv s.reg s.claimOwner hinv.regInv,
+        ?_, ?_, ?_, ?_, ?_, hinv.leaseMatches⟩
+      · intro h; contradiction
+      · intro h; contradiction
+      · intro h; contradiction
+      · intro h; cases h <;> contradiction
+      · intro h; cases h <;> contradiction
 
   | sendSrcResult srcUnit ok =>
     dsimp only [CoordState.step] at hstep
@@ -296,35 +280,19 @@ theorem step_preserves_coordInv {policy : CleanupPolicy} {s s' : CoordState} {e 
       · intro h; contradiction
       · intro h; cases h <;> contradiction
       · intro _; exact hinv.allArmedDispatch (Or.inl hphase)
-    · cases policy with
-      | shipping =>
-        injection hstep with h; subst h
-        refine ⟨hinv.regInv, ?_, ?_, ?_, ?_, ?_, hinv.leaseMatches⟩
-        · intro h; contradiction
-        · intro h; contradiction
-        · intro h; contradiction
-        · intro h; cases h <;> contradiction
-        · intro h; cases h <;> contradiction
-      | disarmAndAbandonOnFailure =>
-        injection hstep with h; subst h
-        refine ⟨abandonIfClaimed_inv s.reg s.claimOwner hinv.regInv,
-          ?_, ?_, ?_, ?_, ?_, ?_⟩
-        · intro h; contradiction
-        · intro h; contradiction
-        · intro h; contradiction
-        · intro h; cases h <;> contradiction
-        · intro h; cases h <;> contradiction
-        · intro d hd
-          simp only [List.mem_map] at hd
-          obtain ⟨d0, _, rfl⟩ := hd
-          rfl
+    · injection hstep with h; subst h
+      refine ⟨hinv.regInv, ?_, ?_, ?_, ?_, ?_, hinv.leaseMatches⟩
+      · intro h; contradiction
+      · intro h; contradiction
+      · intro h; contradiction
+      · intro h; cases h <;> contradiction
+      · intro h; cases h <;> contradiction
 
 /-- **Main Universal Reachability Theorem (`reachable_coord_inv`)**:
-Every reachable state of `CoordState.sys` (under either `.shipping` or
-`.disarmAndAbandonOnFailure`) satisfies `CoordInv`. -/
-theorem reachable_coord_inv {policy : CleanupPolicy} {srcUnits dstUnits : List Nat}
+Every reachable state of `CoordState.sys` satisfies `CoordInv`. -/
+theorem reachable_coord_inv {srcUnits dstUnits : List Nat}
     {claimOwner : Nat} {s : CoordState}
-    (hr : (CoordState.sys policy srcUnits dstUnits claimOwner).Reachable s) :
+    (hr : (CoordState.sys srcUnits dstUnits claimOwner).Reachable s) :
     CoordInv s := by
   induction hr with
   | init => exact init_coordInv srcUnits dstUnits claimOwner
@@ -333,9 +301,9 @@ theorem reachable_coord_inv {policy : CleanupPolicy} {srcUnits dstUnits : List N
 /-- **Corollary (`no_push_before_all_armed`)**:
 In any reachable state, while the coordinator is in `.idle` or `.arming`, no
 sender has been dispatched and no destination unit has received any push. -/
-theorem no_push_before_all_armed {policy : CleanupPolicy} {srcUnits dstUnits : List Nat}
+theorem no_push_before_all_armed {srcUnits dstUnits : List Nat}
     {claimOwner : Nat} {s : CoordState}
-    (hr : (CoordState.sys policy srcUnits dstUnits claimOwner).Reachable s) :
+    (hr : (CoordState.sys srcUnits dstUnits claimOwner).Reachable s) :
     NoPushBeforeAllArmed s :=
   (reachable_coord_inv hr).noPushEarly
 
@@ -343,9 +311,9 @@ theorem no_push_before_all_armed {policy : CleanupPolicy} {srcUnits dstUnits : L
 In any reachable state, while the coordinator is in `.arming`, the source
 snapshot is claimed in `RequestBlockRegistry` (`s.reg.claimedUnits = some s.srcUnits`),
 and therefore `CancelIfUnclaimed` and late `Register` calls are blocked. -/
-theorem claimed_while_arming {policy : CleanupPolicy} {srcUnits dstUnits : List Nat}
+theorem claimed_while_arming {srcUnits dstUnits : List Nat}
     {claimOwner : Nat} {s : CoordState}
-    (hr : (CoordState.sys policy srcUnits dstUnits claimOwner).Reachable s)
+    (hr : (CoordState.sys srcUnits dstUnits claimOwner).Reachable s)
     (harm : s.phase = .arming) :
     s.reg.claimedUnits = some s.srcUnits ∧
     RegGen.step s.reg .cancelIfUnclaimed = some s.reg := by

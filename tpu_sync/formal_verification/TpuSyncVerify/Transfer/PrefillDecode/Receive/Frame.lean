@@ -99,6 +99,18 @@ theorem step_pullPending_of_ne_pullReply {s s' : Recv} {e : Ev} (hs : step s e =
     | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; rfl)
     | (cases hs <;> (repeat' split) <;> rfl)
 
+/-- Events outside `{pushBegin, pushEnd, h2dDone}` leave `pushes` and
+`retired` unchanged. -/
+theorem step_pushes_retired {s s' : Recv} {e : Ev} (hs : step s e = some s')
+    (hpb : e ≠ .pushBegin) (hpe : e ≠ .pushEnd) (hhd : ∀ ok, e ≠ .h2dDone ok) :
+    s'.pushes = s.pushes ∧ s'.retired = s.retired := by
+  cases e <;>
+    (try exact absurd rfl hpb) <;> (try exact absurd rfl hpe) <;>
+    (try exact absurd rfl (hhd _)) <;> recv_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩)
+    | (cases hs <;> (repeat' split) <;> exact ⟨rfl, rfl⟩)
+
 
 end Recv
 

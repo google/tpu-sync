@@ -1,7 +1,7 @@
 import TpuSyncVerify.Common.System
 import TpuSyncVerify.Transfer.Reshard.Registry
 
-/-! # `Coordinator`: coordinator, receiver-arming, and cleanup policy state machine
+/-! # `Coordinator`: coordinator and receiver-arming state machine
 
 Part of `TpuSyncVerify.Transfer.Reshard.Coordinator`; the module docstring and
 source map live in `Coordinator.lean`. -/
@@ -11,24 +11,7 @@ namespace TpuSyncVerify.Transfer.Reshard.Coordinator
 open TpuSyncVerify
 open TpuSyncVerify.Transfer.Reshard.Registry
 
-/-! ## Part I — Coordinator, Receiver-Arming, and Cleanup Policy State Machine -/
-
-/-- Coordinator failure cleanup policy comparing the shipping implementation
-(`ReshardCoordinator::RunSubPlan`'s `arm_status` and `sender_status` checks, sub-plan `index == 0`) against a hardened policy that
-disarms armed receivers and abandons the registry claim on any barrier failure. -/
-inductive CleanupPolicy where
-  /-- Shipping C++ behavior:
-      * Arm failure (`if (armed[i]) continue;` scan ending in `return arm_status[i];`): calls `AbandonClaim`
-        (`if (index == 0)`), does not disarm already-armed `dst_units`.
-      * Send failure (`for (const absl::Status& status : sender_status)`): neither disarms
-        `dst_units` nor calls `AbandonClaim`. -/
-  | shipping
-  /-- Hardened cleanup behavior: on either arm-barrier failure or send-barrier
-      failure, disarms all currently armed `dst_units` (releasing their
-      `ReshardReceiveSession` and `PoolStagingLease`) and calls `AbandonClaim`
-      on `RequestBlockRegistry`. -/
-  | disarmAndAbandonOnFailure
-  deriving DecidableEq, Repr
+/-! ## Part I — Coordinator and Receiver-Arming State Machine -/
 
 /-- Lifecycle phase of one `ReshardCoordinator::RunSubPlan` call. -/
 inductive CoordPhase where
@@ -47,7 +30,7 @@ inductive CoordPhase where
   /-- `RunSubPlan` returned a non-OK `absl::Status`
       (`if (!plan_or.ok())`, `return arm_status[i];`, or `for (const absl::Status& status : sender_status)`). -/
   | aborted
-  deriving DecidableEq, Repr
+  deriving DecidableEq, Repr, Hashable
 
 /-- Per-destination-unit receiver state (`KVCacheListener::HandleControlRequest`,
 `KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
@@ -67,7 +50,7 @@ structure DstUnitState where
   /-- True once all `src_units` have pushed and the session has settled and
       released its staging lease (`ReshardReceiveSession::ReleaseStagingLocked` / `ReshardReceiveSession::ReleaseStaging`). -/
   completed : Bool
-  deriving DecidableEq, Repr
+  deriving DecidableEq, Repr, Hashable
 
 namespace DstUnitState
 
@@ -86,13 +69,6 @@ def arm (d : DstUnitState) : DstUnitState :=
   { d with
     sessionArmed := true
     stagingLeaseHeld := true }
-
-/-- Explicitly disarm this destination unit on coordinator abort, releasing its
-active `ReshardReceiveSession` and `PoolStagingLease`. -/
-def disarm (d : DstUnitState) : DstUnitState :=
-  { d with
-    sessionArmed := false
-    stagingLeaseHeld := false }
 
 /-- Deliver a sender push from `srcUnit` to an armed destination unit; if all
 `srcUnits` have now contributed (`ReshardReceiveSession::RecordPoolH2dResultLocked` through `ReshardReceiveSession::FinishPoolH2d`), complete
@@ -140,7 +116,7 @@ structure CoordState where
   sendFailed : Bool
   /-- Underlying `RequestBlockRegistry` state for `(args.req_id, args.uuid)`. -/
   reg : RegGen
-  deriving DecidableEq, Repr
+  deriving DecidableEq, Repr, Hashable
 
 /-- Events of the two-stage coordinator + registry composition. -/
 inductive Ev where
@@ -199,8 +175,11 @@ def init (srcUnits dstUnits : List Nat) (claimOwner : Nat) : CoordState :=
     reg := RegGen.init }
 
 /-- Small-step transition relation of one `ReshardCoordinator::RunSubPlan` call
-(sub-plan `index == 0`) parameterized by `CleanupPolicy`. -/
-def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState :=
+(sub-plan `index == 0`). On an arm failure the shipping code calls `AbandonClaim`
+(`if (index == 0)`) and returns `arm_status[i]` without disarming the
+destinations that armed; on a sender failure it returns `sender_status` without
+disarming and without `AbandonClaim`. -/
+def step (s : CoordState) (e : Ev) : Option CoordState :=
   match e with
   | .registerProducer srcUnit =>
     if s.phase != .idle then
@@ -254,20 +233,12 @@ def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState 
       some { s with phase := .dispatching }
     else
       -- an unarmed destination (`if (armed[i]) continue;`) after the join:
-      match policy with
-      | .shipping =>
-        -- Shipping code calls `registry_->AbandonClaim(args.req_id, uuid, ctx->claim_owner)` (`if (index == 0)`)
-        -- and `return arm_status[i];` WITHOUT disarming `dst_units` that already armed!
-        some
-          { s with
-            phase := .aborted
-            reg := abandonIfClaimed s.reg s.claimOwner }
-      | .disarmAndAbandonOnFailure =>
-        some
-          { s with
-            phase := .aborted
-            dstStates := s.dstStates.map DstUnitState.disarm
-            reg := abandonIfClaimed s.reg s.claimOwner }
+      -- `registry_->AbandonClaim(args.req_id, uuid, ctx->claim_owner)` (`if (index == 0)`)
+      -- and `return arm_status[i];`, without disarming the `dst_units` that armed.
+      some
+        { s with
+          phase := .aborted
+          reg := abandonIfClaimed s.reg s.claimOwner }
 
   | .sendSrcResult srcUnit ok =>
     if s.phase != .dispatching then
@@ -305,23 +276,14 @@ def step (policy : CleanupPolicy) (s : CoordState) (e : Ev) : Option CoordState 
       some { s with phase := .succeeded }
     else
       -- `if (!status.ok()) return status;` in `for (const absl::Status& status : sender_status)`:
-      match policy with
-      | .shipping =>
-        -- Shipping code returns `sender_status` directly WITHOUT disarming
-        -- `dst_units` AND WITHOUT calling `registry_->AbandonClaim`!
-        some { s with phase := .aborted }
-      | .disarmAndAbandonOnFailure =>
-        some
-          { s with
-            phase := .aborted
-            dstStates := s.dstStates.map DstUnitState.disarm
-            reg := abandonIfClaimed s.reg s.claimOwner }
+      -- returns `sender_status` without disarming `dst_units` and without
+      -- `registry_->AbandonClaim`.
+      some { s with phase := .aborted }
 
-/-- System wrapper for a given `(policy, srcUnits, dstUnits, claimOwner)`. -/
-def sys (policy : CleanupPolicy) (srcUnits dstUnits : List Nat) (claimOwner : Nat) :
-    System CoordState Ev where
+/-- System wrapper for a given `(srcUnits, dstUnits, claimOwner)`. -/
+def sys (srcUnits dstUnits : List Nat) (claimOwner : Nat) : System CoordState Ev where
   init := init srcUnits dstUnits claimOwner
-  step := step policy
+  step := step
 
 end CoordState
 

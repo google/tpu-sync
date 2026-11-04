@@ -34,7 +34,8 @@ into `active_pool_reshard_sends_` (recording it in the request's `send_chains_`
 entry, `NoteSubPlanRegisteredLocked`, when the plan is a sub-plan of a chain).
 It then calls `ExecutePush(*this, src_block_ids)`. The model is one such
 session — one plan `uuid`, which for a windowed request is one sub-plan of
-its chain (`Pipeline.lean` §"Scope: one plan").
+its chain (`Pipeline.lean` §"Scope: one plan"; multi-window chaining and worker
+terminal folding are modelled in `Reshard/SubPlanChain.lean`).
 
 `ReshardSendSession::ExecutePush` takes its own caller op
 (`++in_flight_; manager_ = &manager;`) and iterates over
@@ -108,9 +109,8 @@ Session-level fields:
 ## Lock scopes
 
 Every mutable field of `ReshardSendSession` is `ABSL_GUARDED_BY(mu_)`;
-`base_`, `src_block_ids_`, `parallelism_`, `deadline_`, `dst_peers_`,
-`data_connection_reuse_`, and `transfer_plan_` (whose request supplies the
-uuid, req_id and plan) are `const`.
+`base_`, `staging_allocator_`, `req_id_`, `uuid_`, `parallelism_`, `deadline_`,
+`plan_`, `dst_peers_`, and `data_connection_reuse_` are `const`.
 `ReshardSendSession::EndOp` is always at least two `mu_` scopes: the
 fallback-unregistration check
 (`if (in_flight_ == 1 && finalizing_ && !done_ && !plan_unregistered_`), then
@@ -201,11 +201,13 @@ All proved on every reachable state (`reachable_safe`) for any valid schedule
   0 < inFlight`: the session never drops to `in_flight_ == 0` before
   `finalizing_` is set.
 * **Plan unregistration (`PlanIntegrity`).** `done → planUnregistered` and
-  `planUnregistered → draining` under both policies; under
-  `UnregisterPolicy.onSettle`, `planUnregistered = done` (`reachable_onSettle_plan_iff_done`),
-  so the active plan is never torn down while sibling pools or peer pushes are
-  still resolving chunks through `KVCacheManagerBase::GetBlockChunks`
-  (`if (schedule_it != schedules.end())`).
+  `planUnregistered → draining`. The converse does not hold:
+  `RecordPushCompletion` unregisters the plan as soon as `finalizing_` is
+  latched, while sibling pools or peer pushes may still resolve chunks through
+  `KVCacheManagerBase::GetBlockChunks` (`if (schedule_it != schedules.end())`)
+  (`trace_early_unregister_on_error`); `Traces.lean` §"The `EndOp`-only
+  unregistration alternative" shows the `step` change under which
+  `planUnregistered = done`.
 * **Slot accounting & publication (`Publication`).** `published = some true →
   remainingPushes = 0 ∧ allPushed pools = true`: `done_sending` is published
   only when `CountPoolReshardSendSlots` has counted down to `0` and every active

@@ -2,9 +2,10 @@ import TpuSyncVerify.Transfer.Caller.Model
 import TpuSyncVerify.Transfer.Caller.Invariant
 import TpuSyncVerify.Transfer.Caller.Traces
 import TpuSyncVerify.Transfer.Caller.MultiWorker
+import TpuSyncVerify.Transfer.Caller.NumaBarrier
 
 /-!
-# The engine above `poll_stats()`: connector and scheduler block lifecycle
+# The engine above `poll_stats()`: NUMA sub-managers, connector, aggregator, and scheduler
 
 Both transfer pipelines (`PrefillDecode/Pipeline.lean` and
 `Reshard/Pipeline.lean`, together with their `MultiRequest.lean` lifts) end at
@@ -15,11 +16,14 @@ once tpu-sync publishes a request's send or receive outcome (`send.published`,
 request's HBM any more (`PrefillHbmSafe` / `DecodeHbmSafe` and `SrcHbmSafe` /
 `DstHbmSafe`), and the pipeline models *assume* (**A4**) that the engine frees
 that HBM only after publication. This module models the other direction of the
-same contract — what the engine must do *with* a publication, both for a
-single worker (`Model.lean`, `Invariant.lean`, `Traces.lean`) and across
-multiple workers aggregated by `KVOutputAggregator` (`MultiWorker.lean`,
-covering both its eager block-level `invalid_block_ids` channel and its latched
-request-level `_failed_recving_pending` channel) — for the two production vLLM
+same contract — what the caller stack must do *with* a publication, across a
+single worker (`Model.lean`, `Invariant.lean`, `Traces.lean`), across multiple
+workers aggregated by `KVOutputAggregator` (`MultiWorker.lean`, covering both
+its eager block-level `invalid_block_ids` channel and its latched request-level
+`_failed_recving_pending` channel), and across intra-worker NUMA sub-managers
+inside `NumaAwareKVCacheManager::CompleteReadRaw` (`NumaBarrier.lean`, comparing
+the baseline `NumaPolicy.eagerFailSet` against the settled-count barrier
+`NumaPolicy.settledCounts` across `req_id` reuse) — for the two production vLLM
 connectors that drive `tpu-sync`:
 
 1. **Prefill-to-decode (`tpu-inference`):** vLLM's scheduler driving `tpu-sync`
@@ -71,14 +75,22 @@ Citations: `conn.py` = `tpu_inference/distributed/tpu_raiden_connector.py`;
 | `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_recvs_.begin();` .. `active_pool_reshard_recvs_.erase(it++);`) | `:1239-1263` |
 | `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked` | `:177-227` |
 | `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::SweepSubPlanChainsLocked` | `:229-288` |
+| `tpu_sync/frameworks/jax/kv_cache_manager.h` | `NumaAwareKVCacheManager` (`std::map<std::string, int> done_sending_counts_;` .. `std::set<std::string> failed_recving_set_;`) | `:287-290` |
+| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::NotifyForRead` | `:528-536` |
+| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::StartRead(remote_descriptors)` | `:574-618` |
+| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::StartRead(remote_endpoint)` | `:620-635` |
+| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::CompleteReadRaw` | `:638-678` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.VotingConsensusPromotesDoneRecvingOnlyWhenAllAgree` | `:169-196` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks` | `:198-225` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.VotingConsensusPromotesDoneSendingOnlyWhenAllAgree` | `:227-247` |
 <!-- source-map:end -->
 
 ## Lock scopes
 
 | Event | Scopes | Between them |
 |---|---|---|
-| `pOutcome ok`, `dOutcome ok`, `pWorker w ok`, `dWorker w ok` | 1 `KVCacheManagerWithTransfer::mu_` scope in `CompleteReadWithDetails` (`absl::MutexLock lock(mu_);`), followed on the single-threaded Python scheduler / model-runner loop by `get_transfer_results` (or `get_finished` + `get_block_ids_with_load_errors`), `KVOutputAggregator.aggregate`, and `update_from_output` | nothing engine-visible happens between `CompleteReadWithDetails` draining `done_sending_`, `done_recving_`, and `failed_recving_` and the scheduler step that consumes them; by `applySend_staggered_eq_batch`, `applyRecv_staggered_eq_batch`, and `applyRecv_eager_eq_latched`, two workers reporting in one `KVOutputAggregator.aggregate` pass produce the same state as two back-to-back `pWorker` / `dWorker` steps on either `AggChannel` |
-| `promote`, `finish` | 0 (single-threaded Python scheduler `schedule()` and `finish_requests()`) | serialized on the Python scheduler loop |
+| `pOutcome ok`, `dOutcome ok`, `pWorker w ok`, `dWorker w ok`, `pSub sub ok`, `dSub sub ok` | 1 `KVCacheManagerWithTransfer::mu_` scope per polled sub-manager in `CompleteReadWithDetails` (`absl::MutexLock lock(mu_);`); `NumaAwareKVCacheManager::CompleteReadRaw` aggregates the sub-managers' lists with no lock of its own, serialized with `StartRead` and `NotifyForRead` by the GIL (the `complete_read`, `start_read`, and `notify_for_read` bindings do not release it); then, on the single-threaded Python scheduler / model-runner loop, `get_transfer_results` (or `get_finished` + `get_block_ids_with_load_errors`), `KVOutputAggregator.aggregate`, and `update_from_output` | nothing engine-visible happens between `CompleteReadWithDetails` draining `done_sending_`, `done_recving_`, and `failed_recving_` and the scheduler step that consumes them; by `applySend_staggered_eq_batch`, `applyRecv_staggered_eq_batch`, and `applyRecv_eager_eq_latched`, two workers reporting in one `KVOutputAggregator.aggregate` pass produce the same state as two back-to-back `pWorker` / `dWorker` steps on either `AggChannel`; one `CompleteReadRaw` batch is split into back-to-back `pSub` / `dSub` steps (`NumaBarrier.lean` **N4**) |
+| `promote`, `finish`, `recycle` | 0 (single-threaded Python scheduler `schedule()` and `finish_requests()`) | serialized on the Python scheduler loop |
 
 ## What is modelled
 
@@ -198,24 +210,48 @@ withholds completion until all workers have reported (`pSentCount = expectedP`,
   _failed_recving_pending & finished_recving` (clearing `_failed_recving_pending`)
   on the completing step (`dRecvCount = expectedD`).
 
+Inside a single JAX worker, `NumaAwareKVCacheManager::CompleteReadRaw`
+(`tpu_sync/frameworks/jax/kv_cache_manager.cc`) sits between the per-NUMA
+`KVCacheManagerWithTransfer` sub-managers (`num_subs = 1` under
+`ENABLE_MULTI_NUMA=0`, `num_subs = 2` under `ENABLE_MULTI_NUMA=1`) and
+`TPUConnectorWorker.get_transfer_results` (`NumaBarrier.lean`). Two sub-manager
+barrier policies are compared across sequential transfers that reuse the same
+`req_id` (`recycle`):
+* `NumaPolicy.eagerFailSet` (shipping `kv_cache_manager.cc`): emits
+  `done_sending` at `done_sending_counts_[req] == num_subs`, emits `done_recving`
+  (unless suppressed by `failed_recving_set_`) and erases
+  `done_recving_counts_[req]`, `req_expected_counts_[req]`, and
+  `failed_recving_set_[req]` at `done_recving_counts_[req] >= expected`, and
+  emits `failed_recving` immediately on `failed_recving_set_.insert(req).second`
+  without waiting for sibling sub-managers or erasing any map entry
+  (`KVCacheManagerWrapperTest.AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks`).
+* `NumaPolicy.settledCounts` (settled-count barrier, not in C++ at the baseline
+  commit): counts `done_sending_counts_`, `done_recving_counts_`, and
+  `failed_recving_counts_`, withholds emission until
+  `done_sending_counts_ + done_recving_counts_ + failed_recving_counts_ >= expected`,
+  emits `failed_recving` if `failed_recving_counts_ > 0` (else `done_recving` or
+  `done_sending`), and erases all four per-request map entries.
+
 ## Properties
 
-* `leakP` (`mwLeakP`): the send is published (on all workers) and P still
-  holds the blocks.
-* `leakD` (`mwLeakD`): the receive is published (on all workers) and D
-  either keeps the request parked with its blocks and nothing to promote it, or
-  has finished it with the free deferred. Both are *absorbing* for every
-  connector, aggregator channel, and policy (`leakP_absorbing`,
+* `leakP` (`mwLeakP`, `numaLeakP`): the send is published (on all workers /
+  sub-managers) and P still holds the blocks.
+* `leakD` (`mwLeakD`, `numaLeakD`): the receive is published (on all workers /
+  sub-managers) and D either keeps the request parked with its blocks and
+  nothing to promote it, or has finished it with the free deferred. Both are
+  *absorbing* for every connector, aggregator channel, and policy (`leakP_absorbing`,
   `leakD_absorbing`, `mwLeakP_absorbing`, `mwLeakD_absorbing`): nothing in the
   engine can free them afterwards, because the only events that could are the
   publications, and each happens once.
-* `decodesUnwritten` (`mwDecodesUnwritten`): D's request proceeds to decode
-  while the receive is not published as done (on every worker).
-* `mwEarlyFree`: on a multi-worker node, P frees its HBM (`pHeld = false`)
-  while a P worker is still unpublished, or D frees its HBM (`dHeld = false`)
-  while a D worker is still unpublished — discharging the pipeline models' **A4**
-  assumption across workers when one worker fails early while another worker's
-  transfer is still in flight.
+* `decodesUnwritten` (`mwDecodesUnwritten`, `numaDecodesUnwritten`): D's request
+  proceeds to decode while the receive is not published as done (on every worker
+  and sub-manager).
+* `mwEarlyFree` (`numaEarlyFree`): P frees its HBM (`pHeld = false`) while a P
+  worker or sub-manager is still unpublished, or D frees its HBM
+  (`dHeld = false`) while a D worker or sub-manager is still unpublished —
+  discharging the pipeline models' **A4** assumption across workers and NUMA
+  sub-managers when one shard fails early while another shard's DMA is still in
+  flight.
 
 `Contract conn` is the obligation on a connector that the theorems need:
 every P outcome yields `finishedSending`, every D outcome yields
@@ -254,6 +290,23 @@ destination HBM is not freed while any receiver rank is still armed), and the
 subsequent terminal `dOutcome false` / `dWorker` publications on
 `connectorTwoChannel` free `dHeld = false`.
 
+On the intra-worker JAX wrapper (`NumaBarrier.lean`), `NumaPolicy.eagerFailSet`
+frees consumer or producer HBM while a sibling sub-manager's DMA is still in
+flight at `num_subs = 2` (`trace_eagerFailSet_recv_early_free`,
+`trace_eagerFailSet_send_early_free`) and, across `recycle` (`req_id` reuse),
+leaks blocks at `num_subs = 1` (`trace_eagerFailSet_single_sub_reuse_leaks`) and
+desynchronizes `done_recving_counts_` at `num_subs = 2` into premature
+`done_recving` on a later transfer
+(`trace_eagerFailSet_partial_fail_desync_premature_doneRecving`). Under
+`NumaPolicy.settledCounts`, `numa_settledCounts_safe` and
+`numa_settledCounts_maps_clean` prove safety (`NumaSafe`) and full map cleanup
+across unbounded `recycle` rounds for both `num_subs = 1` and `num_subs = 2`,
+both failure policies, and both `StartRead` overloads (`numaSearch` exhausts the
+cyclic multi-round state space), while
+`numaProcessSettled_expected_numSubs_eq_none` shows that pre-setting
+`req_expected_counts_[req] = num_subs` in `StartRead(remote_descriptors)` is
+observationally redundant.
+
 ## Assumptions
 
 * **B1 (every participating worker sub-manager eventually publishes once).**
@@ -261,15 +314,21 @@ subsequent terminal `dOutcome false` / `dWorker` publications on
   terminal publication (`some true` or `some false`) after its local DMAs have
   drained, and `get_finished_count()` equals the number of participating workers
   (`expectedP = 2`, `expectedD = 2`). On both paths this is enforced for
-  single-plan transfers (`sub_plan_count <= 1`) on single-sub-manager workers
-  (`ENABLE_MULTI_NUMA=0`) by the 180 s native session
+  single-round, single-plan transfers (`sub_plan_count <= 1`) on
+  single-sub-manager workers (`ENABLE_MULTI_NUMA=0`) by the 180 s native session
   deadline (`TPU_P2P_WAIT_PULL_TIMEOUT` in
   `TPUConnectorWorker.register_kv_caches` and `tpu_connector.py`
   `get_p2p_wait_pull_timeout()`) together with `_sync_stage3_tp_submit_states`
   in `tpu_connector.py` (which broadcasts `"failed"`, `"uncertain"`, or
   `"accepted"` across TP ranks so no rank is left unarmed while another waits).
   `MultiWorker.lean` models the 2-worker `KVOutputAggregator` combining step
-  directly on both `AggChannel.eagerBlock` and `AggChannel.latchedReq`.
+  directly on both `AggChannel.eagerBlock` and `AggChannel.latchedReq`;
+  `NumaBarrier.lean` models the intra-worker `NumaAwareKVCacheManager` barrier
+  below it, assuming one report per NUMA sub-manager per transfer (its **N1**,
+  this assumption applied per sub-manager) and proving that
+  `NumaPolicy.settledCounts` turns those reports into exactly one worker-level
+  publication, after every sub-manager has settled, also under
+  `ENABLE_MULTI_NUMA=1` and `req_id` reuse.
 * **B2 (whole-transfer failure).** A failed pull invalidates every local
   block of the request, so recomputation starts from token 0 and the
   `num_computed_tokens ≠ 0` branch of `Scheduler._update_waiting_for_remote_kv`

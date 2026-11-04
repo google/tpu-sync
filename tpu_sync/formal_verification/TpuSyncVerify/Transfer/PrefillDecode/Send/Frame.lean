@@ -145,6 +145,33 @@ theorem h2hDone_h2hRetired {s s' : Send} {ok : Bool} (hs : step s (.h2hDone ok) 
       simp only [endOp, finish, Lifecycle.finishOnceLocked_inFlight] <;> (repeat' split) <;> rfl
   · cases hs
 
+theorem step_h2hIssued_le {s s' : Send} {e : Ev} (hs : step s e = some s') :
+    s.h2hIssued ≤ s'.h2hIssued := by
+  cases e <;> send_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs; simp)
+    | (cases hs <;> simp only [endOp, finish, trySendNext, Lifecycle.finishOnceLocked_inFlight] <;>
+        (repeat' split) <;> simp)
+
+/-- Events outside `{start, d2hBegin, d2hIssue, wake, h2hIssue}` leave all
+loop/lease-ownership counters (`started`, `d2hPending`, `d2hIssued`,
+`h2hIssued`, `pooled`, `woken`) unchanged. -/
+theorem step_lease_counters {s s' : Send} {e : Ev} (hs : step s e = some s')
+    (hst : e ≠ .start) (hdb : e ≠ .d2hBegin) (hdi : ∀ ok, e ≠ .d2hIssue ok)
+    (hwk : ∀ ok, e ≠ .wake ok) (hhi : e ≠ .h2hIssue) :
+    s'.started = s.started ∧ s'.d2hPending = s.d2hPending ∧
+    s'.d2hIssued = s.d2hIssued ∧ s'.h2hIssued = s.h2hIssued ∧
+    s'.pooled = s.pooled ∧ s'.woken = s.woken := by
+  cases e <;>
+    (try exact absurd rfl hst) <;> (try exact absurd rfl hdb) <;>
+    (try exact absurd rfl (hdi _)) <;> (try exact absurd rfl (hwk _)) <;>
+    (try exact absurd rfl hhi) <;> send_cases hs <;>
+  first
+    | (simp only [Option.map_eq_some_iff] at hs; obtain ⟨l, _, rfl⟩ := hs;
+       exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩)
+    | (cases hs <;> simp only [endOp, finish, trySendNext, Lifecycle.finishOnceLocked_inFlight] <;>
+        (repeat' split) <;> simp)
+
 
 end Send
 

@@ -25,10 +25,10 @@ started by its own `ReshardCoordinator::RunSubPlan` call and recycled through
 `.recycleSrc` / `.nextRequest` like any other transfer: the chain runs them one
 after another over the same destination window, and the destination's bounded
 staging arena is what makes a later sub-plan wait for the earlier one's leases
-(`ArmRefusedForBusyStaging`, re-armed by `RunSubPlan`). The request-level
-terminal the worker reports for the whole chain
-(`KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked`) is outside the
-model.
+(`ArmRefusedForBusyStaging`, re-armed by `RunSubPlan`). Multi-window chain
+coordination and the request-level terminal the worker reports for the whole
+chain (`KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked`,
+`SweepSubPlanChainsLocked`) are modelled in `Reshard/SubPlanChain.lean`.
 
 The multi-request transition systems `multiSys` (post-Phase-1 armed transfers)
 and `multiSysUnarmed` (pre-Phase-1 unarmed transfers requiring

@@ -16,6 +16,10 @@ theorem lt_length_of_getElem?_eq {α : Type} {l : List α} {i : Nat} {a : α}
     (h : l[i]? = some a) : i < l.length :=
   (List.getElem?_eq_some_iff.mp h).1
 
+theorem getD_of_getElem?_eq_some {α : Type} {xs : List α} {i : Nat} {v d : α}
+    (h : xs[i]? = some v) : xs.getD i d = v := by
+  simp [List.getD, h]
+
 theorem mem_set_cases {α : Type} {l : List α} {i : Nat} {x y : α}
     (h : y ∈ l.set i x) : y = x ∨ y ∈ l := by
   induction l generalizing i with
@@ -207,5 +211,138 @@ theorem all_true_lt_of_countTrue : ∀ {l : List Bool} {k : Nat},
       Nat.lt_of_succ_lt_succ (hb (j + 1) hj)
     simp [countTrue] at hcnt
     exact all_true_lt_of_countTrue hb' (by omega) i (by omega)
+
+theorem countTrue_le_of_imp : ∀ {a b : List Bool},
+    a.length = b.length →
+    (∀ i : Nat, a[i]? = some true → b[i]? = some true) →
+    countTrue a ≤ countTrue b
+  | [], [], _, _ => Nat.le_refl 0
+  | _ :: _, [], hlen, _ => by simp at hlen
+  | [], _ :: _, hlen, _ => by simp at hlen
+  | x :: xs, y :: ys, hlen, himp => by
+    have ih := countTrue_le_of_imp (by simpa using hlen)
+      (fun i hi => himp (i + 1) (by simpa using hi))
+    cases x with
+    | false => cases y <;> simp [countTrue] <;> omega
+    | true =>
+      have hy : y = true := by simpa using himp 0 rfl
+      subst hy; simp [countTrue, ih]
+
+theorem countTrue_lt_of_imp : ∀ {a b : List Bool},
+    a.length = b.length →
+    (∀ i : Nat, a[i]? = some true → b[i]? = some true) →
+    ∀ {k : Nat}, a[k]? = some false → b[k]? = some true →
+    countTrue a < countTrue b
+  | [], _, _, _, _, ha, _ => by simp at ha
+  | _ :: _, [], hlen, _, _, _, _ => by simp at hlen
+  | _ :: xs, _ :: ys, hlen, himp, 0, ha, hb => by
+    simp only [List.getElem?_cons_zero, Option.some.injEq] at ha hb; subst ha hb
+    have := countTrue_le_of_imp (by simpa using hlen)
+      (fun i hi => himp (i + 1) (by simpa using hi))
+    simp [countTrue]; omega
+  | x :: xs, y :: ys, hlen, himp, k + 1, ha, hb => by
+    have ih := countTrue_lt_of_imp (by simpa using hlen)
+      (fun i hi => himp (i + 1) (by simpa using hi)) (by simpa using ha) (by simpa using hb)
+    cases x with
+    | false => cases y <;> simp [countTrue] <;> omega
+    | true =>
+      have hy : y = true := by simpa using himp 0 rfl
+      subst hy; simp [countTrue, ih]
+
+/-- Number of elements satisfying `p` in `xs`. -/
+def countPred {α : Type} (p : α → Bool) (xs : List α) : Nat :=
+  countTrue (xs.map p)
+
+private theorem map_set_eq {α β : Type} (f : α → β) :
+    ∀ (xs : List α) (i : Nat) (v : α), (xs.set i v).map f = (xs.map f).set i (f v)
+  | [], _, _ => rfl
+  | _ :: _, 0, _ => rfl
+  | _ :: xs, i + 1, v => by simp [List.set_cons_succ, map_set_eq f xs i v]
+
+theorem countPred_replicate_false {α : Type} {p : α → Bool} {v : α}
+    (hp : p v = false) (n : Nat) : countPred p (List.replicate n v) = 0 := by
+  simp [countPred, hp, countTrue_replicate_false]
+
+theorem countPred_set_true {α : Type} {p : α → Bool} {xs : List α} {l : Nat}
+    {oldV newV : α} (hl : xs[l]? = some oldV)
+    (hold : p oldV = false) (hnew : p newV = true) :
+    countPred p (xs.set l newV) = countPred p xs + 1 := by
+  unfold countPred; rw [map_set_eq, hnew]
+  exact countTrue_set_true (by simp [hl, hold])
+
+theorem countPred_set_false {α : Type} {p : α → Bool} {xs : List α} {l : Nat}
+    {oldV newV : α} (hl : xs[l]? = some oldV)
+    (hold : p oldV = true) (hnew : p newV = false) :
+    countPred p (xs.set l newV) + 1 = countPred p xs := by
+  unfold countPred; rw [map_set_eq, hnew]
+  exact countTrue_set_false (by simp [hl, hold])
+
+theorem countPred_set_same {α : Type} {p : α → Bool} {xs : List α} {l : Nat}
+    {oldV newV : α} (hl : xs[l]? = some oldV) (heq : p newV = p oldV) :
+    countPred p (xs.set l newV) = countPred p xs := by
+  have hlt : l < (xs.map p).length := by simp [lt_length_of_getElem?_eq hl]
+  unfold countPred; rw [map_set_eq, heq]
+  congr 1; apply List.ext_getElem?; intro i
+  by_cases hi : i = l
+  · subst hi; rw [List.getElem?_set_self hlt]; simp [hl]
+  · exact List.getElem?_set_ne (Ne.symm hi)
+
+theorem exists_of_countPred_pos : ∀ {α : Type} {p : α → Bool} {xs : List α},
+    0 < countPred p xs → ∃ (l : Nat) (v : α), xs[l]? = some v ∧ p v = true
+  | _, _, [], h => by simp [countPred, countTrue] at h
+  | _, p, v :: rest, h => by
+    cases hp : p v
+    · obtain ⟨l, w, hl, hw⟩ :=
+        exists_of_countPred_pos (by simpa [countPred, countTrue, hp] using h)
+      exact ⟨l + 1, w, hl, hw⟩
+    · exact ⟨0, v, rfl, hp⟩
+
+/-- A boolean checklist `xs` of length `n` with `cnt` marked entries (`countTrue xs = cnt`). -/
+structure Checklist (xs : List Bool) (n cnt : Nat) : Prop where
+  len : xs.length = n
+  cnt_eq : countTrue xs = cnt
+
+namespace Checklist
+
+theorem init (n : Nat) : Checklist (List.replicate n false) n 0 :=
+  ⟨List.length_replicate, countTrue_replicate_false n⟩
+
+theorem set_true {xs : List Bool} {n cnt l : Nat}
+    (h : Checklist xs n cnt) (hf : xs[l]? = some false) :
+    Checklist (xs.set l true) n (cnt + 1) :=
+  ⟨(List.length_set ..).trans h.len, (countTrue_set_true hf).trans (by rw [h.cnt_eq])⟩
+
+theorem set_false {xs : List Bool} {n cnt l : Nat}
+    (h : Checklist xs n cnt) (ht : xs[l]? = some true) :
+    Checklist (xs.set l false) n (cnt - 1) :=
+  ⟨(List.length_set ..).trans h.len, by have := countTrue_set_false ht; rw [h.cnt_eq] at this; omega⟩
+
+theorem cast_cnt {xs : List Bool} {n c₁ c₂ : Nat}
+    (h : Checklist xs n c₁) (hc : c₁ = c₂) : Checklist xs n c₂ :=
+  hc ▸ h
+
+theorem all_true {xs : List Bool} {n : Nat}
+    (h : Checklist xs n n) {k : Nat} (hk : k < n) : xs[k]? = some true :=
+  all_true_of_countTrue_eq_length (h.cnt_eq.trans h.len.symm) k (h.len ▸ hk)
+
+theorem exists_false {xs : List Bool} {n cnt k : Nat}
+    (h : Checklist xs n cnt) (hk : k ≤ n) (hlt : cnt < k) :
+    ∃ l < k, xs[l]? = some false :=
+  exists_false_lt (h.len ▸ hk) (h.cnt_eq ▸ hlt)
+
+theorem exists_true {xs : List Bool} {n cnt : Nat}
+    (h : Checklist xs n cnt) (hpos : 0 < cnt) :
+    ∃ l < n, xs[l]? = some true := by
+  obtain ⟨l, hl, ht⟩ := exists_true_of_countTrue_pos (h.cnt_eq ▸ hpos)
+  exact ⟨l, h.len ▸ hl, ht⟩
+
+theorem exists_diff {xs₁ xs₂ : List Bool} {n c₁ c₂ : Nat}
+    (h₁ : Checklist xs₁ n c₁) (h₂ : Checklist xs₂ n c₂) (hlt : c₁ < c₂) :
+    ∃ l < n, xs₁[l]? = some false ∧ xs₂[l]? = some true := by
+  obtain ⟨l, hl, hf, ht⟩ := exists_diff_of_countTrue_lt (h₁.len.trans h₂.len.symm)
+    (by rw [h₁.cnt_eq, h₂.cnt_eq]; exact hlt)
+  exact ⟨l, h₁.len ▸ hl, hf, ht⟩
+
+end Checklist
 
 end TpuSyncVerify

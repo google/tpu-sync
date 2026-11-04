@@ -38,16 +38,17 @@ or `.blank` (never written). Layer `l` of a memory is correct iff it is
 | `decodeStaging`  | the receive's host staging | `land l` (transport, `ForEachPayload` in `BlockTransportServerPushSession::StartStream`), `reseatDecodeStaging` |
 | `decodeHbm`      | the decode request's KV cache in decode HBM | `h2dReady l` (H2D copy, `TransferReceiveSession::ExecuteLayerH2d`) |
 
-Both host stagings are one cell per layer: the full host mirror
+Both host stagings here are one cell per layer: the full host mirror
 (`KVCacheManagerBase::num_host_layers() == num_layers()`, the default). With
-fewer host layer buffers than layers (`TPU_RAIDEN_NUM_STAGING_LAYERS`) each
+fewer host layer buffers than layers (`TPU_RAIDEN_NUM_STAGING_LAYERS`), each
 session leases a buffer per layer from its `StagingLayerManager`
 (`TransferSendSession::AcquireStagingSlot` before the layer's D2H,
 `TransferReceiveSession::AcquireStagingSlot` from `GetBlockChunks` inside the
 push lease) and returns it once the layer has left the buffer (the push
-callback on the send side, the H2D callback on the receive side); that reuse
-of one buffer by successive layers is outside this model, see `Receive.lean`
-§"Bounded host layer staging".
+callback on the send side, the H2D callback on the receive side);
+`PrefillDecode/LayerStaging.lean` refines `Pipeline` with bounded `prefillSlots`
+and `decodeSlots` and proves publication correctness, slot conservation,
+settlement, and `1`-slot sufficiency over this `Pipeline.step`.
 
 ## Layers complete in any order
 

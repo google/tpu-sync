@@ -2,11 +2,13 @@ import TpuSyncVerify.Common.System
 import TpuSyncVerify.Common.ModelCheck
 import TpuSyncVerify.Common.ListAux
 import TpuSyncVerify.Transfer.Session
+import TpuSyncVerify.Transfer.LayerStaging
 import TpuSyncVerify.Transfer.Caller
 import TpuSyncVerify.Transfer.PrefillDecode.Receive
 import TpuSyncVerify.Transfer.PrefillDecode.ReceivePoll
 import TpuSyncVerify.Transfer.PrefillDecode.Send
 import TpuSyncVerify.Transfer.PrefillDecode.Pipeline
+import TpuSyncVerify.Transfer.PrefillDecode.LayerStaging
 import TpuSyncVerify.Transfer.PrefillDecode.MultiRequest
 import TpuSyncVerify.Transfer.PrefillDecode.PeerIsolation
 import TpuSyncVerify.Transfer.PrefillDecode.UuidTable
@@ -31,6 +33,7 @@ modelled, the directory layout, and how the C++ is cited.
 
 * `Common` — transition-system core, list lemmas, bounded model checker.
 * `Transfer` — `Session` (settle protocol shared by every transfer session),
+  `LayerStaging` (`StagingLayerManager` bounded host-layer buffer pool),
   `Caller` (serving engine above `poll_stats()` shared by both transfer paths),
   `PrefillDecode/`, `Reshard/`.
 -/

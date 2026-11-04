@@ -954,18 +954,39 @@ def checkEvents : List Ev :=
   , .complete 0, .complete 1
   , .cancelIfUnclaimed, .release ]
 
+private theorem forall_some_iff_all {α : Type} (o : Option α) (P : α → Prop) [DecidablePred P] :
+    (∀ x, o = some x → P x) ↔ o.all (fun x => decide (P x)) = true := by
+  cases o <;> simp
+
+instance (s : RegGen) : Decidable (ClaimOwnersConsistent s) :=
+  decidable_of_iff
+    ((s.claimedUnits.isSome = !s.claimOwners.isEmpty) ∧
+      s.claimedUnits.all (fun units =>
+        decide (units ≠ [] ∧ ∀ u ∈ units, (s.lookupUnit u).isSome = true)) = true)
+    (by unfold ClaimOwnersConsistent; rw [forall_some_iff_all])
+
+instance (s : RegGen) : Decidable (TombstoneClean s) := by
+  unfold TombstoneClean; infer_instance
+
+instance (s : RegGen) : Decidable (RetiredClean s) := by
+  unfold RetiredClean; infer_instance
+
+instance (s : RegGen) : Decidable (PartialVotesNotAllVoted s) :=
+  decidable_of_iff
+    (s.claimedUnits.all (fun expected =>
+      decide (allVoted expected s.completedUnits = false)) = true)
+    (by unfold PartialVotesNotAllVoted; rw [forall_some_iff_all])
+
+instance (s : RegGen) : Decidable (Inv s) :=
+  decidable_of_iff
+    (ClaimOwnersConsistent s ∧ TombstoneClean s ∧ RetiredClean s ∧ PartialVotesNotAllVoted s)
+    ⟨fun ⟨a, b, c, d⟩ => ⟨a, b, c, d⟩, fun h => ⟨h.1, h.2, h.3, h.4⟩⟩
+
 /-- Executable negation of `Inv`. -/
-def violates (s : RegGen) : Bool :=
-  (s.claimedUnits.isSome != !s.claimOwners.isEmpty) ||
-  (match s.claimedUnits with
-   | none => false
-   | some units =>
-     units.isEmpty ||
-     units.any (fun u => !(s.lookupUnit u).isSome) ||
-     allVoted units s.completedUnits) ||
-  (s.cancelled && (!s.registeredUnits.isEmpty || s.claimedUnits.isSome ||
-                   !s.claimOwners.isEmpty || !s.completedUnits.isEmpty)) ||
-  (s.retired && (!s.registeredUnits.isEmpty || s.claimedUnits.isSome || !s.claimOwners.isEmpty))
+def violates (s : RegGen) : Bool := !decide (Inv s)
+
+theorem violates_iff (s : RegGen) : violates s = false ↔ Inv s := by
+  simp [violates]
 
 #guard ModelCheck.check RegGen.sys checkEvents violates 12 = .safe
 

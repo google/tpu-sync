@@ -50,8 +50,8 @@ ranges for every symbol, sub-block, and test are in the generated
 
 ## What this module proves
 
-1. **Resource conservation (`reachable_inv`):**
-   Across all reachable states for any backend and slot policy:
+1. **Resource conservation (`reachable_inv`, `reachable_safe`):**
+   Across all reachable states for either control-plane backend:
    - `s.freeSlots + activeStaging s.sessions = s.cfg.numSlots` (no staging slot
      is ever leaked or double-freed);
    - `s.freeWorkers + activeWorkers s.cfg.backend s.sessions = s.cfg.poolSize`
@@ -71,23 +71,21 @@ ranges for every symbol, sub-block, and test are in the generated
      `trace_grpc_sick_peer_does_not_delay_healthy`,
      `trace_grpc_healthy_progresses_under_backlog`).
 
-3. **Staging-slot starvation counterexample & per-peer quota fix
+3. **Staging-slot starvation
    (`ControlHandshakeTest.DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`):**
-   - Under the shipping `SlotPolicy.unboundedPerPeer`, `numSlots` wedged reads
-     to `Peer.sick` exhaust `freeSlots = 0` (even if their session deadlines
-     expire via `.cancel`, since `inFlight = 1` keeps their staging pinned until
+   - `StartRead` acquires staging slots from `StagingBlockAllocator` with no
+     per-peer cap (`canAdmit`), so `numSlots` wedged reads to `Peer.sick`
+     exhaust `freeSlots = 0` (even if their session deadlines expire via
+     `.cancel`, since `inFlight = 1` keeps their staging pinned until
      `pullReply false`). A subsequent `StartRead` to `Peer.healthy` fails slot
      allocation immediately (`trace_sick_peer_starves_staging_slots`, plus the
-     bounded model check counterexample).
-   - Under `SlotPolicy.perPeerQuota maxPerPeer` (the per-peer admission the
-     comment above `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer` calls
-     for; no such policy exists in C++ at the baseline commit), `Peer.sick` can
-     hold at most `maxPerPeer` slots (`reachable_sick_staging_le_quota`). Thus
-     whenever `maxPerPeer < numSlots` and `Peer.healthy` has fewer than
-     `min maxPerPeer (numSlots - maxPerPeer)` sessions holding staging (in particular,
-     when the first healthy read arrives), `canAdmit s .healthy = true` holds on
-     **every** reachable state (`reachable_quota_admits_healthy`,
-     `trace_per_peer_quota_admits_healthy`).
+     `#guard` counterexample search).
+   - At the bottom of the file, `stepPerPeerQuota` models the per-peer cap
+     sketched in the comment above
+     `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer` (not in shipping C++):
+     capping each peer at `maxPerPeer = 1 < numSlots = 2` refuses the second
+     `Peer.sick` read and admits `Peer.healthy`
+     (`trace_per_peer_quota_admits_healthy` and `#guard` search).
 
 ## Source map
 
@@ -143,13 +141,6 @@ inductive Backend where
   | grpcAsync
   deriving Repr, DecidableEq
 
-/-- Host staging slot admission policy at `KVCacheManagerWithTransfer::StartRead`
-(`TransferReceiveSession::AllocateStagingForLoad`). -/
-inductive SlotPolicy where
-  | unboundedPerPeer
-  | perPeerQuota (maxPerPeer : Nat)
-  deriving Repr, DecidableEq
-
 /-- One receive session in `active_recv_sessions_` together with its target
 prefill `peer` and whether `ExecutePullRequest` has dispatched `SendPullRequest`
 via `push_pool_` (`pullDispatched`). -/
@@ -187,7 +178,6 @@ structure Config where
   numSlots : Nat := 8
   poolSize : Nat := 4
   backend : Backend := .grpcAsync
-  policy : SlotPolicy := .unboundedPerPeer
   deriving Repr, DecidableEq
 
 structure State where
@@ -205,12 +195,10 @@ structure State where
 def init (cfg : Config) : State :=
   { cfg, freeSlots := cfg.numSlots, freeWorkers := cfg.poolSize }
 
-/-- Whether `StartRead` for `peer` can acquire a host staging slot. -/
-def canAdmit (s : State) (p : Peer) : Bool :=
-  0 < s.freeSlots &&
-  match s.cfg.policy with
-  | .unboundedPerPeer => true
-  | .perPeerQuota maxPerPeer => peerStaging p s.sessions < maxPerPeer
+/-- Whether `StartRead` can acquire a host staging slot (`0 < freeSlots` in
+`StagingBlockAllocator::Acquire`; shipping C++ applies no per-peer cap). -/
+def canAdmit (s : State) : Bool :=
+  decide (0 < s.freeSlots)
 
 /-- Events that require `SendPullRequest` to have been dispatched (`pullDispatched`)
 before the producer can reply or push data. -/
@@ -240,7 +228,7 @@ inductive Ev where
 
 def step (s : State) : Ev → Option State
   | .startRead peer =>
-    if canAdmit s peer then
+    if canAdmit s then
       some { s with
         freeSlots := s.freeSlots - 1,
         sessions := s.sessions ++
@@ -290,6 +278,13 @@ def step (s : State) : Ev → Option State
 def sys (cfg : Config) : System State Ev where
   init := init cfg
   step := step
+
+/-- Observable resource conservation and per-session safety across all active
+receive sessions. -/
+def Safe (s : State) : Prop :=
+  s.freeSlots + activeStaging s.sessions = s.cfg.numSlots ∧
+  s.freeWorkers + activeWorkers s.cfg.backend s.sessions = s.cfg.poolSize ∧
+  ∀ e ∈ s.sessions, Recv.Safe e.recv
 
 /-! ## Monotonicity of `hasStaging` and `pullPending` across `Recv.step` -/
 
@@ -372,21 +367,6 @@ theorem entry_holdsWorker_mono {b : Backend} {e : Entry} {r' : Recv} {ev : Recv.
   | nil => cases b <;> rfl
   | cons e es ih => simp [activeWorkers, ih]
 
-@[simp] theorem peerStaging_append_initLoad (p q : Peer) (es : List Entry) (n : Nat) :
-    peerStaging p (es ++ [{ peer := q, pullDispatched := false, recv := Recv.initLoad n }]) =
-      peerStaging p es + (if q == p then 1 else 0) := by
-  induction es with
-  | nil => simp [peerStaging, Recv.initLoad]
-  | cons e es ih => simp [peerStaging, ih]; omega
-
-theorem peerStaging_sum (es : List Entry) :
-    peerStaging .sick es + peerStaging .healthy es = activeStaging es := by
-  induction es with
-  | nil => rfl
-  | cons e es ih =>
-    cases hp : e.peer <;> cases hs : e.recv.life.hasStaging <;>
-      simp [peerStaging, activeStaging, hp, hs, ← ih] <;> omega
-
 theorem activeStaging_set : ∀ {es : List Entry} {idx : Nat} {e e' : Entry},
     es[idx]? = some e →
     (e.recv.life.hasStaging = false → e'.recv.life.hasStaging = false) →
@@ -407,39 +387,6 @@ theorem activeStaging_set : ∀ {es : List Entry} {idx : Nat} {e e' : Entry},
     have ih := activeStaging_set h hmono
     simp only [List.set_cons_succ, activeStaging]
     omega
-
-theorem peerStaging_set_le : ∀ {es : List Entry} {idx : Nat} {e e' : Entry} (p : Peer),
-    es[idx]? = some e →
-    e'.peer = e.peer →
-    (e.recv.life.hasStaging = false → e'.recv.life.hasStaging = false) →
-    peerStaging p (es.set idx e') ≤ peerStaging p es
-  | [], _, _, _, _, h, _, _ => by simp at h
-  | a :: as, 0, e, e', p, h, hpeer, hmono => by
-    simp only [List.getElem?_cons_zero, Option.some.injEq] at h
-    subst h
-    cases h1 : a.recv.life.hasStaging <;> cases h2 : e'.recv.life.hasStaging
-    · simp [peerStaging, hpeer, h1, h2]
-    · have := hmono h1; simp [h2] at this
-    · simp [peerStaging, hpeer, h1, h2]
-    · simp [peerStaging, hpeer, h1, h2]
-  | a :: as, idx + 1, e, e', p, h, hpeer, hmono => by
-    simp only [List.getElem?_cons_succ] at h
-    have ih := peerStaging_set_le p h hpeer hmono
-    simp only [List.set_cons_succ, peerStaging]
-    omega
-
-theorem peerStaging_set_eq_of_hasStaging : ∀ {es : List Entry} {idx : Nat} {e e' : Entry} (p : Peer),
-    es[idx]? = some e →
-    e'.peer = e.peer →
-    e'.recv.life.hasStaging = e.recv.life.hasStaging →
-    peerStaging p (es.set idx e') = peerStaging p es
-  | [], _, _, _, _, h, _, _ => by simp at h
-  | a :: as, 0, e, e', p, h, hpeer, hst => by
-    simp only [List.getElem?_cons_zero, Option.some.injEq] at h
-    subst h; simp [peerStaging, hpeer, hst]
-  | a :: as, idx + 1, e, e', p, h, hpeer, hst => by
-    simp only [List.getElem?_cons_succ] at h
-    simp [List.set_cons_succ, peerStaging, peerStaging_set_eq_of_hasStaging p h hpeer hst]
 
 theorem activeWorkers_set_dispatch : ∀ {b : Backend} {es : List Entry} {idx : Nat} {e : Entry},
     es[idx]? = some e →
@@ -490,13 +437,13 @@ structure Inv (s : State) : Prop where
   slots : s.freeSlots + activeStaging s.sessions = s.cfg.numSlots
   workers : s.freeWorkers + activeWorkers s.cfg.backend s.sessions = s.cfg.poolSize
   sessions_inv : ∀ e ∈ s.sessions, Recv.Inv e.recv ∧ e.recv.numLayers = s.cfg.numLayers
-  quota_sick : ∀ maxPerPeer, s.cfg.policy = .perPeerQuota maxPerPeer →
-    peerStaging .sick s.sessions ≤ maxPerPeer
 
 theorem inv_init (cfg : Config) : Inv (init cfg) := by
-  refine ⟨by simp [init, activeStaging], by simp [init, activeWorkers], ?_, ?_⟩
-  · intro e he; simp [init] at he
-  · intro m _; simp [init, peerStaging]
+  refine ⟨by simp [init, activeStaging], by simp [init, activeWorkers], ?_⟩
+  intro e he; simp [init] at he
+
+theorem inv_safe {s : State} (h : Inv s) : Safe s :=
+  ⟨h.slots, h.workers, fun e he => Recv.inv_safe (h.sessions_inv e he).1⟩
 
 theorem step_cfg {s s' : State} {ev : Ev} (hs : step s ev = some s') :
     s'.cfg = s.cfg := by
@@ -523,15 +470,15 @@ theorem step_cfg {s s' : State} {ev : Ev} (hs : step s ev = some s') :
 
 theorem step_inv {s s' : State} {ev : Ev} (h : Inv s) (hs : step s ev = some s') :
     Inv s' := by
-  rcases h with ⟨hslots, hworkers, hsess, hquota⟩
+  rcases h with ⟨hslots, hworkers, hsess⟩
   cases ev with
   | startRead peer =>
     simp only [step] at hs
     split at hs
     · rename_i hadm
       cases hs
-      simp only [canAdmit, Bool.and_eq_true, decide_eq_true_eq] at hadm
-      refine ⟨?_, ?_, ?_, ?_⟩
+      simp only [canAdmit, decide_eq_true_eq] at hadm
+      refine ⟨?_, ?_, ?_⟩
       · simp only [activeStaging_append_initLoad]; omega
       · simp only [activeWorkers_append_undispatched]; exact hworkers
       · intro e he
@@ -539,20 +486,8 @@ theorem step_inv {s s' : State} {ev : Ev} (h : Inv s) (hs : step s ev = some s')
         rcases he with he | rfl
         · exact hsess e he
         · exact ⟨Recv.inv_initLoad s.cfg.numLayers, rfl⟩
-      · intro maxPerPeer hpol
-        have hq := hquota maxPerPeer hpol
-        simp only [peerStaging_append_initLoad]
-        cases peer with
-        | sick =>
-          have hlt : peerStaging .sick s.sessions < maxPerPeer := by
-            have h2 := hadm.2
-            rw [hpol] at h2
-            simpa using h2
-          simp; omega
-        | healthy =>
-          simp; omega
     · cases peer <;> dsimp only at hs <;> split at hs <;> cases hs <;>
-      exact ⟨hslots, hworkers, hsess, hquota⟩
+      exact ⟨hslots, hworkers, hsess⟩
   | dispatchPull idx =>
     simp only [step] at hs
     split at hs
@@ -568,17 +503,13 @@ theorem step_inv {s s' : State} {ev : Ev} (h : Inv s) (hs : step s ev = some s')
           have := activeStaging_set (e' := { entry with pullDispatched := true }) hget (fun h => h)
           simpa using this
         have hw := activeWorkers_set_dispatch (b := s.cfg.backend) hget hguard.1
-        refine ⟨by simp only [hst, hslots], ?_, ?_, ?_⟩
+        refine ⟨by simp only [hst, hslots], ?_, ?_⟩
         · dsimp only
           split <;> rename_i hhold <;> simp [hhold] at hw <;> omega
         · intro e he
           rcases mem_set_cases he with rfl | he
           · exact hsess entry (getElem?_mem hget)
           · exact hsess e he
-        · intro maxPerPeer hpol
-          dsimp only at hpol ⊢
-          rw [peerStaging_set_eq_of_hasStaging .sick (e' := { entry with pullDispatched := true }) hget rfl rfl]
-          exact hquota maxPerPeer hpol
   | sessStep idx e =>
     simp only [step] at hs
     split at hs
@@ -594,7 +525,7 @@ theorem step_inv {s s' : State} {ev : Ev} (h : Inv s) (hs : step s ev = some s')
             (recv_step_hasStaging_false hstep)
           have hw := activeWorkers_set_step (b := s.cfg.backend)
             (e' := { entry with recv := recv' }) hget (entry_holdsWorker_mono hstep)
-          refine ⟨?_, ?_, ?_, ?_⟩
+          refine ⟨?_, ?_, ?_⟩
           · dsimp only
             split <;> rename_i hrel <;> simp [hrel] at hst <;> omega
           · dsimp only
@@ -604,14 +535,12 @@ theorem step_inv {s s' : State} {ev : Ev} (h : Inv s) (hs : step s ev = some s')
             · obtain ⟨hinv_e, hlen_e⟩ := hsess entry (getElem?_mem hget)
               exact ⟨Recv.step_inv hinv_e hstep, (Recv.step_numLayers hstep).trans hlen_e⟩
             · exact hsess e' he'
-          · intro maxPerPeer hpol
-            dsimp only at hpol ⊢
-            exact Nat.le_trans
-              (peerStaging_set_le .sick hget rfl (recv_step_hasStaging_false hstep))
-              (hquota maxPerPeer hpol)
 
 theorem reachable_inv {cfg : Config} {s : State} (h : (sys cfg).Reachable s) : Inv s :=
   (sys cfg).reachable_induction (inv_init cfg) (fun _ _ _ ih hs => step_inv ih hs) h
+
+theorem reachable_safe {cfg : Config} {s : State} (h : (sys cfg).Reachable s) : Safe s :=
+  inv_safe (reachable_inv h)
 
 theorem reachable_cfg {cfg : Config} {s : State} (h : (sys cfg).Reachable s) : s.cfg = cfg :=
   (sys cfg).reachable_induction (P := fun s => s.cfg = cfg) rfl
@@ -620,9 +549,9 @@ theorem reachable_cfg {cfg : Config} {s : State} (h : (sys cfg).Reachable s) : s
 /-- Every active session in any reachable state satisfies `Recv.Safe`. -/
 theorem reachable_sessions_safe {cfg : Config} {s : State}
     (h : (sys cfg).Reachable s) {e : Entry} (he : e ∈ s.sessions) : Recv.Safe e.recv :=
-  Recv.inv_safe ((reachable_inv h).sessions_inv e he).1
+  (reachable_safe h).2.2 e he
 
-/-! ## General theorems: TCP blocking vs. gRPC non-blocking & per-peer quota -/
+/-! ## General theorems: TCP blocking vs. gRPC non-blocking -/
 
 /-- On `Backend.tcpBlocking`, when all `poolSize` workers are held by in-flight
 handshakes (`activeWorkers = poolSize`), `freeWorkers = 0` and no queued
@@ -698,37 +627,6 @@ theorem grpc_healthy_can_complete {s : State} {idx : Nat}
     Lifecycle.beginOp, Lifecycle.endOpLocked, Lifecycle.finishLocked,
     Lifecycle.settleLocked]
 
-/-- Under `SlotPolicy.perPeerQuota maxPerPeer`, `Peer.sick` holds at most
-`maxPerPeer` staging slots on every reachable state. -/
-theorem reachable_sick_staging_le_quota {cfg : Config} {s : State} {maxPerPeer : Nat}
-    (h : (sys cfg).Reachable s) (hpol : cfg.policy = .perPeerQuota maxPerPeer) :
-    peerStaging .sick s.sessions ≤ maxPerPeer := by
-  have hinv := reachable_inv h
-  have hcfg := reachable_cfg h
-  exact hinv.quota_sick maxPerPeer (by rw [hcfg, hpol])
-
-/-- Under `SlotPolicy.perPeerQuota maxPerPeer`, whenever `Peer.healthy` holds
-fewer than `maxPerPeer` slots and `maxPerPeer + peerStaging .healthy < numSlots`
-(in particular, when `maxPerPeer < numSlots` and `peerStaging .healthy = 0`),
-at least one staging slot is guaranteed to be free (`0 < s.freeSlots`) and
-`canAdmit s .healthy = true` on **every** reachable state — regardless of how
-many `StartRead` requests were sent to `Peer.sick`. -/
-theorem reachable_quota_admits_healthy {cfg : Config} {s : State} {maxPerPeer : Nat}
-    (h : (sys cfg).Reachable s)
-    (hpol : cfg.policy = .perPeerQuota maxPerPeer)
-    (hhealthy_lt : peerStaging .healthy s.sessions < maxPerPeer)
-    (hsum_lt : maxPerPeer + peerStaging .healthy s.sessions < cfg.numSlots) :
-    0 < s.freeSlots ∧ canAdmit s .healthy = true := by
-  have hinv := reachable_inv h
-  have hcfg := reachable_cfg h
-  have hsick := reachable_sick_staging_le_quota h hpol
-  have hsum := peerStaging_sum s.sessions
-  have hslots := hinv.slots
-  rw [hcfg] at hslots
-  have hfree : 0 < s.freeSlots := by omega
-  refine ⟨hfree, ?_⟩
-  simp [canAdmit, hcfg, hpol, hfree, hhealthy_lt]
-
 /-! ## Concrete traces and bounded model checks (`ControlHandshakeTest`) -/
 
 /-- Issue #888 background (the cross-peer fault isolation design comment in
@@ -740,8 +638,7 @@ but `.dispatchPull 2` is blocked (`none`) until one of the `.sick` handshakes
 times out (`pullReply false`). -/
 theorem trace_tcp_sick_peer_blocks_healthy :
     let cfg : Config :=
-      { numLayers := 1, numSlots := 4, poolSize := 2,
-        backend := .tcpBlocking, policy := .unboundedPerPeer }
+      { numLayers := 1, numSlots := 4, poolSize := 2, backend := .tcpBlocking }
     let pre : List Ev :=
       [.startRead .sick, .dispatchPull 0,
        .startRead .sick, .dispatchPull 1,
@@ -766,8 +663,7 @@ while all 4 `.sick` reads are
 still waiting on the wedged producer. -/
 theorem trace_grpc_sick_peer_does_not_delay_healthy :
     let cfg : Config :=
-      { numLayers := 1, numSlots := 8, poolSize := 4,
-        backend := .grpcAsync, policy := .unboundedPerPeer }
+      { numLayers := 1, numSlots := 8, poolSize := 4, backend := .grpcAsync }
     let sick4 : List Ev :=
       [.startRead .sick, .dispatchPull 0,
        .startRead .sick, .dispatchPull 1,
@@ -795,8 +691,7 @@ complete H2D and `done_recving` publication while all 5 sick reads remain
 stalled on the wire. -/
 theorem trace_grpc_healthy_progresses_under_backlog :
     let cfg : Config :=
-      { numLayers := 1, numSlots := 8, poolSize := 4,
-        backend := .grpcAsync, policy := .unboundedPerPeer }
+      { numLayers := 1, numSlots := 8, poolSize := 4, backend := .grpcAsync }
     let sick5 : List Ev :=
       [.startRead .sick, .dispatchPull 0,
        .startRead .sick, .dispatchPull 1,
@@ -826,8 +721,7 @@ settle, publish failure (`published = some false`), and return every staging
 slot back to `freeSlots = numSlots`. -/
 theorem trace_consumer_gives_up_and_drains :
     let cfg : Config :=
-      { numLayers := 1, numSlots := 2, poolSize := 2,
-        backend := .grpcAsync, policy := .unboundedPerPeer }
+      { numLayers := 1, numSlots := 2, poolSize := 2, backend := .grpcAsync }
     let evs : List Ev :=
       [.startRead .sick, .dispatchPull 0,
        .startRead .sick, .dispatchPull 1,
@@ -841,15 +735,13 @@ theorem trace_consumer_gives_up_and_drains :
   decide
 
 /-- `ControlHandshakeTest.DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`:
-under the shipping `SlotPolicy.unboundedPerPeer`, once `numSlots` reads to
-`Peer.sick` are outstanding (even if their session deadlines `.cancel` have
-already fired, since `inFlight = 1` keeps their staging slots pinned until
-`pullReply false`), `freeSlots = 0`. A subsequent `StartRead` to `Peer.healthy`
-is rejected outright (`rejectedHealthy = true`). -/
+once `numSlots` reads to `Peer.sick` are outstanding (even if their session
+deadlines `.cancel` have already fired, since `inFlight = 1` keeps their
+staging slots pinned until `pullReply false`), `freeSlots = 0`. A subsequent
+`StartRead` to `Peer.healthy` is rejected outright (`rejectedHealthy = true`). -/
 theorem trace_sick_peer_starves_staging_slots :
     let cfg : Config :=
-      { numLayers := 1, numSlots := 2, poolSize := 2,
-        backend := .grpcAsync, policy := .unboundedPerPeer }
+      { numLayers := 1, numSlots := 2, poolSize := 2, backend := .grpcAsync }
     let evs : List Ev :=
       [.startRead .sick, .dispatchPull 0, .sessStep 0 .cancel,
        .startRead .sick, .dispatchPull 1, .sessStep 1 .cancel,
@@ -859,32 +751,15 @@ theorem trace_sick_peer_starves_staging_slots :
       some (0, true, 2) := by
   decide
 
-/-- Under `SlotPolicy.perPeerQuota 1` (`maxPerPeer = 1 < numSlots = 2`; the
-per-peer admission that the comment above
-`ControlHandshakeTest.DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`
-calls for, not present in C++ at the baseline commit), the second
-`StartRead` to `Peer.sick` is refused by the per-peer
-quota, leaving a staging slot free so `Peer.healthy` is admitted and completes
-its transfer to `published = some true` with `rejectedHealthy = false`. -/
-theorem trace_per_peer_quota_admits_healthy :
-    let cfg : Config :=
-      { numLayers := 1, numSlots := 2, poolSize := 2,
-        backend := .grpcAsync, policy := .perPeerQuota 1 }
-    let evs : List Ev :=
-      [.startRead .sick, .dispatchPull 0, .sessStep 0 .cancel,
-       .startRead .sick,
-       .startRead .healthy, .dispatchPull 1,
-       .sessStep 1 (.pullReply true),
-       .sessStep 1 .h2dBegin, .sessStep 1 (.h2dIssue true),
-       .sessStep 1 .h2dReady, .sessStep 1 (.h2dDone true),
-       .sessStep 1 .publish]
-    ((sys cfg).run evs).map
-      (fun s => (s.rejectedSick, s.rejectedHealthy, s.freeSlots,
-                 (s.sessions[1]?).bind (fun e => e.recv.published))) =
-      some (true, false, 1, some true) := by
-  decide
-
 /-! ## Bounded model checks -/
+
+instance (s : State) : Decidable (Safe s) := by
+  unfold Safe; infer_instance
+
+def violates (s : State) : Bool := !decide (Safe s)
+
+theorem violates_iff (s : State) : violates s = false ↔ Safe s := by
+  simp [violates]
 
 def checkEvents : List Ev :=
   [.startRead .sick, .startRead .healthy,
@@ -894,6 +769,20 @@ def checkEvents : List Ev :=
    .sessStep 1 .h2dBegin, .sessStep 1 (.h2dIssue true),
    .sessStep 1 .h2dReady, .sessStep 1 (.h2dDone true), .sessStep 1 .publish]
 
+/-- Mutant: reclaim the consumer staging slot on `.cancel` while the handshake
+op (`inFlight = 1`) is still in flight. Violates `Safe` in 2 steps (`startRead .sick`,
+`sessStep 0 .cancel`) because the un-settled `Recv` still holds `hasStaging = true`. -/
+def stepReleaseOnCancel (s : State) : Ev → Option State
+  | .sessStep idx .cancel =>
+    (step s (.sessStep idx .cancel)).map fun s' => { s' with freeSlots := s'.freeSlots + 1 }
+  | ev => step s ev
+
+#guard (ModelCheck.check
+          ⟨init { numLayers := 1, numSlots := 2, poolSize := 2, backend := .grpcAsync },
+           stepReleaseOnCancel⟩
+          checkEvents violates 3
+        matches .counterexample _)
+
 /-- Violation predicate for `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`:
 the first `StartRead` to `Peer.healthy` (`peerStaging .healthy s.sessions = 0` and
 no prior healthy session) is rejected at admission (`rejectedHealthy = true`). -/
@@ -901,14 +790,67 @@ def starvesFirstHealthy (s : State) : Bool :=
   s.rejectedHealthy &&
   (s.sessions.filter (fun e => e.peer == .healthy)).isEmpty
 
--- Shipping `unboundedPerPeer` (`numSlots = 2`): bounded search finds the
--- starvation counterexample in 3 steps (`startRead .sick`, `startRead .sick`,
+-- Shipping `StartRead` (`numSlots = 2`): bounded search finds the starvation
+-- counterexample in 3 steps (`startRead .sick`, `startRead .sick`,
 -- `startRead .healthy`).
-#guard (match ModelCheck.check
-          (sys { numLayers := 1, numSlots := 2, poolSize := 2,
-                 backend := .grpcAsync, policy := .unboundedPerPeer })
-          checkEvents starvesFirstHealthy 4 with
-        | .counterexample _ => true
-        | _ => false)
+#guard (ModelCheck.check
+          (sys { numLayers := 1, numSlots := 2, poolSize := 2, backend := .grpcAsync })
+          checkEvents starvesFirstHealthy 4
+        matches .counterexample _)
+
+/-! ### The per-peer staging quota alternative
+
+The comment above `ControlHandshakeTest.DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`
+notes that stopping one wedged peer from holding every staging slot needs
+per-peer admission at `StartRead`. `stepPerPeerQuota` is `step` with a cap
+`peerStaging peer s.sessions < maxPerPeer` added to `.startRead`; it is not the
+shipping code. -/
+
+def stepPerPeerQuota (maxPerPeer : Nat) (s : State) : Ev → Option State
+  | .startRead peer =>
+    if 0 < s.freeSlots && peerStaging peer s.sessions < maxPerPeer then
+      step s (.startRead peer)
+    else
+      match peer with
+      | .healthy =>
+        if s.rejectedHealthy then none else some { s with rejectedHealthy := true }
+      | .sick =>
+        if s.rejectedSick then none else some { s with rejectedSick := true }
+  | ev => step s ev
+
+def sysPerPeerQuota (cfg : Config) (maxPerPeer : Nat) : System State Ev :=
+  ⟨init cfg, stepPerPeerQuota maxPerPeer⟩
+
+/-- Under `stepPerPeerQuota 1` (`maxPerPeer = 1 < numSlots = 2`), the second
+`StartRead` to `Peer.sick` is refused by the per-peer cap, leaving a staging
+slot free so `Peer.healthy` is admitted and completes its transfer to
+`published = some true` with `rejectedHealthy = false`. -/
+theorem trace_per_peer_quota_admits_healthy :
+    let cfg : Config :=
+      { numLayers := 1, numSlots := 2, poolSize := 2, backend := .grpcAsync }
+    let evs : List Ev :=
+      [.startRead .sick, .dispatchPull 0, .sessStep 0 .cancel,
+       .startRead .sick,
+       .startRead .healthy, .dispatchPull 1,
+       .sessStep 1 (.pullReply true),
+       .sessStep 1 .h2dBegin, .sessStep 1 (.h2dIssue true),
+       .sessStep 1 .h2dReady, .sessStep 1 (.h2dDone true),
+       .sessStep 1 .publish]
+    ((sysPerPeerQuota cfg 1).run evs).map
+      (fun s => (s.rejectedSick, s.rejectedHealthy, s.freeSlots,
+                 (s.sessions[1]?).bind (fun e => e.recv.published))) =
+      some (true, false, 1, some true) := by
+  decide
+
+def violatesQuota (maxPerPeer : Nat) (s : State) : Bool :=
+  !decide (Safe s ∧ peerStaging .sick s.sessions ≤ maxPerPeer) ||
+  starvesFirstHealthy s
+
+-- Bounded only: settled sessions return their slots so sequential `startRead`s
+-- grow `sessions` without bound; no violation within 8 events where shipping
+-- `step` finds `starvesFirstHealthy` at depth 3.
+#guard ModelCheck.check
+  (sysPerPeerQuota { numLayers := 1, numSlots := 2, poolSize := 2, backend := .grpcAsync } 1)
+  checkEvents (violatesQuota 1) 8 = .outOfFuel
 
 end TpuSyncVerify.Transfer.PrefillDecode.PeerIsolation

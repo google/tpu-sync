@@ -36,7 +36,10 @@ File aliases used in the source map below:
 `bts.cc` (`tpu_sync/transport/block_transport_session.cc`),
 `base.cc` (`tpu_sync/kv_cache/kv_cache_manager_base.cc`),
 `reshard_recv_test.cc` (`tpu_sync/kv_cache/reshard_receive_session_test.cc`),
-`pool_reshard_test.cc` (`tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`).
+`pool_reshard_test.cc` (`tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`),
+`pool_reshard_send_slots_test.cc` (`tpu_sync/core/pool_reshard_send_slots_test.cc`),
+`reshard_service_test.cc` (`tpu_sync/kv_cache/reshard/reshard_service_test.cc`),
+`pool_reshard_planner_streams_test.cc` (`tpu_sync/kv_cache/reshard/pool_reshard_planner_streams_test.cc`).
 
 What this module proves:
 1. **Multi-sender stream count conservation (`stream_count_matches`,
@@ -104,6 +107,14 @@ What this module proves:
 | `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsExpectedPushMismatch` | `:354-363` |
 | `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsWriteBeyondDeclaredLiveTail` | `:365-403` |
 | `pool_reshard_test.cc` | `ExpectedPushSendersTest.CountsReceiverPlanSchedules` | `:222-269` |
+| `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.SingleDestinationIsPoolsTimesOnePeer` | `:49-55` |
+| `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.ReplicatedDestinationsIsPoolsTimesPeers` | `:57-65` |
+| `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.ShardedGroupCountsOnlyItsPeers` | `:67-76` |
+| `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.GroupWithoutEntriesContributesNoSlot` | `:78-83` |
+| `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.EmptyScheduleHasNoSlots` | `:85-89` |
+| `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsShardedSpansRouteBytesPerReceiver` | `:1982-2047` |
+| `reshard_service_test.cc` | `ReshardStackTest.ShardedDestinationWithoutCoverageFailsClosed` | `:2168-2181` |
+| `reshard_service_test.cc` | `ReshardStackTest.ReplicatedAndRoutedSpansCombine` | `:2210-2242` |
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.UnsetEmptyOrZeroKeepsOneStreamPerSourceRank` | `:59-72` |
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.PositiveValueCapsStreamsWithinAdmission` | `:74-87` |
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.RejectsUnparsableValueNamingVariableAndValue` | `:89-95` |
@@ -209,6 +220,56 @@ theorem stream_count_matches {parallelism : Nat} {senders : List Nat}
       recomputedExpectedPushes parallelism senders entries = expectedPushes := by
   simp only [validateExpectedPushes, Bool.and_eq_true, decide_eq_true_eq] at h
   exact ⟨h.1.1, h.1.2, h.2⟩
+
+/-! ### The sender's slot count (`CountPoolReshardSendSlots`)
+
+The sender sizes its session by `CountPoolReshardSendSlots(plan, schedule)`
+(`tpu_sync/core/pool_reshard_send_slots.cc`): for every transferred pool
+(`plan.transfer_pool_indices()`), the number of distinct `dst_peer`s among the
+schedule entries whose `pool_group` is that pool's group
+(`peers_by_group[entry.pool_group()].insert(entry.dst_peer())`), summed over the
+pools; a pool whose group has no entry contributes nothing
+(`if (it == peers_by_group.end()) continue;`). The per-pool terms are the
+`peerCounts` the `Reshard/Send` model is initialised with, and the sum is its
+push budget (`Send.init`, `sumPeers`). -/
+
+/-- Distinct peers with at least one entry for pool group `g`; `entries` are
+`(pool_group, dst_peer)` pairs. -/
+def groupPeers (entries : List (Nat × Nat)) (g : Nat) : Nat :=
+  ((entries.filter fun e => e.1 == g).map (·.2)).eraseDups.length
+
+/-- The group of `pool` in `poolGroups` (`plan.pool_groups(g).pool_indices()`),
+if any. -/
+def poolGroupOf (poolGroups : List (List Nat)) (pool : Nat) : Option Nat :=
+  poolGroups.findIdx? (·.contains pool)
+
+/-- `CountPoolReshardSendSlots`. -/
+def countPoolReshardSendSlots (transferPools : List Nat) (poolGroups : List (List Nat))
+    (entries : List (Nat × Nat)) : Nat :=
+  (transferPools.map fun pool =>
+    match poolGroupOf poolGroups pool with
+    | some g => groupPeers entries g
+    | none => 0).foldl (· + ·) 0
+
+/-- Replay of `PoolReshardSendSlots` (`tpu_sync/core/pool_reshard_send_slots_test.cc`);
+peers `0` and `1` stand for `10.0.0.2:9400` and `10.0.0.2:9401`:
+1. `PoolReshardSendSlots.SingleDestinationIsPoolsTimesOnePeer`: groups
+   `{0,1,2}`, `{3}`, one peer in each: `3 + 1 = 4`.
+2. `PoolReshardSendSlots.ReplicatedDestinationsIsPoolsTimesPeers`: groups
+   `{0,1}`, `{2}`, two peers in each: `2 + 2 + 2 = 6`.
+3. `PoolReshardSendSlots.ShardedGroupCountsOnlyItsPeers`: group `{0,1}` reaches
+   both peers, group `{2,3}` one: `2 + 2 + 1 + 1 = 6`, not `4 * 2 = 8` (the
+   over-count `Reshard/Send`'s mutant `initOvercountedSlots` plants).
+4. `PoolReshardSendSlots.GroupWithoutEntriesContributesNoSlot`: groups `{0}`,
+   `{1}`, only group `0` scheduled: `1`.
+5. `PoolReshardSendSlots.EmptyScheduleHasNoSlots`: no entries: `0`. -/
+theorem trace_pool_reshard_send_slots_test_parity :
+    countPoolReshardSendSlots [0, 1, 2, 3] [[0, 1, 2], [3]] [(0, 0), (1, 0)] = 4 ∧
+    countPoolReshardSendSlots [0, 1, 2] [[0, 1], [2]] [(0, 0), (1, 0), (0, 1), (1, 1)] = 6 ∧
+    countPoolReshardSendSlots [0, 1, 2, 3] [[0, 1], [2, 3]] [(0, 0), (0, 1), (1, 1)] = 6 ∧
+    countPoolReshardSendSlots [0, 1] [[0], [1]] [(0, 0)] = 1 ∧
+    countPoolReshardSendSlots [0] [[0]] [] = 0 := by
+  decide
 
 /-! ## Part 2: Sub-block interval partition and byte-level block reconstruction -/
 
@@ -547,7 +608,7 @@ theorem mutant_gap_in_coverage_leaves_unwritten_byte :
 /-- Mutant 2: overlapping sub-block intervals (`[0, 20)` and `[16, 32)`) are
 rejected by `validBlockCoverage`
 (`ReshardReceiveSession::ValidateReceiverCoverage`
-`if (interval.start_bytes < covered_until)` in `reshard_receive_session.cc`). -/
+`if (start_bytes != covered_until)` in `reshard_receive_session.cc`). -/
 theorem mutant_overlap_in_coverage_rejected :
     validBlockCoverage 32 [⟨0, 20⟩, ⟨16, 32⟩] = false := by
   decide
@@ -640,6 +701,39 @@ theorem trace_expected_push_senders_test_parity :
     expectedPushSenders false [] = none := by
   decide
 
+/-- Replay of the per-destination routing tests of `ReshardStackTest`
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc`), as each armed receiver
+sees them: two source ranks (`topology_parallelism = 2`), two destination units
+with 512-byte blocks, and the planner's `ValidateSpanCoverage` /
+`expected_pushes` reproduced by `validBlockCoverage` /
+`validateExpectedPushes` on the receiver (`ReshardReceiveSession::ValidateReceiverCoverage`
+is the same check on the plan it is handed):
+1. `ReshardStackTest.TwoDestinationsShardedSpansRouteBytesPerReceiver`: rank 0
+   owns source block 3 → destination block 0, rank 1 source block 5 →
+   destination block 1, each destination taking its own 512-byte half. Each
+   receiver's plan carries one entry per sender (`entries_size() == 1` in both
+   `shard_push_schedules`), `expected_pushes == 2`, and
+   `dst_expected_extent_bytes == {512, 512}`, every block fully covered.
+2. `ReshardStackTest.ReplicatedAndRoutedSpansCombine`: rank 0's block is
+   replicated to both destinations and rank 1's is sharded; each receiver again
+   sees two entries and `expected_pushes == 2`.
+3. `ReshardStackTest.ShardedDestinationWithoutCoverageFailsClosed`: everything
+   is routed to destination 0, so destination 1 has no bytes ("has no declared
+   coverage"): an empty interval list covers nothing and recomputes zero pushes,
+   and the plan is refused before any receiver is armed
+   (`transport_.calls_.empty()`). -/
+theorem trace_reshard_stack_routing_test_parity :
+    let sharded : List ScheduleEntry := [⟨0, 3, 0, ⟨0, 512⟩⟩, ⟨1, 5, 1, ⟨0, 512⟩⟩]
+    let mixed : List ScheduleEntry := [⟨0, 0, 0, ⟨0, 512⟩⟩, ⟨1, 1, 1, ⟨0, 512⟩⟩]
+    (senderPairs sharded 0).length = 1 ∧ (senderPairs sharded 1).length = 1 ∧
+    validateExpectedPushes 2 [0, 1] sharded 2 = true ∧
+    validGroupExtents 512 [512, 512] = true ∧
+    validBlockCoverage 512 [⟨0, 512⟩] = true ∧
+    validateExpectedPushes 2 [0, 1] mixed 2 = true ∧
+    validBlockCoverage 512 [] = false ∧
+    validateExpectedPushes 2 [0, 1] [] 0 = false := by
+  decide
+
 /-- Parsed `TPU_RAIDEN_TRANSFER_STREAMS` environment variable
 (`kTransferStreamsEnvVar` in `tpu_sync/kv_cache/reshard/pool_reshard_planner.h`,
 `DefaultTransferStreams` in `tpu_sync/kv_cache/reshard/pool_reshard_planner.cc`). -/
@@ -652,11 +746,11 @@ inductive TransferStreamsEnv where
 /-- `DefaultTransferStreams(topology_parallelism)`
 (`tpu_sync/kv_cache/reshard/pool_reshard_planner.cc`):
 - Unset, empty, or `0` returns `some topologyParallelism`
-  (`if (raw == nullptr || raw[0] == '\0')` / `if (parsed == 0)`).
+  (`if (raw == nullptr || raw[0] == '\0')` / `if (streams == 0)`).
 - A positive integer `n` returns `some (min n topologyParallelism)`
-  (`if (parsed > topology_parallelism)`).
+  (`if (streams > topology_parallelism)`).
 - Unparsable or negative values return `none` (`InvalidArgumentError`,
-  `if (!absl::SimpleAtoi(raw, &parsed) || parsed < 0)`). -/
+  `if (!absl::SimpleAtoi(raw, &streams) || streams < 0)`). -/
 def defaultTransferStreams (topologyParallelism : Nat) : TransferStreamsEnv → Option Nat
   | .unsetOrEmpty => some topologyParallelism
   | .intVal n =>

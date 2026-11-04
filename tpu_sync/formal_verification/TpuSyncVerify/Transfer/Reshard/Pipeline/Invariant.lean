@@ -86,7 +86,7 @@ def Safe (s : Pipeline) : Prop :=
 /-! ## Inductive invariant -/
 
 structure Inv (s : Pipeline) : Prop where
-  sendInv : Send.Inv .shipping s.send
+  sendInv : Send.Inv s.send
   recvInv : Recv.Inv s.recv
   num_pos : 0 < s.numPools
   len_peers : s.peerCounts.length = s.numPools
@@ -172,7 +172,7 @@ theorem getElem?_map_init_recv {ranks : List Nat} {p : Nat} {pool : Pool}
 theorem inv_init {ranks peerCounts : List Nat} (h : validConfig ranks peerCounts = true) :
     Inv (init ranks peerCounts) := by
   obtain ⟨hsend, hpos, hlen⟩ := validConfig_parts h
-  refine ⟨Send.inv_init .shipping hsend, Recv.inv_init ranks, hpos,
+  refine ⟨Send.inv_init hsend, Recv.inv_init ranks, hpos,
     hlen, by simp [init, Send.init, hlen], by simp [init, Recv.init],
     by simp [init], by simp [init], by simp [init], by simp [init],
     by simp [init], by simp [init], by simp [init],
@@ -229,7 +229,7 @@ theorem peerCount_pos {s : Pipeline} (h : Inv s) {p : Nat} (hp : p < s.numPools)
   exact hp_pos
 
 theorem step_send_isSome {s : Pipeline} {e : Send.Ev} (he : e ∈ Send.drainEvents s.numPools) :
-    (step s (.send e)).isSome = (Send.step .shipping s.send e).isSome := by
+    (step s (.send e)).isSome = (Send.step s.send e).isSome := by
   simp only [Send.drainEvents, List.mem_append, List.mem_singleton, List.mem_flatMap,
     List.mem_range] at he
   rcases he with rfl | ⟨p, _, hp⟩
@@ -346,28 +346,28 @@ theorem inv_safe {s : Pipeline} (h : Inv s) : Safe s := by
 @[simp] theorem endOp_published (r : Send) : (Send.endOp r).published = r.published := rfl
 @[simp] theorem endOp_life (r : Send) : (Send.endOp r).life = r.life.endOpLocked := rfl
 
-@[simp] theorem recordPushCompletion_pools (pol : UnregisterPolicy) (ok : Bool) (r : Send) :
-    (Send.recordPushCompletion pol ok r).pools = r.pools := by
+@[simp] theorem recordPushCompletion_pools (ok : Bool) (r : Send) :
+    (Send.recordPushCompletion ok r).pools = r.pools := by
   unfold Send.recordPushCompletion
   split <;> try rfl
   split <;> try rfl
   split <;> rfl
 
-@[simp] theorem recordPushCompletion_published (pol : UnregisterPolicy) (ok : Bool) (r : Send) :
-    (Send.recordPushCompletion pol ok r).published = r.published := by
+@[simp] theorem recordPushCompletion_published (ok : Bool) (r : Send) :
+    (Send.recordPushCompletion ok r).published = r.published := by
   unfold Send.recordPushCompletion
   split <;> try rfl
   split <;> try rfl
   split <;> rfl
 
-theorem recordPushCompletion_done_mono (pol : UnregisterPolicy) (ok : Bool) (r : Send)
+theorem recordPushCompletion_done_mono (ok : Bool) (r : Send)
     (hd : r.life.done = true) :
-    (Send.recordPushCompletion pol ok r).life.done = true := by
+    (Send.recordPushCompletion ok r).life.done = true := by
   unfold Send.recordPushCompletion
   simp [hd]
 
-theorem send_step_published_ne_none {pol : UnregisterPolicy} {r r' : Send} {e : Send.Ev}
-    (hs : Send.step pol r e = some r') (hpub : r.published ≠ none) :
+theorem send_step_published_ne_none {r r' : Send} {e : Send.Ev}
+    (hs : Send.step r e = some r') (hpub : r.published ≠ none) :
     r'.published ≠ none := by
   cases e with
   | d2hIssue p ok =>
@@ -400,8 +400,8 @@ theorem send_step_published_ne_none {pol : UnregisterPolicy} {r r' : Send} {e : 
     split at hs <;> try cases hs
     simp
 
-theorem send_step_done_mono {pol : UnregisterPolicy} {r r' : Send} {e : Send.Ev}
-    (hs : Send.step pol r e = some r') (hd : r.life.done = true) :
+theorem send_step_done_mono {r r' : Send} {e : Send.Ev}
+    (hs : Send.step r e = some r') (hd : r.life.done = true) :
     r'.life.done = true := by
   cases e with
   | d2hIssue p ok =>
@@ -412,7 +412,7 @@ theorem send_step_done_mono {pol : UnregisterPolicy} {r r' : Send} {e : Send.Ev}
     split at hs
     · cases hs; exact hd
     · cases hs
-      exact Lifecycle.endOpLocked_done_mono (recordPushCompletion_done_mono pol false _ hd)
+      exact Lifecycle.endOpLocked_done_mono (recordPushCompletion_done_mono false _ hd)
   | execFinish =>
     simp only [Send.step, Send.execFinish] at hs
     split at hs <;> try cases hs
@@ -423,13 +423,13 @@ theorem send_step_done_mono {pol : UnregisterPolicy} {r r' : Send} {e : Send.Ev}
     split at hs <;> try cases hs
     split at hs
     · cases hs
-      exact Lifecycle.endOpLocked_done_mono (recordPushCompletion_done_mono pol false _ hd)
+      exact Lifecycle.endOpLocked_done_mono (recordPushCompletion_done_mono false _ hd)
     · split at hs <;> { cases hs; exact Lifecycle.endOpLocked_done_mono hd }
   | pushDone p ok =>
     simp only [Send.step, Send.pushDone] at hs
     split at hs <;> try cases hs
     split at hs <;> try cases hs
-    exact Lifecycle.endOpLocked_done_mono (recordPushCompletion_done_mono pol ok _ hd)
+    exact Lifecycle.endOpLocked_done_mono (recordPushCompletion_done_mono ok _ hd)
   | cancel =>
     simp only [Send.step, Send.cancel, Option.some.injEq] at hs
     subst hs; exact Lifecycle.finishLocked_done_mono false hd
@@ -444,7 +444,7 @@ theorem send_poolOps_pos_of_stage {ps : List SendPool} {p : Nat} {pool : SendPoo
   have ⟨_, hle⟩ := Send.poolOps_set pool.stage hget
   omega
 
-theorem send_not_done_of_stage {r : Send} (h : Send.Inv .shipping r) {p : Nat} {pool : SendPool}
+theorem send_not_done_of_stage {r : Send} (h : Send.Inv r) {p : Nat} {pool : SendPool}
     (hget : r.pools[p]? = some pool) (hop : 0 < pool.stage.opCount) :
     r.life.done = false := by
   have hpo := send_poolOps_pos_of_stage hget hop

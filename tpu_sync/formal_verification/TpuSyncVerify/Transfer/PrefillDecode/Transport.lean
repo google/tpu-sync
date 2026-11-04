@@ -20,7 +20,11 @@ Abbreviations: `bt.cc` = `tpu_sync/transport/block_transport.cc`, `bt.h` =
 `tpu_sync/kv_cache/transfer_receive_session.cc`, `mgr.cc` =
 `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`, `send.cc` =
 `tpu_sync/kv_cache/transfer_send_session.cc`, `base.cc` =
-`tpu_sync/kv_cache/kv_cache_manager_base.cc`. Exact line ranges for every
+`tpu_sync/kv_cache/kv_cache_manager_base.cc`, `coord.cc` =
+`tpu_sync/kv_cache/reshard/reshard_coordinator.cc`, `planner.cc` =
+`tpu_sync/kv_cache/reshard/pool_reshard_planner.cc`, `block_transport_session_test.cc` =
+`tpu_sync/transport/block_transport_session_test.cc`, `block_transport_test.cc` =
+`tpu_sync/transport/block_transport_test.cc`. Exact line ranges for every
 symbol and sub-block are in the generated `## Source map` table below.
 
 ## What is modelled
@@ -180,14 +184,36 @@ finds the receive session draining. It is not an event.
 * **A2 (stable expectation).** `ExpectedPushSenders(uuid)` is read outside
   the lock and latched on the layer's first stream (`if (!progress.expected_senders_resolved)`),
   so the contract a layer runs under is whatever the first stream saw. Encoded as
-  the fixed `Cfg.declared`. On the `StartRead` path there is never a plan;
-  on the plan path (`RegisterActivePlan`) the session is seated (`EmplaceRecvSessionLocked`)
-  *before* the plan is published (`base_->RegisterActivePlan`), so a push landing in that window would
-  latch chunk-count on a layer of a sender-declared plan. That the sender
-  does not start before the receiver's registration has returned is a
-  controller-side ordering outside this repository's code; it is assumed,
-  not proved. `trace_chunk_two_senders` is what the window would produce
-  on a multi-sender plan.
+  the fixed `Cfg.declared`. `ExpectedPushSenders` returns `std::nullopt` when no
+  receiver plan is registered (`StartRead`, `KVCacheStore` /
+  `WorkerServiceImpl::TransferBuffers`, and `WeightSynchronizerBase`), when
+  `pool_groups_size() > 0` (pool reshard via `ReshardCoordinator::RunSubPlan`,
+  which takes the `GetPoolPushProgressSpec` branch in `CompleteIncomingPush`),
+  and when `shard_push_schedules_size() == 0` (including primary
+  `StageBroadcastGroup` hops in `BroadcastEngine.execute_slice_broadcast_pipeline`
+  (`_dispatch_hop`) in
+  `tpu_sync/weight_sync/manager/broadcast_engine.py`), so the sender-declared
+  contract (`sender_streams`) is entered only on non-pool receiver
+  `RegisterActivePlan` plans (`pool_groups_size() == 0` with
+  `shard_push_schedules_size() > 0`). Inside
+  `KVCacheManagerWithTransfer::RegisterActivePlan` the receive session is seated
+  (`EmplaceRecvSessionLocked`) synchronously before the plan is published
+  (`base_->RegisterActivePlan`) within the same call, so `A2` holds whenever
+  senders are dispatched only after `RegisterActivePlan` has returned (whereas a
+  push arriving before or concurrently with `RegisterActivePlan` could latch
+  chunk-count on a sender-declared plan, `trace_chunk_two_senders`). Every
+  in-repo controller hop that populates receiver `shard_push_schedules` on a
+  non-pool plan (`BroadcastEngine.execute_slice_broadcast_pipeline`
+  (`_run_single_transfer`) in
+  `tpu_sync/weight_sync/manager/broadcast_engine.py`, invoked from
+  `RaidenController.start_transfer` in `tpu_sync/rpc/raiden_controller.py`, and
+  remote destination preparation via
+  `RaidenControllerClientFacade.register_transfer_schedule` in
+  `tpu_sync/weight_sync/manager/controller_rpc_service.py`) awaits the
+  destination `COMMAND_START_TRANSFER` RPC (`KVCacheListener::HandleControlRequest`
+  runs `register_active_plan` synchronously before replying) before dispatching
+  any sender; `A2` therefore remains an external ordering assumption only against
+  callers that dispatch pushes before `RegisterActivePlan` returns.
 * **A3 (uniform declaration, one node per schedule).** Every sender declares
   the same `numStreams`, and no sender outside the expected set appears; the
   `FailedPrecondition` and "more senders" rejections in `CompleteIncomingPush`
@@ -195,10 +221,24 @@ finds the receive session draining. It is not an event.
   `if (progress.sender_streams.size() > *expected_senders)`) are
   therefore never taken and are not modelled. Senders are told apart by
   `header.remote_id = node_id()` (`BuildBlockRequests`:
-  `remote_id = static_cast<uint32_t>(block_delegate_->node_id())`) while
-  `expected_senders` counts `shard_push_schedules`, keyed by source shard
-  partition (`StartTransferRequest.shard_push_schedules`); the contract
-  therefore presumes one source shard per node, which the receiver never checks.
+  `remote_id = static_cast<uint32_t>(block_delegate_->node_id())`), which also
+  keys `GetBlockChunks` (`if (sender_node_id != -1)`), while
+  `expected_senders` counts `shard_push_schedules` on non-pool plans
+  (`StartTransferRequest.shard_push_schedules`). Pool reshard checks unique
+  contiguous `transfer_rank`s in `BuildPoolReshardPlan` (`Source transfer_rank
+  values must be unique`) and bypasses `ExpectedPushSenders`, and `KVCacheStore`
+  startup checks dense `[0, N)` `node_id`s in
+  `HostOffloadBackend::ComposeKVTransferSpec` when `expected_worker_count > 0`
+  with a global registry (`WorkerRegistry::RegisterWorker` exempts
+  `node_id == 0`, and store transfers bypass `RegisterActivePlan`). On
+  legacy non-pool `RegisterActivePlan` plans (`KVCacheManagerWithTransfer` and
+  its `KVCacheManager` bindings default `node_id` to `0`, while
+  `KVCacheManagerBase::node_id()` defaults to `-1`, and
+  `JobEntity.encode_start_transfer` in `tpu_sync/weight_sync/manager/job_entity.py`
+  keys receiver `shard_push_schedules` per source shard when `num_src_shards > 1`),
+  neither `KVCacheManagerBase` / `KVCacheManagerWithTransfer` nor
+  `RegisterActivePlan` checks that pushing workers carry distinct `node_id`s
+  matching one `shard_push_schedules` entry each.
 * **A4 (honest senders) — `Cfg.honest`.** Every sender sends at most the
   streams it declared for each layer, for the life of the receive. Encoded as
   a guard on `stream`: a stream beyond the declaration is not enabled. This
@@ -226,6 +266,19 @@ stream does: on the chunk-count contract before retirement the receive is
 published with a layer never copied; on either contract after retirement the
 layer is copied twice (the session's `in_flight_` still holds `done_` off
 until both copies return, and a failing duplicate copy fails the receive).
+
+Four transport unit tests replay on `step` (`Transport/Traces.lean`):
+`BlockTransportServerPushSessionTest.LifecycleAndStreamCompletion` (chunk-count,
+two streams complete and retire one layer),
+`BlockTransportTest.LayerCompletesOnlyAfterEveryDeclaredSender` (sender-declared,
+either arrival order, then reuse after retirement),
+`BlockTransportTest.SenderOverDeliveryIsRejected` (the `streams.landed >
+streams.declared` rejection) and
+`BlockTransportTest.UndeclaredUuidKeepsHeaderDeclaredCompletion` (the chunk-count
+contract on two senders, `Cfg.WF.chunkSingle`'s excluded instance); sibling
+push-progress tests that vary declarations per sender (outside A3), call
+`Cancel` / `ForgetPushProgress`, or exercise the plan-declared pool or Peregrine
+bitmask branches are documented alongside them.
 
 ## Source map
 
@@ -266,6 +319,20 @@ Generated by `tools/resolve_anchors.py`.
 | `recv.cc` | `TransferReceiveSession::OnBlockShardsReceived` | `:711-758` |
 | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:786-925` |
 | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`future.OnReady`) | `:862-922` |
+| `block_transport_session_test.cc` | `MockSessionDelegate` | `:42-142` |
+| `block_transport_session_test.cc` | `BlockTransportServerPushSessionTest.LifecycleAndStreamCompletion` | `:144-179` |
+| `block_transport_session_test.cc` | `BlockTransportServerPushSessionTest.Cancel` | `:181-195` |
+| `block_transport_test.cc` | `MockDelegate` | `:124-317` |
+| `block_transport_test.cc` | `MultiSenderReceiverDelegate` | `:361-380` |
+| `block_transport_test.cc` | `BlockTransportTest.PushSplitBySourceNumaCompletesPlanDeclaredPool` | `:787-817` |
+| `block_transport_test.cc` | `BlockTransportTest.LayerCompletesOnlyAfterEveryDeclaredSender` | `:996-1042` |
+| `block_transport_test.cc` | `BlockTransportTest.DeclaredSendersEachCompleteTheirOwnParallelism` | `:1044-1080` |
+| `block_transport_test.cc` | `BlockTransportTest.SenderOverDeliveryIsRejected` | `:1082-1119` |
+| `block_transport_test.cc` | `BlockTransportTest.SenderChangingDeclaredStreamCountIsRejected` | `:1121-1154` |
+| `block_transport_test.cc` | `BlockTransportTest.UndeclaredUuidKeepsHeaderDeclaredCompletion` | `:1156-1190` |
+| `block_transport_test.cc` | `BlockTransportTest.ForgetPushProgressAllowsUuidReuse` | `:1192-1224` |
+| `block_transport_test.cc` | `BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires` | `:1226-1265` |
+| `block_transport_test.cc` | `BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration` | `:1267-1294` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.on_layer_received =`) | `:303-319` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.begin_incoming_push =`) | `:364-389` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.end_incoming_push =`) | `:390-436` |
@@ -279,6 +346,13 @@ Generated by `tools/resolve_anchors.py`.
 | `mgr.cc` | `KVCacheManagerWithTransfer::OnBlockShardsReceived` | `:1668-1692` |
 | `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:625-653` |
 | `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2745-2762` |
+| `base.cc` | `KVCacheManagerBase::RegisterActivePlan(host_block_of)` | `:3136-3222` |
+| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`if (sender_node_id != -1) {` .. `auto schedule_found_it = schedules.find(found_src_shard);`) | `:3512-3535` |
+| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`std::vector<absl::Status> arm_status` .. `for (std::thread& t : armers) t.join();`) | `:743-776` |
+| `planner.cc` | `BuildPoolReshardPlan` (`std::map<int64_t, RaidenId> ranks;` .. `++expected_rank;`) | `:966-981` |
+| `tpu_sync/core/controller/worker_registry.cc` | `WorkerRegistry::RegisterWorker` (`if (entry.node_id != 0)`) | `:63-73` |
+| `tpu_sync/kv_cache/host_offload_backend.cc` | `HostOffloadBackend::ComposeKVTransferSpec` | `:1365-1408` |
+| `tpu_sync/kv_cache/kv_cache_listener.cc` | `KVCacheListener::HandleControlRequest` (`absl::Status status = callbacks_.register_active_plan(` .. `(*resp->mutable_receiver_pool_addrs())[static_cast<int32_t>(l)] =`) | `:189-202` |
 | `tpu_sync/rpc/raiden_service.proto` | `StartTransferRequest` (`map<int32, ShardPushScheduleProto> shard_push_schedules`) | `:180` |
 <!-- source-map:end -->
 -/

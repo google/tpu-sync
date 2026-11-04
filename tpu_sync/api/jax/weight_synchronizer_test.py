@@ -15,6 +15,7 @@
 """Integration tests for JAX WeightSynchronizer Python API."""
 
 import os
+import socket
 
 from absl.testing import absltest  # pylint: disable=g-import-not-at-top
 import jax
@@ -22,32 +23,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from tpu_sync.api.jax import weight_synchronizer
-from tpu_sync.common.control_pipe import control_pipe_client
 from tpu_sync.rpc import raiden_service_pb2
 
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 WeightSynchronizer = weight_synchronizer.WeightSynchronizer
-
-
-def _send_control_request(
-    port: int, request: raiden_service_pb2.ControlRequest
-) -> raiden_service_pb2.ControlResponse:
-  pipe_client = control_pipe_client.ControlPipeClient(
-      backend=control_pipe_client.ControlPipeBackendType.GRPC
-  )
-  try:
-    resp_bytes = pipe_client.send_raw_bytes_sync(
-        f"localhost:{port}",
-        request.SerializeToString(),
-        timeout=10.0,
-        message_type="tpu_sync.rpc.ControlRequest",
-    )
-  finally:
-    pipe_client.close()
-  response = raiden_service_pb2.ControlResponse()
-  response.ParseFromString(resp_bytes)
-  return response
 
 
 class WeightSynchronizerIntegrationTest(absltest.TestCase):
@@ -118,8 +98,18 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
             is_sender=True
         ),
     )
-    resp = _send_control_request(ws_source.listener_port, req)
+    payload = req.SerializeToString()
+
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+    sock.connect(("::1", ws_source.listener_port))
+    sock.sendall(len(payload).to_bytes(4, "big") + payload)
+
+    resp_len = int.from_bytes(sock.recv(4), "big")
+    resp_bytes = sock.recv(resp_len)
+    resp = raiden_service_pb2.ControlResponse()
+    resp.ParseFromString(resp_bytes)
     assert resp.success
+    sock.close()
 
     ws_dest1.h2d()
     ws_dest2.h2d()
@@ -225,8 +215,18 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
             is_sender=True
         ),
     )
-    resp = _send_control_request(ws_source.listener_port, req)
+    payload = req.SerializeToString()
+
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+    sock.connect(("::1", ws_source.listener_port))
+    sock.sendall(len(payload).to_bytes(4, "big") + payload)
+
+    resp_len = int.from_bytes(sock.recv(4), "big")
+    resp_bytes = sock.recv(resp_len)
+    resp = raiden_service_pb2.ControlResponse()
+    resp.ParseFromString(resp_bytes)
     assert resp.success
+    sock.close()
 
     ws_dest.h2d()
 
@@ -257,8 +257,16 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     ws_dest.bind_weights(new_dst_arrs)
 
     # --- Sync 2 (V2: 10.0 -> -1.0) ---
-    resp = _send_control_request(ws_source.listener_port, req)
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+    sock.connect(("::1", ws_source.listener_port))
+    sock.sendall(len(payload).to_bytes(4, "big") + payload)
+
+    resp_len = int.from_bytes(sock.recv(4), "big")
+    resp_bytes = sock.recv(resp_len)
+    resp = raiden_service_pb2.ControlResponse()
+    resp.ParseFromString(resp_bytes)
     assert resp.success
+    sock.close()
 
     ws_dest.h2d()
 
@@ -310,8 +318,18 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
             is_sender=True
         ),
     )
-    resp = _send_control_request(ws_source.listener_port, req)
+    payload = req.SerializeToString()
+
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+    sock.connect(("::1", ws_source.listener_port))
+    sock.sendall(len(payload).to_bytes(4, "big") + payload)
+
+    resp_len = int.from_bytes(sock.recv(4), "big")
+    resp_bytes = sock.recv(resp_len)
+    resp = raiden_service_pb2.ControlResponse()
+    resp.ParseFromString(resp_bytes)
     self.assertTrue(resp.success)
+    sock.close()
 
     ws_dest.h2d()
 
@@ -367,8 +385,18 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
             is_sender=True
         ),
     )
-    resp = _send_control_request(ws_source.listener_port, req)
+    payload = req.SerializeToString()
+
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+    sock.connect(("::1", ws_source.listener_port))
+    sock.sendall(len(payload).to_bytes(4, "big") + payload)
+
+    resp_len = int.from_bytes(sock.recv(4), "big")
+    resp_bytes = sock.recv(resp_len)
+    resp = raiden_service_pb2.ControlResponse()
+    resp.ParseFromString(resp_bytes)
     self.assertTrue(resp.success)
+    sock.close()
 
     ws_dest.h2d()
 
@@ -513,8 +541,18 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
             is_sender=True
         ),
     )
-    resp = _send_control_request(ws_source.listener_port, req)
+    payload = req.SerializeToString()
+
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+    sock.connect(("::1", ws_source.listener_port))
+    sock.sendall(len(payload).to_bytes(4, "big") + payload)
+
+    resp_len = int.from_bytes(sock.recv(4), "big")
+    resp_bytes = sock.recv(resp_len)
+    resp = raiden_service_pb2.ControlResponse()
+    resp.ParseFromString(resp_bytes)
     self.assertTrue(resp.success)
+    sock.close()
 
     ws_dest.h2d()
 
@@ -548,8 +586,16 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     self.assertEqual(m0["total_h2h_bandwidth_gbps"], 0.0)
 
     def _send_ctrl_req(port: int, req: raiden_service_pb2.ControlRequest):
-      resp = _send_control_request(port, req)
+      payload = req.SerializeToString()
+      sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+      sock.connect(("::1", port))
+      sock.sendall(len(payload).to_bytes(4, "big") + payload)
+      resp_len = int.from_bytes(sock.recv(4), "big")
+      resp_bytes = sock.recv(resp_len)
+      resp = raiden_service_pb2.ControlResponse()
+      resp.ParseFromString(resp_bytes)
       self.assertTrue(resp.success, resp.message)
+      sock.close()
 
     for step in range(2):
       uuid = 70001 + step
@@ -684,8 +730,16 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
       dst_buf[:64] = 0
 
     def _send_ctrl_req(port: int, req: raiden_service_pb2.ControlRequest):
-      resp = _send_control_request(port, req)
+      payload = req.SerializeToString()
+      sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0)
+      sock.connect(("::1", port))
+      sock.sendall(len(payload).to_bytes(4, "big") + payload)
+      resp_len = int.from_bytes(sock.recv(4), "big")
+      resp_bytes = sock.recv(resp_len)
+      resp = raiden_service_pb2.ControlResponse()
+      resp.ParseFromString(resp_bytes)
       self.assertTrue(resp.success, resp.message)
+      sock.close()
 
     uuid = 80001
     dst_req = raiden_service_pb2.ControlRequest(

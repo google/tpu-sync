@@ -71,7 +71,7 @@ benchmarks {
 
   environment_configs {
     id: "tpu-v5e-single-node"
-    runner_label: "linux-x86-ct5lp-224-8tpu"
+    runner_label: "linux-x86-n2-32"
     container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers-ibverbs"
     workload_action_inputs { key: "bazel_run_flags" value: "-c opt --config=oss --config=ci" }
   }

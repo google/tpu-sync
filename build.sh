@@ -76,9 +76,13 @@ BAZEL_VERSION="$(cat .bazelversion | tr -d '[:space:]')"
 
 BAZEL_BIN="/tmp/bazel-bootstrap-${BAZEL_VERSION}"
 if [[ ! -f "${BAZEL_BIN}" ]]; then
-  echo "Bootstrapping standalone Bazel ${BAZEL_VERSION} to temporary folder ${BAZEL_BIN}..."
-  download_file "https://storage.googleapis.com/bazel/${BAZEL_VERSION}/release/bazel-${BAZEL_VERSION}-linux-x86_64" "${BAZEL_BIN}"
-  chmod +x "${BAZEL_BIN}"
+  if [[ -x "/usr/local/bin/bazel-${BAZEL_VERSION}" ]]; then
+    ln -sf "/usr/local/bin/bazel-${BAZEL_VERSION}" "${BAZEL_BIN}"
+  else
+    echo "Bootstrapping standalone Bazel ${BAZEL_VERSION} to temporary folder ${BAZEL_BIN}..."
+    download_file "https://storage.googleapis.com/bazel/${BAZEL_VERSION}/release/bazel-${BAZEL_VERSION}-linux-x86_64" "${BAZEL_BIN}"
+    chmod +x "${BAZEL_BIN}"
+  fi
 fi
 
 "${BAZEL_BIN}" --version
@@ -86,6 +90,8 @@ fi
 # Default behavior based on auto-detection
 BUILD_JAX=true
 BUILD_TORCH=true
+ONLY_EXTENSIONS=false
+SKIP_PIP=false
 
 
 # Parse command line arguments
@@ -110,11 +116,26 @@ if [ "$#" -gt 0 ]; then
       # Standard Bazel/environment flags: keep defaults and do not shift.
       ;;
     *)
-      echo "Usage: $0 [jax|torch|both] [bazel_flags...]"
+      echo "Usage: $0 [jax|torch|both] [--only-extensions] [--skip-pip] [bazel_flags...]"
       exit 1
       ;;
   esac
 fi
+
+BAZEL_EXTRA_ARGS=()
+for arg in "$@"; do
+  case "${arg}" in
+    --only-extensions)
+      ONLY_EXTENSIONS=true
+      ;;
+    --skip-pip)
+      SKIP_PIP=true
+      ;;
+    *)
+      BAZEL_EXTRA_ARGS+=("${arg}")
+      ;;
+  esac
+done
 
 if [ "${BUILD_TORCH}" = true ]; then
   # Ensure clang-18 is installed on the host (required for PyTorch C++ extensions)
@@ -144,11 +165,15 @@ BAZEL_TARGETS=(
   "//tpu_sync/proto:control_pipe_py_pb2_grpc"
   "//tpu_sync/rpc:coordination_py_pb2_grpc"
   "//tpu_sync/rpc:controller_service_py_pb2"
-  # C++ control-plane service binaries. These do not depend on JAX or Torch,
-  # so they are always built.
-  "//tpu_sync/kv_cache/global_registry:global_registry_server"
-  "//tpu_sync/store_node:kv_cache_host_store_node_main"
 )
+if [ "${ONLY_EXTENSIONS}" = false ]; then
+  # C++ control-plane service binaries. These do not depend on JAX or Torch,
+  # so they are built unless --only-extensions is requested.
+  BAZEL_TARGETS+=(
+    "//tpu_sync/kv_cache/global_registry:global_registry_server"
+    "//tpu_sync/store_node:kv_cache_host_store_node_main"
+  )
+fi
 DEFINE_FLAGS=" --define raiden_wheel_build=true"
 BAZEL_MODULE_FLAGS=()
 TORCH_REPO_ENV_FLAGS=()
@@ -383,7 +408,7 @@ printf 'module override: %s\n' "${BAZEL_MODULE_FLAGS[@]#--override_module=}"
   ${DEFINE_FLAGS} \
   --disk_cache=${BAZEL_DISK_CACHE} \
   --repository_cache=${BAZEL_REPO_CACHE} \
-  "$@"
+  "${BAZEL_EXTRA_ARGS[@]}"
 
 
 echo "=== Copying generated protobuf Python modules ==="
@@ -394,21 +419,23 @@ cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/rpc/controller_service_pb2.py" "${WOR
 cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/proto/control_pipe_pb2.py" "${WORKSPACE_DIR}/tpu_sync/proto/" 2>/dev/null || true
 cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/proto/control_pipe_pb2_grpc.py" "${WORKSPACE_DIR}/tpu_sync/proto/" 2>/dev/null || true
 
-echo "=== Linking C++ control-plane service binaries into source tree ==="
-# The KVCacheStore tests (kv_cache_store_test.py / kv_cache_store_e2e_test.py)
-# launch these binaries from their SOURCE-tree path, but Bazel emits them under
-# bazel-bin/. Symlink them so a fresh checkout can run the tests without extra
-# steps.
-link_service_binary() {
-  local rel="$1"
-  local src="${WORKSPACE_DIR}/bazel-bin/${rel}"
-  local dst="${WORKSPACE_DIR}/${rel}"
-  if [ -e "${src}" ]; then
-    ln -sf "${src}" "${dst}"
-  fi
-}
-link_service_binary "tpu_sync/kv_cache/global_registry/global_registry_server"
-link_service_binary "tpu_sync/store_node/kv_cache_host_store_node_main"
+if [ "${ONLY_EXTENSIONS}" = false ]; then
+  echo "=== Linking C++ control-plane service binaries into source tree ==="
+  # The KVCacheStore tests (kv_cache_store_test.py / kv_cache_store_e2e_test.py)
+  # launch these binaries from their SOURCE-tree path, but Bazel emits them under
+  # bazel-bin/. Symlink them so a fresh checkout can run the tests without extra
+  # steps.
+  link_service_binary() {
+    local rel="$1"
+    local src="${WORKSPACE_DIR}/bazel-bin/${rel}"
+    local dst="${WORKSPACE_DIR}/${rel}"
+    if [ -e "${src}" ]; then
+      ln -sf "${src}" "${dst}"
+    fi
+  }
+  link_service_binary "tpu_sync/kv_cache/global_registry/global_registry_server"
+  link_service_binary "tpu_sync/store_node/kv_cache_host_store_node_main"
+fi
 
 echo "=== Copying compiled shared libraries to source directory ==="
 if [ "$BUILD_JAX" = true ]; then
@@ -457,28 +484,32 @@ if [ "$BUILD_TORCH" = true ]; then
   echo "Torch Artifacts are located in: ${WORKSPACE_DIR}/tpu_sync/frameworks/torch/"
 fi
 
-echo "=== Install Python Dependencies! ==="
-echo "Using Python interpreter: $(which python3) ($(python3 --version))"
-REQUIREMENTS_FILE="${WORKSPACE_DIR}/requirements.txt"
-if [ "$BUILD_JAX" = true ]; then
-  # The built version's requirements, not the top-level file as written. A
-  # 0.10.x build that installed the default version's jax would leave a .so
-  # compiled against one jaxlib's headers and loaded against another's ABI.
-  # That does not fail; it corrupts. The version supplies only the three specs
-  # that move with jax. Everything else comes from the top-level file, so a
-  # dependency added there reaches every version.
-  #
-  # For the default version this renders the top-level file unchanged, which
-  # check_jax_deps.sh is what guarantees. A torch-only build installs that file
-  # directly, exactly as it did before versions were selectable.
-  RENDERED_REQUIREMENTS="$(mktemp "${TMPDIR:-/tmp}/raiden_requirements.XXXXXX")"
-  trap 'rm -f "${RENDERED_REQUIREMENTS}"' EXIT
-  raiden_jax_render_requirements "${WORKSPACE_DIR}" "${RAIDEN_JAX_VERSION}" \
-    "${RENDERED_REQUIREMENTS}"
-  REQUIREMENTS_FILE="${RENDERED_REQUIREMENTS}"
-  echo "Installing requirements for JAX ${RAIDEN_JAX_VERSION}:"
-  grep -E '^(jax|jaxlib|libtpu)==' "${REQUIREMENTS_FILE}" | sed 's/^/  /'
-fi
-python3 -m pip install --index-url=https://pypi.org/simple -r "${REQUIREMENTS_FILE}" || echo "Warning: pip installation returned a non-zero status. Proceeding anyway."
+if [ "${SKIP_PIP}" = true ]; then
+  echo "=== Skipping Python dependency installation (--skip-pip) ==="
+else
+  echo "=== Install Python Dependencies! ==="
+  echo "Using Python interpreter: $(which python3) ($(python3 --version))"
+  REQUIREMENTS_FILE="${WORKSPACE_DIR}/requirements.txt"
+  if [ "$BUILD_JAX" = true ]; then
+    # The built version's requirements, not the top-level file as written. A
+    # 0.10.x build that installed the default version's jax would leave a .so
+    # compiled against one jaxlib's headers and loaded against another's ABI.
+    # That does not fail; it corrupts. The version supplies only the three specs
+    # that move with jax. Everything else comes from the top-level file, so a
+    # dependency added there reaches every version.
+    #
+    # For the default version this renders the top-level file unchanged, which
+    # check_jax_deps.sh is what guarantees. A torch-only build installs that file
+    # directly, exactly as it did before versions were selectable.
+    RENDERED_REQUIREMENTS="$(mktemp "${TMPDIR:-/tmp}/raiden_requirements.XXXXXX")"
+    trap 'rm -f "${RENDERED_REQUIREMENTS}"' EXIT
+    raiden_jax_render_requirements "${WORKSPACE_DIR}" "${RAIDEN_JAX_VERSION}" \
+      "${RENDERED_REQUIREMENTS}"
+    REQUIREMENTS_FILE="${RENDERED_REQUIREMENTS}"
+    echo "Installing requirements for JAX ${RAIDEN_JAX_VERSION}:"
+    grep -E '^(jax|jaxlib|libtpu)==' "${REQUIREMENTS_FILE}" | sed 's/^/  /'
+  fi
+  python3 -m pip install --index-url=https://pypi.org/simple -r "${REQUIREMENTS_FILE}" || echo "Warning: pip installation returned a non-zero status. Proceeding anyway."
 
-echo "=== Installation Complete! ==="
+  echo "=== Installation Complete! ==="
+fi

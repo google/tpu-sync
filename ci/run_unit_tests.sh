@@ -28,14 +28,14 @@
 # Execution phases (when invoked without explicit target arguments):
 #   Phase 1: Every cc_test and py_test under the package patterns in
 #            RAIDEN_TEST_SCOPE that carries none of the exclusion tags (no_oss,
-#            notap, manual, or any requires-<resource> tag).
-#   Phase 2: E2E JAX validation build via `./build.sh jax`, compiling
-#            _tpu_raiden_jax.so, C++ control-plane service binaries, and
-#            Python protobuf modules, reusing the warm Bazel server and
-#            Skyframe analysis cache from Phase 1.
+#            notap, manual, or any requires-<resource> tag), plus the E2E JAX
+#            build targets (_tpu_raiden_jax.so, _weight_synchronizer_ffi.so,
+#            C++ control-plane service binaries, and Python protobuf modules)
+#            in a single Bazel invocation.
+#   Phase 2: Materialize and verify the built E2E JAX and control-plane
+#            artifacts in the source tree.
 #   Phase 3: Python 3.12 dynamic module binding linkage check (`import
-#            kv_cache_manager` with JAX mocked on CPU) and pure-Python CPU
-#            unit tests (`nd_slice_math_test.py`).
+#            kv_cache_manager` with JAX mocked on CPU).
 #
 # Naming targets as arguments (e.g. `ci/run_unit_tests.sh //tpu_sync/core:foo_test`)
 # overrides the query and skips Phases 2 & 3 unless RAIDEN_RUN_E2E_BUILD=true.
@@ -62,41 +62,49 @@ export HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION:-3.12}"
 RAIDEN_TEST_SCOPE="${RAIDEN_TEST_SCOPE:-//tpu_sync/core:all //tpu_sync/kv_cache:all //tpu_sync/weight_sync:all //tpu_sync/rpc:all}"
 mkdir -p "${BAZEL_CACHE_DIR}/disk_cache" "${BAZEL_CACHE_DIR}/repo_cache" "$(dirname "${BAZEL_OUTPUT_BASE}")"
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq wget gnupg ca-certificates >/dev/null
-# Add the LLVM jammy-18 apt repo manually (the container's add-apt-repository is
-# broken: python apt_pkg is missing for python3.12) unless the image already
-# carries it: apt refuses to read its sources when the same suite is listed
-# twice under different keyrings.
-if ! grep -rqs 'apt.llvm.org/jammy/ llvm-toolchain-jammy-18' /etc/apt/sources.list /etc/apt/sources.list.d/; then
-  wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
-  echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" \
-    > /etc/apt/sources.list.d/llvm18.list
+if ! command -v clang-18 >/dev/null || ! command -v clang++-18 >/dev/null || \
+   ! dpkg -s libstdc++-12-dev libibverbs-dev >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq wget gnupg ca-certificates >/dev/null
+  # Add the LLVM jammy-18 apt repo manually (the container's add-apt-repository is
+  # broken: python apt_pkg is missing for python3.12) unless the image already
+  # carries it: apt refuses to read its sources when the same suite is listed
+  # twice under different keyrings.
+  if ! grep -rqs 'apt.llvm.org/jammy/ llvm-toolchain-jammy-18' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+    wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+    echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" \
+      > /etc/apt/sources.list.d/llvm18.list
+  fi
+  apt-get update -qq
+  # clang ships no standard library of its own: it compiles against the newest
+  # GCC installation present. The container carries only libstdc++ 11, which
+  # predates parts of the C++20 library this code uses, so 12 is installed
+  # alongside it and clang selects it automatically.
+  apt-get install -y -qq clang-18 libstdc++-12-dev >/dev/null
+  # Required by the peregrine module.
+  apt-get install -y -qq libibverbs-dev >/dev/null
 fi
-apt-get update -qq
-# clang ships no standard library of its own: it compiles against the newest
-# GCC installation present. The container carries only libstdc++ 11, which
-# predates parts of the C++20 library this code uses, so 12 is installed
-# alongside it and clang selects it automatically.
-apt-get install -y -qq clang-18 libstdc++-12-dev >/dev/null
-# Required by the peregrine module.
-apt-get install -y -qq libibverbs-dev >/dev/null
 ln -sf /usr/bin/clang-18 /usr/bin/clang
 ln -sf /usr/bin/clang++-18 /usr/bin/clang++
 export CC=clang-18
 export CXX=clang++-18
 clang --version | head -1
 
+# Prefer pre-installed standalone Bazel when available in the container image.
 BAZEL_VERSION="$(tr -d '\r\n ' < .bazelversion)"
 # Use the exact same binary path and startup options as build.sh so both
 # scripts share the downloaded binary and connect to the same running Bazel
 # server without triggering a JVM server restart.
 BAZEL_BIN="/tmp/bazel-bootstrap-${BAZEL_VERSION}"
 if [[ ! -x "${BAZEL_BIN}" ]]; then
-  wget -qO "${BAZEL_BIN}" \
-    "https://storage.googleapis.com/bazel/${BAZEL_VERSION}/release/bazel-${BAZEL_VERSION}-linux-x86_64"
-  chmod +x "${BAZEL_BIN}"
+  if [[ -x "/usr/local/bin/bazel-${BAZEL_VERSION}" ]]; then
+    ln -sf "/usr/local/bin/bazel-${BAZEL_VERSION}" "${BAZEL_BIN}"
+  else
+    wget -qO "${BAZEL_BIN}" \
+      "https://storage.googleapis.com/bazel/${BAZEL_VERSION}/release/bazel-${BAZEL_VERSION}-linux-x86_64"
+    chmod +x "${BAZEL_BIN}"
+  fi
 fi
 "${BAZEL_BIN}" --version
 
@@ -167,8 +175,27 @@ for target in "${TARGETS[@]}"; do
   fi
 done
 
-echo "=== Phase 1: Running Bazel CPU Unit Test Suite (${#TARGETS[@]} targets) ==="
-printf '  %s\n' "${TARGETS[@]}"
+E2E_BUILD_TARGETS=()
+if [[ "${RAIDEN_RUN_E2E_BUILD}" == "true" ]]; then
+  echo "=== Checking JAX deps ==="
+  "${REPO_ROOT}/tools/jax/check_jax_deps.sh"
+  E2E_BUILD_TARGETS=(
+    "//tpu_sync/rpc:raiden_service_py_pb2"
+    "//tpu_sync/rpc:coordination_py_pb2"
+    "//tpu_sync/proto:control_pipe_py_pb2"
+    "//tpu_sync/proto:control_pipe_py_pb2_grpc"
+    "//tpu_sync/rpc:coordination_py_pb2_grpc"
+    "//tpu_sync/rpc:controller_service_py_pb2"
+    "//tpu_sync/kv_cache/global_registry:global_registry_server"
+    "//tpu_sync/store_node:kv_cache_host_store_node_main"
+    "//tpu_sync/frameworks/jax:_tpu_raiden_jax"
+    "//tpu_sync/frameworks/jax:_weight_synchronizer_ffi"
+  )
+  EXTRA_BAZEL_FLAGS+=" --remote_download_outputs=toplevel"
+fi
+
+echo "=== Phase 1: Running Bazel CPU Unit Test Suite (${#TARGETS[@]} test targets + ${#E2E_BUILD_TARGETS[@]} E2E build targets) ==="
+printf '  %s\n' "${TARGETS[@]}" "${E2E_BUILD_TARGETS[@]}"
 
 # --keep_going: report every target that fails to build or test, rather than
 # stopping at the first one.
@@ -179,7 +206,8 @@ if ! "${BAZEL_BIN}" "${BAZEL_STARTUP_FLAGS[@]}" test -c opt \
   --test_output=errors \
   --test_summary=detailed \
   ${EXTRA_BAZEL_FLAGS} \
-  "${TARGETS[@]}"; then
+  "${TARGETS[@]}" \
+  "${E2E_BUILD_TARGETS[@]}"; then
   echo "=== Bazel CPU Unit Test Suite Failed: Extracting Test Logs ==="
   for xml_file in $(find -L "${REPO_ROOT}/bazel-testlogs" -name "test.xml" 2>/dev/null); do
     if grep -qE '<(failure|error)' "${xml_file}"; then
@@ -202,8 +230,24 @@ if ! "${BAZEL_BIN}" "${BAZEL_STARTUP_FLAGS[@]}" test -c opt \
 fi
 
 if [[ "${RAIDEN_RUN_E2E_BUILD}" == "true" ]]; then
-  echo "=== Phase 2: E2E JAX Validation Build (./build.sh jax) ==="
-  ./build.sh jax --config=oss --remote_download_outputs=toplevel ${EXTRA_BAZEL_FLAGS}
+  echo "=== Phase 2: Staging and Verifying E2E JAX Build Artifacts ==="
+  cp -f "${REPO_ROOT}/bazel-bin/tpu_sync/rpc/raiden_service_pb2.py" "${REPO_ROOT}/tpu_sync/rpc/" 2>/dev/null || true
+  cp -f "${REPO_ROOT}/bazel-bin/tpu_sync/rpc/coordination_pb2.py" "${REPO_ROOT}/tpu_sync/rpc/" 2>/dev/null || true
+  cp -f "${REPO_ROOT}/bazel-bin/tpu_sync/rpc/coordination_pb2_grpc.py" "${REPO_ROOT}/tpu_sync/rpc/" 2>/dev/null || true
+  cp -f "${REPO_ROOT}/bazel-bin/tpu_sync/rpc/controller_service_pb2.py" "${REPO_ROOT}/tpu_sync/rpc/" 2>/dev/null || true
+  cp -f "${REPO_ROOT}/bazel-bin/tpu_sync/proto/control_pipe_pb2.py" "${REPO_ROOT}/tpu_sync/proto/" 2>/dev/null || true
+  cp -f "${REPO_ROOT}/bazel-bin/tpu_sync/proto/control_pipe_pb2_grpc.py" "${REPO_ROOT}/tpu_sync/proto/" 2>/dev/null || true
+
+  for rel in \
+    "tpu_sync/kv_cache/global_registry/global_registry_server" \
+    "tpu_sync/store_node/kv_cache_host_store_node_main"; do
+    if [[ -e "${REPO_ROOT}/bazel-bin/${rel}" ]]; then
+      ln -sf "${REPO_ROOT}/bazel-bin/${rel}" "${REPO_ROOT}/${rel}"
+    fi
+  done
+
+  cp -f "${REPO_ROOT}/bazel-bin/tpu_sync/frameworks/jax/_tpu_raiden_jax.so" "${REPO_ROOT}/tpu_sync/frameworks/jax/"
+  cp -f "${REPO_ROOT}/bazel-bin/tpu_sync/frameworks/jax/_weight_synchronizer_ffi.so" "${REPO_ROOT}/tpu_sync/frameworks/jax/"
 
   echo "=== Verifying E2E Build Artifacts ==="
   EXPECTED_ARTIFACTS=(

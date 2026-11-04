@@ -12,7 +12,7 @@ benchmarks {
   environment_configs {
     id: "tpu-v5e-single-node"
     runner_label: "linux-x86-ct5lp-224-8tpu"
-    container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers-ibverbs"
+    container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers-ibverbs-bazel"
     workload_action_inputs { key: "bazel_run_flags" value: "-c opt --config=oss --config=ci" }
   }
 
@@ -49,7 +49,7 @@ benchmarks {
   environment_configs {
     id: "tpu-v5e-single-node"
     runner_label: "linux-x86-ct5lp-224-8tpu"
-    container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers-ibverbs"
+    container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers-ibverbs-bazel"
   }
 
   metrics { name: "torch_int32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
@@ -71,8 +71,8 @@ benchmarks {
 
   environment_configs {
     id: "tpu-v5e-single-node"
-    runner_label: "linux-x86-ct5lp-224-8tpu"
-    container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers-ibverbs"
+    runner_label: "linux-x86-n2-32"
+    container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers-ibverbs-bazel"
     workload_action_inputs { key: "bazel_run_flags" value: "-c opt --config=oss --config=ci" }
   }
 

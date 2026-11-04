@@ -128,7 +128,7 @@ the key exchange before establishing encrypted data streams.
    `(client_spi, client_key)`.
 5. On Node B, `PeregrineControlServiceImpl` delegates to
    `RawBufferTransport::RegisterPspPeer`, calling
-   `RegisterPspPeerKey(server_fd, client_spi, client_key)`.
+   `RegisterPeerPspToken(server_fd, client_spi, client_key)`.
 6. `AddSecureListener` registers the client key on `server_fd` and returns
    allocated `(server_spi, server_key)` in the gRPC response.
 7. Node A applies `SetTxSpiAndKey(sock_fd, server_tx_key)` to configure

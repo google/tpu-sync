@@ -15,6 +15,8 @@
 #ifndef TPU_SYNC_TRANSPORT_LIB_PSP_PEREGRINE_CONTROL_SERVICE_H_
 #define TPU_SYNC_TRANSPORT_LIB_PSP_PEREGRINE_CONTROL_SERVICE_H_
 
+#include <string_view>
+
 #include "absl/status/statusor.h"
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
@@ -76,9 +78,10 @@ class PeregrineControlServiceImpl final
     }
 
     auto* resp_psp = response->mutable_psp_tcp_resp()->mutable_psp();
-    resp_psp->set_spi(server_rx_key->spi);
-    resp_psp->set_gen(server_rx_key->gen);
-    resp_psp->set_key(server_rx_key->key);
+    resp_psp->set_spi(server_rx_key->spi.value());
+    resp_psp->set_gen(server_rx_key->gen.value());
+    const char* data = reinterpret_cast<const char*>(server_rx_key->key.data());
+    resp_psp->set_key(std::string_view(data, server_rx_key->key.size()));
     return grpc::Status::OK;
   }
 

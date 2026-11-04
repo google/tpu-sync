@@ -39,6 +39,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@peregrine//peregrine/src/api/v1:psp",
     ] + _PSP_DEPS,
 )
 
@@ -59,6 +60,7 @@ cc_test(
         "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
+        "@peregrine//peregrine/src/api/v1:psp",
         "@peregrine//peregrine/src/internal/control:message_cc_proto",
         "@peregrine//peregrine/src/internal/control:message_internal_cc_proto",
         "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",

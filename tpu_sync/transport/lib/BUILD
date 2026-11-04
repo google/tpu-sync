@@ -298,6 +298,7 @@ cc_library(
         "@peregrine//peregrine/src/api/v1:conn_pool",
         "@peregrine//peregrine/src/api/v1:histogram",
         "@peregrine//peregrine/src/api/v1:ip_util",
+        "@peregrine//peregrine/src/api/v1:psp",
         "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@peregrine//peregrine/src/api/v1:socket_util",
     ],

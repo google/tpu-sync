@@ -25,6 +25,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "grpcpp/channel.h"
+#include "peregrine/src/api/v1/psp/psp.h"
 
 ABSL_FLAG(bool, require_psp_tcp, false,
           "Whether to require PSP-TCP encryption for TCP transport connections."
@@ -36,13 +37,13 @@ namespace tpu_raiden::transport::lib {
 
 bool IsPspSupported() { return false; }
 
-absl::StatusOr<PspPeerKey> RegisterPspPeerKey(
+bool IsPspEnabled(int client_fd) { return false; }
+
+absl::StatusOr<::peregrine::v1::PspToken> RegisterPeerPspToken(
     int server_fd, uint32_t client_spi, absl::string_view client_key,
     absl::string_view peer_target) {
   return absl::UnimplementedError("PSP-TCP is unimplemented.");
 }
-
-bool PspEnabled(int client_fd) { return false; }
 
 absl::Status TcpPspConnect(
     int sock_fd, const struct sockaddr* addr, socklen_t addrlen,

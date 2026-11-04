@@ -19,13 +19,13 @@
 
 #include <cstdint>
 #include <memory>
-#include <string>
 
 #include "absl/flags/declare.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "grpcpp/channel.h"
+#include "peregrine/src/api/v1/psp/psp.h"
 
 ABSL_DECLARE_FLAG(bool, require_psp_tcp);
 
@@ -35,26 +35,18 @@ namespace internal {
 void SetPspTcpSyscallsForTesting(void* psp_sys);
 }  // namespace internal
 
-// Structure representing an exchanged PSP key.
-struct PspPeerKey {
-  uint32_t spi = 0;
-  uint32_t gen = 0;
-  std::string key;
-};
-
 // Returns true if PSP-TCP is supported.
 bool IsPspSupported();
 
-// Registers a client's PSP key on server_fd and returns the allocated server
-// RX key.
-absl::StatusOr<PspPeerKey> RegisterPspPeerKey(int server_fd,
-                                              uint32_t client_spi,
-                                              absl::string_view client_key,
-                                              absl::string_view peer_target);
-
 // Returns true if the accepted socket has valid PSP encryption active
 // according to GetInitialRxSpi().
-bool PspEnabled(int client_fd);
+bool IsPspEnabled(int client_fd);
+
+// Registers a client's PSP key on server_fd and returns the allocated server
+// RX key.
+absl::StatusOr<::peregrine::v1::PspToken> RegisterPeerPspToken(
+    int server_fd, uint32_t client_spi, absl::string_view client_key,
+    absl::string_view peer_target);
 
 // Performs out-of-band PSP key exchange on sock_fd using the provided gRPC
 // channel and connects to addr.

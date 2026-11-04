@@ -64,6 +64,7 @@
 #include "peregrine/src/api/v1/conn_pool.h"
 #include "peregrine/src/api/v1/histogram.h"
 #include "peregrine/src/api/v1/ip_util.h"
+#include "peregrine/src/api/v1/psp/psp.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -84,6 +85,7 @@ namespace tpu_raiden::transport::lib {
 using ::peregrine::v1::GetAddrPortPair;
 using ::peregrine::v1::Histogram;
 using ::peregrine::v1::IsEnvVarEnabled;
+using ::peregrine::v1::PspToken;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::ReadVExact;
 using ::peregrine::v1::SourceIpRoutesToPeer;
@@ -756,7 +758,7 @@ void RawBufferTransport::ConnectionWorker(int client_fd) {
   close(client_fd);
 }
 
-absl::StatusOr<PspPeerKey> RawBufferTransport::RegisterPspPeer(
+absl::StatusOr<PspToken> RawBufferTransport::RegisterPspPeer(
     uint32_t client_spi, absl::string_view client_key,
     absl::string_view peer_target) {
   if (!require_psp_tcp_) {
@@ -769,7 +771,7 @@ absl::StatusOr<PspPeerKey> RawBufferTransport::RegisterPspPeer(
         "Transport is stopping or listening socket is not initialized.");
   }
 
-  return RegisterPspPeerKey(server_fd_, client_spi, client_key, peer_target);
+  return RegisterPeerPspToken(server_fd_, client_spi, client_key, peer_target);
 }
 
 void RawBufferTransport::ListenerLoop() {
@@ -807,7 +809,7 @@ void RawBufferTransport::ListenerLoop() {
         }
         break;
       }
-      if (require_psp_tcp_ && !PspEnabled(client_fd)) {
+      if (require_psp_tcp_ && !IsPspEnabled(client_fd)) {
         close(client_fd);
         LOG_EVERY_N_SEC(ERROR, 1)
             << "Unencrypted TCP connection rejected on PSP listener";

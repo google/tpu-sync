@@ -38,13 +38,13 @@
 #include "absl/types/span.h"
 #include "grpcpp/channel.h"
 #include "peregrine/src/api/v1/conn_pool.h"
+#include "peregrine/src/api/v1/psp/psp.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "tpu_sync/common/detached_thread_group.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
-#include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 
 namespace tpu_raiden::transport::lib {
@@ -178,9 +178,9 @@ class RawBufferTransport final {
 
   // Registers incoming client PSP key and returns server's allocated RX key.
   // Triggered by ProcessUnary() in PeregrineControlServiceImpl.
-  absl::StatusOr<PspPeerKey> RegisterPspPeer(uint32_t client_spi,
-                                             absl::string_view client_key,
-                                             absl::string_view peer_target);
+  absl::StatusOr<::peregrine::v1::PspToken> RegisterPspPeer(
+      uint32_t client_spi, absl::string_view client_key,
+      absl::string_view peer_target);
 
   void SetTestOnlyRateLimiters(
       std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> egress,

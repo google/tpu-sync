@@ -92,23 +92,37 @@ using CompletionCallback =
 // Sentinel `local_id` when no specific layer/block-array index is specified.
 inline constexpr uint32_t kUnspecifiedLocalId = 0xFFFF'FFFF;
 
+// Metadata wire versions.
+inline constexpr uint8_t kMetadataVersionV1 = 1;
+
+// Default metadata wire version. Bump only after all receivers can decode the
+// new version; decoders keep supporting old ones.
+inline constexpr uint8_t kMetadataVersion = kMetadataVersionV1;
+
 // Application metadata attached to one Post. Identical across the Post's
 // requests.
+// LINT.IfChange(post_metadata)
 struct PostMetadata {
   uint64_t uuid;
   uint32_t remote_id;
   uint32_t local_id;
   uint16_t shard_mask = 0;
+  TransferOp op;
+  // Metadata wire version; also governs the request layout.
+  uint8_t version = kMetadataVersion;
 };
+// LINT.ThenChange(../metadata.fbs:post_metadata)
 
 // Application metadata attached to one request of a Post.
+// LINT.IfChange(request_metadata)
 struct RequestMetadata {
   uint32_t shard = 0;
-  int32_t block_id = -1;
-  int32_t src_block_id = -1;
+  int32_t block_id = -1;      // -1 = unset
+  int32_t src_block_id = -1;  // -1 = no source block
   uint16_t chunk_idx = 0;
   uint32_t len = 0;
 };
+// LINT.ThenChange(../metadata.fbs:request_metadata)
 
 // Abstract transport adapter interface for Post and Poll operations.
 class TransportAdapter {

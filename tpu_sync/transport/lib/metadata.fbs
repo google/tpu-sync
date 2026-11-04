@@ -1,0 +1,42 @@
+namespace tpu_raiden.transport.lib.flatbuf;
+
+// Wire layout of the 32-byte Post and request metadata. To change a
+// layout, add a new versioned struct. `version` stays at byte 0 in every Post
+// version and also governs the request layout. Reserved fields must be zero.
+
+// LINT.IfChange(post_metadata)
+struct PostMetadataV1 {
+  version:uint8;
+  reserved0:uint8;  // reserved0..2 keep `uuid` 8-byte aligned
+  reserved1:uint16;
+  reserved2:uint32;
+  uuid:uint64;
+  remote_id:uint32;
+  local_id:uint32;
+  shard_mask:uint16;
+  op:uint8;  // TransferOp
+  reserved3:uint8;
+  reserved4:uint32;
+}
+
+// LINT.ThenChange(
+//     metadata.cc:post_metadata_v1,
+//     adapter/transport_adapter.h:post_metadata,
+// )
+
+// LINT.IfChange(request_metadata)
+struct RequestMetadataV1 {
+  shard:uint32;
+  block_id:int32;
+  src_block_id:int32;
+  chunk_idx:uint16;
+  reserved0:uint16;  // keeps `len` 4-byte aligned
+  len:uint32;
+  reserved1:uint32;
+  reserved2:uint64;
+}
+
+// LINT.ThenChange(
+//     metadata.cc:request_metadata_v1,
+//     adapter/transport_adapter.h:request_metadata,
+// )

@@ -47,6 +47,41 @@ cc_library(
     ],
 )
 
+flatbuffer_cc_library(
+    name = "metadata_cc_fbs",
+    srcs = ["metadata.fbs"],
+)
+
+cc_library(
+    name = "metadata",
+    srcs = ["metadata.cc"],
+    hdrs = ["metadata.h"],
+    deps = [
+        ":metadata_cc_fbs",
+        ":transport_adapter",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@peregrine//peregrine/src/api:transport_types",
+    ],
+)
+
+cc_test(
+    name = "metadata_test",
+    srcs = ["metadata_test.cc"],
+    deps = [
+        ":metadata",
+        ":transport_adapter",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "chunk_serializer_test",
     srcs = ["chunk_serializer_test.cc"],

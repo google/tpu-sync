@@ -113,12 +113,12 @@ compiled against the installed torch and torch_tpu wheels, which
 `build.sh torch` sets up, so `ci/run_in_tpu_env.py` builds it first and then
 runs the gate outside Bazel.
 
-In CI, each framework is its own workload in `benchmark_registry.pbtxt`,
-`h2d_d2h_gating_jax` (JAX) and `h2d_d2h_gating_torch` (PyTorch). Both run on
-pull requests, after merge and nightly, on the assigned Cloud TPU runner, and
-both are required checks with enforced floors. Re-record a framework's
-baselines with the Record H2D/D2H Baselines workflow (`h2d_d2h_record_jax` and
-`h2d_d2h_record_torch`), which runs `--record` on that runner.
+In CI, both frameworks run sequentially in a single workload in
+`benchmark_registry.pbtxt`, `h2d_d2h_gating` (`--framework=all`). This runs on
+pull requests, after merge and nightly, on the assigned Cloud TPU runner, with
+enforced floors. Re-record a framework's baselines with the Record H2D/D2H
+Baselines workflow (`h2d_d2h_record_jax` and `h2d_d2h_record_torch`), which runs
+`--record` on that runner.
 
 ## Scope
 

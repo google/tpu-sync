@@ -1,19 +1,24 @@
 benchmarks {
-  name: "h2d_d2h_gating_jax"
-  description: "JAX perf gate: stable configs, fail if median Gbps drops below the statistical floor in h2d_d2h_gating_jax_baselines.json"
+  name: "h2d_d2h_gating"
+  description: "Combined JAX and PyTorch H2D/D2H perf+integrity gate: runs both frameworks sequentially on a single TPU host (--framework=all) and fails if median Gbps drops below the statistical floors in h2d_d2h_gating_{jax,torch}_baselines.json"
   owner: "raiden-dev"
 
+  # Runs both frameworks in one TPU job through ci/run_in_tpu_env.py: the
+  # JAX leg runs first via `bazel run` in a child process (releasing /dev/vfio/*
+  # on exit), and then the PyTorch leg builds the torch extension with build.sh
+  # against the installed torch and torch_tpu wheels and runs in-process.
   workload {
-    action: "./ml_actions/actions/workload_executors/bazel"
-    action_inputs { key: "target" value: "//tpu_sync/benchmarks:h2d_d2h_benchmark_gating" }
-    action_inputs { key: "runtime_flags" value: "--framework=jax" }
+    action: "./ml_actions/actions/workload_executors/python"
+    action_inputs { key: "python_version" value: "3.12" }
+    action_inputs { key: "script_path" value: "ci/run_in_tpu_env.py" }
+    action_inputs { key: "project_path" value: "ci" }
+    action_inputs { key: "runtime_flags" value: "tpu_sync/benchmarks/h2d_d2h_benchmark_gating.py --framework=all" }
   }
 
   environment_configs {
     id: "tpu-v5e-single-node"
     runner_label: "linux-x86-ct5lp-224-8tpu"
     container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers-ibverbs"
-    workload_action_inputs { key: "bazel_run_flags" value: "-c opt --config=oss --config=ci" }
   }
 
   metrics { name: "jax_int32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
@@ -21,36 +26,11 @@ benchmarks {
   metrics { name: "jax_float32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
   metrics { name: "jax_float32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
 
-  # Legacy un-prefixed aliases for MLCompass monitoring (go/tpu-sync-oss-mlcompass)
+  # Legacy un-prefixed metric aliases for backward compatibility with monitoring dashboards.
   metrics { name: "int32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
   metrics { name: "int32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
   metrics { name: "float32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
   metrics { name: "float32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
-}
-
-benchmarks {
-  name: "h2d_d2h_gating_torch"
-  description: "PyTorch perf gate: the h2d_d2h_gating_jax configs on the torch path, fail if median Gbps drops below the statistical floor in h2d_d2h_gating_torch_baselines.json"
-  owner: "raiden-dev"
-
-  # The same gate as h2d_d2h_gating_jax, run through ci/run_in_tpu_env.py
-  # rather than bazel: the torch extension has to be built with build.sh against
-  # the installed torch and torch_tpu wheels, which that script does first.
-  # python_version is the Python build.sh compiles the extension for.
-  # project_path has no dependency files, so BAP installs nothing itself.
-  workload {
-    action: "./ml_actions/actions/workload_executors/python"
-    action_inputs { key: "python_version" value: "3.12" }
-    action_inputs { key: "script_path" value: "ci/run_in_tpu_env.py" }
-    action_inputs { key: "project_path" value: "ci" }
-    action_inputs { key: "runtime_flags" value: "tpu_sync/benchmarks/h2d_d2h_benchmark_gating.py --framework=torch" }
-  }
-
-  environment_configs {
-    id: "tpu-v5e-single-node"
-    runner_label: "linux-x86-ct5lp-224-8tpu"
-    container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers-ibverbs"
-  }
 
   metrics { name: "torch_int32_L1_8x128x1024x128/d2h_gbps" unit: "Gbps" stats { stat: MEAN } }
   metrics { name: "torch_int32_L1_8x128x1024x128/h2d_gbps" unit: "Gbps" stats { stat: MEAN } }
@@ -70,7 +50,7 @@ benchmarks {
   }
 
   environment_configs {
-    id: "tpu-v5e-single-node"
+    id: "cpu-n2-32"
     runner_label: "linux-x86-n2-32"
     container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers-ibverbs"
     workload_action_inputs { key: "bazel_run_flags" value: "-c opt --config=oss --config=ci" }

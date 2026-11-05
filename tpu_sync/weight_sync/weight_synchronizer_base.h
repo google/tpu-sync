@@ -236,6 +236,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   const uint8_t* GetHostPointer(size_t layer_idx,
                                 size_t shard_idx) const override;
   size_t GetHostSize(size_t layer_idx, size_t shard_idx) const override;
+  int GetHostFd(size_t layer_idx, size_t shard_idx) const override;
+  int64_t GetHostFdOffset(size_t layer_idx, size_t shard_idx) const override;
 
   // Returns the tiling scratchpad of `shard_idx`, shared by all layers. The
   // pointer may be reallocated by a later H2D/D2H that needs more space.
@@ -820,6 +822,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       ABSL_GUARDED_BY(block_push_shards_mu_);
 
   std::optional<size_t> pipeline_group_size_override_;
+  size_t ResolveLocalShardIndex(size_t layer_idx, size_t shard_idx) const;
   void UpdateAllocatedOccupancyMetric(size_t delta = 0);
   std::atomic<size_t> allocated_host_dram_bytes_{0};
 };

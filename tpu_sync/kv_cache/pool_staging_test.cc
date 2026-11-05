@@ -679,6 +679,38 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
   manager.ReleasePoolStagingLeases(42);
 }
 
+// With bounded host layers a pool's bytes sit in whichever host buffer its
+// transfer leased, so the manager exposes no flat per-pool host span and the
+// transport's ValidateChunks defers to the per-chunk addressing. Regression
+// test: the pool's own storage buffer used to be exposed, so a chunk in a
+// leased buffer other than pool.storage_index failed with "Chunk out of
+// bounds".
+TEST(PoolStagingTest, BoundedHostLayersExposeNoFlatPoolSpan) {
+  constexpr int64_t kStride = 64;
+  constexpr int64_t kNumBlocks = 4;
+  constexpr size_t kNumLayers = 3;
+  StagingTestManager manager(/*num_layers=*/kNumLayers, /*num_shards=*/1,
+                             /*slice_byte_size=*/kStride,
+                             /*host_blocks=*/kNumBlocks,
+                             /*num_staging_layers=*/2);
+  ASSERT_EQ(manager.num_host_layers(), 2u);
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    manager.SetDeviceBacked(i, kStride * kNumBlocks);
+  }
+  std::vector<PoolSpec> pools;
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    pools.push_back(DensePool("pool_" + std::to_string(i), /*storage_index=*/i,
+                              /*base_offset=*/0, kStride, kNumBlocks,
+                              /*staging_blocks_per_request=*/0));
+  }
+  ABSL_ASSERT_OK(manager.RegisterPools(pools, /*staging_leases=*/0));
+
+  for (size_t pool_idx = 0; pool_idx < kNumLayers; ++pool_idx) {
+    EXPECT_EQ(manager.GetBlockArrayHostPointer(pool_idx, 0), nullptr)
+        << "pool " << pool_idx;
+  }
+}
+
 TEST(PoolStagingTest, GetBlockChunksLargePlanLinearScaling) {
   constexpr size_t kNumShards = 8;
   constexpr size_t kNumFaPools = 6;

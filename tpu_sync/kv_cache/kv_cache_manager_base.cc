@@ -2133,12 +2133,13 @@ size_t KVCacheManagerBase::block_bytes(size_t block_array_idx) const {
 
 uint8_t* KVCacheManagerBase::GetBlockArrayHostPointer(size_t block_array_idx,
                                                       size_t shard_idx) {
+  // When fewer host buffers exist than layers, a layer's or pool's bytes sit in
+  // the buffer its transfer leased rather than at a fixed index, so there is no
+  // flat span to validate against.
+  if (layers_.size() < num_layers_) {
+    return nullptr;
+  }
   if (!explicit_pools_) {
-    // When fewer host buffers exist than layers, a layer's bytes sit in a
-    // leased buffer rather than at its own layer index.
-    if (layers_.size() < num_layers_) {
-      return nullptr;
-    }
     return GetHostPointer(block_array_idx, shard_idx);
   }
   if (block_array_idx >= pools_.size()) {

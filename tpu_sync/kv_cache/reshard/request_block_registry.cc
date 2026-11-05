@@ -458,7 +458,8 @@ RequestBlockRegistry::LookupAndClaim(const std::string& req_id, int64_t uuid,
         "Request block snapshot was already claimed for a different "
         "source unit set");
   }
-  std::map<RaidenId, RequestBlockRegistration, RaidenIdLess> result;
+  std::vector<decltype(request_blocks_)::iterator> claimed_rows;
+  claimed_rows.reserve(units.size());
   for (const RaidenId& unit : units) {
     auto it = request_blocks_.find(BlockKey{req_id, unit});
     if (it == request_blocks_.end() || it->second.uuid != uuid) {
@@ -466,10 +467,18 @@ RequestBlockRegistry::LookupAndClaim(const std::string& req_id, int64_t uuid,
           "Missing producer block registration for req_id=", req_id,
           ", uuid=", uuid, ", unit=", PythonRepr(unit)));
     }
-    result.emplace(unit, it->second);
+    claimed_rows.push_back(it);
   }
   // This is the claim linearization point: every requested rank has been
-  // validated and copied while cancellation is excluded by the shared lock.
+  // validated while cancellation is excluded by the shared lock. The claimed
+  // rows take the claim's TTL so they stay registered for as long as the claim
+  // is held; a producer cannot refresh them itself because Register refuses
+  // claimed generations.
+  std::map<RaidenId, RequestBlockRegistration, RaidenIdLess> result;
+  for (const auto& row : claimed_rows) {
+    row->second.expires_at = now + ttl_s_;
+    result.emplace(row->first.second, row->second);
+  }
   claimed_[lifecycle_key] = now + ttl_s_;
   claimed_units_[lifecycle_key] = claimed_units;
   claimed_owners_[lifecycle_key].insert(claim_owner);

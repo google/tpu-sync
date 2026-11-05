@@ -2702,6 +2702,71 @@ TEST_F(ReshardStackTest, SenderDispatchFailurePropagatesErrorAfterReceiverArm) {
             ReshardCoordinator::Status::kFailed);
 }
 
+TEST_F(ReshardStackTest,
+       ClaimRefreshesRegistrationTtlForSiblingStageAndCompletion) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterPipelinedUnits(/*num_stages=*/2);
+  RegisterPipelinedSpans("req-claim-ttl", 92, /*num_stages=*/2);
+
+  // Stage 0 claims the request 400 s into the 600 s registration TTL, so the
+  // claim and the claimed producer rows now both expire at +1000 s.
+  now_ += 400.0;
+  tpu_sync::rpc::ControllerResponse first =
+      CoordinateStage("req-claim-ttl", 92, /*num_stages=*/2, /*stage=*/0);
+  ASSERT_TRUE(first.success()) << first.message();
+
+  // At +700 s (past the registration TTL, within the claim TTL) the producer
+  // rows are still live: stage 1 joins the claim, a registration under
+  // another uuid for the same (req_id, unit) is still refused, and completion
+  // votes retire both rank rows.
+  now_ += 300.0;
+  EXPECT_EQ(RequestBlockStatuses("req-claim-ttl", 92),
+            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
+  EXPECT_EQ(CancelIfUnclaimed("req-claim-ttl", 92).response_data(), "false");
+
+  tpu_sync::rpc::ControllerResponse second =
+      CoordinateStage("req-claim-ttl", 92, /*num_stages=*/2, /*stage=*/1);
+  ASSERT_TRUE(second.success()) << second.message();
+
+  tpu_sync::rpc::ControllerResponse conflict =
+      RegisterBlockIds(/*rank=*/1, "req-claim-ttl", /*uuid=*/93, {4});
+  ASSERT_FALSE(conflict.success());
+  EXPECT_THAT(conflict.message(),
+              HasSubstr("Conflicting request block registration"));
+
+  tpu_sync::rpc::ControllerResponse vote0 =
+      CompleteRequestBlocks("req-claim-ttl", 92, /*rank=*/0);
+  ASSERT_TRUE(vote0.success()) << vote0.message();
+  EXPECT_EQ(vote0.response_data(), "0");
+
+  tpu_sync::rpc::ControllerResponse vote1 =
+      CompleteRequestBlocks("req-claim-ttl", 92, /*rank=*/1);
+  ASSERT_TRUE(vote1.success()) << vote1.message();
+  EXPECT_EQ(vote1.response_data(), "2");
+  EXPECT_EQ(RequestBlockStatuses("req-claim-ttl", 92),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+}
+
+TEST_F(ReshardStackTest, FailedClaimDoesNotRefreshPartialRegistrationTtl) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterSpans(0, "req-partial-ttl", 94, 1024, 3, 0, 0, 1024);
+
+  // Rank 1 has not registered, so a planning attempt at +400 s fails before
+  // the claim linearization point and leaves rank 0's 600 s TTL untouched.
+  now_ += 400.0;
+  tpu_sync::rpc::ControllerResponse poll =
+      Coordinate("req-partial-ttl", 94, 2, {7, 9});
+  ASSERT_FALSE(poll.success());
+  EXPECT_THAT(poll.message(), HasSubstr("Missing producer block registration"));
+
+  // At +601 s rank 0's registration has lapsed on its original TTL.
+  now_ += 201.0;
+  EXPECT_EQ(RequestBlockStatuses("req-partial-ttl", 94),
+            std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+}
+
 }  // namespace
 }  // namespace reshard
 }  // namespace kv_cache

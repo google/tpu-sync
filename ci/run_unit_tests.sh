@@ -28,14 +28,14 @@
 # Execution phases (when invoked without explicit target arguments):
 #   Phase 1: Every cc_test and py_test under the package patterns in
 #            RAIDEN_TEST_SCOPE that carries none of the exclusion tags (no_oss,
-#            notap, manual, or any requires-<resource> tag).
-#   Phase 2: E2E JAX validation build via `./build.sh jax`, compiling
-#            _tpu_raiden_jax.so, C++ control-plane service binaries, and
-#            Python protobuf modules, reusing the warm Bazel server and
-#            Skyframe analysis cache from Phase 1.
+#            notap, manual, or any requires-<resource> tag), plus the E2E JAX
+#            build targets (_tpu_raiden_jax.so, _weight_synchronizer_ffi.so,
+#            C++ control-plane service binaries, and Python protobuf modules)
+#            in a single Bazel invocation.
+#   Phase 2: Materialize and verify the built E2E JAX and control-plane
+#            artifacts in the source tree.
 #   Phase 3: Python 3.12 dynamic module binding linkage check (`import
-#            kv_cache_manager` with JAX mocked on CPU) and pure-Python CPU
-#            unit tests (`nd_slice_math_test.py`).
+#            kv_cache_manager` with JAX mocked on CPU).
 #
 # Naming targets as arguments (e.g. `ci/run_unit_tests.sh //tpu_sync/core:foo_test`)
 # overrides the query and skips Phases 2 & 3 unless RAIDEN_RUN_E2E_BUILD=true.
@@ -167,8 +167,19 @@ for target in "${TARGETS[@]}"; do
   fi
 done
 
-echo "=== Phase 1: Running Bazel CPU Unit Test Suite (${#TARGETS[@]} targets) ==="
-printf '  %s\n' "${TARGETS[@]}"
+# shellcheck source=tools/stage_artifacts_utils.sh
+source "${REPO_ROOT}/tools/stage_artifacts_utils.sh"
+
+E2E_BUILD_TARGETS=()
+if [[ "${RAIDEN_RUN_E2E_BUILD}" == "true" ]]; then
+  echo "=== Checking JAX deps ==="
+  "${REPO_ROOT}/tools/jax/check_jax_deps.sh"
+  E2E_BUILD_TARGETS=("${RAIDEN_JAX_E2E_BAZEL_TARGETS[@]}")
+  EXTRA_BAZEL_FLAGS+=" --remote_download_outputs=toplevel"
+fi
+
+echo "=== Phase 1: Running Bazel CPU Unit Test Suite (${#TARGETS[@]} test targets + ${#E2E_BUILD_TARGETS[@]} E2E build targets) ==="
+printf '  %s\n' "${TARGETS[@]}" "${E2E_BUILD_TARGETS[@]}"
 
 # --keep_going: report every target that fails to build or test, rather than
 # stopping at the first one.
@@ -179,7 +190,8 @@ if ! "${BAZEL_BIN}" "${BAZEL_STARTUP_FLAGS[@]}" test -c opt \
   --test_output=errors \
   --test_summary=detailed \
   ${EXTRA_BAZEL_FLAGS} \
-  "${TARGETS[@]}"; then
+  "${TARGETS[@]}" \
+  "${E2E_BUILD_TARGETS[@]}"; then
   echo "=== Bazel CPU Unit Test Suite Failed: Extracting Test Logs ==="
   for xml_file in $(find -L "${REPO_ROOT}/bazel-testlogs" -name "test.xml" 2>/dev/null); do
     if grep -qE '<(failure|error)' "${xml_file}"; then
@@ -202,8 +214,8 @@ if ! "${BAZEL_BIN}" "${BAZEL_STARTUP_FLAGS[@]}" test -c opt \
 fi
 
 if [[ "${RAIDEN_RUN_E2E_BUILD}" == "true" ]]; then
-  echo "=== Phase 2: E2E JAX Validation Build (./build.sh jax) ==="
-  ./build.sh jax --config=oss --remote_download_outputs=toplevel ${EXTRA_BAZEL_FLAGS}
+  echo "=== Phase 2: Staging and Verifying E2E JAX Build Artifacts ==="
+  raiden_stage_jax_e2e_artifacts "${REPO_ROOT}"
 
   echo "=== Verifying E2E Build Artifacts ==="
   EXPECTED_ARTIFACTS=(

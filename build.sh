@@ -61,6 +61,8 @@ check_disk_space "/tmp" "Temporary Directory (/tmp)"
 # the --override_module flags that name them.
 # shellcheck source=tools/jax/module_overrides.sh
 source "${WORKSPACE_DIR}/tools/jax/module_overrides.sh"
+# shellcheck source=tools/stage_artifacts_utils.sh
+source "${WORKSPACE_DIR}/tools/stage_artifacts_utils.sh"
 
 echo "=== Navigating to workspace directory ==="
 cd "${WORKSPACE_DIR}"
@@ -154,21 +156,11 @@ if [ "${BUILD_TORCH}" = true ]; then
   fi
 fi
 
-BAZEL_TARGETS=(
-  "//tpu_sync/rpc:raiden_service_py_pb2"
-  "//tpu_sync/rpc:coordination_py_pb2"
-  "//tpu_sync/proto:control_pipe_py_pb2"
-  "//tpu_sync/proto:control_pipe_py_pb2_grpc"
-  "//tpu_sync/rpc:coordination_py_pb2_grpc"
-  "//tpu_sync/rpc:controller_service_py_pb2"
-)
+BAZEL_TARGETS=("${RAIDEN_PROTO_BAZEL_TARGETS[@]}")
 if [ "${SKIP_SERVER_BINARIES}" = false ]; then
   # C++ control-plane service binaries. These do not depend on JAX or Torch,
   # so they are built unless --skip-server-binaries (or --skip-servers) is requested.
-  BAZEL_TARGETS+=(
-    "//tpu_sync/kv_cache/global_registry:global_registry_server"
-    "//tpu_sync/store_node:kv_cache_host_store_node_main"
-  )
+  BAZEL_TARGETS+=("${RAIDEN_SERVER_BAZEL_TARGETS[@]}")
 fi
 DEFINE_FLAGS=" --define raiden_wheel_build=true"
 BAZEL_MODULE_FLAGS=()
@@ -177,10 +169,7 @@ VISIBILITY_FLAGS=()
 
 if [ "$BUILD_JAX" = true ]; then
   echo "Configuring build for JAX..."
-  BAZEL_TARGETS+=(
-    "//tpu_sync/frameworks/jax:_tpu_raiden_jax"
-    "//tpu_sync/frameworks/jax:_weight_synchronizer_ffi"
-  )
+  BAZEL_TARGETS+=("${RAIDEN_JAX_EXTENSION_BAZEL_TARGETS[@]}")
 else
   DEFINE_FLAGS+=" --define with_jax=false"
 fi
@@ -407,37 +396,15 @@ printf 'module override: %s\n' "${BAZEL_MODULE_FLAGS[@]#--override_module=}"
   "${BAZEL_EXTRA_ARGS[@]}"
 
 
-echo "=== Copying generated protobuf Python modules ==="
-cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/rpc/raiden_service_pb2.py" "${WORKSPACE_DIR}/tpu_sync/rpc/" 2>/dev/null || true
-cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/rpc/coordination_pb2.py" "${WORKSPACE_DIR}/tpu_sync/rpc/" 2>/dev/null || true
-cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/rpc/coordination_pb2_grpc.py" "${WORKSPACE_DIR}/tpu_sync/rpc/" 2>/dev/null || true
-cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/rpc/controller_service_pb2.py" "${WORKSPACE_DIR}/tpu_sync/rpc/" 2>/dev/null || true
-cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/proto/control_pipe_pb2.py" "${WORKSPACE_DIR}/tpu_sync/proto/" 2>/dev/null || true
-cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/proto/control_pipe_pb2_grpc.py" "${WORKSPACE_DIR}/tpu_sync/proto/" 2>/dev/null || true
+raiden_stage_proto_artifacts "${WORKSPACE_DIR}"
 
 if [ "${SKIP_SERVER_BINARIES}" = false ]; then
-  echo "=== Linking C++ control-plane service binaries into source tree ==="
-  # The KVCacheStore tests (kv_cache_store_test.py / kv_cache_store_e2e_test.py)
-  # launch these binaries from their SOURCE-tree path, but Bazel emits them under
-  # bazel-bin/. Symlink them so a fresh checkout can run the tests without extra
-  # steps.
-  link_service_binary() {
-    local rel="$1"
-    local src="${WORKSPACE_DIR}/bazel-bin/${rel}"
-    local dst="${WORKSPACE_DIR}/${rel}"
-    if [ -e "${src}" ]; then
-      ln -sf "${src}" "${dst}"
-    fi
-  }
-  link_service_binary "tpu_sync/kv_cache/global_registry/global_registry_server"
-  link_service_binary "tpu_sync/store_node/kv_cache_host_store_node_main"
+  raiden_stage_server_binaries "${WORKSPACE_DIR}"
 fi
 
 echo "=== Copying compiled shared libraries to source directory ==="
 if [ "$BUILD_JAX" = true ]; then
-  echo "Copying JAX artifacts..."
-  cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/jax/_tpu_raiden_jax.so" "${WORKSPACE_DIR}/tpu_sync/frameworks/jax/"
-  cp -f "${WORKSPACE_DIR}/bazel-bin/tpu_sync/frameworks/jax/_weight_synchronizer_ffi.so" "${WORKSPACE_DIR}/tpu_sync/frameworks/jax/"
+  raiden_stage_jax_artifacts "${WORKSPACE_DIR}"
 fi
 
 if [ "${BUILD_TORCH}" = true ]; then

@@ -35,6 +35,13 @@ namespace tpu_raiden {
 struct HostBufferAllocation {
   uint8_t* ptr = nullptr;
   size_t size = 0;
+  // Borrowed file descriptor (`-1` when not file-backed). When `owner` does
+  // not hold the backing mapping itself (e.g.
+  // `SharedMemoryHostMemoryAllocator`), both `ptr` and `fd` remain valid only
+  // while the creating allocator lives.
+  int fd = -1;
+  int64_t fd_offset = 0;
+  std::string shm_name;
   std::shared_ptr<void> owner;
 };
 
@@ -211,6 +218,9 @@ class SharedMemoryHostMemoryAllocator : public HostMemoryAllocator {
     void* ptr = nullptr;
     size_t size_bytes = 0;
     bool dma_mapped = false;
+    int fd = -1;
+    int64_t fd_offset = 0;
+    std::string shm_name;
   };
 
   struct Segment {

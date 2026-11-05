@@ -152,10 +152,9 @@ def _install_runtime_requirements() -> None:
 
   That's torch_tpu's own requirements, read from its metadata, minus torch,
   which is already pinned: `import torch` loads the torch_tpu backend, which
-  imports them. They go in after build.sh installs requirements.txt, so
-  torch_tpu's pins win, and libtpu is pinned to _LIBTPU_VERSION. Plus
-  tensorflow, which bap_metrics (how BAP benchmarks report metrics) writes
-  TensorBoard events with.
+  imports them. libtpu is pinned to _LIBTPU_VERSION, plus tensorflow-cpu, which
+  bap_metrics (how BAP benchmarks report metrics) writes TensorBoard events
+  with.
   """
   importlib.invalidate_caches()  # torch_tpu was installed after startup.
   requirements = [
@@ -175,8 +174,20 @@ def _build_extension() -> None:
   # With torch_tpu installed, importing torch autoloads its backend. The build
   # only needs the wheels' headers, as in ci/build_wheel_impl.sh.
   env['TORCH_DEVICE_BACKEND_AUTOLOAD'] = '0'
+  # --skip-server-binaries: skip standalone C++ service binaries unused by torch
+  # benchmarks.
+  # --skip-pip-install: skip requirements.txt (which installs JAX and newer libtpu);
+  # _install_runtime_requirements() installs torch_tpu's runtime requirements.
   # --config=ci: the remote cache the bazel workloads also build with.
-  _run('./build.sh', 'torch', '--config=ci', cwd=_REPO_ROOT, env=env)
+  _run(
+      './build.sh',
+      'torch',
+      '--skip-server-binaries',
+      '--skip-pip-install',
+      '--config=ci',
+      cwd=_REPO_ROOT,
+      env=env,
+  )
 
 
 def _link_torch_tpu_glue() -> None:

@@ -23,7 +23,7 @@ benchmarks {
   workload {
     action: "./ml_actions/actions/workload_executors/python"
     action_inputs { key: "python_version" value: "3.12" }
-    action_inputs { key: "script_path" value: "ci/run_in_torch_env.py" }
+    action_inputs { key: "script_path" value: "ci/run_in_tpu_env.py" }
     action_inputs { key: "project_path" value: "ci" }
     action_inputs { key: "runtime_flags" value: "tpu_sync/benchmarks/h2d_d2h_benchmark_gating.py --record --iters=500 --framework=torch" }
   }

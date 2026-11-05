@@ -12,17 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Runs a Python script in an open-source PyTorch environment.
+"""Runs a Python script in a TPU runner environment (JAX, PyTorch, or both).
 
-  python3 ci/run_in_torch_env.py <script.py> [args...]
+  python3 ci/run_in_tpu_env.py <script.py> [args...]
 
 <script.py> is relative to the repository root. Run this in a virtualenv: it
-pip-installs into the Python that runs it.
+pip-installs into the Python that runs it when running PyTorch workloads.
+
+If `--framework=torch` (the default) is passed, only the PyTorch leg runs
+in-process against the installed PyTorch and torch_tpu wheels.
+If `--framework=jax` is passed, the JAX leg runs hermetically via `bazel run`.
+If `--framework=all` is passed, the JAX leg runs first via `bazel run`, followed
+by the PyTorch leg.
 
 In the open-source build, torch and torch_tpu reach Bazel only as headers, so
 raiden's torch extension can't come from `bazel run`. It has to be compiled
 against the installed torch and torch_tpu wheels, and against torch_tpu's own
-XLA revision, which only `build.sh torch` sets up. So this script:
+XLA revision, which only `build.sh torch` sets up. For PyTorch workloads, this
+script:
 
   1. installs torch and torch_tpu,
   2. builds the torch extension into the source tree with `build.sh torch`,
@@ -176,7 +183,8 @@ def _build_extension() -> None:
   env['TORCH_DEVICE_BACKEND_AUTOLOAD'] = '0'
   # --skip-server-binaries: skip standalone C++ service binaries unused by torch
   # benchmarks.
-  # --skip-pip-install: skip requirements.txt (which installs JAX and newer libtpu);
+  # --skip-pip-install: skip requirements.txt (which installs JAX and newer
+  # libtpu);
   # _install_runtime_requirements() installs torch_tpu's runtime requirements.
   # --config=ci: the remote cache the bazel workloads also build with.
   _run(
@@ -254,12 +262,52 @@ def _prepare_tpu_environment() -> None:
   print(f'libtpu {importlib.metadata.version("libtpu")}', flush=True)
 
 
+def _run_jax_gating_leg(script_rel: str, jax_args: Sequence[str]) -> None:
+  """Runs the JAX leg of a benchmark via bazel run.
+
+  Running the JAX leg in a separate Bazel subprocess keeps JAX on its hermetic
+  Bazel wheel/libtpu pins and releases /dev/vfio/* when the subprocess exits,
+  before any multi-process PyTorch leg initializes its own TPU slice.
+
+  Args:
+    script_rel: Benchmark script path relative to the repository root.
+    jax_args: Command-line arguments forwarded to the benchmark script.
+  """
+  target = '//' + script_rel.removesuffix('.py').replace('/', ':', 1)
+  if '/' in script_rel:
+    pkg, name = script_rel.removesuffix('.py').rsplit('/', 1)
+    target = f'//{pkg}:{name}'
+  _log(f'Running JAX leg ({target}) via bazel run')
+  _run(
+      'bazel',
+      'run',
+      '-c',
+      'opt',
+      '--config=oss',
+      '--config=ci',
+      target,
+      '--',
+      *jax_args,
+      cwd=_REPO_ROOT,
+  )
+
+
 def main(argv: Sequence[str]) -> None:
   if len(argv) < 2:
     sys.exit(f'usage: {argv[0]} <script.py> [args...]')
   script = _REPO_ROOT / argv[1]
   if not script.is_file():
     sys.exit(f'{script} is not a file')
+
+  script_args = list(argv[2:])
+  base_args = [arg for arg in script_args if not arg.startswith('--framework=')]
+  if '--framework=jax' in script_args:
+    _run_jax_gating_leg(argv[1], [*base_args, '--framework=jax'])
+    return
+
+  if '--framework=all' in script_args:
+    _run_jax_gating_leg(argv[1], [*base_args, '--framework=jax'])
+    script_args = [*base_args, '--framework=torch']
 
   _install_build_inputs()
   _build_extension()
@@ -271,7 +319,7 @@ def main(argv: Sequence[str]) -> None:
       filter(None, [str(_REPO_ROOT), os.environ.get('PYTHONPATH')])
   )
   _log(f'Running {argv[1]}')
-  os.execv(sys.executable, [sys.executable, str(script), *argv[2:]])
+  os.execv(sys.executable, [sys.executable, str(script), *script_args])
 
 
 if __name__ == '__main__':

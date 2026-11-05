@@ -14,7 +14,6 @@
 
 """Integration tests for JAX WeightSynchronizer Python API."""
 
-import os
 import socket
 
 from absl.testing import absltest  # pylint: disable=g-import-not-at-top
@@ -24,8 +23,6 @@ import numpy as np
 
 from tpu_sync.api.jax import weight_synchronizer
 from tpu_sync.rpc import raiden_service_pb2
-
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 WeightSynchronizer = weight_synchronizer.WeightSynchronizer
 
@@ -42,11 +39,18 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     self.sharding = jax.sharding.NamedSharding(
         self.mesh, jax.sharding.PartitionSpec("data")
     )
-    self.mesh_2d = jax.sharding.Mesh(
-        np.array(self.devices[:4]).reshape(2, 2), ("x", "y")
-    )
     self.shape = (8, 128)
     self.dtype = jnp.float32
+
+  def _create_mesh(self, shape, axis_names):
+    num_devices = int(np.prod(shape))
+    if len(self.devices) < num_devices:
+      self.skipTest(
+          f"Requires {num_devices} devices, got {len(self.devices)}"
+      )
+    return jax.sharding.Mesh(
+        np.array(self.devices[:num_devices]).reshape(shape), axis_names
+    )
 
   def test_push_synchronization(self):
     src_arrs = [
@@ -339,11 +343,12 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     )
 
   def test_push_sync_aligned_to_aligned(self):
+    mesh_2d = self._create_mesh((2, 2), ("x", "y"))
     src_sharding = jax.sharding.NamedSharding(
-        self.mesh_2d, jax.sharding.PartitionSpec("x", "y")
+        mesh_2d, jax.sharding.PartitionSpec("x", "y")
     )
     dst_sharding = jax.sharding.NamedSharding(
-        self.mesh_2d, jax.sharding.PartitionSpec("x", "y")
+        mesh_2d, jax.sharding.PartitionSpec("x", "y")
     )
     self._run_resharding_test(src_sharding, dst_sharding, (8, 8))
 
@@ -448,7 +453,8 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
 
   def test_explicit_global_shard_indices(self):
     sharding_2d = jax.sharding.NamedSharding(
-        self.mesh_2d, jax.sharding.PartitionSpec("x", "y")
+        self._create_mesh((2, 2), ("x", "y")),
+        jax.sharding.PartitionSpec("x", "y"),
     )
     arrs = [jax.device_put(jnp.zeros((8, 8), dtype=self.dtype), sharding_2d)]
     for arr in arrs:
@@ -465,8 +471,12 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     self.assertEqual(eps[0]["shards"], [0, 1, 4, 5])
 
   def test_explicit_global_shard_indices_8_shards(self):
+    sharding = jax.sharding.NamedSharding(
+        self._create_mesh((8,), ("data",)),
+        jax.sharding.PartitionSpec("data"),
+    )
     arrs = [
-        jax.device_put(jnp.zeros(self.shape, dtype=self.dtype), self.sharding)
+        jax.device_put(jnp.zeros(self.shape, dtype=self.dtype), sharding)
     ]
     for arr in arrs:
       arr.block_until_ready()
@@ -484,7 +494,8 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
 
   def test_automatic_global_shard_indices_derivation(self):
     sharding_2d = jax.sharding.NamedSharding(
-        self.mesh_2d, jax.sharding.PartitionSpec("x", "y")
+        self._create_mesh((2, 2), ("x", "y")),
+        jax.sharding.PartitionSpec("x", "y"),
     )
     arrs = [jax.device_put(jnp.zeros((8, 8), dtype=self.dtype), sharding_2d)]
     for arr in arrs:
@@ -502,7 +513,8 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
 
   def test_non_contiguous_subgrid_transfer(self):
     sharding_2d = jax.sharding.NamedSharding(
-        self.mesh_2d, jax.sharding.PartitionSpec("x", "y")
+        self._create_mesh((2, 2), ("x", "y")),
+        jax.sharding.PartitionSpec("x", "y"),
     )
     src_arrs = [
         jax.device_put(

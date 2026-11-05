@@ -412,11 +412,7 @@ NB_MODULE(_tpu_raiden_jax, m) {
                   "Weight sync D2H failed: " +
                   std::string(status_or_future.status().message()));
             }
-            absl::Status status = status_or_future.value().Await();
-            if (!status.ok()) {
-              throw std::runtime_error("Weight sync D2H copy failed: " +
-                                       std::string(status.message()));
-            }
+            return tpu_raiden::RaidenFuture{*std::move(status_or_future)};
           },
           nb::call_guard<nb::gil_scoped_release>())
       .def(
@@ -473,9 +469,16 @@ NB_MODULE(_tpu_raiden_jax, m) {
       .def(
           "get_host_buffer",
           [](WeightSynchronizer& self, size_t layer_idx, size_t shard_idx) {
-            const uint8_t* ptr = self.GetHostBufferPtr(layer_idx, shard_idx);
-            if (!ptr) {
-              throw std::runtime_error("Invalid layer or shard index");
+            const uint8_t* ptr = nullptr;
+            {
+              nb::gil_scoped_release release;
+              auto host_ptr = self.WaitAndGetHostBufferPtr(layer_idx, shard_idx);
+              if (!host_ptr.ok()) {
+                throw std::runtime_error(
+                    "Get host buffer failed: " +
+                    std::string(host_ptr.status().message()));
+              }
+              ptr = *host_ptr;
             }
             size_t size = self.GetHostBufferSize(layer_idx, shard_idx);
             if (size == 0) {

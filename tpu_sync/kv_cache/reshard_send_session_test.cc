@@ -372,6 +372,14 @@ class FakeD2hBase : public kv_cache::KVCacheManagerBase {
     return true;
   }
 
+  // Returns the host staging buffer the last copy of `pool_idx` targeted
+  // (nullopt: the pool's own storage).
+  std::optional<size_t> LastHostLayerIdx(size_t pool_idx) const {
+    absl::MutexLock lock(fake_mu_);
+    auto it = last_host_layer_idx_.find(pool_idx);
+    return it == last_host_layer_idx_.end() ? std::nullopt : it->second;
+  }
+
   absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx, std::optional<uint64_t> uuid,
@@ -379,6 +387,7 @@ class FakeD2hBase : public kv_cache::KVCacheManagerBase {
     auto [promise, future] = xla::MakePromise();
     absl::MutexLock lock(fake_mu_);
     ++copies_issued_[pool_idx];
+    last_host_layer_idx_[pool_idx] = host_layer_idx;
     if (hold_next_[pool_idx]) {
       hold_next_[pool_idx] = false;
       pending_[pool_idx] = std::move(promise);
@@ -394,6 +403,8 @@ class FakeD2hBase : public kv_cache::KVCacheManagerBase {
   absl::flat_hash_map<size_t, xla::Promise<>> pending_
       ABSL_GUARDED_BY(fake_mu_);
   absl::flat_hash_map<size_t, int> copies_issued_ ABSL_GUARDED_BY(fake_mu_);
+  absl::flat_hash_map<size_t, std::optional<size_t>> last_host_layer_idx_
+      ABSL_GUARDED_BY(fake_mu_);
 };
 
 // Routes `sender`'s transport session lookups to `session`, as the manager
@@ -763,11 +774,16 @@ TEST(ReshardSendSessionTest, PipelineSlotWaitTimeoutSettlesSendOutOfBand) {
 }
 
 // A pool pushing to several peers keeps its staging slot until the last
-// peer push completes, then the send settles clean.
+// peer push completes, then the send settles clean. Slots are leased only when
+// host layers are bounded (here one host layer buffer for two storages).
 TEST(ReshardSendSessionTest, StagingSlotReleasedAfterLastPeerPush) {
-  FakeD2hBase sender(/*num_layers=*/1, /*num_shards=*/1,
+  FakeD2hBase sender(/*num_layers=*/2, /*num_shards=*/1,
                      /*slice_byte_size=*/128, /*local_port=*/std::nullopt,
-                     /*host_blocks_to_allocate=*/std::make_optional(4));
+                     /*host_blocks_to_allocate=*/std::make_optional(4),
+                     /*parallelism=*/1, /*host_allocator=*/nullptr,
+                     /*bind_ip=*/std::nullopt, /*num_staging_layers=*/1);
+  ASSERT_EQ(sender.num_host_layers(), 1u);
+  ABSL_ASSERT_OK(sender.RegisterPools({DensePool("fa", 128)}));
   kv_cache::KVCacheManagerBase receiver_a = MakeTestBase();
   kv_cache::KVCacheManagerBase receiver_b = MakeTestBase();
   auto recv_session = std::make_shared<StubRecvSession>();
@@ -780,7 +796,7 @@ TEST(ReshardSendSessionTest, StagingSlotReleasedAfterLastPeerPush) {
   sender.AttachPlaceholderDeviceHoldForTest();
   std::unique_ptr<StagingBlockAllocator> allocator =
       CreateStagingBlockAllocator(&sender, /*num_slots=*/0, /*max_blocks=*/0);
-  StartTransferRequest plan = ValidPlan(/*uuid=*/1403, /*dtype_tags=*/{""});
+  StartTransferRequest plan = ValidPlan(/*uuid=*/1403);
   auto* schedule = &(*plan.mutable_shard_push_schedules())[0];
   schedule->mutable_entries(0)->set_dst_peer(peer_a);
   *schedule->add_entries() = schedule->entries(0);
@@ -806,6 +822,57 @@ TEST(ReshardSendSessionTest, StagingSlotReleasedAfterLastPeerPush) {
   EXPECT_FALSE(session->plan().has_value());
   EXPECT_THAT(session->ResolveStagingSlot(0),
               StatusIs(absl::StatusCode::kCancelled));
+}
+
+// On a full host mirror (no num_staging_layers) every pool stages in its own
+// storage's host buffer. Regression test: the send used to lease a staging
+// slot even here, so pool 0 (on storage 1) was copied to host buffer 0 and its
+// push chunks failed the transport's ValidateChunks, which checks them against
+// pool 0's own storage ("Chunk out of bounds").
+TEST(ReshardSendSessionTest, FullHostMirrorStagesPoolsInPlace) {
+  FakeD2hBase sender(/*num_layers=*/2, /*num_shards=*/1,
+                     /*slice_byte_size=*/128, /*local_port=*/std::nullopt,
+                     /*host_blocks_to_allocate=*/std::make_optional(4));
+  ASSERT_EQ(sender.num_host_layers(), sender.num_layers());
+  std::vector<kv_cache::PoolSpec> pools = {
+      DensePool("fa", 128),
+      DensePool("state", 128),
+  };
+  // Pool order differs from storage order, so slot order != storage order.
+  pools[0].storage_index = 1;
+  pools[1].storage_index = 0;
+  ABSL_ASSERT_OK(sender.RegisterPools(pools));
+  kv_cache::KVCacheManagerBase receiver(
+      /*num_layers=*/2, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/std::make_optional(4));
+  AcceptPushes(receiver, std::make_shared<StubRecvSession>());
+  const std::string peer =
+      absl::StrCat("127.0.0.1:", receiver.transport_server()->local_port());
+  sender.AttachPlaceholderDeviceHoldForTest();
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&sender, /*num_slots=*/0, /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(
+      /*uuid=*/1404, /*dtype_tags=*/{"bf16", "bf16"},
+      /*transferred_pools=*/{0, 1});
+  (*plan.mutable_shard_push_schedules())[0].mutable_entries(0)->set_dst_peer(
+      peer);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferSession> session,
+      CreateReshardSendSession(
+          &sender, allocator.get(), std::vector<int64_t>{0},
+          /*parallelism=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
+  RouteSessionLookups(sender, session);
+  EXPECT_THAT(session->ResolveStagingSlot(0),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  ABSL_ASSERT_OK(session->Start());
+  ABSL_EXPECT_OK(session->AwaitForDone());
+  EXPECT_EQ(sender.CopiesIssued(0), 1);
+  EXPECT_EQ(sender.CopiesIssued(1), 1);
+  EXPECT_EQ(sender.LastHostLayerIdx(0), std::nullopt);
+  EXPECT_EQ(sender.LastHostLayerIdx(1), std::nullopt);
 }
 
 }  // namespace

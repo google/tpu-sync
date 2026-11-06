@@ -153,7 +153,11 @@ cc_test(
     tags = ["no_oss"],
     deps = [
         ":weight_synchronizer_base",
+        "//tpu_sync/common/control_pipe",
+        "//tpu_sync/common/control_pipe:control_pipe_types",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@xla//xla/tsl/platform:statusor",

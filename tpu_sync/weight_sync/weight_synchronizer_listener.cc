@@ -19,9 +19,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,6 +34,7 @@
 #include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
@@ -43,14 +46,42 @@
 namespace tpu_raiden {
 namespace weight_sync {
 
+ControlPipeBackendType WeightSynchronizerListener::ResolveBackendType(
+    std::optional<ControlPipeBackendType> backend_type) {
+  if (backend_type.has_value()) {
+    return *backend_type;
+  }
+  if (const char* env_backend = std::getenv("TPU_RAIDEN_CONTROL_PLANE_BACKEND");
+      env_backend != nullptr && env_backend[0] != '\0') {
+    if (std::optional<ControlPipeBackendType> parsed =
+            ParseControlPipeBackendType(env_backend);
+        parsed.has_value()) {
+      return *parsed;
+    }
+    LOG(WARNING) << "Unknown TPU_RAIDEN_CONTROL_PLANE_BACKEND='" << env_backend
+                 << "', falling back to default.";
+    return ControlPipeBackendType::kTcp;
+  }
+  if (const char* env_flag = std::getenv("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE")) {
+    std::string val = absl::AsciiStrToLower(env_flag);
+    if (val == "0" || val == "false") {
+      return ControlPipeBackendType::kTcp;
+    }
+    if (val == "1" || val == "true") {
+      return ControlPipeBackendType::kGrpc;
+    }
+  }
+  return ControlPipeBackendType::kTcp;
+}
+
 WeightSynchronizerListener::WeightSynchronizerListener(
     WeightSynchronizerBase* engine, int listener_port,
-    ControlPipeBackendType backend_type)
+    std::optional<ControlPipeBackendType> backend_type)
     : engine_(engine), listener_port_(listener_port) {
   ControlPipeConfig cfg;
-  cfg.backend_type = backend_type;
+  cfg.backend_type = ResolveBackendType(backend_type);
   cfg.requested_port = listener_port;
-  cfg.allow_legacy_framing = true;
+  cfg.allow_legacy_framing = (cfg.backend_type == ControlPipeBackendType::kTcp);
 
   pipe_server_ = CreateControlPipeServer(cfg);
   pipe_server_->dispatcher()

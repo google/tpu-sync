@@ -19,6 +19,7 @@ import collections
 from concurrent import futures
 import enum
 import errno
+import logging
 import os
 import socket
 import struct
@@ -103,6 +104,47 @@ def resolve_control_pipe_backend(
   if env_flag in ("1", "true"):
     return ControlPipeBackendType.GRPC
   return ControlPipeBackendType.TCP
+
+
+def resolve_weight_sync_listener_backend(
+    override: Optional[ControlPipeBackendType] = None,
+) -> ControlPipeBackendType:
+  """Resolves the active C++ WeightSynchronizerListener ControlPipe backend.
+
+  Mirrors `WeightSynchronizerListener::ResolveBackendType()` so Python callers
+  talking directly to C++ WeightSynchronizer listeners match the listener's
+  configured transport backend without altering Python ControlPipeServer
+  clients.
+
+  Args:
+    override: Optional programmatic backend override.
+
+  Returns:
+    The resolved ControlPipeBackendType enum value.
+  """
+  if override is not None:
+    return override
+  default_backend = ControlPipeBackendType.TCP
+  env_val = os.environ.get("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "")
+  if env_val:
+    lowered = env_val.lower()
+    if lowered == "grpc":
+      return ControlPipeBackendType.GRPC
+    if lowered == "zmq":
+      return ControlPipeBackendType.ZMQ
+    if lowered == "tcp":
+      return ControlPipeBackendType.TCP
+    logging.warning(
+        "Unknown TPU_RAIDEN_CONTROL_PLANE_BACKEND=%r, falling back to default.",
+        env_val,
+    )
+    return default_backend
+  env_flag = os.environ.get("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE", "").lower()
+  if env_flag in ("0", "false"):
+    return ControlPipeBackendType.TCP
+  if env_flag in ("1", "true"):
+    return ControlPipeBackendType.GRPC
+  return default_backend
 
 
 def _format_zmq_endpoint(endpoint: str) -> str:
@@ -230,7 +272,36 @@ class ControlPipeClient:
     if grpc is None or control_pipe_pb2_grpc is None:
       raise RuntimeError("gRPC is required for ControlPipeBackendType.GRPC")
     resolved = self._resolve_address(endpoint)
+    try:
+      current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+      current_loop = None
+
     with self._lock:
+      if current_loop is not None:
+        stale_keys = [
+            k
+            for k, ch in self._aio_channels.items()
+            if getattr(ch, "_loop", None) is not None
+            and (
+                getattr(ch, "_loop").is_closed()
+                or getattr(ch, "_loop") is not current_loop
+            )
+        ]
+        for k in stale_keys:
+          self._aio_stubs.pop(k, None)
+          self._aio_channels.pop(k, None)
+      else:
+        stale_keys = [
+            k
+            for k, ch in self._aio_channels.items()
+            if getattr(ch, "_loop", None) is not None
+            and getattr(ch, "_loop").is_closed()
+        ]
+        for k in stale_keys:
+          self._aio_stubs.pop(k, None)
+          self._aio_channels.pop(k, None)
+
       stub = self._aio_stubs.get(resolved)
       if stub is not None:
         self._aio_stubs.move_to_end(resolved)

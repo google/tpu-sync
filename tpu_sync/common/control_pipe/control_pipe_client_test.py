@@ -291,6 +291,74 @@ class ControlPipeClientTest(absltest.TestCase):
           control_pipe_client.ControlPipeBackendType.GRPC,
       )
 
+  def test_resolve_weight_sync_listener_backend_precedence(self) -> None:
+    with mock.patch.dict(os.environ, {}, clear=True):
+      self.assertEqual(
+          control_pipe_client.resolve_weight_sync_listener_backend(),
+          control_pipe_client.ControlPipeBackendType.TCP,
+      )
+      self.assertEqual(
+          control_pipe_client.resolve_weight_sync_listener_backend(
+              control_pipe_client.ControlPipeBackendType.GRPC
+          ),
+          control_pipe_client.ControlPipeBackendType.GRPC,
+      )
+
+    with mock.patch.dict(
+        os.environ,
+        {
+            "TPU_RAIDEN_CONTROL_PLANE_BACKEND": "grpc",
+            "TPU_RAIDEN_USE_GRPC_CONTROL_PLANE": "0",
+        },
+        clear=True,
+    ):
+      self.assertEqual(
+          control_pipe_client.resolve_weight_sync_listener_backend(),
+          control_pipe_client.ControlPipeBackendType.GRPC,
+      )
+
+    with mock.patch.dict(
+        os.environ,
+        {
+            "TPU_RAIDEN_CONTROL_PLANE_BACKEND": "tcp",
+            "TPU_RAIDEN_USE_GRPC_CONTROL_PLANE": "1",
+        },
+        clear=True,
+    ):
+      self.assertEqual(
+          control_pipe_client.resolve_weight_sync_listener_backend(),
+          control_pipe_client.ControlPipeBackendType.TCP,
+      )
+
+    with mock.patch.dict(
+        os.environ,
+        {
+            "TPU_RAIDEN_CONTROL_PLANE_BACKEND": "invalid",
+            "TPU_RAIDEN_USE_GRPC_CONTROL_PLANE": "1",
+        },
+        clear=True,
+    ):
+      self.assertEqual(
+          control_pipe_client.resolve_weight_sync_listener_backend(),
+          control_pipe_client.ControlPipeBackendType.TCP,
+      )
+
+    with mock.patch.dict(
+        os.environ, {"TPU_RAIDEN_USE_GRPC_CONTROL_PLANE": "1"}, clear=True
+    ):
+      self.assertEqual(
+          control_pipe_client.resolve_weight_sync_listener_backend(),
+          control_pipe_client.ControlPipeBackendType.GRPC,
+      )
+
+    with mock.patch.dict(
+        os.environ, {"TPU_RAIDEN_USE_GRPC_CONTROL_PLANE": "false"}, clear=True
+    ):
+      self.assertEqual(
+          control_pipe_client.resolve_weight_sync_listener_backend(),
+          control_pipe_client.ControlPipeBackendType.TCP,
+      )
+
   def test_tcp_cpip_framing(self) -> None:
     server = _TcpTestServer(
         use_legacy_framing=False, allow_legacy_framing=False
@@ -429,6 +497,49 @@ class ControlPipeClientTest(absltest.TestCase):
         await client.aclose()
 
       asyncio.run(_run())
+    finally:
+      grpc_server.stop(grace=None)
+
+  def test_grpc_backend_reused_across_closed_event_loops(self) -> None:
+    servicer = _MockControlPipeServicer()
+    grpc_server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+    control_pipe_pb2_grpc.add_ControlPipeServiceServicer_to_server(
+        servicer, grpc_server
+    )
+    port = grpc_server.add_insecure_port("[::]:0")
+    grpc_server.start()
+    endpoint = f"localhost:{port}"
+
+    try:
+      client = control_pipe_client.ControlPipeClient(
+          backend=control_pipe_client.ControlPipeBackendType.GRPC
+      )
+      req = raiden_service_pb2.ControlRequest(
+          command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER
+      )
+
+      # First call in loop 1
+      async def _call_in_loop() -> None:
+        resp = await client.call(
+            endpoint, req, raiden_service_pb2.ControlResponse, timeout=5.0
+        )
+        self.assertTrue(resp.success)
+
+      asyncio.run(_call_in_loop())
+
+      # Second call in loop 2 (loop 1 is now closed)
+      asyncio.run(_call_in_loop())
+
+      # Third call via synchronous wrapper which creates and closes its own loop
+      resp_bytes = client.send_raw_bytes_sync(
+          endpoint,
+          req.SerializeToString(),
+          timeout=5.0,
+          message_type="tpu_sync.rpc.ControlRequest",
+      )
+      resp = raiden_service_pb2.ControlResponse()
+      resp.ParseFromString(resp_bytes)
+      self.assertTrue(resp.success)
     finally:
       grpc_server.stop(grace=None)
 

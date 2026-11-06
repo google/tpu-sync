@@ -187,6 +187,22 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   size_t block_bytes(size_t layer_idx) const override;
   size_t shard_factor() const override { return shard_factor_; }
 
+  // Runs |fn| once per shard, concurrently, each as a task on |pool| pinned to
+  // that shard's NUMA node so host-side work on the shard's buffers touches
+  // local memory. Returns as soon as the tasks are scheduled; the returned
+  // future is the join of the futures returned by |fn|, indexed by shard, and
+  // fails with the first error. Shard tasks never block on those futures. |fn|
+  // outlives this call and is invoked concurrently, so it must own its state
+  // and be const-callable. |pool| must outlive the scheduled tasks.
+  template <typename T>
+  xla::Future<std::vector<T>> ForEachShardNumaLocal(
+      tpu_raiden::NumaThreadPool& pool,
+      absl::AnyInvocable<xla::Future<T>(size_t shard_idx) const> fn);
+  // Same, for |fn| without a result.
+  xla::Future<> ForEachShardNumaLocal(
+      tpu_raiden::NumaThreadPool& pool,
+      absl::AnyInvocable<xla::Future<>(size_t shard_idx) const> fn);
+
  protected:
   size_t num_layers_ = 0;
   size_t num_shards_ = 0;
@@ -236,22 +252,6 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   absl::Status OnDataReceived(uint64_t uuid = 0) override {
     return absl::OkStatus();
   }
-
-  // Runs |fn| once per shard, concurrently, each as a task on |pool| pinned to
-  // that shard's NUMA node so host-side work on the shard's buffers touches
-  // local memory. Returns as soon as the tasks are scheduled; the returned
-  // future is the join of the futures returned by |fn|, indexed by shard, and
-  // fails with the first error. Shard tasks never block on those futures. |fn|
-  // outlives this call and is invoked concurrently, so it must own its state
-  // and be const-callable. |pool| must outlive the scheduled tasks.
-  template <typename T>
-  xla::Future<std::vector<T>> ForEachShardNumaLocal(
-      tpu_raiden::NumaThreadPool& pool,
-      absl::AnyInvocable<xla::Future<T>(size_t shard_idx) const> fn);
-  // Same, for |fn| without a result.
-  xla::Future<> ForEachShardNumaLocal(
-      tpu_raiden::NumaThreadPool& pool,
-      absl::AnyInvocable<xla::Future<>(size_t shard_idx) const> fn);
 };
 
 template <typename T>

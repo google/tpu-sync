@@ -40,7 +40,7 @@ statement column is the one-line form, the module docstring has the exact one.
 | Per-side counters | `Recv.Publication`, `Send.Publication`, `Recv.ReadinessSound`, `Recv.SettleSafe`, `Send.SettleSafe`, `Send.NoUnderflow` | `done_recving → every H2D callback ran OK`; `done_sending → every push completed OK`; `IsReadyToComplete → ready = numLayers`; `done → inFlight = 0`; `EndSendOpLocked` never underflows. |
 | Transport accounting | `Transport.reachable_safe` (`OnceDispatched`, `NetworkSound`, `CompleteOnSuccess`) | With honest senders, `OnLayerReceived` fires once per layer, the block target is reached only after every layer was dispatched, and a successful receive copied every layer exactly once. |
 | Engine caller contract (single- and multi-worker) | `Caller.contract_safe`, `Caller.mw_contract_safe`, `Caller.leakP_absorbing`, `Caller.leakD_absorbing`, `Caller.mwLeakP_absorbing`, `Caller.mwLeakD_absorbing` | A connector that forwards every publication leaks no held block on either node, never frees HBM while a worker on that node is still in flight (`mwEarlyFree = false`), and never lets decode read unwritten KV, both for one worker and across workers aggregated by `KVOutputAggregator`; a missed publication is unrecoverable by any later engine action. |
-| Peer isolation and uuid tables | `PeerIsolation.tcp_healthy_blocked_when_pool_full`, `PeerIsolation.grpc_healthy_can_complete`, `PeerIsolation.reachable_quota_admits_healthy`, `UuidTable.reachable_inv` | On the blocking TCP control plane a wedged pull holds a `push_pool_` worker, so `poolSize` pulls to a sick peer stop every further handshake, healthy peers included; on the gRPC backend a waiting pull holds no worker and a healthy peer completes regardless; a per-peer staging quota always admits healthy peers. A uuid is refused until its draining incumbent has settled, so staging slots are conserved. |
+| Peer isolation and uuid tables | `PeerIsolation.reachable_safe`, `PeerIsolation.tcp_healthy_blocked_when_pool_full`, `PeerIsolation.grpc_healthy_can_complete`, `UuidTable.reachable_inv` | Host staging slots and `push_pool_` workers are conserved across peers. On the blocking TCP control plane a wedged pull holds a `push_pool_` worker, so `poolSize` pulls to a sick peer stop every further handshake, healthy peers included; on the gRPC backend a waiting pull holds no worker and a healthy peer completes once admitted (while `numSlots` wedged reads still exhaust the shared staging pool). A uuid is refused until its draining incumbent has settled, so staging slots are conserved. |
 
 ## Modules
 
@@ -59,7 +59,7 @@ over the four shared buffers.
 | `PrefillDecode/Send.lean` | one `TransferSendSession`: pull claim, `StartPush`, D2H loop, H2H chain | `Send.reachable_safe` (`PullClaimed`), `Send.reachable_can_settle` |
 | `PrefillDecode/Pipeline.lean` | single request: handshake rendezvous + five layer-indexed memories, reclaim, reseat, handoff | `Pipeline.reachable_safe`, `Pipeline.reachable_unregistered_safe`, `Pipeline.attention_safe`, `Pipeline.reachable_can_settle`, `Pipeline.handedOff_quiet`, `Pipeline.inv_can_handoff` |
 | `PrefillDecode/MultiRequest.lean` | `multiSys`: concurrent/overlapped requests, read- and write-after-release checks (`wroteReleased`) | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe`, `Pipeline.system_progress` |
-| `PrefillDecode/PeerIsolation.lean` | one consumer, `Peer.sick` / `Peer.healthy` producers, `StagingBlockAllocator` slots (`unboundedPerPeer` vs `perPeerQuota`), `push_pool_` (`tcpBlocking` vs `grpcAsync`) | `PeerIsolation.reachable_inv`, `tcp_healthy_blocked_when_pool_full`, `grpc_healthy_can_complete`, `reachable_quota_admits_healthy` |
+| `PrefillDecode/PeerIsolation.lean` | one consumer, `Peer.sick` / `Peer.healthy` producers, `StagingBlockAllocator` slots, `push_pool_` (`tcpBlocking` vs `grpcAsync`) | `PeerIsolation.reachable_safe`, `PeerIsolation.reachable_inv`, `tcp_healthy_blocked_when_pool_full`, `grpc_healthy_can_complete`, `trace_sick_peer_starves_staging_slots` |
 | `PrefillDecode/UuidTable.lean` | `active_recv_sessions_` / `send_sessions_` tables, drain-before-reuse, `req_id` idempotency, `CompleteReadWithDetails` sweep | `UuidTable.reachable_inv`, `active_recv_preserved`, `active_send_preserved` |
 | `PrefillDecode/BlockOrdering.lean` | within-layer blocks: `PopulateRegisteredBlocks`, `ValidateRequestedBlocksLocked`, `BuildCoalescedCopySpec`, `BuildLoadCopyPlan` (`remote_order` / `local_order`), custom host staging, `BlockPipeline` | `execCoalesced_buildCoalescedSpec`, `landStage_get_requested`, `h2dStage_get_requested`, `BlockPipeline.step_pipe`, `BlockPipeline.reachable_safe` |
 | `PrefillDecode/PipelineChecks.lean` | `Pipeline` / `multiSys` traces, `#guard` searches, mutants | `Pipeline.trace_normal`, `trace_layers_out_of_order`, `trace_pull_ahead_of_registration`, `trace_multi_request`, `trace_overlapped_requests` |
@@ -168,15 +168,22 @@ control flow, or an external contract.
 
 ## Shipping C++ vs. modelled design alternatives
 
-Two modules parameterize both the **shipping C++ behavior** and a
-**non-shipping design alternative** so both can be compared formally:
+One module parameterizes both the **shipping C++ behavior** and a
+**non-shipping design alternative** so both can be compared formally (`stepM` in
+`ReceivePoll.lean`). Every other module has one shipping `step`
+(`Backend.tcpBlocking` and `Backend.grpcAsync` in `PeerIsolation.lean` are both
+shipping C++ control-plane backends); where a trace shows what the shipping code
+leaves open, an alternative `step` at the end of the module or in `Traces.lean`
+records the candidate change — `PeerIsolation.stepPerPeerQuota` (a per-peer
+staging cap on `StartRead` for
+`DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`) and
+`Transport.stepHardened` (chunk-count over-count rejection and a session-side
+per-layer once-latch) — without parameterizing the main model or its inductive
+theorems.
 
 | Module | Parameter | Shipping C++ behavior | Modelled design alternative (not in shipping C++) |
 |---|---|---|---|
-| `PrefillDecode/PeerIsolation.lean` | `SlotPolicy` | **`unboundedPerPeer`**: `StartRead` acquires staging with no per-peer cap, so `numSlots` wedged reads to one sick peer exhaust the pool and healthy reads fail admission (`trace_sick_peer_starves_staging_slots`, the `DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer` test). | **`perPeerQuota maxPerPeer`**: caps the slots one `remote_endpoint` may hold; a sick peer holds at most `maxPerPeer` (`reachable_sick_staging_le_quota`) and healthy peers are always admitted (`reachable_quota_admits_healthy`). |
 | `PrefillDecode/ReceivePoll.lean` | `stepM (poll : Bool)` | **`stepM true`**: the poll in `CompleteReadWithDetails` finishes a session whose `IsReadyToComplete()` holds. Safe, but when it fires between the last future becoming ready and the last callback running, that callback sees `draining_` and skips the end-of-transfer metrics (`trace_poll_skips_metrics`). | **`stepM false`**: only the last H2D callback finishes a session with layers (a zero-layer receive would have to finish at creation, as a zero-layer send does). Keeps every safety and settlement property (`noPoll_safe`, `noPoll_can_settle`) and guarantees metrics on success (`noPoll_metrics_on_success`). |
-
-*(Note: in `PeerIsolation.lean`, `Backend.tcpBlocking` and `Backend.grpcAsync` are both shipping C++ control-plane backends.)*
 
 ## Counterfactual mutants
 
@@ -195,6 +202,8 @@ Each mutant removes a specific C++ guard or ordering constraint and yields a
 | `Pipeline.h2dReadyByRank` (`trace_h2d_by_rank`) | H2D copy for layer `l` reads staging slot `l` rather than a completion-counter index | Publication correctness (out-of-order landing produces `[kv 1, junk]`) |
 | `Pipeline.reseatAtFinish` (`trace_reseat_at_finish`) | Prefill staging released only when settling (`done_ = true`, `in_flight_ == 0`), not immediately on `FinishLocked` (`draining_ = true`) | Publication correctness / staging safety |
 | `UuidTable.stepOverwriteDraining` | `EmplaceRecvSessionLocked` rejects a duplicate UUID while an expired incumbent is still draining (`draining = true, done = false`) rather than overwriting it | Staging slot conservation (`freeSlots + activeStaging = numSlots`) |
+| `PeerIsolation.stepReleaseOnCancel` | `TransferReceiveSession` releases its `StagingBlockAllocator` slot only on `Lifecycle.settleLocked` (`in_flight_ == 0`), not on `.cancel` while the pull handshake (`inFlight = 1`) is still outstanding | Staging slot conservation (`PeerIsolation.Safe`: `freeSlots + activeStaging = numSlots`) |
+| `PeerIsolation.stepPerPeerQuota` (candidate fix, not a mutant) | adds a per-peer cap `peerStaging peer < maxPerPeer` on `StartRead` staging admission (`DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`) | none within the search depth (`= .outOfFuel`), where shipping `step` hits `starvesFirstHealthy` at depth 3 (`trace_per_peer_quota_admits_healthy`) |
 | `BlockOrdering.trace_mutant_mismatched_transport_order` (`buildBuggyCopyPlan`) | `BuildLoadCopyPlan` applies `remote_order` to `producer_remote_block_ids` **and** to `transport_host_block_ids`; the mutant keeps `h2hPairs` in the unsorted request order | Within-layer block publication correctness: on `test_host_reordering` (`remote = [1, 0]`, `local = [0, 1]`) `h2dStage` yields `[.kv 0 0, .kv 0 1]` instead of the correct `[.kv 0 1, .kv 0 0]` |
 | `Transport` with `Cfg.honest = false` (`trace_dup_chunk_publishes_missing_layer`, `trace_dup_after_retirement`) | `Transport` A4, honest senders: the chunk-count contract has no over-count rejection, every accepted stream is counted, and `layer_progress_` is erased on `all_layers_called` while the receive is live | `NetworkSound` / `CompleteOnSuccess`: success published with a layer never copied (chunk-count, before retirement); `OnceDispatched`: a layer copied twice after retirement on either contract (`trace_dup_copy_fails_late`: a failing duplicate fails the receive) |
 | `Transport.stepHardened` (candidate fix, not a mutant) | adds the missing over-count rejection to the chunk-count contract and a per-layer once-latch in `ExecuteLayerH2d` | none within the search depth on the dishonest instances (`searchHardened … = .outOfFuel`); honest traces unchanged (`trace_hardened_honest`) |
@@ -269,7 +278,7 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `mgr.cc` | `KVCacheManagerWithTransfer::EmplaceRecvSessionLocked` | `:703-719` | `PrefillDecode/UuidTable.lean` | drain-before-reuse on `active_recv_sessions_[uuid]` | `UuidTable.active_recv_preserved`, `UuidTable.trace_duplicate_uuid_rejected_until_drained`, mutant `UuidTable.stepOverwriteDraining` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::RegisterActivePlan` | `:721-809` | `PrefillDecode/UuidTable.lean`, `PrefillDecode/Receive.lean` | `UuidTable.Ev.registerRecv`, Receive A2 | `UuidTable.reachable_inv` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::RegisterRecv` | `:811-831` | `PrefillDecode/UuidTable.lean`, `PrefillDecode/Receive.lean` | `UuidTable.Ev.registerRecv` | `UuidTable.reachable_inv` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:1045-1149` | `PrefillDecode/UuidTable.lean`, `PrefillDecode/PeerIsolation.lean`, `PrefillDecode/Receive.lean` | `UuidTable.Ev.startRead`, `PeerIsolation.Ev.startRead peer` | `UuidTable.trace_duplicate_receive_different_req_id`, `UuidTable.trace_repeated_receive_same_req_id_idempotent` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:1045-1149` | `PrefillDecode/UuidTable.lean`, `PrefillDecode/PeerIsolation.lean`, `PrefillDecode/Receive.lean` | `UuidTable.Ev.startRead`, `PeerIsolation.Ev.startRead peer`, `stepPerPeerQuota` | `UuidTable.trace_duplicate_receive_different_req_id`, `UuidTable.trace_repeated_receive_same_req_id_idempotent`, `PeerIsolation.trace_sick_peer_starves_staging_slots` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:1151-1292` | `PrefillDecode/Send.lean`, `PrefillDecode/Receive.lean`, `PrefillDecode/Pipeline.lean`, `PrefillDecode/UuidTable.lean`, `Transfer/Caller.lean` | `cancel`, `pollReady`, `publish`, `sweepSend`, `sweepRecv`, `Caller.Ev.pOutcome`, `Caller.Ev.dOutcome` | `Send.trace_deadline_during_copy`, `Recv.trace_deadline_during_copy`, `Pipeline.PrefillHbmSafe`, `Pipeline.DecodeHbmSafe`, `Pipeline.StagingSafe`, `Caller.contract_safe` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadRaw` | `:1295-1300` | `PrefillDecode/Receive.lean` | `CompleteReadRaw` wrapper around `CompleteReadWithDetails` | `Recv.ReadinessSound` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` | `:1431-1557` | `PrefillDecode/Pipeline.lean`, `PrefillDecode/PipelineChecks.lean`, `PrefillDecode/Send.lean` | `Pipeline.Ev.pullWait`, `Send.Ev.beginPull`, `Send.Ev.cancel` | `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe`, `Pipeline.trace_pull_ahead_of_registration`, `Pipeline.trace_unregistered_pull_rejected`, `Send.trace_pull_spawn_failure_cleanup` |
@@ -298,7 +307,7 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | File | Symbol / anchor | Lines | Lean module | Model events / definitions | Key theorems / mutants |
 |---|---|---|---|---|---|
 | `tcp_control_plane_backend.cc` | `TcpControlPlaneBackend::SendPullRequestBlocking` | `:592-660` | `PrefillDecode/PeerIsolation.lean` | `Backend.tcpBlocking` | `PeerIsolation.tcp_healthy_blocked_when_pool_full` |
-| `grpc_control_plane_backend.cc` | `GrpcControlPlaneBackend::SendPullRequest` | `:306-334` | `PrefillDecode/PeerIsolation.lean` | `Backend.grpcAsync` | `PeerIsolation.grpc_healthy_can_complete`, `PeerIsolation.reachable_quota_admits_healthy` |
+| `grpc_control_plane_backend.cc` | `GrpcControlPlaneBackend::SendPullRequest` | `:306-334` | `PrefillDecode/PeerIsolation.lean` | `Backend.grpcAsync` | `PeerIsolation.grpc_healthy_can_complete`, `PeerIsolation.grpc_freeWorkers_eq_poolSize` |
 <!-- source-map:end -->
 
 *External, the production caller pair (`Transfer/Caller.lean`):*

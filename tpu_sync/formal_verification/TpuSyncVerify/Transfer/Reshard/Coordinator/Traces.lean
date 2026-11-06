@@ -1,7 +1,7 @@
 import TpuSyncVerify.Common.ModelCheck
-import TpuSyncVerify.Transfer.Reshard.Coordinator.Hardened
+import TpuSyncVerify.Transfer.Reshard.Coordinator.Invariant
 
-/-! # `Coordinator`: failure-cleanup counterexamples, happy-path trace, and mutants
+/-! # `Coordinator`: failure-cleanup traces, happy-path trace, searches, mutants, and the disarm-and-abandon alternative
 
 Part of `TpuSyncVerify.Transfer.Reshard.Coordinator`. -/
 
@@ -11,7 +11,7 @@ open TpuSyncVerify
 
 open TpuSyncVerify.Transfer.Reshard.Registry
 
-/-! ## Part V — Failure-Cleanup Counterexamples, Happy-Path Trace, and Mutants -/
+/-! ## Part IV — Failure-Cleanup Traces, Happy-Path Trace, Searches, and Mutants -/
 
 /-- **Partial-arm failure counterexample trace (`ReshardCoordinator::RunSubPlan`, `return arm_status[i];`)**:
 Two source units `[0, 1]` and two destination units `[10, 11]`.
@@ -29,11 +29,11 @@ def partialArmFailureTrace : List Ev :=
   , .armDstResult 11 false
   , .finishArmBarrier ]
 
-/-- Under `.shipping`, `partialArmFailureTrace` ends in `.aborted` with
+/-- `partialArmFailureTrace` ends in `.aborted` with
 `dst_unit 10` still holding `sessionArmed = true` and `stagingLeaseHeld = true`
 (orphaned until `timeout_s_`). -/
 theorem trace_partial_arm_orphans_armed_receiver :
-    ((CoordState.sys .shipping [0, 1] [10, 11] 101).run partialArmFailureTrace).map
+    ((CoordState.sys [0, 1] [10, 11] 101).run partialArmFailureTrace).map
       (fun s =>
         ( s.phase
         , s.dstStates.map (fun d => (d.unit, d.sessionArmed, d.stagingLeaseHeld))
@@ -62,13 +62,13 @@ def dispatchFailureTrace : List Ev :=
   , .sendSrcResult 1 false
   , .finishSendBarrier ]
 
-/-- Under `.shipping`, `dispatchFailureTrace` ends in `.aborted` with:
+/-- `dispatchFailureTrace` ends in `.aborted` with:
 1. Both `dst_unit 10` and `dst_unit 11` orphaned with `sessionArmed = true` and
    `stagingLeaseHeld = true` (waiting for `src_unit 1`'s push until `timeout_s_`);
 2. `s.reg.claimedUnits = some [0, 1]` and `s.reg.claimOwners = [101]` leaked in
    `RequestBlockRegistry` (blocking `CancelIfUnclaimed` until `ttl_s_`). -/
 theorem trace_dispatch_failure_orphans_receivers_and_claim :
-    ((CoordState.sys .shipping [0, 1] [10, 11] 101).run dispatchFailureTrace).map
+    ((CoordState.sys [0, 1] [10, 11] 101).run dispatchFailureTrace).map
       (fun s =>
         ( s.phase
         , s.dstStates.map (fun d => (d.unit, d.sessionArmed, d.stagingLeaseHeld))
@@ -77,27 +77,6 @@ theorem trace_dispatch_failure_orphans_receivers_and_claim :
         , (RegGen.step s.reg .cancelIfUnclaimed).map (fun r => r.cancelled) )) =
       some (.aborted, [(10, true, true), (11, true, true)], some [0, 1], [101], some false) := by
   rfl
-
-/-- Under `.disarmAndAbandonOnFailure`, both `partialArmFailureTrace` and
-`dispatchFailureTrace` clean up all receiver sessions, staging leases, and
-registry claims on abort. -/
-theorem trace_hardened_policy_cleans_up_partial_arm_and_dispatch_failure :
-    (((CoordState.sys .disarmAndAbandonOnFailure [0, 1] [10, 11] 101).run
-        partialArmFailureTrace).map
-      (fun s =>
-        ( s.phase
-        , s.dstStates.map (fun d => (d.sessionArmed, d.stagingLeaseHeld))
-        , s.reg.claimedUnits )) =
-      some (.aborted, [(false, false), (false, false)], none)) ∧
-    (((CoordState.sys .disarmAndAbandonOnFailure [0, 1] [10, 11] 101).run
-        dispatchFailureTrace).map
-      (fun s =>
-        ( s.phase
-        , s.dstStates.map (fun d => (d.sessionArmed, d.stagingLeaseHeld))
-        , s.reg.claimedUnits
-        , s.reg.claimOwners )) =
-      some (.aborted, [(false, false), (false, false)], none, [])) := by
-  exact ⟨rfl, rfl⟩
 
 /-- Happy-path 2x2 multicast reshard execution trace
 (`ReshardCoordinator::RunSubPlan`,
@@ -118,7 +97,7 @@ def coordinatorHappyTrace : List Ev :=
   , .finishSendBarrier ]
 
 theorem trace_coordinator_happy_path :
-    ((CoordState.sys .shipping [0, 1] [10] 101).run
+    ((CoordState.sys [0, 1] [10] 101).run
       [ .registerProducer 0
       , .registerProducer 1
       , .startPlan true
@@ -132,7 +111,7 @@ theorem trace_coordinator_happy_path :
         , s.dstStates.map (fun d => (d.unit, d.completed, d.sessionArmed, d.stagingLeaseHeld))
         , s.reg.retired )) =
       some (.succeeded, [(10, true, false, false)], true) ∧
-    ((CoordState.sys .shipping [0, 1] [10, 11] 101).run coordinatorHappyTrace).map
+    ((CoordState.sys [0, 1] [10, 11] 101).run coordinatorHappyTrace).map
       (fun s =>
         ( s.phase
         , s.dstStates.map (fun d => (d.unit, d.completed, d.sessionArmed, d.stagingLeaseHeld))
@@ -154,8 +133,8 @@ theorem trace_coordinator_happy_path :
    (`s.reg.claimedUnits = none`, `s.reg.status = .registered`), and a fresh
    coordination claim (`RegGen.step s.reg (.lookupAndClaim 102 [0])`) succeeds. -/
 theorem trace_arm_failure_abandons_claim_and_skips_senders :
-    (CoordState.sys .shipping [0] [10] 101).run [.startPlan true] = none ∧
-    (((CoordState.sys .shipping [0] [10] 101).run
+    (CoordState.sys [0] [10] 101).run [.startPlan true] = none ∧
+    (((CoordState.sys [0] [10] 101).run
       [ .registerProducer 0
       , .startPlan true
       , .armDstResult 10 false
@@ -180,7 +159,7 @@ def stepSendWithoutArmBarrier (s : CoordState) (srcUnit : Nat) : CoordState :=
     sendResults := (srcUnit, true) :: s.sendResults }
 
 theorem mutant_dispatch_without_arm_barrier_drops_push :
-    ((CoordState.sys .shipping [0] [10, 11] 101).run
+    ((CoordState.sys [0] [10, 11] 101).run
       [.registerProducer 0, .startPlan true, .armDstResult 10 true]).map
       (fun s =>
         let s_premature := stepSendWithoutArmBarrier s 0
@@ -199,28 +178,75 @@ def checkEvents : List Ev :=
   , .sendSrcResult 1 true, .sendSrcResult 1 false
   , .finishSendBarrier ]
 
-/-- Executable negation of universal `CoordInv` properties. -/
-def violatesCoordInv (s : CoordState) : Bool :=
-  Registry.violates s.reg ||
-  ((s.phase == .idle || s.phase == .arming) &&
-   (!s.sendResults.isEmpty || s.dstStates.any (fun d => !d.pushesReceived.isEmpty || d.completed))) ||
-  (s.phase == .arming &&
-   (s.reg.claimedUnits != some s.srcUnits || s.reg.claimOwners != [s.claimOwner])) ||
-  ((s.phase == .dispatching || s.phase == .succeeded) &&
-   (s.armFailed || !allReported s.dstUnits s.armResults)) ||
-  s.dstStates.any (fun d => d.stagingLeaseHeld != d.sessionArmed)
+instance (s : CoordState) : Decidable (IdleShape s) := by unfold IdleShape; infer_instance
+instance (s : CoordState) : Decidable (ClaimedWhileArming s) := by unfold ClaimedWhileArming; infer_instance
+instance (s : CoordState) : Decidable (DispatchingShape s) := by unfold DispatchingShape; infer_instance
+instance (s : CoordState) : Decidable (NoPushBeforeAllArmed s) := by unfold NoPushBeforeAllArmed; infer_instance
+instance (s : CoordState) : Decidable (AllArmedInDispatching s) := by unfold AllArmedInDispatching; infer_instance
+instance (s : CoordState) : Decidable (LeaseMatchesSession s) := by unfold LeaseMatchesSession; infer_instance
+instance (s : CoordState) : Decidable (CoordInv s) :=
+  decidable_of_iff
+    (Registry.Inv s.reg ∧ IdleShape s ∧ ClaimedWhileArming s ∧ DispatchingShape s ∧
+      NoPushBeforeAllArmed s ∧ AllArmedInDispatching s ∧ LeaseMatchesSession s)
+    ⟨fun ⟨a, b, c, d, e, f, g⟩ => ⟨a, b, c, d, e, f, g⟩,
+     fun h => ⟨h.1, h.2, h.3, h.4, h.5, h.6, h.7⟩⟩
 
-/-- Executable check for orphan freedom in `.aborted`. -/
-def violatesNoOrphans (s : CoordState) : Bool :=
-  violatesCoordInv s ||
-  (s.phase == .aborted &&
-   (s.dstStates.any (fun d => d.sessionArmed || d.stagingLeaseHeld) ||
-    s.reg.claimedUnits.isSome || !s.reg.claimOwners.isEmpty))
+def violatesCoordInv (s : CoordState) : Bool := !decide (CoordInv s)
 
-#guard ModelCheck.check (CoordState.sys .shipping [0, 1] [10, 11] 101) checkEvents violatesCoordInv 12 = .safe
-#guard ModelCheck.check (CoordState.sys .disarmAndAbandonOnFailure [0, 1] [10, 11] 101) checkEvents violatesNoOrphans 12 = .safe
-#guard (match ModelCheck.check (CoordState.sys .shipping [0, 1] [10, 11] 101) checkEvents violatesNoOrphans 12 with
-  | .counterexample _ => true | _ => false)
+theorem violatesCoordInv_iff (s : CoordState) : violatesCoordInv s = false ↔ CoordInv s := by
+  simp [violatesCoordInv]
 
+#guard ModelCheck.check (CoordState.sys [0, 1] [10, 11] 101) checkEvents violatesCoordInv 12 = .safe
+
+/-! ### The disarm-and-abandon alternative
+
+What the two abort paths leave behind — an armed receiver after a partial arm,
+armed receivers and the claim after a failed dispatch — is what a `RunSubPlan`
+that disarmed the armed destinations and called `AbandonClaim` on every abort
+would clean up. `stepDisarmAndAbandon` is `step` with that cleanup on
+`finishArmBarrier` and `finishSendBarrier`; it is not the shipping code. -/
+
+/-- Disarm a destination, releasing its `ReshardReceiveSession` and `PoolStagingLease`. -/
+def disarm (d : DstUnitState) : DstUnitState :=
+  { d with sessionArmed := false, stagingLeaseHeld := false }
+
+def stepDisarmAndAbandon (s : CoordState) (e : Ev) : Option CoordState :=
+  match e with
+  | .finishArmBarrier | .finishSendBarrier =>
+    (CoordState.step s e).map fun s' =>
+      if s'.phase == .aborted then
+        { s' with dstStates := s'.dstStates.map disarm, reg := abandonIfClaimed s'.reg s'.claimOwner }
+      else s'
+  | e => CoordState.step s e
+
+def sysDisarmAndAbandon (srcUnits dstUnits : List Nat) (claimOwner : Nat) : System CoordState Ev :=
+  ⟨CoordState.init srcUnits dstUnits claimOwner, stepDisarmAndAbandon⟩
+
+/-- No armed receiver, held lease, or registry claim survives an abort. -/
+def NoOrphansWhenAborted (s : CoordState) : Prop :=
+  s.phase = .aborted →
+    (∀ d ∈ s.dstStates, d.sessionArmed = false ∧ d.stagingLeaseHeld = false) ∧
+    s.reg.claimedUnits = none ∧ s.reg.claimOwners = []
+
+instance (s : CoordState) : Decidable (NoOrphansWhenAborted s) := by
+  unfold NoOrphansWhenAborted; infer_instance
+
+def violatesNoOrphans (s : CoordState) : Bool := !decide (CoordInv s ∧ NoOrphansWhenAborted s)
+
+/-- On both abort traces the alternative leaves nothing armed, leased, or claimed. -/
+theorem trace_disarm_and_abandon_cleans_up_both_aborts :
+    ((sysDisarmAndAbandon [0, 1] [10, 11] 101).run partialArmFailureTrace).map
+      (fun s => (s.phase, s.dstStates.map (fun d => (d.sessionArmed, d.stagingLeaseHeld)),
+        s.reg.claimedUnits)) =
+      some (.aborted, [(false, false), (false, false)], none) ∧
+    ((sysDisarmAndAbandon [0, 1] [10, 11] 101).run dispatchFailureTrace).map
+      (fun s => (s.phase, s.dstStates.map (fun d => (d.sessionArmed, d.stagingLeaseHeld)),
+        s.reg.claimedUnits, s.reg.claimOwners)) =
+      some (.aborted, [(false, false), (false, false)], none, []) := by
+  exact ⟨rfl, rfl⟩
+
+#guard (ModelCheck.check (CoordState.sys [0, 1] [10, 11] 101) checkEvents violatesNoOrphans 12
+  matches .counterexample _)
+#guard ModelCheck.check (sysDisarmAndAbandon [0, 1] [10, 11] 101) checkEvents violatesNoOrphans 12 = .safe
 
 end TpuSyncVerify.Transfer.Reshard.Coordinator

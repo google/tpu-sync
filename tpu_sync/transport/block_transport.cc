@@ -187,35 +187,6 @@ void RecordTransferFailure(const absl::Status& status,
 
 constexpr uint8_t kUseBlockChunksFlag = 0x80;
 
-absl::Status ValidateChunks(BlockTransportDelegate* delegate, size_t l,
-                            size_t sh, const std::vector<BlockChunk>& chunks) {
-  uint8_t* base = delegate->GetBlockArrayHostPointer(l, sh);
-  // Some legacy delegates intentionally expose only scattered per-block
-  // pointers and no flat array base. Preserve that contract; pool-aware
-  // managers always expose their exact pool span here.
-  if (base != nullptr) {
-    const size_t host_size = delegate->GetBlockArrayHostSize(l, sh);
-    const uintptr_t base_addr = reinterpret_cast<uintptr_t>(base);
-    for (const auto& chunk : chunks) {
-      const uintptr_t chunk_addr = reinterpret_cast<uintptr_t>(chunk.ptr);
-      if (chunk_addr < base_addr) {
-        return absl::OutOfRangeError(absl::StrCat(
-            "Chunk out of bounds. Chunk ptr: ", chunk_addr,
-            ", size: ", chunk.size, ", Block array base: ", base_addr,
-            ", Block array size: ", host_size));
-      }
-      const size_t offset = chunk_addr - base_addr;
-      if (offset > host_size || chunk.size > host_size - offset) {
-        return absl::OutOfRangeError(absl::StrCat(
-            "Chunk out of bounds. Chunk ptr: ", chunk_addr,
-            ", size: ", chunk.size, ", Block array base: ", base_addr,
-            ", Block array size: ", host_size));
-      }
-    }
-  }
-  return absl::OkStatus();
-}
-
 absl::StatusOr<MajorOrder> ParseMajorOrder(uint8_t value) {
   uint8_t order_val = value & ~kUseBlockChunksFlag;
   switch (order_val) {
@@ -839,7 +810,8 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
                 absl::StrCat("No transfer chunks found for block ", src_id,
                              " and uuid ", uuid));
           }
-          ABSL_RETURN_IF_ERROR(ValidateChunks(block_delegate_, l, sh, chunks));
+          ABSL_RETURN_IF_ERROR(
+              ValidateChunks(block_delegate_, l, sh, uuid, chunks));
 
           // What the receiver needs to handle these chunks. Uses
           // `wire_layer_idx` when set (the receiver's array index), otherwise
@@ -1002,12 +974,13 @@ BlockTransport::BuildBlockPullRequests(
                              " and uuid ", uuid));
           }
           ABSL_RETURN_IF_ERROR(
-              ValidateChunks(block_delegate_, l, sh, block_chunks));
+              ValidateChunks(block_delegate_, l, sh, uuid, block_chunks));
 
           uint8_t* default_base = nullptr;
           uint8_t* explicit_base = nullptr;
           if (!explicit_dst_ptrs.empty()) {
-            default_base = block_delegate_->GetBlockArrayHostPointer(l, sh);
+            default_base =
+                block_delegate_->GetBlockArrayHostSpan(l, sh, uuid).ptr;
             explicit_base =
                 explicit_dst_ptrs[l * block_delegate_->num_shards() + sh];
           }

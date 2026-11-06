@@ -451,7 +451,9 @@ TEST(KVCacheManagerTest,
                                              /*pool_idx=*/0, /*shard_idx=*/0,
                                              /*block_id=*/1));
   EXPECT_EQ(last_ref.ptr, src + 160);
-  EXPECT_EQ(sender.GetBlockArrayHostSize(/*pool_idx=*/0, /*shard_idx=*/0), 224);
+  EXPECT_EQ(
+      sender.GetBlockArrayHostSpan(/*block_array_idx=*/0, /*shard_idx=*/0).size,
+      224);
 
   const std::optional<int> receiver_port = receiver.local_port();
   ASSERT_TRUE(receiver_port.has_value());

@@ -539,10 +539,9 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // constructor storages otherwise.
   size_t num_block_arrays() const override;
   size_t block_bytes(size_t block_array_idx) const override;
-  uint8_t* GetBlockArrayHostPointer(size_t block_array_idx,
-                                    size_t shard_idx) override;
-  size_t GetBlockArrayHostSize(size_t block_array_idx,
-                               size_t shard_idx) override;
+  transport::BlockChunk GetBlockArrayHostSpan(size_t block_array_idx,
+                                              size_t shard_idx,
+                                              uint64_t uuid = 0) override;
 
   int64_t LayerBlockByteSize(size_t layer_idx) const;
 
@@ -907,6 +906,14 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Lazily materializes one implicit pool per storage when RegisterPools was
   // never called (or the host buffers were replaced since).
   void EnsureImplicitPools() const;
+
+  // Resolves the host layer buffer index backing |block_array_idx| for
+  // transfer |uuid|, consulting the active TransferSession's staging lease
+  // when |uuid| is non-zero. Returns an error status when |block_array_idx|
+  // is out of range, |uuid| is unleased under bounded host staging, or
+  // session/slot resolution fails.
+  absl::StatusOr<size_t> ResolveBlockArrayHostLayer(size_t block_array_idx,
+                                                    uint64_t uuid) const;
 
   // Grows a storage's host mirror so pool D2H/H2D and block refs can address
   // the last declared live byte at storage offsets. Host staging is sized at

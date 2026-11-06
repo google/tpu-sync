@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -45,6 +46,7 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
+#include "tpu_sync/kv_cache/reshard_receive_session.h"
 #include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
@@ -343,6 +345,11 @@ class FakeD2hBase : public kv_cache::KVCacheManagerBase {
     hold_next_[pool_idx] = true;
   }
 
+  void FillOnCopy(size_t pool_idx, uint8_t fill_byte) {
+    absl::MutexLock lock(fake_mu_);
+    fill_byte_[pool_idx] = fill_byte;
+  }
+
   // Completes the pending copy of `pool_idx`.
   void CompleteCopy(size_t pool_idx) {
     xla::Promise<> promise;
@@ -378,6 +385,16 @@ class FakeD2hBase : public kv_cache::KVCacheManagerBase {
       std::optional<size_t> host_layer_idx) override {
     auto [promise, future] = xla::MakePromise();
     absl::MutexLock lock(fake_mu_);
+    if (auto it = fill_byte_.find(pool_idx);
+        it != fill_byte_.end() && host_layer_idx.has_value()) {
+      const kv_cache::PoolSpec* spec = pool(pool_idx);
+      if (spec != nullptr) {
+        uint8_t* dst = GetHostPointer(*host_layer_idx, 0);
+        if (dst != nullptr) {
+          std::memset(dst + spec->base_offset_bytes, it->second, 16);
+        }
+      }
+    }
     ++copies_issued_[pool_idx];
     if (hold_next_[pool_idx]) {
       hold_next_[pool_idx] = false;
@@ -391,6 +408,7 @@ class FakeD2hBase : public kv_cache::KVCacheManagerBase {
  private:
   mutable absl::Mutex fake_mu_;
   absl::flat_hash_map<size_t, bool> hold_next_ ABSL_GUARDED_BY(fake_mu_);
+  absl::flat_hash_map<size_t, uint8_t> fill_byte_ ABSL_GUARDED_BY(fake_mu_);
   absl::flat_hash_map<size_t, xla::Promise<>> pending_
       ABSL_GUARDED_BY(fake_mu_);
   absl::flat_hash_map<size_t, int> copies_issued_ ABSL_GUARDED_BY(fake_mu_);
@@ -806,6 +824,127 @@ TEST(ReshardSendSessionTest, StagingSlotReleasedAfterLastPeerPush) {
   EXPECT_FALSE(session->plan().has_value());
   EXPECT_THAT(session->ResolveStagingSlot(0),
               StatusIs(absl::StatusCode::kCancelled));
+}
+
+class RecordingH2dReceiverBase : public kv_cache::KVCacheManagerBase {
+ public:
+  explicit RecordingH2dReceiverBase(size_t num_layers)
+      : KVCacheManagerBase(num_layers, /*num_shards=*/1,
+                           /*slice_byte_size=*/128,
+                           /*local_port=*/std::nullopt,
+                           /*host_blocks_to_allocate=*/std::make_optional(4)) {}
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
+      size_t pool_idx, absl::Span<const int64_t> block_ids,
+      std::optional<size_t> shard_idx, std::optional<uint64_t> uuid,
+      std::optional<size_t> host_layer_idx) override {
+    if (!host_layer_idx.has_value() || block_ids.size() != 1) {
+      return absl::InvalidArgumentError(
+          "expected a single resolved host staging block");
+    }
+    const kv_cache::PoolSpec* spec = pool(pool_idx);
+    if (spec == nullptr) {
+      return absl::InvalidArgumentError("unknown pool_idx");
+    }
+    const uint8_t* src = GetHostPointer(*host_layer_idx, /*shard_idx=*/0) +
+                         spec->base_offset_bytes +
+                         static_cast<size_t>(block_ids[0]) *
+                             static_cast<size_t>(spec->block_stride_bytes);
+    {
+      absl::MutexLock lock(mu_);
+      uploaded_bytes_[pool_idx].assign(src, src + 16);
+      uploaded_host_slots_[pool_idx] = *host_layer_idx;
+    }
+    auto [promise, future] = xla::MakePromise();
+    promise.Set();
+    return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
+  }
+
+  std::vector<uint8_t> uploaded_bytes(size_t pool_idx) const {
+    absl::MutexLock lock(mu_);
+    auto it = uploaded_bytes_.find(pool_idx);
+    if (it == uploaded_bytes_.end()) {
+      return {};
+    }
+    return it->second;
+  }
+
+  std::optional<size_t> uploaded_host_slot(size_t pool_idx) const {
+    absl::MutexLock lock(mu_);
+    auto it = uploaded_host_slots_.find(pool_idx);
+    if (it == uploaded_host_slots_.end()) {
+      return std::nullopt;
+    }
+    return it->second;
+  }
+
+ private:
+  mutable absl::Mutex mu_;
+  absl::flat_hash_map<size_t, std::vector<uint8_t>> uploaded_bytes_
+      ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<size_t, size_t> uploaded_host_slots_ ABSL_GUARDED_BY(mu_);
+};
+
+TEST(ReshardSendSessionTest,
+     PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks) {
+  std::vector<kv_cache::PoolSpec> pools = {DensePool("fa"), DensePool("state")};
+  pools[0].storage_index = 1;
+  pools[0].base_offset_bytes = 16;
+  pools[0].num_blocks = 3;
+  pools[1].storage_index = 0;
+  pools[1].base_offset_bytes = 32;
+  pools[1].num_blocks = 3;
+
+  FakeD2hBase sender(/*num_layers=*/2, /*num_shards=*/1,
+                     /*slice_byte_size=*/128, /*local_port=*/std::nullopt,
+                     /*host_blocks_to_allocate=*/std::make_optional(4));
+  sender.set_node_id(0);
+  ABSL_ASSERT_OK(sender.RegisterPools(pools));
+  sender.FillOnCopy(/*pool_idx=*/0, 0xA5);
+  sender.FillOnCopy(/*pool_idx=*/1, 0x5A);
+
+  RecordingH2dReceiverBase receiver(/*num_layers=*/2);
+  ABSL_ASSERT_OK(receiver.RegisterPools(pools));
+  const std::string peer =
+      absl::StrCat("127.0.0.1:", receiver.transport_server()->local_port());
+
+  sender.AttachPlaceholderDeviceHoldForTest();
+  receiver.AttachPlaceholderDeviceHoldForTest();
+  std::unique_ptr<StagingBlockAllocator> send_allocator =
+      CreateStagingBlockAllocator(&sender, /*num_slots=*/0, /*max_blocks=*/0);
+  std::unique_ptr<StagingBlockAllocator> recv_allocator =
+      CreateStagingBlockAllocator(&receiver, /*num_slots=*/0, /*max_blocks=*/0);
+
+  StartTransferRequest plan = ValidPlan(
+      /*uuid=*/1404, /*dtype_tags=*/{"bf16", "bf16"},
+      /*transferred_pools=*/{0, 1});
+  (*plan.mutable_shard_push_schedules())[0].mutable_entries(0)->set_dst_peer(
+      peer);
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferSession> recv_session,
+      CreateReshardReceiveSession(&receiver, recv_allocator.get(), plan,
+                                  std::vector<int64_t>{0}, deadline));
+  RouteSessionLookups(receiver, recv_session);
+  ABSL_ASSERT_OK(recv_session->Start());
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferSession> send_session,
+      CreateReshardSendSession(&sender, send_allocator.get(),
+                               std::vector<int64_t>{0}, /*parallelism=*/2,
+                               deadline, plan));
+  RouteSessionLookups(sender, send_session);
+
+  ABSL_ASSERT_OK(send_session->Start());
+  ABSL_EXPECT_OK(send_session->AwaitForDone());
+  ABSL_EXPECT_OK(recv_session->AwaitForDone());
+
+  EXPECT_EQ(receiver.uploaded_bytes(0), std::vector<uint8_t>(16, 0xA5));
+  EXPECT_EQ(receiver.uploaded_bytes(1), std::vector<uint8_t>(16, 0x5A));
+  EXPECT_NE(receiver.uploaded_host_slot(0), std::nullopt);
+  EXPECT_NE(receiver.uploaded_host_slot(1), std::nullopt);
 }
 
 }  // namespace

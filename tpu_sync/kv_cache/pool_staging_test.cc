@@ -176,7 +176,7 @@ TEST(PoolStagingTest, BoundedArenaLeasesAndAddressing) {
   EXPECT_EQ(summary[0].blocks_per_lease, 2);
   EXPECT_EQ(summary[0].free_slots, 4);
   // The transport's bounds span is the whole arena.
-  EXPECT_EQ(manager.GetBlockArrayHostSize(/*block_array_idx=*/0, 0),
+  EXPECT_EQ(manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, 0).size,
             static_cast<size_t>(4 * kStride));
 
   // No standing host residency on a bounded storage.
@@ -599,8 +599,10 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
   ABSL_ASSERT_OK(manager.RegisterPools(pools, /*staging_leases=*/2));
 
   for (size_t i = 0; i < kNumLayers; ++i) {
-    EXPECT_EQ(manager.GetBlockArrayHostSize(i, 0),
-              static_cast<size_t>(4 * kStride));
+    const transport::BlockChunk unleased_span =
+        manager.GetBlockArrayHostSpan(i, 0);
+    EXPECT_EQ(unleased_span.ptr, nullptr);
+    EXPECT_EQ(unleased_span.size, 0u);
   }
 
   // Receiver plan for uuid 42.
@@ -675,8 +677,96 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
   EXPECT_EQ(chunks[0].size, 16u);
   uint8_t* expected_host_base = manager.GetHostPointer(/*layer_idx=*/1, 0);
   EXPECT_EQ(chunks[0].ptr, expected_host_base + 1 * kStride);
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    const transport::BlockChunk span =
+        manager.GetBlockArrayHostSpan(i, 0, /*uuid=*/42);
+    EXPECT_EQ(span.ptr, manager.GetHostPointer(i % 2, 0));
+    EXPECT_EQ(span.size, static_cast<size_t>(4 * kStride));
+  }
+  const transport::BlockChunk span3 =
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/3, 0, /*uuid=*/42);
+  ASSERT_EQ(span3.ptr, expected_host_base);
+  EXPECT_EQ(span3.size, static_cast<size_t>(4 * kStride));
+  EXPECT_GE(chunks[0].ptr, span3.ptr);
+  EXPECT_LE(chunks[0].ptr + chunks[0].size, span3.ptr + span3.size);
 
   manager.ReleasePoolStagingLeases(42);
+}
+
+TEST(PoolStagingTest, BoundedHostLayersUnboundedPoolBlocksHostPointerAndSize) {
+  constexpr int64_t kBaseOffset = 32;
+  constexpr int64_t kStride = 64;
+  constexpr int64_t kNumBlocks = 8;
+  constexpr size_t kNumLayers = 4;
+  StagingTestManager manager(
+      /*num_layers=*/kNumLayers, /*num_shards=*/1,
+      /*slice_byte_size=*/kBaseOffset + kStride * kNumBlocks,
+      /*host_blocks=*/1, /*num_staging_layers=*/2);
+
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    manager.SetDeviceBacked(i, kBaseOffset + kStride * kNumBlocks);
+  }
+
+  std::vector<PoolSpec> pools;
+  pools.reserve(kNumLayers);
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    pools.push_back(DensePool("pool_" + std::to_string(i), /*storage_index=*/i,
+                              kBaseOffset, kStride, kNumBlocks,
+                              /*staging_blocks_per_request=*/0));
+  }
+  ABSL_ASSERT_OK(manager.RegisterPools(pools, /*staging_leases=*/0));
+  ASSERT_FALSE(manager.PoolStorageStagingBounded(3));
+
+  class StubPoolTransferSession : public TransferSession {
+   public:
+    absl::Status Start() override { return absl::OkStatus(); }
+    bool Done() const override { return false; }
+    void Finish(const absl::Status& status) override {}
+    bool TryBeginOp() override { return true; }
+    void EndOp() override {}
+    absl::Status GetStatus() const override { return absl::OkStatus(); }
+    absl::Status AwaitForDone() override { return absl::OkStatus(); }
+    bool IsDraining() const override { return false; }
+    absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
+      return unit % 2;
+    }
+    absl::Status OnDataReceived(size_t major_dimension_idx,
+                                absl::Span<const int> minor_dimension_indices,
+                                absl::Span<const int> shard_ids) override {
+      return absl::OkStatus();
+    }
+    tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+      return tsl::Future<>(absl::OkStatus());
+    }
+    absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+      return absl::nullopt;
+    }
+    std::chrono::steady_clock::time_point deadline() const override {
+      return std::chrono::steady_clock::time_point::max();
+    }
+  };
+  auto session = std::make_shared<StubPoolTransferSession>();
+  KVCacheManagerBase::TransferEventHooks hooks;
+  hooks.get_session =
+      [session](
+          uint64_t uuid) -> absl::StatusOr<std::shared_ptr<TransferSession>> {
+    if (uuid == 42) {
+      return session;
+    }
+    return absl::NotFoundError("no session");
+  };
+  manager.SetTransferEventHooks(std::move(hooks));
+
+  const transport::BlockChunk unleased_span =
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/3, 0, /*uuid=*/0);
+  EXPECT_EQ(unleased_span.ptr, nullptr);
+  EXPECT_EQ(unleased_span.size, 0u);
+  uint8_t* expected_base = manager.GetHostPointer(/*layer_idx=*/1, 0) +
+                           static_cast<size_t>(kBaseOffset);
+  const transport::BlockChunk leased_span =
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/3, 0, /*uuid=*/42);
+  EXPECT_EQ(leased_span.ptr, expected_base);
+  EXPECT_EQ(leased_span.size, static_cast<size_t>(kStride * kNumBlocks));
 }
 
 TEST(PoolStagingTest, GetBlockChunksLargePlanLinearScaling) {

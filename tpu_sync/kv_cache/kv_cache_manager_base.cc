@@ -2131,36 +2131,86 @@ size_t KVCacheManagerBase::block_bytes(size_t block_array_idx) const {
   return static_cast<size_t>(pools_[block_array_idx].block_stride_bytes);
 }
 
-uint8_t* KVCacheManagerBase::GetBlockArrayHostPointer(size_t block_array_idx,
-                                                      size_t shard_idx) {
+absl::StatusOr<size_t> KVCacheManagerBase::ResolveBlockArrayHostLayer(
+    size_t block_array_idx, uint64_t uuid) const {
   if (!explicit_pools_) {
-    // When fewer host buffers exist than layers, a layer's bytes sit in a
-    // leased buffer rather than at its own layer index.
-    if (layers_.size() < num_layers_) {
-      return nullptr;
+    if (block_array_idx >= num_layers_) {
+      return absl::OutOfRangeError(
+          absl::StrCat("block_array_idx ", block_array_idx,
+                       " out of range for num_layers ", num_layers_));
     }
-    return GetHostPointer(block_array_idx, shard_idx);
+    if (layers_.size() < num_layers_) {
+      if (uuid == 0) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "Cannot resolve host layer for layer ", block_array_idx,
+            " without transfer uuid when num_host_layers (", layers_.size(),
+            ") < num_layers (", num_layers_, ")"));
+      }
+      ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> session,
+                            GetSession(uuid));
+      if (session == nullptr) {
+        return absl::NotFoundError(
+            absl::StrCat("Null session for uuid ", uuid));
+      }
+      return session->ResolveStagingSlot(block_array_idx);
+    }
+    return block_array_idx;
   }
   if (block_array_idx >= pools_.size()) {
-    return nullptr;
+    return absl::OutOfRangeError(
+        absl::StrCat("block_array_idx ", block_array_idx,
+                     " out of range for num_pools ", pools_.size()));
   }
-  const PoolSpec& pool = pools_[block_array_idx];
-  uint8_t* storage_base = GetHostPointer(pool.storage_index, shard_idx);
-  if (storage_base == nullptr) {
-    return nullptr;
+  size_t host_layer_idx = pools_[block_array_idx].storage_index;
+  if (uuid != 0) {
+    absl::StatusOr<std::shared_ptr<TransferSession>> session = GetSession(uuid);
+    if (!session.ok() && !absl::IsNotFound(session.status())) {
+      return session.status();
+    }
+    absl::StatusOr<size_t> slot =
+        absl::NotFoundError(absl::StrCat("Session not found for uuid ", uuid));
+    if (session.ok() && *session != nullptr) {
+      slot = (*session)->ResolveStagingSlot(block_array_idx);
+    }
+    if (slot.ok()) {
+      host_layer_idx = *slot;
+    } else if (!absl::IsNotFound(slot.status())) {
+      return slot.status();
+    } else if (layers_.size() < num_layers_) {
+      return absl::FailedPreconditionError(
+          absl::StrCat("No staging slot leased for pool ", block_array_idx,
+                       " on uuid ", uuid, " when num_host_layers (",
+                       layers_.size(), ") < num_layers (", num_layers_, ")"));
+    }
+  } else if (layers_.size() < num_layers_) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("Cannot resolve host layer for pool ", block_array_idx,
+                     " without transfer uuid when num_host_layers (",
+                     layers_.size(), ") < num_layers (", num_layers_, ")"));
   }
-  return storage_base + pool.base_offset_bytes;
+  return host_layer_idx;
 }
 
-size_t KVCacheManagerBase::GetBlockArrayHostSize(size_t block_array_idx,
-                                                 size_t shard_idx) {
-  if (!explicit_pools_) {
-    return GetHostSize(block_array_idx, shard_idx);
+transport::BlockChunk KVCacheManagerBase::GetBlockArrayHostSpan(
+    size_t block_array_idx, size_t shard_idx, uint64_t uuid) {
+  const absl::StatusOr<size_t> host_layer_idx =
+      ResolveBlockArrayHostLayer(block_array_idx, uuid);
+  if (!host_layer_idx.ok()) {
+    return {};
   }
-  if (block_array_idx >= pools_.size() || shard_idx >= num_shards_) {
-    return 0;
+  uint8_t* storage_base = GetHostPointer(*host_layer_idx, shard_idx);
+  if (storage_base == nullptr) {
+    return {};
+  }
+  if (!explicit_pools_) {
+    return {.ptr = storage_base,
+            .size = GetHostSize(*host_layer_idx, shard_idx)};
   }
   const PoolSpec& pool = pools_[block_array_idx];
+  uint8_t* ptr = storage_base + pool.base_offset_bytes;
+  if (shard_idx >= num_shards_) {
+    return {.ptr = ptr, .size = 0};
+  }
   const size_t base_offset = static_cast<size_t>(pool.base_offset_bytes);
   {
     // Bounded staging: the addressable host span is the whole arena (leased
@@ -2171,22 +2221,22 @@ size_t KVCacheManagerBase::GetBlockArrayHostSize(size_t block_array_idx,
       const PoolStagingStorage& st = pool_staging_[pool.storage_index];
       const uint64_t arena = static_cast<uint64_t>(st.num_slots) *
                              static_cast<uint64_t>(st.stride_bytes);
-      const size_t host_buffer_size =
-          layers_.size() == 0 ? 0 : layers_[0].shards[shard_idx].host_size;
+      const size_t host_buffer_size = GetHostSize(*host_layer_idx, shard_idx);
       if (arena > host_buffer_size || base_offset > arena) {
-        return 0;
+        return {.ptr = ptr, .size = 0};
       }
-      return static_cast<size_t>(arena - base_offset);
+      return {.ptr = ptr, .size = static_cast<size_t>(arena - base_offset)};
     }
   }
-  const size_t storage_size = GetHostSize(pool.storage_index, shard_idx);
+  const size_t storage_size = GetHostSize(*host_layer_idx, shard_idx);
   const int64_t storage_end = pool.storage_extent_end_bytes();
   if (storage_end < pool.base_offset_bytes ||
       static_cast<uint64_t>(storage_end) > storage_size ||
       base_offset > storage_size) {
-    return 0;
+    return {.ptr = ptr, .size = 0};
   }
-  return static_cast<size_t>(storage_end - pool.base_offset_bytes);
+  return {.ptr = ptr,
+          .size = static_cast<size_t>(storage_end - pool.base_offset_bytes)};
 }
 
 int64_t KVCacheManagerBase::LayerBlockByteSize(size_t layer_idx) const {
@@ -3361,6 +3411,7 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
   // inside its storage. Otherwise the legacy uniform layer addressing applies.
   size_t block_size_bytes = block_bytes(layer_idx);
   uint8_t* base_host_ptr = nullptr;
+  uint8_t* storage_base = nullptr;
   // Bounded host staging: on a bounded
   // storage a block's host bytes live in the slot leased to this uuid, not at
   // block_id * stride. `staging_lease` is the snapshot used below; null means
@@ -3393,7 +3444,7 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
     } else if (layers_.size() < num_layers_) {
       return {};
     }
-    uint8_t* storage_base = GetHostPointer(host_layer_idx, shard_idx);
+    storage_base = GetHostPointer(host_layer_idx, shard_idx);
     if (storage_base == nullptr) {
       return {};
     }
@@ -3452,8 +3503,6 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
         auto extents_status = ComputePoolBlockCopyExtents(
             pool, absl::MakeConstSpan(&block_id, 1));
         if (!extents_status.ok()) return {};
-        uint8_t* storage_base = GetHostPointer(pool.storage_index, shard_idx);
-        if (storage_base == nullptr) return {};
         for (const PoolBlockCopyExtent& extent : *extents_status) {
           if (accumulated_bytes >= total_bytes) break;
           const size_t size = std::min(static_cast<size_t>(extent.size_bytes),

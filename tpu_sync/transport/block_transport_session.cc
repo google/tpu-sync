@@ -111,35 +111,6 @@ std::vector<struct iovec> ToIovec(const std::vector<BlockChunk>& chunks) {
   return iov;
 }
 
-absl::Status ValidateChunks(BlockTransportDelegate* delegate, size_t l,
-                            size_t sh, const std::vector<BlockChunk>& chunks) {
-  uint8_t* base = delegate->GetBlockArrayHostPointer(l, sh);
-  // Some legacy delegates intentionally expose only scattered per-block
-  // pointers and no flat array base. Preserve that contract; pool-aware
-  // managers always expose their exact pool span here.
-  if (base != nullptr) {
-    const size_t host_size = delegate->GetBlockArrayHostSize(l, sh);
-    const uintptr_t base_addr = reinterpret_cast<uintptr_t>(base);
-    for (const auto& chunk : chunks) {
-      const uintptr_t chunk_addr = reinterpret_cast<uintptr_t>(chunk.ptr);
-      if (chunk_addr < base_addr) {
-        return absl::OutOfRangeError(absl::StrCat(
-            "Chunk out of bounds. Chunk ptr: ", chunk_addr,
-            ", size: ", chunk.size, ", Block array base: ", base_addr,
-            ", Block array size: ", host_size));
-      }
-      const size_t offset = chunk_addr - base_addr;
-      if (offset > host_size || chunk.size > host_size - offset) {
-        return absl::OutOfRangeError(absl::StrCat(
-            "Chunk out of bounds. Chunk ptr: ", chunk_addr,
-            ", size: ", chunk.size, ", Block array base: ", base_addr,
-            ", Block array size: ", host_size));
-      }
-    }
-  }
-  return absl::OkStatus();
-}
-
 absl::StatusOr<MajorOrder> ParseMajorOrder(uint8_t value) {
   uint8_t order_val = value & ~kUseBlockChunksFlag;
   switch (order_val) {
@@ -301,6 +272,36 @@ absl::Status EndIncomingPush(const std::shared_ptr<TransferSession>& session,
 
 }  // namespace
 
+absl::Status ValidateChunks(BlockTransportDelegate* delegate, size_t l,
+                            size_t sh, uint64_t uuid,
+                            absl::Span<const BlockChunk> chunks) {
+  const BlockChunk span = delegate->GetBlockArrayHostSpan(l, sh, uuid);
+  // Some legacy delegates intentionally expose only scattered per-block
+  // pointers and no flat array base. Preserve that contract; pool-aware
+  // managers always expose their exact pool span here.
+  if (span.ptr == nullptr) {
+    return absl::OkStatus();
+  }
+  const uintptr_t base_addr = reinterpret_cast<uintptr_t>(span.ptr);
+  for (const auto& chunk : chunks) {
+    const uintptr_t chunk_addr = reinterpret_cast<uintptr_t>(chunk.ptr);
+    if (chunk_addr < base_addr) {
+      return absl::OutOfRangeError(absl::StrCat(
+          "Chunk out of bounds. Chunk ptr: ", chunk_addr,
+          ", size: ", chunk.size, ", Block array base: ", base_addr,
+          ", Block array size: ", span.size));
+    }
+    const size_t offset = chunk_addr - base_addr;
+    if (offset > span.size || chunk.size > span.size - offset) {
+      return absl::OutOfRangeError(absl::StrCat(
+          "Chunk out of bounds. Chunk ptr: ", chunk_addr,
+          ", size: ", chunk.size, ", Block array base: ", base_addr,
+          ", Block array size: ", span.size));
+    }
+  }
+  return absl::OkStatus();
+}
+
 // ===========================================================================
 // BlockTransportServerPushSession
 // ===========================================================================
@@ -447,7 +448,8 @@ absl::Status BlockTransportServerPushSession::StartStream(
               absl::StrCat("No transfer chunks found for block ", dst_id,
                            " and uuid ", header.uuid));
         }
-        ABSL_RETURN_IF_ERROR(ValidateChunks(delegate_, l, sh, chunks));
+        ABSL_RETURN_IF_ERROR(
+            ValidateChunks(delegate_, l, sh, header.uuid, chunks));
 
         uint32_t expected_size = 0;
         for (const auto& chunk : chunks) {
@@ -596,7 +598,8 @@ uint8_t* BlockTransportServerPushSession::ResolveRecvBuffer(
         status = absl::OutOfRangeError("chunk_idx out of range or null");
       } else if (chunks[req.chunk_idx].size != req.len) {
         status = absl::InvalidArgumentError("chunk length mismatch");
-      } else if (status = ValidateChunks(delegate_, layer, req.shard, chunks);
+      } else if (status =
+                     ValidateChunks(delegate_, layer, req.shard, uuid_, chunks);
                  status.ok()) {
         addr = chunks[req.chunk_idx].ptr;
       }
@@ -1079,7 +1082,8 @@ void BlockTransportServerPullSession::TriggerNextSendStep() {
             absl::StrCat("No chunks for block ", block_id)));
         return;
       }
-      absl::Status s = ValidateChunks(self->delegate_, l, sh, chunks);
+      absl::Status s =
+          ValidateChunks(self->delegate_, l, sh, self->uuid_, chunks);
       if (!s.ok()) {
         LOG(ERROR) << "Chunks validation failed: " << s;
         self->Finish(s);

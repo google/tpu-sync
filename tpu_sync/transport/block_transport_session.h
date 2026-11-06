@@ -75,6 +75,12 @@ struct BlockTransportConfig {
   }
 };
 
+// Validates that every chunk in |chunks| falls within the host memory span
+// exposed by |delegate| for (|l|, |sh|, |uuid|).
+absl::Status ValidateChunks(BlockTransportDelegate* delegate, size_t l,
+                            size_t sh, uint64_t uuid,
+                            absl::Span<const BlockChunk> chunks);
+
 // Base class for transport-level transfer sessions.
 class BlockTransportSession {
  public:

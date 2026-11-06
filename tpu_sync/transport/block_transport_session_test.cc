@@ -110,14 +110,6 @@ class MockSessionDelegate : public BlockTransportDelegate {
     return absl::NotFoundError("Session not found");
   }
 
-  uint8_t* GetBlockArrayHostPointer(size_t layer, size_t shard) override {
-    return buffers_[layer * num_shards_ + shard].data();
-  }
-
-  size_t GetBlockArrayHostSize(size_t layer, size_t shard) override {
-    return buffers_[layer * num_shards_ + shard].size();
-  }
-
   std::vector<BlockChunk> GetBlockChunks(
       size_t layer, size_t shard, absl::Span<const int64_t> block_ids,
       size_t expected_size = 0, uint64_t uuid = 0, int64_t remote_node_id = -1,

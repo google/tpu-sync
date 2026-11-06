@@ -165,10 +165,21 @@ class FakeH2dBase : public kv_cache::KVCacheManagerBase {
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx, std::optional<uint64_t> uuid,
       std::optional<size_t> host_layer_idx) override {
+    if (host_layer_idx.has_value()) {
+      uploaded_host_slot_by_pool_.emplace_back(pool_idx, *host_layer_idx);
+    }
     auto [promise, future] = xla::MakePromise();
     promise.Set();
     return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
   }
+
+  const std::vector<std::pair<size_t, size_t>>& uploaded_host_slot_by_pool()
+      const {
+    return uploaded_host_slot_by_pool_;
+  }
+
+ private:
+  std::vector<std::pair<size_t, size_t>> uploaded_host_slot_by_pool_;
 };
 
 TEST(ReshardReceiveSessionTest, AcceptsCanonicalPlanOnExplicitPools) {
@@ -515,6 +526,90 @@ TEST(ReshardReceiveSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
               StatusIs(absl::StatusCode::kDeadlineExceeded));
   EXPECT_THAT(timeout_session->ResolveStagingSlot(0),
               StatusIs(absl::StatusCode::kCancelled));
+}
+
+TEST(ReshardReceiveSessionTest,
+     OutOfOrderPoolArrivalResolvesLeasedHostBufferForValidation) {
+  constexpr uint64_t kUuid = 1303;
+  FakeH2dBase base(
+      /*num_layers=*/2, /*num_shards=*/1,
+      /*slice_byte_size=*/128,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/std::make_optional(4));
+  base.AttachPlaceholderDeviceHoldForTest();
+  ASSERT_EQ(base.num_host_layers(), 2u);
+  ASSERT_EQ(base.num_layers(), 2u);
+
+  std::vector<kv_cache::PoolSpec> pools = {
+      DensePool("fa", 128),
+      DensePool("state", 128),
+  };
+  pools[0].storage_index = 0;
+  pools[0].base_offset_bytes = 16;
+  pools[0].num_blocks = 3;
+  pools[1].storage_index = 1;
+  pools[1].base_offset_bytes = 32;
+  pools[1].num_blocks = 3;
+  ABSL_ASSERT_OK(base.RegisterPools(pools));
+
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/0, /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(
+      /*uuid=*/kUuid, /*dtype_tags=*/{"bf16", "bf16"},
+      /*transferred_pools=*/{0, 1});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferSession> session,
+      CreateReshardReceiveSession(
+          &base, allocator.get(), plan, std::vector<int64_t>{0},
+          std::chrono::steady_clock::now() + std::chrono::seconds(2)));
+  kv_cache::KVCacheManagerBase::TransferEventHooks hooks;
+  hooks.get_session = [session](uint64_t uuid)
+      -> absl::StatusOr<std::shared_ptr<TransferSession>> { return session; };
+  base.SetTransferEventHooks(std::move(hooks));
+
+  // Pool 1 arrives before Pool 0 and leases host slot 0 (even though
+  // pools[1].storage_index == 1).
+  std::vector<transport::BlockChunk> chunks1 = base.GetBlockChunks(
+      /*layer_idx=*/1, /*shard_idx=*/0, std::vector<int64_t>{0},
+      /*total_bytes=*/16, kUuid, /*sender_node_id=*/0);
+  ASSERT_EQ(chunks1.size(), 1u);
+  EXPECT_THAT(session->ResolveStagingSlot(1), IsOkAndHolds(0u));
+  const transport::BlockChunk pool1_span = base.GetBlockArrayHostSpan(
+      /*block_array_idx=*/1, /*shard_idx=*/0, kUuid);
+  EXPECT_EQ(pool1_span.ptr,
+            base.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0) +
+                pools[1].base_offset_bytes);
+  EXPECT_EQ(pool1_span.size, static_cast<size_t>(pools[1].num_blocks *
+                                                 pools[1].block_stride_bytes));
+  EXPECT_GE(chunks1[0].ptr, pool1_span.ptr);
+  EXPECT_LE(chunks1[0].ptr + chunks1[0].size, pool1_span.ptr + pool1_span.size);
+
+  // Pool 0 arrives second and leases host slot 1.
+  std::vector<transport::BlockChunk> chunks0 = base.GetBlockChunks(
+      /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{0},
+      /*total_bytes=*/16, kUuid, /*sender_node_id=*/0);
+  ASSERT_EQ(chunks0.size(), 1u);
+  EXPECT_THAT(session->ResolveStagingSlot(0), IsOkAndHolds(1u));
+  const transport::BlockChunk pool0_span = base.GetBlockArrayHostSpan(
+      /*block_array_idx=*/0, /*shard_idx=*/0, kUuid);
+  EXPECT_EQ(pool0_span.ptr,
+            base.GetHostPointer(/*layer_idx=*/1, /*shard_idx=*/0) +
+                pools[0].base_offset_bytes);
+  EXPECT_EQ(pool0_span.size, static_cast<size_t>(pools[0].num_blocks *
+                                                 pools[0].block_stride_bytes));
+  EXPECT_GE(chunks0[0].ptr, pool0_span.ptr);
+  EXPECT_LE(chunks0[0].ptr + chunks0[0].size, pool0_span.ptr + pool0_span.size);
+
+  ABSL_EXPECT_OK(session->OnDataReceived(/*major_dimension_idx=*/1,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  ABSL_EXPECT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  ABSL_EXPECT_OK(session->AwaitForDone());
+  const std::vector<std::pair<size_t, size_t>> expected_uploads = {{1, 0},
+                                                                   {0, 1}};
+  EXPECT_EQ(base.uploaded_host_slot_by_pool(), expected_uploads);
 }
 
 }  // namespace

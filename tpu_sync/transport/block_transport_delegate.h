@@ -38,9 +38,9 @@ namespace transport {
 // Represents a contiguous span of memory within a block transport operation.
 struct BlockChunk {
   // Pointer to the local host memory address of this chunk.
-  uint8_t* ptr;
+  uint8_t* ptr = nullptr;
   // Length of this memory chunk in bytes.
-  size_t size;
+  size_t size = 0;
   // Remote address of this chunk when the receiver's layout is known;
   // nullptr otherwise.
   uint8_t* raddr = nullptr;
@@ -91,17 +91,20 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
 
   // Geometry and host bounds for one wire-addressable block array. Legacy
   // delegates inherit the uniform layer behavior; pool-aware delegates may
-  // map an array to an interior range of a different backing storage.
+  // map an array to an interior range of a different backing storage. When
+  // |uuid| is non-zero, resolves the host staging buffer leased to |uuid| for
+  // |block_array_idx|.
   virtual size_t block_bytes(size_t block_array_idx) const {
     return slice_byte_size();
   }
-  virtual uint8_t* GetBlockArrayHostPointer(size_t block_array_idx,
-                                            size_t shard_idx) {
-    return GetHostPointer(block_array_idx, shard_idx);
-  }
-  virtual size_t GetBlockArrayHostSize(size_t block_array_idx,
-                                       size_t shard_idx) {
-    return GetHostSize(block_array_idx, shard_idx);
+  virtual BlockChunk GetBlockArrayHostSpan(size_t block_array_idx,
+                                           size_t shard_idx,
+                                           uint64_t uuid = 0) {
+    uint8_t* ptr = GetHostPointer(block_array_idx, shard_idx);
+    if (ptr == nullptr) {
+      return {};
+    }
+    return {.ptr = ptr, .size = GetHostSize(block_array_idx, shard_idx)};
   }
 
   // Returns the active node ID (rank) of the worker.
@@ -192,7 +195,7 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
 
   virtual uint8_t* GetBlockHostPointer(size_t layer_idx, size_t shard_idx,
                                        int block_id) {
-    uint8_t* base = GetBlockArrayHostPointer(layer_idx, shard_idx);
+    uint8_t* base = GetBlockArrayHostSpan(layer_idx, shard_idx).ptr;
     if (base == nullptr || block_id < 0) {
       return nullptr;
     }

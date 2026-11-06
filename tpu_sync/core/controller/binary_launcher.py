@@ -14,7 +14,7 @@
 
 """Console-script launchers for wheel-bundled control-plane binaries.
 
-The tpu_raiden_torch wheel ships `global_registry_server` and
+The tpu-sync-torch wheel ships `global_registry_server` and
 `kv_cache_host_store_node_main` as package data next to their sources, so a
 pip install of the wheel is enough to run the global-prefix-cache control
 plane and lend a host's DRAM as a store node — no separately distributed
@@ -43,8 +43,8 @@ def _executable_path(binary: pathlib.Path) -> str:
   """Return an executable path for a bundled binary."""
   if not binary.is_file():
     raise SystemExit(
-        f"{binary.name} is not bundled in this tpu_raiden installation "
-        f"(looked at {binary}). Rebuild/upgrade the tpu_raiden_torch "
+        f"{binary.name} is not bundled in this tpu_sync installation "
+        f"(looked at {binary}). Rebuild/upgrade the tpu-sync-torch "
         "wheel; older releases did not ship the control-plane binaries."
     )
   if os.access(binary, os.X_OK):

@@ -357,7 +357,7 @@ cc_test(
 )
 
 # Console-script launchers for the control-plane binaries bundled in the
-# tpu_raiden_torch wheel. The binaries ride along as data at their source
+# tpu-sync-torch wheel. The binaries ride along as data at their source
 # paths, so pip installs are sufficient to run the registry and the host
 # store node — see //ci/wheel:BUILD.bazel. (The orchestrator the launcher
 # originally also wrapped was deprecated upstream in ff56427.)

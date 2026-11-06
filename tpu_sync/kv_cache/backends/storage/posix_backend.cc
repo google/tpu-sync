@@ -16,12 +16,14 @@
 
 #include <fcntl.h>
 #include <limits.h>
+#include <sys/statvfs.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -39,6 +41,8 @@
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/const_init.h"
+#include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -134,6 +138,107 @@ std::string MakeTempPath(absl::string_view final_path) {
 
 // --- PosixKVBackend Implementation ---
 
+static_assert(std::atomic<int64_t>::is_always_lock_free,
+              "8-byte atomic timestamp must be lock-free");
+
+namespace {
+
+// Minimum interval between periodic `statvfs()` samples on the storage I/O and
+// lookup paths when telemetry backends are active (5 seconds).
+constexpr int64_t kFilesystemMetricsSampleIntervalNs = 5'000'000'000LL;
+
+// Tracks the last sample timestamp (in monotonic nanoseconds) per storage
+// mount.
+absl::Mutex g_fs_metrics_mu(absl::kConstInit);
+absl::flat_hash_map<std::string, int64_t> g_last_fs_metrics_sample_ns
+    ABSL_GUARDED_BY(g_fs_metrics_mu);
+
+// Samples POSIX `statvfs()` on `root_dir` and emits
+// `tpu_raiden_storage_filesystem_bytes{mount, state}` for `total`, `used`, and
+// `free` when telemetry backends are registered. Returns true if `statvfs()`
+// succeeded and gauges were emitted, or false if no backends are active or
+// `statvfs()` failed.
+bool RecordFilesystemMetrics(absl::string_view root_dir) {
+  telemetry::RaidenMetricStore& store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends() || root_dir.empty()) {
+    return false;
+  }
+
+  const std::string mount_path(root_dir);
+  struct statvfs vfs{};
+  if (statvfs(mount_path.c_str(), &vfs) != 0) {
+    return false;
+  }
+
+  const uint64_t block_size = vfs.f_frsize > 0
+                                  ? static_cast<uint64_t>(vfs.f_frsize)
+                                  : static_cast<uint64_t>(vfs.f_bsize);
+  if (block_size == 0 || vfs.f_blocks == 0) {
+    return false;
+  }
+
+  const uint64_t total_blocks = static_cast<uint64_t>(vfs.f_blocks);
+  const uint64_t bfree_blocks =
+      std::min<uint64_t>(static_cast<uint64_t>(vfs.f_bfree), total_blocks);
+  const uint64_t bavail_blocks =
+      std::min<uint64_t>(static_cast<uint64_t>(vfs.f_bavail), total_blocks);
+
+  const double total_bytes = static_cast<double>(total_blocks * block_size);
+  const double used_bytes =
+      static_cast<double>((total_blocks - bfree_blocks) * block_size);
+  const double free_bytes = static_cast<double>(bavail_blocks * block_size);
+
+  const telemetry::MetricLabel total_labels[] = {
+      {telemetry::metric_labels::kMount, mount_path},
+      {telemetry::metric_labels::kState, telemetry::metric_labels::kStateTotal},
+  };
+  const telemetry::MetricLabel used_labels[] = {
+      {telemetry::metric_labels::kMount, mount_path},
+      {telemetry::metric_labels::kState, telemetry::metric_labels::kStateUsed},
+  };
+  const telemetry::MetricLabel free_labels[] = {
+      {telemetry::metric_labels::kMount, mount_path},
+      {telemetry::metric_labels::kState, telemetry::metric_labels::kStateFree},
+  };
+
+  store.SetGauge(telemetry::metric_names::kStorageFilesystemBytes, total_labels,
+                 total_bytes);
+  store.SetGauge(telemetry::metric_names::kStorageFilesystemBytes, used_labels,
+                 used_bytes);
+  store.SetGauge(telemetry::metric_names::kStorageFilesystemBytes, free_labels,
+                 free_bytes);
+  return true;
+}
+
+// Samples `statvfs()` on `root_dir` at most once every 5 seconds per mount
+// when telemetry backends are active.
+// TODO: Replace periodic timestamp-throttled sampling with scrape-time
+// collection or event-driven updates once all telemetry backends support
+// pull callbacks.
+void MaybeRecordFilesystemMetrics(absl::string_view root_dir) {
+  if (!telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends() ||
+      root_dir.empty()) {
+    return;
+  }
+  const int64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  {
+    absl::MutexLock lock(g_fs_metrics_mu);
+    auto it = g_last_fs_metrics_sample_ns.find(root_dir);
+    if (it != g_last_fs_metrics_sample_ns.end() &&
+        now_ns - it->second < kFilesystemMetricsSampleIntervalNs) {
+      return;
+    }
+    g_last_fs_metrics_sample_ns[root_dir] = now_ns;
+  }
+  RecordFilesystemMetrics(root_dir);
+}
+
+}  // namespace
+
 PosixKVBackend::PosixKVBackend(
     std::string name, absl::flat_hash_map<std::string, std::string> properties)
     : KVBackend(std::move(properties)), name_(std::move(name)) {
@@ -161,6 +266,9 @@ PosixKVBackend::PosixKVBackend(
                         .pcp_rank = options_.pcp_rank,
                         .pp_size = options_.pp_size,
                         .pp_rank = options_.pp_rank});
+  std::error_code ec;
+  fs::create_directories(options_.root_dir, ec);
+  MaybeRecordFilesystemMetrics(options_.root_dir);
   thread_pool_ =
       std::make_unique<NumaThreadPool>(options_.storage_io_thread_pool_size);
 }
@@ -216,7 +324,9 @@ void PosixKVBackend::WriteAsync(const BlockKey& key,
                                 absl::Span<const HostBufferDescriptor> slices,
                                 size_t /*total_bytes*/,
                                 std::function<void(absl::Status)> callback) {
-  thread_pool_->Schedule(std::nullopt, [direct_io_supported = direct_io_supported_,
+  thread_pool_->Schedule(std::nullopt, [this,
+                                        direct_io_supported =
+                                            direct_io_supported_,
                                         key,
                                         slices =
                                             std::vector<HostBufferDescriptor>(
@@ -386,6 +496,7 @@ void PosixKVBackend::WriteAsync(const BlockKey& key,
             saved_errno, absl::StrCat("Failed to publish ", key.resolved_key)));
       return;
     }
+    MaybeRecordFilesystemMetrics(options_.root_dir);
     if (callback) callback(absl::OkStatus());
   });
 }
@@ -784,6 +895,7 @@ PosixKVCacheStoreBackend::PosixKVCacheStoreBackend(
     size_t capacity_bytes, size_t lookup_batch_size,
     MetadataCacheOptions cache_options, std::string dp_rank)
     : storage_backend_(std::move(storage_backend)),
+      posix_backend_(dynamic_cast<PosixKVBackend*>(storage_backend_.get())),
       name_(std::move(name)),
       capacity_bytes_(capacity_bytes),
       lookup_batch_size_(lookup_batch_size > 0 ? lookup_batch_size
@@ -799,6 +911,9 @@ PosixKVCacheStoreBackend::PosixKVCacheStoreBackend(
                       ? std::string("unbounded")
                       : absl::StrCat(cache_options_.max_entries))
               << ", ttl=" << cache_options_.ttl << ")";
+  }
+  if (posix_backend_ != nullptr) {
+    MaybeRecordFilesystemMetrics(posix_backend_->options().root_dir);
   }
 }
 
@@ -945,6 +1060,9 @@ absl::StatusOr<BlockSliceList> PosixKVCacheStoreBackend::Lookup(
       !storage_backend_->mapper() || block_hashes.empty()) {
     return results;
   }
+  if (posix_backend_ != nullptr) {
+    MaybeRecordFilesystemMetrics(posix_backend_->options().root_dir);
+  }
 
   // Phase 0 (map).
   std::vector<std::vector<BlockKey>> shard_keys;
@@ -1061,8 +1179,14 @@ size_t PosixKVCacheStoreBackend::Delete(
   if (options.deleted_hashes != nullptr) {
     options.deleted_hashes->clear();
   }
-  if (options.host_resident_only || !cache_options_.enabled() ||
-      !storage_backend_ || !storage_backend_->mapper()) {
+  if (options.host_resident_only || !storage_backend_ ||
+      !storage_backend_->mapper()) {
+    return 0;
+  }
+  if (posix_backend_ != nullptr) {
+    MaybeRecordFilesystemMetrics(posix_backend_->options().root_dir);
+  }
+  if (!cache_options_.enabled()) {
     return 0;
   }
 

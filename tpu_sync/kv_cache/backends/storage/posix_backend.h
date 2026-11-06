@@ -353,6 +353,7 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
   RaidenBlockId MakeSharedStorageBlock() const;
 
   std::shared_ptr<KVBackend> storage_backend_;
+  PosixKVBackend* posix_backend_ = nullptr;
   std::string name_ = std::string(kPosixBackendName);
   size_t capacity_bytes_ = 0;
   size_t lookup_batch_size_ = 32;

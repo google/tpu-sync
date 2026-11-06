@@ -14,7 +14,13 @@
 
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 
+#include <limits.h>
+#include <sys/mman.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>  // NOLINT
 #include <cstddef>
 #include <cstdint>
@@ -25,12 +31,10 @@
 #include <functional>
 #include <ios>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <system_error>
-#include <limits.h>
-#include <sys/mman.h>
-#include <unistd.h>
 #include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
@@ -74,6 +78,7 @@ namespace fs = std::filesystem;
 using ::absl_testing::StatusIs;
 using ::testing::Contains;
 using ::testing::HasSubstr;
+using ::testing::NiceMock;
 using ::testing::Not;
 
 class StorageDriverTest : public ::testing::Test {
@@ -2710,6 +2715,225 @@ TEST_F(MetadataCacheTest, UnmappableHashTruncatesPrefix) {
   EXPECT_EQ(env.LookupCount({"a", std::string(kMaxBlockHashBytes + 1, 'x'),
                              "c"}),
             1);
+}
+
+// ===========================================================================
+// Theme 9: Storage Filesystem Capacity Telemetry (storage_filesystem_bytes)
+// ===========================================================================
+
+auto StorageFilesystemLabels(absl::string_view mount, absl::string_view state) {
+  return testing::ElementsAre(
+      testing::FieldsAre(telemetry::metric_labels::kMount, std::string(mount)),
+      testing::FieldsAre(telemetry::metric_labels::kState, std::string(state)));
+}
+
+TEST_F(StorageDriverTest, FilesystemMetricsEmittedOnConstruction) {
+  struct statvfs vfs{};
+  ASSERT_EQ(statvfs(scratch_dir_.c_str(), &vfs), 0);
+  const uint64_t block_size = vfs.f_frsize > 0
+                                  ? static_cast<uint64_t>(vfs.f_frsize)
+                                  : static_cast<uint64_t>(vfs.f_bsize);
+  const double expected_total =
+      static_cast<double>(static_cast<uint64_t>(vfs.f_blocks) * block_size);
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kStorageFilesystemBytes),
+               StorageFilesystemLabels(scratch_dir_,
+                                       telemetry::metric_labels::kStateTotal),
+               testing::DoubleEq(expected_total)));
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kStorageFilesystemBytes),
+               StorageFilesystemLabels(scratch_dir_,
+                                       telemetry::metric_labels::kStateUsed),
+               testing::AllOf(testing::Ge(0.0), testing::Le(expected_total))));
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kStorageFilesystemBytes),
+               StorageFilesystemLabels(scratch_dir_,
+                                       telemetry::metric_labels::kStateFree),
+               testing::AllOf(testing::Ge(0.0), testing::Le(expected_total))));
+  telemetry::ScopedMetricsBackendReset reset(std::move(mock_backend));
+
+  PosixKVBackend backend("posix_disk", {{"root_dir", scratch_dir_}});
+}
+
+TEST_F(StorageDriverTest, FilesystemMetricsThrottledOnHotPath) {
+  std::atomic<int> gauge_calls{0};
+  auto mock_backend =
+      std::make_unique<NiceMock<telemetry::MockMetricsBackend>>();
+  ON_CALL(*mock_backend, SetGauge)
+      .WillByDefault([&](absl::string_view name, telemetry::LabelSpan, double) {
+        if (name == telemetry::metric_names::kStorageFilesystemBytes) {
+          gauge_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+  telemetry::ScopedMetricsBackendReset reset(std::move(mock_backend));
+
+  auto backend = std::make_shared<PosixKVBackend>(
+      "posix_disk",
+      absl::flat_hash_map<std::string, std::string>{
+          {"root_dir", scratch_dir_}, {"tp_size", "1"}, {"tp_rank", "0"}});
+  EXPECT_EQ(gauge_calls.load(std::memory_order_relaxed), 3);
+
+  PosixKVCacheStoreBackend store(backend, "posix_disk", /*capacity_bytes=*/0,
+                                 /*lookup_batch_size=*/16);
+  // Throttled within the 5-second sampling window.
+  EXPECT_EQ(gauge_calls.load(std::memory_order_relaxed), 3);
+
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList lookup_res, store.Lookup({"block_a"}));
+  EXPECT_TRUE(lookup_res.empty());
+  EXPECT_EQ(store.Delete({"block_a"}), 0);
+  EXPECT_EQ(gauge_calls.load(std::memory_order_relaxed), 3);
+}
+
+TEST_F(StorageDriverTest,
+       FilesystemMetricsSampledOnWriteLookupAndDeleteAfterBackendEnabled) {
+  auto make_backend = [&](std::string name) {
+    return std::make_shared<PosixKVBackend>(
+        std::move(name),
+        absl::flat_hash_map<std::string, std::string>{
+            {"root_dir", scratch_dir_}, {"tp_size", "1"}, {"tp_rank", "0"}});
+  };
+  // Construct backends before telemetry is enabled so construction does not
+  // consume the initial sample window.
+  auto backend = make_backend("posix_storage");
+  PosixKVCacheStoreBackend store(backend, "posix_storage");
+
+  std::atomic<int> gauge_calls{0};
+  auto mock_backend =
+      std::make_unique<NiceMock<telemetry::MockMetricsBackend>>();
+  ON_CALL(*mock_backend, SetGauge)
+      .WillByDefault([&](absl::string_view name, telemetry::LabelSpan, double) {
+        if (name == telemetry::metric_names::kStorageFilesystemBytes) {
+          gauge_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+  telemetry::ScopedMetricsBackendReset reset(std::move(mock_backend));
+
+  // 1. WriteAsync completion triggers the first sample after telemetry enabled.
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey key, backend->mapper()->MapKey("b0"));
+  std::vector<uint8_t> payload(128, 0x5A);
+  HostBufferDescriptor slice{.ptr = payload.data(), .size = payload.size()};
+  absl::Notification write_done;
+  absl::Status write_status;
+  backend->WriteAsync(key, {slice}, payload.size(), [&](absl::Status s) {
+    write_status = std::move(s);
+    write_done.Notify();
+  });
+  write_done.WaitForNotification();
+  ASSERT_TRUE(write_status.ok()) << write_status;
+  EXPECT_EQ(gauge_calls.load(std::memory_order_relaxed), 3);
+
+  // 2. Lookup finds the written block and is throttled on the hot path.
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList found, store.Lookup({"b0"}));
+  EXPECT_EQ(found.size(), 1);
+  EXPECT_EQ(gauge_calls.load(std::memory_order_relaxed), 3);
+
+  // 3. Delete is also throttled on the hot path.
+  store.Delete({"b0"});
+  EXPECT_EQ(gauge_calls.load(std::memory_order_relaxed), 3);
+}
+
+TEST_F(StorageDriverTest,
+       FilesystemMetricsFailsGracefullyWhenRootDirDoesNotExist) {
+  const std::string removable_root =
+      absl::StrCat(scratch_dir_, "/removable_root");
+  auto backend = std::make_shared<PosixKVBackend>(
+      "posix_disk",
+      absl::flat_hash_map<std::string, std::string>{
+          {"root_dir", removable_root}, {"tp_size", "1"}, {"tp_rank", "0"}});
+  std::error_code ec;
+  fs::remove_all(removable_root, ec);
+  ASSERT_FALSE(fs::exists(removable_root));
+
+  auto mock_backend =
+      std::make_unique<NiceMock<telemetry::MockMetricsBackend>>();
+  EXPECT_CALL(*mock_backend, SetGauge).Times(0);
+  telemetry::ScopedMetricsBackendReset reset(std::move(mock_backend));
+
+  // PosixKVCacheStoreBackend construction, Lookup, and Delete attempt
+  // sampling on root_dir, but statvfs fails gracefully on non-existent paths
+  // and emits no metrics.
+  PosixKVCacheStoreBackend store(backend, "posix_disk");
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList lookup_res, store.Lookup({"missing_b0"}));
+  EXPECT_TRUE(lookup_res.empty());
+  EXPECT_EQ(store.Delete({"missing_b0"}), 0);
+}
+
+TEST_F(StorageDriverTest, FilesystemMetricsExportedViaBufferedBackend) {
+  telemetry::ScopedMetricsBackendReset reset;
+  telemetry::RaidenMetricStore& store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  ASSERT_OK(store.InitializeFromBackendNames({"buffered"}));
+
+  PosixKVBackend backend("posix_disk", {{"root_dir", scratch_dir_}});
+
+  const std::map<std::string, std::vector<double>> samples =
+      store.GetAndResetMetricSamples();
+  auto get_last_sample = [&](absl::string_view state) -> double {
+    const std::string key =
+        absl::StrCat("tpu_raiden_storage_filesystem_bytes{mount=\"",
+                     scratch_dir_, "\",state=\"", state, "\"}");
+    EXPECT_TRUE(samples.contains(key));
+    EXPECT_FALSE(samples.at(key).empty());
+    return samples.at(key).back();
+  };
+
+  const double total_bytes =
+      get_last_sample(telemetry::metric_labels::kStateTotal);
+  const double used_bytes =
+      get_last_sample(telemetry::metric_labels::kStateUsed);
+  const double free_bytes =
+      get_last_sample(telemetry::metric_labels::kStateFree);
+  EXPECT_GT(total_bytes, 0.0);
+  EXPECT_GE(used_bytes, 0.0);
+  EXPECT_LE(used_bytes, total_bytes);
+  EXPECT_GE(free_bytes, 0.0);
+  EXPECT_LE(free_bytes, total_bytes);
+}
+
+TEST_F(StorageDriverTest, FilesystemMetricsConcurrentSamplingIsThreadSafe) {
+  std::atomic<int> gauge_calls{0};
+  auto mock_backend =
+      std::make_unique<NiceMock<telemetry::MockMetricsBackend>>();
+  ON_CALL(*mock_backend, SetGauge)
+      .WillByDefault([&](absl::string_view name, telemetry::LabelSpan, double) {
+        if (name == telemetry::metric_names::kStorageFilesystemBytes) {
+          gauge_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+  telemetry::ScopedMetricsBackendReset reset(std::move(mock_backend));
+
+  auto backend = std::make_shared<PosixKVBackend>(
+      "posix_disk",
+      absl::flat_hash_map<std::string, std::string>{
+          {"root_dir", scratch_dir_}, {"tp_size", "1"}, {"tp_rank", "0"}});
+  PosixKVCacheStoreBackend store(backend, "posix_disk");
+
+  std::vector<std::thread> threads;
+  threads.reserve(8);
+  for (int t = 0; t < 8; ++t) {
+    threads.emplace_back([&store, t]() {
+      for (int i = 0; i < 20; ++i) {
+        if (i % 2 == 0) {
+          auto lookup_res = store.Lookup({absl::StrCat("b_", t, "_", i)});
+          (void)lookup_res;
+        } else {
+          store.Delete({absl::StrCat("b_", t, "_", i)});
+        }
+      }
+    });
+  }
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  // 1 initial sample in constructor (3 gauges); concurrent lookups and deletes
+  // are safely throttled.
+  EXPECT_EQ(gauge_calls.load(std::memory_order_relaxed), 3);
 }
 
 auto MetadataCheckLabels(absl::string_view dp_rank, absl::string_view result) {

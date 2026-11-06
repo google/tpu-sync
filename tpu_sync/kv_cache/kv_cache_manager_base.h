@@ -539,9 +539,15 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // constructor storages otherwise.
   size_t num_block_arrays() const override;
   size_t block_bytes(size_t block_array_idx) const override;
-  transport::BlockChunk GetBlockArrayHostSpan(size_t block_array_idx,
-                                              size_t shard_idx,
-                                              uint64_t uuid = 0) override;
+  // Returns the host span of |block_array_idx|: the pool's storage extent, or
+  // the whole staging arena on a bounded storage. Propagates
+  // ResolveBlockArrayHostLayer() errors for |uuid|. With explicit pools,
+  // returns kOutOfRange when |shard_idx| is past num_shards(), and
+  // kFailedPrecondition when the storage has no host buffer or the pool does
+  // not fit it. Without explicit pools, returns an OK empty span when the
+  // storage has no host buffer.
+  absl::StatusOr<absl::Span<const char>> GetBlockArrayHostSpan(
+      size_t block_array_idx, size_t shard_idx, uint64_t uuid = 0) override;
 
   int64_t LayerBlockByteSize(size_t layer_idx) const;
 

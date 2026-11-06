@@ -574,15 +574,20 @@ TEST(ReshardReceiveSessionTest,
       /*total_bytes=*/16, kUuid, /*sender_node_id=*/0);
   ASSERT_EQ(chunks1.size(), 1u);
   EXPECT_THAT(session->ResolveStagingSlot(1), IsOkAndHolds(0u));
-  const transport::BlockChunk pool1_span = base.GetBlockArrayHostSpan(
-      /*block_array_idx=*/1, /*shard_idx=*/0, kUuid);
-  EXPECT_EQ(pool1_span.ptr,
-            base.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0) +
-                pools[1].base_offset_bytes);
-  EXPECT_EQ(pool1_span.size, static_cast<size_t>(pools[1].num_blocks *
-                                                 pools[1].block_stride_bytes));
-  EXPECT_GE(chunks1[0].ptr, pool1_span.ptr);
-  EXPECT_LE(chunks1[0].ptr + chunks1[0].size, pool1_span.ptr + pool1_span.size);
+  TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const char> pool1_span,
+                       base.GetBlockArrayHostSpan(/*block_array_idx=*/1,
+                                                  /*shard_idx=*/0, kUuid));
+  EXPECT_EQ(pool1_span.data(),
+            reinterpret_cast<const char*>(
+                base.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0) +
+                pools[1].base_offset_bytes));
+  EXPECT_EQ(
+      pool1_span.size(),
+      static_cast<size_t>(pools[1].num_blocks * pools[1].block_stride_bytes));
+  const char* chunk1_begin = reinterpret_cast<const char*>(chunks1[0].ptr);
+  EXPECT_GE(chunk1_begin, pool1_span.data());
+  EXPECT_LE(chunk1_begin + chunks1[0].size,
+            pool1_span.data() + pool1_span.size());
 
   // Pool 0 arrives second and leases host slot 1.
   std::vector<transport::BlockChunk> chunks0 = base.GetBlockChunks(
@@ -590,15 +595,20 @@ TEST(ReshardReceiveSessionTest,
       /*total_bytes=*/16, kUuid, /*sender_node_id=*/0);
   ASSERT_EQ(chunks0.size(), 1u);
   EXPECT_THAT(session->ResolveStagingSlot(0), IsOkAndHolds(1u));
-  const transport::BlockChunk pool0_span = base.GetBlockArrayHostSpan(
-      /*block_array_idx=*/0, /*shard_idx=*/0, kUuid);
-  EXPECT_EQ(pool0_span.ptr,
-            base.GetHostPointer(/*layer_idx=*/1, /*shard_idx=*/0) +
-                pools[0].base_offset_bytes);
-  EXPECT_EQ(pool0_span.size, static_cast<size_t>(pools[0].num_blocks *
-                                                 pools[0].block_stride_bytes));
-  EXPECT_GE(chunks0[0].ptr, pool0_span.ptr);
-  EXPECT_LE(chunks0[0].ptr + chunks0[0].size, pool0_span.ptr + pool0_span.size);
+  TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const char> pool0_span,
+                       base.GetBlockArrayHostSpan(/*block_array_idx=*/0,
+                                                  /*shard_idx=*/0, kUuid));
+  EXPECT_EQ(pool0_span.data(),
+            reinterpret_cast<const char*>(
+                base.GetHostPointer(/*layer_idx=*/1, /*shard_idx=*/0) +
+                pools[0].base_offset_bytes));
+  EXPECT_EQ(
+      pool0_span.size(),
+      static_cast<size_t>(pools[0].num_blocks * pools[0].block_stride_bytes));
+  const char* chunk0_begin = reinterpret_cast<const char*>(chunks0[0].ptr);
+  EXPECT_GE(chunk0_begin, pool0_span.data());
+  EXPECT_LE(chunk0_begin + chunks0[0].size,
+            pool0_span.data() + pool0_span.size());
 
   ABSL_EXPECT_OK(session->OnDataReceived(/*major_dimension_idx=*/1,
                                          /*minor_dimension_indices=*/{},

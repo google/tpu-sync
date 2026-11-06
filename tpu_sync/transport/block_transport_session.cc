@@ -275,28 +275,29 @@ absl::Status EndIncomingPush(const std::shared_ptr<TransferSession>& session,
 absl::Status ValidateChunks(BlockTransportDelegate* delegate, size_t l,
                             size_t sh, uint64_t uuid,
                             absl::Span<const BlockChunk> chunks) {
-  const BlockChunk span = delegate->GetBlockArrayHostSpan(l, sh, uuid);
+  ABSL_ASSIGN_OR_RETURN(const absl::Span<const char> span,
+                        delegate->GetBlockArrayHostSpan(l, sh, uuid));
   // Some legacy delegates intentionally expose only scattered per-block
   // pointers and no flat array base. Preserve that contract; pool-aware
   // managers always expose their exact pool span here.
-  if (span.ptr == nullptr) {
+  if (span.data() == nullptr) {
     return absl::OkStatus();
   }
-  const uintptr_t base_addr = reinterpret_cast<uintptr_t>(span.ptr);
+  const uintptr_t base_addr = reinterpret_cast<uintptr_t>(span.data());
   for (const auto& chunk : chunks) {
     const uintptr_t chunk_addr = reinterpret_cast<uintptr_t>(chunk.ptr);
     if (chunk_addr < base_addr) {
       return absl::OutOfRangeError(absl::StrCat(
           "Chunk out of bounds. Chunk ptr: ", chunk_addr,
           ", size: ", chunk.size, ", Block array base: ", base_addr,
-          ", Block array size: ", span.size));
+          ", Block array size: ", span.size()));
     }
     const size_t offset = chunk_addr - base_addr;
-    if (offset > span.size || chunk.size > span.size - offset) {
+    if (offset > span.size() || chunk.size > span.size() - offset) {
       return absl::OutOfRangeError(absl::StrCat(
           "Chunk out of bounds. Chunk ptr: ", chunk_addr,
           ", size: ", chunk.size, ", Block array base: ", base_addr,
-          ", Block array size: ", span.size));
+          ", Block array size: ", span.size()));
     }
   }
   return absl::OkStatus();

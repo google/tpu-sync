@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -40,6 +41,7 @@ namespace {
 using ::absl_testing::IsOk;
 using ::absl_testing::StatusIs;
 using ::testing::Eq;
+using ::testing::HasSubstr;
 
 class MockSessionDelegate : public BlockTransportDelegate {
  public:
@@ -248,6 +250,54 @@ TEST(BlockTransportServerPullSessionTest, Cancel) {
   EXPECT_TRUE(session->IsDone());
   EXPECT_THAT(session->status(), StatusIs(absl::StatusCode::kCancelled));
   EXPECT_TRUE(completed_called);
+}
+
+// Delegate whose GetBlockArrayHostSpan() returns a fixed result.
+class FixedHostSpanDelegate : public MockSessionDelegate {
+ public:
+  explicit FixedHostSpanDelegate(absl::StatusOr<absl::Span<const char>> span)
+      : span_(std::move(span)) {}
+
+  absl::StatusOr<absl::Span<const char>> GetBlockArrayHostSpan(
+      size_t block_array_idx, size_t shard_idx, uint64_t uuid) override {
+    return span_;
+  }
+
+ private:
+  const absl::StatusOr<absl::Span<const char>> span_;
+};
+
+TEST(ValidateChunksTest, BoundsChecksChunksAgainstHostSpan) {
+  MockSessionDelegate delegate(/*slice_size=*/1024, /*max_blocks=*/4);
+  const std::vector<BlockChunk> in_bounds = delegate.GetBlockChunks(
+      /*layer=*/0, /*shard=*/0, std::vector<int64_t>{0, 3});
+  const std::vector<BlockChunk> past_end = {
+      {.ptr = delegate.GetHostPointer(0, 0) + 3 * 1024 + 1, .size = 1024}};
+
+  ABSL_EXPECT_OK(ValidateChunks(&delegate, 0, 0, /*uuid=*/7, in_bounds));
+  EXPECT_THAT(ValidateChunks(&delegate, 0, 0, /*uuid=*/7, past_end),
+              StatusIs(absl::StatusCode::kOutOfRange,
+                       HasSubstr("Block array size: 4096")));
+}
+
+TEST(ValidateChunksTest, PropagatesHostSpanError) {
+  FixedHostSpanDelegate delegate(
+      absl::FailedPreconditionError("no staging slot leased"));
+  const std::vector<BlockChunk> chunks = delegate.GetBlockChunks(
+      /*layer=*/0, /*shard=*/0, std::vector<int64_t>{0});
+
+  EXPECT_THAT(ValidateChunks(&delegate, 0, 0, /*uuid=*/7, chunks),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("no staging slot leased")));
+}
+
+TEST(ValidateChunksTest, SkipsDelegateWithoutFlatHostBase) {
+  FixedHostSpanDelegate delegate((absl::Span<const char>()));
+  const std::vector<BlockChunk> past_end = {
+      {.ptr = delegate.GetHostPointer(0, 0) + delegate.GetHostSize(0, 0),
+       .size = 1024}};
+
+  ABSL_EXPECT_OK(ValidateChunks(&delegate, 0, 0, /*uuid=*/7, past_end));
 }
 
 }  // namespace

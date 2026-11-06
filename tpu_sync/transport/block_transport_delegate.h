@@ -97,14 +97,21 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
   virtual size_t block_bytes(size_t block_array_idx) const {
     return slice_byte_size();
   }
-  virtual BlockChunk GetBlockArrayHostSpan(size_t block_array_idx,
-                                           size_t shard_idx,
-                                           uint64_t uuid = 0) {
-    uint8_t* ptr = GetHostPointer(block_array_idx, shard_idx);
+  // Returns the host bytes addressable for |block_array_idx| and |shard_idx|
+  // (under |uuid|'s staging lease when |uuid| is non-zero). An OK empty span
+  // whose data() is nullptr means the delegate exposes no flat host base for
+  // the array (only per-block pointers), so callers cannot bounds-check
+  // against it. A non-OK status means the span could not be resolved, e.g.
+  // no staging slot is leased for |uuid| or the array does not fit its
+  // backing host buffer.
+  virtual absl::StatusOr<absl::Span<const char>> GetBlockArrayHostSpan(
+      size_t block_array_idx, size_t shard_idx, uint64_t uuid = 0) {
+    const uint8_t* ptr = GetHostPointer(block_array_idx, shard_idx);
     if (ptr == nullptr) {
-      return {};
+      return absl::Span<const char>();
     }
-    return {.ptr = ptr, .size = GetHostSize(block_array_idx, shard_idx)};
+    return absl::Span<const char>(reinterpret_cast<const char*>(ptr),
+                                  GetHostSize(block_array_idx, shard_idx));
   }
 
   // Returns the active node ID (rank) of the worker.
@@ -195,10 +202,15 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
 
   virtual uint8_t* GetBlockHostPointer(size_t layer_idx, size_t shard_idx,
                                        int block_id) {
-    uint8_t* base = GetBlockArrayHostSpan(layer_idx, shard_idx).ptr;
-    if (base == nullptr || block_id < 0) {
+    const absl::StatusOr<absl::Span<const char>> span =
+        GetBlockArrayHostSpan(layer_idx, shard_idx);
+    if (!span.ok() || span->data() == nullptr || block_id < 0) {
       return nullptr;
     }
+    // The span views delegate-owned mutable storage; callers write received
+    // blocks through the returned pointer.
+    uint8_t* base =
+        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(span->data()));
     return base + static_cast<size_t>(block_id) * block_bytes(layer_idx);
   }
 

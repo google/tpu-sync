@@ -138,7 +138,8 @@ class ReshardReceiveSession final
     return tsl::Future<>(absl::OkStatus());
   }
 
-  // Leases a buffer to |pool_idx| on first use.
+  // Leases a buffer to |pool_idx| on first use when host layers are bounded;
+  // kNotFound on a full host mirror (the pool is addressed in place).
   absl::StatusOr<size_t> ResolveStagingSlot(size_t pool_idx) override {
     return AcquireStagingSlot(pool_idx);
   }
@@ -156,8 +157,16 @@ class ReshardReceiveSession final
   absl::Status OnPoolReceived(size_t pool_idx);
 
   // Returns the host staging buffer leased to |pool_idx|, leasing one when it
-  // has none and waiting until deadline when every slot is leased.
+  // has none and waiting until deadline when every slot is leased. Returns
+  // kNotFound on a full host mirror, where every pool stages in its own
+  // storage's host buffer and there is no slot to lease.
   absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx);
+
+  // True when fewer host layer buffers are allocated than storages, so pools
+  // stage through leased slots instead of their own storage's host buffer.
+  bool HostLayersBounded() const {
+    return base_ != nullptr && base_->num_host_layers() < base_->num_layers();
+  }
 
   // Returns the host staging buffer currently leased to |pool_idx|, or
   // kFailedPrecondition if |pool_idx| holds no lease.
@@ -561,7 +570,8 @@ ReshardReceiveSession::ReshardReceiveSession(
       start_time_(std::chrono::steady_clock::now()),
       transfer_plan_(
           std::make_shared<const TransferPlan>(std::move(transfer_plan))),
-      staging_layer_manager_(base != nullptr ? base->num_host_layers() : 0) {
+      staging_layer_manager_(HostLayersBounded() ? base->num_host_layers()
+                                                 : 0) {
   absl::MutexLock lock(mu_);
   chip_block_ids_.assign(chip_blocks.begin(), chip_blocks.end());
   for (int32_t pool_idx : request().transfer_pool_indices()) {
@@ -647,6 +657,13 @@ void ReshardReceiveSession::FinishLocked(const absl::Status& status) {
 
 absl::StatusOr<size_t> ReshardReceiveSession::AcquireStagingSlot(
     size_t pool_idx) {
+  // A full host mirror stages every pool in place: GetBlockChunks, the
+  // transport's chunk validation and H2dPoolBlocks all address the pool's own
+  // storage. A leased slot would land the bytes in another storage's host
+  // buffer, outside the span ValidateChunks accepts for the pool.
+  if (!HostLayersBounded()) {
+    return absl::NotFoundError("no bounded host staging");
+  }
   std::chrono::steady_clock::time_point deadline;
   {
     absl::MutexLock lock(mu_);
@@ -823,13 +840,18 @@ void ReshardReceiveSession::ExecuteEligiblePoolH2ds() {
       EndOp();
       continue;
     }
-    absl::StatusOr<size_t> slot = LookupStagingSlot(pool_idx);
-    if (!slot.ok()) {
-      FinishPoolH2d(pool_idx, slot.status());
-      EndOp();
-      continue;
+    // Host source of the upload: the pool's own storage on a full mirror, or
+    // the slot leased when its bytes were addressed in GetBlockChunks.
+    std::optional<size_t> host_layer_idx;
+    if (HostLayersBounded()) {
+      absl::StatusOr<size_t> slot = LookupStagingSlot(pool_idx);
+      if (!slot.ok()) {
+        FinishPoolH2d(pool_idx, slot.status());
+        EndOp();
+        continue;
+      }
+      host_layer_idx = *slot;
     }
-    const size_t host_layer_idx = *slot;
     absl::StatusOr<raiden::PjRtCopyFuture> copy_future = base_->H2dPoolBlocks(
         pool_idx, dst_chip_block_ids,
         /*shard_idx=*/std::nullopt, uuid(), host_layer_idx);

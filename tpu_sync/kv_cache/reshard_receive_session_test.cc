@@ -26,9 +26,11 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/thread_annotations.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/future.h"
 #include "xla/tsl/platform/statusor.h"
@@ -38,6 +40,8 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 
@@ -165,10 +169,26 @@ class FakeH2dBase : public kv_cache::KVCacheManagerBase {
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx, std::optional<uint64_t> uuid,
       std::optional<size_t> host_layer_idx) override {
+    {
+      absl::MutexLock lock(fake_mu_);
+      uploads_.emplace_back(pool_idx, host_layer_idx);
+    }
     auto [promise, future] = xla::MakePromise();
     promise.Set();
     return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
   }
+
+  // (pool index, host staging buffer) of every upload issued, in order;
+  // a nullopt buffer means the pool's own storage.
+  std::vector<std::pair<size_t, std::optional<size_t>>> uploads() const {
+    absl::MutexLock lock(fake_mu_);
+    return uploads_;
+  }
+
+ private:
+  mutable absl::Mutex fake_mu_;
+  std::vector<std::pair<size_t, std::optional<size_t>>> uploads_
+      ABSL_GUARDED_BY(fake_mu_);
 };
 
 TEST(ReshardReceiveSessionTest, AcceptsCanonicalPlanOnExplicitPools) {
@@ -515,6 +535,88 @@ TEST(ReshardReceiveSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
               StatusIs(absl::StatusCode::kDeadlineExceeded));
   EXPECT_THAT(timeout_session->ResolveStagingSlot(0),
               StatusIs(absl::StatusCode::kCancelled));
+}
+
+// Mirrors the bounds check the transport's ValidateChunks applies to every
+// chunk of an incoming push: the chunk must lie inside the pool's flat host
+// span when the manager exposes one.
+bool ChunkPassesTransportValidation(kv_cache::KVCacheManagerBase& base,
+                                    size_t pool_idx,
+                                    const transport::BlockChunk& chunk) {
+  uint8_t* array_base = base.GetBlockArrayHostPointer(pool_idx, 0);
+  if (array_base == nullptr) return true;
+  const size_t array_size = base.GetBlockArrayHostSize(pool_idx, 0);
+  if (chunk.ptr < array_base) return false;
+  const size_t offset = static_cast<size_t>(chunk.ptr - array_base);
+  return offset <= array_size && chunk.size <= array_size - offset;
+}
+
+// On a full host mirror (no num_staging_layers) every pool stages in its own
+// storage's host buffer. Regression test: the receive used to lease a staging
+// slot even here, so the pool whose bytes arrived first (pool 1, storage 1)
+// was addressed in host buffer 0 while the transport validated its chunks
+// against storage 1, failing the push with "Chunk out of bounds".
+TEST(ReshardReceiveSessionTest, FullHostMirrorAddressesPoolsInPlace) {
+  FakeH2dBase base(
+      /*num_layers=*/2, /*num_shards=*/1,
+      /*slice_byte_size=*/128,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/std::make_optional(4));
+  base.AttachPlaceholderDeviceHoldForTest();
+  ASSERT_EQ(base.num_host_layers(), base.num_layers());
+
+  std::vector<kv_cache::PoolSpec> pools = {
+      DensePool("fa", 128),
+      DensePool("state", 128),
+  };
+  pools[1].storage_index = 1;
+  ABSL_ASSERT_OK(base.RegisterPools(pools));
+
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/0, /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(
+      /*uuid=*/1303, /*dtype_tags=*/{"bf16", "bf16"},
+      /*transferred_pools=*/{0, 1});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferSession> session,
+      CreateReshardReceiveSession(
+          &base, allocator.get(), plan, std::vector<int64_t>{0},
+          std::chrono::steady_clock::now() + std::chrono::seconds(10)));
+  kv_cache::KVCacheManagerBase::TransferEventHooks hooks;
+  hooks.get_session =
+      [weak = std::weak_ptr<TransferSession>(session)](
+          uint64_t uuid) -> absl::StatusOr<std::shared_ptr<TransferSession>> {
+    if (std::shared_ptr<TransferSession> live = weak.lock()) return live;
+    return absl::NotFoundError("session gone");
+  };
+  base.SetTransferEventHooks(std::move(hooks));
+
+  // Pushes land in any order; pool 1 arrives first. There is no slot to lease.
+  EXPECT_THAT(session->ResolveStagingSlot(1),
+              StatusIs(absl::StatusCode::kNotFound));
+  for (size_t pool_idx : {size_t{1}, size_t{0}}) {
+    std::vector<transport::BlockChunk> chunks = base.GetBlockChunks(
+        pool_idx, /*shard_idx=*/0, {0}, /*total_bytes=*/16, plan.uuid(),
+        /*sender_node_id=*/0);
+    ASSERT_EQ(chunks.size(), 1u) << "pool " << pool_idx;
+    EXPECT_EQ(chunks[0].ptr, base.GetBlockArrayHostPointer(pool_idx, 0))
+        << "pool " << pool_idx;
+    EXPECT_TRUE(ChunkPassesTransportValidation(base, pool_idx, chunks[0]))
+        << "pool " << pool_idx;
+  }
+
+  // Each upload reads the pool's own storage.
+  ABSL_EXPECT_OK(session->OnDataReceived(/*major_dimension_idx=*/1,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  ABSL_EXPECT_OK(session->OnDataReceived(/*major_dimension_idx=*/0,
+                                         /*minor_dimension_indices=*/{},
+                                         /*shard_ids=*/{}));
+  using Upload = std::pair<size_t, std::optional<size_t>>;
+  EXPECT_THAT(base.uploads(),
+              ::testing::UnorderedElementsAre(Upload{0, std::nullopt},
+                                              Upload{1, std::nullopt}));
+  ABSL_EXPECT_OK(session->GetStatus());
 }
 
 }  // namespace

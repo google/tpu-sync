@@ -444,7 +444,7 @@ class WeightSynchronizationPerfTest(parameterized.TestCase):
 
     # Warmup transfer to initialize connections and transfer metadata
     logging.info("Executing warmup transfer...")
-    ws_source.d2h()
+    ws_source.d2h().wait()
     future = controller.start_transfer(
         src_units=[src_unit],
         dst_units=[dst_unit],
@@ -468,7 +468,7 @@ class WeightSynchronizationPerfTest(parameterized.TestCase):
 
       # Stage 2: Device-to-Host (D2H) Staging
       t0 = time.perf_counter()
-      ws_source.d2h()
+      ws_source.d2h().wait()
       t1 = time.perf_counter()
       d2h_elapsed = t1 - t0
       d2h_latencies.append(d2h_elapsed)
@@ -567,9 +567,9 @@ class WeightSynchronizationPerfTest(parameterized.TestCase):
       )
       ws_single_src.test_only_set_skip_tiling(True)
       # Warmup
-      ws_single_src.d2h()
+      ws_single_src.d2h().wait()
       t_d2h_s = time.perf_counter()
-      ws_single_src.d2h()
+      ws_single_src.d2h().wait()
       t_d2h_e = time.perf_counter()
       d2h_dur_ms = (t_d2h_e - t_d2h_s) * 1000.0
       d2h_bw = (single_bytes / 1e9) / max(t_d2h_e - t_d2h_s, 1e-9)

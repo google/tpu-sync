@@ -669,7 +669,7 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     self.assertEqual(m0["last_h2d_bytes"], 0)
     self.assertEqual(m0["h2d_bandwidth_gbps"], 0.0)
 
-    ws.d2h()
+    ws.d2h().wait()
     m1 = ws.get_metrics()
     self.assertEqual(m1["d2h_call_count"], 1)
     self.assertGreaterEqual(m1["last_d2h_bytes"], logical_bytes)
@@ -686,7 +686,7 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     self.assertEqual(m2["total_h2d_time_ms"], m2["last_h2d_time_ms"])
     self.assertGreater(m2["h2d_bandwidth_gbps"], 0.0)
 
-    ws.d2h()
+    ws.d2h().wait()
     ws.h2d()
     m3 = ws.get_metrics()
     self.assertEqual(m3["d2h_call_count"], 2)
@@ -779,6 +779,83 @@ class WeightSynchronizerIntegrationTest(absltest.TestCase):
     for shard_idx in range(4):
       dst_buf = ws_dest.get_host_buffer(layer_idx=0, shard_idx=shard_idx)
       np.testing.assert_array_equal(dst_buf[:64], 10 + shard_idx)
+
+
+class WeightSynchronizerD2hTest(absltest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    try:
+      device = jax.devices("tpu")[0]
+    except RuntimeError:
+      device = jax.devices("cpu")[0]
+    self.sharding = jax.sharding.SingleDeviceSharding(device)
+    rng = np.random.default_rng(42)
+    self.expected = [
+        rng.standard_normal(shape).astype(np.float32)
+        for shape in ((128, 256), (256, 128))
+    ]
+    self.arrays = [
+        jax.device_put(array, self.sharding) for array in self.expected
+    ]
+    jax.block_until_ready(self.arrays)
+    self.ws = WeightSynchronizer(
+        jax_arrays=self.arrays,
+        local_port=0,
+        unsafe_skip_buffer_lock=True,
+    )
+    self.addCleanup(self.ws.shutdown)
+    for layer_idx in range(len(self.expected)):
+      self.ws.get_host_buffer(layer_idx).fill(0)
+
+  def _assert_staged_weights(self):
+    for layer_idx, expected in enumerate(self.expected):
+      staged = self.ws.get_host_buffer(layer_idx)
+      actual = staged[:expected.nbytes].view(np.float32).reshape(expected.shape)
+      np.testing.assert_array_equal(actual, expected)
+
+  def test_d2h_returns_completion_future(self):
+    future = self.ws.d2h()
+    self.assertIsNotNone(future)
+    self.assertIsInstance(future, weight_synchronizer.RaidenFuture)
+    future.wait()
+    self.assertTrue(future.is_ready())
+    self._assert_staged_weights()
+    self.assertEqual(self.ws.get_metrics()["d2h_call_count"], 1)
+
+  def test_get_host_buffer_waits_for_d2h(self):
+    future = self.ws.d2h()
+    self._assert_staged_weights()
+    future.wait()
+    with self.assertRaisesRegex(RuntimeError, "layer_idx=2.*num_layers=2"):
+      self.ws.get_host_buffer(2)
+
+  def test_h2d_waits_for_d2h(self):
+    future = self.ws.d2h()
+    self.ws.h2d()
+    future.wait()
+    self._assert_staged_weights()
+    for actual, expected in zip(self.arrays, self.expected):
+      np.testing.assert_array_equal(np.asarray(actual), expected)
+
+  def test_bind_weights_waits_for_d2h(self):
+    zero_arrays = [
+        jax.device_put(np.zeros_like(array), self.sharding)
+        for array in self.expected
+    ]
+    jax.block_until_ready(zero_arrays)
+    future = self.ws.d2h()
+    self.ws.bind_weights(zero_arrays)
+    self.ws.h2d()
+    future.wait()
+    for actual, expected in zip(zero_arrays, self.expected):
+      np.testing.assert_array_equal(np.asarray(actual), expected)
+
+  def test_d2h_future_outlives_synchronizer(self):
+    future = self.ws.d2h()
+    self.ws.shutdown()
+    future.wait()
+    self.assertTrue(future.is_ready())
 
 
 if __name__ == "__main__":

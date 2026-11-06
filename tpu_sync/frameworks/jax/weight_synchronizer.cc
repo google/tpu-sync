@@ -144,6 +144,11 @@ const uint8_t* WeightSynchronizer::GetHostBufferPtr(size_t layer_idx,
   return base_->GetHostBufferPtr(layer_idx, shard_idx);
 }
 
+absl::StatusOr<const uint8_t*> WeightSynchronizer::WaitAndGetHostBufferPtr(
+    size_t layer_idx, size_t shard_idx) const {
+  return base_->WaitAndGetHostBufferPtr(layer_idx, shard_idx);
+}
+
 size_t WeightSynchronizer::GetHostBufferSize(size_t layer_idx,
                                              size_t shard_idx) const {
   return base_->GetHostSize(layer_idx, shard_idx);

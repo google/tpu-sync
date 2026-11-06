@@ -71,6 +71,8 @@ class WeightSynchronizer {
   void ResetMetrics();
 
   const uint8_t* GetHostBufferPtr(size_t layer_idx, size_t shard_idx) const;
+  absl::StatusOr<const uint8_t*> WaitAndGetHostBufferPtr(size_t layer_idx,
+                                                      size_t shard_idx) const;
   size_t GetHostBufferSize(size_t layer_idx, size_t shard_idx) const;
   std::optional<int> local_port() const;
   std::optional<int> listener_port() const;

@@ -138,7 +138,8 @@ class ReshardReceiveSession final
     return tsl::Future<>(absl::OkStatus());
   }
 
-  // Leases a buffer to |pool_idx| on first use.
+  // Leases a buffer to |pool_idx| on first use when host layers are bounded;
+  // on a full host mirror, the pool's own storage buffer.
   absl::StatusOr<size_t> ResolveStagingSlot(size_t pool_idx) override {
     return AcquireStagingSlot(pool_idx);
   }
@@ -156,12 +157,32 @@ class ReshardReceiveSession final
   absl::Status OnPoolReceived(size_t pool_idx);
 
   // Returns the host staging buffer leased to |pool_idx|, leasing one when it
-  // has none and waiting until deadline when every slot is leased.
+  // has none and waiting until deadline when every slot is leased. On a full
+  // host mirror there is nothing to lease: returns the pool's own storage
+  // buffer, which is statically assigned.
   absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx);
 
-  // Returns the host staging buffer currently leased to |pool_idx|, or
-  // kFailedPrecondition if |pool_idx| holds no lease.
+  // True when fewer host layer buffers are allocated than storages, so pools
+  // stage through leased slots instead of their own storage's host buffer.
+  bool HostLayersBounded() const {
+    return base_ != nullptr && base_->num_host_layers() < base_->num_layers();
+  }
+
+  // Returns the host staging buffer currently leased to |pool_idx| (its own
+  // storage buffer on a full host mirror), or kFailedPrecondition if
+  // |pool_idx| holds no lease.
   absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const;
+
+  // Host buffer statically assigned to |pool_idx| on a full host mirror.
+  absl::StatusOr<size_t> StaticHostLayer(size_t pool_idx) const {
+    const kv_cache::PoolSpec* pool =
+        base_ != nullptr ? base_->pool(pool_idx) : nullptr;
+    if (pool == nullptr) {
+      return absl::NotFoundError(
+          absl::StrCat("pool ", pool_idx, " has no host storage"));
+    }
+    return pool->storage_index;
+  }
 
   // The receiver plan this session executes; immutable for its lifetime.
   const ::tpu_sync::rpc::StartTransferRequest& request() const {
@@ -561,7 +582,8 @@ ReshardReceiveSession::ReshardReceiveSession(
       start_time_(std::chrono::steady_clock::now()),
       transfer_plan_(
           std::make_shared<const TransferPlan>(std::move(transfer_plan))),
-      staging_layer_manager_(base != nullptr ? base->num_host_layers() : 0) {
+      staging_layer_manager_(HostLayersBounded() ? base->num_host_layers()
+                                                 : 0) {
   absl::MutexLock lock(mu_);
   chip_block_ids_.assign(chip_blocks.begin(), chip_blocks.end());
   for (int32_t pool_idx : request().transfer_pool_indices()) {
@@ -647,6 +669,13 @@ void ReshardReceiveSession::FinishLocked(const absl::Status& status) {
 
 absl::StatusOr<size_t> ReshardReceiveSession::AcquireStagingSlot(
     size_t pool_idx) {
+  // A full host mirror stages every pool in place: GetBlockChunks, the
+  // transport's chunk validation and H2dPoolBlocks all address the pool's own
+  // storage, so that buffer is the slot. A leased slot would land the bytes in
+  // another storage's host buffer, outside the span ValidateChunks accepts.
+  if (!HostLayersBounded()) {
+    return StaticHostLayer(pool_idx);
+  }
   std::chrono::steady_clock::time_point deadline;
   {
     absl::MutexLock lock(mu_);
@@ -673,6 +702,9 @@ absl::StatusOr<size_t> ReshardReceiveSession::AcquireStagingSlot(
 
 absl::StatusOr<size_t> ReshardReceiveSession::LookupStagingSlot(
     size_t pool_idx) const {
+  if (!HostLayersBounded()) {
+    return StaticHostLayer(pool_idx);
+  }
   {
     absl::MutexLock lock(mu_);
     if (done_ || draining_) {

@@ -2466,9 +2466,10 @@ absl::Status KVCacheManagerBase::ConfigurePoolStaging(
       full_bytes += static_cast<size_t>(agg.extent_end) * num_shards_;
     }
   }
-  // Ensure each allocated host layer that can be leased covers the maximum
-  // required arena or extent across all storages it may stage.
-  if (max_arena_bytes > 0) {
+  // When host layers are bounded, each allocated host layer may be leased to
+  // stage any storage, so grow each to cover the largest arena or extent.
+  // On a full host mirror, every storage stages in place and was sized above.
+  if (layers_.size() < num_layers_ && max_arena_bytes > 0) {
     for (size_t h = 0; h < layers_.size(); ++h) {
       ABSL_RETURN_IF_ERROR(EnsureHostMirrorCovers(h, max_arena_bytes));
     }

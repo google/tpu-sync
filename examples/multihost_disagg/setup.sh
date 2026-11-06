@@ -27,9 +27,9 @@
 #   1. A python3.12 venv created and ACTIVATED.
 #   2. tpu_raiden already installed into that venv via EITHER supported path:
 #        - build from source: `./build.sh jax` from the repo root, or
-#        - wheel:             `pip install tpu-raiden-jax --extra-index-url <url>`
-#      (Both work at run time; the wheel index is googler-only until tpu-raiden
-#      is published to PyPI, so build-from-source is the generally-available path.)
+#        - wheel:             `pip install --pre tpu-sync-jax`
+#      (Both work at run time; `--pre` is needed until the first stable
+#      tpu-sync-jax release is published to PyPI.)
 # Then, from this directory:
 #   bash setup.sh
 set -euo pipefail
@@ -60,7 +60,7 @@ if ! python -c "import tpu_sync.rpc.coordination_pb2" 2>/dev/null \
    && [ ! -f "${RAIDEN_ROOT}/tpu_sync/frameworks/jax/_tpu_raiden_jax.so" ]; then
   echo "ERROR: tpu_raiden is not available. Install it via one of:" >&2
   echo "  - build from source: run \`./build.sh jax\` from the repo root, or" >&2
-  echo "  - wheel:             \`pip install tpu-raiden-jax --extra-index-url <url>\`" >&2
+  echo "  - wheel:             \`pip install --pre tpu-sync-jax\`" >&2
   exit 1
 fi
 

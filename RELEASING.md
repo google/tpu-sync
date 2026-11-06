@@ -32,16 +32,25 @@ pip install --pre torch_tpu \
 pip install tpu-sync-torch
 ```
 
-Nightlies live in the tpu-sync Artifact Registry instead (default
+Nightlies also live in the tpu-sync Artifact Registry (default
 `https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/`, overridable
 via the `RAIDEN_REGISTRY_URL` repository variable); pip's pre-release rules
 keep the channels apart, since `.dev` versions are only ever selected with
-`--pre`:
+`--pre`. When installing from the registry, pin the exact version and use
+`--index-url` (not `--extra-index-url`) so pip never consults a second index
+for this package; install the dependencies from PyPI in a separate step:
 
 ```bash
-pip install --pre tpu_sync_jax \
-  --extra-index-url "https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/simple/"
+pip install --pre --no-deps "tpu_sync_jax==X.Y.Z.devYYYYMMDDHHMMSS" \
+  --index-url "https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/simple/"
 ```
+
+> [!WARNING]
+> The former distribution names `tpu_raiden_jax` / `tpu_raiden_torch` are
+> retired and are not controlled by this project on PyPI. Never reference them
+> in install instructions, and never pair a PyPI install with
+> `--extra-index-url` for a private registry: pip resolves across all indexes
+> and takes the highest version, which enables dependency confusion.
 
 ## How a release reaches PyPI
 

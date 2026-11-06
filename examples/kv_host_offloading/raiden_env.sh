@@ -17,7 +17,7 @@
 # Ensure tpu_raiden is importable for BOTH supported install paths. Sourced by
 # prefill.sh / decode.sh AFTER RAIDEN_ROOT is set and a venv is active.
 #
-#  - Wheel install (`pip install tpu-raiden-jax ...`): tpu_raiden is already
+#  - Wheel install (`pip install --pre tpu-sync-jax`): tpu_raiden is already
 #    importable from site-packages (generated protos + the engine .so are bundled
 #    inside the package), so we leave PYTHONPATH alone. Prepending the source tree
 #    would SHADOW the installed package with a copy lacking the built .so/protos.
@@ -37,6 +37,6 @@ fi
 if ! _raiden_ready; then
   echo "ERROR: tpu_raiden is not importable. Install it via one of:" >&2
   echo "  - build from source: ./build.sh jax  (from the repo root), or" >&2
-  echo "  - wheel:             pip install tpu-raiden-jax --extra-index-url <url>" >&2
+  echo "  - wheel:             pip install --pre tpu-sync-jax" >&2
   exit 1
 fi

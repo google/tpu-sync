@@ -124,7 +124,9 @@ class TestManager : public KVCacheManagerWithTransfer {
     absl::StatusOr<std::shared_ptr<TransferSession>> session = GetSession(uuid);
     ABSL_ASSERT_OK(session);
     static_cast<FakeH2dBase&>(*base_).ArmPoolUpload(pool_idx, status);
-    ABSL_ASSERT_OK((*session)->ResolveStagingSlot(pool_idx));
+    // kNotFound: a full host mirror stages the pool in place.
+    absl::StatusOr<size_t> slot = (*session)->ResolveStagingSlot(pool_idx);
+    ASSERT_TRUE(slot.ok() || absl::IsNotFound(slot.status())) << slot.status();
     ABSL_ASSERT_OK((*session)->OnDataReceived(
         pool_idx, /*minor_dimension_indices=*/{}, /*shard_ids=*/{}));
   }

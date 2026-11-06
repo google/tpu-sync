@@ -154,14 +154,33 @@ class ReshardSendSession final
 
  private:
   // Returns the host staging buffer leased to |pool_idx|, leasing one when it
-  // has none and waiting until deadline when every slot is leased.
+  // has none and waiting until deadline when every slot is leased. On a full
+  // host mirror there is nothing to lease: returns the pool's own storage
+  // buffer, which is statically assigned.
   absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx);
 
-  // Returns the host staging buffer currently leased to |pool_idx|. Fails
-  // with the session's status (or kCancelled) once the session is draining
-  // and holds no lease for |pool_idx|, and kFailedPrecondition when a live
-  // session holds none.
+  // Returns the host staging buffer currently leased to |pool_idx| (its own
+  // storage buffer on a full host mirror). Fails with the session's status
+  // (or kCancelled) once the session is draining and holds no lease for
+  // |pool_idx|, and kFailedPrecondition when a live session holds none.
   absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const;
+
+  // Host buffer statically assigned to |pool_idx| on a full host mirror.
+  absl::StatusOr<size_t> StaticHostLayer(size_t pool_idx) const {
+    const kv_cache::PoolSpec* pool =
+        base_ != nullptr ? base_->pool(pool_idx) : nullptr;
+    if (pool == nullptr) {
+      return absl::NotFoundError(
+          absl::StrCat("pool ", pool_idx, " has no host storage"));
+    }
+    return pool->storage_index;
+  }
+
+  // True when fewer host layer buffers are allocated than storages, so pools
+  // stage through leased slots instead of their own storage's host buffer.
+  bool HostLayersBounded() const {
+    return base_ != nullptr && base_->num_host_layers() < base_->num_layers();
+  }
 
   // Checks the preconditions of Start that need no waiting: a running
   // transport server, at least one host staging layer, and every transfer
@@ -329,7 +348,8 @@ ReshardSendSession::ReshardSendSession(
       transfer_plan_(
           std::make_shared<const TransferPlan>(std::move(transfer_plan))),
       remaining_pool_peer_pushes_(remaining_pool_peer_pushes),
-      staging_layer_manager_(base != nullptr ? base->num_host_layers() : 0) {}
+      staging_layer_manager_(HostLayersBounded() ? base->num_host_layers()
+                                                 : 0) {}
 
 ReshardSendSession::~ReshardSendSession() {
   absl::MutexLock lock(mu_);
@@ -337,6 +357,12 @@ ReshardSendSession::~ReshardSendSession() {
 }
 
 absl::StatusOr<size_t> ReshardSendSession::AcquireStagingSlot(size_t pool_idx) {
+  // A full host mirror stages every pool in place: the D2H copy, GetBlockChunks
+  // and the transport's chunk validation all address the pool's own storage,
+  // so that buffer is the slot.
+  if (!HostLayersBounded()) {
+    return StaticHostLayer(pool_idx);
+  }
   {
     absl::MutexLock lock(mu_);
     if (done_ || finalizing_) {
@@ -362,6 +388,9 @@ absl::StatusOr<size_t> ReshardSendSession::AcquireStagingSlot(size_t pool_idx) {
 
 absl::StatusOr<size_t> ReshardSendSession::LookupStagingSlot(
     size_t pool_idx) const {
+  if (!HostLayersBounded()) {
+    return StaticHostLayer(pool_idx);
+  }
   // A lease outlives the session's finalizing_ flip: a push whose completion
   // started finalizing may still be addressing another pool's host bytes.
   // SettleLocked releases every lease, so a done session never resolves one.

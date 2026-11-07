@@ -295,13 +295,13 @@ class ControlPipeClientTest(absltest.TestCase):
     with mock.patch.dict(os.environ, {}, clear=True):
       self.assertEqual(
           control_pipe_client.resolve_weight_sync_listener_backend(),
-          control_pipe_client.ControlPipeBackendType.TCP,
+          control_pipe_client.ControlPipeBackendType.GRPC,
       )
       self.assertEqual(
           control_pipe_client.resolve_weight_sync_listener_backend(
-              control_pipe_client.ControlPipeBackendType.GRPC
+              control_pipe_client.ControlPipeBackendType.TCP
           ),
-          control_pipe_client.ControlPipeBackendType.GRPC,
+          control_pipe_client.ControlPipeBackendType.TCP,
       )
 
     with mock.patch.dict(
@@ -334,13 +334,13 @@ class ControlPipeClientTest(absltest.TestCase):
         os.environ,
         {
             "TPU_RAIDEN_CONTROL_PLANE_BACKEND": "invalid",
-            "TPU_RAIDEN_USE_GRPC_CONTROL_PLANE": "1",
+            "TPU_RAIDEN_USE_GRPC_CONTROL_PLANE": "0",
         },
         clear=True,
     ):
       self.assertEqual(
           control_pipe_client.resolve_weight_sync_listener_backend(),
-          control_pipe_client.ControlPipeBackendType.TCP,
+          control_pipe_client.ControlPipeBackendType.GRPC,
       )
 
     with mock.patch.dict(

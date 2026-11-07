@@ -171,7 +171,7 @@ class RaidenController:
     if request_registry_ttl_s <= 0:
       raise ValueError("request_registry_ttl_s must be positive")
     self._request_registry_ttl_s = request_registry_ttl_s
-    self._legacy_rpc_client = worker_rpc_client or WorkerRpcClient()
+    self._legacy_rpc_client = worker_rpc_client or WeightSyncWorkerRpcClient()
     if hasattr(self._legacy_rpc_client, "bind_entities"):
       self._legacy_rpc_client.bind_entities(self._entities)
       for ent in self._entities.values():

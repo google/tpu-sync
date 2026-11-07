@@ -96,12 +96,12 @@ int ConnectToListenerPort(int port) {
   return sock;
 }
 
-TEST(WeightSynchronizerListenerTest, DefaultBackendIsTcp) {
+TEST(WeightSynchronizerListenerTest, DefaultBackendIsGrpc) {
   ScopedEnvVar backend_env("TPU_RAIDEN_CONTROL_PLANE_BACKEND", std::nullopt);
   ScopedEnvVar grpc_flag("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE", std::nullopt);
 
   EXPECT_EQ(WeightSynchronizerListener::ResolveBackendType(),
-            ControlPipeBackendType::kTcp);
+            ControlPipeBackendType::kGrpc);
 
   TF_ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<WeightSynchronizerBase> engine_ptr,
@@ -110,7 +110,7 @@ TEST(WeightSynchronizerListenerTest, DefaultBackendIsTcp) {
           /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
           /*parallelism=*/1, /*listener_port=*/std::nullopt));
   WeightSynchronizerListener listener(engine_ptr.get(), /*listener_port=*/0);
-  EXPECT_EQ(listener.backend_type(), ControlPipeBackendType::kTcp);
+  EXPECT_EQ(listener.backend_type(), ControlPipeBackendType::kGrpc);
   EXPECT_GT(listener.listener_port(), 0);
   EXPECT_TRUE(listener.is_active());
 }
@@ -130,9 +130,9 @@ TEST(WeightSynchronizerListenerTest, ResolveBackendTypeHonorsEnvVars) {
   }
   {
     ScopedEnvVar backend_env("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "unknown");
-    ScopedEnvVar grpc_flag("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE", "1");
+    ScopedEnvVar grpc_flag("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE", "0");
     EXPECT_EQ(WeightSynchronizerListener::ResolveBackendType(),
-              ControlPipeBackendType::kTcp);
+              ControlPipeBackendType::kGrpc);
   }
   {
     ScopedEnvVar backend_env("TPU_RAIDEN_CONTROL_PLANE_BACKEND", std::nullopt);
@@ -157,8 +157,7 @@ TEST(WeightSynchronizerListenerTest, PushWeightsCommandGrpcSuccess) {
           /*parallelism=*/1, /*listener_port=*/std::nullopt));
   WeightSynchronizerBase& engine = *engine_ptr;
 
-  WeightSynchronizerListener listener(&engine, /*listener_port=*/0,
-                                      ControlPipeBackendType::kGrpc);
+  WeightSynchronizerListener listener(&engine, /*listener_port=*/0);
   ASSERT_GT(listener.listener_port(), 0);
   EXPECT_TRUE(listener.is_active());
   EXPECT_EQ(listener.backend_type(), ControlPipeBackendType::kGrpc);
@@ -197,8 +196,7 @@ TEST(WeightSynchronizerListenerTest, ShutdownCommandGrpcStopsService) {
           /*parallelism=*/1, /*listener_port=*/std::nullopt));
   WeightSynchronizerBase& engine = *engine_ptr;
 
-  WeightSynchronizerListener listener(&engine, /*listener_port=*/0,
-                                      ControlPipeBackendType::kGrpc);
+  WeightSynchronizerListener listener(&engine, /*listener_port=*/0);
   EXPECT_TRUE(listener.is_active());
   EXPECT_EQ(listener.backend_type(), ControlPipeBackendType::kGrpc);
 
@@ -360,7 +358,6 @@ TEST(WeightSynchronizerListenerTest, PushWeightsReshardedSuccess) {
   ControlPipeConfig cfg;
   cfg.backend_type = listener.backend_type();
   std::unique_ptr<ControlPipeClient> client = CreateControlPipeClient(cfg);
-
   // Send START_TRANSFER (Receiver) payload to target peer to register expected
   // chunks before initiating sender's resharded push transfer.
   ControlRequest dst_req;
@@ -378,7 +375,6 @@ TEST(WeightSynchronizerListenerTest, PushWeightsReshardedSuccess) {
           absl::StrCat("127.0.0.1:", *dst_engine.listener_port()), dst_req,
           absl::Seconds(10))));
   EXPECT_TRUE(dst_resp.success()) << dst_resp.message();
-
   ControlRequest req;
   req.set_command(ControlRequest::COMMAND_START_TRANSFER);
 

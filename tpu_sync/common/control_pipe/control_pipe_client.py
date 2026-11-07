@@ -124,7 +124,7 @@ def resolve_weight_sync_listener_backend(
   """
   if override is not None:
     return override
-  default_backend = ControlPipeBackendType.TCP
+  default_backend = ControlPipeBackendType.GRPC
   env_val = os.environ.get("TPU_RAIDEN_CONTROL_PLANE_BACKEND", "")
   if env_val:
     lowered = env_val.lower()

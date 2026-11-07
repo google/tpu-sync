@@ -60,7 +60,7 @@ ControlPipeBackendType WeightSynchronizerListener::ResolveBackendType(
     }
     LOG(WARNING) << "Unknown TPU_RAIDEN_CONTROL_PLANE_BACKEND='" << env_backend
                  << "', falling back to default.";
-    return ControlPipeBackendType::kTcp;
+    return ControlPipeBackendType::kGrpc;
   }
   if (const char* env_flag = std::getenv("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE")) {
     std::string val = absl::AsciiStrToLower(env_flag);
@@ -71,7 +71,7 @@ ControlPipeBackendType WeightSynchronizerListener::ResolveBackendType(
       return ControlPipeBackendType::kGrpc;
     }
   }
-  return ControlPipeBackendType::kTcp;
+  return ControlPipeBackendType::kGrpc;
 }
 
 WeightSynchronizerListener::WeightSynchronizerListener(

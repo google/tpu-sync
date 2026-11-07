@@ -760,7 +760,10 @@ int main(int argc, char* argv[]) {
       }
       allocated_block_ids.push_back(src_block_ids);
 
-      std::string peer_addr = absl::StrFormat("%s:%d", remote.ip, remote.port);
+      std::string peer_addr =
+          absl::StrContains(remote.ip, ':')
+              ? absl::StrFormat("[%s]:%d", remote.ip, remote.port)
+              : absl::StrFormat("%s:%d", remote.ip, remote.port);
       mapped_peer_addresses.push_back(peer_addr);
       managers.push_back(std::move(manager));
     }

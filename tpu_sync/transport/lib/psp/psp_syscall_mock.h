@@ -15,9 +15,4 @@
 #ifndef TPU_SYNC_TRANSPORT_LIB_PSP_PSP_SYSCALL_MOCK_H_
 #define TPU_SYNC_TRANSPORT_LIB_PSP_PSP_SYSCALL_MOCK_H_
 
-#include <cstdint>
-#include <memory>
-#include <optional>
-#include <utility>
-
 #endif  // TPU_SYNC_TRANSPORT_LIB_PSP_PSP_SYSCALL_MOCK_H_

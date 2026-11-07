@@ -141,6 +141,7 @@ cc_test(
     deps = [
         ":block_transport",
         ":block_transport_delegate",
+        ":block_transport_session",
         ":buffer_push_task",
         ":transfer_session",
         "//tpu_sync/telemetry:metrics_3p_prometheus_exporter",
@@ -150,7 +151,6 @@ cc_test(
         "//tpu_sync/transport/lib:chunk_serializer",
         "//tpu_sync/transport/lib:transport_adapter",
         "//tpu_sync/transport/lib/psp:psp_syscall_mock",
-        "//tpu_sync/transport/lib/psp:tcp_psp_helper",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
@@ -168,6 +168,7 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@peregrine//peregrine/src/api/v1:conn_util",
+        "@peregrine//peregrine/src/api/v1:psp",
         "@peregrine//peregrine/src/api/v1:socket_util",
         "@xla//xla/tsl/concurrency:future",
     ],

@@ -276,7 +276,6 @@ cc_library(
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport:buffer_push_task",
-        "//tpu_sync/transport/lib/psp:tcp_psp_helper",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
@@ -324,7 +323,6 @@ cc_test(
         "//tpu_sync/transport:buffer_push_task",
         "//tpu_sync/transport/lib/psp:peregrine_control_service",
         "//tpu_sync/transport/lib/psp:psp_syscall_mock",
-        "//tpu_sync/transport/lib/psp:tcp_psp_helper",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
@@ -343,6 +341,7 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@peregrine//peregrine/src/api/v1:conn_util",
+        "@peregrine//peregrine/src/api/v1:psp",
         "@peregrine//peregrine/src/api/v1:socket_util",
     ],
 )

@@ -28,11 +28,11 @@
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/channel_arguments.h"
 #include "grpcpp/support/status.h"
+#include "peregrine/src/api/v1/psp/psp.h"
 #include "peregrine/src/internal/control/message.pb.h"
 #include "peregrine/src/internal/control/message_internal.pb.h"
 #include "peregrine/src/internal/control/service.grpc.pb.h"
 #include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
-#include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 
@@ -42,6 +42,7 @@ namespace {
 using ::peregrine::internal::control::PeregrineService;
 using ::peregrine::internal::proto::ReqMsg;
 using ::peregrine::internal::proto::RespMsg;
+using ::peregrine::v1::IsPspSupported;
 using ::testing::NotNull;
 
 class FakeRawDelegate : public RawBufferTransportDelegate {
@@ -63,7 +64,7 @@ ReqMsg MakeValidReq() {
 }
 
 TEST(PeregrineControlServiceTest, ProcessUnary) {
-  absl::SetFlag(&FLAGS_require_psp_tcp, true);
+  absl::SetFlag(&FLAGS_enable_psp_tcp, true);
   FakeRawDelegate raw_delegate;
   RawBufferTransport transport(&raw_delegate, /*local_port=*/0);
   PeregrineControlServiceImpl service(&transport);

@@ -59,6 +59,7 @@
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
 #include "peregrine/src/api/v1/conn_util.h"
+#include "peregrine/src/api/v1/psp/psp.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/fault_injection/hooks.h"
@@ -69,13 +70,13 @@
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/psp/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
-#include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {
 
 using ::peregrine::v1::ConnectToPeer;
+using ::peregrine::v1::IsPspSupported;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::WriteExact;
 
@@ -277,7 +278,7 @@ class RawBufferTransportTest : public ::testing::TestWithParam<bool> {
     if (GetParam() && !IsPspSupported()) {
       GTEST_SKIP() << "PSP-TCP is unimplemented.";
     }
-    absl::SetFlag(&FLAGS_require_psp_tcp, GetParam());
+    absl::SetFlag(&FLAGS_enable_psp_tcp, GetParam());
   }
 
   void TearDown() override {

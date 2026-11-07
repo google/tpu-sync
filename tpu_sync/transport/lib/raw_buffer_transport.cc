@@ -77,7 +77,6 @@
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
-#include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 
 namespace tpu_raiden::transport::lib {
@@ -85,6 +84,8 @@ namespace tpu_raiden::transport::lib {
 using ::peregrine::v1::GetAddrPortPair;
 using ::peregrine::v1::Histogram;
 using ::peregrine::v1::IsEnvVarEnabled;
+using ::peregrine::v1::IsPspEnabled;
+using ::peregrine::v1::PspRegisterPeer;
 using ::peregrine::v1::PspToken;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::ReadVExact;
@@ -290,7 +291,7 @@ RawBufferTransport::RawBufferTransport(
       bound_ip_(local_ips.empty() ? "127.0.0.1" : local_ips[0]),
       local_ips_(local_ips),
       local_port_(local_port),
-      require_psp_tcp_(absl::GetFlag(FLAGS_require_psp_tcp)),
+      require_psp_tcp_(absl::GetFlag(FLAGS_enable_psp_tcp)),
       pin_recv_threads_to_nic_numa_(PinRecvThreadsToNicNumaEnabled()),
       server_fd_(-1),
       stopping_(false),
@@ -771,7 +772,7 @@ absl::StatusOr<PspToken> RawBufferTransport::RegisterPspPeer(
         "Transport is stopping or listening socket is not initialized.");
   }
 
-  return RegisterPeerPspToken(server_fd_, client_spi, client_key, peer_target);
+  return PspRegisterPeer(server_fd_, client_spi, client_key, peer_target);
 }
 
 void RawBufferTransport::ListenerLoop() {

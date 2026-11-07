@@ -58,18 +58,19 @@
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
 #include "peregrine/src/api/v1/conn_util.h"
+#include "peregrine/src/api/v1/psp/psp.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/prometheus_exporter.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/block_transport_session.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
-#include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
@@ -78,6 +79,7 @@ namespace {
 
 using ::absl_testing::StatusIs;
 using ::peregrine::v1::ConnectToPeer;
+using ::peregrine::v1::IsPspSupported;
 using ::peregrine::v1::ReadExact;
 using ::testing::Each;
 using ::testing::Eq;
@@ -479,10 +481,10 @@ class PlanRequiringDelegate : public MockDelegate {
 class BlockTransportTest : public ::testing::TestWithParam<bool> {
  protected:
   void SetUp() override {
-    if (GetParam() && !lib::IsPspSupported()) {
+    if (GetParam() && !IsPspSupported()) {
       GTEST_SKIP() << "PSP-TCP is unimplemented.";
     }
-    absl::SetFlag(&FLAGS_require_psp_tcp, GetParam());
+    absl::SetFlag(&FLAGS_enable_psp_tcp, GetParam());
   }
 
   void TearDown() override {

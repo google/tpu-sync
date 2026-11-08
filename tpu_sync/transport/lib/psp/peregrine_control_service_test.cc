@@ -64,7 +64,7 @@ ReqMsg MakeValidReq() {
 }
 
 TEST(PeregrineControlServiceTest, ProcessUnary) {
-  absl::SetFlag(&FLAGS_enable_psp_tcp, true);
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
   FakeRawDelegate raw_delegate;
   RawBufferTransport transport(&raw_delegate, /*local_port=*/0);
   PeregrineControlServiceImpl service(&transport);

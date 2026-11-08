@@ -291,7 +291,7 @@ RawBufferTransport::RawBufferTransport(
       bound_ip_(local_ips.empty() ? "127.0.0.1" : local_ips[0]),
       local_ips_(local_ips),
       local_port_(local_port),
-      require_psp_tcp_(absl::GetFlag(FLAGS_enable_psp_tcp)),
+      require_psp_tcp_(absl::GetFlag(FLAGS_peregrine_enable_psp_tcp)),
       pin_recv_threads_to_nic_numa_(PinRecvThreadsToNicNumaEnabled()),
       server_fd_(-1),
       stopping_(false),

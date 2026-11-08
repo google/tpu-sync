@@ -204,7 +204,7 @@ class ReshardSendSession final
   bool leases_released_ ABSL_GUARDED_BY(mu_) = false;
   // The last op already closed the idle data connections (kPerTransfer).
   bool connections_released_ ABSL_GUARDED_BY(mu_) = false;
-  StagingLayerManager staging_layer_manager_;
+  PoolStagingLayers staging_layer_manager_;
   std::atomic<bool> cancelled_{false};
 };
 
@@ -329,7 +329,7 @@ ReshardSendSession::ReshardSendSession(
       transfer_plan_(
           std::make_shared<const TransferPlan>(std::move(transfer_plan))),
       remaining_pool_peer_pushes_(remaining_pool_peer_pushes),
-      staging_layer_manager_(base != nullptr ? base->num_host_layers() : 0) {}
+      staging_layer_manager_(PoolStagingLayers::ForManager(base)) {}
 
 ReshardSendSession::~ReshardSendSession() {
   absl::MutexLock lock(mu_);

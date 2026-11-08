@@ -278,7 +278,7 @@ class RawBufferTransportTest : public ::testing::TestWithParam<bool> {
     if (GetParam() && !IsPspSupported()) {
       GTEST_SKIP() << "PSP-TCP is unimplemented.";
     }
-    absl::SetFlag(&FLAGS_enable_psp_tcp, GetParam());
+    absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, GetParam());
   }
 
   void TearDown() override {

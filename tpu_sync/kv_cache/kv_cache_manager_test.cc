@@ -1840,12 +1840,12 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
 
   EXPECT_EQ(manager.GetAllocatedHostDramBytes(), 2048);
 
-  // Calling RegisterPools grows both host staging layers from 4*128 to 8*128
-  // bytes per shard (2 layers * 2 shards = +2048 bytes -> 4096 bytes total).
+  // Calling RegisterPools grows layer 0 host mirror from 4*128 to 8*128 bytes
+  // per shard (2 shards = +1024 bytes -> 3072 bytes total).
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
-               testing::IsEmpty(), testing::DoubleEq(4096.0)))
+               testing::IsEmpty(), testing::DoubleEq(3072.0)))
       .Times(1);
   manager.SetLayerPhysicalSizeForTest(/*layer_idx=*/0,
                                       /*physical_size=*/1024,
@@ -1853,14 +1853,14 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
   ABSL_ASSERT_OK(manager.RegisterPools(
       {DensePool("kind_a", /*storage_index=*/0, /*base_offset=*/0,
                  /*stride=*/128, /*num_blocks=*/8)}));
-  EXPECT_EQ(manager.GetAllocatedHostDramBytes(), 4096);
+  EXPECT_EQ(manager.GetAllocatedHostDramBytes(), 3072);
 
   // Subsequent call to UpdateAllocatedOccupancyMetric maintains and reports
-  // the running value (4096).
+  // the running value (3072).
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
-               testing::IsEmpty(), testing::DoubleEq(4096.0)))
+               testing::IsEmpty(), testing::DoubleEq(3072.0)))
       .Times(1);
   manager.UpdateAllocatedOccupancyMetric();
 }

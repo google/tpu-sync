@@ -955,6 +955,49 @@ TEST(PoolStagingTest, GetBlockChunksLargePlanLinearScaling) {
                   .empty());
 }
 
+// On a full host mirror (num_host_layers == num_layers), storages stage in
+// place, so smaller storages keep their own mirror size instead of inflating to
+// the largest storage's extent; bounded host layers still grow leased buffers
+// to cover the largest storage.
+TEST(PoolStagingTest, FullHostMirrorKeepsHeterogeneousStorageSizes) {
+  constexpr int64_t kSmallStride = 64;
+  constexpr int64_t kLargeStride = 1024;
+  constexpr int64_t kNumBlocks = 8;
+
+  StagingTestManager full_mirror(/*num_layers=*/2, /*num_shards=*/1,
+                                 /*slice_byte_size=*/kSmallStride,
+                                 /*host_blocks=*/1);
+  ASSERT_EQ(full_mirror.num_host_layers(), full_mirror.num_layers());
+  full_mirror.SetDeviceBacked(0, kSmallStride * kNumBlocks);
+  full_mirror.SetDeviceBacked(1, kLargeStride * kNumBlocks);
+  ABSL_ASSERT_OK(full_mirror.RegisterPools(
+      {DensePool("kv", /*storage_index=*/0, /*base_offset=*/0, kSmallStride,
+                 kNumBlocks, /*staging_blocks_per_request=*/0),
+       DensePool("hidden", /*storage_index=*/1, /*base_offset=*/0, kLargeStride,
+                 kNumBlocks, /*staging_blocks_per_request=*/0)},
+      /*staging_leases=*/0));
+  EXPECT_EQ(full_mirror.GetHostSize(0, 0),
+            static_cast<size_t>(kSmallStride * kNumBlocks));
+  EXPECT_EQ(full_mirror.GetHostSize(1, 0),
+            static_cast<size_t>(kLargeStride * kNumBlocks));
+
+  StagingTestManager bounded_layers(/*num_layers=*/2, /*num_shards=*/1,
+                                    /*slice_byte_size=*/kSmallStride,
+                                    /*host_blocks=*/1,
+                                    /*num_staging_layers=*/1);
+  ASSERT_EQ(bounded_layers.num_host_layers(), 1u);
+  bounded_layers.SetDeviceBacked(0, kSmallStride * kNumBlocks);
+  bounded_layers.SetDeviceBacked(1, kLargeStride * kNumBlocks);
+  ABSL_ASSERT_OK(bounded_layers.RegisterPools(
+      {DensePool("kv", /*storage_index=*/0, /*base_offset=*/0, kSmallStride,
+                 kNumBlocks, /*staging_blocks_per_request=*/0),
+       DensePool("hidden", /*storage_index=*/1, /*base_offset=*/0, kLargeStride,
+                 kNumBlocks, /*staging_blocks_per_request=*/0)},
+      /*staging_leases=*/0));
+  EXPECT_EQ(bounded_layers.GetHostSize(0, 0),
+            static_cast<size_t>(kLargeStride * kNumBlocks));
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

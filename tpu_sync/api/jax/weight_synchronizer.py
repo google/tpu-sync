@@ -24,6 +24,8 @@ from tpu_sync.api import weight_sync_common
 # Import Nanobind binary library directly E2E!
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _weight_synchronizer
 
+RaidenFuture = _weight_synchronizer.RaidenFuture
+
 common.register_telemetry_callbacks(
     increment_counter=_weight_synchronizer.increment_counter,
     set_gauge=_weight_synchronizer.set_gauge,
@@ -161,11 +163,18 @@ class WeightSynchronizer:
         test_only_simulated_ingress_gbps,
     )
 
-  def d2h(self) -> None:
-    """Triggers asynchronous Device-to-Host (D2H) copy of current weights to Host buffer."""
-    # TODO(raiden-eng): Return the copy's `RaidenFuture` without blocking, as
-    # the PyTorch `WeightSynchronizer.d2h()` does.
-    self._impl.D2h()
+  def d2h(self) -> RaidenFuture:
+    """Schedules a D2H copy of the bound weights into host staging buffers.
+
+    The returned future completes after all layers have been copied and
+    detiled. Call its `wait()` method to wait for completion and raise any
+    asynchronous copy error. `get_host_buffer()` waits for its requested
+    layer, and `h2d()` waits for all layers, without an explicit `wait()`.
+    A subsequent `d2h()` or `bind_weights()` waits for the in-flight copy.
+    Use `d2h().wait()` before reading a previously obtained host view or
+    inspecting completed-copy metrics.
+    """
+    return self._impl.D2h()
 
   def h2d(self) -> None:
     """Triggers asynchronous Host-to-Device (H2D) copy of staged host buffer back to Device memory E2E."""
@@ -193,6 +202,9 @@ class WeightSynchronizer:
 
   def get_host_buffer(self, layer_idx: int = 0, shard_idx: int = 0) -> any:
     """Returns a zero-copy Host-side CPU NumPy ndarray view of the C++ staging buffer.
+
+    Waits for an in-flight D2H copy of the requested layer and raises if that
+    copy failed before returning the view.
 
     The view keeps the native synchronizer, with its ports, threads and host
     staging memory, alive for as long as the view or any array sharing its

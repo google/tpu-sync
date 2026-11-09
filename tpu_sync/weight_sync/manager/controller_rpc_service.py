@@ -270,6 +270,8 @@ class RaidenControllerServer:
                 transfer_rank=transfer_rank,
                 variables=variables,
                 mesh_axes=mesh_axes,
+                process_start_time_us=reg.host.process_start_time_us,
+                num_hosts=reg.host.num_hosts,
             )
             raiden_resp.success = True
           elif (
@@ -465,6 +467,8 @@ class RaidenControllerClientFacade:
       transfer_rank: Optional[int] = None,
       variables: Optional[Sequence[Any]] = None,
       mesh_axes: Optional[Sequence[str]] = None,
+      process_start_time_us: int = 0,
+      num_hosts: int = 0,
   ) -> None:
     """Sends remote RPC to register a physical worker entity with the central RaidenControllerServer."""
     reg_req = self._raiden_proto_module.RegisterWorkUnitRequest(
@@ -474,6 +478,9 @@ class RaidenControllerClientFacade:
             control_plane_rpc_address if control_plane_rpc_address else ""
         ),
     )
+    if process_start_time_us > 0:
+      reg_req.host.process_start_time_us = process_start_time_us
+      reg_req.host.num_hosts = num_hosts
     if mesh_shape:
       reg_req.mesh_shape.extend(mesh_shape)
     if layout:

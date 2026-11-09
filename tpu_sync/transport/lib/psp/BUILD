@@ -18,12 +18,14 @@ package(default_visibility = ["//visibility:public"])
 
 cc_library(
     name = "peregrine_control_service",
+    srcs = ["peregrine_control_service.cc"],
     hdrs = ["peregrine_control_service.h"],
     deps = [
         "//tpu_sync/common:grpc_util",
         "//tpu_sync/transport/lib:raw_buffer_transport",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/status:statusor",
+        "@peregrine//peregrine/src/api/v1:psp",
         "@peregrine//peregrine/src/internal/control:message_cc_proto",
         "@peregrine//peregrine/src/internal/control:message_internal_cc_proto",
         "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",

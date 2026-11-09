@@ -943,8 +943,9 @@ TEST(ReshardSendSessionTest,
 
   EXPECT_EQ(receiver.uploaded_bytes(0), std::vector<uint8_t>(16, 0xA5));
   EXPECT_EQ(receiver.uploaded_bytes(1), std::vector<uint8_t>(16, 0x5A));
-  EXPECT_NE(receiver.uploaded_host_slot(0), std::nullopt);
-  EXPECT_NE(receiver.uploaded_host_slot(1), std::nullopt);
+  // A full mirror stages each pool in its own storage's buffer.
+  EXPECT_EQ(receiver.uploaded_host_slot(0), std::make_optional<size_t>(1));
+  EXPECT_EQ(receiver.uploaded_host_slot(1), std::make_optional<size_t>(0));
 }
 
 }  // namespace

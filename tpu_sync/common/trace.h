@@ -77,11 +77,22 @@ TraceBackend GetTraceBackend();
 // clear the override. Thread-safe.
 void SetTraceBackendForTesting(std::optional<TraceBackend> backend);
 
+// Default in-process Perfetto ring buffer size in KB (64 MiB).
+inline constexpr uint32_t kDefaultPerfettoBufferSizeKb = 65536;
+
+// Resolves the Perfetto ring buffer size in KB from `explicit_buffer_size_kb`
+// (when > 0), or the TPU_RAIDEN_PERFETTO_BUFFER_SIZE_KB /
+// RAIDEN_PERFETTO_BUFFER_SIZE_KB environment variables, falling back to
+// kDefaultPerfettoBufferSizeKb. Thread-safe.
+uint32_t GetPerfettoBufferSizeKb(uint32_t explicit_buffer_size_kb = 0);
+
 // Starts an in-process Perfetto tracing session and writes the collected
 // trace data to output_file_path when StopPerfettoTraceToFile() is called.
-// Returns true on success, false if a trace session is already running or
-// if output_file_path cannot be created. Thread-safe.
-bool StartPerfettoTraceToFile(absl::string_view output_file_path);
+// When `buffer_size_kb` is 0, the buffer size is resolved via
+// GetPerfettoBufferSizeKb(). Returns true on success, false if a trace session
+// is already running or if output_file_path cannot be created. Thread-safe.
+bool StartPerfettoTraceToFile(absl::string_view output_file_path,
+                              uint32_t buffer_size_kb = 0);
 
 // Stops the file-based Perfetto tracing session started by
 // StartPerfettoTraceToFile(), flushes all buffered events, and writes the

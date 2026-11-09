@@ -37,6 +37,7 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
+#include "tpu_sync/kv_cache/transfer_session.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {
@@ -567,19 +568,19 @@ TEST(ReshardReceiveSessionTest,
       -> absl::StatusOr<std::shared_ptr<TransferSession>> { return session; };
   base.SetTransferEventHooks(std::move(hooks));
 
-  // Pool 1 arrives before Pool 0 and leases host slot 0 (even though
-  // pools[1].storage_index == 1).
+  // Pool 1 arrives before Pool 0. On a full mirror it still lands in its own
+  // storage's buffer (pools[1].storage_index == 1), whatever the order.
   std::vector<transport::BlockChunk> chunks1 = base.GetBlockChunks(
       /*layer_idx=*/1, /*shard_idx=*/0, std::vector<int64_t>{0},
       /*total_bytes=*/16, kUuid, /*sender_node_id=*/0);
   ASSERT_EQ(chunks1.size(), 1u);
-  EXPECT_THAT(session->ResolveStagingSlot(1), IsOkAndHolds(0u));
+  EXPECT_THAT(session->ResolveStagingSlot(1), IsOkAndHolds(1u));
   TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const char> pool1_span,
                        base.GetBlockArrayHostSpan(/*block_array_idx=*/1,
                                                   /*shard_idx=*/0, kUuid));
   EXPECT_EQ(pool1_span.data(),
             reinterpret_cast<const char*>(
-                base.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0) +
+                base.GetHostPointer(/*layer_idx=*/1, /*shard_idx=*/0) +
                 pools[1].base_offset_bytes));
   EXPECT_EQ(
       pool1_span.size(),
@@ -589,18 +590,18 @@ TEST(ReshardReceiveSessionTest,
   EXPECT_LE(chunk1_begin + chunks1[0].size,
             pool1_span.data() + pool1_span.size());
 
-  // Pool 0 arrives second and leases host slot 1.
+  // Pool 0 arrives second and lands in storage 0's buffer.
   std::vector<transport::BlockChunk> chunks0 = base.GetBlockChunks(
       /*layer_idx=*/0, /*shard_idx=*/0, std::vector<int64_t>{0},
       /*total_bytes=*/16, kUuid, /*sender_node_id=*/0);
   ASSERT_EQ(chunks0.size(), 1u);
-  EXPECT_THAT(session->ResolveStagingSlot(0), IsOkAndHolds(1u));
+  EXPECT_THAT(session->ResolveStagingSlot(0), IsOkAndHolds(0u));
   TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const char> pool0_span,
                        base.GetBlockArrayHostSpan(/*block_array_idx=*/0,
                                                   /*shard_idx=*/0, kUuid));
   EXPECT_EQ(pool0_span.data(),
             reinterpret_cast<const char*>(
-                base.GetHostPointer(/*layer_idx=*/1, /*shard_idx=*/0) +
+                base.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0) +
                 pools[0].base_offset_bytes));
   EXPECT_EQ(
       pool0_span.size(),
@@ -617,9 +618,114 @@ TEST(ReshardReceiveSessionTest,
                                          /*minor_dimension_indices=*/{},
                                          /*shard_ids=*/{}));
   ABSL_EXPECT_OK(session->AwaitForDone());
-  const std::vector<std::pair<size_t, size_t>> expected_uploads = {{1, 0},
-                                                                   {0, 1}};
+  const std::vector<std::pair<size_t, size_t>> expected_uploads = {{1, 1},
+                                                                   {0, 0}};
   EXPECT_EQ(base.uploaded_host_slot_by_pool(), expected_uploads);
+}
+
+TEST(ReshardReceiveSessionTest,
+     FullMirrorPoolsSharingAStorageResolveWithoutWaiting) {
+  // The FA pool and two state pools alias one storage, as in a hybrid model.
+  // On a full mirror (one host buffer for the one storage) every pool lands
+  // in that buffer at once; none waits for another pool's upload.
+  constexpr uint64_t kUuid = 1305;
+  FakeH2dBase base(
+      /*num_layers=*/1, /*num_shards=*/1,
+      /*slice_byte_size=*/128,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/std::make_optional(4));
+  base.AttachPlaceholderDeviceHoldForTest();
+  ASSERT_EQ(base.num_host_layers(), 1u);
+
+  std::vector<kv_cache::PoolSpec> pools = {
+      DensePool("fa", 128),
+      DensePool("gdn.conv.g0", 128),
+      DensePool("gdn.ssm.g0", 128),
+  };
+  for (size_t p = 0; p < pools.size(); ++p) {
+    pools[p].num_blocks = 1;
+    pools[p].base_offset_bytes = static_cast<int64_t>(p) * 128;
+  }
+  ABSL_ASSERT_OK(base.RegisterPools(pools));
+
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/0, /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(
+      /*uuid=*/kUuid, /*dtype_tags=*/{"bf16", "bf16", "bf16"},
+      /*transferred_pools=*/{0, 1, 2});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferSession> session,
+      CreateReshardReceiveSession(
+          &base, allocator.get(), plan, std::vector<int64_t>{0},
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(500)));
+
+  // Leasing per pool would make pools 1 and 2 wait for pool 0's buffer until
+  // the deadline.
+  EXPECT_THAT(session->ResolveStagingSlot(2), IsOkAndHolds(0u));
+  EXPECT_THAT(session->ResolveStagingSlot(0), IsOkAndHolds(0u));
+  EXPECT_THAT(session->ResolveStagingSlot(1), IsOkAndHolds(0u));
+  EXPECT_FALSE(session->Done());
+
+  for (size_t pool_idx : {2, 0, 1}) {
+    ABSL_EXPECT_OK(session->OnDataReceived(pool_idx,
+                                           /*minor_dimension_indices=*/{},
+                                           /*shard_ids=*/{}));
+  }
+  ABSL_EXPECT_OK(session->AwaitForDone());
+  EXPECT_THAT(base.uploaded_host_slot_by_pool(),
+              ::testing::UnorderedElementsAre(::testing::Pair(0u, 0u),
+                                              ::testing::Pair(1u, 0u),
+                                              ::testing::Pair(2u, 0u)));
+}
+
+TEST(PoolStagingLayersTest, FullMirrorMapsEachPoolToItsStorage) {
+  PoolStagingLayers layers(/*storage_of_pool=*/{0, 0, 1}, /*bounded=*/false,
+                           /*num_host_layers=*/2);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+  EXPECT_EQ(layers.Lookup(1), std::nullopt);
+  EXPECT_THAT(layers.Acquire(0, deadline), IsOkAndHolds(0u));
+  EXPECT_THAT(layers.Acquire(1, deadline), IsOkAndHolds(0u));
+  EXPECT_THAT(layers.Acquire(2, deadline), IsOkAndHolds(1u));
+  EXPECT_EQ(layers.Lookup(1), std::make_optional<size_t>(0));
+  EXPECT_EQ(layers.Release(1), std::make_optional<size_t>(0));
+  EXPECT_EQ(layers.Lookup(1), std::nullopt);
+  EXPECT_EQ(layers.Lookup(0), std::make_optional<size_t>(0));
+  // A pool index past the registered pools is its own storage.
+  EXPECT_THAT(layers.Acquire(5, deadline), IsOkAndHolds(5u));
+}
+
+TEST(PoolStagingLayersTest, BoundedPoolsOfOneStorageShareItsLease) {
+  // Pools 0 and 1 share storage 0; pool 2 is on storage 1. One host buffer.
+  PoolStagingLayers layers(/*storage_of_pool=*/{0, 0, 1}, /*bounded=*/true,
+                           /*num_host_layers=*/1);
+  auto soon = []() {
+    return std::chrono::steady_clock::now() + std::chrono::milliseconds(30);
+  };
+  EXPECT_THAT(layers.Acquire(0, soon()), IsOkAndHolds(0u));
+  // Pool 1 shares storage 0's buffer instead of waiting for a second one.
+  EXPECT_THAT(layers.Acquire(1, soon()), IsOkAndHolds(0u));
+  EXPECT_THAT(layers.Acquire(2, soon()),
+              StatusIs(absl::StatusCode::kDeadlineExceeded));
+  // The lease ends with the storage's last holder, not its first.
+  EXPECT_EQ(layers.Release(0), std::make_optional<size_t>(0));
+  EXPECT_THAT(layers.Acquire(2, soon()),
+              StatusIs(absl::StatusCode::kDeadlineExceeded));
+  absl::StatusOr<size_t> slot2;
+  std::thread waiter([&]() {
+    slot2 = layers.Acquire(
+        2, std::chrono::steady_clock::now() + std::chrono::seconds(5));
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_EQ(layers.Release(1), std::make_optional<size_t>(0));
+  waiter.join();
+  EXPECT_THAT(slot2, IsOkAndHolds(0u));
+  EXPECT_EQ(layers.Lookup(0), std::nullopt);
+  EXPECT_EQ(layers.Lookup(2), std::make_optional<size_t>(0));
+
+  layers.Shutdown();
+  EXPECT_THAT(layers.Acquire(0, soon()),
+              StatusIs(absl::StatusCode::kCancelled));
 }
 
 }  // namespace

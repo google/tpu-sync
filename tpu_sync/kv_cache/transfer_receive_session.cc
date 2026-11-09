@@ -163,6 +163,130 @@ size_t StagingLayerManager::num_free() const {
   return free_.size();
 }
 
+PoolStagingLayers::PoolStagingLayers(std::vector<size_t> storage_of_pool,
+                                     bool bounded, size_t num_host_layers)
+    : storage_of_pool_(std::move(storage_of_pool)),
+      bounded_(bounded),
+      storage_leases_(bounded ? num_host_layers : 0) {}
+
+PoolStagingLayers PoolStagingLayers::ForManager(
+    const kv_cache::KVCacheManagerBase* base) {
+  if (base == nullptr) {
+    return PoolStagingLayers({}, /*bounded=*/false, /*num_host_layers=*/0);
+  }
+  std::vector<size_t> storage_of_pool;
+  storage_of_pool.reserve(base->num_pools());
+  for (const kv_cache::PoolSpec& pool : base->pools()) {
+    storage_of_pool.push_back(pool.storage_index);
+  }
+  return PoolStagingLayers(std::move(storage_of_pool),
+                           base->num_host_layers() < base->num_layers(),
+                           base->num_host_layers());
+}
+
+absl::StatusOr<size_t> PoolStagingLayers::StorageOf(size_t pool_idx) const {
+  // A manager without registered pools addresses one implicit pool per
+  // storage.
+  if (pool_idx >= storage_of_pool_.size()) {
+    return pool_idx;
+  }
+  return storage_of_pool_[pool_idx];
+}
+
+absl::StatusOr<size_t> PoolStagingLayers::Acquire(
+    size_t pool_idx, std::chrono::steady_clock::time_point deadline,
+    const std::atomic<bool>* cancelled) {
+  ABSL_ASSIGN_OR_RETURN(const size_t storage, StorageOf(pool_idx));
+  {
+    absl::MutexLock lock(mu_);
+    if (shutdown_ ||
+        (cancelled != nullptr && cancelled->load(std::memory_order_relaxed))) {
+      return absl::CancelledError("PoolStagingLayers is shutting down");
+    }
+    if (!bounded_) {
+      holders_[storage].insert(pool_idx);
+      return storage;
+    }
+    auto held = holders_.find(storage);
+    if (held != holders_.end() && !held->second.empty()) {
+      // The storage already holds a buffer: share it.
+      std::optional<size_t> slot = storage_leases_.Lookup(storage);
+      if (slot.has_value()) {
+        held->second.insert(pool_idx);
+        return *slot;
+      }
+    }
+    ++pending_[storage];
+  }
+  // Waits outside mu_: a release that frees a buffer needs mu_.
+  absl::StatusOr<size_t> slot =
+      storage_leases_.Acquire(storage, deadline, cancelled);
+  absl::MutexLock lock(mu_);
+  if (--pending_[storage] == 0) {
+    pending_.erase(storage);
+  }
+  if (slot.ok()) {
+    holders_[storage].insert(pool_idx);
+  } else if (!holders_.contains(storage) && !pending_.contains(storage)) {
+    storage_leases_.Release(storage);
+  }
+  return slot;
+}
+
+std::optional<size_t> PoolStagingLayers::Lookup(size_t pool_idx) const {
+  absl::StatusOr<size_t> storage = StorageOf(pool_idx);
+  if (!storage.ok()) {
+    return std::nullopt;
+  }
+  absl::MutexLock lock(mu_);
+  auto held = holders_.find(*storage);
+  if (held == holders_.end() || !held->second.contains(pool_idx)) {
+    return std::nullopt;
+  }
+  if (!bounded_) {
+    return *storage;
+  }
+  return storage_leases_.Lookup(*storage);
+}
+
+std::optional<size_t> PoolStagingLayers::Release(size_t pool_idx) {
+  absl::StatusOr<size_t> storage = StorageOf(pool_idx);
+  if (!storage.ok()) {
+    return std::nullopt;
+  }
+  absl::MutexLock lock(mu_);
+  auto held = holders_.find(*storage);
+  if (held == holders_.end() || held->second.erase(pool_idx) == 0) {
+    return std::nullopt;
+  }
+  const bool last_holder = held->second.empty();
+  if (last_holder) {
+    holders_.erase(held);
+  }
+  if (!bounded_) {
+    return *storage;
+  }
+  std::optional<size_t> slot = storage_leases_.Lookup(*storage);
+  if (last_holder && !pending_.contains(*storage)) {
+    storage_leases_.Release(*storage);
+  }
+  return slot;
+}
+
+void PoolStagingLayers::ReleaseAll() {
+  absl::MutexLock lock(mu_);
+  holders_.clear();
+  if (bounded_) {
+    storage_leases_.ReleaseAll();
+  }
+}
+
+void PoolStagingLayers::Shutdown() {
+  absl::MutexLock lock(mu_);
+  shutdown_ = true;
+  storage_leases_.Shutdown();
+}
+
 absl::StatusOr<std::shared_ptr<TransferReceiveSession>>
 TransferReceiveSession::Create(
     kv_cache::KVCacheManagerBase* base, KVCacheManagerWithTransfer* manager,

@@ -20,14 +20,20 @@
 #include <cstddef>
 #include <deque>
 #include <optional>
+#include <vector>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "tpu_sync/transport/transfer_session.h"  // IWYU pragma: export
 
 namespace tpu_raiden {
+
+namespace kv_cache {
+class KVCacheManagerBase;
+}  // namespace kv_cache
 
 // Manages the host layer staging slots of a transfer session when fewer host
 // layer buffers are allocated than layers. A layer leases the slot at the head
@@ -71,6 +77,70 @@ class StagingLayerManager {
   // the tail.
   std::deque<size_t> free_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_map<size_t, size_t> leases_ ABSL_GUARDED_BY(mu_);
+  bool shutdown_ ABSL_GUARDED_BY(mu_) = false;
+};
+
+// Host layer staging of a pool-reshard session. A host layer buffer mirrors a
+// storage, and several pools can live in one storage (e.g. the FA pool and
+// the GDN state pools aliasing it), so pools resolve to buffers by storage:
+//  - full mirror (one buffer per storage): a pool's buffer is its own
+//    storage's, with no lease and no waiting;
+//  - bounded host layers: the storage, not the pool, holds the lease, and
+//    every pool of that storage shares it. The lease ends when the last pool
+//    holding it releases.
+// Leasing per pool instead hands two pools of one storage two buffers (so
+// pools beyond the buffer count wait for a release, which can need the very
+// pushes that are waiting) and places a pool outside its storage's buffer.
+// Thread-safe.
+class PoolStagingLayers {
+ public:
+  // |storage_of_pool[p]| is the storage index of pool p. |bounded| is true
+  // when the manager has fewer host layer buffers (|num_host_layers|) than
+  // storages.
+  PoolStagingLayers(std::vector<size_t> storage_of_pool, bool bounded,
+                    size_t num_host_layers);
+
+  // Staging for a session on |base|'s registered pools (none for nullptr).
+  static PoolStagingLayers ForManager(const kv_cache::KVCacheManagerBase* base);
+
+  // Returns the buffer of |pool_idx|'s storage, leasing one for the storage
+  // when bounded and the storage holds none. Waits until |deadline| for a
+  // release when every buffer is leased; fails kDeadlineExceeded on timeout
+  // and kCancelled after Shutdown() or once |*cancelled| is set. A pool
+  // index past |storage_of_pool| is its own storage (implicit pools).
+  absl::StatusOr<size_t> Acquire(size_t pool_idx,
+                                 std::chrono::steady_clock::time_point deadline,
+                                 const std::atomic<bool>* cancelled = nullptr);
+
+  // Returns the buffer |pool_idx| holds, if any. A full mirror answers with
+  // the pool's own storage only while the pool holds it (between Acquire and
+  // Release), as a bounded one does.
+  std::optional<size_t> Lookup(size_t pool_idx) const;
+
+  // Ends |pool_idx|'s hold; the storage's lease ends with its last holder.
+  // Returns the buffer the pool held; nullopt if it held none.
+  std::optional<size_t> Release(size_t pool_idx);
+
+  // Ends every hold and lease.
+  void ReleaseAll();
+
+  // Fails every future Acquire(), and every bounded one still waiting, with
+  // kCancelled.
+  void Shutdown();
+
+ private:
+  absl::StatusOr<size_t> StorageOf(size_t pool_idx) const;
+
+  const std::vector<size_t> storage_of_pool_;
+  const bool bounded_;
+  StagingLayerManager storage_leases_;
+  mutable absl::Mutex mu_;
+  // Pools currently holding each storage's buffer.
+  absl::flat_hash_map<size_t, absl::flat_hash_set<size_t>> holders_
+      ABSL_GUARDED_BY(mu_);
+  // Acquire() calls waiting on |storage_leases_| for each storage; the
+  // storage's lease outlives an empty holder set while any is pending.
+  absl::flat_hash_map<size_t, int> pending_ ABSL_GUARDED_BY(mu_);
   bool shutdown_ ABSL_GUARDED_BY(mu_) = false;
 };
 

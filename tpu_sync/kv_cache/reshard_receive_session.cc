@@ -216,7 +216,7 @@ class ReshardReceiveSession final
   // block ids (the flat chip_block_ids list concatenates all groups).
   absl::flat_hash_map<size_t, std::vector<int64_t>> pool_dst_block_ids_
       ABSL_GUARDED_BY(mu_);
-  StagingLayerManager staging_layer_manager_;
+  PoolStagingLayers staging_layer_manager_;
   std::atomic<bool> cancelled_{false};
 };
 
@@ -561,7 +561,7 @@ ReshardReceiveSession::ReshardReceiveSession(
       start_time_(std::chrono::steady_clock::now()),
       transfer_plan_(
           std::make_shared<const TransferPlan>(std::move(transfer_plan))),
-      staging_layer_manager_(base != nullptr ? base->num_host_layers() : 0) {
+      staging_layer_manager_(PoolStagingLayers::ForManager(base)) {
   absl::MutexLock lock(mu_);
   chip_block_ids_.assign(chip_blocks.begin(), chip_blocks.end());
   for (int32_t pool_idx : request().transfer_pool_indices()) {

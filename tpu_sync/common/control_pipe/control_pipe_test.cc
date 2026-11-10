@@ -24,21 +24,17 @@
 #include <memory>
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
-#include <utility>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
-#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "grpcpp/channel.h"
 #include "grpcpp/client_context.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
-#include "grpcpp/security/server_credentials.h"
 #include "grpcpp/support/status.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
@@ -46,7 +42,6 @@
 #include "tpu_sync/common/control_pipe/control_pipe_server.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/common/control_pipe/grpc_control_pipe.h"
-#include "tpu_sync/platform/grpc_credential_factory.h"
 #include "tpu_sync/proto/control_pipe.grpc.pb.h"
 #include "tpu_sync/proto/control_pipe.pb.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
@@ -306,10 +301,8 @@ TEST(GrpcMultiServiceAdapterTest, ServesLegacyKVCacheAndWeightSyncGrpcClients) {
   TF_ASSERT_OK_AND_ASSIGN(int port, server->Start(0));
   std::string endpoint = absl::StrCat("127.0.0.1:", port);
 
-  TF_ASSERT_OK_AND_ASSIGN(
-      std::shared_ptr<grpc::ChannelCredentials> creds,
-      CreateGrpcCredentialFactory()->CreateClientCredentials());
-  auto channel = grpc::CreateChannel(endpoint, std::move(creds));
+  auto channel =
+      grpc::CreateChannel(endpoint, grpc::InsecureChannelCredentials());
 
   // 1. Call via legacy KVCacheControlPlaneService::Stub
   auto kv_stub = KVCacheControlPlaneService::NewStub(channel);
@@ -622,164 +615,6 @@ TEST(GrpcControlPipeKeepaliveTest,
   EXPECT_EQ(resp2.num_layers(), 2);
 
   server->Stop();
-}
-
-// Counts credential requests and optionally injects errors; otherwise delegates
-// to the platform factory from `CreateGrpcCredentialFactory()`.
-class FakeCredentialFactory final : public GrpcCredentialFactory {
- public:
-  FakeCredentialFactory(absl::Status server_error, absl::Status client_error)
-      : server_error_(std::move(server_error)),
-        client_error_(std::move(client_error)) {}
-
-  absl::StatusOr<std::shared_ptr<grpc::ServerCredentials>>
-  CreateServerCredentials() override {
-    ++server_calls_;
-    if (!server_error_.ok()) {
-      return server_error_;
-    }
-    return delegate_->CreateServerCredentials();
-  }
-
-  absl::StatusOr<std::shared_ptr<grpc::ChannelCredentials>>
-  CreateClientCredentials() override {
-    ++client_calls_;
-    if (!client_error_.ok()) {
-      return client_error_;
-    }
-    return delegate_->CreateClientCredentials();
-  }
-
-  int server_calls() const { return server_calls_.load(); }
-  int client_calls() const { return client_calls_.load(); }
-
- private:
-  std::shared_ptr<GrpcCredentialFactory> delegate_ =
-      CreateGrpcCredentialFactory();
-  absl::Status server_error_;
-  absl::Status client_error_;
-  std::atomic<int> server_calls_{0};
-  std::atomic<int> client_calls_{0};
-};
-
-TEST(ControlPipeTest, GrpcGetOrCreateChannelCachesChannelPerEndpoint) {
-  ControlPipeConfig cfg;
-  cfg.backend_type = ControlPipeBackendType::kGrpc;
-
-  GrpcControlPipeServer server(cfg);
-  server.dispatcher().RegisterHandler<PullStreamRequest, PullStreamResponse>(
-      [](const ControlContext& ctx,
-         const PullStreamRequest& req) -> absl::StatusOr<PullStreamResponse> {
-        PullStreamResponse resp;
-        resp.set_status(0);
-        resp.set_num_layers(static_cast<int32_t>(req.uuid()));
-        return resp;
-      });
-  TF_ASSERT_OK_AND_ASSIGN(int port, server.Start(0));
-
-  std::string endpoint_v4 = absl::StrCat("127.0.0.1:", port);
-  std::string endpoint_host = absl::StrCat("localhost:", port);
-
-  GrpcControlPipeClient client(cfg);
-  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<grpc::Channel> ch1,
-                       client.GetOrCreateChannel(endpoint_v4));
-  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<grpc::Channel> ch2,
-                       client.GetOrCreateChannel(endpoint_v4));
-  EXPECT_NE(ch1, nullptr);
-  EXPECT_EQ(ch1, ch2);
-  EXPECT_EQ(client.TEST_CachedStubCount(), 1);
-  EXPECT_TRUE(client.TEST_HasCachedStub(endpoint_v4));
-
-  auto kv_stub = KVCacheControlPlaneService::NewStub(ch1);
-  grpc::ClientContext ctx;
-  PullStreamRequest req;
-  req.set_uuid(17);
-  PullStreamResponse resp;
-  grpc::Status rpc_status = kv_stub->PullStream(&ctx, req, &resp);
-  ASSERT_TRUE(rpc_status.ok()) << rpc_status.error_message();
-  EXPECT_EQ(resp.num_layers(), 17);
-
-  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<grpc::Channel> ch3,
-                       client.GetOrCreateChannel(endpoint_host));
-  EXPECT_NE(ch3, nullptr);
-  EXPECT_NE(ch1, ch3);
-  EXPECT_EQ(client.TEST_CachedStubCount(), 2);
-
-  server.Stop();
-}
-
-TEST(ControlPipeTest, GrpcCustomCredentialFactoryEndToEnd) {
-  ControlPipeConfig cfg;
-  cfg.backend_type = ControlPipeBackendType::kGrpc;
-
-  auto factory = std::make_shared<FakeCredentialFactory>(absl::OkStatus(),
-                                                         absl::OkStatus());
-  GrpcControlPipeServer server(cfg, factory);
-  server.dispatcher().RegisterHandler<PullStreamRequest, PullStreamResponse>(
-      [](const ControlContext& ctx,
-         const PullStreamRequest& req) -> absl::StatusOr<PullStreamResponse> {
-        PullStreamResponse resp;
-        resp.set_status(0);
-        resp.set_num_layers(static_cast<int32_t>(req.uuid() + 10));
-        return resp;
-      });
-
-  TF_ASSERT_OK_AND_ASSIGN(int port, server.Start(0));
-  EXPECT_EQ(factory->server_calls(), 1);
-  EXPECT_EQ(factory->client_calls(), 0);
-
-  std::string endpoint = absl::StrCat("127.0.0.1:", port);
-  GrpcControlPipeClient client(cfg, factory);
-
-  PullStreamRequest req;
-  req.set_uuid(5);
-  TF_ASSERT_OK_AND_ASSIGN(
-      PullStreamResponse resp1,
-      (client.Call<PullStreamRequest, PullStreamResponse>(endpoint, req)));
-  EXPECT_EQ(resp1.num_layers(), 15);
-  EXPECT_EQ(factory->client_calls(), 1);
-
-  // Subsequent calls reuse the cached channel/stub without re-invoking the
-  // credential factory.
-  TF_ASSERT_OK_AND_ASSIGN(
-      PullStreamResponse resp2,
-      (client.Call<PullStreamRequest, PullStreamResponse>(endpoint, req)));
-  EXPECT_EQ(resp2.num_layers(), 15);
-  EXPECT_EQ(factory->client_calls(), 1);
-
-  server.Stop();
-}
-
-TEST(ControlPipeTest, GrpcCustomCredentialFactoryPropagatesErrors) {
-  ControlPipeConfig cfg;
-  cfg.backend_type = ControlPipeBackendType::kGrpc;
-
-  auto server_fail_factory = std::make_shared<FakeCredentialFactory>(
-      absl::PermissionDeniedError("server creds denied"), absl::OkStatus());
-  GrpcControlPipeServer server(cfg, server_fail_factory);
-  EXPECT_THAT(
-      server.Start(0),
-      ::absl_testing::StatusIs(absl::StatusCode::kPermissionDenied,
-                               ::testing::HasSubstr("server creds denied")));
-  EXPECT_EQ(server_fail_factory->server_calls(), 1);
-
-  auto client_fail_factory = std::make_shared<FakeCredentialFactory>(
-      absl::OkStatus(), absl::PermissionDeniedError("client creds denied"));
-  GrpcControlPipeClient client(cfg, client_fail_factory);
-  EXPECT_THAT(
-      client.GetOrCreateChannel("127.0.0.1:1"),
-      ::absl_testing::StatusIs(absl::StatusCode::kPermissionDenied,
-                               ::testing::HasSubstr("client creds denied")));
-  EXPECT_EQ(client.TEST_CachedStubCount(), 0);
-
-  PullStreamRequest req;
-  req.set_uuid(1);
-  EXPECT_THAT(
-      (client.Call<PullStreamRequest, PullStreamResponse>("127.0.0.1:1", req)),
-      ::absl_testing::StatusIs(absl::StatusCode::kPermissionDenied,
-                               ::testing::HasSubstr("client creds denied")));
-  EXPECT_EQ(client.TEST_CachedStubCount(), 0);
-  EXPECT_EQ(client_fail_factory->client_calls(), 2);
 }
 
 }  // namespace

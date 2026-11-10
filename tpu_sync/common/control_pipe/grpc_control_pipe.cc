@@ -24,7 +24,6 @@
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
-#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
@@ -46,7 +45,6 @@
 #include "grpcpp/support/sync_stream.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
-#include "tpu_sync/platform/grpc_credential_factory.h"
 #include "tpu_sync/proto/control_pipe.grpc.pb.h"
 #include "tpu_sync/proto/control_pipe.pb.h"
 #include "tpu_sync/proto/kv_cache_control_plane_service.grpc.pb.h"
@@ -274,12 +272,8 @@ class GrpcControlPipeServer::LegacyKVCacheServiceImpl final
 // GrpcControlPipeServer
 // =============================================================================
 
-GrpcControlPipeServer::GrpcControlPipeServer(
-    const ControlPipeConfig& config,
-    std::shared_ptr<GrpcCredentialFactory> credential_factory)
+GrpcControlPipeServer::GrpcControlPipeServer(const ControlPipeConfig& config)
     : config_(config),
-      credential_factory_(credential_factory ? std::move(credential_factory)
-                                             : CreateGrpcCredentialFactory()),
       pipe_service_(std::make_unique<ControlPipeServiceImpl>(&dispatcher_)),
       kv_cache_service_(
           std::make_unique<LegacyKVCacheServiceImpl>(&dispatcher_)) {}
@@ -307,20 +301,9 @@ absl::StatusOr<int> GrpcControlPipeServer::Start(int requested_port) {
       config_.grpc_min_recv_ping_interval_without_data_ms);
   builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PING_STRIKES, 0);
 
-  if (!credential_factory_) {
-    return absl::FailedPreconditionError(
-        "GrpcControlPipeServer credential factory is null");
-  }
-  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<grpc::ServerCredentials> server_creds,
-                        credential_factory_->CreateServerCredentials());
-  if (!server_creds) {
-    return absl::FailedPreconditionError(
-        "GrpcCredentialFactory::CreateServerCredentials returned null");
-  }
-
   int selected_port = 0;
   std::string server_address = absl::StrCat("[::]:", requested_port);
-  builder.AddListeningPort(server_address, std::move(server_creds),
+  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials(),
                            &selected_port);
   builder.RegisterService(pipe_service_.get());
   builder.RegisterService(kv_cache_service_.get());
@@ -367,12 +350,8 @@ void GrpcControlPipeServer::Stop() {
 // GrpcControlPipeClient
 // =============================================================================
 
-GrpcControlPipeClient::GrpcControlPipeClient(
-    const ControlPipeConfig& config,
-    std::shared_ptr<GrpcCredentialFactory> credential_factory)
-    : config_(config),
-      credential_factory_(credential_factory ? std::move(credential_factory)
-                                             : CreateGrpcCredentialFactory()) {}
+GrpcControlPipeClient::GrpcControlPipeClient(const ControlPipeConfig& config)
+    : config_(config) {}
 
 size_t GrpcControlPipeClient::TEST_CachedStubCount() const {
   absl::MutexLock lock(stub_mu_);
@@ -385,33 +364,15 @@ bool GrpcControlPipeClient::TEST_HasCachedStub(
   return stubs_.contains(endpoint);
 }
 
-absl::StatusOr<std::shared_ptr<grpc::Channel>>
-GrpcControlPipeClient::GetOrCreateChannel(absl::string_view endpoint) {
-  ABSL_ASSIGN_OR_RETURN(auto entry, GetOrCreateStub(endpoint));
-  return std::move(entry.first);
-}
-
-absl::StatusOr<
-    std::pair<std::shared_ptr<grpc::Channel>,
-              std::shared_ptr<control_pipe::proto::ControlPipeService::Stub>>>
+std::pair<std::shared_ptr<grpc::Channel>,
+          std::shared_ptr<control_pipe::proto::ControlPipeService::Stub>>
 GrpcControlPipeClient::GetOrCreateStub(absl::string_view endpoint) {
   {
     absl::MutexLock lock(stub_mu_);
     if (auto it = stubs_.find(endpoint); it != stubs_.end()) {
       lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
-      return std::make_pair(it->second.channel, it->second.stub);
+      return {it->second.channel, it->second.stub};
     }
-  }
-
-  if (!credential_factory_) {
-    return absl::FailedPreconditionError(
-        "GrpcControlPipeClient credential factory is null");
-  }
-  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<grpc::ChannelCredentials> client_creds,
-                        credential_factory_->CreateClientCredentials());
-  if (!client_creds) {
-    return absl::FailedPreconditionError(
-        "GrpcCredentialFactory::CreateClientCredentials returned null");
   }
 
   std::string ep_str(endpoint);
@@ -425,18 +386,18 @@ GrpcControlPipeClient::GetOrCreateStub(absl::string_view endpoint) {
   args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
   args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
 
-  std::shared_ptr<grpc::Channel> channel =
-      grpc::CreateCustomChannel(ep_str, std::move(client_creds), args);
+  std::shared_ptr<grpc::Channel> channel = grpc::CreateCustomChannel(
+      ep_str, grpc::InsecureChannelCredentials(), args);
   std::shared_ptr<control_pipe::proto::ControlPipeService::Stub> stub =
       control_pipe::proto::ControlPipeService::NewStub(channel);
 
   absl::MutexLock lock(stub_mu_);
   if (auto it = stubs_.find(ep_str); it != stubs_.end()) {
     lru_order_.splice(lru_order_.begin(), lru_order_, it->second.lru_it);
-    return std::make_pair(it->second.channel, it->second.stub);
+    return {it->second.channel, it->second.stub};
   }
   if (config_.max_cached_grpc_stubs == 0) {
-    return std::make_pair(std::move(channel), std::move(stub));
+    return {channel, stub};
   }
   while (stubs_.size() >= config_.max_cached_grpc_stubs &&
          !lru_order_.empty()) {
@@ -446,7 +407,7 @@ GrpcControlPipeClient::GetOrCreateStub(absl::string_view endpoint) {
   lru_order_.push_front(ep_str);
   stubs_.emplace(std::move(ep_str),
                  StubCacheEntry{channel, stub, lru_order_.begin()});
-  return std::make_pair(std::move(channel), std::move(stub));
+  return {channel, stub};
 }
 
 absl::StatusOr<control_pipe::proto::ControlResponseEnvelope>
@@ -457,8 +418,7 @@ GrpcControlPipeClient::SendRaw(
   absl::Duration effective_timeout =
       timeout > absl::ZeroDuration() ? timeout : config_.default_timeout;
 
-  ABSL_ASSIGN_OR_RETURN(auto entry, GetOrCreateStub(endpoint));
-  const auto& [channel, stub] = entry;
+  auto [channel, stub] = GetOrCreateStub(endpoint);
   const absl::Time deadline = effective_timeout > absl::ZeroDuration()
                                   ? absl::Now() + effective_timeout
                                   : absl::InfiniteFuture();

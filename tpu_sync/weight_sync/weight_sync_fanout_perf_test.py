@@ -1619,14 +1619,16 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
       self,
       port: int,
       coalesced: List[Tuple[Any, ...]],
-      uuid: int = 9999,
+      uuid: int = 0,
   ) -> None:
     """Pushes coalesced entries to BlockTransport server over TCP.
 
     Args:
       port: Local port of the destination BlockTransport server.
       coalesced: Coalesced relay entries to push.
-      uuid: Unique transaction ID.
+      uuid: Transfer session ID named by the push. A non-zero uuid must resolve
+        to an active TransferSession on the receiver; 0 names no session, which
+        is the only form a session-less receiver (WeightSynchronizer) accepts.
 
     Raises:
       ConnectionError: If handshake or completion ack fails.
@@ -1739,7 +1741,7 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     # but Receiver expected: 512 bytes for Block ID: 0.
     with self.assertRaises((socket.error, ConnectionError, OSError)):
       self._push_block_transport_entries(
-          ws_mb.local_port, buggy_coalesced, uuid=9998
+          ws_mb.local_port, buggy_coalesced, uuid=0
       )
 
     # Verification 2 (Fixed output acceptance):
@@ -1758,7 +1760,7 @@ class WeightSyncFanoutPerfTest(parameterized.TestCase):
     # Pushing these 16 blocks to ws_mb.local_port succeeds completely
     # (handshake ack, all 16 payloads, and completion ack received).
     self._push_block_transport_entries(
-        ws_mb.local_port, fixed_coalesced, uuid=9999
+        ws_mb.local_port, fixed_coalesced, uuid=0
     )
 
     # Verify that the destination host buffer contains the sent bytes.
